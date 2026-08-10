@@ -22,9 +22,9 @@
 //! 防御は鎖なので、**いちばん弱い輪より強くならない**。だから 4 本を
 //! 1 画面に並べ、それぞれに ✅ / ⚠ / ❌ と 1 行の理由と直すためのボタンを付ける:
 //!
-//! 1. **事前分割** — 稼働中の担当パスが互いに素か ([`Chain::Split`])
-//! 2. **実行中の強制** — 段 ＋ **1 体ずつ**の実態 ([`Chain::Enforce`])
-//! 3. **統合** — いま統合したら衝突するか ([`Chain::Merge`])
+//! 1. **事前分割** — 稼働中の担当**行域**が安全帯を挟んで互いに素か ([`Chain::Split`])
+//! 2. **実行中の強制** — 段 ＋ **1 体ずつ**の実態 ＋ メッシュの生存 ([`Chain::Enforce`])
+//! 3. **統合** — いま統合したら**一撃で通るか** ([`Chain::Merge`])
 //! 4. **共有面** — 検出できていない穴 ([`Chain::Blind`])
 //!
 //! ### 鎖 2 を丸めないことが、このモジュールの存在理由
@@ -33,12 +33,39 @@
 //! cursor-agent は止まらない、という状態でも表示は「強制」になる。
 //! [`agent_rows`] は稼働中の 1 体ずつに [`Gate`] を付けて出す。
 //!
+//! ## 行域を丸めないことが、鎖 1 の存在理由
+//!
+//! [`crate::region`] が入って、**同じファイルでも違う行なら 2 人が同時に
+//! 持てる**ようになった。ところが「ファイル単位で重なっているか」を出す
+//! ままだと、`src/app.rs#L1200-1260` と `src/app.rs#L4000-4100` が
+//! **重なっていることにされる**。これは鎖 2 の「Enforced と 1 つだけ出す」
+//! と同じ丸めであり、同じ理由で禁止する。
+//!
+//! だから鎖 1 は「守られている / いない」を 1 つ出すのではなく、
+//! **どの域が守られていて、どの域が守られていないか**を [`Held`] の 1 件ずつと
+//! [`TooClose`] の組で出す。行番号を並べても人は読めないので、ファイルを
+//! 1 本の**帯** ([`band_layout`]) に潰して、誰の色がどこにあるかを見せる。
+//! 隣り合う 2 つの域が [`crate::region::SAFE_BAND`] 行より近い場所だけが
+//! 危険地帯で、そこには**あと何行空ければ安全か** ([`lines_needed`]) を出す。
+//!
+//! ## メッシュはファイルシステムから読む
+//!
+//! Erlang 風のプロセスメッシュ (`~/.zaivern/mesh/<スコープ>/`) は別の担当が
+//! 同時に作っている。**`use` しない** — 登録ディレクトリを直に読み、
+//! 鍵の名前は別名を全部見て、無ければ「未稼働」と 1 行で正直に出す
+//! ([`read_mesh`])。相手が出来ていなくてもこの画面は 1 ピクセルも壊れない。
+//!
 //! ## 疎結合の約束
 //!
-//! 同時に別のブランチで作られている新規モジュール (guard / train / union /
-//! split) へは**コンパイル時依存を 1 つも持たない**。状態はファイルシステムと
-//! git から直に検出する — そうしておけば、相手が出来ていても居なくても
-//! この画面は動く。
+//! 同時に別のブランチで作られている新規モジュール (mesh / coedit / guard /
+//! train / union / split) へは**コンパイル時依存を 1 つも持たない**。
+//! 状態はファイルシステムと git から直に検出し、証明器だけは
+//! **実行時に**サブプロセスで繋ぐ ([`probe_proof`])。そうしておけば、
+//! 相手が出来ていても居なくてもこの画面は動く。
+//!
+//! 例外は [`crate::region`] だけ。既にコミット済みで、表記
+//! ([`crate::region::render`]) と重なり判定 ([`crate::region::conflicts`]) の
+//! 契約が固定されている。**2 実装を持つとズレる**ので、ここでは再発明しない。
 //!
 //! ## 判定は純関数
 //!
@@ -65,6 +92,21 @@ const OPAQUE_MARK: &str = "opaque-write";
 
 /// 監査ログを読む上限。壊れた・膨らんだログで UI を待たせない。
 const AUDIT_READ_CAP: u64 = 512 * 1024;
+
+/// 走査を諦める時間。ワーカーがここまで戻らなければ受け口を捨てて次を出す。
+///
+/// **捨てないと画面が永久に古いまま**になる (`pending` が埋まっている間は
+/// 次の走査を出さないため)。捨てたワーカーは自分で終わって送信に失敗するだけ。
+const SCAN_GIVEUP: Duration = Duration::from_secs(60);
+
+/// メッシュから読む登録の上限。**64 本の行は情報ではなく壁。**
+const MESH_PROC_CAP: usize = 64;
+
+/// 1 つのメールボックスから数える未読の上限。
+const MESH_INBOX_CAP: usize = 999;
+
+/// 帯を出すファイルの上限。超えたぶんは件数だけ 1 行で出す。
+const BAND_FILE_CAP: usize = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  1. 判定の材料 (検出した生の事実だけ。ここに UI も I/O も無い)
@@ -143,16 +185,282 @@ pub struct AgentFact {
     pub how: String,
 }
 
+/// 誰がどのファイルの**何行目**を持っているか、1 件ぶん。
+///
+/// 台帳のパターン 1 つが 1 件になる。同じ持ち主が 3 つの域を持っていれば
+/// 3 件で、**まとめない** — まとめた瞬間に「このファイルは A のもの」という
+/// ファイル単位の嘘に戻る。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// 持ち主の表示名 (`lease::Holder::display`)。
+    pub owner: String,
+    /// 担当の実体。[`crate::region::Region::is_whole`] ならファイル全体。
+    pub region: crate::region::Region,
+}
+
+/// **唯一の危険地帯** — 別々の持ち主の域が、安全帯を挟んでもなお近すぎる組。
+///
+/// ここが空であることが、そのまま「一撃マージできる」証明になる
+/// ([`crate::region::is_disjoint`] と同じ不変条件)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TooClose {
+    /// 画面に出すファイル (両者は同じファイルを指している)。
+    pub path: String,
+    /// [`Facts::held`] の添字 (行の若い方)。
+    pub lo: usize,
+    /// [`Facts::held`] の添字 (行の深い方)。
+    pub hi: usize,
+    /// あと何行空ければ安全になるか。**0 は「行をずらしても解けない」**
+    /// (ファイル全体・末尾まで・glob のどれか) を意味する。
+    pub need: u32,
+}
+
+/// 台帳のパターンを行域へ起こす (純粋・入力順を保つ)。
+///
+/// **壊れた指定は捨てずにファイル全体として扱う。** 捨てると「持ち主が
+/// 居ない」ように見えてしまい、いちばん危ない側へ倒れる。
+pub fn to_held(owned: &[(String, Vec<String>)]) -> Vec<Held> {
+    let mut out = Vec::new();
+    for (owner, pats) in owned {
+        for spec in pats {
+            let region =
+                crate::region::parse(spec).unwrap_or_else(|_| crate::region::Region::whole(spec));
+            out.push(Held {
+                owner: owner.clone(),
+                region,
+            });
+        }
+    }
+    out
+}
+
+/// 2 つの域を安全帯まで引き離すのに、**あと何行**必要か (純粋)。
+///
+/// 深い側を `need` 行だけ下へずらせば [`crate::region::spans_too_close`] が
+/// `false` になる。既に離れていれば 0。
+///
+/// **片方が末尾まで伸びていると、どれだけずらしても解けない**ので 0 を返す。
+/// 「0 行で足りる」ではなく「行では解けない」の意味なので、呼び出し側は
+/// [`crate::region::conflicts`] と組にして読むこと。
+pub fn lines_needed(a: &crate::region::Span, b: &crate::region::Span, band: u32) -> u32 {
+    let (lo, hi) = if a.start <= b.start { (a, b) } else { (b, a) };
+    if lo.end == crate::region::Span::EOF {
+        return 0;
+    }
+    lo.end
+        .saturating_add(band)
+        .saturating_add(1)
+        .saturating_sub(hi.start)
+}
+
+/// 別々の持ち主の間で、安全帯を挟んでもなお近すぎる組を全部出す (純粋・決定的)。
+///
+/// **同じ持ち主どうしは数えない** — 自分の域が 2 つ隣り合っていても、
+/// 書くのは 1 人なので衝突しない (`count_overlaps` 時代からの不変)。
+pub fn too_close_pairs(held: &[Held], band: u32) -> Vec<TooClose> {
+    let mut out = Vec::new();
+    for i in 0..held.len() {
+        for j in (i + 1)..held.len() {
+            let (a, b) = (&held[i], &held[j]);
+            if a.owner == b.owner || !crate::region::conflicts(&a.region, &b.region, band) {
+                continue;
+            }
+            let (need, swap) = match (a.region.span, b.region.span) {
+                (Some(x), Some(y)) => (lines_needed(&x, &y, band), y.start < x.start),
+                _ => (0, false),
+            };
+            let (lo, hi) = if swap { (j, i) } else { (i, j) };
+            out.push(TooClose {
+                path: held[lo].region.path.clone(),
+                lo,
+                hi,
+                need,
+            });
+        }
+    }
+    out
+}
+
+/// 台帳に出てくる持ち主を、決定的な順に 1 回ずつ (純粋)。
+///
+/// 色の割り当てに使う。`HashMap` を通すと反復順が画面へ漏れて、
+/// **同じ台帳なのに人によって色が違う**という再現しない絵になる。
+pub fn owner_list(held: &[Held]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for h in held {
+        if !v.contains(&h.owner) {
+            v.push(h.owner.clone());
+        }
+    }
+    v.sort();
+    v
+}
+
+/// 持ち主 → 色の枠 (純粋)。一覧に無ければ 0 番へ落とす (fail-soft)。
+pub fn owner_slot(owners: &[String], name: &str) -> usize {
+    owners.iter().position(|o| o == name).unwrap_or(0)
+}
+
+// ── メッシュ (Erlang 風のプロセス相互認識) ──────────────────────────
+
+/// 生存の 3 値。**「判らない」を「死んでいる」へ丸めない。**
+///
+/// 丸めると、PID を書いていない登録が全部「詰まり」に見えて、
+/// 唯一の詰まり (死んだのに担当を握ったまま) が埋もれる。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Live {
+    /// PID が生きている。
+    Yes,
+    /// PID が死んでいる。
+    No,
+    /// 登録に PID が無い / 読めなかった。
+    #[default]
+    Unknown,
+}
+
+impl Live {
+    /// 行頭に出す記号。
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Live::Yes => "●",
+            Live::No => "✕",
+            Live::Unknown => "◌",
+        }
+    }
+}
+
+/// メッシュに登録された 1 プロセス。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshProc {
+    /// 画面に出す名前。登録に無ければファイル名から起こす。
+    pub name: String,
+    /// 種別 (エージェント / エディタ / フック)。判らなければ空。
+    pub kind: String,
+    /// 生存確認に使う PID。0 = 登録に書かれていない。
+    pub pid: u32,
+    /// 生きているか。
+    pub live: Live,
+    /// 握っている担当の数。
+    pub holds: usize,
+    /// メールボックスに溜まっている未読の数。
+    pub unread: usize,
+}
+
+/// メッシュ全体。**ディレクトリが無ければ [`Mesh::present`] が `false`。**
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Mesh {
+    /// 登録ディレクトリが在るか。無いのは異常ではなく「まだ動いていない」。
+    pub present: bool,
+    /// 登録の一覧 (名前順・決定的)。
+    pub procs: Vec<MeshProc>,
+    /// 上限を超えて読まなかった件数。
+    pub more: usize,
+}
+
+impl Mesh {
+    /// **死んだのに担当を握ったままのプロセス** = 唯一の詰まり。
+    ///
+    /// これが 1 件でもあると、生きているエージェントはその担当が解けるまで
+    /// 断られ続ける。「止まる」が「進まない」へ化ける唯一の形なので、
+    /// 鎖 2 はここだけで ❌ へ落ちる。
+    pub fn stuck(&self) -> usize {
+        self.procs
+            .iter()
+            .filter(|p| p.live == Live::No && p.holds > 0)
+            .count()
+    }
+}
+
+/// 数 / 配列の長さ / 数字の文字列を、どれでも件数として読む (純粋)。
+///
+/// 相手の登録が「数」で持つか「一覧」で持つかは実装次第なので、両方受ける。
+fn count_of(v: &serde_json::Value) -> Option<usize> {
+    match v {
+        serde_json::Value::Number(x) => x.as_u64().map(|n| n as usize),
+        serde_json::Value::Array(a) => Some(a.len()),
+        serde_json::Value::String(t) => t.parse().ok(),
+        _ => None,
+    }
+}
+
+/// メッシュの登録 1 件を読む (純粋)。
+///
+/// **相手のモジュールへコンパイル時依存を持たない**ぶん、鍵の名前は揺れうる。
+/// よく使う別名を全部見て、無ければ空のまま通す (fail-soft: 読めない登録を
+/// 「死んでいる」ことにしない — それは [`Live::Unknown`] の役目)。
+pub fn read_proc(json: &str) -> Option<MeshProc> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let o = v.as_object()?;
+    let text = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| o.get(*k).and_then(|x| x.as_str()))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let num = |keys: &[&str]| -> usize {
+        keys.iter()
+            .find_map(|k| o.get(*k).and_then(count_of))
+            .unwrap_or(0)
+    };
+    Some(MeshProc {
+        name: text(&["name", "id", "label", "agent", "holder"]),
+        kind: text(&["kind", "role", "type"]),
+        pid: num(&["pid", "process_id"]).min(u32::MAX as usize) as u32,
+        live: Live::Unknown,
+        holds: num(&["holds", "regions", "owns", "patterns", "leases"]),
+        unread: num(&["unread", "pending", "queued"]),
+    })
+}
+
+// ── 一撃マージの証明 ────────────────────────────────────────────────
+
+/// `zai coedit proof --json` の結果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Proof {
+    /// 一撃で通ることが証明できたか。
+    pub ok: bool,
+    /// 立たなかったときの、近すぎる組の数。
+    pub pairs: usize,
+    /// 証明器が自分で判定を下げた理由 (空なら下げていない)。
+    pub note: String,
+}
+
+/// 証明器の出力を読む (純粋)。
+///
+/// **`ok` に相当する鍵が 1 つも無ければ `None`。** 読めなかったものを
+/// 「証明できた」へ丸めるのが、この画面でいちばんやってはいけない嘘。
+pub fn read_proof(json: &str) -> Option<Proof> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let o = v.as_object()?;
+    let ok = ["ok", "proven", "oneshot", "clean", "disjoint"]
+        .iter()
+        .find_map(|k| o.get(*k).and_then(|x| x.as_bool()))?;
+    let pairs = ["pairs", "conflicts", "clashes", "overlaps"]
+        .iter()
+        .find_map(|k| o.get(*k).and_then(count_of))
+        .unwrap_or(0);
+    let note = ["note", "reason", "why", "degraded"]
+        .iter()
+        .find_map(|k| o.get(*k).and_then(|x| x.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    Some(Proof { ok, pairs, note })
+}
+
 /// 検出した生の事実。**[`judge`] はこれだけを見る。**
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Facts {
     // ── 鎖 1: 事前分割 ──────────────────────────────────────────────
     /// このワークスペースで台帳が有効か。
     pub ledger_on: bool,
-    /// 担当パスを 1 つ以上持っている持ち主の数。
+    /// 担当行域を 1 つ以上持っている持ち主の数。
     pub owners: usize,
-    /// **別々の持ち主の**担当パスが重なっている組の数。
-    pub overlaps: usize,
+    /// 誰がどのファイルの何行目を持っているか。**1 件ずつ持つ** —
+    /// 帯の絵も危険地帯の判定も、ここからだけ作る。
+    pub held: Vec<Held>,
+    /// 安全帯を挟んでもなお近すぎる組 = **唯一の危険地帯**。
+    /// 空であることが、そのまま「一撃で通る」の証明になる。
+    pub clashes: Vec<TooClose>,
 
     // ── 鎖 2: 実行中の強制 ──────────────────────────────────────────
     /// リースの段。[`crate::lease::Tier::Off`] なら、フックが入っていても
@@ -160,6 +468,8 @@ pub struct Facts {
     pub tier: crate::lease::Tier,
     /// 稼働中と分かっている 1 体ずつ。
     pub agents: Vec<AgentFact>,
+    /// Erlang 風メッシュの生存 (登録ディレクトリを直に読んだもの)。
+    pub mesh: Mesh,
 
     // ── 鎖 3: 統合 ──────────────────────────────────────────────────
     /// 同じリポジトリにぶら下がっている作業ツリーの本数 (本体を含む)。
@@ -173,12 +483,18 @@ pub struct Facts {
     /// 未コミットの変更を抱えたツリーの本数。あると merge-tree の判定は
     /// 権威にならないので、衝突ゼロでも言い切らない。
     pub dirty_trees: usize,
+    /// 一撃マージの証明。`None` = **証明器がまだ無い**ので、git の
+    /// 突き合わせへ降格していることを表す (「証明が立った」とは言わない)。
+    pub proof: Option<Proof>,
 
     // ── 鎖 4: 共有面 ────────────────────────────────────────────────
     /// 監査ログに残った「宛先の判らない書き込み」の件数。
     pub opaque_writes: usize,
     /// このエディタ自身の保存が台帳を通っているか ([`crate::lease::armed`])。
     pub editor_guard: bool,
+    /// 監査ログの大きさ。**0 なら「ログの場所」ボタンを出さない** —
+    /// 空のファイルの場所を渡すボタンは、押しても何も起きないのと同じ。
+    pub audit_bytes: u64,
 }
 
 /// **原理的に検出できない穴**。数と中身を画面に出すためにデータで持つ。
@@ -368,29 +684,51 @@ pub fn weakest(rows: &[Row; 4]) -> Grade {
     rows.iter().map(|r| r.grade).max().unwrap_or(Grade::Warn)
 }
 
-/// 鎖 1 — 配る前に担当が分かれているか。
+/// 鎖 1 — 配る前に担当**行域**が分かれているか。
+///
+/// ファイル単位ではなく行域で見る。`src/app.rs#L1200-1260` と
+/// `src/app.rs#L4000-4100` は同じファイルだが**同時に持ってよい** —
+/// ここを丸めると、行域オーナーシップの価値がそのまま画面から消える。
 fn split_row(f: &Facts) -> Row {
+    let band = crate::region::SAFE_BAND.to_string();
     let (grade, reason, fix) = if !f.ledger_on {
         (
             Grade::Warn,
-            Reason::plain("台帳が無効なので、担当パスが重なっているかどうかを判定できません"),
+            Reason::plain("台帳が無効なので、担当行域が近すぎるかどうかを判定できません"),
             Some(Fix::Lease),
         )
-    } else if f.overlaps > 0 {
-        (
-            Grade::Bad,
-            Reason::with(
-                "{n} 組の担当パスが重なっています — このまま走らせると、衝突はマージのときまで見えません",
-                vec![("n", f.overlaps.to_string())],
-            ),
-            Some(Fix::Lease),
-        )
+    } else if !f.clashes.is_empty() {
+        let need = f.clashes.iter().map(|c| c.need).max().unwrap_or(0);
+        let n = f.clashes.len().to_string();
+        if need > 0 {
+            (
+                Grade::Bad,
+                Reason::with(
+                    "{n} 組の行域が安全帯 {b} 行より近すぎます — 最大であと {k} 行空ければ、すべて一撃で通ります",
+                    vec![("n", n), ("b", band), ("k", need.to_string())],
+                ),
+                Some(Fix::Lease),
+            )
+        } else {
+            (
+                Grade::Bad,
+                Reason::with(
+                    "{n} 組の担当が丸ごと重なっています — 行をずらしても解けないので、担当そのものを分ける必要があります",
+                    vec![("n", n)],
+                ),
+                Some(Fix::Lease),
+            )
+        }
     } else if f.owners >= 2 {
         (
             Grade::Ok,
             Reason::with(
-                "{n} 人の担当パスは互いに素です。同じファイルを 2 人が触ることはありません",
-                vec![("n", f.owners.to_string())],
+                "{n} 人が持つ {r} 個の行域は、安全帯 {b} 行を挟んで互いに素です。同じファイルでも行が違えば同時に書けます",
+                vec![
+                    ("n", f.owners.to_string()),
+                    ("r", f.held.len().to_string()),
+                    ("b", band),
+                ],
             ),
             None,
         )
@@ -404,7 +742,7 @@ fn split_row(f: &Facts) -> Row {
         (
             Grade::Warn,
             Reason::plain(
-                "まだ誰も担当パスを確保していません (エージェントが書き込むと自動で登録されます)",
+                "まだ誰も担当行域を確保していません (エージェントが書き込むと自動で登録されます)",
             ),
             Some(Fix::Lease),
         )
@@ -451,6 +789,19 @@ fn enforce_row(f: &Facts) -> Row {
             Grade::Bad,
             Reason::plain(
                 "リースが無効なので、フックを設置してあっても書き込みは 1 件も止まりません",
+            ),
+            Some(Fix::Lease),
+        )
+    } else if f.mesh.stuck() > 0 {
+        // **死んだのに担当を握ったままのプロセスは、唯一の詰まり。**
+        // フックが全部入っていても、生きているエージェントはこの担当が
+        // 解けるまで断られ続ける。「止まる」が「進まない」へ化ける形なので、
+        // 1 体ずつの内訳より先に見る。
+        (
+            Grade::Bad,
+            Reason::with(
+                "メッシュに、死んだのに担当を握ったままのプロセスが {n} 件あります — 生きているエージェントは、この担当が解けるまで断られ続けます",
+                vec![("n", f.mesh.stuck().to_string())],
             ),
             Some(Fix::Lease),
         )
@@ -504,7 +855,11 @@ fn enforce_row(f: &Facts) -> Row {
     }
 }
 
-/// 鎖 3 — いま統合したら衝突するか。
+/// 鎖 3 — いま統合したら**一撃で通るか**。
+///
+/// 権威は証明器 ([`Proof`])。居なければ git の突き合わせへ**降格する**が、
+/// そのときは「証明が立った」とは決して言わない (言えるのは
+/// 「いま突き合わせた限り衝突しない」まで)。
 fn merge_row(f: &Facts) -> Row {
     let n = f.trees.to_string();
     let (grade, reason) = if f.trees < 2 {
@@ -515,6 +870,32 @@ fn merge_row(f: &Facts) -> Row {
                 vec![("n", n)],
             ),
         )
+    } else if let Some(p) = &f.proof {
+        if !p.note.is_empty() {
+            (
+                Grade::Warn,
+                Reason::with(
+                    "証明器は判定を下げました: {note}",
+                    vec![("note", p.note.clone())],
+                ),
+            )
+        } else if p.ok {
+            (
+                Grade::Ok,
+                Reason::with(
+                    "{n} 本は、いま統合すれば一撃で通ります (行域が安全帯を挟んで互いに素であることを証明できました)",
+                    vec![("n", n)],
+                ),
+            )
+        } else {
+            (
+                Grade::Bad,
+                Reason::with(
+                    "{k} 組の行域が近すぎるので、いま統合しても一撃では通りません",
+                    vec![("k", p.pairs.to_string())],
+                ),
+            )
+        }
     } else if !f.merge_scanned {
         (
             Grade::Warn,
@@ -551,7 +932,7 @@ fn merge_row(f: &Facts) -> Row {
         (
             Grade::Ok,
             Reason::with(
-                "{n} 本は、いま統合しても衝突しません",
+                "{n} 本は、git で突き合わせた限り衝突しません (証明器がまだ無いので代用しています)",
                 vec![("n", n)],
             ),
         )
@@ -597,7 +978,9 @@ fn blind_row(f: &Facts) -> Row {
         chain: Chain::Blind,
         grade,
         reason,
-        fix: Some(Fix::Audit),
+        // **ログが空ならボタンごと出さない。** 何も書かれていないファイルの
+        // 場所を渡すボタンは、押しても何も起きないのと同じ。
+        fix: (f.audit_bytes > 0).then_some(Fix::Audit),
     }
 }
 
@@ -685,6 +1068,148 @@ pub fn empty_card(avail: egui::Rect) -> egui::Rect {
     let w = (avail.width() * 0.72).clamp(0.0, 420.0).min(avail.width());
     let h = 120.0f32.min(avail.height());
     egui::Rect::from_center_size(avail.center(), egui::vec2(w, h))
+}
+
+// ── 帯 (ミニマップ) — 誰がどの行を持っているかを 1 本に潰す ─────────
+
+/// 1 行だけの域でも、これだけは見えるようにする幅。
+///
+/// **見えない所有は無いのと同じ。** 1 行の域が 0 ピクセルになると、
+/// 「誰も持っていない」という絵になってしまう。
+const BAND_MIN_W: f32 = 3.0;
+
+/// 帯の高さ。
+const BAND_H: f32 = 10.0;
+
+/// 帯へ並べる域 1 件ぶんの入力。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandItem {
+    /// [`Facts::held`] の添字。
+    pub held: usize,
+    /// 行域。`None` はファイル全体 (帯を丸ごと埋める)。
+    pub span: Option<crate::region::Span>,
+    /// 近すぎる相手が居る域か。
+    pub danger: bool,
+}
+
+/// 帯の中の 1 区画。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandSeg {
+    pub rect: egui::Rect,
+    /// [`Facts::held`] の添字。
+    pub held: usize,
+    /// 危険地帯の当事者か (枠を付けて出す)。
+    pub danger: bool,
+}
+
+/// 帯の目盛 = このファイルで見えている最大行 (純粋)。
+///
+/// ファイルの実際の行数は読まない (走査で全ファイルを開くと UI が待つ)。
+/// **見えている域の最大行を 1 とする**ので、帯は「持っている範囲の相対図」
+/// になる。行の絶対位置ではなく**隣との距離**が読めればよいので、これで足りる。
+pub fn band_scale(items: &[BandItem]) -> u32 {
+    let mut max = 1u32;
+    for it in items {
+        let e = match it.span {
+            None => 1,
+            Some(sp) if sp.end == crate::region::Span::EOF => sp.start,
+            Some(sp) => sp.end,
+        };
+        max = max.max(e);
+    }
+    max
+}
+
+/// 同じファイルの行域を 1 本の帯へ並べる (純粋)。
+///
+/// x が行番号に写る。保証するのは 2 つだけで、どちらもテーブルテストで固定する:
+///
+/// * **`avail` から 1 ピクセルもはみ出さない** (どの幅でも見切れない)
+/// * **区画どうしが 1 ピクセルも重ならない** — 重ねると「2 人が同じ行を
+///   持っている」という嘘の絵になる
+///
+/// 幅が尽きたら**描かない**。無理に押し込むと、上の 2 つが同時には守れない。
+pub fn band_layout(avail: egui::Rect, items: &[BandItem], scale: u32) -> Vec<BandSeg> {
+    let scale = scale.max(1);
+    let w = avail.width().max(0.0);
+    let x_of = |line: u32| -> f32 {
+        let t = (line.saturating_sub(1) as f32 / scale as f32).clamp(0.0, 1.0);
+        avail.left() + w * t
+    };
+    // 先頭行の昇順 (同着は添字順) — 出力順を決定的にする。
+    let mut order: Vec<&BandItem> = items.iter().collect();
+    order.sort_by_key(|it| (it.span.map(|sp| sp.start).unwrap_or(1), it.held));
+
+    let mut out = Vec::with_capacity(order.len());
+    let mut cursor = avail.left();
+    for it in order {
+        let (from, to) = match it.span {
+            None => (1, scale),
+            Some(sp) if sp.end == crate::region::Span::EOF => (sp.start, scale),
+            Some(sp) => (sp.start, sp.end),
+        };
+        let left = x_of(from).max(cursor);
+        if left >= avail.right() {
+            continue;
+        }
+        let right = x_of(to.saturating_add(1))
+            .max(left + BAND_MIN_W)
+            .min(avail.right());
+        out.push(BandSeg {
+            rect: egui::Rect::from_x_y_ranges(left..=right, avail.y_range()),
+            held: it.held,
+            danger: it.danger,
+        });
+        cursor = right;
+    }
+    out
+}
+
+/// 1 ファイルぶんの帯。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileBand {
+    pub path: String,
+    /// [`Facts::held`] の添字 (先頭行の昇順・同着は添字順)。
+    pub items: Vec<usize>,
+    /// この帯に含まれる危険地帯の数。
+    pub danger: usize,
+}
+
+/// 帯を出すファイルを選ぶ (純粋・決定的)。
+///
+/// 並びは **危険地帯がある順 → 持ち主が多い順 → パス順**。
+/// 上限を超えたぶんは画面に出さず件数だけ返す — **50 本の帯は情報ではなく壁**で、
+/// 危険地帯が壁の中に埋もれたら、この画面は目的を果たしていない。
+pub fn band_files(held: &[Held], clashes: &[TooClose], cap: usize) -> (Vec<FileBand>, usize) {
+    // パスごとにまとめる (`HashMap` は使わない — 反復順が画面へ漏れる)。
+    let mut groups: Vec<FileBand> = Vec::new();
+    for (i, h) in held.iter().enumerate() {
+        match groups.iter_mut().find(|g| g.path == h.region.path) {
+            Some(g) => g.items.push(i),
+            None => groups.push(FileBand {
+                path: h.region.path.clone(),
+                items: vec![i],
+                danger: 0,
+            }),
+        }
+    }
+    for g in groups.iter_mut() {
+        g.items
+            .sort_by_key(|&i| (held[i].region.span.map(|s| s.start).unwrap_or(1), i));
+        g.danger = clashes
+            .iter()
+            .filter(|c| g.items.contains(&c.lo) || g.items.contains(&c.hi))
+            .count();
+    }
+    groups.sort_by(|a, b| {
+        b.danger
+            .cmp(&a.danger)
+            .then(b.items.len().cmp(&a.items.len()))
+            .then(a.path.cmp(&b.path))
+    });
+    let more = groups.len().saturating_sub(cap);
+    groups.truncate(cap);
+    (groups, more)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -797,24 +1322,145 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-/// 台帳から「持ち主 → 担当パス」を起こし、重なりの組数を数える (純粋)。
+/// メッシュの登録ディレクトリ (`<zaivern>/mesh/<スコープ>/`)。
 ///
-/// 数えるのは**別々の持ち主の間**だけ。同じ持ち主が自分のパターンを
-/// 2 つ重ねて持っていても、衝突は起こらない。
-fn count_overlaps(owned: &[(String, Vec<String>)]) -> usize {
-    let mut n = 0;
-    for i in 0..owned.len() {
-        for j in (i + 1)..owned.len() {
-            for a in &owned[i].1 {
-                for b in &owned[j].1 {
-                    if crate::lease::overlaps(a, b) {
-                        n += 1;
-                    }
-                }
-            }
-        }
+/// **`crate::mesh` へは `use` しない** — 別のブランチで同時に作られている
+/// ので、コンパイル時に繋ぐと相手が居ないだけでこの画面ごとビルドが落ちる。
+/// スコープの鍵は台帳と同じ [`crate::history::workspace_key`] から出すので、
+/// 書き手と読み手は**必ず同じフォルダへ行き着く** (名前を 2 か所に持たない)。
+fn mesh_dir(scope: &Path) -> PathBuf {
+    crate::config::zaivern_dir()
+        .join("mesh")
+        .join(crate::history::workspace_key(scope))
+}
+
+/// メールボックスに溜まっている未読の数 (I/O・上限つき)。
+///
+/// 名前は相手の実装次第なので、よくある 3 つを順に見る。
+fn inbox_count(proc_dir: &Path) -> usize {
+    for name in ["inbox", "mbox", "mailbox"] {
+        let Ok(rd) = std::fs::read_dir(proc_dir.join(name)) else {
+            continue;
+        };
+        return rd
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .take(MESH_INBOX_CAP)
+            .count();
     }
-    n
+    0
+}
+
+/// PID から生存の 3 値を決める (純粋)。
+///
+/// **0 を「死んでいる」へ丸めない** — 登録に PID を書いていないだけの
+/// プロセスまで詰まり扱いすると、唯一の詰まりがその中に埋もれる。
+///
+/// 生存確認を引数で受けるのは、テストが**実在しない PID を作らない**ため。
+/// [`crate::instances::pid_alive`] は `pid as libc::pid_t` で i32 へ落とすので、
+/// 大きな値を渡すと負のプロセスグループへ signal が飛ぶ (CLAUDE.md の
+/// 「`kill` に負の PID」と同じ罠)。
+pub fn liveness(pid: u32, alive: &dyn Fn(u32) -> bool) -> Live {
+    if pid == 0 {
+        Live::Unknown
+    } else if alive(pid) {
+        Live::Yes
+    } else {
+        Live::No
+    }
+}
+
+/// メッシュをファイルシステムから直に読む (I/O)。
+///
+/// 受け付ける形は 2 つ。どちらで来ても読めるようにしておくのは、
+/// **相手の形をこちらが決められない**から:
+///
+/// * `<スコープ>/<名前>.json` — 登録 1 件が 1 ファイル
+/// * `<スコープ>/<名前>/proc.json` ＋ `<名前>/inbox/*` — メールボックス付き
+///
+/// ディレクトリが無ければ [`Mesh::present`] が `false` のまま返る。
+/// **これはエラーではない** (まだ動いていないだけ)。
+fn read_mesh(dir: &Path, alive: &dyn Fn(u32) -> bool) -> Mesh {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Mesh::default();
+    };
+    // 列挙順は OS 依存。**必ず並べ直す** (同じ状態から違う画面を出さない)。
+    let mut names: Vec<(std::ffi::OsString, bool)> = rd
+        .flatten()
+        .map(|e| (e.file_name(), e.path().is_dir()))
+        .collect();
+    names.sort();
+
+    let mut m = Mesh {
+        present: true,
+        ..Mesh::default()
+    };
+    for (name, is_dir) in names {
+        if m.procs.len() >= MESH_PROC_CAP {
+            m.more += 1;
+            continue;
+        }
+        let path = dir.join(&name);
+        let raw = name.to_string_lossy().into_owned();
+        let stem = raw.strip_suffix(".json").unwrap_or(&raw).to_string();
+        let mut proc = if is_dir {
+            let mut p = ["proc.json", "self.json", "reg.json"]
+                .iter()
+                .find_map(|f| std::fs::read_to_string(path.join(f)).ok())
+                .and_then(|t| read_proc(&t))
+                .unwrap_or_default();
+            p.unread += inbox_count(&path);
+            p
+        } else if raw.ends_with(".json") {
+            match std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| read_proc(&t))
+            {
+                Some(p) => p,
+                None => continue,
+            }
+        } else {
+            continue;
+        };
+        if proc.name.is_empty() {
+            proc.name = stem;
+        }
+        proc.live = liveness(proc.pid, alive);
+        m.procs.push(proc);
+    }
+    m.procs.sort_by(|a, b| a.name.cmp(&b.name));
+    m
+}
+
+/// 一撃マージの証明器を叩く (I/O・ワーカースレッドからだけ)。
+///
+/// **`crate::coedit` へは `use` しない。** 同時に別のブランチで作られている
+/// ので、繋ぐなら実行時に繋ぐ — 自分自身の CLI をサブプロセスで起こして
+/// JSON だけを受け取る。まだ無ければ `None` で、鎖 3 は git の突き合わせへ
+/// 綺麗に降格する。
+///
+/// ## 罠: 先に [`crate::cli::is_cli_subcommand`] を必ず見ること
+///
+/// `zai` は**知らない語をワークスペース指定として扱い、GUI を起動する**。
+/// 登録前に `zai coedit …` を起こすと、走査のたびに新しいエディタの窓が
+/// 生える。登録済みかどうかは同じバイナリの中にある
+/// [`crate::cli::is_cli_subcommand`] が唯一の真実源なので、そこで門を閉じる。
+fn probe_proof(tree: &Path, exe: &Path) -> Option<Proof> {
+    if !crate::cli::is_cli_subcommand("coedit") {
+        return None;
+    }
+    let out = crate::procx::hidden_command(exe)
+        .arg("coedit")
+        .arg("proof")
+        .arg("--json")
+        .current_dir(tree)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    read_proof(&crate::textenc::decode_output(&out.stdout))
 }
 
 /// 走査を裏のスレッドへ出す。**UI は 1 ミリ秒も待たない。**
@@ -870,7 +1516,10 @@ fn collect(roots: &crate::lease::Roots) -> (Facts, PathBuf) {
         }
     }
     f.owners = owned.iter().filter(|(_, p)| !p.is_empty()).count();
-    f.overlaps = count_overlaps(&owned);
+    // **ファイル単位ではなく行域で見る。** 同じファイルでも安全帯を挟んで
+    // 離れていれば、2 人が同時に持ってよい。
+    f.held = to_held(&owned);
+    f.clashes = too_close_pairs(&f.held, crate::region::SAFE_BAND);
 
     // ── タブの記録から起こす分 (台帳に居ない = まだ書いていないエージェント) ──
     // 「1 体ずつ出す」が目的なので、書き込む前から名前を出せるようにする。
@@ -912,12 +1561,17 @@ fn collect(roots: &crate::lease::Roots) -> (Facts, PathBuf) {
         a.gate = hit.0;
         a.how = hit.1;
     }
-    agents.sort_by(|x, y| y.gate.grade().cmp(&x.gate.grade()).then(x.name.cmp(&y.name)));
+    agents.sort_by(|x, y| {
+        y.gate
+            .grade()
+            .cmp(&x.gate.grade())
+            .then(x.name.cmp(&y.name))
+    });
     f.agents = agents;
 
     // ── 作業ツリーと統合の見込み ──────────────────────────────────
-    let porcelain =
-        crate::worktree::git_out(&roots.key, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    let porcelain = crate::worktree::git_out(&roots.key, &["worktree", "list", "--porcelain"])
+        .unwrap_or_default();
     let trees = parse_worktrees(&porcelain);
     f.trees = trees.len();
     if trees.len() >= 2 {
@@ -939,11 +1593,19 @@ fn collect(roots: &crate::lease::Roots) -> (Facts, PathBuf) {
         f.alarm_files = report.alarm_files();
         f.merge_note = report.note.clone();
         f.dirty_trees = report.trees.iter().filter(|t| t.dirty).count();
+        // 証明器が居れば、こちらが権威になる (居なければ上の git 判定のまま)。
+        f.proof = probe_proof(&roots.tree, &exe);
     }
     f.merge_scanned = true;
 
     // ── 共有面 ────────────────────────────────────────────────────
-    f.opaque_writes = read_audit_tail(&audit).map(|s| count_opaque(&s)).unwrap_or(0);
+    f.audit_bytes = std::fs::metadata(&audit).map(|m| m.len()).unwrap_or(0);
+    f.opaque_writes = read_audit_tail(&audit)
+        .map(|s| count_opaque(&s))
+        .unwrap_or(0);
+
+    // ── メッシュ (登録ディレクトリを直に読む) ─────────────────────
+    f.mesh = read_mesh(&mesh_dir(&roots.key), alive);
     (f, audit)
 }
 
@@ -977,6 +1639,8 @@ struct PanelState {
     toast: String,
     /// 走っている走査。UI スレッドは**絶対に待たない**。
     pending: Option<Receiver<Scan>>,
+    /// その走査を出した時刻。[`SCAN_GIVEUP`] を超えたら受け口ごと捨てる。
+    pending_since: Option<Instant>,
     last_scan: Option<Instant>,
     last_cost: Option<Duration>,
 }
@@ -998,9 +1662,13 @@ pub fn open_panel() {
 }
 
 /// パネルが要求した副作用 (描画の中では I/O をしない)。
+///
+/// **「調べ直す」は持たない。** 同じ操作へ到達する経路が 3 つ
+/// (⟳ ボタン / パレットから開き直す / 走査間隔での自動更新) あったので、
+/// ボタンを消して 2 つにした。状態を書き換える操作
+/// ([`install_hooks`]) は、自分で `last_scan` を落として即座に取り直す。
 enum Act {
     None,
-    Refresh,
     Fix(Fix),
 }
 
@@ -1044,8 +1712,16 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
                 st.last_scan = Some(Instant::now());
                 st.ready = true;
                 st.pending = None;
+                st.pending_since = None;
             }
-            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => {
+                // **戻らないワーカーを待ち続けない。** `pending` が埋まって
+                // いる間は次の走査を出さないので、諦めないと画面が永久に
+                // 古いままになる。捨てたワーカーは送信に失敗して終わるだけ。
+                if st.pending_since.is_some_and(|t| t.elapsed() >= SCAN_GIVEUP) {
+                    st.pending = None;
+                }
+            }
             Err(TryRecvError::Disconnected) => st.pending = None,
         }
     }
@@ -1055,6 +1731,7 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
             .is_none_or(|t| t.elapsed() >= crate::git::scan_interval(SCAN_BASE, st.last_cost));
         if due {
             st.pending = Some(spawn_scan(st.roots.clone()));
+            st.pending_since = Some(Instant::now());
         }
     }
     // 開いている間だけ、結果を拾うために軽く回す (閉じたら 1 回も要求しない)。
@@ -1064,14 +1741,16 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
 fn apply(app: &mut crate::app::ZaivernApp, ctx: &egui::Context, st: &mut PanelState, act: Act) {
     match act {
         Act::None => {}
-        Act::Refresh => st.last_scan = None,
+        // **「開きました」というトーストは出さない。** パネルが開いたことは
+        // 開いたパネル自身が示している。見えている事実をもう一度書くと、
+        // 本当に見えない結果 (コピー / 設定ファイルの書き換え) が埋もれる。
         Act::Fix(Fix::Lease) => {
             crate::lease::open_panel();
-            st.toast = tr("ファイル所有の一覧を開きました");
+            st.toast.clear();
         }
         Act::Fix(Fix::Radar) => {
             app.toggle_conflict_radar();
-            st.toast = tr("衝突レーダーを開きました");
+            st.toast.clear();
         }
         Act::Fix(Fix::Audit) => {
             let p = st.audit.display().to_string();
@@ -1137,16 +1816,10 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
             ));
         }
         ui.label(
-            egui::RichText::new(crate::lease::ellipsize(
-                &st.roots.key.to_string_lossy(),
-                44,
-            ))
-            .weak(),
+            egui::RichText::new(crate::lease::ellipsize(&st.roots.key.to_string_lossy(), 44))
+                .weak(),
         )
         .on_hover_text(st.roots.key.display().to_string());
-        if ui.button("⟳").on_hover_text(tr("調べ直す")).clicked() {
-            act = Act::Refresh;
-        }
     });
     ui.separator();
 
@@ -1178,7 +1851,11 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
                     act = a;
                 }
                 match r.chain {
-                    Chain::Enforce => agent_rows(ui, &st.facts, &vis),
+                    Chain::Split => band_rows(ui, &st.facts, &vis),
+                    Chain::Enforce => {
+                        agent_rows(ui, &st.facts, &vis);
+                        mesh_rows(ui, &st.facts.mesh, &vis);
+                    }
                     Chain::Blind => blind_rows(ui),
                     _ => {}
                 }
@@ -1277,6 +1954,227 @@ fn agent_rows(ui: &mut egui::Ui, f: &Facts, vis: &egui::Visuals) {
     });
 }
 
+/// 持ち主の色。黄金比で色相を回すので、何人居ても隣の色と混ざらない。
+///
+/// `Visuals` に「N 人ぶんの色」は無いので、明暗で彩度と明度だけ変える。
+/// 色は [`owner_slot`] (名前順) から出すので、**同じ台帳なら誰の画面でも同じ色**。
+fn owner_color(slot: usize, vis: &egui::Visuals) -> egui::Color32 {
+    let hue = (slot as f32 * 0.618_034) % 1.0;
+    let (sat, val) = if vis.dark_mode {
+        (0.55, 0.95)
+    } else {
+        (0.72, 0.72)
+    };
+    egui::Color32::from(egui::ecolor::Hsva::new(hue, sat, val, 1.0))
+}
+
+/// 鎖 1 の内訳 — **誰がどのファイルの何行目を持っているか**を帯で出す。
+///
+/// **空なら見出しごと出さない** (CLAUDE.md「空白は作らない」)。
+fn band_rows(ui: &mut egui::Ui, f: &Facts, vis: &egui::Visuals) {
+    if f.held.is_empty() {
+        return;
+    }
+    let (files, more) = band_files(&f.held, &f.clashes, BAND_FILE_CAP);
+    if files.is_empty() {
+        return;
+    }
+    let owners = owner_list(&f.held);
+    ui.indent("zv-czero-bands", |ui| {
+        for fb in &files {
+            // 可変長リストの中なので、要素の ID を混ぜる (egui 0.29 の ID 規則)。
+            ui.push_id(fb.path.clone(), |ui| file_band(ui, f, fb, &owners, vis));
+        }
+        if more > 0 {
+            ui.label(
+                egui::RichText::new(trf(
+                    "他 {n} ファイル (危険な順に上から出しています)",
+                    &[("n", more.to_string())],
+                ))
+                .weak(),
+            );
+        }
+    });
+}
+
+/// 1 ファイルぶんの帯。
+///
+/// 帯を**横**に寝かせているのは、縦棒にするとパネルの高さを人数ぶん食って
+/// 4 本の鎖が画面外へ出るため (CLAUDE.md「画面が突然変わらない」)。
+/// 読みたいのは行の絶対位置ではなく**隣との距離**なので、横で足りる。
+fn file_band(ui: &mut egui::Ui, f: &Facts, fb: &FileBand, owners: &[String], vis: &egui::Visuals) {
+    let w = ui.available_width();
+
+    // 1 行目: ファイル名 ＋ 誰が居るかの色見本 (狭ければ折り返す)。
+    ui.horizontal_wrapped(|ui| {
+        let max = (w / 9.0).max(10.0) as usize;
+        ui.label(
+            egui::RichText::new(crate::lease::ellipsize(&fb.path, max))
+                .monospace()
+                .weak(),
+        )
+        .on_hover_text(&fb.path);
+        for &i in &fb.items {
+            let h = &f.held[i];
+            ui.label(
+                egui::RichText::new("■").color(owner_color(owner_slot(owners, &h.owner), vis)),
+            )
+            .on_hover_text(held_label(h));
+        }
+    });
+
+    // 2 行目: 帯そのもの。
+    let items: Vec<BandItem> = fb
+        .items
+        .iter()
+        .map(|&i| BandItem {
+            held: i,
+            span: f.held[i].region.span,
+            danger: f.clashes.iter().any(|c| c.lo == i || c.hi == i),
+        })
+        .collect();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, BAND_H), egui::Sense::hover());
+    let paint = ui.painter().clone();
+    // 地 = まだ誰も持っていない行。ここが見えている限り、まだ入れる。
+    paint.rect_filled(rect, 2.0, vis.extreme_bg_color);
+    for seg in band_layout(rect, &items, band_scale(&items)) {
+        let h = &f.held[seg.held];
+        paint.rect_filled(
+            seg.rect,
+            1.0,
+            owner_color(owner_slot(owners, &h.owner), vis),
+        );
+        if seg.danger {
+            paint.rect_stroke(
+                seg.rect,
+                1.0,
+                egui::Stroke::new(1.5_f32, Grade::Bad.color(vis)),
+            );
+        }
+    }
+    let full: Vec<String> = fb.items.iter().map(|&i| held_label(&f.held[i])).collect();
+    resp.on_hover_text(full.join("\n"));
+
+    // 3 行目以降: **危険地帯にだけ**「あと何行」を出す。
+    // 守られている域には 1 行も割かない (安全は帯の絵で足りている)。
+    for c in f
+        .clashes
+        .iter()
+        .filter(|c| fb.items.contains(&c.lo) || fb.items.contains(&c.hi))
+    {
+        let args = vec![
+            ("a", held_label(&f.held[c.lo])),
+            ("b", held_label(&f.held[c.hi])),
+            ("k", c.need.to_string()),
+        ];
+        let msg = if c.need > 0 {
+            trf(
+                "{a} と {b} は近すぎます — あと {k} 行空ければ一撃で通ります",
+                &args,
+            )
+        } else {
+            trf(
+                "{a} と {b} は丸ごと重なっています — 行では解けないので、担当そのものを分けてください",
+                &args,
+            )
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(Grade::Bad.glyph()).color(Grade::Bad.color(vis)));
+            let max = (w / 8.0).max(12.0) as usize;
+            ui.label(egui::RichText::new(crate::lease::ellipsize(&msg, max)).weak())
+                .on_hover_text(&msg);
+        });
+    }
+    ui.add_space(2.0);
+}
+
+/// 1 件の担当を「持ち主 行域」の 1 行にする (表記は [`crate::region::render`])。
+fn held_label(h: &Held) -> String {
+    format!("{} {}", h.owner, crate::region::render(&h.region))
+}
+
+/// 鎖 2 の内訳 — **メッシュの生存**。登録ディレクトリを直に読んだ結果。
+///
+/// **未稼働はエラーではない。** 1 行で正直に出して終わる
+/// (空のセクションで高さを取らない)。
+fn mesh_rows(ui: &mut egui::Ui, m: &Mesh, vis: &egui::Visuals) {
+    ui.indent("zv-czero-mesh", |ui| {
+        if !m.present {
+            ui.label(
+                egui::RichText::new(tr(
+                    "メッシュ未稼働 — プロセス同士の相互認識はまだ動いていません",
+                ))
+                .weak(),
+            )
+            .on_hover_text(tr(
+                "登録ディレクトリが現れると、生きているプロセスと未読がここに出ます",
+            ));
+            return;
+        }
+        if m.procs.is_empty() {
+            ui.label(
+                egui::RichText::new(tr(
+                    "メッシュは動いていますが、登録されたプロセスが 1 つもありません",
+                ))
+                .weak(),
+            );
+            return;
+        }
+        for p in &m.procs {
+            let w = ui.available_width();
+            let col = match p.live {
+                Live::Yes => Grade::Ok.color(vis),
+                Live::No => Grade::Bad.color(vis),
+                Live::Unknown => vis.weak_text_color(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(p.live.glyph()).color(col))
+                    .on_hover_text(tr(match p.live {
+                        Live::Yes => "プロセスは生きています",
+                        Live::No => "プロセスは終了しています",
+                        Live::Unknown => "登録に PID が無いので、生死を確かめられません",
+                    }));
+                ui.label(
+                    egui::RichText::new(crate::lease::ellipsize(
+                        &p.name,
+                        (w / 14.0).max(6.0) as usize,
+                    ))
+                    .monospace(),
+                )
+                .on_hover_text(&p.name);
+                if !p.kind.is_empty() {
+                    ui.label(egui::RichText::new(&p.kind).weak());
+                }
+                if p.unread > 0 {
+                    ui.label(
+                        egui::RichText::new(trf("未読 {n}", &[("n", p.unread.to_string())])).weak(),
+                    )
+                    .on_hover_text(tr(
+                        "メールボックスに溜まったままのメッセージです。相手が読んでいません",
+                    ));
+                }
+                if p.live == Live::No && p.holds > 0 {
+                    ui.label(
+                        egui::RichText::new(trf(
+                            "死んでいるのに担当を {n} 件握ったままです",
+                            &[("n", p.holds.to_string())],
+                        ))
+                        .color(Grade::Bad.color(vis)),
+                    )
+                    .on_hover_text(tr(
+                        "生きているエージェントは、この担当が解けるまで断られ続けます",
+                    ));
+                }
+            });
+        }
+        if m.more > 0 {
+            ui.label(
+                egui::RichText::new(trf("他 {n} プロセス", &[("n", m.more.to_string())])).weak(),
+            );
+        }
+    });
+}
+
 /// 鎖 4 の内訳 — **検出できない穴を全部並べる**。
 fn blind_rows(ui: &mut egui::Ui) {
     ui.indent("zv-czero-blind", |ui| {
@@ -1339,50 +2237,94 @@ mod tests {
         }
     }
 
+    /// 台帳のパターン 1 つぶんの担当。
+    fn held(owner: &str, spec: &str) -> Held {
+        Held {
+            owner: owner.to_string(),
+            region: crate::region::parse(spec).expect("行域の指定"),
+        }
+    }
+
+    /// 危険地帯 1 組ぶん (段の表を作るためだけの素材)。
+    fn clash(i: usize, need: u32) -> TooClose {
+        TooClose {
+            path: "src/a.rs".into(),
+            lo: i * 2,
+            hi: i * 2 + 1,
+            need,
+        }
+    }
+
+    /// メッシュの登録 1 件。
+    fn proc(name: &str, live: Live, holds: usize, unread: usize) -> MeshProc {
+        MeshProc {
+            name: name.to_string(),
+            kind: "agent".into(),
+            pid: if live == Live::Unknown { 0 } else { 4242 },
+            live,
+            holds,
+            unread,
+        }
+    }
+
     /// 「守られている」状態の材料。個々のテストは 1 か所だけ崩す。
     fn guarded() -> Facts {
         Facts {
             ledger_on: true,
             owners: 2,
-            overlaps: 0,
+            // **同じファイルの違う行**を 2 人が持っている = 新しい既定形。
+            held: vec![
+                held("A", "src/app.rs#L1200-1260"),
+                held("B", "src/app.rs#L4000-4100"),
+            ],
+            clashes: Vec::new(),
             tier: crate::lease::Tier::Enforced,
             agents: vec![agent("claude", Gate::Enforced)],
+            mesh: Mesh::default(),
             trees: 1,
             merge_scanned: true,
             alarm_files: 0,
             merge_note: None,
             dirty_trees: 0,
+            proof: None,
             opaque_writes: 0,
             editor_guard: true,
+            audit_bytes: 1,
         }
     }
 
     // ── 鎖 1: 事前分割 ──────────────────────────────────────────────
 
     #[test]
-    fn 事前分割の段は台帳と重なりの表で決まる() {
-        // (ledger_on, owners, overlaps) → (段, 原文の先頭)
+    fn 事前分割の段は台帳と行域の表で決まる() {
+        // (ledger_on, owners, 危険地帯の数) → (段, 原文の先頭)
         let table: &[(bool, usize, usize, Grade, &str)] = &[
             (false, 0, 0, Grade::Warn, "台帳が無効なので"),
             (false, 3, 2, Grade::Warn, "台帳が無効なので"),
-            (true, 2, 1, Grade::Bad, "{n} 組の担当パスが重なっています"),
-            (true, 5, 9, Grade::Bad, "{n} 組の担当パスが重なっています"),
-            (true, 2, 0, Grade::Ok, "{n} 人の担当パスは互いに素です"),
+            (true, 2, 1, Grade::Bad, "{n} 組の行域が安全帯"),
+            (true, 5, 9, Grade::Bad, "{n} 組の行域が安全帯"),
+            (true, 2, 0, Grade::Ok, "{n} 人が持つ {r} 個の行域は"),
             (true, 1, 0, Grade::Ok, "担当は 1 人だけなので"),
-            (true, 0, 0, Grade::Warn, "まだ誰も担当パスを確保していません"),
+            (
+                true,
+                0,
+                0,
+                Grade::Warn,
+                "まだ誰も担当行域を確保していません",
+            ),
         ];
-        for &(ledger_on, owners, overlaps, want, head) in table {
+        for &(ledger_on, owners, clashes, want, head) in table {
             let f = Facts {
                 ledger_on,
                 owners,
-                overlaps,
+                clashes: (0..clashes).map(|i| clash(i, 2)).collect(),
                 ..guarded()
             };
             let r = &judge(&f)[0];
             assert_eq!(r.chain, Chain::Split);
             assert_eq!(
                 r.grade, want,
-                "ledger_on={ledger_on} owners={owners} overlaps={overlaps}"
+                "ledger_on={ledger_on} owners={owners} clashes={clashes}"
             );
             assert!(
                 r.template_starts_with(head),
@@ -1393,12 +2335,146 @@ mod tests {
     }
 
     #[test]
-    fn 重なりがあるときは件数を差し込む() {
+    fn 危険地帯にはあと何行空ければよいかを差し込む() {
         let f = Facts {
-            overlaps: 3,
+            clashes: vec![clash(0, 2), clash(1, 7)],
             ..guarded()
         };
-        assert!(judge(&f)[0].reason.text().contains('3'));
+        let t = judge(&f)[0].reason.text();
+        assert!(t.contains('2'), "組の数が出ていない: {t}");
+        assert!(t.contains('7'), "最大であと何行かが出ていない: {t}");
+    }
+
+    #[test]
+    fn 行では解けない重なりは別の言い方をする() {
+        // ファイル全体を持たれていると、行をずらしても解けない。
+        // 「あと 0 行」と出すのは嘘なので、言い方ごと変える。
+        let f = Facts {
+            clashes: vec![clash(0, 0)],
+            ..guarded()
+        };
+        let r = &judge(&f)[0];
+        assert_eq!(r.grade, Grade::Bad);
+        assert!(
+            r.template_starts_with("{n} 組の担当が丸ごと重なっています"),
+            "原文が想定と違う: {:?}",
+            r.reason.template
+        );
+    }
+
+    // ── 行域そのもの ────────────────────────────────────────────────
+
+    #[test]
+    fn あと何行空ければ安全かを出す() {
+        use crate::region::Span;
+        // 帯の幅は引数なので、定数と切り離して 3 で表を作る。
+        let band = 3u32;
+        let table: &[(Span, Span, u32)] = &[
+            // 間に 3 行あるので、もう動かさなくてよい
+            (Span { start: 1, end: 10 }, Span { start: 14, end: 20 }, 0),
+            // 間が 1 行だけ → あと 2 行
+            (Span { start: 1, end: 10 }, Span { start: 12, end: 20 }, 2),
+            // 隣り合っている → あと 3 行
+            (Span { start: 1, end: 10 }, Span { start: 11, end: 20 }, 3),
+            // 丸ごと食い込んでいる
+            (Span { start: 1, end: 100 }, Span { start: 50, end: 60 }, 54),
+            // 引数の順は関係ない
+            (Span { start: 14, end: 20 }, Span { start: 1, end: 10 }, 0),
+        ];
+        for &(a, b, want) in table {
+            assert_eq!(lines_needed(&a, &b, band), want, "{a:?} / {b:?}");
+            // **0 と「もう安全」が一致していること。** ここがずれると
+            // 「あと 0 行」と出しながら赤いまま、という画面になる。
+            assert_eq!(
+                crate::region::spans_too_close(&a, &b, band),
+                lines_needed(&a, &b, band) > 0,
+                "{a:?} / {b:?}"
+            );
+        }
+        // 末尾までの域は、どれだけずらしても解けない (0 = 行では解けない)。
+        let eof = Span {
+            start: 5,
+            end: Span::EOF,
+        };
+        let far = Span {
+            start: 900,
+            end: 910,
+        };
+        assert_eq!(lines_needed(&eof, &far, band), 0);
+        assert!(crate::region::spans_too_close(&eof, &far, band));
+    }
+
+    #[test]
+    fn 同じファイルでも安全帯を挟めば同時に持てる() {
+        let band = crate::region::SAFE_BAND;
+        // **これが方針転換の芯。** ファイル単位で丸めると両方 ❌ になる。
+        let far = vec![
+            held("A", "src/app.rs#L1200-1260"),
+            held("B", "src/app.rs#L4000-4100"),
+        ];
+        assert!(
+            too_close_pairs(&far, band).is_empty(),
+            "行域なのにファイル単位で丸めている"
+        );
+
+        // 近すぎれば 1 組だけ出る。
+        let near = vec![
+            held("A", "src/app.rs#L1200-1260"),
+            held("B", "src/app.rs#L1262-1300"),
+        ];
+        let got = too_close_pairs(&near, band);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].lo, got[0].hi), (0, 1));
+        assert!(got[0].need > 0, "あと何行かが出ていない");
+
+        // 行の若い方が lo (帯の絵と説明の順を一致させる)。
+        let rev = vec![
+            held("A", "src/app.rs#L1262-1300"),
+            held("B", "src/app.rs#L1200-1260"),
+        ];
+        assert_eq!(too_close_pairs(&rev, band)[0].lo, 1);
+
+        // 同じ持ち主どうしは数えない (書くのは 1 人)。
+        let mine = vec![
+            held("A", "src/app.rs#L1-10"),
+            held("A", "src/app.rs#L11-20"),
+        ];
+        assert!(too_close_pairs(&mine, band).is_empty());
+
+        // 別ファイルなら行が重なっていても関係ない。
+        let other = vec![held("A", "src/a.rs#L1-10"), held("B", "src/b.rs#L1-10")];
+        assert!(too_close_pairs(&other, band).is_empty());
+
+        // 片方がファイル全体 = 行では解けない (need を 0 で出す)。
+        let whole = vec![held("A", "src/app.rs"), held("B", "src/app.rs#L900-910")];
+        let got = too_close_pairs(&whole, band);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].need, 0, "行をずらせば解けると嘘をついている");
+    }
+
+    #[test]
+    fn 壊れた指定はファイル全体として扱う() {
+        // 捨てると「持ち主が居ない」ように見えて、いちばん危ない側へ倒れる。
+        let owned = vec![(
+            "A".to_string(),
+            vec!["src/a.rs#L".to_string(), "src/b.rs#L1-9".to_string()],
+        )];
+        let got = to_held(&owned);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].region.is_whole(), "壊れた指定を捨てている");
+        assert_eq!(got[0].region.path, "src/a.rs#L");
+        assert_eq!(got[1].region.span.map(|s| (s.start, s.end)), Some((1, 9)));
+    }
+
+    #[test]
+    fn 持ち主の色は名前順から決まる() {
+        // `HashMap` の反復順が漏れると、同じ台帳でも人によって色が変わる。
+        let h = vec![held("Z", "a.rs"), held("A", "b.rs"), held("Z", "c.rs")];
+        assert_eq!(owner_list(&h), vec!["A".to_string(), "Z".to_string()]);
+        let owners = owner_list(&h);
+        assert_eq!(owner_slot(&owners, "A"), 0);
+        assert_eq!(owner_slot(&owners, "Z"), 1);
+        assert_eq!(owner_slot(&owners, "居ない"), 0, "知らない名前でも落ちない");
     }
 
     // ── 鎖 2: 実行中の強制 ──────────────────────────────────────────
@@ -1454,11 +2530,7 @@ mod tests {
                 Grade::Warn,
             ),
             // 台帳はあるがフックが 1 つも無い = 勧告どまり。
-            (
-                crate::lease::Tier::Advisory,
-                &[Gate::Enforced],
-                Grade::Warn,
-            ),
+            (crate::lease::Tier::Advisory, &[Gate::Enforced], Grade::Warn),
         ];
         for (tier, gates, want) in table {
             let f = Facts {
@@ -1470,6 +2542,67 @@ mod tests {
             assert_eq!(r.chain, Chain::Enforce);
             assert_eq!(r.grade, *want, "tier={tier:?} gates={gates:?}");
         }
+    }
+
+    #[test]
+    fn 死んだまま担当を握っていると強制の段は守られていない() {
+        // フックが全部入っていても、この 1 件があると生きているエージェントは
+        // 断られ続ける。「止まる」が「進まない」へ化ける唯一の形。
+        let stuck = Facts {
+            mesh: Mesh {
+                present: true,
+                procs: vec![proc("a", Live::No, 3, 0)],
+                more: 0,
+            },
+            ..guarded()
+        };
+        let r = &judge(&stuck)[1];
+        assert_eq!(r.grade, Grade::Bad);
+        assert!(r.reason.text().contains('1'), "件数が出ていない");
+        assert_eq!(r.fix, Some(Fix::Lease));
+
+        // 死んでいても担当を握っていなければ詰まりではない。
+        let gone = Facts {
+            mesh: Mesh {
+                present: true,
+                procs: vec![proc("a", Live::No, 0, 0)],
+                more: 0,
+            },
+            ..guarded()
+        };
+        assert_eq!(judge(&gone)[1].grade, Grade::Ok);
+
+        // PID を書いていないだけの登録を詰まり扱いにしない。
+        let unknown = Facts {
+            mesh: Mesh {
+                present: true,
+                procs: vec![proc("a", Live::Unknown, 5, 0)],
+                more: 0,
+            },
+            ..guarded()
+        };
+        assert_eq!(judge(&unknown)[1].grade, Grade::Ok);
+
+        // **未稼働はエラーではない。** ✅ を妨げない。
+        assert_eq!(judge(&guarded())[1].grade, Grade::Ok);
+    }
+
+    #[test]
+    fn 詰まりは死んでいて担当を握っている一件だけ数える() {
+        // 生存も未読も 1 体ずつ画面に出す (数え上げは持たない — 常に 0 の
+        // バッジを増やさないため)。判定に効くのは詰まりだけ。
+        let m = Mesh {
+            present: true,
+            procs: vec![
+                proc("a", Live::Yes, 2, 4),
+                proc("b", Live::No, 1, 0),
+                proc("c", Live::Unknown, 9, 1),
+                proc("d", Live::No, 0, 0),
+            ],
+            more: 0,
+        };
+        assert_eq!(m.stuck(), 1, "死んでいても担当が無ければ詰まりではない");
+        assert_eq!(Mesh::default().stuck(), 0);
     }
 
     #[test]
@@ -1505,8 +2638,26 @@ mod tests {
     fn 統合の段はツリー数と走査結果の表で決まる() {
         // (trees, scanned, alarm, note, dirty) → (段, 原文の一部, ボタン)
         let table: &[(usize, bool, usize, Option<&str>, usize, Grade, &str, bool)] = &[
-            (0, true, 0, None, 0, Grade::Ok, "統合で突き合わせる相手", false),
-            (1, true, 0, None, 0, Grade::Ok, "統合で突き合わせる相手", false),
+            (
+                0,
+                true,
+                0,
+                None,
+                0,
+                Grade::Ok,
+                "統合で突き合わせる相手",
+                false,
+            ),
+            (
+                1,
+                true,
+                0,
+                None,
+                0,
+                Grade::Ok,
+                "統合で突き合わせる相手",
+                false,
+            ),
             (3, false, 0, None, 0, Grade::Warn, "調べています", true),
             (
                 3,
@@ -1518,7 +2669,16 @@ mod tests {
                 "判定を下げました",
                 true,
             ),
-            (3, true, 4, None, 0, Grade::Bad, "個のファイルが衝突します", true),
+            (
+                3,
+                true,
+                4,
+                None,
+                0,
+                Grade::Bad,
+                "個のファイルが衝突します",
+                true,
+            ),
             (
                 3,
                 true,
@@ -1529,9 +2689,27 @@ mod tests {
                 "未コミットの変更があるので",
                 true,
             ),
-            (2, true, 0, None, 0, Grade::Ok, "統合しても衝突しません", true),
+            (
+                2,
+                true,
+                0,
+                None,
+                0,
+                Grade::Ok,
+                "git で突き合わせた限り衝突しません",
+                true,
+            ),
             // 衝突が出ているなら、未コミットがあっても ❌ を優先する。
-            (2, true, 1, None, 2, Grade::Bad, "個のファイルが衝突します", true),
+            (
+                2,
+                true,
+                1,
+                None,
+                2,
+                Grade::Bad,
+                "個のファイルが衝突します",
+                true,
+            ),
         ];
         for &(trees, merge_scanned, alarm_files, note, dirty_trees, want, part, has_fix) in table {
             let f = Facts {
@@ -1551,6 +2729,115 @@ mod tests {
                 r.reason.template
             );
             assert_eq!(r.fix.is_some(), has_fix, "trees={trees}");
+        }
+    }
+
+    #[test]
+    fn 証明が立てば一撃_立たなければ守られていない() {
+        let base = Facts {
+            trees: 3,
+            ..guarded()
+        };
+        // 証明が立った
+        let f = Facts {
+            proof: Some(Proof {
+                ok: true,
+                pairs: 0,
+                note: String::new(),
+            }),
+            ..base.clone()
+        };
+        let r = &judge(&f)[2];
+        assert_eq!(r.grade, Grade::Ok);
+        assert!(r.reason.template.contains("一撃で通ります"));
+
+        // 立たなかった → 近すぎる組の数を証拠として出す
+        let f = Facts {
+            proof: Some(Proof {
+                ok: false,
+                pairs: 4,
+                note: String::new(),
+            }),
+            ..base.clone()
+        };
+        let r = &judge(&f)[2];
+        assert_eq!(r.grade, Grade::Bad);
+        assert!(r.reason.text().contains('4'));
+
+        // 証明器が自分で判定を下げたら、こちらも言い切らない
+        let f = Facts {
+            proof: Some(Proof {
+                ok: true,
+                pairs: 0,
+                note: "錨を取り直せません".into(),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(judge(&f)[2].grade, Grade::Warn);
+
+        // **証明器がまだ無いときは git へ降格し、「証明」とは決して言わない。**
+        let r = &judge(&base)[2];
+        assert_eq!(r.grade, Grade::Ok);
+        assert!(
+            r.reason.template.contains("代用"),
+            "降格していない: {:?}",
+            r.reason.template
+        );
+        assert!(!r.reason.template.contains("証明できました"));
+    }
+
+    #[test]
+    fn 証明器の出力を読む() {
+        // 鍵の名前は相手の実装次第なので、別名を全部受ける。
+        assert_eq!(
+            read_proof(r#"{"ok":true}"#),
+            Some(Proof {
+                ok: true,
+                pairs: 0,
+                note: String::new()
+            })
+        );
+        assert_eq!(
+            read_proof(r#"{"proven":false,"conflicts":[[0,1],[2,3]]}"#),
+            Some(Proof {
+                ok: false,
+                pairs: 2,
+                note: String::new()
+            })
+        );
+        assert_eq!(
+            read_proof(r#" {"oneshot":true,"pairs":0,"note":"抜き"} "#).map(|p| p.note),
+            Some("抜き".to_string())
+        );
+        // **読めなかったものを「証明できた」へ丸めない。**
+        assert_eq!(read_proof(""), None);
+        assert_eq!(read_proof("not json"), None);
+        assert_eq!(read_proof("[]"), None);
+        assert_eq!(read_proof(r#"{"pairs":0}"#), None, "ok が無いのに証明扱い");
+    }
+
+    #[test]
+    fn 証明器はサブコマンドに登録されるまで起こさない() {
+        // `zai` は**知らない語をワークスペース指定として扱い、GUI を起動する**。
+        // 門を外すと、走査のたびに新しいエディタの窓が生える。
+        let src = include_str!("czero.rs").replace("\r\n", "\n");
+        let body = src
+            .split_once("fn probe_proof(")
+            .expect("probe_proof が見つからない")
+            .1;
+        let head: String = body.lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            head.contains("is_cli_subcommand") && head.contains("return None"),
+            "サブコマンド登録の門が無い:\n{head}"
+        );
+        if !crate::cli::is_cli_subcommand("coedit") {
+            let dir = crate::test_util::unique_temp_dir("zv-czero", "proof");
+            assert_eq!(
+                probe_proof(&dir, &PathBuf::from("zai")),
+                None,
+                "登録前なのに起こした"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -1586,6 +2873,22 @@ mod tests {
     }
 
     #[test]
+    fn ログが空ならログの場所ボタンを出さない() {
+        // 何も書かれていないファイルの場所を渡すボタンは、
+        // 押しても何も起きないのと同じ (常に 0 のバッジと同類)。
+        let f = Facts {
+            audit_bytes: 0,
+            ..guarded()
+        };
+        assert_eq!(judge(&f)[3].fix, None);
+        let f = Facts {
+            audit_bytes: 12,
+            ..guarded()
+        };
+        assert_eq!(judge(&f)[3].fix, Some(Fix::Audit));
+    }
+
+    #[test]
     fn 穴の一覧は空でも重複でもない() {
         assert!(!BLIND_SPOTS.is_empty());
         let mut seen: Vec<&str> = Vec::new();
@@ -1610,7 +2913,7 @@ mod tests {
 
         // 1 本でも ❌ があれば全体は ❌。
         let f = Facts {
-            overlaps: 1,
+            clashes: vec![clash(0, 2)],
             ..guarded()
         };
         assert_eq!(weakest(&judge(&f)), Grade::Bad);
@@ -1679,7 +2982,7 @@ mod tests {
             Facts::default(),
             guarded(),
             Facts {
-                overlaps: 2,
+                clashes: vec![clash(0, 5), clash(1, 2)],
                 tier: crate::lease::Tier::Advisory,
                 agents: vec![agent("codex", Gate::Unapproved)],
                 trees: 4,
@@ -1687,6 +2990,32 @@ mod tests {
                 merge_note: Some("x".into()),
                 dirty_trees: 1,
                 opaque_writes: 3,
+                ..guarded()
+            },
+            // 行では解けない重なり ＋ メッシュの詰まり ＋ 証明が立たない
+            Facts {
+                clashes: vec![clash(0, 0)],
+                mesh: Mesh {
+                    present: true,
+                    procs: vec![proc("a", Live::No, 2, 3)],
+                    more: 1,
+                },
+                trees: 3,
+                proof: Some(Proof {
+                    ok: false,
+                    pairs: 2,
+                    note: String::new(),
+                }),
+                ..guarded()
+            },
+            // 証明器が自分で判定を下げた形
+            Facts {
+                trees: 3,
+                proof: Some(Proof {
+                    ok: true,
+                    pairs: 0,
+                    note: "錨".into(),
+                }),
                 ..guarded()
             },
         ];
@@ -1740,25 +3069,6 @@ mod tests {
     }
 
     #[test]
-    fn 重なりは別々の持ち主の間だけ数える() {
-        // 同じ持ち主が自分のパターンを重ねて持っていても衝突は起きない。
-        let one = vec![("A".to_string(), vec!["src/**".into(), "src/a.rs".into()])];
-        assert_eq!(count_overlaps(&one), 0);
-
-        let two = vec![
-            ("A".to_string(), vec!["src/auth/**".into()]),
-            ("B".to_string(), vec!["src/ui/**".into()]),
-        ];
-        assert_eq!(count_overlaps(&two), 0);
-
-        let clash = vec![
-            ("A".to_string(), vec!["src/**".into()]),
-            ("B".to_string(), vec!["src/ui/x.rs".into()]),
-        ];
-        assert_eq!(count_overlaps(&clash), 1);
-    }
-
-    #[test]
     fn 監査ログは上限つきで読む() {
         // 実 `~/.zaivern` に触れない。
         let dir = crate::test_util::unique_temp_dir("zv-czero", "audit");
@@ -1802,6 +3112,7 @@ mod tests {
         let sizes = [
             (900.0, 700.0),
             (1200.0, 300.0),
+            (400.0, 900.0),
             (640.0, 480.0),
             (459.0, 200.0),
             (300.0, 120.0),
@@ -1872,6 +3183,277 @@ mod tests {
         }
     }
 
+    #[test]
+    fn 帯はどの幅でも領域に収まり重ならない() {
+        use crate::region::Span;
+        let sets: &[&[BandItem]] = &[
+            &[],
+            // ファイル全体を 1 人が持つ
+            &[BandItem {
+                held: 0,
+                span: None,
+                danger: false,
+            }],
+            // 離れた 2 つ (同じファイルを 2 人で持てている形)
+            &[
+                BandItem {
+                    held: 0,
+                    span: Some(Span {
+                        start: 1200,
+                        end: 1260,
+                    }),
+                    danger: false,
+                },
+                BandItem {
+                    held: 1,
+                    span: Some(Span {
+                        start: 4000,
+                        end: 4100,
+                    }),
+                    danger: false,
+                },
+            ],
+            // 1 行だけの域が並ぶ (最小幅の確保と「重ならない」が両立するか)
+            &[
+                BandItem {
+                    held: 0,
+                    span: Some(Span::line(1)),
+                    danger: true,
+                },
+                BandItem {
+                    held: 1,
+                    span: Some(Span::line(2)),
+                    danger: true,
+                },
+                BandItem {
+                    held: 2,
+                    span: Some(Span::line(3)),
+                    danger: false,
+                },
+                BandItem {
+                    held: 3,
+                    span: Some(Span::line(4)),
+                    danger: false,
+                },
+                BandItem {
+                    held: 4,
+                    span: Some(Span::line(5)),
+                    danger: false,
+                },
+            ],
+            // 末尾まで ＋ その中に入れ子
+            &[
+                BandItem {
+                    held: 0,
+                    span: Some(Span {
+                        start: 10,
+                        end: Span::EOF,
+                    }),
+                    danger: true,
+                },
+                BandItem {
+                    held: 1,
+                    span: Some(Span { start: 12, end: 14 }),
+                    danger: true,
+                },
+            ],
+        ];
+        // 極端な寸法 (900×700 / 1200×300 / 400×900 は CLAUDE.md の指定)。
+        for (w, h) in [
+            (900.0, 700.0),
+            (1200.0, 300.0),
+            (400.0, 900.0),
+            (160.0, 60.0),
+            (24.0, 20.0),
+            (2.0, 10.0),
+            (0.0, 0.0),
+        ] {
+            for items in sets {
+                let avail =
+                    egui::Rect::from_min_size(egui::pos2(12.0, 34.0), egui::vec2(w, BAND_H.min(h)));
+                let segs = band_layout(avail, items, band_scale(items));
+                for (i, seg) in segs.iter().enumerate() {
+                    assert!(seg.rect.width() >= 0.0, "負の幅 w={w} i={i}");
+                    assert!(
+                        seg.rect.left() >= avail.left() - 0.01
+                            && seg.rect.right() <= avail.right() + 0.01,
+                        "領域からはみ出した w={w} i={i}: {:?} ⊄ {avail:?}",
+                        seg.rect
+                    );
+                }
+                for i in 1..segs.len() {
+                    assert!(
+                        segs[i].rect.left() >= segs[i - 1].rect.right() - 0.01,
+                        "区画が重なった (同じ行を 2 人が持っている絵) w={w} i={i}: {:?} / {:?}",
+                        segs[i - 1].rect,
+                        segs[i].rect
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn 一行だけの域も見える幅を持つ() {
+        // **見えない所有は無いのと同じ。** 1 行の域が 0 ピクセルになると
+        // 「誰も持っていない」という絵になる。
+        use crate::region::Span;
+        let items = [
+            BandItem {
+                held: 0,
+                span: Some(Span::line(1)),
+                danger: false,
+            },
+            BandItem {
+                held: 1,
+                span: Some(Span {
+                    start: 500,
+                    end: 600,
+                }),
+                danger: false,
+            },
+        ];
+        let avail = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, BAND_H));
+        let segs = band_layout(avail, &items, band_scale(&items));
+        assert_eq!(segs.len(), 2);
+        assert!(
+            segs[0].rect.width() >= BAND_MIN_W - 0.01,
+            "1 行の域が消えた: {:?}",
+            segs[0].rect
+        );
+    }
+
+    #[test]
+    fn 帯は危険な順に上限まで出す() {
+        // 危険地帯が壁の下に埋もれたら、この画面は目的を果たしていない。
+        let mut h = Vec::new();
+        for i in 0..10 {
+            h.push(held("A", &format!("src/f{i:02}.rs#L1-10")));
+        }
+        h.push(held("A", "src/zz.rs#L1-10"));
+        h.push(held("B", "src/zz.rs#L11-20"));
+        let clashes = too_close_pairs(&h, crate::region::SAFE_BAND);
+        assert_eq!(clashes.len(), 1);
+
+        let (files, more) = band_files(&h, &clashes, 3);
+        assert_eq!(files.len(), 3);
+        assert_eq!(more, 8, "上限を超えたぶんは件数だけ出す");
+        assert_eq!(files[0].path, "src/zz.rs", "危険地帯が先頭に来ていない");
+        assert_eq!(files[0].danger, 1);
+        assert_eq!(files[0].items, vec![10, 11], "先頭行の昇順で並べる");
+        // 残りはパス順 (同じ入力からは必ず同じ並び)。
+        assert_eq!(files[1].path, "src/f00.rs");
+        assert_eq!(files[2].path, "src/f01.rs");
+        assert_eq!(band_files(&h, &clashes, 3).0, files);
+        // 上限に届かなければ余りは 0。
+        assert_eq!(band_files(&h, &clashes, 99).1, 0);
+        assert!(band_files(&[], &[], 8).0.is_empty());
+    }
+
+    // ── メッシュの読み取り ──────────────────────────────────────────
+
+    #[test]
+    fn 判らない生存を死んだ扱いにしない() {
+        assert_eq!(liveness(0, &|_: u32| true), Live::Unknown);
+        assert_eq!(liveness(9, &|_: u32| true), Live::Yes);
+        assert_eq!(liveness(9, &|_: u32| false), Live::No);
+        assert_eq!(Live::default(), Live::Unknown);
+        for l in [Live::Yes, Live::No, Live::Unknown] {
+            assert!(!l.glyph().is_empty(), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn メッシュの登録は別名でも読める() {
+        // 相手の鍵名をこちらが決められないので、よくある別名を全部見る。
+        let p = read_proc(
+            r#"{"id":"claude-1","role":"agent","process_id":77,"owns":["a","b"],"pending":3}"#,
+        )
+        .expect("読めない");
+        assert_eq!(p.name, "claude-1");
+        assert_eq!(p.kind, "agent");
+        assert_eq!(p.pid, 77);
+        assert_eq!(p.holds, 2);
+        assert_eq!(p.unread, 3);
+        // 件数は数でも一覧でも受ける。
+        assert_eq!(
+            read_proc(r#"{"name":"x","holds":5}"#).map(|p| p.holds),
+            Some(5)
+        );
+        // 壊れていても画面ごと壊さない。
+        assert_eq!(read_proc("[]"), None);
+        assert_eq!(read_proc("こわれ"), None);
+        assert_eq!(read_proc("{}").map(|p| p.live), Some(Live::Unknown));
+    }
+
+    #[test]
+    fn メッシュは登録ディレクトリから直に読む() {
+        // 実 `~/.zaivern` には触れない。
+        let dir = crate::test_util::unique_temp_dir("zv-czero", "mesh");
+        // **未稼働はエラーではない** (ディレクトリが無いだけ)。
+        assert_eq!(
+            read_mesh(&dir.join("no-such"), &|_: u32| true),
+            Mesh::default()
+        );
+        assert!(!Mesh::default().present);
+
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 形 1: 1 ファイル 1 登録 (PID 無し)
+        std::fs::write(dir.join("editor.json"), r#"{"kind":"editor"}"#).expect("write");
+        // 形 2: フォルダ ＋ メールボックス (名前は登録に無い)
+        let a = dir.join("agent-a");
+        std::fs::create_dir_all(a.join("inbox")).expect("mkdir");
+        std::fs::write(
+            a.join("proc.json"),
+            r#"{"kind":"agent","pid":4242,"regions":["src/a.rs#L1-9"]}"#,
+        )
+        .expect("write");
+        for i in 0..2 {
+            std::fs::write(a.join("inbox").join(format!("{i}.json")), "{}").expect("write");
+        }
+        // 読めないもの / 関係ないものは黙って飛ばす。
+        std::fs::write(dir.join("broken.json"), "not json").expect("write");
+        std::fs::write(dir.join("notes.txt"), "x").expect("write");
+
+        let m = read_mesh(&dir, &|_: u32| false);
+        assert!(m.present);
+        assert_eq!(m.procs.len(), 2, "読めない登録で画面を壊している");
+        assert_eq!(
+            m.procs[0].name, "agent-a",
+            "名前が無ければフォルダ名から起こす"
+        );
+        assert_eq!(m.procs[0].unread, 2, "メールボックスを数えていない");
+        assert_eq!(m.procs[0].holds, 1);
+        assert_eq!(m.procs[0].live, Live::No);
+        assert_eq!(m.procs[1].name, "editor");
+        assert_eq!(
+            m.procs[1].live,
+            Live::Unknown,
+            "PID が無いのを死んだ扱いにしている"
+        );
+        assert_eq!(m.stuck(), 1);
+        // 生きていれば詰まりではない。
+        assert_eq!(read_mesh(&dir, &|_: u32| true).stuck(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn メッシュの場所は台帳と同じ鍵から出す() {
+        // 書き手と読み手が別の鍵を持つと、静かに空の画面になる。
+        let dir = crate::test_util::unique_temp_dir("zv-czero", "scope");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let got = mesh_dir(&dir);
+        assert!(
+            got.ends_with(crate::history::workspace_key(&dir)),
+            "鍵が台帳と違う: {got:?}"
+        );
+        assert_eq!(
+            got.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("mesh"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── 登録 ────────────────────────────────────────────────────────
 
     #[test]
@@ -1903,6 +3485,34 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[test]
+    fn 新しい内訳は必ず描画から呼ばれている() {
+        // 「作ったのに繋いでいない」を構造で防ぐ (`never used` の代わり —
+        // 描画から呼ばれていない内訳は、UI から到達できないので未完成)。
+        let src = include_str!("czero.rs").replace("\r\n", "\n");
+        let after = src
+            .split_once("fn body(ui: &mut egui::Ui")
+            .expect("body が見つからない")
+            .1;
+        // 自分より後ろの関数やテスト本文を拾わないよう、次の関数で切る。
+        let inside = after
+            .split_once("fn headline(")
+            .map(|(a, _)| a)
+            .unwrap_or(after);
+        for f in ["band_rows(", "mesh_rows(", "agent_rows(", "blind_rows("] {
+            assert!(inside.contains(f), "描画から呼ばれていない: {f}");
+        }
+        // 消したものが黙って戻っていないこと (`concat!` は自己一致よけ)。
+        assert!(
+            !src.contains(concat!("Act::", "Refresh")),
+            "⟳ ボタンが戻っている (到達経路が 3 つに戻る)"
+        );
+        assert!(
+            !src.contains(concat!("fn count", "_overlaps")),
+            "ファイル単位の重なり計算が戻っている (行域と 2 実装になる)"
+        );
     }
 
     #[test]
