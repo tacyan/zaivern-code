@@ -562,7 +562,11 @@ pub fn resolve(r: &Region, text: &str) -> Option<Span> {
 /// 先頭候補と末尾候補の組を、`(先頭のズレ, 行数のズレ)` の辞書順で選ぶ。
 /// 最良が 2 つ以上あれば「曖昧」として `None`。
 fn best_pair(lines: &[&str], anchor: &Anchor, pref: usize) -> Option<(usize, usize)> {
-    let want_len = (anchor.len.max(1) as usize).min(lines.len().max(1));
+    // **ファイルの行数で頭打ちにしない。** 確保した域が現在の EOF を超えて
+    // いるのは「これから書く場所を予約した」正しい状態で、そこを縮めると
+    // 予約が消えて別人が同じ場所を取れてしまう (実測: 1 行のファイルに
+    // `#L1-10` を確保した直後、`#L5-15` が通った)。
+    let want_len = anchor.len.max(1) as usize;
     let radius = want_len.max(ANCHOR_MIN_RADIUS).min(ANCHOR_MAX_RADIUS);
 
     let mut cands: Vec<usize> = lines
@@ -581,8 +585,13 @@ fn best_pair(lines: &[&str], anchor: &Anchor, pref: usize) -> Option<(usize, usi
     let mut best: Option<((usize, usize), (usize, usize))> = None;
     let mut tied = false;
     for &h in &cands {
-        let t = if anchor.tail.is_empty() || want_len == 1 {
+        let t = if want_len == 1 {
             h
+        } else if anchor.tail.is_empty() {
+            // 末尾の錨が空 = 確保した時点で末尾が EOF を超えていた
+            // (= これから書く場所の予約)。**記録された行数を保って伸ばす。**
+            // ここで `h` へ畳むと予約が消える。
+            h + want_len - 1
         } else {
             match nearest_unique(lines, &anchor.tail, h + want_len - 1, radius) {
                 Some(t) if t >= h => t,
@@ -1619,6 +1628,43 @@ mod tests {
             span: Some(span),
             anchor: capture_anchor(text, &span),
         }
+    }
+
+    /// **EOF を超える確保は「これから書く場所の予約」なので縮めない。**
+    ///
+    /// 実測で見つかった回帰: 1 行しかないファイルへ `#L1-10` を確保した直後に
+    /// `#L5-15` が通ってしまい、**重なる 2 つの担当が同時に載った**。
+    /// 原因は (1) 記録した行数をファイルの行数で頭打ちにしていたこと、
+    /// (2) 末尾の錨が空のとき域を先頭 1 行へ畳んでいたこと の 2 つ。
+    #[test]
+    fn eofを超える予約は縮まない() {
+        let text = "x\n";
+        let span = Span { start: 1, end: 10 };
+        let r = Region {
+            path: "a.rs".into(),
+            span: Some(span),
+            anchor: capture_anchor(text, &span),
+        };
+        assert_eq!(r.anchor.len, 10, "予約した行数を記録していない");
+        assert!(r.anchor.tail.is_empty(), "EOF の先に末尾行は無い");
+        assert_eq!(
+            resolve(&r, text),
+            Some(Span { start: 1, end: 10 }),
+            "予約が縮んだ"
+        );
+        // 重なる要求は必ず衝突と判定される
+        let other = parse("a.rs#L5-15").expect("解釈");
+        let live = Region {
+            span: resolve(&r, text),
+            ..r.clone()
+        };
+        assert!(
+            conflicts(&live, &other, SAFE_BAND),
+            "重なる 2 つの担当が同時に載る"
+        );
+        // 予約の先へ足された後も、同じ場所を指し続ける
+        let grown = "x\ny\nz\n";
+        assert_eq!(resolve(&r, grown), Some(Span { start: 1, end: 10 }));
     }
 
     #[test]
