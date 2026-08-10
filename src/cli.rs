@@ -1727,7 +1727,10 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                 .map(|n| format!("注意: {n}"))
                 .collect();
             // 台帳はできてもフックが無ければ**他プロセスは止まらない**。
-            let tier_note = uninitialized_note(&roots, &store);
+            // **確保した後に調べる** — `claim` は台帳ファイルを新規作成して
+            // 暗黙に有効化するので、先に調べると「まだ無効」と読めてしまい
+            // 肝心の未初期化のときだけ黙る (実バイナリで踏んだ)。
+            let tier_note = || uninitialized_note(&roots, &store);
             // **`with_store_retry` を使う。** 素の `with_store` は台帳ロックが
             // 取れなかった時点で即座に諦めるので、高並列だと「他人が持っている」
             // でも「取れた」でもない *busy* が大量に出る。実測 (64 体が同じ
@@ -1765,7 +1768,7 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                                 .map(|g| format!("  ずらしました: {} → {}", g.asked, g.spec)),
                         );
                         lines.extend(notes);
-                        lines.extend(tier_note);
+                        lines.extend(tier_note());
                         // **最後の行は必ず `granted <仕様>`。** 機械が読む面なので
                         // 装飾を付けない (人向けの説明は上の行に出し切る)。
                         lines.extend(gs.iter().map(|g| format!("granted {}", g.spec)));
@@ -1797,7 +1800,7 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                 lease::Claim::Granted(n) => {
                     let mut lines = vec![format!("{n} 件を確保しました")];
                     lines.extend(notes);
-                    lines.extend(tier_note);
+                    lines.extend(tier_note());
                     Ok(lines.join("\n"))
                 }
                 lease::Claim::Refused { owner, pattern, .. } => {
