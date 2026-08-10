@@ -225,12 +225,56 @@ pub fn workspace_key(cwd: &Path) -> String {
 /// **入力 → 出力の対応をテストで固定する**ため。どの OS のどのマシンでも
 /// 同じ値になることを、実在するフォルダ無しで確かめられる。
 fn key_of_normalized(text: &str, raw: Option<&[u8]>) -> String {
-    let mut h = fnv1a64(text.as_bytes());
+    format!("{:016x}", fnv1a64(&normalized_bytes(text, raw)))
+}
+
+/// 正規化済み文字列 (と、あれば生バイト) → ハッシュへ流す 1 本のバイト列。
+///
+/// 区切りの 0 バイトを挟むのは、文字列側と生バイト側の境界をずらした別の入力が
+/// 同じ列にならないようにするため。
+///
+/// **集合版 ([`workspace_set_key`]) もこの列を要素として使う。**
+/// 「1 つのワークスペースをどうバイト列にするか」の決定はここ 1 箇所しかない。
+fn normalized_bytes(text: &str, raw: Option<&[u8]>) -> Vec<u8> {
+    let mut v = text.as_bytes().to_vec();
     if let Some(raw) = raw {
-        // 区切りの 0 バイトを挟むのは、文字列側と生バイト側の境界を
-        // ずらした別の入力が同じ列にならないようにするため。
-        h = fnv1a64_seeded(h, &[0]);
-        h = fnv1a64_seeded(h, raw);
+        v.push(0);
+        v.extend_from_slice(raw);
+    }
+    v
+}
+
+/// ルート**集合** → 16 桁 hex。マルチルートのセッション / Hot Exit の置き場を決める。
+///
+/// 単一の [`workspace_key`] と同じ正規化・同じ FNV-1a を通すが、**畳み方が違うので
+/// 1 要素の集合と単一キーは別の値になる**。これは意図した設計で、両者は別のものに
+/// 名前を付けている (「このフォルダの台帳」と「このルート集合のセッション」) 。
+/// わざと一致させると、`sessions/` の中で旧形式 (単一パス) のファイルと
+/// 新形式 (集合) のファイルが同じ名前を取り合う。
+///
+/// 満たすべき性質は 2 つ:
+///
+/// 1. **順序に依らない。** 並べ替えてから畳むので `[A, B]` と `[B, A]` は同じ。
+///    重複も畳む (`[A, A]` は `[A]`)。
+/// 2. **要素に何が入っていても境界が一意に決まる。** 区切り文字で繋ぐと、
+///    その文字を含むパス名 (unix では改行すら合法) で別の集合が同じ列になる。
+///    そこで**長さを 10 進で前置する** (netstring と同じ) 。長さの後ろの `:` まで
+///    含めて数えれば、どこで要素が切れるかが構造的に決まるので衝突しない。
+pub(crate) fn workspace_set_key(roots: &[PathBuf]) -> String {
+    let mut items: Vec<Vec<u8>> = roots
+        .iter()
+        .map(|p| {
+            let (text, raw) = normalized_workspace(p);
+            normalized_bytes(&text, raw.as_deref())
+        })
+        .collect();
+    items.sort();
+    items.dedup();
+    let mut h = FNV_OFFSET;
+    for it in &items {
+        h = fnv1a64_seeded(h, it.len().to_string().as_bytes());
+        h = fnv1a64_seeded(h, b":");
+        h = fnv1a64_seeded(h, it);
     }
     format!("{h:016x}")
 }
@@ -385,12 +429,56 @@ fn raw_path_bytes(p: &Path) -> Vec<u8> {
 /// この関数が過去の値を再現できるのは「データを書いた版と同じ `DefaultHasher` を
 /// 持つ rustc でビルドされている間」だけである。std は版をまたぐ安定性を保証して
 /// いないので、**移行を先送りするほど引き取れる保証が薄くなる**。
-/// だから [`adopt_legacy_keys_in`] を今入れてある。
+/// だから [`adopt_keys_in`] による引き取りを今入れてある。
 pub(crate) fn legacy_workspace_key(cwd: &Path) -> String {
     let resolved = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut hasher = DefaultHasher::new();
     resolved.to_string_lossy().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// 旧キーその 2 (`session.rs` の `workspace_hash` / `marks.rs` の私的複製)。
+///
+/// **`legacy_workspace_key` と混同しないこと。** あちらは `canonicalize` した
+/// パスの**文字列**を、こちらは **`Path` そのもの**を `DefaultHasher` へ流す。
+/// `Path: Hash` は構成要素ごとに書き込むので**同じフォルダでも別の値**になる
+/// (実測: `7d04257970e725eb` と `be6ef641440bbada`)。
+/// `~/.zaivern/term_logs/<key>/` と `~/.zaivern/bookmarks/<key>.toml` がこの値だった。
+pub(crate) fn legacy_path_key(cwd: &Path) -> String {
+    let resolved = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    resolved.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 旧キーその 3 (`session.rs` の `roots_hash`)。ルート集合版。
+///
+/// `canonicalize` → 文字列化 → ソート → 重複除去 した `Vec<String>` を
+/// `DefaultHasher` へ流していた。`~/.zaivern/sessions/<key>.toml` と
+/// `~/.zaivern/hotexit/<key>/` がこの値。**新しく書くことは無い。**
+pub(crate) fn legacy_roots_key(roots: &[PathBuf]) -> String {
+    let mut keys: Vec<String> = roots
+        .iter()
+        .map(|p| {
+            p.canonicalize()
+                .unwrap_or_else(|_| p.to_path_buf())
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let mut hasher = DefaultHasher::new();
+    keys.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// あるフォルダについて過去に使われていたキーの全部。
+///
+/// **層ごとに旧キーが違った**ので、引き取りは 1 本のリストで受ける。
+/// ここに足せば、キーで場所を決める全ての層がまとめて移行される。
+pub(crate) fn legacy_keys_of(cwd: &Path) -> Vec<String> {
+    vec![legacy_workspace_key(cwd), legacy_path_key(cwd)]
 }
 
 // ── 旧キーの引き取り ────────────────────────────────────────
@@ -419,7 +507,13 @@ fn looks_like_key(name: &str) -> bool {
     name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// 旧キーで置かれた台帳・履歴・ログを新キーの名前へ引き取る。
+/// 旧キーで置かれた台帳・履歴・生ログ・印を、新キーの名前へ引き取る。
+///
+/// 層ごとに旧キーが違ったので (`str` を叩いた版 / `Path` を叩いた版 /
+/// ルート集合版) **旧キーの集まり**で受け、まとめて 1 回の走査で引き取る。
+/// 走査は名前しか見ないので、置き場の形 (`<key>.json` / `<key>/` /
+/// `<agent>/<key>.jsonl`) を知らずに済み、**将来キーで場所を決める層が
+/// 増えても自動的に面倒を見る**。
 ///
 /// `zdir` を引数で受けるのは、テストが実 `~/.zaivern` に一切触らずに
 /// 検証できるようにするため (このモジュールの `*_in()` 系と同じ流儀)。
@@ -433,25 +527,28 @@ fn looks_like_key(name: &str) -> bool {
 ///   誰かがそのファイルを開いている間は改名できないので、黙って諦めて
 ///   次の起動でやり直す。ここで騒ぐと「いちばん使っているワークスペースだけ
 ///   移行できない」形で表に出る
-/// * 旧キー = 新キー (理論上ありえないが) なら即座に何もせず返る
+/// * 旧キー = 新キー (理論上ありえないが) は先に落とす
 ///
 /// 戻り値は引き取った先のパス。テストと、将来ログに出したいときのため。
-pub(crate) fn adopt_legacy_keys_in(zdir: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let old = legacy_workspace_key(cwd);
-    let new = workspace_key(cwd);
+pub(crate) fn adopt_keys_in(zdir: &Path, olds: &[String], new: &str) -> Vec<PathBuf> {
+    let olds: Vec<&str> = olds
+        .iter()
+        .map(String::as_str)
+        .filter(|o| *o != new)
+        .collect();
     let mut moved = Vec::new();
-    if old == new {
+    if olds.is_empty() {
         return moved;
     }
     let mut budget = LEGACY_SCAN_MAX_ENTRIES;
-    adopt_scan(zdir, LEGACY_SCAN_DEPTH, &old, &new, &mut moved, &mut budget);
+    adopt_scan(zdir, LEGACY_SCAN_DEPTH, &olds, new, &mut moved, &mut budget);
     moved
 }
 
 fn adopt_scan(
     dir: &Path,
     depth: usize,
-    old: &str,
+    olds: &[&str],
     new: &str,
     moved: &mut Vec<PathBuf>,
     budget: &mut usize,
@@ -477,7 +574,7 @@ fn adopt_scan(
             Some((s, x)) => (s, Some(x)),
             None => (name, None),
         };
-        if stem == old {
+        if olds.contains(&stem) {
             let dest = dir.join(match ext {
                 Some(x) => format!("{new}.{x}"),
                 None => new.to_string(),
@@ -495,12 +592,12 @@ fn adopt_scan(
             continue;
         }
         if path.is_dir() {
-            adopt_scan(&path, depth - 1, old, new, moved, budget);
+            adopt_scan(&path, depth - 1, olds, new, moved, budget);
         }
     }
 }
 
-/// 実 `~/.zaivern` に対する [`adopt_legacy_keys_in`]。**1 プロセス 1 ワークスペース 1 回**。
+/// 実 `~/.zaivern` に対する引き取り。**1 プロセス 1 ワークスペース 1 回**。
 ///
 /// 履歴の読み書き入口 ([`append`] / [`list_all`]) から呼ぶ。ワークスペースを
 /// 開いた最初の 1 回だけディレクトリを 7 つほど読み、以降は集合の照会で終わる。
@@ -508,19 +605,28 @@ fn adopt_scan(
 /// (リース台帳の 1 操作ごとに) 呼ばれる純関数だからで、そこにファイル操作を
 /// 隠すとテストが実 `~/.zaivern` を読むようにもなる。
 pub(crate) fn adopt_legacy_keys(cwd: &Path) {
+    adopt_keys(&legacy_keys_of(cwd), &workspace_key(cwd));
+}
+
+/// 実 `~/.zaivern` に対する [`adopt_keys_in`]。**プロセス内で組ごとに 1 回だけ**走る。
+///
+/// 旧キーの組と新キーで覚えるので、単一パスの引き取りとルート集合の引き取りが
+/// 互いを打ち消さない。呼ぶのは**実ディレクトリを触る入口だけ** — テストは
+/// `*_in()` 系を一時ディレクトリへ向けるので、ここを通らない。
+pub(crate) fn adopt_keys(olds: &[String], new: &str) {
     static DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
-    let key = workspace_key(cwd);
+    let tag = format!("{}>{new}", olds.join(","));
     let done = DONE.get_or_init(Default::default);
     {
         // 毒された Mutex でも中身は壊れていない (入れるのは String だけ) ので、
         // そのまま使う。ここで panic すると履歴が読めなくなるほうが害が大きい。
         let mut set = done.lock().unwrap_or_else(|e| e.into_inner());
-        if !set.insert(key) {
+        if !set.insert(tag) {
             return;
         }
     }
-    adopt_legacy_keys_in(&zaivern_dir(), cwd);
+    adopt_keys_in(&zaivern_dir(), olds, new);
 }
 
 /// 最初のユーザー指示 → 一覧の 1 行に出せる要約。
@@ -1233,17 +1339,94 @@ mod tests {
         let needle = format!("{}::new()", "DefaultHasher");
         assert_eq!(
             src.matches(&needle).count(),
-            1,
-            "{needle} は旧キーの引き取り 1 箇所だけ"
+            3,
+            "{needle} は旧キー 3 種類 (str 版 / Path 版 / ルート集合版) の再現だけ"
         );
         let legacy = src
             .find("fn legacy_workspace_key")
             .expect("旧キー関数が残っている");
-        let used = src.find(&needle).expect("旧キー関数の中で使っている");
-        assert!(used > legacy, "DefaultHasher が新しいキー側へ戻っている");
+        assert!(
+            src.match_indices(&needle).all(|(at, _)| at > legacy),
+            "DefaultHasher が新しいキー側へ戻っている"
+        );
+    }
+
+    /// **ワークスペースのキーを計算しているのはこのモジュールだけ。**
+    ///
+    /// 寄せる前は同じフォルダが 2 つの名前を持っていた (`history` の
+    /// `7d04257970e725eb` と `session` / `marks` の `be6ef641440bbada`) 。
+    /// 層ごとに別の写像があると**片方の層だけが静かにデータを失う**ので、
+    /// 「他所で計算していない」ことを構造で固定する。
+    ///
+    /// 見張る形は 2 つ:
+    ///
+    /// 1. `format!("{{:016x}}", <ハッシュ>.finish())` — 自前ハッシュから 16 桁キーを作る形
+    /// 2. `canonicalize()` の結果をそのままハッシュへ流す形 — つまり「パス → キー」
+    #[test]
+    fn ワークスペースキーを計算するのはこのモジュールだけ() {
+        // 探す語は実行時に組み立てる。ソースへ直に書くと**このテスト自身が
+        // 検出対象になる** (`新しいキーは_defaulthasher_を使っていない` で実際に踏んだ)。
+        let hex16 = format!("{}{}", "{:016x}\"", ", ");
+        let finish = format!("{}()", "finish");
+        let canon = format!("{}()", "canonicalize");
+        let fnv = format!("{}{}", "fnv1a", "64");
+        let mut checked = 0usize;
+        // パスはビルド時のクレート位置から起こす (どのマシンでも動く)。
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                // ここ (キーの本家) と、その旧キー再現だけは対象外。
+                if path.file_name().and_then(|s| s.to_str()) == Some("history.rs") {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Windows のチェックアウトは CRLF なので必ず正規化する。
+                let text = raw.replace("\r\n", "\n");
+                checked += 1;
+                for (at, _) in text.match_indices(&hex16) {
+                    // **文字数で切る。** バイト位置で切ると日本語コメントの
+                    // 途中に落ちて panic する (実際に踏んだ)。
+                    let tail: String = text[at..].chars().take(80).collect();
+                    assert!(
+                        !tail.contains(&finish),
+                        "{}: 自前ハッシュから 16 桁キーを作っている。\n                         ワークスペースのキーなら crate::history::workspace_key を、\n                         集合なら workspace_set_key を通すこと。",
+                        path.display()
+                    );
+                }
+                for (at, _) in text.match_indices(&canon) {
+                    // 囲っている関数の終わり (列 0 の `}`) まで、無ければ 800 字。
+                    let end = text[at..].find("\n}").map_or(text.len(), |d| at + d);
+                    let win: String = text[at..end].chars().take(800).collect();
+                    assert!(
+                        !win.contains(&finish) && !win.contains(&fnv),
+                        "{}: canonicalize したパスを直接ハッシュしている (= 独自のワークスペースキー)。\n                         crate::history::workspace_key を通すこと。",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(checked > 50, "走査できたのが {checked} 個しかない");
     }
 
     // ── 旧キーの引き取り ────────────────────────────────────
+
+    /// 単一パスの旧キー (`str` 版 / `Path` 版) をまとめて引き取る。
+    fn adopt_legacy_keys_in(zdir: &Path, cwd: &Path) -> Vec<PathBuf> {
+        adopt_keys_in(zdir, &legacy_keys_of(cwd), &workspace_key(cwd))
+    }
 
     /// 旧キーで置かれた 3 つの形 (ファイル / 拡張子なしのディレクトリ / 2 段下) を作る。
     fn legacy_layout(zdir: &Path, old: &str) {
@@ -1342,5 +1525,112 @@ mod tests {
         assert_eq!(adopt_legacy_keys_in(&zdir, &ws).len(), 0);
         assert!(inside.is_file(), "他人の入れ物には降りない");
         assert!(deep_file.is_file(), "深さの上限で止まる");
+    }
+
+    // ── 層をまたぐ引き取り (寄せた分) ──────────────────────
+
+    /// `session.rs` / `marks.rs` が使っていた旧キー (`Path` を叩いた値) も
+    /// **同じ 1 回の走査で**引き取る。生ログは利用者の実データが入っているので、
+    /// ここが抜けると「スクロールバックが全部消えた」として表に出る。
+    #[test]
+    fn 生ログと印の旧キーも同じ走査で引き取る() {
+        let zdir = root("adopt-path-zdir");
+        let ws = root("adopt-path-ws");
+        let old = legacy_path_key(&ws);
+        let new = workspace_key(&ws);
+        assert_ne!(old, legacy_workspace_key(&ws), "Path 版と str 版は別の値");
+        assert_ne!(old, new);
+
+        // term_logs/<旧キー>/<ログ>  と  bookmarks/<旧キー>.toml
+        std::fs::create_dir_all(zdir.join("term_logs").join(&old)).expect("term_logs");
+        std::fs::write(
+            zdir.join("term_logs").join(&old).join("Claude-1.log"),
+            "前回の画面\n",
+        )
+        .expect("log");
+        std::fs::create_dir_all(zdir.join("bookmarks")).expect("bookmarks");
+        std::fs::write(
+            zdir.join("bookmarks").join(format!("{old}.toml")),
+            "version = 1\n",
+        )
+        .expect("marks");
+
+        let moved = adopt_legacy_keys_in(&zdir, &ws);
+        assert_eq!(moved.len(), 2, "生ログと印の両方: {moved:?}");
+        assert_eq!(
+            std::fs::read_to_string(zdir.join("term_logs").join(&new).join("Claude-1.log"))
+                .expect("引き取った生ログが読める"),
+            "前回の画面\n"
+        );
+        assert!(zdir.join("bookmarks").join(format!("{new}.toml")).is_file());
+    }
+
+    /// ルート集合のキー (セッション / Hot Exit) も同じ流儀で引き取れる。
+    #[test]
+    fn ルート集合の旧キーも引き取れる() {
+        let zdir = root("adopt-roots-zdir");
+        let a = root("adopt-roots-a");
+        let b = root("adopt-roots-b");
+        let roots = vec![a, b];
+        let old = legacy_roots_key(&roots);
+        let new = workspace_set_key(&roots);
+        assert_ne!(old, new);
+
+        std::fs::create_dir_all(zdir.join("sessions")).expect("sessions");
+        std::fs::write(
+            zdir.join("sessions").join(format!("{old}.toml")),
+            "active = 0\n",
+        )
+        .expect("session");
+        std::fs::create_dir_all(zdir.join("hotexit").join(&old)).expect("hotexit");
+        std::fs::write(zdir.join("hotexit").join(&old).join("index.toml"), "").expect("index");
+
+        let moved = adopt_keys_in(&zdir, &[old.clone()], &new);
+        assert_eq!(moved.len(), 2, "セッションと退避の両方: {moved:?}");
+        assert_eq!(
+            std::fs::read_to_string(zdir.join("sessions").join(format!("{new}.toml")))
+                .expect("引き取ったセッションが読める"),
+            "active = 0\n"
+        );
+        assert!(zdir.join("hotexit").join(&new).join("index.toml").is_file());
+    }
+
+    // ── ルート集合のキー ────────────────────────────────────
+
+    #[test]
+    fn 集合のキーは順序と重複に依らない() {
+        let a = root("set-a");
+        let b = root("set-b");
+        let c = root("set-c");
+        let ab = workspace_set_key(&[a.clone(), b.clone()]);
+        assert_eq!(ab, workspace_set_key(&[b.clone(), a.clone()]), "順序非依存");
+        assert_eq!(
+            ab,
+            workspace_set_key(&[a.clone(), b.clone(), a.clone()]),
+            "重複は畳む"
+        );
+        assert_ne!(ab, workspace_set_key(&[a.clone(), b.clone(), c]));
+        assert_ne!(ab, workspace_set_key(std::slice::from_ref(&a)));
+        assert_eq!(ab.len(), 16);
+        assert!(ab.chars().all(|c| c.is_ascii_hexdigit()));
+        // 空集合でも決定的な値を返す (呼ぶ側が panic しない)。
+        assert_eq!(workspace_set_key(&[]).len(), 16);
+    }
+
+    /// **区切り文字で繋いでいたら衝突する組**で、実際に衝突しないことを見る。
+    ///
+    /// 素朴に `/` や改行で繋ぐと、要素の切れ目が要素の中身と区別できず
+    /// **別の集合が同じキーになる**。長さを前置しているので起こらない。
+    #[test]
+    fn 集合のキーは要素の切れ目を取り違えない() {
+        let base = root("set-sep");
+        // 繋いだ文字列は同じでも、集合としては別物。
+        let left = vec![base.join("a").join("b"), base.join("c")];
+        let right = vec![base.join("a"), base.join("b").join("c")];
+        assert_ne!(workspace_set_key(&left), workspace_set_key(&right));
+        // パス名そのものに区切りが入っていても取り違えない (unix では改行も合法)。
+        let one = vec![base.join("x\ny"), base.join("z")];
+        let two = vec![base.join("x"), base.join("y\nz")];
+        assert_ne!(workspace_set_key(&one), workspace_set_key(&two));
     }
 }
