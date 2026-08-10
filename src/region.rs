@@ -586,14 +586,55 @@ fn is_glob(p: &str) -> bool {
 ///
 /// 出力そのものが二次になる入力 (全員が同じ行域に重なる) では、当然二次の
 /// ままである。**出力件数に比例する**のが下限で、そこまで落とした。むしろ
-/// そこでは整列のぶん総当たりより遅い (実測で 4 倍)。[`is_disjoint`] は
-/// 「空かどうか」しか要らないので**最初の 1 組で降りられる**が、そうすると
-/// この関数に出荷ビルドからの呼び出し元が 1 つも無くなり `-D dead_code` が
-/// 落ちる (実際に落ちた)。降ろすなら `negotiate::cli_allocate` の
-/// 「計画が互いに素になっていません」の経路でここを呼んで組を出すこと。
+/// そこでは総当たりより遅い。**遅い所は測ってある** (debug, 800 件が全員
+/// 同じ行域に重なる `cost::crowded`):
+///
+/// | 段 | 実測 | 中身 |
+/// |----|------|------|
+/// | 掃引 ([`scan`]) | **127ms** | 判定 319,600 回 (総当たりと同数) |
+/// | 並べ替え | **285ms** | 出力 319,600 組を添字の辞書順へ |
+/// | (総当たり) | 103ms | 判定 319,600 回、整列は不要 |
+///
+/// つまり**遅さの 7 割は最後の並べ替え**で、掃引そのものは総当たりの
+/// 1.23 倍でしかない。掃引は開始行の順に組を出すので添字の順になっておらず、
+/// 出力が二次に膨らむとここだけ `P log P` を払う。
+///
+/// **数え上げ整列で `P + N` へ落とす手は入れていない。** 全件を欲しがる経路は
+/// **互いに素でなかったときの診断** ([`crate::negotiate::Plan::conflict_report`])
+/// だけで、そこは既に「実装のバグが起きた後」だから 0.4 秒を惜しむ理由が無い。
+/// 普通の入力では `out.is_sorted()` が真になって並べ替えごと省かれる
+/// (実測: 互いに素な 800 件で判定 0 回・2.1ms)。
+///
+/// 「空かどうか」しか要らない [`is_disjoint`] は、同じ走査を
+/// **最初の 1 組で降りる**旗付きで呼ぶ (最悪ケースで 319,600 回 → **1 回**)。
+///
+/// 出荷での呼び出し元は `negotiate::cli_allocate` の「計画が互いに素に
+/// なっていません」— **どれとどれがぶつかったのか**を出すためにここを通る
+/// ([`crate::negotiate::Plan::conflict_report`])。
 pub fn conflicting_pairs(list: &[Region], band: u32) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
+    scan(list, band, false, &mut out);
+    // 掃引は開始行の順に出すので、添字の順にはなっていない。
+    // **既に整列していれば並べ替えない** — 組がほとんど出ない普通の入力では
+    // ここが丸ごと省ける (検査は O(件数)、整列は O(件数 log 件数))。
+    if !out.is_sorted() {
+        out.sort_unstable();
+    }
+    out
+}
 
+/// 走査の本体。`stop_at_first` が真なら**最初の 1 組を積んだ時点で降りる**。
+///
+/// [`conflicting_pairs`] と [`is_disjoint`] の違いは**この旗だけ**。絞り込みも
+/// 判定 ([`conflicts`]) も 1 実装しかないので、「速い側だけが違う答えを返す」が
+/// 構造的に起こらない (`cost::総当たりと同じ答えを返す` が両方を乱択 400 通りで
+/// 総当たりと突き合わせている)。
+///
+/// 降りても答えは変わらない: [`is_disjoint`] が要るのは**存在するかどうか**
+/// だけで、1 組でも見つかれば残りを数えても結論は動かない。`band = 0` で
+/// 「重なった行域が衝突しない」と出る性質も、判定を [`conflicts`] に任せた
+/// ままなので**そのまま**である。
+fn scan(list: &[Region], band: u32, stop_at_first: bool, out: &mut Vec<(usize, usize)>) {
     // ① パスを 1 回だけ正規化して分ける。ここが N 回、以前は N² 回だった。
     let mut wide: Vec<usize> = Vec::new();
     let mut plain: Vec<Entry> = Vec::new();
@@ -624,31 +665,37 @@ pub fn conflicting_pairs(list: &[Region], band: u32) -> Vec<(usize, usize)> {
     //    ここが二次でも全体の速さは変わらない。
     for (k, &i) in wide.iter().enumerate() {
         for &j in wide.iter().skip(k + 1) {
-            push_if_conflicts(list, i, j, band, &mut out);
+            if push_if_conflicts(list, i, j, band, out) && stop_at_first {
+                return;
+            }
         }
         for e in &plain {
-            push_if_conflicts(list, i, e.idx, band, &mut out);
+            if push_if_conflicts(list, i, e.idx, band, out) && stop_at_first {
+                return;
+            }
         }
     }
 
     // ③ 具体パスは「同じファイル」ごとに固めて、開始行の順に掃く。
     plain.sort_by(|a, b| (&a.path, a.lo, a.hi, a.idx).cmp(&(&b.path, b.lo, b.hi, b.idx)));
     for bucket in plain.chunk_by(|a, b| a.path == b.path) {
-        sweep_bucket(bucket, list, band, &mut out);
+        if sweep_bucket(bucket, list, band, stop_at_first, out) {
+            return;
+        }
     }
-
-    // 掃引は開始行の順に出すので、添字の順にはなっていない。
-    // **既に整列していれば並べ替えない** — 組がほとんど出ない普通の入力では
-    // ここが丸ごと省ける (検査は O(件数)、整列は O(件数 log 件数))。
-    if !out.is_sorted() {
-        out.sort_unstable();
-    }
-    out
 }
 
 /// 一覧が互いに素か (= この集合なら衝突し得ない)。
+///
+/// **最初の 1 組で降りる。** 欲しいのは「空かどうか」だけなので全件を数える
+/// 必要が無い。全員が重なる最悪ケース (800 件) で判定は
+/// **319,600 回 → 1 回**、互いに素な 800 件では従来どおり 0 回のまま。
+/// 組そのものが要るとき (= 互いに素でなかったときの診断) は
+/// [`conflicting_pairs`] を使う。
 pub fn is_disjoint(list: &[Region], band: u32) -> bool {
-    conflicting_pairs(list, band).is_empty()
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    scan(list, band, true, &mut out);
+    out.is_empty()
 }
 
 /// 掃引に使う 1 件ぶん。`lo`/`hi` は [`Span::probe`] 済み (挿入点は点として入る)。
@@ -660,6 +707,7 @@ struct Entry {
 }
 
 /// 添字の順を保ったまま [`conflicts`] へ掛けて、真なら組を積む。
+/// **積んだら `true`** ([`scan`] の早降りはこれを見る)。
 ///
 /// 総当たりと**同じ向き** (`i < j`) で呼ぶ。`conflicts` は対称だが、
 /// 向きを揃えておけば「総当たりと 1 バイト違わない」が自明に言える。
@@ -669,11 +717,13 @@ fn push_if_conflicts(
     j: usize,
     band: u32,
     out: &mut Vec<(usize, usize)>,
-) {
+) -> bool {
     let (a, b) = if i < j { (i, j) } else { (j, i) };
     if conflicts(&list[a], &list[b], band) {
         out.push((a, b));
+        return true;
     }
+    false
 }
 
 /// 同じファイルの予約を開始行の順に掃いて、衝突し得る組だけを [`conflicts`] へ渡す。
@@ -681,7 +731,15 @@ fn push_if_conflicts(
 /// `active` に残すのは「安全帯の内側にまだ届いている」予約だけ。整列済みなので
 /// 一度死んだものが生き返ることはなく、**取り除きは 1 件につき 1 回**しか起きない
 /// (= 全体で `O(N + 出力件数)`)。
-fn sweep_bucket(bucket: &[Entry], list: &[Region], band: u32, out: &mut Vec<(usize, usize)>) {
+///
+/// `stop_at_first` が真で 1 組見つかったら **`true` を返して降りる**。
+fn sweep_bucket(
+    bucket: &[Entry],
+    list: &[Region],
+    band: u32,
+    stop_at_first: bool,
+    out: &mut Vec<(usize, usize)>,
+) -> bool {
     let mut active: Vec<usize> = Vec::new();
     for (k, cur) in bucket.iter().enumerate() {
         // `gap = cur.lo - hi - 1 < band`  ⇔  `cur.lo <= hi + band`。
@@ -693,10 +751,13 @@ fn sweep_bucket(bucket: &[Entry], list: &[Region], band: u32, out: &mut Vec<(usi
             hi == Span::EOF || cur.lo <= hi.saturating_add(band)
         });
         for &p in &active {
-            push_if_conflicts(list, bucket[p].idx, cur.idx, band, out);
+            if push_if_conflicts(list, bucket[p].idx, cur.idx, band, out) && stop_at_first {
+                return true;
+            }
         }
         active.push(k);
     }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2699,6 +2760,66 @@ mod cost {
         }
     }
 
+    /// [`is_disjoint`] を測る。
+    ///
+    /// 対照 (`naive_*` 欄) は**この早降りを入れる前の実装** =
+    /// 「全件を列挙してから空かを見る」。前と後が同じ表に並ぶので、
+    /// 「消えた」を数字で示せる。
+    fn measure_is_disjoint(
+        case: &str,
+        n: usize,
+        band: u32,
+        iters: u32,
+        build: &dyn Fn() -> Vec<Region>,
+    ) -> Row {
+        let harness = best_of(iters, || {
+            let input = build();
+            let v = is_disjoint(&[], band);
+            (input, v)
+        });
+        let total = best_of(iters, || {
+            let input = build();
+            let v = is_disjoint(&input, band);
+            (input, v)
+        });
+        // 前の実装は最悪ケース (800 件) で debug 0.4 秒。大きいところは
+        // 繰り返しを 1 回に落とす (最小値を採る意味は薄れるが桁は動かない)。
+        let before_iters = if n > 400 { 1 } else { iters };
+        let before = best_of(before_iters, || {
+            let input = build();
+            let v = conflicting_pairs(&input, band).is_empty();
+            (input, v)
+        });
+
+        let input = build();
+        count::reset();
+        let got = is_disjoint(&input, band);
+        let judgements = count::pairs();
+        count::reset();
+        let all = conflicting_pairs(&input, band);
+        let before_judgements = count::pairs();
+        // **早降りが答えを変えていない**ことを、計測のたびに確かめる。
+        assert_eq!(
+            got,
+            all.is_empty(),
+            "{case} n={n} band={band}: 早降りが答えを変えた"
+        );
+
+        Row {
+            case: case.to_string(),
+            axis: "regions",
+            n,
+            band,
+            harness_ns: harness.as_nanos(),
+            total_ns: total.as_nanos(),
+            naive_total_ns: before.as_nanos(),
+            naive_iters: before_iters,
+            out_pairs: all.len(),
+            judgements,
+            naive_judgements: before_judgements,
+        }
+    }
+
     /// テキスト側 (錨の取り直し / 錨打ち / 触れた行域) を測る。
     /// `judge` が本番、`empty` が「同じ入力を作って**空を判定**する」対照。
     fn measure_text(
@@ -2842,6 +2963,43 @@ mod cost {
             cmp * 100 < naive,
             "判定 {cmp} 回 / 総当たり {naive} 回 — 絞り込みが効いていない"
         );
+    }
+
+    #[test]
+    fn 互いに素かの判定は最初の一組で降りる() {
+        // **合否は回数で決める。** 時間は負荷で必ず嘘をつく。
+        for n in [100usize, 200, 400, 800] {
+            // (1) 全員が重なる最悪ケース。全件を数えると N(N-1)/2 回。
+            let list = crowded(n);
+            count::reset();
+            assert!(!is_disjoint(&list, SAFE_BAND), "重なっているのに互いに素");
+            let stop = count::pairs();
+            count::reset();
+            let all = conflicting_pairs(&list, SAFE_BAND);
+            let full = count::pairs();
+            assert_eq!(
+                stop, 1,
+                "n={n} で判定 {stop} 回 (最初の 1 組で降りていない。全件版は {full} 回)"
+            );
+            assert_eq!(full as usize, all.len(), "全件版の回数が出力件数と合わない");
+
+            // (2) 2 件ずつ衝突する並べ方。件数が増えても回数は増えない。
+            let list = couples(n, SAFE_BAND);
+            count::reset();
+            assert!(!is_disjoint(&list, SAFE_BAND));
+            let stop = count::pairs();
+            assert!(stop <= 2, "n={n} で判定 {stop} 回 (件数に連れて増えている)");
+
+            // (3) 互いに素なら降りる先が無いので、全件版と同じ回数のまま。
+            let list = disjoint(n, SAFE_BAND);
+            count::reset();
+            assert!(is_disjoint(&list, SAFE_BAND));
+            let stop = count::pairs();
+            count::reset();
+            let _ = conflicting_pairs(&list, SAFE_BAND);
+            let full = count::pairs();
+            assert_eq!(stop, full, "n={n}: 互いに素な入力で回数が変わった");
+        }
     }
 
     #[test]
@@ -3030,6 +3188,37 @@ mod cost {
                 SAFE_BAND,
                 iters,
                 true,
+                &move || crowded(n),
+            ));
+        }
+
+        // (a') 「空かどうか」だけ知りたい経路 (`is_disjoint`)。
+        //      `naive_*` 欄は**早降りを入れる前の実装** = 全件を列挙してから
+        //      空かを見る。x 欄がそのまま「何倍速くなったか」になる。
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.disjoint",
+                n,
+                SAFE_BAND,
+                iters,
+                &move || disjoint(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.couples",
+                n,
+                SAFE_BAND,
+                iters,
+                &move || couples(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.crowded",
+                n,
+                SAFE_BAND,
+                iters,
                 &move || crowded(n),
             ));
         }

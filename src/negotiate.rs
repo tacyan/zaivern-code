@@ -720,6 +720,60 @@ impl Plan {
         region::is_disjoint(&self.all_regions(), self.band)
     }
 
+    /// [`Plan::all_regions`] と**同じ並び**の持ち主名。
+    ///
+    /// 添字がずれると診断が別人を指すので、`all_regions` と同じ順序で
+    /// 組み立てる (`tests::衝突の診断は持ち主と行域を名指しする` が長さと
+    /// 中身の対応を固定している)。
+    fn region_owners(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.held.iter().map(|_| tr("既存の占有")).collect();
+        for g in &self.granted {
+            for _ in &g.regions {
+                v.push(g.id.clone());
+            }
+        }
+        v
+    }
+
+    /// 互いに素でなかったときの**見出し**。
+    ///
+    /// 実バイナリへ撃って分かったこと: 入力の `occupied` どうしが最初から
+    /// 重なっていても、ここへ落ちる。そのとき「実装のバグです」と出すのは
+    /// **嘘**で、直す場所は呼び出し側の台帳である。組を出すついでに切り分ける。
+    pub fn conflict_headline(&self) -> String {
+        if region::is_disjoint(&self.held, self.band) {
+            tr("計画が互いに素になっていません (実装のバグです)")
+        } else {
+            tr("入力の occupied どうしが重なっています (台帳を直してください)")
+        }
+    }
+
+    /// **どれとどれがぶつかったのか**を、人が読める 1 行ずつで返す。
+    ///
+    /// [`Plan::is_disjoint`] は最初の 1 組で降りるので「偽である」としか
+    /// 言えない。実装のバグを直すには**組そのもの**が要るので、ここだけ
+    /// [`region::conflicting_pairs`] で全件を列挙する。呼ぶのは
+    /// **互いに素でなかったとき = 既にバグが起きた後**だけなので、
+    /// 最悪ケースの列挙費用 (実測 800 件で 0.4 秒) を払ってよい。
+    pub fn conflict_report(&self) -> Vec<String> {
+        let regions = self.all_regions();
+        let owners = self.region_owners();
+        region::conflicting_pairs(&regions, self.band)
+            .into_iter()
+            .map(|(i, j)| {
+                trf(
+                    "{a} {ar} ⇔ {b} {br}",
+                    &[
+                        ("a", owners.get(i).cloned().unwrap_or_default()),
+                        ("ar", region::render(&regions[i])),
+                        ("b", owners.get(j).cloned().unwrap_or_default()),
+                        ("br", region::render(&regions[j])),
+                    ],
+                )
+            })
+            .collect()
+    }
+
     /// ずらして通した件数。
     pub fn shifted(&self) -> usize {
         self.granted
@@ -2066,7 +2120,12 @@ fn cli_allocate() -> i32 {
         serde_json::to_string_pretty(&plan_out(&plan)).unwrap_or_default()
     );
     if !plan.is_disjoint() {
-        eprintln!("{}", tr("計画が互いに素になっていません (実装のバグです)"));
+        // **「バグです」だけでは直せない。** どの予約とどの予約が、どのファイルの
+        // 何行目で重なったのかまで出す (`Plan::conflict_report`)。
+        eprintln!("{}", plan.conflict_headline());
+        for line in plan.conflict_report() {
+            eprintln!("  {line}");
+        }
         return 1;
     }
     if plan.denied.is_empty() {
@@ -3334,6 +3393,134 @@ mod tests {
             }
         }
         k
+    }
+
+    /// **互いに素でなかったときに「誰と誰が」まで出す。**
+    ///
+    /// [`Plan::is_disjoint`] は最初の 1 組で降りるので「偽である」としか
+    /// 言えない。診断は [`region::conflicting_pairs`] を通って組を全部出す
+    /// (= あの関数の**出荷ビルドでの呼び出し元**でもある)。
+    #[test]
+    fn 衝突の診断は持ち主と行域を名指しする() {
+        let plan = Plan {
+            band: region::SAFE_BAND,
+            file_lines: 200,
+            held: vec![reg("src/a.rs#L10-20")],
+            granted: vec![
+                Granted {
+                    id: "agent-b".to_string(),
+                    regions: vec![reg("src/a.rs#L18-30")],
+                    moved: 0,
+                    how: How::AsRequested,
+                },
+                Granted {
+                    id: "agent-c".to_string(),
+                    regions: vec![reg("src/z.rs#L1-5")],
+                    moved: 0,
+                    how: How::AsRequested,
+                },
+            ],
+            denied: vec![],
+        };
+        // 持ち主名は `all_regions` と同じ並びでなければ別人を指してしまう。
+        assert_eq!(
+            plan.region_owners().len(),
+            plan.all_regions().len(),
+            "持ち主名と域の数がずれている"
+        );
+        assert!(!plan.is_disjoint(), "重ねた入力が互いに素と出ている");
+        let report = plan.conflict_report();
+        assert_eq!(report.len(), 1, "出た組: {report:?}");
+        let line = &report[0];
+        assert!(line.contains("agent-b"), "持ち主が出ていない: {line}");
+        assert!(
+            line.contains("src/a.rs#L10-20") && line.contains("src/a.rs#L18-30"),
+            "どのファイルの何行目かが出ていない: {line}"
+        );
+        assert!(
+            !line.contains("agent-c"),
+            "ぶつかっていない予約まで出た: {line}"
+        );
+        eprintln!("衝突の診断: {line}");
+        // 占有どうしは素で、**配った側が他人の占有へ乗った** = こちらのバグ。
+        assert!(
+            plan.conflict_headline().contains("実装のバグ"),
+            "配ったものが占有に乗ったのに入力のせいにした: {}",
+            plan.conflict_headline()
+        );
+
+        // 入力の occupied どうしが最初から重なっているなら、直す場所は
+        // 台帳であって実装ではない (実バイナリへ撃って見つけた誤診)。
+        let bad_input = Plan {
+            held: vec![reg("src/a.rs#L10-20"), reg("src/a.rs#L18-30")],
+            granted: vec![],
+            ..plan.clone()
+        };
+        assert!(!bad_input.is_disjoint());
+        assert!(
+            bad_input.conflict_headline().contains("occupied"),
+            "入力が原因なのに実装のバグだと出た: {}",
+            bad_input.conflict_headline()
+        );
+        assert_eq!(
+            bad_input.conflict_report(),
+            vec![tr("{a} {ar} ⇔ {b} {br}")
+                .replace("{a}", &tr("既存の占有"))
+                .replace("{ar}", "src/a.rs#L10-20")
+                .replace("{b}", &tr("既存の占有"))
+                .replace("{br}", "src/a.rs#L18-30")],
+            "占有どうしの衝突が名指しできていない"
+        );
+
+        // 互いに素なら 1 行も出ない (= 正常時に雑音を出さない)。
+        let ok = Plan {
+            held: vec![reg("src/a.rs#L10-20")],
+            ..plan.clone()
+        };
+        let ok = Plan {
+            granted: vec![Granted {
+                id: "agent-b".to_string(),
+                regions: vec![reg("src/a.rs#L40-50")],
+                moved: 0,
+                how: How::AsRequested,
+            }],
+            ..ok
+        };
+        assert!(ok.is_disjoint());
+        assert!(ok.conflict_report().is_empty());
+
+        // 占有どうしは素なのに配った側がぶつかった = **こちらのバグ**。
+        let bug = Plan {
+            granted: vec![
+                Granted {
+                    id: "agent-b".to_string(),
+                    regions: vec![reg("src/a.rs#L40-50")],
+                    moved: 0,
+                    how: How::AsRequested,
+                },
+                Granted {
+                    id: "agent-c".to_string(),
+                    regions: vec![reg("src/a.rs#L51-60")],
+                    moved: 0,
+                    how: How::AsRequested,
+                },
+            ],
+            ..ok
+        };
+        assert!(!bug.is_disjoint());
+        assert!(
+            bug.conflict_headline().contains("実装のバグ"),
+            "配った側の衝突なのに入力のせいにした: {}",
+            bug.conflict_headline()
+        );
+        let report = bug.conflict_report();
+        assert_eq!(report.len(), 1, "出た組: {report:?}");
+        assert!(
+            report[0].contains("agent-b") && report[0].contains("agent-c"),
+            "両方の持ち主が出ていない: {}",
+            report[0]
+        );
+        eprintln!("配った側の衝突: {}", report[0]);
     }
 
     /// **この機能の存在理由を数字で固定する。**
