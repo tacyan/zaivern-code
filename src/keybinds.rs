@@ -2978,8 +2978,14 @@ fn other() {
 }
 ";
         let out = strip_test_mods(src);
-        assert!(out.contains("\u{2318}W)"), "本体の文字列が消えている:\n{out}");
-        assert!(out.contains("\u{2318}S)"), "テストの後ろの本体が消えている:\n{out}");
+        assert!(
+            out.contains("\u{2318}W)"),
+            "本体の文字列が消えている:\n{out}"
+        );
+        assert!(
+            out.contains("\u{2318}S)"),
+            "テストの後ろの本体が消えている:\n{out}"
+        );
         assert!(
             !out.contains("が効いていない"),
             "テストの中身が残っている:\n{out}"
