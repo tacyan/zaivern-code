@@ -515,6 +515,10 @@ pub const PREFIX_ROOT: char = '#';
 pub const PREFIX_GOTO: char = ':';
 
 /// モードのプレフィクス一覧 (`query()` が剥がす文字)。
+///
+/// **半角形だけを持つ**。全角で打たれた `＞` `＠` `％` `＃` `：` は
+/// [`fold_fullwidth_ascii`] で半角へ写してから照合するので、
+/// 全角形をここへ並べてはいけない (対応表が 2 箇所に散る)。
 const PREFIXES: [char; 5] = [
     PREFIX_COMMAND,
     PREFIX_SYMBOL,
@@ -522,6 +526,54 @@ const PREFIXES: [char; 5] = [
     PREFIX_ROOT,
     PREFIX_GOTO,
 ];
+
+/// 全角 ASCII (U+FF01..=U+FF5E) を対応する半角 ASCII (U+0021..=U+007E) へ写す。
+/// 範囲外の文字はそのまま返す。
+///
+/// 日本語 IME を ON にしたまま打つと `>` は `＞`(U+FF1E)、`1` は `１`(U+FF11) に
+/// なる。全角形は ASCII から一定オフセット (`U+FF01 - 0x21`) ずれているだけなので、
+/// **対応表を持たずこの 1 本で写せる**。
+///
+/// # 畳んでよい範囲
+///
+/// 通してよいのは次の 2 つ**だけ**:
+///
+/// * モードのプレフィクス **1 文字** ([`PREFIXES`] / [`Palette::has_prefix`])
+/// * 行番号モードのクエリ ([`fold_goto`]) — 数字・区切り・空白しか意味を持たない
+///
+/// **検索クエリの本体は絶対に通さない。** 通すと `Ａ` を含むファイル名や、
+/// 全角英数を意図して書いたコードが検索できなくなる (`＞Ａあ` の `Ａ` は
+/// ユーザーが打ちたかった文字であって、`A` の打ち間違いではない)。
+///
+/// # 巻き込まない文字
+///
+/// 半角カナ (U+FF61..=U+FF9F) は範囲の**外**なので素通しする — ここを
+/// 巻き込むと `｡` `ｱ` などが別の記号に化ける。全角スペース (U+3000)、
+/// ひらがな・カタカナ・漢字も範囲外。
+pub fn fold_fullwidth_ascii(c: char) -> char {
+    /// `！` — 全角 ASCII の先頭。
+    const FULLWIDTH_FIRST: u32 = 0xFF01;
+    /// `～` — 全角 ASCII の末尾 (次の U+FF5F からは半角カナ等の別ブロック)。
+    const FULLWIDTH_LAST: u32 = 0xFF5E;
+    /// `!` — 対応する半角 ASCII の先頭。
+    const ASCII_FIRST: u32 = 0x21;
+    let cp = c as u32;
+    if (FULLWIDTH_FIRST..=FULLWIDTH_LAST).contains(&cp) {
+        char::from_u32(cp - FULLWIDTH_FIRST + ASCII_FIRST).unwrap_or(c)
+    } else {
+        c
+    }
+}
+
+/// 行番号モードのクエリを半角へ畳む (`：１２：４５` → `:12:45`)。
+///
+/// このモードのクエリは数字・`:` / `,` の区切り・空白しか意味を持たないので、
+/// 全文字を [`fold_fullwidth_ascii`] に通してよい**唯一の場所**。
+/// 解釈そのものは `editor_ops::parse_goto` に任せる (数値の読み方を 2 箇所に
+/// 書かないため)。
+pub fn fold_goto(q: &str) -> String {
+    q.chars().map(fold_fullwidth_ascii).collect()
+}
 
 pub struct Palette {
     pub open: bool,
@@ -585,8 +637,17 @@ impl Palette {
         std::mem::take(&mut self.cycle_pending)
     }
 
+    /// 先頭 1 文字がプレフィクス `p` か。**全角形も同じに扱う** —
+    /// 日本語 IME を ON にしたまま `>` を打つと `＞`(U+FF1E) が入るため
+    /// ([`fold_fullwidth_ascii`])。畳むのはこの 1 文字だけで、
+    /// 残りのクエリ ([`Palette::query`]) には手を触れない。
     fn has_prefix(&self, p: char) -> bool {
-        self.input.trim_start().starts_with(p)
+        self.input
+            .trim_start()
+            .chars()
+            .next()
+            .map(fold_fullwidth_ascii)
+            == Some(p)
     }
 
     pub fn is_command_mode(&self) -> bool {
@@ -613,10 +674,18 @@ impl Palette {
         self.has_prefix(PREFIX_GOTO)
     }
 
+    /// プレフィクスを剥がした検索クエリ。
+    ///
+    /// 剥がすのは**先頭 1 文字だけ**で、残りは 1 文字も書き換えずに返す。
+    /// 全角で打たれたプレフィクス (`＞` 等) も剥がすが、**クエリ本体は畳まない** —
+    /// `＞Ａあ` → `Ａあ` (`Ａ` は半角 `A` に化けない)。理由は
+    /// [`fold_fullwidth_ascii`] の「畳んでよい範囲」を参照。
     pub fn query(&self) -> &str {
         let t = self.input.trim_start();
         match t.chars().next() {
-            Some(c) if PREFIXES.contains(&c) => t[c.len_utf8()..].trim_start(),
+            Some(c) if PREFIXES.contains(&fold_fullwidth_ascii(c)) => {
+                t[c.len_utf8()..].trim_start()
+            }
             _ => t,
         }
     }
@@ -1247,7 +1316,13 @@ impl Palette {
     ///
     /// `items` は app.rs が fuzzy 素点付きで積んだもの。ここでの並べ替えが
     /// パレットの見え方すべてを決める。
-    pub fn results(&self, mut items: Vec<Item>) -> Results {
+    ///
+    /// `command_alt` は「同じクエリを**コマンドとして**評価したら当たるもの」で、
+    /// 呼び出し側が **0 件のときにだけ**組む。1 件でも当たれば
+    /// 「`>` を付ければコマンドとして見つかる」を案内に出し、当たらなければ
+    /// 1 行も増やさない (常に出る固定文言にはしない)。日本語入力中は `＞` が
+    /// 入ってファイル検索へ落ちるのが典型で、ここが最後の受け皿になる。
+    pub fn results(&self, mut items: Vec<Item>, command_alt: &[Item]) -> Results {
         let cmd_mode = self.is_command_mode();
         let q = self.query().trim().to_lowercase();
 
@@ -1305,11 +1380,27 @@ impl Palette {
                 }));
                 rows.extend((0..items.len()).map(Row::Item));
                 tags = false; // 見出しを出したのでタグは出さない
-            } else if !self.is_symbol_mode() {
-                // シンボルモードでは先頭に案内を出しているので重ねない
-                notes.push(tr(
-                    "> でコマンド、@ でシンボル、: で行番号、% でエージェント、# で worktree を探せます",
-                ));
+            } else {
+                // 打ったものがコマンド名だった場合の受け皿。**当たったときだけ**
+                // 件数付きで案内する (0 件のときに出す固定文言にはしない)。
+                let hits = command_alt
+                    .iter()
+                    .filter(|it| match &it.action {
+                        Action::Cmd(c) => !hidden_from_palette(c),
+                        Action::OpenFile(_) | Action::OpenFileAt(..) => true,
+                    })
+                    .count();
+                if hits > 0 {
+                    notes.push(trf(
+                        "{p} を付けるとコマンドとして {n} 件見つかります",
+                        &[("p", PREFIX_COMMAND.to_string()), ("n", hits.to_string())],
+                    ));
+                } else if !self.is_symbol_mode() {
+                    // シンボルモードでは先頭に案内を出しているので重ねない
+                    notes.push(tr(
+                        "> でコマンド、@ でシンボル、: で行番号、% でエージェント、# で worktree を探せます",
+                    ));
+                }
             }
         } else if browse {
             // 3b) 素の一覧 — 最近使ったものを先頭に、あとは分類ごとに見出し
@@ -1765,21 +1856,24 @@ mod group_tests {
     #[test]
     fn hidden_commands_are_dropped_in_command_mode() {
         let p = cmd_palette("");
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd(
-                "レビューの比較: ステージ済みだけ",
-                Cmd::SetReviewBase("staged".into()),
-            ),
-            cmd("ペット画像を変更…", Cmd::SetPetImage),
-            cmd("プラグインを再スキャン", Cmd::RescanPlugins),
-            cmd("バージョン情報", Cmd::ShowAbout),
-            cmd("この版の新機能 (What's New)", Cmd::ShowWhatsNew),
-            cmd(
-                "改行コードを変換: LF (Unix)",
-                Cmd::ConvertLineEnding(crate::textenc::LineEnding::Lf),
-            ),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),
+                cmd(
+                    "レビューの比較: ステージ済みだけ",
+                    Cmd::SetReviewBase("staged".into()),
+                ),
+                cmd("ペット画像を変更…", Cmd::SetPetImage),
+                cmd("プラグインを再スキャン", Cmd::RescanPlugins),
+                cmd("バージョン情報", Cmd::ShowAbout),
+                cmd("この版の新機能 (What's New)", Cmd::ShowWhatsNew),
+                cmd(
+                    "改行コードを変換: LF (Unix)",
+                    Cmd::ConvertLineEnding(crate::textenc::LineEnding::Lf),
+                ),
+            ],
+            &[],
+        );
         let labels: Vec<&str> = res.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["保存"], "外したはずのコマンドが残っている");
     }
@@ -1826,14 +1920,17 @@ mod group_tests {
     #[test]
     fn ranking_prefix_beats_word_beats_substring_beats_group() {
         let p = cmd_palette("save");
-        let res = p.results(vec![
-            // 分類名だけ一致 (Group::File の英訳ではなく、ここでは日本語見出しに
-            // 当たらないので素点のみ) — 明示的に「分類一致」を作る
-            cmd("まったく別の操作", Cmd::ToggleTerminal),
-            cmd("autosave toggle", Cmd::ToggleAutoSave), // 部分一致
-            cmd("file save all", Cmd::SaveAll),          // 語頭一致
-            cmd("save", Cmd::Save),                      // 前方一致
-        ]);
+        let res = p.results(
+            vec![
+                // 分類名だけ一致 (Group::File の英訳ではなく、ここでは日本語見出しに
+                // 当たらないので素点のみ) — 明示的に「分類一致」を作る
+                cmd("まったく別の操作", Cmd::ToggleTerminal),
+                cmd("autosave toggle", Cmd::ToggleAutoSave), // 部分一致
+                cmd("file save all", Cmd::SaveAll),          // 語頭一致
+                cmd("save", Cmd::Save),                      // 前方一致
+            ],
+            &[],
+        );
         let labels: Vec<&str> = res.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels[0], "save", "前方一致が先頭に来ていない");
         assert_eq!(labels[1], "file save all", "語頭一致が 2 番目に来ていない");
@@ -1847,10 +1944,13 @@ mod group_tests {
     fn group_name_match_ranks_last_but_is_kept() {
         // 「git」は Group::Git の見出しと一致する = 拾うが最下段
         let p = cmd_palette("git");
-        let res = p.results(vec![
-            cmd("git パネルを開く", Cmd::OpenGitPanel), // 前方一致
-            cmd("変更をレビュー", Cmd::OpenReview),     // 分類名だけ一致
-        ]);
+        let res = p.results(
+            vec![
+                cmd("git パネルを開く", Cmd::OpenGitPanel), // 前方一致
+                cmd("変更をレビュー", Cmd::OpenReview),     // 分類名だけ一致
+            ],
+            &[],
+        );
         let labels: Vec<&str> = res.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["git パネルを開く", "変更をレビュー"]);
     }
@@ -1860,10 +1960,13 @@ mod group_tests {
         let mut p = cmd_palette("");
         let a = cmd("ずっと後ろのはずの操作", Cmd::ToggleRemote);
         p.note_used(&a);
-        let res = p.results(vec![
-            cmd("あ", Cmd::Save),
-            cmd("ずっと後ろのはずの操作", Cmd::ToggleRemote),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("あ", Cmd::Save),
+                cmd("ずっと後ろのはずの操作", Cmd::ToggleRemote),
+            ],
+            &[],
+        );
         assert_eq!(
             res.items[0].label, "ずっと後ろのはずの操作",
             "MRU が効いていない"
@@ -1880,10 +1983,13 @@ mod group_tests {
             p.note_used(&fav);
         }
         p.input = ">保存".into();
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd("まったく無関係だがよく使う保存", Cmd::ToggleRemote),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),
+                cmd("まったく無関係だがよく使う保存", Cmd::ToggleRemote),
+            ],
+            &[],
+        );
         assert_eq!(res.items[0].label, "保存", "MRU が前方一致を追い越した");
     }
 
@@ -1919,11 +2025,14 @@ mod group_tests {
     #[test]
     fn empty_query_groups_with_headings_and_is_never_blank() {
         let p = cmd_palette("");
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd("ターミナル表示切替", Cmd::ToggleTerminal),
-            cmd("エージェントへ移動", Cmd::FocusAgent(0)),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),
+                cmd("ターミナル表示切替", Cmd::ToggleTerminal),
+                cmd("エージェントへ移動", Cmd::FocusAgent(0)),
+            ],
+            &[],
+        );
         let out = rendered(&res);
         assert!(!out.is_empty(), "空状態が空白になっている");
         let headings: Vec<&String> = out.iter().filter(|s| s.starts_with("# ")).collect();
@@ -1936,10 +2045,13 @@ mod group_tests {
     fn empty_query_pins_recent_commands_on_top() {
         let mut p = cmd_palette("");
         p.note_used(&cmd("ターミナル表示切替", Cmd::ToggleTerminal));
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd("ターミナル表示切替", Cmd::ToggleTerminal),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),
+                cmd("ターミナル表示切替", Cmd::ToggleTerminal),
+            ],
+            &[],
+        );
         let out = rendered(&res);
         assert_eq!(out[0], format!("# {}", tr("最近使ったコマンド")));
         assert_eq!(out[1], "ターミナル表示切替");
@@ -1954,7 +2066,7 @@ mod group_tests {
     #[test]
     fn no_match_says_so_and_offers_the_nearest_thing() {
         let p = cmd_palette("ないよこんなコマンド");
-        let res = p.results(vec![]);
+        let res = p.results(vec![], &[]);
         assert!(!res.notes.is_empty(), "該当なしの説明が無い (空白になる)");
         assert!(res.notes[0].contains("ないよこんなコマンド"));
         assert!(!res.items.is_empty(), "代わりの候補が出ていない");
@@ -1971,7 +2083,7 @@ mod group_tests {
     fn no_match_offers_recents_when_there_are_any() {
         let mut p = cmd_palette("zzzz");
         p.note_used(&cmd("ターミナル表示切替", Cmd::ToggleTerminal));
-        let res = p.results(vec![]);
+        let res = p.results(vec![], &[]);
         assert_eq!(res.items[0].label, "ターミナル表示切替");
     }
 
@@ -1980,7 +2092,7 @@ mod group_tests {
         let mut p = Palette::new();
         p.open_files();
         p.input = "zzzz".into();
-        let res = p.results(vec![]);
+        let res = p.results(vec![], &[]);
         assert_eq!(
             res.notes.len(),
             2,
@@ -1996,10 +2108,13 @@ mod group_tests {
     #[test]
     fn arrows_skip_headings_and_wrap() {
         let p = cmd_palette("");
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),                         // File
-            cmd("ターミナル表示切替", Cmd::ToggleTerminal), // Run
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),                         // File
+                cmd("ターミナル表示切替", Cmd::ToggleTerminal), // Run
+            ],
+            &[],
+        );
         let out = rendered(&res);
         // # Agent なし / # ファイル, 保存, # ターミナル・実行, ターミナル表示切替
         assert_eq!(out.len(), 4, "{out:?}");
@@ -2022,11 +2137,14 @@ mod group_tests {
     #[test]
     fn headings_are_never_selectable() {
         let p = cmd_palette("");
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd("ターミナル表示切替", Cmd::ToggleTerminal),
-            cmd("エージェントへ移動", Cmd::FocusAgent(0)),
-        ]);
+        let res = p.results(
+            vec![
+                cmd("保存", Cmd::Save),
+                cmd("ターミナル表示切替", Cmd::ToggleTerminal),
+                cmd("エージェントへ移動", Cmd::FocusAgent(0)),
+            ],
+            &[],
+        );
         // どこから何回動かしても見出しには乗らない
         let mut sel = 0usize;
         for k in 0..(res.rows.len() * 3) {
@@ -2046,7 +2164,7 @@ mod group_tests {
     #[test]
     fn step_is_a_no_op_without_input_or_on_both_keys() {
         let p = cmd_palette("");
-        let res = p.results(vec![cmd("保存", Cmd::Save)]);
+        let res = p.results(vec![cmd("保存", Cmd::Save)], &[]);
         let sel = res.clamp(0);
         assert_eq!(res.step(sel, false, false), sel);
         assert_eq!(res.step(sel, true, true), sel);
@@ -2056,7 +2174,7 @@ mod group_tests {
     fn empty_results_never_panic() {
         let mut p = Palette::new();
         p.open_files();
-        let res = p.results(vec![]);
+        let res = p.results(vec![], &[]);
         assert_eq!(res.clamp(0), 0);
         assert_eq!(res.step(0, true, false), 0);
         assert!(res.selected_item(0).is_none());
@@ -2067,10 +2185,10 @@ mod group_tests {
     #[test]
     fn filtering_uses_row_tags_instead_of_headings() {
         let p = cmd_palette("保存");
-        let res = p.results(vec![
-            cmd("保存", Cmd::Save),
-            cmd("すべて保存", Cmd::SaveAll),
-        ]);
+        let res = p.results(
+            vec![cmd("保存", Cmd::Save), cmd("すべて保存", Cmd::SaveAll)],
+            &[],
+        );
         assert!(
             res.rows.iter().all(|r| matches!(r, Row::Item(_))),
             "絞り込み中に見出しが混ざっている (順位と喧嘩する)"
@@ -2083,13 +2201,16 @@ mod group_tests {
         let mut p = Palette::new();
         p.open_files();
         p.input = "main".into();
-        let res = p.results(vec![Item {
-            icon: "📄".into(),
-            label: "main.rs".into(),
-            detail: "src/main.rs".into(),
-            action: Action::OpenFile(std::path::PathBuf::from("src/main.rs")),
-            score: 5,
-        }]);
+        let res = p.results(
+            vec![Item {
+                icon: "📄".into(),
+                label: "main.rs".into(),
+                detail: "src/main.rs".into(),
+                action: Action::OpenFile(std::path::PathBuf::from("src/main.rs")),
+                score: 5,
+            }],
+            &[],
+        );
         assert!(!res.tags);
         assert!(res.rows.iter().all(|r| matches!(r, Row::Item(_))));
         assert!(group_of_item(&res.items[0]).is_none());
@@ -2125,21 +2246,25 @@ mod group_tests {
 
         let states = [
             // 見出しあり (素の一覧)
-            used.results(vec![
-                cmd("保存", Cmd::Save),
-                cmd(&long, Cmd::ToggleTerminal),
-                cmd("エージェントへ移動", Cmd::FocusAgent(0)),
-            ]),
+            used.results(
+                vec![
+                    cmd("保存", Cmd::Save),
+                    cmd(&long, Cmd::ToggleTerminal),
+                    cmd("エージェントへ移動", Cmd::FocusAgent(0)),
+                ],
+                &[],
+            ),
             // 行末タグあり (絞り込み中)
-            cmd_palette("保存").results(vec![cmd("保存", Cmd::Save), cmd(&long, Cmd::SaveAll)]),
+            cmd_palette("保存")
+                .results(vec![cmd("保存", Cmd::Save), cmd(&long, Cmd::SaveAll)], &[]),
             // 該当なし (代わりの候補 + 案内文)
-            cmd_palette("zzzz").results(vec![]),
+            cmd_palette("zzzz").results(vec![], &[]),
             // まったくの空 (ファイルモードの該当なし)
             {
                 let mut p = Palette::new();
                 p.open_files();
                 p.input = "zzzz".into();
-                p.results(vec![])
+                p.results(vec![], &[])
             },
         ];
 
@@ -2210,7 +2335,7 @@ mod quick_open_tests {
     #[test]
     fn ファイルパレット連打は候補を下へ送り端で先頭に折り返す() {
         let p = Palette::new(); // ファイルモード (見出し無し)
-        let res = p.results(files(&["a.rs", "b.rs", "c.rs"]));
+        let res = p.results(files(&["a.rs", "b.rs", "c.rs"]), &[]);
         assert_eq!(res.rows.len(), 3, "見出しの無い 3 行");
         let mut sel = 0usize;
         let mut seen = Vec::new();
@@ -2227,9 +2352,9 @@ mod quick_open_tests {
     #[test]
     fn 候補が空でも1件でも連打はパニックしない() {
         let p = Palette::new();
-        let empty = p.results(Vec::new());
+        let empty = p.results(Vec::new(), &[]);
         assert_eq!(cycle(&empty, 0, 3), empty.clamp(0));
-        let one = p.results(files(&["only.rs"]));
+        let one = p.results(files(&["only.rs"]), &[]);
         assert_eq!(cycle(&one, 0, 7), 0, "1 件なら動かない");
     }
 
@@ -2237,10 +2362,13 @@ mod quick_open_tests {
     fn 連打は見出しを飛び越す() {
         let mut p = Palette::new();
         p.open_commands(); // クエリ空 = 見出しつきの一覧
-        let res = p.results(vec![
-            item("保存", Action::Cmd(Cmd::Save)),
-            item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
-        ]);
+        let res = p.results(
+            vec![
+                item("保存", Action::Cmd(Cmd::Save)),
+                item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
+            ],
+            &[],
+        );
         assert!(
             res.rows.iter().any(|r| matches!(r, Row::Heading(_))),
             "見出しが出ていない前提が崩れている"
@@ -2260,7 +2388,10 @@ mod quick_open_tests {
         let mut p = Palette::new();
         p.input = "@New".into();
         assert!(p.is_symbol_mode());
-        let res = p.results(vec![item("NewFoo", Action::Cmd(Cmd::GoToLspPos(10, 4)))]);
+        let res = p.results(
+            vec![item("NewFoo", Action::Cmd(Cmd::GoToLspPos(10, 4)))],
+            &[],
+        );
         assert!(!res.notes.is_empty(), "案内が出ていない");
         assert!(
             res.notes[0].contains('%'),
@@ -2276,7 +2407,7 @@ mod quick_open_tests {
     fn シンボルモードで候補が無くても案内だけは残る() {
         let mut p = Palette::new();
         p.input = "@zzz".into();
-        let res = p.results(Vec::new());
+        let res = p.results(Vec::new(), &[]);
         assert!(res.notes.iter().any(|n| n.contains('%')));
         // 「> でコマンド…」の一般案内と二重に出さない
         assert_eq!(
@@ -2308,10 +2439,13 @@ mod quick_open_tests {
         restored.rehydrate(|label| Some((format!("[{label}]"), Action::Cmd(Cmd::Save))));
         assert!(!restored.needs_rehydrate());
         // 順位付け (MRU) は復元直後から効く
-        let res = restored.results(vec![
-            item("保存", Action::Cmd(Cmd::Save)),
-            item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
-        ]);
+        let res = restored.results(
+            vec![
+                item("保存", Action::Cmd(Cmd::Save)),
+                item("ターミナル表示切替", Action::Cmd(Cmd::ToggleTerminal)),
+            ],
+            &[],
+        );
         assert_eq!(res.items[0].label, "ターミナル表示切替");
     }
 
@@ -2342,7 +2476,7 @@ mod quick_open_tests {
         let mut p = Palette::new();
         p.input = ">zzzz".into();
         p.restore_recent(&[("復元だけされた".into(), String::new(), 2)]);
-        let res = p.results(Vec::new());
+        let res = p.results(Vec::new(), &[]);
         assert!(
             !res.items.iter().any(|i| i.label == "復元だけされた"),
             "実体の無い項目が候補に出ている"
@@ -2353,14 +2487,216 @@ mod quick_open_tests {
     #[test]
     fn 位置つきで開く候補も分類なしのファイルとして扱われる() {
         let p = Palette::new();
-        let res = p.results(vec![item(
-            "main.rs",
-            Action::OpenFileAt(PathBuf::from("main.rs"), 41, 4),
-        )]);
+        let res = p.results(
+            vec![item(
+                "main.rs",
+                Action::OpenFileAt(PathBuf::from("main.rs"), 41, 4),
+            )],
+            &[],
+        );
         assert_eq!(res.rows.len(), 1);
         assert!(matches!(
             res.selected_item(0).map(|i| i.action.clone()),
             Some(Action::OpenFileAt(_, 41, 4))
         ));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  日本語 IME (全角) 入力
+//
+//  IME を ON にしたまま `>` を打つと入るのは全角の `＞`(U+FF1E)。接頭辞として
+//  読めないと、コマンド名がそのままファイル検索へ流れて「一致するものは
+//  ありません」で行き止まりになる (実機で報告された)。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+
+    fn cmd(label: &str, c: Cmd) -> Item {
+        Item {
+            icon: "●".into(),
+            label: label.into(),
+            detail: String::new(),
+            action: Action::Cmd(c),
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn 全角asciiだけを半角へ畳む() {
+        // 畳む — プレフィクス 5 種
+        for (full, half) in [
+            ('＞', '>'),
+            ('＠', '@'),
+            ('％', '%'),
+            ('＃', '#'),
+            ('：', ':'),
+        ] {
+            assert_eq!(fold_fullwidth_ascii(full), half, "{full} が畳めていない");
+        }
+        // 畳む — 数字・英字・区切り、そして範囲の両端
+        for (full, half) in [
+            ('０', '0'),
+            ('１', '1'),
+            ('５', '5'),
+            ('９', '9'),
+            ('Ａ', 'A'),
+            ('ｚ', 'z'),
+            ('，', ','),
+            ('！', '!'), // 範囲の先頭 U+FF01
+            ('～', '~'), // 範囲の末尾 U+FF5E
+        ] {
+            assert_eq!(fold_fullwidth_ascii(full), half, "{full} が畳めていない");
+        }
+        // 半角はそのまま (冪等)
+        for c in ['>', '@', '%', '#', ':', '0', '9', 'A', 'z', ' '] {
+            assert_eq!(fold_fullwidth_ascii(c), c, "{c} が書き換わっている");
+            assert_eq!(fold_fullwidth_ascii(fold_fullwidth_ascii(c)), c);
+        }
+    }
+
+    #[test]
+    fn 半角カナと仮名漢字は畳まない() {
+        // 半角カナ U+FF61..=U+FF9F は全角 ASCII の**すぐ隣**。巻き込むと壊れる。
+        for cp in 0xFF61u32..=0xFF9Fu32 {
+            let c = char::from_u32(cp).expect("半角カナのコードポイント");
+            assert_eq!(fold_fullwidth_ascii(c), c, "半角カナ U+{cp:04X} を畳んだ");
+        }
+        // 境界の外側 (U+FF00 は未割り当て、U+FF5F/U+FF60 は全角括弧)
+        for cp in [0xFF00u32, 0xFF5Fu32, 0xFF60u32] {
+            let c = char::from_u32(cp).expect("境界のコードポイント");
+            assert_eq!(fold_fullwidth_ascii(c), c, "U+{cp:04X} を畳んだ");
+        }
+        // 全角スペース (U+3000)・ひらがな・カタカナ・漢字・絵文字
+        for c in ['\u{3000}', 'あ', 'ア', 'マ', '漢', '字', '🎨'] {
+            assert_eq!(fold_fullwidth_ascii(c), c, "{c:?} を畳んだ");
+        }
+    }
+
+    #[test]
+    fn 全角プレフィクスでも各モードへ入る() {
+        let mut p = Palette::new();
+
+        p.input = "＞マルチバッファ".into();
+        assert!(p.is_command_mode(), "全角 ＞ がコマンドモードにならない");
+        assert!(!p.is_symbol_mode() && !p.is_goto_mode());
+        assert_eq!(p.query(), "マルチバッファ");
+
+        p.input = "＠new".into();
+        assert!(p.is_symbol_mode() && !p.is_agent_mode());
+
+        p.input = "％claude".into();
+        assert!(p.is_agent_mode() && !p.is_symbol_mode());
+
+        p.input = "＃issue".into();
+        assert!(p.is_root_mode());
+
+        p.input = "：123".into();
+        assert!(p.is_goto_mode() && !p.is_command_mode());
+
+        // 前置きの空白 (全角スペースを含む) があっても同じ
+        p.input = "\u{3000} ＞保存".into();
+        assert!(p.is_command_mode());
+        assert_eq!(p.query(), "保存");
+    }
+
+    #[test]
+    fn 全角プレフィクスを剥がしてもクエリ本体は畳まない() {
+        let mut p = Palette::new();
+        // `Ａ` は打ち間違いではなくユーザーが打ちたかった文字。
+        p.input = "＞Ａあ".into();
+        assert_eq!(p.query(), "Ａあ");
+        // 2 文字目以降のプレフィクス文字は半角と同じく残る
+        p.input = "＞＠foo".into();
+        assert_eq!(p.query(), "＠foo");
+        // プレフィクスが無ければ 1 バイトも触らない (全角のファイル名も引ける)
+        p.input = "ＡＢＣ.rs".into();
+        assert!(!p.is_command_mode());
+        assert_eq!(p.query(), "ＡＢＣ.rs");
+        // プレフィクスだけなら空
+        for input in ["＞", "＠", "％", "＃", "：", "＞   "] {
+            p.input = input.into();
+            assert_eq!(p.query(), "", "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn 行番号モードは全角数字でも同じ結果になる() {
+        for (full, half) in [
+            ("１２３", "123"),
+            ("１２：４５", "12:45"),
+            ("１２，４５", "12,45"),
+            ("\u{3000}７\u{3000}", " 7 "),
+            ("０", "0"),
+        ] {
+            assert_eq!(
+                crate::editor_ops::parse_goto(&fold_goto(full)),
+                crate::editor_ops::parse_goto(half),
+                "{full} と {half} で移動先が違う"
+            );
+        }
+        // 実際の値も確かめる (畳めているのに 0 起点がずれていないこと)
+        assert_eq!(
+            crate::editor_ops::parse_goto(&fold_goto("１２：４５")),
+            Some((11, 44))
+        );
+        // 数字でないものは畳んでも None のまま
+        assert_eq!(crate::editor_ops::parse_goto(&fold_goto("あいう")), None);
+        // 半角カナを数字に化けさせない
+        assert_eq!(crate::editor_ops::parse_goto(&fold_goto("ｱｲｳ")), None);
+    }
+
+    #[test]
+    fn 該当なしの案内はコマンドとして当たるときだけ出る() {
+        let mut p = Palette::new();
+        p.open_files();
+        p.input = "マルチバッファ".into();
+
+        // 当たるとき — 件数付きで 1 行。プレフィクス一覧とは重ねない
+        let alt = vec![
+            cmd("マルチバッファを開く", Cmd::Save),
+            cmd("マルチバッファを閉じる", Cmd::OpenFind),
+        ];
+        let res = p.results(Vec::new(), &alt);
+        assert_eq!(res.notes.len(), 2, "案内が 1 行ではない: {:?}", res.notes);
+        assert!(
+            res.notes[1].contains('>') && res.notes[1].contains('2'),
+            "件数の案内が出ていない: {:?}",
+            res.notes
+        );
+        assert!(
+            !res.notes[1].contains('@'),
+            "件数の案内とプレフィクス一覧が二重に出ている: {:?}",
+            res.notes
+        );
+        // ファイルモードでコマンドを勝手に候補へ出さない (案内するだけ)
+        assert!(res.items.is_empty());
+
+        // 当たらないとき — 固定文言にせず、従来のプレフィクス案内へ戻る
+        let res = p.results(Vec::new(), &[]);
+        assert_eq!(res.notes.len(), 2);
+        assert!(res.notes[1].contains('@'), "プレフィクス案内が消えている");
+
+        // パレットから隠しているコマンドは数に入れない (押せないものを数えない)
+        let hidden = vec![
+            cmd("バージョン情報", Cmd::ShowAbout),
+            cmd("プラグインを再スキャン", Cmd::RescanPlugins),
+        ];
+        assert!(hidden.iter().all(|it| match &it.action {
+            Action::Cmd(c) => hidden_from_palette(c),
+            _ => false,
+        }));
+        let res = p.results(Vec::new(), &hidden);
+        assert!(
+            res.notes[1].contains('@'),
+            "隠しコマンドを件数に数えている: {:?}",
+            res.notes
+        );
+
+        // クエリが空なら案内も出さない (0 を表示するバッジにしない)
+        p.input = String::new();
+        let res = p.results(Vec::new(), &[]);
+        assert!(res.notes[0].contains("候補がありません"));
     }
 }

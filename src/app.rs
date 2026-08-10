@@ -24382,9 +24382,19 @@ impl ZaivernApp {
             self.palette_items_file_mode(&mut items);
         }
 
+        // 行き止まり対策: 何も当たらなかったときだけ、同じクエリを**コマンドとして**
+        // 評価し直す。接頭辞を付け忘れる (日本語 IME を ON にしたまま打って
+        // `>` が入らなかった等) と、コマンド名がそのままファイル検索へ流れて
+        // 「一致するものはありません」で行き止まりになる。当たったときだけ
+        // 案内を 1 行出すので、当たらなければ何も増えない。
+        let mut command_alt: Vec<Item> = Vec::new();
+        if items.is_empty() && !self.palette.is_command_mode() && !q.trim().is_empty() {
+            self.palette_items_command_mode(&pq, &mut command_alt);
+        }
+
         // 並べ替え・件数の頭打ち・グループ分け・空/不一致の見せ方は
         // すべて palette 側の純粋関数に任せる (テーブルテストで固定済み)。
-        self.palette.results(items)
+        self.palette.results(items, &command_alt)
     }
 
     /// パレット: 組み込みコマンド定義 (icon, label, keybind, Cmd) の一覧。
@@ -25836,8 +25846,13 @@ impl ZaivernApp {
     /// パースは `editor_ops::parse_goto` ただ 1 本 (⌃G の小窓と同じもの)。
     /// 行数を超える値・0 行目は `char_index_at` が末尾へ丸めるので、
     /// ここでクランプはしない (二重の丸めは挙動を読みにくくする)。
+    ///
+    /// 日本語入力中は `：１２：４５` のように**数字まで全角**で入るので、
+    /// パースの手前で `palette::fold_goto` に通す。畳んでよいのはこのモードの
+    /// クエリだけ (理由は `palette::fold_fullwidth_ascii` のドキュメント)。
     fn palette_items_goto_mode(&self, items: &mut Vec<Item>) {
-        let Some((line, col)) = editor_ops::parse_goto(self.palette.query()) else {
+        let q = crate::palette::fold_goto(self.palette.query());
+        let Some((line, col)) = editor_ops::parse_goto(&q) else {
             return;
         };
         if self.editor.active.is_none() {
@@ -32942,7 +32957,9 @@ impl ZaivernApp {
                 );
                 resp.request_focus();
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    go = editor_ops::parse_goto(&self.goto_input);
+                    // パレットの `:` モードと同じ扱い — 日本語入力中は
+                    // `４２：５` のように全角で入るので半角へ畳んでから読む。
+                    go = editor_ops::parse_goto(&crate::palette::fold_goto(&self.goto_input));
                     close = true;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -43008,7 +43025,7 @@ mod quick_open_tests {
 
     fn labels(items: &[Item]) -> Vec<String> {
         let p = crate::palette::Palette::new();
-        let res = p.results(items.to_vec());
+        let res = p.results(items.to_vec(), &[]);
         res.items.iter().map(|i| i.label.clone()).collect()
     }
 
@@ -43121,6 +43138,29 @@ mod quick_open_tests {
         // 桁が本文より大きくても丸まる
         let ch = editor_ops::char_index_at(text, 0, usize::MAX);
         assert_eq!(ch, "1 行目".chars().count());
+    }
+
+    /// 行ジャンプの入口は 2 つ (パレットの `:` モードと ⌃G の小窓)。
+    /// **どちらも** `palette::fold_goto` を通してから `parse_goto` を呼ぶこと。
+    /// 片方だけ直すと「パレットでは飛べるのに小窓では飛べない」が残る。
+    #[test]
+    fn 行ジャンプの入口はどちらも全角を畳んでから読む() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let direct = src.matches("editor_ops::parse_goto(").count();
+        let folded = src
+            .matches("editor_ops::parse_goto(&crate::palette::fold_goto(")
+            .count()
+            + src.matches("let q = crate::palette::fold_goto(").count();
+        // 行ジャンプの 2 経路 + `split_path_goto` (パスの `:12` 用。ここは
+        // ファイル名の一部なので畳んではいけない) + このテストと隣のテストの参照。
+        assert!(
+            folded >= 2,
+            "全角を畳んでいる行ジャンプ経路が {folded} 本しかない (direct={direct})"
+        );
+        assert!(
+            src.contains("editor_ops::parse_goto(&crate::palette::fold_goto(&self.goto_input))"),
+            "⌃G の小窓が全角数字を畳んでいない"
+        );
     }
 
     #[test]
