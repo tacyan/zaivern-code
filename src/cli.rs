@@ -254,7 +254,7 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
+    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n{HELP_TRAIN_SPLIT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
 }
 
 const HELP_HEAD: &str = "\
@@ -353,6 +353,26 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
 /// **本文は [`crate::guard`] 側の唯一の出所を指すだけ**。ここへ写経すると
 /// `zai guard --help` と `zai --help` が食い違う (それを戒めるテストが下にある)。
 pub const HELP_GUARD: &str = crate::features::guard::HELP;
+
+/// 順次統合 (マージトレイン) と、配る前の担当分割、そして git マージドライバ。
+///
+/// **本文はここに 1 行ずつの索引だけ置く。** 詳しい使い方は
+/// `zai train --help` / `zai split --help` がそれぞれの実体から出す
+/// (写経すると必ず食い違う。`HELP_GUARD` と同じ方針)。
+pub const HELP_TRAIN_SPLIT: &str = "\
+統合 (並列で走らせた成果を、衝突ゼロで1本にまとめます):
+  zai split plan --tasks <ファイル|->   配る前に、互いに素な担当表を作る
+                                        (終了コード: 0=互いに素 / 1=共有パスが残った)
+  zai train plan [--onto <ブランチ>]    統合の順序と、予想される衝突を出す
+  zai train run [--onto <ブランチ>] [--dry-run]
+                                        重なりの少ない順に自動リベースして統合する
+                                        衝突したら全部戻す (部分統合を残しません)
+  zai merge-driver ...                  git が custom merge driver として起動する入口
+                                        (人が打つものではありません。導入はパレットの
+                                         「追記の自動マージ」から)
+  詳しい使い方は zai train --help / zai split --help
+
+";
 
 /// `zai update --help` のセクション。
 pub const HELP_UPDATE: &str = "\
@@ -2504,6 +2524,7 @@ mod tests {
             HELP_AGENT,
             HELP_LEASE,
             HELP_GUARD,
+            HELP_TRAIN_SPLIT,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {

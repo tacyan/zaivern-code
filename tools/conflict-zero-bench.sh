@@ -24,9 +24,9 @@
 #   union     ④ 共有面の自動解決。git のマージドライバとして働かせ、
 #             ベースラインと同じ書き込みを別のドライバでマージし直す
 #             (`--union-driver` で任意のドライバを指せる。既定は
-#              `zai union` があればそれ。無ければ skip)
-#   train     ③ 統合の順序付け。**未実装のため常に skip**。
-#             契約が決まっていないものを推測で呼ぶコードは書かない
+#              `zai merge-driver` があればそれ。無ければ skip)
+#   train     ③ 統合の順序付け。`zai train` があれば乾式検査を回し、
+#             「この順序なら衝突する」を実行前に出せるかを見る。無ければ skip
 #
 # ## 使い方
 #
@@ -224,8 +224,9 @@ elif has_sub hook && has_sub lease; then
 fi
 
 # 段④。`--union-driver` が明示されていればそれが最優先 (配管の検算に使う)。
-if [ -z "$union_driver" ] && has_sub union; then
-    union_driver="$zai union merge-driver %O %A %B %P"
+# 実装は `zai merge-driver`。`%L` (marker size) まで渡すのが git の規約。
+if [ -z "$union_driver" ] && has_sub merge-driver; then
+    union_driver="$zai merge-driver %O %A %B %L %P"
 fi
 
 # ── 使い捨ての作業場 ──────────────────────────────────────────────
@@ -833,7 +834,7 @@ def main(argv):
             {
                 "stage": "union",
                 "status": "skipped",
-                "reason": "zai union が見つかりません (--union-driver で任意のドライバを指せます)",
+                "reason": "zai merge-driver が見つかりません (--union-driver で任意のドライバを指せます)",
             }
         )
     else:
