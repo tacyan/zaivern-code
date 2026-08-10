@@ -27,8 +27,9 @@
 //! 他人が自分より上の行を書き換えると、自分の行域は下へずれる。行番号だけを
 //! 持っていると、次の書き込みで**別人の領域を自分のものだと思い込む**。
 //! [`Anchor`] は域の先頭行・末尾行の内容と行数を持ち、[`resolve`] が現在の
-//! テキストから域を取り直す。追従 ([`follow`]) は [`crate::marks::map_lines`] を
-//! 再利用する (2 実装を持つとズレるため、行対応の計算はここで再発明しない)。
+//! テキストから域を取り直す。**行番号は保存せず、必要になった時にだけ
+//! 取り直す** (遅延解決)。書き込みのたびに全担当の行番号をずらして回る
+//! eager な追従は持たない — 理由は [`resolve`] に書いた。
 //!
 //! ## 決定性
 //!
@@ -358,7 +359,7 @@ pub fn render(r: &Region) -> String {
 /// 記号指定も含めて、**テキストを見て**行域を確定させる。
 ///
 /// 記号が見つからなければ `Err`。錨も同時に打つので、返った [`Region`] は
-/// そのまま [`follow`] / [`resolve`] で追従できる。
+/// そのまま [`resolve`] で取り直せる。
 pub fn resolve_spec(s: &Spec, text: &str) -> Result<Region, String> {
     match &s.sel {
         Sel::Whole => Ok(Region::whole(&s.path)),
@@ -502,6 +503,15 @@ pub fn capture_anchor(text: &str, span: &Span) -> Anchor {
 /// 「たぶんここだろう」で近い場所を掴むと、他人の領域を自分のものだと
 /// 思い込む事故になる。確信が無ければ持ち主に確保し直させるほうが安い。
 ///
+/// # 追従はこれ 1 本 (eager な `follow` は消した)
+///
+/// 以前は「書き込みが起きるたびに全担当の行番号をずらして回る」eager な
+/// `follow` も持っていたが、[`crate::lease`] は**判定のときにここで取り直す**
+/// 遅延解決を採ったので、呼ぶ人が 1 人もいなくなった (テストだけが呼んでいて
+/// `clippy -D warnings` が `never used` で落ちた)。**2 本持つと必ずズレる**
+/// — 行番号を先に動かしておく設計は、更新を 1 回取りこぼした瞬間に
+/// 「ずれた行番号」を正しいものとして扱ってしまう。消したのは意図的である。
+///
 /// # 曖昧なときは断る
 ///
 /// `}` だけの行・空行・`use std::fmt;` のように**同じ内容の行が複数ある**のは
@@ -629,75 +639,6 @@ fn nearest_unique(lines: &[&str], want: &str, pref: usize, radius: usize) -> Opt
         return None;
     }
     best
-}
-
-/// 他人の編集で行がずれた後、自分の行域を追従させる。
-///
-/// 行の対応付けは [`crate::marks::map_lines`] を再利用する。
-/// 対応が取れない (自分の域が丸ごと消された) 場合は `false` を返し、
-/// 呼び出し側は**確保し直す**。
-///
-/// # 端が消えても諦めない
-///
-/// 素朴に「先頭行と末尾行の両方が対応しなければ失敗」にすると、他人が
-/// 自分の域の**1 行上**を書き換えただけで域を失う。ここでは域の中で
-/// **生き残った最初の行と最後の行**へ縮める。縮む方向は常に安全
-/// (持つ行が減るだけで、他人の行を掴むことはない)。
-///
-/// # 太りすぎたら失ったとみなす
-///
-/// [`crate::marks::map_lines`] は行数が大きいと LCS を諦めて共通の接頭辞/接尾辞
-/// しか返さない。そのとき素朴に「最初と最後の生存行」を採ると、間に挟まった
-/// **他人の数千行を自分の域として飲み込む**。域の伸びがファイル全体の増減を
-/// 超えたら追従に失敗したとみなす。
-pub fn follow(r: &mut Region, old_text: &str, new_text: &str) -> bool {
-    let Some(span) = r.span else {
-        return true; // ファイル全体は動かない
-    };
-    let old = lines_of(old_text);
-    let new = lines_of(new_text);
-    if old.is_empty() || new.is_empty() {
-        return false;
-    }
-    let eof = span.end == Span::EOF;
-    let lo = (span.start.max(1) - 1) as usize;
-    if lo >= old.len() {
-        return false;
-    }
-    let hi = if eof {
-        old.len() - 1
-    } else {
-        ((span.end as usize).saturating_sub(1)).min(old.len() - 1)
-    };
-    if hi < lo {
-        return false;
-    }
-    let map = crate::marks::map_lines(&old, &new);
-    let mut first: Option<usize> = None;
-    let mut last: Option<usize> = None;
-    for i in lo..=hi {
-        if let Some(Some(j)) = map.get(i).copied() {
-            if first.is_none() {
-                first = Some(j);
-            }
-            last = Some(j);
-        }
-    }
-    let (Some(s0), Some(e0)) = (first, last) else {
-        return false;
-    };
-    if e0 < s0 {
-        return false;
-    }
-    let budget = (hi - lo + 1) + new.len().abs_diff(old.len());
-    if e0 - s0 + 1 > budget {
-        return false;
-    }
-    let s = (s0 + 1) as u32;
-    let e = if eof { Span::EOF } else { (e0 + 1) as u32 };
-    r.span = Some(Span { start: s, end: e });
-    r.anchor = capture_anchor(new_text, &Span { start: s, end: e });
-    true
 }
 
 /// 書き込みの前後から「実際に触れた行域」を出す (**新しいファイルの行番号**)。
@@ -1681,14 +1622,11 @@ mod tests {
     fn 錨で行域を取り直せる() {
         let text = numbered(50);
         let span = Span { start: 10, end: 20 };
-        let mut r = region_at(&text, span);
+        let r = region_at(&text, span);
         // 上に 5 行足す → 15..25 へずれる
         let shifted = format!("x\nx\nx\nx\nx\n{text}");
         let got = resolve(&r, &shifted).expect("取り直せるはず");
         assert_eq!(got, Span { start: 15, end: 25 });
-        // follow でも同じ結論になる
-        assert!(follow(&mut r, &text, &shifted));
-        assert_eq!(r.span, Some(Span { start: 15, end: 25 }));
     }
 
     #[test]
@@ -1736,19 +1674,11 @@ mod tests {
             start: 25,
             end: Span::EOF,
         };
-        let mut r = region_at(&text, span);
+        let r = region_at(&text, span);
         // 自分で末尾へ追記しても、EOF の域は EOF のまま追従する
         let grown = format!("{text}line 31\nline 32\n");
         assert_eq!(
             resolve(&r, &grown),
-            Some(Span {
-                start: 25,
-                end: Span::EOF
-            })
-        );
-        assert!(follow(&mut r, &text, &grown));
-        assert_eq!(
-            r.span,
             Some(Span {
                 start: 25,
                 end: Span::EOF
@@ -1776,31 +1706,6 @@ mod tests {
         assert_eq!(resolve(&r, &shifted), Some(Span { start: 12, end: 22 }));
         // 改行コードを変えただけなら「触っていない」
         assert_eq!(touched_spans(&lf, &crlf, SAFE_BAND), vec![]);
-    }
-
-    #[test]
-    fn 域の途中が消えても生き残りへ縮む() {
-        let text = numbered(50);
-        let mut r = region_at(&text, Span { start: 10, end: 20 });
-        // 他人が 10 行目を消した (本当は起きてはいけないが、起きたら縮む)
-        let cut = text.replace("line 10\n", "");
-        assert!(follow(&mut r, &text, &cut));
-        assert_eq!(
-            r.span,
-            Some(Span { start: 10, end: 19 }),
-            "11..20 が 10..19 へ"
-        );
-    }
-
-    #[test]
-    fn 域が丸ごと消えたら正直に失敗する() {
-        let text = numbered(50);
-        let mut r = region_at(&text, Span { start: 10, end: 12 });
-        let mut cut = text.clone();
-        for i in 10..=12 {
-            cut = cut.replace(&format!("line {i}\n"), "");
-        }
-        assert!(!follow(&mut r, &text, &cut), "取り直させるべき");
     }
 
     #[test]

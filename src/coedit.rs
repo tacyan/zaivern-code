@@ -26,7 +26,7 @@
 //!    **座標系が 1 つでなければ行域を比べても意味が無い**ので、ここが土台。
 //! 2. 各ブランチについて `git diff --unified=0 C..<branch>` を読み、
 //!    **C 側の行番号**で「実際に触った行域」を [`crate::region::Region`] として起こす。
-//! 3. 全参加者の行域が [`crate::region::SAFE_BAND`] 行の安全帯を挟んで
+//! 3. 全参加者の行域が [`crate::region::MERGE_ONLY_BAND`] 行の安全帯を挟んで
 //!    **互いに素**なら [`Proof::disjoint`] を立てる。
 //!
 //! 互いに素なら、C の各行を書き換えた参加者は高々 1 人。git の 3 方向マージは
@@ -37,43 +37,91 @@
 //!
 //! 途中の座標系がずれない理由も安全帯が担保する。先に入った誰かが
 //! 間の行を削っても、**未変更行は誰も消さない**ので、残りの参加者の間には
-//! 常に `band` 行以上の未変更行が残る (安全帯 3 行 × 2 = 6 行から、
-//! 削られるのは相手の行域だけ)。
+//! 常に `band` 行以上の未変更行が残る (削られるのは相手の行域だけ)。
+//!
+//! ## なぜ安全帯が 1 行で足りるのか (実測)
+//!
+//! 帯は長らく [`crate::region::SAFE_BAND`] = 3 を使っていたが、**それは
+//! ここでは根拠の無い過剰防衛だった**。実 git で経路ごとに下限を測り直した
+//! 結果 (`region.rs` の `実gitで三方向マージの下限が1行であることを測る` /
+//! `実gitでパッチ適用の下限を測る`):
+//!
+//! | 経路 | 相手=置換 | 相手=削除 | 相手=挿入 | 下限 |
+//! |---|---:|---:|---:|---:|
+//! | `git merge-file -p` | 1 | 1 | 1 | **1** |
+//! | `git merge-tree --write-tree` / `git merge` | 1 | 1 | 1 | **1** |
+//! | `git apply` (文脈 3 行) | 3 | 3 | 3 | **3** |
+//!
+//! **三方向マージは 1 行離れていれば足りる。** 「diff の既定文脈が 3 行だから
+//! ハンクが畳まれる」は誤りで、3 行は*表示*の話でしかない (`myers` /
+//! `minimal` / `patience` / `histogram` の 4 アルゴリズムすべてで同じ結果)。
+//! 3 が要るのは**パッチ適用**の経路だけで、[`crate::region::SAFE_BAND`] が
+//! 3 なのは `git apply` / `git am` まで含めた最悪経路に合わせているため。
+//!
+//! **このモジュールの証明が保証しているのは `git merge` が衝突しないこと、
+//! ただそれだけである。** 統合の実行部 ([`integrate`]) は
+//! `merge-tree` + `commit-tree` + `update-ref` の 3 手しか使わず、
+//! `git apply` は 1 度も通らない。よってここは
+//! [`crate::region::MERGE_ONLY_BAND`] = 1 を使うのが正しい。
+//!
+//! > ⚠ **戻す条件**: 将来この機能に `git apply` / `git am` /
+//! > `git format-patch` / `git rebase --apply` を通す経路が 1 つでも生えたら、
+//! > **帯を [`crate::region::SAFE_BAND`] へ戻さなければならない**。
+//! > 帯 1 で証明した組は、パッチ適用では平気で落ちる。
+//! > 帯は [`Proof::band`] として画面・JSON の両方に出しているので、
+//! > 「どの帯で証明したか」は後からでも必ず分かる (丸めていない)。
 //!
 //! ## 実測 (`cargo test --bin zai coedit:: -- --nocapture`)
 //!
 //! 擬似乱数 (種固定。`HashMap` / `HashSet` の反復順は 1 バイトも混ざらない) で
-//! 2〜5 本のブランチが 300 行のファイルの違う行域を書き換えるケースを作り、
-//! **実 git で本当にマージして**突き合わせた。**誇張しないために、
-//! 良くない数字も並べて書く**:
+//! **1 ケース = 1 ファイル**を 240 本作り、2〜5 本のブランチが 120 行の
+//! ファイルを**置換・削除・挿入**のいずれかで書き換える。行域は production と
+//! 同じ `git diff` から取り、**全ペアを実際に `git merge`** して突き合わせた
+//! (衝突したファイルは `git ls-files --unmerged` がパス単位で返す)。
+//! **誇張しないために、良くない数字も並べて書く**:
 //!
-//! | | 件数 |
-//! |---|---:|
-//! | 回したケース | **48** |
-//! | 証明が立った | 33 |
-//! | └ 実際に `git merge` が綺麗だった | **33 (全部)** |
-//! | └ **見逃し (証明が立ったのに衝突した)** | **0** |
-//! | 証明が立たなかった | 15 |
-//! | └ 実際は綺麗に入った (**過剰報告**) | 6 = **40.0%** |
-//! | └ うち「安全帯だけが理由」(行は重なっていない) | **6 (全部)** |
+//! | | 帯 1 (既定) | 帯 3 (旧既定) |
+//! |---|---:|---:|
+//! | 回したケース | **240** | 240 (同じケース列) |
+//! | 証明が立った | **122** | 72 |
+//! | └ 実際に `git merge` が綺麗だった | **122 (全部)** | 72 (全部) |
+//! | └ **見逃し (証明が立ったのに衝突した)** | **0** | 0 |
+//! | 証明が立たなかった | 118 | 168 |
+//! | └ 実際は綺麗に入った (**過剰報告**) | 18 = **15.3%** | 68 = **40.5%** |
+//! | └ うち「安全帯だけが理由」(行は重なっていない) | 16 | 68 (全部) |
 //!
 //! * **見逃しは 1 件も無い。** これが唯一の必須条件で、テストは 1 件でも
-//!   出たら `panic!` する。
-//! * **過剰報告 40% は安いとは言えない。** 「衝突する」と言われた 15 件のうち
-//!   6 件は、実際には git が綺麗に混ぜられた。**内訳を見ると 6 件すべてが
-//!   「行は重なっていないが安全帯 (3 行) より近い」**で、行域が重なっていた
-//!   9 件は本当に衝突していた。つまり過剰報告のコストは丸ごと
-//!   [`crate::region::SAFE_BAND`] の代金である。
-//! * 帯を下げれば過剰報告は減るが、**一撃マージの保証がそこで壊れる**
-//!   (region.rs が実 git で下限を測っている)。`--band` で下げられるように
-//!   してあるが、下げた統合に「一撃」の保証は付かない。
+//!   出たら `panic!` する。帯を 1 まで下げても 0 のままだった。
+//! * **帯 3 → 1 で過剰報告が 40.5% → 15.3% へ落ちた。** 帯 3 では止まっていた
+//!   **50 件**が新たに証明でき、そのすべてが実 git で綺麗に入った。
+//!   40.5% という数字は「衝突する」と言われた 168 件のうち 68 件が実は
+//!   綺麗だったという意味で、**その 68 件は 1 件残らず「行は重なっていないが
+//!   安全帯より近い」だけ**だった — つまり旧既定の過剰報告は丸ごと
+//!   帯の代金であり、その代金は `git apply` を使わないここでは払う必要が無い。
+//! * **残った 15.3% は帯のせいではない。** 18 件の内訳は、
+//!   (a) 挿入点は「行と行の間」にあるのに、こちらは直前の 1 行として
+//!   持つため左へ 1 行ぶん厚い 16 件と、(b) 2 本が**同じ行を同じように削った**
+//!   ため git が同一変更として畳んだ 2 件。どちらも実 git で裏取り済み
+//!   (10 行目の直後と 11 行目の直後への挿入 → clean、同じ 3 行の削除どうし
+//!   → clean)。安全側の倒し方なので、帯をこれ以上下げても消えない。
 //!
 //! 過剰報告を許して見逃しを許さないのは、**逆の間違いだけが致命的**だから。
 //! 証明が嘘をつくと、ユーザーは「一撃でマージできる」を信じて夜間に無人で
 //! 回し、朝に衝突マーカ入りの main を見ることになる。
 //!
+//! ### 並列度への意味 (純粋な算術)
+//!
+//! 2,000 行のファイルに 80 行の担当を配ると、1 本が占めるのは
+//! 「80 行 + 安全帯」。帯 3 なら 83 行で **24 本**、帯 1 なら 81 行で
+//! **24 本** — この粒度では変わらない。差が出るのは**細かく配るとき**で、
+//! 20 行の担当なら 2000/23 = **86 本** → 2000/21 = **95 本** (+10%)、
+//! 5 行なら 2000/8 = **250 本** → 2000/6 = **333 本** (+33%)。
+//! 帯は担当 1 本ごとに定額でかかるので、**担当が細かいほど帯の比率が効く**。
+//! 実測の 240 ケースで証明が 72 → 122 本 (**+69%**) 増えたのは、
+//! エージェントが実際に書く差分が数行単位だからである。
+//!
 //! 統合そのものの実測は `実gitで一撃統合が人手ゼロで通る` が出す
-//! (**4 本 / 約 0.6 秒 / 人手 0 回**。作業ツリーは一度も触らない)。
+//! (**4 本 / 約 0.8 秒 / 人手 0 回**。作業ツリーは一度も触らない)。
 //!
 //! ## 🚃 マージトレイン (`src/train.rs`) との住み分け
 //!
@@ -242,7 +290,11 @@ impl BranchRegions {
 pub struct Proof {
     /// 互いに素か。**これが証明そのもの。**
     pub disjoint: bool,
-    /// 使った安全帯 (既定は [`crate::region::SAFE_BAND`])。
+    /// 使った安全帯 (既定は [`crate::region::MERGE_ONLY_BAND`] = 1)。
+    ///
+    /// **丸めずに必ず出す。** 画面 ([`Proof::verdict`]) と `--json` の両方に
+    /// 出るので、「どの帯で立った証明か」を後から取り違えられない。
+    /// `--band` で下げた証明と既定の証明を、数字を見ずに混ぜないため。
     pub band: u32,
     /// 互いに素でないなら、原因の組。空でなければ `disjoint` は必ず `false`。
     pub pairs: Vec<Clash>,
@@ -282,12 +334,18 @@ impl Proof {
         }
         if let Some(note) = &self.note {
             if self.pairs.is_empty() {
-                return trf("⛔ 証明できません: {m}", &[("m", note.clone())]);
+                return trf(
+                    "⛔ 証明できません (安全帯 {b} 行): {m}",
+                    &[("b", self.band.to_string()), ("m", note.clone())],
+                );
             }
         }
         trf(
-            "⛔ {n} 組が近すぎます — このままでは人手が要ります",
-            &[("n", (self.pairs.len() + self.truncated).to_string())],
+            "⛔ {n} 組が近すぎます (安全帯 {b} 行) — このままでは人手が要ります",
+            &[
+                ("n", (self.pairs.len() + self.truncated).to_string()),
+                ("b", self.band.to_string()),
+            ],
         )
     }
 }
@@ -320,7 +378,11 @@ impl Yield {
 /// 統合の指定。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opts {
-    /// 安全帯。既定は [`crate::region::SAFE_BAND`]。
+    /// 安全帯。既定は [`crate::region::MERGE_ONLY_BAND`] = 1。
+    ///
+    /// この機能は `git merge` しか通さないので 1 で足りる (モジュール doc の
+    /// 実測表)。`git apply` を通す経路が生えたら
+    /// [`crate::region::SAFE_BAND`] へ戻すこと。
     pub band: u32,
     /// 乾式検査までで止める (参照を 1 つも動かさない)。
     pub dry_run: bool,
@@ -334,7 +396,7 @@ pub struct Opts {
 impl Default for Opts {
     fn default() -> Self {
         Opts {
-            band: region::SAFE_BAND,
+            band: region::MERGE_ONLY_BAND,
             dry_run: false,
             force: false,
         }
@@ -1300,8 +1362,9 @@ pub mod cliface {
       ブランチを省略すると、統合先より先に進んでいるものを全部使います
       (別のワークツリーが握っているものは外します)。
 
-      --band <n>   安全帯の行数 (既定 3)。下げると証明は立ちやすくなりますが、
-                   一撃マージの保証が壊れます。
+      --band <n>   安全帯の行数 (既定 1)。既定の 1 は三方向マージの実測下限で、
+                   これ以上下げると一撃マージの保証が壊れます。パッチ適用
+                   (git apply / git am) まで通す運用なら 3 を指定してください。
       --force      証明が立たなくても、乾式検査が綺麗なら統合します
                    (この統合に「一撃」の保証は付きません)。
 
@@ -1327,7 +1390,7 @@ pub mod cliface {
     fn parse_flags(args: &[String]) -> Result<Flags, String> {
         let mut f = Flags {
             repo: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            band: region::SAFE_BAND,
+            band: region::MERGE_ONLY_BAND,
             ..Default::default()
         };
         let mut i = 0;
@@ -1458,15 +1521,29 @@ pub mod cliface {
         }
     }
 
+    /// 帯の数字に**根拠を 1 語だけ添える**。数字だけ出すと、既定なのか
+    /// `--band` で下げたのかが読み手に分からない。
+    fn band_note(band: u32) -> String {
+        if band == region::MERGE_ONLY_BAND {
+            tr("既定 = 三方向マージの実測下限")
+        } else if band == region::SAFE_BAND {
+            tr("パッチ適用まで含めた最悪経路")
+        } else {
+            tr("--band で指定")
+        }
+    }
+
     fn print_proof(p: &Proof, held: &[String]) {
         println!("{}", p.verdict());
         println!(
             "{}",
             trf(
-                "  基準 {c} / 統合先 {b}{extra} / {ms} ms",
+                "  基準 {c} / 統合先 {b}{extra} / 安全帯 {band} 行 ({why}) / {ms} ms",
                 &[
                     ("c", p.base.chars().take(12).collect::<String>()),
                     ("b", p.base_ref.clone()),
+                    ("band", p.band.to_string()),
+                    ("why", band_note(p.band)),
                     (
                         "extra",
                         if p.base_participates {
@@ -1807,7 +1884,7 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
             .last_scan
             .is_none_or(|t| t.elapsed() >= crate::git::scan_interval(SCAN_BASE, st.last_cost));
         if due {
-            st.pending = spawn_scan(st.root.clone(), region::SAFE_BAND);
+            st.pending = spawn_scan(st.root.clone(), region::MERGE_ONLY_BAND);
             if st.pending.is_none() {
                 st.last_scan = Some(Instant::now());
             }
@@ -1873,7 +1950,13 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
         } else {
             vis.warn_fg_color
         };
-        ui.label(egui::RichText::new(p.verdict()).strong().color(color));
+        ui.label(egui::RichText::new(p.verdict()).strong().color(color))
+            .on_hover_text(trf(
+                "安全帯 {b} 行で証明しています。\n\
+                 三方向マージ (git merge) の実測下限は 1 行、\n\
+                 パッチ適用 (git apply) まで通すなら 3 行が要ります。",
+                &[("b", p.band.to_string())],
+            ));
         if let Some(c) = st.last_cost {
             ui.label(
                 egui::RichText::new(format!("{} ms", c.as_millis()))
@@ -2208,7 +2291,7 @@ mod tests {
                 whole: got.whole,
                 note: got.note,
             }],
-            region::SAFE_BAND,
+            region::MERGE_ONLY_BAND,
         );
         assert!(!p.disjoint, "読めなかったら証明しない (fail-closed)");
     }
@@ -2217,18 +2300,18 @@ mod tests {
 
     #[test]
     fn 証明の表() {
-        let band = region::SAFE_BAND;
-        // 遠く離れた 2 本 → 互いに素
+        let band = region::MERGE_ONLY_BAND;
+        // 間に未変更行が 1 行あれば素 (三方向マージの実測下限ちょうど)
         let p = prove(
             vec![
                 br("a", vec![r("f.rs", 1, 10)]),
-                br("b", vec![r("f.rs", 14, 20)]),
+                br("b", vec![r("f.rs", 12, 20)]),
             ],
             band,
         );
-        assert!(p.disjoint, "間に 3 行あるので素: {:?}", p.pairs);
+        assert!(p.disjoint, "間に 1 行あるので素: {:?}", p.pairs);
 
-        // 1 行足りない → 近すぎる
+        // **帯 3 なら止めていた組**が、帯 1 では素になる (過剰報告が減る箇所)
         let p = prove(
             vec![
                 br("a", vec![r("f.rs", 1, 10)]),
@@ -2236,10 +2319,34 @@ mod tests {
             ],
             band,
         );
+        assert!(p.disjoint, "間に 2 行: 帯 1 なら素 {:?}", p.pairs);
+        let p3 = prove(
+            vec![
+                br("a", vec![r("f.rs", 1, 10)]),
+                br("b", vec![r("f.rs", 13, 20)]),
+            ],
+            region::SAFE_BAND,
+        );
+        assert!(!p3.disjoint, "帯 3 では同じ組が止まる (差はここ)");
+
+        // 隣接 (間に 1 行も無い) → 近すぎる。git の三方向マージも実際に衝突する
+        let p = prove(
+            vec![
+                br("a", vec![r("f.rs", 1, 10)]),
+                br("b", vec![r("f.rs", 11, 20)]),
+            ],
+            band,
+        );
         assert!(!p.disjoint);
         assert_eq!(p.pairs.len(), 1);
-        assert_eq!(p.pairs[0].gap, Some(2));
+        assert_eq!(p.pairs[0].gap, Some(0));
         assert_eq!(p.pairs[0].a, "a", "向きは辞書順で固定");
+        assert_eq!(p.band, band, "どの帯で判定したかを丸めずに持つ");
+        assert!(
+            p.verdict().contains(&band.to_string()),
+            "画面の 1 行に帯が出る: {}",
+            p.verdict()
+        );
 
         // 別ファイルなら何行でも素
         let p = prove(
@@ -2272,7 +2379,7 @@ mod tests {
 
     #[test]
     fn 名前の順を入れ替えても同じ結果が出る() {
-        let band = region::SAFE_BAND;
+        let band = region::MERGE_ONLY_BAND;
         let one = prove(
             vec![
                 br("zeta", vec![r("f.rs", 1, 10)]),
@@ -2294,7 +2401,7 @@ mod tests {
 
     #[test]
     fn 最小の手直しを提案する() {
-        let band = region::SAFE_BAND;
+        let band = region::MERGE_ONLY_BAND;
         // b の 1 つの域が a と c の両方とぶつかる → b が手放すのが最短。
         let p = prove(
             vec![
@@ -2448,90 +2555,277 @@ mod tests {
             .collect()
     }
 
+    /// 書き換えの種別。**帯の表は種別ごとに測ってある**ので、生成側も
+    /// 置換だけでなく削除・挿入を混ぜる (置換しか作らないと、いちばん
+    /// 危ない「挿入点は行と行の間にある」経路を 1 度も踏まない)。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        Replace,
+        Delete,
+        Insert,
+    }
+
+    /// 1 か所の書き換え。`at` は**ベースの行番号** (1 始まり)。
+    #[derive(Clone, Copy, Debug)]
+    struct Edit {
+        at: usize,
+        len: usize,
+        kind: Kind,
+    }
+
+    impl Edit {
+        /// この書き換えが `git diff` のベース側で占める行域。
+        /// 挿入は「行と行の間」なので、直前の行 1 行として現れる。
+        fn span(&self) -> (usize, usize) {
+            match self.kind {
+                Kind::Insert => (self.at, self.at),
+                _ => (self.at, self.at + self.len - 1),
+            }
+        }
+    }
+
+    /// ベース本文へ書き換えを適用する。**後ろから当てる**ので、
+    /// 前の書き換えで行番号がずれない。
+    fn apply(base: &[String], edits: &[Edit], tag: &str) -> String {
+        let mut v: Vec<String> = base.to_vec();
+        let mut es = edits.to_vec();
+        es.sort_by(|a, b| b.at.cmp(&a.at));
+        for e in &es {
+            match e.kind {
+                Kind::Replace => {
+                    for i in e.at..(e.at + e.len).min(v.len() + 1) {
+                        v[i - 1] = format!("{tag} {i}");
+                    }
+                }
+                Kind::Delete => {
+                    let hi = (e.at + e.len - 1).min(v.len());
+                    v.drain((e.at - 1)..hi);
+                }
+                Kind::Insert => {
+                    let add: Vec<String> = (0..e.len)
+                        .map(|k| format!("{tag} ins {} {k}", e.at))
+                        .collect();
+                    let at = e.at.min(v.len());
+                    v.splice(at..at, add);
+                }
+            }
+        }
+        let mut out = v.join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// 次に書き換える場所を決める。
+    ///
+    /// **一様乱数だけでは境界を踏まない。** 120 行に数個の域を散らすと、
+    /// 間隔がちょうど 1〜2 行になる確率はごく低く、「帯 1 で本当に大丈夫か」を
+    /// 1 度も試さないまま緑になってしまう。半分は**既に置いた域から
+    /// 0〜4 行だけ離した位置**を採り、帯 1 の境界を正面から踏む。
+    fn spot(rng: &mut Rng, placed: &[(usize, usize)], len: usize, total: usize) -> usize {
+        let far = |rng: &mut Rng| rng.range(2, total - len - 2);
+        if placed.is_empty() || rng.range(0, 1) == 0 {
+            return far(rng);
+        }
+        let (lo, hi) = placed[rng.range(0, placed.len() - 1)];
+        let gap = rng.range(0, 4);
+        let cand = if rng.range(0, 1) == 0 {
+            hi + 1 + gap
+        } else {
+            match lo.checked_sub(gap + len) {
+                Some(v) if v >= 2 => v,
+                _ => return far(rng),
+            }
+        };
+        if cand < 2 || cand + len + 1 >= total {
+            far(rng)
+        } else {
+            cand
+        }
+    }
+
     /// **この機能の主張そのもの。** 証明が立ったケースは実 git で必ず綺麗に入る。
     ///
-    /// 擬似乱数で行域の取り方を網羅的に振り、各ケースで
-    /// 「証明」と「実際の `git merge` の結果」を突き合わせる。
-    /// 見逃し (証明が立ったのに衝突した) は **1 件でも panic**。
-    /// 過剰報告 (証明は立たなかったが綺麗に入った) は許容し、率を数字で出す。
+    /// # 数え方 — 1 ケース = 1 ファイル
+    ///
+    /// 以前は「1 ケースごとに枝を切って順に `git merge` する」形で、
+    /// 48 ケースに **git を約 1,400 回**起こしていた (macOS 実測 130 秒)。
+    /// CI の nextest は `slow-timeout 60s / terminate-after 1` なので、
+    /// **ケースを増やした瞬間に殺される**。数を増やすために形を変えた:
+    ///
+    /// * 1 ケース = **1 ファイル**。ベースに `f000..` を並べ、枝は
+    ///   自分の担当ファイルだけを書き換える
+    /// * 枝は 5 本だけ作り、**全ペアを 1 回ずつ実際に `git merge`** する。
+    ///   衝突したファイルは `git ls-files --unmerged` が**パス単位**で返すので、
+    ///   1 回のマージが数百ケースぶんの答えを一度に出す
+    /// * 行域は `proof()` = 実際の `git diff` から取る (production の経路)。
+    ///   ケースごとの判定は、その行域をファイルで絞って `prove()` に通すだけ
+    ///
+    /// これで **git 起動は約 55 回**に落ちた (240 ケース)。
+    ///
+    /// # ペアで測ることが N 本の主張と同じである理由
+    ///
+    /// 証明の単位 ([`Clash`]) がそもそもペアである。そして先に入った枝は
+    /// **自分の行域しか変えない**ので、`base + b1 + b2` へ `b3` を混ぜる
+    /// 三方向マージは「`b3` 対 `b1`」「`b3` 対 `b2`」の判定に分解される
+    /// (未変更行は誰も消さないので、間の未変更行は最後まで残る)。
+    /// 全ペアが綺麗なら順に混ぜても綺麗、が成り立つ。N 本を実際に流す実測は
+    /// [`tests::実gitで一撃統合が人手ゼロで通る`] が別に持っている。
     #[test]
     fn 実gitで証明の見逃しが1件も無いことを網羅的に確かめる() {
         let Some(r) = make_repo("prove") else { return };
-        const TOTAL: usize = 300;
-        const CASES: u64 = 48;
-        r.commit("shared.txt", &lines(TOTAL), "base");
-        r.commit("other.txt", &lines(40), "other");
+        const FILES: usize = 240;
+        const LINES: usize = 120;
+        const BRANCHES: usize = 5;
+        let path_of = |f: usize| format!("f{f:03}.txt");
+        let base_lines = |f: usize| -> Vec<String> {
+            (1..=LINES).map(|i| format!("f{f:03} line {i}")).collect()
+        };
+
+        // ── 生成 (決定的。git は 1 度も起こさない) ──────────────────
+        let mut rng = Rng::new(20_260_810);
+        // edits[file][branch] — **ファイルが外側**。1 ケース = 1 ファイルなので
+        // 生成も書き出しもこの順で回る (枝で外側を回すと index が交差する)。
+        let mut edits: Vec<Vec<Vec<Edit>>> = vec![vec![Vec::new(); BRANCHES]; FILES];
+        for per_branch in edits.iter_mut() {
+            // この案件に参加する枝を 2〜5 本選ぶ (重複なし)。
+            let n = rng.range(2, BRANCHES);
+            let mut pool: Vec<usize> = (0..BRANCHES).collect();
+            let mut parts: Vec<usize> = Vec::new();
+            for _ in 0..n {
+                parts.push(pool.remove(rng.range(0, pool.len() - 1)));
+            }
+            parts.sort_unstable();
+            // この案件で既に置いた行域。**わざと際どい間隔で置く**。
+            let mut placed: Vec<(usize, usize)> = Vec::new();
+            for &b in &parts {
+                for _ in 0..rng.range(1, 2) {
+                    let kind = match rng.range(0, 2) {
+                        0 => Kind::Replace,
+                        1 => Kind::Delete,
+                        _ => Kind::Insert,
+                    };
+                    let len = rng.range(1, 3);
+                    let e = Edit {
+                        at: spot(&mut rng, &placed, len, LINES),
+                        len,
+                        kind,
+                    };
+                    let (lo, hi) = e.span();
+                    // 同じ枝の中で重なると本文が壊れるので、そこだけ捨てる。
+                    if per_branch[b].iter().any(|o| {
+                        let (olo, ohi) = o.span();
+                        lo <= ohi + o.len && olo <= hi + len
+                    }) {
+                        continue;
+                    }
+                    per_branch[b].push(e);
+                    placed.push((lo, hi));
+                }
+            }
+        }
+
+        // ── 実 git ─────────────────────────────────────────────
+        for f in 0..FILES {
+            r.write(&path_of(f), &(base_lines(f).join("\n") + "\n"));
+        }
+        r.git(&["add", "--all"]);
+        r.git(&["commit", "--quiet", "-m", "base"]);
         let base_oid = r.oid("base");
+
+        let names: Vec<String> = (0..BRANCHES).map(|b| format!("b{b}")).collect();
+        for (b, name) in names.iter().enumerate() {
+            r.git(&["checkout", "--quiet", "-b", name, "base"]);
+            for (f, per_branch) in edits.iter().enumerate() {
+                if per_branch[b].is_empty() {
+                    continue;
+                }
+                r.write(&path_of(f), &apply(&base_lines(f), &per_branch[b], name));
+            }
+            // 追跡済みファイルだけなので 1 起動で済む。
+            r.git(&["commit", "--quiet", "--all", "-m", name]);
+        }
+        r.git(&["checkout", "--quiet", "base"]);
+
+        // 行域は production の経路 (`git diff`) から取る。
+        let p = proof(&r.0, "base", &names, region::MERGE_ONLY_BAND);
+        assert_eq!(p.base, base_oid, "座標系は共通祖先で 1 つ");
+        assert_eq!(p.branches.len(), BRANCHES, "全枝を読めた");
+        assert!(
+            p.branches.iter().all(|b| b.note.is_none() && b.whole == 0),
+            "読めなかった枝がある: {:?}",
+            p.branches.iter().map(|b| &b.note).collect::<Vec<_>>()
+        );
+
+        // 全ペアを実際に `git merge` して、衝突したパスを集める。
+        let mut conflicted: BTreeSet<String> = BTreeSet::new();
+        let mut pairs_run = 0usize;
+        for i in 0..BRANCHES {
+            for j in (i + 1)..BRANCHES {
+                r.git(&["checkout", "--quiet", "--force", "-B", "mrg", &names[i]]);
+                let msg = format!("merge {}", names[j]);
+                let ok = r
+                    .try_git(&["merge", "--no-edit", "-m", &msg, &names[j]])
+                    .is_ok();
+                let unmerged = r.git(&["ls-files", "--unmerged"]);
+                for l in unmerged.lines() {
+                    if let Some((_, path)) = l.split_once('\t') {
+                        conflicted.insert(path.trim().to_string());
+                    }
+                }
+                if !ok {
+                    let _ = r.try_git(&["merge", "--abort"]);
+                    assert!(
+                        !unmerged.trim().is_empty(),
+                        "マージは落ちたのに未解決パスが取れない ({} × {})",
+                        names[i],
+                        names[j]
+                    );
+                }
+                pairs_run += 1;
+            }
+        }
+        r.git(&["checkout", "--quiet", "--force", "base"]);
+        assert_eq!(pairs_run, BRANCHES * (BRANCHES - 1) / 2, "全ペアを回した");
+
+        // ── 突き合わせ (ここから先は git を 1 度も起こさない) ─────────
+        let per_file = |path: &str| -> Vec<BranchRegions> {
+            p.branches
+                .iter()
+                .filter_map(|b| {
+                    let regions: Vec<Region> = b
+                        .regions
+                        .iter()
+                        .filter(|x| x.path == path)
+                        .cloned()
+                        .collect();
+                    (!regions.is_empty()).then(|| BranchRegions {
+                        branch: b.branch.clone(),
+                        regions,
+                        whole: 0,
+                        note: None,
+                    })
+                })
+                .collect()
+        };
 
         let (mut proven, mut proven_clean, mut miss) = (0usize, 0usize, 0usize);
         let (mut unproven, mut over, mut over_adjacent) = (0usize, 0usize, 0usize);
+        // 帯 3 (SAFE_BAND) との比較。**同じケース列**を git を 1 回も足さずに測る。
+        let (mut proven3, mut unproven3, mut over3, mut tight) = (0, 0, 0, 0usize);
         let mut ran = 0usize;
 
-        for seed in 0..CASES {
-            let mut rng = Rng::new(seed + 1);
-            let n = rng.range(2, 5);
-            let mut names = Vec::new();
-            // 各ブランチは shared.txt の 1〜2 か所を書き換える。
-            // **わざと近い位置も引く** — 過剰報告と見逃しの両方を出すため。
-            for i in 0..n {
-                let b = format!("c{seed}b{i}");
-                if r.try_git(&["checkout", "--quiet", "-b", &b, "base"])
-                    .is_err()
-                {
-                    continue;
-                }
-                let spots = rng.range(1, 2);
-                let mut text = lines(TOTAL);
-                for _ in 0..spots {
-                    let at = rng.range(1, TOTAL - 8);
-                    let len = rng.range(1, 4);
-                    // 直前の本文へ重ねて書く (2 か所を 1 コミットに入れる)
-                    let patch = edited(TOTAL, at, len, &b);
-                    text = merge_text(&text, &patch, TOTAL, at, len, &b);
-                }
-                // ときどき別ファイルや新規ファイルも触る (全体域の経路)
-                match rng.range(0, 9) {
-                    0 => r.commit(&format!("added-{b}.txt"), "new\n", "add"),
-                    1 => {
-                        let o = edited(40, rng.range(1, 30), 2, &b);
-                        r.commit("other.txt", &o, "other");
-                    }
-                    _ => {}
-                }
-                r.commit("shared.txt", &text, &b);
-                names.push(b);
-            }
-            r.git(&["checkout", "--quiet", "base"]);
-            if names.len() < 2 {
+        for f in 0..FILES {
+            let path = path_of(f);
+            let parts = per_file(&path);
+            if parts.len() < 2 {
                 continue;
             }
             ran += 1;
+            let pf = prove(parts.clone(), region::MERGE_ONLY_BAND);
+            let pf3 = prove(parts, region::SAFE_BAND);
+            let clean = !conflicted.contains(&path);
 
-            let p = proof(&r.0, "base", &names, region::SAFE_BAND);
-            assert_eq!(p.base, base_oid, "座標系は共通祖先で 1 つ");
-
-            // 実際に順に merge して、衝突の有無を測る。
-            let scratch = format!("m{seed}");
-            r.git(&["checkout", "--quiet", "-b", &scratch, "base"]);
-            let mut clean = true;
-            for b in &names {
-                let msg = format!("merge {b}");
-                if r.try_git(&["merge", "--no-edit", "-m", &msg, b]).is_err() {
-                    clean = false;
-                    let _ = r.try_git(&["merge", "--abort"]);
-                    break;
-                }
-                // 終了コードが 0 でも未解決が残っていないかを裏取りする。
-                if !r.git(&["ls-files", "--unmerged"]).trim().is_empty() {
-                    clean = false;
-                    let _ = r.try_git(&["merge", "--abort"]);
-                    break;
-                }
-            }
-            r.git(&["checkout", "--quiet", "--force", "base"]);
-            r.git(&["branch", "-D", &scratch]);
-
-            if p.disjoint {
+            if pf.disjoint {
                 proven += 1;
                 if clean {
                     proven_clean += 1;
@@ -2539,9 +2833,12 @@ mod tests {
                     miss += 1;
                     panic!(
                         "見逃し {miss} 件目: 証明は立ったのに実 git が衝突した \
-                         (seed={seed}, branches={names:?})\n{:#?}",
-                        p.branches
+                         (file={path}, band={})\n{:#?}",
+                        pf.band, pf.branches
                     );
+                }
+                if !pf3.disjoint {
+                    tight += 1;
                 }
             } else {
                 unproven += 1;
@@ -2549,52 +2846,58 @@ mod tests {
                     over += 1;
                     // **内訳を取る。** 行が重なっていないのに安全帯だけで
                     // 止めた組は、原理的に「安全側へ倒したぶん」である。
-                    if p.pairs.iter().all(|c| c.reason == Reason::TooClose) {
+                    if pf.pairs.iter().all(|c| c.reason == Reason::TooClose) {
                         over_adjacent += 1;
                     }
                 }
             }
+            if pf3.disjoint {
+                proven3 += 1;
+            } else {
+                unproven3 += 1;
+                if clean {
+                    over3 += 1;
+                }
+            }
         }
 
-        assert!(ran >= 40, "十分な数のケースを回した: {ran}");
+        assert!(ran >= 150, "十分な数のケースを回した: {ran}");
         assert!(
             proven > 0,
             "証明が立つケースが 1 つも無いのは網羅になっていない"
         );
+        assert!(
+            unproven > 0,
+            "止まるケースが 1 つも無いなら境界を踏んでいない"
+        );
         assert_eq!(miss, 0, "**見逃しは 1 件も許さない**");
-        let over_rate = if unproven == 0 {
-            0.0
-        } else {
-            over as f64 * 100.0 / unproven as f64
+        assert!(
+            tight > 0,
+            "帯 3 では止まっていた組が 1 つも無いなら、帯を下げた意味が測れていない"
+        );
+        let rate = |o: usize, u: usize| {
+            if u == 0 {
+                0.0
+            } else {
+                o as f64 * 100.0 / u as f64
+            }
         };
+        let (over_rate, over_rate3) = (rate(over, unproven), rate(over3, unproven3));
         // 数字は `--nocapture` で読む (誇張しないために、悪い側も出す)。
         eprintln!(
-            "[coedit] 実 git 網羅: {ran} ケース / 証明が立った {proven} (全部綺麗 {proven_clean} · \
-             見逃し {miss}) / 立たなかった {unproven} / そのうち実際は綺麗だった {over} \
-             = 過剰報告 {over_rate:.1}% (うち {over_adjacent} 件は安全帯だけが理由)"
+            "[coedit] 実 git 網羅 (帯 {}): {ran} ケース / 証明が立った {proven} \
+             (全部綺麗 {proven_clean} · 見逃し {miss}) / 立たなかった {unproven} / \
+             そのうち実際は綺麗だった {over} = 過剰報告 {over_rate:.1}% \
+             (うち {over_adjacent} 件は安全帯だけが理由)",
+            region::MERGE_ONLY_BAND
         );
-    }
-
-    /// 2 つの書き換えを 1 つの本文へ重ねる (テスト用の合成)。
-    fn merge_text(
-        cur: &str,
-        _patch: &str,
-        total: usize,
-        at: usize,
-        len: usize,
-        tag: &str,
-    ) -> String {
-        let mut out = String::new();
-        for (i, line) in cur.lines().enumerate() {
-            let no = i + 1;
-            if no >= at && no < at + len && no <= total {
-                out.push_str(&format!("{tag} {no}\n"));
-            } else {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-        out
+        eprintln!(
+            "[coedit] 同じ {ran} ケースを帯 {} で測ると: 証明が立った {proven3} / \
+             立たなかった {unproven3} / 過剰報告 {over_rate3:.1}% — \
+             帯を 3→{} にして新たに立った証明は {tight} 件 (どれも実 git で綺麗)",
+            region::SAFE_BAND,
+            region::MERGE_ONLY_BAND
+        );
     }
 
     #[test]
@@ -2679,7 +2982,7 @@ mod tests {
         r.git(&["checkout", "--quiet", "base"]);
         r.commit("shared.txt", &edited(100, 50, 2, "moved"), "base moves");
 
-        let p = proof(&r.0, "base", &["y0".to_string()], region::SAFE_BAND);
+        let p = proof(&r.0, "base", &["y0".to_string()], region::MERGE_ONLY_BAND);
         assert!(p.base_participates, "統合先も参加者に入る");
         assert!(!p.disjoint, "統合先とだけ衝突する抜け道を塞ぐ");
         assert!(p.pairs.iter().any(|c| c.a == "base" || c.b == "base"));
@@ -2699,7 +3002,7 @@ mod tests {
             r.git(&["checkout", "--quiet", "base"]);
             names.push(b);
         }
-        let p = proof(&r.0, "base", &names, region::SAFE_BAND);
+        let p = proof(&r.0, "base", &names, region::MERGE_ONLY_BAND);
         assert_eq!(p.skipped, 2, "切った本数を必ず返す");
         assert!(!p.disjoint, "見ていないものがあるなら言い切らない");
         assert!(p.note.is_some(), "無音で切らない");
