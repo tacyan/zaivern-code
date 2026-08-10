@@ -2118,6 +2118,118 @@ mod tests {
         assert!(text.contains("l2-A") && text.contains("l19-B"));
     }
 
+    // ── 10.5 実共有面のフィクスチャ (tools/union-bench.sh と同じ題材) ──
+    //
+    // 合成ベンチ (`let value = N;` の書き換え) では union は効果ゼロで、
+    // それは設計どおりの正しい「解決しない」。**効く条件と効かない条件を
+    // 両方コードで固定する**ことで、「union は効かない」とも
+    // 「union は何でも直す」とも読めないようにする。
+
+    /// 追記だけの共有面 (config / i18n / mod 宣言 / CHANGELOG) は解決する。
+    #[test]
+    fn 実共有面_追記だけの一覧は四種類とも解決する() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            // (名前, 既存の中身, ours が足す行, theirs が足す行)
+            (
+                "config.rs 型",
+                "    pub theme: String,\n",
+                "    pub which_key_delay_ms: u64,\n",
+                "    pub local_history_days: u32,\n",
+            ),
+            (
+                "i18n テーブル",
+                "    (\"save\", \"保存\"),\n",
+                "    (\"open\", \"開く\"),\n",
+                "    (\"quit\", \"終了\"),\n",
+            ),
+            ("mod 宣言一覧", "mod app;\n", "mod whichkey;\n", "mod local_history;\n"),
+            (
+                "CHANGELOG",
+                "- 0.1.0 最初のリリース\n",
+                "- 0.2.0 which-key\n",
+                "- 0.2.0 local history\n",
+            ),
+        ];
+        for (name, base_body, o_add, t_add) in cases {
+            let base = wrapped(base_body);
+            let ours = wrapped(&format!("{base_body}{o_add}"));
+            let theirs = wrapped(&format!("{base_body}{t_add}"));
+            match resolve(&base, &ours, &theirs, &opts()) {
+                Resolution::Merged(out) => {
+                    assert_eq!(out, wrapped(&format!("{base_body}{o_add}{t_add}")), "{name}");
+                }
+                Resolution::Conflict(out) => panic!("{name} は解決されるはず:\n{out}"),
+            }
+        }
+    }
+
+    /// **keybinds.rs 型は解決できない。** 固定長配列の長さを両側が別々の値へ
+    /// 書き換えるので、これは「追記」ではなく既存行の**変更**にあたる。
+    /// できないことを、できないと固定しておく。
+    #[test]
+    fn 実共有面_固定長配列のカウントは解決できない() {
+        let head = |n: usize| format!("pub const ALL: [BindAction; {n}] = [\n");
+        let tail = |n: usize| format!("];\nfn count() {{ assert_eq!(ALL.len(), {n}); }}\n");
+        let body = "    BindAction::Save,\n";
+        let base = format!("{}{}{}", head(1), wrapped(body), tail(1));
+        // ours は 2 件、theirs は 3 件になったつもりで長さを書き換える。
+        let ours = format!(
+            "{}{}{}",
+            head(2),
+            wrapped(&format!("{body}    BindAction::Open,\n")),
+            tail(2)
+        );
+        let theirs = format!(
+            "{}{}{}",
+            head(3),
+            wrapped(&format!("{body}    BindAction::Quit,\n")),
+            tail(3)
+        );
+        let Resolution::Conflict(out) = resolve(&base, &ours, &theirs, &opts()) else {
+            panic!("配列長の書き換えを自動で解決してはいけない");
+        };
+        // 中身の追記 (領域の内側) は両方残るが、**数値行は衝突として残る**。
+        assert!(out.contains("BindAction::Open"), "{out}");
+        assert!(out.contains("BindAction::Quit"), "{out}");
+        assert!(out.contains("<<<<<<<"), "数値行が衝突として残っていない:\n{out}");
+    }
+
+    /// **衝突ゼロ = 安全ではない。** 全員が同じ新しい長さを書くと、git も
+    /// union も綺麗にマージするが、**要素数と宣言長がずれたまま通る**。
+    /// これは union の欠陥ではなく (素の git でも同じ)、
+    /// 「カウント検査テストを持て」という設計上の要求である。
+    #[test]
+    fn 実共有面_全員が同じ長さを書くと綺麗に壊れる() {
+        let head = |n: usize| format!("pub const ALL: [BindAction; {n}] = [\n");
+        let body = "    BindAction::Save,\n";
+        let base = format!("{}{}]\n", head(1), wrapped(body));
+        let ours = format!(
+            "{}{}]\n",
+            head(2),
+            wrapped(&format!("{body}    BindAction::Open,\n"))
+        );
+        let theirs = format!(
+            "{}{}]\n",
+            head(2),
+            wrapped(&format!("{body}    BindAction::Quit,\n"))
+        );
+        let Resolution::Merged(out) = resolve(&base, &ours, &theirs, &opts()) else {
+            panic!("両側が同じ値を書いたので衝突は出ない");
+        };
+        let entries = out.matches("    BindAction::").count();
+        let declared: usize = out
+            .split_once("[BindAction; ")
+            .and_then(|(_, r)| r.split_once(']'))
+            .and_then(|(n, _)| n.parse().ok())
+            .expect("宣言長");
+        assert_eq!(entries, 3, "要素は 3 件になる");
+        assert_eq!(declared, 2, "宣言長は 2 のまま = 綺麗にマージされて壊れている");
+        assert_ne!(
+            entries, declared,
+            "衝突ゼロでも整合しない。カウント検査テストが要る理由がこれ"
+        );
+    }
+
     // ── 11. レイアウト (純粋関数) ──
 
     #[test]
