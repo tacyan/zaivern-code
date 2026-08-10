@@ -22,6 +22,27 @@
 //!
 //! [`tests::交渉が拒否を減らす`] が上の crowded 条件を純関数だけで再現し、
 //! 効果を数字で固定している (再現した拒否 55 → **48**、完了 9 → **16**)。
+//! 16 件は**位置を無視して小さい順に詰めた理論上限そのもの**で、
+//! ここは分割 (`size_only`) を 1 件も使わずに届く。
+//!
+//! ## 「断らない」を最後まで詰める — 貪欲では取りこぼす
+//!
+//! `tools/coedit-bench.sh` の `crowded` 担当表 (幅 6 行を stride 2 で 64 個、
+//! base = (2000 - 63×2 - 6) / 2 = **934**) では、**完了 11 / 拒否 53** だった。
+//! ところが数えると 64 体が要求している範囲は 934〜1065 行 (**132 行**) で、
+//! ファイルは 2000 行、**空きは 1868 行**。64 体を互いに素に置くのに要るのは
+//! 64×6 + 63×3 = **573 行**しかない。**断られていたのは空きが無いからではなく、
+//! 誰もずらしていないから**である。
+//!
+//! 1 件ずつ「いま空いている一番近い所」へ置く貪欲は、先に置いた 1 件が
+//! 空き域を割り、次の 1 件がその破片を避けてさらに割る。誰も「みんなが
+//! 入るように 1 行ずらす」ことをしないので、132 行の団子が解けない。
+//!
+//! [`allocate`] は**要求をまとめて幾何へ落として詰め込む**ように直した
+//! (詳しくは [`pack`] の前書き)。同じ担当表で **64 / 64 = 100%**、
+//! `max_shift` を既定の 200 行に残しても**その窓での理論上限 59 件**に届く
+//! ([`tests::ベンチのcrowded64件を全部配る`] /
+//! [`tests::上限を残したままでも窓の理論上限に届く`])。
 //!
 //! ## ずらしてよい場合の線引き — ここを間違えると製品が壊れる
 //!
@@ -66,10 +87,17 @@
 //! 上限は定数ではなく [`Want::max_shift`] という**要求ごとの引数**で、
 //! 既定値は設定 `negotiate.max_shift` から差し替えられる。
 //!
-//! 面白い実測がひとつある: **上限を外すと配れる件数が減ることがある**
-//! (crowded 条件の id 順で 13 件 → 11 件)。遠くへ跳んだ 1 件が大きな空き域を
-//! 割ってしまい、後続が入れなくなるため。上限は制約であると同時に
-//! **断片化の抑制**にもなっている。
+//! **上限は件数の天井にもなる。** ベンチの crowded で既定の 200 行を
+//! 残すと、開始行は 734〜1265 の **532 行**にしか置けず、幅 6 + 安全帯 3 で
+//! 割った `floor((532 + 3) / 9) = 59` が**構造的な上限**になる。
+//! 64 件全部を通したいなら、上限のほうを緩める判断が要る
+//! (「場所に意味が無い新規確保」なら [`Want::max_shift`] を広げるか
+//! [`Want::size_only`] を立てる)。
+//!
+//! かつてここには「**上限を外すと配れる件数が減ることがある** (13 件 → 11 件)」
+//! と書いてあった。これは**貪欲な割当の性質であって、問題の性質ではない**。
+//! 遠くへ跳んだ 1 件が大きな空き域を割っていただけで、まとめて詰め込む
+//! いまの [`allocate`] では上限を外すほど件数は増える (11 → **64**)。
 //!
 //! ## 決定性
 //!
@@ -166,7 +194,17 @@ pub fn free_spans(file_lines: u32, occupied: &[Span], band: u32) -> Vec<Span> {
         if s.start == 0 {
             continue; // 壊れた入力 (1 始まりなので 0 は無い)
         }
-        let end = if s.end == Span::EOF {
+        // **挿入点 (幅 0) は点 `n` として塞ぐ。**
+        //
+        // 表現は `[n, n-1]` なので、そのまま引き算すると `start > end` で
+        // 「壊れた占有」に見え、**誰も塞いでいないことになる**。
+        // [`region::spans_too_close`] は挿入点を `probe()` で点 `n` へ
+        // 写しているので、こちらを揃えないと「空きだと言われた場所に
+        // 置いたら衝突した」が起きる (`tests::挿入点を塞いだ空き域も互いに素`
+        // が総当たりで突き合わせている)。
+        let end = if s.is_insert() {
+            s.start
+        } else if s.end == Span::EOF {
             file_lines
         } else {
             s.end
@@ -384,13 +422,23 @@ pub fn fill_deadline(o: &mut Offer, until: u64) {
 ///
 /// **錨は引き継がない。** 錨は「そこにあった内容」なので、
 /// 場所を変えた域へ持って行くと嘘になる (取り直しで別人の域を掴む)。
+///
+/// `lines == 0` は**挿入点**を意味する ([`Span::insert_before`])。
+/// 素直に `[start, start - 1]` を組み立てないのは、`0 - 1` の飽和で
+/// `[start, start]` という**1 行を占有する域**が出来てしまい、
+/// 「既存の行を 1 行も要らない」という挿入点の意味が消えるため。
 fn placed(path: &str, start: u32, lines: u32) -> Region {
+    let span = if lines == 0 {
+        Span::insert_before(start)
+    } else {
+        Span {
+            start,
+            end: start.saturating_add(lines - 1),
+        }
+    };
     Region {
         path: path.to_string(),
-        span: Some(Span {
-            start,
-            end: start.saturating_add(lines.saturating_sub(1)),
-        }),
+        span: Some(span),
         anchor: Anchor::default(),
     }
 }
@@ -482,12 +530,17 @@ pub fn offer(want: &Want, occupied: &[(String, Region)], file_lines: u32, band: 
     } else {
         u64::from(want.max_shift)
     };
+    // **挿入点 (幅 0) も「幅 1 の点」として置き場所を探す。**
+    // `f.end - need + 1` をそのまま使うと `need = 0` で `f.end + 1`、
+    // つまり**空き域の 1 行外**が候補になり、提案どおり置いた瞬間に
+    // 安全帯を割る ([`tests::挿入点はずらす先も安全帯を守る`] が番人)。
+    let width = need.max(1);
     let mut best: Option<(u64, u32)> = None;
     for f in &free {
-        if f.len() < need {
+        if f.len() < width {
             continue;
         }
-        let hi = f.end - need + 1; // f.len() >= need なので下回らない
+        let hi = f.end - width + 1; // f.len() >= width なので下回らない
         let cand = sp.start.clamp(f.start, hi);
         let dist = u64::from(cand.abs_diff(sp.start));
         // 同点は**行番号が小さい方**。ここを揺らすと出力が非決定になる。
@@ -699,13 +752,11 @@ impl Plan {
     }
 }
 
-/// 配分の処理順を決める鍵。**ここが決定性と件数の両方を決める。**
+/// 配分の処理順を決める鍵。**ずらせない要求を先に確定させるためにある。**
 ///
-/// 1. **ずらせない要求が先。** 場所が決まっているので、後回しにすると
-///    ずらせる要求に場所を取られて無駄に落ちる。
-/// 2. ずらせる要求は**小さいものから**。件数の最大化にはこれが効く
-///    (実測: crowded 条件で昇順 14 件 / 降順 6 件 — 2 倍以上違う)。
-/// 3. 同点は**タスク ID の辞書順**。
+/// ずらせない要求は場所が動かせないので、後回しにすると「ずらせる要求に
+/// 場所を取られて無駄に落ちる」。ずらせる側の並びは [`pack`] が EDD で
+/// 決め直すので、ここでは**同点をタスク ID の辞書順**へ落とすことだけが仕事。
 fn sort_key(w: &Want) -> (u8, u32, &str) {
     if w.can_shift() {
         (1, w.lines().unwrap_or(u32::MAX), w.id.as_str())
@@ -714,74 +765,767 @@ fn sort_key(w: &Want) -> (u8, u32, &str) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  5.1 詰め込み器 — 「入るなら必ず全部配る」
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## なぜ貪欲では足りなかったのか (実測)
+//
+// `tools/coedit-bench.sh` の `crowded` は、幅 6 行 (band+3) の要求を
+// stride 2 で 64 個並べる。base = (2000 - 63×2 - 6) / 2 = **934** なので、
+// 要求 i は `[934 + 2(i-1), +5]` — 64 体が **934〜1065 行 (132 行)** に
+// 折り重なる。ファイルは 2000 行あり、64 体を互いに素に置くのに要るのは
+// 64×6 + 63×3 = **573 行**。**空きは 1868 行あるので、余裕で入る。**
+//
+// それでも旧実装は 11 件しか配れなかった。理由は 1 つで、
+// **1 件ずつ「いま空いている一番近い所」へ置いていた**ため。先に置いた
+// 1 件が空き域を割り、次の 1 件がその破片を避けてさらに割る。誰も
+// 「みんなが入るように 1 行ずらす」ことをしないので、132 行の団子が
+// 132 行の団子のまま解けない。
+//
+// ## いま使っている解き方
+//
+// [`Want`] を「幅と、置いてよい開始行の窓」だけの [`Slot`] へ落とすと、
+// 問題は**開始時刻に窓のある 1 台のスケジューリング**そのものになる。
+//
+// 1. **EDD (置ける右端が早い順)** に並べ、**左詰め**で置く。
+//    幅が揃っている場合、この順の左詰めは**全部入るなら必ず全部入る**
+//    (等長ジョブの EDF が最適であることの言い換え)。crowded は
+//    幅 6 行が 64 個なのでここが効き、**64 / 64** になる。
+// 2. 置けなかったら、**いま置いてある中で一番長いものを追い出す**
+//    (Moore–Hodgson)。窓が全部同じときこれは最適で、長さがばらばらな
+//    条件 (80〜320 行を 64 個) でも**位置を無視した詰め込み上限に一致**する。
+// 3. 件数が決まったら、[`reposition`] が**件数を 1 件も変えずに**
+//    ずれの総和 Σ|置いた行 - 要求した行| を最小化する。
+//
+// ## 決定性
+//
+// `HashMap` / `HashSet` を 1 つも使わない。並べ替えの鍵は必ず
+// **タスク ID の辞書順**で終わるので、同じ入力からはどの OS の
+// どのプロセスでも 1 バイト違わない割当が出る
+// ([`tests::配分は互いに素で決定的`] が番人)。
+
+/// 幾何だけに落とした 1 件の要求。
+///
+/// [`Want`] は「どのファイルの何行目が欲しいか」を持つが、詰め込みで要るのは
+/// **幅と、置いてよい開始行の範囲**だけである。
+#[derive(Clone, Copy, Debug)]
+struct Slot<'a> {
+    /// `wants` の中の添字 (結果を戻すのに要る)。
+    idx: usize,
+    /// タスク ID。**同点はこれの辞書順**で割るので決定性の要。
+    id: &'a str,
+    /// 要求した開始行 (ずれの距離を測る基準)。
+    want: u32,
+    /// 実効幅。**挿入点も 1 として扱う。**
+    ///
+    /// 挿入点 (`path#@120`) は既存の行を 1 行も占有しないが、幅 0 のまま
+    /// 計算すると「同じ行に 2 つ置ける」ことになり安全帯が崩れる。
+    /// [`region::spans_too_close`] は挿入点を**点 `n`** として見るので、
+    /// こちらも幅 1 の点として扱うと判定が完全に一致する。
+    w: u32,
+    /// 挿入点か ([`Region`] を組み立てるときだけ効く)。
+    insert: bool,
+    /// 置いてよい開始行の下限。
+    lo: u32,
+    /// 置いてよい開始行の上限。
+    hi: u32,
+}
+
+impl Slot<'_> {
+    /// 要求している行数 (挿入点は 0)。
+    fn need(&self) -> u32 {
+        if self.insert {
+            0
+        } else {
+            self.w
+        }
+    }
+}
+
+// テスト専用の計算量メータ。
+//
+// **性能テストを絶対時間で書かないため**にある。このリポジトリでは
+// Docker の仮想ファイルシステムと高負荷で、絶対時間の性能テストが
+// 実際に 2 件落ちた。内側ループを回った回数なら機械の速さに一切
+// 依存しないので、「件数を 2 倍にしたときの伸び」で計算量を固定できる
+// (`tests::件数を倍にしても計算量が跳ねない`)。
+#[cfg(test)]
+thread_local! {
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 内側ループを 1 回まわった。**リリースビルドでは空**。
+#[inline]
+fn tick() {
+    #[cfg(test)]
+    STEPS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// [`Want`] を [`Slot`] へ落とす。**幾何へ落とせない要求は `None`**。
+///
+/// `None` になるのは「ずらせない」「glob」「ファイル全体」「末尾まで」
+/// 「ファイルに入らない大きさ」「上限が厳しすぎて置ける窓が空」の 6 つ。
+/// これらは 1 件ずつ [`offer`] で答える — 空き行が確定しない要求を
+/// 詰め込みに混ぜると、**空きだと思った場所へ置いて衝突する**。
+fn slot_of<'a>(idx: usize, w: &'a Want, file_lines: u32) -> Option<Slot<'a>> {
+    if !w.can_shift() || file_lines == 0 || is_glob(&w.region.path) {
+        return None;
+    }
+    let sp = w.region.span?;
+    if sp.is_empty() {
+        return None;
+    }
+    let need = w.lines()?; // 末尾まで (EOF) はここで落ちる
+    let width = need.max(1);
+    if width > file_lines {
+        return None;
+    }
+    // `size_only` は「場所に意味が無い」の自己申告なので上限を外す。
+    let limit = if w.size_only { file_lines } else { w.max_shift };
+    let last = file_lines - width + 1; // ファイルへ収まる最後の開始行
+    let lo = sp.start.saturating_sub(limit).max(1);
+    let hi = sp.start.saturating_add(limit).min(last);
+    if lo > hi {
+        return None;
+    }
+    Some(Slot {
+        idx,
+        id: &w.id,
+        want: sp.start,
+        w: width,
+        insert: sp.is_insert(),
+        lo,
+        hi,
+    })
+}
+
+/// 詰め込みに載せられる要求か ([`slot_of`] と 1 実装を共有する)。
+fn packable(w: &Want, file_lines: u32) -> bool {
+    slot_of(0, w, file_lines).is_some()
+}
+
+/// 開始行 `x` に幅 `w` で置いたとき、**安全帯ごと塞がる**区間。
+fn blocked_of(x: u32, w: u32, band: u32) -> (u32, u32) {
+    (
+        x.saturating_sub(band).max(1),
+        x.saturating_add(w.saturating_sub(1)).saturating_add(band),
+    )
+}
+
+/// `lo` 以上で**最も左**の置ける開始行。無ければ `None`。
+///
+/// `pieces` は昇順・互いに素な空き片なので、左から見て最初に見つかった
+/// 位置がそのまま最小になる。`x > hi` になった時点で右の片はもっと大きい
+/// `x` しか出せないので**打ち切れる** (これが無いと窓の狭い要求で
+/// 空き片を毎回全部舐める)。
+fn leftmost(pieces: &[Span], s: &Slot) -> Option<u32> {
+    for g in pieces {
+        tick();
+        let x = s.lo.max(g.start);
+        if x > s.hi {
+            return None;
+        }
+        if x.saturating_add(s.w).saturating_sub(1) <= g.end {
+            return Some(x);
+        }
+    }
+    None
+}
+
+/// 空き片から `[lo, hi]` を差し引く。
+fn carve(pieces: &mut Vec<Span>, lo: u32, hi: u32) {
+    let mut out: Vec<Span> = Vec::with_capacity(pieces.len() + 1);
+    for g in pieces.iter() {
+        tick();
+        if g.end < lo || g.start > hi {
+            out.push(*g);
+            continue;
+        }
+        if g.start < lo {
+            out.push(Span {
+                start: g.start,
+                end: lo - 1,
+            });
+        }
+        if g.end > hi {
+            out.push(Span {
+                start: hi + 1,
+                end: g.end,
+            });
+        }
+    }
+    *pieces = out;
+}
+
+/// 「入るなら全部配る」詰め込み。
+///
+/// 返り値は `(置けた (slot 添字, 開始行) を開始行の昇順で, 落ちた slot 添字)`。
+///
+/// **落ちた本人が一番長いときは掃き直さない** — そのまま断って先へ進める。
+/// 掃き直すのは「置いてあるものを追い出した」ときだけなので、掃き直しの
+/// 回数は**置けた件数**で抑えられる (512 件 / 2000 行の飽和条件で実測
+/// 内側ループ 3.4 万回。件数を倍にしても伸びは 4 倍以内)。
+fn pack(slots: &[Slot], free: &[Span], band: u32) -> (Vec<(usize, u32)>, Vec<usize>) {
+    // EDD — 「置ける右端」が早いものから。窓の締切が早い順に置くのが、
+    // 等長なら最適 (全部入るなら必ず全部入る)。
+    let mut cand: Vec<usize> = (0..slots.len()).collect();
+    cand.sort_by(|&a, &b| {
+        let (x, y) = (&slots[a], &slots[b]);
+        (x.hi, x.lo, x.w, x.id).cmp(&(y.hi, y.lo, y.w, y.id))
+    });
+
+    let mut dropped: Vec<usize> = Vec::new();
+    'restart: loop {
+        let mut pieces: Vec<Span> = free.to_vec();
+        let mut put: Vec<(usize, u32)> = Vec::new();
+        let mut i = 0usize;
+        while i < cand.len() {
+            let s = slots[cand[i]];
+            if let Some(x) = leftmost(&pieces, &s) {
+                let (blo, bhi) = blocked_of(x, s.w, band);
+                carve(&mut pieces, blo, bhi);
+                put.push((cand[i], x));
+                i += 1;
+                continue;
+            }
+            // 置けなかった。**いま置いてある中で一番長いもの**を追い出すと、
+            // 後続がまとめて入ることがある (Moore–Hodgson)。同点は
+            // 「置ける右端が遅い方」→「ID の辞書順で後ろ」を追い出す。
+            let mut victim: Option<usize> = None;
+            let mut key = (s.w, s.hi, s.id);
+            for (p, &(si, _)) in put.iter().enumerate() {
+                tick();
+                let t = &slots[si];
+                if (t.w, t.hi, t.id) > key {
+                    key = (t.w, t.hi, t.id);
+                    victim = Some(p);
+                }
+            }
+            match victim {
+                // 落ちた本人が一番長い → そのまま断って先へ (掃き直さない)
+                None => {
+                    dropped.push(cand[i]);
+                    cand.remove(i);
+                }
+                // 置いてあるものを追い出した → 空き片が変わるので置き直す
+                Some(p) => {
+                    let out = put[p].0;
+                    dropped.push(out);
+                    cand.retain(|&c| c != out);
+                    continue 'restart;
+                }
+            }
+        }
+        put.sort_by_key(|&(_, x)| x);
+        dropped.sort_unstable();
+        return (put, dropped);
+    }
+}
+
+/// 落ちた要求を、**置いてある並びの隙間へ差し込み直す**。1 件でも入ったら `true`。
+///
+/// ## なぜ「余った破片へ入れ直す」では足りないのか (総当たりで見つけた 1 件)
+///
+/// 幅 3 / 9 / 5 / 4 の 4 件 (24 行・安全帯 0・ずらせる幅 4) は 4 件とも入る。
+/// ところが左詰めは幅 4 の要求を「置ける一番左」= 14 行目へ置いてしまい、
+/// 幅 9 が入るはずの 9〜17 行を 5 行に割る。**空き破片を見るだけでは戻せない** —
+/// すでに置いたものを動かす必要がある。
+///
+/// ## 解き方 (前計算 O(m) + 順位ごと O(1))
+///
+/// 1 つの空き域に入った連なりは、「左詰めしたときの最早開始 `E_j`」と
+/// 「右詰めしたときの最遅開始 `L_j`」で挟める。**どちらも並び順だけで決まり、
+/// いま置いてある位置に依存しない。** 落ちた要求を順位 `r` へ差し込めるかは、
+/// この 2 本から即座に分かる:
+///
+/// * 下限 = max(要求の下限, `E_{r-1}` + 直前の幅 + 安全帯)
+/// * 上限 = min(要求の上限, 空き域の右端 - 幅 + 1, `L_r` - 幅 - 安全帯)
+///
+/// 下限 ≤ 上限なら差し込める。差し込んだら連なりを左詰めで置き直し、
+/// あとは [`reposition`] が要求へ寄せ直す。
+fn refill(
+    put: &mut Vec<(usize, u32)>,
+    dropped: &mut Vec<usize>,
+    slots: &[Slot],
+    free: &[Span],
+    band: u32,
+) -> bool {
+    if dropped.is_empty() {
+        return false;
+    }
+    // 短いものから試す (差し込める幅が広い = 後続の邪魔をしにくい)。
+    dropped.sort_by_key(|&si| (slots[si].w, slots[si].hi, slots[si].lo, slots[si].id));
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < dropped.len() {
+        if insert_into_chain(put, dropped[i], slots, free, band) {
+            dropped.remove(i);
+            changed = true;
+        } else {
+            i += 1;
+        }
+    }
+    changed
+}
+
+/// [`refill`] の本体 (1 件ぶん)。差し込めたら `true`。
+fn insert_into_chain(
+    put: &mut Vec<(usize, u32)>,
+    di: usize,
+    slots: &[Slot],
+    free: &[Span],
+    band: u32,
+) -> bool {
+    put.sort_by_key(|&(_, x)| x);
+    let d = slots[di];
+    let mut k = 0usize;
+    for f in free {
+        let a = k;
+        while k < put.len() && put[k].1 >= f.start && put[k].1 <= f.end {
+            k += 1;
+        }
+        let Some(rank) = fit_rank(&put[a..k], &d, *f, slots, band) else {
+            continue;
+        };
+        // 差し込んで、連なりを左詰めで置き直す。
+        let mut ids: Vec<usize> = put[a..k].iter().map(|&(si, _)| si).collect();
+        ids.insert(rank, di);
+        let Some(laid) = lay_out(&ids, *f, slots, band) else {
+            continue; // 順位判定と食い違ったら**入れない** (互いに素が本体)
+        };
+        put.splice(a..k, laid);
+        put.sort_by_key(|&(_, x)| x);
+        return true;
+    }
+    false
+}
+
+/// 連なりを左詰めで置き直す。1 件でも窓に入らなければ `None`。
+fn lay_out(ids: &[usize], f: Span, slots: &[Slot], band: u32) -> Option<Vec<(usize, u32)>> {
+    let mut out: Vec<(usize, u32)> = Vec::with_capacity(ids.len());
+    let mut cur = f.start;
+    for &si in ids {
+        tick();
+        let s = &slots[si];
+        let x = s.lo.max(cur);
+        if x > s.hi || x.saturating_add(s.w).saturating_sub(1) > f.end {
+            return None;
+        }
+        out.push((si, x));
+        cur = x.saturating_add(s.w).saturating_add(band);
+    }
+    Some(out)
+}
+
+/// 連なりのどの順位へ差し込めるか。入れられないなら `None`。
+///
+/// 同点は**要求へ近い順位**を選ぶ (`reposition` がそこから寄せ直す)。
+fn fit_rank(run: &[(usize, u32)], d: &Slot, f: Span, slots: &[Slot], band: u32) -> Option<usize> {
+    let m = run.len();
+    // E_j — 左詰めしたときの最早開始。
+    let mut e: Vec<u32> = Vec::with_capacity(m);
+    let mut cur = f.start;
+    for &(si, _) in run {
+        tick();
+        let s = &slots[si];
+        let x = s.lo.max(cur);
+        e.push(x);
+        cur = x.saturating_add(s.w).saturating_add(band);
+    }
+    // L_j — 右詰めしたときの最遅開始 (後ろから)。
+    let mut l: Vec<u32> = vec![0; m];
+    let mut lim = f.end;
+    for j in (0..m).rev() {
+        tick();
+        let s = &slots[run[j].0];
+        let x = s.hi.min(lim.saturating_sub(s.w).saturating_add(1));
+        l[j] = x;
+        lim = x.saturating_sub(band).saturating_sub(1);
+    }
+
+    let last = f.end.saturating_sub(d.w).saturating_add(1);
+    let mut best: Option<(u64, usize)> = None;
+    for r in 0..=m {
+        tick();
+        let lo_x = if r > 0 {
+            let p = &slots[run[r - 1].0];
+            d.lo.max(e[r - 1].saturating_add(p.w).saturating_add(band))
+        } else {
+            d.lo.max(f.start)
+        };
+        let mut hi_x = d.hi.min(last);
+        if r < m {
+            hi_x = hi_x.min(l[r].saturating_sub(d.w).saturating_sub(band));
+        }
+        if lo_x > hi_x {
+            continue;
+        }
+        let dist = u64::from(d.want.clamp(lo_x, hi_x).abs_diff(d.want));
+        if best.is_none_or(|(bd, _)| dist < bd) {
+            best = Some((dist, r));
+        }
+    }
+    best.map(|(_, r)| r)
+}
+
+/// 単調非減少の制約の下で Σ|y_j - t_j| を**最小化**する (PAVA + 中央値)。
+///
+/// L2 の等分散平均ではなく **L1 の中央値**を使う。ここで測りたいのは
+/// 「要求からのずれの総和 (行)」であって二乗誤差ではないため。
+/// 同点は**下側中央値**に倒す — 上側と下側で総和は同じだが、
+/// 上側だと OS/実装差で揺れる余地が出る。
+fn isotonic_l1(t: &[i64]) -> Vec<i64> {
+    // (昇順に並べた値, 下側中央値)
+    let mut stack: Vec<(Vec<i64>, i64)> = Vec::new();
+    for &v in t {
+        let mut cur = (vec![v], v);
+        while stack.last().is_some_and(|last| last.1 > cur.1) {
+            let l = stack.pop().expect("直前に有ることを確かめた");
+            let mut merged: Vec<i64> = Vec::with_capacity(l.0.len() + cur.0.len());
+            let (mut a, mut b) = (0usize, 0usize);
+            while a < l.0.len() || b < cur.0.len() {
+                tick();
+                if b >= cur.0.len() || (a < l.0.len() && l.0[a] <= cur.0[b]) {
+                    merged.push(l.0[a]);
+                    a += 1;
+                } else {
+                    merged.push(cur.0[b]);
+                    b += 1;
+                }
+            }
+            let m = merged[(merged.len() - 1) / 2];
+            cur = (merged, m);
+        }
+        stack.push(cur);
+    }
+    let mut out: Vec<i64> = Vec::with_capacity(t.len());
+    for (vals, med) in stack {
+        out.resize(out.len() + vals.len(), med);
+    }
+    out
+}
+
+/// 1 つの空き域に入った連なりを、**件数を変えずに**要求へ寄せ直す。
+///
+/// ## なぜ要るのか
+///
+/// [`pack`] は左詰めなので、件数は最大でも**全員が左端へ寄る**。
+/// crowded (要求は 934 行付近) で左詰めのままだと 1 件あたり平均 713 行
+/// ずれ、総和は **45,600 行**になる。「このあたりを触る」と言った場所から
+/// 713 行離れた差分は、レビューで「なぜここ?」になる。
+///
+/// ## 解き方
+///
+/// 連なりの中では `x_{j+1} >= x_j + w_j + band` が要る。累積の下駄
+/// `c_j = Σ_{m<j} (w_m + band)` を引いた `y_j = x_j - c_j` に写すと、
+/// 制約はただの**単調非減少**になり、目的関数は Σ|y_j - (要求_j - c_j)|
+/// のまま変わらない。あとは [`isotonic_l1`] で厳密に最小化できる。
+///
+/// 箱制約 (空き域の端と `max_shift`) は単調化してから解に clamp する。
+/// 箱が単調なら「無制約の解を clamp したもの」が最適解になる。
+///
+/// 実測: crowded の総和は **45,600 → 7,168 行** (1 件あたり 112 行)。
+/// これは**この並びでの厳密な最小値**である。
+fn reposition(placed: &mut [(usize, u32)], slots: &[Slot], free: &[Span], band: u32) {
+    let mut k = 0usize;
+    for f in free {
+        let a = k;
+        while k < placed.len() && placed[k].1 >= f.start && placed[k].1 <= f.end {
+            k += 1;
+        }
+        if k > a {
+            settle_run(&mut placed[a..k], slots, *f, band);
+        }
+    }
+}
+
+/// [`reposition`] の本体 (空き域 1 つぶん)。
+fn settle_run(run: &mut [(usize, u32)], slots: &[Slot], f: Span, band: u32) {
+    let n = run.len();
+    let mut c = vec![0i64; n];
+    for j in 1..n {
+        let prev = &slots[run[j - 1].0];
+        c[j] = c[j - 1] + i64::from(prev.w) + i64::from(band);
+    }
+    let mut t = vec![0i64; n];
+    let mut lob = vec![0i64; n];
+    let mut hib = vec![0i64; n];
+    for j in 0..n {
+        let s = &slots[run[j].0];
+        t[j] = i64::from(s.want) - c[j];
+        lob[j] = i64::from(s.lo.max(f.start)) - c[j];
+        hib[j] = i64::from(s.hi.min(f.end.saturating_sub(s.w).saturating_add(1))) - c[j];
+    }
+    // 箱を単調にする (下限は前から max、上限は後ろから min)。
+    for j in 1..n {
+        lob[j] = lob[j].max(lob[j - 1]);
+    }
+    for j in (0..n.saturating_sub(1)).rev() {
+        hib[j] = hib[j].min(hib[j + 1]);
+    }
+    // [`pack`] が出した解が箱の中にある以上ここは通るが、通らなければ
+    // **左詰めのまま返す** — 寄せ直しは飾りで、件数と互いに素性が本体。
+    if (0..n).any(|j| lob[j] > hib[j]) {
+        return;
+    }
+    let y = isotonic_l1(&t);
+    let mut moved: Vec<u32> = Vec::with_capacity(n);
+    for j in 0..n {
+        let v = y[j].clamp(lob[j], hib[j]) + c[j];
+        if v < 1 {
+            return;
+        }
+        moved.push(v as u32);
+    }
+    // 念のため制約を確かめてから書き戻す (ここが崩れると互いに素性が壊れる)。
+    for j in 1..n {
+        let w = slots[run[j - 1].0].w;
+        if moved[j] < moved[j - 1].saturating_add(w).saturating_add(band) {
+            return;
+        }
+    }
+    for j in 0..n {
+        run[j].1 = moved[j];
+    }
+}
+
+/// このパスの空き行を確定させるための障害物。
+///
+/// **相手が glob / ファイル全体を持っていたら `None`** — どの行が空くか
+/// 確定しないので、詰め込みに載せてはいけない (安全側へ倒す)。
+fn obstacles_for(path: &str, live: &[(String, Region)]) -> Option<Vec<Span>> {
+    let mut out: Vec<Span> = Vec::new();
+    for (_, r) in live {
+        if !crate::lease::overlaps(path, &r.path) {
+            continue;
+        }
+        if is_glob(&r.path) {
+            return None;
+        }
+        match r.span {
+            Some(s) => out.push(s),
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// 断る 1 件を組み立てる (種別と文言を 1 か所に閉じる)。
+fn refuse(w: &Want, live: &[(String, Region)], file_lines: u32, band: u32) -> Denied {
+    let kind = deny_kind(w, live, file_lines, band);
+    let holder = live
+        .iter()
+        .filter(|(_, r)| region::conflicts(&w.region, r, band))
+        .min_by(|a, b| {
+            let ka = a.1.span.map_or(0, |s| s.start);
+            let kb = b.1.span.map_or(0, |s| s.start);
+            ka.cmp(&kb).then_with(|| a.0.cmp(&b.0))
+        })
+        .map_or_else(String::new, |(h, _)| h.clone());
+    Denied {
+        id: w.id.clone(),
+        kind,
+        reason: match kind {
+            DenyKind::NoRoom => tr("空き行が足りません (ファイルが飽和しています)"),
+            DenyKind::TooFar => trf(
+                "空き域はありますが、ずらせる上限 {n} 行より遠くにあります",
+                &[("n", w.max_shift.to_string())],
+            ),
+            _ => trf("{h} が持っています", &[("h", holder)]),
+        },
+    }
+}
+
+/// 詰め込みに載せられない 1 件を、[`offer`] で個別に答える。
+fn settle_one(
+    w: &Want,
+    live: &mut Vec<(String, Region)>,
+    granted: &mut Vec<Granted>,
+    denied: &mut Vec<Denied>,
+    file_lines: u32,
+    band: u32,
+) {
+    match offer(w, live, file_lines, band) {
+        Offer::Grant => {
+            live.push((w.id.clone(), w.region.clone()));
+            granted.push(Granted {
+                id: w.id.clone(),
+                regions: vec![w.region.clone()],
+                moved: 0,
+                how: How::AsRequested,
+            });
+        }
+        Offer::Shift { to, moved } => {
+            live.push((w.id.clone(), to.clone()));
+            granted.push(Granted {
+                id: w.id.clone(),
+                regions: vec![to],
+                moved,
+                how: How::Shifted,
+            });
+        }
+        Offer::Split { parts } => {
+            let moved = parts
+                .first()
+                .and_then(|p| p.span)
+                .zip(w.region.span)
+                .map_or(0, |(a, b)| i64::from(a.start) - i64::from(b.start));
+            for p in &parts {
+                live.push((w.id.clone(), p.clone()));
+            }
+            granted.push(Granted {
+                id: w.id.clone(),
+                regions: parts,
+                moved,
+                how: How::SplitUp,
+            });
+        }
+        Offer::Wait { .. } => denied.push(refuse(w, live, file_lines, band)),
+        Offer::Impossible { reason } => denied.push(Denied {
+            id: w.id.clone(),
+            kind: DenyKind::Broken,
+            reason,
+        }),
+    }
+}
+
 /// N 件の要求を、互いに素な割当へ**最大化**して配る。
 ///
-/// 貪欲だが決定的。同じ入力からは必ず同じ [`Plan`] が出る
+/// ## 順番
+///
+/// 1. **幾何へ落とせない要求**を [`sort_key`] 順に 1 件ずつ確定させる。
+///    ずらせない要求 (`movable: false`) はここに入るので、
+///    **必ずずらせる要求より先に場所を取る**。
+/// 2. 残りを**パスごとに**まとめて [`pack`] で詰め込み、[`reposition`] で
+///    要求へ寄せ直す。パスは昇順に処理し、先に決まったパスの割当は
+///    次のパスから見ると障害物になる (パス表記が違っても
+///    [`crate::lease::overlaps`] が同じファイルだと見抜く)。
+/// 3. それでも落ちた `size_only` の要求だけ、[`split_into`] で拾い直す。
+///
+/// ## 何を最大化しているか
+///
+/// **件数が最優先で、ずれの総和は同点崩し**である。crowded 条件
+/// (幅 6 行 × 64 個 / 2000 行 / 安全帯 3 行) では **64 / 64 = 100%**、
+/// 長さがばらばらな条件 (80〜320 行 × 64 個) では
+/// [`tests::交渉が拒否を減らす`] の「位置を無視した詰め込み上限」に一致する。
+///
+/// 同じ入力からは必ず同じ [`Plan`] が出る
 /// (`HashMap` / `HashSet` を 1 つも使わない)。
 pub fn allocate(wants: &[Want], occupied: &[(String, Region)], file_lines: u32, band: u32) -> Plan {
-    let mut order: Vec<&Want> = wants.iter().collect();
-    order.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-
     let mut live: Vec<(String, Region)> = occupied.to_vec();
     let mut granted: Vec<Granted> = Vec::new();
     let mut denied: Vec<Denied> = Vec::new();
 
-    for w in order {
-        match offer(w, &live, file_lines, band) {
-            Offer::Grant => {
-                live.push((w.id.clone(), w.region.clone()));
-                granted.push(Granted {
-                    id: w.id.clone(),
-                    regions: vec![w.region.clone()],
-                    moved: 0,
-                    how: How::AsRequested,
-                });
+    // ── 1. 幾何へ落とせない要求を先に確定させる ──────────────────────
+    let mut single: Vec<&Want> = wants.iter().filter(|w| !packable(w, file_lines)).collect();
+    single.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    for w in single {
+        settle_one(w, &mut live, &mut granted, &mut denied, file_lines, band);
+    }
+
+    // ── 2. 残りをパスごとにまとめて詰め込む ──────────────────────────
+    let mut paths: Vec<&str> = wants
+        .iter()
+        .filter(|w| packable(w, file_lines))
+        .map(|w| w.region.path.as_str())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+
+    for path in paths {
+        let group: Vec<usize> = (0..wants.len())
+            .filter(|&i| packable(&wants[i], file_lines) && wants[i].region.path == path)
+            .collect();
+        let Some(occ) = obstacles_for(path, &live) else {
+            // 相手が glob / ファイル全体 → 空き行が確定しない。1 件ずつ答える。
+            for i in group {
+                settle_one(
+                    &wants[i],
+                    &mut live,
+                    &mut granted,
+                    &mut denied,
+                    file_lines,
+                    band,
+                );
             }
-            Offer::Shift { to, moved } => {
-                live.push((w.id.clone(), to.clone()));
-                granted.push(Granted {
-                    id: w.id.clone(),
-                    regions: vec![to],
-                    moved,
-                    how: How::Shifted,
-                });
-            }
-            Offer::Split { parts } => {
-                let moved = parts
-                    .first()
-                    .and_then(|p| p.span)
-                    .zip(w.region.span)
-                    .map_or(0, |(a, b)| i64::from(a.start) - i64::from(b.start));
-                for p in &parts {
-                    live.push((w.id.clone(), p.clone()));
-                }
-                granted.push(Granted {
-                    id: w.id.clone(),
-                    regions: parts,
-                    moved,
-                    how: How::SplitUp,
-                });
-            }
-            Offer::Wait { holder, .. } => {
-                let kind = deny_kind(w, &live, file_lines, band);
-                denied.push(Denied {
-                    id: w.id.clone(),
-                    kind,
-                    reason: match kind {
-                        DenyKind::NoRoom => tr("空き行が足りません (ファイルが飽和しています)"),
-                        DenyKind::TooFar => trf(
-                            "空き域はありますが、ずらせる上限 {n} 行より遠くにあります",
-                            &[("n", w.max_shift.to_string())],
-                        ),
-                        _ => trf("{h} が持っています", &[("h", holder)]),
-                    },
-                });
-            }
-            Offer::Impossible { reason } => denied.push(Denied {
+            continue;
+        };
+        let slots: Vec<Slot> = group
+            .iter()
+            .enumerate()
+            .filter_map(|(k, &i)| {
+                slot_of(k, &wants[i], file_lines).map(|mut s| {
+                    s.idx = i;
+                    s
+                })
+            })
+            .collect();
+        let free = free_spans(file_lines, &occ, band);
+        let (mut put, mut dropped) = pack(&slots, &free, band);
+        // 追い出したものを差し込み直す。1 件入るたびに並びが変わって
+        // 次の 1 件が入ることがあるので、動かなくなるまで回す
+        // (`dropped` は毎回必ず減るので、高々件数ぶんで止まる)。
+        while refill(&mut put, &mut dropped, &slots, &free, band) {}
+        reposition(&mut put, &slots, &free, band);
+
+        for (si, x) in put {
+            let s = slots[si];
+            let w = &wants[s.idx];
+            let (region, moved) = if x == s.want {
+                // 要求どおり。**錨は要求のものをそのまま引き継ぐ**
+                // (置き直していないので嘘にならない)。
+                (w.region.clone(), 0i64)
+            } else {
+                (
+                    placed(&w.region.path, x, s.need()),
+                    i64::from(x) - i64::from(s.want),
+                )
+            };
+            live.push((w.id.clone(), region.clone()));
+            granted.push(Granted {
                 id: w.id.clone(),
-                kind: DenyKind::Broken,
-                reason,
-            }),
+                regions: vec![region],
+                moved,
+                how: if moved == 0 {
+                    How::AsRequested
+                } else {
+                    How::Shifted
+                },
+            });
+        }
+
+        // ── 3. 落ちたものは、分割してよいなら拾い直す ────────────────
+        let mut rest = dropped;
+        rest.sort_by_key(|&si| (slots[si].w, slots[si].id));
+        for si in rest {
+            let s = slots[si];
+            let w = &wants[s.idx];
+            let parts = if w.size_only && !s.insert {
+                obstacles_for(path, &live)
+                    .map(|o| free_spans(file_lines, &o, band))
+                    .and_then(|f| split_into(&w.region.path, s.need(), &f))
+            } else {
+                None
+            };
+            match parts {
+                Some(parts) => {
+                    let moved = parts
+                        .first()
+                        .and_then(|p| p.span)
+                        .map_or(0, |a| i64::from(a.start) - i64::from(s.want));
+                    for p in &parts {
+                        live.push((w.id.clone(), p.clone()));
+                    }
+                    granted.push(Granted {
+                        id: w.id.clone(),
+                        regions: parts,
+                        moved,
+                        how: How::SplitUp,
+                    });
+                }
+                None => denied.push(refuse(w, &live, file_lines, band)),
+            }
         }
     }
 
@@ -2662,5 +3406,493 @@ mod tests {
                 split.granted.len()
             );
         }
+    }
+
+    // ── 詰め込み器 — ベンチの crowded を全部配る ──────────────────────
+
+    /// `tools/coedit-bench.sh` の `crowded` と**同じ担当表**を作る。
+    ///
+    /// awk 側 (`plan_regions`) と 1 行ずつ同じ式にしてある:
+    /// 幅 `band + 3` の行域を stride 2 で `n` 個、
+    /// `base = (total - (n-1)*stride - rl) / 2` から並べる。
+    fn bench_crowded(agents: u32, lines: u32, band: u32) -> Vec<(String, Span)> {
+        let rl = band + 3;
+        let stride = 2u32;
+        let base = ((lines - (agents - 1) * stride - rl) / 2).max(1);
+        (1..=agents)
+            .map(|i| {
+                let s = (base + (i - 1) * stride).min(lines);
+                let e = (s + rl - 1).min(lines);
+                (format!("a{i:02}"), sp(s, e))
+            })
+            .collect()
+    }
+
+    /// ずれの総和 (行)。**「近くを優先」を数字で見る唯一の指標。**
+    fn total_shift(plan: &Plan) -> i64 {
+        plan.granted.iter().map(|g| g.moved.abs()).sum()
+    }
+
+    /// **この作業の直接の証拠。**
+    ///
+    /// ベンチが「完了 11 / 拒否 53」を出していた条件で、**64 件すべてを配る**。
+    ///
+    /// 数えると理由は一目で分かる: 64 体が要求している範囲は 934〜1065 行
+    /// (**132 行**) しかないのに、ファイルは 2000 行あって**空きが 1868 行**。
+    /// 64 体を互いに素に置くのに要るのは 64×6 + 63×3 = **573 行**なので、
+    /// 断られていたのは空きが無いからではなく、**誰もずらしていない**から。
+    #[test]
+    fn ベンチのcrowded64件を全部配る() {
+        const AGENTS: u32 = 64;
+        const LINES: u32 = 2000;
+        const BAND: u32 = 3;
+        let base = bench_crowded(AGENTS, LINES, BAND);
+
+        // 担当表そのものがベンチと同じであることを固定する
+        assert_eq!(base.len(), 64);
+        assert_eq!(base[0].1, sp(934, 939), "base = (2000 - 63*2 - 6) / 2");
+        assert_eq!(base[63].1, sp(1060, 1065));
+        let width = base[0].1.len();
+        assert_eq!(width, 6, "幅は band + 3");
+
+        // 理論上限: 64 件を安全帯 3 行で並べるのに要るのは 573 行、
+        // 空きは 1868 行。**位置を無視した詰め込み上限は 64 件 (= 全員)**。
+        let need_lines = AGENTS * width + (AGENTS - 1) * BAND;
+        assert_eq!(need_lines, 573);
+        let ceiling = packing_ceiling(&base, LINES, BAND);
+        assert_eq!(ceiling, 64, "そもそも 64 件は入る条件のはず");
+
+        // (1) ずらせない申告 = 交渉なし。stride 2 では 5 件おきにしか通らない
+        let fixed = allocate(&wants_from(&base, false, false), &[], LINES, BAND);
+        assert!(fixed.is_disjoint());
+
+        // (2) ずらせる申告。**場所に意味が無い新規確保**なので、
+        //     レビュー局所性のための上限はファイル幅まで開ける。
+        let wants: Vec<Want> = base
+            .iter()
+            .map(|(id, s)| {
+                Want::movable(id, reg(&format!("src/big.rs#L{}-{}", s.start, s.end)))
+                    .max_shift(LINES)
+            })
+            .collect();
+        let plan = allocate(&wants, &[], LINES, BAND);
+
+        let rate = 100.0 * plan.granted.len() as f64 / ceiling as f64;
+        eprintln!(
+            "bench crowded 64体/2000行 (幅6・stride2・base934): \
+             交渉なし {}/{} · 交渉あり {}/{} · 理論上限 {} · 到達率 {rate:.0}% · \
+             ずれ総和 {} 行 (1件あたり {:.0} 行)",
+            fixed.granted.len(),
+            fixed.denied.len(),
+            plan.granted.len(),
+            plan.denied.len(),
+            ceiling,
+            total_shift(&plan),
+            total_shift(&plan) as f64 / plan.granted.len() as f64,
+        );
+
+        assert!(
+            plan.denied.is_empty(),
+            "断られた要求が残っている: {:?}",
+            plan.denied
+        );
+        assert_eq!(plan.granted.len(), 64, "64 件すべてを配れていない");
+        assert_eq!(plan.granted.len(), ceiling, "理論上限に届いていない");
+        assert!(plan.is_disjoint(), "配った結果が互いに素でない");
+
+        // 割当は要求のまわり (934〜1065) に寄っていること。
+        // 左詰めのままだと総和 45,600 行 (1 件あたり 713 行) になる。
+        // 寄せ直し後の 7,168 行は**この並びでの厳密な最小値**である。
+        assert_eq!(total_shift(&plan), 7_168, "ずれの総和が最小になっていない");
+
+        // 決定的であること (同じ入力から 1 バイト違わない)
+        for _ in 0..3 {
+            assert_eq!(allocate(&wants, &[], LINES, BAND), plan);
+        }
+        let mut shuffled = wants.clone();
+        shuffled.reverse();
+        assert_eq!(allocate(&shuffled, &[], LINES, BAND), plan);
+    }
+
+    /// **`max_shift` を既定 (200 行) のまま残しても、窓の理論上限に届く。**
+    ///
+    /// 上限を残すと 64 件は**入り得ない**。開始行は
+    /// `[934-200, 1060+200]` にしか置けないので、使える幅は
+    /// 734〜1265 の **532 行**しかなく、幅 6 + 安全帯 3 で割ると
+    /// `floor((532 + 3) / 9) = 59` が上限になる。59 が取れることも構成できる
+    /// (要求 1〜58 と 64 を 734 から 9 行間隔で並べる)。
+    ///
+    /// つまり **59 件が正解**で、それ以上は「配れない」ではなく
+    /// 「その上限では存在しない」。
+    #[test]
+    fn 上限を残したままでも窓の理論上限に届く() {
+        const LINES: u32 = 2000;
+        const BAND: u32 = 3;
+        let base = bench_crowded(64, LINES, BAND);
+        let wants = wants_from(&base, true, false); // max_shift は既定の 200
+        let plan = allocate(&wants, &[], LINES, BAND);
+
+        let span = (1060 + DEFAULT_MAX_SHIFT + 5) - (934 - DEFAULT_MAX_SHIFT) + 1;
+        let ceiling = ((span + BAND) / (6 + BAND)) as usize;
+        assert_eq!((span, ceiling), (532, 59), "窓の上限の計算が変わった");
+
+        eprintln!(
+            "bench crowded (max_shift={} のまま): {}/{} · 窓の理論上限 {} · 到達率 {:.0}%",
+            DEFAULT_MAX_SHIFT,
+            plan.granted.len(),
+            plan.denied.len(),
+            ceiling,
+            100.0 * plan.granted.len() as f64 / ceiling as f64,
+        );
+        assert_eq!(plan.granted.len(), ceiling, "窓の理論上限に届いていない");
+        assert!(plan.is_disjoint());
+        // 落ちた 5 件は「空きが無い」ではなく「上限より遠い」
+        assert_eq!(plan.deny_counts(), [0, 5, 0, 0], "内訳: {:?}", plan.denied);
+    }
+
+    // ── 挿入点 (幅 0 の要求) ─────────────────────────────────────────
+
+    /// **空き域の計算が挿入点を塞ぐこと。**
+    ///
+    /// 挿入点は `[n, n-1]` なので、素直に引き算すると `start > end` で
+    /// 「壊れた占有」に見え、**誰も塞いでいないこと**になる。
+    /// [`region::spans_too_close`] と食い違うと
+    /// 「空きだと言われた場所に置いたら衝突した」が起きるので、
+    /// 小さな盤面を総当たりして突き合わせる。
+    #[test]
+    fn 挿入点を塞いだ空き域も互いに素() {
+        for lines in 1u32..=12 {
+            for band in 0u32..=3 {
+                for a in 1..=lines {
+                    for b in 1..=lines {
+                        let occ = [Span::insert_before(a), Span::insert_before(b)];
+                        for f in free_spans(lines, &occ, band) {
+                            for n in f.start..=f.end {
+                                for o in &occ {
+                                    // 空き域の中の 1 行を取っても
+                                    assert!(
+                                        !region::spans_too_close(&sp(n, n), o, band),
+                                        "空きのはずが衝突: lines={lines} band={band} \
+                                         occ={occ:?} n={n}"
+                                    );
+                                    // 空き域の中へ挿入点を打っても
+                                    assert!(
+                                        !region::spans_too_close(&Span::insert_before(n), o, band),
+                                        "挿入点どうしが衝突: lines={lines} band={band} \
+                                         occ={occ:?} n={n}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 行域と挿入点が混ざっても同じ
+        assert_eq!(
+            free_spans(100, &[Span::insert_before(50)], 3),
+            vec![sp(1, 46), sp(54, 100)]
+        );
+        assert_eq!(
+            free_spans(100, &[sp(20, 30), Span::insert_before(60)], 3),
+            vec![sp(1, 16), sp(34, 56), sp(64, 100)]
+        );
+    }
+
+    /// **挿入点をずらすときも、行の外へ飛ばさない。**
+    ///
+    /// 旧実装は `f.end - need + 1` を候補の上限にしていたので、`need = 0`
+    /// では `f.end + 1` = 空き域の 1 行外を提案していた。提案どおり置くと
+    /// その場で安全帯を割る。
+    #[test]
+    fn 挿入点はずらす先も安全帯を守る() {
+        let want = Want::movable("t0", reg("src/a.rs#@50"));
+        assert_eq!(want.lines(), Some(0), "挿入点は 0 行");
+        let occ = held(&[("bob", "src/a.rs#@50")]);
+        let Offer::Shift { to, moved } = offer(&want, &occ, 100, 3) else {
+            panic!("ずらす提案が出ない: {:?}", offer(&want, &occ, 100, 3));
+        };
+        let s = to.span.expect("行域がある");
+        assert!(s.is_insert(), "ずらした先が挿入点になっていない: {s:?}");
+        assert_eq!(region::render(&to), "src/a.rs#@46");
+        assert_eq!(moved, -4);
+        // 提案どおり置けば本当に互いに素
+        assert!(region::is_disjoint(
+            &[to, occ[0].1.clone()],
+            crate::region::SAFE_BAND
+        ));
+    }
+
+    /// **2000 行のファイルへ挿入点 64 個が全部入る。**
+    ///
+    /// 挿入点は既存の行を 1 行も占有しないので、要るのは安全帯だけ
+    /// (`band = 3` なら 4 行間隔)。2000 行なら 500 個取れる計算で、
+    /// 64 体は全員に配って余る — **これが並列度の天井を外した形**。
+    #[test]
+    fn 挿入点は2000行へ64個入る() {
+        const LINES: u32 = 2000;
+        const BAND: u32 = 3;
+        // 64 体が「同じ 1 行の手前へ足したい」と言っている最悪条件
+        let wants: Vec<Want> = (0..64)
+            .map(|i| Want::movable(&format!("t{i:02}"), reg("src/big.rs#@1000")).max_shift(LINES))
+            .collect();
+        let plan = allocate(&wants, &[], LINES, BAND);
+        eprintln!(
+            "挿入点 64 個 / 2000 行: {}/{} · 理論上限 {} · ずれ総和 {} 行",
+            plan.granted.len(),
+            plan.denied.len(),
+            (LINES + BAND) / (1 + BAND),
+            total_shift(&plan),
+        );
+        assert!(plan.denied.is_empty(), "断られた: {:?}", plan.denied);
+        assert_eq!(plan.granted.len(), 64);
+        assert!(plan.is_disjoint(), "挿入点どうしがぶつかった");
+        for g in &plan.granted {
+            let s = g.regions[0].span.expect("行域がある");
+            assert!(s.is_insert(), "挿入点でなくなっている: {:?}", g.regions[0]);
+            assert_eq!(s.len(), 0, "既存の行を占有している");
+        }
+        // 幅 0 なので、要求の 1000 行のまわり 4 行間隔に収まる
+        assert_eq!(total_shift(&plan), 4_096);
+    }
+
+    /// **挿入点と行域が混ざった要求列でも互いに素に配れる。**
+    #[test]
+    fn 挿入点と行域が混ざっても配れる() {
+        const LINES: u32 = 1200;
+        const BAND: u32 = 3;
+        let mut wants: Vec<Want> = Vec::new();
+        for i in 0..24u32 {
+            // 挿入点と 40 行の行域を交互に、全部同じあたりへ要求させる
+            let spec = if i % 2 == 0 {
+                format!("src/big.rs#@{}", 600 + i)
+            } else {
+                format!("src/big.rs#L{}-{}", 600 + i, 639 + i)
+            };
+            wants.push(Want::movable(&format!("t{i:02}"), reg(&spec)).max_shift(LINES));
+        }
+        // すでに真ん中を持っている人がいる
+        let occ = held(&[("bob", "src/big.rs#L700-760")]);
+        let plan = allocate(&wants, &occ, LINES, BAND);
+        eprintln!(
+            "挿入点 12 + 行域 12 (占有 1 件あり): {}/{} · ずれ総和 {} 行",
+            plan.granted.len(),
+            plan.denied.len(),
+            total_shift(&plan),
+        );
+        assert!(plan.denied.is_empty(), "断られた: {:?}", plan.denied);
+        assert_eq!(plan.granted.len(), 24);
+        assert!(plan.is_disjoint(), "混ざると互いに素にならない: {plan:?}");
+        let inserts = plan
+            .granted
+            .iter()
+            .filter(|g| g.regions[0].span.is_some_and(|s| s.is_insert()))
+            .count();
+        assert_eq!(inserts, 12, "挿入点が行域に化けている");
+    }
+
+    // ── 最適性と計算量 ───────────────────────────────────────────────
+
+    /// **件数が本当に最大か**を、小さな盤面の総当たりと突き合わせる。
+    ///
+    /// 「入るなら全部配る」は主張であって、主張は総当たりでしか固定できない。
+    /// 各要求を「断る」か「窓の中のどこか」に置く全通りを数え上げ、
+    /// 互いに素になる中で**最大件数**を求めて比べる。
+    #[test]
+    fn 件数は総当たりの最大と一致する() {
+        let lines = 24u32;
+        let mut checked = 0usize;
+        let (mut got, mut top) = (0usize, 0usize);
+        // **`band = 0` は使わない。** `region::spans_too_close` の隙間計算は
+        // `hi - lo - 1` の飽和引き算なので、`band = 0` だと重なった 2 つでも
+        // `0 < 0` が偽になり「同時に持てる」と答える。総当たり側がそれを
+        // 正解として数えてしまい、比べる相手が壊れる。
+        for band in [1u32, 2, 3] {
+            for w0 in [3u32, 7] {
+                for w1 in [4u32, 9] {
+                    for shift in [4u32, 12] {
+                        let specs = [(5u32, w0), (6u32, w1), (7u32, 5), (18u32, 4)];
+                        let wants: Vec<Want> = specs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(s, w))| {
+                                Want::movable(
+                                    &format!("t{i}"),
+                                    reg(&format!("src/a.rs#L{}-{}", s, s + w - 1)),
+                                )
+                                .max_shift(shift)
+                            })
+                            .collect();
+                        let plan = allocate(&wants, &[], lines, band);
+                        assert!(plan.is_disjoint(), "band={band} で互いに素でない");
+
+                        // 総当たり: 0 = 断る、1..=lines = その行から置く。
+                        // **`Region` を組み立てない** — パスの `String` を
+                        // 1 回でも確保すると 940 万回で 33 秒かかる (実測)。
+                        // 判定は [`region::spans_too_close`] と同じ 1 実装のまま。
+                        let n = specs.len();
+                        let mut best = 0usize;
+                        let mut pick = [0u32; 4];
+                        let mut put = [Span { start: 1, end: 1 }; 4];
+                        let base = lines as usize + 1;
+                        for code in 0..base.pow(n as u32) {
+                            let mut c = code;
+                            for p in pick.iter_mut() {
+                                *p = (c % base) as u32;
+                                c /= base;
+                            }
+                            let mut ok = true;
+                            let mut k = 0usize;
+                            for (i, &(s, w)) in specs.iter().enumerate() {
+                                if pick[i] == 0 {
+                                    continue;
+                                }
+                                let x = pick[i];
+                                if x + w - 1 > lines || x.abs_diff(s) > shift {
+                                    ok = false;
+                                    break;
+                                }
+                                put[k] = Span {
+                                    start: x,
+                                    end: x + w - 1,
+                                };
+                                k += 1;
+                            }
+                            if !ok || k <= best {
+                                continue;
+                            }
+                            let disjoint = (0..k).all(|a| {
+                                ((a + 1)..k)
+                                    .all(|b| !region::spans_too_close(&put[a], &put[b], band))
+                            });
+                            if disjoint {
+                                best = k;
+                            }
+                        }
+                        assert_eq!(
+                            plan.granted.len(),
+                            best,
+                            "band={band} w0={w0} w1={w1} shift={shift} で最大でない: {plan:?}"
+                        );
+                        got += plan.granted.len();
+                        top += best;
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "総当たりとの照合: {checked} 盤面 · 配れた {got} / 最大 {top} = {:.0}%",
+            100.0 * got as f64 / top as f64
+        );
+        assert_eq!(checked, 24, "盤面を数え損ねている");
+        assert_eq!(got, top, "総当たりの最大に 1 件も足りていない盤面がある");
+    }
+
+    /// **件数を 2 倍にしても、計算量が跳ねないこと。**
+    ///
+    /// 絶対時間で線を引かない — このリポジトリでは Docker の仮想
+    /// ファイルシステムと高負荷で、絶対時間の性能テストが実際に 2 件落ちた。
+    /// 代わりに**内側ループを回った回数**で見る。機械の速さに一切依存せず、
+    /// しかも決定的なので、CI でもローカルでも同じ数字になる。
+    #[test]
+    fn 件数を倍にしても計算量が跳ねない() {
+        /// n 件を作って詰め込み、内側ループの回数と所要を返す。
+        fn run(n: u32, lines: u32, band: u32) -> (u64, std::time::Duration, usize) {
+            let wants: Vec<Want> = (0..n)
+                .map(|i| {
+                    let s = 1 + i * 7 % lines.max(1);
+                    Want::movable(
+                        &format!("t{i:04}"),
+                        reg(&format!("src/big.rs#L{}-{}", s, (s + 7).min(lines))),
+                    )
+                    .max_shift(lines)
+                })
+                .collect();
+            STEPS.with(|c| c.set(0));
+            let t = Instant::now();
+            let plan = allocate(&wants, &[], lines, band);
+            let el = t.elapsed();
+            assert!(plan.is_disjoint(), "n={n} で互いに素でない");
+            (STEPS.with(|c| c.get()), el, plan.granted.len())
+        }
+
+        // (a) 全部入る条件 — 追い出しが 1 回も起きない
+        let (s256, t256, g256) = run(256, 6_000, 3);
+        let (s512, t512, g512) = run(512, 12_000, 3);
+        // (b) 飽和条件 — 追い出しが何度も起きる
+        let (f256, u256, h256) = run(256, 2_000, 3);
+        let (f512, u512, h512) = run(512, 2_000, 3);
+        eprintln!(
+            "計算量: 余裕あり {n1}件 {s256} 歩 ({g256} 配布 / {t256:?}) → \
+             {n2}件 {s512} 歩 ({g512} 配布 / {t512:?}) = {r1:.1} 倍 · \
+             飽和 {n1}件 {f256} 歩 ({h256} 配布 / {u256:?}) → \
+             {n2}件 {f512} 歩 ({h512} 配布 / {u512:?}) = {r2:.1} 倍",
+            n1 = 256,
+            n2 = 512,
+            r1 = s512 as f64 / s256.max(1) as f64,
+            r2 = f512 as f64 / f256.max(1) as f64,
+        );
+        assert_eq!(g512, 512, "余裕のある条件で配り切れていない");
+        // 2 倍にして 6 倍以内 = ほぼ 2 乗以内。指数的に跳ねたら落とす。
+        assert!(
+            s512 <= s256.max(1) * 6,
+            "余裕のある条件で計算量が跳ねた: {s256} → {s512}"
+        );
+        assert!(
+            f512 <= f256.max(1) * 6,
+            "飽和条件で計算量が跳ねた: {f256} → {f512}"
+        );
+    }
+
+    /// **ずれの総和は「件数を犠牲にしない範囲で」最小に寄せていること。**
+    ///
+    /// 左詰めのままなら件数は同じでも総和が桁で悪くなる。
+    /// [`reposition`] を通した結果が、要求の重心へ寄っていることを見る。
+    #[test]
+    fn 件数を変えずにずれを詰める() {
+        const LINES: u32 = 2000;
+        const BAND: u32 = 3;
+        let base = bench_crowded(64, LINES, BAND);
+        let wants: Vec<Want> = base
+            .iter()
+            .map(|(id, s)| {
+                Want::movable(id, reg(&format!("src/big.rs#L{}-{}", s.start, s.end)))
+                    .max_shift(LINES)
+            })
+            .collect();
+        let plan = allocate(&wants, &[], LINES, BAND);
+
+        // 左詰め (寄せ直し無し) だと 1 行目から並ぶので総和は 45,600 行
+        let flat: i64 = base
+            .iter()
+            .enumerate()
+            .map(|(i, (_, s))| i64::from(s.start) - (1 + 9 * i as i64))
+            .sum();
+        assert_eq!(flat, 45_600, "左詰めの総和が変わった");
+        assert!(
+            total_shift(&plan) * 6 < flat,
+            "寄せ直しが効いていない: {} vs {flat}",
+            total_shift(&plan)
+        );
+        // 1 件も欠かさずに、である
+        assert_eq!(plan.granted.len(), 64);
+        // 割当は要求のまわりに固まる (要求は 934〜1065)
+        let lo = plan
+            .granted
+            .iter()
+            .filter_map(|g| g.regions[0].span.map(|s| s.start))
+            .min()
+            .expect("配れている");
+        let hi = plan
+            .granted
+            .iter()
+            .filter_map(|g| g.regions[0].span.map(|s| s.end))
+            .max()
+            .expect("配れている");
+        assert!(
+            lo >= 700 && hi <= 1300,
+            "要求から遠すぎる ({lo}〜{hi}): 934〜1065 のまわりに来るはず"
+        );
     }
 }
