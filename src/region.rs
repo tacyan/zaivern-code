@@ -464,7 +464,7 @@ pub fn spans_too_close(a: &Span, b: &Span, band: u32) -> bool {
     // (`[n, n-1]` のまま引き算すると大小が逆転して必ず衝突になる)。
     let (a0, a1) = a.probe();
     let (b0, b1) = b.probe();
-    let ((lo0, lo1), (hi0, _)) = if a0 <= b0 {
+    let ((_lo0, lo1), (hi0, _)) = if a0 <= b0 {
         ((a0, a1), (b0, b1))
     } else {
         ((b0, b1), (a0, a1))
