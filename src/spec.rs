@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use crate::history::fnv1a64;
 use eframe::egui::{self, RichText};
 use serde::{Deserialize, Serialize};
 
@@ -220,18 +221,6 @@ fn normalize_text(s: &str) -> String {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// FNV-1a 64bit。**自前で持つ理由**: `DefaultHasher` は Rust の版で値が
-/// 変わり得る。この指紋は `state.toml` に書いて別のマシンと突き合わせるので、
-/// 未来永劫同じ値でなければならない。
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
 }
 
 /// `#` の数と見出し文字列。見出しでなければ `None`。

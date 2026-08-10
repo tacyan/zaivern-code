@@ -5,8 +5,6 @@
 //! `~/.zaivern/sessions/<ハッシュhex>.toml` へ保存する。
 #![allow(dead_code)]
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// 1ワークスペース分のセッション情報。
@@ -90,14 +88,72 @@ pub struct AgentSessionRec {
     pub worktree_branch: String,
 }
 
-/// `~/.zaivern/sessions/<ルート集合ハッシュhex>.toml` から読む。無ければ None。
+/// `~/.zaivern/sessions/<ルート集合キー>.toml` から読む。無ければ None。
 pub fn load(roots: &[PathBuf]) -> Option<SessionData> {
-    load_from(&sessions_dir(), roots)
+    adopt_keys_for(roots);
+    let mut data = load_from(&sessions_dir(), roots)?;
+    repoint_log_files(&mut data, roots);
+    Some(data)
 }
 
 /// 同パスへ書く（ディレクトリは自動作成、失敗は無視）。
 pub fn save(roots: &[PathBuf], data: &SessionData) {
+    adopt_keys_for(roots);
     save_to(&sessions_dir(), roots, data);
+}
+
+/// 旧キーで置かれた保存物を、このルート集合の新しい名前へ引き取る。
+///
+/// **実 `~/.zaivern` を触るのはこの関数だけ** (テストは `*_in()` / `*_from()` 系を
+/// 一時ディレクトリへ向けるので通らない)。引き取りは 2 系統ある:
+///
+/// * **単一パスのキー** — `term_logs/` `bookmarks/` `lease/` などが使う。
+///   主ルートについて [`crate::history::adopt_legacy_keys`] が面倒を見る
+/// * **ルート集合のキー** — `sessions/` `hotexit/` が使う。旧値は
+///   [`crate::history::legacy_roots_key`]
+///
+/// どちらも組ごとに 1 プロセス 1 回。
+fn adopt_keys_for(roots: &[PathBuf]) {
+    if let Some(primary) = roots.first() {
+        crate::history::adopt_legacy_keys(primary);
+    }
+    crate::history::adopt_keys(
+        &[crate::history::legacy_roots_key(roots)],
+        &crate::history::workspace_set_key(roots),
+    );
+}
+
+/// 保存されていた生ログのパスを、いまの置き場へ張り替える。
+///
+/// `log_file` は**絶対パス**なので、`term_logs/<キー>/` の名前が変わると宙に浮く
+/// (引き取りでディレクトリごと改名されるため)。ファイル名は変わらないので、
+/// **元のパスが消えていて、同じ名前が現在の置き場にあるときだけ**差し替える。
+/// 存在するパスには触らない — 利用者が別の場所を指していたら、それが真実源。
+fn repoint_log_files(data: &mut SessionData, roots: &[PathBuf]) {
+    let Some(primary) = roots.first() else {
+        return;
+    };
+    repoint_log_files_in(data, &term_log_dir(primary));
+}
+
+/// 内部: 置き場を直接受ける版（テストで差し替え可能）。
+fn repoint_log_files_in(data: &mut SessionData, dir: &Path) {
+    for a in &mut data.agents {
+        if a.log_file.is_empty() {
+            continue;
+        }
+        let old = Path::new(&a.log_file);
+        if old.exists() {
+            continue;
+        }
+        let Some(name) = old.file_name() else {
+            continue;
+        };
+        let cand = dir.join(name);
+        if cand.exists() {
+            a.log_file = cand.to_string_lossy().into_owned();
+        }
+    }
 }
 
 /// 既定の保存先ディレクトリ: `~/.zaivern/sessions`
@@ -112,33 +168,12 @@ fn session_file(roots: &[PathBuf]) -> PathBuf {
 }
 
 /// 内部: 指定ディレクトリ配下のセッションファイルパス（テストで差し替え可能）。
+///
+/// キーは [`crate::history::workspace_set_key`] — **このモジュールでは計算しない**。
+/// 層ごとに別々の写像を持つと、同じフォルダに層の数だけ台帳ができて、
+/// どれか 1 つだけが静かにデータを失う。
 fn session_file_in(dir: &Path, roots: &[PathBuf]) -> PathBuf {
-    dir.join(format!("{}.toml", roots_hash(roots)))
-}
-
-/// 内部: ルート「集合」→ 安定ハッシュhex文字列。
-///
-/// 順序非依存にするため、canonicalize → 文字列化 → ソート → 重複除去 してから
-/// まとめてハッシュする。つまり `[A, B]` と `[B, A]` は同じセッションを指す。
-///
-/// 注意: `DefaultHasher` は Rust バージョン間での安定性が保証されていない。
-/// 値が変わった場合はセッションファイルが見つからなくなるだけで、
-/// クラッシュもデータ破壊も起きない（次回保存で新しいキーに書かれる）。
-fn roots_hash(roots: &[PathBuf]) -> String {
-    let mut keys: Vec<String> = roots
-        .iter()
-        .map(|p| {
-            p.canonicalize()
-                .unwrap_or_else(|_| p.to_path_buf())
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    keys.sort();
-    keys.dedup();
-    let mut hasher = DefaultHasher::new();
-    keys.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    dir.join(format!("{}.toml", crate::history::workspace_set_key(roots)))
 }
 
 /// ターミナル生ログの置き場: `~/.zaivern/term_logs/<ワークスペースハッシュ>/`。
@@ -146,9 +181,16 @@ fn roots_hash(roots: &[PathBuf]) -> String {
 /// ワークスペース単位で分けるので、同じプロジェクトを開き直せば前回のログが
 /// そのまま並ぶ (スクロールバック永続化)。
 pub fn term_log_dir(workspace: &Path) -> PathBuf {
-    crate::config::zaivern_dir()
-        .join("term_logs")
-        .join(workspace_hash(workspace))
+    // 旧キー (`Path` を DefaultHasher へ流した値) で置かれたログを先に引き取る。
+    // ここは実 `~/.zaivern` を触るので、テストは `term_log_dir_in` を使うこと。
+    crate::history::adopt_legacy_keys(workspace);
+    term_log_dir_in(&crate::config::zaivern_dir(), workspace)
+}
+
+/// 内部: `zdir` 配下のログ置き場（テストで差し替え可能・ファイルシステムを触らない）。
+fn term_log_dir_in(zdir: &Path, workspace: &Path) -> PathBuf {
+    zdir.join("term_logs")
+        .join(crate::history::workspace_key(workspace))
 }
 
 /// セッション 1 本分のログファイルパス。ファイル名にタイトルを含めて
@@ -198,7 +240,12 @@ pub fn read_term_log_tail(path: &Path, cap: usize) -> Vec<u8> {
 /// 古いターミナルログの掃除。新しい方から `keep` 本を残して削除する
 /// (`.old` ローテート分は本体と対で消す)。起動時に一度呼ぶ想定。
 pub fn prune_term_logs(workspace: &Path, keep: usize) {
-    let mut logs = list_term_logs(workspace);
+    prune_term_logs_in(&term_log_dir(workspace), keep)
+}
+
+/// 内部: ログ置き場を直接受ける版（テスト用）。
+fn prune_term_logs_in(dir: &Path, keep: usize) {
+    let mut logs = list_term_logs_in(dir);
     for p in logs.split_off(keep.min(logs.len())) {
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(p.with_extension("log.old"));
@@ -207,8 +254,12 @@ pub fn prune_term_logs(workspace: &Path, keep: usize) {
 
 /// ワークスペースの既存ログ一覧 (新しい順)。「📜 前回ログ」メニューの素材。
 pub fn list_term_logs(workspace: &Path) -> Vec<PathBuf> {
-    let dir = term_log_dir(workspace);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    list_term_logs_in(&term_log_dir(workspace))
+}
+
+/// 内部: ログ置き場を直接受ける版（テスト用）。
+fn list_term_logs_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
@@ -221,17 +272,6 @@ pub fn list_term_logs(workspace: &Path) -> Vec<PathBuf> {
         .collect();
     logs.sort_by_key(|b| std::cmp::Reverse(b.0));
     logs.into_iter().map(|(_, p)| p).collect()
-}
-
-/// 内部: ワークスペース絶対パス → 安定ハッシュhex文字列（DefaultHasher）。
-/// canonicalize できる場合は正規化してシンボリックリンク差を吸収する。
-fn workspace_hash(workspace: &Path) -> String {
-    let canonical = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let mut hasher = DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 /// 内部: 指定ディレクトリから読む（テスト用に保存先を差し替え可能）。
@@ -247,7 +287,9 @@ fn load_from(dir: &Path, roots: &[PathBuf]) -> Option<SessionData> {
         return Some(d);
     }
     if roots.len() == 1 {
-        return read(dir.join(format!("{}.toml", workspace_hash(&roots[0]))));
+        // v0.1.3 以前は単一ワークスペースのキーで置いていた。旧キーの引き取りで
+        // その名前は `history::workspace_key` へ改名済みなので、こちらで探す。
+        return read(dir.join(format!("{}.toml", crate::history::workspace_key(&roots[0]))));
     }
     None
 }
@@ -558,7 +600,13 @@ pub fn hotexit_dir() -> PathBuf {
 /// キーはセッションファイルと同じルート集合ハッシュなので、同じフォルダを
 /// 開き直せば必ず同じ場所に着く。
 pub fn hotexit_dir_for(roots: &[PathBuf]) -> PathBuf {
-    hotexit_dir().join(roots_hash(roots))
+    adopt_keys_for(roots);
+    hotexit_dir_for_in(&hotexit_dir(), roots)
+}
+
+/// 内部: 退避ルートを直接受ける版（テストで差し替え可能・実 `~/.zaivern` を触らない）。
+fn hotexit_dir_for_in(dir: &Path, roots: &[PathBuf]) -> PathBuf {
+    dir.join(crate::history::workspace_set_key(roots))
 }
 
 /// 退避ディレクトリを丸ごと消す (失敗は無視)。
@@ -914,13 +962,14 @@ mod tests {
     fn 退避先はワークスペースごとに分かれ順序に依存しない() {
         let a = unique_temp_dir("zaivern-hotexit", "ws-a");
         let b = unique_temp_dir("zaivern-hotexit", "ws-b");
-        let ab = hotexit_dir_for(&[a.clone(), b.clone()]);
-        let ba = hotexit_dir_for(&[b.clone(), a.clone()]);
+        let store = unique_temp_dir("zaivern-hotexit", "store");
+        let ab = hotexit_dir_for_in(&store, &[a.clone(), b.clone()]);
+        let ba = hotexit_dir_for_in(&store, &[b.clone(), a.clone()]);
         assert_eq!(ab, ba, "ルートの並び順で退避先が変わっている");
-        assert_ne!(ab, hotexit_dir_for(&[a.clone()]));
+        assert_ne!(ab, hotexit_dir_for_in(&store, &[a.clone()]));
         // 置き場は必ず ~/.zaivern/hotexit 配下 (パスは dirs から導出する)
-        assert!(ab.starts_with(hotexit_dir()));
         assert!(hotexit_dir().starts_with(crate::config::zaivern_dir()));
+        std::fs::remove_dir_all(&store).ok();
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
     }
@@ -1297,39 +1346,97 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **置き場の名前は `history` の写像そのもの**。ここで別に計算していたら、
+    /// 同じフォルダに層の数だけ台帳ができて片方だけが静かに消える。
     #[test]
-    fn hash_is_stable_and_distinguishes_workspaces() {
-        let base = PathBuf::from("/tmp/zaivern-hash-check");
-        let a1 = workspace_hash(&base.join("a"));
-        let a2 = workspace_hash(&base.join("a"));
-        let b = workspace_hash(&base.join("b"));
+    fn 置き場のキーは_history_の写像そのもの() {
+        let base = unique_temp_dir("zaivern-key-check", "map");
+        let a = base.join("a");
+        let store = base.join("store");
 
-        assert_eq!(a1, a2, "same workspace must map to the same file");
-        assert_ne!(a1, b, "different workspaces should map to different files");
-        assert!(a1.chars().all(|c| c.is_ascii_hexdigit()));
+        // 生ログは単一パスのキー
+        assert_eq!(
+            term_log_dir_in(&store, &a),
+            store
+                .join("term_logs")
+                .join(crate::history::workspace_key(&a)),
+        );
+        // セッションと Hot Exit はルート集合のキー
+        let roots = [a.clone()];
+        assert_eq!(
+            session_file_in(&store, &roots),
+            store.join(format!(
+                "{}.toml",
+                crate::history::workspace_set_key(&roots)
+            )),
+        );
+        assert_eq!(
+            hotexit_dir_for_in(&store, &roots),
+            store.join(crate::history::workspace_set_key(&roots)),
+        );
+        // 別のフォルダは別の置き場
+        assert_ne!(
+            term_log_dir_in(&store, &a),
+            term_log_dir_in(&store, &base.join("b"))
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 
-        let roots = [base.join("a")];
-        let h = roots_hash(&roots);
-        let file = session_file_in(Path::new("/x"), &roots);
-        assert_eq!(file, PathBuf::from(format!("/x/{h}.toml")));
+    /// 引き取りで `term_logs/<キー>/` の名前が変わっても、**前回ログを見失わない**。
+    /// 保存されている `log_file` は絶対パスなので、ここを繋ぎ直さないと
+    /// 「再起動したらスクロールバックが消えた」として表に出る。
+    #[test]
+    fn 引き取りで置き場が変わっても前回ログを見失わない() {
+        let base = unique_temp_dir("zaivern-repoint", "logs");
+        let now = base.join("term_logs").join("fedcba9876543210");
+        let gone = base.join("term_logs").join("0123456789abcdef");
+        std::fs::create_dir_all(&now).expect("mkdir");
+        std::fs::write(now.join("Claude-1.log"), "前回の画面\n").expect("log");
+
+        let rec = |p: &Path| SessionData {
+            agents: vec![AgentSessionRec {
+                log_file: p.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 旧い置き場を指していたら、同じ名前のログがある今の置き場へ繋ぎ直す
+        let mut moved = rec(&gone.join("Claude-1.log"));
+        repoint_log_files_in(&mut moved, &now);
+        assert_eq!(
+            PathBuf::from(&moved.agents[0].log_file),
+            now.join("Claude-1.log")
+        );
+
+        // 実在するパスには触らない (利用者が別の場所を指していたらそれが真実源)
+        let mut kept = rec(&now.join("Claude-1.log"));
+        let before = kept.agents[0].log_file.clone();
+        repoint_log_files_in(&mut kept, &base.join("term_logs").join("nowhere"));
+        assert_eq!(kept.agents[0].log_file, before);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn roots_hash_is_order_independent() {
-        let a = PathBuf::from("/tmp/zaivern-roots/a");
-        let b = PathBuf::from("/tmp/zaivern-roots/b");
-        let c = PathBuf::from("/tmp/zaivern-roots/c");
+        let base = unique_temp_dir("zaivern-roots", "order");
+        let store = base.join("store");
+        let (a, b, c) = (base.join("a"), base.join("b"), base.join("c"));
 
-        let ab = roots_hash(&[a.clone(), b.clone()]);
-        let ba = roots_hash(&[b.clone(), a.clone()]);
-        assert_eq!(ab, ba, "ルート集合が同じなら順序が違っても同じセッション");
-
+        let file = |roots: &[PathBuf]| session_file_in(&store, roots);
+        let ab = file(&[a.clone(), b.clone()]);
+        assert_eq!(
+            ab,
+            file(&[b.clone(), a.clone()]),
+            "ルート集合が同じなら順序が違っても同じセッション"
+        );
         // 重複は畳まれる
-        assert_eq!(roots_hash(&[a.clone(), b.clone(), a.clone()]), ab);
+        assert_eq!(file(&[a.clone(), b.clone(), a.clone()]), ab);
         // 集合が違えば別キー
-        assert_ne!(roots_hash(&[a.clone(), b, c]), ab);
-        assert_ne!(roots_hash(std::slice::from_ref(&a)), ab);
-        assert!(ab.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(file(&[a.clone(), b, c]), ab);
+        assert_ne!(file(std::slice::from_ref(&a)), ab);
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1384,7 +1491,10 @@ mod tests {
         };
         std::fs::create_dir_all(&dir).ok();
         std::fs::write(
-            dir.join(format!("{}.toml", workspace_hash(&workspace))),
+            dir.join(format!(
+                "{}.toml",
+                crate::history::workspace_key(&workspace)
+            )),
             toml::to_string_pretty(&legacy).expect("serialize"),
         )
         .expect("write legacy session");
@@ -1448,8 +1558,7 @@ mod tests {
     fn prune_term_logs_keeps_newest() {
         use std::time::Duration;
         let ws = crate::test_util::unique_temp_dir("zaivern-termlog-test", "prune");
-        std::fs::create_dir_all(&ws).unwrap();
-        let dir = term_log_dir(&ws);
+        let dir = term_log_dir_in(&ws.join("zdir"), &ws);
         std::fs::create_dir_all(&dir).unwrap();
         // mtime 差を付けて 4 本作る
         for i in 0..4u64 {
@@ -1459,8 +1568,8 @@ mod tests {
             let f = std::fs::File::options().write(true).open(&p).unwrap();
             f.set_modified(t).unwrap();
         }
-        prune_term_logs(&ws, 2);
-        let left = list_term_logs(&ws);
+        prune_term_logs_in(&dir, 2);
+        let left = list_term_logs_in(&dir);
         assert_eq!(left.len(), 2, "新しい 2 本だけ残る");
         let names: Vec<String> = left
             .iter()
