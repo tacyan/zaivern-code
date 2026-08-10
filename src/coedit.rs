@@ -1117,9 +1117,15 @@ pub fn integrate(
     }
 
     // ③ 乾式検査。git が古いなら**証明だけへ綺麗に降格**する。
-    let version = git_out(&top, &["--version"]).unwrap_or_default();
-    out.dry_available = crate::conflict::supports_merge_tree(&version);
+    //
+    // 能力はバージョン番号から推定しない — ディストリがバックポートした版
+    // (番号は古いのに機能はある) と、機能を削って再パッケージした版を
+    // 必ず取り違える。`conflict::merge_tree_available` が実際に 1 回叩いて
+    // 決めるので、判定はクレート内で 1 実装しかない。版番号は**使えなかった
+    // ときの説明にだけ**使う。
+    out.dry_available = crate::conflict::merge_tree_available(&top);
     if !out.dry_available {
+        let version = git_out(&top, &["--version"]).unwrap_or_default();
         out.stop = Some(Stop {
             branch: String::new(),
             files: Vec::new(),
@@ -1262,13 +1268,8 @@ fn stop_of(branch: &str, files: Vec<String>, merged: &[String], detail: String) 
 /// **`src/cli.rs` へ 1 行入るまで、ここは 1 つも呼ばれない。** cli.rs は
 /// 並列ブランチが取り合う共有ファイルなので、機能ブランチ側では配線しない
 /// 約束になっている (`src/features/coedit.rs` の申し送りを参照)。配線が
-/// 無いあいだは節ごと `dead_code` になるため、**この節に限って**黙らせる。
-///
-/// **配線の 1 行が入ったらこの `allow` を消すこと。** `never used` は
-/// 「作ったのに繋いでいない」の検出器なので、必要な範囲より広く潰さない
-/// — だからモジュール 1 つに閉じ込めてある (証明・統合・パネルの側には
-/// `allow` が 1 つも無い)。
-#[allow(dead_code)]
+/// `src/cli.rs` の dispatch から `zai coedit …` として呼ばれる
+/// (統合時に直列で配線済み。`allow(dead_code)` はその時点で外した)。
 pub mod cliface {
     use super::*;
 
