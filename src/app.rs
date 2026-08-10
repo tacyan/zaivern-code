@@ -22913,7 +22913,7 @@ impl ZaivernApp {
         // 見るので、保存するまで結果は変わらない。
         let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
         let line_count = self.editor.buffers[active].text.split('\n').count();
-        let blame_map: Option<git::BlameMap> = if self.cfg.git_blame
+        let blame: Option<(git::BlameKey, git::BlameMap)> = if self.cfg.git_blame
             && self.editor.buffers[active].kind == crate::editor::BufferKind::File
         {
             let rows = if row_h > 0.0 {
@@ -22934,7 +22934,9 @@ impl ZaivernApp {
                             start: bs,
                             end: be,
                         };
-                        self.blame.request(&top, &rel, key)
+                        self.blame
+                            .request(&top, &rel, key.clone())
+                            .map(|m| (key, m))
                     }
                 },
                 None => None,
@@ -22944,16 +22946,19 @@ impl ZaivernApp {
             self.blame.clear();
             None
         };
-        // blame 欄の桁数と幅。狭い窓では 0 (= 出さない) まで落ちる。
-        let blame_cols = match blame_map.as_ref() {
-            Some(_) => git::blame_gutter_cols(ui.available_width(), char_w),
-            None => 0,
+        // blame 欄の計画。**いま読み込んでいるブロック全体**から決めるので、
+        // ブロック内をスクロールしても列幅は動かない (画面が突然変わらない)。
+        // 著者が 1 人しか居なければ著者名は出さない — 全行に同じ文字列が並ぶ
+        // だけで情報量がゼロだから。狭い窓では従来どおり 0 (= 列ごと消す)。
+        // `blame_now` は計画を立てた時刻。行ラベルにも**この値**を使う。
+        let (blame_plan, blame_now) = match blame.as_ref() {
+            Some((key, map)) => {
+                let max = git::blame_gutter_cols(ui.available_width(), char_w);
+                self.blame.column_plan(key, map, git::unix_now(), max)
+            }
+            None => (git::BlameColumnPlan::HIDDEN, 0),
         };
-        let blame_w = if blame_cols > 0 {
-            blame_cols as f32 * char_w + 10.0
-        } else {
-            0.0
-        };
+        let blame_cols = blame_plan.cols;
 
         // 虹色括弧 (VS Code の editor.bracketPairColorization)。
         // 色は**テーマから**採る (直書きしない)。強調表示を切っている
@@ -23092,8 +23097,11 @@ impl ZaivernApp {
         } else {
             0.0
         };
-        // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)
-        let gutter_w = char_w * gutter_digits as f32 + 22.0 + marker_w + blame_w;
+        // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)。
+        // x の配置は `git::gutter_layout` が唯一の定義 (テーブルテストで固定)。
+        let gl = git::gutter_layout(blame_cols, char_w, gutter_digits, marker_w, ppp);
+        let blame_w = gl.blame_w;
+        let gutter_w = gl.width;
 
         let ed_id = buf_edit_id(self.cur_pane, *id);
         // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
@@ -23851,7 +23859,7 @@ impl ZaivernApp {
         );
         painter.galley(
             egui::pos2(
-                vis.left() + 6.0 + blame_w,
+                vis.left() + gl.num_left,
                 text_top.unwrap_or(vis.top() - inner.state.offset.y),
             ),
             gutter_galley,
@@ -23939,11 +23947,14 @@ impl ZaivernApp {
             }
         }
 
-        // Git blame: ガター左端に「著者 · 相対日時」を薄く出す。
+        // Git blame: ガターの blame 欄へ薄く出す。
         // 描くのは**可視行だけ** (row_lines が画面外を除いてある)。
+        // ラベルは列の**右端**へ寄せる — 左寄せ + 固定幅列だと、ラベルが
+        // 短いほど行番号との隙間が広がり、1 文字へ縮退した瞬間に画面の
+        // 左端へ取り残される (実際に「離れすぎて見づらい」と報告された)。
         let mut blame_open: Option<String> = None;
-        if let (Some(map), true) = (blame_map.as_ref(), blame_cols > 0) {
-            let now = git::unix_now();
+        if let (Some((_, map)), false) = (blame.as_ref(), blame_plan.is_hidden()) {
+            let now = blame_now;
             let col = egui::Rect::from_min_max(
                 egui::pos2(vis.left(), vis.top()),
                 egui::pos2(vis.left() + blame_w, vis.bottom()),
@@ -23956,18 +23967,14 @@ impl ZaivernApp {
                 let Some(bl) = map.get(src) else {
                     continue;
                 };
-                let rel = git::relative_time(bl.time, now);
-                let author = if bl.uncommitted {
-                    tr("未コミット")
-                } else {
-                    bl.author.clone()
-                };
-                let rel = if bl.uncommitted { String::new() } else { rel };
-                // 幅が足りなければイニシャルへ、それも無理なら描かない
-                if let Some(label) = git::fit_blame_label(&author, &rel, blame_cols) {
+                // 何を書くかは計画が決める (著者が 1 人なら相対日時だけ)。
+                // 幅が足りなければ縮退し、書くことが無ければ描かない。
+                if let Some(label) =
+                    git::blame_row_label(&blame_plan, &bl.author, bl.uncommitted, bl.time, now)
+                {
                     painter.text(
-                        egui::pos2(vis.left() + 6.0, *y0),
-                        Align2::LEFT_TOP,
+                        egui::pos2(vis.left() + gl.blame_right, *y0),
+                        Align2::RIGHT_TOP,
                         &label,
                         font.clone(),
                         blame_color,
@@ -39008,7 +39015,11 @@ mod wave2_tests {
             "実行中だけ再描画を予約する仕組みが無い (アイドルで回り続ける)"
         );
         // ガターの描画とクリックの配線
-        assert!(src.contains("git::fit_blame_label"), "ガターへ描いていない");
+        assert!(src.contains("git::blame_row_label"), "ガターへ描いていない");
+        assert!(
+            src.contains("Align2::RIGHT_TOP"),
+            "blame ラベルを右寄せにしていない (短いほど行番号から離れる)"
+        );
         assert!(
             src.contains("self.open_commit_diff(&sha)"),
             "クリックで差分を開いていない"
