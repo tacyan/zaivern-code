@@ -551,8 +551,11 @@ fn first_oid(raw: &str) -> Option<String> {
 /// 対する判定になり、画面の予想と本番がずれる。作業コミットはどの参照からも
 /// 指されないので `git gc` が回収する。
 pub fn dry_run(repo: &Path, onto: &str, order: &[String]) -> DryResult {
-    let version = git_out(repo, &["--version"]).unwrap_or_default();
-    if !crate::conflict::supports_merge_tree(&version) {
+    // 能力はバージョン番号から推測しない (バックポート版・機能削除版を必ず
+    // 取り違える)。実際に 1 回叩いて決めるのは `conflict::merge_tree_available`。
+    // 版番号は**使えなかったときの説明にだけ**使うので、必要になってから取る。
+    if !crate::conflict::merge_tree_available(repo) {
+        let version = git_out(repo, &["--version"]).unwrap_or_default();
         return DryResult {
             available: false,
             steps: Vec::new(),

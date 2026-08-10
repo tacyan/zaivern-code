@@ -847,6 +847,25 @@ pub fn probe_supports_merge_tree(stdout: &str, stderr: &str, code: Option<i32>) 
     out.contains("--write-tree")
 }
 
+/// この git が `merge-tree --write-tree` を使えるか。**プロセスで 1 回だけ**
+/// 実際に叩いて決め、以降は憶えておく。
+///
+/// [`probe_supports_merge_tree`] は純粋な判定なので、**実行する側**の入口が
+/// 別に要る。ここを公開しておかないと、呼びたいモジュール
+/// (`train` / `coedit`) がそれぞれ `Command` を組み立てて**同じ判定を 3 つ持つ**
+/// ことになり、必ずズレる。
+///
+/// git バイナリはプロセスの寿命の間に入れ替わらないので、結果は
+/// [`std::sync::OnceLock`] に載せてよい。**能力判定にリポジトリは要らない**
+/// (コミットを渡さない usage 出力を読むだけ) ので、`dir` はどこでも構わない。
+pub fn merge_tree_available(dir: &Path) -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        run_probe(dir, &merge_tree_probe_argv())
+            .is_some_and(|(so, se, code)| probe_supports_merge_tree(&so, &se, code))
+    })
+}
+
 /// `git -C <dir>` の後ろに続く引数列。
 ///
 /// `-z` にするのは、空白や日本語や改行を含むパスでもレコードが壊れないため。
@@ -1229,8 +1248,7 @@ pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {
     // ④ ファイル単位で重なった組だけ、実マージを撃つ。
     // 能力は **叩いて** 確かめる (バージョン番号から推定しない)。
     // 起こすプロセスは 1 本で、以前のバージョン確認と同じ本数。
-    let can_merge_tree = run_probe(hub, &merge_tree_probe_argv())
-        .is_some_and(|(so, se, code)| probe_supports_merge_tree(&so, &se, code));
+    let can_merge_tree = merge_tree_available(hub);
     let mut merged_clean: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut merged_conflict: BTreeMap<(usize, usize), BTreeSet<String>> = BTreeMap::new();
     let mut degraded: Option<String> = None;
@@ -2381,9 +2399,28 @@ rename to new.rs
             !body.contains(concat!("parse_git_", "version")),
             "scan がバージョン解析へ戻っている"
         );
+        // 叩いて確かめる入口を通っていること。共通入口 (merge_tree_available) へ
+        // 寄せてあるので、直呼びと共通入口のどちらでも良い — **禁じたいのは
+        // 「バージョン番号で決める」経路だけ**で、判定の置き場所ではない。
         assert!(
-            body.contains("probe_supports_merge_tree"),
+            body.contains(concat!("merge_tree_", "available"))
+                || body.contains("probe_supports_merge_tree"),
             "scan が能力を叩いて確かめていない"
+        );
+        // 共通入口そのものが、純粋判定へ委譲していること
+        // (ここが空洞化すると全員が黙って false になる)。
+        let entry = src
+            .split(concat!("pub fn merge_tree_", "available(dir: &Path) -> bool {"))
+            .nth(1)
+            .expect("共通入口が見つからない");
+        let entry = entry.split("\n}\n").next().expect("入口の終端");
+        assert!(
+            entry.contains("probe_supports_merge_tree"),
+            "共通入口が実際に叩いていない"
+        );
+        assert!(
+            !entry.contains(concat!("parse_git_", "version")),
+            "共通入口がバージョン解析へ戻っている"
         );
     }
 
