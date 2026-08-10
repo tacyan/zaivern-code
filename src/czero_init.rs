@@ -4828,34 +4828,10 @@ mod tests {
     }
 
     /// テストバイナリの隣にあるビルド済み `zai`。無ければ `None`。
+    // 関所は `test_util` に 1 つだけ (`guard` 側と同じ理由)。版が同じまま
+    // 中身が古い残骸を `--version` の照合は素通りさせる。
     fn built_zai() -> Option<PathBuf> {
-        let me = std::env::current_exe().ok()?;
-        // target/<profile>/deps/<test>-<hash> → target/<profile>/zai
-        let profile_dir = me.parent()?.parent()?;
-        let name = if cfg!(windows) { "zai.exe" } else { "zai" };
-        let p = profile_dir.join(name);
-        if !p.is_file() {
-            return None;
-        }
-        // **版まで確かめる。** `cargo test --bin zai` は bin を作らないので、
-        // ここに居るのは前の実行の残骸かもしれない。古い版は
-        // `merge-driver` / `czero` をサブコマンドとして知らないので、
-        // 実マージの段が黙って Skipped になり、テストは「配線が要ります」と
-        // いう**嘘の理由**で落ちる (Docker の Linux で実際に起きた)。
-        let out = std::process::Command::new(&p)
-            .arg("--version")
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        if !text.contains(env!("CARGO_PKG_VERSION")) {
-            eprintln!(
-                "[skip] 隣の zai が版違いなので実バイナリ試験を飛ばします: {} ({})",
-                p.display(),
-                text.trim()
-            );
-            return None;
-        }
-        Some(p)
+        crate::test_util::real_zai("実バイナリでのマージ試験")
     }
 
     // ─────────────── uninstall ───────────────

@@ -2818,30 +2818,12 @@ mod tests {
     /// `cargo test` / `cargo nextest run` は bin も作るので CI では必ず居る。
     /// `cargo test --bin zai` だけを叩いた手元では居ないことがあるので、
     /// **飛ばしたことを必ず出す** (黙って緑になる試験は嘘をつく)。
+    // 隣の `zai` を拾う関所は `test_util` に 1 つだけ持つ。
+    // **版の照合だけでは古いバイナリを捕まえられない** — 版が同じまま中身が
+    // 古い残骸で `guard` の実フック試験が「はみ出したのに通った」と嘘の赤を
+    // 出した (実際に起きた)。`test_util::real_zai` は mtime まで見る。
     fn real_zai() -> Option<PathBuf> {
-        let exe = std::env::current_exe().ok()?;
-        let dir = exe.parent()?.parent()?;
-        let p = dir.join(if cfg!(windows) { "zai.exe" } else { "zai" });
-        if !p.is_file() {
-            return None;
-        }
-        // **版まで確かめる。** `cargo test --bin zai` は bin を作らないので、
-        // ここに居るのは前の実行の残骸かもしれない。古い版は `guard` を
-        // サブコマンドとして知らず、`zai` は知らない語を**ワークスペース指定**
-        // として扱うので **GUI を起こそうとして落ちる** (Docker の Linux で
-        // 実際に起きた: winit が DISPLAY が無いと言って死ぬ)。
-        // 版が違えば「本物の zai ではない」ので、飛ばしたと出して降りる。
-        let out = Command::new(&p).arg("--version").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        if !text.contains(env!("CARGO_PKG_VERSION")) {
-            eprintln!(
-                "[skip] 隣の zai が版違いなので実フック試験を飛ばします: {} ({})",
-                p.display(),
-                text.trim()
-            );
-            return None;
-        }
-        Some(p)
+        crate::test_util::real_zai("実フック試験")
     }
 
     /// 子プロセスの `~` を temp へ寄せる (実 `~/.zaivern` に触れないため)。
