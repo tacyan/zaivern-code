@@ -204,15 +204,30 @@ pub struct FileEdit {
     /// ベース側の変更行範囲 (開始位置の昇順)。
     pub spans: Vec<Span>,
     /// 変更内容の指紋。**両側が同一の変更をしている** ときに一致する。
-    pub digest: u64,
+    ///
+    /// `None` は **共通ベースが取れず指紋を計算できなかった** ことを表す
+    /// (`git merge-base` に失敗し、`git status` からファイル名だけを起こした
+    /// フォールバック経路)。ここを `0` のような具体値で埋めると
+    /// [`same_change`] が **全ペアで真** になり、[`classify_pair`] が全部
+    /// `None` を返して **判定が 1 件も出なくなる**。実際にそうなっていて、
+    /// 画面には「ファイル単位までしか判定できません」と出るのに、その
+    /// **ファイル単位すら 1 件も出ていなかった**。「知らない」は値ではなく
+    /// 型で表す。
+    pub digest: Option<u64>,
 }
 
 /// 2 つの変更が「同じ結果になる同一の変更」か。
 ///
 /// これを衝突として数えると、同じ指示を撒いた 2 体が同じ修正をしただけで
 /// 警報が鳴る。git はこれを綺麗にマージするので、**衝突ではない**。
+///
+/// **指紋が無い (ベース不明の) 側は「同一」と言えない。** 不明どうしを
+/// 同一視すると、ベースが取れなかった走査で衝突が 1 件も出なくなる。
 pub fn same_change(a: &FileEdit, b: &FileEdit) -> bool {
-    a.kind == b.kind && a.digest == b.digest && a.spans == b.spans
+    let (Some(da), Some(db)) = (a.digest, b.digest) else {
+        return false;
+    };
+    a.kind == b.kind && da == db && a.spans == b.spans
 }
 
 /// 変更の指紋を作る。ハンクの中身 (行種別と本文) だけを見るので、
@@ -289,7 +304,7 @@ pub fn edits_from_diff(diff_text: &str) -> Vec<FileEdit> {
         out.push(FileEdit {
             path,
             kind,
-            digest: digest_of(&f.hunks),
+            digest: Some(digest_of(&f.hunks)),
             spans,
         });
     }
@@ -360,6 +375,8 @@ pub enum Reason {
     MergeTree,
     /// `git merge-tree` が綺麗にマージできると言った (降格)
     MergeClean,
+    /// 共通ベースが取れず、ファイル単位でしか突き合わせられていない
+    BaseUnknown,
 }
 
 impl Reason {
@@ -373,6 +390,7 @@ impl Reason {
             Reason::Rename => tr("リネームが絡んでいます"),
             Reason::MergeTree => tr("git が実際に衝突すると判定しました"),
             Reason::MergeClean => tr("git は綺麗にマージできると判定しました"),
+            Reason::BaseUnknown => tr("共通ベースが無いためファイル単位でのみ見ています"),
         }
     }
 }
@@ -399,6 +417,15 @@ pub fn classify_pair(a: &FileEdit, b: &FileEdit, near: usize) -> Option<(Severit
         (K::Created, _) | (_, K::Created) => Some((Severity::Certain, Reason::AddAdd)),
         // ⑦ 素直な書き換えどうし。ここだけ行範囲で段を分ける。
         (K::Modified, K::Modified) => {
+            // **ベース不明 (指紋が無い) 側は行範囲も持っていない。**
+            // そのまま行範囲だけを見ると `spans` が空どうしで
+            // `SameFile` にすら届かず、**1 件も出ない**まま終わる。
+            // ファイル単位の重なりは必ず 1 件出す — ただし段は
+            // [`Severity::Info`] に留める (`src/app.rs` のような大きな
+            // 共有ファイルで狼少年にならないための、冒頭の約束どおり)。
+            if a.digest.is_none() || b.digest.is_none() {
+                return Some((Severity::Info, Reason::BaseUnknown));
+            }
             let mut best = None;
             for x in &a.spans {
                 for y in &b.spans {
@@ -618,6 +645,44 @@ impl Report {
         }
         m
     }
+}
+
+/// 見出しに出す状態。**「✅ 衝突は見つかっていません」を安易に出さない**ための分岐。
+///
+/// 共通ベースが取れなかった走査は行単位を一度も見ていないので、
+/// [`Severity::Warn`] 以上は構造的に 1 件も立たない。そこで
+/// [`Report::is_quiet`] だけを見て ✅ を出すと、**何も見ていないのに
+/// 「安全」と言う**ことになる。純関数にしてテーブルテストで固定する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Headline {
+    /// 見張る対象が 2 本未満 (git を 1 回も起こしていない)
+    TooFew,
+    /// 行単位まで見たうえで静か
+    Quiet,
+    /// 共通ベースが無く、ファイル単位の重なりだけが `n` ファイル見えている
+    FileLevelOnly(usize),
+    /// 警報が `n` ファイル
+    Alarm(usize),
+}
+
+/// [`Report`] から見出しの状態を決める **純関数**。
+pub fn headline(rep: &Report) -> Headline {
+    if rep.trees.len() < 2 {
+        return Headline::TooFew;
+    }
+    if !rep.is_quiet() {
+        return Headline::Alarm(rep.alarm_files());
+    }
+    if rep.base.is_none() && !rep.hits.is_empty() {
+        let n = rep
+            .hits
+            .iter()
+            .map(|h| h.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        return Headline::FileLevelOnly(n);
+    }
+    Headline::Quiet
 }
 
 /// 走査結果から [`Report`] を畳む **純関数**。ここに git は 1 行も無い。
@@ -1073,8 +1138,9 @@ pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {
             )
             .map(|d| edits_from_diff(&d))
             .unwrap_or_default(),
-            // ベースが取れないときはファイル単位まで降格する
-            // (行範囲が無いので `spans` は空 = 常に SameFile 扱い)。
+            // ベースが取れないときはファイル単位まで降格する。
+            // **指紋は `None`** — ここを 0 で埋めると `same_change` が
+            // 全ペアで真になり、判定が 1 件も出なくなる (実際に起きた)。
             None => crate::worktree::status_entries(&s.dir)
                 .unwrap_or_default()
                 .into_iter()
@@ -1083,7 +1149,7 @@ pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {
                     path: norm_path(&p.to_string_lossy()),
                     kind: EditKind::Modified,
                     spans: Vec::new(),
-                    digest: 0,
+                    digest: None,
                 })
                 .collect(),
         };
@@ -1103,7 +1169,7 @@ pub fn scan(specs: &[TreeSpec], want_disk: bool) -> Report {
                     spans: vec![Span::insert_at(0)],
                     // 未追跡ファイルの中身は読まない (大きいかもしれない)。
                     // 指紋を分けておかないと「同一の変更」に誤判定する。
-                    digest: i as u64 + 1,
+                    digest: Some(i as u64 + 1),
                 });
             }
         }
@@ -1380,19 +1446,24 @@ fn radar_body(
 ) {
     // ── 見出し ──
     ui.horizontal(|ui| {
-        let n = rep.alarm_files();
-        let (txt, col) = if rep.trees.len() < 2 {
-            (
+        let (txt, col) = match headline(rep) {
+            Headline::TooFew => (
                 tr("並列で動いているワークツリーが 1 本以下です"),
                 theme.text_dim,
-            )
-        } else if rep.is_quiet() {
-            (tr("✅ 衝突は見つかっていません"), theme.ok)
-        } else {
-            (
+            ),
+            Headline::Quiet => (tr("✅ 衝突は見つかっていません"), theme.ok),
+            // ベース不明のときに ✅ を出さない。行単位を一度も見ていない。
+            Headline::FileLevelOnly(n) => (
+                trf(
+                    "ℹ {n} ファイルを複数のツリーが触っています (共通ベースが無いため行単位は見ていません)",
+                    &[("n", n.to_string())],
+                ),
+                theme.text_dim,
+            ),
+            Headline::Alarm(n) => (
                 trf("⚠ {n} ファイルが衝突しそうです", &[("n", n.to_string())]),
                 theme.warn,
-            )
+            ),
         };
         ui.label(RichText::new(txt).color(col).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1709,7 +1780,17 @@ mod tests {
             path: path.into(),
             kind: EditKind::Modified,
             spans: spans.iter().map(|(a, b)| Span::edit(*a, *b)).collect(),
-            digest,
+            digest: Some(digest),
+        }
+    }
+
+    /// ベースが取れなかった走査が作る形 (指紋も行範囲も無い)。
+    fn base_unknown(path: &str) -> FileEdit {
+        FileEdit {
+            path: path.into(),
+            kind: EditKind::Modified,
+            spans: Vec::new(),
+            digest: None,
         }
     }
 
@@ -1770,10 +1851,10 @@ mod tests {
             path: "src/old.rs".into(),
             kind: EditKind::Deleted,
             spans: vec![Span::edit(1, 40)],
-            digest: 1,
+            digest: Some(1),
         };
         let del2 = FileEdit {
-            digest: 2,
+            digest: Some(2),
             ..del.clone()
         };
         let edit = modified("src/old.rs", &[(5, 6)], 3);
@@ -1797,7 +1878,7 @@ mod tests {
                 from: "src/old.rs".into(),
             },
             spans: vec![Span::edit(1, 1)],
-            digest: 1,
+            digest: Some(1),
         };
         let far = modified("src/new.rs", &[(900, 901)], 2);
         assert_eq!(
@@ -1812,7 +1893,7 @@ mod tests {
             path: "docs/plan.md".into(),
             kind: EditKind::Created,
             spans: vec![Span::insert_at(0)],
-            digest: d,
+            digest: Some(d),
         };
         assert_eq!(
             classify_pair(&mk(1), &mk(2), NEAR_LINES).map(|(s, r)| (s, r)),
@@ -1830,7 +1911,7 @@ mod tests {
             path: "a.txt".into(),
             kind: EditKind::Modified,
             spans: vec![Span::insert_at(at)],
-            digest: d,
+            digest: Some(d),
         };
         assert_eq!(
             classify_pair(&ins(10, 1), &ins(10, 2), NEAR_LINES).map(|(s, _)| s),
@@ -1938,6 +2019,136 @@ mod tests {
         assert!(rep.hits.is_empty());
         assert!(rep.hotspots.is_empty());
         assert!(rep.is_quiet());
+    }
+
+    /// **回帰**: 共通ベースが取れなかった走査で、判定が 1 件も出なくなっていた。
+    ///
+    /// フォールバック ([`scan`]) は全 [`FileEdit`] を `Modified` / `spans` 空 /
+    /// 指紋 0 で作っていたので、[`same_change`] が全ペアで真になり
+    /// [`classify_pair`] が全部 `None` を返していた。画面には
+    /// 「ファイル単位までしか判定できません」と出るのに、その
+    /// **ファイル単位すら 1 件も出ない**という、注記そのものが嘘になる状態。
+    #[test]
+    fn ベース不明でもファイル単位の重なりは必ず出る() {
+        let a = base_unknown("src/app.rs");
+        let b = base_unknown("src/app.rs");
+        assert!(
+            !same_change(&a, &b),
+            "指紋の無い側どうしを「同一の変更」と言わない"
+        );
+        assert_eq!(
+            classify_pair(&a, &b, NEAR_LINES),
+            Some((Severity::Info, Reason::BaseUnknown))
+        );
+        // 片側だけ不明でも取りこぼさない (段が混ざっても出る)
+        let known = modified("src/app.rs", &[(10, 20)], 7);
+        assert_eq!(
+            classify_pair(&a, &known, NEAR_LINES),
+            Some((Severity::Info, Reason::BaseUnknown))
+        );
+        assert_eq!(
+            classify_pair(&known, &a, NEAR_LINES),
+            Some((Severity::Info, Reason::BaseUnknown)),
+            "順序を入れ替えても同じ"
+        );
+
+        // レポートまで畳んでも 1 件残り、逆引きにも段が付く
+        let trees: Vec<TreeInfo> = (0..2)
+            .map(|i| TreeInfo {
+                id: i as u64,
+                label: format!("w{i}"),
+                files: vec!["src/app.rs".into()],
+                ..TreeInfo::default()
+            })
+            .collect();
+        let edits = vec![
+            vec![base_unknown("src/app.rs")],
+            vec![base_unknown("src/app.rs")],
+        ];
+        let rep = build_report(
+            trees,
+            &edits,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            NEAR_LINES,
+        );
+        assert_eq!(rep.hits.len(), 1, "1 件も出ないのが元のバグ: {rep:?}");
+        assert_eq!(rep.hits[0].severity, Severity::Info);
+        assert_eq!(rep.hits[0].reason, Reason::BaseUnknown);
+        assert_eq!(rep.hotspots.len(), 1);
+        assert_eq!(rep.hotspots[0].worst, Some(Severity::Info));
+        // ただしバッジは鳴らさない (ファイル単位だけで警報にすると狼少年になる)
+        assert!(rep.is_quiet());
+        // 見出しは ✅ を出さない
+        assert_eq!(headline(&rep), Headline::FileLevelOnly(1));
+    }
+
+    /// 見出しの分岐 (テーブル)。**ベース不明のときに「安全」と言わない**。
+    #[test]
+    fn 見出しはベース不明のときに衝突なしと言わない() {
+        let mk = |trees: usize, base: Option<&str>, hits: &[(Severity, &str)]| Report {
+            trees: (0..trees)
+                .map(|i| TreeInfo {
+                    id: i as u64,
+                    ..TreeInfo::default()
+                })
+                .collect(),
+            hits: hits
+                .iter()
+                .map(|(sev, path)| Hit {
+                    path: (*path).into(),
+                    a: 0,
+                    b: 1,
+                    severity: *sev,
+                    reason: Reason::SameFile,
+                    line: None,
+                })
+                .collect(),
+            base: base.map(str::to_string),
+            ..Report::default()
+        };
+        let cases: &[(usize, Option<&str>, &[(Severity, &str)], Headline)] = &[
+            // 見張る対象が足りない
+            (1, None, &[], Headline::TooFew),
+            (0, None, &[], Headline::TooFew),
+            // ベースが取れていて警報なし → 本当に静か
+            (2, Some("abc1234"), &[], Headline::Quiet),
+            (
+                2,
+                Some("abc1234"),
+                &[(Severity::Info, "a.rs")],
+                Headline::Quiet,
+            ),
+            // ベース不明 + ファイル単位の重なり → ✅ にしない (重複パスは畳む)
+            (
+                2,
+                None,
+                &[
+                    (Severity::Info, "a.rs"),
+                    (Severity::Info, "a.rs"),
+                    (Severity::Info, "b.rs"),
+                ],
+                Headline::FileLevelOnly(2),
+            ),
+            // ベース不明でも何も触っていなければ静か
+            (2, None, &[], Headline::Quiet),
+            // 警報が立てば段によらず警報 (ベースの有無は関係ない)
+            (2, None, &[(Severity::Warn, "a.rs")], Headline::Alarm(1)),
+            (
+                2,
+                Some("abc1234"),
+                &[(Severity::Certain, "a.rs"), (Severity::Info, "b.rs")],
+                Headline::Alarm(1),
+            ),
+        ];
+        for (trees, base, hits, want) in cases {
+            let rep = mk(*trees, *base, hits);
+            assert_eq!(
+                headline(&rep),
+                *want,
+                "trees={trees} base={base:?} hits={hits:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -2472,6 +2683,77 @@ rename to new.rs
             &base,
             &["worktree", "remove", "--force", &wb.to_string_lossy()],
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **回帰 (実 git)**: 共通ベースが 1 つも無い構成でも、ファイル単位の
+    /// 重なりは必ず出る。
+    ///
+    /// [`scan`] の `merge-base --octopus` が失敗する経路 —
+    /// 別々に `git init` した 2 本を並べると再現できる。以前はここで
+    /// `hits` が空になり、パネルに 1 行も出ないまま
+    /// 「ファイル単位までしか判定できません」とだけ表示していた。
+    #[test]
+    fn 共通ベースが無い二本でもファイル単位の重なりが出る() {
+        if !git_available() {
+            println!("git が無い環境なのでスキップ");
+            return;
+        }
+        let root = crate::test_util::unique_temp_dir("zv-conflict", "nobase");
+        let mut dirs = Vec::new();
+        for name in ["ra", "rb"] {
+            // **別々のリポジトリ** — 共通の祖先コミットが 1 つも無い
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            git(&d, &["init", "-q", "-b", "main"]);
+            std::fs::write(d.join("shared.txt"), "l1\nl2\nl3\n").expect("write");
+            // **リポジトリごとに違うファイルを 1 つ置く。** 同じ内容・同じ
+            // 作者・同じメッセージで commit すると OID まで一致してしまい、
+            // `merge-base` が「共通ベースがある」と答えてしまう (実際に踏んだ)。
+            std::fs::write(d.join(format!("{name}.txt")), name).expect("write");
+            git(&d, &["add", "-A"]);
+            git(&d, &["commit", "-qm", "base"]);
+            // 未コミットの変更を置く (status からファイル名だけを起こす経路)
+            std::fs::write(d.join("shared.txt"), format!("l1\nl2-{name}\nl3\n")).expect("write");
+            dirs.push(d);
+        }
+        let specs: Vec<TreeSpec> = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| TreeSpec {
+                id: i as u64 + 1,
+                label: format!("r{i}"),
+                branch: "main".into(),
+                dir: d.clone(),
+            })
+            .collect();
+        let rep = scan(&specs, false);
+        println!("--- 共通ベース無し ({:?}) ---", rep.took);
+        println!("ベース: {:?}  note={:?}", rep.base, rep.note);
+        for h in &rep.hits {
+            println!(
+                "  {} {:8} {:12} — {}",
+                h.severity.glyph(),
+                h.severity.label(),
+                h.path,
+                h.reason.label()
+            );
+        }
+        assert!(
+            rep.base.is_none(),
+            "共通ベースが取れない構成のはず: {:?}",
+            rep.base
+        );
+        assert!(rep.note.is_some(), "降格の理由を必ず書く");
+        let hit = rep
+            .hits
+            .iter()
+            .find(|h| h.path == "shared.txt")
+            .unwrap_or_else(|| panic!("ファイル単位の重なりが 1 件も出ていない: {:?}", rep.hits));
+        assert_eq!(hit.severity, Severity::Info);
+        assert_eq!(hit.reason, Reason::BaseUnknown);
+        assert_eq!(rep.hotspots.len(), 1, "逆引きにも出る");
+        assert_eq!(headline(&rep), Headline::FileLevelOnly(1));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
