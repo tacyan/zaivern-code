@@ -25,6 +25,15 @@ mutants.out*/
 
 # === Claude Code / AI agents ===
 .claude/settings.local.json
+# Zaivern 自身がワークスペースへ書き込むフック設定 (src/hooks.rs, agents.rs の settings_rel)。
+# `"<zai の絶対パス>" hook --zaivern <agent> <event>` が埋まる = 環境依存なのでコミットしない。
+# (.codex/hooks.json は下の .codex/ で、.claude/hooks/ は末尾の行で除外済み)
+.claude/settings.json
+.gemini/settings.json
+# フック併合の初回バックアップ (<settings>.zaivern.bak)
+*.zaivern.bak
+# Zaivern の予定タスク用ロック (実行時生成物)
+.claude/scheduled_tasks.lock
 .fable5/
 .night/
 .aider*
