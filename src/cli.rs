@@ -463,7 +463,13 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         // 行域の交渉 (ずらす / 分割する / 待つ)。実体は src/negotiate.rs。
         "negotiate" => crate::features::negotiate::cli_main(rest),
         // 競合ゼロの導入・診断・実証・撤去。実体は src/czero_init.rs。
-        "czero" => crate::features::czero_init::cli_main(rest),
+        "czero" => {
+            // lease と同じ理由で、czero の置き場も旧キーから引き取ってから触る。
+            if let Ok(cwd) = std::env::current_dir() {
+                crate::history::adopt_legacy_keys(&cwd);
+            }
+            crate::features::czero_init::cli_main(rest)
+        }
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
@@ -1633,6 +1639,11 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             .map_err(|e| CliError::Runtime(format!("カレントディレクトリが判りません: {e}")))?,
     };
     let roots = lease::roots_of(&start);
+    // **旧キーの台帳を引き取ってから読む。** GUI 側 (`agents.rs` / `session_picker.rs`)
+    // にはこの引き取りが入っているが CLI には無く、rustc の版が変わって
+    // キーが変わったあとの `zai lease status` が、実際には残っている台帳を
+    // 「確保中: 0 件」と答えていた (実バイナリで実証済み)。
+    crate::history::adopt_legacy_keys(&roots.key);
     let store = lease::store_path_in(&lease::store_dir(), &roots.key);
     let now = lease::now_secs();
     match sub {
