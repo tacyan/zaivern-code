@@ -106,6 +106,13 @@ const PREV_SUFFIX: &str = ".zaivern-prev";
 /// 拒否理由に並べるパスの上限 (端末を埋め尽くさない)。
 const MAX_LISTED: usize = 20;
 
+/// Git LFS のポインタファイルの 1 行目。**仕様で固定されている**
+/// (<https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md>)。
+const LFS_POINTER_MARK: &str = "version https://git-lfs.github.com/spec/";
+
+/// git がシンボリックリンクに使うモード。`--raw` の 1・2 列目に出る。
+const SYMLINK_MODE: &str = "120000";
+
 /// 終了コード。0 = 許可 / 1 = 拒否 / 2 = 使い方の誤り。
 const EXIT_OK: i32 = 0;
 const EXIT_DENY: i32 = 1;
@@ -464,12 +471,38 @@ const DIFF_ARGS: &[&str] = &[
     "--no-textconv",
 ];
 
+/// **なぜ行域を持てなかったか。** 黙って劣化させないための理由。
+///
+/// 「ファイル全体の担当として判定した」は安全側だが、**そうなったことが
+/// 利用者に伝わらないと、なぜ止められたのか判らない**。行域をずらせば通る
+/// のか、そもそも行域が効かないファイルなのかで打つ手が正反対になる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WholeWhy {
+    /// 変更の**形**が行で説明できない (新規 / 削除 / リネーム / 複製 /
+    /// 型・モード変更 / シンボリックリンク)。これは劣化ではなく定義。
+    Shape,
+    /// 内容の変更なのに**ハンクが 1 つも出なかった** = 二値 / `-diff` 属性 /
+    /// LFS ポインタ / `core.bigFileThreshold` 超えの巨大ファイル。
+    /// **これが「黙って劣化した」場合**で、理由を文面に出す。
+    NoHunks,
+    /// 記録の数とパッチの節の数が合わない = 出力を解釈できなかった。
+    /// 行域が入る前の挙動へ丸ごと退避している。
+    Unaligned,
+    /// **Git LFS のポインタ。** 見えている 3 行 (`version` / `oid` / `size`) は
+    /// 中身ではなく所在で、実体は別の場所にある。行番号に意味が無いので
+    /// 行域では判定できない。
+    ///
+    /// **`.gitattributes` を引かずに本文から判る**ので、通す経路の git 呼び出しを
+    /// 1 回のまま保てる (`filter=lfs` が設定されているかは、実は関係ない —
+    /// 手で置かれたポインタでも中身は同じ意味を持つ)。
+    Lfs,
+}
+
 /// ステージされた 1 件が「どこを触ったか」。
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Touched {
-    /// 行では説明できない変更 (新規 / 削除 / リネーム / 複製 / 型・モード変更 /
-    /// 二値)。ファイル全体を触ったものとして扱う = **安全側**。
-    Whole,
+    /// 行では説明できない変更。ファイル全体を触ったものとして扱う = **安全側**。
+    Whole(WholeWhy),
     /// 内容の変更。新しい側の行番号 (1 始まり・両端含む・昇順・重なり無し)。
     Lines(Vec<Span>),
 }
@@ -479,8 +512,17 @@ impl Touched {
     /// 何も持っていない人が何でも通せてしまう)。
     fn spans(&self) -> &[Span] {
         match self {
-            Touched::Whole => std::slice::from_ref(&WHOLE),
+            Touched::Whole(_) => std::slice::from_ref(&WHOLE),
             Touched::Lines(v) => v,
+        }
+    }
+
+    /// 「行域を使えなかったので全体にした」なら、その理由。
+    /// 形が行で説明できないもの ([`WholeWhy::Shape`]) は劣化ではないので `None`。
+    fn degraded(&self) -> Option<WholeWhy> {
+        match self {
+            Touched::Whole(WholeWhy::Shape) | Touched::Lines(_) => None,
+            Touched::Whole(w) => Some(*w),
         }
     }
 }
@@ -557,20 +599,35 @@ fn parse_staged(out: &str) -> Vec<StagedChange> {
         }
         // 行域で説明できるのは「内容だけが変わった」形に限る。
         // モードが動いていたら、たとえ本文も変わっていても全体扱い。
+        //
+        // **シンボリックリンク (mode 120000) は行を持たない。** 中身は行き先の
+        // パス 1 本で、git は 1 行のテキストとして差分を出す (`@@ -1 +1 @@`)。
+        // これを行域として受けると「1 行目だけ触った」に見えるが、実際に
+        // 起きるのは**そのリンクを通る全てのパスの意味が変わる**ことなので、
+        // 行の話ではない。fail-closed でファイル全体へ倒す。
+        let link = old_mode == SYMLINK_MODE || new_mode == SYMLINK_MODE;
         recs.push(Rec {
-            whole: !status.starts_with('M') || old_mode != new_mode,
+            whole: link || !status.starts_with('M') || old_mode != new_mode,
             paths,
         });
     }
 
     // パッチを節へ切り分けて、節ごとにハンクの行域を集める。
     let mut sections: Vec<Vec<Span>> = Vec::new();
+    // 節ごとに「LFS のポインタだったか」。
+    let mut lfs: Vec<bool> = Vec::new();
     for line in patch.split('\n') {
         // CRLF のチェックアウトでも同じ結果になること。
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.starts_with("diff --git ") {
             sections.push(Vec::new());
-        } else if line.starts_with("@@ ") {
+            lfs.push(false);
+        } else if lfs_marked(line) {
+            if let Some(f) = lfs.last_mut() {
+                *f = true;
+            }
+        }
+        if line.starts_with("@@ ") {
             // `-U0` では本文行が必ず `-` / `+` / `\` で始まるので、
             // 行頭の `@@ ` と `diff --git ` は本文と衝突しない。
             if let (Some(cur), Some(sp)) = (sections.last_mut(), hunk_span(line)) {
@@ -587,8 +644,14 @@ fn parse_staged(out: &str) -> Vec<StagedChange> {
         } else {
             Vec::new()
         };
-        let touched = if r.whole || spans.is_empty() {
-            Touched::Whole
+        let touched = if r.whole {
+            Touched::Whole(WholeWhy::Shape)
+        } else if !aligned {
+            Touched::Whole(WholeWhy::Unaligned)
+        } else if lfs.get(i).copied().unwrap_or(false) {
+            Touched::Whole(WholeWhy::Lfs)
+        } else if spans.is_empty() {
+            Touched::Whole(WholeWhy::NoHunks)
         } else {
             Touched::Lines(spans)
         };
@@ -600,6 +663,27 @@ fn parse_staged(out: &str) -> Vec<StagedChange> {
         }
     }
     out_v
+}
+
+/// この行から「LFS のポインタだ」と判るか。
+///
+/// ポインタは 3 行 (`version` / `oid` / `size`) しかないので、変更は必ず
+/// **本文に `version` 行が出る**か、**ハンク見出しの文脈として出る**
+/// (`@@ -2,2 +2,2 @@ version https://…`)。`-U0` では文脈行が本文に出ないので、
+/// 見出しの後ろまで見ないと `oid` / `size` だけの変更を取りこぼす
+/// (実際にこれで検査が落ちた)。
+///
+/// 見誤って「ポインタだ」と答えると**ファイル全体の担当として突き合わせる** =
+/// 過剰に止める方向なので、外しても衝突は生まない (fail-closed)。
+fn lfs_marked(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("@@ ") {
+        return rest
+            .split_once("@@ ")
+            .is_some_and(|(_, ctx)| ctx.starts_with(LFS_POINTER_MARK));
+    }
+    line.strip_prefix('+')
+        .or_else(|| line.strip_prefix('-'))
+        .is_some_and(|b| b.starts_with(LFS_POINTER_MARK))
 }
 
 /// `@@ -a,b +c,d @@ …` の**新しい側**だけを行域にする。
@@ -691,10 +775,140 @@ pub fn check_staged_in(repo: &Path, ledger_dir: &Path) -> Verdict {
     let alive = |p: u32| crate::instances::pid_alive(p);
     let hits = collisions(&st, &roots.tree, &changes, now, &alive);
     if hits.is_empty() {
+        return Verdict::Allow; // ここまでで git は 1 回しか呼んでいない
+    }
+    // **止める直前にだけ** `.gitattributes` を引く。通す経路のコストを
+    // 増やさずに、(1) `merge=union` は競合しないので落とし
+    // (2) 行域が使えなかった理由を文面に足せる。
+    let hits = refine(repo, hits);
+    if hits.is_empty() {
+        return Verdict::Allow;
+    }
+    Verdict::Deny(deny_text(&hits, now))
+}
+
+/// **1 本のパスへの書き込みが通るか。** `zai guard check --path <ファイル>`。
+///
+/// コミット時のガード ([`check_staged`]) では**構造的に見えない**穴が 1 つある:
+/// リポジトリの中のシンボリックリンクを通って**外**へ書く経路である。
+/// git は `beyond a symbolic link` としてそのパスを index に入れないので、
+/// フックはその書き込みを一生見ない。にもかかわらず、リンクの先が
+/// **別の作業ツリー**なら、それは同じ台帳を共有する誰かのファイルである
+/// ([`lease::Roots`] はリンクされた worktree を 1 つの台帳へ寄せる)。
+///
+/// そこで、書き込む前に問い合わせられる入口をガード側に置く。
+/// **行番号を渡せないので、答えはファイル全体として出す** (安全側)。
+pub fn check_path(repo: &Path, target: &Path) -> Verdict {
+    check_path_in(repo, &lease::store_dir(), target)
+}
+
+/// 台帳の置き場を明示する [`check_path`] (テストが実 `~/.zaivern` を触らないため)。
+pub fn check_path_in(repo: &Path, ledger_dir: &Path, target: &Path) -> Verdict {
+    let roots = lease::roots_of(repo);
+    let store = lease::store_path_in(ledger_dir, &roots.key);
+    if !lease::enabled(&store) {
+        return Verdict::Allow;
+    }
+    let Ok(st) = lease::read_store(&store) else {
+        return Verdict::Allow;
+    };
+    let abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| roots.tree.clone())
+            .join(target)
+    };
+    let Some(rel) = rel_under_root(&roots.tree, &crate::pathx::lexical(&abs)) else {
+        return Verdict::Allow; // 綴りからしてリポジトリの外 = 関知しない
+    };
+    if rel.is_empty() {
+        return Verdict::Allow;
+    }
+    let mut links = crate::pathx::LinkResolver::new(&roots.tree);
+    let real = match links.resolve(&rel) {
+        crate::pathx::Resolved::Inside(r) => r,
+        crate::pathx::Resolved::Outside => return Verdict::Deny(escape_text(&rel)),
+        // 輪 / 読めない = 判定できない。**判定できないものは通さない。**
+        crate::pathx::Resolved::Unknown => return Verdict::Deny(unresolved_text(&rel)),
+    };
+    // 字句と実体の**両方**で突き合わせる (どちらかに担当が居れば止める)。
+    let mut changes = vec![StagedChange {
+        path: rel.clone(),
+        touched: Touched::Whole(WholeWhy::Shape),
+    }];
+    if real != rel && !real.is_empty() {
+        changes.push(StagedChange {
+            path: real,
+            touched: Touched::Whole(WholeWhy::Shape),
+        });
+    }
+    let now = lease::now_secs();
+    let alive = |p: u32| crate::instances::pid_alive(p);
+    let hits = collisions(&st, &roots.tree, &changes, now, &alive);
+    if hits.is_empty() {
         Verdict::Allow
     } else {
         Verdict::Deny(deny_text(&hits, now))
     }
+}
+
+/// `abs` が作業ツリーの中を指す綴りなら、その相対パス (正規形)。
+///
+/// **リポジトリの頂点より上だけリンクを解き、頂点より下は解かない。**
+/// 上を解くのは、`/var` → `/private/var` (macOS) のようにリポジトリ自体へ
+/// 至る道がリンクでも同じツリーだと判るため。下を解かないのは、
+/// **解いてしまうと `repo/out -> /外` が「リポジトリの外 = 関知しない」に
+/// 落ちて、いま塞ごうとしている抜け道をそのまま素通りさせる**ため。
+/// 下側の解決は [`crate::pathx::LinkResolver`] が別に行い、
+/// 「中の綴りで外を指している」を [`escape_text`] で止める。
+fn rel_under_root(tree: &Path, abs: &Path) -> Option<String> {
+    let root = crate::pathx::canonical(tree);
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = abs.to_path_buf();
+    loop {
+        if crate::pathx::canonical(&cur) == root {
+            let mut p = PathBuf::new();
+            for r in rest.iter().rev() {
+                p.push(r);
+            }
+            return Some(lease::normalize_path(&p.to_string_lossy()));
+        }
+        rest.push(cur.file_name()?.to_os_string());
+        let parent = cur.parent()?;
+        if parent.as_os_str().is_empty() {
+            return None;
+        }
+        cur = parent.to_path_buf();
+    }
+}
+
+/// リポジトリ内のリンクを通って外へ書こうとしたときの文面。
+fn escape_text(rel: &str) -> String {
+    trf(
+        "書き込みを止めました (Zaivern Code のガード)。\n\
+         {rel} はリポジトリの中にある綴りですが、シンボリックリンクを通って\n\
+         **リポジトリの外**を指しています。\n\
+         \n\
+         この経路は git が index に入れない (`beyond a symbolic link`) ので、\n\
+         コミット時のガードでは一生見えません。リンクの先が別の作業ツリーなら、\n\
+         そこは同じ台帳を共有する誰かの担当です。\n\
+         対処:\n\
+         \x20 (1) リンクを通さず、実体のパスを直に指定して書く\n\
+         \x20 (2) 書き先が本当にリポジトリの外で良いなら、リポジトリの外の絶対パスで書く",
+        &[("rel", rel.to_string())],
+    )
+}
+
+/// リンクが輪になっている / 読めないときの文面。
+fn unresolved_text(rel: &str) -> String {
+    trf(
+        "書き込みを止めました (Zaivern Code のガード)。\n\
+         {rel} のシンボリックリンクを解けませんでした (輪になっている / 読めない)。\n\
+         **どのファイルへ書くのか判らないものは通しません。**\n\
+         対処: リンクを直すか、実体のパスを直に指定して書いてください",
+        &[("rel", rel.to_string())],
+    )
 }
 
 /// 拒否 1 件。**「どのファイルが」では足りない** — 行域を持てるようになった
@@ -707,6 +921,13 @@ struct Hit {
     /// 重なった相手の担当。台帳の表記をそのまま出す (`zai lease list` と揃う)。
     owned: String,
     lease: Lease,
+    /// ステージ済みのパス (作業ツリー相対)。`.gitattributes` を引くのに使う。
+    path: String,
+    /// 行域が使えず全体扱いになったなら、その理由。**文面に出す。**
+    degraded: Option<WholeWhy>,
+    /// `.gitattributes` から判った具体的な理由 (`-diff` / `filter=lfs` 等)。
+    /// 拒否の直前にだけ引く (通す経路の git 呼び出しは 1 回のまま)。
+    attr: String,
 }
 
 /// **点検の芯。** I/O を持たない純粋関数。
@@ -759,7 +980,8 @@ fn collisions(
         if region::within(&mine, touched) {
             continue; // 自分の担当の中だけを直した = いちばん多い経路
         }
-        if let Some(hit) = first_collision(&ch.path, touched, &others) {
+        if let Some(mut hit) = first_collision(&ch.path, touched, &others) {
+            hit.degraded = ch.touched.degraded();
             hits.push(hit);
         }
     }
@@ -774,6 +996,13 @@ struct Pat<'a> {
     /// 正規形のパス部分。`*` / `?` を含まないなら、照合は等値比較で足りる。
     /// glob や記号指定は `None` で、[`lease::covers`] へ回す。
     plain: Option<String>,
+    /// **シンボリックリンクを解いた綴り** (字句の綴りと違うときだけ `Some`)。
+    ///
+    /// 台帳をリンク越しの綴りで書いた人 (`lib/app.rs`、`lib -> src`) と、
+    /// git が報告する実体の綴り (`src/app.rs`) は字句では別物なので、
+    /// これが無いと**同じ行を 2 人が持てる**。字句と実体の**両方**で照合し、
+    /// どちらかが当たれば当たり (減らさないので TOCTOU で緩まない)。
+    alias: Option<String>,
     span: Span,
     mine: bool,
 }
@@ -783,7 +1012,7 @@ impl Pat<'_> {
     /// (1 パスにつき 1 回だけ作る)。`raw_path` は glob へ回すときの原文。
     fn matches(&self, key: &str, raw_path: &str) -> bool {
         match &self.plain {
-            Some(p) => p == key,
+            Some(p) => p == key || self.alias.as_deref() == Some(key),
             None => lease::covers(self.raw, raw_path),
         }
     }
@@ -815,6 +1044,9 @@ fn prepare<'a>(
     alive: &dyn Fn(u32) -> bool,
 ) -> Vec<Pat<'a>> {
     let mut out: Vec<Pat<'a>> = Vec::new();
+    // シンボリックリンクの解決器。**ディレクトリの解決を憶える**ので、
+    // `src/` 配下に 200 個の担当があっても `src` を探るのは 1 回で済む。
+    let mut links = crate::pathx::LinkResolver::new(tree);
     for l in &st.leases {
         if !l.active(now, alive) {
             continue;
@@ -832,10 +1064,20 @@ fn prepare<'a>(
                 // 答えると誰でも書けてしまうので、失敗は必ず厳しい側へ倒す。
                 Err(_) => (None, WHOLE),
             };
+            // 実体の綴りは字句の綴りと違うときだけ持つ。**字句を捨てない** —
+            // リンクが張り替えられても (TOCTOU) 字句の答えが残るので、
+            // 照合が緩む方向へは動かない。
+            let alias = plain.as_deref().and_then(|p| match links.resolve(p) {
+                crate::pathx::Resolved::Inside(real) if real != p => Some(real),
+                // リポジトリの外を指す担当は git がステージし得ないので照合対象外。
+                // 解けない (輪 / 読めない) ときも字句の答えをそのまま使う。
+                _ => None,
+            });
             out.push(Pat {
                 lease: l,
                 raw,
                 plain,
+                alias,
                 span,
                 mine,
             });
@@ -853,6 +1095,9 @@ fn first_collision(rel: &str, touched: &[Span], others: &[&Pat<'_>]) -> Option<H
                     touched: label(rel, *t),
                     owned: p.raw.to_string(),
                     lease: p.lease.clone(),
+                    path: rel.to_string(),
+                    degraded: None,
+                    attr: String::new(),
                 });
             }
         }
@@ -949,8 +1194,150 @@ thread_local! {
 fn canon_key(p: &Path) -> String {
     #[cfg(test)]
     CANON_CALLS.with(|c| c.set(c.get() + 1));
-    let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    // **`\\?\` を残さない。** Windows の `canonicalize` は verbatim 形式を
+    // 返すので、片側だけが解決できたとき (`c:/x/y` と `//?/c:/x/y`) に
+    // 文字列が食い違い、**自分の確保を他人のものと誤認して自分のコミットを
+    // 止める**。`pathx::canonical` は解決したうえで接頭辞を外す。
+    let c = crate::pathx::canonical(p);
     lease::normalize_path(&c.to_string_lossy())
+}
+
+/// `.gitattributes` から引いた 1 パスぶんの指定。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Attrs {
+    /// `diff` — `unset` なら `-diff` (差分を出さない) 指定。
+    diff: String,
+    /// `merge` — `union` なら**両方の変更を並べて解決する**ので競合しない。
+    merge: String,
+    /// `filter` — `lfs` なら中身はポインタ (3 行) で、行番号に意味が無い。
+    filter: String,
+}
+
+impl Attrs {
+    /// この指定なら 2 人が同じ行を触っても衝突しないか。
+    ///
+    /// `merge=union` は**両方の行を残す**マージドライバなので、
+    /// 同じ行域を 2 人が持っても解決はぶつからない (`CHANGELOG` や
+    /// `.gitignore` のような追記専用ファイルで実際に使われている)。
+    /// **ここだけは止めない**のが正しい — 止めても得るものが無い。
+    fn never_conflicts(&self) -> bool {
+        self.merge == "union"
+    }
+
+    /// 行域が使えなかった具体的な理由 (判れば)。
+    fn why_no_lines(&self) -> Option<&'static str> {
+        if self.filter == "lfs" || self.diff == "lfs" {
+            return Some("Git LFS のポインタファイル");
+        }
+        if self.diff == "unset" {
+            return Some("`.gitattributes` の `-diff` / `binary` 指定");
+        }
+        None
+    }
+}
+
+/// `.gitattributes` の `diff` / `merge` / `filter` を **1 回の git で**引く。
+///
+/// `-z --stdin` なので、空白・日本語・改行入りのパスでも壊れない
+/// (出力は `パス\0属性\0値\0` の 3 つ組の繰り返し)。
+/// **引けなかったら空を返す** = 何も足さない・何も落とさない (fail-closed)。
+fn check_attrs(repo: &Path, paths: &[String]) -> Vec<Attrs> {
+    use std::io::Write as _;
+    let mut child = match crate::procx::hidden_command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["check-attr", "-z", "--stdin", "diff", "merge", "filter"])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let feed: Vec<u8> = paths
+        .iter()
+        .flat_map(|p| p.as_bytes().iter().copied().chain(std::iter::once(0u8)))
+        .collect();
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(&feed);
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = crate::textenc::decode_output(&out.stdout);
+    let mut got: Vec<Attrs> = vec![Attrs::default(); paths.len()];
+    let toks: Vec<&str> = text.split('\0').collect();
+    for tri in toks.chunks(3) {
+        let [path, attr, value] = tri else { continue };
+        let Some(i) = paths.iter().position(|p| p == path) else {
+            continue;
+        };
+        match *attr {
+            "diff" => got[i].diff = (*value).to_string(),
+            "merge" => got[i].merge = (*value).to_string(),
+            "filter" => got[i].filter = (*value).to_string(),
+            _ => {}
+        }
+    }
+    got
+}
+
+/// 拒否の候補に `.gitattributes` を当てて、落とすものを落とし理由を足す。
+/// **止めると決まった後にしか呼ばない。**
+fn refine(repo: &Path, hits: Vec<Hit>) -> Vec<Hit> {
+    let mut paths: Vec<String> = Vec::new();
+    for h in &hits {
+        if !paths.contains(&h.path) {
+            paths.push(h.path.clone());
+        }
+    }
+    let attrs = check_attrs(repo, &paths);
+    if attrs.len() != paths.len() {
+        return hits; // 引けなかった = 何も変えない
+    }
+    let mut out = Vec::with_capacity(hits.len());
+    for mut h in hits {
+        let Some(i) = paths.iter().position(|p| *p == h.path) else {
+            out.push(h);
+            continue;
+        };
+        if attrs[i].never_conflicts() {
+            continue; // union マージは衝突しない
+        }
+        if h.degraded.is_some() {
+            if let Some(why) = attrs[i].why_no_lines() {
+                h.attr = why.to_string();
+            }
+        }
+        out.push(h);
+    }
+    out
+}
+
+/// 「行域が使えなかった」を人へ伝える 1 行。**黙って劣化させない。**
+fn degrade_note(h: &Hit) -> Option<String> {
+    let why = h.degraded?;
+    let reason = if !h.attr.is_empty() {
+        h.attr.clone()
+    } else {
+        match why {
+            WholeWhy::NoHunks => tr("二値ファイル、または git が差分を出さない大きさ"),
+            WholeWhy::Unaligned => tr("git の差分出力を解釈できませんでした"),
+            WholeWhy::Lfs => {
+                tr("Git LFS のポインタ — 実体は別の場所にあり、行番号に意味がありません")
+            }
+            WholeWhy::Shape => return None,
+        }
+    };
+    Some(trf(
+        "    ※ このファイルは行域で判定できないため**全体**の担当として突き合わせました ({reason})\n",
+        &[("reason", reason)],
+    ))
 }
 
 /// 拒否の文面。**「拒否されました」だけでは、ユーザーは機能を切るだけ。**
@@ -983,6 +1370,9 @@ fn deny_text(hits: &[Hit], now: u64) -> String {
                 ),
             ],
         ));
+        if let Some(note) = degrade_note(h) {
+            lines.push_str(&note);
+        }
     }
     if hits.len() > MAX_LISTED {
         lines.push_str(&trf(
@@ -1122,6 +1512,9 @@ guard (ベンダー非依存の書き込み強制 — git を関所にします)
   zai guard init [--repo <パス>]        pre-commit / pre-applypatch / pre-merge-commit を設置
   zai guard check --staged [--repo <パス>]
                                         ステージ済みのパスを台帳と突き合わせる (フックが呼びます)
+  zai guard check --path <ファイル> [--repo <パス>]
+                                        書き込む前に 1 本のパスを突き合わせる
+                                        (リポジトリ内のリンクを通って外へ出る経路も止めます)
   zai guard status [--json] [--repo <パス>]
                                         設置状況と台帳の状態
   zai guard uninstall [--repo <パス>]   自分のフックだけを消し、退避した元のフックを戻す
@@ -1158,8 +1551,14 @@ pub fn cli_main(argv: &[String]) -> i32 {
     match sub {
         "check" => {
             let (staged, rest) = take_flag(&rest, "--staged");
-            if !staged {
-                return usage(&tr("`--staged` を付けてください: zai guard check --staged"));
+            let (path, rest) = take_opt(&rest, "--path");
+            if staged && path.is_some() {
+                return usage(&tr("`--staged` と `--path` は同時に使えません"));
+            }
+            if !staged && path.is_none() {
+                return usage(&tr(
+                    "`--staged` か `--path <ファイル>` を付けてください: zai guard check --staged",
+                ));
             }
             if let Some(x) = rest.first() {
                 return usage(&trf("余分な引数です: {x}", &[("x", x.clone())]));
@@ -1169,7 +1568,11 @@ pub fn cli_main(argv: &[String]) -> i32 {
             let Ok(repo) = repo_root(&start) else {
                 return EXIT_OK;
             };
-            match check_staged(&repo) {
+            let verdict = match &path {
+                Some(p) => check_path(&repo, Path::new(p)),
+                None => check_staged(&repo),
+            };
+            match verdict {
                 Verdict::Allow => EXIT_OK,
                 Verdict::Deny(reason) => {
                     eprintln!("{reason}");
@@ -1841,6 +2244,9 @@ mod tests {
                 touched: "src/app.rs#L100-160".into(),
                 owned: "src/app.rs#L120-140".into(),
                 lease: l,
+                path: "src/app.rs".into(),
+                degraded: None,
+                attr: String::new(),
             }],
             now,
         );
@@ -1878,6 +2284,9 @@ mod tests {
                 expires_at: now + 60,
                 note: String::new(),
             },
+            path: format!("src/f{i}.rs"),
+            degraded: None,
+            attr: String::new(),
         };
         let hits: Vec<_> = (0..MAX_LISTED + 5).map(mk).collect();
         let text = deny_text(&hits, now);
@@ -2037,7 +2446,7 @@ mod tests {
             vec![StagedChange {
                 path: "a.txt".into(),
                 // HEAD が無いので全部が新規 = ファイル全体
-                touched: Touched::Whole,
+                touched: Touched::Whole(WholeWhy::Shape),
             }]
         );
     }
@@ -2373,12 +2782,26 @@ mod tests {
                 .touched
                 .clone()
         };
-        assert_eq!(touched("gone.txt"), Touched::Whole, "削除");
-        assert_eq!(touched("old.txt"), Touched::Whole, "リネーム元も守る");
-        assert_eq!(touched("new.txt"), Touched::Whole, "リネーム先");
-        assert_eq!(touched("bin.dat"), Touched::Whole, "二値");
+        let shape = Touched::Whole(WholeWhy::Shape);
+        assert_eq!(touched("gone.txt"), shape, "削除");
+        assert_eq!(touched("old.txt"), shape, "リネーム元も守る");
+        assert_eq!(touched("new.txt"), shape, "リネーム先");
+        // 二値の**内容変更**は「行で説明できない形」ではなく
+        // 「ハンクが 1 つも出なかった」= **黙って劣化した**側。
+        // 形で全体になったもの (削除・リネーム) と区別できること。
+        assert_eq!(
+            touched("bin.dat"),
+            Touched::Whole(WholeWhy::NoHunks),
+            "二値の内容変更は劣化として記録する"
+        );
+        assert_eq!(
+            touched("bin.dat").degraded(),
+            Some(WholeWhy::NoHunks),
+            "劣化は文面へ出す対象"
+        );
+        assert_eq!(touched("gone.txt").degraded(), None, "形は劣化ではない");
         #[cfg(unix)]
-        assert_eq!(touched("mode.txt"), Touched::Whole, "モード変更");
+        assert_eq!(touched("mode.txt"), shape, "モード変更");
 
         // 旧パスの担当が止められること (ここが `--name-only` では抜ける)
         let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "shapes-l");
@@ -2624,7 +3047,30 @@ mod tests {
         let patch = "diff --git a/src/a.rs b/src/a.rs\n@@ -30 +30 @@\n-o\n+n\n";
         let got = parse_staged(&format!("{raw}{patch}"));
         assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|c| c.touched == Touched::Whole));
+        assert!(got
+            .iter()
+            .all(|c| c.touched == Touched::Whole(WholeWhy::Unaligned)));
+    }
+
+    #[test]
+    fn lfsのポインタは本文からも見出しの文脈からも判る() {
+        // 1 行目 (`version`) が変わったとき = 本文に出る
+        assert!(lfs_marked("+version https://git-lfs.github.com/spec/v1"));
+        assert!(lfs_marked("-version https://git-lfs.github.com/spec/v1"));
+        // `oid` / `size` だけが変わったとき = 見出しの文脈に出る
+        assert!(lfs_marked(
+            "@@ -2,2 +2,2 @@ version https://git-lfs.github.com/spec/v1"
+        ));
+        // 紛らわしい行を拾わない
+        for line in [
+            "--- a/version https://git-lfs.github.com/spec/v1",
+            "+++ b/x",
+            "@@ -1 +1 @@ fn main() {",
+            "+// version https://git-lfs.github.com/spec/v1 と書いてあるだけ",
+            "diff --git a/x b/x",
+        ] {
+            assert!(!lfs_marked(line), "{line}");
+        }
     }
 
     #[test]
@@ -2784,7 +3230,7 @@ mod tests {
         let changes: Vec<StagedChange> = (0..400)
             .map(|i| StagedChange {
                 path: format!("src/f{i}.rs"),
-                touched: Touched::Whole,
+                touched: Touched::Whole(WholeWhy::Shape),
             })
             .collect();
 
@@ -2806,6 +3252,402 @@ mod tests {
         assert!(
             calls <= cap,
             "canonicalize がパス × リースで増えている: {calls} 回 (上限 {cap})"
+        );
+    }
+
+    // ───────────────── 抜け道 (リンク / 属性 / 改行) ─────────────────
+
+    /// リンクを 1 本作る。作れない環境 (Windows で開発者モードが無い等) は `false`。
+    /// **両方の OS を実装する** — 片側だけ `cfg` を書くと、その OS では
+    /// 一度もコンパイルされないまま「動くはず」になる。
+    fn link(target: &Path, at: &Path, dir: bool) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            std::os::unix::fs::symlink(target, at).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            if dir {
+                std::os::windows::fs::symlink_dir(target, at).is_ok()
+            } else {
+                std::os::windows::fs::symlink_file(target, at).is_ok()
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let (_, _, _) = (target, at, dir);
+            false
+        }
+    }
+
+    /// `src/f.txt` (300 行) と `lib -> src` を持つリポジトリ。
+    /// リンクを作れない環境では `None` (検査を飛ばす)。
+    fn repo_with_link(tag: &str) -> Option<(PathBuf, Vec<String>)> {
+        let repo = temp_repo(tag)?;
+        let lines: Vec<String> = (1..=300).map(|i| format!("line {i}")).collect();
+        write(&repo.join("src/f.txt"), &format!("{}\n", lines.join("\n")));
+        if !link(Path::new("src"), &repo.join("lib"), true) {
+            std::fs::remove_dir_all(&repo).ok();
+            return None;
+        }
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "init"]).status.success());
+        Some((repo, lines))
+    }
+
+    fn restage_at(repo: &Path, rel: &str, lines: &[String], n: usize, text: &str) {
+        let mut v = lines.to_vec();
+        v[n - 1] = text.to_string();
+        write(&repo.join(rel), &format!("{}\n", v.join("\n")));
+        assert!(git(repo, &["add", "-A"]).status.success());
+    }
+
+    /// **本命の穴。** 担当表をリンク越しの綴り (`lib/f.txt`) で書いた人が居ると、
+    /// git が報告する実体の綴り (`src/f.txt`) と字句では別物なので、
+    /// 別人が同じ行を触ってもガードが素通りしていた。
+    #[test]
+    fn リンク越しの綴りで確保された担当を実体のパスで止める() {
+        let Some((repo, lines)) = repo_with_link("link-alias") else {
+            return;
+        };
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-alias-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-alias-a");
+        // alice はリンク越しの綴りで確保している
+        seed_holder(&ledger, &repo, "alice", &alice, &["lib/f.txt#L100-160"]);
+
+        // 実体の綴りで、alice の域の中を触る → 止まる
+        restage_at(&repo, "src/f.txt", &lines, 120, "bob wrote here");
+        let v = check_staged_in(&repo, &ledger);
+        assert!(
+            matches!(v, Verdict::Deny(_)),
+            "リンク越しの担当を実体のパスで止められていない: {v:?}"
+        );
+
+        // 離れた行なら通る (別名の解決が「常に止める」へ倒れていないこと)
+        restage_at(&repo, "src/f.txt", &lines, 10, "far away");
+        assert!(matches!(check_staged_in(&repo, &ledger), Verdict::Allow));
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// リポジトリの中の綴りでリポジトリの外へ書く経路。
+    ///
+    /// **git はこの経路を index に入れない** (`beyond a symbolic link`) ので、
+    /// コミット時のガードは一生見ない = 塞ぐ前は書き放題だった。
+    /// 書く前に問い合わせる入口 (`zai guard check --path`) で止める。
+    #[test]
+    fn リポジトリ内のリンクで外へ出る書き込みは止める() {
+        let Some((repo, _)) = repo_with_link("link-escape") else {
+            return;
+        };
+        let away = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-escape-away");
+        std::fs::create_dir_all(&away).expect("mkdir");
+        if !link(&away, &repo.join("out"), true) {
+            std::fs::remove_dir_all(&repo).ok();
+            return;
+        }
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-escape-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-escape-a");
+        seed_holder(&ledger, &repo, "alice", &alice, &["src/f.txt"]);
+
+        // 塞ぐ前の姿: リンク越しに書いても git は何も拾わない
+        write(&away.join("x.rs"), "written through the link\n");
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(
+            matches!(check_staged_in(&repo, &ledger), Verdict::Allow),
+            "コミット時のガードにはこの経路が見えない (だから書く前に止める)"
+        );
+
+        // 塞いだ後: 書く前の問い合わせが止める
+        match check_path_in(&repo, &ledger, &repo.join("out/x.rs")) {
+            Verdict::Deny(t) => assert!(t.contains("外"), "文面に理由が無い:\n{t}"),
+            v => panic!("リンク越しの脱出が止まっていない: {v:?}"),
+        }
+        // リポジトリの外の絶対パスは関知しない (ここまで止めると誤爆する)
+        assert!(matches!(
+            check_path_in(&repo, &ledger, &away.join("x.rs")),
+            Verdict::Allow
+        ));
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&away).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// **判定できないものは通さない** (fail-closed)。
+    #[test]
+    fn 輪になったリンクへの書き込みは通さない() {
+        let Some((repo, _)) = repo_with_link("link-loop") else {
+            return;
+        };
+        if !link(Path::new("b"), &repo.join("a"), false)
+            || !link(Path::new("a"), &repo.join("b"), false)
+        {
+            std::fs::remove_dir_all(&repo).ok();
+            return;
+        }
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-loop-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-loop-a");
+        seed_holder(&ledger, &repo, "alice", &alice, &["src/f.txt"]);
+        match check_path_in(&repo, &ledger, &repo.join("a")) {
+            Verdict::Deny(t) => assert!(t.contains("解けません"), "文面に理由が無い:\n{t}"),
+            v => panic!("解けないリンクを通している: {v:?}"),
+        }
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// リンク**自体**の書き換えは 1 行のテキスト変更に見えるが、実際に起きるのは
+    /// 「そのリンクを通る全てのパスの意味が変わる」ことなので、行の話ではない。
+    #[test]
+    fn リンク自体の書き換えはファイル全体として扱う() {
+        let Some((repo, _)) = repo_with_link("link-retarget") else {
+            return;
+        };
+        write(&repo.join("src/g.txt"), "g\n");
+        if !link(Path::new("src/f.txt"), &repo.join("ln"), false) {
+            std::fs::remove_dir_all(&repo).ok();
+            return;
+        }
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "link"]).status.success());
+
+        std::fs::remove_file(repo.join("ln")).expect("rm");
+        assert!(link(Path::new("src/g.txt"), &repo.join("ln"), false));
+        assert!(git(&repo, &["add", "-A"]).status.success());
+
+        let changes = staged_changes(&repo).expect("changes");
+        let got = changes
+            .iter()
+            .find(|c| c.path == "ln")
+            .unwrap_or_else(|| panic!("ln が拾えていない: {changes:?}"));
+        assert_eq!(
+            got.touched,
+            Touched::Whole(WholeWhy::Shape),
+            "リンクの張り替えを 1 行の変更として扱っている"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// `.` / `..` / 区切り / 大小の違いでゲートを迂回できないこと。
+    /// **OS で分岐する既定値は、テストも OS 条件を明示する。**
+    #[test]
+    fn ドットと区切りと大小の違いでゲートを回避できない() {
+        let Some((repo, _)) = repo_with_link("link-spelling") else {
+            return;
+        };
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-spelling-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "link-spelling-a");
+        seed_holder(&ledger, &repo, "alice", &alice, &["src/f.txt"]);
+
+        let deny = |rel: &str| {
+            matches!(
+                check_path_in(&repo, &ledger, &repo.join(rel)),
+                Verdict::Deny(_)
+            )
+        };
+        for spelling in [
+            "src/f.txt",
+            "./src/f.txt",
+            "src/./f.txt",
+            "src/sub/../f.txt",
+            "lib/f.txt", // リンク越しの綴り
+        ] {
+            assert!(deny(spelling), "{spelling} で回避できてしまう");
+        }
+        // 担当が居ないパスは通る (「常に止める」へ倒れていないこと)
+        assert!(!deny("src/other.txt"));
+
+        // 大小非区別の OS だけ、綴りの大小でも同じ実体になる
+        assert_eq!(
+            deny("SRC/F.TXT"),
+            cfg!(any(windows, target_os = "macos")),
+            "大小の扱いが OS の性質と食い違っている"
+        );
+        // Windows の区切りでも迂回できない
+        #[cfg(windows)]
+        assert!(deny(r"src\f.txt"));
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// `merge=union` は**両方の行を残す**ドライバなので、同じ行域を 2 人が
+    /// 触っても解決はぶつからない。ここを止めても得るものが無い。
+    #[test]
+    fn merge_unionのファイルは同じ行を重ねても止めない() {
+        let Some(repo) = temp_repo("attr-union") else {
+            return;
+        };
+        let lines: Vec<String> = (1..=60).map(|i| format!("line {i}")).collect();
+        write(&repo.join(".gitattributes"), "u.txt merge=union\n");
+        for f in ["u.txt", "n.txt"] {
+            write(&repo.join(f), &format!("{}\n", lines.join("\n")));
+        }
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "init"]).status.success());
+
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "attr-union-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "attr-union-a");
+        seed_holder(
+            &ledger,
+            &repo,
+            "alice",
+            &alice,
+            &["u.txt#L1-50", "n.txt#L1-50"],
+        );
+
+        restage_at(&repo, "u.txt", &lines, 10, "union は衝突しない");
+        assert!(
+            matches!(check_staged_in(&repo, &ledger), Verdict::Allow),
+            "merge=union を止めている"
+        );
+        // 同じ形でも属性の無いファイルは止まる (対照)
+        restage_at(&repo, "n.txt", &lines, 10, "こちらは止まる");
+        assert!(matches!(check_staged_in(&repo, &ledger), Verdict::Deny(_)));
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// **黙って劣化させない。** 行域が使えず全体扱いになったら、
+    /// その理由を拒否の文面に出す (でないと何をずらせば通るのか判らない)。
+    #[test]
+    fn 行域を使えなかった理由を拒否の文面に出す() {
+        let Some(repo) = temp_repo("attr-degrade") else {
+            return;
+        };
+        write(&repo.join(".gitattributes"), "*.bin -diff\n");
+        std::fs::write(repo.join("a.bin"), [0u8, 1, 2, 3, 4]).expect("write");
+        write(
+            &repo.join("big.psd"),
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 1\n",
+        );
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "init"]).status.success());
+
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "attr-degrade-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "attr-degrade-a");
+        seed_holder(&ledger, &repo, "alice", &alice, &["a.bin", "big.psd"]);
+
+        // `-diff` 属性 = ハンクが 1 つも出ない
+        std::fs::write(repo.join("a.bin"), [9u8, 9, 9]).expect("write");
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        let changes = staged_changes(&repo).expect("changes");
+        assert_eq!(
+            changes
+                .iter()
+                .find(|c| c.path == "a.bin")
+                .map(|c| &c.touched),
+            Some(&Touched::Whole(WholeWhy::NoHunks))
+        );
+        match check_staged_in(&repo, &ledger) {
+            Verdict::Deny(t) => {
+                assert!(t.contains("行域で判定できない"), "劣化が伝わらない:\n{t}");
+                assert!(t.contains("-diff"), "理由が出ていない:\n{t}");
+            }
+            v => panic!("止まっていない: {v:?}"),
+        }
+
+        // LFS のポインタ = 3 行だが中身は別の場所にある
+        write(
+            &repo.join("big.psd"),
+            "version https://git-lfs.github.com/spec/v1\noid sha256:def\nsize 2\n",
+        );
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        let changes = staged_changes(&repo).expect("changes");
+        assert_eq!(
+            changes
+                .iter()
+                .find(|c| c.path == "big.psd")
+                .map(|c| &c.touched),
+            Some(&Touched::Whole(WholeWhy::Lfs)),
+            "LFS のポインタを普通のテキストとして行域で扱っている"
+        );
+        match check_staged_in(&repo, &ledger) {
+            Verdict::Deny(t) => assert!(t.contains("LFS"), "LFS だと伝わらない:\n{t}"),
+            v => panic!("止まっていない: {v:?}"),
+        }
+
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// CRLF / BOM / 混在改行でも行番号がずれないこと。
+    /// (`region.rs` が CRLF を吸収しているのと同じ答えになる)
+    #[test]
+    fn crlfとbomが混ざっても行番号がずれない() {
+        let Some(repo) = temp_repo("eol") else {
+            return;
+        };
+        let body = |mark: &str| {
+            let mut s = String::from("\u{feff}"); // BOM
+            for i in 1..=60 {
+                // 奇数行は CRLF、偶数行は LF (混在)
+                let eol = if i % 2 == 1 { "\r\n" } else { "\n" };
+                let text = if i == 30 { mark } else { "line" };
+                s.push_str(&format!("{text} {i}{eol}"));
+            }
+            s
+        };
+        write(&repo.join("m.txt"), &body("line"));
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "init"]).status.success());
+        write(&repo.join("m.txt"), &body("CHANGED"));
+        assert!(git(&repo, &["add", "-A"]).status.success());
+
+        let changes = staged_changes(&repo).expect("changes");
+        let got = changes
+            .iter()
+            .find(|c| c.path == "m.txt")
+            .unwrap_or_else(|| panic!("m.txt が拾えていない: {changes:?}"));
+        assert_eq!(
+            got.touched,
+            Touched::Lines(vec![Span { start: 30, end: 30 }]),
+            "BOM と混在改行で行番号がずれている"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 別名の解決を足しても、探るシステムコールが**パス × リースで増えない**こと。
+    /// **実時間ではなく回数で固定する** (Docker の仮想 FS では時間が嘘をつく)。
+    #[test]
+    fn 別名の解決はパスとリースの積で増えない() {
+        let mut s = lease::Store::default();
+        let now = lease::now_secs();
+        for i in 0..200 {
+            s.leases.push(Lease {
+                holder: lease::Holder {
+                    agent: format!("a{i}"),
+                    session: String::new(),
+                    cwd: format!("/w/{i}"),
+                    pid: 0,
+                },
+                patterns: vec![format!("src/g{i}.rs#L1-40")],
+                anchors: Vec::new(),
+                acquired_at: now,
+                expires_at: now + 3600,
+                note: String::new(),
+            });
+        }
+        let changes: Vec<StagedChange> = (0..400)
+            .map(|i| StagedChange {
+                path: format!("src/f{i}.rs"),
+                touched: Touched::Whole(WholeWhy::Shape),
+            })
+            .collect();
+        let _ = crate::pathx::link_probes_take();
+        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false);
+        assert!(hits.is_empty());
+        let probes = crate::pathx::link_probes_take();
+        eprintln!("400 パス × 200 リース: リンクを探る {probes} 回");
+        // リースごと 1 回 + ディレクトリ 1 回まで。積で増えていれば桁で超える。
+        let cap = s.leases.len() + 8;
+        assert!(
+            probes <= cap,
+            "別名の解決がパス × リースで増えている: {probes} 回 (上限 {cap})"
         );
     }
 
