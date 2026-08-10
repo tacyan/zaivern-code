@@ -1207,7 +1207,16 @@ pub fn state_path() -> PathBuf {
 
 /// `~/.zaivern` の場所。home が取れない場合は `./.zaivern` にフォールバック。
 /// ディレクトリの作成 (create_dir_all) は行わない — 呼び出し側の責務。
+///
+/// **`ZAIVERN_HOME` で差し替えられる。** 台帳キーの移行のように「本番の経路を
+/// 端から端まで動かさないと確かめられない」処理があり、それを実 `$HOME` で
+/// 試すわけにいかない。`$HOME` のすり替えは unix でしか効かない
+/// (`dirs` 5 の Windows 実装は `SHGetKnownFolderPath` を叩くので環境変数を
+/// 見ない) ため、これが無いと**テスト可能性が OS で非対称**になる。
 pub(crate) fn zaivern_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("ZAIVERN_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(d);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zaivern")
