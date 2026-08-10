@@ -628,6 +628,40 @@ fn take_flag(args: &[String], key: &str) -> (bool, Vec<String>) {
     (found, rest)
 }
 
+/// **位置引数を取るサブコマンドで、知らない旗を弾く。**
+///
+/// [`reject_extra`] は「位置引数を 1 つも取らない」サブコマンド用なので、
+/// `zai lease claim <パターン...>` のように位置引数が可変長のものには使えない。
+/// 使えないからと素通しにしていたため、`zai lease claim a.rs --zzzz` が
+/// **rc=0 で `--zzzz` という名前のファイルを確保していた** (実バイナリで再現)。
+/// 打ち間違えた旗が黙って担当表に載るのは、**効いていると思わせて
+/// 効いていない**いちばん危ない壊れ方。
+///
+/// `--` 以降は旗として解釈しない (`-` で始まる実在のファイルを指すため)。
+fn reject_unknown_flags(rest: &[String], usage: &str) -> Result<Vec<String>, CliError> {
+    let mut out = Vec::with_capacity(rest.len());
+    let mut literal = false;
+    for a in rest {
+        if literal {
+            out.push(a.clone());
+            continue;
+        }
+        if a == "--" {
+            literal = true;
+            continue;
+        }
+        // `-` 単体はファイル名や標準入力の意味で使われ得るので通す。
+        if a.starts_with('-') && a.len() > 1 {
+            return Err(CliError::Usage(format!(
+                "不明なオプションです: {a} — 使い方: {usage}\n\
+                 (`-` で始まるファイルを指すなら `--` の後ろに置いてください)"
+            )));
+        }
+        out.push(a.clone());
+    }
+    Ok(out)
+}
+
 // ───────────────────────── 実行中インスタンス向けサブコマンド ─────────────────────────
 
 fn run_remote(cmd: &str, args: &[String]) -> Result<String, String> {
@@ -1590,6 +1624,9 @@ fn lease_dispatch(args: &[String]) -> CliOut {
     let sub = args.first().map(String::as_str).unwrap_or("");
     let rest: &[String] = if args.is_empty() { &[] } else { &args[1..] };
     let (dir, rest) = take_opt(rest, "--dir");
+    // **`--dir` を打ったこと自体が「ここがルートだ」という明示。**
+    // git 管理でないフォルダでも、利用者が名指ししたなら推測ではない。
+    let explicit_dir = dir.is_some();
     let start = match dir {
         Some(d) => PathBuf::from(d),
         None => std::env::current_dir()
@@ -1600,6 +1637,7 @@ fn lease_dispatch(args: &[String]) -> CliOut {
     let now = lease::now_secs();
     match sub {
         "status" => {
+            reject_extra(&rest, "zai lease status [--dir <フォルダ>]")?;
             let tier = lease::current_tier(&roots);
             let n = lease::read_store(&store).map(|s| s.leases.len()).unwrap_or(0);
             // worktree のときは 2 つのルートが別物になる。**それを隠さない** —
@@ -1618,10 +1656,13 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             ))
         }
         "enable" => {
+            reject_extra(&rest, "zai lease enable [--dir <フォルダ>]")?;
+            require_known_root(&roots, explicit_dir, "enable")?;
             lease::enable(&store).map_err(CliError::Runtime)?;
             Ok(format!("有効にしました: {}", store.display()))
         }
         "disable" => {
+            reject_extra(&rest, "zai lease disable [--dir <フォルダ>]")?;
             if store.exists() {
                 std::fs::remove_file(&store)
                     .map_err(|e| CliError::Runtime(format!("台帳を消せません: {e}")))?;
@@ -1635,23 +1676,58 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             Ok(render_leases(&st, now, json))
         }
         "claim" => {
+            const CLAIM_USAGE: &str = "zai lease claim [--dir <フォルダ>] [--agent 名前] [--shift [--max-shift <行>]] <パターン...>";
             let (agent, rest) = take_opt(&rest, "--agent");
             // **`--shift` を付けなければ、以下は 1 バイトも変わらない。**
             // 「要求どおりか、拒否か」という既存の契約を守る側と、
             // 「断らずにずらす」側を、この 1 つの旗だけで分ける。
             let (shift, rest) = take_flag(&rest, "--shift");
+            let (max_shift, rest) = take_opt(&rest, "--max-shift");
+            // **知らない旗をファイル名として飲み込まない** ([`reject_unknown_flags`])。
+            let rest = reject_unknown_flags(&rest, CLAIM_USAGE)?;
             if rest.is_empty() {
+                return Err(CliError::Usage(format!(
+                    "確保するパターンを 1 つ以上指定してください: {CLAIM_USAGE}"
+                )));
+            }
+            if max_shift.is_some() && !shift {
                 return Err(CliError::Usage(
-                    "確保するパターンを 1 つ以上指定してください: zai lease claim [--shift] <パターン...>"
-                        .into(),
+                    "--max-shift は --shift と一緒に指定してください".into(),
                 ));
             }
+            // 既定は交渉層と同じ設定 (`negotiate.max_shift`) から。
+            // **無制限を既定にしない** — 1 万行ずらされたら、利用者が
+            // 頼んだ場所とは無関係な場所を確保することになる。
+            let max_shift: Option<u32> = match max_shift {
+                Some(v) => Some(v.parse::<u32>().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--max-shift には行数 (0 以上の整数) を指定してください: {v}"
+                    ))
+                })?),
+                None => Some(lease::default_max_shift_in(&roots.tree)),
+            };
+            require_known_root(&roots, explicit_dir, "claim")?;
+            // **絶対パスをスコープ相対へ直す。** ここを通さないと
+            // `normalize_path` が先頭の `/` を落とし、`/repo/src/a.rs` が
+            // `repo/src/a.rs` という実在しない鍵で台帳に載る
+            // (= 相対指定と永久に一致せず、「確保しました」が嘘になる)。
+            // スコープ外なら**成功と偽らずに失敗**する。
+            let rest = lease::resolve_spec_args(&roots.tree, &rest)
+                .map_err(CliError::Usage)?;
             let holder = lease::Holder {
                 agent: agent.unwrap_or_else(|| "cli".to_string()),
                 session: String::new(),
                 cwd: lease::normalize_path(&start.to_string_lossy()),
                 pid: std::process::id(),
             };
+            // 行域を頼まれたのに**ファイル全体でしか守れない**ものを先に言う。
+            let notes: Vec<String> = rest
+                .iter()
+                .filter_map(|p| lease::degradation_note(&roots.tree, p))
+                .map(|n| format!("注意: {n}"))
+                .collect();
+            // 台帳はできてもフックが無ければ**他プロセスは止まらない**。
+            let tier_note = uninitialized_note(&roots, &store);
             // **`with_store_retry` を使う。** 素の `with_store` は台帳ロックが
             // 取れなかった時点で即座に諦めるので、高並列だと「他人が持っている」
             // でも「取れた」でもない *busy* が大量に出る。実測 (64 体が同じ
@@ -1671,6 +1747,7 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                         now,
                         lease::DEFAULT_TTL_SECS,
                         &|p| crate::instances::pid_alive(p),
+                        max_shift,
                     )
                 })
                 .map_err(CliError::Runtime)?;
@@ -1687,29 +1764,45 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                                 .filter(|g| g.moved())
                                 .map(|g| format!("  ずらしました: {} → {}", g.asked, g.spec)),
                         );
+                        lines.extend(notes);
+                        lines.extend(tier_note);
                         // **最後の行は必ず `granted <仕様>`。** 機械が読む面なので
                         // 装飾を付けない (人向けの説明は上の行に出し切る)。
                         lines.extend(gs.iter().map(|g| format!("granted {}", g.spec)));
                         Ok(lines.join("\n"))
                     }
                     lease::ShiftClaim::Refused { owner, pattern, .. } => {
-                        Err(CliError::Runtime(format!(
-                            "確保できません: 「{pattern}」は {owner} が持っています"
-                        )))
+                        Err(CliError::Runtime(refusal(&pattern, &owner)))
                     }
                 };
             }
+            // **`--dir` を渡した相対化の起点をここでも使う。** 以前は
+            // `try_claim` (= プロセスの作業フォルダ) へ落ちていたので、
+            // `--dir` を付けても `#fn:` / `#L` の解決が cwd 基準になっていた
+            // (`--shift` 側だけが `roots.tree` を渡していた = 経路が 2 つ
+            //  あることそのものが原因だった)。**両方が同じ起点を通る。**
             let out = lease::with_store_retry(&store, |s| {
-                lease::try_claim(s, &holder, &rest, now, lease::DEFAULT_TTL_SECS, &|p| {
-                    crate::instances::pid_alive(p)
-                })
+                lease::try_claim_in(
+                    &roots.tree,
+                    s,
+                    &holder,
+                    &rest,
+                    now,
+                    lease::DEFAULT_TTL_SECS,
+                    &|p| crate::instances::pid_alive(p),
+                )
             })
             .map_err(CliError::Runtime)?;
             match out {
-                lease::Claim::Granted(n) => Ok(format!("{n} 件を確保しました")),
-                lease::Claim::Refused { owner, pattern, .. } => Err(CliError::Runtime(format!(
-                    "確保できません: 「{pattern}」は {owner} が持っています"
-                ))),
+                lease::Claim::Granted(n) => {
+                    let mut lines = vec![format!("{n} 件を確保しました")];
+                    lines.extend(notes);
+                    lines.extend(tier_note);
+                    Ok(lines.join("\n"))
+                }
+                lease::Claim::Refused { owner, pattern, .. } => {
+                    Err(CliError::Runtime(refusal(&pattern, &owner)))
+                }
             }
         }
         "release" => {
@@ -1743,6 +1836,71 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             "不明な lease サブコマンドです: {other}"
         ))),
     }
+}
+
+/// 確保できなかったときの 1 行 (**純粋関数**)。
+///
+/// `owner` は 2 種類ある: 本当の持ち主の名前と、**指定そのものが解決できない
+/// 理由** (`fn a を探せません: …`)。後者を「〜が持っています」に流し込むと
+/// 「`fn a を探せません: …` **が持っています**」という意味の通らない文になり、
+/// 実バイナリで実際にそう出ていた。理由文かどうかで文型を変える。
+fn refusal(pattern: &str, owner: &str) -> String {
+    // 持ち主の表示名 ([`lease::Holder::display`]) には `:` が入らないが、
+    // 解決できない理由には必ず `:` が入る (`… を探せません: …`)。
+    if owner.contains(':') {
+        return format!("確保できません: 「{pattern}」— {owner}");
+    }
+    format!("確保できません: 「{pattern}」は {owner} が持っています")
+}
+
+/// 台帳を**新しく作る**操作の前に、ルートが推測でないことを確かめる。
+///
+/// git 管理下でも既存の台帳でもないフォルダで台帳を生やすと、
+/// **サブフォルダごとに別の台帳**が積み上がって、同じファイルを見ている
+/// 2 人が互いに見えなくなる (実バイナリで再現: `/w`・`/w/a`・`/w/a/b` が
+/// 3 つの別の鍵になった)。`czero init` は `git rev-parse --show-toplevel` を
+/// 要求して失敗するのに `lease claim` だけが黙って作る、という**非対称**も
+/// ここで消える。読むだけの `status` / `list` は従来どおり通す。
+fn require_known_root(
+    roots: &crate::lease::Roots,
+    explicit_dir: bool,
+    what: &str,
+) -> Result<(), CliError> {
+    if roots.rooted || explicit_dir {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "git リポジトリではないので、どこをルートにすべきか決められません: {}\n\
+         このまま {what} すると、サブフォルダごとに別の台帳ができて互いに見えなくなります。\n\
+         対処: (1) このフォルダで `git init` する (2) ルートを明示する: zai lease enable --dir <ルート>\n\
+         (--dir を付けた呼び出しは「そこがルート」として通ります)",
+        roots.tree.display()
+    )))
+}
+
+/// 台帳はできたが**フックが無いので他プロセスは止まらない**ときの注意書き。
+///
+/// `zai lease claim` は台帳ファイルを新規作成し、有効判定はファイルの存在な
+/// ので**暗黙に有効化**される。しかしフック未導入では段は「勧告」どまりで、
+/// 他プロセスは 1 つも止まらない。それでも `claim` を**拒否せずに通す**のは:
+///
+/// * 「勧告」は設計上の正規の段で、GUI・`czero` の計画分割・人手のレビューは
+///   台帳だけで機能する (止めないだけで、記録は正しく効いている)
+/// * ここで拒否すると `lease enable` → `claim` という既存の導線が丸ごと死ぬ
+/// * 拒否は**利用者が求めていない**方向の fail-closed — 守れないのは
+///   「他人を止めること」だけで、記録が嘘になるわけではない
+///
+/// 直すべきなのは**黙っていたこと**なので、確保は通して事実を必ず出す。
+fn uninitialized_note(roots: &crate::lease::Roots, store: &Path) -> Vec<String> {
+    if crate::lease::current_tier(roots) != crate::lease::Tier::Advisory {
+        return Vec::new();
+    }
+    let _ = store;
+    vec![
+        "注意: 所有は記録しましたが、フックが未導入のため**他のプロセスは止まりません**。"
+            .to_string(),
+        "      強制するには: zai czero init".to_string(),
+    ]
 }
 
 /// 確保中の一覧を表示用に整える (**純粋関数** — テーブルテストできる形)。
