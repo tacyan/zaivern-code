@@ -3377,8 +3377,8 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // 窓は中央ビューに属さないオーバーレイなので毎フレームここから描く。
     // **閉じているフレームは 1 命令も走らない** (設計原則 3)。
     draw: Some(draw),
-    settings: &[],
     binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 /// 裏で走らせる作業。**UI スレッドでは 1 つも走らせない。**
