@@ -2855,7 +2855,6 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         help: "導入時に .gitattributes へ書き込むパターンです。空にしておくと、実際にリポジトリを走査して「1 行 1 要素の一覧」だと確信できたファイルだけを対象にします。対象になっても中身が一覧でなければ素の git と同じ結果のままです。",
         default: crate::feature::SettingValue::Text(""),
     }],
-    binds: &[],
     ..crate::feature::Feature::DEFAULT
 };
 

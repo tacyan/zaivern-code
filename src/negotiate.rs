@@ -2666,7 +2666,6 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
                このリポジトリの関数長 p99 (162 行) = 「長い関数でもたかだか 1 つ跨ぐ」幅。",
         default: crate::feature::SettingValue::Int(DEFAULT_MAX_SHIFT as i64),
     }],
-    binds: &[],
     ..crate::feature::Feature::DEFAULT
 };
 

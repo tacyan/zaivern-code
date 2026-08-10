@@ -1365,9 +1365,7 @@ pub fn command_env(plugin: &Plugin, ctx: &EnvContext) -> Vec<(String, String)> {
 
 /// `~/.zaivern/plugin-data/<name>/` (存在しなければ作る)。
 pub fn plugin_data_dir(name: &str) -> Option<PathBuf> {
-    let dir = crate::config::zaivern_dir()
-        .join("plugin-data")
-        .join(name);
+    let dir = crate::config::zaivern_dir().join("plugin-data").join(name);
     let _ = std::fs::create_dir_all(&dir);
     Some(dir)
 }

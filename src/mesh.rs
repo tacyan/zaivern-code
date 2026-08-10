@@ -2722,7 +2722,6 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // 中央ビューに属さないオーバーレイなので毎フレームここから描く。
     // **閉じているときは先頭で即 return する**ので、アイドル時のコストはゼロ。
     draw: Some(draw),
-    binds: &[],
     ..crate::feature::Feature::DEFAULT
 };
 

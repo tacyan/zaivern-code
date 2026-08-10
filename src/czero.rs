@@ -2215,7 +2215,6 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     },
     // 窓として自分で描く (`app.rs` のビュー列挙に触らない)。
     draw: Some(draw),
-    binds: &[],
     ..crate::feature::Feature::DEFAULT
 };
 
