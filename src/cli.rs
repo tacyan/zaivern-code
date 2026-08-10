@@ -223,6 +223,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "coedit"
             // Erlang 風プロセスメッシュ (エージェント同士が裏で認識し合う層)
             | "mesh"
+            // 断らずにずらす交渉層 (拒否された担当を近くの空き行域へ振り替える)
+            | "negotiate"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
             | "update"
@@ -452,6 +454,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "coedit" => crate::features::coedit::cli_main(rest),
         // Erlang 風プロセスメッシュ。実体は src/mesh.rs。
         "mesh" => crate::features::mesh::cli_main(rest),
+        // 行域の交渉 (ずらす / 分割する / 待つ)。実体は src/negotiate.rs。
+        "negotiate" => crate::features::negotiate::cli_main(rest),
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。

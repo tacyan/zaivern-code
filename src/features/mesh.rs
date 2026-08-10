@@ -49,5 +49,10 @@ pub use imp::FEATURE;
 /// **まだ配線されていない** (共有ファイルなので統合担当が 1 行入れる)。
 /// それまでは呼び手がテストしか居ないため、`dead_code` を明示的に許す —
 /// 上の 1 行が入った時点でこの属性は消してよい。
-#[allow(unused_imports)] // 配線されるまでの間だけ
 pub use imp::cli_main;
+
+/// メッシュの公開型。**橋 (`crate::negomesh`) がここから引く。**
+///
+/// 実体は `src/mesh.rs` だが `#[path]` で私有 `imp` として取り込んでいるので、
+/// 外から使える名前をここで 1 か所だけ開く (2 か所に写すとズレる)。
+pub use imp::{backoff, Mesh, Msg, Pid, SpawnOpts};

@@ -898,11 +898,10 @@ pub fn decode(s: &str) -> Result<Deal, String> {
 /// 読めなかった行には `Reject`(id 空) を返す — メッシュで黙って落とすと
 /// 送り手が永遠に待つため。
 ///
-/// **いまはまだ呼び手がいない。** 運び手の `src/mesh.rs` は別担当が同時に
-/// 作っているので `use` できない (作りかけの API を掴むと両方が止まる)。
-/// mesh が着いたら `mailbox` の中身をそのままここへ渡すだけで繋がる。
-/// `allow` はその日までの間だけで、**繋いだら外すこと**。
-#[allow(dead_code)]
+/// 呼び手は `zai negotiate deal` (標準入力から 1 行ずつ受け取る形)。
+/// メッシュの上で回す経路は `crate::negomesh` が担当する — あちらは
+/// 素の [`crate::features::mesh::Msg::Claim`] と交渉形の要求が**混ざって**
+/// 届くので、両方を 1 回の [`allocate`] へまとめて渡す必要がある。
 pub fn respond(
     inbox: &[String],
     occupied: &[(String, Region)],
@@ -1151,6 +1150,11 @@ zai negotiate — 行域がぶつかったとき、断らずに「ずらす」
   zai negotiate offer      < in.json   1 件の要求への提案を出す
   zai negotiate allocate   < in.json   N 件をまとめて互いに素に配る
   zai negotiate deal       < in.json   交渉メッセージの束へ返事を作る
+  zai negotiate serve                  メッシュの上で交渉役として実際に回る
+                                       [--rounds N] [--lines N] [--band N]
+  zai negotiate ask --spec <域>        交渉役へ行域を要求して、返事を待つ
+                                       [--movable] [--size-only] [--to <pid>]
+                                       [--as <pid>] [--rounds N] [--max-shift N]
   zai negotiate help                   この使い方
 
 入力は標準入力の JSON。域は \"src/a.rs#L10-40\" の仕様文字列で書く。
@@ -1161,11 +1165,19 @@ zai negotiate — 行域がぶつかったとき、断らずに「ずらす」
   allocate: 同じ形で \"want\" の代わりに \"wants\":[...]
   deal:     同じ形で \"inbox\":[\"<1 行の Deal>\", ...] と \"me\":\"自分の名前\"
 
+`--movable` を付けたときだけ「ずらしてよい」を明示する。付けなければ
+**絶対にずらさない** — 行域は行番号ではなく*そこにある内容*に紐づくので、
+勝手にずらすと「別の関数を編集しろ」と言ったことになる。
+
 終了コード:
-  0  そのまま通る / 全件配れた
-  1  どうやっても通らない / 1 件も配れなかった
+  0  そのまま通る / 全件配れた / 取れた (ask)
+  1  どうやっても通らない / 1 件も配れなかった / 断られた (ask)
   2  使い方の誤り (入力が読めない・サブコマンドが違う)
   3  提案がある (ずらす・分ける・待つ) / 一部だけ配れた
+     serve/ask では「交渉役がちょうど 1 体」の破れ
+     (serve=既に居る / ask=居ない)
+  4  上限まで待ったが返事が来ない (ask のみ。断られたのとは別物)
+  5  メッシュが無効 (先に `zai mesh join`)
 ")
 }
 
@@ -1177,14 +1189,11 @@ fn read_stdin() -> Result<String, String> {
 /// `zai negotiate <sub>` の実体。argv は `"negotiate"` の**次**から渡される。
 ///
 /// 終了コードの意味は [`usage`] を参照 (0=通る / 1=通らない / 2=使い方 / 3=提案あり)。
+/// メッシュを使う `serve` / `ask` は 3〜5 を別の意味で使う —
+/// 一覧は [`crate::negomesh`] のモジュールドキュメントにある。
 ///
-/// **いまはまだ呼び手がいない。** `src/cli.rs` は 8 本のブランチが同時に
-/// 触っている共有ファイルなので、こちらでは配線しない (モジュール冒頭の
-/// 申し送りの 1 行が入った瞬間に呼び手が付く)。`allow` を置いているのは
-/// その 1 行までの間だけで、**このモジュールに他の `allow` は無い** —
-/// `never used` は「作ったのに繋いでいない」の検出器なので、
-/// 潰してよいのは統合担当を待っているこことメッシュ待ちの [`respond`] だけである。
-#[allow(dead_code)]
+/// `src/cli.rs` の dispatch から `zai negotiate …` として呼ばれる
+/// (統合時に直列で配線済み。`allow(dead_code)` はその時点で外した)。
 pub fn cli_main(argv: &[String]) -> i32 {
     let Some(sub) = argv.first().map(String::as_str) else {
         print!("{}", usage());
@@ -1198,6 +1207,11 @@ pub fn cli_main(argv: &[String]) -> i32 {
         "offer" => cli_offer(),
         "allocate" => cli_allocate(),
         "deal" => cli_deal(),
+        // メッシュの上で実際に交渉を回す。実体は `crate::negomesh`
+        // (mesh と negotiate は互いを知らない設計なので、繋ぐ層は別に置く)。
+        "serve" => crate::negomesh::serve_cli(argv),
+        // 要求する側。交渉役へ送って、**上限つきで**返事を待つ。
+        "ask" => crate::negomesh::ask_cli(argv),
         other => {
             eprintln!(
                 "{}",
@@ -2388,10 +2402,17 @@ mod tests {
         assert_eq!(cli_main(&[]), 2, "サブコマンド無しは使い方の誤り");
         assert_eq!(cli_main(&["help".to_string()]), 0);
         assert_eq!(cli_main(&["しらない".to_string()]), 2);
-        // 使い方に 4 つの終了コードが全部書いてある
+        // 使い方に 6 つの終了コードが全部書いてある
+        // (3〜5 は serve / ask がメッシュ上で使う。番号だけ足して説明を
+        //  書き忘れると、呼び出し側が「断られた」と「返事が来ない」を
+        //  取り違える)。
         let u = usage();
-        for code in ["0 ", "1 ", "2 ", "3 "] {
+        for code in ["0 ", "1 ", "2 ", "3 ", "4 ", "5 "] {
             assert!(u.contains(code), "終了コード {code} の説明が無い");
+        }
+        // サブコマンドが使い方に載っている (載せ忘れると到達できない)
+        for sub in ["offer", "allocate", "deal", "serve", "ask"] {
+            assert!(u.contains(sub), "サブコマンド {sub} が使い方に無い");
         }
     }
 
