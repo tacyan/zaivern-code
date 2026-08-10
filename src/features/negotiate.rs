@@ -27,19 +27,19 @@
 //! * `negotiate.rs` — **断るしかなかった要求を、断らずに振り替える側**。
 //!   実測で「衝突 0・人手 0 なのに 64 件中 55 件を断っていた」ところ。
 //!
-//! ## 統合担当への申し送り
+//! ## 到達経路 (配線済み)
 //!
-//! CLI (`zai negotiate offer|allocate|deal`) の入口は [`cli_main`] として
-//! 公開してある。`src/cli.rs` は共有ファイルなので**こちらでは配線していない** —
-//! サブコマンドの分岐へ次の 1 行を足すと繋がる:
+//! CLI (`zai negotiate offer|allocate|deal|serve|ask|help`) の入口は
+//! [`cli_main`]。`src/cli.rs` の dispatch と `is_cli_subcommand("negotiate")`
+//! の門は**統合担当が直列で入れた**ので、もう申し送りは残っていない。
 //!
-//! ```ignore
-//! "negotiate" => return Some(crate::features::negotiate::cli_main(&args[1..])),
-//! ```
+//! **罠 (入れる前に踏んだもの)**: `zai` は知らない語をワークスペース指定として
+//! 扱い GUI を起動する。dispatch だけ入れて `is_cli_subcommand` の門を忘れると
+//! `zai negotiate ...` で**窓が生える**ので、2 つは必ず同じ commit で入れる。
 //!
-//! **罠**: `zai` は知らない語をワークスペース指定として扱い GUI を起動する。
-//! 上の 1 行を入れる前に `zai negotiate ...` を叩くと**窓が生える**ので、
-//! `cli::is_cli_subcommand("negotiate")` の門も同じ commit で入れること。
+//! メッシュの上で実際に回す `serve` / `ask` は [`crate::negomesh`] が持つ
+//! ([`cli_main`] からそちらへ委譲する)。`negotiate` は純関数のまま、
+//! `mesh` は行域を知らないまま保つための分割で、この 2 つを繋ぐ層が橋だけになる。
 //!
 //! 打鍵は 1 つも取っていない。欲しくなったら `BindAction` を増やさずに
 //! `Cmd::Feature("negotiate.panel")` を直に指すのが安い。
@@ -51,12 +51,10 @@ pub use imp::FEATURE;
 
 /// `zai negotiate <sub>` の入口。`src/cli.rs` の dispatch から呼ばれる。
 ///
-/// **いまはまだ呼び手がいない。** `src/cli.rs` は 8 本のブランチが同時に
-/// 触っている共有ファイルなので、こちらでは配線しない (上の申し送りの 1 行が
-/// 入った瞬間に呼び手が付く)。`allow` を置いているのはその 1 行までの間だけで、
-/// **このモジュールに他の `allow` は無い** — `never used` は
-/// 「作ったのに繋いでいない」の検出器なので、潰してよいのはここだけである。
-/// 入口が生きていることは `negotiate::tests::cliの入口と終了コード` が確かめる。
+/// **このモジュールに `allow` は 1 つも無い。** `never used` は
+/// 「作ったのに繋いでいない」の検出器なので、潰さずに配線で消す。
+/// 入口が生きていることは `negotiate::tests::cliの入口と終了コード` が
+/// (サブコマンド一覧と終了コードの説明ごと) 確かめる。
 pub use imp::cli_main;
 
 /// 交渉の公開面。**橋 (`crate::negomesh`) がここから引く。**

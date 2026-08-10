@@ -35,11 +35,31 @@
 //! 受信箱に複数の要求が溜まっていたら、**1 件ずつ答えない**。
 //! [`crate::negotiate::allocate`] へまとめて渡す — 片方ずつ答えると、
 //! 互いに重なる 2 件の両方に「通る」と答えてしまう。
+//!
+//! ただし**ファイルをまたいで 1 回の `allocate` に混ぜる必要は無い**。
+//! 行域はファイルをまたいで干渉しないので、[`serve_once`] は受信箱を
+//! **パスの辞書順**でファイルごとに束ね、1 周で全ファイルを片付ける。
+//!
+//! ## 終了コード (`zai negotiate serve` / `zai negotiate ask` 共通の並び)
+//!
+//! | 値 | `serve` | `ask` |
+//! |---|---|---|
+//! | 0 | 回し終えた | 取れた |
+//! | 1 | — | **断られた** |
+//! | 2 | 使い方の誤り | 使い方の誤り |
+//! | 3 | 既に交渉役が居る | **交渉役が居ない** |
+//! | 4 | — | **上限まで待ったが返事が来ない** |
+//! | 5 | メッシュが無効 | メッシュが無効 |
+//!
+//! 0 / 2 / 5 は両方で同じ意味にしてある。1 / 3 / 4 は
+//! 「要求する側にしか無い失敗」と「答える側にしか無い失敗」なので重ならない。
 
 use crate::features::mesh::{Mesh, Msg, Pid};
 use crate::features::negotiate;
 use crate::region::{self, Region};
 use negotiate::{Deal, Offer, Want};
+use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// 交渉で使う `Msg::Custom` の種別。**この文字列が両側の唯一の合図**。
 pub const DEAL_KIND: &str = "negotiate";
@@ -94,6 +114,14 @@ fn occupied_of(mesh: &Mesh, path: &str) -> Vec<(String, Region)> {
 /// (この層はファイルを読まない — 短命なフックプロセスから呼ばれても
 ///  ディスクを触らずに済ませたいため)。0 を渡すと「上限不明」として扱い、
 /// ずらし先を提案しない (知らない場所を勧めない)。
+///
+/// **1 周で全ファイルを片付ける。** 以前は「受信箱の先頭と同じファイル」だけを
+/// 処理して、別ファイルの要求を次の周へ回していた。ところが次の周は
+/// **新しい要求が来るまで始まらない** (`--rounds 1` の短命フックが既定の使い方)
+/// ので、2 ファイル目以降の送り手だけが上限まで待たされて
+/// 「返事が来ない」で落ちる。ファイルごとに [`negotiate::allocate`] を呼び、
+/// **パスの辞書順**で回す (`BTreeMap` なので `Mesh::claims` の列挙順は
+/// 出力へ漏れない)。
 pub fn serve_once(mesh: &Mesh, me: &Pid, file_lines: u32, band: u32) -> Served {
     let mut out = Served::default();
     let envs = mesh.recv_match(me, &|m| {
@@ -148,74 +176,77 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, file_lines: u32, band: u32) -> Served {
         return out;
     }
 
-    // ② **まとめて**決める。1 件ずつ答えると、互いに重なる 2 件の両方へ
-    //    「通る」と答えてしまう。
-    let path = asks[0].1.region.path.clone();
-    let occupied = occupied_of(mesh, &path);
-    let wants: Vec<Want> = asks
-        .iter()
-        .filter(|(_, w, _)| w.region.path == path)
-        .map(|(_, w, _)| w.clone())
-        .collect();
-    let plan = negotiate::allocate(&wants, &occupied, file_lines, band);
+    // ② **ファイルごとに、まとめて**決める。1 件ずつ答えると、互いに重なる
+    //    2 件の両方へ「通る」と答えてしまう。逆にファイルをまたいで混ぜる
+    //    必要は無い (行域はファイルをまたいで干渉しない)。
+    let mut by_path: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, (_, w, _)) in asks.iter().enumerate() {
+        by_path.entry(w.region.path.as_str()).or_default().push(i);
+    }
 
-    // ③ 返事を出し、通ったぶんはメッシュの台帳にも載せる。
-    for (from, want, is_deal) in &asks {
-        if want.region.path != path {
-            // 別ファイルの要求は次の周で扱う (1 回に 1 ファイル)。
-            continue;
-        }
-        let got = plan.granted.iter().find(|g| g.id == want.id);
-        match got {
-            Some(g) => {
-                let Some(first) = g.regions.first() else {
-                    continue;
-                };
-                let spec = region::render(first);
-                if mesh.claim(&spec, from).is_err() {
-                    // 台帳側で負けた = 誰かが先に取った。断りへ倒す
-                    // (**取れたと言ってから取れていない**が一番危ない)。
-                    out.denied.push((
-                        region::render(&want.region),
-                        String::new(),
-                        "先に取られました。もう一度要求してください".into(),
-                    ));
-                    reply_denied(mesh, me, from, want, "", "再要求", *is_deal);
-                    continue;
+    // ③ パスの辞書順に、返事を出して台帳へ載せる。
+    for (path, idxs) in &by_path {
+        // 台帳は**このファイルを配る直前**に読み直す。前のファイルの確保で
+        // 増えた行は別ファイルなので効かないが、他プロセスが割り込んで
+        // 取った担当はここで拾える (古い占有表で配ると重ねてしまう)。
+        let occupied = occupied_of(mesh, path);
+        let wants: Vec<Want> = idxs.iter().map(|&i| asks[i].1.clone()).collect();
+        let plan = negotiate::allocate(&wants, &occupied, file_lines, band);
+
+        for &i in idxs {
+            let (from, want, is_deal) = &asks[i];
+            let got = plan.granted.iter().find(|g| g.id == want.id);
+            match got {
+                Some(g) => {
+                    let Some(first) = g.regions.first() else {
+                        continue;
+                    };
+                    let spec = region::render(first);
+                    if mesh.claim(&spec, from).is_err() {
+                        // 台帳側で負けた = 誰かが先に取った。断りへ倒す
+                        // (**取れたと言ってから取れていない**が一番危ない)。
+                        out.denied.push((
+                            region::render(&want.region),
+                            String::new(),
+                            "先に取られました。もう一度要求してください".into(),
+                        ));
+                        reply_denied(mesh, me, from, want, "", "再要求", *is_deal);
+                        continue;
+                    }
+                    // 分割されたら 2 つ目以降も台帳へ載せる (載せ落とすと
+                    // 「持っていない域を書いている」状態になる)。
+                    for extra in g.regions.iter().skip(1) {
+                        let _ = mesh.claim(&region::render(extra), from);
+                    }
+                    if g.regions.len() != 1 || g.regions[0] != want.region {
+                        out.shifted
+                            .push((region::render(&want.region), spec.clone()));
+                    }
+                    out.granted.push(spec.clone());
+                    if *is_deal {
+                        let _ = mesh.send(
+                            from,
+                            me,
+                            Msg::Custom {
+                                kind: DEAL_KIND.into(),
+                                body: negotiate::encode(&Deal::Accept {
+                                    from: me.to_string(),
+                                    id: want.id.clone(),
+                                    region: first.clone(),
+                                }),
+                            },
+                        );
+                    } else {
+                        let _ = mesh.send(from, me, Msg::Granted { spec });
+                    }
                 }
-                // 分割されたら 2 つ目以降も台帳へ載せる (載せ落とすと
-                // 「持っていない域を書いている」状態になる)。
-                for extra in g.regions.iter().skip(1) {
-                    let _ = mesh.claim(&region::render(extra), from);
+                None => {
+                    let off = negotiate::offer(want, &occupied, file_lines, band);
+                    let (holder, hint) = describe(&off);
+                    out.denied
+                        .push((region::render(&want.region), holder.clone(), hint.clone()));
+                    reply_denied(mesh, me, from, want, &holder, &hint, *is_deal);
                 }
-                if g.regions.len() != 1 || g.regions[0] != want.region {
-                    out.shifted
-                        .push((region::render(&want.region), spec.clone()));
-                }
-                out.granted.push(spec.clone());
-                if *is_deal {
-                    let _ = mesh.send(
-                        from,
-                        me,
-                        Msg::Custom {
-                            kind: DEAL_KIND.into(),
-                            body: negotiate::encode(&Deal::Accept {
-                                from: me.to_string(),
-                                id: want.id.clone(),
-                                region: first.clone(),
-                            }),
-                        },
-                    );
-                } else {
-                    let _ = mesh.send(from, me, Msg::Granted { spec });
-                }
-            }
-            None => {
-                let off = negotiate::offer(want, &occupied, file_lines, band);
-                let (holder, hint) = describe(&off);
-                out.denied
-                    .push((region::render(&want.region), holder.clone(), hint.clone()));
-                reply_denied(mesh, me, from, want, &holder, &hint, *is_deal);
             }
         }
     }
@@ -284,14 +315,48 @@ fn describe(off: &Offer) -> (String, String) {
     }
 }
 
+/// 要求側の待ち間隔。**[`crate::features::mesh::backoff`] とは別物**。
+///
+/// mesh の backoff は「何も起きていない見張り」用で **2 秒から**始まる。
+/// 要求側が待っているのは*すぐ来るはずの返事*なので、そこから始めると
+/// 交渉役が同じ機械で回っていても**即答が 2 秒に化ける**
+/// (実測: 同一マシン・同一ディレクトリの往復は 1〜3ms。それを 2000ms 待つ)。
+/// 25ms から倍々にして 2 秒で頭打ちにする。
+///
+/// | `rounds` | 待ちの上限 |
+/// |---|---|
+/// | 4 | 0.375 秒 |
+/// | 8 | 5.175 秒 (既定) |
+/// | 12 | 13.175 秒 |
+///
+/// 既定を 8 (≒5 秒) にしたのは Erlang の `gen_server:call` の既定と同じ理由で、
+/// 「人が『固まった』と感じる前に諦める」線がそこにあるため。
+fn ask_backoff(round: u32) -> Duration {
+    // 25ms << round。`round` が大きいと桁溢れするので上限側で先に潰す。
+    let ms = 25u64.saturating_mul(1u64 << round.min(20));
+    Duration::from_millis(ms.min(2_000))
+}
+
+/// `rounds` 回まで待つときの、待ち時間の合計 (表示用)。
+///
+/// 「返事が来ませんでした」とだけ言われても**どれだけ待ったのか**が
+/// 分からないと、増やせばよいのか交渉役が死んでいるのかを判断できない。
+fn ask_budget(rounds: u32) -> Duration {
+    (0..rounds).map(ask_backoff).sum()
+}
+
 /// 要求する側。**確保を頼んで、返事を待つ。**
 ///
 /// `movable` が `true` なら [`Deal`] 形式で送る (= ずらしてよいと明示する)。
 /// `false` なら素の [`Msg::Claim`] を送る — 相手はずらし先を提案しない。
+/// **言っていない要求を勝手にずらさない**のがこの層の約束なので、
+/// ここで形を変えるのが「ずらしてよい」の唯一の表明手段である。
 ///
-/// 待ちは**上限つき**で、来なければ `None` を返す。永遠に待たないのが
-/// この製品の約束 (設計原則 2: 隠れている処理は欠落ありでよいが、
-/// 決してブロックさせない)。
+/// 待ちは**上限つき** ([`ask_budget`]) で、来なければ `None` を返す。
+/// 永遠に待たないのがこの製品の約束 (設計原則 2: 隠れている処理は
+/// 欠落ありでよいが、決してブロックさせない)。返り値の 3 状態
+/// (`Some(Ok)` / `Some(Err)` / `None`) は**呼び出し側で必ず区別する** —
+/// 「断られた」と「返事が来ない」は打つ手がまったく違う。
 pub fn request(
     mesh: &Mesh,
     me: &Pid,
@@ -321,12 +386,18 @@ pub fn request(
         )
     };
     sent.ok()?;
+    // **選択受信**。`recv` は受信箱を丸ごと空にするので、`ZAIVERN_MESH_PID` の
+    // ような**長生きするプロセスの Pid で要求したとき、そのプロセス宛の
+    // `Announce` / `Down` / `Sync` まで食い潰す**。返事に当たる 3 種だけを
+    // 取り出し、残りは受信箱に置いていく (Erlang の `receive` と同じ)。
+    let is_reply = |m: &Msg| {
+        matches!(m, Msg::Granted { .. } | Msg::Denied { .. })
+            || matches!(m, Msg::Custom { kind, .. } if kind == DEAL_KIND)
+    };
     for round in 0..rounds {
-        for e in mesh.recv(me) {
+        for e in mesh.recv_match(me, &is_reply) {
             match e.msg {
-                Msg::Granted { spec } => {
-                    return Some(region::parse(&spec).map_err(|e| e.to_string()))
-                }
+                Msg::Granted { spec } => return Some(region::parse(&spec)),
                 Msg::Denied { holder, hint, .. } => {
                     return Some(Err(if holder.is_empty() {
                         hint
@@ -345,14 +416,40 @@ pub fn request(
                 _ => {}
             }
         }
-        std::thread::sleep(crate::features::mesh::backoff(round));
+        std::thread::sleep(ask_backoff(round));
     }
     None
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  CLI — `zai negotiate serve`
+//  CLI — `zai negotiate serve` / `zai negotiate ask`
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// 取れた / 回し終えた。
+pub const EXIT_OK: i32 = 0;
+/// **断られた** (`ask` のみ)。どうやっても通らない。
+pub const EXIT_DENIED: i32 = 1;
+/// 使い方の誤り。
+pub const EXIT_USAGE: i32 = 2;
+/// 交渉役が居ない (`ask`) / 既に交渉役が居る (`serve`)。
+/// **どちらも「交渉役はちょうど 1 体」の破れ**なので同じ番号にしてある。
+pub const EXIT_NEGOTIATOR: i32 = 3;
+/// **上限まで待ったが返事が来なかった** (`ask` のみ)。
+/// 断られたのとは**別物**: 交渉役が回っていない可能性が高い。
+pub const EXIT_NO_REPLY: i32 = 4;
+/// メッシュが無効 (`~/.zaivern/mesh/…` が無い = 誰もメッシュに載っていない)。
+///
+/// **`join` というサブコマンドは無い。** メッシュは `zai mesh spawn` が
+/// `procs/` を作った時点で有効になる (`Mesh::enabled` は `stat` 1 回)。
+/// 案内文を間違えると、ユーザーは存在しないコマンドを叩いて詰まる
+/// (実際に `zai mesh join` と案内していて `知らないサブコマンド join` が出た)。
+pub const EXIT_NO_MESH: i32 = 5;
+
+/// メッシュ上の登録名。**1 リポジトリに 1 体だけ**が名乗れる。
+pub const NEGOTIATOR: &str = "negotiator";
+
+/// `ask` の既定の待ち周回数 (≒5.2 秒。[`ask_backoff`] の表を参照)。
+const ASK_ROUNDS: u32 = 8;
 
 /// 交渉プロセスを立てて、受信箱を回す。
 ///
@@ -367,10 +464,10 @@ pub fn request(
 ///
 /// | 値 | 意味 |
 /// |---|---|
-/// | 0 | 回し終えた |
-/// | 2 | 使い方の誤り |
-/// | 3 | 既に交渉役が居る (名前が取られている) |
-/// | 4 | メッシュが無効 (`~/.zaivern/mesh/…` が無い) |
+/// | [`EXIT_OK`] | 回し終えた |
+/// | [`EXIT_USAGE`] | 使い方の誤り |
+/// | [`EXIT_NEGOTIATOR`] | 既に交渉役が居る (名前が取られている) |
+/// | [`EXIT_NO_MESH`] | メッシュが無効 (`~/.zaivern/mesh/…` が無い) |
 pub fn serve_cli(argv: &[String]) -> i32 {
     let mut rounds: u32 = 1;
     let mut lines: u32 = 0;
@@ -381,40 +478,46 @@ pub fn serve_cli(argv: &[String]) -> i32 {
         match a.as_str() {
             "--rounds" => match val(&mut it) {
                 Some(v) => rounds = v,
-                None => return 2,
+                None => return EXIT_USAGE,
             },
             "--lines" => match val(&mut it) {
                 Some(v) => lines = v,
-                None => return 2,
+                None => return EXIT_USAGE,
             },
             "--band" => match val(&mut it) {
                 Some(v) => band = v,
-                None => return 2,
+                None => return EXIT_USAGE,
             },
-            _ => return 2,
+            _ => return EXIT_USAGE,
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     let mesh = Mesh::open_for(&cwd);
     if !mesh.enabled() {
-        eprintln!("メッシュが有効ではありません (先に `zai mesh join` を実行してください)");
-        return 4;
+        eprintln!("メッシュが有効ではありません (先に `zai mesh spawn` を実行してください)");
+        return EXIT_NO_MESH;
     }
     let Ok(me) = mesh.spawn(crate::features::mesh::SpawnOpts {
-        role: "negotiator".into(),
+        role: NEGOTIATOR.into(),
         label: "行域の交渉役".into(),
         trap_exit: true,
         ..Default::default()
     }) else {
         eprintln!("メッシュに参加できません");
-        return 4;
+        return EXIT_NO_MESH;
     };
-    if mesh.register("negotiator", &me.pid).is_err() {
+    if mesh.register(NEGOTIATOR, &me.pid).is_err() {
         eprintln!("既に交渉役が居ます (1 リポジトリに 1 体だけ)");
         let _ = mesh.exit(&me.pid, "duplicate-negotiator");
-        return 3;
+        return EXIT_NEGOTIATOR;
     }
     let mut total = Served::default();
+    // **連続して空振りした回数**。周回の通し番号ではない。
+    // `mesh::backoff` の引数は「何も起きなかった周が続いた数」なので、
+    // 通し番号を渡すと**仕事をした直後でも 30 秒寝る**ようになる
+    // (round 4 以降は上限に張り付く)。要求側の待ちは既定 5.2 秒なので、
+    // そのままだと**忙しいリポジトリほど「返事が来ない」で落ちる**。
+    let mut idle_streak: u32 = 0;
     for round in 0..rounds {
         mesh.beat(&me.pid);
         let s = serve_once(&mesh, &me.pid, lines, band);
@@ -423,10 +526,16 @@ pub fn serve_cli(argv: &[String]) -> i32 {
         total.denied.extend(s.denied);
         total.shifted.extend(s.shifted);
         total.unreadable += s.unreadable;
-        if idle && round + 1 < rounds {
-            // 何も来ていない周は寝る (アイドル時のコストはゼロ)。
-            std::thread::sleep(crate::features::mesh::backoff(round));
+        if !idle {
+            // 仕事があった = 次も来る見込み。間隔を最短へ戻す。
+            idle_streak = 0;
+            continue;
         }
+        if round + 1 < rounds {
+            // 何も来ていない周は寝る (アイドル時のコストはゼロ)。
+            std::thread::sleep(crate::features::mesh::backoff(idle_streak));
+        }
+        idle_streak = idle_streak.saturating_add(1);
     }
     println!(
         "通した {} / 断った {} / ずらした {} / 読めなかった {}",
@@ -446,9 +555,206 @@ pub fn serve_cli(argv: &[String]) -> i32 {
         };
         println!("  断った: {spec}{who} — {hint}");
     }
-    let _ = mesh.unregister("negotiator", &me.pid);
+    let _ = mesh.unregister(NEGOTIATOR, &me.pid);
     let _ = mesh.exit(&me.pid, "done");
-    0
+    EXIT_OK
+}
+
+/// 要求する側の入口 — `zai negotiate ask --spec 'src/a.rs#L10-40' […]`。
+///
+/// ## なぜ「自分が交渉役になる」を選択肢に入れないのか
+///
+/// 交渉役が居ないときに勝手に名乗ると、**同時に走った 2 つの `ask` が
+/// 2 体の交渉役になる**。それぞれ相手の判断を知らないので、互いに重なる
+/// 2 件の**両方へ「通る」と答えてしまう** — 衝突 0 の根拠がその瞬間に消える。
+/// 居なければ [`EXIT_NEGOTIATOR`] で正直に降りて、人 (か supervisor) に
+/// `zai negotiate serve` を立てさせる。
+///
+/// ## 誰の担当として台帳に載るのか
+///
+/// 交渉役は**要求を送ってきた [`Pid`]** の担当として台帳へ載せる。
+/// `--as` を付けなければこの CLI が使い捨ての Pid を起こすので、
+/// **プロセスが終われば次の `zai mesh reap` で担当も解放される**
+/// (それが正しい: 死んだ要求者の担当を握り続けるほうが事故)。
+/// 長く持ちたいなら、既にメッシュに居る呼び出し元の Pid を
+/// `--as "$ZAIVERN_MESH_PID"` で渡す — `zai mesh spawn -- <cmd>` が
+/// その環境変数を立てるので、エージェント本体の担当として載る。
+///
+/// ## 引数
+///
+/// | 引数 | 意味 |
+/// |---|---|
+/// | `--spec <s>` | 欲しい行域 (`src/a.rs#L10-40`)。**必須** |
+/// | `--movable` | 近くの空きへ**ずらしてよい**。付けなければ絶対にずらさない |
+/// | `--size-only` | 行数さえ合えばよい (分割も許す)。`--movable` を含む |
+/// | `--to <pid>` | 交渉役を名前で探さずに直接指す |
+/// | `--as <pid>` | 要求者の Pid (既にメッシュに居るもの)。担当がこの Pid に載る |
+/// | `--rounds N` | 返事を待つ周回数 (既定 [`ASK_ROUNDS`]) |
+/// | `--max-shift N` | ずらしてよい幅の上限 (行)。`--movable` があるときだけ効く |
+///
+/// **`--movable` が効くのは、交渉役が `serve --lines N` で
+/// ファイルの行数を知っているときだけ**。行数が分からない交渉役は
+/// 「存在しない行へ振り替える」より断るほうを選ぶ (`offer` の
+/// `file_lines == 0` の枝)。
+///
+/// ## 終了コード
+///
+/// | 値 | 意味 |
+/// |---|---|
+/// | [`EXIT_OK`] | 取れた (ずらして取れた場合も 0。**要求と実際の域を両方出す**) |
+/// | [`EXIT_DENIED`] | 断られた |
+/// | [`EXIT_USAGE`] | 使い方の誤り |
+/// | [`EXIT_NEGOTIATOR`] | 交渉役が居ない |
+/// | [`EXIT_NO_REPLY`] | 上限まで待ったが返事が来ない (**断られたのとは別物**) |
+/// | [`EXIT_NO_MESH`] | メッシュが無効 |
+pub fn ask_cli(argv: &[String]) -> i32 {
+    let mut spec: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut as_pid: Option<String> = None;
+    let mut movable = false;
+    let mut size_only = false;
+    let mut rounds: u32 = ASK_ROUNDS;
+    let mut max_shift: Option<u32> = None;
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--spec" => match it.next() {
+                Some(v) => spec = Some(v.clone()),
+                None => return usage_err("--spec に値がありません"),
+            },
+            "--to" => match it.next() {
+                Some(v) => to = Some(v.clone()),
+                None => return usage_err("--to に値がありません"),
+            },
+            "--as" => match it.next() {
+                Some(v) => as_pid = Some(v.clone()),
+                None => return usage_err("--as に値がありません"),
+            },
+            "--rounds" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(v) => rounds = v,
+                None => return usage_err("--rounds は 0 以上の整数です"),
+            },
+            "--max-shift" => match it.next().and_then(|v| v.parse().ok()) {
+                Some(v) => max_shift = Some(v),
+                None => return usage_err("--max-shift は 0 以上の整数です"),
+            },
+            "--movable" => movable = true,
+            "--size-only" => size_only = true,
+            other => return usage_err(&format!("知らない引数: {other}")),
+        }
+    }
+    let Some(spec) = spec else {
+        return usage_err("--spec が要ります (例: --spec 'src/a.rs#L10-40')");
+    };
+    let region = match region::parse(&spec) {
+        Ok(r) => r,
+        Err(why) => return usage_err(&format!("域が読めません: {why}")),
+    };
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mesh = Mesh::open_for(&cwd);
+    if !mesh.enabled() {
+        eprintln!("メッシュが有効ではありません (先に `zai mesh spawn` を実行してください)");
+        return EXIT_NO_MESH;
+    }
+
+    // ① 交渉役を先に探す。**居なければ何も起こさずに降りる**
+    //    (自分の Pid を作ってから降りると、要らない登録レコードが残る)。
+    let server = match &to {
+        Some(s) => match Pid::parse(s) {
+            Some(p) => p,
+            None => return usage_err(&format!("--to の Pid が読めません: {s}")),
+        },
+        None => match mesh.whereis(NEGOTIATOR) {
+            Some(p) => p,
+            None => {
+                eprintln!("交渉役が居ません (`zai negotiate serve` を 1 体だけ立ててください)");
+                return EXIT_NEGOTIATOR;
+            }
+        },
+    };
+
+    // ② 要求者の Pid。`--as` で呼び出し元の Pid を指せば、担当は
+    //    **その長生きするプロセス**のものとして載る (この CLI が終わっても
+    //    残る)。指さなければ使い捨ての Pid を起こす。
+    let (me, spawned) = match &as_pid {
+        Some(s) => match Pid::parse(s) {
+            Some(p) if mesh.lookup(&p).is_some() => (p, false),
+            Some(p) => return usage_err(&format!("--as の Pid はメッシュに居ません: {p}")),
+            None => return usage_err(&format!("--as の Pid が読めません: {s}")),
+        },
+        None => match mesh.spawn(crate::features::mesh::SpawnOpts {
+            role: "asker".into(),
+            label: "行域の要求".into(),
+            ..Default::default()
+        }) {
+            Ok(p) => (p.pid, true),
+            Err(e) => {
+                eprintln!("メッシュに参加できません: {e}");
+                return EXIT_NO_MESH;
+            }
+        },
+    };
+
+    // ③ 要求を組み立てる。**`--movable` が無ければ `fixed`** —
+    //    行域は行番号ではなく*そこにある内容*に紐づくので、言っていない
+    //    要求をずらすと「別の関数を編集しろ」と言ったことになる。
+    let mut want = if movable || size_only {
+        Want::movable(&me.to_string(), region)
+    } else {
+        Want::fixed(&me.to_string(), region)
+    };
+    if size_only {
+        want = want.size_only();
+    }
+    if let Some(n) = max_shift {
+        want = want.max_shift(n);
+    }
+
+    let asked = region::render(&want.region);
+    let verdict = request(&mesh, &me, &server, &want, rounds);
+    let code = match &verdict {
+        Some(Ok(got)) => {
+            let got_spec = region::render(got);
+            if got_spec == asked {
+                println!("取れました: {got_spec}");
+            } else {
+                // **黙って別の場所を渡さない。** 要求と実際を必ず並べる。
+                println!("ずらして取れました: {asked} → {got_spec}");
+            }
+            println!("  担当: {me}");
+            EXIT_OK
+        }
+        Some(Err(why)) => {
+            println!("断られました: {asked} — {why}");
+            if !movable && !size_only {
+                println!("  `--movable` を付けると、近くの空き域へずらせるか交渉します");
+            }
+            EXIT_DENIED
+        }
+        None => {
+            // **断られたのとは別物**。交渉役が回っていない可能性が高い。
+            println!(
+                "返事がありません: {asked} ({:.1} 秒待ちました)",
+                ask_budget(rounds).as_secs_f32()
+            );
+            println!("  交渉役 {server} が回っているか (`zai mesh list`) を確かめてください");
+            EXIT_NO_REPLY
+        }
+    };
+
+    // ④ 取れていない自前の Pid は片付ける。**取れたときは残す** —
+    //    ここで exit すると、いま載せたばかりの担当を自分で解放してしまう。
+    if spawned && code != EXIT_OK {
+        let _ = mesh.exit(&me, "done");
+    }
+    code
+}
+
+/// 使い方の誤りを 1 行で出して [`EXIT_USAGE`] を返す。
+fn usage_err(why: &str) -> i32 {
+    eprintln!("zai negotiate ask: {why}");
+    EXIT_USAGE
 }
 
 #[cfg(test)]
@@ -456,8 +762,19 @@ mod tests {
     use super::*;
     use crate::features::mesh::SpawnOpts;
     use crate::test_util::unique_temp_dir;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
 
-    fn mesh_at(dir: &std::path::Path) -> Mesh {
+    /// どの OS でも「絶対に生きていない」OS PID。
+    ///
+    /// `u32::MAX - 1` を使ってはいけない理由は `mesh::tests::DEAD_PID` の
+    /// 説明のとおり (unix の `pid_t` は `i32` なので負のプロセスグループ
+    /// 問い合わせに化け、**macOS で緑・Linux で赤**になる)。同じ値を使う。
+    const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    fn mesh_at(dir: &Path) -> Mesh {
         Mesh::open_at(dir.to_path_buf(), "test-node")
     }
 
@@ -468,6 +785,61 @@ mod tests {
         })
         .expect("参加")
         .pid
+    }
+
+    /// 「OS からは既に消えている」プロセスを台帳へ登録する。
+    /// **本物の子プロセスを起こさない** — CI の Linux ランナーは
+    /// プロセスツリーが溜まると死ぬので、PTY もコマンド起動も使わない。
+    fn spawn_dead(m: &Mesh, role: &str) -> Pid {
+        m.spawn(SpawnOpts {
+            role: role.into(),
+            os_pid: DEAD_PID,
+            ..Default::default()
+        })
+        .expect("参加")
+        .pid
+    }
+
+    fn spec(s: &str) -> Region {
+        region::parse(s).expect("域が読める")
+    }
+
+    /// 交渉役を**別スレッド**で回す。プロセスも PTY も起こさない。
+    ///
+    /// `Drop` で必ず止めて join する — テストが落ちてもスレッドが残らない。
+    struct Serving {
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Serving {
+        fn start(dir: &Path, srv: Pid, lines: u32) -> Serving {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let root = dir.to_path_buf();
+            let handle = std::thread::spawn(move || {
+                let m = Mesh::open_at(root, "test-node");
+                while !flag.load(Ordering::Relaxed) {
+                    serve_once(&m, &srv, lines, region::SAFE_BAND);
+                    // 交渉役の周回。要求側の `ask_backoff` (25ms〜) より
+                    // 細かくしておかないと、待ちが常に 1 段ぶん伸びる。
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            Serving {
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for Serving {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
     }
 
     #[test]
@@ -605,6 +977,283 @@ mod tests {
         let got = request(&m, &a, &srv, &want, 3).expect("返事が来る");
         assert!(got.is_ok(), "通るはずが断られた: {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 別ファイルの要求も同じ周で片付ける() {
+        let dir = unique_temp_dir("zaivern", "negomesh-multifile");
+        let m = mesh_at(&dir);
+        let srv = spawn(&m, "negotiator");
+        let a = spawn(&m, "agent");
+        let b = spawn(&m, "agent");
+
+        // わざと辞書順の後ろから積む。「先頭の要求と同じファイルだけ」を
+        // 処理する実装だと、`src/a.rs` が受信箱に残って b だけが待たされる。
+        m.send(
+            &srv,
+            &a,
+            Msg::Claim {
+                spec: "src/z.rs#L10-40".into(),
+            },
+        )
+        .expect("送れる");
+        m.send(
+            &srv,
+            &b,
+            Msg::Claim {
+                spec: "src/a.rs#L10-40".into(),
+            },
+        )
+        .expect("送れる");
+
+        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        assert_eq!(
+            s.granted,
+            vec!["src/a.rs#L10-40".to_string(), "src/z.rs#L10-40".to_string()],
+            "1 周で全ファイルを処理していない (並びはパスの辞書順)"
+        );
+        // **返事も両方へ届いている。** 台帳だけ更新して黙っていると、
+        // 送り手は上限まで待ってから「返事が来ない」で落ちる。
+        assert!(
+            m.recv(&a)
+                .iter()
+                .any(|e| matches!(&e.msg, Msg::Granted { .. })),
+            "src/z.rs の要求者へ返事が来ていない"
+        );
+        assert!(
+            m.recv(&b)
+                .iter()
+                .any(|e| matches!(&e.msg, Msg::Granted { .. })),
+            "src/a.rs の要求者へ返事が来ていない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn メッシュ越しに要求して返事を受け取る往復() {
+        let dir = unique_temp_dir("zaivern", "negomesh-roundtrip");
+        let m = mesh_at(&dir);
+        let srv = spawn(&m, "negotiator");
+        m.register(NEGOTIATOR, &srv).expect("名乗れる");
+        assert_eq!(m.whereis(NEGOTIATOR), Some(srv.clone()), "名前で引ける");
+        let a = spawn(&m, "agent");
+        let b = spawn(&m, "agent");
+        let c = spawn(&m, "agent");
+        // 交渉役を裏で回す (ここから先は本物の往復)。
+        let _serving = Serving::start(&dir, srv.clone(), 2000);
+
+        // ① A は不動で #L10-40 → そのまま取れる
+        let wa = Want::fixed(&a.to_string(), spec("src/a.rs#L10-40"));
+        let ra = request(&m, &a, &srv, &wa, ASK_ROUNDS)
+            .expect("返事が来る")
+            .expect("誰とも重なっていないのに断られた");
+        assert_eq!(region::render(&ra), "src/a.rs#L10-40");
+
+        // ② B は重なる #L20-50 を**不動**で → 断られ、**ずらし先を勧められない**
+        let wb = Want::fixed(&b.to_string(), spec("src/a.rs#L20-50"));
+        let why = request(&m, &b, &srv, &wb, ASK_ROUNDS)
+            .expect("返事が来る")
+            .expect_err("重なっているのに通した");
+        assert!(
+            !why.contains("ずらす"),
+            "movable と言っていない要求へずらし先を勧めた: {why}"
+        );
+        assert!(
+            why.contains(&a.to_string()),
+            "持ち主が誰かを言っていない: {why}"
+        );
+
+        // ③ C は重なる域を **--movable** で → 近くの空きへずらして取れる
+        let wc = Want::movable(&c.to_string(), spec("src/a.rs#L20-50"));
+        let rc = request(&m, &c, &srv, &wc, ASK_ROUNDS)
+            .expect("返事が来る")
+            .expect("ずらせば通るはずが断られた");
+        assert_ne!(
+            region::render(&rc),
+            "src/a.rs#L20-50",
+            "ずらしていない (重なったまま通した)"
+        );
+        assert_eq!(
+            rc.span.expect("行域がある").len(),
+            31,
+            "行数が変わった (要求は 31 行)"
+        );
+
+        // ④ **不変条件**: 台帳に載った担当は互いに素
+        let held: Vec<Region> = m
+            .claims()
+            .iter()
+            .filter_map(|c| region::parse(&c.spec).ok())
+            .collect();
+        assert_eq!(held.len(), 2, "通った 2 件だけが載っている: {held:?}");
+        assert!(
+            region::is_disjoint(&held, region::SAFE_BAND),
+            "重なった担当が載った: {:?}",
+            region::conflicting_pairs(&held, region::SAFE_BAND)
+        );
+        drop(_serving);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 返事が来ないのと断られたのは区別できる() {
+        let dir = unique_temp_dir("zaivern", "negomesh-noreply");
+        let m = mesh_at(&dir);
+        // 交渉役は登録するが**一度も回さない**。
+        let srv = spawn(&m, "negotiator");
+        let a = spawn(&m, "agent");
+        let want = Want::fixed(&a.to_string(), spec("src/a.rs#L10-40"));
+
+        let t0 = Instant::now();
+        let got = request(&m, &a, &srv, &want, 3);
+        let waited = t0.elapsed();
+        assert!(got.is_none(), "誰も答えていないのに返事が出た: {got:?}");
+        // 上限つき: 3 周ぶん (25+50+100ms) 待って諦める。**永遠に待たない**。
+        assert!(
+            waited >= ask_budget(3) && waited < ask_budget(3) + Duration::from_secs(5),
+            "待ち時間が予算どおりでない: {waited:?} (予算 {:?})",
+            ask_budget(3)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 要求側の待ちは二十五ミリ秒から始まり二秒で頭打ちになる() {
+        // mesh::backoff は 2 秒からなので、そのまま使うと即答が 2 秒に化ける。
+        assert_eq!(ask_backoff(0), Duration::from_millis(25));
+        assert_eq!(ask_backoff(1), Duration::from_millis(50));
+        assert_eq!(ask_backoff(6), Duration::from_millis(1600));
+        assert_eq!(ask_backoff(7), Duration::from_millis(2000), "頭打ち");
+        assert_eq!(ask_backoff(99), Duration::from_millis(2000), "桁溢れしない");
+        assert_eq!(ask_budget(ASK_ROUNDS), Duration::from_millis(5175));
+    }
+
+    #[test]
+    fn 落ちた要求者の担当は_reap_が自動で解放する() {
+        let dir = unique_temp_dir("zaivern", "negomesh-reap");
+        let m = mesh_at(&dir);
+        let srv = spawn(&m, "negotiator");
+        // **応答も残さずに死ぬ**エージェント (OS からは既に消えている)。
+        let ghost = spawn_dead(&m, "agent");
+        m.send(
+            &srv,
+            &ghost,
+            Msg::Claim {
+                spec: "src/x.rs#L10-40".into(),
+            },
+        )
+        .expect("送れる");
+        assert_eq!(
+            serve_once(&m, &srv, 2000, region::SAFE_BAND).granted,
+            vec!["src/x.rs#L10-40".to_string()]
+        );
+
+        // ① reap が担当を自動で解放する (人は 1 バイトも掃除しない)。
+        let t0 = Instant::now();
+        let rep = m.reap();
+        let reap_took = t0.elapsed();
+        assert_eq!(rep.dead, vec![ghost.to_string()]);
+        assert_eq!(rep.released, vec!["src/x.rs#L10-40".to_string()]);
+        assert!(m.claims().is_empty(), "担当が残った");
+        // **待ち時間はゼロ**: 生死の一次情報は OS の生存確認なので、
+        // 心拍のタイムアウト (STALE 60 秒 / HARD_STALE 30 分) を待たない。
+        assert!(
+            reap_took < Duration::from_secs(1),
+            "reap が 1 秒以上かかった: {reap_took:?}"
+        );
+
+        // ② 解放されたので、他の要求者が**同じ域を**取れる。
+        let b = spawn(&m, "agent");
+        m.send(
+            &srv,
+            &b,
+            Msg::Claim {
+                spec: "src/x.rs#L10-40".into(),
+            },
+        )
+        .expect("送れる");
+        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        assert_eq!(
+            s.granted,
+            vec!["src/x.rs#L10-40".to_string()],
+            "解放後なのに取れない (死人の担当を握ったまま)"
+        );
+
+        // ③ **冪等**: もう一度刈っても何も起きない (生きている b は残る)。
+        let again = m.reap();
+        assert!(again.released.is_empty(), "生きている担当まで解放した");
+        assert_eq!(m.claims().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 交渉役が落ちたら名前が空いて次の一体が名乗れる() {
+        let dir = unique_temp_dir("zaivern", "negomesh-failover");
+        let m = mesh_at(&dir);
+        let dead_srv = spawn_dead(&m, "negotiator");
+        m.register(NEGOTIATOR, &dead_srv).expect("名乗れる");
+        let next = spawn(&m, "negotiator");
+        assert!(
+            m.register(NEGOTIATOR, &next).is_err(),
+            "刈る前に 2 体目が名乗れると、重なる 2 件の両方へ通ると答えられる"
+        );
+
+        let t0 = Instant::now();
+        let rep = m.reap();
+        let took = t0.elapsed();
+        assert_eq!(
+            rep.unnamed,
+            vec![NEGOTIATOR.to_string()],
+            "名前が外れていない"
+        );
+        assert_eq!(m.whereis(NEGOTIATOR), None);
+        assert!(took < Duration::from_secs(1), "刈るのに 1 秒以上: {took:?}");
+
+        // 空いたので次の 1 体が名乗れる = 交渉が止まらない。
+        m.register(NEGOTIATOR, &next).expect("名乗れる");
+        assert_eq!(m.whereis(NEGOTIATOR), Some(next));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn askの引数検査はメッシュに触る前に落ちる() {
+        // ここで検査しているのは**メッシュを開く前の枝だけ**。
+        // 実 `~/.zaivern` を触らないため、それ以降は通らない引数を渡す。
+        let a = |args: &[&str]| {
+            let mut v = vec!["ask".to_string()];
+            v.extend(args.iter().map(|s| s.to_string()));
+            ask_cli(&v)
+        };
+        assert_eq!(a(&[]), EXIT_USAGE, "--spec が無い");
+        assert_eq!(a(&["--spec"]), EXIT_USAGE, "--spec に値が無い");
+        assert_eq!(a(&["--spec", "src/a.rs#L9-2"]), EXIT_USAGE, "空の域");
+        assert_eq!(a(&["--spec", "src/a.rs#L1-9", "--rounds"]), EXIT_USAGE);
+        assert_eq!(
+            a(&["--spec", "src/a.rs#L1-9", "--rounds", "たくさん"]),
+            EXIT_USAGE
+        );
+        assert_eq!(a(&["--spec", "src/a.rs#L1-9", "--to"]), EXIT_USAGE);
+        assert_eq!(a(&["--spec", "src/a.rs#L1-9", "--as"]), EXIT_USAGE);
+        assert_eq!(a(&["--しらない"]), EXIT_USAGE);
+    }
+
+    #[test]
+    fn 終了コードは全部違う値を持つ() {
+        // 同じ番号を 2 つの意味に使うと、呼び出し側が
+        // 「断られた」と「返事が来ない」を取り違える。
+        let all = [
+            EXIT_OK,
+            EXIT_DENIED,
+            EXIT_USAGE,
+            EXIT_NEGOTIATOR,
+            EXIT_NO_REPLY,
+            EXIT_NO_MESH,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), all.len(), "終了コードが重複している: {all:?}");
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
