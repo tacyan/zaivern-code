@@ -50,3 +50,16 @@ pub use imp::FEATURE;
 /// `zai coedit …` の入口。`src/cli.rs` の dispatch から呼ばれる
 /// (統合時に直列で配線済み)。
 pub use imp::cliface::cli_main;
+
+/// 🚃 `train` から証明を引くための再エクスポート。
+///
+/// `train` は「順番を決めて 1 本ずつ流す」層で、`coedit` は「この N 本は
+/// **どの順でも**一撃で通る」を言い切る層。証明が立つ組に順序を決める意味は
+/// 無いので、`train` は計画時にここを叩き、立てば [`integrate`] へ丸ごと委ねる。
+///
+/// **実体 (`src/coedit.rs`) は 1 バイトも触っていない。** 登録ファイル側で
+/// 名前を出すだけなら、`coedit` 本体を編集している別ブランチと衝突しない。
+/// **使う分だけ出す。** `Proof` / `Outcome` を足したくなったら、そのとき
+/// 呼び出し側と一緒に足す (使われない `pub use` は `never used` で拾えない
+/// ぶん、「繋がっている」という嘘になりやすい)。
+pub use imp::{integrate, proof, Clash, Opts};
