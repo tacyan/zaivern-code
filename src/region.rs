@@ -1467,6 +1467,44 @@ mod tests {
         }
     }
 
+    /// **末尾追加** (EOF への追記) の下限も 3 であること。
+    ///
+    /// 末尾のハンクは**後ろに文脈が無い**ので前 3 行だけで照合される。他の種別と
+    /// 下限がずれていないかを別に確かめる — ファイル末尾は `use` 追加・関数追加・
+    /// 一覧への追記で**全エージェントが同時に触りたがる**場所なので、ここが緩いと
+    /// 事故が集中する。
+    ///
+    /// 実測 (base 60 行、相手が 61 行目を追記、自分は `60-gap` 行目を置換):
+    /// `gap` 0/1/2 はパッチ適用が FAIL、3/4/5 は ok。**他の種別と同じ 3**。
+    #[test]
+    fn 実gitで末尾追加の下限を測る() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("append");
+        let base = base_text(60);
+        // 相手は 61 行目を追記 → 域は [61,61]
+        let theirs = format!("{base}THEIRS tail\n");
+        for gap in 0..=5u32 {
+            let at = 60 - gap; // 自分の域 [at,at] → 間隔は 61-at-1 = gap
+            let ours = edit(&base, Kind::Replace, at, 1, "OURS");
+            let too_close = spans_too_close(&Span::line(at), &Span::line(61), SAFE_BAND);
+            assert_eq!(too_close, gap < SAFE_BAND, "gap={gap} の判定がずれている");
+            let applied = lab.apply_patch(&base, &ours, &theirs);
+            assert_eq!(
+                applied,
+                gap >= SAFE_BAND,
+                "末尾追加 gap={gap}: パッチ適用が想定と違う \
+                 (末尾の下限が動いたら SAFE_BAND を測り直すこと)"
+            );
+            // 見逃しゼロ: 当てられない = 近すぎると言えている
+            assert!(applied || too_close, "末尾追加 gap={gap} で見逃した");
+        }
+        // 末尾追加どうしは同じ点への追記なので必ず衝突する
+        assert!(lab.merge_file(&base, &format!("{base}OURS tail\n"), &theirs));
+    }
+
     /// 実ツリーの三方向マージでも同じ結論になるか。git 2.38 未満では飛ばす。
     #[test]
     fn 実ツリーのマージでも同じ結論になる() {
