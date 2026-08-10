@@ -332,6 +332,8 @@ struct Regions {
     balanced: bool,
 }
 
+/// 領域表を作る。**マーカが 1 つでもあれば `whole_file` より markers が優先**
+/// (明示的に囲った意図を、ファイル単位の指定で上書きしないため)。
 fn regions_of(lines: &[Line], whole_file: bool) -> Regions {
     let n = lines.len();
     let mut marker = vec![false; n];
@@ -932,6 +934,10 @@ pub fn split_patterns(raw: &str) -> Vec<String> {
 
 /// `.gitattributes` から管理ブロックだけを抜く。**既存の行は 1 つも壊さない。**
 ///
+/// 終了行だけ手で消されたブロックでも、**こちらが書いた形の行しか消さない**。
+/// 「開始行から末尾まで」を丸ごと捨てると、ブロックの後ろに人が足した行を
+/// 巻き込んで消してしまう (`.gitattributes` を触るツールが一番嫌われる壊れ方)。
+///
 /// 戻り値は `(残った本文, 使われている改行)`。
 fn strip_block(old: &str) -> (String, &'static str) {
     let eol = if old.contains("\r\n") { "\r\n" } else { "\n" };
@@ -939,19 +945,39 @@ fn strip_block(old: &str) -> (String, &'static str) {
     let mut skipping = false;
     for line in old.split_inclusive('\n') {
         let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed.starts_with(ATTR_BEGIN_KEY) {
-            skipping = true;
-            continue;
-        }
-        if skipping {
-            if trimmed.starts_with(ATTR_END_KEY) {
-                skipping = false;
+        if !skipping {
+            if trimmed.starts_with(ATTR_BEGIN_KEY) {
+                skipping = true;
+            } else {
+                out.push_str(line);
             }
             continue;
         }
+        if trimmed.starts_with(ATTR_END_KEY) {
+            skipping = false;
+            continue;
+        }
+        if is_generated_attr_line(trimmed) {
+            continue;
+        }
+        // 見覚えの無い行に当たった = ブロックはここで終わっている。
+        skipping = false;
         out.push_str(line);
     }
     (out, eol)
+}
+
+/// 管理ブロックの中身としてこちらが書きうる行か (`<パターン> merge=zaivern-union…`)。
+fn is_generated_attr_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let mut it = t.split_whitespace();
+    let (Some(_pattern), Some(attr), None) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    attr.starts_with("merge=zaivern-union")
 }
 
 fn write_attributes(root: &Path, patterns: &[String]) -> Result<(), String> {
@@ -1903,6 +1929,25 @@ mod tests {
         uninstall(&repo).expect("解除");
         let back = std::fs::read_to_string(repo.join(".gitattributes")).expect("読める");
         assert_eq!(back, keep, "解除したら元どおり");
+    }
+
+    #[test]
+    fn 終了行を消されたブロックでも後ろの行を巻き込まない() {
+        let broken = format!(
+            "*.png binary\n{ATTR_BEGIN}\n*.md merge=zaivern-union\n# 人が後から足した行\n*.txt text\n"
+        );
+        let (kept, _) = strip_block(&broken);
+        assert_eq!(kept, "*.png binary\n# 人が後から足した行\n*.txt text\n");
+    }
+
+    #[test]
+    fn 管理ブロックの中身の見分け() {
+        assert!(is_generated_attr_line("*.md merge=zaivern-union"));
+        assert!(is_generated_attr_line("CHANGELOG.md merge=zaivern-union-whole"));
+        assert!(is_generated_attr_line("   "));
+        assert!(!is_generated_attr_line("*.png binary"));
+        assert!(!is_generated_attr_line("*.md merge=zaivern-union text"));
+        assert!(!is_generated_attr_line("# コメント"));
     }
 
     #[test]
