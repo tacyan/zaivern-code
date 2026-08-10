@@ -928,8 +928,27 @@ fn absolutize(raw: &str) -> PathBuf {
     PathBuf::from(format!("/{raw}"))
 }
 
+/// [`canon_key`] を何回通ったか。**テストだけが読む。**
+///
+/// ここは `Path::canonicalize` = システムコールなので、呼ぶ回数がそのまま
+/// フックの所要時間になる。潰したかった回帰は「パス × リース回」呼んでいた
+/// (400 × 200 で 5.04 秒)。**回数を直に数えるのが、この性質を機械の速さに
+/// 依存せず固定する唯一の方法**である — 実時間で線を引くと、Docker の
+/// 仮想ファイルシステムや全 4273 件との同時実行で嘘の赤が出る (実際に出た)。
+///
+/// **スレッドごとに数える。** プロセス共通の静的変数にすると、同時に走って
+/// いる他のテストの呼び出しまで混ざる (実際に 400 回のはずが 800 回になって
+/// 落ちた)。`canon_key` は呼んだスレッドの上で走るので、スレッドローカルで
+/// 過不足なく数えられる。
+#[cfg(test)]
+thread_local! {
+    static CANON_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// 実体まで解決してから台帳の正規形へ。比較専用のキー。
 fn canon_key(p: &Path) -> String {
+    #[cfg(test)]
+    CANON_CALLS.with(|c| c.set(c.get() + 1));
     let c = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     lease::normalize_path(&c.to_string_lossy())
 }
@@ -2769,36 +2788,25 @@ mod tests {
             })
             .collect();
 
-        // **絶対時間で線を引かない。** この判定はマシンの速さに直結するので、
-        // 500ms のような固定値は「速い macOS では通り、仮想化された Docker の
-        // ファイルシステムでは落ちる」試験になる (実際に 1.22 秒で落ちた)。
-        // 見たいのは速さそのものではなく **リース数に対して線形か** で、
-        // 潰したかった回帰 (`holder_is_me` がパス × リース回 `canonicalize` を
-        // 叩いていた = 実質二乗) は比で必ず出る。同じ機械で 2 点測って比べる。
-        let bench = |leases: usize| {
-            let mut sub = lease::Store::default();
-            sub.leases.extend(s.leases.iter().take(leases).cloned());
-            let mut best = std::time::Duration::MAX;
-            for _ in 0..3 {
-                let t0 = std::time::Instant::now();
-                let hits = collisions(&sub, Path::new("/w/me"), &changes, now, &|_| false);
-                best = best.min(t0.elapsed());
-                assert!(hits.is_empty());
-            }
-            best
-        };
-        let small = bench(50);
-        let large = bench(200);
-        eprintln!("行域なしの台帳: 400 パス × 50 リース {small:?} / 200 リース {large:?}");
-        // 4 倍の仕事に 8 倍まで許す (測定の揺れぶんの余裕)。二乗なら 16 倍に
-        // なるので必ず引っかかる。`small` が 0 に丸まる速い機械では比較を
-        // 諦める — そこで落ちるのは機械が速すぎるという意味でしかない。
-        if !small.is_zero() {
-            assert!(
-                large <= small * 8,
-                "リース数に対して線形でない: 50 リース {small:?} → 200 リース {large:?}"
-            );
-        }
+        // **時間で測らない。** 比で見ても、全 4273 件と同時に走らせると
+        // 4 回に 1 回落ちた (2 点の測定が別の瞬間なので、負荷の谷と山を
+        // 引くと比が跳ねる)。守りたいのは速さではなく
+        // **`canonicalize` (システムコール) を何回呼ぶか**で、潰したかった
+        // 回帰はそこを「パス × リース回」呼んでいた (400 × 200 で 5.04 秒)。
+        // 回数なら機械の速さに 1 ミリも依存しない。
+        CANON_CALLS.with(|c| c.set(0));
+        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false);
+        assert!(hits.is_empty());
+        let calls = CANON_CALLS.with(|c| c.get());
+        eprintln!("400 パス × 200 リース: canonicalize {calls} 回");
+        // **積で増えないこと**が要件。パスごと 1 回・リースごと 1 回までは要る
+        // (実測 400 回 = 変更パス 1 つにつき 1 回)。回帰していた頃は
+        // パス × リース = 400 × 200 = 80,000 回で、上限を桁で超える。
+        let cap = changes.len() + s.leases.len() + 8;
+        assert!(
+            calls <= cap,
+            "canonicalize がパス × リースで増えている: {calls} 回 (上限 {cap})"
+        );
     }
 
     // ───────────────────────── e2e: 実際にコミットが止まる ─────────────────────────
