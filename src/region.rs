@@ -121,14 +121,61 @@ impl Span {
         Span { start: n, end: n }
     }
 
-    /// 行数 (EOF 込みの域は [`u32::MAX`] を返す)。
+    /// 行数 (EOF 込みの域は [`u32::MAX`] を返す。挿入点は 0)。
     pub fn len(&self) -> u32 {
+        if self.end < self.start {
+            return 0;
+        }
         self.end.saturating_sub(self.start).saturating_add(1)
     }
 
-    /// 空 (start > end) か。壊れた入力の検出に使う。
+    /// **挿入点** — 行 `n` の**手前**に書き足す権利。既存の行を 1 行も占有しない。
+    ///
+    /// ## なぜ要るのか (これが並列度の天井を外す)
+    ///
+    /// 行域 (`#L100-180`) は**既に在る行**を占有する。ところがエージェントの
+    /// 仕事の大半は「関数を足す」「`use` を足す」「一覧に 1 行足す」で、
+    /// **既存の行を 1 行も要らない**。それでも行域で確保すると、ファイルの
+    /// 行数がそのまま並列度の上限になる — 実測では 2000 行のファイルへ
+    /// 64 体が合計 13,160 行を要求し、**供給の 6.6 倍**の需要になって
+    /// 53 件が断られた。どんな割り当てでも配れない。
+    ///
+    /// 挿入点は幅 0 なので、**2000 行あれば安全帯 3 行で約 500 個**取れる。
+    /// 64 体なら全員に配って余る。git も、違う場所への挿入どうしは
+    /// 綺麗にマージする。
+    ///
+    /// 表現は `end + 1 == start` (空の半開区間)。`len()` は 0 になる。
+    pub fn insert_before(n: u32) -> Span {
+        Span {
+            start: n.max(1),
+            end: n.max(1).saturating_sub(1),
+        }
+    }
+
+    /// 挿入点か (幅 0)。
+    ///
+    /// `end + 1 == start` と書くと `end == Span::EOF` で**桁あふれする**
+    /// (debug ビルドは panic する)。引き算側で判定する。
+    pub fn is_insert(&self) -> bool {
+        self.start >= 1 && self.end == self.start - 1
+    }
+
+    /// 空 (壊れた入力) か。**挿入点は空ではない** — 幅 0 だが正当な指定である。
     pub fn is_empty(&self) -> bool {
+        if self.is_insert() {
+            return false;
+        }
         self.start > self.end || self.start == 0
+    }
+
+    /// 判定に使う「占有区間」。挿入点は `[n, n-1]` のままだと大小比較が
+    /// 逆転するので、**点 `n` として扱う**。
+    fn probe(&self) -> (u32, u32) {
+        if self.is_insert() {
+            (self.start, self.start)
+        } else {
+            (self.start, self.end)
+        }
     }
 }
 
@@ -259,8 +306,26 @@ pub fn parse_spec(spec: &str) -> Result<Spec, String> {
             });
         }
     }
+    // `#@N` — **挿入点**。行 N の手前に書き足す権利で、既存の行を占有しない。
+    // これが並列度の天井を外す指定なので、行域より先に見る。
+    if let Some(at) = frag.strip_prefix('@') {
+        if path.is_empty() {
+            return Err(format!("パスがありません: {spec}"));
+        }
+        let n: u32 = at
+            .trim()
+            .parse()
+            .map_err(|_| format!("挿入点を読めません: {frag}"))?;
+        if n == 0 {
+            return Err(format!("挿入点は 1 行目から: {frag}"));
+        }
+        return Ok(Spec {
+            path: path.to_string(),
+            sel: Sel::Lines(Span::insert_before(n)),
+        });
+    }
     let Some(body) = frag.strip_prefix('L').or_else(|| frag.strip_prefix('l')) else {
-        // `#` があっても `L` でも記号でもないならパスの一部とみなす
+        // `#` があっても `L` でも記号でも挿入点でもないならパスの一部とみなす
         return Ok(Spec {
             path: spec.to_string(),
             sel: Sel::Whole,
@@ -339,6 +404,9 @@ fn parse_span_body(body: &str) -> Option<Span> {
 }
 
 fn render_lines(path: &str, s: Span) -> String {
+    if s.is_insert() {
+        return format!("{path}#@{}", s.start);
+    }
     if s.end == Span::EOF {
         format!("{path}#L{}-", s.start)
     } else if s.start == s.end {
@@ -392,13 +460,21 @@ pub fn resolve_spec(s: &Spec, text: &str) -> Result<Region, String> {
 /// **`band` 行以上離れていれば `false`** (= 同時に持ってよい)。
 /// 例: `1-10` と `14-20` は間に 3 行 (11,12,13) あるので `band = 3` では衝突しない。
 pub fn spans_too_close(a: &Span, b: &Span, band: u32) -> bool {
-    let (lo, hi) = if a.start <= b.start { (a, b) } else { (b, a) };
+    // 挿入点は幅 0 だが、判定では「その行の位置にある点」として扱う
+    // (`[n, n-1]` のまま引き算すると大小が逆転して必ず衝突になる)。
+    let (a0, a1) = a.probe();
+    let (b0, b1) = b.probe();
+    let ((lo0, lo1), (hi0, _)) = if a0 <= b0 {
+        ((a0, a1), (b0, b1))
+    } else {
+        ((b0, b1), (a0, a1))
+    };
     // lo が EOF まで伸びているなら必ず重なる
-    if lo.end == Span::EOF {
+    if lo1 == Span::EOF {
         return true;
     }
     // 間にある未変更行の数
-    let gap = hi.start.saturating_sub(lo.end).saturating_sub(1);
+    let gap = hi0.saturating_sub(lo1).saturating_sub(1);
     gap < band
 }
 
@@ -1029,6 +1105,55 @@ mod tests {
             let r = parse(spec).expect(spec);
             assert_eq!(render(&r), want, "spec={spec}");
         }
+    }
+
+    /// **挿入点は既存の行を 1 行も占有しない。**
+    ///
+    /// 実測で見えた天井: 2000 行のファイルへ 64 体が合計 13,160 行を要求し、
+    /// 供給の 6.6 倍の需要になって 53 件が断られた。エージェントの仕事の
+    /// 大半は「足す」なので、幅 0 の予約が取れれば天井そのものが消える。
+    #[test]
+    fn 挿入点は幅ゼロで多数が同居できる() {
+        let r = parse("src/a.rs#@120").expect("解釈");
+        let sp = r.span.expect("行域がある");
+        assert!(sp.is_insert(), "挿入点として読めていない");
+        assert_eq!(sp.len(), 0, "既存の行を占有している");
+        assert!(!sp.is_empty(), "挿入点を壊れた入力と見なしている");
+        assert_eq!(render(&r), "src/a.rs#@120", "往復しない");
+
+        // 安全帯を挟めば隣り合える
+        let a = Span::insert_before(100);
+        assert!(!spans_too_close(&a, &Span::insert_before(104), SAFE_BAND));
+        assert!(spans_too_close(&a, &Span::insert_before(102), SAFE_BAND));
+        assert!(!spans_too_close(&a, &Span::insert_before(104), SAFE_BAND));
+        // 順序を入れ替えても同じ
+        assert!(spans_too_close(&Span::insert_before(102), &a, SAFE_BAND));
+
+        // 行域との関係も対称
+        let range = Span {
+            start: 100,
+            end: 140,
+        };
+        assert!(spans_too_close(
+            &Span::insert_before(120),
+            &range,
+            SAFE_BAND
+        ));
+        assert!(!spans_too_close(
+            &Span::insert_before(144),
+            &range,
+            SAFE_BAND
+        ));
+
+        // **2000 行あれば 64 体が全員取れる** (これが天井を外した証拠)
+        let pts: Vec<Region> = (0..64)
+            .map(|i| parse(&format!("src/a.rs#@{}", 10 + i * 30)).expect("解釈"))
+            .collect();
+        assert!(
+            is_disjoint(&pts, SAFE_BAND),
+            "64 個の挿入点が互いに素にならない: {:?}",
+            conflicting_pairs(&pts, SAFE_BAND)
+        );
     }
 
     #[test]
