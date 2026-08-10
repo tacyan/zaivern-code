@@ -42,11 +42,50 @@
 //!
 //! **「効いていると思わせて実は勧告」は無いより悪い。** so 段は画面に出す。
 //!
+//! ## 所有の単位は「ファイル」から「行域」へ
+//!
+//! ファイル単位の所有は衝突 0 を**買えた**が、その代金は拒否だった。
+//! `docs/conflict-zero.md` の実測は 64 体・1536 書込でマージ衝突 0 件 —
+//! ただしその 0 件は **971 回の書き込みを断って**買ったもので、
+//! **並列度がファイル数で頭打ちになる**。
+//!
+//! いまは `src/a.rs#L10-40` の書き方で**ファイル内の行域**を持てる:
+//!
+//! * 台帳のスキーマは 1 バイトも変えていない (`patterns: Vec<String>` のまま)。
+//!   `#L` を含まない古い台帳はファイル全体の域として読める
+//! * 判定は [`overlaps`] 1 本に集約してある。確保・分割・重なり検出が
+//!   同じ規則で動くので、**2 実装がズレる余地が無い**
+//! * 「同じファイルでも安全帯 ([`crate::region::SAFE_BAND`] = 3 行) ぶん
+//!   離れていれば 2 人が同時に持てる」。3 行は git の diff が既定で付ける
+//!   文脈の幅で、**これより近い 2 つの変更は xdiff が 1 ハンクに畳んで衝突にする**
+//! * 関門 ([`gate`]) は「書き込み前の中身」と「ペイロードから作った
+//!   書き込み後の中身」から**実際に触れる行域**を出して判定する。
+//!   出せないもの (シェル経由・パッチ・巨大ファイル) は
+//!   **ファイル全体を触るもの**として扱う = 従来と同じ挙動へ落ちる
+//!
 //! ## 失敗の向き
 //!
 //! - **内部エラーは fail-open** (許可)。台帳が読めない・ロックが取れないのは
 //!   こちらの都合で、それでユーザーのエージェントを止めるのは衝突より悪い。
 //! - **本物の競合は fail-closed** (拒否)。
+//!
+//! ## 統合担当へ — このブランチが触れなかった 3 か所
+//!
+//! いずれも**行域リースが正しく効く**うえでの制限で、直せば良くなる:
+//!
+//! 1. **`src/cli.rs`**: `zai lease claim src/a.rs#L10-40` は**そのまま動く**
+//!    ([`try_claim`] が [`normalize_spec`] を通すため)。直したいのは
+//!    `HELP_LEASE` の文面だけで、`<パターン...>` の説明へ
+//!    「`src/a.rs#L10-40` のように行域も指定できます」を足すと入口が完成する。
+//!    `lease claim` は [`with_store`] を直に呼んでいるので、
+//!    [`with_store_retry`] へ替えると混雑時の空振りも消える
+//!    (`gate` / [`claim_for`] / [`release_one`] は既に替えてある)。
+//! 2. **`src/guard.rs`** のコミット前点検は `Lease::covers_path` を使う =
+//!    行番号を見ない。行域リースは**ファイル粒度で効く**ので、離れた行域を
+//!    持つ 2 人が同じファイルへコミットすると**両方止まる** (安全側だが過剰)。
+//!    [`Lease::owned_spans`] / [`decide_spans`] を渡せば緩められる。
+//! 3. **`src/agents.rs`**: [`applied_text`] が使う編集ペイロードのキーは
+//!    本来 `HookTarget` が持つデータ ([`EDIT_KEYS`] のコメントに手順がある)。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -82,9 +121,44 @@ const REFRESH_BELOW: f64 = 0.5;
 /// 1 スコープに置ける最大リース数。壊れた書き手に台帳を膨らませない。
 const MAX_LEASES: usize = 512;
 
+/// 1 リースに載せられる最大パターン数。
+///
+/// 行域リース ([`normalize_spec`]) は「同じファイルの違う行」を別々に持つので、
+/// 素朴に足していくと台帳が書き込みのたびに 1 行ずつ伸びる。
+/// [`absorb`] が安全帯 ([`crate::region::SAFE_BAND`]) 以内の域を畳むので
+/// 実際にはファイルあたり数件で頭打ちになるが、**壊れた書き手への防壁**として
+/// 上限も置く。当たったら [`MAX_LEASES`] と同じく**止めて人に知らせる**
+/// (「確保できていないのに取れたと言う」のがいちばん危ない)。
+const MAX_PATTERNS: usize = 1_024;
+
 /// ロック待ちの上限 (ミリ秒)。**エージェントの書き込みの臨界路**なので短い。
 /// 取れなければ fail-open で許可する。
 const LOCK_WAIT_MS: u64 = 200;
+
+/// ロックを待つとき、**寝る前に譲るだけ**で済ませる回数。
+///
+/// ## これが `busy-deny` の正体だった
+/// 以前は取れないたびに **5ms 固定で寝ていた**。臨界区間 (小さな JSON の
+/// 読み書き) は 0.1〜0.5ms しかかからないのに、待ち手は 5ms 刻みでしか
+/// 起きないので、**ロックの受け渡しが毎秒 200 回で頭打ち**になる。
+/// 64 体が同時に確保しに来ると 64 × 5ms = 320ms 必要で、
+/// 待ち予算 ([`LOCK_WAIT_MS`] = 200ms) を構造的に超える —
+/// `docs/conflict-zero.md` が「32 体以上で busy-deny が増える」と書いていた
+/// のはこれで、混み方の問題ではなく**待ち方の問題**だった。
+const LOCK_SPIN_ROUNDS: u32 = 96;
+
+/// 譲るのをやめた後の待ち時間の初期値 (マイクロ秒)。
+const LOCK_BACKOFF_US: u64 = 120;
+
+/// 指数バックオフの上限 (マイクロ秒)。これ以上空けても取り合いは減らない。
+const LOCK_BACKOFF_CAP_US: u64 = 4_000;
+
+/// `busy` を返す前に [`with_store_retry`] が使う再試行の総予算 (ミリ秒)。
+///
+/// **1 回の `acquire_lock` を長くするのではなく、外側で作り直す。**
+/// 置き去りロックの奪取 ([`LOCK_STALE_MS`]) と TTL の判定を毎回やり直せるので、
+/// 「先客がクラッシュしていた」場合にも自力で抜けられる。
+const LOCK_RETRY_MS: u64 = 1_000;
 
 /// ロック待ちが尽きたことを示す接頭辞 (表示はされない制御文字)。
 /// [`is_lock_busy`] だけが読む。
@@ -100,6 +174,15 @@ const SCAN_BASE: Duration = Duration::from_millis(1_500);
 
 /// 診断ログの上限 (バイト)。超えたら作り直す (無限に伸ばさない)。
 const LOG_CAP: u64 = 64 * 1024;
+
+/// 行域を出すために読むファイルの上限 (バイト)。
+///
+/// [`gate`] は**書き込みのたびに走る短命プロセス**なので、
+/// 「書き込み前の中身」を読む I/O に上限が要る。超えたファイルは
+/// **行域を決められないもの = ファイル全体を触るもの**として扱う
+/// (= 従来のファイル単位リースと同じ挙動へ落ちる)。
+/// 1MiB は src/ の最大ファイル (`app.rs` 約 0.5MB) の 2 倍。
+const GATE_READ_CAP: u64 = 1024 * 1024;
 
 /// 画面が狭いときにボタンをアイコンだけへ縮退させる境界 (pt)。
 const COMPACT_WIDTH: f32 = 560.0;
@@ -187,13 +270,141 @@ fn segments(pattern: &str) -> Vec<String> {
     segs
 }
 
+// ── 行域つきの仕様 (`src/a.rs#L10-40`) ────────────────────────────────────
+//
+// **台帳のスキーマは 1 バイトも変えない。** `Lease::patterns` は今までどおり
+// `Vec<String>` で、そこに `src/a.rs#L10-40` という書き方が載るだけ。
+// `#L` を含まない古い台帳は「ファイル全体の域」として読めるので、
+// 版を上げずに読み書きできる ([`tests::古い台帳は全体の域として読める`])。
+
+/// 行域が付いている**可能性**があるか。
+///
+/// **フックの臨界路なので、付いていない圧倒的多数は 1 バイトも解析しない。**
+/// `#` を含むパスは実在し得る (稀) が、その場合も [`crate::region::parse`] が
+/// 「`L` で始まらない断片はパスの一部」と判断するので取り違えない。
+fn has_frag(spec: &str) -> bool {
+    spec.as_bytes().contains(&b'#')
+}
+
+/// 仕様文字列からパス部分だけを取り出す。行域が無ければそのまま返す。
+///
+/// 行域を**見ない**のが肝で、[`covers`] のようにファイル粒度でしか
+/// 判断できない呼び出し元は、ここを通して**安全側 (= ファイル全体)** へ倒す。
+pub fn spec_path(spec: &str) -> &str {
+    if !has_frag(spec) {
+        return spec;
+    }
+    let t = spec.trim();
+    match crate::region::parse(t) {
+        // `parse` は trim した文字列を `#` で分けるので、`path` は必ず前半。
+        Ok(r) if r.span.is_some() => &t[..r.path.len()],
+        _ => spec,
+    }
+}
+
+/// 仕様文字列の行域。`None` = **ファイル全体** (従来のリースと等価)。
+pub fn spec_span(spec: &str) -> Option<crate::region::Span> {
+    if !has_frag(spec) {
+        return None;
+    }
+    crate::region::parse(spec.trim()).ok().and_then(|r| r.span)
+}
+
+/// 仕様文字列を [`crate::region::Region`] へ。
+/// **壊れていればファイル全体として扱う** (安全側 — 読めない指定で
+/// 「どの行も持っていない」と判断すると、誰でも書けてしまう)。
+pub fn spec_region(spec: &str) -> crate::region::Region {
+    if !has_frag(spec) {
+        return crate::region::Region::whole(spec);
+    }
+    match crate::region::parse(spec.trim()) {
+        Ok(r) => r,
+        Err(_) => crate::region::Region::whole(spec),
+    }
+}
+
+/// 台帳の正規形へ。**行域を保ったまま**パス部分だけ [`normalize_path`] を通す。
+///
+/// ## なぜ [`normalize_path`] をそのまま使えないか
+/// Windows / macOS は大小を畳むので、`src/A.rs#L10-40` が
+/// `src/a.rs#l10-40` になる。[`crate::region::parse`] は小文字の `l` も
+/// 受けるので**壊れはしない**が、同じ域が `#L` と `#l` の 2 通りで
+/// 台帳に載ると `patterns.contains` が外れて二重登録になる。
+/// [`crate::region::render`] を通して**表記を 1 つに保つ**。
+pub fn normalize_spec(raw: &str) -> String {
+    normalize_spec_on(raw, true, cfg!(any(windows, target_os = "macos")))
+}
+
+/// 規則を明示する [`normalize_spec`] ([`normalize_path_on`] と同じ流儀)。
+///
+/// **どのホストからでも 3 つの OS の規則を検査できる**ようにするのが目的。
+/// 実際にここを `cfg!` のままにしていたため、大小を畳む OS
+/// (Windows / macOS) だけで `a.rs#L1-10` が `a.rs#l1-10` になり、
+/// **同じファイルの別パスとして台帳に並んで重なり判定をすり抜けた**
+/// (`tests::正規化は行域の手前だけに掛かる` が番人)。
+pub fn normalize_spec_on(raw: &str, win_sep: bool, fold_case: bool) -> String {
+    if !has_frag(raw) {
+        return normalize_path_on(raw, win_sep, fold_case);
+    }
+    match crate::region::parse(raw.trim()) {
+        Ok(r) if r.span.is_some() => {
+            // **規則が掛かるのはパス部分だけ。** 行域はそのまま
+            // `crate::region::render` が `#L…` の 1 表記へ揃える。
+            let path = normalize_path_on(&r.path, win_sep, fold_case);
+            if path.is_empty() {
+                return String::new();
+            }
+            crate::region::render(&crate::region::Region {
+                path,
+                span: r.span,
+                anchor: r.anchor,
+            })
+        }
+        // 行域が無い / 読めない = 従来どおりのパス正規化
+        _ => normalize_path_on(raw, win_sep, fold_case),
+    }
+}
+
 /// パターンが具体的なパスを覆うか。**フックの臨界路**なのでここは単純に保つ。
 ///
 /// `path` 側は実在のパスなので `*` / `?` はワイルドカードとして扱わない
 /// (ファイル名に `*` が入る環境では過剰一致し得る — Windows では不正文字、
 /// unix でも実運用ではまず無い。既知の限界として受け入れる)。
+///
+/// **行域は見ない。** `src/a.rs#L10-40` は `src/a.rs` を「覆う」と答える。
+/// ここを行域まで見る作りにすると、行番号を知らない呼び出し元
+/// ([`crate::guard`] のコミット前点検など) が「誰も持っていない」と
+/// 誤答して**素通しになる** — 失敗の向きが逆で、いちばん危ない。
+/// 行番号まで見たいときは [`covers_span`] を使う。
 pub fn covers(pattern: &str, path: &str) -> bool {
-    seg_covers(&segments(pattern), &segments(path))
+    seg_covers(&segments(spec_path(pattern)), &segments(spec_path(path)))
+}
+
+/// **行番号まで見る [`covers`]。** パターンが `touched` の行に関わるか。
+///
+/// | パターン | 答え |
+/// |---|---|
+/// | パスが当たらない | `false` |
+/// | 行域なし (ファイル全体) | `true` — 何行目だろうと関わる |
+/// | 行域あり・`touched` が空 | `true` — 触れた行が判らない = 安全側 |
+/// | 行域あり | `touched` のどれかと安全帯 ([`crate::region::SAFE_BAND`]) 以内なら `true` |
+///
+/// 安全帯を挟むのは、git の diff が既定で 3 行の文脈を付けるため。
+/// 3 行未満しか離れていない 2 つの変更は xdiff が 1 ハンクに畳んで
+/// **衝突にする**ので、「重なっていない」と答えてはいけない。
+pub fn covers_span(pattern: &str, path: &str, touched: &[crate::region::Span]) -> bool {
+    if !covers(pattern, path) {
+        return false;
+    }
+    let Some(own) = spec_span(pattern) else {
+        return true; // ファイル全体 = どの行でも自分の領分
+    };
+    if touched.is_empty() {
+        return true; // 触れた行が判らない = 安全側へ倒す
+    }
+    touched
+        .iter()
+        .any(|t| crate::region::spans_too_close(&own, t, crate::region::SAFE_BAND))
 }
 
 fn seg_covers(pat: &[String], path: &[String]) -> bool {
@@ -274,7 +485,23 @@ fn seg_one(pat: &str, s: &str) -> bool {
 /// 難しいのは境界で、テーブルテストで固定してある:
 /// `src/**` と `src/a.rs` は重なる / ファイルとその親ディレクトリは重なる /
 /// `src/*.rs` と `src/sub/a.rs` は重ならない (`*` は `/` を越えない)。
+///
+/// ## 行域 (`src/a.rs#L10-40`)
+/// **どちらかに行域が付いていれば [`crate::region::conflicts`] へ渡す。**
+/// これで「同じファイルでも安全帯ぶん離れていれば 2 人が同時に持てる」
+/// が確保・分割・重なり検出の**全部**へ一度に効く (判定はここ 1 本しかない)。
+/// 片方でも glob なら「同じファイルを指しているか」が確定しないので、
+/// `conflicts` が安全側 (= 衝突扱い) へ倒す。
+///
+/// 再帰しないことの確認: `conflicts` はここを**パス部分だけ**で呼び直すが、
+/// パス部分に `#` は残らないので必ず [`seg_overlap`] 側へ落ちる。
 pub fn overlaps(a: &str, b: &str) -> bool {
+    if has_frag(a) || has_frag(b) {
+        let (ra, rb) = (spec_region(a), spec_region(b));
+        if ra.span.is_some() || rb.span.is_some() {
+            return crate::region::conflicts(&ra, &rb, crate::region::SAFE_BAND);
+        }
+    }
     seg_overlap(&segments(a), &segments(b))
 }
 
@@ -583,9 +810,34 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// このリースが具体的なパスを覆うか。
+    /// このリースが具体的なパスを覆うか。**行域は見ない** ([`covers`] と同じ
+    /// 理由で、行番号を知らない呼び出し元には安全側の答えを返す)。
     pub fn covers_path(&self, rel: &str) -> bool {
         self.patterns.iter().any(|p| covers(p, rel))
+    }
+
+    /// このリースが `rel` の `touched` 行に**関わる**か ([`covers_span`])。
+    pub fn touches(&self, rel: &str, touched: &[crate::region::Span]) -> bool {
+        self.patterns.iter().any(|p| covers_span(p, rel, touched))
+    }
+
+    /// `rel` について、このリースが持っている行域。
+    ///
+    /// `None` = **ファイル全体**を持っている (行域で切り分ける必要が無い)。
+    /// `Some(vec![])` = このパスは 1 行も持っていない。
+    /// 並びはパターンの登録順のまま = 決定的。
+    pub fn owned_spans(&self, rel: &str) -> Option<Vec<crate::region::Span>> {
+        let mut out = Vec::new();
+        for p in &self.patterns {
+            if !covers(p, rel) {
+                continue;
+            }
+            match spec_span(p) {
+                None => return None,
+                Some(s) => out.push(s),
+            }
+        }
+        Some(out)
     }
 
     /// まだ効いているか。
@@ -634,10 +886,115 @@ pub fn prune(store: &mut Store, now: u64, alive: &dyn Fn(u32) -> bool) {
     store.leases.retain(|l| l.active(now, alive));
 }
 
+/// 2 つの行域を包む最小の域。片方でも末尾までなら末尾まで。
+fn hull(a: crate::region::Span, b: crate::region::Span) -> crate::region::Span {
+    crate::region::Span {
+        start: a.start.min(b.start),
+        end: if a.end == crate::region::Span::EOF || b.end == crate::region::Span::EOF {
+            crate::region::Span::EOF
+        } else {
+            a.end.max(b.end)
+        },
+    }
+}
+
+/// 持ち物へ 1 件足す。**同じファイルの近接した行域は畳む。** 変化したら `true`。
+///
+/// ## なぜ畳むのか
+/// フックは書き込みのたびに「今回触れた域」を確保する。畳まないと
+/// 台帳が 1 書き込みにつき 1 行ずつ伸び、`try_claim` の重なり走査
+/// (O(リース数 × パターン数)) がじわじわ重くなる。
+/// **安全帯 ([`crate::region::SAFE_BAND`]) 以内の 2 つの域は、他人から見れば
+/// どのみち衝突扱い**なので、包んでも誰の自由も奪わない。
+///
+/// 1 回の吸収で新たに届く域が出る (A↔B は遠いが A∪C↔B は近い) ため、
+/// 変化が止まるまで繰り返す。並びは **(start, end) の昇順**で決定的。
+fn absorb(pats: &mut Vec<String>, want: &str) -> bool {
+    let w = spec_region(want);
+    let mut same: Vec<crate::region::Span> = Vec::new();
+    for p in pats.iter() {
+        let r = spec_region(p);
+        if r.path != w.path {
+            continue;
+        }
+        match r.span {
+            // 既にファイル全体を持っている = 行域を足す意味が無い
+            None => return false,
+            Some(s) => same.push(s),
+        }
+    }
+    let merged: Vec<crate::region::Span> = match w.span {
+        // 足すのが「ファイル全体」なら、同じパスの行域は全部畳まれる
+        None => Vec::new(),
+        Some(w) => {
+            let mut cur = w;
+            let mut rest = same;
+            loop {
+                let mut hit = false;
+                let mut next = Vec::new();
+                for a in rest.drain(..) {
+                    if crate::region::spans_too_close(&a, &cur, crate::region::SAFE_BAND) {
+                        cur = hull(a, cur);
+                        hit = true;
+                    } else {
+                        next.push(a);
+                    }
+                }
+                rest = next;
+                if !hit {
+                    break;
+                }
+            }
+            rest.push(cur);
+            rest.sort();
+            rest.dedup();
+            rest
+        }
+    };
+    let render = |s: Option<crate::region::Span>| {
+        crate::region::render(&crate::region::Region {
+            path: w.path.clone(),
+            span: s,
+            anchor: crate::region::Anchor::default(),
+        })
+    };
+    // 同じパスの最初の位置へ畳んだ結果を置き、残りは落とす
+    // (並べ直さないので、既に整っていれば台帳は 1 バイトも変わらない)。
+    let mut out: Vec<String> = Vec::with_capacity(pats.len() + 1);
+    let mut placed = false;
+    for p in pats.iter() {
+        if spec_region(p).path != w.path {
+            out.push(p.clone());
+            continue;
+        }
+        if !placed {
+            placed = true;
+            if merged.is_empty() {
+                out.push(render(None));
+            } else {
+                out.extend(merged.iter().map(|s| render(Some(*s))));
+            }
+        }
+    }
+    if !placed {
+        if merged.is_empty() {
+            out.push(render(None));
+        } else {
+            out.extend(merged.iter().map(|s| render(Some(*s))));
+        }
+    }
+    let changed = out != *pats;
+    *pats = out;
+    changed
+}
+
 /// パターン群を確保する。**1 つでも他人と重なれば 1 つも取らない** (全か無か)。
 ///
 /// 全か無かにするのは、部分的に取れた状態がいちばん危ないため —
 /// エージェントは「取れた」と思って作業を始め、取れなかったパスで衝突する。
+///
+/// `patterns` には `src/a.rs#L10-40` の書き方をそのまま渡せる
+/// ([`normalize_spec`] が正規形へ寄せ、[`overlaps`] が行域で切り分ける)。
 pub fn try_claim(
     store: &mut Store,
     holder: &Holder,
@@ -649,7 +1006,7 @@ pub fn try_claim(
     prune(store, now, alive);
     let wanted: Vec<String> = patterns
         .iter()
-        .map(|p| normalize_path(p))
+        .map(|p| normalize_spec(p))
         .filter(|p| !p.is_empty())
         .collect();
     for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
@@ -665,10 +1022,19 @@ pub fn try_claim(
     }
     let expires = now.saturating_add(ttl);
     if let Some(mine) = store.leases.iter_mut().find(|l| l.holder.same(holder)) {
+        // **上限の検査は書き換える前に済ませる** (全か無かを壊さないため)。
+        if mine.patterns.len().saturating_add(wanted.len()) > MAX_PATTERNS {
+            return Claim::Refused {
+                owner: tr("1 つのリースが持てるパターン数の上限に達しています"),
+                pattern: tr(
+                    "(不要な確保を解放してください: zai lease list で確認し、zai lease release)",
+                ),
+                until: now,
+            };
+        }
         let mut added = 0;
         for w in wanted {
-            if !mine.patterns.contains(&w) {
-                mine.patterns.push(w);
+            if absorb(&mut mine.patterns, &w) {
                 added += 1;
             }
         }
@@ -696,15 +1062,104 @@ pub fn try_claim(
             until: now,
         };
     }
-    let n = wanted.len();
+    // 新規のリースでも同じ畳み方を通す (同じ確保に近接した域が並ぶことがある)。
+    let mut patterns: Vec<String> = Vec::with_capacity(wanted.len());
+    let mut n = 0;
+    for w in &wanted {
+        if absorb(&mut patterns, w) {
+            n += 1;
+        }
+    }
     store.leases.push(Lease {
         holder: holder.clone(),
-        patterns: wanted,
+        patterns,
         acquired_at: now,
         expires_at: expires,
         note: String::new(),
     });
     Claim::Granted(n)
+}
+
+/// **断る代わりに「ずらす」提案を出す純関数。**
+///
+/// 拒否は正しいが、拒否しか返せないと並列度は上がらない。実測 (crowded 条件)
+/// では行域リースが 55 件を断っており、そのうち多くは
+/// **すぐ近くの空いている行へずらせば通る**。ここはその候補を 1 つ返す。
+///
+/// * `None` — ずらす必要が無い (`want` がそのまま取れる) か、
+///   ずらしようが無い (ファイル全体 / 末尾までの域 / glob /
+///   **誰かがそのファイルを丸ごと持っている**)
+/// * `Some(r)` — `r` なら誰とも重ならない。**長さは `want` と同じ**
+///
+/// 選び方は決定的: 候補は「占有域の直後」「占有域の直前」「先頭」だけを見て、
+/// `want.start` にいちばん近いもの、同点なら**行番号が小さいほう**。
+///
+/// **`store` は呼び出し側が [`prune`] 済みであること** — 引数に `now` が
+/// 無いのは、交渉層 (メッシュ) が判定済みの台帳を渡す前提だから。
+pub fn suggest_alternative(
+    store: &Store,
+    want: &crate::region::Region,
+) -> Option<crate::region::Region> {
+    use crate::region::{Span, SAFE_BAND};
+    let span = want.span?; // ファイル全体はずらせない
+    if span.end == Span::EOF || span.is_empty() {
+        return None; // 長さが決まらない
+    }
+    if want.path.contains(['*', '?', '[']) {
+        return None; // glob はどのファイルを指すか確定しない
+    }
+    let len = span.len();
+    let mut busy: Vec<Span> = Vec::new();
+    for l in &store.leases {
+        for p in &l.patterns {
+            if !covers(p, &want.path) {
+                continue;
+            }
+            match spec_span(p) {
+                None => return None, // 丸ごと持たれている = ずらす先が無い
+                Some(s) => busy.push(s),
+            }
+        }
+    }
+    let free = |s: &Span| {
+        busy.iter()
+            .all(|b| !crate::region::spans_too_close(b, s, SAFE_BAND))
+    };
+    if free(&span) {
+        return None; // そのまま取れる
+    }
+    let mut cands: Vec<u32> = vec![1];
+    for b in &busy {
+        // 直後 (安全帯を空ける) と、直前 (同じ長さが入る位置)
+        cands.push(b.end.saturating_add(SAFE_BAND).saturating_add(1));
+        cands.push(b.start.saturating_sub(SAFE_BAND).saturating_sub(len).max(1));
+    }
+    cands.retain(|s| *s >= 1);
+    cands.sort_unstable();
+    cands.dedup();
+    let mut best: Option<(u32, u32)> = None;
+    for s in cands {
+        let c = Span {
+            start: s,
+            end: s.saturating_add(len - 1),
+        };
+        if !free(&c) {
+            continue;
+        }
+        let d = s.abs_diff(span.start);
+        if best.is_none_or(|(bd, bs)| d < bd || (d == bd && s < bs)) {
+            best = Some((d, s));
+        }
+    }
+    let (_, start) = best?;
+    Some(crate::region::Region {
+        path: want.path.clone(),
+        span: Some(Span {
+            start,
+            end: start.saturating_add(len - 1),
+        }),
+        anchor: crate::region::Anchor::default(),
+    })
 }
 
 /// 持ち主のリースを手放す。返り値は消した件数。
@@ -723,7 +1178,18 @@ pub enum Verdict {
     Deny(String),
 }
 
-/// **1 パスに対する判定。** ここがこの機能の心臓で、I/O を持たない。
+/// **1 パスに対する判定 (行番号を知らない呼び出し元用)。** I/O を持たない。
+///
+/// ## 行域リースが入ってからの向き
+/// 行域が入ると、**同じパスを複数のリースが覆える**ようになった
+/// (A が `#L1-20`、B が `#L100-200`)。以前は「最初に見つけた 1 件」で
+/// 即答していたので、台帳の並び順で答えが変わる = 非決定的になる。
+///
+/// ここでは**他人が勝つ**。自分の分を先に見つけて `Allow` を返すと、
+/// 「1〜20 行だけ持っている自分」が**ファイル全体を保存できてしまい**、
+/// 100〜200 行を持つ B を黙って上書きする。行番号を知らないのだから、
+/// 知らないなりに安全側 (= 止める) へ倒すのが正しい。
+/// 行番号が判る呼び出し元 ([`gate`]) は [`decide_spans`] を使う。
 pub fn decide(
     store: &Store,
     holder: &Holder,
@@ -736,11 +1202,108 @@ pub fn decide(
             continue;
         }
         if l.holder.same(holder) {
-            return Verdict::Allow;
+            continue; // 自分のものは止める理由にならない (が、即答もしない)
         }
         return Verdict::Deny(deny_reason(rel, l, now));
     }
     Verdict::Allow
+}
+
+/// **行域まで見る判定。** 実際に触れた行 `touched` が他人の域に掛かるときだけ止める。
+///
+/// `touched` が空 = 「触れた行を決められなかった」= ファイル全体を触るものとして
+/// 扱う ([`covers_span`] がそこを安全側へ倒す)。
+///
+/// **自分の域に収まっているか**は見ない。ここは「他人と衝突しないか」だけを
+/// 答え、収まっているかどうかは [`owns_touched`] が別に判断する
+/// (誰も持っていない域は [`gate`] がその場で自分のものにするため、
+///  「持っていないから止める」にすると自動確保が成立しない)。
+pub fn decide_spans(
+    store: &Store,
+    holder: &Holder,
+    rel: &str,
+    touched: &[crate::region::Span],
+    now: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> Verdict {
+    for l in &store.leases {
+        if !l.active(now, alive) || l.holder.same(holder) {
+            continue;
+        }
+        if l.touches(rel, touched) {
+            let mut reason = deny_reason(&touched_label(rel, touched), l, now);
+            // **断るだけで終わらせない。** 同じ長さが入る近くの空きを一緒に出す。
+            // 拒否しか返せないと、エージェントは待つか諦めるかしかできない。
+            if let Some(alt) =
+                wanted_region(rel, touched).and_then(|w| suggest_alternative(store, &w))
+            {
+                reason.push_str(&trf(
+                    "\n(4) ずらす — {alt} なら誰とも重なりません",
+                    &[("alt", crate::region::render(&alt))],
+                ));
+            }
+            return Verdict::Deny(reason);
+        }
+    }
+    Verdict::Allow
+}
+
+/// 触れた行域を「1 つの欲しい域」へ畳む ([`suggest_alternative`] へ渡す形)。
+fn wanted_region(rel: &str, touched: &[crate::region::Span]) -> Option<crate::region::Region> {
+    let (first, last) = (touched.first()?, touched.last()?);
+    Some(crate::region::Region {
+        path: rel.to_string(),
+        span: Some(hull(*first, *last)),
+        anchor: crate::region::Anchor::default(),
+    })
+}
+
+/// 拒否の文面に出す「どこを触ろうとしたか」。行域が判るなら行番号まで出す。
+fn touched_label(rel: &str, touched: &[crate::region::Span]) -> String {
+    let (Some(first), Some(last)) = (touched.first(), touched.last()) else {
+        return rel.to_string();
+    };
+    crate::region::render(&crate::region::Region {
+        path: rel.to_string(),
+        span: Some(hull(*first, *last)),
+        anchor: crate::region::Anchor::default(),
+    })
+}
+
+/// 触れた行を**自分が既に持っている**か。
+///
+/// `touched` が `None` (= 行域を決められなかった) ときは、ファイル全体を
+/// 持っているときだけ `true`。持っている域からはみ出したら `false` で、
+/// 呼び出し側は改めて確保しに行く ([`crate::region::within`])。
+pub fn owns_touched(
+    store: &Store,
+    holder: &Holder,
+    rel: &str,
+    touched: Option<&[crate::region::Span]>,
+    now: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> bool {
+    let mut mine: Vec<crate::region::Span> = Vec::new();
+    let mut any = false;
+    for l in &store.leases {
+        if !l.active(now, alive) || !l.holder.same(holder) {
+            continue;
+        }
+        match l.owned_spans(rel) {
+            None => return true, // ファイル全体を持っている
+            Some(s) => {
+                any |= !s.is_empty();
+                mine.extend(s);
+            }
+        }
+    }
+    let Some(t) = touched else {
+        return false; // 全体が要るのに、持っているのは行域だけ
+    };
+    if t.is_empty() {
+        return true; // 1 行も触らない書き込み = 確保するものが無い
+    }
+    any && crate::region::within(&mine, t)
 }
 
 /// 拒否の文面。**「拒否されました」だけでは、ユーザーは機能を切るだけ。**
@@ -843,12 +1406,57 @@ impl Drop for LockGuard {
     }
 }
 
+/// ロック待ちの間の**譲り方**。[`LOCK_SPIN_ROUNDS`] に理由を書いてある。
+///
+/// 揺らぎ (jitter) を入れるのは、同じ瞬間に寝た待ち手が同じ瞬間に起きて
+/// また取り合う (thundering herd) のを崩すため。種はスレッド ID なので
+/// **出力へは 1 バイトも漏れない** (順序も結果も変えない)。
+fn lock_backoff(attempt: &mut u32) {
+    let n = *attempt;
+    *attempt = attempt.saturating_add(1);
+    if n < LOCK_SPIN_ROUNDS {
+        // 臨界区間は小さな JSON の読み書き = 0.1〜0.5ms。寝るより譲るほうが速い。
+        std::thread::yield_now();
+        return;
+    }
+    let step = 1u64 << (n - LOCK_SPIN_ROUNDS).min(5);
+    let base = LOCK_BACKOFF_US
+        .saturating_mul(step)
+        .min(LOCK_BACKOFF_CAP_US);
+    std::thread::sleep(Duration::from_micros(base / 2 + jitter_us(base)));
+}
+
+/// `0..base` の疑似乱数 (スレッドごとに独立)。
+fn jitter_us(base: u64) -> u64 {
+    use std::cell::Cell;
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static SEED: Cell<u64> = const { Cell::new(0) };
+    }
+    SEED.with(|s| {
+        let mut x = s.get();
+        if x == 0 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::thread::current().id().hash(&mut h);
+            std::process::id().hash(&mut h);
+            x = h.finish() | 1;
+        }
+        // xorshift64
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        x % base.max(1)
+    })
+}
+
 fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
     let path = store.with_extension("lock");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("台帳フォルダを作れません: {e}"))?;
     }
     let deadline = Instant::now() + Duration::from_millis(LOCK_WAIT_MS);
+    let mut attempt = 0u32;
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -881,7 +1489,7 @@ fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
                 tr("ロックを取れませんでした (先客が握っています)")
             ));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        lock_backoff(&mut attempt);
     }
 }
 
@@ -903,6 +1511,45 @@ pub fn with_store<T>(store: &Path, f: impl FnOnce(&mut Store) -> T) -> Result<T,
         write_store(store, &s)?;
     }
     Ok(out)
+}
+
+/// [`with_store`] を、**混雑 (`busy`) のときだけ**上限付きの指数バックオフで
+/// 作り直す。壊れている ([`read_store`] の `Err`) は再試行しない — 直らない。
+///
+/// ## なぜ台帳を分割 (シャーディング) しなかったか
+/// `docs/conflict-zero.md` が測った `busy-deny` を消す手は 2 つある:
+/// 「台帳をパスのハッシュで割る」と「待ち方を直す」。**前者を採らなかった。**
+///
+/// 台帳の不変条件は「**どの 2 人の担当も重ならない**」で、この判定
+/// ([`overlaps`]) は **glob を含む**。`src/**` は全シャードに当たり得るので、
+/// シャードを 1 つ引いただけでは重なりを判定できない。すると:
+///
+/// * glob 用の共有シャードを置く → 具体パスの確保も毎回そこを掴む
+///   = **結局グローバルロック**。分けた意味が無い
+/// * 複数シャードを順序付きで全部ロックする → デッドロックは避けられるが、
+///   確保 1 回で N 個のロックを取ることになり、待ち時間はむしろ伸びる
+/// * シャードごとに独立して確保する → **「全か無か」が壊れる**。
+///   部分的に取れた状態は「取れたと思って書き始めて途中で衝突する」
+///   いちばん危ない形で、この機能が存在する理由そのものを失う
+///
+/// 一方、実測すると `busy` の原因は混雑ではなく**待ち方**だった
+/// ([`LOCK_SPIN_ROUNDS`] に数字がある: 5ms 固定の sleep がロックの
+/// 受け渡しを毎秒 200 回に縛っていた)。譲る + 揺らぎ付き指数バックオフに
+/// 変えるだけで 64 体同時でも `busy` が 0 になる
+/// ([`tests::六十四体が同時に確保してもbusyは出ず勝者は一つ`])。
+/// **台帳は 1 スコープ 1 ファイルのまま = 全か無かは自明に保たれる。**
+pub fn with_store_retry<T>(store: &Path, mut f: impl FnMut(&mut Store) -> T) -> Result<T, String> {
+    let deadline = Instant::now() + Duration::from_millis(LOCK_RETRY_MS);
+    let mut attempt = 0u32;
+    loop {
+        match with_store(store, &mut f) {
+            Ok(v) => return Ok(v),
+            Err(e) if is_lock_busy(&e) && Instant::now() < deadline => {
+                lock_backoff(&mut attempt);
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// 診断ログの場所。**書き手 ([`log_line`]) と読み手 (競合ゼロ点検) が
@@ -1033,6 +1680,143 @@ pub fn target_path(payload: &serde_json::Value, keys: &[&str]) -> String {
     String::new()
 }
 
+/// 編集ペイロードのキー。
+///
+/// **統合担当へ**: これは本来 `agents.rs` の `HookTarget` が持つべきデータで、
+/// CLAUDE.md の「エージェント固有値は `agents.rs` のカタログにデータとして持つ」
+/// に反している。このブランチは `agents.rs` を触れない (同時に別の担当が
+/// 編集中) ので暫定的にここへ置いた。繋ぎ方は:
+///
+/// 1. `HookTarget` に `edit_keys: EditKeys` を足す
+/// 2. `hook_edit_keys(bin) -> Option<&'static EditKeys>` を生やす
+/// 3. ここの `EDIT_KEYS` を消し、[`applied_text`] の引数で受け取る
+///
+/// 現状の値は claude (`Edit` / `MultiEdit` / `Write`) と
+/// gemini (`replace` / `write_file`) で**同じ**なので、表に分けても
+/// 今のところ行は 1 つになる (だから暫定でも実害が出ていない)。
+/// codex の `apply_patch` はパッチ本文なので**この形に当たらず**、
+/// 行域を決められないもの = ファイル全体として扱われる。
+struct EditKeys {
+    /// 全文置換の中身 (`Write` / `write_file`)。
+    content: &'static str,
+    /// 置換前 / 置換後 (`Edit` / `replace`)。
+    old: &'static str,
+    new: &'static str,
+    /// すべて置換するか。
+    all: &'static str,
+    /// 連続適用の配列 (`MultiEdit`)。
+    edits: &'static str,
+}
+
+const EDIT_KEYS: EditKeys = EditKeys {
+    content: "content",
+    old: "old_string",
+    new: "new_string",
+    all: "replace_all",
+    edits: "edits",
+};
+
+/// 1 回の置換。**当たらなければ `None`** (そのツール呼び出しは失敗するので、
+/// 「書き込み後の中身」を推測してはいけない)。
+fn replace_one(text: &str, old: &str, new: &str, all: bool) -> Option<String> {
+    if old.is_empty() || !text.contains(old) {
+        return None;
+    }
+    Some(if all {
+        text.replace(old, new)
+    } else {
+        text.replacen(old, new, 1)
+    })
+}
+
+/// ペイロードから**書き込み後の中身**を作る純関数。
+///
+/// | 形 | 中身 |
+/// |---|---|
+/// | `content` を持つ | それが全文 (`Write`) |
+/// | `edits[]` を持つ | 先頭から順に置換 (`MultiEdit`) |
+/// | `old_string` を持つ | 1 回置換 (`Edit`) |
+/// | それ以外 | `None` = **判らない** |
+///
+/// `None` を返したら呼び出し側は**ファイル全体を触るもの**として扱う。
+/// 「たぶんこう変わる」で行域を狭く見積もると、他人の域へはみ出す書き込みを
+/// 通してしまう — 判らないときは広く見るのが安全側。
+pub fn applied_text(old: &str, input: &serde_json::Value) -> Option<String> {
+    let s = |k: &str| input.get(k).and_then(|v| v.as_str());
+    if let Some(c) = s(EDIT_KEYS.content) {
+        return Some(c.to_string());
+    }
+    if let Some(arr) = input.get(EDIT_KEYS.edits).and_then(|v| v.as_array()) {
+        if arr.is_empty() {
+            return None;
+        }
+        let mut cur = old.to_string();
+        for e in arr {
+            let o = e.get(EDIT_KEYS.old).and_then(|v| v.as_str())?;
+            let n = e.get(EDIT_KEYS.new).and_then(|v| v.as_str()).unwrap_or("");
+            let all = e
+                .get(EDIT_KEYS.all)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            cur = replace_one(&cur, o, n, all)?;
+        }
+        return Some(cur);
+    }
+    let o = s(EDIT_KEYS.old)?;
+    let n = s(EDIT_KEYS.new).unwrap_or("");
+    let all = input
+        .get(EDIT_KEYS.all)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    replace_one(old, o, n, all)
+}
+
+/// 判定のためにファイルを読む。**上限付き** ([`GATE_READ_CAP`])。
+fn read_capped(abs: &Path) -> Option<String> {
+    let m = std::fs::metadata(abs).ok()?;
+    if !m.is_file() || m.len() > GATE_READ_CAP {
+        return None;
+    }
+    std::fs::read_to_string(abs).ok()
+}
+
+/// 行域の並びを整える (昇順 + 安全帯以内は 1 本に畳む)。
+fn coalesce(mut v: Vec<crate::region::Span>, band: u32) -> Vec<crate::region::Span> {
+    v.sort();
+    let mut out: Vec<crate::region::Span> = Vec::with_capacity(v.len());
+    for s in v {
+        match out.last_mut() {
+            Some(p) if crate::region::spans_too_close(p, &s, band) => *p = hull(*p, s),
+            _ => out.push(s),
+        }
+    }
+    out
+}
+
+/// **この書き込みが実際に触れる行域**を、書き込み前の中身とペイロードから出す。
+///
+/// `None` = 決められなかった (ファイルが無い / 大きすぎる / ペイロードの形が
+/// 判らない) = **ファイル全体を触るもの**として扱う。
+///
+/// ## 前後の**両方向**を見る理由 (実測で踏んだ穴)
+/// [`crate::region::touched_spans`] が返すのは**書いた後の行番号**だけ。
+/// ところがリースは**書く前の行番号**で登録されているので、これだけを使うと
+/// **削除がまるごと見えなくなる**。200 行のファイルを 2 行で全文置換すると
+/// 「触れたのは 1〜2 行目」と出て、95〜105 行目を持っている相手を
+/// **黙って消せてしまった** (このテストを書いて初めて分かった)。
+///
+/// なので `old → new` (書いた後の座標) と `new → old` (書く前の座標) の
+/// 両方を出して**合併**する。小さな編集では 2 つはほぼ一致するので域は
+/// 広がらず、全文置換のときだけ正しく広くなる。
+fn touched_of(input: &serde_json::Value, abs: &Path) -> Option<Vec<crate::region::Span>> {
+    let old = read_capped(abs)?;
+    let new = applied_text(&old, input)?;
+    let band = crate::region::SAFE_BAND;
+    let mut all = crate::region::touched_spans(&old, &new, band);
+    all.extend(crate::region::touched_spans(&new, &old, band));
+    Some(coalesce(all, band))
+}
+
 /// `zai hook` から呼ぶ**強制の本体**。GUI が動いていなくても効く。
 ///
 /// 3 つの制約 (どれも load-bearing):
@@ -1041,6 +1825,38 @@ pub fn target_path(payload: &serde_json::Value, keys: &[&str]) -> String {
 /// * **内部エラーは fail-open** — 台帳が読めない / ロックが取れないで
 ///   ユーザーのエージェントを止めない。
 /// * **本物の競合は fail-closed**。
+///
+/// ## 行域での判定 (ファイル単位からの置き換え)
+/// 1. 書き込み先の**現在の中身**を読む ([`read_capped`] — 上限 [`GATE_READ_CAP`])
+/// 2. ペイロードから**書き込み後の中身**を作る ([`applied_text`])
+/// 3. [`crate::region::touched_spans`] で**実際に触れる行域**を出す
+/// 4. 触れた域が自分の域に収まっていれば通し ([`owns_touched`])、
+///    他人の域へ掛かっていれば止める ([`decide_spans`])。
+///    誰も持っていなければ**その域だけ**を自分のものにする
+///
+/// ## 行域で判定できないものの線引き (**明示的に広く倒す**)
+///
+/// | 形 | 扱い | 理由 |
+/// |---|---|---|
+/// | `Write` (全文置換) | 触れた域は広くなる。持っていなければ止まる | 正しい挙動 |
+/// | `Edit` / `MultiEdit` | 置換後の中身から行域が出る | |
+/// | `sed -i` / `> file` などシェル経由 | **ファイル全体** | 書き込み後の中身を事前に知れない |
+/// | codex の `apply_patch` | **ファイル全体** | パッチ本文は [`applied_text`] の形に当たらない |
+/// | 1 コマンドが複数ファイルを書く | **ファイル全体** | どのペイロードがどのファイルの中身か対応が取れない |
+/// | 対象不明 (`opaque`: `eval` / ヒアドキュメント) | **ファイル全体**、かつ通す | 監査ログに残す。ここで止めると `ls` まで落ちる形になり、ユーザーは機能ごと切る |
+/// | ファイルが無い / [`GATE_READ_CAP`] 超 | **ファイル全体** | 前の中身が無い / 読む I/O に上限が要る |
+///
+/// 「ファイル全体として扱う」= **そのファイルの域を誰かが持っていたら止まる**
+/// (従来のファイル単位リースとまったく同じ挙動)。
+///
+/// ## fail-open の範囲 (ここだけ。それ以外は fail-closed)
+/// * 台帳が**無い** (この機能が無効なワークスペース)
+/// * 台帳が**壊れている / 読めない**
+/// * ペイロードが JSON として読めない / エージェントがカタログに無い
+/// * ツールの形が判らない (`opaque`)
+///
+/// 混雑 (`busy`) は fail-open**しない** — [`with_store_retry`] が
+/// 上限付きで作り直し、それでも駄目なら止める (再試行すれば通る)。
 pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     let v: serde_json::Value = match serde_json::from_str(payload) {
         Ok(v) => v,
@@ -1112,7 +1928,10 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     // 相対パスへ。**相対化は作業ツリー基準**で行う (worktree のファイルは
     // 元のリポジトリの配下に無いので、key 基準にすると必ず外れる)。
     // ツリーの外 (別リポジトリ・システムのファイル) は関知しない。
-    let rels: Vec<String> = write
+    // **絶対パスも一緒に持ち回る** — 行域を出すには実ファイルを読む必要があり、
+    // `rel` は正規化 (macOS / Windows では小文字化) を通っているので、
+    // ツリーへ繋ぎ直すと大小非区別に頼ることになる。
+    let targets: Vec<(PathBuf, String)> = write
         .paths
         .iter()
         .map(|raw| {
@@ -1122,13 +1941,33 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
                 cwd.join(raw)
             }
         })
-        .filter_map(|abs| rel_within(&roots.tree, &abs))
+        .filter_map(|abs| rel_within(&roots.tree, &abs).map(|rel| (abs, rel)))
         .collect();
-    if rels.is_empty() {
+    if targets.is_empty() {
         return pass_answer();
     }
+    let rels: Vec<String> = targets.iter().map(|(_, r)| r.clone()).collect();
+
+    // **実際に触れる行域**。`None` = 決められない = ファイル全体を触る扱い。
+    // 出せるのは「パス欄を持つ編集ツールが 1 ファイルだけを書く」形のときだけ
+    // (複数ファイルを書くコマンドは、どのペイロードがどのファイルの中身かの
+    //  対応が取れない)。この線引きは [`gate`] のドキュメント表にある。
+    let spans: Vec<Option<Vec<crate::region::Span>>> =
+        if editing && targets.len() == 1 && !write.opaque {
+            let input = v.get("tool_input").unwrap_or(&v);
+            vec![touched_of(input, &targets[0].0)]
+        } else {
+            vec![None; targets.len()]
+        };
     let now = now_secs();
     let alive: &dyn Fn(u32) -> bool = &pid_alive;
+    // 1 パスぶんの判定 (ロックの内でも外でも同じ規則を使う — 2 実装は必ずズレる)。
+    let judge = |st: &Store, i: usize| -> Verdict {
+        match &spans[i] {
+            Some(t) => decide_spans(st, &holder, &rels[i], t, now, alive),
+            None => decide(st, &holder, &rels[i], now, alive),
+        }
+    };
 
     // **拒否はロックを取らずに決める。** 台帳の置き換えは tmp → rename
     // なので、ロック無しで読んでも書きかけは見えない。ここでロックを待つと、
@@ -1139,25 +1978,39 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
         // **1 件でも他人が持っていたら止める。** 1 コマンドが複数のファイルを
         // 書く (`mv a b` / `sed -i f1 f2`) ので、部分的に通すと「取れたと
         // 思って書き始めて、途中で衝突する」いちばん危ない形になる。
-        for rel in &rels {
-            if let Verdict::Deny(reason) = decide(&st, &holder, rel, now, alive) {
+        for (i, rel) in rels.iter().enumerate() {
+            if let Verdict::Deny(reason) = judge(&st, i) {
                 log_line(&dir, &format!("deny {} {rel}", holder.display()));
                 return deny_answer(agent, &reason);
             }
         }
+        // **自分の域に全部収まっていて、期限にも余裕があるならロックを取らない。**
+        // 行域リースでいちばん多いのが「さっき確保した域を続けて書く」形なので、
+        // ここで抜けられると台帳の取り合いそのものが起きない。
+        let fresh = st.leases.iter().any(|l| {
+            l.holder.same(&holder)
+                && l.expires_at.saturating_sub(now) as f64
+                    >= DEFAULT_TTL_SECS as f64 * REFRESH_BELOW
+        });
+        if fresh
+            && (0..targets.len())
+                .all(|i| owns_touched(&st, &holder, &rels[i], spans[i].as_deref(), now, alive))
+        {
+            return pass_answer();
+        }
     }
 
     // 通す側だけロックを取り、「判定 → 自動確保 / 延長」を済ませる。
-    let outcome = with_store(&store, |st| {
+    let outcome = with_store_retry(&store, |st| {
         prune(st, now, alive);
-        for rel in &rels {
-            if let Verdict::Deny(reason) = decide(st, &holder, rel, now, alive) {
+        for i in 0..rels.len() {
+            if let Verdict::Deny(reason) = judge(st, i) {
                 return Verdict::Deny(reason);
             }
         }
         // **誰も持っていないなら、書いた本人のものにする。**
         // これがあるから、ユーザーが 1 件も設定しなくても
-        // 2 人目が同じファイルへ来た瞬間に止まる。
+        // 2 人目が同じ**行域**へ来た瞬間に止まる。
         let refresh = st
             .leases
             .iter()
@@ -1166,13 +2019,27 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
                 let left = l.expires_at.saturating_sub(now) as f64;
                 left < DEFAULT_TTL_SECS as f64 * REFRESH_BELOW
             });
-        if refresh
-            || !rels
-                .iter()
-                .all(|r| st.leases.iter().any(|l| l.covers_path(r)))
-        {
-            // 全件まとめて確保する (`try_claim` は全か無か)。
-            let _ = try_claim(st, &holder, &rels, now, DEFAULT_TTL_SECS, alive);
+        let need = !(0..targets.len())
+            .all(|i| owns_touched(st, &holder, &rels[i], spans[i].as_deref(), now, alive));
+        if refresh || need {
+            // **触れた域だけ**を確保する (`try_claim` は全か無か)。
+            // 行域を決められなかったパスは、パスそのもの = ファイル全体。
+            let want: Vec<String> = (0..targets.len())
+                .flat_map(|i| match &spans[i] {
+                    None => vec![rels[i].clone()],
+                    Some(t) => t
+                        .iter()
+                        .map(|s| {
+                            crate::region::render(&crate::region::Region {
+                                path: rels[i].clone(),
+                                span: Some(*s),
+                                anchor: crate::region::Anchor::default(),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect();
+            let _ = try_claim(st, &holder, &want, now, DEFAULT_TTL_SECS, alive);
         }
         Verdict::Allow
     });
@@ -1193,6 +2060,14 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
             // 本物のマージ衝突になった)。いちばん混んでいる時 = いちばん
             // 衝突しやすい時にだけ効かなくなる、最悪の壊れ方だった。
             // 再試行すれば直るので、止めても作業は進む。
+            //
+            // **ここまで来ることは実質無くなった。** `with_store_retry` が
+            // [`LOCK_RETRY_MS`] のあいだ作り直し、その内側の `acquire_lock` は
+            // 5ms 固定の sleep をやめた ([`LOCK_SPIN_ROUNDS`])。
+            // 64 体同時でも busy は 0 件
+            // ([`tests::六十四体が同時に確保してもbusyは出ず勝者は一つ`])。
+            // それでも腕を残すのは、ディスクが刺さった等の本物の異常のとき
+            // **通してはいけない**から。
             log_line(&dir, &format!("busy-deny {}", rels.join(" ")));
             deny_answer(agent, &tr(
                 "ファイル所有の台帳が混み合っていて、担当を登録できませんでした。\n                 そのまま書くと他の担当と同じファイルを触る恐れがあるため、いったん止めます。\n                 対処: 数秒おいて同じ操作をやり直してください (再試行すれば通ります)",
@@ -1246,7 +2121,8 @@ pub fn parse_assignments(text: &str) -> Vec<Assignment> {
             .split([',', ' ', '\t'])
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(normalize_path)
+            // 行域つき (`src/a.rs#L10-40`) をそのまま受ける。
+            .map(normalize_spec)
             .collect();
         if !patterns.is_empty() {
             out.push(Assignment { agent, patterns });
@@ -1256,6 +2132,11 @@ pub fn parse_assignments(text: &str) -> Vec<Assignment> {
 }
 
 /// **配る前に**重なりを全部出す。O(担当数² × パターン数²) だがどれも小さい。
+///
+/// 行域つきの担当 (`src/a.rs#L10-40`) を受け付ける。判定は [`overlaps`] 1 本
+/// なので、**同じファイルでも安全帯 ([`crate::region::SAFE_BAND`]) ぶん
+/// 離れていれば重なりとして出ない** = 両方へ配れる。
+/// 出力の並びは担当の並び × パターンの並びで決まる = 決定的。
 pub fn plan_overlaps(list: &[Assignment]) -> Vec<Overlap> {
     let mut out = Vec::new();
     for i in 0..list.len() {
@@ -1281,6 +2162,14 @@ pub fn plan_overlaps(list: &[Assignment]) -> Vec<Overlap> {
 ///
 /// 重なったパターンを後の担当から外した「互いに素な」割り当てを返す。
 /// 外した分は誰も持たなくなるので、直列にやるべき部分として一覧に出す。
+///
+/// **決定性**: 走査は `list` の順 → パターンの順で、同点 (どちらも取れる) は
+/// **先に並んでいる担当が勝つ**。呼び出し側 ([`crate::coordinator`]) が
+/// 担当をタスク ID の辞書順で並べているので、入力が同じなら答えも必ず同じ。
+///
+/// 行域つきの担当もそのまま通る — `src/a.rs#L1-20` と `src/a.rs#L40-60` は
+/// [`overlaps`] が「重ならない」と答えるので、**両方が残る**。
+/// これが並列度をファイル数で頭打ちにしないための肝。
 pub fn split_plan(list: &[Assignment]) -> (Vec<Assignment>, Vec<String>) {
     let mut taken: Vec<String> = Vec::new();
     let mut serial: Vec<String> = Vec::new();
@@ -2449,7 +3338,12 @@ pub fn claim_one(
     claim_for(store, holder, rel, now, DEFAULT_TTL_SECS, alive)
 }
 
-/// 寿命を明示する確保。
+/// 寿命を明示する確保。`rel` には `src/a.rs#L10-40` の書き方も渡せる。
+///
+/// **`with_store_retry` を通す** — ここは UI スレッドではなく、
+/// `Req::Claim` を受ける裏のワーカから呼ばれる (`arm_in` のループ)。
+/// 混雑で取り逃すと `Own::Off` = 「所有が判らない」に落ちて画面が嘘をつくので、
+/// 上限付きで作り直す価値がある。
 pub fn claim_for(
     store: &Path,
     holder: &Holder,
@@ -2459,7 +3353,7 @@ pub fn claim_for(
     alive: &dyn Fn(u32) -> bool,
 ) -> Own {
     let pats = vec![rel.to_string()];
-    match with_store(store, |s| try_claim(s, holder, &pats, now, ttl, alive)) {
+    match with_store_retry(store, |s| try_claim(s, holder, &pats, now, ttl, alive)) {
         // 台帳を触れないときは fail-open (編集を止めない)。保存前に再度見る。
         Err(_) => Own::Off,
         Ok(Claim::Granted(_)) => Own::Mine {
@@ -2479,11 +3373,16 @@ pub fn claim_for(
 }
 
 /// 1 パスを解放する。
+///
+/// `rel` にファイルを渡したら、**そのファイルの行域リースも全部落ちる**
+/// (`src/a.rs` を手放したのに `src/a.rs#L10-40` が残っていたら、
+///  画面の一覧から消えたのに書き込みは止まり続ける = いちばん困る形)。
+/// `rel` に行域そのもの (`src/a.rs#L10-40`) を渡せばその 1 件だけ落ちる。
 pub fn release_one(store: &Path, holder: &Holder, rel: &str) -> Result<(), String> {
-    with_store(store, |s| {
+    with_store_retry(store, |s| {
         for l in s.leases.iter_mut() {
             if l.holder.same(holder) {
-                l.patterns.retain(|p| p != rel);
+                l.patterns.retain(|p| p != rel && spec_path(p) != rel);
             }
         }
         s.leases.retain(|l| !l.patterns.is_empty());
@@ -3749,5 +4648,773 @@ mod os_rule_tests {
     fn 既定の規則は動いているosに一致する() {
         let want = normalize_path_on("SRC/App.rs", true, cfg!(any(windows, target_os = "macos")));
         assert_eq!(normalize_path("SRC/App.rs"), want);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  行域リースのテスト
+//
+//  **`gate` を丸ごと通す e2e はここに置けない。** `gate` は
+//  `store_dir()` = 実 `~/.zaivern/leases` を引くので、テストから走らせると
+//  ユーザーの本物の台帳を書き換えてしまう (CLAUDE.md の「実 `~/.zaivern` に
+//  触れない」)。そこで `gate` が使う判断 (`touched_of` → `decide_spans` /
+//  `owns_touched` → `try_claim`) を**同じ順序で**直接呼んで固定する。
+//  `gate` 自身の素通し経路は `tests` 側の既存テストが押さえている。
+// ═══════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+    use crate::region::{Span, SAFE_BAND};
+    use crate::test_util::unique_temp_dir;
+
+    fn dead(_: u32) -> bool {
+        false
+    }
+
+    fn who(agent: &str) -> Holder {
+        Holder {
+            agent: agent.to_string(),
+            session: format!("s-{agent}"),
+            cwd: String::new(),
+            pid: 0,
+        }
+    }
+
+    // ── 1. 台帳のスキーマは変えずに行域を載せる ─────────────────────
+
+    /// **古い台帳 (`#L` を含まない) はファイル全体の域として読める。**
+    /// 版を上げていないので、これが壊れると既存ユーザーの台帳が全部死ぬ。
+    #[test]
+    fn 古い台帳は全体の域として読める() {
+        let dir = unique_temp_dir("zaivern", "lease-span-old");
+        let store = dir.join("s.json");
+        // 行域が入る前の版が書いた形をそのまま置く
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            &store,
+            r#"{"leases":[{"holder":{"agent":"A","session":"s-A","cwd":"","pid":0},
+                 "patterns":["src/**","README.md"],"acquired_at":1,"expires_at":9999,"note":""}]}"#,
+        )
+        .expect("write");
+        let st = read_store(&store).expect("読める");
+        let l = &st.leases[0];
+        assert_eq!(l.owned_spans("src/a.rs"), None, "行域なし = ファイル全体");
+        assert!(l.covers_path("src/a.rs"));
+        assert!(l.touches("src/a.rs", &[Span { start: 1, end: 2 }]));
+        // 他人はどの行でも止まる
+        assert!(matches!(
+            decide_spans(&st, &who("B"), "src/a.rs", &[Span::line(500)], 100, &dead),
+            Verdict::Deny(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 行域つきの確保は**そのままの書式**で台帳へ載り、読み戻せる。
+    #[test]
+    fn 行域は台帳へそのまま載って読み戻せる() {
+        let dir = unique_temp_dir("zaivern", "lease-span-io");
+        let store = dir.join("s.json");
+        enable(&store).expect("有効化");
+        let got = with_store(&store, |s| {
+            try_claim(
+                s,
+                &who("A"),
+                &["src/a.rs#L10-40".into(), "src/b.rs".into()],
+                5,
+                600,
+                &dead,
+            )
+        })
+        .expect("確保");
+        assert_eq!(got, Claim::Granted(2));
+        let back = read_store(&store).expect("読める");
+        assert_eq!(
+            back.leases[0].patterns,
+            vec![
+                normalize_path("src/a.rs") + "#L10-40",
+                normalize_path("src/b.rs")
+            ],
+            "書式が往復で変わっている"
+        );
+        assert_eq!(
+            back.leases[0].owned_spans(&normalize_path("src/a.rs")),
+            Some(vec![Span { start: 10, end: 40 }])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 大小を畳む OS でも `#L` の表記は 1 つに保たれる (`#l` にならない)。
+    #[test]
+    fn 正規化しても行域の表記は一つに保たれる() {
+        for raw in ["SRC/A.rs#L10-40", "src\\a.rs#l10-40", " src/a.rs#L10+31 "] {
+            let out = normalize_spec(raw);
+            assert!(out.ends_with("#L10-40"), "{raw:?} → {out:?}");
+            assert_eq!(spec_span(&out), Some(Span { start: 10, end: 40 }));
+            assert_eq!(normalize_spec(&out), out, "冪等でない: {out:?}");
+        }
+        // 末尾まで / 1 行だけ も往復する
+        assert_eq!(normalize_spec("a.rs#L7-"), "a.rs#L7-");
+        assert_eq!(normalize_spec("a.rs#L7"), "a.rs#L7");
+        // 行域が読めない `#` はパスの一部 (壊さない)
+        assert_eq!(normalize_spec("a#b.rs"), normalize_path("a#b.rs"));
+    }
+
+    // ── 2. covers / covers_span ────────────────────────────────────
+
+    #[test]
+    fn 行番号まで見る版と見ない版の表() {
+        // (パターン, パス, 触れた行, covers, covers_span)
+        let t = &[
+            (
+                "src/a.rs#L10-40",
+                "src/a.rs",
+                vec![Span::line(20)],
+                true,
+                true,
+            ),
+            (
+                "src/a.rs#L10-40",
+                "src/a.rs",
+                vec![Span::line(100)],
+                true,
+                false,
+            ),
+            // 安全帯 (3 行) の内側は「関わる」— git が 1 ハンクに畳むため
+            (
+                "src/a.rs#L10-40",
+                "src/a.rs",
+                vec![Span::line(42)],
+                true,
+                true,
+            ),
+            (
+                "src/a.rs#L10-40",
+                "src/a.rs",
+                vec![Span::line(44)],
+                true,
+                false,
+            ),
+            (
+                "src/a.rs#L10-40",
+                "src/b.rs",
+                vec![Span::line(20)],
+                false,
+                false,
+            ),
+            // 行域なし = どの行でも自分の領分
+            ("src/a.rs", "src/a.rs", vec![Span::line(999)], true, true),
+            ("src/**", "src/a.rs", vec![Span::line(999)], true, true),
+            // 触れた行が判らない = 安全側
+            ("src/a.rs#L10-40", "src/a.rs", vec![], true, true),
+            // 末尾までの域は後ろ全部
+            (
+                "src/a.rs#L10-",
+                "src/a.rs",
+                vec![Span::line(9999)],
+                true,
+                true,
+            ),
+        ];
+        for (pat, path, touched, want_c, want_s) in t {
+            assert_eq!(covers(pat, path), *want_c, "covers({pat:?}, {path:?})");
+            assert_eq!(
+                covers_span(pat, path, touched),
+                *want_s,
+                "covers_span({pat:?}, {path:?}, {touched:?})"
+            );
+        }
+    }
+
+    /// **行域を無視して「ファイルごと自分のもの」と誤判定しない。**
+    ///
+    /// `covers` は行番号を知らない呼び出し元のために `true` を返す
+    /// (安全側 = 止める向き) が、`owns_touched` は持っていない行を
+    /// 「持っている」とは言わない。ここが逆を向くと、10 行だけ確保した
+    /// エージェントがファイル全体を書けてしまう。
+    #[test]
+    fn 行域しか持っていない者はファイル全体を持っていない() {
+        let mut s = Store::default();
+        let a = who("A");
+        try_claim(&mut s, &a, &["src/a.rs#L1-5".into()], 100, 600, &dead);
+        assert!(
+            owns_touched(&s, &a, "src/a.rs", Some(&[Span::line(3)]), 100, &dead),
+            "自分の域は自分のもの"
+        );
+        assert!(
+            !owns_touched(&s, &a, "src/a.rs", Some(&[Span::line(500)]), 100, &dead),
+            "持っていない行を自分のものと言っている"
+        );
+        assert!(
+            !owns_touched(&s, &a, "src/a.rs", None, 100, &dead),
+            "行域が判らない (= 全体) のに通してしまっている"
+        );
+        // ファイル全体を持っていれば、行域が判らなくても自分のもの
+        let mut s2 = Store::default();
+        try_claim(&mut s2, &a, &["src/a.rs".into()], 100, 600, &dead);
+        assert!(owns_touched(&s2, &a, "src/a.rs", None, 100, &dead));
+    }
+
+    // ── 3. 確保 — 同じファイルでも違う行なら 2 人が持てる ──────────
+
+    #[test]
+    fn 同じファイルでも安全帯ぶん離れていれば二人が持てる() {
+        let mut s = Store::default();
+        let (a, b) = (who("A"), who("B"));
+        assert_eq!(
+            try_claim(&mut s, &a, &["src/a.rs#L1-20".into()], 100, 600, &dead),
+            Claim::Granted(1)
+        );
+        assert_eq!(
+            try_claim(&mut s, &b, &["src/a.rs#L40-60".into()], 100, 600, &dead),
+            Claim::Granted(1),
+            "離れた行域が取れていない = 並列度がファイル数で頭打ちになる"
+        );
+        assert_eq!(s.leases.len(), 2);
+        // 互いの域には入れない
+        assert!(matches!(
+            decide_spans(&s, &b, "src/a.rs", &[Span::line(10)], 100, &dead),
+            Verdict::Deny(_)
+        ));
+        assert_eq!(
+            decide_spans(&s, &b, "src/a.rs", &[Span::line(50)], 100, &dead),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn 安全帯より近い行域は片方しか取れない() {
+        let mut s = Store::default();
+        let (a, b) = (who("A"), who("B"));
+        try_claim(&mut s, &a, &["src/a.rs#L1-20".into()], 100, 600, &dead);
+        // 21 行目は間に 0 行しか無い → git が 1 ハンクに畳む
+        let got = try_claim(&mut s, &b, &["src/a.rs#L21-30".into()], 100, 600, &dead);
+        assert!(matches!(got, Claim::Refused { .. }), "{got:?}");
+        // 全体を持とうとしても取れない
+        assert!(matches!(
+            try_claim(&mut s, &b, &["src/a.rs".into()], 100, 600, &dead),
+            Claim::Refused { .. }
+        ));
+        // 安全帯ちょうど (間に 3 行) なら取れる
+        assert_eq!(
+            try_claim(&mut s, &b, &["src/a.rs#L24-30".into()], 100, 600, &dead),
+            Claim::Granted(1)
+        );
+        assert_eq!(SAFE_BAND, 3, "安全帯を変えたらこの表も測り直すこと");
+    }
+
+    /// 一部でも重なれば 1 つも取らない — **行域でも全か無かを壊さない**。
+    #[test]
+    fn 行域でも一部が重なれば一つも取らない() {
+        let mut s = Store::default();
+        let (a, b) = (who("A"), who("B"));
+        try_claim(&mut s, &a, &["src/a.rs#L1-20".into()], 100, 600, &dead);
+        let got = try_claim(
+            &mut s,
+            &b,
+            &["src/b.rs#L1-20".into(), "src/a.rs#L5-9".into()],
+            100,
+            600,
+            &dead,
+        );
+        assert!(matches!(got, Claim::Refused { .. }), "{got:?}");
+        assert!(
+            s.leases.iter().all(|l| !l.holder.same(&b)),
+            "部分的に取れてしまっている: {s:?}"
+        );
+    }
+
+    /// 近接した行域は畳まれる = 台帳が書き込みのたびに伸びない。
+    #[test]
+    fn 近接した行域は畳まれて台帳が伸びない() {
+        let mut s = Store::default();
+        let a = who("A");
+        for start in [1u32, 5, 9, 13] {
+            try_claim(
+                &mut s,
+                &a,
+                &[format!("src/a.rs#L{start}-{}", start + 2)],
+                100,
+                600,
+                &dead,
+            );
+        }
+        assert_eq!(
+            s.leases[0].patterns,
+            vec!["src/a.rs#L1-15"],
+            "隣り合う域が畳まれていない"
+        );
+        // 離れた域は別のまま
+        try_claim(&mut s, &a, &["src/a.rs#L100-110".into()], 100, 600, &dead);
+        assert_eq!(
+            s.leases[0].patterns,
+            vec!["src/a.rs#L1-15", "src/a.rs#L100-110"]
+        );
+        // 間を埋める域が来たら 1 本になる
+        try_claim(&mut s, &a, &["src/a.rs#L16-99".into()], 100, 600, &dead);
+        assert_eq!(s.leases[0].patterns, vec!["src/a.rs#L1-110"]);
+        // ファイル全体を取ったら行域は畳まれて消える
+        try_claim(&mut s, &a, &["src/a.rs".into()], 100, 600, &dead);
+        assert_eq!(s.leases[0].patterns, vec!["src/a.rs"]);
+        // 既に全体を持っているなら行域を足しても増えない
+        assert_eq!(
+            try_claim(&mut s, &a, &["src/a.rs#L3-4".into()], 100, 600, &dead),
+            Claim::Granted(0)
+        );
+        assert_eq!(s.leases[0].patterns, vec!["src/a.rs"]);
+    }
+
+    /// ファイルを解放したら、その行域リースも一緒に落ちる。
+    #[test]
+    fn ファイルを解放すると行域も落ちる() {
+        let dir = unique_temp_dir("zaivern", "lease-span-rel");
+        let store = dir.join("s.json");
+        enable(&store).expect("有効化");
+        let a = who("A");
+        with_store(&store, |s| {
+            try_claim(
+                s,
+                &a,
+                &[
+                    "src/a.rs#L1-5".into(),
+                    "src/a.rs#L100-110".into(),
+                    "src/b.rs".into(),
+                ],
+                5,
+                600,
+                &dead,
+            )
+        })
+        .expect("確保");
+        release_one(&store, &a, &normalize_path("src/a.rs")).expect("解放");
+        assert_eq!(
+            read_store(&store).expect("読める").leases[0].patterns,
+            vec![normalize_path("src/b.rs")],
+            "ファイルを手放したのに行域が残っている"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 3b. 後退の回帰テスト (実リポジトリで再現された欠陥) ──────────
+    //
+    //  出荷済み 0.13.0 では **`#L` を付けた瞬間に保護が消えていた**。
+    //  `normalize_path` が仕様文字列を丸ごと畳むので `a.rs#L1-10` が
+    //  `a.rs#l1-10` という**別のパス**として台帳へ並び、重なり判定に
+    //  一度も掛からなかった。新機能の欠落ではなく**既存の保証の後退**なので、
+    //  不変条件を表にして固定する。
+
+    /// **行域を指定しても保護は消えない。** (実測で再現された後退の回帰)
+    #[test]
+    fn 行域を指定しても保護は消えない() {
+        // (先に取る側, 後から取る側, 後から取れてよいか)
+        let table: &[(&str, &str, bool)] = &[
+            // 1. ファイル全体の保持者が居たら、あらゆる行域は拒否される
+            ("a.rs", "a.rs#L1-10", false),
+            ("a.rs", "a.rs#L500-600", false),
+            ("a.rs", "a.rs#L1-", false),
+            ("a.rs", "a.rs#L7", false),
+            // 2. 逆向き — 行域の保持者が居たら、ファイル全体は拒否される
+            ("a.rs#L1-10", "a.rs", false),
+            // 3. 行域どうしは安全帯を挟んで離れているときだけ両方通る
+            ("a.rs#L1-10", "a.rs#L5-15", false),  // 重なっている
+            ("a.rs#L1-10", "a.rs#L11-20", false), // 隣接 (間 0 行)
+            ("a.rs#L1-10", "a.rs#L13-20", false), // 間 2 行 < 安全帯 3
+            ("a.rs#L1-10", "a.rs#L14-20", true),  // 間 3 行 = 安全帯
+            ("a.rs#L14-20", "a.rs#L1-10", true),  // 順序を変えても同じ
+            // 4. 別ファイルは行域があってもいつでも通る
+            ("a.rs#L1-10", "b.rs#L1-10", true),
+            ("a.rs", "b.rs#L1-10", true),
+            // 5. glob は行域があっても安全側 (= 衝突扱い)
+            ("src/**", "src/a.rs#L1-10", false),
+            ("src/a.rs#L1-10", "src/**", false),
+        ];
+        for (first, second, want_ok) in table {
+            let mut s = Store::default();
+            let (a, b) = (who("A"), who("B"));
+            assert_eq!(
+                try_claim(&mut s, &a, &[(*first).into()], 100, 600, &dead),
+                Claim::Granted(1),
+                "先に取る側が取れていない: {first:?}"
+            );
+            let got = try_claim(&mut s, &b, &[(*second).into()], 100, 600, &dead);
+            let ok = matches!(got, Claim::Granted(_));
+            assert_eq!(
+                ok, *want_ok,
+                "{first:?} を持つ人が居るとき {second:?} → {got:?}"
+            );
+            // `overlaps` は対称でなければならない (確保の順で答えが変わらない)
+            assert_eq!(
+                overlaps(&normalize_spec(first), &normalize_spec(second)),
+                overlaps(&normalize_spec(second), &normalize_spec(first)),
+                "重なり判定が対称でない: {first:?} / {second:?}"
+            );
+        }
+    }
+
+    /// **正規化は `#L` の手前だけに掛かる。** ここが今回の後退の原因。
+    ///
+    /// フラグメントまで畳むと `a.rs#L1-10` が `a.rs#l1-10` になり、
+    /// パスとして別物になって判定が外れる。
+    #[test]
+    fn 正規化は行域の手前だけに掛かる() {
+        for (win_sep, fold) in [(true, true), (true, false), (false, false)] {
+            // パス部分だけが規則を受け、フラグメントは `#L…` のまま
+            let path = normalize_path_on("SRC\\A.rs", win_sep, fold);
+            let spec = normalize_spec_on("SRC\\A.rs#L10-40", win_sep, fold);
+            assert_eq!(
+                spec,
+                format!("{path}#L10-40"),
+                "win_sep={win_sep} fold={fold}"
+            );
+            // 小文字の `l` で来ても表記は `#L` に揃う
+            assert_eq!(
+                normalize_spec_on("SRC\\A.rs#l10-40", win_sep, fold),
+                format!("{path}#L10-40")
+            );
+            // そして**同じファイルとして**重なりが検出される
+            assert!(
+                overlaps(&path, &spec),
+                "全体と行域が重ならないと判定された: {path:?} / {spec:?}"
+            );
+        }
+    }
+
+    /// 断る代わりに「ずらす」提案を返す (交渉層が呼ぶ純関数)。
+    #[test]
+    fn 通らない行域には近くの空きを提案する() {
+        let mut s = Store::default();
+        try_claim(&mut s, &who("A"), &["a.rs#L10-20".into()], 100, 600, &dead);
+        let want = crate::region::parse("a.rs#L15-19").expect("parse");
+        let got = suggest_alternative(&s, &want).expect("提案が無い");
+        // 長さは変えない (5 行欲しいなら 5 行を返す)
+        assert_eq!(got.span.expect("span").len(), 5);
+        // 提案された場所は本当に空いている
+        assert!(!crate::region::conflicts(
+            &got,
+            &crate::region::parse("a.rs#L10-20").expect("parse"),
+            SAFE_BAND
+        ));
+        // A の直後がいちばん近い (24 行目から)
+        assert_eq!(crate::region::render(&got), "a.rs#L24-28");
+
+        // 決定的: 何度呼んでも同じ
+        for _ in 0..8 {
+            assert_eq!(suggest_alternative(&s, &want), Some(got.clone()));
+        }
+        // 空いているならずらす必要が無い
+        assert_eq!(
+            suggest_alternative(&s, &crate::region::parse("a.rs#L100-104").expect("parse")),
+            None
+        );
+        // 手前が空いていて近ければそちらを選ぶ
+        let mut s2 = Store::default();
+        try_claim(&mut s2, &who("A"), &["a.rs#L50-60".into()], 100, 600, &dead);
+        let near_front = crate::region::parse("a.rs#L48-52").expect("parse");
+        let got2 = suggest_alternative(&s2, &near_front).expect("提案が無い");
+        assert_eq!(crate::region::render(&got2), "a.rs#L42-46");
+        // ずらしようが無いものは正直に None
+        for spec in ["a.rs", "a.rs#L5-", "src/*.rs#L1-5"] {
+            let mut s3 = Store::default();
+            try_claim(&mut s3, &who("A"), &["a.rs".into()], 100, 600, &dead);
+            assert_eq!(
+                suggest_alternative(&s3, &crate::region::parse(spec).expect("parse")),
+                None,
+                "{spec:?}"
+            );
+        }
+    }
+
+    // ── 4. 関門 — 書き込み後の中身から触れた行域を出す ──────────────
+
+    #[test]
+    fn 書き込み後の中身をペイロードから作れる() {
+        let old = "1\n2\n3\n4\n5\n";
+        // Write = 全文置換
+        let w = serde_json::json!({ "content": "x\ny\n" });
+        assert_eq!(applied_text(old, &w).as_deref(), Some("x\ny\n"));
+        // Edit = 1 回置換
+        let e = serde_json::json!({ "old_string": "3", "new_string": "three" });
+        assert_eq!(
+            applied_text(old, &e).as_deref(),
+            Some("1\n2\nthree\n4\n5\n")
+        );
+        // MultiEdit = 連続適用
+        let m = serde_json::json!({ "edits": [
+            { "old_string": "1", "new_string": "one" },
+            { "old_string": "5", "new_string": "five" },
+        ]});
+        assert_eq!(
+            applied_text(old, &m).as_deref(),
+            Some("one\n2\n3\n4\nfive\n")
+        );
+        // replace_all
+        let r =
+            serde_json::json!({ "old_string": "\n", "new_string": "\n\n", "replace_all": true });
+        assert_eq!(applied_text("a\nb\n", &r).as_deref(), Some("a\n\nb\n\n"));
+        // 当たらない置換は **推測しない**
+        assert_eq!(
+            applied_text(
+                old,
+                &serde_json::json!({ "old_string": "そんな行は無い", "new_string": "x" })
+            ),
+            None
+        );
+        // 形が判らない (Bash など) = 判らないと言う
+        assert_eq!(
+            applied_text(old, &serde_json::json!({ "command": "sed -i s/a/b/ f" })),
+            None
+        );
+    }
+
+    /// 触れた行域は、実ファイルとペイロードから出る。
+    /// **読めない / 大きすぎる / 形が判らない ものは `None` = ファイル全体扱い。**
+    #[test]
+    fn 触れた行域を出せないものはファイル全体として扱う() {
+        let dir = unique_temp_dir("zaivern", "lease-span-touch");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("a.rs");
+        let body: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&f, &body).expect("write");
+
+        // 100 行目だけを書き換える → 触れた域は 100 行目の周り
+        let e = serde_json::json!({ "old_string": "line 100", "new_string": "line 100 変更" });
+        let got = touched_of(&e, &f).expect("行域が出る");
+        assert_eq!(got, vec![Span::line(100)], "{got:?}");
+
+        // 無いファイル = 前の中身が無い → 判らない
+        assert_eq!(touched_of(&e, &dir.join("そんなファイルは無い.rs")), None);
+        // シェル経由 (中身が判らない) → 判らない
+        assert_eq!(
+            touched_of(
+                &serde_json::json!({ "command": "sed -i '' s/a/b/ a.rs" }),
+                &f
+            ),
+            None
+        );
+        // 上限より大きいファイル → 読まない
+        let big = dir.join("big.rs");
+        std::fs::write(&big, vec![b'x'; (GATE_READ_CAP + 1) as usize]).expect("write");
+        assert_eq!(
+            touched_of(&serde_json::json!({ "content": "y" }), &big),
+            None
+        );
+
+        // **全文置換で中身が大きく変わるなら、触れた域が広くなるのが正しい。**
+        // 200 行を 2 行にすると「書いた後」の座標では 1〜2 行目しか動かないが、
+        // 消えた 3〜200 行目こそ他人の領分。両方向を見ないとここが素通りする。
+        let w = serde_json::json!({ "content": "まるごと\n別の中身\n" });
+        let wide = touched_of(&w, &f).expect("行域が出る");
+        assert_eq!(wide, vec![Span { start: 1, end: 200 }], "{wide:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **関門の一連**: 触れた行域 → 他人と衝突するか → 自分の域に収まるか。
+    /// `gate` がロックの内外で使う判断そのもの。
+    #[test]
+    fn 関門は触れた行域だけで通し止めする() {
+        let dir = unique_temp_dir("zaivern", "lease-span-gate");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("a.rs");
+        let body: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&f, &body).expect("write");
+        let rel = "a.rs";
+
+        let mut st = Store::default();
+        let (a, b) = (who("A"), who("B"));
+        // A が 100 行目付近を確保している
+        try_claim(&mut st, &a, &["a.rs#L95-105".into()], 100, 600, &dead);
+
+        // B が 100 行目を書こうとする → 止まる
+        let hit = serde_json::json!({ "old_string": "line 100", "new_string": "変更" });
+        let t = touched_of(&hit, &f).expect("行域");
+        let Verdict::Deny(reason) = decide_spans(&st, &b, rel, &t, 100, &dead) else {
+            panic!("他人の行域への書き込みを通してしまった");
+        };
+        assert!(
+            reason.contains("a.rs#L100"),
+            "どこで止まったかが無い: {reason}"
+        );
+        assert!(reason.contains('A'), "誰が持っているかが無い: {reason}");
+        // **断るだけで終わらせない** — ずらせる先が文面に出る
+        assert!(
+            reason.contains("ずらす") && reason.contains("a.rs#L"),
+            "ずらす提案が出ていない: {reason}"
+        );
+
+        // B が 10 行目を書く → 通り、その域だけを自分のものにする
+        let far = serde_json::json!({ "old_string": "line 10\n", "new_string": "変更\n" });
+        let t2 = touched_of(&far, &f).expect("行域");
+        assert_eq!(t2, vec![Span::line(10)]);
+        assert_eq!(decide_spans(&st, &b, rel, &t2, 100, &dead), Verdict::Allow);
+        assert!(!owns_touched(&st, &b, rel, Some(&t2), 100, &dead));
+        let want: Vec<String> = t2
+            .iter()
+            .map(|s| format!("{rel}#L{}-{}", s.start, s.end))
+            .collect();
+        assert_eq!(
+            try_claim(&mut st, &b, &want, 100, 600, &dead),
+            Claim::Granted(1)
+        );
+        assert!(owns_touched(&st, &b, rel, Some(&t2), 100, &dead));
+        // 続けて同じ域を書くならロックすら要らない
+        assert!(owns_touched(
+            &st,
+            &b,
+            rel,
+            Some(&[Span::line(10)]),
+            100,
+            &dead
+        ));
+
+        // 全文置換は触れた域が広い → A の域へ掛かるので止まる
+        let whole = serde_json::json!({ "content": "全部\n入れ替える\n" });
+        let t3 = touched_of(&whole, &f).expect("行域");
+        assert!(matches!(
+            decide_spans(&st, &b, rel, &t3, 100, &dead),
+            Verdict::Deny(_)
+        ));
+        // 行域を決められない書き込み (シェル経由) も同じく止まる
+        assert!(matches!(
+            decide_spans(&st, &b, rel, &[], 100, &dead),
+            Verdict::Deny(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 5. 分割・重なり検出 ────────────────────────────────────────
+
+    #[test]
+    fn 分割案は同じファイルの離れた行域を両方に残す() {
+        let list = parse_assignments("A: src/a.rs#L1-20\nB: src/a.rs#L40-60\nC: src/a.rs#L21-30\n");
+        assert_eq!(list.len(), 3);
+        let ovs = plan_overlaps(&list);
+        // A↔B は離れている / A↔C は近すぎる
+        assert_eq!(ovs.len(), 1, "{ovs:?}");
+        assert_eq!((ovs[0].a, ovs[0].b), (0, 2));
+
+        let (split, serial) = split_plan(&list);
+        assert_eq!(split[0].patterns, vec!["src/a.rs#L1-20"]);
+        assert_eq!(
+            split[1].patterns,
+            vec!["src/a.rs#L40-60"],
+            "離れた行域まで外している = 並列度が上がらない"
+        );
+        assert!(split[2].patterns.is_empty());
+        assert_eq!(serial, vec!["src/a.rs#L21-30"]);
+
+        // 決定性: 同じ入力なら何度でも同じ答え
+        for _ in 0..8 {
+            assert_eq!(split_plan(&list), (split.clone(), serial.clone()));
+        }
+    }
+
+    // ── 6. 混雑 (busy-deny) ────────────────────────────────────────
+
+    /// **64 体が同時に同じものを確保しに行っても `busy` は出ず、勝者は 1 つ。**
+    ///
+    /// `docs/conflict-zero.md` が「32 体以上で busy-deny が増える」と記録した
+    /// 欠陥の回帰テスト。原因は混雑ではなく**待ち方** ([`LOCK_SPIN_ROUNDS`])。
+    #[test]
+    fn 六十四体が同時に確保してもbusyは出ず勝者は一つ() {
+        let dir = unique_temp_dir("zaivern", "lease-busy64");
+        let store = dir.join("s.json");
+        enable(&store).expect("有効化");
+        let n = 64usize;
+        let start = std::time::Instant::now();
+        let mut hs = Vec::with_capacity(n);
+        for i in 0..n {
+            let store = store.clone();
+            hs.push(std::thread::spawn(move || {
+                with_store(&store, |s| {
+                    try_claim(
+                        s,
+                        &who(&format!("A{i}")),
+                        &["shared.rs".into()],
+                        100,
+                        600,
+                        &dead,
+                    )
+                })
+            }));
+        }
+        let (mut granted, mut refused, mut busy, mut broken) = (0, 0, 0, 0);
+        for h in hs {
+            match h.join().expect("スレッド") {
+                Ok(Claim::Granted(_)) => granted += 1,
+                Ok(Claim::Refused { .. }) => refused += 1,
+                Err(e) if is_lock_busy(&e) => busy += 1,
+                Err(_) => broken += 1,
+            }
+        }
+        let ms = start.elapsed().as_millis();
+        assert_eq!(
+            busy, 0,
+            "混雑して判定できなかった (busy-deny) が {busy} 件 / {ms}ms"
+        );
+        assert_eq!(broken, 0, "台帳が壊れた");
+        assert_eq!(
+            granted, 1,
+            "勝者が 1 つでない: 取れた {granted} / 断られた {refused}"
+        );
+        assert_eq!(refused, n - 1);
+        assert_eq!(read_store(&store).expect("読める").leases.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **64 体が同じファイルの違う行を同時に取りに行ったら、全員取れる。**
+    /// ファイル単位のままなら 1 人しか取れなかった場面。
+    ///
+    /// ## ここだけ `with_store_retry` を使う理由 (実測)
+    /// 上の同じもの争いは **63 人が断られる = 台帳が変わらない**ので、
+    /// `with_store` が書き込みを省いて臨界区間が読み取りだけになる。
+    /// こちらは 64 人**全員が台帳へ書く**ので臨界区間が数倍長く、
+    /// 素の `with_store` (1 回だけ試す) では **64 中 21 件が `busy`** になった。
+    /// 本番の入口 (`gate` / `claim_for` / `release_one`) はどれも
+    /// [`with_store_retry`] を通るので、テストもそこを通す。
+    #[test]
+    fn 六十四体が同じファイルの違う行を同時に取れる() {
+        let dir = unique_temp_dir("zaivern", "lease-busy64-span");
+        let store = dir.join("s.json");
+        enable(&store).expect("有効化");
+        let n = 64usize;
+        let mut hs = Vec::with_capacity(n);
+        for i in 0..n {
+            let store = store.clone();
+            hs.push(std::thread::spawn(move || {
+                // 間を 5 行空ける (安全帯 3 行より広い)
+                let s = i as u32 * 10 + 1;
+                let pat = format!("shared.rs#L{s}-{}", s + 4);
+                with_store_retry(&store, |st| {
+                    try_claim(st, &who(&format!("A{i}")), &[pat.clone()], 100, 600, &dead)
+                })
+            }));
+        }
+        let (mut granted, mut refused, mut busy) = (0, 0, 0);
+        for h in hs {
+            match h.join().expect("スレッド") {
+                Ok(Claim::Granted(_)) => granted += 1,
+                Ok(Claim::Refused { .. }) => refused += 1,
+                Err(e) if is_lock_busy(&e) => busy += 1,
+                Err(e) => panic!("台帳が壊れた: {e}"),
+            }
+        }
+        assert_eq!(busy, 0, "混雑して判定できなかった (busy-deny) が {busy} 件");
+        assert_eq!(
+            granted, n,
+            "同じファイルの離れた行を同時に持てていない: 取れた {granted} / 断られた {refused}"
+        );
+        let st = read_store(&store).expect("読める");
+        assert_eq!(st.leases.len(), n);
+        // **不変条件**: どの 2 人の担当も重ならない
+        let regions: Vec<crate::region::Region> = st
+            .leases
+            .iter()
+            .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+            .collect();
+        assert!(
+            crate::region::is_disjoint(&regions, SAFE_BAND),
+            "重なった担当が台帳に載った: {:?}",
+            crate::region::conflicting_pairs(&regions, SAFE_BAND)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
