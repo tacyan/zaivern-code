@@ -25,8 +25,9 @@
 #             ベースラインと同じ書き込みを別のドライバでマージし直す
 #             (`--union-driver` で任意のドライバを指せる。既定は
 #              `zai merge-driver` があればそれ。無ければ skip)
-#   train     ③ 統合の順序付け。`zai train` があれば乾式検査を回し、
-#             「この順序なら衝突する」を実行前に出せるかを見る。無ければ skip
+#   train     ③ 統合の順序付け。`zai train plan` が出した順序と**作成順 (素朴)** の
+#             両方で同じ枝をマージし、衝突数を並べる。片方だけでは「効いた」と
+#             言えない。併せて乾式検査の的中率も出す。無ければ skip
 #
 # ## 使い方
 #
@@ -216,11 +217,23 @@ has_sub() {
 }
 
 # 段②の機構を決める。**新しい名前を優先し、無ければ出荷済みの経路へ落ちる。**
+# **`zai guard` はここでは使わない。**`zai guard` は commit の瞬間に git フックとして
+# 走る仕組み (`guard check --staged`) で、**1 回の書き込みを止める門ではない**。
+# この段が測るのは「書く直前に止まるか」なので、経路は `zai hook` (リース) 一択。
+# 名前が近いだけで別物を当てると、**止めていないのに緑に見える**
+# (実際に `guard check --stdin` を撃って 48 回中 0 件しか止まらず、
+#  それでも「guard 段 実行」と表示された。判定が拾ったので嘘にはならなかったが、
+#  拾わなければ静かな嘘になっていた)。
 guard_mech=none
-if has_sub guard; then
-    guard_mech=guard
-elif has_sub hook && has_sub lease; then
+if has_sub hook && has_sub lease; then
     guard_mech=hook
+fi
+
+# 段③。統合の順序付け。**ヘルプに載っている時だけ**撃つ (知らないサブコマンドを
+# 投げると古い zai は GUI 起動として扱う)。
+train_mech=none
+if has_sub train; then
+    train_mech=train
 fi
 
 # 段④。`--union-driver` が明示されていればそれが最優先 (配管の検算に使う)。
@@ -530,6 +543,9 @@ def merge_all(intdir, branches, driver=None):
         "conflict_files_unique": [],
         "hunks": 0,
         "lines": 0,
+        # **ブランチごとの実測**。乾式検査 (`zai train`) が「この段で衝突する」と
+        # 言い当てられたかを後で突き合わせるのに要る。集計値だけでは的中を測れない。
+        "per_branch": [],
     }
     uniq = set()
     pre = union_config(driver) if driver else []
@@ -540,6 +556,7 @@ def merge_all(intdir, branches, driver=None):
             check=False,
         )
         if p.returncode == 0:
+            st["per_branch"].append({"branch": b, "conflicts": []})
             continue
         files = git(["diff", "--name-only", "--diff-filter=U"], intdir).stdout.split()
         if not files:
@@ -548,6 +565,7 @@ def merge_all(intdir, branches, driver=None):
             )
         st["conflict_merges"] += 1
         st["conflict_files"] += len(files)
+        st["per_branch"].append({"branch": b, "conflicts": sorted(files)})
         for f in files:
             uniq.add(f)
             h, c = resolve_union(os.path.join(intdir, f))
@@ -568,8 +586,12 @@ def attrs_path(intdir):
 # ═════════════════════════════════════════════════════════════════════
 
 
-def run_stage(name, repo, work, base, plan, gate_cmd=None, driver=None):
-    t_all = time.perf_counter()
+def write_phase(name, repo, work, base, plan, gate_cmd=None):
+    """N 本の worktree を切り、書き手を**並列で**走らせ、コミットまでやる。
+
+    返りは `(branches, dirs, writers, t_edit_ms)`。**作成順 = `branches` の順**で、
+    これがそのまま「素朴な統合順」の対照になる。
+    """
     branches, dirs = [], []
     for i in range(len(plan)):
         br = "%s-w-%d" % (name, i + 1)
@@ -593,6 +615,12 @@ def run_stage(name, repo, work, base, plan, gate_cmd=None, driver=None):
         if git(["status", "--porcelain"], wt).stdout.strip():
             git(["add", "-A"], wt)
             git(["commit", "-q", "-m", "writer-%d の作業" % (i + 1)], wt)
+    return branches, dirs, ws, t_edit
+
+
+def run_stage(name, repo, work, base, plan, gate_cmd=None, driver=None):
+    t_all = time.perf_counter()
+    branches, dirs, ws, t_edit = write_phase(name, repo, work, base, plan, gate_cmd)
 
     intdir = os.path.join(work, name, "integration")
     git(["worktree", "add", "-q", "-b", "%s-integration" % name, intdir, base], repo)
@@ -633,6 +661,164 @@ def run_stage(name, repo, work, base, plan, gate_cmd=None, driver=None):
         wall_total_ms=(time.perf_counter() - t_all) * 1000.0,
         **st
     )
+
+
+def clean_prefix(per_branch):
+    """**最初の衝突に当たるまでに、自動で入った本数。**
+
+    順序付けが減らせるとすればここで、衝突の総量ではない。
+    「人手が要るまでに何本が黙って入るか」がそのまま人の割り込み回数になる。
+    """
+    k = 0
+    for x in per_branch:
+        if x["conflicts"]:
+            break
+        k += 1
+    return k
+
+
+def merge_into(repo, work, label, base, branches):
+    """使い捨ての統合 worktree を作り、与えられた**順序で**直列マージする。"""
+    intdir = os.path.join(work, "train", label)
+    git(["worktree", "add", "-q", "-b", "train-int-%s" % label, intdir, base], repo)
+    t0 = time.perf_counter()
+    st = merge_all(intdir, branches)
+    st["wall_merge_ms"] = (time.perf_counter() - t0) * 1000.0
+    return st
+
+
+def train_stage_dict(label, mech, plan, ws, st, t_edit, t_all):
+    dup_files, dup_writes = duplicates([w.written for w in ws])
+    d = dict(
+        stage=label,
+        status="ok",
+        mech=mech,
+        planned=sum(len(x) for x in plan),
+        applied=sum(w.applied for w in ws),
+        denied=0,
+        dup_files=dup_files,
+        dup_writes=dup_writes,
+        gate_calls=0,
+        gate_p50=0.0,
+        gate_p95=0.0,
+        gate_max=0.0,
+        wall_edit_ms=t_edit,
+        wall_total_ms=(time.perf_counter() - t_all) * 1000.0,
+    )
+    d.update(st)
+    return d
+
+
+def run_train_stage(zai, work, files, plan, onto):
+    """③ 統合の順序付け。**専用リポジトリで測る。**
+
+    `zai train plan` は「`--onto` より進んでいるブランチ」を**自分で探す**ので、
+    baseline / guard / union の枝が同じリポジトリに居ると全部拾ってしまい、
+    順序の効果を測れなくなる。この段だけ別リポジトリを立てるのはそのため。
+
+    測るのは 2 つ:
+      1. **同じ N 本を、train が出した順序と作成順 (素朴) の両方でマージした
+         ときの衝突数。**片方だけ出すと「順序付けが効いた」とは言えない。
+      2. **乾式検査 (`plan --json` の `dry`) が、実行前にどこまで言い当てたか。**
+    """
+    repo = os.path.join(work, "train", "repo")
+    os.makedirs(repo, exist_ok=True)
+    base = setup_repo(repo, files)
+    t_all = time.perf_counter()
+    branches, dirs, ws, t_edit = write_phase("train", repo, work, base, plan, None)
+
+    def plan_json():
+        pr = subprocess.run(
+            [zai, "train", "plan", "--repo", repo, "--onto", onto, "--json"],
+            env=ENV,
+            capture_output=True,
+            text=True,
+        )
+        if pr.returncode != 0:
+            raise RuntimeError(
+                "zai train plan が失敗しました (%d)\n%s%s"
+                % (pr.returncode, pr.stdout, pr.stderr)
+            )
+        return json.loads(pr.stdout)
+
+    # ── 観測 1: **worktree を持ったまま**撃つ = 実運用そのままの形。
+    #    `train::candidates` は他の worktree が握っている枝を `held` にして
+    #    候補から外すので、「N 体が各自の worktree で作業中」の状態では
+    #    計画に 1 本も載らないはず。**これは仕様だが、利用者から見ると
+    #    「動いている最中には使えない」ことを意味する。数字として残す。**
+    attached = plan_json()
+    held_while_attached = len(attached.get("held", []))
+    free_while_attached = len(attached.get("plan", {}).get("steps", []))
+
+    # ── worktree を外す (ブランチは残る) = 「エージェントが仕事を終えた後」
+    for wt in dirs:
+        git(["worktree", "remove", "--force", wt], repo)
+    git(["worktree", "prune"], repo)
+
+    detached = plan_json()
+    tp = detached.get("plan", {})
+    dry = detached.get("dry", {})
+    order = [x["branch"] for x in tp.get("steps", [])]
+    missing = [b for b in branches if b not in set(order)]
+    if missing:
+        # **落ちた枝を黙って捨てない。**同じ集合を両方へ流さないと比較にならない。
+        #
+        # 注意: `plan.dropped` は当てにならない。`train::touches_from_repo` が
+        # `take(MAX_BRANCHES)` で先に切ってから `plan_order` へ渡すので、
+        # 24 本を超えたぶんは **`dropped` に数えられないまま計画から消える**
+        # (実測: 32 本を投げると計画は 24 本、`dropped` は 0)。
+        # だから申告値ではなく**自分で引き算した数**を出す。
+        order = order + missing
+
+    # ── `train run --dry-run` の終了コード (0=成功見込み / 1=衝突で停止)
+    pr = subprocess.run(
+        [zai, "train", "run", "--repo", repo, "--onto", onto, "--dry-run"],
+        env=ENV,
+        capture_output=True,
+        text=True,
+    )
+    dry_run_rc = pr.returncode
+
+    st_order = merge_into(repo, work, "order", base, order)
+    st_naive = merge_into(repo, work, "naive", base, branches)
+
+    # ── 乾式の的中率。**予想が触れた段だけ**を分母にする (最初の衝突で
+    #    打ち切る仕様なので、その先を分母に入れると不当に低く出る)。
+    actual = {x["branch"]: x["conflicts"] for x in st_order["per_branch"]}
+    dsteps = dry.get("steps", [])
+    covered = len(dsteps)
+    agree = sum(1 for d in dsteps if bool(d["conflicts"]) == bool(actual.get(d["branch"])))
+    pred_first = next((d["branch"] for d in dsteps if d["conflicts"]), None)
+    act_first = next((x["branch"] for x in st_order["per_branch"] if x["conflicts"]), None)
+    files_exact = None
+    if pred_first is not None and pred_first == act_first:
+        pf = sorted(next(d["conflicts"] for d in dsteps if d["branch"] == pred_first))
+        files_exact = pf == sorted(actual.get(pred_first, []))
+
+    a = train_stage_dict("train", "zai train plan の順序", plan, ws, st_order, t_edit, t_all)
+    b = train_stage_dict("train(素朴順)", "対照: 作成順", plan, ws, st_naive, t_edit, t_all)
+    a["train"] = {
+        "clean_prefix": clean_prefix(st_order["per_branch"]),
+        "naive_clean_prefix": clean_prefix(st_naive["per_branch"]),
+        "onto": detached.get("onto"),
+        "order": order,
+        "naive_order": branches,
+        "same_order": order == branches,
+        "dropped": tp.get("dropped", 0),
+        "missing_from_plan": len(missing),
+        "line_pairs": tp.get("line_pairs", 0),
+        "held_while_attached": held_while_attached,
+        "free_while_attached": free_while_attached,
+        "dry_available": dry.get("available"),
+        "dry_note": dry.get("note"),
+        "dry_covered": covered,
+        "dry_agree": agree,
+        "dry_pred_first_conflict": pred_first,
+        "actual_first_conflict": act_first,
+        "dry_files_exact": files_exact,
+        "dry_run_rc": dry_run_rc,
+    }
+    return a, b
 
 
 def pct(xs, q):
@@ -758,6 +944,7 @@ def main(argv):
         "seed": int(opt["seed"]),
         "zai": opt.get("zai") or "",
         "guard_mech": opt.get("guard-mech", "none"),
+        "train_mech": opt.get("train-mech", "none"),
         "union_driver": opt.get("union-driver", ""),
         "work": opt["work"],
         "json": opt.get("json", "0") == "1",
@@ -784,15 +971,12 @@ def main(argv):
             {
                 "stage": "guard",
                 "status": "skipped",
-                "reason": "zai guard も zai hook も見つかりません"
+                "reason": "zai hook / zai lease が見つかりません"
                 + ("" if cfg["zai"] else " (zai 自体が未検出)"),
             }
         )
     else:
-        if cfg["guard_mech"] == "guard":
-            gate_cmd = [cfg["zai"], "guard", "check", "--stdin"]
-            mech = "zai guard"
-        else:
+        if True:
             r = subprocess.run(
                 [cfg["zai"], "lease", "enable", "--dir", repo],
                 env=ENV,
@@ -805,6 +989,7 @@ def main(argv):
                 )
             gate_cmd = [cfg["zai"], "hook", "--zaivern", "claude", "PreToolUse"]
             mech = "zai hook (crate::lease::gate)"
+
         g = run_stage("guard", repo, work, base, plan, gate_cmd=gate_cmd)
         g["mech"] = mech
         g["fail_open"] = count_gate_log(" fail-open ")
@@ -819,14 +1004,75 @@ def main(argv):
             "",
         ]
 
-    # ── 段③ train — **未実装。推測で呼ばない**
-    stages.append(
-        {
-            "stage": "train",
-            "status": "skipped",
-            "reason": "統合の順序付け (train) は未実装。契約が決まっていないものを推測で呼ぶコードは書きません",
-        }
-    )
+    # ── 段③ train — 順序付けが統合の衝突を減らすか
+    if cfg["train_mech"] != "train":
+        stages.append(
+            {
+                "stage": "train",
+                "status": "skipped",
+                "reason": "zai train が見つかりません"
+                + ("" if cfg["zai"] else " (zai 自体が未検出)"),
+            }
+        )
+    else:
+        ta, tb = run_train_stage(cfg["zai"], work, cfg["files"], plan, "main")
+        stages.append(ta)
+        stages.append(tb)
+        t = ta["train"]
+        dh, dm = ta["hunks"] - tb["hunks"], ta["conflict_merges"] - tb["conflict_merges"]
+        verdict = (
+            "**総量は 1 つも変わらなかった**"
+            if (dh == 0 and dm == 0)
+            else "ハンク %+d 個 / 衝突したマージ %+d 回" % (dh, dm)
+        )
+        notes += [
+            "== train 段の読み方 (**ここを誇張しない**)",
+            "   同じ %d 本のブランチを、train が出した順序と作成順の**両方で**マージした。"
+            % len(t["order"]),
+            "   順序は %s。結果の差は %s。"
+            % ("同じだった" if t["same_order"] else "**違う**", verdict),
+            "   **順序付けは衝突の総量を減らす仕組みではない。**同じ行域が重なった組は",
+            "   どう並べても人手が要る (train 自身が line_pairs = %d 組と申告している)。"
+            % t["line_pairs"],
+            "   順序付けが減らせるとすれば**最初の衝突に当たるまでに自動で入る本数**で、",
+            "   これは人が割り込まれるまでの長さそのもの。実測: train 順 %d 本 / 素朴順 %d 本 (全 %d 本)。"
+            % (t["clean_prefix"], t["naive_clean_prefix"], len(t["order"])),
+            "",
+            "== train の乾式検査 (実行前の予想)",
+            "   予想が触れた段: %d / うち当たり: %d" % (t["dry_covered"], t["dry_agree"]),
+            "   最初に衝突すると予想: %s / 実際に最初に衝突: %s"
+            % (t["dry_pred_first_conflict"] or "(無し)", t["actual_first_conflict"] or "(無し)"),
+            "   衝突ファイルまで一致したか: %s"
+            % {True: "した", False: "しなかった", None: "比較できず (予想が外れたため)"}[
+                t["dry_files_exact"]
+            ],
+            "   merge-tree が使えたか: %s / train run --dry-run の終了コード: %d"
+            % (t["dry_available"], t["dry_run_rc"]),
+        ]
+        if t["dry_note"]:
+            notes.append("   降格・打ち切りの理由: %s" % t["dry_note"])
+        if t["missing_from_plan"]:
+            notes.append(
+                "   **計画に載らなかった枝が %d 本ある** (train::MAX_BRANCHES = 24)。"
+                % t["missing_from_plan"]
+            )
+            notes.append(
+                "   同じ集合で比べるため末尾へ足した。なお train の自己申告は dropped = %d で、"
+                % t["dropped"]
+            )
+            notes.append(
+                "   **落ちた本数を過少に報告している** (`touches_from_repo` が数える前に切るため)。"
+            )
+        notes += [
+            "",
+            "== train が「作業中」には使えないこと (仕様だが、数字として残す)",
+            "   書き手が worktree を持ったまま `zai train plan` を撃つと、",
+            "   計画に載った枝 %d 本 / 他の worktree が握っていて外された枝 %d 本。"
+            % (t["free_while_attached"], t["held_while_attached"]),
+            "   **統合順を出せるのはエージェントが worktree を手放した後**で、",
+            "   走っている最中の並び替えには使えない。",
+            "",
+        ]
 
     # ── 段④ union — 同じ書き込みを別のマージドライバで解決し直す
     if not cfg["union_driver"]:
@@ -899,6 +1145,7 @@ python3 "$work/czbench.py" \
     --seed "$seed" \
     --zai "$zai" \
     --guard-mech "$guard_mech" \
+    --train-mech "$train_mech" \
     --union-driver "$union_driver" \
     --work "$work" \
     --json "$json"
