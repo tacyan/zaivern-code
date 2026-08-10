@@ -1636,7 +1636,14 @@ fn lease_dispatch(args: &[String]) -> CliOut {
                 cwd: lease::normalize_path(&start.to_string_lossy()),
                 pid: std::process::id(),
             };
-            let out = lease::with_store(&store, |s| {
+            // **`with_store_retry` を使う。** 素の `with_store` は台帳ロックが
+            // 取れなかった時点で即座に諦めるので、高並列だと「他人が持っている」
+            // でも「取れた」でもない *busy* が大量に出る。実測 (64 体が同じ
+            // ファイルの離れた行域を取る) で、素の `with_store` は
+            // **64 件中 18 件しか通らず 46 件が busy**。retry 版では 64/64。
+            // 原因は混雑そのものではなく待ち方で、譲る＋揺らぎ付き指数
+            // バックオフに替えると消える (`with_store_retry` の doc 参照)。
+            let out = lease::with_store_retry(&store, |s| {
                 lease::try_claim(s, &holder, &rest, now, lease::DEFAULT_TTL_SECS, &|p| {
                     crate::instances::pid_alive(p)
                 })
@@ -1653,7 +1660,9 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             let (all, rest) = take_flag(&rest, "--all");
             let (agent, rest) = take_opt(&rest, "--agent");
             reject_extra(&rest, "zai lease release [--agent 名前 | --all]")?;
-            let n = lease::with_store(&store, |s| {
+            // 解放も同じ理由で retry 版を使う (解放が busy で落ちると、
+            // 持ち主が居ないのに担当が残り続ける = 誰も書けなくなる)。
+            let n = lease::with_store_retry(&store, |s| {
                 let before = s.leases.len();
                 if all {
                     s.leases.clear();
