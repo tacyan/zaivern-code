@@ -70,6 +70,8 @@ mod preview;
 mod procx;
 mod race;
 mod recent;
+// 行域オーナーシップ (同じファイルでも違う行なら競合しない) の契約面。
+mod region;
 mod remote;
 mod session;
 mod session_picker;
