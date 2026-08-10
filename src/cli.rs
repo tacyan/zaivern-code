@@ -212,6 +212,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "agent"
             | "lease"
             | "hook"
+            // git が custom merge driver として起動する入口 (人が打つものではない)
+            | "merge-driver"
             | "update"
             | "uninstall"
             | "help"
@@ -393,6 +395,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             println!("Zaivern Code {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
+        "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
         "status" if status_list_mode(rest).is_some() => run_status_list(
