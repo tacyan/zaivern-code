@@ -56,6 +56,8 @@ mod mention;
 mod menu_bar;
 mod minimap;
 mod multibuffer;
+// 交渉 (negotiate) を Erlang 風メッシュ (mesh) の上で実際に走らせる橋。
+mod negomesh;
 mod notify;
 mod orchestration;
 mod palette;

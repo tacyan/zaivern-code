@@ -35,11 +35,6 @@
 //! `HashMap` / `HashSet` を 1 つも使わない。同じ入力からは、どの OS の
 //! どのプロセスでも 1 バイト違わない結果が出る。
 
-// TODO(統合担当): 行域オーナーシップが lease / coedit / mesh へ全部繋がった
-// 時点でこの allow を外す。CLAUDE.md の「never used 警告は繋いでいない検出器」に
-// 従い、外せない項目が残ったらそれは未完成として報告する。
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -133,11 +128,6 @@ impl Span {
     /// 空 (start > end) か。壊れた入力の検出に使う。
     pub fn is_empty(&self) -> bool {
         self.start > self.end || self.start == 0
-    }
-
-    /// この域が行 `n` を含むか。
-    pub fn contains(&self, n: u32) -> bool {
-        n >= self.start && n <= self.end
     }
 }
 

@@ -57,5 +57,7 @@ pub use imp::FEATURE;
 /// **このモジュールに他の `allow` は無い** — `never used` は
 /// 「作ったのに繋いでいない」の検出器なので、潰してよいのはここだけである。
 /// 入口が生きていることは `negotiate::tests::cliの入口と終了コード` が確かめる。
-#[allow(unused_imports)]
 pub use imp::cli_main;
+
+/// 交渉の公開面。**橋 (`crate::negomesh`) がここから引く。**
+pub use imp::{allocate, decode, encode, offer, Deal, Offer, Want};

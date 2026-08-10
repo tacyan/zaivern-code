@@ -898,11 +898,10 @@ pub fn decode(s: &str) -> Result<Deal, String> {
 /// 読めなかった行には `Reject`(id 空) を返す — メッシュで黙って落とすと
 /// 送り手が永遠に待つため。
 ///
-/// **いまはまだ呼び手がいない。** 運び手の `src/mesh.rs` は別担当が同時に
-/// 作っているので `use` できない (作りかけの API を掴むと両方が止まる)。
-/// mesh が着いたら `mailbox` の中身をそのままここへ渡すだけで繋がる。
-/// `allow` はその日までの間だけで、**繋いだら外すこと**。
-#[allow(dead_code)]
+/// 呼び手は `zai negotiate deal` (標準入力から 1 行ずつ受け取る形)。
+/// メッシュの上で回す経路は `crate::negomesh` が担当する — あちらは
+/// 素の [`crate::features::mesh::Msg::Claim`] と交渉形の要求が**混ざって**
+/// 届くので、両方を 1 回の [`allocate`] へまとめて渡す必要がある。
 pub fn respond(
     inbox: &[String],
     occupied: &[(String, Region)],
@@ -1151,6 +1150,8 @@ zai negotiate — 行域がぶつかったとき、断らずに「ずらす」
   zai negotiate offer      < in.json   1 件の要求への提案を出す
   zai negotiate allocate   < in.json   N 件をまとめて互いに素に配る
   zai negotiate deal       < in.json   交渉メッセージの束へ返事を作る
+  zai negotiate serve                  メッシュの上で交渉役として実際に回る
+                                       [--rounds N] [--lines N] [--band N]
   zai negotiate help                   この使い方
 
 入力は標準入力の JSON。域は \"src/a.rs#L10-40\" の仕様文字列で書く。
@@ -1178,13 +1179,8 @@ fn read_stdin() -> Result<String, String> {
 ///
 /// 終了コードの意味は [`usage`] を参照 (0=通る / 1=通らない / 2=使い方 / 3=提案あり)。
 ///
-/// **いまはまだ呼び手がいない。** `src/cli.rs` は 8 本のブランチが同時に
-/// 触っている共有ファイルなので、こちらでは配線しない (モジュール冒頭の
-/// 申し送りの 1 行が入った瞬間に呼び手が付く)。`allow` を置いているのは
-/// その 1 行までの間だけで、**このモジュールに他の `allow` は無い** —
-/// `never used` は「作ったのに繋いでいない」の検出器なので、
-/// 潰してよいのは統合担当を待っているこことメッシュ待ちの [`respond`] だけである。
-#[allow(dead_code)]
+/// `src/cli.rs` の dispatch から `zai negotiate …` として呼ばれる
+/// (統合時に直列で配線済み。`allow(dead_code)` はその時点で外した)。
 pub fn cli_main(argv: &[String]) -> i32 {
     let Some(sub) = argv.first().map(String::as_str) else {
         print!("{}", usage());
@@ -1198,6 +1194,9 @@ pub fn cli_main(argv: &[String]) -> i32 {
         "offer" => cli_offer(),
         "allocate" => cli_allocate(),
         "deal" => cli_deal(),
+        // メッシュの上で実際に交渉を回す。実体は `crate::negomesh`
+        // (mesh と negotiate は互いを知らない設計なので、繋ぐ層は別に置く)。
+        "serve" => crate::negomesh::serve_cli(argv),
         other => {
             eprintln!(
                 "{}",
