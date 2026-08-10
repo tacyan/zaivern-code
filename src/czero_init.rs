@@ -991,6 +991,66 @@ fn submodule_paths(root: &Path) -> Vec<String> {
 /// `merge` が埋まっていて [`attr_free`] が弾く。ところが `filter=lfs` だけを
 /// 手で書いた `.gitattributes` があると `merge` は空きに見え、union が当たる。
 /// **union はポインタ行を連結する**ので、その時点で LFS オブジェクトが壊れる。
+/// `git config --show-scope --get-regexp` の出力から拾う値。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopedConfig {
+    sparse: bool,
+    hooks_path: Option<String>,
+    /// **このリポジトリに書かれた** `filter.lfs.*` があるか。
+    lfs_local: bool,
+}
+
+/// 上の出力を読む純関数。**git を起こさないのでテーブルで固定できる。**
+///
+/// 形は `<scope>\t<key> <value>`。`--show-scope` を付けない古い git や、
+/// 取り違えた呼び出しでタブが無いときは**スコープ不明**として扱い、
+/// LFS は数えない (fail-closed 側 = 「このリポジトリのものだ」と決めつけない)。
+fn parse_scoped_config(out: &str) -> ScopedConfig {
+    let mut c = ScopedConfig::default();
+    // Windows のチェックアウト / パイプで CRLF が混ざりうる。
+    for line in out.replace("\r\n", "\n").lines() {
+        let (scope, rest) = match line.split_once('\t') {
+            Some((s, r)) => (s.trim(), r),
+            None => ("", line),
+        };
+        let (k, v) = rest.split_once(' ').unwrap_or((rest, ""));
+        let key = k.to_ascii_lowercase();
+        // **`_ =>` で残り全部を LFS に倒さない。** `git sparse-checkout init --cone`
+        // が置く `core.sparseCheckoutCone` まで LFS と読んで、sparse なだけの
+        // リポジトリに「git-lfs が居ます」と出した (実際に出た)。
+        if key == "core.sparsecheckout" {
+            c.sparse = v.trim().eq_ignore_ascii_case("true");
+        } else if key == "core.hookspath" {
+            c.hooks_path = Some(v.trim().to_string());
+        } else if key.starts_with("filter.lfs.") {
+            // `worktree` はリポジトリ固有の設定なので local と同じ扱い。
+            c.lfs_local |= scope == "local" || scope == "worktree";
+        }
+    }
+    c
+}
+
+/// `.gitattributes` に `filter=lfs` が書かれているか (= このリポジトリが LFS を使う)。
+///
+/// **設定 (`filter.lfs.*`) では判定できない。** git-lfs を 1 度でも入れた
+/// マシンでは global に置かれるので、LFS を使っていないリポジトリまで真になる。
+fn gitattributes_declares_lfs(root: &Path) -> bool {
+    for rel in [".gitattributes", ".git/info/attributes"] {
+        let Ok(raw) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        // Windows のチェックアウトは CRLF なので正規化してから探す。
+        if raw
+            .replace("\r\n", "\n")
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains("filter=lfs"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn lfs_unsafe_patterns(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -1063,29 +1123,30 @@ pub fn read_shape(env: &Env) -> Shape {
         .unwrap_or(true);
 
     // 設定は 1 回の `--get-regexp` でまとめて拾う (往復を増やさない)。
+    //
+    // **`--show-scope` を付けてスコープまで見る。** 素の `git config` は
+    // system / global / local を全部混ぜて返すので、**git-lfs が入っている
+    // マシンでは、LFS を 1 バイトも使っていないリポジトリまで「LFS が居る」
+    // になる** (CI の ubuntu / macOS / windows ランナーは git-lfs 同梱なので
+    // 3 つとも赤くなり、手元の macOS だけ緑という形で出た)。
+    // `core.hooksPath` / `core.sparseCheckout` は global に置いても
+    // **このリポジトリの挙動を変える**ので全スコープのまま見る。
+    // `filter.lfs.*` が global にあるのは「git-lfs が入っている」だけの意味で、
+    // **このリポジトリが LFS を使っているか**は `.gitattributes` が決める。
     let conf = git(
         &probe,
         &[
             "config",
+            "--show-scope",
             "--get-regexp",
             "^(core\\.sparsecheckout|core\\.hookspath|filter\\.lfs\\.)",
         ],
     )
     .unwrap_or_default();
-    for line in conf.lines() {
-        let (k, v) = line.split_once(' ').unwrap_or((line, ""));
-        let key = k.to_ascii_lowercase();
-        // **`_ =>` で残り全部を LFS に倒さない。** `git sparse-checkout init --cone`
-        // が置く `core.sparseCheckoutCone` まで LFS と読んで、sparse なだけの
-        // リポジトリに「git-lfs が居ます」と出した (実際に出た)。
-        if key == "core.sparsecheckout" {
-            sh.sparse = v.trim().eq_ignore_ascii_case("true");
-        } else if key == "core.hookspath" {
-            sh.hooks_path = Some(v.trim().to_string());
-        } else if key.starts_with("filter.lfs.") {
-            sh.lfs = true;
-        }
-    }
+    let cfg = parse_scoped_config(&conf);
+    sh.sparse = cfg.sparse;
+    sh.hooks_path = cfg.hooks_path;
+    sh.lfs |= cfg.lfs_local;
     if let Some(c) = &sh.common_dir {
         sh.shallow = c.join("shallow").exists();
         // **`info/sparse-checkout` の存在では判定しない。** git が見るのは
@@ -1124,6 +1185,12 @@ pub fn read_shape(env: &Env) -> Shape {
         }
         if sh.lfs || !managed_patterns(&root).is_empty() {
             sh.lfs_unsafe = lfs_unsafe_patterns(&root);
+        // **「このリポジトリが LFS を使っている」の本当の証拠は `.gitattributes`。**
+        // 設定は local スコープしか数えないので (global の `filter.lfs.*` は
+        // 「git-lfs が入っている」だけの意味)、属性側でも拾っておく。
+        // `merge=lfs` が正しく入っている普通の LFS リポジトリは
+        // `lfs_unsafe` に載らないため、そこだけでは検出できない。
+        sh.lfs |= gitattributes_declares_lfs(&root);
         }
     }
     sh
@@ -4390,6 +4457,101 @@ mod tests {
             vec!["husky", "pre-commit", "lefthook"],
             "並びか中身が変わった (決定的でなくなると差分が読めない)"
         );
+    }
+
+    /// **CI が 3 プラットフォームとも赤くなった回帰の番人。**
+    ///
+    /// `git config --get-regexp` は system / global / local を混ぜて返すので、
+    /// git-lfs が入っているマシン (GitHub の ubuntu / macOS / windows
+    /// ランナーは同梱) では、LFS を 1 バイトも使っていないリポジトリまで
+    /// 「LFS が居る」になっていた。手元の macOS には global の `filter.lfs`
+    /// が 1 件も無かったので**ローカルだけ緑**という形で出た。
+    ///
+    /// git を起こさない純関数で固定する (環境変数を差し替える形にすると
+    /// 並列に走る他のテストへ漏れる)。
+    #[test]
+    fn 設定のスコープを見てglobalのgit_lfsをこのリポジトリのものと数えない() {
+        let cases: &[(&str, &str, ScopedConfig)] = &[
+            (
+                "global の git-lfs だけ (CI ランナーの形)",
+                "global\tfilter.lfs.clean git-lfs clean -- %f\n\
+                 global\tfilter.lfs.smudge git-lfs smudge -- %f\n\
+                 global\tfilter.lfs.required true\n",
+                ScopedConfig {
+                    sparse: false,
+                    hooks_path: None,
+                    lfs_local: false,
+                },
+            ),
+            (
+                "system に居ても数えない",
+                "system\tfilter.lfs.process git-lfs filter-process\n",
+                ScopedConfig::default(),
+            ),
+            (
+                "local なら数える",
+                "local\tfilter.lfs.clean git-lfs clean -- %f\n",
+                ScopedConfig {
+                    sparse: false,
+                    hooks_path: None,
+                    lfs_local: true,
+                },
+            ),
+            (
+                "worktree もリポジトリ固有なので数える",
+                "worktree\tfilter.lfs.clean git-lfs clean -- %f\n",
+                ScopedConfig {
+                    sparse: false,
+                    hooks_path: None,
+                    lfs_local: true,
+                },
+            ),
+            (
+                "sparse は global に置いてもこのリポジトリの挙動を変えるので見る",
+                "global\tcore.sparsecheckout true\n",
+                ScopedConfig {
+                    sparse: true,
+                    hooks_path: None,
+                    lfs_local: false,
+                },
+            ),
+            (
+                "hooksPath も同じ (global でも効く)",
+                "global\tcore.hookspath .husky\n",
+                ScopedConfig {
+                    sparse: false,
+                    hooks_path: Some(".husky".to_string()),
+                    lfs_local: false,
+                },
+            ),
+            (
+                "cone を LFS と読まない (前の回帰)",
+                "local\tcore.sparsecheckout true\nlocal\tcore.sparsecheckoutcone true\n",
+                ScopedConfig {
+                    sparse: true,
+                    hooks_path: None,
+                    lfs_local: false,
+                },
+            ),
+            (
+                "スコープ不明 (タブ無し) なら数えない — 決めつけない側へ倒す",
+                "filter.lfs.clean git-lfs clean -- %f\n",
+                ScopedConfig::default(),
+            ),
+            (
+                "CRLF が混ざっても壊れない",
+                "local\tcore.sparsecheckout true\r\nglobal\tfilter.lfs.clean x\r\n",
+                ScopedConfig {
+                    sparse: true,
+                    hooks_path: None,
+                    lfs_local: false,
+                },
+            ),
+            ("空の出力", "", ScopedConfig::default()),
+        ];
+        for (name, out, want) in cases {
+            assert_eq!(&parse_scoped_config(out), want, "{name}");
+        }
     }
 
     #[test]
