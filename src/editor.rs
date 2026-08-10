@@ -89,9 +89,23 @@ pub enum BufferKind {
 }
 
 impl BufferKind {
-    /// このタブが読み取り専用か。
+    /// このタブの**中身を一切変えられない**か。
+    ///
+    /// **マルチバッファは含まない** — 抜粋をその場で直して各ファイルへ
+    /// 書き戻せる (`multibuffer::plan_writeback`)。
+    /// `Image` / `Hex` / `Media` / `Archive` / `Pdf` / 差分はこれまでどおり。
     pub fn read_only(&self) -> bool {
-        !matches!(self, BufferKind::File)
+        !matches!(self, BufferKind::File | BufferKind::Multibuffer { .. })
+    }
+
+    /// **このタブ自身をファイルへ保存できる**か (⌘S / 名前を付けて保存)。
+    ///
+    /// [`BufferKind::read_only`] と分けてあるのは、マルチバッファが
+    /// 「編集できるが、このタブ自身はファイルではない」ため。
+    /// ここを混ぜると ⌘S が「名前を付けて保存」を開いて、本文の無いタブを
+    /// **空ファイルとして書き出す**。書き戻しは専用の操作でしか起こさない。
+    pub fn saves_to_file(&self) -> bool {
+        matches!(self, BufferKind::File)
     }
 
     /// 本文の `TextEdit` ではなく**専用ビューア**で描くタブか。
@@ -1844,6 +1858,12 @@ impl Buffer {
     ///
     /// 1 バイトも変わらなければ何もせず `false`。
     pub fn apply_edit(&mut self, new_text: String, ed: Edit) -> bool {
+        // 本文を持たないタブ (画像 / 16 進 / 書庫 / マルチバッファ) の `text` は
+        // **空のまま**が不変条件。ここを塞いでおかないと、`kind.read_only()` が
+        // 偽になった経路 (スマホからの SetText 等) が索引タブへ本文を流し込む。
+        if self.kind.preview_only() {
+            return false;
+        }
         let Some((at, at_chars, before, after)) = diff_replace(&self.text, &new_text) else {
             return false;
         };
@@ -1901,11 +1921,15 @@ impl Buffer {
         self.minimap = None;
     }
 
-    /// このタブが読み取り専用か。種類 (画像 / PDF / 差分) と
+    /// **本文 (`text`) の編集・保存の経路に乗せてよいか**の否定。
+    ///
+    /// ⌘S / ⌘Z / 状態バーの 🔒 はこちらを見る。種類が読み取り専用か、
+    /// 巨大ファイルモードか、**ファイルとして保存できないタブ**
+    /// (マルチバッファのように `text` を持たない索引) ならそう扱う。
+    /// 抜粋を直せるかどうかは別軸で、そちらは `kind.read_only()` が答える。
     #[allow(dead_code)]
-    /// 巨大ファイルモードの**どちらか**が読み取り専用ならそう扱う。
     pub fn read_only(&self) -> bool {
-        self.kind.read_only() || self.large.read_only
+        self.kind.read_only() || !self.kind.saves_to_file() || self.large.read_only
     }
 
     /// シンタックスハイライトを行ってよいか (巨大ファイルでは false)。
@@ -1957,6 +1981,14 @@ impl Buffer {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 msg,
+            ));
+        }
+        // 本文の無いタブ (マルチバッファ等) を**ファイルとして**書き出さない。
+        // `read_only()` との二重の防御 — 門が 1 つしか無いので漏れない。
+        if !self.kind.saves_to_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                crate::i18n::tr("このタブはファイルとして保存できません"),
             ));
         }
         let (bytes, used) = crate::textenc::encode_bytes(&self.text, self.encoding);
@@ -3106,34 +3138,69 @@ mod tests {
     /// すり抜けて、TextEdit にバイナリが流れ込む。
     #[test]
     fn buffer_kind_capability_table() {
-        let cases: &[(BufferKind, bool, bool)] = &[
-            // (種類, 読み取り専用, 専用ビューアで描く)
-            (BufferKind::File, false, false),
-            (BufferKind::PrDiff { number: 1 }, true, false),
-            (BufferKind::RaceDiff { slot: 0 }, true, false),
-            (BufferKind::Pdf, true, false),
-            (BufferKind::Image, true, true),
-            (BufferKind::Hex, true, true),
-            (BufferKind::Media, true, true),
-            (BufferKind::Archive, true, true),
+        let cases: &[(BufferKind, bool, bool, bool)] = &[
+            // (種類, 読み取り専用, 専用ビューアで描く, ファイルとして保存できる)
+            (BufferKind::File, false, false, true),
+            (BufferKind::PrDiff { number: 1 }, true, false, false),
+            (BufferKind::RaceDiff { slot: 0 }, true, false, false),
+            (BufferKind::Pdf, true, false, false),
+            (BufferKind::Image, true, true, false),
+            (BufferKind::Hex, true, true, false),
+            (BufferKind::Media, true, true, false),
+            (BufferKind::Archive, true, true, false),
+            // マルチバッファだけが「読み取り専用ではないが、
+            // このタブ自身はファイルとして保存できない」。
             (
                 BufferKind::Multibuffer {
                     source: crate::multibuffer::Source::Search,
                 },
+                false,
                 true,
-                true,
+                false,
             ),
         ];
-        for (kind, ro, preview) in cases {
+        for (kind, ro, preview, save) in cases {
             assert_eq!(kind.read_only(), *ro, "{kind:?} の read_only");
             assert_eq!(kind.preview_only(), *preview, "{kind:?} の preview_only");
+            assert_eq!(kind.saves_to_file(), *save, "{kind:?} の saves_to_file");
         }
+    }
+
+    /// マルチバッファは**編集できるが、タブ自身はファイルではない**。
+    ///
+    /// ここが崩れると ⌘S が「名前を付けて保存」を開いて、本文の無い索引タブを
+    /// 空ファイルとして書き出す (実際に `read_only()` から外した時に起こる)。
+    #[test]
+    fn マルチバッファのタブはファイルとして保存できない() {
+        let dir = crate::test_util::unique_temp_dir("zv-mbedit", "nosave");
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let target = dir.join("out.txt");
+        let mut ed = Editor::new();
+        let id = ed.open_multibuffer(crate::multibuffer::Multibuffer::default());
+        let i = ed.buffers.iter().position(|b| b.id == id).expect("タブ");
+        assert!(
+            !ed.buffers[i].kind.read_only(),
+            "抜粋は直せる (読み取り専用ではない)"
+        );
+        assert!(
+            ed.buffers[i].read_only(),
+            "本文の保存・取り消しの経路には乗せない"
+        );
+        // 本文を流し込もうとしても `text` は空のまま
+        let ed_step = Edit::programmatic(0, HistoryLimits::default());
+        assert!(!ed.buffers[i].apply_edit("流し込み".into(), ed_step));
+        assert!(ed.buffers[i].text.is_empty());
+        // 唯一の書き込み口が拒否する
+        let err = ed.buffers[i].write_to(&target).expect_err("書けない");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!target.exists(), "空ファイルを作らない");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 専用ビューアのタブが満たすべき不変条件をまとめて確かめる。
     fn assert_preview_tab(b: &Buffer, kind: BufferKind) {
         assert_eq!(b.kind, kind);
-        assert!(b.kind.read_only(), "{kind:?} タブは読み取り専用");
+        assert!(b.read_only(), "{kind:?} タブは本文の保存経路に乗らない");
         assert!(b.kind.preview_only(), "{kind:?} は専用ビューアで描く");
         assert!(b.text.is_empty(), "本文は空 (検索・保存の経路に乗らない)");
         assert!(!b.dirty(), "開いただけで dirty にならない");
