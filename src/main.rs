@@ -56,6 +56,8 @@ mod mention;
 mod menu_bar;
 mod minimap;
 mod multibuffer;
+// 交渉 (negotiate) を Erlang 風メッシュ (mesh) の上で実際に走らせる橋。
+mod negomesh;
 mod notify;
 mod orchestration;
 mod palette;
@@ -70,6 +72,8 @@ mod preview;
 mod procx;
 mod race;
 mod recent;
+// 行域オーナーシップ (同じファイルでも違う行なら競合しない) の契約面。
+mod region;
 mod remote;
 mod session;
 mod session_picker;

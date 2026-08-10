@@ -23,14 +23,67 @@
 //!
 //! * 片側でも既存行を**変更・削除**していたら、その領域は解決せず
 //!   [`Resolution::Conflict`] として人間に返す。
-//! * 既定では `zaivern:union-begin` / `zaivern:union-end` を含む行で
-//!   囲まれた**領域の内側だけ**を対象にする。コメント記号を見ないので
+//! * `zaivern:union-begin` / `zaivern:union-end` を含む行で囲まれた
+//!   **領域の内側だけ**を対象にする。コメント記号を見ないので
 //!   Rust / JS / Python / TOML / YAML / Markdown どれでも同じ書き方で効く。
-//! * **マーカが 1 つも無いファイルでは何もしない。** [`cli_main`] は
-//!   `git merge-file` へそのまま委譲するので、**素の git と 1 バイトも
-//!   変わらない**結果になる。「入れたら普段のマージが変わった」が起きない。
+//! * マーカが 1 つも無いファイルは、自動判定 (`--auto`) が
+//!   **「これは 1 行 1 要素の一覧だ」と確信できたときだけ**対象になる。
+//!   確信できなければ [`cli_main`] は `git merge-file` へそのまま委譲するので、
+//!   **素の git と 1 バイトも変わらない**結果になる。
 //! * 順序は決定的 (ours → theirs)。`HashMap` / `HashSet` を使わず
-//!   `Vec` と `BTreeSet` だけで組んであるので、反復順が出力へ漏れない。
+//!   `Vec` / `BTreeSet` / `BTreeMap` だけで組んであるので、反復順が出力へ漏れない。
+//!
+//! ## マーカ無しで効かせる (`--auto`) — どのリポジトリでも衝突を消すために
+//!
+//! マーカ方式は **zaivern 自身のリポジトリでしか効かない**。ユーザーの要求は
+//! 「どのリポジトリでも衝突が起きない」なので、`zaivern-union-auto` ドライバは
+//! **中身を見て**一覧を探す。拡張子やファイル名は
+//! [`suggest_attributes`] がパターンを選ぶときにしか使わない
+//! (対象にしても、中身が一覧でなければ何も起きない)。
+//!
+//! | 種類 ([`ListKind`]) | 見つけ方 (中身だけ) | 重複行 | 構文検査 |
+//! |---|---|---|---|
+//! | `Flat` | 全行が同じ字下げの「1 行 1 要素」。`.gitignore` / `requirements.txt` / `go.sum` / `.env` | **畳む** (一覧は集合) | 重複キー |
+//! | `Imports` | `use` / `mod` / `import` / `export` / `#include` が 3 行以上続くブロック | **畳む** | 重複キー |
+//! | `Journal` | 見出し + 箇条書きが本体。`CHANGELOG.md` / `NEWS` | **畳まない** (同じ文面の 2 件がありうる) | 見出しの重複 |
+//! | `Bracket` | `{` / `[` で開いて閉じるまでが全部 1 行 1 要素。JSON / 配列リテラル | **畳む** | JSON パーサ / 括弧の釣り合い |
+//! | `TomlSection` | `[section]` + `key = value` だけのファイル | **畳む** | 重複キー (セクション毎) |
+//!
+//! ### 自動判定でも「誤って解決しない」ための 4 段
+//!
+//! 1. **3 版すべて**が同じ種類・同じブロック数に見えなければ、その回は降りる。
+//! 2. 片側でも既存行を変更・削除していたら、その領域は解決しない (マーカ方式と同じ)。
+//! 3. 両側が**同じキー**の行を足していて中身が違えば解決しない
+//!    (`"serde": "1"` と `"serde": "2"`、`## 0.2.0` と `## 0.2.0`)。
+//! 4. 出来上がりを**構文検査**に通す。落ちたら結果を捨てる。
+//!
+//! そして自動判定モードでは **「全部解決できたときだけ」結果を差し替える**。
+//! 1 つでも衝突が残ったら `git merge-file` へ委譲するので、
+//! **自分の衝突マーカを一度も書かない** = 「入れたら見た目が変わった」が起きない。
+//!
+//! ### 実測 (`tools/union-bench.sh`、マーカを 1 つも置かない合成リポジトリ)
+//!
+//! `.gitignore` / `package.json` / `CHANGELOG.md` / `mod` ブロック /
+//! **一覧ではない** `code.rs` の 5 つへ N 人が同時に追記したときの総衝突行:
+//!
+//! | 人数 | 素の git | `--auto` | 削減 | 誤自動解決 |
+//! |---:|---:|---:|---:|---:|
+//! | 4 | 45 | 9 | 80% | 0 |
+//! | 8 | 175 | 35 | 80% | 0 |
+//! | 16 | 675 | 135 | 80% | 0 |
+//!
+//! **残る 20% は `code.rs` (一覧ではないもの) で、そこは効かないのが正しい。**
+//! `--auto` を付けない条件はベースラインと**完全に同じ数字**になる。
+//!
+//! ### 提案 ([`suggest_attributes`]) は「ファイル全体が一覧」のものだけ
+//!
+//! `Imports` とコードの配列リテラルは**ブロック単位**の判定なので、3 行を
+//! 根拠に `*.rs` のような広いパターンを書くことになる (実測: このリポジトリの
+//! `.rs` 124 個のうち 102 個が該当し、`*.rs` が提案された)。効果に対して
+//! 影響範囲が大きすぎるので提案からは外してある — **明示的に
+//! `.gitattributes` へ書けば今までどおり効く**。この絞り込みを入れた後、
+//! このリポジトリでの提案は **8 パターン** (`.gitignore` / `CHANGELOG.md` /
+//! `Cargo.toml` / `plugin.toml` ×10 など) になった。
 //!
 //! ## 使い方
 //!
@@ -47,7 +100,8 @@
 //!
 //! | 名前 | 対象 |
 //! |---|---|
-//! | `zaivern-union` | マーカの内側だけ |
+//! | `zaivern-union` | マーカの内側だけ (**明示指定は自動判定より強い**) |
+//! | `zaivern-union-auto` | マーカがあればその内側、無ければ**中身から一覧を探す** |
 //! | `zaivern-union-whole` | ファイル全体 (`CHANGELOG.md` のような純粋な一覧) |
 //! | `zaivern-union-sorted` | ファイル全体 + 追記を辞書順に整列 |
 //!
@@ -90,15 +144,54 @@ const ATTR_END_KEY: &str = "# zaivern:union-managed-end";
 /// 事故のもとになる。
 const DRIVERS: &[(&str, &str)] = &[
     ("zaivern-union", ""),
+    (AUTO_DRIVER, "--auto"),
     ("zaivern-union-whole", "--whole"),
     ("zaivern-union-sorted", "--whole --sorted"),
 ];
 
+/// `.gitattributes` の提案が既定で当てるドライバ。**マーカ無しで効く唯一のもの。**
+pub const AUTO_DRIVER: &str = "zaivern-union-auto";
+
 /// `git config merge.<名前>.name` に書く説明。
 const DRIVER_DESC: &str = "Zaivern: 追記どうしの衝突だけを自動で解決する";
 
-/// `.gitattributes` へ書く既定のパターン。設定 `union.patterns` で変えられる。
+/// 設定 `union.patterns` を**空にしなかった**ときのための保険。
+/// 既定は空 = [`suggest_attributes`] にリポジトリを見て決めさせる。
 const DEFAULT_PATTERNS: &str = "*.md *.toml *.txt *.json *.yaml *.yml";
+
+/// [`suggest_attributes`] が中身を読むファイル数の上限。
+const MAX_SUGGEST_READ: usize = 2000;
+/// 同上、1 ファイルのバイト数の上限 (大きいものは一覧ではない)。
+const MAX_SUGGEST_BYTES: u64 = 256 * 1024;
+/// まとめられなかったファイルを個別に並べる上限 (`.gitattributes` を汚さない)。
+const MAX_SUGGEST_PATHS: usize = 20;
+
+/// 拡張子でまとめず**その名前のまま**パターンにするファイル。
+/// あくまで「パターンの書き方」の話で、**対象にするかは中身が決める**。
+const WELL_KNOWN: &[&str] = &[
+    ".gitignore",
+    ".dockerignore",
+    ".npmignore",
+    ".eslintignore",
+    ".prettierignore",
+    ".env",
+    ".env.example",
+    "CHANGELOG.md",
+    "CHANGELOG",
+    "NEWS",
+    "NEWS.md",
+    "HISTORY.md",
+    "CODEOWNERS",
+    "Gemfile",
+    "Dockerfile",
+    "go.sum",
+    "go.mod",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "package.json",
+    "Cargo.toml",
+    "pyproject.toml",
+];
 
 /// LCS を素の DP で解いてよい上限 (セル数)。超えたら一意行アンカーで分割する。
 const DP_CELLS: usize = 1_000_000;
@@ -393,6 +486,865 @@ fn slice_region(r: &Regions, start: usize, len: usize) -> Option<usize> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+//  4.5 自動判定 — マーカが 1 つも無いリポジトリで効かせる
+// ═══════════════════════════════════════════════════════════════════════
+//
+// ここが本丸。マーカ方式は「囲んだ人がいる」ことが前提なので、**他人の
+// リポジトリでは 1 度も効かない**。どのリポジトリにも一覧はあるので、
+// 中身から見つけて同じ安全側の規則を当てる。
+//
+// **確信できなければ何もしない**のが唯一の設計方針である。判定は
+// 「これは一覧だ」を*積極的に*証明できたときだけ真を返す (拡張子で
+// 決め打ちしない)。証明できなければ [`cli_main`] が `git merge-file` へ
+// 委譲するので、素の git と 1 バイトも変わらない。
+
+/// 自動判定で見つけた「一覧」の種類。表と根拠はモジュール冒頭のドキュメント。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ListKind {
+    /// 1 行 1 要素の平坦な一覧。`.gitignore` / `requirements.txt` / `go.sum` /
+    /// `.env` / `mod` 宣言だけのファイルなど。
+    Flat,
+    /// 宣言 (`use` / `mod` / `import` / `export` / `#include`) が 3 行以上
+    /// 続くブロック。**ファイルの他の部分は対象にしない。**
+    Imports,
+    /// 見出しつきの追記帳。`CHANGELOG.md` / `NEWS`。**重複を畳まない。**
+    Journal,
+    /// 括弧で囲まれた平坦な本体。JSON のオブジェクト / 配列、
+    /// コードの配列リテラル (`&[` / `[`)。
+    Bracket,
+    /// TOML の `[section]` 本体。
+    TomlSection,
+}
+
+impl ListKind {
+    /// 画面と `.gitattributes` の理由欄に出す短い名前。
+    pub fn label(self) -> &'static str {
+        match self {
+            ListKind::Flat => "1行1要素の一覧",
+            ListKind::Imports => "宣言の連続ブロック",
+            ListKind::Journal => "見出しつきの追記帳",
+            ListKind::Bracket => "括弧で囲んだ一覧",
+            ListKind::TomlSection => "[section] の表",
+        }
+    }
+
+    /// 重複行の扱い。**種類ごとに決めてある** (モジュール冒頭の表が仕様)。
+    ///
+    /// 一覧は集合なので同じ行が 2 本あるのは誤り。CHANGELOG は「同じ文面の
+    /// 2 件」がありうる (別々の人が同じ修正を書いた) ので畳まない。
+    fn dedup(self) -> Dedup {
+        match self {
+            ListKind::Journal => Dedup::Keep,
+            _ => Dedup::Fold,
+        }
+    }
+}
+
+/// 両側が同じ行を足したときの扱い。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dedup {
+    /// 1 本に畳む。
+    Fold,
+    /// 2 本とも残す。
+    Keep,
+}
+
+/// 結果を返す前に通す構文検査。**落ちたら結果ごと捨てる。**
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Check {
+    /// 重複キーの検査だけ (全種類共通)。
+    Off,
+    /// JSON として読み直す (重複キーも弾く)。
+    Json,
+    /// TOML として読み直す (セクション毎の重複キーも弾く)。
+    Toml,
+    /// 括弧の釣り合いが base と同じままか。
+    Brackets,
+}
+
+/// 1 つの版について「どこが一覧の本文か」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Plan {
+    kind: ListKind,
+    check: Check,
+    /// 一覧の本文 (行の半開区間)。**重ならず、開始位置の昇順。**
+    blocks: Vec<(usize, usize)>,
+}
+
+/// 1 行 1 要素と認めるときの上限 (これを超えたら散文とみなす)。
+const MAX_ITEM_WORDS: usize = 8;
+/// 同上、1 行の文字数。
+const MAX_ITEM_CHARS: usize = 200;
+/// 一覧と認めるのに要る最小の要素数。
+const MIN_ITEMS: usize = 3;
+
+/// 中身から一覧の種類を見つける。**分からなければ `None`。**
+///
+/// 画面表示と [`suggest_attributes`] からも使う (1 版だけ見るとき)。
+pub fn detect(text: &str) -> Option<ListKind> {
+    detect_lines(&split_lines(text)).map(|p| p.kind)
+}
+
+/// 3 版すべてが同じ形の一覧に見えるか。[`cli_main`] の「委譲するか」の判断。
+pub fn auto_applies(base: &str, ours: &str, theirs: &str) -> bool {
+    plans_for(
+        &split_lines(base),
+        &split_lines(ours),
+        &split_lines(theirs),
+    )
+    .is_some()
+}
+
+/// 3 版ぶんの計画。**種類もブロック数も一致したときだけ** `Some`。
+///
+/// 片側だけが一覧をやめた / セクションを増やしたなら、その回は降りる。
+fn plans_for(b: &[Line], o: &[Line], t: &[Line]) -> Option<(Plan, Plan, Plan)> {
+    let pb = detect_lines(b)?;
+    let po = detect_lines(o)?;
+    let pt = detect_lines(t)?;
+    if pb.kind != po.kind || po.kind != pt.kind {
+        return None;
+    }
+    if pb.check != po.check || po.check != pt.check {
+        return None;
+    }
+    if pb.blocks.len() != po.blocks.len() || po.blocks.len() != pt.blocks.len() {
+        return None;
+    }
+    if pb.blocks.is_empty() {
+        return None;
+    }
+    Some((pb, po, pt))
+}
+
+/// 判定の本体。**狭い順に試す** (TOML / JSON は平坦な行の集合にも見えるので先)。
+fn detect_lines(lines: &[Line]) -> Option<Plan> {
+    if lines.is_empty() {
+        return None;
+    }
+    let t: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+    detect_journal(&t)
+        .or_else(|| detect_toml(&t))
+        .or_else(|| detect_json(&t))
+        .or_else(|| detect_flat(&t))
+        .or_else(|| detect_bracket(&t))
+        .or_else(|| detect_imports(&t))
+}
+
+// ── 行を読むための小道具 ────────────────────────────────────────
+
+/// 先頭の空白。
+fn indent_of(s: &str) -> &str {
+    &s[..s.len() - s.trim_start().len()]
+}
+
+/// 行の括弧の増減と、途中の最小値。**二重引用符の中は読み飛ばす。**
+///
+/// 文字列を飛ばすのは `"a(b": 1` のような JSON のキーで釣り合いを
+/// 誤判定しないため。引用符が閉じない行は「読めない」として
+/// `(0, -1)` を返し、どの判定にも通さない。
+fn line_delta(s: &str) -> (i32, i32) {
+    let mut d = 0i32;
+    let mut lo = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => d += 1,
+            ')' | ']' | '}' => {
+                d -= 1;
+                lo = lo.min(d);
+            }
+            _ => {}
+        }
+    }
+    if in_str {
+        return (0, -1);
+    }
+    (d, lo)
+}
+
+/// その行だけで括弧が閉じているか。
+fn balanced(s: &str) -> bool {
+    let (d, lo) = line_delta(s);
+    d == 0 && lo >= 0
+}
+
+/// 文末記号で終わる行は**散文**とみなす。一覧の要素は文で終わらない。
+fn sentence_like(t: &str) -> bool {
+    matches!(
+        t.chars().last(),
+        Some('.' | '。' | '!' | '！' | '?' | '？' | '、' | '，')
+    )
+}
+
+/// 「1 行 1 要素」と認める形か。
+///
+/// `{}` と `()` を 1 文字でも含んだら降りるのが要 (これが無いと
+/// `fn a() {}` が 3 行並んだだけのファイルを「一覧」と読んでしまい、
+/// **関数を足しただけの本物の衝突を勝手に解決する**)。`[]` は残してある —
+/// `.gitignore` の `[abc]` や `requirements.txt` の `foo[extra]` が要る。
+fn flat_item(t: &str) -> bool {
+    if t.is_empty() || t.chars().count() > MAX_ITEM_CHARS {
+        return false;
+    }
+    if t.contains(['{', '}', '(', ')']) {
+        return false;
+    }
+    if !balanced(t) || sentence_like(t) {
+        return false;
+    }
+    if t.split_whitespace().count() > MAX_ITEM_WORDS {
+        return false;
+    }
+    // 次の行へ続く形 (継続・ブロックの開始) は 1 要素ではない。
+    // `=` は除いてある — go.sum のハッシュは base64 の `=` で終わる。
+    !matches!(t.chars().last(), Some(',' | '\\' | ':' | '{' | '[' | '('))
+}
+
+// ── 種類ごとの判定 ──────────────────────────────────────────────
+
+/// 見出しつきの追記帳 (`CHANGELOG.md` / `NEWS`)。
+///
+/// 「見出しが 1 つ以上」「箇条書きが 3 行以上」「箇条書きが本体
+/// (それ以外の行より多い)」の 3 つを満たしたときだけ。散文の多い
+/// README を掴まないための線引きで、掴まなければ素の git のまま。
+fn detect_journal(t: &[&str]) -> Option<Plan> {
+    let (mut heads, mut bullets, mut other) = (0usize, 0usize, 0usize);
+    let mut fenced = false;
+    for line in t {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if s.starts_with("```") {
+            fenced = !fenced;
+            other += 1;
+            continue;
+        }
+        if fenced {
+            other += 1;
+            continue;
+        }
+        if s.starts_with('#') && s.trim_start_matches('#').starts_with(' ') {
+            heads += 1;
+        } else if s.starts_with("- ") || s.starts_with("* ") || s.starts_with("+ ") {
+            bullets += 1;
+        } else {
+            other += 1;
+        }
+    }
+    if fenced || heads == 0 || bullets < MIN_ITEMS || bullets < other {
+        return None;
+    }
+    Some(Plan {
+        kind: ListKind::Journal,
+        check: Check::Off,
+        blocks: vec![(0, t.len())],
+    })
+}
+
+/// TOML: `[section]` が 1 つ以上あり、残りが全部 `key = value` / コメント。
+///
+/// 複数行の配列 (`members = [` で改行) があるファイルは掴まない
+/// (開いた行が 1 要素にならないため)。掴まなければ素の git のまま。
+fn detect_toml(t: &[&str]) -> Option<Plan> {
+    let mut heads: Vec<usize> = Vec::new();
+    let mut entries = 0usize;
+    for (i, line) in t.iter().enumerate() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        if s.starts_with('[') && s.ends_with(']') && balanced(s) && line.starts_with('[') {
+            heads.push(i);
+            continue;
+        }
+        if !toml_entry(s) {
+            return None;
+        }
+        entries += 1;
+    }
+    if heads.is_empty() || entries == 0 {
+        return None;
+    }
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    if heads[0] > 0 {
+        blocks.push((0, heads[0]));
+    }
+    for (k, &h) in heads.iter().enumerate() {
+        let end = heads.get(k + 1).copied().unwrap_or(t.len());
+        blocks.push((h + 1, end));
+    }
+    Some(Plan {
+        kind: ListKind::TomlSection,
+        check: Check::Toml,
+        blocks,
+    })
+}
+
+/// `key = value` 1 行ぶん。
+fn toml_entry(s: &str) -> bool {
+    let Some(eq) = s.find('=') else { return false };
+    let key = s[..eq].trim();
+    if key.is_empty() || key.contains('=') {
+        return false;
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '"' | '\''))
+    {
+        return false;
+    }
+    balanced(s) && !matches!(s.chars().last(), Some(',' | '\\' | '[' | '{' | '('))
+}
+
+/// JSON: **本物のパーサで読めたときだけ**。ブロックは「中身が全部 1 行」の本体。
+fn detect_json(t: &[&str]) -> Option<Plan> {
+    let joined = t.join("\n");
+    let head = joined.trim_start();
+    if !(head.starts_with('{') || head.starts_with('[')) {
+        return None;
+    }
+    if !json_ok(&joined) {
+        return None;
+    }
+    let blocks = flat_bodies(t, 2, false);
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(Plan {
+        kind: ListKind::Bracket,
+        check: Check::Json,
+        blocks,
+    })
+}
+
+/// コードの配列 / 構造体リテラル。**全要素が `,` で終わる本体だけ**を対象にする。
+///
+/// `,` を必須にしてあるのは、末尾に足しても構文が絶対に壊れないため
+/// (最後の要素に `,` が無い本体は、そこへ足すと壊れるので掴まない)。
+/// 開き括弧を `[` `{` に限るのは、関数呼び出しの引数 (`(`) を
+/// 「一覧」と誤認しないため — 引数の追加は本物の衝突である。
+fn detect_bracket(t: &[&str]) -> Option<Plan> {
+    let blocks = flat_bodies(t, MIN_ITEMS, true);
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(Plan {
+        kind: ListKind::Bracket,
+        check: Check::Brackets,
+        blocks,
+    })
+}
+
+/// コメント行か。**コメントの中身は自由文でよい**。
+///
+/// この例外が無いと、実在する `.gitignore` はほぼ全部落ちる
+/// (このリポジトリの `.gitignore` は 111 行中 40 行以上が日本語の説明で、
+///  `(誤コミット防止)` や `〜しない。` を含むため「散文」と判定されていた)。
+/// コメントを両側から足し合っても壊れるものは無い。
+fn comment_line(s: &str) -> bool {
+    s.starts_with('#') || s.starts_with("//") || s.starts_with(';')
+}
+
+/// 1 行 1 要素だけで出来たファイル (`.gitignore` / `requirements.txt` / `go.sum`)。
+fn detect_flat(t: &[&str]) -> Option<Plan> {
+    // シェバンがあれば**スクリプト**。命令の並びは一覧ではない
+    // (順序に意味があるので、両方残すと壊れる)。
+    if t.first().map(|l| l.starts_with("#!")).unwrap_or(false) {
+        return None;
+    }
+    let mut items = 0usize;
+    let mut ind: Option<&str> = None;
+    for line in t {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let i = indent_of(line);
+        match ind {
+            None => ind = Some(i),
+            Some(p) if p == i => {}
+            _ => return None,
+        }
+        if comment_line(s) {
+            continue;
+        }
+        if !flat_item(s) {
+            return None;
+        }
+        items += 1;
+    }
+    if items < MIN_ITEMS {
+        return None;
+    }
+    Some(Plan {
+        kind: ListKind::Flat,
+        check: Check::Off,
+        blocks: vec![(0, t.len())],
+    })
+}
+
+/// `use` / `mod` / `import` などが 3 行以上続くブロックだけを対象にする。
+fn detect_imports(t: &[&str]) -> Option<Plan> {
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut ind = "";
+    for (i, line) in t.iter().enumerate() {
+        let s = line.trim();
+        let ok = !s.is_empty() && import_line(s);
+        let same = ok && start.is_some() && ind == indent_of(line);
+        if same {
+            continue;
+        }
+        if let Some(st) = start.take() {
+            if i - st >= MIN_ITEMS {
+                blocks.push((st, i));
+            }
+        }
+        if ok {
+            start = Some(i);
+            ind = indent_of(line);
+        }
+    }
+    if let Some(st) = start {
+        if t.len() - st >= MIN_ITEMS {
+            blocks.push((st, t.len()));
+        }
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(Plan {
+        kind: ListKind::Imports,
+        check: Check::Off,
+        blocks,
+    })
+}
+
+/// 宣言 1 行ぶん。可視性の接頭辞は剥がしてから見る。
+fn import_line(s: &str) -> bool {
+    if !balanced(s) {
+        return false;
+    }
+    let mut rest = s;
+    for p in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(r) = rest.strip_prefix(p) {
+            rest = r.trim_start();
+            break;
+        }
+    }
+    const HEADS: &[&str] = &[
+        "use ",
+        "mod ",
+        "extern crate ",
+        "import ",
+        "export ",
+        "from ",
+        "require ",
+        "require(",
+        "using ",
+        "#include ",
+        "@import ",
+    ];
+    if !HEADS.iter().any(|h| rest.starts_with(h)) {
+        return false;
+    }
+    matches!(s.chars().last(), Some(';' | '"' | '\'' | ')' | '>'))
+}
+
+/// 「開いて閉じるまでの中身が全部 1 行」の本体を集める。
+///
+/// 入れ子の本体があると外側は候補から落ちる (中に 1 行で閉じない行が
+/// あるため)。結果として**ブロックは決して重ならない**。
+fn flat_bodies(t: &[&str], min_body: usize, require_comma: bool) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut ok = true;
+    let mut count = 0usize;
+    let mut ind: Option<String> = None;
+    for (i, raw) in t.iter().enumerate() {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let (d, lo) = line_delta(raw);
+        if d == 1 && lo >= 0 && matches!(s.chars().last(), Some('{' | '[')) {
+            open = Some(i + 1);
+            ok = true;
+            count = 0;
+            ind = None;
+            continue;
+        }
+        if d == -1 && lo < 0 {
+            if let Some(st) = open.take() {
+                if ok && count >= min_body && i >= st {
+                    out.push((st, i));
+                }
+            }
+            continue;
+        }
+        if open.is_some() {
+            if d != 0 || lo < 0 || (require_comma && !s.ends_with(',')) {
+                ok = false;
+            }
+            match &ind {
+                None => ind = Some(indent_of(raw).to_string()),
+                Some(p) if p == indent_of(raw) => {}
+                _ => ok = false,
+            }
+            count += 1;
+        }
+    }
+    out
+}
+
+// ── ブロック → 領域表 ──────────────────────────────────────────
+
+/// 自動判定のブロックから [`Regions`] を作る。
+///
+/// **ブロックの外は全部マーカ扱い**にするので、区切り行 (`}` や
+/// `[section]` の見出し) が union のチャンクへ紛れ込むことはあり得ない。
+fn regions_from_blocks(n: usize, blocks: &[(usize, usize)]) -> Regions {
+    let mut gap = vec![None; n + 1];
+    let mut marker = vec![true; n];
+    for (id, &(s, e)) in blocks.iter().enumerate() {
+        if s > e || e > n {
+            return Regions {
+                gap: vec![None; n + 1],
+                marker: vec![true; n],
+                count: 0,
+                balanced: false,
+            };
+        }
+        for g in gap.iter_mut().take(e + 1).skip(s) {
+            if g.is_some() {
+                // 重なった = 判定が壊れている。union を一切効かせない。
+                return Regions {
+                    gap: vec![None; n + 1],
+                    marker: vec![true; n],
+                    count: 0,
+                    balanced: false,
+                };
+            }
+            *g = Some(id);
+        }
+        for m in marker.iter_mut().take(e).skip(s) {
+            *m = false;
+        }
+    }
+    Regions {
+        gap,
+        marker,
+        count: blocks.len(),
+        balanced: true,
+    }
+}
+
+// ── キー — 「同じキーで値が違えば衝突」を実装する ───────────────
+
+/// その行の**キー**。両側が同じキーの行を足したら、それは追記ではなく衝突。
+///
+/// `::` を跨がないのが肝で、`BindAction::Save,` の `Action` を
+/// キーと読むと、列挙子を足しただけの追記が全部衝突になる。
+fn entry_key(t: &str, kind: ListKind) -> Option<String> {
+    let s = t.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if kind == ListKind::Journal {
+        let h = s.trim_start_matches('#');
+        if h.len() == s.len() {
+            return None;
+        }
+        let h = h.trim();
+        return (!h.is_empty()).then(|| format!("#{h}"));
+    }
+    // "key": value — JSON / 引用符付きの YAML
+    if let Some(rest) = s.strip_prefix('"') {
+        let q = rest.find('"')?;
+        let k = &rest[..q];
+        let after = rest[q + 1..].trim_start();
+        if after.starts_with(':') && !after.starts_with("::") && !k.is_empty() {
+            return Some(k.to_string());
+        }
+        return None;
+    }
+    if let Some(k) = decl_key(s) {
+        return Some(k);
+    }
+    // key = value / key: value
+    let mut end = 0usize;
+    for (i, c) in s.char_indices() {
+        if c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '/' | '@') {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let rest = s[end..].trim_start();
+    match rest.chars().next() {
+        Some('=') => Some(s[..end].to_string()),
+        Some(':') if !rest.starts_with("::") => Some(s[..end].to_string()),
+        _ => None,
+    }
+}
+
+/// `mod x;` / `use a::b;` / `extern crate c;` の名前。
+fn decl_key(s: &str) -> Option<String> {
+    let mut rest = s;
+    for p in ["pub(crate) ", "pub(super) ", "pub "] {
+        if let Some(r) = rest.strip_prefix(p) {
+            rest = r.trim_start();
+            break;
+        }
+    }
+    for kw in ["mod ", "use ", "extern crate "] {
+        if let Some(r) = rest.strip_prefix(kw) {
+            let name = r.trim_end_matches(';').trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                return None;
+            }
+            return Some(format!("{}:{name}", kw.trim()));
+        }
+    }
+    None
+}
+
+/// 2 回以上出てくるキーの集合。**`BTreeSet` なので反復順が出力へ漏れない。**
+fn dup_keys(lines: &[Line], kind: ListKind) -> BTreeSet<String> {
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for l in lines {
+        if let Some(k) = entry_key(&l.text, kind) {
+            *seen.entry(k).or_default() += 1;
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+// ── 構文検査 — 「壊れたものは返さない」 ─────────────────────────
+
+/// 出来上がりを検査する。**落ちたら結果ごと捨てて素の git へ降りる。**
+fn check_ok(p: &Plan, b: &[Line], o: &[Line], t: &[Line], out: &[Line], text: &str) -> bool {
+    // 1. 重複キー。**元から重複していたものだけ**許す (こちらが増やしたら駄目)。
+    let mut allowed = dup_keys(b, p.kind);
+    allowed.append(&mut dup_keys(o, p.kind));
+    allowed.append(&mut dup_keys(t, p.kind));
+    if !dup_keys(out, p.kind).iter().all(|k| allowed.contains(k)) {
+        return false;
+    }
+    match p.check {
+        Check::Off => true,
+        Check::Json => json_ok(text),
+        Check::Toml => toml_ok(text),
+        Check::Brackets => file_delta(out) == file_delta(b),
+    }
+}
+
+/// ファイル全体の括弧の増減と最小値。
+fn file_delta(lines: &[Line]) -> (i32, i32) {
+    let (mut d, mut lo) = (0i32, 0i32);
+    for l in lines {
+        let (dd, ll) = line_delta(&l.text);
+        lo = lo.min(d + ll);
+        d += dd;
+    }
+    (d, lo)
+}
+
+/// JSON として読み直す。**同じオブジェクトに同じキーが 2 つあったら不正**とする
+/// (規格上は許されるが、依存表としては壊れているため)。
+fn json_ok(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    if !json_value(b, &mut i, 0) {
+        return false;
+    }
+    json_ws(b, &mut i);
+    i == b.len()
+}
+
+fn json_ws(b: &[u8], i: &mut usize) {
+    while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r') {
+        *i += 1;
+    }
+}
+
+fn json_value(b: &[u8], i: &mut usize, depth: u32) -> bool {
+    if depth > 128 {
+        return false;
+    }
+    json_ws(b, i);
+    let Some(&c) = b.get(*i) else { return false };
+    match c {
+        b'{' => json_object(b, i, depth),
+        b'[' => json_array(b, i, depth),
+        b'"' => json_string(b, i).is_some(),
+        b't' => json_lit(b, i, b"true"),
+        b'f' => json_lit(b, i, b"false"),
+        b'n' => json_lit(b, i, b"null"),
+        _ => json_number(b, i),
+    }
+}
+
+fn json_lit(b: &[u8], i: &mut usize, w: &[u8]) -> bool {
+    if b.len() >= *i + w.len() && &b[*i..*i + w.len()] == w {
+        *i += w.len();
+        true
+    } else {
+        false
+    }
+}
+
+fn json_number(b: &[u8], i: &mut usize) -> bool {
+    let st = *i;
+    if b.get(*i) == Some(&b'-') {
+        *i += 1;
+    }
+    while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+        *i += 1;
+    }
+    if b.get(*i) == Some(&b'.') {
+        *i += 1;
+        while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            *i += 1;
+        }
+    }
+    if matches!(b.get(*i), Some(b'e' | b'E')) {
+        *i += 1;
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            *i += 1;
+        }
+    }
+    *i > st
+}
+
+fn json_string(b: &[u8], i: &mut usize) -> Option<String> {
+    if b.get(*i) != Some(&b'"') {
+        return None;
+    }
+    *i += 1;
+    let st = *i;
+    while let Some(&c) = b.get(*i) {
+        match c {
+            b'\\' => *i += 2,
+            b'"' => {
+                let s = String::from_utf8_lossy(&b[st..*i]).into_owned();
+                *i += 1;
+                return Some(s);
+            }
+            _ => *i += 1,
+        }
+    }
+    None
+}
+
+fn json_object(b: &[u8], i: &mut usize, depth: u32) -> bool {
+    *i += 1; // '{'
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    json_ws(b, i);
+    if b.get(*i) == Some(&b'}') {
+        *i += 1;
+        return true;
+    }
+    loop {
+        json_ws(b, i);
+        let Some(k) = json_string(b, i) else {
+            return false;
+        };
+        if !keys.insert(k) {
+            return false; // 同じキーが 2 つ = 壊れている
+        }
+        json_ws(b, i);
+        if b.get(*i) != Some(&b':') {
+            return false;
+        }
+        *i += 1;
+        if !json_value(b, i, depth + 1) {
+            return false;
+        }
+        json_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => *i += 1,
+            Some(b'}') => {
+                *i += 1;
+                return true;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn json_array(b: &[u8], i: &mut usize, depth: u32) -> bool {
+    *i += 1; // '['
+    json_ws(b, i);
+    if b.get(*i) == Some(&b']') {
+        *i += 1;
+        return true;
+    }
+    loop {
+        if !json_value(b, i, depth + 1) {
+            return false;
+        }
+        json_ws(b, i);
+        match b.get(*i) {
+            Some(b',') => *i += 1,
+            Some(b']') => {
+                *i += 1;
+                return true;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// TOML の最小検査。**セクション毎の重複キー**を弾く (依存表の壊れ方はこれ)。
+fn toml_ok(s: &str) -> bool {
+    let mut section = String::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for raw in s.split_inclusive('\n') {
+        let line = raw.trim_end_matches(['\n', '\r']);
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('[') && t.ends_with(']') && balanced(t) {
+            section = t.to_string();
+            continue;
+        }
+        if !toml_entry(t) {
+            return false;
+        }
+        let key = t[..t.find('=').unwrap_or(0)].trim().to_string();
+        if !seen.insert((section.clone(), key)) {
+            return false;
+        }
+    }
+    true
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 //  5. 公開 API
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -402,6 +1354,10 @@ pub struct UnionOpts {
     /// マーカが 1 つも無くてもファイル全体を対象にする。**既定は off**。
     /// `.gitattributes` で `merge=zaivern-union-whole` を付けたときだけ立つ。
     pub whole_file: bool,
+    /// マーカが無いとき、**中身から一覧を探す**。既定は off。
+    /// `merge=zaivern-union-auto` (= `--auto`) を付けたときだけ立つ。
+    /// マーカがあればそちらが勝つ (明示指定は自動判定より強い)。
+    pub auto: bool,
     /// 追記を辞書順に整列する。並び順に意味が無い一覧向け。
     pub sorted: bool,
     /// 衝突マーカの長さ (git が `%L` で渡してくる)。
@@ -416,6 +1372,7 @@ impl Default for UnionOpts {
     fn default() -> Self {
         Self {
             whole_file: false,
+            auto: false,
             sorted: false,
             marker_size: DEFAULT_MARKER_SIZE,
             ours_label: "ours".into(),
@@ -458,13 +1415,31 @@ pub fn resolve(base: &str, ours: &str, theirs: &str, opts: &UnionOpts) -> Resolu
         .or_else(|| eol_of(&t))
         .or_else(|| eol_of(&b))
         .unwrap_or("\n");
-    let (lines, conflicts) = three_way(&b, &o, &t, opts, dom);
-    let text = join_lines(&lines, dom);
-    if conflicts == 0 {
-        Resolution::Merged(text)
+    // 自動判定はマーカが 1 つも無いときだけ。**明示指定は自動判定より強い。**
+    let plans = if opts.auto && !opts.whole_file && !has_marker(base, ours, theirs) {
+        plans_for(&b, &o, &t)
     } else {
-        Resolution::Conflict(text)
+        None
+    };
+    let (lines, conflicts) = three_way(&b, &o, &t, opts, dom, plans.as_ref());
+    let text = join_lines(&lines, dom);
+    if conflicts > 0 {
+        return Resolution::Conflict(text);
     }
+    if let Some((pb, _, _)) = &plans {
+        // **構文を壊したら結果ごと捨てる。** 自動判定でしか通らない道なので、
+        // マーカを書いた人の結果は 1 バイトも変わらない。
+        if !check_ok(pb, &b, &o, &t, &lines, &text) {
+            let (l2, c2) = three_way(&b, &o, &t, opts, dom, None);
+            let t2 = join_lines(&l2, dom);
+            return if c2 == 0 {
+                Resolution::Merged(t2)
+            } else {
+                Resolution::Conflict(t2)
+            };
+        }
+    }
+    Resolution::Merged(text)
 }
 
 /// この 3 つの版のどれかに領域マーカがあるか。
@@ -488,6 +1463,7 @@ fn three_way(
     theirs: &[Line],
     opts: &UnionOpts,
     dom: &'static str,
+    plans: Option<&(Plan, Plan, Plan)>,
 ) -> (Vec<Line>, usize) {
     let bt: Vec<&str> = base.iter().map(|l| l.text.as_str()).collect();
     let ot: Vec<&str> = ours.iter().map(|l| l.text.as_str()).collect();
@@ -502,9 +1478,18 @@ fn three_way(
         t_of[i] = Some(j);
     }
 
-    let rb = regions_of(base, opts.whole_file);
-    let ro = regions_of(ours, opts.whole_file);
-    let rt = regions_of(theirs, opts.whole_file);
+    let (rb, ro, rt) = match plans {
+        Some((pb, po, pt)) => (
+            regions_from_blocks(base.len(), &pb.blocks),
+            regions_from_blocks(ours.len(), &po.blocks),
+            regions_from_blocks(theirs.len(), &pt.blocks),
+        ),
+        None => (
+            regions_of(base, opts.whole_file),
+            regions_of(ours, opts.whole_file),
+            regions_of(theirs, opts.whole_file),
+        ),
+    };
     // **片側でもマーカを触っていたら union は一切効かせない。**
     let union_ok = rb.balanced
         && ro.balanced
@@ -512,6 +1497,8 @@ fn three_way(
         && rb.count > 0
         && rb.count == ro.count
         && ro.count == rt.count;
+    let kind = plans.map(|(pb, _, _)| pb.kind);
+    let dedup = kind.map(ListKind::dedup).unwrap_or(Dedup::Fold);
 
     let mut out: Vec<Line> = Vec::new();
     let mut conflicts = 0usize;
@@ -534,6 +1521,8 @@ fn three_way(
                 union_ok,
                 opts,
                 dom,
+                kind,
+                dedup,
             },
             &mut out,
             &mut conflicts,
@@ -558,6 +1547,8 @@ fn three_way(
             union_ok,
             opts,
             dom,
+            kind,
+            dedup,
         },
         &mut out,
         &mut conflicts,
@@ -581,6 +1572,10 @@ struct Ctx<'a> {
     union_ok: bool,
     opts: &'a UnionOpts,
     dom: &'static str,
+    /// 自動判定で決まった種類 (マーカ方式なら `None`)。
+    kind: Option<ListKind>,
+    /// 重複行の扱い。種類ごとに決まる。
+    dedup: Dedup,
 }
 
 fn same(a: &[Line], b: &[Line]) -> bool {
@@ -638,7 +1633,7 @@ fn emit_chunk(s: Slices<'_>, cx: &Ctx<'_>, out: &mut Vec<Line>, conflicts: &mut 
                 && slice_region(cx.rb, ab, b.len()) == slice_region(cx.ro, ao, o.len())
                 && slice_region(cx.ro, ao, o.len()) == slice_region(cx.rt, at, t.len())
             {
-                union_merge(b, o, t, cx.opts)
+                union_merge(b, o, t, cx.opts, cx.kind, cx.dedup)
             } else {
                 None
             };
@@ -655,16 +1650,44 @@ fn emit_chunk(s: Slices<'_>, cx: &Ctx<'_>, out: &mut Vec<Line>, conflicts: &mut 
 }
 
 /// 「両側とも追記しかしていない」なら両方残した行を返す。そうでなければ `None`。
-fn union_merge(b: &[Line], o: &[Line], t: &[Line], opts: &UnionOpts) -> Option<Vec<Line>> {
+///
+/// **同じキーの行を両側が足していて中身が違えば `None`** (それは追記ではなく
+/// 衝突である)。`dedup` が [`Dedup::Keep`] のときは同じキーというだけで降りる
+/// — CHANGELOG に同じ見出しが 2 つ並ぶのは、人が直すべき状態だから。
+fn union_merge(
+    b: &[Line],
+    o: &[Line],
+    t: &[Line],
+    opts: &UnionOpts,
+    kind: Option<ListKind>,
+    dedup: Dedup,
+) -> Option<Vec<Line>> {
     let (o_ins, o_anchor) = align(b, o)?;
     let (t_ins, _) = align(b, t)?;
+    let kk = kind.unwrap_or(ListKind::Flat);
     // 両ブランチが**同じ行**を足した場合は 1 本にまとめる。空白だけの行は
     // 区切りとして何度も出てくるのが普通なので、畳まない。
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut o_keys: BTreeMap<String, &str> = BTreeMap::new();
     for slot in &o_ins {
         for l in slot {
             if !l.text.trim().is_empty() {
                 seen.insert(l.text.as_str());
+            }
+            if let Some(k) = entry_key(&l.text, kk) {
+                o_keys.insert(k, l.text.as_str());
+            }
+        }
+    }
+    for slot in &t_ins {
+        for l in slot {
+            let Some(k) = entry_key(&l.text, kk) else {
+                continue;
+            };
+            if let Some(prev) = o_keys.get(&k) {
+                if dedup == Dedup::Keep || *prev != l.text.as_str() {
+                    return None;
+                }
             }
         }
     }
@@ -672,7 +1695,7 @@ fn union_merge(b: &[Line], o: &[Line], t: &[Line], opts: &UnionOpts) -> Option<V
     for k in 0..=b.len() {
         let mut block: Vec<Line> = o_ins[k].clone();
         for l in &t_ins[k] {
-            if !l.text.trim().is_empty() && seen.contains(l.text.as_str()) {
+            if dedup == Dedup::Fold && !l.text.trim().is_empty() && seen.contains(l.text.as_str()) {
                 continue;
             }
             block.push(l.clone());
@@ -752,6 +1775,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
     for a in argv {
         match a.as_str() {
             "--whole" | "--whole-file" => opts.whole_file = true,
+            "--auto" => opts.auto = true,
             "--sorted" => opts.sorted = true,
             "-h" | "--help" => {
                 println!("{}", driver_help());
@@ -784,13 +1808,23 @@ pub fn cli_main(argv: &[String]) -> i32 {
     ) else {
         return delegate_to_git(o, a, b, opts.marker_size);
     };
-    // **マーカが 1 つも無いファイルでは何もしない。** git 本体へ委譲するので、
-    // 「ドライバを入れたら普段のマージまで変わった」が構造的に起こらない。
-    if !opts.whole_file && !has_marker(&bs, &os, &ts) {
+    // **マーカが 1 つも無いファイルでは、自動判定が確信できたときしか触らない。**
+    // どちらも当たらなければ git 本体へ委譲するので、「ドライバを入れたら
+    // 普段のマージまで変わった」が構造的に起こらない。
+    let markers = has_marker(&bs, &os, &ts);
+    let auto_only = opts.auto && !opts.whole_file && !markers;
+    if !opts.whole_file && !markers && !(opts.auto && auto_applies(&bs, &os, &ts)) {
         return delegate_to_git(o, a, b, opts.marker_size);
     }
 
     let res = resolve(&bs, &os, &ts, &opts);
+    // 自動判定モードは**全部解決できたときだけ**結果を差し替える。1 つでも
+    // 衝突が残るなら書き込む前に git 本体へ降りるので、こちらの衝突マーカが
+    // 画面に出ることは一度も無い (= 見た目が変わらない)。**`%A` へ書く前に
+    // 降りるのが肝** — 書いてしまうと `git merge-file` が読む ours が壊れる。
+    if auto_only && res.has_conflict() {
+        return delegate_to_git(o, a, b, opts.marker_size);
+    }
     if std::fs::write(a, res.text().as_bytes()).is_err() {
         eprintln!("{}", tr("zaivern-union: 結果を書き出せませんでした。"));
         return 2;
@@ -830,7 +1864,7 @@ fn delegate_to_git(o: &Path, a: &Path, b: &Path, marker: usize) -> i32 {
 
 fn driver_help() -> String {
     tr("\
-使い方: zai merge-driver [--whole] [--sorted] <base> <ours> <theirs> [マーカ長] [元のパス]
+使い方: zai merge-driver [--auto] [--whole] [--sorted] <base> <ours> <theirs> [マーカ長] [元のパス]
 
 git の custom merge driver です。手で呼ぶものではありません
 (パレットの「🧬 追記の自動マージ」から導入してください)。
@@ -866,16 +1900,243 @@ fn driver_command(exe: &Path, flags: &str) -> String {
     }
 }
 
+/// `.gitattributes` へ書く 1 行と、**そう決めた根拠**。
+///
+/// 根拠を持ち歩くのは、画面に「なぜこのパターンなのか」を出すため。
+/// 「ツールが勝手に書いた意味の分からない行」は必ず消される。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttrLine {
+    /// git のパターン (`.gitignore` / `*.toml` / `docs/list.txt`)。
+    pub pattern: String,
+    /// 当てるドライバ名。
+    pub driver: String,
+    /// 何を見てそう決めたか。
+    pub why: String,
+    /// このパターンに実際に当たった追跡ファイル数。
+    pub files: usize,
+    /// 既存の指定と衝突しないか調べるときの代表パス。
+    pub sample: String,
+}
+
+impl AttrLine {
+    /// `.gitattributes` の 1 行 (改行は含まない)。
+    pub fn line(&self) -> String {
+        format!("{} merge={}", self.pattern, self.driver)
+    }
+}
+
+/// 導入 / 解除の結果。**何をしたかを数で返す。**
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Report {
+    /// 実際に触ったリポジトリのルート。
+    pub root: PathBuf,
+    /// 登録 (または解除) したドライバの数。
+    pub drivers: usize,
+    /// `.gitattributes` へ書いた行。
+    pub added: Vec<AttrLine>,
+    /// **既に別の merge 指定があるので触らなかった**行。
+    pub skipped: Vec<AttrLine>,
+    /// 画面へそのまま出す 1 行。
+    pub message: String,
+}
+
+/// `.gitattributes` の**提案**に出してよい判定か。
+///
+/// 提案に載せるということは「このパターンのマージを全部こちらのバイナリへ
+/// 通す」ということなので、**ファイル全体が一覧**だと言い切れるものだけに
+/// 絞る。ブロック単位の判定 (`Imports` / コードの配列リテラル) は、
+/// 中身の 3 行だけを根拠に `*.rs` のような広いパターンを書くことになり、
+/// 効果に比べて影響範囲が大きすぎる (実測: このリポジトリでは 124 個の
+/// `.rs` のうち 102 個が該当してしまい `*.rs` が提案された)。
+/// **明示的に `.gitattributes` へ書けば今までどおり効く。**
+fn suggestable(p: &Plan) -> bool {
+    matches!(
+        (p.kind, p.check),
+        (ListKind::Flat, _)
+            | (ListKind::Journal, _)
+            | (ListKind::TomlSection, _)
+            | (ListKind::Bracket, Check::Json)
+    )
+}
+
+/// リポジトリを実際に見て、`.gitattributes` に足すべき行を起こす。
+///
+/// * **存在するファイルだけ**を対象にする (使われていないパターンを並べない)。
+/// * 判定は中身 ([`detect`])。拡張子はここで**パターンをまとめる**ときにしか
+///   使わない。対象になっても中身が一覧でなければ何も起きないので、
+///   まとめすぎても安全側に倒れる。
+/// * 既に別の merge ドライバが当たっているパターンは**返さない**
+///   (判定は git 自身の `check-attr` にやらせるので、glob の解釈がずれない)。
+/// * 並びは `BTreeMap` 由来で決定的。
+pub fn suggest_attributes(repo_root: &Path) -> Vec<AttrLine> {
+    let Ok(root) = crate::worktree::repo_root(repo_root) else {
+        return Vec::new();
+    };
+    let listed = git_out(&root, &["ls-files"]).unwrap_or_default();
+    let mut ext_read: BTreeMap<String, usize> = BTreeMap::new();
+    let mut hits: Vec<(String, ListKind)> = Vec::new();
+    let mut read = 0usize;
+    for rel in listed.lines().filter(|l| !l.is_empty()) {
+        if read >= MAX_SUGGEST_READ {
+            break;
+        }
+        let ext = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let full = root.join(rel);
+        let Ok(meta) = std::fs::metadata(&full) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_SUGGEST_BYTES {
+            continue;
+        }
+        read += 1;
+        if !ext.is_empty() {
+            *ext_read.entry(ext).or_default() += 1;
+        }
+        let Ok(text) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        let Some(plan) = detect_lines(&split_lines(&text)) else {
+            continue;
+        };
+        if !suggestable(&plan) {
+            continue;
+        }
+        hits.push((rel.to_string(), plan.kind));
+    }
+
+    // まとめ方は**狭い順**: よく知られた名前 → 同じファイル名 → 拡張子 → 個別。
+    // 1 つのファイルは 1 つのパターンにしか入らない。
+    let mut out: Vec<AttrLine> = Vec::new();
+    let base_of = |rel: &str| {
+        Path::new(rel)
+            .file_name()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut by_base: BTreeMap<String, Vec<(String, ListKind)>> = BTreeMap::new();
+    for h in hits {
+        by_base.entry(base_of(&h.0)).or_default().push(h);
+    }
+    let mut rest: Vec<(String, ListKind)> = Vec::new();
+    for (base, group) in by_base {
+        // よく知られた名前、または同じ名前が 2 つ以上あるならファイル名でまとめる。
+        if WELL_KNOWN.contains(&base.as_str()) || group.len() >= 2 {
+            out.push(AttrLine {
+                pattern: base,
+                driver: AUTO_DRIVER.to_string(),
+                why: trf(
+                    "{k} を {n} ファイルで確認",
+                    &[
+                        ("k", group[0].1.label().to_string()),
+                        ("n", group.len().to_string()),
+                    ],
+                ),
+                files: group.len(),
+                sample: group[0].0.clone(),
+            });
+        } else {
+            rest.extend(group);
+        }
+    }
+    let mut by_ext: BTreeMap<String, Vec<(String, ListKind)>> = BTreeMap::new();
+    let mut singles: Vec<(String, ListKind)> = Vec::new();
+    for h in rest {
+        let ext = Path::new(&h.0)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if ext.is_empty() {
+            singles.push(h);
+        } else {
+            by_ext.entry(ext).or_default().push(h);
+        }
+    }
+    for (ext, group) in by_ext {
+        let total = ext_read.get(&ext).copied().unwrap_or(group.len());
+        // 「その拡張子の過半数が一覧」ならまとめる。そうでなければ個別に出す。
+        if group.len() >= 2 && group.len() * 2 >= total {
+            out.push(AttrLine {
+                pattern: format!("*.{ext}"),
+                driver: AUTO_DRIVER.to_string(),
+                why: trf(
+                    "{k} が {n}/{t} ファイル",
+                    &[
+                        ("k", group[0].1.label().to_string()),
+                        ("n", group.len().to_string()),
+                        ("t", total.to_string()),
+                    ],
+                ),
+                files: group.len(),
+                sample: group[0].0.clone(),
+            });
+        } else {
+            singles.extend(group);
+        }
+    }
+    singles.sort();
+    for (rel, kind) in singles.into_iter().take(MAX_SUGGEST_PATHS) {
+        out.push(AttrLine {
+            pattern: rel.clone(),
+            driver: AUTO_DRIVER.to_string(),
+            why: trf("{k}", &[("k", kind.label().to_string())]),
+            files: 1,
+            sample: rel,
+        });
+    }
+    out.sort_by(|a, b| a.pattern.cmp(&b.pattern));
+    out
+}
+
+/// 既に別の merge ドライバが当たっている行を分ける。
+///
+/// 判定は `git check-attr` に任せる。**glob を自前で書くと必ずずれる**ので、
+/// git 自身に「このパスにはどの merge が当たるか」を聞く。
+fn split_existing(root: &Path, want: Vec<AttrLine>) -> (Vec<AttrLine>, Vec<AttrLine>) {
+    let (mut keep, mut skip) = (Vec::new(), Vec::new());
+    for a in want {
+        let probe = if a.sample.is_empty() {
+            a.pattern.clone()
+        } else {
+            a.sample.clone()
+        };
+        let cur = git_out(root, &["check-attr", "merge", "--", &probe]).unwrap_or_default();
+        let value = cur.rsplit_once(": ").map(|(_, v)| v.trim()).unwrap_or("");
+        if value.is_empty()
+            || value == "unspecified"
+            || value == "unset"
+            || value.starts_with("zaivern-union")
+        {
+            keep.push(a);
+        } else {
+            skip.push(a);
+        }
+    }
+    (keep, skip)
+}
+
 /// このリポジトリへドライバを登録し、`.gitattributes` の管理ブロックを書く。
-pub fn install(repo: &Path) -> Result<String, String> {
+pub fn install(repo: &Path) -> Result<Report, String> {
     let exe = std::env::current_exe()
         .map_err(|e| trf("実行ファイルの場所が分かりません: {e}", &[("e", e.to_string())]))?;
-    install_with(repo, &exe, &patterns_from_config(repo))
+    install_with(repo, &exe, configured_patterns(repo).as_deref())
 }
 
 /// [`install`] の中身。実行ファイルとパターンを外から渡せる形
 /// (テストがビルド済みバイナリの場所を差し替えられるようにするため)。
-pub fn install_with(repo: &Path, exe: &Path, patterns: &[String]) -> Result<String, String> {
+///
+/// `patterns` が `None` なら [`suggest_attributes`] にリポジトリを見て
+/// 決めさせる。**何度呼んでも同じ結果になる** (管理ブロックは 1 つだけ)。
+pub fn install_with(
+    repo: &Path,
+    exe: &Path,
+    patterns: Option<&[String]>,
+) -> Result<Report, String> {
     let root = crate::worktree::repo_root(repo)?;
     for (name, flags) in DRIVERS {
         let key_name = format!("merge.{name}.name");
@@ -884,15 +2145,39 @@ pub fn install_with(repo: &Path, exe: &Path, patterns: &[String]) -> Result<Stri
         git_out(&root, &["config", "--local", &key_name, DRIVER_DESC])?;
         git_out(&root, &["config", "--local", &key_drv, &cmd])?;
     }
-    write_attributes(&root, patterns)?;
-    Ok(trf(
-        "追記の自動マージを導入しました ({n} パターン)。",
-        &[("n", patterns.len().to_string())],
-    ))
+    let want: Vec<AttrLine> = match patterns {
+        Some(ps) => ps
+            .iter()
+            .map(|p| AttrLine {
+                pattern: p.clone(),
+                driver: AUTO_DRIVER.to_string(),
+                why: tr("設定 union.patterns の指定"),
+                files: 0,
+                sample: p.clone(),
+            })
+            .collect(),
+        None => suggest_attributes(&root),
+    };
+    let (added, skipped) = split_existing(&root, want);
+    write_attributes(&root, &added)?;
+    let message = trf(
+        "追記の自動マージを導入しました (パターン {n} 件 / 既存の指定があるので見送り {s} 件)。",
+        &[("n", added.len().to_string()), ("s", skipped.len().to_string())],
+    );
+    Ok(Report {
+        root,
+        drivers: DRIVERS.len(),
+        added,
+        skipped,
+        message,
+    })
 }
 
 /// 登録を解除し、`.gitattributes` の管理ブロックを取り除く。
-pub fn uninstall(repo: &Path) -> Result<String, String> {
+///
+/// **入れたものを綺麗に戻せないツールは信用されない。** こちらが作った
+/// `.gitattributes` は消し、人が書いた行は 1 つも触らない。
+pub fn uninstall(repo: &Path) -> Result<Report, String> {
     let root = crate::worktree::repo_root(repo)?;
     for (name, _) in DRIVERS {
         let section = format!("merge.{name}");
@@ -900,7 +2185,13 @@ pub fn uninstall(repo: &Path) -> Result<String, String> {
         let _ = git_out(&root, &["config", "--local", "--remove-section", &section]);
     }
     strip_attributes(&root)?;
-    Ok(tr("追記の自動マージを解除しました。"))
+    Ok(Report {
+        root,
+        drivers: DRIVERS.len(),
+        added: Vec::new(),
+        skipped: Vec::new(),
+        message: tr("追記の自動マージを解除しました。"),
+    })
 }
 
 /// このリポジトリにドライバが登録済みか。
@@ -910,11 +2201,14 @@ pub fn is_installed(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 設定 `union.patterns` から `.gitattributes` へ書くパターンを起こす。
-fn patterns_from_config(repo: &Path) -> Vec<String> {
+/// 設定 `union.patterns` の指定。**空なら `None`** = リポジトリを見て決める。
+fn configured_patterns(repo: &Path) -> Option<Vec<String>> {
     let cfg = crate::config::load(std::slice::from_ref(&repo.to_path_buf()), false);
     let raw = cfg.feature_str("union.patterns");
-    split_patterns(&raw)
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(split_patterns(&raw))
 }
 
 /// 空白 / カンマ区切りのパターン列を割る。空なら既定へ戻す。
@@ -980,17 +2274,29 @@ fn is_generated_attr_line(line: &str) -> bool {
     attr.starts_with("merge=zaivern-union")
 }
 
-fn write_attributes(root: &Path, patterns: &[String]) -> Result<(), String> {
+/// 管理ブロックを書き直す。**改行は元のファイルに合わせる** (CRLF の
+/// リポジトリで 1 行だけ LF になると、次の人の差分が全行になる)。
+fn write_attributes(root: &Path, lines: &[AttrLine]) -> Result<(), String> {
     let path = root.join(".gitattributes");
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let (mut kept, eol) = strip_block(&old);
+    if lines.is_empty() {
+        // 書くものが無いなら空のブロックを置かない (空白は作らない)。
+        if kept.trim().is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(());
+        }
+        return std::fs::write(&path, kept)
+            .map_err(|e| trf(".gitattributes を書けません: {e}", &[("e", e.to_string())]));
+    }
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push_str(eol);
     }
     kept.push_str(ATTR_BEGIN);
     kept.push_str(eol);
-    for p in patterns {
-        kept.push_str(&format!("{p} merge=zaivern-union{eol}"));
+    for a in lines {
+        kept.push_str(&a.line());
+        kept.push_str(eol);
     }
     kept.push_str(ATTR_END);
     kept.push_str(eol);
@@ -1022,6 +2328,8 @@ fn strip_attributes(root: &Path) -> Result<(), String> {
 struct Snapshot {
     installed: bool,
     files: Vec<Target>,
+    /// まだ導入していないときに「何を対象にするつもりか」を先に見せる。
+    suggest: Vec<AttrLine>,
     /// 走査を打ち切った件数 (黙って切らない)。
     truncated: usize,
     /// 画面へそのまま出す注記 (git が無い / リポジトリでない 等)。
@@ -1034,8 +2342,10 @@ struct Snapshot {
 struct Target {
     path: String,
     driver: String,
-    /// ファイル内の領域の数。0 なら「対象だが今は素の git と同じ」。
+    /// ファイル内の領域の数。0 なら「マーカは無い」。
     regions: usize,
+    /// マーカが無いときに自動判定が見つけた種類。**両方無ければ素の git と同じ。**
+    kind: Option<ListKind>,
 }
 
 /// 一度に `git check-attr` へ渡すパス数 (コマンド行の上限を避ける)。
@@ -1047,7 +2357,7 @@ const MAX_READ: usize = 300;
 /// 再走査の基準間隔 (実測に応じて `git::scan_interval` が伸ばす)。
 const SCAN_BASE: Duration = Duration::from_secs(4);
 
-fn scan(repo: &Path) -> Snapshot {
+fn scan(repo: &Path, want_suggest: bool) -> Snapshot {
     let t0 = Instant::now();
     let mut snap = Snapshot::default();
     let root = match crate::worktree::repo_root(repo) {
@@ -1085,6 +2395,7 @@ fn scan(repo: &Path) -> Snapshot {
                 path: path.to_string(),
                 driver: value.to_string(),
                 regions: 0,
+                kind: None,
             });
         }
     }
@@ -1092,7 +2403,16 @@ fn scan(repo: &Path) -> Snapshot {
     for f in snap.files.iter_mut().take(MAX_READ) {
         if let Ok(text) = std::fs::read_to_string(root.join(&f.path)) {
             f.regions = text.lines().filter(|l| l.contains(BEGIN)).count();
+            if f.regions == 0 {
+                f.kind = detect(&text);
+            }
         }
+    }
+    // 未導入のときだけ「何が対象になるか」を先に出す (導入後は上の一覧が答え)。
+    // **走査のたびには数えない** — 全ファイルを読むので実測 2.1 秒 (debug,
+    // 248 ファイル) かかる。開いた最初の 1 回だけ計算して以後は使い回す。
+    if want_suggest && !snap.installed {
+        snap.suggest = suggest_attributes(&root);
     }
     snap.cost = t0.elapsed();
     snap
@@ -1185,8 +2505,10 @@ struct PanelState {
     snap: Snapshot,
     pending: Option<Receiver<Snapshot>>,
     /// 導入 / 解除の結果。押した直後に画面へ出す。
-    action: Option<String>,
-    action_rx: Option<Receiver<Result<String, String>>>,
+    action: Option<Report>,
+    /// 失敗したときの文言。
+    action_err: Option<String>,
+    action_rx: Option<Receiver<Result<Report, String>>>,
     last_scan: Option<Instant>,
     last_cost: Option<Duration>,
 }
@@ -1213,15 +2535,15 @@ pub fn toggle_panel() {
     }
 }
 
-fn spawn_scan(root: PathBuf) -> Receiver<Snapshot> {
+fn spawn_scan(root: PathBuf, want_suggest: bool) -> Receiver<Snapshot> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(scan(&root));
+        let _ = tx.send(scan(&root, want_suggest));
     });
     rx
 }
 
-fn spawn_action(root: PathBuf, install_it: bool) -> Receiver<Result<String, String>> {
+fn spawn_action(root: PathBuf, install_it: bool) -> Receiver<Result<Report, String>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let r = if install_it {
@@ -1239,10 +2561,16 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
     if let Some(rx) = &st.action_rx {
         match rx.try_recv() {
             Ok(r) => {
-                st.action = Some(match r {
-                    Ok(m) => m,
-                    Err(e) => e,
-                });
+                match r {
+                    Ok(rep) => {
+                        st.action = Some(rep);
+                        st.action_err = None;
+                    }
+                    Err(e) => {
+                        st.action = None;
+                        st.action_err = Some(e);
+                    }
+                }
                 st.action_rx = None;
                 st.last_scan = None; // 変えたので取り直す
             }
@@ -1252,8 +2580,12 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
     }
     if let Some(rx) = &st.pending {
         match rx.try_recv() {
-            Ok(s) => {
+            Ok(mut s) => {
                 st.last_cost = Some(s.cost);
+                if s.suggest.is_empty() {
+                    // 今回計算していないなら、前回の提案をそのまま残す。
+                    s.suggest = std::mem::take(&mut st.snap.suggest);
+                }
                 st.snap = s;
                 st.last_scan = Some(Instant::now());
                 st.pending = None;
@@ -1267,7 +2599,8 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
             .last_scan
             .is_none_or(|t| t.elapsed() >= crate::git::scan_interval(SCAN_BASE, st.last_cost));
         if due {
-            st.pending = Some(spawn_scan(st.root.clone()));
+            let want = st.snap.suggest.is_empty();
+            st.pending = Some(spawn_scan(st.root.clone(), want));
         }
     }
     // 開いている間だけ、結果を拾うために軽く回す。
@@ -1312,6 +2645,7 @@ pub fn draw(app: &mut crate::app::ZaivernApp, ctx: &egui::Context) {
         Action::Install | Action::Uninstall => {
             if st.action_rx.is_none() {
                 st.action = None;
+                st.action_err = None;
                 st.action_rx = Some(spawn_action(
                     st.root.clone(),
                     matches!(act, Action::Install),
@@ -1366,8 +2700,32 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Action {
             ui.label(egui::RichText::new(tr("実行中…")).color(dim));
         }
     });
-    if let Some(m) = &st.action {
-        ui.label(egui::RichText::new(m).color(dim));
+    if let Some(r) = &st.action {
+        ui.label(egui::RichText::new(&r.message).color(dim));
+        if !r.added.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    r.added
+                        .iter()
+                        .map(|a| a.pattern.clone())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+                .color(dim),
+            );
+        }
+        for a in &r.skipped {
+            ui.label(
+                egui::RichText::new(trf(
+                    "{p} は既に別の merge 指定があるので触っていません",
+                    &[("p", a.pattern.clone())],
+                ))
+                .color(dim),
+            );
+        }
+    }
+    if let Some(e) = &st.action_err {
+        ui.label(egui::RichText::new(e).color(ui.visuals().warn_fg_color));
     }
     if let Some(n) = &st.snap.note {
         ui.label(egui::RichText::new(n).color(ui.visuals().warn_fg_color));
@@ -1405,10 +2763,15 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Action {
                 if let Some(r) = cell.next() {
                     let txt = if f.regions > 0 {
                         trf("領域 {n}", &[("n", f.regions.to_string())])
+                    } else if let Some(k) = f.kind {
+                        tr(k.label())
                     } else {
                         tr("—")
                     };
-                    ui.put(*r, egui::Label::new(egui::RichText::new(txt).color(dim)));
+                    ui.put(
+                        *r,
+                        egui::Label::new(egui::RichText::new(txt).color(dim)).truncate(),
+                    );
                 }
             }
         });
@@ -1430,12 +2793,34 @@ fn empty_state(ui: &mut egui::Ui, st: &PanelState) {
                 );
             } else {
                 ui.label(tr("このリポジトリにはまだ導入されていません。"));
-                ui.label(
-                    egui::RichText::new(tr(
-                        "「このリポジトリに導入」を押すと、一覧への追記どうしが衝突しなくなります。",
-                    ))
-                    .color(ui.visuals().weak_text_color()),
-                );
+                if st.snap.suggest.is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr(
+                            "「このリポジトリに導入」を押すと、一覧への追記どうしが衝突しなくなります。",
+                        ))
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(trf(
+                            "導入すると {n} パターンが対象になります: {p}",
+                            &[
+                                ("n", st.snap.suggest.len().to_string()),
+                                (
+                                    "p",
+                                    st.snap
+                                        .suggest
+                                        .iter()
+                                        .take(6)
+                                        .map(|a| a.pattern.clone())
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
+                                ),
+                            ],
+                        ))
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
             }
         });
     });
@@ -1466,9 +2851,9 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     draw: Some(draw),
     settings: &[crate::feature::Setting {
         key: "union.patterns",
-        label: "追記の自動マージを適用するファイル (空白区切り)",
-        help: "導入時に .gitattributes へ書き込むパターンです。マーカが無いファイルは素の git と同じ挙動のままなので、広めに指定して構いません。",
-        default: crate::feature::SettingValue::Text(DEFAULT_PATTERNS),
+        label: "追記の自動マージを適用するファイル (空白区切り / 空ならリポジトリを見て決める)",
+        help: "導入時に .gitattributes へ書き込むパターンです。空にしておくと、実際にリポジトリを走査して「1 行 1 要素の一覧」だと確信できたファイルだけを対象にします。対象になっても中身が一覧でなければ素の git と同じ結果のままです。",
+        default: crate::feature::SettingValue::Text(""),
     }],
     binds: &[],
 };
@@ -1895,7 +3280,7 @@ mod tests {
         let exe = repo.join("fake-zai");
         let pats = vec!["*.md".to_string()];
         for _ in 0..2 {
-            install_with(&repo, &exe, &pats).expect("導入");
+            install_with(&repo, &exe, Some(&pats)).expect("導入");
         }
         assert!(is_installed(&repo));
         let attrs = std::fs::read_to_string(repo.join(".gitattributes")).expect("読める");
@@ -1923,7 +3308,7 @@ mod tests {
         };
         let keep = "*.png binary\n*.txt text eol=lf\n";
         std::fs::write(repo.join(".gitattributes"), keep).expect("write");
-        install_with(&repo, &repo.join("fake-zai"), &["*.md".to_string()]).expect("導入");
+        install_with(&repo, &repo.join("fake-zai"), Some(&["*.md".to_string()])).expect("導入");
         let after = std::fs::read_to_string(repo.join(".gitattributes")).expect("読める");
         assert!(after.starts_with(keep), "既存の行が先頭に残る:\n{after}");
         uninstall(&repo).expect("解除");
@@ -1988,7 +3373,13 @@ mod tests {
             .iter()
             .map(|k| std::env::var(k).unwrap_or_default())
             .collect();
-        let mut all = vec![o];
+        // `--auto` などのフラグも環境変数で渡す (位置引数は libtest が食う)。
+        let mut all: Vec<String> = std::env::var("ZV_UNION_FLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        all.push(o);
         all.extend(argv);
         std::process::exit(cli_main(&all));
     }
@@ -2313,6 +3704,658 @@ mod tests {
         assert!(src.contains("std::thread::spawn"), "裏のスレッドが無い");
     }
 
+
+    // ── 11. 自動判定 (マーカ無し) ──
+    //
+    // **「誤自動解決」の定義**をここで固定しておく。以下のどれかが起きたら
+    // 誤自動解決であり、テストは落ちなければならない:
+    //
+    //   (a) 片側の追記が結果から消える (取りこぼし)
+    //   (b) 元からあった行が消える / 順序が変わる
+    //   (c) どちらの版にも無い行が出てくる (でっち上げ)
+    //   (d) 出来上がりが構文として壊れている (JSON / TOML / 括弧)
+    //   (e) 既存行の**書き換え**を追記として畳んだ
+    //   (f) 同じキーの別の値を 2 つ並べた
+    //
+    // (a)〜(c) は `自動_解決したら必ず全部の追記が残り勝手な行は増えない` が
+    // 乱数で 800 件回して確かめる。(d)〜(f) は種類ごとに個別のテストで固定する。
+
+    fn auto() -> UnionOpts {
+        UnionOpts {
+            auto: true,
+            ..UnionOpts::default()
+        }
+    }
+
+    /// 自動判定で解決できたときの中身。解決しなければ panic する。
+    fn auto_merged(base: &str, ours: &str, theirs: &str) -> String {
+        match resolve(base, ours, theirs, &auto()) {
+            Resolution::Merged(s) => s,
+            Resolution::Conflict(s) => panic!("解決してほしかったのに衝突した:\n{s}"),
+        }
+    }
+
+    /// 自動判定でも解決しないことの確認。
+    fn auto_conflicted(base: &str, ours: &str, theirs: &str) {
+        assert!(
+            resolve(base, ours, theirs, &auto()).has_conflict(),
+            "人間に返してほしい場面で自動解決した"
+        );
+    }
+
+    const IGNORE: &str = "target/\nnode_modules/\n*.log\n";
+
+    #[test]
+    fn 自動_gitignore型の一覧はマーカ無しで両側の追記が残る() {
+        let got = auto_merged(
+            IGNORE,
+            &format!("{IGNORE}dist/\n"),
+            &format!("{IGNORE}.venv/\n"),
+        );
+        assert_eq!(got, format!("{IGNORE}dist/\n.venv/\n"));
+    }
+
+    #[test]
+    fn 自動_中身を見て判定する_同じ拡張子でも一覧でなければ降りる() {
+        // どちらも拡張子は無い / 同じでも、判定は中身だけで決まる。
+        assert_eq!(detect(IGNORE), Some(ListKind::Flat));
+        assert_eq!(
+            detect("fn main() {\n    println!(\"hi\");\n}\n"),
+            None,
+            "コードは一覧ではない"
+        );
+        assert_eq!(
+            detect("これは説明です。\nもう一行あります。\nさらに続きます。\n"),
+            None,
+            "散文は一覧ではない"
+        );
+        assert_eq!(
+            detect("fn a() {}\nfn b() {}\nfn c() {}\n"),
+            None,
+            "短い関数が並んでいても一覧ではない"
+        );
+    }
+
+    #[test]
+    fn 自動_一覧でない中身は一切解決しない() {
+        let base = "fn main() {\n    let a = 1;\n}\n";
+        auto_conflicted(
+            base,
+            "fn main() {\n    let a = 1;\n    let b = 2;\n}\n",
+            "fn main() {\n    let a = 1;\n    let c = 3;\n}\n",
+        );
+    }
+
+    #[test]
+    fn 自動_関数呼び出しの引数は一覧と見なさない() {
+        // `(` で開く本体は対象外。引数の追加は本物の衝突である。
+        let base = "fn f() {\n    call(\n        a,\n        b,\n        c,\n    );\n}\n";
+        assert_eq!(detect(base), None);
+    }
+
+    #[test]
+    fn 自動_配列リテラルの要素追加は両方残る() {
+        let base = "pub const ITEMS: &[&str] = &[\n    \"alpha\",\n    \"beta\",\n    \"gamma\",\n];\n";
+        let ours = base.replace("    \"beta\",\n", "    \"beta\",\n    \"ours\",\n");
+        let theirs = base.replace("    \"beta\",\n", "    \"beta\",\n    \"theirs\",\n");
+        let got = auto_merged(base, &ours, &theirs);
+        assert!(got.contains("\"ours\","), "{got}");
+        assert!(got.contains("\"theirs\","), "{got}");
+        assert!(
+            got.find("\"ours\"") < got.find("\"theirs\""),
+            "順序は ours → theirs:\n{got}"
+        );
+    }
+
+    const PKG: &str = "{\n  \"name\": \"demo\",\n  \"dependencies\": {\n    \"alpha\": \"^1.0.0\",\n    \"gamma\": \"^3.0.0\"\n  }\n}\n";
+
+    #[test]
+    fn 自動_package_json型はキーが違えば両方残り_json_として妥当() {
+        let ours = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^2.0.0\",\n",
+        );
+        let theirs = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"delta\": \"^4.0.0\",\n",
+        );
+        let got = auto_merged(PKG, &ours, &theirs);
+        assert!(json_ok(&got), "構文が壊れている:\n{got}");
+        for k in ["alpha", "beta", "delta", "gamma"] {
+            assert!(got.contains(&format!("\"{k}\"")), "{k} が消えた:\n{got}");
+        }
+    }
+
+    #[test]
+    fn 自動_同じキーで値が違えば解決しない() {
+        let ours = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^2.0.0\",\n",
+        );
+        let theirs = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^9.9.9\",\n",
+        );
+        auto_conflicted(PKG, &ours, &theirs);
+    }
+
+    #[test]
+    fn 自動_同じキーで値も同じなら一本に畳む() {
+        let add = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^2.0.0\",\n",
+        );
+        let got = auto_merged(PKG, &add, &add);
+        assert_eq!(got.matches("\"beta\"").count(), 1, "二重になった:\n{got}");
+        assert!(json_ok(&got));
+    }
+
+    const TOML: &str = "[dependencies]\nserde = \"1\"\nanyhow = \"1\"\n\n[dev-dependencies]\ntempfile = \"3\"\n";
+
+    #[test]
+    fn 自動_toml_のセクションはキーが違えば両方残る() {
+        let ours = TOML.replace("anyhow = \"1\"\n", "anyhow = \"1\"\nregex = \"1\"\n");
+        let theirs = TOML.replace("anyhow = \"1\"\n", "anyhow = \"1\"\nonce_cell = \"1\"\n");
+        let got = auto_merged(TOML, &ours, &theirs);
+        assert!(toml_ok(&got), "構文が壊れている:\n{got}");
+        assert!(got.contains("regex = ") && got.contains("once_cell = "), "{got}");
+    }
+
+    #[test]
+    fn 自動_toml_で同じキーが両側から来たら解決しない() {
+        let ours = TOML.replace("anyhow = \"1\"\n", "anyhow = \"1\"\nregex = \"1\"\n");
+        let theirs = TOML.replace("anyhow = \"1\"\n", "anyhow = \"1\"\nregex = \"2\"\n");
+        auto_conflicted(TOML, &ours, &theirs);
+    }
+
+    const CHANGELOG: &str =
+        "# Changelog\n\n## Unreleased\n\n- 既存の項目\n- もう一つ\n- 三つ目\n";
+
+    #[test]
+    fn 自動_changelog_は両方残し_重複を畳まない() {
+        // 一覧は集合なので畳むが、追記帳は「同じ文面の 2 件」がありうる。
+        // (両側が**まったく同じ**変更をしたときは 3-way マージの規則で
+        //  1 本になるので、片方だけ重なる形で確かめる。)
+        assert_eq!(detect(CHANGELOG), Some(ListKind::Journal));
+        let got = auto_merged(
+            CHANGELOG,
+            &format!("{CHANGELOG}- 同じ文面\n- ours 固有\n"),
+            &format!("{CHANGELOG}- 同じ文面\n- theirs 固有\n"),
+        );
+        assert_eq!(
+            got.matches("- 同じ文面").count(),
+            2,
+            "追記帳では畳まない:\n{got}"
+        );
+        // 対して一覧は畳む。
+        let g2 = auto_merged(
+            IGNORE,
+            &format!("{IGNORE}dist/\nours/\n"),
+            &format!("{IGNORE}dist/\ntheirs/\n"),
+        );
+        assert_eq!(g2.matches("dist/").count(), 1, "一覧は畳む:\n{g2}");
+    }
+
+    #[test]
+    fn 自動_changelog_で同じ見出しを両側が足したら解決しない() {
+        let ours = CHANGELOG.replace("## Unreleased\n", "## 0.2.0\n\n- ours\n\n## Unreleased\n");
+        let theirs = CHANGELOG.replace("## Unreleased\n", "## 0.2.0\n\n- theirs\n\n## Unreleased\n");
+        auto_conflicted(CHANGELOG, &ours, &theirs);
+    }
+
+    const MODS: &str = "// 先頭のコメント\nfn helper() { }\nmod app;\nmod git;\nmod term;\n\nfn main() {}\n";
+
+    #[test]
+    fn 自動_宣言の連続ブロックだけが対象になる() {
+        assert_eq!(detect(MODS), Some(ListKind::Imports));
+        let ours = MODS.replace("mod git;\n", "mod git;\nmod alpha;\n");
+        let theirs = MODS.replace("mod git;\n", "mod git;\nmod beta;\n");
+        let got = auto_merged(MODS, &ours, &theirs);
+        assert!(got.contains("mod alpha;") && got.contains("mod beta;"), "{got}");
+        // ブロックの外 (関数本体) は対象外なので、そこは衝突のまま人間に返る。
+        let o2 = MODS.replace("fn main() {}", "fn main() { ours() }");
+        let t2 = MODS.replace("fn main() {}", "fn main() { theirs() }");
+        auto_conflicted(MODS, &o2, &t2);
+    }
+
+    #[test]
+    fn 自動_片側が既存行を変更したら解決しない() {
+        // 書き換え × 同じ場所への追記
+        auto_conflicted(
+            IGNORE,
+            &IGNORE.replace("*.log\n", "*.log.bak\n"),
+            &format!("{IGNORE}dist/\n"),
+        );
+        // 削除 × 同じ場所への追記
+        auto_conflicted(
+            IGNORE,
+            &IGNORE.replace("node_modules/\n", ""),
+            &IGNORE.replace("node_modules/\n", "node_modules/\nextra/\n"),
+        );
+    }
+
+    #[test]
+    fn 自動_マーカがあればマーカが勝つ() {
+        // マーカで囲った内側だけが対象 = 外側の追記は解決しない。
+        let base = wrapped("- a\n");
+        let ours = format!("{}外側から\n", wrapped("- a\n- ours\n"));
+        let theirs = format!("{}外側から2\n", wrapped("- a\n- theirs\n"));
+        assert!(
+            resolve(&base, &ours, &theirs, &auto()).has_conflict(),
+            "マーカの外は自動判定で拾わない"
+        );
+    }
+
+    #[test]
+    fn 自動_crlf_のファイルは_crlf_のまま返る() {
+        let crlf = |s: &str| s.replace('\n', "\r\n");
+        let got = auto_merged(
+            &crlf(IGNORE),
+            &crlf(&format!("{IGNORE}dist/\n")),
+            &crlf(&format!("{IGNORE}.venv/\n")),
+        );
+        assert_eq!(got, crlf(&format!("{IGNORE}dist/\n.venv/\n")));
+        assert!(!got.contains("\n\n"), "LF へ潰していない: {got:?}");
+    }
+
+    #[test]
+    fn 自動_順序は常に_ours_から_theirs_で決定的() {
+        let o = format!("{IGNORE}zzz/\n");
+        let t = format!("{IGNORE}aaa/\n");
+        let got = auto_merged(IGNORE, &o, &t);
+        assert_eq!(got, format!("{IGNORE}zzz/\naaa/\n"), "辞書順ではなく ours→theirs");
+        // 何度呼んでも同じ (`HashMap` の反復順が漏れていない)。
+        for _ in 0..8 {
+            assert_eq!(auto_merged(IGNORE, &o, &t), got);
+        }
+    }
+
+    // ── 12. 不変条件を乱数で確かめる (誤自動解決 0 件の根拠) ──
+
+    /// 決定的な擬似乱数。**実行ごとに変わってはいけない** (再現できないテストは
+    /// 落ちたときに何も教えてくれない)。
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+        fn pick(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// `sub` が `all` の部分列か (元の行が順序どおり全部残っているか)。
+    fn is_subsequence(sub: &[&str], all: &[&str]) -> bool {
+        let mut it = all.iter();
+        sub.iter().all(|x| it.any(|y| y == x))
+    }
+
+    /// 隙間へ行を挿し込んだ版を作る。
+    fn insert_at(base: &[String], at: &[(usize, String)]) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for (i, l) in base.iter().enumerate() {
+            for (g, s) in at {
+                if *g == i {
+                    out.push(s.clone());
+                }
+            }
+            out.push(l.clone());
+        }
+        for (g, s) in at {
+            if *g >= base.len() {
+                out.push(s.clone());
+            }
+        }
+        out.join("\n") + "\n"
+    }
+
+    #[test]
+    fn 自動_解決したら必ず全部の追記が残り勝手な行は増えない() {
+        let mut rng = Rng(0x5EED_1234);
+        let mut resolved = 0usize;
+        for shape in 0..4u32 {
+            for _ in 0..200 {
+                let n = 3 + rng.pick(6);
+                let base: Vec<String> = (0..n)
+                    .map(|i| match shape {
+                        0 => format!("path_{i}/"),
+                        1 => format!("    \"k{i}\": \"1.0\","),
+                        2 => format!("key_{i} = \"1\""),
+                        _ => format!("- 既存 {i}"),
+                    })
+                    .collect();
+                let (head, tail) = match shape {
+                    0 => (Vec::new(), Vec::new()),
+                    1 => (
+                        vec!["{".to_string(), "  \"deps\": {".to_string()],
+                        vec!["    \"zz\": \"9\"".to_string(), "  }".to_string(), "}".to_string()],
+                    ),
+                    2 => (vec!["[dependencies]".to_string()], Vec::new()),
+                    _ => (vec!["# Changelog".to_string(), String::new(), "## Unreleased".to_string(), String::new()], Vec::new()),
+                };
+                let full: Vec<String> = head
+                    .iter()
+                    .chain(base.iter())
+                    .chain(tail.iter())
+                    .cloned()
+                    .collect();
+                let gap0 = head.len();
+                let mk = |rng: &mut Rng, who: &str, cnt: usize| -> Vec<(usize, String)> {
+                    (0..cnt)
+                        .map(|j| {
+                            let g = gap0 + rng.pick(base.len() + 1);
+                            let s = match shape {
+                                0 => format!("{who}_{j}/"),
+                                1 => format!("    \"{who}{j}\": \"2.0\","),
+                                2 => format!("{who}{j} = \"2\""),
+                                _ => format!("- {who} の追記 {j}"),
+                            };
+                            (g, s)
+                        })
+                        .collect()
+                };
+                let (no, nt) = (1 + rng.pick(3), 1 + rng.pick(3));
+                let oa = mk(&mut rng, "ours", no);
+                let ta = mk(&mut rng, "theirs", nt);
+                let bs = full.join("\n") + "\n";
+                let os = insert_at(&full, &oa);
+                let ts = insert_at(&full, &ta);
+                let r = resolve(&bs, &os, &ts, &auto());
+                let Resolution::Merged(got) = r else { continue };
+                resolved += 1;
+                let got_lines: Vec<&str> = got.lines().collect();
+                let base_lines: Vec<&str> = bs.lines().collect();
+                // (b) 元の行が順序どおり全部残っている
+                assert!(
+                    is_subsequence(&base_lines, &got_lines),
+                    "元の行が消えた/並び替わった:\n{got}"
+                );
+                // (a) 両側の追記が全部残っている
+                for (_, s) in oa.iter().chain(ta.iter()) {
+                    assert!(got.contains(s.as_str()), "追記が消えた {s:?}:\n{got}");
+                }
+                // (c) どちらの版にも無い行は出てこない
+                let known: BTreeSet<&str> = bs.lines().chain(os.lines()).chain(ts.lines()).collect();
+                for l in &got_lines {
+                    assert!(known.contains(l), "でっち上げの行 {l:?}:\n{got}");
+                }
+                // (d) 構文が壊れていない
+                if shape == 1 {
+                    assert!(json_ok(&got), "JSON が壊れた:\n{got}");
+                }
+                if shape == 2 {
+                    assert!(toml_ok(&got), "TOML が壊れた:\n{got}");
+                }
+                // 決定的
+                assert_eq!(resolve(&bs, &os, &ts, &auto()).text(), got, "結果が揺れた");
+            }
+        }
+        assert!(resolved > 400, "解決した件数が少なすぎる ({resolved}/800)");
+    }
+
+    // ── 13. 部品の単体テスト ──
+
+    #[test]
+    fn json_の受理と拒否() {
+        assert!(json_ok("{\"a\": 1, \"b\": [1, 2, null]}"));
+        assert!(json_ok("[]"));
+        assert!(!json_ok("{\"a\": 1,}"), "末尾のカンマは JSON では不正");
+        assert!(!json_ok("{\"a\": 1, \"a\": 2}"), "重複キーは壊れている扱い");
+        assert!(!json_ok("{\"a\": 1"), "閉じていない");
+    }
+
+    #[test]
+    fn toml_の受理と拒否() {
+        assert!(toml_ok("[a]\nx = 1\ny = 2\n"));
+        assert!(toml_ok("[a]\nx = 1\n\n[b]\nx = 2\n"), "別セクションなら同名でよい");
+        assert!(!toml_ok("[a]\nx = 1\nx = 2\n"), "同じセクションの重複キー");
+    }
+
+    #[test]
+    fn キーは二重コロンを跨がない() {
+        // ここを間違えると `BindAction::Save,` の追記が全部衝突になる。
+        assert_eq!(entry_key("    BindAction::Act1,", ListKind::Flat), None);
+        assert_eq!(
+            entry_key("    \"serde\": \"1\",", ListKind::Bracket).as_deref(),
+            Some("serde")
+        );
+        assert_eq!(entry_key("serde = \"1\"", ListKind::Flat).as_deref(), Some("serde"));
+        assert_eq!(
+            entry_key("requests==2.31.0", ListKind::Flat).as_deref(),
+            Some("requests")
+        );
+        assert_eq!(entry_key("mod app;", ListKind::Imports).as_deref(), Some("mod:app"));
+        assert_eq!(entry_key("target/", ListKind::Flat), None);
+        assert_eq!(entry_key("- 箇条書き", ListKind::Journal), None);
+        assert_eq!(
+            entry_key("## 0.2.0", ListKind::Journal).as_deref(),
+            Some("#0.2.0")
+        );
+    }
+
+    #[test]
+    fn 自動判定のブロックは重ならず昇順() {
+        for text in [IGNORE, PKG, TOML, CHANGELOG, MODS] {
+            let Some(p) = detect_lines(&split_lines(text)) else {
+                panic!("判定できない: {text:?}");
+            };
+            let mut prev = 0usize;
+            for (s, e) in &p.blocks {
+                assert!(*s <= *e, "空でない区間 {s}..{e}");
+                assert!(*s >= prev, "重なっている {s}..{e} (前は {prev} まで)");
+                prev = *e + 1;
+            }
+        }
+    }
+
+    // ── 14. `.gitattributes` の自動生成 ──
+
+    /// 一覧・散文・コードが 1 つずつ入った使い捨てリポジトリ。
+    fn suggest_repo(tag: &str) -> Option<PathBuf> {
+        let repo = temp_repo(tag)?;
+        std::fs::write(repo.join(".gitignore"), IGNORE).ok()?;
+        std::fs::write(repo.join("README.md"), "# Demo\n\nこれは説明です。\n").ok()?;
+        std::fs::create_dir_all(repo.join("src")).ok()?;
+        std::fs::write(
+            repo.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .ok()?;
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        Some(repo)
+    }
+
+    #[test]
+    fn 提案は実在して中身が一覧のファイルだけを出す() {
+        let Some(repo) = suggest_repo("suggest") else {
+            println!("git が無い環境なのでスキップ");
+            return;
+        };
+        let got = suggest_attributes(&repo);
+        let pats: Vec<&str> = got.iter().map(|a| a.pattern.as_str()).collect();
+        assert!(pats.contains(&".gitignore"), "{pats:?}");
+        assert!(!pats.iter().any(|p| p.contains("README")), "散文は出さない: {pats:?}");
+        assert!(!pats.iter().any(|p| p.contains("main.rs")), "コードは出さない: {pats:?}");
+        assert!(!pats.iter().any(|p| *p == "*.rs"), "存在しない意味のパターンを並べない: {pats:?}");
+        for a in &got {
+            assert_eq!(a.driver, AUTO_DRIVER);
+            assert!(!a.why.is_empty(), "根拠を書く");
+            assert!(a.files >= 1, "実在するファイルの数");
+        }
+        // 並びは決定的。
+        assert_eq!(
+            suggest_attributes(&repo)
+                .iter()
+                .map(|a| a.pattern.clone())
+                .collect::<Vec<_>>(),
+            got.iter().map(|a| a.pattern.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn 導入は既存の_merge_指定を上書きしない() {
+        let Some(repo) = suggest_repo("keep-attr") else {
+            println!("git が無い環境なのでスキップ");
+            return;
+        };
+        let keep = ".gitignore merge=ours\n";
+        std::fs::write(repo.join(".gitattributes"), keep).expect("write");
+        let rep = install_with(&repo, &repo.join("fake-zai"), None).expect("導入");
+        assert!(
+            rep.skipped.iter().any(|a| a.pattern == ".gitignore"),
+            "既存の指定があるものは見送る: {:?}",
+            rep.skipped
+        );
+        assert!(
+            !rep.added.iter().any(|a| a.pattern == ".gitignore"),
+            "上書きしていない"
+        );
+        let after = std::fs::read_to_string(repo.join(".gitattributes")).expect("読める");
+        assert!(after.starts_with(keep), "既存の行がそのまま先頭に残る:\n{after}");
+        uninstall(&repo).expect("解除");
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".gitattributes")).expect("読める"),
+            keep,
+            "解除したら元どおり"
+        );
+    }
+
+    #[test]
+    fn 自動生成した_gitattributes_は冪等() {
+        let Some(repo) = suggest_repo("idem") else {
+            println!("git が無い環境なのでスキップ");
+            return;
+        };
+        let mut prev = String::new();
+        for i in 0..3 {
+            let rep = install_with(&repo, &repo.join("fake-zai"), None).expect("導入");
+            assert_eq!(rep.drivers, DRIVERS.len());
+            let now = std::fs::read_to_string(repo.join(".gitattributes")).expect("読める");
+            if i > 0 {
+                assert_eq!(now, prev, "何度書いても同じ中身");
+            }
+            assert_eq!(now.matches(ATTR_BEGIN_KEY).count(), 1);
+            prev = now;
+        }
+        assert!(prev.contains(&format!("merge={AUTO_DRIVER}")), "{prev}");
+        uninstall(&repo).expect("解除");
+        assert!(!repo.join(".gitattributes").exists(), "こちらが作ったものは消す");
+        assert!(!is_installed(&repo));
+    }
+
+    // ── 15. 統合: マーカ無しのリポジトリを本物の git にマージさせる ──
+
+    /// 自分自身をドライバとして登録するときのコマンド行。
+    fn helper_driver(exe: &Path, flags: &str) -> String {
+        format!(
+            "ZV_UNION_FLAGS=\"{flags}\" ZV_UNION_O=\"%O\" ZV_UNION_A=\"%A\" ZV_UNION_B=\"%B\" ZV_UNION_L=\"%L\" ZV_UNION_P=\"%P\" {} --exact {} --quiet",
+            sh_quote(exe),
+            helper_test_name()
+        )
+    }
+
+    #[test]
+    fn 本物の_git_マージでマーカ無しの一覧が自動解決される() {
+        let Some(repo) = temp_repo("auto-merge") else {
+            println!("git が無い環境なのでスキップ");
+            return;
+        };
+        let exe = std::env::current_exe().expect("テストバイナリの場所");
+        git(&repo, &["config", "--local", &format!("merge.{AUTO_DRIVER}.name"), DRIVER_DESC]);
+        git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                &format!("merge.{AUTO_DRIVER}.driver"),
+                &helper_driver(&exe, "--auto"),
+            ],
+        );
+        std::fs::write(
+            repo.join(".gitattributes"),
+            format!(".gitignore merge={AUTO_DRIVER}\nprose.md merge={AUTO_DRIVER}\n"),
+        )
+        .expect("write");
+        std::fs::write(repo.join(".gitignore"), IGNORE).expect("write");
+        let prose = "一行目です。\n二行目です。\n三行目です。\n";
+        std::fs::write(repo.join("prose.md"), prose).expect("write");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+
+        git(&repo, &["checkout", "-q", "-b", "featA"]);
+        std::fs::write(repo.join(".gitignore"), format!("{IGNORE}from-a/\n")).expect("write");
+        std::fs::write(repo.join("prose.md"), format!("{prose}A の段落です。\n")).expect("write");
+        git(&repo, &["commit", "-qam", "A"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        git(&repo, &["checkout", "-q", "-b", "featB"]);
+        std::fs::write(repo.join(".gitignore"), format!("{IGNORE}from-b/\n")).expect("write");
+        std::fs::write(repo.join("prose.md"), format!("{prose}B の段落です。\n")).expect("write");
+        git(&repo, &["commit", "-qam", "B"]);
+
+        let out = git(&repo, &["merge", "--no-edit", "featA"]);
+        let ign = std::fs::read_to_string(repo.join(".gitignore")).expect("読める");
+        assert_eq!(
+            ign,
+            format!("{IGNORE}from-b/\nfrom-a/\n"),
+            "マーカ無しの一覧が自動解決されていない。git の出力:\n{out}"
+        );
+        // 散文は自動判定の対象外 = **素の git と同じ結果** (衝突が残る)。
+        let pr = std::fs::read_to_string(repo.join("prose.md")).expect("読める");
+        assert!(
+            pr.contains("<<<<<<<") && pr.contains(">>>>>>>"),
+            "散文まで勝手に混ぜてはいけない:\n{pr}"
+        );
+    }
+
+    #[test]
+    fn 自動判定モードは自分の衝突マーカを一度も書かない() {
+        // 解決しきれない場面では `%A` を書かずに git 本体へ委譲する。
+        // ラベルが git の既定 (`ours`/`base`/`theirs`) になることで確かめる。
+        let Some(dir) = temp_repo("delegate") else {
+            println!("git が無い環境なのでスキップ");
+            return;
+        };
+        let ours_txt = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^2.0.0\",\n",
+        );
+        let theirs_txt = PKG.replace(
+            "    \"alpha\": \"^1.0.0\",\n",
+            "    \"alpha\": \"^1.0.0\",\n    \"beta\": \"^9.9.9\",\n",
+        );
+        let (o, a, b) = (dir.join("o"), dir.join("a"), dir.join("b"));
+        std::fs::write(&o, PKG).expect("write");
+        std::fs::write(&a, &ours_txt).expect("write");
+        std::fs::write(&b, &theirs_txt).expect("write");
+        let argv: Vec<String> = vec![
+            "--auto".into(),
+            o.to_string_lossy().into_owned(),
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+            "7".into(),
+            "package.json".into(),
+        ];
+        let code = cli_main(&argv);
+        assert_ne!(code, 0, "衝突は衝突として返す");
+        let got = std::fs::read_to_string(&a).expect("読める");
+        // 素の git へ丸投げした結果と 1 バイトも変わらないこと。
+        let (o2, a2, b2) = (dir.join("o2"), dir.join("a2"), dir.join("b2"));
+        std::fs::write(&o2, PKG).expect("write");
+        std::fs::write(&a2, &ours_txt).expect("write");
+        std::fs::write(&b2, &theirs_txt).expect("write");
+        delegate_to_git(&o2, &a2, &b2, 7);
+        assert_eq!(
+            got,
+            std::fs::read_to_string(&a2).expect("読める"),
+            "自動判定モードで自前の衝突マーカを書いている"
+        );
+    }
+
     /// 共有ファイルへ 1 行も足していないこと (この機能の存在意義そのもの)。
     #[test]
     fn 共有ファイルを触らずに繋がっている() {
@@ -2321,3 +4364,4 @@ mod tests {
         assert!(reg.contains("pub use imp::{cli_main, FEATURE};"), "再エクスポートが無い");
     }
 }
+

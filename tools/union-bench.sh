@@ -31,6 +31,12 @@
 #   union-plain   ドライバ有り + マーカ無し (= 素の git へ委譲するはず)
 #   union-whole   ドライバ (--whole) + マーカ無し
 #
+# ## 第 2 部: マーカを 1 つも置かない合成リポジトリ (= 他人のリポジトリ)
+#
+#   .gitignore / package.json / CHANGELOG.md / mod ブロック / code.rs へ
+#   N 人が同時に追記し、baseline / union-nomarker / union-auto を比べる。
+#   **誤自動解決の件数**も出す (0 でなければならない)。定義は下の方に。
+#
 # ## 使い方 (再現は 1 行)
 #
 #   tools/union-bench.sh                       既定 (8 16 32 人)
@@ -59,7 +65,7 @@ json=0
 keep=0
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -96,6 +102,7 @@ if [ -z "$driver" ]; then
     if [ -n "$zai" ] && [ -x "$zai" ]; then
         driver="'$zai' merge-driver %O %A %B %L %P"
         driver_whole="'$zai' merge-driver --whole %O %A %B %L %P"
+        driver_auto="'$zai' merge-driver --auto %O %A %B %L %P"
         driver_label="zai merge-driver ($zai)"
     else
         echo "zai が見つかりません。ZAIVERN_BIN で指定するか --driver を渡してください。" >&2
@@ -104,6 +111,7 @@ if [ -z "$driver" ]; then
     fi
 else
     driver_whole="$driver"
+    driver_auto="$driver"
     driver_label="$driver"
 fi
 
@@ -358,6 +366,262 @@ cat >&2 <<'NOTE'
   「マーカが無いファイルでは素の git と 1 バイトも変わらない」の実測です。
 NOTE
 
+
+# ══════════════════════════════════════════════════════════════════
+#  第 2 部: **マーカが 1 つも無い**合成リポジトリ
+# ══════════════════════════════════════════════════════════════════
+#
+# 第 1 部はマーカ方式の実測なので、**zaivern 自身のリポジトリでしか
+# 再現できない**。ここは「他人のリポジトリ」を模す — マーカを 1 つも
+# 置かず、どこにでもある 4 つの一覧だけを置く:
+#
+#   .gitignore      1 行 1 要素の一覧          (Flat)
+#   package.json    依存表 (キーが違えば共存)   (Bracket + JSON 検査)
+#   CHANGELOG.md    見出しつきの追記帳          (Journal / 重複を畳まない)
+#   mods_block.rs   mod 宣言の連続ブロック      (Imports)
+#   code.rs         **一覧ではない**関数の中身   (判定は None = 素の git のまま)
+#
+# code.rs を必ず入れてあるのは、**効かない条件も数字で出す**ため。ここが
+# baseline と同じでなければ「一覧でないものまで混ぜている」ことになる。
+#
+# 条件:
+#   baseline        ドライバ無し
+#   union-nomarker  ドライバ有り (--auto 無し) = **マーカが無いので何もしない**
+#   union-auto      ドライバ有り (--auto)      = 中身から一覧を見つける
+#
+# **誤自動解決** の定義 (0 でなければならない):
+#   「一度も衝突を出さずに自動でマージされたファイル」のうち、
+#     (a) どれかの書き手の追記が消えた / 二重になった
+#     (b) 元からあった行が消えた
+#     (c) 衝突マーカが残った
+#     (d) package.json が JSON として壊れた  (python3 がある環境でだけ検査)
+#   のいずれかを起こしたものの数。
+
+PLAIN_KEYS="gi pkg chg mods code"
+
+plain_file() {
+    case "$1" in
+        gi)   echo '.gitignore' ;;
+        pkg)  echo 'package.json' ;;
+        chg)  echo 'CHANGELOG.md' ;;
+        mods) echo 'mods_block.rs' ;;
+        code) echo 'code.rs' ;;
+    esac
+}
+
+seed_plain() {
+    _r=$1
+    { echo '# build output'
+      echo 'target/'
+      echo 'node_modules/'
+      echo '*.log'
+    } > "$_r/.gitignore"
+
+    { echo '{'
+      echo '  "name": "bench",'
+      echo '  "version": "0.1.0",'
+      echo '  "dependencies": {'
+      echo '    "alpha": "^1.0.0",'
+      echo '    "zulu": "^9.0.0"'
+      echo '  }'
+      echo '}'
+    } > "$_r/package.json"
+
+    { echo '# Changelog'
+      echo ''
+      echo '## Unreleased'
+      echo ''
+      echo '- 最初の項目'
+      echo '- 二つ目の項目'
+      echo '- 三つ目の項目'
+    } > "$_r/CHANGELOG.md"
+
+    { echo '// この行は一覧ではない'
+      echo 'fn helper() { }'
+      echo ''
+      echo 'mod app;'
+      echo 'mod git;'
+      echo 'mod term;'
+      echo ''
+      echo 'fn main() {}'
+    } > "$_r/mods_block.rs"
+
+    # **一覧ではない**もの。自動判定は降りて、素の git と同じ結果になるはず。
+    { echo 'fn run() {'
+      echo '    let mut n = 0;'
+      echo '    n += 1;'
+      echo '    println!("{n}");'
+      echo '}'
+    } > "$_r/code.rs"
+}
+
+# $1 ファイル, $2 目印の文字列, $3 挿し込む行
+insert_after() {
+    awk -v a="$2" -v ins="$3" '
+        { print }
+        !done_ && index($0, a) > 0 { print ins; done_ = 1 }
+    ' "$1" > "$1.n" && mv "$1.n" "$1"
+}
+
+apply_writer_plain() {
+    _r=$1; _i=$2
+    printf '%s\n' "w_$_i/" >> "$_r/.gitignore"
+    insert_after "$_r/package.json"  '"alpha"'  "    \"dep_$_i\": \"^1.0.0\","
+    printf '%s\n' "- writer-$_i の変更" >> "$_r/CHANGELOG.md"
+    insert_after "$_r/mods_block.rs" 'mod git;' "mod feat_$_i;"
+    insert_after "$_r/code.rs" 'let mut n = 0;' "    n += $_i; // w_$_i"
+}
+
+# ちょうど 1 回だけ出てくるか。$1 ファイル, $2 文字列 → 0 = 良い / 1 = 違反
+once() {
+    _c=$(grep -c -F -- "$2" "$1" 2>/dev/null || true)
+    [ "${_c:-0}" = 1 ] && return 0
+    return 1
+}
+
+# $1 key, $2 repo, $3 人数 → 違反の数を標準出力へ
+verify_plain_one() {
+    _k=$1; _r=$2; _n=$3; _bad=0
+    _f=$_r/$(plain_file "$_k")
+    grep -q '^<<<<<<<' "$_f" 2>/dev/null && _bad=$((_bad + 1))
+    # (b) 元の行がちょうど 1 回ずつ残っている
+    case "$_k" in
+        gi)   _basepats='target/|node_modules/|*.log' ;;
+        pkg)  _basepats='"alpha"|"zulu"|"name"' ;;
+        chg)  _basepats='- 最初の項目|- 二つ目の項目|- 三つ目の項目' ;;
+        mods) _basepats='mod app;|mod term;|fn main() {}' ;;
+        code) _basepats='fn run() {|let mut n = 0;|println!' ;;
+    esac
+    _rest=$_basepats
+    while [ -n "$_rest" ]; do
+        _p=${_rest%%|*}
+        if [ "$_rest" = "$_p" ]; then _rest=''; else _rest=${_rest#*|}; fi
+        once "$_f" "$_p" || _bad=$((_bad + 1))
+    done
+    # (a) 各書き手の追記がちょうど 1 回ずつ
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        case "$_k" in
+            gi)   _p="w_$_i/" ;;
+            pkg)  _p="\"dep_$_i\"" ;;
+            chg)  _p="- writer-$_i の変更" ;;
+            mods) _p="mod feat_$_i;" ;;
+            code) _p="n += $_i; // w_$_i" ;;
+        esac
+        once "$_f" "$_p" || _bad=$((_bad + 1))
+        _i=$((_i + 1))
+    done
+    # (d) JSON として妥当か (python3 がある環境でだけ)
+    if [ "$_k" = pkg ] && [ "$json_check" = 1 ]; then
+        python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$_f" >/dev/null 2>&1 \
+            || _bad=$((_bad + 1))
+    fi
+    echo "$_bad"
+}
+
+# 1 条件 1 人数。標準出力に "総ハンク 総衝突行 人手が要ったファイル数 誤自動解決" を返す。
+run_plain() {
+    _cond=$1; _n=$2
+    _r=$tmp/plain-$_cond-$_n
+    mkdir -p "$_r"
+    git -C "$_r" init -q -b main . >/dev/null 2>&1
+    git -C "$_r" config user.email bench@example.invalid
+    git -C "$_r" config user.name  bench
+    git -C "$_r" config commit.gpgsign false
+    seed_plain "$_r"
+    if [ "$_cond" != baseline ]; then
+        case "$_cond" in
+            union-auto) _d=$driver_auto ;;
+            *)          _d=$driver ;;
+        esac
+        git -C "$_r" config merge.zaivern-union-auto.name "bench"
+        git -C "$_r" config merge.zaivern-union-auto.driver "$_d"
+        : > "$_r/.gitattributes"
+        for k in $PLAIN_KEYS; do
+            echo "$(plain_file "$k") merge=zaivern-union-auto" >> "$_r/.gitattributes"
+        done
+    fi
+    git -C "$_r" add -A >/dev/null; git -C "$_r" commit -qm base >/dev/null
+
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        git -C "$_r" checkout -q -b "w$_i" main
+        apply_writer_plain "$_r" "$_i"
+        git -C "$_r" commit -qam "writer-$_i" >/dev/null
+        git -C "$_r" checkout -q main
+        _i=$((_i + 1))
+    done
+
+    for k in $PLAIN_KEYS; do eval "_manual_$k=0"; done
+    _total=0; _tlines=0
+    _i=1
+    while [ "$_i" -le "$_n" ]; do
+        if ! git -C "$_r" merge --no-edit -q "w$_i" >/dev/null 2>&1; then
+            for f in $(git -C "$_r" diff --name-only --diff-filter=U); do
+                _c=$(grep -c '^<<<<<<<' "$_r/$f" 2>/dev/null || echo 0)
+                _total=$((_total + _c))
+                _tlines=$((_tlines + $(conflict_lines "$_r/$f")))
+                for k in $PLAIN_KEYS; do
+                    [ "$(plain_file "$k")" = "$f" ] && eval "_manual_$k=1"
+                done
+                resolve_keeping_both "$_r/$f"
+                git -C "$_r" add "$f" >/dev/null
+            done
+            git -C "$_r" commit -q --no-edit >/dev/null 2>&1 || true
+        fi
+        _i=$((_i + 1))
+    done
+
+    _manual_files=0
+    _mis=0
+    for k in $PLAIN_KEYS; do
+        eval "_m=\$_manual_$k"
+        _v=$(verify_plain_one "$k" "$_r" "$_n")
+        if [ "$_m" = 1 ]; then
+            _manual_files=$((_manual_files + 1))
+        elif [ "$_v" -gt 0 ]; then
+            # **一度も人手が入っていないのに壊れている = 誤自動解決**
+            _mis=$((_mis + 1))
+            echo "   ! 誤自動解決: $(plain_file "$k") ($_cond, N=$_n, 違反 $_v 件)" >&2
+        fi
+    done
+    echo "$_total $_tlines $_manual_files $_mis"
+}
+
+json_check=0
+command -v python3 >/dev/null 2>&1 && json_check=1
+
+printf '== マーカ無しの合成リポジトリ (.gitignore / package.json / CHANGELOG.md / mod ブロック)\n' >&2
+[ "$json_check" = 1 ] || printf '   (python3 が無いので JSON の構文検査は省略)\n' >&2
+hdr2=$(printf '%-15s %4s | %6s %7s | %11s %11s' condition N hunks c-lines manual-files misresolved)
+printf '%s\n' "$hdr2" >&2
+printf '%s\n' "$(echo "$hdr2" | tr -c '|\n' '-')" >&2
+
+base_lines=''
+for n in $writers_list; do
+    for cond in baseline union-nomarker union-auto; do
+        out=$(run_plain "$cond" "$n")
+        set -- $out
+        printf '%-15s %4s | %6s %7s | %11s %11s\n' "$cond" "$n" "$1" "$2" "$3" "$4" >&2
+        [ "$cond" = baseline ] && base_lines=$2
+        if [ "$cond" = union-auto ] && [ "${base_lines:-0}" -gt 0 ]; then
+            printf '  → 衝突行の削減率 %d%% (%s → %s 行)\n' \
+                "$(( (base_lines - $2) * 100 / base_lines ))" "$base_lines" "$2" >&2
+        fi
+        jrows2="${jrows2:-}{\"part\":\"plain\",\"condition\":\"$cond\",\"writers\":$n,\"hunks\":$1,\"conflict_lines\":$2,\"manual_files\":$3,\"misresolved\":$4},"
+    done
+    printf '\n' >&2
+done
+
+cat >&2 <<'NOTE2'
+読み方:
+  misresolved は **0 でなければならない** (定義はスクリプト冒頭)。
+  union-nomarker が baseline と完全一致であることが
+  「--auto を付けなければ素の git と 1 バイトも変わらない」の実測です。
+  union-auto で残る manual-files は code.rs (一覧ではないもの) だけであるべきで、
+  そこは **効かないのが正しい**。効く条件と効かない条件を同じ表に出しています。
+NOTE2
+
 if [ "$json" = 1 ]; then
-    printf '{"driver":"%s","rows":[%s]}\n' "$driver_label" "${jrows%,}"
+    printf '{"driver":"%s","rows":[%s%s]}\n' "$driver_label" "$jrows" "${jrows2%,}"
 fi

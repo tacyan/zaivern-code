@@ -42,6 +42,13 @@ Claude Code implements. Codex tests. Gemini CLI writes the docs. Zaivern Code br
 | Paste the same instruction repeatedly | Broadcast one instruction to the whole fleet |
 | Miss approvals and stalled sessions | Get live status, notifications, and one-click approval |
 | Stay chained to your desk | Check progress, send instructions, and approve from your phone |
+| **More agents means more merge conflicts** | **Same file, different lines — no conflict** |
+
+The real cost of running agents in parallel is not wall-clock time; it is **resolving
+conflicts at review time**. With 64 agents on one file, plain git produced
+**48 conflicting branches, 960 conflict lines, and 48 manual fixes**. Zaivern Code
+produced **zero conflicts and zero manual fixes — and all 64 agents landed their work**
+([the numbers](docs/conflict-zero.md)).
 
 ## 🚀 Install Zaivern Code
 
@@ -93,9 +100,20 @@ Start with one agent. Add a second or third after you are comfortable with the w
 
 ## What you can do
 
+### 🧩 Conflict-free — same file, different lines
+
+**This is the core of the product.** Ownership is per *line*, so a large file like
+`src/app.rs` can be shared by any number of agents. If your lines are taken, you are
+handed nearby free lines instead of being refused.
+
+```console
+$ zai czero init      # install every layer at once, then self-diagnose
+$ zai czero verify    # create a real conflict and prove it gets stopped
+```
+
 ### 🎛 Agent Cockpit
 
-Arrange multiple AI tools in a grid and see at a glance whether each one is working or waiting. Zaivern includes launch presets for 29 tools, including Claude Code, Codex, and Gemini CLI.
+Arrange multiple AI tools in a grid and see at a glance whether each one is working or waiting. Zaivern includes launch presets for 33 tools, including Claude Code, Codex, and Gemini CLI.
 
 ### 📣 Broadcast
 
@@ -117,63 +135,71 @@ Check progress, send instructions, approve actions, and edit files from your pho
 
 Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
 
-## 🆕 New in v0.10.0
+## 🆕 New in v0.14.0 — no conflicts, even in the same file
 
-**⿴ Multibuffer** — read search results, problems, and uncommitted changes as **one
-surface with real surrounding context**, instead of opening files one by one. Click a
-header to fold, click a line to jump there. Reachable from the "⿴ Open all" button in
-the search and problems panels.
+**🧩 Region ownership.** Until now the only way to protect parallel agents was
+"nobody may write a file someone else holds." Safe, but **one agent holding a large
+file locks everyone else out of it**. From v0.14.0 you hold *lines*:
+`zai lease claim 'src/app.rs#L1200-1260'`.
 
-**⏸ Bulk send to stalled agents only** — "Everyone" interrupts agents that are still
-working. This targets only the ones that have **stopped making progress** (idle,
-stalled, looping, erroring). Agents waiting on an approval prompt are excluded — answer
-those in the approval UI instead.
+Measured with 64 agents hammering a single 2000-line file
+(`tools/coedit-bench.sh --agents 64 --lines 2000`):
 
-**Fixed multi-second freezes in large repositories** — fetching the branch name and the
-gutter diff marks was blocking the UI thread. Worst frame: **4376ms → 20.8ms**.
+| Protection | Landed | Refused | Conflicting branches | Conflict lines | Manual fixes |
+|---|---:|---:|---:|---:|---:|
+| None (plain git) | 64 | 0 | **48** | **960** | **48** |
+| Per file (≤ v0.13) | **1** | 63 | 0 | 0 | 0 |
+| Per line, no shifting | 11 | 53 | 0 | 0 | 0 |
+| **Per line + negotiation (v0.14)** | **64** | **0** | **0** | **0** | **0** |
 
-## 🆕 Previous release: v0.8.0
+**Zero conflicts was already true in v0.13. What v0.14 buys is parallelism** —
+1 of 64 agents could write; now all 64 can.
 
-**22 gaps in day-to-day usability, closed.** We studied superset, VS Code, cmux, orca and Zed,
-and worked through the missing pieces starting with the ones that made the editor unusable.
+**🔀 Shift instead of refuse.** If the lines you asked for are taken, Zaivern hands
+you nearby free lines automatically (`zai lease claim --shift`). The price is
+**how far from your request you landed**: p50 129 lines, p95 253, max 281, and zero
+allocations outside the file. Only requests that explicitly opt in are moved — a
+region is tied to *the content that lives there*, so the default is never to move it.
 
-**Made it a real editor**
+**🤝 Agents recognise each other, Erlang-style.** Every participant has an identity
+(`incarnation` is the start time, so **a recycled OS pid can never be mistaken for
+you**) and a mailbox with per-sender FIFO delivery. `link` / `monitor` / `DOWN` with
+`trap_exit`. **When an agent dies holding regions, its regions are released
+automatically** — "let it crash", applied to editing. Measured release: 23.2 ms.
 
-- Commit, push, pull, hunk-level staging and history, all inside the app (you previously had to drop to a terminal)
-- `.gitignore` is respected, and index truncation is now visible (`node_modules` used to swallow the index and silently break ⌘P)
-- Unsaved buffers survive a restart (hot exit). If the file changed on disk, you get a diff instead of a silent overwrite
-- Multi-cursor actually edits (⌘D only *selected* before)
-- A real undo history, so formatting and code actions rewind in one ⌘Z
-- Drag-and-drop moves with overwrite confirmation, trash instead of hard delete, and ⌘Z in the file tree
+**🔒 Proof that a merge lands in one shot.** If the changed regions of N branches are
+far enough apart, `git merge` **cannot** conflict. Verified exhaustively against real
+git across 240 cases with **zero misses**. When the proof holds, N branches integrate
+with zero human steps — without ever touching the working tree (`merge-tree` →
+`commit-tree`, then one atomic ref update), so a failure leaves nothing half-merged.
 
-**VS Code parity**
+**🧬 List appends stop conflicting, in any repository.** `.gitignore`, `CHANGELOG.md`,
+`package.json` dependencies, `import` blocks — conflicts where the right answer is
+"keep both lines" are resolved by **reading the content**, with no markers to add.
+On a marker-free benchmark: **80% fewer conflict lines, zero wrong auto-resolutions**.
+For files that are not lists, the result is **byte-for-byte identical to plain git**.
 
-Regex / case / whole-word / find-previous / highlight-all in buffer search · inline diagnostic squiggles and hover ·
-matching-bracket highlight and rainbow brackets · vertical rulers · indentation auto-detect ·
-MRU tab switching, pinning and preview tabs · recently-used ordering, `:123` and `@` symbols in Quick Open ·
-two-stroke chords (⌘K ⌘S) and a keybinding editor · a settings UI ·
-a workspace-wide problems panel · clickable file paths and URLs in the terminal
+**🚦 One command in any repository.**
 
-**As an AI cockpit**
+```console
+$ zai czero init      # ledger, git hooks, merge driver, .gitattributes — then self-diagnose
+$ zai czero verify    # actually create a conflict and prove it gets stopped
+```
 
-- **Follow mode** — the editor tracks whatever the running agent is editing
-- **Unread cursor** — jump to whichever agent is waiting on you
-- **Rebuilt state detection** — structured output and hooks instead of guessing from the screen, and the source of each verdict is shown
-- **Isolated worktrees and conflict detection** — if two agents touch the same file, you hear about it now, not at review time
-- **Focused diff review** — a "2 / 5" counter and `]f` / `[f` to move between files
-- **Cost limits and alerts** — set a session or daily cap on estimated spend: warn at 80%, notify on arrival, and with `stop` new messages are blocked with the reason shown (notify-only by default; nothing is drawn at all until you set a limit)
-- ⌃1–⌃9 preset launch, automatic session naming, token usage and estimated cost
+`verify` does not just read configuration. It **creates a real conflict in a
+throwaway repository and proves it is stopped** (your repository is never touched),
+so "installed but not working" cannot happen silently. `zai czero doctor` reports each
+layer with a reason and a fix; `zai czero uninstall` removes only what was added.
 
-**Quality:** 3,134 tests, green CI on macOS, Linux and Windows, clean `cargo fmt --check`.
-
-[v0.8.0 details](https://github.com/tacyan/zaivern-code/releases/latest) · [Previous releases](https://github.com/tacyan/zaivern-code/releases)
+The numbers — **including the conditions where this does not help** — are in
+[docs/conflict-zero.md](docs/conflict-zero.md).
 
 ## Supported environments
 
 | Item | Support |
 |---|---|
 | OS | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
-| AI CLIs | 29 presets, including Claude Code, Codex, and Gemini CLI |
+| AI CLIs | 33 presets, including Claude Code, Codex, and Gemini CLI |
 | Rust | 1.88+ when building from source |
 | License | Apache-2.0 |
 
@@ -202,6 +228,24 @@ Zaivern Code is free, open-source software under the Apache-2.0 license. Subscri
 ### Will it run commands without asking me?
 
 Approval is required by default. Automatic approval only runs after you explicitly turn it on.
+
+### Is "zero conflicts" really zero?
+
+**With protection on, yes** — but here are the conditions, stated honestly. If two
+regions are at least `SAFE_BAND` (3) lines apart, git's three-way merge **structurally
+cannot** emit a conflict. With 64 agents on one file we measured zero conflict hunks
+and zero manual fixes.
+
+There are things this **cannot** do. Changes in *different* files that stop fitting
+together (one side changes a signature, the other keeps calling the old way) are
+impossible to prevent — those are detected and shown, not blocked. Numbers and limits:
+[docs/conflict-zero.md](docs/conflict-zero.md).
+
+### Does it work on an existing repository?
+
+`zai czero init`. Existing git hooks (husky, lefthook, pre-commit framework) are kept
+and called first, with their exit code respected. Hand-written `.gitattributes` lines
+are preserved. `zai czero uninstall` removes only what was added.
 
 ## Build from source
 
