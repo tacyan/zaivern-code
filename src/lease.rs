@@ -1450,24 +1450,223 @@ fn overlaps_live(
     )
 }
 
+/// `path` を覆っている担当の**いまの**行域を集める。
+///
+/// * `None` — 誰かがそのファイルを**丸ごと**持っている (= ずらす先が無い)
+/// * `Some(v)` — 埋まっている域の一覧。並びは台帳の順のまま = 決定的
+///
+/// `keep` が `false` を返したリースは数えない (自分の担当は自分を止めない)。
+/// `text` は `path` の**いまの中身**。台帳の行番号は他人が上へ行を足した
+/// 瞬間に古くなるので、錨で取り直してから空きを探す
+/// ([`Lease::live_span_of`] と同じ規則で、取り直せなければ記録値へ落ちる)。
+fn busy_spans(
+    store: &Store,
+    path: &str,
+    text: Option<&str>,
+    keep: impl Fn(&Lease) -> bool,
+) -> Option<Vec<crate::region::Span>> {
+    let mut busy: Vec<crate::region::Span> = Vec::new();
+    for l in store.leases.iter().filter(|l| keep(l)) {
+        for (i, p) in l.patterns.iter().enumerate() {
+            if !covers(p, path) {
+                continue;
+            }
+            match l.live_span_of(i, text) {
+                None => return None, // 丸ごと持たれている
+                Some(s) => busy.push(s),
+            }
+        }
+    }
+    Some(busy)
+}
+
+/// **他人の担当を 1 回だけ取り直して、「ぶつかるか」と「埋まっている域」を
+/// 同時に出す。**
+///
+/// ## なぜ 1 回にこだわるのか (台帳ロックの長さがそのまま拒否になる)
+/// 素直に書くと [`overlaps_live`] (ぶつかるか) と [`busy_spans`] (どこが
+/// 埋まっているか) で**同じ錨を 2 度取り直す**。[`crate::region::resolve`] は
+/// 1 回ごとにテキスト全体を行へ割り直すので、2000 行 × 63 担当では
+/// 1 件あたり **50ms**、64 体を直列に通すと台帳ロックを **3 秒**握る。
+/// そこまで長いと `with_store_retry` の予算を食い潰し、**衝突でも拒否でもない
+/// busy** が出る (実測: 全テスト同時実行下で 64 件中 **33 件が busy**)。
+/// 拒否を潰すために作った機能が別の形の拒否を作っては意味が無い。
+///
+/// 返り値は `(ぶつかるか, 埋まっている域)`。域が `None` =
+/// **行で切り分けられない** (誰かが丸ごと持っている / glob で持っている)
+/// = ずらす先が無い。
+///
+/// `path` / `want` は**具体パスの、長さが決まっている行域**であること
+/// (ファイル全体 / glob / 末尾までの要求はそもそもずらせないので、
+///  呼び出し側が [`overlaps_live`] の素の走査へ倒す)。
+/// 判定は [`try_claim_wants`] が使う [`overlaps_live`] と一致する —
+/// 具体パスに対しては `covers` と `overlaps` のパス判定が同じ答えを出し、
+/// 丸ごと / glob は安全側 (= ぶつかる) へ倒すため。
+fn live_view(
+    store: &Store,
+    holder: &Holder,
+    path: &str,
+    want: crate::region::Span,
+    text: Option<&str>,
+) -> (bool, Option<Vec<crate::region::Span>>) {
+    let mut taken = false;
+    let mut busy: Vec<crate::region::Span> = Vec::new();
+    for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
+        for (i, p) in l.patterns.iter().enumerate() {
+            if !covers(p, path) {
+                continue;
+            }
+            // glob で持たれている域は「どのファイルの何行目か」が確定しないので
+            // 行では切り分けられない ([`crate::region::conflicts`] と同じ安全側)。
+            if p.contains(['*', '?', '[']) {
+                return (true, None);
+            }
+            match l.live_span_of(i, text) {
+                None => return (true, None), // 丸ごと持たれている
+                Some(s) => {
+                    if crate::region::spans_too_close(&s, &want, crate::region::SAFE_BAND) {
+                        taken = true;
+                    }
+                    busy.push(s);
+                }
+            }
+        }
+    }
+    (taken, Some(busy))
+}
+
+/// テキストの行数。**空 / 読めない / `u32` に収まらないときは `None`**。
+///
+/// 「行数が分からないならずらさない」を 1 か所で決めるための関門。
+/// 知らない場所を勧めると、台帳の上では取れているのに**書く先が無い**
+/// という、いちばん気付きにくい壊れ方になる。
+fn line_count(text: Option<&str>) -> Option<u32> {
+    let n = text?.lines().count();
+    if n == 0 {
+        return None;
+    }
+    u32::try_from(n).ok()
+}
+
+/// **ファイル全体の空きを総なめして、要求と同じ幅が入るいちばん近い場所を返す。**
+///
+/// ## なぜ「直後 / 直前 / 先頭」の 3 候補では足りなかったのか
+/// 以前の候補は占有域の直後・直前・先頭だけだった。詰まった配置ではその 3 つが
+/// すべて埋まっていて、**空きが 1868 行あるのに 53 件が断られた**
+/// (実測: `tools/coedit-bench.sh --layout crowded`。2000 行のファイルへ
+/// 64 体が幅 6 行を stride 2 で要求する条件。要求が集中しているのは
+/// 934〜1065 行の 132 行だけで、64 体を互いに素に置くのに要るのは 573 行)。
+/// ここでは占有域を畳んだ**隙間の一覧**を作り、隙間ごとに「要求開始行に
+/// いちばん近い開始位置」を 1 つ取る。O(n log n) で、空きを 1 つも見落とさない。
+///
+/// ## 引数
+/// * `busy` — いま埋まっている域 (錨で取り直したあとの座標)
+/// * `want` — 欲しい域。**挿入点 (幅 0) は幅 1 の点として置き、挿入点で返す**
+///   ([`crate::region::spans_too_close`] が挿入点を点として扱うのと同じ寄せ方)
+/// * `total` — ファイルの行数。**ここを超えた場所は返さない。**
+///   行数を知らない呼び出し (拘束力の無い提案) は [`u32::MAX`] を渡す
+/// * `band` — 安全帯 ([`crate::region::SAFE_BAND`])
+///
+/// ## 決定性
+/// 近いほうが勝ち、同点なら**行番号が小さいほう**。集合は `Vec` だけで持ち、
+/// `HashMap` / `HashSet` を一切通さないので、どの OS のどのプロセスでも
+/// 1 バイト違わない答えが出る (64 体が同じ台帳を見て別の答えを出すと、
+/// 「ずらしたのに重なる」が起きる)。
+fn fit_span(
+    busy: &[crate::region::Span],
+    want: crate::region::Span,
+    total: u32,
+    band: u32,
+) -> Option<crate::region::Span> {
+    use crate::region::Span;
+    if want.end == Span::EOF || want.is_empty() {
+        return None; // 長さが決まらない
+    }
+    let insert = want.is_insert();
+    let len = if insert { 1 } else { want.len() };
+    if len == 0 || len > total {
+        return None; // ファイルより広い域は入らない
+    }
+    // 占有域を閉区間へ落とす。EOF まで伸びている域は末尾までとして扱う。
+    let mut iv: Vec<(u32, u32)> = busy
+        .iter()
+        .map(|b| {
+            let (s, e) = if b.is_insert() {
+                (b.start, b.start)
+            } else {
+                (b.start, b.end)
+            };
+            (s, if e == Span::EOF { total } else { e.min(total) })
+        })
+        .filter(|(s, _)| *s <= total)
+        .collect();
+    iv.sort_unstable();
+    let mut occupied: Vec<(u32, u32)> = Vec::with_capacity(iv.len());
+    for (s, e) in iv {
+        match occupied.last_mut() {
+            // 重なっている / 隣接しているものだけ畳む (畳まなくても答えは
+            // 同じだが、隙間の数が減るぶん走査が短くなる)。
+            Some(p) if s <= p.1.saturating_add(1) => p.1 = p.1.max(e),
+            _ => occupied.push((s, e)),
+        }
+    }
+    // 開始位置として許される閉区間を左から並べる。
+    // 手前へ置く条件: `s + len - 1 <= b0 - band - 1` → `s <= b0 - band - len`
+    // 後ろへ置く条件: `s >= b1 + band + 1`
+    let last = total.saturating_sub(len).saturating_add(1); // 開始位置の上限
+    let mut gaps: Vec<(u32, u32)> = Vec::with_capacity(occupied.len() + 1);
+    let mut lo = 1u32;
+    for (s, e) in &occupied {
+        let hi = s.saturating_sub(band).saturating_sub(len).min(last);
+        if lo <= hi {
+            gaps.push((lo, hi));
+        }
+        // 入れ子・重なりがあっても後退させない (並びは start 昇順なので
+        // `max` を取れば「ここまでは埋まっている」を正しく持ち越せる)。
+        lo = lo.max(e.saturating_add(band).saturating_add(1));
+    }
+    if lo <= last {
+        gaps.push((lo, last));
+    }
+    let mut best: Option<(u32, u32)> = None; // (要求からの距離, 開始行)
+    for (a, b) in gaps {
+        let s = want.start.clamp(a, b);
+        let d = s.abs_diff(want.start);
+        if best.is_none_or(|(bd, bs)| d < bd || (d == bd && s < bs)) {
+            best = Some((d, s));
+        }
+    }
+    let (_, start) = best?;
+    Some(if insert {
+        Span::insert_before(start)
+    } else {
+        Span {
+            start,
+            end: start.saturating_add(len - 1),
+        }
+    })
+}
+
 /// **断る代わりに「ずらす」提案を出す純関数。**
 ///
 /// 拒否は正しいが、拒否しか返せないと並列度は上がらない。実測 (crowded 条件)
-/// では行域リースが 55 件を断っており、そのうち多くは
-/// **すぐ近くの空いている行へずらせば通る**。ここはその候補を 1 つ返す。
+/// では行域リースが 53 件を断っており、そのうち多くは
+/// **空いている行へずらせば通る**。ここはその候補を 1 つ返す。
 ///
 /// * `None` — ずらす必要が無い (`want` がそのまま取れる) か、
 ///   ずらしようが無い (ファイル全体 / 末尾までの域 / glob /
-///   **誰かがそのファイルを丸ごと持っている**)
+///   **誰かがそのファイルを丸ごと持っている** / どこにも入らない)
 /// * `Some(r)` — `r` なら誰とも重ならない。**長さは `want` と同じ**
 ///
-/// 選び方は決定的: 候補は「占有域の直後」「占有域の直前」「先頭」だけを見て、
-/// `want.start` にいちばん近いもの、同点なら**行番号が小さいほう**。
+/// 探し方は [`fit_span`] — ファイル全体の空きを見て、`want.start` に
+/// いちばん近い場所、同点なら**行番号が小さいほう**。
 ///
 /// **`store` は呼び出し側が [`prune`] 済みであること** — 引数に `now` が
 /// 無いのは、交渉層 (メッシュ) が判定済みの台帳を渡す前提だから。
 /// `text` は `want.path` の**いまの中身**。台帳の行域を錨で取り直してから
 /// 空きを探す — 古い行番号のまま提案すると、提案どおり確保しても弾かれる。
+/// `text` があれば**その行数を超えた場所は勧めない**。無ければ上限なしで
+/// 探す (提案には拘束力が無いので、黙るより出すほうが情報が多い)。
 pub fn suggest_alternative(
     store: &Store,
     want: &crate::region::Region,
@@ -1481,58 +1680,266 @@ pub fn suggest_alternative(
     if want.path.contains(['*', '?', '[']) {
         return None; // glob はどのファイルを指すか確定しない
     }
-    let len = span.len();
-    let mut busy: Vec<Span> = Vec::new();
-    for l in &store.leases {
-        for (i, p) in l.patterns.iter().enumerate() {
-            if !covers(p, &want.path) {
-                continue;
-            }
-            match l.live_span_of(i, text) {
-                None => return None, // 丸ごと持たれている = ずらす先が無い
-                Some(s) => busy.push(s),
-            }
-        }
-    }
-    let free = |s: &Span| {
-        busy.iter()
-            .all(|b| !crate::region::spans_too_close(b, s, SAFE_BAND))
-    };
-    if free(&span) {
+    let busy = busy_spans(store, &want.path, text, |_| true)?;
+    if busy
+        .iter()
+        .all(|b| !crate::region::spans_too_close(b, &span, SAFE_BAND))
+    {
         return None; // そのまま取れる
     }
-    let mut cands: Vec<u32> = vec![1];
-    for b in &busy {
-        // 直後 (安全帯を空ける) と、直前 (同じ長さが入る位置)
-        cands.push(b.end.saturating_add(SAFE_BAND).saturating_add(1));
-        cands.push(b.start.saturating_sub(SAFE_BAND).saturating_sub(len).max(1));
-    }
-    cands.retain(|s| *s >= 1);
-    cands.sort_unstable();
-    cands.dedup();
-    let mut best: Option<(u32, u32)> = None;
-    for s in cands {
-        let c = Span {
-            start: s,
-            end: s.saturating_add(len - 1),
-        };
-        if !free(&c) {
-            continue;
-        }
-        let d = s.abs_diff(span.start);
-        if best.is_none_or(|(bd, bs)| d < bd || (d == bd && s < bs)) {
-            best = Some((d, s));
-        }
-    }
-    let (_, start) = best?;
+    let alt = fit_span(&busy, span, line_count(text).unwrap_or(u32::MAX), SAFE_BAND)?;
     Some(crate::region::Region {
         path: want.path.clone(),
-        span: Some(Span {
-            start,
-            end: start.saturating_add(len - 1),
-        }),
+        span: Some(alt),
         anchor: crate::region::Anchor::default(),
     })
+}
+
+// ── 断らない確保 (`zai lease claim --shift`) ────────────────────────────
+
+/// 1 件ぶんの確保結果。**要求と実際が違い得る**のがこの型の存在理由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    /// 要求 (錨を打ったあとの正規形)。
+    pub asked: String,
+    /// 実際に確保した仕様。ずらしていなければ [`Grant::asked`] と同じ。
+    pub spec: String,
+}
+
+impl Grant {
+    /// ずらしたか。
+    pub fn moved(&self) -> bool {
+        self.asked != self.spec
+    }
+}
+
+/// [`try_claim_wants_shift`] の結果。
+///
+/// [`Claim`] を増やさずに別の型にしたのは、**`--shift` を付けない経路の
+/// 挙動を 1 バイトも変えない**ため ([`Claim`] は GUI・フック・既存テストが
+/// 網羅的に `match` している)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShiftClaim {
+    /// 全部取れた。**要求と同じ並び**で、実際に確保した仕様が入る。
+    Granted(Vec<Grant>),
+    /// どこへずらしても入らない (= [`Claim::Refused`] とまったく同じ文面)。
+    Refused {
+        owner: String,
+        pattern: String,
+        until: u64,
+    },
+}
+
+/// **断らずにずらして確保する** ([`try_claim_in`] の `--shift` 版)。
+///
+/// `tree` はスコープ相対パスの起点 (= [`Roots::tree`])。仕様は
+/// [`hydrate_in`] で実ファイルへ突き合わせてから確保するので、
+/// 記号指定 (`src/a.rs#fn:draw`) もずらせる (行域へ落ちたあとで動かす)。
+pub fn try_claim_shift_in(
+    tree: &Path,
+    store: &mut Store,
+    holder: &Holder,
+    patterns: &[String],
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> ShiftClaim {
+    let mut wants: Vec<Want> = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        match hydrate_in(tree, p) {
+            Ok(w) => wants.push(w),
+            Err(reason) => {
+                return ShiftClaim::Refused {
+                    owner: reason,
+                    pattern: p.clone(),
+                    until: now,
+                }
+            }
+        }
+    }
+    try_claim_wants_shift(store, holder, &wants, now, ttl, alive)
+}
+
+/// **埋まっていたら空いている場所へずらして確保する。** 実ファイルを読まない
+/// ([`try_claim_wants`] と同じく、台帳ロックの内側で I/O が起きない)。
+///
+/// ## なぜ「拒否」を潰す必要があったのか
+/// 行域オーナーシップは離れた域なら 64 体が 1 ファイルへ同時に書ける。
+/// 残っていた唯一の弱点が**拒否**で、crowded 条件 (2000 行へ 64 体が
+/// 幅 6 行を stride 2 で要求) では **完了 11 / 拒否 53**。ところが
+/// 要求が集中しているのは 132 行ぶんだけで、**空きは 1868 行**あり、
+/// 64 体を互いに素に置くのに要るのは 573 行しかない。
+/// **断られていたのは空きが無いからではなく、誰もずらしていなかったから。**
+/// [`suggest_alternative`] は提案までしていたのに、受け取って確保し直す側が
+/// 居なかった。ここがその受け手である。
+///
+/// ## 守っている不変条件
+/// * **全か無か** — 1 件でもずらす先が無ければ 1 件も取らない。
+///   台帳の書き換えは最後の [`try_claim_wants`] 1 回だけなので、
+///   途中で諦めても台帳は 1 バイトも変わらない
+/// * **互いに素** — ずらした先は他人の域からも、*この確保の中で先に置いた域*
+///   からも安全帯ぶん離す。台帳は常に
+///   [`crate::region::is_disjoint`] を満たす
+/// * **決定的** — 位置決めは [`fit_span`] (`Vec` だけ、`HashMap` 無し)。
+///   同じ台帳・同じ要求からは、どの OS のどのプロセスでも同じ答えが出る
+/// * **ずらせないものはずらさない** — ファイル全体 (そのファイルは 1 つしか
+///   無い) / 末尾までの域 / glob / **行数が分からないファイル**
+///
+/// ## 錨は打ち直す
+/// ずらした先の錨は必ず [`crate::region::capture_anchor`] で取り直す。
+/// 元の錨は元の行の中身なので、そのまま持たせると次の取り直しで
+/// **他人の域へ吸い寄せられる** (= 静かに保証が破れる)。
+pub fn try_claim_wants_shift(
+    store: &mut Store,
+    holder: &Holder,
+    wants: &[Want],
+    now: u64,
+    ttl: u64,
+    alive: &dyn Fn(u32) -> bool,
+) -> ShiftClaim {
+    use crate::region::SAFE_BAND;
+    prune(store, now, alive);
+    // この 1 回の確保で先に置いた域 (パスごと)。**`BTreeMap`** — `HashMap` は
+    // 走査順が実行ごとに変わるので、同じ要求から違う配置が出てしまう。
+    let mut placed: std::collections::BTreeMap<String, Vec<crate::region::Span>> =
+        std::collections::BTreeMap::new();
+    let mut planned: Vec<Want> = Vec::with_capacity(wants.len());
+    let mut grants: Vec<Grant> = Vec::with_capacity(wants.len());
+    for w in wants {
+        let asked = normalize_spec(&w.spec);
+        if asked.is_empty() {
+            continue; // `try_claim_wants` と同じ扱い (空の指定は無かったことに)
+        }
+        let text = w.text.as_deref();
+        let region = spec_region(&asked);
+        let here: &[crate::region::Span] = placed
+            .get(&region.path)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        // **ずらせる形か**を先に決める。ここに「ずらさない条件」を集める:
+        //
+        // | 条件 | なぜずらさないのか |
+        // |---|---|
+        // | ファイル全体 (`span == None`) | そのファイルは 1 つしか無い |
+        // | 末尾までの域 (`#L10-`) | 長さが決まらない |
+        // | glob (`src/*.rs#L1-5`) | どのファイルを指すか確定しない |
+        let movable = match region.span {
+            Some(s)
+                if s.end != crate::region::Span::EOF
+                    && !s.is_empty()
+                    && !region.path.contains(['*', '?', '[']) =>
+            {
+                Some(s)
+            }
+            _ => None,
+        };
+        let (taken, busy) = match movable {
+            // ずらせる形 = 錨の取り直しを 1 回で済ませる速い経路
+            Some(s) => live_view(store, holder, &region.path, s, text),
+            // ずらせない形 = 判定だけを従来どおりの走査で出す
+            None => (
+                store
+                    .leases
+                    .iter()
+                    .filter(|l| !l.holder.same(holder))
+                    .any(|l| {
+                        l.patterns
+                            .iter()
+                            .enumerate()
+                            .any(|(i, p)| overlaps_live(p, &l.anchor_at(i), &asked, text))
+                    }),
+                None,
+            ),
+        };
+        // 同じ確保の中で先に置いた域とも重ねない。
+        let taken = taken
+            || match region.span {
+                None => false, // ファイル全体は自分の担当と畳まれるだけ
+                Some(s) => here
+                    .iter()
+                    .any(|p| crate::region::spans_too_close(p, &s, SAFE_BAND)),
+            };
+        if !taken {
+            if let Some(s) = region.span {
+                placed.entry(region.path.clone()).or_default().push(s);
+            }
+            planned.push(Want {
+                spec: asked.clone(),
+                anchor: w.anchor.clone(),
+                text: w.text.clone(),
+            });
+            grants.push(Grant {
+                asked: asked.clone(),
+                spec: asked,
+            });
+            continue;
+        }
+        // ── 埋まっている。空いている場所を探す ──────────────────────
+        // **行数が分からないファイルへはずらさない** ([`line_count`]) —
+        // 知らない場所を勧めると、台帳の上では取れているのに書く先が無い。
+        let alt = movable.zip(busy).and_then(|(s, mut b)| {
+            let total = line_count(text)?;
+            b.extend_from_slice(here);
+            fit_span(&b, s, total, SAFE_BAND)
+        });
+        let Some(alt) = alt else {
+            // ずらす先が無い。**文面は `--shift` 無しとまったく同じ**にする
+            // (拒否の理由が 2 通りあると、読む側が原因を切り分けられない)。
+            return match try_claim_wants(store, holder, wants, now, ttl, alive) {
+                Claim::Refused {
+                    owner,
+                    pattern,
+                    until,
+                } => ShiftClaim::Refused {
+                    owner,
+                    pattern,
+                    until,
+                },
+                // ここへは来ないはずだが、取れたなら取れたと言う
+                // (起こり得ない前提で嘘の拒否を作らない)。
+                Claim::Granted(_) => ShiftClaim::Granted(
+                    wants
+                        .iter()
+                        .map(|w| normalize_spec(&w.spec))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| Grant {
+                            asked: s.clone(),
+                            spec: s,
+                        })
+                        .collect(),
+                ),
+            };
+        };
+        let spec = normalize_spec(&crate::region::render(&crate::region::Region {
+            path: region.path.clone(),
+            span: Some(alt),
+            anchor: crate::region::Anchor::default(),
+        }));
+        let anchor = match text {
+            Some(t) => crate::region::capture_anchor(t, &alt),
+            None => crate::region::Anchor::default(),
+        };
+        placed.entry(region.path.clone()).or_default().push(alt);
+        planned.push(Want {
+            spec: spec.clone(),
+            anchor,
+            text: w.text.clone(),
+        });
+        grants.push(Grant { asked, spec });
+    }
+    match try_claim_wants(store, holder, &planned, now, ttl, alive) {
+        Claim::Granted(_) => ShiftClaim::Granted(grants),
+        // 全か無か: ここで断られても台帳は書き換わっていない。
+        Claim::Refused {
+            owner,
+            pattern,
+            until,
+        } => ShiftClaim::Refused {
+            owner,
+            pattern,
+            until,
+        },
+    }
 }
 
 /// 持ち主のリースを手放す。返り値は消した件数。
@@ -6078,6 +6485,560 @@ mod span_tests {
             "重なった担当が台帳に載った: {:?}",
             crate::region::conflicting_pairs(&regions, SAFE_BAND)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6. 断らない確保 (`zai lease claim --shift`) ─────────────────
+    //
+    //  行域が入って「離れた行なら 64 体が 1 ファイルへ同時に書ける」までは
+    //  出来ていた。残っていた唯一の弱点が**拒否**で、`tools/coedit-bench.sh`
+    //  の crowded 条件は **完了 11 / 拒否 53**。ところが 64 体が要求している
+    //  範囲は 934〜1065 行の **132 行**だけで、ファイルは 2000 行 =
+    //  **空きが 1868 行**ある。互いに素に置くのに要るのは 573 行なので、
+    //  **断られていたのは空きが無いからではなく、誰もずらしていなかったから。**
+
+    /// `tools/coedit-bench.sh` の crowded とまったく同じ担当表。
+    ///
+    /// 幅 `SAFE_BAND + 3 = 6` 行を stride 2 で `n` 個。
+    /// `base = (total - (n-1)*stride - rl) / 2` なので 2000 行 / 64 体なら
+    /// **934**、担当 `i` は `[934 + 2(i-1), +5]` で隣同士は必ず重なる。
+    fn crowded_plan(n: u32, total: u32) -> Vec<String> {
+        let rl = SAFE_BAND + 3;
+        let stride = 2u32;
+        let base = (total - (n - 1) * stride - rl) / 2;
+        (1..=n)
+            .map(|i| {
+                let s = base + (i - 1) * stride;
+                format!("a.rs#L{s}-{}", s + rl - 1)
+            })
+            .collect()
+    }
+
+    /// `total` 行の中身。**行ごとに違う内容**にして錨が一意に決まるようにする。
+    fn body(total: u32) -> String {
+        (1..=total).map(|i| format!("line {i}\n")).collect()
+    }
+
+    /// **ベンチの crowded 条件で「拒否 0」になることの直接の証拠。**
+    ///
+    /// 行域だけの実測は 完了 11 / 拒否 53 / 衝突 0。ここが 64 / 0 になる。
+    #[test]
+    fn crowded_な担当表でも六十四体全部がずらして入る() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-crowded");
+        std::fs::write(dir.join("a.rs"), body(2000)).expect("中身を置く");
+        let plan = crowded_plan(64, 2000);
+        assert_eq!(plan[0], "a.rs#L934-939", "ベンチと同じ担当表になっていない");
+        assert_eq!(plan[63], "a.rs#L1060-1065");
+        let mut store = Store::default();
+        let (mut granted, mut refused, mut moved) = (0, 0, 0);
+        for (i, p) in plan.iter().enumerate() {
+            match try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who(&format!("A{i}")),
+                std::slice::from_ref(p),
+                100,
+                600,
+                &dead,
+            ) {
+                ShiftClaim::Granted(gs) => {
+                    assert_eq!(gs.len(), 1, "1 件の要求に 1 件の結果");
+                    granted += 1;
+                    if gs[0].moved() {
+                        moved += 1;
+                    }
+                }
+                ShiftClaim::Refused { .. } => refused += 1,
+            }
+        }
+        assert_eq!(refused, 0, "空きが 1868 行あるのに {refused} 件を断った");
+        assert_eq!(granted, 64, "ずらした {moved} 件");
+        assert!(moved >= 60, "ほとんど動いていない: {moved} 件");
+        // **不変条件 (1)**: 台帳の担当はどの 2 つも互いに素
+        let regions: Vec<crate::region::Region> = store
+            .leases
+            .iter()
+            .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+            .collect();
+        assert_eq!(regions.len(), 64, "畳まれて減っている");
+        assert!(
+            crate::region::is_disjoint(&regions, SAFE_BAND),
+            "重なった担当が台帳に載った: {:?}",
+            crate::region::conflicting_pairs(&regions, SAFE_BAND)
+        );
+        // **不変条件 (2)**: 使った行は 2000 行に収まっている
+        for r in &regions {
+            let s = r.span.expect("行域");
+            assert!(
+                s.start >= 1 && s.end <= 2000,
+                "ファイルの外へ出した: {}",
+                crate::region::render(r)
+            );
+            assert_eq!(
+                s.len(),
+                SAFE_BAND + 3,
+                "幅が変わった: {}",
+                crate::region::render(r)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **決定的**であること。同じ台帳・同じ要求からは 1 バイト違わない結果が出る
+    /// (`HashMap` を通すと走査順が実行ごとに変わり、64 体が別々の配置を作って
+    ///  「ずらしたのに重なる」が起きる)。
+    ///
+    /// 規模を 32 体 / 1000 行に落としているのは**速度のため**。錨の取り直しは
+    /// 担当数 × 行数で効くので、64 体 / 2000 行を 5 周すると 1 件で 16 秒かかる
+    /// (実測)。決まり方は規模に依らないので、64 体ぶんは
+    /// `crowded_な担当表でも六十四体全部がずらして入る` が押さえる。
+    #[test]
+    fn ずらした結果は決定的で安全帯を必ず挟む() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-det");
+        std::fs::write(dir.join("a.rs"), body(1000)).expect("中身を置く");
+        let plan = crowded_plan(32, 1000);
+        let run = || {
+            let mut store = Store::default();
+            let mut out: Vec<String> = Vec::new();
+            for (i, p) in plan.iter().enumerate() {
+                match try_claim_shift_in(
+                    &dir,
+                    &mut store,
+                    &who(&format!("A{i}")),
+                    std::slice::from_ref(p),
+                    100,
+                    600,
+                    &dead,
+                ) {
+                    ShiftClaim::Granted(gs) => out.push(gs[0].spec.clone()),
+                    ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
+                }
+            }
+            out
+        };
+        let first = run();
+        for _ in 0..4 {
+            assert_eq!(run(), first, "同じ入力から違う配置が出た");
+        }
+        let spans: Vec<Span> = first.iter().map(|s| spec_span(s).expect("行域")).collect();
+        for i in 0..spans.len() {
+            for j in (i + 1)..spans.len() {
+                assert!(
+                    !crate::region::spans_too_close(&spans[i], &spans[j], SAFE_BAND),
+                    "{:?} と {:?} が安全帯より近い",
+                    spans[i],
+                    spans[j]
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **64 スレッドが同時に `--shift` で取りに行っても重なりは 1 件も出ない。**
+    ///
+    /// 位置決めを台帳ロックの外でやると、全員が同じ空きを見つけて
+    /// 同じ場所を取りに行く。確保はアトミックでなければならない。
+    ///
+    /// ## 規模を 1 行幅 / 300 行にしている理由 (実測)
+    /// 錨の取り直し ([`crate::region::resolve`]) は**呼ぶたびにテキスト全体を
+    /// 行へ割り直す**ので、臨界区間は「行数 × 担当数」で伸びる。
+    /// 2000 行 × 幅 6 行だと 1 件 30ms・64 体で台帳ロックを 2 秒握ることになり、
+    /// **全テスト同時実行の負荷では `with_store_retry` の 30 秒の上限を超えて
+    /// busy が出た** (2000 行で 33 件、800 行で 13 件)。
+    /// ここが見たいのは「同時に取りに行っても重ならない」ことなので、
+    /// 混み具合 (64 体が 64 行の中を取り合う) は保ったまま行数を落とす。
+    /// 幅 6 行 / 2000 行の crowded 条件そのものは
+    /// `crowded_な担当表でも六十四体全部がずらして入る` が押さえている。
+    #[test]
+    fn 六十四スレッドが同時にずらしても重なりは生まれない() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-64");
+        let total = 300u32;
+        std::fs::write(dir.join("a.rs"), body(total)).expect("中身を置く");
+        let store = dir.join("s.json");
+        enable(&store).expect("有効化");
+        // 幅 1 行を stride 1 で 64 個 = 全員が互いに安全帯より近い。
+        // 互いに素に置くには 64 × (1 + 3) = 256 行要る (300 行なら入る)。
+        let base = (total - 63 - 1) / 2;
+        let plan: Vec<String> = (0..64).map(|i| format!("a.rs#L{}", base + i)).collect();
+        let mut hs = Vec::with_capacity(plan.len());
+        for (i, p) in plan.iter().enumerate() {
+            let (store, tree, p) = (store.clone(), dir.clone(), p.clone());
+            hs.push(std::thread::spawn(move || {
+                with_store_retry(&store, |st| {
+                    try_claim_shift_in(
+                        &tree,
+                        st,
+                        &who(&format!("A{i}")),
+                        std::slice::from_ref(&p),
+                        100,
+                        600,
+                        &dead,
+                    )
+                })
+            }));
+        }
+        let (mut granted, mut refused, mut busy) = (0, 0, 0);
+        for h in hs {
+            match h.join().expect("スレッド") {
+                Ok(ShiftClaim::Granted(_)) => granted += 1,
+                Ok(ShiftClaim::Refused { .. }) => refused += 1,
+                Err(e) if is_lock_busy(&e) => busy += 1,
+                Err(e) => panic!("台帳が壊れた: {e}"),
+            }
+        }
+        assert_eq!(busy, 0, "混雑して判定できなかった (busy-deny) が {busy} 件");
+        assert_eq!(granted, 64, "断られた {refused} 件");
+        let st = read_store(&store).expect("読める");
+        assert_eq!(st.leases.len(), 64);
+        // **不変条件**: 64 スレッドが同時に走っても、台帳の担当は互いに素
+        let regions: Vec<crate::region::Region> = st
+            .leases
+            .iter()
+            .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+            .collect();
+        assert_eq!(regions.len(), 64);
+        assert!(
+            crate::region::is_disjoint(&regions, SAFE_BAND),
+            "重なった担当が台帳に載った: {:?}",
+            crate::region::conflicting_pairs(&regions, SAFE_BAND)
+        );
+        for r in &regions {
+            let sp = r.span.expect("行域");
+            assert!(
+                sp.end <= total,
+                "ファイルの外へ出した: {}",
+                crate::region::render(r)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空いていればずらさない。**同じ域を取り直しても動かない** (冪等)。
+    #[test]
+    fn 空いていればずらさず要求どおり取る() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-asis");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        for _ in 0..3 {
+            match try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("A"),
+                &["a.rs#L10-20".into()],
+                100,
+                600,
+                &dead,
+            ) {
+                ShiftClaim::Granted(gs) => {
+                    assert_eq!(gs.len(), 1);
+                    assert!(!gs[0].moved(), "空いているのにずらした: {:?}", gs[0]);
+                    assert_eq!(gs[0].spec, "a.rs#L10-20");
+                }
+                ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
+            }
+        }
+        assert_eq!(store.leases.len(), 1);
+        assert_eq!(store.leases[0].patterns, vec!["a.rs#L10-20".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **同じ確保の中で重なっている 2 件も、ずらして両方入る。**
+    /// (先に置いた域を数えないと、自分自身と重なった台帳を作ってしまう)
+    #[test]
+    fn 同じ確保の中の重なりもずらして両方取る() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-self");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        let gs = match try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("A"),
+            &["a.rs#L50-60".into(), "a.rs#L55-65".into()],
+            100,
+            600,
+            &dead,
+        ) {
+            ShiftClaim::Granted(gs) => gs,
+            ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
+        };
+        assert_eq!(gs.len(), 2);
+        assert!(!gs[0].moved(), "1 件目は空いている: {:?}", gs[0]);
+        assert!(gs[1].moved(), "重なっているのに動かなかった: {:?}", gs[1]);
+        assert_eq!(gs[1].spec, "a.rs#L64-74");
+        let regions: Vec<crate::region::Region> = store.leases[0]
+            .patterns
+            .iter()
+            .map(|p| spec_region(p))
+            .collect();
+        assert_eq!(regions.len(), 2, "畳まれた: {:?}", store.leases[0].patterns);
+        assert!(crate::region::is_disjoint(&regions, SAFE_BAND));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **挿入点 (幅 0) もずらせる。**
+    ///
+    /// 幅 0 でも判定では「その行の位置にある点」なので (`Span::probe`)、
+    /// 安全帯を挟んだ空きへ動かせる。行域へ化けないことも見る。
+    #[test]
+    fn 挿入点も空いている場所へずらせる() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-insert");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("A"),
+                &["a.rs#L100-120".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Granted(_)
+        ));
+        let got = match try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("B"),
+            &["a.rs#@110".into()],
+            100,
+            600,
+            &dead,
+        ) {
+            ShiftClaim::Granted(gs) => gs[0].spec.clone(),
+            ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
+        };
+        let s = spec_span(&got).expect("行域");
+        assert!(s.is_insert(), "挿入点が行域へ化けた: {got}");
+        // 手前 96 と後ろ 124 は要求 110 から同じ距離。**同点は小さいほう。**
+        assert_eq!(got, "a.rs#@96", "{got}");
+        let regions: Vec<crate::region::Region> = store
+            .leases
+            .iter()
+            .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+            .collect();
+        assert!(
+            crate::region::is_disjoint(&regions, SAFE_BAND),
+            "{:?}",
+            crate::region::conflicting_pairs(&regions, SAFE_BAND)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **ずらせないものはずらさずに断る。**
+    /// 知らない場所を勧めるくらいなら断るほうがよい —
+    /// 「台帳では取れているのに書く先が無い」がいちばん気付きにくい壊れ方。
+    #[test]
+    fn ずらせない要求は従来どおり断る() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-nope");
+        std::fs::write(dir.join("a.rs"), body(60)).expect("中身を置く");
+        // ① 誰かがファイルを丸ごと持っている = 1 行も空いていない
+        let mut whole = Store::default();
+        try_claim(&mut whole, &who("A"), &["a.rs".into()], 100, 600, &dead);
+        for spec in ["a.rs", "a.rs#L10-20", "a.rs#L10-", "a.rs#@10"] {
+            assert!(
+                matches!(
+                    try_claim_shift_in(
+                        &dir,
+                        &mut whole,
+                        &who("B"),
+                        &[spec.to_string()],
+                        100,
+                        600,
+                        &dead
+                    ),
+                    ShiftClaim::Refused { .. }
+                ),
+                "丸ごと持たれているのに通した: {spec}"
+            );
+        }
+        // ② ファイルが読めない = 行数が分からない
+        let mut ghost = Store::default();
+        try_claim(
+            &mut ghost,
+            &who("A"),
+            &["ghost.rs#L10-20".into()],
+            100,
+            600,
+            &dead,
+        );
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut ghost,
+                &who("B"),
+                &["ghost.rs#L12-22".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Refused { .. }
+        ));
+        // ③ ファイルより広い域はどこにも入らない
+        let mut wide = Store::default();
+        try_claim(
+            &mut wide,
+            &who("A"),
+            &["a.rs#L10-20".into()],
+            100,
+            600,
+            &dead,
+        );
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut wide,
+                &who("B"),
+                &["a.rs#L1-60".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Refused { .. }
+        ));
+        // ④ glob はどのファイルを指すか確定しない
+        let mut glob = Store::default();
+        try_claim(
+            &mut glob,
+            &who("A"),
+            &["a.rs#L10-20".into()],
+            100,
+            600,
+            &dead,
+        );
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut glob,
+                &who("B"),
+                &["*.rs#L12-22".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Refused { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **全か無か。** 1 件でもずらす先が無ければ 1 件も取らない
+    /// (台帳の書き換えは最後の `try_claim_wants` 1 回だけ)。
+    #[test]
+    fn ずらせない一件が混ざったら一件も取らない() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-allornone");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        try_claim(
+            &mut store,
+            &who("A"),
+            &["a.rs#L10-20".into(), "b.rs".into()],
+            100,
+            600,
+            &dead,
+        );
+        let before = store.clone();
+        // `a.rs` はずらせるが、`b.rs` は丸ごと持たれていてずらせない
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("B"),
+                &["a.rs#L12-22".into(), "b.rs".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Refused { .. }
+        ));
+        assert_eq!(store, before, "断ったのに台帳が変わった");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--shift` を通さない経路は**1 バイトも変わらない** —
+    /// 同じ台帳・同じ要求で `try_claim` は昔どおり断る。
+    #[test]
+    fn shift_を通さなければ従来どおり拒否する() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-off");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        try_claim(
+            &mut store,
+            &who("A"),
+            &["a.rs#L50-60".into()],
+            100,
+            600,
+            &dead,
+        );
+        let snapshot = store.clone();
+        assert!(matches!(
+            try_claim(
+                &mut store,
+                &who("B"),
+                &["a.rs#L55-65".into()],
+                100,
+                600,
+                &dead
+            ),
+            Claim::Refused { .. }
+        ));
+        assert_eq!(store, snapshot, "拒否なのに台帳が変わった");
+        // 同じ要求を `--shift` で出せば通る
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("B"),
+                &["a.rs#L55-65".into()],
+                100,
+                600,
+                &dead
+            ),
+            ShiftClaim::Granted(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ずらした先の**錨は打ち直す**。元の錨をそのまま持たせると、
+    /// 次の取り直しで**他人の域へ吸い寄せられる** (静かに保証が破れる)。
+    #[test]
+    fn ずらした先の錨は打ち直される() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-anchor");
+        std::fs::write(dir.join("a.rs"), body(200)).expect("中身を置く");
+        let mut store = Store::default();
+        try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("A"),
+            &["a.rs#L50-60".into()],
+            100,
+            600,
+            &dead,
+        );
+        let spec = match try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("B"),
+            &["a.rs#L55-65".into()],
+            100,
+            600,
+            &dead,
+        ) {
+            ShiftClaim::Granted(gs) => gs[0].spec.clone(),
+            ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
+        };
+        let b = store
+            .leases
+            .iter()
+            .find(|l| l.holder.same(&who("B")))
+            .expect("B のリース");
+        let span = spec_span(&spec).expect("行域");
+        let text = body(200);
+        assert_eq!(b.anchors.len(), 1);
+        assert!(!b.anchors[0].is_blank(), "錨が打たれていない");
+        // 錨から取り直した域が、ずらした先そのものに戻る
+        let mut r = spec_region(&spec);
+        r.anchor = b.anchors[0].clone();
+        assert_eq!(crate::region::resolve(&r, &text), Some(span));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -349,9 +349,12 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
                                         (以後、書き込みの所有が記録されます)
   zai lease disable                     無効にする (台帳を消します)
   zai lease list [--json]               確保中のファイルと持ち主
-  zai lease claim <パターン...> [--agent 名前]
+  zai lease claim [--shift] <パターン...> [--agent 名前]
                                         自分のものとして確保する (glob 可)
                                         重なっていたら拒否されます (後勝ちにしません)
+                                        --shift を付けると、埋まっていたら**同じ幅が
+                                        入るいちばん近い空き行域へずらして**取ります
+                                        (最後の行に granted <確保した仕様> を出します)
   zai lease release [--agent 名前 | --all]
                                         確保を手放す (引き継ぐとき)
   スコープは git の**元のリポジトリ**です。worktree は同じ台帳を共有します
@@ -1633,9 +1636,13 @@ fn lease_dispatch(args: &[String]) -> CliOut {
         }
         "claim" => {
             let (agent, rest) = take_opt(&rest, "--agent");
+            // **`--shift` を付けなければ、以下は 1 バイトも変わらない。**
+            // 「要求どおりか、拒否か」という既存の契約を守る側と、
+            // 「断らずにずらす」側を、この 1 つの旗だけで分ける。
+            let (shift, rest) = take_flag(&rest, "--shift");
             if rest.is_empty() {
                 return Err(CliError::Usage(
-                    "確保するパターンを 1 つ以上指定してください: zai lease claim <パターン...>"
+                    "確保するパターンを 1 つ以上指定してください: zai lease claim [--shift] <パターン...>"
                         .into(),
                 ));
             }
@@ -1652,6 +1659,46 @@ fn lease_dispatch(args: &[String]) -> CliOut {
             // **64 件中 18 件しか通らず 46 件が busy**。retry 版では 64/64。
             // 原因は混雑そのものではなく待ち方で、譲る＋揺らぎ付き指数
             // バックオフに替えると消える (`with_store_retry` の doc 参照)。
+            if shift {
+                // **位置決めは台帳ロックの内側で行う** — 外で空きを探すと、
+                // 64 体が同じ空きを見つけて同じ場所を取りに行く。
+                let out = lease::with_store_retry(&store, |s| {
+                    lease::try_claim_shift_in(
+                        &roots.tree,
+                        s,
+                        &holder,
+                        &rest,
+                        now,
+                        lease::DEFAULT_TTL_SECS,
+                        &|p| crate::instances::pid_alive(p),
+                    )
+                })
+                .map_err(CliError::Runtime)?;
+                return match out {
+                    lease::ShiftClaim::Granted(gs) => {
+                        let moved = gs.iter().filter(|g| g.moved()).count();
+                        let mut lines = vec![if moved == 0 {
+                            format!("{} 件を確保しました", gs.len())
+                        } else {
+                            format!("{} 件を確保しました ({moved} 件をずらしました)", gs.len())
+                        }];
+                        lines.extend(
+                            gs.iter()
+                                .filter(|g| g.moved())
+                                .map(|g| format!("  ずらしました: {} → {}", g.asked, g.spec)),
+                        );
+                        // **最後の行は必ず `granted <仕様>`。** 機械が読む面なので
+                        // 装飾を付けない (人向けの説明は上の行に出し切る)。
+                        lines.extend(gs.iter().map(|g| format!("granted {}", g.spec)));
+                        Ok(lines.join("\n"))
+                    }
+                    lease::ShiftClaim::Refused { owner, pattern, .. } => {
+                        Err(CliError::Runtime(format!(
+                            "確保できません: 「{pattern}」は {owner} が持っています"
+                        )))
+                    }
+                };
+            }
             let out = lease::with_store_retry(&store, |s| {
                 lease::try_claim(s, &holder, &rest, now, lease::DEFAULT_TTL_SECS, &|p| {
                     crate::instances::pid_alive(p)
