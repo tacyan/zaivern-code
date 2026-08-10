@@ -1544,7 +1544,7 @@ fn state() -> &'static Mutex<PanelState> {
 /// `app.rs` へ触らずに済ませるため、**自分自身のインスタンス登録**
 /// (`~/.zaivern/instances/<pid>.json`) から引く。登録が無い / 壊れている
 /// ときはカレントディレクトリへ落ちる (fail-soft)。
-fn gui_workspace_root() -> PathBuf {
+pub fn gui_workspace_root() -> PathBuf {
     let me = std::process::id();
     let found = crate::instances::scan_and_prune(&crate::instances::instances_dir())
         .into_iter()
