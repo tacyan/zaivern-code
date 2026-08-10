@@ -221,7 +221,7 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u
         // 取った担当はここで拾える (古い占有表で配ると重ねてしまう)。
         let occupied = occupied_of(mesh, path);
         let wants: Vec<Want> = idxs.iter().map(|&i| asks[i].1.clone()).collect();
-        let plan = negotiate::allocate(&wants, &occupied, lines_of(&path), band);
+        let plan = negotiate::allocate(&wants, &occupied, lines_of(path), band);
 
         for &i in idxs {
             let (from, want, is_deal) = &asks[i];
@@ -271,7 +271,7 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u
                     }
                 }
                 None => {
-                    let off = negotiate::offer(want, &occupied, lines_of(&path), band);
+                    let off = negotiate::offer(want, &occupied, lines_of(path), band);
                     let (holder, hint) = describe(&off);
                     out.denied
                         .push((region::render(&want.region), holder.clone(), hint.clone()));

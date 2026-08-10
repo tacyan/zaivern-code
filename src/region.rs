@@ -369,8 +369,11 @@ pub fn resolve_spec(s: &Spec, text: &str) -> Result<Region, String> {
             anchor: capture_anchor(text, sp),
         }),
         Sel::Symbol { kind, name } => {
+            // 指定を**そのまま**返す。人は自分が打った文字列で探すので、
+            // `src/a.rs` と `fn` と `name` に散らして出すと照合しづらい
+            // (`render_spec` が唯一の表記の真実源。ここで組み立て直さない)。
             let sp = symbol_span(text, kind, name)
-                .ok_or_else(|| format!("{kind} {name} が見つかりません: {}", s.path))?;
+                .ok_or_else(|| format!("{} が見つかりません", render_spec(s)))?;
             Ok(Region {
                 path: s.path.clone(),
                 span: Some(sp),
