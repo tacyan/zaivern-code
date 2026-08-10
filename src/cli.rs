@@ -221,6 +221,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             // ので、**登録し忘れると `zai` が未知語をワークスペース指定と
             // 解釈して GUI の窓が生える** (実測で発見された罠)。
             | "coedit"
+            // Erlang 風プロセスメッシュ (エージェント同士が裏で認識し合う層)
+            | "mesh"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
             | "update"
@@ -448,6 +450,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "split" => crate::features::split::cli_main(rest),
         // 衝突ゼロ証明と一撃統合。実体は src/coedit.rs。
         "coedit" => crate::features::coedit::cli_main(rest),
+        // Erlang 風プロセスメッシュ。実体は src/mesh.rs。
+        "mesh" => crate::features::mesh::cli_main(rest),
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。

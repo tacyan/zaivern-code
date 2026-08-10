@@ -2097,18 +2097,9 @@ fn usage() -> String {
 /// (`Pid::parse` / `claim` / `release` / `link` / `whereis` / `parse_msg` …) は
 /// 非テストビルドから到達できず、`dead_code` が全部鳴る。
 ///
-/// rustc の `dead_code` は `allow` を付けた項目を**生存の起点**として扱うので、
-/// ここ 1 つで CLI 側の面がまとめて静かになる。**統合担当が `src/cli.rs` へ
-///
-/// ```ignore
-/// "mesh" => return Some(crate::features::mesh::cli_main(&args[1..])),
-/// ```
-///
-/// の 1 行を足したら、この属性は消すこと。** 消して警告が出るなら、それは
-/// 本当に繋がっていない証拠になる (CLAUDE.md「UI から到達できない実装は未完成」)。
-/// GUI 側の面 (参加 / 監視 / ping / 掃除 / 一覧) はパレットから到達済みなので、
-/// この `allow` の内側には入っていない。
-#[allow(dead_code)]
+/// `src/cli.rs` の dispatch から `zai mesh …` として呼ばれる
+/// (統合時に直列で配線済み。`allow(dead_code)` はその時点で外した)。
+/// GUI 側の面 (参加 / 監視 / ping / 掃除 / 一覧) はパレットから到達する。
 pub fn cli_main(argv: &[String]) -> i32 {
     let Some(sub) = argv.first().map(String::as_str) else {
         print!("{}", usage());
