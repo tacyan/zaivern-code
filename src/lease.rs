@@ -3106,13 +3106,18 @@ pub const KEY_GATE_READ_CAP: &str = "lease.gate_read_cap_bytes";
 /// 上げるのが唯一の「行単位に戻す」手段**だから (フックは書き込みのたびに
 /// 走る短命プロセスなので、既定を上げると全員が I/O を払う)。
 /// `0` / 未設定 = 既定。
+///
+/// **既定より小さい値は既定へ引き上げる。** 呼び出し側は「既定を超えたとき
+/// だけ設定を引く」ので、下げた値は**ファイルの大きさによって効いたり
+/// 効かなかったりする**。効かない設定を受け付けるほうが、受け付けないより
+/// 質が悪い (利用者は下げたつもりでいる)。上げる方向だけが意味を持つ。
 fn configured_cap(root: &Path) -> u64 {
     let cfg = crate::config::load(std::slice::from_ref(&root.to_path_buf()), false);
     let v = cfg.feature_i64(KEY_GATE_READ_CAP);
     if v <= 0 {
         GATE_READ_CAP
     } else {
-        v as u64
+        (v as u64).max(GATE_READ_CAP)
     }
 }
 
@@ -3825,6 +3830,12 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
             label: "ファイル所有の寿命 (分)",
             help: "この時間だけ黙っている担当は所有権を失います。                   死んだエージェントにリポジトリを人質へ取らせないための上限です。",
             default: crate::feature::SettingValue::Int(30),
+        },
+        crate::feature::Setting {
+            key: KEY_GATE_READ_CAP,
+            label: "行域を出すために読むファイルの上限 (バイト)",
+            help: "これを超えるファイルは「同じファイルの違う行」を分け合えず、ファイル全体の担当になります。                   生成コード・lock・データファイルが 1MiB を超えるリポジトリでは、上げるのが行単位に戻す唯一の手段です。                   既定より小さい値は既定へ引き上げます (下げても効かないため)。0 か未設定で既定 1MiB。",
+            default: crate::feature::SettingValue::Int(GATE_READ_CAP as i64),
         },
     ],
     ..crate::feature::Feature::DEFAULT
