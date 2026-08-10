@@ -1880,10 +1880,20 @@ mod tests {
     fn 登録ファイルは再エクスポートだけ() {
         let src = include_str!("features/guard.rs").replace("\r\n", "\n");
         assert!(src.contains("#[path = \"../guard.rs\"]"), "実体への path が無い");
-        assert!(
-            src.contains("pub use imp::{cli_main, FEATURE};"),
-            "cli_main と FEATURE の再エクスポートが無い"
-        );
+        // **完全一致で固定しないこと。** 再エクスポートする物が増えるたびに
+        // 落ちると、統合担当が「意図は満たしているのにテストが赤い」状態に
+        // 追い込まれ、番人ごと消される (実際に `HELP` を足したとき落ちた)。
+        // 見るのは「`pub use imp::{..}` の 1 行で、必要な物が載っている」だけ。
+        let reexport = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("pub use imp::{"))
+            .unwrap_or_else(|| panic!("`pub use imp::{{..}}` の再エクスポートが無い"));
+        for item in ["cli_main", "FEATURE"] {
+            assert!(
+                reexport.contains(item),
+                "{item} が再エクスポートされていない: {reexport}"
+            );
+        }
         // 定義を写経していないこと (2 か所に持つとズレる)
         assert!(
             !src.contains("crate::feature::Feature {"),

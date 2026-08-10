@@ -212,6 +212,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "agent"
             | "lease"
             | "hook"
+            // ベンダー非依存の書き込み強制 (git フックがここを呼ぶ)
+            | "guard"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
             | "update"
@@ -239,7 +241,7 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
+    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
 }
 
 const HELP_HEAD: &str = "\
@@ -333,6 +335,12 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
 
 ";
 
+/// `zai guard --help` のセクション。
+///
+/// **本文は [`crate::guard`] 側の唯一の出所を指すだけ**。ここへ写経すると
+/// `zai guard --help` と `zai --help` が食い違う (それを戒めるテストが下にある)。
+pub const HELP_GUARD: &str = crate::features::guard::HELP;
+
 /// `zai update --help` のセクション。
 pub const HELP_UPDATE: &str = "\
 update (Zaivern Code 自身を更新します — エディタが起動していなくても使えます):
@@ -395,6 +403,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             println!("Zaivern Code {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // git フック (pre-commit 等) と CI がここを呼ぶ。実体は src/guard.rs。
+        "guard" => crate::features::guard::cli_main(rest),
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
@@ -2476,6 +2486,7 @@ mod tests {
             HELP_SESSION,
             HELP_AGENT,
             HELP_LEASE,
+            HELP_GUARD,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {

@@ -8,4 +8,4 @@
 #[path = "../guard.rs"]
 mod imp;
 
-pub use imp::{cli_main, FEATURE};
+pub use imp::{cli_main, FEATURE, HELP};
