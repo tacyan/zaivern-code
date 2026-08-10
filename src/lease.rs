@@ -160,6 +160,14 @@ const LOCK_BACKOFF_CAP_US: u64 = 4_000;
 /// 「先客がクラッシュしていた」場合にも自力で抜けられる。
 const LOCK_RETRY_MS: u64 = 1_000;
 
+/// 進捗が観測できている間でも、これを超えたら諦める (ミリ秒)。
+///
+/// [`with_store_retry`] は「台帳が書き換わり続けている＝系は生きている」
+/// 限り待ち続ける。台数が増えれば待ち時間も伸びるのが正しいが、**短命な
+/// `zai hook` プロセスが何十秒も居座るのは別の壊れ方**なので上限を置く。
+/// 30 秒は「64 体が 1 ファイルへ殺到しても実測 1.1 秒」に対して 27 倍の余裕。
+const LOCK_RETRY_CAP_MS: u64 = 30_000;
+
 /// ロック待ちが尽きたことを示す接頭辞 (表示はされない制御文字)。
 /// [`is_lock_busy`] だけが読む。
 const LOCK_BUSY: &str = "\u{0}busy:";
@@ -1534,22 +1542,84 @@ pub fn with_store<T>(store: &Path, f: impl FnOnce(&mut Store) -> T) -> Result<T,
 ///
 /// 一方、実測すると `busy` の原因は混雑ではなく**待ち方**だった
 /// ([`LOCK_SPIN_ROUNDS`] に数字がある: 5ms 固定の sleep がロックの
-/// 受け渡しを毎秒 200 回に縛っていた)。譲る + 揺らぎ付き指数バックオフに
-/// 変えるだけで 64 体同時でも `busy` が 0 になる
-/// ([`tests::六十四体が同時に確保してもbusyは出ず勝者は一つ`])。
+/// 受け渡しを毎秒 200 回に縛っていた)。譲る + 揺らぎ付き指数バックオフと、
+/// **進捗で延びる待ち予算**に変えると 64 体同時でも `busy` が 0 になる
+/// ([`span_tests::六十四体が同時に確保してもbusyは出ず勝者は一つ`])。
 /// **台帳は 1 スコープ 1 ファイルのまま = 全か無かは自明に保たれる。**
+///
+/// **この保証は `with_store_retry` を通ったときのもの**で、素の
+/// [`with_store`] には無い。あちらは 1 回ぶんの primitive で、`busy` は
+/// その定義された失敗形である (機械が飽和した状態で素の版を 64 体で叩くと
+/// 36 件 busy が出た)。製品の経路 (`zai lease claim` / [`gate`]) は
+/// すべてこの retry 版を通ること。
 pub fn with_store_retry<T>(store: &Path, mut f: impl FnMut(&mut Store) -> T) -> Result<T, String> {
-    let deadline = Instant::now() + Duration::from_millis(LOCK_RETRY_MS);
+    // **固定の待ち予算は N が増えれば必ず破綻する。**
+    //
+    // 臨界区間が 1 回 t かかるなら、N 体が順番に通るには N·t 要る。予算を
+    // 定数にすると「N がいくつまでなら大丈夫か」を暗黙に決めることになり、
+    // その上を踏んだ瞬間に **誤りではない busy** が出る (実測: 64 体には
+    // 320ms 要るのに予算 200ms だった)。台数を引数で渡す設計にもできるが、
+    // 呼び出し側は自分以外に何体居るかを知らない。
+    //
+    // そこで**進捗で延ばす**: 台帳ファイルが書き換わっていれば「誰かが通った」
+    // ので、こちらは待ち続けてよい。誰も通らないまま [`LOCK_RETRY_MS`] 経ったら
+    // 本当に詰まっているので諦める。これで N に依存しなくなり、かつ
+    // デッドロック時に永久待ちもしない。上限 [`LOCK_RETRY_CAP_MS`] は
+    // 「壊れた環境で短命フックが居座らない」ための安全弁。
+    let start = Instant::now();
+    let cap = Duration::from_millis(LOCK_RETRY_CAP_MS);
+    let idle_budget = Duration::from_millis(LOCK_RETRY_MS);
+    let mut last_progress = Instant::now();
+    let mut seen = progress_token(store);
     let mut attempt = 0u32;
     loop {
         match with_store(store, &mut f) {
             Ok(v) => return Ok(v),
-            Err(e) if is_lock_busy(&e) && Instant::now() < deadline => {
+            Err(e) if is_lock_busy(&e) => {
+                let now = Instant::now();
+                let rev = progress_token(store);
+                if rev != seen {
+                    // 誰かが通った = 系は生きている。待ちの起点を巻き直す。
+                    seen = rev;
+                    last_progress = now;
+                }
+                if now.duration_since(last_progress) >= idle_budget
+                    || now.duration_since(start) >= cap
+                {
+                    return Err(e);
+                }
                 lock_backoff(&mut attempt);
             }
             Err(e) => return Err(e),
         }
     }
+}
+
+/// 「系が動いているか」を、ロックを取らずに安く見るための印。
+///
+/// 2 つを見る:
+///
+/// 1. **台帳** `(更新時刻, 長さ)` — 誰かが確保・解放に成功した
+/// 2. **ロックファイル** の更新時刻 — 誰かが臨界区間を*通り抜けた*
+///
+/// 1 だけでは足りない。[`with_store`] は**中身が変わったときしか書かない**
+/// ので、63 体が「他人が持っている」と断られるだけの局面では台帳が 1 度も
+/// 動かず、待ち手からは「詰まっている」と区別が付かない。ロックは
+/// `create_new` で作られ `LockGuard` の破棄で消えるため、通り抜けるたびに
+/// 作り直されて更新時刻が変わる — これが**断られた側にも見える進捗**になる。
+///
+/// 取りこぼしても、こちらの待ちが早く尽きるだけで**誤った成功にはならない**。
+fn progress_token(store: &Path) -> (u64, u64, u64) {
+    let mtime = |p: &Path| -> u64 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    };
+    let len = std::fs::metadata(store).map(|m| m.len()).unwrap_or(0);
+    (mtime(store), len, mtime(&store.with_extension("lock")))
 }
 
 /// 診断ログの場所。**書き手 ([`log_line`]) と読み手 (競合ゼロ点検) が
@@ -5324,7 +5394,13 @@ mod span_tests {
         for i in 0..n {
             let store = store.clone();
             hs.push(std::thread::spawn(move || {
-                with_store(&store, |s| {
+                // **製品と同じ経路で測る。** `zai lease claim` も `gate` も
+                // `with_store_retry` を通る。素の `with_store` は内側の
+                // 1 回ぶんの primitive で、`busy` はその定義された失敗形
+                // なので、そこに busy 0 を求めるのは仕様の取り違えになる
+                // (実際、全 4132 件と同時に走らせると素の版は 36 件 busy を
+                //  出した — 機械が飽和すれば当然そうなる)。
+                with_store_retry(&store, |s| {
                     try_claim(
                         s,
                         &who(&format!("A{i}")),
