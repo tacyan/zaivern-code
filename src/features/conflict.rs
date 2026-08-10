@@ -31,6 +31,5 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // **閉じているときは 1 命令も走らない** (`conflict_radar_ui` の先頭で
     // 即 return する) ので、アイドル時のコストはゼロのまま。
     draw: Some(|app, ctx| app.conflict_radar_ui(ctx)),
-    settings: &[],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };

@@ -96,6 +96,14 @@ fn generate_feature_registry() {
     // 明示する。パスは `CARGO_MANIFEST_DIR` から導出するので直書きではない。
     // Windows のバックスラッシュは `#[path]` の文字列リテラルでエスケープが
     // 要るため、`/` へ寄せる (Windows も `/` を受け付ける)。
+    //
+    // **`OUT_DIR` を複数のワークツリーで共有すると、この焼き込みが牙を剥く。**
+    // 生成物は「最後にビルドしたワークツリーの `src/features/*.rs`」を指すので、
+    // 他のワークツリーがそれをコンパイルし、**自分のチェックアウトに存在しない
+    // ファイルのエラー**が出る (別セッションが 2 回踏み、こちらでも
+    // `.claude/worktrees/w-spec/...` を指す E0063 という幻を追った)。
+    // 値が変わったらビルドスクリプトを回し直させて、生成物を作り直す。
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let manifest = manifest.replace('\\', "/");
 

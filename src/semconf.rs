@@ -2248,7 +2248,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
             default: crate::feature::SettingValue::Int(MAX_WARNINGS as i64),
         },
     ],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════
