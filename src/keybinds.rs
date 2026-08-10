@@ -2956,6 +2956,75 @@ mod tests {
         raw.replace("\r\n", "\n")
     }
 
+    /// [`strip_test_mods`] が**本体コードは残す**ことの番人。
+    ///
+    /// テストを飛ばす細工を入れた結果、**何も咎めない番人**になっていたら
+    /// 検査そのものが無意味になる。落とすものと残すものを両方固定する。
+    #[test]
+    fn テスト除去は本体コードを残す() {
+        let src = "\
+fn ui() {
+    label(\"押すと閉じます (\u{2318}W)\");
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        assert!(x, \"\u{2318}W が効いていない\");
+    }
+}
+fn other() {
+    label(\"保存 (\u{2318}S)\");
+}
+";
+        let out = strip_test_mods(src);
+        assert!(out.contains("\u{2318}W)"), "本体の文字列が消えている:\n{out}");
+        assert!(out.contains("\u{2318}S)"), "テストの後ろの本体が消えている:\n{out}");
+        assert!(
+            !out.contains("が効いていない"),
+            "テストの中身が残っている:\n{out}"
+        );
+    }
+
+    /// `#[cfg(test)]` の中身を落とす。**テストコードは画面に出ない**ので、
+    /// 期待値として `⌘` などを書いてよい。
+    ///
+    /// 以前は「`assert` を含む行は飛ばす」だけだったが、`assert!` が
+    /// 複数行に折り返されるとメッセージ行だけが残り、
+    /// **テスト名を咎める誤検知**になった (実際に `⌃G の小窓が…` で落ちた)。
+    /// 誤検知する番人は消されるので、`src/panels.rs` の `egui_id_guard` と
+    /// 同じく**波括弧の深さでモジュールごと飛ばす**。
+    fn strip_test_mods(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut depth = 0usize;
+        let mut test_exit: Option<usize> = None;
+        let mut pend = false;
+        for line in src.lines() {
+            if let Some(d) = test_exit {
+                if depth <= d {
+                    test_exit = None;
+                }
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[cfg(test)]") {
+                pend = true;
+            }
+            let opens = line.matches('{').count();
+            let closes = line.matches('}').count();
+            let inside = test_exit.is_some();
+            if pend && opens > 0 && test_exit.is_none() {
+                test_exit = Some(depth);
+                pend = false;
+            }
+            if !inside && test_exit.is_none() {
+                out.push_str(line);
+            }
+            out.push('\n');
+            depth = depth.saturating_add(opens).saturating_sub(closes);
+        }
+        out
+    }
+
     /// `at` の手前 `n` バイトを、UTF-8 の境界を壊さずに取り出す。
     /// (日本語コメントが混ざるので、素の添字スライスは panic する)
     fn window_before(src: &str, at: usize, n: usize) -> String {
@@ -3544,7 +3613,7 @@ mod tests {
         ];
         let mut bad: Vec<String> = Vec::new();
         for (name, raw) in files {
-            let src = src_of(raw);
+            let src = strip_test_mods(&src_of(raw));
             for line in src.lines() {
                 // 期待値として記号を書くテストは対象外
                 if line.contains("assert") {
