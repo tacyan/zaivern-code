@@ -1198,6 +1198,9 @@ pub struct Blame {
     failed: std::collections::HashSet<BlameKey>,
     /// 実行中のジョブ (同時に 1 本だけ)。
     job: Option<(BlameKey, Receiver<Option<Vec<BlameLine>>>)>,
+    /// ガター欄の描画計画 (ブロック, 上限桁, 立てた時刻, 計画)。
+    /// **毎フレーム blame マップを全走査しない**ためのキャッシュ。
+    plan: Option<(BlameKey, usize, i64, BlameColumnPlan)>,
 }
 
 impl Blame {
@@ -1268,11 +1271,13 @@ impl Blame {
     /// 既に空なら何もしない。
     pub fn clear(&mut self) {
         if self.cache.is_empty() && self.failed.is_empty() && self.job.is_none() {
+            self.plan = None;
             return;
         }
         self.cache.clear();
         self.failed.clear();
         self.job = None;
+        self.plan = None;
     }
 }
 
@@ -3287,5 +3292,531 @@ index 1234567..89abcde 100644
         run(&["config", "user.name", "zaivern test"]);
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", "test"]);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// ガター blame 欄: 「何を・どの幅で出すか」の決定 (すべて純関数)
+//
+// 左寄せ + 固定幅列 (22 桁) で描いていたため、ラベルが 1 文字へ縮退した
+// 瞬間に「行番号のはるか左に `T` だけが並ぶ」状態になっていた。
+// ここでは (1) 実際に描くラベルの最大幅で列を作り (2) 情報量がゼロの
+// ラベル (全行同じ文字列) は最初から作らない、の 2 つで根を絶つ。
+// ══════════════════════════════════════════════════════════════════════════
+
+/// blame 欄に出すラベルの種類。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlameLabelKind {
+    /// 何も出さない (列ごと消える)。
+    #[default]
+    Nothing,
+    /// 「著者 · 相対日時」。ブロック内に著者が 2 人以上いるときだけ。
+    AuthorAndTime,
+    /// 相対日時だけ。著者が 1 人なら著者名は全行同じ = 信号にならない。
+    TimeOnly,
+    /// イニシャルだけ。幅が足りず、かつ**行ごとに違う値になる**ときだけ。
+    Initials,
+}
+
+/// blame 欄の描画計画。`cols == 0` なら列ごと出さない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlameColumnPlan {
+    /// 列に確保する桁数 (等幅 1 桁 = `char_w`)。0 = 列を作らない。
+    pub cols: usize,
+    /// 各行に何を書くか。
+    pub kind: BlameLabelKind,
+}
+
+impl BlameColumnPlan {
+    /// 列を作らない計画。
+    pub const HIDDEN: Self = Self {
+        cols: 0,
+        kind: BlameLabelKind::Nothing,
+    };
+
+    /// 何も描かないか。
+    pub fn is_hidden(&self) -> bool {
+        self.cols == 0 || matches!(self.kind, BlameLabelKind::Nothing)
+    }
+}
+
+/// 1 行ぶんの**素の**ラベル (幅で縮退させる前)。`None` = 書くことが無い。
+fn blame_label_raw(
+    kind: BlameLabelKind,
+    author: &str,
+    uncommitted: bool,
+    time: i64,
+    now: i64,
+) -> Option<String> {
+    // 未コミットは「誰が」ではなく「まだ出していない」という**本物の信号**なので
+    // 著者が 1 人でも必ず残す。
+    let name = if uncommitted {
+        tr("未コミット")
+    } else {
+        let a = author.trim();
+        if a.is_empty() {
+            "?".to_string()
+        } else {
+            a.to_string()
+        }
+    };
+    match kind {
+        BlameLabelKind::Nothing => None,
+        BlameLabelKind::AuthorAndTime => {
+            let rel = if uncommitted {
+                String::new()
+            } else {
+                relative_time(time, now)
+            };
+            // 区切りは `fit_blame_label` と同じ形にしておく (縮退の梯子を共有する)
+            Some(if rel.is_empty() {
+                name
+            } else {
+                format!("{name} · {rel}")
+            })
+        }
+        BlameLabelKind::TimeOnly => {
+            if uncommitted {
+                return Some(name);
+            }
+            let rel = relative_time(time, now);
+            (!rel.is_empty()).then_some(rel)
+        }
+        BlameLabelKind::Initials => Some(author_initials(&name)),
+    }
+}
+
+/// blame ブロック**全体**を見て、この列に何をどの幅で出すかを決める**純関数**。
+///
+/// * 著者が 1 人しか居ないブロックでは**著者名を出さない**。全行に同じ文字列が
+///   並ぶだけで情報量がゼロだから (実際に 5106 行すべてに `T` が並んで
+///   「離れすぎていて見づらい」と報告された)。相対日時だけを残す。
+/// * 列幅は**実際に描くラベルの最大幅**。22 桁を無条件に確保しない。
+/// * 出すものが何も無ければ `cols == 0` = 列ごと消える。
+///
+/// `entries` は `(著者, 未コミットか, author-time)`。判定は max と集合しか
+/// 使わないので**順序に依らない** = `HashMap` の値をそのまま渡してよく、
+/// 同じブロックからは常に同じ計画が出る (スクロールで列幅が揺れない)。
+pub fn blame_column_plan(
+    entries: &[(&str, bool, i64)],
+    now: i64,
+    max_cols: usize,
+) -> BlameColumnPlan {
+    if entries.is_empty() || max_cols == 0 {
+        return BlameColumnPlan::HIDDEN;
+    }
+    // 著者はコミット済みの行だけで数える (未コミットは別種の信号)。
+    let mut authors: Vec<&str> = entries
+        .iter()
+        .filter(|(_, u, _)| !*u)
+        .map(|(a, _, _)| a.trim())
+        .collect();
+    authors.sort_unstable();
+    authors.dedup();
+    // 広い順に試し、**最初に収まったもの**を採る。
+    // 著者が複数いるときは「誰が」が信号なので、幅が足りなければ
+    // 日時ではなくイニシャルを残す (それも同じ文字になるなら日時へ)。
+    let ladder: &[BlameLabelKind] = if authors.len() >= 2 {
+        &[
+            BlameLabelKind::AuthorAndTime,
+            BlameLabelKind::Initials,
+            BlameLabelKind::TimeOnly,
+        ]
+    } else {
+        &[BlameLabelKind::TimeOnly, BlameLabelKind::Initials]
+    };
+    for kind in ladder.iter().copied() {
+        let mut labels: Vec<String> = entries
+            .iter()
+            .filter_map(|(a, u, t)| blame_label_raw(kind, a, *u, *t, now))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if labels.is_empty() {
+            continue;
+        }
+        let cols = labels
+            .iter()
+            .map(|s| crate::textenc::str_width(s))
+            .max()
+            .unwrap_or(0);
+        if cols == 0 || cols > max_cols {
+            continue;
+        }
+        // イニシャルは**行ごとに違う**ときしか情報にならない。
+        // 全行同じ 1 文字 = 情報量ゼロ = このバグの正体そのもの。
+        if kind == BlameLabelKind::Initials {
+            labels.sort_unstable();
+            labels.dedup();
+            if labels.len() < 2 {
+                continue;
+            }
+        }
+        return BlameColumnPlan { cols, kind };
+    }
+    BlameColumnPlan::HIDDEN
+}
+
+/// 1 行ぶんのラベル (計画に従う)。`None` = この行には何も描かない。
+///
+/// `now` は**計画を立てたときと同じ値**を渡すこと ([`Blame::column_plan`] が
+/// 返す時刻)。別の時刻を渡すと相対日時が伸びて計画の幅を超え得るので、
+/// その場合だけ既存の梯子 ([`fit_blame_label`]) で内容を縮退させる。
+pub fn blame_row_label(
+    plan: &BlameColumnPlan,
+    author: &str,
+    uncommitted: bool,
+    time: i64,
+    now: i64,
+) -> Option<String> {
+    if plan.is_hidden() {
+        return None;
+    }
+    let raw = blame_label_raw(plan.kind, author, uncommitted, time, now)?;
+    if raw.is_empty() {
+        return None;
+    }
+    if crate::textenc::str_width(&raw) <= plan.cols {
+        return Some(raw);
+    }
+    // 列幅は動かさない (揺れるほうが害が大きい)。内容だけ縮める。
+    let name = if uncommitted {
+        tr("未コミット")
+    } else {
+        author.trim().to_string()
+    };
+    fit_blame_label(&name, "", plan.cols)
+}
+
+/// 計画を立て直す間隔 (秒)。相対日時の最小単位が 1 分なので、この程度で十分。
+const BLAME_PLAN_REFRESH: i64 = 30;
+
+impl Blame {
+    /// 表示中ブロックの描画計画を返す (**キャッシュ付き**)。
+    ///
+    /// ブロック (`key`) と列の上限 (`max_cols`) が変わらない限り、
+    /// `BLAME_PLAN_REFRESH` 秒に 1 回しか blame マップを走査しない
+    /// (= アイドル時のコストはゼロ)。ブロック内をスクロールしても計画は
+    /// 同じものが返るので、**列幅が揺れない**。
+    ///
+    /// 戻り値の `i64` は計画を立てた時刻。行ラベルにも**この値**を渡すこと。
+    pub fn column_plan(
+        &mut self,
+        key: &BlameKey,
+        map: &BlameMap,
+        now: i64,
+        max_cols: usize,
+    ) -> (BlameColumnPlan, i64) {
+        if let Some((k, mc, at, plan)) = self.plan.as_ref() {
+            if k == key
+                && *mc == max_cols
+                && now.saturating_sub(*at).saturating_abs() < BLAME_PLAN_REFRESH
+            {
+                return (*plan, *at);
+            }
+        }
+        let entries: Vec<(&str, bool, i64)> = map
+            .values()
+            .map(|b| (b.author.as_str(), b.uncommitted, b.time))
+            .collect();
+        let plan = blame_column_plan(&entries, now, max_cols);
+        self.plan = Some((key.clone(), max_cols, now, plan));
+        (plan, now)
+    }
+}
+
+/// ガター左端の余白 (blame ラベルの左端 / 行番号の左端に共通)。
+pub const GUTTER_PAD: f32 = 6.0;
+/// blame 欄の右余白。行番号との隙間は `BLAME_PAD_R + GUTTER_PAD` で**常に一定**。
+pub const BLAME_PAD_R: f32 = 4.0;
+/// 行番号と右端の印 (折りたたみ / ブックマーク) の間隔。
+pub const GUTTER_GAP: f32 = 6.0;
+/// ガターと本文の境界線から右の余白。
+pub const GUTTER_EDGE_PAD: f32 = 10.0;
+
+/// ガター内の x 配置 (**純関数**)。ガター左端を 0 とした相対座標。
+///
+/// blame ラベルを**右寄せ**にするための唯一の定義。左寄せ + 固定幅列だと
+/// 「ラベルが短いほど行番号との隙間が広がる」ため、1 文字へ縮退した瞬間に
+/// ラベルが画面の左端へ取り残される (実際に報告されたバグ)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GutterLayout {
+    /// blame 欄の幅 (0 なら列そのものが無い)。
+    pub blame_w: f32,
+    /// blame ラベルが取り得る左端。
+    pub blame_left: f32,
+    /// blame ラベルの右端 = **右寄せの基準 x**。
+    pub blame_right: f32,
+    /// 行番号の左端 / 右端。
+    pub num_left: f32,
+    pub num_right: f32,
+    /// 折りたたみ / ブックマークの印の左端。
+    pub marker_left: f32,
+    /// ガターと本文の境界線 x。
+    pub edge: f32,
+    /// ガター全体の幅。
+    pub width: f32,
+}
+
+/// ガター内の x 配置を決める。`ppp` は物理ピクセルへ揃えるため
+/// ([`crate::theme::snap_len`]。小数のままだと桁間隔が 1px 揺れる)。
+pub fn gutter_layout(
+    blame_cols: usize,
+    char_w: f32,
+    digits: usize,
+    marker_w: f32,
+    ppp: f32,
+) -> GutterLayout {
+    let num_w = char_w * digits as f32;
+    let blame_w = if blame_cols > 0 && char_w > 0.0 {
+        crate::theme::snap_len(blame_cols as f32 * char_w + GUTTER_PAD + BLAME_PAD_R, ppp)
+    } else {
+        0.0
+    };
+    let blame_right = if blame_w > 0.0 {
+        blame_w - BLAME_PAD_R
+    } else {
+        0.0
+    };
+    let num_left = blame_w + GUTTER_PAD;
+    let num_right = num_left + num_w;
+    let width = blame_w + GUTTER_PAD + num_w + GUTTER_GAP + marker_w + GUTTER_EDGE_PAD;
+    let edge = width - GUTTER_EDGE_PAD;
+    GutterLayout {
+        blame_w,
+        blame_left: if blame_w > 0.0 { GUTTER_PAD } else { 0.0 },
+        blame_right,
+        num_left,
+        num_right,
+        marker_left: edge - marker_w,
+        edge,
+        width,
+    }
+}
+
+#[cfg(test)]
+mod blame_column_tests {
+    use super::*;
+
+    /// 表の 1 行 = (著者, 未コミットか, author-time)。
+    fn e(author: &str, uncommitted: bool, ago: i64, now: i64) -> (&str, bool, i64) {
+        (author, uncommitted, now - ago)
+    }
+
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn blame_著者が1人なら著者名を出さない() {
+        let now = 1_700_000_000;
+        // 報告された実物: 5106 行すべて同じ著者 → 著者名は信号にならない
+        let rows = [
+            e("tacyan", false, 11 * HOUR, now),
+            e("tacyan", false, 3 * DAY, now),
+            e("tacyan", false, 11 * HOUR, now),
+        ];
+        let plan = blame_column_plan(&rows, now, 22);
+        assert_eq!(plan.kind, BlameLabelKind::TimeOnly, "著者名が残っている");
+        // 「11時間前」= 8 桁 / 「3日前」= 5 桁 → 広いほうに合わせる
+        assert_eq!(plan.cols, 8);
+        assert_eq!(
+            blame_row_label(&plan, "tacyan", false, now - 11 * HOUR, now).as_deref(),
+            Some("11時間前")
+        );
+    }
+
+    #[test]
+    fn blame_著者が2人以上なら著者名を出す() {
+        let now = 1_700_000_000;
+        let rows = [e("alice", false, HOUR, now), e("bob", false, DAY, now)];
+        let plan = blame_column_plan(&rows, now, 22);
+        assert_eq!(plan.kind, BlameLabelKind::AuthorAndTime);
+        // 「alice · 1時間前」= 5+3+7 = 15 桁 / 「bob · 1日前」= 3+3+5 = 11 桁
+        assert_eq!(plan.cols, 15);
+        assert_eq!(
+            blame_row_label(&plan, "bob", false, now - DAY, now).as_deref(),
+            Some("bob · 1日前")
+        );
+    }
+
+    #[test]
+    fn blame_未コミットは著者が1人でも残る() {
+        let now = 1_700_000_000;
+        // 全部未コミット: 相対日時は無いが「未コミット」は本物の信号
+        let all = [e("tacyan", true, 0, now), e("tacyan", true, 0, now)];
+        let plan = blame_column_plan(&all, now, 22);
+        let unc = tr("未コミット");
+        assert_eq!(plan.cols, crate::textenc::str_width(&unc));
+        assert_eq!(
+            blame_row_label(&plan, "tacyan", true, 0, now).as_deref(),
+            Some(unc.as_str())
+        );
+        // 一部だけ未コミット: 著者は 1 人なので日時 + 未コミットの混在
+        let mixed = [
+            e("tacyan", true, 0, now),
+            e("tacyan", false, 11 * HOUR, now),
+        ];
+        let plan = blame_column_plan(&mixed, now, 22);
+        assert_eq!(plan.kind, BlameLabelKind::TimeOnly);
+        assert_eq!(
+            blame_row_label(&plan, "tacyan", true, 0, now).as_deref(),
+            Some(unc.as_str())
+        );
+        assert_eq!(
+            blame_row_label(&plan, "tacyan", false, now - 11 * HOUR, now).as_deref(),
+            Some("11時間前")
+        );
+    }
+
+    #[test]
+    fn blame_幅が足りなければ縮退し最後は列ごと消える() {
+        let now = 1_700_000_000;
+        let two = [e("alice", false, HOUR, now), e("bob", false, DAY, now)];
+        let one = [
+            e("tacyan", false, 11 * HOUR, now),
+            e("tacyan", false, 3 * DAY, now),
+        ];
+        // 表: (行, 上限桁) → (種類, 桁数)
+        let table: &[(&[(&str, bool, i64)], usize, BlameLabelKind, usize)] = &[
+            (&two, 22, BlameLabelKind::AuthorAndTime, 15),
+            (&two, 15, BlameLabelKind::AuthorAndTime, 15),
+            (&two, 14, BlameLabelKind::Initials, 1), // A / B は区別がつく
+            (&two, 2, BlameLabelKind::Initials, 1),
+            (&two, 1, BlameLabelKind::Initials, 1),
+            (&two, 0, BlameLabelKind::Nothing, 0),
+            (&one, 22, BlameLabelKind::TimeOnly, 8),
+            (&one, 8, BlameLabelKind::TimeOnly, 8),
+            // 著者 1 人 → イニシャルは全行 `T` = 情報ゼロ。列ごと消す
+            (&one, 7, BlameLabelKind::Nothing, 0),
+            (&one, 2, BlameLabelKind::Nothing, 0),
+            (&one, 1, BlameLabelKind::Nothing, 0),
+            (&one, 0, BlameLabelKind::Nothing, 0),
+            (&[], 22, BlameLabelKind::Nothing, 0), // 空のブロック
+        ];
+        for (rows, max_cols, kind, cols) in table {
+            let plan = blame_column_plan(rows, now, *max_cols);
+            assert_eq!(
+                (plan.kind, plan.cols),
+                (*kind, *cols),
+                "blame_column_plan(len={}, max_cols={max_cols})",
+                rows.len()
+            );
+            // 計画どおりの幅に**必ず**収まる
+            for (a, u, t) in rows.iter() {
+                if let Some(s) = blame_row_label(&plan, a, *u, *t, now) {
+                    assert!(
+                        crate::textenc::str_width(&s) <= plan.cols,
+                        "{s:?} が {} 桁を超えた",
+                        plan.cols
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blame_全角の著者名は幅2で数える() {
+        let now = 1_700_000_000;
+        let rows = [
+            e("山田 太郎", false, DAY, now),
+            e("鈴木 花子", false, DAY, now),
+        ];
+        let plan = blame_column_plan(&rows, now, 22);
+        assert_eq!(plan.kind, BlameLabelKind::AuthorAndTime);
+        // 「山田 太郎 · 1日前」= 4+1+4 +3+ 5 = 17 桁 (.len() では 25 バイト)
+        let label = blame_row_label(&plan, "山田 太郎", false, now - DAY, now).expect("ラベル");
+        assert_eq!(crate::textenc::str_width(&label), 17);
+        assert_eq!(plan.cols, 17);
+        // 幅が足りなければイニシャル 1 文字 (= 2 桁) へ。山 / 鈴 で区別がつく
+        let plan = blame_column_plan(&rows, now, 16);
+        assert_eq!((plan.kind, plan.cols), (BlameLabelKind::Initials, 2));
+    }
+
+    #[test]
+    fn blame_著者名が空でも壊れない() {
+        let now = 1_700_000_000;
+        let rows = [e("", false, DAY, now), e("   ", false, HOUR, now)];
+        // 空白だけの著者は同一視される → 1 人 → 日時のみ
+        let plan = blame_column_plan(&rows, now, 22);
+        assert_eq!(plan.kind, BlameLabelKind::TimeOnly);
+        assert_eq!(
+            blame_row_label(&plan, "", false, now - DAY, now).as_deref(),
+            Some("1日前")
+        );
+        // 時刻も取れない行は何も描かない (`?` だけの列を作らない)
+        let unknown = [("", false, 0_i64), ("", false, 0_i64)];
+        assert_eq!(
+            blame_column_plan(&unknown, now, 22),
+            BlameColumnPlan::HIDDEN
+        );
+        assert_eq!(
+            blame_row_label(&BlameColumnPlan::HIDDEN, "a", false, 1, now),
+            None
+        );
+    }
+
+    #[test]
+    fn blame_同じ入力からは常に同じ計画が出る() {
+        let now = 1_700_000_000;
+        // 順序を入れ替えても (HashMap の値をそのまま渡すため) 計画は変わらない
+        let a = [
+            e("alice", false, HOUR, now),
+            e("bob", false, DAY, now),
+            e("alice", true, 0, now),
+        ];
+        let b = [a[2], a[0], a[1]];
+        let pa = blame_column_plan(&a, now, 22);
+        assert_eq!(pa, blame_column_plan(&b, now, 22));
+        // ブロックの**部分**ではなく全体から決めるので、同じ入力なら何度でも同じ
+        for _ in 0..8 {
+            assert_eq!(pa, blame_column_plan(&a, now, 22));
+        }
+    }
+
+    #[test]
+    fn blame_ガターのx配置は重ならず可用幅に収まる() {
+        // 極端なウィンドウでも、blame / 行番号 / 印 / 本文が重ならないこと。
+        // (900×700 と 1200×300 は CLAUDE.md が指定する検証サイズ)
+        for (avail_w, char_w, digits, marker_w, ppp) in [
+            (900.0_f32, 8.0_f32, 4_usize, 24.0_f32, 1.0_f32),
+            (900.0, 8.0, 4, 24.0, 2.0),
+            (1200.0, 7.0, 5, 24.0, 2.0),
+            (300.0, 8.0, 3, 0.0, 1.0),
+            (120.0, 8.0, 3, 0.0, 1.0),
+            (160.0, 8.0, 3, 24.0, 1.0),
+        ] {
+            let max_cols = blame_gutter_cols(avail_w, char_w);
+            for cols in [0, 1, 2, max_cols / 2, max_cols] {
+                let l = gutter_layout(cols, char_w, digits, marker_w, ppp);
+                assert!(l.width <= avail_w, "ガターが可用幅を超えた: {l:?}");
+                if cols > 0 {
+                    assert!(l.blame_left < l.blame_right, "blame 欄が潰れた: {l:?}");
+                    // ★ 再発防止: ラベルの長さに関わらず行番号との隙間は一定
+                    assert!(
+                        (l.num_left - l.blame_right - (GUTTER_PAD + BLAME_PAD_R)).abs() < 0.001,
+                        "行番号との隙間がラベル長で変わっている: {l:?}"
+                    );
+                    // 1 桁へ縮退しても隙間は 10pt を超えない (これがバグの症状)
+                    assert!(l.num_left - l.blame_right <= 10.0, "隙間が広すぎる: {l:?}");
+                } else {
+                    assert_eq!(l.blame_w, 0.0, "出さないのに幅を取っている: {l:?}");
+                    assert_eq!(l.num_left, GUTTER_PAD);
+                }
+                // 矩形の並びが崩れない: blame < 行番号 < 印 < 境界線 < 全体幅
+                assert!(
+                    l.blame_right <= l.num_left,
+                    "blame と行番号が重なった: {l:?}"
+                );
+                assert!(l.num_left < l.num_right, "行番号が潰れた: {l:?}");
+                assert!(l.num_right <= l.marker_left, "行番号と印が重なった: {l:?}");
+                assert!(
+                    l.marker_left + marker_w <= l.edge + 0.001,
+                    "印がはみ出た: {l:?}"
+                );
+                assert!(l.edge < l.width, "境界線がガターの外: {l:?}");
+                // 右寄せしたラベルは blame 欄の中に必ず収まる
+                let text_left = l.blame_right - cols as f32 * char_w;
+                assert!(text_left >= -0.001, "右寄せラベルが左へはみ出た: {l:?}");
+            }
+        }
     }
 }

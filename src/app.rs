@@ -22096,6 +22096,12 @@ impl ZaivernApp {
     ///
     /// 高さは全行で同じ (見出しも本文も注記も 1 行) なので `show_rows` の
     /// 前提 (等高) を満たす。ここを崩すとスクロール位置が飛ぶ。
+    /// マルチバッファ (複数ファイルの抜粋を 1 面に集めた索引) を描く。
+    ///
+    /// **読むだけの面ではない。** 行をクリックするとその場で直せて、
+    /// 「書き戻す」で各ファイルへ一度に反映する
+    /// ([`ZaivernApp::multibuffer_writeback`])。行番号の桁をクリックすると
+    /// これまでどおりそのファイルを開く。
     fn multibuffer_ui(&mut self, ui: &mut egui::Ui, i: usize) {
         use crate::multibuffer::{self as mbuf, Row};
         let theme = self.theme.clone();
@@ -22104,70 +22110,144 @@ impl ZaivernApp {
         let row_h = ui
             .fonts(|f| crate::theme::snap_len(f.row_height(&font), ppp))
             .max(1.0 / ppp);
+        let glyph_w = ui.fonts(|f| f.glyph_width(&font, '0')).max(1.0);
         let id = self.editor.buffers[i].id;
-        let Some(crate::preview::PreviewDoc::Multi(mb)) = self.editor.buffers[i].preview.as_ref()
+        // **面を取り出してから描く。** 描画のあいだに `&mut self` (書き戻し)
+        // を使うので、`preview` の借用を握ったままにはできない。
+        // ここから先は途中で return せず、最後に必ず戻す。
+        let Some(crate::preview::PreviewDoc::Multi(slot)) = self.editor.buffers[i].preview.as_mut()
         else {
             return;
         };
-        // 借用を握ったまま &mut self を呼べないので、押された操作は記録だけする
-        let rows = mbuf::rows(mb);
-        let mut toggle: Option<usize> = None;
+        let mut mb = std::mem::take(slot);
+
         let mut open: Option<(PathBuf, usize)> = None;
+        let mut do_writeback = false;
+        let mut do_undo = false;
+        let mut do_revert = false;
+        let mut do_replace = false;
         let mut collapse_all: Option<bool> = None;
         let mut step: Option<bool> = None;
 
         // ── 見出し行 ──────────────────────────────────────────────
+        // 出す部品は可用幅から決める (`head_layout` が唯一の判断)。
+        let pending = mb.pending_lines();
+        let pending_files = mb.pending_files();
+        let has_marks = mb.excerpts.iter().any(|e| !e.marks.is_empty());
+        let undoable = !mb.writebacks.is_empty();
+        let head = mbuf::head_layout(
+            ui.available_width(),
+            glyph_w,
+            has_marks,
+            pending > 0,
+            undoable,
+        );
+        let info = trf(
+            "{icon} {n} 件 · {files} ファイル",
+            &[
+                ("icon", mb.source.icon().to_string()),
+                ("n", mb.focus_count().to_string()),
+                (
+                    "files",
+                    mb.excerpts
+                        .iter()
+                        .map(|e| e.label.as_str())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        .to_string(),
+                ),
+            ],
+        );
+        let subtitle = mb.subtitle.clone();
+        let (dropped, unreadable) = (mb.dropped, mb.unreadable);
+        let expanded = mb.any_expanded();
+        let mut replace_with = std::mem::take(&mut mb.replace_with);
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(trf(
-                    "{icon} {n} 件 · {files} ファイル",
-                    &[
-                        ("icon", mb.source.icon().to_string()),
-                        ("n", mb.focus_count().to_string()),
-                        (
-                            "files",
-                            mb.excerpts
-                                .iter()
-                                .map(|e| e.label.as_str())
-                                .collect::<std::collections::BTreeSet<_>>()
-                                .len()
-                                .to_string(),
-                        ),
-                    ],
-                ))
-                .color(theme.text_dim)
-                .small(),
-            );
-            if !mb.subtitle.is_empty() {
+            ui.label(RichText::new(info).color(theme.text_dim).small());
+            if !subtitle.is_empty() {
                 ui.label(
-                    RichText::new(format!("“{}”", mb.subtitle))
+                    RichText::new(format!("“{subtitle}”"))
                         .color(theme.accent)
                         .small(),
                 );
             }
-            if mb.dropped > 0 {
+            if dropped > 0 {
                 ui.label(
                     RichText::new(trf(
                         "⚠ {n} 件は表示していません",
-                        &[("n", mb.dropped.to_string())],
+                        &[("n", dropped.to_string())],
                     ))
                     .color(theme.warn)
                     .small(),
                 )
                 .on_hover_text(tr("抜粋の上限に達しました。条件を絞ってください。"));
             }
-            if mb.unreadable > 0 {
+            if unreadable > 0 {
                 ui.label(
                     RichText::new(trf(
                         "⚠ {n} ファイルは読めませんでした",
-                        &[("n", mb.unreadable.to_string())],
+                        &[("n", unreadable.to_string())],
                     ))
                     .color(theme.warn)
                     .small(),
                 );
             }
-            // ボタン列は右端へ寄せる。狭いときも折り返しで見切れない。
-            let expanded = mb.any_expanded();
+            // 書き戻していない編集があるときだけ出す (常に 0 を出すバッジは作らない)
+            if pending > 0 {
+                ui.label(
+                    RichText::new(trf(
+                        "✎ {n} 行 · {f} ファイル",
+                        &[
+                            ("n", pending.to_string()),
+                            ("f", pending_files.to_string()),
+                        ],
+                    ))
+                    .color(theme.accent)
+                    .small(),
+                );
+                let (wb, rv) = if head.labels {
+                    (tr("書き戻す"), tr("編集を捨てる"))
+                } else {
+                    ("⤓".to_string(), "✕".to_string())
+                };
+                if ui
+                    .button(wb)
+                    .on_hover_text(tr(
+                        "直した行を元のファイルへ書き戻します。他のインスタンスが保有しているファイルと、開いたあとに変わったファイルは飛ばして名指しで知らせます。",
+                    ))
+                    .clicked()
+                {
+                    do_writeback = true;
+                }
+                if ui
+                    .button(rv)
+                    .on_hover_text(tr("この面の編集を全部捨てて開いた直後へ戻す"))
+                    .clicked()
+                {
+                    do_revert = true;
+                }
+            }
+            if undoable
+                && ui
+                    .button("↩")
+                    .on_hover_text(tr("直前の書き戻しを取り消す (1 回の書き戻しがまとめて戻ります)"))
+                    .clicked()
+            {
+                do_undo = true;
+            }
+            // 一括置換は「一致 (marks)」がある面だけ。何も置換できない面に
+            // 入力欄を出すと、押しても何も起きないボタンになる。
+            if head.replace_w > 0.0 {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut replace_with)
+                        .id_salt(("zv-mb-replace", id))
+                        .desired_width(head.replace_w)
+                        .hint_text(tr("一致をまとめて置換")),
+                );
+                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    do_replace = true;
+                }
+            }
             if ui
                 .button(if expanded { "⊟" } else { "⊞" })
                 .on_hover_text(if expanded {
@@ -22186,6 +22266,7 @@ impl ZaivernApp {
                 step = Some(true);
             }
         });
+        mb.replace_with = replace_with;
         ui.separator();
 
         if mb.is_empty() {
@@ -22194,167 +22275,495 @@ impl ZaivernApp {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new(tr("表示するものがありません")).color(dim));
             });
-            return;
-        }
-
-        // ── 本体 ─────────────────────────────────────────────────
-        let cursor = self.multibuffer_cursor.get(&id).copied().unwrap_or(0);
-        let mut scroll_to: Option<usize> = None;
-        if let Some(fwd) = step {
-            if let Some(next) = mbuf::step_focus(&rows, mb, cursor, fwd) {
-                scroll_to = Some(next);
-            }
-        }
-        let gutter_w = ui.fonts(|f| f.glyph_width(&font, '0')) * 6.0;
-        egui::ScrollArea::vertical()
-            .id_salt(("zv-multibuffer", id))
-            .auto_shrink(false)
-            .show_rows(ui, row_h, rows.len(), |ui, range| {
-                for r in range {
-                    let Some(&row) = rows.get(r) else { continue };
-                    let Some(e) = mb.excerpts.get(row.excerpt()) else {
-                        continue;
-                    };
-                    let w = ui.available_width();
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(w, row_h), egui::Sense::click());
-                    if scroll_to == Some(r) {
-                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                    }
-                    if !ui.is_rect_visible(rect) {
-                        continue;
-                    }
-                    let painter = ui.painter_at(rect);
-                    match row {
-                        Row::Header { ex } => {
-                            painter.rect_filled(rect, 0.0, theme.panel_alt);
-                            let mark = if e.collapsed { "▸" } else { "▾" };
-                            let title =
-                                format!("{mark} {}  {}–{}", e.label, e.first_line, e.last_line());
-                            // 見出しの色は**そのファイルで最も重い深刻度**。
-                            // 畳んだままでも「どのファイルが赤いか」が読める。
-                            let col = match e.worst_severity() {
-                                Some(1) => theme.err,
-                                Some(2) => theme.warn,
-                                _ => theme.accent,
-                            };
-                            let g =
-                                truncated_galley(ui, &title, font.clone(), col, (w - 8.0).max(1.0));
-                            painter.galley(
-                                rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
-                                g,
-                                col,
-                            );
-                            if resp.clicked() {
-                                toggle = Some(ex);
-                            }
-                            if resp.double_clicked() {
-                                open = mbuf::target_of(&rows, mb, r);
-                            }
-                            // 畳んでいる間は中身が見えないので、最初の一致行を
-                            // ホバーに出す (開かずに当たりを付けられる)
-                            let peek = e
-                                .focus
-                                .first()
-                                .and_then(|&l| e.line_text(l))
-                                .map(|t| format!("\n{}: {}", e.focus[0], t.trim()))
-                                .unwrap_or_default();
-                            resp.on_hover_text(trf(
-                                "{path} · クリックで開閉 / ダブルクリックで開く{peek}",
-                                &[
-                                    ("path", e.path.to_string_lossy().into_owned()),
-                                    ("peek", peek),
-                                ],
-                            ));
-                        }
-                        Row::Line { idx, .. } => {
-                            let line_no = e.first_line + idx;
-                            let focused = e.focus.binary_search(&line_no).is_ok();
-                            if focused {
-                                painter.rect_filled(rect, 0.0, theme.accent_soft);
-                            } else if resp.hovered() {
-                                painter.rect_filled(rect, 0.0, theme.panel);
-                            }
-                            let text = e.lines.get(idx).map(|s| s.as_str()).unwrap_or("");
-                            let marks: Vec<(usize, usize)> = e
-                                .marks
-                                .iter()
-                                .filter(|m| m.line == line_no)
-                                .map(|m| (m.start, m.end))
-                                .collect();
-                            let job = search_row_job(&theme, line_no, text, &marks, font.clone());
-                            let g = wrap_job_to_one_row(ui, job, (w - 8.0).max(1.0));
-                            painter.galley(
-                                rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
-                                g,
-                                theme.text,
-                            );
-                            if resp.clicked() {
-                                open = mbuf::target_of(&rows, mb, r);
-                            }
-                        }
-                        Row::Note { note, .. } => {
-                            let Some(n) = e.notes.get(note) else { continue };
-                            let col = match n.severity {
-                                1 => theme.err,
-                                2 => theme.warn,
-                                0 => theme.text_dim,
-                                _ => theme.accent,
-                            };
-                            let g = truncated_galley(
-                                ui,
-                                &format!("↳ {}", n.text),
-                                font.clone(),
-                                col,
-                                (w - gutter_w - 8.0).max(1.0),
-                            );
-                            painter.galley(
-                                rect.left_top() + egui::vec2(gutter_w, (row_h - g.size().y) * 0.5),
-                                g,
-                                col,
-                            );
-                            if resp.clicked() {
-                                open = mbuf::target_of(&rows, mb, r);
-                            }
-                            resp.on_hover_text(&n.text);
-                        }
-                        Row::Separator { .. } => {
-                            let y = rect.center().y;
-                            painter.hline(
-                                rect.x_range(),
-                                y,
-                                egui::Stroke::new(1.0_f32, theme.border),
-                            );
-                        }
-                    }
+        } else {
+            // ── 本体 ─────────────────────────────────────────────
+            let rows = mbuf::rows(&mb);
+            let cursor = self.multibuffer_cursor.get(&id).copied().unwrap_or(0);
+            let mut scroll_to: Option<usize> = None;
+            if let Some(fwd) = step {
+                if let Some(next) = mbuf::step_focus(&rows, &mb, cursor, fwd) {
+                    scroll_to = Some(next);
                 }
-            });
-
-        // ── 記録した操作を反映 (借用が切れてから) ───────────────────
-        if let Some(next) = scroll_to {
-            self.multibuffer_cursor.insert(id, next);
-        }
-        if let Some(collapsed) = collapse_all {
-            if let Some(crate::preview::PreviewDoc::Multi(mb)) =
-                self.editor.buffers[i].preview.as_mut()
-            {
-                mb.set_all_collapsed(collapsed);
             }
-            self.multibuffer_cursor.insert(id, 0);
-        }
-        if let Some(ex) = toggle {
-            if let Some(crate::preview::PreviewDoc::Multi(mb)) =
-                self.editor.buffers[i].preview.as_mut()
-            {
+            let gutter_w = glyph_w * 6.0;
+            // 編集中の文字列は `mb` から**外へ出して**持つ (抜粋への可変借用と
+            // 描画のための不変借用がぶつからない)。
+            let mut edit_state = mb.editing.take();
+            let mut start_edit: Option<(usize, usize)> = None;
+            let mut end_edit = false;
+            let mut toggle: Option<usize> = None;
+            let mbr = &mb;
+            egui::ScrollArea::vertical()
+                .id_salt(("zv-multibuffer", id))
+                .auto_shrink(false)
+                .show_rows(ui, row_h, rows.len(), |ui, range| {
+                    for r in range {
+                        let Some(&row) = rows.get(r) else { continue };
+                        let Some(e) = mbr.excerpts.get(row.excerpt()) else {
+                            continue;
+                        };
+                        let w = ui.available_width();
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(w, row_h), egui::Sense::click());
+                        if scroll_to == Some(r) {
+                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                        }
+                        let editing_here = matches!(
+                            (&edit_state, row),
+                            (Some((a, b, _)), Row::Line { ex, idx }) if *a == ex && *b == idx
+                        );
+                        if !ui.is_rect_visible(rect) && !editing_here {
+                            continue;
+                        }
+                        // 編集中の行だけ `TextEdit` に差し替える。
+                        // 可変長リストの中なので salt に (タブ, 抜粋, 行) を混ぜる。
+                        if editing_here {
+                            let Some((_, _, buf)) = edit_state.as_mut() else {
+                                continue;
+                            };
+                            let r = ui.put(
+                                rect,
+                                egui::TextEdit::singleline(buf)
+                                    .id_salt(("zv-mb-line", id, row.excerpt(), r))
+                                    .font(font.clone())
+                                    .frame(false)
+                                    .margin(egui::Margin::symmetric(4.0, 0.0))
+                                    .desired_width(f32::INFINITY),
+                            );
+                            // 入ったフレームで 1 回だけ焦点を取る (他の部品が
+                            // 焦点を持っているときは横取りしない)。
+                            if !r.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                                r.request_focus();
+                            }
+                            if r.lost_focus() || ui.input(|inp| inp.key_pressed(egui::Key::Escape))
+                            {
+                                end_edit = true;
+                            }
+                            continue;
+                        }
+                        let painter = ui.painter_at(rect);
+                        match row {
+                            Row::Header { ex } => {
+                                painter.rect_filled(rect, 0.0, theme.panel_alt);
+                                let mark = if e.collapsed { "▸" } else { "▾" };
+                                let edited = if e.edited() { " ✎" } else { "" };
+                                let title = format!(
+                                    "{mark} {}  {}–{}{edited}",
+                                    e.label,
+                                    e.first_line,
+                                    e.last_line()
+                                );
+                                // 見出しの色は**そのファイルで最も重い深刻度**。
+                                // 畳んだままでも「どのファイルが赤いか」が読める。
+                                let col = match e.worst_severity() {
+                                    Some(1) => theme.err,
+                                    Some(2) => theme.warn,
+                                    _ => theme.accent,
+                                };
+                                let g = truncated_galley(
+                                    ui,
+                                    &title,
+                                    font.clone(),
+                                    col,
+                                    (w - 8.0).max(1.0),
+                                );
+                                painter.galley(
+                                    rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
+                                    g,
+                                    col,
+                                );
+                                if resp.clicked() {
+                                    toggle = Some(ex);
+                                }
+                                if resp.double_clicked() {
+                                    open = mbuf::target_of(&rows, mbr, r);
+                                }
+                                // 畳んでいる間は中身が見えないので、最初の一致行を
+                                // ホバーに出す (開かずに当たりを付けられる)
+                                let peek = e
+                                    .focus
+                                    .first()
+                                    .and_then(|&l| e.line_text(l))
+                                    .map(|t| format!("\n{}: {}", e.focus[0], t.trim()))
+                                    .unwrap_or_default();
+                                resp.on_hover_text(trf(
+                                    "{path} · クリックで開閉 / ダブルクリックで開く{peek}",
+                                    &[
+                                        ("path", e.path.to_string_lossy().into_owned()),
+                                        ("peek", peek),
+                                    ],
+                                ));
+                            }
+                            Row::Line { ex, idx } => {
+                                let line_no = e.first_line + idx;
+                                let focused = e.focus.binary_search(&line_no).is_ok();
+                                if focused {
+                                    painter.rect_filled(rect, 0.0, theme.accent_soft);
+                                } else if resp.hovered() {
+                                    painter.rect_filled(rect, 0.0, theme.panel);
+                                }
+                                let text = e.lines.get(idx).map(|s| s.as_str()).unwrap_or("");
+                                let marks: Vec<(usize, usize)> = e
+                                    .marks
+                                    .iter()
+                                    .filter(|m| m.line == line_no)
+                                    .map(|m| (m.start, m.end))
+                                    .collect();
+                                let job =
+                                    search_row_job(&theme, line_no, text, &marks, font.clone());
+                                let g = wrap_job_to_one_row(ui, job, (w - 8.0).max(1.0));
+                                painter.galley(
+                                    rect.left_top() + egui::vec2(4.0, (row_h - g.size().y) * 0.5),
+                                    g,
+                                    theme.text,
+                                );
+                                if resp.clicked() {
+                                    // 行番号の桁を押したらファイルを開く。
+                                    // 本文側を押したら**その場で直す**。
+                                    let on_gutter = resp
+                                        .interact_pointer_pos()
+                                        .map(|p| p.x < rect.left() + gutter_w)
+                                        .unwrap_or(false);
+                                    if on_gutter {
+                                        open = mbuf::target_of(&rows, mbr, r);
+                                    } else {
+                                        start_edit = Some((ex, idx));
+                                    }
+                                }
+                                resp.on_hover_text(tr(
+                                    "クリックでこの行を直す / 行番号を押すとファイルを開く",
+                                ));
+                            }
+                            Row::Note { note, .. } => {
+                                let Some(n) = e.notes.get(note) else { continue };
+                                let col = match n.severity {
+                                    1 => theme.err,
+                                    2 => theme.warn,
+                                    0 => theme.text_dim,
+                                    _ => theme.accent,
+                                };
+                                let g = truncated_galley(
+                                    ui,
+                                    &format!("↳ {}", n.text),
+                                    font.clone(),
+                                    col,
+                                    (w - gutter_w - 8.0).max(1.0),
+                                );
+                                painter.galley(
+                                    rect.left_top()
+                                        + egui::vec2(gutter_w, (row_h - g.size().y) * 0.5),
+                                    g,
+                                    col,
+                                );
+                                if resp.clicked() {
+                                    open = mbuf::target_of(&rows, mbr, r);
+                                }
+                                resp.on_hover_text(&n.text);
+                            }
+                            Row::Separator { .. } => {
+                                let y = rect.center().y;
+                                painter.hline(
+                                    rect.x_range(),
+                                    y,
+                                    egui::Stroke::new(1.0_f32, theme.border),
+                                );
+                            }
+                        }
+                    }
+                });
+
+            // ── 記録した操作を反映 (借用が切れてから) ───────────────
+            if let Some(next) = scroll_to {
+                self.multibuffer_cursor.insert(id, next);
+            }
+            if let Some((ex, idx)) = start_edit {
+                // 別の行へ移るときは、いま直していた行を先に確定する
+                mbuf::commit_line_edit(&mut mb, edit_state.take());
+                edit_state = mb
+                    .excerpts
+                    .get(ex)
+                    .and_then(|e| e.lines.get(idx))
+                    .map(|t| (ex, idx, t.clone()));
+            } else if end_edit {
+                mbuf::commit_line_edit(&mut mb, edit_state.take());
+            }
+            mb.editing = edit_state;
+            if let Some(collapsed) = collapse_all {
+                let st = mb.editing.take();
+                mbuf::commit_line_edit(&mut mb, st);
+                mb.set_all_collapsed(collapsed);
+                self.multibuffer_cursor.insert(id, 0);
+            }
+            if let Some(ex) = toggle {
+                let st = mb.editing.take();
+                mbuf::commit_line_edit(&mut mb, st);
                 if let Some(e) = mb.excerpts.get_mut(ex) {
                     e.collapsed = !e.collapsed;
                 }
+                self.multibuffer_cursor.insert(id, 0);
             }
-            self.multibuffer_cursor.insert(id, 0);
+        }
+
+        if do_replace && !mb.replace_with.is_empty() {
+            let to = mb.replace_with.clone();
+            let n = mbuf::replace_marks(&mut mb, &to);
+            if n == 0 {
+                self.toast_warn(tr("置き換えるものがありませんでした"));
+            } else {
+                self.toast(
+                    trf(
+                        "{n} 件を置き換えました (まだ書き戻していません)",
+                        &[("n", n.to_string())],
+                    ),
+                    true,
+                );
+            }
+        }
+        if do_revert {
+            mb.revert_edits();
+            self.toast(tr("編集を捨てました"), true);
+        }
+        if do_writeback {
+            self.multibuffer_writeback(&mut mb);
+        }
+        if do_undo {
+            self.multibuffer_undo_writeback(&mut mb);
+        }
+
+        // **必ず戻す。** 途中でタブが動いていても取り違えないよう id で引き直す。
+        if let Some(b) = self.editor.buffers.iter_mut().find(|b| b.id == id) {
+            if let Some(crate::preview::PreviewDoc::Multi(slot)) = b.preview.as_mut() {
+                *slot = mb;
+            }
         }
         if let Some((path, line)) = open {
             // multibuffer は 1-based、jump_to_lsp_pos は 0-based
             self.jump_to_lsp_pos(&path, line.saturating_sub(1), 0);
+        }
+    }
+
+    /// 1 回の書き戻しで触れるファイル数の上限。
+    ///
+    /// 書き戻しはユーザーの単発操作なので同期で書くが、数百ファイルを
+    /// 1 フレームで書くと目に見えて固まる。超えたぶんは名指しで残し、
+    /// もう一度押せば続きが書ける。
+    const MULTIBUFFER_WRITE_MAX_FILES: usize = 64;
+
+    /// 取り消し 1 段として抱えてよい本文の合計バイト数。
+    /// 超えたら取り消し情報を捨てる (抱え込んでメモリを食うより正直に諦める)。
+    const MULTIBUFFER_UNDO_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    /// そのパスの**いまの本文**。エディタで開いていれば未保存の本文を返す。
+    ///
+    /// マルチバッファを組み立てたときと同じ規則にしてある
+    /// (違えると、開いているファイルが必ず「変わっている」判定になる)。
+    fn multibuffer_current_text(editor: &editor::Editor, path: &Path) -> Option<String> {
+        if let Some(b) = editor
+            .buffers
+            .iter()
+            .find(|b| b.kind == editor::BufferKind::File && b.path.as_deref() == Some(path))
+        {
+            return Some(b.text.clone());
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() || meta.len() > Self::MULTIBUFFER_MAX_FILE_BYTES {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        Some(crate::textenc::decode_bytes(&bytes).0)
+    }
+
+    /// 1 ファイルへ書き戻す。**リースの門は必ず通る。**
+    ///
+    /// エディタで開いているファイルは、バッファへ `apply_edit` してから
+    /// 保存する — こうすると**そのタブでも ⌘Z 1 回で戻る**し、画面に出て
+    /// いる本文とディスクが食い違わない。
+    fn multibuffer_write_one(&mut self, path: &Path, new_text: &str) -> std::io::Result<()> {
+        if let Some(j) = self
+            .editor
+            .buffers
+            .iter()
+            .position(|b| b.kind == editor::BufferKind::File && b.path.as_deref() == Some(path))
+        {
+            let ed = self.edit_step();
+            let b = &mut self.editor.buffers[j];
+            b.apply_edit(new_text.to_string(), ed);
+            // `write_to` が `lease::check_write` を通る唯一の書き込み口。
+            b.write_to(path)?;
+            b.mark_saved();
+            b.disk_mtime = disk_mtime(path);
+            b.conflict_notified = None;
+            self.queue_lsp_change(j);
+            return Ok(());
+        }
+        // 開いていないファイル。**同じ門を自分で通す** (書き込み口は 2 つある
+        // ので、片方だけ守っても穴になる)。
+        if let crate::lease::Verdict::Deny(msg) = crate::lease::check_write(path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                msg,
+            ));
+        }
+        // 読み込んだときの文字コードで書き戻す (CP932 を勝手に UTF-8 にしない)。
+        let enc = std::fs::read(path)
+            .map(|b| crate::textenc::decode_bytes(&b).1)
+            .unwrap_or(crate::textenc::Encoding::Utf8);
+        let (bytes, _) = crate::textenc::encode_bytes(new_text, enc);
+        std::fs::write(path, bytes)
+    }
+
+    /// 直した抜粋を各ファイルへ書き戻す。**1 回の操作 = 取り消し 1 段**。
+    ///
+    /// fail-closed の関門が 2 つある。どちらも**そのファイルだけ**を落とし、
+    /// 通せるものは通す (全部を諦めると 1 件の衝突で作業が止まる):
+    ///
+    ///  1. マルチバッファを開いたあとに元ファイルが変わっている
+    ///     (別のエージェントが書いた) → [`multibuffer::Reject::Changed`]
+    ///  2. 他のインスタンスが保有している (`lease::check_write`)
+    ///     → [`multibuffer::Reject::Leased`]
+    fn multibuffer_writeback(&mut self, mb: &mut crate::multibuffer::Multibuffer) {
+        use crate::multibuffer as mbuf;
+        let st = mb.editing.take();
+        mbuf::commit_line_edit(mb, st);
+        let before = mb.baseline();
+        let plan = {
+            let editor = &self.editor;
+            mbuf::plan_writeback(
+                &before,
+                mb,
+                |path| Self::multibuffer_current_text(editor, path),
+                |path| match crate::lease::check_write(path) {
+                    crate::lease::Verdict::Deny(m) => Some(m),
+                    crate::lease::Verdict::Allow => None,
+                },
+            )
+        };
+        if plan.items.is_empty() {
+            self.toast_warn(tr("書き戻すものがありません"));
+            return;
+        }
+        let mut wb = mbuf::WriteBack::default();
+        let mut wrote = 0usize;
+        let mut refused: Vec<String> = Vec::new();
+        for item in &plan.items {
+            let new_text = match &item.outcome {
+                Err(r) => {
+                    refused.push(format!("{}: {}", item.label, r.reason()));
+                    continue;
+                }
+                Ok(t) => t,
+            };
+            if wrote >= Self::MULTIBUFFER_WRITE_MAX_FILES {
+                refused.push(format!(
+                    "{}: {}",
+                    item.label,
+                    tr("一度に書き戻せる上限を超えました (もう一度押すと続きます)")
+                ));
+                continue;
+            }
+            match self.multibuffer_write_one(&item.path, new_text) {
+                Ok(()) => {
+                    let snap = mbuf::settle_file(mb, &item.path, &mbuf::split_lines(new_text));
+                    wb.excerpts.extend(snap);
+                    wb.files
+                        .push((item.path.clone(), item.before.clone(), new_text.clone()));
+                    wrote += 1;
+                }
+                Err(e) => refused.push(format!("{}: {e}", item.label)),
+            }
+        }
+        if wrote > 0 {
+            // 取り消しは 1 段。抱える本文が大きすぎるときは正直に諦める。
+            if wb.bytes() <= Self::MULTIBUFFER_UNDO_MAX_BYTES {
+                mb.writebacks.push(wb);
+                let over = mb.writebacks.len().saturating_sub(4);
+                mb.writebacks.drain(..over);
+            } else {
+                mb.writebacks.clear();
+            }
+            self.tree.invalidate();
+            self.local_history.note(&tr("マルチバッファの書き戻し"));
+        }
+        // 通した数と落とした理由を**両方**出す。落ちたことに気付かないのが
+        // 一番困る (拒否は「あとで発見させない」ための機能なので)。
+        let msg = if refused.is_empty() {
+            trf("{n} ファイルへ書き戻しました", &[("n", wrote.to_string())])
+        } else {
+            trf(
+                "{n} ファイルへ書き戻し / {m} 件は書けませんでした — {why}",
+                &[
+                    ("n", wrote.to_string()),
+                    ("m", refused.len().to_string()),
+                    ("why", refused.join(" / ")),
+                ],
+            )
+        };
+        if refused.is_empty() {
+            self.toast(msg, true);
+        } else {
+            self.toast_warn(msg);
+        }
+    }
+
+    /// 直前の書き戻しを取り消す。**1 回の書き戻しがまとめて戻る。**
+    ///
+    /// 書き戻したあとに誰かがそのファイルを触っていたら戻さない
+    /// (fail-closed)。戻せたファイルの抜粋だけ「編集あり」の状態へ復す。
+    fn multibuffer_undo_writeback(&mut self, mb: &mut crate::multibuffer::Multibuffer) {
+        use crate::multibuffer as mbuf;
+        let Some(wb) = mb.writebacks.pop() else {
+            self.toast_warn(tr("取り消せる書き戻しがありません"));
+            return;
+        };
+        let mut undone: Vec<PathBuf> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for (path, before, after) in &wb.files {
+            let label = self.rel_label(path);
+            match Self::multibuffer_current_text(&self.editor, path) {
+                Some(cur) if cur == *after => match self.multibuffer_write_one(path, before) {
+                    Ok(()) => undone.push(path.clone()),
+                    Err(e) => refused.push(format!("{label}: {e}")),
+                },
+                Some(_) => {
+                    refused.push(format!("{label}: {}", tr("書き戻したあとに変わっています")))
+                }
+                None => refused.push(format!("{label}: {}", tr("読めません"))),
+            }
+        }
+        // 戻せたファイルの抜粋だけ、書き戻し前の姿へ復す。
+        let snap: Vec<_> = wb
+            .excerpts
+            .iter()
+            .filter(|(i, ..)| {
+                mb.excerpts
+                    .get(*i)
+                    .is_some_and(|e| undone.iter().any(|p| p == &e.path))
+            })
+            .cloned()
+            .collect();
+        mbuf::restore_excerpts(mb, &snap);
+        if !undone.is_empty() {
+            self.tree.invalidate();
+        }
+        let msg = if refused.is_empty() {
+            trf(
+                "{n} ファイルの書き戻しを取り消しました",
+                &[("n", undone.len().to_string())],
+            )
+        } else {
+            trf(
+                "{n} ファイルを取り消し / {m} 件は戻せませんでした — {why}",
+                &[
+                    ("n", undone.len().to_string()),
+                    ("m", refused.len().to_string()),
+                    ("why", refused.join(" / ")),
+                ],
+            )
+        };
+        if refused.is_empty() {
+            self.toast(msg, true);
+        } else {
+            self.toast_warn(msg);
         }
     }
 
@@ -22913,7 +23322,7 @@ impl ZaivernApp {
         // 見るので、保存するまで結果は変わらない。
         let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
         let line_count = self.editor.buffers[active].text.split('\n').count();
-        let blame_map: Option<git::BlameMap> = if self.cfg.git_blame
+        let blame: Option<(git::BlameKey, git::BlameMap)> = if self.cfg.git_blame
             && self.editor.buffers[active].kind == crate::editor::BufferKind::File
         {
             let rows = if row_h > 0.0 {
@@ -22934,7 +23343,9 @@ impl ZaivernApp {
                             start: bs,
                             end: be,
                         };
-                        self.blame.request(&top, &rel, key)
+                        self.blame
+                            .request(&top, &rel, key.clone())
+                            .map(|m| (key, m))
                     }
                 },
                 None => None,
@@ -22944,16 +23355,19 @@ impl ZaivernApp {
             self.blame.clear();
             None
         };
-        // blame 欄の桁数と幅。狭い窓では 0 (= 出さない) まで落ちる。
-        let blame_cols = match blame_map.as_ref() {
-            Some(_) => git::blame_gutter_cols(ui.available_width(), char_w),
-            None => 0,
+        // blame 欄の計画。**いま読み込んでいるブロック全体**から決めるので、
+        // ブロック内をスクロールしても列幅は動かない (画面が突然変わらない)。
+        // 著者が 1 人しか居なければ著者名は出さない — 全行に同じ文字列が並ぶ
+        // だけで情報量がゼロだから。狭い窓では従来どおり 0 (= 列ごと消す)。
+        // `blame_now` は計画を立てた時刻。行ラベルにも**この値**を使う。
+        let (blame_plan, blame_now) = match blame.as_ref() {
+            Some((key, map)) => {
+                let max = git::blame_gutter_cols(ui.available_width(), char_w);
+                self.blame.column_plan(key, map, git::unix_now(), max)
+            }
+            None => (git::BlameColumnPlan::HIDDEN, 0),
         };
-        let blame_w = if blame_cols > 0 {
-            blame_cols as f32 * char_w + 10.0
-        } else {
-            0.0
-        };
+        let blame_cols = blame_plan.cols;
 
         // 虹色括弧 (VS Code の editor.bracketPairColorization)。
         // 色は**テーマから**採る (直書きしない)。強調表示を切っている
@@ -23092,8 +23506,11 @@ impl ZaivernApp {
         } else {
             0.0
         };
-        // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)
-        let gutter_w = char_w * gutter_digits as f32 + 22.0 + marker_w + blame_w;
+        // blame 欄は行番号の**左**に置く (行番号は本文の隣に残す)。
+        // x の配置は `git::gutter_layout` が唯一の定義 (テーブルテストで固定)。
+        let gl = git::gutter_layout(blame_cols, char_w, gutter_digits, marker_w, ppp);
+        let blame_w = gl.blame_w;
+        let gutter_w = gl.width;
 
         let ed_id = buf_edit_id(self.cur_pane, *id);
         // 折り返し OFF: highlight::layout_job が wrap.max_width = INFINITY を設定
@@ -23851,7 +24268,7 @@ impl ZaivernApp {
         );
         painter.galley(
             egui::pos2(
-                vis.left() + 6.0 + blame_w,
+                vis.left() + gl.num_left,
                 text_top.unwrap_or(vis.top() - inner.state.offset.y),
             ),
             gutter_galley,
@@ -23939,11 +24356,14 @@ impl ZaivernApp {
             }
         }
 
-        // Git blame: ガター左端に「著者 · 相対日時」を薄く出す。
+        // Git blame: ガターの blame 欄へ薄く出す。
         // 描くのは**可視行だけ** (row_lines が画面外を除いてある)。
+        // ラベルは列の**右端**へ寄せる — 左寄せ + 固定幅列だと、ラベルが
+        // 短いほど行番号との隙間が広がり、1 文字へ縮退した瞬間に画面の
+        // 左端へ取り残される (実際に「離れすぎて見づらい」と報告された)。
         let mut blame_open: Option<String> = None;
-        if let (Some(map), true) = (blame_map.as_ref(), blame_cols > 0) {
-            let now = git::unix_now();
+        if let (Some((_, map)), false) = (blame.as_ref(), blame_plan.is_hidden()) {
+            let now = blame_now;
             let col = egui::Rect::from_min_max(
                 egui::pos2(vis.left(), vis.top()),
                 egui::pos2(vis.left() + blame_w, vis.bottom()),
@@ -23956,18 +24376,14 @@ impl ZaivernApp {
                 let Some(bl) = map.get(src) else {
                     continue;
                 };
-                let rel = git::relative_time(bl.time, now);
-                let author = if bl.uncommitted {
-                    tr("未コミット")
-                } else {
-                    bl.author.clone()
-                };
-                let rel = if bl.uncommitted { String::new() } else { rel };
-                // 幅が足りなければイニシャルへ、それも無理なら描かない
-                if let Some(label) = git::fit_blame_label(&author, &rel, blame_cols) {
+                // 何を書くかは計画が決める (著者が 1 人なら相対日時だけ)。
+                // 幅が足りなければ縮退し、書くことが無ければ描かない。
+                if let Some(label) =
+                    git::blame_row_label(&blame_plan, &bl.author, bl.uncommitted, bl.time, now)
+                {
                     painter.text(
-                        egui::pos2(vis.left() + 6.0, *y0),
-                        Align2::LEFT_TOP,
+                        egui::pos2(vis.left() + gl.blame_right, *y0),
+                        Align2::RIGHT_TOP,
                         &label,
                         font.clone(),
                         blame_color,
@@ -24375,9 +24791,19 @@ impl ZaivernApp {
             self.palette_items_file_mode(&mut items);
         }
 
+        // 行き止まり対策: 何も当たらなかったときだけ、同じクエリを**コマンドとして**
+        // 評価し直す。接頭辞を付け忘れる (日本語 IME を ON にしたまま打って
+        // `>` が入らなかった等) と、コマンド名がそのままファイル検索へ流れて
+        // 「一致するものはありません」で行き止まりになる。当たったときだけ
+        // 案内を 1 行出すので、当たらなければ何も増えない。
+        let mut command_alt: Vec<Item> = Vec::new();
+        if items.is_empty() && !self.palette.is_command_mode() && !q.trim().is_empty() {
+            self.palette_items_command_mode(&pq, &mut command_alt);
+        }
+
         // 並べ替え・件数の頭打ち・グループ分け・空/不一致の見せ方は
         // すべて palette 側の純粋関数に任せる (テーブルテストで固定済み)。
-        self.palette.results(items)
+        self.palette.results(items, &command_alt)
     }
 
     /// パレット: 組み込みコマンド定義 (icon, label, keybind, Cmd) の一覧。
@@ -24658,19 +25084,19 @@ impl ZaivernApp {
             ),
             (
                 "±".into(),
-                tr("マルチバッファ: 未コミットの変更をまとめて読む"),
+                tr("マルチバッファ: 未コミットの変更をまとめて直す"),
                 String::new(),
                 Cmd::OpenChangesMultibuffer,
             ),
             (
                 "🔎".into(),
-                tr("マルチバッファ: 検索結果をまとめて読む"),
+                tr("マルチバッファ: 検索結果をまとめて直す"),
                 String::new(),
                 Cmd::OpenSearchMultibuffer,
             ),
             (
                 "⚠".into(),
-                tr("マルチバッファ: 問題をまとめて読む"),
+                tr("マルチバッファ: 問題をまとめて直す"),
                 String::new(),
                 Cmd::OpenProblemsMultibuffer,
             ),
@@ -25829,8 +26255,13 @@ impl ZaivernApp {
     /// パースは `editor_ops::parse_goto` ただ 1 本 (⌃G の小窓と同じもの)。
     /// 行数を超える値・0 行目は `char_index_at` が末尾へ丸めるので、
     /// ここでクランプはしない (二重の丸めは挙動を読みにくくする)。
+    ///
+    /// 日本語入力中は `：１２：４５` のように**数字まで全角**で入るので、
+    /// パースの手前で `palette::fold_goto` に通す。畳んでよいのはこのモードの
+    /// クエリだけ (理由は `palette::fold_fullwidth_ascii` のドキュメント)。
     fn palette_items_goto_mode(&self, items: &mut Vec<Item>) {
-        let Some((line, col)) = editor_ops::parse_goto(self.palette.query()) else {
+        let q = crate::palette::fold_goto(self.palette.query());
+        let Some((line, col)) = editor_ops::parse_goto(&q) else {
             return;
         };
         if self.editor.active.is_none() {
@@ -32935,7 +33366,9 @@ impl ZaivernApp {
                 );
                 resp.request_focus();
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    go = editor_ops::parse_goto(&self.goto_input);
+                    // パレットの `:` モードと同じ扱い — 日本語入力中は
+                    // `４２：５` のように全角で入るので半角へ畳んでから読む。
+                    go = editor_ops::parse_goto(&crate::palette::fold_goto(&self.goto_input));
                     close = true;
                 }
                 if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -39008,7 +39441,11 @@ mod wave2_tests {
             "実行中だけ再描画を予約する仕組みが無い (アイドルで回り続ける)"
         );
         // ガターの描画とクリックの配線
-        assert!(src.contains("git::fit_blame_label"), "ガターへ描いていない");
+        assert!(src.contains("git::blame_row_label"), "ガターへ描いていない");
+        assert!(
+            src.contains("Align2::RIGHT_TOP"),
+            "blame ラベルを右寄せにしていない (短いほど行番号から離れる)"
+        );
         assert!(
             src.contains("self.open_commit_diff(&sha)"),
             "クリックで差分を開いていない"
@@ -42997,7 +43434,7 @@ mod quick_open_tests {
 
     fn labels(items: &[Item]) -> Vec<String> {
         let p = crate::palette::Palette::new();
-        let res = p.results(items.to_vec());
+        let res = p.results(items.to_vec(), &[]);
         res.items.iter().map(|i| i.label.clone()).collect()
     }
 
@@ -43110,6 +43547,29 @@ mod quick_open_tests {
         // 桁が本文より大きくても丸まる
         let ch = editor_ops::char_index_at(text, 0, usize::MAX);
         assert_eq!(ch, "1 行目".chars().count());
+    }
+
+    /// 行ジャンプの入口は 2 つ (パレットの `:` モードと ⌃G の小窓)。
+    /// **どちらも** `palette::fold_goto` を通してから `parse_goto` を呼ぶこと。
+    /// 片方だけ直すと「パレットでは飛べるのに小窓では飛べない」が残る。
+    #[test]
+    fn 行ジャンプの入口はどちらも全角を畳んでから読む() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let direct = src.matches("editor_ops::parse_goto(").count();
+        let folded = src
+            .matches("editor_ops::parse_goto(&crate::palette::fold_goto(")
+            .count()
+            + src.matches("let q = crate::palette::fold_goto(").count();
+        // 行ジャンプの 2 経路 + `split_path_goto` (パスの `:12` 用。ここは
+        // ファイル名の一部なので畳んではいけない) + このテストと隣のテストの参照。
+        assert!(
+            folded >= 2,
+            "全角を畳んでいる行ジャンプ経路が {folded} 本しかない (direct={direct})"
+        );
+        assert!(
+            src.contains("editor_ops::parse_goto(&crate::palette::fold_goto(&self.goto_input))"),
+            "⌃G の小窓が全角数字を畳んでいない"
+        );
     }
 
     #[test]

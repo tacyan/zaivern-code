@@ -1,0 +1,33 @@
+//! 🧬 追記の自動マージ (zaivern union merge driver) の**登録だけ**。
+//! 実体は `src/union.rs`。
+//!
+//! このファイルを置くだけで機能が繋がる。`feature.rs` のレジストリにも
+//! `build.rs` にも触らない (build.rs が `src/features/*.rs` を走査して拾う)。
+//!
+//! ## なぜ `#[path]` で実体を引き込むのか
+//!
+//! 実体は CLAUDE.md の指示どおり `src/union.rs` に置いている。ただし
+//! `src/<名前>.rs` をクレートへ入れるには通常 `main.rs` の `mod` 一覧へ
+//! 1 行足す必要があり、**それはまさに並列ブランチが取り合う共有行**である。
+//! `#[path]` を使えば `main.rs` を 1 バイトも触らずに実体を
+//! `crate::features::union::imp` として取り込める (`semconf` と同じ手)。
+//!
+//! ## 姉妹機能との住み分け
+//!
+//! * `lease.rs` — 同じファイルを 2 人に触らせない (**起こさない**側)
+//! * `conflict.rs` — 同じファイルの近い行の衝突を先に見せる (**早く見せる**側)
+//! * `semconf.rs` — ファイルが違うのに噛み合わない変更を見せる
+//! * `union.rs` — **起きてしまった衝突のうち「両方残すだけ」のものを消す**側。
+//!   一覧・表・登録簿への追記は、レビューする価値がゼロの衝突を量産する。
+//!
+//! ## 共有面
+//!
+//! `app.rs` / `palette.rs` / `feature.rs` / `config.rs` / `keybinds.rs` /
+//! `main.rs` / `build.rs` はどれも触っていない。唯一 `cli.rs` に
+//! `zai merge-driver` の受け口 (2 箇所・数行) が要る — git がドライバを
+//! **外部プロセスとして起動する**以上、argv の入口だけは共有せざるを得ない。
+
+#[path = "../union.rs"]
+mod imp;
+
+pub use imp::{cli_main, FEATURE};

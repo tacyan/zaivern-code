@@ -66,11 +66,71 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+# ── git を持たせる。**「git が無いので飛ばしました」を無音にしない。** ────
+#
+# `rust:*-slim` には git が入っていない。src/ の 11 ファイル・34 箇所が
+# 「git が無い環境ではスキップ」というガードを持っていて、その中身は
+# `println!` なので **既定のテストハーネスでは出力ごと飲まれる**。
+# つまり画面には緑しか出ないのに、git / worktree / conflict / lease /
+# guard / train / union — **「競合ゼロ」の中核がまるごと未検証**になる。
+# 「無言でスキップ」は緑に見えて検証されていない典型なので、
+#   1. まずイメージに git があるかを確かめ、
+#   2. 無ければ git を足した派生イメージを**1 度だけ**作って使い、
+#   3. それも作れなければ**何が検証されないかを名指しで警告する**。
+git_skip_sites=34
+image_has_git() {
+    docker run --rm --entrypoint sh "$1" -c 'command -v git >/dev/null 2>&1' >/dev/null 2>&1
+}
+
+if [ "${ZAIVERN_LINUX_SKIP_GIT_IMAGE:-0}" = 1 ]; then
+    :
+elif image_has_git "$image"; then
+    :
+else
+    # イメージ名から安定した名前を作る (パスもタグも直書きしない)
+    derived="zaivern-lx-git-$(printf '%s' "$image" | cksum | cut -d' ' -f1)"
+    if docker image inspect "$derived" >/dev/null 2>&1; then
+        image=$derived
+    else
+        echo "== $image に git がありません。git を足した派生イメージを 1 度だけ作ります: $derived"
+        # apt (debian 系) と apk (alpine 系) の**両方**を試す。片側だけ書かない。
+        if printf 'FROM %s
+RUN (command -v apt-get >/dev/null 2>&1 && apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*) || (command -v apk >/dev/null 2>&1 && apk add --no-cache git)
+' "$image" |
+            docker build -q -t "$derived" - >/dev/null 2>&1 && image_has_git "$derived"; then
+            image=$derived
+        else
+            echo "!! git を入れられませんでした。以下は **検証されないまま緑になります**:" >&2
+            echo "   git:: / worktree:: / conflict:: / lease:: / guard:: / train:: / union:: /" >&2
+            echo "   spec:: / race:: / checkpoint:: / git_panel::" >&2
+            echo "   (src/ の 11 ファイル・$git_skip_sites 箇所が「git が無い環境ではスキップ」を持ちます)" >&2
+            echo "   git を含むイメージを ZAIVERN_LINUX_IMAGE で指定してください。" >&2
+        fi
+    fi
+fi
+
 if [ "${1:-}" = "--check" ]; then
     cmd="cargo check --all-targets"
-else
+elif [ "$#" -le 1 ]; then
     filter=${1:-}
     cmd="cargo test --bin zai ${filter}"
+else
+    # **フィルタを複数受け取る。** 以前は `filter=${1:-}` で 1 つ目しか見ず、
+    # `tools/linux-test.sh guard:: train:: union::` と打つと **guard:: だけが
+    # 走って緑**になっていた (実際に踏んだ)。「実行されていないのに緑」は
+    # このリポジトリで繰り返し出ている壊れ方なので、ここで潰す。
+    #
+    # libtest の位置引数は 1 つだけなので、**1 つのコンテナの中で順に回す**
+    # (コンテナ起動を N 回繰り返すと、その分だけ待たされる)。
+    # `&&` で繋ぐので最初に落ちたところで止まり、終了コードが伝わる。
+    cmd=""
+    for f in "$@"; do
+        [ -n "$cmd" ] && cmd="$cmd && "
+        # `$f` はここで展開してコマンド文字列へ焼き込む。エスケープして
+        # コンテナ側へ渡すと、向こうに変数が無いので**見出しが空になる**
+        # (「どれが走ったか分からない」= 実行の証拠にならない)。
+        cmd="${cmd}echo \"== $f\" && cargo test --bin zai $f"
+    done
 fi
 
 # **cargo のレジストリも毎回消えていた。** target だけ残しても、crates.io の
@@ -82,6 +142,11 @@ registry_vol=${ZAIVERN_LINUX_REGISTRY:-zaivern-lx-cargo-registry}
 echo "== Linux ($image) で実行: $cmd"
 echo "   target:   $target_mount (ワークツリーごとに分離。2 回目以降は warm)"
 echo "   registry: $registry_vol (全ワークツリーで共有)"
+if image_has_git "$image"; then
+    echo "   git:      あり (git を要するテストも実行されます)"
+else
+    echo "   git:      **なし — git を要するテストは無言でスキップされます**"
+fi
 # `CARGO_PROFILE_TEST_DEBUG=0` — Docker VM の RAM は実測 7.65GiB しか無く、
 # 並列エージェントのコンテナが同時に居ると `zai` のテストバイナリを
 # `debuginfo=2` でリンクする瞬間に **OOM kill (signal: 9)** される。

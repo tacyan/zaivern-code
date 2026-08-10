@@ -212,6 +212,13 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "agent"
             | "lease"
             | "hook"
+            // ベンダー非依存の書き込み強制 (git フックがここを呼ぶ)
+            | "guard"
+            // 順次統合 (マージトレイン) と、配る前の担当分割
+            | "train"
+            | "split"
+            // git が custom merge driver として起動する入口 (人が打つものではない)
+            | "merge-driver"
             | "update"
             | "uninstall"
             | "help"
@@ -229,7 +236,17 @@ pub fn is_cli_subcommand(word: &str) -> bool {
 fn yields_to_directory(word: &str) -> bool {
     matches!(
         word,
-        "app" | "firewall" | "worktree" | "session" | "agent" | "lease" | "hook" | "help"
+        "app"
+            | "firewall"
+            | "worktree"
+            | "session"
+            | "agent"
+            | "lease"
+            | "hook"
+            | "guard"
+            | "train"
+            | "split"
+            | "help"
     )
 }
 
@@ -237,7 +254,7 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
+    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n{HELP_TRAIN_SPLIT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
 }
 
 const HELP_HEAD: &str = "\
@@ -331,6 +348,32 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
 
 ";
 
+/// `zai guard --help` のセクション。
+///
+/// **本文は [`crate::guard`] 側の唯一の出所を指すだけ**。ここへ写経すると
+/// `zai guard --help` と `zai --help` が食い違う (それを戒めるテストが下にある)。
+pub const HELP_GUARD: &str = crate::features::guard::HELP;
+
+/// 順次統合 (マージトレイン) と、配る前の担当分割、そして git マージドライバ。
+///
+/// **本文はここに 1 行ずつの索引だけ置く。** 詳しい使い方は
+/// `zai train --help` / `zai split --help` がそれぞれの実体から出す
+/// (写経すると必ず食い違う。`HELP_GUARD` と同じ方針)。
+pub const HELP_TRAIN_SPLIT: &str = "\
+統合 (並列で走らせた成果を、衝突ゼロで1本にまとめます):
+  zai split plan --tasks <ファイル|->   配る前に、互いに素な担当表を作る
+                                        (終了コード: 0=互いに素 / 1=共有パスが残った)
+  zai train plan [--onto <ブランチ>]    統合の順序と、予想される衝突を出す
+  zai train run [--onto <ブランチ>] [--dry-run]
+                                        重なりの少ない順に自動リベースして統合する
+                                        衝突したら全部戻す (部分統合を残しません)
+  zai merge-driver ...                  git が custom merge driver として起動する入口
+                                        (人が打つものではありません。導入はパレットの
+                                         「追記の自動マージ」から)
+  詳しい使い方は zai train --help / zai split --help
+
+";
+
 /// `zai update --help` のセクション。
 pub const HELP_UPDATE: &str = "\
 update (Zaivern Code 自身を更新します — エディタが起動していなくても使えます):
@@ -393,6 +436,14 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             println!("Zaivern Code {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // git フック (pre-commit 等) と CI がここを呼ぶ。実体は src/guard.rs。
+        "guard" => crate::features::guard::cli_main(rest),
+        // 順次統合。実体は src/train.rs。
+        "train" => crate::features::train::cli_main(rest),
+        // 配る前の担当分割。実体は src/split.rs。
+        "split" => crate::features::split::cli_main(rest),
+        // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
+        "merge-driver" => crate::features::union::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
         "status" if status_list_mode(rest).is_some() => run_status_list(
@@ -2472,6 +2523,8 @@ mod tests {
             HELP_SESSION,
             HELP_AGENT,
             HELP_LEASE,
+            HELP_GUARD,
+            HELP_TRAIN_SPLIT,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {

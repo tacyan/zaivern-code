@@ -3388,36 +3388,64 @@ mod pack_integration {
 
         let h = Highlighter::new();
         h.set_grammars(set);
-        let src = "// c\nexport const x: number = foo(1) + \"s\";\n".repeat(1000);
-        let t = std::time::Instant::now();
-        let job = h.layout_job(
-            &src,
-            "TypeScript",
-            "base16-ocean.dark",
-            FontId::monospace(12.0),
-            Color32::WHITE,
-        );
-        let paint = t.elapsed();
-        assert_eq!(job.text, src);
 
-        // 1 行だけ書き換えたときの塗り直し。行キャッシュが効いていれば
-        // 変更点の周辺だけを解析し直すので、初回よりはっきり速くなる。
-        // **比**で見るのは、debug/release とマシンの負荷で絶対値が
-        // 2 桁変わるため (実測: 同じコードで debug 5.3s / release 0.2s)。
-        let edited = src.replacen("export const x", "export const y", 1);
-        let t = std::time::Instant::now();
-        let job2 = h.layout_job(
-            &edited,
-            "TypeScript",
-            "base16-ocean.dark",
-            FontId::monospace(12.0),
-            Color32::WHITE,
-        );
-        let repaint = t.elapsed();
-        assert_eq!(job2.text, edited);
+        // 初回の塗りと再描画の塗りを N 回ずつ測り、**それぞれの最小値**で比べる。
+        //
+        // 1 回ずつしか測らないと、比を取る 2 つの計測が**別々の負荷の下**で
+        // 行われるため、フルスイート実行のような混雑した環境で
+        // 「再描画の方が初回より遅い」という物理的にありえない結果が出て落ちる
+        // (実測: 初回 4.28s / 再描画 4.93s)。最小値は負荷スパイクを拾わないので、
+        // ノイズが除かれるぶん**本当に遅くなったときだけ落ちる**。
+        const N: usize = 3;
+        let mut paints: Vec<std::time::Duration> = Vec::with_capacity(N);
+        let mut repaints: Vec<std::time::Duration> = Vec::with_capacity(N);
+
+        for i in 0..N {
+            // 毎回「本当の初回」から測る。ここを間違えると 2 回目以降が全部
+            // キャッシュヒットになり、**テストが何も検査しなくなる**。
+            // 外すべきキャッシュは 2 つある:
+            //  1. `Highlighter::cache` — 本文込みのキー。本文に i を混ぜて外す
+            //     (同じ `Highlighter` を使い回すのは、行キャッシュのキー
+            //      `style_key` にインスタンスのアドレスが入っており、作り直すと
+            //      同じ番地に載って前回の行キャッシュを拾いうるため)
+            //  2. `DOC_CACHE` — 行キャッシュ。空にして全行解析へ落とす
+            let src = format!("// {i}\n")
+                + &"// c\nexport const x: number = foo(1) + \"s\";\n".repeat(1000);
+            DOC_CACHE.with(|c| *c.borrow_mut() = None);
+            let t = std::time::Instant::now();
+            let job = h.layout_job(
+                &src,
+                "TypeScript",
+                "base16-ocean.dark",
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+            paints.push(t.elapsed());
+            assert_eq!(job.text, src);
+
+            // 1 行だけ書き換えたときの塗り直し。直前の初回が残した行キャッシュが
+            // 効いていれば、変更点の周辺だけを解析し直すので初回よりはっきり速い。
+            // **比**で見るのは、debug/release とマシンの負荷で絶対値が
+            // 2 桁変わるため (実測: 同じコードで debug 5.3s / release 0.2s)。
+            let edited = src.replacen("export const x", "export const y", 1);
+            let t = std::time::Instant::now();
+            let job2 = h.layout_job(
+                &edited,
+                "TypeScript",
+                "base16-ocean.dark",
+                FontId::monospace(12.0),
+                Color32::WHITE,
+            );
+            repaints.push(t.elapsed());
+            assert_eq!(job2.text, edited);
+        }
+
+        let paint = paints.iter().copied().min().expect("N >= 1");
+        let repaint = repaints.iter().copied().min().expect("N >= 1");
         assert!(
             repaint * 5 < paint,
-            "1 行編集の塗り直しが差分計算になっていない (初回 {paint:?} / 再描画 {repaint:?})"
+            "1 行編集の塗り直しが差分計算になっていない \
+             (初回 min {paint:?} / 全 {paints:?}, 再描画 min {repaint:?} / 全 {repaints:?})"
         );
     }
 
