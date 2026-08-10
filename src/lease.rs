@@ -905,11 +905,17 @@ pub fn with_store<T>(store: &Path, f: impl FnOnce(&mut Store) -> T) -> Result<T,
     Ok(out)
 }
 
+/// 診断ログの場所。**書き手 ([`log_line`]) と読み手 (競合ゼロ点検) が
+/// ファイル名を 2 か所に持たないための唯一の真実源。**
+pub fn audit_log_path(dir: &Path) -> PathBuf {
+    dir.join("gate.log")
+}
+
 /// 診断ログ (`~/.zaivern/leases/gate.log`)。**拒否と内部エラーだけ**書く。
 /// 許可のたびに書くとエージェントの臨界路で I/O が増える。
 fn log_line(dir: &Path, line: &str) {
     use std::io::Write;
-    let path = dir.join("gate.log");
+    let path = audit_log_path(dir);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_CAP) {
         let _ = std::fs::remove_file(&path);
     }
