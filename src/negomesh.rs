@@ -59,6 +59,7 @@ use crate::features::negotiate;
 use crate::region::{self, Region};
 use negotiate::{Deal, Offer, Want};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 /// 交渉で使う `Msg::Custom` の種別。**この文字列が両側の唯一の合図**。
@@ -110,10 +111,13 @@ fn occupied_of(mesh: &Mesh, path: &str) -> Vec<(String, Region)> {
 
 /// 受信箱を **1 回ぶん**処理して、確保要求へ答える。
 ///
-/// `file_lines` は対象ファイルの行数。**呼び出し側が知っている値**を渡す
-/// (この層はファイルを読まない — 短命なフックプロセスから呼ばれても
-///  ディスクを触らずに済ませたいため)。0 を渡すと「上限不明」として扱い、
-/// ずらし先を提案しない (知らない場所を勧めない)。
+/// `lines_of` は**パス → 行数**を解く関数。1 周で複数ファイルの要求を捌くので、
+/// 行数は 1 つの値では足りない (ここを定数にしていたため、2 ファイル目以降は
+/// 常に間違った上限で判断していた)。この層自身はディスクを触らない —
+/// 短命なフックプロセスから呼ばれても I/O を持たずに済ませたいので、
+/// **読み方は呼び出し側が決める**。既定の実装は [`lines_from_disk`]。
+/// `0` を返すと「上限不明」として扱い、**ずらし先を提案しない**
+/// (知らない場所を勧めるより断る方が安全)。
 ///
 /// **1 周で全ファイルを片付ける。** 以前は「受信箱の先頭と同じファイル」だけを
 /// 処理して、別ファイルの要求を次の周へ回していた。ところが次の周は
@@ -122,7 +126,33 @@ fn occupied_of(mesh: &Mesh, path: &str) -> Vec<(String, Region)> {
 /// 「返事が来ない」で落ちる。ファイルごとに [`negotiate::allocate`] を呼び、
 /// **パスの辞書順**で回す (`BTreeMap` なので `Mesh::claims` の列挙順は
 /// 出力へ漏れない)。
-pub fn serve_once(mesh: &Mesh, me: &Pid, file_lines: u32, band: u32) -> Served {
+/// 既定の「パス → 行数」。**リポジトリのルートからの相対パス**として読む。
+///
+/// 読めない (存在しない・二値・権限が無い) なら `0` を返す —
+/// [`serve_once`] はそれを「上限不明」として扱い、**ずらし先を提案しない**。
+/// 「知らない場所を勧める」より「断る」ほうが安全側だからである。
+///
+/// 上限 [`LINES_READ_CAP`] を超えるファイルは読まない。交渉役は短命な
+/// プロセスから叩かれることがあるので、1 回の判断で数百 MB を読み込む
+/// 経路を残さない。
+pub fn lines_from_disk(root: &Path, rel: &str) -> u32 {
+    let p = root.join(rel);
+    let Ok(md) = std::fs::metadata(&p) else {
+        return 0;
+    };
+    if !md.is_file() || md.len() > LINES_READ_CAP {
+        return 0;
+    }
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return 0; // 二値・不正な UTF-8
+    };
+    text.lines().count().min(u32::MAX as usize) as u32
+}
+
+/// [`lines_from_disk`] が読むファイルサイズの上限 (バイト)。
+const LINES_READ_CAP: u64 = 8 * 1024 * 1024;
+
+pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u32) -> Served {
     let mut out = Served::default();
     let envs = mesh.recv_match(me, &|m| {
         matches!(m, Msg::Claim { .. }) || matches!(m, Msg::Custom { kind, .. } if kind == DEAL_KIND)
@@ -191,7 +221,7 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, file_lines: u32, band: u32) -> Served {
         // 取った担当はここで拾える (古い占有表で配ると重ねてしまう)。
         let occupied = occupied_of(mesh, path);
         let wants: Vec<Want> = idxs.iter().map(|&i| asks[i].1.clone()).collect();
-        let plan = negotiate::allocate(&wants, &occupied, file_lines, band);
+        let plan = negotiate::allocate(&wants, &occupied, lines_of(&path), band);
 
         for &i in idxs {
             let (from, want, is_deal) = &asks[i];
@@ -241,7 +271,7 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, file_lines: u32, band: u32) -> Served {
                     }
                 }
                 None => {
-                    let off = negotiate::offer(want, &occupied, file_lines, band);
+                    let off = negotiate::offer(want, &occupied, lines_of(&path), band);
                     let (holder, hint) = describe(&off);
                     out.denied
                         .push((region::render(&want.region), holder.clone(), hint.clone()));
@@ -492,6 +522,18 @@ pub fn serve_cli(argv: &[String]) -> i32 {
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
+    // 行数は**ファイルごと**に解く。`--lines` は「全ファイルこの行数として
+    // 扱う」上書きで、指定が無ければ実ファイルから読む (既定)。
+    // 定数 1 つで全ファイルを判断していた頃は、2 ファイル目以降が常に
+    // 間違った上限で判定されていた。
+    let root = cwd.clone();
+    let resolver = move |rel: &str| -> u32 {
+        if lines > 0 {
+            lines
+        } else {
+            lines_from_disk(&root, rel)
+        }
+    };
     let mesh = Mesh::open_for(&cwd);
     if !mesh.enabled() {
         eprintln!("メッシュが有効ではありません (先に `zai mesh spawn` を実行してください)");
@@ -520,7 +562,7 @@ pub fn serve_cli(argv: &[String]) -> i32 {
     let mut idle_streak: u32 = 0;
     for round in 0..rounds {
         mesh.beat(&me.pid);
-        let s = serve_once(&mesh, &me.pid, lines, band);
+        let s = serve_once(&mesh, &me.pid, &resolver, band);
         let idle = s.is_idle();
         total.granted.extend(s.granted);
         total.denied.extend(s.denied);
@@ -820,7 +862,7 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 let m = Mesh::open_at(root, "test-node");
                 while !flag.load(Ordering::Relaxed) {
-                    serve_once(&m, &srv, lines, region::SAFE_BAND);
+                    serve_once(&m, &srv, &|_| lines, region::SAFE_BAND);
                     // 交渉役の周回。要求側の `ask_backoff` (25ms〜) より
                     // 細かくしておかないと、待ちが常に 1 段ぶん伸びる。
                     std::thread::sleep(Duration::from_millis(5));
@@ -859,7 +901,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s1 = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s1 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert_eq!(s1.granted, vec!["src/x.rs#L10-40".to_string()]);
         assert!(s1.shifted.is_empty());
 
@@ -872,7 +914,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s2 = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s2 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert!(s2.granted.is_empty(), "重なったのに通した");
         assert!(
             s2.shifted.is_empty(),
@@ -898,7 +940,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
 
         let want = Want::movable("b1", region::parse("src/x.rs#L20-50").expect("解釈"));
         m.send(
@@ -913,7 +955,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert_eq!(s.granted.len(), 1, "ずらせば通るはずが通っていない");
         assert_eq!(s.shifted.len(), 1, "ずらした記録が無い");
 
@@ -945,7 +987,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert_eq!(s.unreadable, 1);
         let back = m.recv(&a);
         assert!(
@@ -973,7 +1015,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         let got = request(&m, &a, &srv, &want, 3).expect("返事が来る");
         assert!(got.is_ok(), "通るはずが断られた: {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1006,7 +1048,7 @@ mod tests {
         )
         .expect("送れる");
 
-        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert_eq!(
             s.granted,
             vec!["src/a.rs#L10-40".to_string(), "src/z.rs#L10-40".to_string()],
@@ -1144,7 +1186,7 @@ mod tests {
         )
         .expect("送れる");
         assert_eq!(
-            serve_once(&m, &srv, 2000, region::SAFE_BAND).granted,
+            serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND).granted,
             vec!["src/x.rs#L10-40".to_string()]
         );
 
@@ -1172,7 +1214,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
         assert_eq!(
             s.granted,
             vec!["src/x.rs#L10-40".to_string()],
@@ -1254,6 +1296,41 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "終了コードが重複している: {all:?}");
         assert_eq!(sorted, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn 行数はファイルごとに解く() {
+        let dir = unique_temp_dir("zaivern", "negomesh-lines");
+        std::fs::create_dir_all(dir.join("src")).expect("作れる");
+        let short = (1..=30).map(|i| format!("l{i}\n")).collect::<String>();
+        let long = (1..=900).map(|i| format!("l{i}\n")).collect::<String>();
+        std::fs::write(dir.join("src/short.rs"), &short).expect("書ける");
+        std::fs::write(dir.join("src/long.rs"), &long).expect("書ける");
+
+        assert_eq!(lines_from_disk(&dir, "src/short.rs"), 30);
+        assert_eq!(lines_from_disk(&dir, "src/long.rs"), 900);
+        // 読めないものは 0 = 「上限不明」。ずらし先を勧めない側へ倒す。
+        assert_eq!(lines_from_disk(&dir, "src/nope.rs"), 0);
+        assert_eq!(lines_from_disk(&dir, "src"), 0, "ディレクトリは 0");
+
+        // **1 周で 2 ファイルを捌いても、それぞれの行数で判断する。**
+        // 定数 1 つで判断していた頃は、2 ファイル目が常に間違った上限だった。
+        let m = mesh_at(&dir.join("mesh"));
+        let srv = spawn(&m, "negotiator");
+        let a = spawn(&m, "agent");
+        for spec in ["src/short.rs#L1-10", "src/long.rs#L800-820"] {
+            m.send(&srv, &a, Msg::Claim { spec: spec.into() })
+                .expect("送れる");
+        }
+        let root = dir.clone();
+        let s = serve_once(
+            &m,
+            &srv,
+            &move |rel: &str| lines_from_disk(&root, rel),
+            region::SAFE_BAND,
+        );
+        assert_eq!(s.granted.len(), 2, "2 ファイルとも 1 周で捌けていない");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
