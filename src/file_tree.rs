@@ -377,7 +377,9 @@ impl FileTree {
             use_trash: true,
             undo_hint: None,
             ignorer: crate::ignore::Ignorer::new(true),
-            dim_ignored: false,
+            // `Config::default()` と同じ値から始める (apply_config 前に描いても
+            // 既定の見え方 = 「消さずに薄く出す」になる)。
+            dim_ignored: true,
             dir_page: crate::config::DEFAULT_TREE_DIR_PAGE,
             more_pages: HashMap::new(),
             scan_budget: crate::config::DEFAULT_INDEX_MAX_FILES,
@@ -1668,6 +1670,44 @@ pub(crate) fn git_status_style(
     }
 }
 
+/// 切り取り待ちの行を薄める係数 (VS Code と同じ「掴んでいる」合図)。
+const CUT_PENDING_ALPHA: f32 = 0.5;
+
+/// git が無視している行の前景色。
+///
+/// VS Code の `gitDecoration.ignoredResourceForeground` に相当する。
+/// **係数 (`gamma_multiply`) を掛けない** — 掛け算はテーマの地の明るさを
+/// 見ないので、ライトテーマでは本文が背景へ寄って薄くなりすぎ、
+/// ダークテーマでは逆に十分弱くならない。テーマが自分で決めた
+/// 「読めるが弱い」色 = `text_dim` を使う (`text_dim/bg` のコントラスト
+/// 下限は `theme::tests::every_theme_meets_the_text_contrast_floor` が守る)。
+pub(crate) fn ignored_fg(theme: &Theme) -> egui::Color32 {
+    theme.text_dim
+}
+
+/// ツリー 1 行の前景色。**優先順位はここだけにある**。
+///
+/// 切り取り待ち > 無視 > git ステータス > 通常。
+/// 無視が git ステータスより強いのは VS Code と同じで、
+/// 「コミットされない物」であることのほうが「変わった」より先に伝わるべきだから
+/// (`.gitignore` の中の変更を M の色で見せると、追跡されていると誤読される)。
+pub(crate) fn row_fg(
+    theme: &Theme,
+    cut_pending: bool,
+    ignored: bool,
+    status: Option<crate::git::FileStatus>,
+) -> egui::Color32 {
+    if cut_pending {
+        theme.text.gamma_multiply(CUT_PENDING_ALPHA)
+    } else if ignored {
+        ignored_fg(theme)
+    } else if let Some(st) = status {
+        git_status_style(st, theme).0
+    } else {
+        theme.text
+    }
+}
+
 impl FileTree {
     fn dir_ui(
         &mut self,
@@ -1696,8 +1736,6 @@ impl FileTree {
             let sel = self.sel.contains(&e.path);
             // 切り取り待ちの項目は薄く描く(VS Code と同じ合図)
             let cut_pending = matches!(&self.clipboard, Some((p, true)) if p.contains(&e.path));
-            // git が無視する項目は (薄表示の設定のときだけ現れ) 淡く描く
-            let dim = if e.ignored { 0.45_f32 } else { 1.0 };
             if e.is_dir {
                 let ctx = ui.ctx().clone();
                 let mut st =
@@ -1710,18 +1748,21 @@ impl FileTree {
 
                 // 折りたたんだままでも「下で何か変わった」が分かるよう、
                 // 配下の変更件数を常にバッジに出す (深さは問わない)。
-                let (dir_color, dir_badge, dir_hint) = if cut_pending {
-                    (theme.text.gamma_multiply(0.5), String::new(), String::new())
+                // 色より先に勝つ条件 (切り取り待ち / 無視) が立っていれば
+                // git へ問い合わせない (畳んだ node_modules で無駄に引かない)。
+                let dir_st = if cut_pending || e.ignored {
+                    None
+                } else {
+                    gitinfo.dir_status(&e.path)
+                };
+                let dir_color = row_fg(theme, cut_pending, e.ignored, dir_st.map(|(s, _)| s));
+                let (dir_badge, dir_hint) = if cut_pending {
+                    (String::new(), String::new())
                 } else if e.ignored {
+                    (String::new(), tr("git が無視しています (.gitignore)"))
+                } else if let Some((st_type, count)) = dir_st {
+                    let (_, b, h) = git_status_style(st_type, theme);
                     (
-                        theme.text.gamma_multiply(dim),
-                        String::new(),
-                        tr("git が無視しています (.gitignore)"),
-                    )
-                } else if let Some((st_type, count)) = gitinfo.dir_status(&e.path) {
-                    let (c, b, h) = git_status_style(st_type, theme);
-                    (
-                        c,
                         format!(" {b}•{count}"),
                         format!(
                             "{}\n{}",
@@ -1730,7 +1771,7 @@ impl FileTree {
                         ),
                     )
                 } else {
-                    (theme.text, String::new(), String::new())
+                    (String::new(), String::new())
                 };
 
                 let hr = st.show_header(ui, |ui| {
@@ -1790,19 +1831,21 @@ impl FileTree {
                     self.auto_reveal_menu(ui);
                 });
             } else {
-                let (file_color, file_badge, hint) = if cut_pending {
-                    (theme.text.gamma_multiply(0.5), String::new(), "")
-                } else if e.ignored {
-                    (
-                        theme.text.gamma_multiply(dim),
-                        String::new(),
-                        "git が無視しています (.gitignore)",
-                    )
-                } else if let Some(st_type) = gitinfo.file_status(&e.path) {
-                    let (c, b, h) = git_status_style(st_type, theme);
-                    (c, format!("  {b}"), h)
+                let file_st = if cut_pending || e.ignored {
+                    None
                 } else {
-                    (theme.text, String::new(), "")
+                    gitinfo.file_status(&e.path)
+                };
+                let file_color = row_fg(theme, cut_pending, e.ignored, file_st);
+                let (file_badge, hint) = if cut_pending {
+                    (String::new(), "")
+                } else if e.ignored {
+                    (String::new(), "git が無視しています (.gitignore)")
+                } else if let Some(st_type) = file_st {
+                    let (_, b, h) = git_status_style(st_type, theme);
+                    (format!("  {b}"), h)
+                } else {
+                    (String::new(), "")
                 };
 
                 let label = format!("{} {}{}", icon_for(&e.name), e.name, file_badge);
@@ -2924,8 +2967,10 @@ mod tests {
 
     // ── .gitignore ────────────────────────────────────────────────
 
+    /// `.gitignore` の 3 経路。**既定は「残して薄く」** (VS Code と同じ) で、
+    /// 「隠す」は `dim_ignored_files = false` を選んだときだけ。
     #[test]
-    fn gitignore_hides_generated_dirs_from_the_tree() {
+    fn gitignore_dims_by_default_and_hides_only_when_asked() {
         let root = unique_temp_dir("zaivern-tree-test", "gitignore");
         std::fs::write(
             root.join(".gitignore"),
@@ -2938,34 +2983,44 @@ mod tests {
         std::fs::write(root.join("a.log"), "x").unwrap();
         std::fs::write(root.join("README.md"), "x").unwrap();
 
+        // 既定: 消えずに残り、`ignored` が立つ (VS Code の既定と同じ見せ方。
+        // 既定で消していると「置いたはずのファイルがツリーに無い」が黙って起きる)
         let cfg = crate::config::Config::default();
+        assert!(cfg.dim_ignored_files, "既定は「隠さず薄く出す」");
+        assert!(cfg.respect_gitignore, "無視の判定自体は既定でオン");
         let mut t = tree_with(&root, &cfg);
-        assert_eq!(names_of(&mut t, &root), [".gitignore", "README.md", "src"]);
+        let entries = t.entries(&root);
+        let flag = |n: &str| entries.iter().find(|e| e.name == n).map(|e| e.ignored);
+        assert_eq!(
+            flag("node_modules"),
+            Some(true),
+            "無視ディレクトリも行に残る"
+        );
+        assert_eq!(flag("target"), Some(true));
+        assert_eq!(flag("a.log"), Some(true), "パターン一致のファイルも残る");
+        assert_eq!(flag("src"), Some(false), "無視されないものには印が付かない");
+        assert_eq!(flag("README.md"), Some(false));
 
-        // 薄く表示する設定なら消えずに残り、`ignored` が立つ
-        let dim = crate::config::Config {
-            dim_ignored_files: true,
+        // 隠す設定を選んだときだけ消える
+        let hide = crate::config::Config {
+            dim_ignored_files: false,
             ..crate::config::Config::default()
         };
-        let mut t = tree_with(&root, &dim);
-        let entries = t.entries(&root);
-        let nm = entries
-            .iter()
-            .find(|e| e.name == "node_modules")
-            .expect("薄表示なら残る");
-        assert!(nm.ignored, "無視対象の印が立つ");
-        assert!(
-            entries.iter().any(|e| e.name == "src" && !e.ignored),
-            "無視されないものには印が付かない"
-        );
+        let mut t = tree_with(&root, &hide);
+        assert_eq!(names_of(&mut t, &root), [".gitignore", "README.md", "src"]);
 
-        // 設定で切れば全部出る
+        // 設定で切れば印も付かない
         let off = crate::config::Config {
             respect_gitignore: false,
             ..crate::config::Config::default()
         };
         let mut t = tree_with(&root, &off);
-        assert!(names_of(&mut t, &root).contains(&"node_modules".to_string()));
+        let entries = t.entries(&root);
+        assert!(entries.iter().any(|e| e.name == "node_modules"));
+        assert!(
+            entries.iter().all(|e| !e.ignored),
+            "尊重しない設定では無視の印が 1 つも立たない"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2979,12 +3034,177 @@ mod tests {
         std::fs::write(root.join("logs").join("important.log"), "x").unwrap();
         std::fs::write(root.join("logs").join("noise.log"), "x").unwrap();
 
+        // 既定 (薄表示) では両方並ぶが、印が付くのは除外されたほうだけ
         let cfg = crate::config::Config::default();
         let mut t = tree_with(&root, &cfg);
+        let logs = t.entries(&root.join("logs"));
+        let flag = |n: &str| logs.iter().find(|e| e.name == n).map(|e| e.ignored);
+        assert_eq!(
+            flag("important.log"),
+            Some(false),
+            "`!` で戻したものは無視されない"
+        );
+        assert_eq!(flag("noise.log"), Some(true));
+
+        // 隠す設定なら、戻したものだけが残る
+        let hide = crate::config::Config {
+            dim_ignored_files: false,
+            ..crate::config::Config::default()
+        };
+        let mut t = tree_with(&root, &hide);
         assert_eq!(
             names_of(&mut t, &root.join("logs")),
             [".gitignore", "important.log"]
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 無視された行の色が「通常より弱いが読める」こと。
+    ///
+    /// **絶対値では線を引かない** — テーマごとに地の明るさが違うので固定の
+    /// しきい値は必ず嘘になる。「通常色より背景に近い」という**関係**と、
+    /// 「背景に沈み切っていない」下限だけを、ライト/ダーク両方で見る。
+    #[test]
+    fn 無視色は全テーマで通常色より背景に近く読める() {
+        use crate::theme::contrast_ratio;
+        let (mut dark, mut light) = (0usize, 0usize);
+        for t in crate::theme::all() {
+            if t.dark {
+                dark += 1;
+            } else {
+                light += 1;
+            }
+            let normal = row_fg(&t, false, false, None);
+            let ignored = row_fg(&t, false, true, None);
+            assert_ne!(ignored, normal, "{}: 無視行が通常行と同じ色", t.name);
+            // ツリーはサイドパネルの上に乗る (theme 適用時 panel_fill = panel)
+            let ci = contrast_ratio(ignored, t.panel);
+            let cn = contrast_ratio(normal, t.panel);
+            assert!(
+                ci < cn,
+                "{}: 無視行が通常行より浮いている (無視 {ci:.2} / 通常 {cn:.2})",
+                t.name
+            );
+            assert!(
+                ci >= 4.0,
+                "{}: 無視行が地に沈んで読めない ({ci:.2})",
+                t.name
+            );
+        }
+        assert!(
+            dark > 0 && light > 0,
+            "ライト/ダーク両方を見ている (dark={dark} light={light})"
+        );
+    }
+
+    /// 行の前景色の優先順位を表で固定する。
+    /// 切り取り待ち > 無視 > git ステータス > 通常 (無視は VS Code と同じく M/U に勝つ)。
+    #[test]
+    fn 無視はgitステータス色より優先される() {
+        use crate::git::FileStatus;
+        let t = crate::theme::all()
+            .into_iter()
+            .next()
+            .expect("テーマがある");
+        let cut = t.text.gamma_multiply(CUT_PENDING_ALPHA);
+        let ign = ignored_fg(&t);
+        let m = git_status_style(FileStatus::Modified, &t).0;
+        let u = git_status_style(FileStatus::Untracked, &t).0;
+        let cases: [(bool, bool, Option<FileStatus>, egui::Color32); 8] = [
+            (false, false, None, t.text),
+            (false, false, Some(FileStatus::Modified), m),
+            (false, false, Some(FileStatus::Untracked), u),
+            (false, true, None, ign),
+            (false, true, Some(FileStatus::Modified), ign),
+            (false, true, Some(FileStatus::Untracked), ign),
+            (true, false, Some(FileStatus::Modified), cut),
+            (true, true, Some(FileStatus::Modified), cut),
+        ];
+        for (cut_pending, ignored, st, want) in cases {
+            assert_eq!(
+                row_fg(&t, cut_pending, ignored, st),
+                want,
+                "cut={cut_pending} ignored={ignored} status={st:?}"
+            );
+        }
+        assert_ne!(
+            ign, m,
+            "無視の色と M の色が同じでは優先順位を確かめられない"
+        );
+        assert_ne!(ign, u);
+    }
+
+    /// `.gitignore` を尊重しない設定なら、薄表示の設定が立っていても
+    /// **薄くならない** (無視の判定そのものが無いため)。
+    #[test]
+    fn gitignoreを尊重しなければ薄表示にならない() {
+        let root = unique_temp_dir("zaivern-tree-test", "no-respect");
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+
+        let off = crate::config::Config {
+            respect_gitignore: false,
+            dim_ignored_files: true,
+            ..crate::config::Config::default()
+        };
+        let mut t = tree_with(&root, &off);
+        assert!(!t.dim_ignored, "尊重しない設定では薄表示も立たない");
+        let entries = t.entries(&root);
+        let nm = entries
+            .iter()
+            .find(|e| e.name == "node_modules")
+            .expect("尊重しない設定なら当然出る");
+        assert!(!nm.ignored, "無視の印が付かない");
+        let theme = crate::theme::all()
+            .into_iter()
+            .next()
+            .expect("テーマがある");
+        assert_eq!(
+            row_fg(&theme, false, nm.ignored, None),
+            theme.text,
+            "通常色のまま"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 巨大な無視ディレクトリを既定で表示しても、**中身は開くまで読まない**。
+    /// 実時間ではなく `read_dir` の**回数**で固定する (時間は必ず嘘をつく)。
+    #[test]
+    fn 無視ディレクトリを既定表示しても中身は読まない() {
+        let root = unique_temp_dir("zaivern-tree-test", "lazy-ignored");
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        let nm = root.join("node_modules");
+        std::fs::create_dir_all(&nm).unwrap();
+        for i in 0..200 {
+            std::fs::create_dir_all(nm.join(format!("p{i:03}"))).unwrap();
+        }
+        std::fs::write(root.join("README.md"), "x").unwrap();
+
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        let ctx = egui::Context::default();
+
+        let rows = t.visible_rows(&ctx);
+        assert!(
+            rows.iter().any(|r| r.name == "node_modules"),
+            "無視ディレクトリ自体は既定で出る"
+        );
+        assert!(
+            !rows.iter().any(|r| r.name.starts_with('p')),
+            "畳んだままなら中身は 1 行も出ない"
+        );
+        assert_eq!(t.io_reads, 1, "ルートの 1 階層しか読まない (中身は遅延)");
+
+        // 開いたときだけ 1 階層ぶん読み足す
+        set_open(&ctx, &nm, true);
+        let rows = t.visible_rows(&ctx);
+        assert!(
+            rows.iter().any(|r| r.name.starts_with('p')),
+            "開けば中身が出る"
+        );
+        assert_eq!(t.io_reads, 2, "開いた 1 階層だけを読み足す");
 
         std::fs::remove_dir_all(&root).ok();
     }

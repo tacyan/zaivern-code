@@ -14,6 +14,11 @@ pub struct Theme {
     pub accent: Color32,
     pub accent_soft: Color32,
     pub text: Color32,
+    /// 補助テキスト。**git が無視するファイル行の色でもある**
+    /// (`file_tree::ignored_fg` — VS Code の
+    /// `gitDecoration.ignoredResourceForeground` 相当)。本文へ係数を掛けて
+    /// 薄くする代わりにこの値を使うので、「読めるが明らかに弱い」を
+    /// 成り立たせるのはテーマ側の責任になる。
     pub text_dim: Color32,
     pub border: Color32,
     pub term_bg: Color32,
@@ -1509,6 +1514,11 @@ mod tests {
                 ("text/bg", t.text, t.bg, 7.0),
                 ("text/panel", t.text, t.panel, 7.0),
                 ("text_dim/bg", t.text_dim, t.bg, 4.5),
+                // ファイルツリー (サイドパネル = panel の上) の無視ファイル行が
+                // これ。地に沈むと「消えた」と区別が付かなくなる。
+                // 下限が bg より低いのは、パネルが地よりわずかに明るい/暗い
+                // ぶん差が縮むため (実測の最小は zaivern-light の 4.31)。
+                ("text_dim/panel", t.text_dim, t.panel, 4.0),
                 ("term_fg/term_bg", t.term_fg, t.term_bg, 7.0),
                 // diff の hunk 背景 (accent_soft) の上にも本文を置く
                 ("text/accent_soft", t.text, t.accent_soft, 4.5),
