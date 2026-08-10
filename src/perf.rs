@@ -28,6 +28,13 @@ use std::time::Instant;
 pub const ENV_ENABLE: &str = "ZAIVERN_PERF";
 /// レポートの出力先ファイル。未設定なら stderr。
 pub const ENV_OUT: &str = "ZAIVERN_PERF_OUT";
+/// **N 秒後に 1 回だけ**レポートを書き出す秒数。未設定なら書き出さない。
+///
+/// [`dump`] は普段 `on_exit` からしか呼ばれないので、**ウィンドウを手で
+/// 閉じないとレポートが出ない**。SIGTERM ではハンドラが無く即終了するため、
+/// 「起動 → N 秒放置 → 数字を取る」を script から回せなかった
+/// (`tools/idle-cpu.sh` が実際にここで詰まった)。
+pub const ENV_DUMP_AFTER: &str = "ZAIVERN_PERF_DUMP_AFTER";
 /// レポート行の接頭辞 (grep / diff しやすいように固定)。
 pub const TAG: &str = "ZAIVERN_PERF";
 /// ヒストグラムの内訳行の接頭辞。
@@ -213,20 +220,107 @@ impl FrameStats {
     }
 
     /// アイドル時の実描画レート (fps)。経過が 0 なら None。
+    ///
+    /// 実時間を読むのはここだけ。**判定に使う数値は
+    /// [`idle_fps_over`](Self::idle_fps_over) 側 (純粋) で作る** —
+    /// 実時間で線を引くテストは必ず嘘をつくため。
     pub fn idle_fps(&self) -> Option<f64> {
-        let s = self.started.elapsed().as_secs_f64();
-        (s > 0.0).then(|| self.idle_frames as f64 / s)
+        self.idle_fps_over(self.started.elapsed().as_secs_f64())
+    }
+
+    /// 経過 `elapsed_s` 秒に対するアイドル描画レート (fps)。**純粋**。
+    ///
+    /// 経過が 0 以下 / 非数なら None (0 と偽らない)。
+    pub fn idle_fps_over(&self, elapsed_s: f64) -> Option<f64> {
+        (elapsed_s > 0.0).then(|| self.idle_frames as f64 / elapsed_s)
+    }
+
+    /// アイドル中に出た再描画要求の総数。
+    ///
+    /// **設計原則 3 が本当に見たいのはフレーム時間ではなくこの数**。
+    /// 再描画が damage 駆動だけなら、放置している間ここは増えない。
+    pub fn idle_repaints(&self) -> u64 {
+        self.repaints.values().sum()
+    }
+
+    /// 経過 `elapsed_s` 秒に対するアイドル再描画要求のレート (件/秒)。**純粋**。
+    pub fn idle_repaint_rate_over(&self, elapsed_s: f64) -> Option<f64> {
+        (elapsed_s > 0.0).then(|| self.idle_repaints() as f64 / elapsed_s)
+    }
+
+    /// **自走している出所** — アイドルフレームと同数以上の要求を出したもの。
+    ///
+    /// アイドルフレームは「実入力が無いのに描いたフレーム」なので、
+    /// ある出所の要求数がそれと同数以上なら、**そのフレームは自分で呼んだ**
+    /// ことになる (= 次のフレームを自分で予約し続けている = 常時アニメーション)。
+    /// 逆に「たまに起こす」出所 (git ジョブの完了通知など) は要求数が
+    /// アイドルフレーム数よりずっと小さくなるので、ここには出ない。
+    ///
+    /// **絶対時間ではなく比で見る**のが肝心で、遅いマシンでも速いマシンでも
+    /// 同じ結論になる (fps が落ちればアイドルフレームも要求も同じだけ減る)。
+    /// アイドルフレームが 0 なら空 (犯人がいないのではなく、標本が無い)。
+    pub fn always_on_sources(&self) -> Vec<(&'static str, u64)> {
+        if self.idle_frames == 0 {
+            return Vec::new();
+        }
+        self.repaint_ranking()
+            .into_iter()
+            .filter(|(_, n)| *n >= self.idle_frames)
+            .collect()
+    }
+
+    /// 1 フレームぶんを積む。**純粋** (グローバル状態も実時間も触らない)。
+    ///
+    /// [`frame_end`] の中身をここへ出してあるので、アイドル N フレームを
+    /// 模擬した検査がプロセスの計測状態を汚さずに書ける
+    /// (テスト用のカウンタを共有 static に置くと、同時に走っている他の
+    ///  テストの呼び出しまで混ざる)。
+    ///
+    /// `pending` はそのフレーム中に来た再描画要求。**アイドルでなければ
+    /// 捨てる** — 入力に応じた再描画は正常なので、分布に混ぜると本命が埋もれる。
+    pub fn record_frame(
+        &mut self,
+        us: u64,
+        idle: bool,
+        pending: impl IntoIterator<Item = (&'static str, u64)>,
+    ) {
+        self.frames.record(us);
+        if !idle {
+            return;
+        }
+        self.idle_frames += 1;
+        for (tag, n) in pending {
+            if self.repaints.len() >= REPAINT_TAGS_CAP && !self.repaints.contains_key(tag) {
+                *self.repaints.entry("other").or_insert(0) += n;
+            } else {
+                *self.repaints.entry(tag).or_insert(0) += n;
+            }
+        }
     }
 
     /// 版間比較のための 1 行 1 レコード。**この関数は純粋** (I/O をしない)。
     pub fn report_lines(&self, version: &str) -> Vec<String> {
         let ms = |us: Option<u64>| us.map(|v| v as f64 / 1000.0).unwrap_or(0.0);
+        // 経過は 1 回だけ読む (2 回読むと fps とレートが別の瞬間の値になる)。
+        let elapsed_s = self.started.elapsed().as_secs_f64();
+        // 犯人がいないときも鍵は残す (awk / diff で列がずれない)。
+        let always_on = self.always_on_sources();
+        let always_on = if always_on.is_empty() {
+            "-".to_string()
+        } else {
+            always_on
+                .iter()
+                .map(|(t, _)| *t)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let mut out = vec![format!(
             "{TAG} version={version} frames={} elapsed_s={:.2} \
              p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3} min_ms={:.3} mean_ms={:.3} \
-             idle_frames={} idle_fps={:.3}",
+             idle_frames={} idle_fps={:.3} idle_repaints={} idle_repaint_rate={:.3} \
+             always_on={}",
             self.frames.count(),
-            self.started.elapsed().as_secs_f64(),
+            elapsed_s,
             ms(self.frames.quantile(0.50)),
             ms(self.frames.quantile(0.95)),
             ms(self.frames.quantile(0.99)),
@@ -234,7 +328,10 @@ impl FrameStats {
             ms(self.frames.min_us()),
             self.frames.mean_us().unwrap_or(0.0) / 1000.0,
             self.idle_frames,
-            self.idle_fps().unwrap_or(0.0),
+            self.idle_fps_over(elapsed_s).unwrap_or(0.0),
+            self.idle_repaints(),
+            self.idle_repaint_rate_over(elapsed_s).unwrap_or(0.0),
+            always_on,
         )];
         for (lo, hi, n) in self.frames.nonempty() {
             out.push(format!(
@@ -277,10 +374,49 @@ fn state() -> &'static Mutex<FrameStats> {
 /// 再描画要求の記録 ([`note_repaint`]) も、この旗が立っている間だけ数える。
 static IDLE_FLAG: AtomicBool = AtomicBool::new(false);
 
+/// [`ENV_DUMP_AFTER`] の値を [`std::time::Duration`] へ。**純粋** (環境を読まない)。
+///
+/// 秒を小数で受ける。0 以下・非数・空は `None` = 「予約しない」。
+/// 数字でない値を黙って 0 扱いにすると、**起動直後に空のレポートが出て
+/// 「アイドルでは何も起きていない」という嘘**になるので、必ず弾く。
+fn parse_dump_after(raw: &str) -> Option<std::time::Duration> {
+    let secs: f64 = raw.trim().parse().ok()?;
+    (secs.is_finite() && secs > 0.0).then(|| std::time::Duration::from_secs_f64(secs))
+}
+
+/// [`ENV_DUMP_AFTER`] が指定されていれば、**1 回だけ**書き出しを予約する。
+///
+/// * 予約するのは**プロセスで 1 回**きり (`OnceLock`)。フレームごとに
+///   スレッドを撒かない。
+/// * このスレッドは**再描画を 1 度も要求しない**。計測のために設計原則 3 を
+///   破らないため、寝て・書いて・終わるだけ。
+fn arm_dump_timer() {
+    static ARMED: OnceLock<()> = OnceLock::new();
+    ARMED.get_or_init(|| {
+        let Some(after) = std::env::var(ENV_DUMP_AFTER)
+            .ok()
+            .as_deref()
+            .and_then(parse_dump_after)
+        else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("perf-dump".into())
+            .spawn(move || {
+                std::thread::sleep(after);
+                dump();
+            });
+    });
+}
+
 /// フレームの開始時刻を取る。無効なら `None` (以降の計測も全部止まる)。
 #[inline]
 pub fn frame_start() -> Option<Instant> {
-    enabled().then(Instant::now)
+    if !enabled() {
+        return None;
+    }
+    arm_dump_timer();
+    Some(Instant::now())
 }
 
 /// このフレームがアイドルだったことを記録する (描画の途中で呼ぶ)。
@@ -304,17 +440,7 @@ pub fn frame_end(started: Option<Instant>) {
         .map(|mut f| std::mem::take(&mut *f))
         .unwrap_or_default();
     if let Ok(mut s) = state().lock() {
-        s.frames.record(us);
-        if idle {
-            s.idle_frames += 1;
-            for (tag, n) in pending {
-                if s.repaints.len() >= REPAINT_TAGS_CAP && !s.repaints.contains_key(tag) {
-                    *s.repaints.entry("other").or_insert(0) += n;
-                } else {
-                    *s.repaints.entry(tag).or_insert(0) += n;
-                }
-            }
-        }
+        s.record_frame(us, idle, pending);
     }
 }
 
@@ -433,18 +559,30 @@ pub fn status_line() -> Option<String> {
     // アイドル再描画の**筆頭の犯人**をその場に出す。
     // 「アイドルなのに N fps 出ている」だけでは直せない — 誰が要求したかが
     // 見えて初めて手が付けられる (仮説から入って外し続けないため)。
+    // **自走している出所は名指しで出す** — 「アイドルなのに N fps 出ている」
+    // だけでは直せない。誰が次のフレームを予約し続けているかが見えて
+    // 初めて手が付く (仮説から入って外し続けないため)。
+    let always_on = s.always_on_sources();
     let top = s
         .repaint_ranking()
         .first()
-        .map(|(tag, n)| format!("  ← {tag} x{n}"))
+        .map(|(tag, n)| {
+            let mark = if always_on.iter().any(|(t, _)| t == tag) {
+                " 常時"
+            } else {
+                ""
+            };
+            format!("  ← {tag} x{n}{mark}")
+        })
         .unwrap_or_default();
     Some(format!(
-        "{} frames  p50 {:.1}ms  p95 {:.1}ms  max {:.1}ms  idle {:.1}/s{top}",
+        "{} frames  p50 {:.1}ms  p95 {:.1}ms  max {:.1}ms  idle {:.1}/s  req {}{top}",
         s.frames.count(),
         ms(s.frames.quantile(0.50)),
         ms(s.frames.quantile(0.95)),
         ms(s.frames.max_us()),
         s.idle_fps().unwrap_or(0.0),
+        s.idle_repaints(),
     ))
 }
 
@@ -489,6 +627,219 @@ mod tests {
             .report_lines("test")
             .iter()
             .any(|l| l.starts_with(TAG_REPAINT)));
+    }
+
+    // ── アイドルの検査 ────────────────────────────────────────────────
+    //
+    // **絶対時間で線を引かない。** ここで見るのは
+    //   (1) 要求の**回数** (2) 構造の**大きさ** (3) 入力を 2 倍にしたときの伸び
+    // だけ。実時間を読む `idle_fps` ではなく純粋な `idle_fps_over` を通す。
+    //
+    // 計測の本体はプロセス共通の `state()` に載るが、以下は全部
+    // **ローカルの `FrameStats`** を組み立てて回す。共有 static を触ると
+    // 同時に走っている他のテストの呼び出しが混ざる。
+
+    /// テスト用に `&'static str` のタグを n 個作る。
+    ///
+    /// 件数は呼ぶ側で有界にしてあるので、意図的に leak させる
+    /// (`&'static str` を要求する API を、確保無しで検査するため)。
+    fn tags(n: usize) -> Vec<&'static str> {
+        (0..n)
+            .map(|i| &*Box::leak(format!("t{i}").into_boxed_str()))
+            .collect()
+    }
+
+    /// **damage 駆動を守っていれば、放置しても再描画要求は 1 件も出ない。**
+    /// アイドルを N フレーム模擬して、内訳が空のままであることを見る。
+    #[test]
+    fn アイドルを続けても再描画要求は増えない() {
+        let mut s = FrameStats::new();
+        for _ in 0..600 {
+            s.record_frame(1_000, true, []);
+        }
+        assert_eq!(s.idle_frames, 600);
+        assert_eq!(s.idle_repaints(), 0);
+        assert!(
+            s.repaint_ranking().is_empty(),
+            "誰も要求していないのに内訳が出た: {:?}",
+            s.repaint_ranking()
+        );
+        assert!(s.always_on_sources().is_empty());
+        // レポートにも内訳行は出ない (常に 0 の行を並べない)
+        assert!(!s
+            .report_lines("test")
+            .iter()
+            .any(|l| l.starts_with(TAG_REPAINT)));
+    }
+
+    /// 実入力があったフレームの要求は数えない。
+    /// (入力に応じた再描画は正常なので、混ぜると本命が埋もれる。)
+    #[test]
+    fn 入力のあったフレームの要求は数えない() {
+        let mut s = FrameStats::new();
+        for _ in 0..100 {
+            s.record_frame(1_000, false, [("typing", 1)]);
+        }
+        assert_eq!(s.idle_frames, 0);
+        assert_eq!(s.idle_repaints(), 0);
+        assert!(s.repaint_ranking().is_empty());
+    }
+
+    /// **毎フレーム自分で次を呼んでいる出所は名指しで出る。**
+    /// たまに起こすだけの出所 (git ジョブ完了など) は出ない。
+    #[test]
+    fn 自走している出所だけが名指しされる() {
+        let mut s = FrameStats::new();
+        for i in 0..300 {
+            // spinner は毎フレーム、git_job_done は 1 回だけ。
+            let mut pending = vec![("spinner", 1)];
+            if i == 7 {
+                pending.push(("git_job_done", 1));
+            }
+            s.record_frame(1_000, true, pending);
+        }
+        assert_eq!(s.idle_repaints(), 301);
+        assert_eq!(
+            s.repaint_ranking(),
+            vec![("spinner", 300), ("git_job_done", 1)]
+        );
+        assert_eq!(
+            s.always_on_sources(),
+            vec![("spinner", 300)],
+            "毎フレーム要求している出所だけが自走"
+        );
+        // レポートの 1 行目にも犯人が載る (grep 1 発で分かる)
+        let head = &s.report_lines("test")[0];
+        assert!(head.contains("always_on=spinner"), "{head}");
+        assert!(head.contains("idle_repaints=301"), "{head}");
+    }
+
+    /// 犯人がいなくても鍵は残す (awk / diff で列がずれない)。
+    #[test]
+    fn 自走が無ければ犯人欄はハイフン() {
+        let mut s = FrameStats::new();
+        s.record_frame(1_000, true, []);
+        assert!(s.report_lines("test")[0].contains("always_on=-"));
+    }
+
+    /// アイドルフレームが 0 のときは犯人を名指ししない (標本が無いだけ)。
+    #[test]
+    fn 標本が無いのに犯人を名指ししない() {
+        let s = FrameStats::new();
+        assert!(s.always_on_sources().is_empty());
+        assert_eq!(s.idle_fps_over(1.0), Some(0.0));
+    }
+
+    /// `note_idle(true)` を N 回続けたあとのアイドル fps。
+    /// **実時間ではなく渡した経過**で割る (実測で線を引くと必ず嘘をつく)。
+    #[test]
+    fn アイドルfpsは経過ぶんで割った値になる() {
+        let mut s = FrameStats::new();
+        for _ in 0..120 {
+            s.record_frame(1_000, true, [("spinner", 1)]);
+        }
+        assert_eq!(s.idle_fps_over(2.0), Some(60.0));
+        assert_eq!(s.idle_repaint_rate_over(2.0), Some(60.0));
+        // 同じ標本でも経過が 2 倍なら fps は半分 (割り算が効いている)
+        assert_eq!(s.idle_fps_over(4.0), Some(30.0));
+        // 経過 0 / 負 / 非数では出さない (0 と偽らない)
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert_eq!(s.idle_fps_over(bad), None, "elapsed={bad}");
+            assert_eq!(s.idle_repaint_rate_over(bad), None, "elapsed={bad}");
+        }
+    }
+
+    /// **記録は O(1) メモリ。** 標本を 2 倍にしても表の大きさは 1 要素も増えない。
+    #[test]
+    fn 記録のメモリは標本数に依らない() {
+        let size = |n: usize| {
+            let mut s = FrameStats::new();
+            for i in 0..n {
+                // 値をばらけさせて、バケットを広く使わせる
+                s.record_frame((i as u64 % 50_000) + 1, true, [("spinner", 1)]);
+            }
+            (s.frames.buckets.len(), s.repaints.len(), s.frames.count())
+        };
+        let (b1, r1, c1) = size(1_000);
+        let (b2, r2, c2) = size(2_000);
+        assert_eq!(c2, c1 * 2, "標本は 2 倍になっている");
+        assert_eq!(b1, BUCKETS);
+        assert_eq!(b2, b1, "標本を 2 倍にしたらバケットが増えた (O(1) でない)");
+        assert_eq!((r1, r2), (1, 1), "出所は 1 種類のまま");
+    }
+
+    /// **出所の種類も O(1)。** 際限なく増える入力でも上限 + `other` で頭打ち。
+    #[test]
+    fn 出所の種類は上限で頭打ちになる() {
+        let all = tags(REPAINT_TAGS_CAP * 4);
+        let size = |n: usize| {
+            let mut s = FrameStats::new();
+            for t in &all[..n] {
+                s.record_frame(1_000, true, [(*t, 1)]);
+            }
+            (s.repaints.len(), s.idle_repaints())
+        };
+        let (small, _) = size(REPAINT_TAGS_CAP / 2);
+        assert_eq!(small, REPAINT_TAGS_CAP / 2, "上限までは素通し");
+        let (n2, sum2) = size(REPAINT_TAGS_CAP * 2);
+        let (n4, sum4) = size(REPAINT_TAGS_CAP * 4);
+        assert_eq!(n2, n4, "入力を 2 倍にしたら種類が増えた (O(1) でない)");
+        assert!(
+            n4 <= REPAINT_TAGS_CAP + 1,
+            "上限 + other を超えた: {n4} > {}",
+            REPAINT_TAGS_CAP + 1
+        );
+        // 溢れたぶんは捨てずに other へ足す (合計は入力と一致する)
+        assert_eq!(sum2 as usize, REPAINT_TAGS_CAP * 2);
+        assert_eq!(sum4 as usize, REPAINT_TAGS_CAP * 4);
+    }
+
+    /// **アイドルの定義は app.rs が持ち、perf は受け取るだけ** という配線を守る。
+    ///
+    /// `note_idle` が消えると、以降のレポートの `idle_frames` が永久に 0 に
+    /// なり、「アイドルでは何も起きていない」という静かな嘘が出る
+    /// (フレーム時間の数字は出続けるので気付けない)。
+    ///
+    /// ソースは `include_str!` ではなく実行時に読む — app.rs は 2MB 近くあり、
+    /// テストバイナリへ 2 本目の複製を入れると nextest の 1 件 1 プロセス起動が
+    /// そのぶん重くなる。改行は正規化する (Windows のチェックアウトは CRLF)。
+    #[test]
+    fn アイドル判定がappから渡されている() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("app.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()))
+            .replace("\r\n", "\n");
+        let call = src
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("crate::perf::note_idle("))
+            .unwrap_or_else(|| {
+                panic!("app.rs が perf::note_idle を呼んでいない (idle_frames が永久に 0 になる)")
+            });
+        assert!(
+            call.contains("had_input"),
+            "アイドル判定が入力の有無を見ていない: {call}"
+        );
+    }
+
+    /// 予約の秒数は「数字でない値を 0 扱いしない」。
+    /// 黙って 0 にすると起動直後に空のレポートが出て、
+    /// **「アイドルでは何も起きていない」という嘘**になる。
+    #[test]
+    fn 書き出し予約の秒数は不正な値を弾く() {
+        assert_eq!(
+            parse_dump_after("2.5"),
+            Some(std::time::Duration::from_millis(2500))
+        );
+        assert_eq!(
+            parse_dump_after("  30 "),
+            Some(std::time::Duration::from_secs(30))
+        );
+        for bad in ["", "0", "-1", "abc", "1s", "NaN", "inf"] {
+            assert_eq!(parse_dump_after(bad), None, "{bad:?} を受け取ってしまった");
+        }
     }
 
     // ── バケット ──────────────────────────────────────────────────────
