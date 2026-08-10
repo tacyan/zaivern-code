@@ -2410,7 +2410,10 @@ rename to new.rs
         // 共通入口そのものが、純粋判定へ委譲していること
         // (ここが空洞化すると全員が黙って false になる)。
         let entry = src
-            .split(concat!("pub fn merge_tree_", "available(dir: &Path) -> bool {"))
+            .split(concat!(
+                "pub fn merge_tree_",
+                "available(dir: &Path) -> bool {"
+            ))
             .nth(1)
             .expect("共通入口が見つからない");
         let entry = entry.split("\n}\n").next().expect("入口の終端");
