@@ -654,8 +654,8 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         _ => false,
     },
     draw: Some(draw),
-    settings: &[],
     binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 /// パネルの状態。**ウィンドウより長生きさせる** (設計原則 1) ため

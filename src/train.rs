@@ -2445,8 +2445,8 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // **閉じているときは 1 命令も走らない** (`draw` の先頭で即 return する)
     // ので、アイドル時のコストはゼロのまま。
     draw: Some(draw),
-    settings: &[],
     binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════

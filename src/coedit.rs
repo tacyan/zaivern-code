@@ -2098,8 +2098,8 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         _ => false,
     },
     draw: Some(draw),
-    settings: &[],
     binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -2856,6 +2856,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         default: crate::feature::SettingValue::Text(""),
     }],
     binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════

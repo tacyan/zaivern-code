@@ -17,6 +17,9 @@
 //!
 //! ## 書き方
 //!
+//! **`..Feature::DEFAULT` で締める** — 既定のままの欄は書かない。
+//! こうしておけば、後から誰が `Feature` に欄を足しても他のブランチが壊れない。
+//!
 //! ```ignore
 //! // src/features/marks.rs
 //! use crate::feature::{Entry, Feature};
@@ -28,8 +31,7 @@
 //!         "marks.list" => { app.open_marks(); true }
 //!         _ => false,
 //!     },
-//!     draw: None,
-//!     settings: &[],
+//!     ..Feature::DEFAULT
 //! };
 //! ```
 //!
