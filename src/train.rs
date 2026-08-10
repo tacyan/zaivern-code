@@ -34,6 +34,28 @@
 //! 4. **git を UI スレッドで待たない**。走査も実行も裏のスレッドへ逃がし、
 //!    描画には**いま手元にある値**を返す (古くてよい。数秒固まるのは許されない)。
 //!
+//! ## 順序付けが何を減らして何を減らさないか (実測。`tools/conflict-zero-bench.sh`)
+//!
+//! **誇張しないために、良くない数字も並べて書く。**
+//!
+//! | 人数 | train 順: 衝突マージ/ハンク | 素朴順 (作成順) | 最初の衝突までに入った本数 (train / 素朴) |
+//! |---:|---:|---:|---:|
+//! | 8 | 4/8 · 7 | 4/8 · 7 | 4 / 2 |
+//! | 16 | 9/16 · 19 | 11/16 · 19 | 7 / 2 |
+//! | 24 | 16/24 · 40 | 19/24 · 40 | 1 / 2 |
+//! | 32 | 23/32 · 56 | 27/32 · 56 | 1 / 2 |
+//!
+//! * **衝突ハンクの総量は全規模で完全に一致する** (7 / 19 / 40 / 56)。
+//!   **順序付けは衝突を 1 つも消さない。** 消したければ `lease.rs` や
+//!   `split.rs` のように「そもそも同じ行を 2 人に触らせない」側が要る。
+//! * 減るのは**止まる回数**だけ。16 人で 11 → 9 回、32 人で 27 → 23 回。
+//! * **24 人以上では「最初の衝突までに自動で入る本数」が素朴順より短くなる**
+//!   (1 本 vs 2 本)。重なりの少ない枝を先に流しても、全員が同じ数本の
+//!   ファイルに集まる規模になると 1 本目で当たる。**ここは負けている。**
+//! * 乾式検査の的中率は 5 規模すべて **100%** (3/3・5/5・8/8・2/2・2/2)。
+//!   最初に衝突する枝も、衝突ファイル集合も、`--dry-run` の終了コードも
+//!   実際の実行と一致した。**予告としては信用してよい。**
+//!
 //! ## 担保できないもの (正直に書く)
 //!
 //! * 乾式検査は**マージで近似**する。rebase はコミットを 1 つずつ当て直すので、
@@ -132,12 +154,35 @@ pub fn touch_from_edits(branch: &str, edits: &[FileEdit]) -> BranchTouch {
     t
 }
 
+/// [`touches_from_repo`] の結果。**上限で切ったぶんを必ず持って回る。**
+///
+/// 以前はここで `take(MAX_BRANCHES)` して**数える前に捨てていた**ので、
+/// 32 本渡しても `TrainPlan::dropped` が 0 のままになり、画面の
+/// 「N 本を超えたので M 本を載せていません」が**構造的に絶対出なかった**
+/// (実測ハーネスで発覚)。黙った打ち切りは「全部見た」と読めてしまうので、
+/// 上限そのものは残したまま、落とした本数だけは必ず外へ出す。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Touched {
+    pub items: Vec<BranchTouch>,
+    /// 費用上限 ([`MAX_BRANCHES`]) を超えたので**集めなかった**本数。
+    pub skipped: usize,
+}
+
 /// リポジトリから各ブランチの触った範囲を集める。
 ///
-/// **裏のスレッドから呼ぶこと。** ブランチ 1 本あたり git を 2 回起動する。
-pub fn touches_from_repo(repo: &Path, onto: &str, branches: &[String]) -> Vec<BranchTouch> {
+/// **裏のスレッドから呼ぶこと。** ブランチ 1 本あたり git を 2 回起動するので、
+/// [`MAX_BRANCHES`] で費用に歯止めを置く — が、**切った本数は
+/// [`Touched::skipped`] で必ず返す**。
+pub fn touches_from_repo(repo: &Path, onto: &str, branches: &[String]) -> Touched {
+    // 同じ名前を 2 度数えない (数えてから切らないと skipped が嘘になる)。
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let uniq: Vec<&String> = branches
+        .iter()
+        .filter(|b| !b.is_empty() && seen.insert(b.as_str()))
+        .collect();
+    let skipped = uniq.len().saturating_sub(MAX_BRANCHES);
     let mut out = Vec::new();
-    for b in branches.iter().take(MAX_BRANCHES) {
+    for b in uniq.into_iter().take(MAX_BRANCHES) {
         let base = git_out(repo, &["merge-base", onto, b])
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -161,7 +206,48 @@ pub fn touches_from_repo(repo: &Path, onto: &str, branches: &[String]) -> Vec<Br
         };
         out.push(touch_from_edits(b, &edits));
     }
-    out
+    Touched {
+        items: out,
+        skipped,
+    }
+}
+
+/// リポジトリから計画を作る。**`dropped` の合流点はここ 1 か所だけ。**
+///
+/// 収集側の上限 ([`Touched::skipped`]) と順序決定側の上限
+/// ([`TrainPlan::dropped`]) を足し込むのをここへ寄せているので、
+/// 呼び出し側が足し忘れて「黙って消える」事故が起こらない。
+///
+/// `held` は**いま動かせない**ブランチ (別のワークツリーが握っている)。
+/// 計画からは外さず、[`TrainStep::blocked_by`] に理由を書いて**残す** —
+/// 「並列で走らせている最中に、いま統合したらどうなるか」を知りたいのが
+/// `plan` の使い所なので、そこで 0 本しか出ないのでは意味がない。
+pub fn plan_from_repo(
+    repo: &Path,
+    onto: &str,
+    branches: &[String],
+    held: &[(String, PathBuf)],
+) -> RepoPlan {
+    let touched = touches_from_repo(repo, onto, branches);
+    let mut plan = plan_order(&touched.items);
+    plan.dropped += touched.skipped;
+    for step in &mut plan.steps {
+        step.blocked_by = held
+            .iter()
+            .find(|(n, _)| n == &step.branch)
+            .map(|(_, d)| d.display().to_string());
+    }
+    RepoPlan {
+        plan,
+        touches: touched.items,
+    }
+}
+
+/// [`plan_from_repo`] の結果。`touches` は衝突の相手を割り出すのに要る。
+#[derive(Clone, Debug, Default)]
+pub struct RepoPlan {
+    pub plan: TrainPlan,
+    pub touches: Vec<BranchTouch>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -249,6 +335,12 @@ pub struct TrainStep {
     pub overlaps: Vec<Overlap>,
     /// この段で予想される結果 = [`TrainStep::overlaps`] の最悪値。
     pub expect: Risk,
+    /// **いまは動かせない**理由 (握っているワークツリーの場所)。動かせるなら `None`。
+    ///
+    /// 純関数の [`plan_order`] は**必ず `None`** にする — リポジトリ側の事情は
+    /// [`plan_from_repo`] が後から埋める。`plan` は読み取りしかしないので
+    /// 握られていても計画に**載せる**が、`run` は載せない (`run_train` が拒否する)。
+    pub blocked_by: Option<String>,
 }
 
 /// 先に入るブランチ 1 本との重なり。
@@ -388,6 +480,8 @@ pub fn plan_order(touches: &[BranchTouch]) -> TrainPlan {
             files: by_name[name].files.len(),
             overlaps,
             expect,
+            // 純関数はリポジトリの事情を知らない。plan_from_repo が埋める。
+            blocked_by: None,
         });
     }
     TrainPlan {
@@ -756,8 +850,8 @@ pub fn run_train(req: &TrainRequest) -> Result<TrainReport, String> {
     }
 
     // ④ 順序を決める (純関数) → 乾式検査。
-    let touches = touches_from_repo(&top, &req.onto, &branches);
-    let plan = plan_order(&touches);
+    // ここへ来た時点で握られているブランチは弾いてあるので held は空でよい。
+    let RepoPlan { plan, touches } = plan_from_repo(&top, &req.onto, &branches, &[]);
     let order = plan.order();
     let dry = dry_run(&top, &req.onto, &order);
 
@@ -1007,6 +1101,18 @@ pub struct RowCells {
     pub hover: String,
 }
 
+/// **いま動かせる**段のブランチだけ (純関数)。
+///
+/// `plan` は握られている枝も載せるので、`run` へ渡す前に必ずここを通す。
+/// 分離の理由は [`plan_from_repo`] を参照 (`plan` は読み取り、`run` は書き込み)。
+pub fn runnable(plan: &TrainPlan) -> Vec<String> {
+    plan.steps
+        .iter()
+        .filter(|s| s.blocked_by.is_none())
+        .map(|s| s.branch.clone())
+        .collect()
+}
+
 /// 実行の進み具合。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RunPhase {
@@ -1058,6 +1164,9 @@ pub fn row_cells(
         format!("{} {}", step.expect.icon(), tr(step.expect.label()))
     };
     let status = match (report, phase) {
+        // **1 本ずつ区別する。** 握られている枝は「計画には載るが、いまは
+        // 動かせない」ので、待機とも失敗とも違う状態として出す。
+        (_, RunPhase::Idle) if step.blocked_by.is_some() => tr("🔒 作業中"),
         (_, RunPhase::Running) => tr("⏳ 実行中"),
         (Some(r), _) if r.merged.iter().any(|m| m == &step.branch) => tr("✅ 入った"),
         (Some(r), _) if r.stop.as_ref().is_some_and(|s| s.branch == step.branch) => {
@@ -1066,21 +1175,31 @@ pub fn row_cells(
         (Some(r), _) if r.stop.is_some() => tr("— 未実行"),
         _ => tr("待機"),
     };
-    let hover = if files.is_empty() {
+    let mut hover = if let Some(d) = &step.blocked_by {
+        trf(
+            "{b} は作業中のワークツリーが握っているので、いまは動かせません:\n{d}\n(計画には載せています。統合は worktree を畳んでから)",
+            &[("b", step.branch.clone()), ("d", d.clone())],
+        )
+    } else if files.is_empty() {
         trf(
             "{b}: 他のブランチと 1 ファイルも被っていません",
             &[("b", step.branch.clone())],
         )
     } else {
-        let mut s = files[..shown].join("\n");
+        String::new()
+    };
+    if !files.is_empty() {
+        if !hover.is_empty() {
+            hover.push('\n');
+        }
+        hover.push_str(&files[..shown].join("\n"));
         if files.len() > shown {
-            s.push_str(&trf(
+            hover.push_str(&trf(
                 "\nほか {n} ファイル",
                 &[("n", (files.len() - shown).to_string())],
             ));
         }
-        s
-    };
+    }
     RowCells {
         branch: step.branch.clone(),
         files: step.files.to_string(),
@@ -1103,7 +1222,6 @@ struct Snapshot {
     onto: String,
     plan: TrainPlan,
     dry: DryResult,
-    held: Vec<(String, PathBuf)>,
     note: Option<String>,
     cost: Duration,
 }
@@ -1169,16 +1287,24 @@ fn scan(root: PathBuf) -> Snapshot {
             ..Default::default()
         };
     }
+    // **計画は握られているブランチも含めて出す。** 走査は読み取りしかしない
+    // (merge-base / diff / merge-tree / commit-tree はどれも参照を動かさない)
+    // ので、作業中の相手を計画から外す理由が無い。外すと「並列で走らせている
+    // 最中に、いま統合したらどうなるか」という一番知りたい場面で 0 本になる。
     let cand = candidates(&top, &onto);
-    let touches = touches_from_repo(&top, &onto, &cand.free);
-    let plan = plan_order(&touches);
+    let all: Vec<String> = cand
+        .free
+        .iter()
+        .cloned()
+        .chain(cand.held.iter().map(|(b, _)| b.clone()))
+        .collect();
+    let RepoPlan { plan, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
     let dry = dry_run(&top, &onto, &plan.order());
     Snapshot {
         repo: top,
         onto,
         plan,
         dry,
-        held: cand.held,
         note: None,
         cost: t0.elapsed(),
     }
@@ -1203,7 +1329,9 @@ fn start_run(st: &mut PanelState) {
     let req = TrainRequest {
         repo: st.snap.repo.clone(),
         onto: st.snap.onto.clone(),
-        branches: st.snap.plan.order(),
+        // **握られている枝は渡さない。** 計画には載っているが、作業中の
+        // エージェントの足元で履歴を書き換えないため run からは外す。
+        branches: runnable(&st.snap.plan),
         dry_run: false,
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1364,12 +1492,20 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = st.run_rx.is_some();
-            let ready = !st.snap.plan.steps.is_empty() && !st.snap.onto.is_empty();
+            let free = runnable(&st.snap.plan).len();
+            let blocked = st.snap.plan.steps.len() - free;
+            let ready = free > 0 && !st.snap.onto.is_empty();
+            let hint = if blocked > 0 {
+                trf(
+                    "動かせる {n} 本だけを順に rebase して fast-forward します (作業中の {m} 本は外します)。失敗したら即止めて、開始時の状態へ全部戻します。",
+                    &[("n", free.to_string()), ("m", blocked.to_string())],
+                )
+            } else {
+                tr("順に rebase して fast-forward します。失敗したら即止めて、開始時の状態へ全部戻します。")
+            };
             if ui
                 .add_enabled(!busy && ready, egui::Button::new(tr("統合を開始")))
-                .on_hover_text(tr(
-                    "順に rebase して fast-forward します。失敗したら即止めて、開始時の状態へ全部戻します。",
-                ))
+                .on_hover_text(hint)
                 .clicked()
             {
                 act = Act::Run;
@@ -1393,26 +1529,6 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
     if let Some(e) = &st.error {
         ui.colored_label(vis.error_fg_color, format!("⛔ {e}"));
     }
-    if !st.snap.held.is_empty() {
-        let list = st
-            .snap
-            .held
-            .iter()
-            .map(|(b, _)| b.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        ui.label(
-            egui::RichText::new(trf(
-                "別のワークツリーが使用中のため外したブランチ: {list}",
-                &[("list", list.clone())],
-            ))
-            .small()
-            .color(dim),
-        )
-        .on_hover_text(tr(
-            "作業中のエージェントの足元で履歴を書き換えないため、対象から外しています。",
-        ));
-    }
     if st.snap.plan.dropped > 0 {
         ui.colored_label(
             vis.warn_fg_color,
@@ -1427,7 +1543,7 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
     }
 
     if st.snap.plan.steps.is_empty() {
-        empty_state(ui, st);
+        empty_state(ui);
         return act;
     }
 
@@ -1543,11 +1659,10 @@ fn stop_detail(ui: &mut egui::Ui, stop: &TrainStop, restored: Option<bool>) {
 }
 
 /// 空状態。**利用可能領域の中央に 1 枚のカード**で出す。
-fn empty_state(ui: &mut egui::Ui, st: &PanelState) {
+fn empty_state(ui: &mut egui::Ui) {
     let vis = ui.visuals().clone();
     let avail = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let card = empty_card(avail);
-    let held = st.snap.held.len();
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(card), |ui| {
         egui::Frame::none()
             .fill(vis.faint_bg_color)
@@ -1563,14 +1678,9 @@ fn empty_state(ui: &mut egui::Ui, st: &PanelState) {
                     ui.label(egui::RichText::new(tr("統合を待っているブランチはありません")).size(14.0));
                     ui.add_space(space::XS);
                     ui.label(
-                        egui::RichText::new(if held > 0 {
-                            trf(
-                                "{n} 本は別のワークツリーが使用中なので外しています",
-                                &[("n", held.to_string())],
-                            )
-                        } else {
-                            tr("統合先より先に進んでいるローカルブランチだけを載せます")
-                        })
+                        egui::RichText::new(tr(
+                            "統合先より先に進んでいるローカルブランチを載せます (作業中のワークツリーが握っているものも、計画には出します)",
+                        ))
                         .small()
                         .color(vis.weak_text_color()),
                     );
@@ -1638,9 +1748,10 @@ fn parse_flags(args: &[String], allow_dry: bool) -> Result<Flags, String> {
 /// `zai train <sub>` の実体。argv は `"train"` の**次**から渡される。
 /// 戻り値は終了コード (0=成功 / 1=衝突で停止 / 2=使い方の誤り)。
 ///
-/// **`src/cli.rs` は共有ファイルなので触っていない。** 配線 (`"train" =>
-/// train::cli_main(&args[1..])` の 1 行) は統合担当が入れる。それまでこの
 /// `zai train <sub>` の実体。`src/cli.rs` の dispatch から呼ばれる。
+///
+/// `plan` は**握られているブランチも含めて**計画を出す (読み取りだけ)。
+/// `run` は動かせるものだけを対象にし、握られた枝を明示的に渡されたら拒否する。
 pub fn cli_main(argv: &[String]) -> i32 {
     let Some(sub) = argv.first().map(String::as_str) else {
         print!("{}", usage());
@@ -1671,9 +1782,12 @@ pub fn cli_main(argv: &[String]) -> i32 {
 #[derive(Serialize)]
 struct PlanOut {
     onto: String,
+    /// 各段の `blocked_by` に「いま動かせない理由」が**1 本ずつ**入る。
+    /// まとめた一覧を別に持つと 2 か所がずれるので、ここには置かない。
     plan: TrainPlan,
     dry: DryResult,
-    held: Vec<String>,
+    /// この計画のうち、いま `run` に回せる本数。
+    runnable: usize,
 }
 
 fn cli_plan(args: &[String]) -> i32 {
@@ -1697,15 +1811,22 @@ fn cli_plan(args: &[String]) -> i32 {
         eprintln!("{}", tr("統合先のブランチが分かりません (--onto で指定してください)"));
         return 2;
     }
+    // **plan は握られている枝も載せる** (読み取りしかしないので安全で、
+    // 「並列で走らせている最中の見通し」がこのコマンドの使い所)。
     let cand = candidates(&top, &onto);
-    let touches = touches_from_repo(&top, &onto, &cand.free);
-    let plan = plan_order(&touches);
+    let all: Vec<String> = cand
+        .free
+        .iter()
+        .cloned()
+        .chain(cand.held.iter().map(|(b, _)| b.clone()))
+        .collect();
+    let RepoPlan { plan, .. } = plan_from_repo(&top, &onto, &all, &cand.held);
     let dry = dry_run(&top, &onto, &plan.order());
     let out = PlanOut {
         onto,
+        runnable: runnable(&plan).len(),
         plan,
         dry,
-        held: cand.held.into_iter().map(|(b, _)| b).collect(),
     };
     if f.json {
         match serde_json::to_string_pretty(&out) {
@@ -1723,14 +1844,35 @@ fn cli_plan(args: &[String]) -> i32 {
     }
     for s in &out.plan.steps {
         let c = row_cells(s, &out.dry, None, RunPhase::Idle);
-        println!("{:>2}. {:<28} {:>4}  {}", s.position + 1, c.branch, c.files, c.expect);
+        println!(
+            "{:>2}. {:<28} {:>4}  {:<26} {}",
+            s.position + 1,
+            c.branch,
+            c.files,
+            c.expect,
+            c.status
+        );
     }
-    if !out.held.is_empty() {
+    // **黙って切らない。** 上限で落としたぶんは必ず件数で出す。
+    if out.plan.dropped > 0 {
         println!(
             "{}",
             trf(
-                "別のワークツリーが使用中: {list}",
-                &[("list", out.held.join(", "))]
+                "⚠ 上限 {n} 本で打ち切りました (残り {m} 本は見ていません)",
+                &[
+                    ("n", MAX_BRANCHES.to_string()),
+                    ("m", out.plan.dropped.to_string())
+                ]
+            )
+        );
+    }
+    let blocked = out.plan.steps.len() - out.runnable;
+    if blocked > 0 {
+        println!(
+            "{}",
+            trf(
+                "🔒 {m} 本は作業中のワークツリーが握っているので、いまは動かせません (計画には載せています)",
+                &[("m", blocked.to_string())]
             )
         );
     }
@@ -1958,6 +2100,10 @@ mod tests {
         assert_eq!(last.overlaps.len(), 1);
     }
 
+    /// [`plan_order`] **単体**の上限。収集側 (`touches_from_repo`) を通る経路は
+    /// 下の `実リポジトリでも上限で落とした本数が消えない` が見る — 以前は
+    /// 収集側が数える前に切っていたので、この直接テストだけが緑で
+    /// **実際には dropped が常に 0** だった。
     #[test]
     fn 上限を超えたぶんは黙って捨てずに数える() {
         let input: Vec<BranchTouch> = (0..MAX_BRANCHES + 3)
@@ -2083,6 +2229,7 @@ mod tests {
                 "run_train(",
                 "dry_run(",
                 "touches_from_repo(",
+                "plan_from_repo(",
                 "candidates(",
                 ".output()",
             ] {
@@ -2380,6 +2527,109 @@ mod tests {
         // 実行は成功して 0
         assert_eq!(cli_main(&s(&["run", "--repo", &repo, "--onto", "base"])), 0);
         assert_eq!(r.git(&["show", "base:solo.txt"]).trim(), "f1");
+    }
+
+    /// **収集側の上限で落とした本数が消えない。**
+    ///
+    /// 以前は `touches_from_repo` が `take(MAX_BRANCHES)` で**数える前に**
+    /// 捨てていたので、32 本渡しても `dropped` が 0 のままだった
+    /// (= 画面の「N 本を超えたので M 本を載せていません」が絶対に出ない)。
+    /// 黙った打ち切りは「全部見た」と読めてしまうので、上限は残したまま
+    /// 落とした本数だけは必ず外へ出す。
+    #[test]
+    fn 実リポジトリでも上限で落とした本数が消えない() {
+        let Some(r) = make_repo("cap") else { return };
+        let over = 8usize;
+        let names: Vec<String> = (0..MAX_BRANCHES + over)
+            .map(|i| format!("cap{i:03}"))
+            .collect();
+        for (i, b) in names.iter().enumerate() {
+            r.git(&["checkout", "--quiet", "-b", b, "base"]);
+            r.commit(&format!("f{i:03}.txt"), &format!("{i}\n"), b);
+        }
+        r.git(&["checkout", "--quiet", "base"]);
+
+        let touched = touches_from_repo(&r.0, "base", &names);
+        assert_eq!(touched.items.len(), MAX_BRANCHES, "費用上限は効いたまま");
+        assert_eq!(touched.skipped, over, "落とした本数を返す");
+
+        // **旧実装の形をそのまま再現すると 0 になる。** 収集で切ってから
+        // 数えても、切られた 8 本は plan_order の目に一度も入らない。
+        assert_eq!(
+            plan_order(&touched.items).dropped,
+            0,
+            "収集側で切った後に数えても落とした本数は出てこない (これが元のバグ)"
+        );
+
+        let RepoPlan { plan, .. } = plan_from_repo(&r.0, "base", &names, &[]);
+        assert_eq!(plan.steps.len(), MAX_BRANCHES);
+        assert_eq!(plan.dropped, over, "黙って消えない (画面と --json に出る)");
+        // --json にそのまま載ること (消費側が気付ける形で出ているか)。
+        let json = serde_json::to_string(&plan).expect("JSON 化できる");
+        assert!(json.contains(&format!("\"dropped\":{over}")), "{json:.200}");
+    }
+
+    /// **`plan` は握られている枝も載せ、`run` だけが拒否する。**
+    ///
+    /// 「並列で走らせている最中に、いま統合したらどうなるか」を知りたいのが
+    /// `plan` の使い所なので、そこで 0 本しか出ないのでは意味が無い。
+    /// `plan` は読み取りしかしない (merge-base / diff / merge-tree /
+    /// commit-tree はどれも参照を動かさない) ので載せて安全。
+    #[test]
+    fn 作業中のブランチは計画に載るが実行からは外れる() {
+        let Some(r) = make_repo("held") else { return };
+        r.git(&["checkout", "--quiet", "-b", "busy", "base"]);
+        r.commit("solo.txt", "busy\n", "busy");
+        r.git(&["checkout", "--quiet", "-b", "idle", "base"]);
+        r.commit("other.txt", "idle\n", "idle");
+        r.git(&["checkout", "--quiet", "base"]);
+        // `Repo` は Drop でディレクトリを消すだけなので、置き場の後始末に使う。
+        let hold = Repo(crate::test_util::unique_temp_dir("zv-train", "wt"));
+        let wt = hold.0.join("busy-wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        r.git(&["worktree", "add", "--quiet", &wt_s, "busy"]);
+
+        let cand = candidates(&r.0, "base");
+        assert_eq!(cand.free, vec!["idle"], "動かせるのは idle だけ");
+        assert_eq!(cand.held.len(), 1);
+        assert_eq!(cand.held[0].0, "busy");
+
+        // 計画には 2 本とも載り、**1 本ずつ**区別が付く。
+        let all: Vec<String> = vec!["busy".into(), "idle".into()];
+        let RepoPlan { plan, .. } = plan_from_repo(&r.0, "base", &all, &cand.held);
+        assert_eq!(plan.steps.len(), 2, "作業中でも計画からは外さない");
+        let busy = plan
+            .steps
+            .iter()
+            .find(|s| s.branch == "busy")
+            .expect("busy が計画に載っている");
+        let idle = plan
+            .steps
+            .iter()
+            .find(|s| s.branch == "idle")
+            .expect("idle が計画に載っている");
+        assert!(busy.blocked_by.is_some(), "作業中だと 1 本ずつ分かる");
+        assert!(idle.blocked_by.is_none());
+        // JSON にも 1 本ずつ出る。
+        let json = serde_json::to_string(&plan).expect("JSON 化できる");
+        assert!(json.contains("blocked_by"), "{json:.200}");
+        // 画面の状態列にも出る。
+        let cells = row_cells(busy, &DryResult::default(), None, RunPhase::Idle);
+        assert!(cells.status.contains("作業中"), "{}", cells.status);
+
+        // run へ回るのは動かせるものだけ。
+        assert_eq!(runnable(&plan), vec!["idle"]);
+        // 握られた枝を明示的に渡したら **run は拒否する** (fail-closed)。
+        let err = run_train(&TrainRequest {
+            repo: r.0.clone(),
+            onto: "base".into(),
+            branches: vec!["busy".into()],
+            dry_run: true,
+        })
+        .expect_err("作業中の枝は動かさない");
+        assert!(err.contains("busy"), "{err}");
+
+        r.git(&["worktree", "remove", "--force", &wt_s]);
     }
 
     #[test]
