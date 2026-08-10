@@ -161,20 +161,69 @@ const FNV_PRIME:  u64 = 0x0000_0100_0000_01b3;
 「データを書いた版と同じ `DefaultHasher` を持つ rustc でビルドされている間」
 だけである。**移行を先送りするほど引き取れる保証が薄くなる**ので、今入れた。
 
-## まだ揃っていないもの
+## キーは 2 つ、旧キーは 3 つ
 
-`workspace_key` を通っていない、**別々に計算されている同種のキー**が残っている。
-どれも同じフォルダに対して**違う値**になるので、寄せるまでは別々の置き場のままになる。
+**新しく書く値は 2 つしかない。**
 
-- `session.rs:228 workspace_hash` — `canonicalize` 後の **`Path` を** `DefaultHasher` に
-  かける (こちらは文字列をかけていた)。`Path::hash` と `str::hash` は別の値を出すので、
-  ドキュメントの「`history` と同じ流儀」は**事実ではない** (実測: 同じフォルダで
-  `7d04257970e725eb` と `be6ef641440bbada`)。`term_logs/<hash>/` の置き場でもある。
-- `session.rs:128 roots_hash` — ルート集合版。マルチルートは 1 本にできないので、
-  「集合を `/` 区切りで繋いで `workspace_key` と同じ写像へ流す」形にするのが筋。
-- `marks.rs:905 workspace_key` — `session.rs` と同じ流儀の私的な複製。
-- `mesh.rs:446 short_hash` — 任意文字列版。コメントは「`history::workspace_key` と
-  同じ流儀」と書いてあるが、こちらも `DefaultHasher`。
+| 何のキーか | 関数 | 置き場の例 |
+|---|---|---|
+| 単一フォルダ | `history::workspace_key(cwd)` | `lease/<key>.json` / `czero/<key>/` / `local_history/<key>/` / `history/<agent>/<key>.jsonl` / `term_logs/<key>/` / `bookmarks/<key>.toml` |
+| ルート**集合** | `history::workspace_set_key(roots)` (`src/history.rs:263`) | `sessions/<key>.toml` / `hotexit/<key>/` |
 
-寄せるときは、**この文書の移行 (改名) をそれぞれの旧キーに対しても走らせること**。
-`adopt_legacy_keys_in` は旧キーと新キーを引数で受ける形へ一般化すれば再利用できる。
+集合版は単一版と同じ正規化・同じ FNV-1a を通すが、**畳み方が違うので
+1 要素の集合と単一キーはわざと別の値になる**。同じにすると `sessions/` の中で
+旧形式 (単一パス) と新形式 (集合) のファイルが同じ名前を取り合う。
+集合版が満たす性質は 2 つ:
+
+1. **順序に依らない。** 並べ替えてから畳むので `[A, B]` と `[B, A]` は同じ。
+   重複も畳む (`[A, A]` は `[A]`)。
+2. **要素の境界が一意に決まる。** 区切り文字で繋ぐと、その文字を含むパス名
+   (unix では改行すら合法) で別の集合が同じ列になる。そこで**長さを 10 進で
+   前置する** (netstring と同じ)。
+
+**引き取る旧キーは 3 種類**。層ごとに別々の値が使われていたので、
+1 本のリストで受けてまとめて改名する。
+
+| 旧キー | 何を `DefaultHasher` へ流していたか | 使っていた層 |
+|---|---|---|
+| `legacy_workspace_key` (`src/history.rs:433`) | `canonicalize` したパスの**文字列** | `history` / `lease` / `czero` / `local_history` |
+| `legacy_path_key` (`src/history.rs:446`) | `canonicalize` した **`Path` そのもの** | `term_logs/<key>/` / `bookmarks/<key>.toml` |
+| `legacy_roots_key` (`src/history.rs:458`) | ソート済みの `Vec<String>` (ルート集合) | `sessions/<key>.toml` / `hotexit/<key>/` |
+
+`Path: Hash` は構成要素ごとに書き込むので、**同じフォルダでも文字列版と別の値**になる
+(実測: `7d04257970e725eb` と `be6ef641440bbada`)。以前この文書と `session.rs` の
+コメントが「`history` と同じ流儀」と書いていたのは**事実ではなかった**。
+
+`legacy_keys_of(cwd)` (`src/history.rs:480`) が単一パスの 2 種類を返し、
+`adopt_keys_in(zdir, olds, new)` (`src/history.rs:533`) がまとめて改名する。
+ルート集合版は `session.rs:121` が `legacy_roots_key` を直接渡して同じ経路へ乗せる。
+呼び出し口は `history::append` / `history::list_all` / `session` の保存入口 /
+`marks.rs:1392` / `cli.rs:469` / `cli.rs:1646` で、`adopt_keys` が
+**旧キーの組ごとに 1 プロセス 1 回**しか走らないよう記憶する。
+
+### 番人テスト
+
+`history::tests::ワークスペースキーを計算するのはこのモジュールだけ`
+(`src/history.rs:1366`) が `src/` を全走査して、**`history.rs` 以外で
+自前のワークスペースキーを組み立てていないか**を構造で弾く。捕まえるのは 2 つ:
+
+- `format!("{:016x}", …finish())` — 自前ハッシュから 16 桁キーを作っている
+- `canonicalize()` を含む関数の中に `finish()` か `fnv1a64` がある —
+  正規化したパスを直接ハッシュしている
+
+このテストは**探す語を実行時に組み立てる**。ソースへ直に書くとテスト自身が
+検出対象になるため (実際に踏んだ)。CRLF も正規化してから探す。
+
+この検査を入れた結果、`session.rs` の `workspace_hash` / `roots_hash` と
+`marks.rs` の私的な複製は**関数ごと消えて** `history::workspace_key` /
+`workspace_set_key` の呼び出しになった (`src/session.rs:176` / `src/session.rs:609` /
+`src/marks.rs:906`)。`grep -rn "fn workspace_hash\|fn roots_hash" src/` は **0 件**。
+
+`mesh.rs:453` の `short_hash` は**ワークスペースキーではない** (入力は Pid /
+登録名 / 担当キーで、パスの正規化を通してはいけない) ので寄せずに残したが、
+`DefaultHasher` から `history::fnv1a64` へ替えた。理由は同じで、rustc を上げると
+名前登録と担当のファイル名が総入れ替わりになるため。
+
+`DefaultHasher` は `src/` にまだ残っているが、**キーで置き場を決めない用途だけ**
+(`failover.rs` / `supervisor.rs` / `terminal.rs` / `conflict.rs` のプロセス内の
+一時的な同一性判定)。ディスクへ残る名前には 1 つも使っていない。
