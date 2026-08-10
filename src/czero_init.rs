@@ -152,6 +152,42 @@ const ATTR_END: &str = "# zaivern:union-managed-end";
 /// ドライバ側が降りるので**安全側に倒れる**。
 const LIST_PATTERNS: &[&str] = &["*.md", "*.toml", "*.txt", "*.json", "*.yaml", "*.yml"];
 
+/// 既存の pre-commit フレームワークの目印。**`(名前, リポジトリ頂点からの相対パス)`。**
+///
+/// 見つけたら「共存できるか / 上書きしてしまうか」を出す。**黙って壊さない**のが
+/// この機能で一番大事な性質なので、名前を増やすのはここへ 1 行足すだけにする。
+const HOOK_FRAMEWORKS: &[(&str, &str)] = &[
+    ("husky", ".husky"),
+    ("pre-commit", ".pre-commit-config.yaml"),
+    ("pre-commit", ".pre-commit-config.yml"),
+    ("lefthook", "lefthook.yml"),
+    ("lefthook", "lefthook.yaml"),
+    ("lefthook", "lefthook.toml"),
+    ("lefthook", ".lefthook.yml"),
+    ("lefthook", ".lefthook.yaml"),
+    ("overcommit", ".overcommit.yml"),
+];
+
+/// `.git/index` がこの大きさを超えたら「巨大」として扱う。
+///
+/// index の 1 件は概ね 62 バイト + パス長なので、32MiB は**おおよそ 30 万件**。
+/// ここを超えると `git ls-files -- <パターン>` を 6 回叩く診断が体感で遅くなる。
+/// **判定に使うのは「遅い可能性がある」という注記だけ**で、緑/赤は動かさない。
+const HUGE_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+
+// **ネットワーク FS を所要時間から当てるのはやめた (撤回の記録)。**
+//
+// 「下見が 2 秒を超えたら遅い置き場」という注記を入れて実測したら、
+// **ローカルの tmpfs に作った空リポジトリでも毎回 1.7〜2.3 秒**出た。
+// 内訳は形態の下見ではなく、`shellenv::resolve_path` が最初の 1 回だけ
+// **ログイン + 対話シェルを起こして PATH を解決する**コスト (プロセス
+// 全体で 1 回・OnceLock で共有) だった。git 呼び出し自体は 1 回 30〜64ms。
+//
+// つまりこの数字は「リポジトリの置き場が遅いか」を 1 ミリも測っていない。
+// 絶対時間で線を引くと必ず嘘をつく (CLAUDE.md) の実例なので、**判定ごと
+// 撤回する**。巨大さは時間ではなく [`HUGE_INDEX_BYTES`] という構造の
+// 大きさで見る。
+
 /// `verify` が使い捨ての作業を作るときの名前の接頭辞。
 /// 置き場は [`std::env::temp_dir`] 由来で、パスの直書きは 1 文字も無い。
 const SCRATCH_PREFIX: &str = "zaivern-czero-verify";
@@ -179,6 +215,10 @@ const VERIFY_MARKER_SIZE: &str = "7";
 /// 入っていない状態でも「有効」と言えてしまう。段ごとに出す。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
+    /// **リポジトリの形態**。sparse-checkout / LFS / submodule / bare / 非 git など、
+    /// 「どのリポジトリでも動く」の反例になり得るもの。ここが判らないまま
+    /// 下の段を緑にしても、**何を保証したのかが判らない**。
+    Shape,
     /// この `zai` が CLI サブコマンドを受け付けるか (フックと driver の前提)。
     Wiring,
     /// 行域の台帳 (`~/.zaivern/leases/<キー>.json`)。
@@ -195,6 +235,7 @@ pub enum Stage {
 
 /// 段の一覧。**出力の並びはこれで固定**する (決定的)。
 pub const STAGES: &[Stage] = &[
+    Stage::Shape,
     Stage::Wiring,
     Stage::Ledger,
     Stage::Hooks,
@@ -207,6 +248,7 @@ impl Stage {
     /// JSON に載る安定キー。**画面表記が変わっても機械の読み手を壊さない。**
     pub fn key(self) -> &'static str {
         match self {
+            Stage::Shape => "shape",
             Stage::Wiring => "wiring",
             Stage::Ledger => "ledger",
             Stage::Hooks => "hooks",
@@ -219,6 +261,7 @@ impl Stage {
     /// 画面に出す見出し。**日本語の原文**を置く (表示時に [`tr`] を通す)。
     pub fn label(self) -> &'static str {
         match self {
+            Stage::Shape => "リポジトリの形態",
             Stage::Wiring => "CLI の配線",
             Stage::Ledger => "行域の台帳",
             Stage::Hooks => "git フック",
@@ -553,12 +596,12 @@ fn read_hooks(repo: &Path) -> Result<Hooks, String> {
     Ok(Hooks { dir, rows })
 }
 
-/// `git check-attr merge -- <path>` の値。**glob の解釈を git 自身に訊く。**
+/// `git check-attr <name> -- <path>` の値。**glob の解釈を git 自身に訊く。**
 ///
-/// 出力は `<path>: merge: <value>` なので、最後の `": "` の後ろを取る
+/// 出力は `<path>: <name>: <value>` なので、最後の `": "` の後ろを取る
 /// (パスに `: ` が入っていても壊れない)。
-fn attr_value(repo: &Path, probe: &str) -> String {
-    let out = git(repo, &["check-attr", "merge", "--", probe]).unwrap_or_default();
+fn attr_value(repo: &Path, name: &str, probe: &str) -> String {
+    let out = git(repo, &["check-attr", name, "--", probe]).unwrap_or_default();
     out.rsplit_once(": ")
         .map(|(_, v)| v.trim().to_string())
         .unwrap_or_default()
@@ -734,6 +777,359 @@ fn driver_uninstall(repo: &Path) -> usize {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  4.5. リポジトリの形態 — 「どのリポジトリでも動く」の反例を先に数える
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// このリポジトリが**どういう形をしているか**。
+///
+/// ## なぜ要るのか
+///
+/// 台帳・フック・driver・`.gitattributes` が全部緑でも、それは
+/// **「普通の作業ツリーなら守られる」**しか言っていない。sparse-checkout で
+/// 作業ツリーに無いパス、LFS のポインタ、submodule の中、bare リポジトリ —
+/// どれも上の 4 段の外側にあり、**緑のまま素通りする**。
+///
+/// 「未検証」を「安全」と書かないために、形態を先に数えて
+/// **何が保証され、何が保証されないか**を段として出す。
+///
+/// ## 集める側の約束
+///
+/// * git は**下見のあいだ最大 5 回**しか叩かない (遅い置き場で往復を増やさない)。
+/// * どの項目も**失敗したら「判らない」に倒す** — 判らないものを緑にしない。
+/// * パスの直書きは 1 文字も無い (すべて git と [`std::path`] 由来)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shape {
+    /// 診断を始めた場所 (`--repo` かカレント)。
+    pub start: PathBuf,
+    /// 作業ツリーの頂点。**bare と非 git では `None`。**
+    pub root: Option<PathBuf>,
+    /// このツリーの git ディレクトリ (linked worktree なら `.git/worktrees/<名>`)。
+    pub git_dir: Option<PathBuf>,
+    /// 共有の git ディレクトリ (`.git/config` と `hooks/` が居る側)。
+    pub common_dir: Option<PathBuf>,
+    /// bare リポジトリ (作業ツリーが無い)。
+    pub bare: bool,
+    /// linked worktree (`git worktree add` で切ったツリー)。
+    pub linked_worktree: bool,
+    /// submodule の中に居る。
+    pub inside_submodule: bool,
+    /// このリポジトリが抱えている submodule のパス (`.gitmodules` 由来・決定的)。
+    pub submodules: Vec<String>,
+    /// sparse-checkout が有効。
+    pub sparse: bool,
+    /// shallow clone (`.git/shallow` が居る)。
+    pub shallow: bool,
+    /// git-lfs のフィルタが設定されている。
+    pub lfs: bool,
+    /// **`filter=lfs` なのに `merge` が空いている**パターン (union を当てると壊れる)。
+    pub lfs_unsafe: Vec<String>,
+    /// `core.hooksPath` が設定されているときの値 (既定なら `None`)。
+    pub hooks_path: Option<String>,
+    /// 見つかった既存の pre-commit フレームワーク (重複なし・決定的)。
+    pub frameworks: Vec<&'static str>,
+    /// 頂点がシンボリックリンク越しだったときの実体。
+    pub symlinked: Option<PathBuf>,
+    /// 書けなかった場所の説明 (空なら書けた)。
+    pub unwritable: Vec<String>,
+    /// `.git/index` の大きさ (バイト)。0 は「読めなかった」。
+    pub index_bytes: u64,
+}
+
+impl Shape {
+    /// git リポジトリとして認識できたか。
+    pub fn is_git(&self) -> bool {
+        self.git_dir.is_some()
+    }
+
+    /// `git -C` の相手にする場所。**bare でも git は答えられる。**
+    pub fn probe_dir(&self) -> &Path {
+        self.root
+            .as_deref()
+            .or(self.git_dir.as_deref())
+            .unwrap_or(&self.start)
+    }
+
+    /// 作業ツリーが無いときの理由 (`init` / `verify` がそのまま返す 1 行)。
+    pub fn no_worktree_reason(&self) -> String {
+        if self.bare {
+            trf(
+                "bare リポジトリなので作業ツリーがありません: {p} (czero は作業ツリーへ .gitattributes を書き、pre-commit で止めるので、bare には入りません。clone した作業ツリー側で実行してください)",
+                &[("p", self.probe_dir().display().to_string())],
+            )
+        } else {
+            trf(
+                "git リポジトリではありません: {p} (czero init は git rev-parse --show-toplevel を要求します)",
+                &[("p", self.start.display().to_string())],
+            )
+        }
+    }
+
+    /// 実証 ([`verify`]) が**扱えていない**形態の注記。空なら注記なし。
+    ///
+    /// 実証は使い捨てリポジトリで行うので、対象リポジトリ固有の形態は
+    /// 1 つも通っていない。**「守られています」と出すときに、この行を
+    /// 一緒に出さないと静かな嘘になる。**
+    pub fn untested_notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.sparse {
+            out.push(tr(
+                "sparse-checkout — 実証は全ファイルが揃った使い捨てツリーで行っています",
+            ));
+        }
+        if !self.lfs_unsafe.is_empty() {
+            out.push(trf(
+                "git-lfs — union が当たっているのに merge=lfs が無いパターンがあります: {list}",
+                &[("list", self.lfs_unsafe.join(" "))],
+            ));
+        } else if self.lfs {
+            out.push(tr("git-lfs — 実証は LFS を使っていません"));
+        }
+        if !self.submodules.is_empty() {
+            out.push(trf(
+                "submodule {n} 件 — 実証は submodule を作っていません (submodule は別リポジトリなので個別に導入が要ります)",
+                &[("n", self.submodules.len().to_string())],
+            ));
+        }
+        if self.linked_worktree {
+            out.push(tr(
+                "linked worktree — 実証は本体ツリーだけを作っています",
+            ));
+        }
+        if !self.frameworks.is_empty() {
+            out.push(trf(
+                "既存のフックフレームワーク ({list}) — 実証は素のフックだけを試しています",
+                &[("list", self.frameworks.join(" "))],
+            ));
+        }
+        out
+    }
+}
+
+/// `git rev-parse` の答えを 1 行ずつ。**失敗したら空** (判らないものは埋めない)。
+fn rev_parse(start: &Path, args: &[&str]) -> Vec<String> {
+    let mut v = vec!["rev-parse"];
+    v.extend_from_slice(args);
+    git(start, &v)
+        .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// 存在すれば実体へ寄せる。**比較する前に必ず通す。**
+fn canon(p: PathBuf) -> PathBuf {
+    p.canonicalize().unwrap_or(p)
+}
+
+/// git が返したパスを絶対に寄せる (相対なら `base` から解く)。
+fn abs_from(base: &Path, raw: &str) -> Option<PathBuf> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(t);
+    Some(if p.is_absolute() { p } else { base.join(p) })
+}
+
+/// その場所へ**書けるか**を、消える一時ファイル 1 つで確かめる。
+///
+/// `metadata().permissions().readonly()` は unix では「誰も書けない」しか
+/// 見ないので、他人の所有物 (0755) を「書ける」と答えてしまう。
+/// **実際に作って消す**のが唯一正しい答えだが、作業ツリーへ置くと
+/// `git add -A` に巻き込まれ得るので、**呼ぶ側は git ディレクトリだけ**にする。
+fn probe_writable(dir: &Path) -> bool {
+    let name = format!(
+        ".zaivern-czero-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let p = dir.join(name);
+    match std::fs::write(&p, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&p);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 作業ツリーの頂点が読み取り専用に見えるか。**作業ツリーには 1 バイトも書かない。**
+///
+/// 判るのは「誰も書けない」形 (`chmod 555` / 読み取り専用マウント / Windows の
+/// 読み取り専用属性) まで。他人の所有物は判らないので、**偽陰性がある**ことを
+/// `docs/czero-repo-shapes.md` に書いてある。
+fn looks_readonly(dir: &Path) -> bool {
+    std::fs::metadata(dir)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
+}
+
+/// `.gitmodules` の `path = <値>` を並び順そのままで。**決定的で重複しない。**
+fn submodule_paths(root: &Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(root.join(".gitmodules")).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.replace("\r\n", "\n").lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("path") else {
+            continue;
+        };
+        let Some((_, v)) = rest.split_once('=') else {
+            continue;
+        };
+        let v = v.trim().to_string();
+        if !v.is_empty() && !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// union を当てているのに `merge=lfs` が無いパターン。**当てると壊れる組。**
+///
+/// git-lfs が置く行は `filter=lfs diff=lfs merge=lfs -text` なので普段は
+/// `merge` が埋まっていて [`attr_free`] が弾く。ところが `filter=lfs` だけを
+/// 手で書いた `.gitattributes` があると `merge` は空きに見え、union が当たる。
+/// **union はポインタ行を連結する**ので、その時点で LFS オブジェクトが壊れる。
+fn lfs_unsafe_patterns(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for pat in managed_patterns(root)
+        .into_iter()
+        .chain(LIST_PATTERNS.iter().map(|p| (*p).to_string()))
+    {
+        if seen.contains(&pat) {
+            continue;
+        }
+        seen.push(pat.clone());
+        let Some(sample) = sample_path(root, &pat) else {
+            continue;
+        };
+        if attr_value(root, "filter", &sample) != "lfs" {
+            continue;
+        }
+        let merge = attr_value(root, "merge", &sample);
+        if attr_free(&merge) {
+            out.push(format!("{pat} ({sample})"));
+        }
+    }
+    out
+}
+
+/// リポジトリの形態を下見する。**書き換えは git ディレクトリの一時ファイル 1 つだけ**
+/// (作って即消す)。
+pub fn read_shape(env: &Env) -> Shape {
+    let start = env.start.clone();
+    let mut sh = Shape {
+        start: start.clone(),
+        ..Shape::default()
+    };
+
+    // 1 回で 3 つ訊く (bare でも答えられる 3 つ)。
+    let head = rev_parse(
+        &start,
+        &["--is-bare-repository", "--absolute-git-dir", "--git-common-dir"],
+    );
+    if head.is_empty() {
+        return sh; // 非 git。ここから先は 1 回も git を叩かない。
+    }
+    sh.bare = head.first().map(|s| s == "true").unwrap_or(false);
+    // **必ず正規形へ寄せてから比べる。** git は `--absolute-git-dir` を
+    // 実体で、`--git-common-dir` を相対 (`.git`) で返すので、生のまま
+    // 比べると `/var/…//x/.git` と `/private/var/…/x/.git` が別物になり、
+    // **どこも linked worktree に見える** (実際にそう出た)。
+    sh.git_dir = head.get(1).and_then(|s| abs_from(&start, s)).map(canon);
+    sh.common_dir = head
+        .get(2)
+        .and_then(|s| abs_from(&start, s))
+        .map(canon)
+        .or_else(|| sh.git_dir.clone());
+    sh.linked_worktree = match (&sh.git_dir, &sh.common_dir) {
+        (Some(g), Some(c)) => g != c,
+        _ => false,
+    };
+    if !sh.bare {
+        sh.root = rev_parse(&start, &["--show-toplevel"])
+            .first()
+            .and_then(|s| abs_from(&start, s));
+    }
+    let probe = sh.probe_dir().to_path_buf();
+
+    // submodule の中に居るか (git 自身に訊く — `.git` がファイルなのは
+    // linked worktree でも同じなので、ポインタの中身で判別しない)。
+    sh.inside_submodule = !rev_parse(&probe, &["--show-superproject-working-tree"])
+        .first()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+
+    // 設定は 1 回の `--get-regexp` でまとめて拾う (往復を増やさない)。
+    let conf = git(
+        &probe,
+        &[
+            "config",
+            "--get-regexp",
+            "^(core\\.sparsecheckout|core\\.hookspath|filter\\.lfs\\.)",
+        ],
+    )
+    .unwrap_or_default();
+    for line in conf.lines() {
+        let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+        let key = k.to_ascii_lowercase();
+        // **`_ =>` で残り全部を LFS に倒さない。** `git sparse-checkout init --cone`
+        // が置く `core.sparseCheckoutCone` まで LFS と読んで、sparse なだけの
+        // リポジトリに「git-lfs が居ます」と出した (実際に出た)。
+        if key == "core.sparsecheckout" {
+            sh.sparse = v.trim().eq_ignore_ascii_case("true");
+        } else if key == "core.hookspath" {
+            sh.hooks_path = Some(v.trim().to_string());
+        } else if key.starts_with("filter.lfs.") {
+            sh.lfs = true;
+        }
+    }
+    if let Some(c) = &sh.common_dir {
+        sh.shallow = c.join("shallow").exists();
+        // **`info/sparse-checkout` の存在では判定しない。** git が見るのは
+        // `core.sparseCheckout` だけで、一覧が残っていても無効なら全件出る。
+        if !probe_writable(c) {
+            sh.unwritable.push(trf(
+                "git ディレクトリ {p}",
+                &[("p", c.display().to_string())],
+            ));
+        }
+    }
+    sh.index_bytes = rev_parse(&probe, &["--git-path", "index"])
+        .first()
+        .and_then(|s| abs_from(&probe, s))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if let Some(root) = sh.root.clone() {
+        if looks_readonly(&root) {
+            sh.unwritable.push(trf(
+                "作業ツリー {p}",
+                &[("p", root.display().to_string())],
+            ));
+        }
+        if let Ok(real) = root.canonicalize() {
+            if real != root {
+                sh.symlinked = Some(real);
+            }
+        }
+        sh.submodules = submodule_paths(&root);
+        for (name, rel) in HOOK_FRAMEWORKS {
+            if root.join(rel).exists() && !sh.frameworks.contains(name) {
+                sh.frameworks.push(name);
+            }
+        }
+        if sh.lfs || !managed_patterns(&root).is_empty() {
+            sh.lfs_unsafe = lfs_unsafe_patterns(&root);
+        }
+    }
+    sh
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  5. `.gitattributes` の管理ブロック
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -813,6 +1209,11 @@ fn write_attributes(root: &Path, patterns: &[String]) -> Result<(), String> {
 /// * **存在するファイルだけ**を対象にする (使われていないパターンを並べない)。
 /// * 既に別の merge ドライバが当たっているパターンは**足さない**
 ///   (判定は `git check-attr` にやらせるので、glob の解釈がずれない)。
+/// * **`filter=lfs` が当たっているパターンも足さない。** git-lfs は普段
+///   `merge=lfs` も一緒に置くので上の条件で弾けるが、`filter=lfs` だけを手で
+///   書いた `.gitattributes` があると `merge` は空きに見える。そこへ union を
+///   当てると**ポインタ行を連結して LFS オブジェクトを壊す**ので、
+///   フィルタ側も見る。
 /// * 並びは [`LIST_PATTERNS`] のまま = 決定的。
 fn plan_patterns(root: &Path) -> (Vec<String>, Vec<String>) {
     let (mut want, mut skip) = (Vec::new(), Vec::new());
@@ -820,7 +1221,9 @@ fn plan_patterns(root: &Path) -> (Vec<String>, Vec<String>) {
         let Some(sample) = sample_path(root, pat) else {
             continue; // 当たる追跡ファイルが無い = 書いても効果がない
         };
-        if attr_free(&attr_value(root, &sample)) {
+        let free = attr_free(&attr_value(root, "merge", &sample))
+            && attr_value(root, "filter", &sample) != "lfs";
+        if free {
             want.push((*pat).to_string());
         } else {
             skip.push((*pat).to_string());
@@ -889,7 +1292,13 @@ fn repo_root(start: &Path) -> Result<PathBuf, String> {
 /// フックは台帳を読むので台帳が先、`.gitattributes` は driver 名を書くので
 /// driver が先。最後の自己検査は**省略できない**。
 pub fn init(env: &Env) -> Result<InitReport, String> {
-    let repo = repo_root(&env.start)?;
+    let shape = read_shape(env);
+    // **作業ツリーが無い形は、素の git のエラーで落とさない。** `git rev-parse` の
+    // 「this operation must be run in a work tree」だけを見せられても、
+    // ユーザーには何をすればいいか判らない (bare と非 git で直し方が違う)。
+    let Some(repo) = shape.root.clone() else {
+        return Err(shape.no_worktree_reason());
+    };
     let roots = lease::roots_of(&repo);
     let store = lease::store_path_in(&env.ledger_dir, &roots.key);
     let mut steps: Vec<Step> = Vec::new();
@@ -907,7 +1316,9 @@ pub fn init(env: &Env) -> Result<InitReport, String> {
         ledger: store,
         dry_run: env.dry_run,
         steps,
-        findings: findings(env, &repo),
+        // **入れた直後の形態も一緒に出す。** 入った段が緑でも、submodule や
+        // sparse-checkout が居れば「どこまで守れたか」は緑の数と一致しない。
+        findings: findings(env, &read_shape(env)),
     })
 }
 
@@ -1179,6 +1590,8 @@ fn step_merge_tree(repo: &Path) -> Step {
 pub struct Doctor {
     pub repo: PathBuf,
     pub ledger: PathBuf,
+    /// 診断したリポジトリの形態。**判定の前提そのもの**なので一緒に持つ。
+    pub shape: Shape,
     /// 何か 1 つでも入っているか。**全部無いなら「未導入です」と正直に出す**
     /// (エラーにしない — 使っていない人を叱らない)。
     pub installed: bool,
@@ -1194,31 +1607,230 @@ impl Doctor {
 
 /// 段ごとに ✅ / ⚠ / ❌ と理由と直し方を出す。**書き換えは一切しない。**
 pub fn doctor(env: &Env) -> Result<Doctor, String> {
-    let repo = repo_root(&env.start)?;
-    let roots = lease::roots_of(&repo);
+    let shape = read_shape(env);
+    // **非 git / bare でもエラーにしない。** ここで `git rev-parse` の失敗を
+    // そのまま返すと、いちばん説明が要る場面 (`zai lease claim` は動くのに
+    // `czero init` だけ失敗する) で 1 行のエラーしか出なくなる。
+    let target = shape.root.clone().unwrap_or_else(|| shape.probe_dir().to_path_buf());
+    let roots = lease::roots_of(&target);
     let store = lease::store_path_in(&env.ledger_dir, &roots.key);
-    let hooks_in = read_hooks(&repo)
+    let hooks_in = read_hooks(&target)
         .map(|h| !h.names(HookState::Ours).is_empty())
         .unwrap_or(false);
     Ok(Doctor {
-        installed: lease::enabled(&store) || hooks_in || driver_installed(&repo),
-        repo: repo.clone(),
+        installed: lease::enabled(&store) || hooks_in || driver_installed(&target),
+        repo: target,
         ledger: store,
-        findings: findings(env, &repo),
+        findings: findings(env, &shape),
+        shape,
     })
 }
 
-/// 段ごとの診断。**丸めない** — 6 段ぶん必ず 1 行以上出す。
-fn findings(env: &Env, repo: &Path) -> Vec<Finding> {
-    let mut out = Vec::new();
+/// 段ごとの診断。**丸めない** — 段ぶん必ず 1 行以上出す。
+///
+/// 形態 ([`Shape`]) を先に見て、**作業ツリーが無い形 (非 git / bare) では
+/// 下の段を「判らない」ではなく「この形では入らない」と理由付きで出す。**
+/// 判らないものを緑にしないのと同じくらい、**判っている赤を無言にしない**
+/// ことが大事なので、6 段ぶんの行は必ず埋める。
+fn findings(env: &Env, sh: &Shape) -> Vec<Finding> {
+    let mut out = check_shape(sh);
     out.push(check_wiring(env));
-    out.extend(check_ledger(env, repo));
-    out.extend(check_hooks(repo));
-    out.extend(check_driver(repo));
-    out.extend(check_attributes(repo));
-    out.push(check_merge_tree(repo));
+    let Some(repo) = sh.root.clone() else {
+        out.extend(check_ledger(env, sh.probe_dir()));
+        let why = sh.no_worktree_reason();
+        for stage in [Stage::Hooks, Stage::Driver, Stage::Attributes] {
+            out.push(Finding::bad(
+                stage,
+                why.clone(),
+                "作業ツリーのある場所で: zai czero init",
+            ));
+        }
+        out.push(if sh.is_git() {
+            check_merge_tree(sh.probe_dir())
+        } else {
+            Finding::warn(
+                Stage::MergeTree,
+                tr("git リポジトリではないので merge-tree は試していません"),
+                "",
+            )
+        });
+        return out;
+    };
+    out.extend(check_ledger(env, &repo));
+    out.extend(check_hooks(&repo));
+    out.extend(check_driver(&repo));
+    out.extend(check_attributes(&repo));
+    out.push(check_merge_tree(&repo));
     out
 }
+
+/// リポジトリの形態。**「未検証」を「安全」と書かない**のがこの関数の全部。
+///
+/// 各形態について「何が保証され、何が保証されないか」を 1 行ずつ出す。
+/// 詳細は `docs/czero-repo-shapes.md`。
+fn check_shape(sh: &Shape) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if !sh.is_git() {
+        out.push(Finding::bad(
+            Stage::Shape,
+            trf(
+                "git リポジトリではありません: {p} — zai lease claim はここでも成功し、カレント基準の台帳を作ります。つまり台帳に参加したエージェントだけは互いの行域を避けますが、フックが入らないので他のプロセス (人間の git commit・台帳を知らないエージェント) は 1 つも止まりません",
+                &[("p", sh.start.display().to_string())],
+            ),
+            "git init するか、git リポジトリを --repo で指すか、強制が要らないなら zai lease list で台帳だけを見てください",
+        ));
+        return out;
+    }
+    if sh.bare {
+        out.push(Finding::bad(
+            Stage::Shape,
+            trf(
+                "bare リポジトリです: {p} — 作業ツリーが無いので .gitattributes も pre-commit も置けません。保証されるのは「clone した作業ツリー側で czero init を打てば守られる」ことだけです",
+                &[("p", sh.probe_dir().display().to_string())],
+            ),
+            "作業ツリー側 (git clone した先) で: zai czero init",
+        ));
+        return out;
+    }
+
+    // ── 素の作業ツリー ─────────────────────────────────────────────
+    let plain = !sh.linked_worktree
+        && !sh.inside_submodule
+        && !sh.sparse
+        && !sh.shallow
+        && !sh.lfs
+        && sh.submodules.is_empty()
+        && sh.lfs_unsafe.is_empty()
+        && sh.frameworks.is_empty()
+        && sh.hooks_path.is_none()
+        && sh.symlinked.is_none()
+        && sh.unwritable.is_empty();
+    if plain {
+        out.push(Finding::ok(
+            Stage::Shape,
+            trf(
+                "素の作業ツリーです ({p}) — 下の段が緑ならこのツリーのコミットは全部フックを通ります",
+                &[("p", sh.probe_dir().display().to_string())],
+            ),
+        ));
+    }
+
+    if sh.linked_worktree {
+        out.push(Finding::ok(
+            Stage::Shape,
+            trf(
+                "linked worktree です (共有 git ディレクトリ {c}) — merge driver とフックは共有側に入るので**本体と他の worktree にも同時に効きます**。台帳のキーも本体へ寄るので、worktree をまたいだ行域の取り合いを検出できます",
+                &[(
+                    "c",
+                    sh.common_dir
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                )],
+            ),
+        ));
+    }
+    if sh.inside_submodule {
+        out.push(Finding::warn(
+            Stage::Shape,
+            tr("submodule の中で実行しています — ここへ入れた守りはこの submodule だけに効きます。親リポジトリは別のフックと別の .git/config を持つので、親側でもう一度 czero init が要ります"),
+            "親リポジトリでも: zai czero init",
+        ));
+    }
+    if !sh.submodules.is_empty() {
+        out.push(Finding::warn(
+            Stage::Shape,
+            trf(
+                "submodule を {n} 件抱えています ({list}) — submodule は別リポジトリなので、**この導入は 1 つも届きません**。submodule 内のコミットは素通りします",
+                &[
+                    ("n", sh.submodules.len().to_string()),
+                    ("list", sh.submodules.join(" ")),
+                ],
+            ),
+            "各 submodule で: zai czero init --repo <submodule のパス>",
+        ));
+    }
+    if sh.sparse {
+        out.push(Finding::warn(
+            Stage::Shape,
+            tr("sparse-checkout が有効です — 台帳とフックは stage されたパスを見るので効きます。効かないのは .gitattributes の側で、cone の外にある .gitattributes は作業ツリーに無く、czero init が書くのも頂点の 1 枚だけです (cone の外を後から checkout すると、そこだけ union が当たらないことがあります)"),
+            "cone を広げてから: zai czero doctor",
+        ));
+    }
+    if sh.shallow {
+        out.push(Finding::warn(
+            Stage::Shape,
+            tr("shallow clone です — フックと台帳は効きますが、切り落とされた履歴に共通祖先がある組では git merge-tree が失敗し、coedit の一撃統合が縮退します"),
+            "git fetch --unshallow",
+        ));
+    }
+    if !sh.lfs_unsafe.is_empty() {
+        out.push(Finding::bad(
+            Stage::Shape,
+            trf(
+                "git-lfs のフィルタが当たっているのに merge 指定が空いているパターンがあります: {list} — union driver はポインタ行を連結するので、この組で衝突が起きると LFS オブジェクトが壊れます",
+                &[("list", sh.lfs_unsafe.join(" / "))],
+            ),
+            "そのパターンへ merge=lfs を書いてから (git lfs track が既定で書きます): zai czero doctor",
+        ));
+    } else if sh.lfs {
+        out.push(Finding::ok(
+            Stage::Shape,
+            tr("git-lfs が居ますが、union を当てているパターンとは重なっていません (LFS のパターンには merge=lfs が入っているので czero は避けます)"),
+        ));
+    }
+    if let Some(hp) = &sh.hooks_path {
+        out.push(Finding::warn(
+            Stage::Shape,
+            trf(
+                "core.hooksPath が {hp} に設定されています — czero はこの置き場へ入れ、既に居るフックは .zaivern-prev へ退避して**連鎖**します (上書きしません)。ただしこの置き場を管理しているツールが自分でフックを書き直すと、こちらの関所が消えます",
+                &[("hp", hp.clone())],
+            ),
+            "書き直したあとは必ず: zai czero doctor",
+        ));
+    }
+    if !sh.frameworks.is_empty() {
+        out.push(Finding::warn(
+            Stage::Shape,
+            trf(
+                "既存の pre-commit フレームワークが居ます: {list} — 導入時は既存のフックを退避して連鎖するので**共存できます**。保証できないのは向こうが再インストールしたとき ( pre-commit install / husky install はフック本体を書き直すので、こちらの関所が黙って消えます)",
+                &[("list", sh.frameworks.join(" "))],
+            ),
+            "向こうを入れ直したあとは必ず: zai czero doctor",
+        ));
+    }
+    if let Some(real) = &sh.symlinked {
+        out.push(Finding::ok(
+            Stage::Shape,
+            trf(
+                "シンボリックリンク越しの頂点です (実体 {real}) — 台帳のキーは実体側へ寄せるので、リンク経由と実体経由で台帳が 2 つに割れることはありません。保証できないのは**リポジトリの中から外を指すシンボリックリンク**で、その先の書き込みは行域の管轄外です",
+                &[("real", real.display().to_string())],
+            ),
+        ));
+    }
+    if !sh.unwritable.is_empty() {
+        out.push(Finding::bad(
+            Stage::Shape,
+            trf(
+                "書けない場所があります: {list} — 読み取り専用のチェックアウトでは czero init が失敗します (診断だけは動きます)",
+                &[("list", sh.unwritable.join(" / "))],
+            ),
+            "書ける場所へ clone し直すか、権限を直してから: zai czero init",
+        ));
+    }
+    if sh.index_bytes >= HUGE_INDEX_BYTES {
+        out.push(Finding::warn(
+            Stage::Shape,
+            trf(
+                "index が {mb} MiB あります (巨大リポジトリ) — 守りの強さは変わりませんが、診断が叩く git ls-files がパターンごとに全件を舐めるので待たされます",
+                &[("mb", (sh.index_bytes / (1024 * 1024)).to_string())],
+            ),
+            "",
+        ));
+    }
+    out
+}
+
 
 /// CLI の配線。**フックも merge driver も `zai <sub>` を叩くので、ここが
 /// 通っていないと上の段が全部「入っているのに効かない」になる。**
@@ -1441,7 +2053,7 @@ fn check_attributes(repo: &Path) -> Vec<Finding> {
         match sample_path(&root, pat) {
             None => empty.push(pat.clone()),
             Some(sample) => {
-                let v = attr_value(&root, &sample);
+                let v = attr_value(&root, "merge", &sample);
                 if v.starts_with("zaivern-union") {
                     live.push(format!("{pat}→{v}"));
                 } else {
@@ -1533,6 +2145,49 @@ impl Outcome {
     }
 }
 
+/// 実証全体の**段**。
+///
+/// ## なぜ 2 値ではいけないか
+///
+/// 以前は「❌ が 1 つも無い」= 守られています、だった。ところが
+/// [`trial_live_commit`] は本物の `zai` と実環境の台帳が揃っていないと
+/// **黙って飛ぶ**ので、いちばん重い実地試行を 1 度も走らせないまま
+/// 「守られています」と出せてしまう。**試していないものを「守られている」と
+/// 言わない**ために、飛んだ試行がある状態には別の名前を与える。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// 全部の試行を実際に起こして、全部通った。
+    Verified,
+    /// 落ちた試行は無いが、**試せなかった試行がある**。検証済みとは言わない。
+    Partial,
+    /// 守られていない試行がある。
+    Broken,
+}
+
+impl Verdict {
+    /// JSON に載る安定キー。
+    pub fn key(self) -> &'static str {
+        match self {
+            Verdict::Verified => "verified",
+            Verdict::Partial => "partial",
+            Verdict::Broken => "broken",
+        }
+    }
+
+    /// 画面に出す見出し。**「守られています」と言えるのは 1 つだけ。**
+    pub fn headline(self) -> &'static str {
+        match self {
+            Verdict::Verified => {
+                "🔬 実証 — 守られています (全ての試行を実際に起こして確かめました)"
+            }
+            Verdict::Partial => {
+                "🔬 実証 — 部分的にしか確かめられていません (試せなかった試行か、実証が触れていない形態があるので「検証済み」とは言えません)"
+            }
+            Verdict::Broken => "🔬 実証 — ここが効いていません",
+        }
+    }
+}
+
 /// 実証 1 件。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trial {
@@ -1551,12 +2206,41 @@ pub struct VerifyReport {
     /// 片付いたか。**残すのは `--keep` を明示したときだけ。**
     pub cleaned: bool,
     pub trials: Vec<Trial>,
+    /// **実証が扱えていない対象リポジトリの形態。**
+    ///
+    /// 試行は全部使い捨てリポジトリで起こすので、submodule や sparse-checkout
+    /// のような対象固有の形は 1 つも通っていない。ここを黙ると
+    /// 「守られています」が対象リポジトリ全体の保証に読める (静かな嘘)。
+    pub shape_notes: Vec<String>,
 }
 
 impl VerifyReport {
-    /// 守られているか (❌ が 1 つも無い)。
+    /// 守られていない試行が無いか。**「検証済み」ではない** — [`Self::verdict`] を見ること。
     pub fn protected(&self) -> bool {
         self.trials.iter().all(|t| t.outcome != Outcome::Failed)
+    }
+
+    /// 試せなかった試行。
+    pub fn skipped(&self) -> Vec<&Trial> {
+        self.trials
+            .iter()
+            .filter(|t| t.outcome == Outcome::Skipped)
+            .collect()
+    }
+
+    /// 段。**飛んだ試行か、実証が触れていない形態があれば `Partial` 止まり。**
+    ///
+    /// 形態も数えるのは、試行が全部通っても**それは使い捨てリポジトリの話**
+    /// だから。submodule を抱えたリポジトリで「守られています」と出すのは、
+    /// 飛んだ試行を黙るのと同じ嘘になる (submodule 内は 1 つも守られていない)。
+    pub fn verdict(&self) -> Verdict {
+        if !self.protected() {
+            Verdict::Broken
+        } else if !self.skipped().is_empty() || !self.shape_notes.is_empty() {
+            Verdict::Partial
+        } else {
+            Verdict::Verified
+        }
     }
 }
 
@@ -1605,11 +2289,20 @@ pub fn verify(env: &Env, keep: bool) -> VerifyReport {
             "一覧への両側追記が、実際の git merge で自動解決する",
             trial_union_live(&scratch, &exe),
         ),
-        Ok(_) | Err(_) => Trial {
+        Ok(exe) => Trial {
             name: "一覧への両側追記が、実際の git merge で自動解決する",
             outcome: Outcome::Skipped,
-            detail: tr(
-                "この実行ファイルは merge-driver サブコマンドを受け付けないので、実マージは試せませんでした (src/cli.rs への配線が要ります)",
+            detail: trf(
+                "この実行ファイルは merge-driver サブコマンドを受け付けないので、実マージは試せませんでした ({p} — src/cli.rs への配線が要ります)",
+                &[("p", sh_path(&exe))],
+            ),
+        },
+        Err(e) => Trial {
+            name: "一覧への両側追記が、実際の git merge で自動解決する",
+            outcome: Outcome::Skipped,
+            detail: trf(
+                "merge driver に埋める実行ファイルの場所が判らないので試せませんでした: {e}",
+                &[("e", e)],
             ),
         },
     });
@@ -1625,6 +2318,8 @@ pub fn verify(env: &Env, keep: bool) -> VerifyReport {
         scratch,
         cleaned,
         trials,
+        // **対象リポジトリの形は 1 つも試していない**ので、そう書く。
+        shape_notes: read_shape(env).untested_notes(),
     }
 }
 
@@ -1813,12 +2508,31 @@ fn trial_driver_resolves(scratch: &Path) -> Result<String, String> {
 /// (通ったことにしない)。
 fn trial_live_commit(env: &Env, scratch: &Path) -> Trial {
     const NAME: &str = "他人が保有するファイルの git commit が実際に止まる";
-    if !env.is_real_zai() || !env.ledger_is_real() {
+    // **なぜ飛ばすのかを 1 件ずつ挙げる。** 「揃っていません」とだけ出すと、
+    // 読んだ人は自分の環境の何を直せばいいか判らないまま「まあ緑だし」で
+    // 通す (この試行こそが「本当に守られるか」の唯一の実地試験なのに)。
+    let mut why: Vec<String> = Vec::new();
+    if !env.is_real_zai() {
+        why.push(tr(
+            "この実行ファイルが本物の zai ではありません (テストバイナリか、guard が CLI へ配線されていないビルド)",
+        ));
+    }
+    if !env.ledger_is_real() {
+        why.push(trf(
+            "台帳が使い捨てへ寄っています ({here}) — フックが読むのは実環境の {real} なので、ここでコミットしても止まりません",
+            &[
+                ("here", env.ledger_dir.display().to_string()),
+                ("real", lease::store_dir().display().to_string()),
+            ],
+        ));
+    }
+    if !why.is_empty() {
         return Trial {
             name: NAME,
             outcome: Outcome::Skipped,
-            detail: tr(
-                "フックは実環境の台帳を読むため、本物の zai と実環境の台帳が揃っているときだけ試せます",
+            detail: trf(
+                "実コミットを試せませんでした: {why}",
+                &[("why", why.join(" / "))],
             ),
         };
     }
@@ -2203,7 +2917,17 @@ pub fn render_init(r: &InitReport) -> String {
 
 /// `doctor` の結果を人が読む形へ。
 pub fn render_doctor(d: &Doctor) -> String {
-    let head = if d.installed {
+    // **作業ツリーが無い形は「未導入」ではない。** 「入れれば入る」と読める
+    // 見出しを出すと、入らない理由 (非 git / bare) が本文まで届かない。
+    let head = if d.shape.root.is_none() {
+        trf(
+            "🩺 競合ゼロの診断 — {repo}\n  {why}",
+            &[
+                ("repo", d.repo.display().to_string()),
+                ("why", d.shape.no_worktree_reason()),
+            ],
+        )
+    } else if d.installed {
         trf(
             "🩺 競合ゼロの診断 — {repo} ({g})",
             &[
@@ -2221,13 +2945,53 @@ pub fn render_doctor(d: &Doctor) -> String {
 }
 
 /// `verify` の結果を人が読む形へ。
+///
+/// **飛んだ試行と、実証が触れていない形態は、必ず見出しの直後に出す。**
+/// 一覧の中に ⚠ として紛れさせると、下まで読まない人には
+/// 「守られています」しか残らない。
 pub fn render_verify(v: &VerifyReport) -> String {
-    let head = if v.protected() {
-        tr("🔬 実証 — 守られています (実際に競合を起こして確かめました)")
-    } else {
-        tr("🔬 実証 — ここが効いていません")
-    };
+    let verdict = v.verdict();
+    let head = trf(
+        "{h} ({p} 件が通り / {f} 件が落ち / {s} 件は試せず)",
+        &[
+            ("h", tr(verdict.headline())),
+            (
+                "p",
+                v.trials
+                    .iter()
+                    .filter(|t| t.outcome == Outcome::Passed)
+                    .count()
+                    .to_string(),
+            ),
+            (
+                "f",
+                v.trials
+                    .iter()
+                    .filter(|t| t.outcome == Outcome::Failed)
+                    .count()
+                    .to_string(),
+            ),
+            ("s", v.skipped().len().to_string()),
+        ],
+    );
     let mut body = String::new();
+    for t in v.skipped() {
+        body.push_str(&format!(
+            "  {} {}\n      {} {}\n",
+            Outcome::Skipped.glyph(),
+            tr("試せなかったので、この点は検証済みではありません:"),
+            tr(t.name),
+            t.detail
+        ));
+    }
+    for n in &v.shape_notes {
+        body.push_str(&format!(
+            "  {} {} {}\n",
+            Mark::Warn.glyph(),
+            tr("実証は使い捨てリポジトリで行うので、この形態は試していません:"),
+            n
+        ));
+    }
     for t in &v.trials {
         body.push_str(&format!("  {} {}\n", t.outcome.glyph(), tr(t.name)));
         body.push_str(&format!("      {}\n", t.detail));
@@ -2307,6 +3071,30 @@ pub fn doctor_json(d: &Doctor) -> serde_json::Value {
         "installed": d.installed,
         "findings": findings_json(&d.findings),
         "healthy": d.healthy(),
+        "shape": shape_json(&d.shape),
+    })
+}
+
+/// 形態を機械の読み手へ。**真偽値をそのまま出す** — 「普通です」に丸めない。
+pub fn shape_json(sh: &Shape) -> serde_json::Value {
+    serde_json::json!({
+        "is_git": sh.is_git(),
+        "root": sh.root.as_ref().map(|p| p.display().to_string()),
+        "git_dir": sh.git_dir.as_ref().map(|p| p.display().to_string()),
+        "common_dir": sh.common_dir.as_ref().map(|p| p.display().to_string()),
+        "bare": sh.bare,
+        "linked_worktree": sh.linked_worktree,
+        "inside_submodule": sh.inside_submodule,
+        "submodules": sh.submodules,
+        "sparse_checkout": sh.sparse,
+        "shallow": sh.shallow,
+        "lfs": sh.lfs,
+        "lfs_unsafe_patterns": sh.lfs_unsafe,
+        "hooks_path": sh.hooks_path,
+        "hook_frameworks": sh.frameworks,
+        "symlinked_root_real": sh.symlinked.as_ref().map(|p| p.display().to_string()),
+        "unwritable": sh.unwritable,
+        "index_bytes": sh.index_bytes,
     })
 }
 
@@ -2315,7 +3103,27 @@ pub fn verify_json(v: &VerifyReport) -> serde_json::Value {
     serde_json::json!({
         "scratch": v.scratch.display().to_string(),
         "cleaned": v.cleaned,
+        // **`protected` だけを読む機械の読み手を騙さない。** 飛んだ試行があると
+        // `protected` は真のままなので、`verdict` を必ず一緒に出す。
         "protected": v.protected(),
+        "verdict": v.verdict().key(),
+        "counts": {
+            "passed": v.trials.iter().filter(|t| t.outcome == Outcome::Passed).count(),
+            "failed": v.trials.iter().filter(|t| t.outcome == Outcome::Failed).count(),
+            "skipped": v.skipped().len(),
+        },
+        "skipped": serde_json::Value::Array(
+            v.skipped()
+                .iter()
+                .map(|t| serde_json::json!({ "name": t.name, "reason": t.detail }))
+                .collect(),
+        ),
+        "untested_shapes": serde_json::Value::Array(
+            v.shape_notes
+                .iter()
+                .map(|n| serde_json::Value::String(n.clone()))
+                .collect(),
+        ),
         "trials": serde_json::Value::Array(
             v.trials
                 .iter()
@@ -2351,9 +3159,16 @@ czero (どのリポジトリでも競合が起きないようにする — 導�
   zai czero doctor [--repo <パス>] [--json]
         段ごとに ✅ / ⚠ / ❌ と理由と直し方を出す (書き換えない)。
         未導入なら「未導入です」と 1 行で出す (エラーにしない)。
-  zai czero verify [--repo <パス>] [--keep] [--json]
+        **非 git / bare / sparse-checkout / LFS / submodule / linked worktree /
+        既存 core.hooksPath / husky・pre-commit・lefthook も検出して、
+        何が保証され何が保証されないかを出す** (非 git と bare は
+        エラーではなく診断として出す — そこだけ他とエラーの扱いが違う)。
+  zai czero verify [--repo <パス>] [--keep] [--strict] [--json]
         **実際に競合を起こして止まることを確かめる。**
         使い捨ての一時領域だけを使い、対象リポジトリは 1 バイトも汚さない。
+        **試せなかった試行があるときは「検証済み」と言わない** —
+        判定は verified / partial / broken の 3 段 (--json の verdict 欄)。
+        --strict を付けると partial も落第 (終了コード 1) として扱う。
         --keep は落ちた原因を見るために一時領域を残す。
   zai czero uninstall [--repo <パス>] [--purge] [--json]
         入れたものだけを戻す。退避した元のフックを復元し、
@@ -2363,9 +3178,12 @@ czero (どのリポジトリでも競合が起きないようにする — 導�
 
 終了コード:
   0  正常 (init が通った / doctor に ❌ が無い / verify が全部通った)
-  1  守れていない (doctor に ❌ が残っている / verify で止まらなかった)
+  1  守れていない (doctor に ❌ が残っている / verify で止まらなかった /
+     --strict 付きの verify が partial だった)
   2  使い方の誤り
-  3  実行時のエラー (git が居ない / リポジトリではない / 書き込めない)
+  3  実行時のエラー (git が居ない / 書き込めない / init と verify を
+     作業ツリーの無い場所で打った)。**doctor だけは非 git / bare でも
+     エラーにせず、何が動いて何が動かないかを出す。**
 
 --repo を省くとカレントディレクトリから git rev-parse --show-toplevel で解決します。
 init は内部で `zai guard init` を呼びます (ユーザーが手で打つのと同じ経路)。
@@ -2393,6 +3211,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
     let (json, rest) = take_flag(&rest, "--json");
     let (dry, rest) = take_flag(&rest, "--dry-run");
     let (keep, rest) = take_flag(&rest, "--keep");
+    let (strict, rest) = take_flag(&rest, "--strict");
     let (purge, rest) = take_flag(&rest, "--purge");
     if let Some(x) = rest.first() {
         return usage(&trf("余分な引数です: {x}", &[("x", x.clone())]));
@@ -2437,17 +3256,15 @@ pub fn cli_main(argv: &[String]) -> i32 {
         },
         "verify" => {
             // **リポジトリの存在だけは先に確かめる** (`--repo` の打ち間違いを
-            // 「守られています」と答えてしまわないため)。
-            if let Err(e) = repo_root(&env.start) {
-                return runtime(&e);
+            // 「守られています」と答えてしまわないため)。理由は形態から起こす
+            // ので、bare と非 git で違う直し方が出る。
+            let shape = read_shape(&env);
+            if shape.root.is_none() {
+                return runtime(&shape.no_worktree_reason());
             }
             let v = verify(&env, keep);
             emit(json, || verify_json(&v), || render_verify(&v));
-            if v.protected() {
-                EXIT_OK
-            } else {
-                EXIT_UNHEALTHY
-            }
+            verify_exit(v.verdict(), strict)
         }
         "uninstall" => match uninstall(&env, purge) {
             Ok(u) => {
@@ -2467,6 +3284,23 @@ pub fn cli_main(argv: &[String]) -> i32 {
             "知らないサブコマンドです: {x}",
             &[("x", other.to_string())],
         )),
+    }
+}
+
+/// `verify` の終了コード。
+///
+/// **既定では partial を落第にしない** (飛んだ試行は失敗ではないので、
+/// 既存の CI を突然赤くしない)。ただし出力は必ず「検証済みではない」と言うし、
+/// `--strict` を付ければ落第にできる。
+///
+/// 写像を関数に切り出してあるのは、**テストが実 `~/.zaivern` を触らずに
+/// 終了コードを固定できる**ようにするため (`cli_main` を通すと
+/// [`Env::here`] が実環境の台帳を掴む)。
+fn verify_exit(verdict: Verdict, strict: bool) -> i32 {
+    match verdict {
+        Verdict::Verified => EXIT_OK,
+        Verdict::Partial if !strict => EXIT_OK,
+        Verdict::Partial | Verdict::Broken => EXIT_UNHEALTHY,
     }
 }
 
@@ -3259,6 +4093,529 @@ mod tests {
         );
     }
 
+    // ─────────────── リポジトリ形態 (穴 2 と穴 3) ───────────────
+
+    /// 形態ごとの使い捨てリポジトリを置く場所。**実 `~/.zaivern` に触れない。**
+    struct ShapeDir(PathBuf);
+
+    impl ShapeDir {
+        fn new(tag: &str) -> ShapeDir {
+            ShapeDir(unique_temp_dir("zaivern-czero-shape-test", tag))
+        }
+        /// `start` を見に行く [`Env`]。台帳も実行ファイルもこのディレクトリ由来。
+        fn env(&self, start: &Path) -> Env {
+            Env {
+                start: start.to_path_buf(),
+                ledger_dir: self.0.join("ledger"),
+                exe: Some(std::env::current_exe().expect("current_exe")),
+                wired_guard: true,
+                wired_driver: true,
+                wired_czero: true,
+                dry_run: false,
+            }
+        }
+        /// コミットが 1 つある普通の作業ツリーを作る。
+        fn repo(&self, name: &str) -> PathBuf {
+            let repo = self.0.join(name);
+            make_repo(&repo, &self.0).expect("使い捨てリポジトリ");
+            let _ = git(&repo, &["config", "--local", "--unset", "core.hooksPath"]);
+            std::fs::write(repo.join("notes.md"), VERIFY_BASE_LIST).unwrap();
+            git(&repo, &["add", "-A"]).unwrap();
+            git(&repo, &["commit", "-m", "base", "--no-verify"]).unwrap();
+            repo
+        }
+    }
+
+    impl Drop for ShapeDir {
+        fn drop(&mut self) {
+            // Windows は最後のハンドルが閉じるまで削除が保留になるので、失敗を許す。
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 段に、この語を含む理由の行が居ること。**部分一致で状態を決めない**ための
+    /// 補助 (探すのは理由の本文であって、判定そのものではない)。
+    fn reason_has(findings: &[Finding], s: Stage, needle: &str) -> bool {
+        stage_rows(findings, s)
+            .iter()
+            .any(|f| f.reason.contains(needle))
+    }
+
+    /// **どの形態でも 6 段すべてに 1 行以上出ること。**
+    ///
+    /// 行が無い段は [`worst_by_stage`] が ❌ に倒すので、黙って赤くなる。
+    /// 「判らない」を理由も無く赤にすると、直しようが無い診断になる。
+    fn 全段が埋まっている(findings: &[Finding]) {
+        for s in STAGES {
+            assert!(
+                !stage_rows(findings, *s).is_empty(),
+                "{:?} の段に 1 行も出ていない",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn 非gitではleaseだけが動く非対称を説明する() {
+        let d = ShapeDir::new("not-git");
+        let plain = d.0.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let env = d.env(&plain);
+
+        let sh = read_shape(&env);
+        assert!(!sh.is_git(), "git ではないのに git と判定した");
+        assert!(sh.root.is_none() && !sh.bare);
+
+        // doctor は**エラーにしない** — ここが穴 3 の本体。
+        let doc = doctor(&env).expect("非 git でも診断は出ること");
+        全段が埋まっている(&doc.findings);
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Bad);
+        assert!(
+            reason_has(&doc.findings, Stage::Shape, "lease claim")
+                && reason_has(&doc.findings, Stage::Shape, "フック"),
+            "lease は動くのにフックが入らない、という非対称を説明していない: {:?}",
+            stage_rows(&doc.findings, Stage::Shape)
+        );
+        assert!(!doc.healthy());
+
+        // init と verify は今までどおり実行時エラー。**理由が bare と違うこと。**
+        let e = init(&env).expect_err("非 git に init は入らない");
+        assert!(e.contains("git"), "理由が具体的でない: {e}");
+        let args: Vec<String> = ["doctor", "--repo", &plain.to_string_lossy()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(cli_main(&args), EXIT_UNHEALTHY, "doctor は診断として出す");
+    }
+
+    #[test]
+    fn bareリポジトリは作業ツリーが無いと説明する() {
+        let d = ShapeDir::new("bare");
+        let bare = d.0.join("bare.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "--bare"]).expect("bare を作れない");
+        let env = d.env(&bare);
+
+        let sh = read_shape(&env);
+        assert!(sh.is_git() && sh.bare, "bare を検出していない: {sh:?}");
+        assert!(sh.root.is_none());
+
+        let doc = doctor(&env).expect("bare でも診断は出ること");
+        全段が埋まっている(&doc.findings);
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Bad);
+        assert!(reason_has(&doc.findings, Stage::Shape, "bare"));
+        let e = init(&env).expect_err("bare に init は入らない");
+        assert!(e.contains("bare"), "bare だと言っていない: {e}");
+    }
+
+    /// **回帰の番人。** git は `--absolute-git-dir` を実体で、`--git-common-dir`
+    /// を相対 (`.git`) で返す。正規形へ寄せずに比べていたころ、
+    /// `/var/…//x/.git` と `/private/var/…/x/.git` が別物になって
+    /// **素の作業ツリーまで linked worktree に見えていた** (実バイナリで発覚)。
+    #[test]
+    fn 素の作業ツリーをlinked_worktreeと言わない() {
+        let d = ShapeDir::new("plain");
+        let repo = d.repo("plain");
+        // シンボリックリンク越し (macOS の temp_dir は /var → /private/var) と
+        // 末尾スラッシュ、どちらの渡し方でも同じ答えになること。
+        for start in [repo.clone(), repo.join("")] {
+            let sh = read_shape(&d.env(&start));
+            assert!(
+                !sh.linked_worktree,
+                "素の作業ツリーを linked worktree と判定した ({}): {sh:?}",
+                start.display()
+            );
+            assert_eq!(sh.git_dir, sh.common_dir);
+        }
+        let doc = doctor(&d.env(&repo)).expect("診断");
+        全段が埋まっている(&doc.findings);
+        assert!(
+            reason_has(&doc.findings, Stage::Shape, "素の作業ツリー"),
+            "素の形をそう言っていない: {:?}",
+            stage_rows(&doc.findings, Stage::Shape)
+        );
+    }
+
+    #[test]
+    fn linked_worktreeは共有側に効くと出す() {
+        let d = ShapeDir::new("linked");
+        let main = d.repo("main");
+        let wt = d.0.join("wt");
+        git(
+            &main,
+            &["worktree", "add", &wt.to_string_lossy(), "-b", "czero-wt"],
+        )
+        .expect("worktree を切れない");
+
+        let env = d.env(&wt);
+        let sh = read_shape(&env);
+        assert!(sh.linked_worktree, "linked worktree を検出していない: {sh:?}");
+        assert!(sh.root.is_some());
+        assert_ne!(sh.git_dir, sh.common_dir);
+
+        // 本体で入れた守りが、worktree 側の診断でも緑になること
+        // (フックと driver は共有 git ディレクトリに入るため)。
+        init(&d.env(&main)).expect("本体へ init");
+        let doc = doctor(&env).expect("worktree の診断");
+        全段が埋まっている(&doc.findings);
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Ok);
+        assert_eq!(
+            worst(&doc.findings, Stage::Hooks),
+            Mark::Ok,
+            "共有側に入れたフックが worktree から見えていない: {:?}",
+            stage_rows(&doc.findings, Stage::Hooks)
+        );
+    }
+
+    #[test]
+    fn submoduleは届かないと出す() {
+        let d = ShapeDir::new("submodule");
+        let child = d.repo("child");
+        let parent = d.repo("parent");
+        // **本物の `git submodule add` を試す。** git 2.38+ は既定で
+        // file プロトコルを止めるので、その 1 回だけ許可する。
+        // 使えない環境 (古い git / 制限された CI) では `.gitmodules` を
+        // 直に置いて、検出そのものは必ず試す。
+        let added = git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &child.to_string_lossy(),
+                "child",
+            ],
+        )
+        .is_ok();
+        if !added {
+            std::fs::write(
+                parent.join(".gitmodules"),
+                "[submodule \"child\"]\n\tpath = child\n\turl = ../child\n",
+            )
+            .unwrap();
+            git(&parent, &["add", "--", ".gitmodules"]).unwrap();
+        }
+
+        let env = d.env(&parent);
+        let sh = read_shape(&env);
+        assert_eq!(sh.submodules, vec!["child".to_string()]);
+        let doc = doctor(&env).expect("診断");
+        全段が埋まっている(&doc.findings);
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Warn);
+        assert!(
+            reason_has(&doc.findings, Stage::Shape, "submodule"),
+            "submodule へ届かないことを言っていない"
+        );
+
+        if added {
+            // submodule の**中**から見たら、親にも要ると言うこと。
+            let inside = d.env(&parent.join("child"));
+            let sh_in = read_shape(&inside);
+            assert!(
+                sh_in.inside_submodule,
+                "submodule の中に居ることを検出していない: {sh_in:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_checkoutを検出してgitattributesの穴を出す() {
+        let d = ShapeDir::new("sparse");
+        let repo = d.repo("sparse");
+        // 本物の sparse-checkout を試し、使えない git では設定だけを置く
+        // (`read_shape` が見るのは `core.sparseCheckout` なので、どちらでも
+        //  同じ形になる)。
+        if git(&repo, &["sparse-checkout", "init", "--cone"]).is_err() {
+            git(&repo, &["config", "--local", "core.sparseCheckout", "true"]).unwrap();
+        }
+
+        let env = d.env(&repo);
+        let sh = read_shape(&env);
+        assert!(sh.sparse, "sparse-checkout を検出していない: {sh:?}");
+        // **回帰の番人。** 設定の振り分けを `_ =>` で締めていたころ、
+        // `git sparse-checkout init --cone` が置く `core.sparseCheckoutCone` を
+        // LFS と読んで「git-lfs が居ます」と出した。
+        assert!(!sh.lfs, "sparse なだけのリポジトリを LFS と判定した");
+        let doc = doctor(&env).expect("診断");
+        全段が埋まっている(&doc.findings);
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Warn);
+        assert!(reason_has(&doc.findings, Stage::Shape, ".gitattributes"));
+    }
+
+    #[test]
+    fn 既存のフック置き場へ入れて上書きしない() {
+        let d = ShapeDir::new("hookspath");
+        let repo = d.repo("hp");
+        // husky を模した置き場。**相対パスで持たせる** (git がそう書くため)。
+        std::fs::create_dir_all(repo.join(".husky")).unwrap();
+        git(&repo, &["config", "--local", "core.hooksPath", ".husky"]).unwrap();
+        std::fs::write(repo.join(".husky").join("pre-commit"), "#!/bin/sh\necho hi\n").unwrap();
+
+        let env = d.env(&repo);
+        let sh = read_shape(&env);
+        assert_eq!(sh.hooks_path.as_deref(), Some(".husky"));
+        assert_eq!(sh.frameworks, vec!["husky"]);
+
+        // **入れても既存のフックは消えない。**
+        init(&env).expect("init");
+        let h = read_hooks(&repo).expect("hooks");
+        assert!(
+            h.dir.ends_with(".husky"),
+            "core.hooksPath を無視して .git/hooks へ入れた: {}",
+            h.dir.display()
+        );
+        assert!(
+            repo.join(".husky")
+                .join(format!("pre-commit{HOOK_PREV_SUFFIX}"))
+                .exists(),
+            "既存の pre-commit を退避していない (黙って壊した)"
+        );
+        let doc = doctor(&env).expect("診断");
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Warn);
+        assert!(reason_has(&doc.findings, Stage::Shape, "husky"));
+    }
+
+    #[test]
+    fn 既存のフックフレームワークを全部名指しする() {
+        let d = ShapeDir::new("frameworks");
+        let repo = d.repo("fw");
+        std::fs::create_dir_all(repo.join(".husky")).unwrap();
+        std::fs::write(repo.join(".pre-commit-config.yaml"), "repos: []\n").unwrap();
+        std::fs::write(repo.join("lefthook.yml"), "pre-commit:\n").unwrap();
+
+        let sh = read_shape(&d.env(&repo));
+        assert_eq!(
+            sh.frameworks,
+            vec!["husky", "pre-commit", "lefthook"],
+            "並びか中身が変わった (決定的でなくなると差分が読めない)"
+        );
+    }
+
+    #[test]
+    fn lfsのパターンにunionを当てない() {
+        let d = ShapeDir::new("lfs");
+        let repo = d.repo("lfs");
+        // **`filter=lfs` だけ**を手で書いた形 (merge が空きに見える)。
+        std::fs::write(repo.join(".gitattributes"), "*.md filter=lfs\n").unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-m", "lfs attrs", "--no-verify"]).unwrap();
+
+        let root = repo.clone();
+        let (want, skip) = plan_patterns(&root);
+        assert!(
+            !want.contains(&"*.md".to_string()),
+            "LFS が当たっているパターンへ union を足そうとした (ポインタが壊れる)"
+        );
+        assert!(skip.contains(&"*.md".to_string()), "見送りとして報告していない");
+
+        // 人が手で union を当ててしまっていたら ❌ にする。
+        std::fs::write(
+            repo.join(".gitattributes"),
+            format!("*.md filter=lfs\n*.md merge={UNION_AUTO}\n"),
+        )
+        .unwrap();
+        let sh = read_shape(&d.env(&repo));
+        assert!(
+            !sh.lfs_unsafe.is_empty(),
+            "filter=lfs と union が重なっているのに黙っている"
+        );
+        let doc = doctor(&d.env(&repo)).expect("診断");
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Bad);
+    }
+
+    #[test]
+    fn shallowを検出する() {
+        let d = ShapeDir::new("shallow");
+        let repo = d.repo("shallow");
+        let sh0 = read_shape(&d.env(&repo));
+        assert!(!sh0.shallow);
+        // shallow clone の印は共有 git ディレクトリの `shallow` ファイル。
+        // 実際に浅い clone を作ると `file://` URL の書式が OS で割れるので、
+        // **見ている印そのもの**を置いて判定を固定する。
+        let common = sh0.common_dir.clone().expect("common dir");
+        std::fs::write(common.join("shallow"), "").unwrap();
+        let sh = read_shape(&d.env(&repo));
+        assert!(sh.shallow, "shallow を検出していない");
+        let doc = doctor(&d.env(&repo)).expect("診断");
+        assert!(reason_has(&doc.findings, Stage::Shape, "merge-tree"));
+    }
+
+    #[test]
+    fn シンボリックリンク越しでも台帳のキーが割れない() {
+        let d = ShapeDir::new("symlink");
+        let repo = d.repo("real");
+        let link = d.0.join("link");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&repo, &link).is_ok();
+        // Windows のディレクトリシンボリックリンクは開発者モードか管理者が要る。
+        // 作れない環境では**この検査を飛ばす** (作れないことを失敗にしない)。
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(&repo, &link).is_ok();
+        if !made {
+            eprintln!("[skip] シンボリックリンクを作れない環境");
+            return;
+        }
+        let a = doctor(&d.env(&repo)).expect("実体側");
+        let b = doctor(&d.env(&link)).expect("リンク側");
+        assert_eq!(
+            a.ledger, b.ledger,
+            "同じリポジトリなのに台帳が 2 つに割れている"
+        );
+    }
+
+    #[test]
+    fn 書けない場所は書けないと出す() {
+        let d = ShapeDir::new("readonly");
+        assert!(
+            !probe_writable(&d.0.join("no-such-dir")),
+            "存在しない場所を「書ける」と答えた"
+        );
+        assert!(probe_writable(&d.0), "書ける場所を「書けない」と答えた");
+        assert!(
+            !looks_readonly(&d.0),
+            "普通のディレクトリを読み取り専用と答えた"
+        );
+    }
+
+    /// 形態 → 判定のテーブル。**[`check_shape`] は [`Shape`] の純粋関数**なので、
+    /// 実ファイルを作れない組み合わせ (巨大 index / 遅い置き場 / 読み取り専用) も
+    /// ここで固定できる。
+    #[test]
+    fn 形態ごとの判定を表で固定する() {
+        let git_dir = std::env::temp_dir().join("g");
+        let base = Shape {
+            start: std::env::temp_dir(),
+            root: Some(std::env::temp_dir().join("r")),
+            git_dir: Some(git_dir.clone()),
+            common_dir: Some(git_dir),
+            ..Shape::default()
+        };
+        let case = |f: &dyn Fn(&mut Shape)| {
+            let mut s = base.clone();
+            f(&mut s);
+            s
+        };
+        let table: Vec<(&str, Shape, Mark, &str)> = vec![
+            ("素の作業ツリー", base.clone(), Mark::Ok, "素の作業ツリー"),
+            (
+                "非 git",
+                Shape {
+                    start: std::env::temp_dir(),
+                    ..Shape::default()
+                },
+                Mark::Bad,
+                "lease claim",
+            ),
+            (
+                "bare",
+                Shape {
+                    bare: true,
+                    root: None,
+                    ..base.clone()
+                },
+                Mark::Bad,
+                "bare",
+            ),
+            (
+                "linked worktree",
+                case(&|s| s.linked_worktree = true),
+                Mark::Ok,
+                "linked worktree",
+            ),
+            (
+                "submodule の中",
+                case(&|s| s.inside_submodule = true),
+                Mark::Warn,
+                "親リポジトリ",
+            ),
+            (
+                "submodule を抱える",
+                case(&|s| s.submodules = vec!["child".into()]),
+                Mark::Warn,
+                "submodule",
+            ),
+            (
+                "sparse-checkout",
+                case(&|s| s.sparse = true),
+                Mark::Warn,
+                ".gitattributes",
+            ),
+            (
+                "shallow",
+                case(&|s| s.shallow = true),
+                Mark::Warn,
+                "merge-tree",
+            ),
+            ("LFS だけ", case(&|s| s.lfs = true), Mark::Ok, "git-lfs"),
+            (
+                "LFS と union が重なる",
+                case(&|s| {
+                    s.lfs = true;
+                    s.lfs_unsafe = vec!["*.md".into()];
+                }),
+                Mark::Bad,
+                "ポインタ",
+            ),
+            (
+                "core.hooksPath",
+                case(&|s| s.hooks_path = Some(".husky".into())),
+                Mark::Warn,
+                "退避",
+            ),
+            (
+                "フレームワーク",
+                case(&|s| s.frameworks = vec!["pre-commit"]),
+                Mark::Warn,
+                "共存",
+            ),
+            (
+                "シンボリックリンク",
+                case(&|s| s.symlinked = Some(std::env::temp_dir().join("real"))),
+                Mark::Ok,
+                "台帳のキー",
+            ),
+            (
+                "読み取り専用",
+                case(&|s| s.unwritable = vec!["作業ツリー".into()]),
+                Mark::Bad,
+                "読み取り専用",
+            ),
+            (
+                "巨大 index",
+                case(&|s| s.index_bytes = HUGE_INDEX_BYTES),
+                Mark::Warn,
+                "巨大リポジトリ",
+            ),
+        ];
+        for (name, sh, mark, needle) in table {
+            let f = check_shape(&sh);
+            assert!(!f.is_empty(), "{name}: 1 行も出ていない");
+            assert_eq!(
+                f.iter().map(|x| x.mark).max().unwrap(),
+                mark,
+                "{name}: 評価が違う ({:?})",
+                f
+            );
+            assert!(
+                f.iter().any(|x| x.reason.contains(needle)),
+                "{name}: 「{needle}」に触れていない ({:?})",
+                f.iter().map(|x| x.reason.as_str()).collect::<Vec<_>>()
+            );
+            assert!(
+                f.iter().all(|x| x.stage == Stage::Shape),
+                "{name}: 形態の段以外へ出している"
+            );
+            // ⚠ / ❌ には必ず直し方を付ける (注記だけの 2 件を除く)。
+            for x in &f {
+                if x.mark == Mark::Bad {
+                    assert!(!x.fix.trim().is_empty(), "{name}: ❌ に直し方が無い");
+                }
+            }
+        }
+    }
+
     // ─────────────── verify ───────────────
 
     #[test]
@@ -3352,6 +4709,99 @@ mod tests {
             assert!(!t.detail.trim().is_empty(), "なぜ試せないかを出していない");
         }
         assert!(v.protected(), "Skipped は失敗ではない");
+        // **ここが穴 1。** 飛んだ試行があるのに「検証済み」と言わせない。
+        assert_eq!(v.verdict(), Verdict::Partial);
+        let text = render_verify(&v);
+        assert!(
+            !text.contains("守られています"),
+            "試せていないのに守られていると出した:\n{text}"
+        );
+        assert!(
+            text.contains(&tr("試せなかったので、この点は検証済みではありません:")),
+            "飛んだ試行を見出しの直後に出していない:\n{text}"
+        );
+        // 飛んだ理由は**具体的**であること (何を直せばいいかが判る語)。
+        let live = v
+            .trials
+            .iter()
+            .find(|t| t.name.contains("git commit"))
+            .expect("実コミットの試行");
+        assert_eq!(live.outcome, Outcome::Skipped);
+        assert!(
+            live.detail.contains("本物の zai") || live.detail.contains("台帳"),
+            "なぜ実コミットを試せないかが具体的でない: {}",
+            live.detail
+        );
+        // JSON にも段と理由が出ること。
+        let j = verify_json(&v);
+        assert_eq!(j["verdict"], "partial");
+        assert_eq!(j["counts"]["skipped"], 2);
+        let sk = j["skipped"].as_array().expect("skipped 配列");
+        assert_eq!(sk.len(), 2);
+        for x in sk {
+            assert!(!x["reason"].as_str().unwrap_or_default().trim().is_empty());
+        }
+    }
+
+    /// **`cli_main` を通さない。** `Env::here` は実環境の台帳を掴むので、
+    /// ここで `verify` を走らせるとテストが実 `~/.zaivern` に触れる。
+    /// 見たいのは「段 → 終了コード」の写像だけなので、そこだけを固定する。
+    #[test]
+    fn strictを付けたときだけ部分検証を落第にする() {
+        let table = [
+            (Verdict::Verified, false, EXIT_OK),
+            (Verdict::Verified, true, EXIT_OK),
+            (Verdict::Partial, false, EXIT_OK),
+            (Verdict::Partial, true, EXIT_UNHEALTHY),
+            (Verdict::Broken, false, EXIT_UNHEALTHY),
+            (Verdict::Broken, true, EXIT_UNHEALTHY),
+        ];
+        for (v, strict, want) in table {
+            assert_eq!(
+                verify_exit(v, strict),
+                want,
+                "{v:?} / --strict={strict} の終了コードが違う"
+            );
+        }
+        assert!(HELP.contains("--strict"), "--strict が HELP に無い");
+        let (found, rest) = take_flag(&["--strict".to_string()], "--strict");
+        assert!(found && rest.is_empty(), "--strict を引数から抜けていない");
+    }
+
+    #[test]
+    fn 実証が触れていない形態を黙らない() {
+        let d = ShapeDir::new("untested-shape");
+        let repo = d.repo("shapes");
+        std::fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"child\"]\n\tpath = child\n\turl = ../child\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-m", "sub", "--no-verify"]).unwrap();
+        let v = verify(&d.env(&repo), false);
+        assert!(
+            v.shape_notes.iter().any(|n| n.contains("submodule")),
+            "実証が submodule を試していないことを黙っている: {:?}",
+            v.shape_notes
+        );
+        assert_eq!(
+            v.verdict(),
+            Verdict::Partial,
+            "試していない形態があるのに「検証済み」と言った"
+        );
+        let text = render_verify(&v);
+        assert!(text.contains("使い捨てリポジトリ"), "本文に注記が出ていない:\n{text}");
+        assert!(
+            !text.contains("守られています"),
+            "触れていない形態があるのに守られていると出した:\n{text}"
+        );
+        assert!(
+            !verify_json(&v)["untested_shapes"]
+                .as_array()
+                .expect("untested_shapes")
+                .is_empty()
+        );
     }
 
     /// **実バイナリがあるときは、実際の `git merge` まで通す。**
@@ -3567,14 +5017,27 @@ mod tests {
         assert_eq!(rest, v(&["--repo"]));
     }
 
+    /// **`doctor` だけは非 git でもエラーにしない。**
+    ///
+    /// 守りを入れられない場所こそ説明が要る (`zai lease claim` は動くのに
+    /// `czero init` だけ失敗する、という非対称の説明)。書き換える側の
+    /// `init` / `verify` は今までどおり実行時エラーのまま。
     #[test]
-    fn cliはリポジトリでない場所を実行時エラーにする() {
+    fn 書き換える側だけがリポジトリでない場所を実行時エラーにする() {
         let dir = unique_temp_dir("zaivern-czero-init-test", "not-a-repo");
-        let args: Vec<String> = ["doctor", "--repo", &dir.to_string_lossy()]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(cli_main(&args), EXIT_RUNTIME);
+        let args = |sub: &str| -> Vec<String> {
+            [sub, "--repo", &dir.to_string_lossy()]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(cli_main(&args("init")), EXIT_RUNTIME);
+        assert_eq!(cli_main(&args("verify")), EXIT_RUNTIME);
+        assert_eq!(
+            cli_main(&args("doctor")),
+            EXIT_UNHEALTHY,
+            "doctor は非 git を説明するので、使い方の誤りでも実行時エラーでもない"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
