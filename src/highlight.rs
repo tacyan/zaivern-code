@@ -4269,24 +4269,39 @@ mod huge_files {
 
     #[test]
     fn 極端に長い一行でも固まらず素通しになる() {
+        // **絶対時間で線を引かない。** 以前ここは `took < 3 秒` を見ていたが、
+        // 全件を同時実行したときだけ落ちる偽陽性を出していた
+        // (このリポジトリで実測 3 件の前例がある罠)。守りたい性質は
+        // 「行長に比例した費用が掛からない」ことなので、**行の長さを 2 倍にして
+        // 出来上がる区間が 1 つも増えない**ことを見る。素通しであれば
+        // 長さに依らず 1 区間で、塗っていれば長さに比例して区間が増える。
         let h = Highlighter::new();
-        // 5MB の 1 行 (minify 済み JS を想定)
-        let long = format!("var a={};\n", "1+".repeat(2_500_000));
-        assert!(long.len() > 5_000_000);
-        let src = format!("// 先頭\n{long}var b=2;\n");
-        let t = std::time::Instant::now();
-        let spans = spans_of(&h, &src, "JavaScript (Babel)");
-        let took = t.elapsed();
-        // 長すぎる行は 1 区間 (= 素通し) になる
-        assert_eq!(spans[1].len(), 1, "長すぎる行を塗ろうとしている");
-        assert_eq!(spans[1][0].end as usize, long.len());
-        // 前後の行は普通に塗れている (状態を壊していない)
-        assert!(!spans[0].is_empty());
-        assert!(spans[2].len() >= 2, "長い行の後ろが塗れていない");
-        // 素通しなので行長に比例した費用は掛からない
-        assert!(
-            took < std::time::Duration::from_secs(3),
-            "遅すぎる: {took:?}"
+        let long_line = |half: usize| format!("var a={};\n", "1+".repeat(half));
+        let build = |half: usize| {
+            let long = long_line(half);
+            (format!("// 先頭\n{long}var b=2;\n"), long.len())
+        };
+        let (src_n, len_n) = build(1_250_000);
+        let (src_2n, len_2n) = build(2_500_000);
+        assert!(len_2n > 5_000_000, "2 倍側が上限を超えていない");
+
+        let spans_n = spans_of(&h, &src_n, "JavaScript (Babel)");
+        let spans_2n = spans_of(&h, &src_2n, "JavaScript (Babel)");
+
+        for (spans, len, label) in [(&spans_n, len_n, "N"), (&spans_2n, len_2n, "2N")] {
+            // 長すぎる行は 1 区間 (= 素通し) になる
+            assert_eq!(spans[1].len(), 1, "{label}: 長すぎる行を塗ろうとしている");
+            assert_eq!(spans[1][0].end as usize, len);
+            // 前後の行は普通に塗れている (状態を壊していない)
+            assert!(!spans[0].is_empty(), "{label}: 先頭行が塗れていない");
+            assert!(spans[2].len() >= 2, "{label}: 長い行の後ろが塗れていない");
+        }
+        // 行を 2 倍にしても区間の総数が増えない = 行長に比例した費用が無い
+        let total = |v: &[Vec<LineSpan>]| v.iter().map(|l| l.len()).sum::<usize>();
+        assert_eq!(
+            total(&spans_n),
+            total(&spans_2n),
+            "行長を 2 倍にしたら区間が増えた = 素通しになっていない"
         );
     }
 
