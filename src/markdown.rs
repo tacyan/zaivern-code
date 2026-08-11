@@ -730,6 +730,44 @@ pub fn list_marker(t: &str) -> Option<(usize, String)> {
     None
 }
 
+/// タブが送る桁数 (CommonMark と同じ 4 桁のタブストップ)。
+pub const TAB_STOP: usize = 4;
+
+/// 行頭の空白を**桁数**で数える。
+///
+/// バイト数 (`line.len() - trimmed.len()`) で数えるとタブが 1 桁になり、
+/// タブで字下げした文書の階層が潰れる (`\t- a` と `- a` が同じ深さになる)。
+/// 全角空白も 1 バイトではない。タブは次のタブストップまで送る。
+pub fn indent_width(line: &str) -> usize {
+    let mut col = 0usize;
+    for c in line.chars() {
+        match c {
+            '\t' => col = (col / TAB_STOP + 1) * TAB_STOP,
+            '\u{3000}' => col += 2,
+            c if c.is_whitespace() => col += 1,
+            _ => break,
+        }
+    }
+    col
+}
+
+/// この行から**別のブロック**が始まるか (リスト項目の続き行の判定に使う)。
+pub fn starts_block(lines: &[&str], i: usize) -> bool {
+    let Some(line) = lines.get(i) else {
+        return true;
+    };
+    let t = line.trim_start();
+    fence_open(t).is_some()
+        || atx_heading(t).is_some()
+        || is_hr(t)
+        || t.starts_with('>')
+        || footnote_def(t).is_some()
+        || list_marker(t).is_some()
+        || t.starts_with("$$")
+        || t.starts_with("\\[")
+        || is_table_head(t, lines.get(i + 1).copied())
+}
+
 /// 引用行の `>` の深さと本文を返す (`>> x` → (2, "x"))。
 pub fn quote_depth(line: &str) -> (usize, &str) {
     let mut rest = line.trim_start();
@@ -5539,6 +5577,15 @@ const TBL_MIN_COL: f32 = 44.0;
 /// 太字を横へずらして重ねる量 (synthetic bold)。
 const BOLD_OFFSET: f32 = 0.6;
 
+/// 箇条書きの行頭記号の左に置く余白。
+const LIST_PAD: f32 = 6.0;
+/// 入れ子 1 桁ぶんの字下げ (フォント寸法に比例させる)。
+const LIST_STEP: f32 = 0.55;
+/// 塊の中の項目どうしだけを詰める縦の間隔。
+const BLOCK_GAP_Y: f32 = 2.0;
+/// ぶら下げの器に必ず残す本文の幅 (フォント寸法の倍数)。
+const HANG_MIN_BODY: f32 = 4.0;
+
 /// 揃えに対応する galley の水平アンカー。
 fn halign_of(a: TableAlign) -> egui::Align {
     match a {
@@ -6565,6 +6612,278 @@ fn mermaid_ui(
 
 /// Markdown 全文を ui へ描画する。
 /// `rctx` は画像解決用の文脈 (基準ディレクトリ + テクスチャキャッシュ)。
+/// 行頭に記号を置き、**折り返した続きを記号の右へ揃える** (ぶら下げ字下げ)。
+///
+/// `horizontal_wrapped` + `add_space` で記号を置くと、器の左端は列 0 のままなので
+/// **折り返した 2 行目が記号より左へ落ちる**。本文専用の器を作り、その中だけで
+/// 折り返させると、続きの行が必ず記号の右へ揃う。
+///
+/// 字下げ (`pad`) は本文の幅より優先度が低い。深い入れ子や狭い幅では
+/// **字下げのほうを削って**本文が潰れないようにする。
+fn hanging_ui(
+    ui: &mut egui::Ui,
+    pad: f32,
+    marker: &str,
+    marker_size: f32,
+    marker_color: Color32,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let mw = ui.fonts(|f| {
+        f.layout_no_wrap(
+            marker.to_owned(),
+            FontId::proportional(marker_size),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+    });
+    let avail = ui.available_width();
+    let min_body = (marker_size * HANG_MIN_BODY).min(avail);
+    let pad = pad.clamp(0.0, (avail - mw - min_body).max(0.0));
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        if !marker.is_empty() {
+            ui.label(RichText::new(marker).size(marker_size).color(marker_color));
+        }
+        // 記号を置いた**あとの**残り幅で器を切る (測った幅との誤差を持ち込まない)
+        let w = ui.available_width().max(min_body);
+        ui.allocate_ui_with_layout(
+            egui::vec2(w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(w);
+                body(ui);
+            },
+        );
+    });
+}
+
+/// ぶら下げの器の中へ、折り返しつきの本文を 1 段落ぶん描く。
+fn hanging_body(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    size: f32,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        spans_ui(ui, theme, text, size, false, color, rctx);
+    });
+}
+
+/// ぶら下げの器の中へ、ハード改行で切られた段落を順に描く。
+fn hanging_parts(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    parts: &[String],
+    size: f32,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
+    for part in parts {
+        if part.trim().is_empty() {
+            continue;
+        }
+        hanging_body(ui, theme, part, size, color, rctx);
+    }
+}
+
+/// 項目の本文を組み立てる。記号の後ろに、**より深く字下げされた続きの行**を畳む。
+///
+/// これを畳まないと、続きの行が段落バッファへ落ちて**字下げ 0 の別段落**として
+/// 描かれる (このリポジトリの `docs/*.md` はほぼ全部この形で書かれている)。
+///
+/// ハード改行 (`行末スペース 2 つ` / `<br>`) はそこで段落を切る。`html_to_md` は
+/// `<li>` の中の `<br>` を**字下げせずに**吐くので、直後の行は字下げが浅くても
+/// 項目の続きとして扱う (でないと項目の途中から左端へ落ちる)。
+/// 戻り値は (段落の並び, 次に見る行番号)。
+fn item_body(lines: &[&str], start: usize, head: &str, indent: usize) -> (Vec<String>, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut brk, first) = hard_break(head);
+    append_para(&mut cur, first);
+    let mut j = start + 1;
+    while j < lines.len() {
+        let cont = lines[j];
+        if cont.trim().is_empty() || starts_block(lines, j) {
+            break;
+        }
+        if indent_width(cont) <= indent && !brk {
+            break;
+        }
+        if brk {
+            parts.push(std::mem::take(&mut cur));
+        }
+        let (b, text) = hard_break(cont);
+        append_para(&mut cur, text);
+        brk = b;
+        j += 1;
+    }
+    parts.push(cur);
+    (parts, j)
+}
+
+/// 連続する箇条書きを 1 つの塊として描き、次に見る行番号を返す。
+fn list_block_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    // 間隔は子 Ui の中だけで詰める。親から見た塊の前後は段落と同じ間隔のまま。
+    // (`ui.spacing_mut()` を直に触ると、詰めた間隔が塊の**後ろ**にも残る)
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = BLOCK_GAP_Y;
+        list_items_ui(ui, theme, base, lines, start, rctx)
+    })
+    .inner
+}
+
+/// 箇条書きの項目を順に描き、次に見る行番号を返す (間隔は呼び出し側が決める)。
+fn list_items_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    let mut i = start;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if is_hr(trimmed) {
+            break;
+        }
+        let Some((off, bullet)) = list_marker(trimmed) else {
+            break;
+        };
+        let indent = indent_width(lines[i]);
+        let (body, next) = item_body(lines, i, &trimmed[off..], indent);
+        let done = bullet == "☑";
+        let mcol = if done { theme.ok } else { theme.accent };
+        let tcol = if done { theme.text_dim } else { theme.text };
+        hanging_ui(
+            ui,
+            LIST_PAD + indent as f32 * base * LIST_STEP,
+            &format!("{bullet} "),
+            base,
+            mcol,
+            |ui| hanging_parts(ui, theme, &body, base, tcol, rctx),
+        );
+        i = next;
+        // 空行を挟んでも、次が項目なら同じ塊として続ける (loose list)
+        let mut k = i;
+        while k < lines.len() && lines[k].trim().is_empty() {
+            k += 1;
+        }
+        if k > i && k < lines.len() {
+            let t = lines[k].trim_start();
+            if !is_hr(t) && list_marker(t).is_some() {
+                ui.add_space(BLOCK_GAP_Y);
+                i = k;
+                continue;
+            }
+            break;
+        }
+    }
+    i
+}
+
+/// 連続する引用行を描き、次に見る行番号を返す。
+///
+/// 1 行ずつ独立に描くと、原文の折り返し位置がそのまま段落の切れ目に見える。
+/// 同じ深さの平文は 1 段落へ畳み、帯 (`▍`) の右へぶら下げて揃える。
+fn quote_block_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = BLOCK_GAP_Y;
+        quote_lines_ui(ui, theme, base, lines, start, rctx)
+    })
+    .inner
+}
+
+/// 引用の各行を描き、次に見る行番号を返す (間隔は呼び出し側が決める)。
+fn quote_lines_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    let bar_of = |d: usize| -> String {
+        let mut s: String = std::iter::repeat_n("▍", d.max(1)).collect();
+        s.push(' ');
+        s
+    };
+    let flush = |ui: &mut egui::Ui, para: &mut String, depth: usize, rctx: &mut RenderCtx| {
+        if para.trim().is_empty() {
+            para.clear();
+            return;
+        }
+        let text = std::mem::take(para);
+        hanging_ui(ui, 0.0, &bar_of(depth), base, theme.accent, |ui| {
+            hanging_body(ui, theme, &text, base, theme.text_dim, rctx)
+        });
+    };
+    let mut i = start;
+    let mut para = String::new();
+    let mut depth = 1usize;
+    while i < lines.len() && lines[i].trim_start().starts_with('>') {
+        let (d, raw) = quote_depth(lines[i].trim_start());
+        let d = d.max(1);
+        let body = raw.trim_start();
+        let is_item = list_marker(body).is_some();
+        let head = atx_heading(body);
+        if d != depth || body.trim().is_empty() || is_item || head.is_some() {
+            flush(ui, &mut para, depth, rctx);
+        }
+        depth = d;
+        if let Some((off, bullet)) = list_marker(body) {
+            let (parts, _) = item_body(lines, i, &body[off..], usize::MAX);
+            hanging_ui(
+                ui,
+                0.0,
+                &format!("{}{bullet} ", bar_of(d)),
+                base,
+                theme.accent,
+                |ui| hanging_parts(ui, theme, &parts, base, theme.text_dim, rctx),
+            );
+        } else if let Some((level, title)) = head {
+            let scale = [1.5f32, 1.35, 1.2, 1.1, 1.0, 0.95][level - 1];
+            hanging_ui(ui, 0.0, &bar_of(d), base * scale, theme.accent, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    spans_ui(ui, theme, &title, base * scale, true, theme.text, rctx);
+                });
+            });
+        } else if !body.trim().is_empty() {
+            let (brk, text) = hard_break(lines[i]);
+            let text = quote_depth(text.trim_start()).1.trim();
+            append_para(&mut para, text);
+            if brk {
+                flush(ui, &mut para, depth, rctx);
+            }
+        }
+        i += 1;
+    }
+    flush(ui, &mut para, depth, rctx);
+    i
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -6608,7 +6927,6 @@ pub fn render(
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
 
         // フェンスコード (``` と ~~~ の両方)
         if let Some((f, lang_tok)) = fence_open(trimmed) {
@@ -6651,6 +6969,28 @@ pub fn render(
             continue;
         }
 
+        // Setext 見出しの下線 (`===` / `---`) は水平線より優先する。
+        // 直前が段落なら、この行は区切り線ではなくその段落の見出し指定。
+        if !para.trim().is_empty() {
+            if let Some(level) = setext_level(line) {
+                let scale = if level == 1 { 1.85f32 } else { 1.5 };
+                let body = std::mem::take(&mut para);
+                ui.add_space(8.0);
+                line_ui(
+                    ui,
+                    theme,
+                    body.trim_end(),
+                    base * scale,
+                    true,
+                    theme.text,
+                    rctx,
+                );
+                ui.separator();
+                i += 1;
+                continue;
+            }
+        }
+
         // 水平線
         if is_hr(trimmed) {
             flush_para(ui, &mut para, theme, rctx);
@@ -6662,36 +7002,23 @@ pub fn render(
         // 引用 (連続する > 行をまとめる。`>>` の入れ子は深さぶん帯を重ねる)
         if trimmed.starts_with('>') {
             flush_para(ui, &mut para, theme, rctx);
-            while i < lines.len() && lines[i].trim_start().starts_with('>') {
-                let (depth, body) = quote_depth(lines[i].trim_start());
-                let bar: String = std::iter::repeat_n("▍", depth.max(1)).collect();
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(
-                        RichText::new(format!("{bar} "))
-                            .color(theme.accent)
-                            .size(base),
-                    );
-                    spans_ui(ui, theme, body, base, false, theme.text_dim, rctx);
-                });
-                i += 1;
-            }
+            i = quote_block_ui(ui, theme, base, &lines, i, rctx);
             continue;
         }
 
-        // 脚注定義 `[^1]: 本文`
-        if let Some((label, body)) = footnote_def(trimmed) {
+        // 脚注定義 `[^1]: 本文` (字下げした続きの行も本文として畳む)
+        if let Some((label, head)) = footnote_def(trimmed) {
             flush_para(ui, &mut para, theme, rctx);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.label(
-                    RichText::new(format!("[{label}] "))
-                        .size(base * 0.78)
-                        .color(theme.accent),
-                );
-                spans_ui(ui, theme, &body, base * 0.92, false, theme.text_dim, rctx);
-            });
-            i += 1;
+            let (body, next) = item_body(&lines, i, &head, indent_width(line));
+            hanging_ui(
+                ui,
+                0.0,
+                &format!("[{label}] "),
+                base * 0.78,
+                theme.accent,
+                |ui| hanging_parts(ui, theme, &body, base * 0.92, theme.text_dim, rctx),
+            );
+            i = next;
             continue;
         }
 
@@ -6721,19 +7048,10 @@ pub fn render(
             continue;
         }
 
-        // リスト
-        if let Some((off, bullet)) = list_marker(trimmed) {
+        // リスト (塊ごと描く: ぶら下げ字下げ + 続きの行 + 項目間だけ詰める)
+        if list_marker(trimmed).is_some() {
             flush_para(ui, &mut para, theme, rctx);
-            let done = bullet == "☑";
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add_space(6.0 + indent as f32 * base * 0.55);
-                let bcol = if done { theme.ok } else { theme.accent };
-                ui.label(RichText::new(format!("{bullet} ")).color(bcol).size(base));
-                let tcol = if done { theme.text_dim } else { theme.text };
-                spans_ui(ui, theme, &trimmed[off..], base, false, tcol, rctx);
-            });
-            i += 1;
+            i = list_block_ui(ui, theme, base, &lines, i, rctx);
             continue;
         }
 
@@ -7764,6 +8082,424 @@ $$
             let _ = table_aligns(src);
             let _ = footnote_def(src);
             let _ = split_front_matter(src);
+        }
+    }
+
+    // ─── 版面 (箇条書き・引用・脚注) ─────────────────────────────────
+
+    /// 描いた結果からテキスト行の矩形を拾う。戻り値は (行の並び, 版面の右端)。
+    ///
+    /// `(上, 下, 左, 右, 本文)`。太字は同じ galley を [`BOLD_OFFSET`] ずらして
+    /// 2 度描くので、直後に来る重ね描きは 1 つに畳む。
+    fn md_rows(doc: &str, width: f32) -> (Vec<(f32, f32, f32, f32, String)>, f32) {
+        let ctx = egui::Context::default();
+        let hl = Highlighter::new();
+        let theme = crate::theme::by_name("zaivern-dark");
+        let mut images = ImageCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 2400.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        let mut right = f32::NAN;
+        for _ in 0..3 {
+            out = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    right = ui.max_rect().right();
+                    let mut rctx = RenderCtx {
+                        dir: None,
+                        images: &mut images,
+                    };
+                    render(ui, &theme, &hl, 14.0, doc, &mut rctx);
+                });
+            }));
+        }
+        let mut rows = Vec::new();
+        let mut prev: Option<(egui::Pos2, String)> = None;
+        for cs in &out.unwrap().shapes {
+            let egui::epaint::Shape::Text(t) = &cs.shape else {
+                continue;
+            };
+            let text = t.galley.text().to_string();
+            let overlay = prev.as_ref().is_some_and(|(pp, ptext)| {
+                *ptext == text
+                    && (t.pos.x - pp.x - BOLD_OFFSET).abs() < 0.01
+                    && (t.pos.y - pp.y).abs() < 0.01
+            });
+            prev = Some((t.pos, text));
+            if overlay {
+                continue;
+            }
+            for row in t.galley.rows.iter() {
+                let body: String = row.glyphs.iter().map(|g| g.chr).collect();
+                if body.trim().is_empty() {
+                    continue;
+                }
+                rows.push((
+                    t.pos.y + row.rect.top(),
+                    t.pos.y + row.rect.bottom(),
+                    t.pos.x + row.rect.left(),
+                    t.pos.x + row.rect.right(),
+                    body,
+                ));
+            }
+        }
+        rows.sort_by(|a, b| (a.0, a.2).partial_cmp(&(b.0, b.2)).unwrap());
+        (rows, right)
+    }
+
+    /// 行頭記号 (`•` / `☐` / `▍`) だけの行か。
+    fn is_marker_row(text: &str) -> bool {
+        let t = text.trim();
+        !t.is_empty() && t.chars().all(|c| matches!(c, '•' | '☐' | '☑' | '▍' | ' '))
+    }
+
+    /// 字下げはバイト数ではなく**桁数**で数える (タブは 4 桁のタブストップ)。
+    #[test]
+    fn 字下げは桁数で数えるのでタブが潰れない() {
+        assert_eq!(indent_width("- a"), 0);
+        assert_eq!(indent_width("  - a"), 2);
+        assert_eq!(indent_width("\t- a"), 4);
+        assert_eq!(indent_width("\t\t- a"), 8);
+        // タブストップなので、空白 2 つのあとのタブは 4 桁目まで送るだけ
+        assert_eq!(indent_width("  \t- a"), 4);
+        assert_eq!(indent_width("     - a"), 5);
+        // 全角空白も 1 バイトではない
+        assert_eq!(indent_width("\u{3000}- a"), 2);
+        assert_eq!(indent_width(""), 0);
+    }
+
+    /// 箇条書きは**折り返しても記号の右へ揃う** (ぶら下げ字下げ)。
+    ///
+    /// 旧実装は `horizontal_wrapped` + `add_space` で記号を置いていたので、
+    /// 器の左端が列 0 のままになり、**2 行目が記号より左へ落ちて**いた。
+    #[test]
+    fn 箇条書きは折り返しても記号の右へ揃う() {
+        let long = "折り返しの検査に使うための十分に長い本文です。".repeat(6);
+        let doc = format!("- {long}\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let marker = rows
+                .iter()
+                .find(|r| is_marker_row(&r.4))
+                .unwrap_or_else(|| panic!("{width}: 行頭記号が描かれていない"));
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(body.len() >= 2, "{width}: 折り返していない ({body:?})");
+            let head = body[0].2;
+            assert!(
+                head > marker.2 + 1.0,
+                "{width}: 本文が記号の右に無い ({head} <= {})",
+                marker.2
+            );
+            for b in &body {
+                assert!(
+                    b.2 >= head - 0.5,
+                    "{width}: 折り返した行が本文左端より左へ出た ({b:?} < {head})"
+                );
+            }
+        }
+    }
+
+    /// 入れ子は**深いほど左端が右へ動く**。タブ字下げも空白 4 つと同じ深さになる。
+    ///
+    /// 旧実装は字下げをバイト数で数えていたので、タブ 1 個が 1 桁に潰れて
+    /// 階層が消えていた。
+    #[test]
+    fn 入れ子は深いほど右へ寄りタブも空白と同じに数える() {
+        let spaces = "- 深さ 0\n    - 深さ 1\n        - 深さ 2\n";
+        let tabs = "- 深さ 0\n\t- 深さ 1\n\t\t- 深さ 2\n";
+        for width in [1200.0_f32, 700.0] {
+            let lefts = |doc: &str| -> Vec<f32> {
+                md_rows(doc, width)
+                    .0
+                    .iter()
+                    .filter(|r| is_marker_row(&r.4))
+                    .map(|r| r.2)
+                    .collect()
+            };
+            let a = lefts(spaces);
+            assert_eq!(a.len(), 3, "{width}: 3 段に描けていない ({a:?})");
+            assert!(
+                a[0] < a[1] && a[1] < a[2],
+                "{width}: 深さが効いていない {a:?}"
+            );
+            let b = lefts(tabs);
+            assert_eq!(b.len(), 3, "{width}: タブ版が 3 段に描けていない ({b:?})");
+            for (x, y) in a.iter().zip(&b) {
+                assert!(
+                    (x - y).abs() < 0.5,
+                    "{width}: タブ字下げが空白 4 つと違う深さになった {a:?} / {b:?}"
+                );
+            }
+        }
+    }
+
+    /// 字下げした続きの行は、**項目の本文**として記号の右へ続く。
+    ///
+    /// 旧実装は続きの行を段落バッファへ落としていたので、**字下げ 0 の別段落**
+    /// として描かれていた (このリポジトリの `docs/*.md` はほぼこの形で書く)。
+    #[test]
+    fn 箇条書きの続きの行は項目の本文になる() {
+        let doc = "- 見出しになる一行目\n  字下げした続きの本文がここに来る\n- 次の項目\n";
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            let head = body
+                .iter()
+                .find(|r| r.4.contains("見出しになる"))
+                .unwrap_or_else(|| panic!("{width}: 1 行目が無い"))
+                .2;
+            let cont = body
+                .iter()
+                .find(|r| r.4.contains("字下げした続き"))
+                .unwrap_or_else(|| panic!("{width}: 続きの行が無い"));
+            assert!(
+                cont.2 >= head - 0.5,
+                "{width}: 続きの行が段落として左端へ落ちた ({cont:?} < {head})"
+            );
+        }
+    }
+
+    /// 項目のあいだは段落のあいだより**詰まって**いる (塊に見える)。
+    #[test]
+    fn 箇条書きの行間は段落より詰まる() {
+        let width = 700.0_f32;
+        let tops = |doc: &str| -> Vec<f32> {
+            md_rows(doc, width)
+                .0
+                .iter()
+                .filter(|r| !is_marker_row(&r.4))
+                .map(|r| r.0)
+                .collect()
+        };
+        let list = tops("- 項目あ\n- 項目い\n- 項目う\n");
+        let para = tops("段落あ\n\n段落い\n\n段落う\n");
+        assert_eq!(list.len(), 3, "{list:?}");
+        assert_eq!(para.len(), 3, "{para:?}");
+        let gap = |v: &[f32]| v[1] - v[0];
+        assert!(
+            gap(&list) < gap(&para) - 0.5,
+            "項目間 {} が段落間 {} より詰まっていない",
+            gap(&list),
+            gap(&para)
+        );
+    }
+
+    /// 引用も折り返しが帯の右へ揃い、同じ深さの平文は 1 段落に畳まれる。
+    #[test]
+    fn 引用は折り返しても帯の右へ揃う() {
+        let long = "帯の右へ揃わないと 2 行目が帯の下へ潜り込んで読めません。".repeat(5);
+        let doc = format!("> {long}\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let bar = rows
+                .iter()
+                .find(|r| is_marker_row(&r.4))
+                .unwrap_or_else(|| panic!("{width}: 帯が描かれていない"));
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(body.len() >= 2, "{width}: 折り返していない");
+            let head = body[0].2;
+            assert!(head > bar.2 + 1.0, "{width}: 本文が帯の右に無い");
+            for b in &body {
+                assert!(
+                    b.2 >= head - 0.5,
+                    "{width}: 折り返した行が帯の下へ潜った ({b:?} < {head})"
+                );
+            }
+        }
+    }
+
+    /// 脚注定義の続きの行も、ラベルの右へぶら下がる。
+    #[test]
+    fn 脚注定義は続きの行までラベルの右へ揃う() {
+        let long = "脚注の本文をわざと長くしてぶら下げの検査に使います。".repeat(4);
+        let doc = format!("[^1]: {long}\n  字下げした続きの行も同じ項目として扱われます。\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(doc, width);
+            let label = rows
+                .iter()
+                .find(|r| r.4.contains("[1]"))
+                .unwrap_or_else(|| panic!("{width}: ラベルが無い"));
+            let body: Vec<_> = rows.iter().filter(|r| !r.4.contains("[1]")).collect();
+            let head = body[0].2;
+            assert!(head > label.2 + 1.0, "{width}: 本文がラベルの右に無い");
+            for b in &body {
+                assert!(b.2 >= head - 0.5, "{width}: {b:?} が左へ落ちた");
+                assert!(b.3 <= right + 0.5, "{width}: {b:?} が版面をはみ出した");
+            }
+            assert!(
+                body.iter().any(|b| b.4.contains("字下げした続き")),
+                "{width}: 続きの行が本文に入っていない"
+            );
+        }
+    }
+
+    /// 段落の直後の罫線は**水平線ではなく Setext 見出し**。
+    ///
+    /// 旧実装は `is_hr` を先に見ていたので、`本文` + `---` が
+    /// 「段落 + 区切り線」に化けていた (HTML 由来の文書でよく出る形)。
+    #[test]
+    fn 段落の直後の罫線はsetext見出しになる() {
+        let h = |doc: &str| -> f32 {
+            let (rows, _) = md_rows(doc, 700.0);
+            let r = rows.iter().find(|r| r.4.contains("題名になる行")).unwrap();
+            r.1 - r.0
+        };
+        // 1 行だけの段落は旧実装も先読みで拾えていた。**複数行**の段落が本番。
+        let heading = h("題名になる行\n題名の続き\n---\n\n次の段落\n");
+        let plain = h("題名になる行\n題名の続き\n\n---\n\n次の段落\n");
+        assert!(
+            heading > plain * 1.2,
+            "Setext 見出しになっていない (見出し {heading} / 段落 {plain})"
+        );
+    }
+
+    /// 深い入れ子でも本文に読める幅が残る (字下げのほうを削る)。
+    ///
+    /// 旧実装は `add_space` で字下げを積むだけだったので、深い入れ子では
+    /// 残り幅が数ピクセルになり、本文が 1 文字ずつ折り返して読めなくなった。
+    #[test]
+    fn 深い入れ子でも本文の幅が潰れない() {
+        let mut doc = String::new();
+        for d in 0..12 {
+            doc.push_str(&" ".repeat(d * 4));
+            doc.push_str(&format!(
+                "- 深さ {d} の項目。折り返しの検査に使う本文を置く。\n"
+            ));
+        }
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(&doc, width);
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(
+                body.len() >= 12,
+                "{width}: 12 段に描けていない ({})",
+                body.len()
+            );
+            for b in &body {
+                assert!(
+                    right - b.2 >= 14.0 * HANG_MIN_BODY - 0.5,
+                    "{width}: {b:?} の本文に残る幅が {} しかない",
+                    right - b.2
+                );
+                assert!(b.3 <= right + 0.5, "{width}: {b:?} が版面をはみ出した");
+            }
+        }
+    }
+
+    /// 左揃え (`:--`) の 2 列表で、**長い英文が折り返しても行が食い込まない**。
+    ///
+    /// 利用者から実物のスクリーンショットで報告された形 (英語 README の比較表)。
+    /// 「…target one **agent**」が次の行「Miss an approval prompt…」に重なっていた。
+    /// 既存の検査は**右揃えの数値表**だけだったので、
+    /// 「左揃え + 長い英文 + 折り返し」は 1 度も通っていなかった。
+    /// 英語は**単語単位**で折り返すので、日本語 (文字単位) とは折り返し位置の
+    /// 決まり方が違う。ここが穴だった。
+    #[test]
+    fn 左揃えの英文表は折り返しても行が食い込まない() {
+        let doc = "\
+| Without a cockpit | With Zaivern Code |
+|:--|:--|
+| Cycle through tabs to find who needs you | Every agent on one screen, with live status |
+| Paste the same instruction into each tool | Broadcast once to the fleet, or target one agent |
+| Miss an approval prompt and lose the run | Notifications and one-click approval |
+| Stay at your desk while agents work | Check progress and approve from your phone |
+| More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines |
+| A heavy editor competes with your agents for the machine | A single native binary, with damage-driven redraws |
+";
+        // 報告のスクリーンショットは 650px 程度。折り返しが起きる幅を並べる
+        for width in [420.0_f32, 560.0, 650.0, 900.0] {
+            let (rows, _) = md_rows(doc, width);
+            assert!(rows.len() >= 14, "{width}: 描けていない ({})", rows.len());
+            assert!(
+                rows.iter().any(|r| r.4.contains("agent")),
+                "{width}: 報告された文言が出ていない"
+            );
+            no_row_bleed(&rows, width);
+        }
+    }
+
+    /// `html::html_to_md` が吐く表の形 (`| --- |` = 既定の左揃え) でも同じこと。
+    ///
+    /// 変換側は別担当が触っている最中なので、**吐かれる形をそのまま書き写して**
+    /// 描画側だけを固定する (`html_to_md` を呼ぶと、あちらの作業でこちらが落ちる)。
+    #[test]
+    fn html由来の表もセル内の長い英文で食い込まない() {
+        let doc = "\
+| Feature | What it does |
+| --- | --- |
+| Fleet broadcast | Send the same instruction to every agent at once, or target a single agent by name |
+| Approval queue | Collects approval prompts from all agents so a missed prompt never stalls the run |
+| Shared ledger | Keeps two agents from writing the same lines of the same file at the same time |
+";
+        for width in [420.0_f32, 560.0, 650.0, 900.0] {
+            let (rows, _) = md_rows(doc, width);
+            assert!(rows.len() >= 8, "{width}: 描けていない ({})", rows.len());
+            no_row_bleed(&rows, width);
+        }
+    }
+
+    /// 上端が違うのに縦の帯が重なる組が 1 つも無いこと (= 行の食い込み)。
+    ///
+    /// 同じ行に並ぶセルは上端が揃う (`horizontal_top`) ので、
+    /// **上端が違うのに重なったら**それは次の行への食い込み。
+    fn no_row_bleed(rows: &[(f32, f32, f32, f32, String)], width: f32) {
+        for (i, a) in rows.iter().enumerate() {
+            for b in rows.iter().skip(i + 1) {
+                if (a.0 - b.0).abs() < 0.5 {
+                    continue;
+                }
+                let overlap = a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5;
+                assert!(!overlap, "{width}: {a:?} と {b:?} が縦に食い込んだ");
+            }
+        }
+    }
+
+    /// どの幅でも、**どのテキスト行も版面をはみ出さない**。
+    ///
+    /// 実文書 (`docs/*.md`) と `html::html_to_md` が吐く形 (入れ子は空白 2 つ、
+    /// `<br>` はハード改行) を混ぜた入力で確かめる。
+    #[test]
+    fn どの幅でも本文が版面をはみ出さない() {
+        let doc = "\
+# 見出し
+
+本文の段落です。長い文をわざと入れて折り返しの検査に使います。
+
+- 箇条書きの項目をわざと長くして折り返させるための本文です
+  字下げした続きの行もここに畳まれます
+  - 入れ子の項目も同じように長くしておきます
+    - さらに深い入れ子。ここまで来ると幅が狭いときに字下げを削る必要があります
+- [ ] 未完のタスク項目
+- [x] 済みのタスク項目
+
+1. 番号付きの項目もぶら下げが効くこと
+2. 二つ目の項目
+
+> 引用の本文。ここも折り返しの検査に使います。長い文を入れておきます。
+>> 深い引用も帯のぶんだけ右へ寄ります。
+> - 引用の中の箇条書き
+
+題名になる行
+---
+
+[^1]: 脚注の本文もぶら下げます。長めに書いて折り返させます。
+";
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(doc, width);
+            assert!(rows.len() > 12, "{width}: 描けていない ({})", rows.len());
+            for r in &rows {
+                assert!(
+                    r.3 <= right + 0.5,
+                    "{width}: {r:?} が版面 (右端 {right}) をはみ出した"
+                );
+                assert!(r.2 >= -0.5, "{width}: {r:?} が左へはみ出した");
+            }
         }
     }
 }
