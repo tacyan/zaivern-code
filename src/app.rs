@@ -930,27 +930,6 @@ fn next_unread(unread: &[bool], from: usize) -> Option<usize> {
     (1..=n).map(|step| (from + step) % n).find(|&i| unread[i])
 }
 
-/// 見張りの段 → 通知の遷移判定に使う粗い 3 値 (純関数)。
-///
-/// 設計原則 4 の実装: 画面の文字列ではなく、**見張り (supervisor) が既に
-/// 段位付きで出した判定**だけを見る。曖昧なものは `None` を返して
-/// [`notify::WorkGate`] に段を動かさせない。
-///
-/// * 走っていない → `None` (プロセスの終了は `SessionEvent::Exited` の担当)
-/// * 承認待ち / エラー / 異常終了 → `None` (**要対応イベント**であって遷移ではない。
-///   専用の通知が別に鳴るので、ここで二重に鳴らさない)
-fn work_phase(running: bool, sup: Option<supervisor::SessionState>) -> Option<notify::WorkPhase> {
-    use supervisor::SessionState as S;
-    if !running {
-        return None;
-    }
-    match sup? {
-        S::Working | S::Stalled | S::Looping => Some(notify::WorkPhase::Working),
-        S::Idle => Some(notify::WorkPhase::Idle),
-        S::WaitingApproval | S::Errored | S::Crashed | S::Done => None,
-    }
-}
-
 /// **ボトムパネルの中身。** 同時に 2 つは描かない。
 ///
 /// 中央ビュー ([`CenterView`]) と同じ理由でここも 1 個の値へ畳む。
@@ -12378,7 +12357,7 @@ impl ZaivernApp {
                 (
                     s.id,
                     s.title.clone(),
-                    work_phase(s.running(), self.supervisor.state_of(s.id)),
+                    self.supervisor.notify_phase_of(s.id, s.running()),
                 )
             })
             .collect();
@@ -31448,87 +31427,6 @@ mod unread_cursor_tests {
 }
 
 /// 通知の遷移判定 — 見張りの段を 3 値へ畳むところ。
-#[cfg(test)]
-mod work_phase_tests {
-    use super::*;
-    use supervisor::SessionState as S;
-
-    #[test]
-    fn 走っていないセッションは段を持たない() {
-        // プロセスの終了は `SessionEvent::Exited` の担当なので二重に鳴らさない
-        assert_eq!(work_phase(false, Some(S::Working)), None);
-        assert_eq!(work_phase(false, Some(S::Done)), None);
-        assert_eq!(work_phase(false, None), None);
-    }
-
-    #[test]
-    fn 見張りの段を3値へ畳む() {
-        assert_eq!(
-            work_phase(true, Some(S::Working)),
-            Some(notify::WorkPhase::Working)
-        );
-        assert_eq!(
-            work_phase(true, Some(S::Stalled)),
-            Some(notify::WorkPhase::Working)
-        );
-        assert_eq!(
-            work_phase(true, Some(S::Looping)),
-            Some(notify::WorkPhase::Working)
-        );
-        assert_eq!(
-            work_phase(true, Some(S::Idle)),
-            Some(notify::WorkPhase::Idle)
-        );
-    }
-
-    #[test]
-    fn 要対応イベントは遷移として扱わない() {
-        // 承認待ち・エラー・異常終了は専用の通知が持っている (残してある)
-        assert_eq!(work_phase(true, Some(S::WaitingApproval)), None);
-        assert_eq!(work_phase(true, Some(S::Errored)), None);
-        assert_eq!(work_phase(true, Some(S::Crashed)), None);
-        // 見張りの観測が足りないフレームも段を動かさない
-        assert_eq!(work_phase(true, None), None);
-    }
-
-    #[test]
-    fn 稼働中から待機で1回だけ鳴り待機のままなら鳴らない() {
-        let mut g = notify::WorkGate::default();
-        assert!(!g.note(1, work_phase(true, Some(S::Working))));
-        assert!(g.note(1, work_phase(true, Some(S::Idle))));
-        for _ in 0..10 {
-            assert!(!g.note(1, work_phase(true, Some(S::Idle))));
-        }
-    }
-
-    #[test]
-    fn 待機から稼働へ戻ってまた待機なら2回鳴る() {
-        let mut g = notify::WorkGate::default();
-        g.note(1, work_phase(true, Some(S::Working)));
-        assert!(g.note(1, work_phase(true, Some(S::Idle))));
-        assert!(!g.note(1, work_phase(true, Some(S::Working))));
-        assert!(g.note(1, work_phase(true, Some(S::Idle))));
-    }
-
-    #[test]
-    fn 承認を挟んでも作業完了は1回だけ鳴る() {
-        let mut g = notify::WorkGate::default();
-        g.note(1, work_phase(true, Some(S::Working)));
-        g.note(1, work_phase(true, Some(S::WaitingApproval)));
-        g.note(1, work_phase(true, Some(S::WaitingApproval)));
-        assert!(g.note(1, work_phase(true, Some(S::Idle))));
-    }
-
-    #[test]
-    fn 起動直後の初期状態で誤爆しない() {
-        let mut g = notify::WorkGate::default();
-        // 起動直後は見張りの観測がまだ無い → 段が動かない
-        assert!(!g.note(1, work_phase(true, None)));
-        // 最初の観測がいきなり待機でも鳴らない
-        assert!(!g.note(1, work_phase(true, Some(S::Idle))));
-    }
-}
-
 /// コスト上限の配線 (ソース構造の回帰テスト)。
 ///
 /// 判定そのものは `coordinator::quota` の純粋関数がテーブルテストで押さえて
@@ -31691,7 +31589,7 @@ mod follow_wiring_tests {
             "遷移エッジの門番を通っていない"
         );
         assert!(
-            body.contains("work_phase(s.running(), self.supervisor.state_of(s.id))"),
+            body.contains("self.supervisor.notify_phase_of(s.id, s.running())"),
             "段を画面から推測している (設計原則 4 違反)"
         );
     }

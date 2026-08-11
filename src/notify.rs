@@ -3,15 +3,59 @@
 //! 依存クレートを使わず `std::process::Command` でシェルアウトする。
 //! 通知は非同期(spawn のみ、wait しない)で送り、失敗はすべて無視する。
 
-#![allow(dead_code)]
-
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// body の最大文字数(char 単位、マルチバイト安全)。
 const MAX_BODY_CHARS: usize = 200;
 
+/// 通知を出してよいか。**既定はオン**(設定を持たない版・欄の無い
+/// `config.toml` から起動しても、いままでと同じ挙動になる)。
+///
+/// この層は依存を持たない設計なので、**設定を読む経路をここへ持ち込まない**。
+/// 値を入れるのは設定を持っている側 (`config::apply_runtime_flags`) の仕事で、
+/// ここは旗を見るだけにする。旗にするのは、通知の呼び出しが 16 箇所あり
+/// **入口で止めないと必ず取りこぼす**ため (呼び出し側を 16 箇所直す形にすると、
+/// 次に足された 17 箇所目が黙って鳴る)。
+const ENABLED_DEFAULT: bool = true;
+static ENABLED: AtomicBool = AtomicBool::new(ENABLED_DEFAULT);
+
+/// 通知のオン/オフを切り替える。上位 (設定) から呼ぶ。
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// いま通知を出す設定か。
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// OS のネイティブ通知を非同期(spawn、wait しない)で送る。失敗は無視。
+///
+/// **オフのときは 1 プロセスも起こさない** (`osascript` / `notify-send` /
+/// `powershell` のどれも spawn しない = 音も鳴らない)。
 pub fn notify(title: &str, body: &str) {
+    if let Some(mut cmd) = notify_plan(title, body) {
+        spawn_and_reap(&mut cmd);
+    }
+}
+
+/// 通知 1 回で**起こすことになるコマンド**。オフなら `None`。
+///
+/// spawn する前にここで全部決まるので、テストは
+/// **実際に通知を飛ばさずに**「1 プロセスも起こさない」ことを確かめられる
+/// (`Command::get_program` で何を起こすつもりだったかまで見える)。
+fn notify_plan(title: &str, body: &str) -> Option<Command> {
+    plan_for(enabled(), title, body)
+}
+
+/// [`notify_plan`] の実体。**旗を引数で受ける純粋な形**にしてあるのは、
+/// プロセス共通の旗を書き換えずに検査するため (書き換えると、同時に走って
+/// いる他のテストの `config::load` が旗を戻して偽の赤が出る)。
+fn plan_for(on: bool, title: &str, body: &str) -> Option<Command> {
+    if !on {
+        return None;
+    }
     let body = truncate_chars(body, MAX_BODY_CHARS);
 
     if cfg!(target_os = "macos") {
@@ -22,10 +66,14 @@ pub fn notify(title: &str, body: &str) {
             escape_applescript(&body),
             escape_applescript(title),
         );
-        spawn_and_reap(Command::new("osascript").args(["-e", &script]));
+        let mut c = Command::new("osascript");
+        c.args(["-e", &script]);
+        Some(c)
     } else if cfg!(target_os = "linux") {
         // notify-send が存在しなければ spawn が Err になるだけで、黙って何もしない。
-        spawn_and_reap(Command::new("notify-send").args([title, &body]));
+        let mut c = Command::new("notify-send");
+        c.args([title, &body]);
+        Some(c)
     } else if cfg!(target_os = "windows") {
         // ベストエフォート: PowerShell の WinRT トースト通知。
         // シングルクォート文字列に埋め込むため ' を '' に二重化する。
@@ -41,14 +89,18 @@ pub fn notify(title: &str, body: &str) {
             title = escape_powershell_single_quoted(title),
             body = escape_powershell_single_quoted(&body),
         );
-        spawn_and_reap(Command::new("powershell").args([
+        let mut c = Command::new("powershell");
+        c.args([
             "-NoProfile",
             "-NonInteractive",
             "-WindowStyle",
             "Hidden",
             "-Command",
             &script,
-        ]));
+        ]);
+        Some(c)
+    } else {
+        None
     }
 }
 
@@ -83,10 +135,32 @@ fn spawn_and_reap(cmd: &mut Command) {
 ///
 /// curl は macOS / Windows 10+ / ほとんどの Linux に同梱されている。
 /// 無い環境では spawn が失敗して黙って何もしない (通知は常にベストエフォート)。
+///
+/// **オン/オフは OS 通知と同じ旗で決める。** 設計原則 5
+/// 「ハンドラは 1 面、トランスポートは多数」— 鳴らすかどうかの**判断は 1 つ**で、
+/// デスクトップと webhook はその配り先の違いでしかない。旗を 2 つに割ると
+/// 「通知を切ったのに Slack だけ鳴り続ける」が起きる。
+/// webhook だけ止めたい場合は URL を空にすればよい (既に別の切り口がある)。
 pub fn webhook(url: &str, title: &str, body: &str) {
+    if let Some(mut cmd) = webhook_plan(url, title, body) {
+        spawn_and_reap(&mut cmd);
+    }
+}
+
+/// webhook 1 回で**起こすことになるコマンド**。オフ / URL 不正なら `None`。
+/// 切り出す理由は [`notify_plan`] と同じ (spawn せずに検査できる)。
+fn webhook_plan(url: &str, title: &str, body: &str) -> Option<Command> {
+    webhook_plan_for(enabled(), url, title, body)
+}
+
+/// [`webhook_plan`] の実体。旗を引数で受ける理由は [`plan_for`] と同じ。
+fn webhook_plan_for(on: bool, url: &str, title: &str, body: &str) -> Option<Command> {
+    if !on {
+        return None;
+    }
     let url = url.trim();
     if url.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
-        return;
+        return None;
     }
     let body = truncate_chars(body, MAX_BODY_CHARS);
     let is_json = url.contains("hooks.slack.com")
@@ -118,7 +192,7 @@ pub fn webhook(url: &str, title: &str, body: &str) {
         ]);
     }
     cmd.arg(url);
-    spawn_and_reap(&mut cmd);
+    Some(cmd)
 }
 
 /// JSON 文字列リテラルへのエスケープ(純関数)。
@@ -228,7 +302,10 @@ impl WorkGate {
         self.seen.remove(&id);
     }
 
-    /// いま覚えている段 (テストと表示用)。
+    /// いま覚えている段。**画面に出している場所は無い**ので、
+    /// モジュール全体の `allow(dead_code)` を外した機に検査用へ絞った
+    /// (表示に使いたくなったら `cfg(test)` を外して呼び出し側を足すこと)。
+    #[cfg(test)]
     pub fn phase(&self, id: u64) -> WorkPhase {
         self.seen.get(&id).copied().unwrap_or_default()
     }
@@ -439,8 +516,50 @@ mod tests {
     #[test]
     fn webhook_rejects_non_http_urls() {
         // URL でないもの・空は何もしない (spawn さえしない)。パニックしないことの確認。
-        webhook("", "t", "b");
-        webhook("ftp://example.com", "t", "b");
-        webhook("javascript:alert(1)", "t", "b");
+        assert!(webhook_plan_for(true, "", "t", "b").is_none());
+        assert!(webhook_plan_for(true, "ftp://example.com", "t", "b").is_none());
+        assert!(webhook_plan_for(true, "javascript:alert(1)", "t", "b").is_none());
+    }
+
+    // ── 通知のオン/オフ ──────────────────────────────────────────────
+    //
+    // 旗はプロセス共通なので、**この 1 本の中で完結させて必ず戻す**
+    // (同時に走っている他のテストへ漏らさない)。
+    // 検査は `*_plan` に対して行うので、**実際の通知は 1 度も飛ばない**。
+
+    #[test]
+    fn 通知がオフのときはosのコマンドを1つも起こさない() {
+        // 旗を書き換えずに、旗の値を引数で与えて検査する
+        // (**実際の通知は 1 度も飛ばない**し、他のテストとも干渉しない)。
+        assert!(
+            plan_for(false, "題名", "本文").is_none(),
+            "オフなのに OS 通知のプロセスを起こそうとした (macOS は音が鳴る)"
+        );
+        assert!(
+            webhook_plan_for(false, "https://hooks.slack.com/services/x", "題名", "本文").is_none(),
+            "オフなのに webhook を送ろうとした"
+        );
+    }
+
+    #[test]
+    fn 通知がオンなら従来どおりosのコマンドを起こす() {
+        let plan = plan_for(true, "題名", "本文");
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
+            let p = plan.expect("オンなのに何も起こさない");
+            let prog = p.get_program().to_string_lossy().into_owned();
+            assert!(
+                ["osascript", "notify-send", "powershell"].contains(&prog.as_str()),
+                "知らないコマンドを起こそうとした: {prog}"
+            );
+        } else {
+            assert!(plan.is_none(), "対応していない OS では何も起こさない");
+        }
+        let w = webhook_plan_for(true, "https://hooks.slack.com/services/x", "題名", "本文")
+            .expect("オンなら webhook は出る");
+        assert_eq!(w.get_program(), "curl");
     }
 }

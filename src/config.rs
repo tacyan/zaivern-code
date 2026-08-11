@@ -2036,7 +2036,22 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     publish_auto_yes_rules(&cfg);
     // 承認ポリシーと承認/拒否キーも同じタイミングで配る。
     publish_approval_policies(&cfg);
+    // 機能が宣言した設定のうち、実行時の旗へ写す必要があるものも配る。
+    apply_runtime_flags(&cfg);
     cfg
+}
+
+/// 機能の設定を**実行時の旗**へ写す。設定を読み直せば再起動なしで反映される。
+///
+/// 旗を持っている側 (`notify` 等) は依存を持たない下層なので、設定を読む
+/// 経路をそちらへ持ち込まない。**写す向きはここからの一方通行**にして、
+/// 「同じ事実を 2 箇所に持って片方だけ更新される」経路を作らない。
+///
+/// 呼ぶのは 2 か所だけ: [`load`] の最後と [`set_setting_value`] の機能設定枝。
+/// この 2 つで「起動 / 設定の読み直し / ワークスペース切り替え / 設定画面での
+/// 変更」が全部覆える。
+pub fn apply_runtime_flags(cfg: &Config) {
+    crate::notify::set_enabled(cfg.feature_bool(crate::features::notifications::KEY_ENABLED));
 }
 
 /// `[[auto_yes_rules]]` を自動YESの応答エンジン (src/agents.rs) へ登録する。
@@ -3155,7 +3170,16 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "ssh_tunnel_host" => t!(cfg.ssh_tunnel_host),
         // 機能が**宣言している**キーだけ機能の設定として書く。
         // 宣言の無いキーは従来どおり false (打ち間違いを黙って通さない)。
-        _ => feature_setting(key).is_some() && cfg.set_feature(key, v.clone()),
+        _ => {
+            if feature_setting(key).is_none() || !cfg.set_feature(key, v.clone()) {
+                return false;
+            }
+            // 書けたら実行時の旗へも写す (設定画面で切り替えた瞬間に効く)。
+            // 個別のキーをここで見分けない — 見分けると設定が増えるたびに
+            // この共有ファイルへ追記することになる。
+            apply_runtime_flags(cfg);
+            true
+        }
     }
 }
 
@@ -6511,6 +6535,77 @@ theme = "zaivern-dark"
         let cfg: Config = toml::from_str(&out).expect("書き戻した結果が読めない");
         assert_eq!(cfg.feature_i64("whichkey.delay_ms"), 500);
         assert!(cfg.feature_bool("みらいの機能.flag"));
+    }
+
+    // ── 通知のオン/オフ ──────────────────────────────────────────────
+
+    /// 欄の無い古い `config.toml` (と、そもそも設定を作っていない利用者) が
+    /// **オンのまま**であること。ここがオフに倒れると、更新しただけで
+    /// 通知が消えたように見える。
+    #[test]
+    fn 通知の既定はオンで欄の無い設定ファイルも壊れない() {
+        use crate::features::notifications::KEY_ENABLED;
+        // 欄が 1 つも無い config.toml
+        let cfg: Config = toml::from_str("theme = \"zaivern-dark\"\n").expect("読めない");
+        assert!(!cfg.extra.contains_key(KEY_ENABLED), "無い欄を勝手に埋めた");
+        assert!(cfg.feature_bool(KEY_ENABLED), "欄が無いのにオフへ倒れた");
+        // 既定の Config も同じ
+        assert!(Config::default().feature_bool(KEY_ENABLED));
+        // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::enabled());
+    }
+
+    /// 設定画面 (⚙) の行として出ていること。**ここが空だと切り替えられない**
+    /// (レジストリに登録しただけで到達経路が無い状態になる)。
+    #[test]
+    fn 通知の設定は設定画面の行として出る() {
+        use crate::features::notifications::KEY_ENABLED;
+        let d = all_setting_defs()
+            .iter()
+            .find(|d| d.key == KEY_ENABLED)
+            .expect("設定画面に行が出ていない");
+        assert!(
+            matches!(d.kind, SettingKind::Bool),
+            "チェックボックスで出る"
+        );
+        // 検索でも引ける (設定画面は settings_rows 越しに描く)
+        let cfg = Config::default();
+        assert!(
+            settings_rows(&cfg, "通知", false)
+                .iter()
+                .any(|r| r.key == KEY_ENABLED),
+            "「通知」で検索しても出てこない"
+        );
+    }
+
+    /// 設定画面から切り替えると、値が保存側にも実行時の旗にも届くこと。
+    #[test]
+    fn 通知の設定を切り替えると値が保存側へ届く() {
+        use crate::features::notifications::KEY_ENABLED;
+        let mut cfg = Config::default();
+        assert!(
+            set_setting_value(&mut cfg, KEY_ENABLED, &SettingValue::Bool(false)),
+            "設定画面からの書き込みが弾かれた"
+        );
+        assert!(!cfg.feature_bool(KEY_ENABLED), "オフが保存されていない");
+        // 実際に鳴らすかどうかは notify 側の純粋な判定が持つ
+        // (旗はプロセス共通なので、ここでオフを観測しに行くと
+        //  同時に走る他のテストの `load` と取り合って偽の赤が出る)。
+        assert!(set_setting_value(
+            &mut cfg,
+            KEY_ENABLED,
+            &SettingValue::Bool(true)
+        ));
+        assert!(cfg.feature_bool(KEY_ENABLED));
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::enabled(), "オンへ戻しても鳴らない");
+        // 型違いは書かせない (書けると読み出しが既定へ落ちて「効かない」になる)
+        assert!(!set_setting_value(
+            &mut cfg,
+            KEY_ENABLED,
+            &SettingValue::Int(1)
+        ));
     }
 
     #[test]
