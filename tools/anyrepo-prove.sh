@@ -477,6 +477,8 @@ json.dump({
     "root": $(printf '%s' "$root" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "repo": $(printf '%s' "$repo" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "zai": $(printf '%s' "$zai" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "target_dir": $(printf '%s' "$target_dir" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "zai_note": $(printf '%s' "$zai_note" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "work": $(printf '%s' "$work" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "writers": [int(x) for x in "$wlist".split()],
     "overlap": float("$overlap"),
@@ -745,13 +747,27 @@ def fingerprint(path):
                 break
         out["tree"] = h("\n".join(rows))
         return out
+    def nz(s):
+        return sum(1 for x in s.split("\n") if x.strip())
+
+    # **数も一緒に持つ。** ハッシュだけだと「変わった」としか言えず、
+    # 利用者は「何が」「どれだけ」動いたのかを追えない (V6 の弱点だった)
+    refs = git(["for-each-ref"], path, check=False, ro=True).out
+    status = git(["status", "--porcelain", "-uall"], path, check=False, ro=True).out
+    objs = git(["count-objects", "-v"], path, check=False, ro=True).out
+    wts = git(["worktree", "list", "--porcelain"], path, check=False, ro=True).out
+    conf = git(["config", "--local", "--list"], path, check=False, ro=True).out
+    nobj = "?"
+    for line in objs.split("\n"):
+        if line.startswith("count:"):
+            nobj = line.split(":", 1)[1].strip()
     out["head"] = git(["rev-parse", "HEAD"], path, check=False, ro=True).out.strip()
-    out["refs"] = h(git(["for-each-ref"], path, check=False, ro=True).out)
-    out["status"] = h(git(["status", "--porcelain", "-uall"], path, check=False, ro=True).out)
-    out["objects"] = h(git(["count-objects", "-v"], path, check=False, ro=True).out)
-    out["worktrees"] = h(git(["worktree", "list", "--porcelain"], path, check=False,
-                             ro=True).out)
-    out["config"] = h(git(["config", "--local", "--list"], path, check=False, ro=True).out)
+    out["refs"] = "%d 本 %s" % (nz(refs), h(refs))
+    out["status"] = "%d 行 %s" % (nz(status), h(status))
+    out["objects"] = "loose %s %s" % (nobj, h(objs))
+    out["worktrees"] = "%d 個 %s" % (
+        sum(1 for x in wts.split("\n") if x.startswith("worktree ")), h(wts))
+    out["config"] = "%d 行 %s" % (nz(conf), h(conf))
     return out
 
 
@@ -788,7 +804,19 @@ def clone_repo(src, dst):
 # ═════════════════════════════════════════════════════════════════════
 
 
+# テキストとして通してよい制御文字 (タブ・改行・改頁・垂直タブ・BS・ESC)。
+TEXT_CTRL = set(b"\t\n\r\f\v\b\x1b")
+
+
 def is_probably_text(path, cap=8192):
+    """git がテキストとして三方向マージする見込みがあるか。
+
+    **UTF-8 を要求しない。** ハーネスはバイト列で編集するので、Shift_JIS や
+    latin-1 のファイルも壊さずに扱える。git 自身の判定も「先頭 8000 バイトに
+    NUL があるか」だけなので、UTF-8 を要求すると**レガシー文字コードの
+    リポジトリだけ標本から丸ごと消える** (= その利用者には何も証明していない
+    のに「証明できた」と出る)。
+    """
     try:
         with open(path, "rb") as fh:
             head = fh.read(cap)
@@ -796,15 +824,17 @@ def is_probably_text(path, cap=8192):
         return False
     if b"\x00" in head:
         return False
+    # 制御文字だらけなら本文ではない (NUL を持たないバイナリ除け)
+    ctrl = sum(1 for b in head if b < 0x20 and b not in TEXT_CTRL)
+    return ctrl * 100 <= len(head)
+
+
+def is_utf8(data):
     try:
-        head.decode("utf-8")
+        data.decode("utf-8")
+        return True
     except UnicodeDecodeError:
-        # 途中で切れた多バイト文字は許す。全滅なら弾く
-        try:
-            head[: max(0, len(head) - 4)].decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-    return True
+        return False
 
 
 def churn_map(clone):
@@ -846,6 +876,7 @@ def sample_corpus(clone, cfg, rng):
     min_lines = cfg["stride"] * (cfg["hot_blocks"] + 1) * MIN_LINES_FACTOR
     langs = {}
     cands = []
+    eol = {"crlf": 0, "lf": 0, "cr": 0, "mixed": 0, "bom": 0, "non_utf8": 0}
     for rel in scanned:
         ap = os.path.join(clone, rel)
         try:
@@ -857,20 +888,39 @@ def sample_corpus(clone, cfg, rng):
         if not is_probably_text(ap):
             continue
         try:
-            with open(ap, "r", encoding="utf-8", errors="replace") as fh:
-                nl = fh.read().count("\n") + 1
+            # **バイト列で数える。** テキストで開くと `\r\n` も孤立 `\r` も
+            # `\n` へ畳まれ、行数が改行コードによって変わる
+            with open(ap, "rb") as fh:
+                data = fh.read()
         except OSError:
             continue
+        nl = data.count(b"\n") + 1
         if nl < min_lines:
             continue
+        crlf, lonecr, lf, bom = eol_kind(data)
+        kinds = sum(1 for v in (crlf, lonecr, lf) if v)
+        if bom:
+            eol["bom"] += 1
+        if not is_utf8(data):
+            eol["non_utf8"] += 1
+        if kinds > 1:
+            eol["mixed"] += 1
+        elif crlf:
+            eol["crlf"] += 1
+        elif lonecr:
+            eol["cr"] += 1
+        else:
+            eol["lf"] += 1
         ext = os.path.splitext(rel)[1].lower() or "(拡張子なし)"
         langs[ext] = langs.get(ext, 0) + 1
         cands.append({
             "path": rel, "lines": nl, "bytes": st.st_size,
             "churn": churn.get(rel, 0), "ext": ext,
+            "crlf": crlf, "lonecr": lonecr, "bom": bom,
         })
     cands.sort(key=lambda c: (-c["churn"], -c["lines"], c["path"]))
     stats["eligible"] = len(cands)
+    stats["eol"] = eol
     stats["languages"] = dict(sorted(langs.items(), key=lambda kv: -kv[1])[:12])
     stats["min_lines"] = min_lines
     stats["max_bytes"] = cfg["max_bytes"]
@@ -973,19 +1023,66 @@ def parse_granted(out):
     return (m.group(1), s, e)
 
 
-MARK = "  /*@ANYREPO-PROVE w%d @*/"
+MARK = b"  /*@ANYREPO-PROVE w%d @*/"
 
 
 def edited_text(old, line_no, writer):
-    """`line_no` (1 始まり) の**末尾に目印を足す**だけの編集。
+    """`line_no` (1 始まり) の**末尾に目印を足す**だけの編集。**バイト列で扱う**。
 
     言語に依らないし、意味も持たない。ビルドはしないので構文は問わない。
     大事なのは「同じ行を 2 人が触れば git が必ず衝突させる」ことだけ。
+
+    ## なぜ str ではなくバイト列なのか (**証明を偽にしていた欠陥**)
+
+    以前は `open(..., "r")` / `open(..., "w")` を `newline=""` 無しで使って
+    いた。Python の既定は**汎用改行**なので、読んだ時点で `\\r\\n` が `\\n` へ
+    畳まれ、書き戻すと**そのファイルは 1 行残らず LF へ書き換わる**。
+    ハーネスが全行を書き換えるのだから、どの段でも必ず衝突する。実測で、
+    ある実在リポジトリの失敗 5 件は**すべて CRLF の 4 ファイル**が原因で、
+    LF へ正規化した複製では 8 通りの設定すべてが衝突 0 だった。
+    **Windows 由来のリポジトリは、守られているのに「証明できず」と言われていた。**
+
+    バイト列で扱えば BOM も混在改行も非 UTF-8 もそのまま通る。CRLF の行は
+    末尾の `\\r` の**手前**へ目印を入れて、その行の改行も CRLF のまま残す。
     """
-    lines = old.split("\n")
+    lines = old.split(b"\n")
     i = min(max(0, line_no - 1), len(lines) - 1)
-    lines[i] = lines[i] + (MARK % writer)
-    return "\n".join(lines), i + 1
+    body, cr = lines[i], b""
+    if body.endswith(b"\r"):
+        body, cr = body[:-1], b"\r"
+    lines[i] = body + (MARK % writer) + cr
+    return b"\n".join(lines), i + 1
+
+
+def mark_only(old, new, writer, line_no):
+    """編集が**`line_no` への目印 1 つの追加だけ**であることの裏取り。
+
+    ここが偽になるのは、改行やエンコードを勝手に書き換えたときだけである
+    (それこそが上の欠陥だった)。**測る側が対象を書き換えていないこと**を、
+    毎回 1 件ずつ実際に確かめる — 口約束にしない。
+
+    **ファイル全体から目印を 1 つ消して比べてはいけない。** 同じ書き手が
+    同じファイルの別の行を 2 回編集すると、消えるのは前回の目印なので
+    偽の警報になる (実際に 8 体で 7 件出した)。行ごとに突き合わせること。
+    """
+    o, n = old.split(b"\n"), new.split(b"\n")
+    if len(o) != len(n):
+        return False
+    i = line_no - 1
+    if not 0 <= i < len(o):
+        return False
+    for k in range(len(o)):
+        if k != i and o[k] != n[k]:
+            return False
+    return n[i].replace(MARK % writer, b"", 1) == o[i]
+
+
+def eol_kind(data):
+    """バイト列の改行の様子。`(crlf, lonecr, lf, bom)` の 4 つ組。"""
+    crlf = data.count(b"\r\n")
+    lf = data.count(b"\n") - crlf
+    cr = data.count(b"\r") - crlf
+    return crlf, cr, lf, data.startswith(b"\xef\xbb\xbf")
 
 
 class Writer(threading.Thread):
@@ -1008,6 +1105,7 @@ class Writer(threading.Thread):
         self.gate_calls = 0
         self.gate_denied = 0
         self.skipped_out_of_file = 0
+        self.mangled = 0
         self.timeouts = 0
         self.gate_ms = []
         self.claim_ms = []
@@ -1058,12 +1156,16 @@ class Writer(threading.Thread):
         **ファイル全体扱いへ広がる**。実リポジトリは重複行だらけなので、
         行域の効き目を測るには全文を渡すのが唯一正しい形 (実測で確認済み)。
         """
+        # フックの payload は JSON なので、ここだけは文字列にするしかない。
+        # **ファイルへ書くのはあくまでバイト列の方**なので、この復号で
+        # 対象ファイルの改行やエンコードが変わることはない。
         payload = json.dumps({
             "session_id": self.session,
             "cwd": self.wt,
             "hook_event_name": "PreToolUse",
             "tool_name": "Write",
-            "tool_input": {"file_path": abspath, "content": newtext},
+            "tool_input": {"file_path": abspath,
+                           "content": newtext.decode("utf-8", "replace")},
         })
         r = run([self.zai, "hook", "--zaivern", "claude", "PreToolUse"], stdin=payload)
         self.gate_ms.append(r.ms)
@@ -1087,21 +1189,29 @@ class Writer(threading.Thread):
                     if line is None:
                         continue
                 try:
-                    with open(ap, "r", encoding="utf-8", errors="replace") as fh:
+                    # **バイト列で読む。** テキストで開くと CRLF が畳まれ、
+                    # 書き戻した瞬間にファイル全体が LF へ変わる (= 全行衝突)
+                    with open(ap, "rb") as fh:
                         old = fh.read()
                 except OSError:
                     continue
-                if line > old.count("\n") + 1:
+                if line > old.count(b"\n") + 1:
                     # ずらした先がファイルの外。**書かずに数える** (縮めて
                     # 重ねると 2 人が同じ行に載る = 保護が消える)
                     self.skipped_out_of_file += 1
                     continue
                 new, actual = edited_text(old, line, self.idx + 1)
+                if not mark_only(old, new, self.idx + 1, actual):
+                    # 目印以外が動いた = ハーネスが対象を壊している。
+                    # **黙って続けない** (これを黙認していたのが元の欠陥)
+                    self.mangled += 1
+                    self.note(ev="mangled", path=rel, asked=asked, line=line)
+                    continue
                 if self.zai and self.gate(ap, new):
                     self.gate_denied += 1
                     self.note(ev="gate-deny", path=rel, asked=asked, line=line)
                     continue
-                with open(ap, "w", encoding="utf-8") as fh:
+                with open(ap, "wb") as fh:
                     fh.write(new)
                 self.written.add((rel, actual))
                 self.note(ev="write", path=rel, asked=asked, line=actual)
@@ -1124,23 +1234,28 @@ def resolve_union(path):
     綺麗になる。両側を残すのが人手の解決にいちばん近い。
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            src = fh.read().split("\n")
+        # **ここもバイト列。** テキストで開くと衝突を片付けるついでに
+        # ファイル全体の改行が LF へ変わり、次のマージが必ず衝突する
+        with open(path, "rb") as fh:
+            src = fh.read().split(b"\n")
     except OSError:
         return 0, 0
     out, hunks, clines, mode = [], 0, 0, 0
     for line in src:
-        if line.startswith("<<<<<<< "):
+        # 目印の行だけ `\r` を落として見る (git は印を LF で書くが、
+        # CRLF のファイルでは印の行にも `\r` が付くことがある)
+        bare = line[:-1] if line.endswith(b"\r") else line
+        if bare.startswith(b"<<<<<<< "):
             hunks += 1
             mode = CONF_OURS
             continue
-        if mode and line.startswith("||||||| "):
+        if mode and bare.startswith(b"||||||| "):
             mode = CONF_BASE
             continue
-        if mode and line == "=======":
+        if mode and bare == b"=======":
             mode = CONF_THEIRS
             continue
-        if mode and line.startswith(">>>>>>> "):
+        if mode and bare.startswith(b">>>>>>> "):
             mode = 0
             continue
         if mode == CONF_BASE:
@@ -1148,8 +1263,8 @@ def resolve_union(path):
         if mode:
             clines += 1
         out.append(line)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(out))
+    with open(path, "wb") as fh:
+        fh.write(b"\n".join(out))
     return hunks, clines
 
 
@@ -1312,6 +1427,7 @@ def run_stage(name, clone, work, base, plan, cands, cfg, zai=None, shift=False):
         gate_calls=sum(w.gate_calls for w in ws),
         gate_denied=sum(w.gate_denied for w in ws),
         skipped_out_of_file=sum(w.skipped_out_of_file for w in ws),
+        mangled=sum(w.mangled for w in ws),
         timeouts=sum(w.timeouts for w in ws),
         dup_lines=dup_files,
         dup_writes=dup_writes,
@@ -1373,6 +1489,218 @@ def check_version(zai, root, checks):
                                     "ワークスペース指定として扱い GUI を起こします**"),
     })
     return got
+
+
+# ── V7: バイナリの素性 (**`touch` で破れない側の判定**) ─────────────
+#
+# 元の関所は「ソースの mtime > バイナリの mtime なら古い」だけだった。
+# **中身の違うバイナリを stale と弾いた直後に `touch` を 1 回する**と、
+# 版は同じ・mtime は新しいので受け入れられ、ハーネスは「証明できた」と出す。
+# 端から端まで再現した。
+#
+# ここで打つ手は「**前回の判定を、バイナリの同一性とソースの内容ハッシュで
+# 覚えておく**」こと。`touch` は mtime しか動かさないので、
+#   * バイナリが同じ (unix: dev+inode+サイズ / windows: 作成時刻+サイズ) で
+#   * ソースの内容ハッシュが前回と同じ
+# なら**前回の判定をそのまま繰り返す** (= 一度 stale と判った物は touch では
+# 生き返らない)。ソースの内容だけが変わった場合は、バイナリが同じである以上
+# 中身は追いついていないので **無条件に stale**。
+#
+# **正直に書く弱点**: スタンプが 1 つも無い状態での初回だけは mtime しか
+# 手掛かりが無い。これを閉じるには build.rs でソースのハッシュをバイナリへ
+# 焼き込むしかなく、それは別の担当ファイルなのでここでは出来ない。
+STAMP_SUFFIX = ".anyrepo-srcstamp"
+
+
+def bin_identity(path):
+    """`touch` で動かない実行ファイルの同一性。**両 OS を実装する**。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if os.name == "nt":
+        # Windows に inode は無いが作成時刻がある。`touch` 相当
+        # (Set-ItemProperty LastWriteTime) では動かない
+        return "win:%d:%d" % (int(getattr(st, "st_birthtime", st.st_ctime)), st.st_size)
+    return "unix:%d:%d:%d" % (st.st_dev, st.st_ino, st.st_size)
+
+
+def source_digest(root):
+    """`src/**.rs` + `Cargo.toml` + `build.rs` の**内容**の指紋。
+
+    ハッシュは相対パスを混ぜてから内容を流し込む (名前の入れ替えも拾う)。
+    """
+    src = os.path.join(root, "src")
+    if not os.path.isdir(src):
+        return None, 0, 0
+    files = []
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            if fn.endswith(".rs"):
+                files.append(os.path.join(dirpath, fn))
+    for extra in ("Cargo.toml", "build.rs"):
+        p = os.path.join(root, extra)
+        if os.path.isfile(p):
+            files.append(p)
+    files.sort()
+    hsh = hashlib.sha256()
+    total = 0
+    for p in files:
+        try:
+            with open(p, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        rel = os.path.relpath(p, root).replace(os.sep, "/")
+        hsh.update(rel.encode("utf-8"))
+        hsh.update(b"\0%d\0" % len(data))
+        hsh.update(data)
+        total += len(data)
+    if not files:
+        return None, 0, 0
+    return hsh.hexdigest(), len(files), total
+
+
+def newest_src_mtime(root):
+    """`src/**.rs` + `Cargo.toml` + `build.rs` のいちばん新しい mtime。"""
+    best, who = 0.0, None
+    src = os.path.join(root, "src")
+    for dirpath, dirnames, filenames in os.walk(src):
+        dirnames.sort()
+        for fn in filenames:
+            if not fn.endswith(".rs"):
+                continue
+            try:
+                m = os.path.getmtime(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            if m > best:
+                best, who = m, fn
+    for extra in ("Cargo.toml", "build.rs"):
+        p = os.path.join(root, extra)
+        try:
+            m = os.path.getmtime(p)
+        except OSError:
+            continue
+        if m > best:
+            best, who = m, extra
+    return (who, best) if who else (None, 0.0)
+
+
+def judge_candidate(path, digest, src_mtime):
+    """1 つの実行ファイルの判定と、次回のための記録。返りは (verdict, 理由)。
+
+    * バイナリが前回と同一 (touch では動かない同一性) で内容ハッシュも同じ
+      → **前回の判定を繰り返す** (一度 stale と判った物は touch で生き返らない)
+    * バイナリが同一なのにソースの内容が変わった → 無条件に stale
+    * それ以外 (初めて見る / 建て直された) → mtime で判定して**記録する**
+    """
+    ident = bin_identity(path)
+    if ident is None:
+        return "missing", "実行ファイルがありません"
+    stamp_path = path + STAMP_SUFFIX
+    prev = None
+    try:
+        with open(stamp_path, encoding="utf-8") as fh:
+            prev = json.load(fh)
+    except (OSError, ValueError):
+        prev = None
+    if prev and prev.get("bin") == ident and prev.get("src") == digest:
+        v = prev.get("verdict", "usable")
+        return v, ("前回と同じ実行ファイル・同じソース内容なので前回の判定"
+                   "「%s」を繰り返します (**`touch` では変わりません**)" % v)
+    if prev and prev.get("bin") == ident:
+        why = ("実行ファイルは前回と同一なのに**ソースの内容が変わりました**。"
+               "中身が追いついていないので使えません")
+        v = "stale"
+    else:
+        try:
+            bm = os.path.getmtime(path)
+        except OSError:
+            return "missing", "実行ファイルがありません"
+        if src_mtime > bm:
+            v, why = "stale", "ソースの方が新しい (mtime による初回判定)"
+        else:
+            v, why = "usable", ("この実行ファイルの記録はまだありません。"
+                                "**初回は mtime しか手掛かりが無く `touch` で"
+                                "騙せます** — 判定を記録したので次回からは"
+                                "ソースの内容で見ます")
+    try:
+        tmp = "%s.%d.tmp" % (stamp_path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"bin": ident, "src": digest, "verdict": v}, fh)
+        os.replace(tmp, stamp_path)
+    except OSError as e:
+        why += " (記録は残せませんでした: %s)" % e
+    return v, why
+
+
+def zai_candidates(cfg):
+    """スタンプを残す対象。**選ばれなかった候補にも残す**のが要点。
+
+    選ばれなかった (= 古いと弾かれた) 実行ファイルにこそ「stale だった」と
+    書き残す必要がある。書き残さないと、`touch` された次の回に
+    「初めて見る実行ファイル」として素通りしてしまう。
+    """
+    out = []
+    for p in (os.environ.get("ZAIVERN_BIN"), cfg.get("zai")):
+        if p:
+            out.append(p)
+    td = cfg.get("target_dir") or os.path.join(cfg["root"], "target")
+    for prof in ("release", "debug"):
+        for name in ("zai", "zai.exe"):
+            out.append(os.path.join(td, prof, name))
+    seen, uniq = set(), []
+    for p in out:
+        ap = os.path.abspath(p)
+        if ap not in seen and os.path.isfile(ap):
+            seen.add(ap)
+            uniq.append(ap)
+    return uniq
+
+
+def check_binary_provenance(cfg, checks):
+    """V7。**前回の判定を内容ハッシュで覚えて `touch` を無効化する。**"""
+    root, zai = cfg["root"], cfg["zai"] or None
+    t0 = time.perf_counter()
+    digest, nfiles, nbytes = source_digest(root)
+    _who, src_mtime = newest_src_mtime(root)
+    ms = (time.perf_counter() - t0) * 1000.0
+    cost = "ソース %d ファイル / %d バイトの sha256 に %.1f ms" % (nfiles, nbytes, ms)
+    if digest is None:
+        checks.append({
+            "id": "V7", "name": "バイナリの素性 (touch 耐性)", "ok": True,
+            "detail": "ソースツリーが隣に無いので内容では測れません "
+                      "(**mtime だけが頼りです。`touch` で騙せます**)"})
+        return True
+    seen = []
+    for p in zai_candidates(cfg):
+        v, why = judge_candidate(p, digest, src_mtime)
+        seen.append((p, v, why))
+    if not zai:
+        # **選ばれなかった理由をここにも出す。** stderr の 1 行を見落とした
+        # 利用者が「なぜ全部 NG なのか」を追えなくなる
+        note = (cfg.get("zai_note") or "").strip()
+        checks.append({
+            "id": "V7", "name": "バイナリの素性 (touch 耐性)", "ok": False,
+            "detail": "zai が選ばれていません。見えた候補 %d 件は記録しました (%s)%s"
+                      % (len(seen), cost, ("。選定の記録: " + note) if note else "")})
+        return False
+    mine = [(p, v, why) for p, v, why in seen if os.path.abspath(p) == os.path.abspath(zai)]
+    if not mine:
+        checks.append({"id": "V7", "name": "バイナリの素性 (touch 耐性)", "ok": True,
+                       "detail": "選ばれた実行ファイルを stat できませんでした"})
+        return True
+    _p, v, why = mine[0]
+    others = ["%s=%s" % (os.path.basename(os.path.dirname(p)), vv)
+              for p, vv, _ in seen if os.path.abspath(p) != os.path.abspath(zai)]
+    checks.append({
+        "id": "V7", "name": "バイナリの素性 (touch 耐性)", "ok": v == "usable",
+        "detail": "%s: %s (%s)%s" % (zai, why, cost,
+                                     ("。他の候補: " + ", ".join(others)) if others else ""),
+    })
+    return v == "usable"
 
 
 def check_subcommands(zai, checks):
@@ -1478,8 +1806,8 @@ def check_gate_blocks(zai, work, checks):
     probe = os.path.join(work, "probe-gate")
     os.makedirs(probe, exist_ok=True)
     git(["init", "-q", "-b", "main", "."], probe)
-    body = "".join("line %d\n" % i for i in range(1, 201))
-    with open(os.path.join(probe, "probe.txt"), "w", encoding="utf-8") as fh:
+    body = b"".join(b"line %d\n" % i for i in range(1, 201))
+    with open(os.path.join(probe, "probe.txt"), "wb") as fh:
         fh.write(body)
     git(["add", "-A"], probe)
     git(["commit", "-qm", "probe"], probe)
@@ -1499,7 +1827,8 @@ def check_gate_blocks(zai, work, checks):
         payload = json.dumps({
             "session_id": "probe-%s" % who, "cwd": wt,
             "hook_event_name": "PreToolUse", "tool_name": "Write",
-            "tool_input": {"file_path": os.path.join(wt, "probe.txt"), "content": new},
+            "tool_input": {"file_path": os.path.join(wt, "probe.txt"),
+                           "content": new.decode("utf-8", "replace")},
         })
         r = run([zai, "hook", "--zaivern", "claude", "PreToolUse"], stdin=payload)
         return '"permissionDecision":"deny"' in r.out.replace(" ", "")
@@ -1599,7 +1928,16 @@ def untouched(res):
 
 
 def verdict_of(res, cap_all_ok):
-    """**「証明」と名乗れるのは全部揃ったときだけ。**"""
+    """**「証明」と名乗れるのは全部揃ったときだけ。**
+
+    ## `dup_lines` を見ていなかった欠陥 (直した)
+
+    以前はここが `conflict_files` だけを見ていた。**2 体が同じ行を書いたのに
+    git がたまたま衝突させなかった実行**でも `proved` と出てしまう。
+    所有の保証 (`dup_lines == 0`) はこの製品の中核の主張なので、
+    「git が衝突しなかった」ことで代用してはいけない。**同じ行に 2 人が
+    載った時点で、衝突の有無に関わらず証明は失敗**である。
+    """
     reasons = list(res.get("reasons", []))
     if res.get("verdict") == "skip":
         return "skip", reasons
@@ -1622,6 +1960,24 @@ def verdict_of(res, cap_all_ok):
                 "%d 体: ベースラインの衝突が 0 件でした。"
                 "重なりが起きていないので A/B に意味がありません "
                 "(--overlap を上げるか --hot-blocks を下げてください)" % r["writers"]
+            )
+        if z["dup_lines"] > 0:
+            # **git の結果に関わらず落とす。** 衝突しなかったのは運であって
+            # 保証ではない (同じ行への 2 つの編集が偶然同一文字列だった等)
+            proved = False
+            reasons.append(
+                "%d 体: **2 体以上が同じ行を書きました** (重なった行 %d 件 / "
+                "重ね書き %d 回)%s。git が衝突させたかどうかに関わらず、"
+                "所有の保証が破れているので証明は成立しません"
+                % (r["writers"], z["dup_lines"], z["dup_writes"],
+                   ("。例: " + ", ".join(z["dup_detail"])) if z["dup_detail"] else "")
+            )
+        if z.get("mangled"):
+            proved = False
+            reasons.append(
+                "%d 体: ハーネスの編集が目印の追加だけになっていない箇所が %d 件 "
+                "(改行コードやエンコードを壊した疑い)。**測定器の側が壊れている**ので"
+                "結果は使えません" % (r["writers"], z["mangled"])
             )
         if z["conflict_files"] > 0:
             proved = False
@@ -1648,7 +2004,64 @@ def verdict_of(res, cap_all_ok):
                            % (r["writers"], z["timeouts"]))
     if not cap_all_ok or not res.get("untouched", {}).get("ok", False):
         proved = False
+    res["checks"] = verdict_checks(res, cap_all_ok)
     return ("proved" if proved else "unproved"), reasons
+
+
+# **「証明できた」と言える条件**。表にも JSON にも同じものを出す。
+# 文章で書くと必ず実装とずれるので、**判定に使う値そのもの**を並べる。
+CRITERIA = [
+    ("C1", "ベースラインで実際に衝突が出た (出なければ A/B に意味がない)"),
+    ("C2", "zaivern あり: **2 体以上が同じ行を書いた数が 0**"),
+    ("C3", "zaivern あり: git のマージで衝突したファイルが 0"),
+    ("C4", "zaivern あり: zai 呼び出しのタイムアウトが 0"),
+    ("C5", "ハーネスの編集が目印 1 つの追加だけ (改行・エンコードを壊していない)"),
+    ("C6", "能力検査 (V1/V2/V3/V5/V7) が全部 OK"),
+    ("C7", "対象リポジトリの指紋が前後で同一"),
+]
+
+# **測っていないもの**。書かないと読み手が勝手に広げて読む。
+NOT_MEASURED = [
+    "編集後にビルドが通るか (目印はコメント風だが構文は検査していない)",
+    "編集の意味的な正しさ (同じ行を避けただけで、直したい場所とは限らない)",
+    "マージ順序の全通り (枝は作った順に 1 本ずつ統合している)",
+    "実在のエージェント (書き手はハーネスのスレッドで、CLI 越しの本物ではない)",
+    "改行以外のファイル属性 (mode / symlink / submodule / LFS の中身)",
+    "リポジトリ全体 (--scan-cap で間引いた標本の中だけ)",
+]
+
+
+def verdict_checks(res, cap_all_ok):
+    """条件ごとの可否。**表と JSON で同じものを出す**ための一次データ。"""
+    runs = res.get("runs", [])
+    zs = [r.get("zaivern") for r in runs]
+    have = [z for z in zs if z is not None]
+
+    def every(fn, default=False):
+        return all(fn(z) for z in have) if have else default
+
+    return [
+        {"id": "C1", "ok": all(r["baseline"]["conflict_files"] > 0 for r in runs)
+         if runs else False,
+         "value": "ベースラインの衝突ファイル "
+                  + "/".join(str(r["baseline"]["conflict_files"]) for r in runs)},
+        {"id": "C2", "ok": every(lambda z: z["dup_lines"] == 0),
+         "value": "重なった行 " + "/".join(str(z["dup_lines"]) for z in have)},
+        {"id": "C3", "ok": every(lambda z: z["conflict_files"] == 0),
+         "value": "衝突ファイル " + "/".join(str(z["conflict_files"]) for z in have)},
+        {"id": "C4", "ok": every(lambda z: z["timeouts"] == 0),
+         "value": "タイムアウト " + "/".join(str(z["timeouts"]) for z in have)},
+        {"id": "C5", "ok": all(s.get("mangled", 0) == 0
+                               for r in runs for s in (r["baseline"], r.get("zaivern"))
+                               if s),
+         "value": "目印以外が動いた編集 "
+                  + "/".join(str(s.get("mangled", 0))
+                             for r in runs for s in (r["baseline"], r.get("zaivern"))
+                             if s)},
+        {"id": "C6", "ok": bool(cap_all_ok), "value": "能力検査"},
+        {"id": "C7", "ok": bool(res.get("untouched", {}).get("ok")),
+         "value": "指紋の一致"},
+    ]
 
 
 # ── 形ごとの可否をその場で作って実測する ─────────────────────────
@@ -1749,6 +2162,21 @@ def w(line=""):
     sys.stderr.write(line + "\n")
 
 
+def render_criteria():
+    """**出力の先頭に「証明できた」と言える条件を置く。**
+
+    言葉を弱めるのではなく正確にする。読み手が結論だけを持ち帰っても、
+    何を測って何を測っていないかが必ず一緒に付いてくるようにする。
+    """
+    w("== 「証明できた」と言える条件 (**全部揃ったときだけ**)")
+    for cid, text in CRITERIA:
+        w("  %s  %s" % (cid, text))
+    w("== このハーネスが**測っていない**もの")
+    for text in NOT_MEASURED:
+        w("  - %s" % text)
+    w("")
+
+
 def render_caps(checks):
     w("== 能力検査 (**測る前に**。1 つでも落ちたら「証明」と名乗らない)")
     for c in checks:
@@ -1775,6 +2203,15 @@ def render_res(res):
         if langs:
             w("   言語構成: " + ", ".join("%s×%d" % (k, v) for k, v in
                                           list(langs.items())[:8]))
+        e = c.get("eol")
+        if e:
+            # **改行コードを必ず出す。** 以前のハーネスは CRLF を LF へ
+            # 書き換えており、Windows 由来のリポジトリは守られているのに
+            # 「証明できず」と言われていた。何件混ざっていたのかを見せる
+            w("   改行の内訳: LF×%d / CRLF×%d / CR×%d / 混在×%d "
+              "(BOM×%d / 非 UTF-8×%d) — **すべてバイト列のまま編集します**"
+              % (e.get("lf", 0), e.get("crlf", 0), e.get("cr", 0), e.get("mixed", 0),
+                 e.get("bom", 0), e.get("non_utf8", 0)))
         hot = c.get("hot", [])
         if hot:
             w("   ホットスポット (git log の変更回数順): "
@@ -1837,6 +2274,10 @@ def render_res(res):
               % (k, str(u["before"].get(k))[:24], str(u["after"].get(k))[:24]))
         w("        ハーネスは複製しか書きません。**対象リポジトリを同時に編集している"
           "プロセスが無いか**を先に確かめてください")
+    texts = dict(CRITERIA)
+    for c in res.get("checks", []):
+        w("   [%s] %s %s — %s" % ("OK" if c["ok"] else "NG", c["id"],
+                                  c["value"], texts.get(c["id"], "")))
     w("   結論: %s" % {"proved": "**証明できた**", "unproved": "証明できず",
                        "skip": "skip"}[res["verdict"]])
     for r in res["reasons"]:
@@ -1849,6 +2290,7 @@ def main():
     checks = []
     zai = cfg["zai"] or None
     check_version(zai, cfg["root"], checks)
+    check_binary_provenance(cfg, checks)
     have = check_subcommands(zai, checks)
     region_ok = check_region_aware(zai, cfg["work"], checks) if have.get("lease") else False
     if not have.get("lease"):
@@ -1871,8 +2313,8 @@ def main():
                        "detail": "V3 が落ちたので実行しませんでした"})
 
     # V4a (交渉) は「あれば強い」であって「無いと嘘になる」検査ではないので
-    # 必須から外す。V1/V2/V3/V5 が本番の測定を成立させる最小集合。
-    required = {"V1", "V2", "V3", "V5"}
+    # 必須から外す。V1/V2/V3/V5/V7 が本番の測定を成立させる最小集合。
+    required = {"V1", "V2", "V3", "V5", "V7"}
     cap_all_ok = all(c["ok"] for c in checks if c["id"] in required)
     cfg["shift_ok"] = shift_ok
     cfg["cap_ok_for_measure"] = bool(zai) and region_ok and gate_ok
@@ -1899,6 +2341,9 @@ def main():
         w("対象がありません (--repo か --shapes を指定してください)")
         return 2
 
+    out["criteria"] = [{"id": c, "text": t} for c, t in CRITERIA]
+    out["not_measured"] = list(NOT_MEASURED)
+    render_criteria()
     render_caps(checks)
     worst = 0
     for label, path in targets:

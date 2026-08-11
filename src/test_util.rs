@@ -179,9 +179,10 @@ fn stamp(t: SystemTime) -> String {
 
 /// `src_root` の下で**いちばん新しい** `*.rs` と、`Cargo.toml` / `build.rs` を見る。
 ///
-/// 内容ハッシュ (= ビルド ID) の方が確実だが、実測で
-/// **mtime 0.51ms に対しハッシュ 62.9ms (124 倍)** かかるうえ、
-/// `build.rs` と `cli.rs` の両方を触らないと実現できない。詳細は
+/// **これ単独では `touch` 1 回で破れる。** 中身の違うバイナリを一度 `Stale` と
+/// 弾いても、`touch` すれば mtime が新しくなって受け入れてしまう (端から端まで
+/// 再現した)。そこで [`zai_gate_at`] は、この mtime 判定に
+/// [`judge_with_stamp`] の**内容ハッシュの記憶**を重ねる。詳細は
 /// `docs/bench-honesty.md`。
 pub fn newest_source_change(src_root: &Path) -> Option<(String, SystemTime)> {
     let mut best: Option<(String, SystemTime)> = None;
@@ -225,9 +226,197 @@ pub fn newest_source_change(src_root: &Path) -> Option<(String, SystemTime)> {
     best
 }
 
-/// **関所そのもの。** `bin` を使ってよいかを、版と古さの両方で判定する。
+/// 前回の判定の記憶。**`touch` では動かない実行ファイルの同一性**と、
+/// そのときのソースの**内容**ハッシュを組にして覚える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrcStamp {
+    /// 実行ファイルの同一性 (unix: dev+inode+サイズ / windows: 作成時刻+サイズ)。
+    pub bin: String,
+    /// ソースの内容ハッシュ。
+    pub src: u64,
+    /// そのとき使ってよいと判断したか。
+    pub usable: bool,
+}
+
+/// `touch` で動かない実行ファイルの同一性。**両 OS を実装する。**
 ///
-/// I/O はここに閉じ込め、判断は [`judge_zai`] に委ねる。
+/// unix は inode。`touch` は mtime しか動かさないが、`cargo build` は
+/// `target/<profile>/deps/zai-<hash>` を張り直すので**別の inode**になる。
+/// Windows に inode は無いが作成時刻がある (`LastWriteTime` を書き換えても動かない)。
+fn bin_identity(bin: &Path) -> Option<String> {
+    let m = bin.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!("unix:{}:{}:{}", m.dev(), m.ino(), m.len()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some(format!("win:{}:{}", m.creation_time(), m.file_size()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Some(format!("other:{}", m.len()))
+    }
+}
+
+/// ソースの**内容**の指紋。`(ハッシュ, ファイル数, バイト数)`。
+///
+/// **暗号学的ハッシュではない** (std だけで済ませるため)。ここで防ぎたいのは
+/// 「うっかり古いバイナリを測る」であって、衝突を細工する攻撃者ではない。
+/// 相対パスも混ぜるので、名前の入れ替えも別物として出る。
+pub fn source_digest(src_root: &Path) -> Option<(u64, usize, u64)> {
+    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    fn mix(h: &mut u64, chunk: u64) {
+        *h = (*h ^ chunk).wrapping_mul(PRIME).rotate_left(29);
+    }
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        let mut it = bytes.chunks_exact(8);
+        for c in &mut it {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(c);
+            mix(h, u64::from_le_bytes(w));
+        }
+        let mut w = [0u8; 8];
+        let r = it.remainder();
+        w[..r.len()].copy_from_slice(r);
+        mix(h, u64::from_le_bytes(w));
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![src_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                files.push(p);
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    if let Some(root) = src_root.parent() {
+        for f in ["Cargo.toml", "build.rs"] {
+            let p = root.join(f);
+            if p.is_file() {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut h = SEED;
+    let mut bytes = 0u64;
+    for f in &files {
+        // **絶対パスを混ぜない。** 混ぜると worktree ごとに別の指紋になり、
+        // 「同じ内容なのに毎回作り直す」記憶になってしまう
+        let rel = f
+            .strip_prefix(src_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from(f.file_name().unwrap_or_default()));
+        feed(&mut h, rel.to_string_lossy().as_bytes());
+        let Ok(data) = std::fs::read(f) else {
+            continue;
+        };
+        mix(&mut h, data.len() as u64);
+        feed(&mut h, &data);
+        bytes += data.len() as u64;
+    }
+    Some((h, files.len(), bytes))
+}
+
+/// **`touch` を効かなくする判断そのもの。** I/O をしないので表で固定できる。
+///
+/// 返りは `(判定, 記録し直すか)`。
+///
+/// * 実行ファイルが前回と同一で、ソースの内容も同じ
+///   → **前回の判定をそのまま繰り返す**。`touch` で mtime が動いても変わらない
+/// * 実行ファイルが前回と同一なのにソースの内容が変わった
+///   → 建て直していない以上、中身は追いついていないので**無条件に古い**
+/// * それ以外 (初めて見る / 建て直された) → mtime の判定を採り、記録する
+///
+/// **正直に書く弱点**: 記録が 1 つも無い状態での初回だけは mtime しか
+/// 手掛かりが無い。ここを閉じるにはビルド時にソースのハッシュをバイナリへ
+/// 焼き込む (`build.rs` + `cli.rs`) しかない。
+pub fn judge_with_stamp(
+    prev: Option<&SrcStamp>,
+    bin_id: &str,
+    src: u64,
+    by_mtime: ZaiVerdict,
+) -> (ZaiVerdict, bool) {
+    match prev {
+        Some(p) if p.bin == bin_id && p.src == src => {
+            if p.usable {
+                (ZaiVerdict::Usable, false)
+            } else {
+                (
+                    ZaiVerdict::Stale(
+                        "同じ実行ファイル・同じソース内容で前回も古いと判定済み \
+                         (mtime を触っても変わりません)"
+                            .into(),
+                    ),
+                    false,
+                )
+            }
+        }
+        Some(p) if p.bin == bin_id => (
+            ZaiVerdict::Stale(
+                "実行ファイルは前回と同一なのにソースの内容が変わりました \
+                 (建て直していないので中身が追いついていません)"
+                    .into(),
+            ),
+            true,
+        ),
+        _ => (by_mtime, true),
+    }
+}
+
+/// スタンプの置き場。実行ファイルの隣 (`<bin>.zai-srcstamp`)。
+fn stamp_path(bin: &Path) -> PathBuf {
+    let mut p = bin.as_os_str().to_owned();
+    p.push(".zai-srcstamp");
+    PathBuf::from(p)
+}
+
+fn read_stamp(path: &Path) -> Option<SrcStamp> {
+    let text = std::fs::read_to_string(path).ok()?;
+    // 改行は正規化してから見る (CRLF のチェックアウトで壊れないため)
+    let line = text.replace("\r\n", "\n");
+    let mut it = line.trim().split('\t');
+    let bin = it.next()?.to_string();
+    let src = it.next()?.parse().ok()?;
+    let usable = it.next()? == "usable";
+    Some(SrcStamp { bin, src, usable })
+}
+
+/// 書けなくても黙って諦める (関所を強くするための記録であって、
+/// 書けないこと自体はテストを落とす理由にならない)。並走する別プロセスと
+/// 混ざらないよう、一時名へ書いてから `rename` する。
+fn write_stamp(path: &Path, s: &SrcStamp) {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let body = format!(
+        "{}\t{}\t{}\n",
+        s.bin,
+        s.src,
+        if s.usable { "usable" } else { "stale" }
+    );
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// **関所そのもの。** `bin` を使ってよいかを、版・古さ・**内容の記憶**で判定する。
+///
+/// I/O はここに閉じ込め、判断は [`judge_zai`] と [`judge_with_stamp`] に委ねる。
 pub fn zai_gate_at(bin: &Path, src_root: &Path, want_ver: &str) -> ZaiVerdict {
     let bin_mtime = bin
         .is_file()
@@ -242,12 +431,32 @@ pub fn zai_gate_at(bin: &Path, src_root: &Path, want_ver: &str) -> ZaiVerdict {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    judge_zai(
+    let by_mtime = judge_zai(
         bin_mtime,
         version_line.as_deref(),
         want_ver,
         newest_source_change(src_root),
-    )
+    );
+    // 版が違う / 実行ファイルが無い / そもそも測れない、は記憶の出番ではない
+    if !matches!(by_mtime, ZaiVerdict::Usable | ZaiVerdict::Stale(_)) {
+        return by_mtime;
+    }
+    let (Some(bin_id), Some((src, _, _))) = (bin_identity(bin), source_digest(src_root)) else {
+        return by_mtime;
+    };
+    let path = stamp_path(bin);
+    let (verdict, record) = judge_with_stamp(read_stamp(&path).as_ref(), &bin_id, src, by_mtime);
+    if record {
+        write_stamp(
+            &path,
+            &SrcStamp {
+                bin: bin_id,
+                src,
+                usable: verdict == ZaiVerdict::Usable,
+            },
+        );
+    }
+    verdict
 }
 
 /// テストバイナリの隣に居る**本物の `zai`**。使えないなら理由を出して `None`。
@@ -429,11 +638,32 @@ mod zai_gate_tests {
             other => panic!("Stale を期待した: {other:?}"),
         }
 
-        // (2) 建て直した (= バイナリが新しい) → 通る
+        // (2) **`touch` しただけでは生き返らない。** mtime は新しくなるが
+        // 実行ファイルは同一・ソースの内容も同じなので、前回の「古い」が残る。
+        // ここが以前は `Usable` になっていた (= 関所が `touch` 1 回で破れた)
+        set(&bin, 2_000_000_100);
+        match zai_gate_at(&bin, &src, "0.14.0") {
+            ZaiVerdict::Stale(why) => assert!(why.contains("前回も古い"), "{why}"),
+            other => panic!("touch では生き返らないはず: {other:?}"),
+        }
+
+        // (3) 本当に建て直した (中身もサイズも変わる) → 通る
+        std::fs::remove_file(&bin).expect("rm");
+        std::fs::write(&bin, "#!/bin/sh\nexec echo \"Zaivern Code 0.14.0\"\n").expect("bin");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         set(&bin, 2_000_000_100);
         assert_eq!(zai_gate_at(&bin, &src, "0.14.0"), ZaiVerdict::Usable);
 
-        // (3) 版が違えば、たとえ新しくても断る
+        // (4) 建て直さずにソースの**中身**を変えたら、mtime を戻しても断る
+        std::fs::write(src.join("a.rs"), b"// x2 changed").expect("a.rs");
+        set(&src.join("a.rs"), 1_000_000_000);
+        match zai_gate_at(&bin, &src, "0.14.0") {
+            ZaiVerdict::Stale(why) => assert!(why.contains("内容が変わり"), "{why}"),
+            other => panic!("内容が変われば断るはず: {other:?}"),
+        }
+
+        // (5) 版が違えば、たとえ新しくても断る
+        std::fs::remove_file(&bin).expect("rm");
         std::fs::write(&bin, "#!/bin/sh\necho \"Zaivern Code 0.12.0\"\n").expect("bin");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         set(&bin, 2_000_000_100);
@@ -441,6 +671,73 @@ mod zai_gate_tests {
             zai_gate_at(&bin, &src, "0.14.0"),
             ZaiVerdict::WrongVersion(_)
         ));
+    }
+
+    /// [`judge_with_stamp`] の表。**`touch` の効かなさをここで固定する。**
+    #[test]
+    fn 記憶は同じバイナリと同じソース内容なら前回の判定を繰り返す() {
+        let stale = || ZaiVerdict::Stale("mtime".into());
+        let s = |bin: &str, src: u64, usable: bool| SrcStamp {
+            bin: bin.into(),
+            src,
+            usable,
+        };
+
+        // 記録が無ければ mtime の判定をそのまま採り、記録する
+        let (v, rec) = judge_with_stamp(None, "b1", 7, ZaiVerdict::Usable);
+        assert_eq!((v, rec), (ZaiVerdict::Usable, true));
+
+        // 同じバイナリ・同じソース内容 → 前回どおり (mtime を無視する)
+        let prev = s("b1", 7, false);
+        let (v, rec) = judge_with_stamp(Some(&prev), "b1", 7, ZaiVerdict::Usable);
+        assert!(matches!(v, ZaiVerdict::Stale(_)), "touch で生き返った");
+        assert!(!rec, "記録は書き換えない");
+
+        let prev = s("b1", 7, true);
+        let (v, rec) = judge_with_stamp(Some(&prev), "b1", 7, stale());
+        assert_eq!((v, rec), (ZaiVerdict::Usable, false));
+
+        // 同じバイナリのままソースの内容が変わった → 無条件に古い
+        let prev = s("b1", 7, true);
+        let (v, rec) = judge_with_stamp(Some(&prev), "b1", 8, ZaiVerdict::Usable);
+        assert!(matches!(v, ZaiVerdict::Stale(_)));
+        assert!(rec);
+
+        // 建て直された (同一性が変わった) → mtime の判定に戻る
+        let prev = s("b1", 7, false);
+        let (v, rec) = judge_with_stamp(Some(&prev), "b2", 8, ZaiVerdict::Usable);
+        assert_eq!((v, rec), (ZaiVerdict::Usable, true));
+    }
+
+    /// 内容ハッシュは**中身**を見る (mtime を触っても動かない)。
+    #[test]
+    fn ソースの指紋は中身が変わったときだけ動く() {
+        let dir = unique_temp_dir("zaivern-zaigate-test", "digest");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).expect("src");
+        std::fs::write(src.join("a.rs"), b"// x").expect("a.rs");
+        let (h1, n, _) = source_digest(&src).expect("digest");
+        assert_eq!(n, 1);
+
+        // mtime だけ動かしても指紋は同じ
+        let f = std::fs::File::options()
+            .write(true)
+            .open(src.join("a.rs"))
+            .expect("open");
+        f.set_times(std::fs::FileTimes::new().set_modified(at(2_000_000_000)))
+            .expect("set_times");
+        assert_eq!(source_digest(&src).expect("digest").0, h1);
+
+        // 中身を変えれば動く
+        std::fs::write(src.join("a.rs"), b"// y").expect("a.rs");
+        assert_ne!(source_digest(&src).expect("digest").0, h1);
+
+        // ファイルが増えても動く
+        std::fs::write(src.join("b.rs"), b"// x").expect("b.rs");
+        let (h3, n3, _) = source_digest(&src).expect("digest");
+        assert_eq!(n3, 2);
+        assert_ne!(h3, h1);
+        assert!(source_digest(&dir.join("no-such-dir")).is_none());
     }
 
     /// **全ベンチの `zai` 決定ブロックが 1 バイトも違わないこと** (事故3の番人)。
