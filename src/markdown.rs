@@ -809,6 +809,16 @@ pub const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 /// プレビュー内での表示用に縮小する長辺 (GPU 上限とは別の、紙面上の上限)。
 const PREVIEW_MAX_SIDE: u32 = 1600;
 
+/// アニメーションの時計を 1 パスで進められる上限 (ms)。
+///
+/// この経路は**見えているパスでしか時計を進めない**ので、間隔がこれより
+/// 開いたときは「再生していなかった」= ウィンドウが背面に居た / 画面外へ
+/// スクロールしていた / 長いフレームで詰まった、のいずれかである。
+/// そこで実時間ぶん飛ばすと、有限ループの GIF が**一度も見えないまま
+/// 再生し切って**最後のコマで固まる。飛ばさず続きから再生する。
+/// 値は 4fps 相当 = 人が「止まった」と気付く境目より少し粗いところ。
+const ANIM_MAX_STEP_MS: u64 = 250;
+
 /// 画像 URL の解決結果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImageSrc {
@@ -1006,12 +1016,67 @@ pub fn classify_image(dir: Option<&Path>, url: &str) -> ImageSrc {
     }
 }
 
+/// 再生中のアニメーション 1 本。画素と時計を分けて持つ
+/// (再生位置の計算に数十 MB の画素を持ち回らせないため)。
+struct AnimPlay {
+    /// コマごとの RGBA8。全コマ [`AnimPlay::size`] と同じ寸法。
+    frames: Vec<Vec<u8>>,
+    /// コマごとの表示時間 (ms)。`frames` と同じ長さ。
+    delays_ms: Vec<u32>,
+    loops: crate::preview::AnimLoop,
+    /// 全コマ共通の画素寸法 (`[幅, 高さ]`)。
+    size: [usize; 2],
+    /// 紙面に載せる寸法。**静止画として先に載せた 1 枚**のものを受け継ぐ。
+    /// コマ列が届いた瞬間にも、コマが進んでも版面が 1px も動かないため。
+    display: egui::Vec2,
+    elapsed_ms: u64,
+    /// いまテクスチャに載っているコマ番号。
+    shown: Option<usize>,
+    /// 最後に時計を進めた egui のパス番号。同じ画像が文書に何度出ても
+    /// 1 パスにつき 1 回しか進めない (出た回数だけ倍速になるのを防ぐ)。
+    stepped_at: Option<u64>,
+}
+
+/// 鍵ごとのアニメーションの状態。
+enum AnimSlot {
+    /// 裏スレッドで復号中。
+    Pending,
+    /// アニメーションではなかった (静止画として今までどおり描く)。
+    Still,
+    Ready(Box<AnimPlay>),
+}
+
+/// 裏スレッドの復号結果。
+struct AnimDone {
+    key: String,
+    anim: Option<crate::preview::Animation>,
+}
+
 /// プレビュー内で参照された画像のテクスチャキャッシュ。
 /// ローカルファイルは mtime をキーに含めるため、外部で差し替わると再読込される。
 /// `data:` URI は内容そのものが鍵なので一度載せたら使い回す。
-#[derive(Default)]
+///
+/// アニメーション (GIF / APNG / アニメーション WebP) は
+/// **鍵 1 つにつきテクスチャ 1 枚**しか使わない。コマは
+/// [`egui::TextureHandle::set`] で差し替える (実測: `assets/zaivern-demo.gif`
+/// は 127 コマ・展開 74.9MB あるので、コマごとにテクスチャを作ると GPU が焼ける)。
 pub struct ImageCache {
     map: HashMap<String, (Option<std::time::SystemTime>, Option<egui::TextureHandle>)>,
+    anims: HashMap<String, AnimSlot>,
+    anim_tx: std::sync::mpsc::Sender<AnimDone>,
+    anim_rx: std::sync::mpsc::Receiver<AnimDone>,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        let (anim_tx, anim_rx) = std::sync::mpsc::channel();
+        Self {
+            map: HashMap::new(),
+            anims: HashMap::new(),
+            anim_tx,
+            anim_rx,
+        }
+    }
 }
 
 impl ImageCache {
@@ -1023,11 +1088,18 @@ impl ImageCache {
                 return tex.clone();
             }
         }
-        let bytes = std::fs::read(path).ok();
-        let tex = bytes
-            .filter(|b| b.len() <= MAX_IMAGE_BYTES)
-            .and_then(|b| decode_texture(ctx, &key, &b));
-        self.map.insert(key, (mtime, tex.clone()));
+        // 中身が差し替わったらコマ列も作り直す (古い絵が回り続けないよう)
+        self.anims.remove(&key);
+        let bytes = std::fs::read(path)
+            .ok()
+            .filter(|b| b.len() <= MAX_IMAGE_BYTES);
+        let tex = bytes.as_deref().and_then(|b| decode_texture(ctx, &key, b));
+        self.map.insert(key.clone(), (mtime, tex.clone()));
+        if tex.is_some() {
+            if let Some(b) = bytes {
+                self.start_anim(ctx, key, b);
+            }
+        }
         tex
     }
 
@@ -1047,13 +1119,160 @@ impl ImageCache {
         if let Some((_, tex)) = self.map.get(key) {
             return tex.clone();
         }
-        let tex = if bytes.len() <= MAX_IMAGE_BYTES {
+        let fits = bytes.len() <= MAX_IMAGE_BYTES;
+        let tex = if fits {
             decode_texture(ctx, key, bytes)
         } else {
             None
         };
         self.map.insert(key.to_string(), (None, tex.clone()));
+        if tex.is_some() && fits {
+            self.start_anim(ctx, key.to_string(), bytes.to_vec());
+        }
         tex
+    }
+
+    /// アニメーションを持ちうる形式なら、全コマの復号を**裏スレッド**で始める。
+    ///
+    /// UI スレッドで復号しない理由は費用が桁違いだから。実測
+    /// (`assets/zaivern-demo.gif` / 960×540 / 127 コマ): release 約 2.5 秒、
+    /// debug 約 28 秒。1 回きりとはいえ、そのあいだフレームがまるごと
+    /// 止まる (このリポジトリが `git` を UI スレッドで待たないのと同じ理由)。
+    ///
+    /// 呼ぶのは**静止画のテクスチャを載せられた直後だけ**。だから紙面には
+    /// 先頭コマが即座に出て、コマ列は届いた時点で静かに動き出す。
+    /// 静止画しか無いファイルではここから先へ 1 バイトも進まない。
+    fn start_anim(&mut self, ctx: &egui::Context, key: String, bytes: Vec<u8>) {
+        if self.anims.contains_key(&key) {
+            return;
+        }
+        // JPEG / BMP / ICO などはマジックナンバーで落として復号器へ回さない
+        if crate::preview::animation_format(&bytes).is_none() {
+            self.anims.insert(key, AnimSlot::Still);
+            return;
+        }
+        let tx = self.anim_tx.clone();
+        let ctx = ctx.clone();
+        let name = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-md-anim".to_string())
+            .spawn(move || {
+                let anim = crate::preview::decode_animation(
+                    &bytes,
+                    &crate::preview::AnimLimits::default(),
+                )
+                .ok();
+                // 送れなかった = 受け手が消えた。要求だけ出すと無駄に起こす
+                if tx.send(AnimDone { key: name, anim }).is_ok() {
+                    ctx.request_repaint();
+                }
+            })
+            .is_ok();
+        // スレッドを作れない環境では静止画のまま (機能が減るだけで壊れない)
+        self.anims.insert(
+            key,
+            if spawned {
+                AnimSlot::Pending
+            } else {
+                AnimSlot::Still
+            },
+        );
+    }
+
+    /// 裏スレッドから届いたコマ列を取り込む。描画の入口で呼ぶ。
+    fn take_ready(&mut self) {
+        while let Ok(done) = self.anim_rx.try_recv() {
+            // 2 コマ以上あるものだけをアニメーションとして扱う。静止 GIF /
+            // 静止 PNG / 復号できなかったものは `decode_texture` が載せた
+            // 1 枚のまま = **静止画の挙動は 1 ミリも変わらない**。
+            let play = done.anim.filter(|a| a.frames.len() > 1).map(|a| {
+                // 途中までしか読めていないものは繰り返さない。切れた尻尾から
+                // 先頭へ飛ぶ絵は「そういう動画」に見え、打ち切った事実を隠す。
+                let loops = if a.truncated.is_some() {
+                    crate::preview::AnimLoop::Times(1)
+                } else {
+                    a.loops
+                };
+                Box::new(AnimPlay {
+                    size: [a.width as usize, a.height as usize],
+                    delays_ms: a.delays_ms(),
+                    frames: a.frames.into_iter().map(|f| f.rgba).collect(),
+                    loops,
+                    display: egui::Vec2::ZERO,
+                    elapsed_ms: 0,
+                    shown: None,
+                    stepped_at: None,
+                })
+            });
+            let Some(mut play) = play else {
+                self.anims.insert(done.key, AnimSlot::Still);
+                continue;
+            };
+            let Some((_, Some(tex))) = self.map.get(&done.key) else {
+                // 静止画のテクスチャが消えている = 鍵ごと捨てられた後。
+                // 印を外して、次に読み直したときにやり直せるようにする。
+                self.anims.remove(&done.key);
+                continue;
+            };
+            play.display = tex.size_vec2();
+            self.anims.insert(done.key, AnimSlot::Ready(play));
+        }
+    }
+
+    /// `key` が再生中なら紙面に載せる寸法を返す。静止画なら `None`。
+    fn anim_display(&self, key: &str) -> Option<egui::Vec2> {
+        match self.anims.get(key) {
+            Some(AnimSlot::Ready(p)) => Some(p.display),
+            _ => None,
+        }
+    }
+
+    /// 時計を `dt_ms` ぶん進め、コマが変わったらテクスチャ 1 枚を差し替える。
+    ///
+    /// 戻り値は次にコマが変わるまでの待ち (ms)。`None` なら
+    /// **再描画を一切要求しない** (コマが 1 枚 / 有限ループを再生し切った)。
+    /// 呼び出し側は**見えているときだけ**ここへ入ること。
+    fn step_anim(&mut self, key: &str, dt_ms: u64, pass: u64) -> Option<u64> {
+        let Self { map, anims, .. } = self;
+        let Some(AnimSlot::Ready(play)) = anims.get_mut(key) else {
+            return None;
+        };
+        if play.stepped_at != Some(pass) {
+            play.stepped_at = Some(pass);
+            play.elapsed_ms = play.elapsed_ms.saturating_add(dt_ms);
+        }
+        let cur = crate::preview::frame_at(&play.delays_ms, play.loops, play.elapsed_ms);
+        if play.shown != Some(cur.frame) {
+            let swapped = match (map.get_mut(key), play.frames.get(cur.frame)) {
+                (Some((_, Some(tex))), Some(px)) => {
+                    tex.set(
+                        egui::ColorImage::from_rgba_unmultiplied(play.size, px),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    true
+                }
+                _ => false,
+            };
+            if swapped {
+                play.shown = Some(cur.frame);
+            }
+        }
+        cur.next_in_ms
+    }
+
+    /// テスト用: いまテクスチャに載っているコマ番号。
+    #[cfg(test)]
+    fn anim_shown(&self, key: &str) -> Option<usize> {
+        match self.anims.get(key) {
+            Some(AnimSlot::Ready(p)) => p.shown,
+            _ => None,
+        }
+    }
+
+    /// テスト用: 裏スレッドの復号が終わって再生に入ったか。
+    #[cfg(test)]
+    fn anim_ready(&self, key: &str) -> bool {
+        matches!(self.anims.get(key), Some(AnimSlot::Ready(_)))
     }
 }
 
@@ -5433,17 +5652,15 @@ fn image_ui(
     rctx: &mut RenderCtx,
 ) {
     let alt = label.trim_start_matches("🖼 ");
-    let draw = |ui: &mut egui::Ui, tex: &egui::TextureHandle| {
-        let avail = ui.available_width().max(60.0);
-        ui.add(egui::Image::new(tex).max_width(avail.min(tex.size_vec2().x)))
-            .on_hover_text(if alt.is_empty() { url } else { alt });
-    };
+    let hover = if alt.is_empty() { url } else { alt };
+    // 裏スレッドで復号し終えたコマ列をここで取り込む (描画の入口)
+    rctx.images.take_ready();
     // data: URI は毎フレーム base64 を解き直さないよう、URL そのものを鍵に引く
     let is_data = url.len() > 5 && url[..5].eq_ignore_ascii_case("data:");
     if is_data {
         if let Some(hit) = rctx.images.cached(url) {
             match hit {
-                Some(tex) => draw(ui, &tex),
+                Some(tex) => image_frame_ui(ui, &tex, url, hover, rctx.images),
                 None => {
                     let src = ImageSrc::Missing(url.to_string());
                     ui.label(
@@ -5457,13 +5674,22 @@ fn image_ui(
         }
     }
     let src = classify_image(rctx.dir, url);
+    // テクスチャの鍵。`get` / `get_bytes` が使うものと必ず同じにする
+    // (ずれるとアニメーションの状態を引けず、静止画のまま止まる)。
+    let key = match &src {
+        ImageSrc::Local(p) => Some(p.to_string_lossy().into_owned()),
+        ImageSrc::Data { .. } => Some(url.to_string()),
+        _ => None,
+    };
     let tex = match &src {
         ImageSrc::Local(p) => rctx.images.get(ui.ctx(), p),
         ImageSrc::Data { bytes, .. } => rctx.images.get_bytes(ui.ctx(), url, bytes),
         _ => None,
     };
     if let Some(tex) = tex {
-        draw(ui, &tex);
+        // テクスチャを作れた = 鍵も必ずある (Remote / Missing は None のまま)
+        let key = key.unwrap_or_else(|| url.to_string());
+        image_frame_ui(ui, &tex, &key, hover, rctx.images);
         return;
     }
     // デコードできなかった data: URI も「試した」ことを記録して再挑戦を防ぐ
@@ -5484,6 +5710,57 @@ fn image_ui(
         ui.hyperlink_to(RichText::new(tr("開く")).size(size * 0.9), url);
     } else {
         resp.on_hover_text(url);
+    }
+}
+
+/// テクスチャ 1 枚を紙面へ載せる。アニメーションなら
+/// **見えているあいだだけ**コマを進める。
+///
+/// アイドルの費用がゼロになる条件 (設計原則 3):
+/// - 静止画では `request_repaint_after` を**一度も呼ばない**
+/// - 画面外へスクロールした GIF も同じく一度も呼ばない。時計も進めないので、
+///   戻ってきたときは止めた続きから再生される
+/// - 有限ループを再生し切ったら [`crate::preview::frame_at`] が `None` を返し、
+///   そこで要求が止まる
+///
+/// 経過時間に `Instant::now()` ではなく `ui.input(|i| i.stable_dt)` を使う理由:
+/// (1) egui が 1 パスにつき 1 度だけ決める値なので、同じ GIF が文書に何度
+/// 出ても足並みが揃う (2) `RawInput::predicted_dt` を差し替えるだけで
+/// テストから時間を進められる。実時計だと再生位置が実行のたびに変わり、
+/// 「コマが進む」ことを固定できない。
+fn image_frame_ui(
+    ui: &mut egui::Ui,
+    tex: &egui::TextureHandle,
+    key: &str,
+    hover: &str,
+    images: &mut ImageCache,
+) {
+    let avail = ui.available_width().max(60.0);
+    // 紙面に載せる寸法はアニメーションでも**静止画 1 枚目**のものを使う。
+    // コマ列は上限 (`preview::ANIM_MAX_SIDE`) まで縮んでいることがあるので、
+    // テクスチャの実寸で組むと復号が終わった瞬間に画像が縮み、表の列幅と
+    // 行の高さが跳ねる。測る側 ([`span_natural_width`]) も同じ値を使う。
+    let fixed = images.anim_display(key);
+    let img = match fixed {
+        Some(d) if d.x > 0.0 && d.y > 0.0 => {
+            let w = avail.min(d.x);
+            egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, w * d.y / d.x))
+        }
+        _ => egui::Image::new(tex).max_width(avail.min(tex.size_vec2().x)),
+    };
+    let resp = ui.add(img).on_hover_text(hover);
+    if fixed.is_none() || !ui.is_rect_visible(resp.rect) {
+        return;
+    }
+    // `round()` を挟むのは丸め誤差対策。秒 → ミリ秒の掛け算は f32 で
+    // 99.999994 のような値を作るので、切り捨てると 1ms ずつ足りなくなり
+    // 再生がじわじわ遅れる (テストのコマ列も 1 パスずつずれる)。
+    let dt_ms = (ui.input(|i| i.stable_dt) * 1000.0)
+        .round()
+        .clamp(0.0, ANIM_MAX_STEP_MS as f32) as u64;
+    if let Some(ms) = images.step_anim(key, dt_ms, ui.ctx().cumulative_pass_nr()) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(ms));
     }
 }
 
@@ -5534,8 +5811,17 @@ fn span_natural_width(ui: &egui::Ui, sp: &Span, size: f32, rctx: &RenderCtx) -> 
             ImageSrc::Data { .. } => Some(url.to_string()),
             _ => None,
         };
-        if let Some(tex) = key.and_then(|k| rctx.images.cached(&k)).flatten() {
-            return tex.size_vec2().x;
+        if let Some(k) = key {
+            // アニメーションは**紙面の寸法** (静止画 1 枚目から受け継いだもの)
+            // で測る。コマ列のテクスチャは `preview::ANIM_MAX_SIDE` まで
+            // 縮んでいることがあり、実寸で測ると復号が終わった瞬間に
+            // 列幅が縮んで表がガタつく。
+            if let Some(d) = rctx.images.anim_display(&k) {
+                return d.x;
+            }
+            if let Some(tex) = rctx.images.cached(&k).flatten() {
+                return tex.size_vec2().x;
+            }
         }
         return text_w(
             &image_placeholder_text(&src, alt),
@@ -7862,6 +8148,350 @@ $$
             classify_image(None, "data:image/png;base64,***"),
             ImageSrc::Missing(_)
         ));
+    }
+
+    // ─── アニメーション画像 (GIF / APNG / アニメーション WebP) ──────────
+
+    /// アニメーション再生の検証台。
+    ///
+    /// **実時計を使わない。** `RawInput::time` と `predicted_dt` を自分で
+    /// 進めるので、どの機械でも・どれだけ負荷が掛かっていても同じコマ列に
+    /// なる (測っているのは速さではなく振る舞い)。
+    struct AnimHarness {
+        ctx: egui::Context,
+        hl: Highlighter,
+        theme: Theme,
+        images: ImageCache,
+        size: egui::Vec2,
+        dt: f32,
+        passes: u32,
+    }
+
+    impl AnimHarness {
+        fn new(w: f32, h: f32) -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                hl: Highlighter::new(),
+                theme: crate::theme::by_name("zaivern-dark"),
+                images: ImageCache::default(),
+                size: egui::vec2(w, h),
+                dt: 0.1,
+                passes: 0,
+            }
+        }
+
+        /// 1 パス描く。本物のプレビュー (app.rs) と同じく縦スクロール領域の
+        /// 中に置くので、画面外へ出た絵は clip rect の外になる。
+        fn pass(&mut self, dir: Option<&Path>, doc: &str) -> egui::FullOutput {
+            self.passes += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), self.size)),
+                time: Some(f64::from(self.passes) * f64::from(self.dt)),
+                predicted_dt: self.dt,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                hl,
+                theme,
+                images,
+                ..
+            } = self;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut rctx = RenderCtx { dir, images };
+                        render(ui, theme, hl, 14.0, doc, &mut rctx);
+                    });
+                });
+            })
+        }
+
+        /// 裏スレッドの復号が届くまでパスを回す。届いたら `true`。
+        ///
+        /// 上限を置くのは**固まらないため**で、速さを測っているのではない
+        /// (何パス掛かったかは一切主張しない)。
+        fn settle(&mut self, dir: Option<&Path>, doc: &str, key: &str) -> bool {
+            for _ in 0..600 {
+                self.pass(dir, doc);
+                if !matches!(self.images.anims.get(key), None | Some(AnimSlot::Pending)) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        }
+    }
+
+    /// 次の再描画までの待ち。`Duration::MAX` = **再描画を要求していない**。
+    fn repaint_delay(out: &egui::FullOutput) -> std::time::Duration {
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX)
+    }
+
+    /// 描かれた画像の矩形。
+    ///
+    /// egui 0.29 の `Image` は**テクスチャ付きの `Shape::Rect`** として積まれる
+    /// (`fill_texture_id`)。メッシュではないので `Shape::Mesh` を探しても
+    /// 1 つも見つからない。フォントアトラス (`TextureId::default()`) は除く。
+    fn drawn_image_rect(out: &egui::FullOutput) -> Option<egui::Rect> {
+        let mut acc: Option<egui::Rect> = None;
+        let mut take = |r: egui::Rect| {
+            acc = Some(match acc {
+                Some(a) => a.union(r),
+                None => r,
+            });
+        };
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Rect(r) if r.fill_texture_id != egui::TextureId::default() => {
+                    take(r.rect)
+                }
+                egui::epaint::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                    take(m.calc_bounds())
+                }
+                _ => {}
+            }
+        }
+        acc
+    }
+
+    /// 描かれた文字の矩形 (整数へ丸めた `(左, 上, 右, 下)` の並び)。
+    /// 表の列幅・行の高さが動いたかを、隣のセルの文字位置で見るために使う。
+    fn text_row_rects(out: &egui::FullOutput) -> Vec<(i32, i32, i32, i32)> {
+        let mut v: Vec<(i32, i32, i32, i32)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let r = t.visual_bounding_rect();
+                    Some((
+                        r.left().round() as i32,
+                        r.top().round() as i32,
+                        r.right().round() as i32,
+                        r.bottom().round() as i32,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// テスト用の base64 符号化 ([`base64_decode`] の逆)。
+    /// `data:` URI を組み立てるためだけに使う。
+    fn base64_encode(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((v >> (18 - 6 * i)) & 0x3F) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// テスト用の小さな静止 PNG (実ファイルを同梱せずどの環境でも同じ入力)。
+    fn still_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([0x20, 0x40, 0x80, 0xFF]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png");
+        out
+    }
+
+    #[test]
+    fn 見えているアニメーションgifはコマが進む() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-play");
+        let gif = crate::preview::testdata::make_gif(8, 8, 4, 100, 0);
+        let path = dir.join("a.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "![動く](a.gif)";
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        // 1 パス 20ms・1 コマ 100ms。**描いた回数ではなく GIF 自身の速さ**で
+        // コマが変わることを見るために、わざと食い違わせる。
+        h.dt = 0.02;
+        assert!(h.settle(Some(&dir), doc, &key), "コマ列が届く");
+        assert!(
+            h.images.anim_ready(&key),
+            "2 コマ以上ならアニメーション扱い"
+        );
+
+        // 5 パス (= 100ms) ごとに 1 コマ、4 枚を巡って先頭へ戻る。
+        // 届いたパスでもう 1 度進めているので、そこを 1 パス目に数える。
+        let mut seen = vec![h.images.anim_shown(&key).expect("届いたパスでもう進む")];
+        for _ in 0..20 {
+            h.pass(Some(&dir), doc);
+            seen.push(h.images.anim_shown(&key).expect("コマ番号"));
+        }
+        let want: Vec<usize> = [0, 0, 0, 0]
+            .into_iter()
+            .chain([1; 5])
+            .chain([2; 5])
+            .chain([3; 5])
+            .chain([0; 2])
+            .collect();
+        assert_eq!(seen, want, "{seen:?}");
+
+        // 見えているあいだは「次のコマまで」だけを要求する (常時再描画しない)。
+        // egui は要求から `predicted_dt` を引くので、待ちは 1 コマ ‐ 1 パス以下。
+        let out = h.pass(Some(&dir), doc);
+        let d = repaint_delay(&out);
+        assert!(d > std::time::Duration::ZERO, "0 = 毎フレーム再描画になる");
+        assert!(
+            d <= std::time::Duration::from_millis(100),
+            "1 コマぶんを超えて先を要求しない: {d:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 画面外のアニメーションgifは一コマも進まず再描画も要求しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-offscreen");
+        let gif = crate::preview::testdata::make_gif(8, 8, 4, 100, 0);
+        let path = dir.join("a.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        // 画像より前に十分な本文を置いて、狭い画面の外へ押し出す
+        let doc = format!("{}\n![動く](a.gif)\n", "本文の行\n\n".repeat(60));
+
+        let mut h = AnimHarness::new(320.0, 140.0);
+        assert!(h.settle(Some(&dir), &doc, &key), "コマ列は届く");
+        assert!(
+            h.images.anim_ready(&key),
+            "アニメーションとしては用意される"
+        );
+
+        // 用意されていても、見えていないので時計は 1ms も進まない
+        for _ in 0..12 {
+            h.pass(Some(&dir), &doc);
+        }
+        assert_eq!(
+            h.images.anim_shown(&key),
+            None,
+            "画面外ではコマを 1 枚も差し替えない"
+        );
+        let out = h.pass(Some(&dir), &doc);
+        assert_eq!(
+            repaint_delay(&out),
+            std::time::Duration::MAX,
+            "画面外の GIF は再描画を 1 回も要求しない"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 静止画は今までどおり再描画を要求しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-still");
+        let path = dir.join("s.png");
+        std::fs::write(&path, still_png(24, 12)).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "![静止](s.png)";
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        assert!(h.settle(Some(&dir), doc, &key), "判定は付く");
+        assert!(
+            !h.images.anim_ready(&key),
+            "静止 PNG をアニメーションにしない"
+        );
+        assert_eq!(h.images.anim_shown(&key), None, "コマの差し替えをしない");
+
+        // 静止画のテクスチャは今までどおり実寸で載る
+        let tex = h.images.cached(&key).flatten().expect("テクスチャ");
+        assert_eq!(tex.size(), [24, 12]);
+
+        for _ in 0..3 {
+            h.pass(Some(&dir), doc);
+        }
+        assert_eq!(
+            repaint_delay(&h.pass(Some(&dir), doc)),
+            std::time::Duration::MAX,
+            "静止画はアイドルの費用ゼロ"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 表の中のgifはコマが進んでも寸法を変えない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-table");
+        // 縮小上限 (preview::ANIM_MAX_SIDE) を跨ぐ寸法にして、コマ列の
+        // テクスチャが静止画より小さくなる場合でも版面が動かないことを見る
+        let gif = crate::preview::testdata::make_gif(600, 300, 4, 100, 0);
+        let path = dir.join("t.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "| 名前 | 絵 |\n| --- | --- |\n| あ | ![](t.gif) |\n| い | ふつうの文字 |\n";
+
+        let mut h = AnimHarness::new(900.0, 700.0);
+        // 静止画だけで描けている段の寸法を控える。1 パス目は ScrollArea の
+        // 状態も列幅もまだ無いので、落ち着かせてから測る。
+        let mut still = None;
+        let mut still_rows = Vec::new();
+        for _ in 0..3 {
+            let out = h.pass(Some(&dir), doc);
+            still = drawn_image_rect(&out);
+            still_rows = text_row_rects(&out);
+        }
+        let still = still.expect("静止画の矩形");
+        assert!(!still_rows.is_empty(), "表の文字が描かれている");
+        assert!(h.settle(Some(&dir), doc, &key), "コマ列が届く");
+        assert!(h.images.anim_ready(&key));
+        // テクスチャ自体は上限 (preview::ANIM_MAX_SIDE = 512) まで縮んでいる。
+        // 紙面の寸法を静止画から受け継いでいなければ、ここで版面が跳ねる。
+        let tex = h.images.cached(&key).flatten().expect("テクスチャ");
+        assert_eq!(tex.size(), [512, 256], "コマ列は上限まで縮む");
+
+        let mut frames = Vec::new();
+        for _ in 0..6 {
+            let out = h.pass(Some(&dir), doc);
+            let r = drawn_image_rect(&out).expect("アニメーションの矩形");
+            assert!(
+                (r.width() - still.width()).abs() < 0.5
+                    && (r.height() - still.height()).abs() < 0.5,
+                "コマ列が届いても寸法が変わらない: 静止 {still:?} / いま {r:?}"
+            );
+            // 列幅も動かない = 隣のセルの文字が 1px も動かない
+            assert_eq!(
+                text_row_rects(&out),
+                still_rows,
+                "コマが進んでも表の行と列が動かない"
+            );
+            frames.push(h.images.anim_shown(&key).expect("コマ番号"));
+        }
+        assert!(
+            frames.windows(2).any(|w| w[0] != w[1]),
+            "実際にコマが進んでいる: {frames:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn データuriのアニメーションgifも再生する() {
+        let gif = crate::preview::testdata::make_gif(8, 8, 3, 100, 0);
+        let url = format!("data:image/gif;base64,{}", base64_encode(&gif));
+        let doc = format!("![動く]({url})");
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        assert!(h.settle(None, &doc, &url), "コマ列が届く");
+        assert!(h.images.anim_ready(&url), "data: URI でも再生する");
+        // data: URI の鍵は URL そのもの。毎パス base64 を解き直さない
+        assert!(h.images.cached(&url).is_some(), "URL を鍵にキャッシュ済み");
+        let a = h.images.anim_shown(&url).expect("コマ番号");
+        h.pass(None, &doc);
+        let b = h.images.anim_shown(&url).expect("コマ番号");
+        assert_ne!(a, b, "コマが進む");
     }
 
     #[test]
