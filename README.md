@@ -2,55 +2,63 @@
 
 <img src="assets/Zaivern.png" width="120" alt="Zaivern Code" />
 
-# ⚡ Zaivern Code
+# Zaivern Code
 
-**Run Claude Code, Codex, Gemini CLI, and other AI coding tools together — from one screen.**<br>
-A Rust-native AI development cockpit for macOS, Windows, and Linux.
+**One cockpit for Claude Code, Codex, Gemini CLI, and the other AI coding CLIs you already use.**<br>
+Launch, watch, and steer them from a single native app on macOS, Windows, and Linux.
 
-[日本語](README.md) | [**English**](README.en.md)
+[English](README.md) | [日本語](README.ja.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-[🌐 **Website**](https://zaivern.com/) · [⬇️ **Download**](https://github.com/tacyan/zaivern-code/releases/latest) · [🗒️ **Release history**](https://github.com/tacyan/zaivern-code/releases)
+[**Download**](https://github.com/tacyan/zaivern-code/releases/latest) ·
+[**Quick Start**](#quick-start) ·
+[**Documentation**](#documentation) ·
+[**Website**](https://zaivern.com/)
 
 <a href="https://zaivern.com/">
-  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code running Claude Code, Codex, Gemini CLI, and other coding agents in parallel" />
+  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code running Claude Code, Codex, Gemini CLI, and other coding agents side by side" />
 </a>
+
+If Zaivern Code looks useful to you, a ⭐ **Star** helps its development.
 
 </div>
 
-## New to Zaivern Code?
+## Why Zaivern Code
 
-Zaivern Code is not an AI model. It is an app that **brings your AI coding tools into one place**. Install and sign in to at least one tool, such as Claude Code, Codex, or Gemini CLI. You do not need all three.
+Starting several AI coding CLIs is easy. Keeping track of them is not. Every agent
+lives in its own terminal tab, asks for approval at its own pace, and edits files
+without knowing what the others are doing.
 
-Getting started takes three steps:
-
-1. Install and sign in to an AI coding tool
-2. Install Zaivern Code with the command below
-3. Run `zai .` inside your project folder
-
-## Stop keeping your AI agents waiting
-
-Claude Code implements. Codex tests. Gemini CLI writes the docs. Zaivern Code brings scattered terminals into **one cockpit**.
-
-| Before | With Zaivern Code |
+| Without a cockpit | With Zaivern Code |
 |---|---|
-| Jump between tabs for every agent | Monitor and control every agent from one screen |
-| Paste the same instruction repeatedly | Broadcast one instruction to the whole fleet |
-| Miss approvals and stalled sessions | Get live status, notifications, and one-click approval |
-| Stay chained to your desk | Check progress, send instructions, and approve from your phone |
-| **More agents means more merge conflicts** | **Same file, different lines — no conflict** |
+| Cycle through tabs to find who needs you | Every agent on one screen, with live status |
+| Paste the same instruction into each tool | Broadcast once to the fleet, or target one agent |
+| Miss an approval prompt and lose the run | Notifications and one-click approval |
+| Stay at your desk while agents work | Check progress and approve from your phone |
+| More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines |
+| A heavy editor competes with your agents for the machine | A single native binary, with damage-driven redraws |
 
-The real cost of running agents in parallel is not wall-clock time; it is **resolving
-conflicts at review time**. With 64 agents on one file, plain git produced
-**48 conflicting branches, 960 conflict lines, and 48 manual fixes**. Zaivern Code
-produced **zero conflicts and zero manual fixes — and all 64 agents landed their work**
-([the numbers](docs/conflict-zero.md)).
+That last row is a design constraint, not a slogan. Zaivern Code ships as one native
+binary — no bundled browser engine, no Node runtime — and it redraws on damage instead
+of running a permanent animation loop, which is what makes holding many PTYs at once
+affordable in memory and latency. Idle cost is treated as a number rather than an
+impression: `tools/idle-cpu.sh` measures it on your own machine, uses a plain `sleep`
+process as the floor, and reports the raw CPU-time increment instead of a pass/fail
+line. See [docs/idle-cost.md](docs/idle-cost.md) for what the measurement does and does
+not tell you.
 
-## 🚀 Install Zaivern Code
+Zaivern Code is not an AI model and does not bundle one. It drives the CLIs you have
+already installed and signed in to — one is enough to start.
+
+## Quick Start
+
+**Prerequisites.** Install and sign in to at least one supported AI coding CLI.
+Zaivern Code ships launch presets for 33 of them, including Claude Code, Codex, and
+Gemini CLI. You do not need more than one.
 
 **macOS / Linux**
 
@@ -66,188 +74,143 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 zai .
 ```
 
-The installer automatically downloads the right app for your operating system. Run the same command again whenever you want to update.
+Rather not pipe a script into your shell? Download the archive for your platform from
+[Releases](https://github.com/tacyan/zaivern-code/releases/latest), unpack it, and put
+`zai` (or `zai.exe`) somewhere on your `PATH`. Then run `zai .` in a project folder.
 
-### Update
+Once the window is open:
 
-```bash
-zai update            # Check for a newer release, show the command, then update
-zai update --check    # Only check; nothing is executed
-zai update --yes      # Update without asking for confirmation
-```
+1. Click `+ Agent` and pick a CLI you already have installed.
+2. Type a task into the input box and send it.
+3. Add a second agent once the first one feels comfortable.
 
-The update method follows where the binary lives: `cargo install --force` when it sits in `~/.cargo/bin`, otherwise the one-liner installer above.
+`zai update` upgrades in place (`--check` only looks, `--yes` skips the prompt), and
+`zai uninstall` removes it (`--dry-run` lists what would go). Uninstalling touches only
+the executable and `~/.zaivern`; anything else on your `PATH` is listed, never deleted.
 
-### Uninstall
+## Key Features
 
-```bash
-zai uninstall --dry-run       # List everything that would be removed, with sizes (removes nothing)
-zai uninstall                 # Show the list, then ask for `y` before removing
-zai uninstall --keep-config   # Keep your settings (config.toml / state.toml)
-zai uninstall --yes           # Remove without asking for confirmation
-```
+### Agent Cockpit
 
-Only the **executable itself and `~/.zaivern`** (settings, session records, terminal logs) are removed. The OS app registration is unregistered at the same time. Any other `zai` still on your `PATH` is listed rather than deleted, so nothing outside those two locations is ever touched.
+Tile several AI CLIs side by side and see at a glance which one is thinking, editing,
+running, or waiting on you. Launch presets for 33 tools are built in, so adding an
+agent is a two-click operation rather than a remembered command line.
 
-### After the first launch
+### Broadcast
 
-1. Follow the two-minute guided tour
-2. Click `+ Agent`
-3. Choose an AI tool you already installed
-4. Enter a task and send it
+Send one instruction to every running agent from a single input box, or pick one agent
+when you want focused control. Useful when the same correction applies to the whole
+fleet.
 
-Start with one agent. Add a second or third after you are comfortable with the workflow.
+### Status, Approvals, and Notifications
 
-## What you can do
+Zaivern Code surfaces permission prompts, stalls, and unexpected exits as notifications
+you can act on in one click. Automatic approval is off by default and has to be turned
+on deliberately.
 
-### 🧩 Conflict-free — same file, different lines
+### Phone Remote
 
-**This is the core of the product.** Ownership is per *line*, so a large file like
-`src/app.rs` can be shared by any number of agents. If your lines are taken, you are
-handed nearby free lines instead of being refused.
+Check progress, send instructions, approve actions, and edit files from your phone.
+The simplest setup works over the same Wi-Fi network, and an SSH tunnel covers the
+case where you are not on it.
 
-```console
-$ zai czero init      # install every layer at once, then self-diagnose
-$ zai czero verify    # create a real conflict and prove it gets stopped
-```
+### Conflict Coordination
 
-### 🎛 Agent Cockpit
+Agents claim the files — or the individual line ranges — they are about to edit in a
+shared ledger, and git hooks refuse a write that would collide. The section below
+spells out what this covers and what it does not.
 
-Arrange multiple AI tools in a grid and see at a glance whether each one is working or waiting. Zaivern includes launch presets for 33 tools, including Claude Code, Codex, and Gemini CLI.
+### Built-in Editor
 
-### 📣 Broadcast
+Read code and review what your agents changed without leaving the app, including
+images, PDFs, CSVs, and Markdown. Unsaved buffers survive a crash: the next launch
+restores them, and if the file changed on disk in the meantime you are shown the
+difference instead of being silently overwritten.
 
-Send one instruction to every active AI at once, or select a single agent when you want focused control.
+## Conflict Coordination
 
-### 🛡 Approvals and supervision
-
-Get notified when an AI asks for permission, stops responding, or exits unexpectedly. Automatic approval is **off by default** for safety.
-
-### 📋 Fleet management
-
-See whether each AI is thinking, editing, running, or checking its work. Once you are comfortable, you can give the same task to several agents and compare their results.
-
-### 📱 Phone Remote
-
-Check progress, send instructions, approve actions, and edit files from your phone. The easiest setup works over the same Wi-Fi network.
-
-### 📝 Built-in code editor
-
-Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
-
-## 🆕 New in v0.14.0 — no conflicts, even in the same file
-
-**🧩 Region ownership.** Until now the only way to protect parallel agents was
-"nobody may write a file someone else holds." Safe, but **one agent holding a large
-file locks everyone else out of it**. From v0.14.0 you hold *lines*:
-`zai lease claim 'src/app.rs#L1200-1260'`.
-
-Measured with 64 agents hammering a single 2000-line file
-(`tools/coedit-bench.sh --agents 64 --lines 2000`):
-
-| Protection | Landed | Refused | Conflicting branches | Conflict lines | Manual fixes |
-|---|---:|---:|---:|---:|---:|
-| None (plain git) | 64 | 0 | **48** | **960** | **48** |
-| Per file (≤ v0.13) | **1** | 63 | 0 | 0 | 0 |
-| Per line, no shifting | 11 | 53 | 0 | 0 | 0 |
-| **Per line + negotiation (v0.14)** | **64** | **0** | **0** | **0** | **0** |
-
-**Zero conflicts was already true in v0.13. What v0.14 buys is parallelism** —
-1 of 64 agents could write; now all 64 can.
-
-**🔀 Shift instead of refuse.** If the lines you asked for are taken, Zaivern hands
-you nearby free lines automatically (`zai lease claim --shift`). The price is
-**how far from your request you landed**: p50 129 lines, p95 253, max 281, and zero
-allocations outside the file. Only requests that explicitly opt in are moved — a
-region is tied to *the content that lives there*, so the default is never to move it.
-
-**🤝 Agents recognise each other, Erlang-style.** Every participant has an identity
-(`incarnation` is the start time, so **a recycled OS pid can never be mistaken for
-you**) and a mailbox with per-sender FIFO delivery. `link` / `monitor` / `DOWN` with
-`trap_exit`. **When an agent dies holding regions, its regions are released
-automatically** — "let it crash", applied to editing. Measured release: 23.2 ms.
-
-**🔒 Proof that a merge lands in one shot.** If the changed regions of N branches are
-far enough apart, `git merge` **cannot** conflict. Verified exhaustively against real
-git across 240 cases with **zero misses**. When the proof holds, N branches integrate
-with zero human steps — without ever touching the working tree (`merge-tree` →
-`commit-tree`, then one atomic ref update), so a failure leaves nothing half-merged.
-
-**🧬 List appends stop conflicting, in any repository.** `.gitignore`, `CHANGELOG.md`,
-`package.json` dependencies, `import` blocks — conflicts where the right answer is
-"keep both lines" are resolved by **reading the content**, with no markers to add.
-On a marker-free benchmark: **80% fewer conflict lines, zero wrong auto-resolutions**.
-For files that are not lists, the result is **byte-for-byte identical to plain git**.
-
-**🚦 One command in any repository.**
+Running agents in parallel is cheap. Reconciling their output at review time is not.
+Zaivern Code keeps a per-repository ledger of who owns which files and line ranges, and
+installs git hooks and a merge driver so that a colliding write is stopped at the point
+it happens rather than discovered during a merge.
 
 ```console
 $ zai czero init      # ledger, git hooks, merge driver, .gitattributes — then self-diagnose
-$ zai czero verify    # actually create a conflict and prove it gets stopped
+$ zai czero verify    # create a real conflict in a throwaway repo and prove it is stopped
 ```
 
-`verify` does not just read configuration. It **creates a real conflict in a
-throwaway repository and proves it is stopped** (your repository is never touched),
-so "installed but not working" cannot happen silently. `zai czero doctor` reports each
-layer with a reason and a fix; `zai czero uninstall` removes only what was added.
+`verify` does not merely read your configuration. It builds a disposable repository,
+provokes an actual conflict, and reports whether each layer stopped it — your own
+repository is never modified. `zai czero doctor` explains each layer with a fix, and
+`zai czero uninstall` removes only what was added.
 
-The numbers — **including the conditions where this does not help** — are in
-[docs/conflict-zero.md](docs/conflict-zero.md).
+**What this prevents.** Git merge conflicts between agents that share the same ledger
+and whose line regions stay safely apart.
 
-## Supported environments
+**What this does not prevent.**
+
+- **Semantic conflicts.** One agent changes a function signature while another keeps
+  calling the old one. The regions never overlap, the merge is clean, and the code is
+  still broken. These are surfaced, not blocked.
+- **Interleaved edits in repetitive content.** Disjoint line regions guarantee
+  *ownership*, not a clean merge. When surrounding lines repeat, git can align a hunk
+  somewhere else and conflict anyway.
+- **Repositories the hooks cannot reach.** Non-git folders accept a claim but enforce
+  nothing; submodule interiors, bare repositories, and read-only checkouts are outside
+  the four layers. `zai czero doctor` reports which case you are in.
+
+Measurements, failure conditions, and the full list of limits live in
+[docs/conflict-zero.md](docs/conflict-zero.md). The write guard is deliberately
+**fail-open**: when `zai` is missing or the ledger is unreadable, commits go through.
+Only a real, detected conflict is allowed to stop you.
+
+## Supported Platforms
 
 | Item | Support |
 |---|---|
 | OS | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
-| AI CLIs | 33 presets, including Claude Code, Codex, and Gemini CLI |
-| Rust | 1.88+ when building from source |
+| AI CLIs | 33 launch presets, including Claude Code, Codex, and Gemini CLI |
+| Rust | 1.88+ — only when building from source |
 | License | Apache-2.0 |
 
-## Safety by default
+A common setup is Claude Code implementing, Codex testing, and Gemini CLI writing docs,
+but nothing in Zaivern Code assumes that split. Any combination works, including a
+single agent.
 
-- Approval-required mode is the default; Auto-YES requires explicit opt-in
-- Privilege escalation always requires manual approval
-- MCP environment-variable values are never displayed, only whether they are configured
-- When using an SSH tunnel, the remote server binds to `127.0.0.1` only
-- Child processes are stopped when sessions are destroyed or the app exits
+## Safety
 
-## Frequently asked questions
+- Approval-required mode is the default; Auto-YES is opt-in per session.
+- Privilege escalation always requires manual approval.
+- MCP environment-variable values are never displayed — only whether they are set.
+- Child processes are stopped when a session is destroyed or the app exits, so no
+  orphaned agent keeps running in the background.
 
-### Are the AI tools included?
+## Documentation
 
-No. Install and sign in to the tools you want to use, such as Claude Code, Codex, or Gemini CLI.
+| Document | What it covers |
+|---|---|
+| [docs/conflict-zero.md](docs/conflict-zero.md) | What "conflict-free" claims, what it does not, and the measurements behind it |
+| [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
+| [docs/anyrepo-proof.md](docs/anyrepo-proof.md) | Reproducing the experiment on your own repository |
+| [docs/xplat-bench.md](docs/xplat-bench.md) | macOS and Linux results, measured side by side |
+| [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU cost is measured, and the current numbers |
+| [docs/region-cost.md](docs/region-cost.md) | Cost of the line-region check itself |
+| [docs/guard-edges.md](docs/guard-edges.md) | Where the write guard leaks, and how it is closed |
+| [docs/bench-honesty.md](docs/bench-honesty.md) | Rules that keep the benchmarks from lying quietly |
+| [docs/workspace-key.md](docs/workspace-key.md) | How per-workspace storage locations are derived |
+| [docs/plugins.md](docs/plugins.md) · [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md) | Writing plugins |
 
-### Do I need all three tools?
+Release notes for each version are on the
+[Releases page](https://github.com/tacyan/zaivern-code/releases).
 
-No. Zaivern Code works with a single AI tool. Starting with the tool you already use is the easiest path.
+## Contributing
 
-### Is Zaivern Code free?
+Bug reports, feature requests, and pull requests are welcome. Please check
+[Issues](https://github.com/tacyan/zaivern-code/issues) for an existing report before
+opening a new one, and open a
+[Pull Request](https://github.com/tacyan/zaivern-code/pulls) against `main`.
 
-Zaivern Code is free, open-source software under the Apache-2.0 license. Subscriptions and usage fees for each AI service are separate.
-
-### Will it run commands without asking me?
-
-Approval is required by default. Automatic approval only runs after you explicitly turn it on.
-
-### Is "zero conflicts" really zero?
-
-**With protection on, yes** — but here are the conditions, stated honestly. If two
-regions are at least `SAFE_BAND` (3) lines apart, git's three-way merge **structurally
-cannot** emit a conflict. With 64 agents on one file we measured zero conflict hunks
-and zero manual fixes.
-
-There are things this **cannot** do. Changes in *different* files that stop fitting
-together (one side changes a signature, the other keeps calling the old way) are
-impossible to prevent — those are detected and shown, not blocked. Numbers and limits:
-[docs/conflict-zero.md](docs/conflict-zero.md).
-
-### Does it work on an existing repository?
-
-`zai czero init`. Existing git hooks (husky, lefthook, pre-commit framework) are kept
-and called first, with their exit code respected. Hand-written `.gitattributes` lines
-are preserved. `zai czero uninstall` removes only what was added.
-
-## Build from source
+**Build from source**
 
 ```bash
 git clone https://github.com/tacyan/zaivern-code.git
@@ -256,32 +219,24 @@ rustup update stable
 cargo run --release -- .
 ```
 
-### Tests
+**Verify a change**
 
 ```bash
-cargo fmt --all --check
-cargo nextest run --profile ci
+tools/verify.sh --lint           # format, compile, tests, and clippy in one pass
+cargo nextest run --profile ci   # the full suite, the way CI runs it
 ```
 
-### Cross-OS checks (runnable locally, even from macOS)
-
-Code behind `#[cfg(windows)]` or Linux-only branches never compiles in a macOS build.
-These scripts let you catch such breakage without waiting for CI.
+Code behind `#[cfg(windows)]` or Linux-only branches never compiles in a macOS build,
+so both are reproducible locally instead of waiting on CI:
 
 ```bash
-tools/linux-test.sh              # Reproduce the Linux tests in Docker
-tools/windows-check.sh           # Type-check for Windows (MSVC)
-tools/windows-check.sh --build   # Produce a real zai.exe (verifies linking)
+tools/linux-test.sh              # run the Linux tests in Docker
+tools/windows-check.sh           # type-check for Windows (MSVC)
+tools/windows-check.sh --build   # produce a real zai.exe, verifying the link step
 ```
 
-The Windows side needs `cargo install cargo-xwin --locked` once.
-Neither script touches the host `target/` directory.
-
-For plugin development, see the [plugin guide](docs/plugins.md) and [specification](docs/PLUGIN_SPEC.md).
-
-## Contributing
-
-Bug reports, feature requests, and pull requests are welcome. Check [Issues](https://github.com/tacyan/zaivern-code/issues) before opening a new report.
+The Windows side needs `cargo install cargo-xwin --locked` once. Neither script writes
+to the host `target/` directory.
 
 ## License
 
