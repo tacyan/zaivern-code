@@ -40,16 +40,6 @@ without knowing what the others are doing.
 | Miss an approval prompt and lose the run | Notifications and one-click approval |
 | Stay at your desk while agents work | Check progress and approve from your phone |
 | More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines |
-| A heavy editor competes with your agents for the machine | A single native binary, with damage-driven redraws |
-
-That last row is a design constraint, not a slogan. Zaivern Code ships as one native
-binary — no bundled browser engine, no Node runtime — and it redraws on damage instead
-of running a permanent animation loop, which is what makes holding many PTYs at once
-affordable in memory and latency. Idle cost is treated as a number rather than an
-impression: `tools/idle-cpu.sh` measures it on your own machine, uses a plain `sleep`
-process as the floor, and reports the raw CPU-time increment instead of a pass/fail
-line. See [docs/idle-cost.md](docs/idle-cost.md) for what the measurement does and does
-not tell you.
 
 Zaivern Code is not an AI model and does not bundle one. It drives the CLIs you have
 already installed and signed in to — one is enough to start.
@@ -129,40 +119,21 @@ difference instead of being silently overwritten.
 
 ## Conflict Coordination
 
-Running agents in parallel is cheap. Reconciling their output at review time is not.
-Zaivern Code keeps a per-repository ledger of who owns which files and line ranges, and
-installs git hooks and a merge driver so that a colliding write is stopped at the point
-it happens rather than discovered during a merge.
+Agents record the files and line ranges they are about to edit in a shared,
+per-repository ledger, and git hooks refuse a write that would collide — so a clash
+surfaces when it happens instead of at merge time.
+
+What it cannot catch is a semantic conflict: one agent changes a function signature
+while another keeps calling the old one, in a different file, with a perfectly clean
+merge.
 
 ```console
-$ zai czero init      # ledger, git hooks, merge driver, .gitattributes — then self-diagnose
-$ zai czero verify    # create a real conflict in a throwaway repo and prove it is stopped
+$ zai czero init      # install the ledger, git hooks, and merge driver, then self-diagnose
+$ zai czero verify    # create a real conflict in a throwaway repo and check that it stops
 ```
 
-`verify` does not merely read your configuration. It builds a disposable repository,
-provokes an actual conflict, and reports whether each layer stopped it — your own
-repository is never modified. `zai czero doctor` explains each layer with a fix, and
-`zai czero uninstall` removes only what was added.
-
-**What this prevents.** Git merge conflicts between agents that share the same ledger
-and whose line regions stay safely apart.
-
-**What this does not prevent.**
-
-- **Semantic conflicts.** One agent changes a function signature while another keeps
-  calling the old one. The regions never overlap, the merge is clean, and the code is
-  still broken. These are surfaced, not blocked.
-- **Interleaved edits in repetitive content.** Disjoint line regions guarantee
-  *ownership*, not a clean merge. When surrounding lines repeat, git can align a hunk
-  somewhere else and conflict anyway.
-- **Repositories the hooks cannot reach.** Non-git folders accept a claim but enforce
-  nothing; submodule interiors, bare repositories, and read-only checkouts are outside
-  the four layers. `zai czero doctor` reports which case you are in.
-
-Measurements, failure conditions, and the full list of limits live in
-[docs/conflict-zero.md](docs/conflict-zero.md). The write guard is deliberately
-**fail-open**: when `zai` is missing or the ledger is unreadable, commits go through.
-Only a real, detected conflict is allowed to stop you.
+Scope, limits, and the measurements behind them are in
+[docs/conflict-zero.md](docs/conflict-zero.md).
 
 ## Supported Platforms
 
@@ -191,14 +162,8 @@ single agent.
 |---|---|
 | [docs/conflict-zero.md](docs/conflict-zero.md) | What "conflict-free" claims, what it does not, and the measurements behind it |
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
-| [docs/anyrepo-proof.md](docs/anyrepo-proof.md) | Reproducing the experiment on your own repository |
-| [docs/xplat-bench.md](docs/xplat-bench.md) | macOS and Linux results, measured side by side |
-| [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU cost is measured, and the current numbers |
-| [docs/region-cost.md](docs/region-cost.md) | Cost of the line-region check itself |
-| [docs/guard-edges.md](docs/guard-edges.md) | Where the write guard leaks, and how it is closed |
-| [docs/bench-honesty.md](docs/bench-honesty.md) | Rules that keep the benchmarks from lying quietly |
-| [docs/workspace-key.md](docs/workspace-key.md) | How per-workspace storage locations are derived |
-| [docs/plugins.md](docs/plugins.md) · [docs/PLUGIN_SPEC.md](docs/PLUGIN_SPEC.md) | Writing plugins |
+| [docs/plugins.md](docs/plugins.md) | Writing plugins, with the [format specification](docs/PLUGIN_SPEC.md) |
+| [docs/README.md](docs/README.md) | Index of every other document, grouped by the claim it backs |
 
 Release notes for each version are on the
 [Releases page](https://github.com/tacyan/zaivern-code/releases).
@@ -210,8 +175,6 @@ Bug reports, feature requests, and pull requests are welcome. Please check
 opening a new one, and open a
 [Pull Request](https://github.com/tacyan/zaivern-code/pulls) against `main`.
 
-**Build from source**
-
 ```bash
 git clone https://github.com/tacyan/zaivern-code.git
 cd zaivern-code
@@ -219,24 +182,8 @@ rustup update stable
 cargo run --release -- .
 ```
 
-**Verify a change**
-
-```bash
-tools/verify.sh --lint           # format, compile, tests, and clippy in one pass
-cargo nextest run --profile ci   # the full suite, the way CI runs it
-```
-
-Code behind `#[cfg(windows)]` or Linux-only branches never compiles in a macOS build,
-so both are reproducible locally instead of waiting on CI:
-
-```bash
-tools/linux-test.sh              # run the Linux tests in Docker
-tools/windows-check.sh           # type-check for Windows (MSVC)
-tools/windows-check.sh --build   # produce a real zai.exe, verifying the link step
-```
-
-The Windows side needs `cargo install cargo-xwin --locked` once. Neither script writes
-to the host `target/` directory.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the rest: how to verify a change, how to run
+the Linux and Windows checks locally, and the conventions this repository follows.
 
 ## License
 
