@@ -88,6 +88,19 @@ use serde::{Deserialize, Serialize};
 /// **いちばん厳しい経路に合わせる**のがこの定数の役目なので 3 のまま据え置く。
 /// 下げてよいのは「三方向マージしか通らない」と保証できる場合だけで、その値は
 /// [`MERGE_ONLY_BAND`] に分けてある。
+///
+/// ## ⚠ この帯が保証していないこと (後から実測で見つかった穴)
+///
+/// 上の表は**変更 2 つを 1 組で**測ったもので、その範囲では今も正しい
+/// (周期 1〜12 のどんな反復本文でも、1 行ずつの変更 2 つは間隔 1 行で通る)。
+/// 保証していないのは**組み合わせ**のほうで、
+///
+/// > 「全部の組が帯を満たす」⇒「全部まとめてマージしても綺麗に通る」
+///
+/// は**成り立たない**。片方の担当がもう片方を上下から挟んでいると (交錯)、
+/// 反復的な本文では帯を何行取っても衝突しうる。詳細と対処は
+/// [`anchor_lines`] / [`interleave_safe`] / [`interleaved`] に書いた。
+/// **帯を広げる方向では直らない**ので、この定数の値は動かしていない。
 pub const SAFE_BAND: u32 = 3;
 
 /// **三方向マージだけ**を通す前提でよいときの下限 (実測値)。
@@ -514,6 +527,147 @@ pub fn spans_too_close(a: &Span, b: &Span, band: u32) -> bool {
     // 間にある未変更行の数
     let gap = hi0.saturating_sub(lo1).saturating_sub(1);
     gap < band
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  2.5 錨 — 帯は**組では正しいが、組み合わせでは足りない**
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// ファイル内で**ちょうど 1 回**しか現れない行に印を付ける (添字 `i` は `i+1` 行目)。
+///
+/// # なぜ要るのか — 帯だけでは足りない実測
+///
+/// [`SAFE_BAND`] / [`MERGE_ONLY_BAND`] は「**2 つの**変更を何行離せば git が
+/// 衝突しないか」を測って決めた値で、その主張は今も正しい (周期 1〜12 の
+/// どんな反復本文でも、1 行ずつの変更 2 つは間隔 1 行で綺麗に通る)。
+/// 崩れたのは**そこから先の推論**のほうで、
+///
+/// > 「全部の組が帯を満たす ⇒ 全部まとめてマージしても綺麗に通る」
+///
+/// は成り立たない。`git merge` の既定戦略 ort は **diff アルゴリズムを
+/// histogram に固定している** (`man git-merge`: "ort specifically uses
+/// diff-algorithm=histogram")。histogram は本文が反復的だと*同じ側の複数の
+/// 変更*を 1 つの巨大なハンクへ畳むので、**片方の担当がもう片方を上下から
+/// 挟んでいる**とき (交錯) に、帯を何行取っていても衝突しうる。
+///
+/// 実測 (`tools/merge-band-probe.sh --mode bracket`、周期 6 の Markdown):
+/// A が 17 行目・B が 5/13/25 行目 — どの組も 4 行以上離れているのに衝突する。
+/// 帯を広げても直らない (周期 6・16 体・ランダム順では **間隔 16 行でも
+/// 9 件衝突**した)。逆に、**隣り合う他人の域の間にこの「唯一の行」が 1 本でも
+/// あれば衝突しなかった** — 錨は diff が越えられない壁になる。
+///
+/// 判定は決定的 (`BTreeMap` のみ。`HashMap` を 1 つも使わない)。
+pub fn anchor_lines(text: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let mut seen: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for l in &lines {
+        *seen.entry(l).or_insert(0) += 1;
+    }
+    lines.iter().map(|l| seen.get(l) == Some(&1)).collect()
+}
+
+/// `lo` と `hi` の**間**に [`anchor_lines`] の錨が 1 本以上あるか。
+///
+/// 両端の域そのものは含めない (どちらかが書き換える行は壁にならない)。
+pub fn anchor_between(anchors: &[bool], lo: &Span, hi: &Span) -> bool {
+    let (lo0, lo1) = lo.probe();
+    let (hi0, hi1) = hi.probe();
+    // 呼び出し側が順序を間違えても答えを変えない
+    let (lo_end, hi_start) = if lo0 <= hi0 { (lo1, hi0) } else { (hi1, lo0) };
+    if lo_end == Span::EOF || hi_start == Span::EOF {
+        return false;
+    }
+    let from = lo_end as usize;
+    let to = (hi_start as usize).saturating_sub(1);
+    if from >= to {
+        return false;
+    }
+    anchors
+        .get(from..to.min(anchors.len()))
+        .map(|s| s.iter().any(|b| *b))
+        .unwrap_or(false)
+}
+
+/// 複数の行域をまとめて包む最小の域。空なら `None`。
+pub fn hull(spans: &[Span]) -> Option<Span> {
+    let mut it = spans.iter();
+    let first = it.next()?;
+    let (mut s, mut e) = first.probe();
+    for sp in it {
+        let (a, b) = sp.probe();
+        s = s.min(a);
+        e = if e == Span::EOF || b == Span::EOF {
+            Span::EOF
+        } else {
+            e.max(b)
+        };
+    }
+    Some(Span { start: s, end: e })
+}
+
+/// 2 人の担当が同じファイルで**交錯**しているか
+/// (= 外接域が重なる = 片方がもう片方を挟んでいる)。
+///
+/// 交錯していなければ、統合を**行番号の昇順**で流す限り
+/// 「累積した側」が「これから混ぜる側」を挟むことは起こり得ない。
+pub fn interleaved(a: &[Span], b: &[Span]) -> bool {
+    match (hull(a), hull(b)) {
+        (Some(x), Some(y)) => !spans_disjoint(&x, &y),
+        _ => false,
+    }
+}
+
+/// 2 つの域がまったく重なっていないか (帯は見ない)。
+fn spans_disjoint(a: &Span, b: &Span) -> bool {
+    let (a0, a1) = a.probe();
+    let (b0, b1) = b.probe();
+    let ((_, lo1), (hi0, _)) = if a0 <= b0 {
+        ((a0, a1), (b0, b1))
+    } else {
+        ((b0, b1), (a0, a1))
+    };
+    lo1 != Span::EOF && hi0 > lo1
+}
+
+/// 交錯している 2 人を、それでも「一撃でマージできる」と言い切ってよいか。
+///
+/// 線の順に並べたとき、**持ち主が変わる境目すべて**に錨 ([`anchor_lines`]) が
+/// 1 本以上あることを要求する。錨が 1 つも無い区間が 1 箇所でもあれば `false`
+/// (**分からない側へ倒す**)。
+///
+/// `anchors` が空 (= 元テキストを読めなかった) なら必ず `false` を返す。
+pub fn interleave_safe(anchors: &[bool], a: &[Span], b: &[Span]) -> bool {
+    if anchors.is_empty() {
+        return false;
+    }
+    let mut all: Vec<(u32, u32, bool)> = Vec::with_capacity(a.len() + b.len());
+    for s in a {
+        let (x, y) = s.probe();
+        all.push((x, y, false));
+    }
+    for s in b {
+        let (x, y) = s.probe();
+        all.push((x, y, true));
+    }
+    all.sort();
+    all.windows(2).all(|w| {
+        let (lo, hi) = (w[0], w[1]);
+        lo.2 == hi.2
+            || anchor_between(
+                anchors,
+                &Span {
+                    start: lo.0,
+                    end: lo.1,
+                },
+                &Span {
+                    start: hi.0,
+                    end: hi.1,
+                },
+            )
+    })
 }
 
 /// 2 つの担当が同時に持てないか。
@@ -1917,6 +2071,209 @@ mod tests {
                 "gap={gap} は実ツリーでも通るはず"
             );
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  周期的な本文 — 帯だけでは足りないことの実測と、錨による手当て
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// 周期 `p` で繰り返すだけの本文 (末尾の 1 行だけが一意)。
+    ///
+    /// 末尾を一意にするのは**実在するファイルの形に寄せるため**で、同時に
+    /// 判定を安定させる。純粋な周期だけの本文は行数によって git の答えが
+    /// 揺れる (周期 6 は 200/300 行で衝突し 400/600 行では通る) が、
+    /// 末尾に一意な行が 1 本あると 200〜600 行のどこでも同じ結果になる。
+    fn periodic(p: usize, n: u32) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let mut s: String = (0..n)
+            .map(|i| format!("{}\n", POOL[(i as usize) % p]))
+            .collect();
+        s.push_str("tail\n");
+        s
+    }
+
+    /// `lines` の各行の末尾へ `tag` を足す (置換 1 行ぶんの変更を複数箇所に置く)。
+    fn touch(base: &str, lines: &[u32], tag: &str) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if lines.contains(&((i + 1) as u32)) {
+                    format!("{l}  <<{tag}>>\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    /// 本文の `at` 行目を「ファイル内で唯一の行」に差し替える。
+    fn plant_anchor(base: &str, at: &[u32]) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let n = (i + 1) as u32;
+                if at.contains(&n) {
+                    format!("UNIQ-{n}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    fn spans(lines: &[u32]) -> Vec<Span> {
+        lines.iter().map(|n| Span::line(*n)).collect()
+    }
+
+    /// **帯だけのモデルが破れる組を、実 git で固定する。**
+    ///
+    /// どの組も [`SAFE_BAND`] (3 行) 以上離れているのに `git merge` は衝突する。
+    /// 原因は「片方が相手を上下から挟んでいる (交錯) + 本文が反復的」で、
+    /// **帯を広げても直らない**。ここが赤くなったら、それは git の側が
+    /// 変わったということなので、[`SAFE_BAND`] の doc を測り直すこと。
+    #[test]
+    fn 実gitで周期的な本文では帯を満たしても衝突することを固定する() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("periodic");
+        // (自分の行, 相手の行, 周期)
+        let table: &[(&[u32], &[u32], usize)] = &[
+            (&[17], &[5, 13, 25], 6),
+            (&[17], &[5, 13, 25], 3),
+            (&[17], &[5, 13, 25], 1),
+            (&[44], &[3, 15, 22, 60], 6),
+            (&[50], &[3, 20, 36, 76], 6),
+        ];
+        let mut broke = 0u32;
+        for (ours, theirs, p) in table {
+            let base = periodic(*p, 400);
+            // 前提: どの組も安全帯を満たしている (= 現行モデルは「素」と言う)
+            for a in ours.iter() {
+                for b in theirs.iter() {
+                    assert!(
+                        !spans_too_close(&Span::line(*a), &Span::line(*b), SAFE_BAND),
+                        "前提が崩れている: {a} と {b} は帯 {SAFE_BAND} を満たすはず"
+                    );
+                }
+            }
+            let o = touch(&base, ours, "OURS");
+            let t = touch(&base, theirs, "THEIRS");
+            let Some(hit) = lab.merge_tree(&base, &o, &t) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            if hit {
+                broke += 1;
+                // 帯は満たしているが、錨が 1 本も無いので言い切ってはいけない組
+                let anchors = anchor_lines(&base);
+                assert!(
+                    !interleave_safe(&anchors, &spans(ours), &spans(theirs)),
+                    "衝突した組を interleave_safe が通してしまった: {ours:?} / {theirs:?} 周期{p}"
+                );
+            }
+        }
+        assert!(
+            broke > 0,
+            "周期的な本文で 1 件も衝突しないなら、この穴の前提が変わっている"
+        );
+    }
+
+    /// **錨を 1 本置くと同じ組が綺麗に通る** — 手当てが効くことを実 git で確かめる。
+    #[test]
+    fn 実gitで錨を一本置けば同じ組が通る() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("periodic-anchor");
+        let table: &[(&[u32], &[u32], &[u32], usize)] = &[
+            (&[17], &[5, 13, 25], &[9, 15, 21], 6),
+            (&[17], &[5, 13, 25], &[9, 15, 21], 1),
+            (&[44], &[3, 15, 22, 60], &[9, 19, 33, 52], 6),
+            (&[50], &[3, 20, 36, 76], &[11, 28, 43, 63], 6),
+        ];
+        for (ours, theirs, planted, p) in table {
+            let base = plant_anchor(&periodic(*p, 400), planted);
+            let anchors = anchor_lines(&base);
+            assert!(
+                interleave_safe(&anchors, &spans(ours), &spans(theirs)),
+                "錨を置いたのに通していない: {ours:?} / {theirs:?}"
+            );
+            let o = touch(&base, ours, "OURS");
+            let t = touch(&base, theirs, "THEIRS");
+            let Some(hit) = lab.merge_tree(&base, &o, &t) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            assert!(!hit, "錨があるのに衝突した: {ours:?} / {theirs:?} 周期{p}");
+        }
+    }
+
+    #[test]
+    fn 錨はファイル内で唯一の行だけ() {
+        let a = anchor_lines("alpha\nsame\nbeta\nsame\n");
+        assert_eq!(a, vec![true, false, true, false]);
+        // CRLF でも同じ答え
+        assert_eq!(anchor_lines("alpha\r\nsame\r\nbeta\r\nsame\r\n"), a);
+        assert!(anchor_lines("").is_empty());
+    }
+
+    #[test]
+    fn 錨は域の間にあるものだけを数える() {
+        // 1:uniq 2:same 3:uniq2 4:same
+        let a = anchor_lines("u1\nsame\nu2\nsame\nu3\nsame\n");
+        // [1,1] と [3,3] の間は 2 行目 (same) だけ → 錨なし
+        assert!(!anchor_between(&a, &Span::line(1), &Span::line(3)));
+        // [1,1] と [5,5] の間は 2,3,4 行目 → 3 行目が錨
+        assert!(anchor_between(&a, &Span::line(1), &Span::line(5)));
+        // 引数の順を入れ替えても同じ
+        assert!(anchor_between(&a, &Span::line(5), &Span::line(1)));
+        // 隣接していれば「間」は空
+        assert!(!anchor_between(&a, &Span::line(1), &Span::line(2)));
+        // EOF まで伸びる域は壁を数えられない
+        assert!(!anchor_between(
+            &a,
+            &Span {
+                start: 1,
+                end: Span::EOF
+            },
+            &Span::line(5)
+        ));
+    }
+
+    #[test]
+    fn 外接域と交錯の判定() {
+        assert_eq!(hull(&spans(&[10, 3, 25])), Some(Span { start: 3, end: 25 }));
+        assert_eq!(hull(&[]), None);
+        // EOF が混ざれば外接域も EOF まで
+        assert_eq!(
+            hull(&[
+                Span::line(3),
+                Span {
+                    start: 9,
+                    end: Span::EOF
+                }
+            ]),
+            Some(Span {
+                start: 3,
+                end: Span::EOF
+            })
+        );
+        // 挟んでいる = 交錯
+        assert!(interleaved(&spans(&[5, 25]), &spans(&[17])));
+        assert!(interleaved(&spans(&[17]), &spans(&[5, 25])));
+        // 上下に分かれていれば交錯ではない
+        assert!(!interleaved(&spans(&[5, 9]), &spans(&[17, 25])));
+        // 片方が空なら交錯しようがない
+        assert!(!interleaved(&[], &spans(&[17])));
+    }
+
+    #[test]
+    fn 錨が読めなければ交錯は通さない() {
+        // 元テキストを読めなかった (= 錨が空) ときは必ず断る (fail-closed)
+        assert!(!interleave_safe(&[], &spans(&[5, 25]), &spans(&[17])));
     }
 
     /// 「近すぎる」と「実際に衝突する」の差を、変更の種類と間隔ごとに数える。
