@@ -296,9 +296,17 @@ pub struct Session {
     /// 既定 30 秒 (テストで短縮する)。
     auto_yes_resend_after: Duration,
     /// マウスドラッグによる文字選択: (開始セル, 終了セル)。(row, col) の画面表示座標。
+    ///
+    /// **`sel_abs` を今の画面へ切り取った派生値**であって、真実源ではない。
+    /// 直接書き換えず `set_selection` / `set_selection_abs` / `clear_selection`
+    /// を通すこと (描画側 `cell_selected` / `normalize_sel` はこの派生値を読む)。
     pub selection: Option<((u16, u16), (u16, u16))>,
-    /// ドラッグ選択のアンカー(ドラッグ開始セル)。
-    sel_anchor: Option<(u16, u16)>,
+    /// 文字選択の真実源: (開始, 終了) を**絶対行** (生きている画面の下端から
+    /// 数えた行) で持つ。スクロールしても同じ文字を指し続けるので、
+    /// 一画面を超える選択とスクロール中の選択保持ができる。
+    sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// ドラッグ選択のアンカー(ドラッグ開始セル)。絶対座標。
+    sel_anchor_abs: Option<(usize, u16)>,
     /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
     pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
@@ -1844,7 +1852,8 @@ impl Session {
             auto_stall_hash: 0,
             auto_yes_resend_after: Duration::from_secs(30),
             selection: None,
-            sel_anchor: None,
+            sel_abs: None,
+            sel_anchor_abs: None,
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
@@ -2355,6 +2364,8 @@ impl Session {
         if self.size != (rows, cols) {
             self.size = (rows, cols);
             lock_ok(&self.parser).set_size(rows, cols);
+            // 行数が変われば絶対行 → 画面行の写像も変わる。派生値を取り直す。
+            self.sync_selection();
         }
         if let Some((r, c)) = self.resize_debounce.on_request((rows, cols)) {
             self.ship_resize(r, c);
@@ -2467,27 +2478,75 @@ impl Session {
     }
 
     pub fn set_scroll(&mut self, n: usize) {
-        if n != self.scroll {
-            // 画面がスクロールすると選択セル座標の指す文字が変わるため解除する
-            self.selection = None;
-            self.sel_anchor = None;
-        }
-        self.scroll = n;
-        lock_ok(&self.parser).set_scrollback(n);
+        // vt100 は履歴より深い戻りを黙って切り詰めるので、実際に効いた量を持つ。
+        // 持たないと「見た目は止まっているのに scroll だけ増える」ので戻すとき空回りする。
+        let eff = {
+            let mut p = lock_ok(&self.parser);
+            p.set_scrollback(n);
+            p.screen().scrollback()
+        };
+        self.scroll = eff;
+        // 選択は絶対座標なので消さない。今の画面へ切り取り直すだけ。
+        self.sync_selection();
     }
 
-    pub fn adjust_scroll(&mut self, delta: i64) {
+    /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
+    pub fn adjust_scroll(&mut self, delta: i64) -> bool {
+        let before = self.scroll;
         let n = (self.scroll as i64 + delta).max(0) as usize;
         self.set_scroll(n);
+        self.scroll != before
     }
 
-    /// ターミナル画面全体の文字列をすべて選択状態にする (Ctrl+A / Cmd+A)
+    /// 絶対座標の選択を、いま見えている画面の座標へ切り取り直す。
+    fn sync_selection(&mut self) {
+        let rows = self.size.0;
+        let scroll = self.scroll;
+        self.selection = self
+            .sel_abs
+            .and_then(|sel| clip_selection(sel, rows, scroll));
+    }
+
+    /// 画面座標で選択を設定する (今の scroll を基準に絶対座標へ写す)。
+    pub fn set_selection(&mut self, sel: ((u16, u16), (u16, u16))) {
+        let (rows, scroll) = (self.size.0, self.scroll);
+        let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
+        let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
+        self.set_selection_abs(a, b);
+    }
+
+    /// 絶対座標で選択を設定する。
+    pub fn set_selection_abs(&mut self, a: (usize, u16), b: (usize, u16)) {
+        self.sel_abs = Some((a, b));
+        self.sync_selection();
+    }
+
+    /// 選択とドラッグアンカーを両方捨てる。
+    pub fn clear_selection(&mut self) {
+        self.sel_abs = None;
+        self.sel_anchor_abs = None;
+        self.selection = None;
+    }
+
+    /// 端末の中身**全部** (スクロールバック履歴 + 現在画面) を選択する
+    /// (Ctrl+A / Cmd+A)。可視画面だけではない。
     pub fn select_all(&mut self) {
-        let p = lock_ok(&self.parser);
-        let (rows, cols) = p.screen().size();
-        if rows > 0 && cols > 0 {
-            self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+        let (max_off, rows, cols) = {
+            let mut p = lock_ok(&self.parser);
+            let saved = p.screen().scrollback();
+            p.set_scrollback(usize::MAX);
+            let max_off = p.screen().scrollback();
+            let (rows, cols) = p.screen().size();
+            p.set_scrollback(saved);
+            (max_off, rows, cols)
+        };
+        if rows == 0 || cols == 0 {
+            return;
         }
+        // 最古の行 = 最大戻り量の窓の最上段。最新の行 = 絶対行 0。
+        let top_abs = max_off + rows as usize - 1;
+        self.sel_anchor_abs = None;
+        self.set_selection_abs((top_abs, 0), (0, cols.saturating_sub(1)));
     }
 
     /// 端末内検索: 次 (forward=true, 新しい方=下) / 前 (古い方=上) のヒットへ。
@@ -3645,10 +3704,23 @@ mod tests {
     }
 
     use super::{
-        all_terminal_lines, input_area_selection, is_image_paste_chord_on, key_bytes, line_hits,
-        mac_agent_input_bytes, normalize_sel, prune_clip_pngs, save_clipboard_png,
-        search_scroll_target, selection_text, word_selection, Session, CLIP_PNG_KEEP,
+        abs_row, all_terminal_lines, autoscroll_step, clip_selection, input_area_selection,
+        is_image_paste_chord_on, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
+        prune_clip_pngs, save_clipboard_png, screen_row, search_scroll_target, selection_text,
+        selection_text_abs, word_selection, Session, CLIP_PNG_KEEP,
     };
+
+    /// 履歴を積んだパーサと「実在する最古の絶対行」を作る。
+    fn history(rows: u16, cols: u16, n: usize) -> (vt100::Parser, usize) {
+        let mut p = vt100::Parser::new(rows, cols, 200);
+        for i in 0..n {
+            p.process(format!("line{:03}\r\n", i).as_bytes());
+        }
+        p.set_scrollback(usize::MAX);
+        let max_abs = p.screen().scrollback() + rows as usize - 1;
+        p.set_scrollback(0);
+        (p, max_abs)
+    }
 
     #[test]
     fn all_terminal_lines_covers_scrollback_and_screen() {
@@ -4060,6 +4132,153 @@ mod tests {
         p.process(b"hello world");
         assert_eq!(selection_text(p.screen(), ((0, 0), (0, 4))), "hello");
         assert_eq!(selection_text(p.screen(), ((0, 6), (0, 10))), "world");
+    }
+
+    #[test]
+    fn abs_row_and_screen_row_are_inverse() {
+        // (画面行, 行数, scroll) → 絶対行。画面の下端が絶対行 scroll。
+        let cases = [
+            ((0u16, 5u16, 0usize), 4usize),
+            ((4, 5, 0), 0),
+            ((0, 5, 10), 14),
+            ((4, 5, 10), 10),
+            ((0, 1, 7), 7),
+        ];
+        for ((r, rows, scroll), want) in cases {
+            assert_eq!(
+                abs_row(r, rows, scroll),
+                want,
+                "abs_row({r},{rows},{scroll})"
+            );
+            assert_eq!(
+                screen_row(want, rows, scroll),
+                Some(r),
+                "screen_row({want})"
+            );
+        }
+        // 画面の外は None
+        assert_eq!(screen_row(5, 5, 0), None); // 1 行ぶん上 (古い)
+        assert_eq!(screen_row(9, 5, 10), None); // 1 行ぶん下 (新しい)
+        assert_eq!(screen_row(0, 0, 0), None); // 行数 0
+                                               // 行数 0 でも panic しない
+        assert_eq!(abs_row(0, 0, 3), 3);
+    }
+
+    #[test]
+    fn clip_selection_clamps_ends_to_the_visible_window() {
+        let rows = 5u16;
+        // 全部見えている (絶対行 4 = 最上段 … 0 = 最下段)
+        assert_eq!(
+            clip_selection(((4, 2), (0, 7)), rows, 0),
+            Some(((0, 2), (4, 7)))
+        );
+        // 逆順で渡しても同じ — 絶対行が「大きい」ほうが画面の上
+        assert_eq!(
+            clip_selection(((0, 7), (4, 2)), rows, 0),
+            Some(((0, 2), (4, 7)))
+        );
+        // 上へはみ出した端は画面の一番上・列 0 で止める
+        assert_eq!(
+            clip_selection(((99, 2), (0, 7)), rows, 0),
+            Some(((0, 0), (4, 7)))
+        );
+        // 下へはみ出した端は画面の一番下・列 u16::MAX で止める
+        assert_eq!(
+            clip_selection(((6, 2), (0, 7)), rows, 3),
+            Some(((1, 2), (4, u16::MAX)))
+        );
+        // 交差しない (全部が画面より上 / 全部が画面より下)
+        assert_eq!(clip_selection(((99, 0), (50, 0)), rows, 0), None);
+        assert_eq!(clip_selection(((1, 0), (0, 0)), rows, 10), None);
+        // 行数 0
+        assert_eq!(clip_selection(((0, 0), (0, 0)), 0, 0), None);
+    }
+
+    #[test]
+    fn autoscroll_step_grows_with_overshoot_and_is_capped() {
+        let cell = 10.0_f32;
+        // (はみ出し px, 期待行数)
+        for (over, want) in [
+            (1.0_f32, 1_i64),
+            (10.0, 1),
+            (11.0, 2),
+            (30.0, 3),
+            (1000.0, 8), // 上限 8 行 — 一瞬で履歴の端まで飛ばさない
+        ] {
+            assert_eq!(autoscroll_step(over, cell), want, "over={over}");
+        }
+        // 退化した入力でも 0 や負を返さない (返すと自動スクロールが止まる)
+        assert_eq!(autoscroll_step(5.0, 0.0), 1);
+        assert_eq!(autoscroll_step(-5.0, 10.0), 1);
+        assert_eq!(autoscroll_step(f32::NAN, 10.0), 1);
+    }
+
+    #[test]
+    fn 画面外ドラッグは自動スクロールで一画面を超えて伸びる() {
+        // handle_mouse_selection と同じ手順を egui 抜きで踏む:
+        // 「スクロールを先に適用 → その scroll で画面セルを絶対座標へ写す」。
+        let rows = 5u16;
+        let mut scroll = 0usize;
+        let anchor = (abs_row(rows - 1, rows, scroll), 0u16); // 最下段で押した
+        assert_eq!(anchor, (0, 0));
+        let mut head = anchor;
+        for _ in 0..12 {
+            scroll += autoscroll_step(1.0, 10.0) as usize; // 上端の外へ 1 行ずつ
+            head = (abs_row(0, rows, scroll), 3);
+        }
+        assert_eq!(head.0, 16);
+        assert!(
+            head.0 >= rows as usize,
+            "一画面 ({rows} 行) を超えて伸びている: {}",
+            head.0
+        );
+        // いま見えている範囲へ切り取ると、下端(アンカー)は画面外なので端で止まる
+        assert_eq!(
+            clip_selection((anchor, head), rows, scroll),
+            Some(((0, 3), (rows - 1, u16::MAX)))
+        );
+    }
+
+    #[test]
+    fn 一画面を超える選択がコピーで全部取れる() {
+        // 実 vt100::Parser に 30 行の履歴を作る (画面は 5 行しかない)。
+        let (mut p, max_abs) = history(5, 20, 30);
+        // 最古の行 (絶対行 max_abs) から最新の行 (絶対行 1) まで =
+        // 30 行 = 6 画面ぶん。従来の selection_text は 5 行しか取れない。
+        let text = selection_text_abs(&mut p, ((max_abs, 0), (1, 19)));
+        let want = (0..30)
+            .map(|i| format!("line{:03}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, want);
+        assert_eq!(
+            text.lines().count(),
+            30,
+            "一画面 (5 行) では収まらない行数が取れている"
+        );
+        // 呼び出し後は scrollback 位置が元 (0) に戻っている
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn selection_text_abs_matches_selection_text_within_one_screen() {
+        let (mut p, _) = history(5, 20, 30);
+        // 画面内だけの選択 (絶対行 3..1 = 画面行 1..3) は従来と一致する
+        let want = selection_text(p.screen(), ((1, 2), (3, 6)));
+        assert_eq!(selection_text_abs(&mut p, ((3, 2), (1, 6))), want);
+        // 端を逆順で渡しても同じ
+        assert_eq!(selection_text_abs(&mut p, ((1, 6), (3, 2))), want);
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn selection_text_abs_clamps_beyond_history() {
+        let (mut p, max_abs) = history(5, 20, 30);
+        // 履歴より古い行を指しても panic せず、最古の行から取れる
+        let text = selection_text_abs(&mut p, ((max_abs + 500, 0), (1, 19)));
+        assert!(text.starts_with("line000"), "先頭が最古の行: {text:?}");
+        assert!(text.ends_with("line029"), "末尾が最新の行: {text:?}");
+        assert_eq!(p.screen().scrollback(), 0);
     }
 
     #[test]
@@ -5911,6 +6130,63 @@ fn brighten(c: egui::Color32) -> egui::Color32 {
 
 // ─── 文字選択(マウスドラッグでコピー) ────────────────────────────
 
+/// 画面行 (0 = 最上段) を「生きている画面の下端から数えた絶対行」へ写す。
+///
+/// scroll (スクロールバックの戻り量) が動いても、同じ文字は同じ絶対行を指す。
+/// これが無いと選択は画面座標のままなので、一画面を超えて伸ばせない。
+pub fn abs_row(r: u16, rows: u16, scroll: usize) -> usize {
+    scroll + (rows.saturating_sub(1).saturating_sub(r)) as usize
+}
+
+/// 絶対行を今の画面行へ戻す。画面の外なら None。
+pub fn screen_row(abs: usize, rows: u16, scroll: usize) -> Option<u16> {
+    if rows == 0 {
+        return None;
+    }
+    let d = abs.checked_sub(scroll)?;
+    if d >= rows as usize {
+        return None;
+    }
+    Some(rows - 1 - d as u16)
+}
+
+/// 絶対座標の選択を、いま見えている画面の座標へ切り取る。
+///
+/// 画面外へはみ出した端は画面の端で止める。まったく見えていなければ None。
+/// 画面の並び順は「絶対行が**大きい**ほうが上」なので、行の比較は
+/// `Reverse` を噛ませる (素の `<=` で並べると上下が入れ替わる)。
+pub fn clip_selection(
+    sel: ((usize, u16), (usize, u16)),
+    rows: u16,
+    scroll: usize,
+) -> Option<((u16, u16), (u16, u16))> {
+    if rows == 0 {
+        return None;
+    }
+    let key = |p: (usize, u16)| (std::cmp::Reverse(p.0), p.1);
+    let (start, end) = if key(sel.0) <= key(sel.1) {
+        (sel.0, sel.1)
+    } else {
+        (sel.1, sel.0)
+    };
+    // start = 上端 (絶対行が大きい) / end = 下端 (絶対行が小さい)
+    let win_top = scroll + rows as usize - 1;
+    if end.0 > win_top || start.0 < scroll {
+        return None; // 可視窓 [scroll, win_top] と交差しない
+    }
+    // はみ出した上端は列 0、はみ出した下端は列 u16::MAX でクランプする
+    // (selection_text が e.1.min(last_col) するので MAX でも安全)。
+    let top = match screen_row(start.0, rows, scroll) {
+        Some(r) => (r, start.1),
+        None => (0, 0),
+    };
+    let bottom = match screen_row(end.0, rows, scroll) {
+        Some(r) => (r, end.1),
+        None => (rows - 1, u16::MAX),
+    };
+    Some((top, bottom))
+}
+
 /// 選択範囲を行優先(row-major)で正規化し、(開始 <= 終了) にして返す。
 fn normalize_sel(sel: ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
     let (a, b) = sel;
@@ -5960,6 +6236,58 @@ fn selection_text(screen: &vt100::Screen, sel: ((u16, u16), (u16, u16))) -> Stri
         out.push_str(line.trim_end());
     }
     out
+}
+
+/// 絶対座標の選択範囲を、**スクロールバックをまたいで**文字列に組み立てる。
+///
+/// 見えている 1 画面しか読めない `selection_text` を、1 画面ぶんずつ
+/// `set_scrollback` して呼び直すことで履歴全体へ広げる。
+/// 呼び出し前の scrollback 位置は必ず元へ戻す (`all_terminal_lines` と同じ作法)。
+fn selection_text_abs(p: &mut vt100::Parser, sel: ((usize, u16), (usize, u16))) -> String {
+    let saved = p.screen().scrollback();
+    p.set_scrollback(usize::MAX);
+    let max_off = p.screen().scrollback();
+    let rows = p.screen().size().0;
+    if rows == 0 {
+        p.set_scrollback(saved);
+        return String::new();
+    }
+    let rows_u = rows as usize;
+    // 実在する最古の行 = 最大戻り量の窓の最上段。ここより古い指定は切り詰める。
+    let max_abs = max_off + rows_u - 1;
+    let key = |q: (usize, u16)| (std::cmp::Reverse(q.0), q.1);
+    let (s0, e0) = if key(sel.0) <= key(sel.1) {
+        (sel.0, sel.1)
+    } else {
+        (sel.1, sel.0)
+    };
+    let top_abs = s0.0.min(max_abs); // 上端 (絶対行が大きい = 古い)
+    let bot_abs = e0.0.min(max_abs); // 下端 (絶対行が小さい = 新しい)
+    let s_col = if s0.0 > max_abs { 0 } else { s0.1 };
+    let e_col = if e0.0 > max_abs { u16::MAX } else { e0.1 };
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur_top = top_abs; // まだ読んでいない中で最も古い絶対行
+    loop {
+        let want = cur_top.saturating_sub(rows_u - 1).max(bot_abs);
+        p.set_scrollback(want);
+        // 履歴より深い戻りは vt100 が切り詰めるので、効いた量で画面行へ写す。
+        let off = p.screen().scrollback();
+        let win_top = off + rows_u - 1;
+        let c_top = win_top.min(cur_top);
+        let c_bot = off.max(bot_abs);
+        let r_top = (win_top - c_top) as u16;
+        let r_bot = (win_top - c_bot) as u16;
+        // 端の列が効くのは選択そのものの端の行だけ。途中の行は行全体。
+        let col0 = if c_top == top_abs { s_col } else { 0 };
+        let col1 = if c_bot == bot_abs { e_col } else { u16::MAX };
+        parts.push(selection_text(p.screen(), ((r_top, col0), (r_bot, col1))));
+        if c_bot <= bot_abs {
+            break;
+        }
+        cur_top = c_bot - 1;
+    }
+    p.set_scrollback(saved);
+    parts.join("\n")
 }
 
 /// (r, c) を含む「空白区切りの語」の範囲を返す(ダブルクリック選択用)。
@@ -6177,12 +6505,13 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
 
 /// 選択範囲をクリップボードへコピーし、フィードバック表示を開始する。
 fn copy_selection(ui: &egui::Ui, session: &mut Session) {
-    let Some(sel) = session.selection else {
+    // 絶対座標で取る — 見えている 1 画面に切り詰めない。
+    let Some(sel) = session.sel_abs else {
         return;
     };
     let text = {
-        let p = lock_ok(&session.parser);
-        selection_text(p.screen(), sel)
+        let mut p = lock_ok(&session.parser);
+        selection_text_abs(&mut p, sel)
     };
     if !text.is_empty() {
         ui.ctx().copy_text(text);
@@ -6200,6 +6529,15 @@ fn prompt_path(path: &Path, cwd: &Path) -> String {
         .unwrap_or(&c_path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// ドラッグが画面の外へ出たときに 1 フレームで送る行数。
+/// はみ出すほど速くするが、上限を置かないと一瞬で履歴の端まで飛ぶ。
+fn autoscroll_step(overshoot: f32, cell_h: f32) -> i64 {
+    if !(cell_h > 0.0) || !overshoot.is_finite() || overshoot <= 0.0 {
+        return 1;
+    }
+    ((overshoot / cell_h).ceil() as i64).clamp(1, 8)
 }
 
 /// マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行)。
@@ -6222,33 +6560,58 @@ fn handle_mouse_selection(
     };
     if response.clicked() {
         // クリック(ドラッグなし)で選択解除
-        session.selection = None;
-        session.sel_anchor = None;
+        session.clear_selection();
     }
     if response.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
-            session.sel_anchor = Some(to_cell(pos));
-            session.selection = None;
+            let (r, c) = to_cell(pos);
+            session.clear_selection();
+            session.sel_anchor_abs = Some((abs_row(r, rows_n, session.scroll), c));
         }
     }
     if response.dragged_by(egui::PointerButton::Primary) {
-        if let (Some(anchor), Some(pos)) = (session.sel_anchor, response.interact_pointer_pos()) {
-            session.selection = Some((anchor, to_cell(pos)));
+        if let (Some(anchor), Some(pos)) = (session.sel_anchor_abs, response.interact_pointer_pos())
+        {
+            // 画面の外まで引っ張られたら自動でスクロールし、選択を
+            // 一画面を超えて伸ばせるようにする。
+            let top = rect.min.y + padding;
+            let bottom = rect.max.y - padding;
+            let moved = if pos.y < top {
+                session.adjust_scroll(autoscroll_step(top - pos.y, cell_h))
+            } else if pos.y > bottom && session.scroll > 0 {
+                session.adjust_scroll(-autoscroll_step(pos.y - bottom, cell_h))
+            } else {
+                false
+            };
+            if moved {
+                // 押しっぱなしで止まっていても次のフレームを起こす
+                // (起こさないと 1 行ずつしか進まない)。
+                crate::perf::repaint(&response.ctx, "term_sel_autoscroll");
+            }
+            // **スクロールを適用してから**画面セル → 絶対座標へ写す
+            // (順序が逆だと 1 フレームぶん、送った行数だけ選択がずれる)。
+            let (r, c) = to_cell(pos);
+            let head = (abs_row(r, rows_n, session.scroll), c);
+            session.set_selection_abs(anchor, head);
         }
     }
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (r, c) = to_cell(pos);
-            session.selection = {
+            let word = {
                 let p = lock_ok(&session.parser);
                 word_selection(p.screen(), r, c)
             };
+            match word {
+                Some(sel) => session.set_selection(sel),
+                None => session.clear_selection(),
+            }
         }
     }
     if response.triple_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (r, _) = to_cell(pos);
-            session.selection = Some(((r, 0), (r, cols_n.saturating_sub(1))));
+            session.set_selection(((r, 0), (r, cols_n.saturating_sub(1))));
         }
     }
 }
@@ -6620,8 +6983,8 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     }
     if let Some((sel, text)) = input_select {
         // Ctrl+A の入力欄選択: 選択表示 + 即コピー (⌘C を待たない)
-        session.selection = Some(sel);
-        session.sel_anchor = None;
+        session.set_selection(sel);
+        session.sel_anchor_abs = None;
         ui.ctx().copy_text(text);
         session.copied_at = Some(Instant::now());
     }
@@ -7966,7 +8329,9 @@ pub fn draw(
     // 右クリックメニュー: コピー操作
     if interactive {
         response.context_menu(|ui| {
-            let has_sel = session.selection.is_some();
+            // 判定は真実源 (絶対座標) で。スクロールで画面の外へ出ただけの
+            // 選択まで「無い」にすると、コピーが押せなくなる。
+            let has_sel = session.sel_abs.is_some();
             // 打鍵の表記はベタ書きしない。コピーは egui-winit 固定の打鍵、
             // 検索は再割り当てできるので app 側が配った表記を使う。
             let copy_key = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
@@ -7999,8 +8364,7 @@ pub fn draw(
                 ui.close_menu();
             }
             if has_sel && ui.button(tr("✕ 選択を解除")).clicked() {
-                session.selection = None;
-                session.sel_anchor = None;
+                session.clear_selection();
                 ui.close_menu();
             }
             shell_integration_menu(ui, session, theme);

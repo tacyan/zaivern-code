@@ -4,52 +4,53 @@
 
 # ⚡ Zaivern Code
 
-**Claude Code・Codex・Gemini CLIなど、複数のAIコーディングツールをひとつの画面で動かす。**<br>
-macOS・Windows・Linuxで使える、Rust製のAI開発コックピットです。
+**Run Claude Code, Codex, Gemini CLI, and other AI coding tools together — from one screen.**<br>
+A Rust-native AI development cockpit for macOS, Windows, and Linux.
 
-[**日本語**](README.md) | [English](README.en.md)
+[日本語](README.md) | [**English**](README.en.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-[🌐 **公式サイト**](https://zaivern.com/) ・ [⬇️ **ダウンロード**](https://github.com/tacyan/zaivern-code/releases/latest) ・ [🗒️ **リリース履歴**](https://github.com/tacyan/zaivern-code/releases)
+[🌐 **Website**](https://zaivern.com/) · [⬇️ **Download**](https://github.com/tacyan/zaivern-code/releases/latest) · [🗒️ **Release history**](https://github.com/tacyan/zaivern-code/releases)
 
 <a href="https://zaivern.com/">
-  <img src="assets/zaivern-demo.gif" width="960" alt="Claude Code、Codex、Gemini CLIなどを並列操作するZaivern Codeの実演" />
+  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code running Claude Code, Codex, Gemini CLI, and other coding agents in parallel" />
 </a>
 
 </div>
 
-## はじめての方へ
+## New to Zaivern Code?
 
-Zaivern CodeはAIそのものではなく、**複数のAIコーディングツールをまとめて操作するアプリ**です。まずはClaude Code・Codex・Gemini CLIなど、使いたいAIツールを1つインストールしてログインしてください。3つすべてを用意する必要はありません。
+Zaivern Code is not an AI model. It is an app that **brings your AI coding tools into one place**. Install and sign in to at least one tool, such as Claude Code, Codex, or Gemini CLI. You do not need all three.
 
-使い始めるまでの流れは3ステップです。
+Getting started takes three steps:
 
-1. 使いたいAIコーディングツールをインストールしてログイン
-2. 下のコマンドでZaivern Codeをインストール
-3. プロジェクトのフォルダで`zai .`を実行
+1. Install and sign in to an AI coding tool
+2. Install Zaivern Code with the command below
+3. Run `zai .` inside your project folder
 
-## AIエージェントを待たせない開発へ
+## Stop keeping your AI agents waiting
 
-Claude Codeが実装し、Codexがテストし、Gemini CLIがドキュメントを書く。Zaivern Codeは、散らばったターミナルを**ひとつの操縦席**にまとめます。
+Claude Code implements. Codex tests. Gemini CLI writes the docs. Zaivern Code brings scattered terminals into **one cockpit**.
 
-| これまで | Zaivern Code |
+| Before | With Zaivern Code |
 |---|---|
-| エージェントごとにタブを行き来 | 全エージェントを1画面で監視・操作 |
-| 同じ指示を何度も貼り付け | 1回の入力で全員へブロードキャスト |
-| 承認待ちや停止を見落とす | 状態表示・通知・ワンクリック承認 |
-| 作業中はデスクから離れられない | スマホから進捗確認・指示・承認 |
-| **並列で走らせるほどマージ衝突が増える** | **同じファイルでも行が違えば衝突しない** |
+| Jump between tabs for every agent | Monitor and control every agent from one screen |
+| Paste the same instruction repeatedly | Broadcast one instruction to the whole fleet |
+| Miss approvals and stalled sessions | Get live status, notifications, and one-click approval |
+| Stay chained to your desk | Check progress, send instructions, and approve from your phone |
+| **More agents means more merge conflicts** | **Same file, different lines — no conflict** |
 
-並列エージェントの本当のコストは実行時間ではなく、**レビュー時の衝突解決**です。
-1つのファイルに64体をぶつける実測で、素のgitは**48枝が衝突して960行・48回の手作業**を
-要しました。Zaivern Codeは同じ条件で**衝突0・手作業0**、しかも**64体全員が書けます**
-（[数字と線引き](docs/conflict-zero.md)）。
+The real cost of running agents in parallel is not wall-clock time; it is **resolving
+conflicts at review time**. With 64 agents on one file, plain git produced
+**48 conflicting branches, 960 conflict lines, and 48 manual fixes**. Zaivern Code
+produced **zero conflicts and zero manual fixes — and all 64 agents landed their work**
+([the numbers](docs/conflict-zero.md)).
 
-## 🚀 Zaivern Codeをインストール
+## 🚀 Install Zaivern Code
 
 **macOS / Linux**
 
@@ -65,292 +66,188 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 zai .
 ```
 
-インストーラはお使いのOSに合うアプリを自動で取得します。同じコマンドをもう一度実行すれば最新版へ更新できます。
+The installer automatically downloads the right app for your operating system. Run the same command again whenever you want to update.
 
-### 更新する
-
-```bash
-zai update            # 最新版を確認し、実行するコマンドを見せてから更新
-zai update --check    # 最新かどうかを確認するだけ (何も実行しません)
-zai update --yes      # 確認を求めずに更新
-```
-
-インストールした場所に合わせて更新手段が選ばれます（`~/.cargo/bin` にあれば `cargo install --force`、それ以外は上のワンライナー）。
-
-### アンインストールする
+### Update
 
 ```bash
-zai uninstall --dry-run       # 消えるものと合計サイズを一覧表示（何も消しません）
-zai uninstall                 # 一覧を出して y を確認してから削除
-zai uninstall --keep-config   # 設定 (config.toml / state.toml) は残す
-zai uninstall --yes           # 確認を求めずに削除
+zai update            # Check for a newer release, show the command, then update
+zai update --check    # Only check; nothing is executed
+zai update --yes      # Update without asking for confirmation
 ```
 
-消えるのは**実行ファイル本体と `~/.zaivern`（設定・セッション記録・端末ログ）だけ**です。OSのアプリ一覧の登録も同時に解除します。PATH上に別の `zai` が残っている場合は、安全のため自動では消さず一覧に表示します。
+The update method follows where the binary lives: `cargo install --force` when it sits in `~/.cargo/bin`, otherwise the one-liner installer above.
 
-### 最初の起動後にすること
+### Uninstall
 
-1. 約2分のガイドツアーで画面の基本操作を確認
-2. `+ Agent`を押す
-3. インストール済みのAIツールを選ぶ
-4. 入力欄へ作業内容を書いて送信
+```bash
+zai uninstall --dry-run       # List everything that would be removed, with sizes (removes nothing)
+zai uninstall                 # Show the list, then ask for `y` before removing
+zai uninstall --keep-config   # Keep your settings (config.toml / state.toml)
+zai uninstall --yes           # Remove without asking for confirmation
+```
 
-まずは1体だけで試し、慣れてから2体、3体と増やすのがおすすめです。
+Only the **executable itself and `~/.zaivern`** (settings, session records, terminal logs) are removed. The OS app registration is unregistered at the same time. Any other `zai` still on your `PATH` is listed rather than deleted, so nothing outside those two locations is ever touched.
 
-## できること
+### After the first launch
 
-### 🧩 競合ゼロ — 同じファイルでも、違う行なら同時に書ける
+1. Follow the two-minute guided tour
+2. Click `+ Agent`
+3. Choose an AI tool you already installed
+4. Enter a task and send it
 
-**この製品の中核です。** 担当を*行の単位*で持つので、`src/app.rs` のような
-大きなファイルを何人でも分け合えます。埋まっていたら近くの空きへ自動でずらすので、
-断られることもありません。詳細は[v0.14.0の節](#-v0140-で入ったもの--同じファイルでも競合しない)へ。
+Start with one agent. Add a second or third after you are comfortable with the workflow.
+
+## What you can do
+
+### 🧩 Conflict-free — same file, different lines
+
+**This is the core of the product.** Ownership is per *line*, so a large file like
+`src/app.rs` can be shared by any number of agents. If your lines are taken, you are
+handed nearby free lines instead of being refused.
 
 ```console
-$ zai czero init      # 台帳・gitフック・マージドライバを一度に入れて自己診断
-$ zai czero verify    # 実際に競合を起こして、本当に止まるか実演する
+$ zai czero init      # install every layer at once, then self-diagnose
+$ zai czero verify    # create a real conflict and prove it gets stopped
 ```
 
 ### 🎛 Agent Cockpit
 
-複数のAIツールをタイル状に並べ、動いているか、止まっているかをひと目で確認できます。Claude Code、Codex、Gemini CLIを含む33種類の起動設定を収録しています。
+Arrange multiple AI tools in a grid and see at a glance whether each one is working or waiting. Zaivern includes launch presets for 33 tools, including Claude Code, Codex, and Gemini CLI.
 
-### 📣 ブロードキャスト
+### 📣 Broadcast
 
-ひとつの入力欄から、動いている全AIへ同じ指示をまとめて送れます。もちろん、1体だけを選んで指示することもできます。
+Send one instruction to every active AI at once, or select a single agent when you want focused control.
 
-### 🛡 承認と監視
+### 🛡 Approvals and supervision
 
-「この操作を許可しますか？」という確認待ちや、停止・異常終了を検知して通知します。安全のため、自動承認は**初期状態ではオフ**です。
+Get notified when an AI asks for permission, stops responding, or exits unexpectedly. Automatic approval is **off by default** for safety.
 
-### 📋 フリート管理
+### 📋 Fleet management
 
-各AIが考え中・編集中・実行中・確認中のどこにいるかを一覧表示します。慣れてきたら、同じ課題を複数のAIへ同時に解かせて結果を比較することもできます。
+See whether each AI is thinking, editing, running, or checking its work. Once you are comfortable, you can give the same task to several agents and compare their results.
 
-### 📱 スマホリモート
+### 📱 Phone Remote
 
-スマホから進捗確認、指示、承認、ファイル編集ができます。まずは同じWi-Fi内で簡単に試せます。
+Check progress, send instructions, approve actions, and edit files from your phone. The easiest setup works over the same Wi-Fi network.
 
-### 📝 コードエディタ
+### 📝 Built-in code editor
 
-コードを読んだり、AIが変更した箇所を確認したりできるエディタを内蔵しています。画像・PDF・CSV・Markdownなどもアプリ内で開けます。
+Read code and review changes made by your AI tools without leaving the app. The editor can also open images, PDFs, CSVs, Markdown, and large files.
 
-未保存のまま落ちても本文は失われません（Hot Exit）。次の起動で書きかけの内容がそのまま戻り、その間にディスク側が書き換わっていた場合は黙って上書きせず、差分を見せて選ばせます。
+## 🆕 New in v0.14.0 — no conflicts, even in the same file
 
-### ⚙ 設定
+**🧩 Region ownership.** Until now the only way to protect parallel agents was
+"nobody may write a file someone else holds." Safe, but **one agent holding a large
+file locks everyone else out of it**. From v0.14.0 you hold *lines*:
+`zai lease claim 'src/app.rs#L1200-1260'`.
 
-設定は画面から検索して変更できます（メニューの「ファイル ▸ ユーザー設定 ▸ 設定」／コマンドパレットの「設定を開く」）。説明つきの一覧、既定から変えたものだけを出す絞り込み、1項目ずつ／まとめて既定へ戻す操作があり、書き戻しは該当行だけを差し替えるので手書きのコメントは消えません。GUI に無い設定は同じ画面の「config.toml」ボタンからテキストで編集できます。
+Measured with 64 agents hammering a single 2000-line file
+(`tools/coedit-bench.sh --agents 64 --lines 2000`):
 
-## 🆕 v0.14.0 で入ったもの — 同じファイルでも競合しない
-
-**🧩 行域オーナーシップ** — これまで並列エージェントを守る方法は「誰かが持っている
-ファイルには書かせない」でした。安全ですが、**大きなファイルを 1 人が持つと他の全員が
-そこへ 1 バイトも書けません**。v0.14.0 からは**行の単位**で持ちます。
-`zai lease claim 'src/app.rs#L1200-1260'`。
-
-1 ファイルへ 64 体をぶつけた実測（`tools/coedit-bench.sh --agents 64 --lines 2000`）:
-
-| 守り方 | 書けた担当 | 断られた | マージ衝突 | 人の手 |
-|---|---:|---:|---:|---:|
-| 守らない（素の git） | 64 | 0 | **48 枝 / 960 行** | **48 回** |
-| ファイル単位で持つ（〜v0.13） | **1** | 63 | 0 | 0 |
-| **行の単位で持つ（v0.14）** | **64** | 0 | **0** | **0** |
-
-**衝突ゼロ自体は v0.13 でも達成できていました。v0.14 が買うのは並列度です** —
-64 体中 1 体しか書けなかったものが、全員書けるようになります。
-
-**🔀 断らずに、ずらす** — 要求した行が埋まっていても、近くの空いている行を
-**自動で割り当てます**（`zai lease claim --shift`）。わざと担当を重ねた条件での実測:
-
-| 守り方 | 完了 | 拒否 | 衝突枝 | 衝突行 | 人の手 |
+| Protection | Landed | Refused | Conflicting branches | Conflict lines | Manual fixes |
 |---|---:|---:|---:|---:|---:|
-| 守らない（素の git） | 64 | 0 | **48** | **960** | **48** |
-| ファイル単位で持つ | 1 | 63 | 0 | 0 | 0 |
-| 行の単位で持つ | 11 | 53 | 0 | 0 | 0 |
-| **ずらす（v0.14）** | **64** | **0** | **0** | **0** | **0** |
+| None (plain git) | 64 | 0 | **48** | **960** | **48** |
+| Per file (≤ v0.13) | **1** | 63 | 0 | 0 | 0 |
+| Per line, no shifting | 11 | 53 | 0 | 0 | 0 |
+| **Per line + negotiation (v0.14)** | **64** | **0** | **0** | **0** | **0** |
 
-代償は**要求からどれだけ離れた場所を渡されたか**で、実測は p50 129 行 / p95 253 行 /
-max 281 行、ファイルの外へ出たものは 0 件でした。ずらしてよいと明示した要求だけが
-対象です（行域は行番号ではなく*そこにある内容*に紐づくので、既定は必ず「ずらさない」）。
-どこまで動かしてよいかは設定 `negotiate.max_shift` と `--max-shift <行>` で決められ、
-**無制限が既定になることはありません**。
+**Zero conflicts was already true in v0.13. What v0.14 buys is parallelism** —
+1 of 64 agents could write; now all 64 can.
 
-> **正直に**: この「拒否 0」は 64 体では**出ません**。独立した検証で
-> `coedit-bench --agents 64 --layout crowded` を 6 回まわしたところ、
-> **6 回とも 51〜54 完了 / 10〜13 拒否**でした（対照の参照ゲートは 6 回とも 64/0）。
-> 原因は競合状態ではなく**上限値**で、既定の `negotiate.max_shift = 200` に対し
-> 混んだ計画は 204〜234 行のずらしを要求します。`--max-shift 600` を渡すと
-> **64/64（3 回中 3 回）**。以前ここに「6 回中 4 回は 64/64、稀に取りこぼす」と
-> 書いていたのは誤りで、その測定は条件が違いました。修正中です。詳細は
-> [docs/conflict-zero.md §5-1](docs/conflict-zero.md)。
+**🔀 Shift instead of refuse.** If the lines you asked for are taken, Zaivern hands
+you nearby free lines automatically (`zai lease claim --shift`). The price is
+**how far from your request you landed**: p50 129 lines, p95 253, max 281, and zero
+allocations outside the file. Only requests that explicitly opt in are moved — a
+region is tied to *the content that lives there*, so the default is never to move it.
 
-**🤝 エージェント同士が裏で認識し合う** — Erlang のプロセスと同じ仕組みで、
-それぞれが身元とメールボックスを持ち、互いを監視します。身元には「起動した瞬間」が
-入っているので、**OS が PID を使い回しても別人を自分だと誤認しません**。
-そして **担当を持ったまま落ちたエージェントの担当は自動で解放されます** —
-Erlang の "let it crash" をそのまま持ち込んだ部分で、人が掃除する必要がありません。
+**🤝 Agents recognise each other, Erlang-style.** Every participant has an identity
+(`incarnation` is the start time, so **a recycled OS pid can never be mistaken for
+you**) and a mailbox with per-sender FIFO delivery. `link` / `monitor` / `DOWN` with
+`trap_exit`. **When an agent dies holding regions, its regions are released
+automatically** — "let it crash", applied to editing. Measured release: 23.2 ms.
 
-**🔒 一撃マージの証明** — 複数ブランチの変更行域が離れていれば、`git merge` は
-**必ず**衝突しません。実際の git で網羅的に確かめて**見逃し 0 件**。証明が立てば
-N 本を人手ゼロで統合します。作業ツリーを一度も触らず、最後に参照を 1 回だけ動かすので、
-途中で失敗しても中途半端な統合が残りません。
+**🔒 Proof that a merge lands in one shot.** If the changed regions of N branches are
+far enough apart, `git merge` **cannot** conflict. Verified exhaustively against real
+git across 240 cases with **zero misses**. When the proof holds, N branches integrate
+with zero human steps — without ever touching the working tree (`merge-tree` →
+`commit-tree`, then one atomic ref update), so a failure leaves nothing half-merged.
 
-**🧬 どのリポジトリでも、一覧への追記が衝突しない** — `.gitignore`・`CHANGELOG.md`・
-`package.json` の依存・`import` 宣言のような「両方の行を残すだけ」の衝突を、
-**中身を見て**自動判定して解決します。目印を書く必要はありません。マーカ無しの検証で
-**人が読む衝突行が 80% 減り、誤って自動解決した件数は 0**。一覧と判断できないファイルでは
-**素の git と 1 バイトも変わりません**。
+**🧬 List appends stop conflicting, in any repository.** `.gitignore`, `CHANGELOG.md`,
+`package.json` dependencies, `import` blocks — conflicts where the right answer is
+"keep both lines" are resolved by **reading the content**, with no markers to add.
+On a marker-free benchmark: **80% fewer conflict lines, zero wrong auto-resolutions**.
+For files that are not lists, the result is **byte-for-byte identical to plain git**.
 
-**🔍 誰がどこを持っているか** — 同じファイルを複数人が持っている状態を横帯で見せ、
-近すぎる組だけを赤枠にして「あと何行空ければ一撃で通るか」を出します。
-コマンドパレットの「競合ゼロ点検」から。
-
-**🚦 どのリポジトリでも 1 コマンド** — `zai czero init` で台帳・git フック・
-マージドライバ・`.gitattributes` が一度に入り、**入れた直後に自己診断まで走ります**。
+**🚦 One command in any repository.**
 
 ```console
-$ zai czero verify
-🔬 実証 — 守られています (実際に競合を起こして確かめました)
-  ✅ 同じファイルでも、離れた行なら 2 人が同時に持てる
-  ✅ 他人が保有するファイルへの書き込みを台帳が断る
-  ✅ 一覧への両側追記を merge driver が解決する
-  ✅ 他人が保有するファイルの git commit が実際に止まる
-  ✅ 一覧への両側追記が、実際の git merge で自動解決する
+$ zai czero init      # ledger, git hooks, merge driver, .gitattributes — then self-diagnose
+$ zai czero verify    # actually create a conflict and prove it gets stopped
 ```
 
-`verify` は**設定を読むだけではありません**。使い捨ての一時リポジトリで
-**実際に競合を起こして、本当に止まるかを実演します**（対象リポジトリは 1 バイトも
-汚しません）。「入れたのに効いていない」が構造的に起こらないようにするためです。
-`zai czero doctor` は段ごとに理由と直し方を、`zai czero uninstall` は入れたものだけを
-綺麗に戻します（他人が書いた `.gitattributes` の行や既存のフックは無傷）。
+`verify` does not just read configuration. It **creates a real conflict in a
+throwaway repository and proves it is stopped** (your repository is never touched),
+so "installed but not working" cannot happen silently. `zai czero doctor` reports each
+layer with a reason and a fix; `zai czero uninstall` removes only what was added.
 
-**🧪 あなたのリポジトリで証明できます** — 合成のベンチではなく、**手元の実在の
-リポジトリを複製して**同じ実験を回せます（元のリポジトリは 1 バイトも汚しません）。
+The numbers — **including the conditions where this does not help** — are in
+[docs/conflict-zero.md](docs/conflict-zero.md).
 
-```console
-$ tools/anyrepo-prove.sh --repo . --writers 8
-```
+## Supported environments
 
-| リポジトリ | 書き手 | 素の git | Zaivern Code あり |
-|---|---:|---|---|
-| zaivern-code（Rust・追跡 259 ファイル） | 8 | **9 ファイル / 11 ハンク**衝突 | **0 / 0**（48/48 成立・拒否 0） |
-| zaivern-code | 16 | **26 / 28** | **0 / 0**（96/96・30 件ずらし・拒否 0） |
-| hyperframes（TS/HTML・追跡 1194 ファイル） | 16 | **26 / 28** | **0 / 0**（96/96・32 件ずらし・拒否 0） |
-| 全員が同じファイルを触る合成 | 32 | **118 / 147** | **0 / 0**（192/192・171 件ずらし） |
-
-**素の git は言語にもファイル数にも依らずに壊れます**（Rust の 259 ファイルでも
-TS/HTML の 1194 ファイルでも同じ 26/28）。**乱数の種を 12 通り振り直しても
-二重書き込み 0 / 衝突 0 / 拒否 0**。同じ条件で保護を外すと**毎回 4〜9 行**の
-二重書き込みが出ます。
-
-**🐧 macOS と Linux で結果が一致します** — 同じハーネスを Docker の Linux でも
-回して並べました（`tools/xplat-bench.sh`）。**落とす指標（衝突ハンク数・二重書き込み・
-完了件数）は全段で完全に一致**します。壁時計だけは macOS が 6〜10 倍遅く、原因は
-ファイルシステムではなく**プロセス起動の値段**でした（書き込みだけの編集フェーズは
-逆に macOS のほうが速い）。**時間の数字は OS をまたいで持ち込めません。**
-
-**🪫 アイドル時のコストは測れる**（数値は調整中） — 設計原則の 1 つが
-「アイドル時のコストはゼロ」で、それを `tools/idle-cpu.sh` で数字にできます。
-**ただし今この版では守れていません。** 独立した検証で 1 コアの
-**2.55% / 2.95% / 4.85% / 10.00%** が実測されました（基準線に置いた `sleep` は
-同じ区間で +0.000 秒なので、機械の負荷では説明できません）。
-自走する再描画源は**ペットのアニメーションだけ**（`src/pet.rs`）で、60 秒で
-眠るはずが**65 秒アイドルしても眠っていません**。修正中です。
-以前ここに書いていた 0.32〜1.05% は、この検証で否定されました。
-
-**📐 どのリポジトリ形態で何が保証されるか** — `zai czero doctor` が形を検出して、
-できること／できないことを言います。
-
-| | 形 |
+| Item | Support |
 |---|---|
-| ✅ | 素の作業ツリー・linked worktree・LFS（`merge=lfs` あり） |
-| ⚠ | submodule を抱える（**submodule の中は素通り**・個別に init が要る）・sparse-checkout（cone 外の `.gitattributes` は効かない）・shallow（一撃統合が縮退）・既存のフックフレームワーク（共存はするが、向こうが書き直すと関所が消える） |
-| ❌ | 非 git（フックが入らず**他のプロセスは 1 つも止まりません**）・bare・読み取り専用・**LFS と union の重なり** |
+| OS | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
+| AI CLIs | 33 presets, including Claude Code, Codex, and Gemini CLI |
+| Rust | 1.88+ when building from source |
+| License | Apache-2.0 |
 
-**⚠️ できていないこと（伏せません）**
+## Safety by default
 
-- **64 体規模の `--shift` は取りこぼす回があります。** 上の「拒否 0」の注記のとおりです。
-- **Windows は実行時の挙動と GUI が未検証です。** クロスコンパイルはコンパイルと
-  リンクまでしか担保しません。実在リポジトリでの証明は macOS で、OS 比較は
-  macOS と Docker の Linux です。**Windows で走らせた数字は 1 つもありません。**
-- **`zai lease claim` は非 git のフォルダでも成功します。** 台帳はできますが
-  フックが入らないので**他のプロセスは止まりません**（警告は必ず出しますが、
-  終了コードは 0 のままです）。
+- Approval-required mode is the default; Auto-YES requires explicit opt-in
+- Privilege escalation always requires manual approval
+- MCP environment-variable values are never displayed, only whether they are configured
+- When using an SSH tunnel, the remote server binds to `127.0.0.1` only
+- Child processes are stopped when sessions are destroyed or the app exits
 
-数字と線引き（**効かない条件も含めて**）は [docs/conflict-zero.md](docs/conflict-zero.md) にあります。
-掘り下げた実測は用途ごとに分かれています。
+## Frequently asked questions
 
-| 文書 | 何が書いてあるか |
-|---|---|
-| [docs/anyrepo-proof.md](docs/anyrepo-proof.md) | 実在のリポジトリでの証明と、**間欠的な二重配布の真因** |
-| [docs/xplat-bench.md](docs/xplat-bench.md) | macOS と Linux を並べた実測 |
-| [docs/idle-cost.md](docs/idle-cost.md) | アイドル時のコストの測り方と数字 |
-| [docs/region-cost.md](docs/region-cost.md) | 行域判定そのものの費用（ハーネスを差し引く） |
-| [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | リポジトリ形態ごとの保証 |
-| [docs/guard-edges.md](docs/guard-edges.md) | 書き込みの関所が漏れる形と、その塞ぎ方 |
-| [docs/workspace-key.md](docs/workspace-key.md) | 台帳の置き場を決めるキーと、旧キーの引き取り |
-| [docs/bench-honesty.md](docs/bench-honesty.md) | ベンチが「静かな嘘」をつかないための決まり |
+### Are the AI tools included?
 
-## 対応環境
+No. Install and sign in to the tools you want to use, such as Claude Code, Codex, or Gemini CLI.
 
-| 項目 | 対応内容 |
-|---|---|
-| OS | macOS arm64/x86_64・Linux x86_64/arm64・Windows x86_64 |
-| AI CLI | Claude Code・Codex・Gemini CLIほか、33種類のプリセット |
-| Rust | ソースビルド時のみ1.88以上 |
-| ライセンス | Apache-2.0 |
+### Do I need all three tools?
 
-## 安全設計
+No. Zaivern Code works with a single AI tool. Starting with the tool you already use is the easiest path.
 
-- 承認必須を既定値にし、自動YESは明示的に有効化
-- 権限昇格は常に手動承認
-- MCP設定の環境変数は値を表示せず、設定済みかだけを表示
-- SSHトンネル使用時はリモートサーバーを`127.0.0.1`のみにバインド
-- セッション破棄・終了時に子プロセスを停止し、孤児プロセスを残さない
-- 書き込みの関門は**fail-open**。`zai`が見つからない・台帳が壊れているときは通します
-  （「ツールを消したらコミットできない」は許されません）。止めるのは**本物の競合**のときだけです
+### Is Zaivern Code free?
 
-## よくある質問
+Zaivern Code is free, open-source software under the Apache-2.0 license. Subscriptions and usage fees for each AI service are separate.
 
-### AIツールは同梱されていますか？
+### Will it run commands without asking me?
 
-いいえ。Claude Code・Codex・Gemini CLIなど、使いたいAIツールを別途インストールしてログインしてください。
+Approval is required by default. Automatic approval only runs after you explicitly turn it on.
 
-### 3種類すべて必要ですか？
+### Is "zero conflicts" really zero?
 
-いいえ。1種類だけでも使えます。最初は普段使っているAIツール1つで試すのがおすすめです。
+**With protection on, yes** — but here are the conditions, stated honestly. If two
+regions are at least `SAFE_BAND` (3) lines apart, git's three-way merge **structurally
+cannot** emit a conflict. With 64 agents on one file we measured zero conflict hunks
+and zero manual fixes.
 
-### Zaivern Codeは無料ですか？
+There are things this **cannot** do. Changes in *different* files that stop fitting
+together (one side changes a signature, the other keeps calling the old way) are
+impossible to prevent — those are detected and shown, not blocked. Numbers and limits:
+[docs/conflict-zero.md](docs/conflict-zero.md).
 
-Zaivern CodeはApache-2.0ライセンスの無料オープンソースソフトウェアです。各AIサービスの利用料金や契約は別途必要です。
+### Does it work on an existing repository?
 
-### 勝手にコマンドを実行しませんか？
+`zai czero init`. Existing git hooks (husky, lefthook, pre-commit framework) are kept
+and called first, with their exit code respected. Hand-written `.gitattributes` lines
+are preserved. `zai czero uninstall` removes only what was added.
 
-初期状態では承認が必要です。自動承認を使う場合も、自分で明示的にオンへ切り替えます。
-
-### 「競合ゼロ」は本当に0件ですか？
-
-**保護のある状態では0件です**が、条件を正直に書きます。担当が互いに`SAFE_BAND`（3行）以上
-離れていれば、gitの三方向マージは**構造的に**衝突を出しません。1ファイルに64体を
-ぶつける実測で、衝突ハンク0・手作業0を確認しています。実在のリポジトリでも、
-乱数の種を12通り振り直して**毎回0**でした。
-
-3行という幅は**パッチ適用（`git apply`）を通す前提**の値です。三方向マージ
-（`git merge`）だけを保証すればよい場面では**1行離れていれば足りる**ことを、
-4つのdiffアルゴリズム（myers / minimal / patience / histogram）すべてで確かめました
-（`region::MERGE_ONLY_BAND`）。「diffの既定の文脈が3行だからハンクが畳まれる」は
-誤りで、3行は*表示*の話です。
-
-**できないこと**もあります。ファイルが違うのに噛み合わない変更（片方が引数を変え、
-もう片方が古い呼び方のまま書く）は原理的に防げません。これは検出して画面に出す側で
-扱います。数字と線引きは[docs/conflict-zero.md](docs/conflict-zero.md)にあります。
-
-### 既存のリポジトリでも使えますか？
-
-`zai czero init`で入ります。既存のgitフック（husky / lefthook / pre-commit framework）は
-壊さず、先に呼んで終了コードを尊重します。`.gitattributes`に人が書いた行も残します。
-`zai czero uninstall`で入れたものだけを戻せます。
-
-## ソースからビルド
+## Build from source
 
 ```bash
 git clone https://github.com/tacyan/zaivern-code.git
@@ -359,49 +256,34 @@ rustup update stable
 cargo run --release -- .
 ```
 
-### テスト
+### Tests
 
 ```bash
 cargo fmt --all --check
 cargo nextest run --profile ci
 ```
 
-### 他OSの検証（macOSからでもローカルで回せます）
+### Cross-OS checks (runnable locally, even from macOS)
 
-`#[cfg(windows)]` や Linux 限定のコードは、macOSのビルドでは一度もコンパイルされません。
-CIの往復を待たずに手元で潰せます。
-
-```bash
-tools/linux-test.sh              # Linuxのテストを Docker で再現
-tools/windows-check.sh           # Windows(MSVC)向けの型検査
-tools/windows-check.sh --build   # 実際に zai.exe を作る（リンクまで確認）
-```
-
-Windows側は初回のみ `cargo install cargo-xwin --locked` が必要です。
-どちらのスクリプトもホストの `target/` は汚しません。
-
-### 主張を自分で確かめる
-
-主張を支えるハーネスはすべてリポジトリに入っています。**どれもホストの `target/` を
-汚さず、本物の `~/.zaivern` にも触りません**（一時ディレクトリへ `HOME` ごと退避します）。
+Code behind `#[cfg(windows)]` or Linux-only branches never compiles in a macOS build.
+These scripts let you catch such breakage without waiting for CI.
 
 ```bash
-tools/anyrepo-prove.sh --repo . --writers 8   # 自分のリポジトリで「競合ゼロ」を証明する
-tools/coedit-bench.sh --agents 64 --lines 2000 --mode all   # 行域オーナーシップ
-tools/conflict-zero-bench.sh --writers 8      # ベースラインとガードの比較
-tools/xplat-bench.sh                          # macOS と Linux を並べる
-tools/idle-cpu.sh --baseline                  # アイドル時のCPU（sleepを下限として並べる）
-tools/region-cost.sh                          # 行域判定そのものの費用
-tools/verify.sh --lint                        # 整形＋コンパイル＋テスト＋clippy
+tools/linux-test.sh              # Reproduce the Linux tests in Docker
+tools/windows-check.sh           # Type-check for Windows (MSVC)
+tools/windows-check.sh --build   # Produce a real zai.exe (verifies linking)
 ```
 
-プラグイン開発については[プラグインガイド](docs/plugins.md)と[仕様書](docs/PLUGIN_SPEC.md)を参照してください。
+The Windows side needs `cargo install cargo-xwin --locked` once.
+Neither script touches the host `target/` directory.
 
-## コントリビューション
+For plugin development, see the [plugin guide](docs/plugins.md) and [specification](docs/PLUGIN_SPEC.md).
 
-不具合報告・機能提案・Pull Requestを歓迎します。まず[Issues](https://github.com/tacyan/zaivern-code/issues)で既存の報告を確認してください。
+## Contributing
 
-## ライセンス
+Bug reports, feature requests, and pull requests are welcome. Check [Issues](https://github.com/tacyan/zaivern-code/issues) before opening a new report.
+
+## License
 
 [Apache License 2.0](LICENSE)
 
@@ -409,6 +291,6 @@ tools/verify.sh --lint                        # 整形＋コンパイル＋テ�
 
 <div align="center">
 
-**エージェントは、もう十分に速い。次に速くなるのは、指揮するあなたです。**
+**The agents are already fast. Now it is your turn to command faster.**
 
 </div>
