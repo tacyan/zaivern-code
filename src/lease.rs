@@ -2019,6 +2019,67 @@ pub fn default_max_shift_in(root: &Path) -> u32 {
         .clamp(0, i64::from(u32::MAX)) as u32
 }
 
+/// **ずらしてよい幅の実効上限。** 設定値に「いま実際に場所を奪っているぶん」を足す。
+///
+/// ## 固定値が必ず破綻する理由 (実測)
+///
+/// 設定 [`KEY_MAX_SHIFT`] は「**空いている**ファイルでどこまで飛んでよいか」、
+/// つまり人間のレビュー局所性の表明である。ところが実際にずらす距離を
+/// 決めているのは利用者ではなく**同時に来た人数**で、`n` 体が幅 `w` を
+/// 安全帯 `b` で並べれば、端の 1 体は `n(w+b)/2` 行ずれる。固定値 `m` は
+/// そこから「`n ≤ 2m/(w+b)` までしか通さない」という**誰も表明していない
+/// 上限**を勝手に作る。
+///
+/// 実測 (`tools/coedit-bench.sh --agents 64 --lines 2000 --layout crowded`、
+/// 6 回): 既定 200 行のままだと段 C+ は **51〜54 完了 / 10〜13 拒否**で、
+/// stderr には「上限は 200 行です」だけが出ていた。`--max-shift 600` を
+/// 渡すと 64/64。**空きは 1868 行あり、断る理由はどこにも無かった。**
+///
+/// ## 何を足すか
+///
+/// **他人 1 人が押しのけてよいのは、その人の域の幅 (＋安全帯 2 本) まで。**
+/// ただし 1 人あたりの寄与は設定値で頭打ちにする — さもないと
+/// 「1 人が 9000 行持っている」だけで上限が実質無効になり、
+/// 「頼んだ場所と何の関係も無い所を確保しない」という元の保護が消える
+/// ([`crate::features::negotiate`] の
+/// `tests::断った理由の内訳が取れる` が番人)。
+///
+/// ## 帰結 (これが「N がいくつまで大丈夫か」への答え)
+///
+/// * `busy` が空 (空いているファイル) → **設定値そのまま**。従来と 1 行も変わらない
+/// * `n` 体が並んでいる → 上限は `m + n(min(w,m) + 2b)`。**n に比例して伸びる**。
+///   必要距離は `n(w+b)/2` なので、`w ≤ m` である限り伸びは必要量の
+///   **2 倍以上**で、`n` がいくつでも上限が先に尽きることはない
+///   ([`tests::書き手を倍にしても成立率が落ちない`] が 32/64/128 体で固定)
+/// * `w > m` (1 人の域が設定値より広い) のときは `n = 2` の時点で当たる。
+///   **「しばらく通ってから急に落ちる」という静かな崖にはならない**ので、
+///   利用者は最初の 1 回で気付ける (文面に必要な数を出す)
+/// * ファイル行数で頭打ち。本当に入らないときは「遠すぎる」ではなく
+///   「空きが無い」として断る (理由の内訳が嘘にならない)
+/// * `configured == 0` は「**ずらすな**」の意思表示なので 0 のまま
+pub fn shift_ceiling(
+    configured: u32,
+    busy: &[crate::region::Span],
+    band: u32,
+    file_lines: u32,
+) -> u32 {
+    if configured == 0 {
+        return 0; // 「ずらすな」を混雑で覆さない
+    }
+    let mut reach = u64::from(configured);
+    for s in busy {
+        let w = if s.is_insert() { 1 } else { s.len() };
+        reach = reach
+            .saturating_add(u64::from(w.min(configured)))
+            .saturating_add(2 * u64::from(band));
+    }
+    // ファイルの外へはずらせないので、行数より上を許しても意味が無い。
+    // ただし設定値そのものは下回らせない (行数の分からない呼び出しで
+    // 「設定したのに効かない」を作らないため)。
+    let cap = u64::from(file_lines).max(u64::from(configured));
+    reach.min(cap) as u32
+}
+
 /// **埋まっていたら空いている場所へずらして確保する。** 実ファイルを読まない
 /// ([`try_claim_wants`] と同じく、台帳ロックの内側で I/O が起きない)。
 ///
@@ -2137,27 +2198,51 @@ pub fn try_claim_wants_shift(
         // ── 埋まっている。空いている場所を探す ──────────────────────
         // **行数が分からないファイルへはずらさない** ([`line_count`]) —
         // 知らない場所を勧めると、台帳の上では取れているのに書く先が無い。
-        let alt = movable.zip(busy).and_then(|(s, mut b)| {
-            let total = line_count(text)?;
-            b.extend_from_slice(here);
-            fit_span(&b, s, total, SAFE_BAND)
-        });
+        // ずらす先と、**その距離を決めている混雑ぶん**を同時に出す。
+        // 上限の判定 ([`shift_ceiling`]) には「誰がどれだけ塞いでいるか」が要る。
+        let mut crowd: Vec<crate::region::Span> = Vec::new();
+        let mut total_lines = 0u32;
+        let alt = match (movable, busy) {
+            (Some(s), Some(mut b)) => line_count(text).and_then(|total| {
+                b.extend_from_slice(here);
+                total_lines = total;
+                let got = fit_span(&b, s, total, SAFE_BAND);
+                crowd = b;
+                got
+            }),
+            _ => None,
+        };
         // **ずらし幅に上限を効かせる。** 上限が無いと、詰まった台帳では
         // 1 万行離れた場所が「いちばん近い空き」になり得る。そこは利用者が
         // 頼んだ場所と何の関係も無いので、確保しても意味が無いどころか
         // **無関係な他人の作業域を先取りする**。
+        //
+        // ただし上限は**固定値ではない** — [`shift_ceiling`] が「他人が
+        // いま実際に押しのけているぶん」を足す。固定値のままだと、
+        // 「同時に何体まで通すか」を誰も表明していないのに決めてしまう
+        // (実測: 既定 200 行で 64 体中 10〜13 体が断られていた)。
+        //
         // 断るときは**具体的な数**を出す (「入りません」だけでは、
         // 上限を上げれば通るのか、そもそも空きが無いのかが判らない)。
-        if let (Some(a), Some(limit), Some(s)) = (alt, max_shift, movable) {
+        if let (Some(a), Some(cfg), Some(s)) = (alt, max_shift, movable) {
             let dist = a.start.abs_diff(s.start);
+            let limit = shift_ceiling(cfg, &crowd, SAFE_BAND, total_lines);
             if dist > limit {
                 return ShiftClaim::Refused {
                     owner: trf(
-                        "{dist} 行ずらす必要がありますが、上限は {limit} 行です (設定 {key} か --max-shift で変えられます)",
+                        // **先頭に `:` を含む見出しを置く。** `cli::refusal` は
+                        // 「持ち主の名前」と「断る理由」を `:` の有無で見分けて
+                        // 文型を変えるので、`:` が無いと
+                        // 「…通ります **が持っています**」という意味の通らない
+                        // 文になる (実バイナリで実際にそう出た)。
+                        "ずらせる上限に当たりました: {dist} 行ずらす必要がありますが、上限は {limit} 行です (設定 {key} の {cfg} 行 ＋ 他人の域 {n} 件ぶんの混雑 {crowd} 行)。`--max-shift {dist}` を渡すか、設定 {key} を {dist} 以上にすると通ります",
                         &[
                             ("dist", dist.to_string()),
                             ("limit", limit.to_string()),
                             ("key", KEY_MAX_SHIFT.to_string()),
+                            ("cfg", cfg.to_string()),
+                            ("n", crowd.len().to_string()),
+                            ("crowd", limit.saturating_sub(cfg).to_string()),
                         ],
                     ),
                     pattern: asked,
@@ -7507,9 +7592,148 @@ mod span_tests {
         (1..=total).map(|i| format!("line {i}\n")).collect()
     }
 
+    /// **書き手を倍にしても成立率が落ちない (出荷経路・設定は既定のまま)。**
+    ///
+    /// ## この試験が要る理由 (静かな嘘があった)
+    ///
+    /// 隣の [`tests::crowded_な担当表でも六十四体全部がずらして入る`] は
+    /// `max_shift = None` (**上限なし**) で 64/64 を主張していた。ところが
+    /// 出荷経路の `zai lease claim --shift` は
+    /// [`default_max_shift_in`] = **200 行**を渡す。単体試験が全部緑なのに
+    /// `tools/coedit-bench.sh --agents 64 --lines 2000 --layout crowded` は
+    /// 6 回とも **51〜54 完了 / 10〜13 拒否**だった。
+    /// **上限を外した経路しか測っていなかった。**
+    ///
+    /// ここは**設定の既定値そのまま**で測り、しかも `n` を倍にしていく。
+    /// 固定上限 `m` は `n ≤ 2m/(幅+安全帯)` という体数の天井を作るので、
+    /// 倍にすればどこかで必ず成立率が落ちる。[`shift_ceiling`] が混雑ぶんを
+    /// 足すので落ちない。
+    #[test]
+    fn 書き手を倍にしても成立率が落ちない() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-scale");
+        std::fs::write(dir.join("a.rs"), body(2000)).expect("中身を置く");
+        // **出荷経路とまったく同じ既定値**を使う (設定が無ければ 200 行)。
+        let cfg = default_max_shift_in(&dir);
+        assert!(
+            cfg > 0,
+            "既定が 0 だと「ずらすな」になり、この試験が空になる"
+        );
+        let mut rates: Vec<(u32, usize, usize)> = Vec::new();
+        for n in [16u32, 32, 64, 128] {
+            let plan = crowded_plan(n, 2000);
+            let mut store = Store::default();
+            let (mut granted, mut refused) = (0usize, 0usize);
+            for (i, p) in plan.iter().enumerate() {
+                match try_claim_shift_in(
+                    &dir,
+                    &mut store,
+                    &who(&format!("S{n}_{i}")),
+                    std::slice::from_ref(p),
+                    100,
+                    600,
+                    &dead,
+                    Some(cfg), // ← ここが `None` だと何も守れない
+                ) {
+                    ShiftClaim::Granted(_) => granted += 1,
+                    ShiftClaim::Refused { .. } => refused += 1,
+                }
+            }
+            rates.push((n, granted, refused));
+            assert_eq!(
+                refused, 0,
+                "n={n} 体・上限 {cfg} 行で {refused} 件を断った (完了 {granted})"
+            );
+            // 台帳の中身も互いに素であること (通した代わりに重ねていない)
+            let regions: Vec<crate::region::Region> = store
+                .leases
+                .iter()
+                .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+                .collect();
+            assert_eq!(regions.len(), n as usize, "畳まれて減っている");
+            assert!(
+                crate::region::is_disjoint(&regions, SAFE_BAND),
+                "n={n} で重なった担当が台帳に載った"
+            );
+            for r in &regions {
+                let s = r.span.expect("行域");
+                assert!(s.start >= 1 && s.end <= 2000, "ファイルの外: {s:?}");
+            }
+        }
+        eprintln!("出荷既定 {cfg} 行での (体数, 完了, 拒否): {rates:?}");
+    }
+
+    /// **上限に当たったときの文面に、渡すべき数がそのまま出る。**
+    #[test]
+    fn 上限に当たった文面は渡すべき数まで出す() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-msg");
+        std::fs::write(dir.join("a.rs"), body(400)).expect("中身を置く");
+        let mut store = Store::default();
+        // 先客が 1〜300 行 → 要求 L10-15 は 300 行超えないと入らない。
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("A"),
+                &["a.rs#L1-300".to_string()],
+                100,
+                600,
+                &dead,
+                Some(10),
+            ),
+            ShiftClaim::Granted(_)
+        ));
+        match try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("B"),
+            &["a.rs#L10-15".to_string()],
+            100,
+            600,
+            &dead,
+            Some(10),
+        ) {
+            ShiftClaim::Refused { owner, .. } => {
+                eprintln!("文面: {owner}");
+                assert!(owner.contains("294"), "必要な距離が出ていない: {owner}");
+                assert!(owner.contains("--max-shift"), "渡し方が無い: {owner}");
+                assert!(owner.contains(KEY_MAX_SHIFT), "設定キーが無い: {owner}");
+                // **`cli::refusal` の文型判定を通る形か。** `:` が無いと
+                // 「…通ります が持っています」になる (実バイナリで出た)。
+                assert!(
+                    owner.contains(':'),
+                    "見出しの区切りが無い = 持ち主名として流し込まれる: {owner}"
+                );
+            }
+            other => panic!("上限を超えたのに通った: {other:?}"),
+        }
+    }
+
+    /// **断る理由は必ず「見出し `:` 本文」の形にする。**
+    ///
+    /// `cli::refusal` は `:` の有無だけで「持ち主の名前」と「理由」を
+    /// 見分けて文型を変える。理由に `:` が無いと
+    /// 「`… 通ります` **が持っています**」という意味の通らない 1 行になる。
+    /// 新しい理由を足した人が気付けるよう、ソースを読んで固定する。
+    #[test]
+    fn 断る理由は必ず見出しに区切りを持つ() {
+        let src = include_str!("lease.rs").replace("\r\n", "\n");
+        // `try_claim_wants_shift` が自分で組み立てる理由 (持ち主名ではない) は
+        // これ 1 つ。増えたらここも増やすこと。
+        let needle = "\"ずらせる上限に当たりました: ";
+        assert!(
+            src.contains(needle),
+            "ずらし上限の理由が見出し付きでない (探した: {needle})"
+        );
+    }
+
     /// **ベンチの crowded 条件で「拒否 0」になることの直接の証拠。**
     ///
     /// 行域だけの実測は 完了 11 / 拒否 53 / 衝突 0。ここが 64 / 0 になる。
+    ///
+    /// **上限なし (`None`) の経路**を押さえる。出荷経路が渡す既定値
+    /// (200 行) での成立率は [`tests::書き手を倍にしても成立率が落ちない`]
+    /// が別に測る — ここだけだと「上限を外した経路しか測っていない」という
+    /// 静かな嘘になる (実際になっていた)。
     #[test]
     fn crowded_な担当表でも六十四体全部がずらして入る() {
         let dir = unique_temp_dir("zaivern", "lease-shift-crowded");
