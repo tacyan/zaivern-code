@@ -213,6 +213,13 @@ pub struct TooClose {
     /// あと何行空ければ安全になるか。**0 は「行をずらしても解けない」**
     /// (ファイル全体・末尾まで・glob のどれか) を意味する。
     pub need: u32,
+    /// **交錯**で挙げた組か (`need` は必ず 0)。
+    ///
+    /// 「近すぎる」と**同じ顔をさせない**ために分けてある。交錯は
+    /// *離しても直らない* ので、「あと {k} 行空ければ通ります」という
+    /// 案内をそのまま出すと嘘になる。詳細は
+    /// [`crate::lease::interleave_ok`] / [`crate::region::anchor_lines`]。
+    pub bracketed: bool,
 }
 
 /// 台帳のパターンを行域へ起こす (純粋・入力順を保つ)。
@@ -257,8 +264,15 @@ pub fn lines_needed(a: &crate::region::Span, b: &crate::region::Span, band: u32)
 ///
 /// **同じ持ち主どうしは数えない** — 自分の域が 2 つ隣り合っていても、
 /// 書くのは 1 人なので衝突しない (`count_overlaps` 時代からの不変)。
-pub fn too_close_pairs(held: &[Held], band: u32) -> Vec<TooClose> {
+pub fn too_close_pairs(
+    held: &[Held],
+    band: u32,
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<TooClose> {
     let mut out = Vec::new();
+    // 帯で既に挙げた (持ち主, 持ち主, パス) を覚えて、交錯で二重に出さない。
+    let mut already: std::collections::BTreeSet<(String, String, String)> =
+        std::collections::BTreeSet::new();
     for i in 0..held.len() {
         for j in (i + 1)..held.len() {
             let (a, b) = (&held[i], &held[j]);
@@ -270,11 +284,102 @@ pub fn too_close_pairs(held: &[Held], band: u32) -> Vec<TooClose> {
                 _ => (0, false),
             };
             let (lo, hi) = if swap { (j, i) } else { (i, j) };
+            already.insert(owner_pair(&a.owner, &b.owner, &held[lo].region.path));
             out.push(TooClose {
                 path: held[lo].region.path.clone(),
                 lo,
                 hi,
                 need,
+                bracketed: false,
+            });
+        }
+    }
+    out.extend(bracketed_pairs(held, &already, text_of));
+    out
+}
+
+/// 二重に出さないための鍵 (持ち主 2 人 + パス)。**必ず辞書順**。
+fn owner_pair(a: &str, b: &str, path: &str) -> (String, String, String) {
+    let (x, y) = if a <= b { (a, b) } else { (b, a) };
+    (x.to_string(), y.to_string(), path.to_string())
+}
+
+/// **交錯**している組を出す (帯を全部通ったあとの 2 段目)。
+///
+/// 帯 ([`too_close_pairs`] の前半) は**組ごと**の判定で、それは今も正しい。
+/// 足りないのは「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」と
+/// いう推論のほうで、片方が相手を上下から挟んでいると反復的な本文では帯を
+/// 何行取っても `git merge` が衝突する ([`crate::region::anchor_lines`] に実測)。
+///
+/// 交錯は「A の域が B の 2 つの域に挟まれている」という**集合の性質**なので、
+/// 上の二重ループ (1 組ずつ) では定義できない。持ち主ごとに域をまとめてから
+/// [`crate::lease::interleave_ok`] へ渡す。
+///
+/// `text_of` (錨の元になる本文) は**本当に交錯している持ち主の組が
+/// あるときだけ**呼ばれる。互いに素な担当表 (この画面が普段映す形) では
+/// 1 バイトも読まない。
+fn bracketed_pairs(
+    held: &[Held],
+    already: &std::collections::BTreeSet<(String, String, String)>,
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<TooClose> {
+    // (持ち主, パス) ごとに「代表の添字」と「域の一覧」を集める。
+    // `BTreeMap` だけを使うので並びは決定的。
+    let mut by: std::collections::BTreeMap<(String, String), (usize, Vec<crate::region::Span>)> =
+        std::collections::BTreeMap::new();
+    for (i, h) in held.iter().enumerate() {
+        let path = &h.region.path;
+        if path.contains(['*', '?', '[']) {
+            continue; // どのファイルを指すか確定しない (帯側が安全に扱う)
+        }
+        let Some(span) = h.region.span else {
+            continue; // ファイル全体 — 帯側が必ず挙げている
+        };
+        let e = by
+            .entry((h.owner.clone(), path.clone()))
+            .or_insert_with(|| (i, Vec::new()));
+        e.1.push(span);
+    }
+    let keys: Vec<&(String, String)> = by.keys().collect();
+    let mut text: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for x in 0..keys.len() {
+        for y in (x + 1)..keys.len() {
+            let (ka, kb) = (keys[x], keys[y]);
+            if ka.0 == kb.0 || ka.1 != kb.1 {
+                continue; // 同じ持ち主 / 別のファイル
+            }
+            let (ia, sa) = &by[ka];
+            let (ib, sb) = &by[kb];
+            if !crate::region::interleaved(sa, sb) {
+                continue;
+            }
+            if already.contains(&owner_pair(&ka.0, &kb.0, &ka.1)) {
+                continue; // 帯で既に挙げてある
+            }
+            let t = text
+                .entry(ka.1.clone())
+                .or_insert_with(|| text_of(&ka.1))
+                .clone();
+            if crate::lease::interleave_ok(t.as_deref(), sa, sb) {
+                continue;
+            }
+            let (lo, hi) = if held[*ia].region.span.map_or(0, |s| s.start)
+                <= held[*ib].region.span.map_or(0, |s| s.start)
+            {
+                (*ia, *ib)
+            } else {
+                (*ib, *ia)
+            };
+            out.push(TooClose {
+                path: ka.1.clone(),
+                lo,
+                hi,
+                // **0 は「行をずらしても解けない」の意味。** 交錯はまさに
+                // それなので、既存の読み手 (画面 / doctor) が誤解しない。
+                need: 0,
+                bracketed: true,
             });
         }
     }
@@ -706,6 +811,17 @@ fn split_row(f: &Facts) -> Row {
                 Reason::with(
                     "{n} 組の行域が安全帯 {b} 行より近すぎます — 最大であと {k} 行空ければ、すべて一撃で通ります",
                     vec![("n", n), ("b", band), ("k", need.to_string())],
+                ),
+                Some(Fix::Lease),
+            )
+        } else if f.clashes.iter().all(|c| c.bracketed) {
+            // **交錯を「丸ごと重なっている」と言わない。** 重なってはいない —
+            // 片方が相手を挟んでいるだけで、離しても直らない別の形である。
+            (
+                Grade::Bad,
+                Reason::with(
+                    "{n} 組の担当が交錯しています — 片方が相手の行域を上下から挟んでいて、間に手がかりの行がありません。離しても直らないので、連続した 1 本の行域にするか担当を分けてください",
+                    vec![("n", n)],
                 ),
                 Some(Fix::Lease),
             )
@@ -1519,7 +1635,10 @@ fn collect(roots: &crate::lease::Roots) -> (Facts, PathBuf) {
     // **ファイル単位ではなく行域で見る。** 同じファイルでも安全帯を挟んで
     // 離れていれば、2 人が同時に持ってよい。
     f.held = to_held(&owned);
-    f.clashes = too_close_pairs(&f.held, crate::region::SAFE_BAND);
+    // 錨の元になる本文。**交錯している持ち主の組があるときだけ**呼ばれるので、
+    // 互いに素な担当表 (普段の形) では 1 バイトも読まない。
+    let read = |rel: &str| crate::lease::read_capped(&roots.tree.join(rel), &roots.tree);
+    f.clashes = too_close_pairs(&f.held, crate::region::SAFE_BAND, &read);
 
     // ── タブの記録から起こす分 (台帳に居ない = まだ書いていないエージェント) ──
     // 「1 体ずつ出す」が目的なので、書き込む前から名前を出せるようにする。
@@ -2067,7 +2186,14 @@ fn file_band(ui: &mut egui::Ui, f: &Facts, fb: &FileBand, owners: &[String], vis
             ("b", held_label(&f.held[c.hi])),
             ("k", c.need.to_string()),
         ];
-        let msg = if c.need > 0 {
+        // **交錯を「近すぎる」とも「丸ごと重なっている」とも言わない。**
+        // 離しても直らないし、重なってもいない。第 3 の形である。
+        let msg = if c.bracketed {
+            trf(
+                "{a} と {b} は交錯しています — 片方が相手を上下から挟んでいて、間に「このファイルで 1 回しか出てこない行」がありません。離しても直らないので、連続した 1 本の行域にするか担当を分けてください",
+                &args,
+            )
+        } else if c.need > 0 {
             trf(
                 "{a} と {b} は近すぎます — あと {k} 行空ければ一撃で通ります",
                 &args,
@@ -2251,6 +2377,7 @@ mod tests {
             lo: i * 2,
             hi: i * 2 + 1,
             need,
+            bracketed: false,
         }
     }
 
@@ -2412,7 +2539,7 @@ mod tests {
             held("B", "src/app.rs#L4000-4100"),
         ];
         assert!(
-            too_close_pairs(&far, band).is_empty(),
+            too_close_pairs(&far, band, &|_| None).is_empty(),
             "行域なのにファイル単位で丸めている"
         );
 
@@ -2421,7 +2548,7 @@ mod tests {
             held("A", "src/app.rs#L1200-1260"),
             held("B", "src/app.rs#L1262-1300"),
         ];
-        let got = too_close_pairs(&near, band);
+        let got = too_close_pairs(&near, band, &|_| None);
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].lo, got[0].hi), (0, 1));
         assert!(got[0].need > 0, "あと何行かが出ていない");
@@ -2431,24 +2558,79 @@ mod tests {
             held("A", "src/app.rs#L1262-1300"),
             held("B", "src/app.rs#L1200-1260"),
         ];
-        assert_eq!(too_close_pairs(&rev, band)[0].lo, 1);
+        assert_eq!(too_close_pairs(&rev, band, &|_| None)[0].lo, 1);
 
         // 同じ持ち主どうしは数えない (書くのは 1 人)。
         let mine = vec![
             held("A", "src/app.rs#L1-10"),
             held("A", "src/app.rs#L11-20"),
         ];
-        assert!(too_close_pairs(&mine, band).is_empty());
+        assert!(too_close_pairs(&mine, band, &|_| None).is_empty());
 
         // 別ファイルなら行が重なっていても関係ない。
         let other = vec![held("A", "src/a.rs#L1-10"), held("B", "src/b.rs#L1-10")];
-        assert!(too_close_pairs(&other, band).is_empty());
+        assert!(too_close_pairs(&other, band, &|_| None).is_empty());
 
         // 片方がファイル全体 = 行では解けない (need を 0 で出す)。
         let whole = vec![held("A", "src/app.rs"), held("B", "src/app.rs#L900-910")];
-        let got = too_close_pairs(&whole, band);
+        let got = too_close_pairs(&whole, band, &|_| None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].need, 0, "行をずらせば解けると嘘をついている");
+    }
+
+    /// **交錯を「近すぎる」とも「丸ごと重なる」とも数えない。**
+    ///
+    /// 帯 ([`crate::region::SAFE_BAND`]) は全部満たしているのに `git merge` が
+    /// 衝突する唯一の形。ここが赤くなったら、`region` が直した判定が
+    /// 競合ゼロの画面から外れている。
+    #[test]
+    fn 交錯した担当表を危険地帯として出す() {
+        let band = crate::region::SAFE_BAND;
+        // A が B の 2 つの域に挟まれている。どの組も帯を満たす。
+        let held = vec![
+            held("B", "src/a.rs#L13-13"),
+            held("A", "src/a.rs#L17-17"),
+            held("B", "src/a.rs#L25-25"),
+        ];
+        // 反復本文 = 錨 (ファイル内で唯一の行) が 1 本も無い
+        let 反復: String = (0..60).map(|i| format!("line {}\n", i % 3)).collect();
+        let got = too_close_pairs(&held, band, &|_| Some(反復.clone()));
+        assert_eq!(got.len(), 1, "交錯を挙げていない: {got:?}");
+        assert!(got[0].bracketed, "交錯として印を付けていない");
+        assert_eq!(got[0].need, 0, "行をずらせば解けると嘘をついている");
+        assert_eq!((got[0].lo, got[0].hi), (0, 1), "行の若い方が lo になっていない");
+
+        // 錨が立つ本文なら通す (常に危険と言うへ倒れていないこと)
+        let 一意: String = (0..60).map(|i| format!("行 {i} は他と違う\n")).collect();
+        assert!(
+            too_close_pairs(&held, band, &|_| Some(一意.clone())).is_empty(),
+            "一意な本文まで危険地帯にした"
+        );
+
+        // 本文が読めなければ **fail-closed** (帯だけへ落とさない)
+        let blind = too_close_pairs(&held, band, &|_| None);
+        assert_eq!(blind.len(), 1, "読めないのに黙って通した: {blind:?}");
+        assert!(blind[0].bracketed);
+    }
+
+    /// 交錯していない担当表では、**本文を 1 バイトも読まない** (費用の番人)。
+    #[test]
+    fn 交錯していなければ本文を読まない() {
+        let band = crate::region::SAFE_BAND;
+        // **A の外接域が B を跨がないこと**が「交錯していない」の意味。
+        // (A に 200 行目を持たせると、間の B を挟むので交錯になる)
+        let far = vec![
+            held("A", "src/a.rs#L10-20"),
+            held("A", "src/a.rs#L30-40"),
+            held("B", "src/a.rs#L100-110"),
+        ];
+        let reads = std::cell::Cell::new(0u32);
+        let got = too_close_pairs(&far, band, &|_| {
+            reads.set(reads.get() + 1);
+            None
+        });
+        assert!(got.is_empty(), "互いに素なのに挙げた: {got:?}");
+        assert_eq!(reads.get(), 0, "交錯していないのに本文を読んだ");
     }
 
     #[test]
@@ -3331,7 +3513,7 @@ mod tests {
         }
         h.push(held("A", "src/zz.rs#L1-10"));
         h.push(held("B", "src/zz.rs#L11-20"));
-        let clashes = too_close_pairs(&h, crate::region::SAFE_BAND);
+        let clashes = too_close_pairs(&h, crate::region::SAFE_BAND, &|_| None);
         assert_eq!(clashes.len(), 1);
 
         let (files, more) = band_files(&h, &clashes, 3);

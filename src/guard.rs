@@ -773,7 +773,10 @@ pub fn check_staged_in(repo: &Path, ledger_dir: &Path) -> Verdict {
     }
     let now = lease::now_secs();
     let alive = |p: u32| crate::instances::pid_alive(p);
-    let hits = collisions(&st, &roots.tree, &changes, now, &alive);
+    // 錨を数えるための本文。**交錯が見つかったパスでしか呼ばれない**ので、
+    // 通す経路 (圧倒的多数) の I/O は増えない。
+    let read = |rel: &str| lease::read_capped(&roots.tree.join(rel), &roots.tree);
+    let hits = collisions(&st, &roots.tree, &changes, now, &alive, &read);
     if hits.is_empty() {
         return Verdict::Allow; // ここまでで git は 1 回しか呼んでいない
     }
@@ -845,7 +848,8 @@ pub fn check_path_in(repo: &Path, ledger_dir: &Path, target: &Path) -> Verdict {
     }
     let now = lease::now_secs();
     let alive = |p: u32| crate::instances::pid_alive(p);
-    let hits = collisions(&st, &roots.tree, &changes, now, &alive);
+    let read = |rel: &str| lease::read_capped(&roots.tree.join(rel), &roots.tree);
+    let hits = collisions(&st, &roots.tree, &changes, now, &alive, &read);
     if hits.is_empty() {
         Verdict::Allow
     } else {
@@ -928,6 +932,12 @@ struct Hit {
     /// `.gitattributes` から判った具体的な理由 (`-diff` / `filter=lfs` 等)。
     /// 拒否の直前にだけ引く (通す経路の git 呼び出しは 1 回のまま)。
     attr: String,
+    /// **交錯**で止めたなら、その理由 ([`lease::interleave_reason`])。
+    ///
+    /// 重なり・近すぎ (`None`) と**同じ顔をさせない**ために分けてある。
+    /// 交錯は離しても直らないので、「{band} 行以上離せば同時に書けます」と
+    /// いう既定の案内をそのまま出すと嘘になる。
+    bracketed: Option<String>,
 }
 
 /// **点検の芯。** I/O を持たない純粋関数。
@@ -949,12 +959,26 @@ struct Hit {
 /// ## 決定性
 ///
 /// 台帳の並び順とパッチの順にしか依らない。`HashMap` を 1 つも使わない。
+///
+/// ## 4 段目 — 交錯 (帯だけでは足りない唯一の形)
+///
+/// 3 段目までは**組ごと**の判定で、それは今も正しい。足りないのは
+/// 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」という推論の
+/// ほうで、触った行が他人の域を**上下から挟んでいる**と、反復的な本文では
+/// 帯を何行取っても `git merge` が衝突する
+/// ([`crate::region::anchor_lines`] に実測)。
+///
+/// `text_of` は「そのパスの本文」を返す (錨を数えるのに要る)。
+/// **本当に交錯しているときにしか呼ばれない**ので、互いに素な配り方
+/// (この関所が普段見る形) では 1 バイトも読まない。`None` を返したら
+/// fail-closed (断る) — 理由は [`lease::interleave_ok`] にある。
 fn collisions(
     st: &lease::Store,
     tree: &Path,
     changes: &[StagedChange],
     now: u64,
     alive: &dyn Fn(u32) -> bool,
+    text_of: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Hit> {
     let pats = prepare(st, tree, now, alive);
     let mut hits: Vec<Hit> = Vec::new();
@@ -983,9 +1007,63 @@ fn collisions(
         if let Some(mut hit) = first_collision(&ch.path, touched, &others) {
             hit.degraded = ch.touched.degraded();
             hits.push(hit);
+            continue;
+        }
+        // 4 段目。**帯を全部通ったあとにだけ**見る。
+        if let Some(mut hit) = interleave_collision(&ch.path, touched, &others, text_of) {
+            hit.degraded = ch.touched.degraded();
+            hits.push(hit);
         }
     }
     hits
+}
+
+/// 触った行が他人の担当を**挟んで**いないか (持ち主ごとにまとめて判定)。
+///
+/// 交錯は「A の域が B の 2 つの域に挟まれている」という**集合の性質**なので、
+/// [`first_collision`] のような 1 組ずつの走査では定義できない。持ち主ごとに
+/// 域をまとめてから [`lease::interleave_ok`] へ渡す。
+///
+/// 比べるのは**触った行**であって「自分が持っている行」ではない。
+/// 100 行持っていても 1 行しか直していないなら、マージで動くのはその 1 行
+/// だけである (持っている域で判定すると、触ってもいない行のせいで断る)。
+///
+/// 本文は**交錯が見つかったパスにつき 1 回だけ**読む。
+fn interleave_collision(
+    rel: &str,
+    touched: &[Span],
+    others: &[&Pat<'_>],
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<Hit> {
+    // 持ち主ごとに域をまとめる。**台帳の並び順のまま**進めるので決定的。
+    let mut seen: Vec<(&Lease, Vec<Span>, &str)> = Vec::new();
+    for p in others {
+        match seen.iter_mut().find(|(l, _, _)| std::ptr::eq(*l, p.lease)) {
+            Some(e) => e.1.push(p.span),
+            None => seen.push((p.lease, vec![p.span], p.raw)),
+        }
+    }
+    // 本文は「交錯している持ち主が居る」と分かってから 1 回だけ読む。
+    let mut text: Option<Option<String>> = None;
+    for (lease, spans, raw) in &seen {
+        if !region::interleaved(touched, spans) {
+            continue;
+        }
+        let t = text.get_or_insert_with(|| text_of(rel));
+        if lease::interleave_ok(t.as_deref(), touched, spans) {
+            continue;
+        }
+        return Some(Hit {
+            touched: region::hull(touched).map_or_else(|| rel.to_string(), |h| label(rel, h)),
+            owned: (*raw).to_string(),
+            lease: (*lease).clone(),
+            path: rel.to_string(),
+            degraded: None,
+            attr: String::new(),
+            bracketed: Some(lease::interleave_reason(t.is_some())),
+        });
+    }
+    None
 }
 
 /// 台帳の 1 パターンを、**1 パスあたり文字列比較 1 回**で捌ける形へ畳んだもの。
@@ -1098,6 +1176,7 @@ fn first_collision(rel: &str, touched: &[Span], others: &[&Pat<'_>]) -> Option<H
                     path: rel.to_string(),
                     degraded: None,
                     attr: String::new(),
+                    bracketed: None,
                 });
             }
         }
@@ -1352,9 +1431,17 @@ fn deny_text(hits: &[Hit], now: u64) -> String {
         let l = &h.lease;
         let since = crate::instances::humanize_uptime(now.saturating_sub(l.acquired_at));
         let left = crate::instances::humanize_uptime(l.expires_at.saturating_sub(now));
+        // **交錯は「重なる」ではない。** 重なっていないからこそ帯を通って
+        // しまったので、同じ動詞を使うと直し方を取り違える。
+        let verb = if h.bracketed.is_some() {
+            "を挟んでいます"
+        } else {
+            "と重なります"
+        };
         lines.push_str(&trf(
-            "  {path} — {owner} が保有する {own} と重なります ({since}前から / 期限まであと {left}){note}\n",
+            "  {path} — {owner} が保有する {own} {verb} ({since}前から / 期限まであと {left}){note}\n",
             &[
+                ("verb", tr(verb)),
                 ("path", h.touched.clone()),
                 ("own", h.owned.clone()),
                 ("owner", l.holder.display()),
@@ -1372,6 +1459,11 @@ fn deny_text(hits: &[Hit], now: u64) -> String {
         ));
         if let Some(note) = degrade_note(h) {
             lines.push_str(&note);
+        }
+        // **交錯は「離せば直る」ではない。** 下の既定の案内と食い違うので、
+        // その 1 件だけ理由を上書きして出す。
+        if let Some(why) = &h.bracketed {
+            lines.push_str(&trf("    ※ {why}\n", &[("why", why.clone())]));
         }
     }
     if hits.len() > MAX_LISTED {
@@ -2240,6 +2332,7 @@ mod tests {
         };
         let text = deny_text(
             &[Hit {
+                bracketed: None,
                 touched: "src/app.rs#L100-160".into(),
                 owned: "src/app.rs#L120-140".into(),
                 lease: l,
@@ -2268,6 +2361,7 @@ mod tests {
     fn 拒否の一覧は上限で打ち切る() {
         let now = lease::now_secs();
         let mk = |i: usize| Hit {
+            bracketed: None,
             touched: format!("src/f{i}.rs"),
             owned: format!("src/f{i}.rs"),
             lease: Lease {
@@ -3160,7 +3254,7 @@ mod tests {
         let run = |text: &str| {
             let t0 = std::time::Instant::now();
             let ch = parse_staged(text);
-            let hits = collisions(&store, tree, &ch, now, &|_| false);
+            let hits = collisions(&store, tree, &ch, now, &|_| false, &|_| None);
             assert!(hits.is_empty());
             t0.elapsed()
         };
@@ -3222,7 +3316,7 @@ mod tests {
         // 回帰はそこを「パス × リース回」呼んでいた (400 × 200 で 5.04 秒)。
         // 回数なら機械の速さに 1 ミリも依存しない。
         CANON_CALLS.with(|c| c.set(0));
-        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false);
+        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false, &|_| None);
         assert!(hits.is_empty());
         let calls = CANON_CALLS.with(|c| c.get());
         eprintln!("400 パス × 200 リース: canonicalize {calls} 回");
@@ -3311,6 +3405,110 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// **交錯した書き込みを、コミットの関所が止める。**
+    ///
+    /// 触った 1 行が他人の 2 つの域に挟まれている形。組ごとの帯
+    /// ([`region::SAFE_BAND`]) は全部満たしているので、**帯だけの判定では
+    /// 素通りする**。ここが赤くなったら `region` が直した判定
+    /// (`interleaved` / `interleave_safe`) が出荷経路から外れている。
+    #[test]
+    fn 交錯したコミットを止める() {
+        let Some(repo) = temp_repo("interleave") else {
+            return;
+        };
+        // 周期 6 の反復本文 — 錨 (ファイル内で唯一の行) が 1 本も無い。
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let lines: Vec<String> = (0..300).map(|i| POOL[i % 6].to_string()).collect();
+        write(&repo.join("src/f.txt"), &format!("{}\n", lines.join("\n")));
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "init"]).status.success());
+
+        let ledger = crate::test_util::unique_temp_dir("zaivern-guard-test", "interleave-l");
+        let alice = crate::test_util::unique_temp_dir("zaivern-guard-test", "interleave-a");
+        seed_holder(
+            &ledger,
+            &repo,
+            "alice",
+            &alice,
+            &["src/f.txt#L13-13", "src/f.txt#L25-25"],
+        );
+        // 前提: どの組も帯を満たす = 帯だけの判定は「素」と言う
+        for l in [13u32, 25] {
+            assert!(
+                !region::spans_too_close(
+                    &Span::line(17),
+                    &Span::line(l),
+                    region::SAFE_BAND
+                ),
+                "前提が崩れている: 17 と {l} は帯を満たすはず"
+            );
+        }
+        // 17 行目 = alice の 2 つの域の**間**を触る
+        restage_at(&repo, "src/f.txt", &lines, 17, "bob wrote here");
+        match check_staged_in(&repo, &ledger) {
+            Verdict::Deny(text) => {
+                assert!(text.contains("交錯"), "交錯として断っていない: {text}");
+                // **「近すぎる」と同じ顔をさせない** — 離しても直らない
+                assert!(
+                    text.contains("離しても直りません"),
+                    "離せば直ると読める文面のまま: {text}"
+                );
+                assert!(
+                    text.contains("を挟んでいます"),
+                    "「重なります」のままになっている: {text}"
+                );
+            }
+            v => panic!("交錯を通してしまった: {v:?}"),
+        }
+        // **挟まない行なら従来どおり通る** (常に断るへ倒れていないこと)
+        restage_at(&repo, "src/f.txt", &lines, 200, "far away");
+        assert!(
+            matches!(check_staged_in(&repo, &ledger), Verdict::Allow),
+            "挟んでいない書き込みまで断った"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&ledger).ok();
+    }
+
+    /// 交錯していない普通のコミットでは、**本文を 1 バイトも読まない**。
+    ///
+    /// 関所は書き込みのたびに走る短命プロセスなので、`anchor_lines`
+    /// (ファイル全体の走査) を毎回払ってはいけない (設計原則 3)。
+    /// 時間ではなく**読み取りの呼び出し回数**で固定する。
+    #[test]
+    fn 交錯していなければ本文を読まない() {
+        let mut s = lease::Store::default();
+        let now = lease::now_secs();
+        s.leases.push(Lease {
+            holder: lease::Holder {
+                agent: "alice".into(),
+                session: String::new(),
+                cwd: "/w/alice".into(),
+                pid: 0,
+            },
+            // 触る行 (100) を挟まない 2 つの域
+            patterns: vec!["src/f.rs#L200-210".into(), "src/f.rs#L300-310".into()],
+            anchors: Vec::new(),
+            acquired_at: now,
+            expires_at: now + 3600,
+            note: String::new(),
+        });
+        let changes = vec![StagedChange {
+            path: "src/f.rs".into(),
+            touched: Touched::Lines(vec![Span {
+                start: 100,
+                end: 100,
+            }]),
+        }];
+        let reads = std::cell::Cell::new(0u32);
+        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false, &|_| {
+            reads.set(reads.get() + 1);
+            None
+        });
+        assert!(hits.is_empty(), "挟んでいないのに止めた: {hits:?}");
+        assert_eq!(reads.get(), 0, "交錯していないのに本文を読んだ");
     }
 
     /// リポジトリの中の綴りでリポジトリの外へ書く経路。
@@ -3620,7 +3818,7 @@ mod tests {
             })
             .collect();
         let _ = crate::pathx::link_probes_take();
-        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false);
+        let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false, &|_| None);
         assert!(hits.is_empty());
         let probes = crate::pathx::link_probes_take();
         eprintln!("400 パス × 200 リース: リンクを探る {probes} 回");

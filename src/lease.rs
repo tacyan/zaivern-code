@@ -602,6 +602,104 @@ pub fn overlaps(a: &str, b: &str) -> bool {
     seg_overlap(&segments(a), &segments(b))
 }
 
+/// 本文の走査 ([`Lease::live_span_of`]) を何回通ったかを数えるカウンタ。
+///
+/// 1 回が**ファイル全長の走査**なので、担当が N 人居るところで不用意に
+/// 呼ぶと確保 1 回の費用が N 倍になる。時間ではなく**回数**で固定するのは、
+/// 絶対時間の線が Docker の仮想 FS でも同時実行でも必ず嘘をつくため。
+///
+/// **プロセス共通の `static` にしない。** 同時に走っている他のテストの
+/// 呼び出しまで混ざる (実績あり)。
+#[cfg(test)]
+mod scan_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        // `live_span_of` を通った回数
+        static HITS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn hit() {
+        HITS.with(|c| c.set(c.get().saturating_add(1)));
+    }
+    pub(super) fn reset() {
+        HITS.with(|c| c.set(0));
+    }
+    pub(super) fn get() -> u64 {
+        HITS.with(Cell::get)
+    }
+}
+
+/// **交錯の関所。** 帯だけでは足りない唯一の形をここで止める。
+///
+/// [`crate::region::conflicts`] は**組ごと**の判定で、それは今も正しい。
+/// 足りないのは
+///
+/// > 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」
+///
+/// という推論のほうで、片方が相手を上下から挟んでいる (交錯) と、反復的な
+/// 本文では帯を何行取っても `git merge` が衝突する (ort は diff アルゴリズムを
+/// histogram に固定していて、同じ側の複数の変更を 1 つの巨大なハンクへ畳む)。
+/// 実測は [`crate::region::anchor_lines`] の doc にある。
+///
+/// 返り値 `true` = 通してよい。`a` / `b` は**同じ 1 つのファイル**に対する
+/// 2 人ぶんの行域一覧 (持ち主ごとにまとめて渡すこと — 1 組ずつ渡すと交錯は
+/// 定義できない)。
+///
+/// # 元テキストが読めないときは **fail-closed** (断る)
+///
+/// 錨 ([`crate::region::anchor_lines`]) は元の本文からしか数えられない。
+/// 読めない (存在しない / [`KEY_GATE_READ_CAP`] 超え / バイナリ) ときに
+/// 「帯だけ」へ落とすと、**いちばん判定が効いてほしい場面 — 生成物・
+/// データファイル・行数の多い反復的なファイル — でだけ静かに緩む**。
+/// この製品が主張しているのは「一撃でマージできる」ことなので、証明できない
+/// ものを通す側へ倒すと主張そのものが嘘になる。空の錨を必ず `false` にする
+/// [`crate::region::interleave_safe`] と同じ向きである。
+///
+/// 断られた側の逃げ道は安い (連続した 1 本の域にする / 別ファイルにする /
+/// `zai lease claim --shift`) ので、fail-closed の代償は小さい。
+/// **黙って断らないこと** — 文面は [`interleave_reason`] が出す。
+///
+/// # 費用
+///
+/// 関所は書き込みのたびに走る短命プロセスなので、[`crate::region::anchor_lines`]
+/// (ファイル全体の走査) は**交錯している組が実際にあるときだけ**呼ぶ。
+/// 互いに素な配り方 (この機能が普段扱う形) では
+/// [`crate::region::interleaved`] の外接域 2 つぶんしか払わない。
+pub fn interleave_ok(
+    text: Option<&str>,
+    a: &[crate::region::Span],
+    b: &[crate::region::Span],
+) -> bool {
+    if !crate::region::interleaved(a, b) {
+        return true; // 交錯していなければ帯 (組ごと) で足りる
+    }
+    match text {
+        Some(t) => crate::region::interleave_safe(&crate::region::anchor_lines(t), a, b),
+        None => false,
+    }
+}
+
+/// 交錯で断るときの文面。
+///
+/// **「近すぎます」と同じ顔をさせない。** 交錯は*離しても直らない*
+/// (帯を広げるとむしろ悪化する組が実測で出ている) ので、利用者が
+/// 「もう少しずらせば通る」と読める文面は嘘になる。`coedit::Reason::Bracketed`
+/// と同じことを言っている。
+///
+/// `known_text` が `false` なら、断った理由が「錨が無い」ではなく
+/// 「**数えられなかった**」であることまで出す — 劣化したことを黙らせない。
+pub fn interleave_reason(known_text: bool) -> String {
+    if known_text {
+        tr("交錯しています: 相手の行域を上下から挟んでいて、間に「このファイルで 1 回しか出てこない行」がありません。離しても直りません (帯を広げると悪化する組が実測であります) — 連続した 1 本の行域にするか、別のファイルにしてください")
+    } else {
+        trf(
+            "交錯しています: 相手の行域を上下から挟んでいますが、元の内容を読めなかったので手がかりの行を数えられませんでした (安全側で断ります。読み取り上限は設定 {key} で上げられます)。連続した 1 本の行域にするか、別のファイルにしてください",
+            &[("key", KEY_GATE_READ_CAP.to_string())],
+        )
+    }
+}
+
 fn seg_overlap(a: &[String], b: &[String]) -> bool {
     match (a.first(), b.first()) {
         (None, None) => true,
@@ -1064,6 +1162,8 @@ impl Lease {
     /// * **記録された行番号** — 錨が入る前とまったく同じ判定。既に出荷している
     ///   保証と同じ強さで、過剰でも過少でもない。ここへ倒す。
     fn live_span_of(&self, i: usize, text: Option<&str>) -> Option<crate::region::Span> {
+        #[cfg(test)]
+        scan_count::hit();
         let r = self.region_at(i);
         if r.is_whole() {
             return None;
@@ -1577,6 +1677,18 @@ pub fn try_claim_wants(
             }
         }
     }
+    // ── 交錯 ────────────────────────────────────────────────────────────
+    // ここまでは**組ごと**の帯で、それは今も正しい。足りないのは
+    // 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」のほうで、
+    // 片方が相手を上下から挟んでいると反復的な本文では帯を何行取っても
+    // 衝突する。判定は [`interleave_ok`] 1 本 (関所ごとに書かない)。
+    if let Some((owner, reason, until)) = interleave_clash(store, holder, &wanted) {
+        return Claim::Refused {
+            owner: reason,
+            pattern: owner,
+            until,
+        };
+    }
     let expires = now.saturating_add(ttl);
     if let Some(mine) = store.leases.iter_mut().find(|l| l.holder.same(holder)) {
         // **上限の検査は書き換える前に済ませる** (全か無かを壊さないため)。
@@ -1679,6 +1791,138 @@ fn overlaps_live(
         &spec_region(mine),
         crate::region::SAFE_BAND,
     )
+}
+
+/// [`try_claim_wants`] の**交錯**検査。断るなら `(仕様, 理由, 期限)`。
+///
+/// 帯の検査 ([`overlaps_live`]) を全部通った**あとにだけ**呼ぶこと。
+/// 帯で既に断っている組をここで数え直しても答えは変わらない。
+///
+/// ## なぜ持ち主ごとにまとめるのか
+///
+/// 交錯は「A の域が B の 2 つの域に挟まれている」という**集合の性質**で、
+/// 1 組ずつ ([`overlaps`]) では定義できない。実際に穴だったのはここで、
+/// `A={17}` `B={13,25}` はどの組も帯 (3 行) を満たすのに `git merge` は
+/// 衝突する。
+///
+/// ## 費用
+///
+/// * glob / ファイル全体の要求は 1 バイトも見ない (帯側が安全に断っている)
+/// * 具体パスが一致する他人のリースが無ければ [`interleave_ok`] を呼ばない
+/// * [`crate::region::anchor_lines`] は [`interleave_ok`] の中で、
+///   **本当に交錯している組があるときだけ**走る
+fn interleave_clash(
+    store: &Store,
+    holder: &Holder,
+    wanted: &[Want],
+) -> Option<(String, String, u64)> {
+    // 1. 要求を「具体パス」ごとにまとめる (行域を持つものだけ)。
+    //    値は (自分の域, 判定に使う本文, 代表の仕様)。
+    let mut mine: std::collections::BTreeMap<
+        String,
+        (Vec<crate::region::Span>, Option<&str>, &str),
+    > = std::collections::BTreeMap::new();
+    for w in wanted {
+        if !has_frag(&w.spec) {
+            continue; // ファイル全体 — 帯側が必ず断っている
+        }
+        let r = spec_region(&w.spec);
+        let (Some(span), false) = (r.span, is_globby(&r.path)) else {
+            continue;
+        };
+        let e = mine
+            .entry(r.path.clone())
+            .or_insert_with(|| (Vec::new(), None, w.spec.as_str()));
+        e.0.push(span);
+        if e.1.is_none() {
+            e.1 = w.text.as_deref();
+        }
+    }
+    if mine.is_empty() {
+        return None;
+    }
+    // 2. 自分が既に持っている域も足す。**足さないと交錯を作れてしまう** —
+    //    1 本ずつ取れば毎回「相手 1 人・自分 1 本」に見えるので、
+    //    2 回目の確保で相手を挟んだことに誰も気付かない。
+    //
+    //    **他人が誰もそのパスに居なければ 1 バイトも読まない。**
+    //    `live_span_of` は錨を本文から探し直す (= ファイル全長の走査) ので、
+    //    「同じファイルに他人が居る」と分かってからでないと払えない。
+    let contested: std::collections::BTreeSet<String> = mine
+        .keys()
+        .filter(|path| {
+            store
+                .leases
+                .iter()
+                .filter(|l| !l.holder.same(holder))
+                .any(|l| l.patterns.iter().any(|p| covers(p, path)))
+        })
+        .cloned()
+        .collect();
+    if contested.is_empty() {
+        return None;
+    }
+    if let Some(l) = store.leases.iter().find(|l| l.holder.same(holder)) {
+        for (path, e) in mine.iter_mut() {
+            if !contested.contains(path) {
+                continue;
+            }
+            for (i, p) in l.patterns.iter().enumerate() {
+                if !covers(p, path) {
+                    continue;
+                }
+                if let Some(s) = l.live_span_of(i, e.1) {
+                    e.0.push(s);
+                }
+            }
+        }
+    }
+    // 3. 他人ごとに、同じパスの域をまとめて突き合わせる。
+    for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
+        for (path, (my_spans, text, spec)) in &mine {
+            // **どちらも 1 本しか持っていないなら、交錯は起こり得ない。**
+            // 交錯は「外接域が重なる」ことで、1 本ずつなら外接域は域そのもの。
+            // 帯 (`overlaps_live`) をここまで通っている = 重なっていないので、
+            // 判定するまでもなく答えは決まっている。
+            //
+            // **これは速さのための近似ではなく、厳密に同じ答えである。**
+            // 効き目は大きい: 下の `live_span_of` は錨を本文の中から探し直す
+            // ので**1 回がファイル全長の走査**で、担当 N 人ぶん走ると
+            // 確保 1 回の費用が倍になる (実測: 互いに素な 64 件で
+            // 4203ms → 5082ms、この screening を入れて 4200ms 台へ戻した)。
+            let theirs_n = l.patterns.iter().filter(|p| covers(p, path)).count();
+            if theirs_n == 0 || (theirs_n == 1 && my_spans.len() <= 1) {
+                continue;
+            }
+            let mut theirs: Vec<crate::region::Span> = Vec::new();
+            for (i, p) in l.patterns.iter().enumerate() {
+                if !covers(p, path) {
+                    continue;
+                }
+                match l.live_span_of(i, *text) {
+                    // 丸ごと持たれている = 帯側が既に断っている。
+                    None => return None,
+                    Some(s) => theirs.push(s),
+                }
+            }
+            if theirs.is_empty() {
+                continue;
+            }
+            if !interleave_ok(*text, my_spans, &theirs) {
+                return Some((
+                    (*spec).to_string(),
+                    interleave_reason(text.is_some()),
+                    l.expires_at,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// glob 記号を含むか (`crate::region` 側の同名判定と同じ規則)。
+fn is_globby(p: &str) -> bool {
+    p.contains('*') || p.contains('?') || p.contains('[')
 }
 
 /// `path` を覆っている担当の**いまの**行域を集める。
@@ -3212,6 +3456,19 @@ fn configured_cap(root: &Path) -> u64 {
 /// **既定の上限を超えたときにだけ設定を読む** — フックは書き込みのたびに
 /// 走る短命プロセスなので、圧倒的多数を占める小さいファイルに
 /// TOML の読み込みを払わせない (設計原則 3)。
+/// 判定のためにファイルを読む (上限付き)。読めたときだけ中身を返す版。
+///
+/// 交錯の判定 ([`interleave_ok`]) を持つ関所 — `guard` / `czero` /
+/// `negotiate` — が錨を数えるために使う。**読めなければ `None`** で、
+/// 呼び出し側はそれを fail-closed (断る) として扱うこと。
+/// `root` は読み取り上限の設定 ([`KEY_GATE_READ_CAP`]) を引くスコープ。
+pub fn read_capped(abs: &Path, root: &Path) -> Option<String> {
+    match read_capped_ex(abs, root) {
+        FileRead::Text(s) => Some(s),
+        _ => None,
+    }
+}
+
 fn read_capped_ex(abs: &Path, root: &Path) -> FileRead {
     let Ok(m) = std::fs::metadata(abs) else {
         return FileRead::Unavailable;
@@ -7706,6 +7963,425 @@ mod span_tests {
             }
             other => panic!("上限を超えたのに通った: {other:?}"),
         }
+    }
+
+    // ── 交錯 (帯だけでは足りない唯一の形) ───────────────────────────
+
+    /// 周期 `p` の反復本文を `n` 行 (`region::tests::periodic` と同じ作り)。
+    fn 反復本文(p: usize, n: u32) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let mut s: String = (0..n)
+            .map(|i| format!("{}\n", POOL[(i as usize) % p]))
+            .collect();
+        s.push_str("tail\n");
+        s
+    }
+
+    /// `lines` の各行の末尾へ印を足す (1 行ぶんの置換を複数箇所に置く)。
+    fn 触る(base: &str, lines: &[u32], tag: &str) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if lines.contains(&((i + 1) as u32)) {
+                    format!("{l}  <<{tag}>>\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    /// `git merge-tree --write-tree` の答え。`Some(true)` = 衝突。
+    ///
+    /// **`git merge-file` では測らない。** あちらは `XDL_MERGE_ZEALOUS_ALNUM`
+    /// + myers で `git merge` より寛容なので、実際には失敗する組を clean と
+    /// 答える (これで測定が狂っていた実績がある)。
+    fn 実gitの答え(dir: &Path, base: &str, ours: &str, theirs: &str) -> Option<bool> {
+        let repo = dir.join("merge-lab");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).ok()?;
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", repo.join("no-such-gitconfig"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args([
+                    "-c",
+                    "core.autocrlf=false",
+                    "-c",
+                    "user.name=zai",
+                    "-c",
+                    "user.email=zai@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "-q"]) {
+            return None;
+        }
+        let f = repo.join("a.md");
+        std::fs::write(&f, base).ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+        run(&["checkout", "-qb", "ours"]);
+        std::fs::write(&f, ours).ok()?;
+        run(&["commit", "-qam", "ours"]);
+        run(&["checkout", "-q", "-"]);
+        run(&["checkout", "-qb", "theirs"]);
+        std::fs::write(&f, theirs).ok()?;
+        run(&["commit", "-qam", "theirs"]);
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", repo.join("no-such-gitconfig"))
+            .args(["merge-tree", "--write-tree", "ours", "theirs"])
+            .output()
+            .ok()?;
+        match out.status.code() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None, // 引数を知らない古い git — 判断しない
+        }
+    }
+
+    /// **確保の関所が交錯を止める。** ここが赤くなったら、`region` が直した
+    /// 判定 (`interleaved` / `interleave_safe`) が出荷経路から外れている。
+    ///
+    /// 組ごとの帯 (`SAFE_BAND`) は全部満たしているのに、`git merge` は衝突する
+    /// 配り方を使う (`region::tests::実gitで周期的な本文では…` と同じ形)。
+    #[test]
+    fn 交錯した確保は関所が断る() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave");
+        let body = 反復本文(6, 60);
+        std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        // B が 13 / 25 行目 (自分どうしなので交錯しない)
+        for spec in ["a.md#L13-13", "a.md#L25-25"] {
+            assert!(
+                matches!(
+                    try_claim_in(&dir, &mut store, &b, &[spec.into()], now, 600, &|_| false),
+                    Claim::Granted(_)
+                ),
+                "B の {spec} が取れない"
+            );
+        }
+        // 前提: どの組も帯を満たしている (= 帯だけの判定は「素」と言う)
+        for l in [13u32, 25] {
+            assert!(
+                !crate::region::spans_too_close(
+                    &crate::region::Span::line(17),
+                    &crate::region::Span::line(l),
+                    crate::region::SAFE_BAND
+                ),
+                "前提が崩れている: 17 と {l} は帯を満たすはず"
+            );
+        }
+        // A が 17 行目 = B を上下から挟む
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["a.md#L17-17".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        match got {
+            Claim::Refused { owner, .. } => assert!(
+                owner.contains("交錯"),
+                "交錯として断っていない (帯の文面が出ている): {owner}"
+            ),
+            other => panic!("交錯を通してしまった: {other:?}"),
+        }
+        // **離れていれば従来どおり通る** (交錯の検査で全部が固まっていない)
+        let far = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["a.md#L40-40".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        assert!(
+            matches!(far, Claim::Granted(_)),
+            "挟まない域まで断った: {far:?}"
+        );
+    }
+
+    /// **実 git が衝突する組を、関所が 1 つも取りこぼさない。**
+    ///
+    /// 向きは片側だけであることに注意する — `interleave_safe` は錨が無ければ
+    /// **分からない側へ倒す**ので、「断った ⇒ 必ず衝突する」は成り立たない
+    /// (実際に周期 6・60 行の 17 対 13/25 は綺麗に通るが、関所は断る)。
+    /// ここが守るのは**見逃しゼロ**のほうで、断りすぎていないことは
+    /// [`一意な本文なら交錯していても通す`] が別に押さえる。
+    ///
+    /// 時間は 1 秒も測らない (git の速さは環境で 10 倍変わる)。
+    #[test]
+    fn 実gitが衝突する交錯を関所が取りこぼさない() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-git");
+        // `region::tests::実gitで周期的な本文では帯を満たしても衝突する` と
+        // 同じ形。周期を変えても穴は残る。
+        let table: &[(usize, &[u32], u32)] = &[
+            (6, &[5, 13, 25], 17),
+            (3, &[5, 13, 25], 17),
+            (1, &[5, 13, 25], 17),
+            (6, &[3, 15, 22, 60], 44),
+        ];
+        let mut 衝突した = 0u32;
+        for (p, theirs, mine) in table {
+            let body = 反復本文(*p, 400);
+            std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+            // 前提: どの組も帯を満たしている (= 帯だけの判定は「素」と言う)
+            for l in theirs.iter() {
+                assert!(
+                    !crate::region::spans_too_close(
+                        &crate::region::Span::line(*mine),
+                        &crate::region::Span::line(*l),
+                        crate::region::SAFE_BAND
+                    ),
+                    "前提が崩れている: {mine} と {l} は帯を満たすはず"
+                );
+            }
+            let ours = 触る(&body, &[*mine], "OURS");
+            let th = 触る(&body, theirs, "THEIRS");
+            let Some(衝突) = 実gitの答え(&dir, &body, &ours, &th) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            if !衝突 {
+                continue;
+            }
+            衝突した += 1;
+            let granted = 挟んで確保できるか(&dir, theirs, *mine);
+            assert!(
+                !granted,
+                "実 git が衝突する組を関所が通した: 周期 {p} / 相手 {theirs:?} / 自分 {mine}"
+            );
+        }
+        assert!(
+            衝突した > 0,
+            "1 件も衝突しないなら、この穴の前提が変わっている (git の側を測り直すこと)"
+        );
+    }
+
+    /// **断りすぎていない。** 行がすべて違う本文なら、挟んでいても錨が
+    /// 立つので確保できる。ここが赤くなったら、交錯の検査が「常に断る」に
+    /// なっている (= 帯の意味まで消している)。
+    #[test]
+    fn 一意な本文なら交錯していても通す() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-unique");
+        let body: String = (1..=60).map(|i| format!("行 {i} は他と違う\n")).collect();
+        std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+        assert!(
+            挟んで確保できるか(&dir, &[13, 25], 17),
+            "一意な本文なのに挟んだ域を断った (厳しすぎる)"
+        );
+        if let Some(衝突) = 実gitの答え(
+            &dir,
+            &body,
+            &触る(&body, &[17], "OURS"),
+            &触る(&body, &[13, 25], "THEIRS"),
+        ) {
+            assert!(!衝突, "一意な本文なのに実 git が衝突した (前提が変わった)");
+        }
+    }
+
+    /// B が `theirs` を持っている台帳で、A が `mine` 行を取れるか。
+    fn 挟んで確保できるか(dir: &Path, theirs: &[u32], mine: u32) -> bool {
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        for l in theirs {
+            let spec = format!("a.md#L{l}-{l}");
+            assert!(
+                matches!(
+                    try_claim_in(dir, &mut store, &b, &[spec], now, 600, &|_| false),
+                    Claim::Granted(_)
+                ),
+                "B の {l} 行目が取れない"
+            );
+        }
+        matches!(
+            try_claim_in(
+                dir,
+                &mut store,
+                &a,
+                &[format!("a.md#L{mine}-{mine}")],
+                now,
+                600,
+                &|_| false
+            ),
+            Claim::Granted(_)
+        )
+    }
+
+    /// **本文が読めないときは fail-closed。**
+    ///
+    /// 錨は元の本文からしか数えられない。読めないときに「帯だけ」へ落とすと、
+    /// いちばん判定が効いてほしい場面 (生成物・巨大なデータファイル) でだけ
+    /// 静かに緩む。空の錨を必ず `false` にする `region::interleave_safe` と
+    /// 同じ向きであることを固定する。
+    #[test]
+    fn 本文が読めなければ交錯は通さない() {
+        // 実ファイルを置かない = `hydrate_in` が `Want::text` を埋められない
+        let dir = unique_temp_dir("zaivern", "lease-interleave-noread");
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        for spec in ["nope.md#L13-13", "nope.md#L25-25"] {
+            assert!(matches!(
+                try_claim_in(&dir, &mut store, &b, &[spec.into()], now, 600, &|_| false),
+                Claim::Granted(_)
+            ));
+        }
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["nope.md#L17-17".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        match got {
+            Claim::Refused { owner, .. } => {
+                assert!(owner.contains("交錯"), "交錯として断っていない: {owner}");
+                // **劣化したことを黙らせない** — 読めなかったと文面に出す
+                assert!(
+                    owner.contains(KEY_GATE_READ_CAP),
+                    "読めなかったことが文面に出ていない: {owner}"
+                );
+            }
+            other => panic!("本文が読めないのに交錯を通した: {other:?}"),
+        }
+    }
+
+    /// `interleave_ok` は交錯していない組では錨を 1 度も数えない (費用の番人)。
+    ///
+    /// 関所は書き込みのたびに走る短命プロセスなので、`anchor_lines`
+    /// (ファイル全体の走査) を毎回払うと重い。**交錯していない = 普段の形**
+    /// では本文が `None` でも通ることで、走査していないことを固定する。
+    #[test]
+    fn 交錯していなければ本文を読まずに通す() {
+        let s = |a: u32, b: u32| crate::region::Span { start: a, end: b };
+        // 互いに素 — 本文が無くても通る
+        assert!(interleave_ok(None, &[s(10, 12)], &[s(30, 32)]));
+        assert!(interleave_ok(None, &[s(30, 32)], &[s(10, 12)]));
+        // 挟んでいる — 本文が無ければ断る
+        assert!(!interleave_ok(None, &[s(20, 20)], &[s(10, 10), s(30, 30)]));
+    }
+
+    /// **交錯の検査は、互いに素な配り方の費用を増やさない。**
+    ///
+    /// 関所は書き込みのたびに走る短命プロセスなので、ここが太ると全員が
+    /// 払う。1 回がファイル全長の走査になる [`Lease::live_span_of`] の
+    /// **呼び出し回数**で固定する (時間で線を引かない — 環境で 10 倍動く)。
+    ///
+    /// 実測 (`zai lease claim` を 64 回・互いに素・2000 行):
+    /// 直す前 4421ms / 入れた直後 5082ms (+15%) / screening 後 4325ms。
+    /// 回数で見れば理由は自明で、交錯の検査が担当 N 人ぶん本文を
+    /// 走査し直していた。**両方が 1 本ずつなら交錯は起こり得ない**ので
+    /// (外接域 = 域そのもの、かつ帯を通っている = 重ならない)、
+    /// そこを厳密に飛ばす。
+    #[test]
+    fn 互いに素な確保では本文を走査し直さない() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-cost");
+        let body: String = (1..=2000)
+            .map(|i| format!("fn f{i}() {{ {i} }}\n"))
+            .collect();
+        std::fs::write(dir.join("a.rs"), &body).expect("本文を置く");
+        let now = now_secs();
+        let mut store = Store::default();
+        // 64 体が互いに素な域を 1 本ずつ持つ (ベンチと同じ形)
+        for i in 0..64u32 {
+            let h = Holder {
+                agent: format!("ag{i}"),
+                cwd: format!("/w/{i}"),
+                ..Default::default()
+            };
+            let (s0, e0) = (10 + i * 30, 15 + i * 30);
+            let got = try_claim_in(
+                &dir,
+                &mut store,
+                &h,
+                &[format!("a.rs#L{s0}-{e0}")],
+                now,
+                600,
+                &|_| false,
+            );
+            assert!(
+                matches!(got, Claim::Granted(_)),
+                "{i} 番目が取れない: {got:?}"
+            );
+        }
+        // 65 人目。**他人は全員 1 本ずつなので、交錯の検査は 1 回も
+        // 本文を走査してはいけない** (帯の検査ぶんだけが残る)。
+        let last = Holder {
+            agent: "ag64".into(),
+            cwd: "/w/64".into(),
+            ..Default::default()
+        };
+        scan_count::reset();
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &last,
+            &["a.rs#L1930-1935".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        let scans = scan_count::get();
+        assert!(
+            matches!(got, Claim::Granted(_)),
+            "65 人目が取れない: {got:?}"
+        );
+        // 帯の検査 (`overlaps_live`) が担当ごとに 1 回。交錯の検査ぶんが
+        // 乗っていれば 2 倍になる。
+        eprintln!("64 体の台帳へ 1 件確保: 本文の走査 {scans} 回");
+        assert!(
+            scans <= store.leases.len() as u64,
+            "交錯の検査が本文の走査を増やしている: {scans} 回 (上限 {})",
+            store.leases.len()
+        );
     }
 
     /// **断る理由は必ず「見出し `:` 本文」の形にする。**
