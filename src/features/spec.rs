@@ -33,7 +33,5 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         _ => false,
     },
     // パネルはボトムパネル側で描くので、全画面オーバーレイは持たない。
-    draw: None,
-    settings: &[],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };

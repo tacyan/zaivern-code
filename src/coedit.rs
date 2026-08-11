@@ -205,6 +205,12 @@ pub enum Reason {
     TooClose,
     /// 片方がファイル全体 (二値・新規・削除・リネーム・モード変更)。
     WholeFile,
+    /// **交錯**。どの組も安全帯を満たしているが、片方がもう片方を上下から
+    /// 挟んでいて、しかも境目に錨 ([`crate::region::anchor_lines`]) が無い。
+    ///
+    /// 帯だけでは言い切れない唯一の形。詳細は
+    /// [`crate::region::interleave_safe`] に実測ごと書いてある。
+    Bracketed,
 }
 
 impl Reason {
@@ -214,6 +220,7 @@ impl Reason {
             Reason::Overlap => "行域が重なっています",
             Reason::TooClose => "安全帯より近い行です",
             Reason::WholeFile => "ファイル全体を占める変更です",
+            Reason::Bracketed => "相手の行域を挟んでいて、間に手がかりの行がありません",
         }
     }
 }
@@ -339,6 +346,20 @@ impl Proof {
                     &[("b", self.band.to_string()), ("m", note.clone())],
                 );
             }
+        }
+        // **交錯は「近すぎる」ではない。** 帯は満たしているのに通せない形なので、
+        // 「もう少し離せば済む」と読ませると利用者が無駄に動かすことになる。
+        let bracketed = self
+            .pairs
+            .iter()
+            .filter(|c| c.reason == Reason::Bracketed)
+            .count();
+        if bracketed > 0 && bracketed == self.pairs.len() && self.truncated == 0 {
+            return trf(
+                "⛔ {n} 組が相手の行域を挟んでいます (安全帯 {b} 行は満たしています) \
+                 — 離しても解決しません",
+                &[("n", bracketed.to_string()), ("b", self.band.to_string())],
+            );
         }
         trf(
             "⛔ {n} 組が近すぎます (安全帯 {b} 行) — このままでは人手が要ります",
@@ -718,9 +739,27 @@ fn globby(p: &str) -> bool {
 ///
 /// 同じブランチの中の行域どうしは**数えない** — 自分の変更が自分と衝突する
 /// ことは無い。
-pub fn clashes(branches: &[BranchRegions], band: u32) -> (Vec<Clash>, usize) {
+///
+/// `anchors_of` は共通祖先側の本文から作った錨
+/// ([`crate::region::anchor_lines`]) を返す。
+///
+/// * `None` — 本文を持っていないので**交錯は見ない** (帯だけの判定に戻る)。
+///   純関数として呼ぶ [`prove`] はこちら
+/// * `Some(v)` — `v` で交錯を判定する。読めなかったときは `Some(vec![])` を
+///   返すこと。空の錨は [`crate::region::interleave_safe`] が必ず断るので
+///   **fail-closed** になる
+///
+/// 呼ばれるのは**交錯している組があるファイルだけ**なので、互いに素な
+/// 配り方 (この機能が普段扱う形) では 1 度も呼ばれない。
+pub fn clashes_with(
+    branches: &[BranchRegions],
+    band: u32,
+    anchors_of: &mut dyn FnMut(&str) -> Option<Vec<bool>>,
+) -> (Vec<Clash>, usize) {
     let mut out: Vec<Clash> = Vec::new();
     let mut total = 0usize;
+    // (i, j, path) で「もう帯の側で挙げた」組を覚えておき、交錯を二重に出さない。
+    let mut already: BTreeSet<(usize, usize, String)> = BTreeSet::new();
     for i in 0..branches.len() {
         for j in (i + 1)..branches.len() {
             let (x, y) = (&branches[i], &branches[j]);
@@ -737,6 +776,7 @@ pub fn clashes(branches: &[BranchRegions], band: u32) -> (Vec<Clash>, usize) {
                         continue;
                     }
                     total += 1;
+                    already.insert((i, j, ra.path.clone()));
                     if out.len() >= MAX_CLASHES {
                         continue;
                     }
@@ -748,6 +788,45 @@ pub fn clashes(branches: &[BranchRegions], band: u32) -> (Vec<Clash>, usize) {
                     };
                     out.push(clash_of(na, nb, pa, pb));
                 }
+            }
+            // ── 交錯 ────────────────────────────────────────────────
+            //
+            // ここまでの判定は**組ごと**で、それは今も正しい。足りないのは
+            // 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」という
+            // 推論のほうで、片方が相手を上下から挟んでいると反復的な本文では
+            // 帯を何行取っても衝突しうる (`region::anchor_lines` に実測)。
+            for path in shared_paths(x, y) {
+                if already.contains(&(i, j, path.clone())) {
+                    continue;
+                }
+                let (sa, sb) = (spans_on(x, &path), spans_on(y, &path));
+                if !region::interleaved(&sa, &sb) {
+                    continue;
+                }
+                let Some(anchors) = anchors_of(&path) else {
+                    continue; // 本文を持っていない呼び出し — 交錯は見ない
+                };
+                if region::interleave_safe(&anchors, &sa, &sb) {
+                    continue;
+                }
+                total += 1;
+                if out.len() >= MAX_CLASHES {
+                    continue;
+                }
+                let (na, nb, ha, hb) = if flip {
+                    (&y.branch, &x.branch, region::hull(&sb), region::hull(&sa))
+                } else {
+                    (&x.branch, &y.branch, region::hull(&sa), region::hull(&sb))
+                };
+                out.push(Clash {
+                    a: na.clone(),
+                    b: nb.clone(),
+                    path,
+                    a_span: ha,
+                    b_span: hb,
+                    gap: None,
+                    reason: Reason::Bracketed,
+                });
             }
         }
     }
@@ -763,6 +842,34 @@ pub fn clashes(branches: &[BranchRegions], band: u32) -> (Vec<Clash>, usize) {
     out.sort_by(|p, q| key(p).cmp(&key(q)));
     out.dedup();
     (out, total.saturating_sub(MAX_CLASHES.min(total)))
+}
+
+/// 2 本が両方とも触った**具体パス**(辞書順・重複なし)。
+///
+/// glob とファイル全体は交錯の判定から外す — どちらも既に帯の側で
+/// 「衝突する」と言い切っているので、二重に数えても情報が増えない。
+fn shared_paths(x: &BranchRegions, y: &BranchRegions) -> Vec<String> {
+    let concrete = |b: &BranchRegions| -> BTreeSet<String> {
+        b.regions
+            .iter()
+            .filter(|r| r.span.is_some() && !globby(&r.path))
+            .map(|r| r.path.clone())
+            .collect()
+    };
+    let (a, b) = (concrete(x), concrete(y));
+    a.intersection(&b).cloned().collect()
+}
+
+/// 1 本が `path` で持っている行域 (昇順)。
+fn spans_on(x: &BranchRegions, path: &str) -> Vec<Span> {
+    let mut v: Vec<Span> = x
+        .regions
+        .iter()
+        .filter(|r| r.path == path)
+        .filter_map(|r| r.span)
+        .collect();
+    v.sort();
+    v
 }
 
 /// 1 組ぶんの [`Clash`] を組み立てる。
@@ -794,8 +901,17 @@ fn clash_of(a: &str, b: &str, ra: &Region, rb: &Region) -> Clash {
 ///
 /// `notes` に 1 つでも中身があると `disjoint` は立たない — 「読めなかったが
 /// たぶん大丈夫」を**言わない**ための倒し方 (fail-closed)。
-pub fn prove(branches: Vec<BranchRegions>, band: u32) -> Proof {
-    let (pairs, truncated) = clashes(&branches, band);
+///
+/// `anchors_of` の意味は [`clashes_with`] と同じ。**本文を読める呼び出し
+/// ([`proof`]) は必ず本物の錨を渡すこと** — `None` を返す実装にすると
+/// 帯だけの判定に落ちるので、反復的な本文で交錯していても「素だ」と
+/// 言ってしまう。
+pub fn prove(
+    branches: Vec<BranchRegions>,
+    band: u32,
+    anchors_of: &mut dyn FnMut(&str) -> Option<Vec<bool>>,
+) -> Proof {
+    let (pairs, truncated) = clashes_with(&branches, band, anchors_of);
     let unreadable: Vec<String> = branches.iter().filter_map(|b| b.note.clone()).collect();
     let note = (!unreadable.is_empty()).then(|| unreadable.join(" / "));
     Proof {
@@ -943,7 +1059,21 @@ pub fn proof(repo: &Path, base: &str, branches: &[String], band: u32) -> Proof {
     }
     items.sort_by(|a, b| a.branch.cmp(&b.branch));
 
-    let mut p = prove(items, band);
+    // 交錯している組があるファイルだけ、共通祖先側の本文を 1 回読む。
+    // **互いに素な配り方では 1 度も走らない** (`shared_paths` で交錯が
+    // 見つかったときにしか呼ばれない)。読めなければ空を返して fail-closed。
+    let mut cache: BTreeMap<String, Vec<bool>> = BTreeMap::new();
+    let mut anchors_of = |path: &str| -> Option<Vec<bool>> {
+        if let Some(v) = cache.get(path) {
+            return Some(v.clone());
+        }
+        let spec = format!("{common}:{path}");
+        let text = git_out(&top, &["show", &spec]).unwrap_or_default();
+        let v = region::anchor_lines(&text);
+        cache.insert(path.to_string(), v.clone());
+        Some(v)
+    };
+    let mut p = prove(items, band, &mut anchors_of);
     p.base = common;
     p.base_ref = base.to_string();
     p.base_participates = base_participates;
@@ -1203,6 +1333,17 @@ pub fn integrate(
         return Ok(out);
     }
 
+    // ③.5 **混ぜる順を行番号の昇順にする。**
+    //
+    // 直列マージでは `ours` に「先に入れた全員」が積み上がるので、名前順で
+    // 流すと、まだ入れていない枝が**既に入った枝に上下から挟まれる**
+    // (交錯) 形が順番のせいで生まれる。反復的な本文ではそれだけで衝突する。
+    // 実測 (周期 6・16 体・間隔 1 行、`tools/merge-band-probe.sh --mode order`):
+    // ランダム順は 16 回のマージ中 **最大 7 回**衝突したのに対し、
+    // **昇順は 0 回**。間隔を 8 行に広げてもランダム順は直らない (最大 10 回)
+    // ので、これは帯では買えない性質である。
+    let names = merge_order(&names, &out.proof);
+
     let mut head = base_oid.clone();
     let mut merged: Vec<String> = Vec::new();
     for b in &names {
@@ -1308,6 +1449,32 @@ pub fn integrate(
     out.log = log;
     out.took_ms = t0.elapsed().as_millis();
     Ok(out)
+}
+
+/// 混ぜる順を決める — **行番号の昇順**。
+///
+/// 各枝を「触った行域のいちばん上」で並べる (パス, 開始行, 名前)。
+/// 行域を 1 つも持たない枝は先頭へ (何とも挟み合わない)。
+/// 同点は**名前の辞書順**で割るので、答えは常に決定的。
+///
+/// これは*順番*の問題であって帯の問題ではない。詳細は [`integrate`] の
+/// 該当箇所と [`crate::region::anchor_lines`] に実測ごと書いてある。
+fn merge_order(names: &[String], p: &Proof) -> Vec<String> {
+    let first_touch = |name: &str| -> Option<(String, u32)> {
+        p.branches
+            .iter()
+            .find(|b| b.branch == name)?
+            .regions
+            .iter()
+            .map(|r| (r.path.clone(), r.span.map(|s| s.start).unwrap_or(0)))
+            .min()
+    };
+    let mut v: Vec<(Option<(String, u32)>, String)> = names
+        .iter()
+        .map(|n| (first_touch(n), n.clone()))
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, n)| n).collect()
 }
 
 /// 止まった理由を組み立てる。相手は**既に混ざったブランチ**から探す。
@@ -1673,6 +1840,11 @@ pub mod cliface {
         }
         if out.ok() {
             EXIT_OK
+        } else if !out.proof.disjoint {
+            // **証明で止まったなら 1。** `dry_available` は証明の手前で
+            // 返ったときに既定の `false` のままなので、先に見ると
+            // 「git が古い」(3) と嘘をつく。
+            EXIT_NOT_PROVEN
         } else if !out.dry_available {
             EXIT_NO_MERGE_TREE
         } else {
@@ -2098,8 +2270,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         _ => false,
     },
     draw: Some(draw),
-    settings: &[],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2110,6 +2281,15 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
 mod tests {
     use super::cliface::*;
     use super::*;
+
+    /// **帯だけ**の証明 (交錯を見ない)。本文を持っていない呼び出しの形。
+    ///
+    /// 出荷の経路 ([`proof`]) は必ず本物の錨を渡すので、ここを通るのは
+    /// テストだけである。「帯だけだと何を見逃すか」を測るのに要る
+    /// (`実gitで交錯した組を証明が捕まえる`)。
+    fn prove(branches: Vec<BranchRegions>, band: u32) -> Proof {
+        super::prove(branches, band, &mut |_| None)
+    }
 
     fn r(path: &str, from: u32, to: u32) -> Region {
         Region {
@@ -2941,6 +3121,126 @@ mod tests {
             out.took_ms,
             out.human_touches
         );
+    }
+
+    /// 周期 `p` の本文 (末尾 1 行だけ一意)。`plant` の行は「唯一の行」にする。
+    fn periodic_text(p: usize, n: u32, plant: &[u32]) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let mut s = String::new();
+        for i in 0..n {
+            let line = if plant.contains(&(i + 1)) {
+                format!("UNIQ-{}", i + 1)
+            } else {
+                POOL[(i as usize) % p].to_string()
+            };
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str("tail\n");
+        s
+    }
+
+    /// `lines` の各行の末尾へ印を足した版。
+    fn periodic_touched(base: &str, lines: &[u32], tag: &str) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if lines.contains(&((i + 1) as u32)) {
+                    format!("{l}  <<{tag}>>\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    /// **帯だけの証明が嘘をつく形を、実 git で固定する。**
+    ///
+    /// どの組も安全帯を満たしているのに `git merge` は衝突する
+    /// (`region::anchor_lines` に原因の実測)。`prove` (帯だけ) は
+    /// 「素だ」と言ってしまい、`proof` (交錯まで見る) は捕まえる。
+    /// **錨を 1 本置けば同じ配置が通る**ところまで確かめる。
+    #[test]
+    fn 実gitで交錯した組を証明が捕まえる() {
+        let Some(r) = make_repo("bracket") else { return };
+        let ours: &[u32] = &[17];
+        let theirs: &[u32] = &[5, 13, 25];
+        for (tag, plant, want_conflict) in [
+            ("bare", &[][..], true),
+            ("anchored", &[9u32, 15, 21][..], false),
+        ] {
+            let base_name = format!("base-{tag}");
+            let base = periodic_text(6, 400, plant);
+            let path = format!("{tag}.md");
+            r.git(&["checkout", "--quiet", "--orphan", &base_name]);
+            r.git(&["rm", "-rq", "--cached", "--ignore-unmatch", "."]);
+            r.commit(&path, &base, "base");
+            let names: Vec<String> = ["A", "B"].iter().map(|s| format!("{tag}-{s}")).collect();
+            for (n, at) in names.iter().zip([ours, theirs]) {
+                r.git(&["checkout", "--quiet", "-b", n, &base_name]);
+                r.commit(&path, &periodic_touched(&base, at, n), n);
+            }
+            r.git(&["checkout", "--quiet", &base_name]);
+
+            // 実 git がどう答えるか (これが正解)
+            r.git(&["checkout", "--quiet", "--force", "-B", "mrg", &names[0]]);
+            let merged = r
+                .try_git(&["merge", "--no-edit", "-m", "m", &names[1]])
+                .is_ok();
+            if !merged {
+                let _ = r.try_git(&["merge", "--abort"]);
+            }
+            r.git(&["checkout", "--quiet", "--force", &base_name]);
+            assert_eq!(
+                !merged, want_conflict,
+                "[{tag}] 実 git の答えが前提と違う (この穴の性質が変わっている)"
+            );
+
+            let p = proof(&r.0, &base_name, &names, region::MERGE_ONLY_BAND);
+            assert!(p.note.is_none(), "[{tag}] 読めた: {:?}", p.note);
+            if want_conflict {
+                assert!(!p.disjoint, "[{tag}] 交錯を見逃した");
+                assert!(
+                    p.pairs.iter().any(|c| c.reason == Reason::Bracketed),
+                    "[{tag}] 理由が交錯になっていない: {:?}",
+                    p.pairs
+                );
+                // **帯だけの判定はここを通してしまう** — 残している穴を明示する。
+                let bare = prove(p.branches.clone(), region::MERGE_ONLY_BAND);
+                assert!(
+                    bare.disjoint,
+                    "[{tag}] prove が帯だけで止めているなら、この記述を測り直すこと"
+                );
+            } else {
+                assert!(p.disjoint, "[{tag}] 錨があるのに止めた: {:?}", p.pairs);
+            }
+        }
+    }
+
+    #[test]
+    fn 混ぜる順は行番号の昇順で決まる() {
+        // 名前は逆順、行域は昇順。**名前ではなく行で並ぶ**こと。
+        let p = prove(
+            vec![
+                br("zeta", vec![r("f.rs", 1, 5)]),
+                br("alpha", vec![r("f.rs", 40, 45)]),
+                br("mid", vec![r("f.rs", 20, 25)]),
+            ],
+            region::MERGE_ONLY_BAND,
+        );
+        let names: Vec<String> = ["alpha", "mid", "zeta"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(merge_order(&names, &p), vec!["zeta", "mid", "alpha"]);
+        // 行域を持たない枝は先頭 (何とも挟み合わない)。同点は名前で割る。
+        let p2 = prove(
+            vec![
+                br("empty", vec![]),
+                br("b", vec![r("f.rs", 10, 12)]),
+                br("a", vec![r("f.rs", 10, 12)]),
+            ],
+            region::MERGE_ONLY_BAND,
+        );
+        let n2: Vec<String> = ["a", "b", "empty"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(merge_order(&n2, &p2), vec!["empty", "a", "b"]);
     }
 
     #[test]

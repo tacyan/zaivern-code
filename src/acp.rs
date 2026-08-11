@@ -3557,8 +3557,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // オーバーレイ。**接続が 0 本でパネルも閉じているなら即 return する**
     // ので、アイドルのフレームでは 1 ピクセルも触らない (設計原則 3)。
     draw: Some(|app, ctx| app.acp_tick(ctx)),
-    settings: &[],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -439,13 +439,19 @@ fn read_json_retry<T: for<'a> Deserialize<'a>>(path: &Path) -> Option<T> {
     None
 }
 
-/// 決定的な 16 桁ハッシュ。`history::workspace_key` と同じ流儀
-/// (`DefaultHasher` は固定鍵の SipHash なので、プロセスをまたいでも同じ値)。
+/// 任意の文字列 → 決定的な 16 桁ハッシュ。**ワークスペースキーではない。**
+///
+/// 混同しないこと: メッシュの置き場 (`~/.zaivern/mesh/<スコープ>/`) を決めるのは
+/// [`Mesh::open_for`] が呼ぶ [`crate::history::workspace_key`] で、こちらは
+/// **その中でファイル名に使う短縮鍵**である。入力はパスではなく
+/// Pid / 登録名 / 担当キーなので、パスの正規化 (シンボリックリンク解決・
+/// 区切りの統一・大小の畳み込み) を通してはいけない。
+///
+/// ハッシュ関数だけは [`crate::history::fnv1a64`] を共有する。
+/// 以前は `DefaultHasher` だったが、std は**版をまたぐ出力の安定性を保証していない**
+/// ので、rustc を上げると名前登録と担当のファイル名が総入れ替わりになる。
 fn short_hash(s: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    format!("{:016x}", crate::history::fnv1a64(s.as_bytes()))
 }
 
 /// ファイル名 / node 名に使える形へ落とす。`.` を落とすのが要点
@@ -1355,17 +1361,16 @@ impl Mesh {
     }
 
     fn prune_orphans(&self, procs: &BTreeMap<String, ProcInfo>, rep: &mut ReapReport) {
-        for c in self.claims() {
-            if !procs.contains_key(&c.pid.fkey())
-                && std::fs::remove_file(self.claim_path(&c.spec)).is_ok()
-            {
+        // **読んだファイルそのものを消す。** 名前から作り直すと、短縮鍵の
+        // 作り方が変わった版で書かれた残骸を永久に消せなくなる
+        // (`claims()` / `names()` は中身を読むので拾えるのに、消す先だけ外れる)。
+        for (path, c) in read_all_json_at::<ClaimInfo>(&self.claims_dir()) {
+            if !procs.contains_key(&c.pid.fkey()) && std::fs::remove_file(&path).is_ok() {
                 rep.released.push(c.spec);
             }
         }
-        for n in self.names() {
-            if !procs.contains_key(&n.pid.fkey())
-                && std::fs::remove_file(self.name_path(&n.name)).is_ok()
-            {
+        for (path, n) in read_all_json_at::<NameInfo>(&self.names_dir()) {
+            if !procs.contains_key(&n.pid.fkey()) && std::fs::remove_file(&path).is_ok() {
                 rep.unnamed.push(n.name);
             }
         }
@@ -1407,6 +1412,15 @@ fn next_seq(dir: &Path, prefix: &str) -> u64 {
 }
 
 fn read_all_json<T: for<'a> Deserialize<'a>>(dir: &Path) -> Vec<T> {
+    read_all_json_at::<T>(dir)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// 読めた JSON を**その置き場のパスごと**返す。消す側は名前から作り直さず
+/// これを使うこと (作り直すと、鍵の作り方が変わった版の残骸が消せない)。
+fn read_all_json_at<T: for<'a> Deserialize<'a>>(dir: &Path) -> Vec<(PathBuf, T)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1417,8 +1431,8 @@ fn read_all_json<T: for<'a> Deserialize<'a>>(dir: &Path) -> Vec<T> {
         .collect();
     paths.sort();
     paths
-        .iter()
-        .filter_map(|p| read_json_retry::<T>(p))
+        .into_iter()
+        .filter_map(|p| read_json_retry::<T>(&p).map(|v| (p, v)))
         .collect()
 }
 
@@ -2722,8 +2736,7 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     // 中央ビューに属さないオーバーレイなので毎フレームここから描く。
     // **閉じているときは先頭で即 return する**ので、アイドル時のコストはゼロ。
     draw: Some(draw),
-    settings: &[],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -88,6 +88,19 @@ use serde::{Deserialize, Serialize};
 /// **いちばん厳しい経路に合わせる**のがこの定数の役目なので 3 のまま据え置く。
 /// 下げてよいのは「三方向マージしか通らない」と保証できる場合だけで、その値は
 /// [`MERGE_ONLY_BAND`] に分けてある。
+///
+/// ## ⚠ この帯が保証していないこと (後から実測で見つかった穴)
+///
+/// 上の表は**変更 2 つを 1 組で**測ったもので、その範囲では今も正しい
+/// (周期 1〜12 のどんな反復本文でも、1 行ずつの変更 2 つは間隔 1 行で通る)。
+/// 保証していないのは**組み合わせ**のほうで、
+///
+/// > 「全部の組が帯を満たす」⇒「全部まとめてマージしても綺麗に通る」
+///
+/// は**成り立たない**。片方の担当がもう片方を上下から挟んでいると (交錯)、
+/// 反復的な本文では帯を何行取っても衝突しうる。詳細と対処は
+/// [`anchor_lines`] / [`interleave_safe`] / [`interleaved`] に書いた。
+/// **帯を広げる方向では直らない**ので、この定数の値は動かしていない。
 pub const SAFE_BAND: u32 = 3;
 
 /// **三方向マージだけ**を通す前提でよいときの下限 (実測値)。
@@ -455,6 +468,44 @@ pub fn resolve_spec(s: &Spec, text: &str) -> Result<Region, String> {
 //  4. 重なり判定 — 不変条件を守る唯一の関門
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ── 判定そのものの費用を「回数」で見るための計数器 ────────────────────────
+//
+// 絶対時間で線を引くと必ず嘘をつく (Docker の仮想 FS / 他テストとの同時実行 /
+// 負荷で実際に 3 件落ちた)。守りたいのは「件数を 2 倍にしても仕事が 2 倍しか
+// 増えない」という**構造**なので、番人テストは時間ではなく**呼び出し回数**を見る。
+//
+// カウンタは**スレッドローカル**。プロセス共通の `static AtomicUsize` にすると
+// 同時に走っている他テストの呼び出しまで混ざる (400 回のはずが 800 回になる)。
+// `#[cfg(test)]` なので出荷ビルドには 1 バイトも入らない。
+#[cfg(test)]
+mod count {
+    use std::cell::Cell;
+
+    thread_local! {
+        // 行域どうしの近さ判定 (`conflicts` の入口) を通った回数
+        static PAIRS: Cell<u64> = const { Cell::new(0) };
+        // 行に触れた回数 (テキストを行へ割る走査 + 錨の探索での内容比較)
+        static LINES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn pair() {
+        PAIRS.with(|c| c.set(c.get().saturating_add(1)));
+    }
+    pub(super) fn line() {
+        LINES.with(|c| c.set(c.get().saturating_add(1)));
+    }
+    pub(super) fn reset() {
+        PAIRS.with(|c| c.set(0));
+        LINES.with(|c| c.set(0));
+    }
+    pub(super) fn pairs() -> u64 {
+        PAIRS.with(Cell::get)
+    }
+    pub(super) fn lines() -> u64 {
+        LINES.with(Cell::get)
+    }
+}
+
 /// 2 つの行域が、`band` 行の安全帯を挟んでもなお近すぎるか。
 ///
 /// **`band` 行以上離れていれば `false`** (= 同時に持ってよい)。
@@ -478,6 +529,147 @@ pub fn spans_too_close(a: &Span, b: &Span, band: u32) -> bool {
     gap < band
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  2.5 錨 — 帯は**組では正しいが、組み合わせでは足りない**
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// ファイル内で**ちょうど 1 回**しか現れない行に印を付ける (添字 `i` は `i+1` 行目)。
+///
+/// # なぜ要るのか — 帯だけでは足りない実測
+///
+/// [`SAFE_BAND`] / [`MERGE_ONLY_BAND`] は「**2 つの**変更を何行離せば git が
+/// 衝突しないか」を測って決めた値で、その主張は今も正しい (周期 1〜12 の
+/// どんな反復本文でも、1 行ずつの変更 2 つは間隔 1 行で綺麗に通る)。
+/// 崩れたのは**そこから先の推論**のほうで、
+///
+/// > 「全部の組が帯を満たす ⇒ 全部まとめてマージしても綺麗に通る」
+///
+/// は成り立たない。`git merge` の既定戦略 ort は **diff アルゴリズムを
+/// histogram に固定している** (`man git-merge`: "ort specifically uses
+/// diff-algorithm=histogram")。histogram は本文が反復的だと*同じ側の複数の
+/// 変更*を 1 つの巨大なハンクへ畳むので、**片方の担当がもう片方を上下から
+/// 挟んでいる**とき (交錯) に、帯を何行取っていても衝突しうる。
+///
+/// 実測 (`tools/merge-band-probe.sh --mode bracket`、周期 6 の Markdown):
+/// A が 17 行目・B が 5/13/25 行目 — どの組も 4 行以上離れているのに衝突する。
+/// 帯を広げても直らない (周期 6・16 体・ランダム順では **間隔 16 行でも
+/// 9 件衝突**した)。逆に、**隣り合う他人の域の間にこの「唯一の行」が 1 本でも
+/// あれば衝突しなかった** — 錨は diff が越えられない壁になる。
+///
+/// 判定は決定的 (`BTreeMap` のみ。`HashMap` を 1 つも使わない)。
+pub fn anchor_lines(text: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
+    let mut seen: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for l in &lines {
+        *seen.entry(l).or_insert(0) += 1;
+    }
+    lines.iter().map(|l| seen.get(l) == Some(&1)).collect()
+}
+
+/// `lo` と `hi` の**間**に [`anchor_lines`] の錨が 1 本以上あるか。
+///
+/// 両端の域そのものは含めない (どちらかが書き換える行は壁にならない)。
+pub fn anchor_between(anchors: &[bool], lo: &Span, hi: &Span) -> bool {
+    let (lo0, lo1) = lo.probe();
+    let (hi0, hi1) = hi.probe();
+    // 呼び出し側が順序を間違えても答えを変えない
+    let (lo_end, hi_start) = if lo0 <= hi0 { (lo1, hi0) } else { (hi1, lo0) };
+    if lo_end == Span::EOF || hi_start == Span::EOF {
+        return false;
+    }
+    let from = lo_end as usize;
+    let to = (hi_start as usize).saturating_sub(1);
+    if from >= to {
+        return false;
+    }
+    anchors
+        .get(from..to.min(anchors.len()))
+        .map(|s| s.iter().any(|b| *b))
+        .unwrap_or(false)
+}
+
+/// 複数の行域をまとめて包む最小の域。空なら `None`。
+pub fn hull(spans: &[Span]) -> Option<Span> {
+    let mut it = spans.iter();
+    let first = it.next()?;
+    let (mut s, mut e) = first.probe();
+    for sp in it {
+        let (a, b) = sp.probe();
+        s = s.min(a);
+        e = if e == Span::EOF || b == Span::EOF {
+            Span::EOF
+        } else {
+            e.max(b)
+        };
+    }
+    Some(Span { start: s, end: e })
+}
+
+/// 2 人の担当が同じファイルで**交錯**しているか
+/// (= 外接域が重なる = 片方がもう片方を挟んでいる)。
+///
+/// 交錯していなければ、統合を**行番号の昇順**で流す限り
+/// 「累積した側」が「これから混ぜる側」を挟むことは起こり得ない。
+pub fn interleaved(a: &[Span], b: &[Span]) -> bool {
+    match (hull(a), hull(b)) {
+        (Some(x), Some(y)) => !spans_disjoint(&x, &y),
+        _ => false,
+    }
+}
+
+/// 2 つの域がまったく重なっていないか (帯は見ない)。
+fn spans_disjoint(a: &Span, b: &Span) -> bool {
+    let (a0, a1) = a.probe();
+    let (b0, b1) = b.probe();
+    let ((_, lo1), (hi0, _)) = if a0 <= b0 {
+        ((a0, a1), (b0, b1))
+    } else {
+        ((b0, b1), (a0, a1))
+    };
+    lo1 != Span::EOF && hi0 > lo1
+}
+
+/// 交錯している 2 人を、それでも「一撃でマージできる」と言い切ってよいか。
+///
+/// 線の順に並べたとき、**持ち主が変わる境目すべて**に錨 ([`anchor_lines`]) が
+/// 1 本以上あることを要求する。錨が 1 つも無い区間が 1 箇所でもあれば `false`
+/// (**分からない側へ倒す**)。
+///
+/// `anchors` が空 (= 元テキストを読めなかった) なら必ず `false` を返す。
+pub fn interleave_safe(anchors: &[bool], a: &[Span], b: &[Span]) -> bool {
+    if anchors.is_empty() {
+        return false;
+    }
+    let mut all: Vec<(u32, u32, bool)> = Vec::with_capacity(a.len() + b.len());
+    for s in a {
+        let (x, y) = s.probe();
+        all.push((x, y, false));
+    }
+    for s in b {
+        let (x, y) = s.probe();
+        all.push((x, y, true));
+    }
+    all.sort();
+    all.windows(2).all(|w| {
+        let (lo, hi) = (w[0], w[1]);
+        lo.2 == hi.2
+            || anchor_between(
+                anchors,
+                &Span {
+                    start: lo.0,
+                    end: lo.1,
+                },
+                &Span {
+                    start: hi.0,
+                    end: hi.1,
+                },
+            )
+    })
+}
+
 /// 2 つの担当が同時に持てないか。
 ///
 /// * パスが重ならなければ (glob 同士の交差が無ければ) 常に `false`
@@ -487,7 +679,16 @@ pub fn spans_too_close(a: &Span, b: &Span, band: u32) -> bool {
 /// パスの照合は [`crate::lease::overlaps`] を使う — 3 OS のパス正規化と
 /// glob 同士の交差判定は既にそこで実測済みで、**2 実装を持つとズレる**。
 pub fn conflicts(a: &Region, b: &Region, band: u32) -> bool {
-    if !crate::lease::overlaps(&a.path, &b.path) {
+    #[cfg(test)]
+    count::pair();
+    // **同じ文字列は必ず自分自身と重なる。** [`crate::lease::overlaps`] は毎回
+    // パスを正規化してセグメントへ割り、セグメントごとに DP の表
+    // (`vec![false; (n+1)*(m+1)]`) と `Vec<char>` を確保する。実測 (debug) で
+    // **1 回 53µs** — 「同じファイルの違う行」というこの機能で一番多い形が、
+    // まるごとそこを通っていた。照合をやめるのではなく、**答えが自明な場合
+    // だけ飛ばす**ので実装は 1 本のまま。番人は
+    // `tests::同じパスは必ず自分自身と重なる`。
+    if a.path != b.path && !crate::lease::overlaps(&a.path, &b.path) {
         return false;
     }
     match (a.span, b.span) {
@@ -512,21 +713,205 @@ fn is_glob(p: &str) -> bool {
 /// 一覧の中で同時に持てない組を全部出す (添字の組、`i < j`、辞書順)。
 ///
 /// 出力が空であることが、**そのまま「一撃マージできる」証明**になる。
+///
+/// # 総当たりをやめた (実測して二次だったので直した)
+///
+/// 素朴な二重ループは `N` 件で `N(N-1)/2` 回 [`conflicts`] を呼ぶ。1 回の
+/// [`conflicts`] は [`crate::lease::overlaps`] を通るので、**毎回パスを正規化して
+/// セグメントへ割り、セグメントごとに DP の表を確保する**。`tools/region-cost.sh`
+/// の実測 (debug) では、互いに素な 800 件で判定そのものに **9.5 秒**かかり、
+/// その中身は 319,600 回の呼び出しだった。件数を 2 倍にすると 4 倍に伸びる。
+/// 詳しくは `docs/region-cost.md`。
+///
+/// ここでは**答えを 1 つも変えずに**候補を絞る:
+///
+/// 1. パスを 1 回だけ正規化して、**具体パス**と「広いパス」(glob / `#` を含む /
+///    末尾が区切り) に分ける。具体パスどうしは**正規化した文字列が一致する
+///    ときしか重ならない** (`overlaps` のセグメント照合が literal 同士の
+///    一致に潰れる) ので、一致するものだけをバケツにまとめる
+/// 2. バケツの中は開始行で整列して掃く。「まだ安全帯の内側にいる」予約だけを
+///    `active` に残すので、**触る組は実際に衝突する組しか出てこない**
+/// 3. 広いパスはパスの照合が要るので従来どおり総当たり (実運用では 0 件)
+///
+/// 判定そのものは [`conflicts`] のまま呼ぶ — **述語の実装を 2 本持たない**。
+/// 絞り込みは「衝突し得る組の**上位集合**」を出すだけで、最終的な可否は
+/// 必ず [`conflicts`] が決める。等価性は `cost::総当たりと同じ答えを返す` が
+/// 乱択 400 通りで固定している。
+///
+/// 出力そのものが二次になる入力 (全員が同じ行域に重なる) では、当然二次の
+/// ままである。**出力件数に比例する**のが下限で、そこまで落とした。むしろ
+/// そこでは総当たりより遅い。**遅い所は測ってある** (debug, 800 件が全員
+/// 同じ行域に重なる `cost::crowded`):
+///
+/// | 段 | 実測 | 中身 |
+/// |----|------|------|
+/// | 掃引 ([`scan`]) | **127ms** | 判定 319,600 回 (総当たりと同数) |
+/// | 並べ替え | **285ms** | 出力 319,600 組を添字の辞書順へ |
+/// | (総当たり) | 103ms | 判定 319,600 回、整列は不要 |
+///
+/// つまり**遅さの 7 割は最後の並べ替え**で、掃引そのものは総当たりの
+/// 1.23 倍でしかない。掃引は開始行の順に組を出すので添字の順になっておらず、
+/// 出力が二次に膨らむとここだけ `P log P` を払う。
+///
+/// **数え上げ整列で `P + N` へ落とす手は入れていない。** 全件を欲しがる経路は
+/// **互いに素でなかったときの診断** ([`crate::negotiate::Plan::conflict_report`])
+/// だけで、そこは既に「実装のバグが起きた後」だから 0.4 秒を惜しむ理由が無い。
+/// 普通の入力では `out.is_sorted()` が真になって並べ替えごと省かれる
+/// (実測: 互いに素な 800 件で判定 0 回・2.1ms)。
+///
+/// 「空かどうか」しか要らない [`is_disjoint`] は、同じ走査を
+/// **最初の 1 組で降りる**旗付きで呼ぶ (最悪ケースで 319,600 回 → **1 回**)。
+///
+/// 出荷での呼び出し元は `negotiate::cli_allocate` の「計画が互いに素に
+/// なっていません」— **どれとどれがぶつかったのか**を出すためにここを通る
+/// ([`crate::negotiate::Plan::conflict_report`])。
 pub fn conflicting_pairs(list: &[Region], band: u32) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    for i in 0..list.len() {
-        for j in (i + 1)..list.len() {
-            if conflicts(&list[i], &list[j], band) {
-                out.push((i, j));
-            }
-        }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    scan(list, band, false, &mut out);
+    // 掃引は開始行の順に出すので、添字の順にはなっていない。
+    // **既に整列していれば並べ替えない** — 組がほとんど出ない普通の入力では
+    // ここが丸ごと省ける (検査は O(件数)、整列は O(件数 log 件数))。
+    if !out.is_sorted() {
+        out.sort_unstable();
     }
     out
 }
 
+/// 走査の本体。`stop_at_first` が真なら**最初の 1 組を積んだ時点で降りる**。
+///
+/// [`conflicting_pairs`] と [`is_disjoint`] の違いは**この旗だけ**。絞り込みも
+/// 判定 ([`conflicts`]) も 1 実装しかないので、「速い側だけが違う答えを返す」が
+/// 構造的に起こらない (`cost::総当たりと同じ答えを返す` が両方を乱択 400 通りで
+/// 総当たりと突き合わせている)。
+///
+/// 降りても答えは変わらない: [`is_disjoint`] が要るのは**存在するかどうか**
+/// だけで、1 組でも見つかれば残りを数えても結論は動かない。`band = 0` で
+/// 「重なった行域が衝突しない」と出る性質も、判定を [`conflicts`] に任せた
+/// ままなので**そのまま**である。
+fn scan(list: &[Region], band: u32, stop_at_first: bool, out: &mut Vec<(usize, usize)>) {
+    // ① パスを 1 回だけ正規化して分ける。ここが N 回、以前は N² 回だった。
+    let mut wide: Vec<usize> = Vec::new();
+    let mut plain: Vec<Entry> = Vec::new();
+    for (i, r) in list.iter().enumerate() {
+        let norm = crate::lease::normalize_path(&r.path);
+        // `src/` は正規化で `src/**` になる = 生の文字列だけ見ると取り違える。
+        // `#` を含むパスは `overlaps` が仕様として読み直すので、これも広い側へ。
+        if is_glob(&r.path) || is_glob(&norm) || r.path.contains('#') {
+            wide.push(i);
+            continue;
+        }
+        // ファイル全体は「0 行目から EOF まで」として掃引に混ぜる。どの行域より
+        // 手前から始まって永久に生き残るので、同じバケツの全員と組になる
+        // (= `conflicts` が `None` に対して返す答えと同じ)。
+        let (lo, hi) = match r.span {
+            None => (0, Span::EOF),
+            Some(s) => s.probe(),
+        };
+        plain.push(Entry {
+            path: norm,
+            lo,
+            hi,
+            idx: i,
+        });
+    }
+
+    // ② 広いパスは相手が誰であれパスの照合が要る。実運用では 0 件なので、
+    //    ここが二次でも全体の速さは変わらない。
+    for (k, &i) in wide.iter().enumerate() {
+        for &j in wide.iter().skip(k + 1) {
+            if push_if_conflicts(list, i, j, band, out) && stop_at_first {
+                return;
+            }
+        }
+        for e in &plain {
+            if push_if_conflicts(list, i, e.idx, band, out) && stop_at_first {
+                return;
+            }
+        }
+    }
+
+    // ③ 具体パスは「同じファイル」ごとに固めて、開始行の順に掃く。
+    plain.sort_by(|a, b| (&a.path, a.lo, a.hi, a.idx).cmp(&(&b.path, b.lo, b.hi, b.idx)));
+    for bucket in plain.chunk_by(|a, b| a.path == b.path) {
+        if sweep_bucket(bucket, list, band, stop_at_first, out) {
+            return;
+        }
+    }
+}
+
 /// 一覧が互いに素か (= この集合なら衝突し得ない)。
+///
+/// **最初の 1 組で降りる。** 欲しいのは「空かどうか」だけなので全件を数える
+/// 必要が無い。全員が重なる最悪ケース (800 件) で判定は
+/// **319,600 回 → 1 回**、互いに素な 800 件では従来どおり 0 回のまま。
+/// 組そのものが要るとき (= 互いに素でなかったときの診断) は
+/// [`conflicting_pairs`] を使う。
 pub fn is_disjoint(list: &[Region], band: u32) -> bool {
-    conflicting_pairs(list, band).is_empty()
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    scan(list, band, true, &mut out);
+    out.is_empty()
+}
+
+/// 掃引に使う 1 件ぶん。`lo`/`hi` は [`Span::probe`] 済み (挿入点は点として入る)。
+struct Entry {
+    path: String,
+    lo: u32,
+    hi: u32,
+    idx: usize,
+}
+
+/// 添字の順を保ったまま [`conflicts`] へ掛けて、真なら組を積む。
+/// **積んだら `true`** ([`scan`] の早降りはこれを見る)。
+///
+/// 総当たりと**同じ向き** (`i < j`) で呼ぶ。`conflicts` は対称だが、
+/// 向きを揃えておけば「総当たりと 1 バイト違わない」が自明に言える。
+fn push_if_conflicts(
+    list: &[Region],
+    i: usize,
+    j: usize,
+    band: u32,
+    out: &mut Vec<(usize, usize)>,
+) -> bool {
+    let (a, b) = if i < j { (i, j) } else { (j, i) };
+    if conflicts(&list[a], &list[b], band) {
+        out.push((a, b));
+        return true;
+    }
+    false
+}
+
+/// 同じファイルの予約を開始行の順に掃いて、衝突し得る組だけを [`conflicts`] へ渡す。
+///
+/// `active` に残すのは「安全帯の内側にまだ届いている」予約だけ。整列済みなので
+/// 一度死んだものが生き返ることはなく、**取り除きは 1 件につき 1 回**しか起きない
+/// (= 全体で `O(N + 出力件数)`)。
+///
+/// `stop_at_first` が真で 1 組見つかったら **`true` を返して降りる**。
+fn sweep_bucket(
+    bucket: &[Entry],
+    list: &[Region],
+    band: u32,
+    stop_at_first: bool,
+    out: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut active: Vec<usize> = Vec::new();
+    for (k, cur) in bucket.iter().enumerate() {
+        // `gap = cur.lo - hi - 1 < band`  ⇔  `cur.lo <= hi + band`。
+        // EOF まで伸びている予約は必ず重なるので落とさない。
+        // **これは上位集合**であって判定ではない (band = 0 で重なる組を
+        // 拾いすぎるぶんは `conflicts` が落とす)。
+        active.retain(|&p| {
+            let hi = bucket[p].hi;
+            hi == Span::EOF || cur.lo <= hi.saturating_add(band)
+        });
+        for &p in &active {
+            if push_if_conflicts(list, bucket[p].idx, cur.idx, band, out) && stop_at_first {
+                return true;
+            }
+        }
+        active.push(k);
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -549,7 +934,11 @@ const ANCHOR_CANDIDATES: usize = 32;
 /// 単独 `\r` は残すので、ここで念のため剥がす。
 fn lines_of(text: &str) -> Vec<&str> {
     text.lines()
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .map(|l| {
+            #[cfg(test)]
+            count::line();
+            l.strip_suffix('\r').unwrap_or(l)
+        })
         .collect()
 }
 
@@ -648,7 +1037,11 @@ fn best_pair(lines: &[&str], anchor: &Anchor, pref: usize) -> Option<(usize, usi
     let mut cands: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.trim() == anchor.head)
+        .filter(|(_, l)| {
+            #[cfg(test)]
+            count::line();
+            l.trim() == anchor.head
+        })
         .map(|(i, _)| i)
         .collect();
     if cands.is_empty() {
@@ -711,6 +1104,8 @@ fn nearest_unique(lines: &[&str], want: &str, pref: usize, radius: usize) -> Opt
     let mut best_d = usize::MAX;
     let mut tied = false;
     for (i, l) in lines.iter().enumerate().take(hi + 1).skip(lo) {
+        #[cfg(test)]
+        count::line();
         if l.trim() != want {
             continue;
         }
@@ -1242,6 +1637,30 @@ mod tests {
     }
 
     #[test]
+    fn 同じパスは必ず自分自身と重なる() {
+        // `conflicts` は「パスの文字列が同じなら `overlaps` を呼ばない」という
+        // 近道を持つ。その前提 (同じ文字列は必ず重なる) をここで固定する。
+        for p in [
+            "src/a.rs",
+            "SRC/A.RS",
+            "src/*.rs",
+            "src/**/*.rs",
+            "src/d/",
+            "a[b.rs",
+            "a?.rs",
+            "src/./a.rs",
+            "src/x/../a.rs",
+            "src/c.rs#L1-2",
+            "",
+        ] {
+            assert!(
+                crate::lease::overlaps(p, p),
+                "{p:?} が自分自身と重ならない — conflicts の近道が壊れる"
+            );
+        }
+    }
+
+    #[test]
     fn 互いに素な一覧はそのまま証明になる() {
         let list: Vec<Region> = ["src/a.rs#L1-10", "src/a.rs#L14-20", "src/a.rs#L24-30"]
             .iter()
@@ -1654,6 +2073,209 @@ mod tests {
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────────
+    //  周期的な本文 — 帯だけでは足りないことの実測と、錨による手当て
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// 周期 `p` で繰り返すだけの本文 (末尾の 1 行だけが一意)。
+    ///
+    /// 末尾を一意にするのは**実在するファイルの形に寄せるため**で、同時に
+    /// 判定を安定させる。純粋な周期だけの本文は行数によって git の答えが
+    /// 揺れる (周期 6 は 200/300 行で衝突し 400/600 行では通る) が、
+    /// 末尾に一意な行が 1 本あると 200〜600 行のどこでも同じ結果になる。
+    fn periodic(p: usize, n: u32) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let mut s: String = (0..n)
+            .map(|i| format!("{}\n", POOL[(i as usize) % p]))
+            .collect();
+        s.push_str("tail\n");
+        s
+    }
+
+    /// `lines` の各行の末尾へ `tag` を足す (置換 1 行ぶんの変更を複数箇所に置く)。
+    fn touch(base: &str, lines: &[u32], tag: &str) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if lines.contains(&((i + 1) as u32)) {
+                    format!("{l}  <<{tag}>>\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    /// 本文の `at` 行目を「ファイル内で唯一の行」に差し替える。
+    fn plant_anchor(base: &str, at: &[u32]) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                let n = (i + 1) as u32;
+                if at.contains(&n) {
+                    format!("UNIQ-{n}\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    fn spans(lines: &[u32]) -> Vec<Span> {
+        lines.iter().map(|n| Span::line(*n)).collect()
+    }
+
+    /// **帯だけのモデルが破れる組を、実 git で固定する。**
+    ///
+    /// どの組も [`SAFE_BAND`] (3 行) 以上離れているのに `git merge` は衝突する。
+    /// 原因は「片方が相手を上下から挟んでいる (交錯) + 本文が反復的」で、
+    /// **帯を広げても直らない**。ここが赤くなったら、それは git の側が
+    /// 変わったということなので、[`SAFE_BAND`] の doc を測り直すこと。
+    #[test]
+    fn 実gitで周期的な本文では帯を満たしても衝突することを固定する() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("periodic");
+        // (自分の行, 相手の行, 周期)
+        let table: &[(&[u32], &[u32], usize)] = &[
+            (&[17], &[5, 13, 25], 6),
+            (&[17], &[5, 13, 25], 3),
+            (&[17], &[5, 13, 25], 1),
+            (&[44], &[3, 15, 22, 60], 6),
+            (&[50], &[3, 20, 36, 76], 6),
+        ];
+        let mut broke = 0u32;
+        for (ours, theirs, p) in table {
+            let base = periodic(*p, 400);
+            // 前提: どの組も安全帯を満たしている (= 現行モデルは「素」と言う)
+            for a in ours.iter() {
+                for b in theirs.iter() {
+                    assert!(
+                        !spans_too_close(&Span::line(*a), &Span::line(*b), SAFE_BAND),
+                        "前提が崩れている: {a} と {b} は帯 {SAFE_BAND} を満たすはず"
+                    );
+                }
+            }
+            let o = touch(&base, ours, "OURS");
+            let t = touch(&base, theirs, "THEIRS");
+            let Some(hit) = lab.merge_tree(&base, &o, &t) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            if hit {
+                broke += 1;
+                // 帯は満たしているが、錨が 1 本も無いので言い切ってはいけない組
+                let anchors = anchor_lines(&base);
+                assert!(
+                    !interleave_safe(&anchors, &spans(ours), &spans(theirs)),
+                    "衝突した組を interleave_safe が通してしまった: {ours:?} / {theirs:?} 周期{p}"
+                );
+            }
+        }
+        assert!(
+            broke > 0,
+            "周期的な本文で 1 件も衝突しないなら、この穴の前提が変わっている"
+        );
+    }
+
+    /// **錨を 1 本置くと同じ組が綺麗に通る** — 手当てが効くことを実 git で確かめる。
+    #[test]
+    fn 実gitで錨を一本置けば同じ組が通る() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("periodic-anchor");
+        let table: &[(&[u32], &[u32], &[u32], usize)] = &[
+            (&[17], &[5, 13, 25], &[9, 15, 21], 6),
+            (&[17], &[5, 13, 25], &[9, 15, 21], 1),
+            (&[44], &[3, 15, 22, 60], &[9, 19, 33, 52], 6),
+            (&[50], &[3, 20, 36, 76], &[11, 28, 43, 63], 6),
+        ];
+        for (ours, theirs, planted, p) in table {
+            let base = plant_anchor(&periodic(*p, 400), planted);
+            let anchors = anchor_lines(&base);
+            assert!(
+                interleave_safe(&anchors, &spans(ours), &spans(theirs)),
+                "錨を置いたのに通していない: {ours:?} / {theirs:?}"
+            );
+            let o = touch(&base, ours, "OURS");
+            let t = touch(&base, theirs, "THEIRS");
+            let Some(hit) = lab.merge_tree(&base, &o, &t) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            assert!(!hit, "錨があるのに衝突した: {ours:?} / {theirs:?} 周期{p}");
+        }
+    }
+
+    #[test]
+    fn 錨はファイル内で唯一の行だけ() {
+        let a = anchor_lines("alpha\nsame\nbeta\nsame\n");
+        assert_eq!(a, vec![true, false, true, false]);
+        // CRLF でも同じ答え
+        assert_eq!(anchor_lines("alpha\r\nsame\r\nbeta\r\nsame\r\n"), a);
+        assert!(anchor_lines("").is_empty());
+    }
+
+    #[test]
+    fn 錨は域の間にあるものだけを数える() {
+        // 1:uniq 2:same 3:uniq2 4:same
+        let a = anchor_lines("u1\nsame\nu2\nsame\nu3\nsame\n");
+        // [1,1] と [3,3] の間は 2 行目 (same) だけ → 錨なし
+        assert!(!anchor_between(&a, &Span::line(1), &Span::line(3)));
+        // [1,1] と [5,5] の間は 2,3,4 行目 → 3 行目が錨
+        assert!(anchor_between(&a, &Span::line(1), &Span::line(5)));
+        // 引数の順を入れ替えても同じ
+        assert!(anchor_between(&a, &Span::line(5), &Span::line(1)));
+        // 隣接していれば「間」は空
+        assert!(!anchor_between(&a, &Span::line(1), &Span::line(2)));
+        // EOF まで伸びる域は壁を数えられない
+        assert!(!anchor_between(
+            &a,
+            &Span {
+                start: 1,
+                end: Span::EOF
+            },
+            &Span::line(5)
+        ));
+    }
+
+    #[test]
+    fn 外接域と交錯の判定() {
+        assert_eq!(hull(&spans(&[10, 3, 25])), Some(Span { start: 3, end: 25 }));
+        assert_eq!(hull(&[]), None);
+        // EOF が混ざれば外接域も EOF まで
+        assert_eq!(
+            hull(&[
+                Span::line(3),
+                Span {
+                    start: 9,
+                    end: Span::EOF
+                }
+            ]),
+            Some(Span {
+                start: 3,
+                end: Span::EOF
+            })
+        );
+        // 挟んでいる = 交錯
+        assert!(interleaved(&spans(&[5, 25]), &spans(&[17])));
+        assert!(interleaved(&spans(&[17]), &spans(&[5, 25])));
+        // 上下に分かれていれば交錯ではない
+        assert!(!interleaved(&spans(&[5, 9]), &spans(&[17, 25])));
+        // 片方が空なら交錯しようがない
+        assert!(!interleaved(&[], &spans(&[17])));
+    }
+
+    #[test]
+    fn 錨が読めなければ交錯は通さない() {
+        // 元テキストを読めなかった (= 錨が空) ときは必ず断る (fail-closed)
+        assert!(!interleave_safe(&[], &spans(&[5, 25]), &spans(&[17])));
+    }
+
     /// 「近すぎる」と「実際に衝突する」の差を、変更の種類と間隔ごとに数える。
     ///
     /// 実測ベンチ (64 体が 1 ファイル 2000 行へぶつかる条件) では
@@ -1939,23 +2561,25 @@ mod tests {
         let r = region_at(&text, span);
         assert_eq!(r.anchor.head, "fn f5000() {");
         let shifted = format!("// a\n// b\n// c\n{text}");
-        let mut best = std::time::Duration::from_secs(3600);
-        for _ in 0..5 {
-            let t0 = std::time::Instant::now();
-            let got = resolve(&r, &shifted);
-            best = best.min(t0.elapsed());
-            assert_eq!(
-                got,
-                Some(Span {
-                    start: 20_004,
-                    end: 20_006
-                })
-            );
-        }
-        // O(n) なので 4 万行でも数 ms。負荷で揺れるので**最小値**で判定する
+        count::reset();
+        let got = resolve(&r, &shifted);
+        let visits = count::lines();
+        assert_eq!(
+            got,
+            Some(Span {
+                start: 20_004,
+                end: 20_006
+            })
+        );
+        // **絶対時間で線を引かない。** 以前ここは `300ms 未満` だったが、
+        // その線は Docker の仮想 FS でも他テストとの同時実行でも簡単に嘘をつく
+        // (実際に別のテストで 3 件落ちた)。守りたいのは「行数に比例した仕事しか
+        // しない」という**構造**なので、**行の内容を比べた回数**で見る。
+        // 内訳は「先頭候補を集める全走査 1 回」+「末尾を半径 256 で探すぶん」。
+        let lines = shifted.lines().count() as u64;
         assert!(
-            best < std::time::Duration::from_millis(300),
-            "resolve が遅すぎる (4 万行で {best:?}) — 線形を超えていないか疑う"
+            visits <= 4 * lines,
+            "resolve が {visits} 回も行を比べた ({lines} 行) — 線形を超えていないか疑う"
         );
     }
 
@@ -2210,5 +2834,876 @@ const MAX: u32 = 3;
         let c = resolve_spec(&parse_spec("a.rs#struct:Region").unwrap(), SAMPLE).unwrap();
         // Region と Span の間は 1 行しか空いていない → 安全帯に入らない
         assert!(conflicts(&c, &b, SAFE_BAND));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  行域判定の費用 — ハーネスと分けて測る (プロセス内マイクロベンチ + 番人)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## なぜ別に要るのか
+//
+// `tools/coedit-bench.sh` / `tools/conflict-zero-bench.sh` は一時リポジトリを
+// 作り、git を起こし、`zai` を何十回も起動する。そこで出る数字の**大半は
+// ハーネスの費用**で、「行域判定そのものが速いのか遅いのか」は 1 ミリも見えない。
+//
+// ここは外部プロセス・git・ファイル I/O を 1 つも含まない。**同じ入力の生成を
+// 「判定あり」と「空の判定」の両方で回して差を取る**ことで、入力を作る費用と
+// 判定そのものの費用を分ける:
+//
+//   total   = 入力を作る + 判定する
+//   harness = 入力を作る + 空 (0 件) を判定する
+//   judge   = total - harness      ← これが知りたかった数字
+//
+// ## 合否は時間で決めない
+//
+// 表に出す時間は**数字として出すだけ**で、赤にするかどうかは
+// [`count`] の**呼び出し回数**で決める。絶対時間の線は Docker の仮想 FS でも
+// 他テストとの同時実行でも簡単に嘘をつく。
+#[cfg(test)]
+mod cost {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  入力を作る (決定的。依存を 1 つも増やさない)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// xorshift64*。外部クレートを足さずに決定的な擬似乱数を得る。
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn upto(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next_u64() % n
+            }
+        }
+    }
+
+    /// 1 ファイルあたりの予約数。64 体が数ファイルを分け合う実運用に近い密度。
+    const PER_FILE: usize = 16;
+
+    /// **互いに素**な予約を `n` 件。衝突は 1 件も出ない (出力 0)。
+    /// 実運用で `Plan::is_disjoint` が通る形そのもの。
+    fn disjoint(n: usize, band: u32) -> Vec<Region> {
+        let step = 8 + band as usize + 1;
+        (0..n)
+            .map(|i| {
+                let start = ((i % PER_FILE) * step + 1) as u32;
+                Region {
+                    path: format!("src/gen/f{}.rs", i / PER_FILE),
+                    span: Some(Span {
+                        start,
+                        end: start + 5,
+                    }),
+                    anchor: Anchor::default(),
+                }
+            })
+            .collect()
+    }
+
+    /// **2 件ずつが必ず衝突する**並べ方。出力は `n/2` 件 = 件数に比例する。
+    /// 「出力も判定回数も線形」な、伸びを見るのにいちばん素直な土俵。
+    fn couples(n: usize, band: u32) -> Vec<Region> {
+        (0..n)
+            .map(|i| {
+                let k = i % PER_FILE;
+                let base = ((k / 2) * (40 + band as usize)) as u32;
+                let start = base + 1 + if k.is_multiple_of(2) { 0 } else { 4 };
+                Region {
+                    path: format!("src/gen/f{}.rs", i / PER_FILE),
+                    span: Some(Span {
+                        start,
+                        end: start + 5,
+                    }),
+                    anchor: Anchor::default(),
+                }
+            })
+            .collect()
+    }
+
+    /// **全員が同じ行域に重なる**最悪ケース。出力そのものが `n(n-1)/2` 件になる。
+    /// ここは何をしても二次 — 出力件数が下限だからで、それを正直に出す。
+    fn crowded(n: usize) -> Vec<Region> {
+        (0..n)
+            .map(|i| Region {
+                path: "src/gen/hot.rs".to_string(),
+                span: Some(Span {
+                    start: 1 + (i % 4) as u32,
+                    end: 60,
+                }),
+                anchor: Anchor::default(),
+            })
+            .collect()
+    }
+
+    /// 4 行周期の合成ソース。`}` と空行が全体の半分を占める = 錨の最悪ケース。
+    fn make_text(lines: usize) -> String {
+        let mut s = String::with_capacity(lines * 20);
+        for i in 0..lines {
+            match i % 4 {
+                0 => s.push_str(&format!("fn f{i}() {{\n")),
+                1 => s.push_str(&format!("    let x = {i};\n")),
+                2 => s.push_str("}\n"),
+                _ => s.push('\n'),
+            }
+        }
+        s
+    }
+
+    /// 真ん中あたりの `fn` から 3 行の域を、錨付きで作る。
+    fn anchored(text: &str, lines: usize) -> (Region, Span) {
+        let k = (lines / 8) * 4; // 4 行周期なので `fn` の行 (0 起点)
+        let span = Span {
+            start: (k + 1) as u32,
+            end: (k + 3) as u32,
+        };
+        let r = Region {
+            path: "src/gen/mid.rs".to_string(),
+            span: Some(span),
+            anchor: capture_anchor(text, &span),
+        };
+        (r, span)
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  置き換える前の実装 — 数字を「前後とも」出すために残す
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// 総当たり版の [`conflicting_pairs`]。`N(N-1)/2` 回 [`conflicts`] を呼ぶ。
+    fn naive_pairs(list: &[Region], band: u32) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for i in 0..list.len() {
+            for j in (i + 1)..list.len() {
+                if conflicts(&list[i], &list[j], band) {
+                    out.push((i, j));
+                }
+            }
+        }
+        out
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  計測
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// `iters` 回のうち**最小**を採る。平均は負荷の山を拾うが、最小は
+    /// 「邪魔が入らなかった 1 回」にいちばん近い。
+    fn best_of<T>(iters: u32, mut f: impl FnMut() -> T) -> Duration {
+        let mut best = Duration::MAX;
+        for _ in 0..iters.max(1) {
+            let t0 = Instant::now();
+            let out = std::hint::black_box(f());
+            best = best.min(t0.elapsed());
+            drop(out); // 解放は計測の外 (どの経路でも同じだけ払う)
+        }
+        best
+    }
+
+    /// 1 行ぶんの結果。時間はナノ秒、回数は実測。
+    struct Row {
+        case: String,
+        axis: &'static str,
+        n: usize,
+        band: u32,
+        harness_ns: u128,
+        total_ns: u128,
+        naive_total_ns: u128,
+        naive_iters: u32,
+        out_pairs: usize,
+        judgements: u64,
+        naive_judgements: u64,
+    }
+
+    impl Row {
+        fn judge_ns(&self) -> u128 {
+            self.total_ns.saturating_sub(self.harness_ns)
+        }
+        fn naive_judge_ns(&self) -> u128 {
+            self.naive_total_ns.saturating_sub(self.harness_ns)
+        }
+        fn harness_pct(&self) -> f64 {
+            if self.total_ns == 0 {
+                return 0.0;
+            }
+            self.harness_ns as f64 * 100.0 / self.total_ns as f64
+        }
+    }
+
+    /// 予約一覧の判定を測る。**答えが総当たりと一致することも同時に確かめる**
+    /// (速い版だけが走って静かに間違える、をここで潰す)。
+    fn measure_pairs(
+        case: &str,
+        n: usize,
+        band: u32,
+        iters: u32,
+        want_naive: bool,
+        build: &dyn Fn() -> Vec<Region>,
+    ) -> Row {
+        let harness = best_of(iters, || {
+            let input = build();
+            let p = conflicting_pairs(&[], band);
+            (input, p)
+        });
+        let total = best_of(iters, || {
+            let input = build();
+            let p = conflicting_pairs(&input, band);
+            (input, p)
+        });
+        // 総当たりは `n(n-1)/2` 回の判定になる。debug ビルドでは 800 件で
+        // **17 秒**かかるので、大きいところは繰り返しを 1 回に落とす
+        // (最小値を採る意味は薄れるが、桁は動かない)。何回回したかは JSON に出す。
+        let naive_iters = if !want_naive {
+            0
+        } else if n.saturating_mul(n.saturating_sub(1)) / 2 > 50_000 {
+            1
+        } else {
+            iters
+        };
+        let naive = if naive_iters == 0 {
+            Duration::ZERO
+        } else {
+            best_of(naive_iters, || {
+                let input = build();
+                let p = naive_pairs(&input, band);
+                (input, p)
+            })
+        };
+
+        let input = build();
+        count::reset();
+        let fast_out = conflicting_pairs(&input, band);
+        let judgements = count::pairs();
+        count::reset();
+        let naive_out = naive_pairs(&input, band);
+        let naive_judgements = count::pairs();
+        // **速い版だけが走って静かに間違える**をここで潰す。回数の照合は
+        // 時間の計測と別に必ず 1 回やる (計測を飛ばした段でも)。
+        assert_eq!(
+            fast_out, naive_out,
+            "{case} n={n} band={band}: 掃引と総当たりで答えが違う"
+        );
+        assert_eq!(
+            naive_judgements,
+            (n * n.saturating_sub(1) / 2) as u64,
+            "総当たりの呼び出し回数が N(N-1)/2 でない"
+        );
+
+        Row {
+            case: case.to_string(),
+            axis: "regions",
+            n,
+            band,
+            harness_ns: harness.as_nanos(),
+            total_ns: total.as_nanos(),
+            naive_total_ns: naive.as_nanos(),
+            naive_iters,
+            out_pairs: fast_out.len(),
+            judgements,
+            naive_judgements,
+        }
+    }
+
+    /// [`is_disjoint`] を測る。
+    ///
+    /// 対照 (`naive_*` 欄) は**この早降りを入れる前の実装** =
+    /// 「全件を列挙してから空かを見る」。前と後が同じ表に並ぶので、
+    /// 「消えた」を数字で示せる。
+    fn measure_is_disjoint(
+        case: &str,
+        n: usize,
+        band: u32,
+        iters: u32,
+        build: &dyn Fn() -> Vec<Region>,
+    ) -> Row {
+        let harness = best_of(iters, || {
+            let input = build();
+            let v = is_disjoint(&[], band);
+            (input, v)
+        });
+        let total = best_of(iters, || {
+            let input = build();
+            let v = is_disjoint(&input, band);
+            (input, v)
+        });
+        // 前の実装は最悪ケース (800 件) で debug 0.4 秒。大きいところは
+        // 繰り返しを 1 回に落とす (最小値を採る意味は薄れるが桁は動かない)。
+        let before_iters = if n > 400 { 1 } else { iters };
+        let before = best_of(before_iters, || {
+            let input = build();
+            let v = conflicting_pairs(&input, band).is_empty();
+            (input, v)
+        });
+
+        let input = build();
+        count::reset();
+        let got = is_disjoint(&input, band);
+        let judgements = count::pairs();
+        count::reset();
+        let all = conflicting_pairs(&input, band);
+        let before_judgements = count::pairs();
+        // **早降りが答えを変えていない**ことを、計測のたびに確かめる。
+        assert_eq!(
+            got,
+            all.is_empty(),
+            "{case} n={n} band={band}: 早降りが答えを変えた"
+        );
+
+        Row {
+            case: case.to_string(),
+            axis: "regions",
+            n,
+            band,
+            harness_ns: harness.as_nanos(),
+            total_ns: total.as_nanos(),
+            naive_total_ns: before.as_nanos(),
+            naive_iters: before_iters,
+            out_pairs: all.len(),
+            judgements,
+            naive_judgements: before_judgements,
+        }
+    }
+
+    /// テキスト側 (錨の取り直し / 錨打ち / 触れた行域) を測る。
+    /// `judge` が本番、`empty` が「同じ入力を作って**空を判定**する」対照。
+    fn measure_text(
+        case: &str,
+        lines: usize,
+        iters: u32,
+        judge: &dyn Fn(&str) -> u64,
+        empty: &dyn Fn(&str) -> u64,
+    ) -> Row {
+        let harness = best_of(iters, || {
+            let t = make_text(lines);
+            let v = empty(&t);
+            (t, v)
+        });
+        let total = best_of(iters, || {
+            let t = make_text(lines);
+            let v = judge(&t);
+            (t, v)
+        });
+        let t = make_text(lines);
+        count::reset();
+        let _ = judge(&t);
+        let judgements = count::lines();
+        Row {
+            case: case.to_string(),
+            axis: "lines",
+            n: lines,
+            band: SAFE_BAND,
+            harness_ns: harness.as_nanos(),
+            total_ns: total.as_nanos(),
+            naive_total_ns: 0,
+            naive_iters: 0,
+            out_pairs: 0,
+            judgements,
+            naive_judgements: 0,
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  番人 — 合否はすべて「回数」で決める (時間では決めない)
+    // ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn 総当たりと同じ答えを返す() {
+        // glob / `#` 付き / 大小違い / `./` / 末尾スラッシュ / 空パス、
+        // 全体・挿入点・EOF まで・普通の域を混ぜて乱択で突き合わせる。
+        let mut rng = Rng::new(0x5eed_2024);
+        let paths = [
+            "src/a.rs",
+            "src/b.rs",
+            "SRC/A.RS",
+            "src/./a.rs",
+            "src/x/../a.rs",
+            "src/*.rs",
+            "src/**/*.rs",
+            "src/c.rs#L1-2",
+            "src/d/",
+            "",
+        ];
+        for round in 0..400u32 {
+            let n = 2 + rng.upto(18) as usize;
+            let band = rng.upto(5) as u32;
+            let list: Vec<Region> = (0..n)
+                .map(|_| {
+                    let p = paths[rng.upto(paths.len() as u64) as usize];
+                    let start = 1 + rng.upto(40) as u32;
+                    let span = match rng.upto(5) {
+                        0 => None,
+                        1 => Some(Span::insert_before(start)),
+                        2 => Some(Span {
+                            start,
+                            end: Span::EOF,
+                        }),
+                        3 => Some(Span::line(start)),
+                        _ => Some(Span {
+                            start,
+                            end: start + rng.upto(10) as u32,
+                        }),
+                    };
+                    Region {
+                        path: p.to_string(),
+                        span,
+                        anchor: Anchor::default(),
+                    }
+                })
+                .collect();
+            let naive = naive_pairs(&list, band);
+            assert_eq!(
+                conflicting_pairs(&list, band),
+                naive,
+                "round={round} band={band} list={list:?}"
+            );
+            // `is_disjoint` は最初の 1 組で降りる別経路なので、別に突き合わせる。
+            assert_eq!(
+                is_disjoint(&list, band),
+                naive.is_empty(),
+                "round={round} band={band} で is_disjoint が食い違う list={list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 件数を二倍にしても判定回数は二倍までしか増えない() {
+        // **時間ではなく回数**を見る。時間は負荷で必ず嘘をつく。
+        let band = SAFE_BAND;
+        let mut prev: Option<(usize, u64)> = None;
+        for n in [100usize, 200, 400, 800] {
+            let list = couples(n, band);
+            count::reset();
+            let out = conflicting_pairs(&list, band);
+            let cmp = count::pairs();
+            assert_eq!(out.len(), n / 2, "並べ方の前提が崩れている (n={n})");
+            assert!(
+                cmp <= 4 * n as u64,
+                "n={n} で判定 {cmp} 回 (総当たりなら {} 回)",
+                n * (n - 1) / 2
+            );
+            if let Some((pn, pc)) = prev {
+                assert!(pc > 0, "判定回数が 0 では伸びを測れない");
+                let grow = cmp as f64 / pc as f64;
+                assert!(
+                    grow <= 2.5,
+                    "{pn} → {n} 件で判定回数が {grow:.2} 倍 (総当たりなら 4 倍。二次を疑う)"
+                );
+            }
+            prev = Some((n, cmp));
+        }
+    }
+
+    #[test]
+    fn 互いに素な一覧では総当たりの一パーセントも判定しない() {
+        let band = SAFE_BAND;
+        let n = 800usize;
+        let list = disjoint(n, band);
+        count::reset();
+        let out = conflicting_pairs(&list, band);
+        let cmp = count::pairs();
+        assert!(out.is_empty(), "互いに素なのに {} 組出た", out.len());
+        let naive = (n * (n - 1) / 2) as u64;
+        assert!(
+            cmp * 100 < naive,
+            "判定 {cmp} 回 / 総当たり {naive} 回 — 絞り込みが効いていない"
+        );
+    }
+
+    #[test]
+    fn 互いに素かの判定は最初の一組で降りる() {
+        // **合否は回数で決める。** 時間は負荷で必ず嘘をつく。
+        for n in [100usize, 200, 400, 800] {
+            // (1) 全員が重なる最悪ケース。全件を数えると N(N-1)/2 回。
+            let list = crowded(n);
+            count::reset();
+            assert!(!is_disjoint(&list, SAFE_BAND), "重なっているのに互いに素");
+            let stop = count::pairs();
+            count::reset();
+            let all = conflicting_pairs(&list, SAFE_BAND);
+            let full = count::pairs();
+            assert_eq!(
+                stop, 1,
+                "n={n} で判定 {stop} 回 (最初の 1 組で降りていない。全件版は {full} 回)"
+            );
+            assert_eq!(full as usize, all.len(), "全件版の回数が出力件数と合わない");
+
+            // (2) 2 件ずつ衝突する並べ方。件数が増えても回数は増えない。
+            let list = couples(n, SAFE_BAND);
+            count::reset();
+            assert!(!is_disjoint(&list, SAFE_BAND));
+            let stop = count::pairs();
+            assert!(stop <= 2, "n={n} で判定 {stop} 回 (件数に連れて増えている)");
+
+            // (3) 互いに素なら降りる先が無いので、全件版と同じ回数のまま。
+            let list = disjoint(n, SAFE_BAND);
+            count::reset();
+            assert!(is_disjoint(&list, SAFE_BAND));
+            let stop = count::pairs();
+            count::reset();
+            let _ = conflicting_pairs(&list, SAFE_BAND);
+            let full = count::pairs();
+            assert_eq!(stop, full, "n={n}: 互いに素な入力で回数が変わった");
+        }
+    }
+
+    #[test]
+    fn 全員が重なる最悪ケースでも出力件数までしか判定しない() {
+        // ここは何をしても二次。**出力そのものが二次だから**で、
+        // 「出力件数 + 件数」を超えないことだけを固定する。
+        for n in [50usize, 100, 200] {
+            let list = crowded(n);
+            count::reset();
+            let out = conflicting_pairs(&list, SAFE_BAND);
+            let cmp = count::pairs();
+            assert_eq!(out.len(), n * (n - 1) / 2, "重なりの前提が崩れている");
+            assert!(
+                cmp <= out.len() as u64 + n as u64,
+                "n={n}: 判定 {cmp} 回 > 出力 {} 件 + {n}",
+                out.len()
+            );
+        }
+    }
+
+    #[test]
+    fn 錨の取り直しにかかる行の比較は行数に比例する() {
+        let mut prev: Option<(usize, u64)> = None;
+        for lines in [4_000usize, 8_000, 16_000, 32_000] {
+            let text = make_text(lines);
+            let (r, want) = anchored(&text, lines);
+            count::reset();
+            let got = resolve(&r, &text);
+            let visits = count::lines();
+            assert_eq!(got, Some(want), "{lines} 行で取り直せなかった");
+            assert!(
+                visits <= 4 * lines as u64,
+                "{lines} 行で {visits} 回の行比較 — 線形を超えていないか疑う"
+            );
+            if let Some((pl, pv)) = prev {
+                assert!(pv > 0);
+                let grow = visits as f64 / pv as f64;
+                assert!(
+                    grow <= 2.5,
+                    "{pl} → {lines} 行で行比較が {grow:.2} 倍 (線形を超えた)"
+                );
+            }
+            prev = Some((lines, visits));
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  計測本体 (`tools/region-cost.sh` から起こす)
+    // ───────────────────────────────────────────────────────────────────────
+
+    fn env_list(key: &str, fallback: &str) -> Vec<usize> {
+        let raw = std::env::var(key).unwrap_or_else(|_| fallback.to_string());
+        let v: Vec<usize> = raw
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .collect();
+        if v.is_empty() {
+            return fallback
+                .split(',')
+                .filter_map(|t| t.parse::<usize>().ok())
+                .collect();
+        }
+        v
+    }
+
+    fn json_rows(rows: &[Row]) -> String {
+        let mut s = String::new();
+        for (i, r) in rows.iter().enumerate() {
+            if i > 0 {
+                s.push_str(",\n");
+            }
+            s.push_str(&format!(
+                concat!(
+                    "    {{\"case\": \"{}\", \"axis\": \"{}\", \"n\": {}, \"band\": {}, ",
+                    "\"total_ns\": {}, \"harness_ns\": {}, \"judge_ns\": {}, \"harness_pct\": {:.1}, ",
+                    "\"naive_total_ns\": {}, \"naive_judge_ns\": {}, \"naive_iters\": {}, ",
+                    "\"out_pairs\": {}, \"judgements\": {}, \"naive_judgements\": {}}}"
+                ),
+                r.case,
+                r.axis,
+                r.n,
+                r.band,
+                r.total_ns,
+                r.harness_ns,
+                r.judge_ns(),
+                r.harness_pct(),
+                r.naive_total_ns,
+                r.naive_judge_ns(),
+                r.naive_iters,
+                r.out_pairs,
+                r.judgements,
+                r.naive_judgements,
+            ));
+        }
+        s
+    }
+
+    /// 同じ `case` の中で、軸を 2 倍にしたときの伸びを出す。
+    /// **二次かどうかは回数で決める** — 時間は情報として並べるだけ。
+    fn json_growth(rows: &[Row]) -> (String, bool) {
+        let mut s = String::new();
+        let mut first = true;
+        let mut all_linear = true;
+        for w in rows.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.case != b.case || b.n <= a.n {
+                continue;
+            }
+            let size = b.n as f64 / a.n as f64;
+            let cnt = if a.judgements == 0 {
+                0.0
+            } else {
+                b.judgements as f64 / a.judgements as f64
+            };
+            let tim = if a.judge_ns() == 0 {
+                0.0
+            } else {
+                b.judge_ns() as f64 / a.judge_ns() as f64
+            };
+            // 出力そのものが二次な土俵 (crowded) は、判定も二次で正しい。
+            let output_bound = b.out_pairs > b.n * 2;
+            let quadratic = cnt > size * 1.25 && !output_bound;
+            if quadratic {
+                all_linear = false;
+            }
+            if !first {
+                s.push_str(",\n");
+            }
+            first = false;
+            s.push_str(&format!(
+                concat!(
+                    "    {{\"case\": \"{}\", \"from\": {}, \"to\": {}, \"size_ratio\": {:.2}, ",
+                    "\"judgement_ratio\": {:.2}, \"judge_time_ratio\": {:.2}, ",
+                    "\"output_bound\": {}, \"quadratic\": {}}}"
+                ),
+                a.case, a.n, b.n, size, cnt, tim, output_bound, quadratic
+            ));
+        }
+        (s, all_linear)
+    }
+
+    #[test]
+    fn 行域判定の費用を測る() {
+        if std::env::var("ZAIVERN_REGION_COST").is_err() {
+            println!(
+                "REGION-COST-SKIP ZAIVERN_REGION_COST が未設定なので計測は飛ばす \
+                 (tools/region-cost.sh から起こす)"
+            );
+            return;
+        }
+        let sizes = env_list("ZAIVERN_REGION_COST_SIZES", "100,200,400,800");
+        let line_sizes = env_list("ZAIVERN_REGION_COST_LINES", "2000,4000,8000,16000");
+        let iters = env_list("ZAIVERN_REGION_COST_ITERS", "5")
+            .first()
+            .copied()
+            .unwrap_or(5) as u32;
+
+        let mut rows: Vec<Row> = Vec::new();
+
+        // (a) 件数 N を 2 倍にしたときの伸び
+        for &n in &sizes {
+            rows.push(measure_pairs(
+                "pairs.disjoint",
+                n,
+                SAFE_BAND,
+                iters,
+                true,
+                &move || disjoint(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_pairs(
+                "pairs.couples",
+                n,
+                SAFE_BAND,
+                iters,
+                true,
+                &move || couples(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_pairs(
+                "pairs.crowded",
+                n,
+                SAFE_BAND,
+                iters,
+                true,
+                &move || crowded(n),
+            ));
+        }
+
+        // (a') 「空かどうか」だけ知りたい経路 (`is_disjoint`)。
+        //      `naive_*` 欄は**早降りを入れる前の実装** = 全件を列挙してから
+        //      空かを見る。x 欄がそのまま「何倍速くなったか」になる。
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.disjoint",
+                n,
+                SAFE_BAND,
+                iters,
+                &move || disjoint(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.couples",
+                n,
+                SAFE_BAND,
+                iters,
+                &move || couples(n, SAFE_BAND),
+            ));
+        }
+        for &n in &sizes {
+            rows.push(measure_is_disjoint(
+                "check.crowded",
+                n,
+                SAFE_BAND,
+                iters,
+                &move || crowded(n),
+            ));
+        }
+
+        // (c) 帯幅 — 帯を広げると「近すぎる」組が増える
+        let band_n = *sizes.last().unwrap_or(&800);
+        for band in [0u32, MERGE_ONLY_BAND, SAFE_BAND, 8, 32] {
+            // 総当たりはここでは測らない — 入力も件数も上の段と同じで、
+            // 5 回分の再計測 (debug で 1 回 17 秒) を払う価値が無い。
+            rows.push(measure_pairs(
+                "pairs.band",
+                band_n,
+                band,
+                iters,
+                false,
+                &move || couples(band_n, SAFE_BAND),
+            ));
+        }
+
+        // (b) 1 ファイルあたりの行数
+        for &l in &line_sizes {
+            // 錨は**計測の外**で打つ。中で打つと `capture_anchor` の費用が
+            // `resolve` の数字に混ざる (実測でちょうど 1 走査ぶん上乗せされた)。
+            let pre = make_text(l);
+            let (anchored_region, _) = anchored(&pre, l);
+            // 錨が空の域は**その場で返る** = 同じ入力に対する「空の判定」。
+            let blank = Region {
+                path: "src/gen/mid.rs".to_string(),
+                span: Some(Span { start: 1, end: 3 }),
+                anchor: Anchor::default(),
+            };
+            rows.push(measure_text(
+                "text.resolve",
+                l,
+                iters,
+                &|t| resolve(&anchored_region, t).map_or(0, |s| s.start as u64),
+                &|t| resolve(&blank, t).map_or(0, |s| s.start as u64),
+            ));
+        }
+        for &l in &line_sizes {
+            rows.push(measure_text(
+                "text.anchor",
+                l,
+                iters,
+                &move |t| capture_anchor(t, &Span { start: 2, end: 5 }).len as u64,
+                &move |_| capture_anchor("", &Span { start: 2, end: 5 }).len as u64,
+            ));
+        }
+        for &l in &line_sizes {
+            rows.push(measure_text(
+                "text.touched",
+                l,
+                iters,
+                &move |t| {
+                    let edited = t.replacen("let x = ", "let y = ", 1);
+                    touched_spans(t, &edited, SAFE_BAND).len() as u64
+                },
+                &move |_| touched_spans("", "", SAFE_BAND).len() as u64,
+            ));
+        }
+
+        let (growth, all_linear) = json_growth(&rows);
+
+        // ── 表 (人が読む) ────────────────────────────────────────────────
+        println!("REGION-COST-TABLE-BEGIN");
+        println!(
+            "{:<16} {:>6} {:>4} {:>10} {:>9} {:>10} {:>6} {:>11} {:>6} {:>8} {:>10} {:>11}",
+            "case",
+            "n",
+            "band",
+            "total_us",
+            "harness",
+            "judge_us",
+            "har_%",
+            "naive_us",
+            "x",
+            "out",
+            "judged",
+            "naive_jdg"
+        );
+        for r in &rows {
+            let sp = if r.judge_ns() > 0 && r.naive_judge_ns() > 0 {
+                format!("{:.1}", r.naive_judge_ns() as f64 / r.judge_ns() as f64)
+            } else {
+                "-".to_string()
+            };
+            let naive_us = if r.naive_total_ns > 0 {
+                format!("{:.1}", r.naive_judge_ns() as f64 / 1000.0)
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<16} {:>6} {:>4} {:>10.1} {:>9.1} {:>10.1} {:>5.1}% {:>11} {:>6} {:>8} {:>10} {:>11}",
+                r.case,
+                r.n,
+                r.band,
+                r.total_ns as f64 / 1000.0,
+                r.harness_ns as f64 / 1000.0,
+                r.judge_ns() as f64 / 1000.0,
+                r.harness_pct(),
+                naive_us,
+                sp,
+                r.out_pairs,
+                r.judgements,
+                r.naive_judgements,
+            );
+        }
+        println!("REGION-COST-TABLE-END");
+
+        // ── JSON (機械が読む) ────────────────────────────────────────────
+        println!("REGION-COST-JSON-BEGIN");
+        println!("{{");
+        println!("  \"safe_band\": {SAFE_BAND},");
+        println!("  \"merge_only_band\": {MERGE_ONLY_BAND},");
+        println!("  \"iters\": {iters},");
+        println!("  \"cases\": [");
+        println!("{}", json_rows(&rows));
+        println!("  ],");
+        println!("  \"growth\": [");
+        println!("{growth}");
+        println!("  ],");
+        println!("  \"linear\": {all_linear}");
+        println!("}}");
+        println!("REGION-COST-JSON-END");
+
+        assert!(
+            all_linear,
+            "件数を 2 倍にしたときの判定回数が 2 倍を超えた (出力が二次な土俵を除く)"
+        );
     }
 }

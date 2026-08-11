@@ -25,9 +25,7 @@ use crate::i18n::{tr, trf};
 use crate::theme::Theme;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -901,19 +899,12 @@ pub fn storage_dir() -> PathBuf {
     crate::config::zaivern_dir().join("bookmarks")
 }
 
-/// ワークスペース → 安定キー (`session.rs` と同じ流儀)。
-fn workspace_key(workspace: &Path) -> String {
-    let canonical = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let mut h = DefaultHasher::new();
-    canonical.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
-
 /// `dir` の中のこのワークスペースのファイル。
+///
+/// キーは [`crate::history::workspace_key`] — **ここでは計算しない**。
+/// 以前はこのモジュールが私的な複製を持っていて、`history` 側と違う値を出していた。
 pub fn storage_file(dir: &Path, workspace: &Path) -> PathBuf {
-    dir.join(format!("{}.toml", workspace_key(workspace)))
+    dir.join(format!("{}.toml", crate::history::workspace_key(workspace)))
 }
 
 /// 読み込み。無ければ空。
@@ -1394,6 +1385,12 @@ impl MarksState {
         }
         self.flush();
         self.workspace = workspace.to_path_buf();
+        // 旧キー (このモジュールが私的に計算していた値) で置かれた印を引き取る。
+        // **実 `~/.zaivern` を指しているときだけ** — テストは `set_dir` で
+        // 一時ディレクトリへ差し替えるので、ここは通らない。
+        if self.dir == storage_dir() {
+            crate::history::adopt_legacy_keys(&self.workspace);
+        }
         self.store = load_from_dir(&self.dir, &self.workspace);
         self.track.clear();
         self.selected = None;

@@ -400,6 +400,64 @@ pub fn normalize_spec_on(raw: &str, win_sep: bool, fold_case: bool) -> String {
     }
 }
 
+/// 利用者が打った 1 件の指定を、**台帳が使えるスコープ相対の仕様**へ直す。
+///
+/// ## なぜ要るのか
+/// [`normalize_path_on`] は台帳の鍵を作る関数なので、**先頭の `/` を落とす**
+/// (区切りで分けて空の断片を捨てるため)。そこへ絶対パスを渡すと
+/// `/repo/src/a.rs` が `repo/src/a.rs` という**実在しない鍵**として載り、
+/// 同じファイルの相対指定 `src/a.rs` と永久に一致しない。
+/// CLI は「1 件を確保しました」と返すのに**何ひとつ守らない**
+/// (実バイナリで再現済み: 2 人が同じ物理ファイルを同時に持てた)。
+///
+/// ここは「人が打った文字列」と「台帳の鍵」の境目で、**絶対パスを
+/// ツリー相対へ畳むか、畳めないなら明示的に失敗する**のが仕事。
+/// 成功と偽らない (fail-closed) — 守れない指定を黙って受けるのが最悪。
+///
+/// * `tree` — スコープ相対パスの起点 (= [`Roots::tree`])
+/// * `raw` — `src/a.rs` / `/abs/src/a.rs#L10-20` / `C:\repo\src\a.rs` / `src/`
+///
+/// 相対指定は**1 バイトも変えずに**返す (従来の経路と完全に同じ)。
+pub fn resolve_spec_arg(tree: &Path, raw: &str) -> Result<String, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(tr("空の指定です"));
+    }
+    // パス部分と `#…` を分ける。**行域は 1 バイトも触らない** —
+    // ここで触ると `#L10-20` が壊れ、行域オーナーシップが丸ごと消える。
+    let path_part = spec_path(t);
+    let frag = &t[path_part.len()..];
+    if !is_absolute_any(path_part) {
+        return Ok(t.to_string()); // 相対 = 従来どおり
+    }
+    // 末尾の `/` は「その配下ぜんぶ」の意味。相対化で消えるので先に覚える
+    // (`normalize_path_on` が `**` を足す判断に使う)。
+    let subtree = path_part.ends_with('/') || path_part.ends_with('\\');
+    let abs = PathBuf::from(path_part.replace('\\', "/"));
+    // ツリー自身を指したら「配下ぜんぶ」。`rel_within` は空を `None` に
+    // するので、ここで拾わないと「ルートを指したのに失敗」になる。
+    if canonical_best_effort(&abs) == canonical_best_effort(tree) {
+        return Ok(format!("**{frag}"));
+    }
+    let Some(rel) = rel_within(tree, &abs) else {
+        // **ツリーの外**。台帳はスコープ相対でしか物を言えないので、
+        // ここを通すと「載ったのに誰も守らない」鍵が生まれる。断る。
+        return Err(trf(
+            "「{path}」はこのスコープの外です (スコープ: {tree})。スコープ内の相対パスで指定してください",
+            &[("path", path_part.to_string()), ("tree", tree.display().to_string())],
+        ));
+    };
+    // `rel_within` は [`normalize_path`] を通済み (macOS / Windows は小文字化)。
+    let rel = if subtree { format!("{rel}/") } else { rel };
+    Ok(format!("{rel}{frag}"))
+}
+
+/// [`resolve_spec_arg`] を並びへ。**1 件でも直せなければ全部やめる**
+/// (全か無か — 一部だけ確保して「守っている」と誤解させない)。
+pub fn resolve_spec_args(tree: &Path, raw: &[String]) -> Result<Vec<String>, String> {
+    raw.iter().map(|r| resolve_spec_arg(tree, r)).collect()
+}
+
 /// パターンが具体的なパスを覆うか。**フックの臨界路**なのでここは単純に保つ。
 ///
 /// `path` 側は実在のパスなので `*` / `?` はワイルドカードとして扱わない
@@ -544,6 +602,104 @@ pub fn overlaps(a: &str, b: &str) -> bool {
     seg_overlap(&segments(a), &segments(b))
 }
 
+/// 本文の走査 ([`Lease::live_span_of`]) を何回通ったかを数えるカウンタ。
+///
+/// 1 回が**ファイル全長の走査**なので、担当が N 人居るところで不用意に
+/// 呼ぶと確保 1 回の費用が N 倍になる。時間ではなく**回数**で固定するのは、
+/// 絶対時間の線が Docker の仮想 FS でも同時実行でも必ず嘘をつくため。
+///
+/// **プロセス共通の `static` にしない。** 同時に走っている他のテストの
+/// 呼び出しまで混ざる (実績あり)。
+#[cfg(test)]
+mod scan_count {
+    use std::cell::Cell;
+
+    thread_local! {
+        // `live_span_of` を通った回数
+        static HITS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn hit() {
+        HITS.with(|c| c.set(c.get().saturating_add(1)));
+    }
+    pub(super) fn reset() {
+        HITS.with(|c| c.set(0));
+    }
+    pub(super) fn get() -> u64 {
+        HITS.with(Cell::get)
+    }
+}
+
+/// **交錯の関所。** 帯だけでは足りない唯一の形をここで止める。
+///
+/// [`crate::region::conflicts`] は**組ごと**の判定で、それは今も正しい。
+/// 足りないのは
+///
+/// > 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」
+///
+/// という推論のほうで、片方が相手を上下から挟んでいる (交錯) と、反復的な
+/// 本文では帯を何行取っても `git merge` が衝突する (ort は diff アルゴリズムを
+/// histogram に固定していて、同じ側の複数の変更を 1 つの巨大なハンクへ畳む)。
+/// 実測は [`crate::region::anchor_lines`] の doc にある。
+///
+/// 返り値 `true` = 通してよい。`a` / `b` は**同じ 1 つのファイル**に対する
+/// 2 人ぶんの行域一覧 (持ち主ごとにまとめて渡すこと — 1 組ずつ渡すと交錯は
+/// 定義できない)。
+///
+/// # 元テキストが読めないときは **fail-closed** (断る)
+///
+/// 錨 ([`crate::region::anchor_lines`]) は元の本文からしか数えられない。
+/// 読めない (存在しない / [`KEY_GATE_READ_CAP`] 超え / バイナリ) ときに
+/// 「帯だけ」へ落とすと、**いちばん判定が効いてほしい場面 — 生成物・
+/// データファイル・行数の多い反復的なファイル — でだけ静かに緩む**。
+/// この製品が主張しているのは「一撃でマージできる」ことなので、証明できない
+/// ものを通す側へ倒すと主張そのものが嘘になる。空の錨を必ず `false` にする
+/// [`crate::region::interleave_safe`] と同じ向きである。
+///
+/// 断られた側の逃げ道は安い (連続した 1 本の域にする / 別ファイルにする /
+/// `zai lease claim --shift`) ので、fail-closed の代償は小さい。
+/// **黙って断らないこと** — 文面は [`interleave_reason`] が出す。
+///
+/// # 費用
+///
+/// 関所は書き込みのたびに走る短命プロセスなので、[`crate::region::anchor_lines`]
+/// (ファイル全体の走査) は**交錯している組が実際にあるときだけ**呼ぶ。
+/// 互いに素な配り方 (この機能が普段扱う形) では
+/// [`crate::region::interleaved`] の外接域 2 つぶんしか払わない。
+pub fn interleave_ok(
+    text: Option<&str>,
+    a: &[crate::region::Span],
+    b: &[crate::region::Span],
+) -> bool {
+    if !crate::region::interleaved(a, b) {
+        return true; // 交錯していなければ帯 (組ごと) で足りる
+    }
+    match text {
+        Some(t) => crate::region::interleave_safe(&crate::region::anchor_lines(t), a, b),
+        None => false,
+    }
+}
+
+/// 交錯で断るときの文面。
+///
+/// **「近すぎます」と同じ顔をさせない。** 交錯は*離しても直らない*
+/// (帯を広げるとむしろ悪化する組が実測で出ている) ので、利用者が
+/// 「もう少しずらせば通る」と読める文面は嘘になる。`coedit::Reason::Bracketed`
+/// と同じことを言っている。
+///
+/// `known_text` が `false` なら、断った理由が「錨が無い」ではなく
+/// 「**数えられなかった**」であることまで出す — 劣化したことを黙らせない。
+pub fn interleave_reason(known_text: bool) -> String {
+    if known_text {
+        tr("交錯しています: 相手の行域を上下から挟んでいて、間に「このファイルで 1 回しか出てこない行」がありません。離しても直りません (帯を広げると悪化する組が実測であります) — 連続した 1 本の行域にするか、別のファイルにしてください")
+    } else {
+        trf(
+            "交錯しています: 相手の行域を上下から挟んでいますが、元の内容を読めなかったので手がかりの行を数えられませんでした (安全側で断ります。読み取り上限は設定 {key} で上げられます)。連続した 1 本の行域にするか、別のファイルにしてください",
+            &[("key", KEY_GATE_READ_CAP.to_string())],
+        )
+    }
+}
+
 fn seg_overlap(a: &[String], b: &[String]) -> bool {
     match (a.first(), b.first()) {
         (None, None) => true,
@@ -639,6 +795,22 @@ fn is_absolute_any(p: &str) -> bool {
         || (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic())
 }
 
+/// git ディレクトリが **submodule のもの**か (`…/.git/modules/<名前>`)。
+///
+/// 名前は多段になり得る (`vendor/sub` / `deep/nest/sub`) ので**段数を
+/// 数えない**。`.git` の直後が `modules` かどうかだけを見る。
+/// 入れ子の submodule (`…/.git/modules/foo/modules/bar`) も同じ判定で
+/// 拾えて、いちばん内側の git ディレクトリがそのまま鍵になる。
+///
+/// **区切りは OS 依存にしない** — Windows で作られたポインタを unix から
+/// 読むことがあるので、[`Path::components`] ではなく正規化した文字列で見る。
+fn is_submodule_gitdir(gitdir: &Path) -> bool {
+    let norm = gitdir.to_string_lossy().replace('\\', "/");
+    let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    segs.windows(2)
+        .any(|w| w[0].ends_with(".git") && w[1] == "modules")
+}
+
 pub fn main_repo_root_from_pointer(text: &str, dot_dir: &Path) -> Option<PathBuf> {
     let line = text
         .lines()
@@ -669,6 +841,36 @@ pub fn main_repo_root_from_pointer(text: &str, dot_dir: &Path) -> Option<PathBuf
                 gitdir.join(t)
             }
         });
+    // **submodule は親と台帳を分ける。** git は submodule の実体を
+    // `<親>/.git/modules/<名前>` へ置く。ここを親のルートへ畳むと:
+    //
+    // * パスは `Roots::tree` (= submodule のフォルダ) 基準で相対化されるので、
+    //   submodule の `f.txt` が親の台帳へ**ただの `f.txt`** として載る。
+    //   親自身の `f.txt` と、さらに**別の submodule の `f.txt` とも**
+    //   同じ鍵になり、衝突しようのない組を止める (偽陽性)
+    // * 逆に本当に守りたい組 (親から見た `vendor/sub/f.txt`) とは鍵が違うので、
+    //   畳んでも真陽性は 1 件も増えない
+    //
+    // submodule は独立したリポジトリで、コミットもマージも別に進む。
+    // **マージ衝突が起き得る単位＝リポジトリ**なので、台帳もそこで割る。
+    //
+    // 鍵に git ディレクトリ (`…/.git/modules/<名前>`) を使うのは、
+    // submodule から生やした linked worktree が `commondir` 経由で
+    // **同じ値**に着くため。これで「submodule 本体 + その worktree 群」が
+    // 1 つの台帳を共有する (同じリポジトリなので衝突し得る) という、
+    // 通常のリポジトリとまったく同じ規則になる。
+    //
+    // 直していたのは**非対称**である: `gitdir: ../.git/modules/flat` は
+    // 親へ畳まれるのに `../../.git/modules/vendor/sub` は畳まれない、
+    // という取り違えが実バイナリで再現していた (名前の段数で挙動が変わる)。
+    //
+    // `commondir` があるとき (submodule から生やした worktree) はそれが
+    // submodule の git ディレクトリそのものなので、**両方の入口が同じ値**に
+    // 着く。無ければ `gitdir` 自身が submodule の git ディレクトリ。
+    let base = common.clone().unwrap_or_else(|| gitdir.clone());
+    if is_submodule_gitdir(&base) {
+        return Some(canonical_best_effort(&base));
+    }
     let Some(common) = common else {
         // `commondir` が読めない = git が置いた worktree ではない (あるいは
         // 非常に古い git)。**ここで形を推測しない** — 従来どおり
@@ -703,6 +905,17 @@ pub struct Roots {
     pub key: PathBuf,
     /// パスの相対化に使う = **いまいる作業ツリーのルート**。
     pub tree: PathBuf,
+    /// ルートを**確定できた**か (`.git` があった / 既に台帳がある)。
+    ///
+    /// `false` = git 管理下でもなく既存の台帳も無い ＝ **推測で選んだ**。
+    /// 台帳を新しく作る操作 (`claim` / `enable`) はここで断って、
+    /// `--dir` の明示か `git init` を促す。読むだけの操作 (`status` /
+    /// `list`) は従来どおり動く (断ると現状が見えなくなるため)。
+    ///
+    /// **既存の台帳は「利用者が以前ここをルートに選んだ」証拠**なので
+    /// 確定扱いにする。そうしないと、`--dir` で 1 度決めたあと配下から
+    /// 打つたびに断られ続ける (実バイナリで踏んだ)。
+    pub rooted: bool,
 }
 
 /// 与えられた場所から [`Roots`] を出す。
@@ -716,29 +929,59 @@ pub struct Roots {
 /// `/var` → `/private/var` のようなシンボリックリンクで同じリポジトリが
 /// 2 つのキーへ割れる (これもテストで踏んだ)。
 pub fn roots_of(start: &Path) -> Roots {
-    let (key, tree) = roots_raw(start);
+    let ((key, tree), rooted) = roots_raw_full(start);
     Roots {
         key: key.canonicalize().unwrap_or(key),
         tree: tree.canonicalize().unwrap_or(tree),
+        rooted,
     }
 }
 
-fn roots_raw(start: &Path) -> (PathBuf, PathBuf) {
+/// ルートの生の探索。返り値の `bool` は「`.git` で決まったのか」。
+///
+/// `false` = `.git` がひとつも見つからず、**フォルダを推測で選んだ**。
+/// 呼び出し元 (CLI) はここを見て、黙って別の台帳を生やす代わりに
+/// 明示的に断れる ([`Roots::git`])。
+fn roots_raw_full(start: &Path) -> ((PathBuf, PathBuf), bool) {
+    roots_raw_with(start, &|p| store_path_in(&store_dir(), p).exists())
+}
+
+/// 台帳の在処を差し替えられる [`roots_raw_full`]。
+///
+/// **テストが実 `~/.zaivern` を触らないため**に要る (既定の探索は
+/// ホームの台帳フォルダを stat するので、素のままでは検査できない)。
+fn roots_raw_with(start: &Path, has_store: &dyn Fn(&Path) -> bool) -> ((PathBuf, PathBuf), bool) {
     let base = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
     for dir in base.ancestors() {
         let dot = dir.join(".git");
         if dot.is_dir() {
-            return (dir.to_path_buf(), dir.to_path_buf());
+            return ((dir.to_path_buf(), dir.to_path_buf()), true);
         }
         if dot.is_file() {
             let main = std::fs::read_to_string(&dot)
                 .ok()
                 .and_then(|t| main_repo_root_from_pointer(&t, dir))
                 .unwrap_or_else(|| dir.to_path_buf());
-            return (main, dir.to_path_buf());
+            return ((main, dir.to_path_buf()), true);
         }
     }
-    (base.clone(), base)
+    // ── git 管理でない ────────────────────────────────────────────────
+    // **サブフォルダごとに別の台帳を生やさない。** 以前はここで
+    // `(cwd, cwd)` を返していたので、`/work` と `/work/a` と `/work/a/b` が
+    // **3 つの別々の台帳**になり、同じファイルを見ている 2 人が互いに
+    // 見えなかった (実バイナリで再現済み: 鍵が 3 つに割れた)。
+    //
+    // 既に台帳がある祖先まで上がって、**そこへ寄せる**。既存の台帳は
+    // 「利用者がここをルートとして選んだ」という唯一の手掛かりで、
+    // 推測ではない。見つからなければ「git でも既存の台帳でもない」と
+    // 判る形 (`false`) で返し、断るかどうかは呼び出し元が決める。
+    for anc in base.ancestors() {
+        if has_store(anc) {
+            // 既に台帳がある = 利用者が以前ここをルートに選んだ。**確定**。
+            return ((anc.to_path_buf(), anc.to_path_buf()), true);
+        }
+    }
+    ((base.clone(), base), false)
 }
 
 /// **まだ存在しないパスでも**実在する祖先まで解決する canonicalize。
@@ -919,6 +1162,8 @@ impl Lease {
     /// * **記録された行番号** — 錨が入る前とまったく同じ判定。既に出荷している
     ///   保証と同じ強さで、過剰でも過少でもない。ここへ倒す。
     fn live_span_of(&self, i: usize, text: Option<&str>) -> Option<crate::region::Span> {
+        #[cfg(test)]
+        scan_count::hit();
         let r = self.region_at(i);
         if r.is_whole() {
             return None;
@@ -1060,20 +1305,41 @@ pub fn hydrate_in(tree: &Path, spec: &str) -> Result<Want, String> {
     if matches!(parsed.sel, crate::region::Sel::Whole) {
         return Ok(Want::plain(spec)); // 行番号に依存しない = 錨も要らない
     }
-    let text = read_capped(&tree.join(&parsed.path));
-    let Some(body) = text else {
-        return match parsed.sel {
-            crate::region::Sel::Symbol { kind, name } => Err(trf(
-                "{kind} {name} を探せません: 「{path}」を読めませんでした",
-                &[
-                    ("kind", kind),
-                    ("name", name),
-                    ("path", parsed.path.clone()),
-                ],
-            )),
-            // 行域はそのまま確保できる (錨が無い = 錨が入る前と同じ判定)
-            _ => Ok(Want::plain(spec)),
-        };
+    let body = match read_capped_ex(&tree.join(&parsed.path), tree) {
+        FileRead::Text(b) => b,
+        // **行域 (`#L10-20`) は中身を読まなくても確保できる。**
+        // 錨が無いだけで、域そのものは台帳へそのまま載る
+        // (= 錨が入る前の版とまったく同じ判定)。記号指定 (`#fn:`) だけが
+        // 解析を要するので、そちらだけを断る。
+        other => {
+            let crate::region::Sel::Symbol { kind, name } = parsed.sel else {
+                return Ok(Want::plain(spec));
+            };
+            // **理由を取り違えない。** 「上限超え」を「読めませんでした」と
+            // 出していたため、健在な 1.8MB のファイルに対して
+            // 直しようのない拒否が出ていた。
+            return Err(match other {
+                FileRead::TooLarge(size, cap) => trf(
+                    "{kind} {name} を探せません: 「{path}」は {size} バイトで上限 {cap} バイトを超えます (行番号での指定 (例: {path}#L10-20) なら確保できます。上限は設定 {key} で変えられます)",
+                    &[
+                        ("kind", kind),
+                        ("name", name),
+                        ("path", parsed.path.clone()),
+                        ("size", size.to_string()),
+                        ("cap", cap.to_string()),
+                        ("key", KEY_GATE_READ_CAP.to_string()),
+                    ],
+                ),
+                _ => trf(
+                    "{kind} {name} を探せません: 「{path}」を読めませんでした",
+                    &[
+                        ("kind", kind),
+                        ("name", name),
+                        ("path", parsed.path.clone()),
+                    ],
+                ),
+            });
+        }
     };
     let region = crate::region::resolve_spec(&parsed, &body)?;
     Ok(Want {
@@ -1081,6 +1347,40 @@ pub fn hydrate_in(tree: &Path, spec: &str) -> Result<Want, String> {
         anchor: region.anchor,
         text: Some(std::sync::Arc::from(body)),
     })
+}
+
+/// 行域の指定が**実際には行単位で守られない**なら、その理由を返す。
+///
+/// ## なぜ要るのか
+/// 確保は通る (`src/big.rs#L10-20` は台帳へそのまま載る) のに、
+/// **フック側 ([`gate`]) は上限を超えたファイルの行域を出せない**ので、
+/// 判定が [`decide_spans`] から [`decide`] へ落ちて**ファイル全体**になる。
+/// 実バイナリで再現済み: 1.8MB のファイルで `#L10-20` を持っている相手が
+/// いると、**900 行目への書き込みまで拒否**される。
+/// しかも拒否文には「行単位で見られなかった」と 1 文字も出ないので、
+/// 利用者は「なぜ離れた行なのに止まるのか」を知る手段が無い。
+///
+/// 確保のときに**先に**言う。黙って劣化させない。
+pub fn degradation_note(tree: &Path, spec: &str) -> Option<String> {
+    let path = spec_path(spec);
+    if spec_span(spec).is_none() {
+        return None; // ファイル全体の確保 = 劣化のしようが無い
+    }
+    if path.contains(['*', '?', '[']) {
+        return None; // どのファイルを指すか確定しない
+    }
+    match read_capped_ex(&tree.join(path), tree) {
+        FileRead::TooLarge(size, cap) => Some(trf(
+            "「{path}」は {size} バイトで上限 {cap} バイトを超えます — このファイルは**行単位ではなくファイル全体**として守られます (同じファイルの離れた行を他の人が取れません)。設定 {key} を上げると行単位に戻ります",
+            &[
+                ("path", path.to_string()),
+                ("size", size.to_string()),
+                ("cap", cap.to_string()),
+                ("key", KEY_GATE_READ_CAP.to_string()),
+            ],
+        )),
+        _ => None,
+    }
 }
 
 /// 仕様を実ファイルへ突き合わせるときの基準フォルダ。
@@ -1164,8 +1464,39 @@ fn absorb(pats: &mut Vec<String>, ancs: &mut Vec<crate::region::Anchor>, want: &
         // **持ち主自身の域は、確保のたびに「いまの座標」へ書き直す。**
         // 他人の帳簿には 1 行も触らないので、これは `region::follow` を
         // 全担当へ撒く eager な追従とは別物 (落ちても誰の台帳もずれない)。
+        //
+        // ## ただし「動いた」と読めても、**元の場所を手放してはいけない**
+        //
+        // 錨は確保した瞬間の中身で、**持ち主が自分でその行を書き換えると
+        // 自分の錨が合わなくなる**。すると [`crate::region::resolve`] は
+        // 似た行 (README の空行・```・--- など実ファイルには山ほどある) に
+        // 当たり、域が**別の場所へ移ったこと**にしてしまう。
+        //
+        // 実測 (`tools/anyrepo-prove.sh --repo hyperframes --writers 8`,
+        // 種 20260818): w1 が `README.md#L21` を確保 → 21 行目を書く →
+        // **同じファイルの別の域を確保し直した瞬間に L21 が L15 へ移動** し、
+        // 空いた 21 行目を w2 が正当に確保して**2 人が同じ行を書いた**。
+        // 台帳の最終形に重なりは残らない (移動しただけ) ので、
+        // 台帳を見ても気付けない — いちばん静かな壊れ方だった。
+        //
+        // そこで**動いたと読めたら、その読みを採らない**。
+        //
+        // 包んで (`hull`) 両方持つことも試したが、伸びた域が**他人が既に
+        // 持っている域を飲み込んで**しまい、台帳の不変条件 (どの 2 人の
+        // 担当も重ならない) が壊れた (実測: 種 20260818 で `overlaps=1`)。
+        // 元の場所に留めるのが、伸びも移動もしない唯一の安全な選択。
+        //
+        // **追従が消えるわけではない。** 他人から見た判定は
+        // [`overlaps_live`] が判断のたびに錨で取り直すので、行が本当に
+        // ずれていても保護は効く。ここで書き換えるのは*自分の帳簿の座標*
+        // だけで、それを動かさないだけである。
         let live = match text {
-            Some(t) => crate::region::resolve(&r, t).unwrap_or(recorded),
+            Some(t) => match crate::region::resolve(&r, t) {
+                Some(moved) if moved == recorded => moved,
+                // 「動いた」と読めた = 錨が別の行に当たった可能性がある。
+                // 自分が書いた行を手放すより、留まるほうが必ず安全。
+                _ => recorded,
+            },
             None => recorded,
         };
         same.push((live, r.anchor));
@@ -1346,6 +1677,18 @@ pub fn try_claim_wants(
             }
         }
     }
+    // ── 交錯 ────────────────────────────────────────────────────────────
+    // ここまでは**組ごと**の帯で、それは今も正しい。足りないのは
+    // 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」のほうで、
+    // 片方が相手を上下から挟んでいると反復的な本文では帯を何行取っても
+    // 衝突する。判定は [`interleave_ok`] 1 本 (関所ごとに書かない)。
+    if let Some((owner, reason, until)) = interleave_clash(store, holder, &wanted) {
+        return Claim::Refused {
+            owner: reason,
+            pattern: owner,
+            until,
+        };
+    }
     let expires = now.saturating_add(ttl);
     if let Some(mine) = store.leases.iter_mut().find(|l| l.holder.same(holder)) {
         // **上限の検査は書き換える前に済ませる** (全か無かを壊さないため)。
@@ -1448,6 +1791,138 @@ fn overlaps_live(
         &spec_region(mine),
         crate::region::SAFE_BAND,
     )
+}
+
+/// [`try_claim_wants`] の**交錯**検査。断るなら `(仕様, 理由, 期限)`。
+///
+/// 帯の検査 ([`overlaps_live`]) を全部通った**あとにだけ**呼ぶこと。
+/// 帯で既に断っている組をここで数え直しても答えは変わらない。
+///
+/// ## なぜ持ち主ごとにまとめるのか
+///
+/// 交錯は「A の域が B の 2 つの域に挟まれている」という**集合の性質**で、
+/// 1 組ずつ ([`overlaps`]) では定義できない。実際に穴だったのはここで、
+/// `A={17}` `B={13,25}` はどの組も帯 (3 行) を満たすのに `git merge` は
+/// 衝突する。
+///
+/// ## 費用
+///
+/// * glob / ファイル全体の要求は 1 バイトも見ない (帯側が安全に断っている)
+/// * 具体パスが一致する他人のリースが無ければ [`interleave_ok`] を呼ばない
+/// * [`crate::region::anchor_lines`] は [`interleave_ok`] の中で、
+///   **本当に交錯している組があるときだけ**走る
+fn interleave_clash(
+    store: &Store,
+    holder: &Holder,
+    wanted: &[Want],
+) -> Option<(String, String, u64)> {
+    // 1. 要求を「具体パス」ごとにまとめる (行域を持つものだけ)。
+    //    値は (自分の域, 判定に使う本文, 代表の仕様)。
+    let mut mine: std::collections::BTreeMap<
+        String,
+        (Vec<crate::region::Span>, Option<&str>, &str),
+    > = std::collections::BTreeMap::new();
+    for w in wanted {
+        if !has_frag(&w.spec) {
+            continue; // ファイル全体 — 帯側が必ず断っている
+        }
+        let r = spec_region(&w.spec);
+        let (Some(span), false) = (r.span, is_globby(&r.path)) else {
+            continue;
+        };
+        let e = mine
+            .entry(r.path.clone())
+            .or_insert_with(|| (Vec::new(), None, w.spec.as_str()));
+        e.0.push(span);
+        if e.1.is_none() {
+            e.1 = w.text.as_deref();
+        }
+    }
+    if mine.is_empty() {
+        return None;
+    }
+    // 2. 自分が既に持っている域も足す。**足さないと交錯を作れてしまう** —
+    //    1 本ずつ取れば毎回「相手 1 人・自分 1 本」に見えるので、
+    //    2 回目の確保で相手を挟んだことに誰も気付かない。
+    //
+    //    **他人が誰もそのパスに居なければ 1 バイトも読まない。**
+    //    `live_span_of` は錨を本文から探し直す (= ファイル全長の走査) ので、
+    //    「同じファイルに他人が居る」と分かってからでないと払えない。
+    let contested: std::collections::BTreeSet<String> = mine
+        .keys()
+        .filter(|path| {
+            store
+                .leases
+                .iter()
+                .filter(|l| !l.holder.same(holder))
+                .any(|l| l.patterns.iter().any(|p| covers(p, path)))
+        })
+        .cloned()
+        .collect();
+    if contested.is_empty() {
+        return None;
+    }
+    if let Some(l) = store.leases.iter().find(|l| l.holder.same(holder)) {
+        for (path, e) in mine.iter_mut() {
+            if !contested.contains(path) {
+                continue;
+            }
+            for (i, p) in l.patterns.iter().enumerate() {
+                if !covers(p, path) {
+                    continue;
+                }
+                if let Some(s) = l.live_span_of(i, e.1) {
+                    e.0.push(s);
+                }
+            }
+        }
+    }
+    // 3. 他人ごとに、同じパスの域をまとめて突き合わせる。
+    for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
+        for (path, (my_spans, text, spec)) in &mine {
+            // **どちらも 1 本しか持っていないなら、交錯は起こり得ない。**
+            // 交錯は「外接域が重なる」ことで、1 本ずつなら外接域は域そのもの。
+            // 帯 (`overlaps_live`) をここまで通っている = 重なっていないので、
+            // 判定するまでもなく答えは決まっている。
+            //
+            // **これは速さのための近似ではなく、厳密に同じ答えである。**
+            // 効き目は大きい: 下の `live_span_of` は錨を本文の中から探し直す
+            // ので**1 回がファイル全長の走査**で、担当 N 人ぶん走ると
+            // 確保 1 回の費用が倍になる (実測: 互いに素な 64 件で
+            // 4203ms → 5082ms、この screening を入れて 4200ms 台へ戻した)。
+            let theirs_n = l.patterns.iter().filter(|p| covers(p, path)).count();
+            if theirs_n == 0 || (theirs_n == 1 && my_spans.len() <= 1) {
+                continue;
+            }
+            let mut theirs: Vec<crate::region::Span> = Vec::new();
+            for (i, p) in l.patterns.iter().enumerate() {
+                if !covers(p, path) {
+                    continue;
+                }
+                match l.live_span_of(i, *text) {
+                    // 丸ごと持たれている = 帯側が既に断っている。
+                    None => return None,
+                    Some(s) => theirs.push(s),
+                }
+            }
+            if theirs.is_empty() {
+                continue;
+            }
+            if !interleave_ok(*text, my_spans, &theirs) {
+                return Some((
+                    (*spec).to_string(),
+                    interleave_reason(text.is_some()),
+                    l.expires_at,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// glob 記号を含むか (`crate::region` 側の同名判定と同じ規則)。
+fn is_globby(p: &str) -> bool {
+    p.contains('*') || p.contains('?') || p.contains('[')
 }
 
 /// `path` を覆っている担当の**いまの**行域を集める。
@@ -1735,6 +2210,10 @@ pub enum ShiftClaim {
 /// `tree` はスコープ相対パスの起点 (= [`Roots::tree`])。仕様は
 /// [`hydrate_in`] で実ファイルへ突き合わせてから確保するので、
 /// 記号指定 (`src/a.rs#fn:draw`) もずらせる (行域へ落ちたあとで動かす)。
+// 引数が 8 本ある。束ねると 17 箇所の呼び出しを書き換えることになり、
+// **ずらし上限を足すという 1 点の変更**に対して差分が大きくなりすぎる。
+// このリポジトリの既存の流儀 (deck / terminal / whichkey) に合わせて許可する。
+#[allow(clippy::too_many_arguments)]
 pub fn try_claim_shift_in(
     tree: &Path,
     store: &mut Store,
@@ -1743,6 +2222,7 @@ pub fn try_claim_shift_in(
     now: u64,
     ttl: u64,
     alive: &dyn Fn(u32) -> bool,
+    max_shift: Option<u32>,
 ) -> ShiftClaim {
     let mut wants: Vec<Want> = Vec::with_capacity(patterns.len());
     for p in patterns {
@@ -1757,7 +2237,91 @@ pub fn try_claim_shift_in(
             }
         }
     }
-    try_claim_wants_shift(store, holder, &wants, now, ttl, alive)
+    try_claim_wants_shift(store, holder, &wants, now, ttl, alive, max_shift)
+}
+
+/// 設定キー: ずらしてよい幅の既定 (行)。
+///
+/// **交渉層の `negotiate::KEY_MAX_SHIFT` と同じ文字列**を指す。定数を
+/// import せず綴りを持つのは、実体の `src/negotiate.rs` が
+/// `src/features/negotiate.rs` の**私有 `mod imp`** として `#[path]` で
+/// 取り込まれていて、クレート外からは辿れないから (担当外のファイルなので
+/// re-export も足さない)。綴りがずれたら黙って既定値へ落ちて
+/// 「設定したのに効かない」になるので、
+/// [`tests::ずらし幅の設定キーは交渉層と同じ綴り`] が突き合わせる。
+const KEY_MAX_SHIFT: &str = "negotiate.max_shift";
+
+/// ずらしてよい幅の既定の上限 (行)。設定 [`KEY_MAX_SHIFT`] から取る。
+///
+/// **交渉層と同じ値を使う。** あちらは `zai negotiate ask --max-shift` から
+/// 届くのに、`zai lease claim --shift` だけが**無制限**だった
+/// (出荷経路がいちばん緩い、という最悪の形)。1 万行ずらされたら、
+/// 利用者の意図とまったく無関係な場所を確保してしまう。
+pub fn default_max_shift_in(root: &Path) -> u32 {
+    crate::config::load(std::slice::from_ref(&root.to_path_buf()), false)
+        .feature_i64(KEY_MAX_SHIFT)
+        .clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// **ずらしてよい幅の実効上限。** 設定値に「いま実際に場所を奪っているぶん」を足す。
+///
+/// ## 固定値が必ず破綻する理由 (実測)
+///
+/// 設定 [`KEY_MAX_SHIFT`] は「**空いている**ファイルでどこまで飛んでよいか」、
+/// つまり人間のレビュー局所性の表明である。ところが実際にずらす距離を
+/// 決めているのは利用者ではなく**同時に来た人数**で、`n` 体が幅 `w` を
+/// 安全帯 `b` で並べれば、端の 1 体は `n(w+b)/2` 行ずれる。固定値 `m` は
+/// そこから「`n ≤ 2m/(w+b)` までしか通さない」という**誰も表明していない
+/// 上限**を勝手に作る。
+///
+/// 実測 (`tools/coedit-bench.sh --agents 64 --lines 2000 --layout crowded`、
+/// 6 回): 既定 200 行のままだと段 C+ は **51〜54 完了 / 10〜13 拒否**で、
+/// stderr には「上限は 200 行です」だけが出ていた。`--max-shift 600` を
+/// 渡すと 64/64。**空きは 1868 行あり、断る理由はどこにも無かった。**
+///
+/// ## 何を足すか
+///
+/// **他人 1 人が押しのけてよいのは、その人の域の幅 (＋安全帯 2 本) まで。**
+/// ただし 1 人あたりの寄与は設定値で頭打ちにする — さもないと
+/// 「1 人が 9000 行持っている」だけで上限が実質無効になり、
+/// 「頼んだ場所と何の関係も無い所を確保しない」という元の保護が消える
+/// ([`crate::features::negotiate`] の
+/// `tests::断った理由の内訳が取れる` が番人)。
+///
+/// ## 帰結 (これが「N がいくつまで大丈夫か」への答え)
+///
+/// * `busy` が空 (空いているファイル) → **設定値そのまま**。従来と 1 行も変わらない
+/// * `n` 体が並んでいる → 上限は `m + n(min(w,m) + 2b)`。**n に比例して伸びる**。
+///   必要距離は `n(w+b)/2` なので、`w ≤ m` である限り伸びは必要量の
+///   **2 倍以上**で、`n` がいくつでも上限が先に尽きることはない
+///   ([`tests::書き手を倍にしても成立率が落ちない`] が 32/64/128 体で固定)
+/// * `w > m` (1 人の域が設定値より広い) のときは `n = 2` の時点で当たる。
+///   **「しばらく通ってから急に落ちる」という静かな崖にはならない**ので、
+///   利用者は最初の 1 回で気付ける (文面に必要な数を出す)
+/// * ファイル行数で頭打ち。本当に入らないときは「遠すぎる」ではなく
+///   「空きが無い」として断る (理由の内訳が嘘にならない)
+/// * `configured == 0` は「**ずらすな**」の意思表示なので 0 のまま
+pub fn shift_ceiling(
+    configured: u32,
+    busy: &[crate::region::Span],
+    band: u32,
+    file_lines: u32,
+) -> u32 {
+    if configured == 0 {
+        return 0; // 「ずらすな」を混雑で覆さない
+    }
+    let mut reach = u64::from(configured);
+    for s in busy {
+        let w = if s.is_insert() { 1 } else { s.len() };
+        reach = reach
+            .saturating_add(u64::from(w.min(configured)))
+            .saturating_add(2 * u64::from(band));
+    }
+    // ファイルの外へはずらせないので、行数より上を許しても意味が無い。
+    // ただし設定値そのものは下回らせない (行数の分からない呼び出しで
+    // 「設定したのに効かない」を作らないため)。
+    let cap = u64::from(file_lines).max(u64::from(configured));
+    reach.min(cap) as u32
 }
 
 /// **埋まっていたら空いている場所へずらして確保する。** 実ファイルを読まない
@@ -1796,6 +2360,7 @@ pub fn try_claim_wants_shift(
     now: u64,
     ttl: u64,
     alive: &dyn Fn(u32) -> bool,
+    max_shift: Option<u32>,
 ) -> ShiftClaim {
     use crate::region::SAFE_BAND;
     prune(store, now, alive);
@@ -1877,11 +2442,58 @@ pub fn try_claim_wants_shift(
         // ── 埋まっている。空いている場所を探す ──────────────────────
         // **行数が分からないファイルへはずらさない** ([`line_count`]) —
         // 知らない場所を勧めると、台帳の上では取れているのに書く先が無い。
-        let alt = movable.zip(busy).and_then(|(s, mut b)| {
-            let total = line_count(text)?;
-            b.extend_from_slice(here);
-            fit_span(&b, s, total, SAFE_BAND)
-        });
+        // ずらす先と、**その距離を決めている混雑ぶん**を同時に出す。
+        // 上限の判定 ([`shift_ceiling`]) には「誰がどれだけ塞いでいるか」が要る。
+        let mut crowd: Vec<crate::region::Span> = Vec::new();
+        let mut total_lines = 0u32;
+        let alt = match (movable, busy) {
+            (Some(s), Some(mut b)) => line_count(text).and_then(|total| {
+                b.extend_from_slice(here);
+                total_lines = total;
+                let got = fit_span(&b, s, total, SAFE_BAND);
+                crowd = b;
+                got
+            }),
+            _ => None,
+        };
+        // **ずらし幅に上限を効かせる。** 上限が無いと、詰まった台帳では
+        // 1 万行離れた場所が「いちばん近い空き」になり得る。そこは利用者が
+        // 頼んだ場所と何の関係も無いので、確保しても意味が無いどころか
+        // **無関係な他人の作業域を先取りする**。
+        //
+        // ただし上限は**固定値ではない** — [`shift_ceiling`] が「他人が
+        // いま実際に押しのけているぶん」を足す。固定値のままだと、
+        // 「同時に何体まで通すか」を誰も表明していないのに決めてしまう
+        // (実測: 既定 200 行で 64 体中 10〜13 体が断られていた)。
+        //
+        // 断るときは**具体的な数**を出す (「入りません」だけでは、
+        // 上限を上げれば通るのか、そもそも空きが無いのかが判らない)。
+        if let (Some(a), Some(cfg), Some(s)) = (alt, max_shift, movable) {
+            let dist = a.start.abs_diff(s.start);
+            let limit = shift_ceiling(cfg, &crowd, SAFE_BAND, total_lines);
+            if dist > limit {
+                return ShiftClaim::Refused {
+                    owner: trf(
+                        // **先頭に `:` を含む見出しを置く。** `cli::refusal` は
+                        // 「持ち主の名前」と「断る理由」を `:` の有無で見分けて
+                        // 文型を変えるので、`:` が無いと
+                        // 「…通ります **が持っています**」という意味の通らない
+                        // 文になる (実バイナリで実際にそう出た)。
+                        "ずらせる上限に当たりました: {dist} 行ずらす必要がありますが、上限は {limit} 行です (設定 {key} の {cfg} 行 ＋ 他人の域 {n} 件ぶんの混雑 {crowd} 行)。`--max-shift {dist}` を渡すか、設定 {key} を {dist} 以上にすると通ります",
+                        &[
+                            ("dist", dist.to_string()),
+                            ("limit", limit.to_string()),
+                            ("key", KEY_MAX_SHIFT.to_string()),
+                            ("cfg", cfg.to_string()),
+                            ("n", crowd.len().to_string()),
+                            ("crowd", limit.saturating_sub(cfg).to_string()),
+                        ],
+                    ),
+                    pattern: asked,
+                    until: now,
+                };
+            }
+        }
         let Some(alt) = alt else {
             // ずらす先が無い。**文面は `--shift` 無しとまったく同じ**にする
             // (拒否の理由が 2 通りあると、読む側が原因を切り分けられない)。
@@ -2208,12 +2820,103 @@ fn write_store(store: &Path, s: &Store) -> Result<(), String> {
 
 /// 排他ロック。`create_new` は OS の `O_EXCL` / `CREATE_NEW` に落ちるので、
 /// **同時に来た 2 プロセスのうち 1 つだけが成功する** (後勝ちにならない)。
-struct LockGuard(PathBuf);
+/// 握っているロック。**自分が張ったものだけを外す。**
+///
+/// ## なぜ中身 (token) を照合するのか
+/// 以前は `remove_file` を無条件に撃っていた。置き去りロックの奪取
+/// ([`acquire_lock_in`]) が `remove_file` + `create_new` の**2 手**だったため、
+/// 同じ置き去りを見た 2 人が順に「消して張る」と、**後の人が先の人の
+/// 張りたてのロックを消して**しまい、2 人が同時に臨界区間へ入っていた。
+/// そのまま両方が read → modify → write すると、**後の書き戻しが先の
+/// 予約を消す** (lost update)。
+///
+/// これは観測された 2 つの症状を**同時に**説明する:
+/// * 古い台帳を読んで書き戻す → 他人の予約が消える = **二重配布**
+/// * 古い台帳を読んで「空いていない」と判断する = **取りこぼし**
+///
+/// token を照合すれば、奪われた側の `Drop` が他人のロックを消すことはない。
+struct LockGuard {
+    path: PathBuf,
+    token: String,
+}
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // **自分の token が入っているときだけ外す。** 読めない / 違う =
+        // 既に誰かへ渡っているので、触らないのが正しい。
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+/// このロック取得を他と区別する印。**プロセスとスレッドと時刻**で作る。
+///
+/// 同じプロセスの別スレッドも別の握りなので、PID だけでは足りない。
+fn lock_token() -> String {
+    format!(
+        "{}-{:?}-{}",
+        std::process::id(),
+        std::thread::current().id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// 置き去りロックを**原子的に**奪う。
+///
+/// ## なぜ `remove_file` ではいけなかったのか
+/// `remove_file` は**誰が呼んでも成功する**。同じ置き去りを見た 2 人が
+///
+/// 1. P2 が消す → P2 が張る (P2 が握った)
+/// 2. P3 が消す ← **P2 の張りたてのロックが消える** → P3 が張る
+///
+/// と進むと、**P2 と P3 が同時に臨界区間へ入る**。[`with_store`] は
+/// 読み → 変更 → 書き戻しなので、後から書いたほうが先の予約を丸ごと
+/// 消してしまう (lost update)。これが「予約が途中で消える (二重配布)」と
+/// 「空いているのに取れない (取りこぼし)」の**単一の原因**だった。
+///
+/// ## なぜ `rename` なら正しいのか
+/// `rename` は**元が在るときしか成功しない**。同時に奪おうとした複数の
+/// 待ち手のうち、成功するのは 1 人だけで、残りは `ENOENT` で落ちる。
+/// つまり「奪う」という操作そのものが直列化される。
+///
+/// 奪った後に**中身を照合する**のは、観測してから `rename` するまでの
+/// あいだに正当な持ち主が入れ替わっている可能性があるため。別物だったら
+/// 元へ戻す (戻せなければ諦める — どのみち次の周回で判定し直す)。
+fn steal_stale_lock(path: &Path, observed: &str) {
+    let tmp = path.with_extension(format!("steal-{}", lock_token()));
+    if std::fs::rename(path, &tmp).is_err() {
+        return; // 競走に負けた = 誰かが先に奪った / 持ち主が外した
+    }
+    let got = std::fs::read_to_string(&tmp).unwrap_or_default();
+    if got == observed {
+        let _ = std::fs::remove_file(&tmp); // 正当な奪取
+                                            // **奪取は異常事象なので必ず記録する。** 「なぜ予約が消えたのか」を
+                                            // 後から追える唯一の手掛かりで、頻発するなら持ち主がロックを
+                                            // 長く握りすぎている ([`LOCK_STALE_MS`]) という別の問題を指す。
+        if let Some(dir) = path.parent() {
+            log_line(dir, &format!("stole-stale-lock {}", path.display()));
+        }
+        return;
+    }
+    // 見ていたものとは別のロックだった = 生きている持ち主のものかもしれない。
+    // **消さずに戻す。ただし `rename` では戻さない** — 戻すあいだに別の人が
+    // 張っていたら、その張りたてを上書きして 2 人が握ってしまう。
+    // `create_new` なら**空いているときしか書けない**ので、決して奪わない。
+    let restored = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|mut f| {
+            use std::io::Write;
+            let _ = f.write_all(got.as_bytes());
+        })
+        .is_ok();
+    let _ = restored; // 戻せなければ新しい持ち主が居る = そのままでよい
+    let _ = std::fs::remove_file(&tmp);
 }
 
 /// ロック待ちの間の**譲り方**。[`LOCK_SPIN_ROUNDS`] に理由を書いてある。
@@ -2283,6 +2986,14 @@ fn lock_contended(e: &std::io::Error) -> bool {
 }
 
 fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
+    acquire_lock_in(store, LOCK_STALE_MS)
+}
+
+/// 置き去り判定の閾値を明示する [`acquire_lock`]。
+///
+/// **閾値を引数へ出さないと、奪取の競走をテストできない** (既定の 5 秒を
+/// 待つテストは書けないし、絶対時間で線を引くテストは必ず嘘をつく)。
+fn acquire_lock_in(store: &Path, stale_ms: u64) -> Result<LockGuard, String> {
     let path = store.with_extension("lock");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("台帳フォルダを作れません: {e}"))?;
@@ -2290,23 +3001,34 @@ fn acquire_lock(store: &Path) -> Result<LockGuard, String> {
     let deadline = Instant::now() + Duration::from_millis(LOCK_WAIT_MS);
     let mut attempt = 0u32;
     loop {
+        let token = lock_token();
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return Ok(LockGuard(path)),
+            Ok(mut f) => {
+                // **中身を書いてから握ったことにする。** 空のまま返すと、
+                // `Drop` の照合が自分のロックを外せなくなる。
+                use std::io::Write;
+                let _ = f.write_all(token.as_bytes());
+                let _ = f.flush();
+                return Ok(LockGuard { path, token });
+            }
             Err(e) if !lock_contended(&e) => return Err(format!("ロックを作れません: {e}")),
             Err(_) => {}
         }
         // クラッシュで置き去りになったロックは奪う (でないと永久に詰まる)。
+        // **観測した中身も一緒に覚える** — 奪う瞬間に別物へ入れ替わって
+        // いないことを、これで確かめる。
+        let observed = std::fs::read_to_string(&path).unwrap_or_default();
         let stale = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .is_some_and(|d| d.as_millis() as u64 > LOCK_STALE_MS);
+            .is_some_and(|d| d.as_millis() as u64 > stale_ms);
         if stale {
-            let _ = std::fs::remove_file(&path);
+            steal_stale_lock(&path, &observed);
             continue;
         }
         if Instant::now() >= deadline {
@@ -2508,6 +3230,29 @@ pub struct HookAnswer {
 /// **許可のときは何も出さない。** `"allow"` を返すとユーザー自身の許可設定を
 /// 飛び越えてしまう — こちらが与えたいのは「止める権限」だけで、
 /// 「他人の確認を省く権限」ではない。
+/// 拒否文へ「行単位で見られなかった」ことを添える。
+///
+/// **判定が落ちたことを黙っていると、利用者には直しようが無い。**
+/// 「離れた行を触っているのに止まる」の原因はここにしか無いので、
+/// 拒否そのものと同じ場所に出す (監査ログだけでは誰も見ない)。
+fn with_cap_note(reason: &str, degraded: &Option<(String, u64, u64)>) -> String {
+    let Some((path, size, cap)) = degraded else {
+        return reason.to_string();
+    };
+    format!(
+        "{reason}\n{}",
+        trf(
+            "補足: 「{path}」は {size} バイトで上限 {cap} バイトを超えるため、**どの行を触るかを判定できず、ファイル全体として扱いました**。設定 {key} を上げると行単位に戻ります",
+            &[
+                ("path", path.clone()),
+                ("size", size.to_string()),
+                ("cap", cap.to_string()),
+                ("key", KEY_GATE_READ_CAP.to_string()),
+            ],
+        )
+    )
+}
+
 pub fn deny_answer(agent: &str, reason: &str) -> HookAnswer {
     // **拒否の形はベンダーごとに違う。** カタログから引き、無ければ
     // Claude の形へ落とす (未知のエージェントで無反応にならないように)。
@@ -2663,13 +3408,84 @@ pub fn applied_text(old: &str, input: &serde_json::Value) -> Option<String> {
     replace_one(old, o, n, all)
 }
 
-/// 判定のためにファイルを読む。**上限付き** ([`GATE_READ_CAP`])。
-fn read_capped(abs: &Path) -> Option<String> {
-    let m = std::fs::metadata(abs).ok()?;
-    if !m.is_file() || m.len() > GATE_READ_CAP {
-        return None;
+/// [`read_capped_ex`] の結果。**「読めなかった」を 1 つにまとめない。**
+///
+/// 以前は [`Option`] だったので「上限超え」と「存在しない / 壊れている」が
+/// 同じ `None` になり、利用者には
+/// **「読めませんでした」としか出なかった** (実バイナリで再現済み:
+/// 1.8MB のファイルに対して「読めませんでした」と出るが、ファイルは
+/// 健在で ただ上限を超えているだけだった)。原因が判らない拒否は直せない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileRead {
+    /// 読めた。
+    Text(String),
+    /// 実在するが上限超え。`0` = 実サイズ、`1` = そのとき効いていた上限。
+    TooLarge(u64, u64),
+    /// 無い / ディレクトリ / 読めない。
+    Unavailable,
+}
+
+/// 設定キー: 行域を出すために読むファイルの上限 (バイト)。
+pub const KEY_GATE_READ_CAP: &str = "lease.gate_read_cap_bytes";
+
+/// このスコープで効いている読み取り上限 (バイト)。
+///
+/// 既定は [`GATE_READ_CAP`]。設定 [`KEY_GATE_READ_CAP`] で上げられる
+/// — **生成コード・lock・データファイルが 1MiB を超えるリポジトリでは、
+/// 上げるのが唯一の「行単位に戻す」手段**だから (フックは書き込みのたびに
+/// 走る短命プロセスなので、既定を上げると全員が I/O を払う)。
+/// `0` / 未設定 = 既定。
+///
+/// **既定より小さい値は既定へ引き上げる。** 呼び出し側は「既定を超えたとき
+/// だけ設定を引く」ので、下げた値は**ファイルの大きさによって効いたり
+/// 効かなかったりする**。効かない設定を受け付けるほうが、受け付けないより
+/// 質が悪い (利用者は下げたつもりでいる)。上げる方向だけが意味を持つ。
+fn configured_cap(root: &Path) -> u64 {
+    let cfg = crate::config::load(std::slice::from_ref(&root.to_path_buf()), false);
+    let v = cfg.feature_i64(KEY_GATE_READ_CAP);
+    if v <= 0 {
+        GATE_READ_CAP
+    } else {
+        (v as u64).max(GATE_READ_CAP)
     }
-    std::fs::read_to_string(abs).ok()
+}
+
+/// 判定のためにファイルを読む。**上限付き**。読めなかった**理由**まで返す版。
+///
+/// `root` は設定 ([`KEY_GATE_READ_CAP`]) を引くためのスコープ。
+/// **既定の上限を超えたときにだけ設定を読む** — フックは書き込みのたびに
+/// 走る短命プロセスなので、圧倒的多数を占める小さいファイルに
+/// TOML の読み込みを払わせない (設計原則 3)。
+/// 判定のためにファイルを読む (上限付き)。読めたときだけ中身を返す版。
+///
+/// 交錯の判定 ([`interleave_ok`]) を持つ関所 — `guard` / `czero` /
+/// `negotiate` — が錨を数えるために使う。**読めなければ `None`** で、
+/// 呼び出し側はそれを fail-closed (断る) として扱うこと。
+/// `root` は読み取り上限の設定 ([`KEY_GATE_READ_CAP`]) を引くスコープ。
+pub fn read_capped(abs: &Path, root: &Path) -> Option<String> {
+    match read_capped_ex(abs, root) {
+        FileRead::Text(s) => Some(s),
+        _ => None,
+    }
+}
+
+fn read_capped_ex(abs: &Path, root: &Path) -> FileRead {
+    let Ok(m) = std::fs::metadata(abs) else {
+        return FileRead::Unavailable;
+    };
+    if !m.is_file() {
+        return FileRead::Unavailable;
+    }
+    if m.len() > GATE_READ_CAP {
+        let cap = configured_cap(root);
+        if m.len() > cap {
+            return FileRead::TooLarge(m.len(), cap);
+        }
+    }
+    match std::fs::read_to_string(abs) {
+        Ok(s) => FileRead::Text(s),
+        Err(_) => FileRead::Unavailable,
+    }
 }
 
 /// 行域の並びを整える (昇順 + 安全帯以内は 1 本に畳む)。
@@ -2720,7 +3536,7 @@ fn touched_in(old: &str, input: &serde_json::Value) -> Option<Vec<crate::region:
 /// * **本物の競合は fail-closed**。
 ///
 /// ## 行域での判定 (ファイル単位からの置き換え)
-/// 1. 書き込み先の**現在の中身**を読む ([`read_capped`] — 上限 [`GATE_READ_CAP`])
+/// 1. 書き込み先の**現在の中身**を読む ([`read_capped_ex`] — 上限 [`GATE_READ_CAP`])
 /// 2. ペイロードから**書き込み後の中身**を作る ([`applied_text`])
 /// 3. [`crate::region::touched_spans`] で**実際に触れる行域**を出す
 /// 4. 触れた域が自分の域に収まっていれば通し ([`owns_touched`])、
@@ -2849,17 +3665,34 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
     // **中身は 1 回だけ読む。** 行域を出すのにも、台帳に載っている他人の行域を
     // 錨で取り直すのにも同じテキストが要る (`GATE_READ_CAP` = 1MiB の上限つき)。
     // 2 度読むとフックの往復が倍になり、短命プロセスがそのぶん遅くなる。
+    // 上限超えで行域を出せなかったファイル (拒否文へ添えるため)。
+    let mut cap_degraded: Option<(String, u64, u64)> = None;
     let (spans, text): (
         Vec<Option<Vec<crate::region::Span>>>,
         Option<std::sync::Arc<str>>,
     ) = if editing && targets.len() == 1 && !write.opaque {
-        match read_capped(&targets[0].0) {
-            Some(old) => {
+        match read_capped_ex(&targets[0].0, &roots.tree) {
+            FileRead::Text(old) => {
                 let input = v.get("tool_input").unwrap_or(&v);
                 let t = touched_in(&old, input);
                 (vec![t], Some(std::sync::Arc::from(old)))
             }
-            None => (vec![None], None),
+            // **上限超えは黙って落とさない。** 行域が出せない = 判定が
+            // ファイル全体へ落ちるということなので、監査に必ず残す
+            // (拒否されたときに「なぜ離れた行なのに」を追える唯一の手掛かり)。
+            FileRead::TooLarge(size, cap) => {
+                log_line(
+                    &dir,
+                    &format!(
+                        "cap-degraded {} {} size={size} cap={cap}",
+                        holder.display(),
+                        rels[0]
+                    ),
+                );
+                cap_degraded = Some((rels[0].clone(), size, cap));
+                (vec![None], None)
+            }
+            FileRead::Unavailable => (vec![None], None),
         }
     } else {
         (vec![None; targets.len()], None)
@@ -2894,7 +3727,7 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
         for (i, rel) in rels.iter().enumerate() {
             if let Verdict::Deny(reason) = judge(&st, i) {
                 log_line(&dir, &format!("deny {} {rel}", holder.display()));
-                return deny_answer(agent, &reason);
+                return deny_answer(agent, &with_cap_note(&reason, &cap_degraded));
             }
         }
         // **自分の域に全部収まっていて、期限にも余裕があるならロックを取らない。**
@@ -2992,7 +3825,7 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
                 &dir,
                 &format!("deny {} {}", holder.display(), rels.join(" ")),
             );
-            deny_answer(agent, &reason)
+            deny_answer(agent, &with_cap_note(&reason, &cap_degraded))
         }
         Ok(Verdict::Allow) => pass_answer(),
         Err(e) if is_lock_busy(&e) => {
@@ -3340,8 +4173,14 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
             help: "この時間だけ黙っている担当は所有権を失います。                   死んだエージェントにリポジトリを人質へ取らせないための上限です。",
             default: crate::feature::SettingValue::Int(30),
         },
+        crate::feature::Setting {
+            key: KEY_GATE_READ_CAP,
+            label: "行域を出すために読むファイルの上限 (バイト)",
+            help: "これを超えるファイルは「同じファイルの違う行」を分け合えず、ファイル全体の担当になります。                   生成コード・lock・データファイルが 1MiB を超えるリポジトリでは、上げるのが行単位に戻す唯一の手段です。                   既定より小さい値は既定へ引き上げます (下げても効かないため)。0 か未設定で既定 1MiB。",
+            default: crate::feature::SettingValue::Int(GATE_READ_CAP as i64),
+        },
     ],
-    binds: &[],
+    ..crate::feature::Feature::DEFAULT
 };
 
 /// 台帳の非同期読み取り 1 回ぶん。
@@ -4427,6 +5266,494 @@ pub fn check_one(
 mod tests {
     use super::*;
     use crate::test_util::unique_temp_dir;
+
+    // ── [高1] 絶対パスはスコープ相対へ畳む / 外なら断る ──────────────────
+    #[test]
+    fn 絶対パスはスコープ相対へ畳まれる() {
+        let tree = unique_temp_dir("zaivern-lease-test", "abs-claim");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::write(tree.join("src/a.rs"), "fn a(){}\n").unwrap();
+        let abs = tree.join("src/a.rs");
+        let got = resolve_spec_arg(&tree, &abs.to_string_lossy()).unwrap();
+        // **相対指定とまったく同じ鍵になること**が全て。ここがずれると
+        // 「確保しました」と言いながら 1 つも守らない。
+        assert_eq!(normalize_spec(&got), normalize_spec("src/a.rs"));
+        // 行域は 1 バイトも壊さない。
+        let with_frag = format!("{}#L10-20", abs.to_string_lossy());
+        assert_eq!(
+            normalize_spec(&resolve_spec_arg(&tree, &with_frag).unwrap()),
+            normalize_spec("src/a.rs#L10-20")
+        );
+        // 末尾の `/` (サブツリー) も保つ。
+        let dir_spec = format!("{}/", tree.join("src").to_string_lossy());
+        assert_eq!(
+            normalize_spec(&resolve_spec_arg(&tree, &dir_spec).unwrap()),
+            normalize_spec("src/")
+        );
+        // 相対はそのまま (従来の経路を 1 バイトも変えない)。
+        assert_eq!(resolve_spec_arg(&tree, "src/a.rs").unwrap(), "src/a.rs");
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn スコープ外の絶対パスは成功と偽らず断る() {
+        let tree = unique_temp_dir("zaivern-lease-test", "abs-outside");
+        let other = unique_temp_dir("zaivern-lease-test", "abs-outside-other");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let outside = other.join("x.rs");
+        let e = resolve_spec_arg(&tree, &outside.to_string_lossy()).unwrap_err();
+        assert!(e.contains("スコープの外"), "理由が判る文言であること: {e}");
+        let _ = std::fs::remove_dir_all(&tree);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn ツリー自身を指したら配下ぜんぶになる() {
+        let tree = unique_temp_dir("zaivern-lease-test", "abs-root");
+        std::fs::create_dir_all(&tree).unwrap();
+        let got = resolve_spec_arg(&tree, &tree.to_string_lossy()).unwrap();
+        assert_eq!(got, "**");
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    #[test]
+    fn 絶対パスの綴りは三種類とも固定する() {
+        // `normalize_path_on` と同じ流儀で、**動いている OS の綴りだけを
+        // 検査して満足しない**。Windows のドライブ / UNC も絶対として扱う。
+        for p in [
+            "/abs/x.rs",
+            "C:\\repo\\x.rs",
+            "\\\\srv\\share\\x.rs",
+            "\\abs\\x.rs",
+        ] {
+            assert!(is_absolute_any(p), "絶対として扱うべき: {p}");
+        }
+        for p in ["src/x.rs", "./src/x.rs", "x.rs"] {
+            assert!(!is_absolute_any(p), "相対として扱うべき: {p}");
+        }
+    }
+
+    // ── [中8] submodule は親と台帳を分ける ─────────────────────────────
+    #[test]
+    fn submoduleは名前の段数によらず自分の台帳を持つ() {
+        let root = unique_temp_dir("zaivern-lease-test", "submod");
+        let dot = root.join("parent/.git");
+        std::fs::create_dir_all(&dot).unwrap();
+        // 段数違いを両方固定する。**以前は 1 段だけ親へ畳まれていた**
+        // (= 名前の付け方で挙動が変わる、という取り違え)。
+        for name in ["flat", "vendor/sub", "deep/nest/sub"] {
+            let sub = root.join("parent").join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            let up = "../".repeat(name.split('/').count());
+            let text = format!("gitdir: {up}.git/modules/{name}\n");
+            let got = main_repo_root_from_pointer(&text, &sub).expect("解決できること");
+            assert_ne!(
+                got,
+                canonical_best_effort(&root.join("parent")),
+                "submodule ({name}) を親の台帳へ畳まない"
+            );
+            assert!(
+                got.to_string_lossy()
+                    .replace('\\', "/")
+                    .contains(".git/modules/"),
+                "鍵は submodule の git ディレクトリ: {got:?}"
+            );
+        }
+        // 通常の linked worktree は従来どおり**元のリポジトリ**へ寄る。
+        let wt = root.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let gd = root.join("parent/.git/worktrees/w1");
+        std::fs::create_dir_all(&gd).unwrap();
+        std::fs::write(gd.join("commondir"), "../..\n").unwrap();
+        let got = main_repo_root_from_pointer(&format!("gitdir: {}\n", gd.display()), &wt).unwrap();
+        assert_eq!(got, canonical_best_effort(&root.join("parent")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn submoduleのworktreeは本体と同じ台帳へ寄る() {
+        // submodule から生やした worktree は `commondir` 経由で
+        // **submodule 本体と同じ鍵**に着くこと (同じリポジトリなので
+        // マージ衝突が起き得る = 台帳を共有すべき組)。
+        let root = unique_temp_dir("zaivern-lease-test", "submod-wt");
+        let sub_git = root.join("parent/.git/modules/vendor/sub");
+        std::fs::create_dir_all(&sub_git).unwrap();
+        let body = root.join("parent/vendor/sub");
+        std::fs::create_dir_all(&body).unwrap();
+        let main_key =
+            main_repo_root_from_pointer("gitdir: ../../.git/modules/vendor/sub\n", &body).unwrap();
+        let wt_git = sub_git.join("worktrees/w1");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let wt = root.join("subwt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_key =
+            main_repo_root_from_pointer(&format!("gitdir: {}\n", wt_git.display()), &wt).unwrap();
+        assert_eq!(main_key, wt_key, "submodule 本体とその worktree は同じ鍵");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── [中7] ずらし幅の設定キーは交渉層と同じ綴り ────────────────────
+    #[test]
+    fn ずらし幅の設定キーは交渉層と同じ綴り() {
+        // 定数を import できない (実体が私有 `mod imp`) ので綴りを持っている。
+        // **ずれたら黙って既定へ落ちる**ので、実体のソースと突き合わせる。
+        // CRLF のチェックアウトでも外れないよう改行を正規化する。
+        let src = include_str!("negotiate.rs").replace("\r\n", "\n");
+        let needle = format!("pub const KEY_MAX_SHIFT: &str = \"{KEY_MAX_SHIFT}\";");
+        assert!(
+            src.contains(&needle),
+            "negotiate.rs の KEY_MAX_SHIFT と綴りが違う (探した: {needle})"
+        );
+    }
+
+    // ── [中7] ずらし幅の上限が効く ────────────────────────────────────
+    #[test]
+    fn ずらし幅の上限を超えたら理由を出して断る() {
+        let text: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let arc: std::sync::Arc<str> = std::sync::Arc::from(text.clone());
+        let mut store = Store::default();
+        // 先客が 1〜300 行を持っている → 新しい要求 (10-15) は 300 行超えないと入らない。
+        let a = holder("A", "sa");
+        assert!(matches!(
+            try_claim_wants(
+                &mut store,
+                &a,
+                &[Want {
+                    spec: "src/a.rs#L1-300".into(),
+                    anchor: crate::region::Anchor::default(),
+                    text: Some(arc.clone()),
+                }],
+                100,
+                600,
+                &dead,
+            ),
+            Claim::Granted(_)
+        ));
+        let b = holder("B", "sb");
+        let want = Want {
+            spec: "src/a.rs#L10-15".into(),
+            anchor: crate::region::Anchor::default(),
+            text: Some(arc.clone()),
+        };
+        // 上限 10 行では届かない → **断る。理由に必要な行数と上限が出る。**
+        let out = try_claim_wants_shift(
+            &mut store.clone(),
+            &b,
+            &[want.clone()],
+            100,
+            600,
+            &dead,
+            Some(10),
+        );
+        match out {
+            ShiftClaim::Refused { owner, .. } => {
+                assert!(owner.contains("10"), "上限を出すこと: {owner}");
+                assert!(
+                    owner.contains("ずらす必要") || owner.contains("上限"),
+                    "断る理由が具体的であること: {owner}"
+                );
+            }
+            other => panic!("上限を超えたのに通った: {other:?}"),
+        }
+        // 上限を十分に取れば通る (上限判定だけが効いていること = 空きはある)。
+        let out = try_claim_wants_shift(&mut store, &b, &[want], 100, 600, &dead, Some(1000));
+        assert!(matches!(out, ShiftClaim::Granted(_)), "空きはあるので通る");
+    }
+
+    #[test]
+    fn 上限内のずらしは従来どおり通る() {
+        // **上限を入れたせいで今まで通っていたものが落ちない**ことを固定する。
+        let text: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let arc: std::sync::Arc<str> = std::sync::Arc::from(text);
+        let mut store = Store::default();
+        let a = holder("A", "sa");
+        try_claim_wants(
+            &mut store,
+            &a,
+            &[Want {
+                spec: "src/a.rs#L10-20".into(),
+                anchor: crate::region::Anchor::default(),
+                text: Some(arc.clone()),
+            }],
+            100,
+            600,
+            &dead,
+        );
+        let b = holder("B", "sb");
+        let out = try_claim_wants_shift(
+            &mut store,
+            &b,
+            &[Want {
+                spec: "src/a.rs#L12-18".into(),
+                anchor: crate::region::Anchor::default(),
+                text: Some(arc),
+            }],
+            100,
+            600,
+            &dead,
+            Some(50),
+        );
+        assert!(
+            matches!(out, ShiftClaim::Granted(_)),
+            "近くへずらせる: {out:?}"
+        );
+    }
+
+    // ── [中4] 上限超えは「読めない」ではなく「大きすぎる」と言う ────────
+    #[test]
+    fn 上限超えのファイルは理由を取り違えない() {
+        let tree = unique_temp_dir("zaivern-lease-test", "cap");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        let big: String = (0..(GATE_READ_CAP / 16 + 64))
+            .map(|i| format!("// pad line {i}\n"))
+            .collect();
+        assert!(big.len() as u64 > GATE_READ_CAP, "上限を超える大きさを作る");
+        std::fs::write(tree.join("src/big.rs"), &big).unwrap();
+        match read_capped_ex(&tree.join("src/big.rs"), &tree) {
+            FileRead::TooLarge(size, cap) => {
+                assert!(size > cap, "実サイズと上限の両方を返す");
+            }
+            other => panic!("上限超えとして返すこと: {other:?}"),
+        }
+        // 実在しないものは Unavailable (2 つを同じ値へ潰さない)。
+        assert_eq!(
+            read_capped_ex(&tree.join("src/nope.rs"), &tree),
+            FileRead::Unavailable
+        );
+        // **行域はそのまま確保できる** (中身を読まなくても成立する)。
+        let w = hydrate_in(&tree, "src/big.rs#L10-20").expect("行域は通る");
+        assert_eq!(spec_span(&w.spec).map(|s| s.start), Some(10));
+        // 記号指定だけが断られ、**文言は「大きすぎる」**であること。
+        let e = hydrate_in(&tree, "src/big.rs#fn:nope").unwrap_err();
+        assert!(e.contains("上限"), "理由が「上限超え」と判ること: {e}");
+        assert!(
+            !e.contains("読めませんでした"),
+            "「読めない」と取り違えない: {e}"
+        );
+        // 劣化の告知が出ること (黙って全体所有へ落とさない)。
+        let note = degradation_note(&tree, "src/big.rs#L10-20").expect("劣化を告げる");
+        assert!(
+            note.contains("ファイル全体"),
+            "何が起きるかを言うこと: {note}"
+        );
+        // 小さいファイルでは何も言わない (雑音を足さない)。
+        std::fs::write(tree.join("src/small.rs"), "fn a(){}\n").unwrap();
+        assert_eq!(degradation_note(&tree, "src/small.rs#L1-2"), None);
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    // ── [中5] 非 git はサブフォルダごとに台帳を割らない ────────────────
+    #[test]
+    fn 非gitのサブフォルダは同じルートに寄る() {
+        let root = unique_temp_dir("zaivern-lease-test", "nogit");
+        let deep = root.join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        // まだ台帳が無い = 「推測」なので `git` は false。
+        let r = roots_of(&deep);
+        assert!(!r.rooted, "git でも既存の台帳でもないので推測と判る");
+        // ルートに台帳があれば、配下は**そこへ寄る** (別々に生えない)。
+        let want = canonical_best_effort(&root);
+        let ((key, _), rooted) = roots_raw_with(&deep, &|p| p == want);
+        assert!(rooted, "既存の台帳があるので確定扱い");
+        assert_eq!(key, want, "配下は既存の台帳のあるルートへ寄る");
+        // 台帳がどこにも無ければ、3 つの深さが**同じ答え**にはならないが、
+        // `git == false` で呼び出し元が断れる (静かに割らない)。
+        for d in [root.as_path(), root.join("a").as_path(), deep.as_path()] {
+            assert!(!roots_raw_with(d, &|_| false).1, "推測と判ること: {d:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gitがあればrootsはgit判定になる() {
+        let root = unique_temp_dir("zaivern-lease-test", "withgit");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let deep = root.join("src/x");
+        std::fs::create_dir_all(&deep).unwrap();
+        let r = roots_of(&deep);
+        assert!(r.rooted, ".git があれば推測ではない");
+        assert_eq!(r.key, canonical_best_effort(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── 自分の域は、追従しても手放さない ──────────────────────────────
+    #[test]
+    fn 自分の域は取り直しで移動しても元の場所を手放さない() {
+        // **これが「2 人が同じ行を書く」の原因だった。**
+        // 持ち主が自分の行を書き換えると自分の錨が合わなくなり、
+        // `region::resolve` が**似た行**へ吸い寄せられて域が「移動」する。
+        // 移動した瞬間、元の行が空いたことになって他人が取れてしまう。
+        //
+        // 実測 (`tools/anyrepo-prove.sh --repo hyperframes --writers 8`,
+        // 種 20260818): `README.md#L21` を持つ書き手が同じファイルの別の域を
+        // 確保し直した瞬間に L21 → L15 へ移動し、21 行目を 2 人が書いた。
+        //
+        // 似た行だらけのテキストを使って、その状況をそのまま作る。
+        let same_line = "";
+        let text: String = (1..=40)
+            .map(|i| {
+                if i == 15 || i == 21 {
+                    format!("{same_line}\n")
+                } else {
+                    format!("unique line {i}\n")
+                }
+            })
+            .collect();
+        let arc: std::sync::Arc<str> = std::sync::Arc::from(text.clone());
+        let mut pats = vec!["a.md#L21".to_string()];
+        // 錨は「21 行目の中身」= 他の行と見分けが付かない中身。
+        let mut ancs = vec![crate::region::capture_anchor(
+            &text,
+            &crate::region::Span { start: 21, end: 21 },
+        )];
+        // 同じファイルの**別の**域を確保し直す。
+        let want = Want {
+            spec: "a.md#L5".to_string(),
+            anchor: crate::region::capture_anchor(&text, &crate::region::Span { start: 5, end: 5 }),
+            text: Some(arc),
+        };
+        absorb(&mut pats, &mut ancs, &want);
+        // **21 行目を覆っている域が必ず残っていること。**
+        let covers21 = pats.iter().any(|p| {
+            spec_span(p).is_some_and(|s| {
+                s.start <= 21 && (s.end == crate::region::Span::EOF || s.end >= 21)
+            })
+        });
+        assert!(
+            covers21,
+            "自分の域が 21 行目を手放した (他人が同じ行を取れてしまう): {pats:?}"
+        );
+    }
+
+    // ── 置き去りロックの奪取は原子的でなければならない ────────────────
+    #[test]
+    fn 奪取は張りたての別のロックを消さない() {
+        // **これが「二重配布」と「取りこぼし」の単一原因だった。**
+        // 奪取が `remove_file` + `create_new` の 2 手だったころは、
+        //   1. P2 が消す → P2 が張る (P2 が握った)
+        //   2. P3 が消す ← **P2 の張りたてが消える** → P3 も張る
+        // と進んで 2 人が同時に臨界区間へ入り、後の書き戻しが先の予約を
+        // 消していた。**時計に依存しない形**で、その 2 手目を固定する。
+        let dir = unique_temp_dir("zaivern-lease-test", "steal-fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("s.json");
+        let lock = store.with_extension("lock");
+
+        // P2 と P3 がどちらも「古いロック old」を観測した状況を作る。
+        std::fs::write(&lock, "old").unwrap();
+        // P2 が奪う (正当) 。
+        steal_stale_lock(&lock, "old");
+        assert!(!lock.exists(), "正当な奪取は置き去りを外す");
+        // P2 が張り直した = **生きている新しい持ち主**。
+        std::fs::write(&lock, "fresh-owner").unwrap();
+        // P3 が、古い観測 old のまま遅れて奪いに来る。
+        steal_stale_lock(&lock, "old");
+        assert!(lock.exists(), "張りたての別のロックを消してはいけない");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "fresh-owner",
+            "持ち主が入れ替わっていない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 同じ置き去りを二人が奪っても外れるのは一度だけ() {
+        // `rename` は**元が在るときしか成功しない**ので、奪取そのものが
+        // 直列化される。同じ観測を持つ 2 人が奪いに行っても、
+        // 置き去りが外れるのは 1 度だけで、2 人目は何も壊さない。
+        let dir = unique_temp_dir("zaivern-lease-test", "steal-once");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("s.lock");
+        std::fs::write(&lock, "old").unwrap();
+        steal_stale_lock(&lock, "old");
+        assert!(!lock.exists(), "1 人目が外す");
+        // 2 人目は同じ観測のまま遅れて来る。**何も起きてはいけない。**
+        steal_stale_lock(&lock, "old");
+        assert!(!lock.exists(), "2 人目は何も壊さない");
+        // 新しい持ち主が張ったあとなら、2 人目の遅れた奪取でも消えない。
+        std::fs::write(&lock, "fresh").unwrap();
+        steal_stale_lock(&lock, "old");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            "fresh",
+            "新しい持ち主のロックは残る"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 混雑しても同時に握るのは一人だけ() {
+        // 置き去りが無い普通の混雑では、誰も奪わないので相互排除は自明に
+        // 保たれる。**重なりが起きたら必ず捕まる**形で押さえておく。
+        let dir = unique_temp_dir("zaivern-lease-test", "lock-excl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("s.json");
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worst = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..16 {
+            let (store, live, worst) = (store.clone(), live.clone(), worst.clone());
+            hs.push(std::thread::spawn(move || {
+                use std::sync::atomic::Ordering::SeqCst;
+                for _ in 0..8 {
+                    if let Ok(g) = acquire_lock_in(&store, LOCK_STALE_MS) {
+                        let n = live.fetch_add(1, SeqCst) + 1;
+                        worst.fetch_max(n, SeqCst);
+                        std::thread::yield_now();
+                        live.fetch_sub(1, SeqCst);
+                        drop(g);
+                    }
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            worst.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "同時に 2 人が臨界区間へ入った"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 奪われた側は他人のロックを外さない() {
+        // 奪取のあと、**奪われた側の `Drop`** が新しい持ち主のロックを
+        // 消してしまうと、そこから先はロックが無いのと同じになる。
+        let dir = unique_temp_dir("zaivern-lease-test", "steal-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("s.json");
+        let lock = store.with_extension("lock");
+        let victim = acquire_lock_in(&store, LOCK_STALE_MS).expect("最初は取れる");
+        // 別の持ち主が張り直した状況を作る (中身が変わる = 別の握り)。
+        std::fs::write(&lock, "another-owner").unwrap();
+        drop(victim);
+        assert!(
+            lock.exists(),
+            "自分のものでないロックを外してはいけない (外すと相互排除が消える)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 生きているロックは奪わない() {
+        let dir = unique_temp_dir("zaivern-lease-test", "steal-live");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("s.json");
+        let held = acquire_lock_in(&store, LOCK_STALE_MS).expect("取れる");
+        // 置き去り閾値 (既定) には遠い = 奪ってはいけない。
+        let e = match acquire_lock_in(&store, LOCK_STALE_MS) {
+            Err(e) => e,
+            Ok(_) => panic!("先客が居るのに 2 人目が握れた = 相互排除が壊れている"),
+        };
+        assert!(is_lock_busy(&e), "混雑として返すこと: {e}");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn dead(_: u32) -> bool {
         false
@@ -5681,7 +7008,10 @@ mod span_tests {
     /// `gate` が組み立てているのとまったく同じ「実ファイル → 触れた行域」。
     /// 本番では読んだテキストを錨の取り直しにも使い回すので 2 段になっている。
     fn touched_of(input: &serde_json::Value, abs: &Path) -> Option<Vec<Span>> {
-        touched_in(&read_capped(abs)?, input)
+        let FileRead::Text(body) = read_capped_ex(abs, abs.parent().unwrap_or(abs)) else {
+            return None;
+        };
+        touched_in(&body, input)
     }
 
     fn dead(_: u32) -> bool {
@@ -6519,9 +7849,567 @@ mod span_tests {
         (1..=total).map(|i| format!("line {i}\n")).collect()
     }
 
+    /// **書き手を倍にしても成立率が落ちない (出荷経路・設定は既定のまま)。**
+    ///
+    /// ## この試験が要る理由 (静かな嘘があった)
+    ///
+    /// 隣の [`tests::crowded_な担当表でも六十四体全部がずらして入る`] は
+    /// `max_shift = None` (**上限なし**) で 64/64 を主張していた。ところが
+    /// 出荷経路の `zai lease claim --shift` は
+    /// [`default_max_shift_in`] = **200 行**を渡す。単体試験が全部緑なのに
+    /// `tools/coedit-bench.sh --agents 64 --lines 2000 --layout crowded` は
+    /// 6 回とも **51〜54 完了 / 10〜13 拒否**だった。
+    /// **上限を外した経路しか測っていなかった。**
+    ///
+    /// ここは**設定の既定値そのまま**で測り、しかも `n` を倍にしていく。
+    /// 固定上限 `m` は `n ≤ 2m/(幅+安全帯)` という体数の天井を作るので、
+    /// 倍にすればどこかで必ず成立率が落ちる。[`shift_ceiling`] が混雑ぶんを
+    /// 足すので落ちない。
+    #[test]
+    fn 書き手を倍にしても成立率が落ちない() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-scale");
+        std::fs::write(dir.join("a.rs"), body(2000)).expect("中身を置く");
+        // **出荷経路とまったく同じ既定値**を使う (設定が無ければ 200 行)。
+        let cfg = default_max_shift_in(&dir);
+        assert!(
+            cfg > 0,
+            "既定が 0 だと「ずらすな」になり、この試験が空になる"
+        );
+        let mut rates: Vec<(u32, usize, usize)> = Vec::new();
+        for n in [16u32, 32, 64, 128] {
+            let plan = crowded_plan(n, 2000);
+            let mut store = Store::default();
+            let (mut granted, mut refused) = (0usize, 0usize);
+            for (i, p) in plan.iter().enumerate() {
+                match try_claim_shift_in(
+                    &dir,
+                    &mut store,
+                    &who(&format!("S{n}_{i}")),
+                    std::slice::from_ref(p),
+                    100,
+                    600,
+                    &dead,
+                    Some(cfg), // ← ここが `None` だと何も守れない
+                ) {
+                    ShiftClaim::Granted(_) => granted += 1,
+                    ShiftClaim::Refused { .. } => refused += 1,
+                }
+            }
+            rates.push((n, granted, refused));
+            assert_eq!(
+                refused, 0,
+                "n={n} 体・上限 {cfg} 行で {refused} 件を断った (完了 {granted})"
+            );
+            // 台帳の中身も互いに素であること (通した代わりに重ねていない)
+            let regions: Vec<crate::region::Region> = store
+                .leases
+                .iter()
+                .flat_map(|l| l.patterns.iter().map(|p| spec_region(p)))
+                .collect();
+            assert_eq!(regions.len(), n as usize, "畳まれて減っている");
+            assert!(
+                crate::region::is_disjoint(&regions, SAFE_BAND),
+                "n={n} で重なった担当が台帳に載った"
+            );
+            for r in &regions {
+                let s = r.span.expect("行域");
+                assert!(s.start >= 1 && s.end <= 2000, "ファイルの外: {s:?}");
+            }
+        }
+        eprintln!("出荷既定 {cfg} 行での (体数, 完了, 拒否): {rates:?}");
+    }
+
+    /// **上限に当たったときの文面に、渡すべき数がそのまま出る。**
+    #[test]
+    fn 上限に当たった文面は渡すべき数まで出す() {
+        let dir = unique_temp_dir("zaivern", "lease-shift-msg");
+        std::fs::write(dir.join("a.rs"), body(400)).expect("中身を置く");
+        let mut store = Store::default();
+        // 先客が 1〜300 行 → 要求 L10-15 は 300 行超えないと入らない。
+        assert!(matches!(
+            try_claim_shift_in(
+                &dir,
+                &mut store,
+                &who("A"),
+                &["a.rs#L1-300".to_string()],
+                100,
+                600,
+                &dead,
+                Some(10),
+            ),
+            ShiftClaim::Granted(_)
+        ));
+        match try_claim_shift_in(
+            &dir,
+            &mut store,
+            &who("B"),
+            &["a.rs#L10-15".to_string()],
+            100,
+            600,
+            &dead,
+            Some(10),
+        ) {
+            ShiftClaim::Refused { owner, .. } => {
+                eprintln!("文面: {owner}");
+                assert!(owner.contains("294"), "必要な距離が出ていない: {owner}");
+                assert!(owner.contains("--max-shift"), "渡し方が無い: {owner}");
+                assert!(owner.contains(KEY_MAX_SHIFT), "設定キーが無い: {owner}");
+                // **`cli::refusal` の文型判定を通る形か。** `:` が無いと
+                // 「…通ります が持っています」になる (実バイナリで出た)。
+                assert!(
+                    owner.contains(':'),
+                    "見出しの区切りが無い = 持ち主名として流し込まれる: {owner}"
+                );
+            }
+            other => panic!("上限を超えたのに通った: {other:?}"),
+        }
+    }
+
+    // ── 交錯 (帯だけでは足りない唯一の形) ───────────────────────────
+
+    /// 周期 `p` の反復本文を `n` 行 (`region::tests::periodic` と同じ作り)。
+    fn 反復本文(p: usize, n: u32) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let mut s: String = (0..n)
+            .map(|i| format!("{}\n", POOL[(i as usize) % p]))
+            .collect();
+        s.push_str("tail\n");
+        s
+    }
+
+    /// `lines` の各行の末尾へ印を足す (1 行ぶんの置換を複数箇所に置く)。
+    fn 触る(base: &str, lines: &[u32], tag: &str) -> String {
+        base.lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if lines.contains(&((i + 1) as u32)) {
+                    format!("{l}  <<{tag}>>\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect()
+    }
+
+    /// `git merge-tree --write-tree` の答え。`Some(true)` = 衝突。
+    ///
+    /// **`git merge-file` では測らない。** あちらは `XDL_MERGE_ZEALOUS_ALNUM`
+    /// + myers で `git merge` より寛容なので、実際には失敗する組を clean と
+    /// 答える (これで測定が狂っていた実績がある)。
+    fn 実gitの答え(dir: &Path, base: &str, ours: &str, theirs: &str) -> Option<bool> {
+        let repo = dir.join("merge-lab");
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).ok()?;
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", repo.join("no-such-gitconfig"))
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args([
+                    "-c",
+                    "core.autocrlf=false",
+                    "-c",
+                    "user.name=zai",
+                    "-c",
+                    "user.email=zai@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "-q"]) {
+            return None;
+        }
+        let f = repo.join("a.md");
+        std::fs::write(&f, base).ok()?;
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+        run(&["checkout", "-qb", "ours"]);
+        std::fs::write(&f, ours).ok()?;
+        run(&["commit", "-qam", "ours"]);
+        run(&["checkout", "-q", "-"]);
+        run(&["checkout", "-qb", "theirs"]);
+        std::fs::write(&f, theirs).ok()?;
+        run(&["commit", "-qam", "theirs"]);
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", repo.join("no-such-gitconfig"))
+            .args(["merge-tree", "--write-tree", "ours", "theirs"])
+            .output()
+            .ok()?;
+        match out.status.code() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None, // 引数を知らない古い git — 判断しない
+        }
+    }
+
+    /// **確保の関所が交錯を止める。** ここが赤くなったら、`region` が直した
+    /// 判定 (`interleaved` / `interleave_safe`) が出荷経路から外れている。
+    ///
+    /// 組ごとの帯 (`SAFE_BAND`) は全部満たしているのに、`git merge` は衝突する
+    /// 配り方を使う (`region::tests::実gitで周期的な本文では…` と同じ形)。
+    #[test]
+    fn 交錯した確保は関所が断る() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave");
+        let body = 反復本文(6, 60);
+        std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        // B が 13 / 25 行目 (自分どうしなので交錯しない)
+        for spec in ["a.md#L13-13", "a.md#L25-25"] {
+            assert!(
+                matches!(
+                    try_claim_in(&dir, &mut store, &b, &[spec.into()], now, 600, &|_| false),
+                    Claim::Granted(_)
+                ),
+                "B の {spec} が取れない"
+            );
+        }
+        // 前提: どの組も帯を満たしている (= 帯だけの判定は「素」と言う)
+        for l in [13u32, 25] {
+            assert!(
+                !crate::region::spans_too_close(
+                    &crate::region::Span::line(17),
+                    &crate::region::Span::line(l),
+                    crate::region::SAFE_BAND
+                ),
+                "前提が崩れている: 17 と {l} は帯を満たすはず"
+            );
+        }
+        // A が 17 行目 = B を上下から挟む
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["a.md#L17-17".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        match got {
+            Claim::Refused { owner, .. } => assert!(
+                owner.contains("交錯"),
+                "交錯として断っていない (帯の文面が出ている): {owner}"
+            ),
+            other => panic!("交錯を通してしまった: {other:?}"),
+        }
+        // **離れていれば従来どおり通る** (交錯の検査で全部が固まっていない)
+        let far = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["a.md#L40-40".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        assert!(
+            matches!(far, Claim::Granted(_)),
+            "挟まない域まで断った: {far:?}"
+        );
+    }
+
+    /// **実 git が衝突する組を、関所が 1 つも取りこぼさない。**
+    ///
+    /// 向きは片側だけであることに注意する — `interleave_safe` は錨が無ければ
+    /// **分からない側へ倒す**ので、「断った ⇒ 必ず衝突する」は成り立たない
+    /// (実際に周期 6・60 行の 17 対 13/25 は綺麗に通るが、関所は断る)。
+    /// ここが守るのは**見逃しゼロ**のほうで、断りすぎていないことは
+    /// [`一意な本文なら交錯していても通す`] が別に押さえる。
+    ///
+    /// 時間は 1 秒も測らない (git の速さは環境で 10 倍変わる)。
+    #[test]
+    fn 実gitが衝突する交錯を関所が取りこぼさない() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-git");
+        // `region::tests::実gitで周期的な本文では帯を満たしても衝突する` と
+        // 同じ形。周期を変えても穴は残る。
+        let table: &[(usize, &[u32], u32)] = &[
+            (6, &[5, 13, 25], 17),
+            (3, &[5, 13, 25], 17),
+            (1, &[5, 13, 25], 17),
+            (6, &[3, 15, 22, 60], 44),
+        ];
+        let mut 衝突した = 0u32;
+        for (p, theirs, mine) in table {
+            let body = 反復本文(*p, 400);
+            std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+            // 前提: どの組も帯を満たしている (= 帯だけの判定は「素」と言う)
+            for l in theirs.iter() {
+                assert!(
+                    !crate::region::spans_too_close(
+                        &crate::region::Span::line(*mine),
+                        &crate::region::Span::line(*l),
+                        crate::region::SAFE_BAND
+                    ),
+                    "前提が崩れている: {mine} と {l} は帯を満たすはず"
+                );
+            }
+            let ours = 触る(&body, &[*mine], "OURS");
+            let th = 触る(&body, theirs, "THEIRS");
+            let Some(衝突) = 実gitの答え(&dir, &body, &ours, &th) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            if !衝突 {
+                continue;
+            }
+            衝突した += 1;
+            let granted = 挟んで確保できるか(&dir, theirs, *mine);
+            assert!(
+                !granted,
+                "実 git が衝突する組を関所が通した: 周期 {p} / 相手 {theirs:?} / 自分 {mine}"
+            );
+        }
+        assert!(
+            衝突した > 0,
+            "1 件も衝突しないなら、この穴の前提が変わっている (git の側を測り直すこと)"
+        );
+    }
+
+    /// **断りすぎていない。** 行がすべて違う本文なら、挟んでいても錨が
+    /// 立つので確保できる。ここが赤くなったら、交錯の検査が「常に断る」に
+    /// なっている (= 帯の意味まで消している)。
+    #[test]
+    fn 一意な本文なら交錯していても通す() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-unique");
+        let body: String = (1..=60).map(|i| format!("行 {i} は他と違う\n")).collect();
+        std::fs::write(dir.join("a.md"), &body).expect("本文を置く");
+        assert!(
+            挟んで確保できるか(&dir, &[13, 25], 17),
+            "一意な本文なのに挟んだ域を断った (厳しすぎる)"
+        );
+        if let Some(衝突) = 実gitの答え(
+            &dir,
+            &body,
+            &触る(&body, &[17], "OURS"),
+            &触る(&body, &[13, 25], "THEIRS"),
+        ) {
+            assert!(!衝突, "一意な本文なのに実 git が衝突した (前提が変わった)");
+        }
+    }
+
+    /// B が `theirs` を持っている台帳で、A が `mine` 行を取れるか。
+    fn 挟んで確保できるか(dir: &Path, theirs: &[u32], mine: u32) -> bool {
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        for l in theirs {
+            let spec = format!("a.md#L{l}-{l}");
+            assert!(
+                matches!(
+                    try_claim_in(dir, &mut store, &b, &[spec], now, 600, &|_| false),
+                    Claim::Granted(_)
+                ),
+                "B の {l} 行目が取れない"
+            );
+        }
+        matches!(
+            try_claim_in(
+                dir,
+                &mut store,
+                &a,
+                &[format!("a.md#L{mine}-{mine}")],
+                now,
+                600,
+                &|_| false
+            ),
+            Claim::Granted(_)
+        )
+    }
+
+    /// **本文が読めないときは fail-closed。**
+    ///
+    /// 錨は元の本文からしか数えられない。読めないときに「帯だけ」へ落とすと、
+    /// いちばん判定が効いてほしい場面 (生成物・巨大なデータファイル) でだけ
+    /// 静かに緩む。空の錨を必ず `false` にする `region::interleave_safe` と
+    /// 同じ向きであることを固定する。
+    #[test]
+    fn 本文が読めなければ交錯は通さない() {
+        // 実ファイルを置かない = `hydrate_in` が `Want::text` を埋められない
+        let dir = unique_temp_dir("zaivern", "lease-interleave-noread");
+        let now = now_secs();
+        let mut store = Store::default();
+        let b = Holder {
+            agent: "B".into(),
+            cwd: "/b".into(),
+            ..Default::default()
+        };
+        let a = Holder {
+            agent: "A".into(),
+            cwd: "/a".into(),
+            ..Default::default()
+        };
+        for spec in ["nope.md#L13-13", "nope.md#L25-25"] {
+            assert!(matches!(
+                try_claim_in(&dir, &mut store, &b, &[spec.into()], now, 600, &|_| false),
+                Claim::Granted(_)
+            ));
+        }
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &a,
+            &["nope.md#L17-17".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        match got {
+            Claim::Refused { owner, .. } => {
+                assert!(owner.contains("交錯"), "交錯として断っていない: {owner}");
+                // **劣化したことを黙らせない** — 読めなかったと文面に出す
+                assert!(
+                    owner.contains(KEY_GATE_READ_CAP),
+                    "読めなかったことが文面に出ていない: {owner}"
+                );
+            }
+            other => panic!("本文が読めないのに交錯を通した: {other:?}"),
+        }
+    }
+
+    /// `interleave_ok` は交錯していない組では錨を 1 度も数えない (費用の番人)。
+    ///
+    /// 関所は書き込みのたびに走る短命プロセスなので、`anchor_lines`
+    /// (ファイル全体の走査) を毎回払うと重い。**交錯していない = 普段の形**
+    /// では本文が `None` でも通ることで、走査していないことを固定する。
+    #[test]
+    fn 交錯していなければ本文を読まずに通す() {
+        let s = |a: u32, b: u32| crate::region::Span { start: a, end: b };
+        // 互いに素 — 本文が無くても通る
+        assert!(interleave_ok(None, &[s(10, 12)], &[s(30, 32)]));
+        assert!(interleave_ok(None, &[s(30, 32)], &[s(10, 12)]));
+        // 挟んでいる — 本文が無ければ断る
+        assert!(!interleave_ok(None, &[s(20, 20)], &[s(10, 10), s(30, 30)]));
+    }
+
+    /// **交錯の検査は、互いに素な配り方の費用を増やさない。**
+    ///
+    /// 関所は書き込みのたびに走る短命プロセスなので、ここが太ると全員が
+    /// 払う。1 回がファイル全長の走査になる [`Lease::live_span_of`] の
+    /// **呼び出し回数**で固定する (時間で線を引かない — 環境で 10 倍動く)。
+    ///
+    /// 実測 (`zai lease claim` を 64 回・互いに素・2000 行):
+    /// 直す前 4421ms / 入れた直後 5082ms (+15%) / screening 後 4325ms。
+    /// 回数で見れば理由は自明で、交錯の検査が担当 N 人ぶん本文を
+    /// 走査し直していた。**両方が 1 本ずつなら交錯は起こり得ない**ので
+    /// (外接域 = 域そのもの、かつ帯を通っている = 重ならない)、
+    /// そこを厳密に飛ばす。
+    #[test]
+    fn 互いに素な確保では本文を走査し直さない() {
+        let dir = unique_temp_dir("zaivern", "lease-interleave-cost");
+        let body: String = (1..=2000)
+            .map(|i| format!("fn f{i}() {{ {i} }}\n"))
+            .collect();
+        std::fs::write(dir.join("a.rs"), &body).expect("本文を置く");
+        let now = now_secs();
+        let mut store = Store::default();
+        // 64 体が互いに素な域を 1 本ずつ持つ (ベンチと同じ形)
+        for i in 0..64u32 {
+            let h = Holder {
+                agent: format!("ag{i}"),
+                cwd: format!("/w/{i}"),
+                ..Default::default()
+            };
+            let (s0, e0) = (10 + i * 30, 15 + i * 30);
+            let got = try_claim_in(
+                &dir,
+                &mut store,
+                &h,
+                &[format!("a.rs#L{s0}-{e0}")],
+                now,
+                600,
+                &|_| false,
+            );
+            assert!(
+                matches!(got, Claim::Granted(_)),
+                "{i} 番目が取れない: {got:?}"
+            );
+        }
+        // 65 人目。**他人は全員 1 本ずつなので、交錯の検査は 1 回も
+        // 本文を走査してはいけない** (帯の検査ぶんだけが残る)。
+        let last = Holder {
+            agent: "ag64".into(),
+            cwd: "/w/64".into(),
+            ..Default::default()
+        };
+        scan_count::reset();
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &last,
+            &["a.rs#L1930-1935".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        let scans = scan_count::get();
+        assert!(
+            matches!(got, Claim::Granted(_)),
+            "65 人目が取れない: {got:?}"
+        );
+        // 帯の検査 (`overlaps_live`) が担当ごとに 1 回。交錯の検査ぶんが
+        // 乗っていれば 2 倍になる。
+        eprintln!("64 体の台帳へ 1 件確保: 本文の走査 {scans} 回");
+        assert!(
+            scans <= store.leases.len() as u64,
+            "交錯の検査が本文の走査を増やしている: {scans} 回 (上限 {})",
+            store.leases.len()
+        );
+    }
+
+    /// **断る理由は必ず「見出し `:` 本文」の形にする。**
+    ///
+    /// `cli::refusal` は `:` の有無だけで「持ち主の名前」と「理由」を
+    /// 見分けて文型を変える。理由に `:` が無いと
+    /// 「`… 通ります` **が持っています**」という意味の通らない 1 行になる。
+    /// 新しい理由を足した人が気付けるよう、ソースを読んで固定する。
+    #[test]
+    fn 断る理由は必ず見出しに区切りを持つ() {
+        let src = include_str!("lease.rs").replace("\r\n", "\n");
+        // `try_claim_wants_shift` が自分で組み立てる理由 (持ち主名ではない) は
+        // これ 1 つ。増えたらここも増やすこと。
+        let needle = "\"ずらせる上限に当たりました: ";
+        assert!(
+            src.contains(needle),
+            "ずらし上限の理由が見出し付きでない (探した: {needle})"
+        );
+    }
+
     /// **ベンチの crowded 条件で「拒否 0」になることの直接の証拠。**
     ///
     /// 行域だけの実測は 完了 11 / 拒否 53 / 衝突 0。ここが 64 / 0 になる。
+    ///
+    /// **上限なし (`None`) の経路**を押さえる。出荷経路が渡す既定値
+    /// (200 行) での成立率は [`tests::書き手を倍にしても成立率が落ちない`]
+    /// が別に測る — ここだけだと「上限を外した経路しか測っていない」という
+    /// 静かな嘘になる (実際になっていた)。
     #[test]
     fn crowded_な担当表でも六十四体全部がずらして入る() {
         let dir = unique_temp_dir("zaivern", "lease-shift-crowded");
@@ -6540,6 +8428,7 @@ mod span_tests {
                 100,
                 600,
                 &dead,
+                None,
             ) {
                 ShiftClaim::Granted(gs) => {
                     assert_eq!(gs.len(), 1, "1 件の要求に 1 件の結果");
@@ -6609,6 +8498,7 @@ mod span_tests {
                     100,
                     600,
                     &dead,
+                    None,
                 ) {
                     ShiftClaim::Granted(gs) => out.push(gs[0].spec.clone()),
                     ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
@@ -6673,6 +8563,7 @@ mod span_tests {
                         100,
                         600,
                         &dead,
+                        None,
                     )
                 })
             }));
@@ -6710,6 +8601,7 @@ mod span_tests {
                     100,
                     600,
                     &dead,
+                    None,
                 )
             })
             .expect("取り直しは通る");
@@ -6765,6 +8657,7 @@ mod span_tests {
                 100,
                 600,
                 &dead,
+                None,
             ) {
                 ShiftClaim::Granted(gs) => {
                     assert_eq!(gs.len(), 1);
@@ -6794,6 +8687,7 @@ mod span_tests {
             100,
             600,
             &dead,
+            None,
         ) {
             ShiftClaim::Granted(gs) => gs,
             ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
@@ -6829,7 +8723,8 @@ mod span_tests {
                 &["a.rs#L100-120".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Granted(_)
         ));
@@ -6841,6 +8736,7 @@ mod span_tests {
             100,
             600,
             &dead,
+            None,
         ) {
             ShiftClaim::Granted(gs) => gs[0].spec.clone(),
             ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),
@@ -6882,7 +8778,8 @@ mod span_tests {
                         &[spec.to_string()],
                         100,
                         600,
-                        &dead
+                        &dead,
+                        None,
                     ),
                     ShiftClaim::Refused { .. }
                 ),
@@ -6907,7 +8804,8 @@ mod span_tests {
                 &["ghost.rs#L12-22".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Refused { .. }
         ));
@@ -6929,7 +8827,8 @@ mod span_tests {
                 &["a.rs#L1-60".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Refused { .. }
         ));
@@ -6951,7 +8850,8 @@ mod span_tests {
                 &["*.rs#L12-22".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Refused { .. }
         ));
@@ -6983,7 +8883,8 @@ mod span_tests {
                 &["a.rs#L12-22".into(), "b.rs".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Refused { .. }
         ));
@@ -7028,7 +8929,8 @@ mod span_tests {
                 &["a.rs#L55-65".into()],
                 100,
                 600,
-                &dead
+                &dead,
+                None,
             ),
             ShiftClaim::Granted(_)
         ));
@@ -7050,6 +8952,7 @@ mod span_tests {
             100,
             600,
             &dead,
+            None,
         );
         let spec = match try_claim_shift_in(
             &dir,
@@ -7059,6 +8962,7 @@ mod span_tests {
             100,
             600,
             &dead,
+            None,
         ) {
             ShiftClaim::Granted(gs) => gs[0].spec.clone(),
             ShiftClaim::Refused { owner, .. } => panic!("断られた: {owner}"),

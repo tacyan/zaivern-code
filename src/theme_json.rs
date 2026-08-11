@@ -12,9 +12,7 @@ use crate::theme::{self, Theme};
 /// プラグイン同梱テーマは app 側でこの一覧へマージされる。
 pub fn discover_user_themes() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        scan_flat(&home.join(".zaivern").join("themes"), &mut out);
-    }
+    scan_flat(&crate::config::zaivern_dir().join("themes"), &mut out);
     out.sort_by_key(|a| a.0.to_lowercase());
     out.dedup_by(|a, b| a.1 == b.1);
     out

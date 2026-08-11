@@ -145,6 +145,31 @@ pub struct Feature {
     pub binds: &'static [Bind],
 }
 
+impl Feature {
+    /// 欄を埋めるための雛形。**機能側は `..Feature::DEFAULT` で締める。**
+    ///
+    /// レジストリは「登録の追記」を無くしたが、**`Feature` 構造体そのものは
+    /// まだ共有面**で、欄を 1 つ足すと既存の全機能モジュールが同じコミットで
+    /// 壊れる (実際に `settings` / `binds` を足したとき 4 モジュールを
+    /// 同時に直す必要があり、別ワークツリーのビルドも巻き込んだ)。
+    /// `..Feature::DEFAULT` で締めてあれば、次に誰が欄を足しても
+    /// 他のブランチは壊れない。
+    ///
+    /// **既定と同じ値の欄は書かないこと。** 全欄を明示したうえで `..DEFAULT`
+    /// を足すと clippy の `needless_update` が `-D warnings` の CI を落とす。
+    ///
+    /// `module` / `entries` / `dispatch` は既定のままだと何もしないので、
+    /// 必ず自分で埋める (番人テストが空の `module` を弾く)。
+    pub const DEFAULT: Feature = Feature {
+        module: "",
+        entries: &[],
+        dispatch: |_app, _ctx, _id| false,
+        draw: None,
+        settings: &[],
+        binds: &[],
+    };
+}
+
 /// 登録済みの機能。
 ///
 /// **ここへ行を足してよいのは統合担当だけ。** 機能ブランチ側でこの配列を
@@ -266,6 +291,57 @@ mod tests {
                 assert!(!e.label.trim().is_empty(), "{:?} のラベルが空", e.id);
             }
         }
+    }
+
+    /// **全ての `FEATURE` が `..Feature::DEFAULT` で締められている。**
+    ///
+    /// レジストリは「登録の追記」を無くしたが、`Feature` 構造体そのものは
+    /// まだ共有面で、欄を 1 つ足すと既存の全機能モジュールが同じコミットで
+    /// 壊れる。`..Feature::DEFAULT` があれば壊れない。**規約はテストで
+    /// 強制しないと必ず腐る**ので、ここで番人にする。
+    #[test]
+    fn 全ての機能登録は_default_で締められている() {
+        // パスはリテラルではなくビルド時のクレート位置から起こす
+        // (どのマシンでチェックアウトしても動く)。
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Windows のチェックアウトは CRLF なので必ず正規化する。
+                let text = raw.replace("\r\n", "\n");
+                let Some(at) = text.find("pub const FEATURE:") else {
+                    continue;
+                };
+                let Some(end) = text[at..].find("\n};") else {
+                    continue;
+                };
+                let block = &text[at..at + end];
+                assert!(
+                    block.contains("Feature::DEFAULT"),
+                    "{} の FEATURE が `..Feature::DEFAULT` で締められていない。\n                     欄を足したときに他のブランチを壊さないため、必ず付けること。",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        // 走査そのものが空振りしていないことを確かめる
+        // (パスを間違えて 0 件でも緑、が最悪の壊れ方)。
+        assert!(checked >= 4, "FEATURE が {checked} 件しか見つからない");
     }
 
     /// 所有判定の境界。**接頭辞が一致しても区切りの `.` が無ければ他人の ID**

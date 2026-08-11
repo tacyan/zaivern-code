@@ -223,11 +223,23 @@ build_test_exe() {
     CARGO_TARGET_DIR="$target" cargo xwin test --bin zai --target "$triple" --no-run >&2
     # 2 回目は warm なので即返る。**パスを ls -t で推測しない** —
     # 古い .exe が残っていると別物を動かしてしまう。cargo に聞く。
-    CARGO_TARGET_DIR="$target" cargo xwin test --bin zai --target "$triple" \
-        --no-run --message-format=json 2>/dev/null \
+    # **パイプの終了コードは最後の段のもの**なので、cargo が落ちても sed が
+    # 成功して空文字 + rc=0 を返してしまう (= 「.exe が出来た」という嘘)。
+    # 一度変数へ受けて cargo 自身の終了コードを見てから解析する。
+    _json=$(CARGO_TARGET_DIR="$target" cargo xwin test --bin zai --target "$triple" \
+        --no-run --message-format=json 2>/dev/null) || {
+        echo "cargo xwin test が失敗しました (実行ファイルの場所を聞けません)" >&2
+        return 1
+    }
+    _exe=$(printf '%s\n' "$_json" \
         | grep -o '"executable":"[^"]*\.exe"' \
         | tail -1 \
-        | sed 's/^"executable":"//; s/"$//'
+        | sed 's/^"executable":"//; s/"$//')
+    if [ -z "$_exe" ]; then
+        echo "cargo は成功したのに実行ファイルの場所が出てきませんでした" >&2
+        return 1
+    fi
+    printf '%s\n' "$_exe"
 }
 
 mode=${1:-}

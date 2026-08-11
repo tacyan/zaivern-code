@@ -669,7 +669,7 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 pub fn plugins_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".zaivern").join("plugins"))
+    Some(crate::config::zaivern_dir().join("plugins"))
 }
 
 /// ~/.zaivern/plugins/*/plugin.toml をスキャンする。
@@ -1365,10 +1365,7 @@ pub fn command_env(plugin: &Plugin, ctx: &EnvContext) -> Vec<(String, String)> {
 
 /// `~/.zaivern/plugin-data/<name>/` (存在しなければ作る)。
 pub fn plugin_data_dir(name: &str) -> Option<PathBuf> {
-    let dir = dirs::home_dir()?
-        .join(".zaivern")
-        .join("plugin-data")
-        .join(name);
+    let dir = crate::config::zaivern_dir().join("plugin-data").join(name);
     let _ = std::fs::create_dir_all(&dir);
     Some(dir)
 }

@@ -428,10 +428,7 @@ fn parse_line(line: &str) -> Option<Event> {
 // ─── macOS 内蔵ヘルパー ─────────────────────────────────────────────
 
 fn voice_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".zaivern")
-        .join("voice")
+    crate::config::zaivern_dir().join("voice")
 }
 
 /// 内蔵ヘルパーのパス。無ければ (ソースが変わっていれば) ビルドする。

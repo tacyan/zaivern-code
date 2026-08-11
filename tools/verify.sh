@@ -7,6 +7,7 @@
 #   tools/verify.sh --all           # 全テスト (cargo test。CI の nextest とは別)
 #   tools/verify.sh --quick         # 整形と警告だけ (テストは走らせない)
 #   tools/verify.sh --lint          # CI と同じ clippy (**push する前に必ず**)
+#   tools/verify.sh --bin           # 実バイナリ (target/debug/zai) も建てる
 #
 # ## なぜこのスクリプトが要るのか (実測)
 #
@@ -35,18 +36,29 @@ cd "$(dirname "$0")/.."
 QUICK=0
 ALL=0
 LINT=0
+BIN=0
 FILTERS=""
 for a in "$@"; do
   case "$a" in
     --quick) QUICK=1 ;;
     --lint) LINT=1 ;;
     --all) ALL=1 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --bin) BIN=1 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) FILTERS="$FILTERS $a" ;;
   esac
 done
 
 step() { printf '\n\033[1;36m▸ %s\033[0m\n' "$1"; }
+
+# `target/<profile>/zai` より新しいソースの一覧 (空なら zai の方が新しい)。
+# **mtime を数値で取らない** (GNU は `stat -c %Y`、BSD は `stat -f %m` で
+# 引数が違う)。`find -newer` は POSIX にあるのでどちらの OS でも動く。
+newer_than_bin() {
+  [ -e "$1" ] || return 0
+  find src -name '*.rs' -newer "$1" -print 2>/dev/null || true
+  find Cargo.toml build.rs -newer "$1" -print 2>/dev/null || true
+}
 
 step "整形 (cargo fmt --all --check)"
 cargo fmt --all --check
@@ -66,6 +78,29 @@ if [ "$LINT" = 1 ]; then
   printf '\033[1;32m✓ clippy 緑\033[0m\n'
 fi
 
+# ## 実バイナリ (`target/debug/zai`) の扱い — **静かな嘘の温床**
+#
+# `cargo test --bin zai --no-run` も `cargo test` も **bin を作らない**。
+# だから `target/debug/zai` は前の実行の残骸のまま残り、実バイナリを使う
+# テスト (`crate::test_util::real_zai` を通るもの) は黙って skip されるか、
+# **版が同じまま中身だけ古いバイナリ**で走る。実際にこれで
+# `guard` の実フック試験が「はみ出したのに通った」で赤くなり、
+# **`--version` は両方 0.14.0 だった** (照合をすり抜けた)。
+#
+# 既定でここを建てないのは、bin が `#[cfg(test)]` 抜きの別成果物で
+# **もう一度コード生成とリンクが走る**から。実測 (1 ファイル touch、warm):
+#
+#   cargo test --bin zai --no-run      44s / 94s
+#   そのあと cargo build --bin zai     +6s / +22s   ← --bin の追加費用
+#
+# 2 回で 3 倍ばらついたのは同居している他のビルドと取り合ったため。
+# **「Compiling」行とバイナリの mtime が動いたことを確認済み**で、
+# どちらも本当にリンクし直している (空振りではない)。要るときだけ払う。
+if [ "$BIN" = 1 ]; then
+  step "実バイナリ (cargo build --bin zai)"
+  cargo build --bin zai
+fi
+
 # **1 回だけコンパイルする。** ここで bin もテストコードも全部通るので、
 # 警告の検出はこれで完結する (別途 cargo check は走らせない = 二重払いしない)。
 step "コンパイルと警告 (cargo test --no-run。テストコードも含む)"
@@ -76,6 +111,19 @@ if printf '%s\n' "$OUT" | grep -qE '^warning'; then
   exit 1
 fi
 printf '\033[1;32m✓ 警告ゼロ\033[0m\n'
+
+# **実バイナリが古ければ黙らない。** ここを黙ると、実バイナリを使うテストが
+# 全部 skip されたまま「全部緑」に見える (= 静かな嘘)。
+ZAI_BIN="${CARGO_TARGET_DIR:-target}/debug/zai"
+STALE=$(newer_than_bin "$ZAI_BIN")
+if [ ! -e "$ZAI_BIN" ]; then
+  printf '\033[1;33m! %s が無い → 実バイナリを使うテストは skip されます (tools/verify.sh --bin で建てる)\033[0m\n' "$ZAI_BIN"
+elif [ -n "$STALE" ]; then
+  printf '\033[1;33m! %s がソースより古い (%s 件が新しい。例: %s)\n  → 実バイナリを使うテストは skip されます (tools/verify.sh --bin で建て直す)\033[0m\n' \
+    "$ZAI_BIN" "$(printf '%s\n' "$STALE" | grep -c . || true)" "$(printf '%s\n' "$STALE" | sed -n '1p')"
+else
+  printf '\033[1;32m✓ 実バイナリも最新 (%s)\033[0m\n' "$ZAI_BIN"
+fi
 
 [ "$QUICK" = 1 ] && { printf '\n--quick なのでテストは走らせない\n'; exit 0; }
 

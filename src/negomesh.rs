@@ -152,7 +152,22 @@ pub fn lines_from_disk(root: &Path, rel: &str) -> u32 {
 /// [`lines_from_disk`] が読むファイルサイズの上限 (バイト)。
 const LINES_READ_CAP: u64 = 8 * 1024 * 1024;
 
-pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u32) -> Served {
+/// 既定の「パス → 本文」。**交錯の判定 (錨) にだけ**使う。
+///
+/// 読めなければ `None` — [`negotiate::offer`] はそれを fail-closed
+/// (交錯を通さない) として扱う。上限は台帳の関所と同じものを使うので、
+/// 設定 `lease.gate_read_cap_bytes` を上げれば一緒に効く。
+pub fn text_from_disk(root: &Path, rel: &str) -> Option<String> {
+    crate::lease::read_capped(&root.join(rel), root)
+}
+
+pub fn serve_once(
+    mesh: &Mesh,
+    me: &Pid,
+    lines_of: &dyn Fn(&str) -> u32,
+    band: u32,
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Served {
     let mut out = Served::default();
     let envs = mesh.recv_match(me, &|m| {
         matches!(m, Msg::Claim { .. }) || matches!(m, Msg::Custom { kind, .. } if kind == DEAL_KIND)
@@ -221,7 +236,11 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u
         // 取った担当はここで拾える (古い占有表で配ると重ねてしまう)。
         let occupied = occupied_of(mesh, path);
         let wants: Vec<Want> = idxs.iter().map(|&i| asks[i].1.clone()).collect();
-        let plan = negotiate::allocate(&wants, &occupied, lines_of(path), band);
+        // 本文は**交錯の判定 (錨) にだけ**要る。パスごとに 1 回。
+        // 読めなければ `None` = fail-closed
+        // (`crate::lease::interleave_ok` に理由)。
+        let body = text_of(path);
+        let plan = negotiate::allocate(&wants, &occupied, lines_of(path), band, body.as_deref());
 
         for &i in idxs {
             let (from, want, is_deal) = &asks[i];
@@ -271,7 +290,8 @@ pub fn serve_once(mesh: &Mesh, me: &Pid, lines_of: &dyn Fn(&str) -> u32, band: u
                     }
                 }
                 None => {
-                    let off = negotiate::offer(want, &occupied, lines_of(path), band);
+                    let off =
+                        negotiate::offer(want, &occupied, lines_of(path), band, body.as_deref());
                     let (holder, hint) = describe(&off);
                     out.denied
                         .push((region::render(&want.region), holder.clone(), hint.clone()));
@@ -534,6 +554,8 @@ pub fn serve_cli(argv: &[String]) -> i32 {
             lines_from_disk(&root, rel)
         }
     };
+    let body_root = cwd.clone();
+    let body_of = move |rel: &str| -> Option<String> { text_from_disk(&body_root, rel) };
     let mesh = Mesh::open_for(&cwd);
     if !mesh.enabled() {
         eprintln!("メッシュが有効ではありません (先に `zai mesh spawn` を実行してください)");
@@ -562,7 +584,7 @@ pub fn serve_cli(argv: &[String]) -> i32 {
     let mut idle_streak: u32 = 0;
     for round in 0..rounds {
         mesh.beat(&me.pid);
-        let s = serve_once(&mesh, &me.pid, &resolver, band);
+        let s = serve_once(&mesh, &me.pid, &resolver, band, &body_of);
         let idle = s.is_idle();
         total.granted.extend(s.granted);
         total.denied.extend(s.denied);
@@ -862,7 +884,7 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 let m = Mesh::open_at(root, "test-node");
                 while !flag.load(Ordering::Relaxed) {
-                    serve_once(&m, &srv, &|_| lines, region::SAFE_BAND);
+                    serve_once(&m, &srv, &|_| lines, region::SAFE_BAND, &|_| None);
                     // 交渉役の周回。要求側の `ask_backoff` (25ms〜) より
                     // 細かくしておかないと、待ちが常に 1 段ぶん伸びる。
                     std::thread::sleep(Duration::from_millis(5));
@@ -901,7 +923,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s1 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s1 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert_eq!(s1.granted, vec!["src/x.rs#L10-40".to_string()]);
         assert!(s1.shifted.is_empty());
 
@@ -914,7 +936,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s2 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s2 = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert!(s2.granted.is_empty(), "重なったのに通した");
         assert!(
             s2.shifted.is_empty(),
@@ -940,7 +962,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
 
         let want = Want::movable("b1", region::parse("src/x.rs#L20-50").expect("解釈"));
         m.send(
@@ -955,7 +977,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert_eq!(s.granted.len(), 1, "ずらせば通るはずが通っていない");
         assert_eq!(s.shifted.len(), 1, "ずらした記録が無い");
 
@@ -987,7 +1009,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert_eq!(s.unreadable, 1);
         let back = m.recv(&a);
         assert!(
@@ -1015,7 +1037,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         let got = request(&m, &a, &srv, &want, 3).expect("返事が来る");
         assert!(got.is_ok(), "通るはずが断られた: {got:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1048,7 +1070,7 @@ mod tests {
         )
         .expect("送れる");
 
-        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert_eq!(
             s.granted,
             vec!["src/a.rs#L10-40".to_string(), "src/z.rs#L10-40".to_string()],
@@ -1186,7 +1208,7 @@ mod tests {
         )
         .expect("送れる");
         assert_eq!(
-            serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND).granted,
+            serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None).granted,
             vec!["src/x.rs#L10-40".to_string()]
         );
 
@@ -1214,7 +1236,7 @@ mod tests {
             },
         )
         .expect("送れる");
-        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND);
+        let s = serve_once(&m, &srv, &|_| 2000, region::SAFE_BAND, &|_| None);
         assert_eq!(
             s.granted,
             vec!["src/x.rs#L10-40".to_string()],
@@ -1328,6 +1350,7 @@ mod tests {
             &srv,
             &move |rel: &str| lines_from_disk(&root, rel),
             region::SAFE_BAND,
+            &|_| None,
         );
         assert_eq!(s.granted.len(), 2, "2 ファイルとも 1 周で捌けていない");
         let _ = std::fs::remove_dir_all(&dir);

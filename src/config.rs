@@ -76,7 +76,10 @@ pub struct Config {
     pub respect_gitignore: bool,
 
     /// 無視されたファイルを隠さず**薄く**表示するか (VS Code と同じ見せ方)。
-    /// `respect_gitignore = false` のときは意味を持たない。既定はオフ。
+    /// **既定はオン** — VS Code の既定 (`explorer.excludeGitIgnore = false` +
+    /// `git.decorations.enabled = true`) が「消さずに薄く出す」だからで、
+    /// 「置いたはずのファイルがツリーに無い」を既定で起こさないため。
+    /// `respect_gitignore = false` のときは意味を持たない (無視の判定自体が無い)。
     pub dim_ignored_files: bool,
 
     /// ファイル索引 (⌘P) に載せる最大件数。上限に達したらパレットに
@@ -840,7 +843,7 @@ impl Default for Config {
             last_seen_version: String::new(),
             show_hidden_files: true,
             respect_gitignore: true,
-            dim_ignored_files: false,
+            dim_ignored_files: true,
             index_max_files: DEFAULT_INDEX_MAX_FILES,
             index_max_depth: DEFAULT_INDEX_MAX_DEPTH,
             tree_dir_page: DEFAULT_TREE_DIR_PAGE,
@@ -1204,7 +1207,16 @@ pub fn state_path() -> PathBuf {
 
 /// `~/.zaivern` の場所。home が取れない場合は `./.zaivern` にフォールバック。
 /// ディレクトリの作成 (create_dir_all) は行わない — 呼び出し側の責務。
+///
+/// **`ZAIVERN_HOME` で差し替えられる。** 台帳キーの移行のように「本番の経路を
+/// 端から端まで動かさないと確かめられない」処理があり、それを実 `$HOME` で
+/// 試すわけにいかない。`$HOME` のすり替えは unix でしか効かない
+/// (`dirs` 5 の Windows 実装は `SHGetKnownFolderPath` を叩くので環境変数を
+/// 見ない) ため、これが無いと**テスト可能性が OS で非対称**になる。
 pub(crate) fn zaivern_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("ZAIVERN_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(d);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zaivern")
@@ -1234,9 +1246,11 @@ show_hidden_files = true
 # ファイルツリーとファイル検索 (⌘P) から除外します。既定は true。
 # false にすると node_modules / target なども全部並びます。
 # respect_gitignore = true
-# 無視されたファイルを隠さず「薄く」表示する (VS Code と同じ見せ方)。既定は false。
+# 無視されたファイルを隠さず「薄く」表示する。既定は true (VS Code と同じ:
+# explorer.excludeGitIgnore = false + git.decorations.enabled = true)。
+# false にすると node_modules / target などはツリーから消えます。
 # respect_gitignore = false のときは効きません。
-# dim_ignored_files = false
+# dim_ignored_files = true
 
 # ファイル検索 (⌘P) の索引の上限。上限に達したらパレットにその旨を出します
 # (黙って切り捨てません)。索引はバックグラウンドで作るので UI は止まりません。
@@ -2587,7 +2601,7 @@ pub fn setting_defs() -> &'static [SettingDef] {
         SettingDef {
             key: "dim_ignored_files",
             group: G_FILES,
-            label: "無視されたファイルを薄く出す",
+            label: "無視されたファイルを薄く出す (既定: VS Code と同じ)",
             kind: Bool,
         },
         SettingDef {

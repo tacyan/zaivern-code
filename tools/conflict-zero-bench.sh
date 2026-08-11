@@ -197,19 +197,153 @@ EOS
 target_dir=${CARGO_TARGET_DIR:-}
 [ -n "$target_dir" ] || target_dir="$root/target"
 
-zai=""
-zai_help_text=""
-for cand in \
-    "${ZAIVERN_BIN:-}" \
-    "$target_dir/release/zai" "$target_dir/release/zai.exe" \
-    "$target_dir/debug/zai" "$target_dir/debug/zai.exe" \
-    "$(command -v zai 2>/dev/null || true)"; do
-    [ -n "$cand" ] || continue
-    if zai_help_text=$(zai_help "$cand" 2>/dev/null); then
-        zai=$cand
-        break
+# ── 使う zai を決める (**全ベンチで 1 バイトも変えない共通ブロック**) ──
+#
+# ## なぜ「共通」でないと嘘になるか (事故3)
+#
+# 探索順が `conflict-zero-bench.sh` は release→debug、`coedit-bench.sh` は
+# debug→release で**逆だった**。この環境は release が 0.12.0・debug が
+# 0.14.0 だったので、**同一セッションで別のバイナリを測って**その数字を
+# 並べていた。順序は **release → debug → PATH** で統一する。
+#
+# ## なぜ版の照合だけでは足りないか (事故1)
+#
+# `cargo test` も `cargo test --bin zai --no-run` も **bin を作らない**ので、
+# `target/<profile>/zai` は前の実行の残骸のまま残る。実際に
+# 「ソースは 06:00 なのにバイナリは 02:40 のビルド」で `guard` の実フック
+# 試験が赤くなり、**`--version` は両方 0.14.0 だった**。版が同じでも中身は
+# 別物なので、**ソースより古いバイナリは使わない**。
+#
+# 内容ハッシュ (ビルド ID) の方が確実だが、実測で mtime 0.51ms に対し
+# ハッシュ 62.9ms (124 倍) で、しかも `build.rs` と `cli.rs` の両方を
+# 触らないと実現できない。詳細は `docs/bench-honesty.md`。
+#
+# 前提: `$root` (リポジトリルート) と `$target_dir` が決まっていること。
+# 使い方: `zai_pick <追加判定の関数名>` → 見つかれば `$zai` に入る。
+# @zai-honesty-begin
+expect_ver=$(awk -F'"' '/^version[ ]*=/ { print $2; exit }' "$root/Cargo.toml" 2>/dev/null || true)
+zai_ver=""
+zai_note=""
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_reject() { zai_note="${zai_note}${zai_note:+ / }$1"; }
+
+# `$1` より新しいソースの一覧 (空なら `$1` の方が新しい = 使ってよい)。
+#
+# **mtime を数値で取らない。** GNU は `stat -c %Y`、BSD は `stat -f %m` と
+# 引数が違うため、どちらかを直書きすると必ず片方の OS で壊れる。
+# `find -newer` は POSIX にあるのでどちらでも動く。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+newer_sources() {
+    [ -e "$1" ] || return 0
+    find "$root/src" -name '*.rs' -newer "$1" -print 2>/dev/null || true
+    find "$root/Cargo.toml" "$root/build.rs" -newer "$1" -print 2>/dev/null || true
+}
+
+# 候補 `$1` が「版が合っていて、ソースより新しい」なら 0 で `$zai_ver` を更新。
+# 駄目なら**理由を積んでから** 1 を返す (黙って次の候補へ行かない)。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_fresh() {
+    # **無い候補は黙って飛ばす。** unix で `.exe` を、release を建てていない
+    # 環境で release を、毎回「実行できません」と報告すると、本当に見てほしい
+    # 「有るのに使えない」理由が雑音に埋もれる。
+    [ -e "$1" ] || return 1
+    [ -x "$1" ] || {
+        zai_reject "$1: 実行権がありません"
+        return 1
+    }
+    _v=$("$1" --version 2>/dev/null) || {
+        zai_reject "$1: --version が動きません"
+        return 1
+    }
+    # ZAIVERN_BIN は**利用者の明示**。照合は飛ばすが、飛ばしたことは書き残す。
+    if [ -n "${ZAIVERN_BIN:-}" ] && [ "$1" = "$ZAIVERN_BIN" ]; then
+        zai_reject "ZAIVERN_BIN で明示 (版と古さの照合は飛ばしました)"
+        zai_ver=$_v
+        return 0
     fi
-done
+    if [ -n "$expect_ver" ]; then
+        case "$_v" in
+        *"$expect_ver"*) ;;
+        *)
+            zai_reject "$1 は版が違うので使いません ($_v != $expect_ver)"
+            return 1
+            ;;
+        esac
+    fi
+    _n=$(newer_sources "$1")
+    if [ -n "$_n" ]; then
+        # 何件が新しいのか・どれが新しいのかまで出す (出さないと直せない)。
+        # `$?` を見ないので、ここのパイプは終了コードを壊さない。
+        _cnt=$(printf '%s\n' "$_n" | grep -c . || true)
+        _one=$(printf '%s\n' "$_n" | sed -n '1p')
+        # **`${...}` で必ず囲む。** 変数の直後に日本語を置くと、macOS の
+        # /bin/sh は多バイト文字の先頭バイトを変数名に取り込んでしまい
+        # (`_one\xe3: unbound variable`)、`set -u` でその場で落ちる。
+        # しかも落ちるのは**古いバイナリを弾く経路だけ**なので、
+        # 「普段は動くのに、いちばん大事なときに死ぬ」形になる (実際に踏んだ)。
+        zai_reject "$1 はソースより古いので使いません (${_cnt} 件が新しい。例: ${_one}。\`cargo build --bin zai\` を先に走らせること)"
+        return 1
+    fi
+    zai_ver=$_v
+    return 0
+}
+
+# 候補 `$2` を、鮮度 → 計測ごとの適格判定 (`$1` の関数) の順で見る。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_try() {
+    zai_fresh "$2" || return 1
+    "$1" "$2" || {
+        zai_reject "$2: この計測に要る機能がありません"
+        return 1
+    }
+    zai=$2
+    return 0
+}
+
+# 探索順 (**全ベンチ共通**): ZAIVERN_BIN → release → debug → PATH。
+# `for` の各語を引用しているので、**空白を含むパスでも壊れない**。
+# shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
+zai_pick() {
+    zai=""
+    if [ -n "${ZAIVERN_BIN:-}" ]; then
+        zai_try "$1" "$ZAIVERN_BIN"
+        return $?
+    fi
+    for _c in \
+        "$target_dir/release/zai" "$target_dir/release/zai.exe" \
+        "$target_dir/debug/zai" "$target_dir/debug/zai.exe" \
+        "$(command -v zai 2>/dev/null || true)"; do
+        [ -n "$_c" ] || continue
+        zai_try "$1" "$_c" && return 0
+    done
+    return 1
+}
+
+# **使ったバイナリを絶対パスと版で必ず出す。** 出さない計測は再現できない。
+# shellcheck disable=SC2329  # 各ベンチの出力部から呼ぶ (静的には見えない)
+zai_identity() {
+    if [ -n "${1:-}" ]; then
+        case "$1" in
+        /*) _p=$1 ;;
+        *) _p="$PWD/$1" ;;
+        esac
+        printf 'zai: %s (%s)\n' "$_p" "${zai_ver:-版不明}"
+    else
+        printf 'zai: 見つかりません\n'
+    fi
+    [ -n "$zai_note" ] && printf 'zai の選定: %s\n' "$zai_note"
+    return 0
+}
+# @zai-honesty-end
+
+# この計測の適格判定: `zai help` が動き、その中身を段の判定に使う。
+zai_help_text=""
+cz_capable() {
+    zai_help_text=$(zai_help "$1" 2>/dev/null) || return 1
+    return 0
+}
+zai=""
+zai_pick cz_capable || true
 
 has_sub() {
     [ -n "$zai" ] || return 1
@@ -225,9 +359,73 @@ has_sub() {
 #  それでも「guard 段 実行」と表示された。判定が拾ったので嘘にはならなかったが、
 #  拾わなければ静かな嘘になっていた)。
 guard_mech=none
+guard_skip_reason="zai hook / zai lease が見つかりません"
 if has_sub hook && has_sub lease; then
     guard_mech=hook
+    guard_skip_reason=""
 fi
+
+# ── ゲートが**本当に止められるか**の事前検査 (事故2) ──────────────
+#
+# **`zai help` に文字列があるかを見るだけでは足りない。** これまでの検出は
+# 「重なりがあったのに衝突が残った」という**事後判定だけ**だったので、
+# `--overlap 0.0` のように衝突がそもそも起きない条件で回すと、ゲートが
+# 1 件も止めていなくても綺麗な数字が出て**静かな嘘**になる。
+# `tools/coedit-bench.sh` の流儀 (exit 20〜23) に合わせて、**測る前に**
+# 「1 件でも実際に止められるか」「持っていない相手は通すか」を確かめ、
+# 落ちたら「証明」と言わずに理由を出して降りる。
+#
+#   20 lease enable が失敗した
+#   21 lease claim が失敗した (予約が取れない)
+#   22 他人が持っているファイルへの書き込みを**通した** (門が無い)
+#   23 誰も持っていないファイルへの書き込みを**止めた** (門が閉じっぱなし)
+gate_probe() {
+    probe=$1
+    mkdir -p "$probe/repo" "$probe/home"
+    (
+        HOME="$probe/home"
+        USERPROFILE="$probe/home"
+        export HOME USERPROFILE
+        cd "$probe/repo" || exit 20
+        git init -q -b main . >/dev/null 2>&1 || exit 20
+        printf 'x\n' >a.rs
+        printf 'y\n' >b.rs
+        git add -A >/dev/null 2>&1
+        git -c user.email=probe@example.invalid -c user.name=probe \
+            commit -qm probe >/dev/null 2>&1 || exit 20
+        "$zai" lease enable --dir "$probe/repo" >/dev/null 2>&1 || exit 20
+        "$zai" lease claim 'a.rs' --agent probe-holder --dir "$probe/repo" >/dev/null 2>&1 || exit 21
+        # 他人が持っている a.rs → **deny でないといけない**
+        gate_says "$probe/repo" "$probe/repo/a.rs" | grep -q deny || exit 22
+        # 誰も持っていない b.rs → **deny であってはいけない**
+        gate_says "$probe/repo" "$probe/repo/b.rs" | grep -q deny && exit 23
+        exit 0
+    )
+}
+
+# ゲートへ 1 回だけ問い合わせて、その返事 (stdout) をそのまま返す。
+# 本番と**同じ payload の形**を使う (形が違えば検査の意味が無い)。
+gate_says() {
+    python3 - "$zai" "$1" "$2" <<'EOS'
+import json, subprocess, sys
+zai, cwd, path = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = json.dumps({
+    "session_id": "czbench-probe",
+    "cwd": cwd,
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Edit",
+    "tool_input": {"file_path": path},
+})
+try:
+    p = subprocess.run([zai, "hook", "--zaivern", "claude", "PreToolUse"],
+                       input=payload, capture_output=True, text=True, timeout=60)
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+sys.stdout.write(p.stdout)
+EOS
+}
+
 
 # 段③。統合の順序付け。**ヘルプに載っている時だけ**撃つ (知らないサブコマンドを
 # 投げると古い zai は GUI 起動として扱う)。
@@ -254,6 +452,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# ゲートの事前検査は **work が出来てから**走らせる (後始末を trap に乗せるため)。
+if [ "$guard_mech" = hook ]; then
+    probe_rc=0
+    gate_probe "$work/gate-probe" || probe_rc=$?
+    case "$probe_rc" in
+    0) ;;
+    20) guard_mech=none guard_skip_reason="事前検査: zai lease enable が失敗しました" ;;
+    21) guard_mech=none guard_skip_reason="事前検査: zai lease claim が失敗しました (予約が取れません)" ;;
+    22) guard_mech=none guard_skip_reason="事前検査: **他人が持っているファイルへの書き込みを通しました** (門が働いていないので、この段の数字は保護の証明になりません)" ;;
+    23) guard_mech=none guard_skip_reason="事前検査: 誰も持っていないファイルへの書き込みを止めました (門が閉じっぱなしです)" ;;
+    *) guard_mech=none guard_skip_reason="事前検査そのものが失敗しました (rc=$probe_rc)" ;;
+    esac
+fi
 
 # **本物の ~/.zaivern と ~/.gitconfig に触らせない。**
 mkdir -p "$work/home"
@@ -907,7 +1119,13 @@ def render(cfg, stages, notes):
         % (cfg["writers"], cfg["files"], cfg["overlap"], cfg["seed"]),
         "   1 ファイル %d ブロック (同じファイルでも別ブロックなら git は自動マージする)"
         % BLOCKS,
-        "   zai: %s" % (cfg["zai"] or "見つかりません (ベースラインのみ実行します)"),
+        "   zai: %s"
+        % (
+            "%s (%s)" % (os.path.abspath(cfg["zai"]), cfg["zai_version"] or "版不明")
+            if cfg["zai"]
+            else "見つかりません (ベースラインのみ実行します)"
+        ),
+    ] + (["   zai の選定: %s" % cfg["zai_note"]] if cfg["zai_note"] else []) + [
         "   一時リポジトリ: %s" % cfg["work"],
         "",
         "== 段ごとの実測",
@@ -944,6 +1162,10 @@ def main(argv):
         "seed": int(opt["seed"]),
         "zai": opt.get("zai") or "",
         "guard_mech": opt.get("guard-mech", "none"),
+        "guard_skip_reason": opt.get("guard-skip-reason", "")
+        or "zai hook / zai lease が見つかりません",
+        "zai_version": opt.get("zai-version", ""),
+        "zai_note": opt.get("zai-note", ""),
         "train_mech": opt.get("train-mech", "none"),
         "union_driver": opt.get("union-driver", ""),
         "work": opt["work"],
@@ -971,7 +1193,7 @@ def main(argv):
             {
                 "stage": "guard",
                 "status": "skipped",
-                "reason": "zai hook / zai lease が見つかりません"
+                "reason": cfg["guard_skip_reason"]
                 + ("" if cfg["zai"] else " (zai 自体が未検出)"),
             }
         )
@@ -1144,7 +1366,10 @@ python3 "$work/czbench.py" \
     --overlap "$overlap" \
     --seed "$seed" \
     --zai "$zai" \
+    --zai-version "$zai_ver" \
+    --zai-note "$zai_note" \
     --guard-mech "$guard_mech" \
+    --guard-skip-reason "$guard_skip_reason" \
     --train-mech "$train_mech" \
     --union-driver "$union_driver" \
     --work "$work" \
