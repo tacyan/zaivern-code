@@ -87,12 +87,24 @@
 //! 上限は定数ではなく [`Want::max_shift`] という**要求ごとの引数**で、
 //! 既定値は設定 `negotiate.max_shift` から差し替えられる。
 //!
-//! **上限は件数の天井にもなる。** ベンチの crowded で既定の 200 行を
-//! 残すと、開始行は 734〜1265 の **532 行**にしか置けず、幅 6 + 安全帯 3 で
-//! 割った `floor((532 + 3) / 9) = 59` が**構造的な上限**になる。
-//! 64 件全部を通したいなら、上限のほうを緩める判断が要る
-//! (「場所に意味が無い新規確保」なら [`Want::max_shift`] を広げるか
-//! [`Want::size_only`] を立てる)。
+//! **固定値のままだと、上限は件数の天井にもなる。** ベンチの crowded で
+//! 200 行を*固定*すると、開始行は 734〜1265 の **532 行**にしか置けず、
+//! 幅 6 + 安全帯 3 で割った `floor((532 + 3) / 9) = 59` が**構造的な上限**に
+//! なる。出荷経路 (`zai lease claim --shift`) では同じ理由で
+//! **64 体中 51〜54 体しか通らなかった** (実測 6 回、
+//! `tools/coedit-bench.sh --agents 64 --lines 2000 --layout crowded`)。
+//!
+//! つまり固定値は「同時に何体まで通すか」を**誰も表明していないのに
+//! 決めてしまう**。だから上限は固定値ではなく、
+//! [`crate::lease::shift_ceiling`] が**混んでいるぶんだけ自動で広げる**:
+//!
+//! * 空いているファイル → 設定値そのまま (従来と 1 行も変わらない)
+//! * `n` 体が並んでいる → `設定値 + n(min(幅, 設定値) + 2×安全帯)`。
+//!   必要距離 `n(幅+安全帯)/2` の 2 倍以上の速さで伸びるので、
+//!   **`n` がいくつでも上限が先に尽きない**
+//!
+//! [`allocate`] は入口で [`widen`] を通すので、以降のコードは
+//! 「渡された上限を守る」だけでよい。
 //!
 //! かつてここには「**上限を外すと配れる件数が減ることがある** (13 件 → 11 件)」
 //! と書いてあった。これは**貪欲な割当の性質であって、問題の性質ではない**。
@@ -139,11 +151,15 @@ use crate::region::{self, Anchor, Region, Span};
 //  1. 定数 — どれも「なぜその値か」を実測で言えるものだけ置く
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// ずらしてよい幅の既定の上限 (行)。
+/// ずらしてよい幅の既定の上限 (行)。**空いているファイルでの上限**である。
 ///
 /// 根拠はモジュール冒頭の実測 (このリポジトリの関数長 p99 = 162 行)。
 /// **200 行 = 長い関数でもたかだか 1 つ跨ぐ幅**。要求ごとに
 /// [`Want::max_shift`] で上書きでき、設定 `negotiate.max_shift` が既定を決める。
+///
+/// **これは同時に走れる体数の上限ではない。** 混んでいるときの実効上限は
+/// [`crate::lease::shift_ceiling`] が混雑ぶんを足して決める
+/// (固定値のままだと 64 体中 10〜13 体が断られていた)。
 pub const DEFAULT_MAX_SHIFT: u32 = 200;
 
 /// 分割したときの 1 断片の下限 (行)。
@@ -1382,13 +1398,45 @@ fn refuse(w: &Want, live: &[(String, Region)], file_lines: u32, band: u32) -> De
         kind,
         reason: match kind {
             DenyKind::NoRoom => tr("空き行が足りません (ファイルが飽和しています)"),
-            DenyKind::TooFar => trf(
-                "空き域はありますが、ずらせる上限 {n} 行より遠くにあります",
-                &[("n", w.max_shift.to_string())],
-            ),
+            // **「上限より遠い」だけでは次に何をすればよいか判らない。**
+            // いちばん近い空きまでの距離を数えて、`--max-shift` に渡す
+            // **具体的な数**まで出す (出せないときだけ従来の文面へ落ちる)。
+            DenyKind::TooFar => match nearest_free_dist(w, live, file_lines, band) {
+                Some(d) => trf(
+                    "いちばん近い空きは {d} 行先ですが、ずらせる上限は {n} 行です (`--max-shift {d}` を渡すか、設定 {key} を {d} 以上にすると通ります)",
+                    &[
+                        ("d", d.to_string()),
+                        ("n", w.max_shift.to_string()),
+                        ("key", KEY_MAX_SHIFT.to_string()),
+                    ],
+                ),
+                None => trf(
+                    "空き域はありますが、ずらせる上限 {n} 行より遠くにあります (設定 {key} で上げられます)",
+                    &[
+                        ("n", w.max_shift.to_string()),
+                        ("key", KEY_MAX_SHIFT.to_string()),
+                    ],
+                ),
+            },
             _ => trf("{h} が持っています", &[("h", holder)]),
         },
     }
+}
+
+/// **要求から、要求と同じ幅が入るいちばん近い空きまでの距離** (行)。
+///
+/// [`refuse`] の文面に「`--max-shift` へ何を渡せば通るか」を出すためだけに
+/// ある。空きが 1 つも無い / 幅が確定しない要求では `None`
+/// (そのときは [`DenyKind::NoRoom`] 側なので、この数を出す意味が無い)。
+fn nearest_free_dist(w: &Want, live: &[(String, Region)], file_lines: u32, band: u32) -> Option<u32> {
+    let sp = w.region.span?;
+    let need = w.lines()?.max(1);
+    let occ = obstacles_for(&w.region.path, live)?;
+    free_spans(file_lines, &occ, band)
+        .iter()
+        .filter(|f| f.len() >= need)
+        .map(|f| sp.start.clamp(f.start, f.end - need + 1).abs_diff(sp.start))
+        .min()
 }
 
 /// 詰め込みに載せられない 1 件を、[`offer`] で個別に答える。
@@ -1444,6 +1492,60 @@ fn settle_one(
     }
 }
 
+/// **要求ごとの上限を「いま混んでいるぶん」だけ広げた写しを返す。**
+///
+/// 広げ方の中身は [`crate::lease::shift_ceiling`] 1 実装しかない
+/// (`zai lease claim --shift` と `zai negotiate` で答えが違うと、
+///  同じ台帳を見ている 2 つの経路が別々の拒否を出す)。
+///
+/// ここが渡す「混雑」は**既存の占有 ＋ 同じ束に入っている他の要求**である。
+/// 後者が要る: ベンチの crowded は `occupied` が空で、距離を決めているのは
+/// **同時に来た 64 件そのもの**だから。供給 (空き行) ではなく**需要**から
+/// 上限を導く、というのがこの関数の全部である。
+///
+/// パスは表記そのままで束ねる ([`allocate`] の詰め込みと同じ束ね方)。
+/// 別表記の同一ファイルを取りこぼしても**上限が広がらないだけ**で、
+/// 配る場所の正しさ (互いに素) には一切影響しない。
+fn widen(
+    wants: &[Want],
+    occupied: &[(String, Region)],
+    file_lines: u32,
+    band: u32,
+) -> Vec<Want> {
+    // パスごとの「場所を奪っているもの」を 1 回だけ作る (要求ごとに
+    // 作り直すと O(n^2) になる)。
+    fn push<'a>(crowd: &mut Vec<(&'a str, Vec<Span>)>, path: &'a str, s: Span) {
+        match crowd.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, v)) => v.push(s),
+            None => crowd.push((path, vec![s])),
+        }
+    }
+    let mut crowd: Vec<(&str, Vec<Span>)> = Vec::new();
+    for w in wants {
+        if let Some(s) = w.region.span {
+            push(&mut crowd, &w.region.path, s);
+        }
+    }
+    for (_, r) in occupied {
+        if let Some(s) = r.span {
+            push(&mut crowd, &r.path, s);
+        }
+    }
+    wants
+        .iter()
+        .map(|w| {
+            let here = crowd
+                .iter()
+                .find(|(p, _)| *p == w.region.path)
+                .map(|(_, v)| v.as_slice())
+                .unwrap_or_default();
+            let mut out = w.clone();
+            out.max_shift = crate::lease::shift_ceiling(w.max_shift, here, band, file_lines);
+            out
+        })
+        .collect()
+}
+
 /// N 件の要求を、互いに素な割当へ**最大化**して配る。
 ///
 /// ## 順番
@@ -1467,6 +1569,10 @@ fn settle_one(
 /// 同じ入力からは必ず同じ [`Plan`] が出る
 /// (`HashMap` / `HashSet` を 1 つも使わない)。
 pub fn allocate(wants: &[Want], occupied: &[(String, Region)], file_lines: u32, band: u32) -> Plan {
+    // **最初に上限を混雑ぶんだけ広げる。** これ以降は 1 行も変えていない —
+    // 詰め込みも寄せ直しも断り方も、広げたあとの [`Want::max_shift`] を見る。
+    let widened = widen(wants, occupied, file_lines, band);
+    let wants: &[Want] = &widened;
     let mut live: Vec<(String, Region)> = occupied.to_vec();
     let mut granted: Vec<Granted> = Vec::new();
     let mut denied: Vec<Denied> = Vec::new();
@@ -2047,6 +2153,15 @@ fn cli_offer() -> i32 {
         Err(e) => return fail(e),
     };
     let band = input.band.unwrap_or(region::SAFE_BAND);
+    // [`offer`] は渡された上限をそのまま守る純関数なので、混雑ぶんの上乗せは
+    // **入口で 1 回だけ**行う ([`allocate`] は自分で [`widen`] を通す)。
+    let want = widen(
+        std::slice::from_ref(&want),
+        &held,
+        input.file_lines,
+        band,
+    )
+    .remove(0);
     let mut o = offer(&want, &held, input.file_lines, band);
     if let Offer::Wait { holder, .. } = &o {
         let until = deadline_of(&input.occupied, holder);
@@ -2661,9 +2776,11 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     draw: Some(draw),
     settings: &[crate::feature::Setting {
         key: KEY_MAX_SHIFT,
-        label: "ずらしてよい幅の上限 (行)",
+        label: "ずらしてよい幅の上限 (行・空いているとき)",
         help: "まだ書いていない新規確保だけをここまでずらします。既定 200 行は、\
-               このリポジトリの関数長 p99 (162 行) = 「長い関数でもたかだか 1 つ跨ぐ」幅。",
+               このリポジトリの関数長 p99 (162 行) = 「長い関数でもたかだか 1 つ跨ぐ」幅。\
+               混んでいるときは、他人が実際に塞いでいるぶんだけ自動で広がります \
+               (この値が同時に走れる体数の上限にならないようにするため)。",
         default: crate::feature::SettingValue::Int(DEFAULT_MAX_SHIFT as i64),
     }],
     ..crate::feature::Feature::DEFAULT
@@ -3701,40 +3818,133 @@ mod tests {
         assert_eq!(allocate(&shuffled, &[], LINES, BAND), plan);
     }
 
-    /// **`max_shift` を既定 (200 行) のまま残しても、窓の理論上限に届く。**
+    /// **既定 (200 行) のままでも 64 件全部が通る。固定値だったら 59 件が天井。**
     ///
-    /// 上限を残すと 64 件は**入り得ない**。開始行は
-    /// `[934-200, 1060+200]` にしか置けないので、使える幅は
-    /// 734〜1265 の **532 行**しかなく、幅 6 + 安全帯 3 で割ると
-    /// `floor((532 + 3) / 9) = 59` が上限になる。59 が取れることも構成できる
-    /// (要求 1〜58 と 64 を 734 から 9 行間隔で並べる)。
+    /// 200 行を*固定*すると開始行は `[934-200, 1060+200]` にしか置けず、
+    /// 使える幅は 734〜1265 の **532 行**、幅 6 + 安全帯 3 で割った
+    /// `floor((532 + 3) / 9) = 59` が**構造的な天井**になる。
+    /// つまり固定値のままなら 64 件は「配れない」のではなく
+    /// **その上限では存在しない**。
     ///
-    /// つまり **59 件が正解**で、それ以上は「配れない」ではなく
-    /// 「その上限では存在しない」。
+    /// [`widen`] は「他人が実際に塞いでいるぶん」を足すので、同じ設定値の
+    /// ままで天井そのものが上がる。**この差 (59 → 64) が修正の全部**である。
     #[test]
-    fn 上限を残したままでも窓の理論上限に届く() {
+    fn 既定の上限のままでも固定窓の天井を超える() {
         const LINES: u32 = 2000;
         const BAND: u32 = 3;
         let base = bench_crowded(64, LINES, BAND);
         let wants = wants_from(&base, true, false); // max_shift は既定の 200
         let plan = allocate(&wants, &[], LINES, BAND);
 
+        // 固定値だったときの天井 (この数を超えることが証拠になる)
         let span = (1060 + DEFAULT_MAX_SHIFT + 5) - (934 - DEFAULT_MAX_SHIFT) + 1;
-        let ceiling = ((span + BAND) / (6 + BAND)) as usize;
-        assert_eq!((span, ceiling), (532, 59), "窓の上限の計算が変わった");
+        let fixed_ceiling = ((span + BAND) / (6 + BAND)) as usize;
+        assert_eq!((span, fixed_ceiling), (532, 59), "固定窓の計算が変わった");
 
         eprintln!(
-            "bench crowded (max_shift={} のまま): {}/{} · 窓の理論上限 {} · 到達率 {:.0}%",
+            "bench crowded (設定は既定 {} 行のまま): {}/{} · 固定窓なら {} 件が天井",
             DEFAULT_MAX_SHIFT,
             plan.granted.len(),
             plan.denied.len(),
-            ceiling,
-            100.0 * plan.granted.len() as f64 / ceiling as f64,
+            fixed_ceiling,
         );
-        assert_eq!(plan.granted.len(), ceiling, "窓の理論上限に届いていない");
+        assert!(
+            plan.denied.is_empty(),
+            "既定のままで断られた: {:?}",
+            plan.denied
+        );
+        assert_eq!(plan.granted.len(), 64, "64 件すべてを配れていない");
+        assert!(
+            plan.granted.len() > fixed_ceiling,
+            "固定窓の天井 {fixed_ceiling} を超えていない = 上限が広がっていない"
+        );
         assert!(plan.is_disjoint());
-        // 落ちた 5 件は「空きが無い」ではなく「上限より遠い」
-        assert_eq!(plan.deny_counts(), [0, 5, 0, 0], "内訳: {:?}", plan.denied);
+    }
+
+    /// **書き手を倍にしても成立率が落ちない。** これがこの修正の性質そのもの。
+    ///
+    /// 線形性ではなく**成立率**で見る (絶対時間でも固定値でもない)。
+    /// 固定上限 `m` は `n ≤ 2m/(幅+安全帯)` という**誰も表明していない
+    /// 体数の上限**を作るので、`n` を倍にすると必ずどこかで成立率が落ちる。
+    /// 混雑ぶんを足す上限は `n` に比例して伸びるので落ちない。
+    #[test]
+    fn 書き手を倍にしても成立率が落ちない() {
+        const LINES: u32 = 2000;
+        const BAND: u32 = 3;
+        let mut rates: Vec<(u32, f64, usize)> = Vec::new();
+        for n in [8u32, 16, 32, 64, 128] {
+            let base = bench_crowded(n, LINES, BAND);
+            let wants = wants_from(&base, true, false); // 設定は既定のまま
+            let plan = allocate(&wants, &[], LINES, BAND);
+            assert!(plan.is_disjoint(), "n={n} で互いに素でない");
+            // 固定値だったときの天井 (n が増えると要求が伸びる)
+            let lo = base[0].1.start.saturating_sub(DEFAULT_MAX_SHIFT).max(1);
+            let hi = base[base.len() - 1].1.end + DEFAULT_MAX_SHIFT;
+            let fixed = ((hi - lo + 1 + BAND) / (6 + BAND)) as usize;
+            let rate = plan.granted.len() as f64 / f64::from(n);
+            rates.push((n, rate, fixed.min(n as usize)));
+            assert!(
+                plan.denied.is_empty(),
+                "n={n} で {} 件を断った: {:?}",
+                plan.denied.len(),
+                plan.denied
+            );
+        }
+        eprintln!("成立率 (書き手数, 成立率, 固定上限なら): {rates:?}");
+        // 全ての n で 100%。**倍にしても 1 件も落ちない。**
+        for (n, rate, _) in &rates {
+            assert!((rate - 1.0).abs() < f64::EPSILON, "n={n} の成立率 {rate}");
+        }
+        // 固定値のままなら、n を倍にしていくと必ず天井に当たっていた。
+        let (n_big, _, fixed_big) = rates[rates.len() - 1];
+        assert!(
+            fixed_big < n_big as usize,
+            "n={n_big} は固定上限でも入ってしまう条件 = この試験が何も守っていない"
+        );
+    }
+
+    /// **上限に当たったときの文面に、渡すべき数がそのまま出る。**
+    ///
+    /// 「上限は 200 行です」だけでは、上げれば通るのか・そもそも空きが
+    /// 無いのかが判らない (実際にベンチの stderr がそれだけだった)。
+    #[test]
+    fn 上限に当たった文面は渡すべき数まで出す() {
+        // 先客が 1〜100 行。要求 L1-30 に上限 5 行 =「ほとんど動くな」。
+        let wants = vec![Want::movable("t0", reg("src/a.rs#L1-30")).max_shift(5)];
+        let occ = held(&[("bob", "src/a.rs#L1-100")]);
+        let plan = allocate(&wants, &occ, 400, 3);
+        assert_eq!(plan.deny_counts(), [0, 1, 0, 0], "TooFar のはず: {plan:?}");
+        let reason = &plan.denied[0].reason;
+        eprintln!("文面: {reason}");
+        // いちばん近い空きは 104 行目 → 103 行先
+        assert!(reason.contains("103"), "必要な距離が出ていない: {reason}");
+        assert!(
+            reason.contains("--max-shift"),
+            "渡し方が出ていない: {reason}"
+        );
+        assert!(
+            reason.contains(KEY_MAX_SHIFT),
+            "設定キーが出ていない: {reason}"
+        );
+    }
+
+    /// **空いているファイルでは、上限は 1 行も広がらない。**
+    ///
+    /// 広げる根拠は「他人が実際に塞いでいる」ことなので、誰も居なければ
+    /// 設定値そのまま。ここが崩れると「既定を黙って上げた」のと同じになる。
+    #[test]
+    fn 誰も居なければ上限は設定値のまま() {
+        use crate::lease::shift_ceiling;
+        assert_eq!(shift_ceiling(200, &[], 3, 2000), 200);
+        // 0 は「ずらすな」。混雑で覆さない。
+        assert_eq!(shift_ceiling(0, &[sp(10, 20), sp(30, 40)], 3, 2000), 0);
+        // 1 人あたりの寄与は設定値で頭打ち (1 人の巨大な域で無効化されない)。
+        assert_eq!(shift_ceiling(5, &[sp(1, 100)], 3, 400), 5 + 5 + 6);
+        // 体数に比例して伸びる (幅 6 / 帯 3 なら 1 体あたり 12 行)。
+        let many: Vec<Span> = (0..64).map(|i| sp(1 + i * 9, 6 + i * 9)).collect();
+        assert_eq!(shift_ceiling(200, &many, 3, 2000), 200 + 64 * (6 + 6));
+        // ファイル行数で頭打ち (外へはずらせない)。
+        assert_eq!(shift_ceiling(200, &many, 3, 300), 300);
     }
 
     // ── 挿入点 (幅 0 の要求) ─────────────────────────────────────────
@@ -3912,6 +4122,19 @@ mod tests {
                             .collect();
                         let plan = allocate(&wants, &[], lines, band);
                         assert!(plan.is_disjoint(), "band={band} で互いに素でない");
+
+                        // **総当たり側も実効上限で回す。** [`allocate`] は
+                        // 入口で [`widen`] を通すので、素の `shift` で比べると
+                        // 「総当たりより多く配れている」= 比べる相手のほうが
+                        // 狭い、という形で落ちる (実際に落ちた)。
+                        let crowd: Vec<Span> = specs
+                            .iter()
+                            .map(|&(s, w)| Span {
+                                start: s,
+                                end: s + w - 1,
+                            })
+                            .collect();
+                        let shift = crate::lease::shift_ceiling(shift, &crowd, band, lines);
 
                         // 総当たり: 0 = 断る、1..=lines = その行から置く。
                         // **`Region` を組み立てない** — パスの `String` を

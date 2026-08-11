@@ -1861,6 +1861,11 @@ fn lease_dispatch(args: &[String]) -> CliOut {
 fn refusal(pattern: &str, owner: &str) -> String {
     // 持ち主の表示名 ([`lease::Holder::display`]) には `:` が入らないが、
     // 解決できない理由には必ず `:` が入る (`… を探せません: …`)。
+    //
+    // **理由を新しく足す側の約束**: 先頭に `:` を含む見出しを置くこと
+    // (`ずらせる上限に当たりました: …`)。忘れると「〜が持っています」へ
+    // 流し込まれて意味の通らない文になる。
+    // [`lease::tests::断る理由は必ず見出しに区切りを持つ`] が番人。
     if owner.contains(':') {
         return format!("確保できません: 「{pattern}」— {owner}");
     }
