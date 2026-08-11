@@ -167,10 +167,206 @@ fn entity(name: &str) -> Option<String> {
         "check" => "✓",
         "cross" => "✗",
         "heart" => "♥",
-        _ => return None,
+        // match に無いものは表を引く (分音符付きラテン文字・ASCII 記号名など)
+        _ => {
+            return NAMED_ENTITIES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, c)| c.to_string());
+        }
     };
     Some(s.to_string())
 }
+
+/// 名前付き実体参照の続き。match 腕に並べると 150 行を超えるのでデータで持つ。
+///
+/// ここが欠けると `&eacute;` `&lpar;` がそのまま本文へ出る (= 生のマークアップの
+/// 漏れと同じ見え方になる) ので、実際の文書で出る範囲を厚く埋めている。
+const NAMED_ENTITIES: &[(&str, char)] = &[
+    // ── ASCII 記号 (HTML5 が名前を付けているもの) ──
+    ("excl", '!'),
+    ("quest", '?'),
+    ("num", '#'),
+    ("dollar", '$'),
+    ("percnt", '%'),
+    ("ast", '*'),
+    ("midast", '*'),
+    ("plus", '+'),
+    ("comma", ','),
+    ("period", '.'),
+    ("sol", '/'),
+    ("bsol", '\\'),
+    ("colon", ':'),
+    ("semi", ';'),
+    ("equals", '='),
+    ("commat", '@'),
+    ("lsqb", '['),
+    ("lbrack", '['),
+    ("rsqb", ']'),
+    ("rbrack", ']'),
+    ("lcub", '{'),
+    ("lbrace", '{'),
+    ("rcub", '}'),
+    ("rbrace", '}'),
+    ("lpar", '('),
+    ("rpar", ')'),
+    ("Hat", '^'),
+    ("grave", '`'),
+    ("lowbar", '_'),
+    ("verbar", '|'),
+    ("vert", '|'),
+    ("tilde", '~'),
+    ("Tab", '\t'),
+    ("NewLine", '\n'),
+    // ── 空白 ──
+    ("NonBreakingSpace", '\u{00A0}'),
+    ("numsp", '\u{2007}'),
+    ("puncsp", '\u{2008}'),
+    ("hairsp", '\u{200A}'),
+    ("emsp13", '\u{2004}'),
+    ("emsp14", '\u{2005}'),
+    ("zwsp", '\u{200B}'),
+    // ── ラテン文字 (Latin-1 補助 + 拡張 A の頻出分) ──
+    ("Agrave", 'À'),
+    ("Aacute", 'Á'),
+    ("Acirc", 'Â'),
+    ("Atilde", 'Ã'),
+    ("Auml", 'Ä'),
+    ("Aring", 'Å'),
+    ("AElig", 'Æ'),
+    ("Ccedil", 'Ç'),
+    ("Egrave", 'È'),
+    ("Eacute", 'É'),
+    ("Ecirc", 'Ê'),
+    ("Euml", 'Ë'),
+    ("Igrave", 'Ì'),
+    ("Iacute", 'Í'),
+    ("Icirc", 'Î'),
+    ("Iuml", 'Ï'),
+    ("ETH", 'Ð'),
+    ("Ntilde", 'Ñ'),
+    ("Ograve", 'Ò'),
+    ("Oacute", 'Ó'),
+    ("Ocirc", 'Ô'),
+    ("Otilde", 'Õ'),
+    ("Ouml", 'Ö'),
+    ("Oslash", 'Ø'),
+    ("Ugrave", 'Ù'),
+    ("Uacute", 'Ú'),
+    ("Ucirc", 'Û'),
+    ("Uuml", 'Ü'),
+    ("Yacute", 'Ý'),
+    ("THORN", 'Þ'),
+    ("szlig", 'ß'),
+    ("agrave", 'à'),
+    ("aacute", 'á'),
+    ("acirc", 'â'),
+    ("atilde", 'ã'),
+    ("auml", 'ä'),
+    ("aring", 'å'),
+    ("aelig", 'æ'),
+    ("ccedil", 'ç'),
+    ("egrave", 'è'),
+    ("eacute", 'é'),
+    ("ecirc", 'ê'),
+    ("euml", 'ë'),
+    ("igrave", 'ì'),
+    ("iacute", 'í'),
+    ("icirc", 'î'),
+    ("iuml", 'ï'),
+    ("eth", 'ð'),
+    ("ntilde", 'ñ'),
+    ("ograve", 'ò'),
+    ("oacute", 'ó'),
+    ("ocirc", 'ô'),
+    ("otilde", 'õ'),
+    ("ouml", 'ö'),
+    ("oslash", 'ø'),
+    ("ugrave", 'ù'),
+    ("uacute", 'ú'),
+    ("ucirc", 'û'),
+    ("uuml", 'ü'),
+    ("yacute", 'ý'),
+    ("thorn", 'þ'),
+    ("yuml", 'ÿ'),
+    ("OElig", 'Œ'),
+    ("oelig", 'œ'),
+    ("Scaron", 'Š'),
+    ("scaron", 'š'),
+    ("Yuml", 'Ÿ'),
+    ("fnof", 'ƒ'),
+    ("circ", 'ˆ'),
+    // ── ギリシャ文字の残り ──
+    ("Epsilon", 'Ε'),
+    ("Zeta", 'Ζ'),
+    ("Eta", 'Η'),
+    ("Theta", 'Θ'),
+    ("Iota", 'Ι'),
+    ("Kappa", 'Κ'),
+    ("Mu", 'Μ'),
+    ("Nu", 'Ν'),
+    ("Xi", 'Ξ'),
+    ("Omicron", 'Ο'),
+    ("Rho", 'Ρ'),
+    ("Tau", 'Τ'),
+    ("Upsilon", 'Υ'),
+    ("Chi", 'Χ'),
+    ("Psi", 'Ψ'),
+    ("zeta", 'ζ'),
+    ("eta", 'η'),
+    ("iota", 'ι'),
+    ("kappa", 'κ'),
+    ("nu", 'ν'),
+    ("xi", 'ξ'),
+    ("omicron", 'ο'),
+    ("rho", 'ρ'),
+    ("sigmaf", 'ς'),
+    ("upsilon", 'υ'),
+    ("chi", 'χ'),
+    ("psi", 'ψ'),
+    ("thetasym", 'ϑ'),
+    ("upsih", 'ϒ'),
+    ("piv", 'ϖ'),
+    // ── 記号・矢印の残り ──
+    ("oplus", '⊕'),
+    ("otimes", '⊗'),
+    ("sdot", '⋅'),
+    ("lceil", '⌈'),
+    ("rceil", '⌉'),
+    ("lfloor", '⌊'),
+    ("rfloor", '⌋'),
+    ("lang", '⟨'),
+    ("rang", '⟩'),
+    ("sube", '⊆'),
+    ("supe", '⊇'),
+    ("nsub", '⊄'),
+    ("ni", '∋'),
+    ("weierp", '℘'),
+    ("real", 'ℜ'),
+    ("image", 'ℑ'),
+    ("alefsym", 'ℵ'),
+    ("uArr", '⇑'),
+    ("dArr", '⇓'),
+    ("nwarr", '↖'),
+    ("nearr", '↗'),
+    ("searr", '↘'),
+    ("swarr", '↙'),
+    ("hearts", '♥'),
+    ("diamonds", '♦'),
+    ("horbar", '―'),
+    ("dash", '‐'),
+    ("mldr", '…'),
+    ("nldr", '‥'),
+    ("checkmark", '✓'),
+    ("sung", '♪'),
+    ("flat", '♭'),
+    ("natur", '♮'),
+    ("sharp", '♯'),
+    ("numero", '№'),
+    ("phone", '☎'),
+    ("female", '♀'),
+    ("male", '♂'),
+];
 
 /// テキスト中の文字実体参照をすべて解決する。未知の参照はそのまま残す。
 /// (変換ループは entity() を直接使う。属性値の復号にはこちらを使う)
@@ -297,6 +493,83 @@ fn attr_text(attrs: &str, name: &str) -> Option<String> {
     attr(attrs, name).map(|v| decode_entities(&v))
 }
 
+/// `colspan="2"` のような桁数属性を読む。壊れた値・0 は 1、上限は `MAX_SPAN`。
+fn attr_span(attrs: &str, name: &str) -> usize {
+    attr(attrs, name)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .map_or(1, |n| n.min(MAX_SPAN))
+}
+
+/// `src` / `srcset="a.png 1x, b.png 2x"` から先頭の URL を取り出す。
+fn first_src(attrs: &str) -> Option<String> {
+    attr_text(attrs, "src")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| attr_text(attrs, "data-src"))
+        .or_else(|| {
+            attr_text(attrs, "srcset").and_then(|s| {
+                s.split(',')
+                    .next()
+                    .and_then(|p| p.split_whitespace().next())
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Markdown のリンク先として安全な形へ整える。
+///
+/// `markdown::read_link` は `(` の次から**最初の `)`** までを URL と読むので、
+/// 丸括弧を含む URL (Wikipedia の `Foo_(bar)` 等) や空白入りの相対パスは
+/// そのまま書くとリンクが途中で切れる。パーセント符号化すれば同じ URL のまま
+/// 記法を壊さない。
+fn safe_url(u: &str) -> String {
+    let mut out = String::with_capacity(u.len());
+    for c in u.trim().chars() {
+        match c {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            ' ' => out.push_str("%20"),
+            // 改行はリンク記法を必ず壊すので落とす
+            '\n' | '\r' | '\t' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 画像の代替文字列を Markdown の `![...]` に収まる形へ整える。
+fn safe_alt(alt: &str) -> String {
+    alt.replace('[', "(")
+        .replace(']', ")")
+        .replace(['\n', '\r'], " ")
+}
+
+/// 描けない図版 (svg / canvas) に添える説明。取れないときは None (何も出さない)。
+///
+/// `aria-label` / `title` 属性か、中の `<title>` を使う。README のインライン
+/// アイコンには説明が無いことが多く、そこへ一律にプレースホルダを置くと
+/// 本文が「🖼」だらけになるので、**名前が分かるときだけ**残す。
+fn media_label(region: &[char], attrs: &str) -> Option<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    for key in ["aria-label", "title"] {
+        if let Some(l) = attr_text(attrs, key) {
+            let l = squash(&l);
+            if !l.is_empty() {
+                return Some(l);
+            }
+        }
+    }
+    let text: String = region.iter().collect();
+    let lower = text.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let gt = text[open..].find('>')? + open + 1;
+    let close = lower.get(gt..)?.find("</title")? + gt;
+    let inner = squash(&decode_entities(text.get(gt..close)?));
+    (!inner.is_empty()).then_some(inner)
+}
+
 /// `style="font-weight:bold"` 等から Markdown の装飾記号を作る。
 /// 返り値は (開き, 閉じ)。装飾なしなら両方空。
 fn style_marks(attrs: &str) -> (String, String) {
@@ -352,16 +625,111 @@ enum ListKind {
     Ol(usize),
 }
 
+/// `colspan` / `rowspan` として受け付ける上限。
+/// `colspan="99999"` のような壊れた/悪意ある値で行が膨らまないように。
+const MAX_SPAN: usize = 64;
+
+/// 1 つのテーブルで作る桁数の上限。
+/// **中身のあるセルは必ず出す**ので、この上限が削るのは span 由来の空欄だけ。
+const MAX_TABLE_COLS: usize = 1024;
+
+/// 溜めているテーブル 1 つ。
+///
+/// `<th>` かどうかは持たない — Markdown のテーブルはヘッダ行が必須なので
+/// `emit_table` は **`<th>` の有無に関わらず 1 行目をヘッダとして扱う**。
+/// 覚えても出力が変わらない値は持たない (書くだけの状態は嘘の情報源になる)。
 #[derive(Default)]
 struct TableState {
     rows: Vec<Vec<String>>,
-    header: bool,
     cur_row: Vec<String>,
     cur_cell: Option<String>,
-    row_is_th: bool,
+    /// いま開いているセルの (colspan, rowspan)
+    cur_span: (usize, usize),
+    /// いま開いているセルの左端の桁
+    cur_col: usize,
+    /// 桁ごとの rowspan の残り (この行を含む数)
+    rowspan_left: Vec<usize>,
     /// `<caption>` の本文 (テーブルの直前に見出しとして出す)
     caption: String,
     in_caption: bool,
+}
+
+impl TableState {
+    /// 上の行から rowspan で伸びてきている桁を空欄で飛ばす。
+    /// これをしないと、結合セルのある表で以降のセルが**左へ詰まって**
+    /// 見出しと中身の対応が 1 桁ずつずれる。
+    fn skip_spanned(&mut self) {
+        while self.rowspan_left.get(self.cur_col).copied().unwrap_or(0) > 0 {
+            if self.cur_row.len() >= MAX_TABLE_COLS {
+                return;
+            }
+            self.cur_row.push(String::new());
+            self.cur_col += 1;
+        }
+    }
+
+    /// 開いているセルを確定して行へ置く (colspan の分だけ桁を埋める)。
+    fn finish_cell(&mut self) {
+        let Some(text) = self.cur_cell.take() else {
+            return;
+        };
+        let (cs, rs) = self.cur_span;
+        while self.cur_row.len() < self.cur_col.min(MAX_TABLE_COLS) {
+            self.cur_row.push(String::new());
+        }
+        self.cur_row.push(text);
+        for _ in 1..cs {
+            if self.cur_row.len() >= MAX_TABLE_COLS {
+                break;
+            }
+            self.cur_row.push(String::new());
+        }
+        if rs > 1 {
+            let end = (self.cur_col + cs).min(MAX_TABLE_COLS);
+            if self.rowspan_left.len() < end {
+                self.rowspan_left.resize(end, 0);
+            }
+            for c in self.cur_col.min(end)..end {
+                self.rowspan_left[c] = rs;
+            }
+        }
+        self.cur_col = (self.cur_col + cs).min(MAX_TABLE_COLS);
+        self.skip_spanned();
+    }
+
+    /// 行の開始。上から伸びている結合セルの分だけ最初から桁を空ける。
+    fn begin_row(&mut self) {
+        self.cur_row.clear();
+        self.cur_cell = None;
+        self.cur_col = 0;
+        self.skip_spanned();
+    }
+
+    /// 行の終了。rowspan の残りを 1 行分減らす。
+    fn end_row(&mut self) {
+        self.finish_cell();
+        if !self.cur_row.is_empty() {
+            self.rows.push(std::mem::take(&mut self.cur_row));
+        }
+        for v in &mut self.rowspan_left {
+            *v = v.saturating_sub(1);
+        }
+    }
+}
+
+/// 開いている装飾 1 つ。
+///
+/// 開き記号を出した長さと位置を控えておくと「中身が 1 文字も無かった」が
+/// 判定できる。`<b></b>` が `****` という literal になるのを防ぐため。
+struct OpenSpan {
+    /// 同じ種類の閉じタグを探すための鍵
+    key: &'static str,
+    /// 出力済みの開き記号の長さ (記号を出していなければ 0)
+    open_len: usize,
+    /// 閉じたときに出す文字列
+    close: String,
+    /// 開き記号を出した直後の sink 長
+    at: usize,
 }
 
 struct Conv {
@@ -372,11 +740,21 @@ struct Conv {
     links: Vec<Option<String>>,
     pre: bool,
     pre_lang_pending: bool,
+    /// 開いている `<pre>` のフェンス開始位置 (sink 上のバイト長)
+    pre_start: usize,
     table: Option<TableState>,
     /// `<table>` の入れ子の深さ (内側のテーブルは外側のセルへ平坦化する)
     table_depth: usize,
-    /// `<span style>` 等で開いた装飾の閉じ記号スタック
-    spans: Vec<String>,
+    /// 開いた装飾のスタック
+    spans: Vec<OpenSpan>,
+    /// 開いているインラインコードの開始位置 (sink 上のバイト長)
+    code_open: Vec<usize>,
+    /// `<picture>` の深さと、その中で最初に見た `<source>` の URL
+    picture_depth: usize,
+    picture_src: Option<String>,
+    picture_img: bool,
+    /// `<video>`/`<audio>` が src 無しで開いていて、子の `<source>` を待っている
+    media_pending: Option<&'static str>,
 }
 
 impl Conv {
@@ -389,9 +767,15 @@ impl Conv {
             links: Vec::new(),
             pre: false,
             pre_lang_pending: false,
+            pre_start: 0,
             table: None,
             table_depth: 0,
             spans: Vec::new(),
+            code_open: Vec::new(),
+            picture_depth: 0,
+            picture_src: None,
+            picture_img: false,
+            media_pending: None,
         }
     }
 
@@ -449,6 +833,149 @@ impl Conv {
         }
     }
 
+    /// 本文テキストを 1 文字書く (タグが出す記法とは別経路)。
+    ///
+    /// リンクの中では `[` `]` を丸括弧へ落とす。`markdown::read_link` は
+    /// **最初の `]`** でリンク文字列を切るので、本文に `]` があると
+    /// リンクがそこで壊れて残りが生の記法として出てしまう。
+    /// タグ側が出す `![alt](src)` を巻き込まないよう、この経路だけで直す。
+    fn push_text(&mut self, c: char) {
+        if self.links.last().is_some_and(Option::is_some) {
+            match c {
+                '[' => return self.push_char('('),
+                ']' => return self.push_char(')'),
+                _ => {}
+            }
+        }
+        self.push_char(c);
+    }
+
+    fn push_text_str(&mut self, t: &str) {
+        for c in t.chars() {
+            self.push_text(c);
+        }
+    }
+
+    /// テーブルのセルの中にいる。
+    fn in_table_cell(&self) -> bool {
+        self.table.as_ref().is_some_and(|t| t.cur_cell.is_some())
+    }
+
+    /// 装飾を開く。閉じるときに「中身が空だったか」を判定できるよう長さを控える。
+    fn open_span(&mut self, key: &'static str, open: &str, close: &str) {
+        let before = self.sink().len();
+        self.push_str(open);
+        let at = self.sink().len();
+        self.spans.push(OpenSpan {
+            key,
+            open_len: at.saturating_sub(before),
+            close: close.to_string(),
+            at,
+        });
+    }
+
+    /// 装飾を閉じる。同じ鍵で開いた最も内側の要素まで巻き戻す。
+    ///
+    /// `<b><i>x</b></i>` のような交差した閉じタグでも、間に挟まった装飾を
+    /// 先に閉じることで記号の対応が崩れない。開いていない閉じタグは
+    /// 記号だけ出す (従来どおり)。
+    fn close_span(&mut self, key: &'static str, fallback: &str) {
+        let Some(k) = self.spans.iter().rposition(|s| s.key == key) else {
+            self.push_str(fallback);
+            return;
+        };
+        while self.spans.len() > k {
+            let Some(sp) = self.spans.pop() else { return };
+            self.finish_span(sp);
+        }
+    }
+
+    /// 開いた装飾 1 つを閉じる。中身が空白だけなら**開き記号だけ**取り消す。
+    ///
+    /// `<b></b>` を素直に閉じると `****` という literal がプレビューに出る。
+    /// 中身の空白は消さない (`a<b> </b>c` を `ac` に詰めないため)。
+    fn finish_span(&mut self, sp: OpenSpan) {
+        let has_body = {
+            let s = self.sink();
+            sp.at > s.len() || !s[sp.at..].trim().is_empty()
+        };
+        if has_body {
+            self.push_str(&sp.close);
+            return;
+        }
+        let from = sp.at - sp.open_len;
+        self.sink().replace_range(from..sp.at, "");
+    }
+
+    /// 開閉どちらかの装飾タグを処理する。
+    fn emphasis(&mut self, tag: &Tag, key: &'static str, mark: &str) {
+        if tag.closing {
+            self.close_span(key, mark);
+        } else {
+            self.open_span(key, mark, mark);
+        }
+    }
+
+    /// ハード改行 (行末スペース 2 個)。段落は変えずに行だけ分ける。
+    fn hard_break(&mut self) {
+        let s = self.sink();
+        if s.is_empty() || s.ends_with('\n') {
+            return;
+        }
+        while s.ends_with(' ') || s.ends_with('\t') {
+            s.pop();
+        }
+        s.push_str("  \n");
+    }
+
+    /// インラインコードを開く。
+    fn open_code(&mut self) {
+        let at = self.sink().len();
+        self.push_str("`");
+        self.code_open.push(at);
+    }
+
+    /// インラインコードを閉じる。
+    ///
+    /// 中身に `` ` `` があれば区切りを 1 つ長くする (markdown 側は連長を
+    /// 数えて対応する)。中身の改行は空白へ潰す — Markdown のインラインコードは
+    /// 行をまたげないので、放置すると `` ` `` が本文へ生のまま残る。
+    fn close_code(&mut self) {
+        let Some(at) = self.code_open.pop() else {
+            self.push_str("`");
+            return;
+        };
+        let s = self.sink();
+        let Some(tick) = s.get(at..).and_then(|r| r.find('`')) else {
+            s.push('`');
+            return;
+        };
+        let open_at = at + tick;
+        let body = s[open_at + 1..].replace(['\n', '\r'], " ");
+        if body.trim().is_empty() {
+            s.truncate(open_at);
+            return;
+        }
+        let (mut run, mut max_run) = (0usize, 0usize);
+        for c in body.chars() {
+            run = if c == '`' { run + 1 } else { 0 };
+            max_run = max_run.max(run);
+        }
+        let delim = "`".repeat(max_run + 1);
+        // 先頭/末尾が ` のときは空白で挟む (CommonMark は 1 個だけ剥がす)
+        let pad = if body.starts_with('`') || body.ends_with('`') {
+            " "
+        } else {
+            ""
+        };
+        s.truncate(open_at);
+        s.push_str(&delim);
+        s.push_str(pad);
+        s.push_str(&body);
+        s.push_str(pad);
+        s.push_str(&delim);
+    }
+
     fn newline(&mut self) {
         let s = self.sink();
         if !s.is_empty() {
@@ -474,20 +1001,64 @@ impl Conv {
         }
     }
 
+    /// ブロック要素の境界。**リスト項目の中では空行を作らない。**
+    ///
+    /// `<li><p>本文</p></li>` は実世界の HTML でごく普通に出るが、そこで
+    /// 空行を入れるとリストが分断され「マーカーだけの空項目」が生まれる。
+    /// 項目の中では代わりにハード改行 + インデントで続きにする。
+    fn block_boundary(&mut self) {
+        if self.lists.is_empty() || self.in_table_cell() {
+            self.block_break();
+            return;
+        }
+        let indent = "  ".repeat(self.lists.len());
+        let quote = self.quote_depth;
+        let s = self.sink();
+        // マーカー直後なら足すものは無い
+        if s.is_empty() || s.ends_with("- ") || s.ends_with(". ") || s.ends_with("• ") {
+            return;
+        }
+        // 前のブロックが残した行末のインデントを落としてから判断する。
+        // 落とさずに改行を足すと「空白だけの行」= 空行になってリストが切れる
+        while s.ends_with(' ') || s.ends_with('\t') {
+            s.pop();
+        }
+        if !s.ends_with('\n') {
+            s.push_str("  \n");
+        }
+        for _ in 0..quote {
+            s.push_str("> ");
+        }
+        s.push_str(&indent);
+    }
+
     /// タグ 1 個を処理する。
     fn tag(&mut self, tag: &Tag) {
         let name = tag.name.as_str();
         match name {
-            "b" | "strong" => self.push_str("**"),
-            "i" | "em" | "cite" | "var" | "dfn" => self.push_str("*"),
-            "s" | "del" | "strike" => self.push_str("~~"),
+            // 強調系は開閉をスタックで対応させる (空要素・交差した閉じタグの修復)
+            "b" | "strong" => self.emphasis(tag, "strong", "**"),
+            "i" | "em" | "cite" | "var" | "dfn" => self.emphasis(tag, "em", "*"),
+            "s" | "del" | "strike" => self.emphasis(tag, "del", "~~"),
+            // Markdown に強調表示の記法は無いので太字で代用する
+            "mark" => self.emphasis(tag, "strong", "**"),
             "code" if self.pre => {
                 // <pre><code class="language-x"> の言語はフェンス開始時に処理済み
             }
-            "code" | "kbd" | "samp" | "tt" => self.push_str("`"),
+            "code" | "kbd" | "samp" | "tt" => {
+                if tag.closing {
+                    self.close_code();
+                } else {
+                    self.open_code();
+                }
+            }
             "br" => {
-                if self.table.is_some() {
+                if self.in_table_cell() {
+                    // GFM の表のセルは改行を持てない (markdown 側もセル内は 1 行)。
+                    // 生の <br> を残すと本文にマークアップが出るので空白へ落とす
                     self.push_char(' ');
+                } else if self.table.is_some() {
+                    // セルの外 (行間) の <br> は捨てる
                 } else if !tag.closing {
                     // Markdown のハード改行 (行末スペース 2 個)
                     self.sink().push_str("  ");
@@ -495,48 +1066,89 @@ impl Conv {
                 }
             }
             "hr" => {
-                if !tag.closing {
-                    self.block_break();
-                    self.push_str("---");
-                    self.block_break();
+                if tag.closing || self.in_table_cell() {
+                    // セル内の `---` は区切り行と読み違えられるので出さない
+                    return;
                 }
+                self.block_break();
+                self.push_str("---");
+                self.block_break();
             }
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => self.tag_heading(tag, name),
             "p" | "div" | "section" | "article" | "main" | "header" | "footer" | "aside"
-            | "nav" | "center" | "figure" | "figcaption" | "address" | "dl" | "form"
-            | "fieldset" | "hgroup" | "dialog" | "search" | "noscript" | "html" | "body" => {
-                self.block_break();
+            | "nav" | "center" | "figure" | "address" | "dl" | "form" | "fieldset" | "hgroup"
+            | "dialog" | "search" | "noscript" | "html" | "body" => {
+                self.block_boundary();
             }
-            // 定義リスト: 用語は太字、説明は 1 段下げ
+            // 図版のキャプションは本文と区別が付くよう斜体にする
+            "figcaption" => {
+                if tag.closing {
+                    self.close_span("figcaption", "*");
+                    self.block_boundary();
+                } else {
+                    self.block_boundary();
+                    self.open_span("figcaption", "*", "*");
+                }
+            }
+            // <select> の選択肢は 1 行ずつに割る (地の文へ繋がると読めない)
+            "option" => {
+                if !tag.closing {
+                    self.newline();
+                }
+            }
+            // 定義リスト: 用語は太字、説明は 1 段下げ。
+            // 段落を分けずに行だけ分けたいのでハード改行 (行末スペース 2 個) を使う
             "dt" => {
                 if tag.closing {
-                    self.push_str("**");
-                    self.newline();
+                    self.close_span("dt", "**");
+                    self.hard_break();
                 } else {
-                    self.block_break();
-                    self.push_str("**");
+                    self.block_boundary();
+                    self.open_span("dt", "**", "**");
                 }
             }
             "dd" => {
                 if tag.closing {
-                    self.newline();
+                    self.hard_break();
                 } else {
-                    self.newline();
-                    self.push_str("  ");
+                    self.hard_break();
+                    let quote = self.quote_depth;
+                    let s = self.sink();
+                    for _ in 0..quote {
+                        s.push_str("> ");
+                    }
+                    s.push_str("  ");
+                }
+            }
+            // 引用符付きの短い引用
+            "q" => {
+                if tag.closing {
+                    self.close_span("q", "\u{201D}");
+                } else {
+                    self.open_span("q", "\u{201C}", "\u{201D}");
+                }
+            }
+            // 略語は展開を丸括弧で添える (title を落とすと情報が消える)
+            "abbr" | "acronym" => {
+                if tag.closing {
+                    self.close_span("abbr", "");
+                } else {
+                    let title = attr_text(&tag.attrs, "title")
+                        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                        .filter(|t| !t.is_empty());
+                    let close = title.map_or(String::new(), |t| format!(" ({t})"));
+                    self.open_span("abbr", "", &close);
                 }
             }
             // インライン装飾のうち Markdown に無いものは素通し (中身は残る)。
             // style 属性に太字/斜体/打消しが書かれていれば拾う
-            "span" | "font" | "small" | "u" | "ins" | "mark" | "abbr" | "bdi" | "bdo" | "q"
-            | "time" | "data" | "output" | "ruby" | "rt" | "rp" | "big" => {
+            "span" | "font" | "small" | "u" | "ins" | "bdi" | "bdo" | "time" | "data"
+            | "output" | "ruby" | "rt" | "rp" | "big" | "label" | "legend" | "button" => {
                 if tag.closing {
-                    if let Some(close) = self.spans.pop() {
-                        self.push_str(&close);
-                    }
+                    self.close_span("style", "");
                 } else {
                     let (open, close) = style_marks(&tag.attrs);
-                    self.push_str(&open);
-                    self.spans.push(close);
+                    self.open_span("style", &open, &close);
                 }
             }
             "sup" => self.push_str(if tag.closing { ")" } else { "^(" }),
@@ -569,21 +1181,61 @@ impl Conv {
             }
             // 再生できないメディアは「ここに何があるか」をリンクで残す
             "video" | "audio" | "embed" | "object" | "iframe" => {
-                if tag.closing {
-                    return;
-                }
-                let src = attr_text(&tag.attrs, "src")
-                    .or_else(|| attr_text(&tag.attrs, "data"))
-                    .unwrap_or_default();
-                if src.is_empty() {
-                    return;
-                }
                 let icon = match name {
                     "audio" => "🔊",
                     "video" => "🎬",
                     _ => "🔗",
                 };
-                self.push_str(&format!("[{icon} {src}]({src})"));
+                if tag.closing {
+                    self.media_pending = None;
+                    return;
+                }
+                match attr_text(&tag.attrs, "src")
+                    .or_else(|| attr_text(&tag.attrs, "data"))
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    Some(src) => self.push_media(icon, &src),
+                    // <video><source src=…> 形式。子の <source> を待つ
+                    None if matches!(name, "video" | "audio") => {
+                        self.media_pending = Some(icon);
+                    }
+                    None => {}
+                }
+            }
+            // <picture> の中では <img> が主役。<img> が無い (= <source> だけの)
+            // 構成でも画像が消えないよう、最初の srcset を控えておく
+            "picture" => {
+                if tag.closing {
+                    self.picture_depth = self.picture_depth.saturating_sub(1);
+                    if self.picture_depth == 0 {
+                        if !self.picture_img {
+                            if let Some(src) = self.picture_src.take() {
+                                self.push_str(&format!("![]({})", safe_url(&src)));
+                            }
+                        }
+                        self.picture_src = None;
+                        self.picture_img = false;
+                    }
+                } else {
+                    self.picture_depth += 1;
+                    self.picture_src = None;
+                    self.picture_img = false;
+                }
+            }
+            "source" => {
+                if tag.closing {
+                    return;
+                }
+                let Some(src) = first_src(&tag.attrs) else {
+                    return;
+                };
+                if self.picture_depth > 0 {
+                    if self.picture_src.is_none() {
+                        self.picture_src = Some(src);
+                    }
+                } else if let Some(icon) = self.media_pending {
+                    self.push_media(icon, &src);
+                }
             }
             "blockquote" => {
                 self.block_break();
@@ -626,7 +1278,11 @@ impl Conv {
                         self.push_str(&format!("]({href})"));
                     }
                 } else {
-                    let href = attr_text(&tag.attrs, "href").filter(|h| !h.is_empty());
+                    // `javascript:` 等の実行系スキームはリンクにしない (中身は残る)
+                    let href = attr_text(&tag.attrs, "href")
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty() && !is_script_url(h))
+                        .map(|h| safe_url(&h));
                     if href.is_some() {
                         self.push_str("[");
                     }
@@ -638,27 +1294,17 @@ impl Conv {
                     return;
                 }
                 // src が空なら data-src / srcset の先頭を代わりに使う (遅延読込対策)
-                let src = attr_text(&tag.attrs, "src")
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| attr_text(&tag.attrs, "data-src"))
-                    .or_else(|| {
-                        attr_text(&tag.attrs, "srcset").and_then(|s| {
-                            s.split(',')
-                                .next()
-                                .and_then(|p| p.split_whitespace().next())
-                                .map(|p| p.to_string())
-                        })
-                    })
-                    .unwrap_or_default();
-                if src.trim().is_empty() {
+                let Some(src) = first_src(&tag.attrs) else {
                     return;
+                };
+                if self.picture_depth > 0 {
+                    self.picture_img = true;
                 }
                 let alt = attr_text(&tag.attrs, "alt")
                     .or_else(|| attr_text(&tag.attrs, "title"))
                     .unwrap_or_default();
                 // alt の `[` `]` は画像記法を壊すので丸括弧へ置き換える
-                let alt = alt.replace('[', "(").replace(']', ")").replace('\n', " ");
-                self.push_str(&format!("![{alt}]({})", src.trim()));
+                self.push_str(&format!("![{}]({})", safe_alt(&alt), safe_url(&src)));
             }
             "details" => self.block_break(),
             "summary" => {
@@ -694,15 +1340,15 @@ impl Conv {
             "tr" if self.table_depth <= 1 => self.tag_table_row(tag),
             "tr" => {}
             "th" | "td" if self.table_depth <= 1 => {
+                let span = (
+                    attr_span(&tag.attrs, "colspan"),
+                    attr_span(&tag.attrs, "rowspan"),
+                );
                 if let Some(t) = &mut self.table {
-                    if let Some(c) = t.cur_cell.take() {
-                        t.cur_row.push(c);
-                    }
+                    t.finish_cell();
                     if !tag.closing {
                         t.cur_cell = Some(String::new());
-                        if name == "td" {
-                            t.row_is_th = false;
-                        }
+                        t.cur_span = span;
                     }
                 }
             }
@@ -742,7 +1388,31 @@ impl Conv {
         if tag.closing {
             return;
         }
-        self.newline();
+        // 表のセルの中は 1 行しか持てないので、箇条書きは中黒で区切る
+        // (改行を空白へ潰すと項目の切れ目が消えて読めなくなる)
+        if self.in_table_cell() {
+            let s = self.sink();
+            if !s.is_empty() && !s.ends_with(' ') {
+                s.push(' ');
+            }
+            s.push_str("• ");
+            return;
+        }
+        // 直前の項目内ブロックが残したインデントを落とす。残したまま改行すると
+        // 空白だけの行 (= 空行) が入ってリストが 2 つに割れる。
+        //
+        // **落とすのは「空白だけの行」全体だけ。** 行末の空白を無条件に削ると
+        // 中身が空の項目のマーカー (`1. `) の空白まで食う
+        {
+            let s = self.sink();
+            let line_start = s.rfind('\n').map_or(0, |p| p + 1);
+            if s[line_start..].trim().is_empty() {
+                s.truncate(line_start);
+            }
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+        }
         let depth = self.lists.len().saturating_sub(1);
         let marker = match self.lists.last_mut() {
             Some(ListKind::Ol(n)) => {
@@ -768,20 +1438,9 @@ impl Conv {
     fn tag_table_row(&mut self, tag: &Tag) {
         if let Some(t) = &mut self.table {
             if tag.closing {
-                if let Some(c) = t.cur_cell.take() {
-                    t.cur_row.push(c);
-                }
-                if !t.cur_row.is_empty() {
-                    if t.rows.is_empty() && t.row_is_th {
-                        t.header = true;
-                    }
-                    t.rows.push(std::mem::take(&mut t.cur_row));
-                }
-                t.row_is_th = false;
+                t.end_row();
             } else {
-                t.cur_row.clear();
-                t.cur_cell = None;
-                t.row_is_th = true;
+                t.begin_row();
             }
         }
     }
@@ -791,17 +1450,23 @@ impl Conv {
         if tag.closing {
             self.pre = false;
             self.pre_lang_pending = false;
+            let start = self.pre_start;
             let s = self.sink();
+            let marker = pick_fence(s, start);
+            if marker != "```" && s.len() >= start + 3 {
+                s.replace_range(start..start + 3, marker);
+            }
             if !s.ends_with('\n') {
                 s.push('\n');
             }
-            s.push_str("```");
+            s.push_str(marker);
             self.block_break();
         } else {
             self.block_break();
             self.pre = true;
             // 言語は直後の <code class="language-x"> から拾う
             self.pre_lang_pending = true;
+            self.pre_start = self.sink().len();
             self.sink().push_str("```");
             // <pre class="language-x"> にも対応
             if let Some(lang) = fence_lang(&tag.attrs) {
@@ -812,15 +1477,25 @@ impl Conv {
         }
     }
 
+    /// 再生できないメディアを「何があるか」の分かるリンクにする。
+    fn push_media(&mut self, icon: &str, src: &str) {
+        self.media_pending = None;
+        let src = src.trim();
+        if src.is_empty() || is_script_url(src) {
+            return;
+        }
+        // 表示側の文字列も記法を壊さない形へ (`]` があるとリンクが切れる)
+        self.push_str(&format!("[{icon} {}]({})", safe_alt(src), safe_url(src)));
+    }
+
     /// 溜めたテーブルを Markdown テーブルとして書き出す。
     fn emit_table(&mut self) {
         let Some(mut t) = self.table.take() else {
             return;
         };
         t.in_caption = false;
-        if let Some(c) = t.cur_cell.take() {
-            t.cur_row.push(c);
-        }
+        // 閉じ忘れの行/セルも流す (壊れた HTML でも表を落とさない)
+        t.finish_cell();
         if !t.cur_row.is_empty() {
             t.rows.push(std::mem::take(&mut t.cur_row));
         }
@@ -858,6 +1533,43 @@ impl Conv {
         }
         self.block_break();
     }
+}
+
+/// `<pre>` の中身に合わせてフェンス記号を選ぶ。
+///
+/// markdown 側のフェンスは「同じ記号で始まる行」で閉じるので、中身に
+/// ` ``` ` で始まる行があると**そこでコードブロックが切れ**、残りが本文として
+/// 描かれてしまう (Markdown の説明ページで必ず起きる)。その場合だけ `~~~` を
+/// 使う。両方入っているときは打つ手が無いので ` ``` ` のまま (壊れるが落ちない)。
+///
+/// `s[start..]` は `<pre>` が書き出したフェンス行から末尾まで。
+fn pick_fence(s: &str, start: usize) -> &'static str {
+    let Some(region) = s.get(start..) else {
+        return "```";
+    };
+    if !region.starts_with("```") {
+        return "```";
+    }
+    // 1 行目は自分が書いた開きフェンスなので飛ばす
+    let body_lines = || region.split('\n').skip(1);
+    let has_back = body_lines().any(|l| l.trim_start().starts_with("```"));
+    let has_tilde = body_lines().any(|l| l.trim_start().starts_with("~~~"));
+    if has_back && !has_tilde {
+        "~~~"
+    } else {
+        "```"
+    }
+}
+
+/// リンク先として開いてはいけない (実行系の) スキームか。
+fn is_script_url(u: &str) -> bool {
+    let head: String = u
+        .trim_start()
+        .chars()
+        .take_while(|c| *c != ':' && !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(head.as_str(), "javascript" | "vbscript")
 }
 
 /// class 属性から `language-x` / `lang-x` を取り出す。
@@ -899,6 +1611,17 @@ fn is_known_tag(name: &str) -> bool {
             | "param" | "noscript" | "slot" | "base" | "link" | "meta" | "title" | "q"
             | "big" | "marquee" | "nobr" | "blink" | "acronym" | "basefont" | "noframes"
             | "iframe"
+            // フォーム/旧世代の要素。ここに無いと Markdown モードで
+            // `<option>` などが生のまま本文へ出る。
+            //
+            // **ここへ足す名前は「ジェネリクスの型名として書かれうるか」で選ぶ。**
+            // `Map` / `Element` / `Content` / `Command` / `Frame` / `Dir` は
+            // `Array<Map>` のような書き方が普通にあり、タグ扱いにすると
+            // **本文からその語が消える**ので、あえて入れていない
+            // (`Option` は Rust では必ず `Option<T>` と書かれ、属性部に `<` が
+            //  入るので `looks_like_markup` 側で弾かれる)
+            | "option" | "xmp" | "menuitem" | "frameset" | "applet" | "keygen"
+            | "listing" | "plaintext" | "spacer" | "bgsound" | "isindex" | "multicol"
     )
 }
 
@@ -1035,8 +1758,14 @@ fn convert(text: &str, mode: Mode) -> String {
                     i = (k + 3).min(chars.len());
                     continue;
                 }
-                // <!DOCTYPE ...> 等
-                if mode == Mode::Html {
+                // `<!DOCTYPE …>` / `<![CDATA[…]]>` などの宣言。
+                // Markdown モードでも捨てる — `<!` の次が英字か `[` である形は
+                // ジェネリクスにはならないので誤爆せず、残すと宣言行が
+                // そのまま本文に出る (README の先頭で実際に起きる)
+                let decl = chars
+                    .get(i + 2)
+                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == '[');
+                if mode == Mode::Html || decl {
                     while i < chars.len() && chars[i] != '>' {
                         i += 1;
                     }
@@ -1066,7 +1795,16 @@ fn convert(text: &str, mode: Mode) -> String {
                         "script" | "style" | "head" | "svg" | "canvas" | "template"
                     )
                 {
-                    i = skip_until_close(&chars, tag.end, &tag.name);
+                    let end = skip_until_close(&chars, tag.end, &tag.name);
+                    // 描けない図版は、名前が分かるときだけ説明を残す。
+                    // README のインラインアイコンには説明が無いことが多く、
+                    // 一律にプレースホルダを置くと本文が記号だらけになる
+                    if matches!(tag.name.as_str(), "svg" | "canvas") {
+                        if let Some(label) = media_label(&chars[i..end], &tag.attrs) {
+                            conv.push_str(&format!("🖼 {label}"));
+                        }
+                    }
+                    i = end;
                     at_line_start = true;
                     continue;
                 }
@@ -1107,7 +1845,11 @@ fn convert(text: &str, mode: Mode) -> String {
             if let Some(end) = end {
                 let name: String = chars[i + 1..end].iter().collect();
                 if let Some(rep) = entity(&name) {
-                    conv.push_str(&rep);
+                    if conv.pre {
+                        conv.sink().push_str(&rep);
+                    } else {
+                        conv.push_text_str(&rep);
+                    }
                     at_line_start = false;
                     i = end + 1;
                     continue;
@@ -1124,15 +1866,32 @@ fn convert(text: &str, mode: Mode) -> String {
             conv.pre_lang_pending = false;
             conv.sink().push(c);
         } else {
-            conv.push_char(c);
+            conv.push_text(c);
         }
         at_line_start = c == '\n';
         i += 1;
     }
 
-    // 閉じ忘れの装飾/テーブルを流す (壊れた HTML でも出力が途切れないように)
-    while let Some(close) = conv.spans.pop() {
-        conv.push_str(&close);
+    // 閉じ忘れを全部流す (壊れた HTML でも出力が途切れないように)
+    while let Some(sp) = conv.spans.pop() {
+        conv.finish_span(sp);
+    }
+    while !conv.code_open.is_empty() {
+        conv.close_code();
+    }
+    while let Some(href) = conv.links.pop() {
+        if let Some(h) = href {
+            conv.push_str(&format!("]({h})"));
+        }
+    }
+    if conv.pre {
+        let fake = Tag {
+            name: "pre".to_string(),
+            closing: true,
+            attrs: String::new(),
+            end: 0,
+        };
+        conv.tag_pre(&fake);
     }
     conv.table_depth = 0;
     conv.emit_table();
@@ -1681,6 +2440,631 @@ let v: Vec<Option<String>> = vec![];
         // フロントマターはそのまま残り、描画側で畳まれる
         let (fm, _) = crate::markdown::split_front_matter(&md);
         assert_eq!(fm.map(|s| s.trim()), Some("title: サンプル"));
+    }
+
+    // ─── 生のマークアップが漏れていないことの検査 ───────────────────
+
+    /// 変換結果に生の HTML が残っていないか。
+    ///
+    /// 「タグが 1 つ残る」= プレビューが崩れて見える、なので入口をまとめて
+    /// 1 箇所で検査する。Markdown モードは `Vec<String>` のようなジェネリクスを
+    /// 原文で残すのが仕様なので、閉じタグと**既知のタグ名で始まる `<`** だけを見る。
+    fn assert_no_raw_markup(out: &str, ctx: &str) {
+        let lower = out.to_ascii_lowercase();
+        // 閉じタグは 1 つも残ってはいけない (ジェネリクスと紛れる形が無い)
+        for name in [
+            "div",
+            "p",
+            "span",
+            "a",
+            "table",
+            "tr",
+            "td",
+            "th",
+            "ul",
+            "ol",
+            "li",
+            "pre",
+            "code",
+            "dl",
+            "dt",
+            "dd",
+            "figure",
+            "figcaption",
+            "picture",
+            "source",
+            "video",
+            "audio",
+            "iframe",
+            "svg",
+            "script",
+            "style",
+            "template",
+            "noscript",
+            "select",
+            "option",
+            "button",
+            "form",
+            "label",
+            "abbr",
+            "mark",
+            "q",
+            "kbd",
+            "blockquote",
+            "strong",
+            "em",
+            "details",
+            "summary",
+            "header",
+            "footer",
+            "nav",
+        ] {
+            let close = format!("</{name}>");
+            assert!(
+                !lower.contains(&close),
+                "{ctx}: {close:?} が残っている:\n{out}"
+            );
+            // 開始タグ (`<td>` / `<td ` の両方)
+            for open in [format!("<{name}>"), format!("<{name} ")] {
+                assert!(
+                    !lower.contains(&open),
+                    "{ctx}: {open:?} が残っている:\n{out}"
+                );
+            }
+        }
+        assert!(
+            !lower.contains("<!--"),
+            "{ctx}: コメントが残っている:\n{out}"
+        );
+        assert!(
+            !lower.contains("<!doctype"),
+            "{ctx}: DOCTYPE が残っている:\n{out}"
+        );
+        // 解決できるはずの実体参照が生で残っていないか
+        let chars: Vec<char> = out.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c != '&' {
+                continue;
+            }
+            let Some(end) = (i + 1..chars.len().min(i + 33)).find(|&k| chars[k] == ';') else {
+                continue;
+            };
+            let name: String = chars[i + 1..end].iter().collect();
+            // 実体参照の形をしているものだけ見る (地の文の `&` … `;` を拾わない)
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '#') {
+                continue;
+            }
+            assert!(
+                entity(&name).is_none(),
+                "{ctx}: 実体参照 &{name}; が解決されずに残っている:\n{out}"
+            );
+        }
+    }
+
+    /// 実世界にある形の HTML 文書を通しで変換し、生のマークアップが
+    /// 1 つも本文へ出ないことを確認する (`real_world_readme_…` の系統)。
+    #[test]
+    fn real_world_documents_leave_no_raw_markup() {
+        let docs: &[(&str, &str)] = &[
+            (
+                "ブログ記事 (nav/header/footer/script/style つき)",
+                r#"<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8"><title>記事</title>
+<style>body{color:#333}</style></head>
+<body>
+<nav><ul><li><a href="/">ホーム</a></li><li><a href="/blog">ブログ</a></li></ul></nav>
+<header><h1>HTML &amp; Markdown</h1></header>
+<article>
+  <p>本文です。<abbr title="HyperText Markup Language">HTML</abbr> の話。</p>
+  <figure><img src="fig.png" alt="図1"><figcaption>図 1: 構成</figcaption></figure>
+  <blockquote><p>引用の 1 段目</p><blockquote><p>2 段目</p></blockquote></blockquote>
+  <p>キーは <kbd>Ctrl</kbd>+<kbd>C</kbd>、<mark>重要</mark>です。</p>
+</article>
+<footer><p>&copy; 2026 &mdash; example</p></footer>
+<script>console.log("<p>これは出てはいけない</p>")</script>
+</body></html>"#,
+            ),
+            (
+                "仕様表 (colspan / rowspan / thead / tfoot)",
+                r#"<table>
+  <caption>対応表</caption>
+  <thead><tr><th>機能</th><th>Linux</th><th>macOS</th><th>Windows</th></tr></thead>
+  <tbody>
+    <tr><td>PTY</td><td colspan="2">対応</td><td>一部</td></tr>
+    <tr><td rowspan="2">GPU</td><td>OK</td><td>OK</td><td>OK</td></tr>
+    <tr><td>NG</td><td>OK</td><td>NG</td></tr>
+  </tbody>
+  <tfoot><tr><td colspan="4">以上</td></tr></tfoot>
+</table>"#,
+            ),
+            (
+                "定義リストと入れ子リスト",
+                r#"<dl>
+  <dt>ワークツリー</dt><dd>独立した作業ディレクトリ。</dd>
+  <dt>リース</dt><dd>行域の<strong>所有権</strong>。</dd>
+</dl>
+<ul>
+  <li><p>親の段落</p>
+    <ul><li>子 1</li><li>子 2<ul><li>孫</li></ul></li></ul>
+  </li>
+  <li>単純な項目</li>
+</ul>"#,
+            ),
+            (
+                "メディア (picture / video / iframe / svg)",
+                r##"<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="dark.png">
+  <source srcset="light.png">
+  <img src="fallback.png" alt="ロゴ">
+</picture>
+<picture><source srcset="only-source.avif 1x, only-source@2x.avif 2x"></picture>
+<video controls poster="p.jpg"><source src="movie.mp4" type="video/mp4">対応してません</video>
+<audio><source src="track.ogg"></audio>
+<iframe src="https://example.com/embed" width="560"></iframe>
+<svg viewBox="0 0 10 10"><title>状態遷移図</title><circle cx="5" cy="5" r="4"/></svg>
+<svg class="icon"><use href="#i"/></svg>"##,
+            ),
+            (
+                "フォームと選択肢",
+                r#"<form action="/s"><fieldset><legend>絞り込み</legend>
+<label for="k">種別</label>
+<select id="k"><option>すべて</option><option selected>本</option><option>雑誌</option></select>
+<textarea rows="3">初期値</textarea>
+<button type="submit">送信</button>
+</fieldset></form>"#,
+            ),
+            (
+                "コード例を含む解説 (pre の中に ``` がある)",
+                r#"<h2>書き方</h2>
+<pre><code class="language-markdown">見出し
+
+```rust
+let x = 1;
+```
+</code></pre>
+<p>インラインは <code>`code`</code> のように書きます。</p>"#,
+            ),
+            (
+                "メール風の入れ子テーブルとインライン style",
+                r#"<table width="100%"><tr><td align="center">
+  <table><tr><td><span style="font-weight:bold">見出し</span></td></tr>
+  <tr><td><span style="font-style:italic;line-through">古い値</span></td></tr></table>
+</td></tr></table>"#,
+            ),
+            (
+                "壊れた文書 (閉じ忘れ・交差・属性の引用符なし)",
+                r#"<div class=box><p>閉じない段落
+<b>太字<i>交差</b>している</i>
+<ul><li>一<li>二
+<table><tr><td>セル<td>もう 1 つ
+<a href=/rel/path?a=1&amp;b=2>リンク
+<img src=x.png alt=図>
+<pre><code>閉じない"#,
+            ),
+        ];
+        for (name, src) in docs {
+            for (mode, out) in [
+                ("html_to_md", html_to_md(src)),
+                ("preprocess_markdown", preprocess_markdown(src)),
+            ] {
+                assert_no_raw_markup(&out, &format!("{name} / {mode}"));
+            }
+        }
+    }
+
+    // ─── 表 (結合セル・セル内の構造) ───────────────────────────────
+
+    /// `| a | b |` 行をセルの列へ分解する (空白の詰め方に依らず桁を見るため)。
+    fn cells(line: &str) -> Vec<&str> {
+        line.trim()
+            .trim_start_matches('|')
+            .trim_end_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn table_spans_keep_columns_aligned() {
+        // colspan: 埋めないと後続のセルが左へ詰まり、見出しと中身がずれる
+        let md = html_to_md(
+            "<table><tr><th>A</th><th>B</th><th>C</th></tr>\
+             <tr><td colspan=\"2\">結合</td><td>右端</td></tr></table>",
+        );
+        let rows: Vec<&str> = md.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(cells(rows[0]), ["A", "B", "C"], "{md}");
+        assert_eq!(cells(rows[2]), ["結合", "", "右端"], "{md}");
+
+        // rowspan: 次の行でも桁を予約する
+        let md = html_to_md(
+            "<table><tr><th>K</th><th>V1</th><th>V2</th></tr>\
+             <tr><td rowspan=\"2\">共通</td><td>a</td><td>b</td></tr>\
+             <tr><td>c</td><td>d</td></tr></table>",
+        );
+        let rows: Vec<&str> = md.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(cells(rows[2]), ["共通", "a", "b"], "{md}");
+        assert_eq!(cells(rows[3]), ["", "c", "d"], "{md}");
+
+        // 壊れた span 値でも桁が飛ばない
+        for bad in ["0", "-3", "abc", "", "999999"] {
+            let md = html_to_md(&format!(
+                "<table><tr><td colspan=\"{bad}\">x</td><td>y</td></tr></table>"
+            ));
+            let cols = md
+                .lines()
+                .find(|l| l.starts_with('|'))
+                .unwrap_or_default()
+                .matches('|')
+                .count();
+            assert!(
+                (2..=MAX_SPAN + 2).contains(&cols),
+                "colspan={bad:?} で桁数が壊れた: {md}"
+            );
+        }
+    }
+
+    #[test]
+    fn table_cells_stay_on_one_line() {
+        // GFM の表は 1 セル 1 行しか持てない。<br>・段落・箇条書きが
+        // セルの外へ漏れると表そのものが崩れる
+        let md = html_to_md(
+            "<table><tr><td>1 行目<br>2 行目</td>\
+             <td><p>段落 A</p><p>段落 B</p></td>\
+             <td><ul><li>甲</li><li>乙</li></ul></td>\
+             <td><hr></td></tr></table>",
+        );
+        // 1 行 (= ヘッダ扱いの行) と区切り行だけ。セルの中身が行を割っていない
+        let rows: Vec<&str> = md.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(rows.len(), 2, "セルの中身が行を割った:\n{md}");
+        let row = rows[0];
+        assert!(row.contains("1 行目 2 行目"), "{md}");
+        assert!(row.contains("段落 A") && row.contains("段落 B"), "{md}");
+        // 箇条書きは中黒で区切って項目の切れ目を残す
+        assert!(row.contains("• 甲") && row.contains("• 乙"), "{md}");
+        // セル内の <hr> は区切り行と読み違えられるので出さない
+        assert!(!row.contains("---"), "{md}");
+    }
+
+    #[test]
+    fn table_cell_pipes_and_code_are_escaped() {
+        let md = html_to_md(
+            "<table><tr><td>a|b</td><td><code>x || y</code></td>\
+             <td>&verbar;</td></tr></table>",
+        );
+        let row = md.lines().find(|l| l.starts_with("| ")).unwrap_or_default();
+        // 生の | が残ると桁が増えて表がずれる
+        assert_eq!(row.matches("\\|").count(), 4, "{md}");
+    }
+
+    // ─── インライン記法を壊さない ─────────────────────────────────
+
+    #[test]
+    fn inline_code_survives_backticks_and_newlines() {
+        // Markdown モードは「インラインコード内は触らない」が先に立つので
+        // (裸の ` が保護をトグルする)、ここは HTML 文書として通す
+        let cases: &[(&str, &str)] = &[
+            ("<code>plain</code>", "`plain`"),
+            // 中身に ` があるときは区切りを伸ばして前後に空白を入れる
+            ("<code>a`b</code>", "``a`b``"),
+            ("<code>``x``</code>", "``` ``x`` ```"),
+            // 改行を残すと Markdown のインラインコードが閉じない
+            ("<code>a\nb</code>", "`a b`"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(html_to_md(src).trim(), *want, "{src:?}");
+        }
+        // 空の要素は記法ごと消す (`` が literal で残らない)
+        assert_eq!(html_to_md("<code></code>").trim(), "");
+        assert_eq!(preprocess_markdown("<code>plain</code>").trim(), "`plain`");
+    }
+
+    #[test]
+    fn pre_containing_a_fence_switches_marker() {
+        let md = html_to_md("<pre><code>前\n```\n中\n```\n後</code></pre>");
+        assert!(md.starts_with("~~~"), "{md:?}");
+        assert!(md.trim_end().ends_with("~~~"), "{md:?}");
+        // 中身は 1 文字も落とさない
+        for w in ["前", "```", "中", "後"] {
+            assert!(md.contains(w), "{w:?} が無い: {md:?}");
+        }
+        // 普通の pre は ``` のまま
+        let md = html_to_md("<pre><code class=\"language-rust\">let x;</code></pre>");
+        assert!(md.starts_with("```rust"), "{md:?}");
+        // 両方入っていたら ``` のまま (落ちないことだけ保証する)
+        let md = html_to_md("<pre>```\n~~~\n</pre>");
+        assert!(md.starts_with("```"), "{md:?}");
+    }
+
+    #[test]
+    fn empty_inline_elements_emit_no_stray_marks() {
+        // `****` `~~~~` のような literal がプレビューに出ないこと
+        for src in [
+            "<b></b>",
+            "<strong> </strong>",
+            "<em></em>",
+            "<i></i>",
+            "<del></del>",
+            "<mark></mark>",
+            "<code></code>",
+            "<q></q>",
+            "<abbr title=\"x\"></abbr>",
+            "<figcaption></figcaption>",
+        ] {
+            let md = preprocess_markdown(src);
+            for bad in ["**", "~~", "``", "\u{201C}\u{201D}"] {
+                assert!(!md.contains(bad), "{src:?} → {md:?} に {bad:?} が出た");
+            }
+        }
+        // 交差した閉じタグでも本文が消えず、生のタグも残らない
+        let md = preprocess_markdown("<b>太<i>交</b>差</i>");
+        for w in ['太', '交', '差'] {
+            assert!(md.contains(w), "{w:?} が消えた: {md:?}");
+        }
+        assert!(!md.contains('<'), "{md:?}");
+    }
+
+    #[test]
+    fn link_and_image_urls_survive_parens_and_spaces() {
+        let cases: &[(&str, &str)] = &[
+            // 丸括弧をそのまま書くと markdown 側が最初の ) で URL を切る
+            (
+                r#"<a href="https://ja.wikipedia.org/wiki/Rust_(プログラミング言語)">Rust</a>"#,
+                "[Rust](https://ja.wikipedia.org/wiki/Rust_%28プログラミング言語%29)",
+            ),
+            (
+                r#"<img src="my image.png" alt="図">"#,
+                "![図](my%20image.png)",
+            ),
+            // リンク文字列の中の ] はリンクを途中で切る
+            (r#"<a href="/x">a[1]b</a>"#, "[a(1)b](/x)"),
+            // 実体参照経由の ] も同じ経路で直す
+            (r#"<a href="/x">a&rsqb;b</a>"#, "[a)b](/x)"),
+        ];
+        for (src, want) in cases {
+            let md = preprocess_markdown(src);
+            assert_eq!(md.trim(), *want, "{src:?}");
+        }
+        // 実行系スキームはリンクにしない (中身のテキストは残す)
+        let md = preprocess_markdown(r#"<a href="javascript:alert(1)">押す</a>"#);
+        assert_eq!(md.trim(), "押す", "{md:?}");
+    }
+
+    // ─── ブロック構造 ─────────────────────────────────────────────
+
+    #[test]
+    fn block_elements_inside_list_items_do_not_split_the_list() {
+        let md = html_to_md("<ul><li><p>一つ目</p><p>続き</p></li><li>二つ目</li></ul>");
+        // 空行が入るとリストが切れて「マーカーだけの項目」が生まれる
+        assert!(!md.contains("-\n"), "空の項目ができた:\n{md}");
+        assert!(!md.contains("- \n"), "空の項目ができた:\n{md}");
+        let items: Vec<&str> = md
+            .lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .collect();
+        assert_eq!(items.len(), 2, "{md}");
+        assert!(
+            md.contains("一つ目") && md.contains("続き") && md.contains("二つ目"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn definition_list_keeps_terms_and_descriptions_apart() {
+        let md = html_to_md("<dl><dt>語</dt><dd>説明</dd><dt>語 2</dt><dd>説明 2</dd></dl>");
+        let lines: Vec<&str> = md.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 4, "用語と説明が同じ行に潰れた:\n{md}");
+        assert!(lines[0].contains("**語**"), "{md}");
+        assert!(lines[1].contains("説明"), "{md}");
+        // ハード改行 (行末スペース 2 個) で行が分かれていること
+        assert!(lines[0].ends_with("  "), "{:?}", lines[0]);
+    }
+
+    #[test]
+    fn nested_blockquotes_are_prefixed_by_depth() {
+        let md = html_to_md("<blockquote>外<blockquote>内</blockquote></blockquote>");
+        assert!(md.contains("> 外"), "{md}");
+        assert!(md.contains("> > 内"), "{md}");
+    }
+
+    // ─── メディア ─────────────────────────────────────────────────
+
+    #[test]
+    fn media_without_src_falls_back_to_source_children() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            // <picture> は <img> が主役
+            (
+                r#"<picture><source srcset="d.png"><img src="l.png" alt="ロゴ"></picture>"#,
+                &["![ロゴ](l.png)"],
+                &["d.png"],
+            ),
+            // <img> が無ければ最初の <source> を使う (画像が消えない)
+            (
+                r#"<picture><source srcset="a.avif 1x, a@2x.avif 2x"></picture>"#,
+                &["![](a.avif)"],
+                &["2x"],
+            ),
+            // <video src> 無し + 子の <source>
+            (
+                r#"<video controls><source src="m.mp4"></video>"#,
+                &["🎬", "(m.mp4)"],
+                &["<source"],
+            ),
+            (
+                r#"<audio><source src="t.ogg"></audio>"#,
+                &["🔊", "(t.ogg)"],
+                &["<audio"],
+            ),
+            // src があれば従来どおり。子の <source> で二重に出さない
+            (
+                r#"<video src="a.mp4"><source src="b.mp4"></video>"#,
+                &["(a.mp4)"],
+                &["b.mp4"],
+            ),
+        ];
+        for (src, want, unwanted) in cases {
+            let md = preprocess_markdown(src);
+            for w in *want {
+                assert!(md.contains(w), "{src:?} → {md:?} に {w:?} が無い");
+            }
+            for u in *unwanted {
+                assert!(!md.contains(u), "{src:?} → {md:?} に {u:?} が残った");
+            }
+        }
+    }
+
+    #[test]
+    fn undrawable_graphics_leave_a_label_only_when_named() {
+        // 名前が取れるときだけ説明を残す (アイコンだらけにしない)
+        let md = html_to_md("<p><svg><title>構成図</title><rect/></svg></p>");
+        assert!(md.contains("🖼 構成図"), "{md:?}");
+        let md = html_to_md(r#"<p><svg aria-label="警告アイコン"><path/></svg></p>"#);
+        assert!(md.contains("🖼 警告アイコン"), "{md:?}");
+        // 名前が無いインライン SVG は何も残さない (中身も漏らさない)
+        let md = html_to_md(r#"<p>前<svg><path d="M0 0 L1 1"/></svg>後</p>"#);
+        assert!(!md.contains("path") && !md.contains("M0 0"), "{md:?}");
+        assert!(md.contains('前') && md.contains('後'), "{md:?}");
+    }
+
+    // ─── インライン要素の細部 ─────────────────────────────────────
+
+    #[test]
+    fn inline_semantics_render_readably() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            (
+                r#"<abbr title="HyperText Markup Language">HTML</abbr>"#,
+                &["HTML (HyperText Markup Language)"],
+                &["<abbr", "title="],
+            ),
+            // title が無ければ本文だけ
+            ("<abbr>ID</abbr>", &["ID"], &["("]),
+            ("<q>引用</q>", &["\u{201C}引用\u{201D}"], &["<q>"]),
+            ("<mark>目印</mark>", &["**目印**"], &["<mark>"]),
+            ("<kbd>Ctrl</kbd>", &["`Ctrl`"], &["<kbd>"]),
+            (
+                "<time datetime=\"2026-08-12\">今日</time>",
+                &["今日"],
+                &["datetime"],
+            ),
+            ("<ins>追加</ins>", &["追加"], &["<ins>"]),
+            (
+                "<figure><img src=\"a.png\" alt=\"図\"><figcaption>説明文</figcaption></figure>",
+                &["![図](a.png)", "*説明文*"],
+                &["<figcaption>"],
+            ),
+            // <select> の選択肢が地の文へ繋がらない
+            (
+                "<select><option>甲</option><option>乙</option></select>",
+                &["甲", "乙"],
+                &["甲乙", "<option>"],
+            ),
+        ];
+        for (src, want, unwanted) in cases {
+            let md = html_to_md(src);
+            for w in *want {
+                assert!(md.contains(w), "{src:?} → {md:?} に {w:?} が無い");
+            }
+            for u in *unwanted {
+                assert!(!md.contains(u), "{src:?} → {md:?} に {u:?} が残った");
+            }
+        }
+    }
+
+    #[test]
+    fn extended_entity_table() {
+        let cases: &[(&str, &str)] = &[
+            // ラテン文字 — 欠けると本文に &eacute; がそのまま出る
+            ("caf&eacute;", "café"),
+            ("&Uuml;ber &ntilde;", "Über ñ"),
+            ("&aring;&oslash;&aelig;", "åøæ"),
+            ("&szlig;&ccedil;&OElig;", "ßçŒ"),
+            // ASCII 記号名
+            ("a&lpar;b&rpar;", "a(b)"),
+            ("&lbrack;x&rbrack;", "[x]"),
+            ("&num;1 &percnt; &commat;", "#1 % @"),
+            ("&colon;&semi;&excl;&quest;", ":;!?"),
+            // 記号・矢印
+            ("&mdash;&hellip;&rarr;&copy;", "—…→©"),
+            ("&oplus;&sdot;&lceil;&rceil;", "⊕⋅⌈⌉"),
+            ("&hearts;&numero;", "♥№"),
+            // 数値参照は従来どおり
+            ("&#65;&#x1F600;", "A\u{1F600}"),
+            // 未知の名前はそのまま残す (誤変換しない)
+            ("&notarealentity;", "&notarealentity;"),
+        ];
+        for (src, want) in cases {
+            assert_eq!(decode_entities(src), *want, "{src:?}");
+            assert_eq!(preprocess_markdown(src).trim(), *want, "{src:?}");
+        }
+        // 表の名前が重複していない (先に書いたほうが勝って気付けなくなる)
+        for (i, (n, _)) in NAMED_ENTITIES.iter().enumerate() {
+            assert!(
+                !NAMED_ENTITIES[i + 1..].iter().any(|(m, _)| m == n),
+                "実体参照 {n:?} が表に 2 回ある"
+            );
+        }
+    }
+
+    /// 対応タグを増やすと、その名前のジェネリクスが本文から消える。
+    /// `is_known_tag` へ足すたびにここで踏み止まること。
+    #[test]
+    fn generic_type_names_are_not_eaten_by_new_tags() {
+        for src in [
+            "Array<Map>",
+            "Vec<Element>",
+            "Box<Content>",
+            "Handler<Command>",
+            "Rc<Frame>",
+            "PathBuf<Dir>",
+            "Vec<Option<T>>",
+            "HashMap<String, Vec<u8>>",
+            "fn f() -> Result<(), Box<dyn Error>>",
+        ] {
+            assert_eq!(
+                preprocess_markdown(src),
+                src,
+                "{src:?} は原文のまま残すべき"
+            );
+        }
+    }
+
+    // ─── 壊れた入力 ───────────────────────────────────────────────
+
+    #[test]
+    fn hostile_html_degrades_without_panic() {
+        let cases = [
+            "<table><td colspan=\"999999\">x",
+            "<table><tr><td rowspan=\"64\">a</td></tr><tr><td>b</td></tr>",
+            &"<ul><li>".repeat(200),
+            &"<blockquote>".repeat(200),
+            &"<b>".repeat(500),
+            &"<table><tr><td>".repeat(100),
+            "<picture><source srcset=\"\">",
+            "<video><source>",
+            "<svg><title>閉じない",
+            "<code>``",
+            "<pre><code class=\"language-",
+            "<a href=\"(\">x</a>",
+            "<abbr title=\"",
+            "<dl><dd>説明だけ",
+            "<figcaption>孤立",
+            "&#xFFFFFFFF; &#99999999999;",
+            "<td colspan=\"1e9\">",
+        ];
+        for src in cases {
+            let md = preprocess_markdown(src);
+            let html = html_to_md(src);
+            // 出力が青天井にならない (span の増幅などが無い)
+            assert!(
+                md.len() < src.len() * 64 + 4096,
+                "{src:?} → {} bytes",
+                md.len()
+            );
+            assert!(
+                html.len() < src.len() * 64 + 4096,
+                "{src:?} → {} bytes",
+                html.len()
+            );
+        }
     }
 
     // ─── 巨大入力 ───────────────────────────────────────────────────
