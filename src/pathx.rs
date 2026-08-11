@@ -178,6 +178,13 @@ impl LinkResolver {
         // **最後にだけ**中外を決める。途中でルートの外へ出ても、その先の
         // リンクで戻ってくることがある (`a -> ../out`, `out/back -> ../repo/src`)。
         // 途中で打ち切ると、戻ってくる場合の担当を落とす = 緩む方向。
+        //
+        // **比べる前に両側を同じ形へ寄せる。** `self.root` は `canonical` を
+        // 通してあるが `acc` はリンクの行き先を**書かれたまま**積んだ形なので、
+        // Windows では `\\?\` の有無・8.3 短縮名・ドライブ文字の大小が食い違い、
+        // 中に居るのに `Outside` になる (CI の windows-latest だけで実際に落ちた:
+        // `left: Outside / right: Inside("src/app.rs")`)。
+        let acc = settle(&acc);
         match acc.strip_prefix(&self.root) {
             Ok(r) => Resolved::Inside(crate::lease::normalize_path(&r.to_string_lossy())),
             Err(_) => Resolved::Outside,
@@ -193,6 +200,40 @@ impl LinkResolver {
 /// `private/var` がまさにこれ) ので、葉だけを見て済ませると
 /// **外へ出たまま戻ってこられず、実体が中にあるのに「外」と答える**。
 /// 実際にこれで「外へ出てから戻るリンク」の検査が落ちた。
+/// 比較できる形へ寄せる。**存在しないパスでも必ず答えを返す。**
+///
+/// [`canonical`] は解決に失敗すると入力をそのまま返すので、まだ作られていない
+/// ファイルは寄らないままになる。そこで**実在する最深の祖先まで戻って解決し、
+/// 残りを継ぎ足す**。これが無いと「フォルダを作った瞬間に判定が変わる」形になる。
+fn settle(p: &Path) -> PathBuf {
+    let direct = canonical(p);
+    if direct != p {
+        return direct;
+    }
+    // 祖先を辿って、解決できたところから積み直す。
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = p.to_path_buf();
+    while let Some(parent) = cur.parent().map(Path::to_path_buf) {
+        let Some(name) = cur.file_name().map(|s| s.to_os_string()) else {
+            break;
+        };
+        tail.push(name);
+        let base = canonical(&parent);
+        if base != parent {
+            let mut out = base;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        cur = parent;
+    }
+    plain(p.to_path_buf())
+}
+
 fn step(base: &Path, seg: &str, hops: &mut u32) -> Option<PathBuf> {
     let mut acc = base.to_path_buf();
     let mut queue: std::collections::VecDeque<std::ffi::OsString> =

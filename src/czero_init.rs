@@ -1030,6 +1030,20 @@ fn parse_scoped_config(out: &str) -> ScopedConfig {
     c
 }
 
+/// 同じ場所を指すか。**大小を区別しないファイルシステムでは綴りを畳む。**
+///
+/// macOS (APFS 既定) と Windows は大小を区別しないので、`C:\Users` と
+/// `C:\users` は同じフォルダ。区別する Linux では畳んではいけない
+/// (別のフォルダを同一視すると、他人の担当を自分のものと誤認する)。
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        let norm = |p: &Path| p.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+        norm(a) == norm(b)
+    } else {
+        a == b
+    }
+}
+
 /// `.gitattributes` に `filter=lfs` が書かれているか (= このリポジトリが LFS を使う)。
 ///
 /// **設定 (`filter.lfs.*`) では判定できない。** git-lfs を 1 度でも入れた
@@ -1172,10 +1186,16 @@ pub fn read_shape(env: &Env) -> Shape {
                 &[("p", root.display().to_string())],
             ));
         }
-        if let Ok(real) = root.canonicalize() {
-            if real != root {
-                sh.symlinked = Some(real);
-            }
+        // **`canonicalize()` の生の結果と比べない。** Windows は必ず
+        // `\\?\C:\...` (verbatim 形式) を返すので、リンクが 1 つも無い
+        // 素の作業ツリーまで「シンボリックリンク越し」になる
+        // (CI の windows-latest だけで実際に落ちた)。`pathx::canonical` は
+        // その接頭辞を外す。大小を区別しないファイルシステムでは綴りの
+        // 違いだけで別物に見えるので、そこも畳んでから比べる。
+        let real = crate::pathx::canonical(&root);
+        let plain_root = crate::pathx::plain(root.clone());
+        if !same_path(&real, &plain_root) {
+            sh.symlinked = Some(real);
         }
         sh.submodules = submodule_paths(&root);
         for (name, rel) in HOOK_FRAMEWORKS {
@@ -4551,6 +4571,52 @@ mod tests {
         ];
         for (name, out, want) in cases {
             assert_eq!(&parse_scoped_config(out), want, "{name}");
+        }
+    }
+
+    /// **CI の windows-latest だけが赤くなった回帰の番人。**
+    ///
+    /// `Path::canonicalize` は Windows で必ず `\\?\C:\...` (verbatim 形式) を
+    /// 返すので、生の結果と入力を比べると**リンクが 1 つも無い素の作業ツリーまで
+    /// 「シンボリックリンク越し」**になる。実 FS を触らない純関数で固定する
+    /// (Windows でしか出ない差なので、他 OS でも回せる形にしないと番人にならない)。
+    #[test]
+    fn 同じ場所を指すかの判定はos差を畳む() {
+        let fold = cfg!(any(windows, target_os = "macos"));
+        let cases: &[(&str, &str, &str, bool)] = &[
+            ("同一", "/a/b", "/a/b", true),
+            ("別物", "/a/b", "/a/c", false),
+            (
+                "大小違いは畳む OS でだけ同じ",
+                "/Users/Me/proj",
+                "/users/me/proj",
+                fold,
+            ),
+            (
+                "Windows の区切り違いは畳む OS でだけ同じ",
+                r"C:\Users\me",
+                "C:/Users/me",
+                fold,
+            ),
+            (
+                "接頭辞を外した後なら一致する (canonical が外す前提)",
+                "C:/Users/me/proj",
+                "C:/Users/me/proj",
+                true,
+            ),
+            (
+                "接頭辞が片側に残っていたら別物と見なす (外し忘れの検出)",
+                r"\\?\C:\Users\me\proj",
+                "C:/Users/me/proj",
+                false,
+            ),
+        ];
+        for (name, a, b, want) in cases {
+            assert_eq!(
+                same_path(Path::new(a), Path::new(b)),
+                *want,
+                "{name}: {a} vs {b}"
+            );
         }
     }
 
