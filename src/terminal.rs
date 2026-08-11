@@ -1638,6 +1638,21 @@ fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// **端末へ流れ込むバイト列の符号化。**
+///
+/// 既定は自動 — UTF-8 を 1 バイトも変えずに素通しし、ISO-2022-JP の切替列を
+/// 実際に見たときだけ変換に入る。CP932 / EUC-JP のように切替列を持たない
+/// 符号化は見ただけではバイナリと区別が付かないので自動では入らない。
+/// `ZAIVERN_TERM_ENCODING` (`cp932` / `euc-jp` / `cp<番号>` / `auto`) で固定できる。
+///
+/// 読めない名前は既定へ落とす — 綴りを間違えた瞬間に端末が使えなくなる方が悪い。
+fn term_encoding() -> crate::textenc::TermEncoding {
+    std::env::var("ZAIVERN_TERM_ENCODING")
+        .ok()
+        .and_then(|s| crate::textenc::term_encoding_by_name(&s))
+        .unwrap_or_default()
+}
+
 /// セッション復元時、再生した前回スクロールバックの末尾へ入れる区切りバナー。
 /// 先頭で代替画面 (?1049) とスクロール領域・文字属性を平常へ戻す — 前回ログが
 /// TUI の途中で切れていても、バナーと今回の出力が壊れずに描かれるようにする。
@@ -1659,8 +1674,15 @@ impl Session {
         if bytes.is_empty() {
             return;
         }
+        // 生ログは PTY のバイト列そのままなので、読取スレッドと**同じ**
+        // 正規化を通す (通さないと復元した画面だけが化ける)。
+        let mut norm = crate::textenc::TermDecoder::new(term_encoding());
         let mut p = lock_ok(&self.parser);
-        p.process(bytes);
+        p.process(norm.feed(bytes));
+        let rest = norm.finish();
+        if !rest.is_empty() {
+            p.process(rest);
+        }
         p.process(RESTORE_BANNER.as_bytes());
     }
 
@@ -1753,17 +1775,34 @@ impl Session {
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut scanner = QueryScanner::default();
+                // PTY のバイト列は UTF-8 とは限らない。ISO-2022-JP の切替列を
+                // vte は「知らないエスケープ」として黙って食べるので、後続の
+                // JIS バイトだけが ASCII として画面に残り `$3$s$K…` になる
+                // (textenc の記録を参照)。vt100 へ渡す前に UTF-8 へ揃える。
+                // 素の UTF-8 は 1 バイトも変えずに素通しする。
+                let mut norm = crate::textenc::TermDecoder::new(term_encoding());
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) | Err(_) => {
+                            // 境界で持ち越したバイトを取り残さない。
+                            let rest = norm.finish();
+                            if !rest.is_empty() {
+                                lock_ok(&parser).process(rest);
+                            }
+                            break;
+                        }
                         Ok(n) => {
                             if let Some(l) = log_sink.as_mut() {
+                                // 生ログは**生のまま**残す (再生時に同じ経路を通す)。
                                 l.write(&buf[..n]);
                             }
                             // 先に vt100 へ流してから走査する。CSI 6n はアプリが
                             // 「ここまで描いた」直後に送って返事を待つものなので、
                             // チャンクを反映し終えたカーソル位置が正解になる。
-                            lock_ok(&parser).process(&buf[..n]);
+                            {
+                                let bytes = norm.feed(&buf[..n]);
+                                lock_ok(&parser).process(bytes);
+                            }
                             let mut reply: Vec<u8> = Vec::new();
                             for ev in scanner.scan(&buf[..n]) {
                                 match ev {
@@ -13509,5 +13548,147 @@ mod screen_boundary_tests {
         let whole = screen_of(&[bytes]);
         let one: Vec<&[u8]> = bytes.iter().map(std::slice::from_ref).collect();
         assert_eq!(screen_of(&one), whole);
+    }
+}
+
+/// **端末の文字化けの番人 (画面まで見る)。**
+///
+/// `textenc::TermDecoder` の単体テストは「バイト列が UTF-8 になる」までしか
+/// 見ない。ユーザーが見るのは vt100 の画面なので、**実 `vt100::Parser` に
+/// 流して画面の文字列**で確かめる。修正前はここが `$3$s$K$A$OF|K\8l` だった。
+#[cfg(test)]
+mod term_encoding_screen_tests {
+    use crate::textenc::{TermDecoder, TermEncoding};
+
+    /// ISO-2022-JP の「こんにちは日本語」。`ESC $ B` で JIS X 0208、
+    /// `ESC ( B` で ASCII へ。**実測で `$3$s$K$A$OF|K\8l` になっていた入力そのもの**
+    /// (ひらがなの区の先行バイトが 0x24 = `$` なので `$` が並ぶ)。
+    const ISO2022JP_JA: &[u8] = b"\x1b$B$3$s$K$A$OF|K\\8l\x1b(B";
+    /// CP932 (Shift_JIS) の「日本語」。
+    const CP932_JA: &[u8] = &[0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea];
+    /// EUC-JP の「日本語」。
+    const EUCJP_JA: &[u8] = &[0xc6, 0xfc, 0xcb, 0xdc, 0xb8, 0xec];
+
+    /// 読取スレッドと**同じ経路**で画面を作る (正規化 → `process`)。
+    fn screen_of(enc: TermEncoding, chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        let mut d = TermDecoder::new(enc);
+        for c in chunks {
+            p.process(d.feed(c));
+        }
+        p.process(d.finish());
+        p.screen().contents()
+    }
+
+    /// 正規化を通さない素の画面 (「直った」ことを比較で示すため)。
+    fn raw_screen_of(chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        for c in chunks {
+            p.process(c);
+        }
+        p.screen().contents()
+    }
+
+    /// **これが報告された不具合そのもの。**
+    #[test]
+    fn iso2022jpの日本語が画面で日本語になる() {
+        // 直す前の姿を先に固定しておく (直った証拠になる)。
+        assert_eq!(raw_screen_of(&[ISO2022JP_JA]), "$3$s$K$A$OF|K\\8l");
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[ISO2022JP_JA]),
+            "こんにちは日本語"
+        );
+    }
+
+    /// どこで割っても同じ画面 (2 分割の総当たり)。
+    #[test]
+    fn iso2022jpは画面もどこで割っても同じになる() {
+        let whole = screen_of(TermEncoding::Auto, &[ISO2022JP_JA]);
+        assert_eq!(whole, "こんにちは日本語");
+        for cut in 0..=ISO2022JP_JA.len() {
+            let split = screen_of(
+                TermEncoding::Auto,
+                &[&ISO2022JP_JA[..cut], &ISO2022JP_JA[cut..]],
+            );
+            assert_eq!(split, whole, "cut={cut} で画面が変わった");
+        }
+        let one: Vec<&[u8]> = ISO2022JP_JA.iter().map(std::slice::from_ref).collect();
+        assert_eq!(screen_of(TermEncoding::Auto, &one), whole, "1 バイトずつ");
+    }
+
+    /// 明示したコードページでも画面が正しい文字になる。
+    /// `encoding_rs` の表を使うので **OS を問わず**同じ結果になる。
+    #[test]
+    fn 明示したコードページでも画面が日本語になる() {
+        assert_eq!(
+            screen_of(TermEncoding::CodePage(932), &[CP932_JA]),
+            "日本語"
+        );
+        assert_eq!(
+            screen_of(TermEncoding::CodePage(51932), &[EUCJP_JA]),
+            "日本語"
+        );
+        for (cp, src) in [(932u32, CP932_JA), (51932, EUCJP_JA)] {
+            for cut in 0..=src.len() {
+                assert_eq!(
+                    screen_of(TermEncoding::CodePage(cp), &[&src[..cut], &src[cut..]]),
+                    "日本語",
+                    "cp={cp} cut={cut}"
+                );
+            }
+        }
+    }
+
+    /// **UTF-8 の画面は 1 ドットも変わらない。** 既存の境界テストと同じ素材で、
+    /// 正規化を挟んだ画面と挟まない画面が一致することを見る。
+    #[test]
+    fn utf8の画面は正規化を挟んでも変わらない() {
+        let sample = "日本語 🎉 café ＡＢ か\u{3099} \x1b[1;32m緑\x1b[0m ok";
+        let bytes = sample.as_bytes();
+        let raw = raw_screen_of(&[bytes]);
+        assert!(!raw.contains('\u{fffd}'), "素材からして化けている");
+        assert_eq!(screen_of(TermEncoding::Auto, &[bytes]), raw);
+        for cut in 0..=bytes.len() {
+            assert_eq!(
+                screen_of(TermEncoding::Auto, &[&bytes[..cut], &bytes[cut..]]),
+                raw,
+                "cut={cut}"
+            );
+        }
+    }
+
+    /// バイナリを `cat` した画面も変わらない (素通しなので当然、が番人)。
+    #[test]
+    fn バイナリを流した画面は正規化を挟んでも変わらない() {
+        let mut bin: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut x: u32 = 20260812;
+        for _ in 0..2000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            bin.push((x >> 16) as u8);
+        }
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[&bin]),
+            raw_screen_of(&[&bin])
+        );
+    }
+
+    /// TUI が使う列 (DEC 罫線 / 代替画面 / OSC タイトル) を壊さない。
+    #[test]
+    fn tuiの制御列を壊さない() {
+        let src: &[u8] = b"\x1b]0;title\x07\x1b[?1049h\x1b(0qqqj\x1b(B\x1b[31mred\x1b[0m";
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[src]),
+            raw_screen_of(&[src]),
+            "正規化で画面が変わった"
+        );
+    }
+
+    /// 環境変数の入口が生きている (読めない名前は既定へ落ちる)。
+    #[test]
+    fn 端末の符号化の名前を解釈できる() {
+        use crate::textenc::term_encoding_by_name as by;
+        assert_eq!(by("auto"), Some(TermEncoding::Auto));
+        assert_eq!(by("cp932"), Some(TermEncoding::CodePage(932)));
+        assert_eq!(by("でたらめ"), None);
     }
 }

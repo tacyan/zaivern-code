@@ -33,6 +33,14 @@ rfd = "0.15"
 # ico は `zai app install` の Windows ショートカットアイコン生成に使う
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 qrcode = { version = "0.14", default-features = false }
+# 端末の文字化け対策。PTY から来るバイト列が UTF-8 とは限らない
+# (日本語 Windows の CP932、`iconv` や古い CLI が吐く ISO-2022-JP 等)。
+# vt100 は UTF-8 しか解さず、ISO-2022-JP の切替列 `ESC $ B` を「知らない
+# エスケープ」として黙って食べるため、**後続の JIS バイトが ASCII として
+# 画面に残る** (ひらがな区の先行バイトが 0x24 なので `$` の羅列になる)。
+# 実測と経緯は src/textenc.rs の「記録: 端末に出る「$ だらけの文字化け」の正体」。
+# 既に推移依存として Cargo.lock に居るのでビルド時間もサイズも増えない。
+encoding_rs = "0.8"
 # クリップボードの画像取得 (⌘V/Ctrl+V で画像を PNG 保存してパス挿入)。
 # egui-winit も arboard を使うが image-data feature なしのため直接依存する。
 # wayland-data-control は Linux (Wayland) 専用で他 OS のビルドには影響しない。
