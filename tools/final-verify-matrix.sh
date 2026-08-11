@@ -10,9 +10,17 @@
 #
 # ## anyrepo-prove.sh の判定をそのまま信じない
 #
-# `verdict_of()` は `conflict_files` しか見ておらず、**`dup_lines` を見ていない**。
-# 「2 人が同じ行を書いたが、たまたま git が衝突と呼ばなかった」場合、
-# 向こうは `proved` と言う。ここでは `dup_lines > 0` も**独立に反証として数える**。
+# **かつて `verdict_of()` は `conflict_files` しか見ておらず `dup_lines` を
+# 見ていなかった**。「2 人が同じ行を書いたが、たまたま git が衝突と呼ばなかった」
+# 場合に向こうは `proved` と言っていた。これは直したが (`C2`)、
+# **ここでの独立な計数はやめない**。判定器と計数器を同じ人が書いている以上、
+# 片方が壊れたときにもう片方が気付けなければ意味がないためである。
+#
+# したがってこの駆動は 2 つを別々に出す:
+#
+#   * 反証 — `zaivern` 段で `dup_lines > 0` か `conflict_files > 0`
+#   * **判定器の欠陥** — 反証があるのに向こうが `proved` と言った
+#
 # 「断られて 0」と「全員書けて 0」も区別する (`applied` / `planned`)。
 #
 # ## 使い方
@@ -135,6 +143,11 @@ for fn in sorted(os.listdir(d)):
                                  detail=s.get("dup_detail", [])))
                 if stage == "zaivern" and (s["dup_lines"] > 0 or s["conflict_files"] > 0):
                     bad.append(rows[-1])
+                    if v == "proved":
+                        # **判定器の欠陥。** 反証が出ているのに「証明できた」と
+                        # 言うのは、測り方ではなく判定の側が壊れている
+                        broken.append((fn, "判定器の欠陥: dup=%d conf=%d なのに proved"
+                                       % (s["dup_lines"], s["conflict_files"])))
         if v not in ("proved",):
             broken.append((fn, "%s: %s" % (v, "; ".join(res.get("reasons", []))[:300])))
 
