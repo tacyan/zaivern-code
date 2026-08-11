@@ -1,6 +1,10 @@
-# プラグイン基盤 v2 — 実装仕様（内部設計メモ）
+# プラグイン基盤 — 実装仕様（内部設計メモ）
 
 この文書は実装者向けの確定仕様である。既存 v1 マニフェストとの後方互換を必ず保つこと。
+
+**この文書は v2 として書き起こしたが、実装はすでに `api = 3` まで進んでいる。**
+v3 で足した `[[syntax]]` / `[language]` / `default_enabled` は §1 に含めてある
+(節見出しは歴史的な理由で「v2」のまま)。
 
 ## 0. 互換性の絶対条件
 
@@ -16,7 +20,8 @@ name = "example"          # 既存: [a-z0-9_-]{1,64}
 version = "0.1.0"
 author = ""
 description = ""
-api = 2                   # 追加: 省略時 1
+api = 2                   # 追加: 省略時 1。`[[syntax]]` を使うなら 3
+default_enabled = true    # v3 追加: 省略時 true。false なら初回は無効で入る
 
 [[command]]
 id = "fmt"                # 追加: 安定ID。省略時は title から slug 生成
@@ -62,12 +67,24 @@ path = "themes/x.json"
 [[snippet]]               # 既存
 language = "rust"
 path = "snippets/rust.json"
+
+[[syntax]]                # v3 追加: 構文定義。`api = 3` が要る
+path = "syntaxes"         # ファイル、またはディレクトリ (中の *.toml を全部読む)
+
+[language]                # v3 追加: UI 言語パック
+id = "en"                 # 言語ID
+name = "English"          # 表示名。省略時は id
+dict = "lang"             # 辞書のパス (プラグインディレクトリ相対)。ファイル or ディレクトリ
 ```
 
 ### 検証規則
 - `on_save = true` は従来どおり `input="file"` + `output="replace"` を要求。
 - `output="panel"` は `panel` が既存パネルIDを指すこと。
 - `event="interval"` は `interval_secs >= 5`。
+- `[[hook]]` の `output` は `[[command]]` と**同じパーサ** (`CmdSink::parse`) を
+  通る。上に並べた 4 値以外 (`replace` / `insert` / `new_tab` / `agent_prompt`) も
+  受理されるが、フックには適用先が無いので**無害な no-op** になる
+  (`CmdSink::legacy`)。**弾いてはいない** — 検証を足すならここ。
 - 不正値はプラグイン全体を落とさず `Plugin.error` に格納（既存挙動を踏襲）。
 
 ## 2. アクションプロトコル（プラグイン → アプリ）

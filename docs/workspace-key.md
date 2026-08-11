@@ -216,8 +216,10 @@ const FNV_PRIME:  u64 = 0x0000_0100_0000_01b3;
 
 この検査を入れた結果、`session.rs` の `workspace_hash` / `roots_hash` と
 `marks.rs` の私的な複製は**関数ごと消えて** `history::workspace_key` /
-`workspace_set_key` の呼び出しになった (`src/session.rs:176` / `src/session.rs:609` /
-`src/marks.rs:906`)。`grep -rn "fn workspace_hash\|fn roots_hash" src/` は **0 件**。
+`workspace_set_key` の呼び出しになった (`src/session.rs` / `src/marks.rs`)。
+本番コードに `fn workspace_hash` / `fn roots_hash` は **1 つも無い**
+(`grep -rn "fn workspace_hash" src/` は 0 件。`roots_hash` はテスト名
+`roots_hash_is_order_independent` に残っているだけ)。
 
 `mesh.rs:453` の `short_hash` は**ワークスペースキーではない** (入力は Pid /
 登録名 / 担当キーで、パスの正規化を通してはいけない) ので寄せずに残したが、
