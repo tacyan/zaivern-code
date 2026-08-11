@@ -725,7 +725,77 @@ pub struct ImageDoc {
     /// 呼び出し側は [`ImageDoc::step`] の前後でこれを比べ、変わったときだけ
     /// テクスチャを載せ替える。
     pub shown_frame: Option<usize>,
+    /// 裏で走らせている**全コマ復号**の受け口。`Some` の間は `rgba` が
+    /// 暫定表示 (先頭コマ) で、コマ列はまだ無い。
+    ///
+    /// ここだけ非公開にしてあるのは、外から差し替えられると
+    /// [`ImageJob`] の `Drop` による取り消しの筋が切れるため。
+    /// 状態は [`ImageDoc::decoding`] で読む。
+    job: Option<ImageJob>,
 }
+
+/// 画像タブの**全コマ復号**をバックグラウンドで走らせている受け口。
+///
+/// 手本は `git::Git::branch` / `Git::line_marks` と、同じファイルの
+/// [`PdfJob`] — 裏のスレッド + チャネルで受け、UI へは**いま手元にある値**
+/// (= 先頭コマ) を返す。UI スレッドは 1 度も待たない。
+///
+/// 取り消しは `Drop` で行う。タブを閉じれば `Buffer` → `ImageDoc` → ここ、
+/// と落ちて旗が立ち、受け口も消える (ワーカーの `send` は失敗する)。
+/// ただし `preview::decode_animation` は**途中で降りる口を持たない**ので、
+/// 走り始めた 1 本は最後まで走る。旗が効くのは「復号を始める前」と
+/// 「送る前」の 2 点で、そこで降りれば**結果は 1 バイトも取り込まれない**。
+struct ImageJob {
+    rx: std::sync::mpsc::Receiver<ImageAnimOutcome>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ImageJob {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// ワーカーが返す全コマ復号の結果。
+///
+/// 画素と寸法だけを渡す。`ImageDoc` そのものを送らないのは
+/// `TextureHandle` がスレッドを跨げないため。
+enum ImageAnimOutcome {
+    /// 2 コマ以上あった (= アニメーションだった)。
+    Animated {
+        size: [usize; 2],
+        orig_size: (u32, u32),
+        anim: ImageAnim,
+    },
+    /// アニメーションではなかった。暫定表示 (先頭コマ) がそのまま最終結果。
+    Still,
+}
+
+/// 全コマ復号を裏のスレッドへ回す最小のファイルサイズ (バイト)。
+///
+/// 実測 (macOS / release / 5 回の最小値。合成 GIF をサイズ順に並べたもの):
+///
+/// | 入力 | 先頭コマだけ | 全コマ |
+/// | --- | --- | --- |
+/// | 185,690 B (128×128 · 8 コマ) | 0.68 ms | 6.5 ms |
+/// | 430,333 B (160×160 · 12 コマ) | 0.78 ms | 20.2 ms |
+/// | 765,526 B (`assets/zaivern-demo.gif` 960×540 · 127 コマ) | 6.51 ms | **2921 ms** |
+///
+/// 60Hz の 1 フレーム (16.7ms) に収まる境目が 185KB と 430KB の間にあるので
+/// 256KiB で切る。**これより小さいものは今までどおり丸ごと同期で復号する** —
+/// 1 フレームで終わる復号を裏へ回しても、「暫定の先頭コマ → 縮小済みのコマ列」
+/// の載せ替えが 1 回増えるだけで得るものが無いため。
+///
+/// この値は**体験の線引きでしかなく、正しさは依存しない** (どちら側を通っても
+/// 最終的に表示される絵は同じ)。だから機械やビルド設定で数字がずれても壊れない。
+pub const IMAGE_ASYNC_MIN_BYTES: u64 = 256 * 1024;
+
+/// 復号を待っているあいだの再描画間隔 (ms)。
+///
+/// **復号が終われば再描画を一切要求しない**ので、アイドルの費用はゼロのまま
+/// (設計原則 3)。待ちは秒の単位なので、この粗さで取りこぼす体験は無い。
+const IMAGE_DECODE_POLL_MS: u64 = 100;
 
 /// アニメーション画像のコマ列。画素と時計を分けて持つ
 /// (再生位置の計算に数十 MB の画素を持ち回らせないため)。
@@ -750,6 +820,13 @@ impl ImageDoc {
     /// 画面に出ていないタブでは描画関数ごと呼ばれないため、見えていない
     /// GIF は時計すら進まない = CPU を 1% も使わない。
     ///
+    /// **裏で走っている全コマ復号の取り込みもここで行う。** 走っている間は
+    /// [`IMAGE_DECODE_POLL_MS`] を返し続け (= その間だけ再描画を要求し)、
+    /// 取り込みが終われば通常の待ち (静止画なら `None`) へ戻る。
+    /// そのあいだ `rgba` には**先頭コマだけ**が載っている ([`ImageDoc::decoding`]
+    /// が真)。コマ列が届くと `size` が変わりうるので `texture` は `None` へ
+    /// 戻る — 下の使い方どおり `texture.is_none()` を見ていれば載せ直される。
+    ///
     /// 呼び出し側 (`app.rs::image_viewer_ui`) の使い方:
     /// ```ignore
     /// let prev = doc.shown_frame;
@@ -762,7 +839,14 @@ impl ImageDoc {
     /// }
     /// ```
     pub fn step(&mut self, dt_ms: u64) -> Option<u64> {
-        let anim = self.anim.as_ref()?;
+        // 裏で走らせた全コマ復号をここで取り込む (`try_recv` なので待たない)。
+        let decoding = self.poll_job();
+        let Some(anim) = self.anim.as_ref() else {
+            // 静止画、またはコマ列がまだ届いていない状態。
+            // **復号中だけ**再描画を要求し、終われば `None` へ戻る
+            // (= 何も動いていないフレームの費用はゼロ)。
+            return decoding.then_some(IMAGE_DECODE_POLL_MS);
+        };
         // 途中までしか読めなかったアニメーションは繰り返さない。
         // 切れた尻尾から先頭へ飛ぶ絵は「そういう動画」に見えてしまい、
         // 打ち切ったという事実を隠してしまうため。
@@ -787,6 +871,58 @@ impl ImageDoc {
         } else {
             None
         }
+    }
+
+    /// 全コマ復号がまだ裏で走っているか (= いま出ているのは暫定表示)。
+    pub fn decoding(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// 裏の結果を**待たずに**取り込む。返り値は「まだ走っているか」。
+    ///
+    /// ワーカーが結果を送らずに消えた (panic した) 場合も、`Disconnected` を
+    /// 受けて必ず終わらせる — 「読み込み中」のまま永久に固まらせない。
+    /// そのときは暫定表示 (先頭コマ) がそのまま最終結果になる。
+    fn poll_job(&mut self) -> bool {
+        let Some(job) = self.job.as_ref() else {
+            return false;
+        };
+        match job.rx.try_recv() {
+            Ok(out) => {
+                self.job = None;
+                self.install_anim(out);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.job = None;
+                false
+            }
+        }
+    }
+
+    /// 届いたコマ列を載せる。`Still` なら暫定表示が最終結果なので何もしない。
+    fn install_anim(&mut self, out: ImageAnimOutcome) {
+        let ImageAnimOutcome::Animated {
+            size,
+            orig_size,
+            anim,
+        } = out
+        else {
+            return;
+        };
+        self.size = size;
+        self.orig_size = orig_size;
+        self.anim = Some(anim);
+        // アニメーションとして読めたのだから、静止画としての失敗は取り消す
+        // (先頭コマだけ読めない形式でも、コマ列が読めれば表示できる)。
+        self.error = None;
+        // 寸法が変わりうる (先頭コマは原寸、コマ列は縮小済み)。テクスチャを
+        // 捨てて描画側に載せ直させる。`rgba` はこの直後に先頭コマで埋まる。
+        self.texture = None;
+        self.rgba.clear();
+        self.shown_frame = None;
+        self.elapsed_ms = 0;
     }
 }
 
@@ -824,15 +960,21 @@ pub fn image_downscale(w: u32, h: u32, max_side: u32) -> Option<(u32, u32)> {
     Some((nw, nh))
 }
 
-/// バイト列を画像としてデコードする。失敗しても panic せず `error` 入りで返す。
+// 「全コマ復号を何回呼んだか」を**スレッドごと**に数える。プロセス共通の
+// static にすると、同時に走っている他のテストの呼び出しまで混ざる。
+#[cfg(test)]
+thread_local! {
+    static ANIM_DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// アニメーションの**全コマ復号** = 重い側。同期経路 ([`decode_image_doc`]) も
+/// 裏のワーカー ([`start_image_decode`]) も、必ずここだけを通る。
 ///
-/// アニメーション (GIF / APNG / アニメーション WebP) は**全コマ**を復号して
-/// [`ImageDoc::anim`] へ入れる。`image::load_from_memory` は先頭 1 コマしか
-/// 返さないので、そのままでは GIF が静止画になっていた。
 /// 2 コマ以上あるものだけをアニメーションとして扱い、それ以外
-/// (静止画・非対応形式・壊れている) は従来の静止画経路へ落とすので、
-/// **静止画の挙動は 1 ミリも変わらない**。
-pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
+/// (静止画・非対応形式・壊れている) は `Still` を返して静止画経路へ委ねる。
+fn decode_animation_frames(raw: &[u8]) -> ImageAnimOutcome {
+    #[cfg(test)]
+    ANIM_DECODE_CALLS.with(|c| c.set(c.get() + 1));
     let limits = crate::preview::AnimLimits {
         // GPU へ載せられない辺は復号しても捨てるだけなので、テクスチャの
         // 上限でも抑える (既定の ANIM_MAX_SIDE の方が小さいが、どちらかが
@@ -840,31 +982,57 @@ pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
         max_side: crate::preview::ANIM_MAX_SIDE.min(MAX_TEXTURE_SIDE),
         ..Default::default()
     };
-    if let Ok(anim) = crate::preview::decode_animation(raw, &limits) {
-        if anim.frames.len() > 1 {
-            let delays_ms = anim.delays_ms();
-            let mut doc = ImageDoc {
-                rgba: Vec::new(),
-                size: [anim.width as usize, anim.height as usize],
-                orig_size: (anim.source_width, anim.source_height),
-                file_bytes,
-                error: None,
-                texture: None,
-                anim: Some(ImageAnim {
-                    frames: anim.frames.into_iter().map(|f| f.rgba).collect(),
-                    delays_ms,
-                    loops: anim.loops,
-                    truncated: anim.truncated,
-                }),
-                playing: true,
-                elapsed_ms: 0,
-                shown_frame: None,
-            };
-            // 先頭コマを rgba へ載せる (以後は step が差し替える)。
-            let _ = doc.step(0);
-            return doc;
-        }
+    let Ok(anim) = crate::preview::decode_animation(raw, &limits) else {
+        return ImageAnimOutcome::Still;
+    };
+    if anim.frames.len() < 2 {
+        return ImageAnimOutcome::Still;
     }
+    let size = [anim.width as usize, anim.height as usize];
+    let want = size[0].saturating_mul(size[1]).saturating_mul(4);
+    // 描画側は 1 枚のテクスチャを使い回すので、寸法の合わないコマが 1 つでも
+    // 混ざると `ColorImage::from_rgba_unmultiplied` が落ちる。ここで弾いて
+    // 静止画のまま出す (裏のスレッドの結果で UI を panic させない)。
+    if want == 0 || anim.frames.iter().any(|f| f.rgba.len() != want) {
+        return ImageAnimOutcome::Still;
+    }
+    let delays_ms = anim.delays_ms();
+    ImageAnimOutcome::Animated {
+        size,
+        orig_size: (anim.source_width, anim.source_height),
+        anim: ImageAnim {
+            frames: anim.frames.into_iter().map(|f| f.rgba).collect(),
+            delays_ms,
+            loops: anim.loops,
+            truncated: anim.truncated,
+        },
+    }
+}
+
+/// 画素をまだ 1 バイトも持たない `ImageDoc`。ここから `install_anim` で
+/// コマ列を載せる。フィールドを増やしたときに埋め忘れる場所を 1 つに絞る用。
+fn blank_image_doc(file_bytes: u64) -> ImageDoc {
+    ImageDoc {
+        rgba: Vec::new(),
+        size: [0, 0],
+        orig_size: (0, 0),
+        file_bytes,
+        error: None,
+        texture: None,
+        anim: None,
+        playing: true,
+        elapsed_ms: 0,
+        shown_frame: None,
+        job: None,
+    }
+}
+
+/// 静止画 1 枚として復号する。失敗しても panic せず `error` 入りで返す。
+///
+/// GIF / APNG のように複数コマを持つ入力に対しては **先頭コマだけ**が返る
+/// (`image::load_from_memory` の仕様)。それが全コマ復号を待つあいだの
+/// 暫定表示になる。
+fn decode_still_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
     match image::load_from_memory(raw) {
         Ok(img) => {
             let mut rgba = img.to_rgba8();
@@ -879,28 +1047,89 @@ pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
                 rgba: rgba.into_raw(),
                 size: [w as usize, h as usize],
                 orig_size: orig,
-                file_bytes,
-                error: None,
-                texture: None,
-                anim: None,
-                playing: true,
-                elapsed_ms: 0,
-                shown_frame: None,
+                ..blank_image_doc(file_bytes)
             }
         }
         Err(e) => ImageDoc {
-            rgba: Vec::new(),
-            size: [0, 0],
-            orig_size: (0, 0),
-            file_bytes,
             error: Some(e.to_string()),
-            texture: None,
-            anim: None,
-            playing: true,
-            elapsed_ms: 0,
-            shown_frame: None,
+            ..blank_image_doc(file_bytes)
         },
     }
+}
+
+/// バイト列を画像としてデコードする。失敗しても panic せず `error` 入りで返す。
+///
+/// アニメーション (GIF / APNG / アニメーション WebP) は**全コマ**を復号して
+/// [`ImageDoc::anim`] へ入れる。`image::load_from_memory` は先頭 1 コマしか
+/// 返さないので、そのままでは GIF が静止画になっていた。
+/// 2 コマ以上あるものだけをアニメーションとして扱い、それ以外
+/// (静止画・非対応形式・壊れている) は従来の静止画経路へ落とすので、
+/// **静止画の挙動は 1 ミリも変わらない**。
+///
+/// **この関数は同期**で、大きなアニメーションでは秒の単位で返らない。
+/// タブを開く経路からは必ず [`start_image_decode`] を使うこと。
+pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
+    match decode_animation_frames(raw) {
+        ImageAnimOutcome::Still => decode_still_doc(raw, file_bytes),
+        out => {
+            let mut doc = blank_image_doc(file_bytes);
+            doc.install_anim(out);
+            // 先頭コマを rgba へ載せる (以後は step が差し替える)。
+            let _ = doc.step(0);
+            doc
+        }
+    }
+}
+
+/// 全コマ復号を裏のスレッドへ回すかを決める**純関数** (IO なし・先頭バイトだけ見る)。
+///
+/// - アニメーションを持ちえない形式 (JPEG / ICO / BMP) は対象外。
+///   従来どおり丸ごと同期で復号する = **静止画の体験を 1 ミリも変えない**
+/// - [`IMAGE_ASYNC_MIN_BYTES`] 未満も同期 (1 フレームで終わるため)
+///
+/// PNG / WebP は静止画でも真になるが、そのときワーカーは
+/// `decode_animation` のヘッダ検査 (実測 0.01ms) だけで `Still` を返す。
+/// 表示されるのは同期で復号した静止画そのもので、見た目は従来と同一。
+pub fn image_decode_offload(head: &[u8], file_bytes: u64) -> bool {
+    crate::preview::animation_format(head).is_some() && file_bytes >= IMAGE_ASYNC_MIN_BYTES
+}
+
+/// 画像タブのピクセルを用意する。**UI スレッドを止めない**入口。
+///
+/// 軽いものは今までどおりその場で復号し、重いものは
+/// 「先頭コマだけ同期で復号 → 全コマはワーカーへ」に分ける。
+/// 呼び出し側 (`Editor::open`) は必ず即座に戻る。
+pub fn start_image_decode(raw: Vec<u8>, file_bytes: u64) -> ImageDoc {
+    if !image_decode_offload(&raw, file_bytes) {
+        return decode_image_doc(&raw, file_bytes);
+    }
+    // 暫定表示: 先頭コマだけ復号して先に出す (実測 6.51ms = 全コマ 2921ms の 1/449)。
+    // 真っ白のまま数秒待たせないための一手で、`highlight.rs` の
+    // 「追い付く前は暫定表示、白一色にしない」と同じ思想。
+    //
+    // コマ列が届くと表示寸法が原寸から `ANIM_MAX_SIDE` 基準へ 1 度だけ変わる。
+    // 揃えるには原寸の控えを別に抱えるしかなく、巨大な静止画で記憶量が
+    // 倍になるので採らなかった (数秒の停止を消す価値のほうが大きい)。
+    let mut doc = decode_still_doc(&raw, file_bytes);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&cancel);
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering::Relaxed;
+        // タブがもう閉じられていれば、重い復号を始めない。
+        if flag.load(Relaxed) {
+            return;
+        }
+        let out = decode_animation_frames(&raw);
+        // 復号中に閉じられたら結果を捨てる (受け口も落ちているので送信は
+        // どのみち失敗するが、旗で降りるほうが意図が読める)。
+        if flag.load(Relaxed) {
+            return;
+        }
+        let _ = tx.send(out);
+    });
+    doc.job = Some(ImageJob { rx, cancel });
+    doc
 }
 
 /// 画像ビューア: 表示領域へ収まる「フィット」倍率。等倍を上限にする
@@ -2325,7 +2554,10 @@ impl Editor {
             let id = self.next_id;
             self.next_id += 1;
             let mtime = disk_mtime(&canon);
-            let doc = decode_image_doc(&raw, raw.len() as u64);
+            // 重いものは先頭コマだけ載せて返る (全コマは裏のスレッドで復号し、
+            // `ImageDoc::step` / `poll_image_jobs` が取り込む)。
+            let image_bytes = raw.len() as u64;
+            let doc = start_image_decode(raw, image_bytes);
             self.buffers.push(Buffer {
                 id,
                 path: Some(canon),
@@ -2575,7 +2807,10 @@ impl Editor {
             if m == b.disk_mtime {
                 return false;
             }
-            b.image = Some(decode_image_doc(&raw, raw.len() as u64));
+            // 走っていた古い復号は `b.image` ごと落ちて取り消される
+            // (`ImageJob` の Drop)。差し替え後の絵を古い結果で上書きしない。
+            let image_bytes = raw.len() as u64;
+            b.image = Some(start_image_decode(raw, image_bytes));
             b.disk_mtime = m;
             b.conflict_notified = None;
             return true;
@@ -2648,12 +2883,40 @@ impl Editor {
         changed
     }
 
+    /// 裏で走らせたアニメーションの全コマ復号を取り込む。取り込んだら true。
+    /// `try_recv` なので待ちはしない。
+    ///
+    /// 画面に出ているタブは [`ImageDoc::step`] が毎フレーム同じことをする。
+    /// こちらは**画面に出ていないタブ**の受け皿で、描画側が step を呼ばない
+    /// 経路 (別のビューを見ている / ウィンドウが背面) でも復号が確定する。
+    pub fn poll_image_jobs(&mut self) -> bool {
+        let mut changed = false;
+        for b in &mut self.buffers {
+            let Some(doc) = b.image.as_mut() else {
+                continue;
+            };
+            if !doc.decoding() {
+                continue;
+            }
+            // dt=0: 見えていないタブの時計は進めない
+            // (見えていない GIF は CPU を 1% も使わない)。
+            let _ = doc.step(0);
+            if !doc.decoding() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// 全バッファの外部変更を確認する。クリーンなバッファは自動で読み直し、
     /// 未保存の編集と競合したバッファは一度だけ Conflict を報告する。
     pub fn check_external(&mut self) -> Vec<ExternalEvent> {
-        // 走り終わった PDF 抽出をここで拾う (専用のポーリングを app.rs へ
-        // 足さずに済むよう、既存の 1 秒ポーリングへ相乗りする)
+        // 走り終わった PDF 抽出とアニメーション復号をここで拾う (専用の
+        // ポーリングを app.rs へ足さずに済むよう、既存の 1 秒ポーリングへ
+        // 相乗りする)。画面に出ているタブは `ImageDoc::step` が毎フレーム
+        // 同じことをするので、こちらは**見えていないタブ**の受け皿。
         self.poll_pdf_jobs();
+        self.poll_image_jobs();
         let mut events = Vec::new();
         for i in 0..self.buffers.len() {
             let Some(path) = self.buffers[i].path.clone() else {
@@ -3144,6 +3407,7 @@ mod tests {
             playing: true,
             elapsed_ms: 0,
             shown_frame: None,
+            job: None,
         };
         assert_eq!(doc.step(0), Some(100), "先頭コマ");
         assert_eq!(doc.step(100), None, "最後のコマで止まる (無限ループしない)");
@@ -3161,6 +3425,292 @@ mod tests {
         assert_eq!(doc.step(0), Some(100));
         assert_eq!(doc.step(200), Some(100), "1 周して先頭へ戻る");
         assert_eq!(doc.shown_frame, Some(0));
+    }
+
+    #[test]
+    fn 復号を裏へ回すかの判定表() {
+        let gif: &[u8] = b"GIF89a\x01\x00";
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0];
+        let webp: &[u8] = b"RIFF\x00\x00\x00\x00WEBP";
+        let big = IMAGE_ASYNC_MIN_BYTES;
+        let cases: &[(&[u8], u64, bool, &str)] = &[
+            (gif, big, true, "大きい GIF は裏へ回す"),
+            (
+                gif,
+                big - 1,
+                false,
+                "小さい GIF は 1 フレームで終わるので同期",
+            ),
+            (png, big, true, "大きい PNG は APNG かもしれないので裏へ"),
+            (png, 10, false, "小さい PNG は同期"),
+            (webp, big, true, "大きい WebP も裏へ"),
+            (jpeg, big * 100, false, "JPEG はアニメーションを持ちえない"),
+            (b"", big, false, "空でも落ちない"),
+            (b"GIF8", big, false, "途中で切れたマジックは対象外"),
+            (
+                b"RIFF\x00\x00\x00\x00WEB",
+                big,
+                false,
+                "12 バイト未満の RIFF",
+            ),
+        ];
+        for (head, bytes, want, why) in cases {
+            assert_eq!(image_decode_offload(head, *bytes), *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn 小さい静止画は今までどおり同期で復号する() {
+        let dir = unique_temp_dir("zaivern-editor-test", "img-sync");
+        let path = dir.join("small.png");
+        write_png(&path, 3, 2);
+        let raw = std::fs::read(&path).expect("read png");
+        let bytes = raw.len() as u64;
+
+        ANIM_DECODE_CALLS.with(|c| c.set(0));
+        let mut doc = start_image_decode(raw.clone(), bytes);
+        assert!(!doc.decoding(), "小さい静止画は裏へ回さない");
+        assert_eq!(
+            ANIM_DECODE_CALLS.with(|c| c.get()),
+            1,
+            "同じスレッドで復号し切る (待ちも暫定表示も挟まない)"
+        );
+        // 従来の入口と 1 ビットも変わらない絵が出る。
+        let same = decode_image_doc(&raw, bytes);
+        assert_eq!(doc.size, same.size);
+        assert_eq!(doc.orig_size, same.orig_size);
+        assert_eq!(doc.rgba, same.rgba);
+        assert_eq!(doc.error, same.error);
+        assert_eq!(doc.step(1000), None, "静止画は再描画を要求しない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **UI スレッドで画像復号を待たない**という約束の番人。
+    ///
+    /// 実測 (macOS / release / 5 回の最小値): `assets/zaivern-demo.gif` の
+    /// 全コマ復号は **2921ms**、先頭コマだけなら **6.51ms** (1/449)。
+    /// 全部同期でやると、この GIF を開いた瞬間にウィンドウが 3 秒固まる。
+    ///
+    /// 時間ではなく**守りたい性質そのもの**を測る:
+    /// 「開いた側のスレッドで全コマ復号を呼んだ回数 = 0」。
+    #[test]
+    fn 巨大なgifを開いても全コマ復号を待たない() {
+        let Some(raw) = asset_bytes("zaivern-demo.gif") else {
+            eprintln!("[skip] assets/zaivern-demo.gif が無い");
+            return;
+        };
+        let dir = unique_temp_dir("zaivern-editor-test", "img-async");
+        let path = dir.join("demo.gif");
+        std::fs::write(&path, &raw).expect("write gif");
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+
+        ANIM_DECODE_CALLS.with(|c| c.set(0));
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        assert_eq!(
+            ANIM_DECODE_CALLS.with(|c| c.get()),
+            0,
+            "開く経路で全コマ復号を呼んだら、その時間ぶん UI が止まる"
+        );
+
+        {
+            let doc = ed.buffers[0].image.as_ref().expect("画像タブ");
+            assert!(doc.decoding(), "全コマ復号は裏で走っている");
+            assert!(doc.anim.is_none(), "コマ列はまだ届いていない");
+            // 暫定表示: 先頭コマが載っている = 真っ白のまま待たせない。
+            assert_eq!(doc.error, None);
+            assert_eq!(doc.orig_size, (960, 540), "寸法はもう出せる");
+            assert!(doc.size[0] > 0 && doc.size[1] > 0);
+            assert_eq!(
+                doc.rgba.len(),
+                doc.size[0] * doc.size[1] * 4,
+                "暫定表示も 1 枚ぶんの RGBA が揃っている (描画側が落ちない)"
+            );
+        }
+
+        // 復号を待つあいだ、UI は何度でも進める。待ち上限は CI の遅い
+        // ランナーでも足りる長さにし、超えたら固まらずに落とす。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        let mut frames = 0u32;
+        while ed.buffers[0].image.as_ref().expect("画像タブ").decoding() {
+            let doc = ed.buffers[0].image.as_mut().expect("画像タブ");
+            let wait = doc.step(0);
+            if doc.decoding() {
+                assert_eq!(
+                    wait,
+                    Some(IMAGE_DECODE_POLL_MS),
+                    "復号中は再描画を要求し続ける"
+                );
+                frames += 1;
+                assert!(std::time::Instant::now() < deadline, "復号が終わらない");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        eprintln!("[info] 復号を待つあいだに UI が進めた回数: {frames}");
+
+        // 届いたコマ列は、同期で復号したときと同じもの。
+        let doc = ed.buffers[0].image.as_ref().expect("画像タブ");
+        let anim = doc.anim.as_ref().expect("コマ列が届く");
+        assert_eq!(anim.frames.len(), 127, "全 127 コマ");
+        assert_eq!(doc.size, [512, 288], "全コマ共通の表示寸法");
+        assert_eq!(doc.shown_frame, Some(0), "先頭コマを載せ直す");
+        assert_eq!(doc.rgba.len(), doc.size[0] * doc.size[1] * 4);
+        assert!(
+            doc.texture.is_none(),
+            "寸法が変わるのでテクスチャは描画側に載せ直させる"
+        );
+        // 取り込みは 1 度きり。以後は普通のアニメーションとして進む。
+        let doc = ed.buffers[0].image.as_mut().expect("画像タブ");
+        assert!(doc.step(0).is_some(), "コマ送りの待ちへ変わる");
+        assert!(!doc.decoding());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 復号中の受け口だけを持つ画像タブ。実ファイルを使わずに
+    /// 「読み込み中 → 完了」を決定的に検証するため。
+    fn pending_image_doc() -> (
+        std::sync::mpsc::Sender<ImageAnimOutcome>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ImageDoc,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observe = std::sync::Arc::clone(&cancel);
+        let doc = ImageDoc {
+            // 暫定表示 (先頭コマ) が載っている状態
+            rgba: vec![7, 7, 7, 255],
+            size: [1, 1],
+            orig_size: (960, 540),
+            job: Some(ImageJob { rx, cancel }),
+            ..blank_image_doc(0)
+        };
+        (tx, observe, doc)
+    }
+
+    #[test]
+    fn 復号中だけ再描画を要求する() {
+        let (tx, _cancel, mut doc) = pending_image_doc();
+        assert!(doc.decoding());
+        // 走っているあいだは再描画を要求し続ける。
+        assert_eq!(doc.step(16), Some(IMAGE_DECODE_POLL_MS));
+        assert_eq!(doc.step(16), Some(IMAGE_DECODE_POLL_MS));
+        assert_eq!(doc.elapsed_ms, 0, "コマ列が無いあいだは時計を進めない");
+
+        // 静止画だと分かったら、そこで止まる (アイドルの費用はゼロ)。
+        tx.send(ImageAnimOutcome::Still)
+            .expect("受け口は生きている");
+        assert_eq!(doc.step(16), None, "終わったら再描画を要求しない");
+        assert!(!doc.decoding());
+        assert_eq!(doc.rgba, vec![7, 7, 7, 255], "暫定表示がそのまま最終結果");
+        assert_eq!(doc.size, [1, 1]);
+        assert_eq!(doc.step(10_000), None, "以後もずっと要求しない");
+    }
+
+    #[test]
+    fn 復号が終わるとコマ列が載って再生が始まる() {
+        let (tx, _cancel, mut doc) = pending_image_doc();
+        assert_eq!(doc.step(0), Some(IMAGE_DECODE_POLL_MS));
+        tx.send(ImageAnimOutcome::Animated {
+            size: [1, 2],
+            orig_size: (10, 20),
+            anim: ImageAnim {
+                frames: vec![vec![1, 2, 3, 4, 5, 6, 7, 8], vec![8, 7, 6, 5, 4, 3, 2, 1]],
+                delays_ms: vec![100, 100],
+                loops: crate::preview::AnimLoop::Forever,
+                truncated: None,
+            },
+        })
+        .expect("受け口は生きている");
+
+        assert_eq!(doc.step(0), Some(100), "コマ送りの待ちへ変わる");
+        assert!(!doc.decoding());
+        assert_eq!(doc.size, [1, 2], "コマ列の寸法を採る");
+        assert_eq!(doc.orig_size, (10, 20));
+        assert_eq!(doc.shown_frame, Some(0));
+        assert_eq!(doc.rgba, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(doc.texture.is_none(), "寸法が変わるので載せ直させる");
+        assert_eq!(doc.step(100), Some(100));
+        assert_eq!(doc.shown_frame, Some(1), "以後は普通に再生する");
+    }
+
+    #[test]
+    fn タブを閉じたら復号を取り消す() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // 「重い復号の最中」のワーカーを門で止めておき、閉じた後に進ませる。
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let (tx, rx) = std::sync::mpsc::channel::<ImageAnimOutcome>();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let observe = std::sync::Arc::clone(&cancel);
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sent_worker = std::sync::Arc::clone(&sent);
+        let worker = std::thread::spawn(move || {
+            // ここが `decode_animation` に相当する区間。
+            let _ = gate_rx.recv();
+            if flag.load(Relaxed) {
+                return; // 取り消されたので結果を捨てる
+            }
+            sent_worker.store(true, Relaxed);
+            let _ = tx.send(ImageAnimOutcome::Still);
+        });
+
+        let dir = unique_temp_dir("zaivern-editor-test", "img-cancel");
+        let path = dir.join("pic.png");
+        write_png(&path, 2, 2);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        ed.buffers[0].image = Some(ImageDoc {
+            job: Some(ImageJob { rx, cancel }),
+            ..blank_image_doc(0)
+        });
+        assert!(ed.buffers[0].image.as_ref().expect("doc").decoding());
+        assert!(!observe.load(Relaxed), "開いているうちは取り消さない");
+
+        ed.close(0);
+        assert!(ed.buffers.is_empty(), "タブが消えた");
+        assert!(observe.load(Relaxed), "閉じたら取り消し旗が立つ");
+
+        // ワーカーを進ませる: 旗を見て、結果を送らずに降りる。
+        gate_tx.send(()).expect("門は生きている");
+        worker.join().expect("ワーカーは静かに終わる");
+        assert!(!sent.load(Relaxed), "閉じた後は結果を送らない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ワーカーが結果を送らずに消えても読み込み中で固まらない() {
+        let (tx, _cancel, mut doc) = pending_image_doc();
+        assert_eq!(doc.step(0), Some(IMAGE_DECODE_POLL_MS));
+        // ワーカーが panic した = 送信側だけが落ちる。
+        drop(tx);
+        assert_eq!(doc.step(0), None, "永久に読み込み中にしない");
+        assert!(!doc.decoding());
+        assert_eq!(doc.rgba, vec![7, 7, 7, 255], "暫定表示が最終結果として残る");
+        assert_eq!(doc.error, None, "読めた絵はそのまま出す");
+    }
+
+    #[test]
+    fn 見えていないタブの復号もポーリングで確定する() {
+        let dir = unique_temp_dir("zaivern-editor-test", "img-poll");
+        let path = dir.join("pic.png");
+        write_png(&path, 2, 2);
+        let hl = Highlighter::new();
+        let mut ed = Editor::new();
+        assert_eq!(ed.open(&path, &hl), Ok(false));
+        let (tx, _cancel, doc) = pending_image_doc();
+        ed.buffers[0].image = Some(doc);
+
+        assert!(!ed.poll_image_jobs(), "まだ届いていないので何も変わらない");
+        assert!(ed.buffers[0].image.as_ref().expect("doc").decoding());
+
+        tx.send(ImageAnimOutcome::Still)
+            .expect("受け口は生きている");
+        assert!(ed.poll_image_jobs(), "届いたら取り込む");
+        assert!(!ed.buffers[0].image.as_ref().expect("doc").decoding());
+        assert!(!ed.poll_image_jobs(), "二度目は何もしない");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
