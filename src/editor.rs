@@ -709,6 +709,85 @@ pub struct ImageDoc {
     pub error: Option<String>,
     /// 遅延生成の GPU テクスチャ (初回描画でアップロードし、以後使い回す)。
     pub texture: Option<eframe::egui::TextureHandle>,
+    /// アニメーション画像のコマ列。静止画では `None`。
+    ///
+    /// `rgba` は**いま表示しているコマ**で、[`ImageDoc::step`] が差し替える。
+    /// テクスチャは 1 枚を使い回せる (全コマ同じ寸法) ので、ここでは
+    /// `TextureHandle` を持たない — コマ数ぶん作ると GPU を焼くため。
+    pub anim: Option<ImageAnim>,
+    /// 再生中か。既定 `true` (開いた瞬間から動く = ブラウザや Finder と同じ)。
+    /// 一時停止の UI はこの値を書き換えるだけでよい。
+    pub playing: bool,
+    /// 再生開始からの経過 (ms)。一時停止中は進まない。
+    /// 先頭へ戻すときは `0` を書く。
+    pub elapsed_ms: u64,
+    /// いま `rgba` に載っているコマ番号。`None` = まだ 1 コマも載せていない。
+    /// 呼び出し側は [`ImageDoc::step`] の前後でこれを比べ、変わったときだけ
+    /// テクスチャを載せ替える。
+    pub shown_frame: Option<usize>,
+}
+
+/// アニメーション画像のコマ列。画素と時計を分けて持つ
+/// (再生位置の計算に数十 MB の画素を持ち回らせないため)。
+pub struct ImageAnim {
+    /// コマごとの RGBA8。全コマ `ImageDoc::size` と同じ寸法。
+    pub frames: Vec<Vec<u8>>,
+    /// コマごとの表示時間 (ms)。`frames` と同じ長さ。
+    pub delays_ms: Vec<u32>,
+    /// 繰り返し回数。
+    pub loops: crate::preview::AnimLoop,
+    /// 上限や破損で途中までしか読めなかったときの理由。
+    pub truncated: Option<crate::preview::AnimStop>,
+}
+
+impl ImageDoc {
+    /// 再生を `dt_ms` ぶん進め、**次に再描画すべきまでの待ち (ms)** を返す。
+    ///
+    /// 返り値が `None` なら再描画を一切要求しない。静止画・一時停止中・
+    /// 有限ループを再生し切った後がこれに当たるので、**アイドルの費用が
+    /// ゼロになる** (設計原則 3: 常時アニメーションはバッテリーのバグである)。
+    ///
+    /// 画面に出ていないタブでは描画関数ごと呼ばれないため、見えていない
+    /// GIF は時計すら進まない = CPU を 1% も使わない。
+    ///
+    /// 呼び出し側 (`app.rs::image_viewer_ui`) の使い方:
+    /// ```ignore
+    /// let prev = doc.shown_frame;
+    /// let wait = doc.step(ui.input(|i| i.stable_dt) as f64 * 1000.0);
+    /// if doc.error.is_none() && (doc.texture.is_none() || doc.shown_frame != prev) {
+    ///     // doc.rgba はいま出すコマ。テクスチャは 1 枚を set() で使い回す。
+    /// }
+    /// if let Some(ms) = wait {
+    ///     ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
+    /// }
+    /// ```
+    pub fn step(&mut self, dt_ms: u64) -> Option<u64> {
+        let anim = self.anim.as_ref()?;
+        // 途中までしか読めなかったアニメーションは繰り返さない。
+        // 切れた尻尾から先頭へ飛ぶ絵は「そういう動画」に見えてしまい、
+        // 打ち切ったという事実を隠してしまうため。
+        let loops = if anim.truncated.is_some() {
+            crate::preview::AnimLoop::Times(1)
+        } else {
+            anim.loops
+        };
+        if self.playing {
+            self.elapsed_ms = self.elapsed_ms.saturating_add(dt_ms);
+        }
+        let cur = crate::preview::frame_at(&anim.delays_ms, loops, self.elapsed_ms);
+        if self.shown_frame != Some(cur.frame) {
+            if let Some(px) = anim.frames.get(cur.frame) {
+                self.rgba.clear();
+                self.rgba.extend_from_slice(px);
+                self.shown_frame = Some(cur.frame);
+            }
+        }
+        if self.playing {
+            cur.next_in_ms
+        } else {
+            None
+        }
+    }
 }
 
 /// 画像ビューアで開く拡張子 (小文字)。Cargo.toml の image クレートの
@@ -746,8 +825,46 @@ pub fn image_downscale(w: u32, h: u32, max_side: u32) -> Option<(u32, u32)> {
 }
 
 /// バイト列を画像としてデコードする。失敗しても panic せず `error` 入りで返す。
-/// アニメーション GIF は最初のフレームのみの静止表示 (今夜はこれで十分)。
+///
+/// アニメーション (GIF / APNG / アニメーション WebP) は**全コマ**を復号して
+/// [`ImageDoc::anim`] へ入れる。`image::load_from_memory` は先頭 1 コマしか
+/// 返さないので、そのままでは GIF が静止画になっていた。
+/// 2 コマ以上あるものだけをアニメーションとして扱い、それ以外
+/// (静止画・非対応形式・壊れている) は従来の静止画経路へ落とすので、
+/// **静止画の挙動は 1 ミリも変わらない**。
 pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
+    let limits = crate::preview::AnimLimits {
+        // GPU へ載せられない辺は復号しても捨てるだけなので、テクスチャの
+        // 上限でも抑える (既定の ANIM_MAX_SIDE の方が小さいが、どちらかが
+        // 変わっても破綻しないよう両方で押さえる)。全コマへ一貫して当たる。
+        max_side: crate::preview::ANIM_MAX_SIDE.min(MAX_TEXTURE_SIDE),
+        ..Default::default()
+    };
+    if let Ok(anim) = crate::preview::decode_animation(raw, &limits) {
+        if anim.frames.len() > 1 {
+            let delays_ms = anim.delays_ms();
+            let mut doc = ImageDoc {
+                rgba: Vec::new(),
+                size: [anim.width as usize, anim.height as usize],
+                orig_size: (anim.source_width, anim.source_height),
+                file_bytes,
+                error: None,
+                texture: None,
+                anim: Some(ImageAnim {
+                    frames: anim.frames.into_iter().map(|f| f.rgba).collect(),
+                    delays_ms,
+                    loops: anim.loops,
+                    truncated: anim.truncated,
+                }),
+                playing: true,
+                elapsed_ms: 0,
+                shown_frame: None,
+            };
+            // 先頭コマを rgba へ載せる (以後は step が差し替える)。
+            let _ = doc.step(0);
+            return doc;
+        }
+    }
     match image::load_from_memory(raw) {
         Ok(img) => {
             let mut rgba = img.to_rgba8();
@@ -765,6 +882,10 @@ pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
                 file_bytes,
                 error: None,
                 texture: None,
+                anim: None,
+                playing: true,
+                elapsed_ms: 0,
+                shown_frame: None,
             }
         }
         Err(e) => ImageDoc {
@@ -774,6 +895,10 @@ pub fn decode_image_doc(raw: &[u8], file_bytes: u64) -> ImageDoc {
             file_bytes,
             error: Some(e.to_string()),
             texture: None,
+            anim: None,
+            playing: true,
+            elapsed_ms: 0,
+            shown_frame: None,
         },
     }
 }
@@ -2891,6 +3016,151 @@ mod tests {
             "読めない旨を持つ"
         );
         assert!(b.text.is_empty(), "文字化けテキストを本文に入れない");
+    }
+
+    /// リポジトリ同梱の実ファイルを読む。パスは `CARGO_MANIFEST_DIR` から
+    /// 組み立てる (どの環境でも同じ場所を指し、ハードコードしない)。
+    fn asset_bytes(name: &str) -> Option<Vec<u8>> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join(name);
+        std::fs::read(p).ok()
+    }
+
+    #[test]
+    fn アニメーションgifは全コマを持つ画像タブになる() {
+        let Some(raw) = asset_bytes("zaivern-demo.gif") else {
+            eprintln!("[skip] assets/zaivern-demo.gif が無い");
+            return;
+        };
+        let doc = decode_image_doc(&raw, raw.len() as u64);
+        assert_eq!(doc.error, None, "デモ GIF は読める");
+        let anim = doc.anim.as_ref().expect("アニメーションとして開く");
+        assert!(anim.frames.len() >= 2, "2 コマ以上 (静止画にしない)");
+        assert_eq!(anim.frames.len(), 127, "全 127 コマ");
+        assert_eq!(anim.delays_ms.len(), anim.frames.len());
+        assert_eq!(doc.orig_size, (960, 540), "元の寸法をステータスへ出せる");
+        assert_eq!(doc.size, [512, 288], "全コマ共通の表示寸法");
+
+        // 全コマが同じ寸法 = 1 枚のテクスチャを使い回せる。
+        // (寸法がコマごとに違うと ColorImage::from_rgba_unmultiplied が落ちる)
+        let want = doc.size[0] * doc.size[1] * 4;
+        assert!(
+            anim.frames.iter().all(|f| f.len() == want),
+            "全コマ {want} バイト"
+        );
+        // 総再生時間が正であること。
+        assert!(
+            crate::preview::total_ms(&anim.delays_ms) > 0,
+            "総再生時間が正"
+        );
+        assert_eq!(crate::preview::total_ms(&anim.delays_ms), 15_880);
+        assert_eq!(anim.truncated, None, "既定の上限では打ち切られない");
+        assert_eq!(anim.loops, crate::preview::AnimLoop::Forever);
+
+        // 先頭コマが rgba へ載っていて、既存のビューアがそのまま描ける。
+        assert_eq!(doc.shown_frame, Some(0));
+        assert_eq!(doc.rgba.len(), want, "rgba は表示中のコマ 1 枚ぶん");
+        assert_eq!(doc.rgba, anim.frames[0]);
+        assert!(doc.playing, "開いた瞬間から再生する");
+    }
+
+    #[test]
+    fn 静止画は今までどおり一コマとして扱う() {
+        let Some(raw) = asset_bytes("Zaivern.png") else {
+            eprintln!("[skip] assets/Zaivern.png が無い");
+            return;
+        };
+        let doc = decode_image_doc(&raw, raw.len() as u64);
+        assert_eq!(doc.error, None);
+        assert!(doc.anim.is_none(), "静止画にコマ列を持たせない");
+        assert_eq!(doc.shown_frame, None, "コマの載せ替えをしない");
+        assert!(doc.size[0] > 0 && doc.size[1] > 0);
+        assert_eq!(
+            doc.rgba.len(),
+            doc.size[0] * doc.size[1] * 4,
+            "従来どおり 1 枚ぶんの RGBA"
+        );
+        // 静止画では step が何もせず、再描画も要求しない (アイドル費用ゼロ)。
+        let mut doc = doc;
+        let before = doc.rgba.len();
+        assert_eq!(doc.step(1000), None, "静止画は再描画を要求しない");
+        assert_eq!(doc.rgba.len(), before);
+        assert_eq!(doc.shown_frame, None);
+    }
+
+    #[test]
+    fn 再生を進めるとコマが変わり止めると再描画を要求しない() {
+        let Some(raw) = asset_bytes("zaivern-demo.gif") else {
+            eprintln!("[skip] assets/zaivern-demo.gif が無い");
+            return;
+        };
+        let mut doc = decode_image_doc(&raw, raw.len() as u64);
+        let d0 = doc.anim.as_ref().expect("anim").delays_ms[0];
+
+        // 開いた直後は 0 コマ目。次のコマまでの待ちを返す。
+        assert_eq!(doc.shown_frame, Some(0));
+        assert_eq!(doc.step(0), Some(u64::from(d0)));
+
+        // 遅延ぶん進めると次のコマへ移り、rgba が差し替わる。
+        let first = doc.rgba.clone();
+        let wait = doc.step(u64::from(d0)).expect("まだ続く");
+        assert_eq!(doc.shown_frame, Some(1), "1 コマ目へ");
+        assert_ne!(doc.rgba, first, "画素が差し替わっている");
+        assert!(wait > 0, "次のコマまでの待ちは正");
+        assert_eq!(doc.rgba.len(), doc.size[0] * doc.size[1] * 4);
+
+        // 一時停止すると時計が進まず、再描画も要求しない。
+        doc.playing = false;
+        let at = doc.elapsed_ms;
+        let held = doc.shown_frame;
+        assert_eq!(doc.step(10_000), None, "止めたら再描画を要求しない");
+        assert_eq!(doc.elapsed_ms, at, "止めたら時計も進まない");
+        assert_eq!(doc.shown_frame, held);
+
+        // 先頭へ戻す = elapsed_ms に 0 を書くだけ。
+        doc.playing = true;
+        doc.elapsed_ms = 0;
+        assert!(doc.step(0).is_some());
+        assert_eq!(doc.shown_frame, Some(0));
+    }
+
+    #[test]
+    fn 打ち切ったアニメーションは繰り返さない() {
+        // 上限で切られたコマ列は、切れた尻尾から先頭へ飛ばずに止める。
+        let mut doc = ImageDoc {
+            rgba: Vec::new(),
+            size: [1, 1],
+            orig_size: (1, 1),
+            file_bytes: 0,
+            error: None,
+            texture: None,
+            anim: Some(ImageAnim {
+                frames: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
+                delays_ms: vec![100, 100],
+                loops: crate::preview::AnimLoop::Forever,
+                truncated: Some(crate::preview::AnimStop::FrameCount),
+            }),
+            playing: true,
+            elapsed_ms: 0,
+            shown_frame: None,
+        };
+        assert_eq!(doc.step(0), Some(100), "先頭コマ");
+        assert_eq!(doc.step(100), None, "最後のコマで止まる (無限ループしない)");
+        assert_eq!(doc.shown_frame, Some(1));
+        // その後いくら進めても最後のコマのまま = 再描画を要求し続けない。
+        assert_eq!(doc.step(10_000), None);
+        assert_eq!(doc.shown_frame, Some(1));
+
+        // 打ち切られていなければ、同じコマ列でも周回する。
+        if let Some(a) = doc.anim.as_mut() {
+            a.truncated = None;
+        }
+        doc.elapsed_ms = 0;
+        doc.shown_frame = None;
+        assert_eq!(doc.step(0), Some(100));
+        assert_eq!(doc.step(200), Some(100), "1 周して先頭へ戻る");
+        assert_eq!(doc.shown_frame, Some(0));
     }
 
     #[test]

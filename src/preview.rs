@@ -12,6 +12,8 @@
 //! * [`hex_row`] — 16 進ダンプの 1 行を**その行だけ**組み立てる (全体を展開しない)
 //! * [`probe_media`] / [`locate_moov`] / [`probe_mp4_moov`] — 動画・音声のヘッダ解析
 //! * [`parse_zip_at`] — ZIP のセントラルディレクトリ解析 (新規依存なし)
+//! * [`decode_animation`] / [`frame_at`] — アニメーション画像 (GIF / APNG /
+//!   アニメーション WebP) を RGBA のコマ列へ落とし、経過時間からコマ番号を決める
 //!
 //! ## 設計方針
 //!
@@ -865,12 +867,459 @@ impl PreviewDoc {
     }
 }
 
+// ---------------------------------------------------------------------------
+// アニメーション画像 (GIF / APNG / アニメーション WebP)
+// ---------------------------------------------------------------------------
+//
+// `image::load_from_memory` は**先頭の 1 コマしか返さない**ので、これまで
+// アニメーション GIF は静止画になっていた。ここはバイト列を受けて
+// **RGBA のコマ列**へ落とす純関数だけを置く。テクスチャ化 (GPU への転送) と
+// 時計は呼び出し側 (`editor.rs` / `app.rs` / `markdown.rs`) の仕事。
+
+/// 復号したアニメーションの 1 コマ。
+///
+/// コマは**合成済み** (GIF の部分更新と廃棄方法、APNG のブレンドを適用済み) で、
+/// どのコマも `Animation::width` × `Animation::height` の全面ぶんある。
+/// 呼び出し側は差分合成を自分でやらなくてよい。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimFrame {
+    /// RGBA8 の画素 (幅 × 高さ × 4 バイト)。
+    pub rgba: Vec<u8>,
+    /// このコマを表示し続ける時間 (ミリ秒)。[`normalize_delay_ms`] 済み。
+    pub delay_ms: u32,
+}
+
+/// 繰り返し回数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimLoop {
+    /// 無限に繰り返す (GIF の NETSCAPE 拡張が 0 / 無指定のとき)。
+    Forever,
+    /// 有限回。`0` は 1 回として扱う ([`frame_at`] 参照)。
+    Times(u32),
+}
+
+/// どの上限に当たって復号を打ち切ったか。
+///
+/// **黙って切らない**ための印。`Animation::truncated` が `Some` なら
+/// 「そのファイルの全部ではない」ことを呼び出し側が UI に出せる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimStop {
+    /// コマ数の上限 ([`AnimLimits::max_frames`]) に当たった。
+    FrameCount,
+    /// 復号後の総バイト数の上限 ([`AnimLimits::max_total_bytes`]) に当たった。
+    TotalBytes,
+    /// ファイルが途中で切れている / 壊れていて、そこから先が読めなかった。
+    Decode,
+}
+
+/// アニメーションとして読めなかった理由。文言は app.rs が持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimError {
+    /// アニメーションを持ちうる形式ではない (JPEG / BMP / ICO / 画像ですらない)。
+    NotAnimated,
+    /// 形式は GIF / PNG / WebP だが、この 1 本はアニメーションを持たない。
+    /// 静止画として `image::load_from_memory` で開くのが正しい。
+    Still,
+    /// 対応形式だが 1 コマも復号できなかった (先頭から壊れている)。
+    Broken,
+    /// 宣言された寸法が大きすぎて、1 コマぶんの領域すら確保できない。
+    /// **復号を始める前に**断るので、嘘の寸法でメモリを焼かれない。
+    TooLarge,
+}
+
+/// アニメーションを持ちうる形式。中身までは見ない (マジックナンバーだけ)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimFormat {
+    /// GIF87a / GIF89a。
+    Gif,
+    /// PNG。アニメーションかどうかは `acTL` チャンクの有無で決まる (APNG)。
+    Png,
+    /// RIFF/WEBP。アニメーションかどうかは `ANIM` チャンクの有無で決まる。
+    WebP,
+}
+
+/// 復号したアニメーション 1 本。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Animation {
+    /// `frames` の幅 (縮小後)。全コマ共通。
+    pub width: u32,
+    /// `frames` の高さ (縮小後)。全コマ共通。
+    pub height: u32,
+    /// 元の (縮小前の) 幅。
+    pub source_width: u32,
+    /// 元の (縮小前の) 高さ。
+    pub source_height: u32,
+    /// コマ列。**必ず 1 つ以上**入る (0 コマなら [`AnimError::Broken`] で返す)。
+    pub frames: Vec<AnimFrame>,
+    /// 繰り返し回数。
+    pub loops: AnimLoop,
+    /// 上限や破損で途中までしか読めなかったときの理由。
+    pub truncated: Option<AnimStop>,
+}
+
+impl Animation {
+    /// コマごとの表示時間だけを取り出す。[`frame_at`] へそのまま渡せる。
+    ///
+    /// 画素と時計を分けて持てるようにするための橋渡し。再生位置の計算に
+    /// 数十 MB の画素を持ち回らせないため、呼び出し側はこれを 1 度だけ作って
+    /// 使い回すのがよい。
+    pub fn delays_ms(&self) -> Vec<u32> {
+        self.frames.iter().map(|f| f.delay_ms).collect()
+    }
+}
+
+/// この時間 (ms) 未満の遅延は「速すぎる指定」とみなす。
+///
+/// GIF の遅延は 1/100 秒単位で、`0` は「できるだけ速く」の意味になる。
+/// 実際には 0 を指定した広告 GIF が CPU を焼くため、Firefox も Chromium も
+/// **10ms 未満は 100ms に読み替える**という同じ挙動を採っている。
+/// ここもそれに合わせる (合わせないと、同じ GIF がブラウザの数倍速で回る)。
+pub const ANIM_MIN_DELAY_MS: u32 = 10;
+
+/// [`ANIM_MIN_DELAY_MS`] 未満だったときの読み替え先 (ms) = 10fps 相当。
+pub const ANIM_DEFAULT_DELAY_MS: u32 = 100;
+
+/// 復号するコマ数の上限。
+///
+/// 既定遅延 [`ANIM_DEFAULT_DELAY_MS`] (100ms) 換算で 51 秒ぶん。
+/// プレビューとしてはこれ以上を一度に抱える理由がない。
+pub const ANIM_MAX_FRAMES: usize = 512;
+
+/// 復号後 (RGBA8) の総バイト数の上限。
+///
+/// `markdown::MAX_IMAGE_BYTES` (24MB) は**符号化された**入力 1 枚の上限で、
+/// 展開後の大きさではない。実測: `assets/zaivern-demo.gif` は 765KB しかないが
+/// 960×540 × 127 コマ = **251MB** へ展開される (327 倍)。
+/// 入力の上限だけでは記憶量を全く縛れないので、展開後にも上限を置く。
+/// 96MiB = `MAX_IMAGE_BYTES` の 4 倍。
+pub const ANIM_MAX_TOTAL_BYTES: usize = 96 * 1024 * 1024;
+
+/// 1 コマの長辺の上限 (画素)。これを超えるコマは縮小してから積む。
+///
+/// `markdown::PREVIEW_MAX_SIDE` (1600) は**静止画 1 枚**の上限で、
+/// アニメーションではそこにコマ数が掛かる。上の実測 GIF を 512 へ縮めると
+/// 512×288 × 127 コマ = 74.9MB となり [`ANIM_MAX_TOTAL_BYTES`] に収まる
+/// (縮小しないと 251MB で 96MB を超え、半分以上のコマを捨てることになる)。
+pub const ANIM_MAX_SIDE: u32 = 512;
+
+/// 復号の上限。呼び出し側が用途に応じて緩められるよう値で持つ
+/// (紙面に小さく載せる Markdown と、全画面のビューアでは適切な値が違う)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimLimits {
+    /// 積むコマ数の上限。
+    pub max_frames: usize,
+    /// 積んだ RGBA の総バイト数の上限。
+    pub max_total_bytes: usize,
+    /// 1 コマの長辺の上限。`0` は「縮小しない」。
+    pub max_side: u32,
+}
+
+impl Default for AnimLimits {
+    fn default() -> Self {
+        Self {
+            max_frames: ANIM_MAX_FRAMES,
+            max_total_bytes: ANIM_MAX_TOTAL_BYTES,
+            max_side: ANIM_MAX_SIDE,
+        }
+    }
+}
+
+/// 再生位置の問い合わせ結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimCursor {
+    /// いま表示すべきコマ番号。
+    pub frame: usize,
+    /// 次にコマが変わるまでの残り (ms)。`None` = **もう変わらない**
+    /// (有限ループを再生し切った / コマが 1 枚しかない)。
+    ///
+    /// 呼び出し側はこれが `Some(ms)` のときだけ `request_repaint_after(ms)` を
+    /// 呼ぶ。`None` なら再描画を一切要求しない = **アイドルの費用がゼロになる**。
+    pub next_in_ms: Option<u64>,
+}
+
+/// 先頭バイトから「アニメーションを持ちうる形式か」を当てる。中身は見ない。
+///
+/// 本当にアニメーションかどうかは復号しないと分からない (静止 PNG と APNG、
+/// 静止 WebP とアニメーション WebP は同じマジックナンバー) が、
+/// JPEG や ICO をわざわざ復号器へ通さずに済ませるための門番として使う。
+pub fn animation_format(head: &[u8]) -> Option<AnimFormat> {
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some(AnimFormat::Gif);
+    }
+    if head.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some(AnimFormat::Png);
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some(AnimFormat::WebP);
+    }
+    None
+}
+
+/// GIF の遅延を実際に使う値へ読み替える。根拠は [`ANIM_MIN_DELAY_MS`]。
+pub fn normalize_delay_ms(raw_ms: u32) -> u32 {
+    if raw_ms < ANIM_MIN_DELAY_MS {
+        ANIM_DEFAULT_DELAY_MS
+    } else {
+        raw_ms
+    }
+}
+
+/// コマ列の総再生時間 (ms)。1 周ぶん。
+pub fn total_ms(delays_ms: &[u32]) -> u64 {
+    delays_ms.iter().map(|d| u64::from(*d)).sum()
+}
+
+/// **経過時間 → 表示すべきコマ番号**を返す純関数。
+///
+/// 呼び出し側は時計 (経過ミリ秒) を持つだけでよく、再生位置の決め方は
+/// 全部ここで固定される (= テストで完全に固定できる)。
+///
+/// 壊れない条件:
+/// - `delays_ms` が空、または総再生時間が 0 のときは**割り算をしない**で
+///   `frame = 0` / `next_in_ms = None` を返す (ゼロ除算も無限ループも起きない)。
+/// - `AnimLoop::Times(0)` は 1 回として扱う (0 回再生という状態を作らない)。
+/// - 有限ループを再生し切った後は**最後のコマで止まり** `next_in_ms = None`。
+pub fn frame_at(delays_ms: &[u32], loops: AnimLoop, elapsed_ms: u64) -> AnimCursor {
+    let total = total_ms(delays_ms);
+    if delays_ms.is_empty() || total == 0 {
+        return AnimCursor {
+            frame: 0,
+            next_in_ms: None,
+        };
+    }
+    let last = delays_ms.len() - 1;
+    let (pos, final_pass) = match loops {
+        AnimLoop::Forever => (elapsed_ms % total, false),
+        AnimLoop::Times(n) => {
+            let n = u64::from(n.max(1));
+            if elapsed_ms >= total.saturating_mul(n) {
+                return AnimCursor {
+                    frame: last,
+                    next_in_ms: None,
+                };
+            }
+            (elapsed_ms % total, elapsed_ms / total + 1 == n)
+        }
+    };
+    let mut acc = 0u64;
+    for (i, d) in delays_ms.iter().enumerate() {
+        let end = acc + u64::from(*d);
+        if pos < end {
+            // 最終周の最後のコマは、ここで止まる = 次の再描画が要らない。
+            let stop_here = final_pass && i == last;
+            return AnimCursor {
+                frame: i,
+                next_in_ms: if stop_here { None } else { Some(end - pos) },
+            };
+        }
+        acc = end;
+    }
+    // pos < total なので上の走査で必ず返るが、丸め等で漏れても止めるだけにする。
+    AnimCursor {
+        frame: last,
+        next_in_ms: None,
+    }
+}
+
+/// 縮小が要るなら縮小後の寸法を返す。不要なら `None`。
+///
+/// `editor::image_downscale` と同じ規則だが、`preview` は IO を持つ層へ
+/// 依存しない (ここは純関数だけの層) ので自前に持つ。
+fn anim_downscale(w: u32, h: u32, max_side: u32) -> Option<(u32, u32)> {
+    let longest = w.max(h);
+    if max_side == 0 || longest <= max_side || longest == 0 {
+        return None;
+    }
+    let scale = f64::from(max_side) / f64::from(longest);
+    let nw = ((f64::from(w) * scale).round() as u32).clamp(1, max_side);
+    let nh = ((f64::from(h) * scale).round() as u32).clamp(1, max_side);
+    Some((nw, nh))
+}
+
+/// `image` の [`image::Delay`] をミリ秒へ落とし、読み替え規則を当てる。
+fn delay_to_ms(delay: image::Delay) -> u32 {
+    let (numer, denom) = delay.numer_denom_ms();
+    let raw = if denom == 0 {
+        0
+    } else {
+        (u64::from(numer) / u64::from(denom)).min(u64::from(u32::MAX)) as u32
+    };
+    normalize_delay_ms(raw)
+}
+
+/// バイト列をアニメーションとして復号する**純関数** (IO なし)。
+///
+/// GIF / APNG / アニメーション WebP を同じ形へ落とす。`image` 0.25 が
+/// `AnimationDecoder` を実装しているのはこの 3 つだけで、Cargo.toml の
+/// feature (`png` / `gif` / `webp`) は既に全部入っている = 依存追加は要らない。
+///
+/// - どのコマも合成済み・同じ寸法。GIF の部分更新 / 廃棄方法は `image` 側が畳む。
+/// - [`AnimLimits`] を必ず超えない。超えたら**そこで復号をやめて**
+///   `truncated` に理由を入れて返す (黙って切らない)。
+/// - 壊れた入力で panic しない。読めた分が 1 コマもなければ [`AnimError`]。
+pub fn decode_animation(bytes: &[u8], limits: &AnimLimits) -> Result<Animation, AnimError> {
+    use image::ImageDecoder;
+    use std::io::Cursor;
+
+    match animation_format(bytes).ok_or(AnimError::NotAnimated)? {
+        AnimFormat::Gif => {
+            let dec = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+                .map_err(|_| AnimError::Broken)?;
+            let (w, h) = dec.dimensions();
+            collect_frames(dec, w, h, limits)
+        }
+        AnimFormat::Png => {
+            let dec = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
+                .map_err(|_| AnimError::Broken)?;
+            if !dec.is_apng().unwrap_or(false) {
+                return Err(AnimError::Still);
+            }
+            let (w, h) = dec.dimensions();
+            let dec = dec.apng().map_err(|_| AnimError::Broken)?;
+            collect_frames(dec, w, h, limits)
+        }
+        AnimFormat::WebP => {
+            let dec = image::codecs::webp::WebPDecoder::new(Cursor::new(bytes))
+                .map_err(|_| AnimError::Broken)?;
+            if !dec.has_animation() {
+                return Err(AnimError::Still);
+            }
+            let (w, h) = dec.dimensions();
+            collect_frames(dec, w, h, limits)
+        }
+    }
+}
+
+/// 復号器からコマを**遅延評価のまま**取り出し、上限で止める。
+///
+/// 上限の検査を `next()` の**前**に置いてあるのが肝で、こうしないと
+/// 「上限ちょうどの次の 1 コマ」を復号してから捨てることになる
+/// (`tests::上限に当たった後は一切復号していない` が番人)。
+fn collect_frames<'a, D: image::AnimationDecoder<'a>>(
+    dec: D,
+    src_w: u32,
+    src_h: u32,
+    limits: &AnimLimits,
+) -> Result<Animation, AnimError> {
+    if src_w == 0 || src_h == 0 {
+        return Err(AnimError::Broken);
+    }
+    // 復号器は**縮小前の全面**を確保するので、宣言寸法の 1 コマぶんが
+    // 予算に収まらないなら復号を始めてはいけない (嘘の寸法対策)。
+    let src_bytes = u64::from(src_w)
+        .saturating_mul(u64::from(src_h))
+        .saturating_mul(4);
+    if src_bytes > limits.max_total_bytes as u64 {
+        return Err(AnimError::TooLarge);
+    }
+
+    let loops = match dec.loop_count() {
+        image::metadata::LoopCount::Infinite => AnimLoop::Forever,
+        image::metadata::LoopCount::Finite(n) => AnimLoop::Times(n.get()),
+    };
+    let scaled = anim_downscale(src_w, src_h, limits.max_side);
+    let (w, h) = scaled.unwrap_or((src_w, src_h));
+    let per_frame = (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(4)
+        .max(1);
+
+    let mut frames: Vec<AnimFrame> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = None;
+    let mut it = dec.into_frames();
+    loop {
+        if frames.len() >= limits.max_frames {
+            truncated = Some(AnimStop::FrameCount);
+            break;
+        }
+        if total.saturating_add(per_frame) > limits.max_total_bytes {
+            truncated = Some(AnimStop::TotalBytes);
+            break;
+        }
+        let Some(item) = it.next() else { break };
+        let Ok(frame) = item else {
+            truncated = Some(AnimStop::Decode);
+            break;
+        };
+        let delay_ms = delay_to_ms(frame.delay());
+        let mut buf = frame.into_buffer();
+        // 全コマを同じ寸法へ揃える。揃っていないと呼び出し側は 1 枚の
+        // テクスチャを使い回せず、描画が破綻する。
+        if buf.dimensions() != (w, h) {
+            if buf.width() == 0 || buf.height() == 0 {
+                truncated = Some(AnimStop::Decode);
+                break;
+            }
+            // `resize(Triangle)` ではなく `thumbnail` を使う。ここは**必ず縮小**
+            // なので箱平均 (整数演算) で足り、浮動小数のフィルタより桁違いに
+            // 安い。コマ数ぶん掛かるので定数倍がそのまま体感になる。
+            //
+            // 実測 (release / assets/zaivern-demo.gif 127 コマ / 同じ機械で
+            // 連続して 3 回ずつ): Triangle 4.03・4.23・5.57 秒 →
+            // thumbnail 2.86・2.79・2.48 秒。**絶対値は当てにしない**
+            // (16 コアに対し負荷 35 の状態で測ったので 2 倍ほど膨らんでいる)。
+            // 意味があるのは同条件で並べた比 = およそ 1.7 倍速いこと。
+            buf = image::imageops::thumbnail(&buf, w, h);
+        }
+        total = total.saturating_add(buf.as_raw().len());
+        frames.push(AnimFrame {
+            rgba: buf.into_raw(),
+            delay_ms,
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(AnimError::Broken);
+    }
+    Ok(Animation {
+        width: w,
+        height: h,
+        source_width: src_w,
+        source_height: src_h,
+        frames,
+        loops,
+        truncated,
+    })
+}
+
 /// テスト用の最小サンプル生成 (`preview` と `editor` のテストで共有する)。
 ///
 /// 実ファイルを置くと OS・ロケール・改行の扱いで壊れるので、
 /// **バイト列をその場で組み立てる**。どの環境でも同じ入力になる。
 #[cfg(test)]
 pub mod testdata {
+    /// テスト用のアニメーション GIF を組み立てる。
+    ///
+    /// コマごとに色を変える (同じ絵だと符号化が畳んでコマ数を確かめられない)。
+    pub fn make_gif(w: u32, h: u32, frames: usize, delay_ms: u32, repeat: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+            let r = if repeat == 0 {
+                image::codecs::gif::Repeat::Infinite
+            } else {
+                image::codecs::gif::Repeat::Finite(repeat)
+            };
+            let _ = enc.set_repeat(r);
+            for i in 0..frames {
+                let mut buf = image::RgbaImage::new(w, h);
+                let v = ((i * 37) % 256) as u8;
+                for px in buf.pixels_mut() {
+                    *px = image::Rgba([v, 255u8.wrapping_sub(v), 0x80, 0xFF]);
+                }
+                let f = image::Frame::from_parts(
+                    buf,
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(delay_ms, 1),
+                );
+                let _ = enc.encode_frame(f);
+            }
+        }
+        out
+    }
+
     /// 最小の WAV (44.1kHz / 16bit / ステレオ)。
     pub fn make_wav(seconds: u32) -> Vec<u8> {
         let rate = 44100u32;
@@ -980,7 +1429,7 @@ pub mod testdata {
 
 #[cfg(test)]
 mod tests {
-    use super::testdata::{make_mp4, make_wav, make_zip};
+    use super::testdata::{make_gif, make_mp4, make_wav, make_zip};
     use super::*;
 
     // ── テキスト / バイナリ判定 ────────────────────────────────
@@ -1370,5 +1819,464 @@ mod tests {
         assert_eq!(hex.tag(), PreviewTag::Hex);
         assert_eq!(media.tag(), PreviewTag::Media);
         assert_eq!(arch.tag(), PreviewTag::Archive);
+    }
+
+    // ── アニメーション画像 ────────────────────────────────────
+
+    /// リポジトリ同梱のデモ GIF を読む。無ければ `None` (CI のチェックアウトが
+    /// 部分的でも落とさない)。パスは `CARGO_MANIFEST_DIR` から組み立てるので
+    /// どの環境でも同じ場所を指す (ハードコードしない)。
+    fn demo_gif() -> Option<Vec<u8>> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("zaivern-demo.gif");
+        std::fs::read(p).ok()
+    }
+
+    #[test]
+    fn animation_format_table() {
+        // (先頭バイト, 期待, 説明)
+        let cases: &[(&[u8], Option<AnimFormat>, &str)] = &[
+            (b"GIF89a\x01\x00", Some(AnimFormat::Gif), "GIF89a"),
+            (b"GIF87a\x01\x00", Some(AnimFormat::Gif), "GIF87a"),
+            (
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\r",
+                Some(AnimFormat::Png),
+                "PNG (APNG かは中身次第)",
+            ),
+            (
+                b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+                Some(AnimFormat::WebP),
+                "WebP",
+            ),
+            (b"\xFF\xD8\xFF\xE0", None, "JPEG はアニメーションを持てない"),
+            (
+                b"RIFF\x00\x00\x00\x00WAVEfmt ",
+                None,
+                "RIFF でも WAVE は別物",
+            ),
+            (b"", None, "空"),
+            (b"GIF8", None, "GIF の途中で切れた先頭"),
+        ];
+        for (head, want, why) in cases {
+            assert_eq!(animation_format(head), *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn 遅延の読み替え表() {
+        // (生の遅延 ms, 期待 ms, 根拠)
+        let cases: &[(u32, u32, &str)] = &[
+            (0, ANIM_DEFAULT_DELAY_MS, "0 = 「できるだけ速く」→ 100ms"),
+            (1, ANIM_DEFAULT_DELAY_MS, "1ms も速すぎる指定として 100ms"),
+            (9, ANIM_DEFAULT_DELAY_MS, "10ms 未満は読み替える"),
+            (10, 10, "境界ちょうどはそのまま (読み替えない)"),
+            (20, 20, "GIF の 2/100 秒"),
+            (130, 130, "デモ GIF の 13/100 秒"),
+            (u32::MAX, u32::MAX, "上限は置かない (長い静止コマは正当)"),
+        ];
+        for (raw, want, why) in cases {
+            assert_eq!(normalize_delay_ms(*raw), *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn 経過時間からコマ番号を求める表() {
+        let d = [100u32, 200, 300]; // 総 600ms
+                                    // (遅延列, ループ, 経過 ms, 期待コマ, 次までの残り, 説明)
+        type Case<'a> = (&'a [u32], AnimLoop, u64, usize, Option<u64>, &'a str);
+        let cases: &[Case] = &[
+            (&d, AnimLoop::Forever, 0, 0, Some(100), "先頭"),
+            (&d, AnimLoop::Forever, 99, 0, Some(1), "1 コマ目の終わり際"),
+            (&d, AnimLoop::Forever, 100, 1, Some(200), "境界は次のコマへ"),
+            (&d, AnimLoop::Forever, 299, 1, Some(1), "2 コマ目の終わり際"),
+            (&d, AnimLoop::Forever, 300, 2, Some(300), "3 コマ目へ"),
+            (
+                &d,
+                AnimLoop::Forever,
+                600,
+                0,
+                Some(100),
+                "1 周して先頭へ戻る",
+            ),
+            (
+                &d,
+                AnimLoop::Forever,
+                6_000_000,
+                0,
+                Some(100),
+                "何周しても割り算だけ",
+            ),
+            (&d, AnimLoop::Times(1), 0, 0, Some(100), "1 回再生の先頭"),
+            (
+                &d,
+                AnimLoop::Times(1),
+                300,
+                2,
+                None,
+                "最終周の最後のコマは止まる",
+            ),
+            (
+                &d,
+                AnimLoop::Times(1),
+                600,
+                2,
+                None,
+                "再生し切ったら最後のコマで固定",
+            ),
+            (
+                &d,
+                AnimLoop::Times(1),
+                u64::MAX,
+                2,
+                None,
+                "経過が飛んでも固定",
+            ),
+            (
+                &d,
+                AnimLoop::Times(2),
+                300,
+                2,
+                Some(300),
+                "1 周目の最後はまだ続く",
+            ),
+            (&d, AnimLoop::Times(2), 900, 2, None, "2 周目の最後で止まる"),
+            (
+                &d,
+                AnimLoop::Times(0),
+                600,
+                2,
+                None,
+                "0 回は 1 回として扱う",
+            ),
+            (&[], AnimLoop::Forever, 0, 0, None, "空のコマ列でも割らない"),
+            (&[], AnimLoop::Times(3), 999, 0, None, "空 + 有限ループ"),
+            (
+                &[0, 0, 0],
+                AnimLoop::Forever,
+                999,
+                0,
+                None,
+                "総再生時間 0 でもゼロ除算しない",
+            ),
+            (
+                &[0, 0, 0],
+                AnimLoop::Times(5),
+                0,
+                0,
+                None,
+                "総 0 + 有限ループ",
+            ),
+            (
+                &[100],
+                AnimLoop::Forever,
+                50,
+                0,
+                Some(50),
+                "1 コマだけ + 無限",
+            ),
+            (
+                &[100],
+                AnimLoop::Times(1),
+                50,
+                0,
+                None,
+                "1 コマだけ = もう変わらない",
+            ),
+        ];
+        for (delays, loops, elapsed, frame, next, why) in cases {
+            let got = frame_at(delays, *loops, *elapsed);
+            assert_eq!(
+                got,
+                AnimCursor {
+                    frame: *frame,
+                    next_in_ms: *next
+                },
+                "{why} (経過 {elapsed}ms)"
+            );
+        }
+    }
+
+    #[test]
+    fn 総再生時間はコマの遅延の合計() {
+        assert_eq!(total_ms(&[]), 0);
+        assert_eq!(total_ms(&[100, 200, 300]), 600);
+        // u32 の最大級を並べても u64 で受けるので溢れない。
+        assert_eq!(total_ms(&[u32::MAX, u32::MAX]), 2 * u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn 実物のデモgifを全コマ復号できる() {
+        let Some(bytes) = demo_gif() else {
+            eprintln!("[skip] assets/zaivern-demo.gif が無い");
+            return;
+        };
+        let a = decode_animation(&bytes, &AnimLimits::default()).expect("デモ GIF は読める");
+        // 実測値 (GIF のヘッダを直接読んで確かめた値)。
+        assert_eq!(a.frames.len(), 127, "全 127 コマ");
+        assert_eq!((a.source_width, a.source_height), (960, 540), "元の寸法");
+        assert_eq!(a.truncated, None, "既定の上限では打ち切られない");
+        assert_eq!(a.loops, AnimLoop::Forever, "NETSCAPE 拡張で無限ループ");
+        // 既定の上限 (長辺 512) まで縮む。
+        assert_eq!((a.width, a.height), (512, 288));
+        // 全コマが同じ寸法 = 1 枚のテクスチャを使い回せる。
+        let want = (a.width as usize) * (a.height as usize) * 4;
+        assert!(
+            a.frames.iter().all(|f| f.rgba.len() == want),
+            "全コマが {want} バイト"
+        );
+        // 総再生時間は 12/100 と 13/100 秒の合計 = 15.88 秒。
+        let delays = a.delays_ms();
+        assert_eq!(delays.len(), a.frames.len());
+        assert_eq!(total_ms(&delays), 15_880, "総再生時間 (ms)");
+        assert!(
+            delays.iter().all(|d| *d >= ANIM_MIN_DELAY_MS),
+            "読み替え後は必ず下限以上"
+        );
+        // 記憶量が上限の内側にあることを、実測として固定する。
+        let bytes_used: usize = a.frames.iter().map(|f| f.rgba.len()).sum();
+        assert!(
+            bytes_used <= ANIM_MAX_TOTAL_BYTES,
+            "{bytes_used} <= {ANIM_MAX_TOTAL_BYTES}"
+        );
+    }
+
+    #[test]
+    fn デモgifのコマは合成済みで焼き付きも抜けもない() {
+        let Some(bytes) = demo_gif() else {
+            eprintln!("[skip] assets/zaivern-demo.gif が無い");
+            return;
+        };
+        let a = decode_animation(&bytes, &AnimLimits::default()).expect("デモ GIF は読める");
+        // GIF の部分更新 (差分) が合成されずに返ってくると、更新されなかった
+        // 領域が透明 (alpha 0) のまま残る。画面録画なので全面不透明が正しい。
+        for (i, f) in a.frames.iter().enumerate() {
+            let clear = f.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+            assert_eq!(clear, 0, "{i} コマ目に透明画素が {clear} 個残っている");
+        }
+        // 全コマが同じ絵 = 前のコマが焼き付いて更新されていない、の検出。
+        let first = &a.frames[0].rgba;
+        assert!(
+            a.frames.iter().any(|f| &f.rgba != first),
+            "どのコマも先頭と同じ = 合成が効いていない"
+        );
+    }
+
+    #[test]
+    fn 静止画としてのgifとpngとjpegの断り方() {
+        // 1 コマの GIF は「アニメーション 1 コマ」として読める (呼び出し側が
+        // frames.len() > 1 で静止画と区別する)。
+        let one = make_gif(4, 4, 1, 100, 0);
+        let a = decode_animation(&one, &AnimLimits::default()).expect("1 コマでも読める");
+        assert_eq!(a.frames.len(), 1);
+
+        // アニメーションでない PNG / WebP は Still で断る (静止画経路へ回す)。
+        let png = {
+            let mut v = Vec::new();
+            let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png)
+                .expect("encode png");
+            v
+        };
+        assert_eq!(
+            decode_animation(&png, &AnimLimits::default()),
+            Err(AnimError::Still),
+            "静止 PNG は APNG ではない"
+        );
+
+        // アニメーションを持てない形式は NotAnimated。
+        assert_eq!(
+            decode_animation(b"\xFF\xD8\xFF\xE0JFIF", &AnimLimits::default()),
+            Err(AnimError::NotAnimated),
+            "JPEG"
+        );
+        assert_eq!(
+            decode_animation(b"", &AnimLimits::default()),
+            Err(AnimError::NotAnimated),
+            "空"
+        );
+    }
+
+    #[test]
+    fn 壊れた入力でも復号がpanicしない() {
+        let good = make_gif(8, 6, 6, 50, 0);
+        let limits = AnimLimits::default();
+
+        // 1) あらゆる位置で切り詰めても panic しない。
+        for cut in 0..good.len() {
+            let _ = decode_animation(&good[..cut], &limits);
+        }
+        // 2) 1 バイトずつ壊しても panic しない。
+        for at in (0..good.len()).step_by(7) {
+            let mut bad = good.clone();
+            bad[at] ^= 0xFF;
+            let _ = decode_animation(&bad, &limits);
+        }
+        // 3) GIF ではないバイト列。
+        for junk in [
+            &b""[..],
+            &b"GIF89a"[..],
+            &b"GIF89a\x00\x00\x00\x00"[..],
+            &[0u8; 64][..],
+            &[0xFFu8; 1024][..],
+        ] {
+            let _ = decode_animation(junk, &limits);
+        }
+        // 4) 嘘の巨大寸法 (65535×65535 = 17GB) を宣言したヘッダ。ここは
+        //    復号器自身も断る (gif クレートが既定で 50MB の上限を持つ) が、
+        //    panic せず Err で返ることを固定しておく。
+        let mut huge = Vec::from(&b"GIF89a"[..]);
+        huge.extend_from_slice(&u16::MAX.to_le_bytes()); // width
+        huge.extend_from_slice(&u16::MAX.to_le_bytes()); // height
+        huge.extend_from_slice(&[0x00, 0x00, 0x00]); // packed / bg / aspect
+        huge.push(0x3B); // trailer
+        assert!(decode_animation(&huge, &limits).is_err());
+    }
+
+    #[test]
+    fn 宣言寸法が予算を超えたら復号を始めない() {
+        // 200×100 = 80,000 バイト/コマ。予算をその手前に置くと、コマを
+        // 1 つも確保せずに TooLarge で降りる (嘘の寸法でメモリを焼かせない)。
+        let bytes = make_gif(200, 100, 4, 60, 0);
+        let tight = AnimLimits {
+            max_total_bytes: 200 * 100 * 4 - 1,
+            max_side: 0, // 縮小に逃がさず、宣言寸法そのもので判定させる
+            ..AnimLimits::default()
+        };
+        assert_eq!(
+            decode_animation(&bytes, &tight),
+            Err(AnimError::TooLarge),
+            "1 コマぶんも入らない予算では復号を始めない"
+        );
+        // ちょうど 1 コマ入る予算なら、1 コマだけ読んで打ち切りを報告する。
+        let just = AnimLimits {
+            max_total_bytes: 200 * 100 * 4,
+            max_side: 0,
+            ..AnimLimits::default()
+        };
+        let a = decode_animation(&bytes, &just).expect("1 コマは読める");
+        assert_eq!(a.frames.len(), 1);
+        assert_eq!(a.truncated, Some(AnimStop::TotalBytes));
+    }
+
+    #[test]
+    fn コマ数の上限で打ち切りが報告される() {
+        let bytes = make_gif(8, 6, 20, 50, 0);
+        let limits = AnimLimits {
+            max_frames: 5,
+            ..AnimLimits::default()
+        };
+        let a = decode_animation(&bytes, &limits).expect("読める");
+        assert_eq!(a.frames.len(), 5, "上限ちょうどで止まる");
+        assert_eq!(
+            a.truncated,
+            Some(AnimStop::FrameCount),
+            "黙って切らずに理由を返す"
+        );
+        // 上限に届かなければ打ち切りは報告されない。
+        let a = decode_animation(&bytes, &AnimLimits::default()).expect("読める");
+        assert_eq!(a.frames.len(), 20);
+        assert_eq!(a.truncated, None);
+    }
+
+    #[test]
+    fn 総バイト数の上限で打ち切りが報告される() {
+        let bytes = make_gif(16, 16, 12, 50, 0);
+        let per_frame = 16 * 16 * 4;
+        let limits = AnimLimits {
+            // 3 コマぶんちょうど。4 コマ目は入らない。
+            max_total_bytes: per_frame * 3,
+            max_side: 0, // 縮小しない (バイト数の上限だけを試す)
+            ..AnimLimits::default()
+        };
+        let a = decode_animation(&bytes, &limits).expect("読める");
+        assert_eq!(a.frames.len(), 3, "予算ちょうどまで");
+        assert_eq!(a.truncated, Some(AnimStop::TotalBytes));
+        let used: usize = a.frames.iter().map(|f| f.rgba.len()).sum();
+        assert!(used <= limits.max_total_bytes, "予算を 1 バイトも超えない");
+    }
+
+    #[test]
+    fn 上限に当たった後は一切復号していない() {
+        // 前半 4 コマが健全で、その先が壊れている GIF を作る。
+        let mut bytes = make_gif(8, 6, 12, 50, 0);
+        let cut = bytes.len() * 2 / 5;
+        bytes.truncate(cut);
+
+        // まず「壊れている」ことを確かめる: 上限を外すと Decode で止まる。
+        let loose = decode_animation(&bytes, &AnimLimits::default()).expect("前半は読める");
+        assert_eq!(
+            loose.truncated,
+            Some(AnimStop::Decode),
+            "上限が緩ければ壊れた場所まで進む"
+        );
+        let healthy = loose.frames.len();
+        assert!(healthy >= 2, "健全なコマが 2 つ以上ある前提 ({healthy})");
+
+        // 上限をその手前に置くと、壊れた場所へ**到達しない** = FrameCount で
+        // 止まる。先に全部復号してから切る実装ならここが Decode になる。
+        let limits = AnimLimits {
+            max_frames: healthy - 1,
+            ..AnimLimits::default()
+        };
+        let tight = decode_animation(&bytes, &limits).expect("読める");
+        assert_eq!(tight.frames.len(), healthy - 1);
+        assert_eq!(
+            tight.truncated,
+            Some(AnimStop::FrameCount),
+            "上限で止めた後は 1 コマも余分に復号していない"
+        );
+    }
+
+    #[test]
+    fn 復号の費用はコマ数に比例する() {
+        // 絶対時間では測らない (負荷で必ず嘘をつく)。守りたい性質は
+        // 「コマ数を 2 倍にしたら、積む画素も 2 倍で頭打ちしない」こと。
+        let n = 8usize;
+        let a = decode_animation(&make_gif(16, 12, n, 50, 0), &AnimLimits::default()).expect("n");
+        let b =
+            decode_animation(&make_gif(16, 12, n * 2, 50, 0), &AnimLimits::default()).expect("2n");
+        let bytes_a: usize = a.frames.iter().map(|f| f.rgba.len()).sum();
+        let bytes_b: usize = b.frames.iter().map(|f| f.rgba.len()).sum();
+        assert_eq!(a.frames.len(), n);
+        assert_eq!(b.frames.len(), n * 2);
+        assert_eq!(bytes_b, bytes_a * 2, "画素の総量はコマ数に正比例する");
+        assert_eq!(total_ms(&b.delays_ms()), total_ms(&a.delays_ms()) * 2);
+    }
+
+    #[test]
+    fn ループ回数を読み取る() {
+        let inf = make_gif(4, 4, 3, 50, 0);
+        assert_eq!(
+            decode_animation(&inf, &AnimLimits::default())
+                .expect("読める")
+                .loops,
+            AnimLoop::Forever
+        );
+        let three = make_gif(4, 4, 3, 50, 3);
+        assert_eq!(
+            decode_animation(&three, &AnimLimits::default())
+                .expect("読める")
+                .loops,
+            AnimLoop::Times(3)
+        );
+    }
+
+    #[test]
+    fn 上限より大きいコマは縮んで全コマ同じ寸法になる() {
+        let bytes = make_gif(200, 100, 4, 60, 0);
+        let limits = AnimLimits {
+            max_side: 50,
+            ..AnimLimits::default()
+        };
+        let a = decode_animation(&bytes, &limits).expect("読める");
+        assert_eq!((a.source_width, a.source_height), (200, 100), "元は保つ");
+        assert_eq!((a.width, a.height), (50, 25), "長辺 50 へ縮む (縦横比維持)");
+        let want = 50 * 25 * 4;
+        assert!(a.frames.iter().all(|f| f.rgba.len() == want));
+        // 縮小不要なときは 1 画素も触らない。
+        let same = decode_animation(&bytes, &AnimLimits::default()).expect("読める");
+        assert_eq!((same.width, same.height), (200, 100));
     }
 }
