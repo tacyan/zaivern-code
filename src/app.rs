@@ -998,6 +998,50 @@ fn buf_edit_id(pane: editor_split::PaneId, buf: u64) -> egui::Id {
     egui::Id::new(("zaivern-buffer", buf, pane))
 }
 
+/// 可視域ハイライトの追い付き状態を覚えておく (ペイン, バッファ) の上限。
+/// 超えたら丸ごと捨てる — 作り直しは 1 フレームで済むので LRU は要らない。
+const HL_STATE_CAP: usize = 256;
+
+/// `BlameMode::Current` で `git blame` を取りに行く帯の高さ (行)。
+///
+/// 1 行きっかりにすると**カーソルを 1 行動かすたびに git が起きる**ので、
+/// この行数の帯へ丸めて、帯の中ではキーが変わらない = git を起こさない。
+/// `git::BLAME_BLOCK` (200 行) をそのまま使うと `all` と重さが変わらず、
+/// 3 段にした意味が無くなる。
+const BLAME_CURRENT_BAND: usize = 16;
+
+/// `BlameMode::Current` が取りに行く行域 (**1 始まり・両端含む**)。
+///
+/// `git::blame_block` と同じ形の戻り値にしてあるので、呼び出し側は
+/// どちらを使ったかを意識しなくてよい。
+fn blame_current_range(caret0: usize, total: usize) -> (usize, usize) {
+    if total == 0 {
+        return (1, 1);
+    }
+    let caret0 = caret0.min(total - 1);
+    let b = caret0 / BLAME_CURRENT_BAND;
+    let start = (b * BLAME_CURRENT_BAND + 1).min(total);
+    let end = ((b + 1) * BLAME_CURRENT_BAND).min(total).max(start);
+    (start, end)
+}
+
+/// galley キャッシュキーへ混ぜる可視域 (`(start, end)`)。
+///
+/// `Highlighter::layout_job_visible` が可視域で塗り分けるのは
+/// **巨大ファイルだけ**で、それ以外は可視域を無視して全文を塗る。それでも
+/// 可視域をキーへ混ぜると、512 行スクロールするたびに galley を丸ごと
+/// 組み直すことになる (組み直しは実測 495ms で、セクション数にほとんど
+/// 依存しない)。だから**塗り分けが可視域に依存すると分かってから**混ぜる。
+///
+/// `windowed` は直前のフレームの `VisibleJob::scanned_lines > 0`。
+fn galley_window_key(windowed: bool, win: crate::highlight::Window) -> (usize, usize) {
+    if windowed {
+        (win.start, win.end)
+    } else {
+        (0, 0)
+    }
+}
+
 /// Cockpit の見出し行を縮退させるか (純関数)。
 fn cockpit_header_compact(avail_w: f32) -> bool {
     avail_w < COCKPIT_HEADER_COMPACT_W
@@ -3135,6 +3179,24 @@ pub struct ZaivernApp {
     /// 構文ハイライタ。プロセスで 1 つの共有インスタンス
     /// (`SyntaxSet` は数 MB あるので差分ビューと二重に持たない)。
     highlighter: &'static Highlighter,
+    /// 巨大ファイルの可視域ハイライトが「正しい文脈まで追い付いたか」。
+    /// 鍵は本文の `TextEdit` の ID (= **ペインとバッファの組**)、値は
+    /// `(可視域と本文を表す鍵, 追い付いたか)`。
+    ///
+    /// `false → true` に変わった**その 1 回だけ** galley を捨てて塗り直す。
+    /// 毎フレーム捨てると組み直し (実測 495ms) が毎フレーム乗る。
+    ///
+    /// **1 枠で持たない**のは、分割中は 1 フレームの中で `code_editor_ui` が
+    /// ペインの数だけ走るため。1 枠だと 2 つのペインが毎フレーム上書きし合い、
+    /// どちらも「変化した」と誤検出して galley を組み直し続ける。
+    hl_ready: HashMap<egui::Id, (u64, bool)>,
+    /// 直前に組んだ galley が**可視域で塗り分けられた**か
+    /// (= `Highlighter::layout_job_visible` の窓が効いたか)。鍵は [`Self::hl_ready`] と同じ。
+    ///
+    /// 効いていない文書 (小さいファイル) で可視域を galley キーへ混ぜると、
+    /// 512 行スクロールするたびに全文の galley を組み直すことになるので、
+    /// **効くと分かってから**混ぜる。
+    hl_windowed: HashMap<egui::Id, bool>,
     cockpit: bool,
     /// Cockpit グリッドで最後に「見える位置まで運んだ」セッション。
     ///
@@ -4065,6 +4127,8 @@ impl ZaivernApp {
             pending_stop_all: false,
             pending_worktree: None,
             highlighter: crate::highlight::shared(),
+            hl_ready: HashMap::new(),
+            hl_windowed: HashMap::new(),
             cockpit: false,
             cockpit_followed: None,
             center: CenterView::Editor,
@@ -7683,6 +7747,36 @@ impl ZaivernApp {
 
     /// 自動フェイルオーバーの有効/無効を切り替えて保存し、結果を知らせる。
     /// パレット項目と 📊 プラン使用量ウィンドウのトグルが両方ここを通る。
+    /// git blame の表示段階を決める**唯一の入口**。
+    ///
+    /// パレット (`src/features/blame.rs` の `blame.off` / `blame.current` /
+    /// `blame.all`)・表示メニュー (`Cmd::ToggleGitBlame` が次の段へ回す)・
+    /// 設定画面 (`git_blame` の 3 択) の 3 経路がここへ集まる。
+    pub(crate) fn set_blame_mode(&mut self, mode: config::BlameMode) {
+        let changed = self.cfg.git_blame != mode;
+        self.cfg.git_blame = mode;
+        self.cfg.global_git_blame = mode;
+        if changed {
+            // 段が変わると取りに行く行域も変わる。古い結果は捨てる
+            // (OFF にしたときは裏で走り続けないためでもある)。
+            self.blame.clear();
+        }
+        config::save_state(&self.cfg);
+        // 段の名前は `BlameMode::label` が唯一の定義 (画面と設定でずらさない)。
+        let name = tr(mode.label());
+        self.toast(
+            if mode.is_on() {
+                trf(
+                    "👤 Git blame: {mode} (ガターに 著者 · 相対日時。クリックでそのコミットの差分)",
+                    &[("mode", name)],
+                )
+            } else {
+                trf("👤 Git blame: {mode}", &[("mode", name)])
+            },
+            true,
+        );
+    }
+
     fn set_failover_enabled(&mut self, on: bool) {
         self.failover.set_enabled(on);
         self.cfg.failover.enabled = on;
@@ -12783,21 +12877,10 @@ impl ZaivernApp {
                 );
             }
             Cmd::ToggleGitBlame => {
-                self.cfg.git_blame = !self.cfg.git_blame;
-                self.cfg.global_git_blame = self.cfg.git_blame;
-                if !self.cfg.git_blame {
-                    // OFF にしたら覚えている結果ごと捨てる (裏で走り続けない)
-                    self.blame.clear();
-                }
-                config::save_state(&self.cfg);
-                self.toast(
-                    if self.cfg.git_blame {
-                        tr("👤 Git blame: オン (ガターに 著者 · 相対日時。クリックでそのコミットの差分)")
-                    } else {
-                        tr("👤 Git blame: オフ")
-                    },
-                    true,
-                );
+                // 表示メニューの 1 項目からは 3 段を順に回す。
+                // **どれかを直接選ぶ経路**はパレット (`blame.off` /
+                // `blame.current` / `blame.all`) と設定画面にある。
+                self.set_blame_mode(self.cfg.git_blame.next());
             }
             Cmd::TogglePet => {
                 self.cfg.show_pet = !self.cfg.show_pet;
@@ -23284,6 +23367,78 @@ impl ZaivernApp {
             sticky_cache = None;
         }
 
+        // ── 巨大ファイルの構文ハイライト (可視域だけ塗る) ──────────────
+        //
+        // `MAX_HIGHLIGHT_BYTES` (400KB) を超える文書は、素の `layout_job` だと
+        // **色を丸ごと捨てて**白一色で返る。`layout_job_visible` は可視域だけを
+        // 正しい文脈で塗るので、2MB のファイルでも 20,000 行目に色が付く。
+        //
+        // 正しい文脈まで解析のフロンティアを進めるのは `advance_to_visible` の
+        // 仕事で、こちらは `LayoutJob` を作らない = galley を組み直さないので
+        // **毎フレーム呼んでよい**。追い付き済みなら本文に 1 バイトも触らずに
+        // 返るので、スクロールが止まっているあいだの費用はゼロ (設計原則 3)。
+        let hl_rows = if row_h > 0.0 {
+            (view_h / row_h).ceil() as usize + 2
+        } else {
+            1
+        };
+        // **生のスクロール行番号は galley キーへ混ぜない。** `snap_window` が
+        // 512 行の倍数へ丸めた値だけを混ぜる (1 行動くたびに組み直すと
+        // 実測 495ms/回 が毎フレーム乗る)。
+        let hl_win = crate::highlight::snap_window(top_disp_line, hl_rows);
+        // 直前のフレームで可視域の塗り分けが効いたか (galley キーへ可視域を
+        // 混ぜてよいかの判定。詳細は `galley_window_key`)。
+        //
+        // **まだ分からないうちは「効く」側に倒す。** 外した場合に払うのは
+        // 小さい文書の galley を 1 回組み直す費用だけだが、逆に倒して外すと
+        // 巨大ファイルの組み直し (実測 495ms) を開くたびに余計に 1 回払う。
+        let hl_windowed_prev = self.hl_windowed.get(&ed_id_early).copied().unwrap_or(true);
+        // 追い付きが完了したフレームで 1 回だけ galley を捨てる印。
+        let hl_drop_galley = {
+            let hl_text: &str = match disp_text.as_deref() {
+                Some(d) => d,
+                None => &self.editor.buffers[active].text,
+            };
+            let adv = self.highlighter.advance_to_visible(
+                hl_text,
+                &lang_clone,
+                &syntect_theme,
+                theme_text,
+                hl_win,
+            );
+            // 追い付きは (本文, 可視域, バッファ) ごとに決まる。どれかが動いたら
+            // 「まだ追い付いていない」から数え直す。
+            let key = [
+                hl_win.start as u64,
+                hl_win.end as u64,
+                disp_lines.len() as u64,
+            ]
+            .into_iter()
+            .fold(
+                crate::editor::combine_hash(text_hash, self.editor.buffers[active].id),
+                crate::editor::combine_hash,
+            );
+            // 捨てるのは **`false` → `true` に変わったその 1 回だけ**。
+            // 「記録が無い」は変化ではない (タブを切り替えただけで組み直す
+            // ことになり、巨大ファイルでは 495ms を無駄に払う)。
+            let was_waiting = self.hl_ready.get(&ed_id_early) == Some(&(key, false));
+            // 可視域で塗り分けている文書だけが塗り直しの対象
+            // (小さい文書は全文を塗ってあるので捨てる意味が無い)。
+            let drop_galley = hl_windowed_prev && adv.ready && was_waiting;
+            // 閉じたタブぶんが残り続けないよう、増えすぎたら丸ごと捨てる
+            // (作り直しは 1 フレームで済む値なので LRU を持つ意味が無い)。
+            if self.hl_ready.len() > HL_STATE_CAP {
+                self.hl_ready.clear();
+            }
+            self.hl_ready.insert(ed_id_early, (key, adv.ready));
+            if !adv.ready {
+                // **追い付くまでだけ**再描画を要求する。追い付いたら止めるので
+                // アイドルでは 1 フレームも要求しない。
+                crate::perf::repaint(ui.ctx(), "highlight-window");
+            }
+            drop_galley
+        };
+
         // 同一シンボルの薄いハイライト (LSP documentHighlight) を塗る位置。
         // 応答が来た時点で計算済みの char スパンを写すだけで、ここでは本文を
         // 走査しない。折りたたみ中は表示テキストと char 添字がずれるので塗らない。
@@ -23322,15 +23477,34 @@ impl ZaivernApp {
         // 見るので、保存するまで結果は変わらない。
         let char_w = ui.fonts(|f| f.glyph_width(&font, '0'));
         let line_count = self.editor.buffers[active].text.split('\n').count();
-        let blame: Option<(git::BlameKey, git::BlameMap)> = if self.cfg.git_blame
+        let blame_mode = self.cfg.git_blame;
+        // 折りたたみ中でも blame は**原文の行**に紐づく。表示行を原文行へ写す。
+        let caret_src_line = if disp_lines.is_empty() {
+            caret_line0
+        } else {
+            disp_lines.get(caret_line0).copied().unwrap_or(caret_line0)
+        };
+        // `current` で描くのはこの 1 行だけ (GitLens の既定と同じ)。
+        let blame_only_line = match blame_mode {
+            config::BlameMode::Current => Some(caret_src_line),
+            _ => None,
+        };
+        let blame: Option<(git::BlameKey, git::BlameMap)> = if blame_mode.is_on()
             && self.editor.buffers[active].kind == crate::editor::BufferKind::File
         {
-            let rows = if row_h > 0.0 {
-                (view_h / row_h).ceil() as usize + 2
-            } else {
-                1
+            // **取りに行く行域もモードで変える。** 全行ぶん取ってから 1 行だけ
+            // 描くのでは重さが `all` と変わらず、3 段にした意味が無い。
+            let (bs, be) = match blame_mode {
+                config::BlameMode::Current => blame_current_range(caret_src_line, line_count),
+                _ => {
+                    let rows = if row_h > 0.0 {
+                        (view_h / row_h).ceil() as usize + 2
+                    } else {
+                        1
+                    };
+                    git::blame_block(top_src_line + 1, top_src_line + 1 + rows, line_count)
+                }
             };
-            let (bs, be) = git::blame_block(top_src_line + 1, top_src_line + 1 + rows, line_count);
             let rev = self.editor.buffers[active].saved_hash;
             match abs.clone() {
                 Some(p) => match self.gitinfo.locate(&p) {
@@ -23518,6 +23692,15 @@ impl ZaivernApp {
         // 折り返し ON: TextEdit から渡る利用可能幅で折り返す。キャッシュキーに
         // 折り返し幅と空白可視化の有無も混ぜてあるので、条件が変わらない限り
         // フレーム跨ぎで使い回せる。
+        // 追い付きが終わったフレームは、暫定色で組んだ galley を 1 回だけ捨てる。
+        if hl_drop_galley {
+            *cache = None;
+        }
+        // 可視域で塗り分けが効いたかを layouter から持ち帰る器
+        // (次のフレームの `galley_window_key` の入力になる)。
+        let hl_windowed_now = std::cell::Cell::new(hl_windowed_prev);
+        // galley キーへ混ぜる可視域。**効くと分かってからしか混ぜない**。
+        let (win_k0, win_k1) = galley_window_key(hl_windowed_prev, hl_win);
         let mut layouter = |ui: &egui::Ui, t: &str, wrap_w: f32| {
             let max_w = crate::editor::wrap_max_width(word_wrap, wrap_w);
             let key = [
@@ -23529,6 +23712,8 @@ impl ZaivernApp {
                 (word_wrap as u64) | ((show_ws as u64) << 1) | ((bracket_on as u64) << 2),
                 max_w.to_bits() as u64,
                 find_key,
+                win_k0 as u64,
+                win_k1 as u64,
             ]
             .into_iter()
             .fold(hash_str(t), combine_hash);
@@ -23537,7 +23722,18 @@ impl ZaivernApp {
                 // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。
                 Some((k, g)) if *k == key => g.clone(),
                 _ => {
-                    let mut j = hl.layout_job(t, lang, &syntect_theme, font.clone(), theme_text);
+                    // 巨大ファイルはここで**可視域だけ**が塗り分けられる。
+                    // `scanned_lines > 0` = 窓が効いた (小さい文書は 0)。
+                    let v = hl.layout_job_visible(
+                        t,
+                        lang,
+                        &syntect_theme,
+                        font.clone(),
+                        theme_text,
+                        hl_win,
+                    );
+                    hl_windowed_now.set(v.scanned_lines > 0);
+                    let mut j = v.job;
                     // 虹色括弧も**空白可視化の前**に当てる (下と同じ理由)。
                     // 括弧だけを深さの色へ塗り替える (本文は 1 バイトも動かない)。
                     if bracket_on {
@@ -24124,6 +24320,10 @@ impl ZaivernApp {
             sa.show(ui, body_ui)
         };
 
+        // layouter は組み直したフレームにだけ動かす。値だけ取り出しておく
+        // (Cell はこの先の `&mut self` と両立しない)。
+        let hl_windowed_val = hl_windowed_now.get();
+
         let (cursor_out, changed, text_top, text_left, caret_at, hover_hit, sel_out, multi_ptr) =
             inner.inner;
 
@@ -24373,6 +24573,11 @@ impl ZaivernApp {
             let mut detail: Option<String> = None;
             let blame_color = theme_dim.gamma_multiply(0.8);
             for (src, y0, y1) in &row_lines {
+                // `current` はカーソル行だけ。全行ガターは横幅を食って邪魔になる
+                // という評価が競合 (GitLens) で最も多かったので中間の段を置く。
+                if blame_only_line.is_some_and(|l| l != *src) {
+                    continue;
+                }
                 let Some(bl) = map.get(src) else {
                     continue;
                 };
@@ -24603,6 +24808,90 @@ impl ZaivernApp {
                 on_screen,
             );
         }
+        // ミニマップを出さないときは、スクロールバー幅の帯へ**印だけ**を出す。
+        // ミニマップは 64px を本文から奪うので既定 off で、印 (検索ヒット /
+        // 診断 / ブックマーク) が誰にも見えていなかった。
+        //
+        // 当たり判定は **`Sense::click()` だけ**にする。`ScrollArea` は egui 側で
+        // `outer_scroll_bar_rect` へ `Sense::click_and_drag()` を**先に**置いて
+        // いる (egui-0.29.1 の scroll_area.rs:1083) ので、`click_and_drag` を
+        // 後から重ねるとドラッグの当たりまで奪い、**つまみのドラッグが
+        // 「クリック位置へ飛ぶ」に変わる**。egui の hit_test は click と drag を
+        // **別々に**選ぶ (hit_test.rs:122-123) ので、click だけならつまみの
+        // ドラッグは egui のまま残る。さらにつまみの上のクリックは
+        // 何もしない — 掴み直しただけで表示が飛ばないようにする。
+        // 描くのは印だけで、ビューポート枠は描かない (egui のつまみと二重になる)。
+        // 印は egui がスクロールバーを描いた**後**に重ねるので、つまみに
+        // 隠れず必ず見える。
+        //
+        // スクロールバーが出ていないフレーム (中身が収まっている) と、
+        // 印が 1 つも無いフレームは 1 ピクセルも触らない — 本文の右端に
+        // 意味の無い帯を出さないため (「空白は作らない」)。
+        let sb_visible = inner.content_size.y > inner.inner_rect.height() + 0.5;
+        if !mm_on && sb_visible {
+            let sb_w = crate::minimap::scrollbar_width(ppp);
+            let band = egui::Rect::from_min_max(
+                egui::pos2((vis.right() - sb_w).max(vis.left()), vis.top()),
+                egui::pos2(vis.right(), vis.bottom()),
+            );
+            let sb = crate::minimap::scrollbar_geometry(band, disp_count, ppp);
+            let none_hits: Vec<usize> = Vec::new();
+            let none_diag: HashMap<usize, u8> = HashMap::new();
+            let none_marks: HashSet<usize> = HashSet::new();
+            let marks = crate::minimap::Marks {
+                search: if folds_active { &none_hits } else { &mm_search },
+                diags: if folds_active {
+                    &none_diag
+                } else {
+                    diag_by_line
+                },
+                bookmarks: if folds_active {
+                    &none_marks
+                } else {
+                    &bookmark_lines
+                },
+            };
+            let first_line = if row_h > 0.0 {
+                inner.state.offset.y / row_h
+            } else {
+                0.0
+            };
+            let on_screen = if row_h > 0.0 {
+                (vis.height() / row_h).max(1.0)
+            } else {
+                1.0
+            };
+            let deco = crate::minimap::scrollbar_marks(&sb, &marks, first_line, on_screen, None);
+            if !deco.marks.is_empty() {
+                let p = ui.painter().with_clip_rect(sb.band);
+                for m in &deco.marks {
+                    let c = match m.kind {
+                        crate::minimap::ScrollKind::Error => theme_err,
+                        crate::minimap::ScrollKind::Warn => theme_warn,
+                        crate::minimap::ScrollKind::Cursor => theme_text,
+                        _ => theme_accent,
+                    };
+                    p.rect_filled(m.rect, 0.0, c.gamma_multiply(m.weight));
+                }
+                // 印を押したらそこへ飛ぶ (押せない印は飾り)。
+                let resp =
+                    ui.interact(sb.band, ed_id.with("scrollbar_marks"), egui::Sense::click());
+                if let Some(pos) = resp
+                    .clicked()
+                    .then(|| resp.interact_pointer_pos())
+                    .flatten()
+                    .filter(|pos| !deco.viewport.contains(*pos))
+                {
+                    mm_scroll = Some(sb.scroll_for_y(pos.y, row_h, vis.height()));
+                }
+            }
+        }
+        // 可視域の塗り分けが効いたかを次のフレームへ渡す
+        // (galley キーへ可視域を混ぜてよいかの判定に使う)。
+        if self.hl_windowed.len() > HL_STATE_CAP {
+            self.hl_windowed.clear();
+        }
+        self.hl_windowed.insert(ed_id_early, hl_windowed_val);
         if let Some(y) = mm_scroll {
             self.pending_scroll = Some(y);
         }
@@ -25036,7 +25325,7 @@ impl ZaivernApp {
             ),
             (
                 "👤".into(),
-                tr("Git blame の表示切替"),
+                tr("Git blame: 次の段へ (出さない → カーソル行 → 全行)"),
                 String::new(),
                 Cmd::ToggleGitBlame,
             ),
@@ -32224,7 +32513,7 @@ impl ZaivernApp {
             show_whitespace: self.cfg.show_whitespace,
             minimap: self.cfg.minimap,
             breadcrumbs: self.cfg.breadcrumbs,
-            git_blame: self.cfg.git_blame,
+            git_blame: self.cfg.git_blame.is_on(),
             has_editor: self.editor.active.is_some(),
             editor_split: self.panes.is_split(),
             has_file: active_path.is_some(),
@@ -39359,6 +39648,321 @@ mod wave2_tests {
         }
     }
 
+    /// テストで使う実物の巨大ソース = このリポジトリの `src/app.rs`。
+    /// **これがユーザーの報告した現物** (2MB / 43,000 行超)。
+    fn 実物の巨大ソース() -> String {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"))
+            .expect("自分自身は読める")
+    }
+
+    /// 実物の `src/app.rs` を開いて **20,000 行目付近に色が付く**ことを見る。
+    ///
+    /// 素の `Highlighter::layout_job` は 400KB を超えると色を丸ごと捨てて
+    /// 白一色を返すので、`layout_job_visible` へ繋ぎ替えていないとここが
+    /// 1 色になって落ちる (= ユーザーが報告したバグそのもの)。
+    #[test]
+    fn 巨大ファイルの二万行目に色が付く() {
+        let src = 実物の巨大ソース();
+        let lines: Vec<&str> = src.split_inclusive('\n').collect();
+        let target = 20_000usize;
+        let rows = 40usize;
+        assert!(
+            lines.len() > target + rows,
+            "src/app.rs が 20,000 行より短い ({} 行)",
+            lines.len()
+        );
+        let start: usize = lines[..target].iter().map(|l| l.len()).sum();
+        let end: usize = start
+            + lines[target..target + rows]
+                .iter()
+                .map(|l| l.len())
+                .sum::<usize>();
+        let win = crate::highlight::snap_window(target, rows);
+        assert!(
+            win.start <= target && win.end >= target + rows,
+            "可視域が対象行を含んでいない: {win:?}"
+        );
+        let hl = crate::highlight::shared();
+        let v = hl.layout_job_visible(
+            &src,
+            "Rust",
+            "base16-ocean.dark",
+            egui::FontId::monospace(12.0),
+            egui::Color32::WHITE,
+            win,
+        );
+        let mut colors = std::collections::HashSet::new();
+        for sec in &v.job.sections {
+            if sec.byte_range.start < end && sec.byte_range.end > start {
+                colors.insert(sec.format.color.to_array());
+            }
+        }
+        assert!(
+            colors.len() >= 3,
+            "20,000 行目付近が {} 色しかない (色を捨てている)",
+            colors.len()
+        );
+        // 可視域の**外**はまとめて 1 セクションで足りる (画面に出ないので
+        // 色が要らない。セクションを作る費用だけが乗る)。
+        let win_start_byte: usize = lines[..win.start].iter().map(|l| l.len()).sum();
+        let outside = v
+            .job
+            .sections
+            .iter()
+            .filter(|s| s.byte_range.end <= win_start_byte)
+            .count();
+        assert!(
+            outside <= 1,
+            "可視域の手前を {outside} セクションに割っている (1 つで足りる)"
+        );
+    }
+
+    /// 追い付き (`advance_to_visible`) は**追い付いたら止まる**。
+    /// 止まらなければ `code_editor_ui` が毎フレーム再描画を要求し続け、
+    /// アイドルの CPU がゼロにならない (設計原則 3)。
+    #[test]
+    fn 可視域の追い付きは終わったら本文に触れない() {
+        let src = 実物の巨大ソース();
+        let win = crate::highlight::snap_window(20_000, 40);
+        let hl = crate::highlight::shared();
+        let mut pumps = 0usize;
+        loop {
+            let a =
+                hl.advance_to_visible(&src, "Rust", "base16-ocean.dark", egui::Color32::WHITE, win);
+            if a.ready {
+                break;
+            }
+            pumps += 1;
+            assert!(pumps < 1_000_000, "追い付かない");
+        }
+        // 追い付いた後は本文を 1 行も舐めない = 再描画を要求しない条件。
+        for _ in 0..8 {
+            let a =
+                hl.advance_to_visible(&src, "Rust", "base16-ocean.dark", egui::Color32::WHITE, win);
+            assert!(a.ready, "一度追い付いたのに戻った");
+            assert_eq!(
+                a.scanned_lines, 0,
+                "追い付いた後も本文を舐めている (アイドルで CPU を焼く)"
+            );
+        }
+    }
+
+    /// 可視域ハイライトが `code_editor_ui` に**繋がっている**ことと、
+    /// 再描画の要求が「追い付くまで」に限られていることを構造で固定する。
+    #[test]
+    fn 可視域ハイライトがエディタ描画へ繋がっている() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let (_, editor_src) = src
+            .split_once("fn code_editor_ui(&mut self, ui: &mut egui::Ui) {")
+            .expect("code_editor_ui がある");
+        let (editor_src, _) = editor_src
+            .split_once("\n    // ─── UI: palette ")
+            .expect("code_editor_ui の終わり");
+        assert!(
+            editor_src.contains("hl.layout_job_visible("),
+            "古い layout_job のままで、巨大ファイルの色が捨てられる"
+        );
+        assert!(
+            !editor_src.contains("hl.layout_job("),
+            "素の layout_job が残っている (可視域を渡さない経路)"
+        );
+        assert!(
+            editor_src.contains("self.highlighter.advance_to_visible("),
+            "毎フレームの追い付きを回していない"
+        );
+        assert!(
+            editor_src.contains("crate::highlight::snap_window(top_disp_line, hl_rows)"),
+            "可視域を snap_window で丸めていない (生の行番号は 495ms/フレームになる)"
+        );
+        assert!(
+            editor_src.contains("galley_window_key(hl_windowed_prev, hl_win)"),
+            "可視域を galley キーへ混ぜていない (スクロールしても色が追わない)"
+        );
+        // 分割中は 1 フレームでペインの数だけ走る。状態を 1 枠で持つと
+        // 2 ペインが毎フレーム上書きし合い、どちらも galley を組み直し続ける。
+        assert!(
+            editor_src.contains("self.hl_windowed.get(&ed_id_early)")
+                && editor_src.contains("self.hl_ready.get(&ed_id_early)"),
+            "追い付き状態が (ペイン, バッファ) ごとになっていない"
+        );
+        // 再描画の要求は「まだ追い付いていない」枝の中だけ。
+        let (_, after) = editor_src
+            .split_once("if !adv.ready {")
+            .expect("追い付き待ちの分岐がある");
+        let (guarded, _) = after.split_once("\n            }").expect("分岐の終わり");
+        assert!(
+            guarded.contains("crate::perf::repaint(ui.ctx(), \"highlight-window\")"),
+            "追い付き待ちで再描画を要求していない (色が出るまで固まる)"
+        );
+        assert_eq!(
+            editor_src.matches("perf::repaint(").count(),
+            1,
+            "エディタ描画からの再描画要求は追い付き待ちの 1 か所だけにする"
+        );
+    }
+
+    /// `current` が取りに行く行域は**カーソルの帯だけ**。
+    ///
+    /// 全行ぶん (可視域 = 数百行) を取ってから 1 行だけ描くのでは、重さが
+    /// `all` と変わらず 3 段にした意味が無い。一方で 1 行きっかりにすると
+    /// カーソルを 1 行動かすたびに git が起きるので、帯へ丸める。
+    #[test]
+    fn current_の_blame_は帯ぶんしか取りに行かない() {
+        // 帯の中ではキーが動かない = git が起きない
+        let a = super::blame_current_range(0, 10_000);
+        for l in 0..super::BLAME_CURRENT_BAND {
+            assert_eq!(
+                super::blame_current_range(l, 10_000),
+                a,
+                "{l} 行目で帯が動いた"
+            );
+        }
+        // 帯をまたぐと動く
+        assert_ne!(
+            super::blame_current_range(super::BLAME_CURRENT_BAND, 10_000),
+            a
+        );
+        // 取りに行く量は帯ぶんだけ (git::BLAME_BLOCK = 200 行より必ず小さい)
+        for caret in [0usize, 1, 15, 16, 999, 9_999] {
+            let (bs, be) = super::blame_current_range(caret, 10_000);
+            assert!(bs >= 1 && be >= bs && be <= 10_000, "{caret}: {bs}..{be}");
+            assert!(
+                be - bs + 1 <= super::BLAME_CURRENT_BAND,
+                "{caret}: {} 行も取りに行っている",
+                be - bs + 1
+            );
+            assert!(
+                bs <= caret + 1 && caret + 1 <= be,
+                "{caret}: カーソル行 {} が範囲 {bs}..{be} の外",
+                caret + 1
+            );
+            assert!(
+                be - bs + 1 < crate::git::BLAME_BLOCK,
+                "全行モードと同じ量を取っている"
+            );
+        }
+        // 端: 空ファイル / 末尾を越えたカーソル / 1 行だけ
+        assert_eq!(super::blame_current_range(0, 0), (1, 1));
+        assert_eq!(super::blame_current_range(0, 1), (1, 1));
+        assert_eq!(super::blame_current_range(99_999, 5), (1, 5));
+    }
+
+    /// 3 段の blame が**画面の配線まで**届いていること。
+    #[test]
+    fn blame_の三段が描画とコマンドへ繋がっている() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        // 状態を書き換える入口は 1 つだけ (3 経路がここへ集まる)
+        // needle は実行時に組み立てる (この行そのものが自分に一致しないため)
+        let needle = format!(
+            "pub(crate) fn set_blame_mode(&mut self, mode: {}::BlameMode)",
+            "config"
+        );
+        assert_eq!(
+            src.matches(&needle).count(),
+            1,
+            "段を決める入口が 1 つでない"
+        );
+        // 表示メニューの 1 項目は次の段へ回す
+        assert!(
+            src.contains("self.set_blame_mode(self.cfg.git_blame.next());"),
+            "表示メニューから段を回せない"
+        );
+        // 取得と描画の両方がモードを見ている
+        assert!(
+            src.contains(
+                "config::BlameMode::Current => blame_current_range(caret_src_line, line_count)"
+            ),
+            "current でも全行ぶん取りに行っている (重さが変わらない)"
+        );
+        assert!(
+            src.contains("if blame_only_line.is_some_and(|l| l != *src)"),
+            "current でも全行描いている"
+        );
+        // git を UI スレッドで待っていない (既存の非同期経路をそのまま使う)
+        assert!(
+            src.contains("self.blame.request(&top, &rel, key.clone())"),
+            "blame の非同期経路を通っていない"
+        );
+    }
+
+    /// スクロールバー帯の装飾が **egui 本来のドラッグを奪っていない**こと。
+    ///
+    /// `ScrollArea` は `outer_scroll_bar_rect` へ `Sense::click_and_drag()` を
+    /// 先に置いている。後から `click_and_drag` を重ねると egui の hit_test が
+    /// こちらを選び、つまみのドラッグが「クリック位置へ飛ぶ」に変わる。
+    #[test]
+    fn スクロールバーの装飾がドラッグを奪っていない() {
+        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let (_, band) = src
+            .split_once("ed_id.with(\"scrollbar_marks\"),")
+            .expect("スクロールバー帯の当たり判定がある");
+        let sense = band.lines().take(3).collect::<String>();
+        assert!(
+            sense.contains("egui::Sense::click()"),
+            "帯が click 以外を掴んでいる (つまみのドラッグを奪う): {sense}"
+        );
+        // つまみの上のクリックは egui へ譲る
+        assert!(
+            src.contains(".filter(|pos| !deco.viewport.contains(*pos))"),
+            "つまみの上のクリックでも飛ばしている"
+        );
+        // 二重描画の防止: ミニマップ表示中は帯を出さない
+        assert!(
+            src.contains("if !mm_on && sb_visible {"),
+            "ミニマップ表示中に帯を二重に描いている / バーが無くても描いている"
+        );
+        // 印が 0 件なら 1 ピクセルも触らない (空白は作らない)
+        assert!(
+            src.contains("if !deco.marks.is_empty() {"),
+            "印が 0 件でも帯を描いている"
+        );
+        // egui のつまみと二重になるビューポート枠は描かない
+        let viewport_fill = format!("p.rect_filled(deco.{},", "viewport");
+        assert!(
+            !src.contains(&viewport_fill),
+            "egui のつまみの上へビューポート枠を重ねている"
+        );
+    }
+
+    /// 可視域を galley キーへ混ぜるのは「塗り分けが可視域に依存するとき」だけ。
+    /// 小さい文書まで混ぜると、512 行スクロールするたびに galley を丸ごと
+    /// 組み直す (実測 495ms/回)。
+    #[test]
+    fn galley_キーの可視域は窓が効くときだけ混ざる() {
+        use crate::highlight::Window;
+        let cases = [
+            Window { start: 0, end: 512 },
+            Window {
+                start: 19_968,
+                end: 20_992,
+            },
+            Window {
+                start: usize::MAX - 1,
+                end: usize::MAX,
+            },
+        ];
+        for w in cases {
+            assert_eq!(
+                super::galley_window_key(false, w),
+                (0, 0),
+                "窓が効かない文書で可視域を混ぜている: {w:?}"
+            );
+            assert_eq!(
+                super::galley_window_key(true, w),
+                (w.start, w.end),
+                "窓が効く文書で可視域を混ぜていない: {w:?}"
+            );
+        }
+        // 同じ画面でも行が 1 つ動いただけでは鍵が動かない (512 行単位へ丸める)
+        let a = crate::highlight::snap_window(20_000, 40);
+        let b = crate::highlight::snap_window(20_001, 40);
+        assert_eq!(
+            super::galley_window_key(true, a),
+            super::galley_window_key(true, b),
+            "1 行スクロールで galley を組み直す鍵になっている"
+        );
+    }
+
     /// フェイルオーバーが「作ったのに繋いでいない」状態で終わらないことを、
     /// ソースの構造で固定する。UI から到達できない実装は未完成なので、
     /// 到達経路 (パレット / 設定トグル / 状態表示) と駆動点を全部見る。
@@ -39423,8 +40027,10 @@ mod wave2_tests {
     /// **既定は OFF**。どれかが切れたら気付けるようにする。
     #[test]
     fn git_blameは既定offで3経路から届く() {
-        assert!(
-            !crate::config::Config::default().git_blame,
+        use crate::config::BlameMode;
+        assert_eq!(
+            crate::config::Config::default().git_blame,
+            BlameMode::Off,
             "既定は OFF (勝手に git が走らない)"
         );
         let menu = include_str!("menu_bar.rs").replace("\r\n", "\n");
@@ -39432,6 +40038,39 @@ mod wave2_tests {
             menu.contains("Cmd::ToggleGitBlame"),
             "表示メニューから届いていない"
         );
+        // 3 段すべてが**パレットから 1 手で**選べる (循環しか無いと選べない)。
+        let ids: Vec<&str> = crate::feature::palette_entries()
+            .iter()
+            .filter_map(|(_, _, _, c)| match c {
+                crate::palette::Cmd::Feature(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for id in ["blame.off", "blame.current", "blame.all"] {
+            assert!(ids.contains(&id), "{id} がパレットに出ていない");
+        }
+        // config (設定画面) 側は 3 択で出る。
+        let def = crate::config::setting_defs()
+            .iter()
+            .find(|d| d.key == "git_blame")
+            .expect("設定一覧に git_blame がある");
+        match def.kind {
+            crate::config::SettingKind::Choice(opts) => assert_eq!(
+                opts,
+                ["off", "current", "all"],
+                "設定画面の選択肢が 3 段になっていない"
+            ),
+            _ => panic!("git_blame が Choice ではない (トグルのままでは選べない)"),
+        }
+        // 表示メニューの 1 項目は 3 段を順に回す (どの段からも次へ行ける)。
+        let mut m = BlameMode::Off;
+        let mut seen: Vec<BlameMode> = Vec::new();
+        for _ in 0..3 {
+            assert!(!seen.contains(&m), "循環が 3 段に届いていない");
+            seen.push(m);
+            m = m.next();
+        }
+        assert_eq!(m, BlameMode::Off, "3 回で元へ戻らない");
         let src = &include_str!("app.rs").replace("\r\n", "\n");
         let update = src
             .split("fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {")
