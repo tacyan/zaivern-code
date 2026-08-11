@@ -454,6 +454,9 @@ pub fn frame_end(started: Option<Instant>) {
 /// 無効時は `enabled()` の読み出し 1 回で戻る。
 #[inline]
 pub fn note_repaint(tag: &'static str) {
+    // テストからは `enabled()` (環境変数・プロセスで 1 回きり) に依らず観測したい。
+    #[cfg(test)]
+    test_sink::note(tag);
     if !enabled() {
         return;
     }
@@ -468,6 +471,33 @@ pub fn note_repaint(tag: &'static str) {
             return;
         }
         *f.entry(tag).or_insert(0) += 1;
+    }
+}
+
+/// **テストから再描画要求を観測するための受け皿。**
+///
+/// 本体 ([`note_repaint`]) は `ZAIVERN_PERF=1` のときしか数えないので、
+/// テストでは「要求が出たか」を確かめられない。かといってプロセス共通の
+/// static に置くと、**同時に走っている他のテストの呼び出しまで混ざる**
+/// (このリポジトリで 400 回のはずが 800 回になって落ちた実績がある)。
+/// スレッドローカルにして、数えるのを自分のスレッドの中だけに閉じる。
+#[cfg(test)]
+pub mod test_sink {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        // このスレッドで観測した再描画要求 (タグ → 件数)。
+        static SINK: RefCell<BTreeMap<&'static str, u64>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    pub(super) fn note(tag: &'static str) {
+        SINK.with(|s| *s.borrow_mut().entry(tag).or_insert(0) += 1);
+    }
+
+    /// 溜まった要求を取り出して空にする。**取り出した側が消費する。**
+    pub fn take() -> BTreeMap<&'static str, u64> {
+        SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
 }
 

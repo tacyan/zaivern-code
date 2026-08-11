@@ -210,9 +210,22 @@ pub fn draw(
     let scale = input.scale.clamp(0.25, 4.0);
 
     // ── ポインタ入力の観測(睡眠判定と視線追従)──
+    //
+    // **ホイールとタッチも「触った」に数える。** 端末を 10 分スクロールして
+    // いる間ずっと熟睡している、というのは目の前の事実と食い違う。
+    // 逆に `delta` の閾値 (0.1px) は残す — マウスの微振動 1 カウントで
+    // [`SLEEP_AFTER`] の秒読みが振り出しに戻るのは「触った」ではない。
     let (t, ptr_pos, ptr_active) = ctx.input(|i| {
-        let active =
-            i.pointer.delta().length() > 0.1 || i.pointer.any_down() || i.pointer.any_pressed();
+        let scrolled = i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::MouseWheel { .. } | egui::Event::Touch { .. }
+            )
+        });
+        let active = i.pointer.delta().length() > 0.1
+            || i.pointer.any_down()
+            || i.pointer.any_pressed()
+            || scrolled;
         (i.time, i.pointer.latest_pos(), active)
     });
     if rt.last_t == 0.0 {
@@ -235,11 +248,17 @@ pub fn draw(
 
     // ── 状態解決(優先度順)──
     let state = resolve_state(input, rt, t, idle_for, pos.is_none());
+    // **絵が止まっているか。** ここから下の「時刻に依存する計算」は全部これで殺す。
+    let still = is_still(state, idle_for);
     rt.was_drowsy = matches!(state, PetState::Dozing | PetState::Sleeping);
 
     // ── ローム更新(歩いては休むサイクル。位相は歩行中のみ進む)──
+    //
+    // `still` のときは**位相も進めない**。`roam_phase` は描画位置
+    // (`roam_x`) に効くので、進めた時点で「絵は静止画」が嘘になり、
+    // 止めたはずのペットがじりじり横へ流れる。
     let mut roam_moving = false;
-    if state == PetState::Roam {
+    if state == PetState::Roam && !still {
         if t >= rt.roam_state_until {
             rt.roam_walking = !rt.roam_walking;
             let r = prand(t);
@@ -259,63 +278,68 @@ pub fn draw(
 
     // ── 状態ごとのアニメパラメータ ──
     //
-    // 熟睡 (Sleeping) だけは時刻に依存しない**静止画**にする。
-    // ±0.6px の上下は目で追えないのに、そのために 5fps でフレームを回し続けて
+    // `still` ([`is_still`]) のときは時刻に依存しない**静止画**にする。
+    // ±0.6px の上下は目で追えないのに、そのために毎秒フレームを回し続けて
     // いた (アイドル時の CPU の主因)。止めれば「何も起きていないときは 1 枚も
     // 描かない」が成立し、ポインタが動いた瞬間に起床ホップで動き出す。
-    let (bob, wave, leg_t): (f64, f64, f64) = match state {
-        PetState::Sleeping => (0.0, 0.0, 0.0),
-        PetState::Dozing => ((t * 1.6).sin() * 1.2, (t * 1.0).sin() * 0.6, 0.0),
-        PetState::Idle => {
-            // ときどき耳をぴょこぴょこ動かす
-            let wiggle = if (t * 0.11).fract() < 0.22 { 2.0 } else { 0.5 };
-            (
-                (t * 2.0).sin() * 2.5,
-                (t * 1.6).sin() * wiggle,
-                (t * 1.6).sin() * 0.5,
-            )
-        }
-        PetState::Roam => {
-            if roam_moving {
+    let (bob, wave, leg_t): (f64, f64, f64) = if still {
+        // 静止 — いつ描いても同じ絵。これが「再描画を 1 枚も予約しない」の前提。
+        (0.0, 0.0, 0.0)
+    } else {
+        match state {
+            PetState::Sleeping => (0.0, 0.0, 0.0),
+            PetState::Dozing => ((t * 1.6).sin() * 1.2, (t * 1.0).sin() * 0.6, 0.0),
+            PetState::Idle => {
+                // ときどき耳をぴょこぴょこ動かす
+                let wiggle = if (t * 0.11).fract() < 0.22 { 2.0 } else { 0.5 };
                 (
-                    (t * 3.4).sin() * 2.0,
-                    (t * 3.0).sin() * 1.5,
-                    (t * 6.0).sin() * 2.4,
+                    (t * 2.0).sin() * 2.5,
+                    (t * 1.6).sin() * wiggle,
+                    (t * 1.6).sin() * 0.5,
                 )
-            } else {
-                ((t * 2.0).sin() * 1.8, (t * 1.4).sin() * 0.8, 0.0)
             }
+            PetState::Roam => {
+                if roam_moving {
+                    (
+                        (t * 3.4).sin() * 2.0,
+                        (t * 3.0).sin() * 1.5,
+                        (t * 6.0).sin() * 2.4,
+                    )
+                } else {
+                    ((t * 2.0).sin() * 1.8, (t * 1.4).sin() * 0.8, 0.0)
+                }
+            }
+            PetState::Working(n) => {
+                // 稼働数に応じて足踏みが速くなる
+                let sp = 3.0 + (n.min(8) as f64) * 0.7;
+                (
+                    (t * sp).sin() * 2.2,
+                    (t * sp).sin() * 2.0,
+                    (t * sp * 1.3).sin() * 2.6,
+                )
+            }
+            PetState::Groove => (
+                -(t * 7.0).sin().abs() * 5.0,
+                (t * 11.0).sin() * 3.2,
+                (t * 9.0).sin() * 2.4,
+            ),
+            PetState::Attention => (
+                (t * 6.4).sin() * 1.6,
+                (t * 6.0).sin() * 2.0,
+                (t * 8.0).sin() * 2.0,
+            ),
+            PetState::Happy => (
+                -(t * 7.0).sin().abs() * 6.0,
+                (t * 9.0).sin() * 2.5,
+                (t * 9.0).sin() * 2.0,
+            ),
+            PetState::Error => ((t * 20.0).sin() * 0.8, 0.5, 0.5),
+            PetState::Annoyed => (
+                (t * 4.0).sin() * 1.0,
+                (t * 14.0).sin() * 2.5,
+                (t * 16.0).sin() * 2.0,
+            ),
         }
-        PetState::Working(n) => {
-            // 稼働数に応じて足踏みが速くなる
-            let sp = 3.0 + (n.min(8) as f64) * 0.7;
-            (
-                (t * sp).sin() * 2.2,
-                (t * sp).sin() * 2.0,
-                (t * sp * 1.3).sin() * 2.6,
-            )
-        }
-        PetState::Groove => (
-            -(t * 7.0).sin().abs() * 5.0,
-            (t * 11.0).sin() * 3.2,
-            (t * 9.0).sin() * 2.4,
-        ),
-        PetState::Attention => (
-            (t * 6.4).sin() * 1.6,
-            (t * 6.0).sin() * 2.0,
-            (t * 8.0).sin() * 2.0,
-        ),
-        PetState::Happy => (
-            -(t * 7.0).sin().abs() * 6.0,
-            (t * 9.0).sin() * 2.5,
-            (t * 9.0).sin() * 2.0,
-        ),
-        PetState::Error => ((t * 20.0).sin() * 0.8, 0.5, 0.5),
-        PetState::Annoyed => (
-            (t * 4.0).sin() * 1.0,
-            (t * 14.0).sin() * 2.5,
-            (t * 16.0).sin() * 2.0,
-        ),
     };
     let mut bob = bob as f32 * scale;
     let wave = wave as f32 * scale;
@@ -324,7 +348,16 @@ pub fn draw(
     if t < rt.wake_until {
         bob -= ((t * 16.0).sin().abs() as f32) * 4.0 * scale;
     }
-    let blink = (t * 0.47).fract() < 0.05;
+    // まばたきも時刻依存。静止中に残すと「たまに 1 フレームだけ目が閉じた絵」に
+    // なり、そのフレームを誰も予約しないので**閉じたまま固まる**ことがある。
+    let blink = !still && (t * 0.47).fract() < 0.05;
+    // **バリアント描画へ渡す時計。** 静止中は止める。
+    //
+    // `pet_variants::state_motion` は `Sleeping` にも呼吸 (`squash`) を入れて
+    // いるので、ここで `t` をそのまま渡すと「熟睡は静止画」が**バリアントでは
+    // 嘘**になる (Crab/Cat/Cloud で実際にそうだった)。時計そのものを止めれば、
+    // 後から足したバリアントも自動的に静止する。
+    let anim_t = if still { 0.0 } else { t };
     let flip_x = rt.flip_x;
 
     // ── 配置: Some = 固定位置 / None = 右下アンカー(free_roam で位相うろうろ)──
@@ -381,15 +414,15 @@ pub fn draw(
             match tex {
                 Some(tex) => draw_image(painter, rect, tex, &params),
                 None => match input.variant {
-                    PetVariant::Blocky => draw_blocky(painter, rect, t, state, &params),
+                    PetVariant::Blocky => draw_blocky(painter, rect, anim_t, state, &params),
                     PetVariant::Crab => {
-                        crate::pet_variants::draw_crab(painter, rect, t, state, &params)
+                        crate::pet_variants::draw_crab(painter, rect, anim_t, state, &params)
                     }
                     PetVariant::Cat => {
-                        crate::pet_variants::draw_cat(painter, rect, t, state, &params)
+                        crate::pet_variants::draw_cat(painter, rect, anim_t, state, &params)
                     }
                     PetVariant::Cloud => {
-                        crate::pet_variants::draw_cloud(painter, rect, t, state, &params)
+                        crate::pet_variants::draw_cloud(painter, rect, anim_t, state, &params)
                     }
                 },
             }
@@ -440,8 +473,12 @@ pub fn draw(
 
     // 再描画は「本当に絵が変わるとき」だけ要求する。
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-    if let Some(ms) = repaint_ms(state, focused) {
-        crate::perf::repaint_after(ctx, std::time::Duration::from_millis(ms), "pet_anim");
+    if let Some(ms) = repaint_ms(state, focused, still) {
+        crate::perf::repaint_after(
+            ctx,
+            std::time::Duration::from_millis(ms),
+            repaint_tag(state),
+        );
     }
 
     PetResponse {
@@ -453,38 +490,85 @@ pub fn draw(
     }
 }
 
+/// **絵が時刻に依存しない (= 描き直しても 1px も変わらない) 状態か。**
+///
+/// `Sleeping` は元から静止画。それに加えて、**`pet_sleep = false` でも**
+/// 放置が [`SLEEP_AFTER`] を超えたら動きを止める。設定で
+/// 「アイドル時のコストはゼロ」(設計原則 3) を外せてはいけない —
+/// 「眠らない」は*目を閉じない*であって、*永久に描き続ける*ではない。
+///
+/// ここに載る状態は `working == 0 && attention == 0` かつリアクション中でも
+/// ない ([`resolve_state`] の優先順位) ので、**止めて困る進捗表示は無い**。
+fn is_still(state: PetState, idle_for: f64) -> bool {
+    match state {
+        PetState::Sleeping => true,
+        PetState::Dozing | PetState::Idle | PetState::Roam => idle_for >= SLEEP_AFTER,
+        _ => false,
+    }
+}
+
 /// 状態ごとの再描画間隔 (ms)。`None` は「絵が変わらないので予約しない」。
 ///
-/// 熟睡中の絵は時刻に依存しない静止画なので、1 枚も描き直さない。
-/// ポインタが動けば egui が入力でフレームを起こし、そのフレームで起床ホップに
-/// 移るため、寝たまま反応しなくなることはない。
-/// 背面 (フォーカスなし) では、動いていても刻みを粗くする — 進捗は伝わるが
-/// 見ていない画面を 16fps で描く理由は無い。
+/// `still` ([`is_still`]) なら常に `None`。ポインタが動けば egui が入力で
+/// フレームを起こし、そのフレームで起床ホップに移るため、止まったまま
+/// 反応しなくなることはない。
 ///
-/// ## 刻みを状態ごとに変える理由 (実測に基づく)
+/// ## 刻みの決め方 — **ペットがアプリで一番速いスケジューラであってはならない**
 ///
-/// `ZAIVERN_PERF=1` で測ったところ、**アイドル時の再描画要求は 100% が
-/// ここ** (`pet_anim`) だった。しかも `Working` はエージェントが 1 体でも
-/// 走っていれば入る状態なので、以前の一律 60ms は
-/// **作業中ずっと 16.7fps を回し続ける**ことを意味していた
-/// (「アイドル 13fps」として報告された症状の正体)。
+/// `app::idle_repaint_ms` はアプリ自身の予約表を持っている
+/// (エージェント実行中 250ms / 背面 1500ms、家事だけなら 2000ms / 背面 6000ms、
+///  何も無ければ**予約しない**)。ペットがそれより短い刻みを出した瞬間、
+/// **ペットがフレームレートの決定者になる** = 常時アニメーションになる。
 ///
-/// そこで **長く続く状態ほど粗く**する:
-/// - `Working` / `Groove` … 最長。動いていると伝わればよい
-/// - `Attention` / `Error` / `Happy` / `Annoyed` … 短命。ここだけ滑らかに
+/// 実測 (v0.14.0, debug, macOS): 直しの前はどの状態でもペットの方が速く、
+/// **ポインタが 1 回動くたびに 60 秒間・600 回**の要求が出ていた
+/// (`pet::sleep_tests::一度の入力で出る要求の総量に上限がある` で計数。
+///  前面 Idle 80ms × 20 秒 + Dozing 160ms × 40 秒)。
+/// この表にしてからは **89 回**。眠るまでの秒数 ([`SLEEP_AFTER`]) は変えて
+/// いないので、**見た目の挙動はそのまま**で 6.7 分の 1 になる。
 ///
-/// 「常時アニメーションはバッテリーのバグである」(設計原則 3) を、
-/// 進捗表示を殺さずに守るための配分。
-fn repaint_ms(state: PetState, focused: bool) -> Option<u64> {
+/// そこで **アプリの刻みを上限にする**:
+/// - `Working` / `Groove` / `Attention` … エージェントが走っている状況なので
+///   `app::IDLE_AGENT_MS` (250 / 1500) と**同じ**にする。ペットは
+///   アプリが既に頼んだフレームに相乗りするだけになり、駆動源にならない
+/// - `Idle` / `Roam` / `Dozing` … 時間の上限が無いので家事 (2000ms) を超えない
+/// - `Happy` / `Annoyed` / `Error` / 起き抜け … **必ず数秒で終わる**
+///   (Happy 4s / Error 6s / Annoyed 2s) ので、ここだけ滑らかに描いてよい。
+///   総量は 6 秒 × 12.5fps = 75 枚で頭打ち
+fn repaint_ms(state: PetState, focused: bool, still: bool) -> Option<u64> {
+    if still {
+        return None;
+    }
     match state {
         PetState::Sleeping => None,
-        // うとうとはゆっくりした上下だけ。背面ではさらに粗く。
-        PetState::Dozing => Some(if focused { 160 } else { 400 }),
-        // **一番長く続く状態**なので一番粗くする。8fps でも
-        // 「動いている」ことは十分に伝わる。
-        PetState::Working(_) | PetState::Groove => Some(if focused { 120 } else { 500 }),
-        // 短命な状態だけ滑らかに描く。
+        // 放置中。**時間の上限が無い**ので、アプリの家事 (2000ms) より速くしない。
+        PetState::Idle | PetState::Roam => Some(if focused { 500 } else { 2000 }),
+        // うとうとはゆっくりした上下だけ。Idle よりさらに粗く。
+        PetState::Dozing => Some(if focused { 1000 } else { 2000 }),
+        // エージェントが走っている状況 = app が 250 / 1500 で回している。
+        // **同じ刻みに揃えて、ペットが駆動源にならないようにする。**
+        PetState::Working(_) | PetState::Groove | PetState::Attention => {
+            Some(if focused { 250 } else { 1500 })
+        }
+        // 数秒で必ず終わる演出だけ滑らかに描く。
         _ => Some(if focused { 80 } else { 250 }),
+    }
+}
+
+/// 再描画要求の出所タグ。**状態まで割る。**
+///
+/// `pet_anim` の 1 本だけだと「ペットが描かせている」までしか分からず、
+/// **どの状態で自走しているか**が読めない。実際に `perf::dump()` の
+/// `pet_anim x251` から状態を逆算するのに、刻みの表と突き合わせる必要があった。
+/// 状態ごとに割っておけば、レポートを 1 行見るだけで犯人が確定する。
+fn repaint_tag(state: PetState) -> &'static str {
+    match state {
+        PetState::Sleeping => "pet_anim.sleep",
+        PetState::Dozing => "pet_anim.doze",
+        PetState::Idle | PetState::Roam => "pet_anim.idle",
+        PetState::Working(_) | PetState::Groove => "pet_anim.work",
+        PetState::Attention => "pet_anim.attention",
+        PetState::Happy | PetState::Error | PetState::Annoyed => "pet_anim.react",
     }
 }
 
@@ -958,30 +1042,52 @@ mod tests {
 
     // ── 再描画ポリシー ────────────────────────────────────────────
 
+    /// 動いている状態(まだ静止していない)の全部。
+    const MOVING: [PetState; 9] = [
+        PetState::Idle,
+        PetState::Dozing,
+        PetState::Roam,
+        PetState::Working(1),
+        PetState::Groove,
+        PetState::Happy,
+        PetState::Annoyed,
+        PetState::Attention,
+        PetState::Error,
+    ];
+
     /// 回帰テスト: 熟睡中は 1 枚も描き直さない。
     /// ここが Some に戻るとアイドル時に常時フレームが回る。
     #[test]
     fn sleeping_never_asks_for_a_frame() {
-        assert_eq!(repaint_ms(PetState::Sleeping, true), None);
-        assert_eq!(repaint_ms(PetState::Sleeping, false), None);
+        for focused in [true, false] {
+            for still in [true, false] {
+                assert_eq!(repaint_ms(PetState::Sleeping, focused, still), None);
+            }
+        }
+    }
+
+    /// **静止したら、どの状態でも・前面でも 1 枚も予約しない。**
+    ///
+    /// `pet_sleep = false` でも設計原則 3 を外せないことの本体。
+    #[test]
+    fn 静止したら前面でも一枚も予約しない() {
+        for st in MOVING {
+            for focused in [true, false] {
+                assert_eq!(
+                    repaint_ms(st, focused, true),
+                    None,
+                    "{st:?} focused={focused}: 静止中に予約している"
+                );
+            }
+        }
     }
 
     /// 動いている状態は必ず予約する (止まって見えたらバグ)。
     #[test]
     fn moving_states_keep_animating() {
-        for st in [
-            PetState::Idle,
-            PetState::Dozing,
-            PetState::Roam,
-            PetState::Working(1),
-            PetState::Groove,
-            PetState::Happy,
-            PetState::Annoyed,
-            PetState::Attention,
-            PetState::Error,
-        ] {
+        for st in MOVING {
             assert!(
-                repaint_ms(st, true).is_some(),
+                repaint_ms(st, true, false).is_some(),
                 "{st:?} は前景で動き続けるはず"
             );
         }
@@ -990,64 +1096,141 @@ mod tests {
     /// 背面では刻みを粗くする。ただし止めはしない (進捗が伝わらなくなる)。
     #[test]
     fn unfocused_backs_off_but_keeps_moving() {
-        for st in [PetState::Working(2), PetState::Attention, PetState::Dozing] {
-            let fg = repaint_ms(st, true).expect("前景では予約する");
-            let bg = repaint_ms(st, false).expect("背面でも止めない");
+        for st in [PetState::Working(2), PetState::Attention, PetState::Idle] {
+            let fg = repaint_ms(st, true, false).expect("前景では予約する");
+            let bg = repaint_ms(st, false, false).expect("背面でも止めない");
             assert!(bg > fg, "{st:?}: 背面 {bg}ms は前景 {fg}ms より粗いはず");
         }
     }
 
-    /// うとうと (Dozing) は通常アニメより粗くてよい (ゆっくりした上下だけ)。
+    /// うとうと (Dozing) は待機より粗くてよい (ゆっくりした上下だけ)。
     #[test]
     fn dozing_is_cheaper_than_full_animation() {
-        let doze = repaint_ms(PetState::Dozing, true).expect("Dozing は動く");
-        let idle = repaint_ms(PetState::Idle, true).expect("Idle は動く");
+        let doze = repaint_ms(PetState::Dozing, true, false).expect("Dozing は動く");
+        let idle = repaint_ms(PetState::Idle, true, false).expect("Idle は動く");
         assert!(doze > idle, "Dozing {doze}ms は Idle {idle}ms より粗いはず");
     }
 
-    /// **一番長く続く状態が一番安いこと。**
+    /// **ペットはアプリで一番速いスケジューラであってはならない。**
     ///
-    /// `Working` はエージェントが 1 体でも走っていれば入る = 実運用で
-    /// 最も長く居座る状態。ここを短命な状態と同じ刻みにすると、
-    /// 作業中ずっとフレームを回し続ける (実測で「アイドル時の再描画要求の
-    /// 100% がペット」だった原因がこれ)。
+    /// `app::idle_repaint_ms` の刻みより短い要求を出した瞬間、ペットが
+    /// フレームレートの決定者になる = 常時アニメーション。**時間の上限が
+    /// 無い状態**だけを見る (数秒で終わる演出は総量が頭打ちになるので別枠)。
     #[test]
-    fn 作業中のアニメは短命な状態より安い() {
-        for bg in [true, false] {
-            let work = repaint_ms(PetState::Working(1), bg).expect("動く");
-            let groove = repaint_ms(PetState::Groove, bg).expect("動く");
-            for short in [PetState::Attention, PetState::Error, PetState::Happy] {
-                let s = repaint_ms(short, bg).expect("動く");
-                assert!(
-                    work > s,
-                    "focused={bg}: Working {work}ms は {short:?} {s}ms より粗いはず"
-                );
-                assert!(
-                    groove > s,
-                    "focused={bg}: Groove {groove}ms は {short:?} {s}ms より粗いはず"
-                );
+    fn 終わりの無い状態はアプリの刻みを超えない() {
+        // app.rs の定数 (エージェント実行中 / 家事)。ここを下回ってはいけない。
+        const APP_AGENT_MS: u64 = 250;
+        const APP_AGENT_BG_MS: u64 = 1500;
+        const APP_HOUSEKEEP_MS: u64 = 2000;
+
+        for st in [PetState::Working(1), PetState::Groove, PetState::Attention] {
+            let fg = repaint_ms(st, true, false).expect("動く");
+            let bg = repaint_ms(st, false, false).expect("動く");
+            assert!(
+                fg >= APP_AGENT_MS,
+                "{st:?}: 前面 {fg}ms < app {APP_AGENT_MS}ms"
+            );
+            assert!(
+                bg >= APP_AGENT_BG_MS,
+                "{st:?}: 背面 {bg}ms < app {APP_AGENT_BG_MS}ms"
+            );
+        }
+        for st in [PetState::Idle, PetState::Roam, PetState::Dozing] {
+            let bg = repaint_ms(st, false, false).expect("動く");
+            assert!(
+                bg >= APP_HOUSEKEEP_MS,
+                "{st:?}: 背面 {bg}ms < app の家事 {APP_HOUSEKEEP_MS}ms"
+            );
+        }
+    }
+
+    /// **放置が続く状態が、数秒で終わる演出より安いこと。**
+    ///
+    /// `Idle` / `Dozing` / `Working` は何分でも続きうる。ここを
+    /// 「短命な演出」と同じ刻みにすると、その間ずっとフレームを回し続ける
+    /// (実測で「アイドル時の再描画要求の 100% がペット」だった原因がこれ)。
+    #[test]
+    fn 終わりの無い状態は短命な演出より安い() {
+        // 数秒で必ず終わる: Happy 4s / Error 6s / Annoyed 2s (app.rs)
+        let short = [PetState::Happy, PetState::Error, PetState::Annoyed];
+        let long = [
+            PetState::Idle,
+            PetState::Roam,
+            PetState::Dozing,
+            PetState::Working(1),
+            PetState::Groove,
+            PetState::Attention,
+        ];
+        for focused in [true, false] {
+            for l in long {
+                let lm = repaint_ms(l, focused, false).expect("動く");
+                for sh in short {
+                    let sm = repaint_ms(sh, focused, false).expect("動く");
+                    assert!(
+                        lm > sm,
+                        "focused={focused}: {l:?} {lm}ms は {sh:?} {sm}ms より粗いはず"
+                    );
+                }
             }
         }
     }
 
-    /// **どの状態も 8fps を超えて回さない。**
+    /// **どの状態も 12.5fps を超えて回さない。**
     /// これが破れると「常時アニメーションはバッテリーのバグ」に逆戻りする。
     #[test]
-    fn 前景でも_8fps_を超えて回さない() {
-        for st in [
-            PetState::Idle,
-            PetState::Dozing,
-            PetState::Roam,
-            PetState::Working(1),
-            PetState::Groove,
-            PetState::Happy,
-            PetState::Annoyed,
-            PetState::Attention,
-            PetState::Error,
-        ] {
-            if let Some(ms) = repaint_ms(st, true) {
+    fn 前景でも_12fps_を超えて回さない() {
+        for st in MOVING {
+            if let Some(ms) = repaint_ms(st, true, false) {
                 assert!(ms >= 80, "{st:?}: {ms}ms は速すぎる (>12.5fps)");
             }
+        }
+    }
+
+    /// 出所タグは状態ごとに割れていて、必ず `pet_anim.` で始まる。
+    /// (`perf::dump()` の 1 行から犯人が確定できることの担保)
+    #[test]
+    fn 出所タグは状態ごとに割れている() {
+        use std::collections::BTreeSet;
+        let mut seen = BTreeSet::new();
+        for st in MOVING.into_iter().chain([PetState::Sleeping]) {
+            let tag = repaint_tag(st);
+            assert!(tag.starts_with("pet_anim."), "{st:?}: {tag}");
+            seen.insert(tag);
+        }
+        // 少なくとも「放置 / うとうと / 作業 / 承認待ち / 演出 / 熟睡」は分かれる
+        assert!(seen.len() >= 6, "タグが割れていない: {seen:?}");
+    }
+
+    // ── 静止の判定 (is_still) ──────────────────────────────────────
+
+    /// `SLEEP_AFTER` を超えた放置は、**睡眠設定に関係なく**止まる。
+    #[test]
+    fn 放置がsleep_afterを超えたら睡眠設定に関係なく止まる() {
+        for st in [PetState::Idle, PetState::Roam, PetState::Dozing] {
+            assert!(!is_still(st, SLEEP_AFTER - 0.001), "{st:?} は早すぎる");
+            assert!(is_still(st, SLEEP_AFTER), "{st:?} が止まらない");
+            assert!(is_still(st, SLEEP_AFTER * 10.0), "{st:?} が止まらない");
+        }
+        // 熟睡は放置時間に依らず静止画
+        assert!(is_still(PetState::Sleeping, 0.0));
+    }
+
+    /// **進捗を伝える状態は、どれだけ放置しても止めない。**
+    /// (エージェントが走っているのに固まって見えるのは別のバグになる)
+    #[test]
+    fn 進捗を伝える状態は放置しても止めない() {
+        for st in [
+            PetState::Working(1),
+            PetState::Groove,
+            PetState::Attention,
+            PetState::Happy,
+            PetState::Error,
+            PetState::Annoyed,
+        ] {
+            assert!(
+                !is_still(st, SLEEP_AFTER * 100.0),
+                "{st:?} を止めてしまった"
+            );
         }
     }
 }
@@ -1157,5 +1340,275 @@ mod placement_tests {
         assert!(vp.contains_rect(r), "vp={vp:?} r={r:?}");
         let r2 = pet_rect(vp, size, Some(egui::pos2(0.0, 0.0)), 0.0, EDGE_MARGIN);
         assert!(vp.contains_rect(r2), "vp={vp:?} r2={r2:?}");
+    }
+}
+
+/// **アイドルで本当に静止するか** — 設計原則 3 のリリースゲートを
+/// 実時間を待たずに固定する検査。時計は `RawInput::time` で注入する。
+#[cfg(test)]
+mod sleep_tests {
+    use super::*;
+
+    fn idle_input() -> PetInput {
+        PetInput {
+            working: 0,
+            attention: 0,
+            recent_success: false,
+            recent_error: false,
+            variant: PetVariant::Blocky,
+            scale: 1.0,
+            free_roam: true,
+            sleep_enabled: true,
+        }
+    }
+
+    /// 時計を注入してペットを描く headless ハーネス。**実時間を 1 秒も待たない。**
+    struct Harness {
+        ctx: egui::Context,
+        theme: Theme,
+        rt: PetRuntime,
+        pos: Option<Pos2>,
+        t: f64,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                theme: crate::theme::by_name("zaivern-dark"),
+                rt: PetRuntime::default(),
+                pos: None,
+                t: 1.0,
+            }
+        }
+
+        /// `dt` 秒進めて 1 フレーム描く。返り値は egui が予約した再描画待ち
+        /// (`Duration::MAX` = **1 枚も予約していない**)。
+        fn frame(
+            &mut self,
+            input: &PetInput,
+            dt: f64,
+            events: Vec<egui::Event>,
+        ) -> std::time::Duration {
+            self.t += dt;
+            let raw = egui::RawInput {
+                time: Some(self.t),
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                theme,
+                rt,
+                pos,
+                ..
+            } = self;
+            let out = ctx.run(raw, |c| {
+                draw(c, theme, input, pos, None, rt);
+            });
+            out.viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .unwrap_or(std::time::Duration::MAX)
+        }
+    }
+
+    /// 溜まった要求を捨てて、以降の観測を自分のフレームだけに閉じる。
+    fn drain() -> std::collections::BTreeMap<&'static str, u64> {
+        crate::perf::test_sink::take()
+    }
+
+    /// **活動なしで時計を進めたら、`SLEEP_AFTER` を過ぎた時点で
+    /// 再描画要求が完全に止まる。**
+    ///
+    /// 実時間を待たない (時計は `RawInput::time` で注入する)。
+    /// 絶対時間ではなく「状態と回数」で線を引く — 予約が `None` に
+    /// なったか / 何件出たか、だけを見る。
+    #[test]
+    fn 放置がsleep_afterを過ぎたら要求が止まる() {
+        let input = idle_input();
+        let mut h = Harness::new();
+        let _ = drain();
+
+        // SLEEP_AFTER までは動いている (= 止まって見えない)
+        let mut before = 0u64;
+        while h.t - h.rt.last_input_time < SLEEP_AFTER {
+            h.frame(&input, 1.0, vec![]);
+            before += drain().values().sum::<u64>();
+        }
+        assert!(before > 0, "眠るまでの間は動いているはず");
+
+        // 越えたあとは 1 件も出ない
+        for _ in 0..200 {
+            let delay = h.frame(&input, 1.0, vec![]);
+            let got = drain();
+            assert!(got.is_empty(), "静止後に要求が出た: {got:?}");
+            assert_eq!(
+                delay,
+                std::time::Duration::MAX,
+                "静止後にフレームが予約された"
+            );
+        }
+    }
+
+    /// **止まったあとに入力があれば、その場で起きる。**
+    /// (寝たまま反応しなくなっていないこと)
+    #[test]
+    fn 入力があれば即座に起きる() {
+        let input = idle_input();
+        let mut h = Harness::new();
+        while h.t - h.rt.last_input_time < SLEEP_AFTER + 5.0 {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let _ = drain();
+        assert_eq!(h.frame(&input, 1.0, vec![]), std::time::Duration::MAX);
+        assert!(drain().is_empty());
+
+        // ポインタを動かす。`delta` は**前フレームとの差**なので、窓の外から
+        // 入ってきた最初の 1 件は差が取れない (実機のマウスは連続でイベントを
+        // 出すので、動かし始めの 1 フレーム以内に必ず差が出る)。
+        h.frame(
+            &input,
+            0.1,
+            vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))],
+        );
+        let _ = drain();
+        let moved = h.frame(
+            &input,
+            0.1,
+            vec![egui::Event::PointerMoved(egui::pos2(420.0, 300.0))],
+        );
+        let got = drain();
+        assert!(!got.is_empty(), "入力があったのに起きない");
+        assert!(
+            moved < std::time::Duration::from_millis(600),
+            "起床が遅い: {moved:?}"
+        );
+
+        // ホイールだけでも起きる (端末をスクロールしている間は寝ない)
+        while h.t - h.rt.last_input_time < SLEEP_AFTER + 1.0 {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let _ = drain();
+        assert_eq!(h.frame(&input, 1.0, vec![]), std::time::Duration::MAX);
+        let _ = drain();
+        h.frame(
+            &input,
+            0.1,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -3.0),
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(!drain().is_empty(), "ホイールで起きない");
+    }
+
+    /// **アイドルを N フレーム続けたあと、`perf` の内訳が空になる。**
+    ///
+    /// `perf::repaint_ranking()` が空 = 「damage 駆動のみ」が守れている
+    /// ことの、集計側から見た同じ事実。
+    #[test]
+    fn 静止後はperfの内訳が空になる() {
+        let input = idle_input();
+        let mut h = Harness::new();
+        while h.t - h.rt.last_input_time < SLEEP_AFTER + 1.0 {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let _ = drain();
+
+        let mut st = crate::perf::FrameStats::new();
+        for _ in 0..600 {
+            h.frame(&input, 1.0, vec![]);
+            st.record_frame(1_000, true, drain());
+        }
+        assert_eq!(st.idle_frames, 600);
+        assert!(
+            st.repaint_ranking().is_empty(),
+            "静止しているのに出所が残っている: {:?}",
+            st.repaint_ranking()
+        );
+        assert_eq!(st.idle_repaints(), 0);
+        assert!(st.always_on_sources().is_empty());
+    }
+
+    /// **睡眠を切っていても止まる。** 設定で設計原則 3 を外せない。
+    #[test]
+    fn 睡眠を切っていても放置すれば止まる() {
+        let mut input = idle_input();
+        input.sleep_enabled = false;
+        let mut h = Harness::new();
+        while h.t - h.rt.last_input_time < SLEEP_AFTER + 1.0 {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let _ = drain();
+        for _ in 0..100 {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let got = drain();
+        assert!(got.is_empty(), "pet_sleep=false で回り続けている: {got:?}");
+    }
+
+    /// **エージェントが走っている間は止めない** (固まって見えてはいけない)。
+    #[test]
+    fn 作業中は放置しても止まらない() {
+        let mut input = idle_input();
+        input.working = 2;
+        let mut h = Harness::new();
+        for _ in 0..(SLEEP_AFTER as usize + 60) {
+            h.frame(&input, 1.0, vec![]);
+        }
+        let got = drain();
+        assert!(!got.is_empty(), "作業中なのに止まった");
+        assert!(
+            got.keys().all(|k| k.starts_with("pet_anim.")),
+            "出所タグが割れていない: {got:?}"
+        );
+    }
+
+    /// **止まる前後で、要求の総量が上限を超えない。**
+    ///
+    /// 絶対時間ではなく**件数**で線を引く。ポインタが 1 回動くたびに
+    /// この回数だけ描き直す、という意味なのでここが番人になる
+    /// (直す前は前面で 500 件だった)。
+    #[test]
+    fn 一度の入力で出る要求の総量に上限がある() {
+        let input = idle_input();
+        let mut h = Harness::new();
+        let _ = drain();
+        // **予約した刻みで次のフレームが来る** (egui の実挙動) を模して回す。
+        let mut total = 0u64;
+        let mut dt = 0.0;
+        let mut frames = 0u64;
+        loop {
+            let delay = h.frame(&input, dt, vec![]);
+            total += drain().values().sum::<u64>();
+            frames += 1;
+            assert!(frames < 5_000, "静止しない");
+            if delay == std::time::Duration::MAX {
+                break;
+            }
+            // egui は起動直後など「いますぐ」を返すことがある。0 のままだと
+            // 時計が進まないので、実機の上限 (60fps) で下から押さえる。
+            dt = delay.as_secs_f64().max(1.0 / 60.0);
+        }
+        // 前面: Idle 500ms × 20s = 40 件 + Dozing 1000ms × 40s = 40 件 → 80 件。
+        // 直す前は Idle 80ms × 20s = 250 + Dozing 160ms × 40s = 250 → 500 件だった。
+        assert!(
+            total <= 120,
+            "1 度の入力で {total} 件も要求している (上限 120, 実測 {frames} フレーム)"
+        );
+        assert!(total > 0, "そもそも動いていない");
+        // 静止までにかかる時間は SLEEP_AFTER のまま (見た目の挙動は変えない)
+        let elapsed = h.t - h.rt.last_input_time;
+        assert!(
+            (SLEEP_AFTER..SLEEP_AFTER + 2.0).contains(&elapsed),
+            "静止まで {elapsed}s (SLEEP_AFTER={SLEEP_AFTER}s のはず)"
+        );
     }
 }
