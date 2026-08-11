@@ -112,14 +112,215 @@ fn common_alias(cp: u32) -> Option<&'static str> {
 /// ただし「末尾で切れているだけの UTF-8」はコードページで読み直さない。
 /// 出力を途中で打ち切ったり、チャンク境界で切れたバイト列は最後の 1 文字だけが
 /// 不完全なので、そこで CP932 として読み直すと**全体**が化ける
-/// (壊れているのは末尾の数バイトだけなので lossy で受けるのが正しい)。
+/// (壊れているのは末尾の数バイトだけ)。
+///
+/// **切れた末尾は落とす — 置換文字 (U+FFFD) にしない。**
+/// `String::from_utf8_lossy` は切れた列を `\u{FFFD}` へ変えるので、
+/// 「あと 1 バイト来れば読めた文字」が画面に化けとして焼き付いてしまう。
+/// 1 文字ぶんに満たないバイト列は**まだ文字ではない**ので、
+/// 見せるべき字が無い = 出さない、が正しい。
+/// 続きが来る流れ (PTY・パイプ) なら [`StreamDecoder`] を使うこと
+/// (落とさずに次のチャンクへ持ち越して復元する)。
 pub fn decode_output(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         // error_len() == None = 「入力が途中で終わった」= 不正な符号化ではない
-        Err(e) if e.error_len().is_none() => String::from_utf8_lossy(bytes).into_owned(),
+        Err(e) if e.error_len().is_none() => valid_head(bytes, e.valid_up_to()),
         Err(_) => decode_ansi_or_lossy(bytes, console_code_page()),
     }
+}
+
+// ═════════════ チャンク境界で文字を割らない (逐次復号) ═════════════
+//
+// # なぜ必要か
+//
+// PTY・パイプ・ソケットから届くバイト列は**任意の位置で切れる**。
+// 日本語 1 文字は UTF-8 で 3 バイト、絵文字は 4 バイトなので、
+// 8KB のチャンク境界がマルチバイト文字の途中に落ちるのは日常的に起きる。
+// そこを `String::from_utf8_lossy` に通すと、割れた分が `U+FFFD` (置換文字)
+// になり、**次のチャンクが来ても直らない** — 既に文字列へ焼き付いているため。
+// これが「文字化けが残る」の正体のひとつ。
+//
+// # どう直すか
+//
+// 「今回のチャンクで確定した文字列」と「次回へ持ち越す末尾バイト」に分ける。
+// 持ち越しは高々 3 バイト (UTF-8 の 1 文字は最大 4 バイトで、未完成なら
+// そのうち 1〜3 バイトしか来ていない) なので、無制限には溜まらない。
+// **本物の不正バイト** (`error_len().is_some()`) は今までどおり置換する —
+// 「まだ来ていない」と「壊れている」を区別することがこの層の仕事である。
+
+/// UTF-8 の 1 文字の最大バイト長。
+pub const MAX_UTF8_LEN: usize = 4;
+
+/// 持ち越せる最大バイト数。未完成の列は最大長より 1 バイト短い。
+pub const MAX_CARRY_LEN: usize = MAX_UTF8_LEN - 1;
+
+/// `bytes[..upto]` は検証済み、という前提で文字列にする。
+///
+/// `unsafe` を使わずに済ませるための小さな包み。`from_utf8` が
+/// `valid_up_to()` として返した位置しか渡さないので失敗しない。
+fn valid_head(bytes: &[u8], upto: usize) -> String {
+    std::str::from_utf8(&bytes[..upto])
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// **末尾に居る「まだ完成していない UTF-8 列」の長さ。**
+///
+/// 完成している / そもそも不正で終わっている場合は 0。
+/// 途中に本物の不正バイトがあっても、そこで止まらず末尾まで見る
+/// (壊れた行の後ろに、切れただけの正しい文字が続くことがある)。
+///
+/// 返り値は UTF-8 の定義から必ず [`MAX_CARRY_LEN`] 以下になる。
+pub fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(_) => return 0,
+            Err(e) => match e.error_len() {
+                // 入力が途中で終わった = ここから末尾までが持ち越し分
+                None => return bytes.len() - i - e.valid_up_to(),
+                // 本物の不正。その先も見る
+                Some(n) => i += e.valid_up_to() + n,
+            },
+        }
+    }
+    0
+}
+
+/// 2 バイト文字を持つコードページ (DBCS) の先行バイトか。
+///
+/// 表は符号化の定義そのもので、実行環境には依存しない。
+/// 知らないコードページでは `false` を返す = 持ち越さない
+/// (従来の挙動のままなので、判定を足したことで悪くはならない)。
+fn dbcs_lead(cp: u32, b: u8) -> bool {
+    match cp {
+        // CP932 (Shift_JIS)。0xA1..=0xDF は半角カナで 1 バイト文字なので外す。
+        932 => (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b),
+        // GBK / EUC-KR / Big5
+        936 | 949 | 950 => (0x81..=0xFE).contains(&b),
+        _ => false,
+    }
+}
+
+/// **レガシー符号化 (CP932 等) で末尾が先行バイトだけになっているか。**
+///
+/// 境界問題は UTF-8 だけの話ではない。CP932 の「日」は 0x93 0xFA の 2 バイトで、
+/// チャンクが 0x93 で切れたら次のチャンクの 0xFA と組にしないと読めない。
+/// バイト列の頭から数えるので、チャンクが文字境界から始まっていれば正しく同期する
+/// ([`StreamDecoder`] は持ち越しによってそれを保証する)。
+///
+/// 先行バイトだけで終わっていれば 1、そうでなければ 0。
+pub fn incomplete_dbcs_tail(bytes: &[u8], cp: u32) -> usize {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if dbcs_lead(cp, bytes[i]) {
+            if i + 1 >= bytes.len() {
+                return 1;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    0
+}
+
+/// **チャンク境界で文字を割らない復号器。**
+///
+/// PTY やパイプのように「続きが来る」流れは、1 回の読み取りごとに
+/// [`feed`](Self::feed) へ渡す。確定した文字列だけが返り、
+/// 途中で切れた末尾は次の呼び出しへ持ち越される。
+/// 流れが終わったら [`flush`](Self::flush) で残りを吐き出す
+/// (そこまで来て完成しないなら本物の不正なので置換する)。
+#[derive(Default, Debug)]
+pub struct StreamDecoder {
+    /// 次のチャンクの頭と組にする、まだ完成していない末尾バイト。
+    /// 不変条件: 常に [`MAX_CARRY_LEN`] 以下。
+    carry: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// **1 チャンクを食わせ、確定した文字列を受け取る。**
+    ///
+    /// 末尾が途中で切れていれば、そのバイトは返り値に含めず持ち越す。
+    pub fn feed(&mut self, chunk: &[u8]) -> String {
+        // 持ち越しが無い普段の道。連結せずに済むのでコピーが起きない。
+        if self.carry.is_empty() {
+            let tail = stream_tail(chunk);
+            let cut = chunk.len() - tail;
+            self.carry.extend_from_slice(&chunk[cut..]);
+            debug_assert!(self.carry.len() <= MAX_CARRY_LEN);
+            return decode_output(&chunk[..cut]);
+        }
+        // 持ち越しがあるときだけ連結する (持ち越しは高々 3 バイト)。
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(chunk);
+        let tail = stream_tail(&buf);
+        let cut = buf.len() - tail;
+        self.carry.extend_from_slice(&buf[cut..]);
+        debug_assert!(self.carry.len() <= MAX_CARRY_LEN);
+        decode_output(&buf[..cut])
+    }
+
+    /// **流れの終わり。** 持ち越しが残っていれば置換して吐き出す。
+    ///
+    /// ここまで来て完成しないバイト列は「続きが来ない」= 本物の不正なので、
+    /// 黙って捨てず置換文字にする (捨てると出力が静かに欠ける)。
+    pub fn flush(&mut self) -> String {
+        if self.carry.is_empty() {
+            return String::new();
+        }
+        let rest = std::mem::take(&mut self.carry);
+        String::from_utf8_lossy(&rest).into_owned()
+    }
+
+    /// いま持ち越しているバイト数。番人テストが不変条件を見るために公開する。
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+}
+
+// ───────── 記録: 端末に出る「$ だらけの文字化け」の正体 ─────────
+//
+// **PTY の生バイト列は vt100 (vte) へ直接流れるので、この層を通らない。**
+// vte の UTF-8 状態機械は呼び出しをまたいで途中の列を覚えるため、
+// **チャンク境界で割れても画面は化けない** (`terminal::screen_boundary_tests` が番人)。
+// 化けるのは「そもそも UTF-8 で書かれていない出力」で、実測すると次のようになる
+// (vt100 0.15.2 + vendor パッチ、10x40 の画面へ「日本語」を流した結果):
+//
+// | 子プロセスの出力 | 画面に出るもの |
+// |---|---|
+// | ISO-2022-JP `1B 24 42 …` | **`$3$s$K$A$OF|K\8l`** — `$` の羅列 |
+// | CP932 `93 FA 96 7B 8C EA` | `{` (6 バイトが 1 文字に潰れる) |
+// | EUC-JP `C6 FC CB DC B8 EC` | `\u{FFFD}\u{FFFD}` |
+//
+// `$` になるのは偶然ではない: ISO-2022-JP は JIS X 0208 を 7 ビットで書くので、
+// **ひらがなの区 (4 区) の先行バイトがちょうど 0x24 = `$`** になる。
+// 切り替え列 `ESC $ B` 自体も `$` を含む。vte は `ESC $ B` を
+// 「知らないエスケープ」として**黙って食べる**ので、後続の JIS バイトだけが
+// ASCII として画面に残り、`$3$s$K…` という見た目になる。
+//
+// **直すには PTY のバイト列を vt100 へ渡す前に UTF-8 へ変換する必要がある。**
+// この層は Windows の `MultiByteToWideChar` しか変換表を持たないので、
+// mac / Linux では ISO-2022-JP / EUC-JP を復号できない (表を持っていない)。
+// 変換表を持つクレート (`encoding_rs` は既に Cargo.lock に居る = 依存木にある) を
+// **直接依存に足す**のが筋だが、`Cargo.toml` は共有ファイルなので
+// このブランチでは触らない。統合担当への申し送りとしてここに残す。
+
+/// 「このチャンクの末尾のうち、次へ持ち越すバイト数」。
+///
+/// UTF-8 として切れているならその長さ。UTF-8 として**本物に壊れている**
+/// (= レガシー符号化の流れ) なら、DBCS の先行バイトが末尾に居ないかを見る。
+fn stream_tail(bytes: &[u8]) -> usize {
+    let tail = incomplete_utf8_tail(bytes);
+    if tail > 0 {
+        return tail;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return 0;
+    }
+    incomplete_dbcs_tail(bytes, console_code_page())
 }
 
 /// ファイルの中身を文字列にする。BOM と UTF-16 も見る。
@@ -138,6 +339,9 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, Encoding) {
     }
     match std::str::from_utf8(bytes) {
         Ok(s) => (s.to_string(), Encoding::Utf8),
+        // 末尾が切れているだけ = UTF-8 のファイルが途中で終わっている。
+        // ここでコードページへ倒すと**全文**が化ける (壊れているのは末尾数バイト)。
+        Err(e) if e.error_len().is_none() => (valid_head(bytes, e.valid_up_to()), Encoding::Utf8),
         Err(_) => {
             let cp = ansi_code_page();
             (decode_ansi_or_lossy(bytes, cp), Encoding::Ansi(cp))
@@ -451,6 +655,8 @@ pub fn ps_script_bytes(script: &str) -> Vec<u8> {
 fn decode_utf8_or_ansi(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
+        // BOM が付いていて末尾だけ切れている = やはり UTF-8。全文を倒さない。
+        Err(e) if e.error_len().is_none() => valid_head(bytes, e.valid_up_to()),
         Err(_) => decode_ansi_or_lossy(bytes, ansi_code_page()),
     }
 }
@@ -1990,6 +2196,160 @@ pub fn grapheme_end(s: &str, at: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────── チャンク境界 (逐次復号) の番人 ─────────
+    //
+    // ここが緑である限り「途中で切れたから化けた」は構造的に起こらない。
+    // 素材は 3 バイト (日本語)・4 バイト (絵文字)・結合文字・全角英数を
+    // わざと混ぜてある。1 バイトの ASCII だけでは境界問題が再現しない。
+
+    /// 割り方を変えても結果が変わってはいけない素材。
+    fn boundary_sample() -> &'static str {
+        "日本語 🎉 café ＡＢ か\u{3099} 👨\u{200d}👩\u{200d}👧\u{200d}👦 end"
+    }
+
+    /// **修正前はここで `U+FFFD` が出ていた。**
+    /// 「進捗を報告します」の最後の 1 バイトを落としただけで、
+    /// `from_utf8_lossy` が末尾を置換文字に変えていた。
+    #[test]
+    fn 切れた末尾は置換文字にならない() {
+        let full = boundary_sample().as_bytes();
+        for cut in 1..full.len() {
+            let s = decode_output(&full[..cut]);
+            assert!(!s.contains('\u{fffd}'), "cut={cut} で置換文字が出た: {s:?}");
+        }
+    }
+
+    /// **総当たり: どこで 2 分割しても、一括で流したのと同じ文字列になる。**
+    /// これが一致する限り、チャンク境界で文字が割れる事故は起こらない。
+    #[test]
+    fn どこで割っても結果が一致する() {
+        let src = boundary_sample();
+        let bytes = src.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut d = StreamDecoder::default();
+            let mut got = d.feed(&bytes[..cut]);
+            got.push_str(&d.feed(&bytes[cut..]));
+            got.push_str(&d.flush());
+            assert_eq!(got, src, "cut={cut} で結果が変わった");
+            assert_eq!(d.carry_len(), 0, "cut={cut} で持ち越しが残った");
+        }
+    }
+
+    /// 1 バイトずつ流しても同じ (最悪の割れ方)。
+    #[test]
+    fn 一バイトずつ流しても結果が一致する() {
+        let src = boundary_sample();
+        let mut d = StreamDecoder::default();
+        let mut got = String::new();
+        for b in src.as_bytes() {
+            got.push_str(&d.feed(&[*b]));
+        }
+        got.push_str(&d.flush());
+        assert_eq!(got, src);
+    }
+
+    /// 3 分割の総当たり。2 分割が通っても、持ち越しの上に更に持ち越しが
+    /// 乗る形 (4 バイト文字を 1+1+2 に割る等) は別の道を通る。
+    #[test]
+    fn 三分割の総当たりでも結果が一致する() {
+        let src = "あ🎉い"; // 3 + 4 + 3 バイト
+        let bytes = src.as_bytes();
+        for i in 0..=bytes.len() {
+            for j in i..=bytes.len() {
+                let mut d = StreamDecoder::default();
+                let mut got = d.feed(&bytes[..i]);
+                got.push_str(&d.feed(&bytes[i..j]));
+                got.push_str(&d.feed(&bytes[j..]));
+                got.push_str(&d.flush());
+                assert_eq!(got, src, "i={i} j={j}");
+            }
+        }
+    }
+
+    /// **持ち越しは無限に溜まらない。** UTF-8 の 1 文字は最大 4 バイトなので、
+    /// 未完成な列は必ず 3 バイト以下。不正なバイト列を延々と流しても同じ。
+    #[test]
+    fn 持ち越しは上限を超えない() {
+        let mut d = StreamDecoder::default();
+        // 決定的な擬似乱数 (種を固定 — 間欠的な失敗を作らない)
+        let mut x: u32 = 0x2026_0812;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = [(x >> 24) as u8, (x >> 16) as u8, (x >> 8) as u8];
+            let _ = d.feed(&b[..1 + (x as usize % 3)]);
+            assert!(
+                d.carry_len() <= MAX_CARRY_LEN,
+                "持ち越しが {} バイトまで伸びた",
+                d.carry_len()
+            );
+        }
+    }
+
+    /// **「まだ来ていない」と「壊れている」を区別する。**
+    /// 本物の不正バイトは今までどおり置換する — ここを区別しないと、
+    /// 壊れたバイト列を永久に待ち続けて出力が止まる。
+    #[test]
+    fn 本物の不正バイトは置換して先へ進む() {
+        let mut d = StreamDecoder::default();
+        let got = d.feed(&[0xff, 0xfe, b'o', b'k']);
+        assert!(got.ends_with("ok"), "後続の正しい文字は出ること: {got:?}");
+        assert!(
+            got.contains('\u{fffd}'),
+            "不正バイトは置換されること: {got:?}"
+        );
+        assert_eq!(d.carry_len(), 0, "不正バイトを持ち越してはいけない");
+    }
+
+    /// 先頭バイトだけ来て続きが来ないまま流れが終わったら、黙って捨てずに置換する
+    /// (捨てると出力が静かに欠ける)。
+    #[test]
+    fn 終端で完成しない列は置換して吐き出す() {
+        let mut d = StreamDecoder::default();
+        assert_eq!(d.feed("あ".as_bytes().split_last().unwrap().1), "");
+        assert_eq!(d.carry_len(), 2);
+        assert_eq!(d.flush(), "\u{fffd}");
+        assert_eq!(d.carry_len(), 0);
+    }
+
+    /// 末尾の未完成長は表で固定する (境界の判定そのもの)。
+    #[test]
+    fn 未完成な末尾の長さを数える() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"", 0),
+            (b"ascii", 0),
+            (&[0xE6, 0x97, 0xA5], 0),       // 日 (完成)
+            (&[0xE6, 0x97], 2),             // 日 の途中
+            (&[0xE6], 1),                   // 日 の頭だけ
+            (&[0xF0, 0x9F, 0x8E], 3),       // 🎉 の途中 (最大の持ち越し)
+            (&[0xFF, 0xE6], 1),             // 不正の後ろに切れた頭
+            (&[0xFF, 0xFF], 0),             // 全部不正 = 持ち越さない
+            (&[b'a', 0xE6, 0x97, 0xA5], 0), // ascii + 完成
+        ];
+        for (b, want) in cases {
+            assert_eq!(incomplete_utf8_tail(b), *want, "bytes={b:x?}");
+            assert!(
+                incomplete_utf8_tail(b) <= MAX_CARRY_LEN,
+                "持ち越しは {MAX_CARRY_LEN} バイト以下"
+            );
+        }
+    }
+
+    /// **レガシー符号化でも同じ境界問題が起きる。**
+    /// CP932 の「日」は 0x93 0xFA。0x93 で切れたら次のチャンクと組にしないと読めない。
+    /// 純関数なので Windows 以外でも検証できる。
+    #[test]
+    fn dbcs_の先行バイトだけの末尾を持ち越す() {
+        // 0x93 0xFA 0x96 = 「日」+「本」の先行バイトまで
+        assert_eq!(incomplete_dbcs_tail(&[0x93, 0xFA, 0x96], 932), 1);
+        assert_eq!(incomplete_dbcs_tail(&[0x93, 0xFA, 0x96, 0x7B], 932), 0);
+        // 半角カナ (0xA1..=0xDF) は 1 バイト文字なので持ち越さない
+        assert_eq!(incomplete_dbcs_tail(&[0xB1], 932), 0);
+        // ASCII だけなら何も持ち越さない
+        assert_eq!(incomplete_dbcs_tail(b"plain ascii", 932), 0);
+        // 知らないコードページでは判定しない (従来どおり)
+        assert_eq!(incomplete_dbcs_tail(&[0x93], 1252), 0);
+    }
 
     #[test]
     fn utf8_passes_through_unchanged() {

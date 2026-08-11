@@ -1115,6 +1115,11 @@ pub struct TypedLine {
     buf: String,
     /// この行に再現できない打鍵 (エスケープ列) が混ざったか。
     tainted: bool,
+    /// **チャンク境界で文字を割らないための持ち越し。**
+    /// 打鍵は 1 回の write に収まるとは限らず、日本語 1 文字 (3 バイト) や
+    /// 絵文字 (4 バイト) は途中で切れて届く。ここを lossy で受けると
+    /// `U+FFFD` が本文へ焼き付き、次のバイトが来ても直らない。
+    dec: crate::textenc::StreamDecoder,
 }
 
 /// **打鍵バイト列から「確定した 1 行」を組み立てる (純関数)。**
@@ -1133,10 +1138,12 @@ pub struct TypedLine {
 /// - bracketed paste の囲み … 剥がして中身だけ残す
 /// - その他の制御文字 … 無視
 ///
-/// UTF-8 の途中で切れたバイト列が来ても壊れない (不正な並びは捨てる)。
+/// UTF-8 の途中で切れたバイト列が来ても壊れない。**切れた末尾は置換文字にせず
+/// 次の呼び出しへ持ち越す**ので、「あ」が `\u{FFFD}` として本文に残らない。
+/// 本物の不正な並びは従来どおり置換する (「まだ来ていない」と「壊れている」は別物)。
 pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
     // bracketed paste の囲みを剥がす (中身は普通の文字として扱う)。
-    let text = String::from_utf8_lossy(bytes);
+    let text = st.dec.feed(bytes);
     let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
     let mut out: Option<String> = None;
     let mut chars = text.chars().peekable();
@@ -13414,5 +13421,93 @@ mod typed_line_tests {
     fn 壊れた_utf8_でも落ちない() {
         let mut st = TypedLine::default();
         let _ = feed_typed_line(&mut st, &[0xff, 0xfe, b'a', b'b', b'\r']);
+    }
+
+    // ───────── チャンク境界の番人 ─────────
+    //
+    // 打鍵・貼り付けは 1 回の write に収まるとは限らない。日本語 1 文字は
+    // 3 バイト、絵文字は 4 バイトなので、境界がその途中に落ちるのは普通に起きる。
+    // ここが lossy だと `U+FFFD` が本文へ焼き付き、**次のバイトが来ても直らない**。
+
+    /// **修正前はここで `Some("\u{fffd}\u{fffd}\u{fffd}本語のしじ")` が返っていた。**
+    /// 総当たり: どこで 2 分割しても、一括で流したのと同じ 1 行になる。
+    #[test]
+    fn 打鍵がどこで割れても同じ本文になる() {
+        let src = "日本語 🎉 café ＡＢ の指示";
+        let bytes = src.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut st = TypedLine::default();
+            let _ = feed_typed_line(&mut st, &bytes[..cut]);
+            let got = feed_typed_line(&mut st, &[&bytes[cut..], b"\r"].concat());
+            assert_eq!(got.as_deref(), Some(src), "cut={cut}");
+        }
+    }
+
+    /// 1 バイトずつ届いても同じ (最悪の割れ方)。
+    #[test]
+    fn 打鍵が一バイトずつ届いても同じ本文になる() {
+        let src = "日本語 🎉 の指示";
+        let mut st = TypedLine::default();
+        for b in src.as_bytes() {
+            assert_eq!(feed_typed_line(&mut st, &[*b]), None);
+        }
+        assert_eq!(feed_typed_line(&mut st, b"\r").as_deref(), Some(src));
+    }
+
+    /// 覚えた本文に置換文字が混ざらない (混ざると自動命名も引き継ぎも化ける)。
+    #[test]
+    fn 覚えた本文に置換文字が残らない() {
+        let src = "絵文字🎉と日本語";
+        let bytes = src.as_bytes();
+        for cut in 1..bytes.len() {
+            let mut st = TypedLine::default();
+            let _ = feed_typed_line(&mut st, &bytes[..cut]);
+            let got =
+                feed_typed_line(&mut st, &[&bytes[cut..], b"\r"].concat()).unwrap_or_default();
+            assert!(!got.contains('\u{fffd}'), "cut={cut} got={got:?}");
+        }
+    }
+}
+
+/// **画面 (vt100) 側のチャンク境界の番人。**
+///
+/// PTY 読み取りスレッドは生バイト列をそのまま `Parser::process` へ流す。
+/// vte の UTF-8 状態機械は呼び出しをまたいで途中の列を覚えるので、
+/// ここは元から割れない — が、「割れない」は**検証されていて初めて事実**であり、
+/// 途中に `from_utf8_lossy` を挟む改変が入った瞬間に壊れる。
+/// その改変を止めるのがこのテスト。
+#[cfg(test)]
+mod screen_boundary_tests {
+    /// 3 バイト・4 バイト・結合文字・全角をわざと混ぜる。
+    /// ASCII だけでは境界問題は再現しない。
+    const SAMPLE: &str = "日本語 🎉 café ＡＢ か\u{3099} 👨\u{200d}👩\u{200d}👧\u{200d}👦";
+
+    fn screen_of(chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 200, 100);
+        for c in chunks {
+            p.process(c);
+        }
+        p.screen().contents()
+    }
+
+    /// 総当たり: どこで 2 分割しても画面が一致し、置換文字が出ない。
+    #[test]
+    fn 画面はどこで割っても同じになる() {
+        let bytes = SAMPLE.as_bytes();
+        let whole = screen_of(&[bytes]);
+        assert!(!whole.contains('\u{fffd}'), "素材からして化けている");
+        for cut in 0..=bytes.len() {
+            let split = screen_of(&[&bytes[..cut], &bytes[cut..]]);
+            assert_eq!(split, whole, "cut={cut} で画面が変わった");
+        }
+    }
+
+    /// 1 バイトずつ流しても同じ画面になる (PTY が最悪の切り方をした場合)。
+    #[test]
+    fn 画面は一バイトずつ流しても同じになる() {
+        let bytes = SAMPLE.as_bytes();
+        let whole = screen_of(&[bytes]);
+        let one: Vec<&[u8]> = bytes.iter().map(std::slice::from_ref).collect();
+        assert_eq!(screen_of(&one), whole);
     }
 }
