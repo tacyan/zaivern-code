@@ -5523,7 +5523,7 @@ fn span_natural_width(ui: &egui::Ui, sp: &Span, size: f32, rctx: &RenderCtx) -> 
             .max(2.0);
     }
     if sp.fnote {
-        return text_w(&sp.text, FontId::proportional(size * 0.78));
+        return text_w(&sp.text, FontId::proportional(size * FNOTE_FONT_SCALE));
     }
     if sp.image {
         let url = sp.link.as_deref().unwrap_or("");
@@ -5543,7 +5543,7 @@ fn span_natural_width(ui: &egui::Ui, sp: &Span, size: f32, rctx: &RenderCtx) -> 
         );
     }
     let font = if sp.code {
-        FontId::monospace(size * 0.92)
+        FontId::monospace(size * CODE_FONT_SCALE)
     } else {
         FontId::proportional(size)
     };
@@ -5562,6 +5562,8 @@ fn cell_natural_width(ui: &egui::Ui, text: &str, size: f32, rctx: &RenderCtx) ->
 #[derive(Clone, Copy)]
 struct CellStyle {
     size: f32,
+    /// 表じゅうで共通の行の高さ ([`cell_line_height`] が決める)。
+    line_h: f32,
     strong: bool,
     color: Color32,
     align: TableAlign,
@@ -5574,6 +5576,14 @@ const TBL_GAP_X: f32 = 18.0;
 const TBL_GAP_Y: f32 = 6.0;
 const TBL_MIN_COL: f32 = 44.0;
 
+/// インライン code と脚注参照を本文より小さく組む倍率。
+///
+/// 列幅の見積り ([`span_natural_width`]) と実際の組版 ([`cell_job`]) が
+/// **同じ倍率**を使うことが列幅の前提なので、値は 1 箇所に置く。
+/// 片方だけ変えると「自然幅は足りているのに折り返す」列ができる。
+const CODE_FONT_SCALE: f32 = 0.92;
+const FNOTE_FONT_SCALE: f32 = 0.78;
+
 /// 太字を横へずらして重ねる量 (synthetic bold)。
 const BOLD_OFFSET: f32 = 0.6;
 
@@ -5585,6 +5595,35 @@ const LIST_STEP: f32 = 0.55;
 const BLOCK_GAP_Y: f32 = 2.0;
 /// ぶら下げの器に必ず残す本文の幅 (フォント寸法の倍数)。
 const HANG_MIN_BODY: f32 = 4.0;
+
+/// 表のセルが使う**行の高さ**を決める純関数。
+///
+/// [`cell_job`] は 1 枚の `LayoutJob` に 3 種類のフォント (本文 /
+/// インライン code / 脚注参照) を混ぜる。epaint は行の高さを
+/// **その行に実際に出たフォントの最大値**で決める
+/// (`epaint::text::layout::galley_from_rows`) ので、放っておくと
+/// 「code だけのセル」と「本文だけのセル」で 1 行の高さが変わる。
+/// 実測 (base 14, 同梱フォント): 本文 16.086 / code 14.993 / 脚注 12.685。
+/// **1 段につき 1px ずつ横の列と段がずれ、5 段で 4px 開いた**。
+/// 重なりはしないが、複数行に折り返す表では段のガタつきとして見える。
+///
+/// 表じゅうで同じ行高を配れば段は必ず揃う。いちばん高いフォントに
+/// 合わせるので、どのフォント構成でも文字が潰れることはない。
+fn cell_line_height(prop_h: f32, code_h: f32, fnote_h: f32) -> f32 {
+    prop_h.max(code_h).max(fnote_h).max(1.0)
+}
+
+/// いま使っているフォントから表 1 つぶんの行高を測る
+/// ([`cell_line_height`] への入力を集めるだけ)。
+fn table_line_height(ui: &egui::Ui, base: f32) -> f32 {
+    ui.fonts(|f| {
+        cell_line_height(
+            f.row_height(&FontId::proportional(base)),
+            f.row_height(&FontId::monospace(base * CODE_FONT_SCALE)),
+            f.row_height(&FontId::proportional(base * FNOTE_FONT_SCALE)),
+        )
+    })
+}
 
 /// 揃えに対応する galley の水平アンカー。
 fn halign_of(a: TableAlign) -> egui::Align {
@@ -5611,9 +5650,15 @@ fn cell_job(
     job.wrap.max_width = w;
     for sp in spans {
         let (font, mut color) = if sp.code {
-            (FontId::monospace(style.size * 0.92), theme.accent)
+            (
+                FontId::monospace(style.size * CODE_FONT_SCALE),
+                theme.accent,
+            )
         } else if sp.fnote {
-            (FontId::proportional(style.size * 0.78), theme.accent)
+            (
+                FontId::proportional(style.size * FNOTE_FONT_SCALE),
+                theme.accent,
+            )
         } else {
             (FontId::proportional(style.size), style.color)
         };
@@ -5631,6 +5676,8 @@ fn cell_job(
             0.0,
             egui::TextFormat {
                 font_id: font,
+                // 混在フォントでも段を揃えるため、行高は表じゅうで共通にする
+                line_height: Some(style.line_h),
                 color,
                 background,
                 italics: sp.em,
@@ -5684,8 +5731,9 @@ fn table_cell_ui(
     let w = ui.available_width();
     let spans = parse_inline(text);
     if spans.is_empty() {
-        // 空セルでも 1 行ぶんの高さを確保する (縞と罫線が痩せないように)
-        ui.allocate_exact_size(egui::vec2(w, style.size * 1.2), egui::Sense::hover());
+        // 空セルでも 1 行ぶんの高さを確保する (縞と罫線が痩せないように)。
+        // 中身のあるセルと同じ行高を使うので、空セルだけ痩せることはない。
+        ui.allocate_exact_size(egui::vec2(w, style.line_h), egui::Sense::hover());
         return;
     }
     // リンク・画像・数式はウィジェットでしか描けないのでそちらへ回す
@@ -5699,6 +5747,7 @@ fn table_cell_ui(
             // (`horizontal_wrapped` だと余白ぶんで折り返しが起きる)
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                ui.spacing_mut().interact_size.y = style.line_h;
                 let pad = (w - nat).max(0.0);
                 ui.add_space(if style.align == TableAlign::Right {
                     pad
@@ -5710,6 +5759,11 @@ fn table_cell_ui(
         } else {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                // egui の既定の当たり判定の高さ (`interact_size.y` = 18) が
+                // 折り返した段の高さになるので、そのままだと galley 経路
+                // (行高 [`cell_line_height`] = 16) と段がずれる。
+                ui.spacing_mut().interact_size.y = style.line_h;
+                ui.set_row_height(style.line_h);
                 spans_ui(ui, theme, text, style.size, style.strong, style.color, rctx);
             });
         }
@@ -5724,6 +5778,7 @@ fn table_row_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     base: f32,
+    line_h: f32,
     widths: &[f32],
     cells: &[String],
     aligns: &[TableAlign],
@@ -5739,6 +5794,7 @@ fn table_row_ui(
         for (c, w) in widths.iter().enumerate() {
             let style = CellStyle {
                 size: base,
+                line_h,
                 strong: head,
                 color: theme.text,
                 align: aligns.get(c).copied().unwrap_or(TableAlign::Left),
@@ -5785,6 +5841,8 @@ fn table_ui(
     rctx: &mut RenderCtx,
 ) {
     let ncols = header.len().max(1);
+    // 行高は表じゅうで 1 つ (セルごとに測ると混在フォントで段がずれる)
+    let line_h = table_line_height(ui, base);
     let mut natural = vec![0.0_f32; ncols];
     for (c, cell) in header.iter().enumerate().take(ncols) {
         natural[c] = natural[c].max(cell_natural_width(ui, cell, base, rctx));
@@ -5807,7 +5865,7 @@ fn table_ui(
                 ui.set_width(inner);
                 ui.spacing_mut().item_spacing = egui::vec2(0.0, TBL_GAP_Y);
                 table_row_ui(
-                    ui, theme, base, &widths, header, aligns, true, false, inner, rctx,
+                    ui, theme, base, line_h, &widths, header, aligns, true, false, inner, rctx,
                 );
                 // ヘッダ下の罫線 (見出しと本文の境目)
                 let (line, _) =
@@ -5818,6 +5876,7 @@ fn table_ui(
                         ui,
                         theme,
                         base,
+                        line_h,
                         &widths,
                         row,
                         aligns,
@@ -7293,6 +7352,26 @@ mod tests {
         assert!(w.iter().all(|v| v.is_finite()), "{w:?}");
     }
 
+    /// セルの行高の決め方 (純関数)。
+    ///
+    /// 表の中では**いちばん高いフォント**に合わせて全セルへ同じ行高を配る。
+    /// 実測値 (base 14 / 同梱フォント): 本文 16.086 / code 14.993 /
+    /// 脚注 12.685。倍率 ([`CODE_FONT_SCALE`] / [`FNOTE_FONT_SCALE`]) を
+    /// 1.0 以上へ変えても潰れないよう、順序は仮定せず最大値を採る。
+    #[test]
+    fn セルの行高は一番高いフォントに合わせる() {
+        // 同梱フォントの実測どおり本文がいちばん高い場合
+        assert!((cell_line_height(16.086, 14.993, 12.685) - 16.086).abs() < 1e-3);
+        // code のほうが高いフォント構成でも、code が潰れない
+        assert!((cell_line_height(14.0, 19.0, 12.0) - 19.0).abs() < 1e-3);
+        assert!((cell_line_height(14.0, 12.0, 20.0) - 20.0).abs() < 1e-3);
+        // 3 つとも同じなら当然それ
+        assert!((cell_line_height(16.0, 16.0, 16.0) - 16.0).abs() < 1e-3);
+        // 0 や負の値が来ても高さ 0 の行 (= 全部の段が同じ位置) にはしない
+        assert!(cell_line_height(0.0, 0.0, 0.0) >= 1.0);
+        assert!(cell_line_height(-5.0, -3.0, -1.0) >= 1.0);
+    }
+
     /// 行頭 `|` を省いた GFM 形式の表も拾い、水平線や箇条書きは表にしない。
     #[test]
     fn 行頭のパイプが無い表も表として扱う() {
@@ -8458,6 +8537,272 @@ $$
                 assert!(!overlap, "{width}: {a:?} と {b:?} が縦に食い込んだ");
             }
         }
+    }
+
+    /// 描かれたもの (文字の行 **と画像**) の矩形を全部拾う。
+    ///
+    /// [`md_rows`] は `Shape::Text` しか見ないので、**画像セル**の崩れを
+    /// 1 つも捕まえられなかった。`![]()` を含むセルは
+    /// [`table_cell_ui`] でウィジェット経路 (`horizontal_wrapped`) へ落ち、
+    /// galley 経路とは行の高さの決まり方が違うので、両方を同じ土俵で見る。
+    fn md_draw_rects(doc: &str, width: f32, dir: Option<&Path>) -> Vec<(egui::Rect, String)> {
+        let ctx = egui::Context::default();
+        let hl = Highlighter::new();
+        let theme = crate::theme::by_name("zaivern-dark");
+        let mut images = ImageCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 4000.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        // 画像は 1 フレーム目で初めて復号されるので、寸法が落ち着くまで回す
+        for _ in 0..4 {
+            out = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut rctx = RenderCtx {
+                        dir,
+                        images: &mut images,
+                    };
+                    render(ui, &theme, &hl, 14.0, doc, &mut rctx);
+                });
+            }));
+        }
+        let mut rects = Vec::new();
+        let mut prev: Option<(egui::Pos2, String)> = None;
+        for cs in &out.expect("1 フレームも回っていない").shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let text = t.galley.text().to_string();
+                    let overlay = prev.as_ref().is_some_and(|(pp, ptext)| {
+                        *ptext == text
+                            && (t.pos.x - pp.x - BOLD_OFFSET).abs() < 0.01
+                            && (t.pos.y - pp.y).abs() < 0.01
+                    });
+                    prev = Some((t.pos, text));
+                    if overlay {
+                        continue;
+                    }
+                    for row in t.galley.rows.iter() {
+                        let body: String = row.glyphs.iter().map(|g| g.chr).collect();
+                        if body.trim().is_empty() {
+                            continue;
+                        }
+                        rects.push((row.rect.translate(t.pos.to_vec2()), body));
+                    }
+                }
+                // 画像 (egui::Image はテクスチャ付きの矩形として積まれる)
+                egui::epaint::Shape::Rect(r) if r.fill_texture_id != egui::TextureId::default() => {
+                    rects.push((r.rect, "<image>".to_string()));
+                }
+                _ => {}
+            }
+        }
+        rects.sort_by(|a, b| {
+            (a.0.top(), a.0.left())
+                .partial_cmp(&(b.0.top(), b.0.left()))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rects
+    }
+
+    /// 画面上で**実際に重なる**組が 1 つも無いこと (縦横の両方で見る)。
+    ///
+    /// [`no_row_bleed`] は縦の帯だけを見るので、**別の列**に並ぶ 2 行を
+    /// 「食い込み」と数えてしまう。実文書 20 本 × 3 幅の実測で、
+    /// 1 軸判定は 117 組を挙げたが**横方向は 1 組残らず 18.06px 以上
+    /// 離れていた** (= 列の間隔 [`TBL_GAP_X`] ぶん) ので、
+    /// 画面上の重なりは **0 組**だった。
+    /// 「縦の帯が重なる」と「見た目が重なる」を混ぜないこと。
+    fn no_screen_overlap(rects: &[(egui::Rect, String)], label: &str) {
+        for (i, (a, at)) in rects.iter().enumerate() {
+            for (b, bt) in rects.iter().skip(i + 1) {
+                // 同じ段に並ぶものは上端が揃う (`horizontal_top`)
+                if (a.top() - b.top()).abs() < 0.5 {
+                    continue;
+                }
+                let vy = a.bottom().min(b.bottom()) - a.top().max(b.top());
+                let vx = a.right().min(b.right()) - a.left().max(b.left());
+                assert!(
+                    !(vy > 0.5 && vx > 0.5),
+                    "{label}: {a:?} {at:?} と {b:?} {bt:?} が画面上で重なった (縦 {vy:.2}px / 横 {vx:.2}px)"
+                );
+            }
+        }
+    }
+
+    /// 表の中身にあたる矩形 (ヘッダより下) を列ごとに束ねる。
+    fn body_rows_by_column(
+        rects: &[(egui::Rect, String)],
+        header_bottom: f32,
+    ) -> std::collections::BTreeMap<i64, Vec<f32>> {
+        let mut by_col: std::collections::BTreeMap<i64, Vec<f32>> = Default::default();
+        for (r, _) in rects {
+            if r.top() < header_bottom {
+                continue;
+            }
+            by_col
+                .entry(r.left().round() as i64)
+                .or_default()
+                .push(r.top());
+        }
+        for v in by_col.values_mut() {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        by_col
+    }
+
+    /// 表の行の中では、**どの列も段の上端が同じ**。
+    ///
+    /// `cell_job` は 1 枚の galley に本文 (`proportional`) と
+    /// インライン code (`monospace`) を混ぜる。epaint は行の高さを
+    /// **その行に実際に出たフォントの最大値**で決めるので
+    /// (`epaint::text::layout::galley_from_rows`)、行高を揃えないと
+    /// 「code だけのセル」は 15px 行・「本文のセル」は 16px 行になり、
+    /// **折り返し 1 段につき 1px ずつ**ずれる。
+    /// 修正前の実測: 4 段で `[0, -1, -2, -3]`、5 段で `[0, -1, -2, -3, -4]`。
+    /// 重なりはしないので [`no_row_bleed`] では捕まらない。
+    #[test]
+    fn 表の段は列をまたいでも揃う() {
+        // 1 列目は galley 経路 (code) / ウィジェット経路 (リンク・数式) を
+        // それぞれ通す。2 列目は必ず折り返す本文で、こちらが基準の段になる。
+        let prose = "ふつうの日本語の説明文がここに入って何段にも折り返す想定である。さらに長くする。もっと長くする。どの幅でも三段以上に折り返さないと検査にならないので、基準になる列の本文はここまで長くしてある。";
+        let docs = [
+            format!(
+                "| コード | 説明 |\n|---|---|\n| `alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima` | {prose} |\n"
+            ),
+            format!(
+                "| リンク | 説明 |\n|---|---|\n| [alpha bravo charlie delta echo foxtrot golf hotel india](https://example.com) | {prose} |\n"
+            ),
+            format!("| 式 | 説明 |\n|---|---|\n| $a+b$ | {prose} |\n"),
+        ];
+        for doc in &docs {
+            段が揃っている(doc);
+        }
+    }
+
+    /// [`表の段は列をまたいでも揃う`] の本体 (入力ごとに同じ検査を当てる)。
+    fn 段が揃っている(doc: &str) {
+        for width in [360.0_f32, 420.0, 520.0] {
+            let rects = md_draw_rects(doc, width, None);
+            let header_bottom = rects
+                .first()
+                .map(|(r, _)| r.bottom() + 1.0)
+                .expect("ヘッダが描けていない");
+            let by_col = body_rows_by_column(&rects, header_bottom);
+            assert!(
+                by_col.len() >= 2,
+                "{width}: 2 列に描けていない ({by_col:?})"
+            );
+            let max_lines = by_col.values().map(Vec::len).max().unwrap_or(0);
+            assert!(
+                max_lines >= 3,
+                "{width}: 折り返していない ({max_lines} 段) — 検査になっていない"
+            );
+            // 全列の段の上端を集めて重複を潰す。段が揃っていれば
+            // 「相異なる上端の数」は「いちばん段数の多い列の段数」に一致する。
+            let mut tops: Vec<f32> = by_col.values().flatten().copied().collect();
+            tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            tops.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+            assert_eq!(
+                tops.len(),
+                max_lines,
+                "{width}: 段がずれている (上端 {tops:?} / 最大 {max_lines} 段 / 列 {by_col:?})"
+            );
+            no_screen_overlap(&rects, &format!("段揃え w={width}"));
+        }
+    }
+
+    /// 表のいろいろな形を、どの幅で描いても**画面上で重ならない**。
+    ///
+    /// 書き直しの直後に**1 度も通っていなかった組み合わせ**を並べる。
+    /// 画像 (バッジ) を含むセルだけはウィジェット経路へ落ちるので、
+    /// 実ファイルを一時ディレクトリに置いて実物の寸法で描かせる。
+    #[test]
+    fn どの表の形でも画面上で重ならない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-md", "table-shapes");
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れない");
+        // README のバッジと同じくらいの横長画像と、版面より広い画像
+        for (name, w, h) in [("badge.png", 140_u32, 24_u32), ("wide.png", 900, 40)] {
+            image::RgbaImage::from_pixel(w, h, image::Rgba([10, 120, 200, 255]))
+                .save(dir.join(name))
+                .expect("テスト画像を書けない");
+        }
+
+        let many_cols = {
+            let n = 12;
+            let cell = |f: &dyn Fn(usize) -> String| (1..=n).map(f).collect::<Vec<_>>().join(" | ");
+            format!(
+                "| {} |\n| {} |\n| {} |\n| {} |\n",
+                cell(&|i| format!("列{i}")),
+                cell(&|_| "---".to_string()),
+                cell(&|i| format!("`v{i}`")),
+                cell(&|i| format!("値がとても長い場合{i}")),
+            )
+        };
+
+        let cases: [(&str, &str); 16] = [
+            (
+                "code+長い英文+折り返し",
+                "| API | 説明 |\n|---|---|\n| `region::conflicting_pairs` | Sorts by start line and sweeps so that the worst case never becomes quadratic even with eight hundred disjoint reservations |\n| `lease::claim` | 短い |\n",
+            ),
+            (
+                "バッジ画像",
+                "| 状態 | バッジ |\n|---|---|\n| CI | ![build](badge.png) ![cov](badge.png) |\n| 版 | ![v](badge.png) |\n",
+            ),
+            ("版面より広い画像", "| 図 |\n|---|\n| ![w](wide.png) |\n"),
+            (
+                "取得できない遠隔バッジ",
+                "| 状態 | バッジ |\n|---|---|\n| CI | ![build](https://example.invalid/badge.svg) |\n",
+            ),
+            (
+                "リンク+太字+取り消し線",
+                "| 名前 | 備考 |\n|---|---|\n| [**手引き**](https://example.com) | ~~廃止~~ **重要** *斜体* |\n| [`code link`](https://example.com/very/long/path/that/never/ends) | ~~`old api`~~ |\n",
+            ),
+            ("12 列", &many_cols),
+            (
+                "1 列だけ",
+                "| 唯一 |\n|---|\n| 値 |\n| とても長い日本語の値がここに入って折り返すはずである |\n",
+            ),
+            ("空セルだけの行", "| A | B | C |\n|---|---|---|\n|  |  |  |\n| x | | z |\n"),
+            ("ヘッダだけ", "| A | B |\n|---|---|\n"),
+            (
+                "全角と半角の混在",
+                "| 混在 | ascii |\n|---|---|\n| 日本語abc英字混在テキスト | Mixed 全角ＡＢＣ and half ABC |\n",
+            ),
+            (
+                "折り返せない URL",
+                "| URL | 備考 |\n|---|---|\n| https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbb | 折り返せない |\n",
+            ),
+            (
+                "折り返せない code",
+                "| CODE | 備考 |\n|---|---|\n| `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` | x |\n",
+            ),
+            (
+                "右揃え + code",
+                "| 名 | 数 |\n|:---|---:|\n| `zai lease claim --shift` | `1,234` |\n| a | 7 |\n",
+            ),
+            (
+                "脚注参照つきのセル",
+                "| A | B |\n|---|---|\n| 脚注つき[^1] の文 | ふつう |\n\n[^1]: 注の中身\n",
+            ),
+            (
+                "数式つきのセル",
+                "| 式 | 説明 |\n|---|---|\n| $O(N^2)$ | 総当たり |\n| $\\frac{a}{b}$ | 分数 |\n",
+            ),
+            ("列数が揃わない行", "| A | B | C |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 | 5 |\n"),
+        ];
+
+        for (name, doc) in cases {
+            for width in [1200.0_f32, 700.0, 420.0, 260.0] {
+                let rects = md_draw_rects(doc, width, Some(&dir));
+                assert!(!rects.is_empty(), "{name} w={width}: 何も描けていない");
+                no_screen_overlap(&rects, &format!("{name} w={width}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// どの幅でも、**どのテキスト行も版面をはみ出さない**。
