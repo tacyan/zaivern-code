@@ -331,6 +331,15 @@ git は 5 つの環境すべてで CRLF のまま綺麗にマージする)。
 **完全に同一**。5 種類の本文 (unique / fences / blank / generated / repeat)
 すべてで `gap=1` は衝突、`gap>=2` は clean。
 
+> **`gap` の定義が 2 つある。混ぜないこと。**
+> このハーネスの `gap` は**行番号の差** (行 100 と 100+gap) で、
+> `region::SAFE_BAND` / `MERGE_ONLY_BAND` の `gap`
+> (`region::spans_too_close`) は**間に挟まる未変更行の数**である。
+> ハーネスの `gap=2` = 未変更行 1 行 = `MERGE_ONLY_BAND = 1`。
+> つまり下の表は `MERGE_ONLY_BAND = 1` と**矛盾していない**、
+> どころかそれを 4 環境で再確認したものである
+> (`src/region.rs:45-62` の下限表を参照)。
+
 | git | gap=1 | gap=2 | gap=3 | gap=4 | gap=6 | gap=8 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 2.47.1 (macOS) | 衝突 ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 |
