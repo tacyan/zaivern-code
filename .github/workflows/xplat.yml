@@ -232,7 +232,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     name: shapes (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # **まだ実測が無いので広めに取る。** 30 分では足りず 29 分 33 秒で
+    # cancelled になったが、出力を溜め込んでいたため**内訳が残らなかった**。
+    # 上の tee で内訳が出るようになったので、1 度完走したら実測に合わせて
+    # 締め直すこと (週次なので wall-clock は貴重ではないが、
+    # 「いくらでもいい」にすると本当に壊れたときに気付けない)。
+    timeout-minutes: 90
     steps:
       # probe と同じ理由。`.sh` が CRLF で降りると git-bash が実行できない。
       - name: 改行を LF に固定 (Windows のみ)
@@ -473,10 +478,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$ZAIVERN_HOME"
-          out=$(cargo test --locked --bin zai \
+          # **出力を溜め込まない。** `out=$(...)` だと時間切れのときに
+          # ログが 1 行も残らず、**どこで時間を使ったのか分からない**
+          # (実際に 29 分 33 秒走って cancelled になり、手掛かりがゼロだった)。
+          # tee で流しながら控える。`set -o pipefail` があるので rc は保たれる。
+          log="$RUNNER_TEMP/proof.log"
+          cargo test --locked --bin zai \
             'features::coedit::imp::tests::実gitで証明の見逃しが1件も無いことを網羅的に確かめる' \
-            -- --exact --nocapture 2>&1)
-          echo "$out"
+            -- --exact --nocapture 2>&1 | tee "$log"
+          out=$(cat "$log")
           if ! echo "$out" | grep -q '1 passed'; then
             echo "::error::証明のテストが 1 件も走っていない (名前が変わった可能性)"
             exit 1
