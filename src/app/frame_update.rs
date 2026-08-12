@@ -265,7 +265,10 @@ impl ZaivernApp {
         // interval フックと interval 更新のパネルを回す
         self.tick_plugin_timers(ctx);
 
-        // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする
+        // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする。
+        // 見張りは別スレッド (`watch_tick`)。ここは「見に行け」と言われたときと、
+        // 入力等で回ったフレームのついで、の 2 通りで回る。
+        self.watch_tick(ctx);
         self.check_external_changes();
 
         // Hot Exit: 未保存の本文を間引いて退避する。
@@ -794,6 +797,13 @@ impl ZaivernApp {
         // 古い矩形で「ファイル単位ズーム」に流れることがない。
         self.zoom_area = self.zoom_area_next.take();
 
+        // 見張りへ「いまの姿」を置き直す。**全ての描画のあと**でなければ
+        // ならない — ファイルツリーは描くときに初めてフォルダを読む
+        // (`FileTree::entries`) ので、描画より前に置くと**このフレームで
+        // 増えたフォルダが 1 枚ぶん見張られない**。次のフレームが来る保証は
+        // 無い (それがこの版の主眼) ので、1 枚遅れは「永久に見張らない」になる。
+        self.publish_watch_targets();
+
         // フレームの最後に、次の定期フレームだけをまとめて予約する。
         // ここより上で誰かが予約していれば egui は最短を採るので、
         // このポリシーは「他に誰も予約していないときの下限」を決める役になる。
@@ -947,8 +957,78 @@ impl ZaivernApp {
     /// `request_repaint` を撃っているので、ここでは数えない。
     /// 逆に**自前で起こさない**待ち (OS ファイルダイアログ・ファイアウォール
     /// 操作・横断検索・定義ジャンプ) は `awaiting` として拾う。
-    pub(super) fn schedule_idle_repaint(&self, ctx: &egui::Context) {
+    /// **期限つきの家事が、あと何 ms で来るか。** 無ければ `None` = 寝てよい。
+    ///
+    /// ここに載るのは「自分ではフレームを予約しないのに、期限が来たら
+    /// 動かないと困る」家事だけ。`hotexit_tick` のように**自分で予約する**
+    /// ものは載せない (二重に予約すると刻みが短いほうへ引きずられる)。
+    ///
+    /// **`true`/`false` ではなく ms を返すのが肝。** 同梱プラグイン
+    /// `usage-meter` の interval フックは 900 秒に 1 回でよいのに、
+    /// 「期限つきの家事がある」を真偽で渡していたせいで、アイドルでも
+    /// 2 秒ごとに 1 枚描き続けていた。
+    fn next_timer_due_ms(&self) -> Option<u64> {
         use plugins::PluginList;
+        let mut next: Option<u64> = None;
+        let mut take = |ms: u64| {
+            next = Some(next.map_or(ms, |n: u64| n.min(ms)));
+        };
+        let left = |at: Option<Instant>, period: u64| -> u64 {
+            at.map_or(0, |t| period.saturating_sub(t.elapsed().as_millis() as u64))
+        };
+
+        // 自動保存。**未保存が 1 つも無いなら期限は無い** —
+        // `autosave_tick` は保存点に居るバッファを飛ばすので、
+        // そのために起きても 1 バイトも書かない (`at_saved_point` は
+        // 全文ハッシュを取らない近道なので、毎フレーム見ても安い)。
+        if self.menu_state.auto_save
+            && self
+                .editor
+                .buffers
+                .iter()
+                .any(|b| !b.kind.read_only() && b.path.is_some() && !b.history.at_saved_point())
+        {
+            take(left(self.autosave_at, AUTOSAVE_MS));
+        }
+
+        // 裏で走らせた読み込み (PDF 抽出 / アニメーション復号) は
+        // `Editor::check_external` に相乗りして取り込まれる。**自分では
+        // 起こさない**ので、走っているあいだは外部チェックの刻みで回す。
+        if self.editor.buffers.iter().any(|b| {
+            b.pdf_job.is_some() || b.image.as_ref().is_some_and(editor::ImageDoc::decoding)
+        }) {
+            take(left(self.ext_check_at, EXT_CHECK_MS));
+        }
+
+        // LSP のデバウンス。入力が止まった直後の 1 枚を落とすと
+        // `did_change` が届かず、診断が古いまま残る。
+        if let Some(oldest) = self.lsp_pending.values().map(|(_, at, _)| *at).min() {
+            take(LSP_DEBOUNCE_MS.saturating_sub(oldest.elapsed().as_millis() as u64));
+        }
+
+        // interval フック / interval パネル。**それぞれの期限まで寝る。**
+        for (p, h) in self.plugins.active_hooks(plugins::HookEvent::Interval) {
+            let period = h.interval_secs.max(5) * 1000;
+            let key = (p.name.clone(), h.event.as_str().to_string());
+            take(left(self.hook_last_run.get(&key).copied(), period));
+        }
+        // パネルはプラグインタブが見えているときだけ取り直す
+        // (`tick_plugin_timers` が同じ条件で降りる)。見ていない画面の
+        // ために起きない。
+        if self.sidebar_open && self.sidebar_tab == SidebarTab::Plugins {
+            for (p, pa) in self.plugins.active_panels() {
+                if pa.refresh != plugins::PanelRefresh::Interval || pa.run.trim().is_empty() {
+                    continue;
+                }
+                let period = pa.interval_secs.max(5) * 1000;
+                let key = (p.name.clone(), pa.id.clone());
+                take(left(self.panel_last_run.get(&key).copied(), period));
+            }
+        }
+        next
+    }
+
+    pub(super) fn schedule_idle_repaint(&self, ctx: &egui::Context) {
         let (focused, minimized, had_input) = ctx.input(|i| {
             let v = i.viewport();
             (
@@ -961,30 +1041,38 @@ impl ZaivernApp {
             || self.fw.busy().is_some()
             || self.gsearch.rx.is_some()
             || self.awaiting_definition.is_some();
-        // 外部での書き換えを見張る対象: 開いているフォルダか、
-        // ディスク上のファイルに紐付いたタブ (`check_external_changes` の対象)
-        let watching_files =
-            !self.roots.is_empty() || self.editor.buffers.iter().any(|b| b.path.is_some());
-        let timers_due = self.menu_state.auto_save
-            || !self
-                .plugins
-                .active_hooks(plugins::HookEvent::Interval)
-                .is_empty();
+        // 外部での書き換えのために**定期フレームが要るか**。
+        //
+        // 見張り (`crate::fswatch`) が生きているなら要らない — `stat` は
+        // 別スレッドが回し、UI が信じている姿と食い違ったときにだけ
+        // 起こしてくる (= damage 駆動)。**見張りを起こせなかった環境
+        // (スレッドが作れない等) だけ**、従来どおり定期フレームで見張る。
+        let watched_by_thread = self
+            .fswatch
+            .as_ref()
+            .is_some_and(crate::fswatch::FsWatch::active);
+        let watching_files = !watched_by_thread
+            && (!self.roots.is_empty() || self.editor.buffers.iter().any(|b| b.path.is_some()));
         let signals = IdleSignals {
             had_input,
             animating: ctx.has_requested_repaint(),
             awaiting,
             agents_running: self.agents.running_count() > 0,
             watching_files,
-            timers_due,
+            timer_due_in_ms: self.next_timer_due_ms(),
             focused,
             visible: !minimized,
         };
         if let Some(ms) = idle_repaint_ms(signals) {
+            // **出所は理由まで割る。** `schedule_idle_repaint` の 1 本だと
+            // 「アプリが定期フレームを回している」までしか分からず、
+            // *どの理由で*回っているかを読むのに `IdleSignals` の組み立てを
+            // 逆算する必要がある (実際に「見張りを降ろしたのに数字が動かない」
+            // の犯人が家事ではなく別の欄だった、を見つけ損ねた)。
             crate::perf::repaint_after(
                 ctx,
                 std::time::Duration::from_millis(ms),
-                "schedule_idle_repaint",
+                idle_repaint_tag(signals),
             );
         }
         // 「実入力が無いのに描いたフレーム」を数える。

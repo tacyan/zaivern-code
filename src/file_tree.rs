@@ -567,6 +567,16 @@ impl FileTree {
     /// キャッシュ済みの各階層をディレクトリ mtime で確認し、外部(エージェント等)で
     /// ファイルが追加・削除・リネームされていたら全キャッシュを破棄する。
     /// 変化があれば true(次フレームの描画でディスクから読み直される)。
+    /// 外部変更の見張り対象 (読んだフォルダ → 憶えている mtime)。
+    ///
+    /// [`refresh_if_changed`](Self::refresh_if_changed) が突き合わせるのと
+    /// **まったく同じ組**を、描画スレッドの外の見張り (`crate::fswatch`) へ
+    /// そのまま渡すために公開する。片方だけ増減すると「見張っているのに
+    /// 気付かない」フォルダができるので、出所は必ずここ 1 つにする。
+    pub fn watch_dirs(&self) -> impl Iterator<Item = (&Path, Option<SystemTime>)> + '_ {
+        self.mtimes.iter().map(|(d, m)| (d.as_path(), *m))
+    }
+
     pub fn refresh_if_changed(&mut self) -> bool {
         let changed = self
             .mtimes

@@ -98,6 +98,65 @@ impl ZaivernApp {
         }
     }
 
+    /// **見張りスレッドの 1 フレームぶん。**
+    ///
+    /// 見張りが「変わった」と言っているなら、`check_external_changes` の
+    /// 1 秒ゲートを開けてから通す。開けないと、直前に別の理由でチェックが
+    /// 走っていた場合にゲートへ捨てられ、**次のフレームを誰も予約しない**ので
+    /// 取り込みがそこで止まる (= 外部変更が画面へ出ない)。
+    pub(super) fn watch_tick(&mut self, ctx: &egui::Context) {
+        let w = self
+            .fswatch
+            .get_or_insert_with(|| crate::fswatch::FsWatch::new(ctx));
+        if w.take_news() {
+            self.ext_check_at = None;
+        }
+    }
+
+    /// **見張りへ「いま何を、どの姿だと思っているか」を置き直す。**
+    ///
+    /// 指紋が変わらないフレームでは 1 バイトも確保しない
+    /// (パスと mtime を舐めて畳むだけ)。置き直しを怠ると、見張りは
+    /// 古い姿と食い違ったままになり 1 秒ごとに起こし続ける。
+    pub(super) fn publish_watch_targets(&mut self) {
+        use crate::fswatch;
+        let Some(w) = self.fswatch.as_mut() else {
+            return;
+        };
+        if !w.active() {
+            return;
+        }
+        // ① 指紋 (確保なし)
+        let mut sig = fswatch::Sig::new();
+        for b in &self.editor.buffers {
+            if let Some(p) = b.path.as_deref() {
+                sig.file(p, b.disk_mtime, b.conflict_notified);
+            }
+        }
+        for (d, m) in self.tree.watch_dirs() {
+            sig.dir(d, m);
+        }
+        // ② 変わったときだけ組み立てる
+        let editor = &self.editor;
+        let tree = &self.tree;
+        w.publish(sig.finish(), || {
+            let mut v: Vec<fswatch::Target> = editor
+                .buffers
+                .iter()
+                .filter_map(|b| {
+                    b.path
+                        .clone()
+                        .map(|p| fswatch::Target::file(p, b.disk_mtime, b.conflict_notified))
+                })
+                .collect();
+            v.extend(
+                tree.watch_dirs()
+                    .map(|(d, m)| fswatch::Target::dir(d.to_path_buf(), m)),
+            );
+            v
+        });
+    }
+
     /// 開いているタブのファイルが外部(エージェント等)で書き換えられていないか
     /// 約1秒ごとに確認する。未保存の編集が無いバッファはディスクの内容へ自動で
     /// 読み直し、編集と競合したバッファは上書きせず一度だけ警告する。
@@ -105,7 +164,7 @@ impl ZaivernApp {
     pub(super) fn check_external_changes(&mut self) {
         let fresh = self
             .ext_check_at
-            .map(|t| t.elapsed().as_millis() < 1000)
+            .map(|t| (t.elapsed().as_millis() as u64) < EXT_CHECK_MS)
             .unwrap_or(false);
         if fresh {
             return;

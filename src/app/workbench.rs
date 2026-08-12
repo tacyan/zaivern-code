@@ -266,7 +266,7 @@ impl ZaivernApp {
         }
         if self
             .autosave_at
-            .map(|t| t.elapsed().as_millis() < 2000)
+            .map(|t| (t.elapsed().as_millis() as u64) < AUTOSAVE_MS)
             .unwrap_or(false)
         {
             return;

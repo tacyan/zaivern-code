@@ -31,6 +31,7 @@ use crate::file_tree::{
 use crate::find_buffer;
 use crate::firewall;
 use crate::follow;
+use crate::fswatch;
 use crate::fuzzy;
 use crate::git;
 use crate::git_panel;
@@ -167,6 +168,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("dialog_windows.rs"),
     include_str!("quick_launch_tests.rs"),
     include_str!("idle_repaint_tests.rs"),
+    include_str!("idle_tag_tests.rs"),
     include_str!("tests.rs"),
     include_str!("wiring_tests.rs"),
     include_str!("super_agent_tests.rs"),
@@ -3708,6 +3710,12 @@ pub struct ZaivernApp {
     rulers: Vec<usize>,
     /// 外部変更チェックの直近実行時刻(約1秒スロットリング)
     ext_check_at: Option<Instant>,
+    /// 外部変更の見張り (描画スレッドの外)。最初のフレームで起こす。
+    ///
+    /// **これが生きているあいだ、家事のための定期フレームは 1 枚も要らない。**
+    /// 見張りは `stat` だけを別スレッドで回し、UI が信じている mtime と
+    /// 食い違ったときにだけ `request_repaint` する (`crate::fswatch`)。
+    pub(super) fswatch: Option<fswatch::FsWatch>,
     keys: Keybinds,
     /// 機能レジストリ由来の打鍵表。**`BindAction` を 1 つも増やさずに**
     /// `Cmd::Feature(id)` を直に指す (`keybinds.rs` が共有の壁にならない)。
@@ -4746,14 +4754,33 @@ fn global_search_panel(
 //   (c) 本当に動いているアニメーション — 持ち主が自分の刻みで予約する
 //   (d) ユーザーに**見える**期限 or 落とせない家事 — それがこの関数
 
+/// 自動保存の刻み ([`ZaivernApp::autosave_tick`] のゲート)。
+///
+/// **期限の計算と同じ定数を使う。** 別々に書くと、片方を直したときに
+/// 「起きたのにまだ期限が来ていない」= 空振りのフレームが増える。
+pub(super) const AUTOSAVE_MS: u64 = 2000;
+/// 外部変更チェックの刻み ([`ZaivernApp::check_external_changes`] のゲート)。
+pub(super) const EXT_CHECK_MS: u64 = 1000;
+/// LSP へ `did_change` を送るまでのデバウンス ([`ZaivernApp::flush_lsp_changes`])。
+pub(super) const LSP_DEBOUNCE_MS: u64 = 250;
+/// 期限つきの家事を予約するときの下限。
+///
+/// 期限が「もう過ぎている」(= 0) ときに `Some(0)` を返すと、家事が
+/// 何かの理由で進まない局面で**毎フレーム予約し直す忙しいループ**になる。
+/// 下限を置けば、進まないときでも 20fps 相当で頭打ちになる。
+const IDLE_TIMER_FLOOR_MS: u64 = 50;
+
 /// フォルダ/ファイルの外部変更を取り込む刻み (フォーカスあり)。
 ///
-/// `check_external_changes` 自身は 1 秒のゲートを持つので、実際の確認は
-/// 「2 秒に 1 回」になる。実測でこの 1 フレームが約 3.3ms — 1 秒刻みだと
-/// アイドルで 0.33%/コアかかり、目標 (0.3%) を割れない。2 秒刻みなら 0.17%。
-/// 外部で書き換えられたファイルの取り込みが最悪 2 秒遅れるだけで、
-/// ウィンドウにフォーカスが戻った瞬間は入力イベントでフレームが回るため、
-/// 「他のエディタで直してから戻る」体験は変わらない。
+/// **これは見張りスレッドを起こせなかった環境の後退経路である。**
+/// 通常は `crate::fswatch` が別スレッドで `stat` し、UI が信じている姿と
+/// 食い違ったときにだけ 1 枚起こすので、ここの刻みは使われない。
+///
+/// なぜ降ろしたか: `check_external_changes` の中身は数十回の `stat`
+/// (実測 20 パスで約 12µs) にすぎないのに、それを UI スレッドでやるために
+/// **egui のフレームを丸ごと 1 枚 (実測 約 3.3ms)** 回していた。
+/// 2 秒刻みでも 0.17%/コアで、画面は 1px も変わらない。
+/// 見張りを別スレッドへ出すと、この 0.17% がまるごと消える。
 const IDLE_HOUSEKEEP_MS: u64 = 2000;
 /// 同上・背面に回っているとき。見ていない画面の鮮度は落として良い。
 const IDLE_BACKGROUND_MS: u64 = 6000;
@@ -4778,10 +4805,22 @@ pub struct IdleSignals {
     pub awaiting: bool,
     /// 走っているエージェントが 1 本以上ある
     pub agents_running: bool,
-    /// 外部での書き換えを見張る対象がある (開いているファイル / フォルダ)
+    /// **定期フレームで**外部の書き換えを見張る必要がある。
+    ///
+    /// 見張りスレッド (`crate::fswatch`) が生きていれば `false` —
+    /// `stat` は別スレッドが回し、変化があったときにだけ起こしてくる。
+    /// スレッドを起こせなかった環境だけ `true` になり、従来どおり
+    /// [`IDLE_HOUSEKEEP_MS`] の刻みで UI スレッドが見張る。
     pub watching_files: bool,
-    /// 期限を持つ家事がある (自動保存・interval プラグイン)
-    pub timers_due: bool,
+    /// **期限を持つ家事が、あと何 ms で来るか。** 無ければ `None`。
+    ///
+    /// 以前は `timers_due: bool` で、真なら [`IDLE_HOUSEKEEP_MS`] (2 秒) の
+    /// 刻みで回していた。**これが最大の常時再描画源だった** —
+    /// 同梱プラグイン `usage-meter` の interval フックは **900 秒**に 1 回で
+    /// よいのに、その期限を見張るためだけにアイドルで 2 秒ごとに 1 枚
+    /// 描いていた (実測: 出所タグ `idle.timers`)。
+    /// 期限そのものを渡せば、**その 1 枚まで寝られる**。
+    pub timer_due_in_ms: Option<u64>,
     /// ウィンドウがフォーカスされている
     pub focused: bool,
     /// ウィンドウが見えている (最小化されていない)
@@ -4812,17 +4851,62 @@ pub fn idle_repaint_ms(s: IdleSignals) -> Option<u64> {
         });
     }
     // ④ ここから下は「何も起きていない」。落とせない家事が無ければ 1 枚も描かない
-    if !(s.watching_files || s.timers_due) {
+    if !s.watching_files && s.timer_due_in_ms.is_none() {
         return None;
     }
-    Some(if !s.visible {
+    let housekeep = if !s.visible {
         IDLE_HIDDEN_MS
     } else if s.focused || s.had_input {
         IDLE_HOUSEKEEP_MS
     } else {
         IDLE_BACKGROUND_MS
+    };
+    let timer = s.timer_due_in_ms.map(|t| t.max(IDLE_TIMER_FLOOR_MS));
+    Some(match (s.watching_files, timer) {
+        // 見張りを UI スレッドで回すしかない環境。期限がそれより近ければ寄せる
+        (true, Some(t)) => housekeep.min(t),
+        (true, None) => housekeep,
+        // **家事の期限だけ。そこまで寝る。** 900 秒後のフックのために
+        // 2 秒ごとに描いていたのをやめるのが、この版の主眼
+        (false, Some(t)) => t,
+        // ③ の手前で弾いてあるので来ない
+        (false, None) => housekeep,
     })
 }
+
+/// [`idle_repaint_ms`] が `Some` を返した**理由**。`perf::dump` の出所タグ。
+///
+/// `idle_repaint_ms` と**同じ優先順位**で降りる純関数。1 本のタグ
+/// (`"schedule_idle_repaint"`) だけだと「アプリが定期フレームを回している」
+/// までしか分からず、犯人 (待ち / エージェント / 家事 / 期限つきの家事) を
+/// 逆算するのに `IdleSignals` の組み立てを読む必要があった。
+/// `pet::repaint_tag` が状態まで割っているのと同じ考え方。
+///
+/// 順位がずれたら `idle_tag_tests::予約する理由とタグが必ず一致する` が落ちる
+/// (2 つの関数を別々に直すと静かに嘘をつくため、全 256 通りで突き合わせる)。
+pub fn idle_repaint_tag(s: IdleSignals) -> &'static str {
+    if s.awaiting {
+        return "idle.awaiting";
+    }
+    if s.animating {
+        // ここへは来ない (`idle_repaint_ms` が None を返す) が、
+        // 順位を写している以上、抜けを作らない
+        return "idle.animating";
+    }
+    if s.agents_running {
+        return "idle.agents";
+    }
+    if s.watching_files {
+        return "idle.watch";
+    }
+    if s.timer_due_in_ms.is_some() {
+        return "idle.timers";
+    }
+    "idle.none"
+}
+
+#[cfg(test)]
+mod idle_tag_tests;
 
 #[cfg(test)]
 mod quick_launch_tests;

@@ -113,6 +113,9 @@ impl ZaivernApp {
             bracket_colorization: cfg.bracket_colorization,
             rulers: normalize_rulers(&cfg.rulers),
             ext_check_at: None,
+            // ここでは `egui::Context` を持てない (`new` はフレームの外)。
+            // 最初の `watch_tick` で起こす。
+            fswatch: None,
             keys: Keybinds::from_overrides(&cfg.keybindings),
             feature_keys: crate::keybinds::FeatureBinds::from_overrides(&cfg.keybindings),
             theme,

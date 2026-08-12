@@ -170,7 +170,7 @@ impl ZaivernApp {
         let ready: Vec<PathBuf> = self
             .lsp_pending
             .iter()
-            .filter(|(_, (_, at, _))| at.elapsed().as_millis() >= 250)
+            .filter(|(_, (_, at, _))| (at.elapsed().as_millis() as u64) >= LSP_DEBOUNCE_MS)
             .map(|(p, _)| p.clone())
             .collect();
         for p in ready {
