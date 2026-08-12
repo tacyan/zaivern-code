@@ -9,15 +9,18 @@
 //! [`crate::config::apply_runtime_flags`] が 1 か所で行う
 //! (通知モジュールは依存を持たない層なので、設定を読む経路を持ち込まない)。
 //!
-//! **パレット項目は置いていない。** 機能側から `ZaivernApp` のフィールドへは
-//! 触れないので、パレットから切り替えても `app.cfg` が古いままになり、
-//! 設定画面のチェックが嘘を表示する。到達経路は設定画面 1 つに絞ってある
-//! (「同じ操作への到達経路が 3 つあるなら 2 つ削る」)。トースト付きで
-//! パレットからも切り替えたくなったら、`app.rs` 側に
-//! `pub(crate) fn set_notifications_enabled(&mut self, on: bool)` を置いて
-//! ここから呼ぶ — それが `set_blame_mode` と同じ作法。
+//! **切り替えは `app.rs` の glue 越しに行う。** 機能側から `ZaivernApp` の
+//! フィールドを直接触ると `app.cfg` が古いまま残り、設定画面のチェックが
+//! 嘘を表示する。そこで [`crate::app::ZaivernApp::set_notify_sound`] を
+//! 呼ぶ — 設定画面が使うのと**同じ書き戻し経路** (`config.toml` への保存と
+//! `apply_runtime_flags` まで) を通るので、どこから切り替えても状態が 1 つに保たれる。
+//!
+//! 到達経路は 2 つ: 設定画面 (⚙) の行と、ペットメニュー / パレットの
+//! 「🔔 通知音」。**同じ真実源 (`KEY_SOUND`) を指しているので増やしても嘘が出ない**
+//! (削るべきなのは「別々の状態を持つ重複」であって、同じ 1 つの設定への
+//! 近道ではない)。
 
-use crate::feature::{Feature, Setting, SettingValue};
+use crate::feature::{Entry, Feature, Setting, SettingValue};
 
 /// 通知を出すかどうかの設定キー。**既定はオン** (いままでの挙動)。
 ///
@@ -35,8 +38,27 @@ pub const KEY_ENABLED: &str = "notifications.enabled";
 /// 観測できない (到達経路は設定画面の 2 行だけで、パレットには出さない)。
 pub const KEY_SOUND: &str = "notifications.sound";
 
+/// 通知音を切り替える [`Entry::id`]。ペットメニューからも直に指す。
+pub const ID_TOGGLE_SOUND: &str = "notifications.toggle_sound";
+
 pub const FEATURE: Feature = Feature {
     module: "notifications",
+    entries: &[Entry {
+        icon: "🔔",
+        label: "通知音のオン/オフ",
+        id: ID_TOGGLE_SOUND,
+    }],
+    dispatch: |app, ctx, id| {
+        if id != ID_TOGGLE_SOUND {
+            return false;
+        }
+        // いまの値は**設定から読む** (`notify::sound()` の旗ではなく)。
+        // 旗は設定から一方通行で写した派生値なので、書き戻す側がそちらを
+        // 真実源に使うと向きが循環する。
+        let now = app.notify_sound_enabled();
+        app.set_notify_sound(!now, ctx);
+        true
+    },
     settings: &[
         Setting {
             key: KEY_ENABLED,

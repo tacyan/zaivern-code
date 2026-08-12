@@ -14776,8 +14776,27 @@ impl ZaivernApp {
                 cmds.push(Cmd::TogglePetSleep);
             }
             let mut sounds = self.cfg.pet_sounds;
-            if ui.checkbox(&mut sounds, tr("🔔 効果音")).clicked() {
+            if ui
+                .checkbox(&mut sounds, tr("🔔 効果音"))
+                .on_hover_text(tr("ペット自身の音 (ホップ等)。通知音とは別です"))
+                .clicked()
+            {
                 cmds.push(Cmd::TogglePetSounds);
+            }
+            // 通知音は `Config` の機能設定 (notifications.sound) が真実源。
+            // ここは設定画面 (⚙) の行への近道であって、別の状態ではない
+            // (`set_notify_sound` が同じ書き戻し経路を通る)。
+            let mut notify_sound = self.notify_sound_enabled();
+            if ui
+                .checkbox(&mut notify_sound, tr("🔊 通知音"))
+                .on_hover_text(tr(
+                    "OS 通知に音を付けるか。⚙ 設定の「通知音を鳴らす」と同じ設定です",
+                ))
+                .clicked()
+            {
+                cmds.push(Cmd::Feature(
+                    crate::features::notifications::ID_TOGGLE_SOUND,
+                ));
             }
             let mut bubbles = self.cfg.pet_bubbles;
             if ui.checkbox(&mut bubbles, tr("💬 承認バブル")).clicked() {
@@ -34781,6 +34800,34 @@ impl ZaivernApp {
             self.toast_warn(e);
         }
         self.apply_config_to_ui(ctx);
+    }
+
+    /// いま通知音を鳴らす設定か。**真実源は `Config`** (`notify::sound()` の
+    /// 旗は設定から一方通行で写した派生値なので、書き戻す側はこちらを読む)。
+    pub(crate) fn notify_sound_enabled(&self) -> bool {
+        self.cfg
+            .feature_bool(crate::features::notifications::KEY_SOUND)
+    }
+
+    /// 通知音のオン/オフ。**設定画面 (⚙) と同じ書き戻し経路を通る** —
+    /// `config.toml` への保存と `apply_runtime_flags` まで含む。
+    /// ペットメニュー・パレット・設定画面のどこから変えても状態が 1 つに保たれる。
+    pub(crate) fn set_notify_sound(&mut self, on: bool, ctx: &egui::Context) {
+        self.apply_settings(
+            vec![(
+                crate::features::notifications::KEY_SOUND,
+                config::SettingValue::Bool(on),
+            )],
+            ctx,
+        );
+        self.toast(
+            if on {
+                tr("🔔 通知音を有効にしました")
+            } else {
+                tr("🔕 通知音を無効にしました")
+            },
+            true,
+        );
     }
 
     /// 設定値を「いま見えているもの」へ効かせる。
