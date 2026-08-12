@@ -73,6 +73,17 @@ concurrency:
 permissions:
   contents: read
 
+# **test.yml と 1 文字も違えないこと。** 下のジョブは rust-cache の
+# `shared-key: test-<os>` で test.yml の fast / pty とキャッシュを共有するが、
+# RUSTFLAGS が違うと成果物の fingerprint が変わるので、共有どころか
+# **互いに上書きし合って毎回フルビルド**になる。
+# (ここに env が無かった間、shapes ジョブのコメントは「同じ RUSTFLAGS なので
+#  再利用できる」と書いていたが、実際には test.yml だけが -C debuginfo=0 を
+#  持っていて成立していなかった。)
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C debuginfo=0
+
 jobs:
   # ── 3 OS で素の git の挙動を測る (cargo 不要 = 速い) ────────────────
   #
@@ -109,13 +120,13 @@ jobs:
           git config --show-scope --get-all core.autocrlf || echo "(未設定)"
           git config --global core.autocrlf input
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # `tools/merge-band-probe.sh` は `python3` を直に呼ぶ (このジョブの
       # 担当外のファイルなので直していない)。windows-latest の git-bash では
       # `python3` が Microsoft Store のスタブに化けることがあるので、
       # **確実に実体を置く**。ubuntu / macOS では既に入っているぶんを拾うだけ。
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.x"
 
@@ -143,7 +154,7 @@ jobs:
         shell: bash
         run: sh tools/merge-band-probe.sh --mode pairs
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: xplat-probe-${{ matrix.os }}
@@ -183,7 +194,7 @@ jobs:
           git --version
           python3 --version
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # コンテナ内は root で走るので、checkout したツリーの所有者が
       # runner と食い違って `dubious ownership` になる。プローブは自分で
@@ -197,7 +208,7 @@ jobs:
       - name: 帯の反証 (merge-band-probe --mode pairs)
         run: sh tools/merge-band-probe.sh --mode pairs
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: xplat-probe-debian-${{ matrix.base }}
@@ -229,20 +240,25 @@ jobs:
         shell: bash
         run: git config --global core.autocrlf input
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # `tools/anyrepo-prove.sh` は python3 が無いと 1 行も走らない
       # (乱数種から決まる担当表を実装非依存に固定するため)。
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.x"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA 固定すると github.action_ref が SHA になり、既定の toolchain を
+      # ref 名から拾えなくなる。**toolchain: を必ず明示する**
+      # (書き忘れるとツールチェーン解決に失敗してジョブが落ちる)。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
 
       # test.yml の fast / pty と同じ shared-key を読む。同じ RUSTFLAGS /
       # プロファイルなので依存クレートのビルドはそのまま再利用でき、
       # このジョブが増やすのは zai 本体のリンクだけ。
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -267,9 +283,193 @@ jobs:
           sh tools/anyrepo-prove.sh --shapes --writers 4 --overlap 1.0 --json \
             > "shapes-${{ matrix.os }}.json"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: xplat-shapes-${{ matrix.os }}
           path: shapes-*.json
           if-no-files-found: warn
+
+  # ══ ここから下は「重い証明とベンチ」= 週次 + 手動だけ ═══════════════════
+  #
+  # **毎 PR では回さない。** どれも `cargo build --bin zai` (実測 3m24s) を
+  # 前提にしたうえで実際の `git merge` を数百回撃つので、5 分予算 (wall-clock)
+  # に入らない。日常の担保は安いほうへ寄せてある:
+  #
+  #   * tools/*.sh の構文 + shellcheck → test.yml の installers (実測 1 秒未満)
+  #   * 証明 240 ケース                → test.yml の fast (coedit::tests::実gitで証明)
+  #   * 素の git の帯                  → 上の probe (--mode pairs)
+  #
+  # ここが持つのは、その**網羅版と実測版**である。
+
+  # `zai czero` が言う 4 段の守りを、リポジトリの**形ごとに実際に起こして**測る。
+  # doctor の ✅ を成功と数えず、起きたことだけを見る (docs/conflict-zero.md §3.11.5)。
+  # 3 OS で回すのは sparse-checkout / LFS / hooks / 読み取り専用の振る舞いが
+  # OS ごとに違うため — ここを 1 台に減らすと測る意味がほとんど消える。
+  repo-shapes:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: repo shapes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      # probe / shapes と同じ理由。`.sh` が CRLF で降りると git-bash が実行できない。
+      - name: 改行を LF に固定 (Windows のみ)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-${{ matrix.os }}
+          cache-on-failure: true
+
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      # ハーネスは cargo を 1 度も呼ばない。**先に作っておく必要がある**
+      # (古い zai を掴むと「実装したのに直っていない」という嘘の結果が出るので、
+      #  ハーネス側が mtime を見て Stale を弾く)。
+      - name: zai を作る
+        run: cargo build --bin zai --locked
+
+      # **本物の ~/.zaivern に触らせない。** ハーネス自身も差し替えるが二重に張る。
+      - name: 形ごとの 4 段 (repo-shapes-prove)
+        shell: bash
+        env:
+          ZAIVERN_HOME: ${{ runner.temp }}/zaivern-home
+        run: |
+          mkdir -p "$ZAIVERN_HOME"
+          sh tools/repo-shapes-prove.sh --json > "repo-shapes-${{ matrix.os }}.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: xplat-repo-shapes-${{ matrix.os }}
+          path: repo-shapes-*.json
+          if-no-files-found: warn
+
+  # 鎖① (配る前の分割) と鎖④ (共有面の自動解決) を端から端まで実測する。
+  # ubuntu 1 台だけなのは、測っているのが**配り方と併合ドライバの効き**で、
+  # OS 差はここでは効かないため (OS 差は上の probe / repo-shapes が持つ)。
+  #
+  # ローカル実測 (macOS, 他エージェントと同時実行の上限値):
+  #   zai のビルド 203.9s + 鎖① 44.0s + 鎖④ 178.7s = 約 7 分。
+  #   ランナーはこれより遅いので timeout は 3 倍ほど取ってある。
+  chains:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: chains (1 分割 / 4 共有面)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-ubuntu-latest
+          cache-on-failure: true
+
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: zai を作る
+        run: cargo build --bin zai --locked
+
+      # 鎖① — 分割を通さない naive と、coordinator を通した coord を
+      # **同じ担当表・同じ種**で並べる。二重書きが 1 件でもあればその段は失格。
+      - name: 鎖① 配る前の分割 (coordinator-bench)
+        shell: bash
+        env:
+          ZAIVERN_HOME: ${{ runner.temp }}/zaivern-home-1
+        run: |
+          mkdir -p "$ZAIVERN_HOME"
+          sh tools/coordinator-bench.sh --json > chain1-coordinator.json
+
+      # 鎖④ — このリポジトリ自身の実際の共有面 (src/config.rs / src/keybinds.rs) と、
+      # 「src/features/ を新規作成するだけ」という構造的な解を同じ土俵で並べる。
+      - name: 鎖④ 共有面の自動解決 (shared-surface-bench)
+        shell: bash
+        env:
+          ZAIVERN_HOME: ${{ runner.temp }}/zaivern-home-4
+        run: |
+          mkdir -p "$ZAIVERN_HOME"
+          sh tools/shared-surface-bench.sh --json > chain4-shared-surface.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: xplat-chains
+          path: chain*.json
+          if-no-files-found: warn
+
+  # 証明の**網羅版**。fast は既定の 120 ケースを 3 OS で回す (回帰の番人)。
+  # こちらは同じ検査を 2400 ケース (`region::exhaustive_scale(120, 2400)`) へ
+  # 広げて**反証しに行く**。
+  # 注意: src/coedit.rs の doc コメントは「既定 240」と書いているが、
+  # 実装は 120 である (docs 側がずれている。src は別の担当なのでここでは直さない)。
+  # ubuntu 1 台なのは、素の git の OS 差は上の probe が 3 OS + debian 系で
+  # 持っているため。ここで見たいのはケース数であって OS ではない。
+  proof-exhaustive:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: proof (2400 ケース)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-ubuntu-latest
+          cache-on-failure: true
+
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
+
+      # ■ `--exact` と「1 件走ったか」の検査を必ず付けること。
+      #   `cargo test <filter>` は **1 件も当たらなくても終了コード 0** を返す。
+      #   実際にここを `coedit::tests::実gitで証明` と書いていて
+      #   「running 0 tests / 4739 filtered out」で**緑になった**
+      #   (CLAUDE.md: 計測コマンドが本当に走ったかを、結果を読む前に確かめる)。
+      #   名前を変えたら黙って何も検査しなくなるので、件数で fail-closed にする。
+      - name: 実 git で 2400 ケース
+        env:
+          ZAIVERN_PROOF_EXHAUSTIVE: "1"
+          ZAIVERN_HOME: ${{ runner.temp }}/zaivern-home
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZAIVERN_HOME"
+          out=$(cargo test --locked --bin zai \
+            'features::coedit::imp::tests::実gitで証明の見逃しが1件も無いことを網羅的に確かめる' \
+            -- --exact --nocapture 2>&1)
+          echo "$out"
+          if ! echo "$out" | grep -q '1 passed'; then
+            echo "::error::証明のテストが 1 件も走っていない (名前が変わった可能性)"
+            exit 1
+          fi
