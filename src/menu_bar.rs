@@ -162,7 +162,7 @@ pub struct MenuInfo {
     /// ブレッドクラム (表示メニューのチェック状態)
     pub breadcrumbs: bool,
     /// ガターの git blame 表示 (表示メニューのチェック状態)
-    pub git_blame: bool,
+    pub git_blame: crate::config::BlameMode,
     /// アクティブなエディタタブがあるか (編集系メニューの有効/無効)
     pub has_editor: bool,
     /// エディタが分割されているか (分割の解除・ペイン移動の有効/無効)

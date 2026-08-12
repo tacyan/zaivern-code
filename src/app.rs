@@ -23537,7 +23537,15 @@ impl ZaivernApp {
         let (blame_plan, blame_now) = match blame.as_ref() {
             Some((key, map)) => {
                 let max = git::blame_gutter_cols(ui.available_width(), char_w);
-                self.blame.column_plan(key, map, git::unix_now(), max)
+                self.blame.column_plan(
+                    key,
+                    map,
+                    git::unix_now(),
+                    git::BlameFit {
+                        max_cols: max,
+                        single_line: blame_only_line.is_some(),
+                    },
+                )
             }
             None => (git::BlameColumnPlan::HIDDEN, 0),
         };
@@ -32432,7 +32440,7 @@ impl ZaivernApp {
             show_whitespace: self.cfg.show_whitespace,
             minimap: self.cfg.minimap,
             breadcrumbs: self.cfg.breadcrumbs,
-            git_blame: self.cfg.git_blame.is_on(),
+            git_blame: self.cfg.git_blame,
             has_editor: self.editor.active.is_some(),
             editor_split: self.panes.is_split(),
             has_file: active_path.is_some(),
