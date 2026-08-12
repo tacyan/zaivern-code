@@ -3278,12 +3278,24 @@ mod tests {
     fn 本物の不正バイトは置換して先へ進む() {
         let mut d = StreamDecoder::default();
         let got = d.feed(&[0xff, 0xfe, b'o', b'k']);
+        // どの OS でも成り立つ不変条件は 3 つ
         assert!(got.ends_with("ok"), "後続の正しい文字は出ること: {got:?}");
+        assert_eq!(d.carry_len(), 0, "不正バイトを持ち越してはいけない");
+        assert!(
+            got.chars().count() > 2,
+            "不正バイトを黙って捨ててはいけない: {got:?}"
+        );
+        // **置換文字になるかは OS で変わる。** `decode_output` は本物の不正バイトを
+        // `decode_ansi_or_lossy(bytes, console_code_page())` へ送るので、
+        // Windows では**コンソールのコードページで復号され**、置換文字にならない
+        // (CP437 なら 0xFF/0xFE は罫線記号になる)。これは仕様どおりの分岐なので、
+        // 置換文字を要求するのは非 Windows だけにする。
+        // 「OS で分岐する既定値は、テストも OS 条件を明示する」(CLAUDE.md)。
+        #[cfg(not(windows))]
         assert!(
             got.contains('\u{fffd}'),
             "不正バイトは置換されること: {got:?}"
         );
-        assert_eq!(d.carry_len(), 0, "不正バイトを持ち越してはいけない");
     }
 
     /// 先頭バイトだけ来て続きが来ないまま流れが終わったら、黙って捨てずに置換する
