@@ -4363,5 +4363,184 @@ mod tests {
         assert!(reg.contains("#[path = \"../union.rs\"]"), "実体の引き込みが無い");
         assert!(reg.contains("pub use imp::{cli_main, FEATURE};"), "再エクスポートが無い");
     }
+
+    // ── 実物の共有面に対する自動判定の現状を固定する ──
+
+    /// `--auto` (マーカ無しの自動判定) が、**このリポジトリ自身の共有面**を
+    /// 一覧として認識するかどうか。
+    ///
+    /// `tools/shared-surface-bench.sh` の実測では、`src/config.rs` /
+    /// `src/keybinds.rs` へ `--auto` を挿してもハンクは 1 つも減らなかった
+    /// (ドライバは呼ばれている = 配管は繋がっている。**自分で降りている**)。
+    /// その理由がここに固定してある: [`detect`] はファイル全体を見るので、
+    /// 6900 行の `config.rs` や 3000 行の `keybinds.rs` は「一覧」に見えない。
+    ///
+    /// **これは失敗ではなく、安全側に倒した設計どおりの「解決しない」**である。
+    /// 一覧に見えないファイルを勝手に両側マージすると、順序に意味がある
+    /// コードを黙って壊す。変わったら数字も変わるので、ここで気付ける。
+    /// `--auto` (マーカ無しの自動判定) が、**このリポジトリ自身の共有面**へ
+    /// どこまで届くか。`tools/shared-surface-bench.sh` の union-auto の行が
+    /// baseline と同数になる理由がここに固定してある。
+    ///
+    /// 実測 (2026-08-12 / HEAD 85a350e):
+    ///
+    /// | 追記先 | 一覧に見えるか | 追記行が塊の内側か | `--auto` で解けるか |
+    /// | --- | --- | --- | --- |
+    /// | `struct Config` の末尾 | Bracket・79 塊 | **外側** | 解けない |
+    /// | `impl Default` の末尾 | 同上 | 内側 | **解けない** |
+    /// | `enum BindAction` の末尾 | Bracket・15 塊 | **外側** | 解けない |
+    /// | `ALL_ACTIONS` の末尾 | 同上 | 内側 | **解ける** |
+    ///
+    /// **4 箇所のうち解けるのは 1 箇所だけ**で、しかも `cli_main` は
+    /// 1 つでも衝突が残るとファイルごと git へ降りる
+    /// (`auto_only && res.has_conflict()`)。だから 1 箇所解けても
+    /// ベンチのハンク数は 1 つも減らない。
+    ///
+    /// 外側になる理由は `flat_bodies` が**連続した宣言行**しか塊にしないため。
+    /// 実物の `struct Config` は末尾フィールドの直前に doc コメントと
+    /// `#[serde(...)]` が挟まるので、閉じ括弧の手前は塊の外になる。
+    /// `impl Default` は内側なのに解けない — 塊の内側であることは
+    /// **必要条件であって十分条件ではない**。
+    /// **これは失敗ではなく、安全側に倒した設計どおりの「解決しない」**である。
+    #[test]
+    fn 実物の共有面で自動判定がどこまで届くか() {
+        let auto = UnionOpts {
+            auto: true,
+            ..UnionOpts::default()
+        };
+        let mut facts: Vec<String> = Vec::new();
+        for (name, text, start, end, line1, line2) in real_surface_cases() {
+            let ours = insert_before_end(text, start, end, &line1);
+            let theirs = insert_before_end(text, start, end, &line2);
+            let b = split_lines(text);
+            let plan = detect_lines(&b);
+            let at = anchor_index(text, start, end);
+            let inb = plan
+                .as_ref()
+                .map(|p| p.blocks.iter().any(|(s, l)| at >= *s && at < s + l))
+                .unwrap_or(false);
+            facts.push(format!(
+                "{name}: {:?} ブロック{} 追記行{at} 内側{inb} auto{} 衝突{}",
+                plan.as_ref().map(|p| p.kind),
+                plan.as_ref().map(|p| p.blocks.len()).unwrap_or(0),
+                auto_applies(text, &ours, &theirs),
+                resolve(text, &ours, &theirs, &auto).has_conflict(),
+            ));
+        }
+        // **行番号まで固定する。** ずれたら共有面の形が変わった合図で、
+        // そのときは `tools/shared-surface-bench.sh` を測り直す必要がある。
+        assert_eq!(
+            facts.join("\n"),
+            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック15 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック15 追記行298 内側true autotrue 衝突false",
+            "共有面の形が変わりました。tools/shared-surface-bench.sh を測り直してください"
+        );
+    }
+
+    /// 追記が入る行 (= 終端行) の番号。
+    fn anchor_index(text: &str, start: &str, end: &str) -> usize {
+        let mut seen = false;
+        for (i, line) in text.split_inclusive('\n').enumerate() {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            if !seen && bare.starts_with(start) {
+                seen = true;
+                continue;
+            }
+            if seen && bare == end {
+                return i;
+            }
+        }
+        usize::MAX
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn real_surface_cases() -> Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        String,
+        String,
+    )> {
+        let cfg = include_str!("config.rs");
+        let kb = include_str!("keybinds.rs");
+        vec![
+            (
+                "config.rs/struct",
+                cfg,
+                "pub struct Config {",
+                "}",
+                "    pub bench_opt_1: bool,".to_string(),
+                "    pub bench_opt_2: bool,".to_string(),
+            ),
+            (
+                "config.rs/default",
+                cfg,
+                "impl Default for Config {",
+                "        }",
+                "            bench_opt_1: false,".to_string(),
+                "            bench_opt_2: false,".to_string(),
+            ),
+            (
+                "keybinds.rs/enum",
+                kb,
+                "pub enum BindAction {",
+                "}",
+                "    BenchAct1,".to_string(),
+                "    BenchAct2,".to_string(),
+            ),
+            (
+                "keybinds.rs/array",
+                kb,
+                "pub const ALL_ACTIONS: [BindAction; ",
+                "];",
+                "    BindAction::BenchAct1,".to_string(),
+                "    BindAction::BenchAct2,".to_string(),
+            ),
+        ]
+    }
+
+    /// ハーネス (`tools/shared-surface-bench.sh`) と同じ差し込み方。
+    fn insert_before_end(text: &str, start: &str, end: &str, ins: &str) -> String {
+        let mut out = String::with_capacity(text.len() + ins.len() + 1);
+        let (mut seen, mut done) = (false, false);
+        for line in text.split_inclusive('\n') {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            if !seen && bare.starts_with(start) {
+                seen = true;
+                out.push_str(line);
+                continue;
+            }
+            if seen && !done && bare == end {
+                out.push_str(ins);
+                out.push('\n');
+                done = true;
+            }
+            out.push_str(line);
+        }
+        assert!(done, "錨が見つかりません: {start} / {end}");
+        out
+    }
+
+    /// 一方で、**マーカで囲めば**同じ形の一覧が解決できること。
+    /// ベンチの `union-marked` が 0 ハンクになる根拠。
+    #[test]
+    fn マーカで囲めば周りに別の中身があっても追記が両方残る() {
+        let head = "// 上に何百行もの別の中身がある\nfn other() {}\n";
+        let base = format!(
+            "{head}pub struct Config {{\n    // zaivern:union-begin\n    pub theme: String,\n    // zaivern:union-end\n}}\n"
+        );
+        let ours = base.replace(
+            "    // zaivern:union-end",
+            "    pub bench_opt_1: bool,\n    // zaivern:union-end",
+        );
+        let theirs = base.replace(
+            "    // zaivern:union-end",
+            "    pub bench_opt_2: bool,\n    // zaivern:union-end",
+        );
+        let r = resolve(&base, &ours, &theirs, &opts());
+        assert!(!r.has_conflict(), "{}", r.text());
+        assert!(r.text().contains("bench_opt_1"));
+        assert!(r.text().contains("bench_opt_2"));
+    }
 }
 
