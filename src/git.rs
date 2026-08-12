@@ -1198,9 +1198,9 @@ pub struct Blame {
     failed: std::collections::HashSet<BlameKey>,
     /// 実行中のジョブ (同時に 1 本だけ)。
     job: Option<(BlameKey, Receiver<Option<Vec<BlameLine>>>)>,
-    /// ガター欄の描画計画 (ブロック, 上限桁, 立てた時刻, 計画)。
+    /// ガター欄の描画計画 (ブロック, 制約, 立てた時刻, 計画)。
     /// **毎フレーム blame マップを全走査しない**ためのキャッシュ。
-    plan: Option<(BlameKey, usize, i64, BlameColumnPlan)>,
+    plan: Option<(BlameKey, BlameFit, i64, BlameColumnPlan)>,
 }
 
 impl Blame {
@@ -3391,16 +3391,25 @@ fn blame_label_raw(
 /// * 著者が 1 人しか居ないブロックでは**著者名を出さない**。全行に同じ文字列が
 ///   並ぶだけで情報量がゼロだから (実際に 5106 行すべてに `T` が並んで
 ///   「離れすぎていて見づらい」と報告された)。相対日時だけを残す。
+/// * ただし **1 行しか描かないとき (`single_line`) は落とさない**。落とす理由は
+///   「同じ文字列が縦に並ぶ」ことなので、1 行きりの表示には当てはまらない。
+///   `BlameMode::Current` はカーソル行だけを描くのに、計画は 16 行帯から
+///   立てるため、帯の著者が 1 人だと必ず「3 日前」しか残らなかった。
+///   GitLens が評価されているのは「**誰が・いつ**」が 1 行で分かるからで、
+///   ここで著者を落とすと 3 段にした価値そのものが消える。
 /// * 列幅は**実際に描くラベルの最大幅**。22 桁を無条件に確保しない。
 /// * 出すものが何も無ければ `cols == 0` = 列ごと消える。
 ///
 /// `entries` は `(著者, 未コミットか, author-time)`。判定は max と集合しか
 /// 使わないので**順序に依らない** = `HashMap` の値をそのまま渡してよく、
 /// 同じブロックからは常に同じ計画が出る (スクロールで列幅が揺れない)。
+/// `single_line` でも `entries` は**帯全体**を渡す — 列幅を 1 行から決めると
+/// カーソルを動かすたびにガター幅が動く (画面が突然変わる) ため。
 pub fn blame_column_plan(
     entries: &[(&str, bool, i64)],
     now: i64,
     max_cols: usize,
+    single_line: bool,
 ) -> BlameColumnPlan {
     if entries.is_empty() || max_cols == 0 {
         return BlameColumnPlan::HIDDEN;
@@ -3416,7 +3425,8 @@ pub fn blame_column_plan(
     // 広い順に試し、**最初に収まったもの**を採る。
     // 著者が複数いるときは「誰が」が信号なので、幅が足りなければ
     // 日時ではなくイニシャルを残す (それも同じ文字になるなら日時へ)。
-    let ladder: &[BlameLabelKind] = if authors.len() >= 2 {
+    // 1 行だけ描くときも同じ梯子 — 縦に並ばない以上、著者名は冗長ではない。
+    let ladder: &[BlameLabelKind] = if authors.len() >= 2 || single_line {
         &[
             BlameLabelKind::AuthorAndTime,
             BlameLabelKind::Initials,
@@ -3444,7 +3454,9 @@ pub fn blame_column_plan(
         }
         // イニシャルは**行ごとに違う**ときしか情報にならない。
         // 全行同じ 1 文字 = 情報量ゼロ = このバグの正体そのもの。
-        if kind == BlameLabelKind::Initials {
+        // 1 行だけ描くときは「隣の行と同じ」が起こらないので、この検査は要らない
+        // (ここで弾くと狭い窓の `Current` から「誰が」が消える)。
+        if kind == BlameLabelKind::Initials && !single_line {
             labels.sort_unstable();
             labels.dedup();
             if labels.len() < 2 {
@@ -3490,10 +3502,35 @@ pub fn blame_row_label(
 /// 計画を立て直す間隔 (秒)。相対日時の最小単位が 1 分なので、この程度で十分。
 const BLAME_PLAN_REFRESH: i64 = 30;
 
+/// [`Blame::column_plan`] へ渡す制約。
+///
+/// `usize` (桁数だけ) からも作れるので、**桁数しか渡さない呼び出しは
+/// 「ブロックを丸ごと描く」= 全行表示**として扱う (従来の挙動)。
+/// カーソル行だけを描く段 (`BlameMode::Current`) は `single_line: true` を
+/// 渡すこと — 渡さないと帯の著者が 1 人のときに著者名が落ちて
+/// 「3 日前」しか残らない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlameFit {
+    /// 列に許す最大桁数 ([`blame_gutter_cols`] の結果)。
+    pub max_cols: usize,
+    /// この計画で**実際にラベルを描くのが 1 行だけ**か。
+    /// 列幅は帯全体から決めるので、真にしても幅は揺れない。
+    pub single_line: bool,
+}
+
+impl From<usize> for BlameFit {
+    fn from(max_cols: usize) -> Self {
+        Self {
+            max_cols,
+            single_line: false,
+        }
+    }
+}
+
 impl Blame {
     /// 表示中ブロックの描画計画を返す (**キャッシュ付き**)。
     ///
-    /// ブロック (`key`) と列の上限 (`max_cols`) が変わらない限り、
+    /// ブロック (`key`) と制約 (`fit`) が変わらない限り、
     /// `BLAME_PLAN_REFRESH` 秒に 1 回しか blame マップを走査しない
     /// (= アイドル時のコストはゼロ)。ブロック内をスクロールしても計画は
     /// 同じものが返るので、**列幅が揺れない**。
@@ -3504,11 +3541,12 @@ impl Blame {
         key: &BlameKey,
         map: &BlameMap,
         now: i64,
-        max_cols: usize,
+        fit: impl Into<BlameFit>,
     ) -> (BlameColumnPlan, i64) {
-        if let Some((k, mc, at, plan)) = self.plan.as_ref() {
+        let fit = fit.into();
+        if let Some((k, f, at, plan)) = self.plan.as_ref() {
             if k == key
-                && *mc == max_cols
+                && *f == fit
                 && now.saturating_sub(*at).saturating_abs() < BLAME_PLAN_REFRESH
             {
                 return (*plan, *at);
@@ -3518,8 +3556,8 @@ impl Blame {
             .values()
             .map(|b| (b.author.as_str(), b.uncommitted, b.time))
             .collect();
-        let plan = blame_column_plan(&entries, now, max_cols);
-        self.plan = Some((key.clone(), max_cols, now, plan));
+        let plan = blame_column_plan(&entries, now, fit.max_cols, fit.single_line);
+        self.plan = Some((key.clone(), fit, now, plan));
         (plan, now)
     }
 }
@@ -3614,7 +3652,7 @@ mod blame_column_tests {
             e("tacyan", false, 3 * DAY, now),
             e("tacyan", false, 11 * HOUR, now),
         ];
-        let plan = blame_column_plan(&rows, now, 22);
+        let plan = blame_column_plan(&rows, now, 22, false);
         assert_eq!(plan.kind, BlameLabelKind::TimeOnly, "著者名が残っている");
         // 「11時間前」= 8 桁 / 「3日前」= 5 桁 → 広いほうに合わせる
         assert_eq!(plan.cols, 8);
@@ -3624,11 +3662,82 @@ mod blame_column_tests {
         );
     }
 
+    /// **1 行しか描かないときは著者名を落とさない。**
+    ///
+    /// `BlameMode::Current` はカーソル行だけを描くのに、計画は 16 行帯から
+    /// 立てる。帯の著者が 1 人だと従来は必ず `TimeOnly` になり、カーソル行に
+    /// 「3 日前」とだけ出ていた (**誰が**書いたのかが分からない)。
+    /// この表を修正前のコード (`single_line` を見ない版) へ当てると、
+    /// `single_line = true` の行がすべて `TimeOnly` / `Nothing` になって落ちる。
+    #[test]
+    fn blame_1行表示では著者が1人でも著者名を落とさない() {
+        let now = 1_700_000_000;
+        // 16 行帯の中身が全部同じ著者 = 報告された状況そのもの
+        let band = [
+            e("tacyan", false, 11 * HOUR, now),
+            e("tacyan", false, 3 * DAY, now),
+            e("tacyan", false, 11 * HOUR, now),
+        ];
+        // 表: (1 行表示か, 上限桁) → (種類, 桁数)
+        let table: &[(bool, usize, BlameLabelKind, usize)] = &[
+            // 全行表示は**従来のまま**。同じ文字列が縦に並ぶので著者名は冗長
+            (false, 22, BlameLabelKind::TimeOnly, 8),
+            (false, 8, BlameLabelKind::TimeOnly, 8),
+            (false, 7, BlameLabelKind::Nothing, 0),
+            // 1 行表示は「誰が・いつ」を残す。
+            // 「tacyan · 11時間前」= 6 + 3 + 8 = 17 桁
+            (true, 22, BlameLabelKind::AuthorAndTime, 17),
+            (true, 17, BlameLabelKind::AuthorAndTime, 17),
+            // 幅が足りなければイニシャル (= 誰が)。縦に並ばないので
+            // 「全行同じ 1 文字 = 情報ゼロ」の検査はここには当てない
+            (true, 16, BlameLabelKind::Initials, 1),
+            (true, 1, BlameLabelKind::Initials, 1),
+            (true, 0, BlameLabelKind::Nothing, 0),
+        ];
+        for (single, max_cols, kind, cols) in table {
+            let plan = blame_column_plan(&band, now, *max_cols, *single);
+            assert_eq!(
+                (plan.kind, plan.cols),
+                (*kind, *cols),
+                "blame_column_plan(single_line={single}, max_cols={max_cols})"
+            );
+            // 計画どおりの幅に**必ず**収まる (どの幅でも見切れない)
+            for (a, u, t) in band.iter() {
+                if let Some(s) = blame_row_label(&plan, a, *u, *t, now) {
+                    assert!(
+                        crate::textenc::str_width(&s) <= plan.cols,
+                        "{s:?} が {} 桁を超えた",
+                        plan.cols
+                    );
+                }
+            }
+        }
+        // カーソル行のラベルに**著者が残る**ことを実際の文字列で固定する
+        let plan = blame_column_plan(&band, now, 22, true);
+        assert_eq!(
+            blame_row_label(&plan, "tacyan", false, now - 3 * DAY, now).as_deref(),
+            Some("tacyan · 3日前")
+        );
+    }
+
+    /// 桁数だけを渡す呼び方 (`impl From<usize>`) は**全行表示**を意味する。
+    /// ここが逆になると、全行ガターの見た目が黙って変わる。
+    #[test]
+    fn blame_桁数だけ渡す呼び方は全行表示を意味する() {
+        assert_eq!(
+            BlameFit::from(22),
+            BlameFit {
+                max_cols: 22,
+                single_line: false,
+            }
+        );
+    }
+
     #[test]
     fn blame_著者が2人以上なら著者名を出す() {
         let now = 1_700_000_000;
         let rows = [e("alice", false, HOUR, now), e("bob", false, DAY, now)];
-        let plan = blame_column_plan(&rows, now, 22);
+        let plan = blame_column_plan(&rows, now, 22, false);
         assert_eq!(plan.kind, BlameLabelKind::AuthorAndTime);
         // 「alice · 1時間前」= 5+3+7 = 15 桁 / 「bob · 1日前」= 3+3+5 = 11 桁
         assert_eq!(plan.cols, 15);
@@ -3643,7 +3752,7 @@ mod blame_column_tests {
         let now = 1_700_000_000;
         // 全部未コミット: 相対日時は無いが「未コミット」は本物の信号
         let all = [e("tacyan", true, 0, now), e("tacyan", true, 0, now)];
-        let plan = blame_column_plan(&all, now, 22);
+        let plan = blame_column_plan(&all, now, 22, false);
         let unc = tr("未コミット");
         assert_eq!(plan.cols, crate::textenc::str_width(&unc));
         assert_eq!(
@@ -3655,7 +3764,7 @@ mod blame_column_tests {
             e("tacyan", true, 0, now),
             e("tacyan", false, 11 * HOUR, now),
         ];
-        let plan = blame_column_plan(&mixed, now, 22);
+        let plan = blame_column_plan(&mixed, now, 22, false);
         assert_eq!(plan.kind, BlameLabelKind::TimeOnly);
         assert_eq!(
             blame_row_label(&plan, "tacyan", true, 0, now).as_deref(),
@@ -3693,7 +3802,7 @@ mod blame_column_tests {
             (&[], 22, BlameLabelKind::Nothing, 0), // 空のブロック
         ];
         for (rows, max_cols, kind, cols) in table {
-            let plan = blame_column_plan(rows, now, *max_cols);
+            let plan = blame_column_plan(rows, now, *max_cols, false);
             assert_eq!(
                 (plan.kind, plan.cols),
                 (*kind, *cols),
@@ -3720,14 +3829,14 @@ mod blame_column_tests {
             e("山田 太郎", false, DAY, now),
             e("鈴木 花子", false, DAY, now),
         ];
-        let plan = blame_column_plan(&rows, now, 22);
+        let plan = blame_column_plan(&rows, now, 22, false);
         assert_eq!(plan.kind, BlameLabelKind::AuthorAndTime);
         // 「山田 太郎 · 1日前」= 4+1+4 +3+ 5 = 17 桁 (.len() では 25 バイト)
         let label = blame_row_label(&plan, "山田 太郎", false, now - DAY, now).expect("ラベル");
         assert_eq!(crate::textenc::str_width(&label), 17);
         assert_eq!(plan.cols, 17);
         // 幅が足りなければイニシャル 1 文字 (= 2 桁) へ。山 / 鈴 で区別がつく
-        let plan = blame_column_plan(&rows, now, 16);
+        let plan = blame_column_plan(&rows, now, 16, false);
         assert_eq!((plan.kind, plan.cols), (BlameLabelKind::Initials, 2));
     }
 
@@ -3736,7 +3845,7 @@ mod blame_column_tests {
         let now = 1_700_000_000;
         let rows = [e("", false, DAY, now), e("   ", false, HOUR, now)];
         // 空白だけの著者は同一視される → 1 人 → 日時のみ
-        let plan = blame_column_plan(&rows, now, 22);
+        let plan = blame_column_plan(&rows, now, 22, false);
         assert_eq!(plan.kind, BlameLabelKind::TimeOnly);
         assert_eq!(
             blame_row_label(&plan, "", false, now - DAY, now).as_deref(),
@@ -3745,7 +3854,7 @@ mod blame_column_tests {
         // 時刻も取れない行は何も描かない (`?` だけの列を作らない)
         let unknown = [("", false, 0_i64), ("", false, 0_i64)];
         assert_eq!(
-            blame_column_plan(&unknown, now, 22),
+            blame_column_plan(&unknown, now, 22, false),
             BlameColumnPlan::HIDDEN
         );
         assert_eq!(
@@ -3764,11 +3873,11 @@ mod blame_column_tests {
             e("alice", true, 0, now),
         ];
         let b = [a[2], a[0], a[1]];
-        let pa = blame_column_plan(&a, now, 22);
-        assert_eq!(pa, blame_column_plan(&b, now, 22));
+        let pa = blame_column_plan(&a, now, 22, false);
+        assert_eq!(pa, blame_column_plan(&b, now, 22, false));
         // ブロックの**部分**ではなく全体から決めるので、同じ入力なら何度でも同じ
         for _ in 0..8 {
-            assert_eq!(pa, blame_column_plan(&a, now, 22));
+            assert_eq!(pa, blame_column_plan(&a, now, 22, false));
         }
     }
 

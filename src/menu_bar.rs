@@ -5,6 +5,7 @@
 //! 選ばれた操作を `Cmd` として返す。実処理はすべて app.rs の `apply_cmd` が担う。
 //! ショートカット表記は実際のキーバインド (config.toml の上書き込み) に追従する。
 
+use crate::config::BlameMode;
 use crate::i18n::{tr, trf};
 use crate::keybinds::{format_shortcut, BindAction, Keybinds};
 use crate::palette::Cmd;
@@ -66,6 +67,79 @@ pub fn theme_menu_ui(ui: &mut egui::Ui, themes: &[ThemeEntry], cmds: &mut Vec<Cm
                 }
             }
         });
+}
+
+/// 表示メニューが受け取っている Git blame の状態。
+///
+/// `MenuInfo::git_blame` はいま **on/off の 2 値しか運んでいない**
+/// (`app.rs` が `BlameMode::is_on()` を渡している)。「出ているが 3 段の
+/// どれかは分からない」を型で区別するのは、**分からないものにチェックを
+/// 付けない**ため — 段が分からないまま「全行」に印を付けると、
+/// `current` を選んでいる人に嘘を見せることになる。
+///
+/// `MenuInfo::git_blame` が [`BlameMode`] を運ぶようになれば
+/// `From<BlameMode>` 側が使われ、`OnUnknown` は作られなくなる
+/// (描画側は `BlameMenuState::from(info.git_blame)` のままでよい)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlameMenuState {
+    /// 3 段のどれかが確定している。
+    Mode(BlameMode),
+    /// 出ていることだけ分かっている。
+    OnUnknown,
+}
+
+impl From<BlameMode> for BlameMenuState {
+    fn from(m: BlameMode) -> Self {
+        BlameMenuState::Mode(m)
+    }
+}
+
+impl From<bool> for BlameMenuState {
+    fn from(on: bool) -> Self {
+        if on {
+            BlameMenuState::OnUnknown
+        } else {
+            BlameMenuState::Mode(BlameMode::Off)
+        }
+    }
+}
+
+/// 表示メニュー「Git blame」の 1 行。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlameMenuRow {
+    /// 段の名前 (翻訳前)。`BlameMode::label` が**唯一の定義**なので、
+    /// 設定画面・トースト・メニューで名前がずれない。
+    pub label: &'static str,
+    /// パレットと共有する機能 ID。`Cmd::Feature` にそのまま渡す。
+    pub id: &'static str,
+    /// いまこの段が選ばれているか (分からないときは全行 false)。
+    pub selected: bool,
+}
+
+/// 3 段を並べる**純関数**。並びは `BlameMode::next` の循環と同じ順
+/// (出さない → カーソル行だけ → 全行) にして、循環と行順を食い違わせない。
+pub fn blame_menu_rows(state: BlameMenuState) -> [BlameMenuRow; 3] {
+    /// 段と機能 ID の対応。ID は `src/features/blame.rs` の登録と同じ文字列で、
+    /// `menu_bar::tests::blame_の3段はパレット登録と同じidを指す` が番人。
+    const STAGES: [(BlameMode, &str); 3] = [
+        (BlameMode::Off, "blame.off"),
+        (BlameMode::Current, "blame.current"),
+        (BlameMode::All, "blame.all"),
+    ];
+    STAGES.map(|(m, id)| BlameMenuRow {
+        label: m.label(),
+        id,
+        selected: state == BlameMenuState::Mode(m),
+    })
+}
+
+/// サブメニューを開く親行のラベル (翻訳前)。段の名前は中の 3 行が持つので、
+/// ここは **出ているかどうか**だけを示す (2 値しか分からなくても嘘にならない)。
+pub fn blame_menu_title(state: BlameMenuState) -> &'static str {
+    match state {
+        BlameMenuState::Mode(BlameMode::Off) => "Git blame",
+        _ => "✓ Git blame",
+    }
 }
 
 /// メニューの表示状態スナップショット。描画のためだけの読み取り専用情報。
@@ -759,14 +833,25 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
         if item(ui, &bc, "", true) {
             cmds.push(Cmd::ToggleBreadcrumbs);
         }
-        let gb = if info.git_blame {
-            tr("✓ Git blame をガターに表示")
-        } else {
-            tr("Git blame をガターに表示")
-        };
-        if item(ui, &gb, "", true) {
-            cmds.push(Cmd::ToggleGitBlame);
-        }
+        // Git blame は 3 段 (出さない / カーソル行だけ / 全行)。循環する 1 項目
+        // だけだと「いまどれか」も「何が選べるか」も分からないので、段ごとに
+        // 独立した行として出す (排他選択なので配色テーマと同じ
+        // `selectable_label` の作法)。
+        let blame = BlameMenuState::from(info.git_blame);
+        ui.menu_button(tr(blame_menu_title(blame)), |ui| {
+            ui.set_min_width(280.0);
+            for r in blame_menu_rows(blame) {
+                if ui.selectable_label(r.selected, tr(r.label)).clicked() {
+                    cmds.push(Cmd::Feature(r.id));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+            // 段を見ずに 1 手で回す口 (パレットにも同じ項目がある)。
+            if item(ui, &tr("次の段へ"), "", true) {
+                cmds.push(Cmd::ToggleGitBlame);
+            }
+        });
         ui.separator();
         let md = if info.md_preview {
             tr("✓ Markdown/HTML プレビュー")
@@ -1508,5 +1593,99 @@ mod tests {
         assert_eq!(build_task_for(&root), None);
 
         std::fs::remove_dir_all(&root).expect("後片付け");
+    }
+
+    // ── 表示メニューの Git blame (3 段) ────────────────────────────
+
+    /// 3 段が**独立した行**として並び、選ばれている段にだけ印が付くこと。
+    /// 循環しか無いと「いまどれか」「何が選べるか」が分からない。
+    #[test]
+    fn blame_の3段は独立した行として並び選択中だけに印が付く() {
+        // 表: 状態 → (印の付く段, 印の付いた行数)
+        let table: [(BlameMenuState, Option<&str>); 4] = [
+            (BlameMenuState::Mode(BlameMode::Off), Some("blame.off")),
+            (
+                BlameMenuState::Mode(BlameMode::Current),
+                Some("blame.current"),
+            ),
+            (BlameMenuState::Mode(BlameMode::All), Some("blame.all")),
+            // 段が分からないときは**どこにも印を付けない** (嘘を見せない)
+            (BlameMenuState::OnUnknown, None),
+        ];
+        for (state, want) in table {
+            let rows = blame_menu_rows(state);
+            assert_eq!(
+                rows.map(|r| r.id),
+                ["blame.off", "blame.current", "blame.all"],
+                "段の並びが `BlameMode::next` の循環と食い違っている ({state:?})"
+            );
+            let marked: Vec<&str> = rows.iter().filter(|r| r.selected).map(|r| r.id).collect();
+            assert_eq!(
+                marked,
+                want.into_iter().collect::<Vec<_>>(),
+                "印の付き方が違う ({state:?})"
+            );
+        }
+    }
+
+    /// 段の名前は `BlameMode::label` が唯一の定義 (設定画面とずらさない)。
+    #[test]
+    fn blame_の段の名前はblamemodeのlabelから来る() {
+        let rows = blame_menu_rows(BlameMenuState::Mode(BlameMode::Current));
+        assert_eq!(
+            rows.map(|r| r.label),
+            [
+                BlameMode::Off.label(),
+                BlameMode::Current.label(),
+                BlameMode::All.label(),
+            ]
+        );
+    }
+
+    /// メニューが押す ID は**パレットに登録されている ID と同じ**。
+    /// どちらかを改名すると、メニューの行が黙って何もしなくなる。
+    #[test]
+    fn blame_の3段はパレット登録と同じidを指す() {
+        let known: Vec<&str> = crate::feature::palette_entries()
+            .iter()
+            .filter_map(|(_, _, _, c)| match c {
+                Cmd::Feature(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for r in blame_menu_rows(BlameMenuState::OnUnknown) {
+            assert!(known.contains(&r.id), "{} が登録されていない", r.id);
+        }
+    }
+
+    /// 親行は「出ているか」だけを示す。2 値しか分からなくても嘘にならない。
+    #[test]
+    fn blame_の親行は出ているかどうかだけを示す() {
+        assert_eq!(
+            blame_menu_title(BlameMenuState::Mode(BlameMode::Off)),
+            "Git blame"
+        );
+        for s in [
+            BlameMenuState::Mode(BlameMode::Current),
+            BlameMenuState::Mode(BlameMode::All),
+            BlameMenuState::OnUnknown,
+        ] {
+            assert_eq!(blame_menu_title(s), "✓ Git blame", "{s:?}");
+        }
+    }
+
+    /// `MenuInfo::git_blame` が bool でも `BlameMode` でも同じ書き方で受けられる。
+    /// bool の間は「出ている」までしか言えない (段は分からない)。
+    #[test]
+    fn blame_の状態はboolからもblamemodeからも作れる() {
+        assert_eq!(
+            BlameMenuState::from(false),
+            BlameMenuState::Mode(BlameMode::Off)
+        );
+        assert_eq!(BlameMenuState::from(true), BlameMenuState::OnUnknown);
+        assert_eq!(
+            BlameMenuState::from(BlameMode::Current),
+            BlameMenuState::Mode(BlameMode::Current)
+        );
     }
 }
