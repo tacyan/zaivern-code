@@ -27,6 +27,9 @@ tools/coedit-bench.sh --agents 64 --lines 2000      # 行域オーナーシッ�
 tools/anyrepo-prove.sh --repo . --writers 8         # **自分のリポジトリで**証明する (§3.12)
 tools/xplat-bench.sh                                # macOS と Linux を並べる (§3.13)
 tools/region-cost.sh                                # 行域判定そのものの費用 (§3.14)
+tools/repo-shapes-prove.sh --seed 20260812          # リポジトリの形ごとの可否 (§3.15)
+tools/coordinator-bench.sh                          # 鎖① を端から端まで (chain-1-and-4.md)
+tools/shared-surface-bench.sh                       # 鎖④ を**実際の共有面**で (chain-1-and-4.md)
 ```
 
 ---
@@ -111,17 +114,21 @@ tools/region-cost.sh                                # 行域判定そのもの�
 
 | # | 鎖 | いつ効くか | 実装 | 実測 |
 |---|---|---|---|---|
-| ① | **配る前の分割** | タスクをエージェントへ割り当てる瞬間 | `coordinator::overlap_reason` / `overlap_split` (GUI から到達) | **未測定** |
+| ① | **配る前の分割** | タスクをエージェントへ割り当てる瞬間 | `coordinator::overlap_reason` / `overlap_split` (GUI から到達) | **測定済み — [docs/chain-1-and-4.md](chain-1-and-4.md)** |
 | ② | **実行中の強制** | エージェントがファイルを書く直前 | `crate::lease::gate` (`zai hook` / エディタ自身の保存 / シェル経由の書き込み) | **測定済み (下記)** |
 | ②' | **実行中の強制 (行域)** | 同上。粒度がファイル → 行域になる | `src/region.rs` → `lease.rs` / `czero.rs` / `coedit.rs` / `zai lease claim [--shift]` (`src/cli.rs`) | **測定済み — 出荷物 0.14.0 で §3.9 / §3.11.4 / §3.12** |
 | ③ | **統合** | ブランチをマージする時 | `zai train plan` / `run --dry-run` (`src/train.rs`) | **測定済み (下記)** |
-| ④ | **共有面の自動解決** | 全員が触らざるを得ないファイル (設定一覧・`mod` 宣言など) | `zai merge-driver` (`src/union.rs`) | **測定済み — この合成リポジトリでは効果ゼロ** |
+| ④ | **共有面の自動解決** | 全員が触らざるを得ないファイル (設定一覧・`mod` 宣言など) | `zai merge-driver` (`src/union.rs`) | **測定済み — 合成では効果ゼロ。実共有面では marked なら 0、auto は効かない ([chain-1-and-4.md](chain-1-and-4.md))** |
 
 ### 正直に言うと
 
-- **① は動いているが、この文書には数字が無い。**`coordinator` のテストは
-  「重なったら配らない」を単体で固定しているが、**エンドツーエンドで
-  「配り方を変えたら衝突が何件減ったか」は測っていない。**
+- **① は測った。効くのは「編集が実際に当たるとき」だけで、代償は作業量。**
+  `--edit same` (全員が同じ行域を狙う) では **17〜22 ハンク → 0** になるが、
+  **書けた担当が 36 → 13〜17 に減る**。ゼロは作業量で買っている。
+  `--edit spread` では naive も 6 種すべて 0 ハンクで、**① は 1 件も減らさない** —
+  それでいて naive の二重書きは 6〜10 件あるので、**衝突だけを見る判定は見逃す**
+  (`tools/coordinator-bench.sh` は二重書き≠0 を失格にする)。
+  詳細は [docs/chain-1-and-4.md](chain-1-and-4.md)。
 - **③ は実装されたが、衝突の総量は 1 つも減らない。**測ると
   **ハンク数は素朴な順序と完全に同じ**で、減るのは「衝突で止まる回数」だけ。
   さらに **書き手が worktree を持っている間は 1 本も計画に載らない**
@@ -137,13 +144,23 @@ tools/region-cost.sh                                # 行域判定そのもの�
   先頭行・末尾行の中身を覚え (`region::capture_anchor`)、判定のたびに
   取り直す (`region::resolve`)。**この錨が誤マッチして二重配布を起こしていた**
   ので、いまは「動いたと読めたら、その読みを採らない」(§3.12.2)。
-- **④ は実装されたが、この合成リポジトリでは 1 件も吸収しなかった。**
+- **④ を実共有面で測った。マーカで囲めば実物でも 0 になる。囲まなければ効かない。**
+  このリポジトリ自身を複製して `src/config.rs` へ 8 人が独立追記すると、
+  `union-marked` は **14 → 0 ハンク**。マーカ無し (`union-auto`) は **14 → 14 で
+  1 件も吸収しない** — ドライバの駆動回数を数えているので「配管が繋がっていない」
+  のではなく**自分で降りている**と確定した (追記先 4 箇所のうち塊の内側で解けるのは
+  `ALL_ACTIONS` の 1 箇所だけで、1 つでも残るとファイルごと git へ降りる)。
+  **衝突 0 でも正しいとは限らない**: `keybinds.rs` の `[BindAction; 89]` は
+  全員が 90 へ書くので git は綺麗に通すが、実要素数は 89+N になる。
+  union では原理的に直らない。詳細は [docs/chain-1-and-4.md](chain-1-and-4.md)。
+- (旧記述) **④ は実装されたが、この合成リポジトリでは 1 件も吸収しなかった。**
   `zai merge-driver` を挿しても衝突数はベースラインと 1 桁も変わらない
   (下記 3.7)。**配管の問題ではない** — 同じ場所へ参照ドライバ
   (`git merge-file --union`) を挿すと 18 ハンクが 0 になるので、
   差はドライバの方針 (共有面の構文だけを吸収し、それ以外は通常の 3-way
   へ譲る) にある。CLAUDE.md が言う `config.rs` / `keybinds.rs` のような
-  **実際の共有面での効果は、この合成ベンチでは測れていない。**
+  **実際の共有面での効果は、この合成ベンチでは測れていない**
+  (→ `tools/shared-surface-bench.sh` で測った。上記と [chain-1-and-4.md](chain-1-and-4.md) §2)。
 
 ---
 
@@ -787,16 +804,24 @@ macOS だけの数字は**製品の数字ではない**。同じハーネスを 
 `zai czero doctor` が検出する形と、その形で保証されるものは
 [docs/czero-repo-shapes.md](czero-repo-shapes.md) に実測で並べてある。要約:
 
-- ✅ 素の作業ツリー / linked worktree / LFS (`merge=lfs` あり)
-- ⚠ submodule を抱える (**submodule 内は素通り**。個別に init が要る) /
-  sparse-checkout (cone 外の `.gitattributes` は効かない) /
-  shallow (`merge-tree` が失敗して一撃統合が縮退する) /
+- ✅ 素の作業ツリー / linked worktree / LFS (`merge=lfs` あり) /
+  **sparse-checkout** / **shallow** /
+  **submodule (`--recurse-submodules` を打てば。入れ子 2 段目まで実測)**
+- ⚠ submodule (打っていないとき。未初期化のものがあれば ❌) /
   既存のフックフレームワーク (共存はするが、向こうが書き直すと関所が消える)
-- ❌ 非 git (フックが入らず**他のプロセスは 1 つも止まらない**) / bare /
-  読み取り専用 / **LFS × union の重なり** (union がポインタ行を連結して LFS を
-  壊すので、当てないように修正済み)
+- ❌ 非 git (`--git-init` で git 化すれば ✅ へ動く。既定では 1 バイトも書かない) /
+  bare / 読み取り専用 — いずれも**原理的に不可なので、はっきり断る**
+- ✅ **LFS × union の重なり** (union がポインタ行を連結して LFS を壊すので、
+  czero は当てない = 壊れる組がそもそも存在しない)
 
-関連: [docs/guard-edges.md](guard-edges.md) (関所が漏れる形) /
+**sparse と shallow が ⚠ だったのは前提が誤っていた。** 実測がどちらも旧記述を
+否定している — sparse は git が**作業ツリーに無い `.gitattributes` を index から読む**
+ので、頂点のファイルが 1 バイトも展開されていなくても cone 外に union が当たる。
+shallow で `merge-tree` が落ちるのは共通祖先が graft より下の組だけで、
+coedit が混ぜる HEAD 由来の枝は depth=1 でも通る。
+
+関連: [docs/repo-shapes.md](repo-shapes.md) (形ごとの実測と ⚠/❌ を動かした根拠) /
+[docs/guard-edges.md](guard-edges.md) (関所が漏れる形) /
 [docs/bench-honesty.md](bench-honesty.md) (ベンチが静かな嘘をつかないための決まり) /
 [docs/idle-cost.md](idle-cost.md) (アイドル時のコスト)。
 
