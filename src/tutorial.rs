@@ -1473,8 +1473,17 @@ pub struct RowCols {
 }
 
 /// 可用幅から列幅を決める。打鍵欄は残り幅の 4 割まで。
-pub fn row_cols(avail: f32, want_keys: f32) -> RowCols {
-    let avail = avail.max(0.0);
+///
+/// **`gap` は列と列のあいだの余白** (`ui.spacing().item_spacing.x`)。
+/// これを引かないと、3 つの列の合計が可用幅ちょうどになるのに
+/// egui が間に余白を 2 つ入れるので、**合計が可用幅を超えて右端の列が
+/// 画面外へ出る**。実画面では章の進捗 (`0/7`) が 9 行中 8 行消えていた
+/// (1 行目だけ x=908 に描かれ、画面幅は 900 だった)。
+///
+/// 列幅の計算そのものは元から正しく、抜けていたのは**余白の勘定**だった。
+pub fn row_cols(avail: f32, want_keys: f32, gap: f32) -> RowCols {
+    // 列は 3 つなので隙間は 2 つ。負にならないよう床を張る。
+    let avail = (avail - gap.max(0.0) * 2.0).max(0.0);
     let icon = 18.0_f32.min(avail * 0.2);
     let rest = (avail - icon).max(0.0);
     let keys = want_keys.max(0.0).min(rest * 0.4);
@@ -2644,6 +2653,31 @@ fn guide_section(ui: &mut egui::Ui, theme: &crate::theme::Theme, title: &str) {
     ui.separator();
 }
 
+/// 指定した幅に**実際に収まる** galley を作る。
+///
+/// `fit_chars` は「1 文字 12px」と仮定して字数で詰めるが、**日本語は実際には
+/// もっと広い**ので足りない。足りないまま `Button` に渡すと、ボタンは文字から
+/// 必要幅を計算するので**列幅を超えて次の列を右へ押し出す**
+/// (章の進捗 `0/7` が行ごとにずれ、狭い幅では画面外へ消えていた。
+///  `set_max_width` を張ってもボタン側は縮まないので効かない)。
+///
+/// egui にレイアウトさせて `max_rows = 1` で切ると、**フォントと文字の実幅**で
+/// 決まるので、どの言語でも必ず収まる。詰めた分はホバーで全文を出す。
+fn fit_galley(
+    ui: &egui::Ui,
+    text: &str,
+    width: f32,
+    style: egui::TextStyle,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let font_id = style.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
+    job.wrap.max_width = width.max(1.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    ui.fonts(|f| f.layout_job(job))
+}
+
 /// 行の 1 列を、**指定した幅を必ず占有して**描く。
 ///
 /// `ui.add_sized` を使ってはいけない。あれは中身を
@@ -2667,7 +2701,16 @@ fn guide_col<R>(
         egui::Layout::left_to_right(egui::Align::Center)
     };
     ui.allocate_ui_with_layout(egui::vec2(w, h), layout, |ui| {
+        // **下限と上限の両方を張る。** 下限だけだと中身が短いときに列が縮んで
+        // 次の列が左へ寄り、上限だけだと中身が長いときに列が伸びて
+        // **次の列を右へ押し出す**。実画面では後者が起きていた —
+        // 章の進捗 (`0/7`) が行ごとに右へずれ、狭い幅では画面外へ消えた。
+        //
+        // 原因は `fit_chars` が「1 文字 12px」と仮定していること。
+        // **日本語は実際にはもっと広い**ので、字数で詰めても足りない。
+        // 幅で殴るのが確実 (詰めた文字列はホバーで全文が出る)。
         ui.set_min_width(w);
+        ui.set_max_width(w);
         add(ui)
     })
     .inner
@@ -2681,7 +2724,7 @@ fn chapter_row(
     seen: &BTreeMap<String, u32>,
 ) -> bool {
     let (done, total) = chapter_progress(seen, w);
-    let cols = row_cols(ui.available_width(), 44.0);
+    let cols = row_cols(ui.available_width(), 44.0, ui.spacing().item_spacing.x);
     let full = format!("{} {} — {}", w.icon, tr(w.title), tr(w.summary));
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
     let mut clicked = false;
@@ -2696,7 +2739,8 @@ fn chapter_row(
             );
         });
         clicked = guide_col(ui, cols.label, 20.0, false, |ui| {
-            ui.add(egui::Button::new(egui::RichText::new(shown).color(theme.text)).frame(false))
+            let g = fit_galley(ui, &shown, cols.label, egui::TextStyle::Body, theme.text);
+            ui.add(egui::Button::new(g).frame(false))
                 .on_hover_text(full.as_str())
                 .clicked()
         });
@@ -2722,7 +2766,7 @@ fn chapter_row(
 /// 従って「その手順を再生する / 機能を実行する / 打鍵を教える」。
 fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) -> bool {
     let want_keys = if r.keys.is_empty() { 0.0 } else { 96.0 };
-    let cols = row_cols(ui.available_width(), want_keys);
+    let cols = row_cols(ui.available_width(), want_keys, ui.spacing().item_spacing.x);
     let full = if r.note.is_empty() {
         format!("{} ({})", r.label, r.id)
     } else {
@@ -2745,19 +2789,16 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) ->
             ui.label(egui::RichText::new(r.icon.as_str()).small());
         });
         clicked = guide_col(ui, cols.label, 16.0, false, |ui| {
-            ui.add(
-                egui::Button::new(egui::RichText::new(shown).small().color(
-                    // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
-                    if r.kind == RowKind::Feature {
-                        theme.text
-                    } else {
-                        theme.text_dim
-                    },
-                ))
-                .frame(false),
-            )
-            .on_hover_text(tip.as_str())
-            .clicked()
+            // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
+            let color = if r.kind == RowKind::Feature {
+                theme.text
+            } else {
+                theme.text_dim
+            };
+            let g = fit_galley(ui, &shown, cols.label, egui::TextStyle::Small, color);
+            ui.add(egui::Button::new(g).frame(false))
+                .on_hover_text(tip.as_str())
+                .clicked()
         });
         if cols.keys > 0.0 && !r.keys.is_empty() {
             guide_col(ui, cols.keys, 16.0, true, |ui| {
@@ -2883,6 +2924,64 @@ mod tests {
         }
     }
 
+    // ── 章立てガイドの行揃え ──
+
+    /// **章の行も列で揃う。** 進捗 (`0/7`) が行ごとに右へずれない。
+    ///
+    /// 索引 (`index_row_ui`) だけを守っていて、章 (`chapter_row`) は
+    /// 番人が無かった。実画面では進捗表示が 1 行ごとに右へ階段状にずれていた。
+    /// **同じ形の不具合は、同じ形のテストで両方を押さえる。**
+    #[test]
+    fn 章立てガイドの進捗も列で揃う() {
+        use egui::epaint::Shape;
+        let theme = crate::theme::all()[0].clone();
+        let seen: BTreeMap<String, u32> = BTreeMap::new();
+
+        for w in [900.0_f32, 1200.0, 1760.0] {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 900.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for wk in WALKTHROUGHS {
+                        let _ = chapter_row(ui, &theme, wk, &seen);
+                    }
+                });
+            });
+
+            // 進捗の文字 (`0/7` の形) が描かれた x を集める。
+            let mut xs: Vec<f32> = Vec::new();
+            for sh in &out.shapes {
+                if let Shape::Text(t) = &sh.shape {
+                    let s = t.galley.text();
+                    if s.contains('/') && s.chars().all(|c| c.is_ascii_digit() || c == '/') {
+                        xs.push(t.pos.x);
+                    }
+                }
+            }
+            assert!(
+                xs.len() >= WALKTHROUGHS.len(),
+                "{w}px: 進捗が全章ぶん描かれていない ({} / {})",
+                xs.len(),
+                WALKTHROUGHS.len()
+            );
+            let lo = xs.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = xs.iter().cloned().fold(f32::MIN, f32::max);
+            // 桁数が違う (`0/3` と `0/13`) ので右寄せの開始 x は数 px 動く。
+            // **行ごとに階段状にずれる**のは別物で、そちらは数十 px 単位になる。
+            assert!(
+                hi - lo < 12.0,
+                "{w}px: 進捗の x が行ごとにずれている ({lo}..{hi} = {:.1}px 幅)\n{xs:?}",
+                hi - lo
+            );
+        }
+    }
+
     // ── 全機能ガイドの行揃え ──
 
     /// 索引の行は **列で揃う**。
@@ -2982,7 +3081,8 @@ mod tests {
                     key_ends.iter().cloned().fold(f32::MAX, f32::min),
                     key_ends.iter().cloned().fold(f32::MIN, f32::max),
                 );
-                let cols = row_cols(w, 96.0);
+                // 描画側と同じ余白を渡す (既定の item_spacing.x = 8.0)。
+                let cols = row_cols(w, 96.0, 8.0);
                 assert!(
                     khi - klo <= cols.keys,
                     "{w}px: 打鍵欄が見出しの長さで動いている ({klo}..{khi}, 列幅 {})",
@@ -3780,16 +3880,28 @@ mod tests {
         }
     }
 
+    /// **列幅の合計 + 列間の余白** が可用幅に収まること。
+    ///
+    /// 以前は余白を勘定していなかった。3 列の合計がちょうど可用幅になるので
+    /// 一見正しいが、egui は列と列のあいだに `item_spacing.x` を入れるため
+    /// **合計が可用幅を超え、右端の列が画面外へ出ていた**
+    /// (実画面で章の進捗が 9 行中 8 行消えた)。
     #[test]
-    fn 索引の列幅は可用幅を超えない() {
+    fn 索引の列幅は余白を入れても可用幅を超えない() {
         for avail in [0.0_f32, 1.0, 40.0, 120.0, 300.0, 680.0, 2000.0] {
             for want in [0.0_f32, 44.0, 96.0, 400.0] {
-                let c = row_cols(avail, want);
-                assert!(c.icon >= 0.0 && c.label >= 0.0 && c.keys >= 0.0);
-                assert!(
-                    c.icon + c.label + c.keys <= avail + 0.01,
-                    "avail={avail} want={want} → {c:?} が可用幅を超えた"
-                );
+                for gap in [0.0_f32, 4.0, 8.0, 20.0] {
+                    let c = row_cols(avail, want, gap);
+                    assert!(c.icon >= 0.0 && c.label >= 0.0 && c.keys >= 0.0);
+                    // 列は 3 つ = 隙間は 2 つ。**余白を引いた「使える幅」**に収まること。
+                    // 可用幅が余白より狭い退化ケースでは列が 0 幅になり、
+                    // そのとき余白は描かれない (並べる中身が無い) ので床は 0。
+                    let usable = (avail - gap * 2.0).max(0.0);
+                    assert!(
+                        c.icon + c.label + c.keys <= usable + 0.01,
+                        "avail={avail} want={want} gap={gap} → {c:?} が使える幅 {usable} を超えた"
+                    );
+                }
             }
         }
     }

@@ -412,19 +412,6 @@ zai_try() {
 # 探索順 (**全ベンチ共通**): ZAIVERN_BIN → release → debug → PATH。
 # `for` の各語を引用しているので、**空白を含むパスでも壊れない**。
 # shellcheck disable=SC2329  # 共通ブロック外／間接 (`"$1"`) から呼ぶ
-# Git Bash (MSYS/MINGW) の `/d/a/…` は、`setup-python` が入れる
-# **ネイティブ Windows の Python** からは解決できない
-# (`FileNotFoundError: [WinError 2]` になる。実際に CI の
-#  `shapes (windows-latest)` がこれで落ちた)。
-# `cygpath` があるときだけ native 形へ寄せる。無い環境では素通し。
-to_native_path() {
-    if [ -n "${1:-}" ] && command -v cygpath >/dev/null 2>&1; then
-        cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
-    else
-        printf '%s' "${1:-}"
-    fi
-}
-
 zai_pick() {
     zai=""
     if [ -n "${ZAIVERN_BIN:-}" ]; then
@@ -457,6 +444,19 @@ zai_identity() {
     return 0
 }
 # @zai-honesty-end
+
+# Git Bash (MSYS/MINGW) の `/d/a/…` は、`setup-python` が入れる
+# **ネイティブ Windows の Python** からは解決できない
+# (`FileNotFoundError: [WinError 2]` になる。実際に CI の
+#  `shapes (windows-latest)` がこれで落ちた)。
+# `cygpath` があるときだけ native 形へ寄せる。無い環境では素通し。
+to_native_path() {
+    if [ -n "${1:-}" ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
+    else
+        printf '%s' "${1:-}"
+    fi
+}
 
 zai=""
 zai_pick zai_help_ok || true
