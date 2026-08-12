@@ -104,5 +104,9 @@ LFS の判定は `.gitattributes` を引かずに**パッチ本文から**行う
   ただし `--path` の問い合わせは実体を探るので、
   sparse で materialize されていないパスは「まだ無いファイル」として扱われる
   (リンクではあり得ないので字句の答えがそのまま使われる = 安全側)。
+  **`.gitattributes` の側も cone の外へ効く** — git は作業ツリーに無い
+  `.gitattributes` を index から読むので、`check_attrs` が引く
+  `git check-attr` は cone の外のパスにも正しい答えを返す
+  (cone / no-cone の両方で実測。[docs/repo-shapes.md](repo-shapes.md) §3)。
 * **ファイル名に `*` `?` `[` が入っている**と `region::conflicts` が glob と
   見なして常に衝突扱いになる (`lease::covers` と同じ限界。安全側)。

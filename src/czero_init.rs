@@ -815,6 +815,12 @@ pub struct Shape {
     pub inside_submodule: bool,
     /// このリポジトリが抱えている submodule のパス (`.gitmodules` 由来・決定的)。
     pub submodules: Vec<String>,
+    /// 入れ子まで辿った submodule (初期化済みかどうかも持つ)。
+    ///
+    /// `submodules` は**頂点の `.gitmodules` 1 枚**しか見ないので、
+    /// submodule が submodule を抱えている形では数が合わない。
+    /// `--recurse-submodules` が実際に回る先はこちら。
+    pub submodule_tree: Vec<SubRepo>,
     /// sparse-checkout が有効。
     pub sparse: bool,
     /// shallow clone (`.git/shallow` が居る)。
@@ -871,9 +877,12 @@ impl Shape {
     /// 一緒に出さないと静かな嘘になる。**
     pub fn untested_notes(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.sparse {
+        // **sparse-checkout はここから外した。** `trial_sparse_union` が
+        // cone / no-cone の両方を実際に起こして実マージまで通すので、
+        // 「触れていない形態」ではなくなった。
+        if self.shallow {
             out.push(tr(
-                "sparse-checkout — 実証は全ファイルが揃った使い捨てツリーで行っています",
+                "shallow clone — 実証は使い捨ての shallow clone で「HEAD から切った枝は通る」ところまでしか見ていません (graft より古い ref どうしは対象リポジトリの履歴でしか試せません)",
             ));
         }
         if !self.lfs_unsafe.is_empty() {
@@ -884,10 +893,10 @@ impl Shape {
         } else if self.lfs {
             out.push(tr("git-lfs — 実証は LFS を使っていません"));
         }
-        if !self.submodules.is_empty() {
+        if !self.submodule_tree.is_empty() {
             out.push(trf(
-                "submodule {n} 件 — 実証は submodule を作っていません (submodule は別リポジトリなので個別に導入が要ります)",
-                &[("n", self.submodules.len().to_string())],
+                "submodule {n} 件 — 実証は submodule を作っていません (別リポジトリなので zai czero init --recurse-submodules が要ります)",
+                &[("n", self.submodule_tree.len().to_string())],
             ));
         }
         if self.linked_worktree {
@@ -983,6 +992,127 @@ fn submodule_paths(root: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// 入れ子の submodule を辿る深さの上限。
+///
+/// 輪 (`seen`) で止まるので本来は要らないが、**壊れた `.gitmodules` が
+/// 自分自身を指している**ときに `canonicalize` が別の綴りを返すと輪の判定を
+/// すり抜ける。深さでも止めておく (どちらか片方では足りない)。
+const MAX_SUBMODULE_DEPTH: usize = 8;
+
+/// `.` と `..` を**字句で**畳む。存在しないパスでも答えを返す。
+///
+/// `canonicalize` は実在しない要素があると失敗するので、未初期化の submodule
+/// (ディレクトリごと無い) には使えない。ここで畳んでおかないと
+/// `root/a/b/../../../evil` が `starts_with(root)` を**素通りする**
+/// (前半が `root/…` なので接頭辞としては一致してしまう)。
+fn fold_dots(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // 頂点より上へは出さない (`pop` が false なら既に根)。
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// 抱えている submodule 1 件。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubRepo {
+    /// 親の作業ツリーからの相対 (入れ子は `/` で連ねる)。**表示と JSON のキー。**
+    pub rel: String,
+    /// 実際の場所。
+    pub path: PathBuf,
+    /// 作業ツリーとして初期化済みか (`.git` が居る)。
+    ///
+    /// `git submodule update --init` を打っていない submodule は
+    /// **空のディレクトリ**なので、導入しようとしても git が答えない。
+    /// 飛ばした理由として出すために、居ないことも値として持つ。
+    pub active: bool,
+}
+
+/// この作業ツリーが抱える submodule を**入れ子まで**列挙する。
+///
+/// `git submodule foreach --recursive` を使わない理由が 3 つある:
+///
+/// 1. submodule ごとに**シェルを起こす**ので、Windows では引数の綴りが
+///    cmd の再解析とずれる (CLAUDE.md「`cmd /C` に押し込まない」の同型)。
+/// 2. 未初期化の submodule を**黙って飛ばす**ので、「届いていない場所」が
+///    出力に出ない。こちらは飛ばした理由も値として返す。
+/// 3. 走らせるコマンドの終了コードが 1 つに畳まれるので、
+///    どの submodule で失敗したのかが判らない。
+///
+/// `.gitmodules` を自分で読めば**決定的**で、git の呼び出しも 0 回で済む。
+fn submodule_repos(root: &Path) -> Vec<SubRepo> {
+    // **頂点を先に正規形へ寄せてから辿る。** 生の綴りから始めると、
+    // 実在する子は `canonicalize` が効いて `/private/var/…` に、実在しない子
+    // (未初期化の submodule) は字句のまま `/var/…` になり、**同じ木の中で
+    // 綴りが 2 種類**できる。すると `starts_with(頂点)` が未初期化のものだけ
+    // 落として、いちばん報告したい「届いていない場所」が消える (実際に落ちた)。
+    let top = crate::pathx::plain(canon(fold_dots(root)));
+    let mut out = Vec::new();
+    let mut seen: Vec<PathBuf> = vec![top.clone()];
+    collect_submodules(&top, &top, "", 0, &mut seen, &mut out);
+    out
+}
+
+/// 深さ優先で辿る (親のすぐ後ろに、その子が並ぶ)。
+///
+/// **頂点の外へ出る綴りは辿らない。** `.gitmodules` は追跡されたファイルなので
+/// 中身は「このリポジトリを clone した誰か」が決められる。`path = ../../evil` と
+/// 書かれていると、`--recurse-submodules` が**リポジトリの外へフックを書き込む**。
+/// 導入は書き込みを伴うので、ここは fail-closed にする
+/// (`lease::rel_within` / `guard::check_path` と同じ立場)。
+fn collect_submodules(
+    dir: &Path,
+    top: &Path,
+    prefix: &str,
+    depth: usize,
+    seen: &mut Vec<PathBuf>,
+    out: &mut Vec<SubRepo>,
+) {
+    if depth >= MAX_SUBMODULE_DEPTH {
+        return;
+    }
+    for rel in submodule_paths(dir) {
+        // `.gitmodules` の綴りは常に `/` 区切り。`Path::join` は Windows でも
+        // `/` を区切りとして受けるので、**分解して繋ぎ直さない**
+        // (綴りを作り変えると、表示と実際の場所がずれる)。
+        let path = dir.join(&rel);
+        // **存在しない要素があっても答えを返す必要がある** (未初期化の
+        // submodule はディレクトリごと無い)。`canonicalize` は失敗するので、
+        // 字句で `..` を畳む `pathx::plain` を通してから比べる。
+        let key = crate::pathx::plain(canon(fold_dots(&path)));
+        if !key.starts_with(top) {
+            continue; // 頂点の外を指す綴りは辿らない
+        }
+        if seen.contains(&key) {
+            continue; // 輪 / 重複を踏まない
+        }
+        seen.push(key.clone());
+        let full = if prefix.is_empty() {
+            rel.clone()
+        } else {
+            format!("{prefix}/{rel}")
+        };
+        // **`.git` はファイルのこともある** (submodule は既定で
+        // `gitdir: ../.git/modules/<名>` の 1 行ファイル)。`is_dir` で見ない。
+        let active = key.join(".git").exists();
+        out.push(SubRepo {
+            rel: full.clone(),
+            path: key.clone(),
+            active,
+        });
+        if active {
+            collect_submodules(&key, top, &full, depth + 1, seen, out);
+        }
+    }
 }
 
 /// union を当てているのに `merge=lfs` が無いパターン。**当てると壊れる組。**
@@ -1198,6 +1328,7 @@ pub fn read_shape(env: &Env) -> Shape {
             sh.symlinked = Some(real);
         }
         sh.submodules = submodule_paths(&root);
+        sh.submodule_tree = submodule_repos(&root);
         for (name, rel) in HOOK_FRAMEWORKS {
             if root.join(rel).exists() && !sh.frameworks.contains(name) {
                 sh.frameworks.push(name);
@@ -1407,6 +1538,124 @@ pub fn init(env: &Env) -> Result<InitReport, String> {
         // sparse-checkout が居れば「どこまで守れたか」は緑の数と一致しない。
         findings: findings(env, &read_shape(env)),
     })
+}
+
+/// 親と、抱えている submodule **全部**へ順に導入する (`--recurse-submodules`)。
+///
+/// submodule は独立したリポジトリで、独自の `.git/config` と独自のフック置き場
+/// (`.git/modules/<名>/hooks`) を持つ。**親へ入れた守りは 1 バイトも届かない。**
+/// 手で 1 つずつ `--repo` を打たせるのは、入れ子があると現実的でないので
+/// ここで畳む。
+///
+/// **失敗しても止まらない。** 1 つの submodule が読み取り専用でも、
+/// 残りは入る。入らなかったものは `Action::Failed` の段として出る
+/// (途中で `Err` を返すと、どこまで入ったのかが判らなくなる)。
+pub fn init_all(env: &Env) -> Result<Vec<InitReport>, String> {
+    let first = init(env)?;
+    let root = first.repo.clone();
+    let mut out = vec![first];
+    for sub in submodule_repos(&root) {
+        out.push(init_one_sub(env, &sub));
+    }
+    Ok(out)
+}
+
+/// submodule 1 件への導入。**未初期化と失敗を、飛ばさずに段として残す。**
+fn init_one_sub(env: &Env, sub: &SubRepo) -> InitReport {
+    if !sub.active {
+        return sub_report(
+            sub,
+            fail(
+                Stage::Shape,
+                &trf(
+                    "submodule {rel} は初期化されていません (作業ツリーが空なので導入できません)",
+                    &[("rel", sub.rel.clone())],
+                ),
+            ),
+        );
+    }
+    let mut sub_env = env.clone();
+    sub_env.start = sub.path.clone();
+    match init(&sub_env) {
+        Ok(r) => r,
+        Err(e) => sub_report(
+            sub,
+            fail(
+                Stage::Shape,
+                &trf(
+                    "submodule {rel} へ導入できませんでした: {e}",
+                    &[("rel", sub.rel.clone()), ("e", e)],
+                ),
+            ),
+        ),
+    }
+}
+
+/// 導入できなかった submodule の報告。**緑を 1 つも立てない。**
+fn sub_report(sub: &SubRepo, step: Step) -> InitReport {
+    let detail = step.detail.clone();
+    InitReport {
+        repo: sub.path.clone(),
+        ledger_key: sub.path.clone(),
+        ledger: PathBuf::new(),
+        dry_run: false,
+        steps: vec![step],
+        findings: vec![Finding::bad(
+            Stage::Shape,
+            detail,
+            "git submodule update --init --recursive を打ってから、もう一度",
+        )],
+    }
+}
+
+/// 親と submodule 全部を診断する (`--recurse-submodules`)。
+pub fn doctor_all(env: &Env) -> Result<Vec<Doctor>, String> {
+    let first = doctor(env)?;
+    let root = first.repo.clone();
+    let mut out = vec![first];
+    for sub in submodule_repos(&root) {
+        if !sub.active {
+            continue; // 未初期化は診断する中身が無い (init 側は理由を出す)
+        }
+        let mut sub_env = env.clone();
+        sub_env.start = sub.path.clone();
+        if let Ok(d) = doctor(&sub_env) {
+            out.push(d);
+        }
+    }
+    Ok(out)
+}
+
+/// `--git-init`: git 管理でないフォルダを、**利用者が明示したときだけ** git 化する。
+///
+/// 非 git は「片方だけ動く」いちばん誤解される形だった — `zai lease claim` は
+/// 成功するのに、フックが入らないので**他のプロセスは 1 つも止まらない**。
+/// 黙って git 化すると勝手にリポジトリを生やすことになるので、
+/// **フラグを打った人だけ**が通れる道にしてある。
+///
+/// bare では断る。git 化しても作業ツリーが無いことは変わらない。
+fn ensure_git_repo(env: &Env) -> Result<Option<PathBuf>, String> {
+    let sh = read_shape(env);
+    if sh.bare {
+        return Err(sh.no_worktree_reason());
+    }
+    if sh.is_git() {
+        return Ok(None);
+    }
+    if env.dry_run {
+        return Ok(Some(env.start.clone()));
+    }
+    std::fs::create_dir_all(&env.start).map_err(|e| {
+        trf(
+            "{p} を作れません: {e}",
+            &[("p", env.start.display().to_string()), ("e", e.to_string())],
+        )
+    })?;
+    git(&env.start, &["init"])?;
+    // **git 化しただけでは 1 コミットも無い。** `git diff --cached` は
+    // HEAD が無くても動くのでフックは効くが、`merge-tree` の相手が居ない。
+    // 空でも良いので確定させるのは利用者の仕事なので、ここでは触らない。
+    Ok(Some(env.start.clone()))
 }
 
 /// 2. 行域の台帳を有効にする。**有効化はファイルの存在**で表す
@@ -1824,31 +2073,72 @@ fn check_shape(sh: &Shape) -> Vec<Finding> {
             "親リポジトリでも: zai czero init",
         ));
     }
-    if !sh.submodules.is_empty() {
-        out.push(Finding::warn(
-            Stage::Shape,
-            trf(
-                "submodule を {n} 件抱えています ({list}) — submodule は別リポジトリなので、**この導入は 1 つも届きません**。submodule 内のコミットは素通りします",
-                &[
-                    ("n", sh.submodules.len().to_string()),
-                    ("list", sh.submodules.join(" ")),
-                ],
-            ),
-            "各 submodule で: zai czero init --repo <submodule のパス>",
-        ));
+    if !sh.submodule_tree.is_empty() {
+        let n = sh.submodule_tree.len();
+        let dead: Vec<&str> = sh
+            .submodule_tree
+            .iter()
+            .filter(|s| !s.active)
+            .map(|s| s.rel.as_str())
+            .collect();
+        let list = sh
+            .submodule_tree
+            .iter()
+            .map(|s| s.rel.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if dead.is_empty() {
+            out.push(Finding::warn(
+                Stage::Shape,
+                trf(
+                    "submodule を {n} 件抱えています ({list}) — submodule は別リポジトリなので、**頂点だけへ入れた守りは 1 つも届きません**。--recurse-submodules を付ければ、入れ子まで辿って全部へ同じ導入をします",
+                    &[("n", n.to_string()), ("list", list)],
+                ),
+                "zai czero init --recurse-submodules",
+            ));
+        } else {
+            out.push(Finding::bad(
+                Stage::Shape,
+                trf(
+                    "submodule {n} 件のうち {d} 件が初期化されていません ({dead}) — 作業ツリーが空なので導入できず、あとで checkout した瞬間に**そこだけ素通り**になります",
+                    &[
+                        ("n", n.to_string()),
+                        ("d", dead.len().to_string()),
+                        ("dead", dead.join(" ")),
+                    ],
+                ),
+                "git submodule update --init --recursive してから: zai czero init --recurse-submodules",
+            ));
+        }
     }
     if sh.sparse {
-        out.push(Finding::warn(
+        // **⚠ から ✅ へ動かした。以前の記述は実測で否定された。**
+        //
+        // 「cone の外の `.gitattributes` は効かない」と書いていたが、git は
+        // 作業ツリーに無い `.gitattributes` を **index から読む**。cone mode /
+        // no-cone mode の両方で、cone の外のパスに union driver が当たり、
+        // 実際の `git merge` が衝突なしで両側を残すことを確かめた
+        // (`trial_sparse_union` / `tools/repo-shapes-prove.sh`)。
+        // 頂点の `.gitattributes` が作業ツリーに 1 バイトも無い no-cone でも
+        // 同じ答えになる。
+        out.push(Finding::ok(
             Stage::Shape,
-            tr("sparse-checkout が有効です — 台帳とフックは stage されたパスを見るので効きます。効かないのは .gitattributes の側で、cone の外にある .gitattributes は作業ツリーに無く、czero init が書くのも頂点の 1 枚だけです (cone の外を後から checkout すると、そこだけ union が当たらないことがあります)"),
-            "cone を広げてから: zai czero doctor",
+            tr("sparse-checkout が有効です — 台帳とフックは stage されたパスを見るので効き、.gitattributes は git が index から読むので **cone の外のパスにも union が当たります** (cone / no-cone の両方で実マージまで確認済み)"),
         ));
     }
     if sh.shallow {
-        out.push(Finding::warn(
+        // **⚠ から ✅ へ動かした (範囲を限って)。**
+        //
+        // `merge-tree --write-tree` が落ちるのは「2 つの ref の**真の共通祖先が
+        // graft 点より下**」のときだけで、そのとき git は
+        // `fatal: refusing to merge unrelated histories` (rc=128) を返す。
+        // coedit が混ぜるのは**いま居る HEAD から切った局所枝**なので、
+        // 共通祖先は常に HEAD 自身 = 必ず手元にある。depth=1 の clone でも
+        // 実測 rc=0 だった。縮退するのは、graft より古い履歴を持つ
+        // **fetch してきた ref どうし**を混ぜるときに限られる。
+        out.push(Finding::ok(
             Stage::Shape,
-            tr("shallow clone です — フックと台帳は効きますが、切り落とされた履歴に共通祖先がある組では git merge-tree が失敗し、coedit の一撃統合が縮退します"),
-            "git fetch --unshallow",
+            tr("shallow clone です — フックと台帳は効きます。git merge-tree が落ちるのは「真の共通祖先が切り落とされている ref の組」だけで、coedit が混ぜる**いまの HEAD から切った枝**は共通祖先が HEAD 自身なので depth=1 でも通ります (縮退するのは graft より古い ref どうしを混ぜるときだけ。そのときは git fetch --deepen=<数> か --unshallow で戻る)"),
         ));
     }
     if !sh.lfs_unsafe.is_empty() {
@@ -2127,6 +2417,21 @@ fn check_attributes(repo: &Path) -> Vec<Finding> {
     };
     let patterns = managed_patterns(&root);
     if patterns.is_empty() {
+        // **「もう一度 init しろ」を出さない場合が 1 つある。**
+        // 追跡ファイルが 1 つも無いリポジトリ (`git init` した直後 /
+        // `czero init --git-init` で git 化した直後) では、何度 init を
+        // 打っても当たるパターンは 0 件のままで、案内が輪になる。
+        // 先に**追跡させる**のが唯一の出口なのでそう言う。
+        let untracked = git(&root, &["ls-files"])
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false);
+        if untracked {
+            return vec![Finding::warn(
+                Stage::Attributes,
+                tr("追跡されているファイルが 1 つも無いので、union を当てる先がありません (git init した直後のリポジトリです。台帳とフックは既に効いています)"),
+                "ファイルを 1 度コミットしてから: zai czero init",
+            )];
+        }
         return vec![Finding::bad(
             Stage::Attributes,
             tr(".gitattributes に union の指定がありません (driver を登録しても当たるファイルがゼロです)"),
@@ -2371,6 +2676,23 @@ pub fn verify(env: &Env, keep: bool) -> VerifyReport {
         ),
         trial_live_commit(env, &scratch),
     ];
+    trials.push(run_trial(
+        "shallow clone でも、HEAD から切った枝の一撃統合は縮退しない",
+        trial_shallow_merge_tree(&scratch),
+    ));
+    trials.push(match env.driver_exe() {
+        Ok(exe) if env.driver_capable() => run_trial(
+            "sparse-checkout の cone の外にも union driver が当たる",
+            trial_sparse_union(&scratch, &exe),
+        ),
+        Ok(_) | Err(_) => Trial {
+            name: "sparse-checkout の cone の外にも union driver が当たる",
+            outcome: Outcome::Skipped,
+            detail: tr(
+                "merge driver を登録できる実行ファイルが無いので試せませんでした (実マージを起こす試行と同じ前提)",
+            ),
+        },
+    });
     trials.push(match env.driver_exe() {
         Ok(exe) if env.driver_capable() => run_trial(
             "一覧への両側追記が、実際の git merge で自動解決する",
@@ -2740,6 +3062,185 @@ fn trial_union_live(scratch: &Path, exe: &Path) -> Result<String, String> {
     ))
 }
 
+/// 実証: **sparse-checkout の cone の外にも union driver が当たる。**
+///
+/// ここは「⚠ だと書いてあったものを ✅ へ動かした」根拠そのものなので、
+/// 主張と同じ形を測る (`docs/conflict-zero.md` §3.11.5)。`git check-attr` は
+/// **代理**でしかない — 本当の保証は「実際の `git merge` が union を起こして
+/// 両側を残す」ことなので、マージまで通す。
+///
+/// cone mode と no-cone mode の両方を見る。no-cone では**頂点の
+/// `.gitattributes` 自体が作業ツリーに 1 バイトも無い**状態になるので、
+/// 「index から読んでいる」ことがここでしか確かめられない。
+fn trial_sparse_union(scratch: &Path, exe: &Path) -> Result<String, String> {
+    let repo = scratch.join("sparse");
+    make_repo(&repo, scratch)?;
+    let inside = repo.join("in");
+    let outside = repo.join("out");
+    std::fs::create_dir_all(&inside).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&outside).map_err(|e| e.to_string())?;
+    write(&inside.join("keep.txt"), "keep\n")?;
+    let list = outside.join("list.txt");
+    write(&list, VERIFY_BASE_LIST)?;
+    driver_install(&repo, exe)?;
+    write_attributes(&repo, &["*.txt".to_string()])?;
+    git(&repo, &["add", "-A"])?;
+    git(&repo, &["commit", "-m", "base", "--no-verify"])?;
+    let base = git(&repo, &["symbolic-ref", "--short", "HEAD"])?;
+
+    git(&repo, &["checkout", "-b", "zaivern-verify-theirs"])?;
+    write(&list, &format!("{VERIFY_BASE_LIST}{VERIFY_THEIRS_LINE}"))?;
+    git(&repo, &["commit", "-am", "theirs", "--no-verify"])?;
+    git(&repo, &["checkout", &base])?;
+    write(&list, &format!("{VERIFY_BASE_LIST}{VERIFY_OURS_LINE}"))?;
+    git(&repo, &["commit", "-am", "ours", "--no-verify"])?;
+
+    let mut modes: Vec<String> = Vec::new();
+    for (label, args) in [
+        ("cone", vec!["sparse-checkout", "set", "in"]),
+        ("no-cone", vec!["sparse-checkout", "set", "--no-cone", "/in/"]),
+    ] {
+        git(&repo, &args)?;
+        // out/ が本当に作業ツリーから消えていないと、この試行は
+        // 「素の作業ツリーをもう 1 回測っただけ」になる。**前提を確かめる。**
+        if list.exists() {
+            return Err(trf(
+                "{m}: cone の外 (out/list.txt) が作業ツリーに残っているので、sparse を測れていません",
+                &[("m", label.to_string())],
+            ));
+        }
+        let attrs_on_disk = repo.join(".gitattributes").exists();
+        git(&repo, &["merge", "--no-edit", "zaivern-verify-theirs"]).map_err(|e| {
+            trf(
+                "{m}: cone の外で git merge が衝突しました (union が当たっていません): {e}",
+                &[("m", label.to_string()), ("e", e)],
+            )
+        })?;
+        let blob = git(&repo, &["show", "HEAD:out/list.txt"])?;
+        if blob.contains("<<<<<<<")
+            || !blob.contains(VERIFY_OURS_LINE.trim())
+            || !blob.contains(VERIFY_THEIRS_LINE.trim())
+        {
+            return Err(trf(
+                "{m}: マージは通りましたが片側の追記が消えました: {t}",
+                &[("m", label.to_string()), ("t", blob.replace('\n', "⏎"))],
+            ));
+        }
+        git(&repo, &["reset", "--hard", &base])?;
+        modes.push(trf(
+            "{m} (.gitattributes は作業ツリーに{d})",
+            &[
+                ("m", label.to_string()),
+                (
+                    "d",
+                    if attrs_on_disk {
+                        tr("あり")
+                    } else {
+                        tr("無し = index から読んでいる")
+                    },
+                ),
+            ],
+        ));
+    }
+    git(&repo, &["sparse-checkout", "disable"])?;
+    Ok(trf(
+        "cone の外 (out/list.txt) への両側追記が、{list} のどちらでも衝突なしに解決しました",
+        &[("list", modes.join(" / "))],
+    ))
+}
+
+/// 実証: **shallow clone でも、HEAD から切った枝の `merge-tree` は通る。**
+///
+/// 「shallow だと一撃統合が縮退する」と書いていたが、落ちるのは
+/// **真の共通祖先が graft より下にある ref の組**だけである。
+/// coedit が混ぜるのは常に HEAD から切った局所枝なので、そこは落ちない。
+///
+/// **境界の両側を測る。** 通る側だけを見せると「shallow は大丈夫」という
+/// 別の嘘になるので、落ちる組も同じ試行の中で落ちることを確かめる。
+fn trial_shallow_merge_tree(scratch: &Path) -> Result<String, String> {
+    let origin = scratch.join("shallow-origin");
+    make_repo(&origin, scratch)?;
+    let f = origin.join("f.txt");
+    let mut body = String::new();
+    for i in 1..=12 {
+        body.push_str(&format!("line {i}\n"));
+        write(&f, &body)?;
+        git(&origin, &["add", "-A"])?;
+        git(&origin, &["commit", "-m", &format!("c{i}"), "--no-verify"])?;
+    }
+    let base = git(&origin, &["symbolic-ref", "--short", "HEAD"])?;
+    // graft より**下**に分岐点を持つ枝を 1 本作る (落ちる側の材料)。
+    git(&origin, &["checkout", "-b", "zaivern-old", "HEAD~9"])?;
+    write(&origin.join("g.txt"), "old\n")?;
+    git(&origin, &["add", "-A"])?;
+    git(&origin, &["commit", "-m", "old", "--no-verify"])?;
+    git(&origin, &["checkout", &base])?;
+
+    let clone = scratch.join("shallow-clone");
+    // **`file://` を通す。** ローカルパスの clone は git がハードリンクで
+    // 全部持ってくるので `--depth` が効かない (= shallow を測れない)。
+    let url = format!("file://{}", origin.display());
+    git(
+        scratch,
+        &[
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--no-single-branch",
+            &url,
+            &clone.display().to_string(),
+        ],
+    )?;
+    if !clone.join(".git").join("shallow").exists() {
+        return Err(tr(
+            "clone が shallow になりませんでした (この試行は shallow を測れていません)",
+        ));
+    }
+    for (k, v) in [
+        ("user.email", "czero-verify@example.invalid"),
+        ("user.name", "Zaivern czero verify"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&clone, &["config", "--local", k, v])?;
+    }
+
+    // ── 通る側: HEAD から切った 2 本 (coedit が作る形そのもの) ──────────
+    let head = git(&clone, &["symbolic-ref", "--short", "HEAD"])?;
+    git(&clone, &["checkout", "-b", "zaivern-w1"])?;
+    write(&clone.join("w1.txt"), "w1\n")?;
+    git(&clone, &["add", "-A"])?;
+    git(&clone, &["commit", "-m", "w1", "--no-verify"])?;
+    git(&clone, &["checkout", &head])?;
+    git(&clone, &["checkout", "-b", "zaivern-w2"])?;
+    write(&clone.join("w2.txt"), "w2\n")?;
+    git(&clone, &["add", "-A"])?;
+    git(&clone, &["commit", "-m", "w2", "--no-verify"])?;
+    git(&clone, &["merge-tree", "--write-tree", "zaivern-w1", "zaivern-w2"]).map_err(|e| {
+        trf(
+            "depth=1 の clone で、HEAD から切った枝どうしの merge-tree が落ちました: {e}",
+            &[("e", e)],
+        )
+    })?;
+
+    // ── 落ちる側: graft より古い分岐点を持つ組 ─────────────────────────
+    git(&clone, &["fetch", "--quiet", "origin", "zaivern-old"])?;
+    let cut = git(
+        &clone,
+        &["merge-tree", "--write-tree", "FETCH_HEAD", "zaivern-w1"],
+    );
+    if cut.is_ok() {
+        // 落ちないなら、この clone は測りたい境界を再現できていない。
+        // **「両方通った」を成功と数えない** (境界の主張が空になる)。
+        return Err(tr(
+            "graft より古い分岐点を持つ組でも merge-tree が通ってしまい、境界を再現できませんでした",
+        ));
+    }
+    Ok(tr(
+        "depth=1 の shallow clone で、HEAD から切った枝どうしの merge-tree は通り (coedit が混ぜる形)、graft より古い分岐点を持つ組だけが落ちました (境界は履歴の深さではなく共通祖先の有無)",
+    ))
+}
+
 /// 使い捨ての git リポジトリを作る。
 ///
 /// **ユーザーの global 設定に左右されないこと**が肝。署名の強制・
@@ -3002,6 +3503,44 @@ pub fn render_init(r: &InitReport) -> String {
     )
 }
 
+/// 親 + submodule 全部の `init` を 1 枚に。**何件へ届いたかを先頭に出す。**
+///
+/// 「1 件目だけ緑で残りが赤」を見落とさないよう、健全でない件数を見出しに置く。
+pub fn render_init_all(rs: &[InitReport]) -> String {
+    let bad = rs.iter().filter(|r| !r.healthy()).count();
+    let head = if bad == 0 {
+        trf(
+            "🚦 競合ゼロの導入 — {n} 件のリポジトリ (親 + submodule) すべてに入りました",
+            &[("n", rs.len().to_string())],
+        )
+    } else {
+        trf(
+            "🚦 競合ゼロの導入 — {n} 件中 {b} 件が守られていません",
+            &[("n", rs.len().to_string()), ("b", bad.to_string())],
+        )
+    };
+    let body: Vec<String> = rs.iter().map(render_init).collect();
+    format!("{head}\n\n{}", body.join("\n\n"))
+}
+
+/// 親 + submodule 全部の `doctor` を 1 枚に。
+pub fn render_doctor_all(ds: &[Doctor]) -> String {
+    let bad = ds.iter().filter(|d| !d.healthy()).count();
+    let head = if bad == 0 {
+        trf(
+            "🩺 競合ゼロの診断 — {n} 件のリポジトリ (親 + submodule) すべてに ❌ はありません",
+            &[("n", ds.len().to_string())],
+        )
+    } else {
+        trf(
+            "🩺 競合ゼロの診断 — {n} 件中 {b} 件に ❌ があります",
+            &[("n", ds.len().to_string()), ("b", bad.to_string())],
+        )
+    };
+    let body: Vec<String> = ds.iter().map(render_doctor).collect();
+    format!("{head}\n\n{}", body.join("\n\n"))
+}
+
 /// `doctor` の結果を人が読む形へ。
 pub fn render_doctor(d: &Doctor) -> String {
     // **作業ツリーが無い形は「未導入」ではない。** 「入れれば入る」と読める
@@ -3150,6 +3689,25 @@ pub fn init_json(r: &InitReport) -> serde_json::Value {
     })
 }
 
+/// `init --recurse-submodules --json`。**必ず配列**で出す
+/// (1 件のときも配列にしないと、読む側が形で分岐することになる)。
+pub fn init_all_json(rs: &[InitReport]) -> serde_json::Value {
+    serde_json::json!({
+        "repos": rs.iter().map(init_json).collect::<Vec<_>>(),
+        "count": rs.len(),
+        "healthy": rs.iter().all(InitReport::healthy),
+    })
+}
+
+/// `doctor --recurse-submodules --json`。
+pub fn doctor_all_json(ds: &[Doctor]) -> serde_json::Value {
+    serde_json::json!({
+        "repos": ds.iter().map(doctor_json).collect::<Vec<_>>(),
+        "count": ds.len(),
+        "healthy": ds.iter().all(Doctor::healthy),
+    })
+}
+
 /// `doctor --json`。
 pub fn doctor_json(d: &Doctor) -> serde_json::Value {
     serde_json::json!({
@@ -3173,6 +3731,11 @@ pub fn shape_json(sh: &Shape) -> serde_json::Value {
         "linked_worktree": sh.linked_worktree,
         "inside_submodule": sh.inside_submodule,
         "submodules": sh.submodules,
+        "submodule_tree": sh.submodule_tree.iter().map(|s| serde_json::json!({
+            "rel": s.rel,
+            "path": s.path.display().to_string(),
+            "active": s.active,
+        })).collect::<Vec<_>>(),
         "sparse_checkout": sh.sparse,
         "shallow": sh.shallow,
         "lfs": sh.lfs,
@@ -3240,10 +3803,16 @@ pub fn uninstall_json(u: &UninstallReport) -> serde_json::Value {
 pub const HELP: &str = "\
 czero (どのリポジトリでも競合が起きないようにする — 導入 / 診断 / 実証 / 撤去):
   zai czero init [--repo <パス>] [--dry-run] [--json]
+                 [--recurse-submodules] [--git-init]
         1 コマンドで守りを入れる (冪等)。台帳 → git フック → merge driver →
         .gitattributes の順に入れ、**最後に必ず自己検査する**。
         --dry-run は 1 バイトも書かずに予定だけ出す。
-  zai czero doctor [--repo <パス>] [--json]
+        --recurse-submodules は**入れ子まで辿って submodule 全部**へ同じ導入を
+        する (submodule は別リポジトリなので、親へ入れた守りは 1 つも届かない)。
+        --git-init は git 管理でないフォルダを git 化してから入れる
+        (非 git は「台帳だけ効いて強制が 1 つも無い」いちばん危ない形なので、
+         **明示したときだけ**通す)。
+  zai czero doctor [--repo <パス>] [--json] [--recurse-submodules]
         段ごとに ✅ / ⚠ / ❌ と理由と直し方を出す (書き換えない)。
         未導入なら「未導入です」と 1 行で出す (エラーにしない)。
         **非 git / bare / sparse-checkout / LFS / submodule / linked worktree /
@@ -3300,6 +3869,8 @@ pub fn cli_main(argv: &[String]) -> i32 {
     let (keep, rest) = take_flag(&rest, "--keep");
     let (strict, rest) = take_flag(&rest, "--strict");
     let (purge, rest) = take_flag(&rest, "--purge");
+    let (recurse, rest) = take_flag(&rest, "--recurse-submodules");
+    let (git_init, rest) = take_flag(&rest, "--git-init");
     if let Some(x) = rest.first() {
         return usage(&trf("余分な引数です: {x}", &[("x", x.clone())]));
     }
@@ -3319,10 +3890,42 @@ pub fn cli_main(argv: &[String]) -> i32 {
     env.dry_run = dry;
 
     match sub {
-        "init" => match init(&env) {
-            Ok(r) => {
-                emit(json, || init_json(&r), || render_init(&r));
-                if r.healthy() {
+        "init" => {
+            if git_init {
+                if let Err(e) = ensure_git_repo(&env) {
+                    return runtime(&e);
+                }
+            }
+            if recurse {
+                match init_all(&env) {
+                    Ok(rs) => {
+                        emit(json, || init_all_json(&rs), || render_init_all(&rs));
+                        if rs.iter().all(InitReport::healthy) {
+                            EXIT_OK
+                        } else {
+                            EXIT_UNHEALTHY
+                        }
+                    }
+                    Err(e) => runtime(&e),
+                }
+            } else {
+                match init(&env) {
+                    Ok(r) => {
+                        emit(json, || init_json(&r), || render_init(&r));
+                        if r.healthy() {
+                            EXIT_OK
+                        } else {
+                            EXIT_UNHEALTHY
+                        }
+                    }
+                    Err(e) => runtime(&e),
+                }
+            }
+        }
+        "doctor" if recurse => match doctor_all(&env) {
+            Ok(ds) => {
+                emit(json, || doctor_all_json(&ds), || render_doctor_all(&ds));
+                if ds.iter().all(Doctor::healthy) {
                     EXIT_OK
                 } else {
                     EXIT_UNHEALTHY
@@ -4389,7 +4992,13 @@ mod tests {
         assert_eq!(sh.submodules, vec!["child".to_string()]);
         let doc = doctor(&env).expect("診断");
         全段が埋まっている(&doc.findings);
-        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Warn);
+        // 本物の `git submodule add` が通れば child は初期化済み (⚠ = 届かない)。
+        // `.gitmodules` を手で置いただけなら**未初期化**なので ❌ が正しい
+        // (あとで checkout した瞬間にそこだけ素通りになるため)。
+        assert_eq!(
+            worst(&doc.findings, Stage::Shape),
+            if added { Mark::Warn } else { Mark::Bad }
+        );
         assert!(
             reason_has(&doc.findings, Stage::Shape, "submodule"),
             "submodule へ届かないことを言っていない"
@@ -4404,6 +5013,214 @@ mod tests {
                 "submodule の中に居ることを検出していない: {sh_in:?}"
             );
         }
+    }
+
+    // `.gitmodules` を辿るのはここだけなので、**輪と入れ子と未初期化**を
+    // 1 つの表で固定する。git を 1 回も叩かないので、どの環境でも同じ答えになる。
+    #[test]
+    fn submoduleの列挙は入れ子を辿り輪で止まる() {
+        let d = ShapeDir::new("subtree");
+        let root = d.0.join("root");
+        // root ─ a ─ b、そして b は root を指す (輪)。
+        for (dir, entries) in [
+            ("root", vec![("a", "a")]),
+            ("root/a", vec![("b", "b")]),
+            // `back` は**輪** (root へ戻る)、`escape` は**頂点の外**。
+            // どちらも辿ってはいけない。
+            ("root/a/b", vec![("back", "../.."), ("escape", "../../../evil")]),
+        ] {
+            let p = d.0.join(dir);
+            std::fs::create_dir_all(&p).unwrap();
+            // `.git` を置いた場所だけが「初期化済み」。
+            std::fs::write(p.join(".git"), "gitdir: x").unwrap();
+            let text: String = entries
+                .iter()
+                .map(|(name, path)| {
+                    format!("[submodule \"{name}\"]\n\tpath = {path}\n\turl = ./{name}\n")
+                })
+                .collect();
+            std::fs::write(p.join(".gitmodules"), text).unwrap();
+        }
+        // 初期化されていない submodule を 1 件足す (ディレクトリごと無い)。
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"a\"]\n\tpath = a\n\turl = ./a\n\
+             [submodule \"dead\"]\n\tpath = dead\n\turl = ./dead\n",
+        )
+        .unwrap();
+
+        let got = submodule_repos(&root);
+        let rels: Vec<&str> = got.iter().map(|s| s.rel.as_str()).collect();
+        // 深さ優先 = 親のすぐ後ろにその子が並ぶ。
+        assert_eq!(
+            rels,
+            vec!["a", "a/b", "dead"],
+            "入れ子まで辿れていないか、順序が決定的でない: {got:?}"
+        );
+        assert_eq!(
+            got.iter().map(|s| s.active).collect::<Vec<_>>(),
+            vec![true, true, false],
+            "初期化済みかどうかを取り違えている: {got:?}"
+        );
+        // 輪 (`a/b/back` が root を指す) で止まっていること。
+        assert!(
+            !rels.iter().any(|r| r.contains("back")),
+            "輪を踏んで戻ってきている: {rels:?}"
+        );
+        // **頂点の外を指す綴りを 1 つも辿っていないこと。**
+        // `.gitmodules` は追跡されたファイルなので、clone した相手が
+        // `path = ../../../evil` と書ける。辿るとリポジトリの外へ
+        // フックを書き込むことになる。
+        assert!(
+            !rels.iter().any(|r| r.contains("escape")),
+            "頂点の外を指す submodule を辿っている: {rels:?}"
+        );
+        for s in &got {
+            assert!(
+                s.path.starts_with(canon(root.clone())),
+                "頂点の外の場所を返している: {}",
+                s.path.display()
+            );
+        }
+        // 2 回呼んでも同じ (診断は並びが変わらないことを約束している)。
+        assert_eq!(submodule_repos(&root), got);
+    }
+
+    /// **これが「submodule ⚠ → ✅」の本体。** 親へ入れただけでは
+    /// submodule のコミットは素通りするので、実際に両方へ入ることを見る。
+    #[test]
+    fn recurse_submodulesは親とsubmodule両方へ入れる() {
+        let d = ShapeDir::new("recurse");
+        let child = d.repo("child");
+        let parent = d.repo("parent");
+        let added = git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--",
+                &child.to_string_lossy(),
+                "child",
+            ],
+        )
+        .is_ok();
+        if !added {
+            eprintln!("[skip] この git では file プロトコルの submodule add が使えない");
+            return;
+        }
+        let env = d.env(&parent);
+        let rs = init_all(&env).expect("親と submodule へ導入");
+        assert_eq!(rs.len(), 2, "submodule へ届いていない: {rs:?}");
+
+        // **フックが submodule 側の置き場に入っていること**が保証の実体。
+        // 親の `.git/hooks` を見ても submodule のコミットは止まらない。
+        // 「ファイルがある」ではなく「**zaivern のフックである**」まで見る
+        // (他人のフックが居るだけの状態を緑と数えないため)。
+        for r in &rs {
+            let hooks = read_hooks(&r.repo).expect("フック置き場");
+            assert!(
+                hooks.names(HookState::Ours).contains(&"pre-commit".to_string()),
+                "{} に zaivern の pre-commit が入っていない ({})",
+                r.repo.display(),
+                hooks.dir.display()
+            );
+        }
+        // 親と submodule のフック置き場は**別**であること
+        // (同じなら「届いた」の検査が空になる)。
+        let a = hooks_dir(&rs[0].repo).unwrap();
+        let b = hooks_dir(&rs[1].repo).unwrap();
+        assert!(!same_path(&a, &b), "親と submodule が同じ置き場を指している");
+
+        // 冪等: 2 回打っても同じ件数で、全部緑のまま。
+        let again = init_all(&env).expect("2 回目");
+        assert_eq!(again.len(), rs.len());
+    }
+
+    /// 未初期化の submodule は**飛ばさずに赤で残す**。黙って飛ばすと、
+    /// あとで checkout した瞬間にそこだけ素通りになる。
+    #[test]
+    fn 未初期化のsubmoduleは飛ばさず赤で残す() {
+        let d = ShapeDir::new("subdead");
+        let parent = d.repo("parent");
+        std::fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"dead\"]\n\tpath = dead\n\turl = ./dead\n",
+        )
+        .unwrap();
+        let env = d.env(&parent);
+        let rs = init_all(&env).expect("導入");
+        assert_eq!(rs.len(), 2);
+        assert!(!rs[1].healthy(), "未初期化を緑にしている: {:?}", rs[1]);
+        assert!(
+            rs[1].steps.iter().any(|s| s.action == Action::Failed),
+            "飛ばした理由が段として残っていない: {:?}",
+            rs[1].steps
+        );
+        assert!(
+            !render_init_all(&rs).contains("すべてに入りました"),
+            "届いていないのに全部入ったと出している"
+        );
+    }
+
+    /// 非 git は「台帳だけ効いて強制が 1 つも無い」いちばん危ない形なので、
+    /// **`--git-init` を明示したときだけ**通す。既定では 1 バイトも書かない。
+    #[test]
+    fn git_initは明示したときだけgit化する() {
+        let d = ShapeDir::new("gitinit");
+        let plain = d.0.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let env = d.env(&plain);
+
+        // 既定: git 化しない (init はそもそも作業ツリーを見つけられない)。
+        assert!(init(&env).is_err(), "非 git で黙って導入している");
+        assert!(!plain.join(".git").exists(), "頼まれずに git 化している");
+
+        // --dry-run: 1 バイトも書かない。
+        let mut dry = env.clone();
+        dry.dry_run = true;
+        ensure_git_repo(&dry).expect("下見");
+        assert!(!plain.join(".git").exists(), "--dry-run が git 化している");
+
+        // 明示すれば git 化して、そのあと導入が通る。
+        ensure_git_repo(&env).expect("git 化");
+        assert!(plain.join(".git").exists(), "git 化していない");
+        let r = init(&env).expect("git 化のあとは導入できる");
+        assert!(
+            r.steps.iter().all(|s| s.action != Action::Failed),
+            "git 化のあとで落ちた段がある: {:?}",
+            r.steps
+        );
+
+        // **案内が輪にならないこと。** 追跡ファイルが 0 件のリポジトリで
+        // 「もう一度 czero init」と出すと、何度打っても同じ画面に戻る。
+        let attrs: Vec<&Finding> = r
+            .findings
+            .iter()
+            .filter(|f| f.stage == Stage::Attributes)
+            .collect();
+        assert!(!attrs.is_empty(), ".gitattributes の段が空");
+        for f in &attrs {
+            assert_ne!(
+                f.mark,
+                Mark::Bad,
+                "git 化した直後を ❌ にしている: {}",
+                f.reason
+            );
+            assert!(
+                !f.fix.trim().is_empty() && f.fix != "zai czero init",
+                "案内が輪になっている (もう一度 init しても 0 件のまま): {}",
+                f.fix
+            );
+        }
+
+        // bare では断る (git 化しても作業ツリーは生えない)。
+        let bare = d.0.join("bare.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "--bare"]).unwrap();
+        let e = ensure_git_repo(&d.env(&bare)).expect_err("bare は断る");
+        assert!(e.contains("bare"), "bare だと言っていない: {e}");
     }
 
     #[test]
@@ -4426,8 +5243,19 @@ mod tests {
         assert!(!sh.lfs, "sparse なだけのリポジトリを LFS と判定した");
         let doc = doctor(&env).expect("診断");
         全段が埋まっている(&doc.findings);
-        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Warn);
-        assert!(reason_has(&doc.findings, Stage::Shape, ".gitattributes"));
+        // **⚠ から ✅ へ動かした。** 以前は「cone の外の .gitattributes は
+        // 効かない」と出していたが、git は作業ツリーに無い `.gitattributes` を
+        // **index から読む**。`trial_sparse_union` が cone / no-cone の両方で
+        // 実マージまで通して確かめている。
+        assert_eq!(worst(&doc.findings, Stage::Shape), Mark::Ok);
+        assert!(reason_has(&doc.findings, Stage::Shape, "index から読む"));
+        // 「実証が触れていない形態」からも外れていること
+        // (試していないと言い続けると、直したことが利用者に届かない)。
+        assert!(
+            !sh.untested_notes().iter().any(|n| n.contains("sparse")),
+            "sparse を実証していないと言い続けている: {:?}",
+            sh.untested_notes()
+        );
     }
 
     #[test]
@@ -4758,21 +5586,44 @@ mod tests {
                 "親リポジトリ",
             ),
             (
-                "submodule を抱える",
-                case(&|s| s.submodules = vec!["child".into()]),
+                "submodule を抱える (初期化済み)",
+                case(&|s| {
+                    s.submodules = vec!["child".into()];
+                    s.submodule_tree = vec![SubRepo {
+                        rel: "child".into(),
+                        path: std::env::temp_dir().join("child"),
+                        active: true,
+                    }];
+                }),
                 Mark::Warn,
-                "submodule",
+                "--recurse-submodules",
             ),
+            (
+                "submodule が未初期化",
+                case(&|s| {
+                    s.submodules = vec!["child".into()];
+                    s.submodule_tree = vec![SubRepo {
+                        rel: "child".into(),
+                        path: std::env::temp_dir().join("child"),
+                        active: false,
+                    }];
+                }),
+                Mark::Bad,
+                "初期化されていません",
+            ),
+            // **sparse と shallow は ⚠ から ✅ へ動かした。**
+            // 以前の記述は実測で否定された (`trial_sparse_union` /
+            // `trial_shallow_merge_tree` / `tools/repo-shapes-prove.sh`)。
             (
                 "sparse-checkout",
                 case(&|s| s.sparse = true),
-                Mark::Warn,
-                ".gitattributes",
+                Mark::Ok,
+                "index から読む",
             ),
             (
                 "shallow",
                 case(&|s| s.shallow = true),
-                Mark::Warn,
+                Mark::Ok,
                 "merge-tree",
             ),
             ("LFS だけ", case(&|s| s.lfs = true), Mark::Ok, "git-lfs"),
@@ -4849,7 +5700,7 @@ mod tests {
     fn verifyは実際に止まることを確かめる() {
         let f = Fixture::new("verify");
         let v = verify(&f.env, false);
-        assert_eq!(v.trials.len(), 5, "実証の本数が変わった");
+        assert_eq!(v.trials.len(), 7, "実証の本数が変わった");
         for t in &v.trials {
             assert_ne!(
                 t.outcome,
@@ -4931,7 +5782,7 @@ mod tests {
             .iter()
             .filter(|t| t.outcome == Outcome::Skipped)
             .collect();
-        assert_eq!(skipped.len(), 2, "試せない 2 本が Skipped になっていない");
+        assert_eq!(skipped.len(), 3, "試せない 3 本が Skipped になっていない");
         for t in skipped {
             assert!(!t.detail.trim().is_empty(), "なぜ試せないかを出していない");
         }
@@ -4962,9 +5813,9 @@ mod tests {
         // JSON にも段と理由が出ること。
         let j = verify_json(&v);
         assert_eq!(j["verdict"], "partial");
-        assert_eq!(j["counts"]["skipped"], 2);
+        assert_eq!(j["counts"]["skipped"], 3);
         let sk = j["skipped"].as_array().expect("skipped 配列");
-        assert_eq!(sk.len(), 2);
+        assert_eq!(sk.len(), 3);
         for x in sk {
             assert!(!x["reason"].as_str().unwrap_or_default().trim().is_empty());
         }

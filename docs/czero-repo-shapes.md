@@ -47,8 +47,16 @@ union driver が解決する。同じファイルでも離れた行なら 2 人�
 強制は 1 つも無い**。人間の `git commit` も、台帳を知らないエージェントも、
 1 つも止まらない。`czero doctor` はこの非対称をそのまま出す。
 
-直し方: `git init` するか、`--repo` で git リポジトリを指す。強制が要らない
+ただし**静かには壊れない**: `zai lease claim` は `Roots::rooted` が偽なので
+**断る** (台帳を新しく作る操作だけ。`status` / `list` は従来どおり動く)。
+
+直し方: **`zai czero init --git-init`** — その場で `git init` してから
+守りを全部入れる。勝手にリポジトリを生やさないよう、**このフラグを
+打った人だけ**が通れる (`--dry-run` は 1 バイトも書かない)。
+`--repo` で別の git リポジトリを指してもよい。強制が要らない
 （同意ベースで足りる）なら `zai lease list` で台帳だけを見る。
+ファイル監視やラッパーを代替に検討して**採らなかった**理由は
+[docs/repo-shapes.md](repo-shapes.md) §5。
 
 ### bare リポジトリ — ❌
 
@@ -68,33 +76,54 @@ union driver が解決する。同じファイルでも離れた行なら 2 人�
 別ブランチをチェックアウトしている worktree では中身が違うことがある
 (git の通常の挙動どおり)。
 
-### submodule — ⚠
+### submodule — ⚠ (`--recurse-submodules` を打てば ✅)
 
-保証される: 実行した側のリポジトリ (親なら親、submodule 内なら submodule)。
+保証される: 実行した側のリポジトリ。**`zai czero init --recurse-submodules`
+を打てば、入れ子まで辿って submodule 全部**に同じ導入が入る
+(`.gitmodules` を深さ優先で辿る。実測で 2 段目の submodule まで
+関所・union・merge-tree のすべてが効くことを確認した)。
 
-保証されない: **反対側**。submodule は別リポジトリで、独自の
-`.git/config`・独自のフック置き場 (`.git/modules/<名>/hooks`) を持つ。
-親で `czero init` しても submodule 内のコミットは素通りする。逆も同じ。
+保証されない: 打っていないとき。submodule は別リポジトリで、独自の
+`.git/config`・独自のフック置き場 (`.git/modules/<名>/hooks`) を持つので、
+親で `czero init` しても submodule 内のコミットは素通りする。
+**初期化されていない submodule には入らない** (作業ツリーが空なので)。
+その場合は ❌ として名指しする — 黙って飛ばすと、あとで checkout した
+瞬間にそこだけ素通りになる。
 
-直し方: `zai czero init --repo <submodule のパス>` を submodule ごとに。
+直し方: `zai czero init --recurse-submodules`
+(未初期化があるなら先に `git submodule update --init --recursive`)。
+実測は [docs/repo-shapes.md](repo-shapes.md) §2。
 
-### sparse-checkout — ⚠
+### sparse-checkout — ✅ (**以前の ⚠ は前提が誤りだった**)
 
-保証される: 台帳とフックは**stage されたパス**を見るので、cone の中は
-普通どおりに守られる。cone の外のファイルはそもそも stage されない。
+保証される: 台帳とフックは**stage されたパス**を見るので cone の中は普通どおり。
+**`.gitattributes` も cone の外へ効く。** git は作業ツリーに無い
+`.gitattributes` を **index から読む**ので、cone mode でも no-cone mode でも
+cone の外のパスに union driver が当たる。**頂点の `.gitattributes` 自体が
+作業ツリーに 1 バイトも無い no-cone** でも、両側追記が実 `git merge` で
+衝突なしに解決した。
 
-保証されない: `.gitattributes` の側。cone の外にある `.gitattributes` は
-作業ツリーに無く、`czero init` が書くのも頂点の 1 枚だけ。**cone を後から
-広げると、そこだけ union が当たらない**ことがある。広げたら `doctor` を
-打ち直すこと。
+以前ここには「cone の外にある `.gitattributes` は効かない」と書いてあったが、
+実測が否定した。`czero verify` の `trial_sparse_union` が cone / no-cone の
+両方を実際に起こして実マージまで通すので、壊れたら実証が落ちる。
 
-### shallow clone — ⚠
+保証されない: 特になし。実測は [docs/repo-shapes.md](repo-shapes.md) §3
+(`$GIT_DIR/info/attributes` を使う案を**採らなかった**理由もそこにある —
+最高優先度なので利用者の `merge=lfs` を黙って潰す)。
 
-保証される: フックと台帳 (履歴を見ないので影響なし)。
+### shallow clone — ✅ (範囲を限って)
 
-保証されない: `git merge-tree --write-tree` は共通祖先が要るので、
-切り落とされた履歴に共通祖先がある組では失敗し、`coedit` の一撃統合が
-縮退する。`git fetch --unshallow` で戻る。
+保証される: フックと台帳 (履歴を見ないので影響なし)。**一撃統合も縮退しない。**
+`git merge-tree --write-tree` が落ちるのは「2 つの ref の**真の共通祖先が
+graft 点より下**」のときだけで (`fatal: refusing to merge unrelated histories`)、
+`coedit` が混ぜるのは**いまの HEAD から切った局所枝**なので共通祖先は常に
+HEAD 自身 = 必ず手元にある。**depth=1 の clone でも実測 rc=0。**
+
+保証されない: graft より古い分岐点を持つ **fetch してきた ref どうし**を
+混ぜるとき。`git fetch --deepen=<数>` (実測で共通祖先が現れるまで深めれば通る)
+か `--unshallow` で戻る。**`--allow-unrelated-histories` は使ってはいけない** —
+共通祖先を空ツリーと見なすので、両側が持つ全ファイルが**偽の衝突**になる
+(縮退ではなく誤った答え)。実測は [docs/repo-shapes.md](repo-shapes.md) §4。
 
 ### git-lfs — ✅ / ❌ (書き方による)
 
@@ -174,6 +203,16 @@ UNC パス (`\\server\share`) のような**構造で判る**信号が要るな�
 `verify` は対象の形態を見て、扱えていないものを見出しの直後に列挙する
 (`--json` なら `untested_shapes`)。これを黙ると「守られています」が
 リポジトリ全体の保証に読めてしまう。
+
+**sparse-checkout はこの一覧から外れた。** `trial_sparse_union` が
+cone / no-cone の両方を実際に起こして実マージまで通すようになったため。
+shallow は「HEAD から切った枝は通る」ところまでを `trial_shallow_merge_tree`
+が実証するが、**graft より古い ref どうし**は対象リポジトリの履歴でしか
+試せないので一覧に残る。
+
+形ごとの実測を通しで取り直すハーネスは
+[`tools/repo-shapes-prove.sh`](../tools/repo-shapes-prove.sh) (決定的・`--seed` 対応)。
+結果と、⚠ / ❌ を動かした根拠は [docs/repo-shapes.md](repo-shapes.md)。
 
 ## 判定の 3 段 (`verify` の `verdict`)
 
