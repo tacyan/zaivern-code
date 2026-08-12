@@ -14828,7 +14828,7 @@ mod shell_line_tests {
 // ─── 選択と「出力で流れた画面」のずれ ──────────────────────────────
 
 #[cfg(test)]
-mod selection_scroll_tests {
+mod selection_scroll_pty_tests {
     use super::{normalize_sel, selection_text, Session, SpawnSpec};
     use crate::lockx::lock_ok;
     use std::sync::atomic::Ordering;

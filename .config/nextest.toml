@@ -7,11 +7,17 @@
 # プロセスグループごと kill するため、孤児が stdout パイプを
 # 掴み続けることがない。
 #
-# 直列化するのは「実際に PTY を起動する 4 モジュール」だけである点に注意。
+# **分類は「モジュール名に pty を含むか」で決まる。** 以前は 4 モジュールを
+# 名指しする**ブロックリスト**だったが、新しく実 PTY を起動するテスト
+# (`selection_scroll_pty_tests`) を足したときに `fast` 側へ混ざり、
+# Windows で 3 件が 20 秒で時間切れした。**名前で決まる形なら足すだけで正しく分類される。**
+# 実 PTY を起動するテストモジュールには必ず `pty` を名前に入れること。
+#
+# 直列化するのは「実際に PTY を起動するモジュール」だけである点に注意。
 # terminal:: には純粋なロジックテストが約 100 件あり、それらを直列化するのは
 # CI 時間の丸損だった (5 分予算のための最重要チューニング)。
 #
-# 実行例: cargo nextest run --profile ci -E 'not test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+# 実行例: cargo nextest run --profile ci -E 'not test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
 
 [profile.ci]
 # 60 秒応答なしでプロセスグループごと terminate (SIGTERM 後 5 秒待って SIGKILL)。
@@ -28,7 +34,7 @@ pty = { max-threads = 1 }
 
 [[profile.ci.overrides]]
 # 実 PTY を起動するモジュールのみ。他の terminal:: テストは並列で構わない。
-filter = 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+filter = 'test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
 test-group = "pty"
 # 実シェル起動を伴うが keep-alive スリープは 5-10 秒に短縮済みのため 45 秒で十分。
 # ハング 1 件のコストは ≤50 秒 (旧設定の 4 分から短縮)。
