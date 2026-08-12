@@ -821,7 +821,13 @@ struct MenuAnswer {
 }
 
 /// 番号 1〜9 の応答表。**表示される文字列は 4 本だった頃と 1 字も変わらない。**
-const MENU_ANSWERS: [MenuAnswer; 9] = [
+///
+/// **長さを書かない** (`[MenuAnswer; 9]` にしない)。複数の枝が 1 つずつ足すと
+/// 全員が同じ N+1 を書くので、git は衝突を出さないのに要素数が合わなくなる
+/// (`keybinds::ALL_ACTIONS` で実際に起きた形)。使うのは `.get(idx)` と
+/// `.iter()` だけなので、スライスで足りる。
+/// 番人は `union::handcounted_len::module直下の手書き長は既知の分だけ`。
+const MENU_ANSWERS: &[MenuAnswer] = &[
     MenuAnswer {
         key: b"1\r",
         allow: "番号メニューの承認肢「1」",

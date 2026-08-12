@@ -4795,26 +4795,11 @@ mod handcounted_len {
             ("failover.rs", "LADDER", "停止シグナルの梯子。増えうる・範囲外"),
             ("whichkey.rs", "DIGIT_KEYS", "数字キー 1〜9。10 個目は無い"),
             ("zoom.rs", "STEPS", "ズーム段。設計された曲線・範囲外"),
-            (
-                "terminal.rs",
-                "MENU_KEYS",
-                "承認メニューの選択キー。下の 3 本と長さを揃える必要がある",
-            ),
-            (
-                "terminal.rs",
-                "MENU_DESC_ALLOW",
-                "MENU_KEYS と添字で対応する並行配列",
-            ),
-            (
-                "terminal.rs",
-                "MENU_DESC_SKIP",
-                "MENU_KEYS と添字で対応する並行配列",
-            ),
-            (
-                "terminal.rs",
-                "MENU_DESC_RATING",
-                "MENU_KEYS と添字で対応する並行配列",
-            ),
+            // 承認メニューの 4 本 (MENU_KEYS / MENU_DESC_ALLOW / MENU_DESC_SKIP /
+            // MENU_DESC_RATING) は**返済済み**。添字で対応する並行配列だったので、
+            // 長さが揃っていても*対応がずれる*ぶんはコンパイラが何も言わなかった。
+            // 1 本の `MENU_ANSWERS: &[MenuAnswer]` へ束ね、長さも書かない形にした
+            // (表示される 36 文字列は 1 字も変えていない)。
             ("terminal.rs", "SIG_MARKS", "出力の目印。増えうる・範囲外"),
             ("editor_ops.rs", "AUTO_PAIRS", "自動対応する括弧。範囲外"),
             ("coedit.rs", "IDENT", "共同編集の識別子。範囲外 (他が編集中)"),
