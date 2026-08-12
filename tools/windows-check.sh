@@ -20,6 +20,30 @@
 #   tools/windows-check.sh --wine git:: # 実行するテストを絞る
 #   tools/windows-check.sh keybinds::   # そのテストを Windows バイナリで実行 (--wine と同じ)
 #
+# ## ビルド置き場 (並列で走らせるときに効く)
+#
+# 既定では **ワークツリーごとに別の target** を使う。隔離ワークツリーで
+# 複数のエージェントが同時に走っても、互いの診断が混ざらない。
+#
+#   ZAIVERN_WINDOWS_TARGET=<path>   置き場を明示する (最優先)
+#   ZAIVERN_WINDOWS_TARGET_SHARED=1 全ワークツリーで 1 つを共有する。
+#                                   ツリーが 1 つだけならキャッシュが効いて速い。
+#                                   **並列で走らせているときは立てない**
+#
+# ## 既知の穴 — cargo-xwin 側の競合 (target を分けても残る)
+#
+# cargo-xwin は**起動のたびに**共有キャッシュの `clang-cl` シンボリックリンクを
+# 作り直す (macOS なら `~/Library/Caches/cargo-xwin/clang-cl`)。そのため
+# **2 本を完全に同時に起こすと必ず片方が落ちる**:
+#
+#   Error: Failed to setup clang-cl symlink
+#   Caused by: ... File exists (os error 17)
+#
+# これは CARGO_TARGET_DIR とは無関係で、ここで直せるものではない
+# (この版の cargo-xwin にキャッシュ位置を変える引数が無く、SDK は 1.1GB
+#  あるのでワークツリーごとに持たせるのも現実的でない)。
+# **数秒ずらして起こせば当たらない。** 落ちたら間を空けて撃ち直すこと。
+#
 # ## どこまで担保できるか (正直な話)
 #
 #   * **担保できる**: コンパイルとリンク。`#[cfg(windows)]` の型エラー・
@@ -53,7 +77,32 @@ cd "$root"
 # 成果物で macOS のビルドが無効化され、戻ったときにフルビルドが走る。
 # TMPDIR は macOS では per-user、Linux では /tmp。どちらでも書ける場所になる。
 tmp=${TMPDIR:-/tmp}
-target=${ZAIVERN_WINDOWS_TARGET:-"${tmp%/}/zaivern-windows-target"}
+
+# **さらに、ワークツリーごとに分ける。** 以前はここが固定パス
+# (`$TMPDIR/zaivern-windows-target`) だったため、隔離ワークツリーで複数の
+# エージェントが同時に走ると **全員が 1 つの target を共有**していた。
+# cargo のビルドロックは target ディレクトリ単位なので直列化するだけでなく、
+# **別のツリーの失敗した診断が自分のエラーとして再生される**:
+#
+#   実測 — 自分のツリーには確かに在る定数が `E0425 cannot find value` で落ちた。
+#   `touch build.rs` で通ったので「古いキャッシュ」と誤診したが、真因は
+#   **隣のツリーの診断の再生**だった。target を分けたら 31.9 秒で緑になった。
+#
+# 「自分のコードが悪い」と読める嘘を出すので、既定は必ず分離する。
+# 分ける鍵は**ワークツリーの絶対パス**から導く (linux-test.sh と同じ流儀。
+# パスを直書きしない)。basename は人が読むため、cksum は衝突を避けるため。
+if [ -n "${ZAIVERN_WINDOWS_TARGET:-}" ]; then
+    # 明示指定が最優先 (従来どおりの逃げ道)。
+    target=$ZAIVERN_WINDOWS_TARGET
+elif [ "${ZAIVERN_WINDOWS_TARGET_SHARED:-0}" = 1 ]; then
+    # **共有したい人のための明示的な手段。** ワークツリーを 1 つしか動かして
+    # いないなら、キャッシュを使い回せて速い。並列で走らせているときに
+    # これを立てると上の誤診が戻ってくるので、既定にはしない。
+    target="${tmp%/}/zaivern-windows-target"
+else
+    slug=$(printf '%s' "$root" | cksum | cut -d' ' -f1)
+    target="${tmp%/}/zaivern-windows-target-$(basename "$root")-$slug"
+fi
 
 # CI の windows-latest は MSVC。既定はそれに合わせる (target_env が食い違わない)。
 triple=${ZAIVERN_WINDOWS_TRIPLE:-x86_64-pc-windows-msvc}
