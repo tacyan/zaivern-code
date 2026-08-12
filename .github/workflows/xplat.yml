@@ -232,12 +232,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     name: shapes (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # **まだ実測が無いので広めに取る。** 30 分では足りず 29 分 33 秒で
-    # cancelled になったが、出力を溜め込んでいたため**内訳が残らなかった**。
-    # 上の tee で内訳が出るようになったので、1 度完走したら実測に合わせて
-    # 締め直すこと (週次なので wall-clock は貴重ではないが、
-    # 「いくらでもいい」にすると本当に壊れたときに気付けない)。
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       # probe と同じ理由。`.sh` が CRLF で降りると git-bash が実行できない。
       - name: 改行を LF に固定 (Windows のみ)
@@ -444,7 +439,13 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: proof (2400 ケース)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # **実測に基づく予算。** tee でログが残るようにして初めて内訳が取れた:
+    # ビルドは 53 秒で終わり、**テスト本体が 28 分 47 秒走って打ち切られた**
+    # (手元 macOS では 244.7 秒。CI の ubuntu は約 7 倍遅い)。
+    # 30 分では足りないので広げる。週次なので wall-clock は貴重ではないが、
+    # 「いくらでもいい」にすると本当に壊れたときに気付けないので上限は置く。
+    # 1 度完走したら実測に合わせて締め直すこと。
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
