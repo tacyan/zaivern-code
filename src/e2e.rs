@@ -1622,6 +1622,117 @@ mod ime_tests {
             );
         }
     }
+
+    /// **確定文字列が `Text` としても届く環境でも、CJK は二重に入らない。**
+    ///
+    /// 同じフレームに `Ime::Commit("日本語")` と `Text("日本語")` が両方
+    /// 届く環境がある (Windows の一部 IME)。egui-winit 0.29 の 2 経路 —
+    /// `WindowEvent::Ime` (lib.rs:358) と `WindowEvent::KeyboardInput`
+    /// (同 786) — は**互いに何も知らない**ので、素通しすると `TextEdit` が
+    /// 両方を挿入して `"日本語日本語"` になる。実測で確認済みだった壊れ方。
+    ///
+    /// 影響範囲は端末ではなく**アプリのほぼ全ての入力欄** —
+    /// コマンドパレットの検索欄 (`app/cmd_palette.rs`)、検索・置換
+    /// (`app/editor_layout.rs`)、コードエディタ本体
+    /// (`app/code_editor.rs` の `TextEdit::multiline`)。
+    ///
+    /// 防御は `keybinds::drop_duplicate_ime_text` の 1 か所
+    /// (`terminal::translate_input` の**規則 4** と同じ考え方)。ここでは
+    /// `App::update_impl` と同じ場所 — **入力欄を 1 つも描く前** — で
+    /// 呼んだフレームを組み立てて、`ctx.run()` を通った後の中身を見る。
+    /// 呼び出しが実際に `update_impl` に居ることは
+    /// `keybinds::tests::確定文字列の重複落としをパネル描画より前に通している`
+    /// が構造で固定する。
+    ///
+    /// **わざと壊す側も同時に見る** — 関門を外すと必ず二重に入ることを
+    /// A/B で残す (外しても緑なら、このテストは関門を見ていない)。
+    #[test]
+    fn 確定文字列がtextとしても届いてもcjkは二重に入らない() {
+        // 並び順は IME 実装依存 (Windows は WM_IME_ENDCOMPOSITION と WM_CHAR の
+        // 前後が IME ごとに違う)。**両方**で見る。
+        for text_first in [false, true] {
+            for (kana, kanji) in [("にほんご", "日本語"), ("ㅎ", "한"), ("かんじ", "漢字")]
+            {
+                let what = if text_first {
+                    "Text → Commit"
+                } else {
+                    "Commit → Text"
+                };
+                assert_eq!(
+                    ime_commit_with_echo(true, kana, kanji, text_first),
+                    kanji,
+                    "{what} / {kanji}: 確定文字列が二重に入った"
+                );
+                assert_eq!(
+                    ime_commit_with_echo(false, kana, kanji, text_first),
+                    format!("{kanji}{kanji}"),
+                    "{what} / {kanji}: 関門を外しても二重にならない \
+                     = このテストは関門を見ていない"
+                );
+            }
+        }
+    }
+
+    /// **IME を使わない入力は 1 文字も落ちない。**
+    ///
+    /// 「同フレームの重複を落とす」は、やりすぎると全利用者の通常入力を
+    /// 壊す。確定 (`Commit`) が 1 つも無いフレームでは 1 バイトも触らない
+    /// ことを、`ctx.run()` を通した後の中身で見る。同じ字の連打
+    /// (`aaa` / `ををを`) まで含める — ここを雑に潰すと連打が消える。
+    #[test]
+    fn imeを使わない通常入力は一文字も落ちない() {
+        for typed in [
+            vec!["h", "e", "l", "l", "o"],
+            vec!["a", "a", "a"],
+            vec!["を", "を", "を"],
+            vec!["日", "本", "語"],
+            vec!["日本語"],
+            vec!["🙂", "🙂"],
+        ] {
+            let want: String = typed.concat();
+            let mut buf = String::new();
+            let mut s = Screen::new(600.0, 200.0);
+            s.run(Vec::new(), |ctx| dup_draw(ctx, &mut buf, false));
+            for t in &typed {
+                s.run(vec![egui::Event::Text((*t).into())], |ctx| {
+                    dup_draw(ctx, &mut buf, true)
+                });
+            }
+            assert_eq!(
+                buf, want,
+                "IME を使わない入力が関門で削られた (打った: {typed:?})"
+            );
+        }
+    }
+
+    /// 入力欄を 1 つ描いて焦点を当てる (関門を通すかを選べる)。
+    fn dup_draw(ctx: &egui::Context, buf: &mut String, gated: bool) {
+        if gated {
+            crate::keybinds::drop_duplicate_ime_text(ctx);
+        }
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add(egui::TextEdit::singleline(buf).id_salt("zv-dup"))
+                .request_focus();
+        });
+    }
+
+    /// 変換を一巡させ、確定フレームに「確定と同じ文字列の `Text`」を混ぜる。
+    /// 戻り値は入力欄の中身。
+    fn ime_commit_with_echo(gated: bool, kana: &str, kanji: &str, text_first: bool) -> String {
+        let mut buf = String::new();
+        let mut s = Screen::new(600.0, 200.0);
+        s.run(Vec::new(), |ctx| dup_draw(ctx, &mut buf, gated));
+        s.run(vec![enabled()], |ctx| dup_draw(ctx, &mut buf, gated));
+        s.run(vec![preedit(kana)], |ctx| dup_draw(ctx, &mut buf, gated));
+        let echo = egui::Event::Text(kanji.into());
+        let last = if text_first {
+            vec![preedit(""), echo, commit(kanji)]
+        } else {
+            vec![preedit(""), commit(kanji), echo]
+        };
+        s.run(last, |ctx| dup_draw(ctx, &mut buf, gated));
+        buf
+    }
 }
 
 // ── 層 1-g: サブディスプレイ (画面の原点が (0,0) でない) とフォーカス ────
@@ -2062,83 +2173,5 @@ mod app_reachability_tests {
         assert_eq!(ptr, Some(egui::pos2(-1900.0, -280.0)), "ポインタが届かない");
         assert!(ime, "IME イベントが届かない");
         assert!(painted.find("ZV-READY").is_some(), "描画が拾えない");
-    }
-}
-
-// ── 実測で見つかった「まだ直っていない壊れ方」の再現 ────────────────────
-//
-// **`#[ignore]` にしてあるのは、直っていないからである。** 緑にするために
-// 現状の (壊れた) 値を期待値へ書くと「壊れているのに緑」になるので、
-// アサーションは**直った姿**のまま置き、既定の実行からは外してある。
-//   再現: `cargo test --bin zai e2e::known_breakage -- --ignored --nocapture`
-
-#[cfg(test)]
-mod known_breakage {
-    use super::*;
-
-    /// **確定文字列が `Text` としても届く環境では、CJK が二重に入る。**
-    ///
-    /// `terminal::translate_input` はこれを規則 4 として明示的に潰している
-    /// (「確定と同じ文字列が同フレームで `Text` としても届く環境がある。
-    ///  そのまま流すと CJK が二重に入る (Windows の一部 IME で起きる)」)。
-    /// **エディタ側にはその防御が無い。**
-    ///
-    /// 経路も確認済み: `egui-winit-0.29.1/src/lib.rs:786-800` の `Event::Text`
-    /// は `WindowEvent::KeyboardInput` から出ており、IME の `Commit`
-    /// (同 358-363 行) とは**互いに何も知らない**。両方来たら両方入る。
-    ///
-    /// 実測 (`Screen` + 素の `egui::TextEdit`):
-    ///   `Commit("日本語")` + `Text("日本語")` を同フレーム → `"日本語日本語"`
-    ///
-    /// 影響範囲は端末ではなく**アプリのほぼ全ての入力欄** —
-    /// コマンドパレットの検索欄 (`app/cmd_palette.rs`)、
-    /// 検索・置換 (`app/editor_layout.rs`)、コードエディタ本体
-    /// (`app/code_editor.rs` の `TextEdit::multiline`) が同じ経路を通る。
-    ///
-    /// **直し方 (1 箇所)**: `keybinds::ime_blocks_shortcuts_now` は
-    /// `app::handle_shortcuts` の先頭 (`app/frame_update.rs:143`) で
-    /// **1 フレームに 1 回**、しかも**パネルを描く前に**呼ばれている。
-    /// そこで「同フレームの `Commit` と同じ文字列の `Text`」を
-    /// `ctx.input_mut(|i| i.events.retain(..))` で 1 つだけ落とせばよい
-    /// (端末の規則 4 と同じ判定)。`feature::draw_all` は
-    /// `app/frame_update.rs:597` = 入力欄を描き終えた**後**なので使えない。
-    ///
-    /// `src/keybinds.rs` と `src/app/` はこの担当の管轄外なので、
-    /// ここでは**再現だけ**を残す。
-    #[test]
-    #[ignore = "未修正の不具合の再現 (直し方は doc コメント)"]
-    fn 確定文字列がtextとしても届くとcjkが二重に入る() {
-        for (kana, kanji) in [("にほんご", "日本語"), ("한", "한")] {
-            let mut buf = String::new();
-            let mut s = Screen::new(600.0, 200.0);
-            let draw = |ctx: &egui::Context, buf: &mut String| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add(egui::TextEdit::singleline(buf).id_salt("zv-dup"))
-                        .request_focus();
-                });
-            };
-            s.run(Vec::new(), |ctx| draw(ctx, &mut buf));
-            s.run(vec![egui::Event::Ime(egui::ImeEvent::Enabled)], |ctx| {
-                draw(ctx, &mut buf)
-            });
-            s.run(
-                vec![egui::Event::Ime(egui::ImeEvent::Preedit(kana.into()))],
-                |ctx| draw(ctx, &mut buf),
-            );
-            s.run(
-                vec![
-                    egui::Event::Ime(egui::ImeEvent::Preedit("".into())),
-                    egui::Event::Ime(egui::ImeEvent::Commit(kanji.into())),
-                    // 確定と同じ文字列が Text としても届く (Windows の一部 IME)
-                    egui::Event::Text(kanji.into()),
-                ],
-                |ctx| draw(ctx, &mut buf),
-            );
-            assert_eq!(
-                buf, kanji,
-                "確定文字列が二重に入った (実測: {buf:?})。\n\
-                 端末の規則 4 と同じ防御がエディタ側に無い"
-            );
-        }
     }
 }

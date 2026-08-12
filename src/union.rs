@@ -4382,13 +4382,18 @@ mod tests {
     /// どこまで届くか。`tools/shared-surface-bench.sh` の union-auto の行が
     /// baseline と同数になる理由がここに固定してある。
     ///
-    /// 実測 (2026-08-12 / HEAD 85a350e):
+    /// 実測 (2026-08-13 / IME 二重入力の修正後):
+    ///
+    /// **塊の数はファイル全体の形なので、`keybinds.rs` へ 1 行足すだけで動く**
+    /// (15 → 16 はその類)。判断に効く 4 列 — 追記行・内側・auto・衝突 —
+    /// が全部同じなら共有面の結論は変わっていないので、
+    /// `tools/shared-surface-bench.sh` を測り直す必要は無い。
     ///
     /// | 追記先 | 一覧に見えるか | 追記行が塊の内側か | `--auto` で解けるか |
     /// | --- | --- | --- | --- |
     /// | `struct Config` の末尾 | Bracket・79 塊 | **外側** | 解けない |
     /// | `impl Default` の末尾 | 同上 | 内側 | **解けない** |
-    /// | `enum BindAction` の末尾 | Bracket・15 塊 | **外側** | 解けない |
+    /// | `enum BindAction` の末尾 | Bracket・16 塊 | **外側** | 解けない |
     /// | `ALL_ACTIONS` の末尾 | 同上 | 内側 | **解ける** |
     ///
     /// **4 箇所のうち解けるのは 1 箇所だけ**で、しかも `cli_main` は
@@ -4431,7 +4436,7 @@ mod tests {
         // そのときは `tools/shared-surface-bench.sh` を測り直す必要がある。
         assert_eq!(
             facts.join("\n"),
-            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック15 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック15 追記行348 内側true autotrue 衝突false",
+            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック16 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック16 追記行348 内側true autotrue 衝突false",
             "共有面の形が変わりました。tools/shared-surface-bench.sh を測り直してください"
         );
     }
