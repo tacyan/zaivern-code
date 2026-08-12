@@ -192,10 +192,21 @@ pub enum BindAction {
     QuickLaunch7,
     QuickLaunch8,
     QuickLaunch9,
+    /// 端末で**前のプロンプトへ**跳ぶ (Ghostty / VS Code の
+    /// "Terminal: Scroll To Previous Command")。
+    ///
+    /// 打鍵は VS Code (mac) と同じ ⌘↑ / ⌘↓。`MACOS_RESERVED` が押さえて
+    /// いるのは **⌃↑ / ⌃↓** (Mission Control / アプリケーションウィンドウ)
+    /// のほうで、⌘ + 矢印は 1 つも入っていない。⌃ を避けるのは必須で、
+    /// 他 OS では [`canonical_mods`] が ⌃ を ⌘ へ畳むため
+    /// `Ctrl+↑` と `⌘↑` が同じ打鍵になり片方が永久に死ぬ。
+    TermPrevPrompt,
+    /// 端末で**次のプロンプトへ**跳ぶ。
+    TermNextPrompt,
 }
 
 /// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 87] = [
+pub const ALL_ACTIONS: [BindAction; 89] = [
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -283,6 +294,8 @@ pub const ALL_ACTIONS: [BindAction; 87] = [
     BindAction::QuickLaunch7,
     BindAction::QuickLaunch8,
     BindAction::QuickLaunch9,
+    BindAction::TermPrevPrompt,
+    BindAction::TermNextPrompt,
 ];
 
 /// ファイル単位ズームの修飾キー。macOS は ⌥⌘、他は Ctrl+Alt+Shift。
@@ -423,6 +436,11 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
         BindAction::ToggleFold => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::OpenBracket),
         BindAction::UnfoldAll => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::CloseBracket),
         BindAction::ToggleBookmark => KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::B),
+        // 端末のプロンプト間ジャンプ。VS Code (mac) と同じ ⌘↑ / ⌘↓。
+        // `MACOS_RESERVED` に載っているのは ⌃↑ / ⌃↓ / ⌃⇧↑ / ⌃⇧↓ /
+        // ⌃← / ⌃→ だけで、⌘ + 矢印は 1 つも予約されていない。
+        BindAction::TermPrevPrompt => KeyboardShortcut::new(cmd, Key::ArrowUp),
+        BindAction::TermNextPrompt => KeyboardShortcut::new(cmd, Key::ArrowDown),
         // ── ブックマーク (ニーモニック付き) ──────────────────────
         // 素の切替 ⌥⌘B に ⇧ を足した形。⇧⌥⌘ 系の既定割り当ては 1 つも無く、
         // `MACOS_RESERVED` にも ⇧⌥⌘ の項目は無い。
@@ -653,6 +671,8 @@ pub fn config_name(a: BindAction) -> &'static str {
         ToggleFold => "toggle_fold",
         UnfoldAll => "unfold_all",
         ToggleBookmark => "toggle_bookmark",
+        TermPrevPrompt => "term_prev_prompt",
+        TermNextPrompt => "term_next_prompt",
         MarkToggleMnemonic => "mark_toggle_mnemonic",
         MarksPanel => "marks_panel",
         MarkJump => "mark_jump",
@@ -750,6 +770,8 @@ pub fn action_label(a: BindAction) -> &'static str {
         ToggleFold => "折りたたみの切り替え",
         UnfoldAll => "すべて展開",
         ToggleBookmark => "ブックマークの切り替え",
+        TermPrevPrompt => "端末: 前のプロンプトへ",
+        TermNextPrompt => "端末: 次のプロンプトへ",
         MarkToggleMnemonic => "ニーモニック付きブックマーク",
         MarksPanel => "ブックマーク一覧",
         MarkJump => "ブックマークへジャンプ",
@@ -959,6 +981,8 @@ impl Keybinds {
             "toggle_fold" => ToggleFold,
             "unfold_all" => UnfoldAll,
             "toggle_bookmark" => ToggleBookmark,
+            "term_prev_prompt" => TermPrevPrompt,
+            "term_next_prompt" => TermNextPrompt,
             "mark_toggle_mnemonic" => MarkToggleMnemonic,
             "marks_panel" => MarksPanel,
             "mark_jump" => MarkJump,

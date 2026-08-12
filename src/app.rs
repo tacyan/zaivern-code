@@ -13598,6 +13598,27 @@ impl ZaivernApp {
                 cmds.push(Cmd::OpenFind);
             }
         }
+        // ── 端末: 前/次のプロンプトへ跳ぶ (Ghostty の "killer feature") ──
+        // **端末にフォーカスがあるときだけ消費する。** 無条件に消費すると
+        // エディタでの ⌘↑ / ⌘↓ (他 OS では Ctrl+↑/↓) まで飲み込む。
+        // 前フレームで terminal::draw が残したセッション ID で振り分ける
+        // (Cmd+F の端末内検索と同じ経路)。
+        if let Some(sid) = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("zv-focused-terminal"))) {
+            // シェル統合が来ていなければ候補が無く、`shell_jump_prompt` は
+            // false を返して**何も起きない** (嘘の移動をしない)。
+            let mut jump: Option<bool> = None;
+            if consume(ctx, self.keys.binding(BindAction::TermPrevPrompt)) {
+                jump = Some(false);
+            }
+            if consume(ctx, self.keys.binding(BindAction::TermNextPrompt)) {
+                jump = Some(true);
+            }
+            if let Some(forward) = jump {
+                if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+                    s.shell_jump_prompt(forward);
+                }
+            }
+        }
         if consume(ctx, self.keys.binding(BindAction::ToggleCockpit)) {
             cmds.push(Cmd::ToggleCockpit);
         }
