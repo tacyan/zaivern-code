@@ -456,16 +456,200 @@ pub fn compute_overlaps(sets: &[(usize, HashSet<PathBuf>)]) -> OverlapReport {
     OverlapReport { contended, pairs }
 }
 
-/// このプラットフォームのファイルシステムが大文字小文字を区別しないか。
+// ═══════════════════════════════════════════════════════════════════════════
+//  大文字小文字を畳むか — **実ファイルシステムに訊く**
+//
+//  かつてここは `cfg!(any(target_os = "macos", windows))` だった。つまり
+//  **コンパイル時の OS** を FS の性質の代用にしていた。この 2 つは別物である:
+//
+//  * Linux でも case-insensitive なマウントは普通にある
+//    (ciopfs / ntfs-3g / exFAT / SMB / macOS 由来のディスクイメージ)
+//  * macOS でも case-sensitive な APFS ボリュームを作れる (`hdiutil`)
+//  * Windows は `fsutil file setCaseSensitiveInfo` で**ディレクトリ単位**に変わる
+//
+//  食い違うと **同じファイルに 2 つの台帳キー**ができ、「同じ行を 2 人に
+//  配らない」という中心的な保証が静かに崩れる。台帳の最終形に重なりは
+//  残らないので、台帳を見ても気付けない。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 実 FS を叩いて**観測したこと**。判定 ([`judge_case_probe`]) と分けてある。
 ///
-/// macOS (既定の APFS/HFS+) と Windows は区別しない。そこで `SRC/App.rs` と
-/// `src/app.rs` は **同じファイル** なので、衝突判定でも同じ鍵に畳まないと
-/// 「別ファイル扱いで衝突を見落とす」ことになる。
+/// 分ける理由は 1 つ: **大小を区別するボリュームを持っていないホストからでも
+/// 判定の両方の枝を固定できる**ようにするため (`czero_init::parse_scoped_config`
+/// と同じ流儀)。I/O を含んだままでは、macOS で開発している限り
+/// 「区別する側」の枝が一度も検査されない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaseProbe {
+    /// 綴りだけ変えた名前で開けて、中身も自分が書いた印だった = **非区別**。
+    SameFile,
+    /// 綴りを変えた名前では見つからなかった = **区別する**。
+    Missing,
+    /// 開けたが中身が違った (無関係な実体がたまたま居た) = **区別する**。
+    OtherFile,
+}
+
+/// 観測 → 判定。**純関数**。`None` = 検査そのものができなかった。
+///
+/// ## 検査できないときに畳む側へ倒す理由
+///
+/// 読み取り専用・権限が無い・容量が無い、のいずれでも `None` になる。
+/// このとき取れる向きは 2 つで、**壊れ方が対称ではない**:
+///
+/// * **畳まない**側へ倒すと、実際には非区別な FS で `src/Foo.rs` と
+///   `src/foo.rs` が別リースになる = **同じ物理ファイルを 2 人が同時に持てる**。
+///   中心の保証が破れる。しかも台帳には重なりが残らないので気付けない。
+/// * **畳む**側へ倒すと、実際には区別する FS で別々の 2 ファイルが同じ鍵に
+///   なる = **要らない待ちが 1 件増える**だけ。過剰に止める方向 (fail-closed)。
+///
+/// 前者は静かにデータを壊し、後者は目に見えて不便なだけなので、畳む側へ倒す。
+pub fn judge_case_probe(obs: Option<CaseProbe>) -> bool {
+    match obs {
+        Some(CaseProbe::SameFile) => true,
+        Some(CaseProbe::Missing | CaseProbe::OtherFile) => false,
+        None => true,
+    }
+}
+
+// テスト用のカウンタ。**プロセス共通の `static AtomicUsize` にしない** —
+// 同時に走っている他のテストの検査まで混ざって数が合わなくなる。
+thread_local! {
+    static CASE_PROBE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// このスレッドが実 I/O の検査を行った回数。**費用を絶対時間ではなく
+/// 呼び出し回数で見る**ため (負荷で散る数字は線を引く材料にならない)。
+#[cfg(test)]
+pub fn case_probe_calls() -> u64 {
+    CASE_PROBE_CALLS.with(std::cell::Cell::get)
+}
+
+/// 検査でファイルを置く場所。
+///
+/// `dir` に `.git` ディレクトリがあればその中を使う。同じボリューム
+/// (= 同じ大小の性質) でありながら、**git が中身を一切報告しない**ので
+/// 作業ツリーに一瞬でもゴミが見えない。`gate` は書き込みのたびに走る
+/// 短命プロセスなので、リポジトリ直下に作ると監視側 (このアプリ自身の
+/// git スキャンを含む) が毎回反応してしまう。
+///
+/// linked worktree の `.git` は**ファイル**なので、その場合は `dir` 自身。
+fn case_probe_dir(dir: &Path) -> PathBuf {
+    let dot = dir.join(".git");
+    if dot.is_dir() {
+        dot
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// 実 FS を 1 度だけ叩いて観測する。**記憶しない** (記憶は [`CaseOracle`])。
+///
+/// 綴りだけが違う 2 つの名前を使い、片方で書いて**もう片方で読めるか**を見る。
+/// 存在検査 (`exists`) だけでは足りない — 無関係な同名ファイルが居たときに
+/// 「非区別」と誤判定するため、書いた印を読み返して同一性まで確かめる。
+pub fn probe_case_at(dir: &Path) -> Option<CaseProbe> {
+    CASE_PROBE_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+    let base = case_probe_dir(dir);
+    // 名前は **ASCII の大小だけ**が違う 2 つ。残りは pid + 時刻 + 連番なので
+    // 数字と `-` しか含まず、綴り替えの影響を受けない。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let uniq = format!("{}-{}-{}", std::process::id(), nanos, seq);
+    let written = base.join(format!(".zaivern-case-{uniq}"));
+    let flipped = base.join(format!(".zaivern-CASE-{uniq}"));
+    std::fs::write(&written, uniq.as_bytes()).ok()?;
+    let obs = match std::fs::read(&flipped) {
+        Ok(got) if got == uniq.as_bytes() => CaseProbe::SameFile,
+        Ok(_) => CaseProbe::OtherFile,
+        Err(_) => CaseProbe::Missing,
+    };
+    // 短命プロセスが途中で死んでも置き去りが 1 個で済むよう、必ず消す。
+    let _ = std::fs::remove_file(&written);
+    Some(obs)
+}
+
+/// 検査結果の記憶。**同じ場所を 2 度検査しない。**
+///
+/// 台帳の鍵は書き込みのたびに作られるので、毎回 I/O すると全部が重くなる。
+/// 記憶の単位は**ディレクトリ**である (Windows は大小の扱いがディレクトリ
+/// 単位で変わるため、ボリューム単位に丸めると外す)。
+#[derive(Default)]
+pub struct CaseOracle {
+    cache: std::sync::Mutex<HashMap<PathBuf, bool>>,
+}
+
+impl CaseOracle {
+    /// この場所の FS が大文字小文字を区別しないか。初回だけ実 I/O。
+    pub fn get(&self, dir: &Path) -> bool {
+        // 検査を抱えたままロックを持つ。**ちょうど 1 回**にするためで、
+        // 先に降りると 2 スレッドが同時に検査しうる (数え方が嘘になる)。
+        let Ok(mut m) = self.cache.lock() else {
+            // 毒された = どこかで panic した。記憶を諦めて毎回検査する
+            // (遅いだけで答えは正しい)。
+            return judge_case_probe(probe_case_at(dir));
+        };
+        if let Some(v) = m.get(dir) {
+            return *v;
+        }
+        let v = judge_case_probe(probe_case_at(dir));
+        m.insert(dir.to_path_buf(), v);
+        v
+    }
+}
+
+static CASE_ORACLE: std::sync::OnceLock<CaseOracle> = std::sync::OnceLock::new();
+
+/// **この場所の** FS が大文字小文字を区別しないか (実測・記憶付き)。
+pub fn fs_case_insensitive_at(dir: &Path) -> bool {
+    CASE_ORACLE.get_or_init(CaseOracle::default).get(dir)
+}
+
+// プロセス内で 1 度だけ決まる答え。**途中で変わってはいけない** —
+// パターン側 (`lease::segments`) と実パス側 (`lease::rel_within`) が
+// 別の答えを使うと、鍵が食い違って確保が素通りする。
+static CASE_FOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 台帳とコンフリクト判定で大文字小文字を畳むか。
+///
+/// **プロセス内で 1 度だけ実 FS を検査して固定する。**「1 度だけ」は費用の
+/// 話ではなく**正しさ**の話で、途中で答えが変われば同じファイルに 2 つの
+/// 鍵ができる。既知の作業ツリーがあるなら [`seed_fs_case`] で先に固定する
+/// こと (誰も固定しなければ、初回の呼び出し時に現在地を検査する)。
+///
+/// ## 担保できないこと (正直に)
+///
+/// 答えはプロセスに 1 つなので、**1 つのプロセスが性質の違う 2 つの
+/// ボリュームを同時に扱う場合**、後から来た側は最初に固定した答えを使う。
+/// 台帳は作業ツリーごとに分かれているので実害は「片方の台帳で畳み方が
+/// 過剰／不足」だが、ゼロではない。場所ごとの答えが要る呼び出しは
+/// [`fs_case_insensitive_at`] を使う。
 pub fn fs_case_insensitive() -> bool {
-    cfg!(any(target_os = "macos", target_os = "ios", windows))
+    *CASE_FOLD.get_or_init(|| fs_case_insensitive_at(&default_probe_dir()))
+}
+
+/// 既知の作業ツリーで [`fs_case_insensitive`] を固定する。
+///
+/// **最初の 1 回だけ効く**。返り値は固定された答え。
+pub fn seed_fs_case(dir: &Path) -> bool {
+    *CASE_FOLD.get_or_init(|| fs_case_insensitive_at(dir))
+}
+
+/// 誰も固定しなかったときに検査する場所。
+///
+/// 現在地 = `zai` / `gate` が起動された場所で、ほぼ必ず作業ツリーの中。
+/// 取れなければ一時ディレクトリ (`TMPDIR` / `TEMP` を尊重するので、
+/// パスの直書きにならない)。
+fn default_probe_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
 /// 衝突判定に使うパスの鍵。大文字小文字を区別しない FS では小文字へ畳む。
+///
+/// 「区別しないか」は [`fs_case_insensitive`] = **実 FS の実測**で決まる
+/// (コンパイル時の OS ではない)。
 ///
 /// セパレータも `/` へ寄せる (Windows の `src\app.rs` と git 由来の
 /// `src/app.rs` を同じ鍵にするため)。
@@ -741,6 +925,161 @@ pub fn removal_prompt(branch: &str, dir: &Path, dirty: bool) -> String {
 // ---------------------------------------------------------------------------
 // テスト
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod case_tests {
+    use super::{case_probe_calls, judge_case_probe, probe_case_at};
+    use super::{CaseOracle, CaseProbe};
+    use crate::test_util::unique_temp_dir;
+
+    /// このディレクトリの FS が実際に大小を区別しないか。**テスト自身の目**で
+    /// 見る (実装を一切通さない地の真実)。
+    fn truth_at(dir: &std::path::Path) -> bool {
+        let mixed = dir.join("Zz-truth.probe");
+        std::fs::write(&mixed, b"x").expect("write truth probe");
+        let seen = dir.join("zZ-truth.probe").exists();
+        std::fs::remove_file(&mixed).ok();
+        seen
+    }
+
+    /// 観測 → 判定の表。**大小を区別するボリュームを持っていないホストからでも
+    /// 両方の枝を通る**のがこの表の目的。
+    #[test]
+    fn 観測から大小の判定を出す表() {
+        let table: &[(Option<CaseProbe>, bool)] = &[
+            (Some(CaseProbe::SameFile), true),
+            (Some(CaseProbe::Missing), false),
+            (Some(CaseProbe::OtherFile), false),
+            // 検査できない → 畳む。畳みすぎは「余計に止める」だけだが、
+            // 畳み損ねは「同じファイルに 2 つの鍵」= 中心の保証が壊れる。
+            (None, true),
+        ];
+        for (obs, want) in table {
+            assert_eq!(judge_case_probe(*obs), *want, "観測={obs:?}");
+        }
+    }
+
+    /// **コンパイル時の OS ではなく実 FS に従う。**
+    ///
+    /// 旧実装は `cfg!(any(target_os = "macos", target_os = "ios", windows))`
+    /// だった。macOS 上の case-sensitive ボリューム (hdiutil で作れる) や
+    /// Linux 上の case-insensitive マウント (ciopfs / exFAT / SMB) では、
+    /// この 2 つは食い違う。
+    #[test]
+    fn 大小の判定はコンパイル時のosではなく実fsに従う() {
+        let dir = unique_temp_dir("zaivern-case", "fs");
+        let truth = truth_at(&dir);
+        let by_os = cfg!(any(target_os = "macos", target_os = "ios", windows));
+        let by_fs = super::fs_case_insensitive_at(&dir);
+        assert_eq!(
+            by_fs,
+            truth,
+            "実 FS は大小を{}のに判定は{} (旧実装の OS 由来の答えは {by_os})",
+            if truth {
+                "区別しない"
+            } else {
+                "区別する"
+            },
+            by_fs
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 費用は**呼び出し回数**で見る。場所ごとにちょうど 1 回。
+    ///
+    /// 絶対時間で線を引かない (負荷で散る数字は材料にならない)。
+    /// カウンタはスレッドローカルなので、同時に走る他のテストが混ざらない。
+    #[test]
+    fn 大小の検査は場所ごとにちょうど一度だけ() {
+        let a = unique_temp_dir("zaivern-case", "once-a");
+        let b = unique_temp_dir("zaivern-case", "once-b");
+        // 記憶を独立させる (プロセス共通の記憶を使うと、他のテストが先に
+        // 温めていたぶんが混ざって数が合わない)。
+        let oracle = CaseOracle::default();
+        let base = case_probe_calls();
+        for _ in 0..500 {
+            oracle.get(&a);
+        }
+        assert_eq!(
+            case_probe_calls() - base,
+            1,
+            "同じ場所を 500 回訊いたのに検査が 1 回で済んでいない"
+        );
+        for _ in 0..500 {
+            oracle.get(&b);
+        }
+        assert_eq!(
+            case_probe_calls() - base,
+            2,
+            "場所ごとに記憶していない (Windows は大小の扱いがディレクトリ単位)"
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    /// 検査は作業ツリーにゴミを残さない。`.git` があるならその中でやる
+    /// (`gate` は書き込みのたびに走る短命プロセスなので、直下に作ると
+    /// 監視側が毎回反応する)。
+    #[test]
+    fn 検査は作業ツリーを汚さない() {
+        let dir = unique_temp_dir("zaivern-case", "clean");
+        std::fs::create_dir_all(dir.join(".git")).expect("create .git");
+        assert!(probe_case_at(&dir).is_some(), "検査そのものが失敗した");
+        let top: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            top,
+            vec![".git".to_string()],
+            "作業ツリー直下にゴミが残った"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join(".git"))
+                .expect("read .git")
+                .count(),
+            0,
+            ".git の中にゴミが残った"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `.git` が無い場所でも検査でき、後に何も残らない。
+    #[test]
+    fn gitが無い場所でも検査できて何も残らない() {
+        let dir = unique_temp_dir("zaivern-case", "nogit");
+        assert!(probe_case_at(&dir).is_some());
+        assert_eq!(std::fs::read_dir(&dir).expect("read dir").count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 検査できない場所 (存在しない) は `None` = 畳む側へ倒れる。
+    #[test]
+    fn 検査できない場所は畳む側へ倒す() {
+        let dir = unique_temp_dir("zaivern-case", "gone");
+        std::fs::remove_dir_all(&dir).expect("remove");
+        assert_eq!(probe_case_at(&dir), None);
+        assert!(
+            super::fs_case_insensitive_at(&dir),
+            "fail-closed になっていない"
+        );
+    }
+
+    /// プロセス共通の答えは**一度決まったら変わらない**。
+    /// 変わると、パターン側と実パス側で鍵が食い違って確保が素通りする。
+    #[test]
+    fn プロセス共通の答えは変わらない() {
+        let first = super::fs_case_insensitive();
+        let dir = unique_temp_dir("zaivern-case", "seed");
+        assert_eq!(
+            super::seed_fs_case(&dir),
+            first,
+            "後から固定し直せてしまった"
+        );
+        assert_eq!(super::fs_case_insensitive(), first);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
 
 #[cfg(test)]
 mod tests {
