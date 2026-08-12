@@ -45,7 +45,7 @@
 //! 説明文は [`FEATURE_NOTES`] で足せるが、**表に無い機能も必ず一覧には出る**
 //! (説明が空になるだけ)。ここを取り違えると「新機能に対応していない」が再発する。
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::keybinds::{BindAction, Keybinds};
 use eframe::egui;
 use egui::{Color32, Id, Pos2, Rect, Rounding, Stroke, Vec2};
@@ -276,6 +276,9 @@ pub enum TutorialAction {
     OpenRaceForm,
     /// スマホリモートの QR 画面を開く
     ShowRemoteQr,
+    /// 全機能ガイドで選ばれた機能を**その場で実行する**
+    /// (`Cmd::Feature` と同じ経路を通る)。
+    RunFeature(&'static str),
 }
 
 // ── 手順表 (データ) ──────────────────────────────────────────
@@ -1270,6 +1273,96 @@ pub fn index_rows(keys: &Keybinds) -> Vec<IndexRow> {
     out
 }
 
+/// 索引の行を選んだときに何をするか。
+///
+/// **「体験できる」の中身は行の種類で変わる。** どれも実際に何かが起きる —
+/// 「その機能を説明した手順がありません」で終わらせない。
+#[derive(Clone, Copy)]
+pub enum GuidePick {
+    /// その操作を教えている手順がある → **その章を再生してその手順から始める**。
+    Step(&'static Step),
+    /// 手順は無いが機能そのものは呼べる → **その場で実行して見せる**。
+    RunFeature(&'static str),
+    /// 手順も無く、こちらから呼ぶ口も無い組み込み操作 → **打鍵を教える**。
+    ///
+    /// 組み込み操作は `handle_shortcuts` が打鍵ごとに直接処理していて、
+    /// 「名前から実行する」口が無い。**無いものを有るふりはしない**ので、
+    /// ここは「この打鍵で使えます」と伝えるところまでにする。
+    ShowKeys,
+}
+
+impl std::fmt::Debug for GuidePick {
+    /// `Step` は本文まで持っているので、失敗メッセージには **id だけ**出す
+    /// (カード 1 枚ぶんの日本語がテストの出力に流れ込むと読めなくなる)。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuidePick::Step(s) => write!(f, "Step({})", s.id),
+            GuidePick::RunFeature(id) => write!(f, "RunFeature({id})"),
+            GuidePick::ShowKeys => write!(f, "ShowKeys"),
+        }
+    }
+}
+
+impl PartialEq for GuidePick {
+    /// `Step` は同じ手順を指しているかを **id** で見る
+    /// (`Step` は `&'static str` を並べた構造体なので、`PartialEq` を導出すると
+    ///  本文まで比較することになり、テストの意図と合わない)。
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (GuidePick::Step(a), GuidePick::Step(b)) => a.id == b.id,
+            (GuidePick::RunFeature(a), GuidePick::RunFeature(b)) => a == b,
+            (GuidePick::ShowKeys, GuidePick::ShowKeys) => true,
+            _ => false,
+        }
+    }
+}
+
+/// 行を「体験」する方法を決める。
+///
+/// 組み込み操作は [`Step::keys`] に載っている手順を探す — 手順表が打鍵を
+/// `BindAction` で持っているので、**ここに新しい対応表を作らずに済む**
+/// (作ると手順を足した人が 2 か所を直す羽目になり、必ず片方が腐る)。
+pub fn pick_for_row(row: &IndexRow) -> GuidePick {
+    match row.kind {
+        RowKind::Feature => {
+            feature_id_static(&row.id).map_or(GuidePick::ShowKeys, GuidePick::RunFeature)
+        }
+        RowKind::Action => {
+            let Some(action) = crate::keybinds::ALL_ACTIONS
+                .iter()
+                .copied()
+                .find(|a| crate::keybinds::config_name(*a) == row.id)
+            else {
+                return GuidePick::ShowKeys;
+            };
+            STEPS
+                .iter()
+                .find(|s| s.keys.contains(&action))
+                .map_or(GuidePick::ShowKeys, GuidePick::Step)
+        }
+    }
+}
+
+/// 機能 id の `&'static str` をレジストリから引き直す。
+///
+/// [`IndexRow::id`] は表示のために `String` にしてあるが、実行の依頼
+/// ([`TutorialAction::RunFeature`]) は `Cmd::Feature(&'static str)` へ載せるので
+/// 静的な方を要る。**レジストリに無い id は返さない** = 知らない機能を
+/// 実行しようとしない。
+fn feature_id_static(id: &str) -> Option<&'static str> {
+    crate::feature::REGISTRY
+        .iter()
+        .flat_map(|f| f.entries.iter())
+        .find(|e| e.id == id)
+        .map(|e| e.id)
+}
+
+/// その手順を含む章 (拾い読みの再生に使う)。手順表の全部がどれかの章に載る
+/// ことは番人テストが担保しているが、**無くても落ちない**ようにしてある。
+pub fn chapter_of_step(step_id: &str) -> Option<&'static Walkthrough> {
+    WALKTHROUGHS.iter().find(|w| w.step_ids.contains(&step_id))
+}
+
 /// 絞り込み。名前・id・補足・打鍵のどれかに含まれれば残す (大小を無視)。
 ///
 /// **純関数**なので、日本語・英語・空・複数語の振る舞いを表で固定できる。
@@ -1698,6 +1791,9 @@ pub struct Tutorial {
     playlist: Vec<&'static Step>,
     /// 章から始めたときの章 id (進捗の保存先)。初回ツアーなら `None`。
     chapter_id: Option<&'static str>,
+    /// 索引で選んだ行の一言 (打鍵の案内など)。**次に何か選ぶまで**出す。
+    /// `None` のときは 1 ピクセルも高さを取らない。
+    hint: Option<String>,
     /// 全機能ガイドを開いているか (開いている間ツアーのカードは重ねない)
     guide: bool,
     /// 索引の絞り込み文字列
@@ -1736,6 +1832,7 @@ impl Tutorial {
             confirm_skip: false,
             missing: MissingTracker::default(),
             pending: None,
+            hint: None,
             dir,
             playlist: Vec::new(),
             chapter_id: None,
@@ -1782,6 +1879,7 @@ impl Tutorial {
     pub fn open_guide(&mut self) {
         self.guide = true;
         self.confirm_skip = false;
+        self.hint = None;
     }
 
     /// 手順列を差し替えて再生を始める。
@@ -2222,6 +2320,9 @@ impl Tutorial {
         let mut filter = std::mem::take(&mut self.filter);
         let mut close = false;
         let mut start: Option<&'static Walkthrough> = None;
+        // 索引で選ばれた行 (押した瞬間には処理しない — 描画中に自分の状態を
+        // 差し替えると、同じフレームの残りが古い前提で描かれる)。
+        let mut picked: Option<IndexRow> = None;
         let inner_w = (lay.window.width() - 2.0 * GUIDE_PAD).max(60.0);
         let body_h = (lay.body.height() - GUIDE_PAD).max(40.0);
 
@@ -2269,6 +2370,15 @@ impl Tutorial {
                                 .id_salt("zv-guide-filter")
                                 .hint_text(tr("機能名・説明・打鍵で絞り込む")),
                         );
+                        // 選んだ行の一言。**無いときは高さを 1 px も取らない**。
+                        if let Some(msg) = self.hint.clone() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("▶ {msg}"))
+                                    .small()
+                                    .color(theme.accent),
+                            );
+                        }
                         ui.add_space(4.0);
 
                         egui::ScrollArea::vertical()
@@ -2327,7 +2437,9 @@ impl Tutorial {
                                         &format!("{} ({})", tr("機能"), feats.len()),
                                     );
                                     for r in feats {
-                                        index_row_ui(ui, theme, r);
+                                        if index_row_ui(ui, theme, r) {
+                                            picked = Some(r.clone());
+                                        }
                                     }
                                     ui.add_space(6.0);
                                 }
@@ -2338,7 +2450,9 @@ impl Tutorial {
                                         &format!("{} ({})", tr("組み込み操作"), acts.len()),
                                     );
                                     for r in acts {
-                                        index_row_ui(ui, theme, r);
+                                        if index_row_ui(ui, theme, r) {
+                                            picked = Some(r.clone());
+                                        }
                                     }
                                 }
                             });
@@ -2356,8 +2470,60 @@ impl Tutorial {
         }
         if let Some(w) = start {
             self.start_chapter(w);
+        } else if let Some(row) = picked {
+            self.experience(&row);
         } else if close {
             self.guide = false;
+        }
+    }
+
+    /// 索引で選ばれた行を「体験」する。
+    ///
+    /// **どの行を選んでも何かが起きる。** 手順があるならその章をそこから再生し、
+    /// 無ければ機能そのものを開いて見せ、それも出来ない組み込み操作は
+    /// 打鍵を教える。「説明がありません」で行き止まりにしない。
+    fn experience(&mut self, row: &IndexRow) {
+        self.hint = None;
+        match pick_for_row(row) {
+            GuidePick::Step(step) => {
+                // その手順を含む章を、**その手順から**再生する。
+                // 章が見つからない手順は番人テストが禁じているが、
+                // 万一のときは単独再生へ落ちる (行き止まりを作らない)。
+                match chapter_of_step(step.id) {
+                    Some(w) => {
+                        self.play(w.steps(), Some(w.id));
+                        self.idx = w
+                            .step_ids
+                            .iter()
+                            .position(|id| *id == step.id)
+                            .unwrap_or(0)
+                            .min(self.playlist.len().saturating_sub(1));
+                    }
+                    None => self.play(vec![step], None),
+                }
+                self.pending = self.playlist.get(self.idx).and_then(|s| s.pre_action);
+            }
+            GuidePick::RunFeature(id) => {
+                // ガイドを閉じてから実行する — 開いたパネルがガイドの裏に
+                // 隠れたら「押したのに何も起きない」に見える。
+                self.guide = false;
+                self.pending = Some(TutorialAction::RunFeature(id));
+            }
+            GuidePick::ShowKeys => {
+                // 呼ぶ口が無い組み込み操作。**無い機能を有るふりはしない**ので、
+                // 打鍵だけを伝えてガイドは開いたままにする (次を探せる)。
+                self.hint = Some(if row.keys.is_empty() {
+                    trf(
+                        "{label} は打鍵が割り当てられていません (⚙ 設定 → キーバインドで割り当てられます)",
+                        &[("label", row.label.clone())],
+                    )
+                } else {
+                    trf(
+                        "{label}: {keys} で使えます",
+                        &[("label", row.label.clone()), ("keys", row.keys.clone())],
+                    )
+                });
+            }
         }
     }
 
@@ -2479,7 +2645,10 @@ fn chapter_row(
 }
 
 /// 索引 1 行。行は必ず可用幅に収め、詰めた分はホバーで全文を出す。
-fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
+///
+/// **押せる。** 押されたら `true` — 呼び出し側が [`pick_for_row`] の結果へ
+/// 従って「その手順を再生する / 機能を実行する / 打鍵を教える」。
+fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) -> bool {
     let want_keys = if r.keys.is_empty() { 0.0 } else { 96.0 };
     let cols = row_cols(ui.available_width(), want_keys);
     let full = if r.note.is_empty() {
@@ -2488,13 +2657,24 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
         format!("{} — {} ({})", r.label, r.note, r.id)
     };
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
+    // 押したときに何が起きるかを**先に**伝える (押してから驚かせない)。
+    let tip = match pick_for_row(r) {
+        GuidePick::Step(s) => format!(
+            "{full}\n\n▶ {}",
+            trf("「{t}」の手順を再生します", &[("t", tr(s.title))])
+        ),
+        GuidePick::RunFeature(_) => format!("{full}\n\n▶ {}", tr("この機能をいま開いて見せます")),
+        GuidePick::ShowKeys if r.keys.is_empty() => full.clone(),
+        GuidePick::ShowKeys => format!("{full}\n\n▶ {}", tr("使い方 (打鍵) を出します")),
+    };
+    let mut clicked = false;
     ui.horizontal(|ui| {
         guide_col(ui, cols.icon, 16.0, false, |ui| {
             ui.label(egui::RichText::new(r.icon.as_str()).small());
         });
-        guide_col(ui, cols.label, 16.0, false, |ui| {
+        clicked = guide_col(ui, cols.label, 16.0, false, |ui| {
             ui.add(
-                egui::Label::new(egui::RichText::new(shown).small().color(
+                egui::Button::new(egui::RichText::new(shown).small().color(
                     // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
                     if r.kind == RowKind::Feature {
                         theme.text
@@ -2502,9 +2682,10 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
                         theme.text_dim
                     },
                 ))
-                .truncate(),
+                .frame(false),
             )
-            .on_hover_text(full.as_str());
+            .on_hover_text(tip.as_str())
+            .clicked()
         });
         if cols.keys > 0.0 && !r.keys.is_empty() {
             guide_col(ui, cols.keys, 16.0, true, |ui| {
@@ -2520,6 +2701,7 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
             });
         }
     });
+    clicked
 }
 
 // ── テスト ───────────────────────────────────────────────────
@@ -2539,6 +2721,94 @@ mod tests {
             && r.min.y >= screen.min.y - 0.01
             && r.max.x <= screen.max.x + 0.01
             && r.max.y <= screen.max.y + 0.01
+    }
+
+    // ── 全機能ガイド: 選んだら体験できる ──
+
+    /// **索引のどの行を選んでも行き止まりにならない。**
+    ///
+    /// 「説明がありません」で終わる行が 1 つでもあると、ガイドは
+    /// 「載っているけど何も起きない一覧」になる。3 通りのどれかへ必ず落ちること、
+    /// そして**それぞれが実在するもの**を指していることを固定する。
+    #[test]
+    fn 索引の全行が体験の仕方を持つ() {
+        let keys = Keybinds::default();
+        let rows = index_rows(&keys);
+        assert!(!rows.is_empty(), "索引が空");
+
+        let (mut steps, mut feats, mut keys_only) = (0, 0, 0);
+        for r in &rows {
+            match pick_for_row(r) {
+                GuidePick::Step(s) => {
+                    steps += 1;
+                    assert!(
+                        STEPS.iter().any(|x| x.id == s.id),
+                        "{}: 手順表に無い手順を指している ({})",
+                        r.id,
+                        s.id
+                    );
+                    // 章に載っていない手順もある (初回ツアー専用の手順など)。
+                    // その場合は `experience` が**単独で 1 枚再生する**ので
+                    // 行き止まりにはならない。ここで章を必須にすると、
+                    // 手順表を足した人が章にも足すまで CI が赤くなるだけで、
+                    // 利用者の体験は何も良くならない。
+                    if let Some(w) = chapter_of_step(s.id) {
+                        assert!(
+                            w.steps().iter().any(|x| x.id == s.id),
+                            "{}: 章が指す手順を引けない ({})",
+                            r.id,
+                            s.id
+                        );
+                    }
+                }
+                GuidePick::RunFeature(id) => {
+                    feats += 1;
+                    assert_eq!(id, r.id, "実行する機能 id が行とずれている");
+                    assert!(
+                        crate::feature::REGISTRY
+                            .iter()
+                            .flat_map(|f| f.entries.iter())
+                            .any(|e| e.id == id),
+                        "{id}: レジストリに無い機能を実行しようとしている"
+                    );
+                }
+                GuidePick::ShowKeys => keys_only += 1,
+            }
+        }
+        // 機能行は**全部**実行できる (レジストリの id をそのまま使うため)。
+        let n_feat = rows.iter().filter(|r| r.kind == RowKind::Feature).count();
+        assert_eq!(feats, n_feat, "実行できない機能行がある");
+        // 組み込み操作は「手順あり」と「打鍵を教える」に分かれる。
+        // **手順ありが 0 なら対応付けが壊れている** (Step::keys を見ていない)。
+        assert!(steps > 0, "手順へ繋がる組み込み操作が 1 つも無い");
+        assert_eq!(
+            steps + feats + keys_only,
+            rows.len(),
+            "分類から漏れた行がある"
+        );
+    }
+
+    /// 打鍵から手順を引く対応が**実物で**効いている。
+    ///
+    /// `Step::keys` を唯一の対応表にしてあるので、手順表に打鍵を書き足すだけで
+    /// 索引からも届くようになる (別表を作らない = 片方が腐らない)。
+    #[test]
+    fn 打鍵を教えている手順は索引から辿れる() {
+        let keys = Keybinds::default();
+        let rows = action_rows(&keys);
+        for step in STEPS.iter().filter(|s| !s.keys.is_empty()) {
+            for a in step.keys {
+                let name = crate::keybinds::config_name(*a);
+                let row = rows
+                    .iter()
+                    .find(|r| r.id == name)
+                    .unwrap_or_else(|| panic!("{name}: 索引に行が無い"));
+                assert!(
+                    matches!(pick_for_row(row), GuidePick::Step(_)),
+                    "{name}: 手順が教えているのに索引から手順へ届かない"
+                );
+            }
+        }
     }
 
     // ── 全機能ガイドの行揃え ──
