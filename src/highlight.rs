@@ -9,7 +9,13 @@ use syntect::util::LinesWithEndings;
 
 use crate::grammar::{self, FoldKindSpec, Grammar, GrammarSet, ScanState, Span, Tok};
 
-/// Files larger than this are laid out without highlighting to stay snappy.
+/// **1 回の呼び出しで全文を舐めてよい**上限。
+///
+/// これを超える文書は「諦めて素の文字にする」のではなく、
+/// **可視域だけをチェックポイントから再開して塗る**経路
+/// ([`Highlighter::layout_job_visible`]) へ落ちる。
+/// 全文を 1 度に塗ると、実測 (src/app.rs = 2.0MB / 43,887 行) で
+/// syntect だけで秒単位かかりフレームが止まるため。
 const MAX_HIGHLIGHT_BYTES: usize = 400_000;
 
 /// Single lines longer than this (e.g. minified JS) are laid out without
@@ -35,6 +41,44 @@ const CHECKPOINT_LINES: usize = 256;
 /// 完成品の `LayoutJob` まで 32 件抱えるとメモリだけを食う
 /// (2MB の文書なら本文だけで 64MB)。小さい文書に絞って持つ。
 const JOB_CACHE_MAX_BYTES: usize = 64 * 1024;
+
+/// 可視域を丸める単位 (行)。[`snap_window`] がこの倍数へ外側に広げる。
+///
+/// 呼び出し側の galley キャッシュキーはこの単位でしか動かないので、
+/// **この行数ぶんスクロールするまで galley を組み直さない**。
+///
+/// 実測 (release, src/app.rs = 2.0MB / 43,887 行) で、`LayoutJob` から
+/// galley を組む費用は **495ms**。しかも**セクション数にはほとんど依存しない**
+/// (1 セクション 495ms / 213,110 セクション 509ms = +2.9%)。
+/// つまり「可視域だけ塗る」で節約できるのは syntect の側だけで、
+/// **可視域が動くたびに galley を組み直すと 0.5 秒ずつ持っていかれる**。
+/// だから可視域は粗い粒度へ丸める。1 画面 50 行として、この値なら
+/// 10 画面ぶんスクロールするまで組み直しが起きない。
+const WINDOW_BLOCK_LINES: usize = 512;
+
+/// 1 回の呼び出しで**フロンティア (先頭から連続して解析済みの位置) を
+/// 進めてよい**行数の上限。
+///
+/// 実測 (release, src/app.rs) で `ParseState::parse_line` は **1 行 ≒ 100µs**
+/// (20,060 行で 2.03 秒)。フレーム予算 16.7ms の 4 割弱に収まる行数にした。
+/// ここで止めた続きは次のフレームで再開するので、遠い行へ飛んでも
+/// 1 フレームに払う費用は一定に保たれる。
+const WINDOW_SCAN_BUDGET_LINES: usize = 64;
+
+/// スナップショット 1 つぶんのメモリ見積り。
+///
+/// `ParseState` の文脈スタックと `HighlightState` のスタイルスタックは
+/// どちらも数十要素の `Vec` なので実際はもっと小さいが、言語によっては
+/// 深くなるため多めに見込む (下限ではなく上限として使う)。
+const CHECKPOINT_APPROX_BYTES: usize = 8 * 1024;
+
+/// スナップショット全体で使ってよいメモリ。
+const CHECKPOINT_MEM_BUDGET: usize = 4 * 1024 * 1024;
+
+/// 抱えるスナップショットの最大数。超えたら 1 つおきに間引き、
+/// 間隔 (`stride`) を倍にする — **等間隔を保つ**のが肝で、近い所だけを
+/// 残すと遠い行が毎回先頭からの再計算になる。
+const MAX_CHECKPOINTS: usize = CHECKPOINT_MEM_BUDGET / CHECKPOINT_APPROX_BYTES;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -100,6 +144,271 @@ thread_local! {
 /// 抱えるとむしろ本命 (編集中の巨大ファイル) を押し出してしまう。
 /// Markdown プレビューのコードフェンスがこれに当たる。
 const DOC_CACHE_MIN_BYTES: usize = 8 * 1024;
+
+/// 巨大文書の 1 つのチェックポイント。`cp.line` 行目を**読む直前**の状態と、
+/// その位置までの本文の走行ハッシュを持つ。
+///
+/// ハッシュを持つのは「本文が変わっていないか」を**行を持たずに**確かめる
+/// ため。前回の本文を丸ごと抱えると 2MB の文書で 2MB 余計に食ううえ、
+/// 打鍵のたびに 43,887 行の比較が要る。ここでは先頭から 1 パス回して
+/// **最初に食い違ったチェックポイントで切る**だけで済む。
+#[derive(Clone)]
+struct WinPoint {
+    cp: Checkpoint,
+    /// `cp.line` 行目の先頭の本文バイト位置。
+    byte: usize,
+    /// `text[..byte]` を流し込んだハッシャ。`finish()` で照合する
+    /// (`Hasher::write` は連続入力なので、区切り方が違っても同じ値になる)。
+    hasher: std::collections::hash_map::DefaultHasher,
+}
+
+/// 巨大文書の解析フロンティアとチェックポイント台帳。1 文書ぶんだけ持つ。
+struct WinCache {
+    /// 本文以外のキー (言語・テーマ・既定色)。変わったら作り直す。
+    style_key: u64,
+    /// 0 行目から `stride` 行おきのスナップショット。行番号の昇順で、
+    /// **先頭は必ず 0 行目**。
+    points: Vec<WinPoint>,
+    /// 先頭から連続して解析し終えた位置。`points` の最後より先に居てよい
+    /// (予算切れで止まった続きを捨てないため)。
+    frontier: WinPoint,
+    /// いまのスナップショット間隔 (行)。
+    stride: usize,
+    /// 直近に見た本文の行数。可視域が末尾を越えているときに
+    /// 「届かない目標」を追いかけないための上限として使う。
+    line_count: usize,
+}
+
+// 巨大文書のチェックポイント台帳を置く場所。
+//
+// `DOC_CACHE` と同じ理由でスレッドローカル (`ParseState` は `Send` でない)。
+thread_local! {
+    static WIN_CACHE: std::cell::RefCell<Option<WinCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl WinCache {
+    /// 0 行目のスナップショットだけを持つ台帳を作る。
+    fn new(style_key: u64, syntax: &SyntaxReference, hl: &ThemeHighlighter) -> Self {
+        let zero = WinPoint {
+            cp: Checkpoint {
+                line: 0,
+                ps: ParseState::new(syntax),
+                hs: HighlightState::new(hl, syntect::parsing::ScopeStack::new()),
+            },
+            byte: 0,
+            hasher: std::collections::hash_map::DefaultHasher::new(),
+        };
+        Self {
+            style_key,
+            points: vec![zero.clone()],
+            frontier: zero,
+            stride: CHECKPOINT_LINES,
+            line_count: 0,
+        }
+    }
+
+    /// 本文が変わっていないところまで台帳を切り詰める。
+    ///
+    /// 先頭から 1 パスでハッシュを取り直し、**最初に食い違った位置から先**を
+    /// 捨てる。0 行目は必ず生き残る (空のハッシュ同士なので必ず一致する)。
+    fn trim_to_unchanged(&mut self, text: &str) {
+        let bytes = text.as_bytes();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut at = 0usize;
+        let mut ok = 0usize;
+        for p in &self.points {
+            if p.byte > bytes.len() {
+                break;
+            }
+            h.write(&bytes[at..p.byte]);
+            at = p.byte;
+            if h.finish() != p.hasher.finish() {
+                break;
+            }
+            ok += 1;
+        }
+        if ok < self.points.len() {
+            self.points.truncate(ok.max(1));
+            // 途中で切った以上、フロンティアも生き残った末尾まで戻す。
+            self.frontier = self.points[self.points.len() - 1].clone();
+            return;
+        }
+        // 全チェックポイントが生きていた。フロンティアはその先にあるので
+        // 続きだけを流して確かめる。
+        if self.frontier.byte > bytes.len() || self.frontier.byte < at {
+            self.frontier = self.points[self.points.len() - 1].clone();
+            return;
+        }
+        h.write(&bytes[at..self.frontier.byte]);
+        if h.finish() != self.frontier.hasher.finish() {
+            self.frontier = self.points[self.points.len() - 1].clone();
+        }
+    }
+
+    /// スナップショットが増えすぎたら 1 つおきに間引く (間隔は倍になる)。
+    fn thin(&mut self) {
+        while self.points.len() > MAX_CHECKPOINTS {
+            let mut keep = Vec::with_capacity(self.points.len().div_ceil(2));
+            for (i, p) in self.points.drain(..).enumerate() {
+                if i.is_multiple_of(2) {
+                    keep.push(p);
+                }
+            }
+            self.points = keep;
+            self.stride *= 2;
+        }
+    }
+}
+
+/// フロンティアを `target` 行まで進める。1 回で進めるのは `budget` 行まで。
+///
+/// 進めながら `stride` 行ごとにスナップショットを取る。返り値は実際に
+/// syntect へ通した行数 (= 費用の実測値。テストがここを見る)。
+fn win_advance(
+    ps: &SyntaxSet,
+    syntax: &SyntaxReference,
+    hl: &ThemeHighlighter,
+    lines: &[&str],
+    wc: &mut WinCache,
+    target: usize,
+    budget: usize,
+) -> usize {
+    if wc.frontier.cp.line >= target {
+        return 0;
+    }
+    // 解析状態は 1 度だけ取り出して回す (1 行ごとに複製すると、進めるより
+    // 複製のほうが高くつく)。抜き取った跡には作り直した空の状態を置く。
+    let mut state = (
+        std::mem::replace(&mut wc.frontier.cp.ps, ParseState::new(syntax)),
+        std::mem::replace(
+            &mut wc.frontier.cp.hs,
+            HighlightState::new(hl, syntect::parsing::ScopeStack::new()),
+        ),
+    );
+    let mut scanned = 0usize;
+    while wc.frontier.cp.line < target && scanned < budget {
+        let i = wc.frontier.cp.line;
+        let Some(line) = lines.get(i) else { break };
+        // 色はここでは要らない (可視域に入ってから塗る) ので捨てる。
+        paint_line(ps, syntax, hl, line, &mut state, Color32::WHITE);
+        wc.frontier.hasher.write(line.as_bytes());
+        wc.frontier.byte += line.len();
+        wc.frontier.cp.line = i + 1;
+        scanned += 1;
+        if wc.frontier.cp.line.is_multiple_of(wc.stride) {
+            wc.points.push(WinPoint {
+                cp: Checkpoint {
+                    line: wc.frontier.cp.line,
+                    ps: state.0.clone(),
+                    hs: state.1.clone(),
+                },
+                byte: wc.frontier.byte,
+                hasher: wc.frontier.hasher.clone(),
+            });
+            wc.thin();
+        }
+    }
+    wc.frontier.cp.ps = state.0;
+    wc.frontier.cp.hs = state.1;
+    scanned
+}
+
+/// 1 行ぶん塗って状態を進める。
+///
+/// **[`highlight_doc`] の 1 行ぶんと同じ規則**にしてある (長すぎる行は
+/// 素通し / 解析エラーなら状態を作り直して素通し)。ここがずれると
+/// 「チェックポイントから再開した結果」と「先頭から通した結果」が
+/// 食い違い、文字列やコメントの色が延々と尾を引く。
+fn paint_line(
+    ps: &SyntaxSet,
+    syntax: &SyntaxReference,
+    hl: &ThemeHighlighter,
+    line: &str,
+    state: &mut (ParseState, HighlightState),
+    fallback: Color32,
+) -> Vec<LineSpan> {
+    if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+        return plain_span(line.len(), fallback);
+    }
+    match state.0.parse_line(line, ps) {
+        Ok(ops) => {
+            let mut v = Vec::new();
+            let mut off = 0usize;
+            for (style, piece) in HighlightIterator::new(&mut state.1, &ops, line, hl) {
+                let end = off + piece.len();
+                if end > off {
+                    v.push(span_of(&style, off, end));
+                }
+                off = end;
+            }
+            if off < line.len() {
+                v.push(LineSpan {
+                    start: off as u32,
+                    end: line.len() as u32,
+                    color: fallback,
+                    italic: false,
+                    underline: false,
+                });
+            }
+            v
+        }
+        Err(_) => {
+            *state = (
+                ParseState::new(syntax),
+                HighlightState::new(hl, syntect::parsing::ScopeStack::new()),
+            );
+            plain_span(line.len(), fallback)
+        }
+    }
+}
+
+/// 塗る対象の行域 (半開区間)。[`snap_window`] で作る。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    /// 最初の行 (0 始まり)。
+    pub start: usize,
+    /// 最後の行の次。
+    pub end: usize,
+}
+
+/// 可視域を [`WINDOW_BLOCK_LINES`] の倍数へ**外側に**広げる。
+///
+/// 呼び出し側は galley キャッシュのキーにも `start` / `end` を混ぜること。
+/// 生のスクロール位置を混ぜると 1 行動くだけで galley を組み直すことになり、
+/// 巨大ファイルではそれ自体がフレーム落ちの原因になる (実測 495ms/回)。
+pub fn snap_window(first_line: usize, line_count: usize) -> Window {
+    Window {
+        start: first_line - first_line % WINDOW_BLOCK_LINES,
+        end: (first_line + line_count.max(1)).next_multiple_of(WINDOW_BLOCK_LINES),
+    }
+}
+
+/// [`Highlighter::layout_job_visible`] の結果。
+pub struct VisibleJob {
+    /// 本文まるごとの `LayoutJob`。可視域は塗り分け、その外は 1 セクション。
+    pub job: LayoutJob,
+    /// 可視域を**正しい文脈**で塗れたか。
+    ///
+    /// `false` は暫定表示 (可視域の先頭から解析し直した近似) を意味する。
+    /// 呼び出し側は galley を捨てて次のフレームでもう一度呼ぶこと
+    /// (`ctx.request_repaint()`)。何度か呼べば必ず `true` になり、
+    /// **そこからは再描画を要求しない** = アイドルの費用はゼロに戻る。
+    pub exact: bool,
+    /// この呼び出しで syntect へ通した行数。文書全体ではなく
+    /// 「チェックポイント間隔 + 可視域」で頭打ちになることを
+    /// テストがここで確かめる。
+    pub scanned_lines: usize,
+}
+
+/// [`Highlighter::advance_to_visible`] の結果。
+pub struct Advance {
+    /// 可視域を正しい文脈で塗れる所までフロンティアが届いたか。
+    pub ready: bool,
+    /// この呼び出しで syntect へ通した行数
+    /// ([`WINDOW_SCAN_BUDGET_LINES`] で頭打ちになる)。
+    pub scanned_lines: usize,
+}
 
 /// `Style` を [`LineSpan`] へ落とす (色と字体だけ残す)。
 fn span_of(style: &syntect::highlighting::Style, start: usize, end: usize) -> LineSpan {
@@ -295,7 +604,23 @@ fn job_from_spans(text: &str, lines: &[&str], spans: &[Vec<LineSpan>], font: &Fo
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     job.text.push_str(text);
-    let mut base = 0usize;
+    append_spans(&mut job, 0, lines, spans, font);
+    job
+}
+
+/// 行ごとの塗り分けを `job` の**セクションとして**積む。
+///
+/// `base` は `lines[0]` の先頭が本文のどこに当たるか (バイト)。可視域だけを
+/// 塗る経路 ([`Highlighter::layout_job_visible`]) は本文の途中から積むので
+/// ここを分けてある。呼び出し側が `job.text` を先に用意しておくこと。
+fn append_spans(
+    job: &mut LayoutJob,
+    base: usize,
+    lines: &[&str],
+    spans: &[Vec<LineSpan>],
+    font: &FontId,
+) {
+    let mut base = base;
     // (バイト範囲, 色, italic, underline) を貯めて、変わった時点で吐く。
     let mut cur: Option<(usize, usize, Color32, bool, bool)> = None;
     for (i, line) in lines.iter().enumerate() {
@@ -309,7 +634,7 @@ fn job_from_spans(text: &str, lines: &[&str], spans: &[Vec<LineSpan>], font: &Fo
                 }
                 _ => {
                     if let Some((s0, e0, c, it, ul)) = cur.take() {
-                        push_section(&mut job, s0..e0, c, it, ul, font);
+                        push_section(job, s0..e0, c, it, ul, font);
                     }
                     cur = Some((s, e, sp.color, sp.italic, sp.underline));
                 }
@@ -318,9 +643,8 @@ fn job_from_spans(text: &str, lines: &[&str], spans: &[Vec<LineSpan>], font: &Fo
         base += line.len();
     }
     if let Some((s0, e0, c, it, ul)) = cur.take() {
-        push_section(&mut job, s0..e0, c, it, ul, font);
+        push_section(job, s0..e0, c, it, ul, font);
     }
-    job
 }
 
 fn push_section(
@@ -694,6 +1018,33 @@ impl Highlighter {
         font: FontId,
         fallback: Color32,
     ) -> LayoutJob {
+        // 全文を 1 度に塗るとフレームが止まる大きさなら、可視域だけを塗る
+        // 経路へ落とす。画面のどこを見ているか知らないここでは先頭ブロックを
+        // 塗る (可視域を渡せる呼び出し側は [`Self::layout_job_visible`] を使う)。
+        // 本文のハッシュを取る**前**に分岐する — 巨大文書は `cache_put` が
+        // 弾くので完成品キャッシュに載ることが無く、鍵を作るだけ無駄になる。
+        if text.len() > MAX_HIGHLIGHT_BYTES {
+            let v = self.layout_job_visible(
+                text,
+                lang,
+                theme_name,
+                font,
+                fallback,
+                snap_window(0, WINDOW_BLOCK_LINES),
+            );
+            // 先頭ブロックは 0 行目のスナップショットからそのまま塗れるので、
+            // ここが暫定表示になることは無い。
+            debug_assert!(v.exact, "先頭ブロックが暫定表示になっている");
+            // 1 回の塗りは「チェックポイント間隔 + 可視域」で頭打ちになる。
+            // ここが破れたら、遠い行へ飛んだときにフレームが止まる。
+            debug_assert!(
+                v.scanned_lines
+                    <= WINDOW_SCAN_BUDGET_LINES + CHECKPOINT_LINES + 2 * WINDOW_BLOCK_LINES,
+                "1 回の塗りが頭打ちを超えた: {}",
+                v.scanned_lines
+            );
+            return v.job;
+        }
         // キャッシュキーのハッシュ計算
         // 本文を**含まない**キー。行キャッシュ ([`DocCache`]) はこれが
         // 一致するときだけ再利用できる (言語やテーマが変われば色が変わるため)。
@@ -775,6 +1126,258 @@ impl Highlighter {
         self.cache_put(key, &job);
 
         job
+    }
+
+    /// 巨大ファイルでも**可視域には必ず色を付ける**入口。
+    ///
+    /// `first_line` / `line_count` は画面に見えている行域。**[`snap_window`] を
+    /// 通した値を渡し、呼び出し側の galley キャッシュキーにも同じ値を混ぜること**
+    /// (生のスクロール位置を混ぜると 1 行動くたびに galley を組み直すことになり、
+    /// 実測 495ms/回 が毎フレーム乗る)。
+    ///
+    /// [`MAX_HIGHLIGHT_BYTES`] 以下の文書は従来どおり全文を塗って返すので、
+    /// `exact` は必ず `true` になる。
+    pub fn layout_job_visible(
+        &self,
+        text: &str,
+        lang: &str,
+        theme_name: &str,
+        font: FontId,
+        fallback: Color32,
+        win: Window,
+    ) -> VisibleJob {
+        if text.len() > MAX_HIGHLIGHT_BYTES {
+            return self.visible_job(text, lang, theme_name, font, fallback, win);
+        }
+        VisibleJob {
+            job: self.layout_job(text, lang, theme_name, font, fallback),
+            exact: true,
+            scanned_lines: 0,
+        }
+    }
+
+    /// 可視域を**正しい文脈**で塗るための追い付きを 1 フレームぶん進める。
+    ///
+    /// `LayoutJob` を作らないので、呼び出し側は galley を組み直さなくてよい
+    /// (組み直しは実測 495ms なので、追い付きのたびに組み直すと本末転倒)。
+    /// 毎フレーム呼び、
+    ///
+    /// * `ready` が `false` のあいだは `ctx.request_repaint()` する
+    /// * `false` → `true` に変わった 1 回だけ galley を捨てて塗り直す
+    ///
+    /// という使い方をする。**追い付き済みなら本文に触れずに即座に返る**ので、
+    /// スクロールが止まっているあいだの費用はゼロになる。
+    pub fn advance_to_visible(
+        &self,
+        text: &str,
+        lang: &str,
+        theme_name: &str,
+        fallback: Color32,
+        win: Window,
+    ) -> Advance {
+        if text.len() <= MAX_HIGHLIGHT_BYTES {
+            return Advance {
+                ready: true,
+                scanned_lines: 0,
+            };
+        }
+        let w0 = win.start;
+        let Some(style_key) = self.window_style_key(lang, theme_name, fallback) else {
+            // 構文もテーマも引けない = そもそも塗らないので、待つものが無い。
+            return Advance {
+                ready: true,
+                scanned_lines: 0,
+            };
+        };
+        WIN_CACHE.with(|c| {
+            let mut slot = c.borrow_mut();
+            // 追い付き済みなら本文を 1 バイトも読まずに返る (アイドル費用ゼロ)。
+            // 本文が変わったかどうかの照合は、galley を作り直す側
+            // (`visible_job`) が必ず通るのでここでは要らない。
+            if let Some(wc) = slot.as_ref() {
+                // `line_count` は本文の行数 (塗る側が毎回入れ直す)。可視域が
+                // 末尾を越えているときに「永遠に届かない目標」を追いかけて
+                // 毎フレーム全行を数え直さないためのもの。
+                if wc.style_key == style_key && wc.frontier.cp.line >= w0.min(wc.line_count) {
+                    return Advance {
+                        ready: true,
+                        scanned_lines: 0,
+                    };
+                }
+            }
+            let Some((set, syntax)) = self.syntax_for(lang).filter(|(_, s)| s.name != PLAIN_TEXT)
+            else {
+                return Advance {
+                    ready: true,
+                    scanned_lines: 0,
+                };
+            };
+            let Some(theme) = self.ts().themes.get(theme_name) else {
+                return Advance {
+                    ready: true,
+                    scanned_lines: 0,
+                };
+            };
+            let hl = ThemeHighlighter::new(theme);
+            let lines: Vec<&str> = LinesWithEndings::from(text).collect();
+            let w0 = w0.min(lines.len());
+            if !matches!(slot.as_ref(), Some(w) if w.style_key == style_key) {
+                *slot = Some(WinCache::new(style_key, syntax, &hl));
+            }
+            let wc = slot.as_mut().expect("直前に入れた");
+            wc.line_count = lines.len();
+            let scanned = win_advance(set, syntax, &hl, &lines, wc, w0, WINDOW_SCAN_BUDGET_LINES);
+            Advance {
+                ready: wc.frontier.cp.line >= w0,
+                scanned_lines: scanned,
+            }
+        })
+    }
+
+    /// 可視域だけを塗る本体 ([`MAX_HIGHLIGHT_BYTES`] 超え専用)。
+    fn visible_job(
+        &self,
+        text: &str,
+        lang: &str,
+        theme_name: &str,
+        font: FontId,
+        fallback: Color32,
+        win: Window,
+    ) -> VisibleJob {
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
+        job.text.push_str(text);
+        let flat = |job: &mut LayoutJob| {
+            if !text.is_empty() {
+                push_section(job, 0..text.len(), fallback, false, false, &font);
+            }
+        };
+
+        // 構文もテーマも引けないなら塗りようが無い (従来どおり素の文字)。
+        let (Some((set, syntax)), Some(style_key)) = (
+            self.syntax_for(lang).filter(|(_, s)| s.name != PLAIN_TEXT),
+            self.window_style_key(lang, theme_name, fallback),
+        ) else {
+            flat(&mut job);
+            return VisibleJob {
+                job,
+                exact: true,
+                scanned_lines: 0,
+            };
+        };
+        let Some(theme) = self.ts().themes.get(theme_name) else {
+            flat(&mut job);
+            return VisibleJob {
+                job,
+                exact: true,
+                scanned_lines: 0,
+            };
+        };
+
+        let hl = ThemeHighlighter::new(theme);
+        let lines: Vec<&str> = LinesWithEndings::from(text).collect();
+        let n = lines.len();
+        let (w0, w1) = (win.start.min(n), win.end.min(n));
+        if w0 >= w1 {
+            flat(&mut job);
+            return VisibleJob {
+                job,
+                exact: true,
+                scanned_lines: 0,
+            };
+        }
+
+        // 本文が変わっていたら、変わった所から先の足場を捨てる。ここは
+        // 呼び出し側の galley キャッシュが外れた時 = 本文か可視域が動いた時
+        // にしか通らないので、照合の費用 (先頭からフロンティアまでのハッシュ)
+        // を毎フレーム払うことにはならない。
+        WIN_CACHE.with(|c| {
+            let mut slot = c.borrow_mut();
+            if !matches!(slot.as_ref(), Some(w) if w.style_key == style_key) {
+                *slot = Some(WinCache::new(style_key, syntax, &hl));
+            }
+            slot.as_mut().expect("直前に入れた").trim_to_unchanged(text);
+        });
+        // 追い付きを 1 回ぶん進める。**前進する経路はここ 1 本だけ**にして、
+        // 「毎フレーム呼ぶ pump」と「塗るとき」で規則がずれないようにする。
+        let adv = self.advance_to_visible(text, lang, theme_name, fallback, win);
+
+        let (spans, exact, scanned) = WIN_CACHE.with(|c| {
+            let mut slot = c.borrow_mut();
+            let wc = slot.as_mut().expect("直前に入れた");
+            wc.line_count = n;
+            let mut scanned = adv.scanned_lines;
+            // 再開点 = 可視域の手前で最も後ろのスナップショット。0 行目は
+            // 必ず居るので `partition_point` は 1 以上を返す。
+            let k = wc.points.partition_point(|p| p.cp.line <= w0) - 1;
+            // 追い付き済みでも、再開点から可視域までが間隔を超えているなら
+            // 「正確に塗る」を名乗らない。**1 回の塗りの費用を
+            // `stride + 可視域` で頭打ちにする**のはこの条件そのもの。
+            let exact = adv.ready && w0 - wc.points[k].cp.line <= wc.stride;
+            let mut state = if exact {
+                // 可視域の手前で最も後ろのスナップショットから再開し、
+                // そこから可視域の先頭まで追い付く (最大 `stride` 行)。
+                let k = wc.points.partition_point(|p| p.cp.line <= w0) - 1;
+                let p = &wc.points[k];
+                let mut st = (p.cp.ps.clone(), p.cp.hs.clone());
+                // ここは最大 `stride` 行 (上の条件で保証されている)。
+                for line in &lines[p.cp.line..w0] {
+                    paint_line(set, syntax, &hl, line, &mut st, fallback);
+                    scanned += 1;
+                }
+                st
+            } else {
+                // 暫定表示。可視域の先頭から解析し直すので、行を跨ぐコメントや
+                // 生文字列の途中だと色がずれる。**それでも白一色にはしない** —
+                // 追い付いた時点で `exact` が立ち、正しい色へ塗り替わる。
+                // 「素の文字にする」のとは違い、キーワード・文字列・コメント・
+                // 数値はこの時点で既に塗り分けられている。
+                (
+                    ParseState::new(syntax),
+                    HighlightState::new(&hl, syntect::parsing::ScopeStack::new()),
+                )
+            };
+            let mut out = Vec::with_capacity(w1 - w0);
+            for line in &lines[w0..w1] {
+                out.push(paint_line(set, syntax, &hl, line, &mut state, fallback));
+                scanned += 1;
+            }
+            (out, exact, scanned)
+        });
+
+        // 可視域の外は 1 セクションにまとめる (画面に出ないので色は要らない。
+        // セクション数は galley の費用にほとんど効かないが、作る費用は効く)。
+        let off0: usize = lines[..w0].iter().map(|l| l.len()).sum();
+        let off1: usize = off0 + lines[w0..w1].iter().map(|l| l.len()).sum::<usize>();
+        if off0 > 0 {
+            push_section(&mut job, 0..off0, fallback, false, false, &font);
+        }
+        append_spans(&mut job, off0, &lines[w0..w1], &spans, &font);
+        if off1 < text.len() {
+            push_section(&mut job, off1..text.len(), fallback, false, false, &font);
+        }
+        VisibleJob {
+            job,
+            exact,
+            scanned_lines: scanned,
+        }
+    }
+
+    /// チェックポイント台帳を作り直すかどうかを決める鍵。
+    ///
+    /// フォントは混ぜない — 塗り分け ([`LineSpan`]) は色と字体しか持たず
+    /// フォントに依存しないので、文字サイズを変えただけで台帳を捨てると
+    /// また先頭から舐め直しになる。構文もテーマも引けないときは `None`。
+    fn window_style_key(&self, lang: &str, theme_name: &str, fallback: Color32) -> Option<u64> {
+        self.syntax_for(lang)
+            .filter(|(_, s)| s.name != PLAIN_TEXT)?;
+        self.ts().themes.get(theme_name)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (self as *const Self as usize).hash(&mut hasher);
+        lang.hash(&mut hasher);
+        theme_name.hash(&mut hasher);
+        fallback.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     /// 連続した行の並びを 1 パスで色分けし、**行ごとの (開始, 終了, 色)** を返す。
@@ -2442,18 +3045,23 @@ mod tests {
     }
 
     #[test]
-    fn oversized_text_skips_highlighting() {
+    fn oversized_text_is_highlighted_at_the_visible_window() {
+        // 上限超えの文書は「諦めて素の文字」ではなく、可視域だけを塗る経路へ
+        // 落ちる。可視域を渡さない `layout_job` では先頭ブロックが塗られる。
         let unit = "fn main() { let x = 1; }\n";
         let text = unit.repeat(MAX_HIGHLIGHT_BYTES / unit.len() + 2);
         assert!(text.len() > MAX_HIGHLIGHT_BYTES);
 
         let job = job_of(&text, "Rust");
+        assert_eq!(job.text, text, "本文が欠けた");
+        assert_spans_ok(&job, &text);
+        assert!(job.sections.len() > 1, "上限超えを塗っていない");
+        // 先頭は色が付き、可視域の外はフォールバック 1 色にまとまる。
+        assert_ne!(job.sections[0].format.color, fallback());
         assert_eq!(
-            job.sections.len(),
-            1,
-            "large files must be laid out in one plain span"
+            job.sections[job.sections.len() - 1].format.color,
+            fallback()
         );
-        assert_eq!(job.sections[0].format.color, fallback());
     }
 
     #[test]
@@ -3661,29 +4269,44 @@ mod huge_files {
 
     #[test]
     fn 極端に長い一行でも固まらず素通しになる() {
+        // **絶対時間で線を引かない。** 以前ここは `took < 3 秒` を見ていたが、
+        // 全件を同時実行したときだけ落ちる偽陽性を出していた
+        // (このリポジトリで実測 3 件の前例がある罠)。守りたい性質は
+        // 「行長に比例した費用が掛からない」ことなので、**行の長さを 2 倍にして
+        // 出来上がる区間が 1 つも増えない**ことを見る。素通しであれば
+        // 長さに依らず 1 区間で、塗っていれば長さに比例して区間が増える。
         let h = Highlighter::new();
-        // 5MB の 1 行 (minify 済み JS を想定)
-        let long = format!("var a={};\n", "1+".repeat(2_500_000));
-        assert!(long.len() > 5_000_000);
-        let src = format!("// 先頭\n{long}var b=2;\n");
-        let t = std::time::Instant::now();
-        let spans = spans_of(&h, &src, "JavaScript (Babel)");
-        let took = t.elapsed();
-        // 長すぎる行は 1 区間 (= 素通し) になる
-        assert_eq!(spans[1].len(), 1, "長すぎる行を塗ろうとしている");
-        assert_eq!(spans[1][0].end as usize, long.len());
-        // 前後の行は普通に塗れている (状態を壊していない)
-        assert!(!spans[0].is_empty());
-        assert!(spans[2].len() >= 2, "長い行の後ろが塗れていない");
-        // 素通しなので行長に比例した費用は掛からない
-        assert!(
-            took < std::time::Duration::from_secs(3),
-            "遅すぎる: {took:?}"
+        let long_line = |half: usize| format!("var a={};\n", "1+".repeat(half));
+        let build = |half: usize| {
+            let long = long_line(half);
+            (format!("// 先頭\n{long}var b=2;\n"), long.len())
+        };
+        let (src_n, len_n) = build(1_250_000);
+        let (src_2n, len_2n) = build(2_500_000);
+        assert!(len_2n > 5_000_000, "2 倍側が上限を超えていない");
+
+        let spans_n = spans_of(&h, &src_n, "JavaScript (Babel)");
+        let spans_2n = spans_of(&h, &src_2n, "JavaScript (Babel)");
+
+        for (spans, len, label) in [(&spans_n, len_n, "N"), (&spans_2n, len_2n, "2N")] {
+            // 長すぎる行は 1 区間 (= 素通し) になる
+            assert_eq!(spans[1].len(), 1, "{label}: 長すぎる行を塗ろうとしている");
+            assert_eq!(spans[1][0].end as usize, len);
+            // 前後の行は普通に塗れている (状態を壊していない)
+            assert!(!spans[0].is_empty(), "{label}: 先頭行が塗れていない");
+            assert!(spans[2].len() >= 2, "{label}: 長い行の後ろが塗れていない");
+        }
+        // 行を 2 倍にしても区間の総数が増えない = 行長に比例した費用が無い
+        let total = |v: &[Vec<LineSpan>]| v.iter().map(|l| l.len()).sum::<usize>();
+        assert_eq!(
+            total(&spans_n),
+            total(&spans_2n),
+            "行長を 2 倍にしたら区間が増えた = 素通しになっていない"
         );
     }
 
     #[test]
-    fn 上限を超える文書は素通しになるが本文は欠けない() {
+    fn 上限を超える文書も本文が欠けずに色が付く() {
         let h = Highlighter::new();
         let src = "let x = 1;\n".repeat(MAX_HIGHLIGHT_BYTES / 11 + 100);
         assert!(src.len() > MAX_HIGHLIGHT_BYTES);
@@ -3695,7 +4318,13 @@ mod huge_files {
             Color32::WHITE,
         );
         assert_eq!(job.text, src, "本文が欠けた");
-        assert_eq!(job.sections.len(), 1, "上限超えなのに塗っている");
+        assert!(job.sections.len() > 1, "上限超えで塗るのを諦めている");
+        let colored = job
+            .sections
+            .iter()
+            .filter(|s| s.format.color != Color32::WHITE)
+            .count();
+        assert!(colored > 0, "どのセクションにも色が付いていない");
     }
 }
 
@@ -4491,5 +5120,459 @@ where
         for name in TERMINAL_ONLY_THEMES {
             assert!(!h.ts().themes.contains_key(*name), "{name} を混ぜている");
         }
+    }
+}
+
+// ===========================================================================
+// 可視域だけを塗る経路 (巨大ファイル)
+//
+// ここで守りたいのは 3 つ。
+//   * **どんな行数でも色が付く** — 先頭・中間・末尾のどこを見ても、
+//     トークンが 1 種類ということが無い
+//   * **チェックポイントから再開した結果が、先頭から通した結果と一致する**
+//     — ここがずれると文字列やコメントの色が延々と尾を引く
+//   * **1 回の塗りの費用が頭打ちになる** — 実時間では測らない。
+//     「syntect へ通した行数」という守りたい性質そのものを数える
+// ===========================================================================
+#[cfg(test)]
+mod visible_window {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn theme() -> &'static str {
+        "base16-ocean.dark"
+    }
+
+    fn font() -> FontId {
+        FontId::monospace(12.0)
+    }
+
+    /// 台帳を空にする (テスト同士が前の文書の足場を拾わないように)。
+    fn reset() {
+        WIN_CACHE.with(|c| *c.borrow_mut() = None);
+        DOC_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// 各行の先頭バイト位置 (行数 + 1 個。末尾は本文長)。
+    fn line_starts(text: &str) -> Vec<usize> {
+        let mut v = vec![0usize];
+        for l in LinesWithEndings::from(text) {
+            v.push(v[v.len() - 1] + l.len());
+        }
+        v
+    }
+
+    /// `range` に掛かるセクションの色を集める (空白だけの区間は数えない)。
+    fn palette_in(job: &LayoutJob, range: std::ops::Range<usize>) -> BTreeSet<(u8, u8, u8)> {
+        let mut set = BTreeSet::new();
+        for s in &job.sections {
+            if s.byte_range.end <= range.start || s.byte_range.start >= range.end {
+                continue;
+            }
+            let a = s.byte_range.start.max(range.start);
+            let b = s.byte_range.end.min(range.end);
+            if job.text[a..b].trim().is_empty() {
+                continue;
+            }
+            let c = s.format.color;
+            set.insert((c.r(), c.g(), c.b()));
+        }
+        set
+    }
+
+    /// セクションが本文を隙間なく・重なりなく覆っていること。
+    fn assert_covered(job: &LayoutJob) {
+        let mut at = 0usize;
+        for s in &job.sections {
+            assert_eq!(s.byte_range.start, at, "セクションに隙間か重なりがある");
+            assert!(s.byte_range.end >= s.byte_range.start, "逆順のセクション");
+            at = s.byte_range.end;
+        }
+        assert_eq!(at, job.text.len(), "本文の末尾まで覆えていない");
+    }
+
+    /// 追い付くまで pump する。返り値は回った回数。
+    fn pump(h: &Highlighter, text: &str, lang: &str, first: usize, rows: usize) -> usize {
+        let win = snap_window(first, rows);
+        for i in 1..1_000_000usize {
+            let a = h.advance_to_visible(text, lang, theme(), Color32::WHITE, win);
+            if a.ready {
+                return i;
+            }
+            assert!(
+                a.scanned_lines <= WINDOW_SCAN_BUDGET_LINES,
+                "1 回の追い付きが予算を超えた: {}",
+                a.scanned_lines
+            );
+        }
+        panic!("追い付かない");
+    }
+
+    fn paint(
+        h: &Highlighter,
+        text: &str,
+        lang: &str,
+        first: usize,
+        rows: usize,
+    ) -> super::VisibleJob {
+        h.layout_job_visible(
+            text,
+            lang,
+            theme(),
+            font(),
+            Color32::WHITE,
+            snap_window(first, rows),
+        )
+    }
+
+    /// このリポジトリで一番大きな実ソース。無ければ手元のファイルを
+    /// 繰り返して嵩を出す (どの環境でも [`MAX_HIGHLIGHT_BYTES`] を超える)。
+    fn 巨大な実ソース() -> String {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        if let Ok(s) = std::fs::read_to_string(root.join("src/app.rs")) {
+            if s.len() > MAX_HIGHLIGHT_BYTES {
+                return s;
+            }
+        }
+        let one = std::fs::read_to_string(root.join("src/highlight.rs")).expect("自分自身は読める");
+        let mut s = String::new();
+        while s.len() <= MAX_HIGHLIGHT_BYTES * 3 {
+            s.push_str(&one);
+        }
+        s
+    }
+
+    /// 行を跨ぐ構文 (`/* */` と生文字列) を含む合成ソース。
+    /// `MAX_HIGHLIGHT_BYTES` を確実に超える大きさにする。
+    fn 行を跨ぐ構文を含む合成ソース() -> String {
+        let mut s = String::new();
+        let mut i = 0usize;
+        while s.len() <= MAX_HIGHLIGHT_BYTES + 64 * 1024 {
+            // 1 かたまり 13 行。ブロックコメントと生文字列が行を跨ぐ。
+            // **13 は 512 ([`WINDOW_BLOCK_LINES`]) と互いに素**にしてある —
+            // かたまりの長さが割り切れると、ブロック境界がいつも同じ行種に
+            // 当たってしまい「行を跨ぐ構文の途中で始まる可視域」を作れない。
+            s.push_str(&format!("fn f{i}(a: u32) -> u32 {{\n"));
+            s.push_str("    /* ここから\n");
+            s.push_str("       さらにコメント\n");
+            s.push_str("       行を跨ぐ\n");
+            s.push_str("       ブロックコメント */\n");
+            s.push_str(&format!("    let s = r#\"生の文字列 {i}\n"));
+            s.push_str("       まだ文字列の中 fn let 123\n");
+            s.push_str("       ここで閉じる\"#;\n");
+            s.push_str(&format!("    let n = {i} + 0x2a; // 行コメント\n"));
+            s.push_str("    let _ = s;\n");
+            s.push_str("    n + a\n");
+            s.push_str("}\n");
+            s.push('\n');
+            i += 1;
+        }
+        s
+    }
+
+    #[test]
+    fn 可視域の丸めは外側へ広がる() {
+        // (先頭行, 行数) -> (開始, 終了)
+        let b = WINDOW_BLOCK_LINES;
+        for (first, rows, want) in [
+            (0usize, 1usize, (0usize, b)),
+            (0, b, (0, b)),
+            (1, b, (0, 2 * b)),
+            (b, 10, (b, 2 * b)),
+            (b - 1, 1, (0, b)),
+            (3 * b + 7, 40, (3 * b, 4 * b)),
+        ] {
+            let w = snap_window(first, rows);
+            assert_eq!((w.start, w.end), want, "first={first} rows={rows}");
+            let (s, e) = (w.start, w.end);
+            assert!(
+                s <= first && first + rows.max(1) <= e,
+                "可視域を覆えていない"
+            );
+            assert!(s.is_multiple_of(b) && e.is_multiple_of(b), "境界が粗くない");
+        }
+    }
+
+    #[test]
+    fn 巨大な実ソースの先頭と中間と末尾に色が付く() {
+        let text = 巨大な実ソース();
+        assert!(
+            text.len() > MAX_HIGHLIGHT_BYTES,
+            "入力が上限を超えていない: {}",
+            text.len()
+        );
+        let starts = line_starts(&text);
+        let n = starts.len() - 1;
+        let h = Highlighter::new();
+        let rows = 50usize;
+        for (name, first) in [
+            ("先頭", 0usize),
+            ("中間", (n / 2).min(20_000)),
+            ("末尾", n.saturating_sub(rows + 1)),
+        ] {
+            reset();
+            let v = paint(&h, &text, "Rust", first, rows);
+            assert_covered(&v.job);
+            assert_eq!(v.job.text, text, "{name}: 本文が欠けた");
+            let Window { start: w0, end: w1 } = snap_window(first, rows);
+            let (w0, w1) = (w0.min(n), w1.min(n));
+            let pal = palette_in(&v.job, starts[w0]..starts[w1]);
+            assert!(
+                pal.len() >= 3,
+                "{name} (行 {first}) が塗られていない: 色 {} 種類",
+                pal.len()
+            );
+        }
+    }
+
+    #[test]
+    fn 追い付く前でも可視域は白一色にならない() {
+        let text = 行を跨ぐ構文を含む合成ソース();
+        let starts = line_starts(&text);
+        let n = starts.len() - 1;
+        let h = Highlighter::new();
+        reset();
+        // 台帳が空のまま遠くを塗る = 暫定表示。
+        let first = n / 2;
+        let v = paint(&h, &text, "Rust", first, 50);
+        assert!(!v.exact, "この位置は 1 回では追い付けないはず");
+        let Window { start: w0, end: w1 } = snap_window(first, 50);
+        let pal = palette_in(&v.job, starts[w0.min(n)]..starts[w1.min(n)]);
+        assert!(pal.len() >= 3, "暫定表示が単色になっている: {}", pal.len());
+    }
+
+    #[test]
+    fn チェックポイントから再開した結果は先頭から通したものと一致する() {
+        let text = 行を跨ぐ構文を含む合成ソース();
+        let starts = line_starts(&text);
+        let n = starts.len() - 1;
+        let lines: Vec<&str> = LinesWithEndings::from(text.as_str()).collect();
+        let h = Highlighter::new();
+
+        // 先頭から通した答え (既存の全文経路)。
+        let (set, syntax) = h.syntax_for("Rust").expect("Rust の構文がある");
+        let theme_ref = h.ts().themes.get(theme()).expect("既定テーマがある");
+        reset();
+        let want = highlight_doc(set, syntax, theme_ref, &text, Color32::WHITE, 0, None);
+        let want_job = job_from_spans(&text, &lines, &want.spans, &font());
+
+        // 行を跨ぐ構文の途中で始まる可視域を選ぶ (ここがずれると尾を引く)。
+        // 生文字列の 2 行目が来る所を狙って、ブロック境界を後ろから探す。
+        let mut first = None;
+        for b in (1..n / WINDOW_BLOCK_LINES).rev() {
+            let l = lines[b * WINDOW_BLOCK_LINES];
+            if l.trim_start().starts_with("まだ文字列の中")
+                || l.trim_start().starts_with("行を跨ぐ")
+            {
+                first = Some(b * WINDOW_BLOCK_LINES);
+                break;
+            }
+        }
+        let first = first.expect("行を跨ぐ構文の途中に当たるブロック境界がある");
+        let Window { start: w0, end: w1 } = snap_window(first, 1);
+        let (w0, w1) = (w0.min(n), w1.min(n));
+        let range = starts[w0]..starts[w1];
+
+        // (1) 追い付く前 = 暫定表示は、正解と違っていてよい (むしろ違う)。
+        reset();
+        let prov = paint(&h, &text, "Rust", first, 1);
+        assert!(!prov.exact, "この位置は暫定表示になるはず");
+        // 色の**集合**は可視域 512 行ぶんを均せば一致してしまうので、
+        // 1 バイトずつ突き合わせる。
+        assert_ne!(
+            colors_of(&prov.job, range.clone()),
+            colors_of(&want_job, range.clone()),
+            "暫定表示が正解と同じ = この検査は再開の失敗を捕まえられない"
+        );
+
+        // (2) 追い付いたら、先頭から通した結果と**バイト単位で**一致する。
+        pump(&h, &text, "Rust", first, 1);
+        let got = paint(&h, &text, "Rust", first, 1);
+        assert!(got.exact, "追い付いたのに暫定表示のまま");
+        assert_covered(&got.job);
+        let a = colors_of(&got.job, range.clone());
+        let b = colors_of(&want_job, range.clone());
+        assert_eq!(a.len(), b.len());
+        let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 0, "再開した結果が {diff} バイトぶんずれている");
+    }
+
+    /// `range` の 1 バイトごとの色。
+    fn colors_of(job: &LayoutJob, range: std::ops::Range<usize>) -> Vec<(u8, u8, u8)> {
+        let mut out = vec![(0u8, 0u8, 0u8); range.len()];
+        for s in &job.sections {
+            if s.byte_range.end <= range.start || s.byte_range.start >= range.end {
+                continue;
+            }
+            let a = s.byte_range.start.max(range.start);
+            let b = s.byte_range.end.min(range.end);
+            let c = s.format.color;
+            for x in a..b {
+                out[x - range.start] = (c.r(), c.g(), c.b());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 可視域を塗るのに舐める行数はチェックポイント間隔で頭打ちになる() {
+        let text = 行を跨ぐ構文を含む合成ソース();
+        let n = line_starts(&text).len() - 1;
+        let h = Highlighter::new();
+        let first = (n / 2) - (n / 2) % WINDOW_BLOCK_LINES;
+        reset();
+        pump(&h, &text, "Rust", first, 50);
+        let v = paint(&h, &text, "Rust", first, 50);
+        assert!(v.exact);
+        let Window { start: w0, end: w1 } = snap_window(first, 50);
+        let window = w1.min(n) - w0.min(n);
+        let ceiling = CHECKPOINT_LINES + window + WINDOW_SCAN_BUDGET_LINES;
+        assert!(
+            v.scanned_lines <= ceiling,
+            "{first} 行目を塗るのに {} 行舐めた (頭打ちは {ceiling} 行)",
+            v.scanned_lines
+        );
+        // ファイル全体を舐めていないこと (ここが本題)。
+        assert!(
+            v.scanned_lines * 4 < first,
+            "先頭から舐め直している: {} 行 / 開始行 {first}",
+            v.scanned_lines
+        );
+    }
+
+    #[test]
+    fn 文書を二倍にしても可視域の塗りに要る行数は増えない() {
+        let one = 行を跨ぐ構文を含む合成ソース();
+        let two = format!("{one}{one}");
+        let n = line_starts(&one).len() - 1;
+        let first = (n / 2) - (n / 2) % WINDOW_BLOCK_LINES;
+        let h = Highlighter::new();
+
+        let mut got = Vec::new();
+        for text in [&one, &two] {
+            reset();
+            pump(&h, text, "Rust", first, 50);
+            let v = paint(&h, text, "Rust", first, 50);
+            assert!(v.exact);
+            got.push(v.scanned_lines);
+        }
+        assert_eq!(
+            got[0], got[1],
+            "文書を 2 倍にしたら舐める行数が {} → {} に増えた",
+            got[0], got[1]
+        );
+    }
+
+    #[test]
+    fn 可視域より後ろを直しても足場は生き残る() {
+        let text = 行を跨ぐ構文を含む合成ソース();
+        let starts = line_starts(&text);
+        let n = starts.len() - 1;
+        let first = (n / 3) - (n / 3) % WINDOW_BLOCK_LINES;
+        let h = Highlighter::new();
+        reset();
+        pump(&h, &text, "Rust", first, 50);
+        let before = paint(&h, &text, "Rust", first, 50);
+        assert!(before.exact);
+
+        // 可視域より**後ろ**の行を書き換える。
+        let tail = starts[n - 2];
+        let edited = format!("{}// 後ろを直した\n", &text[..tail]);
+        let after = paint(&h, &edited, "Rust", first, 50);
+        assert!(after.exact, "後ろを直しただけで足場を捨てている");
+        assert_eq!(
+            after.scanned_lines, before.scanned_lines,
+            "後ろの編集で先頭から舐め直している"
+        );
+
+        // 逆に**前**を直したら足場は捨てる (捨てないと色がずれる)。
+        let edited2 = format!("/* 先頭に開いたコメント\n{text}");
+        let after2 = paint(&h, &edited2, "Rust", first, 50);
+        assert!(!after2.exact, "前を直したのに古い足場を使っている");
+    }
+
+    #[test]
+    fn 巨大な実ソースでも再開した色が先頭から通した色と一致する() {
+        // 合成ソースだけでなく**実物**でも突き合わせる。深追いすると
+        // debug ビルドで分単位になるので、可視域は手前のブロックに置く。
+        let text = 巨大な実ソース();
+        let starts = line_starts(&text);
+        let n = starts.len() - 1;
+        let first = 4 * WINDOW_BLOCK_LINES;
+        assert!(n > first + WINDOW_BLOCK_LINES, "実ソースが短すぎる");
+        let h = Highlighter::new();
+        let Window { start: w0, end: w1 } = snap_window(first, 50);
+        let (w0, w1) = (w0.min(n), w1.min(n));
+
+        // 先頭から通した答え。syntect の状態は前の行にしか依存しないので、
+        // 可視域の末尾までの**前半分**を塗れば同じ答えになる。
+        let head = &text[..starts[w1]];
+        let head_lines: Vec<&str> = LinesWithEndings::from(head).collect();
+        let (set, syntax) = h.syntax_for("Rust").expect("Rust の構文がある");
+        let theme_ref = h.ts().themes.get(theme()).expect("既定テーマがある");
+        reset();
+        let want = highlight_doc(set, syntax, theme_ref, head, Color32::WHITE, 0, None);
+        let want_job = job_from_spans(head, &head_lines, &want.spans, &font());
+
+        reset();
+        pump(&h, &text, "Rust", first, 50);
+        let got = paint(&h, &text, "Rust", first, 50);
+        assert!(got.exact, "追い付いたのに暫定表示のまま");
+        assert_covered(&got.job);
+        let range = starts[w0]..starts[w1];
+        let diff = colors_of(&got.job, range.clone())
+            .into_iter()
+            .zip(colors_of(&want_job, range))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diff, 0, "実ソースで {diff} バイトぶん色がずれている");
+    }
+
+    #[test]
+    fn 追い付き済みなら本文を舐め直さない() {
+        // アイドル時の費用はゼロ。スクロールが止まっているあいだ、毎フレーム
+        // 呼ばれても syntect には 1 行も通さない。
+        let text = 行を跨ぐ構文を含む合成ソース();
+        let n = line_starts(&text).len() - 1;
+        let first = (n / 4) - (n / 4) % WINDOW_BLOCK_LINES;
+        let h = Highlighter::new();
+        reset();
+        pump(&h, &text, "Rust", first, 50);
+        let win = snap_window(first, 50);
+        for i in 0..8 {
+            let a = h.advance_to_visible(&text, "Rust", theme(), Color32::WHITE, win);
+            assert!(a.ready, "{i} 回目で追い付きが外れた");
+            assert_eq!(a.scanned_lines, 0, "{i} 回目に舐め直している");
+        }
+    }
+
+    #[test]
+    fn 間引いても等間隔が保たれる() {
+        let h = Highlighter::new();
+        let (_, syntax) = h.syntax_for("Rust").expect("Rust の構文がある");
+        let theme_ref = h.ts().themes.get(theme()).expect("既定テーマがある");
+        let thl = ThemeHighlighter::new(theme_ref);
+        let mut wc = WinCache::new(0, syntax, &thl);
+        // 実際の解析は要らないので、スナップショットだけを積む。
+        let zero = wc.points[0].clone();
+        // `win_advance` と同じ規則で積む: いまの間隔の倍数に達したら 1 つ置く。
+        for line in 1..=MAX_CHECKPOINTS * CHECKPOINT_LINES * 4 {
+            if !line.is_multiple_of(wc.stride) {
+                continue;
+            }
+            let mut p = zero.clone();
+            p.cp.line = line;
+            wc.points.push(p);
+            wc.thin();
+        }
+        assert!(wc.points.len() <= MAX_CHECKPOINTS, "上限を超えて抱えている");
+        assert!(wc.stride > CHECKPOINT_LINES, "間隔が広がっていない");
+        let gaps: BTreeSet<usize> = wc
+            .points
+            .windows(2)
+            .map(|w| w[1].cp.line - w[0].cp.line)
+            .collect();
+        assert_eq!(gaps.len(), 1, "等間隔でない: {gaps:?}");
+        assert_eq!(*gaps.iter().next().expect("1 つある"), wc.stride);
     }
 }

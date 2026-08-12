@@ -547,10 +547,56 @@ pub fn is_hr(t: &str) -> bool {
     false
 }
 
-/// テーブルの区切り行 (`|---|:--:|` 形式) か。
+/// テーブルの区切り行 (`|---|:--:|` / `--- | :-:` 形式) か。
+///
+/// GFM は行頭・行末の `|` を省略できる。省略形は水平線 (`---`) と紛れるので、
+/// **セル区切りの `|` があって、どのセルにも `-` がある**ときだけ区切り行とみなす。
 pub fn is_table_sep(t: &str) -> bool {
     let t = t.trim();
-    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+    if !t.contains('-') || !t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')) {
+        return false;
+    }
+    if t.starts_with('|') {
+        return true;
+    }
+    t.contains('|') && split_row(t).iter().all(|c| c.contains('-'))
+}
+
+/// この行から GFM テーブルが始まるか (次の行が区切り行かどうかで決まる)。
+///
+/// 先頭の `|` が無い `a | b` 形式も表として扱うが、箇条書き・見出し・引用が
+/// 先に立つ行は表にしない (`- a | b` は表ではなくリスト)。
+pub fn is_table_head(line: &str, next: Option<&str>) -> bool {
+    let t = line.trim();
+    if t.is_empty() || !t.contains('|') || is_table_sep(t) {
+        return false;
+    }
+    if !next.is_some_and(is_table_sep) {
+        return false;
+    }
+    t.starts_with('|') || (list_marker(t).is_none() && !t.starts_with('#') && !t.starts_with('>'))
+}
+
+/// テーブルの本文行がまだ続くか。
+///
+/// 空行か、別のブロック (見出し・引用・フェンス・箇条書き・水平線) が
+/// 始まったところで表は終わる。
+pub fn table_row_continues(line: &str) -> bool {
+    let t = line.trim_start();
+    if t.trim().is_empty() {
+        return false;
+    }
+    if t.starts_with('|') {
+        return true;
+    }
+    if !t.contains('|') {
+        return false;
+    }
+    !(t.starts_with('#')
+        || t.starts_with('>')
+        || fence_open(t).is_some()
+        || list_marker(t).is_some()
+        || is_hr(t))
 }
 
 /// `| a | b |` をセル列へ分解する。`\|` はエスケープされたパイプとして本文に残す。
@@ -602,6 +648,56 @@ pub fn table_aligns(sep: &str) -> Vec<TableAlign> {
         .collect()
 }
 
+/// テーブルの列幅を内容から決める**純関数**。
+///
+/// * `natural` — その列を折り返さずに描いたときに要る幅
+/// * `avail`   — 表の中身に使える横幅 (枠線と内側余白を引いたもの)
+/// * `gap`     — 列と列のあいだ
+/// * `min_w`   — これ以上は縮めない下限
+///
+/// 収まるときは余りを自然幅の比で配って**可用幅いっぱいに広げる**。
+/// 収まらないときは広い列から削る (water-filling) ので、
+/// **狭い列は自然幅のまま折り返さない**。下限まで縮めても入らないときだけ
+/// 合計が `avail` を超え、呼び出し側が横スクロールへ逃がす。
+///
+/// 全列を同じ上限で切る (旧実装の `Grid::max_col_width`) と、
+/// 「1 文字の数値列」と「20 文字の見出し列」が同じ幅になって
+/// **広い列だけが必ず折り返す**。ここが表の見た目を決める中心なので、
+/// 描画から切り離してテーブルテストで固定する。
+pub fn table_col_widths(natural: &[f32], avail: f32, gap: f32, min_w: f32) -> Vec<f32> {
+    let n = natural.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let min_w = min_w.max(1.0);
+    let nat: Vec<f32> = natural
+        .iter()
+        .map(|w| if w.is_finite() { w.max(1.0) } else { min_w })
+        .collect();
+    let content = (avail - gap * (n - 1) as f32).max(min_w);
+    let total: f32 = nat.iter().sum();
+    if total <= content {
+        let extra = content - total;
+        return nat.iter().map(|w| w + extra * w / total).collect();
+    }
+    // sum(min(nat, k)) == content となる k を、小さい列から順に確定して求める
+    let mut sorted = nat.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut prefix = 0.0_f32;
+    let mut k = content / n as f32;
+    for (i, w) in sorted.iter().enumerate() {
+        let cand = (content - prefix) / (n - i) as f32;
+        if cand <= *w {
+            k = cand;
+            break;
+        }
+        prefix += *w;
+        k = *w;
+    }
+    let k = k.max(min_w);
+    nat.iter().map(|w| w.min(k)).collect()
+}
+
 /// リスト行なら (本文開始オフセット, 行頭記号) を返す。
 pub fn list_marker(t: &str) -> Option<(usize, String)> {
     for m in ["- ", "* ", "+ "] {
@@ -632,6 +728,44 @@ pub fn list_marker(t: &str) -> Option<(usize, String)> {
         }
     }
     None
+}
+
+/// タブが送る桁数 (CommonMark と同じ 4 桁のタブストップ)。
+pub const TAB_STOP: usize = 4;
+
+/// 行頭の空白を**桁数**で数える。
+///
+/// バイト数 (`line.len() - trimmed.len()`) で数えるとタブが 1 桁になり、
+/// タブで字下げした文書の階層が潰れる (`\t- a` と `- a` が同じ深さになる)。
+/// 全角空白も 1 バイトではない。タブは次のタブストップまで送る。
+pub fn indent_width(line: &str) -> usize {
+    let mut col = 0usize;
+    for c in line.chars() {
+        match c {
+            '\t' => col = (col / TAB_STOP + 1) * TAB_STOP,
+            '\u{3000}' => col += 2,
+            c if c.is_whitespace() => col += 1,
+            _ => break,
+        }
+    }
+    col
+}
+
+/// この行から**別のブロック**が始まるか (リスト項目の続き行の判定に使う)。
+pub fn starts_block(lines: &[&str], i: usize) -> bool {
+    let Some(line) = lines.get(i) else {
+        return true;
+    };
+    let t = line.trim_start();
+    fence_open(t).is_some()
+        || atx_heading(t).is_some()
+        || is_hr(t)
+        || t.starts_with('>')
+        || footnote_def(t).is_some()
+        || list_marker(t).is_some()
+        || t.starts_with("$$")
+        || t.starts_with("\\[")
+        || is_table_head(t, lines.get(i + 1).copied())
 }
 
 /// 引用行の `>` の深さと本文を返す (`>> x` → (2, "x"))。
@@ -674,6 +808,16 @@ pub fn append_para(para: &mut String, line: &str) {
 pub const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 /// プレビュー内での表示用に縮小する長辺 (GPU 上限とは別の、紙面上の上限)。
 const PREVIEW_MAX_SIDE: u32 = 1600;
+
+/// アニメーションの時計を 1 パスで進められる上限 (ms)。
+///
+/// この経路は**見えているパスでしか時計を進めない**ので、間隔がこれより
+/// 開いたときは「再生していなかった」= ウィンドウが背面に居た / 画面外へ
+/// スクロールしていた / 長いフレームで詰まった、のいずれかである。
+/// そこで実時間ぶん飛ばすと、有限ループの GIF が**一度も見えないまま
+/// 再生し切って**最後のコマで固まる。飛ばさず続きから再生する。
+/// 値は 4fps 相当 = 人が「止まった」と気付く境目より少し粗いところ。
+const ANIM_MAX_STEP_MS: u64 = 250;
 
 /// 画像 URL の解決結果。
 #[derive(Debug, Clone, PartialEq)]
@@ -872,12 +1016,67 @@ pub fn classify_image(dir: Option<&Path>, url: &str) -> ImageSrc {
     }
 }
 
+/// 再生中のアニメーション 1 本。画素と時計を分けて持つ
+/// (再生位置の計算に数十 MB の画素を持ち回らせないため)。
+struct AnimPlay {
+    /// コマごとの RGBA8。全コマ [`AnimPlay::size`] と同じ寸法。
+    frames: Vec<Vec<u8>>,
+    /// コマごとの表示時間 (ms)。`frames` と同じ長さ。
+    delays_ms: Vec<u32>,
+    loops: crate::preview::AnimLoop,
+    /// 全コマ共通の画素寸法 (`[幅, 高さ]`)。
+    size: [usize; 2],
+    /// 紙面に載せる寸法。**静止画として先に載せた 1 枚**のものを受け継ぐ。
+    /// コマ列が届いた瞬間にも、コマが進んでも版面が 1px も動かないため。
+    display: egui::Vec2,
+    elapsed_ms: u64,
+    /// いまテクスチャに載っているコマ番号。
+    shown: Option<usize>,
+    /// 最後に時計を進めた egui のパス番号。同じ画像が文書に何度出ても
+    /// 1 パスにつき 1 回しか進めない (出た回数だけ倍速になるのを防ぐ)。
+    stepped_at: Option<u64>,
+}
+
+/// 鍵ごとのアニメーションの状態。
+enum AnimSlot {
+    /// 裏スレッドで復号中。
+    Pending,
+    /// アニメーションではなかった (静止画として今までどおり描く)。
+    Still,
+    Ready(Box<AnimPlay>),
+}
+
+/// 裏スレッドの復号結果。
+struct AnimDone {
+    key: String,
+    anim: Option<crate::preview::Animation>,
+}
+
 /// プレビュー内で参照された画像のテクスチャキャッシュ。
 /// ローカルファイルは mtime をキーに含めるため、外部で差し替わると再読込される。
 /// `data:` URI は内容そのものが鍵なので一度載せたら使い回す。
-#[derive(Default)]
+///
+/// アニメーション (GIF / APNG / アニメーション WebP) は
+/// **鍵 1 つにつきテクスチャ 1 枚**しか使わない。コマは
+/// [`egui::TextureHandle::set`] で差し替える (実測: `assets/zaivern-demo.gif`
+/// は 127 コマ・展開 74.9MB あるので、コマごとにテクスチャを作ると GPU が焼ける)。
 pub struct ImageCache {
     map: HashMap<String, (Option<std::time::SystemTime>, Option<egui::TextureHandle>)>,
+    anims: HashMap<String, AnimSlot>,
+    anim_tx: std::sync::mpsc::Sender<AnimDone>,
+    anim_rx: std::sync::mpsc::Receiver<AnimDone>,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        let (anim_tx, anim_rx) = std::sync::mpsc::channel();
+        Self {
+            map: HashMap::new(),
+            anims: HashMap::new(),
+            anim_tx,
+            anim_rx,
+        }
+    }
 }
 
 impl ImageCache {
@@ -889,11 +1088,18 @@ impl ImageCache {
                 return tex.clone();
             }
         }
-        let bytes = std::fs::read(path).ok();
-        let tex = bytes
-            .filter(|b| b.len() <= MAX_IMAGE_BYTES)
-            .and_then(|b| decode_texture(ctx, &key, &b));
-        self.map.insert(key, (mtime, tex.clone()));
+        // 中身が差し替わったらコマ列も作り直す (古い絵が回り続けないよう)
+        self.anims.remove(&key);
+        let bytes = std::fs::read(path)
+            .ok()
+            .filter(|b| b.len() <= MAX_IMAGE_BYTES);
+        let tex = bytes.as_deref().and_then(|b| decode_texture(ctx, &key, b));
+        self.map.insert(key.clone(), (mtime, tex.clone()));
+        if tex.is_some() {
+            if let Some(b) = bytes {
+                self.start_anim(ctx, key, b);
+            }
+        }
         tex
     }
 
@@ -913,13 +1119,160 @@ impl ImageCache {
         if let Some((_, tex)) = self.map.get(key) {
             return tex.clone();
         }
-        let tex = if bytes.len() <= MAX_IMAGE_BYTES {
+        let fits = bytes.len() <= MAX_IMAGE_BYTES;
+        let tex = if fits {
             decode_texture(ctx, key, bytes)
         } else {
             None
         };
         self.map.insert(key.to_string(), (None, tex.clone()));
+        if tex.is_some() && fits {
+            self.start_anim(ctx, key.to_string(), bytes.to_vec());
+        }
         tex
+    }
+
+    /// アニメーションを持ちうる形式なら、全コマの復号を**裏スレッド**で始める。
+    ///
+    /// UI スレッドで復号しない理由は費用が桁違いだから。実測
+    /// (`assets/zaivern-demo.gif` / 960×540 / 127 コマ): release 約 2.5 秒、
+    /// debug 約 28 秒。1 回きりとはいえ、そのあいだフレームがまるごと
+    /// 止まる (このリポジトリが `git` を UI スレッドで待たないのと同じ理由)。
+    ///
+    /// 呼ぶのは**静止画のテクスチャを載せられた直後だけ**。だから紙面には
+    /// 先頭コマが即座に出て、コマ列は届いた時点で静かに動き出す。
+    /// 静止画しか無いファイルではここから先へ 1 バイトも進まない。
+    fn start_anim(&mut self, ctx: &egui::Context, key: String, bytes: Vec<u8>) {
+        if self.anims.contains_key(&key) {
+            return;
+        }
+        // JPEG / BMP / ICO などはマジックナンバーで落として復号器へ回さない
+        if crate::preview::animation_format(&bytes).is_none() {
+            self.anims.insert(key, AnimSlot::Still);
+            return;
+        }
+        let tx = self.anim_tx.clone();
+        let ctx = ctx.clone();
+        let name = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zv-md-anim".to_string())
+            .spawn(move || {
+                let anim = crate::preview::decode_animation(
+                    &bytes,
+                    &crate::preview::AnimLimits::default(),
+                )
+                .ok();
+                // 送れなかった = 受け手が消えた。要求だけ出すと無駄に起こす
+                if tx.send(AnimDone { key: name, anim }).is_ok() {
+                    ctx.request_repaint();
+                }
+            })
+            .is_ok();
+        // スレッドを作れない環境では静止画のまま (機能が減るだけで壊れない)
+        self.anims.insert(
+            key,
+            if spawned {
+                AnimSlot::Pending
+            } else {
+                AnimSlot::Still
+            },
+        );
+    }
+
+    /// 裏スレッドから届いたコマ列を取り込む。描画の入口で呼ぶ。
+    fn take_ready(&mut self) {
+        while let Ok(done) = self.anim_rx.try_recv() {
+            // 2 コマ以上あるものだけをアニメーションとして扱う。静止 GIF /
+            // 静止 PNG / 復号できなかったものは `decode_texture` が載せた
+            // 1 枚のまま = **静止画の挙動は 1 ミリも変わらない**。
+            let play = done.anim.filter(|a| a.frames.len() > 1).map(|a| {
+                // 途中までしか読めていないものは繰り返さない。切れた尻尾から
+                // 先頭へ飛ぶ絵は「そういう動画」に見え、打ち切った事実を隠す。
+                let loops = if a.truncated.is_some() {
+                    crate::preview::AnimLoop::Times(1)
+                } else {
+                    a.loops
+                };
+                Box::new(AnimPlay {
+                    size: [a.width as usize, a.height as usize],
+                    delays_ms: a.delays_ms(),
+                    frames: a.frames.into_iter().map(|f| f.rgba).collect(),
+                    loops,
+                    display: egui::Vec2::ZERO,
+                    elapsed_ms: 0,
+                    shown: None,
+                    stepped_at: None,
+                })
+            });
+            let Some(mut play) = play else {
+                self.anims.insert(done.key, AnimSlot::Still);
+                continue;
+            };
+            let Some((_, Some(tex))) = self.map.get(&done.key) else {
+                // 静止画のテクスチャが消えている = 鍵ごと捨てられた後。
+                // 印を外して、次に読み直したときにやり直せるようにする。
+                self.anims.remove(&done.key);
+                continue;
+            };
+            play.display = tex.size_vec2();
+            self.anims.insert(done.key, AnimSlot::Ready(play));
+        }
+    }
+
+    /// `key` が再生中なら紙面に載せる寸法を返す。静止画なら `None`。
+    fn anim_display(&self, key: &str) -> Option<egui::Vec2> {
+        match self.anims.get(key) {
+            Some(AnimSlot::Ready(p)) => Some(p.display),
+            _ => None,
+        }
+    }
+
+    /// 時計を `dt_ms` ぶん進め、コマが変わったらテクスチャ 1 枚を差し替える。
+    ///
+    /// 戻り値は次にコマが変わるまでの待ち (ms)。`None` なら
+    /// **再描画を一切要求しない** (コマが 1 枚 / 有限ループを再生し切った)。
+    /// 呼び出し側は**見えているときだけ**ここへ入ること。
+    fn step_anim(&mut self, key: &str, dt_ms: u64, pass: u64) -> Option<u64> {
+        let Self { map, anims, .. } = self;
+        let Some(AnimSlot::Ready(play)) = anims.get_mut(key) else {
+            return None;
+        };
+        if play.stepped_at != Some(pass) {
+            play.stepped_at = Some(pass);
+            play.elapsed_ms = play.elapsed_ms.saturating_add(dt_ms);
+        }
+        let cur = crate::preview::frame_at(&play.delays_ms, play.loops, play.elapsed_ms);
+        if play.shown != Some(cur.frame) {
+            let swapped = match (map.get_mut(key), play.frames.get(cur.frame)) {
+                (Some((_, Some(tex))), Some(px)) => {
+                    tex.set(
+                        egui::ColorImage::from_rgba_unmultiplied(play.size, px),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    true
+                }
+                _ => false,
+            };
+            if swapped {
+                play.shown = Some(cur.frame);
+            }
+        }
+        cur.next_in_ms
+    }
+
+    /// テスト用: いまテクスチャに載っているコマ番号。
+    #[cfg(test)]
+    fn anim_shown(&self, key: &str) -> Option<usize> {
+        match self.anims.get(key) {
+            Some(AnimSlot::Ready(p)) => p.shown,
+            _ => None,
+        }
+    }
+
+    /// テスト用: 裏スレッドの復号が終わって再生に入ったか。
+    #[cfg(test)]
+    fn anim_ready(&self, key: &str) -> bool {
+        matches!(self.anims.get(key), Some(AnimSlot::Ready(_)))
     }
 }
 
@@ -5255,17 +5608,37 @@ fn spans_ui(
         } else {
             RichText::new(&sp.text).size(size).color(color)
         };
-        if sp.strong || strong_all {
-            rt = rt.strong();
-        }
         if sp.em {
             rt = rt.italics();
         }
         if sp.strike {
             rt = rt.strikethrough();
         }
-        ui.label(rt);
+        if sp.strong || strong_all {
+            bold_label(ui, rt, color);
+        } else {
+            ui.label(rt);
+        }
     }
+}
+
+/// 太字を実際に太く見せる (synthetic bold)。
+///
+/// egui 0.29 の `RichText::strong()` は**色を変えるだけ**で、しかも
+/// `.color()` を先に指定していると `get_text_color` が色のほうを採るので
+/// **何も起きない**。同梱フォントに太字フェイスも無いため、
+/// 見出しも `**強調**` も本文と 1px も違わないまま描かれていた。
+/// ここでは Label に折り返しまで組ませてから、同じ galley を
+/// [`BOLD_OFFSET`] だけ横へずらして 2 度描く。フォントを増やさずに済み、
+/// 折り返しの規則は素の `ui.label` と完全に同じになる。
+fn bold_label(ui: &mut egui::Ui, rt: RichText, color: Color32) -> egui::Response {
+    let (pos, galley, response) = egui::Label::new(rt).layout_in_ui(ui);
+    if ui.is_rect_visible(response.rect) {
+        ui.painter().galley(pos, galley.clone(), color);
+        ui.painter()
+            .galley(pos + egui::vec2(BOLD_OFFSET, 0.0), galley, color);
+    }
+    response
 }
 
 /// 画像スパン 1 個を描く。実体を出せないときは必ず説明付きの
@@ -5279,17 +5652,15 @@ fn image_ui(
     rctx: &mut RenderCtx,
 ) {
     let alt = label.trim_start_matches("🖼 ");
-    let draw = |ui: &mut egui::Ui, tex: &egui::TextureHandle| {
-        let avail = ui.available_width().max(60.0);
-        ui.add(egui::Image::new(tex).max_width(avail.min(tex.size_vec2().x)))
-            .on_hover_text(if alt.is_empty() { url } else { alt });
-    };
+    let hover = if alt.is_empty() { url } else { alt };
+    // 裏スレッドで復号し終えたコマ列をここで取り込む (描画の入口)
+    rctx.images.take_ready();
     // data: URI は毎フレーム base64 を解き直さないよう、URL そのものを鍵に引く
     let is_data = url.len() > 5 && url[..5].eq_ignore_ascii_case("data:");
     if is_data {
         if let Some(hit) = rctx.images.cached(url) {
             match hit {
-                Some(tex) => draw(ui, &tex),
+                Some(tex) => image_frame_ui(ui, &tex, url, hover, rctx.images),
                 None => {
                     let src = ImageSrc::Missing(url.to_string());
                     ui.label(
@@ -5303,13 +5674,22 @@ fn image_ui(
         }
     }
     let src = classify_image(rctx.dir, url);
+    // テクスチャの鍵。`get` / `get_bytes` が使うものと必ず同じにする
+    // (ずれるとアニメーションの状態を引けず、静止画のまま止まる)。
+    let key = match &src {
+        ImageSrc::Local(p) => Some(p.to_string_lossy().into_owned()),
+        ImageSrc::Data { .. } => Some(url.to_string()),
+        _ => None,
+    };
     let tex = match &src {
         ImageSrc::Local(p) => rctx.images.get(ui.ctx(), p),
         ImageSrc::Data { bytes, .. } => rctx.images.get_bytes(ui.ctx(), url, bytes),
         _ => None,
     };
     if let Some(tex) = tex {
-        draw(ui, &tex);
+        // テクスチャを作れた = 鍵も必ずある (Remote / Missing は None のまま)
+        let key = key.unwrap_or_else(|| url.to_string());
+        image_frame_ui(ui, &tex, &key, hover, rctx.images);
         return;
     }
     // デコードできなかった data: URI も「試した」ことを記録して再挑戦を防ぐ
@@ -5333,6 +5713,57 @@ fn image_ui(
     }
 }
 
+/// テクスチャ 1 枚を紙面へ載せる。アニメーションなら
+/// **見えているあいだだけ**コマを進める。
+///
+/// アイドルの費用がゼロになる条件 (設計原則 3):
+/// - 静止画では `request_repaint_after` を**一度も呼ばない**
+/// - 画面外へスクロールした GIF も同じく一度も呼ばない。時計も進めないので、
+///   戻ってきたときは止めた続きから再生される
+/// - 有限ループを再生し切ったら [`crate::preview::frame_at`] が `None` を返し、
+///   そこで要求が止まる
+///
+/// 経過時間に `Instant::now()` ではなく `ui.input(|i| i.stable_dt)` を使う理由:
+/// (1) egui が 1 パスにつき 1 度だけ決める値なので、同じ GIF が文書に何度
+/// 出ても足並みが揃う (2) `RawInput::predicted_dt` を差し替えるだけで
+/// テストから時間を進められる。実時計だと再生位置が実行のたびに変わり、
+/// 「コマが進む」ことを固定できない。
+fn image_frame_ui(
+    ui: &mut egui::Ui,
+    tex: &egui::TextureHandle,
+    key: &str,
+    hover: &str,
+    images: &mut ImageCache,
+) {
+    let avail = ui.available_width().max(60.0);
+    // 紙面に載せる寸法はアニメーションでも**静止画 1 枚目**のものを使う。
+    // コマ列は上限 (`preview::ANIM_MAX_SIDE`) まで縮んでいることがあるので、
+    // テクスチャの実寸で組むと復号が終わった瞬間に画像が縮み、表の列幅と
+    // 行の高さが跳ねる。測る側 ([`span_natural_width`]) も同じ値を使う。
+    let fixed = images.anim_display(key);
+    let img = match fixed {
+        Some(d) if d.x > 0.0 && d.y > 0.0 => {
+            let w = avail.min(d.x);
+            egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, w * d.y / d.x))
+        }
+        _ => egui::Image::new(tex).max_width(avail.min(tex.size_vec2().x)),
+    };
+    let resp = ui.add(img).on_hover_text(hover);
+    if fixed.is_none() || !ui.is_rect_visible(resp.rect) {
+        return;
+    }
+    // `round()` を挟むのは丸め誤差対策。秒 → ミリ秒の掛け算は f32 で
+    // 99.999994 のような値を作るので、切り捨てると 1ms ずつ足りなくなり
+    // 再生がじわじわ遅れる (テストのコマ列も 1 パスずつずれる)。
+    let dt_ms = (ui.input(|i| i.stable_dt) * 1000.0)
+        .round()
+        .clamp(0.0, ANIM_MAX_STEP_MS as f32) as u64;
+    if let Some(ms) = images.step_anim(key, dt_ms, ui.ctx().cumulative_pass_nr()) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// 1行を折り返しつきで描く。
 fn line_ui(
     ui: &mut egui::Ui,
@@ -5349,38 +5780,233 @@ fn line_ui(
     });
 }
 
-/// セル内容を折り返しなしで描いたときの幅を見積もる (中央/右揃えの余白計算用)。
-/// spans_ui は item_spacing.x = 0 で描くためスパン幅の総和と一致する。
-fn spans_width(ui: &egui::Ui, text: &str, size: f32) -> f32 {
-    ui.fonts(|f| {
-        parse_inline(text)
-            .iter()
-            .map(|sp| {
-                let font = if sp.code {
-                    FontId::monospace(size * 0.92)
-                } else {
-                    FontId::proportional(size)
-                };
-                f.layout_no_wrap(sp.text.clone(), font, Color32::WHITE)
-                    .size()
-                    .x
-            })
-            .sum()
-    })
+/// スパン 1 個を折り返さずに描いたときの幅。
+///
+/// 画像は読み込み済みなら実寸、まだなら代替文の幅で見積もる
+/// (次のフレームには実寸へ落ち着く)。
+fn span_natural_width(ui: &egui::Ui, sp: &Span, size: f32, rctx: &RenderCtx) -> f32 {
+    let text_w = |s: &str, font: FontId| {
+        ui.fonts(|f| {
+            f.layout_no_wrap(s.to_owned(), font, Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if sp.math {
+        let sz = if sp.math_display { size * 1.1 } else { size };
+        return ui
+            .fonts(|f| math::cached_layout(&sp.text, sz, &FontMetrics { fonts: f }))
+            .w
+            .max(2.0);
+    }
+    if sp.fnote {
+        return text_w(&sp.text, FontId::proportional(size * FNOTE_FONT_SCALE));
+    }
+    if sp.image {
+        let url = sp.link.as_deref().unwrap_or("");
+        let alt = sp.text.trim_start_matches("🖼 ");
+        let src = classify_image(rctx.dir, url);
+        let key = match &src {
+            ImageSrc::Local(p) => Some(p.to_string_lossy().to_string()),
+            ImageSrc::Data { .. } => Some(url.to_string()),
+            _ => None,
+        };
+        if let Some(k) = key {
+            // アニメーションは**紙面の寸法** (静止画 1 枚目から受け継いだもの)
+            // で測る。コマ列のテクスチャは `preview::ANIM_MAX_SIDE` まで
+            // 縮んでいることがあり、実寸で測ると復号が終わった瞬間に
+            // 列幅が縮んで表がガタつく。
+            if let Some(d) = rctx.images.anim_display(&k) {
+                return d.x;
+            }
+            if let Some(tex) = rctx.images.cached(&k).flatten() {
+                return tex.size_vec2().x;
+            }
+        }
+        return text_w(
+            &image_placeholder_text(&src, alt),
+            FontId::proportional(size * 0.95),
+        );
+    }
+    let font = if sp.code {
+        FontId::monospace(size * CODE_FONT_SCALE)
+    } else {
+        FontId::proportional(size)
+    };
+    text_w(&sp.text, font)
 }
 
-/// テーブルセルの書式ひとまとめ (table_cell_ui の引数構造化用。値の器のみで計算はしない)。
+/// セル 1 つを折り返さずに描いたときの幅 (列幅の決定に使う)。
+fn cell_natural_width(ui: &egui::Ui, text: &str, size: f32, rctx: &RenderCtx) -> f32 {
+    parse_inline(text)
+        .iter()
+        .map(|sp| span_natural_width(ui, sp, size, rctx))
+        .sum()
+}
+
+/// テーブルセルの書式ひとまとめ (値の器のみで計算はしない)。
 #[derive(Clone, Copy)]
 struct CellStyle {
     size: f32,
+    /// 表じゅうで共通の行の高さ ([`cell_line_height`] が決める)。
+    line_h: f32,
     strong: bool,
     color: Color32,
     align: TableAlign,
 }
 
-/// テーブルの1セルを揃え付きで描く。
-/// 中央/右揃えの列はセル幅いっぱいを確保して余白で寄せる
-/// (egui::Grid のセルは常に左詰めのため、揃えはセル内で自前で行う)。
+/// 表の版面。枠の内側余白 / 列間 / 行間 / 列の下限。
+const TBL_PAD_X: f32 = 10.0;
+const TBL_PAD_Y: f32 = 6.0;
+const TBL_GAP_X: f32 = 18.0;
+const TBL_GAP_Y: f32 = 6.0;
+const TBL_MIN_COL: f32 = 44.0;
+
+/// インライン code と脚注参照を本文より小さく組む倍率。
+///
+/// 列幅の見積り ([`span_natural_width`]) と実際の組版 ([`cell_job`]) が
+/// **同じ倍率**を使うことが列幅の前提なので、値は 1 箇所に置く。
+/// 片方だけ変えると「自然幅は足りているのに折り返す」列ができる。
+const CODE_FONT_SCALE: f32 = 0.92;
+const FNOTE_FONT_SCALE: f32 = 0.78;
+
+/// 太字を横へずらして重ねる量 (synthetic bold)。
+const BOLD_OFFSET: f32 = 0.6;
+
+/// 箇条書きの行頭記号の左に置く余白。
+const LIST_PAD: f32 = 6.0;
+/// 入れ子 1 桁ぶんの字下げ (フォント寸法に比例させる)。
+const LIST_STEP: f32 = 0.55;
+/// 塊の中の項目どうしだけを詰める縦の間隔。
+const BLOCK_GAP_Y: f32 = 2.0;
+/// ぶら下げの器に必ず残す本文の幅 (フォント寸法の倍数)。
+const HANG_MIN_BODY: f32 = 4.0;
+
+/// 表のセルが使う**行の高さ**を決める純関数。
+///
+/// [`cell_job`] は 1 枚の `LayoutJob` に 3 種類のフォント (本文 /
+/// インライン code / 脚注参照) を混ぜる。epaint は行の高さを
+/// **その行に実際に出たフォントの最大値**で決める
+/// (`epaint::text::layout::galley_from_rows`) ので、放っておくと
+/// 「code だけのセル」と「本文だけのセル」で 1 行の高さが変わる。
+/// 実測 (base 14, 同梱フォント): 本文 16.086 / code 14.993 / 脚注 12.685。
+/// **1 段につき 1px ずつ横の列と段がずれ、5 段で 4px 開いた**。
+/// 重なりはしないが、複数行に折り返す表では段のガタつきとして見える。
+///
+/// 表じゅうで同じ行高を配れば段は必ず揃う。いちばん高いフォントに
+/// 合わせるので、どのフォント構成でも文字が潰れることはない。
+fn cell_line_height(prop_h: f32, code_h: f32, fnote_h: f32) -> f32 {
+    prop_h.max(code_h).max(fnote_h).max(1.0)
+}
+
+/// いま使っているフォントから表 1 つぶんの行高を測る
+/// ([`cell_line_height`] への入力を集めるだけ)。
+fn table_line_height(ui: &egui::Ui, base: f32) -> f32 {
+    ui.fonts(|f| {
+        cell_line_height(
+            f.row_height(&FontId::proportional(base)),
+            f.row_height(&FontId::monospace(base * CODE_FONT_SCALE)),
+            f.row_height(&FontId::proportional(base * FNOTE_FONT_SCALE)),
+        )
+    })
+}
+
+/// 揃えに対応する galley の水平アンカー。
+fn halign_of(a: TableAlign) -> egui::Align {
+    match a {
+        TableAlign::Left => egui::Align::LEFT,
+        TableAlign::Center => egui::Align::Center,
+        TableAlign::Right => egui::Align::RIGHT,
+    }
+}
+
+/// セルのスパン列を 1 枚の `LayoutJob` に組む (`only_bold` なら太字以外を透明にする)。
+fn cell_job(
+    theme: &Theme,
+    spans: &[Span],
+    style: CellStyle,
+    w: f32,
+    only_bold: bool,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob {
+        halign: halign_of(style.align),
+        break_on_newline: false,
+        ..Default::default()
+    };
+    job.wrap.max_width = w;
+    for sp in spans {
+        let (font, mut color) = if sp.code {
+            (
+                FontId::monospace(style.size * CODE_FONT_SCALE),
+                theme.accent,
+            )
+        } else if sp.fnote {
+            (
+                FontId::proportional(style.size * FNOTE_FONT_SCALE),
+                theme.accent,
+            )
+        } else {
+            (FontId::proportional(style.size), style.color)
+        };
+        let mut background = if sp.code {
+            theme.panel_alt
+        } else {
+            Color32::TRANSPARENT
+        };
+        if only_bold && !(style.strong || sp.strong) {
+            color = Color32::TRANSPARENT;
+            background = Color32::TRANSPARENT;
+        }
+        job.append(
+            &sp.text,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                // 混在フォントでも段を揃えるため、行高は表じゅうで共通にする
+                line_height: Some(style.line_h),
+                color,
+                background,
+                italics: sp.em,
+                strikethrough: if sp.strike {
+                    egui::Stroke::new(1.0_f32, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// 折り返しと揃えを galley 側で解決してセルを描く (リンク等を含まない普通のセル)。
+///
+/// `Grid` + `horizontal_wrapped` に余白で寄せる旧実装では、右揃えの余白が
+/// **折り返しを誘発してセルの 2 行目が左端へ落ち**、しかもその高さが行に
+/// 数えられず**次の行と重なって**いた。ここは幅ちょうどの galley を 1 枚だけ
+/// 組み、`halign` で行ごとに寄せるので、何行に折り返しても揃えは崩れない。
+fn cell_text_ui(ui: &mut egui::Ui, theme: &Theme, spans: &[Span], style: CellStyle, w: f32) {
+    let job = cell_job(theme, spans, style, w, false);
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, galley.size().y), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let pos = match style.align {
+        TableAlign::Left => rect.left_top(),
+        TableAlign::Center => egui::pos2(rect.center().x, rect.top()),
+        TableAlign::Right => rect.right_top(),
+    };
+    ui.painter().galley(pos, galley, style.color);
+    if style.strong || spans.iter().any(|s| s.strong) {
+        let bold = cell_job(theme, spans, style, w, true);
+        let bg = ui.fonts(|f| f.layout_job(bold));
+        ui.painter()
+            .galley(pos + egui::vec2(BOLD_OFFSET, 0.0), bg, style.color);
+    }
+}
+
+/// テーブルの 1 セルを、列幅ちょうどの中へ揃え付きで描く。
 fn table_cell_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -5388,28 +6014,173 @@ fn table_cell_ui(
     style: CellStyle,
     rctx: &mut RenderCtx,
 ) {
-    let CellStyle {
-        size,
-        strong: strong_all,
-        color,
-        align,
-    } = style;
-    if align == TableAlign::Left {
-        line_ui(ui, theme, text, size, strong_all, color, rctx);
+    let w = ui.available_width();
+    let spans = parse_inline(text);
+    if spans.is_empty() {
+        // 空セルでも 1 行ぶんの高さを確保する (縞と罫線が痩せないように)。
+        // 中身のあるセルと同じ行高を使うので、空セルだけ痩せることはない。
+        ui.allocate_exact_size(egui::vec2(w, style.line_h), egui::Sense::hover());
         return;
     }
-    let w = ui.available_width();
-    let pad = (w - spans_width(ui, text, size)).max(0.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.set_min_width(w);
-        ui.add_space(if align == TableAlign::Right {
-            pad
+    // リンク・画像・数式はウィジェットでしか描けないのでそちらへ回す
+    if spans.iter().any(|s| s.link.is_some() || s.image || s.math) {
+        let nat: f32 = spans
+            .iter()
+            .map(|sp| span_natural_width(ui, sp, style.size, rctx))
+            .sum();
+        if style.align != TableAlign::Left && nat <= w {
+            // 収まると分かっているので折り返さない `horizontal` で寄せる
+            // (`horizontal_wrapped` だと余白ぶんで折り返しが起きる)
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.spacing_mut().interact_size.y = style.line_h;
+                let pad = (w - nat).max(0.0);
+                ui.add_space(if style.align == TableAlign::Right {
+                    pad
+                } else {
+                    pad * 0.5
+                });
+                spans_ui(ui, theme, text, style.size, style.strong, style.color, rctx);
+            });
         } else {
-            pad * 0.5
-        });
-        spans_ui(ui, theme, text, size, strong_all, color, rctx);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // egui の既定の当たり判定の高さ (`interact_size.y` = 18) が
+                // 折り返した段の高さになるので、そのままだと galley 経路
+                // (行高 [`cell_line_height`] = 16) と段がずれる。
+                ui.spacing_mut().interact_size.y = style.line_h;
+                ui.set_row_height(style.line_h);
+                spans_ui(ui, theme, text, style.size, style.strong, style.color, rctx);
+            });
+        }
+        return;
+    }
+    cell_text_ui(ui, theme, &spans, style, w);
+}
+
+/// テーブルの 1 行を描く (列幅・揃え・ヘッダ地・縞はここで面倒を見る)。
+#[allow(clippy::too_many_arguments)]
+fn table_row_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    line_h: f32,
+    widths: &[f32],
+    cells: &[String],
+    aligns: &[TableAlign],
+    head: bool,
+    stripe: bool,
+    inner: f32,
+    rctx: &mut RenderCtx,
+) {
+    // 地は本文より先に積む必要があるので、場所だけ取って後から差し替える
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let resp = ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (c, w) in widths.iter().enumerate() {
+            let style = CellStyle {
+                size: base,
+                line_h,
+                strong: head,
+                color: theme.text,
+                align: aligns.get(c).copied().unwrap_or(TableAlign::Left),
+            };
+            let cell = cells.get(c).map(String::as_str).unwrap_or("");
+            ui.allocate_ui_with_layout(
+                egui::vec2(*w, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_width(*w);
+                    table_cell_ui(ui, theme, cell, style, rctx);
+                },
+            );
+            if c + 1 < widths.len() {
+                ui.add_space(TBL_GAP_X);
+            }
+        }
     });
+    let fill = if head {
+        theme.panel_alt
+    } else if stripe {
+        theme.panel_alt.gamma_multiply(0.45)
+    } else {
+        return;
+    };
+    let r = egui::Rect::from_min_size(
+        resp.response.rect.left_top(),
+        egui::vec2(inner, resp.response.rect.height()),
+    )
+    .expand2(egui::vec2(4.0, TBL_GAP_Y * 0.5));
+    ui.painter().set(bg, egui::Shape::rect_filled(r, 2.0, fill));
+}
+
+/// テーブル 1 つを描く。列幅は中身から決め、入り切らないときだけ横へ逃がす。
+#[allow(clippy::too_many_arguments)]
+fn table_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    id: usize,
+    header: &[String],
+    aligns: &[TableAlign],
+    rows: &[Vec<String>],
+    rctx: &mut RenderCtx,
+) {
+    let ncols = header.len().max(1);
+    // 行高は表じゅうで 1 つ (セルごとに測ると混在フォントで段がずれる)
+    let line_h = table_line_height(ui, base);
+    let mut natural = vec![0.0_f32; ncols];
+    for (c, cell) in header.iter().enumerate().take(ncols) {
+        natural[c] = natural[c].max(cell_natural_width(ui, cell, base, rctx));
+    }
+    for row in rows {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            natural[c] = natural[c].max(cell_natural_width(ui, cell, base, rctx));
+        }
+    }
+    // 枠線 (左右 1px ずつ) と内側余白を引いた、中身に使える幅
+    let avail = (ui.available_width() - 2.0 * TBL_PAD_X - 2.0).max(TBL_MIN_COL);
+    let widths = table_col_widths(&natural, avail, TBL_GAP_X, TBL_MIN_COL);
+    let inner: f32 = widths.iter().sum::<f32>() + TBL_GAP_X * (ncols - 1) as f32;
+    let draw = |ui: &mut egui::Ui, rctx: &mut RenderCtx| {
+        egui::Frame::none()
+            .stroke(egui::Stroke::new(1.0_f32, theme.border))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(TBL_PAD_X, TBL_PAD_Y))
+            .show(ui, |ui| {
+                ui.set_width(inner);
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, TBL_GAP_Y);
+                table_row_ui(
+                    ui, theme, base, line_h, &widths, header, aligns, true, false, inner, rctx,
+                );
+                // ヘッダ下の罫線 (見出しと本文の境目)
+                let (line, _) =
+                    ui.allocate_exact_size(egui::vec2(inner, 1.0), egui::Sense::hover());
+                ui.painter().rect_filled(line, 0.0, theme.border);
+                for (ri, row) in rows.iter().enumerate() {
+                    table_row_ui(
+                        ui,
+                        theme,
+                        base,
+                        line_h,
+                        &widths,
+                        row,
+                        aligns,
+                        false,
+                        ri % 2 == 1,
+                        inner,
+                        rctx,
+                    );
+                }
+            });
+    };
+    if inner + 2.0 * TBL_PAD_X + 2.0 > ui.available_width() + 0.5 {
+        egui::ScrollArea::horizontal()
+            .id_salt(("md-table-scroll", id))
+            .show(ui, |ui| draw(ui, rctx));
+    } else {
+        draw(ui, rctx);
+    }
 }
 
 /// フェンスコードブロック (syntect でハイライト、横スクロール)。
@@ -6186,6 +6957,278 @@ fn mermaid_ui(
 
 /// Markdown 全文を ui へ描画する。
 /// `rctx` は画像解決用の文脈 (基準ディレクトリ + テクスチャキャッシュ)。
+/// 行頭に記号を置き、**折り返した続きを記号の右へ揃える** (ぶら下げ字下げ)。
+///
+/// `horizontal_wrapped` + `add_space` で記号を置くと、器の左端は列 0 のままなので
+/// **折り返した 2 行目が記号より左へ落ちる**。本文専用の器を作り、その中だけで
+/// 折り返させると、続きの行が必ず記号の右へ揃う。
+///
+/// 字下げ (`pad`) は本文の幅より優先度が低い。深い入れ子や狭い幅では
+/// **字下げのほうを削って**本文が潰れないようにする。
+fn hanging_ui(
+    ui: &mut egui::Ui,
+    pad: f32,
+    marker: &str,
+    marker_size: f32,
+    marker_color: Color32,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let mw = ui.fonts(|f| {
+        f.layout_no_wrap(
+            marker.to_owned(),
+            FontId::proportional(marker_size),
+            Color32::WHITE,
+        )
+        .size()
+        .x
+    });
+    let avail = ui.available_width();
+    let min_body = (marker_size * HANG_MIN_BODY).min(avail);
+    let pad = pad.clamp(0.0, (avail - mw - min_body).max(0.0));
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        if !marker.is_empty() {
+            ui.label(RichText::new(marker).size(marker_size).color(marker_color));
+        }
+        // 記号を置いた**あとの**残り幅で器を切る (測った幅との誤差を持ち込まない)
+        let w = ui.available_width().max(min_body);
+        ui.allocate_ui_with_layout(
+            egui::vec2(w, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(w);
+                body(ui);
+            },
+        );
+    });
+}
+
+/// ぶら下げの器の中へ、折り返しつきの本文を 1 段落ぶん描く。
+fn hanging_body(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: &str,
+    size: f32,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        spans_ui(ui, theme, text, size, false, color, rctx);
+    });
+}
+
+/// ぶら下げの器の中へ、ハード改行で切られた段落を順に描く。
+fn hanging_parts(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    parts: &[String],
+    size: f32,
+    color: Color32,
+    rctx: &mut RenderCtx,
+) {
+    for part in parts {
+        if part.trim().is_empty() {
+            continue;
+        }
+        hanging_body(ui, theme, part, size, color, rctx);
+    }
+}
+
+/// 項目の本文を組み立てる。記号の後ろに、**より深く字下げされた続きの行**を畳む。
+///
+/// これを畳まないと、続きの行が段落バッファへ落ちて**字下げ 0 の別段落**として
+/// 描かれる (このリポジトリの `docs/*.md` はほぼ全部この形で書かれている)。
+///
+/// ハード改行 (`行末スペース 2 つ` / `<br>`) はそこで段落を切る。`html_to_md` は
+/// `<li>` の中の `<br>` を**字下げせずに**吐くので、直後の行は字下げが浅くても
+/// 項目の続きとして扱う (でないと項目の途中から左端へ落ちる)。
+/// 戻り値は (段落の並び, 次に見る行番号)。
+fn item_body(lines: &[&str], start: usize, head: &str, indent: usize) -> (Vec<String>, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut brk, first) = hard_break(head);
+    append_para(&mut cur, first);
+    let mut j = start + 1;
+    while j < lines.len() {
+        let cont = lines[j];
+        if cont.trim().is_empty() || starts_block(lines, j) {
+            break;
+        }
+        if indent_width(cont) <= indent && !brk {
+            break;
+        }
+        if brk {
+            parts.push(std::mem::take(&mut cur));
+        }
+        let (b, text) = hard_break(cont);
+        append_para(&mut cur, text);
+        brk = b;
+        j += 1;
+    }
+    parts.push(cur);
+    (parts, j)
+}
+
+/// 連続する箇条書きを 1 つの塊として描き、次に見る行番号を返す。
+fn list_block_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    // 間隔は子 Ui の中だけで詰める。親から見た塊の前後は段落と同じ間隔のまま。
+    // (`ui.spacing_mut()` を直に触ると、詰めた間隔が塊の**後ろ**にも残る)
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = BLOCK_GAP_Y;
+        list_items_ui(ui, theme, base, lines, start, rctx)
+    })
+    .inner
+}
+
+/// 箇条書きの項目を順に描き、次に見る行番号を返す (間隔は呼び出し側が決める)。
+fn list_items_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    let mut i = start;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if is_hr(trimmed) {
+            break;
+        }
+        let Some((off, bullet)) = list_marker(trimmed) else {
+            break;
+        };
+        let indent = indent_width(lines[i]);
+        let (body, next) = item_body(lines, i, &trimmed[off..], indent);
+        let done = bullet == "☑";
+        let mcol = if done { theme.ok } else { theme.accent };
+        let tcol = if done { theme.text_dim } else { theme.text };
+        hanging_ui(
+            ui,
+            LIST_PAD + indent as f32 * base * LIST_STEP,
+            &format!("{bullet} "),
+            base,
+            mcol,
+            |ui| hanging_parts(ui, theme, &body, base, tcol, rctx),
+        );
+        i = next;
+        // 空行を挟んでも、次が項目なら同じ塊として続ける (loose list)
+        let mut k = i;
+        while k < lines.len() && lines[k].trim().is_empty() {
+            k += 1;
+        }
+        if k > i && k < lines.len() {
+            let t = lines[k].trim_start();
+            if !is_hr(t) && list_marker(t).is_some() {
+                ui.add_space(BLOCK_GAP_Y);
+                i = k;
+                continue;
+            }
+            break;
+        }
+    }
+    i
+}
+
+/// 連続する引用行を描き、次に見る行番号を返す。
+///
+/// 1 行ずつ独立に描くと、原文の折り返し位置がそのまま段落の切れ目に見える。
+/// 同じ深さの平文は 1 段落へ畳み、帯 (`▍`) の右へぶら下げて揃える。
+fn quote_block_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = BLOCK_GAP_Y;
+        quote_lines_ui(ui, theme, base, lines, start, rctx)
+    })
+    .inner
+}
+
+/// 引用の各行を描き、次に見る行番号を返す (間隔は呼び出し側が決める)。
+fn quote_lines_ui(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    base: f32,
+    lines: &[&str],
+    start: usize,
+    rctx: &mut RenderCtx,
+) -> usize {
+    let bar_of = |d: usize| -> String {
+        let mut s: String = std::iter::repeat_n("▍", d.max(1)).collect();
+        s.push(' ');
+        s
+    };
+    let flush = |ui: &mut egui::Ui, para: &mut String, depth: usize, rctx: &mut RenderCtx| {
+        if para.trim().is_empty() {
+            para.clear();
+            return;
+        }
+        let text = std::mem::take(para);
+        hanging_ui(ui, 0.0, &bar_of(depth), base, theme.accent, |ui| {
+            hanging_body(ui, theme, &text, base, theme.text_dim, rctx)
+        });
+    };
+    let mut i = start;
+    let mut para = String::new();
+    let mut depth = 1usize;
+    while i < lines.len() && lines[i].trim_start().starts_with('>') {
+        let (d, raw) = quote_depth(lines[i].trim_start());
+        let d = d.max(1);
+        let body = raw.trim_start();
+        let is_item = list_marker(body).is_some();
+        let head = atx_heading(body);
+        if d != depth || body.trim().is_empty() || is_item || head.is_some() {
+            flush(ui, &mut para, depth, rctx);
+        }
+        depth = d;
+        if let Some((off, bullet)) = list_marker(body) {
+            let (parts, _) = item_body(lines, i, &body[off..], usize::MAX);
+            hanging_ui(
+                ui,
+                0.0,
+                &format!("{}{bullet} ", bar_of(d)),
+                base,
+                theme.accent,
+                |ui| hanging_parts(ui, theme, &parts, base, theme.text_dim, rctx),
+            );
+        } else if let Some((level, title)) = head {
+            let scale = [1.5f32, 1.35, 1.2, 1.1, 1.0, 0.95][level - 1];
+            hanging_ui(ui, 0.0, &bar_of(d), base * scale, theme.accent, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    spans_ui(ui, theme, &title, base * scale, true, theme.text, rctx);
+                });
+            });
+        } else if !body.trim().is_empty() {
+            let (brk, text) = hard_break(lines[i]);
+            let text = quote_depth(text.trim_start()).1.trim();
+            append_para(&mut para, text);
+            if brk {
+                flush(ui, &mut para, depth, rctx);
+            }
+        }
+        i += 1;
+    }
+    flush(ui, &mut para, depth, rctx);
+    i
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -6229,7 +7272,6 @@ pub fn render(
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
 
         // フェンスコード (``` と ~~~ の両方)
         if let Some((f, lang_tok)) = fence_open(trimmed) {
@@ -6272,6 +7314,28 @@ pub fn render(
             continue;
         }
 
+        // Setext 見出しの下線 (`===` / `---`) は水平線より優先する。
+        // 直前が段落なら、この行は区切り線ではなくその段落の見出し指定。
+        if !para.trim().is_empty() {
+            if let Some(level) = setext_level(line) {
+                let scale = if level == 1 { 1.85f32 } else { 1.5 };
+                let body = std::mem::take(&mut para);
+                ui.add_space(8.0);
+                line_ui(
+                    ui,
+                    theme,
+                    body.trim_end(),
+                    base * scale,
+                    true,
+                    theme.text,
+                    rctx,
+                );
+                ui.separator();
+                i += 1;
+                continue;
+            }
+        }
+
         // 水平線
         if is_hr(trimmed) {
             flush_para(ui, &mut para, theme, rctx);
@@ -6283,49 +7347,37 @@ pub fn render(
         // 引用 (連続する > 行をまとめる。`>>` の入れ子は深さぶん帯を重ねる)
         if trimmed.starts_with('>') {
             flush_para(ui, &mut para, theme, rctx);
-            while i < lines.len() && lines[i].trim_start().starts_with('>') {
-                let (depth, body) = quote_depth(lines[i].trim_start());
-                let bar: String = std::iter::repeat_n("▍", depth.max(1)).collect();
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(
-                        RichText::new(format!("{bar} "))
-                            .color(theme.accent)
-                            .size(base),
-                    );
-                    spans_ui(ui, theme, body, base, false, theme.text_dim, rctx);
-                });
-                i += 1;
-            }
+            i = quote_block_ui(ui, theme, base, &lines, i, rctx);
             continue;
         }
 
-        // 脚注定義 `[^1]: 本文`
-        if let Some((label, body)) = footnote_def(trimmed) {
+        // 脚注定義 `[^1]: 本文` (字下げした続きの行も本文として畳む)
+        if let Some((label, head)) = footnote_def(trimmed) {
             flush_para(ui, &mut para, theme, rctx);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.label(
-                    RichText::new(format!("[{label}] "))
-                        .size(base * 0.78)
-                        .color(theme.accent),
-                );
-                spans_ui(ui, theme, &body, base * 0.92, false, theme.text_dim, rctx);
-            });
-            i += 1;
+            let (body, next) = item_body(&lines, i, &head, indent_width(line));
+            hanging_ui(
+                ui,
+                0.0,
+                &format!("[{label}] "),
+                base * 0.78,
+                theme.accent,
+                |ui| hanging_parts(ui, theme, &body, base * 0.92, theme.text_dim, rctx),
+            );
+            i = next;
             continue;
         }
 
-        // テーブル
-        if trimmed.starts_with('|') && lines.get(i + 1).map(|l| is_table_sep(l)).unwrap_or(false) {
+        // テーブル (行頭の `|` を省いた GFM 形式も拾う)
+        if is_table_head(trimmed, lines.get(i + 1).copied()) {
             flush_para(ui, &mut para, theme, rctx);
-            let header = split_row(trimmed);
             let aligns = table_aligns(lines[i + 1]);
-            let ncols = header.len().max(1);
-            let table_id = i;
+            // 列数はヘッダと区切り行の多いほうに合わせる
+            let mut header = split_row(trimmed);
+            let ncols = header.len().max(aligns.len()).max(1);
+            header.resize(ncols, String::new());
             let mut r = i + 2;
             let mut rows: Vec<Vec<String>> = Vec::new();
-            while r < lines.len() && lines[r].trim_start().starts_with('|') {
+            while r < lines.len() && table_row_continues(lines[r]) {
                 let lt = lines[r].trim_start();
                 // 迷い込んだ区切り行 (`|---|` 等) はセルとして描画しない
                 if !is_table_sep(lt) {
@@ -6336,67 +7388,15 @@ pub fn render(
                 }
                 r += 1;
             }
-            // 列幅の上限は全列均等割り (最低 80px)。egui::Grid は上限が有限のときだけ
-            // セル内折り返しが有効になる。収まらない分は横スクロールで逃がす。
-            let cap = ((ui.available_width() - 34.0 - 16.0 * (ncols - 1) as f32) / ncols as f32)
-                .max(80.0);
-            let col_align = |c: usize| aligns.get(c).copied().unwrap_or(TableAlign::Left);
-            egui::ScrollArea::horizontal()
-                .id_salt(("md-table-scroll", table_id))
-                .show(ui, |ui| {
-                    egui::Frame::none()
-                        .stroke(egui::Stroke::new(1.0_f32, theme.border))
-                        .rounding(egui::Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .show(ui, |ui| {
-                            egui::Grid::new(("md-table", table_id))
-                                .num_columns(ncols)
-                                .max_col_width(cap)
-                                .striped(true)
-                                .spacing([16.0, 5.0])
-                                .show(ui, |ui| {
-                                    for (c, cell) in header.iter().enumerate() {
-                                        let style = CellStyle {
-                                            size: base,
-                                            strong: true,
-                                            color: theme.text,
-                                            align: col_align(c),
-                                        };
-                                        table_cell_ui(ui, theme, cell, style, rctx);
-                                    }
-                                    ui.end_row();
-                                    for row in &rows {
-                                        for (c, cell) in row.iter().enumerate() {
-                                            let style = CellStyle {
-                                                size: base,
-                                                strong: false,
-                                                color: theme.text,
-                                                align: col_align(c),
-                                            };
-                                            table_cell_ui(ui, theme, cell, style, rctx);
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                });
+            table_ui(ui, theme, base, i, &header, &aligns, &rows, rctx);
             i = r;
             continue;
         }
 
-        // リスト
-        if let Some((off, bullet)) = list_marker(trimmed) {
+        // リスト (塊ごと描く: ぶら下げ字下げ + 続きの行 + 項目間だけ詰める)
+        if list_marker(trimmed).is_some() {
             flush_para(ui, &mut para, theme, rctx);
-            let done = bullet == "☑";
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                ui.add_space(6.0 + indent as f32 * base * 0.55);
-                let bcol = if done { theme.ok } else { theme.accent };
-                ui.label(RichText::new(format!("{bullet} ")).color(bcol).size(base));
-                let tcol = if done { theme.text_dim } else { theme.text };
-                spans_ui(ui, theme, &trimmed[off..], base, false, tcol, rctx);
-            });
-            i += 1;
+            i = list_block_ui(ui, theme, base, &lines, i, rctx);
             continue;
         }
 
@@ -6500,6 +7500,192 @@ mod tests {
             .collect()
     }
 
+    /// テーブルを実際に描いて、テキスト行ごとの矩形を拾う。
+    /// 太字は同じ galley を [`BOLD_OFFSET`] ずらして 2 度描くので、
+    /// 直後に来る重ね描きは 1 つに畳む。
+    fn table_text_rows(doc: &str, width: f32) -> Vec<(f32, f32, f32, f32, String)> {
+        let ctx = egui::Context::default();
+        let hl = Highlighter::new();
+        let theme = crate::theme::by_name("zaivern-dark");
+        let mut images = ImageCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 1400.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        // 1 フレーム目は ScrollArea の状態がまだ無いので数フレーム回して落ち着かせる
+        for _ in 0..3 {
+            out = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut rctx = RenderCtx {
+                        dir: None,
+                        images: &mut images,
+                    };
+                    render(ui, &theme, &hl, 14.0, doc, &mut rctx);
+                });
+            }));
+        }
+        let mut rows = Vec::new();
+        let mut prev: Option<(egui::Pos2, String)> = None;
+        for cs in &out.unwrap().shapes {
+            let egui::epaint::Shape::Text(t) = &cs.shape else {
+                continue;
+            };
+            let text = t.galley.text().to_string();
+            let overlay = prev.as_ref().is_some_and(|(pp, ptext)| {
+                *ptext == text
+                    && (t.pos.x - pp.x - BOLD_OFFSET).abs() < 0.01
+                    && (t.pos.y - pp.y).abs() < 0.01
+            });
+            prev = Some((t.pos, text));
+            if overlay {
+                continue;
+            }
+            for row in t.galley.rows.iter() {
+                let body: String = row.glyphs.iter().map(|g| g.chr).collect();
+                if body.trim().is_empty() {
+                    continue;
+                }
+                rows.push((
+                    t.pos.y + row.rect.top(),
+                    t.pos.y + row.rect.bottom(),
+                    t.pos.x + row.rect.left(),
+                    t.pos.x + row.rect.right(),
+                    body,
+                ));
+            }
+        }
+        rows
+    }
+
+    /// 表の中身は、どの幅でも**互いに重ならない**。
+    ///
+    /// 旧実装 (`egui::Grid` + 右揃えの余白) は、折り返したヘッダの高さを
+    /// 行に数えなかったため**次の行の数字とヘッダが重なって**描かれていた。
+    /// 「重なりが 1 組も無い」は目で見た崩れをそのまま式にしたもの。
+    #[test]
+    fn 表のセルはどの幅でも重ならない() {
+        let doc = "\
+| 重なり | 2 人以上が書いたファイル | 衝突したマージ | 衝突ファイル | 衝突ハンク | 衝突行 |
+|---:|---:|---:|---:|---:|---:|
+| 0.00 | 0 | 0 / 8 | 0 | 0 | 0 |
+| 0.25 | 3 | 3 / 8 | 3 | 3 | 6 |
+| 1.00 | 6 | 7 / 8 | 6 | 18 | 42 |
+";
+        for width in [1200.0_f32, 700.0, 480.0, 340.0] {
+            let rows = table_text_rows(doc, width);
+            assert!(rows.len() >= 24, "{width}: 描けていない ({})", rows.len());
+            for (i, a) in rows.iter().enumerate() {
+                for b in rows.iter().skip(i + 1) {
+                    // 同じ行に並ぶセルは上端が揃う (`horizontal_top`)。
+                    // 上端が違うのに縦の帯が重なったら、それは行の食い込み。
+                    if (a.0 - b.0).abs() < 0.5 {
+                        continue;
+                    }
+                    let overlap = a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5;
+                    assert!(!overlap, "{width}: {a:?} と {b:?} が縦に食い込んだ");
+                }
+            }
+        }
+    }
+
+    /// 右揃えの列は、**折り返しても**列の右端に揃う。
+    ///
+    /// 旧実装は余白で寄せていたので、余白ぶんが折り返しを誘発した瞬間に
+    /// 2 行目が左端へ落ちていた (画面では桁がばらけて見える)。
+    #[test]
+    fn 右揃えの列は折り返しても右端が揃う() {
+        let doc = "\
+| 重なり | 2 人以上が書いたファイル | 衝突したマージ |
+|---:|---:|---:|
+| 0.00 | 0 | 0 / 8 |
+| 1.00 | 6 | 7 / 8 |
+";
+        for width in [700.0_f32, 340.0] {
+            let rows = table_text_rows(doc, width);
+            let mut edges: Vec<i64> = rows.iter().map(|r| (r.3 * 10.0).round() as i64).collect();
+            edges.sort_unstable();
+            edges.dedup();
+            assert_eq!(edges.len(), 3, "{width}: 右端が {edges:?} にばらけた");
+            // 狭い幅では実際に折り返していること (折り返さずに通っていたら検査になっていない)
+            if width < 400.0 {
+                assert!(rows.len() > 9, "{width}: 折り返していない");
+            }
+        }
+    }
+
+    /// 列幅の決め方 (純関数)。描画を通さずに端の条件まで固定する。
+    #[test]
+    fn 列幅は内容から決まり狭いときだけ削られる() {
+        // 収まるときは余りを配って可用幅いっぱいに広げる
+        let w = table_col_widths(&[40.0, 100.0, 60.0], 400.0, 20.0, 44.0);
+        assert!((w.iter().sum::<f32>() - 360.0).abs() < 0.01, "{w:?}");
+        assert!(w[1] > w[2] && w[2] > w[0], "{w:?}");
+        // 収まらないときは広い列だけが削られ、狭い列は自然幅のまま残る
+        let w = table_col_widths(&[30.0, 400.0, 40.0], 300.0, 20.0, 44.0);
+        assert!((w[0] - 30.0).abs() < 0.01, "{w:?}");
+        assert!((w[2] - 40.0).abs() < 0.01, "{w:?}");
+        assert!(w.iter().sum::<f32>() <= 260.01, "{w:?}");
+        // 下限まで縮めても入らないときだけ合計が可用幅を超える (横スクロールへ逃がす)
+        let w = table_col_widths(&[200.0; 6], 200.0, 18.0, 44.0);
+        assert!(w.iter().all(|v| (*v - 44.0).abs() < 0.01), "{w:?}");
+        // 列が無くても、異常値が来ても壊れない
+        assert!(table_col_widths(&[], 100.0, 18.0, 44.0).is_empty());
+        let w = table_col_widths(&[f32::NAN, f32::INFINITY], 300.0, 18.0, 44.0);
+        assert!(w.iter().all(|v| v.is_finite()), "{w:?}");
+    }
+
+    /// セルの行高の決め方 (純関数)。
+    ///
+    /// 表の中では**いちばん高いフォント**に合わせて全セルへ同じ行高を配る。
+    /// 実測値 (base 14 / 同梱フォント): 本文 16.086 / code 14.993 /
+    /// 脚注 12.685。倍率 ([`CODE_FONT_SCALE`] / [`FNOTE_FONT_SCALE`]) を
+    /// 1.0 以上へ変えても潰れないよう、順序は仮定せず最大値を採る。
+    #[test]
+    fn セルの行高は一番高いフォントに合わせる() {
+        // 同梱フォントの実測どおり本文がいちばん高い場合
+        assert!((cell_line_height(16.086, 14.993, 12.685) - 16.086).abs() < 1e-3);
+        // code のほうが高いフォント構成でも、code が潰れない
+        assert!((cell_line_height(14.0, 19.0, 12.0) - 19.0).abs() < 1e-3);
+        assert!((cell_line_height(14.0, 12.0, 20.0) - 20.0).abs() < 1e-3);
+        // 3 つとも同じなら当然それ
+        assert!((cell_line_height(16.0, 16.0, 16.0) - 16.0).abs() < 1e-3);
+        // 0 や負の値が来ても高さ 0 の行 (= 全部の段が同じ位置) にはしない
+        assert!(cell_line_height(0.0, 0.0, 0.0) >= 1.0);
+        assert!(cell_line_height(-5.0, -3.0, -1.0) >= 1.0);
+    }
+
+    /// 行頭 `|` を省いた GFM 形式の表も拾い、水平線や箇条書きは表にしない。
+    #[test]
+    fn 行頭のパイプが無い表も表として扱う() {
+        assert!(is_table_sep("--- | ---"));
+        assert!(is_table_sep(":-: | --:"));
+        assert!(is_table_sep("|---|:--:|"));
+        assert!(!is_table_sep("---"), "水平線を区切り行にしない");
+        assert!(!is_table_sep("- - -"));
+        assert!(!is_table_sep("| a | b |"));
+
+        assert!(is_table_head("a | b", Some("--- | ---")));
+        assert!(is_table_head("| a | b |", Some("|---|---|")));
+        assert!(!is_table_head("- a | b", Some("--- | ---")), "箇条書きが先");
+        assert!(!is_table_head("# a | b", Some("--- | ---")), "見出しが先");
+        assert!(!is_table_head("> a | b", Some("--- | ---")), "引用が先");
+        assert!(!is_table_head("見出し", Some("---")), "setext を表にしない");
+        assert!(!is_table_head("a | b", None));
+
+        assert!(table_row_continues("c | d"));
+        assert!(table_row_continues("| c | d |"));
+        assert!(!table_row_continues(""));
+        assert!(!table_row_continues("   "));
+        assert!(!table_row_continues("次の段落"));
+        assert!(!table_row_continues("- 箇条書き | です"));
+        assert!(!table_row_continues("## 見出し | です"));
+        assert!(!table_row_continues("```rust | x"));
+    }
+
     /// 図と数式を含む文書を実際に描いてみて、描画経路が落ちないことを見る。
     /// (解析と配置は純関数側で検査済み。ここは painter 呼び出しの通し確認)
     #[test]
@@ -6550,6 +7736,16 @@ $$
 \\[ \\lim_{x \\to \\infty} \\frac{1}{x} = 0 \\]
 
 未対応の命令 $\\thisisnotreal{x}$ も本文を壊さない。
+
+| 名前 | 状態 | 参考 |
+|:--|:-:|--:|
+| `zai lease` | **有効** | [手引き](https://example.com) と ![図](missing.png) |
+| ~~旧版~~ | 無効 | 行内の $x^2$ |
+
+行頭のパイプが無い表
+名前 | 値
+--- | ---:
+あ | 1
 ";
         let ctx = egui::Context::default();
         let hl = Highlighter::new();
@@ -6954,6 +8150,350 @@ $$
         ));
     }
 
+    // ─── アニメーション画像 (GIF / APNG / アニメーション WebP) ──────────
+
+    /// アニメーション再生の検証台。
+    ///
+    /// **実時計を使わない。** `RawInput::time` と `predicted_dt` を自分で
+    /// 進めるので、どの機械でも・どれだけ負荷が掛かっていても同じコマ列に
+    /// なる (測っているのは速さではなく振る舞い)。
+    struct AnimHarness {
+        ctx: egui::Context,
+        hl: Highlighter,
+        theme: Theme,
+        images: ImageCache,
+        size: egui::Vec2,
+        dt: f32,
+        passes: u32,
+    }
+
+    impl AnimHarness {
+        fn new(w: f32, h: f32) -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                hl: Highlighter::new(),
+                theme: crate::theme::by_name("zaivern-dark"),
+                images: ImageCache::default(),
+                size: egui::vec2(w, h),
+                dt: 0.1,
+                passes: 0,
+            }
+        }
+
+        /// 1 パス描く。本物のプレビュー (app.rs) と同じく縦スクロール領域の
+        /// 中に置くので、画面外へ出た絵は clip rect の外になる。
+        fn pass(&mut self, dir: Option<&Path>, doc: &str) -> egui::FullOutput {
+            self.passes += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), self.size)),
+                time: Some(f64::from(self.passes) * f64::from(self.dt)),
+                predicted_dt: self.dt,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                hl,
+                theme,
+                images,
+                ..
+            } = self;
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let mut rctx = RenderCtx { dir, images };
+                        render(ui, theme, hl, 14.0, doc, &mut rctx);
+                    });
+                });
+            })
+        }
+
+        /// 裏スレッドの復号が届くまでパスを回す。届いたら `true`。
+        ///
+        /// 上限を置くのは**固まらないため**で、速さを測っているのではない
+        /// (何パス掛かったかは一切主張しない)。
+        fn settle(&mut self, dir: Option<&Path>, doc: &str, key: &str) -> bool {
+            for _ in 0..600 {
+                self.pass(dir, doc);
+                if !matches!(self.images.anims.get(key), None | Some(AnimSlot::Pending)) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        }
+    }
+
+    /// 次の再描画までの待ち。`Duration::MAX` = **再描画を要求していない**。
+    fn repaint_delay(out: &egui::FullOutput) -> std::time::Duration {
+        out.viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay)
+            .unwrap_or(std::time::Duration::MAX)
+    }
+
+    /// 描かれた画像の矩形。
+    ///
+    /// egui 0.29 の `Image` は**テクスチャ付きの `Shape::Rect`** として積まれる
+    /// (`fill_texture_id`)。メッシュではないので `Shape::Mesh` を探しても
+    /// 1 つも見つからない。フォントアトラス (`TextureId::default()`) は除く。
+    fn drawn_image_rect(out: &egui::FullOutput) -> Option<egui::Rect> {
+        let mut acc: Option<egui::Rect> = None;
+        let mut take = |r: egui::Rect| {
+            acc = Some(match acc {
+                Some(a) => a.union(r),
+                None => r,
+            });
+        };
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Rect(r) if r.fill_texture_id != egui::TextureId::default() => {
+                    take(r.rect)
+                }
+                egui::epaint::Shape::Mesh(m) if m.texture_id != egui::TextureId::default() => {
+                    take(m.calc_bounds())
+                }
+                _ => {}
+            }
+        }
+        acc
+    }
+
+    /// 描かれた文字の矩形 (整数へ丸めた `(左, 上, 右, 下)` の並び)。
+    /// 表の列幅・行の高さが動いたかを、隣のセルの文字位置で見るために使う。
+    fn text_row_rects(out: &egui::FullOutput) -> Vec<(i32, i32, i32, i32)> {
+        let mut v: Vec<(i32, i32, i32, i32)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let r = t.visual_bounding_rect();
+                    Some((
+                        r.left().round() as i32,
+                        r.top().round() as i32,
+                        r.right().round() as i32,
+                        r.bottom().round() as i32,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// テスト用の base64 符号化 ([`base64_decode`] の逆)。
+    /// `data:` URI を組み立てるためだけに使う。
+    fn base64_encode(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for c in bytes.chunks(3) {
+            let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[((v >> (18 - 6 * i)) & 0x3F) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    /// テスト用の小さな静止 PNG (実ファイルを同梱せずどの環境でも同じ入力)。
+    fn still_png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([0x20, 0x40, 0x80, 0xFF]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("png");
+        out
+    }
+
+    #[test]
+    fn 見えているアニメーションgifはコマが進む() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-play");
+        let gif = crate::preview::testdata::make_gif(8, 8, 4, 100, 0);
+        let path = dir.join("a.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "![動く](a.gif)";
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        // 1 パス 20ms・1 コマ 100ms。**描いた回数ではなく GIF 自身の速さ**で
+        // コマが変わることを見るために、わざと食い違わせる。
+        h.dt = 0.02;
+        assert!(h.settle(Some(&dir), doc, &key), "コマ列が届く");
+        assert!(
+            h.images.anim_ready(&key),
+            "2 コマ以上ならアニメーション扱い"
+        );
+
+        // 5 パス (= 100ms) ごとに 1 コマ、4 枚を巡って先頭へ戻る。
+        // 届いたパスでもう 1 度進めているので、そこを 1 パス目に数える。
+        let mut seen = vec![h.images.anim_shown(&key).expect("届いたパスでもう進む")];
+        for _ in 0..20 {
+            h.pass(Some(&dir), doc);
+            seen.push(h.images.anim_shown(&key).expect("コマ番号"));
+        }
+        let want: Vec<usize> = [0, 0, 0, 0]
+            .into_iter()
+            .chain([1; 5])
+            .chain([2; 5])
+            .chain([3; 5])
+            .chain([0; 2])
+            .collect();
+        assert_eq!(seen, want, "{seen:?}");
+
+        // 見えているあいだは「次のコマまで」だけを要求する (常時再描画しない)。
+        // egui は要求から `predicted_dt` を引くので、待ちは 1 コマ ‐ 1 パス以下。
+        let out = h.pass(Some(&dir), doc);
+        let d = repaint_delay(&out);
+        assert!(d > std::time::Duration::ZERO, "0 = 毎フレーム再描画になる");
+        assert!(
+            d <= std::time::Duration::from_millis(100),
+            "1 コマぶんを超えて先を要求しない: {d:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 画面外のアニメーションgifは一コマも進まず再描画も要求しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-offscreen");
+        let gif = crate::preview::testdata::make_gif(8, 8, 4, 100, 0);
+        let path = dir.join("a.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        // 画像より前に十分な本文を置いて、狭い画面の外へ押し出す
+        let doc = format!("{}\n![動く](a.gif)\n", "本文の行\n\n".repeat(60));
+
+        let mut h = AnimHarness::new(320.0, 140.0);
+        assert!(h.settle(Some(&dir), &doc, &key), "コマ列は届く");
+        assert!(
+            h.images.anim_ready(&key),
+            "アニメーションとしては用意される"
+        );
+
+        // 用意されていても、見えていないので時計は 1ms も進まない
+        for _ in 0..12 {
+            h.pass(Some(&dir), &doc);
+        }
+        assert_eq!(
+            h.images.anim_shown(&key),
+            None,
+            "画面外ではコマを 1 枚も差し替えない"
+        );
+        let out = h.pass(Some(&dir), &doc);
+        assert_eq!(
+            repaint_delay(&out),
+            std::time::Duration::MAX,
+            "画面外の GIF は再描画を 1 回も要求しない"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 静止画は今までどおり再描画を要求しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-still");
+        let path = dir.join("s.png");
+        std::fs::write(&path, still_png(24, 12)).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "![静止](s.png)";
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        assert!(h.settle(Some(&dir), doc, &key), "判定は付く");
+        assert!(
+            !h.images.anim_ready(&key),
+            "静止 PNG をアニメーションにしない"
+        );
+        assert_eq!(h.images.anim_shown(&key), None, "コマの差し替えをしない");
+
+        // 静止画のテクスチャは今までどおり実寸で載る
+        let tex = h.images.cached(&key).flatten().expect("テクスチャ");
+        assert_eq!(tex.size(), [24, 12]);
+
+        for _ in 0..3 {
+            h.pass(Some(&dir), doc);
+        }
+        assert_eq!(
+            repaint_delay(&h.pass(Some(&dir), doc)),
+            std::time::Duration::MAX,
+            "静止画はアイドルの費用ゼロ"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 表の中のgifはコマが進んでも寸法を変えない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-markdown-test", "anim-table");
+        // 縮小上限 (preview::ANIM_MAX_SIDE) を跨ぐ寸法にして、コマ列の
+        // テクスチャが静止画より小さくなる場合でも版面が動かないことを見る
+        let gif = crate::preview::testdata::make_gif(600, 300, 4, 100, 0);
+        let path = dir.join("t.gif");
+        std::fs::write(&path, &gif).expect("write");
+        let key = path.to_string_lossy().to_string();
+        let doc = "| 名前 | 絵 |\n| --- | --- |\n| あ | ![](t.gif) |\n| い | ふつうの文字 |\n";
+
+        let mut h = AnimHarness::new(900.0, 700.0);
+        // 静止画だけで描けている段の寸法を控える。1 パス目は ScrollArea の
+        // 状態も列幅もまだ無いので、落ち着かせてから測る。
+        let mut still = None;
+        let mut still_rows = Vec::new();
+        for _ in 0..3 {
+            let out = h.pass(Some(&dir), doc);
+            still = drawn_image_rect(&out);
+            still_rows = text_row_rects(&out);
+        }
+        let still = still.expect("静止画の矩形");
+        assert!(!still_rows.is_empty(), "表の文字が描かれている");
+        assert!(h.settle(Some(&dir), doc, &key), "コマ列が届く");
+        assert!(h.images.anim_ready(&key));
+        // テクスチャ自体は上限 (preview::ANIM_MAX_SIDE = 512) まで縮んでいる。
+        // 紙面の寸法を静止画から受け継いでいなければ、ここで版面が跳ねる。
+        let tex = h.images.cached(&key).flatten().expect("テクスチャ");
+        assert_eq!(tex.size(), [512, 256], "コマ列は上限まで縮む");
+
+        let mut frames = Vec::new();
+        for _ in 0..6 {
+            let out = h.pass(Some(&dir), doc);
+            let r = drawn_image_rect(&out).expect("アニメーションの矩形");
+            assert!(
+                (r.width() - still.width()).abs() < 0.5
+                    && (r.height() - still.height()).abs() < 0.5,
+                "コマ列が届いても寸法が変わらない: 静止 {still:?} / いま {r:?}"
+            );
+            // 列幅も動かない = 隣のセルの文字が 1px も動かない
+            assert_eq!(
+                text_row_rects(&out),
+                still_rows,
+                "コマが進んでも表の行と列が動かない"
+            );
+            frames.push(h.images.anim_shown(&key).expect("コマ番号"));
+        }
+        assert!(
+            frames.windows(2).any(|w| w[0] != w[1]),
+            "実際にコマが進んでいる: {frames:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn データuriのアニメーションgifも再生する() {
+        let gif = crate::preview::testdata::make_gif(8, 8, 3, 100, 0);
+        let url = format!("data:image/gif;base64,{}", base64_encode(&gif));
+        let doc = format!("![動く]({url})");
+
+        let mut h = AnimHarness::new(400.0, 300.0);
+        assert!(h.settle(None, &doc, &url), "コマ列が届く");
+        assert!(h.images.anim_ready(&url), "data: URI でも再生する");
+        // data: URI の鍵は URL そのもの。毎パス base64 を解き直さない
+        assert!(h.images.cached(&url).is_some(), "URL を鍵にキャッシュ済み");
+        let a = h.images.anim_shown(&url).expect("コマ番号");
+        h.pass(None, &doc);
+        let b = h.images.anim_shown(&url).expect("コマ番号");
+        assert_ne!(a, b, "コマが進む");
+    }
+
     #[test]
     fn base64_and_percent_decoding() {
         assert_eq!(base64_decode("aGVsbG8="), Some(b"hello".to_vec()));
@@ -7251,6 +8791,690 @@ $$
             let _ = table_aligns(src);
             let _ = footnote_def(src);
             let _ = split_front_matter(src);
+        }
+    }
+
+    // ─── 版面 (箇条書き・引用・脚注) ─────────────────────────────────
+
+    /// 描いた結果からテキスト行の矩形を拾う。戻り値は (行の並び, 版面の右端)。
+    ///
+    /// `(上, 下, 左, 右, 本文)`。太字は同じ galley を [`BOLD_OFFSET`] ずらして
+    /// 2 度描くので、直後に来る重ね描きは 1 つに畳む。
+    fn md_rows(doc: &str, width: f32) -> (Vec<(f32, f32, f32, f32, String)>, f32) {
+        let ctx = egui::Context::default();
+        let hl = Highlighter::new();
+        let theme = crate::theme::by_name("zaivern-dark");
+        let mut images = ImageCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 2400.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        let mut right = f32::NAN;
+        for _ in 0..3 {
+            out = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    right = ui.max_rect().right();
+                    let mut rctx = RenderCtx {
+                        dir: None,
+                        images: &mut images,
+                    };
+                    render(ui, &theme, &hl, 14.0, doc, &mut rctx);
+                });
+            }));
+        }
+        let mut rows = Vec::new();
+        let mut prev: Option<(egui::Pos2, String)> = None;
+        for cs in &out.unwrap().shapes {
+            let egui::epaint::Shape::Text(t) = &cs.shape else {
+                continue;
+            };
+            let text = t.galley.text().to_string();
+            let overlay = prev.as_ref().is_some_and(|(pp, ptext)| {
+                *ptext == text
+                    && (t.pos.x - pp.x - BOLD_OFFSET).abs() < 0.01
+                    && (t.pos.y - pp.y).abs() < 0.01
+            });
+            prev = Some((t.pos, text));
+            if overlay {
+                continue;
+            }
+            for row in t.galley.rows.iter() {
+                let body: String = row.glyphs.iter().map(|g| g.chr).collect();
+                if body.trim().is_empty() {
+                    continue;
+                }
+                rows.push((
+                    t.pos.y + row.rect.top(),
+                    t.pos.y + row.rect.bottom(),
+                    t.pos.x + row.rect.left(),
+                    t.pos.x + row.rect.right(),
+                    body,
+                ));
+            }
+        }
+        rows.sort_by(|a, b| (a.0, a.2).partial_cmp(&(b.0, b.2)).unwrap());
+        (rows, right)
+    }
+
+    /// 行頭記号 (`•` / `☐` / `▍`) だけの行か。
+    fn is_marker_row(text: &str) -> bool {
+        let t = text.trim();
+        !t.is_empty() && t.chars().all(|c| matches!(c, '•' | '☐' | '☑' | '▍' | ' '))
+    }
+
+    /// 字下げはバイト数ではなく**桁数**で数える (タブは 4 桁のタブストップ)。
+    #[test]
+    fn 字下げは桁数で数えるのでタブが潰れない() {
+        assert_eq!(indent_width("- a"), 0);
+        assert_eq!(indent_width("  - a"), 2);
+        assert_eq!(indent_width("\t- a"), 4);
+        assert_eq!(indent_width("\t\t- a"), 8);
+        // タブストップなので、空白 2 つのあとのタブは 4 桁目まで送るだけ
+        assert_eq!(indent_width("  \t- a"), 4);
+        assert_eq!(indent_width("     - a"), 5);
+        // 全角空白も 1 バイトではない
+        assert_eq!(indent_width("\u{3000}- a"), 2);
+        assert_eq!(indent_width(""), 0);
+    }
+
+    /// 箇条書きは**折り返しても記号の右へ揃う** (ぶら下げ字下げ)。
+    ///
+    /// 旧実装は `horizontal_wrapped` + `add_space` で記号を置いていたので、
+    /// 器の左端が列 0 のままになり、**2 行目が記号より左へ落ちて**いた。
+    #[test]
+    fn 箇条書きは折り返しても記号の右へ揃う() {
+        let long = "折り返しの検査に使うための十分に長い本文です。".repeat(6);
+        let doc = format!("- {long}\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let marker = rows
+                .iter()
+                .find(|r| is_marker_row(&r.4))
+                .unwrap_or_else(|| panic!("{width}: 行頭記号が描かれていない"));
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(body.len() >= 2, "{width}: 折り返していない ({body:?})");
+            let head = body[0].2;
+            assert!(
+                head > marker.2 + 1.0,
+                "{width}: 本文が記号の右に無い ({head} <= {})",
+                marker.2
+            );
+            for b in &body {
+                assert!(
+                    b.2 >= head - 0.5,
+                    "{width}: 折り返した行が本文左端より左へ出た ({b:?} < {head})"
+                );
+            }
+        }
+    }
+
+    /// 入れ子は**深いほど左端が右へ動く**。タブ字下げも空白 4 つと同じ深さになる。
+    ///
+    /// 旧実装は字下げをバイト数で数えていたので、タブ 1 個が 1 桁に潰れて
+    /// 階層が消えていた。
+    #[test]
+    fn 入れ子は深いほど右へ寄りタブも空白と同じに数える() {
+        let spaces = "- 深さ 0\n    - 深さ 1\n        - 深さ 2\n";
+        let tabs = "- 深さ 0\n\t- 深さ 1\n\t\t- 深さ 2\n";
+        for width in [1200.0_f32, 700.0] {
+            let lefts = |doc: &str| -> Vec<f32> {
+                md_rows(doc, width)
+                    .0
+                    .iter()
+                    .filter(|r| is_marker_row(&r.4))
+                    .map(|r| r.2)
+                    .collect()
+            };
+            let a = lefts(spaces);
+            assert_eq!(a.len(), 3, "{width}: 3 段に描けていない ({a:?})");
+            assert!(
+                a[0] < a[1] && a[1] < a[2],
+                "{width}: 深さが効いていない {a:?}"
+            );
+            let b = lefts(tabs);
+            assert_eq!(b.len(), 3, "{width}: タブ版が 3 段に描けていない ({b:?})");
+            for (x, y) in a.iter().zip(&b) {
+                assert!(
+                    (x - y).abs() < 0.5,
+                    "{width}: タブ字下げが空白 4 つと違う深さになった {a:?} / {b:?}"
+                );
+            }
+        }
+    }
+
+    /// 字下げした続きの行は、**項目の本文**として記号の右へ続く。
+    ///
+    /// 旧実装は続きの行を段落バッファへ落としていたので、**字下げ 0 の別段落**
+    /// として描かれていた (このリポジトリの `docs/*.md` はほぼこの形で書く)。
+    #[test]
+    fn 箇条書きの続きの行は項目の本文になる() {
+        let doc = "- 見出しになる一行目\n  字下げした続きの本文がここに来る\n- 次の項目\n";
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            let head = body
+                .iter()
+                .find(|r| r.4.contains("見出しになる"))
+                .unwrap_or_else(|| panic!("{width}: 1 行目が無い"))
+                .2;
+            let cont = body
+                .iter()
+                .find(|r| r.4.contains("字下げした続き"))
+                .unwrap_or_else(|| panic!("{width}: 続きの行が無い"));
+            assert!(
+                cont.2 >= head - 0.5,
+                "{width}: 続きの行が段落として左端へ落ちた ({cont:?} < {head})"
+            );
+        }
+    }
+
+    /// 項目のあいだは段落のあいだより**詰まって**いる (塊に見える)。
+    #[test]
+    fn 箇条書きの行間は段落より詰まる() {
+        let width = 700.0_f32;
+        let tops = |doc: &str| -> Vec<f32> {
+            md_rows(doc, width)
+                .0
+                .iter()
+                .filter(|r| !is_marker_row(&r.4))
+                .map(|r| r.0)
+                .collect()
+        };
+        let list = tops("- 項目あ\n- 項目い\n- 項目う\n");
+        let para = tops("段落あ\n\n段落い\n\n段落う\n");
+        assert_eq!(list.len(), 3, "{list:?}");
+        assert_eq!(para.len(), 3, "{para:?}");
+        let gap = |v: &[f32]| v[1] - v[0];
+        assert!(
+            gap(&list) < gap(&para) - 0.5,
+            "項目間 {} が段落間 {} より詰まっていない",
+            gap(&list),
+            gap(&para)
+        );
+    }
+
+    /// 引用も折り返しが帯の右へ揃い、同じ深さの平文は 1 段落に畳まれる。
+    #[test]
+    fn 引用は折り返しても帯の右へ揃う() {
+        let long = "帯の右へ揃わないと 2 行目が帯の下へ潜り込んで読めません。".repeat(5);
+        let doc = format!("> {long}\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, _) = md_rows(doc, width);
+            let bar = rows
+                .iter()
+                .find(|r| is_marker_row(&r.4))
+                .unwrap_or_else(|| panic!("{width}: 帯が描かれていない"));
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(body.len() >= 2, "{width}: 折り返していない");
+            let head = body[0].2;
+            assert!(head > bar.2 + 1.0, "{width}: 本文が帯の右に無い");
+            for b in &body {
+                assert!(
+                    b.2 >= head - 0.5,
+                    "{width}: 折り返した行が帯の下へ潜った ({b:?} < {head})"
+                );
+            }
+        }
+    }
+
+    /// 脚注定義の続きの行も、ラベルの右へぶら下がる。
+    #[test]
+    fn 脚注定義は続きの行までラベルの右へ揃う() {
+        let long = "脚注の本文をわざと長くしてぶら下げの検査に使います。".repeat(4);
+        let doc = format!("[^1]: {long}\n  字下げした続きの行も同じ項目として扱われます。\n");
+        let doc = doc.as_str();
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(doc, width);
+            let label = rows
+                .iter()
+                .find(|r| r.4.contains("[1]"))
+                .unwrap_or_else(|| panic!("{width}: ラベルが無い"));
+            let body: Vec<_> = rows.iter().filter(|r| !r.4.contains("[1]")).collect();
+            let head = body[0].2;
+            assert!(head > label.2 + 1.0, "{width}: 本文がラベルの右に無い");
+            for b in &body {
+                assert!(b.2 >= head - 0.5, "{width}: {b:?} が左へ落ちた");
+                assert!(b.3 <= right + 0.5, "{width}: {b:?} が版面をはみ出した");
+            }
+            assert!(
+                body.iter().any(|b| b.4.contains("字下げした続き")),
+                "{width}: 続きの行が本文に入っていない"
+            );
+        }
+    }
+
+    /// 段落の直後の罫線は**水平線ではなく Setext 見出し**。
+    ///
+    /// 旧実装は `is_hr` を先に見ていたので、`本文` + `---` が
+    /// 「段落 + 区切り線」に化けていた (HTML 由来の文書でよく出る形)。
+    #[test]
+    fn 段落の直後の罫線はsetext見出しになる() {
+        let h = |doc: &str| -> f32 {
+            let (rows, _) = md_rows(doc, 700.0);
+            let r = rows.iter().find(|r| r.4.contains("題名になる行")).unwrap();
+            r.1 - r.0
+        };
+        // 1 行だけの段落は旧実装も先読みで拾えていた。**複数行**の段落が本番。
+        let heading = h("題名になる行\n題名の続き\n---\n\n次の段落\n");
+        let plain = h("題名になる行\n題名の続き\n\n---\n\n次の段落\n");
+        assert!(
+            heading > plain * 1.2,
+            "Setext 見出しになっていない (見出し {heading} / 段落 {plain})"
+        );
+    }
+
+    /// 深い入れ子でも本文に読める幅が残る (字下げのほうを削る)。
+    ///
+    /// 旧実装は `add_space` で字下げを積むだけだったので、深い入れ子では
+    /// 残り幅が数ピクセルになり、本文が 1 文字ずつ折り返して読めなくなった。
+    #[test]
+    fn 深い入れ子でも本文の幅が潰れない() {
+        let mut doc = String::new();
+        for d in 0..12 {
+            doc.push_str(&" ".repeat(d * 4));
+            doc.push_str(&format!(
+                "- 深さ {d} の項目。折り返しの検査に使う本文を置く。\n"
+            ));
+        }
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(&doc, width);
+            let body: Vec<_> = rows.iter().filter(|r| !is_marker_row(&r.4)).collect();
+            assert!(
+                body.len() >= 12,
+                "{width}: 12 段に描けていない ({})",
+                body.len()
+            );
+            for b in &body {
+                assert!(
+                    right - b.2 >= 14.0 * HANG_MIN_BODY - 0.5,
+                    "{width}: {b:?} の本文に残る幅が {} しかない",
+                    right - b.2
+                );
+                assert!(b.3 <= right + 0.5, "{width}: {b:?} が版面をはみ出した");
+            }
+        }
+    }
+
+    /// 左揃え (`:--`) の 2 列表で、**長い英文が折り返しても行が食い込まない**。
+    ///
+    /// 利用者から実物のスクリーンショットで報告された形 (英語 README の比較表)。
+    /// 「…target one **agent**」が次の行「Miss an approval prompt…」に重なっていた。
+    /// 既存の検査は**右揃えの数値表**だけだったので、
+    /// 「左揃え + 長い英文 + 折り返し」は 1 度も通っていなかった。
+    /// 英語は**単語単位**で折り返すので、日本語 (文字単位) とは折り返し位置の
+    /// 決まり方が違う。ここが穴だった。
+    #[test]
+    fn 左揃えの英文表は折り返しても行が食い込まない() {
+        let doc = "\
+| Without a cockpit | With Zaivern Code |
+|:--|:--|
+| Cycle through tabs to find who needs you | Every agent on one screen, with live status |
+| Paste the same instruction into each tool | Broadcast once to the fleet, or target one agent |
+| Miss an approval prompt and lose the run | Notifications and one-click approval |
+| Stay at your desk while agents work | Check progress and approve from your phone |
+| More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines |
+| A heavy editor competes with your agents for the machine | A single native binary, with damage-driven redraws |
+";
+        // 報告のスクリーンショットは 650px 程度。折り返しが起きる幅を並べる
+        for width in [420.0_f32, 560.0, 650.0, 900.0] {
+            let (rows, _) = md_rows(doc, width);
+            assert!(rows.len() >= 14, "{width}: 描けていない ({})", rows.len());
+            assert!(
+                rows.iter().any(|r| r.4.contains("agent")),
+                "{width}: 報告された文言が出ていない"
+            );
+            no_row_bleed(&rows, width);
+        }
+    }
+
+    /// `html::html_to_md` が吐く表の形 (`| --- |` = 既定の左揃え) でも同じこと。
+    ///
+    /// 変換側は別担当が触っている最中なので、**吐かれる形をそのまま書き写して**
+    /// 描画側だけを固定する (`html_to_md` を呼ぶと、あちらの作業でこちらが落ちる)。
+    #[test]
+    fn html由来の表もセル内の長い英文で食い込まない() {
+        let doc = "\
+| Feature | What it does |
+| --- | --- |
+| Fleet broadcast | Send the same instruction to every agent at once, or target a single agent by name |
+| Approval queue | Collects approval prompts from all agents so a missed prompt never stalls the run |
+| Shared ledger | Keeps two agents from writing the same lines of the same file at the same time |
+";
+        for width in [420.0_f32, 560.0, 650.0, 900.0] {
+            let (rows, _) = md_rows(doc, width);
+            assert!(rows.len() >= 8, "{width}: 描けていない ({})", rows.len());
+            no_row_bleed(&rows, width);
+        }
+    }
+
+    /// 上端が違うのに縦の帯が重なる組が 1 つも無いこと (= 行の食い込み)。
+    ///
+    /// 同じ行に並ぶセルは上端が揃う (`horizontal_top`) ので、
+    /// **上端が違うのに重なったら**それは次の行への食い込み。
+    fn no_row_bleed(rows: &[(f32, f32, f32, f32, String)], width: f32) {
+        for (i, a) in rows.iter().enumerate() {
+            for b in rows.iter().skip(i + 1) {
+                if (a.0 - b.0).abs() < 0.5 {
+                    continue;
+                }
+                let overlap = a.0 < b.1 - 0.5 && b.0 < a.1 - 0.5;
+                assert!(!overlap, "{width}: {a:?} と {b:?} が縦に食い込んだ");
+            }
+        }
+    }
+
+    /// 描かれたもの (文字の行 **と画像**) の矩形を全部拾う。
+    ///
+    /// [`md_rows`] は `Shape::Text` しか見ないので、**画像セル**の崩れを
+    /// 1 つも捕まえられなかった。`![]()` を含むセルは
+    /// [`table_cell_ui`] でウィジェット経路 (`horizontal_wrapped`) へ落ち、
+    /// galley 経路とは行の高さの決まり方が違うので、両方を同じ土俵で見る。
+    fn md_draw_rects(doc: &str, width: f32, dir: Option<&Path>) -> Vec<(egui::Rect, String)> {
+        let ctx = egui::Context::default();
+        let hl = Highlighter::new();
+        let theme = crate::theme::by_name("zaivern-dark");
+        let mut images = ImageCache::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(width, 4000.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = None;
+        // 画像は 1 フレーム目で初めて復号されるので、寸法が落ち着くまで回す
+        for _ in 0..4 {
+            out = Some(ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut rctx = RenderCtx {
+                        dir,
+                        images: &mut images,
+                    };
+                    render(ui, &theme, &hl, 14.0, doc, &mut rctx);
+                });
+            }));
+        }
+        let mut rects = Vec::new();
+        let mut prev: Option<(egui::Pos2, String)> = None;
+        for cs in &out.expect("1 フレームも回っていない").shapes {
+            match &cs.shape {
+                egui::epaint::Shape::Text(t) => {
+                    let text = t.galley.text().to_string();
+                    let overlay = prev.as_ref().is_some_and(|(pp, ptext)| {
+                        *ptext == text
+                            && (t.pos.x - pp.x - BOLD_OFFSET).abs() < 0.01
+                            && (t.pos.y - pp.y).abs() < 0.01
+                    });
+                    prev = Some((t.pos, text));
+                    if overlay {
+                        continue;
+                    }
+                    for row in t.galley.rows.iter() {
+                        let body: String = row.glyphs.iter().map(|g| g.chr).collect();
+                        if body.trim().is_empty() {
+                            continue;
+                        }
+                        rects.push((row.rect.translate(t.pos.to_vec2()), body));
+                    }
+                }
+                // 画像 (egui::Image はテクスチャ付きの矩形として積まれる)
+                egui::epaint::Shape::Rect(r) if r.fill_texture_id != egui::TextureId::default() => {
+                    rects.push((r.rect, "<image>".to_string()));
+                }
+                _ => {}
+            }
+        }
+        rects.sort_by(|a, b| {
+            (a.0.top(), a.0.left())
+                .partial_cmp(&(b.0.top(), b.0.left()))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rects
+    }
+
+    /// 画面上で**実際に重なる**組が 1 つも無いこと (縦横の両方で見る)。
+    ///
+    /// [`no_row_bleed`] は縦の帯だけを見るので、**別の列**に並ぶ 2 行を
+    /// 「食い込み」と数えてしまう。実文書 20 本 × 3 幅の実測で、
+    /// 1 軸判定は 117 組を挙げたが**横方向は 1 組残らず 18.06px 以上
+    /// 離れていた** (= 列の間隔 [`TBL_GAP_X`] ぶん) ので、
+    /// 画面上の重なりは **0 組**だった。
+    /// 「縦の帯が重なる」と「見た目が重なる」を混ぜないこと。
+    fn no_screen_overlap(rects: &[(egui::Rect, String)], label: &str) {
+        for (i, (a, at)) in rects.iter().enumerate() {
+            for (b, bt) in rects.iter().skip(i + 1) {
+                // 同じ段に並ぶものは上端が揃う (`horizontal_top`)
+                if (a.top() - b.top()).abs() < 0.5 {
+                    continue;
+                }
+                let vy = a.bottom().min(b.bottom()) - a.top().max(b.top());
+                let vx = a.right().min(b.right()) - a.left().max(b.left());
+                assert!(
+                    !(vy > 0.5 && vx > 0.5),
+                    "{label}: {a:?} {at:?} と {b:?} {bt:?} が画面上で重なった (縦 {vy:.2}px / 横 {vx:.2}px)"
+                );
+            }
+        }
+    }
+
+    /// 表の中身にあたる矩形 (ヘッダより下) を列ごとに束ねる。
+    fn body_rows_by_column(
+        rects: &[(egui::Rect, String)],
+        header_bottom: f32,
+    ) -> std::collections::BTreeMap<i64, Vec<f32>> {
+        let mut by_col: std::collections::BTreeMap<i64, Vec<f32>> = Default::default();
+        for (r, _) in rects {
+            if r.top() < header_bottom {
+                continue;
+            }
+            by_col
+                .entry(r.left().round() as i64)
+                .or_default()
+                .push(r.top());
+        }
+        for v in by_col.values_mut() {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        by_col
+    }
+
+    /// 表の行の中では、**どの列も段の上端が同じ**。
+    ///
+    /// `cell_job` は 1 枚の galley に本文 (`proportional`) と
+    /// インライン code (`monospace`) を混ぜる。epaint は行の高さを
+    /// **その行に実際に出たフォントの最大値**で決めるので
+    /// (`epaint::text::layout::galley_from_rows`)、行高を揃えないと
+    /// 「code だけのセル」は 15px 行・「本文のセル」は 16px 行になり、
+    /// **折り返し 1 段につき 1px ずつ**ずれる。
+    /// 修正前の実測: 4 段で `[0, -1, -2, -3]`、5 段で `[0, -1, -2, -3, -4]`。
+    /// 重なりはしないので [`no_row_bleed`] では捕まらない。
+    #[test]
+    fn 表の段は列をまたいでも揃う() {
+        // 1 列目は galley 経路 (code) / ウィジェット経路 (リンク・数式) を
+        // それぞれ通す。2 列目は必ず折り返す本文で、こちらが基準の段になる。
+        let prose = "ふつうの日本語の説明文がここに入って何段にも折り返す想定である。さらに長くする。もっと長くする。どの幅でも三段以上に折り返さないと検査にならないので、基準になる列の本文はここまで長くしてある。";
+        let docs = [
+            format!(
+                "| コード | 説明 |\n|---|---|\n| `alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima` | {prose} |\n"
+            ),
+            format!(
+                "| リンク | 説明 |\n|---|---|\n| [alpha bravo charlie delta echo foxtrot golf hotel india](https://example.com) | {prose} |\n"
+            ),
+            format!("| 式 | 説明 |\n|---|---|\n| $a+b$ | {prose} |\n"),
+        ];
+        for doc in &docs {
+            段が揃っている(doc);
+        }
+    }
+
+    /// [`表の段は列をまたいでも揃う`] の本体 (入力ごとに同じ検査を当てる)。
+    fn 段が揃っている(doc: &str) {
+        for width in [360.0_f32, 420.0, 520.0] {
+            let rects = md_draw_rects(doc, width, None);
+            let header_bottom = rects
+                .first()
+                .map(|(r, _)| r.bottom() + 1.0)
+                .expect("ヘッダが描けていない");
+            let by_col = body_rows_by_column(&rects, header_bottom);
+            assert!(
+                by_col.len() >= 2,
+                "{width}: 2 列に描けていない ({by_col:?})"
+            );
+            let max_lines = by_col.values().map(Vec::len).max().unwrap_or(0);
+            assert!(
+                max_lines >= 3,
+                "{width}: 折り返していない ({max_lines} 段) — 検査になっていない"
+            );
+            // 全列の段の上端を集めて重複を潰す。段が揃っていれば
+            // 「相異なる上端の数」は「いちばん段数の多い列の段数」に一致する。
+            let mut tops: Vec<f32> = by_col.values().flatten().copied().collect();
+            tops.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            tops.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+            assert_eq!(
+                tops.len(),
+                max_lines,
+                "{width}: 段がずれている (上端 {tops:?} / 最大 {max_lines} 段 / 列 {by_col:?})"
+            );
+            no_screen_overlap(&rects, &format!("段揃え w={width}"));
+        }
+    }
+
+    /// 表のいろいろな形を、どの幅で描いても**画面上で重ならない**。
+    ///
+    /// 書き直しの直後に**1 度も通っていなかった組み合わせ**を並べる。
+    /// 画像 (バッジ) を含むセルだけはウィジェット経路へ落ちるので、
+    /// 実ファイルを一時ディレクトリに置いて実物の寸法で描かせる。
+    #[test]
+    fn どの表の形でも画面上で重ならない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-md", "table-shapes");
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れない");
+        // README のバッジと同じくらいの横長画像と、版面より広い画像
+        for (name, w, h) in [("badge.png", 140_u32, 24_u32), ("wide.png", 900, 40)] {
+            image::RgbaImage::from_pixel(w, h, image::Rgba([10, 120, 200, 255]))
+                .save(dir.join(name))
+                .expect("テスト画像を書けない");
+        }
+
+        let many_cols = {
+            let n = 12;
+            let cell = |f: &dyn Fn(usize) -> String| (1..=n).map(f).collect::<Vec<_>>().join(" | ");
+            format!(
+                "| {} |\n| {} |\n| {} |\n| {} |\n",
+                cell(&|i| format!("列{i}")),
+                cell(&|_| "---".to_string()),
+                cell(&|i| format!("`v{i}`")),
+                cell(&|i| format!("値がとても長い場合{i}")),
+            )
+        };
+
+        let cases: [(&str, &str); 16] = [
+            (
+                "code+長い英文+折り返し",
+                "| API | 説明 |\n|---|---|\n| `region::conflicting_pairs` | Sorts by start line and sweeps so that the worst case never becomes quadratic even with eight hundred disjoint reservations |\n| `lease::claim` | 短い |\n",
+            ),
+            (
+                "バッジ画像",
+                "| 状態 | バッジ |\n|---|---|\n| CI | ![build](badge.png) ![cov](badge.png) |\n| 版 | ![v](badge.png) |\n",
+            ),
+            ("版面より広い画像", "| 図 |\n|---|\n| ![w](wide.png) |\n"),
+            (
+                "取得できない遠隔バッジ",
+                "| 状態 | バッジ |\n|---|---|\n| CI | ![build](https://example.invalid/badge.svg) |\n",
+            ),
+            (
+                "リンク+太字+取り消し線",
+                "| 名前 | 備考 |\n|---|---|\n| [**手引き**](https://example.com) | ~~廃止~~ **重要** *斜体* |\n| [`code link`](https://example.com/very/long/path/that/never/ends) | ~~`old api`~~ |\n",
+            ),
+            ("12 列", &many_cols),
+            (
+                "1 列だけ",
+                "| 唯一 |\n|---|\n| 値 |\n| とても長い日本語の値がここに入って折り返すはずである |\n",
+            ),
+            ("空セルだけの行", "| A | B | C |\n|---|---|---|\n|  |  |  |\n| x | | z |\n"),
+            ("ヘッダだけ", "| A | B |\n|---|---|\n"),
+            (
+                "全角と半角の混在",
+                "| 混在 | ascii |\n|---|---|\n| 日本語abc英字混在テキスト | Mixed 全角ＡＢＣ and half ABC |\n",
+            ),
+            (
+                "折り返せない URL",
+                "| URL | 備考 |\n|---|---|\n| https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbb | 折り返せない |\n",
+            ),
+            (
+                "折り返せない code",
+                "| CODE | 備考 |\n|---|---|\n| `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` | x |\n",
+            ),
+            (
+                "右揃え + code",
+                "| 名 | 数 |\n|:---|---:|\n| `zai lease claim --shift` | `1,234` |\n| a | 7 |\n",
+            ),
+            (
+                "脚注参照つきのセル",
+                "| A | B |\n|---|---|\n| 脚注つき[^1] の文 | ふつう |\n\n[^1]: 注の中身\n",
+            ),
+            (
+                "数式つきのセル",
+                "| 式 | 説明 |\n|---|---|\n| $O(N^2)$ | 総当たり |\n| $\\frac{a}{b}$ | 分数 |\n",
+            ),
+            ("列数が揃わない行", "| A | B | C |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 | 5 |\n"),
+        ];
+
+        for (name, doc) in cases {
+            for width in [1200.0_f32, 700.0, 420.0, 260.0] {
+                let rects = md_draw_rects(doc, width, Some(&dir));
+                assert!(!rects.is_empty(), "{name} w={width}: 何も描けていない");
+                no_screen_overlap(&rects, &format!("{name} w={width}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// どの幅でも、**どのテキスト行も版面をはみ出さない**。
+    ///
+    /// 実文書 (`docs/*.md`) と `html::html_to_md` が吐く形 (入れ子は空白 2 つ、
+    /// `<br>` はハード改行) を混ぜた入力で確かめる。
+    #[test]
+    fn どの幅でも本文が版面をはみ出さない() {
+        let doc = "\
+# 見出し
+
+本文の段落です。長い文をわざと入れて折り返しの検査に使います。
+
+- 箇条書きの項目をわざと長くして折り返させるための本文です
+  字下げした続きの行もここに畳まれます
+  - 入れ子の項目も同じように長くしておきます
+    - さらに深い入れ子。ここまで来ると幅が狭いときに字下げを削る必要があります
+- [ ] 未完のタスク項目
+- [x] 済みのタスク項目
+
+1. 番号付きの項目もぶら下げが効くこと
+2. 二つ目の項目
+
+> 引用の本文。ここも折り返しの検査に使います。長い文を入れておきます。
+>> 深い引用も帯のぶんだけ右へ寄ります。
+> - 引用の中の箇条書き
+
+題名になる行
+---
+
+[^1]: 脚注の本文もぶら下げます。長めに書いて折り返させます。
+";
+        for width in [1200.0_f32, 700.0, 420.0] {
+            let (rows, right) = md_rows(doc, width);
+            assert!(rows.len() > 12, "{width}: 描けていない ({})", rows.len());
+            for r in &rows {
+                assert!(
+                    r.3 <= right + 0.5,
+                    "{width}: {r:?} が版面 (右端 {right}) をはみ出した"
+                );
+                assert!(r.2 >= -0.5, "{width}: {r:?} が左へはみ出した");
+            }
         }
     }
 }

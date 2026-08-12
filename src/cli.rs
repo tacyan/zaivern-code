@@ -3484,7 +3484,7 @@ prunable gitdir file points to non-existent location
         // Windows のチェックアウトは CRLF なので改行を正規化してから探す。
         let readmes = [
             include_str!("../README.md").replace("\r\n", "\n"),
-            include_str!("../README.en.md").replace("\r\n", "\n"),
+            include_str!("../README.ja.md").replace("\r\n", "\n"),
         ];
         let sh = update_command_line(UpdateMethod::Shell, &d);
         let ps = update_command_line(UpdateMethod::PowerShell, &d);

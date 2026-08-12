@@ -79,6 +79,85 @@ pub struct LadderRead {
     pub detail: String,
 }
 
+/// **「待機に見える」の根拠の質。完了通知を鳴らしてよいかは、これだけで決まる。**
+///
+/// [`SessionState::Idle`] は従来どおり「画面が静か」の意味のまま
+/// (かんばんの列・「⏸ 停止中へ一括送信」の対象はこれで決める)。
+/// **「終わった」と名乗れるかはそれとは別の問い**なので、別の値で持つ。
+/// 1 つの値へ混ぜると、どちらかの用途が必ず嘘になる —
+/// 実際に「出力が止まった」を完了と読んで偽の完了通知 (音つき) が出ていた。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum IdleEvidence {
+    /// **積極的な根拠が無い。** 出力が止まっているだけで、
+    /// 「考えている / API 応答待ち / ネットワーク待ち」と区別が付かない。
+    #[default]
+    Quiet,
+    /// 状態ラダー上位段が「この回は終わった」と報告した。
+    /// フック段なら `Stop` / `SessionEnd`、シェル統合段なら OSC 133 の `D`
+    /// (終了コード付き) が根拠。**推定ではなく、報告された事実。**
+    Ladder(Rung),
+}
+
+impl IdleEvidence {
+    /// 「終わった」と名乗ってよいか。**完了通知の可否はこの 1 つで決まる。**
+    ///
+    /// 取れないときは鳴らさない — 誤って鳴らす害 (音が出る) のほうが、
+    /// 鳴らさない害より大きい。
+    pub fn conclusive(self) -> bool {
+        matches!(self, IdleEvidence::Ladder(_))
+    }
+
+    /// UI に出す根拠の名前 (tr のキーになる日本語原文)。
+    /// 設計原則 4 の後半 —「今どの段にいるか」を必ず辿れるようにする。
+    pub fn label(self) -> &'static str {
+        match self {
+            IdleEvidence::Quiet => "画面推定",
+            IdleEvidence::Ladder(r) => r.label(),
+        }
+    }
+}
+
+/// [`derive_state`] の判定 1 件 — 状態・理由・根拠の質を**まとめて 1 個**返す。
+///
+/// 3 つを別々の関数で出すと同じ事実を 2 箇所に持つことになり、
+/// 片方だけ更新される経路が必ずできる。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StateVerdict {
+    pub state: SessionState,
+    /// なぜそう判断したか (遷移履歴として UI に出る)。
+    /// 上位段由来なら**段の名前が頭に付く**ので、根拠の質が読んで分かる。
+    pub reason: String,
+    /// 「待機」の根拠の質。`state` が `Idle` 以外なら常に [`IdleEvidence::Quiet`]
+    /// (= 完了を名乗らない)。
+    pub evidence: IdleEvidence,
+}
+
+impl StateVerdict {
+    /// 画面・異常検出など**下位段**から出した判定 (完了は名乗れない)。
+    fn guess(state: SessionState, reason: impl Into<String>) -> Self {
+        Self {
+            state,
+            reason: reason.into(),
+            evidence: IdleEvidence::Quiet,
+        }
+    }
+
+    /// 上位段が「この回は終わった」と言ったときだけ作れる待機。
+    fn finished(rung: Rung, reason: impl Into<String>) -> Self {
+        Self {
+            state: SessionState::Idle,
+            reason: reason.into(),
+            evidence: IdleEvidence::Ladder(rung),
+        }
+    }
+
+    /// 従来の `(状態, 理由)` の形 (既存テストの読みやすさを保つため)。
+    #[cfg(test)]
+    fn tuple(self) -> (SessionState, String) {
+        (self.state, self.reason)
+    }
+}
+
 /// 構造化イベントが途切れたと見なすまでの時間 (ミリ秒)。
 ///
 /// ツール実行の合間は数十秒黙ることがあるので、短すぎると上位段と下位段の間で
@@ -1373,6 +1452,9 @@ struct SessionMonitor {
     recent_actions: Ring<(u64, Intervention, Anomaly)>,
     /// 最終スクリーン (LLM 抜粋用)。上限付き。
     last_screen: String,
+    /// いまの `state` を「待機」と読んだときの根拠の質。
+    /// **完了通知はこれが `conclusive()` のときだけ**鳴る。
+    idle_evidence: IdleEvidence,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1402,6 +1484,7 @@ impl SessionMonitor {
             escalation: HashMap::new(),
             recent_actions: Ring::new(64),
             last_screen: String::new(),
+            idle_evidence: IdleEvidence::default(),
         }
     }
 
@@ -1734,6 +1817,45 @@ impl Supervisor {
         self.monitors.get(&id).map(|m| m.state)
     }
 
+    /// 「待機」と見えているときの**根拠の質**。UI と通知が同じ値を見る。
+    ///
+    /// [`IdleEvidence::label`] をそのまま画面に出せば、
+    /// 「何を根拠にそう判断したか」が利用者から辿れる (設計原則 4 後半)。
+    pub fn idle_evidence_of(&self, id: u64) -> IdleEvidence {
+        self.monitors
+            .get(&id)
+            .map(|m| m.idle_evidence)
+            .unwrap_or_default()
+    }
+
+    /// **完了通知へ渡す段** — [`crate::notify::WorkGate::note`] の入力はこれ。
+    ///
+    /// 段位付きで出した判定**だけ**を `Some` にする。曖昧なものは `None` を返し、
+    /// 門番に段を動かさせない (前の段のまま = 鳴らない)。
+    ///
+    /// * 走っていない → `None` (プロセスの終了は `SessionEvent::Exited` の担当)
+    /// * 承認待ち / エラー / 異常終了 → `None` (**要対応イベント**であって
+    ///   遷移ではない。専用の通知が別に鳴るので、ここで二重に鳴らさない)
+    /// * 待機だが根拠が [`IdleEvidence::Quiet`] → `None`
+    ///   (**出力が止まっただけでは「終わった」と言わない**)
+    pub fn notify_phase_of(&self, id: u64, running: bool) -> Option<crate::notify::WorkPhase> {
+        use crate::notify::WorkPhase;
+        if !running {
+            return None;
+        }
+        let m = self.monitors.get(&id)?;
+        match m.state {
+            SessionState::Working | SessionState::Stalled | SessionState::Looping => {
+                Some(WorkPhase::Working)
+            }
+            SessionState::Idle => m.idle_evidence.conclusive().then_some(WorkPhase::Idle),
+            SessionState::WaitingApproval
+            | SessionState::Errored
+            | SessionState::Crashed
+            | SessionState::Done => None,
+        }
+    }
+
     /// 状態遷移履歴 (新しい順ではなく古い順、上限付き)。
     pub fn history_of(&self, id: u64) -> Vec<StateTransition> {
         self.monitors
@@ -1953,9 +2075,22 @@ impl Supervisor {
         }
 
         // --- 状態機械の更新 ---
-        let (next_state, reason) = derive_state(prev_state, snap, &samples, &found, &cfg, now_ms);
+        // 上位段 (構造化 / フック / シェル統合) を先に読む。**「終わった」と
+        // 名乗るにはここからの積極的な根拠が要る** — 「出力が止まった」は
+        // 考えている間・API 応答待ちと区別が付かないので根拠にしない。
+        let ladder = self.ladder_read(snap.id, now_ms);
+        let v = derive_state(
+            prev_state,
+            snap,
+            &samples,
+            &found,
+            &cfg,
+            now_ms,
+            ladder.as_ref(),
+        );
         let mon = self.monitors.get_mut(&snap.id).expect("monitor exists");
-        mon.transition(next_state, reason, now_ms);
+        mon.idle_evidence = v.evidence;
+        mon.transition(v.state, v.reason, now_ms);
 
         // --- はしごを昇る ---
         let mut intents = Vec::new();
@@ -2172,7 +2307,56 @@ impl Supervisor {
     }
 }
 
+/// 上位段の判定が「**まだこの回は終わっていない**」と言っているか。
+///
+/// `Failed` はここへ入れない — 失敗は「進行中」でも「完了」でもなく、
+/// 専用の通知 (異常終了) が持つ**事件**なので、段を動かさせない。
+fn ladder_busy(state: ProtoState) -> bool {
+    matches!(
+        state,
+        ProtoState::Starting | ProtoState::Thinking | ProtoState::Running | ProtoState::Editing
+    )
+}
+
+/// 上位段の判定が「**この回は終わった**」と言っているか。
+///
+/// フックの `Stop` / `SessionEnd`、シェル統合 (OSC 133) の `D` がここへ来る。
+/// `Failed` を含めないのは上と同じ理由 (異常終了で完了音を鳴らさない)。
+fn ladder_done(state: ProtoState) -> bool {
+    matches!(state, ProtoState::Idle | ProtoState::Done)
+}
+
+/// 上位段の判定を遷移履歴に出す文にする。
+///
+/// **どの段の言葉かを必ず頭に付ける** — 設計原則 4 の後半
+/// (「今どの段にいるか」を UI から辿れること)。頭が付いていない理由は
+/// 下位段 (画面推定) 由来、という読み方ができる。
+fn ladder_reason(l: &LadderRead) -> String {
+    if l.detail.is_empty() {
+        format!("{}: {}", l.rung.label(), l.state.label())
+    } else {
+        format!("{}: {} ({})", l.rung.label(), l.state.label(), l.detail)
+    }
+}
+
 /// 状態を導出する。異常が出ていればそれを優先。
+///
+/// `ladder` は状態ラダー上位段 ([`Supervisor::ladder_read`]) の判定。
+/// 段が黙っていれば `None` で、そのときの状態判定は導入前と同じ
+/// (シェル統合もフックも入れていない利用者でも壊れない)。
+///
+/// **順序の理由**:
+/// 1. 異常検出 (ループ・エラー多発) は上位段より先 — 上位段が「実行中」と
+///    言ったまま固まる (ツールの中で詰まる) ことがあり、そこで異常を殺すと
+///    いちばん助けが要る場面で黙る。ただし**停滞だけ**は上位段が「終わった」と
+///    言っているときに退く (完了後の画面は当然ずっと止まっているため)。
+/// 2. 上位段が「実行中/思考中」なら**画面が静かでも作業中**。
+///    ここが偽の「完了」の主因だった — 考えている間・API 応答待ち・
+///    ネットワーク待ちで出力が止まっただけで完了扱いになっていた。
+/// 3. 画面に進捗があれば作業中 (上位段の古い「完了」より新しい事実を採る)。
+/// 4. **完了を名乗るには上位段からの積極的な根拠が要る。**
+/// 5. どれも無ければ「静かなだけ」— 状態は `Idle` (かんばん・一括送信の
+///    従来の意味) だが根拠は [`IdleEvidence::Quiet`] なので通知は鳴らない。
 fn derive_state(
     prev: SessionState,
     snap: &SessionSnapshot,
@@ -2180,33 +2364,58 @@ fn derive_state(
     found: &[(Anomaly, String)],
     cfg: &SupervisorConfig,
     now_ms: u64,
-) -> (SessionState, String) {
+    ladder: Option<&LadderRead>,
+) -> StateVerdict {
     if !snap.running {
         if found.iter().any(|(a, _)| *a == Anomaly::Crash) {
-            return (SessionState::Crashed, "作業中にプロセスが終了".into());
+            return StateVerdict::guess(SessionState::Crashed, "作業中にプロセスが終了");
         }
         return match snap.exit_code {
-            Some(0) | None => (SessionState::Done, "正常終了".into()),
-            Some(c) => (SessionState::Errored, format!("終了コード {c}")),
+            Some(0) | None => StateVerdict::guess(SessionState::Done, "正常終了"),
+            Some(c) => StateVerdict::guess(SessionState::Errored, format!("終了コード {c}")),
         };
     }
     if snap.waiting_approval {
-        return (SessionState::WaitingApproval, "承認プロンプト検出".into());
+        return StateVerdict::guess(SessionState::WaitingApproval, "承認プロンプト検出");
     }
+    // 上位段が「この回は終わった」と言っている間は、**停滞だけ**が退く。
+    // 停滞は「画面が止まった」という画面由来の推定で、完了した後の
+    // セッションは当然ずっと止まっている — ここで退かないと、根拠が
+    // 取れている相手でも状態が Stalled のまま完了通知が永久に鳴らない。
+    // ループ / エラー多発は**内容**の話なので退かない。
+    let done = ladder.filter(|l| ladder_done(l.state));
     for want in [Anomaly::Looping, Anomaly::ErrorStorm, Anomaly::Stall] {
+        if want == Anomaly::Stall && done.is_some() {
+            break;
+        }
         if let Some((a, r)) = found.iter().find(|(x, _)| *x == want) {
             if let Some(s) = a.state() {
-                return (s, r.clone());
+                return StateVerdict::guess(s, r.clone());
             }
+        }
+    }
+    // 上位段が「まだ動いている」と言っているなら、画面が静かでも作業中。
+    if let Some(l) = ladder {
+        if ladder_busy(l.state) {
+            return StateVerdict::guess(SessionState::Working, ladder_reason(l));
+        }
+        if l.state == ProtoState::Approval {
+            // 承認待ちは遷移ではなく事件。専用の通知が持つので、ここでは
+            // 「終わっていない」ことだけを記録する (完了音を鳴らさない)。
+            return StateVerdict::guess(SessionState::WaitingApproval, ladder_reason(l));
         }
     }
     // 直近に意味的な進捗があれば作業中
     let idle_win = now_ms.saturating_sub(cfg.sample_interval_ms.saturating_mul(8).max(10_000));
     if changes_in(samples, idle_win, false) > 0 {
-        return (SessionState::Working, "出力に進捗あり".into());
+        return StateVerdict::guess(SessionState::Working, "出力に進捗あり");
+    }
+    // ここから下は「静か」。**完了を名乗るには積極的な根拠が要る。**
+    if let Some(l) = done {
+        return StateVerdict::finished(l.rung, ladder_reason(l));
     }
     let _ = prev;
-    (SessionState::Idle, "出力なし".into())
+    StateVerdict::guess(SessionState::Idle, "出力なし (完了の根拠なし)")
 }
 
 // ---------------------------------------------------------------------------
@@ -3379,14 +3588,15 @@ mod tests {
         let mut s = snap(1, "", false, false);
         s.exit_code = Some(0);
         let f = found(&[(Anomaly::Crash, "作業中に落ちた")]);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &f, &c, 10_000, None).tuple();
         assert_eq!(
             st,
             SessionState::Crashed,
             "Crash 異常は exit_code より優先されるべき: {reason}"
         );
         // 同じ exit_code=0 でも Crash 異常が無ければ正常終了
-        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000, None).tuple();
         assert_eq!(st2, SessionState::Done);
     }
 
@@ -3395,12 +3605,13 @@ mod tests {
         let c = cfg();
         let mut s = snap(1, "", false, false);
         s.exit_code = Some(3);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &[], &c, 10_000, None).tuple();
         assert_eq!(st, SessionState::Errored);
         assert_eq!(reason, "終了コード 3");
         // exit_code 無しの非 running は正常終了扱い
         s.exit_code = None;
-        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000);
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 10_000, None).tuple();
         assert_eq!(st2, SessionState::Done);
     }
 
@@ -3412,7 +3623,8 @@ mod tests {
             (Anomaly::Looping, "ループ中"),
             (Anomaly::ErrorStorm, "エラー多発"),
         ]);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &f, &c, 10_000, None).tuple();
         assert_eq!(
             st,
             SessionState::WaitingApproval,
@@ -3431,15 +3643,18 @@ mod tests {
             (Anomaly::ErrorStorm, "E"),
             (Anomaly::Looping, "L"),
         ]);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &f, &c, 10_000, None).tuple();
         assert_eq!((st, reason.as_str()), (SessionState::Looping, "L"));
         // Looping が無ければ ErrorStorm
         let f = found(&[(Anomaly::Stall, "S"), (Anomaly::ErrorStorm, "E")]);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &f, &c, 10_000, None).tuple();
         assert_eq!((st, reason.as_str()), (SessionState::Errored, "E"));
         // Stall 単独なら Stalled
         let f = found(&[(Anomaly::Stall, "S")]);
-        let (st, reason) = derive_state(SessionState::Working, &s, &[], &f, &c, 10_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &[], &f, &c, 10_000, None).tuple();
         assert_eq!((st, reason.as_str()), (SessionState::Stalled, "S"));
     }
 
@@ -3452,7 +3667,8 @@ mod tests {
             &c,
             false,
         );
-        let (st, reason) = derive_state(SessionState::Idle, &s, &samples, &[], &c, 5_000);
+        let (st, reason) =
+            derive_state(SessionState::Idle, &s, &samples, &[], &c, 5_000, None).tuple();
         assert_eq!(st, SessionState::Working, "{reason}");
     }
 
@@ -3471,11 +3687,336 @@ mod tests {
             &c,
             false,
         );
-        let (st, reason) = derive_state(SessionState::Working, &s, &samples, &[], &c, 30_000);
+        let (st, reason) =
+            derive_state(SessionState::Working, &s, &samples, &[], &c, 30_000, None).tuple();
         assert_eq!(st, SessionState::Idle, "{reason}");
         // サンプルが無い場合も待機
-        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000);
+        let (st2, _) = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000, None).tuple();
         assert_eq!(st2, SessionState::Idle);
+    }
+
+    // ------- 偽の「完了」通知 — 出力が止まっただけでは終わりではない -------
+
+    /// 完了判定の表 1 行:
+    /// (上位段の判定, 期待する状態, 完了を名乗れるか)。
+    type IdleCase = (Option<(Rung, ProtoState)>, SessionState, bool);
+
+    /// 上位段の判定を作るテストヘルパ。
+    fn ladder(rung: Rung, state: ProtoState) -> LadderRead {
+        LadderRead {
+            rung,
+            state,
+            detail: String::new(),
+        }
+    }
+
+    /// **報告された不具合の芯。** 「出力が無い」= 完了、で鳴っていた。
+    ///
+    /// 表の左が上位段の判定、右が「完了を名乗れるか」。
+    /// `true` は 3 行だけ — フックの `Stop` / `SessionEnd`、
+    /// シェル統合 (OSC 133) の `D`。それ以外は**全部鳴らさない**。
+    #[test]
+    fn 出力が止まっただけでは完了の根拠にならない() {
+        let cases: &[IdleCase] = &[
+            // 段が黙っている = 画面が静かなだけ。**これがいちばんの誤爆源だった**
+            (None, SessionState::Idle, false),
+            // 考えている / ツール実行中 / 編集中 — どれも出力が止まるのが普通
+            (
+                Some((Rung::Protocol, ProtoState::Starting)),
+                SessionState::Working,
+                false,
+            ),
+            (
+                Some((Rung::Protocol, ProtoState::Thinking)),
+                SessionState::Working,
+                false,
+            ),
+            (
+                Some((Rung::Hook, ProtoState::Running)),
+                SessionState::Working,
+                false,
+            ),
+            (
+                Some((Rung::Hook, ProtoState::Editing)),
+                SessionState::Working,
+                false,
+            ),
+            // 承認待ちは遷移ではなく事件。専用の通知が持つので二重に鳴らさない
+            (
+                Some((Rung::Hook, ProtoState::Approval)),
+                SessionState::WaitingApproval,
+                false,
+            ),
+            // 異常終了も「完了」ではない (完了音を鳴らさない)
+            (
+                Some((Rung::Shell, ProtoState::Failed)),
+                SessionState::Idle,
+                false,
+            ),
+            // ここだけが本物の完了
+            (
+                Some((Rung::Hook, ProtoState::Idle)),
+                SessionState::Idle,
+                true,
+            ),
+            (
+                Some((Rung::Protocol, ProtoState::Done)),
+                SessionState::Idle,
+                true,
+            ),
+            (
+                Some((Rung::Shell, ProtoState::Idle)),
+                SessionState::Idle,
+                true,
+            ),
+        ];
+        let c = cfg();
+        let s = snap(1, "何も動いていない画面", true, false);
+        for (l, want_state, want_ring) in cases {
+            let l = l.map(|(r, st)| ladder(r, st));
+            // サンプル無し = 画面に進捗が無い状態
+            let v = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000, l.as_ref());
+            assert_eq!(v.state, *want_state, "{l:?} → {}", v.reason);
+            assert_eq!(
+                v.evidence.conclusive(),
+                *want_ring,
+                "{l:?} の根拠 ({}) で鳴らすかを間違えた: {}",
+                v.evidence.label(),
+                v.reason
+            );
+        }
+    }
+
+    /// 根拠の質が理由の文から読めること (設計原則 4 後半)。
+    #[test]
+    fn 判断の根拠が理由の文から辿れる() {
+        let c = cfg();
+        let s = snap(1, "静か", true, false);
+        // 上位段由来なら段の名前が頭に付く
+        let l = LadderRead {
+            rung: Rung::Shell,
+            state: ProtoState::Idle,
+            detail: "cargo test".into(),
+        };
+        let v = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000, Some(&l));
+        assert!(v.reason.starts_with(Rung::Shell.label()), "{}", v.reason);
+        assert!(v.reason.contains("cargo test"), "{}", v.reason);
+        assert_eq!(v.evidence.label(), Rung::Shell.label());
+        // 画面推定由来なら段の名前は付かず、根拠が無いことが読める
+        let v2 = derive_state(SessionState::Working, &s, &[], &[], &c, 30_000, None);
+        assert_eq!(v2.evidence, IdleEvidence::Quiet);
+        assert_eq!(v2.evidence.label(), "画面推定");
+        assert!(v2.reason.contains("完了の根拠なし"), "{}", v2.reason);
+    }
+
+    /// 停滞は「画面が止まった」という画面由来の推定なので、上位段が
+    /// 「終わった」と言っているときは退く。退かないと、根拠が取れている
+    /// 相手でも `Stalled` のまま完了通知が永久に鳴らない。
+    #[test]
+    fn 上位段が完了と言ったら停滞は退くがループは退かない() {
+        let c = cfg();
+        let s = snap(1, "静か", true, false);
+        let l = ladder(Rung::Hook, ProtoState::Idle);
+        let f = found(&[(Anomaly::Stall, "3 分止まっている")]);
+        let v = derive_state(SessionState::Working, &s, &[], &f, &c, 30_000, Some(&l));
+        assert_eq!(v.state, SessionState::Idle, "{}", v.reason);
+        assert!(v.evidence.conclusive());
+        // ループ・エラー多発は内容の話なので退かない (専用通知を殺さない)
+        let f = found(&[(Anomaly::Looping, "同じ手順の反復")]);
+        let v = derive_state(SessionState::Working, &s, &[], &f, &c, 30_000, Some(&l));
+        assert_eq!(
+            (v.state, v.reason.as_str()),
+            (SessionState::Looping, "同じ手順の反復")
+        );
+        assert!(!v.evidence.conclusive(), "ループ中に完了音を鳴らさない");
+    }
+
+    /// `notify::WorkGate` へ渡す段の表。**曖昧なものは全部 `None`**。
+    #[test]
+    fn 通知へ渡す段の表() {
+        use crate::notify::WorkPhase;
+        let mut sv = Supervisor::new(cfg());
+        sv.tick_ms(&[snap(1, "x", true, false)], Approval::Ask, 0);
+        // (状態, 根拠, 走っているか) → 段
+        let cases: &[(SessionState, IdleEvidence, bool, Option<WorkPhase>)] = &[
+            (
+                SessionState::Working,
+                IdleEvidence::Quiet,
+                true,
+                Some(WorkPhase::Working),
+            ),
+            (
+                SessionState::Stalled,
+                IdleEvidence::Quiet,
+                true,
+                Some(WorkPhase::Working),
+            ),
+            (
+                SessionState::Looping,
+                IdleEvidence::Quiet,
+                true,
+                Some(WorkPhase::Working),
+            ),
+            // 根拠のない待機は段を動かさない (= 鳴らない)
+            (SessionState::Idle, IdleEvidence::Quiet, true, None),
+            // 根拠のある待機だけが「完了」
+            (
+                SessionState::Idle,
+                IdleEvidence::Ladder(Rung::Hook),
+                true,
+                Some(WorkPhase::Idle),
+            ),
+            // 要対応イベントは専用の通知が持つ (ここで二重に鳴らさない)
+            (
+                SessionState::WaitingApproval,
+                IdleEvidence::Quiet,
+                true,
+                None,
+            ),
+            (SessionState::Errored, IdleEvidence::Quiet, true, None),
+            (SessionState::Crashed, IdleEvidence::Quiet, true, None),
+            (SessionState::Done, IdleEvidence::Quiet, true, None),
+            // 走っていなければ段は無い (プロセス終了は Exited の担当)
+            (
+                SessionState::Idle,
+                IdleEvidence::Ladder(Rung::Hook),
+                false,
+                None,
+            ),
+        ];
+        for (state, ev, running, want) in cases {
+            let m = sv.monitors.get_mut(&1).expect("monitor");
+            m.state = *state;
+            m.idle_evidence = *ev;
+            assert_eq!(
+                sv.notify_phase_of(1, *running),
+                *want,
+                "{state:?} / {} / running={running}",
+                ev.label()
+            );
+        }
+        // 知らないセッションは段を持たない
+        assert_eq!(sv.notify_phase_of(999, true), None);
+    }
+
+    /// 実際に鳴らす経路 (見張り → 門番) を通した再現。
+    /// **修正前はここで 20 秒目に鳴っていた。**
+    #[test]
+    fn 考えている間の無出力で完了通知が鳴らない() {
+        let mut sv = Supervisor::new(cfg());
+        let mut gate = crate::notify::WorkGate::default();
+        for (t, text) in [(0u64, "step one"), (2_000, "step two")] {
+            sv.tick_ms(&[snap(1, text, true, false)], Approval::Ask, t);
+            gate.note(1, sv.notify_phase_of(1, true));
+        }
+        assert_eq!(sv.state_of(1), Some(SessionState::Working));
+        // 出力が止まる (考えている / API 応答待ち / ネットワーク待ち)
+        for t in [20_000u64, 40_000, 60_000, 120_000] {
+            sv.tick_ms(&[snap(1, "step two", true, false)], Approval::Ask, t);
+            assert!(
+                !gate.note(1, sv.notify_phase_of(1, true)),
+                "{t}ms で偽の完了通知が鳴った"
+            );
+        }
+        // 状態そのものは従来どおり「待機」(かんばん・一括送信の意味) のまま。
+        // 変えたのは**鳴らしてよいかの判断**だけ。
+        assert_eq!(sv.state_of(1), Some(SessionState::Idle));
+        assert_eq!(sv.idle_evidence_of(1), IdleEvidence::Quiet);
+    }
+
+    /// シェル統合を入れていない利用者 (OSC 133 が 1 つも来ない) でも
+    /// 壊れず、そして**誤って鳴らない**。
+    #[test]
+    fn シェル統合が無い相手でも壊れず誤って鳴らない() {
+        let t = crate::shellint::Tracker::new();
+        assert_eq!(
+            t.tier(),
+            crate::shellint::Tier::None,
+            "マーカーが来ていない"
+        );
+        let mut sv = Supervisor::new(cfg());
+        let mut gate = crate::notify::WorkGate::default();
+        let mut s = snap(1, "動いている", true, false);
+        // マーカーが 1 つも来ていない端末は段を出さない
+        s.shell = t.read_now();
+        assert!(s.shell.is_none());
+        sv.tick_ms(&[s.clone()], Approval::Ask, 0);
+        gate.note(1, sv.notify_phase_of(1, true));
+        s.screen_text = "止まった".into();
+        for at in [30_000u64, 90_000] {
+            sv.tick_ms(&[s.clone()], Approval::Ask, at);
+            assert!(
+                !gate.note(1, sv.notify_phase_of(1, true)),
+                "{at}ms で鳴った"
+            );
+        }
+        assert!(sv.ladder_of(1).is_none(), "上位段は黙ったまま");
+    }
+
+    /// OSC 133 の `D` (終了コード付き) が来て**初めて**完了として鳴る。
+    /// 本物の `shellint::Tracker` にマーカーを流して端から端まで通す。
+    #[test]
+    fn osc133の終了マーカーで初めて完了として鳴る() {
+        use crate::shellint::{Marker, Tracker, SHELL_STALE_MS};
+        let mut t = Tracker::new();
+        t.feed_at(Marker::PromptEnd, 0);
+        t.feed_at(Marker::PreExec, 1); // 実行開始。D はまだ来ていない
+        let mut sv = Supervisor::new(cfg());
+        let mut gate = crate::notify::WorkGate::default();
+        let mut s = snap(1, "ビルド中", true, false);
+        s.shell = t.read(2, SHELL_STALE_MS);
+        sv.tick_ms(&[s.clone()], Approval::Ask, 0);
+        assert_eq!(sv.state_of(1), Some(SessionState::Working));
+        assert!(!gate.note(1, sv.notify_phase_of(1, true)));
+        // 画面が静かになっても D の前は鳴らない
+        for at in [30_000u64, 90_000] {
+            s.shell = t.read(at, SHELL_STALE_MS);
+            sv.tick_ms(&[s.clone()], Approval::Ask, at);
+            assert!(
+                !gate.note(1, sv.notify_phase_of(1, true)),
+                "D の前に {at}ms で鳴った"
+            );
+        }
+        // D (終了コード 0) = コマンドが実際に終わったという構造化された事実
+        t.feed_at(Marker::Finished(Some(0)), 100_000);
+        s.shell = t.read(100_100, SHELL_STALE_MS);
+        sv.tick_ms(&[s.clone()], Approval::Ask, 120_000);
+        assert_eq!(sv.idle_evidence_of(1), IdleEvidence::Ladder(Rung::Shell));
+        assert!(
+            gate.note(1, sv.notify_phase_of(1, true)),
+            "D が来ても鳴らなかった"
+        );
+        // 鳴るのは遷移した 1 回だけ (鳴り続けない)
+        sv.tick_ms(&[s], Approval::Ask, 150_000);
+        assert!(!gate.note(1, sv.notify_phase_of(1, true)), "鳴り続けている");
+    }
+
+    /// 終了コードが 0 以外なら「完了」として鳴らさない
+    /// (異常終了は専用の通知が持つ — ここで二重に鳴らさない)。
+    #[test]
+    fn 失敗して終わったコマンドで完了音を鳴らさない() {
+        use crate::shellint::{Marker, Tracker, SHELL_STALE_MS};
+        let mut t = Tracker::new();
+        t.feed_at(Marker::PromptEnd, 0);
+        t.feed_at(Marker::PreExec, 1);
+        t.feed_at(Marker::Finished(Some(101)), 2);
+        let mut sv = Supervisor::new(cfg());
+        let mut gate = crate::notify::WorkGate::default();
+        let mut s = snap(1, "テストが落ちた", true, false);
+        s.shell = t.read(3, SHELL_STALE_MS);
+        assert_eq!(
+            s.shell.as_ref().map(|r| r.state),
+            Some(ProtoState::Failed),
+            "終了コードは事実として読めている"
+        );
+        sv.tick_ms(&[s.clone()], Approval::Ask, 0);
+        gate.note(1, sv.notify_phase_of(1, true));
+        sv.tick_ms(&[s], Approval::Ask, 60_000);
+        assert!(
+            !gate.note(1, sv.notify_phase_of(1, true)),
+            "異常終了で鳴った"
+        );
+        assert!(!sv.idle_evidence_of(1).conclusive());
     }
 
     // ---------------- LLM 診断 → 意図 (intent_from_diagnosis) ----------------

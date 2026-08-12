@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -296,9 +296,22 @@ pub struct Session {
     /// 既定 30 秒 (テストで短縮する)。
     auto_yes_resend_after: Duration,
     /// マウスドラッグによる文字選択: (開始セル, 終了セル)。(row, col) の画面表示座標。
+    ///
+    /// **`sel_abs` を今の画面へ切り取った派生値**であって、真実源ではない。
+    /// 直接書き換えず `set_selection` / `set_selection_abs` / `clear_selection`
+    /// を通すこと (描画側 `cell_selected` / `normalize_sel` はこの派生値を読む)。
     pub selection: Option<((u16, u16), (u16, u16))>,
-    /// ドラッグ選択のアンカー(ドラッグ開始セル)。
-    sel_anchor: Option<(u16, u16)>,
+    /// 文字選択の真実源: (開始, 終了) を**絶対行** (生きている画面の下端から
+    /// 数えた行) で持つ。スクロールしても同じ文字を指し続けるので、
+    /// 一画面を超える選択とスクロール中の選択保持ができる。
+    sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// ドラッグ選択のアンカー(ドラッグ開始セル)。絶対座標。
+    sel_anchor_abs: Option<(usize, u16)>,
+    /// `sel_abs` / `sel_anchor_abs` を記録した時点の [`LineIndex::scrolled`]。
+    ///
+    /// 絶対行は**生きている画面の下端**が起点なので、1 行押し出されるたびに
+    /// 同じ文字を指す値が +1 される。差分がそのまま「進めるべき量」になる。
+    sel_pushed: u64,
     /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
     pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
@@ -317,6 +330,11 @@ pub struct Session {
     /// **画面 (vt100) を 1 文字も見ない**判定の出どころ。マーカーが来なければ
     /// 空のままで、その場合の挙動は導入前と完全に同じ (`Tier::None`)。
     shell: Arc<Mutex<crate::shellint::Tracker>>,
+    /// 端末の通し番号 ([`LineIndex`])。読取スレッドが書き、描画が読む。
+    ///
+    /// **シェル統合の行番号はここが唯一の出どころ。** vt100 は押し出した
+    /// 行数を残さないので、`process` を通した回数ぶんだけ測って積み上げる。
+    lines: Arc<LineIndex>,
     /// アプリが CSI ?1004h でフォーカス通知を要求しているか。
     /// (set_focus 経由でのみ読む。app.rs から呼ばれるまでは未使用)
     #[allow(dead_code)]
@@ -1107,6 +1125,11 @@ pub struct TypedLine {
     buf: String,
     /// この行に再現できない打鍵 (エスケープ列) が混ざったか。
     tainted: bool,
+    /// **チャンク境界で文字を割らないための持ち越し。**
+    /// 打鍵は 1 回の write に収まるとは限らず、日本語 1 文字 (3 バイト) や
+    /// 絵文字 (4 バイト) は途中で切れて届く。ここを lossy で受けると
+    /// `U+FFFD` が本文へ焼き付き、次のバイトが来ても直らない。
+    dec: crate::textenc::StreamDecoder,
 }
 
 /// **打鍵バイト列から「確定した 1 行」を組み立てる (純関数)。**
@@ -1125,10 +1148,12 @@ pub struct TypedLine {
 /// - bracketed paste の囲み … 剥がして中身だけ残す
 /// - その他の制御文字 … 無視
 ///
-/// UTF-8 の途中で切れたバイト列が来ても壊れない (不正な並びは捨てる)。
+/// UTF-8 の途中で切れたバイト列が来ても壊れない。**切れた末尾は置換文字にせず
+/// 次の呼び出しへ持ち越す**ので、「あ」が `\u{FFFD}` として本文に残らない。
+/// 本物の不正な並びは従来どおり置換する (「まだ来ていない」と「壊れている」は別物)。
 pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
     // bracketed paste の囲みを剥がす (中身は普通の文字として扱う)。
-    let text = String::from_utf8_lossy(bytes);
+    let text = st.dec.feed(bytes);
     let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
     let mut out: Option<String> = None;
     let mut chars = text.chars().peekable();
@@ -1623,6 +1648,21 @@ fn base64_decode(src: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// **端末へ流れ込むバイト列の符号化。**
+///
+/// 既定は自動 — UTF-8 を 1 バイトも変えずに素通しし、ISO-2022-JP の切替列を
+/// 実際に見たときだけ変換に入る。CP932 / EUC-JP のように切替列を持たない
+/// 符号化は見ただけではバイナリと区別が付かないので自動では入らない。
+/// `ZAIVERN_TERM_ENCODING` (`cp932` / `euc-jp` / `cp<番号>` / `auto`) で固定できる。
+///
+/// 読めない名前は既定へ落とす — 綴りを間違えた瞬間に端末が使えなくなる方が悪い。
+fn term_encoding() -> crate::textenc::TermEncoding {
+    std::env::var("ZAIVERN_TERM_ENCODING")
+        .ok()
+        .and_then(|s| crate::textenc::term_encoding_by_name(&s))
+        .unwrap_or_default()
+}
+
 /// セッション復元時、再生した前回スクロールバックの末尾へ入れる区切りバナー。
 /// 先頭で代替画面 (?1049) とスクロール領域・文字属性を平常へ戻す — 前回ログが
 /// TUI の途中で切れていても、バナーと今回の出力が壊れずに描かれるようにする。
@@ -1644,8 +1684,15 @@ impl Session {
         if bytes.is_empty() {
             return;
         }
+        // 生ログは PTY のバイト列そのままなので、読取スレッドと**同じ**
+        // 正規化を通す (通さないと復元した画面だけが化ける)。
+        let mut norm = crate::textenc::TermDecoder::new(term_encoding());
         let mut p = lock_ok(&self.parser);
-        p.process(bytes);
+        p.process(norm.feed(bytes));
+        let rest = norm.finish();
+        if !rest.is_empty() {
+            p.process(rest);
+        }
         p.process(RESTORE_BANNER.as_bytes());
     }
 
@@ -1677,7 +1724,7 @@ impl Session {
         let child_pid = child.process_id();
         drop(pair.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 5000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_ROWS)));
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
@@ -1704,6 +1751,7 @@ impl Session {
         };
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
         let shell = Arc::new(Mutex::new(crate::shellint::Tracker::new()));
+        let lines: Arc<LineIndex> = Arc::new(LineIndex::default());
         let focus_reports = Arc::new(AtomicBool::new(false));
         let clipboard_pending: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         // 既定はダークテーマ寄りの色。app.rs から set_report_colors で上書きできる。
@@ -1730,6 +1778,7 @@ impl Session {
             let writer = writer.clone();
             let cursor_shape = cursor_shape.clone();
             let shell = shell.clone();
+            let lines = lines.clone();
             let focus_reports = focus_reports.clone();
             let clipboard_pending = clipboard_pending.clone();
             let report_fg = report_fg.clone();
@@ -1738,48 +1787,108 @@ impl Session {
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut scanner = QueryScanner::default();
+                // PTY のバイト列は UTF-8 とは限らない。ISO-2022-JP の切替列を
+                // vte は「知らないエスケープ」として黙って食べるので、後続の
+                // JIS バイトだけが ASCII として画面に残り `$3$s$K…` になる
+                // (textenc の記録を参照)。vt100 へ渡す前に UTF-8 へ揃える。
+                // 素の UTF-8 は 1 バイトも変えずに素通しする。
+                let mut norm = crate::textenc::TermDecoder::new(term_encoding());
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) | Err(_) => {
+                            // 境界で持ち越したバイトを取り残さない。
+                            let rest = norm.finish();
+                            if !rest.is_empty() {
+                                lock_ok(&parser).process(rest);
+                            }
+                            break;
+                        }
                         Ok(n) => {
                             if let Some(l) = log_sink.as_mut() {
+                                // 生ログは**生のまま**残す (再生時に同じ経路を通す)。
                                 l.write(&buf[..n]);
                             }
-                            // 先に vt100 へ流してから走査する。CSI 6n はアプリが
-                            // 「ここまで描いた」直後に送って返事を待つものなので、
-                            // チャンクを反映し終えたカーソル位置が正解になる。
-                            lock_ok(&parser).process(&buf[..n]);
                             let mut reply: Vec<u8> = Vec::new();
-                            for ev in scanner.scan(&buf[..n]) {
-                                match ev {
-                                    TermEvent::Reply(b) => reply.extend_from_slice(&b),
-                                    TermEvent::CursorReport | TermEvent::ExtCursorReport => {
-                                        let ext = matches!(ev, TermEvent::ExtCursorReport);
-                                        let (r, c) = {
-                                            let p = lock_ok(&parser);
-                                            p.screen().cursor_position()
-                                        };
-                                        reply.extend_from_slice(&cursor_report(r, c, ext));
+                            let mut moved_total = 0u64;
+                            // シェル統合のマーカーで区切って流す。マーカーが
+                            // 無ければ区間は 1 本 = 従来と同じ経路
+                            // (**入れていない利用者は 1 バイトも違わない**)。
+                            for seg in shell_segments(&buf[..n]) {
+                                // 先に vt100 へ流してから走査する。CSI 6n はアプリが
+                                // 「ここまで描いた」直後に送って返事を待つものなので、
+                                // チャンクを反映し終えたカーソル位置が正解になる。
+                                // ついでに押し出された行数を数える (通し番号の素)。
+                                let line = {
+                                    let mut p = lock_ok(&parser);
+                                    // 1 回の process が押し出せる行数は履歴の容量で
+                                    // 頭打ちになる (それ以上は痕跡が消えて数えられ
+                                    // ない)。容量より小さく刻んで必ず数え切る。
+                                    let mut scrolled = lines.scrolled();
+                                    for piece in seg.chunks(FEED_CHUNK) {
+                                        let bytes = norm.feed(piece);
+                                        let (_, moved, sb_len) =
+                                            count_around(&mut p, |p| p.process(bytes));
+                                        moved_total += moved;
+                                        scrolled = lines.advance(moved, sb_len);
                                     }
-                                    TermEvent::CursorShape(s) => {
-                                        cursor_shape.store(s.to_u8(), Ordering::Relaxed);
+                                    // 代替画面 (vim / less / TUI) には履歴が無く、
+                                    // 通し番号を数えられない。**無いものを 0 行目と
+                                    // 偽らない** — 位置抜きで記録する。
+                                    (!p.screen().alternate_screen()).then(|| {
+                                        // 区間はマーカーの終端で切ってあるので、
+                                        // いまのカーソル行がそのままマーカーの行。
+                                        scrolled + u64::from(p.screen().cursor_position().0)
+                                    })
+                                };
+                                for ev in scanner.scan(seg) {
+                                    match ev {
+                                        TermEvent::Reply(b) => reply.extend_from_slice(&b),
+                                        TermEvent::CursorReport | TermEvent::ExtCursorReport => {
+                                            let ext = matches!(ev, TermEvent::ExtCursorReport);
+                                            let (r, c) = {
+                                                let p = lock_ok(&parser);
+                                                p.screen().cursor_position()
+                                            };
+                                            reply.extend_from_slice(&cursor_report(r, c, ext));
+                                        }
+                                        TermEvent::CursorShape(s) => {
+                                            cursor_shape.store(s.to_u8(), Ordering::Relaxed);
+                                        }
+                                        TermEvent::FocusReports(on) => {
+                                            focus_reports.store(on, Ordering::Relaxed);
+                                        }
+                                        TermEvent::Clipboard(s) => {
+                                            *lock_ok(&clipboard_pending) = Some(s);
+                                        }
+                                        TermEvent::ColorQuery(ps) => {
+                                            let rgb =
+                                                if ps == 10 { &report_fg } else { &report_bg }
+                                                    .load(Ordering::Relaxed);
+                                            reply.extend_from_slice(&color_report(ps, rgb));
+                                        }
+                                        // シェル統合。ここでの仕事は小さな構造体を
+                                        // 1 つ積むだけ — 読取スレッドを止めない
+                                        // (設計原則 2)。UI が居なくても記録は進む。
+                                        TermEvent::Shell(m) => {
+                                            let mut t = lock_ok(&shell);
+                                            match line {
+                                                Some(l) => {
+                                                    let now = t.now_ms();
+                                                    t.feed_at_line(m, now, Some(l));
+                                                }
+                                                None => t.feed(m),
+                                            }
+                                        }
                                     }
-                                    TermEvent::FocusReports(on) => {
-                                        focus_reports.store(on, Ordering::Relaxed);
-                                    }
-                                    TermEvent::Clipboard(s) => {
-                                        *lock_ok(&clipboard_pending) = Some(s);
-                                    }
-                                    TermEvent::ColorQuery(ps) => {
-                                        let rgb = if ps == 10 { &report_fg } else { &report_bg }
-                                            .load(Ordering::Relaxed);
-                                        reply.extend_from_slice(&color_report(ps, rgb));
-                                    }
-                                    // シェル統合。ここでの仕事は小さな構造体を
-                                    // 1 つ積むだけ — 読取スレッドを止めない
-                                    // (設計原則 2)。UI が居なくても記録は進む。
-                                    TermEvent::Shell(m) => lock_ok(&shell).feed(m),
                                 }
+                            }
+                            // 履歴から落ちた行を指すブロックを捨てる。
+                            // これをやらないと「もう画面に無い行」を指す
+                            // ブロックが溜まり続ける (行数の上限と件数の
+                            // 上限が食い違う)。窓が動いたときだけでよい。
+                            if moved_total > 0 {
+                                let oldest = lines.oldest_live();
+                                lock_ok(&shell).forget_before(oldest);
                             }
                             if !reply.is_empty() {
                                 writer.send(&reply);
@@ -1844,12 +1953,15 @@ impl Session {
             auto_stall_hash: 0,
             auto_yes_resend_after: Duration::from_secs(30),
             selection: None,
-            sel_anchor: None,
+            sel_abs: None,
+            sel_pushed: 0,
+            sel_anchor_abs: None,
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
             cursor_shape,
             shell,
+            lines,
             focus_reports,
             focus_sent: None,
             clipboard_pending,
@@ -2194,6 +2306,168 @@ impl Session {
         lock_ok(&self.shell).running_command().map(str::to_string)
     }
 
+    // ── シェル統合の描画のための問い合わせ (行番号 ↔ 画面行) ──────────
+
+    /// **いま実際に効いている戻り量。**
+    ///
+    /// `self.scroll` ではなく vt100 に聞く。履歴を戻して見ている最中に出力が
+    /// 来ると、vt100 は同じ文字が同じ位置に見えるよう**自分で戻り量を増やす**
+    /// が、`self.scroll` は `set_scroll` を通ったときしか更新されない。
+    /// 描画 (`draw_screen`) はパーサの値で描くので、こちらに合わせないと
+    /// 印と帯だけが本文からずれる。
+    fn eff_scroll(&self) -> usize {
+        lock_ok(&self.parser).screen().scrollback()
+    }
+
+    /// 画面行 `r` (0 = 最上段) の**通し番号**。
+    ///
+    /// 履歴を戻して見ている間はその戻り量ぶん古い行が見えているので引く。
+    /// **入れるときと問い合わせるときで同じ番号体系**、という `shellint` の
+    /// 唯一の要求はここで守られる。
+    pub fn line_of_row(&self, r: u16) -> u64 {
+        self.line_of_row_at(self.eff_scroll(), r)
+    }
+
+    /// 戻り量を渡す版 (1 回のロックで複数行を引くため)。
+    fn line_of_row_at(&self, scroll: usize, r: u16) -> u64 {
+        self.lines
+            .scrolled()
+            .saturating_sub(scroll as u64)
+            .saturating_add(u64::from(r))
+    }
+
+    /// 通し番号を今の画面行へ戻す。画面の外なら `None`。
+    fn row_of_line_at(&self, scroll: usize, line: u64) -> Option<u16> {
+        let top = self.lines.scrolled().saturating_sub(scroll as u64);
+        let d = line.checked_sub(top)?;
+        (d < u64::from(self.size.0)).then_some(d as u16)
+    }
+
+    /// 通し番号を [`abs_row`] と同じ**下端起点の絶対行**へ写す。
+    /// 選択のコピー経路 (`selection_text_abs`) がこの座標系を使う。
+    fn abs_of_line(&self, line: u64) -> usize {
+        let bottom = self
+            .lines
+            .scrolled()
+            .saturating_add(u64::from(self.size.0).saturating_sub(1));
+        bottom.saturating_sub(line) as usize
+    }
+
+    /// `line` を画面の最上段へ持ってくるための戻り量。
+    fn scroll_for_line(&self, line: u64) -> usize {
+        self.lines.scrolled().saturating_sub(line) as usize
+    }
+
+    /// **前/次のプロンプトへ跳ぶ。** 跳んだら `true`。
+    ///
+    /// 基準は画面の最上段なので、続けて押すと 1 つずつ移動する。
+    /// シェル統合が来ていない端末では候補が 1 つも無いので**常に `false`**
+    /// — 押しても何も起きない (嘘の移動をしない)。
+    pub fn shell_jump_prompt(&mut self, forward: bool) -> bool {
+        let cur = self.line_of_row(0);
+        let target = {
+            let t = lock_ok(&self.shell);
+            if forward {
+                t.next_prompt(cur)
+            } else {
+                t.prev_prompt(cur)
+            }
+        };
+        let Some(line) = target else {
+            return false;
+        };
+        self.set_scroll(self.scroll_for_line(line));
+        true
+    }
+
+    /// 上端に固定表示する「いま見えている出力はどのコマンドのものか」。
+    ///
+    /// コマンド行そのものが画面に見えているときは `None` — 同じものを
+    /// 二重に出さない (VS Code の sticky scroll と同じ条件)。該当が
+    /// 無ければ `None` で、呼び出し側は**帯ごと描かない** (空白を作らない)。
+    pub fn shell_sticky(&self) -> Option<ShellSticky> {
+        let top = self.line_of_row(0);
+        let t = lock_ok(&self.shell);
+        let b = t.block_at(top)?;
+        let l = b.lines?;
+        // コマンド行が見えている = 帯は要らない。
+        if l.command_row() >= top {
+            return None;
+        }
+        let text = crate::shellint::one_line(&b.cmd.command_line, crate::shellint::SUMMARY_CHARS);
+        if text.is_empty() {
+            return None;
+        }
+        Some(ShellSticky {
+            text,
+            ok: b.ok(),
+            prompt: l.prompt,
+            running: l.end.is_none(),
+        })
+    }
+
+    /// いま画面に見えているコマンドの印 (VS Code の command decoration)。
+    ///
+    /// シェル統合が来ていなければ**空** = 1 ピクセルも描かない。
+    /// 行を知らないブロックは黙って飛ばす (「たぶんここ」で印を置かない)。
+    pub fn shell_marks(&self) -> Vec<ShellMark> {
+        let rows = self.size.0;
+        if rows == 0 {
+            return Vec::new();
+        }
+        let scroll = self.eff_scroll();
+        let top = self.line_of_row_at(scroll, 0);
+        let bottom = self.line_of_row_at(scroll, rows - 1);
+        let t = lock_ok(&self.shell);
+        let mut out: Vec<ShellMark> = Vec::new();
+        let mut push = |b: &crate::shellint::CommandBlock| {
+            let Some(l) = b.lines else {
+                return;
+            };
+            let row = l.command_row();
+            if row < top || row > bottom {
+                return;
+            }
+            let Some(r) = self.row_of_line_at(scroll, row) else {
+                return;
+            };
+            out.push(ShellMark {
+                row: r,
+                ok: b.ok(),
+                command: b.cmd.command_line.clone(),
+                summary: b.cmd.summary(),
+                output: l.output_start.map(|s| (s, l.end.unwrap_or(bottom))),
+                running: l.end.is_none(),
+            });
+        };
+        if let Some(b) = t.running_block() {
+            push(b);
+        }
+        // ブロックは prompt の昇順。新しいほうから見て、窓より古くなったら降りる。
+        for b in t.blocks().iter().rev() {
+            match b.lines.map(|l| l.command_row()) {
+                Some(row) if row < top => break,
+                _ => push(b),
+            }
+        }
+        out
+    }
+
+    /// 通し番号の行を画面の最上段へ持ってくる。
+    pub fn shell_scroll_to_line(&mut self, line: u64) {
+        self.set_scroll(self.scroll_for_line(line));
+    }
+
+    /// ブロックの出力を丸ごと文字列にする (履歴をまたいで拾う)。
+    ///
+    /// 範囲は `output_start ..= end` の**通し番号**。まだ画面に残っている
+    /// ぶんだけが取れる (落ちた行は `selection_text_abs` が切り詰める)。
+    pub fn shell_block_output(&self, range: (u64, u64)) -> String {
+        let (a, b) = (self.abs_of_line(range.0), self.abs_of_line(range.1));
+        let mut p = lock_ok(&self.parser);
+        selection_text_abs(&mut p, ((a, 0), (b, u16::MAX)))
+    }
+
     /// アプリが DECSCUSR で指定した現在のカーソル形状。
     ///
     /// Neovim / Helix は挿入モードで縦バーへ切り替える。追従しないと
@@ -2354,7 +2628,15 @@ impl Session {
         // グリッドがずれて「画面が崩れる」ため、遅延側には含めない。
         if self.size != (rows, cols) {
             self.size = (rows, cols);
-            lock_ok(&self.parser).set_size(rows, cols);
+            {
+                // 縮小は**行を履歴へ押し出す** (vendor/vt100 の set_size パッチ)。
+                // 数えないと通し番号と画面行の対応が縮めた行数ぶんずれる。
+                let mut p = lock_ok(&self.parser);
+                let (_, moved, sb_len) = count_around(&mut p, |p| p.set_size(rows, cols));
+                self.lines.advance(moved, sb_len);
+            }
+            // 行数が変われば絶対行 → 画面行の写像も変わる。派生値を取り直す。
+            self.sync_selection();
         }
         if let Some((r, c)) = self.resize_debounce.on_request((rows, cols)) {
             self.ship_resize(r, c);
@@ -2422,7 +2704,7 @@ impl Session {
     pub fn ensure_parser_healthy(&mut self) {
         let (rows, cols) = self.size;
         let (mut p, rebuilt) = crate::lockx::lock_rebuilding(&self.parser, |p| {
-            *p = vt100::Parser::new(rows, cols, 5000);
+            *p = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
         });
         if !rebuilt {
             return;
@@ -2466,28 +2748,136 @@ impl Session {
         });
     }
 
-    pub fn set_scroll(&mut self, n: usize) {
-        if n != self.scroll {
-            // 画面がスクロールすると選択セル座標の指す文字が変わるため解除する
-            self.selection = None;
-            self.sel_anchor = None;
+    /// **出力で画面が流れたぶんを取り込む。**
+    ///
+    /// 履歴を遡って見ている最中に出力が来ると、vt100 は同じ文字が同じ位置に
+    /// 見えるよう**自分の戻り量を増やす** ([`count_around`] が復元する)。
+    /// `self.scroll` は `set_scroll` を通ったときしか動かないので、放置すると
+    ///
+    /// 1. 次のスクロールが古い基準からやり直して**画面が飛ぶ**
+    /// 2. [`abs_row`] の絶対行は下端起点なので、`sel_abs` が**別の文字**を指す。
+    ///    しかも表示は `self.scroll` も同じだけ古いおかげで偶然一致するため、
+    ///    **コピーだけが静かにずれる**(スクロールした瞬間に表示も露見する)
+    ///
+    /// 進める量は戻り量の伸びではなく**押し出した総数**([`LineIndex`])の伸び。
+    /// 履歴が容量に達すると戻り量は頭打ちになるのに、行は流れ続けるため。
+    /// 押し出されて履歴から消えた行はもう追えないので、最古の行で止め、
+    /// 選択が丸ごと落ちたら解除する — **黙って別の場所を指さない。**
+    ///
+    /// 算術そのものは [`adopt_scroll`] (純関数) が持つ。ここは観測値を集めて
+    /// 書き戻すだけ — **実 PTY 無しで表に固定できる形**にしてある。
+    fn adopt_scrolled_output(&mut self) {
+        let out = adopt_scroll(ScrollAdopt {
+            scroll: self.scroll,
+            eff: self.eff_scroll(),
+            sel_pushed: self.sel_pushed,
+            pushed: self.lines.scrolled(),
+            rows: self.size.0,
+            sb_len: self.lines.sb_len(),
+            sel_abs: self.sel_abs,
+            sel_anchor_abs: self.sel_anchor_abs,
+        });
+        self.scroll = out.scroll;
+        self.sel_pushed = out.sel_pushed;
+        self.sel_abs = out.sel_abs;
+        self.sel_anchor_abs = out.sel_anchor_abs;
+        if out.changed {
+            self.sync_selection();
         }
-        self.scroll = n;
-        lock_ok(&self.parser).set_scrollback(n);
     }
 
-    pub fn adjust_scroll(&mut self, delta: i64) {
+    pub fn set_scroll(&mut self, n: usize) {
+        // 先に「出力で流れたぶん」を取り込む。取り込まないと選択が置き去りになる。
+        self.adopt_scrolled_output();
+        // vt100 は履歴より深い戻りを黙って切り詰めるので、実際に効いた量を持つ。
+        // 持たないと「見た目は止まっているのに scroll だけ増える」ので戻すとき空回りする。
+        let eff = {
+            let mut p = lock_ok(&self.parser);
+            p.set_scrollback(n);
+            p.screen().scrollback()
+        };
+        self.scroll = eff;
+        // 選択は絶対座標なので消さない。今の画面へ切り取り直すだけ。
+        self.sync_selection();
+    }
+
+    /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
+    pub fn adjust_scroll(&mut self, delta: i64) -> bool {
+        // 相対量の基準は**いま実際に効いている戻り量**。取り込まずに足すと、
+        // 出力が来ていた場合その行数ぶん画面が飛ぶ。
+        self.adopt_scrolled_output();
+        let before = self.scroll;
         let n = (self.scroll as i64 + delta).max(0) as usize;
         self.set_scroll(n);
+        self.scroll != before
     }
 
-    /// ターミナル画面全体の文字列をすべて選択状態にする (Ctrl+A / Cmd+A)
+    /// 絶対座標の選択を、いま見えている画面の座標へ切り取り直す。
+    fn sync_selection(&mut self) {
+        let rows = self.size.0;
+        let scroll = self.scroll;
+        self.selection = self
+            .sel_abs
+            .and_then(|sel| clip_selection(sel, rows, scroll));
+    }
+
+    /// 画面座標で選択を設定する (今の scroll を基準に絶対座標へ写す)。
+    pub fn set_selection(&mut self, sel: ((u16, u16), (u16, u16))) {
+        // 画面座標 → 絶対座標の基準を最新にしてから写す。
+        self.adopt_scrolled_output();
+        let (rows, scroll) = (self.size.0, self.scroll);
+        let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
+        let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
+        self.set_selection_abs(a, b);
+    }
+
+    /// 絶対座標で選択を設定する。
+    pub fn set_selection_abs(&mut self, a: (usize, u16), b: (usize, u16)) {
+        self.sel_abs = Some((a, b));
+        // 以後のずれはここからの差分で数える。
+        self.sel_pushed = self.lines.scrolled();
+        self.sync_selection();
+    }
+
+    /// **選択範囲の文字列** (コピーの中身そのもの)。選択が無ければ空。
+    ///
+    /// 真実源の絶対座標で取るので、見えている 1 画面には切り詰めない。
+    pub(crate) fn selection_string(&mut self) -> String {
+        // コピーは絶対行でパーサを直に読む。取り込まないとここだけずれる。
+        self.adopt_scrolled_output();
+        let Some(sel) = self.sel_abs else {
+            return String::new();
+        };
+        let mut p = lock_ok(&self.parser);
+        selection_text_abs(&mut p, sel)
+    }
+
+    /// 選択とドラッグアンカーを両方捨てる。
+    pub fn clear_selection(&mut self) {
+        self.sel_abs = None;
+        self.sel_anchor_abs = None;
+        self.selection = None;
+    }
+
+    /// 端末の中身**全部** (スクロールバック履歴 + 現在画面) を選択する
+    /// (Ctrl+A / Cmd+A)。可視画面だけではない。
     pub fn select_all(&mut self) {
-        let p = lock_ok(&self.parser);
-        let (rows, cols) = p.screen().size();
-        if rows > 0 && cols > 0 {
-            self.selection = Some(((0, 0), (rows.saturating_sub(1), cols.saturating_sub(1))));
+        let (max_off, rows, cols) = {
+            let mut p = lock_ok(&self.parser);
+            let saved = p.screen().scrollback();
+            p.set_scrollback(usize::MAX);
+            let max_off = p.screen().scrollback();
+            let (rows, cols) = p.screen().size();
+            p.set_scrollback(saved);
+            (max_off, rows, cols)
+        };
+        if rows == 0 || cols == 0 {
+            return;
         }
+        // 最古の行 = 最大戻り量の窓の最上段。最新の行 = 絶対行 0。
+        let top_abs = max_off + rows as usize - 1;
+        self.sel_anchor_abs = None;
+        self.set_selection_abs((top_abs, 0), (0, cols.saturating_sub(1)));
     }
 
     /// 端末内検索: 次 (forward=true, 新しい方=下) / 前 (古い方=上) のヒットへ。
@@ -3645,10 +4035,23 @@ mod tests {
     }
 
     use super::{
-        all_terminal_lines, input_area_selection, is_image_paste_chord_on, key_bytes, line_hits,
-        mac_agent_input_bytes, normalize_sel, prune_clip_pngs, save_clipboard_png,
-        search_scroll_target, selection_text, word_selection, Session, CLIP_PNG_KEEP,
+        abs_row, all_terminal_lines, autoscroll_step, clip_selection, input_area_selection,
+        is_image_paste_chord_on, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
+        prune_clip_pngs, save_clipboard_png, screen_row, search_scroll_target, selection_text,
+        selection_text_abs, word_selection, Session, CLIP_PNG_KEEP,
     };
+
+    /// 履歴を積んだパーサと「実在する最古の絶対行」を作る。
+    fn history(rows: u16, cols: u16, n: usize) -> (vt100::Parser, usize) {
+        let mut p = vt100::Parser::new(rows, cols, 200);
+        for i in 0..n {
+            p.process(format!("line{:03}\r\n", i).as_bytes());
+        }
+        p.set_scrollback(usize::MAX);
+        let max_abs = p.screen().scrollback() + rows as usize - 1;
+        p.set_scrollback(0);
+        (p, max_abs)
+    }
 
     #[test]
     fn all_terminal_lines_covers_scrollback_and_screen() {
@@ -4060,6 +4463,153 @@ mod tests {
         p.process(b"hello world");
         assert_eq!(selection_text(p.screen(), ((0, 0), (0, 4))), "hello");
         assert_eq!(selection_text(p.screen(), ((0, 6), (0, 10))), "world");
+    }
+
+    #[test]
+    fn abs_row_and_screen_row_are_inverse() {
+        // (画面行, 行数, scroll) → 絶対行。画面の下端が絶対行 scroll。
+        let cases = [
+            ((0u16, 5u16, 0usize), 4usize),
+            ((4, 5, 0), 0),
+            ((0, 5, 10), 14),
+            ((4, 5, 10), 10),
+            ((0, 1, 7), 7),
+        ];
+        for ((r, rows, scroll), want) in cases {
+            assert_eq!(
+                abs_row(r, rows, scroll),
+                want,
+                "abs_row({r},{rows},{scroll})"
+            );
+            assert_eq!(
+                screen_row(want, rows, scroll),
+                Some(r),
+                "screen_row({want})"
+            );
+        }
+        // 画面の外は None
+        assert_eq!(screen_row(5, 5, 0), None); // 1 行ぶん上 (古い)
+        assert_eq!(screen_row(9, 5, 10), None); // 1 行ぶん下 (新しい)
+        assert_eq!(screen_row(0, 0, 0), None); // 行数 0
+                                               // 行数 0 でも panic しない
+        assert_eq!(abs_row(0, 0, 3), 3);
+    }
+
+    #[test]
+    fn clip_selection_clamps_ends_to_the_visible_window() {
+        let rows = 5u16;
+        // 全部見えている (絶対行 4 = 最上段 … 0 = 最下段)
+        assert_eq!(
+            clip_selection(((4, 2), (0, 7)), rows, 0),
+            Some(((0, 2), (4, 7)))
+        );
+        // 逆順で渡しても同じ — 絶対行が「大きい」ほうが画面の上
+        assert_eq!(
+            clip_selection(((0, 7), (4, 2)), rows, 0),
+            Some(((0, 2), (4, 7)))
+        );
+        // 上へはみ出した端は画面の一番上・列 0 で止める
+        assert_eq!(
+            clip_selection(((99, 2), (0, 7)), rows, 0),
+            Some(((0, 0), (4, 7)))
+        );
+        // 下へはみ出した端は画面の一番下・列 u16::MAX で止める
+        assert_eq!(
+            clip_selection(((6, 2), (0, 7)), rows, 3),
+            Some(((1, 2), (4, u16::MAX)))
+        );
+        // 交差しない (全部が画面より上 / 全部が画面より下)
+        assert_eq!(clip_selection(((99, 0), (50, 0)), rows, 0), None);
+        assert_eq!(clip_selection(((1, 0), (0, 0)), rows, 10), None);
+        // 行数 0
+        assert_eq!(clip_selection(((0, 0), (0, 0)), 0, 0), None);
+    }
+
+    #[test]
+    fn autoscroll_step_grows_with_overshoot_and_is_capped() {
+        let cell = 10.0_f32;
+        // (はみ出し px, 期待行数)
+        for (over, want) in [
+            (1.0_f32, 1_i64),
+            (10.0, 1),
+            (11.0, 2),
+            (30.0, 3),
+            (1000.0, 8), // 上限 8 行 — 一瞬で履歴の端まで飛ばさない
+        ] {
+            assert_eq!(autoscroll_step(over, cell), want, "over={over}");
+        }
+        // 退化した入力でも 0 や負を返さない (返すと自動スクロールが止まる)
+        assert_eq!(autoscroll_step(5.0, 0.0), 1);
+        assert_eq!(autoscroll_step(-5.0, 10.0), 1);
+        assert_eq!(autoscroll_step(f32::NAN, 10.0), 1);
+    }
+
+    #[test]
+    fn 画面外ドラッグは自動スクロールで一画面を超えて伸びる() {
+        // handle_mouse_selection と同じ手順を egui 抜きで踏む:
+        // 「スクロールを先に適用 → その scroll で画面セルを絶対座標へ写す」。
+        let rows = 5u16;
+        let mut scroll = 0usize;
+        let anchor = (abs_row(rows - 1, rows, scroll), 0u16); // 最下段で押した
+        assert_eq!(anchor, (0, 0));
+        let mut head = anchor;
+        for _ in 0..12 {
+            scroll += autoscroll_step(1.0, 10.0) as usize; // 上端の外へ 1 行ずつ
+            head = (abs_row(0, rows, scroll), 3);
+        }
+        assert_eq!(head.0, 16);
+        assert!(
+            head.0 >= rows as usize,
+            "一画面 ({rows} 行) を超えて伸びている: {}",
+            head.0
+        );
+        // いま見えている範囲へ切り取ると、下端(アンカー)は画面外なので端で止まる
+        assert_eq!(
+            clip_selection((anchor, head), rows, scroll),
+            Some(((0, 3), (rows - 1, u16::MAX)))
+        );
+    }
+
+    #[test]
+    fn 一画面を超える選択がコピーで全部取れる() {
+        // 実 vt100::Parser に 30 行の履歴を作る (画面は 5 行しかない)。
+        let (mut p, max_abs) = history(5, 20, 30);
+        // 最古の行 (絶対行 max_abs) から最新の行 (絶対行 1) まで =
+        // 30 行 = 6 画面ぶん。従来の selection_text は 5 行しか取れない。
+        let text = selection_text_abs(&mut p, ((max_abs, 0), (1, 19)));
+        let want = (0..30)
+            .map(|i| format!("line{:03}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, want);
+        assert_eq!(
+            text.lines().count(),
+            30,
+            "一画面 (5 行) では収まらない行数が取れている"
+        );
+        // 呼び出し後は scrollback 位置が元 (0) に戻っている
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn selection_text_abs_matches_selection_text_within_one_screen() {
+        let (mut p, _) = history(5, 20, 30);
+        // 画面内だけの選択 (絶対行 3..1 = 画面行 1..3) は従来と一致する
+        let want = selection_text(p.screen(), ((1, 2), (3, 6)));
+        assert_eq!(selection_text_abs(&mut p, ((3, 2), (1, 6))), want);
+        // 端を逆順で渡しても同じ
+        assert_eq!(selection_text_abs(&mut p, ((1, 6), (3, 2))), want);
+        assert_eq!(p.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn selection_text_abs_clamps_beyond_history() {
+        let (mut p, max_abs) = history(5, 20, 30);
+        // 履歴より古い行を指しても panic せず、最古の行から取れる
+        let text = selection_text_abs(&mut p, ((max_abs + 500, 0), (1, 19)));
+        assert!(text.starts_with("line000"), "先頭が最古の行: {text:?}");
+        assert!(text.ends_with("line029"), "末尾が最新の行: {text:?}");
+        assert_eq!(p.screen().scrollback(), 0);
     }
 
     #[test]
@@ -5911,6 +6461,396 @@ fn brighten(c: egui::Color32) -> egui::Color32 {
 
 // ─── 文字選択(マウスドラッグでコピー) ────────────────────────────
 
+/// 画面行 (0 = 最上段) を「生きている画面の下端から数えた絶対行」へ写す。
+///
+/// scroll (スクロールバックの戻り量) が動いても、同じ文字は同じ絶対行を指す。
+/// これが無いと選択は画面座標のままなので、一画面を超えて伸ばせない。
+pub fn abs_row(r: u16, rows: u16, scroll: usize) -> usize {
+    scroll + (rows.saturating_sub(1).saturating_sub(r)) as usize
+}
+
+/// 絶対行を今の画面行へ戻す。画面の外なら None。
+pub fn screen_row(abs: usize, rows: u16, scroll: usize) -> Option<u16> {
+    if rows == 0 {
+        return None;
+    }
+    let d = abs.checked_sub(scroll)?;
+    if d >= rows as usize {
+        return None;
+    }
+    Some(rows - 1 - d as u16)
+}
+
+/// 絶対座標の選択を、いま見えている画面の座標へ切り取る。
+///
+/// 画面外へはみ出した端は画面の端で止める。まったく見えていなければ None。
+/// 画面の並び順は「絶対行が**大きい**ほうが上」なので、行の比較は
+/// `Reverse` を噛ませる (素の `<=` で並べると上下が入れ替わる)。
+pub fn clip_selection(
+    sel: ((usize, u16), (usize, u16)),
+    rows: u16,
+    scroll: usize,
+) -> Option<((u16, u16), (u16, u16))> {
+    if rows == 0 {
+        return None;
+    }
+    let key = |p: (usize, u16)| (std::cmp::Reverse(p.0), p.1);
+    let (start, end) = if key(sel.0) <= key(sel.1) {
+        (sel.0, sel.1)
+    } else {
+        (sel.1, sel.0)
+    };
+    // start = 上端 (絶対行が大きい) / end = 下端 (絶対行が小さい)
+    let win_top = scroll + rows as usize - 1;
+    if end.0 > win_top || start.0 < scroll {
+        return None; // 可視窓 [scroll, win_top] と交差しない
+    }
+    // はみ出した上端は列 0、はみ出した下端は列 u16::MAX でクランプする
+    // (selection_text が e.1.min(last_col) するので MAX でも安全)。
+    let top = match screen_row(start.0, rows, scroll) {
+        Some(r) => (r, start.1),
+        None => (0, 0),
+    };
+    let bottom = match screen_row(end.0, rows, scroll) {
+        Some(r) => (r, end.1),
+        None => (rows - 1, u16::MAX),
+    };
+    Some((top, bottom))
+}
+
+/// 履歴に残っている**最も古い絶対行** (純関数)。
+///
+/// 絶対行は生きている画面の下端起点なので、最大戻り量の窓の最上段が最古 —
+/// つまり `履歴の長さ + 画面行数 - 1`。これは `selection_text_abs` が
+/// 切り詰める上限 (`max_off + rows - 1`) と**同じ値**である。
+pub fn oldest_abs_of(rows: u16, sb_len: usize) -> usize {
+    sb_len.saturating_add(usize::from(rows.saturating_sub(1)))
+}
+
+/// [`adopt_scroll`] の入力 (`Session` の観測値をそのまま写したもの)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollAdopt {
+    /// これまでに取り込み済みの戻り量 (`Session::scroll`)。
+    pub scroll: usize,
+    /// vt100 が**いま実際に効かせている**戻り量 (`Session::eff_scroll`)。
+    pub eff: usize,
+    /// 選択を記録した時点の押し出し総数 (`Session::sel_pushed`)。
+    pub sel_pushed: u64,
+    /// いまの押し出し総数 ([`LineIndex::scrolled`])。
+    pub pushed: u64,
+    /// 画面行数。
+    pub rows: u16,
+    /// 履歴に残っている行数 (戻れる上限)。
+    pub sb_len: usize,
+    /// 選択範囲 (絶対座標)。
+    pub sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// ドラッグ選択のアンカー (絶対座標)。
+    pub sel_anchor_abs: Option<(usize, u16)>,
+}
+
+/// [`adopt_scroll`] の出力。呼び出し側はこの値を書き戻すだけでよい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    /// 新しい戻り量。
+    pub scroll: usize,
+    /// 次に差分を数えるための新しい基準。
+    pub sel_pushed: u64,
+    /// 新しい選択範囲 (`None` = 履歴の外へ出たので解除)。
+    pub sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// 新しいアンカー。
+    pub sel_anchor_abs: Option<(usize, u16)>,
+    /// 画面座標への切り取り直し (`sync_selection`) が要るか。
+    pub changed: bool,
+}
+
+/// **出力で画面が流れたぶんを取り込む算術** (純関数)。
+///
+/// `Session` にも vt100 にも触らないので、実 PTY 無しで表に固定できる
+/// (実 PTY を起こすと ConPTY が読取スレッドを畳まず Windows でだけ落ちた)。
+/// 実体の説明は [`Session::adopt_scrolled_output`] を見ること。
+pub fn adopt_scroll(input: ScrollAdopt) -> Adopted {
+    let ScrollAdopt {
+        mut scroll,
+        eff,
+        sel_pushed,
+        pushed,
+        rows,
+        sb_len,
+        mut sel_abs,
+        mut sel_anchor_abs,
+    } = input;
+    // 減る方向 (代替画面へ入ると履歴が無くなる) は写さない。戻ってきた
+    // ときに元の位置を復元できなくなるため。
+    let mut changed = eff > scroll;
+    if changed {
+        scroll = eff;
+    }
+    let d = usize::try_from(pushed.saturating_sub(sel_pushed)).unwrap_or(usize::MAX);
+    if d > 0 && (sel_abs.is_some() || sel_anchor_abs.is_some()) {
+        changed = true;
+        let oldest = oldest_abs_of(rows, sb_len);
+        if let Some(a) = sel_anchor_abs.as_mut() {
+            a.0 = a.0.saturating_add(d).min(oldest);
+        }
+        if let Some((mut a, mut b)) = sel_abs {
+            a.0 = a.0.saturating_add(d);
+            b.0 = b.0.saturating_add(d);
+            if a.0 > oldest && b.0 > oldest {
+                // 選択していた行は丸ごと履歴の外へ出た。
+                sel_abs = None;
+            } else {
+                // はみ出した端 (絶対行が大きい = 古い) は最古の行の先頭で止める
+                // (`selection_text_abs` の切り詰めと同じ扱い)。
+                if a.0 > oldest {
+                    a = (oldest, 0);
+                }
+                if b.0 > oldest {
+                    b = (oldest, 0);
+                }
+                sel_abs = Some((a, b));
+            }
+        }
+    }
+    Adopted {
+        scroll,
+        sel_pushed: pushed,
+        sel_abs,
+        sel_anchor_abs,
+        changed,
+    }
+}
+
+// ─── シェル統合の通し番号 (OSC 133 の行を記録できる形にする) ──────────────
+
+/// 押し出された行数を数えるための観測点。
+///
+/// # なぜ数える必要があるのか
+///
+/// [`abs_row`] の座標は**生きている画面の下端起点**なので、出力が 1 行増える
+/// たびに同じ文字を指す値が変わる。`shellint` が記録するのは逆向きの
+/// **単調非減少な通し番号**で、両者は `通し番号 = 押し出した総数 + 画面行`
+/// で結ばれる。つまり必要なのは「押し出した総数」ただ 1 つ。
+///
+/// vt100 はそれをどこにも残さない。数えられるのは 2 つだけ —
+/// 1. **履歴の長さの伸び**。容量に達するまでは押し出した行数そのもの。
+/// 2. **戻り量の伸び**。vt100 は履歴を戻して見ている間、同じ文字が同じ位置に
+///    見えるよう 1 スクロールごとに戻り量を +1 する。ただし
+///    **0 のときは加算しない**実装なので、測る側が 1 以上へ留める必要がある。
+///
+/// 容量に達したあとは 1 が 0 になるので 2 だけが効く。逆に履歴が空のうちは
+/// 2 が効かないので 1 だけが効く。**両方を取って大きいほうを採る。**
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScrollProbe {
+    /// 履歴に入っている行数 = `min(押し出した総数, 容量)`。
+    pub sb_len: usize,
+    /// いま何行戻して見ているか。
+    pub offset: usize,
+    /// 代替画面か。代替画面のグリッドは履歴を持たない (容量 0) ので、
+    /// ここで測った 0 を通常画面の値と引き算すると桁違いの嘘が出る。
+    pub alt: bool,
+}
+
+/// 2 つの観測点から**押し出された行数**を出す (純関数)。
+///
+/// `before` は**戻り量を 1 以上へ留めたあと**に取ること (0 のままだと
+/// vt100 が数えてくれない)。留めた量が `pinned` なら、飽和するまでの
+/// 余裕は `容量 - pinned` — だから留める値は小さいほどよい。
+pub fn scrolled_delta(before: ScrollProbe, after: ScrollProbe) -> u64 {
+    // 代替画面は履歴を持たない。出入りの瞬間に引き算すると、抜けた瞬間に
+    // 「通常画面の履歴長ぶん一気にスクロールした」という嘘が出る。
+    // 代替画面の中ではシェルのマーカーは出ないので、数えないで困らない。
+    if before.alt || after.alt {
+        return 0;
+    }
+    let by_len = after.sb_len.saturating_sub(before.sb_len);
+    let by_off = after.offset.saturating_sub(before.offset);
+    by_len.max(by_off) as u64
+}
+
+/// パーサを 1 回動かし、**押し出された行数**と動かしたあとの履歴長を返す。
+///
+/// 呼び出し前の戻り量は必ず元へ戻す — ただし「vt100 が自分で動かしたときと
+/// 同じ値」へ戻す (0 = 最新に貼り付いたまま / 1 以上 = 同じ文字を見続ける)。
+/// ここを素の元値へ戻すと、履歴を見ている最中に出力が来たとき画面が流れる。
+fn count_around<R>(
+    p: &mut vt100::Parser,
+    f: impl FnOnce(&mut vt100::Parser) -> R,
+) -> (R, u64, usize) {
+    let saved = p.screen().scrollback();
+    // 履歴の行数は「戻れる上限」として読める。
+    p.set_scrollback(usize::MAX);
+    let sb_len = p.screen().scrollback();
+    // 1 へ留める (履歴が空なら 0 のまま = 長さの伸びだけで数える)。
+    p.set_scrollback(1);
+    let before = ScrollProbe {
+        sb_len,
+        offset: p.screen().scrollback(),
+        alt: p.screen().alternate_screen(),
+    };
+    let out = f(p);
+    // 長さを測る前に戻り量を読む (set_scrollback が上書きしてしまう)。
+    let offset = p.screen().scrollback();
+    let alt = p.screen().alternate_screen();
+    p.set_scrollback(usize::MAX);
+    let after = ScrollProbe {
+        sb_len: p.screen().scrollback(),
+        offset,
+        alt,
+    };
+    let moved = scrolled_delta(before, after);
+    p.set_scrollback(if saved == 0 {
+        0
+    } else {
+        saved.saturating_add(moved as usize)
+    });
+    (out, moved, after.sb_len)
+}
+
+/// シェル統合マーカー (OSC 133 / 633) の**終端の次**の位置 (純関数)。
+///
+/// ここでバイト列を切ってから vt100 へ流すと、マーカーを見た瞬間の
+/// カーソル位置がそのまま「マーカーの行」になる。切らないと
+/// 「`C` + 出力 8000 行」が 1 回の read で届いたとき、出力の**末尾**を
+/// 出力の**先頭**として記録してしまう。
+///
+/// マーカーが 1 つも無ければ空 = 分割なし。**シェル統合を入れていない
+/// 利用者は 1 バイトも違う経路を通らない。**
+pub fn shell_marker_cuts(bytes: &[u8]) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    let mut i = 0usize;
+    while i + 6 <= bytes.len() {
+        if bytes[i] != 0x1b || bytes[i + 1] != b']' {
+            i += 1;
+            continue;
+        }
+        let ps = &bytes[i + 2..i + 6];
+        if ps != b"133;" && ps != b"633;" {
+            i += 1;
+            continue;
+        }
+        // 終端は BEL か ST (ESC \)。この塊の中で閉じていなければ切らない
+        // (途中で切ると行が 1 つ手前へずれる。次の read で拾い直せばよい)。
+        let mut j = i + 6;
+        let end = loop {
+            match bytes.get(j) {
+                None => break None,
+                Some(0x07) => break Some(j + 1),
+                Some(0x1b) => {
+                    break if bytes.get(j + 1) == Some(&b'\\') {
+                        Some(j + 2)
+                    } else {
+                        None
+                    }
+                }
+                Some(_) => j += 1,
+            }
+        };
+        match end {
+            Some(e) => {
+                cuts.push(e);
+                i = e;
+            }
+            None => break,
+        }
+    }
+    cuts
+}
+
+/// [`shell_marker_cuts`] の切れ目でバイト列を区間へ分ける (純関数)。
+///
+/// 切れ目が無ければ**元の 1 本をそのまま**返す。
+pub fn shell_segments(bytes: &[u8]) -> Vec<&[u8]> {
+    let cuts = shell_marker_cuts(bytes);
+    if cuts.is_empty() {
+        return vec![bytes];
+    }
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut from = 0usize;
+    for c in cuts {
+        out.push(&bytes[from..c]);
+        from = c;
+    }
+    if from < bytes.len() {
+        out.push(&bytes[from..]);
+    }
+    out
+}
+
+/// 上端に固定表示する 1 行 (ターミナルの sticky scroll)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShellSticky {
+    /// 1 行へ丸めたコマンド行。
+    pub text: String,
+    /// 成功したか。終了コード不明なら `None` (印を付けない)。
+    pub ok: Option<bool>,
+    /// 帯を押したときの着地点 (プロンプト行の通し番号)。
+    pub prompt: u64,
+    /// まだ実行中か (下へ開いたまま)。
+    pub running: bool,
+}
+
+/// 画面に見えている 1 コマンドの印 (VS Code の command decoration)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShellMark {
+    /// 印を置く画面行 (0 = 最上段)。
+    pub row: u16,
+    /// 成功したか。`None` は終了コード不明 = **印を付けない**。
+    pub ok: Option<bool>,
+    /// 打たれたコマンド行 (空なら「コマンド行を知らない段」)。
+    pub command: String,
+    /// ホバー/メニューに出す要約。
+    pub summary: String,
+    /// 出力の通し番号の範囲 `(先頭, 末尾)`。まだ出力が始まっていなければ `None`。
+    pub output: Option<(u64, u64)>,
+    /// まだ実行中か (終了コードが来ていない = 下へ開いたまま)。
+    pub running: bool,
+}
+
+/// vt100 に持たせるスクロールバックの行数 (履歴の容量)。
+pub const SCROLLBACK_ROWS: usize = 5000;
+
+/// 1 回の [`vt100::Parser::process`] へ渡すバイト数の上限。
+///
+/// [`count_around`] が数えられるのは**高々「容量 - 留めた量」行**まで
+/// (それ以上は vt100 が古い行を捨てて痕跡が消える)。1 バイトが最大 1 行を
+/// 押し出すので、**容量より小さく刻めば数え損ねない。**
+/// `FEED_CHUNK < SCROLLBACK_ROWS - 1` が成り立つことを
+/// `feed_chunk_fits_in_scrollback` が固定する。
+const FEED_CHUNK: usize = 4096;
+
+/// 端末の**通し番号**。読取スレッドが書き、描画が読む。
+///
+/// `scrolled` は「画面の上へ押し出した総行数」。画面行 `r` (0 = 最上段) の
+/// 通し番号は `scrolled - 戻り量 + r`、履歴の最古は `scrolled - sb_len`。
+#[derive(Debug, Default)]
+pub struct LineIndex {
+    scrolled: AtomicU64,
+    sb_len: AtomicU64,
+}
+
+impl LineIndex {
+    /// 押し出した総行数。
+    pub fn scrolled(&self) -> u64 {
+        self.scrolled.load(Ordering::Relaxed)
+    }
+
+    /// 履歴に残っている行数 (= 戻れる上限)。
+    pub fn sb_len(&self) -> usize {
+        self.sb_len.load(Ordering::Relaxed) as usize
+    }
+
+    /// まだ読める最も古い通し番号。これより古い行はもう存在しない。
+    pub fn oldest_live(&self) -> u64 {
+        self.scrolled()
+            .saturating_sub(self.sb_len.load(Ordering::Relaxed))
+    }
+
+    /// 1 回ぶんの観測を取り込み、取り込んだあとの総行数を返す。
+    fn advance(&self, moved: u64, sb_len: usize) -> u64 {
+        self.sb_len.store(sb_len as u64, Ordering::Relaxed);
+        self.scrolled.fetch_add(moved, Ordering::Relaxed) + moved
+    }
+}
 /// 選択範囲を行優先(row-major)で正規化し、(開始 <= 終了) にして返す。
 fn normalize_sel(sel: ((u16, u16), (u16, u16))) -> ((u16, u16), (u16, u16)) {
     let (a, b) = sel;
@@ -5960,6 +6900,58 @@ fn selection_text(screen: &vt100::Screen, sel: ((u16, u16), (u16, u16))) -> Stri
         out.push_str(line.trim_end());
     }
     out
+}
+
+/// 絶対座標の選択範囲を、**スクロールバックをまたいで**文字列に組み立てる。
+///
+/// 見えている 1 画面しか読めない `selection_text` を、1 画面ぶんずつ
+/// `set_scrollback` して呼び直すことで履歴全体へ広げる。
+/// 呼び出し前の scrollback 位置は必ず元へ戻す (`all_terminal_lines` と同じ作法)。
+fn selection_text_abs(p: &mut vt100::Parser, sel: ((usize, u16), (usize, u16))) -> String {
+    let saved = p.screen().scrollback();
+    p.set_scrollback(usize::MAX);
+    let max_off = p.screen().scrollback();
+    let rows = p.screen().size().0;
+    if rows == 0 {
+        p.set_scrollback(saved);
+        return String::new();
+    }
+    let rows_u = rows as usize;
+    // 実在する最古の行 = 最大戻り量の窓の最上段。ここより古い指定は切り詰める。
+    let max_abs = max_off + rows_u - 1;
+    let key = |q: (usize, u16)| (std::cmp::Reverse(q.0), q.1);
+    let (s0, e0) = if key(sel.0) <= key(sel.1) {
+        (sel.0, sel.1)
+    } else {
+        (sel.1, sel.0)
+    };
+    let top_abs = s0.0.min(max_abs); // 上端 (絶対行が大きい = 古い)
+    let bot_abs = e0.0.min(max_abs); // 下端 (絶対行が小さい = 新しい)
+    let s_col = if s0.0 > max_abs { 0 } else { s0.1 };
+    let e_col = if e0.0 > max_abs { u16::MAX } else { e0.1 };
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur_top = top_abs; // まだ読んでいない中で最も古い絶対行
+    loop {
+        let want = cur_top.saturating_sub(rows_u - 1).max(bot_abs);
+        p.set_scrollback(want);
+        // 履歴より深い戻りは vt100 が切り詰めるので、効いた量で画面行へ写す。
+        let off = p.screen().scrollback();
+        let win_top = off + rows_u - 1;
+        let c_top = win_top.min(cur_top);
+        let c_bot = off.max(bot_abs);
+        let r_top = (win_top - c_top) as u16;
+        let r_bot = (win_top - c_bot) as u16;
+        // 端の列が効くのは選択そのものの端の行だけ。途中の行は行全体。
+        let col0 = if c_top == top_abs { s_col } else { 0 };
+        let col1 = if c_bot == bot_abs { e_col } else { u16::MAX };
+        parts.push(selection_text(p.screen(), ((r_top, col0), (r_bot, col1))));
+        if c_bot <= bot_abs {
+            break;
+        }
+        cur_top = c_bot - 1;
+    }
+    p.set_scrollback(saved);
+    parts.join("\n")
 }
 
 /// (r, c) を含む「空白区切りの語」の範囲を返す(ダブルクリック選択用)。
@@ -6177,13 +7169,7 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
 
 /// 選択範囲をクリップボードへコピーし、フィードバック表示を開始する。
 fn copy_selection(ui: &egui::Ui, session: &mut Session) {
-    let Some(sel) = session.selection else {
-        return;
-    };
-    let text = {
-        let p = lock_ok(&session.parser);
-        selection_text(p.screen(), sel)
-    };
+    let text = session.selection_string();
     if !text.is_empty() {
         ui.ctx().copy_text(text);
         session.copied_at = Some(Instant::now());
@@ -6200,6 +7186,15 @@ fn prompt_path(path: &Path, cwd: &Path) -> String {
         .unwrap_or(&c_path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// ドラッグが画面の外へ出たときに 1 フレームで送る行数。
+/// はみ出すほど速くするが、上限を置かないと一瞬で履歴の端まで飛ぶ。
+fn autoscroll_step(overshoot: f32, cell_h: f32) -> i64 {
+    if !(cell_h > 0.0) || !overshoot.is_finite() || overshoot <= 0.0 {
+        return 1;
+    }
+    ((overshoot / cell_h).ceil() as i64).clamp(1, 8)
 }
 
 /// マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行)。
@@ -6222,33 +7217,58 @@ fn handle_mouse_selection(
     };
     if response.clicked() {
         // クリック(ドラッグなし)で選択解除
-        session.selection = None;
-        session.sel_anchor = None;
+        session.clear_selection();
     }
     if response.drag_started_by(egui::PointerButton::Primary) {
         if let Some(pos) = response.interact_pointer_pos() {
-            session.sel_anchor = Some(to_cell(pos));
-            session.selection = None;
+            let (r, c) = to_cell(pos);
+            session.clear_selection();
+            session.sel_anchor_abs = Some((abs_row(r, rows_n, session.scroll), c));
         }
     }
     if response.dragged_by(egui::PointerButton::Primary) {
-        if let (Some(anchor), Some(pos)) = (session.sel_anchor, response.interact_pointer_pos()) {
-            session.selection = Some((anchor, to_cell(pos)));
+        if let (Some(anchor), Some(pos)) = (session.sel_anchor_abs, response.interact_pointer_pos())
+        {
+            // 画面の外まで引っ張られたら自動でスクロールし、選択を
+            // 一画面を超えて伸ばせるようにする。
+            let top = rect.min.y + padding;
+            let bottom = rect.max.y - padding;
+            let moved = if pos.y < top {
+                session.adjust_scroll(autoscroll_step(top - pos.y, cell_h))
+            } else if pos.y > bottom && session.scroll > 0 {
+                session.adjust_scroll(-autoscroll_step(pos.y - bottom, cell_h))
+            } else {
+                false
+            };
+            if moved {
+                // 押しっぱなしで止まっていても次のフレームを起こす
+                // (起こさないと 1 行ずつしか進まない)。
+                crate::perf::repaint(&response.ctx, "term_sel_autoscroll");
+            }
+            // **スクロールを適用してから**画面セル → 絶対座標へ写す
+            // (順序が逆だと 1 フレームぶん、送った行数だけ選択がずれる)。
+            let (r, c) = to_cell(pos);
+            let head = (abs_row(r, rows_n, session.scroll), c);
+            session.set_selection_abs(anchor, head);
         }
     }
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (r, c) = to_cell(pos);
-            session.selection = {
+            let word = {
                 let p = lock_ok(&session.parser);
                 word_selection(p.screen(), r, c)
             };
+            match word {
+                Some(sel) => session.set_selection(sel),
+                None => session.clear_selection(),
+            }
         }
     }
     if response.triple_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let (r, _) = to_cell(pos);
-            session.selection = Some(((r, 0), (r, cols_n.saturating_sub(1))));
+            session.set_selection(((r, 0), (r, cols_n.saturating_sub(1))));
         }
     }
 }
@@ -6620,8 +7640,8 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     }
     if let Some((sel, text)) = input_select {
         // Ctrl+A の入力欄選択: 選択表示 + 即コピー (⌘C を待たない)
-        session.selection = Some(sel);
-        session.sel_anchor = None;
+        session.set_selection(sel);
+        session.sel_anchor_abs = None;
         ui.ctx().copy_text(text);
         session.copied_at = Some(Instant::now());
     }
@@ -7726,6 +8746,179 @@ fn shell_integration_menu(ui: &mut egui::Ui, session: &mut Session, theme: &Them
     }
 }
 
+// ─── シェル統合の描画 (装飾 / sticky / ジャンプ) ──────────────────────
+
+/// sticky 帯の矩形 (純関数)。**本文の最上行に重ねる。**
+///
+/// 行を 1 本挿し込む形にすると、コマンドが変わるたびに本文が上下する
+/// (「画面が突然変わらない」に反する)。重ねれば本文の座標は 1 ピクセルも
+/// 動かない。本文が 2 行ぶんも取れない小さな端末では `None` —
+/// 帯で画面を埋めてしまわない。
+pub fn shell_sticky_rect(rect: egui::Rect, padding: f32, cell_h: f32) -> Option<egui::Rect> {
+    let w = rect.width() - padding * 2.0;
+    if w <= 0.0 || cell_h <= 0.0 || rect.height() < padding * 2.0 + cell_h * 2.0 {
+        return None;
+    }
+    Some(egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + padding, rect.min.y + padding),
+        egui::vec2(w, cell_h),
+    ))
+}
+
+/// コマンドの印の矩形 (純関数)。**左の余白の中だけ**に収める。
+///
+/// 本文は `rect.min.x + padding` から始まるので、そこへ食い込むと
+/// 1 桁目の選択が奪われる。余白より内側へは絶対に出さない。
+pub fn shell_mark_rect(
+    rect: egui::Rect,
+    padding: f32,
+    cell_h: f32,
+    row: u16,
+) -> Option<egui::Rect> {
+    let w = (padding - 2.0).min(4.0);
+    if w <= 0.0 || cell_h <= 0.0 {
+        return None;
+    }
+    let top = rect.min.y + padding + f32::from(row) * cell_h;
+    if top + cell_h > rect.max.y - padding + 0.5 {
+        return None;
+    }
+    Some(egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + 1.0, top),
+        egui::vec2(w, cell_h),
+    ))
+}
+
+/// 印と帯の色。終了コード不明は**印を付けない** (`None`)。
+fn shell_mark_color(theme: &Theme, ok: Option<bool>, running: bool) -> Option<egui::Color32> {
+    if running {
+        return Some(theme.accent);
+    }
+    match ok {
+        Some(true) => Some(theme.ok),
+        Some(false) => Some(theme.err),
+        None => None,
+    }
+}
+
+/// コマンド装飾 (左の印) と sticky 帯を描く。
+///
+/// **シェル統合が来ていない端末では 1 ピクセルも描かない** — `shell_marks`
+/// が空を返し、`shell_sticky` が `None` を返すので、この関数は
+/// 何もせずに戻る (印も帯も出ない)。
+fn draw_shell_decorations(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    theme: &Theme,
+    rect: egui::Rect,
+    padding: f32,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let marks = session.shell_marks();
+    let sticky = session.shell_sticky();
+    if marks.is_empty() && sticky.is_none() {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    let mut jump_to: Option<u64> = None;
+    let mut copy: Option<(u64, u64)> = None;
+    let mut insert: Option<String> = None;
+
+    for m in &marks {
+        let Some(color) = shell_mark_color(theme, m.ok, m.running) else {
+            continue;
+        };
+        let Some(r) = shell_mark_rect(rect, padding, cell_h, m.row) else {
+            continue;
+        };
+        let res = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r), |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
+            let btn = egui::Button::new("")
+                .fill(color)
+                .rounding(1.5)
+                .min_size(r.size());
+            egui::menu::menu_custom_button(ui, btn, |ui| {
+                ui.label(
+                    egui::RichText::new(ellipsize(&m.summary, 56))
+                        .small()
+                        .color(theme.text_dim),
+                );
+                if m.output.is_some() && ui.button(tr("出力を丸ごとコピー")).clicked() {
+                    copy = m.output;
+                    ui.close_menu();
+                }
+                if !m.command.is_empty()
+                    && ui
+                        .button(tr("もう一度実行する (入力欄へ入れる)"))
+                        .on_hover_text(tr(
+                            "Enter は送りません。誤クリックで消えないものが消える作りにしない",
+                        ))
+                        .clicked()
+                {
+                    insert = Some(m.command.clone());
+                    ui.close_menu();
+                }
+            })
+            .response
+        });
+        res.inner.on_hover_text(ellipsize(&m.summary, 80));
+    }
+
+    if let Some(st) = &sticky {
+        if let Some(band) = shell_sticky_rect(rect, padding, cell_h) {
+            painter.rect_filled(band, 3.0, theme.term_bg.gamma_multiply(0.92));
+            painter.rect_stroke(
+                band,
+                3.0,
+                egui::Stroke::new(1.0_f32, theme.text_dim.gamma_multiply(0.35)),
+            );
+            if let Some(c) = shell_mark_color(theme, st.ok, st.running) {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(band.min, egui::vec2(3.0, band.height())),
+                    1.5,
+                    c,
+                );
+            }
+            let budget = ((band.width() - 10.0) / cell_w).floor().max(1.0) as usize;
+            painter.text(
+                egui::pos2(band.min.x + 8.0, band.center().y),
+                egui::Align2::LEFT_CENTER,
+                ellipsize(&st.text, budget),
+                egui::FontId::proportional((cell_h * 0.72).clamp(9.0, 14.0)),
+                theme.text_dim,
+            );
+            let res = ui.interact(
+                band,
+                ui.id().with(("zv-term-sticky", session.id)),
+                egui::Sense::click(),
+            );
+            if res
+                .on_hover_text(tr(
+                    "いま見えている出力を出したコマンド。クリックでその行へ戻る",
+                ))
+                .clicked()
+            {
+                jump_to = Some(st.prompt);
+            }
+        }
+    }
+
+    if let Some(line) = jump_to {
+        session.shell_scroll_to_line(line);
+    }
+    if let Some(range) = copy {
+        let text = session.shell_block_output(range);
+        if !text.is_empty() {
+            ui.ctx().copy_text(text);
+        }
+    }
+    if let Some(line) = insert {
+        session.write_bytes(line.as_bytes());
+        session.note_user_input();
+    }
+}
+
 /// 表示用に `max` 文字で省略する (全文はホバーで出す)。
 fn ellipsize(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -7808,6 +9001,9 @@ pub fn draw(
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
     // リンクを開いてよいかは「このクリックの前に選択があったか」で変わるが、
     // handle_mouse_selection はクリックで選択を消してしまう。先に控えておく。
+    // 出力で画面が流れたぶんをここで 1 回だけ取り込む。以降この関数の中では
+    // `session.scroll` と `session.selection` が**パーサと同じ現在**を指す。
+    session.adopt_scrolled_output();
     let had_selection = session.selection.is_some();
     if interactive {
         // 押し始めの座標。ドラッグ選択とクリックの見分けに使う。
@@ -7855,6 +9051,9 @@ pub fn draw(
     draw_screen(
         ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,
     );
+
+    // シェル統合の印と sticky 帯。マーカーが来ていなければ何も描かない。
+    draw_shell_decorations(ui, session, theme, rect, padding, cell_w, cell_h);
 
     // リンク (URL / ファイル:行:桁) のホバー表示とクリック。
     // 走査するのはポインタ下の 1 行だけなので、静止中のコストは 0。
@@ -7966,7 +9165,9 @@ pub fn draw(
     // 右クリックメニュー: コピー操作
     if interactive {
         response.context_menu(|ui| {
-            let has_sel = session.selection.is_some();
+            // 判定は真実源 (絶対座標) で。スクロールで画面の外へ出ただけの
+            // 選択まで「無い」にすると、コピーが押せなくなる。
+            let has_sel = session.sel_abs.is_some();
             // 打鍵の表記はベタ書きしない。コピーは egui-winit 固定の打鍵、
             // 検索は再割り当てできるので app 側が配った表記を使う。
             let copy_key = crate::keybinds::format_shortcut(egui::KeyboardShortcut::new(
@@ -7999,8 +9200,7 @@ pub fn draw(
                 ui.close_menu();
             }
             if has_sel && ui.button(tr("✕ 選択を解除")).clicked() {
-                session.selection = None;
-                session.sel_anchor = None;
+                session.clear_selection();
                 ui.close_menu();
             }
             shell_integration_menu(ui, session, theme);
@@ -13050,5 +14250,1025 @@ mod typed_line_tests {
     fn 壊れた_utf8_でも落ちない() {
         let mut st = TypedLine::default();
         let _ = feed_typed_line(&mut st, &[0xff, 0xfe, b'a', b'b', b'\r']);
+    }
+
+    // ───────── チャンク境界の番人 ─────────
+    //
+    // 打鍵・貼り付けは 1 回の write に収まるとは限らない。日本語 1 文字は
+    // 3 バイト、絵文字は 4 バイトなので、境界がその途中に落ちるのは普通に起きる。
+    // ここが lossy だと `U+FFFD` が本文へ焼き付き、**次のバイトが来ても直らない**。
+
+    /// **修正前はここで `Some("\u{fffd}\u{fffd}\u{fffd}本語のしじ")` が返っていた。**
+    /// 総当たり: どこで 2 分割しても、一括で流したのと同じ 1 行になる。
+    #[test]
+    fn 打鍵がどこで割れても同じ本文になる() {
+        let src = "日本語 🎉 café ＡＢ の指示";
+        let bytes = src.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut st = TypedLine::default();
+            let _ = feed_typed_line(&mut st, &bytes[..cut]);
+            let got = feed_typed_line(&mut st, &[&bytes[cut..], b"\r"].concat());
+            assert_eq!(got.as_deref(), Some(src), "cut={cut}");
+        }
+    }
+
+    /// 1 バイトずつ届いても同じ (最悪の割れ方)。
+    #[test]
+    fn 打鍵が一バイトずつ届いても同じ本文になる() {
+        let src = "日本語 🎉 の指示";
+        let mut st = TypedLine::default();
+        for b in src.as_bytes() {
+            assert_eq!(feed_typed_line(&mut st, &[*b]), None);
+        }
+        assert_eq!(feed_typed_line(&mut st, b"\r").as_deref(), Some(src));
+    }
+
+    /// 覚えた本文に置換文字が混ざらない (混ざると自動命名も引き継ぎも化ける)。
+    #[test]
+    fn 覚えた本文に置換文字が残らない() {
+        let src = "絵文字🎉と日本語";
+        let bytes = src.as_bytes();
+        for cut in 1..bytes.len() {
+            let mut st = TypedLine::default();
+            let _ = feed_typed_line(&mut st, &bytes[..cut]);
+            let got =
+                feed_typed_line(&mut st, &[&bytes[cut..], b"\r"].concat()).unwrap_or_default();
+            assert!(!got.contains('\u{fffd}'), "cut={cut} got={got:?}");
+        }
+    }
+}
+
+/// **画面 (vt100) 側のチャンク境界の番人。**
+///
+/// PTY 読み取りスレッドは生バイト列をそのまま `Parser::process` へ流す。
+/// vte の UTF-8 状態機械は呼び出しをまたいで途中の列を覚えるので、
+/// ここは元から割れない — が、「割れない」は**検証されていて初めて事実**であり、
+/// 途中に `from_utf8_lossy` を挟む改変が入った瞬間に壊れる。
+/// その改変を止めるのがこのテスト。
+#[cfg(test)]
+mod screen_boundary_tests {
+    /// 3 バイト・4 バイト・結合文字・全角をわざと混ぜる。
+    /// ASCII だけでは境界問題は再現しない。
+    const SAMPLE: &str = "日本語 🎉 café ＡＢ か\u{3099} 👨\u{200d}👩\u{200d}👧\u{200d}👦";
+
+    fn screen_of(chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 200, 100);
+        for c in chunks {
+            p.process(c);
+        }
+        p.screen().contents()
+    }
+
+    /// 総当たり: どこで 2 分割しても画面が一致し、置換文字が出ない。
+    #[test]
+    fn 画面はどこで割っても同じになる() {
+        let bytes = SAMPLE.as_bytes();
+        let whole = screen_of(&[bytes]);
+        assert!(!whole.contains('\u{fffd}'), "素材からして化けている");
+        for cut in 0..=bytes.len() {
+            let split = screen_of(&[&bytes[..cut], &bytes[cut..]]);
+            assert_eq!(split, whole, "cut={cut} で画面が変わった");
+        }
+    }
+
+    /// 1 バイトずつ流しても同じ画面になる (PTY が最悪の切り方をした場合)。
+    #[test]
+    fn 画面は一バイトずつ流しても同じになる() {
+        let bytes = SAMPLE.as_bytes();
+        let whole = screen_of(&[bytes]);
+        let one: Vec<&[u8]> = bytes.iter().map(std::slice::from_ref).collect();
+        assert_eq!(screen_of(&one), whole);
+    }
+}
+
+/// **端末の文字化けの番人 (画面まで見る)。**
+///
+/// `textenc::TermDecoder` の単体テストは「バイト列が UTF-8 になる」までしか
+/// 見ない。ユーザーが見るのは vt100 の画面なので、**実 `vt100::Parser` に
+/// 流して画面の文字列**で確かめる。修正前はここが `$3$s$K$A$OF|K\8l` だった。
+#[cfg(test)]
+mod term_encoding_screen_tests {
+    use crate::textenc::{TermDecoder, TermEncoding};
+
+    /// ISO-2022-JP の「こんにちは日本語」。`ESC $ B` で JIS X 0208、
+    /// `ESC ( B` で ASCII へ。**実測で `$3$s$K$A$OF|K\8l` になっていた入力そのもの**
+    /// (ひらがなの区の先行バイトが 0x24 = `$` なので `$` が並ぶ)。
+    const ISO2022JP_JA: &[u8] = b"\x1b$B$3$s$K$A$OF|K\\8l\x1b(B";
+    /// CP932 (Shift_JIS) の「日本語」。
+    const CP932_JA: &[u8] = &[0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea];
+    /// EUC-JP の「日本語」。
+    const EUCJP_JA: &[u8] = &[0xc6, 0xfc, 0xcb, 0xdc, 0xb8, 0xec];
+
+    /// 読取スレッドと**同じ経路**で画面を作る (正規化 → `process`)。
+    fn screen_of(enc: TermEncoding, chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        let mut d = TermDecoder::new(enc);
+        for c in chunks {
+            p.process(d.feed(c));
+        }
+        p.process(d.finish());
+        p.screen().contents()
+    }
+
+    /// 正規化を通さない素の画面 (「直った」ことを比較で示すため)。
+    fn raw_screen_of(chunks: &[&[u8]]) -> String {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        for c in chunks {
+            p.process(c);
+        }
+        p.screen().contents()
+    }
+
+    /// **これが報告された不具合そのもの。**
+    #[test]
+    fn iso2022jpの日本語が画面で日本語になる() {
+        // 直す前の姿を先に固定しておく (直った証拠になる)。
+        assert_eq!(raw_screen_of(&[ISO2022JP_JA]), "$3$s$K$A$OF|K\\8l");
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[ISO2022JP_JA]),
+            "こんにちは日本語"
+        );
+    }
+
+    /// どこで割っても同じ画面 (2 分割の総当たり)。
+    #[test]
+    fn iso2022jpは画面もどこで割っても同じになる() {
+        let whole = screen_of(TermEncoding::Auto, &[ISO2022JP_JA]);
+        assert_eq!(whole, "こんにちは日本語");
+        for cut in 0..=ISO2022JP_JA.len() {
+            let split = screen_of(
+                TermEncoding::Auto,
+                &[&ISO2022JP_JA[..cut], &ISO2022JP_JA[cut..]],
+            );
+            assert_eq!(split, whole, "cut={cut} で画面が変わった");
+        }
+        let one: Vec<&[u8]> = ISO2022JP_JA.iter().map(std::slice::from_ref).collect();
+        assert_eq!(screen_of(TermEncoding::Auto, &one), whole, "1 バイトずつ");
+    }
+
+    /// 明示したコードページでも画面が正しい文字になる。
+    /// `encoding_rs` の表を使うので **OS を問わず**同じ結果になる。
+    #[test]
+    fn 明示したコードページでも画面が日本語になる() {
+        assert_eq!(
+            screen_of(TermEncoding::CodePage(932), &[CP932_JA]),
+            "日本語"
+        );
+        assert_eq!(
+            screen_of(TermEncoding::CodePage(51932), &[EUCJP_JA]),
+            "日本語"
+        );
+        for (cp, src) in [(932u32, CP932_JA), (51932, EUCJP_JA)] {
+            for cut in 0..=src.len() {
+                assert_eq!(
+                    screen_of(TermEncoding::CodePage(cp), &[&src[..cut], &src[cut..]]),
+                    "日本語",
+                    "cp={cp} cut={cut}"
+                );
+            }
+        }
+    }
+
+    /// **UTF-8 の画面は 1 ドットも変わらない。** 既存の境界テストと同じ素材で、
+    /// 正規化を挟んだ画面と挟まない画面が一致することを見る。
+    #[test]
+    fn utf8の画面は正規化を挟んでも変わらない() {
+        let sample = "日本語 🎉 café ＡＢ か\u{3099} \x1b[1;32m緑\x1b[0m ok";
+        let bytes = sample.as_bytes();
+        let raw = raw_screen_of(&[bytes]);
+        assert!(!raw.contains('\u{fffd}'), "素材からして化けている");
+        assert_eq!(screen_of(TermEncoding::Auto, &[bytes]), raw);
+        for cut in 0..=bytes.len() {
+            assert_eq!(
+                screen_of(TermEncoding::Auto, &[&bytes[..cut], &bytes[cut..]]),
+                raw,
+                "cut={cut}"
+            );
+        }
+    }
+
+    /// バイナリを `cat` した画面も変わらない (素通しなので当然、が番人)。
+    #[test]
+    fn バイナリを流した画面は正規化を挟んでも変わらない() {
+        let mut bin: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut x: u32 = 20260812;
+        for _ in 0..2000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            bin.push((x >> 16) as u8);
+        }
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[&bin]),
+            raw_screen_of(&[&bin])
+        );
+    }
+
+    /// TUI が使う列 (DEC 罫線 / 代替画面 / OSC タイトル) を壊さない。
+    #[test]
+    fn tuiの制御列を壊さない() {
+        let src: &[u8] = b"\x1b]0;title\x07\x1b[?1049h\x1b(0qqqj\x1b(B\x1b[31mred\x1b[0m";
+        assert_eq!(
+            screen_of(TermEncoding::Auto, &[src]),
+            raw_screen_of(&[src]),
+            "正規化で画面が変わった"
+        );
+    }
+
+    /// 環境変数の入口が生きている (読めない名前は既定へ落ちる)。
+    #[test]
+    fn 端末の符号化の名前を解釈できる() {
+        use crate::textenc::term_encoding_by_name as by;
+        assert_eq!(by("auto"), Some(TermEncoding::Auto));
+        assert_eq!(by("cp932"), Some(TermEncoding::CodePage(932)));
+        assert_eq!(by("でたらめ"), None);
+    }
+}
+
+// ─── シェル統合: 通し番号と描画のテスト ────────────────────────────
+
+#[cfg(test)]
+mod shell_line_tests {
+    use super::{
+        count_around, scrolled_delta, shell_mark_color, shell_mark_rect, shell_marker_cuts,
+        shell_segments, shell_sticky_rect, LineIndex, ScrollProbe, FEED_CHUNK, SCROLLBACK_ROWS,
+    };
+    use crate::shellint::{Marker, Tracker};
+
+    fn probe(sb_len: usize, offset: usize) -> ScrollProbe {
+        ScrollProbe {
+            sb_len,
+            offset,
+            alt: false,
+        }
+    }
+
+    #[test]
+    fn feed_chunk_fits_in_scrollback() {
+        // 1 バイトが最大 1 行を押し出すので、刻み幅が容量未満なら
+        // 「留めた 1 行 + 刻み幅」が容量を超えない = 必ず数え切れる。
+        assert!(
+            FEED_CHUNK + 1 <= SCROLLBACK_ROWS,
+            "刻み幅が容量を超えている"
+        );
+    }
+
+    #[test]
+    fn scrolled_delta_reads_length_growth_and_offset_growth() {
+        // 履歴がまだ空 → 戻り量は動かない。長さの伸びだけが答え。
+        assert_eq!(scrolled_delta(probe(0, 0), probe(7, 0)), 7);
+        // 容量に達していない間は両方が同じ値を出す。
+        assert_eq!(scrolled_delta(probe(10, 1), probe(14, 5)), 4);
+        // 満杯 (長さが動かない) → 戻り量だけが効く。**ここが本番。**
+        assert_eq!(scrolled_delta(probe(5000, 1), probe(5000, 41)), 40);
+        // 何も起きていない。
+        assert_eq!(scrolled_delta(probe(5000, 1), probe(5000, 1)), 0);
+        // 逆行 (履歴が縮む) は 0 に留める。負の通し番号は作らない。
+        assert_eq!(scrolled_delta(probe(30, 4), probe(10, 1)), 0);
+    }
+
+    #[test]
+    fn scrolled_delta_never_counts_across_the_alternate_screen() {
+        // 代替画面のグリッドは履歴を持たない (容量 0)。抜けた瞬間に
+        // 通常画面の履歴長と引き算すると「一気に 5000 行流れた」と出る。
+        let alt = ScrollProbe {
+            sb_len: 0,
+            offset: 0,
+            alt: true,
+        };
+        assert_eq!(scrolled_delta(alt, probe(5000, 0)), 0);
+        assert_eq!(scrolled_delta(probe(5000, 1), alt), 0);
+    }
+
+    /// 実際の vt100 を回して「押し出した行数」が合うことを見る。
+    /// **容量より多く流す**ので、飽和したあとも数えられていることの証明になる。
+    fn count_lines(cap: usize, rows: u16, total: usize, per_call: usize) -> u64 {
+        let mut p = vt100::Parser::new(rows, 20, cap);
+        let idx = LineIndex::default();
+        let mut bytes = Vec::new();
+        for i in 0..total {
+            bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        for piece in bytes.chunks(per_call) {
+            let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
+            idx.advance(moved, sb_len);
+        }
+        idx.scrolled()
+    }
+
+    #[test]
+    fn scrolled_count_survives_a_full_scrollback() {
+        // 画面 5 行なので、k 行送ると押し出されるのは k - (5 - 1)。
+        // 容量 8 = 100 行流せば必ず飽和する。飽和しても数え続けること。
+        assert_eq!(count_lines(8, 5, 100, 16), 96);
+        // 刻みを変えても同じ答え (刻み幅 < 容量 である限り)。
+        assert_eq!(count_lines(8, 5, 100, 7), 96);
+        // 容量に一度も届かない場合。
+        assert_eq!(count_lines(5000, 5, 100, 64), 96);
+    }
+
+    #[test]
+    fn scrolled_count_restores_the_users_scroll_position() {
+        let mut p = vt100::Parser::new(5, 20, 100);
+        for i in 0..40 {
+            let _ = count_around(&mut p, |p| p.process(format!("l{i}\r\n").as_bytes()));
+        }
+        // 最新に貼り付いたまま = 0 のまま。
+        assert_eq!(p.screen().scrollback(), 0);
+        // 履歴を戻して見ている間は、同じ文字が同じ位置に見えるよう
+        // vt100 自身が戻り量を増やす。測定がその挙動を壊さないこと。
+        p.set_scrollback(10);
+        let before = p.screen().contents();
+        let (_, moved, _) = count_around(&mut p, |p| p.process(b"x\r\ny\r\n"));
+        assert_eq!(moved, 2);
+        assert_eq!(p.screen().scrollback(), 12);
+        assert_eq!(p.screen().contents(), before, "見ている画面が流れた");
+    }
+
+    #[test]
+    fn marker_cuts_split_right_after_the_terminator() {
+        // マーカーが 1 つも無ければ**切らない** (= 従来と同じ 1 本)。
+        let plain = b"hello\r\nworld\r\n";
+        assert!(shell_marker_cuts(plain).is_empty());
+        assert_eq!(shell_segments(plain), vec![&plain[..]]);
+        // BEL 終端。
+        let bel = b"a\x1b]133;C\x07out";
+        assert_eq!(shell_marker_cuts(bel), vec![9]);
+        assert_eq!(shell_segments(bel), vec![&bel[..9], &bel[9..]]);
+        // ST 終端 + OSC 633。
+        let st = b"\x1b]633;E;ls\x1b\\rest";
+        assert_eq!(shell_marker_cuts(st), vec![12]);
+        // 2 つ並んでいれば 2 回切る。
+        let two = b"\x1b]133;D;0\x07\x1b]133;A\x07$ ";
+        assert_eq!(shell_marker_cuts(two), vec![10, 18]);
+        // 閉じていないものは切らない (次の read で拾い直す)。
+        assert!(shell_marker_cuts(b"x\x1b]133;A").is_empty());
+        // 関係の無い OSC (52 / 10) では切らない。
+        assert!(shell_marker_cuts(b"\x1b]52;c;YQ==\x07").is_empty());
+    }
+
+    #[test]
+    fn sticky_band_hides_itself_when_the_terminal_is_too_short() {
+        let r =
+            |w: f32, h: f32| egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(w, h));
+        // 本文が 2 行ぶん取れない = 帯で画面を埋めてしまう → 出さない。
+        assert!(shell_sticky_rect(r(400.0, 24.0), 6.0, 17.0).is_none());
+        assert!(shell_sticky_rect(r(4.0, 400.0), 6.0, 17.0).is_none());
+        let band = shell_sticky_rect(r(400.0, 400.0), 6.0, 17.0).expect("出るはず");
+        assert_eq!(band.height(), 17.0);
+        assert!(
+            r(400.0, 400.0).contains_rect(band),
+            "帯が領域からはみ出した"
+        );
+    }
+
+    #[test]
+    fn marks_stay_inside_the_left_padding_and_never_overlap() {
+        // 極端な大きさでも (1) 領域内に収まる (2) 互いに重ならない
+        // (3) 本文の 1 桁目 (rect.min.x + padding) へ食い込まない。
+        for (w, h) in [(900.0_f32, 700.0_f32), (1200.0, 300.0), (140.0, 60.0)] {
+            let rect = egui::Rect::from_min_size(egui::pos2(3.0, 7.0), egui::vec2(w, h));
+            let (padding, cell_h) = (6.0_f32, 17.0_f32);
+            let mut prev: Option<egui::Rect> = None;
+            for row in 0..40u16 {
+                let Some(m) = shell_mark_rect(rect, padding, cell_h, row) else {
+                    continue;
+                };
+                assert!(rect.contains_rect(m), "{w}x{h} row{row}: 領域外");
+                assert!(
+                    m.max.x <= rect.min.x + padding,
+                    "{w}x{h} row{row}: 本文へ食い込んだ"
+                );
+                if let Some(q) = prev {
+                    assert!(q.max.y <= m.min.y, "{w}x{h} row{row}: 印が重なった");
+                }
+                prev = Some(m);
+            }
+        }
+        // 帯と印は縦に重なるが、横は決して重ならない (帯は本文側にある)。
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 700.0));
+        let band = shell_sticky_rect(rect, 6.0, 17.0).expect("出るはず");
+        let mark = shell_mark_rect(rect, 6.0, 17.0, 0).expect("出るはず");
+        assert!(mark.max.x <= band.min.x, "印と帯が重なった");
+    }
+
+    #[test]
+    fn an_unknown_exit_code_gets_no_mark_at_all() {
+        let th = crate::theme::by_name("dark");
+        // 終了コード不明 = 印を付けない (誤った印を出さない)。
+        assert!(shell_mark_color(&th, None, false).is_none());
+        assert!(shell_mark_color(&th, Some(true), false).is_some());
+        assert!(shell_mark_color(&th, Some(false), false).is_some());
+        // 実行中は「まだ分からない」を色で出す (成功でも失敗でもない)。
+        assert!(shell_mark_color(&th, None, true).is_some());
+    }
+
+    /// OSC 133 を出さないシェル = マーカーが 1 つも来ない。
+    #[test]
+    fn without_shell_integration_there_is_nothing_to_draw() {
+        let t = Tracker::new();
+        assert!(t.blocks().is_empty());
+        assert!(t.running_block().is_none());
+        // 印も帯もジャンプ先も、どの行を聞いても出てこない。
+        for line in [0u64, 1, 7, 4096, u64::MAX / 2] {
+            assert!(t.block_at(line).is_none(), "line {line} に印が出た");
+            assert!(t.prev_prompt(line).is_none(), "line {line} で上へ跳べた");
+            assert!(t.next_prompt(line).is_none(), "line {line} で下へ跳べた");
+        }
+    }
+
+    /// 行番号を渡していない経路 (行を数えられない呼び出し側) でも、
+    /// 位置を捏造しない = 印も帯も出ない。
+    #[test]
+    fn markers_without_line_numbers_never_produce_a_position() {
+        let mut t = Tracker::new();
+        t.feed_at(Marker::PromptStart, 0);
+        t.feed_at(Marker::PromptEnd, 1);
+        t.feed_at(Marker::PreExec, 2);
+        t.feed_at(Marker::Finished(Some(0)), 3);
+        assert_eq!(t.blocks().len(), 1, "コマンド自体は記録される");
+        assert!(t.blocks()[0].lines.is_none(), "位置を捏造した");
+        assert!(t.block_at(0).is_none());
+        assert!(t.prev_prompt(u64::MAX).is_none());
+    }
+
+    /// ジャンプ先の決定: 画面最上段を基準に、前/次のプロンプトへ 1 つずつ。
+    #[test]
+    fn prompt_jump_targets_are_the_neighbouring_prompts() {
+        let mut t = Tracker::new();
+        // 3 つのコマンドを 10 / 30 / 50 行目のプロンプトで置く。
+        for (i, at) in [10u64, 30, 50].into_iter().enumerate() {
+            t.feed_at_line(Marker::PromptStart, i as u64 * 10, Some(at));
+            t.feed_at_line(Marker::PromptEnd, i as u64 * 10, Some(at));
+            t.feed_at_line(Marker::PreExec, i as u64 * 10, Some(at + 1));
+            t.feed_at_line(Marker::Finished(Some(0)), i as u64 * 10, Some(at + 9));
+        }
+        assert_eq!(t.prev_prompt(50), Some(30));
+        assert_eq!(t.prev_prompt(30), Some(10));
+        assert_eq!(t.prev_prompt(10), None, "いちばん上より先は無い");
+        assert_eq!(t.next_prompt(10), Some(30));
+        assert_eq!(t.next_prompt(30), Some(50));
+        assert_eq!(t.next_prompt(50), None, "いちばん下より先は無い");
+        // 出力の途中 (35 行目) からでも上下の境界へ跳べる。
+        assert_eq!(t.prev_prompt(35), Some(30));
+        assert_eq!(t.next_prompt(35), Some(50));
+        // sticky の中身: その行を含むブロックが引ける。
+        assert_eq!(
+            t.block_at(35).and_then(|b| b.lines).map(|l| l.prompt),
+            Some(30)
+        );
+        // どのブロックにも属さない行では帯を出さない。
+        assert!(t.block_at(0).is_none());
+    }
+
+    /// 履歴から落ちた行のブロックを忘れること (窓と整合させる)。
+    #[test]
+    fn blocks_older_than_the_live_window_are_forgotten() {
+        let mut t = Tracker::new();
+        for i in 0..5u64 {
+            let at = i * 10;
+            t.feed_at_line(Marker::PromptStart, at, Some(at));
+            t.feed_at_line(Marker::PromptEnd, at, Some(at));
+            t.feed_at_line(Marker::PreExec, at, Some(at + 1));
+            t.feed_at_line(Marker::Finished(Some(0)), at, Some(at + 5));
+        }
+        assert_eq!(t.blocks().len(), 5);
+        // 25 行目より古い行はもう存在しない → 0/10 のブロックを忘れる。
+        assert_eq!(t.forget_before(25), 2);
+        assert_eq!(t.blocks().len(), 3);
+        assert_eq!(t.oldest_indexed_line(), Some(20));
+        assert!(t.gap_note().is_some(), "捨てたことを黙っている");
+    }
+    /// **読取スレッドと同じ手順**でバイト列を通し、記録された行が本当の
+    /// 画面行と合うことを見る。単体の純関数が全部緑でも、繋ぎ方を間違えると
+    /// ここだけが落ちる (CLAUDE.md「実バイナリを回さないと分からない回帰」)。
+    fn run_pipeline(rows: u16, cap: usize, chunks: &[&[u8]]) -> (Tracker, u64) {
+        let mut p = vt100::Parser::new(rows, 40, cap);
+        let mut scanner = super::QueryScanner::default();
+        let idx = LineIndex::default();
+        let mut t = Tracker::new();
+        let mut clock = 0u64;
+        for chunk in chunks {
+            for seg in shell_segments(chunk) {
+                let mut scrolled = idx.scrolled();
+                for piece in seg.chunks(FEED_CHUNK) {
+                    let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
+                    scrolled = idx.advance(moved, sb_len);
+                }
+                let line = (!p.screen().alternate_screen())
+                    .then(|| scrolled + u64::from(p.screen().cursor_position().0));
+                for ev in scanner.scan(seg) {
+                    if let super::TermEvent::Shell(m) = ev {
+                        clock += 1;
+                        t.feed_at_line(m, clock, line);
+                    }
+                }
+            }
+            if idx.scrolled() > 0 {
+                t.forget_before(idx.oldest_live());
+            }
+        }
+        (t, idx.scrolled())
+    }
+
+    #[test]
+    fn osc133_markers_land_on_the_rows_they_were_printed_on() {
+        // 画面 10 行。プロンプト → コマンド → 出力 3 行 → 終了。
+        let (t, _) = run_pipeline(
+            10,
+            5000,
+            &[b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07"],
+        );
+        assert_eq!(t.blocks().len(), 1);
+        let l = t.blocks()[0].lines.expect("行が付いていない");
+        assert_eq!(l.prompt, 0, "プロンプトは 0 行目");
+        assert_eq!(l.input, Some(0), "1 行プロンプトなので入力も 0 行目");
+        assert_eq!(l.output_start, Some(1), "出力は 1 行目から");
+        assert_eq!(l.end, Some(4), "a/b/c を出して 4 行目で終わる");
+        assert_eq!(t.blocks()[0].ok(), Some(true));
+        // sticky: 出力の途中はこのブロックのもの。
+        assert_eq!(
+            t.block_at(2).and_then(|b| b.lines).map(|l| l.prompt),
+            Some(0)
+        );
+        // OSC 133 だけの段ではコマンド行が来ない (来ないものを捏造しない)。
+        assert_eq!(t.blocks()[0].cmd.command_line, "");
+        // プロンプトより前 (存在しない行) では帯を出さない。
+        assert!(t.block_at(9).is_none());
+    }
+
+    #[test]
+    fn a_huge_output_in_one_read_does_not_drag_the_start_marker_to_its_end() {
+        // `C` と 300 行の出力が **1 回の read** で届く形。区切らずに流すと
+        // 「出力の先頭」が出力の**末尾**として記録される (最も痛い誤り)。
+        let mut chunk = b"\x1b]133;A\x07$ \x1b]133;B\x07seq\r\n\x1b]133;C\x07".to_vec();
+        for i in 0..300 {
+            chunk.extend_from_slice(format!("{i}\r\n").as_bytes());
+        }
+        chunk.extend_from_slice(b"\x1b]133;D;0\x07");
+        let (t, scrolled) = run_pipeline(10, 5000, &[&chunk]);
+        let l = t.blocks()[0].lines.expect("行が付いていない");
+        assert_eq!(l.prompt, 0);
+        assert_eq!(l.output_start, Some(1), "出力の先頭が末尾へずれた");
+        assert_eq!(l.end, Some(301), "出力 300 行 + コマンド行");
+        // 画面 10 行なので 301 - 9 行が押し出されている。
+        assert_eq!(scrolled, 292);
+        // 出力の途中を指しても、ちゃんとこのコマンドが引ける。
+        assert_eq!(
+            t.block_at(150).and_then(|b| b.lines).map(|l| l.prompt),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn two_line_prompts_keep_the_prompt_row_and_the_input_row_apart() {
+        // powerlevel10k のような 2 行プロンプト: A のあと改行してから B。
+        let (t, _) = run_pipeline(
+            10,
+            5000,
+            &[b"\x1b]133;A\x07top\r\n\xe2\x9d\xaf \x1b]133;B\x07id\r\n\x1b]133;C\x07u\r\n\x1b]133;D;1\x07"],
+        );
+        let l = t.blocks()[0].lines.expect("行が付いていない");
+        assert_eq!(l.prompt, 0, "A はプロンプトの 1 行目");
+        assert_eq!(l.input, Some(1), "B は 2 行目");
+        assert_eq!(l.output_start, Some(2));
+        assert_eq!(t.blocks()[0].ok(), Some(false), "終了コード 1 は失敗");
+        // ジャンプの着地点はプロンプトの先頭 (A) であって B ではない。
+        assert_eq!(t.prev_prompt(5), Some(0));
+    }
+
+    #[test]
+    fn markers_split_across_two_reads_are_still_recorded() {
+        // OSC が read の境界で割れる形。区切りは見つけられないが、
+        // 走査側の pending が拾うので**記録は落ちない**。
+        let (t, _) = run_pipeline(
+            10,
+            5000,
+            &[
+                b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]13",
+                b"3;C\x07x\r\n\x1b]133;D;0\x07",
+            ],
+        );
+        assert_eq!(t.blocks().len(), 1);
+        let l = t.blocks()[0].lines.expect("行が付いていない");
+        assert_eq!(l.prompt, 0);
+        assert_eq!(l.end, Some(2));
+    }
+
+    #[test]
+    fn the_line_index_keeps_working_after_the_scrollback_is_full() {
+        // 容量 20 行に対し 200 行のコマンドを 40 本。飽和後も
+        // 行が進み続け、落ちた行のブロックは忘れられていること。
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        for i in 0..40 {
+            let mut c = b"\x1b]133;A\x07$ \x1b]133;B\x07".to_vec();
+            c.extend_from_slice(format!("\x1b]633;E;cmd{i}\x07cmd{i}\r\n").as_bytes());
+            c.extend_from_slice(b"\x1b]133;C\x07");
+            for k in 0..5 {
+                c.extend_from_slice(format!("out{i}-{k}\r\n").as_bytes());
+            }
+            c.extend_from_slice(b"\x1b]133;D;0\x07");
+            chunks.push(c);
+        }
+        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let (t, scrolled) = run_pipeline(10, 20, &refs);
+        // 40 本 × 6 行 = 240 行。画面 10 行ぶんが残る。
+        assert_eq!(scrolled, 240 - 9);
+        // 直近のブロックは行を持ち、いちばん新しいプロンプトが引ける。
+        let last = t.blocks().last().expect("空になった");
+        let l = last.lines.expect("飽和後に行が消えた");
+        assert_eq!(last.cmd.command_line, "cmd39");
+        assert_eq!(l.prompt, 234, "飽和後も通し番号が進んでいない");
+        // 履歴から落ちた行のブロックは忘れている。**残っているものは
+        // すべて、まだ生きている窓に末尾が掛かっている**のが不変条件。
+        let oldest_live = scrolled - 20; // 履歴の容量ぶんだけ遡れる
+        for b in t.blocks() {
+            let l = b.lines.expect("索引から落ちた");
+            assert!(
+                l.end.is_some_and(|e| e >= oldest_live),
+                "もう画面に無い行を指すブロックが残っている: {l:?}"
+            );
+        }
+        assert!(
+            t.blocks().len() < 10,
+            "忘れていない ({} 件)",
+            t.blocks().len()
+        );
+        assert!(t.gap_note().is_some(), "捨てたことを黙っている");
+    }
+}
+
+// ─── 選択と「出力で流れた画面」のずれ ──────────────────────────────
+
+#[cfg(test)]
+mod selection_scroll_tests {
+    use super::{
+        abs_row, adopt_scroll, clip_selection, count_around, normalize_sel, oldest_abs_of,
+        selection_text, selection_text_abs, Adopted, ScrollAdopt, FEED_CHUNK,
+    };
+
+    /// `Session` の**選択まわりの状態だけ**を持つ模型。
+    ///
+    /// 実 PTY を起こさない。以前は 1 バイトも書かない子を起動して読取スレッドが
+    /// 畳まれるのを待っていたが、**ConPTY は子が終わってもハンドルを保持する**ので
+    /// Windows でだけ待ちが返らず 3 件が時間切れした。パーサと通し番号は本番と
+    /// 同じ手順 ([`count_around`]) で動かし、取り込みの算術は本番と**同じ純関数**
+    /// ([`adopt_scroll`]) を通すので、見ている性質は 1 つも減っていない。
+    struct Model {
+        parser: vt100::Parser,
+        rows: u16,
+        /// `Session::scroll`。
+        scroll: usize,
+        /// `LineIndex::scrolled` 相当。
+        pushed: u64,
+        /// `LineIndex` の履歴長。
+        sb_len: usize,
+        sel_pushed: u64,
+        sel_abs: Option<((usize, u16), (usize, u16))>,
+        sel_anchor_abs: Option<(usize, u16)>,
+        selection: Option<((u16, u16), (u16, u16))>,
+    }
+
+    impl Model {
+        fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+            Self {
+                parser: vt100::Parser::new(rows, cols, scrollback),
+                rows,
+                scroll: 0,
+                pushed: 0,
+                sb_len: 0,
+                sel_pushed: 0,
+                sel_abs: None,
+                sel_anchor_abs: None,
+                selection: None,
+            }
+        }
+
+        /// 読取スレッドと**同じ手順**でバイト列を取り込む。
+        fn feed(&mut self, bytes: &[u8]) {
+            for piece in bytes.chunks(FEED_CHUNK) {
+                let (_, moved, sb_len) = count_around(&mut self.parser, |p| p.process(piece));
+                self.sb_len = sb_len;
+                self.pushed += moved;
+            }
+        }
+
+        /// `Session::eff_scroll`。
+        fn eff_scroll(&self) -> usize {
+            self.parser.screen().scrollback()
+        }
+
+        /// `Session::adopt_scrolled_output` と**同じ 1 点**を通る。
+        fn adopt(&mut self) {
+            let out: Adopted = adopt_scroll(ScrollAdopt {
+                scroll: self.scroll,
+                eff: self.eff_scroll(),
+                sel_pushed: self.sel_pushed,
+                pushed: self.pushed,
+                rows: self.rows,
+                sb_len: self.sb_len,
+                sel_abs: self.sel_abs,
+                sel_anchor_abs: self.sel_anchor_abs,
+            });
+            self.scroll = out.scroll;
+            self.sel_pushed = out.sel_pushed;
+            self.sel_abs = out.sel_abs;
+            self.sel_anchor_abs = out.sel_anchor_abs;
+            if out.changed {
+                self.sync_selection();
+            }
+        }
+
+        /// `Session::sync_selection`。
+        fn sync_selection(&mut self) {
+            let (rows, scroll) = (self.rows, self.scroll);
+            self.selection = self
+                .sel_abs
+                .and_then(|sel| clip_selection(sel, rows, scroll));
+        }
+
+        /// `Session::set_scroll`。
+        fn set_scroll(&mut self, n: usize) {
+            self.adopt();
+            self.parser.set_scrollback(n);
+            self.scroll = self.parser.screen().scrollback();
+            self.sync_selection();
+        }
+
+        /// `Session::adjust_scroll`。
+        fn adjust_scroll(&mut self, delta: i64) -> bool {
+            self.adopt();
+            let before = self.scroll;
+            let n = (self.scroll as i64 + delta).max(0) as usize;
+            self.set_scroll(n);
+            self.scroll != before
+        }
+
+        /// `Session::set_selection` (画面座標 → 絶対座標)。
+        fn set_selection(&mut self, sel: ((u16, u16), (u16, u16))) {
+            self.adopt();
+            let (rows, scroll) = (self.rows, self.scroll);
+            let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
+            let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
+            self.sel_abs = Some((a, b));
+            self.sel_pushed = self.pushed;
+            self.sync_selection();
+        }
+
+        /// `Session::selection_string` (コピーの中身そのもの)。
+        fn selection_string(&mut self) -> String {
+            self.adopt();
+            let Some(sel) = self.sel_abs else {
+                return String::new();
+            };
+            selection_text_abs(&mut self.parser, sel)
+        }
+
+        /// 行を n 本流す。
+        fn feed_lines(&mut self, range: std::ops::Range<usize>) {
+            for i in range {
+                self.feed(format!("line{:03}\r\n", i).as_bytes());
+            }
+        }
+
+        /// 画面に出ているハイライトの下に**実際にある**文字
+        /// (`draw_screen` はパーサの今の窓から描くので、これが利用者の見るもの)。
+        fn under_highlight(&self) -> String {
+            let sel = self.selection.expect("選択が画面に見えている");
+            selection_text(self.parser.screen(), normalize_sel(sel))
+        }
+    }
+
+    #[test]
+    fn 遡って選択したまま出力が来ても同じ文字を指し続ける() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = Model::new(rows, cols, 200);
+        s.feed_lines(0..30);
+        // 履歴を 10 行ぶん遡って、真ん中の行を選ぶ。
+        s.set_scroll(10);
+        s.set_selection(((2, 0), (2, 6)));
+        let want = s.selection_string();
+        assert!(want.starts_with("line"), "行を選べている: {want:?}");
+        assert_eq!(s.under_highlight(), want, "選ぶ直前は一致している");
+
+        // ここでエージェントが 3 行出力する (利用者は遡ったまま)。
+        s.feed(b"a\r\nb\r\nc\r\n");
+        assert_eq!(s.selection_string(), want, "コピーが同じ文字を指し続ける");
+        assert_eq!(s.under_highlight(), want, "ハイライトが同じ文字の上にある");
+
+        // さらに 1 行ぶん遡る。画面は 1 行しか動かない。
+        let before = s.eff_scroll();
+        assert!(s.adjust_scroll(1), "遡れる");
+        assert_eq!(s.eff_scroll(), before + 1, "1 行ぶんだけ動く");
+        assert_eq!(s.under_highlight(), want, "スクロールしてもずれない");
+        assert_eq!(s.selection_string(), want, "コピーもずれない");
+    }
+
+    #[test]
+    fn 履歴から押し出された選択は端で止まるか解除される() {
+        let (rows, cols) = (5u16, 20u16);
+        // 履歴は 8 行しか持てない = すぐ満杯になる。
+        let mut s = Model::new(rows, cols, 8);
+        s.feed_lines(0..20);
+        // 履歴の最古 2 行を選ぶ (画面行 0..1)。
+        s.set_scroll(usize::MAX);
+        assert!(s.eff_scroll() > 0, "遡れている");
+        s.set_selection(((0, 0), (1, 6)));
+        let want = s.selection_string();
+        let mut kept = want.lines();
+        let dropped = kept.next().expect("上の行").to_string();
+        let survives = kept.next().expect("下の行").to_string();
+
+        // 1 行流れると、上の行は履歴から落ちる → 残った側で止まる。
+        s.feed(b"a\r\n");
+        let now = s.selection_string();
+        assert!(
+            !now.contains(&dropped),
+            "消えた行を指し続けていない: {now:?}"
+        );
+        assert_eq!(now, survives, "生きている端で止まる: {now:?}");
+
+        // さらに流れて選択が丸ごと落ちたら解除する (黙って別の場所を指さない)。
+        s.feed(b"b\r\nc\r\nd\r\ne\r\nf\r\n");
+        assert_eq!(s.selection_string(), "", "残骸をコピーさせない");
+        assert_eq!(s.sel_abs, None, "選択が解除されている");
+        assert!(s.selection.is_none(), "ハイライトも消えている");
+    }
+
+    #[test]
+    fn 代替画面を出入りしても選択がずれない() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = Model::new(rows, cols, 200);
+        s.feed_lines(0..30);
+        s.set_scroll(6);
+        s.set_selection(((1, 0), (1, 6)));
+        let want = s.selection_string();
+        let abs = s.sel_abs;
+        assert!(want.starts_with("line"), "行を選べている: {want:?}");
+
+        // vim / less: 代替画面へ入って描いて出る。履歴は 1 行も伸びない。
+        s.feed(b"\x1b[?1049h");
+        s.feed(b"alt screen\r\nmore lines\r\n");
+        s.feed(b"\x1b[?1049l");
+        assert_eq!(s.sel_abs, abs, "代替画面は絶対行を動かさない");
+        assert_eq!(s.selection_string(), want, "戻ってきたら同じ文字を指す");
+    }
+
+    /// 取り込みの算術を表で固定する (パーサも `Session` も要らない部分)。
+    #[test]
+    fn 押し出しの取り込みを表で固定する() {
+        // rows = 5 / sb_len = 8 → 最古の絶対行は 12。
+        let base = ScrollAdopt {
+            scroll: 3,
+            eff: 3,
+            sel_pushed: 0,
+            pushed: 0,
+            rows: 5,
+            sb_len: 8,
+            sel_abs: Some(((6, 0), (5, 6))),
+            sel_anchor_abs: None,
+        };
+        let cases: &[(&str, ScrollAdopt, Adopted)] = &[
+            (
+                "何も流れていなければ 1 ビットも動かない",
+                base,
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 0,
+                    sel_abs: base.sel_abs,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+            (
+                "vt100 が増やした戻り量は写す (減る方向は写さない)",
+                ScrollAdopt {
+                    eff: 6,
+                    pushed: 3,
+                    ..base
+                },
+                Adopted {
+                    scroll: 6,
+                    sel_pushed: 3,
+                    sel_abs: Some(((9, 0), (8, 6))),
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "代替画面で戻り量が 0 になっても scroll は減らさない",
+                ScrollAdopt { eff: 0, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 0,
+                    sel_abs: base.sel_abs,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+            (
+                "片端だけ履歴から落ちたら最古の行の先頭で止める",
+                ScrollAdopt { pushed: 7, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 7,
+                    sel_abs: Some(((12, 0), (12, 6))),
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "両端とも落ちたら解除する (黙って別の場所をコピーさせない)",
+                ScrollAdopt { pushed: 20, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 20,
+                    sel_abs: None,
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "選択が無くてもアンカーだけは追いかけ、最古で止める",
+                ScrollAdopt {
+                    pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: Some((5, 2)),
+                    ..base
+                },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: Some((12, 2)),
+                    changed: true,
+                },
+            ),
+            (
+                "選択もアンカーも無ければ基準を進めるだけ",
+                ScrollAdopt {
+                    pushed: 9,
+                    sel_abs: None,
+                    ..base
+                },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(&adopt_scroll(*input), want, "{name}");
+        }
+    }
+
+    /// 最古の絶対行は `selection_text_abs` が切り詰める上限と同じ値でなければ
+    /// ならない。ずれると「クランプした先に文字が無い」or「まだ読める行を捨てる」。
+    #[test]
+    fn 最古の絶対行はコピー側の切り詰め上限と一致する() {
+        for rows in [1u16, 2, 5, 24] {
+            for lines in [0usize, 1, 7, 40] {
+                let cap = 8usize;
+                let mut m = Model::new(rows, 20, cap);
+                m.feed_lines(0..lines);
+                let want = {
+                    m.parser.set_scrollback(usize::MAX);
+                    let max_off = m.parser.screen().scrollback();
+                    m.parser.set_scrollback(0);
+                    max_off + usize::from(rows) - 1
+                };
+                assert_eq!(
+                    oldest_abs_of(rows, m.sb_len),
+                    want,
+                    "rows={rows} lines={lines}"
+                );
+            }
+        }
+    }
+
+    /// **コピーと表示が同じ 1 点を通る**ことを構造で固定する。
+    /// どれか 1 つが取り込みを飛ばすと「片方だけ直っている」事故に戻る。
+    #[test]
+    fn 取り込みは五つの入口すべてを通る() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        // 算術は純関数に 1 本だけ。`Session` 側は観測値を渡すだけ。
+        // 検索語は `concat!` で組む — ベタ書きするとこのテスト自身が引っ掛かる。
+        assert_eq!(
+            src.matches(concat!("pub fn ", "adopt_scroll(")).count(),
+            1,
+            "取り込みの算術が 2 箇所に分かれている"
+        );
+        assert!(
+            src.contains("fn adopt_scrolled_output(&mut self) {\n        let out = adopt_scroll("),
+            "Session が純関数を通っていない"
+        );
+        // 呼び出し口 (draw / set_scroll / adjust_scroll / set_selection /
+        // selection_string) の 5 つ + 定義 1 つ。
+        assert_eq!(
+            src.matches(concat!("adopt_scrolled", "_output()")).count(),
+            5,
+            "取り込みの入口が 5 つでない"
+        );
     }
 }

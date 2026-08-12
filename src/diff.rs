@@ -1603,6 +1603,151 @@ pub fn selectable_lines(hunk: &Hunk) -> Vec<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// 変更行どうしの対応付け
+// ---------------------------------------------------------------------------
+
+/// 対応付けの総当たりを諦めるマス数。`|削除| * |追加|` がこれを超えたら
+/// 位置どうしを素直に並べる。128x128 を超える置換の塊は事実上
+/// 「まるごと書き直した」ケースで、そこに拾うべき対応は残っていない。
+const PAIR_MAX_CELLS: usize = 16_384;
+
+/// 類似度を測るときに見るトークン数の上限。極端に長い 1 行 (minify 済み JS 等)
+/// でも 1 組あたりの手間をここで止める。
+const SIM_MAX_TOKENS: usize = 512;
+
+/// 「組にすること自体」の価値。`0 < x < 1` にしてあるのが要点:
+///
+/// * `x > 0` なので、1 文字も共有しない 2 行でも**上下に並べず横に並べる**
+///   (`- old` / `+ new` は組にしたほうが読める)。
+/// * `x < 1` なので、完全一致の組 1 本 (`1.0 + x`) が
+///   無関係な組 2 本 (`2x`) に勝つ。無理やり全部を組にしない。
+const PAIR_BONUS: f32 = 0.5;
+
+/// 語単位ハイライトを諦める類似度。これ未満の 2 行は「別物」なので、
+/// 行全体を塗ったほうが読みやすい (点在する濃い帯は却って読めない)。
+const INTRA_LINE_MIN_SIM: f32 = 0.25;
+
+// テスト用の呼び出し回数カウンタ。プロセス共通の static にすると同時に
+// 走っている他のテストの呼び出しまで混ざるのでスレッドローカルにする。
+// thread_local! に /// を付けると unused_doc_comments で -D warnings が落ちる。
+#[cfg(test)]
+thread_local! {
+    static SIM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_sim_calls() {
+    SIM_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn bump_sim_calls() {}
+
+/// 2 行の似かたを `0.0`〜`1.0` で返す**純関数** (トークンの Dice 係数)。
+///
+/// * 空白だけのトークンは数えない。字下げが同じというだけで
+///   「似ている」ことにすると、無関係な行が組になる。
+/// * 見るトークンは先頭から [`SIM_MAX_TOKENS`] 個まで。長い行でも手間は一定。
+/// * 完全一致は `1.0`。中身の無い行どうしは一致なら `1.0`、違えば `0.0`。
+pub fn line_similarity(a: &str, b: &str) -> f32 {
+    bump_sim_calls();
+    if a == b {
+        return 1.0;
+    }
+    let toks = |s: &str| -> Vec<String> {
+        tokenize(s)
+            .into_iter()
+            .map(|(x, y)| s[x..y].to_string())
+            .filter(|t| !t.trim().is_empty())
+            .take(SIM_MAX_TOKENS)
+            .collect()
+    };
+    let (av, bv) = (toks(a), toks(b));
+    if av.is_empty() || bv.is_empty() {
+        return 0.0;
+    }
+    let mut have: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
+    for t in &av {
+        *have.entry(t.as_str()).or_insert(0) += 1;
+    }
+    let mut common = 0usize;
+    for t in &bv {
+        if let Some(n) = have.get_mut(t.as_str()) {
+            if *n > 0 {
+                *n -= 1;
+                common += 1;
+            }
+        }
+    }
+    2.0 * common as f32 / (av.len() + bv.len()) as f32
+}
+
+/// 削除行 N 本と追加行 M 本を「似ている行どうし」で組にする**純関数**。
+///
+/// 返すのは `(削除側の添字, 追加側の添字)` の並び。片側が `None` なら
+/// 反対側にしか行が無い (= 空のプレースホルダを置く)。
+///
+/// * **順序は保つ**。交差させると同じ行が上下に飛んで読めなくなる。
+/// * `類似度 + `[`PAIR_BONUS`]` の総和を最大にする単調な対応を DP で選ぶ。
+///   同点なら「組にする」を先に採るので、N == M で全部似ている普通の置換では
+///   素直な位置どうしの対応に落ちる。
+/// * `N * M` が [`PAIR_MAX_CELLS`] を超えたら**総当たりを打ち切って**
+///   位置どうしを並べる。ハンクの行数に対して二乗にしないための上限。
+pub fn pair_changed_lines(olds: &[&str], news: &[&str]) -> Vec<(Option<usize>, Option<usize>)> {
+    let (n, m) = (olds.len(), news.len());
+    if n == 0 || m == 0 || n.saturating_mul(m) > PAIR_MAX_CELLS {
+        return (0..n.max(m))
+            .map(|i| ((i < n).then_some(i), (i < m).then_some(i)))
+            .collect();
+    }
+    // dp[i][j] = olds[i..] と news[j..] を対応させたときの最大得点。
+    let w = m + 1;
+    let at = |i: usize, j: usize| i * w + j;
+    let mut sim = vec![0.0f32; n * m];
+    for (i, o) in olds.iter().enumerate() {
+        for (j, e) in news.iter().enumerate() {
+            sim[i * m + j] = line_similarity(o, e);
+        }
+    }
+    let mut dp = vec![0.0f32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let pair = sim[i * m + j] + PAIR_BONUS + dp[at(i + 1, j + 1)];
+            let skip_old = dp[at(i + 1, j)];
+            let skip_new = dp[at(i, j + 1)];
+            dp[at(i, j)] = pair.max(skip_old).max(skip_new);
+        }
+    }
+    let mut out = Vec::with_capacity(n.max(m));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        let pair = sim[i * m + j] + PAIR_BONUS + dp[at(i + 1, j + 1)];
+        let skip_old = dp[at(i + 1, j)];
+        // 同点なら組にする → 位置どうしの対応へ落ちる (既定の見た目を変えない)。
+        if pair >= skip_old && pair >= dp[at(i, j + 1)] {
+            out.push((Some(i), Some(j)));
+            i += 1;
+            j += 1;
+        } else if skip_old >= dp[at(i, j + 1)] {
+            out.push((Some(i), None));
+            i += 1;
+        } else {
+            out.push((None, Some(j)));
+            j += 1;
+        }
+    }
+    while i < n {
+        out.push((Some(i), None));
+        i += 1;
+    }
+    while j < m {
+        out.push((None, Some(j)));
+        j += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // 並列表示の行揃え
 // ---------------------------------------------------------------------------
 
@@ -1632,15 +1777,20 @@ pub fn align_hunk(hunk: &Hunk) -> Vec<(Option<LineRef>, Option<LineRef>)> {
     let mut adds: Vec<usize> = Vec::new();
 
     fn flush(
+        hunk: &Hunk,
         dels: &mut Vec<usize>,
         adds: &mut Vec<usize>,
         out: &mut Vec<(Option<LineRef>, Option<LineRef>)>,
     ) {
-        let n = dels.len().max(adds.len());
-        for i in 0..n {
+        if dels.is_empty() && adds.is_empty() {
+            return;
+        }
+        let text =
+            |v: &[usize]| -> Vec<&str> { v.iter().map(|&i| hunk.lines[i].text.as_str()).collect() };
+        for (a, b) in pair_changed_lines(&text(dels), &text(adds)) {
             out.push((
-                dels.get(i).copied().map(LineRef::at),
-                adds.get(i).copied().map(LineRef::at),
+                a.map(|k| LineRef::at(dels[k])),
+                b.map(|k| LineRef::at(adds[k])),
             ));
         }
         dels.clear();
@@ -1652,18 +1802,18 @@ pub fn align_hunk(hunk: &Hunk) -> Vec<(Option<LineRef>, Option<LineRef>)> {
             LineKind::Removed => {
                 // 追加のあとに削除が来たら、そこで塊が切れている。
                 if !adds.is_empty() {
-                    flush(&mut dels, &mut adds, &mut out);
+                    flush(hunk, &mut dels, &mut adds, &mut out);
                 }
                 dels.push(i);
             }
             LineKind::Added => adds.push(i),
             LineKind::Context => {
-                flush(&mut dels, &mut adds, &mut out);
+                flush(hunk, &mut dels, &mut adds, &mut out);
                 out.push((Some(LineRef::at(i)), Some(LineRef::at(i))));
             }
         }
     }
-    flush(&mut dels, &mut adds, &mut out);
+    flush(hunk, &mut dels, &mut adds, &mut out);
     out
 }
 
@@ -1920,6 +2070,19 @@ pub fn word_diff(old: &str, new: &str) -> Option<(Vec<WordSpan>, Vec<WordSpan>)>
     Some((merge_spans(&oc), merge_spans(&nc)))
 }
 
+/// 置換の組 1 つぶんの行内ハイライト。**描画から呼ぶのはこちら**。
+///
+/// [`word_diff`] の前に類似度の下限を効かせるのが役目。
+/// 似ていない 2 行 (組にはしたが中身は別物) で語単位を出すと、
+/// 行のあちこちに濃い帯が点在して**行全体を塗るより読みにくい**。
+/// ついでに、そういう行では一番高い O(n²) の LCS を走らせずに済む。
+pub fn intra_line_spans(old: &str, new: &str) -> Option<(Vec<WordSpan>, Vec<WordSpan>)> {
+    if line_similarity(old, new) < INTRA_LINE_MIN_SIM {
+        return None;
+    }
+    word_diff(old, new)
+}
+
 // ---------------------------------------------------------------------------
 // 未変更行の折りたたみ
 // ---------------------------------------------------------------------------
@@ -1939,6 +2102,23 @@ impl FoldRun {
 
 /// 変更の前後に残す文脈行の数 (VS Code の既定と同じ 3 行)。
 pub const CONTEXT_KEEP: usize = 3;
+
+/// 畳む対象にする「連続した変更なし行」の最小数。
+///
+/// 根拠: 差分パネルの高さはだいたい 30〜50 行。**1 画面の半分未満**なら
+/// 「⋯ を押して読み込む」手間のほうが、そのまま目で飛ばすより高くつく。
+/// 逆にこれを超えると、変更が画面の外へ押し出されて見つからなくなる。
+pub const FOLD_MIN_RUN: usize = 20;
+
+/// 実際に隠す中央部の最小行数 ([`FOLD_MIN_RUN`] 行から前後
+/// [`CONTEXT_KEEP`] 行を残した残り)。
+pub const FOLD_MIN_HIDDEN: usize = FOLD_MIN_RUN - CONTEXT_KEEP * 2;
+
+/// 「⋯」を 1 回押したときに開く行数。
+///
+/// 根拠: 全部開くと 1 万行のファイルで差分パネルが実質的に使えなくなる
+/// (スクロール位置も見失う)。1 画面ぶんずつ開けば、押した場所が画面に残る。
+pub const UNFOLD_STEP: usize = 20;
 
 /// 連続する文脈行のうち、前後 `keep` 行を残した**中央部**を畳む**純関数**。
 ///
@@ -1968,11 +2148,177 @@ pub fn fold_context_runs(kinds: &[LineKind], keep: usize) -> Vec<FoldRun> {
     out
 }
 
-/// `line` を隠す折りたたみがあれば、その区間を返す。
-pub fn fold_covering(runs: &[FoldRun], line: usize) -> Option<FoldRun> {
+/// 隠す行が `min_hidden` に満たない区間を落とす**純関数**。
+///
+/// [`fold_context_runs`] は「畳めるところ」を全部返すので、そのまま使うと
+/// 2 行のために「⋯ 2 行を展開」が挟まる。読む側の得にならない折りたたみは
+/// ここで捨てる。
+pub fn fold_worth_hiding(runs: &[FoldRun], min_hidden: usize) -> Vec<FoldRun> {
     runs.iter()
-        .find(|r| line >= r.start && line < r.end)
         .copied()
+        .filter(|r| r.len() >= min_hidden)
+        .collect()
+}
+
+/// `revealed` 行を上から開いたあと、まだ隠れている区間 (無ければ `None`)。
+///
+/// 段階的な展開の本体。区間そのものは動かさず「どこまで出したか」だけを
+/// 覚えるので、差分を作り直しても開いた量が壊れない。
+pub fn fold_remaining(run: FoldRun, revealed: usize) -> Option<FoldRun> {
+    let start = run.start.saturating_add(revealed).min(run.end);
+    (start < run.end).then_some(FoldRun {
+        start,
+        end: run.end,
+    })
+}
+
+/// 次の 1 回で開く行数を決める**純関数**。
+///
+/// 残りが `step + min_stub` に満たないときは残り全部を開く。
+/// そうしないと「⋯ 2 行を展開」のような、畳む価値が無いと自分で判定した
+/// 大きさの端数が最後に残る。
+pub fn unfold_next(hidden: usize, step: usize, min_stub: usize) -> usize {
+    if step == 0 || hidden <= step || hidden - step < min_stub.max(1) {
+        hidden
+    } else {
+        step
+    }
+}
+
+/// 折りたたみ行で押せる場所。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldClick {
+    /// 決まった行数だけ開く (段階的展開)。
+    Step,
+    /// 残り全部を開く。
+    All,
+    /// 開いたぶんを畳み直す。
+    Collapse,
+}
+
+/// 折りたたみ行に置くボタン 1 個。`x` は**行矩形の左端を 0 とした**位置。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldZone {
+    pub label: String,
+    pub x: f32,
+    pub w: f32,
+}
+
+impl FoldZone {
+    fn hits(&self, x: f32) -> bool {
+        x >= self.x && x < self.x + self.w
+    }
+}
+
+/// 折りたたみ行の中身を決める**純関数**の結果。
+///
+/// **不変条件** (テーブルテストで固定):
+/// * どのゾーンも `0 <= x` かつ `x + w <= avail_w` に収まる。
+/// * ゾーンどうしは 1px も重ならない。
+/// * 幅が足りないときは任意ゾーンから落ちる。落とす順は「畳む」→「すべて」。
+///   畳み直しは差分を開き直せば戻るが、「すべて」が無いと 1 万行の未変更域を
+///   何百回も押すことになる。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoldRowPlan {
+    /// 主ボタン。必ずある。
+    pub step: FoldZone,
+    pub all: Option<FoldZone>,
+    pub collapse: Option<FoldZone>,
+    /// このクリックで開く行数 ([`unfold_next`] の結果)。
+    pub step_lines: usize,
+}
+
+impl FoldRowPlan {
+    /// 押された x (行矩形の左端が 0) から操作を決める。
+    /// どのゾーンにも当たらない余白は主ボタン扱い — 行全体が「開く」なので
+    /// 狙いを外しても何も起きない、という不親切を避ける。
+    pub fn hit(&self, x: f32) -> FoldClick {
+        if self.all.as_ref().is_some_and(|z| z.hits(x)) {
+            FoldClick::All
+        } else if self.collapse.as_ref().is_some_and(|z| z.hits(x)) {
+            FoldClick::Collapse
+        } else {
+            FoldClick::Step
+        }
+    }
+}
+
+/// 折りたたみ行のボタン配置を決める**純関数**。
+///
+/// `hidden` は**まだ隠れている**行数、`revealed` は既に開いた行数。
+pub fn fold_row_plan(
+    avail_w: f32,
+    text_x: f32,
+    char_w: f32,
+    hidden: usize,
+    revealed: usize,
+    step: usize,
+) -> FoldRowPlan {
+    let next = unfold_next(hidden, step, FOLD_MIN_HIDDEN);
+    let label = if next >= hidden {
+        trf("⋯ {n} 行を展開", &[("n", hidden.to_string())])
+    } else {
+        trf(
+            "⋯ {n} 行を展開 (残り {r})",
+            &[("n", next.to_string()), ("r", hidden.to_string())],
+        )
+    };
+    let x0 = text_x.max(0.0).min(avail_w.max(0.0));
+    let main = FoldZone {
+        w: btn_width(&label, char_w).min((avail_w - x0).max(0.0)),
+        x: x0,
+        label,
+    };
+    let mut right = avail_w.max(x0);
+    // 右端から順に詰める。入らないものは落とす (見切れさせない)。
+    let mut place = |label: String| -> Option<FoldZone> {
+        let w = btn_width(&label, char_w);
+        let x = right - w;
+        if x - BTN_GAP < main.x + main.w {
+            return None;
+        }
+        right = x - BTN_GAP;
+        Some(FoldZone { label, x, w })
+    };
+    let all = (next < hidden).then(|| place(tr("すべて"))).flatten();
+    let collapse = (revealed > 0).then(|| place(tr("畳む"))).flatten();
+    FoldRowPlan {
+        step: main,
+        all,
+        collapse,
+        step_lines: next,
+    }
+}
+
+// テスト用の探索回数カウンタ (スレッドローカル: 他のテストと混ざらない)。
+#[cfg(test)]
+thread_local! {
+    static FOLD_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_fold_probes() {
+    FOLD_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn bump_fold_probes() {}
+
+/// `line` を隠す折りたたみがあれば、その区間を返す。
+///
+/// **二分探索で降りる**。[`fold_context_runs`] の区間は開始位置の昇順で
+/// 互いに素なので、素朴に舐めると「行数 × 区間数」= ハンクの行数の**二乗**に
+/// なる (しかも毎フレーム)。区間が 1 つも無い普通のハンクでは 0 回で降りる。
+pub fn fold_covering(runs: &[FoldRun], line: usize) -> Option<FoldRun> {
+    if runs.is_empty() {
+        return None;
+    }
+    let i = runs.partition_point(|r| {
+        bump_fold_probes();
+        r.start <= line
+    });
+    let r = *runs.get(i.checked_sub(1)?)?;
+    (line < r.end).then_some(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -2216,9 +2562,10 @@ pub fn set_review_notice(ctx: &egui::Context, msg: String) {
 #[derive(Clone, Copy, Debug, Default)]
 struct NavCell(Option<usize>);
 
-/// 展開済みの折りたたみ (ファイル, ハンク, 区間の先頭)。既定は「全部畳む」。
+/// 折りたたみごとに**上から何行開いたか**。鍵は (ファイル, ハンク, 区間の先頭)。
+/// 既定は 0 = 全部畳む。真偽値ではなく行数を持つのが段階的展開の要。
 #[derive(Clone, Debug, Default)]
-struct UnfoldedCell(std::collections::HashSet<(usize, usize, usize)>);
+struct UnfoldedCell(std::collections::HashMap<(usize, usize, usize), usize>);
 
 /// ファイル差分ごとの構文色キャッシュ。`key` が変わったときだけ計算し直す。
 #[derive(Clone)]
@@ -2459,7 +2806,8 @@ pub fn diff_ui_with_line_selection(
         .data(|d| d.get_temp::<UnfoldedCell>(unfold_id))
         .unwrap_or_default()
         .0;
-    let mut unfold_toggle: Option<(usize, usize, usize)> = None;
+    // (鍵, 適用後に開いている行数)。描画中に書き換えると同じフレームで表示がずれる。
+    let mut unfold_toggle: Option<((usize, usize, usize), usize)> = None;
 
     let font = FontId::monospace(size);
     let row_h = crate::theme::snap_len(ui.fonts(|f| f.row_height(&font)) + 2.0, ppp);
@@ -2531,25 +2879,69 @@ pub fn diff_ui_with_line_selection(
                     let base = ord;
                     ord += hunk.lines.len();
                     let kinds: Vec<LineKind> = hunk.lines.iter().map(|l| l.kind).collect();
-                    let folds = fold_context_runs(&kinds, CONTEXT_KEEP);
+                    let folds = fold_worth_hiding(
+                        &fold_context_runs(&kinds, CONTEXT_KEEP),
+                        FOLD_MIN_HIDDEN,
+                    );
+                    // 置換の組。**表示モードに依らず**作る — 1 列表示でも
+                    // 行内ハイライトを効かせるため (相手の行がどれかは同じ)。
+                    let pairs = align_hunk(hunk);
+                    let mut partner: Vec<Option<usize>> = vec![None; hunk.lines.len()];
+                    for (l, r) in &pairs {
+                        if let (Some(l), Some(r)) = (l, r) {
+                            if hunk.lines[l.idx].kind == LineKind::Removed
+                                && hunk.lines[r.idx].kind == LineKind::Added
+                            {
+                                partner[l.idx] = Some(r.idx);
+                                partner[r.idx] = Some(l.idx);
+                            }
+                        }
+                    }
                     let rows: Vec<(Option<LineRef>, Option<LineRef>)> = match lay.mode {
                         // 一列: 左右の区別が無いので「左だけ」に全行を流す。
                         DiffMode::Inline => (0..hunk.lines.len())
                             .map(|i| (Some(LineRef::at(i)), None))
                             .collect(),
-                        DiffMode::SideBySide => align_hunk(hunk),
+                        DiffMode::SideBySide => pairs,
                     };
                     for (left, right) in rows {
                         // 折りたたみ対象かどうかは「文脈行の添字」で決まる。
                         let li = left.or(right).map(|r| r.idx).unwrap_or(0);
                         if let Some(run) = fold_covering(&folds, li) {
-                            if !unfolded.contains(&(fi, hi, run.start)) {
-                                if li == run.start
-                                    && fold_row_ui(ui, theme, &pal, &lay, run.len(), size, row_h)
-                                {
-                                    unfold_toggle = Some((fi, hi, run.start));
+                            let key = (fi, hi, run.start);
+                            let revealed = unfolded.get(&key).copied().unwrap_or(0);
+                            if let Some(rem) = fold_remaining(run, revealed) {
+                                if li >= rem.start {
+                                    if li == rem.start {
+                                        if let Some(click) = fold_row_ui(
+                                            ui,
+                                            theme,
+                                            &pal,
+                                            &lay,
+                                            FoldArgs {
+                                                hidden: rem.len(),
+                                                revealed,
+                                                size,
+                                                row_h,
+                                            },
+                                        ) {
+                                            let next = match click {
+                                                FoldClick::Step => {
+                                                    revealed
+                                                        + unfold_next(
+                                                            rem.len(),
+                                                            UNFOLD_STEP,
+                                                            FOLD_MIN_HIDDEN,
+                                                        )
+                                                }
+                                                FoldClick::All => run.len(),
+                                                FoldClick::Collapse => 0,
+                                            };
+                                            unfold_toggle = Some((key, next));
+                                        }
+                                    }
+                                    continue;
                                 }
-                                continue;
                             }
                         }
                         let scroll_here = jump_to.is_some_and(|a| {
@@ -2580,6 +2972,7 @@ pub fn diff_ui_with_line_selection(
                                 scroll_here,
                                 sel: &sel_lines,
                                 selectable: sel_file.is_some(),
+                                partner: &partner,
                             },
                         ) {
                             row_hit = Some(ev);
@@ -2597,9 +2990,11 @@ pub fn diff_ui_with_line_selection(
         ui.add_space(6.0);
     }
 
-    if let Some(k) = unfold_toggle {
-        if !unfolded.remove(&k) {
-            unfolded.insert(k);
+    if let Some((k, n)) = unfold_toggle {
+        if n == 0 {
+            unfolded.remove(&k);
+        } else {
+            unfolded.insert(k, n);
         }
         ui.data_mut(|d| d.insert_temp(unfold_id, UnfoldedCell(unfolded)));
     }
@@ -2961,9 +3356,26 @@ fn file_line_colors(
     arc
 }
 
+// テスト用の突き合わせ回数カウンタ (スレッドローカル: 他のテストと混ざらない)。
+#[cfg(test)]
+thread_local! {
+    static JOB_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_job_probes() {
+    JOB_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn bump_job_probes() {}
+
 /// 1 行ぶんの `LayoutJob`。構文色 (前景) と語単位の変更 (背景) を重ねる。
 ///
-/// 範囲の境界だけで区切って `append` するので、手間は区間数に比例するだけ。
+/// 構文色も語の範囲も**開始位置の昇順で互いに素**なので、切れ目を舐めながら
+/// カーソルを前へ送るだけで色が決まる。区間ごとに `find` / `any` で線形探索
+/// すると「切れ目の数 × 区間の数」= 区間数の**二乗**になり、構文色が細かい行
+/// (トークンが数百個ある 1 行) で毎フレーム効いてくる。
 fn line_job(
     text: &str,
     syntax: &[(usize, usize, Color32)],
@@ -2994,20 +3406,30 @@ fn line_job(
     cuts.retain(|&c| text.is_char_boundary(c));
     cuts.sort_unstable();
     cuts.dedup();
+    // `a` は単調増加なので、両方のカーソルは前へしか動かない = O(区間数)。
+    let (mut si, mut wi) = (0usize, 0usize);
     for pair in cuts.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         if b <= a {
             continue;
         }
-        let color = syntax
-            .iter()
-            .find(|(s, e, _)| a >= *s && a < *e)
-            .map(|(_, _, c)| *c)
-            .unwrap_or(fg);
-        let background = if words.iter().any(|w| a >= w.start && a < w.end) {
-            word_bg
-        } else {
-            Color32::TRANSPARENT
+        while si < syntax.len() && syntax[si].1 <= a {
+            bump_job_probes();
+            si += 1;
+        }
+        bump_job_probes();
+        let color = match syntax.get(si) {
+            Some(&(s, e, c)) if a >= s && a < e => c,
+            _ => fg,
+        };
+        while wi < words.len() && words[wi].end <= a {
+            bump_job_probes();
+            wi += 1;
+        }
+        bump_job_probes();
+        let background = match words.get(wi) {
+            Some(w) if a >= w.start && a < w.end => word_bg,
+            _ => Color32::TRANSPARENT,
         };
         job.append(
             &text[a..b],
@@ -3060,6 +3482,9 @@ struct RowArgs<'a> {
     sel: &'a BTreeSet<usize>,
     /// 行選択そのものが有効か (無効なら従来どおりコメントだけ)。
     selectable: bool,
+    /// 行内ハイライトの相手 (`hunk.lines` の添字)。組になっていなければ `None`。
+    /// 1 列表示では左右が無いので、ここだけが相手を知る手がかりになる。
+    partner: &'a [Option<usize>],
 }
 
 /// 対応する 1 行 (一列なら 1 セル、並列なら左右 2 セル) を描く。
@@ -3120,13 +3545,29 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) -> Option<RowSelect> {
 
     // --- 語単位ハイライト: 置換の組にだけ効かせる ---
     let (mut lw, mut rw) = (Vec::new(), Vec::new());
-    if let (Some(o), Some(n)) = (left_line, right_line) {
-        if o.kind == LineKind::Removed && n.kind == LineKind::Added {
-            if let Some((a, b)) = word_diff(&o.text, &n.text) {
+    match (left_line, right_line) {
+        (Some(o), Some(n)) if o.kind == LineKind::Removed && n.kind == LineKind::Added => {
+            if let Some((a, b)) = intra_line_spans(&o.text, &n.text) {
                 lw = a;
                 rw = b;
             }
         }
+        // 1 列表示: 相手は同じハンクの別の行 (並列表示なら組にならなかった行)。
+        (Some(l), None) => {
+            let mate = args
+                .left
+                .and_then(|r| args.partner.get(r.idx).copied())
+                .flatten()
+                .and_then(|p| args.hunk.lines.get(p));
+            if let Some(other) = mate {
+                let del = l.kind == LineKind::Removed;
+                let (o, n) = if del { (l, other) } else { (other, l) };
+                if let Some((a, b)) = intra_line_spans(&o.text, &n.text) {
+                    lw = if del { a } else { b };
+                }
+            }
+        }
+        _ => {}
     }
 
     let span_of = |r: Option<LineRef>| -> &[(usize, usize, Color32)] {
@@ -3161,7 +3602,7 @@ fn diff_row_ui(cx: &mut RowCtx, args: RowArgs) -> Option<RowSelect> {
             ],
             badge: left_anchor.as_ref().and_then(|a| cx.comments.badge(a)),
             syntax: span_of(args.left),
-            words: Vec::new(),
+            words: lw,
         }]
     };
 
@@ -3383,37 +3824,77 @@ fn paint_cell(
 }
 
 /// 「⋯ N 行を展開」の 1 行。押されたら true。
+/// 「⋯ N 行を展開」の帯。押された場所に応じて [`FoldClick`] を返す。
+///
+/// 配置は [`fold_row_plan`] が決める (このなかで幅の判断をしない)。
+struct FoldArgs {
+    /// まだ隠れている行数。
+    hidden: usize,
+    /// すでに開いた行数 (0 なら「畳む」は出さない)。
+    revealed: usize,
+    size: f32,
+    row_h: f32,
+}
+
 fn fold_row_ui(
     ui: &mut egui::Ui,
     theme: &Theme,
     pal: &DiffPalette,
     lay: &DiffLayout,
-    hidden: usize,
-    size: f32,
-    row_h: f32,
-) -> bool {
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(lay.width.max(1.0), row_h), egui::Sense::click());
+    args: FoldArgs,
+) -> Option<FoldClick> {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(lay.width.max(1.0), args.row_h),
+        egui::Sense::click(),
+    );
+    let text_x = lay.panes.first().map(|c| c.text_x).unwrap_or(0.0);
+    let font = FontId::monospace(args.size);
+    let char_w = ui.fonts(|f| f.glyph_width(&font, ' '));
+    let plan = fold_row_plan(
+        rect.width(),
+        text_x,
+        char_w,
+        args.hidden,
+        args.revealed,
+        UNFOLD_STEP,
+    );
     if ui.is_rect_visible(rect) {
         let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         p.rect_filled(rect, 0.0, pal.gutter_bg);
-        let text_x = lay.panes.first().map(|c| c.text_x).unwrap_or(0.0);
-        p.text(
-            egui::pos2(rect.left() + text_x, rect.top() + 1.0),
-            egui::Align2::LEFT_TOP,
-            trf("⋯ {n} 行を展開", &[("n", hidden.to_string())]),
-            FontId::monospace(size),
-            if resp.hovered() {
-                theme.accent
-            } else {
-                theme.text_dim
-            },
-        );
+        let hovered = resp.hover_pos().map(|q| q.x - rect.left());
+        let draw = |z: &FoldZone, main: bool| {
+            let on = hovered.is_some_and(|x| {
+                if main {
+                    plan.hit(x) == FoldClick::Step
+                } else {
+                    z.hits(x)
+                }
+            });
+            p.text(
+                egui::pos2(rect.left() + z.x, rect.top() + 1.0),
+                egui::Align2::LEFT_TOP,
+                &z.label,
+                font.clone(),
+                if on { theme.accent } else { theme.text_dim },
+            );
+        };
+        draw(&plan.step, true);
+        if let Some(z) = &plan.all {
+            draw(z, false);
+        }
+        if let Some(z) = &plan.collapse {
+            draw(z, false);
+        }
     }
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.on_hover_text(tr("変更のない行を表示します")).clicked()
+    let resp = resp.on_hover_text(tr("変更のない行を段階的に表示します"));
+    if !resp.clicked() {
+        return None;
+    }
+    let x = resp.interact_pointer_pos().map(|q| q.x - rect.left());
+    Some(x.map(|x| plan.hit(x)).unwrap_or(FoldClick::Step))
 }
 
 /// コメントスレッドの右余白。
@@ -5716,6 +6197,406 @@ diff --git a/src/foo.rs b/src/foo.rs
         assert!(fold_covering(&runs, 7).is_none(), "区間は半開");
     }
 
+    // ---- 行の対応付け / 行内ハイライト -------------------------------------
+
+    fn paired(olds: &[&str], news: &[&str]) -> Vec<(Option<usize>, Option<usize>)> {
+        pair_changed_lines(olds, news)
+    }
+
+    #[test]
+    fn 語の切り方と行の似かたのテーブル() {
+        // (旧, 新, 期待, 何を見ているか)
+        let table: &[(&str, &str, f32, &str)] = &[
+            ("", "", 1.0, "空どうしは完全一致"),
+            ("a", "a", 1.0, "同じ行"),
+            ("   ", "\t", 0.0, "空白だけの行は中身が無い = 0"),
+            (
+                "    let x = 1;",
+                "        let x = 1;",
+                1.0,
+                "字下げの差は無視する",
+            ),
+            ("let x = 1;", "let x = 2;", 0.8, "数字 1 個の差"),
+            ("old", "new", 0.0, "1 トークンも共有しない"),
+            (
+                "日本語のテキスト",
+                "日本語のテキストです",
+                16.0 / 18.0,
+                "CJK は語ではなく文字単位で刻む (語にまとめると行全体の塗りに退化する)",
+            ),
+        ];
+        for (a, b, want, why) in table {
+            let got = line_similarity(a, b);
+            assert!(
+                (got - *want).abs() < 0.001,
+                "{why}: {a:?} vs {b:?} = {got} (期待 {want})"
+            );
+            assert_eq!(got, line_similarity(b, a), "対称でない: {why}");
+            assert!((0.0..=1.0).contains(&got), "範囲外: {got}");
+        }
+    }
+
+    #[test]
+    fn 行の対応付けのテーブル() {
+        // (旧側, 新側, 期待する (旧, 新) の並び, 何を見ているか)
+        let table: &[(&[&str], &[&str], &[(Option<usize>, Option<usize>)], &str)] = &[
+            (&[], &[], &[], "空"),
+            (
+                &["a"],
+                &[],
+                &[(Some(0), None)],
+                "片側だけ: 反対側は空プレースホルダ",
+            ),
+            (&[], &["a"], &[(None, Some(0))], "追加だけ"),
+            (
+                &["old"],
+                &["new"],
+                &[(Some(0), Some(0))],
+                "1 対 1 は似ていなくても組にする (上下に離すより横に並べる)",
+            ),
+            (
+                &[
+                    "    let alpha = compute_alpha(input);",
+                    "    let beta = compute_beta(input);",
+                ],
+                &["    let beta = compute_beta(input, opts);"],
+                &[(Some(0), None), (Some(1), Some(0))],
+                "似ている行のほうを組にする (位置ではなく中身で決める)",
+            ),
+            (
+                &["    let beta = compute_beta(input);"],
+                &[
+                    "    let alpha = compute_alpha(input);",
+                    "    let beta = compute_beta(input, opts);",
+                ],
+                &[(None, Some(0)), (Some(0), Some(1))],
+                "追加が多い側でも似ている行を選ぶ",
+            ),
+            (
+                &["a", "b", "c"],
+                &["a2", "b2", "c2"],
+                &[(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2))],
+                "N == M で全部似ていなくても位置どうしに落ちる",
+            ),
+            (
+                &["keep", "keep", "keep"],
+                &["keep"],
+                &[(Some(0), Some(0)), (Some(1), None), (Some(2), None)],
+                "同じ内容が並ぶ (周期的な入力) と先頭から組にする",
+            ),
+        ];
+        for (olds, news, want, why) in table {
+            assert_eq!(&paired(olds, news)[..], *want, "{why}");
+        }
+    }
+
+    #[test]
+    fn 行の対応付けは順序を保ち各行を1回だけ使う() {
+        let olds = ["zzz", "common line here", "aaa", "bbb"];
+        let news = ["qqq", "common line here!", "ccc"];
+        let rows = paired(&olds, &news);
+        let (mut lo, mut ln) = (Vec::new(), Vec::new());
+        for (a, b) in &rows {
+            if let Some(i) = a {
+                lo.push(*i);
+            }
+            if let Some(j) = b {
+                ln.push(*j);
+            }
+        }
+        assert_eq!(lo, (0..olds.len()).collect::<Vec<_>>(), "旧側が1回ずつ昇順");
+        assert_eq!(ln, (0..news.len()).collect::<Vec<_>>(), "新側が1回ずつ昇順");
+        // 中身が同じ行どうしが組になっている (交差させずに拾えている)。
+        assert!(
+            rows.contains(&(Some(1), Some(1))),
+            "似ている行が組になっていない: {rows:?}"
+        );
+    }
+
+    /// 守りたい性質は「ハンクが大きくなっても手間が青天井にならない」。
+    /// 絶対時間ではなく**類似度を何回計算したか**を数える。
+    #[test]
+    fn 行の対応付けの比較回数は上限で止まる() {
+        fn sims(n: usize, m: usize) -> usize {
+            let olds: Vec<String> = (0..n).map(|i| format!("old line {i}")).collect();
+            let news: Vec<String> = (0..m).map(|i| format!("new line {i}")).collect();
+            let ov: Vec<&str> = olds.iter().map(|s| s.as_str()).collect();
+            let nv: Vec<&str> = news.iter().map(|s| s.as_str()).collect();
+            SIM_CALLS.with(|c| c.set(0));
+            let rows = pair_changed_lines(&ov, &nv);
+            // 行はどんな入力でも 1 回ずつ出てくる (件数は線形)。
+            assert!(rows.len() >= n.max(m), "行が消えた: {n}x{m}");
+            SIM_CALLS.with(|c| c.get())
+        }
+        let small = sims(40, 40);
+        assert_eq!(small, 40 * 40, "上限の内側では全対全");
+        // 上限を跨いだ瞬間に 0 回へ落ちる = 二乗が伸び続けない。
+        assert_eq!(sims(200, 200), 0, "上限を超えたのに総当たりしている");
+        assert_eq!(sims(4000, 4000), 0, "巨大な置換で総当たりしている");
+        // 片側だけ巨大 (よくある「まるごと追記」) でも上限で降りる。
+        assert_eq!(sims(1, 100_000), 0, "片側だけ巨大な入力で総当たりしている");
+    }
+
+    #[test]
+    fn 行内ハイライトは似ていない行では降りる() {
+        // 似ている: 変わった語だけが返る。
+        let (a, b) = intra_line_spans("let x = 1;", "let x = 2;").expect("似た行");
+        assert_eq!(spans_text("let x = 1;", &a), vec!["1"]);
+        assert_eq!(spans_text("let x = 2;", &b), vec!["2"]);
+        // 似ていない: None = 行全体を塗る (濃い帯を点在させない)。
+        assert!(
+            intra_line_spans("fn alpha(a: u8) -> u8 { a }", "// 全然ちがう説明文").is_none(),
+            "無関係な 2 行で語単位を出している"
+        );
+        // 極端に長い 1 行は word_diff 側の上限で降りる。
+        let long_a = "x".repeat(40_000);
+        let long_b = format!("{}y", "x".repeat(39_999));
+        assert!(
+            intra_line_spans(&long_a, &long_b).is_none(),
+            "数万文字の 1 行で O(n^2) を走らせている"
+        );
+    }
+
+    #[test]
+    fn 一列表示でも置換の相手が決まる() {
+        use LineKind::{Added as A, Context as C, Removed as R};
+        let h = hunk_of(&[
+            (C, "head"),
+            (R, "let x = 1;"),
+            (R, "まったく別の行"),
+            (A, "let x = 2;"),
+        ]);
+        // align_hunk の対応付けは表示モードに依らない = 1 列表示でも使える。
+        let rows = align_hunk(&h);
+        assert!(
+            rows.contains(&(Some(LineRef::at(1)), Some(LineRef::at(3)))),
+            "似ている行が組になっていない: {rows:?}"
+        );
+        assert!(
+            rows.contains(&(Some(LineRef::at(2)), None)),
+            "余った削除が消えている: {rows:?}"
+        );
+    }
+
+    /// 壊れやすい入力を 1 本にまとめて踏む。
+    /// どれか 1 つでも欠けると、実物の差分で行内ハイライトが静かに死ぬ。
+    #[test]
+    fn 行内ハイライトは極端な入力でも壊れない() {
+        // (1) CRLF と LF の混在。`\r` は本文から外れているので、
+        //     範囲に紛れ込ませてはいけない (紛れ込むと桁がずれる)。
+        let f = parse_unified(
+            "diff --git a/a.rs b/a.rs\r\n--- a/a.rs\r\n+++ b/a.rs\r\n\
+             @@ -1,2 +1,2 @@\r\n-let x = 1;\r\n+let x = 2;\r\n context\n",
+        );
+        let h = &f[0].hunks[0];
+        assert!(
+            h.lines[0].crlf && !h.lines[2].crlf,
+            "CRLF の見分けが付いていない"
+        );
+        let (a, b) = intra_line_spans(&h.lines[0].text, &h.lines[1].text).expect("似た行");
+        assert_eq!(spans_text(&h.lines[0].text, &a), vec!["1"]);
+        assert_eq!(spans_text(&h.lines[1].text, &b), vec!["2"]);
+        assert!(
+            !h.lines[0].text.contains('\r'),
+            "本文に \\r が残っている = 範囲が本文とずれる"
+        );
+
+        // (2) 全行が同じ内容の巨大な置換 (生成コード)。総当たりの上限で降り、
+        //     それでも 1 行も落とさない。
+        let same: Vec<&str> = vec!["    ```"; 400];
+        let rows = pair_changed_lines(&same, &same);
+        assert_eq!(rows.len(), 400, "行が消えた/増えた: {}", rows.len());
+        assert!(
+            rows.iter().all(|(a, b)| a == b),
+            "同じ内容なら位置どうしに落ちる"
+        );
+
+        // (3) 片側だけ巨大 (まるごと追記)。
+        let one = ["fn main() {}"];
+        let many: Vec<String> = (0..20_000).map(|i| format!("line {i}")).collect();
+        let mv: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let rows = pair_changed_lines(&one, &mv);
+        assert_eq!(rows.len(), 20_000, "片側だけ巨大で行が消えた");
+
+        // (4) CJK は文字単位まで刻む (語にまとめると行全体の塗りへ退化する)。
+        let (a, b) = intra_line_spans("日本語のテキスト", "日本語の長いテキスト").expect("似た行");
+        assert!(a.is_empty(), "旧側に消えた文字は無い: {a:?}");
+        assert_eq!(spans_text("日本語の長いテキスト", &b), vec!["長い"]);
+
+        // (5) 空行どうし・片方だけ空。
+        assert_eq!(intra_line_spans("", ""), Some((Vec::new(), Vec::new())));
+        assert!(
+            intra_line_spans("", "let x = 1;").is_none(),
+            "中身が無い行は別物"
+        );
+    }
+
+    // ---- 折りたたみ: 閾値と段階的な展開 -------------------------------------
+
+    #[test]
+    fn 畳む価値のない区間は落とすテーブル() {
+        // (区間の長さ, 最小行数, 残るか, 何を見ているか)
+        let table: &[(usize, usize, bool, &str)] = &[
+            (1, 14, false, "1 行は畳まない"),
+            (13, 14, false, "閾値の 1 つ下"),
+            (14, 14, true, "ちょうど閾値"),
+            (100, 14, true, "長い区間"),
+            (2, 0, true, "最小 0 なら全部残る"),
+        ];
+        for (len, min, keep, why) in table {
+            let runs = [FoldRun {
+                start: 5,
+                end: 5 + len,
+            }];
+            assert_eq!(
+                fold_worth_hiding(&runs, *min).len(),
+                usize::from(*keep),
+                "{why}"
+            );
+        }
+        // 既定は「20 行の塊から前後 3 行を残した 14 行」。
+        assert_eq!(FOLD_MIN_HIDDEN, FOLD_MIN_RUN - CONTEXT_KEEP * 2);
+        let kinds = kinds_of(&".".repeat(FOLD_MIN_RUN));
+        assert_eq!(
+            fold_worth_hiding(&fold_context_runs(&kinds, CONTEXT_KEEP), FOLD_MIN_HIDDEN).len(),
+            1,
+            "{FOLD_MIN_RUN} 行の塊は畳む"
+        );
+        let kinds = kinds_of(&".".repeat(FOLD_MIN_RUN - 1));
+        assert!(
+            fold_worth_hiding(&fold_context_runs(&kinds, CONTEXT_KEEP), FOLD_MIN_HIDDEN).is_empty(),
+            "{} 行の塊まではそのまま出す",
+            FOLD_MIN_RUN - 1
+        );
+    }
+
+    #[test]
+    fn 段階的な展開のテーブル() {
+        let run = FoldRun {
+            start: 10,
+            end: 110,
+        };
+        // (既に開いた行数, まだ隠れている区間, 何を見ているか)
+        let table: &[(usize, Option<(usize, usize)>, &str)] = &[
+            (0, Some((10, 110)), "まだ何も開いていない"),
+            (20, Some((30, 110)), "上から 20 行だけ開いた"),
+            (99, Some((109, 110)), "残り 1 行"),
+            (100, None, "開ききった"),
+            (999, None, "行数を超えても壊れない"),
+        ];
+        for (revealed, want, why) in table {
+            let got = fold_remaining(run, *revealed).map(|r| (r.start, r.end));
+            assert_eq!(got, *want, "{why}");
+        }
+        // (残り, 1 回の量, 端数の最小, 期待, 何を見ているか)
+        let steps: &[(usize, usize, usize, usize, &str)] = &[
+            (100, 20, 14, 20, "まだ長い: 決まった量だけ"),
+            (34, 20, 14, 20, "端数 14 は残してよい"),
+            (33, 20, 14, 33, "端数 13 になるくらいなら全部開く"),
+            (20, 20, 14, 20, "ちょうど 1 回分"),
+            (5, 20, 14, 5, "1 回分より少ない"),
+            (100, 0, 14, 100, "量 0 なら全部 (無限ループにしない)"),
+        ];
+        for (hidden, step, stub, want, why) in steps {
+            assert_eq!(unfold_next(*hidden, *step, *stub), *want, "{why}");
+        }
+        // 何回押しても必ず開ききる (段階展開が止まらない保証)。
+        let (mut revealed, mut clicks) = (0usize, 0usize);
+        while let Some(rem) = fold_remaining(run, revealed) {
+            revealed += unfold_next(rem.len(), UNFOLD_STEP, FOLD_MIN_HIDDEN);
+            clicks += 1;
+            assert!(clicks < 100, "展開が進んでいない");
+        }
+        assert!(clicks > 1, "1 回で全部開いている = 段階的でない");
+    }
+
+    /// 守りたい性質は「区間が増えても 1 行あたりの探索が伸びないこと」。
+    #[test]
+    fn 折りたたみの探索は区間数に比例しない() {
+        fn probes(runs: usize) -> usize {
+            let v: Vec<FoldRun> = (0..runs)
+                .map(|i| FoldRun {
+                    start: i * 100,
+                    end: i * 100 + 50,
+                })
+                .collect();
+            FOLD_PROBES.with(|c| c.set(0));
+            // 最後の区間を引く = 線形探索なら最悪ケース。
+            let want = v.last().copied();
+            assert_eq!(fold_covering(&v, runs * 100 - 100), want);
+            FOLD_PROBES.with(|c| c.get())
+        }
+        let (a, b) = (probes(64), probes(1024));
+        // 線形なら 16 倍。二分探索なら 6 → 10 程度。
+        assert!(
+            b <= a * 2,
+            "区間 64 → 1024 で探索が {a} → {b} 回。線形に舐めている"
+        );
+        assert!(fold_covering(&[], 0).is_none(), "空でも落ちない");
+    }
+
+    #[test]
+    fn 折りたたみ行のボタンは可用幅に収まり重ならない() {
+        let mut checked = 0usize;
+        for avail in [80.0f32, 160.0, 320.0, 640.0, 1200.0, 2400.0] {
+            for text_x in [0.0f32, 24.0, 90.0] {
+                for hidden in [2usize, 14, 20, 21, 500, 100_000] {
+                    for revealed in [0usize, 40] {
+                        let plan = fold_row_plan(avail, text_x, 7.0, hidden, revealed, UNFOLD_STEP);
+                        let why = format!(
+                            "avail={avail} text_x={text_x} hidden={hidden} revealed={revealed}"
+                        );
+                        let mut zones = vec![plan.step.clone()];
+                        zones.extend(plan.all.clone());
+                        zones.extend(plan.collapse.clone());
+                        for z in &zones {
+                            assert!(z.x >= 0.0, "左へはみ出した ({why}): {z:?}");
+                            assert!(z.x + z.w <= avail + 0.01, "右へはみ出した ({why}): {z:?}");
+                            assert!(!z.label.is_empty(), "空ラベル ({why})");
+                        }
+                        for i in 0..zones.len() {
+                            for j in i + 1..zones.len() {
+                                let (p, q) = (&zones[i], &zones[j]);
+                                assert!(
+                                    p.x + p.w <= q.x || q.x + q.w <= p.x,
+                                    "重なった ({why}): {p:?} {q:?}"
+                                );
+                            }
+                        }
+                        // 押した場所と操作の対応。余白は必ず「開く」。
+                        assert_eq!(plan.hit(plan.step.x + 1.0), FoldClick::Step, "{why}");
+                        if let Some(z) = &plan.all {
+                            assert_eq!(plan.hit(z.x + 1.0), FoldClick::All, "{why}");
+                        }
+                        if let Some(z) = &plan.collapse {
+                            assert_eq!(plan.hit(z.x + 1.0), FoldClick::Collapse, "{why}");
+                        }
+                        assert_eq!(plan.hit(-5.0), FoldClick::Step, "{why}");
+                        // 落とす順は「畳む」→「すべて」。逆になっていないこと。
+                        if plan.collapse.is_some() && plan.step_lines < hidden {
+                            assert!(
+                                plan.all.is_some(),
+                                "優先順が逆: 畳むを残して『すべて』を落とした ({why})"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "総当たりが効いていない");
+        // 極端に狭ければ任意ゾーンは全部落ちる (主ボタンだけが残る)。
+        let tight = fold_row_plan(60.0, 0.0, 7.0, 5_000, 40, UNFOLD_STEP);
+        assert!(
+            tight.collapse.is_none() && tight.all.is_none(),
+            "60px しか無いのに任意ボタンを残した"
+        );
+        // 1 回で開ききるなら「すべて」は出さない (同じ操作への経路を増やさない)。
+        let one_shot = fold_row_plan(1200.0, 0.0, 7.0, 5, 0, UNFOLD_STEP);
+        assert!(one_shot.all.is_none(), "1 回で終わるのに『すべて』が出た");
+        assert_eq!(one_shot.step_lines, 5);
+    }
+
     // ---- change_blocks / next_change_index: F7 のジャンプ ------------------
 
     #[test]
@@ -6190,6 +7071,195 @@ diff --git a/src/foo.rs b/src/foo.rs
     }
 
     // ---- DiffMode: config との往復 ----------------------------------------
+
+    /// 濃い地 (行内ハイライト) で描かれた断片だけを拾う。
+    fn word_bg_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => {
+                    for sec in &t.galley.job.sections {
+                        if sec.format.background != Color32::TRANSPARENT {
+                            out.push(t.galley.job.text[sec.byte_range.clone()].to_string());
+                        }
+                    }
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    /// 「⋯」で始まる帯の矩形と文言。
+    fn fold_row_of(shapes: &[egui::epaint::ClippedShape]) -> Option<(egui::Rect, String)> {
+        fn walk(s: &egui::Shape, out: &mut Option<(egui::Rect, String)>) {
+            if out.is_some() {
+                return;
+            }
+            match s {
+                egui::Shape::Text(t) if t.galley.job.text.starts_with('⋯') => {
+                    *out = Some((t.visual_bounding_rect(), t.galley.job.text.clone()));
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        for c in shapes {
+            walk(&c.shape, &mut out);
+        }
+        out
+    }
+
+    fn long_context_diff() -> Vec<FileDiff> {
+        let mut body = String::from(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,61 +1,61 @@\n\
+             -let x = 1;\n+let x = 2;\n",
+        );
+        for i in 0..60 {
+            body.push_str(&format!(" line {i}\n"));
+        }
+        parse_unified(&body)
+    }
+
+    /// 行内ハイライトが**一列表示でも**画面に出る。
+    ///
+    /// 一列表示では左右の対がそのまま渡ってこないので、対応付けを別に
+    /// 作らないとここが静かに死ぬ (行全体が塗られるだけになる)。
+    #[test]
+    fn 行内ハイライトは一列表示でも濃い地で出る() {
+        let theme = crate::theme::all()[0].clone();
+        for mode in [DiffMode::Inline, DiffMode::SideBySide] {
+            let ctx = egui::Context::default();
+            set_diff_mode(&ctx, mode);
+            let files = long_context_diff();
+            let mut store = DiffCommentStore::default();
+            let _ = render(
+                &ctx,
+                &theme,
+                &files,
+                &mut store,
+                (1200.0, 700.0),
+                Vec::new(),
+            );
+            let shapes = render(
+                &ctx,
+                &theme,
+                &files,
+                &mut store,
+                (1200.0, 700.0),
+                Vec::new(),
+            );
+            let hot = word_bg_texts(&shapes);
+            assert!(
+                hot.iter().any(|t| t.contains('1')) && hot.iter().any(|t| t.contains('2')),
+                "{mode:?}: 変わった語だけの濃い地が出ていない: {hot:?}"
+            );
+            assert!(
+                !hot.iter().any(|t| t.contains("let")),
+                "{mode:?}: 変わっていない語まで塗っている: {hot:?}"
+            );
+        }
+    }
+
+    /// 長い未変更域は畳まれ、押すたびに**段階的に**開く。
+    /// 純関数が緑でも UI から届いていなければ未完成なので、実際に押す。
+    #[test]
+    fn 長い未変更域は押すたびに段階的に開く() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::all()[0].clone();
+        set_diff_mode(&ctx, DiffMode::Inline);
+        let files = long_context_diff();
+        let mut store = DiffCommentStore::default();
+        // 62 行が全部入る高さにする (画面外の行は描かれないので、
+        // 開いたことの確認が「見えていないだけ」と区別できなくなる)。
+        let size = (1200.0, 1600.0);
+        let mut draw = |ev: Vec<egui::Event>| render(&ctx, &theme, &files, &mut store, size, ev);
+        let _ = draw(Vec::new());
+        let shapes = draw(Vec::new());
+        let (rect, label) = fold_row_of(&shapes).expect("折りたたみの帯が出ていない");
+        // 変更行はいつでも見える (畳んで隠してはいけない)。
+        assert!(
+            galley_rect(&shapes, "let x = 1;").is_some(),
+            "変更行まで畳んだ"
+        );
+
+        // 隠れている行数を文言から読む。押すたびに必ず減る。
+        let hidden_of = |s: &str| -> usize {
+            s.chars()
+                .filter(|c| c.is_ascii_digit() || *c == ' ')
+                .collect::<String>()
+                .split_whitespace()
+                .last()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        };
+        let mut seen = vec![hidden_of(&label)];
+        assert!(seen[0] >= FOLD_MIN_HIDDEN, "閾値未満で畳んだ: {label:?}");
+        // 開くたびに帯は下へ動く。毎回**取り直して**押す。
+        let mut cur = rect;
+        for step in 0..8 {
+            let at = egui::pos2(cur.left() + 2.0, cur.center().y);
+            let _ = draw(click_at(at, true));
+            let _ = draw(click_at(at, false));
+            // 押した結果が絵に出るのは次のフレーム (適用は描画の最後)。
+            let shapes = draw(Vec::new());
+            let Some((r, next)) = fold_row_of(&shapes) else {
+                break;
+            };
+            let n = hidden_of(&next);
+            assert!(
+                n < *seen.last().unwrap(),
+                "{step} 回目で残りが減っていない: {seen:?} → {next:?}"
+            );
+            seen.push(n);
+            cur = r;
+        }
+        assert!(seen.len() >= 2, "1 回で全部開いた = 段階的でない: {seen:?}");
+        // 最後まで押せば畳みは消え、隠れていた行が本当に出てくる。
+        let shapes = draw(Vec::new());
+        assert!(fold_row_of(&shapes).is_none(), "開ききっていない: {seen:?}");
+        assert!(
+            galley_rect(&shapes, "line 30").is_some(),
+            "隠れていた行が出てこない"
+        );
+    }
+
+    /// 1 行の色付けの手間が区間数の**二乗**にならないこと。
+    #[test]
+    fn 行の色付けの突き合わせは区間数に比例する() {
+        fn probes(k: usize) -> usize {
+            let text: String = std::iter::repeat_n("ab ", k).collect();
+            let syntax: Vec<(usize, usize, Color32)> =
+                (0..k).map(|i| (i * 3, i * 3 + 2, Color32::WHITE)).collect();
+            let words: Vec<WordSpan> = (0..k)
+                .map(|i| WordSpan {
+                    start: i * 3,
+                    end: i * 3 + 2,
+                })
+                .collect();
+            JOB_PROBES.with(|c| c.set(0));
+            let job = line_job(
+                &text,
+                &syntax,
+                &words,
+                &FontId::monospace(12.0),
+                Color32::GRAY,
+                Color32::RED,
+            );
+            assert!(!job.sections.is_empty(), "何も組み立てていない");
+            JOB_PROBES.with(|c| c.get())
+        }
+        let (a, b) = (probes(200), probes(400));
+        assert!(
+            (b as f64) <= (a as f64) * 2.5,
+            "区間 200 → 400 で突き合わせが {a} → {b} 回。二乗になっている"
+        );
+    }
 
     #[test]
     fn diff_mode_config_roundtrip() {

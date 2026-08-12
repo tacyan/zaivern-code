@@ -114,7 +114,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Tests (実PTY 以外の全て)
-        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
 
       # vendor/vt100 はワークスペースメンバーではないため、明示的に走らせないと
       # 敵対的入力テスト (hostile.rs) が一切実行されない。
@@ -169,7 +169,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Terminal (real PTY) tests
-        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::(pty_tests|pty_writer_tests|reap_pty_tests|pty_resize_tests)::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
 
   # ファイル所有リース (lease::) と実行中インスタンスのレジストリ (instances::) を
   # **Windows で実際に実行する**最小ジョブ。表示名: "windows (lease/instances)"。

@@ -112,14 +112,831 @@ fn common_alias(cp: u32) -> Option<&'static str> {
 /// ただし「末尾で切れているだけの UTF-8」はコードページで読み直さない。
 /// 出力を途中で打ち切ったり、チャンク境界で切れたバイト列は最後の 1 文字だけが
 /// 不完全なので、そこで CP932 として読み直すと**全体**が化ける
-/// (壊れているのは末尾の数バイトだけなので lossy で受けるのが正しい)。
+/// (壊れているのは末尾の数バイトだけ)。
+///
+/// **切れた末尾は落とす — 置換文字 (U+FFFD) にしない。**
+/// `String::from_utf8_lossy` は切れた列を `\u{FFFD}` へ変えるので、
+/// 「あと 1 バイト来れば読めた文字」が画面に化けとして焼き付いてしまう。
+/// 1 文字ぶんに満たないバイト列は**まだ文字ではない**ので、
+/// 見せるべき字が無い = 出さない、が正しい。
+/// 続きが来る流れ (PTY・パイプ) なら [`StreamDecoder`] を使うこと
+/// (落とさずに次のチャンクへ持ち越して復元する)。
 pub fn decode_output(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         // error_len() == None = 「入力が途中で終わった」= 不正な符号化ではない
-        Err(e) if e.error_len().is_none() => String::from_utf8_lossy(bytes).into_owned(),
+        Err(e) if e.error_len().is_none() => valid_head(bytes, e.valid_up_to()),
         Err(_) => decode_ansi_or_lossy(bytes, console_code_page()),
     }
+}
+
+// ═════════════ チャンク境界で文字を割らない (逐次復号) ═════════════
+//
+// # なぜ必要か
+//
+// PTY・パイプ・ソケットから届くバイト列は**任意の位置で切れる**。
+// 日本語 1 文字は UTF-8 で 3 バイト、絵文字は 4 バイトなので、
+// 8KB のチャンク境界がマルチバイト文字の途中に落ちるのは日常的に起きる。
+// そこを `String::from_utf8_lossy` に通すと、割れた分が `U+FFFD` (置換文字)
+// になり、**次のチャンクが来ても直らない** — 既に文字列へ焼き付いているため。
+// これが「文字化けが残る」の正体のひとつ。
+//
+// # どう直すか
+//
+// 「今回のチャンクで確定した文字列」と「次回へ持ち越す末尾バイト」に分ける。
+// 持ち越しは高々 3 バイト (UTF-8 の 1 文字は最大 4 バイトで、未完成なら
+// そのうち 1〜3 バイトしか来ていない) なので、無制限には溜まらない。
+// **本物の不正バイト** (`error_len().is_some()`) は今までどおり置換する —
+// 「まだ来ていない」と「壊れている」を区別することがこの層の仕事である。
+
+/// UTF-8 の 1 文字の最大バイト長。
+pub const MAX_UTF8_LEN: usize = 4;
+
+/// 持ち越せる最大バイト数。未完成の列は最大長より 1 バイト短い。
+pub const MAX_CARRY_LEN: usize = MAX_UTF8_LEN - 1;
+
+/// `bytes[..upto]` は検証済み、という前提で文字列にする。
+///
+/// `unsafe` を使わずに済ませるための小さな包み。`from_utf8` が
+/// `valid_up_to()` として返した位置しか渡さないので失敗しない。
+fn valid_head(bytes: &[u8], upto: usize) -> String {
+    std::str::from_utf8(&bytes[..upto])
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// **末尾に居る「まだ完成していない UTF-8 列」の長さ。**
+///
+/// 完成している / そもそも不正で終わっている場合は 0。
+/// 途中に本物の不正バイトがあっても、そこで止まらず末尾まで見る
+/// (壊れた行の後ろに、切れただけの正しい文字が続くことがある)。
+///
+/// 返り値は UTF-8 の定義から必ず [`MAX_CARRY_LEN`] 以下になる。
+pub fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(_) => return 0,
+            Err(e) => match e.error_len() {
+                // 入力が途中で終わった = ここから末尾までが持ち越し分
+                None => return bytes.len() - i - e.valid_up_to(),
+                // 本物の不正。その先も見る
+                Some(n) => i += e.valid_up_to() + n,
+            },
+        }
+    }
+    0
+}
+
+/// 2 バイト文字を持つコードページ (DBCS) の先行バイトか。
+///
+/// 表は符号化の定義そのもので、実行環境には依存しない。
+/// 知らないコードページでは `false` を返す = 持ち越さない
+/// (従来の挙動のままなので、判定を足したことで悪くはならない)。
+fn dbcs_lead(cp: u32, b: u8) -> bool {
+    match cp {
+        // CP932 (Shift_JIS)。0xA1..=0xDF は半角カナで 1 バイト文字なので外す。
+        932 => (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b),
+        // GBK / EUC-KR / Big5
+        936 | 949 | 950 => (0x81..=0xFE).contains(&b),
+        _ => false,
+    }
+}
+
+/// **レガシー符号化 (CP932 等) で末尾が先行バイトだけになっているか。**
+///
+/// 境界問題は UTF-8 だけの話ではない。CP932 の「日」は 0x93 0xFA の 2 バイトで、
+/// チャンクが 0x93 で切れたら次のチャンクの 0xFA と組にしないと読めない。
+/// バイト列の頭から数えるので、チャンクが文字境界から始まっていれば正しく同期する
+/// ([`StreamDecoder`] は持ち越しによってそれを保証する)。
+///
+/// 先行バイトだけで終わっていれば 1、そうでなければ 0。
+pub fn incomplete_dbcs_tail(bytes: &[u8], cp: u32) -> usize {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if dbcs_lead(cp, bytes[i]) {
+            if i + 1 >= bytes.len() {
+                return 1;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    0
+}
+
+/// **チャンク境界で文字を割らない復号器。**
+///
+/// PTY やパイプのように「続きが来る」流れは、1 回の読み取りごとに
+/// [`feed`](Self::feed) へ渡す。確定した文字列だけが返り、
+/// 途中で切れた末尾は次の呼び出しへ持ち越される。
+/// 流れが終わったら [`flush`](Self::flush) で残りを吐き出す
+/// (そこまで来て完成しないなら本物の不正なので置換する)。
+#[derive(Default, Debug)]
+pub struct StreamDecoder {
+    /// 次のチャンクの頭と組にする、まだ完成していない末尾バイト。
+    /// 不変条件: 常に [`MAX_CARRY_LEN`] 以下。
+    carry: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// **1 チャンクを食わせ、確定した文字列を受け取る。**
+    ///
+    /// 末尾が途中で切れていれば、そのバイトは返り値に含めず持ち越す。
+    pub fn feed(&mut self, chunk: &[u8]) -> String {
+        // 持ち越しが無い普段の道。連結せずに済むのでコピーが起きない。
+        if self.carry.is_empty() {
+            let tail = stream_tail(chunk);
+            let cut = chunk.len() - tail;
+            self.carry.extend_from_slice(&chunk[cut..]);
+            debug_assert!(self.carry.len() <= MAX_CARRY_LEN);
+            return decode_output(&chunk[..cut]);
+        }
+        // 持ち越しがあるときだけ連結する (持ち越しは高々 3 バイト)。
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(chunk);
+        let tail = stream_tail(&buf);
+        let cut = buf.len() - tail;
+        self.carry.extend_from_slice(&buf[cut..]);
+        debug_assert!(self.carry.len() <= MAX_CARRY_LEN);
+        decode_output(&buf[..cut])
+    }
+
+    /// **流れの終わり。** 持ち越しが残っていれば置換して吐き出す。
+    ///
+    /// ここまで来て完成しないバイト列は「続きが来ない」= 本物の不正なので、
+    /// 黙って捨てず置換文字にする (捨てると出力が静かに欠ける)。
+    pub fn flush(&mut self) -> String {
+        if self.carry.is_empty() {
+            return String::new();
+        }
+        let rest = std::mem::take(&mut self.carry);
+        String::from_utf8_lossy(&rest).into_owned()
+    }
+
+    /// いま持ち越しているバイト数。番人テストが不変条件を見るために公開する。
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+}
+
+// ───────── 記録: 端末に出る「$ だらけの文字化け」の正体 ─────────
+//
+// **PTY の生バイト列は vt100 (vte) へ直接流れるので、この層を通らない。**
+// vte の UTF-8 状態機械は呼び出しをまたいで途中の列を覚えるため、
+// **チャンク境界で割れても画面は化けない** (`terminal::screen_boundary_tests` が番人)。
+// 化けるのは「そもそも UTF-8 で書かれていない出力」で、実測すると次のようになる
+// (vt100 0.15.2 + vendor パッチ、10x40 の画面へ「日本語」を流した結果):
+//
+// | 子プロセスの出力 | 画面に出るもの |
+// |---|---|
+// | ISO-2022-JP `1B 24 42 …` | **`$3$s$K$A$OF|K\8l`** — `$` の羅列 |
+// | CP932 `93 FA 96 7B 8C EA` | `{` (6 バイトが 1 文字に潰れる) |
+// | EUC-JP `C6 FC CB DC B8 EC` | `\u{FFFD}\u{FFFD}` |
+//
+// `$` になるのは偶然ではない: ISO-2022-JP は JIS X 0208 を 7 ビットで書くので、
+// **ひらがなの区 (4 区) の先行バイトがちょうど 0x24 = `$`** になる。
+// 切り替え列 `ESC $ B` 自体も `$` を含む。vte は `ESC $ B` を
+// 「知らないエスケープ」として**黙って食べる**ので、後続の JIS バイトだけが
+// ASCII として画面に残り、`$3$s$K…` という見た目になる。
+//
+// **直したやり方: PTY のバイト列を vt100 へ渡す前に UTF-8 へ揃える。**
+// この層は Windows の `MultiByteToWideChar` しか変換表を持たないので、
+// mac / Linux では ISO-2022-JP / EUC-JP を復号できなかった (表を持っていない)。
+// `encoding_rs` を直接依存に足して (元から `Cargo.lock` に居たので費用は増えない)、
+// どの OS でも同じ表を引くようにした。入口は下の [`TermDecoder`]。
+
+// ═══════════ 端末バイト列を UTF-8 へ揃える (ISO-2022-JP / レガシー符号化) ═══════════
+//
+// # 位置付け
+//
+// [`StreamDecoder`] は「バイト列 → `String`」の層で、**画面 (vt100) は通らない**。
+// PTY の生バイト列は `vt100::Parser::process` へ直接流れるので、上の記録にある
+// `$` 化けはそこでは直せない。この [`TermDecoder`] は **`process` の直前**に挟む
+// 層で、入力を UTF-8 のバイト列へ揃えてから vte に渡す。
+//
+// # いちばん大事な制約: UTF-8 を壊さない
+//
+// 利用者の大多数は UTF-8 なので、そこへ回帰を入れたら被害の方が大きい。
+// そこで **既定 ([`TermEncoding::Auto`]) は「素通し」**にしてある:
+//
+// * ISO-2022-JP の**多バイト指示列** (`ESC $ @` / `ESC $ B` / `ESC $ ( D`) を
+//   **実際に見たときだけ**変換へ入る。推測で入らないので、たまたま同じ並びを
+//   含まない限りバイナリ出力も 1 バイトも変わらない。
+// * 変換に入っていない間は入力スライスを**そのまま返す** (複製ゼロ・走査 1 周)。
+// * `ESC ( B` (G0 = ASCII) や `ESC ( 0` (DEC 罫線) のような**単バイト集合の
+//   指示列は入口にしない**。前者は ISO-2022-JP を抜けるときにしか意味が無く、
+//   後者は TUI が日常的に使うので、入口にすると誤爆する。
+//
+// CP932 / EUC-JP のような「切替列を持たない」符号化は、見ただけでは
+// バイナリと区別が付かない。**当てずっぽうで変換すると `cat` した画像を壊す**ので
+// 自動では入らない。使うときは [`TermEncoding::CodePage`] を明示する
+// (端末側の入口は `ZAIVERN_TERM_ENCODING`。設定キーは統合担当へ申し送り)。
+//
+// # 変換表を持たない
+//
+// JIS X 0201 カナ / JIS X 0208 / JIS X 0212 は、**EUC-JP のバイト列へ組み替えて**
+// `encoding_rs` に読ませる (EUC-JP の符号空間はこの 3 つをそのまま含む)。
+// 自前の変換表を抱え込まずに済み、どの OS でも同じ結果になる
+// (Windows の `MultiByteToWideChar` は Windows にしか無い)。
+
+/// エスケープ (ESC)。
+const ESC: u8 = 0x1b;
+
+/// OSC / DCS のような「終端まで読む」列に付き合う上限バイト数。
+///
+/// 終端が来ない壊れた列で持ち越しが無限に伸びるのを防ぐ。ここを超えたら
+/// 「列ではなかった」と見なしてそのまま流す (画面の見た目は vte が決める)。
+const MAX_ESC_STRING: usize = 4096;
+
+/// **端末へ流れ込むバイト列の符号化。**
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TermEncoding {
+    /// 既定。UTF-8 を素通しし、ISO-2022-JP の指示列を見たときだけ変換する。
+    #[default]
+    Auto,
+    /// 常にこのコードページとして読む (自動判定が入らない符号化の逃げ道)。
+    /// ISO-2022-JP は [`Auto`](Self::Auto) が扱うのでここには来ない。
+    CodePage(u32),
+}
+
+/// ISO-2022-JP で G0 に指示されている文字集合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Charset {
+    /// `ESC ( B` — ASCII。
+    #[default]
+    Ascii,
+    /// `ESC ( J` — JIS X 0201 ローマ字。0x5C / 0x7E だけが ASCII と違うが、
+    /// そこを ¥ / ‾ へ変えるとパス表示が壊れるので ASCII と同じに扱う
+    /// (端末で困るのは化けであって、この 2 文字の字形ではない)。
+    JisRoman,
+    /// `ESC ( I` — JIS X 0201 片仮名 (半角カナ)。
+    JisKana,
+    /// `ESC $ @` / `ESC $ B` — JIS X 0208。
+    Jis0208,
+    /// `ESC $ ( D` — JIS X 0212 (補助漢字)。
+    Jis0212,
+}
+
+impl Charset {
+    /// この集合では 1 バイトがそのまま ASCII として通るか。
+    fn is_plain(self) -> bool {
+        matches!(self, Charset::Ascii | Charset::JisRoman)
+    }
+}
+
+/// 1 つのエスケープ列をどう扱うか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscStep {
+    /// まだ列が完結していない。次のチャンクを待つ。
+    Incomplete,
+    /// ISO-2022-JP の指示列。飲み込んで集合を切り替える。
+    Designate { len: usize, set: Charset },
+    /// ISO-2022-JP とは関係の無い列。1 バイトも変えずに流す。
+    Through { len: usize },
+}
+
+/// 素通しモードの走査結果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleScan {
+    /// 指示列は無い。末尾 `hold` バイトだけは次のチャンクと組にする
+    /// (`ESC` / `ESC $` / `ESC $ (` が境界で割れた場合。高々 3 バイト)。
+    Clean { hold: usize },
+    /// 指示列がある。変換の道へ。
+    Enter,
+}
+
+/// [`TermDecoder::feed`] が選んだ道。
+///
+/// 「決める」と「借りる」を分けてあるのは、`&mut self` から返す借用を
+/// 条件分岐の途中で return すると借用検査が通らないため。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    /// 入力をそのまま返す。
+    Through,
+    /// 末尾 n バイトを持ち越し、手前だけ返す。
+    Hold(usize),
+    /// ISO-2022-JP の状態機械へ。
+    Convert,
+    /// 固定コードページの復号器へ。
+    Fixed(u32),
+}
+
+/// **PTY のバイト列を vt100 へ渡す前に UTF-8 へ揃える。**
+///
+/// 状態を持つ (指示列も多バイト文字も**チャンク境界を跨ぐ**)。
+/// 1 回の読み取りごとに [`feed`](Self::feed) へ渡し、返ってきたスライスを
+/// `vt100::Parser::process` へ流す。流れが終わったら [`finish`](Self::finish)。
+#[derive(Default)]
+pub struct TermDecoder {
+    enc: TermEncoding,
+    /// いま ISO-2022-JP の状態機械の中に居るか。
+    active: bool,
+    /// G0 に指示されている集合。
+    charset: Charset,
+    /// 境界で割れた列 / 多バイト文字の持ち越し。
+    carry: Vec<u8>,
+    /// 変換したバイト列の置き場 (使い回してアロケーションを抑える)。
+    out: Vec<u8>,
+    /// 連続する多バイト文字を EUC-JP のバイト列として溜める場所。
+    /// まとめて 1 回で復号する (1 文字ずつ呼ぶと表引きの費用が文字数ぶん要る)。
+    run: Vec<u8>,
+    /// 固定コードページ用の逐次復号器 (`encoding_rs` が境界を覚える)。
+    fixed: Option<encoding_rs::Decoder>,
+    /// `fixed` がどのコードページ用か。
+    fixed_cp: Option<u32>,
+    /// 固定コードページの復号先。
+    text: String,
+    /// 走査したバイト数の累計 (番人テストが線形性を見る)。
+    scanned: u64,
+    /// 内部バッファへ**複製した**バイト数の累計。素通しなら増えない。
+    copied: u64,
+}
+
+impl std::fmt::Debug for TermDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TermDecoder")
+            .field("enc", &self.enc)
+            .field("active", &self.active)
+            .field("charset", &self.charset)
+            .field("carry", &self.carry.len())
+            .finish()
+    }
+}
+
+impl TermDecoder {
+    /// 符号化を決めて作る。既定は [`TermEncoding::Auto`]。
+    pub fn new(enc: TermEncoding) -> Self {
+        Self {
+            enc,
+            ..Default::default()
+        }
+    }
+
+    /// **1 チャンクを食わせ、vt100 へ渡すバイト列を受け取る。**
+    ///
+    /// 素通しの道では入力スライスをそのまま返す (複製ゼロ)。
+    pub fn feed<'a>(&'a mut self, chunk: &'a [u8]) -> &'a [u8] {
+        let plan = self.plan(chunk);
+        match plan {
+            Plan::Through => chunk,
+            Plan::Hold(hold) => {
+                let cut = chunk.len() - hold;
+                self.carry.extend_from_slice(&chunk[cut..]);
+                self.copied += hold as u64;
+                &chunk[..cut]
+            }
+            Plan::Convert => self.feed_iso2022(chunk),
+            Plan::Fixed(cp) => self.feed_fixed(cp, chunk),
+        }
+    }
+
+    /// **流れの終わり。** 持ち越しが残っていればそのまま吐き出す。
+    ///
+    /// ここに残るのは「完結しなかったエスケープ列」か「片方しか来なかった
+    /// 多バイト文字」なので、置換文字にはせず生のまま渡す
+    /// (見た目をどうするかは vte の仕事)。
+    pub fn finish(&mut self) -> &[u8] {
+        self.out.clear();
+        self.flush_run();
+        if let Some(dec) = self.fixed.as_mut() {
+            self.text.clear();
+            self.text.reserve(4);
+            let _ = dec.decode_to_string(b"", &mut self.text, true);
+            self.out.extend_from_slice(self.text.as_bytes());
+        }
+        let carry = std::mem::take(&mut self.carry);
+        self.out.extend_from_slice(&carry);
+        self.active = false;
+        self.charset = Charset::Ascii;
+        &self.out
+    }
+
+    /// いま持ち越しているバイト数。番人テストが上限を見るために公開する。
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+
+    /// 走査したバイト数の累計。**入力長に対して線形**であることの証拠に使う。
+    pub fn scanned(&self) -> u64 {
+        self.scanned
+    }
+
+    /// 内部バッファへ複製したバイト数の累計。素通しの道では 1 も増えない。
+    pub fn copied(&self) -> u64 {
+        self.copied
+    }
+
+    /// どの道を通るかだけ決める (`self` の借用をここで閉じる)。
+    fn plan(&mut self, chunk: &[u8]) -> Plan {
+        if let TermEncoding::CodePage(cp) = self.enc {
+            return Plan::Fixed(cp);
+        }
+        if self.active || !self.carry.is_empty() {
+            return Plan::Convert;
+        }
+        self.scanned += chunk.len() as u64;
+        match scan_idle(chunk) {
+            IdleScan::Enter => Plan::Convert,
+            IdleScan::Clean { hold: 0 } => Plan::Through,
+            IdleScan::Clean { hold } => Plan::Hold(hold),
+        }
+    }
+
+    /// ISO-2022-JP の状態機械。指示列だけを飲み込み、他の列は素通しする。
+    fn feed_iso2022(&mut self, chunk: &[u8]) -> &[u8] {
+        self.out.clear();
+        let mut joined = std::mem::take(&mut self.carry);
+        let buf: &[u8] = if joined.is_empty() {
+            chunk
+        } else {
+            joined.extend_from_slice(chunk);
+            &joined
+        };
+        self.scanned += buf.len() as u64;
+
+        let mut i = 0usize;
+        let mut hold: Option<usize> = None;
+        while i < buf.len() {
+            let b = buf[i];
+            if b == ESC {
+                match parse_escape(&buf[i..]) {
+                    EscStep::Incomplete => {
+                        hold = Some(i);
+                        break;
+                    }
+                    EscStep::Designate { len, set } => {
+                        self.flush_run();
+                        self.charset = set;
+                        i += len;
+                    }
+                    EscStep::Through { len } => {
+                        self.flush_run();
+                        self.push(&buf[i..i + len]);
+                        i += len;
+                    }
+                }
+                continue;
+            }
+            match self.charset {
+                Charset::Jis0208 | Charset::Jis0212 => {
+                    if !(0x21..=0x7e).contains(&b) {
+                        // 制御文字 (CR / LF / TAB …) は集合の外なのでそのまま。
+                        self.flush_run();
+                        self.push(&buf[i..i + 1]);
+                        i += 1;
+                        continue;
+                    }
+                    let Some(&b2) = buf.get(i + 1) else {
+                        hold = Some(i);
+                        break;
+                    };
+                    if !(0x21..=0x7e).contains(&b2) {
+                        // 対にならない = この流れは JIS ではなかった。生で流す。
+                        self.flush_run();
+                        self.push(&buf[i..i + 1]);
+                        i += 1;
+                        continue;
+                    }
+                    if self.charset == Charset::Jis0212 {
+                        self.run.push(0x8f); // EUC-JP の SS3
+                    }
+                    self.run.push(b | 0x80);
+                    self.run.push(b2 | 0x80);
+                    i += 2;
+                }
+                Charset::JisKana => {
+                    if (0x21..=0x5f).contains(&b) {
+                        self.run.push(0x8e); // EUC-JP の SS2
+                        self.run.push(b | 0x80);
+                    } else {
+                        self.flush_run();
+                        self.push(&buf[i..i + 1]);
+                    }
+                    i += 1;
+                }
+                Charset::Ascii | Charset::JisRoman => {
+                    // 次の ESC までまとめて流す (1 バイトずつ積まない)。
+                    let end = buf[i..]
+                        .iter()
+                        .position(|&c| c == ESC)
+                        .map_or(buf.len(), |p| i + p);
+                    self.push(&buf[i..end]);
+                    i = end;
+                }
+            }
+        }
+        self.flush_run();
+        if let Some(at) = hold {
+            self.carry.extend_from_slice(&buf[at..]);
+            self.copied += (buf.len() - at) as u64;
+        }
+        // ASCII に戻って持ち越しも無いなら、次のチャンクは素通しの道へ返す。
+        self.active = !(self.charset.is_plain() && self.carry.is_empty());
+        &self.out
+    }
+
+    /// 固定コードページの復号。`encoding_rs` の逐次復号器が境界を覚える。
+    fn feed_fixed<'a>(&'a mut self, cp: u32, chunk: &'a [u8]) -> &'a [u8] {
+        self.scanned += chunk.len() as u64;
+        if self.fixed_cp != Some(cp) {
+            self.fixed = encoding_for_cp(cp).map(|e| e.new_decoder_without_bom_handling());
+            self.fixed_cp = Some(cp);
+        }
+        let Some(dec) = self.fixed.as_mut() else {
+            // 知らないコードページ = 変換表が無い。素通しが最も害が少ない。
+            return chunk;
+        };
+        self.text.clear();
+        let cap = dec
+            .max_utf8_buffer_length(chunk.len())
+            .unwrap_or(chunk.len().saturating_mul(3));
+        self.text.reserve(cap);
+        let (_res, _read, _had_errors) = dec.decode_to_string(chunk, &mut self.text, false);
+        self.copied += self.text.len() as u64;
+        self.text.as_bytes()
+    }
+
+    /// 溜めた EUC-JP のバイト列を 1 回でまとめて復号する。
+    fn flush_run(&mut self) {
+        if self.run.is_empty() {
+            return;
+        }
+        // `decode_without_bom_handling` の返り値が `self.run` を借りるので、
+        // 先に取り出しておく (取り出した器は使い回すために戻す)。
+        let mut run = std::mem::take(&mut self.run);
+        let (text, _had_errors) = encoding_rs::EUC_JP.decode_without_bom_handling(&run);
+        self.out.extend_from_slice(text.as_bytes());
+        self.copied += text.len() as u64;
+        drop(text);
+        run.clear();
+        self.run = run;
+    }
+
+    /// 内部バッファへ積む (複製したバイト数を数える)。
+    fn push(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+        self.copied += bytes.len() as u64;
+    }
+}
+
+/// **素通しモードの走査 (純関数)。**
+///
+/// ISO-2022-JP の**多バイト**指示列だけを探す。`ESC ( B` のような単バイト集合の
+/// 指示列は入口にしない (TUI が日常的に出すので誤爆する)。
+fn scan_idle(bytes: &[u8]) -> IdleScan {
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i] != ESC {
+            i += 1;
+            continue;
+        }
+        let Some(&b1) = bytes.get(i + 1) else {
+            return IdleScan::Clean { hold: n - i };
+        };
+        if b1 != b'$' {
+            i += 1;
+            continue;
+        }
+        let Some(&b2) = bytes.get(i + 2) else {
+            return IdleScan::Clean { hold: n - i };
+        };
+        if b2 == b'@' || b2 == b'B' {
+            return IdleScan::Enter;
+        }
+        if b2 == b'(' {
+            let Some(&b3) = bytes.get(i + 3) else {
+                return IdleScan::Clean { hold: n - i };
+            };
+            if b3 == b'D' {
+                return IdleScan::Enter;
+            }
+        }
+        i += 1;
+    }
+    IdleScan::Clean { hold: 0 }
+}
+
+/// **1 つのエスケープ列を読む (純関数)。** `b[0]` は `ESC` である前提。
+fn parse_escape(b: &[u8]) -> EscStep {
+    debug_assert_eq!(b.first().copied(), Some(ESC));
+    let Some(&b1) = b.get(1) else {
+        return EscStep::Incomplete;
+    };
+    match b1 {
+        b'$' => match b.get(2) {
+            None => EscStep::Incomplete,
+            // JIS X 0208 (1978 / 1983)
+            Some(b'@') | Some(b'B') => EscStep::Designate {
+                len: 3,
+                set: Charset::Jis0208,
+            },
+            Some(b'(') => match b.get(3) {
+                None => EscStep::Incomplete,
+                // JIS X 0212 (補助漢字)
+                Some(b'D') => EscStep::Designate {
+                    len: 4,
+                    set: Charset::Jis0212,
+                },
+                // 他国の 94^n 集合 (GB2312 / KSC) は変換表を持たないので素通し。
+                Some(_) => EscStep::Through { len: 4 },
+            },
+            Some(_) => EscStep::Through { len: 3 },
+        },
+        b'(' => match b.get(2) {
+            None => EscStep::Incomplete,
+            Some(b'B') => EscStep::Designate {
+                len: 3,
+                set: Charset::Ascii,
+            },
+            Some(b'J') => EscStep::Designate {
+                len: 3,
+                set: Charset::JisRoman,
+            },
+            Some(b'I') => EscStep::Designate {
+                len: 3,
+                set: Charset::JisKana,
+            },
+            // `ESC ( 0` (DEC 罫線) など。TUI が使うので必ず素通しする。
+            Some(_) => EscStep::Through { len: 3 },
+        },
+        b'[' => csi_len(b),
+        // OSC / DCS / SOS / PM / APC — 終端 (BEL か ST) まで 1 つの列。
+        b']' | b'P' | b'X' | b'^' | b'_' => string_len(b),
+        // 中間バイトから始まる列 (`ESC # 8` など)。
+        0x20..=0x2f => simple_len(b),
+        _ => EscStep::Through { len: 2 },
+    }
+}
+
+/// `ESC [` … CSI の長さ。母数 → 中間 → 終端 (0x40..=0x7E)。
+fn csi_len(b: &[u8]) -> EscStep {
+    let mut i = 2usize;
+    while i < b.len() && (0x30..=0x3f).contains(&b[i]) {
+        i += 1;
+    }
+    while i < b.len() && (0x20..=0x2f).contains(&b[i]) {
+        i += 1;
+    }
+    if i >= b.len() {
+        return if i >= MAX_ESC_STRING {
+            EscStep::Through { len: i }
+        } else {
+            EscStep::Incomplete
+        };
+    }
+    EscStep::Through { len: i + 1 }
+}
+
+/// `ESC ] …` などの文字列系の長さ。BEL か ST (`ESC \`) で終わる。
+fn string_len(b: &[u8]) -> EscStep {
+    let mut i = 2usize;
+    while i < b.len() {
+        match b[i] {
+            0x07 => return EscStep::Through { len: i + 1 },
+            ESC => {
+                return match b.get(i + 1) {
+                    None => EscStep::Incomplete,
+                    Some(b'\\') => EscStep::Through { len: i + 2 },
+                    // ST でない ESC は列の打ち切り。ここまでを流す。
+                    Some(_) => EscStep::Through { len: i },
+                };
+            }
+            _ => i += 1,
+        }
+        if i >= MAX_ESC_STRING {
+            // 終端が来ない = 壊れた列。持ち越しを無限に伸ばさない。
+            return EscStep::Through { len: i };
+        }
+    }
+    EscStep::Incomplete
+}
+
+/// 中間バイトから始まる短い列 (`ESC # 8` など) の長さ。
+fn simple_len(b: &[u8]) -> EscStep {
+    let mut i = 1usize;
+    while i < b.len() && (0x20..=0x2f).contains(&b[i]) {
+        i += 1;
+    }
+    if i >= b.len() {
+        return EscStep::Incomplete;
+    }
+    EscStep::Through { len: i + 1 }
+}
+
+/// Windows のコードページ番号 → `encoding_rs` のラベル。
+///
+/// 番号は既存の [`Encoding::Ansi`] と同じ体系なので、設定・ステータスバー・
+/// ファイルの符号化と端末の符号化が同じ言葉で並ぶ。
+/// ISO-2022-JP (50220 系) はここに**入れない** — 切替列を素通しできない
+/// 素の復号器へ流すと ANSI のエスケープ列まで壊れるので、[`TermDecoder`] 自身の
+/// 状態機械 ([`TermEncoding::Auto`]) が扱う。
+fn code_page_label(cp: u32) -> Option<&'static str> {
+    const WIN125X: [&str; 9] = [
+        "windows-1250",
+        "windows-1251",
+        "windows-1252",
+        "windows-1253",
+        "windows-1254",
+        "windows-1255",
+        "windows-1256",
+        "windows-1257",
+        "windows-1258",
+    ];
+    const ISO8859: [&str; 16] = [
+        "iso-8859-1",
+        "iso-8859-2",
+        "iso-8859-3",
+        "iso-8859-4",
+        "iso-8859-5",
+        "iso-8859-6",
+        "iso-8859-7",
+        "iso-8859-8",
+        "iso-8859-9",
+        "iso-8859-10",
+        "iso-8859-11",
+        "",
+        "iso-8859-13",
+        "iso-8859-14",
+        "iso-8859-15",
+        "iso-8859-16",
+    ];
+    Some(match cp {
+        932 => "shift_jis",
+        936 => "gbk",
+        54936 => "gb18030",
+        949 => "euc-kr",
+        950 => "big5",
+        20932 | 51932 => "euc-jp",
+        65001 => "utf-8",
+        874 => "windows-874",
+        866 => "ibm866",
+        10000 => "macintosh",
+        20866 => "koi8-r",
+        21866 => "koi8-u",
+        1250..=1258 => WIN125X[(cp - 1250) as usize],
+        28591..=28606 => ISO8859[(cp - 28591) as usize],
+        _ => return None,
+    })
+}
+
+/// コードページ番号に対応する `encoding_rs` の符号化。
+fn encoding_for_cp(cp: u32) -> Option<&'static encoding_rs::Encoding> {
+    encoding_rs::Encoding::for_label(code_page_label(cp)?.as_bytes())
+}
+
+/// **名前から端末の符号化を引く。** 設定 / 環境変数の入口。
+///
+/// `auto` (既定) / `utf-8` / `cp932` / `shift_jis` / `euc-jp` / `iso-2022-jp` /
+/// 表に無い言語環境向けの `cp<番号>` を受ける。
+/// [`encoding_by_name`] と違い**「この OS で保存できるか」で絞らない** —
+/// 端末は読むだけなので、`WideCharToMultiByte` の有無は関係が無い。
+pub fn term_encoding_by_name(name: &str) -> Option<TermEncoding> {
+    let key = normalize_enc_key(name);
+    if key.is_empty() || key == "auto" {
+        return Some(TermEncoding::Auto);
+    }
+    let mut hit: Option<Encoding> = None;
+    for (enc, id, aliases) in encoding_candidates() {
+        let matched = normalize_enc_key(id) == key
+            || aliases.iter().any(|a| normalize_enc_key(a) == key)
+            || matches!(enc, Encoding::Ansi(cp) if key == format!("cp{cp}"));
+        if matched {
+            hit = Some(enc);
+            break;
+        }
+    }
+    let enc = match hit {
+        Some(e) => e,
+        // 表に無いコードページを番号で直に指定する道 (地域を問わない)。
+        None => Encoding::Ansi(key.strip_prefix("cp").and_then(|r| r.parse::<u32>().ok())?),
+    };
+    match enc {
+        // UTF-8 は素通しが正解 (変換を挟まない = 1 バイトも変わらない)。
+        Encoding::Utf8 | Encoding::Utf8Bom => Some(TermEncoding::Auto),
+        // ISO-2022-JP は Auto の状態機械が扱う (エスケープ列を壊さないため)。
+        Encoding::Ansi(cp) if (50220..=50222).contains(&cp) => Some(TermEncoding::Auto),
+        Encoding::Ansi(cp) if encoding_for_cp(cp).is_some() => Some(TermEncoding::CodePage(cp)),
+        // UTF-16 の端末出力は存在しない。表に無いコードページも引けない。
+        _ => None,
+    }
+}
+
+/// 「このチャンクの末尾のうち、次へ持ち越すバイト数」。
+///
+/// UTF-8 として切れているならその長さ。UTF-8 として**本物に壊れている**
+/// (= レガシー符号化の流れ) なら、DBCS の先行バイトが末尾に居ないかを見る。
+fn stream_tail(bytes: &[u8]) -> usize {
+    let tail = incomplete_utf8_tail(bytes);
+    if tail > 0 {
+        return tail;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return 0;
+    }
+    incomplete_dbcs_tail(bytes, console_code_page())
 }
 
 /// ファイルの中身を文字列にする。BOM と UTF-16 も見る。
@@ -138,6 +955,9 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, Encoding) {
     }
     match std::str::from_utf8(bytes) {
         Ok(s) => (s.to_string(), Encoding::Utf8),
+        // 末尾が切れているだけ = UTF-8 のファイルが途中で終わっている。
+        // ここでコードページへ倒すと**全文**が化ける (壊れているのは末尾数バイト)。
+        Err(e) if e.error_len().is_none() => (valid_head(bytes, e.valid_up_to()), Encoding::Utf8),
         Err(_) => {
             let cp = ansi_code_page();
             (decode_ansi_or_lossy(bytes, cp), Encoding::Ansi(cp))
@@ -451,6 +1271,8 @@ pub fn ps_script_bytes(script: &str) -> Vec<u8> {
 fn decode_utf8_or_ansi(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
+        // BOM が付いていて末尾だけ切れている = やはり UTF-8。全文を倒さない。
+        Err(e) if e.error_len().is_none() => valid_head(bytes, e.valid_up_to()),
         Err(_) => decode_ansi_or_lossy(bytes, ansi_code_page()),
     }
 }
@@ -1990,6 +2812,541 @@ pub fn grapheme_end(s: &str, at: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────── 端末バイト列の正規化 (TermDecoder) の番人 ─────────
+    //
+    // 「$ だらけの文字化け」は ISO-2022-JP を vte がそのまま食べたことが原因
+    // (上の記録を参照)。ここでは**実測で確定しているバイト列そのもの**を素材に、
+    // (1) 化けが直る (2) UTF-8 を 1 バイトも変えない (3) どこで割っても同じ、
+    // の 3 つを固定する。
+
+    /// ISO-2022-JP の「日本語」。実測で `$3$s$K$A$OF|K\8l` になっていた形。
+    /// `ESC $ B` で JIS X 0208 へ、`ESC ( B` で ASCII へ戻る。
+    const ISO2022JP_JA: &[u8] = b"\x1b$BF|K\\8l\x1b(B";
+    /// CP932 (Shift_JIS) の「日本語」。
+    const CP932_JA: &[u8] = &[0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea];
+    /// EUC-JP の「日本語」。
+    const EUCJP_JA: &[u8] = &[0xc6, 0xfc, 0xcb, 0xdc, 0xb8, 0xec];
+
+    /// チャンク列を通して、vt100 へ渡るバイト列を全部つなげる。
+    fn normalized(enc: TermEncoding, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut d = TermDecoder::new(enc);
+        let mut out: Vec<u8> = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(d.feed(c));
+        }
+        out.extend_from_slice(d.finish());
+        out
+    }
+
+    fn normalized_text(enc: TermEncoding, chunks: &[&[u8]]) -> String {
+        String::from_utf8_lossy(&normalized(enc, chunks)).into_owned()
+    }
+
+    /// **これが本題。** 修正前は `$3$s$K$A$OF|K\8l` の形で画面に残っていた。
+    #[test]
+    fn iso2022jpの日本語がそのまま日本語になる() {
+        let got = normalized_text(TermEncoding::Auto, &[ISO2022JP_JA]);
+        assert_eq!(got, "日本語");
+        assert!(!got.contains('$'), "$ が残っている: {got:?}");
+    }
+
+    /// 切替列が**チャンク境界のどこで割れても**結果が変わらない。
+    /// `1B` / `24` / `42` が別チャンクになる場合を全部通る。
+    #[test]
+    fn iso2022jpはどこで割っても同じになる() {
+        let whole = normalized(TermEncoding::Auto, &[ISO2022JP_JA]);
+        for cut in 0..=ISO2022JP_JA.len() {
+            let split = normalized(
+                TermEncoding::Auto,
+                &[&ISO2022JP_JA[..cut], &ISO2022JP_JA[cut..]],
+            );
+            assert_eq!(split, whole, "cut={cut} で結果が変わった");
+        }
+    }
+
+    /// 1 バイトずつ流しても同じ (PTY が最悪の切り方をした場合)。
+    #[test]
+    fn iso2022jpは一バイトずつ流しても同じになる() {
+        let whole = normalized(TermEncoding::Auto, &[ISO2022JP_JA]);
+        let one: Vec<&[u8]> = ISO2022JP_JA.iter().map(std::slice::from_ref).collect();
+        assert_eq!(normalized(TermEncoding::Auto, &one), whole);
+    }
+
+    /// 混在 — ANSI の色列・ASCII・半角カナ (`ESC ( I`) を挟んでも壊れない。
+    #[test]
+    fn iso2022jpと制御列が混ざっても壊れない() {
+        let src: &[u8] = b"ok \x1b[31m\x1b$BF|K\\8l\x1b(I123\x1b(B\x1b[0m done\r\n";
+        let whole = normalized(TermEncoding::Auto, &[src]);
+        let text = String::from_utf8_lossy(&whole).into_owned();
+        assert!(text.contains("日本語"), "{text:?}");
+        assert!(text.contains("ｱｲｳ"), "半角カナが出ない: {text:?}");
+        assert!(
+            text.contains("\x1b[31m") && text.contains("\x1b[0m"),
+            "色列が消えた"
+        );
+        for cut in 0..=src.len() {
+            assert_eq!(
+                normalized(TermEncoding::Auto, &[&src[..cut], &src[cut..]]),
+                whole,
+                "cut={cut}"
+            );
+        }
+    }
+
+    /// **最重要の制約。** UTF-8 のチャンクは 1 バイトも変えずに素通しする。
+    /// 返ってきたスライスが**入力そのもの**であること (複製が起きていない)
+    /// をポインタで確かめる。
+    #[test]
+    fn utf8の入力は一バイトも変わらない() {
+        let src = "日本語 🎉 café ＡＢ ok\r\n\x1b[1;32m緑\x1b[0m".as_bytes();
+        let mut d = TermDecoder::new(TermEncoding::Auto);
+        let out = d.feed(src);
+        assert_eq!(out.as_ptr(), src.as_ptr(), "入力とは別の場所を指している");
+        assert_eq!(out.len(), src.len());
+        assert_eq!(d.copied(), 0, "複製が起きた");
+        assert_eq!(d.carry_len(), 0);
+    }
+
+    /// UTF-8 をどこで割っても、つないだ結果は元のバイト列と一致する。
+    #[test]
+    fn utf8はどこで割っても元のバイト列に戻る() {
+        let src = "日本語 🎉 café ＡＢ ok".as_bytes();
+        for cut in 0..=src.len() {
+            let got = normalized(TermEncoding::Auto, &[&src[..cut], &src[cut..]]);
+            assert_eq!(got, src, "cut={cut}");
+        }
+    }
+
+    /// 走査は入力長に**線形**で、素通しの道では複製が 1 バイトも起きない。
+    /// (絶対時間では測らない — 守りたい性質は「余分に触らない」ことなので、
+    ///  触ったバイト数そのものを数える。)
+    #[test]
+    fn 素通しの道は走査が線形で複製が起きない() {
+        let unit = "日本語 ok \x1b[0m ".repeat(64);
+        let mut counts: Vec<(usize, u64, u64)> = Vec::new();
+        for times in [1usize, 2, 4] {
+            let src = unit.repeat(times);
+            let mut d = TermDecoder::new(TermEncoding::Auto);
+            let _ = d.feed(src.as_bytes());
+            counts.push((src.len(), d.scanned(), d.copied()));
+        }
+        for (len, scanned, copied) in &counts {
+            // 走査は**ちょうど 1 周**。入力長を超えたら二度読みしている。
+            assert_eq!(*scanned, *len as u64, "走査が入力長と違う: {counts:?}");
+            assert_eq!(*copied, 0, "複製が起きた: {counts:?}");
+        }
+        let base = counts[0].1;
+        assert_eq!(counts[1].1, base * 2, "2 倍の入力で走査が 2 倍にならない");
+        assert_eq!(counts[2].1, base * 4, "4 倍の入力で走査が 4 倍にならない");
+    }
+
+    /// バイナリ (`cat` した画像など) は 1 バイトも変えない。
+    /// 決め打ちの並びではなく、線形合同法で 0..=255 を一様に混ぜた列で見る。
+    #[test]
+    fn バイナリ出力は素通しする() {
+        let mut bin: Vec<u8> = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut x: u32 = 20260812;
+        for _ in 0..4000 {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            bin.push((x >> 16) as u8);
+        }
+        // 素材そのものが指示列を含んでいたら、この検査は意味を成さない。
+        assert!(
+            !bin.windows(3).any(|w| w == b"\x1b$B" || w == b"\x1b$@"),
+            "素材に指示列が入っている"
+        );
+        let mut d = TermDecoder::new(TermEncoding::Auto);
+        let out = d.feed(&bin).to_vec();
+        let out = [out, d.finish().to_vec()].concat();
+        assert_eq!(out, bin, "バイナリが変わった");
+        assert!(d.copied() <= 1, "複製は末尾の持ち越しだけのはず");
+    }
+
+    /// 切替列だけ・途中で切れた列・閉じない列。
+    /// **飲み込んで良いのは ISO-2022-JP の指示列だけ**で、それ以外は必ず残る。
+    #[test]
+    fn 壊れた切替列でも入力を失わない() {
+        let table: &[(&[u8], &[u8])] = &[
+            // 完結していない列は持ち越し、finish で生のまま出す。
+            (b"\x1b", b"\x1b"),
+            (b"\x1b$", b"\x1b$"),
+            (b"\x1b$(", b"\x1b$("),
+            (b"\x1b]0;title", b"\x1b]0;title"),
+            // 指示列は飲み込む (画面に出す字を持たない)。
+            (b"\x1b$B", b""),
+            (b"\x1b$B\x1b(B", b""),
+            // 対にならなかった JIS の 1 バイトは生で残す。
+            (b"\x1b$BF", b"F"),
+            // 素通しモードでは `ESC ( B` にも触らない。
+            (b"\x1b(B", b"\x1b(B"),
+        ];
+        for (src, want) in table {
+            let got = normalized(TermEncoding::Auto, &[src]);
+            assert_eq!(got, *want, "{src:?}");
+        }
+    }
+
+    /// 明示指定した CP932 / EUC-JP が正しい文字になる。
+    /// `encoding_rs` の表を使うので **OS を問わず**同じ結果になる。
+    #[test]
+    fn 明示したコードページで日本語になる() {
+        assert_eq!(
+            normalized_text(TermEncoding::CodePage(932), &[CP932_JA]),
+            "日本語"
+        );
+        assert_eq!(
+            normalized_text(TermEncoding::CodePage(51932), &[EUCJP_JA]),
+            "日本語"
+        );
+        // UTF-8 を明示しても壊れない。
+        assert_eq!(
+            normalized_text(TermEncoding::CodePage(65001), &["日本語".as_bytes()]),
+            "日本語"
+        );
+    }
+
+    /// 固定コードページでも、どこで割っても同じ (逐次復号器が境界を覚える)。
+    #[test]
+    fn 固定コードページはどこで割っても同じになる() {
+        for (cp, src) in [(932u32, CP932_JA), (51932, EUCJP_JA)] {
+            let whole = normalized(TermEncoding::CodePage(cp), &[src]);
+            for cut in 0..=src.len() {
+                assert_eq!(
+                    normalized(TermEncoding::CodePage(cp), &[&src[..cut], &src[cut..]]),
+                    whole,
+                    "cp={cp} cut={cut}"
+                );
+            }
+        }
+    }
+
+    /// 固定コードページでも ANSI のエスケープ列は素通しする
+    /// (CP932 / EUC-JP は ASCII 透過なので、色が消えない)。
+    #[test]
+    fn 固定コードページでも色列は残る() {
+        let mut src: Vec<u8> = b"\x1b[31m".to_vec();
+        src.extend_from_slice(CP932_JA);
+        src.extend_from_slice(b"\x1b[0m");
+        let got = normalized_text(TermEncoding::CodePage(932), &[&src]);
+        assert_eq!(got, "\x1b[31m日本語\x1b[0m");
+    }
+
+    /// `ESC ( 0` (DEC 罫線) は TUI が日常的に使う。入口にしてはいけない。
+    #[test]
+    fn 単バイト集合の指示列は変換の入口にならない() {
+        for src in [&b"\x1b(0qqqj\x1b(B"[..], &b"\x1b(B plain"[..]] {
+            let mut d = TermDecoder::new(TermEncoding::Auto);
+            let out = d.feed(src);
+            assert_eq!(out, src, "{src:?} で素通しにならなかった");
+            assert_eq!(d.copied(), 0);
+        }
+    }
+
+    /// エスケープ列の読み取り (純関数) を表で固定する。
+    #[test]
+    fn エスケープ列の長さを表で固定する() {
+        let table: &[(&[u8], EscStep)] = &[
+            (b"\x1b", EscStep::Incomplete),
+            (b"\x1b$", EscStep::Incomplete),
+            (b"\x1b$(", EscStep::Incomplete),
+            (
+                b"\x1b$B",
+                EscStep::Designate {
+                    len: 3,
+                    set: Charset::Jis0208,
+                },
+            ),
+            (
+                b"\x1b$@",
+                EscStep::Designate {
+                    len: 3,
+                    set: Charset::Jis0208,
+                },
+            ),
+            (
+                b"\x1b$(D",
+                EscStep::Designate {
+                    len: 4,
+                    set: Charset::Jis0212,
+                },
+            ),
+            (
+                b"\x1b(B",
+                EscStep::Designate {
+                    len: 3,
+                    set: Charset::Ascii,
+                },
+            ),
+            (
+                b"\x1b(J",
+                EscStep::Designate {
+                    len: 3,
+                    set: Charset::JisRoman,
+                },
+            ),
+            (
+                b"\x1b(I",
+                EscStep::Designate {
+                    len: 3,
+                    set: Charset::JisKana,
+                },
+            ),
+            (b"\x1b(0", EscStep::Through { len: 3 }),
+            (b"\x1b[31m", EscStep::Through { len: 5 }),
+            (b"\x1b[1;2;3H rest", EscStep::Through { len: 8 }),
+            (b"\x1b[", EscStep::Incomplete),
+            (b"\x1b]0;t\x07", EscStep::Through { len: 6 }),
+            (b"\x1b]0;t\x1b\\", EscStep::Through { len: 7 }),
+            (b"\x1b]0;t", EscStep::Incomplete),
+            (b"\x1b#8", EscStep::Through { len: 3 }),
+            (b"\x1b7", EscStep::Through { len: 2 }),
+        ];
+        for (src, want) in table {
+            assert_eq!(parse_escape(src), *want, "{src:?}");
+        }
+    }
+
+    /// 素通し走査 (純関数) を表で固定する。持ち越しは高々 3 バイト。
+    #[test]
+    fn 素通し走査の判定を表で固定する() {
+        let table: &[(&[u8], IdleScan)] = &[
+            (b"plain", IdleScan::Clean { hold: 0 }),
+            (b"\x1b[31mred\x1b[0m", IdleScan::Clean { hold: 0 }),
+            (b"a\x1b", IdleScan::Clean { hold: 1 }),
+            (b"a\x1b$", IdleScan::Clean { hold: 2 }),
+            (b"a\x1b$(", IdleScan::Clean { hold: 3 }),
+            (b"a\x1b$B", IdleScan::Enter),
+            (b"a\x1b$@x", IdleScan::Enter),
+            (b"a\x1b$(D", IdleScan::Enter),
+            (b"a\x1b$(C", IdleScan::Clean { hold: 0 }),
+            (b"a\x1b(B", IdleScan::Clean { hold: 0 }),
+        ];
+        for (src, want) in table {
+            assert_eq!(scan_idle(src), *want, "{src:?}");
+        }
+    }
+
+    /// 持ち越しは境界で割れた列のぶんだけ — 無制限には溜まらない。
+    #[test]
+    fn 持ち越しは有界() {
+        let mut d = TermDecoder::new(TermEncoding::Auto);
+        for _ in 0..200 {
+            let _ = d.feed(b"a\x1b$(");
+            assert!(d.carry_len() <= MAX_ESC_STRING, "持ち越しが伸びた");
+        }
+        // 終端の来ない OSC を延々と食わせても上限で降りる。
+        let mut d2 = TermDecoder::new(TermEncoding::Auto);
+        let _ = d2.feed(b"\x1b$B\x1b(B\x1b]0;");
+        for _ in 0..200 {
+            let _ = d2.feed(&[b'x'; 64]);
+            assert!(d2.carry_len() <= MAX_ESC_STRING, "OSC で持ち越しが伸びた");
+        }
+    }
+
+    /// 名前から端末の符号化を引く。**この OS で保存できるかでは絞らない。**
+    #[test]
+    fn 端末の符号化を名前で引く() {
+        let table: &[(&str, Option<TermEncoding>)] = &[
+            ("", Some(TermEncoding::Auto)),
+            ("auto", Some(TermEncoding::Auto)),
+            ("utf-8", Some(TermEncoding::Auto)),
+            ("UTF8", Some(TermEncoding::Auto)),
+            ("iso-2022-jp", Some(TermEncoding::Auto)),
+            ("cp932", Some(TermEncoding::CodePage(932))),
+            ("shift_jis", Some(TermEncoding::CodePage(932))),
+            ("Shift-JIS", Some(TermEncoding::CodePage(932))),
+            ("euc-jp", Some(TermEncoding::CodePage(51932))),
+            ("cp936", Some(TermEncoding::CodePage(936))),
+            ("cp1251", Some(TermEncoding::CodePage(1251))),
+            ("utf-16le", None),
+            ("cp99999", None),
+            ("そんな名前は無い", None),
+        ];
+        for (name, want) in table {
+            assert_eq!(term_encoding_by_name(name), *want, "{name:?}");
+        }
+    }
+
+    /// コードページ番号 → `encoding_rs` の対応。ISO-2022-JP は**入れない**
+    /// (素の復号器へ流すと ANSI のエスケープ列まで壊れるため)。
+    #[test]
+    fn コードページ番号から変換表を引く() {
+        assert!(encoding_for_cp(932).is_some());
+        assert!(encoding_for_cp(51932).is_some());
+        assert!(encoding_for_cp(1252).is_some());
+        assert!(
+            encoding_for_cp(50220).is_none(),
+            "iso-2022-jp は Auto の担当"
+        );
+        assert!(encoding_for_cp(0).is_none());
+    }
+
+    // ───────── チャンク境界 (逐次復号) の番人 ─────────
+    //
+    // ここが緑である限り「途中で切れたから化けた」は構造的に起こらない。
+    // 素材は 3 バイト (日本語)・4 バイト (絵文字)・結合文字・全角英数を
+    // わざと混ぜてある。1 バイトの ASCII だけでは境界問題が再現しない。
+
+    /// 割り方を変えても結果が変わってはいけない素材。
+    fn boundary_sample() -> &'static str {
+        "日本語 🎉 café ＡＢ か\u{3099} 👨\u{200d}👩\u{200d}👧\u{200d}👦 end"
+    }
+
+    /// **修正前はここで `U+FFFD` が出ていた。**
+    /// 「進捗を報告します」の最後の 1 バイトを落としただけで、
+    /// `from_utf8_lossy` が末尾を置換文字に変えていた。
+    #[test]
+    fn 切れた末尾は置換文字にならない() {
+        let full = boundary_sample().as_bytes();
+        for cut in 1..full.len() {
+            let s = decode_output(&full[..cut]);
+            assert!(!s.contains('\u{fffd}'), "cut={cut} で置換文字が出た: {s:?}");
+        }
+    }
+
+    /// **総当たり: どこで 2 分割しても、一括で流したのと同じ文字列になる。**
+    /// これが一致する限り、チャンク境界で文字が割れる事故は起こらない。
+    #[test]
+    fn どこで割っても結果が一致する() {
+        let src = boundary_sample();
+        let bytes = src.as_bytes();
+        for cut in 0..=bytes.len() {
+            let mut d = StreamDecoder::default();
+            let mut got = d.feed(&bytes[..cut]);
+            got.push_str(&d.feed(&bytes[cut..]));
+            got.push_str(&d.flush());
+            assert_eq!(got, src, "cut={cut} で結果が変わった");
+            assert_eq!(d.carry_len(), 0, "cut={cut} で持ち越しが残った");
+        }
+    }
+
+    /// 1 バイトずつ流しても同じ (最悪の割れ方)。
+    #[test]
+    fn 一バイトずつ流しても結果が一致する() {
+        let src = boundary_sample();
+        let mut d = StreamDecoder::default();
+        let mut got = String::new();
+        for b in src.as_bytes() {
+            got.push_str(&d.feed(&[*b]));
+        }
+        got.push_str(&d.flush());
+        assert_eq!(got, src);
+    }
+
+    /// 3 分割の総当たり。2 分割が通っても、持ち越しの上に更に持ち越しが
+    /// 乗る形 (4 バイト文字を 1+1+2 に割る等) は別の道を通る。
+    #[test]
+    fn 三分割の総当たりでも結果が一致する() {
+        let src = "あ🎉い"; // 3 + 4 + 3 バイト
+        let bytes = src.as_bytes();
+        for i in 0..=bytes.len() {
+            for j in i..=bytes.len() {
+                let mut d = StreamDecoder::default();
+                let mut got = d.feed(&bytes[..i]);
+                got.push_str(&d.feed(&bytes[i..j]));
+                got.push_str(&d.feed(&bytes[j..]));
+                got.push_str(&d.flush());
+                assert_eq!(got, src, "i={i} j={j}");
+            }
+        }
+    }
+
+    /// **持ち越しは無限に溜まらない。** UTF-8 の 1 文字は最大 4 バイトなので、
+    /// 未完成な列は必ず 3 バイト以下。不正なバイト列を延々と流しても同じ。
+    #[test]
+    fn 持ち越しは上限を超えない() {
+        let mut d = StreamDecoder::default();
+        // 決定的な擬似乱数 (種を固定 — 間欠的な失敗を作らない)
+        let mut x: u32 = 0x2026_0812;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = [(x >> 24) as u8, (x >> 16) as u8, (x >> 8) as u8];
+            let _ = d.feed(&b[..1 + (x as usize % 3)]);
+            assert!(
+                d.carry_len() <= MAX_CARRY_LEN,
+                "持ち越しが {} バイトまで伸びた",
+                d.carry_len()
+            );
+        }
+    }
+
+    /// **「まだ来ていない」と「壊れている」を区別する。**
+    /// 本物の不正バイトは今までどおり置換する — ここを区別しないと、
+    /// 壊れたバイト列を永久に待ち続けて出力が止まる。
+    #[test]
+    fn 本物の不正バイトは置換して先へ進む() {
+        let mut d = StreamDecoder::default();
+        let got = d.feed(&[0xff, 0xfe, b'o', b'k']);
+        // どの OS でも成り立つ不変条件は 3 つ
+        assert!(got.ends_with("ok"), "後続の正しい文字は出ること: {got:?}");
+        assert_eq!(d.carry_len(), 0, "不正バイトを持ち越してはいけない");
+        assert!(
+            got.chars().count() > 2,
+            "不正バイトを黙って捨ててはいけない: {got:?}"
+        );
+        // **置換文字になるかは OS で変わる。** `decode_output` は本物の不正バイトを
+        // `decode_ansi_or_lossy(bytes, console_code_page())` へ送るので、
+        // Windows では**コンソールのコードページで復号され**、置換文字にならない
+        // (CP437 なら 0xFF/0xFE は罫線記号になる)。これは仕様どおりの分岐なので、
+        // 置換文字を要求するのは非 Windows だけにする。
+        // 「OS で分岐する既定値は、テストも OS 条件を明示する」(CLAUDE.md)。
+        #[cfg(not(windows))]
+        assert!(
+            got.contains('\u{fffd}'),
+            "不正バイトは置換されること: {got:?}"
+        );
+    }
+
+    /// 先頭バイトだけ来て続きが来ないまま流れが終わったら、黙って捨てずに置換する
+    /// (捨てると出力が静かに欠ける)。
+    #[test]
+    fn 終端で完成しない列は置換して吐き出す() {
+        let mut d = StreamDecoder::default();
+        assert_eq!(d.feed("あ".as_bytes().split_last().unwrap().1), "");
+        assert_eq!(d.carry_len(), 2);
+        assert_eq!(d.flush(), "\u{fffd}");
+        assert_eq!(d.carry_len(), 0);
+    }
+
+    /// 末尾の未完成長は表で固定する (境界の判定そのもの)。
+    #[test]
+    fn 未完成な末尾の長さを数える() {
+        let cases: &[(&[u8], usize)] = &[
+            (b"", 0),
+            (b"ascii", 0),
+            (&[0xE6, 0x97, 0xA5], 0),       // 日 (完成)
+            (&[0xE6, 0x97], 2),             // 日 の途中
+            (&[0xE6], 1),                   // 日 の頭だけ
+            (&[0xF0, 0x9F, 0x8E], 3),       // 🎉 の途中 (最大の持ち越し)
+            (&[0xFF, 0xE6], 1),             // 不正の後ろに切れた頭
+            (&[0xFF, 0xFF], 0),             // 全部不正 = 持ち越さない
+            (&[b'a', 0xE6, 0x97, 0xA5], 0), // ascii + 完成
+        ];
+        for (b, want) in cases {
+            assert_eq!(incomplete_utf8_tail(b), *want, "bytes={b:x?}");
+            assert!(
+                incomplete_utf8_tail(b) <= MAX_CARRY_LEN,
+                "持ち越しは {MAX_CARRY_LEN} バイト以下"
+            );
+        }
+    }
+
+    /// **レガシー符号化でも同じ境界問題が起きる。**
+    /// CP932 の「日」は 0x93 0xFA。0x93 で切れたら次のチャンクと組にしないと読めない。
+    /// 純関数なので Windows 以外でも検証できる。
+    #[test]
+    fn dbcs_の先行バイトだけの末尾を持ち越す() {
+        // 0x93 0xFA 0x96 = 「日」+「本」の先行バイトまで
+        assert_eq!(incomplete_dbcs_tail(&[0x93, 0xFA, 0x96], 932), 1);
+        assert_eq!(incomplete_dbcs_tail(&[0x93, 0xFA, 0x96, 0x7B], 932), 0);
+        // 半角カナ (0xA1..=0xDF) は 1 バイト文字なので持ち越さない
+        assert_eq!(incomplete_dbcs_tail(&[0xB1], 932), 0);
+        // ASCII だけなら何も持ち越さない
+        assert_eq!(incomplete_dbcs_tail(b"plain ascii", 932), 0);
+        // 知らないコードページでは判定しない (従来どおり)
+        assert_eq!(incomplete_dbcs_tail(&[0x93], 1252), 0);
+    }
 
     #[test]
     fn utf8_passes_through_unchanged() {

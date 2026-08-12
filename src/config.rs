@@ -38,6 +38,110 @@ pub const DEFAULT_LOCAL_HISTORY_GAP_HOURS: u32 = 12;
 /// 同じ 0.80 で「絞れ」を出すので、しきい値の意味を 2 か所で食い違わせない。
 pub const DEFAULT_COST_WARN_RATIO: f32 = 0.80;
 
+/// ガターの git blame をどこまで出すか。**3 段**ある。
+///
+/// 競合で最も評価が高いのは GitLens の既定である「カーソル行だけ」で、
+/// 全行ガターは横幅を食って邪魔になるという評価が多い。そこで既定は
+/// [`BlameMode::Off`] のまま、`current` を**中間の段**として持つ。
+///
+/// ## 旧設定との互換
+///
+/// 0.15.0 までは `git_blame = true / false` の**真偽値**だった。
+/// [`BlameMode`] の `Deserialize` は bool も文字列も読むので、既存の
+/// config.toml / state.toml はそのまま動く (`true` → [`BlameMode::All`])。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlameMode {
+    /// 出さない (既定)。git は 1 度も起きない。
+    #[default]
+    Off,
+    /// **カーソル行だけ**。取りに行くのもその 1 行を含むブロックだけ。
+    Current,
+    /// 可視域の全行 (0.15.0 までの `git_blame = true` と同じ)。
+    All,
+}
+
+impl BlameMode {
+    /// config の文字列から。未知の値は既定 (Off)。
+    pub fn from_config_str(s: &str) -> BlameMode {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "current" | "line" | "cursor" => BlameMode::Current,
+            "all" | "true" | "gutter" | "1" => BlameMode::All,
+            _ => BlameMode::Off,
+        }
+    }
+
+    /// 旧形式の真偽値から (`true` = 全行)。
+    pub fn from_flag(on: bool) -> BlameMode {
+        if on {
+            BlameMode::All
+        } else {
+            BlameMode::Off
+        }
+    }
+
+    /// config へ書く文字列。
+    pub const fn config_str(self) -> &'static str {
+        match self {
+            BlameMode::Off => "off",
+            BlameMode::Current => "current",
+            BlameMode::All => "all",
+        }
+    }
+
+    /// UI に出す名前 (**日本語の原文**。表示側で `tr` を通す)。
+    pub const fn label(self) -> &'static str {
+        match self {
+            BlameMode::Off => "出さない",
+            BlameMode::Current => "カーソル行だけ",
+            BlameMode::All => "全行",
+        }
+    }
+
+    /// 何か出すか (ガターの列を確保するかの判定)。
+    pub fn is_on(self) -> bool {
+        !matches!(self, BlameMode::Off)
+    }
+
+    /// 次の段 (メニューの 1 項目から 3 段を回すため)。
+    pub fn next(self) -> BlameMode {
+        match self {
+            BlameMode::Off => BlameMode::Current,
+            BlameMode::Current => BlameMode::All,
+            BlameMode::All => BlameMode::Off,
+        }
+    }
+}
+
+impl Serialize for BlameMode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.config_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for BlameMode {
+    /// **旧形式の真偽値も読む。** 既存ユーザーの `git_blame = true` を
+    /// 「壊れた設定」にしないための入口で、ここが唯一の変換点。
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<BlameMode, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BlameMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#""off" / "current" / "all" (旧形式の true / false も可)"#)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<BlameMode, E> {
+                Ok(BlameMode::from_flag(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<BlameMode, E> {
+                Ok(BlameMode::from_config_str(v))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<BlameMode, E> {
+                Ok(BlameMode::from_config_str(&v))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -193,9 +297,11 @@ pub struct Config {
     /// オンでも Shift 併用なら完全削除を選べる。
     pub enable_trash: bool,
 
-    /// エディタ左端のガターに git blame (著者 · 相対日時) を出す。既定はオフ。
-    /// オンの間だけ可視範囲ぶんの `git blame` を非同期で取る。
-    pub git_blame: bool,
+    /// エディタ左端のガターに git blame (著者 · 相対日時) を出すか。
+    /// `"off"` (既定) / `"current"` (カーソル行だけ) / `"all"` (全行)。
+    /// 出している間だけ**必要な行ぶん**の `git blame` を非同期で取る。
+    /// 旧形式の `git_blame = true / false` もそのまま読める。
+    pub git_blame: BlameMode,
 
     // ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
     //
@@ -285,7 +391,7 @@ pub struct Config {
     pub global_minimap: bool,
     #[serde(skip)]
     pub global_breadcrumbs: bool,
-    pub global_git_blame: bool,
+    pub global_git_blame: BlameMode,
     /// overlay を重ねる前のグローバルなプラグイン設定の控え。
     /// save_plugins_section はこちらを書く — セッション中の値を書くと
     /// プロジェクトの .zaivern.toml 由来の無効化・設定値がグローバル
@@ -865,7 +971,7 @@ impl Default for Config {
             whichkey_delay_ms: crate::whichkey::DEFAULT_FIRST_DELAY_MS,
             breadcrumbs: true,
             diff_view: crate::diff::DiffMode::default().config_str().into(),
-            git_blame: false,
+            git_blame: BlameMode::Off,
             confirm_drag_and_drop: true,
             enable_trash: true,
             // 保存時の整形は VS Code と同じく全部オフから始める
@@ -893,7 +999,7 @@ impl Default for Config {
             global_text_scale: 1.0,
             global_minimap: false,
             global_breadcrumbs: true,
-            global_git_blame: false,
+            global_git_blame: BlameMode::Off,
             global_plugins: PluginsConfig::default(),
             pet_image: None,
             pet_x: None,
@@ -1114,7 +1220,7 @@ struct Overlay {
     show_whitespace: Option<bool>,
     minimap: Option<bool>,
     breadcrumbs: Option<bool>,
-    git_blame: Option<bool>,
+    git_blame: Option<BlameMode>,
     approval_mode: Option<String>,
     show_pet: Option<bool>,
     agents: Vec<AgentPreset>,
@@ -1146,7 +1252,7 @@ struct UiState {
     breadcrumbs: Option<bool>,
     /// 差分ビューの表示モード ("side_by_side" | "inline")。
     diff_view: Option<String>,
-    git_blame: Option<bool>,
+    git_blame: Option<BlameMode>,
     /// D&D の移動確認 / ゴミ箱の使用。確認ダイアログの「今後確認しない」と
     /// ツリーのメニューから切り替えるものなので、手書きの config.toml では
     /// なく state 側に置く (config.toml をアプリが書き換えない方針)。
@@ -1354,7 +1460,7 @@ show_hidden_files = true
 # diff_view = "side_by_side"
 # ガターに git blame (著者 · 相対日時) を出す。既定はオフ
 # (表示メニュー・コマンドパレットの「Git blame の表示切替」でも変更できます)
-# git_blame = false
+# git_blame = "off"        # "off" | "current" (カーソル行だけ) | "all" (全行)
 
 # ── 保存時の整形 (VS Code の files.* / editor.formatOnSave 相当) ──
 # どれも既定はオフ。保存しただけで差分が増えないようにするためで、
@@ -1930,7 +2036,23 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     publish_auto_yes_rules(&cfg);
     // 承認ポリシーと承認/拒否キーも同じタイミングで配る。
     publish_approval_policies(&cfg);
+    // 機能が宣言した設定のうち、実行時の旗へ写す必要があるものも配る。
+    apply_runtime_flags(&cfg);
     cfg
+}
+
+/// 機能の設定を**実行時の旗**へ写す。設定を読み直せば再起動なしで反映される。
+///
+/// 旗を持っている側 (`notify` 等) は依存を持たない下層なので、設定を読む
+/// 経路をそちらへ持ち込まない。**写す向きはここからの一方通行**にして、
+/// 「同じ事実を 2 箇所に持って片方だけ更新される」経路を作らない。
+///
+/// 呼ぶのは 2 か所だけ: [`load`] の最後と [`set_setting_value`] の機能設定枝。
+/// この 2 つで「起動 / 設定の読み直し / ワークスペース切り替え / 設定画面での
+/// 変更」が全部覆える。
+pub fn apply_runtime_flags(cfg: &Config) {
+    crate::notify::set_enabled(cfg.feature_bool(crate::features::notifications::KEY_ENABLED));
+    crate::notify::set_sound(cfg.feature_bool(crate::features::notifications::KEY_SOUND));
 }
 
 /// `[[auto_yes_rules]]` を自動YESの応答エンジン (src/agents.rs) へ登録する。
@@ -2411,6 +2533,11 @@ const COST_LIMIT_ACTIONS: &[&str] = &["notify", "stop"];
 /// なので、円建てのように 1 単位が小さい通貨でも足りる桁にしてある。
 const COST_LIMIT_MAX: f32 = 10_000_000.0;
 const DIFF_VIEWS: &[&str] = &["side_by_side", "inline"];
+const BLAME_MODES: &[&str] = &[
+    BlameMode::Off.config_str(),
+    BlameMode::Current.config_str(),
+    BlameMode::All.config_str(),
+];
 const VOICE_ENGINES: &[&str] = &["auto", "mac", "powershell", "browser", "command", "off"];
 const VOICE_TARGETS: &[&str] = &["active", "broadcast"];
 
@@ -2523,8 +2650,8 @@ pub fn setting_defs() -> &'static [SettingDef] {
         SettingDef {
             key: "git_blame",
             group: G_EDITOR,
-            label: "ガターに git blame を出す",
-            kind: Bool,
+            label: "ガターに git blame を出す (off / カーソル行 / 全行)",
+            kind: Choice(BLAME_MODES),
         },
         SettingDef {
             key: "detect_indentation",
@@ -2817,7 +2944,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
         "inline_diagnostics" => B(cfg.inline_diagnostics),
         "inlay_hints" => B(cfg.inlay_hints),
         "lsp_highlight_occurrences" => B(cfg.lsp_highlight_occurrences),
-        "git_blame" => B(cfg.git_blame),
+        "git_blame" => T(cfg.git_blame.config_str().into()),
         "detect_indentation" => B(cfg.detect_indentation),
         "tab_size" => I(cfg.tab_size as i64),
         "insert_spaces" => B(cfg.insert_spaces),
@@ -2975,7 +3102,18 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
             ok
         }
         "git_blame" => {
-            let ok = b!(cfg.git_blame);
+            let ok = match v {
+                T(x) => {
+                    cfg.git_blame = BlameMode::from_config_str(x);
+                    true
+                }
+                // 旧形式で書かれた設定ファイルから直接来ることがある
+                B(x) => {
+                    cfg.git_blame = BlameMode::from_flag(*x);
+                    true
+                }
+                _ => false,
+            };
             if ok {
                 cfg.global_git_blame = cfg.git_blame;
             }
@@ -3033,7 +3171,16 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
         "ssh_tunnel_host" => t!(cfg.ssh_tunnel_host),
         // 機能が**宣言している**キーだけ機能の設定として書く。
         // 宣言の無いキーは従来どおり false (打ち間違いを黙って通さない)。
-        _ => feature_setting(key).is_some() && cfg.set_feature(key, v.clone()),
+        _ => {
+            if feature_setting(key).is_none() || !cfg.set_feature(key, v.clone()) {
+                return false;
+            }
+            // 書けたら実行時の旗へも写す (設定画面で切り替えた瞬間に効く)。
+            // 個別のキーをここで見分けない — 見分けると設定が増えるたびに
+            // この共有ファイルへ追記することになる。
+            apply_runtime_flags(cfg);
+            true
+        }
     }
 }
 
@@ -3897,6 +4044,94 @@ pub fn settings_columns(avail_w: f32) -> SettingsColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧 `git_blame = true / false` (**真偽値**) をそのまま読めること。
+    /// 既存ユーザーの config.toml / state.toml / .zaivern.toml を壊さないのが
+    /// 3 段化の最優先条件で、ここが落ちたら「設定が黙って off に戻る」になる。
+    #[test]
+    fn 旧いgit_blameの真偽値をそのまま読める() {
+        // config.toml 本体 (真偽値 → true は「全行」)
+        let c: Config = toml::from_str("git_blame = true").expect("旧形式が読める");
+        assert_eq!(c.git_blame, BlameMode::All);
+        let c: Config = toml::from_str("git_blame = false").expect("旧形式が読める");
+        assert_eq!(c.git_blame, BlameMode::Off);
+        // 新形式の 3 段
+        for (t, want) in [
+            ("off", BlameMode::Off),
+            ("current", BlameMode::Current),
+            ("all", BlameMode::All),
+        ] {
+            let c: Config =
+                toml::from_str(&format!("git_blame = \"{t}\"")).expect("新形式が読める");
+            assert_eq!(c.git_blame, want, "{t}");
+        }
+        // 未知の値・空白・大文字混じりでも落ちず既定へ倒す (設定を壊しても動く)
+        for t in ["", "  ", "ALL ", "なにか"] {
+            let c: Config = toml::from_str(&format!("git_blame = \"{t}\""))
+                .unwrap_or_else(|e| panic!("{t:?} で落ちた: {e}"));
+            let want = if t.trim().eq_ignore_ascii_case("all") {
+                BlameMode::All
+            } else {
+                BlameMode::Off
+            };
+            assert_eq!(c.git_blame, want, "{t:?}");
+        }
+        // state.toml / .zaivern.toml (Option 側) も同じ入口を通る
+        let st: UiState = toml::from_str("git_blame = true").expect("state の旧形式");
+        assert_eq!(st.git_blame, Some(BlameMode::All));
+        let ov: Overlay = toml::from_str("git_blame = false").expect("overlay の旧形式");
+        assert_eq!(ov.git_blame, Some(BlameMode::Off));
+        let ov: Overlay = toml::from_str(r#"git_blame = "current""#).expect("overlay の新形式");
+        assert_eq!(ov.git_blame, Some(BlameMode::Current));
+        // 書き戻しは必ず新形式の**文字列** (真偽値へ戻さない)
+        #[derive(Serialize)]
+        struct W {
+            git_blame: BlameMode,
+        }
+        let out = toml::to_string(&W {
+            git_blame: BlameMode::Current,
+        })
+        .expect("書ける");
+        assert!(
+            out.contains(r#"git_blame = "current""#),
+            "書き戻しが文字列になっていない: {out}"
+        );
+        // 3 段の往復と、設定画面の選択肢との一致
+        for m in [BlameMode::Off, BlameMode::Current, BlameMode::All] {
+            assert_eq!(BlameMode::from_config_str(m.config_str()), m);
+            assert!(!m.label().is_empty());
+            assert!(
+                BLAME_MODES.contains(&m.config_str()),
+                "{m:?} が選択肢に無い"
+            );
+        }
+        assert_eq!(BLAME_MODES.len(), 3);
+        assert!(!BlameMode::Off.is_on());
+        assert!(BlameMode::Current.is_on() && BlameMode::All.is_on());
+        assert_eq!(BlameMode::default(), BlameMode::Off);
+        // setting_value / set_setting も 3 段を往復する (設定画面の経路)
+        let mut cfg = Config::default();
+        for m in [BlameMode::All, BlameMode::Current, BlameMode::Off] {
+            assert!(set_setting_value(
+                &mut cfg,
+                "git_blame",
+                &SettingValue::Text(m.config_str().into())
+            ));
+            assert_eq!(cfg.git_blame, m);
+            assert_eq!(cfg.global_git_blame, m, "グローバル側へ写っていない");
+            assert_eq!(
+                setting_value(&cfg, "git_blame"),
+                Some(SettingValue::Text(m.config_str().into()))
+            );
+        }
+        // 旧形式の真偽値が設定経路から来ても受ける
+        assert!(set_setting_value(
+            &mut cfg,
+            "git_blame",
+            &SettingValue::Bool(true)
+        ));
+        assert_eq!(cfg.git_blame, BlameMode::All);
+    }
 
     // load() / ensure_default() / save_state() は実ユーザーの ~/.zaivern を
     // 読み書きするためテストしない。実体の load_from_dir() / save_state_to_dir()
@@ -4858,7 +5093,7 @@ command = "agy"
             minimap: Some(true),
             breadcrumbs: Some(false),
             diff_view: Some("inline".into()),
-            git_blame: Some(true),
+            git_blame: Some(BlameMode::Current),
             confirm_drag_and_drop: Some(false),
             enable_trash: Some(false),
             pet_image: Some("/tmp/p.png".into()),
@@ -4903,7 +5138,7 @@ command = "agy"
         assert_eq!(back.show_whitespace, Some(true));
         assert_eq!(back.minimap, Some(true));
         assert_eq!(back.breadcrumbs, Some(false));
-        assert_eq!(back.git_blame, Some(true));
+        assert_eq!(back.git_blame, Some(BlameMode::Current));
         assert_eq!(back.pet_image, Some("/tmp/p.png".to_string()));
         assert_eq!(back.pet_x, Some(10.0));
         assert_eq!(back.pet_y, Some(20.5));
@@ -6301,6 +6536,138 @@ theme = "zaivern-dark"
         let cfg: Config = toml::from_str(&out).expect("書き戻した結果が読めない");
         assert_eq!(cfg.feature_i64("whichkey.delay_ms"), 500);
         assert!(cfg.feature_bool("みらいの機能.flag"));
+    }
+
+    // ── 通知のオン/オフ ──────────────────────────────────────────────
+
+    /// 欄の無い古い `config.toml` (と、そもそも設定を作っていない利用者) が
+    /// **オンのまま**であること。ここがオフに倒れると、更新しただけで
+    /// 通知が消えたように見える。
+    #[test]
+    fn 通知の既定はオンで欄の無い設定ファイルも壊れない() {
+        use crate::features::notifications::KEY_ENABLED;
+        // 欄が 1 つも無い config.toml
+        let cfg: Config = toml::from_str("theme = \"zaivern-dark\"\n").expect("読めない");
+        assert!(!cfg.extra.contains_key(KEY_ENABLED), "無い欄を勝手に埋めた");
+        assert!(cfg.feature_bool(KEY_ENABLED), "欄が無いのにオフへ倒れた");
+        // 既定の Config も同じ
+        assert!(Config::default().feature_bool(KEY_ENABLED));
+        // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::enabled());
+    }
+
+    /// 設定画面 (⚙) の行として出ていること。**ここが空だと切り替えられない**
+    /// (レジストリに登録しただけで到達経路が無い状態になる)。
+    #[test]
+    fn 通知の設定は設定画面の行として出る() {
+        use crate::features::notifications::KEY_ENABLED;
+        let d = all_setting_defs()
+            .iter()
+            .find(|d| d.key == KEY_ENABLED)
+            .expect("設定画面に行が出ていない");
+        assert!(
+            matches!(d.kind, SettingKind::Bool),
+            "チェックボックスで出る"
+        );
+        // 検索でも引ける (設定画面は settings_rows 越しに描く)
+        let cfg = Config::default();
+        assert!(
+            settings_rows(&cfg, "通知", false)
+                .iter()
+                .any(|r| r.key == KEY_ENABLED),
+            "「通知」で検索しても出てこない"
+        );
+    }
+
+    /// 設定画面から切り替えると、値が保存側にも実行時の旗にも届くこと。
+    #[test]
+    fn 通知の設定を切り替えると値が保存側へ届く() {
+        use crate::features::notifications::KEY_ENABLED;
+        let mut cfg = Config::default();
+        assert!(
+            set_setting_value(&mut cfg, KEY_ENABLED, &SettingValue::Bool(false)),
+            "設定画面からの書き込みが弾かれた"
+        );
+        assert!(!cfg.feature_bool(KEY_ENABLED), "オフが保存されていない");
+        // 実際に鳴らすかどうかは notify 側の純粋な判定が持つ
+        // (旗はプロセス共通なので、ここでオフを観測しに行くと
+        //  同時に走る他のテストの `load` と取り合って偽の赤が出る)。
+        assert!(set_setting_value(
+            &mut cfg,
+            KEY_ENABLED,
+            &SettingValue::Bool(true)
+        ));
+        assert!(cfg.feature_bool(KEY_ENABLED));
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::enabled(), "オンへ戻しても鳴らない");
+        // 型違いは書かせない (書けると読み出しが既定へ落ちて「効かない」になる)
+        assert!(!set_setting_value(
+            &mut cfg,
+            KEY_ENABLED,
+            &SettingValue::Int(1)
+        ));
+    }
+
+    /// 欄の無い古い `config.toml` が **「通知オン・音あり」** のまま読めること。
+    /// ここが無音へ倒れると、更新しただけで音が消えたように見える。
+    #[test]
+    fn 通知音の既定はオンで欄の無い設定ファイルも壊れない() {
+        use crate::features::notifications::KEY_SOUND;
+        let cfg: Config = toml::from_str("theme = \"zaivern-dark\"\n").expect("読めない");
+        assert!(!cfg.extra.contains_key(KEY_SOUND), "無い欄を勝手に埋めた");
+        assert!(cfg.feature_bool(KEY_SOUND), "欄が無いのに無音へ倒れた");
+        assert!(Config::default().feature_bool(KEY_SOUND));
+        // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::sound(), "旗へ音ありが届いていない");
+    }
+
+    /// 通知音が設定画面 (⚙) の行として、通知本体とは**別のチェック**で出ること。
+    /// ここが空だと「通知は見たいが音は要らない」を選べない (元の不満そのもの)。
+    #[test]
+    fn 通知音の設定は設定画面の独立した行として出る() {
+        use crate::features::notifications::{KEY_ENABLED, KEY_SOUND};
+        let d = all_setting_defs()
+            .iter()
+            .find(|d| d.key == KEY_SOUND)
+            .expect("設定画面に行が出ていない");
+        assert!(
+            matches!(d.kind, SettingKind::Bool),
+            "チェックボックスで出る"
+        );
+        let cfg = Config::default();
+        let rows = settings_rows(&cfg, "通知", false);
+        // 「通知」で検索すると 2 行とも出る = 独立して切り替えられる
+        assert!(rows.iter().any(|r| r.key == KEY_ENABLED));
+        assert!(rows.iter().any(|r| r.key == KEY_SOUND));
+    }
+
+    /// 音だけをオフにしても、通知本体はオンのままであること
+    /// (2 つの設定が独立していることの検査)。
+    #[test]
+    fn 音だけを切っても通知本体はオンのまま() {
+        use crate::features::notifications::{KEY_ENABLED, KEY_SOUND};
+        let mut cfg = Config::default();
+        assert!(
+            set_setting_value(&mut cfg, KEY_SOUND, &SettingValue::Bool(false)),
+            "設定画面からの書き込みが弾かれた"
+        );
+        assert!(!cfg.feature_bool(KEY_SOUND), "無音が保存されていない");
+        assert!(cfg.feature_bool(KEY_ENABLED), "音を切ったら通知まで消えた");
+        // 実際に音を鳴らすかどうかの判定は notify 側の純関数が持つ
+        // (旗はプロセス共通なので、ここでオフを観測しに行かない)。
+        assert!(set_setting_value(
+            &mut cfg,
+            KEY_SOUND,
+            &SettingValue::Bool(true)
+        ));
+        // 型違いは書かせない
+        assert!(!set_setting_value(
+            &mut cfg,
+            KEY_SOUND,
+            &SettingValue::Int(0)
+        ));
     }
 
     #[test]

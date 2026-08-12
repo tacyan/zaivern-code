@@ -63,6 +63,12 @@ pub const MAX_COMMAND_CHARS: usize = 2048;
 /// `P;Cwd=` で受け取るパスの最大バイト数。
 const MAX_CWD_BYTES: usize = 4096;
 
+/// 一覧に出す 1 行 ([`Command::summary`]) の最大文字数。
+///
+/// [`MAX_COMMAND_CHARS`] (記録の上限) とは別で、こちらは**表示**の上限。
+/// 描画側はさらに可用幅で切るので、ここは「1 行に収まりうる長さ」でよい。
+pub const SUMMARY_CHARS: usize = 160;
+
 /// 段の変化ログの保持件数 (UI に出すだけなので少しでよい)。
 const MAX_TIER_LOG: usize = 16;
 
@@ -308,11 +314,15 @@ impl Command {
     }
 
     /// 一覧に出す 1 行 (コマンド行が無い段でも意味のある文字列になる)。
+    ///
+    /// ヒアドキュメントを丸ごと 1 行で渡してくるシェルがあるので、
+    /// 改行・タブ・制御文字を畳んで [`SUMMARY_CHARS`] で切る
+    /// ([`one_line`])。UI の原則「どの幅でも見切れない」の下ごしらえ。
     pub fn summary(&self) -> String {
-        let head = if self.command_line.is_empty() {
+        let head = if self.command_line.trim().is_empty() {
             tr("(コマンド行は不明)")
         } else {
-            self.command_line.replace('\n', " ")
+            one_line(&self.command_line, SUMMARY_CHARS)
         };
         match self.exit_code {
             Some(0) => trf("✓ {cmd}", &[("cmd", head)]),
@@ -325,15 +335,149 @@ impl Command {
     }
 }
 
+// ---------------------------------------------------------------------------
+// コマンドブロック — 「何を実行したか」に「画面のどこか」を足したモデル
+// ---------------------------------------------------------------------------
+
+/// ブロックが占める**絶対行**。
+///
+/// # なぜ絶対行なのか
+///
+/// 画面座標 (`terminal::abs_row` の「下端起点オフセット」) は、出力が 1 行増える
+/// たびに**同じ文字を指す値が変わる**。記録に使うと、スクロールしただけで
+/// 「このブロックは 3 行目から」が嘘になる。ここで持つのはセッション開始からの
+/// **単調非減少な通し番号**で、行が上へ流れても値は変わらない。
+///
+/// 番号を作るのは呼び出し側 ([`LineCounter`] がそのまま使える)。この層が要求
+/// するのは 1 つだけ — **入れるときと問い合わせるときで同じ番号体系を使う**こと。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BlockLines {
+    /// プロンプトが出た行 (`A`)。ブロックの先頭であり、ジャンプの着地点。
+    pub prompt: u64,
+    /// コマンド行 (`B` = 入力が始まる行)。2 行プロンプトでは `prompt` と別になる。
+    pub input: Option<u64>,
+    /// 出力の先頭行 (`C`)。まだ実行が始まっていなければ `None`。
+    pub output_start: Option<u64>,
+    /// ブロックの最終行 (**含む**)。実行中は `None` = まだ下へ伸びている。
+    pub end: Option<u64>,
+}
+
+impl BlockLines {
+    /// 1 行しか分かっていない状態から始める (以降のマーカーで埋まる)。
+    fn at(line: u64) -> Self {
+        Self {
+            prompt: line,
+            input: None,
+            output_start: None,
+            end: None,
+        }
+    }
+
+    /// `D` を受けて閉じる。
+    ///
+    /// **順序が乱れた列** (`C` の前に `D`、行番号が逆行) を受けても
+    /// 「終わりが始まりより前」だけは作らない。作ってしまうと
+    /// [`BlockLines::contains`] が常に false になり、ブロックが画面から
+    /// 静かに消える (いちばん気付けない壊れ方)。
+    fn close(&mut self, d_line: Option<u64>) {
+        let floor = self.output_start.or(self.input).unwrap_or(self.prompt);
+        self.end = Some(d_line.unwrap_or(floor).max(floor));
+    }
+
+    /// コマンドが打たれている行 (`B` が来ていなければプロンプト行)。
+    pub fn command_row(&self) -> u64 {
+        self.input.unwrap_or(self.prompt)
+    }
+}
+
+/// 1 コマンド = プロンプト行 / コマンド行 / 出力行の範囲 / 終了コード / 経過時間。
+///
+/// VS Code の command decoration・sticky scroll・プロンプト間ジャンプは、
+/// **どれもこの 1 つの構造体から出る**。描画側はここに無い情報を画面から
+/// 拾い直してはいけない (拾い直した瞬間に桁数依存のバグが戻る)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommandBlock {
+    /// 何を実行して、どうなったか。
+    pub cmd: Command,
+    /// 画面のどこか。行番号を貰えていなければ `None`
+    /// (シェル統合は来ているが呼び出し側が行を渡していない場合)。
+    /// **無いものを 0 行目と偽らない。**
+    pub lines: Option<BlockLines>,
+}
+
+impl CommandBlock {
+    /// 成功したか。終了コード不明なら `None` (「たぶん成功」にしない)。
+    pub fn ok(&self) -> Option<bool> {
+        self.cmd.ok()
+    }
+}
+
 /// 実行中のコマンド (まだ `D` が来ていないもの)。
-#[derive(Clone, Debug, Default)]
+///
+/// 実行中も**そのまま [`CommandBlock`] として持つ**。別の型にすると
+/// sticky scroll が「終わったものは引けるが、いま走っているものは引けない」
+/// という一番使う場面で穴の空いた API になる。
+#[derive(Clone, Debug)]
 struct Pending {
-    command_line: String,
-    cwd: Option<PathBuf>,
-    /// `B` を見た時刻。`C` が来たらそちらで上書きする。
-    started_ms: u64,
+    block: CommandBlock,
     /// `C` を見たか = 本当に実行が始まったか。
     executing: bool,
+}
+
+/// 表示用に**1 行へ丸める純関数**。
+///
+/// 改行・タブ・制御文字・連続空白を空白 1 個へ畳み、`max_chars` 文字で切る。
+/// 文字境界で切るので CJK でも壊れない (バイトで切ると `from_utf8` が落ちる)。
+pub fn one_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            space = !out.is_empty();
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(ch);
+        // 省略記号ぶんの余裕を見て早めに降りる (巨大な 1 行を最後まで走らない)。
+        if out.chars().count() > max_chars {
+            break;
+        }
+    }
+    truncate_chars(&mut out, max_chars);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 二分探索 — 「比較回数」で性質を固定するための観測点つき
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    // 二分探索の比較回数。「ブロック数を 2 倍にしても log でしか伸びない」を
+    // **実時間ではなく回数**で固定する (CLAUDE.md: 絶対時間で線を引かない)。
+    // プロセス共通の static にすると、同時に走る他のテストの呼び出しが混ざる。
+    // 製品ビルドには 1 バイトも入れない (設計原則 3: アイドルの費用はゼロ)。
+    static PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 比較回数を 0 に戻す (計測の開始点)。
+#[cfg(test)]
+fn reset_probes() {
+    PROBES.with(|p| p.set(0));
+}
+
+/// 直近の [`reset_probes`] からの比較回数。
+#[cfg(test)]
+fn probe_count() -> u64 {
+    PROBES.with(|p| p.get())
+}
+
+#[cfg(test)]
+fn bump_probe() {
+    PROBES.with(|p| p.set(p.get() + 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -348,16 +492,28 @@ struct Pending {
 pub struct Tracker {
     origin: Instant,
     tier: Tier,
-    ring: VecDeque<Command>,
+    /// 完了したブロックを**到着順**に持つ。
+    ///
+    /// `VecDeque` ではなく `Vec` なのは `blocks() -> &[CommandBlock]` を
+    /// そのまま返すため (二分探索は連続領域でしか書けない)。前から捨てるのは
+    /// 上限 [`MAX_COMMANDS`] を超えたときだけなので、移動は高々 200 要素。
+    blocks: Vec<CommandBlock>,
+    /// 行番号で索引できるブロックの開始位置。
+    ///
+    /// **不変条件**: `blocks[lines_from..]` は全て `lines` を持ち、
+    /// `prompt` の昇順で、隣り合う組は `prev.end <= next.prompt`
+    /// (プロンプト行は直前ブロックの最終行と同じことがある)。
+    /// これがあるから二分探索が O(log N) で正しい。
+    lines_from: usize,
     /// 上限超えで捨てた件数。**0 でない限り UI に出す** (黙って消さない)。
     dropped: u64,
     cur: Option<Pending>,
+    /// `A` を見た行。`B` が来るまで覚えておく (2 行プロンプト対策)。
+    prompt_line: Option<u64>,
     /// 最後に何らかのマーカーを見た時刻 (段の鮮度判定に使う)。
     last_ms: Option<u64>,
     /// 直近に判明した cwd。次のコマンドの既定値になる。
     last_cwd: Option<PathBuf>,
-    /// 直近の完了コマンドが失敗していたか (次のコマンドが始まるまで保持)。
-    last_failure: Option<(String, i32)>,
     /// 段が変わった履歴 (「名前を付けて記録する」の実体)。
     tier_log: VecDeque<String>,
 }
@@ -373,12 +529,13 @@ impl Tracker {
         Self {
             origin: Instant::now(),
             tier: Tier::None,
-            ring: VecDeque::new(),
+            blocks: Vec::new(),
+            lines_from: 0,
             dropped: 0,
             cur: None,
+            prompt_line: None,
             last_ms: None,
             last_cwd: None,
-            last_failure: None,
             tier_log: VecDeque::new(),
         }
     }
@@ -389,13 +546,29 @@ impl Tracker {
     }
 
     /// 実時刻でマーカーを 1 つ流し込む (読取スレッドから呼ぶ)。
+    ///
+    /// 行番号を渡さない経路。ブロックは作られるが [`CommandBlock::lines`] は
+    /// `None` になり、sticky scroll とジャンプは**黙って何も返さない**
+    /// (無い情報を捏造しない)。
     pub fn feed(&mut self, m: Marker) {
         let now = self.now_ms();
         self.feed_at(m, now);
     }
 
-    /// 時刻を明示してマーカーを流し込む (テスト用の決定的な入口)。
+    /// 時刻を明示してマーカーを流し込む (行番号なし・テスト用の決定的な入口)。
     pub fn feed_at(&mut self, m: Marker, now_ms: u64) {
+        self.feed_at_line(m, now_ms, None);
+    }
+
+    /// **唯一の入口**。時刻と絶対行を明示してマーカーを流し込む。
+    ///
+    /// `line` はセッション開始からの**単調非減少な通し番号**。
+    /// 生成するのは呼び出し側 (PTY のバイト列を見ている側にしか数えられない —
+    /// vt100 の `Screen::scrollback()` は「いま何行戻して見ているか」、
+    /// `Grid::scrollback_len()` は容量で、どちらも通し番号にならない)。
+    /// **入れるときと問い合わせるときで同じ番号体系を使う**ことだけが条件で、
+    /// 逆行しても panic せず索引を作り直す。
+    pub fn feed_at_line(&mut self, m: Marker, now_ms: u64, line: Option<u64>) {
         self.last_ms = Some(now_ms);
         if m.rich_evidence() {
             self.set_tier(Tier::Rich, now_ms);
@@ -408,50 +581,77 @@ impl Tracker {
                 // `D` を取りこぼしたまま次のプロンプトが出た。実行中だった
                 // ものは終了コード不明で畳む (画面に取り残さない)。
                 if self.cur.as_ref().is_some_and(|p| p.executing) {
-                    self.finish(None, now_ms);
+                    self.finish(None, now_ms, line);
                 }
                 self.cur = None;
+                // `A` の行がプロンプト行そのもの。`B` まで覚えておく
+                // (powerlevel10k のような 2 行プロンプトでは A と B が別の行)。
+                self.prompt_line = line;
             }
             Marker::PromptEnd => {
                 // プロンプトが終わった = ここから先がユーザーの入力。
-                self.cur = Some(Pending {
-                    command_line: String::new(),
-                    cwd: self.last_cwd.clone(),
-                    started_ms: now_ms,
-                    executing: false,
-                });
+                let prompt = self.prompt_line.take().or(line);
+                let mut p = self.new_pending(now_ms, prompt);
+                if let (Some(l), Some(lines)) = (line, p.block.lines.as_mut()) {
+                    lines.input = Some(l.max(lines.prompt));
+                }
+                self.cur = Some(p);
             }
-            Marker::CommandLine { line, .. } => {
+            Marker::CommandLine { line: text, .. } => {
                 // pwsh は `E` を `B` の後 (PSConsoleHostReadLine) で出し、
                 // bash/zsh は preexec で `C` の直前に出す。どちらでも拾えるよう
                 // 「実行中のものがあればそれに、無ければ作って」当てる。
-                let p = self.cur.get_or_insert_with(|| Pending {
-                    cwd: self.last_cwd.clone(),
-                    started_ms: now_ms,
-                    ..Pending::default()
-                });
-                p.command_line = line;
+                let p = self.pending_mut(now_ms, line);
+                p.block.cmd.command_line = text;
             }
             Marker::PreExec => {
-                let p = self.cur.get_or_insert_with(|| Pending {
-                    cwd: self.last_cwd.clone(),
-                    started_ms: now_ms,
-                    ..Pending::default()
-                });
+                let p = self.pending_mut(now_ms, line);
                 p.executing = true;
-                p.started_ms = now_ms;
-                // 新しいコマンドが始まったので、直前の失敗はもう「いま」ではない。
-                self.last_failure = None;
+                p.block.cmd.started_ms = now_ms;
+                // 実行が始まった時点で、直前の失敗は「いまの状態」ではなくなる
+                // (`read` は実行中を先に見るので、ここでの後始末は要らない)。
+                if let Some(l) = line {
+                    let lines = p.block.lines.get_or_insert_with(|| BlockLines::at(l));
+                    let floor = lines.command_row();
+                    lines.output_start = Some(l.max(floor));
+                }
             }
-            Marker::Finished(code) => self.finish(code, now_ms),
+            Marker::Finished(code) => self.finish(code, now_ms, line),
             Marker::Cwd(path) => {
                 self.last_cwd = Some(path.clone());
                 if let Some(p) = self.cur.as_mut() {
-                    p.cwd = Some(path);
+                    p.block.cmd.cwd = Some(path);
                 }
             }
             Marker::Property { .. } => {}
         }
+    }
+
+    /// 空の実行中ブロックを 1 つ作る。
+    fn new_pending(&mut self, now_ms: u64, prompt: Option<u64>) -> Pending {
+        Pending {
+            block: CommandBlock {
+                cmd: Command {
+                    command_line: String::new(),
+                    exit_code: None,
+                    cwd: self.last_cwd.clone(),
+                    started_ms: now_ms,
+                    finished_ms: now_ms,
+                },
+                lines: prompt.map(BlockLines::at),
+            },
+            executing: false,
+        }
+    }
+
+    /// 実行中ブロック。`B` を取りこぼしていても (`C` だけで) 作る。
+    fn pending_mut(&mut self, now_ms: u64, line: Option<u64>) -> &mut Pending {
+        if self.cur.is_none() {
+            let prompt = self.prompt_line.take().or(line);
+            let p = self.new_pending(now_ms, prompt);
+            self.cur = Some(p);
+        }
+        self.cur.as_mut().expect("直前に入れた")
     }
 
     fn set_tier(&mut self, t: Tier, now_ms: u64) {
@@ -476,31 +676,55 @@ impl Tracker {
         self.tier_log.push_back(line);
     }
 
-    fn finish(&mut self, code: Option<i32>, now_ms: u64) {
+    fn finish(&mut self, code: Option<i32>, now_ms: u64, line: Option<u64>) {
         let Some(p) = self.cur.take() else {
             return;
         };
         // 何も実行していない Enter (プロンプトで改行しただけ) は記録しない。
         // pwsh は毎プロンプトで境界を出すので、これが無いと空行で埋まる。
-        if !p.executing && p.command_line.is_empty() {
+        if !p.executing && p.block.cmd.command_line.is_empty() {
             return;
         }
-        let cmd = Command {
-            command_line: p.command_line,
-            exit_code: code,
-            cwd: p.cwd,
-            started_ms: p.started_ms,
-            finished_ms: now_ms,
-        };
-        self.last_failure = match cmd.exit_code {
-            Some(c) if c != 0 => Some((cmd.command_line.clone(), c)),
-            _ => None,
-        };
-        if self.ring.len() >= MAX_COMMANDS {
-            self.ring.pop_front();
+        let mut b = p.block;
+        b.cmd.exit_code = code;
+        b.cmd.finished_ms = now_ms;
+        if let Some(l) = b.lines.as_mut() {
+            l.close(line);
+        }
+        self.push_block(b);
+    }
+
+    /// 完了ブロックを積む。**索引の不変条件はここだけで守る。**
+    fn push_block(&mut self, b: CommandBlock) {
+        let idx = self.blocks.len();
+        match b.lines.map(|l| l.prompt) {
+            // 行を知らないブロックは索引に載せられない。以降に来る
+            // 「行つき」ブロックから索引をやり直す (末尾の連続性は保たれる)。
+            None => self.lines_from = idx + 1,
+            Some(start) => {
+                // 不変条件より、直前の索引済みブロックは blocks[idx-1] だけ。
+                let prev = (self.lines_from < idx)
+                    .then(|| self.blocks[idx - 1].lines)
+                    .flatten();
+                let ordered = prev.is_none_or(|q| q.end.is_none_or(|e| e <= start));
+                if !ordered {
+                    // 行番号が逆行した = 画面が作り直された (clear / 代替画面 /
+                    // reset)。古い行番号はもう別の内容を指しているので、
+                    // **当てにならないものを黙って使い続けない**。履歴 (何を
+                    // 実行したか) は残し、位置だけを捨てる。
+                    for old in self.blocks.iter_mut() {
+                        old.lines = None;
+                    }
+                    self.lines_from = idx;
+                }
+            }
+        }
+        self.blocks.push(b);
+        while self.blocks.len() > MAX_COMMANDS {
+            self.blocks.remove(0);
+            self.lines_from = self.lines_from.saturating_sub(1);
             self.dropped += 1;
         }
-        self.ring.push_back(cmd);
     }
 
     /// 現在の段。
@@ -520,39 +744,173 @@ impl Tracker {
     /// 設計原則 2: 「捨てた箇所には明示的なギャップ標識を入れる」。
     /// 捨てていなければ `None` (空の行を作らない = UI の原則「空白は作らない」)。
     pub fn gap_note(&self) -> Option<String> {
-        (self.dropped > 0).then(|| {
-            trf(
-                "⋯ 古い {n} 件は上限 ({max}) を超えたため捨てました",
-                &[
-                    ("n", self.dropped.to_string()),
-                    ("max", MAX_COMMANDS.to_string()),
-                ],
-            )
-        })
+        if self.dropped == 0 {
+            return None;
+        }
+        let head = trf(
+            "⋯ 古い {n} 件は上限 ({max}) を超えたため捨てました",
+            &[
+                ("n", self.dropped.to_string()),
+                ("max", MAX_COMMANDS.to_string()),
+            ],
+        );
+        // どこまで遡れるかも一緒に出す。件数だけだと「上へ行けば見つかるはず」
+        // と読めてしまい、追えない行を探させることになる。
+        match self.oldest_indexed_line() {
+            Some(line) => Some(trf(
+                "{head} (行 {line} より上は追えません)",
+                &[("head", head), ("line", line.to_string())],
+            )),
+            None => Some(head),
+        }
     }
 
     /// 直近のコマンド (新しい順、最大 `n` 件)。
     pub fn recent(&self, n: usize) -> Vec<&Command> {
-        self.ring.iter().rev().take(n).collect()
+        self.blocks().iter().rev().take(n).map(|b| &b.cmd).collect()
     }
 
     /// 記録できているコマンド件数 (捨てたぶんは含まない)。
     pub fn recorded(&self) -> usize {
-        self.ring.len()
+        self.blocks.len()
+    }
+
+    // ── ブロックの問い合わせ (描画側はここだけを見る) ──────────────
+
+    /// 完了したブロックを**古い順**に。実行中のものは含まない
+    /// ([`Tracker::running_block`] で取る)。
+    pub fn blocks(&self) -> &[CommandBlock] {
+        &self.blocks
+    }
+
+    /// 行番号で引けるブロックだけ (不変条件により末尾の連続部分)。
+    fn indexed(&self) -> &[CommandBlock] {
+        let from = self.lines_from.min(self.blocks.len());
+        &self.blocks[from..]
+    }
+
+    /// いま実行中のブロック (まだ `D` が来ていない)。
+    pub fn running_block(&self) -> Option<&CommandBlock> {
+        self.cur.as_ref().filter(|p| p.executing).map(|p| &p.block)
+    }
+
+    /// **絶対行 `line` を含むブロック** — sticky scroll の中核。**O(log N)**。
+    ///
+    /// 実行中のブロックは下に開いている (末尾が未確定) ので、画面の一番下を
+    /// 指したときも正しく引ける。どのブロックにも属さない行 (プロンプトより
+    /// 前・行を知らない履歴) では `None` — 近いものを返して嘘をつかない。
+    pub fn block_at(&self, line: u64) -> Option<&CommandBlock> {
+        if let Some(b) = self.running_block().filter(|b| Self::covers(b, line)) {
+            return Some(b);
+        }
+        let v = self.indexed();
+        let i = Self::last_start_at_or_before(v, line)?;
+        Self::covers(&v[i], line).then(|| &v[i])
+    }
+
+    /// このブロックがその絶対行を含むか。
+    ///
+    /// 行が不明なブロックは**決して含まない** (「たぶんここ」で嘘の sticky
+    /// ヘッダを出さない)。実行中 (`end` が `None`) は下に開いている。
+    fn covers(b: &CommandBlock, line: u64) -> bool {
+        b.lines
+            .is_some_and(|l| line >= l.prompt && l.end.is_none_or(|e| line <= e))
+    }
+
+    /// `line` より**手前**で最も近いプロンプト行 (前のプロンプトへジャンプ)。
+    pub fn prev_prompt(&self, line: u64) -> Option<u64> {
+        // 実行中のブロックがいちばん下にある。まずそれを見る。
+        if let Some(p) = self.cur.as_ref().and_then(|p| p.block.lines) {
+            if p.prompt < line {
+                return Some(p.prompt);
+            }
+        }
+        let v = self.indexed();
+        let n = Self::partition_point(v, |b| b.lines.is_some_and(|l| l.prompt < line));
+        (n > 0).then(|| v[n - 1].lines).flatten().map(|l| l.prompt)
+    }
+
+    /// `line` より**後ろ**で最も近いプロンプト行 (次のプロンプトへジャンプ)。
+    pub fn next_prompt(&self, line: u64) -> Option<u64> {
+        let v = self.indexed();
+        let n = Self::partition_point(v, |b| b.lines.is_some_and(|l| l.prompt <= line));
+        if let Some(l) = v.get(n).and_then(|b| b.lines) {
+            return Some(l.prompt);
+        }
+        self.cur
+            .as_ref()
+            .and_then(|p| p.block.lines)
+            .map(|l| l.prompt)
+            .filter(|&p| p > line)
+    }
+
+    /// `start_line() <= line` を満たす**最後**の添字。
+    fn last_start_at_or_before(v: &[CommandBlock], line: u64) -> Option<usize> {
+        let n = Self::partition_point(v, |b| b.lines.is_some_and(|l| l.prompt <= line));
+        n.checked_sub(1)
+    }
+
+    /// `pred` が真である要素が前半に固まっている列で、**真の個数**を返す。
+    ///
+    /// 比較は `ceil(log2(len + 1))` 回で頭打ちになる — これが
+    /// 「ブロックが 2 倍になっても 1 回しか増えない」の実体。
+    fn partition_point(v: &[CommandBlock], pred: impl Fn(&CommandBlock) -> bool) -> usize {
+        let (mut lo, mut hi) = (0usize, v.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            #[cfg(test)]
+            bump_probe();
+            if pred(&v[mid]) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// 行番号で追える最も古い行。これより上は答えられない (**捨てた境界**)。
+    pub fn oldest_indexed_line(&self) -> Option<u64> {
+        Some(self.indexed().first()?.lines?.prompt)
+    }
+
+    /// **スクロールバックから落ちた行のブロックを忘れる。**
+    ///
+    /// 件数の上限 ([`MAX_COMMANDS`]) だけだと、行数の上限 (端末側の
+    /// スクロールバック) と食い違って「もう画面に無い行を指すブロック」が
+    /// 残る。落ちた行を知っている呼び出し側から締めてもらう。
+    /// 戻り値は忘れた件数。
+    ///
+    /// 行を知らないブロックが先頭にある間は**何もしない** — 行で判断できない
+    /// ものを行で捨てない。
+    pub fn forget_before(&mut self, oldest_live_line: u64) -> usize {
+        let mut n = 0;
+        while let Some(end) = self
+            .blocks
+            .first()
+            .and_then(|b| b.lines)
+            .and_then(|l| l.end)
+        {
+            if end >= oldest_live_line {
+                break;
+            }
+            self.blocks.remove(0);
+            self.lines_from = self.lines_from.saturating_sub(1);
+            self.dropped += 1;
+            n += 1;
+        }
+        n
     }
 
     /// 直近コマンドの終了コード。**毎フレームの描画経路から呼ばれる**ので、
     /// [`Command`] を写さず数値だけ返す (1 フレームに 1 アロケーションを作らない)。
     pub fn last_exit(&self) -> Option<i32> {
-        self.ring.back()?.exit_code
+        self.blocks.last()?.cmd.exit_code
     }
 
     /// いま実行中のコマンド行 (実行中でなければ `None`)。
     pub fn running_command(&self) -> Option<&str> {
-        self.cur
-            .as_ref()
-            .filter(|p| p.executing)
-            .map(|p| p.command_line.as_str())
+        self.running_block().map(|b| b.cmd.command_line.as_str())
     }
 
     /// **状態ラダーへの供給** — 画面を 1 文字も読まずに得られた判定。
@@ -566,21 +924,26 @@ impl Tracker {
         if self.tier == Tier::None {
             return None;
         }
-        if let Some(p) = self.cur.as_ref().filter(|p| p.executing) {
+        if let Some(b) = self.running_block() {
             return Some(ProtoRead {
                 state: ProtoState::Running,
-                detail: p.command_line.clone(),
+                detail: one_line(&b.cmd.command_line, SUMMARY_CHARS),
             });
         }
         // 直前のコマンドが落ちている間は「異常終了」。次のコマンドが始まれば
-        // 消える (`PreExec` で last_failure を落としている)。
+        // 上の実行中で上書きされ、成功で終われば消える。
         // これが**文字列一致より強い**根拠: 終了コードは事実であって推定ではない。
-        if let Some((cmd, code)) = self.last_failure.as_ref() {
+        // 別に持たず**最後のブロックから導く** — 同じ事実を 2 箇所に持つと、
+        // 片方だけ更新される経路が必ずできる。
+        if let Some(b) = self.blocks().last().filter(|b| b.ok() == Some(false)) {
             return Some(ProtoRead {
                 state: ProtoState::Failed,
                 detail: trf(
                     "{cmd} → code {code}",
-                    &[("cmd", cmd.clone()), ("code", code.to_string())],
+                    &[
+                        ("cmd", one_line(&b.cmd.command_line, SUMMARY_CHARS)),
+                        ("code", b.cmd.exit_code.unwrap_or_default().to_string()),
+                    ],
                 ),
             });
         }
@@ -2055,5 +2418,393 @@ C
     #[test]
     fn エージェント印を渡す() {
         assert_eq!(agent_env(), [("ZAIVERN_AGENT", "1")]);
+    }
+
+    // ── コマンドブロック (行つき) ────────────────────────────────
+
+    /// 1 コマンドぶんのマーカーを**行番号つき**で流す。
+    /// `at` がプロンプト行、出力は `out_rows` 行ぶん出たことにする。
+    fn run_lines(t: &mut Tracker, cmd: &str, code: i32, at: u64, out_rows: u64) {
+        let base = at * 10;
+        t.feed_at_line(Marker::PromptStart, base, Some(at));
+        t.feed_at_line(Marker::PromptEnd, base + 1, Some(at));
+        t.feed_at_line(
+            Marker::CommandLine {
+                line: cmd.into(),
+                nonce: String::new(),
+            },
+            base + 2,
+            Some(at),
+        );
+        t.feed_at_line(Marker::PreExec, base + 3, Some(at + 1));
+        t.feed_at_line(Marker::Finished(Some(code)), base + 4, Some(at + out_rows));
+    }
+
+    /// 索引の不変条件 — 二分探索が正しいことの根拠そのもの。
+    /// これが崩れると `block_at` は「近いが違うブロック」を返し始める。
+    fn assert_index_sound(t: &Tracker) {
+        let mut prev_end: Option<u64> = None;
+        for b in t.indexed() {
+            let l = b.lines.expect("索引部は必ず行を持つ");
+            assert!(
+                l.end.is_some_and(|e| e >= l.prompt),
+                "終わりが始まりより前: {l:?}"
+            );
+            if let Some(e) = prev_end {
+                assert!(
+                    e <= l.prompt,
+                    "並びが崩れた: prev_end={e} prompt={}",
+                    l.prompt
+                );
+            }
+            prev_end = l.end;
+        }
+        for b in &t.blocks[..t.lines_from.min(t.blocks.len())] {
+            assert!(b.lines.is_none(), "索引外なのに行を持っている: {b:?}");
+        }
+    }
+
+    #[test]
+    fn プロンプトから出力までを1ブロックに畳む() {
+        let mut t = Tracker::new();
+        run_lines(&mut t, "cargo test", 0, 100, 5);
+        assert_index_sound(&t);
+        let b = &t.blocks()[0];
+        let l = b.lines.expect("行つきで流した");
+        assert_eq!(l.prompt, 100, "A の行がブロックの先頭");
+        assert_eq!(l.command_row(), 100);
+        assert_eq!(l.output_start, Some(101), "C の行から出力");
+        assert_eq!(l.end, Some(105), "D の行で閉じる (含む)");
+        assert_eq!(b.ok(), Some(true));
+        assert_eq!(b.cmd.duration_ms(), 1, "C から D まで");
+        assert_eq!(b.cmd.summary(), "✓ cargo test");
+    }
+
+    #[test]
+    fn 二行プロンプトはaとbの行を別々に覚える() {
+        let mut t = Tracker::new();
+        t.feed_at_line(Marker::PromptStart, 0, Some(10)); // 飾り行
+        t.feed_at_line(Marker::PromptEnd, 1, Some(11)); // 入力はその次の行
+        t.feed_at_line(Marker::PreExec, 2, Some(12));
+        t.feed_at_line(Marker::Finished(Some(0)), 3, Some(20));
+        let l = t.blocks()[0].lines.expect("行つき");
+        assert_eq!((l.prompt, l.command_row()), (10, 11));
+    }
+
+    #[test]
+    fn 絶対行を含むブロックを二分探索で引く() {
+        let mut t = Tracker::new();
+        for i in 0..20u64 {
+            run_lines(&mut t, &format!("cmd{i}"), 0, i * 10, 4);
+        }
+        assert_index_sound(&t);
+        let name = |b: Option<&CommandBlock>| b.map(|b| b.cmd.command_line.clone());
+        assert_eq!(name(t.block_at(0)).as_deref(), Some("cmd0"));
+        assert_eq!(name(t.block_at(3)).as_deref(), Some("cmd0"));
+        assert_eq!(name(t.block_at(102)).as_deref(), Some("cmd10"));
+        assert_eq!(t.block_at(7), None, "隙間はどのブロックでもない");
+        assert_eq!(t.block_at(9999), None, "先の行を捏造しない");
+    }
+
+    #[test]
+    fn 前後のプロンプトへ跳べる() {
+        let mut t = Tracker::new();
+        for i in 0..5u64 {
+            run_lines(&mut t, &format!("c{i}"), 0, i * 10, 4);
+        }
+        assert_eq!(t.next_prompt(0), Some(10));
+        assert_eq!(t.next_prompt(15), Some(20));
+        assert_eq!(t.prev_prompt(25), Some(20));
+        assert_eq!(t.prev_prompt(20), Some(10), "自分自身へは戻らない");
+        assert_eq!(t.prev_prompt(0), None, "いちばん上より前は無い");
+        assert_eq!(t.next_prompt(40), None, "いちばん下より後は無い");
+        assert_eq!(t.oldest_indexed_line(), Some(0));
+    }
+
+    #[test]
+    fn 実行中のブロックは下へ開いたまま() {
+        let mut t = Tracker::new();
+        run_lines(&mut t, "done", 0, 0, 3);
+        t.feed_at_line(Marker::PromptStart, 100, Some(10));
+        t.feed_at_line(Marker::PromptEnd, 101, Some(10));
+        t.feed_at_line(
+            Marker::CommandLine {
+                line: "sleep 100".into(),
+                nonce: String::new(),
+            },
+            102,
+            Some(10),
+        );
+        t.feed_at_line(Marker::PreExec, 103, Some(11));
+        let b = t.running_block().expect("実行中");
+        assert_eq!(b.cmd.command_line, "sleep 100");
+        assert_eq!(b.ok(), None, "終了コード不明を成功にしない");
+        assert!(
+            Tracker::covers(b, 11) && Tracker::covers(b, 9_999_999),
+            "末尾は未確定 = 下に開く"
+        );
+        assert_eq!(
+            t.block_at(50_000)
+                .map(|b| b.cmd.command_line.clone())
+                .as_deref(),
+            Some("sleep 100"),
+            "画面のいちばん下でも sticky ヘッダが出る"
+        );
+        assert_eq!(t.prev_prompt(11), Some(10));
+        assert_eq!(t.next_prompt(5), Some(10), "実行中のプロンプトへも跳べる");
+        assert_eq!(
+            t.block_at(1).map(|b| b.cmd.command_line.clone()).as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn マーカーが無ければブロックを1つも作らない() {
+        // OSC 133 を出さないシェル = 普通の出力しか来ない。
+        let ms = markers(b"$ ls -la\r\ntotal 0\r\n\x1b[31mred\x1b[0m\r\n\x1b]0;title\x07");
+        assert!(ms.is_empty(), "シェル統合の印は 1 つも無い: {ms:?}");
+        let mut t = Tracker::new();
+        for m in ms {
+            t.feed_at_line(m, 0, Some(0));
+        }
+        assert_eq!(t.tier(), Tier::None);
+        assert!(t.blocks().is_empty(), "ブロック**なし**へ落ちるだけ");
+        assert!(t.running_block().is_none());
+        assert_eq!(t.block_at(0), None);
+        assert_eq!(t.prev_prompt(u64::MAX), None);
+        assert_eq!(t.next_prompt(0), None);
+        assert_eq!(t.oldest_indexed_line(), None);
+        assert_eq!(t.gap_note(), None, "空の行を作らない");
+    }
+
+    #[test]
+    fn 行番号を渡さない経路ではブロックの位置を答えない() {
+        let mut t = Tracker::new();
+        run(&mut t, "ls", 0, 0);
+        assert_eq!(t.recorded(), 1, "履歴は残る");
+        assert!(t.blocks()[0].lines.is_none(), "無い位置を 0 行目と偽らない");
+        assert_eq!(t.block_at(0), None);
+        assert_eq!(t.next_prompt(0), None);
+        assert_eq!(
+            t.forget_before(u64::MAX),
+            0,
+            "行で判断できないものを行で捨てない"
+        );
+        assert_index_sound(&t);
+    }
+
+    #[test]
+    fn 壊れたマーカー列でもブロックを捏造しない() {
+        let mut t = Tracker::new();
+        // (1) `C` の前に `D` — 実行していないので記録しない
+        t.feed_at_line(Marker::Finished(Some(1)), 0, Some(5));
+        assert_eq!(t.recorded(), 0);
+        // (2) `A` が無く `C` だけ、しかも `D` の行が逆行している
+        t.feed_at_line(Marker::PreExec, 1, Some(20));
+        t.feed_at_line(Marker::Finished(Some(0)), 2, Some(3));
+        let l = t.blocks()[0].lines.expect("C の行から作る");
+        assert_eq!(
+            (l.prompt, l.end),
+            (20, Some(20)),
+            "終わりを始まりより前にしない"
+        );
+        // (3) `D` を 2 回 — 2 件目は畳む相手が居ない
+        t.feed_at_line(Marker::Finished(Some(0)), 3, Some(21));
+        assert_eq!(t.recorded(), 1);
+        // (4) `B` だけが 3 回続く (プロンプトを描き直すシェル)
+        for i in 0..3u64 {
+            t.feed_at_line(Marker::PromptEnd, 4 + i, Some(30 + i));
+        }
+        assert_eq!(t.recorded(), 1, "空 Enter を履歴に積まない");
+        // (5) `E` が `B` より先 (pwsh の順序)
+        t.feed_at_line(
+            Marker::CommandLine {
+                line: "git status".into(),
+                nonce: String::new(),
+            },
+            10,
+            Some(33),
+        );
+        t.feed_at_line(Marker::PreExec, 11, Some(34));
+        t.feed_at_line(Marker::Finished(Some(0)), 12, Some(40));
+        assert_eq!(t.recent(1)[0].command_line, "git status");
+        assert_index_sound(&t);
+        // どの行を引いても panic しない
+        for line in [0u64, 3, 20, 21, 33, 40, u64::MAX] {
+            let _ = t.block_at(line);
+            let _ = t.prev_prompt(line);
+            let _ = t.next_prompt(line);
+        }
+    }
+
+    #[test]
+    fn 行番号が逆行したら古い位置を捨てて索引を作り直す() {
+        let mut t = Tracker::new();
+        for i in 0..5u64 {
+            run_lines(&mut t, &format!("old{i}"), 0, 1000 + i * 10, 4);
+        }
+        // `clear` / 代替画面からの復帰で行番号が巻き戻った
+        run_lines(&mut t, "after-clear", 0, 3, 2);
+        assert_eq!(t.recorded(), 6, "履歴 (何を実行したか) は残す");
+        assert_index_sound(&t);
+        assert_eq!(
+            t.block_at(1005),
+            None,
+            "巻き戻る前の行番号はもう別の内容を指している"
+        );
+        assert_eq!(
+            t.block_at(4).map(|b| b.cmd.command_line.clone()).as_deref(),
+            Some("after-clear")
+        );
+        assert_eq!(t.oldest_indexed_line(), Some(3));
+    }
+
+    #[test]
+    fn 隣り合うブロックが境界行を共有しても新しい方を返す() {
+        let mut t = Tracker::new();
+        // `D` と次の `A` が同じ行に出るのは普通 (出力が改行で終わらない場合)。
+        t.feed_at_line(Marker::PromptEnd, 0, Some(5));
+        t.feed_at_line(Marker::PreExec, 1, Some(5));
+        t.feed_at_line(Marker::Finished(Some(0)), 2, Some(9));
+        t.feed_at_line(Marker::PromptStart, 3, Some(9));
+        t.feed_at_line(Marker::PromptEnd, 4, Some(9));
+        t.feed_at_line(
+            Marker::CommandLine {
+                line: "second".into(),
+                nonce: String::new(),
+            },
+            5,
+            Some(9),
+        );
+        t.feed_at_line(Marker::PreExec, 6, Some(10));
+        t.feed_at_line(Marker::Finished(Some(0)), 7, Some(12));
+        assert_index_sound(&t);
+        assert_eq!(t.recorded(), 2, "境界の共有は逆行ではない (索引は保たれる)");
+        assert_eq!(
+            t.block_at(9).map(|b| b.cmd.command_line.clone()).as_deref(),
+            Some("second"),
+            "共有した行はプロンプトを出した新しい方のもの"
+        );
+    }
+
+    #[test]
+    fn スクロールバックから落ちた行のブロックを忘れる() {
+        let mut t = Tracker::new();
+        for i in 0..10u64 {
+            run_lines(&mut t, &format!("c{i}"), 0, i * 10, 4);
+        }
+        assert_eq!(t.forget_before(35), 4, "35 行目より前で終わったものだけ");
+        assert_eq!(t.recorded(), 6);
+        assert_eq!(t.oldest_indexed_line(), Some(40));
+        let note = t.gap_note().expect("捨てたなら必ず出す");
+        assert!(note.contains("40"), "追える下限を出す: {note}");
+        assert_index_sound(&t);
+        assert_eq!(t.forget_before(0), 0, "何も落ちていなければ何もしない");
+    }
+
+    #[test]
+    fn 巨大な入力でも上限で頭打ちになる() {
+        let mut t = Tracker::new();
+        let huge = "echo ".to_string() + &"あ".repeat(200_000);
+        let n = MAX_COMMANDS * 50;
+        for i in 0..n as u64 {
+            run_lines(&mut t, &huge, 0, i * 8, 3);
+        }
+        assert_eq!(t.recorded(), MAX_COMMANDS, "無限に溜めない");
+        assert!(t.gap_note().is_some(), "捨てたら必ず見せる");
+        assert_index_sound(&t);
+        // 巨大な 1 行でも表示は 1 行へ丸まる (文字境界を壊さない)
+        let sum = t.blocks()[0].cmd.summary();
+        assert!(
+            sum.chars().count() <= SUMMARY_CHARS + 8,
+            "丸めていない: {}",
+            sum.chars().count()
+        );
+        assert!(sum.ends_with('…'));
+        // 捨てた境界より前は「答えない」であって「嘘をつく」ではない
+        let oldest = t.oldest_indexed_line().expect("行つき");
+        assert_eq!(t.block_at(oldest - 1), None);
+        assert!(t.block_at(oldest).is_some());
+    }
+
+    #[test]
+    fn 検索の比較回数はブロック数の対数でしか伸びない() {
+        // 絶対時間で線を引かない (CLAUDE.md)。守りたい性質は
+        // 「N が 2 倍でも比較は 1 回しか増えない」ことそのもの。
+        fn synth(n: u64) -> Vec<CommandBlock> {
+            (0..n)
+                .map(|i| CommandBlock {
+                    cmd: Command {
+                        command_line: String::new(),
+                        exit_code: Some(0),
+                        cwd: None,
+                        started_ms: 0,
+                        finished_ms: 0,
+                    },
+                    lines: Some(BlockLines {
+                        prompt: i * 4,
+                        input: None,
+                        output_start: Some(i * 4 + 1),
+                        end: Some(i * 4 + 3),
+                    }),
+                })
+                .collect()
+        }
+        fn probes_for(n: u64) -> u64 {
+            let v = synth(n);
+            reset_probes();
+            let _ = Tracker::last_start_at_or_before(&v, (n - 1) * 4);
+            probe_count()
+        }
+        let (a, b, c) = (probes_for(1024), probes_for(2048), probes_for(4096));
+        assert_eq!(b, a + 1, "N を 2 倍にして比較は 1 回だけ増える: {a} → {b}");
+        assert_eq!(c, b + 1, "{b} → {c}");
+        assert!(a <= 11, "1024 件で 11 回以内: {a}");
+    }
+
+    #[test]
+    fn 一行へ丸める() {
+        assert_eq!(
+            one_line("git   log\n  --oneline\t-n5", 80),
+            "git log --oneline -n5"
+        );
+        assert_eq!(
+            one_line("  \n\t ", 80),
+            "",
+            "空白だけなら空 (空の行を作らない)"
+        );
+        // CJK をバイトで切ると from_utf8 が落ちる。文字で切る。
+        let cjk = one_line(&"日本語テスト".repeat(10), 5);
+        assert_eq!(cjk, "日本語テス…");
+        assert_eq!(one_line("short", 80), "short", "短ければ省略記号を付けない");
+        // 制御文字 (端末の生ログには必ず混ざる) を素通しさせない
+        assert_eq!(one_line("a\x07b\x1bc", 80), "a b c");
+    }
+
+    #[test]
+    fn 実際の列を行つきで再生して位置まで取れる() {
+        // ~> seq 3 ⏎  → 1 / 2 / 3 の 3 行が出て終わる、を行番号つきで。
+        let mut t = Tracker::new();
+        t.feed_at_line(Marker::PromptStart, 0, Some(7));
+        t.feed_at_line(Marker::PromptEnd, 1, Some(7));
+        t.feed_at_line(
+            Marker::CommandLine {
+                line: "seq 3".into(),
+                nonce: String::new(),
+            },
+            2,
+            Some(7),
+        );
+        t.feed_at_line(Marker::PreExec, 3, Some(8));
+        t.feed_at_line(Marker::Finished(Some(0)), 4, Some(10));
+        assert_eq!(t.tier(), Tier::Rich);
+        let l = t.blocks()[0].lines.expect("行つき");
+        assert_eq!((l.prompt, l.output_start, l.end), (7, Some(8), Some(10)));
+        assert_eq!(
+            t.block_at(9).map(|b| b.cmd.command_line.clone()).as_deref(),
+            Some("seq 3"),
+            "出力の途中の行から親コマンドが引ける"
+        );
+        assert_eq!(t.block_at(6), None, "プロンプトより上は無主");
     }
 }

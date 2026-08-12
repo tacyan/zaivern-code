@@ -5219,6 +5219,7 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "egui",
+ "encoding_rs",
  "image",
  "libc",
  "pdf-extract",
