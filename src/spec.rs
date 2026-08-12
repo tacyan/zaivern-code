@@ -3340,7 +3340,7 @@ mod tests {
 
     #[test]
     fn app_はパネルを出している間だけ走査する() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         assert!(
             src.contains("if self.spec_view {\n            self.spec.poll(")
                 || src.contains("if self.spec_view {"),
@@ -3380,7 +3380,7 @@ mod tests {
             "feature::REGISTRY に spec が登録されていない (統合担当が 1 行足す)"
         );
         // app.rs 側の受け口 (メソッド) が残っていること
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         for needle in [
             "pub(crate) fn open_spec_panel(&mut self)",
             "pub(crate) fn open_spec_stale(&mut self)",

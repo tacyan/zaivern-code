@@ -3041,6 +3041,12 @@ fn other() {
             }
             let opens = line.matches('{').count();
             let closes = line.matches('}').count();
+            // 波括弧を持たない項目 (`mod x;` / `const X: .. = ..;`) に付いた
+            // `#[cfg(test)]` はその行で閉じる。保留したままにすると、次に
+            // 出てきた無関係な `{` から本体を落として検査が静かに緩む。
+            if pend && opens == 0 && trimmed.ends_with(';') {
+                pend = false;
+            }
             let inside = test_exit.is_some();
             if pend && opens > 0 && test_exit.is_none() {
                 test_exit = Some(depth);
@@ -3069,7 +3075,7 @@ fn other() {
     /// 1 つでも欠けたら落ちる。
     #[test]
     fn 全アクションが消費地点に繋がっている() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let mut missing: Vec<String> = Vec::new();
         for a in ALL_ACTIONS {
             // 使用箇所は必ず `self.keys.get(BindAction::X)` の形なので、
@@ -3102,7 +3108,7 @@ fn other() {
     /// 二度と発火しなくなる (egui-winit がキーイベントごと捨てるため)。
     #[test]
     fn ショートカット消費は互換経路を通っている() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
@@ -3153,7 +3159,7 @@ fn other() {
     /// (VS Code の "Record Keys" が守っているのと同じ順序)。
     #[test]
     fn 記録の取り込みは通常の消費より先に来る() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
@@ -3586,7 +3592,7 @@ fn other() {
     /// もう食われている。位置が仕様なので構造で固定する。
     #[test]
     fn ショートカット消費の前に必ず変換中ガードを通る() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context)")
             .nth(1)
@@ -3632,7 +3638,7 @@ fn other() {
             "⇧⌥⌘C",
         ];
         let files: [(&str, &str); 8] = [
-            ("app.rs", include_str!("app.rs")),
+            ("app.rs", crate::app::SRC_IMPL),
             ("whichkey.rs", include_str!("whichkey.rs")),
             ("menu_bar.rs", include_str!("menu_bar.rs")),
             ("palette.rs", include_str!("palette.rs")),

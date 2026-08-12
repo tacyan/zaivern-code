@@ -3483,7 +3483,7 @@ mod tests {
     /// 章のアンカーも app.rs 側で申告されている (無いと 4 秒で勝手に飛ぶ)。
     #[test]
     fn 章の手順もapp_rsでアンカーを申告している() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let mut missing: Vec<String> = Vec::new();
         for s in EXTRA_STEPS {
             let Some(id) = s.anchor else { continue };
@@ -3498,7 +3498,7 @@ mod tests {
     /// 章の手順が出す依頼も app.rs のルーティングに届く。
     #[test]
     fn 章の手順の依頼もapp_rsに届く() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let body = src
             .split("fn apply_tutorial_action(")
             .nth(1)

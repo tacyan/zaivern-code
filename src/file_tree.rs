@@ -4128,12 +4128,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} が見つからない"))
     }
 
-    /// app.rs の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
+    /// app の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
     /// 掃除するために remove_dir_all を使うので対象外)。
     fn app_fns() -> Vec<(String, String)> {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
-        let cut = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
-        split_fns(&src[..cut])
+        let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
+        split_fns(&src)
     }
 
     #[test]
