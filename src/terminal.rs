@@ -307,6 +307,11 @@ pub struct Session {
     sel_abs: Option<((usize, u16), (usize, u16))>,
     /// ドラッグ選択のアンカー(ドラッグ開始セル)。絶対座標。
     sel_anchor_abs: Option<(usize, u16)>,
+    /// `sel_abs` / `sel_anchor_abs` を記録した時点の [`LineIndex::scrolled`]。
+    ///
+    /// 絶対行は**生きている画面の下端**が起点なので、1 行押し出されるたびに
+    /// 同じ文字を指す値が +1 される。差分がそのまま「進めるべき量」になる。
+    sel_pushed: u64,
     /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
     pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
@@ -1949,6 +1954,7 @@ impl Session {
             auto_yes_resend_after: Duration::from_secs(30),
             selection: None,
             sel_abs: None,
+            sel_pushed: 0,
             sel_anchor_abs: None,
             search: SearchUi::default(),
             copied_at: None,
@@ -2347,6 +2353,12 @@ impl Session {
         bottom.saturating_sub(line) as usize
     }
 
+    /// 履歴に残っている**最も古い**絶対行。これより大きい絶対行はもう存在しない
+    /// (`selection_text_abs` が切り詰める上限と同じ値)。
+    fn oldest_abs(&self) -> usize {
+        self.abs_of_line(self.lines.oldest_live())
+    }
+
     /// `line` を画面の最上段へ持ってくるための戻り量。
     fn scroll_for_line(&self, line: u64) -> usize {
         self.lines.scrolled().saturating_sub(line) as usize
@@ -2742,7 +2754,65 @@ impl Session {
         });
     }
 
+    /// **出力で画面が流れたぶんを取り込む。**
+    ///
+    /// 履歴を遡って見ている最中に出力が来ると、vt100 は同じ文字が同じ位置に
+    /// 見えるよう**自分の戻り量を増やす** ([`count_around`] が復元する)。
+    /// `self.scroll` は `set_scroll` を通ったときしか動かないので、放置すると
+    ///
+    /// 1. 次のスクロールが古い基準からやり直して**画面が飛ぶ**
+    /// 2. [`abs_row`] の絶対行は下端起点なので、`sel_abs` が**別の文字**を指す。
+    ///    しかも表示は `self.scroll` も同じだけ古いおかげで偶然一致するため、
+    ///    **コピーだけが静かにずれる**(スクロールした瞬間に表示も露見する)
+    ///
+    /// 進める量は戻り量の伸びではなく**押し出した総数**([`LineIndex`])の伸び。
+    /// 履歴が容量に達すると戻り量は頭打ちになるのに、行は流れ続けるため。
+    /// 押し出されて履歴から消えた行はもう追えないので、最古の行で止め、
+    /// 選択が丸ごと落ちたら解除する — **黙って別の場所を指さない。**
+    fn adopt_scrolled_output(&mut self) {
+        let eff = self.eff_scroll();
+        // 減る方向 (代替画面へ入ると履歴が無くなる) は写さない。戻ってきた
+        // ときに元の位置を復元できなくなるため。
+        let mut changed = eff > self.scroll;
+        if changed {
+            self.scroll = eff;
+        }
+        let pushed = self.lines.scrolled();
+        let d = usize::try_from(pushed.saturating_sub(self.sel_pushed)).unwrap_or(usize::MAX);
+        self.sel_pushed = pushed;
+        if d > 0 && (self.sel_abs.is_some() || self.sel_anchor_abs.is_some()) {
+            changed = true;
+            let oldest = self.oldest_abs();
+            if let Some(a) = self.sel_anchor_abs.as_mut() {
+                a.0 = a.0.saturating_add(d).min(oldest);
+            }
+            if let Some((mut a, mut b)) = self.sel_abs {
+                a.0 = a.0.saturating_add(d);
+                b.0 = b.0.saturating_add(d);
+                if a.0 > oldest && b.0 > oldest {
+                    // 選択していた行は丸ごと履歴の外へ出た。
+                    self.sel_abs = None;
+                } else {
+                    // はみ出した端 (絶対行が大きい = 古い) は最古の行の先頭で止める
+                    // (`selection_text_abs` の切り詰めと同じ扱い)。
+                    if a.0 > oldest {
+                        a = (oldest, 0);
+                    }
+                    if b.0 > oldest {
+                        b = (oldest, 0);
+                    }
+                    self.sel_abs = Some((a, b));
+                }
+            }
+        }
+        if changed {
+            self.sync_selection();
+        }
+    }
+
     pub fn set_scroll(&mut self, n: usize) {
+        // 先に「出力で流れたぶん」を取り込む。取り込まないと選択が置き去りになる。
+        self.adopt_scrolled_output();
         // vt100 は履歴より深い戻りを黙って切り詰めるので、実際に効いた量を持つ。
         // 持たないと「見た目は止まっているのに scroll だけ増える」ので戻すとき空回りする。
         let eff = {
@@ -2757,6 +2827,9 @@ impl Session {
 
     /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
     pub fn adjust_scroll(&mut self, delta: i64) -> bool {
+        // 相対量の基準は**いま実際に効いている戻り量**。取り込まずに足すと、
+        // 出力が来ていた場合その行数ぶん画面が飛ぶ。
+        self.adopt_scrolled_output();
         let before = self.scroll;
         let n = (self.scroll as i64 + delta).max(0) as usize;
         self.set_scroll(n);
@@ -2774,6 +2847,8 @@ impl Session {
 
     /// 画面座標で選択を設定する (今の scroll を基準に絶対座標へ写す)。
     pub fn set_selection(&mut self, sel: ((u16, u16), (u16, u16))) {
+        // 画面座標 → 絶対座標の基準を最新にしてから写す。
+        self.adopt_scrolled_output();
         let (rows, scroll) = (self.size.0, self.scroll);
         let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
         let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
@@ -2783,7 +2858,34 @@ impl Session {
     /// 絶対座標で選択を設定する。
     pub fn set_selection_abs(&mut self, a: (usize, u16), b: (usize, u16)) {
         self.sel_abs = Some((a, b));
+        // 以後のずれはここからの差分で数える。
+        self.sel_pushed = self.lines.scrolled();
         self.sync_selection();
+    }
+
+    /// **選択範囲の文字列** (コピーの中身そのもの)。選択が無ければ空。
+    ///
+    /// 真実源の絶対座標で取るので、見えている 1 画面には切り詰めない。
+    pub(crate) fn selection_string(&mut self) -> String {
+        // コピーは絶対行でパーサを直に読む。取り込まないとここだけずれる。
+        self.adopt_scrolled_output();
+        let Some(sel) = self.sel_abs else {
+            return String::new();
+        };
+        let mut p = lock_ok(&self.parser);
+        selection_text_abs(&mut p, sel)
+    }
+
+    /// 読取スレッドと**同じ手順**でバイト列を取り込む (テスト用)。
+    /// 押し出した行数の数え方まで本番と同じ経路を通すので、
+    /// 「出力が来たときのずれ」を PTY 無しで再現できる。
+    #[cfg(test)]
+    fn feed(&self, bytes: &[u8]) {
+        let mut p = lock_ok(&self.parser);
+        for piece in bytes.chunks(FEED_CHUNK) {
+            let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
+            self.lines.advance(moved, sb_len);
+        }
     }
 
     /// 選択とドラッグアンカーを両方捨てる。
@@ -6996,14 +7098,7 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
 
 /// 選択範囲をクリップボードへコピーし、フィードバック表示を開始する。
 fn copy_selection(ui: &egui::Ui, session: &mut Session) {
-    // 絶対座標で取る — 見えている 1 画面に切り詰めない。
-    let Some(sel) = session.sel_abs else {
-        return;
-    };
-    let text = {
-        let mut p = lock_ok(&session.parser);
-        selection_text_abs(&mut p, sel)
-    };
+    let text = session.selection_string();
     if !text.is_empty() {
         ui.ctx().copy_text(text);
         session.copied_at = Some(Instant::now());
@@ -8835,6 +8930,9 @@ pub fn draw(
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
     // リンクを開いてよいかは「このクリックの前に選択があったか」で変わるが、
     // handle_mouse_selection はクリックで選択を消してしまう。先に控えておく。
+    // 出力で画面が流れたぶんをここで 1 回だけ取り込む。以降この関数の中では
+    // `session.scroll` と `session.selection` が**パーサと同じ現在**を指す。
+    session.adopt_scrolled_output();
     let had_selection = session.selection.is_some();
     if interactive {
         // 押し始めの座標。ドラッグ選択とクリックの見分けに使う。
@@ -14724,5 +14822,143 @@ mod shell_line_tests {
             t.blocks().len()
         );
         assert!(t.gap_note().is_some(), "捨てたことを黙っている");
+    }
+}
+
+// ─── 選択と「出力で流れた画面」のずれ ──────────────────────────────
+
+#[cfg(test)]
+mod selection_scroll_tests {
+    use super::{normalize_sel, selection_text, Session, SpawnSpec};
+    use crate::lockx::lock_ok;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// 子が 1 バイトも書かないセッション。読取スレッドが畳まれるまで待つので、
+    /// 以降パーサを触るのはテストだけになる (起動シェルの profile 出力が
+    /// 混ざると入力が非決定になる)。
+    fn quiet_session(id: u64, rows: u16, cols: u16, scrollback: usize) -> Session {
+        let spec = SpawnSpec {
+            title: "sel".into(),
+            command: "exit 0".into(),
+            cwd: std::env::current_dir().unwrap(),
+            env: std::collections::HashMap::new(),
+            preset_name: String::new(),
+            icon: "💬".into(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(id, spec, eframe::egui::Context::default()).unwrap();
+        // 読取スレッドはパーサの Arc を 1 本持つ。畳まれたら 1 本に戻る。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Arc::strong_count(&s.parser) > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            Arc::strong_count(&s.parser),
+            1,
+            "読取スレッドが畳まれている"
+        );
+        *lock_ok(&s.parser) = vt100::Parser::new(rows, cols, scrollback);
+        s.size = (rows, cols);
+        s.scroll = 0;
+        s.lines.scrolled.store(0, Ordering::Relaxed);
+        s.lines.sb_len.store(0, Ordering::Relaxed);
+        s.sel_pushed = 0;
+        s.clear_selection();
+        s
+    }
+
+    /// 行を n 本流す。
+    fn feed_lines(s: &Session, range: std::ops::Range<usize>) {
+        for i in range {
+            s.feed(format!("line{:03}\r\n", i).as_bytes());
+        }
+    }
+
+    /// 画面に出ているハイライトの下に**実際にある**文字
+    /// (`draw_screen` はパーサの今の窓から描くので、これが利用者の見るもの)。
+    fn under_highlight(s: &Session) -> String {
+        let sel = s.selection.expect("選択が画面に見えている");
+        let p = lock_ok(&s.parser);
+        selection_text(p.screen(), normalize_sel(sel))
+    }
+
+    #[test]
+    fn 遡って選択したまま出力が来ても同じ文字を指し続ける() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = quiet_session(9971, rows, cols, 200);
+        feed_lines(&s, 0..30);
+        // 履歴を 10 行ぶん遡って、真ん中の行を選ぶ。
+        s.set_scroll(10);
+        s.set_selection(((2, 0), (2, 6)));
+        let want = s.selection_string();
+        assert!(want.starts_with("line"), "行を選べている: {want:?}");
+        assert_eq!(under_highlight(&s), want, "選ぶ直前は一致している");
+
+        // ここでエージェントが 3 行出力する (利用者は遡ったまま)。
+        s.feed(b"a\r\nb\r\nc\r\n");
+        assert_eq!(s.selection_string(), want, "コピーが同じ文字を指し続ける");
+        assert_eq!(under_highlight(&s), want, "ハイライトが同じ文字の上にある");
+
+        // さらに 1 行ぶん遡る。画面は 1 行しか動かない。
+        let before = s.eff_scroll();
+        assert!(s.adjust_scroll(1), "遡れる");
+        assert_eq!(s.eff_scroll(), before + 1, "1 行ぶんだけ動く");
+        assert_eq!(under_highlight(&s), want, "スクロールしてもずれない");
+        assert_eq!(s.selection_string(), want, "コピーもずれない");
+        s.kill();
+    }
+
+    #[test]
+    fn 履歴から押し出された選択は端で止まるか解除される() {
+        let (rows, cols) = (5u16, 20u16);
+        // 履歴は 8 行しか持てない = すぐ満杯になる。
+        let mut s = quiet_session(9972, rows, cols, 8);
+        feed_lines(&s, 0..20);
+        // 履歴の最古 2 行を選ぶ (画面行 0..1)。
+        s.set_scroll(usize::MAX);
+        assert!(s.eff_scroll() > 0, "遡れている");
+        s.set_selection(((0, 0), (1, 6)));
+        let want = s.selection_string();
+        let mut kept = want.lines();
+        let dropped = kept.next().expect("上の行").to_string();
+        let survives = kept.next().expect("下の行").to_string();
+
+        // 1 行流れると、上の行は履歴から落ちる → 残った側で止まる。
+        s.feed(b"a\r\n");
+        let now = s.selection_string();
+        assert!(
+            !now.contains(&dropped),
+            "消えた行を指し続けていない: {now:?}"
+        );
+        assert_eq!(now, survives, "生きている端で止まる: {now:?}");
+
+        // さらに流れて選択が丸ごと落ちたら解除する (黙って別の場所を指さない)。
+        s.feed(b"b\r\nc\r\nd\r\ne\r\nf\r\n");
+        assert_eq!(s.selection_string(), "", "残骸をコピーさせない");
+        assert_eq!(s.sel_abs, None, "選択が解除されている");
+        assert!(s.selection.is_none(), "ハイライトも消えている");
+        s.kill();
+    }
+
+    #[test]
+    fn 代替画面を出入りしても選択がずれない() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = quiet_session(9973, rows, cols, 200);
+        feed_lines(&s, 0..30);
+        s.set_scroll(6);
+        s.set_selection(((1, 0), (1, 6)));
+        let want = s.selection_string();
+        let abs = s.sel_abs;
+        assert!(want.starts_with("line"), "行を選べている: {want:?}");
+
+        // vim / less: 代替画面へ入って描いて出る。履歴は 1 行も伸びない。
+        s.feed(b"\x1b[?1049h");
+        s.feed(b"alt screen\r\nmore lines\r\n");
+        s.feed(b"\x1b[?1049l");
+        assert_eq!(s.sel_abs, abs, "代替画面は絶対行を動かさない");
+        assert_eq!(s.selection_string(), want, "戻ってきたら同じ文字を指す");
+        s.kill();
     }
 }
