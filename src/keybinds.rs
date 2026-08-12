@@ -205,8 +205,58 @@ pub enum BindAction {
     TermNextPrompt,
 }
 
-/// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 89] = [
+/// [`ALL_ACTIONS`] を組み立てる。**長さを人が書かない**ための唯一の理由。
+///
+/// ## 何を直したのか
+///
+/// 以前はここが `pub const ALL_ACTIONS: [BindAction; 89] = [ … ];` だった。
+/// 一覧へ 1 行足す人は**必ず 89 を 90 へ書き換える**必要があり、
+/// 並列に走る N 本の枝が**全員まったく同じ「90」を書く**。
+/// 同じ行が同じ内容になるので **git は衝突を出さない** —
+/// にもかかわらず統合後の実要素数は `89 + N` で、宣言と食い違う。
+/// `tools/shared-surface-bench.sh` はこれを `NG(長さ)` として全条件で観測した
+/// (`docs/chain-1-and-4.md`)。**衝突 0 と「正しい」は別物**という典型例で、
+/// union マージ (`crate::union`) では原理的に直せない —
+/// union は「両側の追記を両方残す」ので、両側が同じ `90` を書いた時点で
+/// 残せる正解が存在しない。
+///
+/// ## なぜこの形か (`$p:path` を取って長さを const 評価で数える)
+///
+/// * **呼び出し側が 1 行も変わらない。** 型は `[BindAction; 89]` のままなので
+///   `for a in ALL_ACTIONS`（値で回る）も `.to_vec()` も `.iter().enumerate()`
+///   も今までどおり。`ALL_ACTIONS` は `app.rs` / `jump.rs` / `whichkey.rs` /
+///   `tutorial.rs` / `marks.rs` の 20 箇所超から使われている。
+/// * **一覧の各行が 1 バイトも変わらない。** `    BindAction::Save,` のまま
+///   なので、追記の作法も既存の履歴も merge driver の当たり方も変わらない。
+///
+/// ## 採らなかった案
+///
+/// * **`&[BindAction]` にする** — 長さは消えるが `for a in ALL_ACTIONS` の
+///   要素型が `BindAction` から `&BindAction` へ変わり、上記 6 ファイル
+///   20 箇所超を書き換えることになる。**長さのずれを、他の枝との
+///   マージ衝突に交換するだけ**なので採らない。`feature::REGISTRY` や
+///   `MACOS_RESERVED` のように最初から slice の一覧はそのままでよい。
+/// * **`enum BindAction` ごとマクロで生成して追記点を 1 つにする** —
+///   追記点は 2 → 1 になるが、`pub enum BindAction {` はベンチ・
+///   `all_actionsの数がbindactionの変種数と一致する`・外部ツールが
+///   ソースから読む錨で、700 行の doc コメント付き enum をマクロ呼び出しへ
+///   畳む代償が大きい。そして**追記点が 2 つあること自体は問題ではない**:
+///   同じベンチで `config` 面 (struct + Default の 2 箇所) は全条件 OK。
+///   壊れていたのは手で数えた長さだけなので、そこだけ直す。
+/// * **`const` assertion でずれをコンパイル時に落とす** — 落ちる先が
+///   「配列リテラルの要素数と宣言長が違う」という**元から出るエラー**と
+///   同じで、何も足さない。防ぎたいのは失敗の遅さではなく
+///   「人が数を書く」こと自体。
+macro_rules! all_actions {
+    ($($p:path),* $(,)?) => {
+        /// 全アクションの一覧 (デフォルトマップ構築用)。
+        ///
+        /// 長さは [`all_actions!`] が要素から数える。**手で書く数は無い。**
+        pub const ALL_ACTIONS: [BindAction; [$(stringify!($p)),*].len()] = [$($p),*];
+    };
+}
+
+all_actions![
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -3637,7 +3687,13 @@ fn other() {
             "⌥⌘C",
             "⇧⌥⌘C",
         ];
-        let files: [(&str, &str); 8] = [
+        // 長さを書かない (`[(&str, &str); 8]` と書くと、走査対象を 1 つ足す
+        // 枝が全員「9」を書いて git は通すのに要素数は合わなくなる。
+        // `ALL_ACTIONS` と同じ穴)。
+        //
+        // `app.rs` は 51 ファイルへ分割したので `include_str!` では読めない。
+        // `crate::app::SRC_IMPL` が実装側だけを連結して持っている。
+        let files = [
             ("app.rs", crate::app::SRC_IMPL),
             ("whichkey.rs", include_str!("whichkey.rs")),
             ("menu_bar.rs", include_str!("menu_bar.rs")),

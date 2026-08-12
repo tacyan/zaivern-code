@@ -2846,9 +2846,35 @@ fn write_store(store: &Path, s: &Store) -> Result<(), String> {
     let tmp = store.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, json).map_err(|e| format!("台帳を書けません: {e}"))?;
     // rename は同一ディレクトリ内なら unix / Windows とも置換が保証される。
-    std::fs::rename(&tmp, store).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("台帳を差し替えられません: {e}")
+    //
+    // **ただし Windows は「置換できるか」と「いま置換できるか」が別。**
+    // 削除・置換は *delete pending* を経るので、混んでいる瞬間の rename は
+    // `AlreadyExists` ではなく **`ACCESS_DENIED` (os error 5)** を返す。
+    // ロックを取る側 ([`acquire_lock_in`]) にはこの再試行があるのに、
+    // **書き戻す側にだけ無かった** — しかも `LOCK_BUSY` 接頭辞も付かないので
+    // [`is_lock_busy`] にも掛からず、呼び出し側の再試行にも乗らずに落ちていた
+    // (wine の 64 スレッドで実測。`tools/windows-check.sh --wine`)。
+    // **いちばん混んでいるとき = いちばん衝突しやすいとき**にだけ台帳が
+    // 使えなくなる、という最悪の壊れ方をする非対称だった。
+    let deadline = Instant::now() + Duration::from_millis(LOCK_WAIT_MS);
+    let mut attempt = 0u32;
+    let err = loop {
+        match std::fs::rename(&tmp, store) {
+            Ok(()) => return Ok(()),
+            // 混んでいるだけなら待つ。予算内は何度でも。
+            Err(e) if lock_contended(&e) && Instant::now() < deadline => {
+                lock_backoff(&mut attempt);
+            }
+            Err(e) => break e,
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    // **文面ではなく接頭辞で識別する** ([`acquire_lock_in`] と同じ作法)。
+    // 混雑なら、呼び出し側が再試行できる形で返す。
+    Err(if lock_contended(&err) {
+        format!("{LOCK_BUSY}台帳を差し替えられません: {err}")
+    } else {
+        format!("台帳を差し替えられません: {err}")
     })
 }
 

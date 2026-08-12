@@ -20,8 +20,10 @@
 #   config    `src/config.rs`   `struct Config` へ 1 フィールド追加 +
 #                               `impl Default for Config` へ 1 行追加 (2 箇所)
 #   keybinds  `src/keybinds.rs` `enum BindAction` へ 1 variant 追加 +
-#                               `ALL_ACTIONS` へ 1 行追加 +
-#                               **固定長 `[BindAction; N]` の N を書き換え** (3 箇所)
+#                               `ALL_ACTIONS` へ 1 行追加 (2 箇所)。
+#                               **一覧が手書き長 (`[BindAction; N]`) の綴りなら
+#                               N の書き換えも足して 3 箇所**にする — 古い
+#                               チェックアウトや他リポジトリでも同じ穴を再現する
 #   features  `src/features/`   `bench_feat_<i>.rs` を**新規作成するだけ**
 #
 # `features` を必ず入れてあるのは、**「共有ファイルを 1 バイトも触らない」設計が
@@ -43,6 +45,13 @@
 # `keybinds` の宣言長 (`[BindAction; N]`) は**両側が同じ 90 を書く**ので
 # git は綺麗に通すが、実際の要素数とはずれる。
 # **「衝突 0」と「正しい」は別物**で、ここを混ぜたら嘘になる。
+#
+# この穴は 0.16.0 で `keybinds::all_actions!` (長さを要素から数える) へ
+# 移して塞いだ。**判定は消していない** — `kb_len` が実際に要素を数えて
+# `元の数 + 残った追記` と突き合わせるので、落ちた要素・二重に入った要素は
+# 今までどおり `NG(長さ)` になり、手書き長が復活したら
+# `NG(手書き長が復活)` になる。「直したから見ない」ではなく
+# **同じ性質を、数を書かない形のまま見続ける**。
 #
 # ## 使い方 (再現は 1 行)
 #
@@ -329,7 +338,12 @@ have_surface() {
         keybinds)
             [ -f "$R/$KEYBINDS_RS" ] || return 1
             grep -q '^pub enum BindAction {' "$R/$KEYBINDS_RS" || return 1
-            grep -q '^pub const ALL_ACTIONS: \[BindAction; [0-9]*\] = \[' "$R/$KEYBINDS_RS" || return 1
+            # 一覧は 2 つの綴りがありうる。**どちらでも測れる**ようにする
+            # (古いチェックアウトでは手書き長のまま `NG(長さ)` が再現する)。
+            #   handwritten: pub const ALL_ACTIONS: [BindAction; 89] = [
+            #   counted    : all_actions![
+            grep -q '^pub const ALL_ACTIONS: \[BindAction; [0-9]*\] = \[' "$R/$KEYBINDS_RS" \
+                || grep -q '^all_actions!\[' "$R/$KEYBINDS_RS" || return 1
             ;;
         features)
             [ -d "$R/$FEATURES_DIR" ] || return 1
@@ -338,10 +352,33 @@ have_surface() {
     return 0
 }
 
+# 一覧がどちらの綴りか。`handwritten` = 人が長さを書いている / `counted` = 書いていない。
+kb_form() {
+    if grep -q '^pub const ALL_ACTIONS: \[BindAction; [0-9]*\] = \[' "$R/$KEYBINDS_RS"; then
+        echo handwritten
+    else
+        echo counted
+    fi
+}
+
+# **一覧が主張する要素数**を返す。
+#
+# `handwritten` では宣言の `[BindAction; N]` の N — つまり**人が書いた数**。
+# `counted` では `all_actions![ … ];` の中の要素行を**実際に数えた数**。
+# どちらも「この一覧は何個だと言っているか」であり、`KB_ORIG + 残った追記`
+# と突き合わせれば、落ちた要素も二重に入った要素も同じ 1 本の検算で捕まる。
 kb_len() {
-    awk -F'[;]' '/^pub const ALL_ACTIONS: \[BindAction; [0-9]*\] = \[/ {
-        n = $2; gsub(/[^0-9]/, "", n); print n; exit
-    }' "$R/$KEYBINDS_RS"
+    if [ "$(kb_form)" = handwritten ]; then
+        awk -F'[;]' '/^pub const ALL_ACTIONS: \[BindAction; [0-9]*\] = \[/ {
+            n = $2; gsub(/[^0-9]/, "", n); print n; exit
+        }' "$R/$KEYBINDS_RS"
+    else
+        awk '
+            /^all_actions!\[/ { inside = 1; next }
+            inside && /^\];/  { print n; exit }
+            inside && /^[ \t]*BindAction::[A-Za-z0-9_]+,[ \t\r]*$/ { n++ }
+        ' "$R/$KEYBINDS_RS"
+    fi
 }
 
 # ── 行の差し込み。**その場所の改行に合わせる** ────────────────────
@@ -373,7 +410,15 @@ insert_before_end() {
 ANCHOR_STRUCT='pub struct Config {'
 ANCHOR_DEFAULT='impl Default for Config {'
 ANCHOR_ENUM='pub enum BindAction {'
-ANCHOR_ARRAY='pub const ALL_ACTIONS: [BindAction; '
+# 一覧の錨は綴りで変わる。**`have_surface` を通った後で決める**
+# (`R` の中身が要るので、変数の初期化ではなく関数にしてある)。
+kb_anchor() {
+    if [ "$(kb_form)" = handwritten ]; then
+        echo 'pub const ALL_ACTIONS: [BindAction; '
+    else
+        echo 'all_actions!['
+    fi
+}
 
 # 既存行の**書き換え** ($1 ファイル / $2 元 / $3 先。どちらも固定文字列)。
 replace_literal() {
@@ -398,8 +443,8 @@ add_markers() {
         keybinds)
             insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ENUM" '}' '    // zaivern:union-end' || return 1
             insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ENUM" '    Save,' '    // zaivern:union-begin' || return 1
-            insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ARRAY" '];' '    // zaivern:union-end' || return 1
-            insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ARRAY" '    BindAction::Save,' '    // zaivern:union-begin' || return 1
+            insert_before_end "$R/$KEYBINDS_RS" "$KB_ANCHOR" '];' '    // zaivern:union-end' || return 1
+            insert_before_end "$R/$KEYBINDS_RS" "$KB_ANCHOR" '    BindAction::Save,' '    // zaivern:union-begin' || return 1
             ;;
         features) : ;;
     esac
@@ -426,11 +471,19 @@ apply_writer() {
             insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ENUM" "$_end" \
                 "    BenchAct$2," || return 1
             _end='];'; [ "$MARK" = 1 ] && _end='    // zaivern:union-end'
-            insert_before_end "$R/$KEYBINDS_RS" "$ANCHOR_ARRAY" "$_end" \
+            insert_before_end "$R/$KEYBINDS_RS" "$KB_ANCHOR" "$_end" \
                 "    BindAction::BenchAct$2," || return 1
             # **固定長の N を書き換える。** どの枝も「今の N + 1」を書くので、
             # git は綺麗に通すが実際の要素数とはずれる (kb_same 型)。
-            replace_literal "$R/$KEYBINDS_RS" "[BindAction; $KB0]" "[BindAction; $(( KB0 + 1 ))]"
+            #
+            # `counted` の綴りではこの行が**存在しない** — 書き手は一覧へ
+            # 1 行足すだけで、数はどこにも書かない。ここを飛ばすこと自体が
+            # 「直った」の中身であり、判定を緩めているのではない
+            # (下の検算は `kb_len` が**実際に数えた要素数**を見るので、
+            #  落ちた要素も二重に入った要素も同じように捕まる)。
+            if [ "$KB_FORM" = handwritten ]; then
+                replace_literal "$R/$KEYBINDS_RS" "[BindAction; $KB0]" "[BindAction; $(( KB0 + 1 ))]"
+            fi
             ;;
         features)
             printf 'pub const ID: &str = "bench_feat_%s";\n' "$2" > "$R/$FEATURES_DIR/bench_feat_$2.rs"
@@ -566,6 +619,18 @@ run_case() {
             res_want=$(( KB_ORIG + res_kept ))
             [ "$res_kept" -eq "$_n" ] && [ "$_e" -eq "$_n" ] && [ "$res_dupent" -eq 0 ] || res_ok=NG
             [ "$res_declared" = "$res_want" ] || res_ok="NG(長さ)"
+            # `counted` を主張する以上、**手書きの長さが復活していないこと**まで
+            # 見る。ここを見ないと「綴りを変えただけで数が戻っている」を
+            # 素通りさせてしまう (判定関数が保証そのものを見ているかの確認)。
+            # **行コメントを落としてから見る。** 落とさないと、この穴を
+            # 説明している散文 (「以前は `[BindAction; 89]` だった」) まで
+            # 拾って、直っているのに `NG` と出る (実際に 1 度そうなった)。
+            # `grep -q` をパイプの最後に置いているので `$?` はそれのもの。
+            if [ "$KB_FORM" = counted ] \
+                && grep -v '^[[:space:]]*//' "$R/$KEYBINDS_RS" \
+                | grep -q '\[BindAction; *[0-9]'; then
+                res_ok="NG(手書き長が復活)"
+            fi
             ;;
         features)
             res_kept=$(find "$R/$FEATURES_DIR" -name 'bench_feat_*.rs' | grep -c . || true)
@@ -591,13 +656,22 @@ if ! grep -q '^x$' "$cap/A.txt" || ! grep -q '^y$' "$cap/A.txt"; then
 fi
 
 KB_ORIG=0
-if have_surface keybinds; then KB_ORIG=$(kb_len); fi
+KB_FORM=-
+KB_ANCHOR=
+if have_surface keybinds; then
+    # **複製が汚れる前に**綴りを見る (以降は書き換えるので判定が動く)。
+    KB_FORM=$(kb_form)
+    KB_ANCHOR=$(kb_anchor)
+    KB_ORIG=$(kb_len)
+fi
 
 {
     zai_identity "$zai"
     printf '対象リポジトリ: %s (複製 %s)\n' "$repo" "$R"
     printf 'HEAD: %s\n' "$(git -C "$R" rev-parse --short HEAD)"
-    [ "$KB_ORIG" != 0 ] && printf 'ALL_ACTIONS の元の宣言長: %s\n' "$KB_ORIG"
+    [ "$KB_ORIG" != 0 ] && printf 'ALL_ACTIONS の元の要素数: %s (綴り: %s%s)\n' \
+        "$KB_ORIG" "$KB_FORM" \
+        "$([ "$KB_FORM" = handwritten ] && printf ' = 人が長さを書いている' || printf ' = 人が長さを書かない')"
     printf '時計: %s\n\n' "$clock"
 } >&2
 
@@ -633,7 +707,9 @@ done
     printf '  0 でないのにハンクが減らないなら**ドライバが自分で降りた**という意味です。\n'
     printf '検算は衝突数と**別**に見ています。N 本の枝が 1 つずつ足したのだから、\n'
     printf '  統合後には N 個がちょうど 1 回ずつ無ければ NG です。\n'
-    printf '  NG(長さ) は「衝突は 0 だが [BindAction; N] の N が実際の要素数と違う」。\n'
+    printf '  NG(長さ) は「衝突は 0 だが一覧が主張する要素数が実際と違う」。\n'
+    printf '  「宣言長」は綴りが handwritten なら人が書いた N、counted なら実際に数えた数。\n'
+    printf '  NG(手書き長が復活) は counted のはずが [BindAction; N] に戻っている。\n'
 } >&2
 
 if [ "$json" = 1 ]; then

@@ -4431,7 +4431,7 @@ mod tests {
         // そのときは `tools/shared-surface-bench.sh` を測り直す必要がある。
         assert_eq!(
             facts.join("\n"),
-            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック15 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック15 追記行298 内側true autotrue 衝突false",
+            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック15 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック15 追記行348 内側true autotrue 衝突false",
             "共有面の形が変わりました。tools/shared-surface-bench.sh を測り直してください"
         );
     }
@@ -4491,7 +4491,14 @@ mod tests {
             (
                 "keybinds.rs/array",
                 kb,
-                "pub const ALL_ACTIONS: [BindAction; ",
+                // **宣言の綴りは変わる。** かつては
+                // `pub const ALL_ACTIONS: [BindAction; 89] = [` だったが、
+                // 手書きの長さ自体が「衝突 0 なのに間違っている」の元だったので
+                // `all_actions!` マクロが要素から数える形になった。
+                // ここを綴りごと固定しているのは、**実物の共有面を測る**テストで
+                // あって合成ではないため — 錨が外れたら (= 宣言の形が変わったら)
+                // 静かに素通りせず、必ずここで落ちる。
+                "all_actions![",
                 "];",
                 "    BindAction::BenchAct1,".to_string(),
                 "    BindAction::BenchAct2,".to_string(),
@@ -4544,3 +4551,309 @@ mod tests {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────
+// 「衝突 0 なのに正しくない」の番人 — 手で数えた配列長
+// ─────────────────────────────────────────────────────────────────
+//
+// union マージは**両側の追記を両方残す**ことしかできない。だから
+// 「両側が同じ 1 行を同じ内容へ書き換える」種類のずれは原理的に直せない。
+// その代表が固定長配列の宣言長で、`src/keybinds.rs` の
+// `pub const ALL_ACTIONS: [BindAction; 89]` は実際にそれで壊れていた:
+// N 本の枝が 1 つずつ足すと全員が `90` と書くので **git は衝突を出さない**が、
+// 実要素数は `89 + N` になる (`tools/shared-surface-bench.sh` が全条件で
+// `NG(長さ)` と観測。`docs/chain-1-and-4.md`)。
+//
+// ここはその種を**二度と生やさせない**ための番人である。
+#[cfg(test)]
+mod handcounted_len {
+    use std::path::{Path, PathBuf};
+
+    /// 1 行を見て「**module 直下**の `const` / `static` で、型が
+    /// `[T; <10 進数>]` で、リテラルが**複数行**」なら `(名前, 宣言長)` を返す。
+    ///
+    /// ## なぜこの 3 条件なのか (誤検出を出さないための線引き)
+    ///
+    /// * **module 直下だけ** (字下げ無し)。関数の中の `let` / `const` は
+    ///   その関数 1 つに閉じているので、別々の枝が独立に追記する面にならない。
+    /// * **複数行リテラルだけ** (`= [` で行が終わる)。
+    ///   `const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];` のように
+    ///   1 行で書いてあるものは、要素を足す = **その行を書き換える**ことなので
+    ///   両側の内容が違い、git が必ず衝突として出す。**静かには壊れない。**
+    /// * **10 進リテラルの長さだけ**。長さが `FOO.len()` や定数式なら
+    ///   人は数を書いていないので対象外 ([`crate::keybinds::ALL_ACTIONS`] が
+    ///   まさにこの形へ移った)。
+    fn decl_of(line: &str) -> Option<(String, usize)> {
+        // 字下げがあれば module 直下ではない。
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        // `trim_end` は CR も落とすので CRLF のチェックアウトでも同じに読める。
+        let head = line.trim_end().strip_suffix("= [")?.trim_end();
+        // `pub` / `pub(crate)` / `pub(super)` を落とす。
+        let head = match head.split_once(' ') {
+            Some((v, rest)) if v == "pub" || v.starts_with("pub(") => rest,
+            _ => head,
+        };
+        let rest = head
+            .strip_prefix("const ")
+            .or_else(|| head.strip_prefix("static "))?;
+        let (name, ty) = rest.split_once(':')?;
+        let ty = ty.trim();
+        let inner = ty.strip_prefix('[')?.strip_suffix(']')?;
+        let (_elem, len) = inner.rsplit_once(';')?;
+        let len = len.trim();
+        if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some((name.trim().to_string(), len.parse().ok()?))
+    }
+
+    /// 行コメント (`//` `///` `//!`) の行を落とす。
+    ///
+    /// 落とさないと、この穴を**説明している散文**まで検出器が拾う
+    /// (`keybinds.rs` の「以前はここが `[BindAction; 89]` だった」がまさにそれ)。
+    fn code_lines(src: &str) -> Vec<&str> {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect()
+    }
+
+    fn src_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// `src/` 以下の `.rs` を全部集める。**一覧を手で持たない** —
+    /// 持った瞬間、その一覧自身が「追記で壊れる共有面」になる。
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut ents: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        ents.sort();
+        for p in ents {
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// `src/` からの相対パスを、OS に依らない `/` 区切りで返す。
+    fn rel(p: &Path) -> String {
+        p.strip_prefix(src_root())
+            .unwrap_or(p)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn read(rel_path: &str) -> String {
+        let p = src_root().join(rel_path);
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("{} が読めない: {e}", p.display()))
+            .replace("\r\n", "\n")
+    }
+
+    // ── 検出器そのものの検査 (表で固定する) ──────────────────────
+    //
+    // 番人を入れるときは「拾うもの」と「拾わないもの」を**両方**固定する。
+    // 片側しか見ないと、何も咎めない番人 = 意味の無い検査になる。
+    #[test]
+    fn 手書き長の検出器は拾うものと拾わないものを取り違えない() {
+        // 拾う: module 直下・複数行・10 進リテラル
+        let pick: &[(&str, (&str, usize))] = &[
+            (
+                "pub const ALL_ACTIONS: [BindAction; 89] = [",
+                ("ALL_ACTIONS", 89),
+            ),
+            ("const GROUP_ORDER: [Group; 8] = [", ("GROUP_ORDER", 8)),
+            ("pub(crate) static T: [(&str, u8); 3] = [", ("T", 3)),
+            // 入れ子の型でも、最後の `;` の右が長さ。
+            ("const C: [(&str, [&[&str]; 2], usize); 6] = [", ("C", 6)),
+            // CRLF のチェックアウトでも同じに読める。
+            (
+                "pub const ALL_ACTIONS: [BindAction; 89] = [\r",
+                ("ALL_ACTIONS", 89),
+            ),
+        ];
+        for (line, want) in pick {
+            let got = decl_of(line).unwrap_or_else(|| panic!("拾えていない: {line:?}"));
+            assert_eq!((got.0.as_str(), got.1), *want, "{line:?}");
+        }
+        // 拾わない
+        let skip: &[&str] = &[
+            // 1 行で閉じている = 要素を足すとその行が変わる = git が衝突を出す
+            r#"const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];"#,
+            // 関数の中 (字下げ) = 1 つの関数に閉じている
+            "    const ANSI_KEYS: [&str; 16] = [",
+            "    let cases: [(&str, u8); 6] = [",
+            // 長さを人が書いていない = そもそも対象外 (これが直した後の形)
+            "pub const ALL_ACTIONS: [BindAction; [stringify!(x)].len()] = [",
+            // slice なので長さが無い
+            "pub const MACOS_RESERVED: &[(Modifiers, Key, &str)] = &[",
+            "pub const REGISTRY: &[&Feature] = crate::features::GENERATED;",
+            // 配列ですらない
+            "pub const BEGIN: &str = \"zaivern:union-begin\";",
+            // 散文
+            "// pub const ALL_ACTIONS: [BindAction; 89] = [",
+            "/// 以前は `pub const ALL_ACTIONS: [BindAction; 89] = [` だった。",
+        ];
+        for line in skip {
+            assert!(decl_of(line).is_none(), "誤検出: {line:?}");
+        }
+    }
+
+    /// **`ALL_ACTIONS` に手で数えた長さが戻っていない。**
+    ///
+    /// `tools/shared-surface-bench.sh` が `NG(長さ)` を出した現物そのものの
+    /// 回帰検査。`keybinds.rs` の**コード中**に `[BindAction; <数字>]` が
+    /// 1 つでもあれば落ちる。誤検出は構造的に起こり得ない —
+    /// この綴りは「BindAction の固定長配列」以外を意味しないため。
+    #[test]
+    fn bindactionの配列に手書きの長さが無い() {
+        let src = read("keybinds.rs");
+        let bad: Vec<&str> = code_lines(&src)
+            .into_iter()
+            .filter(|l| {
+                let Some(i) = l.find("[BindAction;") else {
+                    return false;
+                };
+                l[i + "[BindAction;".len()..]
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_digit())
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "`[BindAction; N]` の手書き長が戻っている: {bad:?}\n\
+             N 本の枝が全員同じ N+1 を書くので git は衝突を出さないが、\n\
+             実要素数は合わなくなる (union マージでは直せない)。\n\
+             長さは `all_actions!` に数えさせること。"
+        );
+    }
+
+    /// **共有追記面に、手で数えた長さの一覧を置かない。**
+    ///
+    /// ここに挙げたのは CLAUDE.md が「ゼロにできていない共有面」として
+    /// 名指ししている場所と、機能ごとの登録先。**どれも複数の枝が
+    /// 独立に追記することが前提**なので、手書き長は許容量ゼロでよい。
+    /// 対象を定義で絞ってあるので誤検出は起きない。
+    #[test]
+    fn 共有追記面に手書き長の一覧が無い() {
+        let mut files = vec![
+            "keybinds.rs".to_string(),
+            "config.rs".to_string(),
+            "feature.rs".to_string(),
+        ];
+        let mut feats = Vec::new();
+        rs_files(&src_root().join("features"), &mut feats);
+        files.extend(feats.iter().map(|p| rel(p)));
+
+        let mut bad = Vec::new();
+        for f in &files {
+            let src = read(f);
+            for line in code_lines(&src) {
+                if let Some((name, n)) = decl_of(line) {
+                    bad.push(format!("{f}: {name} (長さ {n})"));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "共有追記面に手で数えた配列長がある: {bad:#?}\n\
+             複数の枝が 1 つずつ足すと全員が同じ N+1 を書くため、\n\
+             git は衝突を出さないのに要素数が合わなくなる。\n\
+             `&[T]` にするか、`keybinds::all_actions!` のように\n\
+             要素から数えさせること。"
+        );
+    }
+
+    /// `src/` 全体では、module 直下の手書き長は**既知の分だけ**。
+    ///
+    /// ## なぜ「全部禁止」にしないのか
+    ///
+    /// 固定長が正しい一覧は実在する (ANSI の 16 色、`[f32; 2]` の余白)。
+    /// 全部咎めると誰も見なくなるので、**咎めるのは新しく増えたときだけ**に
+    /// する。ここに載っているのは「本当に増えない」と確認したものではなく
+    /// **この変更の担当範囲外だった**もので、増えうるものも混ざっている
+    /// (下の理由欄に正直に書いてある)。新しく足す人は、長さを人が書かない形に
+    /// するか、ここへ 1 行足して理由を書くかを**必ず選ぶ**ことになる。
+    #[test]
+    fn module直下の手書き長は既知の分だけ() {
+        // (`src/` からの相対パス, 名前, なぜ今それでよいか)
+        const KNOWN: &[(&str, &str, &str)] = &[
+            ("palette.rs", "PREFIXES", "パレットの接頭辞。増えうる・範囲外"),
+            ("palette.rs", "GROUP_ORDER", "パレットの群の並び。増えうる・範囲外"),
+            ("failover.rs", "LADDER", "停止シグナルの梯子。増えうる・範囲外"),
+            ("whichkey.rs", "DIGIT_KEYS", "数字キー 1〜9。10 個目は無い"),
+            ("zoom.rs", "STEPS", "ズーム段。設計された曲線・範囲外"),
+            (
+                "terminal.rs",
+                "MENU_KEYS",
+                "承認メニューの選択キー。下の 3 本と長さを揃える必要がある",
+            ),
+            (
+                "terminal.rs",
+                "MENU_DESC_ALLOW",
+                "MENU_KEYS と添字で対応する並行配列",
+            ),
+            (
+                "terminal.rs",
+                "MENU_DESC_SKIP",
+                "MENU_KEYS と添字で対応する並行配列",
+            ),
+            (
+                "terminal.rs",
+                "MENU_DESC_RATING",
+                "MENU_KEYS と添字で対応する並行配列",
+            ),
+            ("terminal.rs", "SIG_MARKS", "出力の目印。増えうる・範囲外"),
+            ("editor_ops.rs", "AUTO_PAIRS", "自動対応する括弧。範囲外"),
+            ("coedit.rs", "IDENT", "共同編集の識別子。範囲外 (他が編集中)"),
+            ("kanban.rs", "COLUMNS", "かんばんの列。増えうる・範囲外"),
+            ("train.rs", "DRY_IDENT", "空回しの識別子。範囲外"),
+        ];
+
+        let mut files = Vec::new();
+        rs_files(&src_root(), &mut files);
+        let mut found: Vec<(String, String)> = Vec::new();
+        for p in &files {
+            let f = rel(p);
+            let src = std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .replace("\r\n", "\n");
+            for line in code_lines(&src) {
+                if let Some((name, _)) = decl_of(line) {
+                    found.push((f.clone(), name));
+                }
+            }
+        }
+
+        let known: Vec<(String, String)> = KNOWN
+            .iter()
+            .map(|(f, n, _)| (f.to_string(), n.to_string()))
+            .collect();
+        let added: Vec<&(String, String)> = found.iter().filter(|x| !known.contains(x)).collect();
+        assert!(
+            added.is_empty(),
+            "module 直下に手で数えた配列長が増えている: {added:#?}\n\
+             複数の枝が 1 つずつ足すと全員が同じ N+1 を書くので、\n\
+             git は衝突を出さないのに要素数が合わなくなる\n\
+             (`keybinds::ALL_ACTIONS` で実際に起きた)。\n\
+             1. 長さを人が書かない形にする (`&[T]` / `keybinds::all_actions!`)、\n\
+             2. どうしても固定長なら KNOWN へ 1 行足して理由を書く、\n\
+             のどちらかを選ぶこと。"
+        );
+        // **番人が空回りしていないことも固定する。** 既知が全部消えたら、
+        // 検出器が壊れたのか本当に直ったのかを区別できないので気付けるようにする。
+        let stale: Vec<&(String, String)> = known.iter().filter(|x| !found.contains(x)).collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN に、もう存在しない項目が残っている: {stale:#?}\n\
+             直ったなら KNOWN からも消すこと (残すと番人が緩む)。"
+        );
+    }
+}
