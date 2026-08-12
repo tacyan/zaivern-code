@@ -16,7 +16,10 @@ mod deck;
 mod desktop;
 mod diagnostician;
 mod diagview;
+mod dialog;
 mod diff;
+#[cfg(test)]
+mod e2e;
 mod editor;
 mod editor_ops;
 mod editor_split;

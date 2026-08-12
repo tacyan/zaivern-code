@@ -994,62 +994,67 @@ pub fn task_form_ui(
     let mut close = false;
     let mut open = true;
 
-    egui::Window::new(tr("📋 新しいタスク"))
+    // 中身は **必ず縦スクロールで包む**。素の `Window` は中身の高さぶんだけ
+    // 伸びるので、低い画面 (1200×300) では窓が 384px になり
+    // −42 〜 342 = **タイトルバーと ✕ が画面の外**へ出ていた。
+    // 枠を画面へ縛るのと合わせて 2 つで 1 組 (`crate::dialog` の doc を見よ)。
+    crate::dialog::window(ctx, tr("📋 新しいタスク"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            crate::dialog::scroll_body(ui, "orch-task-form", |ui| {
+                ui.set_min_width(crate::dialog::body_width(ui.ctx(), 420.0));
 
-            ui.label(RichText::new(tr("タイトル")).small().color(theme.text_dim));
-            ui.add(
-                egui::TextEdit::singleline(&mut st.title)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(tr("例: ログイン画面のテストを直す")),
-            );
+                ui.label(RichText::new(tr("タイトル")).small().color(theme.text_dim));
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.title)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(tr("例: ログイン画面のテストを直す")),
+                );
 
-            ui.add_space(6.0);
-            ui.label(RichText::new(tr("内容")).small().color(theme.text_dim));
-            ui.add(
-                egui::TextEdit::multiline(&mut st.description)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(4)
-                    .hint_text(tr("担当するエージェントへそのまま送られます")),
-            );
-
-            // ── ディスパッチ前チェック ────────────────────────────
-            // 既に別のワークツリーが触っているファイルを名指ししていたら、
-            // **始まる前に** 知らせる。当たらなければ高さを 1 px も取らない。
-            let warns = crate::conflict::dispatch_check(
-                &format!("{} {} {}", st.title, st.description, st.files),
-                owners,
-            );
-            if !warns.is_empty() {
                 ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(theme.panel_alt)
-                    .rounding(4.0)
-                    .inner_margin(egui::Margin::same(6.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new(crate::conflict::dispatch_summary(&warns))
-                                .small()
-                                .color(theme.warn)
-                                .strong(),
-                        );
-                        for w in warns.iter().take(5) {
-                            let line = format!("{} — {}", w.path, w.owners.join(" ・ "));
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&line).small().color(theme.text_dim),
+                ui.label(RichText::new(tr("内容")).small().color(theme.text_dim));
+                ui.add(
+                    egui::TextEdit::multiline(&mut st.description)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(4)
+                        .hint_text(tr("担当するエージェントへそのまま送られます")),
+                );
+
+                // ── ディスパッチ前チェック ────────────────────────────
+                // 既に別のワークツリーが触っているファイルを名指ししていたら、
+                // **始まる前に** 知らせる。当たらなければ高さを 1 px も取らない。
+                let warns = crate::conflict::dispatch_check(
+                    &format!("{} {} {}", st.title, st.description, st.files),
+                    owners,
+                );
+                if !warns.is_empty() {
+                    ui.add_space(6.0);
+                    egui::Frame::none()
+                        .fill(theme.panel_alt)
+                        .rounding(4.0)
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(crate::conflict::dispatch_summary(&warns))
+                                    .small()
+                                    .color(theme.warn)
+                                    .strong(),
+                            );
+                            for w in warns.iter().take(5) {
+                                let line = format!("{} — {}", w.path, w.owners.join(" ・ "));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&line).small().color(theme.text_dim),
+                                    )
+                                    .truncate(),
                                 )
-                                .truncate(),
-                            )
-                            .on_hover_text(line);
-                        }
-                        ui.label(
+                                .on_hover_text(line);
+                            }
+                            ui.label(
                             RichText::new(tr(
                                 "同じ場所を 2 体で触ると、マージのときに解決コストを払います。\n\
                                  別のファイルへ割るか、担当を先の相手に合わせてください。",
@@ -1057,96 +1062,101 @@ pub fn task_form_ui(
                             .small()
                             .color(theme.text_dim),
                         );
-                    });
-            }
+                        });
+                }
 
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(tr("担当ファイル (任意・カンマ / 空白区切り・glob 可)"))
-                    .small()
-                    .color(theme.text_dim),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut st.files)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(tr(
-                        "src/app.rs, src/ui/**  — 埋めると重なる割り当てを実際に止めます",
-                    )),
-            );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(tr("担当ファイル (任意・カンマ / 空白区切り・glob 可)"))
+                        .small()
+                        .color(theme.text_dim),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.files)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(tr(
+                            "src/app.rs, src/ui/**  — 埋めると重なる割り当てを実際に止めます",
+                        )),
+                );
 
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(tr("必要な能力 (任意・カンマ区切り)"))
-                    .small()
-                    .color(theme.text_dim),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut st.caps)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("backend, test"),
-            );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(tr("必要な能力 (任意・カンマ区切り)"))
+                        .small()
+                        .color(theme.text_dim),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.caps)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("backend, test"),
+                );
 
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(tr("担当")).small().color(theme.text_dim));
-                let current = match st.target {
-                    TaskTarget::Auto => tr("自動割り当て"),
-                    TaskTarget::Session(id) => row_label(rows, id),
-                };
-                egui::ComboBox::from_id_salt("orch-task-target")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut st.target, TaskTarget::Auto, tr("自動割り当て"));
-                        for r in rows.iter().filter(|r| r.running) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr("担当")).small().color(theme.text_dim));
+                    let current = match st.target {
+                        TaskTarget::Auto => tr("自動割り当て"),
+                        TaskTarget::Session(id) => row_label(rows, id),
+                    };
+                    egui::ComboBox::from_id_salt("orch-task-target")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut st.target,
-                                TaskTarget::Session(r.id),
-                                format!("{} (#{})", r.title, r.id),
+                                TaskTarget::Auto,
+                                tr("自動割り当て"),
                             );
-                        }
-                    });
-            });
+                            for r in rows.iter().filter(|r| r.running) {
+                                ui.selectable_value(
+                                    &mut st.target,
+                                    TaskTarget::Session(r.id),
+                                    format!("{} (#{})", r.title, r.id),
+                                );
+                            }
+                        });
+                });
 
-            if rows.iter().all(|r| !r.running) {
-                ui.label(
-                    RichText::new(tr(
-                        "稼働中のエージェントがいないため、いま割り当てはできません",
-                    ))
-                    .small()
-                    .color(theme.warn),
-                );
-            }
+                if rows.iter().all(|r| !r.running) {
+                    ui.label(
+                        RichText::new(tr(
+                            "稼働中のエージェントがいないため、いま割り当てはできません",
+                        ))
+                        .small()
+                        .color(theme.warn),
+                    );
+                }
 
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let ready = !st.title.trim().is_empty();
-                if ui
-                    .add_enabled(ready, egui::Button::new(tr("▶ 作成して割り当て")))
-                    .clicked()
-                {
-                    acts.push(OrchAction::CreateTask {
-                        title: st.title.trim().to_string(),
-                        description: st.description.trim().to_string(),
-                        caps: st
-                            .caps
-                            .split(',')
-                            .map(|s| s.trim().to_lowercase())
-                            .filter(|s| !s.is_empty())
-                            .collect(),
-                        files: st
-                            .files
-                            .split([',', ' ', '\n'])
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .map(crate::lease::normalize_path)
-                            .collect(),
-                        target: st.target,
-                    });
-                    close = true;
-                }
-                if ui.button(tr("キャンセル")).clicked() {
-                    close = true;
-                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let ready = !st.title.trim().is_empty();
+                    if ui
+                        .add_enabled(ready, egui::Button::new(tr("▶ 作成して割り当て")))
+                        .clicked()
+                    {
+                        acts.push(OrchAction::CreateTask {
+                            title: st.title.trim().to_string(),
+                            description: st.description.trim().to_string(),
+                            caps: st
+                                .caps
+                                .split(',')
+                                .map(|s| s.trim().to_lowercase())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            files: st
+                                .files
+                                .split([',', ' ', '\n'])
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(crate::lease::normalize_path)
+                                .collect(),
+                            target: st.target,
+                        });
+                        close = true;
+                    }
+                    if ui.button(tr("キャンセル")).clicked() {
+                        close = true;
+                    }
+                });
             });
         });
 
@@ -1175,13 +1185,14 @@ pub fn message_form_ui(
     let mut close = false;
     let mut open = true;
 
-    egui::Window::new(tr("📮 エージェントへ送信"))
+    crate::dialog::window(ctx, tr("📮 エージェントへ送信"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.set_min_width(420.0);
+            crate::dialog::scroll_body(ui, "orch-msg-form", |ui| {
+                ui.set_min_width(crate::dialog::body_width(ui.ctx(), 420.0));
 
             ui.horizontal(|ui| {
                 ui.label(RichText::new(tr("宛先")).small().color(theme.text_dim));
@@ -1249,6 +1260,7 @@ pub fn message_form_ui(
                 if ui.button(tr("閉じる")).clicked() {
                     close = true;
                 }
+            });
             });
         });
 

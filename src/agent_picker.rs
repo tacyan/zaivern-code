@@ -311,7 +311,10 @@ pub fn ui(
         picker.installed.count(),
     );
 
-    egui::Window::new(tr("👾 エージェントを追加"))
+    // 画面が低いと `default_height(520)` のまま上下へ食み出す
+    // (1200×300 で −6 〜 306。タイトルバーと ✕ が画面の外)。
+    // 枠を画面へ縛るのは `crate::dialog::window` の役目。
+    crate::dialog::window(ctx, tr("👾 エージェントを追加"))
         .collapsible(false)
         .resizable(true)
         .default_width(620.0)

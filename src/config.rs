@@ -1838,7 +1838,7 @@ pub fn load(roots: &[PathBuf], with_state: bool) -> Config {
 }
 
 /// `load()` の実体。テストから一時ディレクトリを差し込めるよう分離している。
-fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
+pub(crate) fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
     let mut cfg: Config = match std::fs::read_to_string(dir.join("config.toml")) {
         Ok(s) => match toml::from_str(&s) {
             Ok(c) => c,
