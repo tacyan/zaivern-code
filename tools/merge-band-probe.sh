@@ -501,6 +501,15 @@ def run_random():
     if REAL:
         with open(REAL, newline="") as fh:
             real_text = fh.read()
+    # **ハーネス自身の検査。** 何も編集しなければ 1 バイトも変わらないこと。
+    # `anyrepo-prove.sh` は改行を保存せず CRLF のファイルを全部 LF へ書き換えて
+    # いて、**実際には守られているリポジトリを「証明できず」**にしていた。
+    for probe_base in ("a\nb\nc\n", "a\r\nb\r\nc\r\n", "a\nb\nc"):
+        crlf_p = "\r\n" in probe_base
+        same = apply_edits(probe_base, [], [], "X", crlf_p)
+        if same != probe_base:
+            print("   ⚠ ハーネスが改行を保存していない: %r → %r" % (probe_base, same))
+            sys.exit(2)
     print("\n[random] 削除・挿入を混ぜた無作為配置 (種 %d・%d 通り・帯 %d)"
           % (SEED, TRIALS, BAND))
     print("  → **穴はここだった**。交錯していなくても衝突する組がある")
