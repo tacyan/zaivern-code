@@ -3924,6 +3924,53 @@ mod tests {
         std::process::exit(0);
     }
 
+    /// **python3 を呼ぶハーネスは UTF-8 を明示していること。**
+    ///
+    /// Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+    /// Python が日本語を stdout へ書いた瞬間に
+    /// `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる。
+    /// **実際に CI の `probe (windows-latest)` がこれで赤くなり、
+    /// 同じ穴が他に 10 本あった** — 落ちたのは、たまたま CI が Windows で
+    /// 回していた 1 本だけだったから。
+    ///
+    /// macOS / Linux では既定が UTF-8 なので、**手元では永久に気付けない**。
+    #[test]
+    fn python3を呼ぶハーネスはutf8を明示している() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
+        let mut missing: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(&dir).expect("tools/").flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("sh") {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let src = src.replace("\r\n", "\n");
+            if !src.contains("python3") {
+                continue;
+            }
+            // どちらか一方でも宣言してあれば、Windows でも UTF-8 で書ける。
+            if src.contains("PYTHONUTF8") || src.contains("PYTHONIOENCODING") {
+                continue;
+            }
+            missing.push(
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            );
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "python3 を呼ぶのに UTF-8 を明示していないハーネス: {missing:?}\n\
+             `export PYTHONUTF8=\"${{PYTHONUTF8:-1}}\"` と\n\
+             `export PYTHONIOENCODING=\"${{PYTHONIOENCODING:-utf-8}}\"` を足すこと。\n\
+             Windows の既定コードページでは日本語を書いた瞬間に落ちる。"
+        );
+    }
+
     /// ハーネスが `--exact` に渡す名前が、実際のモジュール位置とずれていないこと。
     /// **ずれるとハーネスは「0 件のテストが走った」で静かに緑になる。**
     #[test]

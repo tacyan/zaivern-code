@@ -103,6 +103,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (実際に CI の probe (windows-latest) がこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
 python3 - "$mode" "$seed" "$trials" "$band" "$real" <<'PY'
 import collections
 import os

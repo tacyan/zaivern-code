@@ -2546,7 +2546,36 @@ mod tests {
                 eprintln!("git merge-tree --write-tree が使えないので飛ばす");
                 return;
             };
-            assert!(hit, "実 git が衝突しないなら、この穴の前提が変わっている");
+            // **ここは環境の話であって、我々のコードの性質ではない。**
+            //
+            // この反証が再現するのは `git merge` の既定戦略が ort
+            // (= diff-algorithm=histogram 固定) の版だけ。古い git は
+            // recursive/myers なので同じ組を clean と答える
+            // (実測: 2.30.2 では 5 本文すべて clean / 2.39・2.47 では衝突)。
+            //
+            // 上の 4 つの assert — 帯を満たす・交錯していない・壁を要求する・
+            // 通さない — が**出荷する判定そのもの**で、そちらは git の版に依らず
+            // 全環境で同じ答えを出す。実 git が衝突しない環境では、我々の門は
+            // **過剰に断っているだけ**なので安全側に居る。
+            //
+            // だから落とさずに **声を出して飛ばす**。黙って通すと
+            // 「この穴はもう無い」と読めてしまい、静かな嘘になる。
+            if !hit {
+                let v = std::process::Command::new("git")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "(版を取れない)".into());
+                eprintln!("[skip] 実 git がこの組を衝突させない ({v})");
+                eprintln!(
+                    "       この反証は ort (diff-algorithm=histogram 固定) の版でだけ再現する"
+                );
+                eprintln!("       出荷する判定 (needs_wall / interleave_safe) は上で検査済み");
+                eprintln!("       この環境では過剰に断っている = 安全側に居る");
+                eprintln!("       再現するには git 2.34 以上で実行すること");
+                return;
+            }
         }
     }
 

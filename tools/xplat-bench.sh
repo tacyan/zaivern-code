@@ -60,6 +60,13 @@
 #   2  引数の指定ミス
 #   3  前提が無い (git / python3 が無い、--linux-only なのに Docker が無い 等)
 set -eu
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (CI の probe (windows-latest) が実際にこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 writers=8,16
 files=""

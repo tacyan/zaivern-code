@@ -39,6 +39,13 @@
 #     実際に 920MB の作業ディレクトリを context に取ってしまい、
 #     イメージ 1 枚に 15 分以上かかった。Dockerfile は stdin から渡す
 set -eu
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (CI の probe (windows-latest) が実際にこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 

@@ -58,6 +58,13 @@
 # shellcheck disable=SC2154  # `_h_<fixture>` は eval で作る動的変数 (静的解析からは見えない)
 # shellcheck disable=SC2086  # `set -- $out` / `for w in $writers_list` は意図的な語分割
 set -eu
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (CI の probe (windows-latest) が実際にこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 writers_list="8 16 32"
 driver=""
