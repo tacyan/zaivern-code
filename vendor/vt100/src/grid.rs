@@ -241,6 +241,14 @@ impl Grid {
         self.scrollback_offset
     }
 
+    /// zaivern patch: 履歴だけを捨てる。`clear()` は表示行しか触らないので、
+    /// 代替画面へ入り直したとき (DECSET 1049) に**前のアプリの履歴が残る**。
+    /// 代替画面にも履歴を持たせた以上、入り直しの度にここで捨てる必要がある。
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_offset = 0;
+    }
+
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
     }

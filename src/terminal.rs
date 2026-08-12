@@ -312,6 +312,14 @@ pub struct Session {
     /// 絶対行は**生きている画面の下端**が起点なので、1 行押し出されるたびに
     /// 同じ文字を指す値が +1 される。差分がそのまま「進めるべき量」になる。
     sel_pushed: u64,
+    /// 直前のフレームで代替画面 (alternate screen) だったか。
+    ///
+    /// 代替画面へ**入った瞬間**にだけ履歴表示を畳むための記憶。
+    /// 以前はここを毎フレームの強制 (`if alt { set_scroll(0) }`) でやっていたが、
+    /// それだと上端を超えたドラッグが送った行が次のフレームで必ず打ち消され、
+    /// **エージェントのタイルでだけ選択を画面より上へ伸ばせなかった**
+    /// (Shell は通常画面なので効かず、差になって現れた)。
+    alt_screen_prev: bool,
     /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
     pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
@@ -1956,6 +1964,7 @@ impl Session {
             sel_abs: None,
             sel_pushed: 0,
             sel_anchor_abs: None,
+            alt_screen_prev: false,
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
@@ -2799,6 +2808,22 @@ impl Session {
         self.scroll = eff;
         // 選択は絶対座標なので消さない。今の画面へ切り取り直すだけ。
         self.sync_selection();
+    }
+
+    /// 代替画面へ**入った瞬間**だけ履歴表示を畳む。戻り値は「いま代替画面か」。
+    ///
+    /// 目的は「通常画面で上へスクロールしたまま vim / エージェントが起動したとき、
+    /// 古い履歴ビューが残らないようにする」こと。**遷移の話であって毎フレームの
+    /// 話ではない。** 毎フレーム畳んでいた頃は、代替画面のセッションで
+    /// 上端超えドラッグの自動スクロールが毎フレーム打ち消され、選択を
+    /// 画面より上へ伸ばせなかった。
+    pub fn sync_alt_screen(&mut self) -> bool {
+        let alt = self.wheel_modes().0;
+        if should_collapse_history(alt, self.alt_screen_prev, self.scroll) {
+            self.set_scroll(0);
+        }
+        self.alt_screen_prev = alt;
+        alt
     }
 
     /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
@@ -4038,7 +4063,7 @@ mod tests {
         abs_row, all_terminal_lines, autoscroll_step, clip_selection, input_area_selection,
         is_image_paste_chord_on, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
         prune_clip_pngs, save_clipboard_png, screen_row, search_scroll_target, selection_text,
-        selection_text_abs, word_selection, Session, CLIP_PNG_KEEP,
+        selection_text_abs, should_collapse_history, word_selection, Session, CLIP_PNG_KEEP,
     };
 
     /// 履歴を積んだパーサと「実在する最古の絶対行」を作る。
@@ -4542,6 +4567,47 @@ mod tests {
         assert_eq!(autoscroll_step(5.0, 0.0), 1);
         assert_eq!(autoscroll_step(-5.0, 10.0), 1);
         assert_eq!(autoscroll_step(f32::NAN, 10.0), 1);
+    }
+
+    /// 履歴を畳む条件の真理値表。
+    ///
+    /// **3 行目が、報告された不具合そのもの**: 代替画面に居続けているあいだに
+    /// 畳んでしまうと、上端超えドラッグが送った行が毎フレーム打ち消され、
+    /// 「Shell ではコピー範囲を上へ広げられるのに、エージェントでは広げられない」
+    /// になる。
+    #[test]
+    fn 履歴を畳むのは代替画面へ入った瞬間だけ() {
+        for (alt_now, alt_prev, scroll, want, why) in [
+            (
+                true,
+                false,
+                5,
+                true,
+                "通常画面で遡ったまま vim が起動 → 畳む",
+            ),
+            (true, false, 0, false, "そもそも遡っていない → 何もしない"),
+            (
+                true,
+                true,
+                5,
+                false,
+                "代替画面に居続けている → 畳まない(ドラッグ中)",
+            ),
+            (
+                false,
+                true,
+                5,
+                false,
+                "代替画面から出た → 通常画面の履歴は残す",
+            ),
+            (false, false, 5, false, "ずっと通常画面 (Shell) → 触らない"),
+        ] {
+            assert_eq!(
+                should_collapse_history(alt_now, alt_prev, scroll),
+                want,
+                "alt_now={alt_now} alt_prev={alt_prev} scroll={scroll}: {why}"
+            );
+        }
     }
 
     #[test]
@@ -7197,6 +7263,16 @@ fn autoscroll_step(overshoot: f32, cell_h: f32) -> i64 {
     ((overshoot / cell_h).ceil() as i64).clamp(1, 8)
 }
 
+/// 履歴表示 (`scroll > 0`) を畳むべきか。
+///
+/// **代替画面へ「入った瞬間」だけ true。** 代替画面に居続けているあいだは
+/// false を返すのが要点で、ここを `alt_now && scroll > 0` にすると
+/// 上端超えドラッグの自動スクロールが毎フレーム打ち消され、
+/// エージェントのタイルで選択を画面より上へ伸ばせなくなる。
+fn should_collapse_history(alt_now: bool, alt_prev: bool, scroll: usize) -> bool {
+    alt_now && !alt_prev && scroll > 0
+}
+
 /// マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行)。
 fn handle_mouse_selection(
     session: &mut Session,
@@ -9015,11 +9091,14 @@ pub fn draw(
         handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
     }
 
-    // 代替画面(Claude Code / vim / less 等)にスクロールバック履歴は無いため、
-    // 切替後も古い履歴ビューが画面に残らないよう自動で一番下へ戻す。
-    if session.scroll > 0 && session.wheel_modes().0 {
-        session.set_scroll(0);
-    }
+    // 通常画面で履歴を遡ったまま代替画面のアプリ (vim / less / エージェント) が
+    // 立ち上がったとき、古い履歴ビューを残さない。**入った瞬間だけ**畳む。
+    //
+    // ここを毎フレームの強制にすると、代替画面のセッションでは上端超えドラッグの
+    // 自動スクロールが次のフレームで必ず打ち消され、選択を画面より上へ伸ばせない。
+    // 「Shell ではコピー範囲を上へ広げられるのに、エージェントでは広げられない」
+    // として報告されたのがこれ。
+    session.sync_alt_screen();
 
     // Cmd+F ルーティング用に「どの端末がフォーカス中か」を egui 一時データへ
     // 残す。app 側のグローバルショートカット処理は (パネル描画より先に走るので)

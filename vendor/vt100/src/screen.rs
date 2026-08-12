@@ -91,7 +91,22 @@ impl Screen {
         grid.allocate_rows();
         Self {
             grid,
-            alternate_grid: crate::grid::Grid::new(size, 0),
+            // zaivern patch: 代替画面にも**同じ長さの履歴**を持たせる。
+            //
+            // 元実装は 0 (= 履歴なし)。これは vim / less のように画面を
+            // その場で描き直す全画面アプリを想定した挙動で、実際 tmux も
+            // iTerm2 も代替画面では履歴を取らない。
+            //
+            // ところが Claude Code のような**ストリーム出力する AI エージェント**は
+            // 代替画面のまま画面を下へ流していく。履歴が 0 だと流れた行は
+            // その場で消えるので、利用者から見ると「Shell では上へドラッグして
+            // 過去の出力まで選択できるのに、エージェントでは画面に見えている
+            // ぶんしか選択できない」という差になる (実際にそう報告された)。
+            //
+            // 積むのは `Grid::scroll_up` の `!scroll_region_active()` の枝だけなので、
+            // **スクロール領域を使う全画面 TUI (vim / less) では 1 行も積まれない**。
+            // VecDeque は必要になってから伸びるため、積まないアプリの費用は 0。
+            alternate_grid: crate::grid::Grid::new(size, scrollback_len),
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
@@ -1230,6 +1245,10 @@ impl Screen {
                 &[1049] => {
                     self.decsc();
                     self.alternate_grid.clear();
+                    // zaivern patch: 代替画面に履歴を持たせたので、入り直しの度に
+                    // 捨てる。捨てないと前に動いていたアプリ (別のエージェント /
+                    // vim) の出力が、新しいアプリの履歴として上に見えてしまう。
+                    self.alternate_grid.clear_scrollback();
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
