@@ -1199,8 +1199,9 @@ mod dpi_tests {
     fn 倍率を変えると文字サイズが物理ピクセルへ丸め直される() {
         for &ppp in PPPS {
             let mut s = Screen::new(800.0, 600.0).ppp(ppp);
-            let (size_pt, _) =
-                s.settle(3, |ctx| ctx.style().text_styles[&egui::TextStyle::Body].size);
+            let (size_pt, _) = s.settle(3, |ctx| {
+                ctx.style().text_styles[&egui::TextStyle::Body].size
+            });
             let px = size_pt * ppp;
             assert!(
                 (px - px.round()).abs() < 1e-3,
@@ -1338,10 +1339,7 @@ mod dpi_tests {
                     .unwrap_or_else(|| {
                         panic!("ppp={ppp} {w}x{h}: 行 (zv-dpi-2) を押しても何も返らない")
                     });
-                assert_eq!(
-                    hit.label, "zv-dpi-2",
-                    "ppp={ppp} {w}x{h}: 別の行が反応した"
-                );
+                assert_eq!(hit.label, "zv-dpi-2", "ppp={ppp} {w}x{h}: 別の行が反応した");
             }
         }
     }
@@ -1411,7 +1409,10 @@ mod ime_tests {
             4,
             "IME イベントが Context を通る間に減った: {seen:?}"
         );
-        assert!(seen[1].contains("にほんご"), "未確定文字列が化けた: {seen:?}");
+        assert!(
+            seen[1].contains("にほんご"),
+            "未確定文字列が化けた: {seen:?}"
+        );
         assert!(seen[2].contains("日本語"), "確定文字列が化けた: {seen:?}");
     }
 
@@ -1443,7 +1444,9 @@ mod ime_tests {
             // 変換を開始 → 未確定を伸ばす → 確定 → 閉じる
             for step in [
                 vec![enabled()],
-                vec![preedit(&kana[..kana.char_indices().nth(1).map_or(kana.len(), |(i, _)| i)])],
+                vec![preedit(
+                    &kana[..kana.char_indices().nth(1).map_or(kana.len(), |(i, _)| i)],
+                )],
                 vec![preedit(kana)],
                 vec![preedit(""), commit(kanji)],
                 vec![disabled()],
@@ -1601,7 +1604,13 @@ mod ime_tests {
                     .collect();
                 (w, widths)
             });
-            let expect = [("日本語", 6), ("한글", 4), ("abc", 3), ("ｱｲｳ", 3), ("🙂", 2)];
+            let expect = [
+                ("日本語", 6),
+                ("한글", 4),
+                ("abc", 3),
+                ("ｱｲｳ", 3),
+                ("🙂", 2),
+            ];
             for ((t, got), (_, want)) in widths.iter().zip(expect.iter()) {
                 assert_eq!(got, want, "ppp={ppp}: {t:?} の桁数が {got} (期待 {want})");
             }
@@ -1632,11 +1641,11 @@ mod subdisplay_tests {
 
     /// 実際にありうる置き方。macOS は左/上を負で表す。
     const ORIGINS: &[(f32, f32)] = &[
-        (0.0, 0.0),         // 主ディスプレイ
-        (-1920.0, 0.0),     // 左に 1 枚
-        (-1440.0, -300.0),  // 左上に、縦をずらして置いた (fullscreen_guard の実害の形)
-        (2560.0, 400.0),    // 右に、縦をずらして置いた
-        (0.0, -1080.0),     // 上に 1 枚
+        (0.0, 0.0),        // 主ディスプレイ
+        (-1920.0, 0.0),    // 左に 1 枚
+        (-1440.0, -300.0), // 左上に、縦をずらして置いた (fullscreen_guard の実害の形)
+        (2560.0, 400.0),   // 右に、縦をずらして置いた
+        (0.0, -1080.0),    // 上に 1 枚
     ];
 
     /// **土台の自己検査**: 申告した原点が `ctx.screen_rect()` に届く。
@@ -1706,7 +1715,10 @@ mod subdisplay_tests {
                     .unwrap_or_else(|| {
                         panic!("@({x},{y}) {w}x{h}: 行を押しても何も返らない (座標が原点前提)")
                     });
-                assert_eq!(hit.label, "zv-sub-2", "@({x},{y}) {w}x{h}: 別の行が反応した");
+                assert_eq!(
+                    hit.label, "zv-sub-2",
+                    "@({x},{y}) {w}x{h}: 別の行が反応した"
+                );
             }
         }
     }
@@ -1753,11 +1765,17 @@ mod subdisplay_tests {
                 for presets in 0..8usize {
                     let a = crate::panels::empty_card(base, presets).card.translate(d);
                     let b = crate::panels::empty_card(moved, presets).card;
-                    assert_rect_eq(a, b, &format!("empty_card {w}x{h} presets={presets} d={d:?}"));
+                    assert_rect_eq(
+                        a,
+                        b,
+                        &format!("empty_card {w}x{h} presets={presets} d={d:?}"),
+                    );
                 }
                 for rows in 0..6usize {
                     for buttons in 0..5usize {
-                        let a = crate::panels::media_card(base, rows, buttons).card.translate(d);
+                        let a = crate::panels::media_card(base, rows, buttons)
+                            .card
+                            .translate(d);
                         let b = crate::panels::media_card(moved, rows, buttons).card;
                         assert_rect_eq(
                             a,
@@ -1965,7 +1983,9 @@ mod app_reachability_tests {
     fn 毎フレーム処理はeframe_frameを使っていない() {
         let src = include_str!("app/frame_update.rs").replace("\r\n", "\n");
         assert!(
-            src.contains("fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame)"),
+            src.contains(
+                "fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame)"
+            ),
             "update_impl の形が変わった。frame を使い始めていないか確かめ、\n\
              src/e2e.rs の app_reachability_tests の説明を書き直すこと"
         );
@@ -2033,7 +2053,11 @@ mod app_reachability_tests {
         assert_eq!(ppp, 2.0, "倍率が届かない");
         assert_eq!(origin, egui::pos2(-1920.0, -300.0), "画面の原点が届かない");
         assert!(focused, "フォーカスが届かない");
-        assert_eq!(mon, Some(egui::vec2(1920.0, 1080.0)), "モニタ実寸が届かない");
+        assert_eq!(
+            mon,
+            Some(egui::vec2(1920.0, 1080.0)),
+            "モニタ実寸が届かない"
+        );
         assert_eq!(fs, Some(false), "全画面フラグが届かない");
         assert_eq!(ptr, Some(egui::pos2(-1900.0, -280.0)), "ポインタが届かない");
         assert!(ime, "IME イベントが届かない");
