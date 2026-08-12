@@ -2052,6 +2052,7 @@ fn load_from_dir(dir: &Path, roots: &[PathBuf], with_state: bool) -> Config {
 /// 変更」が全部覆える。
 pub fn apply_runtime_flags(cfg: &Config) {
     crate::notify::set_enabled(cfg.feature_bool(crate::features::notifications::KEY_ENABLED));
+    crate::notify::set_sound(cfg.feature_bool(crate::features::notifications::KEY_SOUND));
 }
 
 /// `[[auto_yes_rules]]` を自動YESの応答エンジン (src/agents.rs) へ登録する。
@@ -6605,6 +6606,67 @@ theme = "zaivern-dark"
             &mut cfg,
             KEY_ENABLED,
             &SettingValue::Int(1)
+        ));
+    }
+
+    /// 欄の無い古い `config.toml` が **「通知オン・音あり」** のまま読めること。
+    /// ここが無音へ倒れると、更新しただけで音が消えたように見える。
+    #[test]
+    fn 通知音の既定はオンで欄の無い設定ファイルも壊れない() {
+        use crate::features::notifications::KEY_SOUND;
+        let cfg: Config = toml::from_str("theme = \"zaivern-dark\"\n").expect("読めない");
+        assert!(!cfg.extra.contains_key(KEY_SOUND), "無い欄を勝手に埋めた");
+        assert!(cfg.feature_bool(KEY_SOUND), "欄が無いのに無音へ倒れた");
+        assert!(Config::default().feature_bool(KEY_SOUND));
+        // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        apply_runtime_flags(&cfg);
+        assert!(crate::notify::sound(), "旗へ音ありが届いていない");
+    }
+
+    /// 通知音が設定画面 (⚙) の行として、通知本体とは**別のチェック**で出ること。
+    /// ここが空だと「通知は見たいが音は要らない」を選べない (元の不満そのもの)。
+    #[test]
+    fn 通知音の設定は設定画面の独立した行として出る() {
+        use crate::features::notifications::{KEY_ENABLED, KEY_SOUND};
+        let d = all_setting_defs()
+            .iter()
+            .find(|d| d.key == KEY_SOUND)
+            .expect("設定画面に行が出ていない");
+        assert!(
+            matches!(d.kind, SettingKind::Bool),
+            "チェックボックスで出る"
+        );
+        let cfg = Config::default();
+        let rows = settings_rows(&cfg, "通知", false);
+        // 「通知」で検索すると 2 行とも出る = 独立して切り替えられる
+        assert!(rows.iter().any(|r| r.key == KEY_ENABLED));
+        assert!(rows.iter().any(|r| r.key == KEY_SOUND));
+    }
+
+    /// 音だけをオフにしても、通知本体はオンのままであること
+    /// (2 つの設定が独立していることの検査)。
+    #[test]
+    fn 音だけを切っても通知本体はオンのまま() {
+        use crate::features::notifications::{KEY_ENABLED, KEY_SOUND};
+        let mut cfg = Config::default();
+        assert!(
+            set_setting_value(&mut cfg, KEY_SOUND, &SettingValue::Bool(false)),
+            "設定画面からの書き込みが弾かれた"
+        );
+        assert!(!cfg.feature_bool(KEY_SOUND), "無音が保存されていない");
+        assert!(cfg.feature_bool(KEY_ENABLED), "音を切ったら通知まで消えた");
+        // 実際に音を鳴らすかどうかの判定は notify 側の純関数が持つ
+        // (旗はプロセス共通なので、ここでオフを観測しに行かない)。
+        assert!(set_setting_value(
+            &mut cfg,
+            KEY_SOUND,
+            &SettingValue::Bool(true)
+        ));
+        // 型違いは書かせない
+        assert!(!set_setting_value(
+            &mut cfg,
+            KEY_SOUND,
+            &SettingValue::Int(0)
         ));
     }
 
