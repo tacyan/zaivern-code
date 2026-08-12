@@ -223,7 +223,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
+      # probe と同じ理由。`.sh` が CRLF で降りると git-bash が実行できない。
+      - name: 改行を LF に固定 (Windows のみ)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf input
+
       - uses: actions/checkout@v4
+
+      # `tools/anyrepo-prove.sh` は python3 が無いと 1 行も走らない
+      # (乱数種から決まる担当表を実装非依存に固定するため)。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - uses: dtolnay/rust-toolchain@stable
 
