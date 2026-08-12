@@ -3981,18 +3981,43 @@ mod pack_integration {
         assert!(h.extra_lang_count() >= 50);
     }
 
-    /// 起動と描画に載る費用の番人。閾値は debug ビルドでも余裕がある値
-    /// (実測は読み込み ~100ms / 2000 行 ~55ms、release はこれより速い)。
-    /// 巨大な定義を足して起動を重くしたら、ここで気づける。
+    /// 起動と描画に載る費用の番人。
+    ///
+    /// **読み込みは時間ではなく「読むバイト数」で測る。** 以前は
+    /// `load < 600ms` と絶対時間で線を引いていたが、並列ビルドの下で
+    /// **727ms を記録して落ちた** — 実装は 1 バイトも変わっていないのに。
+    /// CLAUDE.md の「絶対時間で性能テストの線を引かない。必ず嘘をつく」の実例で、
+    /// 名指しで挙げられている直し方 (構文セットの大きさを測る) がこれ。
+    ///
+    /// 費用を決めているのは**読む量**なので、そこを見れば
+    /// 「巨大な定義を足して起動を重くした」は負荷に関係なく捕まる。
+    /// 塗りのほうは下で**比と最小値**を使う (絶対値は debug/release で 2 桁違う)。
     #[test]
     fn 読み込みと着色が遅くなっていない() {
-        let t = std::time::Instant::now();
-        let set = crate::grammar::bundled_pack::load();
-        let load = t.elapsed();
+        // 同梱パックの実体を数える (実測 2026-08-13: 6 ファイル / 62,034 バイト)。
+        // 上限は実測の約 4 倍 — 言語を足す余地は残しつつ、桁が変わったら落ちる。
+        const MAX_PACK_BYTES: u64 = 256 * 1024;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/plugins/syntax-pack/syntaxes");
+        let (mut files, mut bytes) = (0u32, 0u64);
+        for e in std::fs::read_dir(&dir)
+            .expect("同梱パックのディレクトリ")
+            .flatten()
+        {
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    files += 1;
+                    bytes += m.len();
+                }
+            }
+        }
+        assert!(files > 0, "同梱パックが空 (数え方が壊れている)");
         assert!(
-            load < std::time::Duration::from_millis(600),
-            "同梱パックの読み込みが遅い: {load:?}"
+            bytes <= MAX_PACK_BYTES,
+            "同梱パックが太った: {files} ファイル / {bytes} バイト (上限 {MAX_PACK_BYTES})"
         );
+
+        let set = crate::grammar::bundled_pack::load();
 
         let h = Highlighter::new();
         h.set_grammars(set);
