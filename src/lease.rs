@@ -231,13 +231,18 @@ const COMPACT_WIDTH: f32 = 560.0;
 /// * 区切りは `/` へ寄せる (Windows の `\` をそのまま保存すると、
 ///   同じファイルが 2 つのキーで台帳に載る)
 /// * 連続する区切りと `./` を潰す
-/// * Windows は大文字小文字を区別しないファイルシステムが既定なので畳む。
-///   **両方の側を実装する** — unix はそのまま (`Foo.rs` と `foo.rs` は別物)
+/// * 大文字小文字を畳むかは **実ファイルシステムの実測**で決まる
+///   ([`crate::worktree::fs_case_insensitive`])。**OS では決めない** —
+///   Linux にも非区別なマウントはあり、macOS にも区別するボリュームはある
 pub fn normalize_path(raw: &str) -> String {
     // 規則は 3 つの OS ぶんあるが、動いている OS のぶんしか実行されない。
     // **引数へ出しておかないと、macOS で開発している限り Windows / Linux の
     // 規則は一度も検査されない** (`keybinds::canonical_mods_on` と同じ流儀)。
-    normalize_path_on(raw, true, cfg!(any(windows, target_os = "macos")))
+    //
+    // 畳むかどうかは `cfg!` (= コンパイル時の OS) ではなく、いま乗っている
+    // FS を実際に叩いて決める。プロセス内で 1 度だけ確定するので、
+    // パターン側と実パス側で答えが食い違うことはない。
+    normalize_path_on(raw, true, crate::worktree::fs_case_insensitive())
 }
 
 /// 規則を明示する [`normalize_path`]。
@@ -276,11 +281,12 @@ pub fn normalize_path_on(raw: &str, win_sep: bool, fold_case: bool) -> String {
     if subtree && !out.is_empty() {
         out.push_str("/**");
     }
-    // **大小非区別は「OS」ではなく「ボリューム」の性質**だが、macOS の既定
-    // (APFS) と Windows はどちらも非区別なので、この 2 つは畳む。
-    // ここを `cfg!(windows)` だけにしていたため、**開発機である macOS で
-    // `src/Foo.rs` と `src/foo.rs` が別リースになり、同じ物理ファイルへ
-    // 2 人が同時に書けていた** (実バイナリで再現済み)。
+    // **大小非区別は「OS」ではなく「ボリューム」の性質。** かつてここは
+    // `cfg!(windows)` → `cfg!(any(windows, target_os = "macos"))` と
+    // 直されてきたが、**どちらも OS を FS の代用にしている点で同じ誤り**
+    // だった。いまは `fold_case` の実引数を [`normalize_path`] が実 FS の
+    // 実測から作る。この関数自体は規則を受け取るだけの純関数なので、
+    // どのホストからでも 3 通り全部を検査できる。
     // 畳みすぎる側は「別ファイルを同じ扱いにする」= 過剰に止める方向なので
     // fail-closed。取りこぼす側と違って衝突は生まない。
     if fold_case {
@@ -930,11 +936,16 @@ pub struct Roots {
 /// 2 つのキーへ割れる (これもテストで踏んだ)。
 pub fn roots_of(start: &Path) -> Roots {
     let ((key, tree), rooted) = roots_raw_full(start);
-    Roots {
+    let out = Roots {
         key: key.canonicalize().unwrap_or(key),
         tree: tree.canonicalize().unwrap_or(tree),
         rooted,
-    }
+    };
+    // **台帳に触る経路は必ずここを通る**ので、大小を畳むかの答えを
+    // 「推測できる場所 (現在地)」ではなく**実際の作業ツリー**で固定する。
+    // 2 回目以降は何もしない (`OnceLock`) ので、費用は 1 プロセス 1 回。
+    crate::worktree::seed_fs_case(&out.tree);
+    out
 }
 
 /// ルートの生の探索。返り値の `bool` は「`.git` で決まったのか」。
@@ -5797,11 +5808,10 @@ mod tests {
             normalize_path(".\\日本語\\ファイル.rs"),
             "日本語/ファイル.rs"
         );
-        // 大小非区別のファイルシステムが既定の OS (Windows / macOS) では畳む。
-        // Linux は畳まない — **両側を書く**。
-        // macOS を入れていなかったため、開発機で `Foo.rs` と `foo.rs` が
+        // 大小を畳むかは **実 FS の実測**で決まる — **両側を書く**。
+        // ここを OS から決めていたため、開発機で `Foo.rs` と `foo.rs` が
         // 別リースになり同じ物理ファイルへ 2 人が書けていた。
-        if cfg!(any(windows, target_os = "macos")) {
+        if crate::worktree::fs_case_insensitive() {
             assert_eq!(normalize_path("SRC/App.rs"), "src/app.rs");
         } else {
             assert_eq!(normalize_path("SRC/App.rs"), "SRC/App.rs");
@@ -6981,11 +6991,62 @@ mod os_rule_tests {
         }
     }
 
-    /// 既定は動いている OS の規則を選ぶ (公開シグネチャは据え置き)。
+    /// 既定は**実 FS の実測**を選ぶ (公開シグネチャは据え置き)。
     #[test]
-    fn 既定の規則は動いているosに一致する() {
-        let want = normalize_path_on("SRC/App.rs", true, cfg!(any(windows, target_os = "macos")));
+    fn 既定の規則は実fsの実測に一致する() {
+        let want = normalize_path_on("SRC/App.rs", true, crate::worktree::fs_case_insensitive());
         assert_eq!(normalize_path("SRC/App.rs"), want);
+    }
+
+    /// 台帳の鍵をいくら作っても、**実 I/O の検査は 1 プロセスに最大 1 回**。
+    ///
+    /// 絶対時間ではなく**検査の呼び出し回数**で線を引く (負荷で散る数字は
+    /// 材料にならない)。答えが `OnceLock` で固定されるので、2 回目以降の
+    /// [`normalize_path`] は FS を 1 度も触らない。
+    #[test]
+    fn 鍵をいくつ作っても実fsの検査は最大一度() {
+        let before = crate::worktree::case_probe_calls();
+        for i in 0..10_000 {
+            let _ = normalize_path(&format!("src/Mod{i}/File.rs"));
+        }
+        let probes = crate::worktree::case_probe_calls() - before;
+        assert!(
+            probes <= 1,
+            "鍵を 10000 個作るのに実 FS の検査が {probes} 回走った"
+        );
+    }
+
+    /// **大小を畳むかを `cfg!` (= コンパイル時の OS) から決めていない。**
+    ///
+    /// この誤りは 2 度入っている (`cfg!(windows)` → `cfg!(any(windows,
+    /// target_os = "macos"))`)。どちらも「OS」を「FS の性質」の代用に
+    /// している点で同じで、実 FS と食い違えば**同じファイルに 2 つの台帳
+    /// キー**ができる。壊れても台帳には重なりが残らないので気付けない。
+    ///
+    /// ソースを読む検査なので、改行を正規化してから探す (Windows の
+    /// チェックアウトは CRLF)。
+    #[test]
+    fn 既定の大小規則をコンパイル時のosから決めていない() {
+        let src = include_str!("lease.rs").replace("\r\n", "\n");
+        let head = "pub fn normalize_path(raw: &str) -> String {";
+        let start = src.find(head).expect("normalize_path が見つからない");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("関数の終わりが見つからない");
+        // コメントは落とす (「`cfg!` ではなく実 FS で決める」と**書いてある**
+        // だけで落ちてしまい、番人が説明文を書けなくする)。
+        let body: String = body[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("cfg!"),
+            "normalize_path が cfg! で大小を決めている (FS の性質は OS で決まらない)"
+        );
+        assert!(
+            body.contains("crate::worktree::fs_case_insensitive()"),
+            "normalize_path が実 FS の実測を使っていない"
+        );
     }
 }
 

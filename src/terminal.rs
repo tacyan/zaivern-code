@@ -793,46 +793,81 @@ const MENU_LEAD_MARKS: &[char] = &[
 /// 番号と本文の区切り記号。
 const MENU_SEPS: &[char] = &['.', ')', ']', ':', '-', '、', '．', '：', '。'];
 
-/// 番号キー + Enter。応答は `&'static [u8]` で返す約束なので表にしておく。
-const MENU_KEYS: [&[u8]; 9] = [
-    b"1\r", b"2\r", b"3\r", b"4\r", b"5\r", b"6\r", b"7\r", b"8\r", b"9\r",
-];
-/// 肯定肢を選んだときの説明 (UI 通知用)。
-const MENU_DESC_ALLOW: [&str; 9] = [
-    "番号メニューの承認肢「1」",
-    "番号メニューの承認肢「2」",
-    "番号メニューの承認肢「3」",
-    "番号メニューの承認肢「4」",
-    "番号メニューの承認肢「5」",
-    "番号メニューの承認肢「6」",
-    "番号メニューの承認肢「7」",
-    "番号メニューの承認肢「8」",
-    "番号メニューの承認肢「9」",
-];
-/// 見送り肢を選んだときの説明 (UI 通知用)。
-const MENU_DESC_SKIP: [&str; 9] = [
-    "アンケート/選択をスキップ「1」",
-    "アンケート/選択をスキップ「2」",
-    "アンケート/選択をスキップ「3」",
-    "アンケート/選択をスキップ「4」",
-    "アンケート/選択をスキップ「5」",
-    "アンケート/選択をスキップ「6」",
-    "アンケート/選択をスキップ「7」",
-    "アンケート/選択をスキップ「8」",
-    "アンケート/選択をスキップ「9」",
-];
-/// 評点しか無いアンケートに自動で答えたときの説明 (UI 通知用)。
-/// **勝手に答えた事実を隠さない**ため、選んだ番号を必ず文面に出す。
-const MENU_DESC_RATING: [&str; 9] = [
-    "アンケートに自動で回答しました: 1",
-    "アンケートに自動で回答しました: 2",
-    "アンケートに自動で回答しました: 3",
-    "アンケートに自動で回答しました: 4",
-    "アンケートに自動で回答しました: 5",
-    "アンケートに自動で回答しました: 6",
-    "アンケートに自動で回答しました: 7",
-    "アンケートに自動で回答しました: 8",
-    "アンケートに自動で回答しました: 9",
+/// 番号メニュー 1 件ぶんの応答。**キーと 3 種類の説明文を 1 つに束ねてある。**
+///
+/// かつてここは `MENU_KEYS` / `MENU_DESC_ALLOW` / `MENU_DESC_SKIP` /
+/// `MENU_DESC_RATING` の **4 本の並行配列**で、添字だけが対応を持っていた。
+/// 長さが揃っていればコンパイラは何も言わないので、1 本の並びが入れ替わっても
+/// **「3 を押したのに『…「5」』と説明する」という静かな嘘**が出る。
+/// 束ねてあれば、番号を書き換えるときに 4 つが目の前に並ぶ。
+struct MenuAnswer {
+    /// 番号キー + Enter。応答は `&'static [u8]` で返す約束なので表にしておく。
+    key: &'static [u8],
+    /// 肯定肢を選んだときの説明 (UI 通知用)。
+    allow: &'static str,
+    /// 見送り肢を選んだときの説明 (UI 通知用)。
+    skip: &'static str,
+    /// 評点しか無いアンケートに自動で答えたときの説明 (UI 通知用)。
+    /// **勝手に答えた事実を隠さない**ため、選んだ番号を必ず文面に出す。
+    rating: &'static str,
+}
+
+/// 番号 1〜9 の応答表。**表示される文字列は 4 本だった頃と 1 字も変わらない。**
+const MENU_ANSWERS: [MenuAnswer; 9] = [
+    MenuAnswer {
+        key: b"1\r",
+        allow: "番号メニューの承認肢「1」",
+        skip: "アンケート/選択をスキップ「1」",
+        rating: "アンケートに自動で回答しました: 1",
+    },
+    MenuAnswer {
+        key: b"2\r",
+        allow: "番号メニューの承認肢「2」",
+        skip: "アンケート/選択をスキップ「2」",
+        rating: "アンケートに自動で回答しました: 2",
+    },
+    MenuAnswer {
+        key: b"3\r",
+        allow: "番号メニューの承認肢「3」",
+        skip: "アンケート/選択をスキップ「3」",
+        rating: "アンケートに自動で回答しました: 3",
+    },
+    MenuAnswer {
+        key: b"4\r",
+        allow: "番号メニューの承認肢「4」",
+        skip: "アンケート/選択をスキップ「4」",
+        rating: "アンケートに自動で回答しました: 4",
+    },
+    MenuAnswer {
+        key: b"5\r",
+        allow: "番号メニューの承認肢「5」",
+        skip: "アンケート/選択をスキップ「5」",
+        rating: "アンケートに自動で回答しました: 5",
+    },
+    MenuAnswer {
+        key: b"6\r",
+        allow: "番号メニューの承認肢「6」",
+        skip: "アンケート/選択をスキップ「6」",
+        rating: "アンケートに自動で回答しました: 6",
+    },
+    MenuAnswer {
+        key: b"7\r",
+        allow: "番号メニューの承認肢「7」",
+        skip: "アンケート/選択をスキップ「7」",
+        rating: "アンケートに自動で回答しました: 7",
+    },
+    MenuAnswer {
+        key: b"8\r",
+        allow: "番号メニューの承認肢「8」",
+        skip: "アンケート/選択をスキップ「8」",
+        rating: "アンケートに自動で回答しました: 8",
+    },
+    MenuAnswer {
+        key: b"9\r",
+        allow: "番号メニューの承認肢「9」",
+        skip: "アンケート/選択をスキップ「9」",
+        rating: "アンケートに自動で回答しました: 9",
+    },
 ];
 
 /// 番号メニューで何を選んだかの区分 (UI 説明文の出し分け用)。
@@ -1044,13 +1079,13 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
     };
     let (num, kind) = picked?;
     let idx = usize::from(num).checked_sub(1)?;
-    let key = *MENU_KEYS.get(idx)?;
+    let ans = MENU_ANSWERS.get(idx)?;
     let desc = match kind {
-        MenuPick::Affirm => MENU_DESC_ALLOW[idx],
-        MenuPick::Skip => MENU_DESC_SKIP[idx],
-        MenuPick::Rating => MENU_DESC_RATING[idx],
+        MenuPick::Affirm => ans.allow,
+        MenuPick::Skip => ans.skip,
+        MenuPick::Rating => ans.rating,
     };
-    Some((key, desc))
+    Some((ans.key, desc))
 }
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
@@ -2040,10 +2075,31 @@ impl Session {
     /// 再送・再検出しない — 1プロンプトにつき応答は一回で完結する。
     /// プロンプトが消えるか、指紋の異なる別プロンプトに変わったら再び対象になる。
     pub fn scan_attention(&mut self, auto_yes: bool) -> Option<Attention> {
-        if self.last_scan.elapsed().as_millis() < 900 {
+        self.scan_attention_at(auto_yes, Instant::now())
+    }
+
+    /// 「いま」を差し替えられる [`scan_attention`]。
+    ///
+    /// **待ちの判定に使う時刻を全部この引数から取る。** 分けてある理由は
+    /// `lease::acquire_lock_in` が `stale_ms` を引数へ出しているのと同じで、
+    /// **閾値を跨いだ前後の振る舞いは、実時間を待っていては検査できない**
+    /// から。実時間で測ると、
+    ///
+    /// * 「発火する側」は待ちを入れるので**遅いマシンほど落ちる**
+    /// * 「まだ発火しない側」は 2 つの時刻を**別の瞬間に**読むことになり、
+    ///   その隙間が負荷で伸びると落ちる
+    ///
+    /// 実際に 3 体を並列で走らせた負荷下で
+    /// `stall_fallback_presses_pet_approve_only_once` が
+    /// 「600ms より早く発火した」と落ちた。早く発火したのではなく、
+    /// **テスト側が最初の発火を観測した時刻が、セッションが内部で刻んだ
+    /// 時刻より遅れていた**だけである。閾値を伸ばしても負荷が上がれば
+    /// また破綻するので、時刻そのものを注入して決定的にする。
+    pub fn scan_attention_at(&mut self, auto_yes: bool, now: Instant) -> Option<Attention> {
+        if now.saturating_duration_since(self.last_scan).as_millis() < 900 {
             return None;
         }
-        self.last_scan = Instant::now();
+        self.last_scan = now;
         let text = lock_ok(&self.parser).screen().contents();
         // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
         // 直前のスキャン時の値を控えてから更新する (`output_advanced` の材料)。
@@ -2106,7 +2162,7 @@ impl Session {
         let newly = waiting && !self.attention;
         self.attention = waiting;
         if newly {
-            self.attention_since = Some(Instant::now());
+            self.attention_since = Some(now);
         } else if !waiting {
             self.attention_since = None;
         }
@@ -2116,7 +2172,7 @@ impl Session {
                 // (再送は Claude 側の入力欄への Enter/y 連打事故になる)。
                 // 指紋が変わって別のプロンプトが来たときだけ、また一度応答する。
                 self.answered_sig = sig;
-                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
                 self.write_bytes(bytes);
                 self.attention = false;
@@ -2126,7 +2182,7 @@ impl Session {
             // ここでは**何も送らず**、停滞監視だけを始める。数字を打つのは
             // 下のウォッチドッグが「画面が 30 秒動かない」と確認した後だけ。
             if self.auto_stall_since.is_none() {
-                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
             }
         }
@@ -2144,11 +2200,11 @@ impl Session {
             if let Some(since) = self.auto_stall_since {
                 if self.cur_hash != self.auto_stall_hash {
                     self.auto_stall_hash = self.cur_hash;
-                    self.auto_stall_since = Some(Instant::now());
-                } else if since.elapsed() >= self.auto_yes_resend_after {
+                    self.auto_stall_since = Some(now);
+                } else if now.saturating_duration_since(since) >= self.auto_yes_resend_after {
                     // 押せても押せなくても次の判定は 30 秒後から。
                     // (分類できない画面へ毎スキャン試し続けないため)
-                    self.auto_stall_since = Some(Instant::now());
+                    self.auto_stall_since = Some(now);
                     // 送るのが番号メニューの数字なら「何番を選んだか」を
                     // そのまま説明に出す。勝手に答えた事実を隠さないための
                     // 約束 (MENU_DESC_* の文面)。それ以外は従来の停滞文言。
@@ -3188,6 +3244,44 @@ mod tail_tests {
         // 行頭インデントは残し、行末空白と長すぎる行だけ詰める
         assert_eq!(super::pick_tail_lines("  abcdef   \n", 4, 4), vec!["  a…"]);
         assert!(super::pick_tail_lines("╭──╮\n╰──╯", 4, 120).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod menu_answer_tests {
+    use super::MENU_ANSWERS;
+
+    /// 文字列に出てくる ASCII 数字だけを繋げる (説明文の番号を取り出す)。
+    fn digits(s: &str) -> String {
+        s.chars().filter(char::is_ascii_digit).collect()
+    }
+
+    /// 番号キーと 3 種類の説明文が **同じ番号を指している**こと。
+    ///
+    /// 束ねたので「配列どうしのずれ」は構造的に起こらなくなったが、
+    /// **1 件の中で番号を書き間違える**余地は残る (コピペで 1 つだけ
+    /// 直し忘れる)。表を固定してそれも塞ぐ。
+    #[test]
+    fn 番号メニューの応答表は番号がずれていない() {
+        for (idx, ans) in MENU_ANSWERS.iter().enumerate() {
+            let n = (idx + 1).to_string();
+            assert_eq!(
+                ans.key,
+                format!("{n}\r").as_bytes(),
+                "添字 {idx} のキーが {n} ではない"
+            );
+            for (name, text) in [
+                ("allow", ans.allow),
+                ("skip", ans.skip),
+                ("rating", ans.rating),
+            ] {
+                assert_eq!(
+                    digits(text),
+                    n,
+                    "添字 {idx} の {name} がずれている: {text:?}"
+                );
+            }
+        }
     }
 }
 
@@ -5295,43 +5389,60 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let mut s = spawn_prompt_session(9403, "sleep 10");
-        s.auto_yes_resend_after = Duration::from_millis(600);
+        // **スキャンの最小間隔 (900ms) より確実に長く取る。** 短いと
+        // 「間隔は開いたが停滞の閾値には届いていない」状態を作れない。
+        let stall = Duration::from_secs(5);
+        s.auto_yes_resend_after = stall;
         let menu = "Allow this command to run?\r\n\
                     1. No, cancel\r\n2. Yes, allow this once\r\n\
                     Enter a number (1-2): ";
         s.parser.lock().unwrap().process(menu.as_bytes());
+        // 子の起動時出力が届き切るのを待つ (I/O の到着待ちであって閾値ではない)。
         std::thread::sleep(Duration::from_millis(1_000));
 
-        // 1) 最初のスキャンは「承認待ち」を上げるだけ (数字は打たない)
+        // 1) 最初のスキャンは「承認待ち」を上げるだけ (数字は打たない)。
+        //    **判定に使う「いま」は全部こちらで刻む** — 実時間で
+        //    「まだ閾値の手前のはず」と決めつけると、負荷でテスト側が
+        //    数百 ms 止まった瞬間に前提が崩れる (実際に姉妹テストが落ちた)。
+        let clock = Instant::now() + Duration::from_secs(1);
         assert!(
-            matches!(s.scan_attention(true), Some(Attention::NeedsApproval)),
+            matches!(
+                s.scan_attention_at(true, clock),
+                Some(Attention::NeedsApproval)
+            ),
             "番号メニューが承認待ちにならなかった"
         );
-        // 2) 停滞閾値の前は何度スキャンしても撃たない
-        for _ in 0..3 {
-            s.last_scan = Instant::now() - Duration::from_millis(900);
+        let base = s
+            .auto_stall_since
+            .expect("承認待ちなのに停滞監視が始まっていない");
+
+        // 2) 停滞閾値の前は撃たない。**1ms 手前まで**刻んで確かめる。
+        for early in [Duration::from_secs(1), stall - Duration::from_millis(1)] {
             assert!(
-                s.scan_attention(true).is_none(),
-                "停滞閾値の前に番号メニューへ数字を打った"
+                s.scan_attention_at(true, base + early).is_none(),
+                "停滞閾値 ({stall:?}) の手前 ({early:?}) で番号メニューへ数字を打った"
             );
         }
         // 3) 画面が固まったまま閾値を超えたら、そこで初めて数字を打つ
-        std::thread::sleep(Duration::from_millis(700));
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        match s.scan_attention(true) {
+        let after = base + stall + Duration::from_secs(1);
+        match s.scan_attention_at(true, after) {
             Some(Attention::AutoReplied(desc)) => assert!(
                 desc.contains('2'),
                 "勝手に選んだ番号が説明に出ていない: {desc}"
             ),
             _ => panic!("停滞後も番号メニューに答えなかった"),
         }
-        // 4) 打ったあとは同じ画面が残っても打ち直さない (数字の連打を作らない)
-        for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(200));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
+        // 4) 打ったあとは同じ画面が残っても打ち直さない (数字の連打を作らない)。
+        //    回数の保証なので「何秒待っても」ではなく**閾値を跨いで 0 回**で見る。
+        let mut later = after;
+        for round in 1..=3 {
+            later += stall + Duration::from_secs(1);
             assert!(
-                !matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))),
-                "同じ番号メニューへ数字を再送した"
+                !matches!(
+                    s.scan_attention_at(true, later),
+                    Some(Attention::AutoReplied(_))
+                ),
+                "同じ番号メニューへ数字を再送した ({round} 回目)"
             );
         }
         s.kill();
@@ -5612,62 +5723,71 @@ mod tests {
         // 応答 (y\r) を無視してプロンプトが固まったままの子。
         let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let mut s = spawn_prompt_session(985, cmd);
-        s.auto_yes_resend_after = Duration::from_millis(600);
+        // **スキャンの最小間隔 (900ms) より確実に長く取る。** 短いと
+        // 「間隔は開いたが停滞の閾値には届いていない」という肝心の状態を作れない。
+        let stall = Duration::from_secs(5);
+        s.auto_yes_resend_after = stall;
 
-        // 1) 最初の自動YES
-        let mut first = None;
+        // 1) 最初の自動YES。
+        //    **画面が届くのを待つのは実時間**でよい (子の出力の到着待ちであって、
+        //    閾値の判定ではない)。判定に使う「いま」だけを自分で刻む。
+        let mut clock = Instant::now();
+        let mut fired = false;
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
-            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                first = Some(Instant::now());
+            clock += Duration::from_millis(1_000);
+            if matches!(
+                s.scan_attention_at(true, clock),
+                Some(Attention::AutoReplied(_))
+            ) {
+                fired = true;
                 break;
             }
         }
-        let first = first.expect("最初の自動YESが送られなかった");
+        assert!(fired, "最初の自動YESが送られなかった");
 
-        // 2) 直後の採用スキャンでは再送しない (間隔未満の二重発火防止)
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(s.scan_attention(true).is_none(), "間隔未満で二重発火した");
+        // ここから先は実時間を 1 度も見ない。起点はセッション自身が刻んだ値なので、
+        // 「テストが観測した時刻」と「セッションが刻んだ時刻」の隙間が
+        // 負荷で伸びても影響を受けない (この隙間が旧版の誤検知の正体だった)。
+        let base = s
+            .auto_stall_since
+            .expect("自動YESの後に停滞監視が始まっていない");
 
-        // 3) 間隔経過後にペット承認が発火する
-        let mut second = None;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(100));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
-            match s.scan_attention(true) {
-                Some(Attention::AutoReplied(_)) => {
-                    second = Some(Instant::now());
-                    break;
+        // 2) 閾値の手前では発火しない。**1ms 手前まで**刻んで確かめる。
+        for early in [
+            stall - Duration::from_secs(1),
+            stall - Duration::from_millis(1),
+        ] {
+            assert!(
+                s.scan_attention_at(true, base + early).is_none(),
+                "停滞の閾値 ({stall:?}) の手前 ({early:?}) で発火した"
+            );
+        }
+
+        // 3) 閾値を越えたら発火する。
+        let after = base + stall + Duration::from_secs(1);
+        assert!(
+            matches!(
+                s.scan_attention_at(true, after),
+                Some(Attention::AutoReplied(_))
+            ),
+            "停滞の閾値を越えてもペット承認が発火しなかった"
+        );
+
+        // 4) 一度押したら、**いくら経っても同じプロンプトには二度と押さない。**
+        //    回数の保証なので「何秒待っても」ではなく**閾値を 10 回跨いで 0 回**で見る
+        //    (待ち時間を伸ばす検査は N が増えれば必ず破綻する)。
+        let mut later = after;
+        for round in 1..=10 {
+            later += stall + Duration::from_secs(1);
+            match s.scan_attention_at(true, later) {
+                None => {}
+                Some(Attention::NeedsApproval) => {
+                    panic!("応答済みプロンプトを再検出した ({round} 回目)")
                 }
-                Some(Attention::NeedsApproval) => panic!("応答済みプロンプトを再検出した"),
-                _ => {}
+                Some(_) => panic!("ペット承認が 2 度目に発火した ({round} 回目)"),
             }
         }
-        let second = second.expect("停滞後のペット承認が発火しなかった");
-        assert!(
-            second.duration_since(first) >= Duration::from_millis(550),
-            "ペット承認の待機時間 (600ms) より早く発火した"
-        );
-
-        // 4) ペット承認直後は再発火しない
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(
-            s.scan_attention(true).is_none(),
-            "ペット承認直後に二重発火した"
-        );
-
-        // 5) さらに間隔が経っても同じプロンプトには再発火しない
-        let mut third = false;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(100));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
-            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                third = true;
-                break;
-            }
-        }
-        assert!(!third, "ペット承認後に同じプロンプトへ再発火した");
-        s.kill();
     }
 
     // ── 選択肢が画面外へスクロールした場合 ────────────────────────────
