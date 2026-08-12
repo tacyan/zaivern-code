@@ -64,9 +64,15 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 zai .
 ```
 
+Both installers verify the release archive against the published `checksums.txt`
+**before unpacking it**, and abort without extracting or running anything if the
+SHA-256 does not match — or if the checksums cannot be fetched at all.
+
 Rather not pipe a script into your shell? Download the archive for your platform from
 [Releases](https://github.com/tacyan/zaivern-code/releases/latest), unpack it, and put
 `zai` (or `zai.exe`) somewhere on your `PATH`. Then run `zai .` in a project folder.
+See [SECURITY.md](SECURITY.md) for how to verify the download by hand, check the
+build provenance, or read the SBOM.
 
 Once the window is open:
 
@@ -74,7 +80,18 @@ Once the window is open:
 2. Type a task into the input box and send it.
 3. Add a second agent once the first one feels comfortable.
 
-`zai update` upgrades in place (`--check` only looks, `--yes` skips the prompt), and
+### Updating
+
+```bash
+zai update            # check for a newer release, show the command, then upgrade
+zai update --check    # only look; changes nothing
+zai update --yes      # upgrade without the confirmation prompt
+```
+
+`zai update` works whether or not the editor is running, and picks the right method for
+how you installed it (installer script, or `cargo install`). Re-running the one-liner
+above does the same thing.
+
 `zai uninstall` removes it (`--dry-run` lists what would go). Uninstalling touches only
 the executable and `~/.zaivern`; anything else on your `PATH` is listed, never deleted.
 

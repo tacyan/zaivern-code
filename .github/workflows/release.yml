@@ -16,8 +16,10 @@ on:
         description: "Release tag (e.g. v0.1.0)"
         required: true
 
-permissions:
-  contents: write
+# ■ 既定はゼロ。要る権限は**ジョブ単位で足す**。
+#   このワークフローは `contents: write` を持つ = リリース資産を差し替えられる。
+#   ワークフロー全体に配ると、侵害された 1 つのアクションが全ジョブでその力を持つ。
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +28,10 @@ jobs:
   build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write      # gh release upload
+      id-token: write      # 来歴 (provenance) の署名を Sigstore から受け取る
+      attestations: write  # 来歴を GitHub の attestation ストアへ書く
     strategy:
       fail-fast: false
       matrix:
@@ -41,17 +47,20 @@ jobs:
         shell: bash
         run: echo "tag=${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA 固定すると github.action_ref が SHA になり、ref 名から toolchain を
+      # 拾えなくなる。**toolchain: を必ず明示する**。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # 依存クレートのビルド結果をタグ間で使い回す。これが無いと毎リリース
       # フルビルドになり、待ち時間が数倍になる (キーはリリースタグに依存しない)。
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
           cache-on-failure: true
@@ -85,6 +94,80 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # ── コード署名 ────────────────────────────────────────────────────
+      # 署名鍵はリポジトリに置けないので、**secrets が設定された環境でだけ**動く。
+      # 未設定でもリリースは通る (今日の配布を壊さない) が、**署名の有無は
+      # 必ずサマリに出す** — 「たぶん署名されている」を作らないため。
+      #
+      # ⚠ このリポジトリにはまだ証明書 secrets が無いため、下の 2 ステップは
+      #   一度も実行されたことがない (常に skip)。有効化の手順と必要な secrets は
+      #   docs/signing.md にまとめてある。
+      - name: Sign + notarize (macOS)
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bin='${{ steps.art.outputs.bin }}'
+          # 専用の一時キーチェーンを作る (ランナーの login キーチェーンを汚さない)。
+          kc="$RUNNER_TEMP/zai-signing.keychain-db"
+          kcpw=$(uuidgen)
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings -lut 900 "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # UI プロンプト無しで鍵を使わせる (これが無いと codesign が固まる)。
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc"
+
+          # --options runtime (Hardened Runtime) と --timestamp は公証の必須条件。
+          codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          # notarytool が受け取るのは .zip / .pkg / .dmg のみ。tar.gz は通らないので
+          # 単体バイナリを zip に包んで出す。
+          ditto -c -k --keepParent "$bin" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" --wait
+          # 単体の実行ファイルには stapler が使えない (.app / .dmg / .pkg のみ)。
+          # 公証チケットはオンライン照会されるので staple はしない。
+          security delete-keychain "$kc"
+          echo "MACOS_SIGNED=1" >> "$GITHUB_ENV"
+
+      - name: Sign (Windows Authenticode)
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfx = Join-Path $env:RUNNER_TEMP 'zai-cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          # signtool.exe は Windows SDK 同梱。SDK の版はランナー更新で変わるので探す
+          # (パスを直書きすると、ランナーが更新された日に静かに壊れる)。
+          $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -like '*\x64\*' } |
+                  Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $tool) { throw 'signtool.exe が見つかりません (Windows SDK 未導入)' }
+          & $tool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+              /f $pfx /p $env:WINDOWS_CERT_PASSWORD '${{ steps.art.outputs.bin }}'
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign が失敗しました ($LASTEXITCODE)" }
+          Remove-Item $pfx -Force
+          & $tool.FullName verify /pa '${{ steps.art.outputs.bin }}'
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify が失敗しました ($LASTEXITCODE)" }
+          "WINDOWS_SIGNED=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar'
@@ -166,12 +249,44 @@ jobs:
       # 断片を集約ジョブへ渡す。ファイル名がターゲットごとに一意なので
       # download-artifact の merge-multiple で 1 ディレクトリに平坦展開できる。
       - name: Upload checksum fragment
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sha256-${{ matrix.label }}
           path: sha256-${{ matrix.label }}.txt
           if-no-files-found: error
           retention-days: 7
+
+      # 署名されたか否かを**必ず**出す。出さないと「署名されているつもり」の
+      # リリースが黙って出る (secrets を消した日に静かに無署名へ戻る)。
+      - name: Signing report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ runner.os }}' in
+            macOS)   state="${MACOS_SIGNED:-}" ; kind="Developer ID + notarization" ;;
+            Windows) state="${WINDOWS_SIGNED:-}"; kind="Authenticode" ;;
+            *)       state="n/a"               ; kind="(Linux は OS 署名の仕組みを持たない)" ;;
+          esac
+          if [ "$state" = "1" ]; then
+            echo "- **${{ matrix.label }}**: 署名済み ($kind)" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$state" = "n/a" ]; then
+            echo "- **${{ matrix.label }}**: $kind — 来歴 (attestation) で担保" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **${{ matrix.label }}**: ⚠ **未署名** ($kind の secrets が未設定 / docs/signing.md)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ■ 来歴 (build provenance)。証明書を 1 円も買わずに今日から効く担保。
+      #   「このアーカイブは、この repo の、このワークフローの、このコミットから
+      #    GitHub のランナー上で作られた」を Sigstore が署名した SLSA の証明として残す。
+      #   利用者の検証: gh attestation verify <file> --repo ${{ github.repository }}
+      #
+      #   コード署名 (Gatekeeper / SmartScreen) の代わりにはならない。
+      #   **別の質問に答える**もので、両方あって初めて配布物の身元が揃う。
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.art.outputs.file }}
 
       - name: Upload to release
         shell: bash
@@ -183,25 +298,63 @@ jobs:
   # needs: build なので、1 ターゲットでもビルドが落ちれば このジョブは skip され、
   # 「一部しか載っていない checksums.txt」が世に出ない (fail-closed)。
   checksums:
-    name: checksums.txt + installers
+    name: checksums.txt + SBOM + installers
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write      # gh release upload
+      id-token: write      # SBOM の来歴署名
+      attestations: write
     steps:
       - name: Resolve tag
         id: tag
         shell: bash
         run: echo "tag=${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: sha256-*
           path: parts
           merge-multiple: true
+
+      # ■ SBOM (CycloneDX)。この版が何を取り込んでいるかの一覧を配布物と一緒に配る。
+      #   新しい脆弱性が出たときに「自分の入れた zai は影響あるか」を、
+      #   利用者がこちらの発表を待たずに判定できる。
+      #   Cargo.lock を読むだけなのでビルド不要 = 数秒で終わる。
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate SBOM
+        id: sbom
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --override-filename は拡張子 .json を自動で足すので、ここでは
+          # 「.cdx」までを渡して zai-<tag>-sbom.cdx.json を作らせる。
+          # --target all: 配布 5 ターゲット分の依存を全部入れる (host だけだと
+          #   Windows / Linux 専用の依存が SBOM から丸ごと落ちる)。
+          # --all: 直接依存だけでなく推移依存も列挙する。
+          stem="zai-${{ steps.tag.outputs.tag }}-sbom.cdx"
+          cargo cyclonedx --format json --spec-version 1.5 --all --target all \
+            --override-filename "$stem"
+          out="$stem.json"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          # 中身が空でないことをここで確かめる (空の SBOM は嘘の安心を配る)。
+          # 手元の実測は 546 components / 548 purl なので 100 は十分に低い床。
+          n=$(grep -c '"purl"' "$out" || true)
+          [ "$n" -gt 100 ] || { echo "::error::SBOM の中身が少なすぎる ($n purl)"; exit 1; }
+          echo "SBOM: $out ($n purl)"
+
+      - name: Attest SBOM provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.sbom.outputs.file }}
 
       - name: Assemble checksums.txt
         shell: bash
@@ -210,7 +363,9 @@ jobs:
           # インストーラ自身のハッシュも載せる。install.sh を curl | sh する利用者が
           # 「実行する前にスクリプトを検証する」導線を持てるようにするため。
           cat parts/sha256-*.txt > merged.txt
-          sha256sum install.sh install.ps1 >> merged.txt
+          # SBOM も検証できる資産にする。載せないと「リリースに居るのに
+          # 誰も確かめられないファイル」が 1 つ増える。
+          sha256sum install.sh install.ps1 '${{ steps.sbom.outputs.file }}' >> merged.txt
           # CR を除去 (Windows 断片の保険) し、ファイル名でソートして決定的にする。
           tr -d '\r' < merged.txt | LC_ALL=C sort -k2 > checksums.txt
 
@@ -224,10 +379,12 @@ jobs:
             exit 1
           fi
 
-          # 5 ターゲット + install.sh + install.ps1 = 7 行。
+          # 5 ターゲット + install.sh + install.ps1 + SBOM = 8 行。
+          # 資産を増やすときはこの数字も必ず一緒に直す
+          # (直さないと「載せたつもりの資産」が黙って欠ける)。
           n=$(wc -l < checksums.txt)
-          if [ "$n" -ne 7 ]; then
-            echo "::error::checksums.txt は 7 行のはずが $n 行だった (ターゲット欠落の疑い)"
+          if [ "$n" -ne 8 ]; then
+            echo "::error::checksums.txt は 8 行のはずが $n 行だった (ターゲット欠落の疑い)"
             cat checksums.txt
             exit 1
           fi
@@ -244,8 +401,10 @@ jobs:
       # install.sh / install.ps1 をリリースアセットとしても配る。
       # 理由: main の HEAD ではなくタグに固定されたインストーラを指せるようになり、
       # 「v0.5.1 を入れた手順」を後から完全に再現できる。ファイルは数 KB なのでコストは無い。
-      - name: Upload checksums + installers
+      - name: Upload checksums + SBOM + installers
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ steps.tag.outputs.tag }}" checksums.txt install.sh install.ps1 --clobber
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            checksums.txt '${{ steps.sbom.outputs.file }}' install.sh install.ps1 --clobber

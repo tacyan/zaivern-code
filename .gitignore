@@ -109,3 +109,6 @@ target-verify/
 
 # @all 一斉指示フック (個人用ワークフロー。settings.local.json から参照)
 .claude/hooks/
+
+# cargo-cyclonedx を手元で試したときの出力 (配布物は CI が作る)
+*.cdx.json

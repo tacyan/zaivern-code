@@ -1,0 +1,49 @@
+# 依存と GitHub Actions の更新を Dependabot に見張らせる。
+#
+# ■ なぜ要るのか
+#   - Cargo.lock を固定しているので、脆弱性が出た依存は **誰かが上げるまで
+#     永久にそのまま**残る。手で追うのは続かない。
+#   - GitHub Actions は下の workflows で**コミット SHA に固定**した。
+#     固定は改竄に強い代わりに「勝手に新しくならない」ので、更新の担い手が要る。
+#     Dependabot は SHA 固定の `uses:` も版コメント付きで上げてくれる。
+#
+# ■ 上げてはいけないものは ignore に書く (提案されても毎回却下するのは無駄)。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "rust"]
+    groups:
+      # パッチ更新はまとめて 1 本にする (5 本の PR が毎週来ると誰も見なくなる)。
+      patch-level:
+        update-types: ["patch"]
+    ignore:
+      # CLAUDE.md の絶対ルール: egui は 0.29 固定 (アップグレード禁止)。
+      # 0.30 以降は API が広範囲に変わり、44,000 行の UI コードが全滅する。
+      - dependency-name: "egui"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "eframe"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # vendor/vt100 は [patch.crates-io] で差し替えているパッチ済みベンダリング。
+      # 上流を上げると visible_rows の修正が消え、deep scrollback で
+      # debug パニックが再発する。移植は人間が判断する。
+      - dependency-name: "vt100"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "Asia/Tokyo"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+    groups:
+      actions:
+        patterns: ["*"]

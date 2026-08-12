@@ -2,8 +2,11 @@
 #   irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 #
 # やること:
-#   1. GitHub Releases のビルド済み zai.exe を %LOCALAPPDATA%\Zaivern\bin へ配置
-#   2. ビルド済みが取得できない場合はソースからビルド
+#   1. GitHub Releases のビルド済み zai.exe を取得
+#   2. リリースの checksums.txt と SHA-256 を突き合わせてから
+#      %LOCALAPPDATA%\Zaivern\bin へ配置
+#      (**検証できなければ展開も実行もせずに中止する = fail-closed**)
+#   3. ビルド済みが取得できない場合はソースからビルド
 #      (Rust が無ければ rustup ごと非対話でセットアップ)
 #
 # 2回目以降の実行は「更新」として動作する:
@@ -22,6 +25,40 @@ $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
 
 function Say($msg) { Write-Host "[zaivern-code] $msg" -ForegroundColor Cyan }
 function Warn($msg) { Write-Host "[zaivern-code] $msg" -ForegroundColor Yellow }
+
+# --- 配布物の検証 (fail-closed) ----------------------------------------------
+# 取得した zip は **展開する前に** リリースの checksums.txt と突き合わせる。
+# Expand-Archive がファイルを書き出した後で確かめても手遅れ。
+#
+# 検証できない理由が何であれ (取得失敗・行が無い・不一致) $false を返す。
+# 呼び出し側は zip を消し、ソースビルドへも降りずに終わる —
+# 「確かめられなかったので、とりあえず入れた」は検証していないのと同じ。
+function Test-Checksum($file, $baseName, $sumsUrl) {
+    try {
+        # -UseBasicParsing: Windows PowerShell 5.1 で IE エンジンに依存しない
+        $body = (Invoke-WebRequest $sumsUrl -UseBasicParsing).Content
+    } catch {
+        Warn "checksums.txt を取得できませんでした: $_"
+        return $false
+    }
+    # release.yml が書く標準形 "<64桁hex><SP><SP><ファイル名>" だけを受け付ける。
+    $want = $null
+    foreach ($line in ($body -split "`n")) {
+        if ($line -match '^([0-9a-fA-F]{64})  (\S+)\s*$' -and $matches[2] -eq $baseName) {
+            $want = $matches[1].ToLower()
+            break
+        }
+    }
+    if (-not $want) { Warn "checksums.txt に $baseName の行がありません"; return $false }
+    $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLower()
+    if ($want -ne $got) {
+        Warn "   期待値: $want"
+        Warn "   実際  : $got"
+        return $false
+    }
+    Say "✅ SHA-256 一致: $baseName"
+    return $true
+}
 
 # ユーザー PATH へ追加 (未登録の場合のみ)。現在のセッションにも反映する。
 function Add-UserPath($dir) {
@@ -137,9 +174,24 @@ function Install-Prebuilt {
     $url = "$repoUrl/releases/download/$tag/$name.zip"
     $zip = Join-Path $env:TEMP "$name.zip"
     $extract = Join-Path $env:TEMP "zai-extract"
+    $sumsUrl = "$repoUrl/releases/download/$tag/checksums.txt"
     Say "ダウンロード: $url"
     $ProgressPreference = "SilentlyContinue"  # Invoke-WebRequest の進捗バーは遅いので切る
     Invoke-WebRequest $url -OutFile $zip
+
+    # ここから先は fail-closed。展開する前に必ず突き合わせる。
+    # 戻り値は「最後の出力」で判定する (Say/Warn は Write-Host なので
+    # パイプラインには乗らないが、この形なら混ざっても壊れない)。
+    Say "チェックサムを確認します: $sumsUrl"
+    if (@(Test-Checksum $zip "$name.zip" $sumsUrl)[-1] -ne $true) {
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        Write-Host "[zaivern-code] ⛔ 配布物を検証できなかったため中止しました。" -ForegroundColor Red
+        Write-Host "[zaivern-code]    ダウンロードしたものは展開も実行もしていません。" -ForegroundColor Red
+        Write-Host '[zaivern-code]    ソースから入れる場合: $env:ZAI_FROM_SOURCE = "1" を設定して再実行してください。'
+        $script:zaiGiveUp = $true   # 検証に失敗した以上、黙ってソースビルドへ降りない
+        return $false
+    }
+
     if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
     Expand-Archive $zip -DestinationPath $extract -Force
 
