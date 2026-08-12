@@ -2359,7 +2359,7 @@ pub fn verify(env: &Env, keep: bool) -> VerifyReport {
     let mut trials = vec![
         run_trial(
             "同じファイルでも、離れた行なら 2 人が同時に持てる",
-            trial_regions(),
+            trial_regions(&scratch),
         ),
         run_trial(
             "他人が保有するファイルへの書き込みを台帳が断る",
@@ -2429,14 +2429,28 @@ fn run_trial(name: &'static str, r: Result<String, String>) -> Trial {
 ///
 /// 「同じファイルは 1 人だけ」ではなく「**同じファイルでも離れた行なら 2 人**」
 /// が、この製品が競合他社より 1 段細かいところ。両方を確かめる。
-fn trial_regions() -> Result<String, String> {
+fn trial_regions(scratch: &Path) -> Result<String, String> {
     let mut store = lease::Store::default();
     let now = lease::now_secs();
     let alive = |_: u32| true;
     let a = holder("検証: 担当A", "czero-verify-a", "verify-a");
     let b = holder("検証: 担当B", "czero-verify-b", "verify-b");
 
-    if let lease::Claim::Refused { owner, .. } = lease::try_claim(
+    // **本物のファイルを置く。** 壁 (`region::needs_wall`) の判定は共通祖先側の
+    // 本文を読むので、実在しないパスへ確保すると fail-closed で必ず断られる。
+    // 全行が一意な本文にして、この実証が測りたいもの (行域の相互排除) だけを
+    // 測る。
+    let tree = scratch.join("regions");
+    if std::fs::create_dir_all(tree.join("src")).is_err() {
+        return Err(tr("検証用の作業フォルダを作れませんでした"));
+    }
+    let body: String = (1..=200u32).map(|i| format!("line {i}\n")).collect();
+    if std::fs::write(tree.join("src").join("a.rs"), &body).is_err() {
+        return Err(tr("検証用のファイルを置けませんでした"));
+    }
+
+    if let lease::Claim::Refused { owner, .. } = lease::try_claim_in(
+        &tree,
         &mut store,
         &a,
         &["src/a.rs#L10-40".to_string()],
@@ -2450,7 +2464,8 @@ fn trial_regions() -> Result<String, String> {
         ));
     }
     // 重なる行域 → 断られること。
-    if let lease::Claim::Granted(_) = lease::try_claim(
+    if let lease::Claim::Granted(_) = lease::try_claim_in(
+        &tree,
         &mut store,
         &b,
         &["src/a.rs#L20-30".to_string()],
@@ -2463,7 +2478,8 @@ fn trial_regions() -> Result<String, String> {
         ));
     }
     // 離れた行域 → 通ること。**ここが通らないと並列度が落ちる。**
-    match lease::try_claim(
+    match lease::try_claim_in(
+        &tree,
         &mut store,
         &b,
         &["src/a.rs#L100-140".to_string()],
