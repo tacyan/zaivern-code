@@ -5075,15 +5075,68 @@ mod tests {
             !rels.iter().any(|r| r.contains("escape")),
             "頂点の外を指す submodule を辿っている: {rels:?}"
         );
+        // 期待値は **実装と同じ正規化**を通すこと。`submodule_repos` は
+        // `pathx::plain(canon(fold_dots(..)))` を返すので、素の `canon()` と
+        // 比べてはいけない — Windows の `canonicalize` は `\\?\C:\…` という
+        // 冗長形を返し、`plain` がそれを外すので **Windows でだけ**
+        // `starts_with` が外れる (実際に CI の windows-latest だけが落ちた。
+        // macOS / Linux では `plain` が何もしないので永久に気付けない)。
+        let top = crate::pathx::plain(canon(fold_dots(&root)));
         for s in &got {
             assert!(
-                s.path.starts_with(canon(root.clone())),
-                "頂点の外の場所を返している: {}",
-                s.path.display()
+                s.path.starts_with(&top),
+                "頂点の外の場所を返している: {} (頂点 {})",
+                s.path.display(),
+                top.display()
             );
         }
         // 2 回呼んでも同じ (診断は並びが変わらないことを約束している)。
         assert_eq!(submodule_repos(&root), got);
+    }
+
+    /// **なぜ期待値も `pathx::plain` を通さなければならないか**を、OS に依らず固定する。
+    ///
+    /// `submodule_repos` は `pathx::plain(canon(fold_dots(..)))` を返す。
+    /// 期待値だけ素の `canonicalize` にすると、Windows では
+    /// `\\?\C:\…` (冗長形) と `C:\…` (素) を比べることになり
+    /// **`starts_with` が必ず外れる**。macOS / Linux では `plain` が
+    /// 何もしないので、この取り違えは**永久に気付けない**
+    /// (実際に CI の windows-latest だけが落ちた)。
+    ///
+    /// `pathx::plain` は文字列処理だけなので、非 Windows でも `\\?\` 付きの
+    /// 入力を与えて挙動を確かめられる。
+    #[test]
+    fn 冗長形と素の綴りを混ぜて比べない() {
+        use std::path::PathBuf;
+        let verbatim = PathBuf::from(r"\\?\C:\w\root");
+        let plainified = crate::pathx::plain(verbatim.clone());
+
+        // Windows の `canonicalize` が返す形は、素の綴りへ戻る。
+        assert_eq!(plainified, PathBuf::from(r"C:\w\root"), "plain が効いていない");
+
+        // **これが落ちていた取り違えの正体**: 同じ場所を指しているのに綴りが違う。
+        // 片方だけ `plain` を通すと、`starts_with` は必ず外れる。
+        assert_ne!(
+            verbatim, plainified,
+            "冗長形と素が同じ綴りなら、そもそもこの取り違えは起きない"
+        );
+
+        // `starts_with` の**コンポーネント単位**の比較そのものは std の挙動で、
+        // Windows 形式の綴りは Unix 上では 1 コンポーネントに見える。
+        // だからここは OS を明示して確かめる (CLAUDE.md: OS で分岐するなら
+        // テストも OS 条件を書く)。
+        #[cfg(windows)]
+        {
+            let returned = PathBuf::from(r"C:\w\root\a");
+            assert!(
+                !returned.starts_with(&verbatim),
+                "冗長形と比べているのに一致してしまった"
+            );
+            assert!(
+                returned.starts_with(&plainified),
+                "同じ正規化を通しても一致しない"
+            );
+        }
     }
 
     /// **これが「submodule ⚠ → ✅」の本体。** 親へ入れただけでは
