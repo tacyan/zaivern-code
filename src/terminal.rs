@@ -2353,12 +2353,6 @@ impl Session {
         bottom.saturating_sub(line) as usize
     }
 
-    /// 履歴に残っている**最も古い**絶対行。これより大きい絶対行はもう存在しない
-    /// (`selection_text_abs` が切り詰める上限と同じ値)。
-    fn oldest_abs(&self) -> usize {
-        self.abs_of_line(self.lines.oldest_live())
-    }
-
     /// `line` を画面の最上段へ持ってくるための戻り量。
     fn scroll_for_line(&self, line: u64) -> usize {
         self.lines.scrolled().saturating_sub(line) as usize
@@ -2769,43 +2763,25 @@ impl Session {
     /// 履歴が容量に達すると戻り量は頭打ちになるのに、行は流れ続けるため。
     /// 押し出されて履歴から消えた行はもう追えないので、最古の行で止め、
     /// 選択が丸ごと落ちたら解除する — **黙って別の場所を指さない。**
+    ///
+    /// 算術そのものは [`adopt_scroll`] (純関数) が持つ。ここは観測値を集めて
+    /// 書き戻すだけ — **実 PTY 無しで表に固定できる形**にしてある。
     fn adopt_scrolled_output(&mut self) {
-        let eff = self.eff_scroll();
-        // 減る方向 (代替画面へ入ると履歴が無くなる) は写さない。戻ってきた
-        // ときに元の位置を復元できなくなるため。
-        let mut changed = eff > self.scroll;
-        if changed {
-            self.scroll = eff;
-        }
-        let pushed = self.lines.scrolled();
-        let d = usize::try_from(pushed.saturating_sub(self.sel_pushed)).unwrap_or(usize::MAX);
-        self.sel_pushed = pushed;
-        if d > 0 && (self.sel_abs.is_some() || self.sel_anchor_abs.is_some()) {
-            changed = true;
-            let oldest = self.oldest_abs();
-            if let Some(a) = self.sel_anchor_abs.as_mut() {
-                a.0 = a.0.saturating_add(d).min(oldest);
-            }
-            if let Some((mut a, mut b)) = self.sel_abs {
-                a.0 = a.0.saturating_add(d);
-                b.0 = b.0.saturating_add(d);
-                if a.0 > oldest && b.0 > oldest {
-                    // 選択していた行は丸ごと履歴の外へ出た。
-                    self.sel_abs = None;
-                } else {
-                    // はみ出した端 (絶対行が大きい = 古い) は最古の行の先頭で止める
-                    // (`selection_text_abs` の切り詰めと同じ扱い)。
-                    if a.0 > oldest {
-                        a = (oldest, 0);
-                    }
-                    if b.0 > oldest {
-                        b = (oldest, 0);
-                    }
-                    self.sel_abs = Some((a, b));
-                }
-            }
-        }
-        if changed {
+        let out = adopt_scroll(ScrollAdopt {
+            scroll: self.scroll,
+            eff: self.eff_scroll(),
+            sel_pushed: self.sel_pushed,
+            pushed: self.lines.scrolled(),
+            rows: self.size.0,
+            sb_len: self.lines.sb_len(),
+            sel_abs: self.sel_abs,
+            sel_anchor_abs: self.sel_anchor_abs,
+        });
+        self.scroll = out.scroll;
+        self.sel_pushed = out.sel_pushed;
+        self.sel_abs = out.sel_abs;
+        self.sel_anchor_abs = out.sel_anchor_abs;
+        if out.changed {
             self.sync_selection();
         }
     }
@@ -2874,18 +2850,6 @@ impl Session {
         };
         let mut p = lock_ok(&self.parser);
         selection_text_abs(&mut p, sel)
-    }
-
-    /// 読取スレッドと**同じ手順**でバイト列を取り込む (テスト用)。
-    /// 押し出した行数の数え方まで本番と同じ経路を通すので、
-    /// 「出力が来たときのずれ」を PTY 無しで再現できる。
-    #[cfg(test)]
-    fn feed(&self, bytes: &[u8]) {
-        let mut p = lock_ok(&self.parser);
-        for piece in bytes.chunks(FEED_CHUNK) {
-            let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
-            self.lines.advance(moved, sb_len);
-        }
     }
 
     /// 選択とドラッグアンカーを両方捨てる。
@@ -6554,6 +6518,108 @@ pub fn clip_selection(
     Some((top, bottom))
 }
 
+/// 履歴に残っている**最も古い絶対行** (純関数)。
+///
+/// 絶対行は生きている画面の下端起点なので、最大戻り量の窓の最上段が最古 —
+/// つまり `履歴の長さ + 画面行数 - 1`。これは `selection_text_abs` が
+/// 切り詰める上限 (`max_off + rows - 1`) と**同じ値**である。
+pub fn oldest_abs_of(rows: u16, sb_len: usize) -> usize {
+    sb_len.saturating_add(usize::from(rows.saturating_sub(1)))
+}
+
+/// [`adopt_scroll`] の入力 (`Session` の観測値をそのまま写したもの)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollAdopt {
+    /// これまでに取り込み済みの戻り量 (`Session::scroll`)。
+    pub scroll: usize,
+    /// vt100 が**いま実際に効かせている**戻り量 (`Session::eff_scroll`)。
+    pub eff: usize,
+    /// 選択を記録した時点の押し出し総数 (`Session::sel_pushed`)。
+    pub sel_pushed: u64,
+    /// いまの押し出し総数 ([`LineIndex::scrolled`])。
+    pub pushed: u64,
+    /// 画面行数。
+    pub rows: u16,
+    /// 履歴に残っている行数 (戻れる上限)。
+    pub sb_len: usize,
+    /// 選択範囲 (絶対座標)。
+    pub sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// ドラッグ選択のアンカー (絶対座標)。
+    pub sel_anchor_abs: Option<(usize, u16)>,
+}
+
+/// [`adopt_scroll`] の出力。呼び出し側はこの値を書き戻すだけでよい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adopted {
+    /// 新しい戻り量。
+    pub scroll: usize,
+    /// 次に差分を数えるための新しい基準。
+    pub sel_pushed: u64,
+    /// 新しい選択範囲 (`None` = 履歴の外へ出たので解除)。
+    pub sel_abs: Option<((usize, u16), (usize, u16))>,
+    /// 新しいアンカー。
+    pub sel_anchor_abs: Option<(usize, u16)>,
+    /// 画面座標への切り取り直し (`sync_selection`) が要るか。
+    pub changed: bool,
+}
+
+/// **出力で画面が流れたぶんを取り込む算術** (純関数)。
+///
+/// `Session` にも vt100 にも触らないので、実 PTY 無しで表に固定できる
+/// (実 PTY を起こすと ConPTY が読取スレッドを畳まず Windows でだけ落ちた)。
+/// 実体の説明は [`Session::adopt_scrolled_output`] を見ること。
+pub fn adopt_scroll(input: ScrollAdopt) -> Adopted {
+    let ScrollAdopt {
+        mut scroll,
+        eff,
+        sel_pushed,
+        pushed,
+        rows,
+        sb_len,
+        mut sel_abs,
+        mut sel_anchor_abs,
+    } = input;
+    // 減る方向 (代替画面へ入ると履歴が無くなる) は写さない。戻ってきた
+    // ときに元の位置を復元できなくなるため。
+    let mut changed = eff > scroll;
+    if changed {
+        scroll = eff;
+    }
+    let d = usize::try_from(pushed.saturating_sub(sel_pushed)).unwrap_or(usize::MAX);
+    if d > 0 && (sel_abs.is_some() || sel_anchor_abs.is_some()) {
+        changed = true;
+        let oldest = oldest_abs_of(rows, sb_len);
+        if let Some(a) = sel_anchor_abs.as_mut() {
+            a.0 = a.0.saturating_add(d).min(oldest);
+        }
+        if let Some((mut a, mut b)) = sel_abs {
+            a.0 = a.0.saturating_add(d);
+            b.0 = b.0.saturating_add(d);
+            if a.0 > oldest && b.0 > oldest {
+                // 選択していた行は丸ごと履歴の外へ出た。
+                sel_abs = None;
+            } else {
+                // はみ出した端 (絶対行が大きい = 古い) は最古の行の先頭で止める
+                // (`selection_text_abs` の切り詰めと同じ扱い)。
+                if a.0 > oldest {
+                    a = (oldest, 0);
+                }
+                if b.0 > oldest {
+                    b = (oldest, 0);
+                }
+                sel_abs = Some((a, b));
+            }
+        }
+    }
+    Adopted {
+        scroll,
+        sel_pushed: pushed,
+        sel_abs,
+        sel_anchor_abs,
+        changed,
+    }
+}
+
 // ─── シェル統合の通し番号 (OSC 133 の行を記録できる形にする) ──────────────
 
 /// 押し出された行数を数えるための観測点。
@@ -6766,6 +6832,11 @@ impl LineIndex {
     /// 押し出した総行数。
     pub fn scrolled(&self) -> u64 {
         self.scrolled.load(Ordering::Relaxed)
+    }
+
+    /// 履歴に残っている行数 (= 戻れる上限)。
+    pub fn sb_len(&self) -> usize {
+        self.sb_len.load(Ordering::Relaxed) as usize
     }
 
     /// まだ読める最も古い通し番号。これより古い行はもう存在しない。
@@ -14828,94 +14899,175 @@ mod shell_line_tests {
 // ─── 選択と「出力で流れた画面」のずれ ──────────────────────────────
 
 #[cfg(test)]
-mod selection_scroll_pty_tests {
-    use super::{normalize_sel, selection_text, Session, SpawnSpec};
-    use crate::lockx::lock_ok;
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+mod selection_scroll_tests {
+    use super::{
+        abs_row, adopt_scroll, clip_selection, count_around, normalize_sel, oldest_abs_of,
+        selection_text, selection_text_abs, Adopted, ScrollAdopt, FEED_CHUNK,
+    };
 
-    /// 子が 1 バイトも書かないセッション。読取スレッドが畳まれるまで待つので、
-    /// 以降パーサを触るのはテストだけになる (起動シェルの profile 出力が
-    /// 混ざると入力が非決定になる)。
-    fn quiet_session(id: u64, rows: u16, cols: u16, scrollback: usize) -> Session {
-        let spec = SpawnSpec {
-            title: "sel".into(),
-            command: "exit 0".into(),
-            cwd: std::env::current_dir().unwrap(),
-            env: std::collections::HashMap::new(),
-            preset_name: String::new(),
-            icon: "💬".into(),
-            log_path: None,
-        };
-        let mut s = Session::spawn(id, spec, eframe::egui::Context::default()).unwrap();
-        // 読取スレッドはパーサの Arc を 1 本持つ。畳まれたら 1 本に戻る。
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Arc::strong_count(&s.parser) > 1 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            Arc::strong_count(&s.parser),
-            1,
-            "読取スレッドが畳まれている"
-        );
-        *lock_ok(&s.parser) = vt100::Parser::new(rows, cols, scrollback);
-        s.size = (rows, cols);
-        s.scroll = 0;
-        s.lines.scrolled.store(0, Ordering::Relaxed);
-        s.lines.sb_len.store(0, Ordering::Relaxed);
-        s.sel_pushed = 0;
-        s.clear_selection();
-        s
+    /// `Session` の**選択まわりの状態だけ**を持つ模型。
+    ///
+    /// 実 PTY を起こさない。以前は 1 バイトも書かない子を起動して読取スレッドが
+    /// 畳まれるのを待っていたが、**ConPTY は子が終わってもハンドルを保持する**ので
+    /// Windows でだけ待ちが返らず 3 件が時間切れした。パーサと通し番号は本番と
+    /// 同じ手順 ([`count_around`]) で動かし、取り込みの算術は本番と**同じ純関数**
+    /// ([`adopt_scroll`]) を通すので、見ている性質は 1 つも減っていない。
+    struct Model {
+        parser: vt100::Parser,
+        rows: u16,
+        /// `Session::scroll`。
+        scroll: usize,
+        /// `LineIndex::scrolled` 相当。
+        pushed: u64,
+        /// `LineIndex` の履歴長。
+        sb_len: usize,
+        sel_pushed: u64,
+        sel_abs: Option<((usize, u16), (usize, u16))>,
+        sel_anchor_abs: Option<(usize, u16)>,
+        selection: Option<((u16, u16), (u16, u16))>,
     }
 
-    /// 行を n 本流す。
-    fn feed_lines(s: &Session, range: std::ops::Range<usize>) {
-        for i in range {
-            s.feed(format!("line{:03}\r\n", i).as_bytes());
+    impl Model {
+        fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+            Self {
+                parser: vt100::Parser::new(rows, cols, scrollback),
+                rows,
+                scroll: 0,
+                pushed: 0,
+                sb_len: 0,
+                sel_pushed: 0,
+                sel_abs: None,
+                sel_anchor_abs: None,
+                selection: None,
+            }
         }
-    }
 
-    /// 画面に出ているハイライトの下に**実際にある**文字
-    /// (`draw_screen` はパーサの今の窓から描くので、これが利用者の見るもの)。
-    fn under_highlight(s: &Session) -> String {
-        let sel = s.selection.expect("選択が画面に見えている");
-        let p = lock_ok(&s.parser);
-        selection_text(p.screen(), normalize_sel(sel))
+        /// 読取スレッドと**同じ手順**でバイト列を取り込む。
+        fn feed(&mut self, bytes: &[u8]) {
+            for piece in bytes.chunks(FEED_CHUNK) {
+                let (_, moved, sb_len) = count_around(&mut self.parser, |p| p.process(piece));
+                self.sb_len = sb_len;
+                self.pushed += moved;
+            }
+        }
+
+        /// `Session::eff_scroll`。
+        fn eff_scroll(&self) -> usize {
+            self.parser.screen().scrollback()
+        }
+
+        /// `Session::adopt_scrolled_output` と**同じ 1 点**を通る。
+        fn adopt(&mut self) {
+            let out: Adopted = adopt_scroll(ScrollAdopt {
+                scroll: self.scroll,
+                eff: self.eff_scroll(),
+                sel_pushed: self.sel_pushed,
+                pushed: self.pushed,
+                rows: self.rows,
+                sb_len: self.sb_len,
+                sel_abs: self.sel_abs,
+                sel_anchor_abs: self.sel_anchor_abs,
+            });
+            self.scroll = out.scroll;
+            self.sel_pushed = out.sel_pushed;
+            self.sel_abs = out.sel_abs;
+            self.sel_anchor_abs = out.sel_anchor_abs;
+            if out.changed {
+                self.sync_selection();
+            }
+        }
+
+        /// `Session::sync_selection`。
+        fn sync_selection(&mut self) {
+            let (rows, scroll) = (self.rows, self.scroll);
+            self.selection = self
+                .sel_abs
+                .and_then(|sel| clip_selection(sel, rows, scroll));
+        }
+
+        /// `Session::set_scroll`。
+        fn set_scroll(&mut self, n: usize) {
+            self.adopt();
+            self.parser.set_scrollback(n);
+            self.scroll = self.parser.screen().scrollback();
+            self.sync_selection();
+        }
+
+        /// `Session::adjust_scroll`。
+        fn adjust_scroll(&mut self, delta: i64) -> bool {
+            self.adopt();
+            let before = self.scroll;
+            let n = (self.scroll as i64 + delta).max(0) as usize;
+            self.set_scroll(n);
+            self.scroll != before
+        }
+
+        /// `Session::set_selection` (画面座標 → 絶対座標)。
+        fn set_selection(&mut self, sel: ((u16, u16), (u16, u16))) {
+            self.adopt();
+            let (rows, scroll) = (self.rows, self.scroll);
+            let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
+            let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
+            self.sel_abs = Some((a, b));
+            self.sel_pushed = self.pushed;
+            self.sync_selection();
+        }
+
+        /// `Session::selection_string` (コピーの中身そのもの)。
+        fn selection_string(&mut self) -> String {
+            self.adopt();
+            let Some(sel) = self.sel_abs else {
+                return String::new();
+            };
+            selection_text_abs(&mut self.parser, sel)
+        }
+
+        /// 行を n 本流す。
+        fn feed_lines(&mut self, range: std::ops::Range<usize>) {
+            for i in range {
+                self.feed(format!("line{:03}\r\n", i).as_bytes());
+            }
+        }
+
+        /// 画面に出ているハイライトの下に**実際にある**文字
+        /// (`draw_screen` はパーサの今の窓から描くので、これが利用者の見るもの)。
+        fn under_highlight(&self) -> String {
+            let sel = self.selection.expect("選択が画面に見えている");
+            selection_text(self.parser.screen(), normalize_sel(sel))
+        }
     }
 
     #[test]
     fn 遡って選択したまま出力が来ても同じ文字を指し続ける() {
         let (rows, cols) = (5u16, 20u16);
-        let mut s = quiet_session(9971, rows, cols, 200);
-        feed_lines(&s, 0..30);
+        let mut s = Model::new(rows, cols, 200);
+        s.feed_lines(0..30);
         // 履歴を 10 行ぶん遡って、真ん中の行を選ぶ。
         s.set_scroll(10);
         s.set_selection(((2, 0), (2, 6)));
         let want = s.selection_string();
         assert!(want.starts_with("line"), "行を選べている: {want:?}");
-        assert_eq!(under_highlight(&s), want, "選ぶ直前は一致している");
+        assert_eq!(s.under_highlight(), want, "選ぶ直前は一致している");
 
         // ここでエージェントが 3 行出力する (利用者は遡ったまま)。
         s.feed(b"a\r\nb\r\nc\r\n");
         assert_eq!(s.selection_string(), want, "コピーが同じ文字を指し続ける");
-        assert_eq!(under_highlight(&s), want, "ハイライトが同じ文字の上にある");
+        assert_eq!(s.under_highlight(), want, "ハイライトが同じ文字の上にある");
 
         // さらに 1 行ぶん遡る。画面は 1 行しか動かない。
         let before = s.eff_scroll();
         assert!(s.adjust_scroll(1), "遡れる");
         assert_eq!(s.eff_scroll(), before + 1, "1 行ぶんだけ動く");
-        assert_eq!(under_highlight(&s), want, "スクロールしてもずれない");
+        assert_eq!(s.under_highlight(), want, "スクロールしてもずれない");
         assert_eq!(s.selection_string(), want, "コピーもずれない");
-        s.kill();
     }
 
     #[test]
     fn 履歴から押し出された選択は端で止まるか解除される() {
         let (rows, cols) = (5u16, 20u16);
         // 履歴は 8 行しか持てない = すぐ満杯になる。
-        let mut s = quiet_session(9972, rows, cols, 8);
-        feed_lines(&s, 0..20);
+        let mut s = Model::new(rows, cols, 8);
+        s.feed_lines(0..20);
         // 履歴の最古 2 行を選ぶ (画面行 0..1)。
         s.set_scroll(usize::MAX);
         assert!(s.eff_scroll() > 0, "遡れている");
@@ -14939,14 +15091,13 @@ mod selection_scroll_pty_tests {
         assert_eq!(s.selection_string(), "", "残骸をコピーさせない");
         assert_eq!(s.sel_abs, None, "選択が解除されている");
         assert!(s.selection.is_none(), "ハイライトも消えている");
-        s.kill();
     }
 
     #[test]
     fn 代替画面を出入りしても選択がずれない() {
         let (rows, cols) = (5u16, 20u16);
-        let mut s = quiet_session(9973, rows, cols, 200);
-        feed_lines(&s, 0..30);
+        let mut s = Model::new(rows, cols, 200);
+        s.feed_lines(0..30);
         s.set_scroll(6);
         s.set_selection(((1, 0), (1, 6)));
         let want = s.selection_string();
@@ -14959,6 +15110,165 @@ mod selection_scroll_pty_tests {
         s.feed(b"\x1b[?1049l");
         assert_eq!(s.sel_abs, abs, "代替画面は絶対行を動かさない");
         assert_eq!(s.selection_string(), want, "戻ってきたら同じ文字を指す");
-        s.kill();
+    }
+
+    /// 取り込みの算術を表で固定する (パーサも `Session` も要らない部分)。
+    #[test]
+    fn 押し出しの取り込みを表で固定する() {
+        // rows = 5 / sb_len = 8 → 最古の絶対行は 12。
+        let base = ScrollAdopt {
+            scroll: 3,
+            eff: 3,
+            sel_pushed: 0,
+            pushed: 0,
+            rows: 5,
+            sb_len: 8,
+            sel_abs: Some(((6, 0), (5, 6))),
+            sel_anchor_abs: None,
+        };
+        let cases: &[(&str, ScrollAdopt, Adopted)] = &[
+            (
+                "何も流れていなければ 1 ビットも動かない",
+                base,
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 0,
+                    sel_abs: base.sel_abs,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+            (
+                "vt100 が増やした戻り量は写す (減る方向は写さない)",
+                ScrollAdopt {
+                    eff: 6,
+                    pushed: 3,
+                    ..base
+                },
+                Adopted {
+                    scroll: 6,
+                    sel_pushed: 3,
+                    sel_abs: Some(((9, 0), (8, 6))),
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "代替画面で戻り量が 0 になっても scroll は減らさない",
+                ScrollAdopt { eff: 0, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 0,
+                    sel_abs: base.sel_abs,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+            (
+                "片端だけ履歴から落ちたら最古の行の先頭で止める",
+                ScrollAdopt { pushed: 7, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 7,
+                    sel_abs: Some(((12, 0), (12, 6))),
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "両端とも落ちたら解除する (黙って別の場所をコピーさせない)",
+                ScrollAdopt { pushed: 20, ..base },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 20,
+                    sel_abs: None,
+                    sel_anchor_abs: None,
+                    changed: true,
+                },
+            ),
+            (
+                "選択が無くてもアンカーだけは追いかけ、最古で止める",
+                ScrollAdopt {
+                    pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: Some((5, 2)),
+                    ..base
+                },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: Some((12, 2)),
+                    changed: true,
+                },
+            ),
+            (
+                "選択もアンカーも無ければ基準を進めるだけ",
+                ScrollAdopt {
+                    pushed: 9,
+                    sel_abs: None,
+                    ..base
+                },
+                Adopted {
+                    scroll: 3,
+                    sel_pushed: 9,
+                    sel_abs: None,
+                    sel_anchor_abs: None,
+                    changed: false,
+                },
+            ),
+        ];
+        for (name, input, want) in cases {
+            assert_eq!(&adopt_scroll(*input), want, "{name}");
+        }
+    }
+
+    /// 最古の絶対行は `selection_text_abs` が切り詰める上限と同じ値でなければ
+    /// ならない。ずれると「クランプした先に文字が無い」or「まだ読める行を捨てる」。
+    #[test]
+    fn 最古の絶対行はコピー側の切り詰め上限と一致する() {
+        for rows in [1u16, 2, 5, 24] {
+            for lines in [0usize, 1, 7, 40] {
+                let cap = 8usize;
+                let mut m = Model::new(rows, 20, cap);
+                m.feed_lines(0..lines);
+                let want = {
+                    m.parser.set_scrollback(usize::MAX);
+                    let max_off = m.parser.screen().scrollback();
+                    m.parser.set_scrollback(0);
+                    max_off + usize::from(rows) - 1
+                };
+                assert_eq!(
+                    oldest_abs_of(rows, m.sb_len),
+                    want,
+                    "rows={rows} lines={lines}"
+                );
+            }
+        }
+    }
+
+    /// **コピーと表示が同じ 1 点を通る**ことを構造で固定する。
+    /// どれか 1 つが取り込みを飛ばすと「片方だけ直っている」事故に戻る。
+    #[test]
+    fn 取り込みは五つの入口すべてを通る() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        // 算術は純関数に 1 本だけ。`Session` 側は観測値を渡すだけ。
+        // 検索語は `concat!` で組む — ベタ書きするとこのテスト自身が引っ掛かる。
+        assert_eq!(
+            src.matches(concat!("pub fn ", "adopt_scroll(")).count(),
+            1,
+            "取り込みの算術が 2 箇所に分かれている"
+        );
+        assert!(
+            src.contains("fn adopt_scrolled_output(&mut self) {\n        let out = adopt_scroll("),
+            "Session が純関数を通っていない"
+        );
+        // 呼び出し口 (draw / set_scroll / adjust_scroll / set_selection /
+        // selection_string) の 5 つ + 定義 1 つ。
+        assert_eq!(
+            src.matches(concat!("adopt_scrolled", "_output()")).count(),
+            5,
+            "取り込みの入口が 5 つでない"
+        );
     }
 }
