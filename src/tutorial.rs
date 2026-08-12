@@ -69,6 +69,15 @@ const RING_PAD: f32 = 4.0;
 const MISSING_ANCHOR_TIMEOUT: f64 = 4.0;
 /// アニメーション中の再描画間隔 (静止時のコストを払わないため 30fps に抑える)。
 const REPAINT_MS: u64 = 33;
+/// フォーカスリングの脈動の角速度 (rad/s)。位相は `時刻 × これ`。
+const RING_SPEED: f64 = 2.2;
+/// 最後の操作からこれだけ経ったら脈動を止め、**1 枚も予約しない**静止画にする (秒)。
+///
+/// 脈動の周期は `2π / RING_SPEED` ≒ 2.86 秒なので、ここは約 1.4 周期ぶん。
+/// 「カードを読み始めたときは光っていて、読んでいるうちに落ち着く」長さ。
+/// **誰も見ていないツアーが 1 時間 55fps で回り続ける**のを止めるための線で、
+/// 操作 (ポインタ移動でもキーでも) が来れば同じフレームでまた動き出す。
+const RING_SETTLE_AFTER: f64 = 4.0;
 /// 手順表の版。テーブルを大幅改訂したら上げると、既読の人にも一度だけ出せる。
 const STEPS_VERSION: u32 = 1;
 /// 永続化ファイル名 (`~/.zaivern/` 直下)。
@@ -1666,6 +1675,24 @@ pub fn dim_rects(target: Option<Rect>, screen: Rect) -> Vec<Rect> {
 
 // ── アンカー欠落の自動送り (純粋) ────────────────────────────
 
+/// フォーカスリングの脈動 0..1。**純粋**。
+///
+/// 時刻ベースなのでフレームレートに依存しない (飛ばしたフレームぶん進む)。
+fn ring_pulse(t: f64) -> f32 {
+    ((t * RING_SPEED).sin() as f32) * 0.5 + 0.5
+}
+
+/// **脈動を止める時刻。** `deadline` 以降で最初に位相が π の倍数になる点。**純粋**。
+///
+/// そこで止めると [`ring_pulse`] がちょうど中央値 (0.5) になるので、
+/// **静止画へ移る瞬間に絵が 1px も飛ばない**。「4 秒経ったら即座に固定値へ」
+/// にすると太さと濃さが跳ねて、止めたことが目に見えてしまう。
+/// 余計に回るのは最大で半周期 (≒1.43 秒) だけ。
+fn ring_settle_time(deadline: f64) -> f64 {
+    let step = std::f64::consts::PI / RING_SPEED;
+    (deadline / step).ceil() * step
+}
+
 /// 「アンカーが現れないまま何秒経ったか」を数え、時間切れで自動送りを促す。
 ///
 /// パネルを開く依頼をホストが実行できなかった場合でも、ツアーが**そこで止まらない**
@@ -1694,6 +1721,17 @@ impl MissingTracker {
     /// 手順が変わったら呼ぶ。
     pub fn reset(&mut self) {
         self.since = None;
+    }
+
+    /// 時間切れまでの残り。待っていなければ `None`。**純粋**。
+    ///
+    /// アンカー待ちの間だけは「何も動いていないのにフレームが要る」唯一の
+    /// 場面なので、**その 1 枚を期限ちょうどに予約する**ために使う
+    /// (30fps で回して待つのではなく、時間切れの瞬間だけ起きる)。
+    pub fn remaining(&self, now: f64) -> Option<std::time::Duration> {
+        let t0 = self.since?;
+        let left = MISSING_ANCHOR_TIMEOUT - (now - t0);
+        Some(std::time::Duration::from_secs_f64(left.max(0.0)))
     }
 
     /// フォールバック表示に入っているか (テスト・表示用)。
@@ -1798,6 +1836,11 @@ pub struct Tutorial {
     guide: bool,
     /// 索引の絞り込み文字列
     filter: String,
+    /// 最後に操作 (キー / ポインタ移動 / クリック) があった時刻。
+    ///
+    /// `None` = まだ観測していない (次のフレームで「いま」に初期化する)。
+    /// これを基準に [`ring_settle_time`] で脈動を止める時刻を決める。
+    last_active: Option<f64>,
     /// 章の進捗 (`章 id -> 到達した手順数`)
     seen: BTreeMap<String, u32>,
 }
@@ -1838,6 +1881,7 @@ impl Tutorial {
             chapter_id: None,
             guide: false,
             filter: String::new(),
+            last_active: None,
             seen,
         }
     }
@@ -1889,6 +1933,7 @@ impl Tutorial {
         self.idx = 0;
         self.confirm_skip = false;
         self.missing.reset();
+        self.last_active = None;
         self.chapter_id = chapter;
         self.guide = false;
         self.pending = self.playlist.first().and_then(|s| s.pre_action);
@@ -2002,6 +2047,8 @@ impl Tutorial {
 
     fn on_step_changed(&mut self) {
         self.missing.reset();
+        // 新しい対象を光らせ直す (止まっていた脈動をもう一周ぶん動かす)。
+        self.last_active = None;
         self.pending = self
             .playlist
             .get(self.idx)
@@ -2073,7 +2120,11 @@ impl Tutorial {
         let target = take_anchor(ctx, step.anchor);
 
         // アンカーが要るのに現れない手順は、しばらく待って自動で次へ。
-        let now = ctx.input(|i| i.time);
+        // **操作の有無も同じ 1 回の `input` で読む** (2 回読むと別の瞬間の値になる)。
+        let (now, active) = ctx.input(|i| {
+            // `app::schedule_idle_repaint` の `had_input` と同じ判定にそろえる。
+            (i.time, !i.events.is_empty() || i.pointer.is_moving())
+        });
         let present = step.anchor.is_none() || target.is_some();
         if self.missing.observe(now, present) {
             let act = self.pending.take();
@@ -2082,18 +2133,38 @@ impl Tutorial {
             return act;
         }
 
+        // 脈動を止める時刻。操作があったフレームで基準を更新する。
+        if active || self.last_active.is_none() {
+            self.last_active = Some(now);
+        }
+        let settle = ring_settle_time(self.last_active.unwrap_or(now) + RING_SETTLE_AFTER);
+
         self.paint_dim(ctx, theme, target, screen);
         if let Some(t) = target {
-            self.paint_ring(ctx, theme, t, now);
+            // **時計そのものを止める。** `settle` を過ぎたら位相が進まないので、
+            // 何度描いても同じ絵 = 予約しなくてよい。
+            self.paint_ring(ctx, theme, t, ring_pulse(now.min(settle)));
         }
         self.card(ctx, theme, step, target, screen, keys);
 
-        // リングのアニメーションのため、控えめな間隔で再描画を促す。
-        crate::perf::repaint_after(
-            ctx,
-            std::time::Duration::from_millis(REPAINT_MS),
-            "tutorial",
-        );
+        // **予約するのは「次のフレームで絵が変わる」ときだけ** (設計原則 3)。
+        //
+        // 昔はここで無条件に 30fps を予約していた。ツアーは初回起動で自動再生
+        // されるので、**カードを開いたまま席を立つと 55fps で回り続けた**
+        // (実測 12.45%/コア。閉じているときの 0.35% に対して 35 倍)。
+        // いま予約するのは 2 つだけ:
+        //   (a) リングがまだ脈動している — `settle` まで 30fps
+        //   (b) アンカー待ちの時間切れ — **その 1 枚だけ**を期限ちょうどに
+        // どちらでもなければ 1 枚も予約しない (静止画のまま寝る)。
+        if target.is_some() && now < settle {
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(REPAINT_MS),
+                "tutorial",
+            );
+        } else if let Some(left) = self.missing.remaining(now) {
+            crate::perf::repaint_after(ctx, left, "tutorial.anchor_wait");
+        }
 
         self.handle_keys(ctx);
         self.pending.take()
@@ -2118,14 +2189,15 @@ impl Tutorial {
         }
     }
 
-    /// 呼吸するフォーカスリング。
-    fn paint_ring(&self, ctx: &egui::Context, theme: &crate::theme::Theme, t: Rect, now: f64) {
+    /// 呼吸するフォーカスリング。`pulse` は 0..1 ([`ring_pulse`])。
+    ///
+    /// **時刻ではなく位相を受け取る。** 止めるかどうかの判断は呼び出し側に
+    /// 1 か所だけ置き、ここは「渡された位相を描く」だけにする。
+    fn paint_ring(&self, ctx: &egui::Context, theme: &crate::theme::Theme, t: Rect, pulse: f32) {
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             Id::new("zv-tutorial-ring"),
         ));
-        // 0..1 を行き来する脈動。時刻ベースなのでフレームレートに依存しない。
-        let pulse = ((now * 2.2).sin() as f32) * 0.5 + 0.5;
         let pad = RING_PAD + pulse * 3.0;
         let ring = t.expand(pad);
         let rounding = Rounding::same(6.0);
@@ -3876,5 +3948,295 @@ mod tests {
         for id in ["welcome", "layout", "palette", "cockpit", "finish"] {
             assert!(STEPS.iter().any(|s| s.id == id), "{id} が消えている");
         }
+    }
+}
+
+/// **アイドルで再描画を要求しないこと** — 設計原則 3 のリリースゲート。
+///
+/// ここが赤くなったら「アイドル時のコストはゼロ」が破れている。
+/// **絶対時間では線を引かない** (CPU 秒はマシンと負荷で必ず嘘をつく)。
+/// 見るのは**要求の回数**だけ: 何フレーム回しても要求が 0 件か。
+#[cfg(test)]
+mod idle_repaint_tests {
+    use super::*;
+
+    /// 時計を注入する headless ハーネス。**実時間を 1 秒も待たない。**
+    struct Harness {
+        ctx: egui::Context,
+        tut: Tutorial,
+        theme: crate::theme::Theme,
+        keys: Keybinds,
+        t: f64,
+        dir: PathBuf,
+    }
+
+    impl Harness {
+        fn new(tag: &str) -> Self {
+            // **実 `~/.zaivern` に触らない。** 状態ファイルは一時ディレクトリへ。
+            let dir = crate::test_util::unique_temp_dir("zv-tutorial-idle", tag);
+            Self {
+                ctx: egui::Context::default(),
+                tut: Tutorial::in_dir(dir.clone()),
+                theme: crate::theme::by_name("zaivern-dark"),
+                keys: Keybinds::default(),
+                t: 1.0,
+                dir,
+            }
+        }
+
+        /// `dt` 秒進めて 1 フレーム描く。返り値は egui が予約した再描画待ち
+        /// (`Duration::MAX` = **1 枚も予約していない**)。
+        ///
+        /// 現在の手順のアンカーは毎フレーム申告する (実際のアプリでパネルが
+        /// 自分の位置を申告するのと同じ順番)。
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) -> std::time::Duration {
+            self.t += dt;
+            let raw = egui::RawInput {
+                time: Some(self.t),
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                tut,
+                theme,
+                keys,
+                ..
+            } = self;
+            let out = ctx.run(raw, |c| {
+                if let Some(id) = tut.step().and_then(|s| s.anchor) {
+                    anchor(
+                        c,
+                        id,
+                        Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(200.0, 30.0)),
+                    );
+                }
+                let _ = tut.overlay(c, theme, keys);
+            });
+            out.viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .unwrap_or(std::time::Duration::MAX)
+        }
+
+        /// アンカーを持つ手順まで進める (リングが出る = 脈動する手順)。
+        fn goto_anchored_step(&mut self) {
+            for _ in 0..STEPS.len() {
+                if self.tut.step().and_then(|s| s.anchor).is_some() {
+                    return;
+                }
+                self.tut.next();
+            }
+            panic!("アンカーを持つ手順が 1 つも無い");
+        }
+
+        /// 放置しきる (脈動が止まるまで回す)。
+        fn settle(&mut self) {
+            for _ in 0..300 {
+                self.frame(0.033, vec![]);
+            }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 溜まった要求を取り出して空にする (観測を自分のフレームだけに閉じる)。
+    fn drain() -> BTreeMap<&'static str, u64> {
+        crate::perf::test_sink::take()
+    }
+
+    // ── (1) 表示していないときは 1 回も要求しない ────────────────
+
+    /// **ツアーもガイドも閉じているなら、1 フレームも予約しない。**
+    ///
+    /// 初回起動の自動再生を過ぎた後 (= ほとんどの利用者のほとんどの時間)
+    /// がこの状態。ここが破れると全利用者のバッテリーを焼く。
+    #[test]
+    fn 閉じているツアーは一枚も予約しない() {
+        let mut h = Harness::new("closed");
+        assert!(!h.tut.active(), "開始していないのに active");
+        // 最初の数フレームは egui 自身がレイアウト確定のために要求する
+        // (`RepaintState::outstanding`)。それが落ち着いてから見る。
+        for _ in 0..4 {
+            h.frame(0.05, vec![]);
+        }
+        let _ = drain();
+        for _ in 0..30 {
+            assert_eq!(
+                h.frame(0.05, vec![]),
+                std::time::Duration::MAX,
+                "閉じているのに再描画を予約した"
+            );
+        }
+        assert!(drain().is_empty(), "閉じているのに要求を出した");
+    }
+
+    /// 全機能ガイド (静止画) も同じ — 開いていても予約しない。
+    #[test]
+    fn ガイドは静止画なので予約しない() {
+        let mut h = Harness::new("guide");
+        h.tut.open_guide();
+        let _ = drain();
+        for _ in 0..30 {
+            h.frame(0.05, vec![]);
+        }
+        assert!(drain().is_empty(), "ガイドが再描画を要求した");
+    }
+
+    // ── (2) 表示中でも、放置すれば止まる ────────────────────────
+
+    /// **カードを開いたまま放置したら、脈動が止まって要求が 0 になる。**
+    ///
+    /// 直す前はここが無条件に 30fps を予約していた
+    /// (実測 48〜56fps / 1 コアの 9.2〜12.5%)。
+    #[test]
+    fn 放置したツアーは脈動を止めて要求が消える() {
+        let mut h = Harness::new("settle");
+        h.tut.start();
+        h.goto_anchored_step();
+
+        // 直後は動いている (リングが呼吸している = 見た目を殺していない)。
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "開いた直後にリングが動いていない (見た目を壊した)"
+        );
+
+        h.settle();
+        let _ = drain();
+        for _ in 0..30 {
+            assert_eq!(
+                h.frame(0.033, vec![]),
+                std::time::Duration::MAX,
+                "放置中のツアーが再描画を予約している"
+            );
+        }
+        assert!(drain().is_empty(), "放置中のツアーが要求を出した");
+    }
+
+    /// **自走している出所がゼロ** — `perf` の判定そのもので見る。
+    ///
+    /// `always_on_sources` は「アイドルフレームと同数以上の要求を出した出所」
+    /// = 次のフレームを自分で予約し続けているもの。**絶対時間ではなく比**。
+    #[test]
+    fn 放置後は自走する出所が無い() {
+        let mut h = Harness::new("always-on");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        let _ = drain();
+        let mut stats = crate::perf::FrameStats::new();
+        for _ in 0..30 {
+            h.frame(0.033, vec![]);
+            // 実入力のないフレーム = アイドルフレームとして数える。
+            stats.record_frame(1_000, true, drain());
+        }
+        let on = stats.always_on_sources();
+        assert!(
+            on.is_empty(),
+            "アイドルで自走している出所が残っている: {on:?}"
+        );
+        assert_eq!(stats.idle_repaints(), 0, "アイドルで要求が出ている");
+    }
+
+    /// **操作すれば必ず動き出す。** 止めっぱなしにしていない。
+    #[test]
+    fn 操作したらリングはまた動き出す() {
+        let mut h = Harness::new("wake");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        // ポインタが動いた = 人が居る。
+        h.frame(
+            0.033,
+            vec![egui::Event::PointerMoved(egui::pos2(600.0, 400.0))],
+        );
+        // 次のフレーム (入力なし) でも脈動が続いている。
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "操作したのにリングが動き出さない"
+        );
+    }
+
+    /// **手順が変われば新しい対象がまた光る。**
+    #[test]
+    fn 手順を進めるとまた光る() {
+        let mut h = Harness::new("step");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        h.tut.next();
+        h.goto_anchored_step();
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "次の手順のリングが光っていない"
+        );
+    }
+
+    // ── (3) 止める瞬間に絵が飛ばない (純粋関数) ──────────────────
+
+    /// 脈動を止める時刻では、位相がちょうど中央値 (0.5) になる。
+    #[test]
+    fn 止める瞬間の位相は中央値() {
+        for deadline in [0.0_f64, 0.3, 1.0, 4.0, 4.9, 123.456] {
+            let s = ring_settle_time(deadline);
+            assert!(s >= deadline, "deadline {deadline} より前で止めている: {s}");
+            assert!(
+                s - deadline <= std::f64::consts::PI / RING_SPEED + 1e-9,
+                "半周期より長く回している: {deadline} → {s}"
+            );
+            assert!(
+                (ring_pulse(s) - 0.5).abs() < 1e-4,
+                "止めた瞬間に絵が飛ぶ: pulse={}",
+                ring_pulse(s)
+            );
+        }
+    }
+
+    /// 脈動は 0..1 に収まる (リングの太さが負や過大にならない)。
+    #[test]
+    fn 脈動は0から1に収まる() {
+        for i in 0..2000 {
+            let p = ring_pulse(i as f64 * 0.01);
+            assert!((0.0..=1.0).contains(&p), "pulse={p}");
+        }
+    }
+
+    // ── (4) アンカー待ちは「時間切れの 1 枚」だけを予約する ───────
+
+    /// 30fps で待たず、**時間切れの瞬間 1 枚**だけを予約するための残り時間。
+    #[test]
+    fn アンカー待ちの残り時間は期限までで頭打ち() {
+        let mut m = MissingTracker::default();
+        assert_eq!(m.remaining(0.0), None, "待っていないのに残りがある");
+        assert!(!m.observe(0.0, false));
+        let left = m.remaining(1.0).expect("待っている");
+        assert_eq!(
+            left,
+            std::time::Duration::from_secs_f64(MISSING_ANCHOR_TIMEOUT - 1.0),
+            "残りが期限と合わない"
+        );
+        assert_eq!(
+            m.remaining(MISSING_ANCHOR_TIMEOUT + 10.0),
+            Some(std::time::Duration::ZERO),
+            "期限を過ぎたら 0 (負にしない)"
+        );
     }
 }
