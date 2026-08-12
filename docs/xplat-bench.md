@@ -217,6 +217,12 @@ Windows の数字を取るには CI の `windows-latest` でこのベンチを�
 
 ### CI に足すべきジョブの案 (ワークフローは共有面なので触っていない)
 
+> **【この案は 2026-08-12 に実装された。以下は当時の案の記録である。】**
+> 実際に入ったのは `.github/workflows/xplat.yml` で、案とは形が違う
+> (`zai` のビルドが要らない probe を毎 push・3 OS で回し、
+> `zai` が要るものだけを schedule / 手動へ回した)。
+> 現在の内容は下の「追測 (2026-08-12)」を見ること。
+
 `windows-latest` の runner には git・python3 (`python`) が最初から入っているので、
 **コンテナは要らない**。ホスト側だけを走らせればよい。
 
@@ -247,3 +253,261 @@ Windows の数字を取るには CI の `windows-latest` でこのベンチを�
 * 出た JSON はこのドキュメントの表と同じ形なので、macOS / Linux の JSON と
   並べれば 3 つ目の列になる。突き合わせは `xplat-bench.sh` の判定と同じ規則
   (落とす指標だけを比べる) で行うこと。
+
+---
+
+# 追測 (2026-08-12) — git の版の軸を埋める
+
+上の §「実測 (2026-08-11)」は **OS の軸** (macOS / Linux) を埋めたが、
+**git の版はどちらも 2.47.x の 1 点**だった。ところが中核の判定は git の版で
+はっきり変わる。埋めたのがこの節である。
+
+再現: `tools/git-matrix-prove.sh` / `tools/git-portability-probe.sh` /
+CI の `.github/workflows/xplat.yml`。
+
+## なぜ OS ではなく git だけを振るのか
+
+ディストリを替えると glibc も FS も python も一緒に変わり、
+**「git の版のせい」と言えなくなる**。そこで土台イメージを
+`rust:1.90-slim` (Debian trixie) に固定し、**git だけをソースから入れ替えた**。
+
+裏取りとして、素の `debian:<コードネーム>-slim` に apt で入る git でも同じ
+プローブを回した。**ソースから作った 2.30.2 と、bullseye の apt が入れる
+2.30.2 は 1 項目も違わない** — 作り方の違いが結果に混ざっていないことの確認。
+
+## 素の git の挙動 (`tools/git-portability-probe.sh`)
+
+| 測った場所 | OS | git | `merge-tree --write-tree` | `git merge` の既定戦略 | FS が大小を畳む | `lease.rs` の `cfg!` | CRLF のマージ | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ホスト | macOS 26 (darwin 25.5.0) | **2.47.1** | あり | ort | **はい** | 畳む | 3 通りとも clean | ok |
+| コンテナ (trixie) | Linux 6.10 | **2.47.3** | あり | ort | いいえ | 畳まない | 3 通りとも clean | ok |
+| コンテナ (trixie + 源) | Linux 6.10 | **2.30.2** | **なし** | **recursive** | いいえ | 畳まない | 3 通りとも clean | ok |
+| コンテナ (bookworm) | Linux 6.10 | 2.39.5 | あり | ort | いいえ | 畳まない | 3 通りとも clean | ok |
+| コンテナ (bullseye) | Linux 6.10 | 2.30.2 | **なし** | **recursive** | いいえ | 畳まない | 3 通りとも clean | ok |
+
+「CRLF のマージ」は `core.autocrlf` を **未設定 / true / input** の 3 通りで
+回した結果。CRLF のファイルへ互いに素な 2 つの編集を入れて `git merge` する
+だけの、道具を 1 つも挟まない測定である
+(CLAUDE.md の「ハーネスは自分で壊した結果を測ることがある」の裏取り —
+`anyrepo-prove.sh` が CRLF を LF へ書き換えていた件は**道具側の欠陥**で、
+git は 5 つの環境すべてで CRLF のまま綺麗にマージする)。
+
+### 分かった差は 2 つ。どちらも **2.34 / 2.38 の境**で出る
+
+1. **`git merge-tree --write-tree` は 2.38 未満に無い。**
+   `src/conflict.rs` は版番号ではなく usage の中身で判定しているので
+   (`merge_tree_probe_argv` / `conflict.rs:825-830`)、**予想と実測は 5 環境
+   すべてで一致した**。無い側では行範囲だけの判定へ正しく縮退し、
+   `region::` の三方向テストは理由付きで skip される。**壊れない。**
+2. **`git merge` の既定戦略は 2.34 未満で `recursive`** (= diff は
+   `diff.algorithm` 既定の myers)。2.34 以降は ort で histogram 固定。
+
+## 2 番目の差が効く場所 — §3.16 の反証表は **git 2.34 以降の話**だった
+
+`docs/conflict-zero.md` §3.16 は「帯を満たしていても反復本文では衝突する」
+という穴を `A={17} B={5,13,25}` で示している。**これを git の版で振り直した**
+(`tools/merge-band-probe.sh --mode bracket`、周期 6 の 600 行):
+
+| git | 戦略 | unique | fences | blank | generated | repeat |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2.47.1 (macOS) / 2.47.3 (Linux) | ort (histogram) | clean | **衝突** | clean | **衝突** | **衝突** |
+| **2.30.2 (Linux)** | **recursive (myers)** | clean | clean | clean | clean | clean |
+
+**古い git のほうが通る。** §3.16.2 が挙げている原因
+(「ort は diff-algorithm を histogram に固定している」) と完全に整合する。
+
+これは主張が崩れたのではなく、**主張の適用範囲が測れた**ということである:
+
+* §3.16 の失敗表は **git ≥ 2.34 でだけ再現する**。
+  「素の git ならどこでも起きる」とは読まないこと。
+* **直した後のモデル (帯 + 交錯/錨 + 昇順) の判定は両方の版で同一**で、
+  ort で衝突する 3 つを **2.30.2 でもきちんと「断」にしている**。
+  つまり古い git では**過剰に断っている** (fail-closed) だけで、
+  「通してよいと言ったのに衝突した組」は **両方の版で 0**。安全側は保たれている。
+
+## 帯そのもの (`--mode pairs`) は版に依らない
+
+`region::MERGE_ONLY_BAND` の根拠になった測定を 4 環境で回した結果は
+**完全に同一**。5 種類の本文 (unique / fences / blank / generated / repeat)
+すべてで `gap=1` は衝突、`gap>=2` は clean。
+
+> **`gap` の定義が 2 つある。混ぜないこと。**
+> このハーネスの `gap` は**行番号の差** (行 100 と 100+gap) で、
+> `region::SAFE_BAND` / `MERGE_ONLY_BAND` の `gap`
+> (`region::spans_too_close`) は**間に挟まる未変更行の数**である。
+> ハーネスの `gap=2` = 未変更行 1 行 = `MERGE_ONLY_BAND = 1`。
+> つまり下の表は `MERGE_ONLY_BAND = 1` と**矛盾していない**、
+> どころかそれを 4 環境で再確認したものである
+> (`src/region.rs:45-62` の下限表を参照)。
+
+| git | gap=1 | gap=2 | gap=3 | gap=4 | gap=6 | gap=8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2.47.1 (macOS) | 衝突 ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 |
+| 2.47.3 (Linux) | 衝突 ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 |
+| 2.39.5 (Linux) | 衝突 ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 |
+| 2.30.2 (Linux) | 衝突 ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 | clean ×5 |
+
+## リポジトリの形ごとの可否 — macOS と Linux で **差 0**
+
+`docs/anyrepo-proof.md` の「形ごとの可否」の表は **macOS / git 2.47.1 の
+1 点**でしか測っていなかった。`tools/anyrepo-prove.sh --shapes --writers 4
+--overlap 1.0` を Linux でも回した結果:
+
+| 形 | macOS 2.47.1 | Linux 2.47.3 | Linux **2.30.2** |
+| --- | --- | --- | --- |
+| 普通のリポジトリ / bare / 連結 worktree / shallow / 1 コミット / detached HEAD / 未コミットあり / sparse-checkout / submodule / LFS / 巨大 (4200 件) | `proved`・素の git 6 ファイル 7 ハンク → **0 / 0**・重複行 0・予約 24/24 成立・拒否 0 | **同左 (全項目一致)** | **同左 (全項目一致)** |
+| コミットが 0 件 / 非 git ディレクトリ | `skip` (理由付き) | 同左 | 同左 |
+
+**13 形 × 3 環境 = 39 通りで、落とす指標が 1 つも違わなかった。**
+`merge-tree --write-tree` の無い 2.30.2 でも `skip` は増えず、全部 `proved`
+のまま — つまり `--shapes` の経路は `merge-tree` に寄りかかっていない。
+
+`docs/anyrepo-proof.md:182` の「(git 2.47.1 / macOS)」は
+**「macOS / Linux・git 2.30.2〜2.47.3 で同じ」**へ広げてよい (統合担当へ)。
+
+## 残った穴 — 大文字小文字の畳みは **FS ではなく `cfg!` で決めている**
+
+プローブが見つけた唯一の構造的な問題。`src/lease.rs:240` は
+
+```rust
+cfg!(any(windows, target_os = "macos"))
+```
+
+つまり**コンパイル時の OS** で「台帳のパス鍵を小文字へ畳むか」を決めている。
+実 FS の挙動ではない。食い違うと 2 方向あり、片方は穴になる:
+
+| `cfg!` | 実 FS | 何が起きるか |
+| --- | --- | --- |
+| 畳む | 畳まない | 本当は別物の `Foo.rs` / `foo.rs` を 1 つと見なす。**過剰に断るだけ (fail-closed)**。case-sensitive の APFS / WSL の per-directory case sensitivity で起こる |
+| **畳まない** | **畳む** | **同じファイルに 2 つの鍵ができる。**2 人が「互いに素」な行域を同じ実ファイルへ持てる = 競合ゼロが破れる。Linux で case-insensitive なマウント (ext4 の casefold / CIFS / exFAT) を使うと起こる |
+
+今回測った 5 環境では **1 つも食い違わなかった** (macOS = 畳む / 畳む、
+Linux = 畳まない / 畳まない) ので、**現に壊れてはいない**。
+ただし「どのリポジトリでも」を名乗る以上、置き場が変われば踏む。
+`tools/git-portability-probe.sh` は食い違いを検出し、**穴の開く向きのときだけ
+判定を赤にする** (G5)。CI の `probe` ジョブが 3 OS で毎週これを見る。
+
+判定の前に、**`src/lease.rs` の式そのものをソースから読んで照合する**
+(`read_fold_cfg`)。プローブ側に `Windows または macOS` と書き写すと、
+実装が変わった日に**プローブだけが黙って古くなる**ためである
+(CLAUDE.md の「ソースを読む回帰テストは改行を正規化する」に従い、
+CRLF のチェックアウトでも外れないようにしてある)。式が変わっていたら
+G5 は**落とさずに「式が変わっている」と出して降りる** — 写経した想定で
+赤にするのは嘘の赤だからである。
+
+直し方の案 (実装は統合担当へ。`src/` は触っていない):
+`src/lease.rs:240` の `fold_case` を、`cfg!` ではなく
+**台帳のルートで実際に 1 度だけ試した結果** (`Foo` を作って `foo` で開けるか)
+から決める。純関数の `normalize_path_on(raw, win_sep, fold_case)`
+(`src/lease.rs:250`) は既に `fold_case` を引数で受け取っているので、
+**呼び出し側の 1 行だけ**で済む。表で固定しているテスト
+(`src/lease.rs:6958` 三つの OS の正規化規則) は `fold_case` を直接渡す形なので
+影響を受けない。
+
+なお `src/lease.rs:287` は Unicode の `to_lowercase()`、
+`src/history.rs:302` は ASCII 限定の `make_ascii_lowercase()` を使っており、
+**非 ASCII のパスでは台帳の鍵とワークスペース鍵の畳み方が違う**。
+穴ではない (どちらも一貫して同じ側で使われる) が、揃えておくのが安全。
+
+## Windows — CI のジョブを実際に足した
+
+上の「### CI に足すべきジョブの案」は案のままだったので、
+**`.github/workflows/xplat.yml` として入れた**。案との違い:
+
+* **`zai` のビルドが要らない `probe` を毎 push・3 OS で回す。**
+  素の git と python3 だけで動くので 1 ジョブ 1 分前後。
+  `xplat-bench.sh --host-only` は `zai` のフルビルドが要り、
+  3 OS 分では 5 分予算を確実に割るため、そちらは `shapes` として
+  **schedule と手動起動に限った**。
+* **git の版の軸も CI で回す** (`git-matrix` ジョブ、
+  `debian:{bullseye,bookworm,trixie}-slim` のコンテナ = git 2.30 / 2.39 / 2.47)。
+  ここも cargo を 1 度も呼ばない。
+* `test.yml` とは別ワークフローなので、**既存のジョブは 1 秒も遅くならない**。
+
+### Windows について、まだ言えないこと
+
+`tools/windows-check.sh --wine` で Windows バイナリのテストを wine 上で
+実行できるが、**wine は実機 Windows ではない**。とくに *delete pending*
+(最後のハンドルが閉じるまで削除が中間状態に留まり、その間の `create_new` が
+`ACCESS_DENIED (os error 5)` を返す) は wine が忠実に再現しない。
+`lease::lock_contended` のこの分岐を本当に踏ませられるのは
+**CI の `windows-latest` だけ**である。
+
+`.github/workflows/test.yml` の `windows-lease` ジョブが
+`cargo test --bin zai lease::` を実機 Windows で回しているので、
+**単体の経路はすでに CI で毎回検証されている**。
+未検証のまま残っているのは、`tools/anyrepo-prove.sh --shapes` のような
+**シェルのハーネスを Windows の git-bash で通すこと**で、
+これが `xplat.yml` の `shapes` ジョブ (schedule / 手動) の担当である。
+
+### wine で実際に走らせて出たもの (2026-08-12)
+
+`tools/windows-check.sh --wine lease:: region:: conflict:: czero_init::` の実測。
+**226 件成功 / 43 件失敗**。43 件の内訳は 2 種類で、**片方は環境由来、
+もう片方は実装の非対称**である。混ぜてはいけない。
+
+#### (a) 環境由来 — 40 件。**regression ではない**
+
+`features::czero_init::imp::tests::*` の 40 件は、wine のイメージ
+(debian + wine) に **git が入っていない**ために落ちている。Windows バイナリ
+から見える `git.exe` が存在しないので、git を起こすテストは
+**スキップではなく FAILED になる**。
+
+`tools/linux-test.sh` は「git が無いと*無言でスキップ*される」を警告していたが、
+wine 側はもっと質が悪い — **環境由来の赤が本物の赤を埋める**。
+`tools/windows-check.sh` に `warn_no_git_in_wine` を足して、
+走らせる前に何が赤くなるかを名指しするようにした。
+
+#### (b) 実装の非対称 — 3 件。**こちらが本題**
+
+```
+thread 'lease::span_tests::六十四体が同じファイルの違う行を同時に取れる'
+  panicked at src/lease.rs:7797:
+  台帳が壊れた: 台帳を差し替えられません: Access denied. (os error 5)
+```
+
+64 スレッドが取り合ったときにだけ出る。**取り合いの無いテストは
+36/39 が緑**なので、wine の `rename` が壊れているのではなく
+**delete pending の経路にだけ入っている**。
+
+コードの非対称はこうなっている:
+
+| 操作 | 場所 | Windows の `ACCESS_DENIED (os error 5)` を… |
+| --- | --- | --- |
+| ロックの取得 (`create_new`) | `lock_contended` (`src/lease.rs:2981-2987`) | **取り合いとして待つ** (`cfg!(windows) && PermissionDenied`) |
+| 台帳の差し替え (`rename`) | `write_store` (`src/lease.rs:2807-2819`) | **待たない。`台帳を差し替えられません: {e}` で即失敗** |
+
+さらにその文字列は `is_lock_busy` (`src/lease.rs:2781-2783`) が見る
+`LOCK_BUSY` 接頭辞 (`src/lease.rs:200`) を持たないので、
+**呼び出し側の再試行にも乗らない**。`Err(e) => panic!("台帳が壊れた")` へ落ちる。
+
+CLAUDE.md はまさにこの現象を「Windows はファイル削除が *delete pending* を
+経る … 64 体がロックを奪い合うと必ず踏み、**いちばん混んでいるとき =
+いちばん衝突しやすいときにだけ**台帳が使えなくなる」と書いている。
+**その対策がロック取得側にしか入っていない。**
+
+##### 正直に言えないこと
+
+* **実機 Windows で今これが起きているとは言えない。** CI の
+  `windows (lease/instances)` ジョブは `cargo test --bin zai lease::` を
+  windows-latest で回していて、直近の main は **緑**である。
+* wine の NT ファイル意味論は実機と同じではない。`MoveFileEx` の
+  置換が「開かれている相手」に対して何を返すかは実装差が出やすい箇所。
+* したがってこれは「**実機でも踏みうる非対称が構造として残っている**」
+  という指摘であって、「実機が壊れている」という報告ではない。
+
+##### 直し方の案 (`src/` は触っていない。統合担当へ)
+
+`src/lease.rs:2815` の `std::fs::rename` を、`acquire_lock_in` と同じ
+**上限付きの再試行**で包む。判定は既にある `lock_contended`
+(`src/lease.rs:2981`) をそのまま使えば、Windows でだけ待って
+unix では即失敗するという既存の方針と揃う。
+再試行しても駄目だったときだけ `LOCK_BUSY` 接頭辞を付けて返せば、
+`is_lock_busy` を通る呼び出し側の再試行 (`with_store_retry`) にも乗る。
+
+3 件目 (`六十四体が同時に確保してもbusyは出ず勝者は一つ` が
+`busy-deny 62 件 / 2929ms`) は、CLAUDE.md の
+「固定の待ち予算は N が増えれば必ず破綻する」がそのまま出たもの。
+wine ではロック操作 1 回が実機より桁で遅いので `LOCK_WAIT_MS` を使い切る。
+**進捗が観測できる限り待ちを延ばす**という既存の方針を、
+この経路にも適用するのが筋。

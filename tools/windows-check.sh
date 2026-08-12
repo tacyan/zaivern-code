@@ -173,6 +173,32 @@ EOS
 # 出力に出る次の 2 つは**無害**なので気にしないこと:
 #   * "it looks like wine32 is missing"      — 64bit の exe には要らない
 #   * "failed to open ...\\rundll32.exe"      — prefix 初期化時の探索
+# ── wine の中に git が居ないことを**必ず名指しで言う** ────────────────
+#
+# `tools/linux-test.sh` は「git が無いと無言でスキップされる」を警告するが、
+# wine 側はもっと質が悪い: git を要するテストは**スキップではなく赤になる**。
+# 実測で `czero_init::` の **40 件**が「git が無い」だけで FAILED になり、
+# 3 件の本物 (`lease::span_tests` の 64 体) がその中に埋もれた。
+# **環境由来の赤は、regression の赤と見分けが付かないと意味が無い。**
+#
+# wine のイメージは Linux の debian なので、Windows バイナリから見える
+# `git.exe` は最初から存在しない。Git for Windows を wine prefix へ入れるのは
+# このスクリプトの担当ではないので、**入れずに、何が赤くなるかを先に出す**。
+warn_no_git_in_wine() {
+    if docker run --rm --entrypoint sh "$wine_image" \
+        -c 'command -v git >/dev/null 2>&1' >/dev/null 2>&1; then
+        return 0
+    fi
+    cat >&2 <<'EOS'
+!! wine のイメージに git がありません (Windows バイナリからは git.exe も見えません)。
+   git を起こすテストは **スキップではなく FAILED になります**。実測で赤くなるもの:
+     features::czero_init::imp::tests::*   (40 件)
+   これは環境由来なので **regression ではありません**。本物の赤と混ぜないこと。
+   git を要さない経路 (lease:: / instances:: / pathx:: / keybinds:: など) の
+   結果だけが、ここで意味を持ちます。
+EOS
+}
+
 run_with_wine() {
     exe=$1
     shift
@@ -198,6 +224,7 @@ EOS
         exit 1
     fi
     ensure_wine_image
+    warn_no_git_in_wine
     # 実行ファイルの置き場だけを読み取り専用でマウントする。
     dir=$(CDPATH= cd -- "$(dirname -- "$exe")" && pwd)
     base=$(basename -- "$exe")
