@@ -1046,7 +1046,7 @@ fn interleave_collision(
     // 本文は「交錯している持ち主が居る」と分かってから 1 回だけ読む。
     let mut text: Option<Option<String>> = None;
     for (lease, spans, raw) in &seen {
-        if !region::interleaved(touched, spans) {
+        if !region::needs_wall(touched, spans) {
             continue;
         }
         let t = text.get_or_insert_with(|| text_of(rel));
@@ -1431,10 +1431,10 @@ fn deny_text(hits: &[Hit], now: u64) -> String {
         let l = &h.lease;
         let since = crate::instances::humanize_uptime(now.saturating_sub(l.acquired_at));
         let left = crate::instances::humanize_uptime(l.expires_at.saturating_sub(now));
-        // **交錯は「重なる」ではない。** 重なっていないからこそ帯を通って
-        // しまったので、同じ動詞を使うと直し方を取り違える。
+        // **壁が無いのは「重なる」ではない。** 重なっていないからこそ帯を
+        // 通ってしまったので、同じ動詞を使うと直し方を取り違える。
         let verb = if h.bracketed.is_some() {
-            "を挟んでいます"
+            "と壁なしで並んでいます"
         } else {
             "と重なります"
         };
@@ -2151,8 +2151,19 @@ mod tests {
         };
         let pats: Vec<String> = patterns.iter().map(|s| (*s).to_string()).collect();
         let now = lease::now_secs();
+        // **基準フォルダは `repo`。** 素の `try_claim` はプロセスの cwd を見る
+        // ので本文が読めず、壁の判定 (`region::needs_wall`) が fail-closed で
+        // 全部断る。下ごしらえは実際の作業ツリーを起点にすること。
         let got = lease::with_store(&store, |s| {
-            lease::try_claim(s, &holder, &pats, now, lease::DEFAULT_TTL_SECS, &|_| false)
+            lease::try_claim_in(
+                repo,
+                s,
+                &holder,
+                &pats,
+                now,
+                lease::DEFAULT_TTL_SECS,
+                &|_| false,
+            )
         })
         .expect("claim");
         assert!(
@@ -3456,29 +3467,49 @@ mod tests {
                     "離せば直ると読める文面のまま: {text}"
                 );
                 assert!(
-                    text.contains("を挟んでいます"),
+                    text.contains("と壁なしで並んでいます"),
                     "「重なります」のままになっている: {text}"
                 );
             }
             v => panic!("交錯を通してしまった: {v:?}"),
         }
-        // **挟まない行なら従来どおり通る** (常に断るへ倒れていないこと)
+        // **離れた行でも、錨が 1 本も無い本文なら断る。** 0.16.0 まではここが
+        // 通っていたが、削除・挿入が混ざると上下に分かれた組でも `git merge` は
+        // 衝突する (`region::needs_wall` に実測)。
         restage_at(&repo, "src/f.txt", &lines, 200, "far away");
         assert!(
+            matches!(check_staged_in(&repo, &ledger), Verdict::Deny(_)),
+            "錨が無い本文で離れているだけの書き込みを通した"
+        );
+        // **壁があれば通る** (常に断るへ倒れていないこと)。同じ配置のまま、
+        // 境目に一意な行を 2 本だけ植える。
+        let mut walled = lines.clone();
+        for i in [100usize, 150] {
+            walled[i] = format!("UNIQ-{i}");
+        }
+        write(&repo.join("src/f.txt"), &format!("{}\n", walled.join("\n")));
+        assert!(git(&repo, &["add", "-A"]).status.success());
+        assert!(git(&repo, &["commit", "-m", "wall"]).status.success());
+        restage_at(&repo, "src/f.txt", &walled, 200, "far away");
+        assert!(
             matches!(check_staged_in(&repo, &ledger), Verdict::Allow),
-            "挟んでいない書き込みまで断った"
+            "壁があるのに断った"
         );
         std::fs::remove_dir_all(&repo).ok();
         std::fs::remove_dir_all(&ledger).ok();
     }
 
-    /// 交錯していない普通のコミットでは、**本文を 1 バイトも読まない**。
+    /// 本文の読み取りは**ファイルにつき多くても 1 回**。
     ///
     /// 関所は書き込みのたびに走る短命プロセスなので、`anchor_lines`
-    /// (ファイル全体の走査) を毎回払ってはいけない (設計原則 3)。
+    /// (ファイル全体の走査) を持ち主の数だけ払ってはいけない (設計原則 3)。
     /// 時間ではなく**読み取りの呼び出し回数**で固定する。
+    ///
+    /// 0.16.0 まではここが「交錯していなければ 0 回」だった。その門は
+    /// 見逃す (`region::needs_wall` に実測) ので、いまは同じファイルを持つ
+    /// 他人が居れば必ず 1 回読む。**他人が居なければ今も 0 回**。
     #[test]
-    fn 交錯していなければ本文を読まない() {
+    fn 本文はファイルにつき一度だけ読む() {
         let mut s = lease::Store::default();
         let now = lease::now_secs();
         s.leases.push(Lease {
@@ -3502,13 +3533,31 @@ mod tests {
                 end: 100,
             }]),
         }];
+        // 同じファイルに他人の域が 2 本あっても、読むのは 1 回だけ。
         let reads = std::cell::Cell::new(0u32);
         let hits = collisions(&s, Path::new("/w/me"), &changes, now, &|_| false, &|_| {
             reads.set(reads.get() + 1);
+            // 壁 (200 行目までのどこかで唯一の行) がある本文を返す
+            Some((1..=400).map(|i| format!("line {i}\n")).collect::<String>())
+        });
+        assert!(hits.is_empty(), "壁があるのに止めた: {hits:?}");
+        assert_eq!(reads.get(), 1, "同じファイルを持ち主の数だけ読んでいる");
+
+        // **他人が同じファイルを持っていなければ 0 回のまま。**
+        let other = vec![StagedChange {
+            path: "src/g.rs".into(),
+            touched: Touched::Lines(vec![Span {
+                start: 100,
+                end: 100,
+            }]),
+        }];
+        let reads2 = std::cell::Cell::new(0u32);
+        let hits2 = collisions(&s, Path::new("/w/me"), &other, now, &|_| false, &|_| {
+            reads2.set(reads2.get() + 1);
             None
         });
-        assert!(hits.is_empty(), "挟んでいないのに止めた: {hits:?}");
-        assert_eq!(reads.get(), 0, "交錯していないのに本文を読んだ");
+        assert!(hits2.is_empty(), "別のファイルなのに止めた: {hits2:?}");
+        assert_eq!(reads2.get(), 0, "他人が持っていないファイルの本文を読んだ");
     }
 
     /// リポジトリの中の綴りでリポジトリの外へ書く経路。
