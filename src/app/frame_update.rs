@@ -101,6 +101,18 @@ impl ZaivernApp {
     /// 呼び出し側のパニックガードが囲うので、ここからの panic は
     /// アプリ終了ではなく「フレームのスキップ」になる。
     pub(super) fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // **IME の確定文字列が `Text` としても届く環境の二重入力を潰す。**
+        // 同フレームの `Ime::Commit("日本語")` と `Text("日本語")` を両方
+        // 通すと、コマンドパレットの検索欄も検索置換もコードエディタ本体も
+        // `"日本語日本語"` を受け取る (端末は `translate_input` の規則 4 で
+        // 昔から潰していたが、エディタ側にだけ防御が無かった)。
+        // **フレームの最初でしか落とせない** — 入力欄を 1 つでも描いた後では
+        // `TextEdit` が両方食べ終わっている。いま `update_impl` の先頭にある
+        // `frame_error_banner_ui` に入力欄は無いが、「どのパネルより前」を
+        // 位置で保証しておくほうが後から壊れない。
+        // 非空の Commit が無いフレームでは 1 バイトも触らないので、
+        // IME を使わない入力への影響はゼロ。
+        crate::keybinds::drop_duplicate_ime_text(ctx);
         // 壊れたネイティブ全画面の検知と疑似フルスクリーンへの救出 (macOS)
         self.fullscreen_guard(ctx);
         // 内部エラーの警告バナーは**最初に**描く。フレームの途中で panic しても
@@ -139,7 +151,6 @@ impl ZaivernApp {
         // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
         // (ターミナルが PTY へ転送してしまうため)
         self.poll_voice(ctx);
-
         self.handle_shortcuts(ctx);
         // which-key が拾う打鍵 (⌫ / ? / 番号) は **パネルを描く前に**取る。
         // ポップアップ自身は最後に描くが、そのころには本文の TextEdit が
