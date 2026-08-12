@@ -2406,6 +2406,35 @@ fn guide_section(ui: &mut egui::Ui, theme: &crate::theme::Theme, title: &str) {
     ui.separator();
 }
 
+/// 行の 1 列を、**指定した幅を必ず占有して**描く。
+///
+/// `ui.add_sized` を使ってはいけない。あれは中身を
+/// `Layout::centered_and_justified` で置くので、
+/// (1) 見出しが列の**中央**から始まり、行ごとに開始 x がばらつく
+/// (2) 実際に確保される幅が中身に縮むので、**次の列の開始位置が
+///     見出しの長さで動く** — 打鍵欄が 1 行ごとに右へずれて階段になる。
+/// 全機能ガイドの索引が丸ごとその見た目になっていた。
+///
+/// `set_min_width` で下限を張ると、中身が短くても列幅は縮まない。
+fn guide_col<R>(
+    ui: &mut egui::Ui,
+    w: f32,
+    h: f32,
+    align_right: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(egui::vec2(w, h), layout, |ui| {
+        ui.set_min_width(w);
+        add(ui)
+    })
+    .inner
+}
+
 /// 章 1 行。押されたら `true` (その章の再生を始める)。
 fn chapter_row(
     ui: &mut egui::Ui,
@@ -2419,36 +2448,31 @@ fn chapter_row(
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
     let mut clicked = false;
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [cols.icon, 18.0],
-            egui::Label::new(egui::RichText::new(progress_mark(done, total)).color(
-                if done >= total {
+        guide_col(ui, cols.icon, 18.0, false, |ui| {
+            ui.label(
+                egui::RichText::new(progress_mark(done, total)).color(if done >= total {
                     theme.ok
                 } else {
                     theme.text_dim
-                },
-            )),
-        );
-        if ui
-            .add_sized(
-                [cols.label, 20.0],
-                egui::Button::new(egui::RichText::new(shown).color(theme.text)).frame(false),
-            )
-            .on_hover_text(full.as_str())
-            .clicked()
-        {
-            clicked = true;
-        }
-        if cols.keys > 0.0 {
-            ui.add_sized(
-                [cols.keys, 18.0],
-                egui::Label::new(
-                    egui::RichText::new(format!("{done}/{total}"))
-                        .small()
-                        .color(theme.text_dim),
-                )
-                .truncate(),
+                }),
             );
+        });
+        clicked = guide_col(ui, cols.label, 20.0, false, |ui| {
+            ui.add(egui::Button::new(egui::RichText::new(shown).color(theme.text)).frame(false))
+                .on_hover_text(full.as_str())
+                .clicked()
+        });
+        if cols.keys > 0.0 {
+            guide_col(ui, cols.keys, 18.0, true, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{done}/{total}"))
+                            .small()
+                            .color(theme.text_dim),
+                    )
+                    .truncate(),
+                );
+            });
         }
     });
     clicked
@@ -2465,34 +2489,35 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
     };
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [cols.icon, 16.0],
-            egui::Label::new(egui::RichText::new(r.icon.as_str()).small()),
-        );
-        ui.add_sized(
-            [cols.label, 16.0],
-            egui::Label::new(egui::RichText::new(shown).small().color(
-                // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
-                if r.kind == RowKind::Feature {
-                    theme.text
-                } else {
-                    theme.text_dim
-                },
-            ))
-            .truncate(),
-        )
-        .on_hover_text(full.as_str());
-        if cols.keys > 0.0 && !r.keys.is_empty() {
-            ui.add_sized(
-                [cols.keys, 16.0],
-                egui::Label::new(
-                    egui::RichText::new(r.keys.as_str())
-                        .small()
-                        .monospace()
-                        .color(theme.text_dim),
-                )
+        guide_col(ui, cols.icon, 16.0, false, |ui| {
+            ui.label(egui::RichText::new(r.icon.as_str()).small());
+        });
+        guide_col(ui, cols.label, 16.0, false, |ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(shown).small().color(
+                    // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
+                    if r.kind == RowKind::Feature {
+                        theme.text
+                    } else {
+                        theme.text_dim
+                    },
+                ))
                 .truncate(),
-            );
+            )
+            .on_hover_text(full.as_str());
+        });
+        if cols.keys > 0.0 && !r.keys.is_empty() {
+            guide_col(ui, cols.keys, 16.0, true, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(r.keys.as_str())
+                            .small()
+                            .monospace()
+                            .color(theme.text_dim),
+                    )
+                    .truncate(),
+                );
+            });
         }
     });
 }
@@ -2514,6 +2539,115 @@ mod tests {
             && r.min.y >= screen.min.y - 0.01
             && r.max.x <= screen.max.x + 0.01
             && r.max.y <= screen.max.y + 0.01
+    }
+
+    // ── 全機能ガイドの行揃え ──
+
+    /// 索引の行は **列で揃う**。
+    ///
+    /// 以前は各列を `ui.add_sized` で置いていたため、
+    /// (1) 見出しが列の中央から始まり (2) 確保幅が中身に縮んで
+    /// **打鍵欄の開始 x が見出しの長さで動いた**。実画面では索引全体が
+    /// 階段状にずれて見えた。ここは「同じ列の文字は同じ x から始まる」を
+    /// 実際に描いて確かめる (純関数の `row_cols` だけでは捕まえられない —
+    /// 幅の計算は最初から正しく、崩していたのは配置のほうだった)。
+    #[test]
+    fn 全機能ガイドの索引は列で揃う() {
+        use egui::epaint::Shape;
+        let theme = crate::theme::all()[0].clone();
+        // 見出しの長さがばらばらな行を並べる (長さで位置が動くなら必ず出る)。
+        let rows: Vec<IndexRow> = [
+            ("保存", "save", "⌘S"),
+            ("名前を付けて保存", "save_as", "⇧⌘S"),
+            ("タブを閉じる", "close_tab", "⌘W"),
+            ("コックピットの表示切替", "toggle_cockpit", "⇧⌘C"),
+            ("新しいウィンドウ", "new_window", "⇧⌘N"),
+        ]
+        .iter()
+        .map(|(label, id, keys)| IndexRow {
+            icon: "·".into(),
+            label: (*label).into(),
+            note: String::new(),
+            id: (*id).into(),
+            keys: (*keys).into(),
+            kind: RowKind::Action,
+        })
+        .collect();
+
+        // 極端な幅でも揃うこと (狭いと列幅の配分そのものが変わる)。
+        for w in [520.0_f32, 900.0, 1600.0] {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 600.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for r in &rows {
+                        index_row_ui(ui, &theme, r);
+                    }
+                });
+            });
+
+            // 描かれた文字の (文字列, 左端 x) を集める。
+            let mut drawn: Vec<(String, f32)> = Vec::new();
+            for s in &out.shapes {
+                if let Shape::Text(t) = &s.shape {
+                    drawn.push((t.galley.text().to_string(), t.pos.x));
+                }
+            }
+            assert!(!drawn.is_empty(), "{w}px: 何も描かれていない");
+
+            // 見出し列: すべて同じ x から始まる。
+            let label_xs: Vec<f32> = rows
+                .iter()
+                .map(|r| {
+                    let head: String = r.label.chars().take(2).collect();
+                    drawn
+                        .iter()
+                        .find(|(t, _)| t.starts_with(&head))
+                        .unwrap_or_else(|| panic!("{w}px: 見出しが見つからない: {}", r.label))
+                        .1
+                })
+                .collect();
+            let (lo, hi) = (
+                label_xs.iter().cloned().fold(f32::MAX, f32::min),
+                label_xs.iter().cloned().fold(f32::MIN, f32::max),
+            );
+            assert!(
+                hi - lo < 1.0,
+                "{w}px: 見出しの開始 x がばらついている ({lo}..{hi}) = 列で揃っていない\n{label_xs:?}"
+            );
+
+            // 打鍵列: すべて同じ右端で終わる (右寄せなので終端を見る)。
+            let key_ends: Vec<f32> = rows
+                .iter()
+                .filter_map(|r| {
+                    drawn
+                        .iter()
+                        .find(|(t, _)| t == &r.keys)
+                        .map(|(t, x)| x + t.chars().count() as f32 * 0.0)
+                })
+                .collect();
+            if key_ends.len() == rows.len() {
+                // 打鍵の長さが違うので開始 x は揃わないが、**長い見出しの行ほど
+                // 右へずれる**という以前の壊れ方は起きない: 見出しが最長の行と
+                // 最短の行で、打鍵の開始 x の差が列幅を超えないこと。
+                let (klo, khi) = (
+                    key_ends.iter().cloned().fold(f32::MAX, f32::min),
+                    key_ends.iter().cloned().fold(f32::MIN, f32::max),
+                );
+                let cols = row_cols(w, 96.0);
+                assert!(
+                    khi - klo <= cols.keys,
+                    "{w}px: 打鍵欄が見出しの長さで動いている ({klo}..{khi}, 列幅 {})",
+                    cols.keys
+                );
+            }
+        }
     }
 
     // ── 手順表の整合性 ──
