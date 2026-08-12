@@ -95,12 +95,32 @@ fn housekeeping_backs_off_with_visibility() {
         ..s
     };
     assert_eq!(idle_repaint_ms(s), Some(IDLE_HIDDEN_MS));
-    // タイマ (自動保存・interval プラグイン) だけでも同じ扱い
+    // タイマ (自動保存・interval プラグイン) は**その期限まで**寝る。
+    // 見張りが UI に無いなら、家事の刻み (2 秒) に丸める理由が無い。
     let s = IdleSignals {
-        timers_due: true,
+        timer_due_in_ms: Some(900_000),
+        ..idle()
+    };
+    assert_eq!(idle_repaint_ms(s), Some(900_000));
+    // 期限が過ぎていても忙しいループにしない (下限で頭打ち)
+    let s = IdleSignals {
+        timer_due_in_ms: Some(0),
+        ..idle()
+    };
+    assert_eq!(idle_repaint_ms(s), Some(50));
+    // 見張りが UI 側にある環境では、近いほうを採る
+    let s = IdleSignals {
+        watching_files: true,
+        timer_due_in_ms: Some(900_000),
         ..idle()
     };
     assert_eq!(idle_repaint_ms(s), Some(IDLE_HOUSEKEEP_MS));
+    let s = IdleSignals {
+        watching_files: true,
+        timer_due_in_ms: Some(300),
+        ..idle()
+    };
+    assert_eq!(idle_repaint_ms(s), Some(300));
 }
 
 /// 実際に `egui::Context` を回して「予約されたか」を見る。
@@ -211,7 +231,9 @@ fn priority_order_is_stable() {
         awaiting: true,
         agents_running: true,
         watching_files: true,
-        timers_due: true,
+        // 遠い期限にしておく (近いと家事の刻みより短くなり、
+        // 「優先順位」ではなく「近いほうを採る」の検査になってしまう)
+        timer_due_in_ms: Some(900_000),
         focused: true,
         visible: true,
     };
