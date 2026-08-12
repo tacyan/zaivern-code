@@ -3786,4 +3786,155 @@ mod tests {
         assert!(w.roll_day_if_needed(day0 + Duration::from_secs(quota::DAY_SECS)));
         assert!(w.token_scan().today.is_empty());
     }
+
+    // ── 鎖① をエンドツーエンドで測るための入口 (tools/coordinator-bench.sh) ──
+
+    /// 配る前の分割 (鎖①) を**プロセスの外から**回すための入口。
+    /// **通常のテスト実行では環境変数が無いので、何もせずに返る。**
+    ///
+    /// `coordinator` は GUI からしか到達せず、テストバイナリには `zai` の CLI
+    /// 入口が無い。そこで [`crate::union`] の `merge_driver_helper` と同じ形で
+    /// 自分自身を呼ぶ。**位置引数は libtest がテスト名の絞り込みとして食う**ので、
+    /// 受け渡しは全て環境変数で行う。
+    ///
+    /// * `ZV_COORD_TASKS` … 担当表のパス。1 行 = `<ラベル>\t<パターン>[,…]`
+    /// * `ZV_COORD_MODE`  … `naive` (分割を通さない) / `coord` (通す)
+    /// * `ZV_COORD_AGENTS`… セッション数 (既定 = タスク数)
+    /// * `ZV_COORD_VERBOSE` … 立てると [`overlap_reason`] の文面も `# ` 付きで出す
+    ///
+    /// 出力は 1 行 1 タスクの
+    /// `task\t<ラベル>\t<セッション>\t<ok|split|refused>\t<配ったパターン…>`
+    /// と、集計 1 行。**配ったものをそのまま出す**ので、ハーネス側が
+    /// 「本当に互いに素なものを配ったか」を独立に検査できる (§3.11.5 の教訓)。
+    ///
+    /// `naive` は「同じプロセス起動・同じ解析・同じ出力で、判定だけしない」
+    /// 空回しでもあるので、**ハーネスの費用はこの段との差で引ける**。
+    #[test]
+    fn assign_helper() {
+        let Ok(path) = std::env::var("ZV_COORD_TASKS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mode = std::env::var("ZV_COORD_MODE").unwrap_or_else(|_| "coord".to_string());
+        let verbose = std::env::var("ZV_COORD_VERBOSE").is_ok();
+
+        let mut specs: Vec<(String, Vec<String>)> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            let (id, rest) = line.split_once('\t').unwrap_or((line, ""));
+            let pats: Vec<String> = rest
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if pats.is_empty() {
+                continue;
+            }
+            specs.push((id.to_string(), pats));
+        }
+        let agents: u64 = std::env::var("ZV_COORD_AGENTS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| specs.len().max(1) as u64);
+
+        let mut out = String::new();
+        let (mut full, mut split_n, mut refused) = (0u32, 0u32, 0u32);
+        let (mut granted, mut dropped) = (0u32, 0u32);
+
+        if mode == "naive" {
+            for (i, (id, pats)) in specs.iter().enumerate() {
+                let s = (i as u64 % agents) + 1;
+                full += 1;
+                granted += pats.len() as u32;
+                out.push_str(&format!("task\t{id}\t{s}\tok\t{}\n", pats.join(" ")));
+            }
+        } else {
+            let mut c = Coordinator::new();
+            let now = Instant::now();
+            let ids: Vec<TaskId> = specs
+                .iter()
+                .map(|(id, pats)| {
+                    let refs: Vec<&str> = pats.iter().map(|s| s.as_str()).collect();
+                    c.add_task_with_files(id, "", &[], &refs, now)
+                })
+                .collect();
+            for (i, tid) in ids.iter().enumerate() {
+                let s = (i as u64 % agents) + 1;
+                let want = specs[i].1.len() as u32;
+                let cand = vec![SessionInfo::new(s, SessionState::Idle, &[])];
+                if c.try_assign(*tid, &cand, now).is_ok() {
+                    full += 1;
+                    granted += want;
+                    out.push_str(&format!(
+                        "task\t{}\t{s}\tok\t{}\n",
+                        specs[i].0,
+                        specs[i].1.join(" ")
+                    ));
+                    continue;
+                }
+                // 断る前に「重ならない部分だけ」を出す。**文面 (overlap_reason)
+                // も必ず通す** — 出荷経路 (GUI) と同じ順序で呼ばないと、
+                // 測っているものが違ってしまう。
+                let reason = c.overlap_reason_for(*tid, s);
+                let (now_ok, serial) = c.overlap_split_for(*tid, s);
+                if !serial.is_empty() {
+                    out.push_str(&format!("serial\t{}\t{}\n", specs[i].0, serial.join(" ")));
+                }
+                if verbose {
+                    for l in reason.iter().flat_map(|r| r.lines()) {
+                        out.push_str(&format!("# {l}\n"));
+                    }
+                }
+                let ok = if now_ok.is_empty() {
+                    false
+                } else {
+                    let refs: Vec<&str> = now_ok.iter().map(|s| s.as_str()).collect();
+                    c.set_task_files(*tid, &refs);
+                    c.try_assign(*tid, &cand, now).is_ok()
+                };
+                if ok {
+                    split_n += 1;
+                    granted += now_ok.len() as u32;
+                    dropped += want.saturating_sub(now_ok.len() as u32);
+                    out.push_str(&format!(
+                        "task\t{}\t{s}\tsplit\t{}\n",
+                        specs[i].0,
+                        now_ok.join(" ")
+                    ));
+                } else {
+                    refused += 1;
+                    dropped += want;
+                    out.push_str(&format!("task\t{}\t{s}\trefused\t\n", specs[i].0));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "summary\tfull={full}\tsplit={split_n}\trefused={refused}\tgranted={granted}\tdropped={dropped}\n"
+        ));
+        // **`print!` を使わない。** libtest は `print!` 系だけを横取りするので、
+        // `process::exit` すると捕まえられた出力ごと消える。fd 1 へ直接書く。
+        use std::io::Write;
+        let mut so = std::io::stdout().lock();
+        let _ = so.write_all(out.as_bytes());
+        let _ = so.flush();
+        std::process::exit(0);
+    }
+
+    /// ハーネスが `--exact` に渡す名前が、実際のモジュール位置とずれていないこと。
+    /// **ずれるとハーネスは「0 件のテストが走った」で静かに緑になる。**
+    #[test]
+    fn assign_helper_name_matches_harness() {
+        let m = module_path!();
+        let rel = m.split_once("::").map(|(_, r)| r).unwrap_or(m);
+        let want = format!("{rel}::assign_helper");
+        let sh = include_str!("../tools/coordinator-bench.sh").replace("\r\n", "\n");
+        assert!(
+            sh.contains(&want),
+            "tools/coordinator-bench.sh が {want} を指していません"
+        );
+    }
 }
