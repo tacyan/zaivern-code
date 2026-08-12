@@ -177,6 +177,25 @@ fn severity_word(sev: u8) -> &'static str {
 }
 
 /// severity ごとの件数 (トグルのバッジ用)。添字 0..3 = severity 1..4。
+/// ファイル衝突の見張りへ渡す相手を選ぶ。**素のシェルは除く。**
+///
+/// 見張りは「同じフォルダに 2 体以上」で走り出すので、Shell を 1 体と
+/// 数えると **開いただけで未コミットの全ファイルが取り合いとして出る**
+/// (実際にそう報告された: Shell 起動だけで 17 件)。人が 1 人で叩いている
+/// シェルは「後から衝突を発見させる」相手ではない。
+///
+/// `git status` は**どのエージェントが触ったかを区別できない**ので、
+/// 同居している全員に同じファイル集合が割り当たる。だからこそ
+/// 「誰を同居者と数えるか」がそのまま画面に出る数字になる。
+pub fn conflict_watch_rows<'a>(
+    sessions: impl Iterator<Item = (u64, &'a str, PathBuf, bool)>,
+) -> Vec<(u64, PathBuf, bool)> {
+    sessions
+        .filter(|(_, cmd, _, _)| !agents::is_plain_shell(cmd))
+        .map(|(id, _, cwd, running)| (id, cwd, running))
+        .collect()
+}
+
 pub fn problem_counts(items: &[ProblemItem]) -> [usize; 4] {
     let mut out = [0usize; 4];
     for it in items {
@@ -17671,12 +17690,12 @@ impl ZaivernApp {
     /// 衝突の見張りへ現在のエージェント (ID・作業ツリー・生死) を渡す。
     /// Cockpit / 看板を描くフレームでだけ呼ぶ (閉じている間は 1 命令も走らない)。
     fn sync_conflicts(&mut self) {
-        let live: Vec<(u64, PathBuf, bool)> = self
-            .agents
-            .sessions
-            .iter()
-            .map(|s| (s.id, s.cwd.clone(), s.running()))
-            .collect();
+        let live = conflict_watch_rows(
+            self.agents
+                .sessions
+                .iter()
+                .map(|s| (s.id, s.command.as_str(), s.cwd.clone(), s.running())),
+        );
         self.conflicts.update(&live);
         // 🛰 レーダーは**隔離済み**の worktree 同士を見る (同居は上の担当)。
         // ディスク使用量は窓を開けている間だけ測る (閉じていればゼロコスト)。
@@ -17780,10 +17799,17 @@ impl ZaivernApp {
     /// 衝突バッジのツールチップ (ファイル名と、取り合っている相手の名前)。
     fn conflict_tooltip(&self) -> String {
         let rep = self.conflicts.report();
-        let mut lines = vec![trf(
-            "{n} 体が同じ作業ツリーで同じファイルを触っています",
-            &[("n", rep.agents().len().to_string())],
-        )];
+        // **言い切らない。** `git status` はどのエージェントが触ったかを
+        // 区別しないので、ここで分かるのは「同居している N 体」と
+        // 「そのフォルダの未コミット M ファイル」だけ。実際に誰が書いたかは
+        // 分からないので、全員を取り合いの候補として出している。
+        let mut lines = vec![
+            trf(
+                "{n} 体が同じ作業ツリーに居ます (worktree で隔離されていません)",
+                &[("n", rep.agents().len().to_string())],
+            ),
+            tr("git は誰が触ったかを区別できないため、下のファイルは全員の取り合い候補です"),
+        ];
         for f in rep.files.iter().take(CONFLICT_ROWS_MAX) {
             let who: Vec<String> = f
                 .agents
@@ -17985,7 +18011,7 @@ impl ZaivernApp {
                         RichText::new(if compact {
                             format!("⚠{conflict_n}")
                         } else {
-                            trf("⚠ {n} ファイル競合", &[("n", conflict_n.to_string())])
+                            trf("⚠ {n} ファイル取り合い", &[("n", conflict_n.to_string())])
                         })
                         .color(theme.warn)
                         .strong(),
@@ -31296,6 +31322,10 @@ impl ZaivernApp {
     fn apply_tutorial_action(&mut self, act: tutorial::TutorialAction, ctx: &egui::Context) {
         use tutorial::TutorialAction as TA;
         match act {
+            // 全機能ガイドで選ばれた機能を、パレットから選んだのと**同じ経路**で
+            // 実行する。ここで別経路を作ると、ガイド経由だけ挙動が違う機能が
+            // 生まれる (そして誰も気付かない)。
+            TA::RunFeature(id) => self.apply_cmd(Cmd::Feature(id), ctx),
             TA::OpenSidebar(t) => {
                 self.sidebar_open = true;
                 self.sidebar_tab = sidebar_tab_for(t);
@@ -37910,6 +37940,40 @@ mod tests {
 #[cfg(test)]
 mod wiring_tests {
     use super::*;
+
+    /// **Shell を開いただけで「取り合い」が出ない。**
+    ///
+    /// 見張り (`worktree::ConflictWatch`) は「同じフォルダに 2 体以上」で
+    /// 走り出す。素のシェルを 1 体と数えると、Shell を開いた瞬間に
+    /// 未コミットの全ファイルが取り合いとして出る (17 件出たと報告された)。
+    #[test]
+    fn 素のシェルは衝突の見張りに数えない() {
+        let cwd = std::path::PathBuf::from("/w");
+        let rows = |v: Vec<(u64, &'static str)>| {
+            conflict_watch_rows(v.into_iter().map(|(id, cmd)| (id, cmd, cwd.clone(), true)))
+        };
+
+        // エージェント 1 体 + Shell → 見張りへ渡るのは 1 体だけ = 群れができない
+        let live = rows(vec![(1, "claude"), (2, "")]);
+        assert_eq!(live.len(), 1, "Shell が数えられている: {live:?}");
+        assert!(
+            crate::worktree::shared_cwd_groups(&live).is_empty(),
+            "1 体しか居ないのに見張りが走る"
+        );
+
+        // エージェント 2 体 → ここは今までどおり見張る
+        let live = rows(vec![(1, "claude"), (2, "codex --yolo"), (3, "zsh")]);
+        assert_eq!(live.len(), 2, "エージェントまで落としている: {live:?}");
+        assert_eq!(
+            crate::worktree::shared_cwd_groups(&live).len(),
+            1,
+            "同居 2 体を見張っていない"
+        );
+
+        // Shell だけ何枚開いても静か
+        let live = rows(vec![(1, ""), (2, "bash"), (3, "pwsh")]);
+        assert!(live.is_empty(), "Shell だけなのに見張っている: {live:?}");
+    }
     use crate::coordinator::SessionState as C;
     use crate::supervisor::SessionState as S;
 

@@ -1530,6 +1530,46 @@ pub fn spec_for_command(command: &str) -> Option<&'static AgentSpec> {
     spec_for_bin(head)
 }
 
+/// **利用者が自分で叩く素のシェル**か (= 並列エージェントではない)。
+///
+/// 「Shell」プリセットは空コマンドで起動する (既定のシェルに任せる) ので、
+/// 空文字列もここに入る。
+///
+/// ## なぜこの判定が要るか
+/// ファイル衝突の見張り ([`crate::worktree::ConflictWatch`]) は
+/// 「同じフォルダに 2 体以上」を起点に走る。素のシェルを 1 体と数えると、
+/// **Shell を開いただけで未コミットの全ファイルが「競合」として出る**
+/// (実際にそう報告された: Shell 起動だけで 17 ファイル競合)。
+/// 人が 1 人で叩いているシェルは「後から衝突を発見させる」相手ではない。
+///
+/// 判定はコマンドの先頭トークンの実行ファイル名だけを見る。
+/// 引数 (`-lc "..."` 等) は見ない — 何を打つかは事前に分からないし、
+/// 分かったところで人の操作は並列エージェントではない。
+pub fn is_plain_shell(command: &str) -> bool {
+    let Some(first) = command.split_whitespace().next() else {
+        return true; // 空 = 「Shell」プリセット (既定のシェルに任せる)
+    };
+    let head = basename(first);
+    // 拡張子付き (Windows の cmd.exe / powershell.exe) も同じ扱いにする。
+    let stem = head.rsplit_once('.').map_or(head, |(a, _)| a);
+    matches!(
+        stem,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ksh"
+            | "tcsh"
+            | "csh"
+            | "nu"
+            | "elvish"
+            | "xonsh"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+    )
+}
+
 /// 実行ファイル名(パス無し)からカタログ定義を引く。
 /// `antigravity` や `antigravity-cli` などのエイリアス名も正しく吸収する。
 pub fn spec_for_bin(bin: &str) -> Option<&'static AgentSpec> {
@@ -4286,6 +4326,46 @@ mod tests {
 
     // ---- カタログ (AgentSpec) ----
     use super::{command_is_bypass, spec_for_bin, spec_for_command, AGENT_CATALOG};
+
+    /// 素のシェルとエージェントを見分ける。
+    ///
+    /// **これを間違えると画面の数字が嘘になる**: Shell を同居者と数えた版では、
+    /// Shell を開いただけで未コミットの全ファイルが「競合」として出ていた。
+    #[test]
+    fn 素のシェルとエージェントを見分ける() {
+        for cmd in [
+            "",    // 「Shell」プリセット (既定のシェルに任せる)
+            "   ", // 空白だけも同じ
+            "bash",
+            "zsh -l",
+            "/bin/sh",
+            "/usr/local/bin/fish",
+            "pwsh -NoLogo",
+            "powershell.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+            "nu",
+        ] {
+            assert!(super::is_plain_shell(cmd), "素のシェルのはず: {cmd:?}");
+        }
+        for cmd in [
+            "claude",
+            "claude --model opus",
+            "/usr/local/bin/claude",
+            "codex",
+            "gemini",
+            // シェル**経由で**エージェントを起こす形は「素のシェル」ではない…
+            // わけではない: 先頭がシェルなら人が叩いている可能性のほうが高いので
+            // 素のシェル扱いにする。取りこぼす側 (false negative) に倒すのは、
+            // 誤った警報のほうが害が大きいため。
+            "npm run agent",
+            "cargo run",
+        ] {
+            assert!(
+                !super::is_plain_shell(cmd),
+                "素のシェルではないはず: {cmd:?}"
+            );
+        }
+    }
 
     #[test]
     fn catalog_lookup_by_bare_name() {
