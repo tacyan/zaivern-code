@@ -2465,6 +2465,74 @@ mod tests {
         }
     }
 
+    // ── まとめ読み (純関数) ────────────────────────────────────────
+
+    /// `git cat-file --batch` の出力を割る表。
+    ///
+    /// **ここが壊れると、錨が全部空になって静かに全部断る**方向へ倒れる
+    /// (fail-closed なので気付きにくい)。中身は入力の綴りではなく OID を
+    /// 見出しに持つので、**入力順で突き合わせる**ことまで固定する。
+    #[test]
+    fn まとめ読みの出力を割る表() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        // 見つかった 2 件
+        let raw = format!("{oid} blob 6\nhello\n\n{oid} blob 4\nabc\n\n");
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let got = parse_cat_file_batch(&paths, raw.as_bytes());
+        assert_eq!(got.get("a.rs").map(String::as_str), Some("hello\n"));
+        assert_eq!(got.get("b.rs").map(String::as_str), Some("abc\n"));
+
+        // 真ん中が missing — **中身が続かない**ので、後ろがずれないこと
+        let raw2 = format!("{oid} blob 3\nab\n\nHEAD:x missing\n{oid} blob 3\ncd\n\n");
+        let p2 = vec!["a".to_string(), "x".to_string(), "c".to_string()];
+        let got2 = parse_cat_file_batch(&p2, raw2.as_bytes());
+        assert_eq!(got2.get("a").map(String::as_str), Some("ab\n"));
+        assert_eq!(got2.get("x"), None, "missing を中身として拾った");
+        assert_eq!(
+            got2.get("c").map(String::as_str),
+            Some("cd\n"),
+            "missing の後ろがずれている"
+        );
+
+        // 空の入力 / 空の出力 / 途中で切れた出力 — どれも落ちない
+        assert!(parse_cat_file_batch(&[], b"").is_empty());
+        assert!(parse_cat_file_batch(&paths, b"").is_empty());
+        assert!(parse_cat_file_batch(&paths, format!("{oid} blob 99\nshort").as_bytes())
+            .get("a.rs")
+            .is_some_and(|v| v == "short"));
+
+        // 大きすぎるものは**入れない** (= 錨が空 = fail-closed)
+        let big = format!("{oid} blob {}\n", MAX_BASE_TEXT + 1);
+        let mut raw3 = big.into_bytes();
+        raw3.extend(std::iter::repeat_n(b'x', MAX_BASE_TEXT + 1));
+        raw3.push(b'\n');
+        assert!(
+            parse_cat_file_batch(&["big.bin".to_string()], &raw3).is_empty(),
+            "上限を超えた本文を読み込んでいる"
+        );
+
+        // 2 人以上が触ったファイルだけを対象にする
+        let br = |name: &str, paths: &[&str]| BranchRegions {
+            branch: name.to_string(),
+            regions: paths
+                .iter()
+                .map(|p| Region {
+                    path: (*p).to_string(),
+                    span: Some(Span { start: 1, end: 2 }),
+                    anchor: region::Anchor::default(),
+                })
+                .collect(),
+            whole: 0,
+            note: None,
+        };
+        assert_eq!(
+            multi_owner_paths(&[br("a", &["x.rs", "y.rs"]), br("b", &["y.rs", "z.rs"])]),
+            vec!["y.rs".to_string()]
+        );
+        // 同じ枝が同じパスを 2 回持っていても 1 人と数える
+        assert!(multi_owner_paths(&[br("a", &["x.rs", "x.rs"])]).is_empty());
+    }
+
     // ── 差分 → 行域 (純関数) ──────────────────────────────────────
 
     #[test]
