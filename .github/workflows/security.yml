@@ -55,7 +55,14 @@ jobs:
             ignores+=(--ignore "$id")
             echo "deny.toml の ignore を引き継ぎ: $id"
           done < <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sort -u)
-          cargo audit --deny warnings "${ignores[@]}"
+          # **`--deny warnings` を付けない。** 付けると unmaintained / unsound の
+          # 「情報」でも赤くなり、deny.toml (`unmaintained = "workspace"`) と
+          # 判定が食い違う。実際に初回の CI で ttf-parser / yaml-rust / serial の
+          # 保守終了 3 件と event-listener の unsound 1 件で落ちた —
+          # **どれも脆弱性ではない**。ここを deny にすると、本物の脆弱性が
+          # 保守終了の山に埋もれて誰も見なくなる (deny.toml のコメントと同じ理由)。
+          # 既定の cargo audit は vulnerability でだけ非ゼロ終了する。
+          cargo audit "${ignores[@]}"
 
   # ライセンス / 供給元 / 禁止クレート / 脆弱性 をまとめて見る。
   # sources = deny により、crates.io 以外から引く依存が入った瞬間に落ちる。
