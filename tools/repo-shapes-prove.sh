@@ -373,7 +373,9 @@ refusal() {
     name=$1; d=$2
     want "$name" || return 0
     if "$zai" czero init --repo "$d" >"$work/o" 2>&1; then init_rc=0; else init_rc=$?; fi
-    said=$(head -c 400 "$work/o" | tr '\n' ' ')
+    # **出力を切り詰めない。** 非 git / bare は 1 行目で断るが、読み取り専用は
+    # 段を全部出したあとの自己検査で理由を言うので、先頭だけ見ると取り逃す。
+    said=$(tr '\n' ' ' < "$work/o")
     # doctor は**エラーにせず説明する**こと (診断まで死ぬと直し方が判らない)。
     if "$zai" czero doctor --repo "$d" >/dev/null 2>&1; then doc_rc=0; else doc_rc=$?; fi
     # 台帳だけが黙って動いてしまわないこと。
@@ -383,6 +385,7 @@ refusal() {
     case "$said" in
         *bare*) reason=bare ;;
         *"git リポジトリではありません"*) reason=nongit ;;
+        *"書けない場所があります"*) reason=readonly ;;
         *) case "$said" in *[!\ ]*) reason=other ;; esac ;;
     esac
     record "$name" "init=$init_rc($reason)" "doctor=$doc_rc" "claim=$claim" "-"

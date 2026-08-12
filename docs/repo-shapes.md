@@ -58,7 +58,7 @@ hooksframework    warn          yes          yes       yes     一致
 nongit            init=3(nongit)  doctor=1   claim=refused
 nongit --git-init init=0         gitified=yes  ok
 bare              init=3(bare)    doctor=1   claim=refused
-readonly          init=1          doctor=1   claim=refused
+readonly          init=1(readonly) doctor=1  claim=refused
 ```
 
 ## 2. submodule — ⚠ → ✅
