@@ -5194,7 +5194,7 @@ fn g() {
     #[test]
     fn 本文の書き換えは履歴の入口だけを通る() {
         for (name, raw) in [
-            ("app.rs", include_str!("app.rs")),
+            ("app.rs", crate::app::SRC),
             ("editor.rs", include_str!("editor.rs")),
         ] {
             // Windows のチェックアウトは CRLF なので必ず正規化してから探す
