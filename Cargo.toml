@@ -34,7 +34,7 @@ vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-dirs = "5"
+dirs = "6"
 rfd = "0.17"
 # ico は `zai app install` の Windows ショートカットアイコン生成に使う
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
