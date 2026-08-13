@@ -8,21 +8,34 @@
 #     Dependabot は SHA 固定の `uses:` も版コメント付きで上げてくれる。
 #
 # ■ 上げてはいけないものは ignore に書く (提案されても毎回却下するのは無駄)。
+#
+# ■ **本数を絞ることが品質である。** 初回に 6 本まとめて立って、実際に
+#   人間が「なぜ 6 個あるのか」と困った。多すぎる PR は読まれず、読まれない
+#   PR は「緑だから入れる」で通されるので、**検証しているつもりで何も
+#   検証していない**状態になる。patch と minor を 1 本へまとめ、上限も絞る。
+#
+# ■ 頻度を落としても安全性は下がらない。**脆弱性の修正 (Dependabot security
+#   updates) はこの設定の group / limit / schedule を一切通らず、出た瞬間に
+#   単独の PR として来る。** ここで律速するのは「ただの新版」だけである。
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
       day: monday
       time: "09:00"
       timezone: "Asia/Tokyo"
-    open-pull-requests-limit: 5
+    # メジャーは 1 件ずつ判断したいので group から外れる。上限 2 で氾濫を防ぐ
+    # (溢れたぶんは次の月に回る。急ぐものは security update が別枠で来る)。
+    open-pull-requests-limit: 2
     labels: ["dependencies", "rust"]
     groups:
-      # パッチ更新はまとめて 1 本にする (5 本の PR が毎週来ると誰も見なくなる)。
-      patch-level:
-        update-types: ["patch"]
+      # **patch と minor をまとめて 1 本**にする。0.x の crate では minor が
+      # 破壊的変更を含むが、それは「まとめない理由」ではなく「CI で落ちたら
+      # 犯人を ignore へ移す」で対処する。1 本なら人間が実際に読む。
+      routine:
+        update-types: ["patch", "minor"]
     ignore:
       # CLAUDE.md の絶対ルール: egui は 0.29 固定 (アップグレード禁止)。
       # 0.30 以降は API が広範囲に変わり、44,000 行の UI コードが全滅する。
@@ -38,11 +51,11 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
+      interval: monthly
       day: monday
       time: "09:00"
       timezone: "Asia/Tokyo"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 1
     labels: ["dependencies", "github-actions"]
     groups:
       actions:
