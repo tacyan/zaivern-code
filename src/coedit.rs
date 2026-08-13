@@ -3138,7 +3138,23 @@ mod tests {
         }
 
         // ── 実 git ─────────────────────────────────────────────
-        for f in 0..files {
+        //
+        // **帯はここから効かせる。** 以前は「証明する輪」だけを帯へ割っていたが、
+        // 実測すると **400 ケース 86 秒 / 100 ケース 72 秒** — ケースを 1/4 に
+        // しても 14 秒しか減らなかった。固定費 68 秒が支配していて、その正体は
+        // **帯に関係なく全ファイルを書き・5 本の枝へ commit し・全ツリーを
+        // merge-tree していた**こと。
+        //
+        // 分割を増やすほど固定費 × 本数で**悪化する**ので、
+        // ファイル集合そのものを帯へ割る。1 ケース = 1 ファイルで互いに
+        // 独立なので、これで答えは 1 件も変わらない。
+        //
+        // 生成 (上) は git を 1 度も起こさないので**全ケース分そのまま回す**。
+        // 帯ごとに乱数列がずれるとケースの同一性が失われるため。
+        let (shard, shards) = region::exhaustive_shard();
+        let mine = |f: usize| shards <= 1 || f % shards == shard;
+
+        for f in (0..files).filter(|f| mine(*f)) {
             r.write(&path_of(f), &(base_lines(f).join("\n") + "\n"));
         }
         r.git(&["add", "--all"]);
@@ -3149,7 +3165,7 @@ mod tests {
         for (b, name) in names.iter().enumerate() {
             r.git(&["checkout", "--quiet", "-b", name, "base"]);
             for (f, per_branch) in edits.iter().enumerate() {
-                if per_branch[b].is_empty() {
+                if !mine(f) || per_branch[b].is_empty() {
                     continue;
                 }
                 r.write(&path_of(f), &apply(&base_lines(f), &per_branch[b], name));
@@ -3251,19 +3267,7 @@ mod tests {
         let (mut proven3, mut unproven3, mut over3, mut tight) = (0, 0, 0, 0usize);
         let mut ran = 0usize;
 
-        // **帯へ割る。** 2400 ケースは手元 macOS で 245 秒だが、CI (ubuntu) では
-        // 90 分でも終わらなかった (30 分 → 90 分と 2 度伸ばして 2 度とも打ち切り)。
-        // 実 git を何度も起こす作業は runner のディスク I/O が効き、約 12 倍遅い。
-        // **時間を伸ばすのは筋が悪い** — 伸ばし続ければいつか「いくらでもいい」になり、
-        // 本当に壊れたときに気付けない。総量を減らさずに 1 本を縮めるため帯にする。
-        //
-        // 生成 (上) は git を 1 度も起こさないので**全ケース分そのまま回す**。
-        // こうしないと帯ごとに乱数列がずれて、ケースの同一性が失われる。
-        let (shard, shards) = region::exhaustive_shard();
-        for f in 0..files {
-            if shards > 1 && f % shards != shard {
-                continue;
-            }
+        for f in (0..files).filter(|f| mine(*f)) {
             let path = path_of(f);
             let parts = per_file(&path);
             if parts.len() < 2 {
