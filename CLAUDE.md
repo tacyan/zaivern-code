@@ -11,7 +11,7 @@
 - **egui 0.29 固定**（アップグレード禁止）・rustc 1.88+。
 - **vendor/vt100 はパッチ済みベンダリング。** `visible_rows` 修正を外すと deep scrollback で debug パニックが再発する。バージョンアップ時は必ずパッチを移植。
 - **リリースは checksums.txt を必ず作り、インストーラは必ずそれを検証する。**
-  `release.yml` の checksums ジョブ (5 ターゲット + install.sh + install.ps1 = **7 行**、
+  `release.yml` の checksums ジョブ (5 ターゲット + install.sh + install.ps1 + SBOM = **8 行**、
   形式検査つき fail-closed) と、`install.sh` の `verify_checksum` /
   `install.ps1` の `Test-Checksum` は**対**である。片方だけ外してはいけない。
   - **検証は展開の前**（`tar xzf` / `Expand-Archive` より前）。書き出してから
