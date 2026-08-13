@@ -29,7 +29,7 @@ syntect = "5.2"
 #   * syntect ^5.3 を要求し、こちらのロックは 5.3.0。バージョン衝突は起きない
 #   * 既定 feature は `syntect-onig` のみで、既に有効な syntect の onig と同じ
 two-face = "0.5"
-portable-pty = "0.8"
+portable-pty = "0.9"
 vt100 = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
