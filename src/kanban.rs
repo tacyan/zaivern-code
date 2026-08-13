@@ -1731,6 +1731,9 @@ const FAST_SAMPLE_MS: u64 = 150;
 const SLOW_SAMPLE_MS: u64 = 1_000;
 /// 全員終了しているときの再描画間隔 (実質何もしない)。
 const ASLEEP_REPAINT_MS: u64 = 2_000;
+/// 着地ハイライトが消えるまでのあいだの刻み (≈30fps)。
+/// 走るのは [`LAND_HIGHLIGHT_MS`] のあいだだけで、常時ではない。
+const LAND_ANIM_MS: u64 = 33;
 /// 出力の勢いスパークラインの窓 (30 秒) とバケツ数。
 const PULSE_WINDOW_MS: u64 = 30_000;
 const PULSE_BUCKETS: usize = 30;
@@ -1891,6 +1894,23 @@ pub struct KanbanState {
     any_running: bool,
     /// 着地アニメーションが走っているか (走っている間だけ高頻度描画)
     animating: bool,
+    /// 直近フレームでヘッダの「連続稼働 HH:MM:SS」を描いたか。
+    /// **秒の桁を持つ表示が画面に出ているか**の判断材料 ([`Onscreen::ticking`])。
+    /// 狭い窓ではヘッダを畳んで出さないので、そのぶん回さなくてよい。
+    clock_shown: bool,
+}
+
+/// [`KanbanState::next_repaint_ms`] の入力 — **画面の側の事実**。
+///
+/// 「次に何 ms 後に描くか」は看板の内部状態だけでは決まらない。
+/// 誰も見ていない (最小化) なら 0 枚でよいし、秒で動く表示が 1 つも
+/// 出ていなければ時間が経っても画面は変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Onscreen {
+    /// ウィンドウが見えている (最小化されていない)
+    pub readable: bool,
+    /// 秒の桁を持つ表示 (連続稼働・カードの稼働時間) が出ている
+    pub ticking: bool,
 }
 
 impl KanbanState {
@@ -1929,17 +1949,53 @@ impl KanbanState {
         }
     }
 
-    /// 次に再描画を要求するまでの ms。無条件の再描画をしないための唯一の窓口。
-    pub fn next_repaint_ms(&self) -> u64 {
+    /// 次に再描画を要求するまでの ms。**`None` なら 1 枚も予約しない。**
+    /// 無条件の再描画をしないための唯一の窓口。
+    ///
+    /// ## 看板だけ「ゼロにできない」理由 (正直に書く)
+    ///
+    /// 設計原則 3 は「アイドル時のコストはゼロ」と言うが、**看板は時計を
+    /// 出している画面**である — ヘッダの「連続稼働 HH:MM:SS」とカードの
+    /// 稼働時間 ("3m07s") は**秒**の桁を持つので、入力が 1 つも無くても
+    /// 表示は毎秒変わる。これは damage が無いのではなく、**時間そのものが
+    /// damage** なのであって、定期フレームを外すと時計が止まる = 見た目が変わる。
+    /// だから前景で開いている限り 1〜2 秒の刻みは要る。
+    ///
+    /// **できるのは「要らないときに 1 枚も要求しないこと」**で、そこは
+    /// 実測で丸ごと無駄だった:
+    ///
+    /// | 状況                        | 直す前     | 直した後 |
+    /// |-----------------------------|-----------|---------|
+    /// | 最小化 (誰も読めない)        | 30〜61 枚/分 | **0**   |
+    /// | カード 0 + 狭くて時計を畳む  | 30 枚/分    | **0**   |
+    /// | 前景で時計が出ている         | 30〜61 枚/分 | 変えない |
+    ///
+    /// 走っているエージェントの状態機械は app.rs 側の `IdleSignals`
+    /// (`idle.agents`) が背面用の刻みで回し続けるので、ここで降りても
+    /// 承認待ちの検出が止まることはない。
+    pub fn next_repaint_ms(&self, on: Onscreen) -> Option<u64> {
+        // ① 誰も見ていない画面のために描かない。アニメも時計も読めない。
+        if !on.readable {
+            return None;
+        }
+        // ② 着地アニメーション中は持ち主の刻みで回す
         if self.animating {
-            33
-        } else if self.busy {
-            FAST_SAMPLE_MS
-        } else if self.any_running {
+            return Some(LAND_ANIM_MS);
+        }
+        // ③ 出力が動いている間は速く標本を採る
+        if self.busy {
+            return Some(FAST_SAMPLE_MS);
+        }
+        // ④ ここから下は「動きが無い」。秒で動く表示が 1 つも無ければ、
+        //    時間が経っても画面は変わらない → 1 枚も要らない。
+        if !on.ticking {
+            return None;
+        }
+        Some(if self.any_running {
             SLOW_SAMPLE_MS
         } else {
             ASLEEP_REPAINT_MS
-        }
+        })
     }
 
     /// 追跡状態を 1 ステップ進める。`fresh` が true のフレームだけ
@@ -2253,12 +2309,9 @@ pub fn ui(
     let lanes = st.update_tracks(cards, now_ms, fresh_tail);
     let t = tally_lanes(cards, &lanes);
     st.record_sample(now_ms, t);
-    // 無条件の再描画はしない。動きがあるときだけ速く回す (アイドル時は 1〜2 秒)。
-    crate::perf::repaint_after(
-        ui.ctx(),
-        std::time::Duration::from_millis(st.next_repaint_ms()),
-        "kanban",
-    );
+    // 再描画の予約は**描き終わってから**行う (末尾)。
+    // 「秒で動く表示が画面に出ているか」は、ヘッダを畳んだか / カードが
+    // あるかで決まるので、描く前には分からない。
 
     egui::Frame::none()
         .inner_margin(egui::Margin::same(10.0))
@@ -2388,6 +2441,20 @@ pub fn ui(
                 chart_ui(ui, theme, st);
             }
         });
+
+    // **要らないフレームは 1 枚も予約しない** (設計原則 3)。
+    // 画面が見えているか (最小化されていないか) は egui から直に読む —
+    // app.rs の `IdleSignals` と同じ出どころ。
+    let readable = !ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false));
+    if let Some(ms) = st.next_repaint_ms(Onscreen {
+        readable,
+        // 秒で動く表示: ヘッダの「連続稼働 HH:MM:SS」(畳んでいなければ) と
+        // カードの稼働時間 ("3m07s")。どちらも出ていなければ、時間が経つ
+        // だけでは画面は 1 ピクセルも変わらない。
+        ticking: st.clock_shown || !cards.is_empty(),
+    }) {
+        crate::perf::repaint_after(ui.ctx(), std::time::Duration::from_millis(ms), "kanban");
+    }
 
     acts
 }
@@ -2682,6 +2749,10 @@ fn header_ui(
     // 狭い窓では文字を落としてアイコンだけにする。右端でボタンが切れて
     // 押せなくなる (「＋ Agent」「✕ 閉じる」が見えない) のを防ぐ。
     let compact = header_compact(ui.available_width());
+    // 「連続稼働 HH:MM:SS」は畳んでいないときだけ出る。**秒の桁が画面に
+    // 出ているか**が定期フレームの要否そのものなので、描いた事実を残す
+    // (幅から推し量ると余白のぶんずれて、静かに嘘の判断をする)。
+    st.clock_shown = !compact;
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(if compact { "📋" } else { "📋 FLEET KANBAN" })
@@ -4066,6 +4137,165 @@ mod tests {
     use super::*;
     use crate::supervisor::SessionState as S;
 
+    /// 「前景で開いていて、秒で動く表示が出ている」既定形。
+    /// ここを変えずに済む検査は、画面側の事情と無関係な性質を見ている。
+    const ONSCREEN: Onscreen = Onscreen {
+        readable: true,
+        ticking: true,
+    };
+
+    /// **誰も読めない画面のために 1 枚も描かない。**
+    ///
+    /// 直す前は看板を開いたまま最小化しても 30〜61 枚/分を要求し続けていた
+    /// (実測。`zz_kanban_asks_for_no_frames_when_nothing_can_change` の表)。
+    /// 走っているエージェントの状態機械は app.rs の `idle.agents` が
+    /// 背面用の刻みで回すので、ここで降りても承認待ちの検出は止まらない。
+    #[test]
+    fn 見えない看板は一枚も予約しない() {
+        let hidden = Onscreen {
+            readable: false,
+            ticking: true,
+        };
+        let mut st = KanbanState::default();
+        // 全部の状態で 0 — アニメ中でも走っていても、見えないなら描かない。
+        for (animating, busy, any_running) in [
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            st.animating = animating;
+            st.busy = busy;
+            st.any_running = any_running;
+            assert_eq!(
+                st.next_repaint_ms(hidden),
+                None,
+                "最小化中に予約した (animating={animating} busy={busy} running={any_running})"
+            );
+        }
+    }
+
+    /// **秒で動く表示が 1 つも無ければ、時間が経っても画面は変わらない。**
+    /// 狭い窓 (ヘッダを畳む) でカードが 0 枚のときがこれに当たる。
+    #[test]
+    fn 動く表示が無ければ予約しない() {
+        let still = Onscreen {
+            readable: true,
+            ticking: false,
+        };
+        let mut st = KanbanState::default();
+        assert_eq!(st.next_repaint_ms(still), None, "静止画面に予約した");
+        // ただし**動きがあるとき**は時計と無関係に回す (取りこぼさない)。
+        st.busy = true;
+        assert_eq!(st.next_repaint_ms(still), Some(FAST_SAMPLE_MS));
+        st.busy = false;
+        st.animating = true;
+        assert_eq!(st.next_repaint_ms(still), Some(LAND_ANIM_MS));
+    }
+
+    /// **判断が実際の描画経路まで繋がっていること** (egui へ出た要求を読む)。
+    ///
+    /// 純関数だけを固めても、`ui()` が `Onscreen` を組み立て損ねていれば
+    /// 何も変わらない ("作ったのに繋いでいない")。ここでは本物の
+    /// [`ui`] を 1 フレーム回し、**egui が受け取った再描画要求そのもの**を
+    /// 読んで確かめる。`Duration::MAX` = 1 枚も予約していない。
+    ///
+    /// 直す前の実測 (同じ検査を当てたときの値):
+    ///   カード0・広い・前景 1.98s / カード0・狭い・前景 1.98s /
+    ///   走ってる1枚・前景 0.98s / **走ってる1枚・最小化 0.98s** /
+    ///   **カード0・最小化 1.98s** / **カード0・狭い 1.98s**
+    /// 太字の 3 つが丸ごと無駄で、直した後は 3 つとも予約 0 になる。
+    #[test]
+    fn 見えない看板と静止画面はeguiへ要求を出さない() {
+        let theme = crate::theme::all().remove(0);
+        // (説明, カード, 最小化, 幅, 予約を出すべきか)
+        let cases: Vec<(&str, Vec<Card>, bool, f32, bool)> = vec![
+            (
+                "カード0・広い・前景 (時計が出ている)",
+                vec![],
+                false,
+                1600.0,
+                true,
+            ),
+            (
+                "カード0・狭い・前景 (時計を畳む)",
+                vec![],
+                false,
+                700.0,
+                false,
+            ),
+            (
+                "走ってる1枚・前景",
+                vec![card(Column::Thinking, true)],
+                false,
+                1600.0,
+                true,
+            ),
+            (
+                "走ってる1枚・最小化",
+                vec![card(Column::Thinking, true)],
+                true,
+                1600.0,
+                false,
+            ),
+            ("カード0・最小化", vec![], true, 1600.0, false),
+        ];
+        for (why, cards, minimized, w, want) in cases {
+            let ctx = egui::Context::default();
+            let mut st = KanbanState::default();
+            let mut delay = std::time::Duration::MAX;
+            let mut now = 10_000_u64;
+            // 3 フレーム回す (初回は追跡が空で、着地アニメが走るため)。
+            for _ in 0..3 {
+                now += 2_000;
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, 900.0),
+                    )),
+                    viewports: std::iter::once((
+                        egui::ViewportId::ROOT,
+                        egui::ViewportInfo {
+                            minimized: Some(minimized),
+                            focused: Some(!minimized),
+                            ..Default::default()
+                        },
+                    ))
+                    .collect(),
+                    ..Default::default()
+                };
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut live = |_: &mut egui::Ui, _: usize| None;
+                        let _ =
+                            super::ui(&mut st, ui, &theme, &cards, &[], &[], now, true, &mut live);
+                    });
+                });
+                delay = out
+                    .viewport_output
+                    .values()
+                    .map(|v| v.repaint_delay)
+                    .min()
+                    .unwrap_or(std::time::Duration::MAX);
+            }
+            let asked = delay != std::time::Duration::MAX;
+            assert_eq!(asked, want, "{why}: 予約 ={delay:?}");
+        }
+    }
+
+    /// **前景で時計が出ている間は、今までどおりの刻みを保つ** (見た目を変えない)。
+    #[test]
+    fn 前景の刻みは変えていない() {
+        let mut st = KanbanState::default();
+        assert_eq!(st.next_repaint_ms(ONSCREEN), Some(ASLEEP_REPAINT_MS));
+        st.any_running = true;
+        assert_eq!(st.next_repaint_ms(ONSCREEN), Some(SLOW_SAMPLE_MS));
+        st.busy = true;
+        assert_eq!(st.next_repaint_ms(ONSCREEN), Some(FAST_SAMPLE_MS));
+        st.animating = true;
+        assert_eq!(st.next_repaint_ms(ONSCREEN), Some(LAND_ANIM_MS));
+    }
+
     /// **アクティビティ → レーンの対応表**。ここが仕様書。
     ///
     /// 8 本あるので、細かい状態 (実装中 / 検証中 / 思考中 / 実行中) は
@@ -5068,7 +5298,11 @@ mod tests {
         st.update_tracks(&[c], 1_000, true);
         assert!(!st.sample_due(1_100));
         assert!(st.sample_due(1_200));
-        assert_eq!(st.next_repaint_ms(), 33, "着地アニメ中は高頻度");
+        assert_eq!(
+            st.next_repaint_ms(ONSCREEN),
+            Some(33),
+            "着地アニメ中は高頻度"
+        );
     }
 
     #[test]
@@ -5085,7 +5319,7 @@ mod tests {
         let mut a = card_id(1, Column::Done);
         a.running = false;
         st.update_tracks(&[a], 5_000, true);
-        assert_eq!(st.next_repaint_ms(), ASLEEP_REPAINT_MS);
+        assert_eq!(st.next_repaint_ms(ONSCREEN), Some(ASLEEP_REPAINT_MS));
         // カードが消えたら追跡も捨てる
         st.update_tracks(&[], 6_000, true);
         assert!(st.track(1).is_none());
@@ -5896,7 +6130,7 @@ mod tests {
             h.frame(none.clone(), &cards);
         }
         assert!(!h.st.animating && !h.st.busy && !h.st.any_running);
-        assert_eq!(h.st.next_repaint_ms(), ASLEEP_REPAINT_MS);
+        assert_eq!(h.st.next_repaint_ms(ONSCREEN), Some(ASLEEP_REPAINT_MS));
     }
 }
 

@@ -47,6 +47,95 @@ pub struct SearchUi {
     pub current_vis: Option<(usize, u16)>,
 }
 
+/// **呼び出し側を止め得る操作を数える計器。テストだけが読む。**
+///
+/// 「詰まらないこと」を実時間で測ると必ず嘘をつく。`< 200ms` のような予算は
+/// 「その機械がその瞬間どれだけ空いていたか」を測っているだけで、守りたい性質
+/// (= UI スレッドが PTY / conhost / 子プロセスの都合で待たされない) を
+/// 1 バイトも見ていない。守りたいのは**構造**なので、構造をそのまま数える:
+///
+///   **詰まり得る呼び出しが、呼び出し側のスレッドで何回起きたか。答えは 0。**
+///
+/// ここで数えるのは、相手 (子プロセス / conhost / OS) の都合で
+/// **いくらでも待たされ得る**呼び出しだけ:
+///
+/// | 計器          | 実体                                     | 誰が待たされるか |
+/// |---------------|------------------------------------------|------------------|
+/// | `pty_write`   | PTY 入力パイプへの `write_all` / `flush` | 子が読まなければ永久 |
+/// | `pty_resize`  | `ResizePseudoConsole` (conhost へ同期RPC)| conhost が詰まれば永久 |
+/// | `proc`        | 木殺しコマンドの `spawn` + `wait`        | 木が消えるまで |
+/// | `pty_close`   | `ClosePseudoConsole` (= master の drop)  | クライアントが全員消えるまで |
+///
+/// **スレッドローカルにする。** プロセス共通の `static` にすると、同時に
+/// 走っている他のテストの呼び出しまで混ざる (このリポジトリで実際に 400 回の
+/// はずが 800 回になって落ちた)。しかもここで見たい性質は
+/// 「**どのスレッドが**払ったか」そのものなので、スレッド別でなければ
+/// 意味を成さない — 同じ後始末でも、専用スレッドが払えば 0、
+/// 呼び出し側が払えば 1 以上になる。その差が合否線である。
+///
+/// `#[cfg(test)]` なので出荷ビルドには 1 バイトも入らない。
+#[cfg(test)]
+pub(crate) mod stall {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PTY_WRITE: Cell<u64> = const { Cell::new(0) };
+        static PTY_RESIZE: Cell<u64> = const { Cell::new(0) };
+        static PROC: Cell<u64> = const { Cell::new(0) };
+        static PTY_CLOSE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn bump(c: &'static std::thread::LocalKey<Cell<u64>>) {
+        c.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    pub(crate) fn pty_write() {
+        bump(&PTY_WRITE);
+    }
+    pub(crate) fn pty_resize() {
+        bump(&PTY_RESIZE);
+    }
+    pub(crate) fn proc() {
+        bump(&PROC);
+    }
+    pub(crate) fn pty_close() {
+        bump(&PTY_CLOSE);
+    }
+
+    /// このスレッドの計器を 0 に戻す。区間の頭で呼ぶ。
+    pub(crate) fn reset() {
+        for c in [&PTY_WRITE, &PTY_RESIZE, &PROC, &PTY_CLOSE] {
+            c.with(|c| c.set(0));
+        }
+    }
+
+    pub(crate) fn pty_writes() -> u64 {
+        PTY_WRITE.with(Cell::get)
+    }
+    pub(crate) fn pty_resizes() -> u64 {
+        PTY_RESIZE.with(Cell::get)
+    }
+
+    /// このスレッドが払った「詰まり得る呼び出し」の総数。
+    pub(crate) fn total() -> u64 {
+        [&PTY_WRITE, &PTY_RESIZE, &PROC, &PTY_CLOSE]
+            .iter()
+            .map(|c| c.with(Cell::get))
+            .sum()
+    }
+
+    /// 失敗メッセージ用の内訳 (どの計器が鳴ったかまで出す)。
+    pub(crate) fn breakdown() -> String {
+        format!(
+            "pty_write={} pty_resize={} proc={} pty_close={}",
+            PTY_WRITE.with(Cell::get),
+            PTY_RESIZE.with(Cell::get),
+            PROC.with(Cell::get),
+            PTY_CLOSE.with(Cell::get),
+        )
+    }
+}
+
 /// PTY への書き込み口。**積むだけで、実際に書くのは専用スレッド**。
 ///
 /// 以前はここで直接 `write_all` していた。PTY の入力パイプは子が読まなくなると
@@ -67,6 +156,41 @@ impl PtyWriter {
     /// 待ち行列の上限。これを超えたら子はもう入力を読んでいないので、
     /// 積んでもメモリを食うだけで届かない。人が打つ量からは遠く離してある。
     const MAX_QUEUED: usize = 1 << 20; // 1 MiB
+
+    /// 書き込み口と、それを実際に PTY へ流す専用スレッドを作る。
+    ///
+    /// **`write_all` を呼ぶのは、ここが起こすスレッドだけ。** 書き込み先を
+    /// 引数で受けるのは、テストが**この配線そのもの**を使えるようにするため —
+    /// テスト側で似た配線を組み直すと、production が変わっても気付けない
+    /// (「測っているつもりで何も測っていない」)。
+    fn spawn_for(w: impl std::io::Write + Send + 'static) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = queued.clone();
+        std::thread::spawn(move || Self::pump(w, &rx, &counter));
+        Self { tx, queued }
+    }
+
+    /// 待ち行列を PTY へ流し続けるループ。**詰まってよいのはこのスレッドだけ**。
+    /// 送り手が全員居なくなると `recv` が切れて畳まれる。
+    fn pump(
+        mut w: impl std::io::Write,
+        rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+        queued: &std::sync::atomic::AtomicUsize,
+    ) {
+        while let Ok(chunk) = rx.recv() {
+            let n = chunk.len();
+            // ここが「子が読まなければ永久に返ってこない」呼び出し。
+            // 呼び出し側 (UI スレッド) の計器が 0 であることの裏返しとして数える。
+            #[cfg(test)]
+            stall::pty_write();
+            let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
+            queued.fetch_sub(n, Ordering::Relaxed);
+            if !ok {
+                break; // PTY が閉じた。以降の入力は届かない。
+            }
+        }
+    }
 
     fn send(&self, bytes: &[u8]) {
         use std::sync::atomic::Ordering as O;
@@ -1781,23 +1905,7 @@ impl Session {
 
         // PTY への書き込みは専用スレッドに任せる (PtyWriter の説明を参照)。
         // 送り手 (UI スレッド / 読取スレッド) が全員居なくなると recv が切れて畳まれる。
-        let writer = {
-            let mut w = pair.master.take_writer().map_err(|e| e.to_string())?;
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter = queued.clone();
-            std::thread::spawn(move || {
-                while let Ok(chunk) = rx.recv() {
-                    let n = chunk.len();
-                    let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
-                    counter.fetch_sub(n, Ordering::Relaxed);
-                    if !ok {
-                        break; // PTY が閉じた。以降の入力は届かない。
-                    }
-                }
-            });
-            PtyWriter { tx, queued }
-        };
+        let writer = PtyWriter::spawn_for(pair.master.take_writer().map_err(|e| e.to_string())?);
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
         let shell = Arc::new(Mutex::new(crate::shellint::Tracker::new()));
         let lines: Arc<LineIndex> = Arc::new(LineIndex::default());
@@ -2726,6 +2834,9 @@ impl Session {
                     let Some(master) = weak.upgrade() else {
                         return false;
                     };
+                    // conhost への同期 RPC。**ワーカースレッドの上でだけ**払う。
+                    #[cfg(test)]
+                    stall::pty_resize();
                     let _ = lock_ok(&master).resize(PtySize {
                         rows,
                         cols,
@@ -2745,6 +2856,11 @@ impl Session {
             // 黒いまま固まる」事故になる。
             None => match crate::lockx::try_lock_ok(&self.master) {
                 Some(m) => {
+                    // 代替経路だけは呼び出し側が RPC を払う (ワーカーが起こせない
+                    // 環境)。数えているので、テストは「この環境なら見送る」と
+                    // 判断できる — 0 を期待して落とすのは筋が違う。
+                    #[cfg(test)]
+                    stall::pty_resize();
                     let _ = m.resize(PtySize {
                         rows,
                         cols,
@@ -3099,6 +3215,12 @@ fn kill_target(exited: bool, child_pid: Option<u32>) -> Option<u32> {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // この drop を抜けた直後に master (ConPTY) の強参照が落ちる。
+        // Windows の `ClosePseudoConsole` は「クライアントが全員消えて残りの
+        // 出力を吐き切る」まで戻らないので、**払うスレッドを間違えると
+        // ウィンドウごと固まる**。誰が払ったかを数えられるようにしておく。
+        #[cfg(test)]
+        stall::pty_close();
         // リサイズワーカーを先に畳む (通知だけ — join せず待たない)。
         // ワーカーは master の Weak しか持たないので、万一通知を取り逃しても
         // upgrade 失敗で自然に抜け、master より長生きして触ることはない。
@@ -3169,6 +3291,9 @@ fn kill_tree_command(pid: u32) -> std::process::Command {
 /// 木を辿れた (= 根がまだ生きていた) なら true。
 fn kill_tree_blocking(pid: Option<u32>) -> bool {
     let Some(pid) = pid else { return false };
+    // 木が消えるまで返ってこない。UI スレッドが払ってはいけない呼び出し。
+    #[cfg(test)]
+    stall::proc();
     match kill_tree_command(pid).spawn() {
         Ok(mut child) => child.wait().map(|s| s.success()).unwrap_or(false),
         Err(_) => false,
@@ -3188,22 +3313,28 @@ fn kill_tree_blocking(pid: Option<u32>) -> bool {
 /// drop する。ツリーが消えていれば `ClosePseudoConsole` はすぐ返るし、
 /// 万一返らなくても止まるのは捨てるスレッドだけで、UI は動き続ける。
 pub fn reap(session: Session) {
-    std::thread::spawn(move || {
-        let mut session = session;
-        // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
-        // kill を撃たない。child_pid は wait 済みで OS に返却されており、
-        // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
-        // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
-        // 巻き添えにする。
-        if !session.exited.load(Ordering::SeqCst) {
-            // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
-            // ([`Session::kill`] の説明を参照)。
-            kill_tree_blocking(session.child_pid);
-            let _ = session.killer.kill();
-        }
-        // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
-        drop(session);
-    });
+    std::thread::spawn(move || reap_now(session));
+}
+
+/// [`reap`] の中身。**詰まり得る呼び出しを全部払う** ので、専用スレッドから
+/// だけ呼ぶこと。ここを直に呼ぶのは `reap` が起こすスレッドと、
+/// 「同じ後始末を呼び出し側で行えば必ず 1 回以上払う」ことを見せる番人テスト
+/// ([`reap_pty_tests`]) だけ。
+fn reap_now(session: Session) {
+    let mut session = session;
+    // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
+    // kill を撃たない。child_pid は wait 済みで OS に返却されており、
+    // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
+    // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
+    // 巻き添えにする。
+    if !session.exited.load(Ordering::SeqCst) {
+        // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
+        // ([`Session::kill`] の説明を参照)。
+        kill_tree_blocking(session.child_pid);
+        let _ = session.killer.kill();
+    }
+    // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
+    drop(session);
 }
 
 /// アプリ終了時にセッションを手放す。
@@ -9537,20 +9668,163 @@ mod pty_writer_tests {
         (PtyWriter { tx, queued }, rx)
     }
 
-    /// 子が入力を一切読まなくても、書き込みは即座に返ること。
-    /// ここで待たされると `App::update` の途中で画面が止まる。
+    /// **子が入力を 1 バイトも読まなくても、書き込みは呼び出し側に
+    /// 「詰まり得る呼び出し」を 1 回も課さないこと。**
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `took < 200ms` だった。これは 2 つの意味で測れていない。
+    ///
+    /// 1. **線が現象から遠すぎる。** 中身は不定長キューへの `send` 1000 回 =
+    ///    数 ms。200ms は「この機械が 1000 回のチャネル送信をできるか」を
+    ///    測っているだけで、通っても何も保証しない。
+    /// 2. **もっと悪いことに、守りたい回帰を検出できない。** 旧テストは
+    ///    `PtyWriter` を**手で組み立てて**いて (`stalled_writer`)、
+    ///    production の writer スレッドを 1 行も通らなかった。
+    ///    `Session::spawn` が同期 `write_all` へ戻っても、このテストは緑のまま。
+    ///
+    /// そこで [`PtyWriter::spawn_for`] = **production と同じ配線**へ
+    /// 「絶対に読み終わらない書き込み先」を挿し、
+    /// **呼び出し側スレッドの計器が 0 であること**を見る。
+    /// 詰まる `write_all` は writer スレッドの上で数えられるので、
+    /// 「そもそも書いていないから 0」という抜け道も塞がる。
     #[test]
-    fn writing_to_a_stalled_child_does_not_block() {
-        let (w, _rx) = stalled_writer();
-        let t = Instant::now();
-        for _ in 0..1000 {
-            w.send(b"hello\r");
+    fn writing_to_a_stalled_child_charges_the_caller_no_blocking_calls() {
+        const N: usize = 1000;
+        const CHUNK: &[u8] = b"hello\r";
+
+        // 子が読まない PTY: gate を握っている間、write_all はそこで止まる。
+        let gate = Arc::new(Mutex::new(()));
+        let hold = lock_ok(&gate);
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<usize>();
+        let w = PtyWriter::spawn_for(StalledPty {
+            gate: gate.clone(),
+            wrote: wrote_tx,
+        });
+
+        stall::reset();
+        for _ in 0..N {
+            w.send(CHUNK);
         }
-        let took = t.elapsed();
-        assert!(
-            took < Duration::from_millis(200),
-            "読まれない PTY への書き込みが呼び出し側を待たせた ({took:?})"
+
+        // ① 呼び出し側は「詰まり得る呼び出し」を 1 回も払っていない。
+        assert_eq!(
+            stall::total(),
+            0,
+            "読まれない PTY への書き込みが呼び出し側に詰まり得る呼び出しを課した ({})",
+            stall::breakdown()
         );
+        // ② 捨てて 0 になったのではない — 全部ちゃんと積まれている
+        //    (writer スレッドは 1 発目の write_all に掴まったままなので、
+        //     数え戻しはまだ 1 度も起きていない)。
+        assert_eq!(
+            w.queued.load(Ordering::Relaxed),
+            N * CHUNK.len(),
+            "積んだはずのバイトが待ち行列に無い"
+        );
+
+        // ③ 子が読み始めれば、詰まっていた書き込みは writer スレッドの上で
+        //    全部行われる。**時計もスピンも使わない** — 書けた通知を N 回受ける。
+        drop(hold);
+        for i in 1..=N {
+            let seen = wrote_rx.recv().expect("writer スレッドが畳まれた");
+            assert_eq!(seen, i, "書き込みの順序か回数が合わない");
+        }
+        // ④ 詰まり得る呼び出しは writer スレッドが N 回払っていて、
+        //    呼び出し側は最後まで 0 のまま。**同じ仕事の請求先が違う**。
+        assert_eq!(
+            stall::total(),
+            0,
+            "呼び出し側の計器が後から鳴った ({})",
+            stall::breakdown()
+        );
+    }
+
+    /// **計器で測った経路が、実際に出荷される経路であること。**
+    ///
+    /// 回数のテストは「その仕組みは詰まらない」までしか言えない。
+    /// 出荷側がその仕組みを**使っていなければ**意味が無い —
+    /// 旧テストが `PtyWriter` を手で組み立てていて production の writer
+    /// スレッドを 1 行も通らなかったのが、まさにこの穴だった。
+    /// ここでソースを読んで、穴を構造的に塞ぐ。
+    #[test]
+    fn the_measured_path_is_the_shipped_path() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        // 探す文字列をそのまま書くと**このテスト自身に当たる**ので分割する。
+        let write_all = concat!("write", "_all(");
+        let kill_blocking = concat!("kill_tree", "_blocking(");
+
+        let body_of = |sig: &str, end: &str, name: &str| -> String {
+            let after = src
+                .split(sig)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} が見つからない"));
+            after
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("{name} の本体の終端が見つからない"))
+                .to_string()
+        };
+
+        // ① 送り口は積むだけ。ここで書いたら呼び出し側が子の都合で止まる。
+        let send = body_of(
+            "    fn send(&self, bytes: &[u8]) {",
+            "\n    }\n",
+            "PtyWriter::send",
+        );
+        assert!(
+            !send.contains(write_all),
+            "PtyWriter::send が直に書いている (呼び出し側が子の都合で止まる)"
+        );
+
+        // ② 出荷側は必ず spawn_for 経由。ここが直書きへ戻ると、
+        //    回数のテストは緑のままアプリだけが固まる。
+        let spawn = body_of(
+            "    pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {",
+            "\n    }\n",
+            "Session::spawn",
+        );
+        assert!(
+            !spawn.contains(write_all),
+            "Session::spawn が PtyWriter を通さずに書いている"
+        );
+        assert!(
+            spawn.contains("PtyWriter::spawn_for("),
+            "Session::spawn が計器の付いた writer 配線を使っていない"
+        );
+
+        // ③ 閉じる操作は丸ごと別スレッドへ。本体に後始末が残っていたら、
+        //    それは呼び出し側 (UI スレッド) が払うということ。
+        let reap = body_of("pub fn reap(session: Session) {", "\n}\n", "reap");
+        assert!(
+            reap.contains("std::thread::spawn("),
+            "reap が後始末を別スレッドへ逃がしていない"
+        );
+        assert!(
+            !reap.contains(kill_blocking),
+            "reap が呼び出し側のスレッドで木殺しを待っている"
+        );
+    }
+
+    /// 絶対に読み終わらない PTY の代わり。`gate` を握られている間、
+    /// `write_all` はそこで止まる (= 子が入力を読まなくなった状態)。
+    struct StalledPty {
+        gate: Arc<Mutex<()>>,
+        /// 書けた通し番号を返す口 (テストが時計を使わずに待つため)。
+        wrote: std::sync::mpsc::Sender<usize>,
+    }
+
+    impl std::io::Write for StalledPty {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            drop(lock_ok(&self.gate));
+            // writer スレッドの計器をそのまま通し番号として使う
+            // (production の [`PtyWriter::pump`] が 1 チャンク 1 回数える)。
+            let _ = self.wrote.send(stall::pty_writes() as usize);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// 届かない入力を無制限に溜め込まないこと。上限を超えたら捨てる
@@ -9673,22 +9947,62 @@ mod reap_pty_tests {
         std::fs::metadata(probe).map(|m| m.len()).unwrap_or(0)
     }
 
-    /// 閉じる操作そのものが呼び出し側 (UI スレッド) を待たせないこと。
-    /// ここが待たされると `App::update` の途中で画面が止まり、二度と戻らない。
+    /// **閉じる操作が呼び出し側 (UI スレッド) に「詰まり得る呼び出し」を
+    /// 1 回も課さないこと。**
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `took < 300ms` だった。300ms は「木殺しと `ClosePseudoConsole`
+    /// がその瞬間どれだけ速かったか」で決まる数字で、機械が混めば理由なく赤くなり、
+    /// 空いていれば**壊れていても緑になり得る** (`reap` が同期に戻っても、
+    /// 空いた機械なら 300ms を切ってしまう)。
+    ///
+    /// 見たいのは速さではなく**誰が払うか**である。同じ後始末でも、
+    /// 専用スレッドが払えば呼び出し側は 0、呼び出し側が払えば 1 以上になる。
+    /// その差は機械の速さと無関係に出る。
+    ///
+    /// 裏取り (後半) が要る理由: 前半だけだと「後始末が何もしていないから 0」
+    /// でも通ってしまう。同じセッションの後始末を直に呼べば必ず 1 以上払うことを
+    /// 見せて、0 が**移したことの結果**だと確かめる。
     #[test]
-    fn closing_a_running_agent_returns_immediately() {
+    fn closing_a_running_agent_charges_the_caller_no_blocking_calls() {
         let (session, probe) = spawn_with_a_noisy_grandchild("nonblock");
         if wait_until_growing(&probe).is_none() {
             // 孫を起こせない環境。ここで落としても得るものが無いので見送る。
             reap(session);
             return;
         }
-        let t = Instant::now();
+        stall::reset();
         reap(session);
-        let took = t.elapsed();
+        assert_eq!(
+            stall::total(),
+            0,
+            "閉じる操作が呼び出し側に詰まり得る呼び出しを課した ({})。\
+             UI スレッドならここで固まる",
+            stall::breakdown()
+        );
+
+        // 裏取り: 同じ後始末を**呼び出し側で**行うと、必ず 1 回以上払う。
+        // 別スレッドで走らせるのは、計器がスレッドローカルだから
+        // (このテストスレッドの 0 を汚さずに「払った側」を観測する)。
+        let (direct, probe2) = spawn_with_a_noisy_grandchild("nonblock-direct");
+        if wait_until_growing(&probe2).is_none() {
+            reap(direct);
+            return;
+        }
+        let charged = std::thread::spawn(move || {
+            stall::reset();
+            reap_now(direct);
+            (stall::total(), stall::breakdown())
+        })
+        .join()
+        .expect("後始末スレッド");
         assert!(
-            took < Duration::from_millis(300),
-            "閉じる操作が呼び出し側を待たせた ({took:?})。UI スレッドならここで固まる"
+            charged.0 > 0,
+            "後始末そのものが詰まり得る呼び出しを 1 回も払っていない。\
+             前半の 0 は「別スレッドへ移したから」ではなく「何もしていないから」に\
+             なっている ({})",
+            charged.1
         );
     }
 
@@ -10574,53 +10888,96 @@ mod resize_tests {
 mod pty_resize_tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     /// 潰し込み: 送り側は最新サイズを上書きするだけで待たず、
     /// 詰まった受け側が動き出したら「取り出した時点の最新」だけが届く。
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが「送り側 1001 発が `< 1s`」だった。1 秒は現象 (箱の上書き =
+    /// 数十 µs) から 4 桁離れていて、**受け側と結合していても緑になる** —
+    /// 受け側が 1 秒以内に動き出せば通ってしまうからである。
+    ///
+    /// 見たい性質は速さではなく**分離**なので、それをそのまま数える:
+    /// **受け側が 1 歩も進んでいない (apply 回数 1) 間に、送り側は 1001 発を
+    /// 撃ち終える。** 結合していればこの数は成立しない (送り側が止まる)。
     #[test]
-    fn coalescer_delivers_only_the_latest_size_and_never_blocks_the_sender() {
+    fn coalescer_decouples_the_sender_from_a_stalled_receiver() {
         let sink: Arc<Mutex<Vec<(u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
         // conhost が詰まった状況の再現: テストがゲートを握っている間、
         // 受け側 (apply) は 1 回目の適用で止まったままになる。
         let gate = Arc::new(Mutex::new(()));
-        let hold = gate.lock().unwrap();
+        let hold = lock_ok(&gate);
+        // apply に**入った**回数 (ゲートで止まっている間も 1 と数える)。
+        let entered = Arc::new(AtomicUsize::new(0));
+        // 「apply に入った」「apply を終えた」を時計なしで待つための口。
+        let (enter_tx, enter_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(u16, u16)>();
 
         let c = {
             let sink = sink.clone();
             let gate = gate.clone();
+            let entered = entered.clone();
             ResizeCoalescer::start("zv-test-coalesce".into(), move |r, co| {
-                drop(gate.lock());
-                sink.lock().unwrap().push((r, co));
+                entered.fetch_add(1, Ordering::SeqCst);
+                let _ = enter_tx.send(());
+                drop(lock_ok(&gate)); // ここで詰まる (conhost への同期 RPC 相当)
+                lock_ok(&sink).push((r, co));
+                let _ = done_tx.send((r, co));
                 true
             })
             .expect("ワーカー起動")
         };
 
-        let t0 = Instant::now();
+        // 受け側を起こして、**apply の中で掴まったこと**を確かめてから嵐を撃つ。
+        // (時計を使わずに「受け側は今止まっている」を保証するため)
+        c.request(1, 1);
+        enter_rx.recv().expect("受け側が apply に入らなかった");
+
+        // **分離の原因そのものを、待たずに 1 回で確かめる。**
+        // 受け側は apply の前に状態ロックを手放している。手放さない実装へ
+        // 戻ると `request` が apply の完了を待つようになり (= 詰まる)、
+        // 下の嵐は**赤ではなくハング**になって原因も分からなくなる。
+        // ここなら「握られていない」を try_lock 1 回で即座に落とせる。
+        assert!(
+            c.shared.0.try_lock().is_ok(),
+            "受け側が apply 中も状態ロックを握っている \
+             (送り側が ConPTY の同期 RPC に巻き込まれる)"
+        );
+
+        // 嵐。受け側は 1 歩も進めないので、送り側が待つなら必ずここで止まる。
+        let mut saw_receiver_stuck = 0u32;
         for i in 0..1000u16 {
+            if entered.load(Ordering::SeqCst) == 1 {
+                saw_receiver_stuck += 1;
+            }
             c.request(10 + i % 50, 40 + i % 80);
         }
         c.request(24, 100); // 最終サイズ
-        let sent_in = t0.elapsed();
-        // 受け側が完全に詰まっていても、送り側 1001 発は待たされない。
-        assert!(
-            sent_in < Duration::from_secs(1),
-            "送り側がブロックした: {sent_in:?}"
+
+        // ① 1000 発すべてを、受け側が止まったまま撃ち終えている。
+        assert_eq!(
+            saw_receiver_stuck, 1000,
+            "送り側が受け側の進捗を待った (止まったまま撃てたのは {saw_receiver_stuck} 発)"
+        );
+        // ② 受け側は本当に 1 歩も進んでいない (= ①が「速かった」ではない)。
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "受け側が動いてしまい、分離を測れていない"
         );
 
         drop(hold); // conhost が復帰
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while sink.lock().unwrap().last() != Some(&(24, 100)) {
-            assert!(
-                Instant::now() < deadline,
-                "最終サイズが届かない: {:?}",
-                sink.lock().unwrap()
-            );
-            std::thread::sleep(Duration::from_millis(10));
+
+        // 最終サイズが届くまで待つ。**時計を使わない** — 適用の通知を受ける。
+        let mut delivered_last = done_rx.recv().expect("受け側が畳まれた");
+        while delivered_last != (24, 100) {
+            delivered_last = done_rx.recv().expect("最終サイズが流れてこない");
         }
-        let delivered = sink.lock().unwrap().clone();
-        // ゲートで止まっていた高々 1 発 + 最新の 1 発。1001 発が素通りしたら失敗。
+        let delivered = lock_ok(&sink).clone();
+        // ゲートで止まっていた 1 発 + 最新の 1 発。1001 発が素通りしたら失敗。
         assert!(
             delivered.len() <= 2,
             "潰し込みが効いていない: {delivered:?}"
@@ -10728,13 +11085,22 @@ mod pty_resize_tests {
         .expect("PTY起動")
     }
 
-    /// 実 PTY: リサイズの嵐が呼び出し側 (UI スレッド相当) を待たせないこと、
-    /// それでも最終サイズは PTY まで必ず届くこと。修正前はこのループが
-    /// 1 発ごとに ConPTY への同期 RPC (`ResizePseudoConsole`) を撃っていた。
+    /// 実 PTY: リサイズの嵐が呼び出し側 (UI スレッド相当) に**同期 RPC を
+    /// 1 回も課さない**こと、それでも最終サイズは PTY まで必ず届くこと。
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `elapsed < 3s` だった。潰したい回帰は「101 回の
+    /// `ResizePseudoConsole` が呼び出し側に乗る」ことなのに、3 秒という線は
+    /// **その 101 回が速ければ緑になる** — つまり回帰そのものを見逃す。
+    /// 逆に機械が混めば、正しい実装でも赤くなり得る。
+    ///
+    /// 数えたいものは最初から回数だった: **呼び出し側が撃った同期 RPC の回数。
+    /// 答えは 0** (修正前は 101)。
     #[test]
-    fn resize_storm_neither_blocks_the_caller_nor_loses_the_final_size() {
+    fn resize_storm_charges_the_caller_no_conpty_rpc_and_keeps_the_final_size() {
         let mut s = resize_probe_session(9401);
-        let t0 = Instant::now();
+        stall::reset();
         for i in 0..100u16 {
             let (rows, cols) = (10 + i % 17, 40 + i % 29);
             // 同じサイズを K フレームぶん要求し、毎回ワーカーへの出荷まで起こす
@@ -10747,12 +11113,19 @@ mod pty_resize_tests {
         for _ in 0..RESIZE_STABLE_FRAMES {
             s.resize(frows, fcols);
         }
-        let elapsed = t0.elapsed();
+        // ワーカーを起こせない環境 (スレッド枯渇) では、代替経路が呼び出し側で
+        // RPC を撃つ設計になっている。そこで 0 を求めるのは筋が違うので見送る。
+        if s.resizer.is_none() {
+            s.kill();
+            return;
+        }
         // 修正前は 101 回の同期 RPC がここに乗っていた。呼び出し側は
         // サイズの上書きと通知しかしないので、詰まりようがない。
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "リサイズの呼び出し側がブロックした: {elapsed:?}"
+        assert_eq!(
+            stall::pty_resizes(),
+            0,
+            "リサイズの呼び出し側が ConPTY への同期 RPC を撃った ({})",
+            stall::breakdown()
         );
         // 描画グリッド (vt100) は即時に最終サイズ。
         assert_eq!(
@@ -10761,6 +11134,15 @@ mod pty_resize_tests {
             "vt100 が要求サイズに即時追従していない"
         );
         // PTY 本体にも水面下で最終サイズが届く (取りこぼし禁止)。
+        //
+        // **ここだけ実時間が残る。理由を書いておく。** これは「速いこと」の
+        // 予算ではなく「**いつかは届く**こと」(生存性) の待ちで、性質上
+        // 「まだ来ていない」と「もう来ない」を有限時間で区別できない。
+        // 完了の合図が無い (`pty_size` は問い合わせるしかない) ので、
+        // 時計を外すと回帰が**赤ではなくハング**になる。
+        // 10 秒は実際の所要 (1 ミリ秒未満) から 4 桁上に置いてあり、
+        // 4 倍オーバーサブスクライブ (16 コアに 64 本の busy loop) で
+        // 8 回連続緑を実測済み。合否を分ける線ではない。
         let deadline = Instant::now() + Duration::from_secs(10);
         while s.pty_size() != Some((frows, fcols)) {
             assert!(
