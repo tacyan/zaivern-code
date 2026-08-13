@@ -1458,6 +1458,10 @@ fn group_of_item(it: &Item) -> Option<Group> {
     }
 }
 
+/// 詳細 (パス) を出すのに最低限要る幅。これを割ったら**出さない**
+/// (省略記号だけの詰め物は行を溢れさせるうえ、何の情報も伝えない)。
+const DETAIL_MIN_W: f32 = 40.0;
+
 /// パレットの候補一覧を描く。クリックされた項目を返す。
 ///
 /// 呼び出し側は `egui::ScrollArea` の中でこれを呼ぶだけでよい。
@@ -1510,39 +1514,60 @@ pub fn list_ui(
                         // 右端の分類タグを**先に**置いて幅を予約し、残りの幅で
                         // ラベルを省略する。逆順にするとタグの分だけ行がはみ出す。
                         let tag = if res.tags { group_of_item(it) } else { None };
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(g) = tag {
-                                ui.label(
-                                    egui::RichText::new(g.title())
-                                        .size(11.0)
-                                        .color(theme.text_dim.gamma_multiply(0.75)),
-                                );
-                            }
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.label(&it.icon);
-                                    // 長いラベル・詳細は省略する (どの幅でも
-                                    // 行からはみ出さない。全文はホバーで出る)
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&it.label).color(theme.text),
-                                        )
-                                        .truncate(),
+                        // **`with_layout` を直に使わない。** 右詰め (cross_align =
+                        // Center) の子 Ui は `max_rect` を**縦いっぱい**に取るので、
+                        // 1 行目が残り高さを全部食い、2 行目以降が可視域の外へ
+                        // 落ちる (実測: 900×700 で 6 件のうち **1 件しか描かれない**)。
+                        // `ui.horizontal` が内部でやっているのと同じく、行の高さを
+                        // `interact_size.y` で切ってから配る。
+                        // 番人: `crate::e2e::click_tests::パレットの行はどの幅でも押せる`
+                        let row_size =
+                            egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                        ui.allocate_ui_with_layout(
+                            row_size,
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if let Some(g) = tag {
+                                    ui.label(
+                                        egui::RichText::new(g.title())
+                                            .size(11.0)
+                                            .color(theme.text_dim.gamma_multiply(0.75)),
                                     );
-                                    if !it.detail.is_empty() {
+                                }
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(&it.icon);
+                                        // 長いラベル・詳細は省略する (どの幅でも
+                                        // 行からはみ出さない。全文はホバーで出る)
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(&it.detail)
-                                                    .size(11.5)
-                                                    .color(theme.text_dim),
+                                                egui::RichText::new(&it.label).color(theme.text),
                                             )
                                             .truncate(),
                                         );
-                                    }
-                                },
-                            );
-                        });
+                                        // **入り切らないなら詳細は出さない。**
+                                        // `truncate()` は幅 0 でも省略記号 (…)
+                                        // を描くので、残り 10px の所へ 12px を
+                                        // 置いて行が溢れる。溢れると egui は親の
+                                        // `max_rect` を広げるため、**次の行から
+                                        // ラベルの省略幅まで狂う**
+                                        // (実測 360px 幅で 362 → 381 → … → 448)。
+                                        let room = ui.available_width();
+                                        if !it.detail.is_empty() && room >= DETAIL_MIN_W {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&it.detail)
+                                                        .size(11.5)
+                                                        .color(theme.text_dim),
+                                                )
+                                                .truncate(),
+                                            );
+                                        }
+                                    },
+                                );
+                            },
+                        );
                     });
                 let r = ui.interact(
                     fr.response.rect,

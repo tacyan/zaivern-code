@@ -1972,7 +1972,11 @@ impl LocalHistory {
         }
         let mut open = self.open;
         let screen = ctx.screen_rect();
-        egui::Window::new(tr("🕰 ローカルヒストリ"))
+        // `max_height` だけでは足りない。あれは**中身**の上限なので、
+        // タイトルバーと枠の余白 (実測 44.7px) が画面からはみ出す
+        // (1200×300 で −6 〜 306 になり、掴む場所と ✕ が画面の外へ出た)。
+        // 詳細と実測表は `crate::dialog` のモジュール doc。
+        crate::dialog::window(ctx, tr("🕰 ローカルヒストリ"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)

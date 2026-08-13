@@ -205,8 +205,58 @@ pub enum BindAction {
     TermNextPrompt,
 }
 
-/// 全アクションの一覧 (デフォルトマップ構築用)。
-pub const ALL_ACTIONS: [BindAction; 89] = [
+/// [`ALL_ACTIONS`] を組み立てる。**長さを人が書かない**ための唯一の理由。
+///
+/// ## 何を直したのか
+///
+/// 以前はここが `pub const ALL_ACTIONS: [BindAction; 89] = [ … ];` だった。
+/// 一覧へ 1 行足す人は**必ず 89 を 90 へ書き換える**必要があり、
+/// 並列に走る N 本の枝が**全員まったく同じ「90」を書く**。
+/// 同じ行が同じ内容になるので **git は衝突を出さない** —
+/// にもかかわらず統合後の実要素数は `89 + N` で、宣言と食い違う。
+/// `tools/shared-surface-bench.sh` はこれを `NG(長さ)` として全条件で観測した
+/// (`docs/chain-1-and-4.md`)。**衝突 0 と「正しい」は別物**という典型例で、
+/// union マージ (`crate::union`) では原理的に直せない —
+/// union は「両側の追記を両方残す」ので、両側が同じ `90` を書いた時点で
+/// 残せる正解が存在しない。
+///
+/// ## なぜこの形か (`$p:path` を取って長さを const 評価で数える)
+///
+/// * **呼び出し側が 1 行も変わらない。** 型は `[BindAction; 89]` のままなので
+///   `for a in ALL_ACTIONS`（値で回る）も `.to_vec()` も `.iter().enumerate()`
+///   も今までどおり。`ALL_ACTIONS` は `app.rs` / `jump.rs` / `whichkey.rs` /
+///   `tutorial.rs` / `marks.rs` の 20 箇所超から使われている。
+/// * **一覧の各行が 1 バイトも変わらない。** `    BindAction::Save,` のまま
+///   なので、追記の作法も既存の履歴も merge driver の当たり方も変わらない。
+///
+/// ## 採らなかった案
+///
+/// * **`&[BindAction]` にする** — 長さは消えるが `for a in ALL_ACTIONS` の
+///   要素型が `BindAction` から `&BindAction` へ変わり、上記 6 ファイル
+///   20 箇所超を書き換えることになる。**長さのずれを、他の枝との
+///   マージ衝突に交換するだけ**なので採らない。`feature::REGISTRY` や
+///   `MACOS_RESERVED` のように最初から slice の一覧はそのままでよい。
+/// * **`enum BindAction` ごとマクロで生成して追記点を 1 つにする** —
+///   追記点は 2 → 1 になるが、`pub enum BindAction {` はベンチ・
+///   `all_actionsの数がbindactionの変種数と一致する`・外部ツールが
+///   ソースから読む錨で、700 行の doc コメント付き enum をマクロ呼び出しへ
+///   畳む代償が大きい。そして**追記点が 2 つあること自体は問題ではない**:
+///   同じベンチで `config` 面 (struct + Default の 2 箇所) は全条件 OK。
+///   壊れていたのは手で数えた長さだけなので、そこだけ直す。
+/// * **`const` assertion でずれをコンパイル時に落とす** — 落ちる先が
+///   「配列リテラルの要素数と宣言長が違う」という**元から出るエラー**と
+///   同じで、何も足さない。防ぎたいのは失敗の遅さではなく
+///   「人が数を書く」こと自体。
+macro_rules! all_actions {
+    ($($p:path),* $(,)?) => {
+        /// 全アクションの一覧 (デフォルトマップ構築用)。
+        ///
+        /// 長さは [`all_actions!`] が要素から数える。**手で書く数は無い。**
+        pub const ALL_ACTIONS: [BindAction; [$(stringify!($p)),*].len()] = [$($p),*];
+    };
+}
+
+all_actions![
     BindAction::Save,
     BindAction::SaveAs,
     BindAction::CloseTab,
@@ -2389,6 +2439,86 @@ pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
     blocked
 }
 
+// ── IME 規則 4: 確定文字列の二重入力を落とす ───────────────────────────
+//
+// `Ime::Commit("日本語")` と `Text("日本語")` が**同じフレームに両方**届く
+// 環境がある (Windows の一部 IME)。egui-winit 0.29 の 2 つの経路 —
+// `WindowEvent::Ime` (lib.rs:358) と `WindowEvent::KeyboardInput` (同 786) —
+// は**互いを何も知らない**ので、両方が素通りして `TextEdit` へ入る。
+// egui 0.29 の `TextEdit` は Commit で未確定分を消してから確定文字列を入れ、
+// Text はそのまま挿入するため、結果は `"日本語日本語"` になる。
+//
+// これは `terminal::translate_input` が**規則 4** として既に潰している。
+// 端末だけが守られていてエディタ (コマンドパレットの検索欄・検索置換・
+// コードエディタ本体) が無防備だったので、同じ考え方をここへ持ってくる:
+// **同一フレームの `Commit` と同じ文字列の `Text` を、Commit 1 つにつき
+// 1 つだけ落とす。**
+//
+// 端末との 1 点の違いは**並び順に依存しないこと**。端末は PTY へ流す
+// バイト列を作りながら進むので「Commit を見た後の Text」しか落とせないが、
+// ここはフレームのイベント列を丸ごと先に見られる。winit がどちらの順で
+// 積むかは IME 実装依存 (Windows は WM_IME_ENDCOMPOSITION と WM_CHAR の
+// 前後が IME ごとに違う) なので、順序を仮定しないほうが嘘が少ない。
+//
+// **IME を使わない入力は 1 バイトも触らない**: このフレームに非空の
+// `Commit` が 1 つも無ければ即座に空を返す (下の
+// `確定が無いフレームは何も落とさない` が番人)。
+
+/// 落とすべき `events` の添字を返す純関数。
+///
+/// * 非空の `Commit` が無いフレームでは**必ず空**を返す
+/// * `Commit` 1 つにつき、同じ文字列の `Text` を**ちょうど 1 つ**だけ落とす
+///   (利用者が同じ字を続けて打った 2 つ目までは消さない)
+/// * 文字列が一致しない `Text` は落とさない
+fn duplicate_commit_text_indices(events: &[egui::Event]) -> Vec<usize> {
+    let mut pending: Vec<&str> = Vec::new();
+    for ev in events {
+        if let egui::Event::Ime(egui::ImeEvent::Commit(t)) = ev {
+            if !t.is_empty() {
+                pending.push(t.as_str());
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut drop = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        if let egui::Event::Text(t) = ev {
+            if let Some(p) = pending.iter().position(|c| *c == t.as_str()) {
+                pending.remove(p);
+                drop.push(i);
+            }
+        }
+    }
+    drop
+}
+
+/// 同一フレームで重複した確定文字列の `Text` を `ctx` のイベント列から落とす。
+///
+/// **1 フレームに 1 回、入力欄を 1 つも描く前に呼ぶこと。** 呼び出し地点は
+/// `App::update_impl` の `handle_shortcuts` の直前 1 か所
+/// (`keybinds::tests::確定文字列の重複落としをパネル描画より前に通している`
+/// が位置を構造で固定する)。`feature::draw_all` では遅い — そこまでに
+/// `TextEdit` が両方のイベントを食べ終わっている。
+///
+/// 返り値は落とした個数 (テストと計測のため)。
+pub fn drop_duplicate_ime_text(ctx: &egui::Context) -> usize {
+    ctx.input_mut(|i| {
+        let drop = duplicate_commit_text_indices(&i.events);
+        if drop.is_empty() {
+            return 0;
+        }
+        let mut at = 0usize;
+        i.events.retain(|_| {
+            let keep = !drop.contains(&at);
+            at += 1;
+            keep
+        });
+        drop.len()
+    })
+}
+
 fn hint_id(a: BindAction) -> egui::Id {
     egui::Id::new(("zv-key-hint", format!("{a:?}")))
 }
@@ -3041,6 +3171,12 @@ fn other() {
             }
             let opens = line.matches('{').count();
             let closes = line.matches('}').count();
+            // 波括弧を持たない項目 (`mod x;` / `const X: .. = ..;`) に付いた
+            // `#[cfg(test)]` はその行で閉じる。保留したままにすると、次に
+            // 出てきた無関係な `{` から本体を落として検査が静かに緩む。
+            if pend && opens == 0 && trimmed.ends_with(';') {
+                pend = false;
+            }
             let inside = test_exit.is_some();
             if pend && opens > 0 && test_exit.is_none() {
                 test_exit = Some(depth);
@@ -3069,7 +3205,7 @@ fn other() {
     /// 1 つでも欠けたら落ちる。
     #[test]
     fn 全アクションが消費地点に繋がっている() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let mut missing: Vec<String> = Vec::new();
         for a in ALL_ACTIONS {
             // 使用箇所は必ず `self.keys.get(BindAction::X)` の形なので、
@@ -3102,7 +3238,7 @@ fn other() {
     /// 二度と発火しなくなる (egui-winit がキーイベントごと捨てるため)。
     #[test]
     fn ショートカット消費は互換経路を通っている() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
@@ -3153,7 +3289,7 @@ fn other() {
     /// (VS Code の "Record Keys" が守っているのと同じ順序)。
     #[test]
     fn 記録の取り込みは通常の消費より先に来る() {
-        let src = src_of(include_str!("app.rs"));
+        let src = src_of(crate::app::SRC);
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context) {")
             .nth(1)
@@ -3580,13 +3716,170 @@ fn other() {
         assert!(!run(vec![]), "確定の次フレームから通常どおり");
     }
 
+    /// 規則 4 (確定文字列の二重入力落とし) を表で固定する。
+    ///
+    /// 中核は 2 つ — **確定が無いフレームは 1 つも落とさない**
+    /// (= IME を使わない入力を壊さない) ことと、**Commit 1 つにつき
+    /// Text は 1 つだけ**落ちること (連打の 2 つ目まで消さない)。
+    #[test]
+    fn 同フレームの確定文字列と同じtextだけを一つ落とす() {
+        let t = |s: &str| egui::Event::Text(s.into());
+        let table: &[(&str, Vec<egui::Event>, Vec<usize>)] = &[
+            // ── 落とさない側 (通常入力を 1 文字も壊さない) ──
+            ("空のフレーム", vec![], vec![]),
+            ("確定が無い", vec![t("a"), t("b")], vec![]),
+            ("同じ字の連打 (確定なし)", vec![t("あ"), t("あ")], vec![]),
+            ("未確定だけ", vec![preedit("にほん"), t("n")], vec![]),
+            ("空の確定は数えない", vec![commit(""), t("")], vec![]),
+            (
+                "確定はあるが文字列が違う",
+                vec![commit("日本語"), t("にほんご")],
+                vec![],
+            ),
+            (
+                "部分一致は落とさない",
+                vec![commit("日本語"), t("日本")],
+                vec![],
+            ),
+            // ── 落とす側 ──
+            ("確定 → Text", vec![commit("日本語"), t("日本語")], vec![1]),
+            ("Text → 確定", vec![t("日本語"), commit("日本語")], vec![0]),
+            (
+                "確定の前後に他のイベントがあってもよい",
+                vec![preedit(""), commit("한"), t("한")],
+                vec![2],
+            ),
+            (
+                "Commit 1 つにつき Text は 1 つだけ",
+                vec![commit("あ"), t("あ"), t("あ")],
+                vec![1],
+            ),
+            (
+                "Commit 2 つなら Text も 2 つ",
+                vec![commit("あ"), commit("あ"), t("あ"), t("あ")],
+                vec![2, 3],
+            ),
+            (
+                "落とすのは一致したものだけ",
+                vec![commit("漢字"), t("x"), t("漢字"), t("y")],
+                vec![2],
+            ),
+        ];
+        for (what, events, want) in table {
+            assert_eq!(
+                &duplicate_commit_text_indices(events),
+                want,
+                "{what}: 落とす添字が違う"
+            );
+        }
+    }
+
+    /// `ctx` 越しに呼んでも、落ちるのは重複した `Text` だけ。
+    ///
+    /// 純関数の表だけでは「`retain` の添字がずれて隣のイベントを消す」を
+    /// 捕まえられない (実際に壊しやすい形)。残ったイベント列そのものを見る。
+    #[test]
+    fn 重複落としは隣のイベントを巻き込まない() {
+        let ctx = egui::Context::default();
+        let t = |s: &str| egui::Event::Text(s.into());
+        let key = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let run = |events: Vec<egui::Event>| -> (usize, Vec<String>) {
+            let mut out = (0, Vec::new());
+            let _ = ctx.run(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    let n = drop_duplicate_ime_text(ctx);
+                    let left = ctx.input(|i| {
+                        i.events
+                            .iter()
+                            .map(|e| match e {
+                                egui::Event::Text(s) => format!("T({s})"),
+                                egui::Event::Ime(egui::ImeEvent::Commit(s)) => format!("C({s})"),
+                                egui::Event::Ime(egui::ImeEvent::Preedit(s)) => format!("P({s})"),
+                                egui::Event::Key { key, .. } => format!("K({key:?})"),
+                                other => format!("{other:?}"),
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    out = (n, left);
+                },
+            );
+            out
+        };
+        // 重複が無いフレームは 1 バイトも触らない
+        let (n, left) = run(vec![key.clone(), t("a"), t("b")]);
+        assert_eq!(n, 0, "確定が無いのに落とした");
+        assert_eq!(left, vec!["K(A)", "T(a)", "T(b)"], "通常入力が削られた");
+        // 重複だけが 1 つ消え、前後は残る
+        let (n, left) = run(vec![
+            key.clone(),
+            preedit(""),
+            commit("日本語"),
+            t("日本語"),
+            t("!"),
+        ]);
+        assert_eq!(n, 1, "重複を落としていない");
+        assert_eq!(
+            left,
+            vec!["K(A)", "P()", "C(日本語)", "T(!)"],
+            "重複以外まで消えた (retain の添字ずれ)"
+        );
+    }
+
+    /// 重複落としが **パネルを 1 つも描く前**に通る。
+    ///
+    /// `feature::draw_all` まで下ろすと、そのころには入力欄の `TextEdit` が
+    /// `Commit` と `Text` を両方食べ終わっている (= 直っていない)。
+    /// 位置が仕様なので構造で固定する。
+    #[test]
+    fn 確定文字列の重複落としをパネル描画より前に通している() {
+        // **コメント行を落としてから探す。** 素の `find` は
+        // `// crate::keybinds::drop_duplicate_ime_text(ctx);` のような
+        // コメントアウトにも当たるので、呼び出しを消しても緑のままになる
+        // (実際にこの検査を書いた直後、その形で嘘の緑を出した)。
+        let src: String = crate::app::SRC
+            .replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = src
+            .split("fn update_impl(&mut self, ctx: &egui::Context")
+            .nth(1)
+            .expect("フレーム処理がある");
+        let guard = body
+            .find("keybinds::drop_duplicate_ime_text(ctx)")
+            .expect("IME 二重入力の関門が update_impl に無い");
+        let draw = body
+            .find("feature::draw_all(self, ctx)")
+            .expect("描画地点がある");
+        assert!(
+            guard < draw,
+            "IME 二重入力の関門が描画より後ろにある (入力欄が両方食べ終わっている)"
+        );
+        // ショートカット処理より前でもあること (どちらもイベント列を触る)。
+        let sc = body
+            .find("self.handle_shortcuts(ctx)")
+            .expect("ショートカット処理の呼び出しがある");
+        assert!(guard < sc, "関門がショートカット処理より後ろにある");
+    }
+
     /// `handle_shortcuts` の先頭に IME ガードがある (消費の前に必ず通る)。
     ///
     /// ガードを消費地点の**後ろ**へ動かすと、そのフレームのショートカットは
     /// もう食われている。位置が仕様なので構造で固定する。
     #[test]
     fn ショートカット消費の前に必ず変換中ガードを通る() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let body = src
             .split("fn handle_shortcuts(&mut self, ctx: &egui::Context)")
             .nth(1)
@@ -3631,8 +3924,14 @@ fn other() {
             "⌥⌘C",
             "⇧⌥⌘C",
         ];
-        let files: [(&str, &str); 8] = [
-            ("app.rs", include_str!("app.rs")),
+        // 長さを書かない (`[(&str, &str); 8]` と書くと、走査対象を 1 つ足す
+        // 枝が全員「9」を書いて git は通すのに要素数は合わなくなる。
+        // `ALL_ACTIONS` と同じ穴)。
+        //
+        // `app.rs` は 51 ファイルへ分割したので `include_str!` では読めない。
+        // `crate::app::SRC_IMPL` が実装側だけを連結して持っている。
+        let files = [
+            ("app.rs", crate::app::SRC_IMPL),
             ("whichkey.rs", include_str!("whichkey.rs")),
             ("menu_bar.rs", include_str!("menu_bar.rs")),
             ("palette.rs", include_str!("palette.rs")),

@@ -205,11 +205,14 @@ pub enum Reason {
     TooClose,
     /// 片方がファイル全体 (二値・新規・削除・リネーム・モード変更)。
     WholeFile,
-    /// **交錯**。どの組も安全帯を満たしているが、片方がもう片方を上下から
-    /// 挟んでいて、しかも境目に錨 ([`crate::region::anchor_lines`]) が無い。
+    /// **壁が無い**。どの組も安全帯を満たしているが、持ち主が変わる境目に
+    /// 錨 ([`crate::region::anchor_lines`] = ファイル内で唯一の行) が 1 本も無い。
     ///
-    /// 帯だけでは言い切れない唯一の形。詳細は
-    /// [`crate::region::interleave_safe`] に実測ごと書いてある。
+    /// 帯だけでは言い切れない唯一の形。名前は「挟んでいる」形しか知らなかった
+    /// 頃の名残で、**いまは上下に分かれた組も含む** — 削除・挿入が混ざると
+    /// 交錯していなくても衝突するため ([`crate::region::needs_wall`] に実測)。
+    /// 直し方は「離す」ではなく「壁のある位置へずらす」
+    /// ([`crate::region::anchor_fit`])。
     Bracketed,
 }
 
@@ -220,7 +223,7 @@ impl Reason {
             Reason::Overlap => "行域が重なっています",
             Reason::TooClose => "安全帯より近い行です",
             Reason::WholeFile => "ファイル全体を占める変更です",
-            Reason::Bracketed => "相手の行域を挟んでいて、間に手がかりの行がありません",
+            Reason::Bracketed => "境目に手がかりの行 (ファイル内で唯一の行) がありません",
         }
     }
 }
@@ -241,10 +244,18 @@ pub struct Clash {
     /// ファイル全体が絡むときは `None`。
     pub gap: Option<u32>,
     pub reason: Reason,
+    /// **断る代わりの答え。** `b` 側をここへずらせば壁ができて一撃で通る
+    /// ([`crate::region::anchor_fit`])。壁のある空きが 1 つも無ければ `None`
+    /// (錨が 1 本も無いファイルがこれ)。
+    ///
+    /// [`Reason::Bracketed`] のときだけ入る。`b` 側が 1 本の行域のときに限る
+    /// (複数本をまとめて動かす提案は、利用者が確かめられないので出さない)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shift: Option<Span>,
 }
 
 impl Clash {
-    /// `パス:行` 形式の 1 行표示 (画面にもログにも同じ文字列で出す)。
+    /// `パス:行` 形式の 1 行表示 (画面にもログにも同じ文字列で出す)。
     pub fn render(&self) -> String {
         let span = |s: &Option<Span>| match s {
             None => tr("全体"),
@@ -252,14 +263,32 @@ impl Clash {
             Some(x) if x.end == Span::EOF => format!("L{}-", x.start),
             Some(x) => format!("L{}-{}", x.start, x.end),
         };
-        format!(
+        let mut s = format!(
             "{}: {} {} ↔ {} {}",
             self.path,
             self.a,
             span(&self.a_span),
             self.b,
             span(&self.b_span)
-        )
+        );
+        // **形で直し方が違うので、形を言う。** 挟んでいる (外接域が重なる) なら
+        // どこへ動かしても挟んだままなので、域を 1 本にまとめるしかない。
+        // 上下に並んでいるだけなら、壁のある位置へずらせば通る。
+        if self.reason == Reason::Bracketed {
+            let hull = |x: &Option<Span>| x.iter().copied().collect::<Vec<Span>>();
+            s.push_str(&if region::interleaved(&hull(&self.a_span), &hull(&self.b_span)) {
+                tr(" (挟んでいます)")
+            } else {
+                tr(" (壁なしで並んでいます)")
+            });
+        }
+        if let Some(to) = &self.shift {
+            s.push_str(&trf(
+                " → {b} を {r} へずらせば通ります",
+                &[("b", self.b.clone()), ("r", span(&Some(*to)))],
+            ));
+        }
+        s
     }
 }
 
@@ -347,8 +376,8 @@ impl Proof {
                 );
             }
         }
-        // **交錯は「近すぎる」ではない。** 帯は満たしているのに通せない形なので、
-        // 「もう少し離せば済む」と読ませると利用者が無駄に動かすことになる。
+        // **壁が無いのは「近すぎる」ではない。** 帯は満たしているのに通せない
+        // 形なので、「もう少し離せば済む」と読ませると利用者が無駄に動かす。
         let bracketed = self
             .pairs
             .iter()
@@ -356,7 +385,7 @@ impl Proof {
             .count();
         if bracketed > 0 && bracketed == self.pairs.len() && self.truncated == 0 {
             return trf(
-                "⛔ {n} 組が相手の行域を挟んでいます (安全帯 {b} 行は満たしています) \
+                "⛔ {n} 組の境目に手がかりの行がありません (安全帯 {b} 行は満たしています) \
                  — 離しても解決しません",
                 &[("n", bracketed.to_string()), ("b", self.band.to_string())],
             );
@@ -789,22 +818,25 @@ pub fn clashes_with(
                     out.push(clash_of(na, nb, pa, pb));
                 }
             }
-            // ── 交錯 ────────────────────────────────────────────────
+            // ── 壁 ──────────────────────────────────────────────────
             //
             // ここまでの判定は**組ごと**で、それは今も正しい。足りないのは
             // 「全部の組が帯を満たす ⇒ まとめてマージしても綺麗に通る」という
-            // 推論のほうで、片方が相手を上下から挟んでいると反復的な本文では
-            // 帯を何行取っても衝突しうる (`region::anchor_lines` に実測)。
+            // 推論のほうで、反復的な本文では帯を何行取っても衝突しうる
+            // (`region::anchor_lines` に実測)。
+            //
+            // **門は `interleaved` ではない。** 削除・挿入が混ざると上下に
+            // 分かれた組でも衝突する (`region::needs_wall` に実測)。
             for path in shared_paths(x, y) {
                 if already.contains(&(i, j, path.clone())) {
                     continue;
                 }
                 let (sa, sb) = (spans_on(x, &path), spans_on(y, &path));
-                if !region::interleaved(&sa, &sb) {
+                if !region::needs_wall(&sa, &sb) {
                     continue;
                 }
                 let Some(anchors) = anchors_of(&path) else {
-                    continue; // 本文を持っていない呼び出し — 交錯は見ない
+                    continue; // 本文を持っていない呼び出し — 壁は見ない
                 };
                 if region::interleave_safe(&anchors, &sa, &sb) {
                     continue;
@@ -813,10 +845,23 @@ pub fn clashes_with(
                 if out.len() >= MAX_CLASHES {
                     continue;
                 }
-                let (na, nb, ha, hb) = if flip {
-                    (&y.branch, &x.branch, region::hull(&sb), region::hull(&sa))
+                let (na, nb, ha, hb, stay, movable) = if flip {
+                    (&y.branch, &x.branch, region::hull(&sb), region::hull(&sa), &sb, &sa)
                 } else {
-                    (&x.branch, &y.branch, region::hull(&sa), region::hull(&sb))
+                    (&x.branch, &y.branch, region::hull(&sa), region::hull(&sb), &sa, &sb)
+                };
+                // **断る代わりの答えを一緒に返す。** 動かす側が 1 本の行域の
+                // ときだけ、壁のある空きを探して差し出す。探す幅はファイル全体
+                // (固定の上限を置くと、大きいファイルでだけ静かに諦める)。
+                let shift = match movable.as_slice() {
+                    [one] => region::anchor_fit(
+                        &anchors,
+                        stay,
+                        one,
+                        band,
+                        anchors.len().try_into().unwrap_or(u32::MAX),
+                    ),
+                    _ => None,
                 };
                 out.push(Clash {
                     a: na.clone(),
@@ -826,6 +871,7 @@ pub fn clashes_with(
                     b_span: hb,
                     gap: None,
                     reason: Reason::Bracketed,
+                    shift,
                 });
             }
         }
@@ -872,6 +918,106 @@ fn spans_on(x: &BranchRegions, path: &str) -> Vec<Span> {
     v
 }
 
+/// 1 ファイルぶんの本文をここまで読む (これを超えたら「読めなかった」扱い)。
+///
+/// 読み飛ばすのではなく **fail-closed** に落ちる — 巨大な生成物こそ錨が
+/// 薄いので、静かに緩めると一番効いてほしい場面で効かなくなる。
+const MAX_BASE_TEXT: usize = 4 << 20;
+
+/// まとめ読みで抱える合計 (これを超えたぶんは「読めなかった」扱い)。
+const MAX_BASE_TOTAL: usize = 64 << 20;
+
+/// 2 人以上の枝が触ったファイル (重複なし・辞書順)。
+///
+/// 壁の判定 ([`region::interleave_safe`]) が要るのはここだけなので、
+/// 本文のまとめ読みもこの一覧だけを対象にする。
+fn multi_owner_paths(items: &[BranchRegions]) -> Vec<String> {
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for b in items {
+        // `files()` は重複を落とすので、枝ごとに 1 回だけ数える。
+        for p in b.files() {
+            *count.entry(p).or_insert(0) += 1;
+        }
+    }
+    count
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// `<rev>:<path>` の中身を **1 回の `git cat-file --batch`** で読む。
+///
+/// 返すのはパス → 本文。読めなかったもの (存在しない・大きすぎる・
+/// 合計が上限に届いた) は**入れない** — 呼び出し側は「錨が空」= fail-closed
+/// として扱う。
+fn base_texts(repo: &Path, rev: &str, paths: &[String]) -> BTreeMap<String, String> {
+    if paths.is_empty() {
+        return BTreeMap::new();
+    }
+    let input: String = paths
+        .iter()
+        .map(|p| format!("{rev}:{p}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    let mut child = match crate::procx::hidden_command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return BTreeMap::new(),
+    };
+    if let Some(mut si) = child.stdin.take() {
+        use std::io::Write;
+        let _ = si.write_all(input.as_bytes());
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => return BTreeMap::new(),
+    };
+    parse_cat_file_batch(paths, &out.stdout)
+}
+
+/// `git cat-file --batch` の生出力を割る (**純関数**。git を起こさない)。
+///
+/// 1 件は `<oid> SP <type> SP <size> LF <中身> LF`、見つからなければ
+/// `<入力> SP missing LF` で**中身が続かない**。返事は入力と同じ順に来るので、
+/// 添字で突き合わせる (見出しの OID は入力の綴りではないため照合に使えない)。
+fn parse_cat_file_batch(paths: &[String], raw: &[u8]) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let (mut at, mut n, mut total) = (0usize, 0usize, 0usize);
+    while at < raw.len() && n < paths.len() {
+        let Some(nl) = raw[at..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let head = String::from_utf8_lossy(&raw[at..at + nl]).to_string();
+        at += nl + 1;
+        let size = head
+            .rsplit(' ')
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|_| head.split(' ').count() >= 3);
+        let Some(size) = size else {
+            n += 1; // missing / ambiguous — 中身は続かない
+            continue;
+        };
+        let end = at.saturating_add(size).min(raw.len());
+        if size <= MAX_BASE_TEXT && total.saturating_add(size) <= MAX_BASE_TOTAL {
+            total += size;
+            out.insert(paths[n].clone(), crate::textenc::decode_output(&raw[at..end]));
+        }
+        at = end.saturating_add(1); // 中身の後ろの LF
+        n += 1;
+    }
+    out
+}
+
 /// 1 組ぶんの [`Clash`] を組み立てる。
 fn clash_of(a: &str, b: &str, ra: &Region, rb: &Region) -> Clash {
     let (reason, gap) = match (ra.span, rb.span) {
@@ -894,6 +1040,8 @@ fn clash_of(a: &str, b: &str, ra: &Region, rb: &Region) -> Clash {
         b_span: rb.span,
         gap,
         reason,
+        // 帯で断った組は「離す」で直る。ずらし先の提案は壁が無い組だけに出す。
+        shift: None,
     }
 }
 
@@ -1059,17 +1207,23 @@ pub fn proof(repo: &Path, base: &str, branches: &[String], band: u32) -> Proof {
     }
     items.sort_by(|a, b| a.branch.cmp(&b.branch));
 
-    // 交錯している組があるファイルだけ、共通祖先側の本文を 1 回読む。
-    // **互いに素な配り方では 1 度も走らない** (`shared_paths` で交錯が
-    // 見つかったときにしか呼ばれない)。読めなければ空を返して fail-closed。
+    // 2 人以上が触ったファイルの共通祖先側の本文を、**1 回の
+    // `git cat-file --batch`** でまとめて読む。
+    //
+    // 0.16.0 まではファイルごとに `git show` を撃っていた。門が
+    // [`region::needs_wall`] になって「交錯している組があるファイルだけ」から
+    // 「同じファイルを 2 人が持つ組すべて」へ広がったので、そのままだと
+    // **240 ケースの網羅試験で `git show` が 229 回**走った (実測)。
+    // まとめ読みで **229 → 1**。プロセス起動がいちばん高い Windows で効く。
+    let shared = multi_owner_paths(&items);
+    let texts = base_texts(&top, &common, &shared);
     let mut cache: BTreeMap<String, Vec<bool>> = BTreeMap::new();
     let mut anchors_of = |path: &str| -> Option<Vec<bool>> {
         if let Some(v) = cache.get(path) {
             return Some(v.clone());
         }
-        let spec = format!("{common}:{path}");
-        let text = git_out(&top, &["show", &spec]).unwrap_or_default();
-        let v = region::anchor_lines(&text);
+        // 読めなかったファイルは空の錨 = fail-closed (握り潰さない)。
+        let v = region::anchor_lines(texts.get(path).map(String::as_str).unwrap_or(""));
         cache.insert(path.to_string(), v.clone());
         Some(v)
     };
@@ -2311,6 +2465,74 @@ mod tests {
         }
     }
 
+    // ── まとめ読み (純関数) ────────────────────────────────────────
+
+    /// `git cat-file --batch` の出力を割る表。
+    ///
+    /// **ここが壊れると、錨が全部空になって静かに全部断る**方向へ倒れる
+    /// (fail-closed なので気付きにくい)。中身は入力の綴りではなく OID を
+    /// 見出しに持つので、**入力順で突き合わせる**ことまで固定する。
+    #[test]
+    fn まとめ読みの出力を割る表() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        // 見つかった 2 件
+        let raw = format!("{oid} blob 6\nhello\n\n{oid} blob 4\nabc\n\n");
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let got = parse_cat_file_batch(&paths, raw.as_bytes());
+        assert_eq!(got.get("a.rs").map(String::as_str), Some("hello\n"));
+        assert_eq!(got.get("b.rs").map(String::as_str), Some("abc\n"));
+
+        // 真ん中が missing — **中身が続かない**ので、後ろがずれないこと
+        let raw2 = format!("{oid} blob 3\nab\n\nHEAD:x missing\n{oid} blob 3\ncd\n\n");
+        let p2 = vec!["a".to_string(), "x".to_string(), "c".to_string()];
+        let got2 = parse_cat_file_batch(&p2, raw2.as_bytes());
+        assert_eq!(got2.get("a").map(String::as_str), Some("ab\n"));
+        assert_eq!(got2.get("x"), None, "missing を中身として拾った");
+        assert_eq!(
+            got2.get("c").map(String::as_str),
+            Some("cd\n"),
+            "missing の後ろがずれている"
+        );
+
+        // 空の入力 / 空の出力 / 途中で切れた出力 — どれも落ちない
+        assert!(parse_cat_file_batch(&[], b"").is_empty());
+        assert!(parse_cat_file_batch(&paths, b"").is_empty());
+        assert!(parse_cat_file_batch(&paths, format!("{oid} blob 99\nshort").as_bytes())
+            .get("a.rs")
+            .is_some_and(|v| v == "short"));
+
+        // 大きすぎるものは**入れない** (= 錨が空 = fail-closed)
+        let big = format!("{oid} blob {}\n", MAX_BASE_TEXT + 1);
+        let mut raw3 = big.into_bytes();
+        raw3.extend(std::iter::repeat_n(b'x', MAX_BASE_TEXT + 1));
+        raw3.push(b'\n');
+        assert!(
+            parse_cat_file_batch(&["big.bin".to_string()], &raw3).is_empty(),
+            "上限を超えた本文を読み込んでいる"
+        );
+
+        // 2 人以上が触ったファイルだけを対象にする
+        let br = |name: &str, paths: &[&str]| BranchRegions {
+            branch: name.to_string(),
+            regions: paths
+                .iter()
+                .map(|p| Region {
+                    path: (*p).to_string(),
+                    span: Some(Span { start: 1, end: 2 }),
+                    anchor: region::Anchor::default(),
+                })
+                .collect(),
+            whole: 0,
+            note: None,
+        };
+        assert_eq!(
+            multi_owner_paths(&[br("a", &["x.rs", "y.rs"]), br("b", &["y.rs", "z.rs"])]),
+            vec!["y.rs".to_string()]
+        );
+        // 同じ枝が同じパスを 2 回持っていても 1 人と数える
+        assert!(multi_owner_paths(&[br("a", &["x.rs", "x.rs"])]).is_empty());
+    }
+
     // ── 差分 → 行域 (純関数) ──────────────────────────────────────
 
     #[test]
@@ -2841,6 +3063,16 @@ mod tests {
     ///   ケースごとの判定は、その行域をファイルで絞って `prove()` に通すだけ
     ///
     /// これで **git 起動は約 55 回**に落ちた (240 ケース)。
+    /// さらに組ごとのマージを `merge-tree --write-tree` へ移して
+    /// **31〜41 回 → 10 回**、作業ツリーへの書き込みは **0** になった
+    /// (Windows の CI で 60 秒の slow-timeout に届いていたのがここ。
+    /// 経緯と切り替えは [`crate::region::exhaustive_scale`])。
+    ///
+    /// # 本数を CI とローカルで分ける
+    ///
+    /// 既定は **240 ケース** (Windows でも 60 秒に収まる大きさ)。
+    /// `ZAIVERN_PROOF_EXHAUSTIVE=1` を立てると **2400 ケース**回す。
+    /// 反証しに行くのはローカルの仕事で、CI は回帰の番人に徹する。
     ///
     /// # ペアで測ることが N 本の主張と同じである理由
     ///
@@ -2853,7 +3085,8 @@ mod tests {
     #[test]
     fn 実gitで証明の見逃しが1件も無いことを網羅的に確かめる() {
         let Some(r) = make_repo("prove") else { return };
-        const FILES: usize = 240;
+        // 1 ケース = 1 ファイル。既定は CI (Windows 含む) に収まる大きさ。
+        let files = region::exhaustive_scale(120, 2400);
         const LINES: usize = 120;
         const BRANCHES: usize = 5;
         let path_of = |f: usize| format!("f{f:03}.txt");
@@ -2865,7 +3098,7 @@ mod tests {
         let mut rng = Rng::new(20_260_810);
         // edits[file][branch] — **ファイルが外側**。1 ケース = 1 ファイルなので
         // 生成も書き出しもこの順で回る (枝で外側を回すと index が交差する)。
-        let mut edits: Vec<Vec<Vec<Edit>>> = vec![vec![Vec::new(); BRANCHES]; FILES];
+        let mut edits: Vec<Vec<Vec<Edit>>> = vec![vec![Vec::new(); BRANCHES]; files];
         for per_branch in edits.iter_mut() {
             // この案件に参加する枝を 2〜5 本選ぶ (重複なし)。
             let n = rng.range(2, BRANCHES);
@@ -2905,7 +3138,23 @@ mod tests {
         }
 
         // ── 実 git ─────────────────────────────────────────────
-        for f in 0..FILES {
+        //
+        // **帯はここから効かせる。** 以前は「証明する輪」だけを帯へ割っていたが、
+        // 実測すると **400 ケース 86 秒 / 100 ケース 72 秒** — ケースを 1/4 に
+        // しても 14 秒しか減らなかった。固定費 68 秒が支配していて、その正体は
+        // **帯に関係なく全ファイルを書き・5 本の枝へ commit し・全ツリーを
+        // merge-tree していた**こと。
+        //
+        // 分割を増やすほど固定費 × 本数で**悪化する**ので、
+        // ファイル集合そのものを帯へ割る。1 ケース = 1 ファイルで互いに
+        // 独立なので、これで答えは 1 件も変わらない。
+        //
+        // 生成 (上) は git を 1 度も起こさないので**全ケース分そのまま回す**。
+        // 帯ごとに乱数列がずれるとケースの同一性が失われるため。
+        let (shard, shards) = region::exhaustive_shard();
+        let mine = |f: usize| shards <= 1 || f % shards == shard;
+
+        for f in (0..files).filter(|f| mine(*f)) {
             r.write(&path_of(f), &(base_lines(f).join("\n") + "\n"));
         }
         r.git(&["add", "--all"]);
@@ -2916,7 +3165,7 @@ mod tests {
         for (b, name) in names.iter().enumerate() {
             r.git(&["checkout", "--quiet", "-b", name, "base"]);
             for (f, per_branch) in edits.iter().enumerate() {
-                if per_branch[b].is_empty() {
+                if !mine(f) || per_branch[b].is_empty() {
                     continue;
                 }
                 r.write(&path_of(f), &apply(&base_lines(f), &per_branch[b], name));
@@ -2936,35 +3185,59 @@ mod tests {
             p.branches.iter().map(|b| &b.note).collect::<Vec<_>>()
         );
 
-        // 全ペアを実際に `git merge` して、衝突したパスを集める。
+        // 全ペアを実際にマージして、衝突したパスを集める。
+        //
+        // **作業ツリーを 1 バイトも触らない。** 以前は組ごとに
+        // `checkout --force` + `merge` + `ls-files --unmerged` (+ `merge --abort`)
+        // で **1 組 3〜4 起動**、しかも `checkout` が毎回 FILES 個のファイルを
+        // 書き戻していた。macOS / Linux では通るのに **Windows の CI だけ**
+        // 60 秒の slow-timeout に届いて落ちたのはここで、Windows は
+        // プロセス起動も作業ツリーへの書き込みもいちばん高い。
+        // `merge-tree --write-tree` は **1 組 1 起動・書き込み 0** で同じ答えを
+        // 出す (`crate::conflict::parse_merge_tree` が衝突したパスを返す)。
+        // 起動回数: 10 組で **31〜41 → 10**。
+        //
+        // git 2.38 未満には `--write-tree` が無いので、そのときだけ旧経路へ
+        // 落ちる (答えは同じ。遅いだけ)。
+        let dry = crate::conflict::merge_tree_available(&r.0);
         let mut conflicted: BTreeSet<String> = BTreeSet::new();
         let mut pairs_run = 0usize;
         for i in 0..BRANCHES {
             for j in (i + 1)..BRANCHES {
-                r.git(&["checkout", "--quiet", "--force", "-B", "mrg", &names[i]]);
-                let msg = format!("merge {}", names[j]);
-                let ok = r
-                    .try_git(&["merge", "--no-edit", "-m", &msg, &names[j]])
-                    .is_ok();
-                let unmerged = r.git(&["ls-files", "--unmerged"]);
-                for l in unmerged.lines() {
-                    if let Some((_, path)) = l.split_once('\t') {
-                        conflicted.insert(path.trim().to_string());
+                if dry {
+                    let raw = merge_tree_raw(&r.0, &names[i], &names[j])
+                        .expect("merge-tree が答えを返す");
+                    let files = crate::conflict::parse_merge_tree(&raw)
+                        .expect("merge-tree の出力が読める");
+                    conflicted.extend(files);
+                } else {
+                    r.git(&["checkout", "--quiet", "--force", "-B", "mrg", &names[i]]);
+                    let msg = format!("merge {}", names[j]);
+                    let ok = r
+                        .try_git(&["merge", "--no-edit", "-m", &msg, &names[j]])
+                        .is_ok();
+                    let unmerged = r.git(&["ls-files", "--unmerged"]);
+                    for l in unmerged.lines() {
+                        if let Some((_, path)) = l.split_once('\t') {
+                            conflicted.insert(path.trim().to_string());
+                        }
                     }
-                }
-                if !ok {
-                    let _ = r.try_git(&["merge", "--abort"]);
-                    assert!(
-                        !unmerged.trim().is_empty(),
-                        "マージは落ちたのに未解決パスが取れない ({} × {})",
-                        names[i],
-                        names[j]
-                    );
+                    if !ok {
+                        let _ = r.try_git(&["merge", "--abort"]);
+                        assert!(
+                            !unmerged.trim().is_empty(),
+                            "マージは落ちたのに未解決パスが取れない ({} × {})",
+                            names[i],
+                            names[j]
+                        );
+                    }
                 }
                 pairs_run += 1;
             }
         }
-        r.git(&["checkout", "--quiet", "--force", "base"]);
+        if !dry {
+            r.git(&["checkout", "--quiet", "--force", "base"]);
+        }
         assert_eq!(pairs_run, BRANCHES * (BRANCHES - 1) / 2, "全ペアを回した");
 
         // ── 突き合わせ (ここから先は git を 1 度も起こさない) ─────────
@@ -2994,7 +3267,7 @@ mod tests {
         let (mut proven3, mut unproven3, mut over3, mut tight) = (0, 0, 0, 0usize);
         let mut ran = 0usize;
 
-        for f in 0..FILES {
+        for f in (0..files).filter(|f| mine(*f)) {
             let path = path_of(f);
             let parts = per_file(&path);
             if parts.len() < 2 {
@@ -3041,7 +3314,14 @@ mod tests {
             }
         }
 
-        assert!(ran >= 150, "十分な数のケースを回した: {ran}");
+        // 生成が 2 本以上の枝を選ぶ確率から、ケース数のおよそ 6 割は残る。
+        // **帯へ割ったぶんは下限も割る。** ここを割り忘れると、分割した瞬間に
+        // 「十分な数を回していない」で必ず落ちる (= 分割が使えない)。
+        let mine = files.div_ceil(shards.max(1));
+        assert!(
+            ran >= mine * 5 / 8,
+            "十分な数のケースを回した: {ran} / {mine} (帯 {shard}/{shards} · 全体 {files})"
+        );
         assert!(
             proven > 0,
             "証明が立つケースが 1 つも無いのは網羅になっていない"
@@ -3064,6 +3344,7 @@ mod tests {
         };
         let (over_rate, over_rate3) = (rate(over, unproven), rate(over3, unproven3));
         // 数字は `--nocapture` で読む (誇張しないために、悪い側も出す)。
+        eprintln!("[coedit] 帯 {shard}/{shards} を担当 ({ran} ケース / 全体 {files})");
         eprintln!(
             "[coedit] 実 git 網羅 (帯 {}): {ran} ケース / 証明が立った {proven} \
              (全部綺麗 {proven_clean} · 見逃し {miss}) / 立たなかった {unproven} / \

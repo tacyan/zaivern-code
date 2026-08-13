@@ -1,0 +1,91 @@
+# cargo-deny の設定。CI の security ワークフローが `cargo deny check` で回す。
+#
+# ■ 方針: **今日の依存グラフで緑になる設定を書く。**
+#   最初から赤いゲートは「見なくていいゲート」になって死ぬ (このリポジトリは
+#   cargo fmt --check で一度それをやった)。許可リストは実測 (cargo metadata) から
+#   起こしてあり、増やすときは「なぜ増やすか」を隣にコメントで残すこと。
+
+[graph]
+# 配布している 5 ターゲットだけを見る。それ以外の cfg のためだけに引かれる
+# 依存 (wasm 等) を数えると、実際には配っていないものの license/advisory で落ちる。
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# RustSec の脆弱性 DB。既定で vulnerability = deny。
+# unmaintained は「情報」に留める — 保守終了は脆弱性ではないので、
+# ここを deny にすると本物の脆弱性が警告の山に埋もれる。
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # 例外を足すときは必ず「RUSTSEC-xxxx-xxxx: 理由 / いつ外すか」を書く。
+    # 理由の無い ignore は、脆弱性を見ないための穴になる。
+    #
+    # ── quick-xml 0.30.0 / 0.39.4 (どちらも 0.41.0 で修正済み) ────────────
+    # 上げられない: 直接依存ではなく、上流が semver 範囲で固定している。
+    #   0.30.0 ← zbus_xml 4.0.0 ← accesskit_unix (Linux の支援技術 AT-SPI)
+    #   0.39.4 ← wayland-scanner 0.31.10 ← winit (Wayland プロトコル生成)
+    # egui/eframe 0.29 固定 (CLAUDE.md 絶対ルール) なので winit も上げられない。
+    #
+    # 到達性: どちらも **このアプリが外から受け取った XML を食わせる経路が無い**。
+    #   - wayland-scanner は **ビルド時**に crate 同梱の protocol XML を読むだけ。
+    #     実行時のコードパスに quick-xml は入らない。
+    #   - zbus_xml が読むのはローカル session bus の D-Bus introspection。
+    #     そこへ細工した XML を置ける相手は既に同じユーザー権限を持っている。
+    # 影響も CPU / メモリ枯渇の DoS であって、コード実行や情報漏洩ではない。
+    #
+    # 外す条件: eframe/egui を上げる日、または上流が quick-xml を上げた日。
+    # そのとき **この 2 行を消して緑になるかを必ず確かめる** (惰性で残さない)。
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+# 本体は Apache-2.0。両立するものだけを許可する。
+# 一覧は `cargo metadata` の実測から起こした (2026-08-12 時点で 0 件の違反)。
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    # epaint 同梱フォント (Ubuntu / Hack)。フォントのライセンスであって
+    # コードには及ばない。埋め込み配布は OFL / UFL とも明示的に許可されている。
+    "OFL-1.1",
+    "LicenseRef-UFL-1.0",
+    # option-ext (dirs の依存)。MPL-2.0 はファイル単位のコピーレフトで、
+    # そのファイルを改変せず利用する限り Apache-2.0 の配布と両立する。
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+# 注: r-efi (MIT OR Apache-2.0 OR LGPL-2.1-or-later) / hexf-parse (CC0-1.0) は
+# `cargo metadata` の全体グラフには居るが、上の targets = 配布 5 ターゲット では
+# 引かれない。**通らない依存のために例外を置くと、それが本当に必要かどうかを
+# 誰も確かめられなくなる**ので書かない (cargo-deny も unmatched を警告する)。
+
+[bans]
+multiple-versions = "allow"   # egui 0.29 固定の都合で重複は避けられない。数だけ見る
+wildcards = "deny"            # "*" 指定は再現性を壊す
+deny = []
+
+[sources]
+# crates.io と、明示した git 以外からは引かない。
+# 野良 registry / 野良 git が紛れ込む供給網攻撃を構造的に止める。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

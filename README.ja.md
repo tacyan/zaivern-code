@@ -64,10 +64,15 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 zai .
 ```
 
+どちらのインストーラも、取得したアーカイブを**展開する前に**リリースの
+`checksums.txt` と SHA-256 を突き合わせます。一致しない場合、あるいは
+チェックサム自体を取得できなかった場合は、**展開も実行もせずに中止**します。
+
 スクリプトをシェルへ流し込むのに抵抗がある場合は、
 [Releases](https://github.com/tacyan/zaivern-code/releases/latest) から自分の環境向けの
 アーカイブを取得し、展開した `zai`（Windows は `zai.exe`）を `PATH` 上に置いてください。
-あとはプロジェクトのフォルダで `zai .` を実行します。
+あとはプロジェクトのフォルダで `zai .` を実行します。手で検証する方法・ビルド来歴の
+確認・SBOM については [SECURITY.md](SECURITY.md) を参照してください。
 
 画面が開いたら:
 
@@ -75,9 +80,21 @@ zai .
 2. 入力欄へ作業内容を書いて送る
 3. 慣れてきたら 2 体目を足す
 
-更新は `zai update`（`--check` は確認だけ、`--yes` は確認を省略）、削除は
-`zai uninstall`（`--dry-run` で消える対象を一覧表示）。削除の対象は実行ファイル本体と
-`~/.zaivern` だけで、`PATH` 上の別の `zai` は一覧に出すだけで消しません。
+### 更新する
+
+```bash
+zai update            # 最新版を確認し、実行するコマンドを見せてから更新
+zai update --check    # 確認するだけ（何も実行しません）
+zai update --yes      # 確認を求めずに更新する
+```
+
+`zai update` はエディタが起動していなくても使えます。インストール方法
+（インストーラ / `cargo install`）を判別して、適切なやり方で更新します。
+上のワンライナーを再実行しても同じことができます。
+
+削除は `zai uninstall`（`--dry-run` で消える対象を一覧表示）。削除の対象は
+実行ファイル本体と `~/.zaivern` だけで、`PATH` 上の別の `zai` は一覧に出すだけで
+消しません。
 
 ## 主な機能
 

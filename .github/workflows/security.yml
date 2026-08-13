@@ -1,0 +1,103 @@
+# 供給網 (supply chain) のゲート。
+#
+# ■ なぜ test.yml と分けるのか
+#   test.yml は「コードが正しいか」を見る。ここは「**依存が安全か**」を見る。
+#   後者は**コードが 1 行も変わらなくても赤くなる** — 新しい脆弱性が公表された
+#   瞬間に既存の Cargo.lock が危険になるため。だから schedule で定期的に回す。
+#   PR ゲートだけにすると、リリース直前まで誰も気付かない。
+#
+# ■ 単一の真実は deny.toml
+#   cargo-audit と cargo-deny は同じ RustSec DB を見るので、除外リストが
+#   2 つに割れると必ずずれる。audit 側は deny.toml の ignore を読んで渡す。
+name: Security
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/security.yml"]
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/security.yml"]
+  schedule:
+    # 毎週月曜 00:20 UTC (JST 09:20)。Dependabot の更新 PR と同じ朝に揃える。
+    - cron: "20 0 * * 1"
+  workflow_dispatch:
+
+# 既定を読み取りだけにする。ジョブが要る権限はジョブ側で足す
+# (侵害されたアクションが書き込める範囲を最小にする)。
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  # 依存の既知脆弱性 (RustSec)。Cargo.lock だけを読むのでビルドしない = 速い。
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: cargo-audit
+
+      # 除外 ID は deny.toml から読む。ここに書き写すと必ずずれる
+      # (片方だけ返済されて、もう片方が脆弱性を隠し続ける)。
+      - name: cargo audit
+        run: |
+          set -euo pipefail
+          ignores=()
+          while read -r id; do
+            [ -n "$id" ] || continue
+            ignores+=(--ignore "$id")
+            echo "deny.toml の ignore を引き継ぎ: $id"
+          done < <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sort -u)
+          # **`--deny warnings` を付けない。** 付けると unmaintained / unsound の
+          # 「情報」でも赤くなり、deny.toml (`unmaintained = "workspace"`) と
+          # 判定が食い違う。実際に初回の CI で ttf-parser / yaml-rust / serial の
+          # 保守終了 3 件と event-listener の unsound 1 件で落ちた —
+          # **どれも脆弱性ではない**。ここを deny にすると、本物の脆弱性が
+          # 保守終了の山に埋もれて誰も見なくなる (deny.toml のコメントと同じ理由)。
+          # 既定の cargo audit は vulnerability でだけ非ゼロ終了する。
+          cargo audit "${ignores[@]}"
+
+  # ライセンス / 供給元 / 禁止クレート / 脆弱性 をまとめて見る。
+  # sources = deny により、crates.io 以外から引く依存が入った瞬間に落ちる。
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  # ワークフロー自身の静的解析 (CodeQL の actions 言語)。
+  # ここが見るのは「pull_request_target の誤用」「信頼できない入力の式展開」
+  # 「未固定の uses:」など、**このリポジトリが item 2 で直した種類の穴**そのもの。
+  # ビルドが要らないので数十秒で終わる。
+  codeql-actions:
+    name: CodeQL (actions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write   # SARIF をアップロードするために必要
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          languages: actions
+
+      - uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          category: "/language:actions"

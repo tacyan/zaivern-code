@@ -16,7 +16,10 @@ mod deck;
 mod desktop;
 mod diagnostician;
 mod diagview;
+mod dialog;
 mod diff;
+#[cfg(test)]
+mod e2e;
 mod editor;
 mod editor_ops;
 mod editor_split;
@@ -28,6 +31,7 @@ mod file_tree;
 mod find_buffer;
 mod firewall;
 mod follow;
+mod fswatch;
 mod fuzzy;
 mod git;
 mod git_panel;

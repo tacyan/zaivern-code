@@ -352,7 +352,7 @@ fn bracketed_pairs(
             }
             let (ia, sa) = &by[ka];
             let (ib, sb) = &by[kb];
-            if !crate::region::interleaved(sa, sb) {
+            if !crate::region::needs_wall(sa, sb) {
                 continue;
             }
             if already.contains(&owner_pair(&ka.0, &kb.0, &ka.1)) {
@@ -2538,8 +2538,11 @@ mod tests {
             held("A", "src/app.rs#L1200-1260"),
             held("B", "src/app.rs#L4000-4100"),
         ];
+        // 本文は「壁 (ファイル内で唯一の行)」を数えるために要る。読めなければ
+        // fail-closed なので、ここでは壁が潤沢な本文を渡す。
+        let 一意 = |n: u32| -> String { (1..=n).map(|i| format!("行 {i} は他と違う\n")).collect() };
         assert!(
-            too_close_pairs(&far, band, &|_| None).is_empty(),
+            too_close_pairs(&far, band, &|_| Some(一意(5000))).is_empty(),
             "行域なのにファイル単位で丸めている"
         );
 
@@ -2613,24 +2616,37 @@ mod tests {
         assert!(blind[0].bracketed);
     }
 
-    /// 交錯していない担当表では、**本文を 1 バイトも読まない** (費用の番人)。
+    /// 本文の読み取りは**ファイルにつき多くても 1 回** (費用の番人)。
+    ///
+    /// 0.16.0 まではここが「交錯していなければ 0 回」だった。その門は
+    /// 見逃す (`region::needs_wall` に実測) ので、同じファイルを別の担当が
+    /// 持っていれば必ず 1 回読む。**担当が 1 人しか居ないファイルは 0 回のまま。**
     #[test]
-    fn 交錯していなければ本文を読まない() {
+    fn 本文はファイルにつき一度だけ読む() {
         let band = crate::region::SAFE_BAND;
-        // **A の外接域が B を跨がないこと**が「交錯していない」の意味。
-        // (A に 200 行目を持たせると、間の B を挟むので交錯になる)
         let far = vec![
             held("A", "src/a.rs#L10-20"),
             held("A", "src/a.rs#L30-40"),
             held("B", "src/a.rs#L100-110"),
         ];
         let reads = std::cell::Cell::new(0u32);
+        let 一意: String = (1..=200).map(|i| format!("行 {i} は他と違う\n")).collect();
         let got = too_close_pairs(&far, band, &|_| {
             reads.set(reads.get() + 1);
-            None
+            Some(一意.clone())
         });
-        assert!(got.is_empty(), "互いに素なのに挙げた: {got:?}");
-        assert_eq!(reads.get(), 0, "交錯していないのに本文を読んだ");
+        assert!(got.is_empty(), "壁があるのに挙げた: {got:?}");
+        assert_eq!(reads.get(), 1, "同じファイルを組の数だけ読んでいる");
+
+        // 担当が 1 人だけのファイルは読まない。
+        let solo = vec![held("A", "src/a.rs#L10-20"), held("A", "src/a.rs#L30-40")];
+        let reads2 = std::cell::Cell::new(0u32);
+        assert!(too_close_pairs(&solo, band, &|_| {
+            reads2.set(reads2.get() + 1);
+            None
+        })
+        .is_empty());
+        assert_eq!(reads2.get(), 0, "持ち主が 1 人のファイルの本文を読んだ");
     }
 
     #[test]

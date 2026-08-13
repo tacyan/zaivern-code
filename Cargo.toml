@@ -1,7 +1,13 @@
 [package]
 name = "zaivern-code"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
+# MSRV。README / install.sh / install.ps1 が「1.88 以上」と案内している以上、
+# **cargo にも同じことを言わせる**。ここが無いと 1.88 では通らない構文や依存が
+# 入っても誰も気付かず、案内どおりの環境で `cargo install` が失敗する
+# (利用者側にだけ見える壊れ方をする)。
+# CI の msrv ジョブが 1.88.0 で `cargo check --locked` を回して裏を取る。
+rust-version = "1.88"
 description = "Zaivern Code — Rust-native AI cockpit editor (Zed × Cmux × AGI Cockpit)"
 license = "Apache-2.0"
 

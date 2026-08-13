@@ -47,6 +47,95 @@ pub struct SearchUi {
     pub current_vis: Option<(usize, u16)>,
 }
 
+/// **呼び出し側を止め得る操作を数える計器。テストだけが読む。**
+///
+/// 「詰まらないこと」を実時間で測ると必ず嘘をつく。`< 200ms` のような予算は
+/// 「その機械がその瞬間どれだけ空いていたか」を測っているだけで、守りたい性質
+/// (= UI スレッドが PTY / conhost / 子プロセスの都合で待たされない) を
+/// 1 バイトも見ていない。守りたいのは**構造**なので、構造をそのまま数える:
+///
+///   **詰まり得る呼び出しが、呼び出し側のスレッドで何回起きたか。答えは 0。**
+///
+/// ここで数えるのは、相手 (子プロセス / conhost / OS) の都合で
+/// **いくらでも待たされ得る**呼び出しだけ:
+///
+/// | 計器          | 実体                                     | 誰が待たされるか |
+/// |---------------|------------------------------------------|------------------|
+/// | `pty_write`   | PTY 入力パイプへの `write_all` / `flush` | 子が読まなければ永久 |
+/// | `pty_resize`  | `ResizePseudoConsole` (conhost へ同期RPC)| conhost が詰まれば永久 |
+/// | `proc`        | 木殺しコマンドの `spawn` + `wait`        | 木が消えるまで |
+/// | `pty_close`   | `ClosePseudoConsole` (= master の drop)  | クライアントが全員消えるまで |
+///
+/// **スレッドローカルにする。** プロセス共通の `static` にすると、同時に
+/// 走っている他のテストの呼び出しまで混ざる (このリポジトリで実際に 400 回の
+/// はずが 800 回になって落ちた)。しかもここで見たい性質は
+/// 「**どのスレッドが**払ったか」そのものなので、スレッド別でなければ
+/// 意味を成さない — 同じ後始末でも、専用スレッドが払えば 0、
+/// 呼び出し側が払えば 1 以上になる。その差が合否線である。
+///
+/// `#[cfg(test)]` なので出荷ビルドには 1 バイトも入らない。
+#[cfg(test)]
+pub(crate) mod stall {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PTY_WRITE: Cell<u64> = const { Cell::new(0) };
+        static PTY_RESIZE: Cell<u64> = const { Cell::new(0) };
+        static PROC: Cell<u64> = const { Cell::new(0) };
+        static PTY_CLOSE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn bump(c: &'static std::thread::LocalKey<Cell<u64>>) {
+        c.with(|c| c.set(c.get().saturating_add(1)));
+    }
+
+    pub(crate) fn pty_write() {
+        bump(&PTY_WRITE);
+    }
+    pub(crate) fn pty_resize() {
+        bump(&PTY_RESIZE);
+    }
+    pub(crate) fn proc() {
+        bump(&PROC);
+    }
+    pub(crate) fn pty_close() {
+        bump(&PTY_CLOSE);
+    }
+
+    /// このスレッドの計器を 0 に戻す。区間の頭で呼ぶ。
+    pub(crate) fn reset() {
+        for c in [&PTY_WRITE, &PTY_RESIZE, &PROC, &PTY_CLOSE] {
+            c.with(|c| c.set(0));
+        }
+    }
+
+    pub(crate) fn pty_writes() -> u64 {
+        PTY_WRITE.with(Cell::get)
+    }
+    pub(crate) fn pty_resizes() -> u64 {
+        PTY_RESIZE.with(Cell::get)
+    }
+
+    /// このスレッドが払った「詰まり得る呼び出し」の総数。
+    pub(crate) fn total() -> u64 {
+        [&PTY_WRITE, &PTY_RESIZE, &PROC, &PTY_CLOSE]
+            .iter()
+            .map(|c| c.with(Cell::get))
+            .sum()
+    }
+
+    /// 失敗メッセージ用の内訳 (どの計器が鳴ったかまで出す)。
+    pub(crate) fn breakdown() -> String {
+        format!(
+            "pty_write={} pty_resize={} proc={} pty_close={}",
+            PTY_WRITE.with(Cell::get),
+            PTY_RESIZE.with(Cell::get),
+            PROC.with(Cell::get),
+            PTY_CLOSE.with(Cell::get),
+        )
+    }
+}
+
 /// PTY への書き込み口。**積むだけで、実際に書くのは専用スレッド**。
 ///
 /// 以前はここで直接 `write_all` していた。PTY の入力パイプは子が読まなくなると
@@ -67,6 +156,41 @@ impl PtyWriter {
     /// 待ち行列の上限。これを超えたら子はもう入力を読んでいないので、
     /// 積んでもメモリを食うだけで届かない。人が打つ量からは遠く離してある。
     const MAX_QUEUED: usize = 1 << 20; // 1 MiB
+
+    /// 書き込み口と、それを実際に PTY へ流す専用スレッドを作る。
+    ///
+    /// **`write_all` を呼ぶのは、ここが起こすスレッドだけ。** 書き込み先を
+    /// 引数で受けるのは、テストが**この配線そのもの**を使えるようにするため —
+    /// テスト側で似た配線を組み直すと、production が変わっても気付けない
+    /// (「測っているつもりで何も測っていない」)。
+    fn spawn_for(w: impl std::io::Write + Send + 'static) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = queued.clone();
+        std::thread::spawn(move || Self::pump(w, &rx, &counter));
+        Self { tx, queued }
+    }
+
+    /// 待ち行列を PTY へ流し続けるループ。**詰まってよいのはこのスレッドだけ**。
+    /// 送り手が全員居なくなると `recv` が切れて畳まれる。
+    fn pump(
+        mut w: impl std::io::Write,
+        rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+        queued: &std::sync::atomic::AtomicUsize,
+    ) {
+        while let Ok(chunk) = rx.recv() {
+            let n = chunk.len();
+            // ここが「子が読まなければ永久に返ってこない」呼び出し。
+            // 呼び出し側 (UI スレッド) の計器が 0 であることの裏返しとして数える。
+            #[cfg(test)]
+            stall::pty_write();
+            let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
+            queued.fetch_sub(n, Ordering::Relaxed);
+            if !ok {
+                break; // PTY が閉じた。以降の入力は届かない。
+            }
+        }
+    }
 
     fn send(&self, bytes: &[u8]) {
         use std::sync::atomic::Ordering as O;
@@ -312,6 +436,14 @@ pub struct Session {
     /// 絶対行は**生きている画面の下端**が起点なので、1 行押し出されるたびに
     /// 同じ文字を指す値が +1 される。差分がそのまま「進めるべき量」になる。
     sel_pushed: u64,
+    /// 直前のフレームで代替画面 (alternate screen) だったか。
+    ///
+    /// 代替画面へ**入った瞬間**にだけ履歴表示を畳むための記憶。
+    /// 以前はここを毎フレームの強制 (`if alt { set_scroll(0) }`) でやっていたが、
+    /// それだと上端を超えたドラッグが送った行が次のフレームで必ず打ち消され、
+    /// **エージェントのタイルでだけ選択を画面より上へ伸ばせなかった**
+    /// (Shell は通常画面なので効かず、差になって現れた)。
+    alt_screen_prev: bool,
     /// 端末内検索 (Cmd+F) の状態。スクロールバック全体を対象にする。
     pub search: SearchUi,
     /// コピー完了フィードバックの表示開始時刻。
@@ -793,46 +925,87 @@ const MENU_LEAD_MARKS: &[char] = &[
 /// 番号と本文の区切り記号。
 const MENU_SEPS: &[char] = &['.', ')', ']', ':', '-', '、', '．', '：', '。'];
 
-/// 番号キー + Enter。応答は `&'static [u8]` で返す約束なので表にしておく。
-const MENU_KEYS: [&[u8]; 9] = [
-    b"1\r", b"2\r", b"3\r", b"4\r", b"5\r", b"6\r", b"7\r", b"8\r", b"9\r",
-];
-/// 肯定肢を選んだときの説明 (UI 通知用)。
-const MENU_DESC_ALLOW: [&str; 9] = [
-    "番号メニューの承認肢「1」",
-    "番号メニューの承認肢「2」",
-    "番号メニューの承認肢「3」",
-    "番号メニューの承認肢「4」",
-    "番号メニューの承認肢「5」",
-    "番号メニューの承認肢「6」",
-    "番号メニューの承認肢「7」",
-    "番号メニューの承認肢「8」",
-    "番号メニューの承認肢「9」",
-];
-/// 見送り肢を選んだときの説明 (UI 通知用)。
-const MENU_DESC_SKIP: [&str; 9] = [
-    "アンケート/選択をスキップ「1」",
-    "アンケート/選択をスキップ「2」",
-    "アンケート/選択をスキップ「3」",
-    "アンケート/選択をスキップ「4」",
-    "アンケート/選択をスキップ「5」",
-    "アンケート/選択をスキップ「6」",
-    "アンケート/選択をスキップ「7」",
-    "アンケート/選択をスキップ「8」",
-    "アンケート/選択をスキップ「9」",
-];
-/// 評点しか無いアンケートに自動で答えたときの説明 (UI 通知用)。
-/// **勝手に答えた事実を隠さない**ため、選んだ番号を必ず文面に出す。
-const MENU_DESC_RATING: [&str; 9] = [
-    "アンケートに自動で回答しました: 1",
-    "アンケートに自動で回答しました: 2",
-    "アンケートに自動で回答しました: 3",
-    "アンケートに自動で回答しました: 4",
-    "アンケートに自動で回答しました: 5",
-    "アンケートに自動で回答しました: 6",
-    "アンケートに自動で回答しました: 7",
-    "アンケートに自動で回答しました: 8",
-    "アンケートに自動で回答しました: 9",
+/// 番号メニュー 1 件ぶんの応答。**キーと 3 種類の説明文を 1 つに束ねてある。**
+///
+/// かつてここは `MENU_KEYS` / `MENU_DESC_ALLOW` / `MENU_DESC_SKIP` /
+/// `MENU_DESC_RATING` の **4 本の並行配列**で、添字だけが対応を持っていた。
+/// 長さが揃っていればコンパイラは何も言わないので、1 本の並びが入れ替わっても
+/// **「3 を押したのに『…「5」』と説明する」という静かな嘘**が出る。
+/// 束ねてあれば、番号を書き換えるときに 4 つが目の前に並ぶ。
+struct MenuAnswer {
+    /// 番号キー + Enter。応答は `&'static [u8]` で返す約束なので表にしておく。
+    key: &'static [u8],
+    /// 肯定肢を選んだときの説明 (UI 通知用)。
+    allow: &'static str,
+    /// 見送り肢を選んだときの説明 (UI 通知用)。
+    skip: &'static str,
+    /// 評点しか無いアンケートに自動で答えたときの説明 (UI 通知用)。
+    /// **勝手に答えた事実を隠さない**ため、選んだ番号を必ず文面に出す。
+    rating: &'static str,
+}
+
+/// 番号 1〜9 の応答表。**表示される文字列は 4 本だった頃と 1 字も変わらない。**
+///
+/// **長さを書かない** (`[MenuAnswer; 9]` にしない)。複数の枝が 1 つずつ足すと
+/// 全員が同じ N+1 を書くので、git は衝突を出さないのに要素数が合わなくなる
+/// (`keybinds::ALL_ACTIONS` で実際に起きた形)。使うのは `.get(idx)` と
+/// `.iter()` だけなので、スライスで足りる。
+/// 番人は `union::handcounted_len::module直下の手書き長は既知の分だけ`。
+const MENU_ANSWERS: &[MenuAnswer] = &[
+    MenuAnswer {
+        key: b"1\r",
+        allow: "番号メニューの承認肢「1」",
+        skip: "アンケート/選択をスキップ「1」",
+        rating: "アンケートに自動で回答しました: 1",
+    },
+    MenuAnswer {
+        key: b"2\r",
+        allow: "番号メニューの承認肢「2」",
+        skip: "アンケート/選択をスキップ「2」",
+        rating: "アンケートに自動で回答しました: 2",
+    },
+    MenuAnswer {
+        key: b"3\r",
+        allow: "番号メニューの承認肢「3」",
+        skip: "アンケート/選択をスキップ「3」",
+        rating: "アンケートに自動で回答しました: 3",
+    },
+    MenuAnswer {
+        key: b"4\r",
+        allow: "番号メニューの承認肢「4」",
+        skip: "アンケート/選択をスキップ「4」",
+        rating: "アンケートに自動で回答しました: 4",
+    },
+    MenuAnswer {
+        key: b"5\r",
+        allow: "番号メニューの承認肢「5」",
+        skip: "アンケート/選択をスキップ「5」",
+        rating: "アンケートに自動で回答しました: 5",
+    },
+    MenuAnswer {
+        key: b"6\r",
+        allow: "番号メニューの承認肢「6」",
+        skip: "アンケート/選択をスキップ「6」",
+        rating: "アンケートに自動で回答しました: 6",
+    },
+    MenuAnswer {
+        key: b"7\r",
+        allow: "番号メニューの承認肢「7」",
+        skip: "アンケート/選択をスキップ「7」",
+        rating: "アンケートに自動で回答しました: 7",
+    },
+    MenuAnswer {
+        key: b"8\r",
+        allow: "番号メニューの承認肢「8」",
+        skip: "アンケート/選択をスキップ「8」",
+        rating: "アンケートに自動で回答しました: 8",
+    },
+    MenuAnswer {
+        key: b"9\r",
+        allow: "番号メニューの承認肢「9」",
+        skip: "アンケート/選択をスキップ「9」",
+        rating: "アンケートに自動で回答しました: 9",
+    },
 ];
 
 /// 番号メニューで何を選んだかの区分 (UI 説明文の出し分け用)。
@@ -1044,13 +1217,13 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
     };
     let (num, kind) = picked?;
     let idx = usize::from(num).checked_sub(1)?;
-    let key = *MENU_KEYS.get(idx)?;
+    let ans = MENU_ANSWERS.get(idx)?;
     let desc = match kind {
-        MenuPick::Affirm => MENU_DESC_ALLOW[idx],
-        MenuPick::Skip => MENU_DESC_SKIP[idx],
-        MenuPick::Rating => MENU_DESC_RATING[idx],
+        MenuPick::Affirm => ans.allow,
+        MenuPick::Skip => ans.skip,
+        MenuPick::Rating => ans.rating,
     };
-    Some((key, desc))
+    Some((ans.key, desc))
 }
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
@@ -1732,23 +1905,7 @@ impl Session {
 
         // PTY への書き込みは専用スレッドに任せる (PtyWriter の説明を参照)。
         // 送り手 (UI スレッド / 読取スレッド) が全員居なくなると recv が切れて畳まれる。
-        let writer = {
-            let mut w = pair.master.take_writer().map_err(|e| e.to_string())?;
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counter = queued.clone();
-            std::thread::spawn(move || {
-                while let Ok(chunk) = rx.recv() {
-                    let n = chunk.len();
-                    let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
-                    counter.fetch_sub(n, Ordering::Relaxed);
-                    if !ok {
-                        break; // PTY が閉じた。以降の入力は届かない。
-                    }
-                }
-            });
-            PtyWriter { tx, queued }
-        };
+        let writer = PtyWriter::spawn_for(pair.master.take_writer().map_err(|e| e.to_string())?);
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
         let shell = Arc::new(Mutex::new(crate::shellint::Tracker::new()));
         let lines: Arc<LineIndex> = Arc::new(LineIndex::default());
@@ -1956,6 +2113,7 @@ impl Session {
             sel_abs: None,
             sel_pushed: 0,
             sel_anchor_abs: None,
+            alt_screen_prev: false,
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
@@ -2040,10 +2198,31 @@ impl Session {
     /// 再送・再検出しない — 1プロンプトにつき応答は一回で完結する。
     /// プロンプトが消えるか、指紋の異なる別プロンプトに変わったら再び対象になる。
     pub fn scan_attention(&mut self, auto_yes: bool) -> Option<Attention> {
-        if self.last_scan.elapsed().as_millis() < 900 {
+        self.scan_attention_at(auto_yes, Instant::now())
+    }
+
+    /// 「いま」を差し替えられる [`scan_attention`]。
+    ///
+    /// **待ちの判定に使う時刻を全部この引数から取る。** 分けてある理由は
+    /// `lease::acquire_lock_in` が `stale_ms` を引数へ出しているのと同じで、
+    /// **閾値を跨いだ前後の振る舞いは、実時間を待っていては検査できない**
+    /// から。実時間で測ると、
+    ///
+    /// * 「発火する側」は待ちを入れるので**遅いマシンほど落ちる**
+    /// * 「まだ発火しない側」は 2 つの時刻を**別の瞬間に**読むことになり、
+    ///   その隙間が負荷で伸びると落ちる
+    ///
+    /// 実際に 3 体を並列で走らせた負荷下で
+    /// `stall_fallback_presses_pet_approve_only_once` が
+    /// 「600ms より早く発火した」と落ちた。早く発火したのではなく、
+    /// **テスト側が最初の発火を観測した時刻が、セッションが内部で刻んだ
+    /// 時刻より遅れていた**だけである。閾値を伸ばしても負荷が上がれば
+    /// また破綻するので、時刻そのものを注入して決定的にする。
+    pub fn scan_attention_at(&mut self, auto_yes: bool, now: Instant) -> Option<Attention> {
+        if now.saturating_duration_since(self.last_scan).as_millis() < 900 {
             return None;
         }
-        self.last_scan = Instant::now();
+        self.last_scan = now;
         let text = lock_ok(&self.parser).screen().contents();
         // 未読判定用: 意味的な画面ハッシュを更新する (スピナー等の揺れは無視)。
         // 直前のスキャン時の値を控えてから更新する (`output_advanced` の材料)。
@@ -2106,7 +2285,7 @@ impl Session {
         let newly = waiting && !self.attention;
         self.attention = waiting;
         if newly {
-            self.attention_since = Some(Instant::now());
+            self.attention_since = Some(now);
         } else if !waiting {
             self.attention_since = None;
         }
@@ -2116,7 +2295,7 @@ impl Session {
                 // (再送は Claude 側の入力欄への Enter/y 連打事故になる)。
                 // 指紋が変わって別のプロンプトが来たときだけ、また一度応答する。
                 self.answered_sig = sig;
-                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
                 self.write_bytes(bytes);
                 self.attention = false;
@@ -2126,7 +2305,7 @@ impl Session {
             // ここでは**何も送らず**、停滞監視だけを始める。数字を打つのは
             // 下のウォッチドッグが「画面が 30 秒動かない」と確認した後だけ。
             if self.auto_stall_since.is_none() {
-                self.auto_stall_since = Some(Instant::now());
+                self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
             }
         }
@@ -2144,11 +2323,11 @@ impl Session {
             if let Some(since) = self.auto_stall_since {
                 if self.cur_hash != self.auto_stall_hash {
                     self.auto_stall_hash = self.cur_hash;
-                    self.auto_stall_since = Some(Instant::now());
-                } else if since.elapsed() >= self.auto_yes_resend_after {
+                    self.auto_stall_since = Some(now);
+                } else if now.saturating_duration_since(since) >= self.auto_yes_resend_after {
                     // 押せても押せなくても次の判定は 30 秒後から。
                     // (分類できない画面へ毎スキャン試し続けないため)
-                    self.auto_stall_since = Some(Instant::now());
+                    self.auto_stall_since = Some(now);
                     // 送るのが番号メニューの数字なら「何番を選んだか」を
                     // そのまま説明に出す。勝手に答えた事実を隠さないための
                     // 約束 (MENU_DESC_* の文面)。それ以外は従来の停滞文言。
@@ -2655,6 +2834,9 @@ impl Session {
                     let Some(master) = weak.upgrade() else {
                         return false;
                     };
+                    // conhost への同期 RPC。**ワーカースレッドの上でだけ**払う。
+                    #[cfg(test)]
+                    stall::pty_resize();
                     let _ = lock_ok(&master).resize(PtySize {
                         rows,
                         cols,
@@ -2674,6 +2856,11 @@ impl Session {
             // 黒いまま固まる」事故になる。
             None => match crate::lockx::try_lock_ok(&self.master) {
                 Some(m) => {
+                    // 代替経路だけは呼び出し側が RPC を払う (ワーカーが起こせない
+                    // 環境)。数えているので、テストは「この環境なら見送る」と
+                    // 判断できる — 0 を期待して落とすのは筋が違う。
+                    #[cfg(test)]
+                    stall::pty_resize();
                     let _ = m.resize(PtySize {
                         rows,
                         cols,
@@ -2799,6 +2986,22 @@ impl Session {
         self.scroll = eff;
         // 選択は絶対座標なので消さない。今の画面へ切り取り直すだけ。
         self.sync_selection();
+    }
+
+    /// 代替画面へ**入った瞬間**だけ履歴表示を畳む。戻り値は「いま代替画面か」。
+    ///
+    /// 目的は「通常画面で上へスクロールしたまま vim / エージェントが起動したとき、
+    /// 古い履歴ビューが残らないようにする」こと。**遷移の話であって毎フレームの
+    /// 話ではない。** 毎フレーム畳んでいた頃は、代替画面のセッションで
+    /// 上端超えドラッグの自動スクロールが毎フレーム打ち消され、選択を
+    /// 画面より上へ伸ばせなかった。
+    pub fn sync_alt_screen(&mut self) -> bool {
+        let alt = self.wheel_modes().0;
+        if should_collapse_history(alt, self.alt_screen_prev, self.scroll) {
+            self.set_scroll(0);
+        }
+        self.alt_screen_prev = alt;
+        alt
     }
 
     /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
@@ -3012,6 +3215,12 @@ fn kill_target(exited: bool, child_pid: Option<u32>) -> Option<u32> {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // この drop を抜けた直後に master (ConPTY) の強参照が落ちる。
+        // Windows の `ClosePseudoConsole` は「クライアントが全員消えて残りの
+        // 出力を吐き切る」まで戻らないので、**払うスレッドを間違えると
+        // ウィンドウごと固まる**。誰が払ったかを数えられるようにしておく。
+        #[cfg(test)]
+        stall::pty_close();
         // リサイズワーカーを先に畳む (通知だけ — join せず待たない)。
         // ワーカーは master の Weak しか持たないので、万一通知を取り逃しても
         // upgrade 失敗で自然に抜け、master より長生きして触ることはない。
@@ -3082,6 +3291,9 @@ fn kill_tree_command(pid: u32) -> std::process::Command {
 /// 木を辿れた (= 根がまだ生きていた) なら true。
 fn kill_tree_blocking(pid: Option<u32>) -> bool {
     let Some(pid) = pid else { return false };
+    // 木が消えるまで返ってこない。UI スレッドが払ってはいけない呼び出し。
+    #[cfg(test)]
+    stall::proc();
     match kill_tree_command(pid).spawn() {
         Ok(mut child) => child.wait().map(|s| s.success()).unwrap_or(false),
         Err(_) => false,
@@ -3101,22 +3313,28 @@ fn kill_tree_blocking(pid: Option<u32>) -> bool {
 /// drop する。ツリーが消えていれば `ClosePseudoConsole` はすぐ返るし、
 /// 万一返らなくても止まるのは捨てるスレッドだけで、UI は動き続ける。
 pub fn reap(session: Session) {
-    std::thread::spawn(move || {
-        let mut session = session;
-        // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
-        // kill を撃たない。child_pid は wait 済みで OS に返却されており、
-        // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
-        // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
-        // 巻き添えにする。
-        if !session.exited.load(Ordering::SeqCst) {
-            // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
-            // ([`Session::kill`] の説明を参照)。
-            kill_tree_blocking(session.child_pid);
-            let _ = session.killer.kill();
-        }
-        // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
-        drop(session);
-    });
+    std::thread::spawn(move || reap_now(session));
+}
+
+/// [`reap`] の中身。**詰まり得る呼び出しを全部払う** ので、専用スレッドから
+/// だけ呼ぶこと。ここを直に呼ぶのは `reap` が起こすスレッドと、
+/// 「同じ後始末を呼び出し側で行えば必ず 1 回以上払う」ことを見せる番人テスト
+/// ([`reap_pty_tests`]) だけ。
+fn reap_now(session: Session) {
+    let mut session = session;
+    // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
+    // kill を撃たない。child_pid は wait 済みで OS に返却されており、
+    // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
+    // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
+    // 巻き添えにする。
+    if !session.exited.load(Ordering::SeqCst) {
+        // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
+        // ([`Session::kill`] の説明を参照)。
+        kill_tree_blocking(session.child_pid);
+        let _ = session.killer.kill();
+    }
+    // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
+    drop(session);
 }
 
 /// アプリ終了時にセッションを手放す。
@@ -3188,6 +3406,44 @@ mod tail_tests {
         // 行頭インデントは残し、行末空白と長すぎる行だけ詰める
         assert_eq!(super::pick_tail_lines("  abcdef   \n", 4, 4), vec!["  a…"]);
         assert!(super::pick_tail_lines("╭──╮\n╰──╯", 4, 120).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod menu_answer_tests {
+    use super::MENU_ANSWERS;
+
+    /// 文字列に出てくる ASCII 数字だけを繋げる (説明文の番号を取り出す)。
+    fn digits(s: &str) -> String {
+        s.chars().filter(char::is_ascii_digit).collect()
+    }
+
+    /// 番号キーと 3 種類の説明文が **同じ番号を指している**こと。
+    ///
+    /// 束ねたので「配列どうしのずれ」は構造的に起こらなくなったが、
+    /// **1 件の中で番号を書き間違える**余地は残る (コピペで 1 つだけ
+    /// 直し忘れる)。表を固定してそれも塞ぐ。
+    #[test]
+    fn 番号メニューの応答表は番号がずれていない() {
+        for (idx, ans) in MENU_ANSWERS.iter().enumerate() {
+            let n = (idx + 1).to_string();
+            assert_eq!(
+                ans.key,
+                format!("{n}\r").as_bytes(),
+                "添字 {idx} のキーが {n} ではない"
+            );
+            for (name, text) in [
+                ("allow", ans.allow),
+                ("skip", ans.skip),
+                ("rating", ans.rating),
+            ] {
+                assert_eq!(
+                    digits(text),
+                    n,
+                    "添字 {idx} の {name} がずれている: {text:?}"
+                );
+            }
+        }
     }
 }
 
@@ -4038,7 +4294,7 @@ mod tests {
         abs_row, all_terminal_lines, autoscroll_step, clip_selection, input_area_selection,
         is_image_paste_chord_on, key_bytes, line_hits, mac_agent_input_bytes, normalize_sel,
         prune_clip_pngs, save_clipboard_png, screen_row, search_scroll_target, selection_text,
-        selection_text_abs, word_selection, Session, CLIP_PNG_KEEP,
+        selection_text_abs, should_collapse_history, word_selection, Session, CLIP_PNG_KEEP,
     };
 
     /// 履歴を積んだパーサと「実在する最古の絶対行」を作る。
@@ -4542,6 +4798,47 @@ mod tests {
         assert_eq!(autoscroll_step(5.0, 0.0), 1);
         assert_eq!(autoscroll_step(-5.0, 10.0), 1);
         assert_eq!(autoscroll_step(f32::NAN, 10.0), 1);
+    }
+
+    /// 履歴を畳む条件の真理値表。
+    ///
+    /// **3 行目が、報告された不具合そのもの**: 代替画面に居続けているあいだに
+    /// 畳んでしまうと、上端超えドラッグが送った行が毎フレーム打ち消され、
+    /// 「Shell ではコピー範囲を上へ広げられるのに、エージェントでは広げられない」
+    /// になる。
+    #[test]
+    fn 履歴を畳むのは代替画面へ入った瞬間だけ() {
+        for (alt_now, alt_prev, scroll, want, why) in [
+            (
+                true,
+                false,
+                5,
+                true,
+                "通常画面で遡ったまま vim が起動 → 畳む",
+            ),
+            (true, false, 0, false, "そもそも遡っていない → 何もしない"),
+            (
+                true,
+                true,
+                5,
+                false,
+                "代替画面に居続けている → 畳まない(ドラッグ中)",
+            ),
+            (
+                false,
+                true,
+                5,
+                false,
+                "代替画面から出た → 通常画面の履歴は残す",
+            ),
+            (false, false, 5, false, "ずっと通常画面 (Shell) → 触らない"),
+        ] {
+            assert_eq!(
+                should_collapse_history(alt_now, alt_prev, scroll),
+                want,
+                "alt_now={alt_now} alt_prev={alt_prev} scroll={scroll}: {why}"
+            );
+        }
     }
 
     #[test]
@@ -5295,43 +5592,60 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let mut s = spawn_prompt_session(9403, "sleep 10");
-        s.auto_yes_resend_after = Duration::from_millis(600);
+        // **スキャンの最小間隔 (900ms) より確実に長く取る。** 短いと
+        // 「間隔は開いたが停滞の閾値には届いていない」状態を作れない。
+        let stall = Duration::from_secs(5);
+        s.auto_yes_resend_after = stall;
         let menu = "Allow this command to run?\r\n\
                     1. No, cancel\r\n2. Yes, allow this once\r\n\
                     Enter a number (1-2): ";
         s.parser.lock().unwrap().process(menu.as_bytes());
+        // 子の起動時出力が届き切るのを待つ (I/O の到着待ちであって閾値ではない)。
         std::thread::sleep(Duration::from_millis(1_000));
 
-        // 1) 最初のスキャンは「承認待ち」を上げるだけ (数字は打たない)
+        // 1) 最初のスキャンは「承認待ち」を上げるだけ (数字は打たない)。
+        //    **判定に使う「いま」は全部こちらで刻む** — 実時間で
+        //    「まだ閾値の手前のはず」と決めつけると、負荷でテスト側が
+        //    数百 ms 止まった瞬間に前提が崩れる (実際に姉妹テストが落ちた)。
+        let clock = Instant::now() + Duration::from_secs(1);
         assert!(
-            matches!(s.scan_attention(true), Some(Attention::NeedsApproval)),
+            matches!(
+                s.scan_attention_at(true, clock),
+                Some(Attention::NeedsApproval)
+            ),
             "番号メニューが承認待ちにならなかった"
         );
-        // 2) 停滞閾値の前は何度スキャンしても撃たない
-        for _ in 0..3 {
-            s.last_scan = Instant::now() - Duration::from_millis(900);
+        let base = s
+            .auto_stall_since
+            .expect("承認待ちなのに停滞監視が始まっていない");
+
+        // 2) 停滞閾値の前は撃たない。**1ms 手前まで**刻んで確かめる。
+        for early in [Duration::from_secs(1), stall - Duration::from_millis(1)] {
             assert!(
-                s.scan_attention(true).is_none(),
-                "停滞閾値の前に番号メニューへ数字を打った"
+                s.scan_attention_at(true, base + early).is_none(),
+                "停滞閾値 ({stall:?}) の手前 ({early:?}) で番号メニューへ数字を打った"
             );
         }
         // 3) 画面が固まったまま閾値を超えたら、そこで初めて数字を打つ
-        std::thread::sleep(Duration::from_millis(700));
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        match s.scan_attention(true) {
+        let after = base + stall + Duration::from_secs(1);
+        match s.scan_attention_at(true, after) {
             Some(Attention::AutoReplied(desc)) => assert!(
                 desc.contains('2'),
                 "勝手に選んだ番号が説明に出ていない: {desc}"
             ),
             _ => panic!("停滞後も番号メニューに答えなかった"),
         }
-        // 4) 打ったあとは同じ画面が残っても打ち直さない (数字の連打を作らない)
-        for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(200));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
+        // 4) 打ったあとは同じ画面が残っても打ち直さない (数字の連打を作らない)。
+        //    回数の保証なので「何秒待っても」ではなく**閾値を跨いで 0 回**で見る。
+        let mut later = after;
+        for round in 1..=3 {
+            later += stall + Duration::from_secs(1);
             assert!(
-                !matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))),
-                "同じ番号メニューへ数字を再送した"
+                !matches!(
+                    s.scan_attention_at(true, later),
+                    Some(Attention::AutoReplied(_))
+                ),
+                "同じ番号メニューへ数字を再送した ({round} 回目)"
             );
         }
         s.kill();
@@ -5612,62 +5926,71 @@ mod tests {
         // 応答 (y\r) を無視してプロンプトが固まったままの子。
         let cmd = r#"stty -echo; printf 'Do you want to proceed? (y/n) '; sleep 10"#;
         let mut s = spawn_prompt_session(985, cmd);
-        s.auto_yes_resend_after = Duration::from_millis(600);
+        // **スキャンの最小間隔 (900ms) より確実に長く取る。** 短いと
+        // 「間隔は開いたが停滞の閾値には届いていない」という肝心の状態を作れない。
+        let stall = Duration::from_secs(5);
+        s.auto_yes_resend_after = stall;
 
-        // 1) 最初の自動YES
-        let mut first = None;
+        // 1) 最初の自動YES。
+        //    **画面が届くのを待つのは実時間**でよい (子の出力の到着待ちであって、
+        //    閾値の判定ではない)。判定に使う「いま」だけを自分で刻む。
+        let mut clock = Instant::now();
+        let mut fired = false;
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
-            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                first = Some(Instant::now());
+            clock += Duration::from_millis(1_000);
+            if matches!(
+                s.scan_attention_at(true, clock),
+                Some(Attention::AutoReplied(_))
+            ) {
+                fired = true;
                 break;
             }
         }
-        let first = first.expect("最初の自動YESが送られなかった");
+        assert!(fired, "最初の自動YESが送られなかった");
 
-        // 2) 直後の採用スキャンでは再送しない (間隔未満の二重発火防止)
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(s.scan_attention(true).is_none(), "間隔未満で二重発火した");
+        // ここから先は実時間を 1 度も見ない。起点はセッション自身が刻んだ値なので、
+        // 「テストが観測した時刻」と「セッションが刻んだ時刻」の隙間が
+        // 負荷で伸びても影響を受けない (この隙間が旧版の誤検知の正体だった)。
+        let base = s
+            .auto_stall_since
+            .expect("自動YESの後に停滞監視が始まっていない");
 
-        // 3) 間隔経過後にペット承認が発火する
-        let mut second = None;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(100));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
-            match s.scan_attention(true) {
-                Some(Attention::AutoReplied(_)) => {
-                    second = Some(Instant::now());
-                    break;
+        // 2) 閾値の手前では発火しない。**1ms 手前まで**刻んで確かめる。
+        for early in [
+            stall - Duration::from_secs(1),
+            stall - Duration::from_millis(1),
+        ] {
+            assert!(
+                s.scan_attention_at(true, base + early).is_none(),
+                "停滞の閾値 ({stall:?}) の手前 ({early:?}) で発火した"
+            );
+        }
+
+        // 3) 閾値を越えたら発火する。
+        let after = base + stall + Duration::from_secs(1);
+        assert!(
+            matches!(
+                s.scan_attention_at(true, after),
+                Some(Attention::AutoReplied(_))
+            ),
+            "停滞の閾値を越えてもペット承認が発火しなかった"
+        );
+
+        // 4) 一度押したら、**いくら経っても同じプロンプトには二度と押さない。**
+        //    回数の保証なので「何秒待っても」ではなく**閾値を 10 回跨いで 0 回**で見る
+        //    (待ち時間を伸ばす検査は N が増えれば必ず破綻する)。
+        let mut later = after;
+        for round in 1..=10 {
+            later += stall + Duration::from_secs(1);
+            match s.scan_attention_at(true, later) {
+                None => {}
+                Some(Attention::NeedsApproval) => {
+                    panic!("応答済みプロンプトを再検出した ({round} 回目)")
                 }
-                Some(Attention::NeedsApproval) => panic!("応答済みプロンプトを再検出した"),
-                _ => {}
+                Some(_) => panic!("ペット承認が 2 度目に発火した ({round} 回目)"),
             }
         }
-        let second = second.expect("停滞後のペット承認が発火しなかった");
-        assert!(
-            second.duration_since(first) >= Duration::from_millis(550),
-            "ペット承認の待機時間 (600ms) より早く発火した"
-        );
-
-        // 4) ペット承認直後は再発火しない
-        s.last_scan = Instant::now() - Duration::from_millis(900);
-        assert!(
-            s.scan_attention(true).is_none(),
-            "ペット承認直後に二重発火した"
-        );
-
-        // 5) さらに間隔が経っても同じプロンプトには再発火しない
-        let mut third = false;
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(100));
-            s.last_scan = Instant::now() - Duration::from_millis(900);
-            if matches!(s.scan_attention(true), Some(Attention::AutoReplied(_))) {
-                third = true;
-                break;
-            }
-        }
-        assert!(!third, "ペット承認後に同じプロンプトへ再発火した");
-        s.kill();
     }
 
     // ── 選択肢が画面外へスクロールした場合 ────────────────────────────
@@ -7195,6 +7518,16 @@ fn autoscroll_step(overshoot: f32, cell_h: f32) -> i64 {
         return 1;
     }
     ((overshoot / cell_h).ceil() as i64).clamp(1, 8)
+}
+
+/// 履歴表示 (`scroll > 0`) を畳むべきか。
+///
+/// **代替画面へ「入った瞬間」だけ true。** 代替画面に居続けているあいだは
+/// false を返すのが要点で、ここを `alt_now && scroll > 0` にすると
+/// 上端超えドラッグの自動スクロールが毎フレーム打ち消され、
+/// エージェントのタイルで選択を画面より上へ伸ばせなくなる。
+fn should_collapse_history(alt_now: bool, alt_prev: bool, scroll: usize) -> bool {
+    alt_now && !alt_prev && scroll > 0
 }
 
 /// マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行)。
@@ -9015,11 +9348,14 @@ pub fn draw(
         handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
     }
 
-    // 代替画面(Claude Code / vim / less 等)にスクロールバック履歴は無いため、
-    // 切替後も古い履歴ビューが画面に残らないよう自動で一番下へ戻す。
-    if session.scroll > 0 && session.wheel_modes().0 {
-        session.set_scroll(0);
-    }
+    // 通常画面で履歴を遡ったまま代替画面のアプリ (vim / less / エージェント) が
+    // 立ち上がったとき、古い履歴ビューを残さない。**入った瞬間だけ**畳む。
+    //
+    // ここを毎フレームの強制にすると、代替画面のセッションでは上端超えドラッグの
+    // 自動スクロールが次のフレームで必ず打ち消され、選択を画面より上へ伸ばせない。
+    // 「Shell ではコピー範囲を上へ広げられるのに、エージェントでは広げられない」
+    // として報告されたのがこれ。
+    session.sync_alt_screen();
 
     // Cmd+F ルーティング用に「どの端末がフォーカス中か」を egui 一時データへ
     // 残す。app 側のグローバルショートカット処理は (パネル描画より先に走るので)
@@ -9332,20 +9668,163 @@ mod pty_writer_tests {
         (PtyWriter { tx, queued }, rx)
     }
 
-    /// 子が入力を一切読まなくても、書き込みは即座に返ること。
-    /// ここで待たされると `App::update` の途中で画面が止まる。
+    /// **子が入力を 1 バイトも読まなくても、書き込みは呼び出し側に
+    /// 「詰まり得る呼び出し」を 1 回も課さないこと。**
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `took < 200ms` だった。これは 2 つの意味で測れていない。
+    ///
+    /// 1. **線が現象から遠すぎる。** 中身は不定長キューへの `send` 1000 回 =
+    ///    数 ms。200ms は「この機械が 1000 回のチャネル送信をできるか」を
+    ///    測っているだけで、通っても何も保証しない。
+    /// 2. **もっと悪いことに、守りたい回帰を検出できない。** 旧テストは
+    ///    `PtyWriter` を**手で組み立てて**いて (`stalled_writer`)、
+    ///    production の writer スレッドを 1 行も通らなかった。
+    ///    `Session::spawn` が同期 `write_all` へ戻っても、このテストは緑のまま。
+    ///
+    /// そこで [`PtyWriter::spawn_for`] = **production と同じ配線**へ
+    /// 「絶対に読み終わらない書き込み先」を挿し、
+    /// **呼び出し側スレッドの計器が 0 であること**を見る。
+    /// 詰まる `write_all` は writer スレッドの上で数えられるので、
+    /// 「そもそも書いていないから 0」という抜け道も塞がる。
     #[test]
-    fn writing_to_a_stalled_child_does_not_block() {
-        let (w, _rx) = stalled_writer();
-        let t = Instant::now();
-        for _ in 0..1000 {
-            w.send(b"hello\r");
+    fn writing_to_a_stalled_child_charges_the_caller_no_blocking_calls() {
+        const N: usize = 1000;
+        const CHUNK: &[u8] = b"hello\r";
+
+        // 子が読まない PTY: gate を握っている間、write_all はそこで止まる。
+        let gate = Arc::new(Mutex::new(()));
+        let hold = lock_ok(&gate);
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<usize>();
+        let w = PtyWriter::spawn_for(StalledPty {
+            gate: gate.clone(),
+            wrote: wrote_tx,
+        });
+
+        stall::reset();
+        for _ in 0..N {
+            w.send(CHUNK);
         }
-        let took = t.elapsed();
-        assert!(
-            took < Duration::from_millis(200),
-            "読まれない PTY への書き込みが呼び出し側を待たせた ({took:?})"
+
+        // ① 呼び出し側は「詰まり得る呼び出し」を 1 回も払っていない。
+        assert_eq!(
+            stall::total(),
+            0,
+            "読まれない PTY への書き込みが呼び出し側に詰まり得る呼び出しを課した ({})",
+            stall::breakdown()
         );
+        // ② 捨てて 0 になったのではない — 全部ちゃんと積まれている
+        //    (writer スレッドは 1 発目の write_all に掴まったままなので、
+        //     数え戻しはまだ 1 度も起きていない)。
+        assert_eq!(
+            w.queued.load(Ordering::Relaxed),
+            N * CHUNK.len(),
+            "積んだはずのバイトが待ち行列に無い"
+        );
+
+        // ③ 子が読み始めれば、詰まっていた書き込みは writer スレッドの上で
+        //    全部行われる。**時計もスピンも使わない** — 書けた通知を N 回受ける。
+        drop(hold);
+        for i in 1..=N {
+            let seen = wrote_rx.recv().expect("writer スレッドが畳まれた");
+            assert_eq!(seen, i, "書き込みの順序か回数が合わない");
+        }
+        // ④ 詰まり得る呼び出しは writer スレッドが N 回払っていて、
+        //    呼び出し側は最後まで 0 のまま。**同じ仕事の請求先が違う**。
+        assert_eq!(
+            stall::total(),
+            0,
+            "呼び出し側の計器が後から鳴った ({})",
+            stall::breakdown()
+        );
+    }
+
+    /// **計器で測った経路が、実際に出荷される経路であること。**
+    ///
+    /// 回数のテストは「その仕組みは詰まらない」までしか言えない。
+    /// 出荷側がその仕組みを**使っていなければ**意味が無い —
+    /// 旧テストが `PtyWriter` を手で組み立てていて production の writer
+    /// スレッドを 1 行も通らなかったのが、まさにこの穴だった。
+    /// ここでソースを読んで、穴を構造的に塞ぐ。
+    #[test]
+    fn the_measured_path_is_the_shipped_path() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        // 探す文字列をそのまま書くと**このテスト自身に当たる**ので分割する。
+        let write_all = concat!("write", "_all(");
+        let kill_blocking = concat!("kill_tree", "_blocking(");
+
+        let body_of = |sig: &str, end: &str, name: &str| -> String {
+            let after = src
+                .split(sig)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} が見つからない"));
+            after
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("{name} の本体の終端が見つからない"))
+                .to_string()
+        };
+
+        // ① 送り口は積むだけ。ここで書いたら呼び出し側が子の都合で止まる。
+        let send = body_of(
+            "    fn send(&self, bytes: &[u8]) {",
+            "\n    }\n",
+            "PtyWriter::send",
+        );
+        assert!(
+            !send.contains(write_all),
+            "PtyWriter::send が直に書いている (呼び出し側が子の都合で止まる)"
+        );
+
+        // ② 出荷側は必ず spawn_for 経由。ここが直書きへ戻ると、
+        //    回数のテストは緑のままアプリだけが固まる。
+        let spawn = body_of(
+            "    pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {",
+            "\n    }\n",
+            "Session::spawn",
+        );
+        assert!(
+            !spawn.contains(write_all),
+            "Session::spawn が PtyWriter を通さずに書いている"
+        );
+        assert!(
+            spawn.contains("PtyWriter::spawn_for("),
+            "Session::spawn が計器の付いた writer 配線を使っていない"
+        );
+
+        // ③ 閉じる操作は丸ごと別スレッドへ。本体に後始末が残っていたら、
+        //    それは呼び出し側 (UI スレッド) が払うということ。
+        let reap = body_of("pub fn reap(session: Session) {", "\n}\n", "reap");
+        assert!(
+            reap.contains("std::thread::spawn("),
+            "reap が後始末を別スレッドへ逃がしていない"
+        );
+        assert!(
+            !reap.contains(kill_blocking),
+            "reap が呼び出し側のスレッドで木殺しを待っている"
+        );
+    }
+
+    /// 絶対に読み終わらない PTY の代わり。`gate` を握られている間、
+    /// `write_all` はそこで止まる (= 子が入力を読まなくなった状態)。
+    struct StalledPty {
+        gate: Arc<Mutex<()>>,
+        /// 書けた通し番号を返す口 (テストが時計を使わずに待つため)。
+        wrote: std::sync::mpsc::Sender<usize>,
+    }
+
+    impl std::io::Write for StalledPty {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            drop(lock_ok(&self.gate));
+            // writer スレッドの計器をそのまま通し番号として使う
+            // (production の [`PtyWriter::pump`] が 1 チャンク 1 回数える)。
+            let _ = self.wrote.send(stall::pty_writes() as usize);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// 届かない入力を無制限に溜め込まないこと。上限を超えたら捨てる
@@ -9468,22 +9947,62 @@ mod reap_pty_tests {
         std::fs::metadata(probe).map(|m| m.len()).unwrap_or(0)
     }
 
-    /// 閉じる操作そのものが呼び出し側 (UI スレッド) を待たせないこと。
-    /// ここが待たされると `App::update` の途中で画面が止まり、二度と戻らない。
+    /// **閉じる操作が呼び出し側 (UI スレッド) に「詰まり得る呼び出し」を
+    /// 1 回も課さないこと。**
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `took < 300ms` だった。300ms は「木殺しと `ClosePseudoConsole`
+    /// がその瞬間どれだけ速かったか」で決まる数字で、機械が混めば理由なく赤くなり、
+    /// 空いていれば**壊れていても緑になり得る** (`reap` が同期に戻っても、
+    /// 空いた機械なら 300ms を切ってしまう)。
+    ///
+    /// 見たいのは速さではなく**誰が払うか**である。同じ後始末でも、
+    /// 専用スレッドが払えば呼び出し側は 0、呼び出し側が払えば 1 以上になる。
+    /// その差は機械の速さと無関係に出る。
+    ///
+    /// 裏取り (後半) が要る理由: 前半だけだと「後始末が何もしていないから 0」
+    /// でも通ってしまう。同じセッションの後始末を直に呼べば必ず 1 以上払うことを
+    /// 見せて、0 が**移したことの結果**だと確かめる。
     #[test]
-    fn closing_a_running_agent_returns_immediately() {
+    fn closing_a_running_agent_charges_the_caller_no_blocking_calls() {
         let (session, probe) = spawn_with_a_noisy_grandchild("nonblock");
         if wait_until_growing(&probe).is_none() {
             // 孫を起こせない環境。ここで落としても得るものが無いので見送る。
             reap(session);
             return;
         }
-        let t = Instant::now();
+        stall::reset();
         reap(session);
-        let took = t.elapsed();
+        assert_eq!(
+            stall::total(),
+            0,
+            "閉じる操作が呼び出し側に詰まり得る呼び出しを課した ({})。\
+             UI スレッドならここで固まる",
+            stall::breakdown()
+        );
+
+        // 裏取り: 同じ後始末を**呼び出し側で**行うと、必ず 1 回以上払う。
+        // 別スレッドで走らせるのは、計器がスレッドローカルだから
+        // (このテストスレッドの 0 を汚さずに「払った側」を観測する)。
+        let (direct, probe2) = spawn_with_a_noisy_grandchild("nonblock-direct");
+        if wait_until_growing(&probe2).is_none() {
+            reap(direct);
+            return;
+        }
+        let charged = std::thread::spawn(move || {
+            stall::reset();
+            reap_now(direct);
+            (stall::total(), stall::breakdown())
+        })
+        .join()
+        .expect("後始末スレッド");
         assert!(
-            took < Duration::from_millis(300),
-            "閉じる操作が呼び出し側を待たせた ({took:?})。UI スレッドならここで固まる"
+            charged.0 > 0,
+            "後始末そのものが詰まり得る呼び出しを 1 回も払っていない。\
+             前半の 0 は「別スレッドへ移したから」ではなく「何もしていないから」に\
+             なっている ({})",
+            charged.1
         );
     }
 
@@ -10369,53 +10888,96 @@ mod resize_tests {
 mod pty_resize_tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     /// 潰し込み: 送り側は最新サイズを上書きするだけで待たず、
     /// 詰まった受け側が動き出したら「取り出した時点の最新」だけが届く。
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが「送り側 1001 発が `< 1s`」だった。1 秒は現象 (箱の上書き =
+    /// 数十 µs) から 4 桁離れていて、**受け側と結合していても緑になる** —
+    /// 受け側が 1 秒以内に動き出せば通ってしまうからである。
+    ///
+    /// 見たい性質は速さではなく**分離**なので、それをそのまま数える:
+    /// **受け側が 1 歩も進んでいない (apply 回数 1) 間に、送り側は 1001 発を
+    /// 撃ち終える。** 結合していればこの数は成立しない (送り側が止まる)。
     #[test]
-    fn coalescer_delivers_only_the_latest_size_and_never_blocks_the_sender() {
+    fn coalescer_decouples_the_sender_from_a_stalled_receiver() {
         let sink: Arc<Mutex<Vec<(u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
         // conhost が詰まった状況の再現: テストがゲートを握っている間、
         // 受け側 (apply) は 1 回目の適用で止まったままになる。
         let gate = Arc::new(Mutex::new(()));
-        let hold = gate.lock().unwrap();
+        let hold = lock_ok(&gate);
+        // apply に**入った**回数 (ゲートで止まっている間も 1 と数える)。
+        let entered = Arc::new(AtomicUsize::new(0));
+        // 「apply に入った」「apply を終えた」を時計なしで待つための口。
+        let (enter_tx, enter_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(u16, u16)>();
 
         let c = {
             let sink = sink.clone();
             let gate = gate.clone();
+            let entered = entered.clone();
             ResizeCoalescer::start("zv-test-coalesce".into(), move |r, co| {
-                drop(gate.lock());
-                sink.lock().unwrap().push((r, co));
+                entered.fetch_add(1, Ordering::SeqCst);
+                let _ = enter_tx.send(());
+                drop(lock_ok(&gate)); // ここで詰まる (conhost への同期 RPC 相当)
+                lock_ok(&sink).push((r, co));
+                let _ = done_tx.send((r, co));
                 true
             })
             .expect("ワーカー起動")
         };
 
-        let t0 = Instant::now();
+        // 受け側を起こして、**apply の中で掴まったこと**を確かめてから嵐を撃つ。
+        // (時計を使わずに「受け側は今止まっている」を保証するため)
+        c.request(1, 1);
+        enter_rx.recv().expect("受け側が apply に入らなかった");
+
+        // **分離の原因そのものを、待たずに 1 回で確かめる。**
+        // 受け側は apply の前に状態ロックを手放している。手放さない実装へ
+        // 戻ると `request` が apply の完了を待つようになり (= 詰まる)、
+        // 下の嵐は**赤ではなくハング**になって原因も分からなくなる。
+        // ここなら「握られていない」を try_lock 1 回で即座に落とせる。
+        assert!(
+            c.shared.0.try_lock().is_ok(),
+            "受け側が apply 中も状態ロックを握っている \
+             (送り側が ConPTY の同期 RPC に巻き込まれる)"
+        );
+
+        // 嵐。受け側は 1 歩も進めないので、送り側が待つなら必ずここで止まる。
+        let mut saw_receiver_stuck = 0u32;
         for i in 0..1000u16 {
+            if entered.load(Ordering::SeqCst) == 1 {
+                saw_receiver_stuck += 1;
+            }
             c.request(10 + i % 50, 40 + i % 80);
         }
         c.request(24, 100); // 最終サイズ
-        let sent_in = t0.elapsed();
-        // 受け側が完全に詰まっていても、送り側 1001 発は待たされない。
-        assert!(
-            sent_in < Duration::from_secs(1),
-            "送り側がブロックした: {sent_in:?}"
+
+        // ① 1000 発すべてを、受け側が止まったまま撃ち終えている。
+        assert_eq!(
+            saw_receiver_stuck, 1000,
+            "送り側が受け側の進捗を待った (止まったまま撃てたのは {saw_receiver_stuck} 発)"
+        );
+        // ② 受け側は本当に 1 歩も進んでいない (= ①が「速かった」ではない)。
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "受け側が動いてしまい、分離を測れていない"
         );
 
         drop(hold); // conhost が復帰
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while sink.lock().unwrap().last() != Some(&(24, 100)) {
-            assert!(
-                Instant::now() < deadline,
-                "最終サイズが届かない: {:?}",
-                sink.lock().unwrap()
-            );
-            std::thread::sleep(Duration::from_millis(10));
+
+        // 最終サイズが届くまで待つ。**時計を使わない** — 適用の通知を受ける。
+        let mut delivered_last = done_rx.recv().expect("受け側が畳まれた");
+        while delivered_last != (24, 100) {
+            delivered_last = done_rx.recv().expect("最終サイズが流れてこない");
         }
-        let delivered = sink.lock().unwrap().clone();
-        // ゲートで止まっていた高々 1 発 + 最新の 1 発。1001 発が素通りしたら失敗。
+        let delivered = lock_ok(&sink).clone();
+        // ゲートで止まっていた 1 発 + 最新の 1 発。1001 発が素通りしたら失敗。
         assert!(
             delivered.len() <= 2,
             "潰し込みが効いていない: {delivered:?}"
@@ -10523,13 +11085,22 @@ mod pty_resize_tests {
         .expect("PTY起動")
     }
 
-    /// 実 PTY: リサイズの嵐が呼び出し側 (UI スレッド相当) を待たせないこと、
-    /// それでも最終サイズは PTY まで必ず届くこと。修正前はこのループが
-    /// 1 発ごとに ConPTY への同期 RPC (`ResizePseudoConsole`) を撃っていた。
+    /// 実 PTY: リサイズの嵐が呼び出し側 (UI スレッド相当) に**同期 RPC を
+    /// 1 回も課さない**こと、それでも最終サイズは PTY まで必ず届くこと。
+    ///
+    /// ## なぜ時間で測らないか
+    ///
+    /// 元はここが `elapsed < 3s` だった。潰したい回帰は「101 回の
+    /// `ResizePseudoConsole` が呼び出し側に乗る」ことなのに、3 秒という線は
+    /// **その 101 回が速ければ緑になる** — つまり回帰そのものを見逃す。
+    /// 逆に機械が混めば、正しい実装でも赤くなり得る。
+    ///
+    /// 数えたいものは最初から回数だった: **呼び出し側が撃った同期 RPC の回数。
+    /// 答えは 0** (修正前は 101)。
     #[test]
-    fn resize_storm_neither_blocks_the_caller_nor_loses_the_final_size() {
+    fn resize_storm_charges_the_caller_no_conpty_rpc_and_keeps_the_final_size() {
         let mut s = resize_probe_session(9401);
-        let t0 = Instant::now();
+        stall::reset();
         for i in 0..100u16 {
             let (rows, cols) = (10 + i % 17, 40 + i % 29);
             // 同じサイズを K フレームぶん要求し、毎回ワーカーへの出荷まで起こす
@@ -10542,12 +11113,19 @@ mod pty_resize_tests {
         for _ in 0..RESIZE_STABLE_FRAMES {
             s.resize(frows, fcols);
         }
-        let elapsed = t0.elapsed();
+        // ワーカーを起こせない環境 (スレッド枯渇) では、代替経路が呼び出し側で
+        // RPC を撃つ設計になっている。そこで 0 を求めるのは筋が違うので見送る。
+        if s.resizer.is_none() {
+            s.kill();
+            return;
+        }
         // 修正前は 101 回の同期 RPC がここに乗っていた。呼び出し側は
         // サイズの上書きと通知しかしないので、詰まりようがない。
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "リサイズの呼び出し側がブロックした: {elapsed:?}"
+        assert_eq!(
+            stall::pty_resizes(),
+            0,
+            "リサイズの呼び出し側が ConPTY への同期 RPC を撃った ({})",
+            stall::breakdown()
         );
         // 描画グリッド (vt100) は即時に最終サイズ。
         assert_eq!(
@@ -10556,6 +11134,15 @@ mod pty_resize_tests {
             "vt100 が要求サイズに即時追従していない"
         );
         // PTY 本体にも水面下で最終サイズが届く (取りこぼし禁止)。
+        //
+        // **ここだけ実時間が残る。理由を書いておく。** これは「速いこと」の
+        // 予算ではなく「**いつかは届く**こと」(生存性) の待ちで、性質上
+        // 「まだ来ていない」と「もう来ない」を有限時間で区別できない。
+        // 完了の合図が無い (`pty_size` は問い合わせるしかない) ので、
+        // 時計を外すと回帰が**赤ではなくハング**になる。
+        // 10 秒は実際の所要 (1 ミリ秒未満) から 4 桁上に置いてあり、
+        // 4 倍オーバーサブスクライブ (16 コアに 64 本の busy loop) で
+        // 8 回連続緑を実測済み。合否を分ける線ではない。
         let deadline = Instant::now() + Duration::from_secs(10);
         while s.pty_size() != Some((frows, fcols)) {
             assert!(

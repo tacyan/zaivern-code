@@ -567,6 +567,16 @@ impl FileTree {
     /// キャッシュ済みの各階層をディレクトリ mtime で確認し、外部(エージェント等)で
     /// ファイルが追加・削除・リネームされていたら全キャッシュを破棄する。
     /// 変化があれば true(次フレームの描画でディスクから読み直される)。
+    /// 外部変更の見張り対象 (読んだフォルダ → 憶えている mtime)。
+    ///
+    /// [`refresh_if_changed`](Self::refresh_if_changed) が突き合わせるのと
+    /// **まったく同じ組**を、描画スレッドの外の見張り (`crate::fswatch`) へ
+    /// そのまま渡すために公開する。片方だけ増減すると「見張っているのに
+    /// 気付かない」フォルダができるので、出所は必ずここ 1 つにする。
+    pub fn watch_dirs(&self) -> impl Iterator<Item = (&Path, Option<SystemTime>)> + '_ {
+        self.mtimes.iter().map(|(d, m)| (d.as_path(), *m))
+    }
+
     pub fn refresh_if_changed(&mut self) -> bool {
         let changed = self
             .mtimes
@@ -4128,12 +4138,11 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} が見つからない"))
     }
 
-    /// app.rs の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
+    /// app の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
     /// 掃除するために remove_dir_all を使うので対象外)。
     fn app_fns() -> Vec<(String, String)> {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
-        let cut = src.find("\n#[cfg(test)]\nmod ").unwrap_or(src.len());
-        split_fns(&src[..cut])
+        let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
+        split_fns(&src)
     }
 
     #[test]

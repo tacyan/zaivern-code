@@ -644,7 +644,7 @@ impl<'a> Anchors<'a> {
     /// `a` と `b` を同時に持ってよいか (交錯していなければ常に `true`)。
     /// 本文が無いのに交錯していたら `false` = **fail-closed**。
     fn ok(&mut self, a: &[Span], b: &[Span]) -> bool {
-        if a.is_empty() || b.is_empty() || !region::interleaved(a, b) {
+        if !region::needs_wall(a, b) {
             return true;
         }
         let text = self.text;
@@ -2965,6 +2965,16 @@ mod tests {
             .collect()
     }
 
+    /// **壁が潤沢にある本文** (全行が一意)。
+    ///
+    /// 門は [`region::needs_wall`] なので、本文を渡さない (`None`) 呼び出しは
+    /// 同じファイルの組を**すべて断る** (fail-closed。読めなかったときの
+    /// 正しい振る舞い)。ずらしの寸法や空き域の数え方を測るテストは
+    /// 壁の有無を測っているのではないので、こちらを渡す。
+    fn walled(n: u32) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
     // ── 空き域 ───────────────────────────────────────────────────────
 
     #[test]
@@ -3096,7 +3106,7 @@ mod tests {
     fn ぶつからなければそのまま通る() {
         let w = Want::fixed("t", reg("src/a.rs#L100-120"));
         let occ = held(&[("bob", "src/a.rs#L1-50"), ("eve", "src/b.rs#L100-120")]);
-        assert_eq!(offer(&w, &occ, 500, 3, None), Offer::Grant);
+        assert_eq!(offer(&w, &occ, 500, 3, Some(&walled(500))), Offer::Grant);
     }
 
     /// **交錯した要求はそのまま通さない。**
@@ -3175,7 +3185,7 @@ mod tests {
     fn 新規確保は最も近い空き域へずれる() {
         let w = Want::movable("t", reg("src/a.rs#L10-40")); // 31 行
         let occ = held(&[("bob", "src/a.rs#L1-50")]);
-        match offer(&w, &occ, 500, 3, None) {
+        match offer(&w, &occ, 500, 3, Some(&walled(500))) {
             Offer::Shift { to, moved } => {
                 // 占有 1-50 + 安全帯 3 → 54 行目から空く
                 assert_eq!(region::render(&to), "src/a.rs#L54-84");
@@ -3191,7 +3201,7 @@ mod tests {
         // 200 行の要求が 300-500 を持たれている。上 (1-296) のほうが近い。
         let w = Want::movable("t", reg("src/a.rs#L310-509"));
         let occ = held(&[("bob", "src/a.rs#L300-500")]);
-        match offer(&w, &occ, 1000, 3, None) {
+        match offer(&w, &occ, 1000, 3, Some(&walled(1000))) {
             Offer::Shift { to, moved } => {
                 assert_eq!(region::render(&to), "src/a.rs#L504-703");
                 assert_eq!(moved, 194);
@@ -3200,7 +3210,7 @@ mod tests {
         }
         // 上に十分な空きがあるなら上を選ぶ
         let w2 = Want::movable("t", reg("src/a.rs#L290-309"));
-        match offer(&w2, &occ, 1000, 3, None) {
+        match offer(&w2, &occ, 1000, 3, Some(&walled(1000))) {
             Offer::Shift { to, moved } => {
                 assert_eq!(region::render(&to), "src/a.rs#L277-296");
                 assert_eq!(moved, -13);
@@ -3867,7 +3877,7 @@ mod tests {
         let base = crowded(20_260_810, AGENTS, LINES, 80, 320);
 
         // (1) 交渉なし = ずらせない要求として配る (実測表の再現)
-        let plain = allocate(&wants_from(&base, false, false), &[], LINES, BAND, None);
+        let plain = allocate(&wants_from(&base, false, false), &[], LINES, BAND, Some(&walled(LINES)));
         assert!(plain.is_disjoint());
         assert_eq!(
             (plain.granted.len(), plain.denied.len()),
@@ -3876,11 +3886,11 @@ mod tests {
         );
 
         // (2) 交渉あり (ずらすだけ)
-        let shift = allocate(&wants_from(&base, true, false), &[], LINES, BAND, None);
+        let shift = allocate(&wants_from(&base, true, false), &[], LINES, BAND, Some(&walled(LINES)));
         assert!(shift.is_disjoint(), "ずらした結果が互いに素でない");
 
         // (3) 交渉あり (行数だけの要求 = 分割も許す)
-        let split = allocate(&wants_from(&base, true, true), &[], LINES, BAND, None);
+        let split = allocate(&wants_from(&base, true, true), &[], LINES, BAND, Some(&walled(LINES)));
         assert!(split.is_disjoint(), "分割した結果が互いに素でない");
 
         let ceiling = packing_ceiling(&base, LINES, BAND);
@@ -3983,7 +3993,7 @@ mod tests {
         assert_eq!(ceiling, 64, "そもそも 64 件は入る条件のはず");
 
         // (1) ずらせない申告 = 交渉なし。stride 2 では 5 件おきにしか通らない
-        let fixed = allocate(&wants_from(&base, false, false), &[], LINES, BAND, None);
+        let fixed = allocate(&wants_from(&base, false, false), &[], LINES, BAND, Some(&walled(LINES)));
         assert!(fixed.is_disjoint());
 
         // (2) ずらせる申告。**場所に意味が無い新規確保**なので、
@@ -3995,7 +4005,7 @@ mod tests {
                     .max_shift(LINES)
             })
             .collect();
-        let plan = allocate(&wants, &[], LINES, BAND, None);
+        let plan = allocate(&wants, &[], LINES, BAND, Some(&walled(LINES)));
 
         let rate = 100.0 * plan.granted.len() as f64 / ceiling as f64;
         eprintln!(
@@ -4027,11 +4037,11 @@ mod tests {
 
         // 決定的であること (同じ入力から 1 バイト違わない)
         for _ in 0..3 {
-            assert_eq!(allocate(&wants, &[], LINES, BAND, None), plan);
+            assert_eq!(allocate(&wants, &[], LINES, BAND, Some(&walled(LINES))), plan);
         }
         let mut shuffled = wants.clone();
         shuffled.reverse();
-        assert_eq!(allocate(&shuffled, &[], LINES, BAND, None), plan);
+        assert_eq!(allocate(&shuffled, &[], LINES, BAND, Some(&walled(LINES))), plan);
     }
 
     /// **既定 (200 行) のままでも 64 件全部が通る。固定値だったら 59 件が天井。**
@@ -4050,7 +4060,7 @@ mod tests {
         const BAND: u32 = 3;
         let base = bench_crowded(64, LINES, BAND);
         let wants = wants_from(&base, true, false); // max_shift は既定の 200
-        let plan = allocate(&wants, &[], LINES, BAND, None);
+        let plan = allocate(&wants, &[], LINES, BAND, Some(&walled(LINES)));
 
         // 固定値だったときの天井 (この数を超えることが証拠になる)
         let span = (1060 + DEFAULT_MAX_SHIFT + 5) - (934 - DEFAULT_MAX_SHIFT) + 1;
@@ -4091,7 +4101,7 @@ mod tests {
         for n in [8u32, 16, 32, 64, 128] {
             let base = bench_crowded(n, LINES, BAND);
             let wants = wants_from(&base, true, false); // 設定は既定のまま
-            let plan = allocate(&wants, &[], LINES, BAND, None);
+            let plan = allocate(&wants, &[], LINES, BAND, Some(&walled(LINES)));
             assert!(plan.is_disjoint(), "n={n} で互いに素でない");
             // 固定値だったときの天井 (n が増えると要求が伸びる)
             let lo = base[0].1.start.saturating_sub(DEFAULT_MAX_SHIFT).max(1);
@@ -4222,8 +4232,9 @@ mod tests {
         let want = Want::movable("t0", reg("src/a.rs#@50"));
         assert_eq!(want.lines(), Some(0), "挿入点は 0 行");
         let occ = held(&[("bob", "src/a.rs#@50")]);
-        let Offer::Shift { to, moved } = offer(&want, &occ, 100, 3, None) else {
-            panic!("ずらす提案が出ない: {:?}", offer(&want, &occ, 100, 3, None));
+        let body = walled(100);
+        let Offer::Shift { to, moved } = offer(&want, &occ, 100, 3, Some(&body)) else {
+            panic!("ずらす提案が出ない: {:?}", offer(&want, &occ, 100, 3, Some(&body)));
         };
         let s = to.span.expect("行域がある");
         assert!(s.is_insert(), "ずらした先が挿入点になっていない: {s:?}");
@@ -4249,7 +4260,7 @@ mod tests {
         let wants: Vec<Want> = (0..64)
             .map(|i| Want::movable(&format!("t{i:02}"), reg("src/big.rs#@1000")).max_shift(LINES))
             .collect();
-        let plan = allocate(&wants, &[], LINES, BAND, None);
+        let plan = allocate(&wants, &[], LINES, BAND, Some(&walled(LINES)));
         eprintln!(
             "挿入点 64 個 / 2000 行: {}/{} · 理論上限 {} · ずれ総和 {} 行",
             plan.granted.len(),
@@ -4286,7 +4297,7 @@ mod tests {
         }
         // すでに真ん中を持っている人がいる
         let occ = held(&[("bob", "src/big.rs#L700-760")]);
-        let plan = allocate(&wants, &occ, LINES, BAND, None);
+        let plan = allocate(&wants, &occ, LINES, BAND, Some(&walled(LINES)));
         eprintln!(
             "挿入点 12 + 行域 12 (占有 1 件あり): {}/{} · ずれ総和 {} 行",
             plan.granted.len(),
@@ -4487,7 +4498,7 @@ mod tests {
                     .max_shift(LINES)
             })
             .collect();
-        let plan = allocate(&wants, &[], LINES, BAND, None);
+        let plan = allocate(&wants, &[], LINES, BAND, Some(&walled(LINES)));
 
         // 左詰め (寄せ直し無し) だと 1 行目から並ぶので総和は 45,600 行
         let flat: i64 = base

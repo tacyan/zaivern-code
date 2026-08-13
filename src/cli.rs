@@ -3452,6 +3452,76 @@ prunable gitdir file points to non-existent location
 
     // ── update: 配布元の URL は install.sh / install.ps1 が単一の真実 ──
 
+    // ── 供給網: インストーラは「展開する前に」SHA-256 を突き合わせる ──
+
+    /// release.yml が checksums.txt を作っていても、**インストーラが見ていなければ
+    /// 意味が無い**。しかも検証は *展開の前* でなければならない — tar / Expand-Archive
+    /// が中身を書き出した後で気付いても、そのファイルはもうディスク上にある。
+    ///
+    /// ここは「呼んでいるか」だけでなく **順序** を固定する。
+    #[test]
+    fn インストーラは展開前にsha256を検証する() {
+        // Windows のチェックアウトは CRLF なので改行を正規化してから探す。
+        let sh = INSTALL_SH.replace("\r\n", "\n");
+        let ps1 = INSTALL_PS1.replace("\r\n", "\n");
+
+        for (name, src, tokens) in [
+            (
+                "install.sh",
+                &sh,
+                ["checksums.txt", "verify_checksum", "abort_unverified"].as_slice(),
+            ),
+            (
+                "install.ps1",
+                &ps1,
+                ["checksums.txt", "Test-Checksum", "Get-FileHash"].as_slice(),
+            ),
+        ] {
+            for t in tokens {
+                assert!(src.contains(t), "{name} に {t} が無い (検証していない)");
+            }
+        }
+
+        // 順序: 検証の呼び出し < 展開の呼び出し。
+        let verify = sh
+            .find(r#"verify_checksum "$tmp/$base""#)
+            .expect("sh: 検証の呼び出し");
+        let extract = sh.find("tar xzf").expect("sh: 展開");
+        assert!(verify < extract, "install.sh: tar xzf の前に検証していない");
+
+        let verify = ps1.find("Test-Checksum $zip").expect("ps1: 検証の呼び出し");
+        // **実際の呼び出し行**を探す。素の "Expand-Archive" だと、なぜ展開前に
+        // 検証するのかを説明した**コメント**が先に当たって常に失敗する
+        // (「検証していない」と嘘の赤を出す)。
+        let extract = ps1
+            .find("Expand-Archive $zip -DestinationPath")
+            .expect("ps1: 展開の呼び出し");
+        assert!(
+            verify < extract,
+            "install.ps1: Expand-Archive の前に検証していない"
+        );
+    }
+
+    /// 検証できなかったときに **黙って続けない** こと (fail-closed)。
+    /// 「checksums.txt が取れなかったので素通しした」は、検証していないのと同じ。
+    #[test]
+    fn 検証できないときは中止する() {
+        let sh = INSTALL_SH.replace("\r\n", "\n");
+        let ps1 = INSTALL_PS1.replace("\r\n", "\n");
+        assert!(
+            sh.contains("|| abort_unverified \"checksums.txt を取得できませんでした\""),
+            "install.sh: checksums.txt を取れなかったときに中止していない"
+        );
+        assert!(
+            sh.contains("exit 1"),
+            "install.sh: abort_unverified が終了していない"
+        );
+        assert!(
+            ps1.contains("$script:zaiGiveUp = $true   # 検証に失敗した以上"),
+            "install.ps1: 検証失敗後にソースビルドへ降りてしまう"
+        );
+    }
+
     #[test]
     fn 配布元は付属インストーラから導出できる() {
         let d = distribution_from(INSTALL_SH, INSTALL_PS1).expect("配布元を導出できるべき");

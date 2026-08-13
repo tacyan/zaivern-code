@@ -231,13 +231,18 @@ const COMPACT_WIDTH: f32 = 560.0;
 /// * 区切りは `/` へ寄せる (Windows の `\` をそのまま保存すると、
 ///   同じファイルが 2 つのキーで台帳に載る)
 /// * 連続する区切りと `./` を潰す
-/// * Windows は大文字小文字を区別しないファイルシステムが既定なので畳む。
-///   **両方の側を実装する** — unix はそのまま (`Foo.rs` と `foo.rs` は別物)
+/// * 大文字小文字を畳むかは **実ファイルシステムの実測**で決まる
+///   ([`crate::worktree::fs_case_insensitive`])。**OS では決めない** —
+///   Linux にも非区別なマウントはあり、macOS にも区別するボリュームはある
 pub fn normalize_path(raw: &str) -> String {
     // 規則は 3 つの OS ぶんあるが、動いている OS のぶんしか実行されない。
     // **引数へ出しておかないと、macOS で開発している限り Windows / Linux の
     // 規則は一度も検査されない** (`keybinds::canonical_mods_on` と同じ流儀)。
-    normalize_path_on(raw, true, cfg!(any(windows, target_os = "macos")))
+    //
+    // 畳むかどうかは `cfg!` (= コンパイル時の OS) ではなく、いま乗っている
+    // FS を実際に叩いて決める。プロセス内で 1 度だけ確定するので、
+    // パターン側と実パス側で答えが食い違うことはない。
+    normalize_path_on(raw, true, crate::worktree::fs_case_insensitive())
 }
 
 /// 規則を明示する [`normalize_path`]。
@@ -276,11 +281,12 @@ pub fn normalize_path_on(raw: &str, win_sep: bool, fold_case: bool) -> String {
     if subtree && !out.is_empty() {
         out.push_str("/**");
     }
-    // **大小非区別は「OS」ではなく「ボリューム」の性質**だが、macOS の既定
-    // (APFS) と Windows はどちらも非区別なので、この 2 つは畳む。
-    // ここを `cfg!(windows)` だけにしていたため、**開発機である macOS で
-    // `src/Foo.rs` と `src/foo.rs` が別リースになり、同じ物理ファイルへ
-    // 2 人が同時に書けていた** (実バイナリで再現済み)。
+    // **大小非区別は「OS」ではなく「ボリューム」の性質。** かつてここは
+    // `cfg!(windows)` → `cfg!(any(windows, target_os = "macos"))` と
+    // 直されてきたが、**どちらも OS を FS の代用にしている点で同じ誤り**
+    // だった。いまは `fold_case` の実引数を [`normalize_path`] が実 FS の
+    // 実測から作る。この関数自体は規則を受け取るだけの純関数なので、
+    // どのホストからでも 3 通り全部を検査できる。
     // 畳みすぎる側は「別ファイルを同じ扱いにする」= 過剰に止める方向なので
     // fail-closed。取りこぼす側と違って衝突は生まない。
     if fold_case {
@@ -662,20 +668,46 @@ mod scan_count {
 ///
 /// # 費用
 ///
-/// 関所は書き込みのたびに走る短命プロセスなので、[`crate::region::anchor_lines`]
-/// (ファイル全体の走査) は**交錯している組が実際にあるときだけ**呼ぶ。
-/// 互いに素な配り方 (この機能が普段扱う形) では
-/// [`crate::region::interleaved`] の外接域 2 つぶんしか払わない。
+/// 0.16.0 までは [`crate::region::anchor_lines`] (ファイル全体の走査) を
+/// **交錯している組が実際にあるときだけ**呼んでいた。その門は見逃すことが
+/// 実測で分かったので ([`crate::region::needs_wall`])、いまは**同じファイルを
+/// 他人が持っている組すべて**で払う。関所は書き込みのたびに走る短命プロセス
+/// なので、呼び出し側は**ファイルにつき 1 回**へまとめること
+/// (`crate::guard::bracket_hit` の `text` / `crate::czero` の `text` 表が手本)。
 pub fn interleave_ok(
     text: Option<&str>,
     a: &[crate::region::Span],
     b: &[crate::region::Span],
 ) -> bool {
-    if !crate::region::interleaved(a, b) {
-        return true; // 交錯していなければ帯 (組ごと) で足りる
+    if !crate::region::needs_wall(a, b) {
+        return true; // 片方が空 = 境目が無い
     }
-    match text {
-        Some(t) => crate::region::interleave_safe(&crate::region::anchor_lines(t), a, b),
+    interleave_ok_anchors(text.map(crate::region::anchor_lines).as_deref(), a, b)
+}
+
+/// [`interleave_ok`] の、**錨を数え終えている**版。
+///
+/// # なぜ分けるのか — O(N²) の全長走査になっていた
+///
+/// 門が [`crate::region::needs_wall`] になって「同じファイルを持つ組すべて」を
+/// 見るようになったので、持ち主ごとに [`crate::region::anchor_lines`]
+/// (ファイル全長の走査 + `BTreeMap` の構築) を払うと **持ち主 N 人 × 確保 N 回**
+/// になる。実測: 1 ファイル 2000 行へ 16/32/64/128 体が確保する試験が
+/// **86.8 秒**まで伸びて nextest の 60 秒に届いた。
+/// 錨は**ファイルにつき 1 回**数えれば足りる (`bracket_conflict` が呼び出し前に
+/// 1 回だけ数える)。直した後は 2.5 秒。
+///
+/// `anchors` が `None` (= 本文を読めなかった) なら必ず `false` = fail-closed。
+pub fn interleave_ok_anchors(
+    anchors: Option<&[bool]>,
+    a: &[crate::region::Span],
+    b: &[crate::region::Span],
+) -> bool {
+    if !crate::region::needs_wall(a, b) {
+        return true;
+    }
+    match anchors {
+        Some(x) => crate::region::interleave_safe(x, a, b),
         None => false,
     }
 }
@@ -691,10 +723,10 @@ pub fn interleave_ok(
 /// 「**数えられなかった**」であることまで出す — 劣化したことを黙らせない。
 pub fn interleave_reason(known_text: bool) -> String {
     if known_text {
-        tr("交錯しています: 相手の行域を上下から挟んでいて、間に「このファイルで 1 回しか出てこない行」がありません。離しても直りません (帯を広げると悪化する組が実測であります) — 連続した 1 本の行域にするか、別のファイルにしてください")
+        tr("交錯しています: 相手の行域との境目に「このファイルで 1 回しか出てこない行」がありません。離しても直りません (帯を広げると悪化する組が実測であります) — 連続した 1 本の行域にするか、別のファイルにしてください")
     } else {
         trf(
-            "交錯しています: 相手の行域を上下から挟んでいますが、元の内容を読めなかったので手がかりの行を数えられませんでした (安全側で断ります。読み取り上限は設定 {key} で上げられます)。連続した 1 本の行域にするか、別のファイルにしてください",
+            "交錯しています: 相手の行域と同じファイルですが、元の内容を読めなかったので境目の手がかりの行を数えられませんでした (安全側で断ります。読み取り上限は設定 {key} で上げられます)。連続した 1 本の行域にするか、別のファイルにしてください",
             &[("key", KEY_GATE_READ_CAP.to_string())],
         )
     }
@@ -930,11 +962,16 @@ pub struct Roots {
 /// 2 つのキーへ割れる (これもテストで踏んだ)。
 pub fn roots_of(start: &Path) -> Roots {
     let ((key, tree), rooted) = roots_raw_full(start);
-    Roots {
+    let out = Roots {
         key: key.canonicalize().unwrap_or(key),
         tree: tree.canonicalize().unwrap_or(tree),
         rooted,
-    }
+    };
+    // **台帳に触る経路は必ずここを通る**ので、大小を畳むかの答えを
+    // 「推測できる場所 (現在地)」ではなく**実際の作業ツリー**で固定する。
+    // 2 回目以降は何もしない (`OnceLock`) ので、費用は 1 プロセス 1 回。
+    crate::worktree::seed_fs_case(&out.tree);
+    out
 }
 
 /// ルートの生の探索。返り値の `bool` は「`.git` で決まったのか」。
@@ -1877,21 +1914,28 @@ fn interleave_clash(
             }
         }
     }
+    // 錨は**ファイルにつき 1 回**数える。持ち主ごとに数えると
+    // `anchor_lines` (ファイル全長の走査 + BTreeMap の構築) が
+    // **持ち主 N 人 × 確保 N 回**になり、1 ファイル 2000 行へ 128 体が
+    // 集まる試験が 86.8 秒まで伸びた (`interleave_ok_anchors` に実測)。
+    let walls: std::collections::BTreeMap<String, Option<Vec<bool>>> = contested
+        .iter()
+        .map(|path| {
+            let text = mine.get(path).and_then(|e| e.1);
+            (path.clone(), text.map(crate::region::anchor_lines))
+        })
+        .collect();
     // 3. 他人ごとに、同じパスの域をまとめて突き合わせる。
     for l in store.leases.iter().filter(|l| !l.holder.same(holder)) {
         for (path, (my_spans, text, spec)) in &mine {
-            // **どちらも 1 本しか持っていないなら、交錯は起こり得ない。**
-            // 交錯は「外接域が重なる」ことで、1 本ずつなら外接域は域そのもの。
-            // 帯 (`overlaps_live`) をここまで通っている = 重なっていないので、
-            // 判定するまでもなく答えは決まっている。
-            //
-            // **これは速さのための近似ではなく、厳密に同じ答えである。**
-            // 効き目は大きい: 下の `live_span_of` は錨を本文の中から探し直す
-            // ので**1 回がファイル全長の走査**で、担当 N 人ぶん走ると
-            // 確保 1 回の費用が倍になる (実測: 互いに素な 64 件で
-            // 4203ms → 5082ms、この screening を入れて 4200ms 台へ戻した)。
+            // **1 本ずつでも壁は要る。** 0.16.0 まではここで
+            // 「どちらも 1 本なら交錯は起こり得ない」と降りていた。交錯は
+            // 起こり得なくても**壁は要る** — 削除・挿入が混ざると上下に
+            // 分かれた組でも `git merge` は衝突する
+            // (`crate::region::needs_wall` に実測)。降りてよいのは
+            // 「相手がこのパスを 1 本も持っていない」ときだけ。
             let theirs_n = l.patterns.iter().filter(|p| covers(p, path)).count();
-            if theirs_n == 0 || (theirs_n == 1 && my_spans.len() <= 1) {
+            if theirs_n == 0 {
                 continue;
             }
             let mut theirs: Vec<crate::region::Span> = Vec::new();
@@ -1908,7 +1952,8 @@ fn interleave_clash(
             if theirs.is_empty() {
                 continue;
             }
-            if !interleave_ok(*text, my_spans, &theirs) {
+            let wall = walls.get(path).and_then(|w| w.as_deref());
+            if !interleave_ok_anchors(wall, my_spans, &theirs) {
                 return Some((
                     (*spec).to_string(),
                     interleave_reason(text.is_some()),
@@ -2812,9 +2857,35 @@ fn write_store(store: &Path, s: &Store) -> Result<(), String> {
     let tmp = store.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, json).map_err(|e| format!("台帳を書けません: {e}"))?;
     // rename は同一ディレクトリ内なら unix / Windows とも置換が保証される。
-    std::fs::rename(&tmp, store).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("台帳を差し替えられません: {e}")
+    //
+    // **ただし Windows は「置換できるか」と「いま置換できるか」が別。**
+    // 削除・置換は *delete pending* を経るので、混んでいる瞬間の rename は
+    // `AlreadyExists` ではなく **`ACCESS_DENIED` (os error 5)** を返す。
+    // ロックを取る側 ([`acquire_lock_in`]) にはこの再試行があるのに、
+    // **書き戻す側にだけ無かった** — しかも `LOCK_BUSY` 接頭辞も付かないので
+    // [`is_lock_busy`] にも掛からず、呼び出し側の再試行にも乗らずに落ちていた
+    // (wine の 64 スレッドで実測。`tools/windows-check.sh --wine`)。
+    // **いちばん混んでいるとき = いちばん衝突しやすいとき**にだけ台帳が
+    // 使えなくなる、という最悪の壊れ方をする非対称だった。
+    let deadline = Instant::now() + Duration::from_millis(LOCK_WAIT_MS);
+    let mut attempt = 0u32;
+    let err = loop {
+        match std::fs::rename(&tmp, store) {
+            Ok(()) => return Ok(()),
+            // 混んでいるだけなら待つ。予算内は何度でも。
+            Err(e) if lock_contended(&e) && Instant::now() < deadline => {
+                lock_backoff(&mut attempt);
+            }
+            Err(e) => break e,
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    // **文面ではなく接頭辞で識別する** ([`acquire_lock_in`] と同じ作法)。
+    // 混雑なら、呼び出し側が再試行できる形で返す。
+    Err(if lock_contended(&err) {
+        format!("{LOCK_BUSY}台帳を差し替えられません: {err}")
+    } else {
+        format!("台帳を差し替えられません: {err}")
     })
 }
 
@@ -5797,11 +5868,10 @@ mod tests {
             normalize_path(".\\日本語\\ファイル.rs"),
             "日本語/ファイル.rs"
         );
-        // 大小非区別のファイルシステムが既定の OS (Windows / macOS) では畳む。
-        // Linux は畳まない — **両側を書く**。
-        // macOS を入れていなかったため、開発機で `Foo.rs` と `foo.rs` が
+        // 大小を畳むかは **実 FS の実測**で決まる — **両側を書く**。
+        // ここを OS から決めていたため、開発機で `Foo.rs` と `foo.rs` が
         // 別リースになり同じ物理ファイルへ 2 人が書けていた。
-        if cfg!(any(windows, target_os = "macos")) {
+        if crate::worktree::fs_case_insensitive() {
             assert_eq!(normalize_path("SRC/App.rs"), "src/app.rs");
         } else {
             assert_eq!(normalize_path("SRC/App.rs"), "SRC/App.rs");
@@ -6981,11 +7051,62 @@ mod os_rule_tests {
         }
     }
 
-    /// 既定は動いている OS の規則を選ぶ (公開シグネチャは据え置き)。
+    /// 既定は**実 FS の実測**を選ぶ (公開シグネチャは据え置き)。
     #[test]
-    fn 既定の規則は動いているosに一致する() {
-        let want = normalize_path_on("SRC/App.rs", true, cfg!(any(windows, target_os = "macos")));
+    fn 既定の規則は実fsの実測に一致する() {
+        let want = normalize_path_on("SRC/App.rs", true, crate::worktree::fs_case_insensitive());
         assert_eq!(normalize_path("SRC/App.rs"), want);
+    }
+
+    /// 台帳の鍵をいくら作っても、**実 I/O の検査は 1 プロセスに最大 1 回**。
+    ///
+    /// 絶対時間ではなく**検査の呼び出し回数**で線を引く (負荷で散る数字は
+    /// 材料にならない)。答えが `OnceLock` で固定されるので、2 回目以降の
+    /// [`normalize_path`] は FS を 1 度も触らない。
+    #[test]
+    fn 鍵をいくつ作っても実fsの検査は最大一度() {
+        let before = crate::worktree::case_probe_calls();
+        for i in 0..10_000 {
+            let _ = normalize_path(&format!("src/Mod{i}/File.rs"));
+        }
+        let probes = crate::worktree::case_probe_calls() - before;
+        assert!(
+            probes <= 1,
+            "鍵を 10000 個作るのに実 FS の検査が {probes} 回走った"
+        );
+    }
+
+    /// **大小を畳むかを `cfg!` (= コンパイル時の OS) から決めていない。**
+    ///
+    /// この誤りは 2 度入っている (`cfg!(windows)` → `cfg!(any(windows,
+    /// target_os = "macos"))`)。どちらも「OS」を「FS の性質」の代用に
+    /// している点で同じで、実 FS と食い違えば**同じファイルに 2 つの台帳
+    /// キー**ができる。壊れても台帳には重なりが残らないので気付けない。
+    ///
+    /// ソースを読む検査なので、改行を正規化してから探す (Windows の
+    /// チェックアウトは CRLF)。
+    #[test]
+    fn 既定の大小規則をコンパイル時のosから決めていない() {
+        let src = include_str!("lease.rs").replace("\r\n", "\n");
+        let head = "pub fn normalize_path(raw: &str) -> String {";
+        let start = src.find(head).expect("normalize_path が見つからない");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("関数の終わりが見つからない");
+        // コメントは落とす (「`cfg!` ではなく実 FS で決める」と**書いてある**
+        // だけで落ちてしまい、番人が説明文を書けなくする)。
+        let body: String = body[..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("cfg!"),
+            "normalize_path が cfg! で大小を決めている (FS の性質は OS で決まらない)"
+        );
+        assert!(
+            body.contains("crate::worktree::fs_case_insensitive()"),
+            "normalize_path が実 FS の実測を使っていない"
+        );
     }
 }
 
@@ -7025,6 +7146,49 @@ mod span_tests {
             cwd: String::new(),
             pid: 0,
         }
+    }
+
+    /// **壁が潤沢な作業ツリー** (全行が一意の 800 行のファイルを何本か置く)。
+    ///
+    /// 門は `crate::region::needs_wall` なので、**本文を読めないファイルでは
+    /// 同じファイルの 2 人目を必ず断る** (fail-closed)。行域の配り方そのものを
+    /// 測るテストは壁の有無を測っているのではないので、ここを起点にする。
+    /// 中身は読むだけなので、テストプロセスで 1 つ作れば足りる。
+    fn walled_tree() -> &'static Path {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = unique_temp_dir("zaivern", "lease-span-tree");
+            std::fs::create_dir_all(dir.join("src")).expect("src を作る");
+            let body: String = (1..=800u32).map(|i| format!("line {i}\n")).collect();
+            for rel in [
+                "a.rs",
+                "b.rs",
+                "shared.rs",
+                "src/a.rs",
+                "src/b.rs",
+                "src/app.rs",
+            ] {
+                std::fs::write(dir.join(rel), &body).expect("本文を置く");
+            }
+            dir
+        })
+        .as_path()
+    }
+
+    /// このモジュールの `try_claim` は [`walled_tree`] を基準にする。
+    ///
+    /// 素の `super::try_claim` は `default_tree()` (= プロセスの cwd) を見るので、
+    /// 本文が読めず **同じファイルの 2 人目が全部 fail-closed で断られる**。
+    /// 壁そのものを測るテストは `try_claim_in` を直に呼ぶこと。
+    fn try_claim(
+        store: &mut Store,
+        holder: &Holder,
+        patterns: &[String],
+        now: u64,
+        ttl: u64,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> Claim {
+        try_claim_in(walled_tree(), store, holder, patterns, now, ttl, alive)
     }
 
     // ── 1. 台帳のスキーマは変えずに行域を載せる ─────────────────────
@@ -8111,7 +8275,10 @@ mod span_tests {
             ),
             other => panic!("交錯を通してしまった: {other:?}"),
         }
-        // **離れていれば従来どおり通る** (交錯の検査で全部が固まっていない)
+        // **離しても直らない。** 0.16.0 まではここで `a.md#L40` が通っていたが、
+        // それは「交錯していなければ帯で足りる」という誤った門のせいだった
+        // (`region::needs_wall` の実測: 削除・挿入が混ざると上下に分かれた組でも
+        // `git merge` は衝突する)。錨が 1 本も無い本文では、離しても通らない。
         let far = try_claim_in(
             &dir,
             &mut store,
@@ -8122,8 +8289,121 @@ mod span_tests {
             &|_| false,
         );
         assert!(
-            matches!(far, Claim::Granted(_)),
-            "挟まない域まで断った: {far:?}"
+            matches!(far, Claim::Refused { .. }),
+            "錨が無い本文で離しただけの域を通してしまった: {far:?}"
+        );
+        // **壁があれば通る。** 同じ配り方でも、境目に一意な行が 1 本あれば済む
+        // — 断っているのは「離れていないから」ではなく「壁が無いから」である。
+        let dir2 = unique_temp_dir("zaivern", "lease-interleave-wall");
+        let mut walled: Vec<String> = 反復本文(6, 60).lines().map(str::to_string).collect();
+        for i in [30usize, 34] {
+            walled[i] = format!("UNIQ-{i}");
+        }
+        std::fs::write(dir2.join("a.md"), walled.join("\n") + "\n").expect("本文を置く");
+        let mut store2 = Store::default();
+        assert!(
+            matches!(
+                try_claim_in(
+                    &dir2,
+                    &mut store2,
+                    &b,
+                    &["a.md#L25-25".into()],
+                    now,
+                    600,
+                    &|_| false
+                ),
+                Claim::Granted(_)
+            ),
+            "B の下ごしらえが取れない"
+        );
+        let walled_ok = try_claim_in(
+            &dir2,
+            &mut store2,
+            &a,
+            &["a.md#L40-40".into()],
+            now,
+            600,
+            &|_| false,
+        );
+        assert!(
+            matches!(walled_ok, Claim::Granted(_)),
+            "壁があるのに断った: {walled_ok:?}"
+        );
+    }
+
+    /// **1 本ずつでも壁は要る** (0.16.0 の screening が空けていた穴)。
+    ///
+    /// 関所には「どちらも 1 本しか持っていないなら交錯は起こり得ない」と
+    /// 降りる近道があった。交錯は確かに起こり得ないが、**壁は要る** —
+    /// 削除・挿入が混ざると上下に分かれた組でも `git merge` は衝突する
+    /// (`crate::region::needs_wall`)。しかも「2 人が 1 本ずつ」は
+    /// **いちばん普通の形**なので、そこだけ素通りしていた。
+    #[test]
+    fn 一本ずつでも壁が無ければ断る() {
+        let dir = unique_temp_dir("zaivern", "lease-wall-single");
+        // 錨が 1 本も無い本文 (周期 6・末尾も一意でない)
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        let bare: String = (0..300).map(|i| format!("{}\n", POOL[i % 6])).collect();
+        std::fs::write(dir.join("a.md"), &bare).expect("本文を置く");
+        let now = now_secs();
+        let mut store = Store::default();
+        let (a, b) = (who("A"), who("B"));
+        assert!(matches!(
+            try_claim_in(
+                &dir,
+                &mut store,
+                &a,
+                &["a.md#L20-25".into()],
+                now,
+                600,
+                &dead
+            ),
+            Claim::Granted(_)
+        ));
+        // **1 本ずつ・200 行離れている**のに、壁が無いので断る
+        let got = try_claim_in(
+            &dir,
+            &mut store,
+            &b,
+            &["a.md#L220-225".into()],
+            now,
+            600,
+            &dead,
+        );
+        assert!(
+            matches!(got, Claim::Refused { .. }),
+            "壁が無いのに 1 本ずつだからと通した: {got:?}"
+        );
+        // 壁を 1 本植えれば通る (「常に断る」へ倒れていない)
+        let dir2 = unique_temp_dir("zaivern", "lease-wall-single-ok");
+        let mut walled: Vec<String> = bare.lines().map(str::to_string).collect();
+        walled[100] = "UNIQ-100".into();
+        std::fs::write(dir2.join("a.md"), walled.join("\n") + "\n").expect("本文を置く");
+        let mut store2 = Store::default();
+        assert!(matches!(
+            try_claim_in(
+                &dir2,
+                &mut store2,
+                &a,
+                &["a.md#L20-25".into()],
+                now,
+                600,
+                &dead
+            ),
+            Claim::Granted(_)
+        ));
+        let ok = try_claim_in(
+            &dir2,
+            &mut store2,
+            &b,
+            &["a.md#L220-225".into()],
+            now,
+            600,
+            &dead,
+        );
+        assert!(
+            matches!(ok, Claim::Granted(_)),
+            "壁があるのに断った: {ok:?}"
         );
     }
 
@@ -8294,19 +8574,27 @@ mod span_tests {
         }
     }
 
-    /// `interleave_ok` は交錯していない組では錨を 1 度も数えない (費用の番人)。
+    /// `interleave_ok` は本文が読めなければ**必ず断る** (fail-closed の番人)。
     ///
-    /// 関所は書き込みのたびに走る短命プロセスなので、`anchor_lines`
-    /// (ファイル全体の走査) を毎回払うと重い。**交錯していない = 普段の形**
-    /// では本文が `None` でも通ることで、走査していないことを固定する。
+    /// 0.16.0 まではここが「交錯していない組は本文を読まずに通す」だった。
+    /// その門は削除・挿入が混ざると見逃す (`region::needs_wall` に実測: 上下に
+    /// 分かれた組でも `git merge` は衝突する) ので、**同じファイルを持つ組は
+    /// すべて壁を要求する**へ変えた。費用は「読む回数」で抑える (呼び出し側が
+    /// ファイルにつき 1 回だけ読む) のであって、門を緩めて買うものではない。
     #[test]
-    fn 交錯していなければ本文を読まずに通す() {
+    fn 本文が読めなければ同じファイルの組は通さない() {
         let s = |a: u32, b: u32| crate::region::Span { start: a, end: b };
-        // 互いに素 — 本文が無くても通る
-        assert!(interleave_ok(None, &[s(10, 12)], &[s(30, 32)]));
-        assert!(interleave_ok(None, &[s(30, 32)], &[s(10, 12)]));
-        // 挟んでいる — 本文が無ければ断る
+        // 上下に分かれていても、本文が無ければ壁を確かめられないので断る
+        assert!(!interleave_ok(None, &[s(10, 12)], &[s(30, 32)]));
+        assert!(!interleave_ok(None, &[s(30, 32)], &[s(10, 12)]));
+        // 挟んでいる — 本文が無ければ断る (従来どおり)
         assert!(!interleave_ok(None, &[s(20, 20)], &[s(10, 10), s(30, 30)]));
+        // 片方が空 = 境目が無いので壁は要らない
+        assert!(interleave_ok(None, &[], &[s(30, 32)]));
+        assert!(interleave_ok(None, &[s(10, 12)], &[]));
+        // 壁 (ファイル内で唯一の行) があれば通る
+        let text = "a\nb\nc\nd\ne\nf\n";
+        assert!(interleave_ok(Some(text), &[s(1, 1)], &[s(5, 5)]));
     }
 
     /// **交錯の検査は、互いに素な配り方の費用を増やさない。**
@@ -8318,9 +8606,15 @@ mod span_tests {
     /// 実測 (`zai lease claim` を 64 回・互いに素・2000 行):
     /// 直す前 4421ms / 入れた直後 5082ms (+15%) / screening 後 4325ms。
     /// 回数で見れば理由は自明で、交錯の検査が担当 N 人ぶん本文を
-    /// 走査し直していた。**両方が 1 本ずつなら交錯は起こり得ない**ので
-    /// (外接域 = 域そのもの、かつ帯を通っている = 重ならない)、
-    /// そこを厳密に飛ばす。
+    /// 走査し直していた。
+    ///
+    /// **0.16.0 の screening は撤回した。** 「両方が 1 本ずつなら交錯は
+    /// 起こり得ない」は正しいが、**交錯していなくても壁は要る**
+    /// (`crate::region::needs_wall` に実測)。飛ばしてよいのは「相手が
+    /// そのパスを 1 本も持っていない」ときだけ。費用は代わりに
+    /// **錨をファイルにつき 1 回しか数えない** ことで抑えている
+    /// (`interleave_ok_anchors`)。ここが数えているのは
+    /// [`Lease::live_span_of`] の回数なので、上限は担当の数のままである。
     #[test]
     fn 互いに素な確保では本文を走査し直さない() {
         let dir = unique_temp_dir("zaivern", "lease-interleave-cost");

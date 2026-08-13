@@ -4569,7 +4569,7 @@ bare
     /// ソースを読んで見張る。改行は正規化する (Windows は CRLF)。
     #[test]
     fn コミットの引数を組み立てるのはこのモジュールだけ() {
-        let app = include_str!("app.rs").replace("\r\n", "\n");
+        let app = crate::app::SRC.replace("\r\n", "\n");
         assert!(
             app.contains("crate::git_panel::commit_args("),
             "app.rs は git_panel::commit_args を通すこと"
@@ -4874,7 +4874,7 @@ bare
             panel.contains("self.spawn_history(&ctx, 0);"),
             "履歴の初回読み込みが仕込まれていない"
         );
-        let app = include_str!("app.rs").replace("\r\n", "\n");
+        let app = crate::app::SRC.replace("\r\n", "\n");
         assert!(
             app.contains("self.git_panel.ui(ui, &theme, &mut git_actions);"),
             "GitPanel を描いていない"
@@ -5542,7 +5542,7 @@ diff --git a/b.rs b/b.rs
         ] {
             assert!(src.contains(k), "レビュー画面に配線が無い: {k}");
         }
-        let app = include_str!("app.rs").replace("\r\n", "\n");
+        let app = crate::app::SRC.replace("\r\n", "\n");
         for k in [
             "Cmd::DiffNextFile",
             "Cmd::DiffPrevFile",

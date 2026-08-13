@@ -41,6 +41,12 @@ on:
     paths-ignore: ["**.md", "docs/**", "LICENSE"]
   workflow_dispatch:
 
+# GITHUB_TOKEN は既定で読み取りだけ。テストは何も書き込まないので、
+# 侵害されたアクションが押し込める範囲をここで潰しておく
+# (リリースワークフローと違い、このワークフローに書き込みは 1 つも要らない)。
+permissions:
+  contents: read
+
 # 同一ブランチへの連続 push では古い run をキャンセルし、ランナーを節約する。
 #
 # キーに **event 名を含める**のが要点。含めないと push run と pull_request run が
@@ -87,14 +93,19 @@ jobs:
     # nextest の slow-timeout が効かない事態への最終防壁。
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA 固定すると github.action_ref が SHA になり、既定の toolchain を
+      # ref 名から拾えなくなる。**toolchain: を必ず明示する**
+      # (書き忘れるとツールチェーン解決に失敗してジョブが落ちる)。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
 
       # 依存クレートのビルド結果をコミット間・fast/pty ジョブ間で使い回す。
       # shared-key はジョブ名ベースの自動キーを置き換えるため、
       # 同一 OS の fast と pty が同じキャッシュを読み書きする。
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -111,7 +122,10 @@ jobs:
             echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
           fi
 
-      - uses: taiki-e/install-action@nextest
+      # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: nextest
 
       - name: Tests (実PTY 以外の全て)
         run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
@@ -146,11 +160,16 @@ jobs:
     # 直列実行のためわずかに長めの防壁 (それでも旧 30 分の半分以下)。
     timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA 固定すると github.action_ref が SHA になり、既定の toolchain を
+      # ref 名から拾えなくなる。**toolchain: を必ず明示する**
+      # (書き忘れるとツールチェーン解決に失敗してジョブが落ちる)。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -166,7 +185,10 @@ jobs:
             echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
           fi
 
-      - uses: taiki-e/install-action@nextest
+      # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+        with:
+          tool: nextest
 
       - name: Terminal (real PTY) tests
         run: cargo nextest run --locked --no-fail-fast --profile ci -E 'test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
@@ -200,11 +222,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # SHA 固定すると github.action_ref が SHA になり、既定の toolchain を
+      # ref 名から拾えなくなる。**toolchain: を必ず明示する**
+      # (書き忘れるとツールチェーン解決に失敗してジョブが落ちる)。
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-windows-latest
           cache-on-failure: true
@@ -216,6 +243,198 @@ jobs:
 
       - name: "instances:: (実行中インスタンスのレジストリ)"
         run: "cargo test --bin zai --locked instances::"
+
+  # MSRV (Cargo.toml の rust-version) を **実際に 1.88.0 でコンパイルして**裏取りする。
+  #
+  # ■ なぜ要るのか — README / install.sh / install.ps1 は 3 つとも「Rust 1.88 以上」と
+  #   案内している。CI が stable でしか回らないと、1.88 では通らない構文や依存が
+  #   入っても**誰も気付かない**。壊れるのは利用者の `cargo install` だけ、という
+  #   いちばん見えない形で出る。
+  #
+  # ■ check だけで足りる — MSRV が問われるのは型検査と構文であって実行時ではない。
+  #   test まで回すと 1.88 用のキャッシュをもう 1 セット持つことになり、
+  #   得られる情報は増えないのに wall-clock だけ伸びる。
+  #   `--all-targets` は必須: これが無いと #[cfg(test)] のコードを一切見ない。
+  msrv:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: msrv (1.88.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          # Cargo.toml の rust-version と**同じ値**であること。
+          # 片方だけ上げると、案内と実測がずれたまま緑になる。
+          toolchain: "1.88.0"
+
+      # stable のキャッシュとは別に持つ (rustc が違えば成果物は共有できない)。
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: msrv-188
+          cache-on-failure: true
+
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
+
+      # Cargo.toml の rust-version と、ここで使う toolchain がずれていないことを
+      # **ワークフロー自身に確かめさせる** (人間の同期に頼らない)。
+      - name: rust-version と一致していることを確かめる
+        run: |
+          set -euo pipefail
+          want=$(cargo metadata --no-deps --format-version 1 | sed -En 's/.*"rust_version":"([^"]+)".*/\1/p')
+          got=$(rustc --version | sed -En 's/^rustc ([0-9]+\.[0-9]+).*/\1/p')
+          echo "Cargo.toml rust-version=$want / このジョブの rustc=$got"
+          [ "$want" = "$got" ] || { echo "::error::MSRV がずれている (Cargo.toml=$want, job=$got)"; exit 1; }
+
+      - name: cargo check (MSRV)
+        run: cargo check --locked --all-targets
+
+  # ワンライナーインストーラの静的検査。
+  #
+  # ■ なぜ Rust のテストだけでは足りないのか — cli.rs の番人テストは
+  #   「checksums.txt を検証する記述があるか」を**文字列で**見ているだけで、
+  #   その sh / PowerShell が**構文として正しいか**は一切見ていない。
+  #   install.sh は `curl | sh` で実行されるので、構文エラーは
+  #   「利用者の端末でだけ壊れる」形になる。ここで潰す。
+  #
+  # ubuntu ランナーには sh / shellcheck / pwsh が最初から入っている
+  # (pwsh が居るので Windows ランナーを 1 台増やさずに .ps1 まで見られる)。
+  installers:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: installers + tools (sh / ps1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: install.sh (構文 + shellcheck)
+        run: |
+          set -euo pipefail
+          sh -n install.sh
+          # SC1091: `. "$HOME/.cargo/env"` は実行時にしか存在しないので追えない。
+          # これだけは構造的に消せないため除外する (他は 0 件で通っている)。
+          shellcheck --shell=sh --exclude=SC1091 install.sh
+
+      - name: install.ps1 (パーサに通す)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path './install.ps1').Path, [ref]$null, [ref]$errors)
+          if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host "::error::$($_.Extent.StartLineNumber): $($_.Message)" }
+              exit 1
+          }
+          Write-Host "install.ps1: 構文エラー 0 件"
+
+      # tools/*.sh は 21 本あり、重いもの (ベンチ・証明の網羅版) は
+      # xplat.yml の週次でしか動かさない。**壊れていることに 1 週間気付かない**
+      # のを避けるため、実行はせずに構文と静的検査だけをここで毎回通す。
+      # cargo を 1 度も呼ばないので実測 7.3 秒。既存の installers ジョブ
+      # (timeout 5 分・中身は install.sh/ps1 の検査だけ) に相乗りするので、
+      # **ランナーは 1 台も増えず** wall-clock も動かない。
+      #
+      # --severity=error に絞るのは、この 21 本が今ちょうど 0 件で通るから
+      # (whitelist ではなくラチェット: 新しく増えたエラーだけが赤くなる)。
+      # 警告まで含めると初回から赤でゲートとして機能しない。
+      - name: tools/*.sh (構文 + shellcheck)
+        run: |
+          set -euo pipefail
+          n=0
+          for f in tools/*.sh; do
+            sh -n "$f"
+            n=$((n + 1))
+          done
+          shellcheck --shell=sh --severity=error tools/*.sh
+          echo "tools/*.sh: ${n} 本すべて通過"
+
+  # GUI E2E の **層 2** — 実バイナリを起こして、生きていることを確かめる
+  # (起動して指定秒数生存 / panic.log が 0 バイト / プロセスツリーごと片付く)。
+  #
+  # ■ なぜ fast へ足さないのか (実測)
+  #   `cargo build --bin zai` は **テストバイナリとは別のコンパイル単位**で、
+  #   ローカル実測 **4m44s**。fast が作るのはテスト用の成果物だけなので
+  #   再利用できず、fast へ足すとそれだけで 5 分予算を食い潰す。
+  #   **独立した並列ジョブ**にすれば wall-clock は max であって sum ではないので、
+  #   既存ジョブを 1 秒も遅くしない。`tools/gui-smoke.sh --seconds 5` 自体は
+  #   実測 **7.36s** で、費用はほぼ全部がビルドである。
+  #
+  # ■ なぜ macOS 1 台だけなのか
+  #   ubuntu のランナーには X も Wayland も無い。`xvfb-run` を足せば「開く」が、
+  #   それは llvmpipe という**別物**を測ることになる (gui-smoke.sh 自身も
+  #   ヘッドレス Linux では理由を出して `[skip]` で降りる)。
+  #   macOS は常にウィンドウサーバがあるので、ここだけが実物を測れる。
+  #
+  # ■ 層 1 (`e2e::`) はここに要らない。fast の
+  #   `-E 'not test(/^terminal::...pty...::/)'` が**もう拾っている**。
+  gui-smoke:
+    # fast / pty / msrv / installers / lint と**同じ判定**にすること。
+    # 揃えないと「PR でだけ走らない」「push でだけ走らない」というムラが出る。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: gui smoke (macos)
+    runs-on: macos-latest
+    # ビルドが支配的。キャッシュが冷えた回だけ長くなるので少し厚めに取る。
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
+        with:
+          toolchain: stable
+
+      # 同じ OS の fast / pty と**同じ shared-key** を読む。RUSTFLAGS も
+      # プロファイルも同じなので依存クレートのビルドはそのまま再利用でき、
+      # このジョブが増やすのは zai 本体のコンパイルとリンクだけになる
+      # (xplat.yml の shapes ジョブと同じ流儀)。
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test-macos-latest
+          cache-on-failure: true
+
+      - name: zai を作る
+        run: cargo build --bin zai --locked
+
+      # **本物の ~/.zaivern に触らせない。** ハーネス自身も差し替えるが、
+      # 二重に張る (CLAUDE.md: サブエージェントに実 ~/.zaivern を触らせない)。
+      #
+      # ■ `[skip]` を緑にしない。
+      #   gui-smoke.sh は「開けない環境」「バイナリが無い / src より古い」で
+      #   **終了コード 0 のまま `[skip]` で降りる**。手元ではそれが正しいが、
+      #   CI でそれを通すと**何も検査しないジョブが永久に緑**になる。
+      #   ここは必ず実測できる前提 (macOS + 直前に build 済み) なので、
+      #   降りたら赤にする。
+      - name: GUI スモーク (起動して 5 秒生存するか)
+        env:
+          ZAIVERN_HOME: ${{ runner.temp }}/zaivern-home
+        run: |
+          set -euo pipefail
+          mkdir -p "$ZAIVERN_HOME"
+          out=$(sh tools/gui-smoke.sh --seconds 5 2>&1)
+          echo "$out"
+          if echo "$out" | grep -q '^\[skip\]'; then
+            echo "::error::層 2 が実行されずに降りた (このジョブでは skip は不合格)"
+            exit 1
+          fi
 
   # 静的解析。ubuntu 1 台だけ (診断は OS 非依存。3 OS で回すのは丸損)。
   #
@@ -243,10 +462,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable @2026-08-05
         with:
+          toolchain: stable
           # dtolnay/rust-toolchain は --profile minimal 相当。rustfmt は既定で
           # 入らないので明示する (下の債務レポートが cargo fmt を呼ぶため)。
           components: clippy, rustfmt
@@ -254,7 +474,7 @@ jobs:
       # lint は clippy-driver 経由で fingerprint が変わるため、
       # test ジョブとキャッシュを共有すると互いに上書きし合って
       # 毎回ミスになる。専用の shared-key を持たせる。
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: lint-ubuntu
           cache-on-failure: true

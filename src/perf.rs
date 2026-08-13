@@ -830,23 +830,35 @@ mod tests {
     /// なり、「アイドルでは何も起きていない」という静かな嘘が出る
     /// (フレーム時間の数字は出続けるので気付けない)。
     ///
-    /// ソースは `include_str!` ではなく実行時に読む — app.rs は 2MB 近くあり、
+    /// ソースは `include_str!` ではなく実行時に読む — app は 2MB 近くあり、
     /// テストバイナリへ 2 本目の複製を入れると nextest の 1 件 1 プロセス起動が
     /// そのぶん重くなる。改行は正規化する (Windows のチェックアウトは CRLF)。
     #[test]
     fn アイドル判定がappから渡されている() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
-            .join("app.rs");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()))
-            .replace("\r\n", "\n");
+            .join("app");
+        let mut src = String::new();
+        let rd =
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{} が読めない: {e}", dir.display()));
+        for ent in rd {
+            let p = ent.expect("項目").path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            src.push_str(
+                &std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("{} が読めない: {e}", p.display())),
+            );
+            src.push('\n');
+        }
+        let src = src.replace("\r\n", "\n");
         let call = src
             .lines()
             .map(str::trim)
             .find(|l| l.starts_with("crate::perf::note_idle("))
             .unwrap_or_else(|| {
-                panic!("app.rs が perf::note_idle を呼んでいない (idle_frames が永久に 0 になる)")
+                panic!("app が perf::note_idle を呼んでいない (idle_frames が永久に 0 になる)")
             });
         assert!(
             call.contains("had_input"),

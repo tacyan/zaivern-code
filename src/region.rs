@@ -611,13 +611,62 @@ pub fn hull(spans: &[Span]) -> Option<Span> {
 /// 2 人の担当が同じファイルで**交錯**しているか
 /// (= 外接域が重なる = 片方がもう片方を挟んでいる)。
 ///
-/// 交錯していなければ、統合を**行番号の昇順**で流す限り
-/// 「累積した側」が「これから混ぜる側」を挟むことは起こり得ない。
+/// **これは「壁が要るか」の判定ではない。** かつては
+/// [`interleave_safe`] を呼ぶかどうかの門にしていたが、その門は
+/// 見逃す ([`needs_wall`] に実測)。いまは*形の説明*
+/// ([`crate::coedit::Reason::Bracketed`] の文面) にだけ使う。
 pub fn interleaved(a: &[Span], b: &[Span]) -> bool {
     match (hull(a), hull(b)) {
         (Some(x), Some(y)) => !spans_disjoint(&x, &y),
         _ => false,
     }
+}
+
+/// 同じファイルを持つ 2 人に、**錨の壁 ([`interleave_safe`]) を要求するか**。
+///
+/// # なぜ [`interleaved`] ではなくなったのか — 見逃しの実測
+///
+/// 0.16.0 まで、この門は「交錯しているか」だった。理屈は
+/// 「上下に分かれていれば、昇順で混ぜる限り挟まれようが無い」で、
+/// **置換だけを測っている限りは正しかった** (§3.16.4 の 400 通り)。
+///
+/// 崩れたのは**削除・挿入を混ぜたとき**である。削除と挿入は行数を変えるので、
+/// histogram diff は*同じ側の変更をどこへ置くか*を選び直せる。周期的な本文では
+/// その自由度がファイル全体に及び、**上下に分かれていても衝突する**。
+///
+/// `tools/merge-band-probe.sh --mode random --trials 2000` の実測
+/// (帯 1・種 20260812 / 777 / 31337 の **6000 通り**・削除/挿入/置換を混ぜる):
+///
+/// | 門 | 通した | うち実際は衝突 (見逃し) |
+/// |---|---:|---:|
+/// | 帯だけ | 5492 | **272** |
+/// | 交錯のときだけ壁 (旧) | 4136 | **35** |
+/// | **常に壁 (これ)** | **3159** | **0** |
+///
+/// いちばん短い反証は「A が 126〜127 行目を置換 / B が 32 行目の手前へ 1 行挿入」
+/// (周期 6 の本文 300 行・末尾に一意な行を置かない)。**94 行離れていて交錯も
+/// していない**のに `git merge` は衝突する
+/// (`tests::実gitで交錯していなくても壁が要ることを固定する`)。
+///
+/// # 何を失ったか (隠さない)
+///
+/// 同じ 6000 通りで通す数は **4136 → 3159 (−23.6%)**。ただしこの合成本文は
+/// 錨の密度 0% を 1/3 の確率で引く**極端に敵対的な標本**である。
+/// **実ファイルでは 1 件も減らない** — このリポジトリの `src/region.rs` を
+/// 素材にした 800 通り (`--real src/region.rs`) では旧門・新門とも 792 通りを
+/// 通し、差は 0 だった (`docs/conflict-zero.md` §3.16.7)。
+///
+/// 断るしかない組には**ずらし先を差し出す** ([`anchor_fit`])。
+///
+/// # 費用
+///
+/// 門が緩くなったぶん [`anchor_lines`] を呼ぶ頻度は上がる (同じファイルを持つ
+/// 組ごとに 1 回)。呼び出し側は**ファイルにつき 1 回**へまとめること
+/// (`crate::negotiate` の `Anchors` / `crate::czero` の `text` 表が手本)。
+pub fn needs_wall(a: &[Span], b: &[Span]) -> bool {
+    #[cfg(test)]
+    count::pair();
+    !a.is_empty() && !b.is_empty()
 }
 
 /// 2 つの域がまったく重なっていないか (帯は見ない)。
@@ -632,13 +681,17 @@ fn spans_disjoint(a: &Span, b: &Span) -> bool {
     lo1 != Span::EOF && hi0 > lo1
 }
 
-/// 交錯している 2 人を、それでも「一撃でマージできる」と言い切ってよいか。
+/// 2 人を、それでも「一撃でマージできる」と言い切ってよいか。
 ///
 /// 線の順に並べたとき、**持ち主が変わる境目すべて**に錨 ([`anchor_lines`]) が
 /// 1 本以上あることを要求する。錨が 1 つも無い区間が 1 箇所でもあれば `false`
 /// (**分からない側へ倒す**)。
 ///
 /// `anchors` が空 (= 元テキストを読めなかった) なら必ず `false` を返す。
+///
+/// **名前に反して、交錯している組だけの判定ではない。** 上下に分かれた組でも
+/// 境目は 1 つあり、そこに壁が要る (理由と実測は [`needs_wall`])。
+/// 呼ぶかどうかの門は [`needs_wall`] であって [`interleaved`] ではない。
 pub fn interleave_safe(anchors: &[bool], a: &[Span], b: &[Span]) -> bool {
     if anchors.is_empty() {
         return false;
@@ -668,6 +721,86 @@ pub fn interleave_safe(anchors: &[bool], a: &[Span], b: &[Span]) -> bool {
                 },
             )
     })
+}
+
+/// 壁が無くて断る代わりに、**壁のある位置へずらして配る**。
+///
+/// # なぜ要るのか — 「断る」は並列度を捨てているだけ
+///
+/// [`needs_wall`] を常に効かせた瞬間、錨の薄いファイル (生成コード・区切り記号
+/// だけの表・全行同一のデータ) では 2 人目が必ず断られる。断るのは**安全**では
+/// あるが、**空いている行が大量にあるのに誰にも配らない**という形の損である。
+///
+/// この関数は要求 `want` と同じ長さのまま、`taken` のどれとも
+///
+/// 1. 帯 `band` を満たし ([`spans_too_close`] が偽)
+/// 2. 境目に壁がある ([`interleave_safe`] が真)
+///
+/// 位置へ**いちばん近いところ**まで動かす。`max_shift` 行以内に無ければ `None`
+/// (そのときは本当に配れない — 錨が 1 本も無いファイルがこれ)。
+///
+/// # 決定性
+///
+/// 距離が同じなら**下方向 (行番号が大きい側) を先に採る**。64 体が同時に
+/// 呼んでも同じ答えが出ないと、台帳の書き込み順で結果が変わってしまう。
+///
+/// # 採らなかった案 (同じ案が再提案されるので残す)
+///
+/// * **統合順で直列化する** — 効かない。`git merge` の衝突は順番だけでは
+///   決まらず、削除・挿入が混ざると**上下に分かれた組でも**衝突する
+///   ([`needs_wall`] の表)。順番は §3.16.4 (a) で既に効かせてあり、
+///   その上でなお残っているのがこの穴である
+/// * **境目へ一意な行を注入する** — 効くことは実測済み
+///   (`tests::実gitで錨を一本置けば同じ組が通る`) が、**他人の本文を勝手に
+///   書き換える**。行域を配る側が中身を変えると、`resolve` が拠り所にしている
+///   「錨は元の本文から数える」という前提も壊れる。ずらしで届かないときの
+///   最後の手段として *提案* に留め、自動では当てない
+/// * **ファイル単位へ粒度を落とす** — 「2 人目を断る」と同じことなので、
+///   並列度は 1 も増えない
+pub fn anchor_fit(
+    anchors: &[bool],
+    taken: &[Span],
+    want: &Span,
+    band: u32,
+    max_shift: u32,
+) -> Option<Span> {
+    if anchors.is_empty() || want.is_empty() {
+        return None;
+    }
+    let last = anchors.len() as u32;
+    let (w0, w1) = want.probe();
+    if w1 == Span::EOF {
+        return None; // 末尾まで伸びる域は動かしようが無い
+    }
+    let len = w1.saturating_sub(w0);
+    let fits = |start: u32| -> Option<Span> {
+        let end = start.checked_add(len)?;
+        if start < 1 || end > last {
+            return None;
+        }
+        let cand = if want.is_insert() {
+            Span::insert_before(start)
+        } else {
+            Span { start, end }
+        };
+        if taken.iter().any(|t| spans_too_close(t, &cand, band)) {
+            return None;
+        }
+        interleave_safe(anchors, taken, std::slice::from_ref(&cand)).then_some(cand)
+    };
+    for d in 0..=max_shift {
+        if let Some(v) = fits(w0.saturating_add(d)) {
+            return Some(v);
+        }
+        if d > 0 {
+            if let Some(s) = w0.checked_sub(d) {
+                if let Some(v) = fits(s) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 2 つの担当が同時に持てないか。
@@ -1475,6 +1608,87 @@ fn item_end(lines: &[&str], start: usize) -> Option<usize> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  網羅試験の大きさ — CI で回る版と、反証しに行く版
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 網羅試験を「反証しに行く大きさ」へ切り替える環境変数。**名前はここ 1 か所**。
+///
+/// 空文字と `0` は「立てていない」と読む (`FOO=` で消せる)。
+#[cfg(test)]
+pub const EXHAUSTIVE_ENV: &str = "ZAIVERN_PROOF_EXHAUSTIVE";
+
+/// 網羅試験の大きさを選ぶ。既定 (CI) は `ci`、[`EXHAUSTIVE_ENV`] が立っていれば `full`。
+///
+/// # なぜ分けるのか — Windows の CI で実際に落ちた
+///
+/// `coedit` の網羅試験は実 git を何度も起こす。nextest の slow-timeout は
+/// 60 秒 (`.config/nextest.toml`) で、**macOS / Linux は通るのに Windows だけ
+/// 時間切れ**になった:
+///
+/// ```text
+/// TERMINATING [> 60.000s] coedit::tests::実gitで証明の見逃しが1件も無いことを網羅的に確かめる
+/// ```
+///
+/// Windows はプロセス起動と作業ツリーへの書き込みがどちらも最も高い。
+/// **回数を減らし** (`merge-tree --write-tree` で 1 組 1 起動・書き込み 0)、
+/// そのうえで**既定の本数を CI 側に合わせる**。反証しに行くときだけ
+/// 環境変数で膨らませる:
+///
+/// ```sh
+/// ZAIVERN_PROOF_EXHAUSTIVE=1 cargo test coedit::tests::実gitで証明 -- --nocapture
+/// ```
+#[cfg(test)]
+pub fn exhaustive_scale(ci: usize, full: usize) -> usize {
+    match std::env::var_os(EXHAUSTIVE_ENV) {
+        Some(v) if !v.is_empty() && v != "0" => full,
+        _ => ci,
+    }
+}
+
+/// 網羅試験を分割するときの帯 (`ZAIVERN_PROOF_SHARD=i/n` で `i` 番目の帯)。
+///
+/// **`#[cfg(test)]` を付けるのは、使う [`exhaustive_shard`] が試験専用だから。**
+/// 付け忘れると通常ビルドで誰も使わない定数になり、`-D dead-code` が落とす
+/// (CI の clippy が実際に落とした)。この警告は「作ったのに繋いでいない」の
+/// 検出器なので、`allow` で黙らせずに **cfg を合わせる**のが正しい。
+#[cfg(test)]
+pub const SHARD_ENV: &str = "ZAIVERN_PROOF_SHARD";
+
+/// このプロセスが担当する帯 `(index, total)`。指定が無ければ `(0, 1)` = 全部。
+///
+/// # なぜ分割が要るのか — 時間を伸ばしても届かなかった
+///
+/// 2400 ケースは手元の macOS で **245 秒**だが、CI (ubuntu) では
+/// **90 分でも終わらなかった** (30 分 → 90 分と 2 度伸ばして 2 度とも打ち切り)。
+/// 実 git を何度も起こす作業は runner のディスク I/O が効き、およそ **12 倍**遅い。
+///
+/// **時間を伸ばすのは筋が悪い。** 1 ジョブに詰め込む設計そのものが無理で、
+/// 伸ばし続ければいつか「いくらでもいい」になり、本当に壊れたときに気付けない。
+/// 帯へ割って並列に走らせれば、**総量を減らさずに** 1 本あたりの時間が縮む。
+///
+/// ```sh
+/// ZAIVERN_PROOF_EXHAUSTIVE=1 ZAIVERN_PROOF_SHARD=0/6 cargo test …   # 6 本のうち 1 本目
+/// ```
+///
+/// 形が壊れている指定 (`3/0` や `abc`) は**黙って全部にせず**、そのまま
+/// `(0, 1)` へ倒す。分割したつもりで 1 本しか回っていない、を作らないため
+/// 呼び出し側は必ず「自分が何件見たか」を出すこと。
+#[cfg(test)]
+pub fn exhaustive_shard() -> (usize, usize) {
+    let Some(v) = std::env::var_os(SHARD_ENV) else {
+        return (0, 1);
+    };
+    let v = v.to_string_lossy().to_string();
+    let Some((a, b)) = v.split_once('/') else {
+        return (0, 1);
+    };
+    match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+        (Ok(i), Ok(n)) if n > 0 && i < n => (i, n),
+        _ => (0, 1),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  テスト
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2274,6 +2488,276 @@ mod tests {
     fn 錨が読めなければ交錯は通さない() {
         // 元テキストを読めなかった (= 錨が空) ときは必ず断る (fail-closed)
         assert!(!interleave_safe(&[], &spans(&[5, 25]), &spans(&[17])));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  壁 — 交錯していない組でも要る (削除・挿入が混ざったときの反証)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// 末尾に一意な行を**足さない**周期本文。
+    ///
+    /// [`periodic`] は末尾へ `tail` を足す。それはそれで実在の形なのだが、
+    /// **末尾の 1 行が答えを反転させる** (§3.16.5 の 4)。ここで測りたいのは
+    /// 「錨が 1 本も無い本文」なので、足さない版を別に持つ。
+    fn periodic_bare(p: usize, n: u32) -> String {
+        const POOL: [&str; 6] = ["```", "code line", "```", "", "---", ""];
+        (0..n)
+            .map(|i| format!("{}\n", POOL[(i as usize) % p]))
+            .collect()
+    }
+
+    /// `lines` を消す (1 始まり)。
+    fn drop_lines(base: &str, lines: &[u32]) -> String {
+        base.lines()
+            .enumerate()
+            .filter(|(i, _)| !lines.contains(&((i + 1) as u32)))
+            .map(|(_, l)| format!("{l}\n"))
+            .collect()
+    }
+
+    /// `at` 行目の**手前**へ 1 行足す。
+    fn insert_at(base: &str, at: u32, tag: &str) -> String {
+        let mut out = String::new();
+        for (i, l) in base.lines().enumerate() {
+            if (i + 1) as u32 == at {
+                out.push_str(&format!("{tag}-new\n"));
+            }
+            out.push_str(&format!("{l}\n"));
+        }
+        out
+    }
+
+    /// **交錯していない組でも壁が要る。** これが 0.16.0 で塞いだ穴。
+    ///
+    /// どちらの組も外接域が上下に分かれている (= [`interleaved`] は `false`) の
+    /// に、`git merge` は衝突する。旧い門は [`interleaved`] だったので、この 2 件を
+    /// **通していた**。ここが赤くなったら git の側が変わったということなので、
+    /// [`needs_wall`] の表を測り直すこと。
+    ///
+    /// 本文は周期 6・300 行・**末尾に一意な行を置かない**。置くと答えが反転する
+    /// (§3.16.5 の 4 — 局所的な性質だけでは決まらないことの実例)。
+    #[test]
+    fn 実gitで交錯していなくても壁が要ることを固定する() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("wall");
+        let base = periodic_bare(6, 300);
+        let anchors = anchor_lines(&base);
+        assert!(
+            !anchors.iter().any(|b| *b),
+            "この本文には錨が 1 本も無いはず"
+        );
+        // (自分の域, 相手の域, ours, theirs)
+        let cases: Vec<(Vec<Span>, Vec<Span>, String, String)> = vec![
+            (
+                spans(&[126, 127]),
+                vec![Span::insert_before(32)],
+                touch(&base, &[126, 127], "OURS"),
+                insert_at(&base, 32, "THEIRS"),
+            ),
+            (
+                vec![Span {
+                    start: 100,
+                    end: 102,
+                }],
+                spans(&[40]),
+                drop_lines(&base, &[100, 101, 102]),
+                touch(&base, &[40], "THEIRS"),
+            ),
+        ];
+        for (a, b, ours, theirs) in &cases {
+            // 前提 1: どの組も帯を大きく満たす
+            for x in a {
+                for y in b {
+                    assert!(
+                        !spans_too_close(x, y, SAFE_BAND),
+                        "前提が崩れている: {x:?} と {y:?} は帯を満たすはず"
+                    );
+                }
+            }
+            // 前提 2: **交錯していない** (旧い門はここで通していた)
+            assert!(!interleaved(a, b), "この組は上下に分かれているはず");
+            // 新しい門は壁を要求し、壁が無いので断る
+            assert!(needs_wall(a, b), "同じファイルの 2 人には壁が要る");
+            assert!(
+                !interleave_safe(&anchors, a, b),
+                "壁が無いのに通してしまった: {a:?} / {b:?}"
+            );
+            let Some(hit) = lab.merge_tree(&base, ours, theirs) else {
+                eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+                return;
+            };
+            // **ここは環境の話であって、我々のコードの性質ではない。**
+            //
+            // この反証が再現するのは `git merge` の既定戦略が ort
+            // (= diff-algorithm=histogram 固定) の版だけ。古い git は
+            // recursive/myers なので同じ組を clean と答える
+            // (実測: 2.30.2 では 5 本文すべて clean / 2.39・2.47 では衝突)。
+            //
+            // 上の 4 つの assert — 帯を満たす・交錯していない・壁を要求する・
+            // 通さない — が**出荷する判定そのもの**で、そちらは git の版に依らず
+            // 全環境で同じ答えを出す。実 git が衝突しない環境では、我々の門は
+            // **過剰に断っているだけ**なので安全側に居る。
+            //
+            // だから落とさずに **声を出して飛ばす**。黙って通すと
+            // 「この穴はもう無い」と読めてしまい、静かな嘘になる。
+            if !hit {
+                let v = std::process::Command::new("git")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "(版を取れない)".into());
+                eprintln!("[skip] 実 git がこの組を衝突させない ({v})");
+                eprintln!(
+                    "       この反証は ort (diff-algorithm=histogram 固定) の版でだけ再現する"
+                );
+                eprintln!("       出荷する判定 (needs_wall / interleave_safe) は上で検査済み");
+                eprintln!("       この環境では過剰に断っている = 安全側に居る");
+                eprintln!("       再現するには git 2.34 以上で実行すること");
+                return;
+            }
+        }
+    }
+
+    /// 壁を 1 本置けば、同じ組が綺麗に通る (断る理由が「壁」であることの裏取り)。
+    #[test]
+    fn 実gitで壁を一本置けば交錯していない組も通る() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("wall-ok");
+        let base = plant_anchor(&periodic_bare(6, 300), &[70]);
+        let anchors = anchor_lines(&base);
+        let a = spans(&[126, 127]);
+        let b = vec![Span::insert_before(32)];
+        assert!(interleave_safe(&anchors, &a, &b), "壁があるのに断っている");
+        let ours = touch(&base, &[126, 127], "OURS");
+        let theirs = insert_at(&base, 32, "THEIRS");
+        let Some(hit) = lab.merge_tree(&base, &ours, &theirs) else {
+            eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+            return;
+        };
+        assert!(!hit, "壁があるのに衝突した");
+    }
+
+    #[test]
+    fn 壁が要るのは同じファイルに二人居るときだけ() {
+        assert!(needs_wall(&spans(&[10]), &spans(&[200])));
+        assert!(!needs_wall(&[], &spans(&[200])));
+        assert!(!needs_wall(&spans(&[10]), &[]));
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  断る代わりにずらす (anchor_fit)
+    // ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn 壁のある位置へずらせる() {
+        // 錨は 70 と 200 の 2 本だけ。A が 100-102 を持っている。
+        let base = plant_anchor(&periodic_bare(6, 300), &[70, 200]);
+        let anchors = anchor_lines(&base);
+        let taken = vec![Span {
+            start: 100,
+            end: 102,
+        }];
+        let want = Span { start: 80, end: 82 };
+        // そのままでは壁が無い
+        assert!(!interleave_safe(
+            &anchors,
+            &taken,
+            std::slice::from_ref(&want)
+        ));
+        let got = anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 300).expect("空きがある");
+        // 70 の壁を挟む側 (上) がいちばん近い
+        assert_eq!(got, Span { start: 67, end: 69 });
+        assert!(interleave_safe(&anchors, &taken, &[got]));
+        assert_eq!(got.len(), want.len(), "長さは変えない");
+        // 決定的 — 何度呼んでも同じ
+        assert_eq!(
+            anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 300),
+            Some(got)
+        );
+    }
+
+    #[test]
+    fn 錨が一本も無ければずらし先も無い() {
+        let base = periodic_bare(6, 300);
+        let anchors = anchor_lines(&base);
+        let taken = vec![Span {
+            start: 100,
+            end: 102,
+        }];
+        let want = Span { start: 80, end: 82 };
+        // **ここが「本当に配れない」形。** 断る以外の答えが存在しない。
+        assert_eq!(
+            anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 300),
+            None
+        );
+        // 錨を読めなかったときも同じ (fail-closed)
+        assert_eq!(anchor_fit(&[], &taken, &want, MERGE_ONLY_BAND, 300), None);
+    }
+
+    #[test]
+    fn 挿入点も壁のある位置へずらせる() {
+        let base = plant_anchor(&periodic_bare(6, 300), &[70]);
+        let anchors = anchor_lines(&base);
+        let taken = vec![Span {
+            start: 100,
+            end: 102,
+        }];
+        let want = Span::insert_before(90);
+        let got = anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 300).expect("空きがある");
+        assert!(got.is_insert(), "挿入点は挿入点のまま: {got:?}");
+        assert!(interleave_safe(&anchors, &taken, &[got]));
+        // 探す幅を絞れば届かない (上限は「諦める距離」であって安全性ではない)
+        assert_eq!(
+            anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 3),
+            None
+        );
+    }
+
+    /// **ずらした先が実 git でも通る。** 提案が机上のものになっていないこと。
+    ///
+    /// 「ずらす前は必ず衝突する」とは**書かない**。判定は分からない側へ倒す
+    /// ので、壁が無くても git がたまたま綺麗に通す組はある (実際にこの配置が
+    /// そうだった)。ここが守るのは「提案どおり動かせば**証明が立ち**、
+    /// しかも実 git でも綺麗」の側である。
+    #[test]
+    fn 実gitでずらした先なら通る() {
+        if !git_available() {
+            eprintln!("git が無いので飛ばす");
+            return;
+        }
+        let lab = Lab::new("anchor-fit");
+        let base = plant_anchor(&periodic_bare(6, 300), &[70, 200]);
+        let anchors = anchor_lines(&base);
+        let taken = vec![Span {
+            start: 100,
+            end: 102,
+        }];
+        let want = Span { start: 80, end: 82 };
+        // ずらす前は証明が立たない (= この提案に意味がある)
+        assert!(!interleave_safe(
+            &anchors,
+            &taken,
+            std::slice::from_ref(&want)
+        ));
+        let to = anchor_fit(&anchors, &taken, &want, MERGE_ONLY_BAND, 300).expect("空きがある");
+        assert!(
+            interleave_safe(&anchors, &taken, &[to]),
+            "ずらしても証明が立たない"
+        );
+        let ours = drop_lines(&base, &[100, 101, 102]);
+        let after = touch(&base, &[to.start, to.start + 1, to.end], "THEIRS");
+        let Some(hit) = lab.merge_tree(&base, &ours, &after) else {
+            eprintln!("git merge-tree --write-tree が使えないので飛ばす");
+            return;
+        };
+        assert!(!hit, "ずらした先が実 git で衝突した: {to:?}");
     }
 
     /// 「近すぎる」と「実際に衝突する」の差を、変更の種類と間隔ごとに数える。

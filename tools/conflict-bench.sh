@@ -45,6 +45,13 @@
 #   * 後始末は trap。`--keep` を付けたときだけ残す。
 #   * ホストの `target/` は汚さない (既にある `zai` を再利用するだけ)。
 set -eu
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (CI の probe (windows-latest) が実際にこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 # プロジェクトのルート (このスクリプトの 1 つ上)。パスを直書きしない。
 # shellcheck disable=SC1007  # `CDPATH= cd` は「その cd にだけ空の CDPATH を渡す」正しい書き方

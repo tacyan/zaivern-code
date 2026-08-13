@@ -45,7 +45,7 @@
 //! 説明文は [`FEATURE_NOTES`] で足せるが、**表に無い機能も必ず一覧には出る**
 //! (説明が空になるだけ)。ここを取り違えると「新機能に対応していない」が再発する。
 
-use crate::i18n::tr;
+use crate::i18n::{tr, trf};
 use crate::keybinds::{BindAction, Keybinds};
 use eframe::egui;
 use egui::{Color32, Id, Pos2, Rect, Rounding, Stroke, Vec2};
@@ -69,6 +69,15 @@ const RING_PAD: f32 = 4.0;
 const MISSING_ANCHOR_TIMEOUT: f64 = 4.0;
 /// アニメーション中の再描画間隔 (静止時のコストを払わないため 30fps に抑える)。
 const REPAINT_MS: u64 = 33;
+/// フォーカスリングの脈動の角速度 (rad/s)。位相は `時刻 × これ`。
+const RING_SPEED: f64 = 2.2;
+/// 最後の操作からこれだけ経ったら脈動を止め、**1 枚も予約しない**静止画にする (秒)。
+///
+/// 脈動の周期は `2π / RING_SPEED` ≒ 2.86 秒なので、ここは約 1.4 周期ぶん。
+/// 「カードを読み始めたときは光っていて、読んでいるうちに落ち着く」長さ。
+/// **誰も見ていないツアーが 1 時間 55fps で回り続ける**のを止めるための線で、
+/// 操作 (ポインタ移動でもキーでも) が来れば同じフレームでまた動き出す。
+const RING_SETTLE_AFTER: f64 = 4.0;
 /// 手順表の版。テーブルを大幅改訂したら上げると、既読の人にも一度だけ出せる。
 const STEPS_VERSION: u32 = 1;
 /// 永続化ファイル名 (`~/.zaivern/` 直下)。
@@ -276,6 +285,9 @@ pub enum TutorialAction {
     OpenRaceForm,
     /// スマホリモートの QR 画面を開く
     ShowRemoteQr,
+    /// 全機能ガイドで選ばれた機能を**その場で実行する**
+    /// (`Cmd::Feature` と同じ経路を通る)。
+    RunFeature(&'static str),
 }
 
 // ── 手順表 (データ) ──────────────────────────────────────────
@@ -1270,6 +1282,96 @@ pub fn index_rows(keys: &Keybinds) -> Vec<IndexRow> {
     out
 }
 
+/// 索引の行を選んだときに何をするか。
+///
+/// **「体験できる」の中身は行の種類で変わる。** どれも実際に何かが起きる —
+/// 「その機能を説明した手順がありません」で終わらせない。
+#[derive(Clone, Copy)]
+pub enum GuidePick {
+    /// その操作を教えている手順がある → **その章を再生してその手順から始める**。
+    Step(&'static Step),
+    /// 手順は無いが機能そのものは呼べる → **その場で実行して見せる**。
+    RunFeature(&'static str),
+    /// 手順も無く、こちらから呼ぶ口も無い組み込み操作 → **打鍵を教える**。
+    ///
+    /// 組み込み操作は `handle_shortcuts` が打鍵ごとに直接処理していて、
+    /// 「名前から実行する」口が無い。**無いものを有るふりはしない**ので、
+    /// ここは「この打鍵で使えます」と伝えるところまでにする。
+    ShowKeys,
+}
+
+impl std::fmt::Debug for GuidePick {
+    /// `Step` は本文まで持っているので、失敗メッセージには **id だけ**出す
+    /// (カード 1 枚ぶんの日本語がテストの出力に流れ込むと読めなくなる)。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuidePick::Step(s) => write!(f, "Step({})", s.id),
+            GuidePick::RunFeature(id) => write!(f, "RunFeature({id})"),
+            GuidePick::ShowKeys => write!(f, "ShowKeys"),
+        }
+    }
+}
+
+impl PartialEq for GuidePick {
+    /// `Step` は同じ手順を指しているかを **id** で見る
+    /// (`Step` は `&'static str` を並べた構造体なので、`PartialEq` を導出すると
+    ///  本文まで比較することになり、テストの意図と合わない)。
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (GuidePick::Step(a), GuidePick::Step(b)) => a.id == b.id,
+            (GuidePick::RunFeature(a), GuidePick::RunFeature(b)) => a == b,
+            (GuidePick::ShowKeys, GuidePick::ShowKeys) => true,
+            _ => false,
+        }
+    }
+}
+
+/// 行を「体験」する方法を決める。
+///
+/// 組み込み操作は [`Step::keys`] に載っている手順を探す — 手順表が打鍵を
+/// `BindAction` で持っているので、**ここに新しい対応表を作らずに済む**
+/// (作ると手順を足した人が 2 か所を直す羽目になり、必ず片方が腐る)。
+pub fn pick_for_row(row: &IndexRow) -> GuidePick {
+    match row.kind {
+        RowKind::Feature => {
+            feature_id_static(&row.id).map_or(GuidePick::ShowKeys, GuidePick::RunFeature)
+        }
+        RowKind::Action => {
+            let Some(action) = crate::keybinds::ALL_ACTIONS
+                .iter()
+                .copied()
+                .find(|a| crate::keybinds::config_name(*a) == row.id)
+            else {
+                return GuidePick::ShowKeys;
+            };
+            STEPS
+                .iter()
+                .find(|s| s.keys.contains(&action))
+                .map_or(GuidePick::ShowKeys, GuidePick::Step)
+        }
+    }
+}
+
+/// 機能 id の `&'static str` をレジストリから引き直す。
+///
+/// [`IndexRow::id`] は表示のために `String` にしてあるが、実行の依頼
+/// ([`TutorialAction::RunFeature`]) は `Cmd::Feature(&'static str)` へ載せるので
+/// 静的な方を要る。**レジストリに無い id は返さない** = 知らない機能を
+/// 実行しようとしない。
+fn feature_id_static(id: &str) -> Option<&'static str> {
+    crate::feature::REGISTRY
+        .iter()
+        .flat_map(|f| f.entries.iter())
+        .find(|e| e.id == id)
+        .map(|e| e.id)
+}
+
+/// その手順を含む章 (拾い読みの再生に使う)。手順表の全部がどれかの章に載る
+/// ことは番人テストが担保しているが、**無くても落ちない**ようにしてある。
+pub fn chapter_of_step(step_id: &str) -> Option<&'static Walkthrough> {
+    WALKTHROUGHS.iter().find(|w| w.step_ids.contains(&step_id))
+}
+
 /// 絞り込み。名前・id・補足・打鍵のどれかに含まれれば残す (大小を無視)。
 ///
 /// **純関数**なので、日本語・英語・空・複数語の振る舞いを表で固定できる。
@@ -1371,8 +1473,17 @@ pub struct RowCols {
 }
 
 /// 可用幅から列幅を決める。打鍵欄は残り幅の 4 割まで。
-pub fn row_cols(avail: f32, want_keys: f32) -> RowCols {
-    let avail = avail.max(0.0);
+///
+/// **`gap` は列と列のあいだの余白** (`ui.spacing().item_spacing.x`)。
+/// これを引かないと、3 つの列の合計が可用幅ちょうどになるのに
+/// egui が間に余白を 2 つ入れるので、**合計が可用幅を超えて右端の列が
+/// 画面外へ出る**。実画面では章の進捗 (`0/7`) が 9 行中 8 行消えていた
+/// (1 行目だけ x=908 に描かれ、画面幅は 900 だった)。
+///
+/// 列幅の計算そのものは元から正しく、抜けていたのは**余白の勘定**だった。
+pub fn row_cols(avail: f32, want_keys: f32, gap: f32) -> RowCols {
+    // 列は 3 つなので隙間は 2 つ。負にならないよう床を張る。
+    let avail = (avail - gap.max(0.0) * 2.0).max(0.0);
     let icon = 18.0_f32.min(avail * 0.2);
     let rest = (avail - icon).max(0.0);
     let keys = want_keys.max(0.0).min(rest * 0.4);
@@ -1573,6 +1684,24 @@ pub fn dim_rects(target: Option<Rect>, screen: Rect) -> Vec<Rect> {
 
 // ── アンカー欠落の自動送り (純粋) ────────────────────────────
 
+/// フォーカスリングの脈動 0..1。**純粋**。
+///
+/// 時刻ベースなのでフレームレートに依存しない (飛ばしたフレームぶん進む)。
+fn ring_pulse(t: f64) -> f32 {
+    ((t * RING_SPEED).sin() as f32) * 0.5 + 0.5
+}
+
+/// **脈動を止める時刻。** `deadline` 以降で最初に位相が π の倍数になる点。**純粋**。
+///
+/// そこで止めると [`ring_pulse`] がちょうど中央値 (0.5) になるので、
+/// **静止画へ移る瞬間に絵が 1px も飛ばない**。「4 秒経ったら即座に固定値へ」
+/// にすると太さと濃さが跳ねて、止めたことが目に見えてしまう。
+/// 余計に回るのは最大で半周期 (≒1.43 秒) だけ。
+fn ring_settle_time(deadline: f64) -> f64 {
+    let step = std::f64::consts::PI / RING_SPEED;
+    (deadline / step).ceil() * step
+}
+
 /// 「アンカーが現れないまま何秒経ったか」を数え、時間切れで自動送りを促す。
 ///
 /// パネルを開く依頼をホストが実行できなかった場合でも、ツアーが**そこで止まらない**
@@ -1601,6 +1730,17 @@ impl MissingTracker {
     /// 手順が変わったら呼ぶ。
     pub fn reset(&mut self) {
         self.since = None;
+    }
+
+    /// 時間切れまでの残り。待っていなければ `None`。**純粋**。
+    ///
+    /// アンカー待ちの間だけは「何も動いていないのにフレームが要る」唯一の
+    /// 場面なので、**その 1 枚を期限ちょうどに予約する**ために使う
+    /// (30fps で回して待つのではなく、時間切れの瞬間だけ起きる)。
+    pub fn remaining(&self, now: f64) -> Option<std::time::Duration> {
+        let t0 = self.since?;
+        let left = MISSING_ANCHOR_TIMEOUT - (now - t0);
+        Some(std::time::Duration::from_secs_f64(left.max(0.0)))
     }
 
     /// フォールバック表示に入っているか (テスト・表示用)。
@@ -1698,10 +1838,18 @@ pub struct Tutorial {
     playlist: Vec<&'static Step>,
     /// 章から始めたときの章 id (進捗の保存先)。初回ツアーなら `None`。
     chapter_id: Option<&'static str>,
+    /// 索引で選んだ行の一言 (打鍵の案内など)。**次に何か選ぶまで**出す。
+    /// `None` のときは 1 ピクセルも高さを取らない。
+    hint: Option<String>,
     /// 全機能ガイドを開いているか (開いている間ツアーのカードは重ねない)
     guide: bool,
     /// 索引の絞り込み文字列
     filter: String,
+    /// 最後に操作 (キー / ポインタ移動 / クリック) があった時刻。
+    ///
+    /// `None` = まだ観測していない (次のフレームで「いま」に初期化する)。
+    /// これを基準に [`ring_settle_time`] で脈動を止める時刻を決める。
+    last_active: Option<f64>,
     /// 章の進捗 (`章 id -> 到達した手順数`)
     seen: BTreeMap<String, u32>,
 }
@@ -1736,11 +1884,13 @@ impl Tutorial {
             confirm_skip: false,
             missing: MissingTracker::default(),
             pending: None,
+            hint: None,
             dir,
             playlist: Vec::new(),
             chapter_id: None,
             guide: false,
             filter: String::new(),
+            last_active: None,
             seen,
         }
     }
@@ -1782,6 +1932,7 @@ impl Tutorial {
     pub fn open_guide(&mut self) {
         self.guide = true;
         self.confirm_skip = false;
+        self.hint = None;
     }
 
     /// 手順列を差し替えて再生を始める。
@@ -1791,6 +1942,7 @@ impl Tutorial {
         self.idx = 0;
         self.confirm_skip = false;
         self.missing.reset();
+        self.last_active = None;
         self.chapter_id = chapter;
         self.guide = false;
         self.pending = self.playlist.first().and_then(|s| s.pre_action);
@@ -1904,6 +2056,8 @@ impl Tutorial {
 
     fn on_step_changed(&mut self) {
         self.missing.reset();
+        // 新しい対象を光らせ直す (止まっていた脈動をもう一周ぶん動かす)。
+        self.last_active = None;
         self.pending = self
             .playlist
             .get(self.idx)
@@ -1975,7 +2129,11 @@ impl Tutorial {
         let target = take_anchor(ctx, step.anchor);
 
         // アンカーが要るのに現れない手順は、しばらく待って自動で次へ。
-        let now = ctx.input(|i| i.time);
+        // **操作の有無も同じ 1 回の `input` で読む** (2 回読むと別の瞬間の値になる)。
+        let (now, active) = ctx.input(|i| {
+            // `app::schedule_idle_repaint` の `had_input` と同じ判定にそろえる。
+            (i.time, !i.events.is_empty() || i.pointer.is_moving())
+        });
         let present = step.anchor.is_none() || target.is_some();
         if self.missing.observe(now, present) {
             let act = self.pending.take();
@@ -1984,18 +2142,38 @@ impl Tutorial {
             return act;
         }
 
+        // 脈動を止める時刻。操作があったフレームで基準を更新する。
+        if active || self.last_active.is_none() {
+            self.last_active = Some(now);
+        }
+        let settle = ring_settle_time(self.last_active.unwrap_or(now) + RING_SETTLE_AFTER);
+
         self.paint_dim(ctx, theme, target, screen);
         if let Some(t) = target {
-            self.paint_ring(ctx, theme, t, now);
+            // **時計そのものを止める。** `settle` を過ぎたら位相が進まないので、
+            // 何度描いても同じ絵 = 予約しなくてよい。
+            self.paint_ring(ctx, theme, t, ring_pulse(now.min(settle)));
         }
         self.card(ctx, theme, step, target, screen, keys);
 
-        // リングのアニメーションのため、控えめな間隔で再描画を促す。
-        crate::perf::repaint_after(
-            ctx,
-            std::time::Duration::from_millis(REPAINT_MS),
-            "tutorial",
-        );
+        // **予約するのは「次のフレームで絵が変わる」ときだけ** (設計原則 3)。
+        //
+        // 昔はここで無条件に 30fps を予約していた。ツアーは初回起動で自動再生
+        // されるので、**カードを開いたまま席を立つと 55fps で回り続けた**
+        // (実測 12.45%/コア。閉じているときの 0.35% に対して 35 倍)。
+        // いま予約するのは 2 つだけ:
+        //   (a) リングがまだ脈動している — `settle` まで 30fps
+        //   (b) アンカー待ちの時間切れ — **その 1 枚だけ**を期限ちょうどに
+        // どちらでもなければ 1 枚も予約しない (静止画のまま寝る)。
+        if target.is_some() && now < settle {
+            crate::perf::repaint_after(
+                ctx,
+                std::time::Duration::from_millis(REPAINT_MS),
+                "tutorial",
+            );
+        } else if let Some(left) = self.missing.remaining(now) {
+            crate::perf::repaint_after(ctx, left, "tutorial.anchor_wait");
+        }
 
         self.handle_keys(ctx);
         self.pending.take()
@@ -2020,14 +2198,15 @@ impl Tutorial {
         }
     }
 
-    /// 呼吸するフォーカスリング。
-    fn paint_ring(&self, ctx: &egui::Context, theme: &crate::theme::Theme, t: Rect, now: f64) {
+    /// 呼吸するフォーカスリング。`pulse` は 0..1 ([`ring_pulse`])。
+    ///
+    /// **時刻ではなく位相を受け取る。** 止めるかどうかの判断は呼び出し側に
+    /// 1 か所だけ置き、ここは「渡された位相を描く」だけにする。
+    fn paint_ring(&self, ctx: &egui::Context, theme: &crate::theme::Theme, t: Rect, pulse: f32) {
         let p = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             Id::new("zv-tutorial-ring"),
         ));
-        // 0..1 を行き来する脈動。時刻ベースなのでフレームレートに依存しない。
-        let pulse = ((now * 2.2).sin() as f32) * 0.5 + 0.5;
         let pad = RING_PAD + pulse * 3.0;
         let ring = t.expand(pad);
         let rounding = Rounding::same(6.0);
@@ -2222,6 +2401,9 @@ impl Tutorial {
         let mut filter = std::mem::take(&mut self.filter);
         let mut close = false;
         let mut start: Option<&'static Walkthrough> = None;
+        // 索引で選ばれた行 (押した瞬間には処理しない — 描画中に自分の状態を
+        // 差し替えると、同じフレームの残りが古い前提で描かれる)。
+        let mut picked: Option<IndexRow> = None;
         let inner_w = (lay.window.width() - 2.0 * GUIDE_PAD).max(60.0);
         let body_h = (lay.body.height() - GUIDE_PAD).max(40.0);
 
@@ -2269,6 +2451,15 @@ impl Tutorial {
                                 .id_salt("zv-guide-filter")
                                 .hint_text(tr("機能名・説明・打鍵で絞り込む")),
                         );
+                        // 選んだ行の一言。**無いときは高さを 1 px も取らない**。
+                        if let Some(msg) = self.hint.clone() {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("▶ {msg}"))
+                                    .small()
+                                    .color(theme.accent),
+                            );
+                        }
                         ui.add_space(4.0);
 
                         egui::ScrollArea::vertical()
@@ -2327,7 +2518,9 @@ impl Tutorial {
                                         &format!("{} ({})", tr("機能"), feats.len()),
                                     );
                                     for r in feats {
-                                        index_row_ui(ui, theme, r);
+                                        if index_row_ui(ui, theme, r) {
+                                            picked = Some(r.clone());
+                                        }
                                     }
                                     ui.add_space(6.0);
                                 }
@@ -2338,7 +2531,9 @@ impl Tutorial {
                                         &format!("{} ({})", tr("組み込み操作"), acts.len()),
                                     );
                                     for r in acts {
-                                        index_row_ui(ui, theme, r);
+                                        if index_row_ui(ui, theme, r) {
+                                            picked = Some(r.clone());
+                                        }
                                     }
                                 }
                             });
@@ -2356,8 +2551,60 @@ impl Tutorial {
         }
         if let Some(w) = start {
             self.start_chapter(w);
+        } else if let Some(row) = picked {
+            self.experience(&row);
         } else if close {
             self.guide = false;
+        }
+    }
+
+    /// 索引で選ばれた行を「体験」する。
+    ///
+    /// **どの行を選んでも何かが起きる。** 手順があるならその章をそこから再生し、
+    /// 無ければ機能そのものを開いて見せ、それも出来ない組み込み操作は
+    /// 打鍵を教える。「説明がありません」で行き止まりにしない。
+    fn experience(&mut self, row: &IndexRow) {
+        self.hint = None;
+        match pick_for_row(row) {
+            GuidePick::Step(step) => {
+                // その手順を含む章を、**その手順から**再生する。
+                // 章が見つからない手順は番人テストが禁じているが、
+                // 万一のときは単独再生へ落ちる (行き止まりを作らない)。
+                match chapter_of_step(step.id) {
+                    Some(w) => {
+                        self.play(w.steps(), Some(w.id));
+                        self.idx = w
+                            .step_ids
+                            .iter()
+                            .position(|id| *id == step.id)
+                            .unwrap_or(0)
+                            .min(self.playlist.len().saturating_sub(1));
+                    }
+                    None => self.play(vec![step], None),
+                }
+                self.pending = self.playlist.get(self.idx).and_then(|s| s.pre_action);
+            }
+            GuidePick::RunFeature(id) => {
+                // ガイドを閉じてから実行する — 開いたパネルがガイドの裏に
+                // 隠れたら「押したのに何も起きない」に見える。
+                self.guide = false;
+                self.pending = Some(TutorialAction::RunFeature(id));
+            }
+            GuidePick::ShowKeys => {
+                // 呼ぶ口が無い組み込み操作。**無い機能を有るふりはしない**ので、
+                // 打鍵だけを伝えてガイドは開いたままにする (次を探せる)。
+                self.hint = Some(if row.keys.is_empty() {
+                    trf(
+                        "{label} は打鍵が割り当てられていません (⚙ 設定 → キーバインドで割り当てられます)",
+                        &[("label", row.label.clone())],
+                    )
+                } else {
+                    trf(
+                        "{label}: {keys} で使えます",
+                        &[("label", row.label.clone()), ("keys", row.keys.clone())],
+                    )
+                });
+            }
         }
     }
 
@@ -2406,6 +2653,69 @@ fn guide_section(ui: &mut egui::Ui, theme: &crate::theme::Theme, title: &str) {
     ui.separator();
 }
 
+/// 指定した幅に**実際に収まる** galley を作る。
+///
+/// `fit_chars` は「1 文字 12px」と仮定して字数で詰めるが、**日本語は実際には
+/// もっと広い**ので足りない。足りないまま `Button` に渡すと、ボタンは文字から
+/// 必要幅を計算するので**列幅を超えて次の列を右へ押し出す**
+/// (章の進捗 `0/7` が行ごとにずれ、狭い幅では画面外へ消えていた。
+///  `set_max_width` を張ってもボタン側は縮まないので効かない)。
+///
+/// egui にレイアウトさせて `max_rows = 1` で切ると、**フォントと文字の実幅**で
+/// 決まるので、どの言語でも必ず収まる。詰めた分はホバーで全文を出す。
+fn fit_galley(
+    ui: &egui::Ui,
+    text: &str,
+    width: f32,
+    style: egui::TextStyle,
+    color: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    let font_id = style.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font_id, color);
+    job.wrap.max_width = width.max(1.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    ui.fonts(|f| f.layout_job(job))
+}
+
+/// 行の 1 列を、**指定した幅を必ず占有して**描く。
+///
+/// `ui.add_sized` を使ってはいけない。あれは中身を
+/// `Layout::centered_and_justified` で置くので、
+/// (1) 見出しが列の**中央**から始まり、行ごとに開始 x がばらつく
+/// (2) 実際に確保される幅が中身に縮むので、**次の列の開始位置が
+///     見出しの長さで動く** — 打鍵欄が 1 行ごとに右へずれて階段になる。
+/// 全機能ガイドの索引が丸ごとその見た目になっていた。
+///
+/// `set_min_width` で下限を張ると、中身が短くても列幅は縮まない。
+fn guide_col<R>(
+    ui: &mut egui::Ui,
+    w: f32,
+    h: f32,
+    align_right: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(egui::vec2(w, h), layout, |ui| {
+        // **下限と上限の両方を張る。** 下限だけだと中身が短いときに列が縮んで
+        // 次の列が左へ寄り、上限だけだと中身が長いときに列が伸びて
+        // **次の列を右へ押し出す**。実画面では後者が起きていた —
+        // 章の進捗 (`0/7`) が行ごとに右へずれ、狭い幅では画面外へ消えた。
+        //
+        // 原因は `fit_chars` が「1 文字 12px」と仮定していること。
+        // **日本語は実際にはもっと広い**ので、字数で詰めても足りない。
+        // 幅で殴るのが確実 (詰めた文字列はホバーで全文が出る)。
+        ui.set_min_width(w);
+        ui.set_max_width(w);
+        add(ui)
+    })
+    .inner
+}
+
 /// 章 1 行。押されたら `true` (その章の再生を始める)。
 fn chapter_row(
     ui: &mut egui::Ui,
@@ -2414,87 +2724,97 @@ fn chapter_row(
     seen: &BTreeMap<String, u32>,
 ) -> bool {
     let (done, total) = chapter_progress(seen, w);
-    let cols = row_cols(ui.available_width(), 44.0);
+    let cols = row_cols(ui.available_width(), 44.0, ui.spacing().item_spacing.x);
     let full = format!("{} {} — {}", w.icon, tr(w.title), tr(w.summary));
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
     let mut clicked = false;
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [cols.icon, 18.0],
-            egui::Label::new(egui::RichText::new(progress_mark(done, total)).color(
-                if done >= total {
+        guide_col(ui, cols.icon, 18.0, false, |ui| {
+            ui.label(
+                egui::RichText::new(progress_mark(done, total)).color(if done >= total {
                     theme.ok
                 } else {
                     theme.text_dim
-                },
-            )),
-        );
-        if ui
-            .add_sized(
-                [cols.label, 20.0],
-                egui::Button::new(egui::RichText::new(shown).color(theme.text)).frame(false),
-            )
-            .on_hover_text(full.as_str())
-            .clicked()
-        {
-            clicked = true;
-        }
-        if cols.keys > 0.0 {
-            ui.add_sized(
-                [cols.keys, 18.0],
-                egui::Label::new(
-                    egui::RichText::new(format!("{done}/{total}"))
-                        .small()
-                        .color(theme.text_dim),
-                )
-                .truncate(),
+                }),
             );
+        });
+        clicked = guide_col(ui, cols.label, 20.0, false, |ui| {
+            let g = fit_galley(ui, &shown, cols.label, egui::TextStyle::Body, theme.text);
+            ui.add(egui::Button::new(g).frame(false))
+                .on_hover_text(full.as_str())
+                .clicked()
+        });
+        if cols.keys > 0.0 {
+            guide_col(ui, cols.keys, 18.0, true, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{done}/{total}"))
+                            .small()
+                            .color(theme.text_dim),
+                    )
+                    .truncate(),
+                );
+            });
         }
     });
     clicked
 }
 
 /// 索引 1 行。行は必ず可用幅に収め、詰めた分はホバーで全文を出す。
-fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) {
+///
+/// **押せる。** 押されたら `true` — 呼び出し側が [`pick_for_row`] の結果へ
+/// 従って「その手順を再生する / 機能を実行する / 打鍵を教える」。
+fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) -> bool {
     let want_keys = if r.keys.is_empty() { 0.0 } else { 96.0 };
-    let cols = row_cols(ui.available_width(), want_keys);
+    let cols = row_cols(ui.available_width(), want_keys, ui.spacing().item_spacing.x);
     let full = if r.note.is_empty() {
         format!("{} ({})", r.label, r.id)
     } else {
         format!("{} — {} ({})", r.label, r.note, r.id)
     };
     let shown = ellipsize(&full, fit_chars(cols.label, 12.0));
+    // 押したときに何が起きるかを**先に**伝える (押してから驚かせない)。
+    let tip = match pick_for_row(r) {
+        GuidePick::Step(s) => format!(
+            "{full}\n\n▶ {}",
+            trf("「{t}」の手順を再生します", &[("t", tr(s.title))])
+        ),
+        GuidePick::RunFeature(_) => format!("{full}\n\n▶ {}", tr("この機能をいま開いて見せます")),
+        GuidePick::ShowKeys if r.keys.is_empty() => full.clone(),
+        GuidePick::ShowKeys => format!("{full}\n\n▶ {}", tr("使い方 (打鍵) を出します")),
+    };
+    let mut clicked = false;
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [cols.icon, 16.0],
-            egui::Label::new(egui::RichText::new(r.icon.as_str()).small()),
-        );
-        ui.add_sized(
-            [cols.label, 16.0],
-            egui::Label::new(egui::RichText::new(shown).small().color(
-                // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
-                if r.kind == RowKind::Feature {
-                    theme.text
-                } else {
-                    theme.text_dim
-                },
-            ))
-            .truncate(),
-        )
-        .on_hover_text(full.as_str());
+        guide_col(ui, cols.icon, 16.0, false, |ui| {
+            ui.label(egui::RichText::new(r.icon.as_str()).small());
+        });
+        clicked = guide_col(ui, cols.label, 16.0, false, |ui| {
+            // 機能は本文色、組み込み操作は控えめに (行数が多いので沈める)。
+            let color = if r.kind == RowKind::Feature {
+                theme.text
+            } else {
+                theme.text_dim
+            };
+            let g = fit_galley(ui, &shown, cols.label, egui::TextStyle::Small, color);
+            ui.add(egui::Button::new(g).frame(false))
+                .on_hover_text(tip.as_str())
+                .clicked()
+        });
         if cols.keys > 0.0 && !r.keys.is_empty() {
-            ui.add_sized(
-                [cols.keys, 16.0],
-                egui::Label::new(
-                    egui::RichText::new(r.keys.as_str())
-                        .small()
-                        .monospace()
-                        .color(theme.text_dim),
-                )
-                .truncate(),
-            );
+            guide_col(ui, cols.keys, 16.0, true, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(r.keys.as_str())
+                            .small()
+                            .monospace()
+                            .color(theme.text_dim),
+                    )
+                    .truncate(),
+                );
+            });
         }
     });
+    clicked
 }
 
 // ── テスト ───────────────────────────────────────────────────
@@ -2514,6 +2834,262 @@ mod tests {
             && r.min.y >= screen.min.y - 0.01
             && r.max.x <= screen.max.x + 0.01
             && r.max.y <= screen.max.y + 0.01
+    }
+
+    // ── 全機能ガイド: 選んだら体験できる ──
+
+    /// **索引のどの行を選んでも行き止まりにならない。**
+    ///
+    /// 「説明がありません」で終わる行が 1 つでもあると、ガイドは
+    /// 「載っているけど何も起きない一覧」になる。3 通りのどれかへ必ず落ちること、
+    /// そして**それぞれが実在するもの**を指していることを固定する。
+    #[test]
+    fn 索引の全行が体験の仕方を持つ() {
+        let keys = Keybinds::default();
+        let rows = index_rows(&keys);
+        assert!(!rows.is_empty(), "索引が空");
+
+        let (mut steps, mut feats, mut keys_only) = (0, 0, 0);
+        for r in &rows {
+            match pick_for_row(r) {
+                GuidePick::Step(s) => {
+                    steps += 1;
+                    assert!(
+                        STEPS.iter().any(|x| x.id == s.id),
+                        "{}: 手順表に無い手順を指している ({})",
+                        r.id,
+                        s.id
+                    );
+                    // 章に載っていない手順もある (初回ツアー専用の手順など)。
+                    // その場合は `experience` が**単独で 1 枚再生する**ので
+                    // 行き止まりにはならない。ここで章を必須にすると、
+                    // 手順表を足した人が章にも足すまで CI が赤くなるだけで、
+                    // 利用者の体験は何も良くならない。
+                    if let Some(w) = chapter_of_step(s.id) {
+                        assert!(
+                            w.steps().iter().any(|x| x.id == s.id),
+                            "{}: 章が指す手順を引けない ({})",
+                            r.id,
+                            s.id
+                        );
+                    }
+                }
+                GuidePick::RunFeature(id) => {
+                    feats += 1;
+                    assert_eq!(id, r.id, "実行する機能 id が行とずれている");
+                    assert!(
+                        crate::feature::REGISTRY
+                            .iter()
+                            .flat_map(|f| f.entries.iter())
+                            .any(|e| e.id == id),
+                        "{id}: レジストリに無い機能を実行しようとしている"
+                    );
+                }
+                GuidePick::ShowKeys => keys_only += 1,
+            }
+        }
+        // 機能行は**全部**実行できる (レジストリの id をそのまま使うため)。
+        let n_feat = rows.iter().filter(|r| r.kind == RowKind::Feature).count();
+        assert_eq!(feats, n_feat, "実行できない機能行がある");
+        // 組み込み操作は「手順あり」と「打鍵を教える」に分かれる。
+        // **手順ありが 0 なら対応付けが壊れている** (Step::keys を見ていない)。
+        assert!(steps > 0, "手順へ繋がる組み込み操作が 1 つも無い");
+        assert_eq!(
+            steps + feats + keys_only,
+            rows.len(),
+            "分類から漏れた行がある"
+        );
+    }
+
+    /// 打鍵から手順を引く対応が**実物で**効いている。
+    ///
+    /// `Step::keys` を唯一の対応表にしてあるので、手順表に打鍵を書き足すだけで
+    /// 索引からも届くようになる (別表を作らない = 片方が腐らない)。
+    #[test]
+    fn 打鍵を教えている手順は索引から辿れる() {
+        let keys = Keybinds::default();
+        let rows = action_rows(&keys);
+        for step in STEPS.iter().filter(|s| !s.keys.is_empty()) {
+            for a in step.keys {
+                let name = crate::keybinds::config_name(*a);
+                let row = rows
+                    .iter()
+                    .find(|r| r.id == name)
+                    .unwrap_or_else(|| panic!("{name}: 索引に行が無い"));
+                assert!(
+                    matches!(pick_for_row(row), GuidePick::Step(_)),
+                    "{name}: 手順が教えているのに索引から手順へ届かない"
+                );
+            }
+        }
+    }
+
+    // ── 章立てガイドの行揃え ──
+
+    /// **章の行も列で揃う。** 進捗 (`0/7`) が行ごとに右へずれない。
+    ///
+    /// 索引 (`index_row_ui`) だけを守っていて、章 (`chapter_row`) は
+    /// 番人が無かった。実画面では進捗表示が 1 行ごとに右へ階段状にずれていた。
+    /// **同じ形の不具合は、同じ形のテストで両方を押さえる。**
+    #[test]
+    fn 章立てガイドの進捗も列で揃う() {
+        use egui::epaint::Shape;
+        let theme = crate::theme::all()[0].clone();
+        let seen: BTreeMap<String, u32> = BTreeMap::new();
+
+        for w in [900.0_f32, 1200.0, 1760.0] {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 900.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for wk in WALKTHROUGHS {
+                        let _ = chapter_row(ui, &theme, wk, &seen);
+                    }
+                });
+            });
+
+            // 進捗の文字 (`0/7` の形) が描かれた x を集める。
+            let mut xs: Vec<f32> = Vec::new();
+            for sh in &out.shapes {
+                if let Shape::Text(t) = &sh.shape {
+                    let s = t.galley.text();
+                    if s.contains('/') && s.chars().all(|c| c.is_ascii_digit() || c == '/') {
+                        xs.push(t.pos.x);
+                    }
+                }
+            }
+            assert!(
+                xs.len() >= WALKTHROUGHS.len(),
+                "{w}px: 進捗が全章ぶん描かれていない ({} / {})",
+                xs.len(),
+                WALKTHROUGHS.len()
+            );
+            let lo = xs.iter().cloned().fold(f32::MAX, f32::min);
+            let hi = xs.iter().cloned().fold(f32::MIN, f32::max);
+            // 桁数が違う (`0/3` と `0/13`) ので右寄せの開始 x は数 px 動く。
+            // **行ごとに階段状にずれる**のは別物で、そちらは数十 px 単位になる。
+            assert!(
+                hi - lo < 12.0,
+                "{w}px: 進捗の x が行ごとにずれている ({lo}..{hi} = {:.1}px 幅)\n{xs:?}",
+                hi - lo
+            );
+        }
+    }
+
+    // ── 全機能ガイドの行揃え ──
+
+    /// 索引の行は **列で揃う**。
+    ///
+    /// 以前は各列を `ui.add_sized` で置いていたため、
+    /// (1) 見出しが列の中央から始まり (2) 確保幅が中身に縮んで
+    /// **打鍵欄の開始 x が見出しの長さで動いた**。実画面では索引全体が
+    /// 階段状にずれて見えた。ここは「同じ列の文字は同じ x から始まる」を
+    /// 実際に描いて確かめる (純関数の `row_cols` だけでは捕まえられない —
+    /// 幅の計算は最初から正しく、崩していたのは配置のほうだった)。
+    #[test]
+    fn 全機能ガイドの索引は列で揃う() {
+        use egui::epaint::Shape;
+        let theme = crate::theme::all()[0].clone();
+        // 見出しの長さがばらばらな行を並べる (長さで位置が動くなら必ず出る)。
+        let rows: Vec<IndexRow> = [
+            ("保存", "save", "⌘S"),
+            ("名前を付けて保存", "save_as", "⇧⌘S"),
+            ("タブを閉じる", "close_tab", "⌘W"),
+            ("コックピットの表示切替", "toggle_cockpit", "⇧⌘C"),
+            ("新しいウィンドウ", "new_window", "⇧⌘N"),
+        ]
+        .iter()
+        .map(|(label, id, keys)| IndexRow {
+            icon: "·".into(),
+            label: (*label).into(),
+            note: String::new(),
+            id: (*id).into(),
+            keys: (*keys).into(),
+            kind: RowKind::Action,
+        })
+        .collect();
+
+        // 極端な幅でも揃うこと (狭いと列幅の配分そのものが変わる)。
+        for w in [520.0_f32, 900.0, 1600.0] {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 600.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for r in &rows {
+                        index_row_ui(ui, &theme, r);
+                    }
+                });
+            });
+
+            // 描かれた文字の (文字列, 左端 x) を集める。
+            let mut drawn: Vec<(String, f32)> = Vec::new();
+            for s in &out.shapes {
+                if let Shape::Text(t) = &s.shape {
+                    drawn.push((t.galley.text().to_string(), t.pos.x));
+                }
+            }
+            assert!(!drawn.is_empty(), "{w}px: 何も描かれていない");
+
+            // 見出し列: すべて同じ x から始まる。
+            let label_xs: Vec<f32> = rows
+                .iter()
+                .map(|r| {
+                    let head: String = r.label.chars().take(2).collect();
+                    drawn
+                        .iter()
+                        .find(|(t, _)| t.starts_with(&head))
+                        .unwrap_or_else(|| panic!("{w}px: 見出しが見つからない: {}", r.label))
+                        .1
+                })
+                .collect();
+            let (lo, hi) = (
+                label_xs.iter().cloned().fold(f32::MAX, f32::min),
+                label_xs.iter().cloned().fold(f32::MIN, f32::max),
+            );
+            assert!(
+                hi - lo < 1.0,
+                "{w}px: 見出しの開始 x がばらついている ({lo}..{hi}) = 列で揃っていない\n{label_xs:?}"
+            );
+
+            // 打鍵列: すべて同じ右端で終わる (右寄せなので終端を見る)。
+            let key_ends: Vec<f32> = rows
+                .iter()
+                .filter_map(|r| {
+                    drawn
+                        .iter()
+                        .find(|(t, _)| t == &r.keys)
+                        .map(|(t, x)| x + t.chars().count() as f32 * 0.0)
+                })
+                .collect();
+            if key_ends.len() == rows.len() {
+                // 打鍵の長さが違うので開始 x は揃わないが、**長い見出しの行ほど
+                // 右へずれる**という以前の壊れ方は起きない: 見出しが最長の行と
+                // 最短の行で、打鍵の開始 x の差が列幅を超えないこと。
+                let (klo, khi) = (
+                    key_ends.iter().cloned().fold(f32::MAX, f32::min),
+                    key_ends.iter().cloned().fold(f32::MIN, f32::max),
+                );
+                // 描画側と同じ余白を渡す (既定の item_spacing.x = 8.0)。
+                let cols = row_cols(w, 96.0, 8.0);
+                assert!(
+                    khi - klo <= cols.keys,
+                    "{w}px: 打鍵欄が見出しの長さで動いている ({klo}..{khi}, 列幅 {})",
+                    cols.keys
+                );
+            }
+        }
     }
 
     // ── 手順表の整合性 ──
@@ -3079,7 +3655,7 @@ mod tests {
     /// 章のアンカーも app.rs 側で申告されている (無いと 4 秒で勝手に飛ぶ)。
     #[test]
     fn 章の手順もapp_rsでアンカーを申告している() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let mut missing: Vec<String> = Vec::new();
         for s in EXTRA_STEPS {
             let Some(id) = s.anchor else { continue };
@@ -3094,7 +3670,7 @@ mod tests {
     /// 章の手順が出す依頼も app.rs のルーティングに届く。
     #[test]
     fn 章の手順の依頼もapp_rsに届く() {
-        let src = include_str!("app.rs").replace("\r\n", "\n");
+        let src = crate::app::SRC.replace("\r\n", "\n");
         let body = src
             .split("fn apply_tutorial_action(")
             .nth(1)
@@ -3304,16 +3880,28 @@ mod tests {
         }
     }
 
+    /// **列幅の合計 + 列間の余白** が可用幅に収まること。
+    ///
+    /// 以前は余白を勘定していなかった。3 列の合計がちょうど可用幅になるので
+    /// 一見正しいが、egui は列と列のあいだに `item_spacing.x` を入れるため
+    /// **合計が可用幅を超え、右端の列が画面外へ出ていた**
+    /// (実画面で章の進捗が 9 行中 8 行消えた)。
     #[test]
-    fn 索引の列幅は可用幅を超えない() {
+    fn 索引の列幅は余白を入れても可用幅を超えない() {
         for avail in [0.0_f32, 1.0, 40.0, 120.0, 300.0, 680.0, 2000.0] {
             for want in [0.0_f32, 44.0, 96.0, 400.0] {
-                let c = row_cols(avail, want);
-                assert!(c.icon >= 0.0 && c.label >= 0.0 && c.keys >= 0.0);
-                assert!(
-                    c.icon + c.label + c.keys <= avail + 0.01,
-                    "avail={avail} want={want} → {c:?} が可用幅を超えた"
-                );
+                for gap in [0.0_f32, 4.0, 8.0, 20.0] {
+                    let c = row_cols(avail, want, gap);
+                    assert!(c.icon >= 0.0 && c.label >= 0.0 && c.keys >= 0.0);
+                    // 列は 3 つ = 隙間は 2 つ。**余白を引いた「使える幅」**に収まること。
+                    // 可用幅が余白より狭い退化ケースでは列が 0 幅になり、
+                    // そのとき余白は描かれない (並べる中身が無い) ので床は 0。
+                    let usable = (avail - gap * 2.0).max(0.0);
+                    assert!(
+                        c.icon + c.label + c.keys <= usable + 0.01,
+                        "avail={avail} want={want} gap={gap} → {c:?} が使える幅 {usable} を超えた"
+                    );
+                }
             }
         }
     }
@@ -3472,5 +4060,295 @@ mod tests {
         for id in ["welcome", "layout", "palette", "cockpit", "finish"] {
             assert!(STEPS.iter().any(|s| s.id == id), "{id} が消えている");
         }
+    }
+}
+
+/// **アイドルで再描画を要求しないこと** — 設計原則 3 のリリースゲート。
+///
+/// ここが赤くなったら「アイドル時のコストはゼロ」が破れている。
+/// **絶対時間では線を引かない** (CPU 秒はマシンと負荷で必ず嘘をつく)。
+/// 見るのは**要求の回数**だけ: 何フレーム回しても要求が 0 件か。
+#[cfg(test)]
+mod idle_repaint_tests {
+    use super::*;
+
+    /// 時計を注入する headless ハーネス。**実時間を 1 秒も待たない。**
+    struct Harness {
+        ctx: egui::Context,
+        tut: Tutorial,
+        theme: crate::theme::Theme,
+        keys: Keybinds,
+        t: f64,
+        dir: PathBuf,
+    }
+
+    impl Harness {
+        fn new(tag: &str) -> Self {
+            // **実 `~/.zaivern` に触らない。** 状態ファイルは一時ディレクトリへ。
+            let dir = crate::test_util::unique_temp_dir("zv-tutorial-idle", tag);
+            Self {
+                ctx: egui::Context::default(),
+                tut: Tutorial::in_dir(dir.clone()),
+                theme: crate::theme::by_name("zaivern-dark"),
+                keys: Keybinds::default(),
+                t: 1.0,
+                dir,
+            }
+        }
+
+        /// `dt` 秒進めて 1 フレーム描く。返り値は egui が予約した再描画待ち
+        /// (`Duration::MAX` = **1 枚も予約していない**)。
+        ///
+        /// 現在の手順のアンカーは毎フレーム申告する (実際のアプリでパネルが
+        /// 自分の位置を申告するのと同じ順番)。
+        fn frame(&mut self, dt: f64, events: Vec<egui::Event>) -> std::time::Duration {
+            self.t += dt;
+            let raw = egui::RawInput {
+                time: Some(self.t),
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1200.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                tut,
+                theme,
+                keys,
+                ..
+            } = self;
+            let out = ctx.run(raw, |c| {
+                if let Some(id) = tut.step().and_then(|s| s.anchor) {
+                    anchor(
+                        c,
+                        id,
+                        Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(200.0, 30.0)),
+                    );
+                }
+                let _ = tut.overlay(c, theme, keys);
+            });
+            out.viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .unwrap_or(std::time::Duration::MAX)
+        }
+
+        /// アンカーを持つ手順まで進める (リングが出る = 脈動する手順)。
+        fn goto_anchored_step(&mut self) {
+            for _ in 0..STEPS.len() {
+                if self.tut.step().and_then(|s| s.anchor).is_some() {
+                    return;
+                }
+                self.tut.next();
+            }
+            panic!("アンカーを持つ手順が 1 つも無い");
+        }
+
+        /// 放置しきる (脈動が止まるまで回す)。
+        fn settle(&mut self) {
+            for _ in 0..300 {
+                self.frame(0.033, vec![]);
+            }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 溜まった要求を取り出して空にする (観測を自分のフレームだけに閉じる)。
+    fn drain() -> BTreeMap<&'static str, u64> {
+        crate::perf::test_sink::take()
+    }
+
+    // ── (1) 表示していないときは 1 回も要求しない ────────────────
+
+    /// **ツアーもガイドも閉じているなら、1 フレームも予約しない。**
+    ///
+    /// 初回起動の自動再生を過ぎた後 (= ほとんどの利用者のほとんどの時間)
+    /// がこの状態。ここが破れると全利用者のバッテリーを焼く。
+    #[test]
+    fn 閉じているツアーは一枚も予約しない() {
+        let mut h = Harness::new("closed");
+        assert!(!h.tut.active(), "開始していないのに active");
+        // 最初の数フレームは egui 自身がレイアウト確定のために要求する
+        // (`RepaintState::outstanding`)。それが落ち着いてから見る。
+        for _ in 0..4 {
+            h.frame(0.05, vec![]);
+        }
+        let _ = drain();
+        for _ in 0..30 {
+            assert_eq!(
+                h.frame(0.05, vec![]),
+                std::time::Duration::MAX,
+                "閉じているのに再描画を予約した"
+            );
+        }
+        assert!(drain().is_empty(), "閉じているのに要求を出した");
+    }
+
+    /// 全機能ガイド (静止画) も同じ — 開いていても予約しない。
+    #[test]
+    fn ガイドは静止画なので予約しない() {
+        let mut h = Harness::new("guide");
+        h.tut.open_guide();
+        let _ = drain();
+        for _ in 0..30 {
+            h.frame(0.05, vec![]);
+        }
+        assert!(drain().is_empty(), "ガイドが再描画を要求した");
+    }
+
+    // ── (2) 表示中でも、放置すれば止まる ────────────────────────
+
+    /// **カードを開いたまま放置したら、脈動が止まって要求が 0 になる。**
+    ///
+    /// 直す前はここが無条件に 30fps を予約していた
+    /// (実測 48〜56fps / 1 コアの 9.2〜12.5%)。
+    #[test]
+    fn 放置したツアーは脈動を止めて要求が消える() {
+        let mut h = Harness::new("settle");
+        h.tut.start();
+        h.goto_anchored_step();
+
+        // 直後は動いている (リングが呼吸している = 見た目を殺していない)。
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "開いた直後にリングが動いていない (見た目を壊した)"
+        );
+
+        h.settle();
+        let _ = drain();
+        for _ in 0..30 {
+            assert_eq!(
+                h.frame(0.033, vec![]),
+                std::time::Duration::MAX,
+                "放置中のツアーが再描画を予約している"
+            );
+        }
+        assert!(drain().is_empty(), "放置中のツアーが要求を出した");
+    }
+
+    /// **自走している出所がゼロ** — `perf` の判定そのもので見る。
+    ///
+    /// `always_on_sources` は「アイドルフレームと同数以上の要求を出した出所」
+    /// = 次のフレームを自分で予約し続けているもの。**絶対時間ではなく比**。
+    #[test]
+    fn 放置後は自走する出所が無い() {
+        let mut h = Harness::new("always-on");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        let _ = drain();
+        let mut stats = crate::perf::FrameStats::new();
+        for _ in 0..30 {
+            h.frame(0.033, vec![]);
+            // 実入力のないフレーム = アイドルフレームとして数える。
+            stats.record_frame(1_000, true, drain());
+        }
+        let on = stats.always_on_sources();
+        assert!(
+            on.is_empty(),
+            "アイドルで自走している出所が残っている: {on:?}"
+        );
+        assert_eq!(stats.idle_repaints(), 0, "アイドルで要求が出ている");
+    }
+
+    /// **操作すれば必ず動き出す。** 止めっぱなしにしていない。
+    #[test]
+    fn 操作したらリングはまた動き出す() {
+        let mut h = Harness::new("wake");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        // ポインタが動いた = 人が居る。
+        h.frame(
+            0.033,
+            vec![egui::Event::PointerMoved(egui::pos2(600.0, 400.0))],
+        );
+        // 次のフレーム (入力なし) でも脈動が続いている。
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "操作したのにリングが動き出さない"
+        );
+    }
+
+    /// **手順が変われば新しい対象がまた光る。**
+    #[test]
+    fn 手順を進めるとまた光る() {
+        let mut h = Harness::new("step");
+        h.tut.start();
+        h.goto_anchored_step();
+        h.settle();
+
+        h.tut.next();
+        h.goto_anchored_step();
+        let _ = drain();
+        h.frame(0.033, vec![]);
+        assert!(
+            drain().contains_key("tutorial"),
+            "次の手順のリングが光っていない"
+        );
+    }
+
+    // ── (3) 止める瞬間に絵が飛ばない (純粋関数) ──────────────────
+
+    /// 脈動を止める時刻では、位相がちょうど中央値 (0.5) になる。
+    #[test]
+    fn 止める瞬間の位相は中央値() {
+        for deadline in [0.0_f64, 0.3, 1.0, 4.0, 4.9, 123.456] {
+            let s = ring_settle_time(deadline);
+            assert!(s >= deadline, "deadline {deadline} より前で止めている: {s}");
+            assert!(
+                s - deadline <= std::f64::consts::PI / RING_SPEED + 1e-9,
+                "半周期より長く回している: {deadline} → {s}"
+            );
+            assert!(
+                (ring_pulse(s) - 0.5).abs() < 1e-4,
+                "止めた瞬間に絵が飛ぶ: pulse={}",
+                ring_pulse(s)
+            );
+        }
+    }
+
+    /// 脈動は 0..1 に収まる (リングの太さが負や過大にならない)。
+    #[test]
+    fn 脈動は0から1に収まる() {
+        for i in 0..2000 {
+            let p = ring_pulse(i as f64 * 0.01);
+            assert!((0.0..=1.0).contains(&p), "pulse={p}");
+        }
+    }
+
+    // ── (4) アンカー待ちは「時間切れの 1 枚」だけを予約する ───────
+
+    /// 30fps で待たず、**時間切れの瞬間 1 枚**だけを予約するための残り時間。
+    #[test]
+    fn アンカー待ちの残り時間は期限までで頭打ち() {
+        let mut m = MissingTracker::default();
+        assert_eq!(m.remaining(0.0), None, "待っていないのに残りがある");
+        assert!(!m.observe(0.0, false));
+        let left = m.remaining(1.0).expect("待っている");
+        assert_eq!(
+            left,
+            std::time::Duration::from_secs_f64(MISSING_ANCHOR_TIMEOUT - 1.0),
+            "残りが期限と合わない"
+        );
+        assert_eq!(
+            m.remaining(MISSING_ANCHOR_TIMEOUT + 10.0),
+            Some(std::time::Duration::ZERO),
+            "期限を過ぎたら 0 (負にしない)"
+        );
     }
 }

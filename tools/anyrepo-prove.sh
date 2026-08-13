@@ -76,6 +76,13 @@
 #
 # 終了コード: 0 = 証明できた / 1 = 証明できなかった (理由を出す) / 2 = 使い方の誤り
 set -eu
+# Windows (Git Bash / PowerShell) の既定コードページは UTF-8 ではないので、
+# Python が日本語を stdout へ書いた瞬間に
+# `UnicodeEncodeError: 'charmap' codec can't encode characters` で落ちる
+# (CI の probe (windows-latest) が実際にこれで赤くなった)。
+# **どの OS でも同じ出力になるよう UTF-8 を明示する。** 既に設定されていれば尊重する。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 
 # shellcheck disable=SC1007  # `CDPATH= cd` は「その cd にだけ空の CDPATH を渡す」正しい書き方
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -438,6 +445,37 @@ zai_identity() {
 }
 # @zai-honesty-end
 
+# ── shell と python のあいだのパスの形 ────────────────────────────
+#
+# **Git Bash の shell と、`setup-python` が入れるネイティブ Windows の python は
+# パスの形が違う。** 境界を越える値は必ず `to_native_path` を通すこと。
+# 通し忘れると 2 つの症状が出る:
+#
+#   * `FileNotFoundError: [WinError 2]` — `/d/a/…` を native python が開けない
+#   * **もっと悪い「静かにずれる」** — native python は `/tmp/x` を
+#     *カレントドライブの* `\tmp\x` として作るのに、git.exe は同じ文字列を
+#     MSYS の `/tmp` (= `%TEMP%`) と読む。**作った場所と探す場所が別**になり
+#     `fatal: '…/plain/.git' does not appear to be a git repository` で落ちた
+#     (CI の `shapes (windows-latest)`。`git init` は cwd 指定なので通り、
+#      **パスを引数で渡す `git clone` だけ**が落ちるので原因が見えにくい)。
+#
+# 変換するのは **python が本当にネイティブ Windows のときだけ**。
+# MSYS/Cygwin の python3 は POSIX 形をそのまま解決するので、`C:\…` を渡すと
+# 逆に壊れる。素の macOS/Linux は `os.name == "posix"` なので**素通し** —
+# **1 バイトも変わらない**。
+py_native_win=0
+if [ "$(python3 -c 'import os; print(os.name)' 2>/dev/null || echo posix)" = nt ]; then
+    py_native_win=1
+fi
+
+to_native_path() {
+    if [ "$py_native_win" = 1 ] && [ -n "${1:-}" ] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
+    else
+        printf '%s' "${1:-}"
+    fi
+}
+
 zai=""
 zai_pick zai_help_ok || true
 zai_identity "$zai" >&2
@@ -461,7 +499,10 @@ trap 'exit 143' TERM
 # **本物の ~/.zaivern と ~/.gitconfig に触らせない。**
 mkdir -p "$work/home"
 HOME="$work/home"
-USERPROFILE="$work/home" # Windows 側の同等物。片側だけ書かない
+# Windows 側の同等物。片側だけ書かない。**`USERPROFILE` を読むのは
+# ネイティブ側 (zai / native python) なので native 形で渡す**
+# (`HOME` は MSYS 側の git.exe が読むので POSIX 形のままにする)。
+USERPROFILE=$(to_native_path "$work/home")
 export HOME USERPROFILE
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
@@ -474,12 +515,12 @@ export GIT_COMMITTER_EMAIL=anyrepo-prove@example.invalid
 python3 - "$work/config.json" <<EOS
 import json, sys
 json.dump({
-    "root": $(printf '%s' "$root" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
-    "repo": $(printf '%s' "$repo" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
-    "zai": $(printf '%s' "$zai" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
-    "target_dir": $(printf '%s' "$target_dir" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "root": $(printf '%s' "$(to_native_path "$root")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "repo": $(printf '%s' "$(to_native_path "$repo")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "zai": $(printf '%s' "$(to_native_path "$zai")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "target_dir": $(printf '%s' "$(to_native_path "$target_dir")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "zai_note": $(printf '%s' "$zai_note" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
-    "work": $(printf '%s' "$work" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "work": $(printf '%s' "$(to_native_path "$work")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "writers": [int(x) for x in "$wlist".split()],
     "overlap": float("$overlap"),
     "picks": $picks,
@@ -489,7 +530,7 @@ json.dump({
     "scan_cap": $scan_cap,
     "max_bytes": $max_bytes,
     "timeout": $timeout_s,
-    "trace": $(printf '%s' "$trace" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+    "trace": $(printf '%s' "$(to_native_path "$trace")" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
     "shift": $want_shift == 1,
     "json": $json == 1,
     "keep": $keep == 1,
@@ -517,6 +558,25 @@ import hashlib
 
 CFG = json.load(open(sys.argv[1], encoding="utf-8"))
 ENV = dict(os.environ)
+
+# **ネイティブ Windows の python に POSIX 形のパスを渡さない。**
+# 渡すと `os.makedirs("/tmp/x")` は*カレントドライブ*の `\tmp\x` を作り、
+# 同じ文字列を受け取った git.exe は MSYS の `/tmp` (= `%TEMP%`) を見るので、
+# **作った場所と探す場所がずれる**。しかも `git init` は cwd 指定なので通り、
+# パスを引数で渡す `git clone` だけが `does not appear to be a git repository`
+# で落ちるため、原因が git 側に見えてしまう (CI で実際にそう読み違えた)。
+# ここで**その場で**落として、直す場所 (shell の `to_native_path`) を名指しする。
+# posix では 1 度も走らない。
+if os.name == "nt":
+    for _k in ("root", "repo", "zai", "target_dir", "work", "trace"):
+        _v = CFG.get(_k) or ""
+        if _v.startswith("/"):
+            sys.exit(
+                "config の %s が POSIX 形のままです: %s\n"
+                "  shell 側で to_native_path を通していません "
+                "(cygpath が無い環境かもしれません)。\n"
+                "  このまま進むと作った場所と git が探す場所がずれます。" % (_k, _v)
+            )
 
 # 対象リポジトリの指紋に使う git は「読むだけ」に固定する。
 # `git status` は既定で索引を書き戻すことがあり、それを「汚した」と
@@ -592,6 +652,22 @@ def git(args, cwd, check=True, ro=False):
             % (" ".join(args), r.rc, r.timed_out, r.out, r.err)
         )
     return r
+
+
+def file_url(path):
+    """ローカルのパスから `file://` の URL を作る。
+
+    **`"file://" + パス` の素の連結は Windows で壊れる。**
+    `C:\\x` を足すと `file://C:/x` になり、`C:` が**ホスト名**として読まれる
+    (正しくは `file:///C:/x` — スラッシュ 3 本)。
+    posix は絶対パスが `/` で始まるので、これまでと **1 バイトも変わらない**
+    (`\\` の置換も nt のときだけ — posix ではファイル名に `\\` を使えるので、
+     無条件に置換すると*正しいパスを壊す*)。
+    """
+    p = os.path.abspath(path)
+    if os.name == "nt":
+        p = p.replace("\\", "/")
+    return "file://" + p if p.startswith("/") else "file:///" + p
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -782,7 +858,7 @@ def clone_repo(src, dst):
     """
     attempts = [
         ("local-no-hardlinks", ["clone", "-q", "--local", "--no-hardlinks", src, dst]),
-        ("file-transport", ["clone", "-q", "--no-local", "file://" + os.path.abspath(src), dst]),
+        ("file-transport", ["clone", "-q", "--no-local", file_url(src), dst]),
     ]
     errors = []
     for name, args in attempts:
@@ -2099,7 +2175,7 @@ def build_shapes(work):
     made.append(("連結 worktree の中", lw))
 
     sh = os.path.join(root, "shallow")
-    git(["clone", "-q", "--depth", "1", "file://" + seed_repo("shallow-src"), sh], root)
+    git(["clone", "-q", "--depth", "1", file_url(seed_repo("shallow-src")), sh], root)
     made.append(("shallow clone", sh))
 
     made.append(("履歴が 1 コミットだけ", seed_repo("single", commits=1)))
