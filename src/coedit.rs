@@ -3251,7 +3251,19 @@ mod tests {
         let (mut proven3, mut unproven3, mut over3, mut tight) = (0, 0, 0, 0usize);
         let mut ran = 0usize;
 
+        // **帯へ割る。** 2400 ケースは手元 macOS で 245 秒だが、CI (ubuntu) では
+        // 90 分でも終わらなかった (30 分 → 90 分と 2 度伸ばして 2 度とも打ち切り)。
+        // 実 git を何度も起こす作業は runner のディスク I/O が効き、約 12 倍遅い。
+        // **時間を伸ばすのは筋が悪い** — 伸ばし続ければいつか「いくらでもいい」になり、
+        // 本当に壊れたときに気付けない。総量を減らさずに 1 本を縮めるため帯にする。
+        //
+        // 生成 (上) は git を 1 度も起こさないので**全ケース分そのまま回す**。
+        // こうしないと帯ごとに乱数列がずれて、ケースの同一性が失われる。
+        let (shard, shards) = region::exhaustive_shard();
         for f in 0..files {
+            if shards > 1 && f % shards != shard {
+                continue;
+            }
             let path = path_of(f);
             let parts = per_file(&path);
             if parts.len() < 2 {
@@ -3299,9 +3311,12 @@ mod tests {
         }
 
         // 生成が 2 本以上の枝を選ぶ確率から、ケース数のおよそ 6 割は残る。
+        // **帯へ割ったぶんは下限も割る。** ここを割り忘れると、分割した瞬間に
+        // 「十分な数を回していない」で必ず落ちる (= 分割が使えない)。
+        let mine = files.div_ceil(shards.max(1));
         assert!(
-            ran >= files * 5 / 8,
-            "十分な数のケースを回した: {ran} / {files}"
+            ran >= mine * 5 / 8,
+            "十分な数のケースを回した: {ran} / {mine} (帯 {shard}/{shards} · 全体 {files})"
         );
         assert!(
             proven > 0,
@@ -3325,6 +3340,7 @@ mod tests {
         };
         let (over_rate, over_rate3) = (rate(over, unproven), rate(over3, unproven3));
         // 数字は `--nocapture` で読む (誇張しないために、悪い側も出す)。
+        eprintln!("[coedit] 帯 {shard}/{shards} を担当 ({ran} ケース / 全体 {files})");
         eprintln!(
             "[coedit] 実 git 網羅 (帯 {}): {ran} ケース / 証明が立った {proven} \
              (全部綺麗 {proven_clean} · 見逃し {miss}) / 立たなかった {unproven} / \
