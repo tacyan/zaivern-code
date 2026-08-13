@@ -1646,6 +1646,12 @@ pub fn exhaustive_scale(ci: usize, full: usize) -> usize {
 }
 
 /// 網羅試験を分割するときの帯 (`ZAIVERN_PROOF_SHARD=i/n` で `i` 番目の帯)。
+///
+/// **`#[cfg(test)]` を付けるのは、使う [`exhaustive_shard`] が試験専用だから。**
+/// 付け忘れると通常ビルドで誰も使わない定数になり、`-D dead-code` が落とす
+/// (CI の clippy が実際に落とした)。この警告は「作ったのに繋いでいない」の
+/// 検出器なので、`allow` で黙らせずに **cfg を合わせる**のが正しい。
+#[cfg(test)]
 pub const SHARD_ENV: &str = "ZAIVERN_PROOF_SHARD";
 
 /// このプロセスが担当する帯 `(index, total)`。指定が無ければ `(0, 1)` = 全部。
