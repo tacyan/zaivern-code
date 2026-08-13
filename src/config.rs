@@ -6540,6 +6540,23 @@ theme = "zaivern-dark"
 
     // ── 通知のオン/オフ ──────────────────────────────────────────────
 
+    /// **通知の旗を触るテストを直列化する。**
+    ///
+    /// `notify::enabled()` / `sound()` は**プロセス共通の `AtomicBool`** で、
+    /// `apply_runtime_flags` が書き換える。テストは既定で並列に走るので、
+    /// 「旗を立てる → 読む」のあいだに**別のテストが倒せる**。
+    /// 実際にフルスイートでだけ落ちた (単独では通る = いちばん質の悪い形)。
+    ///
+    /// 「オンへ倒す向きなら衝突しない」は**誤り**だった —
+    /// 立ててから読むまでが不可分でないので、向きは関係ない。
+    ///
+    /// 毒された (panic を跨いだ) ロックも受け取る。ここが守るのは
+    /// 「同時に触らない」ことだけで、中身の一貫性ではない。
+    fn notify_flag_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 欄の無い古い `config.toml` (と、そもそも設定を作っていない利用者) が
     /// **オンのまま**であること。ここがオフに倒れると、更新しただけで
     /// 通知が消えたように見える。
@@ -6552,7 +6569,8 @@ theme = "zaivern-dark"
         assert!(cfg.feature_bool(KEY_ENABLED), "欄が無いのにオフへ倒れた");
         // 既定の Config も同じ
         assert!(Config::default().feature_bool(KEY_ENABLED));
-        // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        // 旗へ写す側も同じ値を配る。**旗はプロセス共通**なので直列化する。
+        let _g = notify_flag_lock();
         apply_runtime_flags(&cfg);
         assert!(crate::notify::enabled());
     }
@@ -6599,6 +6617,7 @@ theme = "zaivern-dark"
             &SettingValue::Bool(true)
         ));
         assert!(cfg.feature_bool(KEY_ENABLED));
+        let _g = notify_flag_lock();
         apply_runtime_flags(&cfg);
         assert!(crate::notify::enabled(), "オンへ戻しても鳴らない");
         // 型違いは書かせない (書けると読み出しが既定へ落ちて「効かない」になる)
@@ -6619,6 +6638,7 @@ theme = "zaivern-dark"
         assert!(cfg.feature_bool(KEY_SOUND), "欄が無いのに無音へ倒れた");
         assert!(Config::default().feature_bool(KEY_SOUND));
         // 旗へ写す側も同じ値を配る (オンの向きは他のテストと衝突しない)
+        let _g = notify_flag_lock();
         apply_runtime_flags(&cfg);
         assert!(crate::notify::sound(), "旗へ音ありが届いていない");
     }
