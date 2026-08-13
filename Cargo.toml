@@ -80,7 +80,7 @@ regex = "1"
 ed25519-dalek = "3"
 # ライセンスキーの Base64URL 部分。0.22 は syntect → plist 経由で既にロックへ
 # 入っているため、直接依存にしても依存グラフは 1 つも増えない。
-base64 = "0.22"
+base64 = "0.23"
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
