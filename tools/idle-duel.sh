@@ -126,6 +126,23 @@ if ! mkdir "$lock" 2>/dev/null; then
     exit 2
 fi
 
+# **スクリーンセーバとディスプレイスリープは、このハーネスが自分で止める。**
+# 操作者が別途 `caffeinate` を張る前提にすると、**期限切れに誰も気付けない**。
+# 実測: 1 回目は手動の `caffeinate` の有効期限に偶然収まって 6/6 通り、
+# 2 回目は期限切れ後に走って **既定 20 分のスクリーンセーバが観測窓に入り**、
+# 1 件が INVALID になった。同じ手順の 2 回で結果が違うなら、それは手順ではない。
+#
+#   * `-u` は付けない。人の在席を偽装するので `HIDIdleTime` が潰れ、
+#     このハーネスの在席ゲートそのものが機能しなくなる
+#   * `-w $$` でこのスクリプトの寿命に縛る。異常終了しても道連れで消える
+#     (`trap` に頼ると `kill -9` で取り残される)
+if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -dims -w $$ &
+    echo "スクリーンセーバ/ディスプレイスリープを抑止しました (このハーネスの実行中のみ)"
+else
+    echo "警告: caffeinate がありません。既定 20 分のスクリーンセーバで測定が無効になることがあります" >&2
+fi
+
 # 中立なワークスペースを用意する (指定が無ければ)。
 tmpws=""
 if [ -z "$WS" ]; then
@@ -153,6 +170,16 @@ front_pid() {
     a=$(lsappinfo front 2>/dev/null) || { echo 0; return; }
     [ -n "$a" ] || { echo 0; return; }
     lsappinfo info -only pid "$a" 2>/dev/null | sed 's/.*=//; s/[^0-9]//g'
+}
+# 最前面アプリの**名前**。判定そのものは pid で行うが、名前が無いと
+# **ロック/スクリーンセーバで loginwindow が前に出た**のか、単に別のアプリが
+# 前に出たのかを区別できない (実測: 20 分の既定スクリーンセーバが起動したのを
+# 「最前面でない (222 -> 222)」と報告し、原因の特定に 1 時間かかった)。
+front_name() {
+    a=$(lsappinfo front 2>/dev/null) || { echo "-"; return; }
+    [ -n "$a" ] || { echo "-"; return; }
+    n=$(lsappinfo info -only name "$a" 2>/dev/null | sed 's/.*=//; s/"//g')
+    echo "${n:--}"
 }
 # 人が最後にキーボード/マウスへ触ってからの秒数。
 hid_idle() {
@@ -239,24 +266,32 @@ measure() {
         sleep "$SETTLE"
         alive "$pid" || { invalid "$label" "落ち着かせ中に終了 (試行 $attempt)"; attempt=$((attempt + 1)); continue; }
 
-        fp0=$(front_pid); hid0=$(hid_idle); t0=$(cpu_seconds "$pid"); s0=$(date +%H:%M:%S)
+        fp0=$(front_pid); fn0=$(front_name); hid0=$(hid_idle)
+        t0=$(cpu_seconds "$pid"); s0=$(date +%H:%M:%S)
         sleep "$OBSERVE"
         alive "$pid" || { invalid "$label" "観測中に終了 (試行 $attempt)"; attempt=$((attempt + 1)); continue; }
-        t1=$(cpu_seconds "$pid"); fp1=$(front_pid); hid1=$(hid_idle)
+        t1=$(cpu_seconds "$pid"); fp1=$(front_pid); fn1=$(front_name); hid1=$(hid_idle)
         rss=$(rss_mb "$pid"); s1=$(date +%H:%M:%S); grew=$((hid1 - hid0))
 
+        # **ロック/スクリーンセーバを先に判定する。** どちらも loginwindow を
+        # 最前面へ出すので、順序を逆にすると「最前面でない」という**間違った
+        # 理由**が出る。実際にそれで誤診し、電源ログを 1 時間漁ってから
+        # `targetUserIdle = 1200.0` (既定 20 分) に行き着いた。
+        # 理由が違うと、直すべき場所も違ってしまう。
+        if [ "$fn0" = loginwindow ] || [ "$fn1" = loginwindow ]; then
+            invalid "$label" "観測中にロック/スクリーンセーバ (loginwindow が最前面) $s0..$s1 (試行 $attempt)"
+            attempt=$((attempt + 1)); continue
+        fi
         if [ "$fp0" != "$pid" ] || [ "$fp1" != "$pid" ]; then
-            invalid "$label" "最前面でない ($fp0 -> ${fp1}、期待 $pid) $s0..$s1 (試行 $attempt)"
+            invalid "$label" "最前面でない ($fp0 $fn0 -> $fp1 $fn1、期待 $pid) $s0..$s1 (試行 $attempt)"
             attempt=$((attempt + 1)); continue
         fi
         if [ "$grew" -lt $((OBSERVE - 10)) ]; then
             invalid "$label" "観測中に人が触った (hid +${grew}s < ${OBSERVE}s) $s0..$s1 (試行 $attempt)"
             attempt=$((attempt + 1)); continue
         fi
-        if [ "$(locked)" = yes ]; then
-            invalid "$label" "観測中にロック $s0..$s1 (試行 $attempt)"
-            attempt=$((attempt + 1)); continue
-        fi
+        # (ロック判定は観測窓の両端で `fn0`/`fn1` として済ませた。ここでもう一度
+        #  `locked` を呼ぶと、同じ瞬間を二度見るだけで新しいことは分からない)
 
         pct=$(awk -v a="$t0" -v b="$t1" -v s="$OBSERVE" 'BEGIN{printf "%.3f", (b-a)/s*100}')
         printf '%s\tVALID\t%s\t%s\t%s\t%s\t%s\twindow=%s hid+%ss\n' \
