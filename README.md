@@ -97,9 +97,9 @@ zai update --check    # only look; changes nothing
 zai update --yes      # upgrade without the confirmation prompt
 ```
 
-`zai update` works whether or not the editor is running, and picks the right method for
-how you installed it (installer script, or `cargo install`). Re-running the one-liner
-above does the same thing.
+`zai update` works whether or not the editor is running, and upgrades in place through
+the installer script for your platform. Re-running the one-liner above does the same
+thing.
 
 `zai uninstall` removes it (`--dry-run` lists what would go). Uninstalling touches only
 the executable and `~/.zaivern`; anything else on your `PATH` is listed, never deleted.
@@ -218,13 +218,18 @@ the moment it is attempted rather than leaving it to be found at merge time.
 
 **Does the lease ledger slow things down?**
 
-<!-- 出典: docs/conflict-zero.md §1「意味しないこと」4 (4〜8 体 p50 40〜50ms / 64 体 p50 298.7ms)、
-     §3.3 (busy-deny: 32 体で 4 件・64 体で 14 件、fail-open は全規模 0) -->
-Yes, and it gets worse with scale, because the gate sits on the write path. Measured
-gate latency is p50 40–50 ms at 4–8 agents and p50 298.7 ms at 64. From 32 agents up
-the gate also starts answering `busy-deny` when it cannot decide in time: it refuses
-rather than guessing, and a retry goes through, but you see it as an occasional
-rejection. At one or two agents the gate is not on your critical path.
+<!-- 出典: docs/conflict-zero.md §1「意味しないこと」4 / §3.3 (掃引: 4〜8 体 p50 40〜50ms、
+     64 体 p50 160ms、busy-deny 32 体 4 件・64 体 14 件) / §3.4 (ゲート 1536 回で p50 298.7ms)。
+     体数だけでは決まらないので、必ず担当表の大きさを添えること -->
+Yes, and it gets worse with scale, because the gate sits on the write path. On the
+standard sweep — N writers over N×6 files — gate latency is p50 40–50 ms at 4–8
+agents and p50 160 ms at 64. Agent count is not the only variable: a heavier
+assignment table that calls the gate 1536 times reaches p50 298.7 ms at the same 64
+agents, so any single "at 64 agents it costs X" number is incomplete without the
+size of the workload. From 32 agents up the gate also starts answering `busy-deny`
+when it cannot decide in time: it refuses rather than guessing, and a retry goes
+through, but you see it as an occasional rejection. At one or two agents the gate is
+not on your critical path.
 
 **What does "zero conflicts" actually mean?**
 
