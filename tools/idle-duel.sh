@@ -20,6 +20,8 @@
 #   --settle <秒>        起動後に落ち着かせる時間 (既定 150)
 #   --observe <秒>       観測する時間 (既定 180)
 #   --retries <N>        無効だったときの再試行 (既定 3)
+#   --tutorial seen|fresh 初回ガイドツアーを既読にするか (既定 seen)。
+#                        `fresh` は**利用者が最初に見る経路**をそのまま測る
 #   --out <パス>         結果の TSV (必須)
 #
 # ## ここが壊れていた、という記録 (同じ穴を掘り直さないために)
@@ -36,7 +38,17 @@
 #   4. **`syntax error` で途中死。** → `sh -n` を通してから使う (CI の
 #      `installers + tools` ジョブが全 `tools/*.sh` を検査している)
 #   5. **初回ガイドツアーが出たまま測っていた。** 32fps で回るので
-#      測りたいアイドルの下限が埋もれる。→ 既読にしてから起動する
+#      測りたいアイドルの下限が埋もれる。→ 既読にしてから起動する。
+#      ただし**既読にした経路しか測れない**と、利用者が最初に見る画面を
+#      測らずに「軽い」と言うことになる。→ `--tutorial fresh` で両方測る
+#   6. **`cpu_pct` を note 欄の中に埋めていた上に、書式と引数がずれていた。**
+#      `cpu_pct=` が観測時刻を、`hid+` が CPU% を表示し、**人が触っていない
+#      ことの証拠 (`grew`) は TSV に一度も書かれていなかった**。標準出力の
+#      `echo` だけが正しかったので、端末を閉じると証拠が消えた。
+#      → `cpu_pct` を独立した列にし、`grew` を必ず残す
+#   7. **測定床を書いていなかった。** `ps -o time` は 1/100 秒までしか
+#      持たないので、観測 180 秒なら 0.006% より下は区別できない。
+#      床に張り付いた値を「実測 0.006%」と読んでしまう。→ `# floor` を出す
 #
 # ## 出さないもの
 #
@@ -58,12 +70,15 @@ SETTLE=150
 OBSERVE=180
 ROUNDS=3
 RETRIES=3
+TUTORIAL=seen
 OUT=""
 # 人が居ないと見なすまでの空き時間 (秒)。短くすると「席を立った直後」を
 # 拾ってしまい、まだ画面が動いている状態で測ることになる。
 HUMAN_AWAY=${HUMAN_AWAY:-420}
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+# 行番号で切らない。説明を 1 行足すたびに使い方が黙って途中で切れる
+# (実際に切れた)。先頭のコメント塊が終わるところまでを出す。
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,6 +90,7 @@ while [ $# -gt 0 ]; do
     --observe) OBSERVE=$2; shift 2 ;;
     --rounds) ROUNDS=$2; shift 2 ;;
     --retries) RETRIES=$2; shift 2 ;;
+    --tutorial) TUTORIAL=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "知らない引数: $1 (--help で使い方)" >&2; exit 2 ;;
@@ -91,6 +107,10 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 [ -n "$OUT" ] || { echo "--out が要ります (--help で使い方)" >&2; exit 2; }
+case "$TUTORIAL" in
+seen | fresh) ;;
+*) echo "--tutorial は seen か fresh です: $TUTORIAL" >&2; exit 2 ;;
+esac
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 [ -n "$ZAI_A" ] || ZAI_A="$root/target/release/zai"
@@ -172,7 +192,7 @@ wait_for_away() {
 }
 
 invalid() {
-    printf '%s\tINVALID\t-\t-\t-\t-\t%s\n' "$1" "$2" >>"$OUT"
+    printf '%s\tINVALID\t-\t-\t-\t-\t-\t%s\n' "$1" "$2" >>"$OUT"
     echo "[$1] $2"
 }
 
@@ -195,9 +215,16 @@ measure() {
         else
             ZH=$(mktemp -d)
             mkdir -p "$ZH/z"
-            # **初回ガイドツアーを既読にしてから起動する。** 出したままだと
-            # 32fps で回り、測りたいアイドルの下限が完全に埋もれる。
-            printf 'done = true\nversion = 1\n' >"$ZH/z/tutorial.toml"
+            # **初回ガイドツアーを既読にするかどうかで、測る経路が変わる。**
+            #   seen  — ツアーを飛ばした「2 回目以降」のアイドル (既定)。
+            #           出したままだと 32fps で回り、測りたい下限が埋もれる
+            #   fresh — 何も無いホームから起こした**初回起動そのもの**。
+            #           利用者が最初に見る経路はこちらなので、`seen` だけを
+            #           測って「アイドルは軽い」と言うと、いちばん多く使われる
+            #           経路を測らずに主張したことになる
+            if [ "$TUTORIAL" = seen ]; then
+                printf 'done = true\nversion = 1\n' >"$ZH/z/tutorial.toml"
+            fi
             ZAIVERN_HOME="$ZH/z" "$target" "$WS" >"$ZH/log" 2>&1 &
             pid=$!
             sleep 10
@@ -232,8 +259,8 @@ measure() {
         fi
 
         pct=$(awk -v a="$t0" -v b="$t1" -v s="$OBSERVE" 'BEGIN{printf "%.3f", (b-a)/s*100}')
-        printf '%s\tVALID\t%s\t%s\t%s\t%s\tcpu_pct=%s hid+%ss\n' \
-            "$label" "$rss" "$t0" "$t1" "$pid" "$s0..$s1" "$pct" >>"$OUT"
+        printf '%s\tVALID\t%s\t%s\t%s\t%s\t%s\twindow=%s hid+%ss\n' \
+            "$label" "$pct" "$rss" "$t0" "$t1" "$pid" "$s0..$s1" "$grew" >>"$OUT"
         echo "[$label] cpu=${pct}% rss=${rss}MB $s0..$s1 (試行 $attempt)"
         kill_apps
         return 0
@@ -242,10 +269,18 @@ measure() {
     return 0
 }
 
-: >"$OUT"
-printf '# label\tstatus\trss_mb\tt0\tt1\tpid\tnote\n' >>"$OUT"
-printf '# gate\t人が %s 秒以上触っていない かつ 画面ロックなし のときだけ測る\n' "$HUMAN_AWAY" >>"$OUT"
-printf '# ws\t%s\n' "$WS" >>"$OUT"
+# **測定床を必ず一緒に出す。** `ps -o time` は 1/100 秒までしか持たないので、
+# 観測 $OBSERVE 秒での最小の刻みがそのまま cpu_pct の下限になる。これを書いて
+# おかないと、床に張り付いた値を「実測 0.006%」と読んでしまう (実際に読んだ)。
+floor_pct=$(awk -v s="$OBSERVE" 'BEGIN{printf "%.3f", 0.01/s*100}')
+{
+    printf '# label\tstatus\tcpu_pct\trss_mb\tt0\tt1\tpid\tnote\n'
+    printf '# gate\t人が %s 秒以上触っていない かつ 画面ロックなし のときだけ測る\n' "$HUMAN_AWAY"
+    printf '# floor\tcpu_pct はこの値より下を区別できない: %s%% (ps の分解能 0.01 秒 / 観測 %s 秒)\n' \
+        "$floor_pct" "$OBSERVE"
+    printf '# tutorial\t%s\n' "$TUTORIAL"
+    printf '# ws\t%s\n' "$WS"
+} >"$OUT"
 
 r=1
 while [ "$r" -le "$ROUNDS" ]; do
