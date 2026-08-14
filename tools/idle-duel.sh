@@ -20,6 +20,8 @@
 #   --settle <秒>        起動後に落ち着かせる時間 (既定 150)
 #   --observe <秒>       観測する時間 (既定 180)
 #   --retries <N>        無効だったときの再試行 (既定 3)
+#   --tutorial seen|fresh 初回ガイドツアーを既読にするか (既定 seen)。
+#                        `fresh` は**利用者が最初に見る経路**をそのまま測る
 #   --out <パス>         結果の TSV (必須)
 #
 # ## ここが壊れていた、という記録 (同じ穴を掘り直さないために)
@@ -36,7 +38,17 @@
 #   4. **`syntax error` で途中死。** → `sh -n` を通してから使う (CI の
 #      `installers + tools` ジョブが全 `tools/*.sh` を検査している)
 #   5. **初回ガイドツアーが出たまま測っていた。** 32fps で回るので
-#      測りたいアイドルの下限が埋もれる。→ 既読にしてから起動する
+#      測りたいアイドルの下限が埋もれる。→ 既読にしてから起動する。
+#      ただし**既読にした経路しか測れない**と、利用者が最初に見る画面を
+#      測らずに「軽い」と言うことになる。→ `--tutorial fresh` で両方測る
+#   6. **`cpu_pct` を note 欄の中に埋めていた上に、書式と引数がずれていた。**
+#      `cpu_pct=` が観測時刻を、`hid+` が CPU% を表示し、**人が触っていない
+#      ことの証拠 (`grew`) は TSV に一度も書かれていなかった**。標準出力の
+#      `echo` だけが正しかったので、端末を閉じると証拠が消えた。
+#      → `cpu_pct` を独立した列にし、`grew` を必ず残す
+#   7. **測定床を書いていなかった。** `ps -o time` は 1/100 秒までしか
+#      持たないので、観測 180 秒なら 0.006% より下は区別できない。
+#      床に張り付いた値を「実測 0.006%」と読んでしまう。→ `# floor` を出す
 #
 # ## 出さないもの
 #
@@ -58,12 +70,15 @@ SETTLE=150
 OBSERVE=180
 ROUNDS=3
 RETRIES=3
+TUTORIAL=seen
 OUT=""
 # 人が居ないと見なすまでの空き時間 (秒)。短くすると「席を立った直後」を
 # 拾ってしまい、まだ画面が動いている状態で測ることになる。
 HUMAN_AWAY=${HUMAN_AWAY:-420}
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+# 行番号で切らない。説明を 1 行足すたびに使い方が黙って途中で切れる
+# (実際に切れた)。先頭のコメント塊が終わるところまでを出す。
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,6 +90,7 @@ while [ $# -gt 0 ]; do
     --observe) OBSERVE=$2; shift 2 ;;
     --rounds) ROUNDS=$2; shift 2 ;;
     --retries) RETRIES=$2; shift 2 ;;
+    --tutorial) TUTORIAL=$2; shift 2 ;;
     --out) OUT=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "知らない引数: $1 (--help で使い方)" >&2; exit 2 ;;
@@ -91,6 +107,10 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 [ -n "$OUT" ] || { echo "--out が要ります (--help で使い方)" >&2; exit 2; }
+case "$TUTORIAL" in
+seen | fresh) ;;
+*) echo "--tutorial は seen か fresh です: $TUTORIAL" >&2; exit 2 ;;
+esac
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 [ -n "$ZAI_A" ] || ZAI_A="$root/target/release/zai"
@@ -104,6 +124,23 @@ if ! mkdir "$lock" 2>/dev/null; then
     echo "別の idle-duel が走っています ($lock)。終わってから実行してください。" >&2
     echo "  古い残骸なら: rmdir '$lock'" >&2
     exit 2
+fi
+
+# **スクリーンセーバとディスプレイスリープは、このハーネスが自分で止める。**
+# 操作者が別途 `caffeinate` を張る前提にすると、**期限切れに誰も気付けない**。
+# 実測: 1 回目は手動の `caffeinate` の有効期限に偶然収まって 6/6 通り、
+# 2 回目は期限切れ後に走って **既定 20 分のスクリーンセーバが観測窓に入り**、
+# 1 件が INVALID になった。同じ手順の 2 回で結果が違うなら、それは手順ではない。
+#
+#   * `-u` は付けない。人の在席を偽装するので `HIDIdleTime` が潰れ、
+#     このハーネスの在席ゲートそのものが機能しなくなる
+#   * `-w $$` でこのスクリプトの寿命に縛る。異常終了しても道連れで消える
+#     (`trap` に頼ると `kill -9` で取り残される)
+if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -dims -w $$ &
+    echo "スクリーンセーバ/ディスプレイスリープを抑止しました (このハーネスの実行中のみ)"
+else
+    echo "警告: caffeinate がありません。既定 20 分のスクリーンセーバで測定が無効になることがあります" >&2
 fi
 
 # 中立なワークスペースを用意する (指定が無ければ)。
@@ -133,6 +170,16 @@ front_pid() {
     a=$(lsappinfo front 2>/dev/null) || { echo 0; return; }
     [ -n "$a" ] || { echo 0; return; }
     lsappinfo info -only pid "$a" 2>/dev/null | sed 's/.*=//; s/[^0-9]//g'
+}
+# 最前面アプリの**名前**。判定そのものは pid で行うが、名前が無いと
+# **ロック/スクリーンセーバで loginwindow が前に出た**のか、単に別のアプリが
+# 前に出たのかを区別できない (実測: 20 分の既定スクリーンセーバが起動したのを
+# 「最前面でない (222 -> 222)」と報告し、原因の特定に 1 時間かかった)。
+front_name() {
+    a=$(lsappinfo front 2>/dev/null) || { echo "-"; return; }
+    [ -n "$a" ] || { echo "-"; return; }
+    n=$(lsappinfo info -only name "$a" 2>/dev/null | sed 's/.*=//; s/"//g')
+    echo "${n:--}"
 }
 # 人が最後にキーボード/マウスへ触ってからの秒数。
 hid_idle() {
@@ -172,7 +219,7 @@ wait_for_away() {
 }
 
 invalid() {
-    printf '%s\tINVALID\t-\t-\t-\t-\t%s\n' "$1" "$2" >>"$OUT"
+    printf '%s\tINVALID\t-\t-\t-\t-\t-\t%s\n' "$1" "$2" >>"$OUT"
     echo "[$1] $2"
 }
 
@@ -195,9 +242,16 @@ measure() {
         else
             ZH=$(mktemp -d)
             mkdir -p "$ZH/z"
-            # **初回ガイドツアーを既読にしてから起動する。** 出したままだと
-            # 32fps で回り、測りたいアイドルの下限が完全に埋もれる。
-            printf 'done = true\nversion = 1\n' >"$ZH/z/tutorial.toml"
+            # **初回ガイドツアーを既読にするかどうかで、測る経路が変わる。**
+            #   seen  — ツアーを飛ばした「2 回目以降」のアイドル (既定)。
+            #           出したままだと 32fps で回り、測りたい下限が埋もれる
+            #   fresh — 何も無いホームから起こした**初回起動そのもの**。
+            #           利用者が最初に見る経路はこちらなので、`seen` だけを
+            #           測って「アイドルは軽い」と言うと、いちばん多く使われる
+            #           経路を測らずに主張したことになる
+            if [ "$TUTORIAL" = seen ]; then
+                printf 'done = true\nversion = 1\n' >"$ZH/z/tutorial.toml"
+            fi
             ZAIVERN_HOME="$ZH/z" "$target" "$WS" >"$ZH/log" 2>&1 &
             pid=$!
             sleep 10
@@ -212,28 +266,36 @@ measure() {
         sleep "$SETTLE"
         alive "$pid" || { invalid "$label" "落ち着かせ中に終了 (試行 $attempt)"; attempt=$((attempt + 1)); continue; }
 
-        fp0=$(front_pid); hid0=$(hid_idle); t0=$(cpu_seconds "$pid"); s0=$(date +%H:%M:%S)
+        fp0=$(front_pid); fn0=$(front_name); hid0=$(hid_idle)
+        t0=$(cpu_seconds "$pid"); s0=$(date +%H:%M:%S)
         sleep "$OBSERVE"
         alive "$pid" || { invalid "$label" "観測中に終了 (試行 $attempt)"; attempt=$((attempt + 1)); continue; }
-        t1=$(cpu_seconds "$pid"); fp1=$(front_pid); hid1=$(hid_idle)
+        t1=$(cpu_seconds "$pid"); fp1=$(front_pid); fn1=$(front_name); hid1=$(hid_idle)
         rss=$(rss_mb "$pid"); s1=$(date +%H:%M:%S); grew=$((hid1 - hid0))
 
+        # **ロック/スクリーンセーバを先に判定する。** どちらも loginwindow を
+        # 最前面へ出すので、順序を逆にすると「最前面でない」という**間違った
+        # 理由**が出る。実際にそれで誤診し、電源ログを 1 時間漁ってから
+        # `targetUserIdle = 1200.0` (既定 20 分) に行き着いた。
+        # 理由が違うと、直すべき場所も違ってしまう。
+        if [ "$fn0" = loginwindow ] || [ "$fn1" = loginwindow ]; then
+            invalid "$label" "観測中にロック/スクリーンセーバ (loginwindow が最前面) $s0..$s1 (試行 $attempt)"
+            attempt=$((attempt + 1)); continue
+        fi
         if [ "$fp0" != "$pid" ] || [ "$fp1" != "$pid" ]; then
-            invalid "$label" "最前面でない ($fp0 -> ${fp1}、期待 $pid) $s0..$s1 (試行 $attempt)"
+            invalid "$label" "最前面でない ($fp0 $fn0 -> $fp1 $fn1、期待 $pid) $s0..$s1 (試行 $attempt)"
             attempt=$((attempt + 1)); continue
         fi
         if [ "$grew" -lt $((OBSERVE - 10)) ]; then
             invalid "$label" "観測中に人が触った (hid +${grew}s < ${OBSERVE}s) $s0..$s1 (試行 $attempt)"
             attempt=$((attempt + 1)); continue
         fi
-        if [ "$(locked)" = yes ]; then
-            invalid "$label" "観測中にロック $s0..$s1 (試行 $attempt)"
-            attempt=$((attempt + 1)); continue
-        fi
+        # (ロック判定は観測窓の両端で `fn0`/`fn1` として済ませた。ここでもう一度
+        #  `locked` を呼ぶと、同じ瞬間を二度見るだけで新しいことは分からない)
 
         pct=$(awk -v a="$t0" -v b="$t1" -v s="$OBSERVE" 'BEGIN{printf "%.3f", (b-a)/s*100}')
-        printf '%s\tVALID\t%s\t%s\t%s\t%s\tcpu_pct=%s hid+%ss\n' \
-            "$label" "$rss" "$t0" "$t1" "$pid" "$s0..$s1" "$pct" >>"$OUT"
+        printf '%s\tVALID\t%s\t%s\t%s\t%s\t%s\twindow=%s hid+%ss\n' \
+            "$label" "$pct" "$rss" "$t0" "$t1" "$pid" "$s0..$s1" "$grew" >>"$OUT"
         echo "[$label] cpu=${pct}% rss=${rss}MB $s0..$s1 (試行 $attempt)"
         kill_apps
         return 0
@@ -242,10 +304,18 @@ measure() {
     return 0
 }
 
-: >"$OUT"
-printf '# label\tstatus\trss_mb\tt0\tt1\tpid\tnote\n' >>"$OUT"
-printf '# gate\t人が %s 秒以上触っていない かつ 画面ロックなし のときだけ測る\n' "$HUMAN_AWAY" >>"$OUT"
-printf '# ws\t%s\n' "$WS" >>"$OUT"
+# **測定床を必ず一緒に出す。** `ps -o time` は 1/100 秒までしか持たないので、
+# 観測 $OBSERVE 秒での最小の刻みがそのまま cpu_pct の下限になる。これを書いて
+# おかないと、床に張り付いた値を「実測 0.006%」と読んでしまう (実際に読んだ)。
+floor_pct=$(awk -v s="$OBSERVE" 'BEGIN{printf "%.3f", 0.01/s*100}')
+{
+    printf '# label\tstatus\tcpu_pct\trss_mb\tt0\tt1\tpid\tnote\n'
+    printf '# gate\t人が %s 秒以上触っていない かつ 画面ロックなし のときだけ測る\n' "$HUMAN_AWAY"
+    printf '# floor\tcpu_pct はこの値より下を区別できない: %s%% (ps の分解能 0.01 秒 / 観測 %s 秒)\n' \
+        "$floor_pct" "$OBSERVE"
+    printf '# tutorial\t%s\n' "$TUTORIAL"
+    printf '# ws\t%s\n' "$WS"
+} >"$OUT"
 
 r=1
 while [ "$r" -le "$ROUNDS" ]; do
