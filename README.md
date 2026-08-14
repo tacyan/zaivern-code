@@ -23,6 +23,12 @@ Launch, watch, and steer them from a single native app on macOS, Windows, and Li
   <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code running Claude Code, Codex, Gemini CLI, and other coding agents side by side" />
 </a>
 
+<!-- 出典: docs/conflict-zero.md §3.12 — zaivern-code / 書き手 16 / zai 0.14.0:
+     素の git 26 ファイル・28 ハンク、zaivern あり 0/0・96/96 成立・拒否 0・30 件ずらし -->
+**16 agents writing this repository in parallel** — plain git: **26 conflicted files / 28 hunks**.<br>
+With the lease ledger: **0 / 0**, and all **96 edits landed** — none refused, 30 of them shifted to a free line range.<br>
+[See the measurements →](docs/conflict-zero.md)
+
 If Zaivern Code looks useful to you, a ⭐ **Star** helps its development.
 
 </div>
@@ -33,13 +39,16 @@ Starting several AI coding CLIs is easy. Keeping track of them is not. Every age
 lives in its own terminal tab, asks for approval at its own pace, and edits files
 without knowing what the others are doing.
 
+<!-- 出典: docs/conflict-zero.md §3.3 — 書き手 64 / 重なり 0.5:
+     ベースラインは 57/64 のマージが衝突し 132 ハンク、ガード側は全規模で 0 ハンク -->
+
 | Without a cockpit | With Zaivern Code |
 |---|---|
+| More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines — 0 conflict hunks with 64 agents, where plain git produced 132 |
 | Cycle through tabs to find who needs you | Every agent on one screen, with live status |
 | Paste the same instruction into each tool | Broadcast once to the fleet, or target one agent |
 | Miss an approval prompt and lose the run | Notifications and one-click approval |
 | Stay at your desk while agents work | Check progress and approve from your phone |
-| More parallel agents, more merge conflicts | A shared ledger keeps agents off each other's lines |
 
 Zaivern Code is not an AI model and does not bundle one. It drives the CLIs you have
 already installed and signed in to — one is enough to start.
@@ -97,6 +106,27 @@ the executable and `~/.zaivern`; anything else on your `PATH` is listed, never d
 
 ## Key Features
 
+### Conflict Coordination (the reason this exists)
+
+Agents claim the files — or the individual line ranges — they are about to edit in a
+shared, per-repository ledger, and git hooks refuse a write that would collide.
+
+<!-- 出典: docs/conflict-zero.md §3.8.1 — --layout disjoint / 64 体:
+     B (ファイル単位の所有) 完了 1・拒否 63、Cref (行域) 完了 64・拒否 0・ハンク 0 -->
+Line ranges are what makes this usable at scale. Point 64 agents at a single file and
+a file-level lease lets exactly **1** of them through while refusing the other **63**;
+with line-region ownership all **64** get through, nothing is refused, and the merge
+still produces **0** conflict hunks.
+
+<!-- 出典: docs/conflict-zero.md §3.12.2 — 錨の誤マッチによる二重配布と、その修正 -->
+A region is tracked by an anchor — the contents of its first and last line — rather
+than by a line number, so it survives edits made above it. If re-resolving that anchor
+lands somewhere other than what the ledger recorded, the reading is discarded instead
+of trusted, so a claim never silently migrates to another part of the file.
+
+None of this catches a semantic conflict; the [section below](#conflict-coordination)
+spells out what is covered and what is not.
+
 ### Agent Cockpit
 
 Tile several AI CLIs side by side and see at a glance which one is thinking, editing,
@@ -121,12 +151,6 @@ Check progress, send instructions, approve actions, and edit files from your pho
 The simplest setup works over the same Wi-Fi network, and an SSH tunnel covers the
 case where you are not on it.
 
-### Conflict Coordination
-
-Agents claim the files — or the individual line ranges — they are about to edit in a
-shared ledger, and git hooks refuse a write that would collide. The section below
-spells out what this covers and what it does not.
-
 ### Built-in Editor
 
 Read code and review what your agents changed without leaving the app, including
@@ -136,9 +160,17 @@ difference instead of being silently overwritten.
 
 ## Conflict Coordination
 
-Agents record the files and line ranges they are about to edit in a shared,
-per-repository ledger, and git hooks refuse a write that would collide — so a clash
-surfaces when it happens instead of at merge time.
+A claim in the ledger is not advice: the hook refuses the colliding write at the
+moment it is attempted, so the clash surfaces there instead of at merge time.
+
+<!-- 出典: docs/conflict-zero.md §3.16.6 — dup_lines=0 は常に成立 (内容に依存しない)、
+     conflict_files=0 は条件付き (帯 + 壁 + 昇順。反復的な内容では断ることがある) -->
+Two guarantees hold to different degrees, and mixing them would overstate the case.
+"No two agents are handed the same lines" is a property of the ledger and holds
+regardless of what the files contain. "The merge then goes through in one pass" is
+conditional: it needs a safety band, a unique line between the two regions, and
+ascending order. Repetitive content can break the second while the first still holds,
+and the gate refuses in that case rather than guessing.
 
 What it cannot catch is a semantic conflict: one agent changes a function signature
 while another keeps calling the old one, in a different file, with a perfectly clean
@@ -172,6 +204,47 @@ single agent.
 - MCP environment-variable values are never displayed — only whether they are set.
 - Child processes are stopped when a session is destroyed or the app exits, so no
   orphaned agent keeps running in the background.
+
+## FAQ
+
+**How is this different from tmux with split panes?**
+
+tmux tiles terminals; it has no idea what is running inside them. Zaivern Code reads
+each agent's state, so it can show which one is thinking, editing, or blocked on an
+approval prompt, and turn that prompt into a notification you answer in one click.
+The part tmux has no equivalent for is the shared ledger: two agents cannot
+physically write to the same lines, because a git hook refuses the second write at
+the moment it is attempted rather than leaving it to be found at merge time.
+
+**Does the lease ledger slow things down?**
+
+<!-- 出典: docs/conflict-zero.md §1「意味しないこと」4 (4〜8 体 p50 40〜50ms / 64 体 p50 298.7ms)、
+     §3.3 (busy-deny: 32 体で 4 件・64 体で 14 件、fail-open は全規模 0) -->
+Yes, and it gets worse with scale, because the gate sits on the write path. Measured
+gate latency is p50 40–50 ms at 4–8 agents and p50 298.7 ms at 64. From 32 agents up
+the gate also starts answering `busy-deny` when it cannot decide in time: it refuses
+rather than guessing, and a retry goes through, but you see it as an occasional
+rejection. At one or two agents the gate is not on your critical path.
+
+**What does "zero conflicts" actually mean?**
+
+Something narrower than it sounds, deliberately:
+
+<!-- 出典: docs/conflict-zero.md §3.2 (書き手 8 / 重なり 1.00: 10/48 成立・38 件をゲートが停止)、
+     §3.8.1 (disjoint / 64 体: 素の git のハンクは全規模 0。B は完了 1、Cref は 64)、§3.16.6 -->
+- **Zero is bought by refusing writes.** With eight writers all aiming at the same
+  files, 10 of 48 planned edits were written and the other 38 were stopped at the
+  gate. The conflict count is 0; the throughput is not.
+- **Line ranges that are far enough apart never needed help.** Plain git already
+  merges those at zero conflicts. Line-region ownership is not doing something git
+  cannot — it gives back the parallelism a file-level lease destroys (1 of 64 agents
+  through, versus 64 of 64).
+- **The two guarantees are not equally strong.** "No two agents get the same lines"
+  always holds; "the merge goes through in one pass" is conditional and can fail on
+  repetitive content.
+
+[docs/conflict-zero.md](docs/conflict-zero.md) opens with exactly this boundary and
+carries every measurement behind it, including the claims that were later refuted.
 
 ## Documentation
 
