@@ -184,6 +184,43 @@ $ zai czero verify    # create a real conflict in a throwaway repo and check tha
 Scope, limits, and the measurements behind them are in
 [docs/conflict-zero.md](docs/conflict-zero.md).
 
+## Resource Use
+
+<!-- 出典: docs/idle-cost.md §7 — 2026-08-15、同一マシン・同一セッションで
+     Zed 1.15.0 / zai 0.16.0 / zai 0.17.0 を交互に 3 ラウンド、9/9 VALID。
+     0.16.0 を陽性対照に入れてあるので「測定が生きていること」まで示せる。
+     0.17.0 は測定床に張り付いているので必ず「≤」で書くこと -->
+
+An editor you leave open all day should cost nothing while you are not typing.
+Measured on one machine in a single session, alternating between apps three times
+(macOS 26.5.2, on AC, 180-second observation windows, a neutral 4-file workspace):
+
+| | Zed 1.15.0 | Zaivern Code 0.17.0 |
+|---|---:|---:|
+| Idle CPU (median of 3) | 0.761% of one core | **≤0.006%** — at the measurement floor |
+| Download | 424.6 MB (`.app`) | **28.7 MB** (one binary) |
+| RSS | 162.2 MB | 170.3 MB |
+
+Two things this table is careful about:
+
+- **`≤0.006%` is a floor, not a reading.** `ps` resolves CPU time to 1/100 s, so a
+  180-second window cannot distinguish anything below 0.006%. All three rounds landed
+  on exactly one tick. The honest claim is "at least 127x lower than Zed", not a ratio.
+- **RSS is not a win, and we do not claim one.** Zed is also written in Rust; the two
+  are within 5% of each other, which is noise. The number that differs by an order of
+  magnitude is download size.
+
+The same run measured Zaivern Code **0.16.0** at 8.933% — that is the positive control.
+Without a version that produces a high reading in the same session, a near-zero result
+cannot be told apart from a broken measurement. Idle cost dropped in 0.17.0 because the
+guided tour no longer reserves frames unconditionally, and the two-second housekeeping
+repaint is gone.
+
+Reproduce it with `tools/idle-duel.sh --vs Zed --out /tmp/duel.tsv`. The harness refuses
+to measure when it cannot measure honestly: it verifies the app is frontmost by pid,
+requires the machine to be untouched, and records the evidence in every row. Full method,
+raw numbers, and the traps we hit are in [docs/idle-cost.md](docs/idle-cost.md).
+
 ## Supported Platforms
 
 | Item | Support |
