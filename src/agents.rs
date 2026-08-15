@@ -1799,6 +1799,29 @@ fn is_safe_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// **端末側に履歴を残させる**ための、エージェントごとの環境変数 (カタログ)。
+///
+/// 全画面 TUI — 代替画面へ入ったまま同じ場所へ描き直す形 — の CLI は、
+/// 端末へ 1 行も流さない。実測 (claude 2.1.233 / 起動 8 秒 / 120x40):
+/// `?1049h` 1 回・**改行 0 回**・CUP 7 回。押し出される行が 1 行も無いので、
+/// 端末側がどれだけ頑張っても遡れない (Shell では遡れるのに、という差の正体)。
+/// 公式の env で全画面をやめさせると `?1049h` **0 回**・改行 14 回になり、
+/// Shell と同じスクロールバック・選択・コピーがそのまま効く。
+///
+/// **利用者の意思が勝つ**: プリセット env に同じキーがあれば `merged_env` が
+/// 後から上書きする。`=0` / `=false` で全画面へ戻せることは実機で確認済み。
+const TERMINAL_SCROLLBACK_ENV: &[(&str, &[(&str, &str)])] =
+    &[("claude", &[("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")])];
+
+/// `bin` に対応する履歴用 env を返す。持たない CLI は空。
+fn scrollback_env_for(bin: &str) -> &'static [(&'static str, &'static str)] {
+    TERMINAL_SCROLLBACK_ENV
+        .iter()
+        .find(|(b, _)| *b == bin)
+        .map(|(_, env)| *env)
+        .unwrap_or(&[])
+}
+
 /// 起動時にプロセスへ渡す環境変数を組み立てる。
 ///
 /// goose / aider のように「一括自動承認フラグを持たない」CLI は、環境変数でしか
@@ -1813,8 +1836,13 @@ pub fn merged_env(
     preset_env: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = HashMap::new();
-    if approval == Approval::Auto {
-        if let Some(spec) = spec_for_command(command) {
+    if let Some(spec) = spec_for_command(command) {
+        // 履歴を残させる env は承認モードに関係なく常に入れる
+        // (「遡って読める」は権限とは無関係の、端末としての土台なので)。
+        for (k, v) in scrollback_env_for(spec.bin) {
+            out.insert((*k).to_string(), (*v).to_string());
+        }
+        if approval == Approval::Auto {
             for (k, v) in spec.auto_env {
                 out.insert((*k).to_string(), (*v).to_string());
             }
@@ -4812,10 +4840,68 @@ mod tests {
     #[test]
     fn merged_env_untouched_for_agents_without_auto_env() {
         let empty = HashMap::new();
-        // auto_flag 型の CLI には環境変数を足さない
-        assert!(merged_env("claude", Approval::Auto, &empty).is_empty());
-        // カタログ外のコマンドも同様
+        // auto_flag 型の CLI には**自動承認の**環境変数を足さない
+        // (履歴用 env は別枠で常に入るので、そこだけを許す)。
+        let e = merged_env("claude", Approval::Auto, &empty);
+        let allowed: Vec<&str> = super::scrollback_env_for("claude")
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        for k in e.keys() {
+            assert!(
+                allowed.contains(&k.as_str()),
+                "承認と無関係の env が混ざった: {k}"
+            );
+        }
+        // カタログ外のコマンドには何も足さない
         assert!(merged_env("mycmd --x", Approval::Auto, &empty).is_empty());
+    }
+
+    // ── 履歴用 env (端末側にスクロールバックを残させる) ────────────────
+
+    /// カタログの bin が実在すること。綴りを間違えると**静かに何も起きない**
+    /// (「直したのに遡れない」という形で出る) ので、ここで落とす。
+    #[test]
+    fn 履歴用envのbinはカタログに実在する() {
+        for (bin, env) in super::TERMINAL_SCROLLBACK_ENV {
+            assert!(spec_for_bin(bin).is_some(), "カタログに居ない bin: {bin}");
+            assert!(!env.is_empty(), "空の登録は繋がっている嘘になる: {bin}");
+        }
+    }
+
+    /// 承認モードに関係なく入ること。遡って読めることは権限の話ではない。
+    #[test]
+    fn 履歴用envはどの承認モードでも入る() {
+        let empty = HashMap::new();
+        for (name, mode) in [
+            ("Ask", Approval::Ask),
+            ("Agent", Approval::Agent),
+            ("Auto", Approval::Auto),
+        ] {
+            let e = merged_env("claude --continue", mode, &empty);
+            assert_eq!(
+                e.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN")
+                    .map(String::as_str),
+                Some("1"),
+                "mode={name}"
+            );
+        }
+    }
+
+    /// 利用者が明示した値が勝つこと (`=0` で全画面 TUI へ戻せる)。
+    #[test]
+    fn 履歴用envは利用者の指定に負ける() {
+        let mut preset = HashMap::new();
+        preset.insert(
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".to_string(),
+            "0".to_string(),
+        );
+        let e = merged_env("claude", Approval::Ask, &preset);
+        assert_eq!(
+            e.get("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN")
+                .map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]

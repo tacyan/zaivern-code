@@ -4317,6 +4317,119 @@ mod tests {
         s.kill();
     }
 
+    /// DoD: **履歴用 env が、起動したプロセスの環境まで実際に届く。**
+    ///
+    /// カタログに書いただけでは何も起きない。`merged_env` → `SpawnSpec.env`
+    /// → PTY の子、の**繋がり**をここで見る (claude は要らないので、
+    /// どの環境でも決定的に落ちる)。
+    #[test]
+    #[cfg(unix)]
+    fn 履歴用envは子プロセスの環境まで届く() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let env =
+            crate::agents::merged_env("claude", crate::agents::Approval::Ask, &HashMap::new());
+        assert!(
+            env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "カタログから env が出ていない"
+        );
+        let spec = SpawnSpec {
+            title: "env-e2e".into(),
+            preset_name: "test".into(),
+            icon: "◆".into(),
+            command: "echo GOT=$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".into(),
+            cwd: std::env::temp_dir(),
+            env,
+            log_path: None,
+        };
+        let mut s = Session::spawn(9971, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let t0 = Instant::now();
+        let mut got = false;
+        while t0.elapsed() < Duration::from_secs(20) {
+            if lock_ok(&s.parser).screen().contents().contains("GOT=1") {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        s.kill();
+        assert!(got, "子プロセスの環境に届いていない");
+    }
+
+    /// DoD: **その env で Claude Code が代替画面をやめる** (実バイナリ)。
+    ///
+    /// **対照を先に取る。** env 無しの起動が代替画面へ入らない環境
+    /// (未認証・初回オンボーディング等) では、この検査は何も証明できないので
+    /// `[skip]` して降りる — 「対照が壊れたまま緑」が一番たちが悪い
+    /// (実際に一時 `CLAUDE_CONFIG_DIR` を渡したら、素の claude まで
+    ///  全画面へ入らなくなり、env を `0` に戻しても緑のままだった)。
+    ///
+    /// 利用者の設定は**読むだけ**で、こちらからは何も書かない
+    /// (cwd は一時ディレクトリ、数秒で kill する)。
+    #[test]
+    #[cfg(unix)]
+    fn claude_codeは履歴用envで代替画面をやめる() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        // PTY へ渡る PATH と同じものを見る (`spawn` は `shellenv::user_path`)。
+        let on_path = std::env::split_paths(&crate::shellenv::user_path())
+            .any(|d| d.join("claude").is_file());
+        if !on_path {
+            eprintln!("[skip] claude が PATH に無い");
+            return;
+        }
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "claude-alt");
+
+        // 起動して、代替画面へ入ったか / 入るまで何秒かかったかを見る。
+        let watch = |env: HashMap<String, String>, id: u64, budget: Duration| -> Option<Duration> {
+            let spec = SpawnSpec {
+                title: "claude-alt".into(),
+                preset_name: "test".into(),
+                icon: "◆".into(),
+                command: "claude".into(),
+                cwd: dir.clone(),
+                env,
+                log_path: None,
+            };
+            let mut s =
+                Session::spawn(id, spec, eframe::egui::Context::default()).expect("PTY起動");
+            let t0 = Instant::now();
+            let mut hit = None;
+            while t0.elapsed() < budget {
+                {
+                    let p = lock_ok(&s.parser);
+                    if p.screen().alternate_screen() {
+                        hit = Some(t0.elapsed());
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            s.kill();
+            hit
+        };
+
+        // ① 対照: 素の起動 (env 無し) は代替画面へ入る、が前提。
+        let Some(took) = watch(HashMap::new(), 9972, Duration::from_secs(25)) else {
+            eprintln!("[skip] 対照が代替画面へ入らない (未認証などでこの環境では証明できない)");
+            return;
+        };
+        // ② 本番: カタログの env を通した起動は入らない。
+        let env =
+            crate::agents::merged_env("claude", crate::agents::Approval::Ask, &HashMap::new());
+        // **待ちは対照から導く** (絶対値で決めると、遅いマシンでは嘘の緑、
+        // 速いマシンでは無駄に PTY を握り続けて枯渇させる)。
+        let budget = (took * 4).max(Duration::from_secs(5));
+        assert!(
+            watch(env, 9973, budget).is_none(),
+            "履歴用 env を渡しても代替画面へ入った (対照は {took:?} で入った)"
+        );
+    }
+
     #[test]
     fn unread_lifecycle_via_real_pty() {
         use super::{Session, SpawnSpec};
@@ -4909,8 +5022,11 @@ mod tests {
             (true, false, 0, false, W::Arrows),
             (true, false, 0, true, W::History),
             (true, false, 2, false, W::History),
-            // 通常画面でアプリがマウス報告 (稀: 全画面でないマウス対応アプリ)。
-            (false, true, 0, false, W::Report),
+            // **通常画面でアプリがマウス報告していても履歴が勝つ** (gemini 等)。
+            // 押し出された行が実在するのに遡れない、を作らないため。
+            (false, true, 0, false, W::History),
+            (false, true, 3, false, W::History),
+            (false, true, 0, true, W::History),
         ];
         for (alt, mouse_on, scroll, shift, want) in cases {
             assert_eq!(
@@ -8284,12 +8400,18 @@ pub fn wheel_route(alt: bool, mouse_on: bool, scroll: usize, shift: bool) -> Whe
     if shift || scroll > 0 {
         return WheelRoute::History;
     }
+    // **通常画面は Shell と同じ**: 自分のスクロールバックを動かす。
+    // ここでマウス報告を優先するとエージェントで「ホイールが何も起こさない」に
+    // なる。実測: gemini は `?1006h` を出す (クリックのため) が画面は流れて
+    // いて (20 秒で改行 133 回)、**履歴はこちら側に積まれている**。
+    // 積まれている履歴を見せないのは端末の落ち度なので、通常画面では渡さない。
+    if !alt {
+        return WheelRoute::History;
+    }
     if mouse_on {
         WheelRoute::Report
-    } else if alt {
-        WheelRoute::Arrows
     } else {
-        WheelRoute::History
+        WheelRoute::Arrows
     }
 }
 
