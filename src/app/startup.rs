@@ -276,6 +276,7 @@ impl ZaivernApp {
             qr_tex: None,
             qr_url: String::new(),
             tunnel: tunnel::Tunnel::new(cc.egui_ctx.clone()),
+            ts: crate::tailscale::Probe::default(),
             tunnel_host: cfg.ssh_tunnel_host.clone(),
             tunnel_err: None,
             agent_input_buf: crate::agent_input::AgentInputBuffer::new(),

@@ -89,6 +89,7 @@ mod sound;
 mod spec;
 mod submit;
 mod supervisor;
+mod tailscale;
 mod tasks;
 mod terminal;
 #[cfg(test)]

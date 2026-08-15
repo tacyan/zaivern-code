@@ -465,7 +465,7 @@ impl ZaivernApp {
             ),
             (
                 "🔐".into(),
-                tr("リモート接続 (SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ"),
+                tr("リモート接続 (Tailscale / SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ"),
                 String::new(),
                 Cmd::OpenSshRemote,
             ),

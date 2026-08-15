@@ -515,9 +515,10 @@ impl ZaivernApp {
         }
         let token = old.token.clone();
         let prefer = old.port;
+        let was = old.bind;
         // 先に畳んでポートを解放する (Drop が accept の終了まで待つ)
         drop(old);
-        match remote::RemoteServer::rebind(ctx.clone(), bind, token, prefer) {
+        match remote::RemoteServer::rebind(ctx.clone(), bind, token.clone(), prefer) {
             Ok(s) => {
                 let port = s.port;
                 // CLI (`zai open` など) が見る接続情報も更新する
@@ -531,8 +532,23 @@ impl ZaivernApp {
                 Ok(port)
             }
             Err(e) => {
-                let msg = trf("待ち受けの切り替えに失敗しました: {e}", &[("e", e.clone())]);
-                self.remote_err = Some(e);
+                // **元の待ち受けへ戻す。** 張り替えは失敗しうる (Tailscale が
+                // 落ちた / ポートを横取りされた) のに、失敗したまま None にすると
+                // **スマホリモートも `zai` CLI も 🎤 も、再起動するまで全部死ぬ**。
+                // 切り替えに失敗しただけで、元の経路まで失う理由は無い。
+                let back = remote::RemoteServer::rebind(ctx.clone(), was, token, prefer).ok();
+                let restored = back.is_some();
+                self.remote = back;
+                self.qr_url.clear();
+                let msg = if restored {
+                    trf(
+                        "待ち受けの切り替えに失敗しました: {e} (元の待ち受けに戻しました)",
+                        &[("e", e.clone())],
+                    )
+                } else {
+                    trf("待ち受けの切り替えに失敗しました: {e}", &[("e", e.clone())])
+                };
+                self.remote_err = if restored { None } else { Some(e) };
                 Err(msg)
             }
         }
@@ -614,11 +630,22 @@ impl ZaivernApp {
             .map(|r| r.bind)
             .unwrap_or(remote::Bind::Lan);
         let lan_mode = bind == remote::Bind::Lan;
+        let ts_mode = bind == remote::Bind::Tailscale;
+        // Tailscale の検出。**この画面が描かれている間だけ**測る
+        // (スレッドもタイマーも持たない — 設計原則 3)。
+        let ts = self.ts.get();
+        let mut ts_on = false;
+        let mut ts_off = false;
 
         // Windows の受信許可。ここが無いと「QR は読めるのにスマホからだけ
         // 何も起きない」になるので、繋がる前提として真っ先に見せる
         self.fw.ensure_checked();
-        let fw_check = firewall::applicable() && lan_mode;
+        // SSH トンネル (127.0.0.1) のときだけ隠す。**Tailscale では隠さない** —
+        // 受信は tailnet のインタフェース越しに来るので、Windows の受信許可は
+        // 同じように効く。ここを隠すと「QR は読めるのにスマホからだけ何も
+        // 起きない」の原因が画面から消える。規則は「この実行ファイル +
+        // TCP 8899-8919」でインタフェースを問わないので、そのまま直せる。
+        let fw_check = firewall::applicable() && (lan_mode || ts_mode);
         let fw_busy = self.fw.busy();
         let fw_report = self.fw.report().cloned();
         let fw_error = self.fw.error.clone();
@@ -652,14 +679,25 @@ impl ZaivernApp {
             .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_width(340.0);
+                // **ここに `ScrollArea` を置かない** (一度入れて撤回した)。
+                // 中央に固定した窓の中では、`ScrollArea` が使える高さを
+                // 「窓の中の残り」= 実質画面の半分と読むので、`max_height` に
+                // いくら大きな値を渡しても効かず、**窓が半分に畳まれる**。
+                // 実測 (2026-08-16 / アプリ窓 1920×1050 · ui_zoom 1.0):
+                // 上限 954px を渡しても中身は 470px で頭打ちになり、
+                // Tailscale と SSH の段がスクロールの下へ隠れた。
                 match (&url_full, &err) {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                RichText::new(tr(if lan_mode {
-                                    "同じ Wi-Fi のスマホで QR を読み取るだけで接続"
-                                } else {
-                                    "SSH トンネル経由 — 外出先のスマホで QR を読み取って接続"
+                                RichText::new(tr(match bind {
+                                    remote::Bind::Lan => {
+                                        "同じ Wi-Fi のスマホで QR を読み取るだけで接続"
+                                    }
+                                    remote::Bind::Tailscale => tailscale::HEADLINE,
+                                    remote::Bind::Loopback => {
+                                        "SSH トンネル経由 — 外出先のスマホで QR を読み取って接続"
+                                    }
                                 }))
                                 .color(theme.text),
                             );
@@ -878,16 +916,21 @@ impl ZaivernApp {
                             // ルータのクライアント分離)、1 件でもあれば届いてはいる、と
                             // 切り分けられる。「真っ白で、繋がっているのかも分からない」を
                             // PC 側から潰すための表示。
-                            if let Some(re) = reach.as_ref().filter(|_| lan_mode) {
+                            if let Some(re) = reach.as_ref().filter(|_| lan_mode || ts_mode) {
                                 ui.add_space(6.0);
                                 if re.hits == 0 {
+                                    // 届いていない理由は経路ごとに違う。LAN の
+                                    // 文面を Tailscale で出すと、直しようのない
+                                    // ところ (ファイアウォール) を疑わせてしまう。
                                     ui.label(
-                                        RichText::new(tr(
+                                        RichText::new(tr(if ts_mode {
+                                            tailscale::NO_REACH
+                                        } else {
                                             "📶 まだスマホからの接続はありません\n\u{3000}\
                                              スマホが真っ白なままなら、通信が PC まで届いていません\n\u{3000}\
                                              (ファイアウォール / スマホが同じ Wi-Fi でない / \
-                                             ルータのプライバシーセパレータ)",
-                                        ))
+                                             ルータのプライバシーセパレータ)"
+                                        }))
                                         .size(11.0)
                                         .color(theme.text_dim),
                                     );
@@ -939,6 +982,78 @@ impl ZaivernApp {
                             );
                             ui.add_space(6.0);
                             ui.separator();
+
+                            // ── Tailscale VPN ───────────────────────────
+                            // 踏み台も同じ Wi-Fi も要らない 3 本目の経路。
+                            // **入れていない人には 1 行も出さない** — 押せない
+                            // ボタンと直せない警告を並べても場所を食うだけ。
+                            // (繋がっていれば必ず検出できるので、使える人には出る)
+                            if ts.stage != tailscale::Stage::Missing || ts_mode {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(tr("🔒 Tailscale VPN"))
+                                            .strong()
+                                            .color(theme.text),
+                                    );
+                                    ui.label(
+                                        RichText::new(tr("(同じ Wi-Fi でなくても繋ぐ)"))
+                                            .size(10.5)
+                                            .color(theme.text_dim),
+                                    );
+                                });
+                                ui.add_space(3.0);
+                                let ts_col = match ts.stage {
+                                    tailscale::Stage::Up => theme.ok,
+                                    tailscale::Stage::Down => theme.warn,
+                                    tailscale::Stage::Missing => theme.err,
+                                };
+                                // 段は必ず出す (「繋がりません」だけでは、
+                                // 入っていないのか止まっているのか分からない)
+                                let ts_txt = match ts.ip {
+                                    Some(ip) => trf(
+                                        "● {stage} ({ip})",
+                                        &[
+                                            ("stage", tr(ts.stage.label())),
+                                            ("ip", ip.to_string()),
+                                        ],
+                                    ),
+                                    None => trf("● {stage}", &[("stage", tr(ts.stage.label()))]),
+                                };
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(ts_txt).size(11.5).color(ts_col));
+                                });
+                                ui.label(
+                                    RichText::new(tr(ts.stage.hint()))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                                ui.add_space(3.0);
+                                if ts_mode {
+                                    if ui
+                                        .button(tr("📶 同じ Wi-Fi に戻す"))
+                                        .on_hover_text(tr(tailscale::BACK_HINT))
+                                        .clicked()
+                                    {
+                                        ts_off = true;
+                                    }
+                                    ui.label(
+                                        RichText::new(tr(tailscale::ONLY_TAILNET_NOTE))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                    );
+                                } else if ui
+                                    .add_enabled(
+                                        ts.ready(),
+                                        egui::Button::new(tr("🔒 Tailscale で待ち受ける")),
+                                    )
+                                    .on_hover_text(tr(tailscale::SWITCH_HINT))
+                                    .clicked()
+                                {
+                                    ts_on = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.separator();
+                            }
 
                             // ── SSH リモート接続 ────────────────────────
                             // 同じ Wi-Fi にいないスマホは、ユーザーが既に SSH で
@@ -1106,6 +1221,36 @@ impl ZaivernApp {
 
         self.remote_open = open;
         self.tunnel_host = tunnel_host;
+        // ── Tailscale の待ち受け切り替え ──
+        if ts_on || ts_off {
+            // 経路は 1 本に決める。SSH トンネルを張ったまま Tailscale へ
+            // 切り替えると、QR に出るのは踏み台の URL のまま (url_full が
+            // トンネルを優先する) で、**押しても何も変わらないように見える**。
+            if ts_on {
+                self.tunnel.disconnect();
+            }
+            let want = if ts_on {
+                remote::Bind::Tailscale
+            } else {
+                remote::Bind::Lan
+            };
+            match self.rebind_remote(ctx, want) {
+                Ok(_) => {
+                    self.tunnel_err = None;
+                    self.toast(
+                        tr(if ts_on {
+                            "Tailscale の IP で待ち受けています"
+                        } else {
+                            "同じ Wi-Fi から繋げるように戻しました"
+                        }),
+                        true,
+                    );
+                }
+                Err(e) => self.tunnel_err = Some(e),
+            }
+            // 切り替えた直後の状態はもう古い (tailnet が落ちていたかもしれない)
+            self.ts.invalidate();
+        }
         // ── SSH トンネルの操作 ──
         if tunnel_connect {
             match tunnel::parse_target(&self.tunnel_host) {

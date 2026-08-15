@@ -1,0 +1,36 @@
+# Tailscale VPN 経由のスマホ接続 (tailscale.rs / remote.rs / app/remote_api.rs)
+
+# ── 見出し ──
+"🔒 Tailscale VPN" = "🔒 Tailscale VPN"
+"Tailscale 経由 — 同じ tailnet のスマホで QR を読み取って接続" = "Over Tailscale — scan the QR from any phone on the same tailnet"
+
+# ── 段 (tailscale::Stage) ──
+"Tailscale が見つかりません" = "Tailscale not found"
+"Tailscale が tailnet に繋がっていません" = "Tailscale is not connected to your tailnet"
+"Tailscale に繋がっています" = "Connected to Tailscale"
+"● {stage} ({ip})" = "● {stage} ({ip})"
+
+# ── 次にすること (tailscale::Stage::hint) ──
+"Tailscale アプリを開いてログイン (または「接続」) してください" = "Open the Tailscale app and sign in (or hit Connect)"
+"スマホも同じ tailnet に入れておけば、Wi-Fi が違っても繋がります" = "Add your phone to the same tailnet and it connects from any network"
+"App Store か tailscale.com から Tailscale を入れてサインインしてください" = "Install Tailscale from the App Store or tailscale.com, then sign in"
+"tailscale.com からインストーラを入れてサインインしてください" = "Get the installer from tailscale.com, then sign in"
+"curl -fsSL https://tailscale.com/install.sh | sh でインストールできます" = "Install it with: curl -fsSL https://tailscale.com/install.sh | sh"
+
+# ── 待ち受け先 (remote::Bind::Tailscale) ──
+"Tailscale の IP のみ (同じ tailnet から)" = "Tailscale IP only (from the same tailnet)"
+
+# ── 切り替え ──
+"🔒 Tailscale で待ち受ける" = "🔒 Listen on Tailscale"
+"tailnet の IP と 127.0.0.1 だけで待ち受け直します。\n喫茶店や空港の Wi-Fi に居ても、その LAN からは\nポートが見えません (経路も鍵も Tailscale が持ちます)" = "Rebinds to your tailnet IP and 127.0.0.1 only.\nOn café or airport Wi-Fi the port stays invisible to that LAN\n(Tailscale owns the route and the keys)."
+"📶 同じ Wi-Fi に戻す" = "📶 Back to the same Wi-Fi"
+"0.0.0.0 で待ち受け直します\n(同じ Wi-Fi のスマホから直接繋がるようになります)" = "Rebinds to 0.0.0.0\n(phones on the same Wi-Fi can connect directly again)"
+"※ いまは tailnet と PC 自身からだけ届きます。\n　同じ Wi-Fi でも Tailscale に入っていないスマホからは繋がりません" = "※ Only your tailnet and this PC can reach it right now.\n　A phone on the same Wi-Fi but outside Tailscale cannot connect."
+"Tailscale の IP で待ち受けています" = "Listening on your Tailscale IP"
+"同じ Wi-Fi から繋げるように戻しました" = "Back to accepting connections from the same Wi-Fi"
+
+# ── 届いているか ──
+"📶 まだスマホからの接続はありません\n　スマホ側でも Tailscale を繋いで、同じ tailnet に\n　入れてください (ACL で塞いでいないかも確認)" = "📶 No connection from a phone yet\n　Connect Tailscale on the phone too, on the same tailnet\n　(also check your ACLs are not blocking it)"
+
+# ── 張り替えの失敗 ──
+"待ち受けの切り替えに失敗しました: {e} (元の待ち受けに戻しました)" = "Could not switch where we listen: {e} (restored the previous one)"

@@ -686,10 +686,11 @@ impl ZaivernApp {
         // (📱 を開かないと理由が分からない、という状態を作らないため)
         // SSH トンネル中は 127.0.0.1 でしか待ち受けないので、受信許可は無関係。
         // それでも ⚠ を出すと「直せない警告」を突きつけることになる。
+        // Tailscale は tailnet のインタフェース越しに受信するので**関係する**。
         let lan_mode = self
             .remote
             .as_ref()
-            .map(|r| r.bind == remote::Bind::Lan)
+            .map(|r| r.bind != remote::Bind::Loopback)
             .unwrap_or(true);
         let blocked = lan_mode && self.fw.needs_allow();
         let mut icon = RichText::new(if blocked { "📱⚠" } else { "📱" });
