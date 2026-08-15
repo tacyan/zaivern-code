@@ -238,7 +238,26 @@ pub struct RemoteServer {
     /// accept ループの停止指示 (`Drop` で立てる)
     stop: Arc<AtomicBool>,
     accept: Vec<std::thread::JoinHandle<()>>,
+    /// accept ループが 1 本終わるごとに 1 つ届く合図。
+    /// **`Drop` が「本当に起きたか」を確かめるために要る** — 起こし用の接続は
+    /// 別プロセスに横取りされることがある ([`RemoteServer::drop`])。
+    done: mpsc::Receiver<()>,
 }
+
+/// スレッドがどの経路で終わっても 1 度だけ合図を送る見張り。
+struct DoneSignal(mpsc::Sender<()>);
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// `Drop` が accept を起こすのに使ってよい時間。
+///
+/// **超えたら join せずに手放す。** 待ち続けるとアプリの終了が固まるが、
+/// 手放して困るのはポートが 1 つ塞がったままになることだけである。
+const WAKE_BUDGET: Duration = Duration::from_secs(2);
 
 /// 待ち受けに使うポートの範囲 (両端を含む)。
 ///
@@ -358,15 +377,19 @@ impl RemoteServer {
         // (1 スレッドで多重化するには非同期 I/O か select が要る。ここは
         //  多くても 2 本なので、素直にスレッドを分けるほうが読める)
         let mut accept: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(listeners.len());
+        let (done_tx, done) = mpsc::channel::<()>();
         for listener in listeners {
             let tx = tx.clone();
             let ctx = ctx.clone();
             let tok = token.clone();
             let reach_srv = Arc::clone(&reach);
             let stop_srv = Arc::clone(&stop);
+            let signal = DoneSignal(done_tx.clone());
             let h = std::thread::Builder::new()
                 .name("zv-remote-accept".into())
                 .spawn(move || {
+                    // どの経路で抜けても `Drop` へ「終わった」と伝える
+                    let _signal = signal;
                     for stream in listener.incoming() {
                         // 停止指示は accept を抜けた直後に見る。`Drop` が自分自身へ
                         // 1 本繋いで起こすので、ここが最初に踏まれる。
@@ -417,6 +440,7 @@ impl RemoteServer {
             reach,
             stop,
             accept,
+            done,
         })
     }
 
@@ -441,18 +465,49 @@ impl Drop for RemoteServer {
     /// ポート番号がずれ、トンネルの転送先と食い違う。
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // **1 本の accept を起こせるのは 1 接続だけ**。待ち受けているアドレス
-        // ごとに 1 本ずつ繋ぐ (Tailscale モードは loopback + tailnet の 2 本)。
-        // ここを 1 本で済ませると、起こされなかったスレッドが次の接続まで
-        // 眠り続け、join が返らず**アプリの終了が固まる**。
-        for a in &self.addrs {
-            if let Ok(s) = TcpStream::connect_timeout(&wake_addr(*a), Duration::from_millis(500)) {
-                let _ = s.shutdown(std::net::Shutdown::Both);
+        let n = self.accept.len();
+        let deadline = Instant::now() + WAKE_BUDGET;
+        let mut woken = 0usize;
+        while woken < n && Instant::now() < deadline {
+            // **1 本の accept を起こせるのは 1 接続だけ**。待ち受けている
+            // アドレスごとに 1 本ずつ繋ぐ (Tailscale モードは loopback と
+            // tailnet の 2 本)。
+            for a in &self.addrs {
+                if let Ok(s) =
+                    TcpStream::connect_timeout(&wake_addr(*a), Duration::from_millis(300))
+                {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            // **繋いだ = 起きた、ではない。** unix は `SO_REUSEADDR` で
+            // `0.0.0.0:P` と `127.0.0.1:P` が同居でき、接続はより具体的な
+            // `127.0.0.1` 側へ行く。別インスタンスが同じ番号の loopback を
+            // 握っていると、こちらの起こし用接続は**そちらに攫われる**。
+            // 実際に CI で踏んだ (テストが 60 秒で打ち切られた)。
+            while woken < n {
+                match self.done.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => woken += 1,
+                    Err(_) => break,
+                }
             }
         }
-        for h in self.accept.drain(..) {
-            let _ = h.join();
+        if woken == n {
+            for h in self.accept.drain(..) {
+                let _ = h.join();
+            }
+            return;
         }
+        // 起こせなかった。**join すると終了が固まる**ので待たずに手放す。
+        // 手放したスレッドはリスナを握ったままなので、この番号は
+        // プロセスが終わるまで空かない (張り直しは次の番号へ落ちる)。
+        eprintln!(
+            "📱 スマホリモート: 待ち受け {}/{} 本を起こせませんでした \
+             (同じポートの 127.0.0.1 を別プロセスが握っている可能性)。\
+             待たずに手放します",
+            n - woken,
+            n
+        );
+        self.accept.clear();
     }
 }
 
@@ -1713,7 +1768,17 @@ mod tests {
         }
         let ctx = egui::Context::default();
         let ips: Vec<IpAddr> = vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), IpAddr::V6(v6)];
-        let srv = RemoteServer::start_on(ctx, Bind::Tailscale, &ips, None, None)
+        // **8899-8919 を他のテストと取り合わない。** unix は SO_REUSEADDR で
+        // `0.0.0.0:P` と `127.0.0.1:P` が同居でき、接続はより具体的な
+        // `127.0.0.1` 側へ行く。ここが同じ番号の loopback を握ると、
+        // 並列に走っている `張り直しても…` (0.0.0.0) の**起こし用接続を
+        // 攫って**しまう (CI の macOS で実際に 60 秒打ち切りになった)。
+        // 空き番号は OS に選ばせる。
+        let free = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("空きポートを 1 つ借りられる");
+        let want = free.local_addr().expect("番号が取れる").port();
+        drop(free);
+        let srv = RemoteServer::start_on(ctx, Bind::Tailscale, &ips, None, Some(want))
             .expect("2 本で待ち受けられる");
         assert_eq!(srv.addrs.len(), 2, "2 本とも掴んでいること");
         let port = srv.port;
@@ -1758,6 +1823,56 @@ mod tests {
         assert_eq!(lo.bind, Bind::Loopback);
         // URL は待ち受けと必ず一致させる (繋がらない URL を QR にしない)
         assert_eq!(lo.url, format!("http://127.0.0.1:{}/", lo.port));
+    }
+
+    /// **起こし用の接続を別の待ち受けに攫われても、終了で固まらないこと。**
+    ///
+    /// unix は `SO_REUSEADDR` で `0.0.0.0:P` と `127.0.0.1:P` が同居でき、
+    /// 接続はより具体的な `127.0.0.1` 側へ行く。Zaivern を 2 つ起動して
+    /// 片方が SSH モード (127.0.0.1) だと、もう片方 (0.0.0.0) の `Drop` は
+    /// **自分の accept を永久に起こせない**。以前はそこで join し続けて
+    /// いたので、アプリの終了がそのまま固まった。
+    #[test]
+    fn 起こす接続を横取りされても終了で固まらない() {
+        let ctx = egui::Context::default();
+        let any: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let srv = RemoteServer::start_on(ctx, Bind::Lan, &[any], None, None)
+            .expect("0.0.0.0 で待ち受けられる");
+        let port = srv.port;
+        // 後から同じ番号の loopback を横から握る (= 別インスタンスの SSH モード)
+        let Ok(thief) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) else {
+            // Windows は同居できない = この事故自体が起こらない
+            eprintln!("[skip] 127.0.0.1:{port} を同居させられないので飛ばす");
+            return;
+        };
+        // 攫った接続は握りつぶす (起こしの合図を通さない)
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let t = std::thread::spawn(move || {
+            for c in thief.incoming() {
+                if s2.load(Ordering::SeqCst) {
+                    return;
+                }
+                drop(c);
+            }
+        });
+
+        let t0 = Instant::now();
+        drop(srv);
+        let took = t0.elapsed();
+        // 予算は 2 秒 (`WAKE_BUDGET`)。ここは速さではなく
+        // **返ってくること**の検査なので、余裕を持って倍以上で見る
+        assert!(
+            took < WAKE_BUDGET * 5,
+            "終了に {took:?} 掛かった (固まっている)"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            Duration::from_millis(500),
+        );
+        let _ = t.join();
     }
 
     /// **実測**: いまのこのマシンで `Bind::Tailscale` を起動してみる。
