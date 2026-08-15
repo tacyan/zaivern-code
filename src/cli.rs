@@ -3452,6 +3452,43 @@ prunable gitdir file points to non-existent location
 
     // ── update: 配布元の URL は install.sh / install.ps1 が単一の真実 ──
 
+    // ── 検証スクリプトは「読める形」で結果を言う ────────────────────
+
+    /// 検証コマンドの結果を**終了コードだけ**に持たせない。
+    ///
+    /// `tools/verify.sh … | tail` のようにパイプを挟むと `$?` は tail のものに
+    /// なるので、**中止したのに rc=0** に見える (実際にこれで「docker が
+    /// 起動していないのに緑」と読み違えた)。どの経路で終わっても最後の 1 行に
+    /// 判定を書くこと。`exec` で置き換えると EXIT の trap が発火しないので、
+    /// そこも併せて禁じる。
+    #[test]
+    fn 検証スクリプトは終了時に判定行を出す() {
+        for (name, src) in [
+            ("tools/verify.sh", include_str!("../tools/verify.sh")),
+            (
+                "tools/linux-test.sh",
+                include_str!("../tools/linux-test.sh"),
+            ),
+            (
+                "tools/windows-check.sh",
+                include_str!("../tools/windows-check.sh"),
+            ),
+        ] {
+            // Windows のチェックアウトは CRLF なので正規化してから探す。
+            let sh = src.replace("\r\n", "\n");
+            // コメントアウトを緑にしないため、**行そのもの**で照合する。
+            assert!(
+                sh.lines().any(|l| l.trim() == "trap _verdict EXIT"),
+                "{name}: 終了時の判定行が無い (パイプ越しに嘘の緑が出る)"
+            );
+            assert!(sh.contains("_LABEL="), "{name}: 判定行のラベルが無い");
+            assert!(
+                !sh.contains("\nexec docker ") && !sh.contains("\nexec cargo "),
+                "{name}: exec でプロセスを置き換えると判定行が出ない"
+            );
+        }
+    }
+
     // ── 供給網: インストーラは「展開する前に」SHA-256 を突き合わせる ──
 
     /// release.yml が checksums.txt を作っていても、**インストーラが見ていなければ
