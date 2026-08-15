@@ -1,7 +1,7 @@
 # SSH リモート接続 (tunnel.rs / remote.rs / app.rs のリモートウィンドウ)
 
 # ── 入口 (コマンドパレット / 見出し) ──
-"リモート接続 (SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ" = "Remote access (SSH) — reach your phone even off your Wi-Fi"
+"リモート接続 (Tailscale / SSH) — 同じ Wi-Fi でなくてもスマホから繋ぐ" = "Remote access (Tailscale / SSH) — reach your phone even off your Wi-Fi"
 "🔐 SSH リモート接続" = "🔐 SSH remote access"
 "(同じ Wi-Fi でなくても繋ぐ)" = "(works away from your Wi-Fi)"
 "SSH トンネル経由 — 外出先のスマホで QR を読み取って接続" = "Over an SSH tunnel — scan the QR from anywhere to connect"

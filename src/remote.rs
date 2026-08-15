@@ -12,14 +12,14 @@
 
 use std::hash::Hasher;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-/// 待ち受け先。**LAN と SSH トンネルの違いはここだけ**
+/// 待ち受け先。**LAN / Tailscale / SSH トンネルの違いはここだけ**
 /// (設計原則 5: ハンドラは 1 面、トランスポートは多数)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bind {
@@ -30,23 +30,79 @@ pub enum Bind {
     /// トンネルを張ったまま `0.0.0.0` で待ち受けていると、**SSH を迂回して
     /// 平文で直接叩けてしまう** — トンネルを張る意味が消えるので必ず絞る。
     Loopback,
+    /// Tailscale の tailnet からだけ繋ぐ (`100.64.0.0/10` の自分の IP)。
+    ///
+    /// `0.0.0.0` にしない理由は [`Bind::Loopback`] と同じで、**繋ぐ相手を
+    /// tailnet に限る**ため。喫茶店や空港の Wi-Fi に居ても、その LAN からは
+    /// ポートが見えない (経路も鍵も Tailscale が持つ)。
+    Tailscale,
 }
 
 impl Bind {
-    /// 実際に bind する IP。
-    pub fn ip(&self) -> &'static str {
+    /// 実際に bind する IP の**集合**。
+    ///
+    /// **どのモードでも `127.0.0.1` に届くこと**が不変条件である。
+    /// `zai` CLI は `127.0.0.1:<port>` へ繋ぎ ([`crate::cli`])、PC 側の
+    /// ブラウザ音声ページも `http://127.0.0.1:<port>/voice` を開く。
+    /// ここから loopback を落とすと「スマホからは繋がるのに PC の CLI と
+    /// 🎤 だけが死ぬ」という、気付くまでに時間の掛かる壊れ方をする
+    /// (`0.0.0.0` は loopback を含むので Lan は 1 本で足りる)。
+    ///
+    /// Tailscale だけは検出結果 (`ts`) が要る。純関数にしてあるのは、
+    /// この不変条件を表で固定するため。
+    pub fn listen_ips(&self, ts: Option<IpAddr>) -> Result<Vec<IpAddr>, String> {
         match self {
-            Bind::Lan => "0.0.0.0",
-            Bind::Loopback => "127.0.0.1",
+            Bind::Lan => Ok(vec![IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)]),
+            Bind::Loopback => Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
+            Bind::Tailscale => {
+                let ip = ts.ok_or_else(|| {
+                    "Tailscale の IP が見つかりません (tailnet に繋がっていません)".to_string()
+                })?;
+                // tailnet 以外を渡されたら断る。ここを通すと「Tailscale モードの
+                // つもりで LAN の IP に晒す」という、いちばん危ない取り違えが
+                // 黙って成立してしまう (検出側が CGNAT の LAN を掴んだ場合など)。
+                if !crate::tailscale::is_tailnet(ip) {
+                    return Err(format!(
+                        "{ip} は tailnet (100.64.0.0/10 / fd7a:115c:a1e0::/48) のアドレスではありません"
+                    ));
+                }
+                Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), ip])
+            }
         }
     }
 
     /// UI に出す 1 行 (呼び出し側で `tr()` を通すこと)。
+    ///
+    /// Tailscale の行に IP を書かないのは、`&'static str` = 辞書キーだから。
+    /// 実際の IP は URL 欄と QR に出る。
     pub fn label(&self) -> &'static str {
         match self {
             Bind::Lan => "0.0.0.0 (同じ Wi-Fi から直接)",
             Bind::Loopback => "127.0.0.1 (SSH トンネル経由のみ)",
+            Bind::Tailscale => "Tailscale の IP のみ (同じ tailnet から)",
         }
+    }
+}
+
+/// URL の host 部に置ける形にする (IPv6 リテラルは RFC 3986 の角括弧で包む)。
+fn url_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// 待ち受けている accept ループを**外から起こす**ための宛先。
+///
+/// `0.0.0.0` / `::` へは繋げない (Windows では明確なエラー、unix でも
+/// 実装依存) ので、ワイルドカードのときは同じポートの loopback へ読み替える。
+fn wake_addr(a: SocketAddr) -> SocketAddr {
+    if !a.ip().is_unspecified() {
+        return a;
+    }
+    match a.ip() {
+        IpAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, a.port())),
+        IpAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, a.port())),
     }
 }
 
@@ -174,12 +230,34 @@ pub struct RemoteServer {
     pub url: String,
     /// いまどこで待ち受けているか (UI に必ず出す)
     pub bind: Bind,
+    /// 実際に待ち受けているアドレス (`Drop` が 1 本ずつ起こすので必要)。
+    /// Tailscale モードでは loopback と tailnet の 2 本になる。
+    pub addrs: Vec<SocketAddr>,
     rx: mpsc::Receiver<Request>,
     reach: Arc<Mutex<Reach>>,
     /// accept ループの停止指示 (`Drop` で立てる)
     stop: Arc<AtomicBool>,
-    accept: Option<std::thread::JoinHandle<()>>,
+    accept: Vec<std::thread::JoinHandle<()>>,
+    /// accept ループが 1 本終わるごとに 1 つ届く合図。
+    /// **`Drop` が「本当に起きたか」を確かめるために要る** — 起こし用の接続は
+    /// 別プロセスに横取りされることがある ([`RemoteServer::drop`])。
+    done: mpsc::Receiver<()>,
 }
+
+/// スレッドがどの経路で終わっても 1 度だけ合図を送る見張り。
+struct DoneSignal(mpsc::Sender<()>);
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// `Drop` が accept を起こすのに使ってよい時間。
+///
+/// **超えたら join せずに手放す。** 待ち続けるとアプリの終了が固まるが、
+/// 手放して困るのはポートが 1 つ塞がったままになることだけである。
+const WAKE_BUDGET: Duration = Duration::from_secs(2);
 
 /// 待ち受けに使うポートの範囲 (両端を含む)。
 ///
@@ -216,20 +294,65 @@ impl RemoteServer {
         keep_token: Option<String>,
         prefer_port: Option<u16>,
     ) -> Result<Self, String> {
-        let mut listener = None;
+        // **待ち受ける直前に**引き直す。UI に出ている検出結果は最大 2 秒前の
+        // もので、その間に Tailscale が落ちていれば bind は必ず失敗する。
+        let ts = match bind {
+            Bind::Tailscale => crate::tailscale::listen_ip(),
+            _ => None,
+        };
+        let ips = bind.listen_ips(ts)?;
+        Self::start_on(ctx, bind, &ips, keep_token, prefer_port)
+    }
+
+    /// 待ち受けるアドレスを明示して起動する (`Bind` の解決は済んでいる)。
+    fn start_on(
+        ctx: egui::Context,
+        bind: Bind,
+        ips: &[IpAddr],
+        keep_token: Option<String>,
+        prefer_port: Option<u16>,
+    ) -> Result<Self, String> {
+        let mut listeners: Vec<TcpListener> = Vec::new();
         let mut port = 0u16;
+        let mut last_err: Option<String> = None;
         // 張り直しでは元のポートを最優先で試す。unix では SO_REUSEADDR が
         // 効くため `0.0.0.0:P` と `127.0.0.1:P` が同居できてしまい、素直に
         // 先頭から走査すると**別インスタンスのポート**を掴むことがある。
+        //
+        // 複数アドレスのときは **1 つでも取れなければその番号ごと捨てる** —
+        // ポートが 2 つに割れると、URL に書ける番号が 1 つに決まらない。
         for p in prefer_port.into_iter().chain(PORT_FROM..=PORT_TO) {
-            if let Ok(l) = TcpListener::bind((bind.ip(), p)) {
-                listener = Some(l);
+            let mut got: Vec<TcpListener> = Vec::with_capacity(ips.len());
+            let mut ok = true;
+            for ip in ips {
+                match TcpListener::bind((*ip, p)) {
+                    Ok(l) => got.push(l),
+                    Err(e) => {
+                        last_err = Some(format!("{ip}:{p} — {e}"));
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                listeners = got;
                 port = p;
                 break;
             }
+            // 取れた分はここで閉じる (次の番号へ持ち越さない)
         }
-        let listener =
-            listener.ok_or_else(|| format!("空きポートがありません ({PORT_FROM}-{PORT_TO})"))?;
+        if listeners.is_empty() {
+            // 「空きポートが無い」で片付けない — Tailscale の IP が消えている
+            // ような、ポートとは無関係の理由もここへ来る。最後の理由を必ず出す。
+            let why = last_err.unwrap_or_else(|| "理由不明".to_string());
+            return Err(format!(
+                "待ち受けを開始できません ({PORT_FROM}-{PORT_TO}): {why}"
+            ));
+        }
+        let addrs: Vec<SocketAddr> = listeners
+            .iter()
+            .filter_map(|l| l.local_addr().ok())
+            .collect();
 
         let token = keep_token.unwrap_or_else(gen_token);
         // 待ち受けが loopback だけのときに LAN の IP を出すと、
@@ -237,60 +360,87 @@ impl RemoteServer {
         let host = match bind {
             Bind::Lan => lan_ip(),
             Bind::Loopback => "127.0.0.1".to_string(),
+            // loopback 以外 = tailnet 側。スマホが読むのはこちら
+            Bind::Tailscale => addrs
+                .iter()
+                .map(|a| a.ip())
+                .find(|ip| !ip.is_loopback())
+                .map(url_host)
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
         };
         let url = format!("http://{host}:{port}/");
         let (tx, rx) = mpsc::channel::<Request>();
         let reach = Arc::new(Mutex::new(Reach::default()));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let tok = token.clone();
-        let reach_srv = Arc::clone(&reach);
-        let stop_srv = Arc::clone(&stop);
-        let accept = std::thread::Builder::new()
-            .name("zv-remote-accept".into())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    // 停止指示は accept を抜けた直後に見る。`Drop` が自分自身へ
-                    // 1 本繋いで起こすので、ここが最初に踏まれる。
-                    if stop_srv.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let Ok(stream) = stream else {
-                        // fd 枯渇などで accept が失敗し続けると待機なしの
-                        // ビジーループになるため、少し休んでから再試行する
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    };
-                    // 「スマホから届いたか」はここでしか分からない。
-                    if let Ok(peer) = stream.peer_addr() {
-                        if counts_as_remote(&peer) {
-                            if let Ok(mut r) = reach_srv.lock() {
-                                r.hits += 1;
-                                r.last_ip = Some(peer.ip().to_string());
-                                r.last_at = Some(Instant::now());
+        // 待ち受けるアドレスごとに 1 本ずつ accept ループを持つ。
+        // (1 スレッドで多重化するには非同期 I/O か select が要る。ここは
+        //  多くても 2 本なので、素直にスレッドを分けるほうが読める)
+        let mut accept: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(listeners.len());
+        let (done_tx, done) = mpsc::channel::<()>();
+        for listener in listeners {
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            let tok = token.clone();
+            let reach_srv = Arc::clone(&reach);
+            let stop_srv = Arc::clone(&stop);
+            let signal = DoneSignal(done_tx.clone());
+            let h = std::thread::Builder::new()
+                .name("zv-remote-accept".into())
+                .spawn(move || {
+                    // どの経路で抜けても `Drop` へ「終わった」と伝える
+                    let _signal = signal;
+                    for stream in listener.incoming() {
+                        // 停止指示は accept を抜けた直後に見る。`Drop` が自分自身へ
+                        // 1 本繋いで起こすので、ここが最初に踏まれる。
+                        if stop_srv.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let Ok(stream) = stream else {
+                            // fd 枯渇などで accept が失敗し続けると待機なしの
+                            // ビジーループになるため、少し休んでから再試行する
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        };
+                        // 「スマホから届いたか」はここでしか分からない。
+                        if let Ok(peer) = stream.peer_addr() {
+                            if counts_as_remote(&peer) {
+                                if let Ok(mut r) = reach_srv.lock() {
+                                    r.hits += 1;
+                                    r.last_ip = Some(peer.ip().to_string());
+                                    r.last_at = Some(Instant::now());
+                                }
                             }
                         }
+                        let tx = tx.clone();
+                        let ctx = ctx.clone();
+                        let tok = tok.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("zv-remote-conn".into())
+                            .spawn(move || handle_conn(stream, tx, ctx, tok));
                     }
-                    let tx = tx.clone();
-                    let ctx = ctx.clone();
-                    let tok = tok.clone();
-                    let _ = std::thread::Builder::new()
-                        .name("zv-remote-conn".into())
-                        .spawn(move || handle_conn(stream, tx, ctx, tok));
-                }
-            })
-            .map_err(|e| format!("サーバスレッド起動失敗: {e}"))?;
+                })
+                .map_err(|e| format!("サーバスレッド起動失敗: {e}"))?;
+            accept.push(h);
+        }
 
-        eprintln!("📱 スマホリモート起動 ({}): {url}?t={token}", bind.ip());
+        let where_ = addrs
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("📱 スマホリモート起動 ({where_}): {url}?t={token}");
         Ok(Self {
             port,
             token,
             url,
             bind,
+            addrs,
             rx,
             reach,
             stop,
-            accept: Some(accept),
+            accept,
+            done,
         })
     }
 
@@ -315,16 +465,49 @@ impl Drop for RemoteServer {
     /// ポート番号がずれ、トンネルの転送先と食い違う。
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // loopback は Lan / Loopback どちらの待ち受けにも届く
-        if let Ok(s) = TcpStream::connect_timeout(
-            &(std::net::Ipv4Addr::LOCALHOST, self.port).into(),
-            Duration::from_millis(500),
-        ) {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        let n = self.accept.len();
+        let deadline = Instant::now() + WAKE_BUDGET;
+        let mut woken = 0usize;
+        while woken < n && Instant::now() < deadline {
+            // **1 本の accept を起こせるのは 1 接続だけ**。待ち受けている
+            // アドレスごとに 1 本ずつ繋ぐ (Tailscale モードは loopback と
+            // tailnet の 2 本)。
+            for a in &self.addrs {
+                if let Ok(s) =
+                    TcpStream::connect_timeout(&wake_addr(*a), Duration::from_millis(300))
+                {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            // **繋いだ = 起きた、ではない。** unix は `SO_REUSEADDR` で
+            // `0.0.0.0:P` と `127.0.0.1:P` が同居でき、接続はより具体的な
+            // `127.0.0.1` 側へ行く。別インスタンスが同じ番号の loopback を
+            // 握っていると、こちらの起こし用接続は**そちらに攫われる**。
+            // 実際に CI で踏んだ (テストが 60 秒で打ち切られた)。
+            while woken < n {
+                match self.done.recv_timeout(Duration::from_millis(100)) {
+                    Ok(()) => woken += 1,
+                    Err(_) => break,
+                }
+            }
         }
-        if let Some(h) = self.accept.take() {
-            let _ = h.join();
+        if woken == n {
+            for h in self.accept.drain(..) {
+                let _ = h.join();
+            }
+            return;
         }
+        // 起こせなかった。**join すると終了が固まる**ので待たずに手放す。
+        // 手放したスレッドはリスナを握ったままなので、この番号は
+        // プロセスが終わるまで空かない (張り直しは次の番号へ落ちる)。
+        eprintln!(
+            "📱 スマホリモート: 待ち受け {}/{} 本を起こせませんでした \
+             (同じポートの 127.0.0.1 を別プロセスが握っている可能性)。\
+             待たずに手放します",
+            n - woken,
+            n
+        );
+        self.accept.clear();
     }
 }
 
@@ -1492,17 +1675,131 @@ mod tests {
     }
 
     /// トンネル使用時に `0.0.0.0` のままだと、SSH を迂回して LAN から平文で
-    /// 直接叩けてしまう (= トンネルを張った意味が消える)。
+    /// 直接叩けてしまう (= トンネルを張った意味が消える)。Tailscale も同じ理由で
+    /// `0.0.0.0` にしない (喫茶店の Wi-Fi からポートが見えてしまう)。
     #[test]
     fn bind先はモードで切り替わる() {
-        assert_eq!(Bind::Lan.ip(), "0.0.0.0");
-        assert_eq!(Bind::Loopback.ip(), "127.0.0.1");
-        assert!(!Bind::Lan.label().is_empty());
-        assert!(!Bind::Loopback.label().is_empty());
+        let ts: IpAddr = "100.101.102.103".parse().unwrap();
+        assert_eq!(
+            Bind::Lan.listen_ips(None).unwrap(),
+            vec!["0.0.0.0".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            Bind::Loopback.listen_ips(None).unwrap(),
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            Bind::Tailscale.listen_ips(Some(ts)).unwrap(),
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap(), ts]
+        );
+        // tailnet の IP が引けないのに Tailscale で待ち受けようとしたら、
+        // 黙って LAN へ落とさずに理由を返す (繋がらない QR を出さないため)
+        assert!(Bind::Tailscale.listen_ips(None).is_err());
+        // tailnet 以外を渡されても断る (LAN の IP に晒す取り違えを構造的に塞ぐ)
+        for bad in ["192.168.1.3", "127.0.0.1", "10.0.0.5", "2001:db8::1"] {
+            assert!(
+                Bind::Tailscale
+                    .listen_ips(Some(bad.parse().unwrap()))
+                    .is_err(),
+                "{bad} を tailnet として受け入れてはいけない"
+            );
+        }
+        // tailnet の IPv6 は受け入れる
+        assert!(Bind::Tailscale
+            .listen_ips(Some("fd7a:115c:a1e0::1".parse().unwrap()))
+            .is_ok());
+
+        for b in [Bind::Lan, Bind::Loopback, Bind::Tailscale] {
+            assert!(!b.label().is_empty(), "{b:?} の説明が無い");
+        }
         assert!(
             Bind::Loopback.label().contains("127.0.0.1"),
             "どちらで待ち受けているかが UI から読めること"
         );
+    }
+
+    /// **どのモードでも `127.0.0.1` に届くこと。**
+    /// `zai` CLI (`cli.rs` は 127.0.0.1:<port> へ繋ぐ) と PC 側の 🎤 音声ページ
+    /// (`http://127.0.0.1:<port>/voice`) がそこに居る。ここを落とすと
+    /// 「スマホからは繋がるのに PC の CLI と 🎤 だけが死ぬ」という、
+    /// 触っている本人からは見えない壊れ方をする。
+    #[test]
+    fn どのモードでもloopbackに届く() {
+        let ts: IpAddr = "100.101.102.103".parse().unwrap();
+        for b in [Bind::Lan, Bind::Loopback, Bind::Tailscale] {
+            let ips = b.listen_ips(Some(ts)).expect("解決できる");
+            let reaches_loopback = ips.iter().any(|ip| ip.is_loopback() || ip.is_unspecified());
+            assert!(reaches_loopback, "{b:?} が 127.0.0.1 を捨てている: {ips:?}");
+        }
+    }
+
+    /// ワイルドカードで待ち受けている accept は `0.0.0.0` へ繋いでも起こせない
+    /// (Windows は明確なエラー)。同じポートの loopback へ読み替える。
+    #[test]
+    fn 起こす宛先はワイルドカードを畳む() {
+        let f = |s: &str| wake_addr(s.parse().unwrap()).to_string();
+        assert_eq!(f("0.0.0.0:8899"), "127.0.0.1:8899");
+        assert_eq!(f("[::]:8899"), "[::1]:8899");
+        assert_eq!(f("127.0.0.1:8899"), "127.0.0.1:8899");
+        assert_eq!(f("100.101.102.103:8900"), "100.101.102.103:8900");
+    }
+
+    /// URL のホスト部は IPv6 だけ角括弧で包む (RFC 3986)。
+    /// 包み忘れると `http://fd7a:...:8899/` になり、ポートと区別が付かない。
+    #[test]
+    fn urlのホスト部はipv6を角括弧で包む() {
+        assert_eq!(url_host("100.64.0.1".parse().unwrap()), "100.64.0.1");
+        assert_eq!(
+            url_host("fd7a:115c:a1e0::1".parse().unwrap()),
+            "[fd7a:115c:a1e0::1]"
+        );
+    }
+
+    /// 2 つのアドレスで待ち受けたとき、**両方が応答し、両方の accept が
+    /// `Drop` で畳まれる**こと。1 本ずつ起こしていないと join が返らず、
+    /// ここがそのまま固まる (タイムアウトで落ちる)。
+    #[test]
+    fn 複数アドレスで待ち受けても両方応答して畳める() {
+        let v6 = std::net::Ipv6Addr::LOCALHOST;
+        // IPv6 が無効な環境 (一部の Docker) では素直に降りる
+        if TcpListener::bind((v6, 0)).is_err() {
+            eprintln!("[skip] IPv6 loopback が使えないので飛ばす");
+            return;
+        }
+        let ctx = egui::Context::default();
+        let ips: Vec<IpAddr> = vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), IpAddr::V6(v6)];
+        // **8899-8919 を他のテストと取り合わない。** unix は SO_REUSEADDR で
+        // `0.0.0.0:P` と `127.0.0.1:P` が同居でき、接続はより具体的な
+        // `127.0.0.1` 側へ行く。ここが同じ番号の loopback を握ると、
+        // 並列に走っている `張り直しても…` (0.0.0.0) の**起こし用接続を
+        // 攫って**しまう (CI の macOS で実際に 60 秒打ち切りになった)。
+        // 空き番号は OS に選ばせる。
+        let free = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("空きポートを 1 つ借りられる");
+        let want = free.local_addr().expect("番号が取れる").port();
+        drop(free);
+        let srv = RemoteServer::start_on(ctx, Bind::Tailscale, &ips, None, Some(want))
+            .expect("2 本で待ち受けられる");
+        assert_eq!(srv.addrs.len(), 2, "2 本とも掴んでいること");
+        let port = srv.port;
+        for a in [
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((v6, port)),
+        ] {
+            let mut c = TcpStream::connect_timeout(&a, Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("{a} へ繋がらない: {e}"));
+            // トークン無しなので 401 でよい。**応答が返ること**が要件
+            let _ = c.write_all(b"GET /api/state HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut buf = [0u8; 16];
+            let n = c.read(&mut buf).unwrap_or(0);
+            assert!(n > 0, "{a} から応答が無い");
+            assert!(
+                String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1"),
+                "{a} の応答が HTTP でない"
+            );
+        }
+        // ここで固まらないこと (両方の accept を起こせているか)
+        drop(srv);
     }
 
     /// 張り直しでトークンが変わると、既に QR を読んだスマホが一斉に 401 になる。
@@ -1526,6 +1823,115 @@ mod tests {
         assert_eq!(lo.bind, Bind::Loopback);
         // URL は待ち受けと必ず一致させる (繋がらない URL を QR にしない)
         assert_eq!(lo.url, format!("http://127.0.0.1:{}/", lo.port));
+    }
+
+    /// **起こし用の接続を別の待ち受けに攫われても、終了で固まらないこと。**
+    ///
+    /// unix は `SO_REUSEADDR` で `0.0.0.0:P` と `127.0.0.1:P` が同居でき、
+    /// 接続はより具体的な `127.0.0.1` 側へ行く。Zaivern を 2 つ起動して
+    /// 片方が SSH モード (127.0.0.1) だと、もう片方 (0.0.0.0) の `Drop` は
+    /// **自分の accept を永久に起こせない**。以前はそこで join し続けて
+    /// いたので、アプリの終了がそのまま固まった。
+    #[test]
+    fn 起こす接続を横取りされても終了で固まらない() {
+        let ctx = egui::Context::default();
+        let any: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let srv = RemoteServer::start_on(ctx, Bind::Lan, &[any], None, None)
+            .expect("0.0.0.0 で待ち受けられる");
+        let port = srv.port;
+        // 後から同じ番号の loopback を横から握る (= 別インスタンスの SSH モード)
+        let Ok(thief) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) else {
+            // Windows は同居できない = この事故自体が起こらない
+            eprintln!("[skip] 127.0.0.1:{port} を同居させられないので飛ばす");
+            return;
+        };
+        // 攫った接続は握りつぶす (起こしの合図を通さない)
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let t = std::thread::spawn(move || {
+            for c in thief.incoming() {
+                if s2.load(Ordering::SeqCst) {
+                    return;
+                }
+                drop(c);
+            }
+        });
+
+        let t0 = Instant::now();
+        drop(srv);
+        let took = t0.elapsed();
+        // 予算は 2 秒 (`WAKE_BUDGET`)。ここは速さではなく
+        // **返ってくること**の検査なので、余裕を持って倍以上で見る
+        assert!(
+            took < WAKE_BUDGET * 5,
+            "終了に {took:?} 掛かった (固まっている)"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+            Duration::from_millis(500),
+        );
+        let _ = t.join();
+    }
+
+    /// **実測**: いまのこのマシンで `Bind::Tailscale` を起動してみる。
+    ///
+    /// tailnet が上がっていれば**本当に tailnet の IP で待ち受けられる**ことを、
+    /// 上がっていなければ**理由の分かるエラーで断る**ことを確かめる。
+    /// どちらの環境でも意味のある表明になるので、CI でも手元でも走らせられる。
+    #[test]
+    fn tailscaleモードは繋がっていれば待ち受け繋がっていなければ断る() {
+        let ctx = egui::Context::default();
+        let st = crate::tailscale::probe();
+        match RemoteServer::start(ctx, Bind::Tailscale) {
+            Ok(s) => {
+                assert!(st.ready(), "検出は繋がっていないのに待ち受けられてしまった");
+                let ip = st.ip.expect("ready なら IP がある");
+                // URL のホストは tailnet の IP そのもの (loopback を出さない)
+                assert_eq!(s.url, format!("http://{}:{}/", url_host(ip), s.port));
+                // loopback も必ず握っていること (`zai` CLI と 🎤 の経路)
+                assert!(
+                    s.addrs.iter().any(|a| a.ip().is_loopback()),
+                    "loopback を握っていない: {:?}",
+                    s.addrs
+                );
+                assert!(
+                    s.addrs.iter().any(|a| a.ip() == ip),
+                    "tailnet の IP を握っていない: {:?}",
+                    s.addrs
+                );
+                // 戻り道 (📶 同じ Wi-Fi に戻す) も同じ port / token のまま
+                let (port, token) = (s.port, s.token.clone());
+                drop(s);
+                let back =
+                    RemoteServer::rebind(egui::Context::default(), Bind::Lan, token.clone(), port)
+                        .expect("Wi-Fi へ戻せる");
+                assert_eq!(back.token, token, "戻しでトークンを変えない");
+                // ポート番号は要求しない。**別インスタンスが `0.0.0.0:P` を
+                // 握っていると、unix では `127.0.0.1:P` だけが取れてしまう**
+                // ので (SO_REUSEADDR)、Tailscale で取れた番号が Lan では
+                // 取れないことがある。番号の引き継ぎは
+                // `張り直してもトークンは変わらずurlのホストだけ変わる` が
+                // 他が居ない前提で単独に見る。
+                assert!(
+                    back.addrs.iter().all(|a| a.ip().is_unspecified()),
+                    "Wi-Fi へ戻したら 0.0.0.0 だけ: {:?}",
+                    back.addrs
+                );
+            }
+            Err(e) => {
+                assert!(
+                    !st.ready(),
+                    "検出は繋がっているのに待ち受けられなかった: {e}"
+                );
+                // 「空きポートがありません」で片付けず、Tailscale の話だと分かること
+                assert!(
+                    e.contains("Tailscale"),
+                    "理由が Tailscale の話になっていない: {e}"
+                );
+            }
+        }
     }
 
     #[test]

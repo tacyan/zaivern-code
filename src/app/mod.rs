@@ -70,6 +70,7 @@ use crate::sound::{self, SoundKind};
 use crate::spec;
 use crate::submit;
 use crate::supervisor;
+use crate::tailscale;
 use crate::tasks;
 use crate::terminal;
 use crate::theme::{self, Theme};
@@ -3544,6 +3545,9 @@ pub struct ZaivernApp {
     tunnel_host: String,
     /// 接続先の書式エラー / 待ち受けの張り替え失敗 (1 行)
     tunnel_err: Option<String>,
+    /// Tailscale の検出結果 (踏み台も Wi-Fi も要らない 3 本目の経路)。
+    /// スレッドを持たず、📱 の画面が描かれたときだけ測り直す薄いキャッシュ。
+    ts: tailscale::Probe,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
     /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。

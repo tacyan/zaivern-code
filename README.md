@@ -148,8 +148,20 @@ on deliberately.
 ### Phone Remote
 
 Check progress, send instructions, approve actions, and edit files from your phone.
-The simplest setup works over the same Wi-Fi network, and an SSH tunnel covers the
-case where you are not on it.
+The simplest setup works over the same Wi-Fi network. When you are not on it, either
+of two transports takes over: **[Tailscale](https://tailscale.com/)**, if both machines
+are already on the same tailnet, or an SSH tunnel through a host you can already reach.
+Switching transport only changes where the server listens — the token, the port and the
+page stay the same, so a QR already scanned on the phone keeps working.
+
+Tailscale mode needs no bastion and no port forwarding: install
+[Tailscale](https://tailscale.com/download) on the PC and the phone, sign both into the
+same tailnet, then hit **🔒 Listen on Tailscale** in the phone-remote window. It binds
+the tailnet address and `127.0.0.1` and nothing else, so the café or airport Wi-Fi you
+happen to be on cannot see the port at all. Zaivern finds the tailnet address from the
+kernel routing table and never shells out to the `tailscale` command — on macOS that CLI
+is a shell wrapper that can hang forever when the daemon is not reachable, and a hung
+child would freeze the UI.
 
 ### Built-in Editor
 
