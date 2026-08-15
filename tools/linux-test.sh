@@ -28,6 +28,25 @@
 #
 # 判断に迷ったら、その 1 件を CI の ubuntu ジョブで確認する。
 set -eu
+_LABEL='Linux (Docker)'
+
+# ── 判定を「出力そのもの」へ書く ────────────────────────────────────────
+#
+# 呼び出し側が `| tail` / `| head` を挟むと `$?` はそちらのものになるので、
+# **中止したのに rc=0** に見える (実際にこれで「docker が起動していないのに
+# 緑」と誤読した)。終了コードだけを真実にしない — どの経路で終わっても
+# 最後の 1 行に結果を書き、パイプ越しでも嘘にならないようにする。
+_verdict() {
+    _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        printf '\033[1;32m✓ %s 緑\033[0m\n' "$_LABEL"
+    else
+        printf '\033[1;31m✗ %s 赤 (rc=%s)%s\033[0m\n' \
+            "$_LABEL" "$_rc" "${_WHY:+ — $_WHY}"
+    fi
+}
+_WHY=''
+trap _verdict EXIT
 
 # プロジェクトのルート (このスクリプトの 1 つ上)。パスを直書きしない。
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -63,6 +82,7 @@ fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "docker が動いていません。Docker Desktop を起動してください。" >&2
+    _WHY='docker 未起動のため 1 件も検証していない'
     exit 1
 fi
 
@@ -152,7 +172,9 @@ fi
 # `debuginfo=2` でリンクする瞬間に **OOM kill (signal: 9)** される。
 # 素の "could not compile" としてしか出ないのでコードの失敗と誤読しやすい。
 # Linux 側の目的は**挙動の確認**でデバッガを当てることではないので落とす。
-exec docker run --rm \
+# `exec` にしない — プロセスを置き換えると EXIT の判定行が出せない
+# (パイプ越しに読む人には「何も出ずに終わった」としか見えなくなる)。
+docker run --rm \
     -v "$root":/w -w /w \
     -v "$target_mount":/target \
     -v "$registry_vol":/usr/local/cargo/registry \

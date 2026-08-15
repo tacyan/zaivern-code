@@ -30,6 +30,25 @@
 # だから検証は「test を 1 回コンパイルして、そのバイナリでテストを走らせる」に
 # 一本化する。
 set -eu
+_LABEL='検証'
+
+# ── 判定を「出力そのもの」へ書く ────────────────────────────────────────
+#
+# 呼び出し側が `| tail` / `| head` を挟むと `$?` はそちらのものになるので、
+# **中止したのに rc=0** に見える (実際にこれで「docker が起動していないのに
+# 緑」と誤読した)。終了コードだけを真実にしない — どの経路で終わっても
+# 最後の 1 行に結果を書き、パイプ越しでも嘘にならないようにする。
+_verdict() {
+    _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        printf '\033[1;32m✓ %s 緑\033[0m\n' "$_LABEL"
+    else
+        printf '\033[1;31m✗ %s 赤 (rc=%s)%s\033[0m\n' \
+            "$_LABEL" "$_rc" "${_WHY:+ — $_WHY}"
+    fi
+}
+_WHY=''
+trap _verdict EXIT
 
 cd "$(dirname "$0")/.."
 
@@ -125,7 +144,11 @@ else
   printf '\033[1;32m✓ 実バイナリも最新 (%s)\033[0m\n' "$ZAI_BIN"
 fi
 
-[ "$QUICK" = 1 ] && { printf '\n--quick なのでテストは走らせない\n'; exit 0; }
+[ "$QUICK" = 1 ] && {
+  printf '\n--quick なのでテストは走らせない\n'
+  _LABEL='整形と警告だけ (テストは走らせていない)'
+  exit 0
+}
 
 # ここから先は **再コンパイルしない**。上で作ったバイナリをそのまま使う。
 if [ "$ALL" = 1 ]; then
@@ -148,6 +171,7 @@ MODS=$(git status --porcelain -- 'src/*.rs' 2>/dev/null | awk '{print $NF}' \
        | sed -e 's|^src/||' -e 's|\.rs$||' | sort -u)
 if [ -z "$MODS" ]; then
   printf '\n変更された src/*.rs が無いので、テストは走らせない (--all で全部)\n'
+  _LABEL='検証 (テストは 1 件も走っていない)'
   exit 0
 fi
 for m in $MODS; do

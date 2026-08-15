@@ -3452,6 +3452,75 @@ prunable gitdir file points to non-existent location
 
     // ── update: 配布元の URL は install.sh / install.ps1 が単一の真実 ──
 
+    // ── 日本語 README は英語版から遅れない ──────────────────────────
+
+    /// **節が片方にしか無い状態を許さない。**
+    ///
+    /// 実際に英語版だけに `## Resource Use` (Zed との実測比較) があり、
+    /// 日本語版には 1 行も無かった。読む人の言語で内容が変わるのは、
+    /// 「測っていないことは書かない」と同じくらい避けたい嘘なので、
+    /// **見出しの階層の並び**で釘を刺す (本文の長さは言語で当然変わるため見ない)。
+    #[test]
+    fn 二つのreadmeは同じ節を持つ() {
+        let levels = |src: &str| -> Vec<usize> {
+            src.replace("\r\n", "\n")
+                .lines()
+                .filter_map(|l| {
+                    let n = l.len() - l.trim_start_matches('#').len();
+                    let head = (2..=3).contains(&n) && l[n..].starts_with(' ');
+                    head.then_some(n)
+                })
+                .collect()
+        };
+        let en = levels(include_str!("../README.md"));
+        let ja = levels(include_str!("../README.ja.md"));
+        assert_eq!(
+            en.len(),
+            ja.len(),
+            "節の数が違う (英語 {} / 日本語 {}) — 片方にしか無い節がある",
+            en.len(),
+            ja.len()
+        );
+        assert_eq!(en, ja, "見出しの階層の並びが違う");
+    }
+
+    // ── 検証スクリプトは「読める形」で結果を言う ────────────────────
+
+    /// 検証コマンドの結果を**終了コードだけ**に持たせない。
+    ///
+    /// `tools/verify.sh … | tail` のようにパイプを挟むと `$?` は tail のものに
+    /// なるので、**中止したのに rc=0** に見える (実際にこれで「docker が
+    /// 起動していないのに緑」と読み違えた)。どの経路で終わっても最後の 1 行に
+    /// 判定を書くこと。`exec` で置き換えると EXIT の trap が発火しないので、
+    /// そこも併せて禁じる。
+    #[test]
+    fn 検証スクリプトは終了時に判定行を出す() {
+        for (name, src) in [
+            ("tools/verify.sh", include_str!("../tools/verify.sh")),
+            (
+                "tools/linux-test.sh",
+                include_str!("../tools/linux-test.sh"),
+            ),
+            (
+                "tools/windows-check.sh",
+                include_str!("../tools/windows-check.sh"),
+            ),
+        ] {
+            // Windows のチェックアウトは CRLF なので正規化してから探す。
+            let sh = src.replace("\r\n", "\n");
+            // コメントアウトを緑にしないため、**行そのもの**で照合する。
+            assert!(
+                sh.lines().any(|l| l.trim() == "trap _verdict EXIT"),
+                "{name}: 終了時の判定行が無い (パイプ越しに嘘の緑が出る)"
+            );
+            assert!(sh.contains("_LABEL="), "{name}: 判定行のラベルが無い");
+            assert!(
+                !sh.contains("\nexec docker ") && !sh.contains("\nexec cargo "),
+                "{name}: exec でプロセスを置き換えると判定行が出ない"
+            );
+        }
+    }
+
     // ── 供給網: インストーラは「展開する前に」SHA-256 を突き合わせる ──
 
     /// release.yml が checksums.txt を作っていても、**インストーラが見ていなければ

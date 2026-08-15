@@ -436,6 +436,11 @@ pub struct Session {
     /// 絶対行は**生きている画面の下端**が起点なので、1 行押し出されるたびに
     /// 同じ文字を指す値が +1 される。差分がそのまま「進めるべき量」になる。
     sel_pushed: u64,
+    /// `sel_pushed` を**どちらのグリッドの台帳**で数えたか。
+    ///
+    /// 通常画面と代替画面では押し出し総数が別勘定なので、これが今のグリッド
+    /// と違う間は差分を引き算しない ([`adopt_scroll`])。
+    sel_alt: bool,
     /// 直前のフレームで代替画面 (alternate screen) だったか。
     ///
     /// 代替画面へ**入った瞬間**にだけ履歴表示を畳むための記憶。
@@ -1983,10 +1988,13 @@ impl Session {
                                     let mut scrolled = lines.scrolled();
                                     for piece in seg.chunks(FEED_CHUNK) {
                                         let bytes = norm.feed(piece);
-                                        let (_, moved, sb_len) =
+                                        let (_, pushed) =
                                             count_around(&mut p, |p| p.process(bytes));
-                                        moved_total += moved;
-                                        scrolled = lines.advance(moved, sb_len);
+                                        moved_total += pushed.moved;
+                                        lines.advance(pushed);
+                                        // 通し番号は**通常画面の台帳**だけを読む
+                                        // (代替画面ぶんを混ぜるとマーカー行がずれる)。
+                                        scrolled = lines.scrolled();
                                     }
                                     // 代替画面 (vim / less / TUI) には履歴が無く、
                                     // 通し番号を数えられない。**無いものを 0 行目と
@@ -2112,6 +2120,7 @@ impl Session {
             selection: None,
             sel_abs: None,
             sel_pushed: 0,
+            sel_alt: false,
             sel_anchor_abs: None,
             alt_screen_prev: false,
             search: SearchUi::default(),
@@ -2811,8 +2820,8 @@ impl Session {
                 // 縮小は**行を履歴へ押し出す** (vendor/vt100 の set_size パッチ)。
                 // 数えないと通し番号と画面行の対応が縮めた行数ぶんずれる。
                 let mut p = lock_ok(&self.parser);
-                let (_, moved, sb_len) = count_around(&mut p, |p| p.set_size(rows, cols));
-                self.lines.advance(moved, sb_len);
+                let (_, pushed) = count_around(&mut p, |p| p.set_size(rows, cols));
+                self.lines.advance(pushed);
             }
             // 行数が変われば絶対行 → 画面行の写像も変わる。派生値を取り直す。
             self.sync_selection();
@@ -2954,18 +2963,27 @@ impl Session {
     /// 算術そのものは [`adopt_scroll`] (純関数) が持つ。ここは観測値を集めて
     /// 書き戻すだけ — **実 PTY 無しで表に固定できる形**にしてある。
     fn adopt_scrolled_output(&mut self) {
+        // 戻り量とグリッドは**同じ 1 回のロック**で読む (別々に読むと、
+        // 間で代替画面へ入れ替わったとき別のグリッドの値を組み合わせる)。
+        let (eff, alt) = {
+            let p = lock_ok(&self.parser);
+            (p.screen().scrollback(), p.screen().alternate_screen())
+        };
         let out = adopt_scroll(ScrollAdopt {
             scroll: self.scroll,
-            eff: self.eff_scroll(),
+            eff,
             sel_pushed: self.sel_pushed,
-            pushed: self.lines.scrolled(),
+            pushed: self.lines.pushed_in(alt),
             rows: self.size.0,
-            sb_len: self.lines.sb_len(),
+            sb_len: self.lines.sb_len_in(alt),
             sel_abs: self.sel_abs,
             sel_anchor_abs: self.sel_anchor_abs,
+            alt,
+            sel_alt: self.sel_alt,
         });
         self.scroll = out.scroll;
         self.sel_pushed = out.sel_pushed;
+        self.sel_alt = out.sel_alt;
         self.sel_abs = out.sel_abs;
         self.sel_anchor_abs = out.sel_anchor_abs;
         if out.changed {
@@ -3037,9 +3055,17 @@ impl Session {
     /// 絶対座標で選択を設定する。
     pub fn set_selection_abs(&mut self, a: (usize, u16), b: (usize, u16)) {
         self.sel_abs = Some((a, b));
-        // 以後のずれはここからの差分で数える。
-        self.sel_pushed = self.lines.scrolled();
+        // 以後のずれはここからの差分で数える。**どちらのグリッドの台帳で
+        // 数えたか**まで覚える (混ぜると代替画面の出入りで飛ぶ)。
+        let alt = self.is_alt_screen();
+        self.sel_alt = alt;
+        self.sel_pushed = self.lines.pushed_in(alt);
         self.sync_selection();
+    }
+
+    /// いま映っているのが代替画面のグリッドか。
+    fn is_alt_screen(&self) -> bool {
+        lock_ok(&self.parser).screen().alternate_screen()
     }
 
     /// **選択範囲の文字列** (コピーの中身そのもの)。選択が無ければ空。
@@ -3123,8 +3149,11 @@ impl Session {
     }
 
     /// (代替画面か, アプリがマウス報告を有効にしているか, SGRエンコードか)。
-    /// 代替画面(vim / less / Claude Code 等)にはスクロールバック履歴が無いため、
-    /// ローカルスクロールではなくホイールをアプリへ転送する必要がある。
+    ///
+    /// 代替画面のアプリ (vim / less / Claude Code 等) は自前でスクロールを持つ
+    /// ので、既定ではホイールをアプリへ転送する。**ただし代替画面にも履歴は
+    /// ある** (vendor/vt100 のパッチで、スクロール領域を使わずに画面を流す
+    /// アプリの行は履歴へ積まれる)。どちらへ渡すかは [`wheel_route`] が決める。
     pub fn wheel_modes(&self) -> (bool, bool, bool) {
         let p = lock_ok(&self.parser);
         let s = p.screen();
@@ -4210,6 +4239,197 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    /// **実 PTY と実 `Session` で**、代替画面のエージェントを遡って選び、
+    /// そのあと出力が来てもコピーが同じ文字を指し続けることを見る。
+    ///
+    /// 純関数の表 (`selection_scroll_tests`) が全部緑でも、読取スレッドが
+    /// どちらのグリッドの台帳へ積むかを間違えるとここだけが落ちる
+    /// (CLAUDE.md「実バイナリを回さないと分からない回帰」の小さい版)。
+    ///
+    /// 追加出力の**時刻を測らない** — 子は `read` で待たせ、こちらが
+    /// 書き込んだ瞬間だけ流れる。負荷で 1 秒が伸びても揺れない。
+    #[test]
+    #[cfg(unix)]
+    fn 代替画面のまま流すエージェントを遡って選びコピーできる() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        // 代替画面へ入ってから画面より多く流し、合図が来たらもう 3 行流す。
+        // (エージェントが代替画面のまま出力を下へ流していく形そのもの)
+        let spec = SpawnSpec {
+            title: "alt-select".into(),
+            preset_name: "test".into(),
+            icon: "◆".into(),
+            command: "printf '\\033[?1049h'; i=1; while [ $i -le 200 ]; do \
+                      echo \"L$i\"; i=$((i+1)); done; read _go; \
+                      echo TAIL1; echo TAIL2; echo TAIL3"
+                .into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(9977, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let until = |f: &dyn Fn() -> bool| -> bool {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(20) {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        };
+        // まだ遡っていないので、素の画面をそのまま見てよい。
+        assert!(
+            until(&|| lock_ok(&s.parser).screen().contents().contains("L200")),
+            "200 行目が届かない"
+        );
+        assert!(
+            lock_ok(&s.parser).screen().alternate_screen(),
+            "代替画面のままである"
+        );
+
+        // 画面より上 (履歴) へ遡って、見えている行を 1 本選ぶ。
+        assert!(s.adjust_scroll(50), "代替画面でも履歴を遡れる");
+        let eff0 = s.eff_scroll();
+        s.set_selection(((1, 0), (1, 5)));
+        let want = s.selection_string();
+        assert!(
+            want.starts_with('L') && want.len() >= 2,
+            "遡った先の行を選べている: {want:?}"
+        );
+
+        // 遡ったまま、エージェントがさらに出力する。届いたかどうかは
+        // **vt100 自身の戻り量**で見る (遡ったままの画面を覗かずに済む)。
+        s.write_bytes(b"\n");
+        assert!(
+            until(&|| s.eff_scroll() >= eff0 + 3),
+            "追加の出力が届かない (eff={} → {})",
+            eff0,
+            s.eff_scroll()
+        );
+        assert_eq!(
+            s.selection_string(),
+            want,
+            "出力が来てもコピーが同じ文字を指し続ける"
+        );
+        s.kill();
+    }
+
+    /// DoD: **履歴用 env が、起動したプロセスの環境まで実際に届く。**
+    ///
+    /// カタログに書いただけでは何も起きない。`merged_env` → `SpawnSpec.env`
+    /// → PTY の子、の**繋がり**をここで見る (claude は要らないので、
+    /// どの環境でも決定的に落ちる)。
+    #[test]
+    #[cfg(unix)]
+    fn 履歴用envは子プロセスの環境まで届く() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let env =
+            crate::agents::merged_env("claude", crate::agents::Approval::Ask, &HashMap::new());
+        assert!(
+            env.contains_key("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"),
+            "カタログから env が出ていない"
+        );
+        let spec = SpawnSpec {
+            title: "env-e2e".into(),
+            preset_name: "test".into(),
+            icon: "◆".into(),
+            command: "echo GOT=$CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN".into(),
+            cwd: std::env::temp_dir(),
+            env,
+            log_path: None,
+        };
+        let mut s = Session::spawn(9971, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let t0 = Instant::now();
+        let mut got = false;
+        while t0.elapsed() < Duration::from_secs(20) {
+            if lock_ok(&s.parser).screen().contents().contains("GOT=1") {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        s.kill();
+        assert!(got, "子プロセスの環境に届いていない");
+    }
+
+    /// DoD: **その env で Claude Code が代替画面をやめる** (実バイナリ)。
+    ///
+    /// **対照を先に取る。** env 無しの起動が代替画面へ入らない環境
+    /// (未認証・初回オンボーディング等) では、この検査は何も証明できないので
+    /// `[skip]` して降りる — 「対照が壊れたまま緑」が一番たちが悪い
+    /// (実際に一時 `CLAUDE_CONFIG_DIR` を渡したら、素の claude まで
+    ///  全画面へ入らなくなり、env を `0` に戻しても緑のままだった)。
+    ///
+    /// 利用者の設定は**読むだけ**で、こちらからは何も書かない
+    /// (cwd は一時ディレクトリ、数秒で kill する)。
+    #[test]
+    #[cfg(unix)]
+    fn claude_codeは履歴用envで代替画面をやめる() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        // PTY へ渡る PATH と同じものを見る (`spawn` は `shellenv::user_path`)。
+        let on_path = std::env::split_paths(&crate::shellenv::user_path())
+            .any(|d| d.join("claude").is_file());
+        if !on_path {
+            eprintln!("[skip] claude が PATH に無い");
+            return;
+        }
+        let dir = crate::test_util::unique_temp_dir("zaivern-term-test", "claude-alt");
+
+        // 起動して、代替画面へ入ったか / 入るまで何秒かかったかを見る。
+        let watch = |env: HashMap<String, String>, id: u64, budget: Duration| -> Option<Duration> {
+            let spec = SpawnSpec {
+                title: "claude-alt".into(),
+                preset_name: "test".into(),
+                icon: "◆".into(),
+                command: "claude".into(),
+                cwd: dir.clone(),
+                env,
+                log_path: None,
+            };
+            let mut s =
+                Session::spawn(id, spec, eframe::egui::Context::default()).expect("PTY起動");
+            let t0 = Instant::now();
+            let mut hit = None;
+            while t0.elapsed() < budget {
+                {
+                    let p = lock_ok(&s.parser);
+                    if p.screen().alternate_screen() {
+                        hit = Some(t0.elapsed());
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            s.kill();
+            hit
+        };
+
+        // ① 対照: 素の起動 (env 無し) は代替画面へ入る、が前提。
+        let Some(took) = watch(HashMap::new(), 9972, Duration::from_secs(25)) else {
+            eprintln!("[skip] 対照が代替画面へ入らない (未認証などでこの環境では証明できない)");
+            return;
+        };
+        // ② 本番: カタログの env を通した起動は入らない。
+        let env =
+            crate::agents::merged_env("claude", crate::agents::Approval::Ask, &HashMap::new());
+        // **待ちは対照から導く** (絶対値で決めると、遅いマシンでは嘘の緑、
+        // 速いマシンでは無駄に PTY を握り続けて枯渇させる)。
+        let budget = (took * 4).max(Duration::from_secs(5));
+        assert!(
+            watch(env, 9973, budget).is_none(),
+            "履歴用 env を渡しても代替画面へ入った (対照は {took:?} で入った)"
+        );
+    }
+
     #[test]
     fn unread_lifecycle_via_real_pty() {
         use super::{Session, SpawnSpec};
@@ -4779,6 +4999,81 @@ mod tests {
         assert_eq!(clip_selection(((1, 0), (0, 0)), rows, 10), None);
         // 行数 0
         assert_eq!(clip_selection(((0, 0), (0, 0)), 0, 0), None);
+    }
+
+    /// ホイールの行き先を表で固定する。
+    ///
+    /// **エージェント (代替画面 + マウス報告) でも自分の履歴を遡れること**が
+    /// ここの主眼。Shell だけがローカル履歴を持てる状態が、報告された
+    /// 「Claude Code では上まで遡って選択・コピーできない」の正体だった。
+    #[test]
+    fn ホイールの行き先を表で固定する() {
+        use super::{wheel_route, WheelRoute as W};
+        // (代替画面, マウス報告, いまの戻り量, Shift, 期待)
+        let cases: &[(bool, bool, usize, bool, W)] = &[
+            // 通常画面 (Shell): 常にローカル履歴。
+            (false, false, 0, false, W::History),
+            (false, false, 0, true, W::History),
+            // 代替画面 + マウス報告 (Claude Code / Codex 等)。
+            (true, true, 0, false, W::Report), // 素のホイールはアプリのもの
+            (true, true, 0, true, W::History), // Shift でこちらの履歴へ
+            (true, true, 4, false, W::History), // 遡っている最中は続けられる
+            // 代替画面 + マウス報告なし (vim / less)。
+            (true, false, 0, false, W::Arrows),
+            (true, false, 0, true, W::History),
+            (true, false, 2, false, W::History),
+            // **通常画面でアプリがマウス報告していても履歴が勝つ** (gemini 等)。
+            // 押し出された行が実在するのに遡れない、を作らないため。
+            (false, true, 0, false, W::History),
+            (false, true, 3, false, W::History),
+            (false, true, 0, true, W::History),
+        ];
+        for (alt, mouse_on, scroll, shift, want) in cases {
+            assert_eq!(
+                wheel_route(*alt, *mouse_on, *scroll, *shift),
+                *want,
+                "alt={alt} mouse={mouse_on} scroll={scroll} shift={shift}"
+            );
+        }
+    }
+
+    /// デッキ / Cockpit のタイル (`hover_scroll = false`) でも、
+    /// **Shift 付き**と**遡っている最中**はその端末がホイールを受ける。
+    /// ここが false のままだと、タイルの中身を上へ辿って選ぶことができない。
+    #[test]
+    fn タイルでもshiftと遡り中はホイールがその端末のものになる() {
+        use super::wheel_belongs_here as w;
+        // 下パネル (hover_scroll = true): ホバーだけで受ける。
+        assert!(w(false, true, 0, false));
+        // タイル (hover_scroll = false): 素のホイールはページのもの。
+        assert!(!w(false, false, 0, false));
+        // フォーカス中は従来どおり受ける。
+        assert!(w(true, false, 0, false));
+        // Shift 付きは「この端末の履歴を見たい」の明示。
+        assert!(w(false, false, 0, true));
+        // すでに遡っている最中は手放さない (数行ごとにページが飛ばない)。
+        assert!(w(false, false, 3, false));
+        // 一番下 (scroll == 0) へ戻ればページへ返す。
+        assert!(!w(false, false, 0, false));
+    }
+
+    /// **egui 0.29 は Shift 付きホイールを水平へ寄せる。** 素の `.y` を読むと
+    /// Shift+ホイールが常に 0 になり、履歴が 1 行も動かない。
+    #[test]
+    fn shift付きホイールは水平へ寄せられた量を読み直す() {
+        use super::wheel_dy;
+        let v = egui::vec2(0.0, 12.0);
+        assert_eq!(wheel_dy(v, false), 12.0, "素のホイールは縦をそのまま");
+        // egui が寄せた後の姿 (縦の量が x に載り、y は 0)。
+        let swapped = egui::vec2(12.0, 0.0);
+        assert_eq!(
+            wheel_dy(swapped, true),
+            12.0,
+            "Shift 付きは x を縦として読む"
+        );
+        assert_eq!(wheel_dy(swapped, false), 0.0);
+        // 符号 (上方向が正) は寄せても変わらない。
+        assert_eq!(wheel_dy(egui::vec2(-12.0, 0.0), true), -12.0);
     }
 
     #[test]
@@ -6869,6 +7164,10 @@ pub struct ScrollAdopt {
     pub sel_abs: Option<((usize, u16), (usize, u16))>,
     /// ドラッグ選択のアンカー (絶対座標)。
     pub sel_anchor_abs: Option<(usize, u16)>,
+    /// いま映っているのが代替画面のグリッドか。
+    pub alt: bool,
+    /// 選択を記録したときのグリッド (`Session::sel_alt`)。
+    pub sel_alt: bool,
 }
 
 /// [`adopt_scroll`] の出力。呼び出し側はこの値を書き戻すだけでよい。
@@ -6882,6 +7181,8 @@ pub struct Adopted {
     pub sel_abs: Option<((usize, u16), (usize, u16))>,
     /// 新しいアンカー。
     pub sel_anchor_abs: Option<(usize, u16)>,
+    /// 新しい「選択を記録したグリッド」。
+    pub sel_alt: bool,
     /// 画面座標への切り取り直し (`sync_selection`) が要るか。
     pub changed: bool,
 }
@@ -6901,6 +7202,8 @@ pub fn adopt_scroll(input: ScrollAdopt) -> Adopted {
         sb_len,
         mut sel_abs,
         mut sel_anchor_abs,
+        alt,
+        sel_alt,
     } = input;
     // 減る方向 (代替画面へ入ると履歴が無くなる) は写さない。戻ってきた
     // ときに元の位置を復元できなくなるため。
@@ -6908,7 +7211,15 @@ pub fn adopt_scroll(input: ScrollAdopt) -> Adopted {
     if changed {
         scroll = eff;
     }
-    let d = usize::try_from(pushed.saturating_sub(sel_pushed)).unwrap_or(usize::MAX);
+    // 選択を記録したのが別のグリッドなら、押し出し総数の差は引き算できない
+    // (通常画面と代替画面で別の台帳を数えている)。基準を取り直すだけにして
+    // **絶対行は 1 行も動かさない** — vim / less を通っても選択がずれない、
+    // という既存の性質はこれで保たれる。
+    let d = if alt == sel_alt {
+        usize::try_from(pushed.saturating_sub(sel_pushed)).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
     if d > 0 && (sel_abs.is_some() || sel_anchor_abs.is_some()) {
         changed = true;
         let oldest = oldest_abs_of(rows, sb_len);
@@ -6939,6 +7250,7 @@ pub fn adopt_scroll(input: ScrollAdopt) -> Adopted {
         sel_pushed: pushed,
         sel_abs,
         sel_anchor_abs,
+        sel_alt: alt,
         changed,
     }
 }
@@ -6968,8 +7280,8 @@ pub struct ScrollProbe {
     pub sb_len: usize,
     /// いま何行戻して見ているか。
     pub offset: usize,
-    /// 代替画面か。代替画面のグリッドは履歴を持たない (容量 0) ので、
-    /// ここで測った 0 を通常画面の値と引き算すると桁違いの嘘が出る。
+    /// 代替画面のグリッドで測ったか。**通常画面と代替画面は別の履歴**なので、
+    /// 片方だけの値と引き算すると桁違いの嘘が出る (またいだ 2 点は数えない)。
     pub alt: bool,
 }
 
@@ -6979,10 +7291,16 @@ pub struct ScrollProbe {
 /// vt100 が数えてくれない)。留めた量が `pinned` なら、飽和するまでの
 /// 余裕は `容量 - pinned` — だから留める値は小さいほどよい。
 pub fn scrolled_delta(before: ScrollProbe, after: ScrollProbe) -> u64 {
-    // 代替画面は履歴を持たない。出入りの瞬間に引き算すると、抜けた瞬間に
-    // 「通常画面の履歴長ぶん一気にスクロールした」という嘘が出る。
-    // 代替画面の中ではシェルのマーカーは出ないので、数えないで困らない。
-    if before.alt || after.alt {
+    // **またいだ 2 点だけ数えない。** 通常画面と代替画面は別のグリッド =
+    // 別の履歴なので、出入りの瞬間に引き算すると「一気に履歴長ぶん流れた」
+    // という嘘が出る。
+    //
+    // 逆に**代替画面の中に留まっている 2 点は数える**。Claude Code のような
+    // ストリーム出力するエージェントは代替画面のまま画面を下へ流していくので、
+    // ここを 0 にすると押し出した行数が誰にも数えられず、遡って選んだ範囲が
+    // 出力のたびに静かにずれる (Shell では合っているのにエージェントでは
+    // ずれる、という差になって報告された)。
+    if before.alt != after.alt {
         return 0;
     }
     let by_len = after.sb_len.saturating_sub(before.sb_len);
@@ -6995,10 +7313,21 @@ pub fn scrolled_delta(before: ScrollProbe, after: ScrollProbe) -> u64 {
 /// 呼び出し前の戻り量は必ず元へ戻す — ただし「vt100 が自分で動かしたときと
 /// 同じ値」へ戻す (0 = 最新に貼り付いたまま / 1 以上 = 同じ文字を見続ける)。
 /// ここを素の元値へ戻すと、履歴を見ている最中に出力が来たとき画面が流れる。
-fn count_around<R>(
-    p: &mut vt100::Parser,
-    f: impl FnOnce(&mut vt100::Parser) -> R,
-) -> (R, u64, usize) {
+/// [`count_around`] の観測結果。**どちらのグリッドで数えたか**まで持つ。
+///
+/// 通常画面と代替画面は別の履歴なので、行数だけを渡すと受け取った側が
+/// どちらの台帳へ積めばよいか分からない ([`LineIndex`] は両方を別に持つ)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pushed {
+    /// 押し出された行数。
+    pub moved: u64,
+    /// 数えたグリッドに残っている履歴の行数。
+    pub sb_len: usize,
+    /// 代替画面のグリッドで数えたか。
+    pub alt: bool,
+}
+
+fn count_around<R>(p: &mut vt100::Parser, f: impl FnOnce(&mut vt100::Parser) -> R) -> (R, Pushed) {
     let saved = p.screen().scrollback();
     // 履歴の行数は「戻れる上限」として読める。
     p.set_scrollback(usize::MAX);
@@ -7026,7 +7355,14 @@ fn count_around<R>(
     } else {
         saved.saturating_add(moved as usize)
     });
-    (out, moved, after.sb_len)
+    (
+        out,
+        Pushed {
+            moved,
+            sb_len: after.sb_len,
+            alt: after.alt,
+        },
+    )
 }
 
 /// シェル統合マーカー (OSC 133 / 633) の**終端の次**の位置 (純関数)。
@@ -7145,21 +7481,53 @@ const FEED_CHUNK: usize = 4096;
 ///
 /// `scrolled` は「画面の上へ押し出した総行数」。画面行 `r` (0 = 最上段) の
 /// 通し番号は `scrolled - 戻り量 + r`、履歴の最古は `scrolled - sb_len`。
+///
+/// **グリッドごとに別の台帳を持つ。** 通常画面と代替画面は vt100 の中で
+/// 別のグリッド = 別の履歴なので、1 つの数に混ぜると
+///
+/// * シェル統合の通し番号 (`scrolled`) が vim / less を 1 回通っただけで
+///   代替画面の行数ぶんずれ、記録済みのマーカー行が別の行を指す
+/// * 逆に代替画面を数えないと、代替画面のまま流し続けるエージェントで
+///   選択の取り込み ([`adopt_scroll`]) が動かず、コピーが静かにずれる
+///
+/// のどちらかが必ず起きる。**シェル統合が読むのは通常画面側だけ**
+/// (`scrolled` / `sb_len` / `oldest_live`)、選択の取り込みは
+/// `pushed_in` / `sb_len_in` で**いま映っているグリッド**の側を読む。
 #[derive(Debug, Default)]
 pub struct LineIndex {
     scrolled: AtomicU64,
     sb_len: AtomicU64,
+    alt_scrolled: AtomicU64,
+    alt_sb_len: AtomicU64,
 }
 
 impl LineIndex {
-    /// 押し出した総行数。
+    /// 通常画面で押し出した総行数 (シェル統合の通し番号の素)。
     pub fn scrolled(&self) -> u64 {
         self.scrolled.load(Ordering::Relaxed)
     }
 
-    /// 履歴に残っている行数 (= 戻れる上限)。
+    /// 通常画面の履歴に残っている行数 (= 戻れる上限)。
     pub fn sb_len(&self) -> usize {
         self.sb_len.load(Ordering::Relaxed) as usize
+    }
+
+    /// `alt` 側のグリッドで押し出した総行数。
+    pub fn pushed_in(&self, alt: bool) -> u64 {
+        if alt {
+            self.alt_scrolled.load(Ordering::Relaxed)
+        } else {
+            self.scrolled()
+        }
+    }
+
+    /// `alt` 側のグリッドの履歴長。
+    pub fn sb_len_in(&self, alt: bool) -> usize {
+        if alt {
+            self.alt_sb_len.load(Ordering::Relaxed) as usize
+        } else {
+            self.sb_len()
+        }
     }
 
     /// まだ読める最も古い通し番号。これより古い行はもう存在しない。
@@ -7168,10 +7536,15 @@ impl LineIndex {
             .saturating_sub(self.sb_len.load(Ordering::Relaxed))
     }
 
-    /// 1 回ぶんの観測を取り込み、取り込んだあとの総行数を返す。
-    fn advance(&self, moved: u64, sb_len: usize) -> u64 {
-        self.sb_len.store(sb_len as u64, Ordering::Relaxed);
-        self.scrolled.fetch_add(moved, Ordering::Relaxed) + moved
+    /// 1 回ぶんの観測を、**数えたグリッドの台帳へ**取り込む。
+    fn advance(&self, p: Pushed) {
+        let (total, len) = if p.alt {
+            (&self.alt_scrolled, &self.alt_sb_len)
+        } else {
+            (&self.scrolled, &self.sb_len)
+        };
+        len.store(p.sb_len as u64, Ordering::Relaxed);
+        total.fetch_add(p.moved, Ordering::Relaxed);
     }
 }
 /// 選択範囲を行優先(row-major)で正規化し、(開始 <= 終了) にして返す。
@@ -7983,6 +8356,80 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
     }
 }
 
+/// ホイールを**この端末が受けるか** (純関数)。
+///
+/// `hover_scroll` が false のタイル (Cockpit / デッキ) は、既定では
+/// フォーカス中しかホイールを取らない — さもないとミニ端末で埋まった
+/// グリッドの上でページを一切スクロールできなくなるため。
+///
+/// ただしそれだと**タイルの中身を遡って選ぶ**ことができない (Shell は
+/// 下パネルなので `hover_scroll = true`、という差がそのまま
+/// 「デッキ / Cockpit では Shell のように上へ辿れない」になっていた)。
+/// 次の 2 つはページのスクロールと取り違えようが無いので、フォーカスが
+/// 無くてもこの端末が受ける:
+///
+/// * `shift` — 「この端末の履歴を見たい」という明示 (実端末と同じ修飾)
+/// * `scroll > 0` — すでに遡っている最中。ここで手放すと数行ごとに
+///   ページが飛んで、遡りながら選ぶことができない
+pub fn wheel_belongs_here(focused: bool, hover_scroll: bool, scroll: usize, shift: bool) -> bool {
+    focused || hover_scroll || shift || scroll > 0
+}
+
+/// ホイールを**どこへ渡すか** (純関数)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelRoute {
+    /// この端末が持つスクロールバック履歴を動かす (Shell と同じ挙動)。
+    History,
+    /// アプリへマウス報告として転送する (アプリ自身がスクロールする)。
+    Report,
+    /// 矢印キーで代用する (代替画面でマウス報告が無いとき)。
+    Arrows,
+}
+
+/// ホイールの行き先を決める。
+///
+/// 判断材料は 4 つだけ: 代替画面か / アプリがマウス報告中か /
+/// **いま履歴を遡っている最中か** / Shift を押しているか。
+///
+/// * `shift` — 実端末と同じ「アプリを飛び越える」修飾。Claude Code のように
+///   マウス報告を有効にするエージェントでも、これで**自分の履歴**を遡れる。
+/// * `scroll > 0` — すでに遡っている最中はローカルのまま。ここを見ないと
+///   1 ノッチごとに live へ引き戻され、遡った位置から先へ進めない
+///   (ドラッグで上端を超えて選択を伸ばした後も同じ)。
+pub fn wheel_route(alt: bool, mouse_on: bool, scroll: usize, shift: bool) -> WheelRoute {
+    if shift || scroll > 0 {
+        return WheelRoute::History;
+    }
+    // **通常画面は Shell と同じ**: 自分のスクロールバックを動かす。
+    // ここでマウス報告を優先するとエージェントで「ホイールが何も起こさない」に
+    // なる。実測: gemini は `?1006h` を出す (クリックのため) が画面は流れて
+    // いて (20 秒で改行 133 回)、**履歴はこちら側に積まれている**。
+    // 積まれている履歴を見せないのは端末の落ち度なので、通常画面では渡さない。
+    if !alt {
+        return WheelRoute::History;
+    }
+    if mouse_on {
+        WheelRoute::Report
+    } else {
+        WheelRoute::Arrows
+    }
+}
+
+/// ホイールの縦移動量を読む (純関数)。
+///
+/// **egui 0.29 は Shift 付きホイールを水平へ寄せる**
+/// (`egui-0.29.1/src/input_state/mod.rs`: `if modifiers.shift { delta =
+/// vec2(delta.x + delta.y, 0.0) }`)。素直に `raw_scroll_delta.y` を読むと
+/// Shift+ホイールは**常に 0** になり、履歴が 1 行も動かない。
+/// 押されているときは x 側を縦の量として読み直す (⌘V の飲み込みと同じ型の罠)。
+pub fn wheel_dy(raw: egui::Vec2, shift: bool) -> f32 {
+    if shift {
+        raw.x
+    } else {
+        raw.y
+    }
+}
+
 /// ホイール入力の処理: マウス報告転送 / 矢印キー代用 / ローカル履歴スクロール。
 fn handle_wheel_scroll(
     ui: &mut egui::Ui,
@@ -7992,13 +8439,37 @@ fn handle_wheel_scroll(
     cell_w: f32,
     cell_h: f32,
 ) {
-    let dy = ui.input(|i| i.raw_scroll_delta.y);
+    let (dy, shift) = ui.input(|i| {
+        let shift = i.modifiers.shift;
+        (wheel_dy(i.raw_scroll_delta, shift), shift)
+    });
     if dy.abs() > 0.5 {
         let (alt, mouse_on, sgr) = session.wheel_modes();
         let up = dy > 0.0;
         // ホイールの移動量をノッチ数へ(1〜8)
         let notches = ((dy.abs() / cell_h).ceil() as i32).clamp(1, 8);
-        if mouse_on {
+        let mut route = wheel_route(alt, mouse_on, session.scroll, shift);
+        if route == WheelRoute::History {
+            // ローカルのスクロールバック履歴 (通常画面 / Shift 付き /
+            // すでに遡っている最中)。
+            // 整数切り捨てで 0 行になると、ゆっくりスクロールしたとき
+            // 一番下(scroll=0)まで戻り切れず履歴表示が残るため、
+            // 1 イベントにつき最低 1 行は必ず動かす。
+            let mut lines = (dy / cell_h * 2.0) as i64;
+            if lines == 0 {
+                lines = if up { 1 } else { -1 };
+            }
+            let moved = session.adjust_scroll(lines);
+            // **履歴が 1 行も無い全画面アプリでは、Shift 付きを死なせない。**
+            // Claude Code v2 のように画面を流さず**同じ場所へ描き直す**
+            // アプリでは、こちらの履歴には最初から 1 行も積まれない
+            // (実ログ 1.39MB を再生して LF 0 回 / SU 0 回 / CUP 3 万回)。
+            // 動かせないときはアプリへ渡して、アプリ自身の履歴を辿らせる。
+            if !moved && session.scroll == 0 {
+                route = wheel_route(alt, mouse_on, 0, false);
+            }
+        }
+        if route == WheelRoute::Report {
             // アプリがマウス報告中: ホイールをそのまま転送する。
             // これで Claude Code / less / vim などがアプリ側でスクロールする。
             let hover = ui
@@ -8013,7 +8484,7 @@ fn handle_wheel_scroll(
             if session.scroll != 0 {
                 session.set_scroll(0);
             }
-        } else if alt {
+        } else if route == WheelRoute::Arrows {
             // マウス無効の全画面アプリ: 矢印キーで代用スクロール
             let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
             for _ in 0..notches {
@@ -8022,21 +8493,12 @@ fn handle_wheel_scroll(
             if session.scroll != 0 {
                 session.set_scroll(0);
             }
-        } else {
-            // 通常画面(シェル等): ローカルのスクロールバック履歴。
-            // 整数切り捨てで 0 行になると、ゆっくりスクロールしたとき
-            // 一番下(scroll=0)まで戻り切れず履歴表示が残るため、
-            // 1 イベントにつき最低 1 行は必ず動かす。
-            let mut lines = (dy / cell_h * 2.0) as i64;
-            if lines == 0 {
-                lines = if up { 1 } else { -1 };
-            }
-            session.adjust_scroll(lines);
         }
-        // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する
+        // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する。
+        // Shift 付きは egui が x へ寄せているので**両軸とも**消す。
         ui.input_mut(|i| {
-            i.raw_scroll_delta.y = 0.0;
-            i.smooth_scroll_delta.y = 0.0;
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
         });
     }
 }
@@ -9373,7 +9835,13 @@ pub fn draw(
         session.preedit.clear();
     }
 
-    if interactive && (focused || hover_scroll) && response.hovered() {
+    let wheel_here = wheel_belongs_here(
+        focused,
+        hover_scroll,
+        session.scroll,
+        ui.input(|i| i.modifiers.shift),
+    );
+    if interactive && wheel_here && response.hovered() {
         handle_wheel_scroll(ui, session, rect, padding, cell_w, cell_h);
     }
 
@@ -15135,8 +15603,8 @@ mod shell_line_tests {
             bytes.extend_from_slice(format!("line{i}\r\n").as_bytes());
         }
         for piece in bytes.chunks(per_call) {
-            let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
-            idx.advance(moved, sb_len);
+            let (_, pushed) = count_around(&mut p, |p| p.process(piece));
+            idx.advance(pushed);
         }
         idx.scrolled()
     }
@@ -15164,8 +15632,8 @@ mod shell_line_tests {
         // vt100 自身が戻り量を増やす。測定がその挙動を壊さないこと。
         p.set_scrollback(10);
         let before = p.screen().contents();
-        let (_, moved, _) = count_around(&mut p, |p| p.process(b"x\r\ny\r\n"));
-        assert_eq!(moved, 2);
+        let (_, pushed) = count_around(&mut p, |p| p.process(b"x\r\ny\r\n"));
+        assert_eq!(pushed.moved, 2);
         assert_eq!(p.screen().scrollback(), 12);
         assert_eq!(p.screen().contents(), before, "見ている画面が流れた");
     }
@@ -15337,8 +15805,9 @@ mod shell_line_tests {
             for seg in shell_segments(chunk) {
                 let mut scrolled = idx.scrolled();
                 for piece in seg.chunks(FEED_CHUNK) {
-                    let (_, moved, sb_len) = count_around(&mut p, |p| p.process(piece));
-                    scrolled = idx.advance(moved, sb_len);
+                    let (_, pushed) = count_around(&mut p, |p| p.process(piece));
+                    idx.advance(pushed);
+                    scrolled = idx.scrolled();
                 }
                 let line = (!p.screen().alternate_screen())
                     .then(|| scrolled + u64::from(p.screen().cursor_position().0));
@@ -15504,11 +15973,10 @@ mod selection_scroll_tests {
         rows: u16,
         /// `Session::scroll`。
         scroll: usize,
-        /// `LineIndex::scrolled` 相当。
-        pushed: u64,
-        /// `LineIndex` の履歴長。
-        sb_len: usize,
+        /// `LineIndex` 相当 (グリッドごとに別勘定)。
+        lines: super::LineIndex,
         sel_pushed: u64,
+        sel_alt: bool,
         sel_abs: Option<((usize, u16), (usize, u16))>,
         sel_anchor_abs: Option<(usize, u16)>,
         selection: Option<((u16, u16), (u16, u16))>,
@@ -15520,9 +15988,9 @@ mod selection_scroll_tests {
                 parser: vt100::Parser::new(rows, cols, scrollback),
                 rows,
                 scroll: 0,
-                pushed: 0,
-                sb_len: 0,
+                lines: super::LineIndex::default(),
                 sel_pushed: 0,
+                sel_alt: false,
                 sel_abs: None,
                 sel_anchor_abs: None,
                 selection: None,
@@ -15532,9 +16000,8 @@ mod selection_scroll_tests {
         /// 読取スレッドと**同じ手順**でバイト列を取り込む。
         fn feed(&mut self, bytes: &[u8]) {
             for piece in bytes.chunks(FEED_CHUNK) {
-                let (_, moved, sb_len) = count_around(&mut self.parser, |p| p.process(piece));
-                self.sb_len = sb_len;
-                self.pushed += moved;
+                let (_, pushed) = count_around(&mut self.parser, |p| p.process(piece));
+                self.lines.advance(pushed);
             }
         }
 
@@ -15543,20 +16010,29 @@ mod selection_scroll_tests {
             self.parser.screen().scrollback()
         }
 
+        /// `Session::is_alt_screen`。
+        fn is_alt(&self) -> bool {
+            self.parser.screen().alternate_screen()
+        }
+
         /// `Session::adopt_scrolled_output` と**同じ 1 点**を通る。
         fn adopt(&mut self) {
+            let alt = self.is_alt();
             let out: Adopted = adopt_scroll(ScrollAdopt {
                 scroll: self.scroll,
                 eff: self.eff_scroll(),
                 sel_pushed: self.sel_pushed,
-                pushed: self.pushed,
+                pushed: self.lines.pushed_in(alt),
                 rows: self.rows,
-                sb_len: self.sb_len,
+                sb_len: self.lines.sb_len_in(alt),
                 sel_abs: self.sel_abs,
                 sel_anchor_abs: self.sel_anchor_abs,
+                alt,
+                sel_alt: self.sel_alt,
             });
             self.scroll = out.scroll;
             self.sel_pushed = out.sel_pushed;
+            self.sel_alt = out.sel_alt;
             self.sel_abs = out.sel_abs;
             self.sel_anchor_abs = out.sel_anchor_abs;
             if out.changed {
@@ -15596,7 +16072,9 @@ mod selection_scroll_tests {
             let a = (abs_row(sel.0 .0, rows, scroll), sel.0 .1);
             let b = (abs_row(sel.1 .0, rows, scroll), sel.1 .1);
             self.sel_abs = Some((a, b));
-            self.sel_pushed = self.pushed;
+            let alt = self.is_alt();
+            self.sel_alt = alt;
+            self.sel_pushed = self.lines.pushed_in(alt);
             self.sync_selection();
         }
 
@@ -15680,6 +16158,29 @@ mod selection_scroll_tests {
         assert!(s.selection.is_none(), "ハイライトも消えている");
     }
 
+    /// **報告された不具合そのもの**: Claude Code などのエージェントは
+    /// 代替画面のまま出力を下へ流していく。Shell (通常画面) では遡って
+    /// 選んだ範囲が出力の後もその文字を指し続けるのに、代替画面では
+    /// ずれる/消えるという差が出ていた。
+    #[test]
+    fn 代替画面のエージェントでも遡って選んだ範囲がずれない() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = Model::new(rows, cols, 200);
+        // エージェントが代替画面へ入って、そのまま出力を流す。
+        s.feed(b"\x1b[?1049h");
+        s.feed_lines(0..30);
+        assert!(s.adjust_scroll(10), "代替画面でも履歴を遡れる");
+        s.set_selection(((2, 0), (2, 6)));
+        let want = s.selection_string();
+        assert!(want.starts_with("line"), "行を選べている: {want:?}");
+        assert_eq!(s.under_highlight(), want, "選ぶ直前は一致している");
+
+        // 遡ったまま、エージェントがさらに 3 行出力する。
+        s.feed(b"a\r\nb\r\nc\r\n");
+        assert_eq!(s.selection_string(), want, "コピーが同じ文字を指し続ける");
+        assert_eq!(s.under_highlight(), want, "ハイライトが同じ文字の上にある");
+    }
+
     #[test]
     fn 代替画面を出入りしても選択がずれない() {
         let (rows, cols) = (5u16, 20u16);
@@ -15712,6 +16213,8 @@ mod selection_scroll_tests {
             sb_len: 8,
             sel_abs: Some(((6, 0), (5, 6))),
             sel_anchor_abs: None,
+            alt: false,
+            sel_alt: false,
         };
         let cases: &[(&str, ScrollAdopt, Adopted)] = &[
             (
@@ -15722,6 +16225,7 @@ mod selection_scroll_tests {
                     sel_pushed: 0,
                     sel_abs: base.sel_abs,
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: false,
                 },
             ),
@@ -15737,6 +16241,7 @@ mod selection_scroll_tests {
                     sel_pushed: 3,
                     sel_abs: Some(((9, 0), (8, 6))),
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: true,
                 },
             ),
@@ -15748,6 +16253,7 @@ mod selection_scroll_tests {
                     sel_pushed: 0,
                     sel_abs: base.sel_abs,
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: false,
                 },
             ),
@@ -15759,6 +16265,7 @@ mod selection_scroll_tests {
                     sel_pushed: 7,
                     sel_abs: Some(((12, 0), (12, 6))),
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: true,
                 },
             ),
@@ -15770,6 +16277,7 @@ mod selection_scroll_tests {
                     sel_pushed: 20,
                     sel_abs: None,
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: true,
                 },
             ),
@@ -15786,6 +16294,7 @@ mod selection_scroll_tests {
                     sel_pushed: 9,
                     sel_abs: None,
                     sel_anchor_abs: Some((12, 2)),
+                    sel_alt: false,
                     changed: true,
                 },
             ),
@@ -15801,10 +16310,49 @@ mod selection_scroll_tests {
                     sel_pushed: 9,
                     sel_abs: None,
                     sel_anchor_abs: None,
+                    sel_alt: false,
                     changed: false,
                 },
             ),
         ];
+        // グリッドをまたいだ差分は引き算しない。基準だけ取り直す。
+        let across = adopt_scroll(ScrollAdopt {
+            pushed: 9,
+            alt: true,
+            ..base
+        });
+        assert_eq!(
+            across,
+            Adopted {
+                scroll: 3,
+                sel_pushed: 9,
+                sel_abs: base.sel_abs,
+                sel_anchor_abs: None,
+                sel_alt: true,
+                changed: false,
+            },
+            "別のグリッドの押し出しでは絶対行を動かさない"
+        );
+        // 同じグリッド (どちらも代替画面) なら、通常画面とまったく同じに動く。
+        let within = adopt_scroll(ScrollAdopt {
+            pushed: 3,
+            eff: 6,
+            alt: true,
+            sel_alt: true,
+            ..base
+        });
+        assert_eq!(
+            within,
+            Adopted {
+                scroll: 6,
+                sel_pushed: 3,
+                sel_abs: Some(((9, 0), (8, 6))),
+                sel_anchor_abs: None,
+                sel_alt: true,
+                changed: true,
+            },
+            "代替画面の中でも通常画面と同じ算術で追いかける"
+        );
         for (name, input, want) in cases {
             assert_eq!(&adopt_scroll(*input), want, "{name}");
         }
@@ -15826,7 +16374,7 @@ mod selection_scroll_tests {
                     max_off + usize::from(rows) - 1
                 };
                 assert_eq!(
-                    oldest_abs_of(rows, m.sb_len),
+                    oldest_abs_of(rows, m.lines.sb_len()),
                     want,
                     "rows={rows} lines={lines}"
                 );
@@ -15846,9 +16394,19 @@ mod selection_scroll_tests {
             1,
             "取り込みの算術が 2 箇所に分かれている"
         );
+        // `Session` 側は観測値を集めて純関数へ渡すだけ — 算術を持たない。
+        let body = src
+            .split_once("fn adopt_scrolled_output(&mut self) {")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(b, _)| b.to_string())
+            .expect("adopt_scrolled_output が居ない");
         assert!(
-            src.contains("fn adopt_scrolled_output(&mut self) {\n        let out = adopt_scroll("),
+            body.contains("adopt_scroll(ScrollAdopt {"),
             "Session が純関数を通っていない"
+        );
+        assert!(
+            !body.contains("saturating_"),
+            "Session 側が自前で算術をしている (純関数と二重実装になる)"
         );
         // 呼び出し口 (draw / set_scroll / adjust_scroll / set_selection /
         // selection_string) の 5 つ + 定義 1 つ。
