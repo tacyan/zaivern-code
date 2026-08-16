@@ -194,6 +194,32 @@ pub fn trf(template: &str, args: &[(&str, String)]) -> String {
     s
 }
 
+/// 訳文に残る**位置プレースホルダ** `{}` を、渡された順に埋める。
+///
+/// [`trf`] が置換するのは `{name}` だけだが、辞書の原文は `format!` の位置指定を
+/// そのまま持っていることがある (`"{} を作成できません: {e}"` 等)。
+/// **辞書は原文そのものが鍵**なので綴りを名前付きへ変えることはできず、
+/// 訳したあとにここで埋める。
+///
+/// 分割して繋ぎ直すので、埋めた値の中に `{}` が入っていても次の穴と取り違えない。
+/// 穴が足りなければ余った値は捨て、多ければ `{}` のまま残す
+/// (訳が壊れていても panic しない — 訳の事故で機能を止めない)。
+///
+/// 使い方は `fill_positional(&trf(原文, 名前付き), &[位置引数…])`。
+pub fn fill_positional(translated: &str, args: &[String]) -> String {
+    let mut parts = translated.split("{}");
+    let mut out = String::with_capacity(translated.len() + 32);
+    out.push_str(parts.next().unwrap_or(""));
+    for (i, tail) in parts.enumerate() {
+        match args.get(i) {
+            Some(v) => out.push_str(v),
+            None => out.push_str("{}"),
+        }
+        out.push_str(tail);
+    }
+    out
+}
+
 /// 接頭辞に一致する ID だけを取り出す（スマホ側 UI へ渡す辞書など）。
 /// 値は選択中の言語で解決済み。
 pub fn export_prefix(prefix: &str) -> BTreeMap<String, String> {
@@ -546,6 +572,25 @@ mod tests {
         // 存在しないパスもエラー
         assert!(load_dict(&root.join("nope")).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 位置プレースホルダは順に埋まり壊れても止まらない() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            fill_positional("{} を作成できません: X", &a(&["/tmp/a"])),
+            "/tmp/a を作成できません: X"
+        );
+        // 順に埋まる
+        assert_eq!(fill_positional("{}/{}", &a(&["a", "b"])), "a/b");
+        // 埋めた値の中の `{}` を次の穴と取り違えない
+        assert_eq!(fill_positional("{}/{}", &a(&["{}", "b"])), "{}/b");
+        // 穴が多ければそのまま残す (panic しない)
+        assert_eq!(fill_positional("{}/{}", &a(&["a"])), "a/{}");
+        // 値が余れば捨てる
+        assert_eq!(fill_positional("{}", &a(&["a", "b"])), "a");
+        // 穴が無ければ素通し
+        assert_eq!(fill_positional("穴なし", &a(&["a"])), "穴なし");
     }
 
     #[test]

@@ -72,6 +72,12 @@
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+use crate::i18n::tr;
+// `trf` が要るのは Windows 専用の経路だけ。素の `use` にすると
+// 非 Windows の `cargo check --bin zai` で unused import になる。
+#[cfg(any(windows, test))]
+use crate::i18n::trf;
+
 /// 作成する受信規則の表示名。
 pub const RULE_NAME: &str = "Zaivern Code (Mobile Remote)";
 
@@ -128,6 +134,9 @@ pub enum Problem {
 
 impl Problem {
     /// 画面と CLI に出す 1 行の見出し。
+    ///
+    /// **ここでは訳さない。** `&'static str` のまま返し、画面へ出す側が
+    /// `tr()` を通す (`app/remote_api.rs` が既にその形で呼んでいる)。
     pub fn headline(&self) -> &'static str {
         match self {
             Problem::StrictInbound => {
@@ -274,11 +283,13 @@ impl Report {
     pub fn network_label(&self) -> String {
         self.categories
             .iter()
+            // 左辺 ("Public" 等) は PowerShell が返す**識別子**なので訳さない
+            // (照合に使う値であって画面の文字列ではない)。右辺だけが画面に出る。
             .map(|c| match c.as_str() {
-                "Public" => "パブリック",
-                "Private" => "プライベート",
-                "Domain" => "ドメイン",
-                other => other,
+                "Public" => tr("パブリック"),
+                "Private" => tr("プライベート"),
+                "Domain" => tr("ドメイン"),
+                other => other.to_string(),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -552,7 +563,7 @@ pub fn parse_report(out: &str) -> Option<Report> {
     }
     // 名前が読めなくても「別の製品が居る」ことは伝える (黙ると元のバグに戻る)。
     if r.other_fw.is_empty() && other > 0 {
-        r.other_fw.push("別のファイアウォール製品".to_string());
+        r.other_fw.push(tr("別のファイアウォール製品"));
     }
     Some(r)
 }
@@ -567,8 +578,12 @@ pub fn applicable() -> bool {
 /// 規則に書く実行ファイルのパス (verbatim 接頭辞は外す)。
 #[cfg(windows)]
 fn exe_path() -> Result<String, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("自分の実行ファイルの場所を特定できません: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        trf(
+            "自分の実行ファイルの場所を特定できません: {e}",
+            &[("e", e.to_string())],
+        )
+    })?;
     Ok(crate::pathx::canonical(&exe).to_string_lossy().to_string())
 }
 
@@ -576,10 +591,14 @@ fn exe_path() -> Result<String, String> {
 #[cfg(windows)]
 fn script_path(name: &str) -> Result<PathBuf, String> {
     let dir = dirs::data_local_dir()
-        .ok_or("LOCALAPPDATA が見つかりません")?
+        .ok_or_else(|| tr("LOCALAPPDATA が見つかりません"))?
         .join("Zaivern");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        crate::i18n::fill_positional(
+            &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+            &[dir.display().to_string()],
+        )
+    })?;
     Ok(dir.join(name))
 }
 
@@ -604,7 +623,7 @@ fn run_ps(script: &str) -> Result<PsOut, String> {
             &format!("{}{script}", crate::textenc::PS_UTF8_PRELUDE),
         ])
         .output()
-        .map_err(|e| format!("powershell を実行できません: {e}"))?;
+        .map_err(|e| trf("powershell を実行できません: {e}", &[("e", e.to_string())]))?;
     // PowerShell はコンソールのコードページ (日本語 Windows なら CP932) で
     // 書いてくるので、UTF-8 として読むと日本語のエラーが化ける。
     // 化けるだけでなく「キャンセル」の照合まで外れるため textenc へ通す。
@@ -624,9 +643,12 @@ fn check_now() -> Result<Report, String> {
     parse_report(&out.stdout).ok_or_else(|| {
         let hint = out.stderr.trim();
         if hint.is_empty() {
-            "ファイアウォールの状態を取得できませんでした".to_string()
+            tr("ファイアウォールの状態を取得できませんでした")
         } else {
-            format!("ファイアウォールの状態を取得できませんでした: {hint}")
+            trf(
+                "ファイアウォールの状態を取得できませんでした: {hint}",
+                &[("hint", hint.to_string())],
+            )
         }
     })
 }
@@ -647,8 +669,12 @@ fn run_elevated(file: &str, script: &str) -> Result<(), String> {
     // 日本語が入っている環境 (`C:\Users\たろう\…`) では規則のパスが壊れ、
     // 「許可したのにスマホから繋がらない」が再発する。
     let wrapped = with_error_log(script, &log.to_string_lossy());
-    std::fs::write(&path, crate::textenc::ps_script_bytes(&wrapped))
-        .map_err(|e| format!("{} を書けません: {e}", path.display()))?;
+    std::fs::write(&path, crate::textenc::ps_script_bytes(&wrapped)).map_err(|e| {
+        crate::i18n::fill_positional(
+            &trf("{} を書けません: {e}", &[("e", e.to_string())]),
+            &[path.display().to_string()],
+        )
+    })?;
     let outer = elevate_script(&path.to_string_lossy());
     let res = run_ps(&outer);
     // 平文のスクリプトを残さない (失敗しても消す)
@@ -663,13 +689,16 @@ fn run_elevated(file: &str, script: &str) -> Result<(), String> {
     }
     // UAC で「いいえ」を押した場合。文言は言語ごとに違うので終了コードで見る
     // (念のため昔の文字列照合も残す — 古い Windows は例外を投げずに返す)。
+    // **照合side の "キャンセル" は tr() へ通さない** — Windows が返す文言
+    // そのものであって、こちらが画面へ出す文字列ではない。UI 言語を韓国語に
+    // したら日本語 Windows のメッセージと照合できなくなる。
     let err = out.stderr.trim();
     if out.code == CANCELLED
         || err.contains("canceled")
         || err.contains("cancelled")
         || err.contains("キャンセル")
     {
-        return Err("管理者の確認がキャンセルされました".to_string());
+        return Err(tr("管理者の確認がキャンセルされました"));
     }
     // 昇格側のログ → こちら側の標準エラー、の順に理由を探す。
     let why = if !reason.is_empty() {
@@ -678,12 +707,15 @@ fn run_elevated(file: &str, script: &str) -> Result<(), String> {
         err.lines().next().unwrap_or("").to_string()
     };
     Err(if why.is_empty() {
-        format!(
-            "ファイアウォール設定の変更に失敗しました (終了コード {})",
-            out.code
+        crate::i18n::fill_positional(
+            &tr("ファイアウォール設定の変更に失敗しました (終了コード {})"),
+            &[out.code.to_string()],
         )
     } else {
-        format!("ファイアウォール設定の変更に失敗しました: {why}")
+        trf(
+            "ファイアウォール設定の変更に失敗しました: {why}",
+            &[("why", why)],
+        )
     })
 }
 
@@ -723,34 +755,41 @@ pub fn status_text(r: Report) -> String {
     let problems = r.problems();
     if problems.is_empty() {
         let mut msg = if r.allowed {
-            format!(
-                "✅ 受信を許可済み: {RULE_NAME} (TCP {PORT_FROM}-{PORT_TO} / {})",
-                if r.profiles.is_empty() {
-                    "-".into()
+            crate::i18n::fill_positional(
+                &trf(
+                    "✅ 受信を許可済み: {RULE_NAME} (TCP {PORT_FROM}-{PORT_TO} / {})",
+                    &[
+                        ("RULE_NAME", RULE_NAME.to_string()),
+                        ("PORT_FROM", PORT_FROM.to_string()),
+                        ("PORT_TO", PORT_TO.to_string()),
+                    ],
+                ),
+                &[if r.profiles.is_empty() {
+                    "-".to_string()
                 } else {
                     r.profiles.clone()
-                }
+                }],
             )
         } else {
             // 規則は無いが Windows も検査していない (ファイアウォールが切られている)。
-            "✅ 受信はブロックされていません (ファイアウォールが無効です)".to_string()
+            tr("✅ 受信はブロックされていません (ファイアウォールが無効です)")
         };
         let net = r.network_label();
         if !net.is_empty() {
-            msg.push_str(&format!("\n\u{3000}いまのネットワーク: {net}"));
+            msg.push_str(&trf("\n\u{3000}いまのネットワーク: {net}", &[("net", net)]));
         }
         return msg;
     }
     let mut out = Vec::new();
     for p in &problems {
-        out.push(p.headline().to_string());
+        out.push(tr(p.headline()));
         // 別製品は名指しで出す。「別のファイアウォール」とだけ言われても
         // どこを開けば良いのか分からない。
         if *p == Problem::OtherFirewall {
             out.push(format!("\u{3000}{}", r.other_firewall_label()));
         }
         out.push(
-            p.detail()
+            tr(p.detail())
                 .lines()
                 .map(|l| format!("\u{3000}{}", l.trim_start()))
                 .collect::<Vec<_>>()
@@ -759,20 +798,21 @@ pub fn status_text(r: Report) -> String {
     }
     let net = r.network_label();
     if !net.is_empty() {
-        out.push(format!(
-            "\u{3000}いまのネットワーク: {net}{}",
-            if r.profiles.is_empty() {
-                String::new()
-            } else {
-                format!(" / 規則のプロファイル: {}", r.profiles)
-            }
+        let suffix = if r.profiles.is_empty() {
+            String::new()
+        } else {
+            crate::i18n::fill_positional(&tr(" / 規則のプロファイル: {}"), &[r.profiles.clone()])
+        };
+        out.push(crate::i18n::fill_positional(
+            &trf("\u{3000}いまのネットワーク: {net}{}", &[("net", net)]),
+            &[suffix],
         ));
     }
     if problems.contains(&Problem::StrictInbound) {
-        out.push("\u{3000}→ `zai firewall unblock` (管理者の確認あり)".to_string());
+        out.push(tr("\u{3000}→ `zai firewall unblock` (管理者の確認あり)"));
     }
     if r.fixable_by_allow() {
-        out.push("\u{3000}→ `zai firewall allow` (管理者の確認あり)".to_string());
+        out.push(tr("\u{3000}→ `zai firewall allow` (管理者の確認あり)"));
     }
     out.join("\n")
 }
@@ -784,7 +824,10 @@ pub fn run(args: &[String]) -> i32 {
     #[cfg(not(windows))]
     {
         let _ = sub;
-        println!("この OS ではファイアウォールの設定は要りません (受信は既定で通ります)。");
+        println!(
+            "{}",
+            tr("この OS ではファイアウォールの設定は要りません (受信は既定で通ります)。")
+        );
         return 0;
     }
     #[cfg(windows)]
@@ -792,35 +835,45 @@ pub fn run(args: &[String]) -> i32 {
         let result: Result<String, String> = match sub {
             "status" | "" => check_now().map(status_text),
             "allow" => allow_now().map(|r| {
-                let mut msg = format!(
-                    "✅ 受信を許可しました: TCP {PORT_FROM}-{PORT_TO} / {}",
-                    if r.profiles.is_empty() {
-                        "-".into()
+                let mut msg = crate::i18n::fill_positional(
+                    &trf(
+                        "✅ 受信を許可しました: TCP {PORT_FROM}-{PORT_TO} / {}",
+                        &[
+                            ("PORT_FROM", PORT_FROM.to_string()),
+                            ("PORT_TO", PORT_TO.to_string()),
+                        ],
+                    ),
+                    &[if r.profiles.is_empty() {
+                        "-".to_string()
                     } else {
                         r.profiles.clone()
-                    }
+                    }],
                 );
                 // 規則を作っても残る原因 (「すべての受信接続をブロックする」) は
                 // ここで言っておく。黙っていると「許可したのに繋がらない」に戻る。
                 for p in r.problems() {
-                    msg.push_str(&format!("\n{}", p.headline()));
+                    msg.push_str(&format!("\n{}", tr(p.headline())));
                 }
                 if r.problems().contains(&Problem::StrictInbound) {
-                    msg.push_str("\n\u{3000}`zai firewall unblock` で解除できます");
+                    msg.push_str(&tr("\n\u{3000}`zai firewall unblock` で解除できます"));
                 }
                 msg
             }),
-            "revoke" | "remove" | "uninstall" => {
-                revoke_now().map(|_| format!("🗑 受信許可を取り消しました: {RULE_NAME}"))
-            }
-            "unblock" => unblock_now().map(|r| {
-                format!(
-                    "✅ 「すべての受信接続をブロックする」を解除しました\n{}",
-                    status_text(r)
+            "revoke" | "remove" | "uninstall" => revoke_now().map(|_| {
+                trf(
+                    "🗑 受信許可を取り消しました: {RULE_NAME}",
+                    &[("RULE_NAME", RULE_NAME.to_string())],
                 )
             }),
-            other => Err(format!(
-                "不明な firewall サブコマンドです: {other} (status / allow / revoke / unblock)"
+            "unblock" => unblock_now().map(|r| {
+                crate::i18n::fill_positional(
+                    &tr("✅ 「すべての受信接続をブロックする」を解除しました\n{}"),
+                    &[status_text(r)],
+                )
+            }),
+            other => Err(trf(
+                "不明な firewall サブコマンドです: {other} (status / allow / revoke / unblock)",
+                &[("other", other.to_string())],
             )),
         };
         match result {
@@ -933,14 +986,12 @@ impl FirewallUi {
                 // (画面は許可済み・実際は繋がらない) をそのまま再現してしまう。
                 self.done = match what {
                     Some(Busy::Allow) if report.problems().is_empty() => {
-                        Some("🛡 ファイアウォールで受信を許可しました".to_string())
+                        Some(tr("🛡 ファイアウォールで受信を許可しました"))
                     }
                     Some(Busy::Unblock) if report.strict == 0 => {
-                        Some("🛡 「すべての受信接続をブロックする」を解除しました".to_string())
+                        Some(tr("🛡 「すべての受信接続をブロックする」を解除しました"))
                     }
-                    Some(Busy::Revoke) if !report.allowed => {
-                        Some("🛡 受信許可を取り消しました".to_string())
-                    }
+                    Some(Busy::Revoke) if !report.allowed => Some(tr("🛡 受信許可を取り消しました")),
                     _ => None,
                 };
                 self.report = Some(report);
@@ -1013,6 +1064,27 @@ impl FirewallUi {
 
 #[cfg(test)]
 mod tests {
+    /// 位置プレースホルダの埋め方を表で固定する (`desktop.rs` と対の複製)。
+    /// 訳文は外部ファイルから来るので、`{}` の数が原文と食い違いうる。
+    #[test]
+    fn 位置プレースホルダは順に埋まり数が食い違っても壊れない() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            ("{} を書けません: x", &["/a/b"], "/a/b を書けません: x"),
+            ("Cannot write {}", &["/a", "余り"], "Cannot write /a"),
+            ("{} と {}", &["/a"], "/a と {}"),
+            ("穴なし", &["/a"], "穴なし"),
+            ("{} / {}", &["a{}b", "後"], "a{}b / 後"),
+        ];
+        for (tpl, args, want) in cases {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                &crate::i18n::fill_positional(tpl, &owned),
+                want,
+                "template={tpl:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
