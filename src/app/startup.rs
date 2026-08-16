@@ -930,7 +930,7 @@ impl ZaivernApp {
                 );
             }
         }
-        ctx.request_repaint();
+        crate::perf::repaint(ctx, "set_ui_language");
     }
 
     pub(super) fn active_selection(&self, ctx: &egui::Context) -> Option<String> {

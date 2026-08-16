@@ -100,6 +100,30 @@ zai update --yes      # 跳过确认提示直接升级
 `zai uninstall` 用于卸载（`--dry-run` 会列出将被删除的内容）。卸载只会动可执行文件本体和
 `~/.zaivern`；`PATH` 上的其他内容只会被列出来，绝不会被删除。
 
+## 界面语言
+
+内置 **English、日本語、简体中文、한국어、Português (Brasil)、Español** 六种语言，
+切换**不需要重启**，选中之后的下一帧整个界面就换好了。
+
+入口有：工具栏的 🌐 菜单、菜单栏的「视图 → 界面语言」、命令面板，以及设置里的「外观」。
+无论从哪里改，最后都会落到 `~/.zaivern/config.toml` 的 `ui_language`；默认值 `"auto"`
+跟随操作系统的语言。
+
+没有内置的语言可以直接从 GitHub 装，不用重新构建应用：
+
+```sh
+zai lang list --remote        # 查看发布源里有哪些语言包
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+想自己做一份：`zai lang export fr` 会把模板写到 `~/.zaivern/locales/fr.json`，编辑之后用
+`zai lang check fr` 检查缺漏，再 `zai lang set fr` 生效。**只要写一条和内置相同的 ID，
+就只覆盖那一条**，为了改一个词而抄一整本词典是不必要的。
+
+细节见 [docs/i18n.md](docs/i18n.md)。
+
 ## 主要功能
 
 ### 冲突协调（这个项目存在的理由）

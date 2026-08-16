@@ -104,6 +104,33 @@ O `zai uninstall` remove tudo (`--dry-run` lista o que seria removido). A desins
 toca apenas no executável e em `~/.zaivern`; qualquer outra coisa no seu `PATH` é apenas
 listada, nunca apagada.
 
+## Idioma
+
+A interface vem em seis idiomas — English, 日本語, 简体中文, 한국어, Português (Brasil) e
+Español — e a troca vale já no quadro seguinte, **sem reiniciar**.
+
+Escolha pelo menu 🌐 na barra de ferramentas, por **Exibir → Idioma** na barra de menus,
+pela paleta de comandos ou em Configurações → Aparência. Por qualquer um desses caminhos a
+escolha vai parar em `ui_language`, no `~/.zaivern/config.toml`; o padrão `"auto"` segue o
+idioma do seu sistema operacional.
+
+Idiomas que não vêm embutidos são instalados a partir de um repositório do GitHub, sem
+recompilar o aplicativo:
+
+```sh
+zai lang list --remote        # pacotes de idioma disponíveis no repositório de origem
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+Para fazer o seu, `zai lang export fr` escreve um modelo em `~/.zaivern/locales/fr.json`;
+edite, confira com `zai lang check fr` e aplique com `zai lang set fr`. **Escrever um único
+ID que um idioma embutido já tem sobrescreve apenas aquela linha**, então corrigir um
+rótulo não exige carregar um dicionário inteiro.
+
+O [docs/i18n.md](docs/i18n.md) cobre o resto.
+
 ## Principais recursos
 
 ### Coordenação de conflitos (a razão de isto existir)

@@ -105,6 +105,33 @@ mismo.
 únicamente el ejecutable y `~/.zaivern`; cualquier otra cosa en tu `PATH` se lista, nunca
 se borra.
 
+## Idioma
+
+La interfaz viene en seis idiomas — English, 日本語, 简体中文, 한국어, Português (Brasil) y
+Español — y el cambio surte efecto en el siguiente fotograma, **sin reiniciar**.
+
+Elige desde el menú 🌐 de la barra de herramientas, desde **Ver → Idioma** en la barra de
+menús, desde la paleta de comandos o en Ajustes → Apariencia. Vengas por donde vengas, la
+elección acaba en `ui_language`, dentro de `~/.zaivern/config.toml`; el valor por defecto
+`"auto"` sigue el idioma de tu sistema operativo.
+
+Los idiomas que no vienen incluidos se instalan desde un repositorio de GitHub, sin
+recompilar la aplicación:
+
+```sh
+zai lang list --remote        # paquetes de idioma disponibles en el repositorio de origen
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+Para hacer el tuyo, `zai lang export fr` escribe una plantilla en
+`~/.zaivern/locales/fr.json`; edítala, compruébala con `zai lang check fr` y aplícala con
+`zai lang set fr`. **Escribir un único ID que un idioma incluido ya tiene sobrescribe solo
+esa línea**, así que corregir una etiqueta no obliga a arrastrar un diccionario entero.
+
+[docs/i18n.md](docs/i18n.md) cubre el resto.
+
 ## Funcionalidades principales
 
 ### Coordinación de conflictos (la razón de que esto exista)

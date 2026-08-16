@@ -104,6 +104,32 @@ zai update --yes      # 확인 프롬프트 없이 업그레이드
 실행 파일과 `~/.zaivern`뿐이며, `PATH` 위의 다른 것들은 목록에 보여줄 뿐 절대
 삭제하지 않습니다.
 
+## 표시 언어
+
+기본으로 들어 있는 언어는 **English · 日本語 · 简体中文 · 한국어 · Português (Brasil) ·
+Español** 여섯 가지이고, 전환에 **재시작은 필요 없습니다**. 고른 다음 프레임부터 화면
+전체가 바뀝니다.
+
+입구는 툴바의 🌐 메뉴, 메뉴 바의 "보기 → 표시 언어", 명령 팔레트, 설정 화면의
+"외관"입니다. 어디에서 바꾸든 `~/.zaivern/config.toml`의 `ui_language`로 모이며,
+기본값 `"auto"`는 OS의 언어를 따릅니다.
+
+들어 있지 않은 언어는 앱을 다시 빌드하지 않고 GitHub에서 설치할 수 있습니다.
+
+```sh
+zai lang list --remote        # 배포처에 있는 언어 팩 보기
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+직접 만들 때는 `zai lang export fr`로 `~/.zaivern/locales/fr.json`에 서식을 써 내고,
+편집한 뒤 `zai lang check fr`로 과부족을 검사하고 `zai lang set fr`. **기본 제공과 같은
+ID를 한 줄만 쓰면 그 한 줄만 덮어쓸 수 있습니다.** 한 단어를 고치려고 사전을 통째로
+들고 있을 필요는 없습니다.
+
+자세한 내용은 [docs/i18n.md](docs/i18n.md)에 있습니다.
+
 ## 주요 기능
 
 ### 충돌 조정 (이 프로젝트가 존재하는 이유)

@@ -271,7 +271,7 @@ impl ZaivernApp {
         // (届いていないときは何もしない = アイドルのコストはゼロ)。
         if locale::take_detection_update() {
             self.apply_ui_language();
-            ctx.request_repaint();
+            crate::perf::repaint(ctx, "locale-detected");
         }
 
         // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする。

@@ -4436,7 +4436,7 @@ mod tests {
         // そのときは `tools/shared-surface-bench.sh` を測り直す必要がある。
         assert_eq!(
             facts.join("\n"),
-            "config.rs/struct: Some(Bracket) ブロック79 追記行559 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック79 追記行1044 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック16 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック16 追記行348 内側true autotrue 衝突false",
+            "config.rs/struct: Some(Bracket) ブロック81 追記行566 内側false autotrue 衝突true\nconfig.rs/default: Some(Bracket) ブロック81 追記行1052 内側true autotrue 衝突true\nkeybinds.rs/enum: Some(Bracket) ブロック16 追記行205 内側false autotrue 衝突true\nkeybinds.rs/array: Some(Bracket) ブロック16 追記行348 内側true autotrue 衝突false",
             "共有面の形が変わりました。tools/shared-surface-bench.sh を測り直してください"
         );
     }
