@@ -4370,9 +4370,18 @@ prunable gitdir file points to non-existent location
                 "{name}: 終了時の判定行が無い (パイプ越しに嘘の緑が出る)"
             );
             assert!(sh.contains("_LABEL="), "{name}: 判定行のラベルが無い");
+            // **行頭固定では足りない。** 実際に `    exec env … cargo xwin check`
+            // (字下げ + env 経由) がこの検査をすり抜けていて、
+            // `tools/windows-check.sh` は判定行を 1 行も出していなかった。
+            // 字下げを落として**行の先頭語**で見る。
+            let bad: Vec<&str> = sh
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("exec ") && !l.starts_with("exec wine"))
+                .collect();
             assert!(
-                !sh.contains("\nexec docker ") && !sh.contains("\nexec cargo "),
-                "{name}: exec でプロセスを置き換えると判定行が出ない"
+                bad.is_empty(),
+                "{name}: exec でプロセスを置き換えると判定行が出ない: {bad:?}"
             );
         }
     }

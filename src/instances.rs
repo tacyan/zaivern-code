@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::zaivern_dir;
+use crate::i18n::{tr, trf};
 
 /// レジストリの置き場所: `~/.zaivern/instances/`。
 pub fn instances_dir() -> PathBuf {
@@ -524,7 +525,11 @@ pub fn set_process_name() {
 
 // ───────────────────────── 表示 (純粋関数) ─────────────────────────
 
-/// 稼働時間を日本語で人間向けに (例: "42秒" / "5分3秒" / "2時間30分" / "3日2時間")。
+/// 稼働時間を人間向けに (例: "42秒" / "5分3秒" / "2時間30分" / "3日2時間")。
+///
+/// 単位語まで選択中の言語で出す。`format!` ではなく [`trf`] を通すのは、
+/// 言語によって単位の綴りも並びも変わるため (en は `{d}d {h}h`)。
+/// テンプレートの綴りは**辞書の鍵そのもの**なので 1 文字も変えないこと。
 pub fn humanize_uptime(secs: u64) -> String {
     let (d, h, m, s) = (
         secs / 86_400,
@@ -533,23 +538,34 @@ pub fn humanize_uptime(secs: u64) -> String {
         secs % 60,
     );
     if d > 0 {
-        format!("{d}日{h}時間")
+        trf(
+            "{d}日{h}時間",
+            &[("d", d.to_string()), ("h", h.to_string())],
+        )
     } else if h > 0 {
-        format!("{h}時間{m}分")
+        trf(
+            "{h}時間{m}分",
+            &[("h", h.to_string()), ("m", m.to_string())],
+        )
     } else if m > 0 {
-        format!("{m}分{s}秒")
+        trf("{m}分{s}秒", &[("m", m.to_string()), ("s", s.to_string())])
     } else {
-        format!("{s}秒")
+        trf("{s}秒", &[("s", s.to_string())])
     }
 }
 
 /// `zai status` 用のテーブル文字列を作る。副作用なし (テーブルテスト用)。
 pub fn render_table(entries: &[InstanceEntry], now_epoch: u64) -> String {
     if entries.is_empty() {
-        return "実行中の Zaivern Code はありません。".to_string();
+        return tr("実行中の Zaivern Code はありません。");
     }
-    let mut rows: Vec<[String; 4]> =
-        vec![["PID", "バージョン", "稼働時間", "ワークスペース"].map(String::from)];
+    // "PID" は訳さない — どの言語でも PID と書く頭字語で、辞書にも項目が無い。
+    let mut rows: Vec<[String; 4]> = vec![[
+        "PID".to_string(),
+        tr("バージョン"),
+        tr("稼働時間"),
+        tr("ワークスペース"),
+    ]];
     for e in entries {
         rows.push([
             e.pid.to_string(),
