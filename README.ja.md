@@ -129,7 +129,8 @@ zai lang install fr --from someone/zaivern-lang-fr
 1 行書けば、その 1 行だけを上書きできます**。1 語直すために辞書を丸ごと持つ必要は
 ありません。
 
-詳しくは [docs/i18n.md](docs/i18n.md) を参照してください。
+**自分の言語に訳したいときは** [docs/translating.md](docs/translating.md) を参照してください
+（Rust も再ビルドも要りません。JSON を 1 枚置くだけです）。仕組みは [docs/i18n.md](docs/i18n.md)。
 
 ## 主な機能
 

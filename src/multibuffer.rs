@@ -1196,6 +1196,268 @@ pub fn head_layout(avail: f32, glyph: f32, has_marks: bool, pending: bool, undoa
 }
 
 // ---------------------------------------------------------------------------
+// 一望 — ファイルごとの要約と空状態 (純粋関数)
+// ---------------------------------------------------------------------------
+//
+// **抜粋を 1 本の列に並べただけでは「全体でどれだけ変わったか」が読めない。**
+// 300 個の抜粋を上から舐めないと分からないのでは索引の意味が薄い。
+// ここはその集約だけを担当する — 画面には触らず、`file_viewers.rs` の
+// `multibuffer_ui` が結果を描く。
+
+/// 1 ファイルぶんの要約。
+///
+/// **数え方は「注記が付いているか」で決まる。**`Source::Changes` を組む
+/// `open_changes_multibuffer` は、追加行を注記なしの種、削除だけのハンクを
+/// 注記付きの種 1 個として入れる。だから注記の有無で追加と削除を分けられる
+/// (注記の**文言**では分けない — 訳された瞬間に壊れるため)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSummary {
+    pub path: PathBuf,
+    /// 表示名 (`Excerpt::label` と同じ)。
+    pub label: String,
+    /// 注記の付いていない注目行の数。`Changes` では**追加・変更された行**。
+    pub added: usize,
+    /// 注記の付いた注目行の数。`Changes` では**削除のあった箇所**
+    /// (消えた行数ではない — 消えた行は本文に無いので数えられない)。
+    pub removed: usize,
+    /// このファイルが持つ抜粋の数。
+    pub excerpts: usize,
+}
+
+impl FileSummary {
+    /// 注目行の総数。
+    pub fn hits(&self) -> usize {
+        self.added + self.removed
+    }
+}
+
+/// ファイルごとの要約を**抜粋の初出順**で返す。
+///
+/// 並べ替えない — `build` が呼び出し側の並び (変更はファイル順、診断は
+/// 深刻度順) を保っているので、ここで崩すと画面の順序と食い違う。
+pub fn file_summaries(mb: &Multibuffer) -> Vec<FileSummary> {
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut out: Vec<FileSummary> = Vec::new();
+    for e in &mb.excerpts {
+        let i = match order.iter().position(|p| p == &e.path) {
+            Some(i) => i,
+            None => {
+                order.push(e.path.clone());
+                out.push(FileSummary {
+                    path: e.path.clone(),
+                    label: e.label.clone(),
+                    added: 0,
+                    removed: 0,
+                    excerpts: 0,
+                });
+                out.len() - 1
+            }
+        };
+        let (a, r) = count_focus(e);
+        out[i].added += a;
+        out[i].removed += r;
+        out[i].excerpts += 1;
+    }
+    out
+}
+
+/// 1 抜粋の注目行を「注記なし / 注記あり」に分けて数える。
+fn count_focus(e: &Excerpt) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for &l in &e.focus {
+        if e.notes.iter().any(|n| n.line == l) {
+            removed += 1;
+        } else {
+            added += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// 要約バッジ (`"+12 −3"`)。**`Source::Changes` 以外は空文字**。
+///
+/// 検索と診断は「何件」が見出しの件数表示で既に読めるので、同じ数を
+/// 見出しにも重ねない (UI 原則: 同じことを 2 か所に出さない)。
+/// 記号だけなので訳語が要らない。
+pub fn summary_badge(source: Source, s: &FileSummary) -> String {
+    if source != Source::Changes {
+        return String::new();
+    }
+    format!("+{} −{}", s.added, s.removed)
+}
+
+/// `ex` がそのファイルの**最初の抜粋**か。
+///
+/// 1 ファイルが複数の抜粋に割れるので、要約は先頭の見出しに 1 回だけ出す
+/// (全部の見出しに出すと同じ数字が並んで読みにくい)。
+fn is_file_head(mb: &Multibuffer, ex: usize) -> bool {
+    let Some(e) = mb.excerpts.get(ex) else {
+        return false;
+    };
+    !mb.excerpts[..ex].iter().any(|o| o.path == e.path)
+}
+
+/// 見出し行 1 本の文言。**描画側はこれを 1 回呼ぶだけ**にする
+/// (組み立てを画面側に散らすと、要約を足すたびに描画コードを触ることになる)。
+pub fn header_title(mb: &Multibuffer, ex: usize) -> String {
+    let Some(e) = mb.excerpts.get(ex) else {
+        return String::new();
+    };
+    let mark = if e.collapsed { "▸" } else { "▾" };
+    let edited = if e.edited() { " ✎" } else { "" };
+    let mut out = format!(
+        "{mark} {}  {}–{}{edited}",
+        e.label,
+        e.first_line,
+        e.last_line()
+    );
+    if is_file_head(mb, ex) {
+        // **1 ファイルぶんだけ数える。** ここは可視行ごとに毎フレーム走るので、
+        // `file_summaries` (全ファイルぶんを確保する) を呼ぶと
+        // 見えている見出しの数だけ無駄な Vec を作ることになる。
+        let badge = summary_badge(mb.source, &summary_of(mb, ex));
+        if !badge.is_empty() {
+            out.push_str("  ");
+            out.push_str(&badge);
+        }
+    }
+    out
+}
+
+/// `ex` と同じファイルの抜粋だけを数えた要約。
+fn summary_of(mb: &Multibuffer, ex: usize) -> FileSummary {
+    let Some(e) = mb.excerpts.get(ex) else {
+        return FileSummary {
+            path: PathBuf::new(),
+            label: String::new(),
+            added: 0,
+            removed: 0,
+            excerpts: 0,
+        };
+    };
+    let mut s = FileSummary {
+        path: e.path.clone(),
+        label: e.label.clone(),
+        added: 0,
+        removed: 0,
+        excerpts: 0,
+    };
+    for o in mb.excerpts.iter().filter(|o| o.path == e.path) {
+        let (a, r) = count_focus(o);
+        s.added += a;
+        s.removed += r;
+        s.excerpts += 1;
+    }
+    s
+}
+
+/// 一望に出すファイル数の上限。**超えたぶんは黙って消さず数えて返す**。
+pub const OVERVIEW_MAX_FILES: usize = 20;
+
+/// 打ち切りの文言 (原文)。表示側が [`crate::i18n::trf`] に通す。
+///
+/// **文言を集約の隣に置く**のは、上限を変えた人が文言も同時に見るため。
+pub const OVERVIEW_CUT_MSG: &str = "他 {n} ファイルは打ち切りました";
+
+/// ファイルごとの要約を並べた「一望」。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Overview {
+    /// 1 ファイル 1 行 (`"src/app.rs  +12 −3"`)。
+    pub lines: Vec<String>,
+    /// 上限で落としたファイル数 (0 なら全部入っている)。
+    pub cut: usize,
+}
+
+/// ファイルごとの要約を `max_files` 行までにまとめる。
+///
+/// **落としたぶんは [`Overview::cut`] に必ず出る** — 黙って切ると
+/// 「7 ファイルしか変わっていない」という嘘の読み取りを作る。
+pub fn overview(mb: &Multibuffer, max_files: usize) -> Overview {
+    let sums = file_summaries(mb);
+    let cut = sums.len().saturating_sub(max_files);
+    let lines = sums
+        .iter()
+        .take(max_files)
+        .map(|s| {
+            let badge = summary_badge(mb.source, s);
+            if badge.is_empty() {
+                format!("{}  ×{}", s.label, s.hits())
+            } else {
+                format!("{}  {badge}", s.label)
+            }
+        })
+        .collect();
+    Overview { lines, cut }
+}
+
+/// 空状態の見出し (原文)。**出所ごとに何が無いのかを言う。**
+///
+/// 「表示するものがありません」だけだと、何を探した結果なのかが読めない。
+pub fn empty_message(source: Source) -> &'static str {
+    match source {
+        Source::Search => "一致はありません",
+        Source::Problems => "問題はありません",
+        Source::Changes => "変更はありません",
+    }
+}
+
+/// 空状態の補足 (原文)。次に何をすればよいかを 1 行で言う。
+pub fn empty_hint(source: Source) -> &'static str {
+    match source {
+        Source::Search => "検索語を変えてもう一度試してください",
+        Source::Problems => "この作業ツリーに診断は出ていません",
+        Source::Changes => "作業ツリーは HEAD と同じ内容です",
+    }
+}
+
+/// 空状態カードの最大幅。
+const EMPTY_CARD_MAX_W: f32 = 420.0;
+/// 空状態カードの内側余白。
+const EMPTY_CARD_PAD: f32 = 16.0;
+
+/// 空状態カードの矩形。**常に可用領域の中央 1 枚**で、どの寸法でも必ず収まる。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmptyCard {
+    /// カードの外形。
+    pub card: egui::Rect,
+    /// 見出しを置く矩形 (カードの内側・上段)。
+    pub title: egui::Rect,
+    /// 補足を置く矩形 (カードの内側・下段)。**`title` と重ならない。**
+    pub hint: egui::Rect,
+}
+
+/// 空状態カードの割り付け (純粋関数)。
+///
+/// - `avail` 描ける領域 / `row_h` 1 行の高さ (px)
+///
+/// 高さが足りない領域では**カードごと縮む**ので、下や上へ取り残されない。
+pub fn empty_card(avail: egui::Rect, row_h: f32) -> EmptyCard {
+    let row_h = row_h.max(1.0);
+    let aw = avail.width().max(0.0);
+    let ah = avail.height().max(0.0);
+    // 余白は可用領域が小さいほど縮む (0 幅でも負にならない)
+    let pad = EMPTY_CARD_PAD.min(aw * 0.25).min(ah * 0.25).max(0.0);
+    let w = (aw - pad * 2.0).clamp(0.0, EMPTY_CARD_MAX_W).min(aw);
+    let h = (row_h * 2.0 + pad * 2.0).min(ah);
+    let x = avail.left() + (aw - w) * 0.5;
+    let y = avail.top() + (ah - h) * 0.5;
+    let card = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+    // 内側を上下 2 段へ等分する (段の境界を共有するので重ならない)
+    let side = pad.min(w * 0.5);
+    let inner_w = (w - side * 2.0).max(0.0);
+    let inner_h = (h - pad * 2.0).max(0.0);
+    let line_h = inner_h * 0.5;
+    let ix = card.left() + side;
+    let iy = card.top() + (h - inner_h) * 0.5;
+    EmptyCard {
+        card,
+        title: egui::Rect::from_min_size(egui::pos2(ix, iy), egui::vec2(inner_w, line_h)),
+        hint: egui::Rect::from_min_size(egui::pos2(ix, iy + line_h), egui::vec2(inner_w, line_h)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // テスト
 // ---------------------------------------------------------------------------
 
@@ -1951,6 +2213,184 @@ mod tests {
         assert!(head_layout(1200.0, 8.0, true, true, true).labels);
         assert!(!head_layout(180.0, 8.0, true, true, true).labels);
         assert_eq!(head_layout(180.0, 8.0, true, true, true).replace_w, 0.0);
+    }
+
+    // ── 一望 (ファイルごとの要約 / 空状態) ─────────────────────────
+
+    /// `open_changes_multibuffer` と同じ形の種を作る。
+    ///
+    /// 追加行は注記なし、削除だけのハンクは注記 1 個 (**文言ではなく注記の
+    /// 有無で数える**ので、ここでは原文をそのまま置いてよい)。
+    fn changes_mb(files: &[(&str, &[usize], &[usize])]) -> Multibuffer {
+        let mut seeds: Vec<Seed> = Vec::new();
+        for (name, added, deleted) in files {
+            for &l in *added {
+                seeds.push(Seed::plain(p(name), l));
+            }
+            for &l in *deleted {
+                seeds.push(Seed {
+                    path: p(name),
+                    line: l,
+                    note: "ここで削除".into(),
+                    severity: 0,
+                    mark: None,
+                });
+            }
+        }
+        build(
+            Source::Changes,
+            "proj",
+            &seeds,
+            Some(Path::new("proj")),
+            BuildOpts {
+                context: 0,
+                max_excerpts: 100,
+                max_lines: 100,
+            },
+            |_| Some(text(60)),
+        )
+    }
+
+    #[test]
+    fn ファイルごとの要約は初出順で追加と削除を分けて数える() {
+        let mb = changes_mb(&[
+            ("app.rs", &[10, 11, 12], &[30]),
+            ("git.rs", &[5], &[]),
+            ("app.rs", &[50], &[]), // 同じファイルが後から出ても 1 件にまとまる
+        ]);
+        let sums = file_summaries(&mb);
+        assert_eq!(sums.len(), 2, "ファイル数: {sums:?}");
+        assert_eq!(sums[0].label, "app.rs", "初出順が崩れている");
+        assert_eq!((sums[0].added, sums[0].removed), (4, 1));
+        assert!(sums[0].excerpts >= 2, "離れた行は別の抜粋になる");
+        assert_eq!(sums[0].hits(), 5);
+        assert_eq!((sums[1].added, sums[1].removed), (1, 0));
+        // バッジは変更の面だけ。検索・診断では空 (件数は見出しに出ている)
+        assert_eq!(summary_badge(Source::Changes, &sums[0]), "+4 −1");
+        assert!(summary_badge(Source::Search, &sums[0]).is_empty());
+        assert!(summary_badge(Source::Problems, &sums[0]).is_empty());
+    }
+
+    #[test]
+    fn 見出しの要約はファイルの先頭の抜粋にだけ出る() {
+        let mb = changes_mb(&[("app.rs", &[10, 50], &[])]);
+        assert_eq!(
+            mb.excerpts.len(),
+            2,
+            "離れた 2 行は 2 抜粋: {:?}",
+            mb.excerpts.len()
+        );
+        let head = header_title(&mb, 0);
+        assert!(head.contains("app.rs"), "{head}");
+        assert!(head.contains("+2 −0"), "先頭の見出しに要約が無い: {head}");
+        let tail = header_title(&mb, 1);
+        assert!(
+            !tail.contains("+2 −0"),
+            "同じ数字が 2 度出ている (読みにくい): {tail}"
+        );
+        // 範囲外でも panic しない
+        assert_eq!(header_title(&mb, 99), "");
+        // 検索の面ではバッジを重ねない
+        let s = sample();
+        assert!(
+            !header_title(&s, 0).contains('+'),
+            "{}",
+            header_title(&s, 0)
+        );
+    }
+
+    #[test]
+    fn 一望は上限で打ち切って落とした件数を返す() {
+        let names: Vec<String> = (0..25).map(|i| format!("f{i}.rs")).collect();
+        let files: Vec<(&str, &[usize], &[usize])> = names
+            .iter()
+            .map(|n| (n.as_str(), &[7usize][..], &[][..]))
+            .collect();
+        let mb = changes_mb(&files);
+        let ov = overview(&mb, OVERVIEW_MAX_FILES);
+        assert_eq!(ov.lines.len(), OVERVIEW_MAX_FILES);
+        assert_eq!(ov.cut, 5, "落としたぶんを数えていない");
+        assert!(ov.lines[0].contains("+1 −0"), "{}", ov.lines[0]);
+        // **黙って切らない**: 文言に件数の差し込み口がある
+        assert!(
+            OVERVIEW_CUT_MSG.contains("{n}"),
+            "打ち切りの文言に件数が入らない"
+        );
+        // 全部入るときは 0
+        let small = changes_mb(&[("a.rs", &[1], &[])]);
+        assert_eq!(overview(&small, OVERVIEW_MAX_FILES).cut, 0);
+        // 検索・診断の面は件数表記へ落ちる
+        let ov2 = overview(&sample(), OVERVIEW_MAX_FILES);
+        assert!(ov2.lines.iter().all(|l| l.contains('×')), "{ov2:?}");
+        // 空の面では 1 行も出さない
+        assert_eq!(overview(&Multibuffer::default(), 5), Overview::default());
+    }
+
+    #[test]
+    fn 空状態の文言は出所ごとに何が無いのかを言う() {
+        assert_eq!(empty_message(Source::Changes), "変更はありません");
+        for s in [Source::Search, Source::Problems, Source::Changes] {
+            assert!(!empty_message(s).trim().is_empty());
+            assert!(!empty_hint(s).trim().is_empty());
+            assert_ne!(empty_message(s), empty_hint(s));
+        }
+        // 3 つとも違う文言 (どの面でも同じ文だと出所が読めない)
+        let msgs = [
+            empty_message(Source::Search),
+            empty_message(Source::Problems),
+            empty_message(Source::Changes),
+        ];
+        let mut uniq = msgs.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "{msgs:?}");
+        // 空判定そのもの (開いた直後に何を出すかの分岐点)
+        assert!(Multibuffer::default().is_empty());
+        assert!(!changes_mb(&[("a.rs", &[1], &[])]).is_empty());
+    }
+
+    #[test]
+    fn 空状態カードはどの寸法でも中央に収まり二段が重ならない() {
+        for &(w, h, row_h) in &[
+            (900.0_f32, 700.0_f32, 16.0_f32),
+            (1200.0, 300.0, 16.0),
+            (300.0, 900.0, 16.0),
+            (200.0, 40.0, 16.0),
+            (60.0, 20.0, 16.0),
+            (0.0, 0.0, 16.0),
+            (900.0, 700.0, 0.0), // 行高 0 でも潰れない
+        ] {
+            let avail = egui::Rect::from_min_size(egui::pos2(11.0, 37.0), egui::vec2(w, h));
+            let c = empty_card(avail, row_h);
+            assert!(
+                avail.contains_rect(c.card),
+                "{w}x{h}: カードがはみ出した {:?}",
+                c.card
+            );
+            assert!(
+                c.card.contains_rect(c.title) && c.card.contains_rect(c.hint),
+                "{w}x{h}: 中身がカードからはみ出した"
+            );
+            assert!(
+                c.title.bottom() <= c.hint.top() + 0.01,
+                "{w}x{h}: 見出しと補足が重なった"
+            );
+            for r in [c.card, c.title, c.hint] {
+                assert!(r.width() >= 0.0 && r.height() >= 0.0, "{w}x{h}: 負の矩形");
+            }
+            if w > 0.0 && h > 0.0 {
+                assert!(
+                    (c.card.center().x - avail.center().x).abs() < 0.01,
+                    "{w}x{h}"
+                );
+                assert!(
+                    (c.card.center().y - avail.center().y).abs() < 0.01,
+                    "{w}x{h}"
+                );
+            }
+            // 広い領域でも横いっぱいには広げない (中央 1 枚に見える幅で止める)
+            assert!(c.card.width() <= EMPTY_CARD_MAX_W + 0.01);
+        }
     }
 
     /// **統合テスト。** 実ファイルを一時ディレクトリに作り、マルチバッファ経由で

@@ -212,7 +212,39 @@ pub fn bulk_targets(mode: BulkMode, agents: &[AgentPick]) -> Vec<u64> {
         .collect()
 }
 
+/// 承認キューの 1 件に対して撃てる操作。
+///
+/// **知らない語は `None`** — 綴り違いを黙って「承認」に落とすと、
+/// 押していない承認が飛ぶ ([`AgentAct::parse`] と同じ立場)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveAct {
+    /// この 1 件だけ承認する
+    Approve,
+    /// この 1 件だけ拒否する
+    Deny,
+    /// 以後この種別 × このエージェントを常に許可する
+    Always,
+    /// 以後この種別 × このエージェントを常に拒否する
+    AlwaysDeny,
+}
+
+impl ApproveAct {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(Self::Approve),
+            "deny" => Some(Self::Deny),
+            "always" => Some(Self::Always),
+            "always_deny" => Some(Self::AlwaysDeny),
+            _ => None,
+        }
+    }
+}
+
 /// UI スレッドへ渡す問い合わせの種類。
+///
+/// `Clone` なのは、**git を UI スレッドで待たない**ための聞き直しに要るため
+/// ([`Query::retries_while_pending`])。
+#[derive(Clone)]
 pub enum Query {
     /// タブ・エージェント・カーソル等の全体状態
     State,
@@ -287,6 +319,37 @@ pub enum Query {
     /// スマホから押すと**誰も押せないダイアログが PC に出たまま**になる。
     /// リモートから届くのは「Esc で止める」までに留める。
     BulkStop { mode: BulkMode },
+
+    // ─── ここから下はスマホの「PC と同じことができる」ための読み取り ───
+    //
+    // **git と横断検索は UI スレッドで走らせない** (CLAUDE.md の鉄則:
+    // `git status` は単独 0.03 秒でも同時実行で 2.3〜10.2 秒かかる)。
+    // UI 側は控えを読むだけで、控えが無ければ `pending` と即答する。
+    // 実際に待つのは接続ごとのスレッド ([`Query::retries_while_pending`])。
+    /// 未コミットの変更をファイル単位で返す (PC の `open_changes_multibuffer`
+    /// と同じ入口 = `git::working_tree_diff` + `diff::parse_unified`)。
+    Changes,
+    /// 1 ファイルぶんのハンク。`rel` はルート相対 ([`safe_rel`] 済み)。
+    Diff { rel: String },
+    /// 端末の履歴を**色つき**で返す。`agent` が負ならアクティブなセッション。
+    /// `before` は「この絶対行より前」(None なら末尾)。
+    Scrollback {
+        agent: i64,
+        lines: usize,
+        before: Option<usize>,
+    },
+    /// 承認キューの中身 (種別・根拠行・待ち時間)。
+    Approvals,
+    /// 承認キューの 1 件を決着させる。
+    Approve { id: u64, act: ApproveAct },
+    /// ファイルを**開かずに**読む (PC のアクティブタブを奪わない)。
+    Read {
+        rel: String,
+        from: usize,
+        lines: usize,
+    },
+    /// ワークスペース横断検索 (`file_search` へ合流)。
+    Search { q: String, max: usize },
 }
 
 impl Query {
@@ -317,7 +380,36 @@ impl Query {
     fn ack(&self) -> &'static str {
         r#"{"ok":true,"queued":true}"#
     }
+
+    /// 応答が `"pending": true` のとき、**聞き直してよい**要求か。
+    ///
+    /// git と横断検索は UI スレッドで待てない (CLAUDE.md: 同時実行で
+    /// 2.3〜10.2 秒かかり、その間フレームが止まる)。そこで UI 側は
+    /// 「まだ用意できていない」と**即答**し、裏のスレッドが結果を作る。
+    /// 待つのは接続ごとのこのスレッドなので、**UI は 1 フレームも止まらない**
+    /// のに、スマホから見れば 1 回の GET で答えが返る。
+    fn retries_while_pending(&self) -> bool {
+        matches!(
+            self,
+            Query::Changes | Query::Diff { .. } | Query::Search { .. }
+        )
+    }
 }
+
+/// 応答 JSON が「まだ用意できていない」と言っているか (**純関数**)。
+///
+/// 読めない JSON は `false` — 聞き直しの輪に入れて塞ぐより、
+/// そのままスマホへ返して見せるほうが原因が分かる。
+pub fn is_pending(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("pending").and_then(|p| p.as_bool()))
+        .unwrap_or(false)
+}
+
+/// `pending` のときに聞き直す間隔。短すぎると UI スレッドを無駄に起こし、
+/// 長すぎるとスマホの体感が悪くなる。
+const PENDING_POLL: Duration = Duration::from_millis(120);
 
 /// サーバスレッド → UI スレッドへのリクエスト。UI 側は必ず respond すること。
 pub struct Request {
@@ -819,6 +911,111 @@ fn handle_conn(
         ("GET", "/api/files") => Query::Files,
         ("GET", "/api/term") => Query::Term,
         ("GET", "/api/agents") => Query::Agents,
+        // ─── ここから下はスマホを PC と同じ土俵に載せるための読み取り ───
+        // GET のクエリは `?t=` と同じ文字列から取り出す (認証は上で済んでいる)。
+        ("GET", "/api/changes") => Query::Changes,
+        ("GET", "/api/diff") => {
+            // パスは必ずルート相対へ畳む。畳めない綴りは**実行前に**断る
+            let Some(rel) = query_param(&query_str, "path")
+                .as_deref()
+                .and_then(safe_rel)
+            else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"bad path"}"#,
+                );
+            };
+            Query::Diff { rel }
+        }
+        ("GET", "/api/scrollback") => Query::Scrollback {
+            agent: query_param(&query_str, "agent")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(-1),
+            lines: clamp_count(
+                query_param(&query_str, "lines")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0),
+                SCROLLBACK_DEFAULT,
+                SCROLLBACK_MAX,
+            ),
+            // 0 は「先頭より前」= 空。無指定 (末尾) と区別する
+            before: query_param(&query_str, "before")
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v >= 0)
+                .map(|v| v as usize),
+        },
+        ("GET", "/api/approvals") => Query::Approvals,
+        // 承認は**知らない語を絶対に通さない** (押していない承認が飛ぶ)
+        ("POST", "/api/approve") => {
+            let Some(act) = ApproveAct::parse(&s("act")) else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"unknown act (approve|deny|always|always_deny)"}"#,
+                );
+            };
+            // id は文字列でも数値でも受ける (JS の JSON は数値に落としがち)
+            let id = json
+                .get("id")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|t| t.trim().parse::<u64>().ok()))
+                })
+                .unwrap_or(u64::MAX);
+            Query::Approve { id, act }
+        }
+        ("GET", "/api/read") => {
+            let Some(rel) = query_param(&query_str, "path")
+                .as_deref()
+                .and_then(safe_rel)
+            else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"bad path"}"#,
+                );
+            };
+            Query::Read {
+                rel,
+                from: query_param(&query_str, "from")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(1) as usize,
+                lines: clamp_count(
+                    query_param(&query_str, "lines")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0),
+                    READ_DEFAULT,
+                    READ_MAX,
+                ),
+            }
+        }
+        ("GET", "/api/search") => {
+            // 1 文字の検索は索引全体を舐めるだけで役に立たない。断る
+            let q = query_param(&query_str, "q").unwrap_or_default();
+            if q.trim().chars().count() < SEARCH_MIN_CHARS {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"query too short (2+ chars)"}"#,
+                );
+            }
+            Query::Search {
+                q: q.trim().to_string(),
+                max: clamp_count(
+                    query_param(&query_str, "max")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0),
+                    SEARCH_DEFAULT,
+                    SEARCH_MAX,
+                ),
+            }
+        }
         // 一覧の行から撃つ 1 体宛ての操作。知らない語は実行せずに断る
         ("POST", "/api/agent_act") => {
             let Some(act) = AgentAct::parse(&s("act")) else {
@@ -929,43 +1126,30 @@ fn handle_conn(
     };
 
     // UI スレッドへ渡す
-    let (rtx, rrx) = mpsc::sync_channel::<String>(1);
     let immediate = query.is_fire_and_forget().then(|| query.ack());
-    if tx.send(Request { query, reply: rtx }).is_err() {
-        return respond(
-            &mut stream,
+    let retry_pending = query.retries_while_pending();
+    let deadline = Instant::now() + REMOTE_TIMEOUT;
+    let closed = |stream: &mut TcpStream| {
+        respond(
+            stream,
             500,
             "application/json",
             br#"{"ok":false,"error":"app closed"}"#,
-        );
-    }
-
-    // 一方向の指示は積んだ時点で成功。UI スレッドの復帰を待たない。
-    if let Some(js) = immediate {
-        crate::perf::repaint(&ctx, "remote");
-        return respond(
-            &mut stream,
-            200,
-            "application/json; charset=utf-8",
-            js.as_bytes(),
-        );
-    }
-    // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
-    // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
-    // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
-    let deadline = Instant::now() + REMOTE_TIMEOUT;
-    let reply = loop {
-        crate::perf::repaint(&ctx, "remote");
-        match rrx.recv_timeout(Duration::from_millis(150)) {
-            Ok(js) => break Some(js),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    break None;
-                }
-            }
-        }
+        )
     };
+    let Ok(mut reply) = send_query(&tx, &ctx, query.clone(), immediate, deadline) else {
+        return closed(&mut stream);
+    };
+    // **git と横断検索を UI スレッドで待たない**ための聞き直し (CLAUDE.md)。
+    // UI 側は控えが無ければ `pending` と即答し、裏のスレッドが結果を作る。
+    // 待つのはこのスレッドだけなので、フレームは 1 度も止まらない。
+    while retry_pending && reply.as_deref().is_some_and(is_pending) && Instant::now() < deadline {
+        std::thread::sleep(PENDING_POLL);
+        let Ok(next) = send_query(&tx, &ctx, query.clone(), immediate, deadline) else {
+            return closed(&mut stream);
+        };
+        reply = next;
+    }
     match reply {
         Some(js) => respond(
             &mut stream,
@@ -980,6 +1164,43 @@ fn handle_conn(
             br#"{"ok":false,"error":"timeout"}"#,
         ),
     }
+}
+
+/// 要求を 1 件 UI スレッドへ渡して応答を受け取る。
+///
+/// `immediate` が `Some` なら**積んだ時点で成功**として即座に返す
+/// (一方向の指示。macOS はウィンドウが背面だとイベントループごと凍結する)。
+/// `Err(())` はアプリが閉じたことだけを意味する。
+fn send_query(
+    tx: &mpsc::Sender<Request>,
+    ctx: &egui::Context,
+    query: Query,
+    immediate: Option<&'static str>,
+    deadline: Instant,
+) -> Result<Option<String>, ()> {
+    let (rtx, rrx) = mpsc::sync_channel::<String>(1);
+    if tx.send(Request { query, reply: rtx }).is_err() {
+        return Err(());
+    }
+    if let Some(js) = immediate {
+        crate::perf::repaint(ctx, "remote");
+        return Ok(Some(js.to_string()));
+    }
+    // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
+    // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
+    // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
+    Ok(loop {
+        crate::perf::repaint(ctx, "remote");
+        match rrx.recv_timeout(Duration::from_millis(150)) {
+            Ok(js) => break Some(js),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+            }
+        }
+    })
 }
 
 /// UI スレッドの応答を待つ上限。背面ウィンドウでもフレームが 1 回は来る余裕を取る。
@@ -1008,6 +1229,291 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  上限 — **どれも黙って切らない**。切ったら必ず `truncated` で伝える
+//  (切られたことを知らせない一覧は、無いのと同じくらい危ない)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `/api/scrollback` の既定行数と上限 (契約: 1〜2000)。
+pub const SCROLLBACK_DEFAULT: usize = 200;
+pub const SCROLLBACK_MAX: usize = 2000;
+/// `/api/read` の既定行数と上限 (契約: 1〜2000)。
+pub const READ_DEFAULT: usize = 400;
+pub const READ_MAX: usize = 2000;
+/// `/api/search` の検索語の最小文字数 / 既定件数 / 上限。
+pub const SEARCH_MIN_CHARS: usize = 2;
+pub const SEARCH_DEFAULT: usize = 100;
+pub const SEARCH_MAX: usize = 500;
+/// `/api/changes` が返すファイル数の上限。
+pub const CHANGES_CAP: usize = 500;
+/// `/api/diff` が返すハンク数の上限。
+pub const DIFF_HUNK_CAP: usize = 300;
+/// 追跡外ファイルを「全部追加された差分」として読むときの 1 ファイル上限。
+pub const UNTRACKED_READ_CAP: u64 = 256 * 1024;
+
+// ══════════════════════════════════════════════════════════════════════
+//  GET のクエリ文字列 / パスの正規化 (すべて純関数)
+//
+//  スマホから届く文字列は**全部疑う**。パスは必ずルート配下へ畳んでから
+//  使い、畳めないものは受け取らない (fail-closed)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `%XX` と `+` を解いた文字列。壊れた `%` はそのまま残す
+/// (弾いてしまうと `100%` のような素直な検索語が通らなくなる)。
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// クエリ文字列から 1 つのキーの値を取り出す (`%XX` 復号つき)。
+/// 同じキーが複数あれば**最初の 1 つ**。
+pub fn query_param(qs: &str, key: &str) -> Option<String> {
+    qs.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+/// スマホから届いた相対パスを、**ルート配下に必ず収まる形**へ畳む。
+///
+/// 弾くもの (どれも `None`):
+/// * 空、`..` を 1 つでも含む
+/// * 絶対パス (`/a`、`C:\a`、`\\server\share`)
+/// * NUL を含む (OS 呼び出しの終端に化ける)
+///
+/// 区切りは `/` へ寄せ、`.` と空の要素は落とす。**返り値は必ず相対**なので、
+/// 呼び出し側は `root.join()` してよい (それでも実体の前方一致は別途見る)。
+pub fn safe_rel(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    let unified = raw.replace('\\', "/");
+    if unified.starts_with('/') {
+        return None;
+    }
+    // Windows のドライブ指定 (`C:` / `c:/x`) とドライブ相対 (`C:x`) の両方を弾く
+    let mut ch = unified.chars();
+    if let (Some(c0), Some(':')) = (ch.next(), ch.next()) {
+        if c0.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in unified.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => return None,
+            s => parts.push(s),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// 件数の指定を「無指定なら既定・範囲外なら丸める」で受ける (**純関数**)。
+///
+/// 0 や負数を「無指定」として扱うのは、`?lines=` を空で送ってくる素朴な
+/// クライアントが必ず居るため。上限は呼び出し側が契約どおりに渡す。
+pub fn clamp_count(v: i64, default: usize, max: usize) -> usize {
+    if v <= 0 {
+        return default.min(max);
+    }
+    (v as usize).min(max)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  端末の色 — ANSI ではなく**構造**でスマホへ渡す
+//
+//  スマホ側でエスケープを解釈させない (パーサが 2 つになると必ずずれる)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `#rrggbb`。
+pub fn hex_rgb(r: u8, g: u8, b: u8) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// 256 色の番号を `#rrggbb` にする (**純関数**)。
+///
+/// 0〜15 はテーマの 16 色をそのまま使い、16〜231 は 6×6×6 の立方体、
+/// 232〜255 は 24 段の灰色。段の作り方は `terminal::ansi_color` と同じ式で、
+/// **PC の端末とスマホで同じ色に見える**ことがここの目的。
+pub fn ansi_hex(i: u8, base: &[[u8; 3]; 16]) -> String {
+    if i < 16 {
+        let c = base[i as usize];
+        hex_rgb(c[0], c[1], c[2])
+    } else if i < 232 {
+        let i = i - 16;
+        let f = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        hex_rgb(f(i / 36), f((i % 36) / 6), f(i % 6))
+    } else {
+        let v = 8 + (i - 232) * 10;
+        hex_rgb(v, v, v)
+    }
+}
+
+/// 端末セル 1 個ぶんの見た目。色は `#rrggbb`、既定色は `None` (= 省略)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellStyle {
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl CellStyle {
+    /// 既定の見た目か (span を畳むときの「捨ててよい」判定に使う)。
+    pub fn is_plain(&self) -> bool {
+        *self == CellStyle::default()
+    }
+}
+
+/// 同じ見た目が続くセルを 1 つに畳んだもの。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: CellStyle,
+}
+
+/// セル列を span へ畳む (**純関数**)。
+///
+/// 2 つのことを同時にやる:
+/// * 同じ見た目が続く間は 1 つにまとめる (バイト数を減らす)
+/// * **行末の「既定色の空白」を落とす** — 80〜200 桁の詰め物をそのまま
+///   送ると、実際の文字よりパディングのほうが大きくなる
+///
+/// 落とすのは*既定色の*空白だけ。背景色の付いた空白は見た目そのものなので残す。
+pub fn fold_spans(cells: &[(String, CellStyle)]) -> Vec<Span> {
+    // 行末の詰め物を先に切る (畳んでから切ると、色付きの空白まで消しかねない)
+    let mut end = cells.len();
+    while end > 0 {
+        let (t, st) = &cells[end - 1];
+        if st.is_plain() && (t.is_empty() || t.chars().all(|c| c == ' ')) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut out: Vec<Span> = Vec::new();
+    for (t, st) in &cells[..end] {
+        // 空セル (未描画) は 1 桁の空白として扱う。落とすと桁がずれる
+        let t = if t.is_empty() { " " } else { t.as_str() };
+        match out.last_mut() {
+            Some(prev) if prev.style == *st => prev.text.push_str(t),
+            _ => out.push(Span {
+                text: t.to_string(),
+                style: st.clone(),
+            }),
+        }
+    }
+    out
+}
+
+/// span 列を契約どおりの JSON へ落とす。
+///
+/// 既定値のキーは**出さない** (`fg`/`bg` は既定色なら省略、真偽は false なら省略)。
+/// 1 画面 2000 行ぶん送るので、キー 1 つの差が実測で効く。
+pub fn spans_json(spans: &[Span]) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = spans
+        .iter()
+        .map(|s| {
+            let mut o = serde_json::Map::new();
+            o.insert("t".into(), serde_json::Value::String(s.text.clone()));
+            if let Some(fg) = &s.style.fg {
+                o.insert("fg".into(), serde_json::Value::String(fg.clone()));
+            }
+            if let Some(bg) = &s.style.bg {
+                o.insert("bg".into(), serde_json::Value::String(bg.clone()));
+            }
+            for (k, v) in [
+                ("bold", s.style.bold),
+                ("italic", s.style.italic),
+                ("underline", s.style.underline),
+            ] {
+                if v {
+                    o.insert(k.into(), serde_json::Value::Bool(true));
+                }
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  変更一覧 — 真実の在り処は git 1 つ (スマホ側で数え直さない)
+// ══════════════════════════════════════════════════════════════════════
+
+/// unified diff のヘッダから 1 文字の状態を決める (**純関数**)。
+///
+/// `"M"|"A"|"D"|"R"`。追跡外 (`"?"`) は diff に出てこないので、
+/// `git status` 側から別に来る ([`untracked_paths_z`])。
+pub fn change_status(old_path: &str, new_path: &str, is_rename: bool) -> &'static str {
+    const DEV_NULL: &str = "/dev/null";
+    if is_rename {
+        "R"
+    } else if old_path == DEV_NULL || old_path.is_empty() {
+        "A"
+    } else if new_path == DEV_NULL || new_path.is_empty() {
+        "D"
+    } else {
+        "M"
+    }
+}
+
+/// `git status --porcelain=v1 -z` の出力から**追跡外**のパスだけ拾う (**純関数**)。
+///
+/// `-z` を使うのは、引用 (`"a b.txt"`) を一切通さないため。改名 (`R`/`C`) は
+/// **2 レコード**使うので、後ろの 1 つを読み飛ばさないと元パスを
+/// エントリと取り違える。
+pub fn untracked_paths_z(out: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let mut skip_next = false;
+    for rec in out.split('\0').filter(|r| !r.is_empty()) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let Some((xy, path)) = rec.split_at_checked(3) else {
+            continue;
+        };
+        let x = xy.as_bytes()[0];
+        if x == b'R' || x == b'C' {
+            skip_next = true;
+        }
+        if xy.starts_with("??") {
+            v.push(path.replace('\\', "/"));
+        }
+    }
+    v
 }
 
 // ─── ページの多言語化 (Language Pack) ────────────────────────────────
@@ -1093,879 +1599,24 @@ fn page_for_client(template: &str) -> String {
 
 // ─── スマホ用ページ (完全内蔵・依存ゼロ) ─────────────────────────────
 
-const PAGE: &str = r##"<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0d1117">
-<title>Zaivern Remote</title>
-<script>/*__ZV_I18N__*/</script>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-  html,body { height:100%; }
-  body {
-    background:#0d1117; color:#e6edf3;
-    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
-    display:flex; flex-direction:column; overflow:hidden;
-    -webkit-text-size-adjust:100%;
-  }
-  header {
-    flex:none; display:flex; align-items:center; gap:8px;
-    padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;
-    background:#161b22; border-bottom:1px solid #21262d;
-  }
-  header .logo { font-weight:800; font-size:15px; color:#7ee1ff; letter-spacing:.5px; }
-  header .ws { font-size:12px; color:#8b949e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
-  #dot { width:9px; height:9px; border-radius:50%; background:#f85149; flex:none; }
-  #dot.on { background:#3fb950; box-shadow:0 0 6px #3fb95088; }
-  main { flex:1; overflow:hidden; position:relative; }
-  .view { position:absolute; inset:0; display:none; flex-direction:column; }
-  .view.act { display:flex; }
-  nav {
-    flex:none; display:flex; background:#161b22; border-top:1px solid #21262d;
-    padding-bottom:env(safe-area-inset-bottom);
-  }
-  nav button {
-    flex:1; background:none; border:none; color:#8b949e; font-size:10.5px;
-    padding:8px 0 6px; display:flex; flex-direction:column; align-items:center; gap:2px;
-  }
-  nav button .ico { font-size:20px; }
-  nav button.act { color:#7ee1ff; }
-  .chips { flex:none; display:flex; gap:6px; overflow-x:auto; padding:8px 10px; -webkit-overflow-scrolling:touch; }
-  .chips::-webkit-scrollbar { display:none; }
-  .chip {
-    flex:none; background:#21262d; color:#c9d1d9; border:1px solid #30363d;
-    border-radius:14px; padding:6px 12px; font-size:12.5px; max-width:46vw;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }
-  .chip.act { background:#1f3a5f; border-color:#7ee1ff; color:#7ee1ff; }
-  .chip.mic { font-size:15px; padding:6px 10px; }
-  .chip.mic.rec { background:#6e2c1e; border-color:#f85149; color:#fff; animation:zvpulse 1.1s ease-in-out infinite; }
-  @keyframes zvpulse { 50% { box-shadow:0 0 12px #f85149; } }
-  #ta {
-    flex:1; width:100%; background:#0d1117; color:#e6edf3; border:none; outline:none;
-    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
-    padding:10px 12px; resize:none; white-space:pre; overflow:auto;
-  }
-  .bar { flex:none; display:flex; gap:8px; padding:8px 10px; background:#161b22; border-top:1px solid #21262d; align-items:center; }
-  .btn {
-    background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
-    padding:10px 14px; font-size:13.5px; font-weight:600;
-  }
-  .btn.pri { background:#1f6feb; border-color:#1f6feb; color:#fff; }
-  .btn.warn { background:#6e2c1e; border-color:#f85149; }
-  .btn:active { opacity:.7; }
-  /* 宛先がいないときは押せない (誤爆ではなく「押しても何も起きない」を潰す) */
-  .btn[disabled] { opacity:.35; }
-  /* 一括操作の宛先行。宛先が無い (エージェント 0 体) ときは高さも取らない */
-  #btgt {
-    flex:none; display:none; align-items:center; gap:8px;
-    padding:6px 10px; background:#161b22; border-bottom:1px solid #21262d;
-    font-size:12px; color:#8b949e;
-  }
-  #btgt.show { display:flex; }
-  #btgt .n { color:#e6edf3; font-weight:700; }
-  #btgt .btn { padding:6px 10px; font-size:12px; }
-  /* エージェントタブの中のビュー切替 (端末 / 待ち / デッキ / 看板)。
-     下部ナビを増やさずに済ませる。指の当たり判定は 44px 以上を保つ */
-  .seg { flex:none; display:flex; background:#161b22; border-bottom:1px solid #21262d; }
-  .seg button {
-    flex:1; min-width:0; padding:14px 2px; font-size:12.5px; font-weight:600;
-    background:none; border:none; border-bottom:2px solid transparent; color:#8b949e;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }
-  .seg button.act { color:#7ee1ff; border-bottom-color:#7ee1ff; }
-  .seg .badge {
-    display:inline-block; margin-left:4px; padding:0 5px; border-radius:8px;
-    background:#6e2c1e; color:#fff; font-size:10.5px; font-weight:700;
-  }
-  /* 一覧 (待ち / デッキ / 看板 で共有する 1 枚の入れ物) */
-  #alist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; display:none; padding:8px 10px 12px; }
-  #alist.show { display:block; }
-  /* 空状態は「利用可能領域の中央に 1 枚」。下や上に取り残さない */
-  #alist.mid { display:flex; align-items:center; justify-content:center; padding:16px; }
-  .card {
-    background:#161b22; border:1px solid #21262d; border-radius:10px;
-    padding:10px 12px; margin-bottom:8px;
-  }
-  .card.act { border-color:#7ee1ff; }
-  .card:active { background:#1c2432; }
-  .card .hd { display:flex; align-items:center; gap:6px; font-size:13.5px; }
-  .card .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:700; }
-  .card .st { flex:none; font-size:11px; color:#8b949e; max-width:46%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .card .pv {
-    margin:6px 0 0; font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
-    color:#8b949e; white-space:pre-wrap; word-break:break-all; max-height:3em; overflow:hidden;
-  }
-  .card .ax { display:flex; gap:8px; margin-top:8px; }
-  .card .ax .btn {
-    flex:1; min-width:0; padding:12px 6px; font-size:12.5px;
-    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-  }
-  .lane { margin:0 0 8px; }
-  .lane .lhd {
-    display:flex; align-items:center; gap:8px; width:100%; padding:12px 10px;
-    background:#161b22; border:1px solid #21262d; border-radius:10px;
-    color:#c9d1d9; font-size:13px; font-weight:700; text-align:left;
-  }
-  .lane .lhd .n { margin-left:auto; color:#8b949e; }
-  .lane .body { padding:8px 0 0; }
-  .mid-card {
-    max-width:300px; text-align:center; background:#161b22; border:1px solid #21262d;
-    border-radius:12px; padding:22px 18px; color:#8b949e; font-size:13px; line-height:1.7;
-  }
-  .mid-card .big { display:block; font-size:30px; margin-bottom:8px; }
-  /* 音声が使えない端末への案内 (トーストと違い消えない) */
-  #vnote {
-    display:none; margin:0 0 8px; padding:9px 11px; border-radius:8px;
-    background:#3a2c12; border:1px solid #d29922; color:#f2dfb4;
-    font-size:12px; line-height:1.65; word-break:break-all;
-  }
-  #vnote.show { display:block; }
-  .grow { flex:1; }
-  #meta { font-size:11px; color:#8b949e; }
-  #filter, #ti {
-    flex:1; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
-    padding:10px 12px; font-size:16px; outline:none; min-width:0;
-  }
-  #flist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; }
-  #flist div { padding:12px 14px; border-bottom:1px solid #1c2128; font-size:13.5px; }
-  #flist div:active { background:#1f3a5f; }
-  #flist .dir { color:#8b949e; font-size:11px; }
-  #scr {
-    flex:1; overflow:auto; -webkit-overflow-scrolling:touch; background:#010409;
-    font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
-    padding:8px 10px; white-space:pre; color:#c9d1d9;
-  }
-  .keys { flex:none; display:flex; gap:6px; overflow-x:auto; padding:6px 10px; background:#161b22; }
-  .keys::-webkit-scrollbar { display:none; }
-  .key {
-    flex:none; background:#21262d; color:#e6edf3; border:1px solid #30363d;
-    border-radius:8px; padding:9px 13px; font-size:13px; font-weight:600;
-  }
-  .key:active { background:#1f3a5f; }
-  .grid { flex:1; overflow-y:auto; display:grid; grid-template-columns:1fr 1fr; gap:10px; padding:12px; align-content:start; }
-  .grid .btn { padding:16px 8px; font-size:14px; text-align:center; }
-  #toast {
-    position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom) + 74px);
-    transform:translateX(-50%); background:#1f6feb; color:#fff; padding:10px 18px;
-    border-radius:20px; font-size:13px; opacity:0; transition:opacity .25s; pointer-events:none;
-    max-width:86vw; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; z-index:9;
-  }
-  #toast.show { opacity:1; }
-  .empty { color:#8b949e; text-align:center; padding:40px 20px; font-size:13px; }
-</style>
-</head>
-<body>
-<header>
-  <span class="logo">&#9889; ZAIVERN</span>
-  <span class="ws" id="ws" data-i18n="remote.connecting">接続中…</span>
-  <span id="dot"></span>
-</header>
-<main>
-  <!-- エディタ -->
-  <section class="view act" id="v-editor">
-    <div class="chips" id="tabs"></div>
-    <textarea id="ta" autocapitalize="off" autocorrect="off" spellcheck="false"
-      data-i18n-ph="remote.editor_placeholder"
-      placeholder="PC 側でファイルを開くか、[ファイル] タブから選択してください"></textarea>
-    <div class="bar">
-      <span id="meta"></span>
-      <span class="grow"></span>
-      <button class="btn" id="reload" data-i18n="remote.reload">&#8635; 再読込</button>
-      <button class="btn pri" id="save" data-i18n="remote.save">&#128190; 保存</button>
-    </div>
-  </section>
-  <!-- ファイル -->
-  <section class="view" id="v-files">
-    <div class="bar" style="border-top:none;border-bottom:1px solid #21262d">
-      <input id="filter" type="search" data-i18n-ph="remote.file_filter_placeholder"
-        placeholder="ファイル名で絞り込み…">
-    </div>
-    <div id="flist"></div>
-  </section>
-  <!-- エージェント -->
-  <section class="view" id="v-agent">
-    <div class="seg" id="aseg"></div>
-    <div class="chips" id="achips"></div>
-    <div id="btgt"></div>
-    <div id="vnote"></div>
-    <div id="scr" class="empty" data-i18n="remote.no_agents">エージェントがいません</div>
-    <div id="alist"></div>
-    <div class="keys" id="keys"></div>
-    <div class="bar">
-      <input id="ti" type="text" autocapitalize="off" autocorrect="off"
-        data-i18n-ph="remote.agent_input_placeholder"
-        placeholder="エージェントへ指示を送る…">
-      <button class="btn" id="tput" data-i18n="remote.put" data-i18n-title="remote.put_title"
-        title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入れる</button>
-      <button class="btn pri" id="tsend" data-i18n="remote.send">送信</button>
-    </div>
-  </section>
-  <!-- コマンド -->
-  <section class="view" id="v-cmds">
-    <div class="grid" id="cmds"></div>
-  </section>
-</main>
-<nav id="nav">
-  <button data-v="editor" class="act"><span class="ico">&#128196;</span><span data-i18n="remote.tab_editor">エディタ</span></button>
-  <button data-v="files"><span class="ico">&#128194;</span><span data-i18n="remote.tab_files">ファイル</span></button>
-  <button data-v="agent"><span class="ico">&#129302;</span><span data-i18n="remote.tab_agent">エージェント</span></button>
-  <button data-v="cmds"><span class="ico">&#127899;</span><span data-i18n="remote.tab_cmds">コマンド</span></button>
-</nav>
-<div id="toast"></div>
-<script>
-'use strict';
-const qs = new URLSearchParams(location.search);
-let TOK = qs.get('t') || localStorage.getItem('zv_tok') || '';
-if (qs.get('t')) localStorage.setItem('zv_tok', qs.get('t'));
-const $ = id => document.getElementById(id);
-// ─── 多言語 (Language Pack) ───
-// 文言はサーバが <head> の window.ZVI18N へ 1 回だけ注入する。
-// 第 2 引数 d は日本語の原文フォールバック — 辞書が届かなくても画面は壊れない。
-const T = (k, d) => (window.ZVI18N && window.ZVI18N[k]) || d;
-// 静的な文言は HTML 側に data-i18n 属性で宣言しておき、起動時に一括で差し込む。
-// 差し込み先は属性ごとに分ける (本文 / placeholder / title)。
-// 訳が無いときは HTML に書いてある原文をそのまま残す (上書きしない)。
-function applyI18n() {
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    const v = T(el.dataset.i18n, ''); if (v) el.textContent = v;
-  });
-  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
-    const v = T(el.dataset.i18nPh, ''); if (v) el.placeholder = v;
-  });
-  document.querySelectorAll('[data-i18n-title]').forEach(el => {
-    const v = T(el.dataset.i18nTitle, ''); if (v) el.title = v;
-  });
-}
-// 音声認識の言語は画面の言語に合わせる (英語 UI なのに日本語を聞き取ろうとしない)。
-// ja だけは地域つきの ja-JP が明確に良いので特別扱いする。
-function speechLang() {
-  const l = document.documentElement.lang || 'ja';
-  return l === 'ja' ? 'ja-JP' : l;
-}
-let view = 'editor', dirty = false, files = [], state = null, curTab = -1;
-let taTab = -1;  // textarea の内容がどのタブのものか (誤上書き防止)
-
-function toast(m) {
-  const t = $('toast'); t.textContent = m; t.classList.add('show');
-  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 1800);
-}
-async function api(path, body) {
-  const opt = body
-    ? { method:'POST', headers:{'Content-Type':'application/json','X-Token':TOK}, body:JSON.stringify(body) }
-    : { headers:{'X-Token':TOK} };
-  const r = await fetch(path, opt);
-  if (r.status === 401) { toast(T('remote.auth_error', '認証エラー: QRコードを読み直してください')); throw 0; }
-  if (!r.ok) throw 0;
-  return r.json();
-}
-
-// ─── ビュー切替 ───
-$('nav').addEventListener('click', e => {
-  const b = e.target.closest('button'); if (!b) return;
-  view = b.dataset.v;
-  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('act', x === b));
-  document.querySelectorAll('.view').forEach(x => x.classList.toggle('act', x.id === 'v' + '-' + view));
-  if (view === 'files' && !files.length) loadFiles();
-  if (view === 'agent') pollTerm();
-});
-
-// ─── 状態ポーリング ───
-async function pollState() {
-  try {
-    state = await api('/api/state');
-    $('dot').classList.add('on');
-    $('ws').textContent = state.workspace + (state.file ? ' — ' + state.file + (state.dirty ? ' ●' : '') : '');
-    renderTabs(); renderAgents(); renderCmds(); renderSeg();
-    if (curTab !== state.active) { curTab = state.active; if (!dirty) loadFile(); }
-  } catch (e) { $('dot').classList.remove('on'); }
-}
-function renderTabs() {
-  const el = $('tabs');
-  el.innerHTML = '';
-  (state.tabs || []).forEach((t, i) => {
-    const c = document.createElement('button');
-    c.className = 'chip' + (i === state.active ? ' act' : '');
-    c.textContent = t.title + (t.dirty ? ' ●' : '');
-    c.onclick = async () => { await api('/api/tab', {index:i}); dirty = false; await pollState(); };
-    el.appendChild(c);
-  });
-}
-
-// ─── エディタ ───
-async function loadFile() {
-  try {
-    const f = await api('/api/file');
-    if (!f.ok) { $('ta').value = ''; $('meta').textContent = ''; taTab = -1; return; }
-    $('ta').value = f.text;
-    // 文字コードは UTF-8 以外のときだけ出す (PC 側のステータスバーと同じ扱い)。
-    // 保存でどう書かれるかがスマホからも分かるようにするため。
-    $('meta').textContent =
-      f.title + '  ·  ' + f.lang + (f.encoding ? '  ·  ' + f.encoding : '');
-    taTab = (f.index === undefined || f.index === null) ? -1 : f.index;
-    dirty = false;
-  } catch (e) {}
-}
-$('ta').addEventListener('input', () => { dirty = true; });
-$('reload').onclick = () => { dirty = false; loadFile().then(() => toast(T('remote.reloaded', '再読込しました'))); };
-$('save').onclick = async () => {
-  try {
-    // 適用+保存を 1 リクエストで原子的に行う。タブ不一致はサーバ側で拒否される
-    const r = await api('/api/text', {text: $('ta').value, index: taTab, save: true});
-    if (r.ok) {
-      dirty = false;
-      // 元の文字コードで表せない文字を足すと UTF-8 へ切り替わる。
-      // 黙って変わると「他のツールで読めなくなった」原因が分からないので必ず伝える
-      if (r.promoted) {
-        toast(T('remote.encoding_promoted', '{enc} では表せない文字があるため UTF-8 で保存しました')
-          .replace('{enc}', r.was));
-        loadFile();
-      } else {
-        toast(T('remote.saved', 'PC 側で保存しました ✅'));
-      }
-    } else {
-      toast(r.error || T('remote.save_failed', '保存に失敗しました'));
-    }
-  } catch (e) { toast(T('remote.save_failed', '保存に失敗しました')); }
-};
-
-// ─── ファイル ───
-async function loadFiles() {
-  try {
-    const r = await api('/api/files');
-    files = r.files || [];
-    renderFiles();
-  } catch (e) {}
-}
-function renderFiles() {
-  const q = $('filter').value.toLowerCase();
-  const el = $('flist');
-  el.innerHTML = '';
-  const hit = files.filter(f => f.toLowerCase().includes(q)).slice(0, 400);
-  if (!hit.length) {
-    const e0 = document.createElement('div');
-    e0.className = 'empty'; e0.textContent = T('remote.no_match', '該当なし');
-    el.appendChild(e0); return;
-  }
-  hit.forEach(f => {
-    const d = document.createElement('div');
-    // Windows のパスは `src\app.rs` と区切りが `\` で来る。
-    // `/` だけを見ていると全体がファイル名として出てフォルダ行が空になる
-    const i = Math.max(f.lastIndexOf('/'), f.lastIndexOf('\\'));
-    d.innerHTML = '<span></span><br><span class="dir"></span>';
-    d.children[0].textContent = i >= 0 ? f.slice(i + 1) : f;
-    d.children[2].textContent = i >= 0 ? f.slice(0, i) : '';
-    d.onclick = async () => {
-      await api('/api/open', {path: f});
-      dirty = false;
-      toast(T('remote.opened', '{path} を開きました').replace('{path}', f));
-      document.querySelector('nav button[data-v=editor]').click();
-      await pollState();
-    };
-    el.appendChild(d);
-  });
-}
-$('filter').addEventListener('input', renderFiles);
-
-// ─── エージェント ───
-const ESC = '\u001b';
-const KEYS = [
-  ['Enter', '\r'], ['Esc', ESC], ['^C', '\u0003'],
-  ['↑', ESC + '[A'], ['↓', ESC + '[B'],
-  ['Tab', '\t'], [T('remote.key_shift_tab_perm', '⇧Tab 権限'), ESC + '[Z'],
-  ['1', '1'], ['2', '2'], ['3', '3'], ['y', 'y'],
-];
-KEYS.forEach(([label, seq]) => {
-  const b = document.createElement('button');
-  b.className = 'key'; b.textContent = label;
-  b.onclick = () => api('/api/term', {text: seq, raw: true}).catch(() => {});
-  $('keys').appendChild(b);
-});
-// ─── 音声入力モード (エージェント毎) ───
-// マイクボタンでトグル。話した内容は下の入力欄に溜まっていくだけで、
-// 自動送信はしない。送るのは [⤵ 入れる] か [送信] を押したときだけ。
-// 無音で認識が切れてもモードが ON なら自動で録音を再開する。
-// voiceFatal = 復帰不能なエラーで止めた印。これが立っている間は onend で再開しない
-// (network 等で無限リスタートし、画面上は無反応のまま壊れるのを防ぐ)
-let voiceAgent = -1, recog = null, lastInterim = '', voiceFatal = false;
-function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
-// 音声認識が使えるかを事前判定する。使えない理由コードを返す:
-//   'insecure'    … http 接続 = セキュアコンテキストでない (スマホから見る場合はこれ)
-//   'unsupported' … SpeechRecognition が無い (iOS Safari / Firefox など)
-//   ''            … 使える
-function speechBlockReason() {
-  if (!window.isSecureContext) return 'insecure';
-  if (!speechAPI()) return 'unsupported';
-  return '';
-}
-// OS キーボードのディクテーション (Gboard の 🎤 / iOS 音声入力) への案内文。
-// キーボード側の音声入力は https でなくても、ページ側の権限も要らずに使える。
-// 原因と、いま何をすればいいかの両方を必ず書く。
-function dictationHint(reason) {
-  // 実際に待ち受けているポートをそのまま案内する (既定 8899 とは限らない)。
-  // /voice の API はトークンを要るので、いま持っているものを付けて渡す
-  const p = location.port || '8899';
-  const u = 'http://127.0.0.1:' + p + '/voice' + (TOK ? '?t=' + encodeURIComponent(TOK) : '');
-  const how = T('remote.dictation_how',
-    'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
-    + 'PC からは {url} で連続認識が使えます。').replace('{url}', u);
-  const why = reason === 'unsupported'
-    ? T('remote.speech_unsupported', 'このブラウザは音声認識 (Web Speech API) に未対応です。')
-    : reason === 'network'
-    ? T('remote.speech_network', '音声認識サーバーに接続できませんでした（http 接続では利用できません）。')
-    : T('remote.speech_insecure', 'この接続 (http) ではブラウザの音声認識が使えません。');
-  return why + how;
-}
-function showNote(m) { const n = $('vnote'); n.textContent = m; n.classList.add('show'); }
-function hideNote() { const n = $('vnote'); n.textContent = ''; n.classList.remove('show'); }
-// 認識が使えないときの代替: 入力欄にフォーカスしてキーボード音声入力へ誘導する。
-// 自動送信はしないので、話した内容は入力欄に残ったままになる。
-function keyboardDictation(i, reason) {
-  if (i >= 0) api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
-  const t = $('ti');
-  t.focus();
-  try { t.setSelectionRange(t.value.length, t.value.length); } catch (e) {}
-  t.placeholder = T('remote.dictation_placeholder', '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動');
-  showNote(dictationHint(reason));
-  toast(T('remote.dictation_toast', 'キーボードの \u{1F3A4} から入力してください'));
-}
-// 復帰不能なエラー。再開させずに止め、理由を消えない形で残す
-function fatalVoiceStop(msg) {
-  voiceFatal = true;
-  stopVoice0();
-  renderAgents();
-  showNote(msg);
-  toast(msg);
-}
-function stopVoice0() {
-  voiceAgent = -1;
-  const r = recog; recog = null;
-  if (r) { r.onend = null; try { r.stop(); } catch (e) {} }
-  if ($('ti').value === lastInterim) $('ti').value = '';
-  lastInterim = '';
-  $('ti').placeholder = T('remote.agent_input_placeholder', 'エージェントへ指示を送る…');
-}
-function stopVoice() { stopVoice0(); hideNote(); renderAgents(); toast(T('remote.voice_mode_off', '\u{1F3A4} 音声入力モード OFF')); }
-function startVoice(i) {
-  // 使えない端末では死んだエラーを出さず、キーボード音声入力へ逃がす
-  const reason = speechBlockReason();
-  if (reason) { stopVoice0(); renderAgents(); keyboardDictation(i, reason); return; }
-  const C = speechAPI();
-  stopVoice0();
-  hideNote();
-  voiceFatal = false;
-  voiceAgent = i;
-  api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
-  const r = new C();
-  recog = r;
-  r.lang = speechLang();
-  r.continuous = true;
-  r.interimResults = true;
-  r.onresult = ev => {
-    let fin = '', interim = '';
-    for (let k = ev.resultIndex; k < ev.results.length; k++) {
-      const t = ev.results[k][0].transcript;
-      if (ev.results[k].isFinal) fin += t; else interim += t;
-    }
-    // 途中経過は「入力欄の末尾に仮表示」。確定したらその場で本文に変わる
-    const base = $('ti').value.endsWith(lastInterim) && lastInterim
-      ? $('ti').value.slice(0, -lastInterim.length)
-      : $('ti').value;
-    fin = fin.trim();
-    if (fin) {
-      $('ti').value = (base + (base && !base.endsWith(' ') ? ' ' : '') + fin).trim();
-      lastInterim = '';
-    } else {
-      $('ti').value = base + interim;
-      lastInterim = interim;
-    }
-  };
-  r.onerror = ev => {
-    const e = ev.error;
-    if (e === 'no-speech') return;              // 無音だけ: onend の自動再開に任せる
-    if (e === 'not-allowed' || e === 'service-not-allowed') {
-      fatalVoiceStop(T('remote.mic_not_allowed', 'マイクが許可されていません（ブラウザ設定を確認）'));
-    } else if (e === 'network') {
-      // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
-      voiceFatal = true;
-      stopVoice0(); renderAgents();
-      keyboardDictation(i, 'network');
-    } else if (e === 'audio-capture') {
-      fatalVoiceStop(T('remote.mic_not_found', 'マイクが見つかりません'));
-    } else if (e === 'aborted') {
-      stopVoice0(); renderAgents();            // 明示停止・画面遷移。黙って終わる
-    }
-  };
-  r.onend = () => {
-    if (voiceFatal) return;                    // 致命的エラー後は再開しない
-    if (recog === r && voiceAgent === i) {
-      try { r.start(); } catch (e) { stopVoice(); }
-    }
-  };
-  try { r.start(); } catch (e) { toast(T('remote.voice_start_failed', '音声入力を開始できません')); stopVoice0(); renderAgents(); return; }
-  $('ti').placeholder = T('remote.voice_placeholder', '\u{1F3A4} 話した内容がここに溜まります — 送信はボタンで');
-  renderAgents();
-  const a = (state.agents || [])[i];
-  toast(T('remote.voice_mode_on', '\u{1F3A4} 音声入力モード ON → {agent} (自動送信はしません)')
-    .replace('{agent}', a ? a.title : ''));
-}
-// ─── 一括操作 (宛先の粒度) ───
-// 'one'     … いま選んでいる 1 体 (既定)
-// 'all'     … 起動中の全エージェント (PC 側の「📣 全エージェントへブロードキャスト」)
-// 'stalled' … 止まっている (待機中の) ものだけ (PC 側の「止まっているものへまとめて送る」)
+// スマホ用ページ。**中身は `assets/remote/` に置いてある。**
 //
-// 既定をいちばん狭い 'one' にするのは、画面を開いた瞬間が全員宛てだと
-// 打ち込んだ 1 行がそのまま全機へ飛ぶため。
-// 件数は **PC 側が数えた state.bulk をそのまま出す**。スマホ側でも数えると
-// 数え方が 2 か所になり、「3 体と出ているのに 5 体へ飛んだ」が起こりうる。
-let bulkMode = 'one';
-function bulkCount(m) { return ((state && state.bulk) || {})[m || bulkMode] || 0; }
-function bulkModeLabel(m) {
-  return m === 'all' ? T('remote.bulk_all', '\u{1F4E3} 全員')
-    : m === 'stalled' ? T('remote.bulk_stalled', '⏸ 待機')
-    : T('remote.bulk_one', '\u{1F916} 選択中');
-}
-// 宛先行: 何体へ届くのかを送信前に必ず見せる + 一括停止をここから届かせる。
-// エージェントが 0 体なら行ごと消す (中身の無い帯で高さを取らない)。
-function renderBulk() {
-  const el = $('btgt');
-  el.innerHTML = '';
-  const agents = (state && state.agents) || [];
-  const n = bulkCount();
-  el.classList.toggle('show', agents.length > 0);
-  if (agents.length) {
-    const lab = document.createElement('span');
-    lab.className = 'grow';
-    lab.textContent = T('remote.bulk_target', '宛先: {mode} — {n} 体')
-      .replace('{mode}', bulkModeLabel(bulkMode)).replace('{n}', n);
-    el.appendChild(lab);
-    const stop = document.createElement('button');
-    stop.className = 'btn warn';
-    stop.textContent = T('remote.bulk_stop', '⏹ 停止');
-    stop.title = T('remote.bulk_stop_title', '宛先へ Esc を送っていまの作業を止める');
-    stop.disabled = n === 0;
-    stop.onclick = bulkStop;
-    el.appendChild(stop);
-  }
-  // 宛先 0 体では送れない。押しても届かないボタンは押させない
-  $('tsend').disabled = n === 0;
-  $('tput').disabled = n === 0;
-}
-// 一括停止 = 宛先へ Esc。セッションを殺すのは PC 側の確認モーダルに任せる
-// (スマホから殺すと、誰も押せないダイアログが PC に開いたままになる)。
-async function bulkStop() {
-  if (!bulkCount()) return;
-  try {
-    const r = await api('/api/bulk_stop', {mode: bulkMode});
-    toast(r.ok
-      ? T('remote.bulk_stopped', '⏹ {n} 体へ停止 (Esc) を送りました').replace('{n}', r.sent)
-      : (r.error || T('remote.bulk_failed', '送信できませんでした')));
-  } catch (e) {}
-}
-function renderAgents() {
-  const el = $('achips');
-  el.innerHTML = '';
-  const agents = state.agents || [];
-  if (voiceAgent >= agents.length) stopVoice0();
-  // 1 体以下なら「全員 / 待機」を選ぶ余地が無いので出さない (到達経路を増やさない)。
-  // 減ったときは宛先を 1 体へ戻す — 消えた宛先のまま送らせない
-  if (agents.length < 2 && bulkMode !== 'one') bulkMode = 'one';
-  if (agents.length >= 2) {
-    ['all', 'stalled'].forEach(m => {
-      const c = document.createElement('button');
-      c.className = 'chip' + (bulkMode === m ? ' act' : '');
-      c.textContent = bulkModeLabel(m) + ' ' + bulkCount(m);
-      c.onclick = () => { bulkMode = m; renderAgents(); };
-      el.appendChild(c);
-    });
-  }
-  agents.forEach((a, i) => {
-    const c = document.createElement('button');
-    c.className = 'chip' + (bulkMode === 'one' && i === state.agent_active ? ' act' : '');
-    c.textContent = (a.running ? (a.attention ? '\u{1F514} ' : a.stalled ? '⏸ ' : '● ') : '○ ') + a.icon + ' ' + a.title;
-    // 1 体を選んだら宛先も 1 体へ戻す (全員宛てのまま個別チップを押して誤爆しない)
-    c.onclick = () => { bulkMode = 'one'; api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => renderAgents()); };
-    el.appendChild(c);
-    const m = document.createElement('button');
-    m.className = 'chip mic' + (i === voiceAgent ? ' rec' : '');
-    m.textContent = i === voiceAgent ? T('remote.stop', '⏹ 停止') : '\u{1F3A4}';
-    m.title = T('remote.mic_title', '{agent} へ音声入力').replace('{agent}', a.title);
-    m.onclick = () => (i === voiceAgent ? stopVoice() : startVoice(i));
-    el.appendChild(m);
-  });
-  const plus = document.createElement('button');
-  plus.className = 'chip'; plus.textContent = T('remote.launch', '＋ 起動');
-  plus.onclick = () => {
-    const names = (state.presets || []).map((p, i) => i + ': ' + p.icon + ' ' + p.name).join('\n');
-    const v = prompt(T('remote.launch_prompt', '起動するプリセット番号') + '\n' + names, '0');
-    if (v !== null) api('/api/cmd', {name:'agent_launch', arg:parseInt(v) || 0}).then(pollState).catch(() => {});
-  };
-  el.appendChild(plus);
-  renderBulk();
-}
-// ─── エージェントタブの中のビュー切替 ───────────────────────────
-// 下部ナビ (エディタ/ファイル/エージェント/コマンド) は増やさず、この中で切り替える。
-//   'term'   … 端末 (従来どおり)
-//   'wait'   … 人の手が要るもの (返事待ち・承認・停滞) だけを縦に並べる
-//   'deck'   … PC のデッキ相当。スマホなので 1 列固定 (横スクロールを作らない)
-//   'kanban' … PC の看板相当。レーンは横に並べず「見出し + カード」の縦積み
-// レーンの定義・状態ラベルは **PC 側 (kanban.rs) が決めたものをそのまま出す**。
-// スマホ側で画面文字から状態を決め直さない (設計原則 4)。
-let aview = 'term', alist = [], alanes = [], laneOpen = {};
-const AVIEWS = [
-  ['term', () => T('remote.view_term', '\u{1F5A5} 端末')],
-  ['wait', () => T('remote.view_wait', '⏳ 待ち')],
-  ['deck', () => T('remote.view_deck', '\u{1F0CF} デッキ')],
-  ['kanban', () => T('remote.view_kanban', '\u{1F4CB} 看板')],
-];
-// 待ち件数は **PC が数えた state.waiting** をそのまま出す。一覧を開いていない
-// 間も /api/state だけで最新になるので、バッジのために余分に叩かない。
-function waitCount() { return (state && state.waiting) || 0; }
-function renderSeg() {
-  const el = $('aseg');
-  el.innerHTML = '';
-  AVIEWS.forEach(([k, lab]) => {
-    const b = document.createElement('button');
-    if (aview === k) b.className = 'act';
-    b.appendChild(document.createTextNode(lab()));
-    const n = k === 'wait' ? waitCount() : 0;
-    if (n) {
-      const s = document.createElement('span');
-      s.className = 'badge'; s.textContent = n;
-      b.appendChild(s);
-    }
-    b.onclick = () => setAView(k);
-    el.appendChild(b);
-  });
-}
-function setAView(k) {
-  if (aview === k) return;
-  aview = k;
-  const term = k === 'term';
-  // 端末と一覧は同じ場所を使う。切り替えで**上下のバーは動かさない**ので、
-  // 画面が突然作り替わったようには見えない
-  $('scr').style.display = term ? '' : 'none';
-  $('keys').style.display = term ? '' : 'none';
-  $('alist').classList.toggle('show', !term);
-  renderSeg();
-  renderList();
-  pollTerm();   // 切り替えた瞬間に取りに行く (1 テンポ空白にしない)
-}
-function laneIcon(i) { const L = alanes.find(x => x.i === i); return L ? L.icon : ''; }
-// 空状態は利用可能領域の中央に 1 枚のカードで出す (CLAUDE.md の UI 原則)
-function emptyCard(k) {
-  const d = document.createElement('div');
-  d.className = 'mid-card';
-  const b = document.createElement('span');
-  b.className = 'big';
-  b.textContent = alist.length === 0 ? '\u{1F916}' : (k === 'wait' ? '✅' : '\u{1F4A4}');
-  d.appendChild(b);
-  const t = document.createElement('span');
-  t.textContent = alist.length === 0
-    ? T('remote.no_agents_hint', 'エージェントがいません — ＋ 起動 から始められます')
-    : (k === 'wait'
-      ? T('remote.wait_empty', '待っているエージェントはいません — 全員動いています')
-      : T('remote.list_empty', '表示できるエージェントがいません'));
-  d.appendChild(t);
-  return d;
-}
-function cardBtn(label, cls, fn) {
-  const b = document.createElement('button');
-  b.className = 'btn' + (cls ? ' ' + cls : '');
-  b.textContent = label;
-  b.onclick = e => { e.stopPropagation(); fn(); };
-  return b;
-}
-// 1 枚のカード: 名前 / 状態 / 直近出力の末尾 2 行 / 経過時間 + その場の操作。
-// 3 つのビュー (待ち・デッキ・看板) で同じカードを使う — 見た目を作り分けない。
-function agentCard(a) {
-  const c = document.createElement('div');
-  c.className = 'card' + (a.active ? ' act' : '');
-  const hd = document.createElement('div'); hd.className = 'hd';
-  const ic = document.createElement('span'); ic.textContent = a.icon; hd.appendChild(ic);
-  const nm = document.createElement('span'); nm.className = 'nm';
-  nm.textContent = (a.running ? (a.attention ? '\u{1F514} ' : a.unread ? '● ' : '') : '○ ') + a.title;
-  hd.appendChild(nm);
-  const st = document.createElement('span'); st.className = 'st';
-  st.textContent = laneIcon(a.lane) + ' ' + a.state + (a.running ? ' · ' + a.uptime : '');
-  hd.appendChild(st);
-  c.appendChild(hd);
-  if (a.preview) {
-    const p = document.createElement('pre'); p.className = 'pv'; p.textContent = a.preview;
-    c.appendChild(p);
-  }
-  const ax = document.createElement('div'); ax.className = 'ax';
-  // 承認は「人の手が要る」ときだけ出す (いつも並ぶ押せないボタンを作らない)
-  if (a.attention) ax.appendChild(cardBtn(T('remote.card_approve', '✅ 承認'), 'pri', () => agentAct(a, 'approve')));
-  if (a.running) ax.appendChild(cardBtn(T('remote.card_send', '✏ 指示'), '', () => openAgent(a, true)));
-  if (a.running) ax.appendChild(cardBtn(T('remote.card_stop', '⏹ 停止'), 'warn', () => agentAct(a, 'stop')));
-  if (ax.childNodes.length) c.appendChild(ax);
-  // タップ = そのエージェントへ入る
-  c.onclick = () => openAgent(a, false);
-  return c;
-}
-// カードをタップ = 選んで端末へ入る。[✏ 指示] は一覧に留まったまま宛先だけ移す
-// (「一覧で見つけて、その場で 1 行送る」を 1 タップで終わらせる)
-function openAgent(a, stay) {
-  bulkMode = 'one';
-  api('/api/cmd', {name:'agent_focus', arg:a.idx}).then(pollState).catch(() => renderAgents());
-  if (stay) { $('ti').focus(); } else { setAView('term'); }
-}
-// 行内の操作。承認キーは PC 側 (エージェントのカタログ) が知っているので、
-// スマホから当て推量の文字を送らない
-async function agentAct(a, act) {
-  try {
-    const r = await api('/api/agent_act', {id: a.id, act: act});
-    if (!r.ok) { toast(r.error || T('remote.bulk_failed', '送信できませんでした')); return; }
-    toast((act === 'approve'
-      ? T('remote.approved', '✅ {agent} を承認しました')
-      : T('remote.stopped_one', '⏹ {agent} を止めました')).replace('{agent}', a.title));
-    pollTerm();
-  } catch (e) {}
-}
-function renderList() {
-  if (aview === 'term') return;
-  const el = $('alist');
-  // 1.5 秒ごとに作り直すので、読んでいる位置を必ず戻す
-  // (戻さないと、スクロールした瞬間に毎回先頭へ跳ね上がる)
-  const keep = el.scrollTop;
-  el.innerHTML = '';
-  el.classList.remove('mid');
-  // 「待ち」は PC 側の判定 (remote::is_waiting_lane) で印が付いたものだけ
-  const rows = aview === 'wait' ? alist.filter(a => a.waiting) : alist;
-  if (!rows.length) { el.classList.add('mid'); el.appendChild(emptyCard(aview)); return; }
-  if (aview === 'kanban') renderKanban(el, rows);
-  else rows.forEach(a => el.appendChild(agentCard(a)));
-  el.scrollTop = keep;
-}
-// 看板: レーン見出し + その下にカードの縦積み。空のレーンは見出しごと出さない
-// (常に 0 と出る見出しを 8 本並べない)。見出しをタップで畳める。
-function renderKanban(el, rows) {
-  let shown = 0;
-  alanes.forEach(L => {
-    const mem = rows.filter(a => a.lane === L.i);
-    if (!mem.length) return;
-    shown += mem.length;
-    const open = laneOpen[L.i] !== false;
-    const box = document.createElement('div'); box.className = 'lane';
-    const hd = document.createElement('button'); hd.className = 'lhd';
-    const car = document.createElement('span'); car.textContent = open ? '▾' : '▸';
-    hd.appendChild(car);
-    const t = document.createElement('span'); t.textContent = L.icon + ' ' + L.title;
-    hd.appendChild(t);
-    const n = document.createElement('span'); n.className = 'n'; n.textContent = mem.length;
-    hd.appendChild(n);
-    hd.onclick = () => { laneOpen[L.i] = !open; renderList(); };
-    box.appendChild(hd);
-    if (open) {
-      const body = document.createElement('div'); body.className = 'body';
-      mem.forEach(a => body.appendChild(agentCard(a)));
-      box.appendChild(body);
-    }
-    el.appendChild(box);
-  });
-  if (!shown) { el.classList.add('mid'); el.appendChild(emptyCard('kanban')); }
-}
-let termTimer = null;
-// ポーリングは**ビューが増えても 1 本のまま**。端末を見ているときは /api/term、
-// 一覧を見ているときは /api/agents を同じ間隔で叩く (合計回数は増えない)。
-// 見ていないビューのために PTY を読ませない。
-async function pollTerm() {
-  clearTimeout(termTimer);
-  if (view !== 'agent') return;
-  try {
-    if (aview === 'term') {
-      const r = await api('/api/term');
-      const el = $('scr');
-      if (r.ok) {
-        const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
-        el.classList.remove('empty');
-        el.textContent = r.text;
-        if (stick) el.scrollTop = el.scrollHeight;
-      } else {
-        el.classList.add('empty');
-        el.textContent = T('remote.no_agents_hint', 'エージェントがいません — ＋ 起動 から始められます');
-      }
-    } else {
-      const r = await api('/api/agents');
-      if (r.ok) { alist = r.agents || []; alanes = r.lanes || []; renderList(); }
-    }
-  } catch (e) {}
-  termTimer = setTimeout(pollTerm, 1500);
-}
-// 送信 = テキスト + Enter。入れる = テキストのみ (PC 側で内容を見て Enter)
-// 宛先は bulkMode が決める。1 体宛て / 全員 / 待機だけ のどれも同じ入口を通る
-// ので、「1 体には届くのに一括だけ挙動が違う」が起きない。
-async function sendInput(submit) {
-  const v = $('ti').value.trim();
-  if (!v) return;
-  if (!bulkCount()) { toast(T('remote.bulk_none', '送れる宛先がいません')); return; }
-  if (bulkMode === 'one' && voiceAgent >= 0) {
-    // 音声モード中は、選んだエージェントへ確実に届くようフォーカスし直す
-    await api('/api/cmd', {name:'agent_focus', arg:voiceAgent}).catch(() => {});
-  }
-  let r = null;
-  try { r = await api('/api/bulk', {text: v, mode: bulkMode, submit: submit}); } catch (e) { return; }
-  if (!r.ok) { toast(r.error || T('remote.bulk_failed', '送信できませんでした')); return; }
-  $('ti').value = ''; lastInterim = '';
-  if (bulkMode === 'one') {
-    toast(submit
-      ? T('remote.sent', '送信しました')
-      : T('remote.put_done', 'PC の入力欄に入れました (Enter で送信)'));
-  } else {
-    toast((submit
-      ? T('remote.bulk_sent', '\u{1F4E3} {n} 体へ送信しました')
-      : T('remote.bulk_put', '\u{1F4E3} {n} 体の入力欄に入れました')).replace('{n}', r.sent));
-  }
-}
-$('tsend').onclick = () => sendInput(true);
-$('tput').onclick = () => sendInput(false);
-$('ti').addEventListener('keydown', e => { if (e.key === 'Enter') sendInput(true); });
-
-// ─── コマンド ───
-const CMDS = [
-  [T('remote.save', '\u{1F4BE} 保存'), 'save'],
-  [T('remote.cmd_new', '\u{1F4C4} 新規ファイル'), 'new'],
-  [T('remote.cmd_close_tab', '❌ タブを閉じる'), 'close_tab'],
-  [T('remote.cmd_terminal', '\u{1F5A5} ターミナル'), 'terminal'],
-  [T('remote.cmd_sidebar', '\u{1F4C1} サイドバー'), 'sidebar'],
-  [T('remote.cmd_cockpit', '\u{1F39b} Cockpit'), 'cockpit'],
-  [T('remote.cmd_zoom_in', '\u{1F50D} ズーム +'), 'zoom_in'],
-  [T('remote.cmd_zoom_out', '\u{1F50D} ズーム −'), 'zoom_out'],
-  [T('remote.cmd_zoom_reset', '\u{1F50D} ズーム 100%'), 'zoom_reset'],
-  [T('remote.cmd_tree', '\u{1F332} ツリー更新'), 'tree'],
-  [T('remote.cmd_approval_ask', '\u{1F6e1} 承認モード'), 'approval_ask'],
-  [T('remote.cmd_approval_auto', '⚡ 全自動モード'), 'approval_auto'],
-  [T('remote.cmd_approval_agent', '\u{1F916} Agent優先モード'), 'approval_agent'],
-  [T('remote.cmd_permission_cycle', '\u{1F6e1} 権限切替(全Agent)'), 'permission_cycle'],
-];
-function renderCmds() {
-  const el = $('cmds');
-  if (el.childElementCount) return;
-  CMDS.forEach(([label, name]) => {
-    const b = document.createElement('button');
-    b.className = 'btn' + (name === 'approval_auto' ? ' warn' : '');
-    b.textContent = label;
-    b.onclick = () => api('/api/cmd', {name: name, arg: 0})
-      .then(r => toast(r.ok
-        ? T('remote.cmd_done', '{label} を実行').replace('{label}', label)
-        : (r.error || T('remote.failed', '失敗しました'))))
-      .catch(() => {});
-    el.appendChild(b);
-  });
-}
-
-applyI18n();
-renderSeg();
-pollState();
-setInterval(pollState, 2500);
-</script>
-</body>
-</html>
-"##;
+// 1 つの巨大な `const` 文字列だったものを、層ごとのファイルへ割った。理由は 2 つ:
+//
+// * **複数のエージェントが同時に触れるようにするため。** git が衝突を作るのは
+//   「2 つのブランチが同じファイルの近い行を触った」時だけなので、画面の担当ごとに
+//   ファイルを分ければ、並行して足しても構造的に衝突しない
+//   (`src/features/` で潰したのと同じ形の衝突が web 側に残っていた)。
+//   **`assets/remote/js/<名前>.js` を 1 つ置くだけで画面が増える** —
+//   共有ファイルへの追記が 1 行も要らない。
+// * 3200 行の Rust の中に 900 行の HTML/CSS/JS が埋まっていると、
+//   エディタの補完も検索も効かない。
+//
+// 一覧は `build.rs` が走査して `OUT_DIR/remote_page.rs` へ生成する
+// (`concat!` はリテラルしか受け取らないので、`PAGE` ごと生成している)。
+// **ビルド時に 1 本の文字列へ畳まれる**ので、実行時にファイルを探しに行かない。
+// JS はファイル名順に繋ぐ (1 つのスコープを共有するため番号で並びを固定する)。
+include!(concat!(env!("OUT_DIR"), "/remote_page.rs"));
 
 // ─── PC 用 音声入力ページ ────────────────────────────────────────────
 //
@@ -3089,7 +2740,261 @@ mod tests {
             Query::BulkStop {
                 mode: BulkMode::Stalled,
             },
+            Query::Changes,
+            Query::Diff {
+                rel: "src/app.rs".into(),
+            },
+            Query::Scrollback {
+                agent: -1,
+                lines: 200,
+                before: None,
+            },
+            Query::Approvals,
+            Query::Approve {
+                id: 3,
+                act: ApproveAct::Approve,
+            },
+            Query::Read {
+                rel: "src/app.rs".into(),
+                from: 1,
+                lines: 400,
+            },
+            Query::Search {
+                q: "fn main".into(),
+                max: 100,
+            },
         ]
+    }
+
+    // ─── スマホ用 API の純粋ロジック (契約をここで固定する) ─────────
+
+    #[test]
+    fn 知らない承認操作は受け付けない() {
+        // 綴り違いを黙って「承認」に落とすと、押していない承認が飛ぶ
+        for (s, want) in [
+            ("approve", Some(ApproveAct::Approve)),
+            ("deny", Some(ApproveAct::Deny)),
+            ("always", Some(ApproveAct::Always)),
+            ("always_deny", Some(ApproveAct::AlwaysDeny)),
+            ("APPROVE", None),
+            ("yes", None),
+            ("", None),
+            ("approve ", None),
+        ] {
+            assert_eq!(ApproveAct::parse(s), want, "act={s:?}");
+        }
+    }
+
+    #[test]
+    fn パスはルート配下へ畳めないものを断る() {
+        for (raw, want) in [
+            ("src/app.rs", Some("src/app.rs")),
+            ("./src/./app.rs", Some("src/app.rs")),
+            ("src//app.rs", Some("src/app.rs")),
+            // Windows の区切りは / へ寄せる (同じファイルが 2 通りに見えない)
+            ("src\\app.rs", Some("src/app.rs")),
+            ("a/b/c.txt", Some("a/b/c.txt")),
+            // ここから下は全部お断り
+            ("", None),
+            ("..", None),
+            ("../etc/passwd", None),
+            ("src/../../etc/passwd", None),
+            ("/etc/passwd", None),
+            ("\\etc\\passwd", None),
+            ("C:/Windows/system32", None),
+            ("c:notes.txt", None),
+            ("\\\\server\\share\\x", None),
+            (".", None),
+            ("./", None),
+            ("a\0b", None),
+        ] {
+            assert_eq!(
+                safe_rel(raw).as_deref(),
+                want,
+                "safe_rel({raw:?}) が契約と違う"
+            );
+        }
+    }
+
+    #[test]
+    fn 件数は無指定と範囲外を丸める() {
+        // 0 / 負数は「無指定」= 既定。上限は必ず効かせる
+        for (v, def, max, want) in [
+            (0i64, 200usize, 2000usize, 200usize),
+            (-5, 200, 2000, 200),
+            (1, 200, 2000, 1),
+            (2000, 200, 2000, 2000),
+            (99999, 200, 2000, 2000),
+            // 既定が上限を超えていても上限で止まる
+            (0, 5000, 2000, 2000),
+        ] {
+            assert_eq!(clamp_count(v, def, max), want, "v={v}");
+        }
+    }
+
+    #[test]
+    fn クエリ文字列を復号して取り出す() {
+        let qs = "t=abc&path=src%2Fapp.rs&q=fn+main&empty=";
+        assert_eq!(query_param(qs, "path").as_deref(), Some("src/app.rs"));
+        assert_eq!(query_param(qs, "q").as_deref(), Some("fn main"));
+        assert_eq!(query_param(qs, "empty").as_deref(), Some(""));
+        assert_eq!(query_param(qs, "nope"), None);
+        // 日本語も通る (スマホの検索窓から普通に来る)
+        assert_eq!(
+            query_param("q=%E6%97%A5%E6%9C%AC%E8%AA%9E", "q").as_deref(),
+            Some("日本語")
+        );
+        // 壊れた % は落とさずそのまま残す (100% のような検索語を殺さない)
+        assert_eq!(query_param("q=100%", "q").as_deref(), Some("100%"));
+        assert_eq!(query_param("q=a%zz", "q").as_deref(), Some("a%zz"));
+    }
+
+    #[test]
+    fn 変更の状態は1文字に決まる() {
+        for (o, n, ren, want) in [
+            ("a.rs", "a.rs", false, "M"),
+            ("/dev/null", "a.rs", false, "A"),
+            ("a.rs", "/dev/null", false, "D"),
+            ("a.rs", "b.rs", true, "R"),
+            // 改名は他のどれより優先する (中身も変わっているのが普通)
+            ("/dev/null", "b.rs", true, "R"),
+            ("", "a.rs", false, "A"),
+        ] {
+            assert_eq!(change_status(o, n, ren), want, "{o} -> {n} rename={ren}");
+        }
+    }
+
+    #[test]
+    fn 追跡外だけをstatusから拾う() {
+        // -z なので引用は無い。改名は 2 レコード使う
+        let out = "?? new.txt\0 M src/app.rs\0R  dst.rs\0src.rs\0?? a b.txt\0A  added.rs\0";
+        assert_eq!(untracked_paths_z(out), vec!["new.txt", "a b.txt"]);
+        // 改名の「元パス」をエントリと取り違えない
+        let ren = "R  ?? weird.txt\0?? old.txt\0";
+        assert_eq!(untracked_paths_z(ren), Vec::<String>::new());
+        assert_eq!(untracked_paths_z(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn 拡張256色は同じ式でrgbになる() {
+        let base = {
+            let mut b = [[0u8; 3]; 16];
+            b[1] = [255, 0, 0];
+            b[15] = [255, 255, 255];
+            b
+        };
+        // 0〜15 はテーマの色をそのまま
+        assert_eq!(ansi_hex(1, &base), "#ff0000");
+        assert_eq!(ansi_hex(15, &base), "#ffffff");
+        // 6×6×6 の立方体 (16 が黒、231 が白)
+        assert_eq!(ansi_hex(16, &base), "#000000");
+        assert_eq!(ansi_hex(231, &base), "#ffffff");
+        assert_eq!(ansi_hex(196, &base), "#ff0000");
+        // 24 段の灰色
+        assert_eq!(ansi_hex(232, &base), "#080808");
+        assert_eq!(ansi_hex(255, &base), "#eeeeee");
+    }
+
+    /// span 畳み込み。**行末の詰め物を落とすこと**が本題
+    /// (80〜200 桁の空白をそのまま送ると、本文よりパディングが大きくなる)。
+    #[test]
+    fn 同じ見た目のセルは1つに畳まれ行末の空白は落ちる() {
+        let plain = CellStyle::default();
+        let red = CellStyle {
+            fg: Some("#ff0000".into()),
+            ..Default::default()
+        };
+        let cell = |t: &str, st: &CellStyle| (t.to_string(), st.clone());
+
+        // 同じ属性が続けば 1 span
+        let out = fold_spans(&[
+            cell("a", &plain),
+            cell("b", &plain),
+            cell("c", &red),
+            cell("d", &red),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "ab");
+        assert_eq!(out[1].text, "cd");
+        assert_eq!(out[1].style, red);
+
+        // 行末の既定色の空白は消える (空セルも同じ扱い)
+        let out = fold_spans(&[
+            cell("x", &plain),
+            cell(" ", &plain),
+            cell("", &plain),
+            cell(" ", &plain),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "x");
+
+        // 背景色の付いた空白は**見た目そのもの**なので残す
+        let bg = CellStyle {
+            bg: Some("#003300".into()),
+            ..Default::default()
+        };
+        let out = fold_spans(&[cell("x", &plain), cell(" ", &bg)]);
+        assert_eq!(out.len(), 2, "色付きの空白まで落としている");
+        assert_eq!(out[1].text, " ");
+
+        // 途中の空白は落とさない (桁がずれる)
+        let out = fold_spans(&[cell("a", &plain), cell(" ", &plain), cell("b", &plain)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "a b");
+
+        // 全部が詰め物なら空 (1 行まるごと省ける)
+        assert!(fold_spans(&[cell(" ", &plain), cell(" ", &plain)]).is_empty());
+        assert!(fold_spans(&[]).is_empty());
+    }
+
+    #[test]
+    fn spanのjsonは既定値のキーを出さない() {
+        let spans = vec![
+            Span {
+                text: "err".into(),
+                style: CellStyle {
+                    fg: Some("#f85149".into()),
+                    bold: true,
+                    ..Default::default()
+                },
+            },
+            Span {
+                text: ": failed".into(),
+                style: CellStyle::default(),
+            },
+        ];
+        let v = spans_json(&spans);
+        let a = v.as_array().expect("配列");
+        assert_eq!(a[0]["t"], "err");
+        assert_eq!(a[0]["fg"], "#f85149");
+        assert_eq!(a[0]["bold"], true);
+        assert!(a[0].get("bg").is_none(), "既定の背景色を書いている");
+        assert!(a[0].get("italic").is_none(), "false を書いている");
+        // 既定色の span は t だけ
+        assert_eq!(a[1].as_object().expect("obj").len(), 1);
+    }
+
+    #[test]
+    fn pendingの応答だけ聞き直す() {
+        assert!(is_pending(r#"{"ok":false,"pending":true}"#));
+        assert!(!is_pending(r#"{"ok":false,"pending":false}"#));
+        assert!(!is_pending(r#"{"ok":true,"files":[]}"#));
+        // 読めない応答を聞き直しの輪に入れない (塞ぐより見せる)
+        assert!(!is_pending("not json"));
+        assert!(!is_pending(""));
+        assert!(!is_pending(r#"{"pending":"yes"}"#));
+    }
+
+    #[test]
+    fn 聞き直すのはgitと検索だけ() {
+        // 聞き直す = UI スレッドで待たない要求。他は 1 往復で答えが出る
+        for q in all_query_variants() {
+            let expected = matches!(
+                &q,
+                Query::Changes | Query::Diff { .. } | Query::Search { .. }
+            );
+            assert_eq!(q.retries_while_pending(), expected);
+        }
     }
 
     #[test]
@@ -3112,7 +3017,15 @@ mod tests {
                 | Query::BulkStop { .. }
                 // 承認は「効いたか」が返らないと、押したのに止まったままか
                 // 分からない (press_pet_approve_button は失敗しうる)
-                | Query::AgentAct { .. } => false,
+                | Query::AgentAct { .. }
+                // 読み取りは値そのものが要る。承認の決着も「効いたか」を返す
+                | Query::Changes
+                | Query::Diff { .. }
+                | Query::Scrollback { .. }
+                | Query::Approvals
+                | Query::Approve { .. }
+                | Query::Read { .. }
+                | Query::Search { .. } => false,
                 // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
                 Query::Notify(..)
                 | Query::SetPanel { .. }

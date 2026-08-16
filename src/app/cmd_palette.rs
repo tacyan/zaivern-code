@@ -316,12 +316,6 @@ impl ZaivernApp {
                 Cmd::GitHistory,
             ),
             (
-                "±".into(),
-                tr("マルチバッファ: 未コミットの変更をまとめて直す"),
-                String::new(),
-                Cmd::OpenChangesMultibuffer,
-            ),
-            (
                 "🔎".into(),
                 tr("マルチバッファ: 検索結果をまとめて直す"),
                 String::new(),
@@ -1203,7 +1197,7 @@ impl ZaivernApp {
         }
         // feature.rs のレジストリに登録された機能。**ここが唯一の差し込み口**で、
         // 機能が増えてもこの 1 ブロックは変わらない (並列開発の衝突対策)。
-        cmds.extend(crate::feature::palette_entries());
+        cmds.extend(crate::feature::palette_entries(&self.feature_keys));
         // 実行中のセッション毎に音声入力エントリを出す (パレットで「音声」検索用)
         for s in self.agents.sessions.iter().take(20) {
             cmds.push((

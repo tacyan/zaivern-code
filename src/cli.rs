@@ -269,7 +269,10 @@ fn yields_to_directory(word: &str) -> bool {
 /// `zai <cmd> --help` は該当セクションだけを出す。
 /// **セクションの実体は 1 箇所** — 全体ヘルプと個別ヘルプが食い違わない。
 pub fn help_text() -> String {
-    format!("{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n{HELP_TRAIN_SPLIT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}")
+    format!(
+        "{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n\
+         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
+    )
 }
 
 const HELP_HEAD: &str = "\
@@ -388,6 +391,31 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
 /// **本文は [`crate::guard`] 側の唯一の出所を指すだけ**。ここへ写経すると
 /// `zai guard --help` と `zai --help` が食い違う (それを戒めるテストが下にある)。
 pub const HELP_GUARD: &str = crate::features::guard::HELP;
+
+/// 競合ゼロの導入・証明・プロセスメッシュ・交渉。
+///
+/// **本文はここに 1 行ずつの索引だけ置く。** 詳しい使い方は各サブコマンドの
+/// `--help` がそれぞれの実体から出す (写経すると必ず食い違う。`HELP_GUARD` と同じ方針)。
+///
+/// ここが空だった間、`czero` / `coedit` / `mesh` / `negotiate` の 4 つは
+/// **動くのに `zai help` に 1 文字も出ていなかった** — 導入コマンドが CLI から
+/// 発見できないという、いちばん惜しい壊れ方をしていた。番人は
+/// [`全サブコマンドがヘルプに出ている`]。
+pub const HELP_CZERO: &str = "\
+競合ゼロ (並列で走らせても同じ行を 2 人に配らない仕組み):
+  zai czero init                        このリポジトリへ導入する (フック / 追記の自動マージ)
+  zai czero doctor                      いま何段まで効いているかを診断する
+  zai czero prove                       効いていることを実測で示す
+  zai czero uninstall                   導入したものを外す
+  zai coedit proof                      配る前に「後で一撃で統合できる」ことを証明する
+  zai coedit regions                    いま誰がどの行域を持っているかを出す
+  zai mesh spawn|list|register          エージェント同士が互いを監視するメッシュ
+                                        (Erlang のプロセスリンク相当。落ちたら気付ける)
+  zai negotiate offer|allocate|deal     行域がぶつかったとき、断らずに「ずらす」
+  詳しい使い方は zai czero --help / zai coedit --help /
+                 zai mesh --help / zai negotiate --help
+
+";
 
 /// 順次統合 (マージトレイン) と、配る前の担当分割、そして git マージドライバ。
 ///
@@ -3622,6 +3650,59 @@ mod tests {
         assert!(help.contains("終了コード: 0 = 成功 / 1 = 実行時エラー / 2 = 引数の指定ミス"));
     }
 
+    /// **門が受け付ける語は、全部ヘルプに出ていること。**
+    ///
+    /// `czero` / `coedit` / `mesh` / `negotiate` の 4 つは**動くのに
+    /// `zai help` に 1 文字も出ていなかった** — 導入コマンドが CLI から
+    /// 発見できないという、いちばん惜しい壊れ方をしていた。
+    /// 門 (`is_cli_subcommand`) へ足したのにヘルプへ書き忘れる、を構造で禁じる。
+    #[test]
+    fn 全サブコマンドがヘルプに出ている() {
+        // 門そのものを引く (一覧を写経すると必ずずれる)
+        const WORDS: &[&str] = &[
+            "open",
+            "notify",
+            "prompt",
+            "run",
+            "panel",
+            "status",
+            "state",
+            "plugin",
+            "app",
+            "firewall",
+            "worktree",
+            "session",
+            "agent",
+            "lease",
+            "hook",
+            "guard",
+            "train",
+            "split",
+            "coedit",
+            "mesh",
+            "negotiate",
+            "czero",
+            "merge-driver",
+            "update",
+            "uninstall",
+            "i18n",
+            "lang",
+        ];
+        let help = help_text();
+        let mut missing = Vec::new();
+        for w in WORDS {
+            // 門が本当にその語を受けることを先に確かめる (表が腐っていないか)
+            assert!(is_cli_subcommand(w), "門が {w} を受けていない (表が古い)");
+            if !help.contains(&format!("zai {w}")) {
+                missing.push(*w);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "動くのに zai help に出ていないサブコマンド: {missing:?}"
+        );
+    }
+
     /// 個別ヘルプは全体ヘルプの一部でなければならない (二重管理で食い違わせない)。
     #[test]
     fn per_command_help_is_a_slice_of_the_full_help() {
@@ -3632,6 +3713,7 @@ mod tests {
             HELP_AGENT,
             HELP_LEASE,
             HELP_GUARD,
+            HELP_CZERO,
             HELP_TRAIN_SPLIT,
             HELP_UPDATE,
             HELP_UNINSTALL,

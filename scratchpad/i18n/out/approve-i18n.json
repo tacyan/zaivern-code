@@ -1,0 +1,207 @@
+[
+  {
+    "id": "remote.appr_age_h",
+    "where": "assets/remote/js/47-approve.js:210 (承認ビュー — 待ち時間 (1 時間以上))",
+    "ja": "{n} 時間待ち"
+  },
+  {
+    "id": "remote.appr_age_m",
+    "where": "assets/remote/js/47-approve.js:209 (承認ビュー — 待ち時間 (60 分未満))",
+    "ja": "{n} 分待ち"
+  },
+  {
+    "id": "remote.appr_age_s",
+    "where": "assets/remote/js/47-approve.js:208 (承認ビュー — 待ち時間 (60 秒未満))",
+    "ja": "{n} 秒待ち"
+  },
+  {
+    "id": "remote.appr_always",
+    "where": "assets/remote/js/47-approve.js:304 (承認ビュー — 行内の「常に許可」ボタン (act=always))",
+    "ja": "♾ 常に許可"
+  },
+  {
+    "id": "remote.appr_always_confirm",
+    "where": "assets/remote/js/47-approve.js:323 (承認ビュー — 「常に許可」の確認ダイアログ (何が残るかを書く))",
+    "ja": "「{kind}」を自動で承認する設定が PC 側 (config.toml) に残ります。\nいまの要求: {agent} — {detail}\n\nPC で外すまで、この種別の確認は出なくなります。よろしいですか？"
+  },
+  {
+    "id": "remote.appr_always_done",
+    "where": "assets/remote/js/47-approve.js:336 (承認ビュー — 「常に許可」にしたときのトースト)",
+    "ja": "♾ 「{kind}」を常に許可にしました"
+  },
+  {
+    "id": "remote.appr_approve",
+    "where": "assets/remote/js/47-approve.js:297 (承認ビュー — 行内の承認ボタン)",
+    "ja": "✅ 承認"
+  },
+  {
+    "id": "remote.appr_approved",
+    "where": "assets/remote/js/47-approve.js:337 (承認ビュー — 1 件承認したときのトースト)",
+    "ja": "✅ 承認しました"
+  },
+  {
+    "id": "remote.appr_auto_confirm",
+    "where": "assets/remote/js/47-approve.js:238 (承認ビュー — ⚡ 全自動 へ切り替える前の確認ダイアログ)",
+    "ja": "⚡ 全自動 にすると、これから出る承認要求をすべて自動で通します。よろしいですか？"
+  },
+  {
+    "id": "remote.appr_bulk",
+    "where": "assets/remote/js/47-approve.js:414 (承認ビュー — まとめて承認ボタン (効く件数つき))",
+    "ja": "✅ 全部承認 ({n})"
+  },
+  {
+    "id": "remote.appr_bulk_ask",
+    "where": "assets/remote/js/47-approve.js:372 (承認ビュー — まとめて承認の確認ダイアログ (最後の問い))",
+    "ja": "よろしいですか？"
+  },
+  {
+    "id": "remote.appr_bulk_confirm",
+    "where": "assets/remote/js/47-approve.js:363 (承認ビュー — まとめて承認の確認ダイアログ (見出し))",
+    "ja": "{n} 件をまとめて承認します。"
+  },
+  {
+    "id": "remote.appr_bulk_done",
+    "where": "assets/remote/js/47-approve.js:382 (承認ビュー — まとめて承認の結果トースト)",
+    "ja": "✅ {n} 件を承認しました"
+  },
+  {
+    "id": "remote.appr_bulk_kind",
+    "where": "assets/remote/js/47-approve.js:365 (承認ビュー — まとめて承認の確認ダイアログ (種別ごとの内訳の 1 行))",
+    "ja": "・{kind} {n} 件"
+  },
+  {
+    "id": "remote.appr_bulk_left",
+    "where": "assets/remote/js/47-approve.js:383 (承認ビュー — まとめて承認で返せなかった件数 (結果トーストの後ろ))",
+    "ja": "（{m} 件は返せませんでした）"
+  },
+  {
+    "id": "remote.appr_bulk_none",
+    "where": "assets/remote/js/47-approve.js:354 (承認ビュー — まとめて承認できるものが無いときのトースト)",
+    "ja": "まとめて承認できるものがありません"
+  },
+  {
+    "id": "remote.appr_bulk_skip",
+    "where": "assets/remote/js/47-approve.js:368 (承認ビュー — まとめて承認から外した種別と件数 (確認ダイアログ内))",
+    "ja": "（「{kind}」の {m} 件は含めません — 1 件ずつ確かめてください）"
+  },
+  {
+    "id": "remote.appr_confirm_danger",
+    "where": "assets/remote/js/47-approve.js:317 (承認ビュー — 取り返しのつかない種別を承認する前の確認ダイアログ)",
+    "ja": "「{kind}」を承認します。取り消せません。\n{detail}"
+  },
+  {
+    "id": "remote.appr_denied",
+    "where": "assets/remote/js/47-approve.js:334 (承認ビュー — 1 件拒否したときのトースト)",
+    "ja": "⛔ 拒否しました"
+  },
+  {
+    "id": "remote.appr_deny",
+    "where": "assets/remote/js/47-approve.js:300 (承認ビュー — 行内の拒否ボタン)",
+    "ja": "⛔ 拒否"
+  },
+  {
+    "id": "remote.appr_empty",
+    "where": "assets/remote/js/47-approve.js:257 (承認ビュー — 0 件のときの中央カード)",
+    "ja": "待っている承認はありません"
+  },
+  {
+    "id": "remote.appr_failed",
+    "where": "assets/remote/js/47-approve.js:343 (承認ビュー — 返せなかったときのトースト)",
+    "ja": "返せませんでした"
+  },
+  {
+    "id": "remote.appr_gone",
+    "where": "assets/remote/js/47-approve.js:344 (承認ビュー — 送る前に横 (PC / 通知) で決着していたときのトースト)",
+    "ja": "すでに決着していました"
+  },
+  {
+    "id": "remote.appr_kind_file_delete",
+    "where": "assets/remote/js/47-approve.js:72 (承認ビュー — 種別 (approvals.rs の file_delete))",
+    "ja": "ファイル削除"
+  },
+  {
+    "id": "remote.appr_kind_file_read",
+    "where": "assets/remote/js/47-approve.js:70 (承認ビュー — 種別 (approvals.rs の file_read))",
+    "ja": "ファイル読み取り"
+  },
+  {
+    "id": "remote.appr_kind_file_write",
+    "where": "assets/remote/js/47-approve.js:71 (承認ビュー — 種別 (approvals.rs の file_write))",
+    "ja": "ファイル書き込み"
+  },
+  {
+    "id": "remote.appr_kind_git_operation",
+    "where": "assets/remote/js/47-approve.js:75 (承認ビュー — 種別 (approvals.rs の git_operation))",
+    "ja": "git 操作"
+  },
+  {
+    "id": "remote.appr_kind_network_access",
+    "where": "assets/remote/js/47-approve.js:74 (承認ビュー — 種別 (approvals.rs の network_access))",
+    "ja": "ネットワーク接続"
+  },
+  {
+    "id": "remote.appr_kind_other",
+    "where": "assets/remote/js/47-approve.js:78 (承認ビュー — 種別 (approvals.rs の other))",
+    "ja": "その他の承認"
+  },
+  {
+    "id": "remote.appr_kind_package_install",
+    "where": "assets/remote/js/47-approve.js:76 (承認ビュー — 種別 (approvals.rs の package_install))",
+    "ja": "パッケージ導入"
+  },
+  {
+    "id": "remote.appr_kind_privilege",
+    "where": "assets/remote/js/47-approve.js:77 (承認ビュー — 種別 (approvals.rs の privilege))",
+    "ja": "管理者権限の昇格"
+  },
+  {
+    "id": "remote.appr_kind_shell_command",
+    "where": "assets/remote/js/47-approve.js:73 (承認ビュー — 種別 (approvals.rs の shell_command))",
+    "ja": "コマンド実行"
+  },
+  {
+    "id": "remote.appr_legacy",
+    "where": "assets/remote/js/47-approve.js:397 (承認ビュー — サーバが承認キュー未対応のときの帯)",
+    "ja": "この PC の版は承認キューに未対応です — 種別と根拠は出せません（承認のみ）"
+  },
+  {
+    "id": "remote.appr_mode",
+    "where": "assets/remote/js/47-approve.js:228 (承認ビュー — モード帯の見出し)",
+    "ja": "承認モード"
+  },
+  {
+    "id": "remote.appr_mode_agent",
+    "where": "assets/remote/js/47-approve.js:83 (承認ビュー — モード切替ボタン (Agent 優先))",
+    "ja": "🤖 Agent優先"
+  },
+  {
+    "id": "remote.appr_mode_ask",
+    "where": "assets/remote/js/47-approve.js:82 (承認ビュー — モード切替ボタン (都度確認))",
+    "ja": "🛡 都度確認"
+  },
+  {
+    "id": "remote.appr_mode_auto",
+    "where": "assets/remote/js/47-approve.js:84 (承認ビュー — モード切替ボタン (全自動))",
+    "ja": "⚡ 全自動"
+  },
+  {
+    "id": "remote.appr_mode_set",
+    "where": "assets/remote/js/47-approve.js:243 (承認ビュー — モードを切り替えたときのトースト)",
+    "ja": "承認モードを {mode} にしました"
+  },
+  {
+    "id": "remote.appr_unknown",
+    "where": "assets/remote/js/47-approve.js:274 (承認ビュー — 種別・根拠・エージェント名が取れないときの表示)",
+    "ja": "不明"
+  },
+  {
+    "id": "remote.appr_view",
+    "where": "assets/remote/js/47-approve.js:450 (エージェントタブのビュー切替 5 つ目 (バッジ付き))",
+    "ja": "✅ 承認"
+  },
+  {
+    "id": "remote.appr_why",
+    "where": "assets/remote/js/47-approve.js:292 (承認ビュー — 行の根拠 (対象ファイル / コマンド) の見出し)",
+    "ja": "根拠"
+  }
+]

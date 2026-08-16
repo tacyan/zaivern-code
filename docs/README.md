@@ -46,3 +46,5 @@
   [region-cost.md](region-cost.md) §8 (`is_disjoint` 早期脱出後の最悪ケース)。
 * **`src/*.rs:行番号` は書かない。** 複数のエージェントが同時に編集するので
   行番号は必ず腐る。**ファイル名と記号名**で指すこと。
+- [i18n.md](i18n.md) — 多言語化の仕組み
+- [translating.md](translating.md) — 翻訳の手引き

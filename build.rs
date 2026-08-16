@@ -27,8 +27,85 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/Zaivern.ico");
     generate_feature_registry();
+    generate_remote_assets();
     #[cfg(windows)]
     embed_windows_version_info();
+}
+
+/// `assets/remote/` を走査して、スマホ用ページ (`PAGE`) を 1 本へ畳む式を生成する。
+///
+/// ## なぜコード生成なのか
+///
+/// スマホ画面はもともと `src/remote.rs` の中の**900 行の `const` 文字列**だった。
+/// 画面を 1 つ足すたびに、同じファイルの近い行を全員が触ることになる —
+/// `src/features/` で潰したのと**まったく同じ形の衝突**が web 側に残っていた。
+///
+/// ここで走査にしておくと、**`assets/remote/js/<名前>.js` を 1 つ置くだけ**で
+/// 画面が増える。共有ファイルへの追記が 1 行も要らないので、並列に足しても
+/// 構造的に衝突しない。
+///
+/// * 並びは**ファイル名順**。1 つのスコープを共有するので、定義より前で
+///   使わないよう番号を頭に付けて順序を固定する (`00-core.js` → `90-boot.js`)
+/// * `include_str!` なので**ビルド時に埋め込まれる**。実行時にファイルを
+///   探しに行かないから、どの OS のどのインストール先でも動く
+/// * 生成物はコミットしないので、生成物自体も衝突しない
+fn generate_remote_assets() {
+    use std::fmt::Write as _;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/remote/js");
+    println!("cargo:rerun-if-changed=assets/remote/js");
+    println!("cargo:rerun-if-changed=assets/remote/page-head.html");
+    println!("cargo:rerun-if-changed=assets/remote/body.html");
+    println!("cargo:rerun-if-changed=assets/remote/style.css");
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} を読めません: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "js"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "{} に .js がありません", dir.display());
+
+    // **`PAGE` を丸ごとここで組む。** `concat!` はリテラルしか受け取らないので、
+    // 「JS だけ定数にして後で足す」ことができない (`concat!(REMOTE_JS, …)` は
+    // コンパイルエラー)。頭・CSS・本文・JS・尻尾を 1 つの `concat!` に畳む。
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/remote");
+    let lit = |p: &std::path::Path| format!("{}", p.display()).replace('\\', "/");
+    let mut out = String::from(
+        "// build.rs が生成 — 触らない (assets/remote/ を編集すること)\n         pub const PAGE: &str = concat!(\n",
+    );
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("page-head.html"))
+    );
+    out.push_str("    \"<style>\\n\",\n");
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("style.css"))
+    );
+    out.push_str("    \"</style>\\n</head>\\n\",\n");
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("body.html"))
+    );
+    out.push_str("    \"<script>\\n\",\n");
+    for f in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        let _ = writeln!(out, "    include_str!(\"{}\"),", lit(f));
+    }
+    out.push_str("    \"</script>\\n</body>\\n</html>\\n\",\n);\n");
+
+    let dest =
+        std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("remote_page.rs");
+    let same = std::fs::read_to_string(&dest)
+        .map(|old| old == out)
+        .unwrap_or(false);
+    if !same {
+        std::fs::write(&dest, out).expect("remote_page.rs を書けません");
+    }
 }
 
 /// `src/features/*.rs` を走査して、`mod` 宣言とレジストリ配列を生成する。

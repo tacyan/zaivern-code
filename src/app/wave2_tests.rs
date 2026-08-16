@@ -1310,7 +1310,7 @@ fn git_blameは既定offで3経路から届く() {
         "表示メニューから届いていない"
     );
     // 3 段すべてが**パレットから 1 手で**選べる (循環しか無いと選べない)。
-    let ids: Vec<&str> = crate::feature::palette_entries()
+    let ids: Vec<&str> = crate::feature::palette_entries(&crate::keybinds::FeatureBinds::default())
         .iter()
         .filter_map(|(_, _, _, c)| match c {
             crate::palette::Cmd::Feature(id) => Some(*id),

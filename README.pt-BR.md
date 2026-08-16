@@ -129,7 +129,8 @@ edite, confira com `zai lang check fr` e aplique com `zai lang set fr`. **Escrev
 ID que um idioma embutido já tem sobrescreve apenas aquela linha**, então corrigir um
 rótulo não exige carregar um dicionário inteiro.
 
-O [docs/i18n.md](docs/i18n.md) cobre o resto.
+**Quer traduzir o Zaivern Code para o seu idioma?** Sem Rust e sem recompilar — basta colocar um
+arquivo JSON: [docs/translating.md](docs/translating.md). Como funciona: [docs/i18n.md](docs/i18n.md).
 
 ## Principais recursos
 

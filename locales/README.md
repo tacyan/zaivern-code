@@ -86,4 +86,8 @@ zai lang check ja
 ```
 
 The guards live in `src/locale.rs` and `src/tutorial.rs` tests. If one goes red,
-**fix the JSON, not the test**. Details: [`docs/i18n.md`](../docs/i18n.md).
+**fix the JSON, not the test**.
+
+- **Translating?** Start here: [`docs/translating.md`](../docs/translating.md)
+  (rules, pitfalls, how to publish your pack).
+- **How it works:** [`docs/i18n.md`](../docs/i18n.md).

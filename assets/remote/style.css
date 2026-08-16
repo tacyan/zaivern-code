@@ -1,0 +1,153 @@
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; }
+  body {
+    background:#0d1117; color:#e6edf3;
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+    display:flex; flex-direction:column; overflow:hidden;
+    -webkit-text-size-adjust:100%;
+  }
+  header {
+    flex:none; display:flex; align-items:center; gap:8px;
+    padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;
+    background:#161b22; border-bottom:1px solid #21262d;
+  }
+  header .logo { font-weight:800; font-size:15px; color:#7ee1ff; letter-spacing:.5px; }
+  header .ws { font-size:12px; color:#8b949e; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; }
+  #dot { width:9px; height:9px; border-radius:50%; background:#f85149; flex:none; }
+  #dot.on { background:#3fb950; box-shadow:0 0 6px #3fb95088; }
+  main { flex:1; overflow:hidden; position:relative; }
+  .view { position:absolute; inset:0; display:none; flex-direction:column; }
+  .view.act { display:flex; }
+  nav {
+    flex:none; display:flex; background:#161b22; border-top:1px solid #21262d;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  nav button {
+    flex:1; background:none; border:none; color:#8b949e; font-size:10.5px;
+    padding:8px 0 6px; display:flex; flex-direction:column; align-items:center; gap:2px;
+  }
+  nav button .ico { font-size:20px; }
+  nav button.act { color:#7ee1ff; }
+  .chips { flex:none; display:flex; gap:6px; overflow-x:auto; padding:8px 10px; -webkit-overflow-scrolling:touch; }
+  .chips::-webkit-scrollbar { display:none; }
+  .chip {
+    flex:none; background:#21262d; color:#c9d1d9; border:1px solid #30363d;
+    border-radius:14px; padding:6px 12px; font-size:12.5px; max-width:46vw;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .chip.act { background:#1f3a5f; border-color:#7ee1ff; color:#7ee1ff; }
+  .chip.mic { font-size:15px; padding:6px 10px; }
+  .chip.mic.rec { background:#6e2c1e; border-color:#f85149; color:#fff; animation:zvpulse 1.1s ease-in-out infinite; }
+  @keyframes zvpulse { 50% { box-shadow:0 0 12px #f85149; } }
+  #ta {
+    flex:1; width:100%; background:#0d1117; color:#e6edf3; border:none; outline:none;
+    font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;
+    padding:10px 12px; resize:none; white-space:pre; overflow:auto;
+  }
+  .bar { flex:none; display:flex; gap:8px; padding:8px 10px; background:#161b22; border-top:1px solid #21262d; align-items:center; }
+  .btn {
+    background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
+    padding:10px 14px; font-size:13.5px; font-weight:600;
+  }
+  .btn.pri { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .btn.warn { background:#6e2c1e; border-color:#f85149; }
+  .btn:active { opacity:.7; }
+  /* 宛先がいないときは押せない (誤爆ではなく「押しても何も起きない」を潰す) */
+  .btn[disabled] { opacity:.35; }
+  /* 一括操作の宛先行。宛先が無い (エージェント 0 体) ときは高さも取らない */
+  #btgt {
+    flex:none; display:none; align-items:center; gap:8px;
+    padding:6px 10px; background:#161b22; border-bottom:1px solid #21262d;
+    font-size:12px; color:#8b949e;
+  }
+  #btgt.show { display:flex; }
+  #btgt .n { color:#e6edf3; font-weight:700; }
+  #btgt .btn { padding:6px 10px; font-size:12px; }
+  /* エージェントタブの中のビュー切替 (端末 / 待ち / デッキ / 看板)。
+     下部ナビを増やさずに済ませる。指の当たり判定は 44px 以上を保つ */
+  .seg { flex:none; display:flex; background:#161b22; border-bottom:1px solid #21262d; }
+  .seg button {
+    flex:1; min-width:0; padding:14px 2px; font-size:12.5px; font-weight:600;
+    background:none; border:none; border-bottom:2px solid transparent; color:#8b949e;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .seg button.act { color:#7ee1ff; border-bottom-color:#7ee1ff; }
+  .seg .badge {
+    display:inline-block; margin-left:4px; padding:0 5px; border-radius:8px;
+    background:#6e2c1e; color:#fff; font-size:10.5px; font-weight:700;
+  }
+  /* 一覧 (待ち / デッキ / 看板 で共有する 1 枚の入れ物) */
+  #alist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; display:none; padding:8px 10px 12px; }
+  #alist.show { display:block; }
+  /* 空状態は「利用可能領域の中央に 1 枚」。下や上に取り残さない */
+  #alist.mid { display:flex; align-items:center; justify-content:center; padding:16px; }
+  .card {
+    background:#161b22; border:1px solid #21262d; border-radius:10px;
+    padding:10px 12px; margin-bottom:8px;
+  }
+  .card.act { border-color:#7ee1ff; }
+  .card:active { background:#1c2432; }
+  .card .hd { display:flex; align-items:center; gap:6px; font-size:13.5px; }
+  .card .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:700; }
+  .card .st { flex:none; font-size:11px; color:#8b949e; max-width:46%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .card .pv {
+    margin:6px 0 0; font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:#8b949e; white-space:pre-wrap; word-break:break-all; max-height:3em; overflow:hidden;
+  }
+  .card .ax { display:flex; gap:8px; margin-top:8px; }
+  .card .ax .btn {
+    flex:1; min-width:0; padding:12px 6px; font-size:12.5px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .lane { margin:0 0 8px; }
+  .lane .lhd {
+    display:flex; align-items:center; gap:8px; width:100%; padding:12px 10px;
+    background:#161b22; border:1px solid #21262d; border-radius:10px;
+    color:#c9d1d9; font-size:13px; font-weight:700; text-align:left;
+  }
+  .lane .lhd .n { margin-left:auto; color:#8b949e; }
+  .lane .body { padding:8px 0 0; }
+  .mid-card {
+    max-width:300px; text-align:center; background:#161b22; border:1px solid #21262d;
+    border-radius:12px; padding:22px 18px; color:#8b949e; font-size:13px; line-height:1.7;
+  }
+  .mid-card .big { display:block; font-size:30px; margin-bottom:8px; }
+  /* 音声が使えない端末への案内 (トーストと違い消えない) */
+  #vnote {
+    display:none; margin:0 0 8px; padding:9px 11px; border-radius:8px;
+    background:#3a2c12; border:1px solid #d29922; color:#f2dfb4;
+    font-size:12px; line-height:1.65; word-break:break-all;
+  }
+  #vnote.show { display:block; }
+  .grow { flex:1; }
+  #meta { font-size:11px; color:#8b949e; }
+  #filter, #ti {
+    flex:1; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
+    padding:10px 12px; font-size:16px; outline:none; min-width:0;
+  }
+  #flist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  #flist div { padding:12px 14px; border-bottom:1px solid #1c2128; font-size:13.5px; }
+  #flist div:active { background:#1f3a5f; }
+  #flist .dir { color:#8b949e; font-size:11px; }
+  #scr {
+    flex:1; overflow:auto; -webkit-overflow-scrolling:touch; background:#010409;
+    font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    padding:8px 10px; white-space:pre; color:#c9d1d9;
+  }
+  .keys { flex:none; display:flex; gap:6px; overflow-x:auto; padding:6px 10px; background:#161b22; }
+  .keys::-webkit-scrollbar { display:none; }
+  .key {
+    flex:none; background:#21262d; color:#e6edf3; border:1px solid #30363d;
+    border-radius:8px; padding:9px 13px; font-size:13px; font-weight:600;
+  }
+  .key:active { background:#1f3a5f; }
+  .grid { flex:1; overflow-y:auto; display:grid; grid-template-columns:1fr 1fr; gap:10px; padding:12px; align-content:start; }
+  .grid .btn { padding:16px 8px; font-size:14px; text-align:center; }
+  #toast {
+    position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom) + 74px);
+    transform:translateX(-50%); background:#1f6feb; color:#fff; padding:10px 18px;
+    border-radius:20px; font-size:13px; opacity:0; transition:opacity .25s; pointer-events:none;
+    max-width:86vw; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; z-index:9;
+  }
+  #toast.show { opacity:1; }
+  .empty { color:#8b949e; text-align:center; padding:40px 20px; font-size:13px; }

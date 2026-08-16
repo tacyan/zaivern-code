@@ -1,0 +1,93 @@
+[
+  {
+    "ja": "変更一覧 — 未コミットの差分 (diff) をまとめて見て直す",
+    "where": "src/features/changes.rs: Entry::label (コマンドパレットの行。表示時に tr を通る)",
+    "key": "changes.changes_list_uncommitted_diff",
+    "guard": "tutorial::tests::全機能索引の全行が辞書にある",
+    "translations": {
+      "en": "Changes — review and edit every uncommitted diff in one place",
+      "zh-CN": "变更一览 — 集中查看并修改未提交的差异 (diff)",
+      "ko": "변경 목록 — 커밋하지 않은 차이(diff)를 한곳에서 보고 고치기",
+      "es": "Cambios — revisa y edita todas las diferencias sin confirmar en un solo lugar",
+      "pt-BR": "Alterações — veja e edite todas as diferenças não commitadas em um só lugar"
+    }
+  },
+  {
+    "ja": "変更はありません",
+    "where": "src/multibuffer.rs: empty_message(Source::Changes) — 空状態カードの見出し",
+    "key": "(追加不要: diff.no_changes / remote.changes_empty に同じ原文が既にある)",
+    "translations": {}
+  },
+  {
+    "ja": "一致はありません",
+    "where": "src/multibuffer.rs: empty_message(Source::Search) — 空状態カードの見出し",
+    "key": "multibuffer.no_matches",
+    "translations": {
+      "en": "No matches",
+      "zh-CN": "没有匹配",
+      "ko": "일치하는 항목이 없습니다",
+      "es": "No hay coincidencias",
+      "pt-BR": "Nenhuma correspondência"
+    }
+  },
+  {
+    "ja": "問題はありません",
+    "where": "src/multibuffer.rs: empty_message(Source::Problems) — 空状態カードの見出し",
+    "key": "multibuffer.no_problems",
+    "translations": {
+      "en": "No problems",
+      "zh-CN": "没有问题",
+      "ko": "문제가 없습니다",
+      "es": "No hay problemas",
+      "pt-BR": "Nenhum problema"
+    }
+  },
+  {
+    "ja": "作業ツリーは HEAD と同じ内容です",
+    "where": "src/multibuffer.rs: empty_hint(Source::Changes) — 空状態カードの補足",
+    "key": "multibuffer.worktree_same_as_head",
+    "translations": {
+      "en": "The working tree is identical to HEAD",
+      "zh-CN": "工作树与 HEAD 内容相同",
+      "ko": "작업 트리가 HEAD와 동일합니다",
+      "es": "El árbol de trabajo es idéntico a HEAD",
+      "pt-BR": "A árvore de trabalho é idêntica ao HEAD"
+    }
+  },
+  {
+    "ja": "検索語を変えてもう一度試してください",
+    "where": "src/multibuffer.rs: empty_hint(Source::Search) — 空状態カードの補足",
+    "key": "multibuffer.try_another_query",
+    "translations": {
+      "en": "Try a different search term",
+      "zh-CN": "请换个搜索词再试一次",
+      "ko": "검색어를 바꿔 다시 시도해 보세요",
+      "es": "Prueba con otro término de búsqueda",
+      "pt-BR": "Tente outro termo de busca"
+    }
+  },
+  {
+    "ja": "この作業ツリーに診断は出ていません",
+    "where": "src/multibuffer.rs: empty_hint(Source::Problems) — 空状態カードの補足",
+    "key": "multibuffer.no_diagnostics_here",
+    "translations": {
+      "en": "No diagnostics in this working tree",
+      "zh-CN": "此工作树中没有诊断信息",
+      "ko": "이 작업 트리에는 진단이 없습니다",
+      "es": "No hay diagnósticos en este árbol de trabajo",
+      "pt-BR": "Nenhum diagnóstico nesta árvore de trabalho"
+    }
+  },
+  {
+    "ja": "他 {n} ファイルは打ち切りました",
+    "where": "src/multibuffer.rs: OVERVIEW_CUT_MSG — 件数ラベルのホバーに出す一望の打ち切り告知 (trf で {n} を差し込む)",
+    "key": "multibuffer.overview_cut",
+    "translations": {
+      "en": "{n} more files were truncated",
+      "zh-CN": "另有 {n} 个文件已截断",
+      "ko": "다른 {n}개 파일은 잘렸습니다",
+      "es": "Se omitieron otros {n} archivos",
+      "pt-BR": "Outros {n} arquivos foram truncados"
+    }
+  }
+]

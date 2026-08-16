@@ -56,3 +56,10 @@ pub use imp::cli_main;
 /// 実体は `src/mesh.rs` だが `#[path]` で私有 `imp` として取り込んでいるので、
 /// 外から使える名前をここで 1 か所だけ開く (2 か所に写すとズレる)。
 pub use imp::{backoff, Mesh, Msg, Pid, SpawnOpts};
+
+/// **台帳 (`crate::lease`) がここから引く 1 本の橋。**
+///
+/// `zai hook` は短命プロセスなので自分の PID を台帳へ書いても意味が無い。
+/// メッシュに載っているエージェント本体の OS PID を引ければ、
+/// `lease::gc_in` が「死んだ持ち主のリース」を TTL (30 分) より前に返せる。
+pub use imp::linked_os_pid;

@@ -1691,13 +1691,14 @@ mod tests {
     /// どちらかを改名すると、メニューの行が黙って何もしなくなる。
     #[test]
     fn blame_の3段はパレット登録と同じidを指す() {
-        let known: Vec<&str> = crate::feature::palette_entries()
-            .iter()
-            .filter_map(|(_, _, _, c)| match c {
-                Cmd::Feature(id) => Some(*id),
-                _ => None,
-            })
-            .collect();
+        let known: Vec<&str> =
+            crate::feature::palette_entries(&crate::keybinds::FeatureBinds::default())
+                .iter()
+                .filter_map(|(_, _, _, c)| match c {
+                    Cmd::Feature(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
         for r in blame_menu_rows(BlameMenuState::OnUnknown) {
             assert!(known.contains(&r.id), "{} が登録されていない", r.id);
         }

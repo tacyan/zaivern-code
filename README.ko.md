@@ -128,7 +128,8 @@ zai lang install fr --from someone/zaivern-lang-fr
 ID를 한 줄만 쓰면 그 한 줄만 덮어쓸 수 있습니다.** 한 단어를 고치려고 사전을 통째로
 들고 있을 필요는 없습니다.
 
-자세한 내용은 [docs/i18n.md](docs/i18n.md)에 있습니다.
+**Zaivern Code를 여러분의 언어로 옮기고 싶다면** Rust도 재빌드도 필요 없습니다. JSON 파일 하나만 두면 됩니다:
+[docs/translating.md](docs/translating.md). 동작 원리는 [docs/i18n.md](docs/i18n.md).
 
 ## 주요 기능
 
