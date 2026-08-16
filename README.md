@@ -7,7 +7,7 @@
 **One cockpit for Claude Code, Codex, Gemini CLI, and the other AI coding CLIs you already use.**<br>
 Launch, watch, and steer them from a single native app on macOS, Windows, and Linux.
 
-[English](README.md) | [日本語](README.ja.md)
+**English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)

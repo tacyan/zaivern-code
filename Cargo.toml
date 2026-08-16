@@ -1,6 +1,6 @@
 [package]
 name = "zaivern-code"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 # MSRV。README / install.sh / install.ps1 が「1.88 以上」と案内している以上、
 # **cargo にも同じことを言わせる**。ここが無いと 1.88 では通らない構文や依存が

@@ -7,7 +7,7 @@
 **Claude Code・Codex・Gemini CLI など、いま使っている AI コーディング CLI をひとつの操縦席へ。**<br>
 起動・監視・指示を、macOS・Windows・Linux で動くひとつのネイティブアプリから。
 
-[English](README.md) | [日本語](README.ja.md)
+[English](README.md) | **日本語** | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)

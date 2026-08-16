@@ -25,6 +25,7 @@ impl ZaivernApp {
             })
         });
         let themes = self.theme_entries();
+        let languages = self.language_entries();
         let plugin_commands: Vec<(usize, usize, String, String)> = self
             .plugins
             .iter()
@@ -72,6 +73,7 @@ impl ZaivernApp {
                 .map(|(i, p)| (i, p.icon.clone(), p.name.clone()))
                 .collect(),
             themes,
+            languages,
             line_ending: self
                 .editor
                 .active

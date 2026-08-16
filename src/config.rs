@@ -146,6 +146,13 @@ impl<'de> Deserialize<'de> for BlameMode {
 #[serde(default)]
 pub struct Config {
     pub theme: String,
+    /// UI の表示言語。`"auto"` (既定) は OS の言語に従う。
+    ///
+    /// 値は `locales/<id>.json` の `<id>`。同梱は
+    /// `en` / `ja` / `zh-CN` / `ko` / `pt-BR` / `es` の 6 つで、
+    /// `~/.zaivern/locales/fr.json` を置けば `"fr"` も選べる。
+    /// 解決の規則は [`crate::locale::resolve`]。
+    pub ui_language: String,
     pub editor_font_size: f32,
     pub terminal_font_size: f32,
     /// 画面全体のズーム倍率 (VS Code の `window.zoomLevel` 相当)。
@@ -942,6 +949,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             theme: "zaivern-dark".into(),
+            ui_language: crate::locale::AUTO.into(),
             editor_font_size: 15.0,
             terminal_font_size: 13.0,
             ui_zoom: crate::zoom::DEFAULT,
@@ -1328,12 +1336,34 @@ pub(crate) fn zaivern_dir() -> PathBuf {
         .join(".zaivern")
 }
 
+/// `~/.zaivern/config.toml` の `ui_language` **だけ**を読む軽い入口。
+///
+/// CLI (`zai <sub>`) は GUI の設定一式を組み立てない (ワークスペースが無い)
+/// ので、表示言語のためだけに `Config` を全部読むのは重い。ここは
+/// **1 ファイルを 1 度読んで 1 つのキーを見るだけ**。
+/// 読めない・書いていない場合は `"auto"`。
+pub fn ui_language_pref() -> String {
+    let raw = std::fs::read_to_string(config_path()).unwrap_or_default();
+    raw.parse::<toml::Table>()
+        .ok()
+        .and_then(|t| t.get("ui_language")?.as_str().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::locale::AUTO.to_string())
+}
+
 pub const DEFAULT_CONFIG: &str = r#"# ══════════════════════════════════════════════════
 #  Zaivern Code 設定ファイル
 #  場所: ~/.zaivern/config.toml
 #  プロジェクトごとの上書き: <workspace>/.zaivern.toml
 #  変更後はコマンドパレット (⌘⇧P) の「設定を再読み込み」で反映されます
 # ══════════════════════════════════════════════════
+
+# UI の表示言語。"auto" は OS の言語に従います (取れなければ日本語)。
+#   同梱: "en" | "ja" | "zh-CN" | "ko" | "pt-BR" | "es"
+#   ~/.zaivern/locales/<id>.json を置けば、その <id> も選べます (例: "fr")
+#   同じ ID を書けば同梱の訳を上書きできます (再ビルド不要)
+ui_language = "auto"
 
 # テーマ (ダーク): "zaivern-dark" | "zaivern-midnight" | "zaivern-nordic"
 #                 | "zaivern-ember" | "zaivern-forest" | "zaivern-ocean" | "zaivern-carbon"
@@ -2541,6 +2571,22 @@ const BLAME_MODES: &[&str] = &[
 const VOICE_ENGINES: &[&str] = &["auto", "mac", "powershell", "browser", "command", "off"];
 const VOICE_TARGETS: &[&str] = &["active", "broadcast"];
 
+/// 設定 GUI の「表示言語」に出す候補。**同梱ぶんだけ**を並べる。
+///
+/// `~/.zaivern/locales/fr.json` のようなコミュニティ言語はここに出ない
+/// (`&'static` の一覧に実行時の走査結果は入らない) が、🌐 の言語ピッカーと
+/// `config.toml` の直接編集からは選べる。番人は
+/// `config::tests::表示言語の候補は同梱言語と一致する`。
+const UI_LANGUAGES: &[&str] = &[
+    crate::locale::AUTO,
+    "en",
+    "ja",
+    "zh-CN",
+    "ko",
+    "pt-BR",
+    "es",
+];
+
 /// GUI に出す設定の一覧。
 ///
 /// ここに無い設定 (エージェントプリセット / キーバインド / プラグイン /
@@ -2557,6 +2603,12 @@ pub fn setting_defs() -> &'static [SettingDef] {
     const G_COST: &str = "コスト";
     const G_LINK: &str = "音声・連携";
     &[
+        SettingDef {
+            key: "ui_language",
+            group: G_LOOK,
+            label: "表示言語",
+            kind: Choice(UI_LANGUAGES),
+        },
         SettingDef {
             key: "theme",
             group: G_LOOK,
@@ -2931,6 +2983,7 @@ pub fn setting_value(cfg: &Config, key: &str) -> Option<SettingValue> {
     use SettingValue::{Bool as B, Float as F, Int as I, Text as T};
     Some(match key {
         "theme" => T(cfg.theme.clone()),
+        "ui_language" => T(cfg.ui_language.clone()),
         "editor_font_size" => F(cfg.editor_font_size),
         "terminal_font_size" => F(cfg.terminal_font_size),
         "ui_zoom" => F(cfg.ui_zoom),
@@ -3050,6 +3103,7 @@ pub fn set_setting_value(cfg: &mut Config, key: &str, v: &SettingValue) -> bool 
             }
             ok
         }
+        "ui_language" => t!(cfg.ui_language),
         "editor_font_size" => f!(cfg.editor_font_size),
         "terminal_font_size" => f!(cfg.terminal_font_size),
         "ui_zoom" => {

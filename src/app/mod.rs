@@ -44,6 +44,7 @@ use crate::kanban;
 use crate::keybinds::{parse_shortcut, BindAction, Keybinds};
 use crate::license;
 use crate::local_history;
+use crate::locale;
 use crate::lsp;
 use crate::markdown;
 use crate::marks;

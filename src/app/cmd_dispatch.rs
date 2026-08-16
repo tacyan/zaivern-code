@@ -205,6 +205,7 @@ impl ZaivernApp {
             | Cmd::ToggleUnreadAgent
             | Cmd::StopAllAgents => self.apply_cmd_agent(cmd, ctx),
             Cmd::SetTheme(_)
+            | Cmd::SetUiLanguage(_)
             | Cmd::OpenSettings
             | Cmd::OpenConfig
             | Cmd::ReloadConfig
@@ -1399,6 +1400,7 @@ impl ZaivernApp {
                     true,
                 );
             }
+            Cmd::SetUiLanguage(id) => self.set_ui_language(&id, ctx),
             Cmd::OpenSettings => self.settings_open = true,
             Cmd::OpenConfig => {
                 config::ensure_default();
