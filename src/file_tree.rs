@@ -4138,8 +4138,14 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} が見つからない"))
     }
 
-    /// app の非テスト部分だけを関数へ切る (テストは一時ディレクトリを
-    /// 掃除するために remove_dir_all を使うので対象外)。
+    /// app のソースを関数へ切る。
+    ///
+    /// **`SRC_IMPL` は `#[cfg(test)]` も含む。** つまり `app/*.rs` の中に
+    /// テスト用の `remove_dir_all` を書くと、この検査は製品コードの削除と
+    /// 区別できずに落ちる。それでよい — 後始末は
+    /// `test_util::unique_temp_dir` の掃除に任せる作法なので、
+    /// **テストでも直に消さない**のが正しい (実際に `remote_api.rs` の
+    /// テストがこれで落ち、後始末を消して直した)。
     fn app_fns() -> Vec<(String, String)> {
         let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
         split_fns(&src)

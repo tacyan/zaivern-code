@@ -1278,6 +1278,99 @@ pub fn prune(store: &mut Store, now: u64, alive: &dyn Fn(u32) -> bool) {
     store.leases.retain(|l| l.active(now, alive));
 }
 
+// ── 持ち主の生死 (3 値) と自動回収の判断 ──────────────────────────────────
+
+/// 台帳の持ち主の生死。**3 値**なのが要点で、「分からない」を「死んだ」に
+/// 丸めない ([`crate::features::mesh::Liveness`] と同じ流儀)。
+///
+/// この 3 値を潰すと、どちらへ潰しても壊れ方が違う:
+///
+/// * 「分からない」→ **死んだ**: 生きているエージェントの行域を横取りする。
+///   このモジュールが売っている保証そのものを壊す (いちばんやってはいけない)
+/// * 「分からない」→ **生きている**: 何も起きない。最大 [`DEFAULT_TTL_SECS`]
+///   待つだけで、**今までとまったく同じ**。だから迷ったらこちらへ倒す
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Life {
+    /// 持ち主のプロセスが動いている。
+    Alive,
+    /// 確かめる手段が無い (`pid == 0` = フック経由で、mesh にも紐付いていない)。
+    Unknown,
+    /// **確実に死んでいる。** OS がその PID を知らない、または mesh が死亡と判定した。
+    Dead,
+}
+
+/// 生死から回収を決める規則。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gc {
+    /// TTL を待たずに解放する。
+    Release,
+    /// 解放しない (期限まで待つ)。
+    Wait,
+}
+
+/// 持ち主の生死を決める規則。**引数だけで決まる純粋関数**なので、
+/// どの OS からでもテーブルテストで固定できる
+/// (`crate::features::mesh::liveness_of` / `instances::osrule` と同じ流儀)。
+///
+/// * `mesh` — mesh から得た証拠。`None` = mesh に登録が無い / 紐付いていない。
+///   **証拠があるならそれが一次**で、mesh 側が既に「OS の pid 生存 + 心拍」を
+///   畳んだ答えを持っている (心拍は PID 再利用への保険)。
+/// * `pid` — 台帳に載っている持ち主の OS PID。`0` = 確かめる手段が無い。
+/// * `os_alive` — `pid != 0` のときの OS の答え。
+///
+/// # **`pid` が死んでいることは、持ち主が死んだ証拠にならない**
+///
+/// ここがこの関数のいちばん大事な線引きで、台帳の `pid` は**書いた場所ごとに
+/// 意味が違う**:
+///
+/// | 書いた場所 | `pid` の中身 | 死んだら担当も死ぬか |
+/// |---|---|---|
+/// | [`gate`] (エージェント) | mesh に載っている**エージェント本体**の PID | **死ぬ** |
+/// | `zai lease claim` (`cli.rs`) | **打った CLI プロセス自身**の PID | 死なない (代理で取っただけ。コマンドが戻った瞬間に死ぬ) |
+/// | エディタ ([`editor_holder`]) | GUI の PID | 死ぬ |
+///
+/// 素の `pid_alive` だけで解放してよいことにすると、**`zai lease claim` で
+/// 取った担当が次の掃除で全部消える** (`tools/coedit-bench.sh` が 64 体ぶん
+/// そうやって取っている)。だから「確実に死んだ」と言えるのは
+/// **mesh が死亡と答えたとき**だけ — mesh の登録は `zai mesh spawn` が
+/// 「この OS プロセスがこの担当の持ち主だ」と明示的に宣言したものだから。
+///
+/// 証拠が無ければ `pid` は**生きている側の裏付けにしか使わない**
+/// (`os_alive` なら [`Life::Alive`]、そうでなければ [`Life::Unknown`])。
+///
+/// # 残る穴 (隠さない)
+///
+/// 突き合わせの鍵が OS PID なので、**PID が再利用され、しかもその新しい住人が
+/// mesh に登録されていて死んでいる**と、無関係な担当を 1 件早く返してしまう。
+/// mesh の [`crate::features::mesh::Pid`] は incarnation で同一性を守っているが、
+/// 台帳の [`Holder`] には OS PID しか無いのでここまでしか辿れない
+/// (`Holder` へ欄を足すと、この台帳を組み立てている 4 ファイルを同時に触る)。
+pub fn holder_life(mesh: Option<Life>, pid: u32, os_alive: bool) -> Life {
+    match mesh {
+        Some(Life::Dead) => Life::Dead,
+        Some(Life::Alive) => Life::Alive,
+        // mesh の証拠が無い / 判らない。ここから先は**生きている側の裏付け**にしか
+        // 使わない (上の表の理由で、死んでいることは証拠にならない)。
+        _ if pid != 0 && os_alive => Life::Alive,
+        _ => Life::Unknown,
+    }
+}
+
+/// 生死から回収を決める規則。**確実に死んだと分かるときだけ解放する**
+/// (fail-closed)。
+///
+/// 「分からない」で解放すると、生きているエージェントの行域を他人へ配る —
+/// 静かに 2 人が同じ行を書く形になり、台帳の最終形にも重なりが残らないので
+/// **後から気付けない**。だから [`Life::Unknown`] は必ず [`Gc::Wait`]。
+pub fn gc_of(life: Life) -> Gc {
+    match life {
+        Life::Dead => Gc::Release,
+        Life::Alive | Life::Unknown => Gc::Wait,
+    }
+}
+
 // ── 確保したい 1 件 (仕様 + 錨 + いまの中身) ──────────────────────────────
 
 /// 確保したい 1 件。**錨を打つのは確保のこの瞬間だけ。**
@@ -3276,6 +3369,113 @@ fn pid_alive(pid: u32) -> bool {
     crate::instances::pid_alive(pid)
 }
 
+// ── 自動回収 (死んだ持ち主のリースを TTL より前に返す) ────────────────────
+
+/// [`gc_in`] の結果。**冪等**なので、2 回目は全部空になる。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GcReport {
+    /// 解放した行域 / パターン (昇順)。
+    pub released: Vec<String>,
+    /// 死んだと判定した持ち主の表示名 (重複を畳んで昇順)。
+    pub dead: Vec<String>,
+    /// 期限切れで落ちた件数 ([`prune`] = 従来からある TTL 経路)。
+    pub expired: usize,
+    /// **生死が分からず TTL に委ねた**件数。fail-closed で残したぶん。
+    pub waited: usize,
+}
+
+impl GcReport {
+    /// 何かしたか。`false` なら 2 回目以降の空回り。
+    pub fn is_empty(&self) -> bool {
+        self.released.is_empty() && self.dead.is_empty() && self.expired == 0
+    }
+}
+
+/// **死んだ持ち主のリースを、期限を待たずに解放する。**
+///
+/// これが無かったころは、エージェントが握るリースの `pid` が 0 (フックは
+/// 短命プロセスなので生存確認に使えない) で、**エージェントが死んでも生存確認が
+/// 1 度も行われず**、[`DEFAULT_TTL_SECS`] = 30 分のあいだ他の全員が同じ行を
+/// 取れなかった。しかも回収は「次の要求者が来たときのついで」([`prune`] は
+/// [`try_claim_wants`] の中) だけで、掃除を回す者が居なかった。
+///
+/// * `dir` — 台帳の置き場 (`store_dir()`)。監査ログもここへ書く
+/// * `scope` — [`Roots::key`]
+/// * `life` — 持ち主 1 人ぶんの生死を答える関数。**mesh を見る側が渡す**
+///   (この層は mesh の型を知らない)。呼ばれるのは**リース 1 件につき 1 回**
+///
+/// # fail-closed
+///
+/// 解放するのは [`Life::Dead`] だけ ([`gc_of`])。「分からない」は今までどおり
+/// TTL に委ねる。**生きているかもしれないものは 1 件も解放しない。**
+/// そして「確実に死んだ」と言えるのは **mesh に登録された持ち主だけ** —
+/// 理由と、素の `pid_alive` で解放すると何が壊れるかは [`holder_life`] にある。
+///
+/// # 記録
+///
+/// 解放した 1 件ごとに `gate.log` へ「誰の・どの行域を・なぜ」を残す
+/// ([`audit_log_path`])。ロックを持ったまま書かない (ログ I/O が臨界区間に入ると
+/// 混んでいるときにだけ遅くなる)。
+pub fn gc_in(
+    dir: &Path,
+    scope: &Path,
+    now: u64,
+    life: &dyn Fn(&Holder) -> Life,
+) -> Result<GcReport, String> {
+    let store = store_path_in(dir, scope);
+    // **使っていないワークスペースが払う全コスト = stat 1 回** (設計原則 3)。
+    if !enabled(&store) {
+        return Ok(GcReport::default());
+    }
+    let mut rep = GcReport::default();
+    let mut lines: Vec<String> = Vec::new();
+    with_store_retry(&store, |s| {
+        // `with_store_retry` は混雑時にここを**何度も**呼ぶので、
+        // 積み上げる値は毎回まっさらから作り直す (二重計上を防ぐ)。
+        rep = GcReport::default();
+        lines.clear();
+        let before = s.leases.len();
+        prune(s, now, &pid_alive);
+        rep.expired = before.saturating_sub(s.leases.len());
+        let mut keep: Vec<Lease> = Vec::with_capacity(s.leases.len());
+        for l in std::mem::take(&mut s.leases) {
+            let lf = life(&l.holder);
+            match gc_of(lf) {
+                Gc::Release => {
+                    lines.push(format!(
+                        "gc-dead {} pid={} [{}]",
+                        l.holder.display(),
+                        l.holder.pid,
+                        l.patterns.join(" ")
+                    ));
+                    rep.dead.push(l.holder.display());
+                    rep.released.extend(l.patterns.iter().cloned());
+                }
+                Gc::Wait => {
+                    if lf == Life::Unknown {
+                        rep.waited += 1;
+                    }
+                    keep.push(l);
+                }
+            }
+        }
+        s.leases = keep;
+    })?;
+    rep.released.sort();
+    rep.dead.sort();
+    rep.dead.dedup();
+    for line in &lines {
+        log_line(dir, line);
+    }
+    Ok(rep)
+}
+
+/// 実運用の入口。`start` からスコープを決めて [`gc_in`] を回す。
+pub fn gc_for(start: &Path, life: &dyn Fn(&Holder) -> Life) -> Result<GcReport, String> {
+    let roots = roots_of(start);
+    gc_in(&store_dir(), &roots.key, now_secs(), life)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  6. フック経路 — 強制はここでしか起きない
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3691,7 +3891,12 @@ pub fn gate(agent: &str, event: &str, payload: &str) -> HookAnswer {
         agent: agent.to_string(),
         session: s("session_id"),
         cwd: normalize_path(&cwd.to_string_lossy()),
-        pid: 0, // フックは短命プロセス。生存確認には使えないので TTL に委ねる
+        // **フック自身の PID は使えない** — 数十 ms で消える短命プロセスなので、
+        // 書いた瞬間に「死んだ持ち主」になる。代わりに **mesh に載っている
+        // エージェント本体の OS PID** を引く (`ZAIVERN_MESH_PID` を継承して
+        // いれば 1 ファイル読むだけ。無ければ 0 = 従来どおり TTL に委ねる)。
+        // これがあると [`gc_in`] が 30 分待たずに回収できる。
+        pid: crate::features::mesh::linked_os_pid(&cwd),
     };
     // 書き込み先の抽出は**有効なワークスペースでだけ**払う (コマンド行の
     // 解析は stat より高いので、使っていない人に持たせない)。
@@ -9737,6 +9942,241 @@ mod anchor_tests {
             Verdict::Deny(m) => assert!(m.contains("zai lease"), "戻し方が無い: {m}"),
             Verdict::Allow => panic!("壊れた台帳で素通しした"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  自動回収 (死んだ持ち主のリースを TTL より前に返す) のテスト
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use crate::test_util::unique_temp_dir;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// 判定器 (`life`) を通った回数。**プロセス共通の `AtomicUsize` にしない** —
+        /// 同時に走っている他のテストの呼び出しまで混ざる (CLAUDE.md)。
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn probes_reset() {
+        PROBES.with(|c| c.set(0));
+    }
+    fn probes() -> u64 {
+        PROBES.with(Cell::get)
+    }
+    /// 数えながら答える判定器。
+    fn counting(answer: Life) -> impl Fn(&Holder) -> Life {
+        move |_| {
+            PROBES.with(|c| c.set(c.get() + 1));
+            answer
+        }
+    }
+
+    fn lease_of(agent: &str, pid: u32, pattern: &str, now: u64) -> Lease {
+        Lease {
+            holder: Holder {
+                agent: agent.to_string(),
+                session: format!("s-{agent}"),
+                cwd: "/w".to_string(),
+                pid,
+            },
+            patterns: vec![pattern.to_string()],
+            anchors: vec![Default::default()],
+            acquired_at: now,
+            expires_at: now + DEFAULT_TTL_SECS,
+            note: String::new(),
+        }
+    }
+
+    /// 台帳を 1 つ用意して `(置き場, スコープ, 台帳ファイル)` を返す。
+    fn store_for(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = unique_temp_dir("zaivern", tag);
+        let scope = dir.join("ws");
+        let store = store_path_in(&dir, &scope);
+        enable(&store).expect("有効化");
+        (dir, scope, store)
+    }
+
+    fn put(store: &Path, leases: Vec<Lease>) {
+        with_store(store, |s| s.leases = leases).expect("台帳へ書く");
+    }
+
+    // ── 純粋な判断 (I/O 無し・テーブルで固定する) ───────────────────────
+
+    #[test]
+    fn 持ち主の生死は三値で決まる() {
+        // (mesh の証拠, pid, OS の答え) -> 生死
+        let table: &[(Option<Life>, u32, bool, Life)] = &[
+            // mesh に登録があれば**それが一次** (OS の答えより優先する。
+            // mesh 側で「OS の pid 生存 + 心拍」を既に畳んでいるため)。
+            (Some(Life::Dead), 1234, true, Life::Dead),
+            (Some(Life::Alive), 1234, false, Life::Alive),
+            // mesh が判らないと言ったら pid へ落ちる
+            (Some(Life::Unknown), 1234, true, Life::Alive),
+            // mesh に居ない = 素の pid 生存だけ。**生きている裏付けにしか使わない**
+            (None, 1234, true, Life::Alive),
+            // **ここが要**: pid が死んでいても mesh の証拠が無ければ「分からない」。
+            // `zai lease claim` は打った CLI 自身の pid を書いて即座に死ぬので、
+            // ここを Dead へ倒すと代理で取った担当が次の掃除で全部消える。
+            (None, 1234, false, Life::Unknown),
+            (Some(Life::Unknown), 1234, false, Life::Unknown),
+            // **pid 0 は「確かめる手段が無い」。**
+            (None, 0, false, Life::Unknown),
+            (None, 0, true, Life::Unknown),
+            (Some(Life::Unknown), 0, false, Life::Unknown),
+            // mesh が死亡と言えば pid が何であろうと死亡 (これだけが解放の根拠)
+            (Some(Life::Dead), 0, true, Life::Dead),
+        ];
+        for (mesh, pid, os, want) in table {
+            assert_eq!(
+                holder_life(*mesh, *pid, *os),
+                *want,
+                "mesh={mesh:?} pid={pid} os_alive={os}"
+            );
+        }
+    }
+
+    #[test]
+    fn 解放するのは確実に死んだときだけ() {
+        assert_eq!(gc_of(Life::Dead), Gc::Release);
+        // **「分からない」を解放へ倒さない。** 倒すと生きているエージェントの
+        // 行域を他人へ配ることになり、静かに 2 人が同じ行を書く。
+        assert_eq!(gc_of(Life::Unknown), Gc::Wait);
+        assert_eq!(gc_of(Life::Alive), Gc::Wait);
+    }
+
+    // ── 台帳を実際に掃除する ────────────────────────────────────────────
+
+    #[test]
+    fn 死んだ持ち主のリースは期限を待たずに返る() {
+        let (dir, scope, store) = store_for("lease-gc-dead");
+        let now = 1_000;
+        put(&store, vec![lease_of("A", 4242, "src/a.rs#L10-40", now)]);
+        // 期限はまだ遥か先 — **TTL では 1 件も落ちない**ことを先に押さえる。
+        let untouched = gc_in(&dir, &scope, now, &|_| Life::Alive).expect("gc");
+        assert!(untouched.is_empty(), "生きているなら何もしない");
+        assert_eq!(read_store(&store).expect("読める").leases.len(), 1);
+
+        let rep = gc_in(&dir, &scope, now, &|_| Life::Dead).expect("gc");
+        assert_eq!(rep.released, vec!["src/a.rs#L10-40"]);
+        assert_eq!(rep.dead.len(), 1);
+        assert_eq!(rep.expired, 0, "期限切れではない");
+        assert!(read_store(&store).expect("読める").leases.is_empty());
+        // **冪等**: 2 回目は空
+        let again = gc_in(&dir, &scope, now, &|_| Life::Dead).expect("gc");
+        assert!(again.is_empty(), "2 回目は空回り: {again:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 生死不明は期限に委ねる() {
+        let (dir, scope, store) = store_for("lease-gc-unknown");
+        let now = 1_000;
+        put(&store, vec![lease_of("A", 0, "src/a.rs", now)]);
+        let rep = gc_in(&dir, &scope, now, &|_| Life::Unknown).expect("gc");
+        assert!(rep.released.is_empty(), "分からないものは解放しない");
+        assert_eq!(rep.waited, 1, "保留として数える");
+        assert_eq!(read_store(&store).expect("読める").leases.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 期限切れは従来どおり落ちる() {
+        let (dir, scope, store) = store_for("lease-gc-expired");
+        let mut l = lease_of("A", 0, "src/a.rs", 0);
+        l.expires_at = 500;
+        put(&store, vec![l]);
+        let rep = gc_in(&dir, &scope, 1_000, &|_| Life::Unknown).expect("gc");
+        assert_eq!(rep.expired, 1);
+        assert!(rep.released.is_empty(), "期限切れは死亡解放に数えない");
+        assert!(read_store(&store).expect("読める").leases.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 解放は誰のどの行域をなぜかを記録に残す() {
+        let (dir, scope, _store) = store_for("lease-gc-log");
+        let now = 1_000;
+        put(
+            &store_path_in(&dir, &scope),
+            vec![lease_of("claude", 4242, "src/a.rs#L10-40", now)],
+        );
+        gc_in(&dir, &scope, now, &|_| Life::Dead).expect("gc");
+        let log = std::fs::read_to_string(audit_log_path(&dir)).expect("監査ログ");
+        assert!(log.contains("gc-dead"), "理由が無い: {log}");
+        assert!(log.contains("claude"), "誰のか判らない: {log}");
+        assert!(log.contains("pid=4242"), "生存確認の根拠が無い: {log}");
+        assert!(log.contains("src/a.rs#L10-40"), "どの行域か判らない: {log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 台帳が無ければ何もせず作りもしない() {
+        let dir = unique_temp_dir("zaivern", "lease-gc-off");
+        let scope = dir.join("ws");
+        let rep = gc_in(&dir, &scope, 1_000, &|_| panic!("判定器を呼んではいけない")).expect("gc");
+        assert!(rep.is_empty());
+        assert!(
+            !store_path_in(&dir, &scope).exists(),
+            "無効なワークスペースに台帳を生やさない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **絶対時間で線を引かない。** 守りたい性質は「持ち主ごとに 1 回しか
+    /// 生存確認しない」= 件数に**線形**であること (総当たりなら N² になる)。
+    #[test]
+    fn 判定器を呼ぶ回数はリース件数に比例する() {
+        let (dir, scope, store) = store_for("lease-gc-linear");
+        let now = 1_000;
+        let mut counts = Vec::new();
+        for n in [8usize, 16] {
+            let leases: Vec<Lease> = (0..n)
+                .map(|i| lease_of(&format!("A{i}"), 0, &format!("src/a{i}.rs"), now))
+                .collect();
+            put(&store, leases);
+            probes_reset();
+            let probe = counting(Life::Unknown);
+            let rep = gc_in(&dir, &scope, now, &probe).expect("gc");
+            assert_eq!(rep.waited, n);
+            counts.push((n as u64, probes()));
+        }
+        // 件数ぶんちょうど 1 回ずつ
+        for (n, got) in &counts {
+            assert_eq!(got, n, "リース {n} 件に対して判定 {got} 回");
+        }
+        // 件数を 2 倍にしたら呼び出しも 2 倍 (線形)
+        assert_eq!(counts[1].1, counts[0].1 * 2, "{counts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 生きている持ち主と死んだ持ち主が混ざっても生きている方は残る() {
+        let (dir, scope, store) = store_for("lease-gc-mixed");
+        let now = 1_000;
+        put(
+            &store,
+            vec![
+                lease_of("生", 0, "src/live.rs", now),
+                lease_of("死", 4242, "src/dead.rs", now),
+            ],
+        );
+        let rep = gc_in(&dir, &scope, now, &|h| {
+            if h.pid == 0 {
+                Life::Unknown
+            } else {
+                Life::Dead
+            }
+        })
+        .expect("gc");
+        assert_eq!(rep.released, vec!["src/dead.rs"]);
+        let left = read_store(&store).expect("読める");
+        assert_eq!(left.leases.len(), 1);
+        assert_eq!(left.leases[0].patterns, vec!["src/live.rs"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

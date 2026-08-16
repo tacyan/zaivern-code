@@ -188,7 +188,6 @@ impl ZaivernApp {
             | Cmd::GitHistory
             | Cmd::OpenSearchMultibuffer
             | Cmd::OpenProblemsMultibuffer
-            | Cmd::OpenChangesMultibuffer
             | Cmd::OpenFind
             | Cmd::NewAgent(_)
             | Cmd::FocusAgent(_)
@@ -927,7 +926,6 @@ impl ZaivernApp {
             Cmd::GitHistory => self.open_git_history(ctx),
             Cmd::OpenSearchMultibuffer => self.open_search_multibuffer(),
             Cmd::OpenProblemsMultibuffer => self.open_problems_multibuffer(),
-            Cmd::OpenChangesMultibuffer => self.open_changes_multibuffer(),
             // 選択があればそれを検索語にする (VS Code と同じ)
             Cmd::OpenFind => self.open_find(ctx, false),
             Cmd::NewAgent(i) => self.launch_preset(i, ctx),

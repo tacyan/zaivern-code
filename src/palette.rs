@@ -83,8 +83,6 @@ pub enum Cmd {
     OpenSearchMultibuffer,
     /// ワークスペース全体の**診断**を 1 枚の面で開く
     OpenProblemsMultibuffer,
-    /// **未コミットの変更**を 1 枚の面で開く (エージェントの成果をまとめて読む)
-    OpenChangesMultibuffer,
     OpenFind,
     NewAgent(usize),
     /// プリセット `usize` を **専用の git worktree** で起動する。
@@ -918,7 +916,6 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::GitPush
         | Cmd::GitPull
         | Cmd::GitHistory
-        | Cmd::OpenChangesMultibuffer
         | Cmd::ShowGitHubTab
         | Cmd::OpenReview
         | Cmd::SetReviewBase(_)

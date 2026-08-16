@@ -54,6 +54,19 @@ impl ZaivernApp {
             }
             remote::Query::BulkStop { mode } => self.remote_reply_bulk_stop(*mode),
             remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
+            // ─── スマホを PC と同じ土俵に載せる読み取り ───
+            // git と横断検索は**必ず裏のスレッド**。ここでは控えを見るだけ
+            remote::Query::Changes => self.remote_reply_changes(),
+            remote::Query::Diff { rel } => self.remote_reply_diff(rel),
+            remote::Query::Scrollback {
+                agent,
+                lines,
+                before,
+            } => self.remote_reply_scrollback(*agent, *lines, *before),
+            remote::Query::Approvals => self.remote_reply_approvals(),
+            remote::Query::Approve { id, act } => self.remote_reply_approve(*id, *act),
+            remote::Query::Read { rel, from, lines } => self.remote_reply_read(rel, *from, *lines),
+            remote::Query::Search { q, max } => self.remote_reply_search(q, *max),
         }
     }
 
@@ -1627,6 +1640,724 @@ impl ZaivernApp {
             );
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  変更一覧 / 差分 — PC の `open_changes_multibuffer` と同じ入口
+    //
+    //  **ここでは git を 1 度も起こさない。** `git status` は単独 0.03 秒でも、
+    //  このアプリが同じリポジトリへ同時に撃つと 2.3〜10.2 秒かかる
+    //  (CLAUDE.md の実測)。UI スレッドで待つとフレームがそのまま止まるので、
+    //  取りに行くのは [`refresh_changes`] が起こす裏のスレッドだけにして、
+    //  ここは控えを読む。控えが無い間は `pending` と即答し、
+    //  待つのは接続ごとのスレッド (`remote::Query::retries_while_pending`)。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// remote_reply: Changes — 未コミットの変更をファイル単位で。
+    pub(super) fn remote_reply_changes(&mut self) -> String {
+        use serde_json::json;
+        let Some(top) = self.git_ops_repo() else {
+            return json!({"ok": false, "error": tr("git リポジトリではありません")}).to_string();
+        };
+        match changes_snapshot(&top) {
+            None => json!({
+                "ok": false, "pending": true,
+                "error": tr("git の読み取り中です"),
+            })
+            .to_string(),
+            Some(Err(e)) => json!({"ok": false, "error": e}).to_string(),
+            Some(Ok(snap)) => {
+                let files: Vec<_> = snap
+                    .files
+                    .iter()
+                    .map(|f| {
+                        json!({
+                            "rel": f.rel, "status": f.status,
+                            "added": f.added, "removed": f.removed,
+                            "binary": f.binary,
+                        })
+                    })
+                    .collect();
+                json!({
+                    "ok": true, "root": top.display().to_string(), "files": files,
+                    "added": snap.added, "removed": snap.removed,
+                    "truncated": snap.truncated,
+                })
+                .to_string()
+            }
+        }
+    }
+
+    /// remote_reply: Diff — 1 ファイルぶんのハンク。
+    pub(super) fn remote_reply_diff(&mut self, rel: &str) -> String {
+        use serde_json::json;
+        let Some(top) = self.git_ops_repo() else {
+            return json!({"ok": false, "error": tr("git リポジトリではありません")}).to_string();
+        };
+        let snap = match changes_snapshot(&top) {
+            None => {
+                return json!({
+                    "ok": false, "pending": true,
+                    "error": tr("git の読み取り中です"),
+                })
+                .to_string()
+            }
+            Some(Err(e)) => return json!({"ok": false, "error": e}).to_string(),
+            Some(Ok(s)) => s,
+        };
+        let Some(f) = snap.files.iter().find(|f| f.rel == rel) else {
+            // 変更が無いファイルを尋ねられただけ。エラーにはしない
+            return json!({
+                "ok": true, "rel": rel, "binary": false,
+                "truncated": false, "hunks": [],
+            })
+            .to_string();
+        };
+        let shown = f.hunks.len().min(remote::DIFF_HUNK_CAP);
+        let hunks: Vec<_> = f.hunks[..shown]
+            .iter()
+            .map(|h| {
+                let lines: Vec<_> = h
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        json!({
+                            "k": match l.kind {
+                                crate::diff::LineKind::Added => "add",
+                                crate::diff::LineKind::Removed => "del",
+                                crate::diff::LineKind::Context => "ctx",
+                            },
+                            "o": l.old_no, "n": l.new_no, "t": l.text,
+                        })
+                    })
+                    .collect();
+                // `Hunk` は行数を持たないので、行から数える
+                // (ヘッダの数字を信じるより、実際に送る行と必ず一致する)
+                let old_lines = h
+                    .lines
+                    .iter()
+                    .filter(|l| l.kind != crate::diff::LineKind::Added)
+                    .count();
+                let new_lines = h
+                    .lines
+                    .iter()
+                    .filter(|l| l.kind != crate::diff::LineKind::Removed)
+                    .count();
+                json!({
+                    "header": h.header,
+                    "old_start": h.old_start, "old_lines": old_lines,
+                    "new_start": h.new_start, "new_lines": new_lines,
+                    "lines": lines,
+                })
+            })
+            .collect();
+        json!({
+            "ok": true, "rel": f.rel, "status": f.status, "binary": f.binary,
+            "truncated": f.truncated || shown < f.hunks.len(),
+            "hunks": hunks,
+        })
+        .to_string()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  端末の履歴 — 色は ANSI ではなく**構造**で渡す
+    // ══════════════════════════════════════════════════════════════════
+
+    /// remote_reply: Scrollback — 端末の履歴を色つきで返す。
+    pub(super) fn remote_reply_scrollback(
+        &mut self,
+        agent: i64,
+        lines: usize,
+        before: Option<usize>,
+    ) -> String {
+        use serde_json::json;
+        let idx = if agent < 0 {
+            self.agents.active
+        } else {
+            agent as usize
+        };
+        let Some(s) = self.agents.sessions.get(idx) else {
+            return json!({"ok": false, "error": tr("セッションがありません")}).to_string();
+        };
+        let pal = TermPalette::of(&self.theme);
+        let (title, running) = (s.title.clone(), s.running());
+        let mut p = crate::lockx::lock_ok(&s.parser);
+        let (total, from, rows) = scrollback_rows(&mut p, lines, before, &pal);
+        drop(p);
+        let rows: Vec<_> = rows
+            .iter()
+            .map(|spans| json!({"spans": remote::spans_json(spans)}))
+            .collect();
+        json!({
+            "ok": true, "agent": idx, "title": title, "running": running,
+            "total": total, "from": from, "rows": rows,
+            // 要求より少ないのは「そこまでしか履歴が無い」— 黙って切ったのではない
+            "truncated": from > 0,
+        })
+        .to_string()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  承認キュー — 決着は PC の承認パネルと**同じ入口** (resolve_approval)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// remote_reply: Approvals — 承認待ちの中身 (種別・根拠行・待ち時間)。
+    pub(super) fn remote_reply_approvals(&self) -> String {
+        use serde_json::json;
+        let now = git::unix_now().max(0) as u64;
+        let items: Vec<_> = self
+            .agents
+            .approvals
+            .pending()
+            .map(|r| {
+                let found = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.id == r.agent_session_id);
+                let (agent, agent_index) = match found {
+                    Some((i, s)) => (s.title.clone(), i as i64),
+                    None => (r.agent_bin.clone(), -1),
+                };
+                json!({
+                    // 文字列で渡す (JS の Number は 2^53 までしか正確でない)
+                    "id": r.id.to_string(),
+                    "agent": agent, "agent_index": agent_index,
+                    // 種別・表示名・アイコンは **approvals.rs の型そのまま**。
+                    // ここで語を作り直すと真実の在り処が 2 つになる
+                    "kind": r.kind.as_str(),
+                    "label": tr(r.kind.label()),
+                    "icon": r.kind.icon(),
+                    // 自動承認を許す種別か (権限昇格だけは常に false)
+                    "auto_ok": r.kind.auto_approvable(),
+                    "detail": r.detail, "summary": r.summary,
+                    "since": now.saturating_sub(r.created_at),
+                    // 「常に許可」にできない要求 (権限昇格など) を先に見せる
+                    "never_auto": r.never_auto,
+                })
+            })
+            .collect();
+        json!({
+            "ok": true, "mode": self.cfg.approval_mode, "items": items,
+        })
+        .to_string()
+    }
+
+    /// remote_reply: Approve — 承認キューの 1 件を決着させる。
+    pub(super) fn remote_reply_approve(&mut self, id: u64, act: remote::ApproveAct) -> String {
+        use serde_json::json;
+        let Some(req) = self.agents.approvals.get(id) else {
+            return json!({
+                "ok": false,
+                "error": tr("その承認はもうありません (PC 側で決着した可能性)"),
+            })
+            .to_string();
+        };
+        let summary = req.summary.clone();
+        let cmd = match act {
+            remote::ApproveAct::Approve => agents::approvals::Command::Approve,
+            remote::ApproveAct::Deny => agents::approvals::Command::Deny,
+            remote::ApproveAct::Always => agents::approvals::Command::ApproveKindForAgentAlways,
+            remote::ApproveAct::AlwaysDeny => agents::approvals::Command::DenyKindForAgentAlways,
+        };
+        // PC の承認パネルと**同じ入口**。応答の送信・ポリシーの永続化・監査ログを
+        // ここで作り直さない (作り直すと見張りが素通りする経路がもう 1 本増える)。
+        self.resolve_approval(id, cmd);
+        json!({
+            "ok": true,
+            "msg": trf("🛡 {s}", &[("s", summary)]),
+            "pending": false,
+        })
+        .to_string()
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  ファイルを開かずに読む / 横断検索
+    // ══════════════════════════════════════════════════════════════════
+
+    /// remote_reply: Read — **PC のタブを切り替えずに**ファイルを読む。
+    pub(super) fn remote_reply_read(&self, rel: &str, from: usize, lines: usize) -> String {
+        use serde_json::json;
+        let Some(path) = self.resolve_remote_rel(rel) else {
+            return json!({"ok": false, "error": tr("ワークスペース外は読めません")}).to_string();
+        };
+        match std::fs::metadata(&path) {
+            Ok(m) if !m.is_file() => {
+                return json!({"ok": false, "error": tr("ファイルではありません")}).to_string()
+            }
+            Ok(m) if m.len() > file_search::MAX_FILE_BYTES => {
+                return json!({
+                    "ok": false,
+                    "error": trf(
+                        "大きすぎて読めません ({n} バイト)",
+                        &[("n", m.len().to_string())],
+                    ),
+                })
+                .to_string()
+            }
+            Ok(_) => {}
+            Err(e) => return json!({"ok": false, "error": e.to_string()}).to_string(),
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return json!({"ok": false, "error": e.to_string()}).to_string(),
+        };
+        if bytes.contains(&0) {
+            return json!({"ok": false, "error": tr("バイナリファイルです")}).to_string();
+        }
+        let (text, enc) = crate::textenc::decode_bytes(&bytes);
+        let all: Vec<&str> = text.lines().collect();
+        let start = from.saturating_sub(1).min(all.len());
+        let end = (start + lines).min(all.len());
+        json!({
+            "ok": true, "rel": rel, "from": start + 1, "total": all.len(),
+            "lines": &all[start..end],
+            "lang": self.highlighter.lang_for(Some(&path), &text),
+            "encoding": enc.label(),
+            // 続きがあることを黙らない
+            "truncated": end < all.len(),
+        })
+        .to_string()
+    }
+
+    /// remote_reply: Search — ワークスペース横断検索。
+    ///
+    /// **索引 4000 件を UI スレッドで舐めない。** 既存の非同期入口
+    /// [`file_search::spawn_with_options`] へ合流させ、結果が届くまでは
+    /// `pending` と即答する。
+    pub(super) fn remote_reply_search(&self, q: &str, max: usize) -> String {
+        use serde_json::json;
+        let hits = match self.search_snapshot(q, max) {
+            Err(e) => return json!({"ok": false, "error": e}).to_string(),
+            Ok(None) => {
+                return json!({"ok": false, "pending": true, "error": tr("検索中です")}).to_string()
+            }
+            Ok(Some(h)) => h,
+        };
+        // 絶対パス → 表示ラベル。索引を 1 度だけ引き当てる
+        let by_abs: std::collections::HashMap<&std::path::Path, &str> = self
+            .file_index
+            .iter()
+            .map(|f| (f.abs.as_path(), f.label.as_str()))
+            .collect();
+        let out: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                let rel = by_abs
+                    .get(h.path.as_path())
+                    .map(|s| (*s).to_string())
+                    .or_else(|| {
+                        self.roots
+                            .iter()
+                            .find_map(|r| crate::ignore::rel_slash(r, &h.path))
+                    })
+                    .unwrap_or_else(|| h.path.display().to_string());
+                // `Hit.line` は 0 起点。画面に出すのは 1 起点
+                json!({"rel": rel, "line": h.line + 1, "text": h.text})
+            })
+            .collect();
+        json!({
+            "ok": true, "q": q, "hits": out,
+            "truncated": hits.len() >= max,
+        })
+        .to_string()
+    }
+
+    /// ルート相対の綴りを、**必ずいずれかのルート配下にある**実パスへ解く。
+    ///
+    /// [`remote::safe_rel`] が字句を畳んだ後でも、シンボリックリンクを踏めば
+    /// 外へ出られる。`canonicalize` した実体で前方一致を取り直すのはそのため
+    /// (`remote_reply_open_file` と同じ守り方)。
+    fn resolve_remote_rel(&self, rel: &str) -> Option<PathBuf> {
+        let rel = remote::safe_rel(rel)?;
+        let cand = self
+            .file_index
+            .iter()
+            .find(|f| f.label == rel || f.rel == rel)
+            .map(|f| f.abs.clone())
+            .or_else(|| {
+                self.roots
+                    .iter()
+                    .map(|r| r.join(&rel))
+                    .find(|c| c.is_file())
+            })?;
+        let canon = cand.canonicalize().ok()?;
+        self.roots
+            .iter()
+            .any(|r| {
+                let root = r.canonicalize().unwrap_or_else(|_| r.clone());
+                canon.starts_with(&root)
+            })
+            .then_some(canon)
+    }
+
+    /// 検索結果の控えを返す。`Ok(None)` は「まだ走っている」。
+    ///
+    /// **この関数はファイルを 1 バイトも読まない** — 読むのは
+    /// `spawn_with_options` が起こしたスレッドだけ。
+    fn search_snapshot(
+        &self,
+        q: &str,
+        max: usize,
+    ) -> Result<Option<Arc<Vec<file_search::Hit>>>, String> {
+        let key = format!("{max}\u{1}{q}");
+        let cell = SEARCH.get_or_init(Default::default);
+        let mut c = crate::lockx::lock_ok(cell);
+        if c.key != key {
+            *c = SearchCache {
+                key: key.clone(),
+                ..Default::default()
+            };
+        }
+        // 走らせた検索が終わっていれば取り込む
+        if let Some(rx) = &c.rx {
+            if let Ok((hits, _scanned)) = rx.try_recv() {
+                c.got = Some(Arc::new(hits));
+                c.at = Some(Instant::now());
+                c.rx = None;
+            }
+        }
+        let fresh = c.at.is_some_and(|t| t.elapsed() < SEARCH_TTL);
+        if c.rx.is_none() && (c.got.is_none() || !fresh) {
+            let files: Vec<PathBuf> = self.file_index.iter().map(|f| f.abs.clone()).collect();
+            let opts = file_search::SearchOptions {
+                query: q.to_string(),
+                max_results: max,
+                root: self.roots.first().cloned(),
+                ..Default::default()
+            };
+            match file_search::spawn_with_options(files, opts) {
+                Ok(rx) => c.rx = Some(rx),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok(c.got.clone())
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  控え (git / 検索) — **UI スレッドの外**で作る
+//
+//  `ZaivernApp` にフィールドを増やさない (共有ファイルを 1 バイトも触らない)
+//  ため、モジュール内の static に置く。鍵はリポジトリの絶対パス / 検索語なので、
+//  別のワークスペースの結果が混ざることはない。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 変更 1 ファイルぶん。`git` の出力から**裏のスレッドで**組み立てる。
+struct ChangeFile {
+    rel: String,
+    /// `"M"|"A"|"D"|"R"|"?"`
+    status: &'static str,
+    added: usize,
+    removed: usize,
+    binary: bool,
+    /// 上限で切ったか (追跡外の巨大ファイルなど)。
+    truncated: bool,
+    hunks: Vec<crate::diff::Hunk>,
+}
+
+/// 作業ツリー全体の控え。
+struct ChangesSnapshot {
+    files: Vec<ChangeFile>,
+    added: usize,
+    removed: usize,
+    truncated: bool,
+}
+
+#[derive(Default)]
+struct ChangesCache {
+    repo: PathBuf,
+    got: Option<Result<Arc<ChangesSnapshot>, String>>,
+    at: Option<Instant>,
+    cost: Option<Duration>,
+    inflight: bool,
+}
+
+static CHANGES: std::sync::OnceLock<std::sync::Mutex<ChangesCache>> = std::sync::OnceLock::new();
+
+/// 控えを取り直すまでの最短間隔。実際の間隔は直近の所要時間から
+/// [`git::scan_interval`] が決める (遅いリポジトリで git が常時走るのを防ぐ)。
+const CHANGES_BASE: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct SearchCache {
+    key: String,
+    rx: Option<std::sync::mpsc::Receiver<(Vec<file_search::Hit>, usize)>>,
+    got: Option<Arc<Vec<file_search::Hit>>>,
+    at: Option<Instant>,
+}
+
+static SEARCH: std::sync::OnceLock<std::sync::Mutex<SearchCache>> = std::sync::OnceLock::new();
+
+/// 同じ検索語を撃ち直すまでの猶予。スマホは画面を見ている間ポーリングするので、
+/// これが無いと**同じ検索が延々と走り続ける**。
+const SEARCH_TTL: Duration = Duration::from_secs(15);
+
+/// 作業ツリーの差分を控えから返す。`None` は「まだ用意できていない」。
+///
+/// **この関数は git を 1 度も起こさない。** 起こすのは spawn した先だけで、
+/// 呼び出し側 (UI スレッド) は必ず即座に戻る。
+fn changes_snapshot(repo: &Path) -> Option<Result<Arc<ChangesSnapshot>, String>> {
+    let cell = CHANGES.get_or_init(Default::default);
+    let mut c = crate::lockx::lock_ok(cell);
+    if c.repo != repo {
+        *c = ChangesCache {
+            repo: repo.to_path_buf(),
+            ..Default::default()
+        };
+    }
+    let interval = git::scan_interval(CHANGES_BASE, c.cost);
+    let stale = c.at.map(|t| t.elapsed() >= interval).unwrap_or(true);
+    if stale && !c.inflight {
+        c.inflight = true;
+        let repo = repo.to_path_buf();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let got = scan_changes(&repo).map(Arc::new);
+            let cost = t0.elapsed();
+            let cell = CHANGES.get_or_init(Default::default);
+            let mut c = crate::lockx::lock_ok(cell);
+            // 走っている間にワークスペースが変わっていたら、この結果は捨てる
+            if c.repo == repo {
+                c.got = Some(got);
+                c.at = Some(Instant::now());
+                c.cost = Some(cost);
+                c.inflight = false;
+            }
+        });
+    }
+    c.got.clone()
+}
+
+/// 未コミットの変更を集める。**必ず裏のスレッドから呼ぶこと**。
+///
+/// PC の `open_changes_multibuffer` と同じ 2 本
+/// (`git::working_tree_diff` → `crate::diff::parse_unified`) を通る。
+/// スマホ側で数え直さないのは、真実の在り処を 1 つに保つため。
+/// 追跡外のファイルは diff に出てこないので `git status` から別に足す。
+fn scan_changes(repo: &Path) -> Result<ChangesSnapshot, String> {
+    let out = git::working_tree_diff(repo)?;
+    let mut files: Vec<ChangeFile> = Vec::new();
+    let mut truncated = false;
+    for f in crate::diff::parse_unified(&out) {
+        if files.len() >= remote::CHANGES_CAP {
+            truncated = true;
+            break;
+        }
+        let status = remote::change_status(&f.old_path, &f.new_path, f.is_rename);
+        let rel = if status == "D" {
+            f.old_path.clone()
+        } else {
+            f.new_path.clone()
+        };
+        if rel.is_empty() || rel == "/dev/null" {
+            continue;
+        }
+        files.push(ChangeFile {
+            rel,
+            status,
+            added: f.additions,
+            removed: f.deletions,
+            binary: f.is_binary,
+            truncated: false,
+            hunks: f.hunks,
+        });
+    }
+    // ── 追跡外 (`?`)。git は diff の対象にしないので status から拾う ──
+    let args: Vec<String> = ["status", "--porcelain=v1", "-z", "--untracked-files=all"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Ok(porcelain) = git::run_git_at(repo, &args) {
+        for rel in remote::untracked_paths_z(&porcelain) {
+            if files.len() >= remote::CHANGES_CAP {
+                truncated = true;
+                break;
+            }
+            let (added, binary, cut, hunks) = untracked_body(&repo.join(&rel));
+            files.push(ChangeFile {
+                rel,
+                status: "?",
+                added,
+                removed: 0,
+                binary,
+                truncated: cut,
+                hunks,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let added = files.iter().map(|f| f.added).sum();
+    let removed = files.iter().map(|f| f.removed).sum();
+    Ok(ChangesSnapshot {
+        files,
+        added,
+        removed,
+        truncated,
+    })
+}
+
+/// 追跡外のファイルを「全部が追加された 1 ハンク」として読む。
+///
+/// 返り値は `(行数, バイナリか, 切ったか, ハンク)`。読めない / 大きすぎる /
+/// バイナリなら**中身は付けない** (0 行と言い切らず `binary` / `truncated` で伝える)。
+fn untracked_body(path: &Path) -> (usize, bool, bool, Vec<crate::diff::Hunk>) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return (0, false, true, Vec::new());
+    };
+    if !meta.is_file() {
+        return (0, false, false, Vec::new());
+    }
+    if meta.len() > remote::UNTRACKED_READ_CAP {
+        return (0, false, true, Vec::new());
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return (0, false, true, Vec::new());
+    };
+    if bytes.contains(&0) {
+        return (0, true, false, Vec::new());
+    }
+    let (text, _enc) = crate::textenc::decode_bytes(&bytes);
+    let lines: Vec<crate::diff::DiffLine> = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| crate::diff::DiffLine {
+            kind: crate::diff::LineKind::Added,
+            old_no: None,
+            new_no: Some(i + 1),
+            text: l.to_string(),
+            no_newline: false,
+            crlf: false,
+        })
+        .collect();
+    let n = lines.len();
+    if n == 0 {
+        return (0, false, false, Vec::new());
+    }
+    (
+        n,
+        false,
+        false,
+        vec![crate::diff::Hunk {
+            header: format!("@@ -0,0 +1,{n} @@"),
+            old_start: 0,
+            new_start: 1,
+            lines,
+        }],
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  端末のセル → span
+// ══════════════════════════════════════════════════════════════════════
+
+/// スマホへ色を渡すのに要るテーマの抜き出し。
+///
+/// egui の型を span へ持ち込まないための境界でもある
+/// (畳み込み自体は `remote::fold_spans` = 純関数)。
+struct TermPalette {
+    ansi: [[u8; 3]; 16],
+    fg: [u8; 3],
+    bg: [u8; 3],
+}
+
+impl TermPalette {
+    fn of(t: &theme::Theme) -> Self {
+        let c = |x: egui::Color32| [x.r(), x.g(), x.b()];
+        let mut ansi = [[0u8; 3]; 16];
+        for (i, slot) in ansi.iter_mut().enumerate() {
+            *slot = c(t.ansi[i]);
+        }
+        Self {
+            ansi,
+            fg: c(t.term_fg),
+            bg: c(t.term_bg),
+        }
+    }
+
+    /// 既定色は `None` (= 契約どおり省略する)。
+    fn hex(&self, c: vt100::Color) -> Option<String> {
+        match c {
+            vt100::Color::Default => None,
+            vt100::Color::Idx(i) => Some(remote::ansi_hex(i, &self.ansi)),
+            vt100::Color::Rgb(r, g, b) => Some(remote::hex_rgb(r, g, b)),
+        }
+    }
+}
+
+/// 画面 1 行ぶんのセルを span へ畳む。
+fn row_spans(sc: &vt100::Screen, r: u16, cols: u16, pal: &TermPalette) -> Vec<remote::Span> {
+    let mut cells: Vec<(String, remote::CellStyle)> = Vec::with_capacity(cols as usize);
+    for col in 0..cols {
+        let Some(cell) = sc.cell(r, col) else { break };
+        // 全角の 2 桁目は 1 つ目のセルに畳まれている。足すと桁が倍になる
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        let (mut fg, mut bg) = (pal.hex(cell.fgcolor()), pal.hex(cell.bgcolor()));
+        if cell.inverse() {
+            // 反転は「既定色どうしの入れ替え」でも見た目が変わる。
+            // None のまま入れ替えると**反転が消える**ので、既定色を実体化してから入れ替える
+            let f = fg.unwrap_or_else(|| remote::hex_rgb(pal.fg[0], pal.fg[1], pal.fg[2]));
+            let b = bg.unwrap_or_else(|| remote::hex_rgb(pal.bg[0], pal.bg[1], pal.bg[2]));
+            fg = Some(b);
+            bg = Some(f);
+        }
+        cells.push((
+            cell.contents(),
+            remote::CellStyle {
+                fg,
+                bg,
+                bold: cell.bold(),
+                italic: cell.italic(),
+                underline: cell.underline(),
+            },
+        ));
+    }
+    remote::fold_spans(&cells)
+}
+
+/// 履歴を絶対行 (0 = 最古) で切り出す。返り値は `(全行数, 先頭の絶対行, 行)`。
+///
+/// vt100 は「いま見えている 1 画面」しか読めないので、`set_scrollback` で
+/// 窓をずらしながら 1 画面ずつ読む (`terminal::all_terminal_lines` と同じ作法)。
+/// **呼び出し前の戻り量は必ず元へ戻す** — 戻さないと PC 側の表示が飛ぶ。
+fn scrollback_rows(
+    p: &mut vt100::Parser,
+    want: usize,
+    before: Option<usize>,
+    pal: &TermPalette,
+) -> (usize, usize, Vec<Vec<remote::Span>>) {
+    let saved = p.screen().scrollback();
+    p.set_scrollback(usize::MAX);
+    let top = p.screen().scrollback();
+    let (rows, cols) = p.screen().size();
+    if rows == 0 {
+        p.set_scrollback(saved);
+        return (0, 0, Vec::new());
+    }
+    let rows_u = rows as usize;
+    let total = top + rows_u;
+    let end = before.unwrap_or(total).min(total);
+    let start = end.saturating_sub(want);
+    let mut out: Vec<Vec<remote::Span>> = Vec::with_capacity(end - start);
+    let mut abs = start;
+    while abs < end {
+        p.set_scrollback(top.saturating_sub(abs));
+        // 効いた戻り量で窓の位置を読み直す (vt100 は履歴より深い指定を切り詰める)
+        let win_first = top - p.screen().scrollback();
+        if abs < win_first {
+            break; // 進めない (履歴が縮んだ)。黙って回り続けない
+        }
+        let mut r = (abs - win_first) as u16;
+        while (r as usize) < rows_u && abs < end {
+            out.push(row_spans(p.screen(), r, cols, pal));
+            r += 1;
+            abs += 1;
+        }
+    }
+    p.set_scrollback(saved);
+    (total, start, out)
 }
 
 /// スマホの一括操作が **PC 側の入口へ合流しているか**をソースで固定する。
@@ -1695,5 +2426,202 @@ mod bulk_wiring_tests {
             !body.contains(".contains(\""),
             "画面テキストの部分一致で状態を決めている"
         );
+    }
+}
+
+/// スマホの読み取り API が **PC 側の入口へ合流しているか**と、
+/// **git を UI スレッドで走らせていないか**をソースで固定する。
+///
+/// どちらも実行時には見えない (画面は「動いているように」見える) ので、
+/// ここで押さえる。合流を外すと真実の在り処が 2 つになり、
+/// UI スレッドで git を撃つとフレームが数秒止まる (CLAUDE.md の実測)。
+#[cfg(test)]
+mod mobile_api_wiring_tests {
+    fn src() -> String {
+        crate::app::SRC.replace("\r\n", "\n")
+    }
+
+    fn body_of(sig: &str) -> String {
+        let s = src();
+        let after = s
+            .split(sig)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{sig} が無い"))
+            .to_string();
+        let end = crate::app::method_end(&after);
+        after[..end.min(after.len())].to_string()
+    }
+
+    #[test]
+    fn 変更一覧はpcと同じ入口へ合流する() {
+        let s = src();
+        // PC の open_changes_multibuffer と同じ 2 本を通る (数え直さない)
+        assert!(
+            s.contains("git::working_tree_diff(repo)"),
+            "変更一覧が git::working_tree_diff を通っていない"
+        );
+        assert!(
+            s.contains("crate::diff::parse_unified(&out)"),
+            "変更一覧が diff::parse_unified を通っていない"
+        );
+        // 状態の 1 文字も純関数 1 本だけ (スマホ側でも remote 側でも作り直さない)
+        assert!(
+            s.contains("remote::change_status("),
+            "状態の判定を remote::change_status 以外で決めている"
+        );
+    }
+
+    /// **git を UI スレッドで待たない** (CLAUDE.md の鉄則)。
+    ///
+    /// `remote_reply` は毎フレーム呼ばれる。ここで `git` を起こすと
+    /// 1 回 2.3〜10.2 秒かかることがあり、そのままフレームが止まる。
+    #[test]
+    fn 描画スレッドの応答からgitを起こしていない() {
+        for sig in [
+            "pub(super) fn remote_reply_changes(",
+            "pub(super) fn remote_reply_diff(",
+        ] {
+            let body = body_of(sig);
+            for ng in ["working_tree_diff", "run_git_at", "Command::new"] {
+                assert!(
+                    !body.contains(ng),
+                    "{sig} が {ng} を直接呼んでいる (UI スレッドで git が走る)"
+                );
+            }
+            assert!(
+                body.contains("changes_snapshot("),
+                "{sig} が控え (changes_snapshot) を読んでいない"
+            );
+        }
+        // 控えを取り直すのは必ず別スレッド
+        let snap = body_of("fn changes_snapshot(");
+        assert!(
+            snap.contains("std::thread::spawn"),
+            "控えの取り直しが別スレッドになっていない"
+        );
+    }
+
+    /// 横断検索も同じ理由で UI スレッドから外す
+    /// (索引 4000 件 × 最大 1.5MB を舐める)。
+    #[test]
+    fn 検索は既存の非同期入口へ合流する() {
+        let body = body_of("fn search_snapshot(");
+        assert!(
+            body.contains("file_search::spawn_with_options("),
+            "検索が file_search の非同期入口を通っていない"
+        );
+        assert!(
+            !body.contains("search_with_options(&"),
+            "同期検索を UI スレッドで撃っている"
+        );
+    }
+
+    /// 承認は `approvals.rs` の型と入口をそのまま使う。
+    /// ここで種別や応答キーを作り直すと、ポリシー・監査ログが素通りする。
+    #[test]
+    fn 承認は既存のキューへ合流する() {
+        let list = body_of("pub(super) fn remote_reply_approvals(");
+        for entry in ["r.kind.as_str()", "r.kind.label()", "r.detail"] {
+            assert!(
+                list.contains(entry),
+                "承認一覧が {entry} を使っていない (種別を作り直している疑い)"
+            );
+        }
+        let act = body_of("pub(super) fn remote_reply_approve(");
+        assert!(
+            act.contains("self.resolve_approval(id, cmd)"),
+            "承認の決着が PC の承認パネルと同じ入口を通っていない"
+        );
+        for cmd in [
+            "agents::approvals::Command::Approve",
+            "agents::approvals::Command::Deny",
+            "agents::approvals::Command::ApproveKindForAgentAlways",
+            "agents::approvals::Command::DenyKindForAgentAlways",
+        ] {
+            assert!(act.contains(cmd), "{cmd} へ写していない");
+        }
+        // 承認キーを当て推量で送っていない (approvals.rs が持っている)
+        assert!(
+            !act.contains("write_bytes"),
+            "承認が生バイトを直接送っている"
+        );
+    }
+
+    /// スマホから届くパスは**必ず**畳んでから使う。
+    #[test]
+    fn リモートのパスは必ず正規化を通る() {
+        let body = body_of("fn resolve_remote_rel(");
+        assert!(
+            body.contains("remote::safe_rel(rel)"),
+            "パスが remote::safe_rel を通っていない"
+        );
+        assert!(
+            body.contains("canonicalize"),
+            "実体の前方一致を見ていない (リンクで外へ出られる)"
+        );
+    }
+}
+
+/// 実際に git リポジトリを作って、変更一覧が**中身を返す**ことまで見る。
+///
+/// 単体テストが全部緑でも、実物を回さないと分からない回帰がある
+/// (CLAUDE.md)。ここは `scan_changes` を直に呼ぶので UI もサーバも要らない。
+#[cfg(test)]
+mod changes_scan_tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    /// `git` が使えないマシンでは検査そのものを降りる (嘘の緑を出さない)。
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["-C"])
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn 変更一覧は追跡中と追跡外の両方を返す() {
+        let dir = crate::test_util::unique_temp_dir("zv-remote", "changes");
+        if !git(&dir, &["init", "-q"]) {
+            eprintln!("[skip] git が使えないため検査を降りる");
+            return;
+        }
+        std::fs::write(dir.join("kept.txt"), "one\ntwo\nthree\n").expect("write");
+        assert!(git(&dir, &["add", "."]), "add");
+        assert!(git(&dir, &["commit", "-qm", "init"]), "commit");
+        // 追跡中を 1 行足して 1 行消す / 追跡外を 1 つ置く
+        std::fs::write(dir.join("kept.txt"), "one\ntwo\nfour\n").expect("write");
+        std::fs::write(dir.join("fresh.txt"), "a\nb\n").expect("write");
+
+        let snap = super::scan_changes(&dir).expect("scan");
+        let by = |rel: &str| snap.files.iter().find(|f| f.rel == rel);
+
+        let kept = by("kept.txt").expect("追跡中の変更が出ていない");
+        assert_eq!(kept.status, "M");
+        assert_eq!((kept.added, kept.removed), (1, 1));
+        assert!(!kept.hunks.is_empty(), "ハンクが空 (差分が取れていない)");
+
+        let fresh = by("fresh.txt").expect("追跡外が出ていない");
+        assert_eq!(fresh.status, "?", "追跡外が ? になっていない");
+        assert_eq!(fresh.added, 2, "追跡外の行数を数えていない");
+        assert!(!fresh.truncated);
+        // 追跡外も「全部追加された 1 ハンク」として読める
+        assert_eq!(fresh.hunks.len(), 1);
+        assert_eq!(fresh.hunks[0].lines.len(), 2);
+
+        assert_eq!(snap.added, 3, "合計の追加行が合わない");
+        assert_eq!(snap.removed, 1);
+        assert!(!snap.truncated);
+
+        // **後始末は書かない。** `unique_temp_dir` が古いものを掃く
+        // (`test_util::sweep_stale_dirs`)。ここで `remove_dir_all` を書くと、
+        // 「復元できない削除は delete_permanently / replace_dest の中だけ」を
+        // 守る番人 (`file_tree::tests::破壊的なファイル操作は確認を経ずに呼ばれない`)
+        // が **app の非テスト部分と区別できずに落ちる** — `app/*.rs` は
+        // `SRC_IMPL` へ丸ごと入るので、テストの中の削除も同じ検査に載る。
     }
 }

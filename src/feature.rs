@@ -184,14 +184,21 @@ pub const REGISTRY: &[&Feature] = crate::features::GENERATED;
 /// 機能側にキーバインドを持たせると `keybinds.rs` の `BindAction` と
 /// `ALL_ACTIONS` がまた共有の壁になるため、ここでは持たせない
 /// (打鍵が要る機能は統合時に個別へ切り出す)。
-pub fn palette_entries() -> Vec<(String, String, String, Cmd)> {
+pub fn palette_entries(
+    binds: &crate::keybinds::FeatureBinds,
+) -> Vec<(String, String, String, Cmd)> {
     let mut out = Vec::new();
     for f in REGISTRY {
         for e in f.entries {
             out.push((
                 e.icon.to_string(),
                 tr(e.label),
-                String::new(),
+                // **打鍵表記をここで入れる。** 以前は常に空文字で、
+                // `keybinds::feature_key_hint` は実装済みなのに**テストからしか
+                // 呼ばれていなかった** (= 既定打鍵を宣言した機能が、パレットでは
+                // 打鍵の無い行に見えた)。表記は必ずキーバインド表から作る —
+                // ベタ書きは再割り当てで嘘になり、Windows/Linux では綴りも違う。
+                crate::keybinds::feature_key_hint(binds, e.id),
                 Cmd::Feature(e.id),
             ));
         }
@@ -369,7 +376,8 @@ mod tests {
     fn empty_registry_yields_no_entries() {
         // REGISTRY が空のうちは 0 件、埋まれば entries の総数と一致する。
         let expected: usize = REGISTRY.iter().map(|f| f.entries.len()).sum();
-        assert_eq!(palette_entries().len(), expected);
+        let binds = crate::keybinds::FeatureBinds::default();
+        assert_eq!(palette_entries(&binds).len(), expected);
     }
 
     /// **機能側が共有ファイルを触っていないこと**を構造で担保する番人。

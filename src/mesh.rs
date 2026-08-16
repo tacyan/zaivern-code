@@ -577,6 +577,31 @@ pub fn liveness_of(os_alive: bool, beat_age: Duration) -> Liveness {
     Liveness::Alive
 }
 
+/// 「どれだけ生きている側か」の序列。**純粋関数**。
+///
+/// [`Mesh::life_map`] が同じ OS PID の 2 つの登録を畳むときにだけ使う。
+/// 生きている側を採るのが fail-closed で、`Dead` へ丸めると
+/// **生きているエージェントの担当を他人へ配る**ことになる。
+fn liveness_rank(l: Liveness) -> u8 {
+    match l {
+        Liveness::Dead => 0,
+        Liveness::Suspect => 1,
+        Liveness::Alive => 2,
+    }
+}
+
+/// mesh の 3 値を、台帳 ([`crate::lease::Life`]) の 3 値へ写す**純粋関数**。
+///
+/// **`Suspect` は「生きている」へ倒す。** 重い処理をしていて心拍が遅れている
+/// だけかもしれないので、ここで刈ると生きているエージェントの行域を
+/// 他人へ配ってしまう ([`Mesh::reap`] も `Suspect` は刈らずに報告だけする)。
+fn life_of(l: Liveness) -> crate::lease::Life {
+    match l {
+        Liveness::Alive | Liveness::Suspect => crate::lease::Life::Alive,
+        Liveness::Dead => crate::lease::Life::Dead,
+    }
+}
+
 /// 一覧に出す 1 行。
 #[derive(Clone, Debug, Serialize)]
 pub struct ProcInfo {
@@ -778,6 +803,39 @@ impl Mesh {
     /// 登録レコードを引く。
     pub fn lookup(&self, pid: &Pid) -> Option<Proc> {
         read_json_retry::<Proc>(&self.proc_path(pid))
+    }
+
+    /// 登録レコードの **OS PID**。居なければ 0。
+    ///
+    /// [`Pid`] は同一性 (再起動したら別物) で、生存確認の手段は
+    /// [`Proc::os_pid`] という分離を守るための 1 行 —
+    /// **この 2 つを混ぜると「PID が再利用された瞬間に別人が自分になる」。**
+    pub fn os_pid_of(&self, pid: &Pid) -> u32 {
+        self.lookup(pid).map(|p| p.os_pid).unwrap_or(0)
+    }
+
+    /// `os_pid → 生死` の写し。**レジストリを読むのは 1 回だけ。**
+    ///
+    /// 台帳 (`lease.rs`) の持ち主は OS PID しか持っていないので、突き合わせは
+    /// この向きになる。持ち主ごとにディレクトリを舐めると
+    /// **持ち主数 × プロセス数**の `read_dir` になるが、こちらは
+    /// **プロセス数ぶんの 1 回**で済む (`gc_in` は 1 リース 1 回しか判定器を呼ばない)。
+    ///
+    /// 同じ OS プロセスが複数の [`Pid`] を持てる (GUI が「エディタ本体」と
+    /// 「見張り」を別 pid で登録する等) ので、鍵が衝突したら**生きている方を採る**
+    /// — 片方でも生きていれば、その OS プロセスは生きている。
+    pub fn life_map(&self) -> BTreeMap<u32, Liveness> {
+        let mut out: BTreeMap<u32, Liveness> = BTreeMap::new();
+        for i in self.list() {
+            if i.proc.os_pid == 0 {
+                continue; // 生存確認の手段が無い登録は写さない
+            }
+            let e = out.entry(i.proc.os_pid).or_insert(i.liveness);
+            if liveness_rank(i.liveness) > liveness_rank(*e) {
+                *e = i.liveness;
+            }
+        }
+        out
     }
 
     /// link 伝播で置かれた「降りてくれ」の理由。**自分で見に来る**のが約束で、
@@ -1490,6 +1548,156 @@ pub fn self_pid_from_env() -> Option<Pid> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  6.9 自動回収 — supervisor が「時間で」子の死を拾う
+// ═══════════════════════════════════════════════════════════════════════════
+//
+//  Erlang の supervisor は子の死を**即座に**検出して `DOWN` を配る。ここまでの
+//  実装は monitor / link / `Down` / [`Mesh::reap`] を全部持っていたのに、
+//  **呼び手が `zai mesh reap` (人が打つ) しか居なかった** — つまり
+//  「人が掃除を起こしたときにしか supervisor が動かない」状態だった。
+//  ここがその欠けていた刻みで、次の 2 つを同じ周回で回す:
+//
+//    1. [`Mesh::reap`] — 死んだ pid を刈り、`Down` を配り、担当を解放する
+//    2. [`crate::lease::gc_in`] — **死んだ持ち主のリースを TTL より前に返す**
+//
+//  順序は **台帳が先**。刈ってから見ると登録レコードが消えていて「死んだ」証拠を
+//  失う (fail-closed なので TTL へ落ちるだけだが、30 分待たせないのが目的そのもの)。
+
+/// `ZAIVERN_MESH_PID` を継承しているなら、**自分を起こした mesh プロセスの
+/// OS PID** を返す。継承していなければ 0。
+///
+/// `zai hook` は数十 ms で消える短命プロセスなので、自分の PID を台帳へ書いても
+/// 意味が無い ([`crate::lease::gate`] のコメント)。一方 `zai mesh spawn -- <cmd>`
+/// で起こされたエージェント本体は登録レコードを持ち、心拍も打っている。
+/// **env が無ければファイルを 1 つも触らない** (使っていない人のコストはゼロ)。
+pub fn linked_os_pid(start: &Path) -> u32 {
+    let Some(pid) = self_pid_from_env() else {
+        return 0;
+    };
+    Mesh::open_for(start).os_pid_of(&pid)
+}
+
+/// 台帳の持ち主 1 人ぶんの生死。[`crate::lease::gc_in`] へ渡す判定器の中身。
+///
+/// **OS の pid 生存が一次・心拍が PID 再利用の保険**という mesh の作りを
+/// そのまま台帳へ持ち込む: mesh に登録があればその 3 値を採り、無ければ
+/// 素の pid 生存へ落ちる。`pid == 0` は**確かめる手段が無い**ので
+/// [`crate::lease::Life::Unknown`] = TTL に委ねる (fail-closed)。
+pub fn holder_life_from(
+    map: &BTreeMap<u32, Liveness>,
+    h: &crate::lease::Holder,
+) -> crate::lease::Life {
+    if h.pid == 0 {
+        // ここで `pid_alive(0)` を呼ばない。**システムコールを 1 回も払わない**
+        // ことが「紐付いていない持ち主は無料」という約束の実体。
+        return crate::lease::holder_life(None, 0, false);
+    }
+    let ev = map.get(&h.pid).copied().map(life_of);
+    crate::lease::holder_life(ev, h.pid, crate::instances::pid_alive(h.pid))
+}
+
+/// 1 周ぶんの後始末の結果。
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SweepReport {
+    /// mesh 側 ([`Mesh::reap`])。
+    pub reaped: ReapReport,
+    /// 台帳側 ([`crate::lease::gc_in`])。
+    pub gc: crate::lease::GcReport,
+    /// 台帳を触れなかった理由 (ロックが取れない / 壊れている)。**握り潰さない。**
+    pub note: Option<String>,
+}
+
+impl SweepReport {
+    /// 何かしたか。`false` なら 2 回目以降の空回り = 間隔を空けてよい。
+    pub fn is_empty(&self) -> bool {
+        self.reaped.is_empty() && self.gc.is_empty()
+    }
+}
+
+/// **1 周ぶんの自動回収。** mesh の刈り取りと台帳の掃除を同じ周回で回す。
+///
+/// 冪等なので、何度呼んでも 2 回目以降は空の [`SweepReport`] になる。
+/// メッシュも台帳も未導入なら `stat` 2 回で戻る (設計原則 3)。
+pub fn sweep(root: &Path) -> SweepReport {
+    let mesh = Mesh::open_for(root);
+    // **台帳が先** (この関数の上のコメントに理由がある)。
+    let map = mesh.life_map();
+    let (gc, note) = match crate::lease::gc_for(root, &|h| holder_life_from(&map, h)) {
+        Ok(g) => (g, None),
+        Err(e) => (crate::lease::GcReport::default(), Some(e)),
+    };
+    SweepReport {
+        reaped: mesh.reap(),
+        gc,
+        note,
+    }
+}
+
+/// 次の周回の「暇だった回数」と待ち時間。**純粋関数**。
+///
+/// 何も起きなければ間隔を空け ([`backoff`] で 2 秒 → 30 秒)、
+/// 1 件でも刈ったら 0 へ戻して詰める。**固定間隔にすると、誰も居ない
+/// リポジトリでも 2 秒ごとに `read_dir` が走り続ける** (`git::scan_interval`
+/// と同じ考え方で、CLAUDE.md の「固定の待ち予算は N が増えれば必ず破綻する」)。
+pub fn reap_interval(idle_rounds: u32, did_something: bool) -> (u32, Duration) {
+    let next = if did_something {
+        0
+    } else {
+        idle_rounds.saturating_add(1)
+    };
+    (next, backoff(next))
+}
+
+/// ワークスペースを引き直す間隔。**毎周回引くと、詰まっている (2 秒) 局面で
+/// `instances` ディレクトリを 2 秒ごとに舐めることになる。**
+const ROOT_REFRESH: Duration = Duration::from_secs(30);
+
+/// 自動回収スレッドが起きているか。**起動は 1 回だけ。**
+static REAPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 自動回収を起こす (**冪等**。2 回目以降は原子的な読み取り 1 回で戻る)。
+///
+/// 呼び手は [`draw`] — 毎フレーム呼ばれる既存の刻みへ相乗りしている。
+/// `app.rs` / `app/*` を 1 バイトも触らずに常駐を持てるのはこの経路だけで、
+/// パネルを開いていなくても (むしろ閉じているときこそ) 回る必要がある。
+pub fn ensure_reaper() {
+    use std::sync::atomic::Ordering;
+    if REAPER.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("zv-mesh-reap".into())
+        .spawn(reaper_loop)
+        .is_err()
+    {
+        // 起こせなかった (資源不足)。**旗を戻して次のフレームに再挑戦する** —
+        // 立てたままにすると「掃除が回っている」という静かな嘘になる。
+        REAPER.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 常駐の本体。**ここには判断を置かない** — 判断は [`sweep`] と
+/// [`reap_interval`] にあり、どちらもテストから直に呼べる。
+fn reaper_loop() {
+    let mut idle = 0u32;
+    let mut root: Option<(PathBuf, std::time::Instant)> = None;
+    loop {
+        let here = match &root {
+            Some((p, t)) if t.elapsed() < ROOT_REFRESH => p.clone(),
+            _ => {
+                let p = gui_workspace_root();
+                root = Some((p.clone(), std::time::Instant::now()));
+                p
+            }
+        };
+        let rep = sweep(&here);
+        let (next, wait) = reap_interval(idle, !rep.is_empty());
+        idle = next;
+        std::thread::sleep(wait);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  7. GUI — 裏スレッド + チャネル。**UI スレッドは 1 ミリ秒も待たない**
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1507,7 +1715,7 @@ struct Snapshot {
     inbox: Vec<Envelope>,
     /// 走れなかった / 何も無い理由。
     note: Option<String>,
-    reaped: Option<ReapReport>,
+    sweep: Option<SweepReport>,
     cost: Duration,
 }
 
@@ -1607,6 +1815,11 @@ fn scan(root: PathBuf, mut me: Option<Pid>, act: Act) -> Snapshot {
     let node = mesh.node().to_string();
     let mut note: Option<String> = None;
 
+    // **掃除はメッシュ未導入でも回す。** 台帳 (`lease.rs`) は独立して有効に
+    // なり得るので、「メッシュに誰も居ない」を理由に台帳の掃除まで降りると、
+    // 死んだエージェントのリースが 30 分残るという当の症状が消えない。
+    let sweep = (act == Act::Reap).then(|| self::sweep(&root));
+
     // 参加は明示的な操作でだけ行う (ここで初めてレジストリが生える)。
     if act == Act::Join && me.is_none() {
         match mesh.spawn(SpawnOpts {
@@ -1632,6 +1845,7 @@ fn scan(root: PathBuf, mut me: Option<Pid>, act: Act) -> Snapshot {
             note: Some(tr(
                 "まだ誰も参加していません (「参加」を押すか zai mesh spawn で載ります)",
             )),
+            sweep,
             cost: t0.elapsed(),
             ..Default::default()
         };
@@ -1664,7 +1878,6 @@ fn scan(root: PathBuf, mut me: Option<Pid>, act: Act) -> Snapshot {
         mesh.beat(&my);
     }
 
-    let reaped = (act == Act::Reap).then(|| mesh.reap());
     // 自分宛ての `Ping` には `Pong` を返す。これで `zai mesh ping --wait` が
     // GUI に対して本当に成立する (Erlang の応答ループの最小形)。
     let mut inbox = Vec::new();
@@ -1692,7 +1905,7 @@ fn scan(root: PathBuf, mut me: Option<Pid>, act: Act) -> Snapshot {
         names: mesh.names(),
         inbox,
         note,
-        reaped,
+        sweep,
         cost: t0.elapsed(),
     }
 }
@@ -1725,7 +1938,7 @@ fn poll(st: &mut PanelState, ctx: &egui::Context) {
                 let same = s.procs.len() == st.snap.procs.len()
                     && s.claims.len() == st.snap.claims.len()
                     && s.inbox.is_empty()
-                    && s.reaped.is_none();
+                    && s.sweep.is_none();
                 st.idle_rounds = if same { st.idle_rounds + 1 } else { 0 };
                 st.me = s.me.clone();
                 st.snap = s;
@@ -1805,6 +2018,10 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
 /// 毎フレームのオーバーレイ。**閉じているフレームは 1 ピクセルも触らない。**
 pub fn draw(app: &mut crate::app::ZaivernApp, ctx: &egui::Context) {
     let _ = app; // 状態はモジュール側に持つので app の中身へは触らない
+                 // **監視ツリーの常駐をここで起こす。** パネルを開いていなくても
+                 // (むしろ閉じているときこそ) 死んだエージェントの後始末は要る。
+                 // 2 回目以降は原子的な読み取り 1 回なので、毎フレームでも無料。
+    ensure_reaper();
     let Ok(mut st) = state().lock() else { return };
     if !st.open {
         // **参加したまま閉じられたら、最後に 1 回だけ裏で退出する。**
@@ -1907,15 +2124,19 @@ fn body(ui: &mut egui::Ui, st: &PanelState) -> Act {
         }
     });
 
-    if let Some(r) = &st.snap.reaped {
+    if let Some(r) = &st.snap.sweep {
         if !r.is_empty() {
             ui.label(trf(
-                "掃除: {d} 体を刈り、担当 {c} 件を解放しました",
+                "掃除: {d} 体を刈り、担当 {c} 件・リース {l} 件を解放しました",
                 &[
-                    ("d", r.dead.len().to_string()),
-                    ("c", r.released.len().to_string()),
+                    ("d", r.reaped.dead.len().to_string()),
+                    ("c", r.reaped.released.len().to_string()),
+                    ("l", r.gc.released.len().to_string()),
                 ],
             ));
+        }
+        if let Some(e) = &r.note {
+            ui.label(egui::RichText::new(e.clone()).color(dim).small());
         }
     }
 
@@ -2095,7 +2316,7 @@ fn usage() -> String {
         "  recv    [--pid PID] [--kind K] [--json]   受信 (読んだら消える)\n",
         "  monitor <対象PID> [--from PID] [--off]    死んだら Down を受け取る\n",
         "  link    <PID-A> <PID-B> [--off]          双方向。異常終了を伝播する\n",
-        "  reap    [--json]                     死んだ Pid を刈り、担当を自動解放する\n",
+        "  reap    [--json]                     死んだ Pid を刈り、担当とリースを解放する\n",
         "  ping    <宛先PID> [--from PID] [--wait MS]\n",
         "\n",
         "終了コード: 0=成功 1=失敗 2=引数の誤り 3=既に他人のもの 4=見つからない\n",
@@ -2317,6 +2538,26 @@ fn cli_spawn_child(mesh: &Mesh, mut opts: SpawnOpts, link: Option<String>, cmd: 
     } else {
         format!("exit_{}", status.code().unwrap_or(-1))
     };
+    // **子が死んだ「その瞬間」に台帳を返す。** ここが Erlang の supervisor が
+    // 子の死を即座に拾う位置で、時間で回る常駐 ([`reaper_loop`]) より速い。
+    //
+    // **`mesh.exit` より前でなければならない。** `exit` は登録レコードを消すので、
+    // 後に回すと「この OS プロセスが持ち主だ」という唯一の証拠が消え、
+    // リースは TTL (30 分) まで残る (実バイナリで踏んだ)。
+    // `mesh.reap()` はここでは呼ばない — 終了理由 (`exit_1` 等) を知っているのは
+    // こちらなので、`Down` は下の `exit` から正確な理由つきで配る。
+    let map = mesh.life_map();
+    match crate::lease::gc_for(&cwd(), &|h| holder_life_from(&map, h)) {
+        Ok(g) if !g.released.is_empty() => eprintln!(
+            "{}",
+            trf(
+                "死んだ持ち主のリースを {n} 件返しました",
+                &[("n", g.released.len().to_string())]
+            )
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("{e}"),
+    }
     let _ = mesh.exit(&p.pid, &reason);
     status.code().unwrap_or(EXIT_FAIL)
 }
@@ -2640,7 +2881,10 @@ fn cli_link(args: &[String]) -> i32 {
 
 fn cli_reap(args: &[String]) -> i32 {
     let (_pos, flags) = split_flags(args, &[]);
-    let rep = mesh_here().reap();
+    // **メッシュの刈り取りと台帳の掃除は同じ 1 つの操作。** 入口を 2 つに
+    // 割ると「どちらを打てばよいか」を利用者に覚えさせることになる
+    // (CLAUDE.md「同じ操作への到達経路が 3 つあるなら 2 つ削る」)。
+    let rep = sweep(&cwd());
     if flags.contains_key("json") {
         println!("{}", serde_json::to_string_pretty(&rep).unwrap_or_default());
         return EXIT_OK;
@@ -2650,14 +2894,29 @@ fn cli_reap(args: &[String]) -> i32 {
         trf(
             "刈った {d} / Down {n} / 解放 {c} / 名前 {m} / 疑わしい {s}",
             &[
-                ("d", rep.dead.len().to_string()),
-                ("n", rep.downs.to_string()),
-                ("c", rep.released.len().to_string()),
-                ("m", rep.unnamed.len().to_string()),
-                ("s", rep.suspect.len().to_string()),
+                ("d", rep.reaped.dead.len().to_string()),
+                ("n", rep.reaped.downs.to_string()),
+                ("c", rep.reaped.released.len().to_string()),
+                ("m", rep.reaped.unnamed.len().to_string()),
+                ("s", rep.reaped.suspect.len().to_string()),
             ]
         )
     );
+    println!(
+        "{}",
+        trf(
+            "リース: 死亡で解放 {r} / 期限切れ {e} / 生死不明で保留 {w}",
+            &[
+                ("r", rep.gc.released.len().to_string()),
+                ("e", rep.gc.expired.to_string()),
+                ("w", rep.gc.waited.to_string()),
+            ]
+        )
+    );
+    if let Some(e) = &rep.note {
+        eprintln!("{e}");
+        return EXIT_FAIL;
+    }
     EXIT_OK
 }
 
@@ -2718,6 +2977,10 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
         },
         crate::feature::Entry {
             icon: "🧹",
+            // **文言を変えない。** `Entry::label` は `feature.rs` が `tr(e.label)` で
+            // 引くが、変数なので `locale::tests::ソースのtrリテラルは…` の網に
+            // 掛からない — 変えると 6 言語のうち日本語以外で**黙って**原文が出る。
+            // 新しい訳が要るときは `locales/*.json` (共有ファイル) 側と対で入れる。
             label: "メッシュを掃除する (落ちた担当を自動解放)",
             id: "mesh.reap",
         },
@@ -3773,6 +4036,389 @@ mod tests {
         assert!(
             src.contains("std::thread::Builder::new()"),
             "走査を裏スレッドへ逃がしていない"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  11. 自動回収 (supervisor が「時間で」子の死を拾う) のテスト
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+    use crate::lease;
+    use crate::test_util::unique_temp_dir;
+
+    /// 「絶対に生きていない」PID。理由は `super::tests::DEAD_PID` の doc にある
+    /// (`u32::MAX - 1` は unix で負の pid = プロセスグループへの問い合わせに化ける)。
+    const DEAD_PID: u32 = 0x7FFF_FFFE;
+
+    fn mesh_for(tag: &str) -> (Mesh, PathBuf) {
+        let dir = unique_temp_dir("zaivern-mesh-reap", tag);
+        (Mesh::open_at(dir.clone(), "testnode"), dir)
+    }
+
+    /// OS 標準のスリーパーで「確かに生きている子」を作る
+    /// (`instances::tests::liveness_tracks_a_real_child` と同じ流儀)。
+    fn sleeper() -> std::process::Child {
+        #[cfg(windows)]
+        {
+            crate::procx::hidden_command("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn ping")
+        }
+        #[cfg(unix)]
+        {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep")
+        }
+    }
+
+    fn lease_held_by(pid: u32, pattern: &str, now: u64) -> lease::Lease {
+        lease::Lease {
+            holder: lease::Holder {
+                agent: "claude".into(),
+                session: "s-1".into(),
+                cwd: "/w".into(),
+                pid,
+            },
+            patterns: vec![pattern.to_string()],
+            anchors: vec![Default::default()],
+            acquired_at: now,
+            expires_at: now + lease::DEFAULT_TTL_SECS,
+            note: String::new(),
+        }
+    }
+
+    // ── 純粋な判断 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn 疑わしいは生きている側へ倒す() {
+        assert_eq!(life_of(Liveness::Alive), lease::Life::Alive);
+        // **重い処理で心拍が遅れているだけかもしれない。** ここで死亡へ倒すと
+        // 生きているエージェントの行域を他人へ配る (`reap` も刈らない)。
+        assert_eq!(life_of(Liveness::Suspect), lease::Life::Alive);
+        assert_eq!(life_of(Liveness::Dead), lease::Life::Dead);
+        // 畳むときの序列も「生きている方が強い」
+        assert!(liveness_rank(Liveness::Alive) > liveness_rank(Liveness::Suspect));
+        assert!(liveness_rank(Liveness::Suspect) > liveness_rank(Liveness::Dead));
+    }
+
+    #[test]
+    fn 間隔は暇なら空き何かあれば詰まる() {
+        // (いまの暇回数, 何かしたか) -> (次の暇回数, 待ち)
+        assert_eq!(reap_interval(0, true), (0, backoff(0)));
+        assert_eq!(reap_interval(9, true), (0, backoff(0)), "刈ったら詰める");
+        assert_eq!(reap_interval(0, false), (1, backoff(1)));
+        assert_eq!(reap_interval(1, false), (2, backoff(2)));
+        // 暇が続くほど伸び、上限で頭打ち (アイドル時のコストをゼロへ寄せる)
+        let (_, a) = reap_interval(0, false);
+        let (_, b) = reap_interval(3, false);
+        assert!(b > a, "暇が続けば間隔は伸びる: {a:?} -> {b:?}");
+        assert_eq!(reap_interval(64, false).1, BEAT_MAX, "上限で頭打ち");
+        assert_eq!(reap_interval(u32::MAX, false).0, u32::MAX, "溢れない");
+    }
+
+    #[test]
+    fn 紐付いていない持ち主は生死不明のまま() {
+        let map = BTreeMap::new();
+        let h = lease::Holder {
+            pid: 0,
+            ..Default::default()
+        };
+        // `pid == 0` は「確かめる手段が無い」= TTL に委ねる (fail-closed)。
+        assert_eq!(holder_life_from(&map, &h), lease::Life::Unknown);
+    }
+
+    #[test]
+    fn メッシュが死亡と言えば台帳の持ち主も死亡() {
+        // **自分自身の PID を使う** — OS は「生きている」と答えるので、
+        // mesh の答えが一次であることがこの 1 件で分かる。
+        let me = std::process::id();
+        let mut map = BTreeMap::new();
+        map.insert(me, Liveness::Dead);
+        let h = lease::Holder {
+            pid: me,
+            ..Default::default()
+        };
+        assert_eq!(holder_life_from(&map, &h), lease::Life::Dead);
+        map.insert(me, Liveness::Suspect);
+        assert_eq!(holder_life_from(&map, &h), lease::Life::Alive);
+        // mesh に居なければ素の pid 生存へ落ちる
+        assert_eq!(
+            holder_life_from(&BTreeMap::new(), &h),
+            lease::Life::Alive,
+            "自プロセスは生きている"
+        );
+        // **mesh の登録が無ければ、pid が死んでいても「分からない」。**
+        // `zai lease claim` は打った CLI 自身の pid を書いて即座に死ぬので、
+        // ここを死亡へ倒すと代理で取った担当が次の掃除で全部消える。
+        let dead = lease::Holder {
+            pid: DEAD_PID,
+            ..Default::default()
+        };
+        assert_eq!(
+            holder_life_from(&BTreeMap::new(), &dead),
+            lease::Life::Unknown
+        );
+    }
+
+    #[test]
+    fn 同じosプロセスの二重登録は生きている方を採る() {
+        let (m, dir) = mesh_for("life-map-fold");
+        let live = m
+            .spawn(SpawnOpts {
+                role: "editor".into(),
+                os_pid: std::process::id(),
+                ..Default::default()
+            })
+            .expect("spawn")
+            .pid;
+        let stale = m
+            .spawn(SpawnOpts {
+                role: "watcher".into(),
+                os_pid: std::process::id(),
+                ..Default::default()
+            })
+            .expect("spawn")
+            .pid;
+        // 片方の心拍を HARD_STALE より古くする = mesh 的には Dead。
+        let old = now_ms().saturating_sub(HARD_STALE.as_millis() as u64 + 1_000);
+        write_atomic(&m.beat_path(&stale), old.to_string().as_bytes()).expect("beat");
+        let map = m.life_map();
+        assert_eq!(
+            map.get(&std::process::id()).copied(),
+            Some(Liveness::Alive),
+            "生きている登録がある以上、その OS プロセスは生きている"
+        );
+        let _ = live;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 登録が無ければos_pidは0() {
+        let (m, dir) = mesh_for("ospid-none");
+        let ghost = Pid {
+            node: "testnode".into(),
+            incarnation: 1,
+            serial: 0,
+        };
+        assert_eq!(m.os_pid_of(&ghost), 0);
+        let p = m
+            .spawn(SpawnOpts {
+                os_pid: 4242,
+                ..Default::default()
+            })
+            .expect("spawn")
+            .pid;
+        assert_eq!(m.os_pid_of(&p), 4242, "エージェント本体の PID を引ける");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 死を実際に作って確かめる ────────────────────────────────────────
+
+    /// **子プロセスを本当に殺して、TTL (30 分) を待たずに返ることを測る。**
+    ///
+    /// `~/.zaivern` には触らない — mesh も台帳も一時ディレクトリを明示して開く
+    /// (`ZAIVERN_HOME` を差し替えると並列に走る他のテストへ漏れる)。
+    #[test]
+    fn 子プロセスを殺すとリースは期限を待たずに返る() {
+        let (m, mdir) = mesh_for("real-death");
+        let ldir = unique_temp_dir("zaivern-lease-reap", "real-death");
+        let scope = ldir.join("ws");
+        let store = lease::store_path_in(&ldir, &scope);
+        lease::enable(&store).expect("有効化");
+
+        let mut child = sleeper();
+        let os_pid = child.id();
+        let p = m
+            .spawn(SpawnOpts {
+                role: "agent".into(),
+                label: "claude".into(),
+                os_pid,
+                ..Default::default()
+            })
+            .expect("spawn")
+            .pid;
+
+        // 台帳へ「その子が持っている」リースを 1 件置く。期限は 30 分先。
+        let now = lease::now_secs();
+        let held = lease_held_by(os_pid, "src/a.rs#L10-40", now);
+        let deadline = held.expires_at;
+        lease::with_store(&store, |s| s.leases = vec![held]).expect("台帳へ書く");
+
+        // (1) 生きているうちは **1 件も解放しない** (fail-closed の裏取り)
+        let map = m.life_map();
+        assert_eq!(
+            map.get(&os_pid).copied(),
+            Some(Liveness::Alive),
+            "起動直後の子は生きている"
+        );
+        let keep =
+            lease::gc_in(&ldir, &scope, now, &|h| holder_life_from(&map, h)).expect("gc(生存中)");
+        assert!(
+            keep.released.is_empty(),
+            "生きている持ち主のリースを解放した: {keep:?}"
+        );
+        assert_eq!(
+            lease::read_store(&store).expect("読める").leases.len(),
+            1,
+            "生きているあいだは残る"
+        );
+
+        // (2) 殺す。**wait でゾンビを回収してから**判定する
+        let killed = std::time::Instant::now();
+        child.kill().ok();
+        child.wait().expect("wait child");
+
+        let map = m.life_map();
+        assert_eq!(
+            map.get(&os_pid).copied(),
+            Some(Liveness::Dead),
+            "回収済みの子は死んでいる"
+        );
+        let rep =
+            lease::gc_in(&ldir, &scope, lease::now_secs(), &|h| holder_life_from(&map, h))
+                .expect("gc(死亡後)");
+        let took = killed.elapsed();
+        assert_eq!(rep.released, vec!["src/a.rs#L10-40"], "解放されていない");
+        assert!(
+            lease::read_store(&store).expect("読める").leases.is_empty(),
+            "台帳から消えていない"
+        );
+        // **これが「TTL を待たずに」の中身**: 解放した時刻はまだ期限の遥か手前。
+        // 絶対時間で線は引かない (負荷で必ず嘘の赤が出る) — 見るのは
+        // 「期限より前に返ったか」という守りたい性質そのもの。
+        let at = lease::now_secs();
+        assert!(
+            at < deadline,
+            "期限 ({deadline}) を過ぎてから解放しても意味が無い (いま {at})"
+        );
+        eprintln!(
+            "[measured] 死亡から解放まで {} ms / 期限まで残り {} 秒",
+            took.as_millis(),
+            deadline.saturating_sub(at)
+        );
+
+        // (3) mesh 側も同じ周回で刈れている
+        let reaped = m.reap();
+        assert!(
+            reaped.dead.contains(&p.to_string()),
+            "死んだ pid を刈っていない: {reaped:?}"
+        );
+        let _ = std::fs::remove_dir_all(&mdir);
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    /// 逆向きの裏取り: **生きている子のリースは何周回しても解放されない。**
+    #[test]
+    fn 生きている持ち主のリースは何度掃除しても残る() {
+        let (m, mdir) = mesh_for("alive-keeps");
+        let ldir = unique_temp_dir("zaivern-lease-reap", "alive-keeps");
+        let scope = ldir.join("ws");
+        let store = lease::store_path_in(&ldir, &scope);
+        lease::enable(&store).expect("有効化");
+
+        let mut child = sleeper();
+        let os_pid = child.id();
+        m.spawn(SpawnOpts {
+            role: "agent".into(),
+            os_pid,
+            ..Default::default()
+        })
+        .expect("spawn");
+        let now = lease::now_secs();
+        lease::with_store(&store, |s| {
+            s.leases = vec![lease_held_by(os_pid, "src/a.rs#L10-40", now)]
+        })
+        .expect("台帳へ書く");
+
+        for round in 0..3 {
+            let map = m.life_map();
+            let rep = lease::gc_in(&ldir, &scope, lease::now_secs(), &|h| {
+                holder_life_from(&map, h)
+            })
+            .expect("gc");
+            assert!(rep.released.is_empty(), "{round} 周目で横取りした: {rep:?}");
+            assert_eq!(lease::read_store(&store).expect("読める").leases.len(), 1);
+        }
+        child.kill().ok();
+        child.wait().expect("wait child");
+        let _ = std::fs::remove_dir_all(&mdir);
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    /// **代理で取った担当を巻き添えにしない。**
+    ///
+    /// `zai lease claim` (`cli.rs`) は**打った CLI プロセス自身の PID** を台帳へ
+    /// 書き、コマンドが戻った瞬間にそのプロセスは死ぬ。ここで素の `pid_alive`
+    /// だけを根拠に解放すると、`tools/coedit-bench.sh` が 64 体ぶん取った担当が
+    /// 次の掃除で**全部**消える。mesh の登録が無い持ち主は触らないこと。
+    #[test]
+    fn メッシュに登録の無い持ち主は死んでいても解放しない() {
+        let ldir = unique_temp_dir("zaivern-lease-reap", "proxy-claim");
+        let scope = ldir.join("ws");
+        let store = lease::store_path_in(&ldir, &scope);
+        lease::enable(&store).expect("有効化");
+
+        // 「打ち終わって死んだ CLI」を実物で作る (実在した PID が死んでいる形)。
+        let mut child = sleeper();
+        let os_pid = child.id();
+        child.kill().ok();
+        child.wait().expect("wait child");
+        assert!(!crate::instances::pid_alive(os_pid), "確かに死んでいる");
+
+        let now = lease::now_secs();
+        lease::with_store(&store, |s| {
+            s.leases = vec![lease_held_by(os_pid, "src/a.rs#L10-40", now)]
+        })
+        .expect("台帳へ書く");
+
+        // mesh は空 = 「この OS プロセスが持ち主だ」と誰も宣言していない。
+        let map = BTreeMap::new();
+        let rep = lease::gc_in(&ldir, &scope, lease::now_secs(), &|h| {
+            holder_life_from(&map, h)
+        })
+        .expect("gc");
+        assert!(
+            rep.released.is_empty(),
+            "代理で取った担当を巻き添えにした: {rep:?}"
+        );
+        assert_eq!(rep.waited, 1, "生死不明として保留する");
+        assert_eq!(lease::read_store(&store).expect("読める").leases.len(), 1);
+        let _ = std::fs::remove_dir_all(&ldir);
+    }
+
+    // ── 配線 (作ったのに繋いでいない、を構造で防ぐ) ─────────────────────
+
+    /// **`reap` に定期実行が無い**のが直した穴そのものなので、
+    /// 「常駐を起こす呼び出しが毎フレームの刻みに残っている」を構造で固定する。
+    /// これが消えると、また人が掃除を起こすまで `Down` が配られなくなる。
+    #[test]
+    fn 描画の刻みから自動回収を起こしている() {
+        let src = include_str!("mesh.rs").replace("\r\n", "\n");
+        let sig = "pub fn draw(app: &mut crate::app::ZaivernApp, ctx: &egui::Context) {";
+        let body = src.split(sig).nth(1).expect("draw が見つからない");
+        let head: String = body.chars().take(600).collect();
+        assert!(
+            head.contains("ensure_reaper();"),
+            "draw の先頭で ensure_reaper を呼んでいない (定期実行が死ぬ)"
+        );
+        // 常駐は掃除の両輪 (mesh の刈り取り + 台帳の回収) を回すこと。
+        let loop_body = src
+            .split("fn reaper_loop() {")
+            .nth(1)
+            .expect("reaper_loop が見つからない");
+        assert!(loop_body.contains("sweep(&here)"), "常駐が sweep を回していない");
+        assert!(
+            loop_body.contains("reap_interval("),
+            "間隔が適応的でない (固定間隔はアイドルのコストを 0 にできない)"
         );
     }
 }

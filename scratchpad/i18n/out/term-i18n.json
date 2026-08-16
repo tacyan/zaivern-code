@@ -1,0 +1,92 @@
+[
+  {
+    "id": "remote.term_find",
+    "where": "assets/remote/js/45-term.js:102 (スマホ端末ビュー)",
+    "ja": "🔍 検索"
+  },
+  {
+    "id": "remote.term_find_ph",
+    "where": "assets/remote/js/45-term.js:103 (スマホ端末ビュー)",
+    "ja": "端末内を検索…"
+  },
+  {
+    "id": "remote.term_wrap",
+    "where": "assets/remote/js/45-term.js:104 (スマホ端末ビュー)",
+    "ja": "↩ 折返"
+  },
+  {
+    "id": "remote.term_wrap_title",
+    "where": "assets/remote/js/45-term.js:105 (スマホ端末ビュー)",
+    "ja": "長い行を折り返す / 横スクロールに戻す"
+  },
+  {
+    "id": "remote.term_copy",
+    "where": "assets/remote/js/45-term.js:106 (スマホ端末ビュー)",
+    "ja": "⧉ コピー"
+  },
+  {
+    "id": "remote.term_copy_title",
+    "where": "assets/remote/js/45-term.js:107 (スマホ端末ビュー)",
+    "ja": "読み込んだ端末の内容を全部コピーする"
+  },
+  {
+    "id": "remote.term_bottom",
+    "where": "assets/remote/js/45-term.js:110 (スマホ端末ビュー)",
+    "ja": "⬇ 最新"
+  },
+  {
+    "id": "remote.term_bottom_title",
+    "where": "assets/remote/js/45-term.js:111 (スマホ端末ビュー)",
+    "ja": "いちばん下へ戻って追従を再開する"
+  },
+  {
+    "id": "remote.term_find_scope",
+    "where": "assets/remote/js/45-term.js:124 (スマホ端末ビュー)",
+    "ja": "読み込み済みの範囲だけを検索します"
+  },
+  {
+    "id": "remote.term_prev",
+    "where": "assets/remote/js/45-term.js:128 (スマホ端末ビュー)",
+    "ja": "前の一致へ"
+  },
+  {
+    "id": "remote.term_next",
+    "where": "assets/remote/js/45-term.js:129 (スマホ端末ビュー)",
+    "ja": "次の一致へ"
+  },
+  {
+    "id": "remote.term_find_close",
+    "where": "assets/remote/js/45-term.js:130 (スマホ端末ビュー)",
+    "ja": "検索を閉じる"
+  },
+  {
+    "id": "remote.term_no_hit",
+    "where": "assets/remote/js/45-term.js:312 (スマホ端末ビュー)",
+    "ja": "見つかりません"
+  },
+  {
+    "id": "remote.term_copied",
+    "where": "assets/remote/js/45-term.js:376 (スマホ端末ビュー)",
+    "ja": "{n} 行をコピーしました"
+  },
+  {
+    "id": "remote.term_copy_failed",
+    "where": "assets/remote/js/45-term.js:377 (スマホ端末ビュー)",
+    "ja": "コピーできませんでした — 長押しで選択してください"
+  },
+  {
+    "id": "remote.term_pos",
+    "where": "assets/remote/js/45-term.js:387 (スマホ端末ビュー)",
+    "ja": "{n}/{total} 行"
+  },
+  {
+    "id": "remote.term_limit",
+    "where": "assets/remote/js/45-term.js:481 (スマホ端末ビュー)",
+    "ja": "読み込みは {n} 行までです"
+  },
+  {
+    "id": "remote.term_top_reached",
+    "where": "assets/remote/js/45-term.js:492 (スマホ端末ビュー)",
+    "ja": "これより前の記録はありません"
+  }
+]

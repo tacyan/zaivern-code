@@ -74,11 +74,23 @@ fn generate_remote_assets() {
     let mut out = String::from(
         "// build.rs が生成 — 触らない (assets/remote/ を編集すること)\n         pub const PAGE: &str = concat!(\n",
     );
-    let _ = writeln!(out, "    include_str!(\"{}\"),", lit(&root.join("page-head.html")));
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("page-head.html"))
+    );
     out.push_str("    \"<style>\\n\",\n");
-    let _ = writeln!(out, "    include_str!(\"{}\"),", lit(&root.join("style.css")));
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("style.css"))
+    );
     out.push_str("    \"</style>\\n</head>\\n\",\n");
-    let _ = writeln!(out, "    include_str!(\"{}\"),", lit(&root.join("body.html")));
+    let _ = writeln!(
+        out,
+        "    include_str!(\"{}\"),",
+        lit(&root.join("body.html"))
+    );
     out.push_str("    \"<script>\\n\",\n");
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
@@ -86,8 +98,11 @@ fn generate_remote_assets() {
     }
     out.push_str("    \"</script>\\n</body>\\n</html>\\n\",\n);\n");
 
-    let dest = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("remote_page.rs");
-    let same = std::fs::read_to_string(&dest).map(|old| old == out).unwrap_or(false);
+    let dest =
+        std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("remote_page.rs");
+    let same = std::fs::read_to_string(&dest)
+        .map(|old| old == out)
+        .unwrap_or(false);
     if !same {
         std::fs::write(&dest, out).expect("remote_page.rs を書けません");
     }

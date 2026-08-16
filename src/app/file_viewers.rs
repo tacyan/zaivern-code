@@ -671,9 +671,25 @@ impl ZaivernApp {
         let subtitle = mb.subtitle.clone();
         let (dropped, unreadable) = (mb.dropped, mb.unreadable);
         let expanded = mb.any_expanded();
+        // 件数のラベルにファイルごとの要約を添える。**打ち切ったぶんは必ず数で言う**
+        // (黙って切ると「7 ファイルしか変わっていない」という嘘の読み取りを作る)。
+        let overview = {
+            let ov = mbuf::overview(&mb, mbuf::OVERVIEW_MAX_FILES);
+            let mut t = ov.lines.join("\n");
+            if ov.cut > 0 {
+                if !t.is_empty() {
+                    t.push('\n');
+                }
+                t.push_str(&trf(mbuf::OVERVIEW_CUT_MSG, &[("n", ov.cut.to_string())]));
+            }
+            t
+        };
         let mut replace_with = std::mem::take(&mut mb.replace_with);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(info).color(theme.text_dim).small());
+            let r = ui.label(RichText::new(info).color(theme.text_dim).small());
+            if !overview.is_empty() {
+                r.on_hover_text(overview);
+            }
             if !subtitle.is_empty() {
                 ui.label(
                     RichText::new(format!("“{subtitle}”"))
@@ -780,11 +796,29 @@ impl ZaivernApp {
         ui.separator();
 
         if mb.is_empty() {
-            // 空状態は利用可能領域の**中央**に 1 枚で出す (下に取り残さない)
-            let dim = theme.text_dim;
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new(tr("表示するものがありません")).color(dim));
-            });
+            // 空状態は利用可能領域の**中央に 1 枚のカード**で出す (下に取り残さない)。
+            // 文言は出所ごとに変える (`変更はありません` / `一致はありません` …) —
+            // 「表示するものがありません」だけだと、何を探した結果なのかが読めない。
+            // 割り付けは `mbuf::empty_card` が唯一の判断 (テーブルテストで固定)。
+            let avail = ui.available_rect_before_wrap();
+            let card = mbuf::empty_card(avail, row_h);
+            let p = ui.painter().clone();
+            p.rect_filled(card.card, 6.0, theme.panel_alt);
+            p.text(
+                card.title.center(),
+                egui::Align2::CENTER_CENTER,
+                tr(mbuf::empty_message(mb.source)),
+                font.clone(),
+                theme.text,
+            );
+            p.text(
+                card.hint.center(),
+                egui::Align2::CENTER_CENTER,
+                tr(mbuf::empty_hint(mb.source)),
+                font.clone(),
+                theme.text_dim,
+            );
+            ui.allocate_rect(avail, egui::Sense::hover());
         } else {
             // ── 本体 ─────────────────────────────────────────────
             let rows = mbuf::rows(&mb);
@@ -855,14 +889,11 @@ impl ZaivernApp {
                         match row {
                             Row::Header { ex } => {
                                 painter.rect_filled(rect, 0.0, theme.panel_alt);
-                                let mark = if e.collapsed { "▸" } else { "▾" };
-                                let edited = if e.edited() { " ✎" } else { "" };
-                                let title = format!(
-                                    "{mark} {}  {}–{}{edited}",
-                                    e.label,
-                                    e.first_line,
-                                    e.last_line()
-                                );
+                                // 見出しの文言は `mbuf::header_title` が唯一の判断。
+                                // 変更の面では**そのファイルの先頭の抜粋にだけ**
+                                // 要約 (`+12 −3`) が付くので、1 ファイルが 3 抜粋に
+                                // 割れていても数字は 1 度しか出ない。
+                                let title = mbuf::header_title(mbr, ex);
                                 // 見出しの色は**そのファイルで最も重い深刻度**。
                                 // 畳んだままでも「どのファイルが赤いか」が読める。
                                 let col = match e.worst_severity() {

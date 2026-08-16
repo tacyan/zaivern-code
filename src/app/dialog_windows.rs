@@ -210,7 +210,9 @@ impl ZaivernApp {
     ///
     /// `git diff HEAD` を **1 回だけ**走らせて全ファイルぶんの変更行を取る
     /// (ファイルごとに git を起動すると、変更が多いときに固まる)。
-    pub(super) fn open_changes_multibuffer(&mut self) {
+    /// (可視性は `pub(crate)` — 機能レジストリ `src/features/changes.rs` から
+    /// **メソッド越しに**呼ぶため。`ZaivernApp` のフィールドは公開しない。)
+    pub(crate) fn open_changes_multibuffer(&mut self) {
         use crate::multibuffer as mbuf;
         let Some(top) = self.git_ops_repo() else {
             self.toast_warn(tr("git リポジトリではありません"));

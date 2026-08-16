@@ -212,7 +212,39 @@ pub fn bulk_targets(mode: BulkMode, agents: &[AgentPick]) -> Vec<u64> {
         .collect()
 }
 
+/// 承認キューの 1 件に対して撃てる操作。
+///
+/// **知らない語は `None`** — 綴り違いを黙って「承認」に落とすと、
+/// 押していない承認が飛ぶ ([`AgentAct::parse`] と同じ立場)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveAct {
+    /// この 1 件だけ承認する
+    Approve,
+    /// この 1 件だけ拒否する
+    Deny,
+    /// 以後この種別 × このエージェントを常に許可する
+    Always,
+    /// 以後この種別 × このエージェントを常に拒否する
+    AlwaysDeny,
+}
+
+impl ApproveAct {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(Self::Approve),
+            "deny" => Some(Self::Deny),
+            "always" => Some(Self::Always),
+            "always_deny" => Some(Self::AlwaysDeny),
+            _ => None,
+        }
+    }
+}
+
 /// UI スレッドへ渡す問い合わせの種類。
+///
+/// `Clone` なのは、**git を UI スレッドで待たない**ための聞き直しに要るため
+/// ([`Query::retries_while_pending`])。
+#[derive(Clone)]
 pub enum Query {
     /// タブ・エージェント・カーソル等の全体状態
     State,
@@ -287,6 +319,37 @@ pub enum Query {
     /// スマホから押すと**誰も押せないダイアログが PC に出たまま**になる。
     /// リモートから届くのは「Esc で止める」までに留める。
     BulkStop { mode: BulkMode },
+
+    // ─── ここから下はスマホの「PC と同じことができる」ための読み取り ───
+    //
+    // **git と横断検索は UI スレッドで走らせない** (CLAUDE.md の鉄則:
+    // `git status` は単独 0.03 秒でも同時実行で 2.3〜10.2 秒かかる)。
+    // UI 側は控えを読むだけで、控えが無ければ `pending` と即答する。
+    // 実際に待つのは接続ごとのスレッド ([`Query::retries_while_pending`])。
+    /// 未コミットの変更をファイル単位で返す (PC の `open_changes_multibuffer`
+    /// と同じ入口 = `git::working_tree_diff` + `diff::parse_unified`)。
+    Changes,
+    /// 1 ファイルぶんのハンク。`rel` はルート相対 ([`safe_rel`] 済み)。
+    Diff { rel: String },
+    /// 端末の履歴を**色つき**で返す。`agent` が負ならアクティブなセッション。
+    /// `before` は「この絶対行より前」(None なら末尾)。
+    Scrollback {
+        agent: i64,
+        lines: usize,
+        before: Option<usize>,
+    },
+    /// 承認キューの中身 (種別・根拠行・待ち時間)。
+    Approvals,
+    /// 承認キューの 1 件を決着させる。
+    Approve { id: u64, act: ApproveAct },
+    /// ファイルを**開かずに**読む (PC のアクティブタブを奪わない)。
+    Read {
+        rel: String,
+        from: usize,
+        lines: usize,
+    },
+    /// ワークスペース横断検索 (`file_search` へ合流)。
+    Search { q: String, max: usize },
 }
 
 impl Query {
@@ -317,7 +380,36 @@ impl Query {
     fn ack(&self) -> &'static str {
         r#"{"ok":true,"queued":true}"#
     }
+
+    /// 応答が `"pending": true` のとき、**聞き直してよい**要求か。
+    ///
+    /// git と横断検索は UI スレッドで待てない (CLAUDE.md: 同時実行で
+    /// 2.3〜10.2 秒かかり、その間フレームが止まる)。そこで UI 側は
+    /// 「まだ用意できていない」と**即答**し、裏のスレッドが結果を作る。
+    /// 待つのは接続ごとのこのスレッドなので、**UI は 1 フレームも止まらない**
+    /// のに、スマホから見れば 1 回の GET で答えが返る。
+    fn retries_while_pending(&self) -> bool {
+        matches!(
+            self,
+            Query::Changes | Query::Diff { .. } | Query::Search { .. }
+        )
+    }
 }
+
+/// 応答 JSON が「まだ用意できていない」と言っているか (**純関数**)。
+///
+/// 読めない JSON は `false` — 聞き直しの輪に入れて塞ぐより、
+/// そのままスマホへ返して見せるほうが原因が分かる。
+pub fn is_pending(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("pending").and_then(|p| p.as_bool()))
+        .unwrap_or(false)
+}
+
+/// `pending` のときに聞き直す間隔。短すぎると UI スレッドを無駄に起こし、
+/// 長すぎるとスマホの体感が悪くなる。
+const PENDING_POLL: Duration = Duration::from_millis(120);
 
 /// サーバスレッド → UI スレッドへのリクエスト。UI 側は必ず respond すること。
 pub struct Request {
@@ -819,6 +911,111 @@ fn handle_conn(
         ("GET", "/api/files") => Query::Files,
         ("GET", "/api/term") => Query::Term,
         ("GET", "/api/agents") => Query::Agents,
+        // ─── ここから下はスマホを PC と同じ土俵に載せるための読み取り ───
+        // GET のクエリは `?t=` と同じ文字列から取り出す (認証は上で済んでいる)。
+        ("GET", "/api/changes") => Query::Changes,
+        ("GET", "/api/diff") => {
+            // パスは必ずルート相対へ畳む。畳めない綴りは**実行前に**断る
+            let Some(rel) = query_param(&query_str, "path")
+                .as_deref()
+                .and_then(safe_rel)
+            else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"bad path"}"#,
+                );
+            };
+            Query::Diff { rel }
+        }
+        ("GET", "/api/scrollback") => Query::Scrollback {
+            agent: query_param(&query_str, "agent")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(-1),
+            lines: clamp_count(
+                query_param(&query_str, "lines")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0),
+                SCROLLBACK_DEFAULT,
+                SCROLLBACK_MAX,
+            ),
+            // 0 は「先頭より前」= 空。無指定 (末尾) と区別する
+            before: query_param(&query_str, "before")
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| *v >= 0)
+                .map(|v| v as usize),
+        },
+        ("GET", "/api/approvals") => Query::Approvals,
+        // 承認は**知らない語を絶対に通さない** (押していない承認が飛ぶ)
+        ("POST", "/api/approve") => {
+            let Some(act) = ApproveAct::parse(&s("act")) else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"unknown act (approve|deny|always|always_deny)"}"#,
+                );
+            };
+            // id は文字列でも数値でも受ける (JS の JSON は数値に落としがち)
+            let id = json
+                .get("id")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|t| t.trim().parse::<u64>().ok()))
+                })
+                .unwrap_or(u64::MAX);
+            Query::Approve { id, act }
+        }
+        ("GET", "/api/read") => {
+            let Some(rel) = query_param(&query_str, "path")
+                .as_deref()
+                .and_then(safe_rel)
+            else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"bad path"}"#,
+                );
+            };
+            Query::Read {
+                rel,
+                from: query_param(&query_str, "from")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(1) as usize,
+                lines: clamp_count(
+                    query_param(&query_str, "lines")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0),
+                    READ_DEFAULT,
+                    READ_MAX,
+                ),
+            }
+        }
+        ("GET", "/api/search") => {
+            // 1 文字の検索は索引全体を舐めるだけで役に立たない。断る
+            let q = query_param(&query_str, "q").unwrap_or_default();
+            if q.trim().chars().count() < SEARCH_MIN_CHARS {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"query too short (2+ chars)"}"#,
+                );
+            }
+            Query::Search {
+                q: q.trim().to_string(),
+                max: clamp_count(
+                    query_param(&query_str, "max")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0),
+                    SEARCH_DEFAULT,
+                    SEARCH_MAX,
+                ),
+            }
+        }
         // 一覧の行から撃つ 1 体宛ての操作。知らない語は実行せずに断る
         ("POST", "/api/agent_act") => {
             let Some(act) = AgentAct::parse(&s("act")) else {
@@ -929,43 +1126,30 @@ fn handle_conn(
     };
 
     // UI スレッドへ渡す
-    let (rtx, rrx) = mpsc::sync_channel::<String>(1);
     let immediate = query.is_fire_and_forget().then(|| query.ack());
-    if tx.send(Request { query, reply: rtx }).is_err() {
-        return respond(
-            &mut stream,
+    let retry_pending = query.retries_while_pending();
+    let deadline = Instant::now() + REMOTE_TIMEOUT;
+    let closed = |stream: &mut TcpStream| {
+        respond(
+            stream,
             500,
             "application/json",
             br#"{"ok":false,"error":"app closed"}"#,
-        );
-    }
-
-    // 一方向の指示は積んだ時点で成功。UI スレッドの復帰を待たない。
-    if let Some(js) = immediate {
-        crate::perf::repaint(&ctx, "remote");
-        return respond(
-            &mut stream,
-            200,
-            "application/json; charset=utf-8",
-            js.as_bytes(),
-        );
-    }
-    // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
-    // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
-    // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
-    let deadline = Instant::now() + REMOTE_TIMEOUT;
-    let reply = loop {
-        crate::perf::repaint(&ctx, "remote");
-        match rrx.recv_timeout(Duration::from_millis(150)) {
-            Ok(js) => break Some(js),
-            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    break None;
-                }
-            }
-        }
+        )
     };
+    let Ok(mut reply) = send_query(&tx, &ctx, query.clone(), immediate, deadline) else {
+        return closed(&mut stream);
+    };
+    // **git と横断検索を UI スレッドで待たない**ための聞き直し (CLAUDE.md)。
+    // UI 側は控えが無ければ `pending` と即答し、裏のスレッドが結果を作る。
+    // 待つのはこのスレッドだけなので、フレームは 1 度も止まらない。
+    while retry_pending && reply.as_deref().is_some_and(is_pending) && Instant::now() < deadline {
+        std::thread::sleep(PENDING_POLL);
+        let Ok(next) = send_query(&tx, &ctx, query.clone(), immediate, deadline) else {
+            return closed(&mut stream);
+        };
+        reply = next;
+    }
     match reply {
         Some(js) => respond(
             &mut stream,
@@ -980,6 +1164,43 @@ fn handle_conn(
             br#"{"ok":false,"error":"timeout"}"#,
         ),
     }
+}
+
+/// 要求を 1 件 UI スレッドへ渡して応答を受け取る。
+///
+/// `immediate` が `Some` なら**積んだ時点で成功**として即座に返す
+/// (一方向の指示。macOS はウィンドウが背面だとイベントループごと凍結する)。
+/// `Err(())` はアプリが閉じたことだけを意味する。
+fn send_query(
+    tx: &mpsc::Sender<Request>,
+    ctx: &egui::Context,
+    query: Query,
+    immediate: Option<&'static str>,
+    deadline: Instant,
+) -> Result<Option<String>, ()> {
+    let (rtx, rrx) = mpsc::sync_channel::<String>(1);
+    if tx.send(Request { query, reply: rtx }).is_err() {
+        return Err(());
+    }
+    if let Some(js) = immediate {
+        crate::perf::repaint(ctx, "remote");
+        return Ok(Some(js.to_string()));
+    }
+    // UI スレッドは次のフレームでしか応答できない。ウィンドウが背面や
+    // 非表示だとフレームが来る間隔が延びるため、1 回だけ起こして待つと
+    // 取りこぼす。応答が返るまで一定間隔で起こし続ける。
+    Ok(loop {
+        crate::perf::repaint(ctx, "remote");
+        match rrx.recv_timeout(Duration::from_millis(150)) {
+            Ok(js) => break Some(js),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    break None;
+                }
+            }
+        }
+    })
 }
 
 /// UI スレッドの応答を待つ上限。背面ウィンドウでもフレームが 1 回は来る余裕を取る。
@@ -1008,6 +1229,291 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) {
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  上限 — **どれも黙って切らない**。切ったら必ず `truncated` で伝える
+//  (切られたことを知らせない一覧は、無いのと同じくらい危ない)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `/api/scrollback` の既定行数と上限 (契約: 1〜2000)。
+pub const SCROLLBACK_DEFAULT: usize = 200;
+pub const SCROLLBACK_MAX: usize = 2000;
+/// `/api/read` の既定行数と上限 (契約: 1〜2000)。
+pub const READ_DEFAULT: usize = 400;
+pub const READ_MAX: usize = 2000;
+/// `/api/search` の検索語の最小文字数 / 既定件数 / 上限。
+pub const SEARCH_MIN_CHARS: usize = 2;
+pub const SEARCH_DEFAULT: usize = 100;
+pub const SEARCH_MAX: usize = 500;
+/// `/api/changes` が返すファイル数の上限。
+pub const CHANGES_CAP: usize = 500;
+/// `/api/diff` が返すハンク数の上限。
+pub const DIFF_HUNK_CAP: usize = 300;
+/// 追跡外ファイルを「全部追加された差分」として読むときの 1 ファイル上限。
+pub const UNTRACKED_READ_CAP: u64 = 256 * 1024;
+
+// ══════════════════════════════════════════════════════════════════════
+//  GET のクエリ文字列 / パスの正規化 (すべて純関数)
+//
+//  スマホから届く文字列は**全部疑う**。パスは必ずルート配下へ畳んでから
+//  使い、畳めないものは受け取らない (fail-closed)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `%XX` と `+` を解いた文字列。壊れた `%` はそのまま残す
+/// (弾いてしまうと `100%` のような素直な検索語が通らなくなる)。
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// クエリ文字列から 1 つのキーの値を取り出す (`%XX` 復号つき)。
+/// 同じキーが複数あれば**最初の 1 つ**。
+pub fn query_param(qs: &str, key: &str) -> Option<String> {
+    qs.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+/// スマホから届いた相対パスを、**ルート配下に必ず収まる形**へ畳む。
+///
+/// 弾くもの (どれも `None`):
+/// * 空、`..` を 1 つでも含む
+/// * 絶対パス (`/a`、`C:\a`、`\\server\share`)
+/// * NUL を含む (OS 呼び出しの終端に化ける)
+///
+/// 区切りは `/` へ寄せ、`.` と空の要素は落とす。**返り値は必ず相対**なので、
+/// 呼び出し側は `root.join()` してよい (それでも実体の前方一致は別途見る)。
+pub fn safe_rel(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.contains('\0') {
+        return None;
+    }
+    let unified = raw.replace('\\', "/");
+    if unified.starts_with('/') {
+        return None;
+    }
+    // Windows のドライブ指定 (`C:` / `c:/x`) とドライブ相対 (`C:x`) の両方を弾く
+    let mut ch = unified.chars();
+    if let (Some(c0), Some(':')) = (ch.next(), ch.next()) {
+        if c0.is_ascii_alphabetic() {
+            return None;
+        }
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in unified.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => return None,
+            s => parts.push(s),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// 件数の指定を「無指定なら既定・範囲外なら丸める」で受ける (**純関数**)。
+///
+/// 0 や負数を「無指定」として扱うのは、`?lines=` を空で送ってくる素朴な
+/// クライアントが必ず居るため。上限は呼び出し側が契約どおりに渡す。
+pub fn clamp_count(v: i64, default: usize, max: usize) -> usize {
+    if v <= 0 {
+        return default.min(max);
+    }
+    (v as usize).min(max)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  端末の色 — ANSI ではなく**構造**でスマホへ渡す
+//
+//  スマホ側でエスケープを解釈させない (パーサが 2 つになると必ずずれる)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// `#rrggbb`。
+pub fn hex_rgb(r: u8, g: u8, b: u8) -> String {
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+/// 256 色の番号を `#rrggbb` にする (**純関数**)。
+///
+/// 0〜15 はテーマの 16 色をそのまま使い、16〜231 は 6×6×6 の立方体、
+/// 232〜255 は 24 段の灰色。段の作り方は `terminal::ansi_color` と同じ式で、
+/// **PC の端末とスマホで同じ色に見える**ことがここの目的。
+pub fn ansi_hex(i: u8, base: &[[u8; 3]; 16]) -> String {
+    if i < 16 {
+        let c = base[i as usize];
+        hex_rgb(c[0], c[1], c[2])
+    } else if i < 232 {
+        let i = i - 16;
+        let f = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        hex_rgb(f(i / 36), f((i % 36) / 6), f(i % 6))
+    } else {
+        let v = 8 + (i - 232) * 10;
+        hex_rgb(v, v, v)
+    }
+}
+
+/// 端末セル 1 個ぶんの見た目。色は `#rrggbb`、既定色は `None` (= 省略)。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellStyle {
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+}
+
+impl CellStyle {
+    /// 既定の見た目か (span を畳むときの「捨ててよい」判定に使う)。
+    pub fn is_plain(&self) -> bool {
+        *self == CellStyle::default()
+    }
+}
+
+/// 同じ見た目が続くセルを 1 つに畳んだもの。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: CellStyle,
+}
+
+/// セル列を span へ畳む (**純関数**)。
+///
+/// 2 つのことを同時にやる:
+/// * 同じ見た目が続く間は 1 つにまとめる (バイト数を減らす)
+/// * **行末の「既定色の空白」を落とす** — 80〜200 桁の詰め物をそのまま
+///   送ると、実際の文字よりパディングのほうが大きくなる
+///
+/// 落とすのは*既定色の*空白だけ。背景色の付いた空白は見た目そのものなので残す。
+pub fn fold_spans(cells: &[(String, CellStyle)]) -> Vec<Span> {
+    // 行末の詰め物を先に切る (畳んでから切ると、色付きの空白まで消しかねない)
+    let mut end = cells.len();
+    while end > 0 {
+        let (t, st) = &cells[end - 1];
+        if st.is_plain() && (t.is_empty() || t.chars().all(|c| c == ' ')) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut out: Vec<Span> = Vec::new();
+    for (t, st) in &cells[..end] {
+        // 空セル (未描画) は 1 桁の空白として扱う。落とすと桁がずれる
+        let t = if t.is_empty() { " " } else { t.as_str() };
+        match out.last_mut() {
+            Some(prev) if prev.style == *st => prev.text.push_str(t),
+            _ => out.push(Span {
+                text: t.to_string(),
+                style: st.clone(),
+            }),
+        }
+    }
+    out
+}
+
+/// span 列を契約どおりの JSON へ落とす。
+///
+/// 既定値のキーは**出さない** (`fg`/`bg` は既定色なら省略、真偽は false なら省略)。
+/// 1 画面 2000 行ぶん送るので、キー 1 つの差が実測で効く。
+pub fn spans_json(spans: &[Span]) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = spans
+        .iter()
+        .map(|s| {
+            let mut o = serde_json::Map::new();
+            o.insert("t".into(), serde_json::Value::String(s.text.clone()));
+            if let Some(fg) = &s.style.fg {
+                o.insert("fg".into(), serde_json::Value::String(fg.clone()));
+            }
+            if let Some(bg) = &s.style.bg {
+                o.insert("bg".into(), serde_json::Value::String(bg.clone()));
+            }
+            for (k, v) in [
+                ("bold", s.style.bold),
+                ("italic", s.style.italic),
+                ("underline", s.style.underline),
+            ] {
+                if v {
+                    o.insert(k.into(), serde_json::Value::Bool(true));
+                }
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  変更一覧 — 真実の在り処は git 1 つ (スマホ側で数え直さない)
+// ══════════════════════════════════════════════════════════════════════
+
+/// unified diff のヘッダから 1 文字の状態を決める (**純関数**)。
+///
+/// `"M"|"A"|"D"|"R"`。追跡外 (`"?"`) は diff に出てこないので、
+/// `git status` 側から別に来る ([`untracked_paths_z`])。
+pub fn change_status(old_path: &str, new_path: &str, is_rename: bool) -> &'static str {
+    const DEV_NULL: &str = "/dev/null";
+    if is_rename {
+        "R"
+    } else if old_path == DEV_NULL || old_path.is_empty() {
+        "A"
+    } else if new_path == DEV_NULL || new_path.is_empty() {
+        "D"
+    } else {
+        "M"
+    }
+}
+
+/// `git status --porcelain=v1 -z` の出力から**追跡外**のパスだけ拾う (**純関数**)。
+///
+/// `-z` を使うのは、引用 (`"a b.txt"`) を一切通さないため。改名 (`R`/`C`) は
+/// **2 レコード**使うので、後ろの 1 つを読み飛ばさないと元パスを
+/// エントリと取り違える。
+pub fn untracked_paths_z(out: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    let mut skip_next = false;
+    for rec in out.split('\0').filter(|r| !r.is_empty()) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let Some((xy, path)) = rec.split_at_checked(3) else {
+            continue;
+        };
+        let x = xy.as_bytes()[0];
+        if x == b'R' || x == b'C' {
+            skip_next = true;
+        }
+        if xy.starts_with("??") {
+            v.push(path.replace('\\', "/"));
+        }
+    }
+    v
 }
 
 // ─── ページの多言語化 (Language Pack) ────────────────────────────────
@@ -2234,7 +2740,261 @@ mod tests {
             Query::BulkStop {
                 mode: BulkMode::Stalled,
             },
+            Query::Changes,
+            Query::Diff {
+                rel: "src/app.rs".into(),
+            },
+            Query::Scrollback {
+                agent: -1,
+                lines: 200,
+                before: None,
+            },
+            Query::Approvals,
+            Query::Approve {
+                id: 3,
+                act: ApproveAct::Approve,
+            },
+            Query::Read {
+                rel: "src/app.rs".into(),
+                from: 1,
+                lines: 400,
+            },
+            Query::Search {
+                q: "fn main".into(),
+                max: 100,
+            },
         ]
+    }
+
+    // ─── スマホ用 API の純粋ロジック (契約をここで固定する) ─────────
+
+    #[test]
+    fn 知らない承認操作は受け付けない() {
+        // 綴り違いを黙って「承認」に落とすと、押していない承認が飛ぶ
+        for (s, want) in [
+            ("approve", Some(ApproveAct::Approve)),
+            ("deny", Some(ApproveAct::Deny)),
+            ("always", Some(ApproveAct::Always)),
+            ("always_deny", Some(ApproveAct::AlwaysDeny)),
+            ("APPROVE", None),
+            ("yes", None),
+            ("", None),
+            ("approve ", None),
+        ] {
+            assert_eq!(ApproveAct::parse(s), want, "act={s:?}");
+        }
+    }
+
+    #[test]
+    fn パスはルート配下へ畳めないものを断る() {
+        for (raw, want) in [
+            ("src/app.rs", Some("src/app.rs")),
+            ("./src/./app.rs", Some("src/app.rs")),
+            ("src//app.rs", Some("src/app.rs")),
+            // Windows の区切りは / へ寄せる (同じファイルが 2 通りに見えない)
+            ("src\\app.rs", Some("src/app.rs")),
+            ("a/b/c.txt", Some("a/b/c.txt")),
+            // ここから下は全部お断り
+            ("", None),
+            ("..", None),
+            ("../etc/passwd", None),
+            ("src/../../etc/passwd", None),
+            ("/etc/passwd", None),
+            ("\\etc\\passwd", None),
+            ("C:/Windows/system32", None),
+            ("c:notes.txt", None),
+            ("\\\\server\\share\\x", None),
+            (".", None),
+            ("./", None),
+            ("a\0b", None),
+        ] {
+            assert_eq!(
+                safe_rel(raw).as_deref(),
+                want,
+                "safe_rel({raw:?}) が契約と違う"
+            );
+        }
+    }
+
+    #[test]
+    fn 件数は無指定と範囲外を丸める() {
+        // 0 / 負数は「無指定」= 既定。上限は必ず効かせる
+        for (v, def, max, want) in [
+            (0i64, 200usize, 2000usize, 200usize),
+            (-5, 200, 2000, 200),
+            (1, 200, 2000, 1),
+            (2000, 200, 2000, 2000),
+            (99999, 200, 2000, 2000),
+            // 既定が上限を超えていても上限で止まる
+            (0, 5000, 2000, 2000),
+        ] {
+            assert_eq!(clamp_count(v, def, max), want, "v={v}");
+        }
+    }
+
+    #[test]
+    fn クエリ文字列を復号して取り出す() {
+        let qs = "t=abc&path=src%2Fapp.rs&q=fn+main&empty=";
+        assert_eq!(query_param(qs, "path").as_deref(), Some("src/app.rs"));
+        assert_eq!(query_param(qs, "q").as_deref(), Some("fn main"));
+        assert_eq!(query_param(qs, "empty").as_deref(), Some(""));
+        assert_eq!(query_param(qs, "nope"), None);
+        // 日本語も通る (スマホの検索窓から普通に来る)
+        assert_eq!(
+            query_param("q=%E6%97%A5%E6%9C%AC%E8%AA%9E", "q").as_deref(),
+            Some("日本語")
+        );
+        // 壊れた % は落とさずそのまま残す (100% のような検索語を殺さない)
+        assert_eq!(query_param("q=100%", "q").as_deref(), Some("100%"));
+        assert_eq!(query_param("q=a%zz", "q").as_deref(), Some("a%zz"));
+    }
+
+    #[test]
+    fn 変更の状態は1文字に決まる() {
+        for (o, n, ren, want) in [
+            ("a.rs", "a.rs", false, "M"),
+            ("/dev/null", "a.rs", false, "A"),
+            ("a.rs", "/dev/null", false, "D"),
+            ("a.rs", "b.rs", true, "R"),
+            // 改名は他のどれより優先する (中身も変わっているのが普通)
+            ("/dev/null", "b.rs", true, "R"),
+            ("", "a.rs", false, "A"),
+        ] {
+            assert_eq!(change_status(o, n, ren), want, "{o} -> {n} rename={ren}");
+        }
+    }
+
+    #[test]
+    fn 追跡外だけをstatusから拾う() {
+        // -z なので引用は無い。改名は 2 レコード使う
+        let out = "?? new.txt\0 M src/app.rs\0R  dst.rs\0src.rs\0?? a b.txt\0A  added.rs\0";
+        assert_eq!(untracked_paths_z(out), vec!["new.txt", "a b.txt"]);
+        // 改名の「元パス」をエントリと取り違えない
+        let ren = "R  ?? weird.txt\0?? old.txt\0";
+        assert_eq!(untracked_paths_z(ren), Vec::<String>::new());
+        assert_eq!(untracked_paths_z(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn 拡張256色は同じ式でrgbになる() {
+        let base = {
+            let mut b = [[0u8; 3]; 16];
+            b[1] = [255, 0, 0];
+            b[15] = [255, 255, 255];
+            b
+        };
+        // 0〜15 はテーマの色をそのまま
+        assert_eq!(ansi_hex(1, &base), "#ff0000");
+        assert_eq!(ansi_hex(15, &base), "#ffffff");
+        // 6×6×6 の立方体 (16 が黒、231 が白)
+        assert_eq!(ansi_hex(16, &base), "#000000");
+        assert_eq!(ansi_hex(231, &base), "#ffffff");
+        assert_eq!(ansi_hex(196, &base), "#ff0000");
+        // 24 段の灰色
+        assert_eq!(ansi_hex(232, &base), "#080808");
+        assert_eq!(ansi_hex(255, &base), "#eeeeee");
+    }
+
+    /// span 畳み込み。**行末の詰め物を落とすこと**が本題
+    /// (80〜200 桁の空白をそのまま送ると、本文よりパディングが大きくなる)。
+    #[test]
+    fn 同じ見た目のセルは1つに畳まれ行末の空白は落ちる() {
+        let plain = CellStyle::default();
+        let red = CellStyle {
+            fg: Some("#ff0000".into()),
+            ..Default::default()
+        };
+        let cell = |t: &str, st: &CellStyle| (t.to_string(), st.clone());
+
+        // 同じ属性が続けば 1 span
+        let out = fold_spans(&[
+            cell("a", &plain),
+            cell("b", &plain),
+            cell("c", &red),
+            cell("d", &red),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].text, "ab");
+        assert_eq!(out[1].text, "cd");
+        assert_eq!(out[1].style, red);
+
+        // 行末の既定色の空白は消える (空セルも同じ扱い)
+        let out = fold_spans(&[
+            cell("x", &plain),
+            cell(" ", &plain),
+            cell("", &plain),
+            cell(" ", &plain),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "x");
+
+        // 背景色の付いた空白は**見た目そのもの**なので残す
+        let bg = CellStyle {
+            bg: Some("#003300".into()),
+            ..Default::default()
+        };
+        let out = fold_spans(&[cell("x", &plain), cell(" ", &bg)]);
+        assert_eq!(out.len(), 2, "色付きの空白まで落としている");
+        assert_eq!(out[1].text, " ");
+
+        // 途中の空白は落とさない (桁がずれる)
+        let out = fold_spans(&[cell("a", &plain), cell(" ", &plain), cell("b", &plain)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "a b");
+
+        // 全部が詰め物なら空 (1 行まるごと省ける)
+        assert!(fold_spans(&[cell(" ", &plain), cell(" ", &plain)]).is_empty());
+        assert!(fold_spans(&[]).is_empty());
+    }
+
+    #[test]
+    fn spanのjsonは既定値のキーを出さない() {
+        let spans = vec![
+            Span {
+                text: "err".into(),
+                style: CellStyle {
+                    fg: Some("#f85149".into()),
+                    bold: true,
+                    ..Default::default()
+                },
+            },
+            Span {
+                text: ": failed".into(),
+                style: CellStyle::default(),
+            },
+        ];
+        let v = spans_json(&spans);
+        let a = v.as_array().expect("配列");
+        assert_eq!(a[0]["t"], "err");
+        assert_eq!(a[0]["fg"], "#f85149");
+        assert_eq!(a[0]["bold"], true);
+        assert!(a[0].get("bg").is_none(), "既定の背景色を書いている");
+        assert!(a[0].get("italic").is_none(), "false を書いている");
+        // 既定色の span は t だけ
+        assert_eq!(a[1].as_object().expect("obj").len(), 1);
+    }
+
+    #[test]
+    fn pendingの応答だけ聞き直す() {
+        assert!(is_pending(r#"{"ok":false,"pending":true}"#));
+        assert!(!is_pending(r#"{"ok":false,"pending":false}"#));
+        assert!(!is_pending(r#"{"ok":true,"files":[]}"#));
+        // 読めない応答を聞き直しの輪に入れない (塞ぐより見せる)
+        assert!(!is_pending("not json"));
+        assert!(!is_pending(""));
+        assert!(!is_pending(r#"{"pending":"yes"}"#));
+    }
+
+    #[test]
+    fn 聞き直すのはgitと検索だけ() {
+        // 聞き直す = UI スレッドで待たない要求。他は 1 往復で答えが出る
+        for q in all_query_variants() {
+            let expected = matches!(
+                &q,
+                Query::Changes | Query::Diff { .. } | Query::Search { .. }
+            );
+            assert_eq!(q.retries_while_pending(), expected);
+        }
     }
 
     #[test]
@@ -2257,7 +3017,15 @@ mod tests {
                 | Query::BulkStop { .. }
                 // 承認は「効いたか」が返らないと、押したのに止まったままか
                 // 分からない (press_pet_approve_button は失敗しうる)
-                | Query::AgentAct { .. } => false,
+                | Query::AgentAct { .. }
+                // 読み取りは値そのものが要る。承認の決着も「効いたか」を返す
+                | Query::Changes
+                | Query::Diff { .. }
+                | Query::Scrollback { .. }
+                | Query::Approvals
+                | Query::Approve { .. }
+                | Query::Read { .. }
+                | Query::Search { .. } => false,
                 // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
                 Query::Notify(..)
                 | Query::SetPanel { .. }
