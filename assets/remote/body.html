@@ -1,0 +1,58 @@
+<body>
+<header>
+  <span class="logo">&#9889; ZAIVERN</span>
+  <span class="ws" id="ws" data-i18n="remote.connecting">接続中…</span>
+  <span id="dot"></span>
+</header>
+<main>
+  <!-- エディタ -->
+  <section class="view act" id="v-editor">
+    <div class="chips" id="tabs"></div>
+    <textarea id="ta" autocapitalize="off" autocorrect="off" spellcheck="false"
+      data-i18n-ph="remote.editor_placeholder"
+      placeholder="PC 側でファイルを開くか、[ファイル] タブから選択してください"></textarea>
+    <div class="bar">
+      <span id="meta"></span>
+      <span class="grow"></span>
+      <button class="btn" id="reload" data-i18n="remote.reload">&#8635; 再読込</button>
+      <button class="btn pri" id="save" data-i18n="remote.save">&#128190; 保存</button>
+    </div>
+  </section>
+  <!-- ファイル -->
+  <section class="view" id="v-files">
+    <div class="bar" style="border-top:none;border-bottom:1px solid #21262d">
+      <input id="filter" type="search" data-i18n-ph="remote.file_filter_placeholder"
+        placeholder="ファイル名で絞り込み…">
+    </div>
+    <div id="flist"></div>
+  </section>
+  <!-- エージェント -->
+  <section class="view" id="v-agent">
+    <div class="seg" id="aseg"></div>
+    <div class="chips" id="achips"></div>
+    <div id="btgt"></div>
+    <div id="vnote"></div>
+    <div id="scr" class="empty" data-i18n="remote.no_agents">エージェントがいません</div>
+    <div id="alist"></div>
+    <div class="keys" id="keys"></div>
+    <div class="bar">
+      <input id="ti" type="text" autocapitalize="off" autocorrect="off"
+        data-i18n-ph="remote.agent_input_placeholder"
+        placeholder="エージェントへ指示を送る…">
+      <button class="btn" id="tput" data-i18n="remote.put" data-i18n-title="remote.put_title"
+        title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入れる</button>
+      <button class="btn pri" id="tsend" data-i18n="remote.send">送信</button>
+    </div>
+  </section>
+  <!-- コマンド -->
+  <section class="view" id="v-cmds">
+    <div class="grid" id="cmds"></div>
+  </section>
+</main>
+<nav id="nav">
+  <button data-v="editor" class="act"><span class="ico">&#128196;</span><span data-i18n="remote.tab_editor">エディタ</span></button>
+  <button data-v="files"><span class="ico">&#128194;</span><span data-i18n="remote.tab_files">ファイル</span></button>
+  <button data-v="agent"><span class="ico">&#129302;</span><span data-i18n="remote.tab_agent">エージェント</span></button>
+  <button data-v="cmds"><span class="ico">&#127899;</span><span data-i18n="remote.tab_cmds">コマンド</span></button>
+</nav>
+<div id="toast"></div>
