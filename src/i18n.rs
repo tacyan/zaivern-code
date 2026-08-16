@@ -89,12 +89,21 @@ pub fn set_locale(id: &str, extra: &[PathBuf]) -> Vec<String> {
         None
     } else {
         let src = crate::locale::load_one(crate::locale::SOURCE_LANG, extra, &mut errs);
-        let mut m = HashMap::with_capacity(src.len());
-        for (key, ja) in src {
+        // **ID の順に畳んで、先に来たものを勝たせる。**
+        // 同じ日本語原文を複数の ID が持つことがある (`"送信"` = `agent.send` /
+        // `acp.sent` / `remote.send`)。HashMap の並びのまま入れると**実行のたびに
+        // 勝者が変わり**、同じボタンが起動ごとに別の訳になる。並びを固定すれば
+        // 決定的になる。さらに「同じ原文なら訳も同じ」を辞書側の不変条件に
+        // してあるので (番人テスト `同じ原文を持つIDは訳も一致する`)、
+        // どれが勝っても結果は変わらない。
+        let mut sorted: Vec<(String, String)> = src.into_iter().collect();
+        sorted.sort();
+        let mut m: HashMap<String, String> = HashMap::with_capacity(sorted.len());
+        for (key, ja) in sorted {
             match by_id.get(&key) {
                 // 訳が原文と同じなら入れない (引く意味が無く、地図が太るだけ)
                 Some(v) if v != &ja => {
-                    m.insert(ja, v.clone());
+                    m.entry(ja).or_insert_with(|| v.clone());
                 }
                 _ => {}
             }

@@ -101,7 +101,14 @@ libc = "0.2"
 #   * `trash` クレートは採らない: macOS でゴミ箱の中のパスを返さないため
 #     「削除の取り消し」が作れない (自前実装なら戻り先が分かる)
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell"] }
+# Win32_Globalization は `GetUserDefaultLocaleName` (UI 表示言語の自動判定)。
+# Windows は言語を環境変数へ置かないので、これが無いと `auto` が
+# **Windows でだけ**効かない (macOS/Linux では気付けない壊れ方をする)。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_UI_Shell",
+] }
 
 # Windows のタスクマネージャー「説明」列に "Zaivern Code" を出すための
 # VERSIONINFO リソースを build.rs から埋め込む。

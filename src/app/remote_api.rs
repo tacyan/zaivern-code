@@ -45,6 +45,14 @@ impl ZaivernApp {
                 self.remote_reply_voice_send(text, *id, *submit)
             }
             remote::Query::TermInput(payload, raw) => self.remote_reply_term_input(payload, *raw),
+            // 待ち一覧 / デッキ / 看板が読む 1 本
+            remote::Query::Agents => self.remote_reply_agents(),
+            remote::Query::AgentAct { id, act } => self.remote_reply_agent_act(*id, *act),
+            // 一括送信 / 一括停止 (スマホの「全員 / 待機 / 選択中」)
+            remote::Query::Bulk { text, mode, submit } => {
+                self.remote_reply_bulk(text, *mode, *submit)
+            }
+            remote::Query::BulkStop { mode } => self.remote_reply_bulk_stop(*mode),
             remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
         }
     }
@@ -66,14 +74,20 @@ impl ZaivernApp {
             ),
             None => (String::new(), false),
         };
+        // 一括操作の宛先。判定は PC 側 (`stalled_session_ids` = supervisor) から
+        // 取る — 画面の見た目からは推測しない (設計原則 4)。
+        let picks = self.bulk_picks();
         let agents: Vec<_> = self
             .agents
             .sessions
             .iter()
-            .map(|s| {
+            .zip(picks.iter())
+            .map(|(s, p)| {
                 json!({
                     "id": s.id, "title": s.title, "icon": s.icon,
                     "running": s.running(), "attention": s.attention,
+                    // 止まっている (待機中) か。スマホのチップの ⏸ 印に使う
+                    "stalled": p.stalled,
                 })
             })
             .collect();
@@ -83,12 +97,39 @@ impl ZaivernApp {
             .iter()
             .map(|p| json!({"name": p.name, "icon": p.icon}))
             .collect();
+        // 「待ち」の件数。スマホのビュー切替バッジがこれを出す。
+        // **数え方は `/api/agents` と同じ 1 本** (`remote::is_waiting_lane`) —
+        // ここで別に数えると「バッジ 3 なのに一覧は 5 件」になる。
+        // PTY は読まない (`column_for` は画面末尾を使わない) ので、
+        // 一覧を開いていない間の費用はゼロのまま。
+        let waiting = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| {
+                remote::is_waiting_lane(kanban::column_for(
+                    s.running(),
+                    s.attention,
+                    s.rate_limited.is_some(),
+                    self.supervisor.state_of(s.id),
+                ))
+            })
+            .count();
         json!({
             "ok": true, "workspace": ws, "tabs": tabs,
             "active": self.editor.active, "file": file, "dirty": dirty,
             "cursor": [self.editor.cursor.0, self.editor.cursor.1],
             "agents": agents, "agent_active": self.agents.active,
             "presets": presets, "approval": self.cfg.approval_mode,
+            // 「待ち」ビューのバッジ (/api/agents の waiting と同じ数え方)
+            "waiting": waiting,
+            // 一括操作の宛先数。**数えるのはここ 1 か所だけ** — スマホ側でも
+            // 数えると「3 体と出ているのに 5 体へ飛ぶ」がいずれ起きる。
+            "bulk": {
+                "all": remote::bulk_targets(remote::BulkMode::All, &picks).len(),
+                "stalled": remote::bulk_targets(remote::BulkMode::Stalled, &picks).len(),
+                "one": remote::bulk_targets(remote::BulkMode::One, &picks).len(),
+            },
             // 音声入力ページ (スマホ) が参照する設定
             "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
         })
@@ -352,6 +393,109 @@ impl ZaivernApp {
         }
     }
 
+    /// remote_reply: Agents — 待ち一覧 / デッキ / 看板が読む 1 本。
+    ///
+    /// **レーンも状態ラベルも PC 側の判定をそのまま返す**
+    /// (`kanban::column_for` / `kanban::state_label`)。スマホ側で画面文字を
+    /// 見て状態を決め直すと、PC と食い違ううえに設計原則 4 に反する。
+    /// 直近出力も `Session::screen_tail_lines` (看板カードと同じ関数) で取る。
+    ///
+    /// PTY を読むのはこの応答を作るときだけ。端末ビューを見ているスマホは
+    /// `/api/term` しか叩かないので、一覧を開いていない間の費用はゼロ。
+    pub(super) fn remote_reply_agents(&self) -> String {
+        use serde_json::json;
+        let stalled = self.stalled_session_ids();
+        let active = self.agents.active;
+        // レーン別の件数。看板の見出しに出す (0 本の見出しはページ側が畳む)
+        let mut counts = [0usize; kanban::LANES];
+        let agents: Vec<_> = self
+            .agents
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let running = s.running();
+                let col = kanban::column_for(
+                    running,
+                    s.attention,
+                    s.rate_limited.is_some(),
+                    self.supervisor.state_of(s.id),
+                );
+                counts[col.index()] += 1;
+                // 直近の出力は 2 行だけ。行あたりの桁も詰める
+                // (スマホの幅で折り返すと 1 行のカードが画面を埋める)
+                let tail = s.screen_tail_lines(2, 120);
+                json!({
+                    "id": s.id, "idx": i, "title": s.title,
+                    "icon": if s.icon.is_empty() { "👾" } else { &s.icon },
+                    "running": running,
+                    "attention": s.attention && running,
+                    "stalled": stalled.contains(&s.id),
+                    "active": i == active,
+                    "unread": s.has_unread(),
+                    "lane": col.index(),
+                    "state": tr(kanban::state_label(
+                        running,
+                        s.attention,
+                        s.rate_limited.is_some(),
+                        self.supervisor.state_of(s.id),
+                    )),
+                    // 「待ち」一覧に載せるか。判定は remote::is_waiting_lane 1 か所
+                    "waiting": remote::is_waiting_lane(col),
+                    "uptime": s.uptime(),
+                    "preview": tail.join("\n"),
+                })
+            })
+            .collect();
+        let lanes: Vec<_> = kanban::COLUMNS
+            .iter()
+            .map(|c| {
+                json!({
+                    "i": c.index(), "icon": c.icon(),
+                    "title": tr(c.title()), "n": counts[c.index()],
+                })
+            })
+            .collect();
+        json!({"ok": true, "agents": agents, "lanes": lanes}).to_string()
+    }
+
+    /// remote_reply: AgentAct — 一覧の行から撃つ 1 体宛ての操作。
+    ///
+    /// 承認は PC 側と**同じ入口** (`press_pet_approve_button`) を通す。
+    /// エージェントごとの承認キー (`y` / `1` / Enter…) はカタログが持っている
+    /// ので、スマホ側で当て推量の文字を送らない。
+    pub(super) fn remote_reply_agent_act(&mut self, id: i64, act: remote::AgentAct) -> String {
+        use serde_json::json;
+        let fallback = self.cfg.pet_approve_keys.clone();
+        let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id as u64) else {
+            return json!({"ok": false, "error": tr("セッションが見つかりません (閉じられた可能性)")})
+                .to_string();
+        };
+        if !s.running() {
+            return json!({"ok": false, "error": tr("セッションが停止しています")}).to_string();
+        }
+        let title = s.title.clone();
+        match act {
+            remote::AgentAct::Approve => {
+                if s.press_pet_approve_button(Some(&fallback)) {
+                    self.toast(trf("✅ {title} を承認しました", &[("title", title)]), true);
+                    json!({"ok": true}).to_string()
+                } else {
+                    // 承認キーが分からないまま当て推量を送らない。
+                    // 端末ビューの [y] [1] [Enter] で人が選べる
+                    json!({"ok": false, "error": tr("このセッションは承認キーが分かりません")})
+                        .to_string()
+                }
+            }
+            remote::AgentAct::Stop => {
+                // リモートからの手動操作もユーザーの応答扱い
+                s.note_user_input();
+                s.write_bytes(b"\x1b");
+                json!({"ok": true}).to_string()
+            }
+        }
+    }
+
     /// remote_reply: VoiceSend — 音声入力ページからの送信 (id 負数はブロードキャスト)。
     pub(super) fn remote_reply_voice_send(&mut self, text: &str, id: i64, submit: bool) -> String {
         use serde_json::json;
@@ -411,6 +555,156 @@ impl ZaivernApp {
                 .to_string(),
             }
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  一括操作 (スマホの「全員 / 待機 / 選択中」)
+    //
+    //  宛先の**選び方**は `remote::bulk_targets` (純関数)、**届け方**は
+    //  PC 側と同じ入口 (`queue_submit_all` / `queue_submit_stalled` /
+    //  `queue_submit`) に合流させる。ここで配達を作り直さない —
+    //  作り直すと承認・コスト上限・チェックポイントの見張りが素通りする。
+    // ══════════════════════════════════════════════════════════════════
+
+    /// 一括操作の宛先一覧を作る。
+    ///
+    /// 「止まっている」の判定は [`Self::stalled_session_ids`] (= supervisor) から
+    /// 取る。画面の文字列から推測しない (設計原則 4)。
+    pub(super) fn bulk_picks(&self) -> Vec<remote::AgentPick> {
+        let stalled = self.stalled_session_ids();
+        let active = self.agents.active;
+        self.agents
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| remote::AgentPick {
+                id: s.id,
+                running: s.running(),
+                stalled: stalled.contains(&s.id),
+                active: i == active,
+            })
+            .collect()
+    }
+
+    /// 指定した ID 群へ生バイトを書く。実際に届いた数を返す。
+    ///
+    /// 制御キー (Esc 等) と「入力欄へ入れるだけ」の 1 体宛て送信で使う。
+    /// `/api/term` と同じ経路なので、1 体宛ての挙動はこれまでと変わらない。
+    fn bulk_write_raw(&mut self, ids: &[u64], bytes: &[u8]) -> usize {
+        let mut n = 0;
+        for s in self
+            .agents
+            .sessions
+            .iter_mut()
+            .filter(|s| s.running() && ids.contains(&s.id))
+        {
+            // リモートからの手動操作もユーザーの応答扱い (承認エピソードを解決する)
+            s.note_user_input();
+            s.write_bytes(bytes);
+            n += 1;
+        }
+        n
+    }
+
+    /// remote_reply: Bulk — 宛先モードに従って同じ本文を配る。
+    pub(super) fn remote_reply_bulk(
+        &mut self,
+        text: &str,
+        mode: remote::BulkMode,
+        submit: bool,
+    ) -> String {
+        use serde_json::json;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return json!({"ok": false, "error": tr("テキストが空です")}).to_string();
+        }
+        let picks = self.bulk_picks();
+        let targets = remote::bulk_targets(mode, &picks);
+        if targets.is_empty() {
+            return json!({"ok": false, "error": tr("送れる宛先がいません")}).to_string();
+        }
+        // コスト上限で止まっているなら、**理由をそのままスマホへ返す**。
+        // 先に見ておくと `queue_submit*` 側の栓は通るので、PC に同じ理由の
+        // トーストが二重に出ることも無い。
+        if let Some(why) = self.cost_block_reason() {
+            return json!({"ok": false, "error": why}).to_string();
+        }
+        let sent = match (mode, submit) {
+            // 1 体宛ては従来どおり生書き (`/api/term` と同じバイト列)。
+            // 素のシェルにも効く経路をここで変えない。
+            (remote::BulkMode::One, _) => {
+                let payload = if submit {
+                    format!("{text}\r")
+                } else {
+                    text.clone()
+                };
+                self.bulk_write_raw(&targets, payload.as_bytes())
+            }
+            // 一斉送信は Cockpit のブロードキャストと同じ入口へ合流させる。
+            // 確定キーの再送・コスト上限・チェックポイントが全部そのまま効く。
+            (remote::BulkMode::All, true) => match self.queue_submit_all(&text) {
+                // None = コスト上限。理由は送信側がトーストで説明済み
+                None => return json!({"ok": false, "error": tr("送信できませんでした")}).to_string(),
+                Some(n) => n,
+            },
+            (remote::BulkMode::Stalled, true) => match self.queue_submit_stalled(&text) {
+                None => return json!({"ok": false, "error": tr("送信できませんでした")}).to_string(),
+                Some(n) => n,
+            },
+            // 「入れるだけ」は Cockpit に対応する入口が無い (一斉送信は必ず確定する)
+            // ので、同じ配達機構を submit=false のジョブで通す。
+            // コスト上限は**宛先ごとに理由を出さない**よう、ここで一度だけ見る。
+            (_, false) => {
+                if let Some(why) = self.cost_block_reason() {
+                    self.toast(why, false);
+                    return json!({"ok": false, "error": tr("送信できませんでした")}).to_string();
+                }
+                let mut n = 0;
+                for id in &targets {
+                    let job = submit::Job {
+                        submit: false,
+                        ..submit::Job::user(*id, text.clone())
+                    };
+                    if self.queue_submit(job) {
+                        n += 1;
+                    }
+                }
+                n
+            }
+        };
+        // 1 体宛ては従来どおりトーストを出さない (PC 側が二重に喋らない)。
+        // 一斉送信だけは「何体へ流したか」を PC 側にも残す。
+        if mode != remote::BulkMode::One {
+            self.toast(
+                trf(
+                    "📣 {n} セッションへ送信しました",
+                    &[("n", sent.to_string())],
+                ),
+                true,
+            );
+        }
+        json!({"ok": true, "sent": sent, "mode": mode.as_str()}).to_string()
+    }
+
+    /// remote_reply: BulkStop — 宛先へ Esc を送っていまの作業を止める。
+    ///
+    /// セッションを殺す [`Cmd::StopAllAgents`] は PC 側に確認モーダルを開くので、
+    /// スマホから撃つと**誰も押せないダイアログが PC に残る**。リモートから
+    /// 届くのは「中断」までに留め、破壊的な停止は PC 側の確認を通す。
+    pub(super) fn remote_reply_bulk_stop(&mut self, mode: remote::BulkMode) -> String {
+        use serde_json::json;
+        let picks = self.bulk_picks();
+        let targets = remote::bulk_targets(mode, &picks);
+        if targets.is_empty() {
+            return json!({"ok": false, "error": tr("送れる宛先がいません")}).to_string();
+        }
+        // Esc 1 バイト。端末キーの [Esc] と同じものを人数分だけ送る
+        let n = self.bulk_write_raw(&targets, b"\x1b");
+        self.toast(
+            trf("⏹ {n} セッションへ停止を送りました", &[("n", n.to_string())]),
+            true,
+        );
+        json!({"ok": true, "sent": n, "mode": mode.as_str()}).to_string()
     }
 
     /// remote_reply: TermInput — アクティブなエージェントへ入力を送る。
@@ -1325,5 +1619,70 @@ impl ZaivernApp {
                 true,
             );
         }
+    }
+}
+
+/// スマホの一括操作が **PC 側の入口へ合流しているか**をソースで固定する。
+///
+/// 配達 (確定キーの再送・コスト上限・チェックポイント) を remote 側で
+/// 作り直すと、見張りが素通りしたまま「送れているように見える」経路が
+/// もう 1 本増える。合流していることは実行時には見えないので、ここで押さえる。
+#[cfg(test)]
+mod bulk_wiring_tests {
+    /// 関数 1 本ぶんの本文を切り出す (実装はテストより前に来る前提)。
+    fn body_of(sig: &str) -> String {
+        let src = crate::app::SRC.replace("\r\n", "\n");
+        let after = src
+            .split(sig)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{sig} が無い"))
+            .to_string();
+        let end = crate::app::method_end(&after);
+        after[..end.min(after.len())].to_string()
+    }
+
+    #[test]
+    fn 一括送信は既存の入口へ合流する() {
+        let body = body_of("pub(super) fn remote_reply_bulk(");
+        for entry in [
+            "self.queue_submit_all(&text)",
+            "self.queue_submit_stalled(&text)",
+            "self.queue_submit(job)",
+        ] {
+            assert!(
+                body.contains(entry),
+                "一括送信が {entry} を通っていない (配達を作り直している疑い)"
+            );
+        }
+        // 宛先の選び方は純関数 1 本だけ (ここで数え直さない)
+        assert!(
+            body.contains("remote::bulk_targets(mode, &picks)"),
+            "宛先の選び方を remote::bulk_targets 以外で決めている"
+        );
+    }
+
+    #[test]
+    fn 承認は既存の承認キーを使う() {
+        let body = body_of("pub(super) fn remote_reply_agent_act(");
+        assert!(
+            body.contains("s.press_pet_approve_button(Some(&fallback))"),
+            "承認が PC 側の入口を通っていない (当て推量の文字を送っている疑い)"
+        );
+    }
+
+    #[test]
+    fn 一覧の状態は看板の判定をそのまま出す() {
+        let body = body_of("pub(super) fn remote_reply_agents(");
+        for entry in ["kanban::column_for(", "kanban::state_label(", "remote::is_waiting_lane("] {
+            assert!(
+                body.contains(entry),
+                "一覧が {entry} を使っていない (状態を作り直している疑い)"
+            );
+        }
+        // 画面文字の部分一致で状態を決めていないこと
+        assert!(
+            !body.contains(".contains(\""),
+            "画面テキストの部分一致で状態を決めている"
+        );
     }
 }

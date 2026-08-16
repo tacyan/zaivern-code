@@ -17,6 +17,7 @@
 - **言語パックはプラグイン画面から選べます**。`english-mode` / `japanese-mode` / `chinese-mode` / `korean-mode` / `portuguese-mode` / `spanish-mode` の 6 つが並び、**同時に有効になるのは 1 つだけ**です。どの入口から変えても設定と食い違いません (1 つも有効にしていない状態が「自動」)
 - **フランス語版を作るのに、アプリを作り直す必要はありません**。`zai i18n export fr` で雛形を出し、`~/.zaivern/locales/fr.json` に置くだけで 🌐 の一覧に並びます。`zai i18n check fr` が過不足とプレースホルダの食い違いを見て、合わなければ終了コード 1 で降ります。**同梱と同じ ID を 1 行だけ書けば、その 1 行だけ上書き**できます (訳の直しをその場で試せます)
 - **訳が 1 つ欠けても画面は壊れません**。選んだ言語 → 英語 → 元の文字列、の順に落ちるので、必ず何かが表示されます。訳漏れは `ZAIVERN_I18N_TRACE=1` を付けて起動し、`⌘⇧P` の「表示言語: 訳が無い文字列を書き出す」で一覧にできます
+- **`zai lang` で言語パックを GitHub から入れられます**。`zai lang list --remote` で配布元にある言語を見て、`zai lang install zh-CN` で `~/.zaivern/locales/` へ入れて、`zai lang set zh-CN` で切り替えます。**配布元は決め打ちしていない**ので、誰でも自分のリポジトリで配れます (`zai lang install fr --from someone/zaivern-lang-fr`)。入れる前に JSON の形とプレースホルダを検査し、**基準と食い違うものは置きません** (実行時に案内から `{path}` が消えるような壊れ方を防ぎます)。書き込みは一時ファイル + 差し替えなので、途中で切れても半端なファイルが残りません
 - **README も 6 言語になりました** (`README.md` / `README.ja.md` / `README.zh-CN.md` / `README.ko.md` / `README.pt-BR.md` / `README.es.md`)
 
 ## 0.18.0 — 2026-08-16

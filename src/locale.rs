@@ -920,6 +920,37 @@ mod tests {
     }
 
     #[test]
+    fn 同じ原文を持つidは訳も一致する() {
+        // 呼び出し側が同じ文字列 (`tr("送信")`) を渡す以上、**実行時に区別できない**。
+        // なのに辞書が別々の訳を持っていると、逆引きでどちらが勝つかで
+        // 表示が変わる (実際に `agent.send`="Send" と `acp.sent`="sent" が
+        // ぶつかっていた)。区別したいなら呼び出し側を ID にするのが筋。
+        let maps = builtin_maps();
+        let ja = &maps
+            .iter()
+            .find(|(i, _)| *i == SOURCE_LANG)
+            .expect("ja がある")
+            .1;
+        let mut by_text: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (k, v) in ja {
+            by_text.entry(v.as_str()).or_default().push(k.as_str());
+        }
+        let mut bad = Vec::new();
+        for (text, ids) in by_text.iter().filter(|(_, v)| v.len() > 1) {
+            for (lang, m) in &maps {
+                let vals: std::collections::BTreeSet<&str> =
+                    ids.iter().filter_map(|k| m.get(*k)).map(|s| s.as_str()).collect();
+                if vals.len() > 1 {
+                    bad.push(format!("{text:?} {ids:?} [{lang}] -> {vals:?}"));
+                }
+            }
+        }
+        bad.sort();
+        bad.truncate(15);
+        assert!(bad.is_empty(), "同じ原文なのに訳が違う:\n{}", bad.join("\n"));
+    }
+
+    #[test]
     fn 利用者が示した正準idは必ずある() {
         // README / 設計の説明に出す ID。名前を変えると外部の説明が嘘になる。
         const CANON: &[&str] = &[

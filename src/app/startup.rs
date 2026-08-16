@@ -730,19 +730,12 @@ impl ZaivernApp {
                 );
             }
         }
-        let want = match active {
-            Some(id) => id,
-            None => {
-                let cur = self.cfg.ui_language.trim().to_string();
-                if cur.is_empty() || cur.eq_ignore_ascii_case(locale::AUTO) {
-                    return;
-                }
-                if !installed.iter().any(|(_, id)| *id == cur) {
-                    return; // コミュニティ言語 — プラグインは元から無い
-                }
-                locale::AUTO.to_string()
-            }
-        };
+        // **有効なものが無いときは何もしない。**
+        // 「無効にしたら自動へ戻す」は plugin パネルの切り替え側
+        // (`set_ui_language(auto)`) が既にやっている。ここでも同じ判断をすると、
+        // `zai lang set ko` のように**プラグインを使わずに言語を選んだ**設定を
+        // 起動のたびに `auto` へ書き戻してしまう (CLI で選べなくなる)。
+        let Some(want) = active else { return };
         if self.cfg.ui_language == want {
             return;
         }
