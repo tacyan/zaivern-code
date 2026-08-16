@@ -106,6 +106,112 @@ fn wake_addr(a: SocketAddr) -> SocketAddr {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  一括操作の宛先 (スマホの「全員 / 待機 / 1 体」)
+//
+//  **誰に届くのか**を決めるのはここ 1 か所だけにする。送信・停止・件数表示の
+//  3 つが別々に数え方を持つと、「3 体と出ているのに 5 体へ飛んだ」が起きる。
+//  純関数なので表で固定でき、UI (件数表示) と実処理 (配達) が必ず一致する。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 一括操作の宛先モード。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkMode {
+    /// 起動中の全エージェント (PC 側の「📣 全エージェントへブロードキャスト」相当)
+    All,
+    /// 止まっている (待機中の) エージェントだけ (PC 側の「止まっているものへまとめて送る」相当)
+    Stalled,
+    /// いま選んでいる 1 体
+    One,
+}
+
+impl BulkMode {
+    /// 文字列から起こす。**知らない語は `None`**。
+    ///
+    /// 既定で「全員」へ落とすと、綴りを 1 文字間違えただけで全エージェントへ
+    /// 誤爆する。宛先の解釈は fail-closed にして、呼び出し側が 400 で断る。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(Self::All),
+            "stalled" => Some(Self::Stalled),
+            "one" => Some(Self::One),
+            _ => None,
+        }
+    }
+
+    /// API とページで使う語 (ログ・エラー文言用)。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Stalled => "stalled",
+            Self::One => "one",
+        }
+    }
+}
+
+/// 宛先を選ぶために必要な、エージェント 1 体ぶんの最小の姿。
+///
+/// `stalled` は **supervisor の状態判定から取った値**を入れること。
+/// 画面のピクセルから推測してはいけない (設計原則 4)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPick {
+    pub id: u64,
+    /// PTY が生きているか
+    pub running: bool,
+    /// 止まっている (待機中) と判定されているか
+    pub stalled: bool,
+    /// いま選ばれている 1 体か
+    pub active: bool,
+}
+
+/// 一覧の行から撃てる 1 体宛ての操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAct {
+    /// 承認する (PC 側の「✅ 承認」= `press_pet_approve_button` と同じ入口)
+    Approve,
+    /// いまの作業を止める (Esc)
+    Stop,
+}
+
+impl AgentAct {
+    /// 文字列から起こす。**知らない語は `None`** — 綴り違いを黙って
+    /// 「承認」に落とすと、押していない承認が飛ぶ。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approve" => Some(Self::Approve),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// スマホの「待ち」一覧に載せるレーンか。
+///
+/// 人の手が要る 2 本 ([`kanban::Column::loud`] = 承認待ち / 停滞・異常) に、
+/// 手が空いて指示を待っている 1 本 (`Ready`) を足したもの。
+/// **レーンの定義そのものは `kanban.rs` が持つ** — しきい値も名前もここで
+/// 作り直さない (真実の在り処を 1 つに保つ)。
+pub fn is_waiting_lane(col: crate::kanban::Column) -> bool {
+    col.loud() || col == crate::kanban::Column::Ready
+}
+
+/// 宛先の ID を選ぶ純関数。並びは起動順 (入力の順) のまま。
+///
+/// どのモードでも**動いていないセッションは必ず除く** — 終了済みへ書いても
+/// 届かないのに「N 体へ送りました」と数えてしまうため。
+pub fn bulk_targets(mode: BulkMode, agents: &[AgentPick]) -> Vec<u64> {
+    agents
+        .iter()
+        .filter(|a| a.running)
+        .filter(|a| match mode {
+            BulkMode::All => true,
+            BulkMode::Stalled => a.stalled,
+            BulkMode::One => a.active,
+        })
+        .map(|a| a.id)
+        .collect()
+}
+
 /// UI スレッドへ渡す問い合わせの種類。
 pub enum Query {
     /// タブ・エージェント・カーソル等の全体状態
@@ -159,6 +265,28 @@ pub enum Query {
     /// submit=false ならテキストを入力欄へ挿入するだけで Enter は送らない
     /// (PC 側と同じく、送信は必ず人の操作で行う)。
     VoiceSend { text: String, id: i64, submit: bool },
+    /// 一括送信。宛先は [`BulkMode`] で決まる (全員 / 待機だけ / 選んでいる 1 体)。
+    /// submit=false なら入力欄へ入れるだけで確定キーは送らない。
+    Bulk {
+        text: String,
+        mode: BulkMode,
+        submit: bool,
+    },
+    /// エージェント一覧 (待ち一覧 / デッキ / 看板が読む 1 本)。
+    ///
+    /// 状態・レーン・直近出力を**まとめて 1 回**で返す。ビューごとに別の
+    /// エンドポイントを叩くとポーリングが 3 倍になるので、形は 1 つにして
+    /// 絞り込みと並べ替えはスマホ側で行う。
+    Agents,
+    /// 一覧の行から撃つ 1 体宛ての操作 (承認 / 停止)。
+    /// `id` は**セッション ID** — 一覧が並び替わっても宛先がずれない。
+    AgentAct { id: i64, act: AgentAct },
+    /// 一括停止。宛先ごとに Esc を送って**いまの作業を中断**させる。
+    ///
+    /// セッションを殺す `Cmd::StopAllAgents` は PC 側に確認モーダルを開くので、
+    /// スマホから押すと**誰も押せないダイアログが PC に出たまま**になる。
+    /// リモートから届くのは「Esc で止める」までに留める。
+    BulkStop { mode: BulkMode },
 }
 
 impl Query {
@@ -606,7 +734,7 @@ fn handle_conn(
             &mut stream,
             200,
             "text/html; charset=utf-8",
-            PAGE.as_bytes(),
+            page_for_client(PAGE).as_bytes(),
         );
     }
     if path == "/voice" {
@@ -615,7 +743,7 @@ fn handle_conn(
             &mut stream,
             200,
             "text/html; charset=utf-8",
-            VOICE_PAGE.as_bytes(),
+            page_for_client(VOICE_PAGE).as_bytes(),
         );
     }
     if !path.starts_with("/api/") {
@@ -690,6 +818,19 @@ fn handle_conn(
         ("GET", "/api/file") => Query::File,
         ("GET", "/api/files") => Query::Files,
         ("GET", "/api/term") => Query::Term,
+        ("GET", "/api/agents") => Query::Agents,
+        // 一覧の行から撃つ 1 体宛ての操作。知らない語は実行せずに断る
+        ("POST", "/api/agent_act") => {
+            let Some(act) = AgentAct::parse(&s("act")) else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"unknown act (approve|stop)"}"#,
+                );
+            };
+            Query::AgentAct { id: n("id"), act }
+        }
         ("POST", "/api/text") => {
             // text フィールドが無いリクエストで空文字を適用しない (バッファ全消し防止)
             if json.get("text").and_then(|v| v.as_str()).is_none() {
@@ -743,6 +884,31 @@ fn handle_conn(
             s("text"),
             json.get("raw").and_then(|v| v.as_bool()).unwrap_or(false),
         ),
+        // 一括送信 / 一括停止。宛先の語を読めなければ**送らずに断る**
+        // (既定で「全員」に落とすと綴り違いで誤爆する)。
+        ("POST", "/api/bulk") | ("POST", "/api/bulk_stop") => {
+            let Some(mode) = BulkMode::parse(&s("mode")) else {
+                return respond(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"ok":false,"error":"unknown mode (all|stalled|one)"}"#,
+                );
+            };
+            if path == "/api/bulk_stop" {
+                Query::BulkStop { mode }
+            } else {
+                Query::Bulk {
+                    text: s("text"),
+                    mode,
+                    // 既定は「挿入のみ」。/api/voice・/api/prompt と同じ約束にする
+                    submit: json
+                        .get("submit")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                }
+            }
+        }
         ("POST", "/api/voice") => Query::VoiceSend {
             text: s("text"),
             id: json.get("id").and_then(|v| v.as_i64()).unwrap_or(-1),
@@ -844,6 +1010,87 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+// ─── ページの多言語化 (Language Pack) ────────────────────────────────
+//
+// スマホ側は別プロセス (ブラウザ) なので `tr()` を直接呼べない。そこで
+// **配信の瞬間に 1 回だけ**、`remote.*` の訳を JSON で `<head>` へ流し込み、
+// あとは JS が `T(id, 日本語原文)` で引く。辞書が 1 件も無くても
+// フォールバック (日本語原文) が出るので、画面は決して壊れない。
+
+/// `<head>` に置いた差し込み口。[`localize_page`] がここを
+/// `window.ZVI18N = {…};` へ置き換える。置き換えられなくても
+/// ただの空コメントなので、素の `PAGE` も正しい HTML のまま。
+const I18N_SLOT: &str = "/*__ZV_I18N__*/";
+
+/// `PAGE` / `VOICE_PAGE` へ現在の言語の文言を差し込む。
+///
+/// HTTP を 1 バイトも触らない**ただの文字列処理**にしてあるので、サーバを
+/// 起こさずにテストできる (引数で受けて `String` を返すだけ)。
+/// `dict_json` は `{"remote.save":"Save",…}` 形式の JSON オブジェクト。
+fn localize_page(template: &str, dict_json: &str, lang: &str) -> String {
+    // `<html lang>` は読み上げ・折り返し・フォント選択に効くので実際の言語にする
+    let out = template.replacen(
+        "<html lang=\"ja\">",
+        &format!("<html lang=\"{}\">", html_lang_attr(lang)),
+        1,
+    );
+    out.replace(
+        I18N_SLOT,
+        &format!("window.ZVI18N = {};", script_safe_json(dict_json)),
+    )
+}
+
+/// `<html lang="…">` へ入れてよい形だけを通す。
+///
+/// 言語 ID は利用者が置いた `locales/*.json` 由来なので、引用符や `>` が
+/// 混ざると属性を抜け出して HTML を書き換えられる。**通すものを決める**
+/// (弾くものを列挙しない) 方式にして、想定外の文字は落とす。
+fn html_lang_attr(lang: &str) -> String {
+    let ok: String = lang
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if ok.is_empty() {
+        crate::locale::SOURCE_LANG.to_string()
+    } else {
+        ok
+    }
+}
+
+/// `<script>` の中へ JSON を置くための無害化。
+///
+/// ブラウザは **文字列リテラルの途中でも** `</script>` を見つけた時点で
+/// スクリプトを終わらせる。訳文に `</script>` が入っていると、そこから先が
+/// HTML として解釈され、ページが壊れるだけでなく任意のタグを注入できてしまう。
+/// JSON の文字列中では `<` と `<` が同じ値なので、`<` を全部書き換えれば
+/// `</script>` は**構造的に作れない**。
+/// U+2028 / U+2029 は古い JS で行終端として扱われるので併せて潰す。
+/// 壊れた入力 (JSON でない・オブジェクトでない) は空辞書に落として、
+/// JS の構文まで道連れにしない。
+fn script_safe_json(dict_json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(dict_json) {
+        Ok(v) => v,
+        Err(_) => return "{}".to_string(),
+    };
+    if !v.is_object() {
+        return "{}".to_string();
+    }
+    let s = match serde_json::to_string(&v) {
+        Ok(s) => s,
+        Err(_) => return "{}".to_string(),
+    };
+    s.replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// 配信直前に、いまの UI 言語でページを組み立てる。
+fn page_for_client(template: &str) -> String {
+    let dict = crate::i18n::export_prefix("remote.");
+    let json = serde_json::to_string(&dict).unwrap_or_else(|_| "{}".to_string());
+    localize_page(template, &json, &crate::i18n::current())
+}
+
 // ─── スマホ用ページ (完全内蔵・依存ゼロ) ─────────────────────────────
 
 const PAGE: &str = r##"<!DOCTYPE html>
@@ -854,6 +1101,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0d1117">
 <title>Zaivern Remote</title>
+<script>/*__ZV_I18N__*/</script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { height:100%; }
@@ -909,6 +1157,66 @@ const PAGE: &str = r##"<!DOCTYPE html>
   .btn.pri { background:#1f6feb; border-color:#1f6feb; color:#fff; }
   .btn.warn { background:#6e2c1e; border-color:#f85149; }
   .btn:active { opacity:.7; }
+  /* 宛先がいないときは押せない (誤爆ではなく「押しても何も起きない」を潰す) */
+  .btn[disabled] { opacity:.35; }
+  /* 一括操作の宛先行。宛先が無い (エージェント 0 体) ときは高さも取らない */
+  #btgt {
+    flex:none; display:none; align-items:center; gap:8px;
+    padding:6px 10px; background:#161b22; border-bottom:1px solid #21262d;
+    font-size:12px; color:#8b949e;
+  }
+  #btgt.show { display:flex; }
+  #btgt .n { color:#e6edf3; font-weight:700; }
+  #btgt .btn { padding:6px 10px; font-size:12px; }
+  /* エージェントタブの中のビュー切替 (端末 / 待ち / デッキ / 看板)。
+     下部ナビを増やさずに済ませる。指の当たり判定は 44px 以上を保つ */
+  .seg { flex:none; display:flex; background:#161b22; border-bottom:1px solid #21262d; }
+  .seg button {
+    flex:1; min-width:0; padding:14px 2px; font-size:12.5px; font-weight:600;
+    background:none; border:none; border-bottom:2px solid transparent; color:#8b949e;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .seg button.act { color:#7ee1ff; border-bottom-color:#7ee1ff; }
+  .seg .badge {
+    display:inline-block; margin-left:4px; padding:0 5px; border-radius:8px;
+    background:#6e2c1e; color:#fff; font-size:10.5px; font-weight:700;
+  }
+  /* 一覧 (待ち / デッキ / 看板 で共有する 1 枚の入れ物) */
+  #alist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; display:none; padding:8px 10px 12px; }
+  #alist.show { display:block; }
+  /* 空状態は「利用可能領域の中央に 1 枚」。下や上に取り残さない */
+  #alist.mid { display:flex; align-items:center; justify-content:center; padding:16px; }
+  .card {
+    background:#161b22; border:1px solid #21262d; border-radius:10px;
+    padding:10px 12px; margin-bottom:8px;
+  }
+  .card.act { border-color:#7ee1ff; }
+  .card:active { background:#1c2432; }
+  .card .hd { display:flex; align-items:center; gap:6px; font-size:13.5px; }
+  .card .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:700; }
+  .card .st { flex:none; font-size:11px; color:#8b949e; max-width:46%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .card .pv {
+    margin:6px 0 0; font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:#8b949e; white-space:pre-wrap; word-break:break-all; max-height:3em; overflow:hidden;
+  }
+  .card .ax { display:flex; gap:8px; margin-top:8px; }
+  .card .ax .btn {
+    flex:1; min-width:0; padding:12px 6px; font-size:12.5px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .lane { margin:0 0 8px; }
+  .lane .lhd {
+    display:flex; align-items:center; gap:8px; width:100%; padding:12px 10px;
+    background:#161b22; border:1px solid #21262d; border-radius:10px;
+    color:#c9d1d9; font-size:13px; font-weight:700; text-align:left;
+  }
+  .lane .lhd .n { margin-left:auto; color:#8b949e; }
+  .lane .body { padding:8px 0 0; }
+  .mid-card {
+    max-width:300px; text-align:center; background:#161b22; border:1px solid #21262d;
+    border-radius:12px; padding:22px 18px; color:#8b949e; font-size:13px; line-height:1.7;
+  }
+  .mid-card .big { display:block; font-size:30px; margin-bottom:8px; }
   /* 音声が使えない端末への案内 (トーストと違い消えない) */
   #vnote {
     display:none; margin:0 0 8px; padding:9px 11px; border-radius:8px;
@@ -953,7 +1261,7 @@ const PAGE: &str = r##"<!DOCTYPE html>
 <body>
 <header>
   <span class="logo">&#9889; ZAIVERN</span>
-  <span class="ws" id="ws">接続中…</span>
+  <span class="ws" id="ws" data-i18n="remote.connecting">接続中…</span>
   <span id="dot"></span>
 </header>
 <main>
@@ -961,32 +1269,39 @@ const PAGE: &str = r##"<!DOCTYPE html>
   <section class="view act" id="v-editor">
     <div class="chips" id="tabs"></div>
     <textarea id="ta" autocapitalize="off" autocorrect="off" spellcheck="false"
+      data-i18n-ph="remote.editor_placeholder"
       placeholder="PC 側でファイルを開くか、[ファイル] タブから選択してください"></textarea>
     <div class="bar">
       <span id="meta"></span>
       <span class="grow"></span>
-      <button class="btn" id="reload">&#8635; 再読込</button>
-      <button class="btn pri" id="save">&#128190; 保存</button>
+      <button class="btn" id="reload" data-i18n="remote.reload">&#8635; 再読込</button>
+      <button class="btn pri" id="save" data-i18n="remote.save">&#128190; 保存</button>
     </div>
   </section>
   <!-- ファイル -->
   <section class="view" id="v-files">
     <div class="bar" style="border-top:none;border-bottom:1px solid #21262d">
-      <input id="filter" type="search" placeholder="ファイル名で絞り込み…">
+      <input id="filter" type="search" data-i18n-ph="remote.file_filter_placeholder"
+        placeholder="ファイル名で絞り込み…">
     </div>
     <div id="flist"></div>
   </section>
   <!-- エージェント -->
   <section class="view" id="v-agent">
+    <div class="seg" id="aseg"></div>
     <div class="chips" id="achips"></div>
+    <div id="btgt"></div>
     <div id="vnote"></div>
-    <div id="scr" class="empty">エージェントがいません</div>
+    <div id="scr" class="empty" data-i18n="remote.no_agents">エージェントがいません</div>
+    <div id="alist"></div>
     <div class="keys" id="keys"></div>
     <div class="bar">
       <input id="ti" type="text" autocapitalize="off" autocorrect="off"
+        data-i18n-ph="remote.agent_input_placeholder"
         placeholder="エージェントへ指示を送る…">
-      <button class="btn" id="tput" title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入れる</button>
-      <button class="btn pri" id="tsend">送信</button>
+      <button class="btn" id="tput" data-i18n="remote.put" data-i18n-title="remote.put_title"
+        title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入れる</button>
+      <button class="btn pri" id="tsend" data-i18n="remote.send">送信</button>
     </div>
   </section>
   <!-- コマンド -->
@@ -995,10 +1310,10 @@ const PAGE: &str = r##"<!DOCTYPE html>
   </section>
 </main>
 <nav id="nav">
-  <button data-v="editor" class="act"><span class="ico">&#128196;</span>エディタ</button>
-  <button data-v="files"><span class="ico">&#128194;</span>ファイル</button>
-  <button data-v="agent"><span class="ico">&#129302;</span>エージェント</button>
-  <button data-v="cmds"><span class="ico">&#127899;</span>コマンド</button>
+  <button data-v="editor" class="act"><span class="ico">&#128196;</span><span data-i18n="remote.tab_editor">エディタ</span></button>
+  <button data-v="files"><span class="ico">&#128194;</span><span data-i18n="remote.tab_files">ファイル</span></button>
+  <button data-v="agent"><span class="ico">&#129302;</span><span data-i18n="remote.tab_agent">エージェント</span></button>
+  <button data-v="cmds"><span class="ico">&#127899;</span><span data-i18n="remote.tab_cmds">コマンド</span></button>
 </nav>
 <div id="toast"></div>
 <script>
@@ -1007,6 +1322,30 @@ const qs = new URLSearchParams(location.search);
 let TOK = qs.get('t') || localStorage.getItem('zv_tok') || '';
 if (qs.get('t')) localStorage.setItem('zv_tok', qs.get('t'));
 const $ = id => document.getElementById(id);
+// ─── 多言語 (Language Pack) ───
+// 文言はサーバが <head> の window.ZVI18N へ 1 回だけ注入する。
+// 第 2 引数 d は日本語の原文フォールバック — 辞書が届かなくても画面は壊れない。
+const T = (k, d) => (window.ZVI18N && window.ZVI18N[k]) || d;
+// 静的な文言は HTML 側に data-i18n 属性で宣言しておき、起動時に一括で差し込む。
+// 差し込み先は属性ごとに分ける (本文 / placeholder / title)。
+// 訳が無いときは HTML に書いてある原文をそのまま残す (上書きしない)。
+function applyI18n() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const v = T(el.dataset.i18n, ''); if (v) el.textContent = v;
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+    const v = T(el.dataset.i18nPh, ''); if (v) el.placeholder = v;
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const v = T(el.dataset.i18nTitle, ''); if (v) el.title = v;
+  });
+}
+// 音声認識の言語は画面の言語に合わせる (英語 UI なのに日本語を聞き取ろうとしない)。
+// ja だけは地域つきの ja-JP が明確に良いので特別扱いする。
+function speechLang() {
+  const l = document.documentElement.lang || 'ja';
+  return l === 'ja' ? 'ja-JP' : l;
+}
 let view = 'editor', dirty = false, files = [], state = null, curTab = -1;
 let taTab = -1;  // textarea の内容がどのタブのものか (誤上書き防止)
 
@@ -1019,7 +1358,7 @@ async function api(path, body) {
     ? { method:'POST', headers:{'Content-Type':'application/json','X-Token':TOK}, body:JSON.stringify(body) }
     : { headers:{'X-Token':TOK} };
   const r = await fetch(path, opt);
-  if (r.status === 401) { toast('認証エラー: QRコードを読み直してください'); throw 0; }
+  if (r.status === 401) { toast(T('remote.auth_error', '認証エラー: QRコードを読み直してください')); throw 0; }
   if (!r.ok) throw 0;
   return r.json();
 }
@@ -1040,7 +1379,7 @@ async function pollState() {
     state = await api('/api/state');
     $('dot').classList.add('on');
     $('ws').textContent = state.workspace + (state.file ? ' — ' + state.file + (state.dirty ? ' ●' : '') : '');
-    renderTabs(); renderAgents(); renderCmds();
+    renderTabs(); renderAgents(); renderCmds(); renderSeg();
     if (curTab !== state.active) { curTab = state.active; if (!dirty) loadFile(); }
   } catch (e) { $('dot').classList.remove('on'); }
 }
@@ -1071,7 +1410,7 @@ async function loadFile() {
   } catch (e) {}
 }
 $('ta').addEventListener('input', () => { dirty = true; });
-$('reload').onclick = () => { dirty = false; loadFile().then(() => toast('再読込しました')); };
+$('reload').onclick = () => { dirty = false; loadFile().then(() => toast(T('remote.reloaded', '再読込しました'))); };
 $('save').onclick = async () => {
   try {
     // 適用+保存を 1 リクエストで原子的に行う。タブ不一致はサーバ側で拒否される
@@ -1081,15 +1420,16 @@ $('save').onclick = async () => {
       // 元の文字コードで表せない文字を足すと UTF-8 へ切り替わる。
       // 黙って変わると「他のツールで読めなくなった」原因が分からないので必ず伝える
       if (r.promoted) {
-        toast(r.was + ' では表せない文字があるため UTF-8 で保存しました');
+        toast(T('remote.encoding_promoted', '{enc} では表せない文字があるため UTF-8 で保存しました')
+          .replace('{enc}', r.was));
         loadFile();
       } else {
-        toast('PC 側で保存しました ✅');
+        toast(T('remote.saved', 'PC 側で保存しました ✅'));
       }
     } else {
-      toast(r.error || '保存に失敗しました');
+      toast(r.error || T('remote.save_failed', '保存に失敗しました'));
     }
-  } catch (e) { toast('保存に失敗しました'); }
+  } catch (e) { toast(T('remote.save_failed', '保存に失敗しました')); }
 };
 
 // ─── ファイル ───
@@ -1105,7 +1445,11 @@ function renderFiles() {
   const el = $('flist');
   el.innerHTML = '';
   const hit = files.filter(f => f.toLowerCase().includes(q)).slice(0, 400);
-  if (!hit.length) { el.innerHTML = '<div class="empty">該当なし</div>'; return; }
+  if (!hit.length) {
+    const e0 = document.createElement('div');
+    e0.className = 'empty'; e0.textContent = T('remote.no_match', '該当なし');
+    el.appendChild(e0); return;
+  }
   hit.forEach(f => {
     const d = document.createElement('div');
     // Windows のパスは `src\app.rs` と区切りが `\` で来る。
@@ -1117,7 +1461,7 @@ function renderFiles() {
     d.onclick = async () => {
       await api('/api/open', {path: f});
       dirty = false;
-      toast(f + ' を開きました');
+      toast(T('remote.opened', '{path} を開きました').replace('{path}', f));
       document.querySelector('nav button[data-v=editor]').click();
       await pollState();
     };
@@ -1131,7 +1475,7 @@ const ESC = '\u001b';
 const KEYS = [
   ['Enter', '\r'], ['Esc', ESC], ['^C', '\u0003'],
   ['↑', ESC + '[A'], ['↓', ESC + '[B'],
-  ['Tab', '\t'], ['⇧Tab 権限', ESC + '[Z'],
+  ['Tab', '\t'], [T('remote.key_shift_tab_perm', '⇧Tab 権限'), ESC + '[Z'],
   ['1', '1'], ['2', '2'], ['3', '3'], ['y', 'y'],
 ];
 KEYS.forEach(([label, seq]) => {
@@ -1165,13 +1509,14 @@ function dictationHint(reason) {
   // /voice の API はトークンを要るので、いま持っているものを付けて渡す
   const p = location.port || '8899';
   const u = 'http://127.0.0.1:' + p + '/voice' + (TOK ? '?t=' + encodeURIComponent(TOK) : '');
-  const how = 'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
-    + 'PC からは ' + u + ' で連続認識が使えます。';
+  const how = T('remote.dictation_how',
+    'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
+    + 'PC からは {url} で連続認識が使えます。').replace('{url}', u);
   const why = reason === 'unsupported'
-    ? 'このブラウザは音声認識 (Web Speech API) に未対応です。'
+    ? T('remote.speech_unsupported', 'このブラウザは音声認識 (Web Speech API) に未対応です。')
     : reason === 'network'
-    ? '音声認識サーバーに接続できませんでした（http 接続では利用できません）。'
-    : 'この接続 (http) ではブラウザの音声認識が使えません。';
+    ? T('remote.speech_network', '音声認識サーバーに接続できませんでした（http 接続では利用できません）。')
+    : T('remote.speech_insecure', 'この接続 (http) ではブラウザの音声認識が使えません。');
   return why + how;
 }
 function showNote(m) { const n = $('vnote'); n.textContent = m; n.classList.add('show'); }
@@ -1183,9 +1528,9 @@ function keyboardDictation(i, reason) {
   const t = $('ti');
   t.focus();
   try { t.setSelectionRange(t.value.length, t.value.length); } catch (e) {}
-  t.placeholder = '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動';
+  t.placeholder = T('remote.dictation_placeholder', '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動');
   showNote(dictationHint(reason));
-  toast('キーボードの \u{1F3A4} から入力してください');
+  toast(T('remote.dictation_toast', 'キーボードの \u{1F3A4} から入力してください'));
 }
 // 復帰不能なエラー。再開させずに止め、理由を消えない形で残す
 function fatalVoiceStop(msg) {
@@ -1201,9 +1546,9 @@ function stopVoice0() {
   if (r) { r.onend = null; try { r.stop(); } catch (e) {} }
   if ($('ti').value === lastInterim) $('ti').value = '';
   lastInterim = '';
-  $('ti').placeholder = 'エージェントへ指示を送る…';
+  $('ti').placeholder = T('remote.agent_input_placeholder', 'エージェントへ指示を送る…');
 }
-function stopVoice() { stopVoice0(); hideNote(); renderAgents(); toast('\u{1F3A4} 音声入力モード OFF'); }
+function stopVoice() { stopVoice0(); hideNote(); renderAgents(); toast(T('remote.voice_mode_off', '\u{1F3A4} 音声入力モード OFF')); }
 function startVoice(i) {
   // 使えない端末では死んだエラーを出さず、キーボード音声入力へ逃がす
   const reason = speechBlockReason();
@@ -1216,7 +1561,7 @@ function startVoice(i) {
   api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
   const r = new C();
   recog = r;
-  r.lang = 'ja-JP';
+  r.lang = speechLang();
   r.continuous = true;
   r.interimResults = true;
   r.onresult = ev => {
@@ -1242,14 +1587,14 @@ function startVoice(i) {
     const e = ev.error;
     if (e === 'no-speech') return;              // 無音だけ: onend の自動再開に任せる
     if (e === 'not-allowed' || e === 'service-not-allowed') {
-      fatalVoiceStop('マイクが許可されていません（ブラウザ設定を確認）');
+      fatalVoiceStop(T('remote.mic_not_allowed', 'マイクが許可されていません（ブラウザ設定を確認）'));
     } else if (e === 'network') {
       // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
       voiceFatal = true;
       stopVoice0(); renderAgents();
       keyboardDictation(i, 'network');
     } else if (e === 'audio-capture') {
-      fatalVoiceStop('マイクが見つかりません');
+      fatalVoiceStop(T('remote.mic_not_found', 'マイクが見つかりません'));
     } else if (e === 'aborted') {
       stopVoice0(); renderAgents();            // 明示停止・画面遷移。黙って終わる
     }
@@ -1260,69 +1605,321 @@ function startVoice(i) {
       try { r.start(); } catch (e) { stopVoice(); }
     }
   };
-  try { r.start(); } catch (e) { toast('音声入力を開始できません'); stopVoice0(); renderAgents(); return; }
-  $('ti').placeholder = '\u{1F3A4} 話した内容がここに溜まります — 送信はボタンで';
+  try { r.start(); } catch (e) { toast(T('remote.voice_start_failed', '音声入力を開始できません')); stopVoice0(); renderAgents(); return; }
+  $('ti').placeholder = T('remote.voice_placeholder', '\u{1F3A4} 話した内容がここに溜まります — 送信はボタンで');
   renderAgents();
   const a = (state.agents || [])[i];
-  toast('\u{1F3A4} 音声入力モード ON → ' + (a ? a.title : '') + ' (自動送信はしません)');
+  toast(T('remote.voice_mode_on', '\u{1F3A4} 音声入力モード ON → {agent} (自動送信はしません)')
+    .replace('{agent}', a ? a.title : ''));
+}
+// ─── 一括操作 (宛先の粒度) ───
+// 'one'     … いま選んでいる 1 体 (既定)
+// 'all'     … 起動中の全エージェント (PC 側の「📣 全エージェントへブロードキャスト」)
+// 'stalled' … 止まっている (待機中の) ものだけ (PC 側の「止まっているものへまとめて送る」)
+//
+// 既定をいちばん狭い 'one' にするのは、画面を開いた瞬間が全員宛てだと
+// 打ち込んだ 1 行がそのまま全機へ飛ぶため。
+// 件数は **PC 側が数えた state.bulk をそのまま出す**。スマホ側でも数えると
+// 数え方が 2 か所になり、「3 体と出ているのに 5 体へ飛んだ」が起こりうる。
+let bulkMode = 'one';
+function bulkCount(m) { return ((state && state.bulk) || {})[m || bulkMode] || 0; }
+function bulkModeLabel(m) {
+  return m === 'all' ? T('remote.bulk_all', '\u{1F4E3} 全員')
+    : m === 'stalled' ? T('remote.bulk_stalled', '⏸ 待機')
+    : T('remote.bulk_one', '\u{1F916} 選択中');
+}
+// 宛先行: 何体へ届くのかを送信前に必ず見せる + 一括停止をここから届かせる。
+// エージェントが 0 体なら行ごと消す (中身の無い帯で高さを取らない)。
+function renderBulk() {
+  const el = $('btgt');
+  el.innerHTML = '';
+  const agents = (state && state.agents) || [];
+  const n = bulkCount();
+  el.classList.toggle('show', agents.length > 0);
+  if (agents.length) {
+    const lab = document.createElement('span');
+    lab.className = 'grow';
+    lab.textContent = T('remote.bulk_target', '宛先: {mode} — {n} 体')
+      .replace('{mode}', bulkModeLabel(bulkMode)).replace('{n}', n);
+    el.appendChild(lab);
+    const stop = document.createElement('button');
+    stop.className = 'btn warn';
+    stop.textContent = T('remote.bulk_stop', '⏹ 停止');
+    stop.title = T('remote.bulk_stop_title', '宛先へ Esc を送っていまの作業を止める');
+    stop.disabled = n === 0;
+    stop.onclick = bulkStop;
+    el.appendChild(stop);
+  }
+  // 宛先 0 体では送れない。押しても届かないボタンは押させない
+  $('tsend').disabled = n === 0;
+  $('tput').disabled = n === 0;
+}
+// 一括停止 = 宛先へ Esc。セッションを殺すのは PC 側の確認モーダルに任せる
+// (スマホから殺すと、誰も押せないダイアログが PC に開いたままになる)。
+async function bulkStop() {
+  if (!bulkCount()) return;
+  try {
+    const r = await api('/api/bulk_stop', {mode: bulkMode});
+    toast(r.ok
+      ? T('remote.bulk_stopped', '⏹ {n} 体へ停止 (Esc) を送りました').replace('{n}', r.sent)
+      : (r.error || T('remote.bulk_failed', '送信できませんでした')));
+  } catch (e) {}
 }
 function renderAgents() {
   const el = $('achips');
   el.innerHTML = '';
   const agents = state.agents || [];
   if (voiceAgent >= agents.length) stopVoice0();
+  // 1 体以下なら「全員 / 待機」を選ぶ余地が無いので出さない (到達経路を増やさない)。
+  // 減ったときは宛先を 1 体へ戻す — 消えた宛先のまま送らせない
+  if (agents.length < 2 && bulkMode !== 'one') bulkMode = 'one';
+  if (agents.length >= 2) {
+    ['all', 'stalled'].forEach(m => {
+      const c = document.createElement('button');
+      c.className = 'chip' + (bulkMode === m ? ' act' : '');
+      c.textContent = bulkModeLabel(m) + ' ' + bulkCount(m);
+      c.onclick = () => { bulkMode = m; renderAgents(); };
+      el.appendChild(c);
+    });
+  }
   agents.forEach((a, i) => {
     const c = document.createElement('button');
-    c.className = 'chip' + (i === state.agent_active ? ' act' : '');
-    c.textContent = (a.running ? (a.attention ? '\u{1F514} ' : '● ') : '○ ') + a.icon + ' ' + a.title;
-    c.onclick = () => api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => {});
+    c.className = 'chip' + (bulkMode === 'one' && i === state.agent_active ? ' act' : '');
+    c.textContent = (a.running ? (a.attention ? '\u{1F514} ' : a.stalled ? '⏸ ' : '● ') : '○ ') + a.icon + ' ' + a.title;
+    // 1 体を選んだら宛先も 1 体へ戻す (全員宛てのまま個別チップを押して誤爆しない)
+    c.onclick = () => { bulkMode = 'one'; api('/api/cmd', {name:'agent_focus', arg:i}).then(pollState).catch(() => renderAgents()); };
     el.appendChild(c);
     const m = document.createElement('button');
     m.className = 'chip mic' + (i === voiceAgent ? ' rec' : '');
-    m.textContent = i === voiceAgent ? '⏹ 停止' : '\u{1F3A4}';
-    m.title = a.title + ' へ音声入力';
+    m.textContent = i === voiceAgent ? T('remote.stop', '⏹ 停止') : '\u{1F3A4}';
+    m.title = T('remote.mic_title', '{agent} へ音声入力').replace('{agent}', a.title);
     m.onclick = () => (i === voiceAgent ? stopVoice() : startVoice(i));
     el.appendChild(m);
   });
   const plus = document.createElement('button');
-  plus.className = 'chip'; plus.textContent = '＋ 起動';
+  plus.className = 'chip'; plus.textContent = T('remote.launch', '＋ 起動');
   plus.onclick = () => {
     const names = (state.presets || []).map((p, i) => i + ': ' + p.icon + ' ' + p.name).join('\n');
-    const v = prompt('起動するプリセット番号\n' + names, '0');
+    const v = prompt(T('remote.launch_prompt', '起動するプリセット番号') + '\n' + names, '0');
     if (v !== null) api('/api/cmd', {name:'agent_launch', arg:parseInt(v) || 0}).then(pollState).catch(() => {});
   };
   el.appendChild(plus);
+  renderBulk();
+}
+// ─── エージェントタブの中のビュー切替 ───────────────────────────
+// 下部ナビ (エディタ/ファイル/エージェント/コマンド) は増やさず、この中で切り替える。
+//   'term'   … 端末 (従来どおり)
+//   'wait'   … 人の手が要るもの (返事待ち・承認・停滞) だけを縦に並べる
+//   'deck'   … PC のデッキ相当。スマホなので 1 列固定 (横スクロールを作らない)
+//   'kanban' … PC の看板相当。レーンは横に並べず「見出し + カード」の縦積み
+// レーンの定義・状態ラベルは **PC 側 (kanban.rs) が決めたものをそのまま出す**。
+// スマホ側で画面文字から状態を決め直さない (設計原則 4)。
+let aview = 'term', alist = [], alanes = [], laneOpen = {};
+const AVIEWS = [
+  ['term', () => T('remote.view_term', '\u{1F5A5} 端末')],
+  ['wait', () => T('remote.view_wait', '⏳ 待ち')],
+  ['deck', () => T('remote.view_deck', '\u{1F0CF} デッキ')],
+  ['kanban', () => T('remote.view_kanban', '\u{1F4CB} 看板')],
+];
+// 待ち件数は **PC が数えた state.waiting** をそのまま出す。一覧を開いていない
+// 間も /api/state だけで最新になるので、バッジのために余分に叩かない。
+function waitCount() { return (state && state.waiting) || 0; }
+function renderSeg() {
+  const el = $('aseg');
+  el.innerHTML = '';
+  AVIEWS.forEach(([k, lab]) => {
+    const b = document.createElement('button');
+    if (aview === k) b.className = 'act';
+    b.appendChild(document.createTextNode(lab()));
+    const n = k === 'wait' ? waitCount() : 0;
+    if (n) {
+      const s = document.createElement('span');
+      s.className = 'badge'; s.textContent = n;
+      b.appendChild(s);
+    }
+    b.onclick = () => setAView(k);
+    el.appendChild(b);
+  });
+}
+function setAView(k) {
+  if (aview === k) return;
+  aview = k;
+  const term = k === 'term';
+  // 端末と一覧は同じ場所を使う。切り替えで**上下のバーは動かさない**ので、
+  // 画面が突然作り替わったようには見えない
+  $('scr').style.display = term ? '' : 'none';
+  $('keys').style.display = term ? '' : 'none';
+  $('alist').classList.toggle('show', !term);
+  renderSeg();
+  renderList();
+  pollTerm();   // 切り替えた瞬間に取りに行く (1 テンポ空白にしない)
+}
+function laneIcon(i) { const L = alanes.find(x => x.i === i); return L ? L.icon : ''; }
+// 空状態は利用可能領域の中央に 1 枚のカードで出す (CLAUDE.md の UI 原則)
+function emptyCard(k) {
+  const d = document.createElement('div');
+  d.className = 'mid-card';
+  const b = document.createElement('span');
+  b.className = 'big';
+  b.textContent = alist.length === 0 ? '\u{1F916}' : (k === 'wait' ? '✅' : '\u{1F4A4}');
+  d.appendChild(b);
+  const t = document.createElement('span');
+  t.textContent = alist.length === 0
+    ? T('remote.no_agents_hint', 'エージェントがいません — ＋ 起動 から始められます')
+    : (k === 'wait'
+      ? T('remote.wait_empty', '待っているエージェントはいません — 全員動いています')
+      : T('remote.list_empty', '表示できるエージェントがいません'));
+  d.appendChild(t);
+  return d;
+}
+function cardBtn(label, cls, fn) {
+  const b = document.createElement('button');
+  b.className = 'btn' + (cls ? ' ' + cls : '');
+  b.textContent = label;
+  b.onclick = e => { e.stopPropagation(); fn(); };
+  return b;
+}
+// 1 枚のカード: 名前 / 状態 / 直近出力の末尾 2 行 / 経過時間 + その場の操作。
+// 3 つのビュー (待ち・デッキ・看板) で同じカードを使う — 見た目を作り分けない。
+function agentCard(a) {
+  const c = document.createElement('div');
+  c.className = 'card' + (a.active ? ' act' : '');
+  const hd = document.createElement('div'); hd.className = 'hd';
+  const ic = document.createElement('span'); ic.textContent = a.icon; hd.appendChild(ic);
+  const nm = document.createElement('span'); nm.className = 'nm';
+  nm.textContent = (a.running ? (a.attention ? '\u{1F514} ' : a.unread ? '● ' : '') : '○ ') + a.title;
+  hd.appendChild(nm);
+  const st = document.createElement('span'); st.className = 'st';
+  st.textContent = laneIcon(a.lane) + ' ' + a.state + (a.running ? ' · ' + a.uptime : '');
+  hd.appendChild(st);
+  c.appendChild(hd);
+  if (a.preview) {
+    const p = document.createElement('pre'); p.className = 'pv'; p.textContent = a.preview;
+    c.appendChild(p);
+  }
+  const ax = document.createElement('div'); ax.className = 'ax';
+  // 承認は「人の手が要る」ときだけ出す (いつも並ぶ押せないボタンを作らない)
+  if (a.attention) ax.appendChild(cardBtn(T('remote.card_approve', '✅ 承認'), 'pri', () => agentAct(a, 'approve')));
+  if (a.running) ax.appendChild(cardBtn(T('remote.card_send', '✏ 指示'), '', () => openAgent(a, true)));
+  if (a.running) ax.appendChild(cardBtn(T('remote.card_stop', '⏹ 停止'), 'warn', () => agentAct(a, 'stop')));
+  if (ax.childNodes.length) c.appendChild(ax);
+  // タップ = そのエージェントへ入る
+  c.onclick = () => openAgent(a, false);
+  return c;
+}
+// カードをタップ = 選んで端末へ入る。[✏ 指示] は一覧に留まったまま宛先だけ移す
+// (「一覧で見つけて、その場で 1 行送る」を 1 タップで終わらせる)
+function openAgent(a, stay) {
+  bulkMode = 'one';
+  api('/api/cmd', {name:'agent_focus', arg:a.idx}).then(pollState).catch(() => renderAgents());
+  if (stay) { $('ti').focus(); } else { setAView('term'); }
+}
+// 行内の操作。承認キーは PC 側 (エージェントのカタログ) が知っているので、
+// スマホから当て推量の文字を送らない
+async function agentAct(a, act) {
+  try {
+    const r = await api('/api/agent_act', {id: a.id, act: act});
+    if (!r.ok) { toast(r.error || T('remote.bulk_failed', '送信できませんでした')); return; }
+    toast((act === 'approve'
+      ? T('remote.approved', '✅ {agent} を承認しました')
+      : T('remote.stopped_one', '⏹ {agent} を止めました')).replace('{agent}', a.title));
+    pollTerm();
+  } catch (e) {}
+}
+function renderList() {
+  if (aview === 'term') return;
+  const el = $('alist');
+  // 1.5 秒ごとに作り直すので、読んでいる位置を必ず戻す
+  // (戻さないと、スクロールした瞬間に毎回先頭へ跳ね上がる)
+  const keep = el.scrollTop;
+  el.innerHTML = '';
+  el.classList.remove('mid');
+  // 「待ち」は PC 側の判定 (remote::is_waiting_lane) で印が付いたものだけ
+  const rows = aview === 'wait' ? alist.filter(a => a.waiting) : alist;
+  if (!rows.length) { el.classList.add('mid'); el.appendChild(emptyCard(aview)); return; }
+  if (aview === 'kanban') renderKanban(el, rows);
+  else rows.forEach(a => el.appendChild(agentCard(a)));
+  el.scrollTop = keep;
+}
+// 看板: レーン見出し + その下にカードの縦積み。空のレーンは見出しごと出さない
+// (常に 0 と出る見出しを 8 本並べない)。見出しをタップで畳める。
+function renderKanban(el, rows) {
+  let shown = 0;
+  alanes.forEach(L => {
+    const mem = rows.filter(a => a.lane === L.i);
+    if (!mem.length) return;
+    shown += mem.length;
+    const open = laneOpen[L.i] !== false;
+    const box = document.createElement('div'); box.className = 'lane';
+    const hd = document.createElement('button'); hd.className = 'lhd';
+    const car = document.createElement('span'); car.textContent = open ? '▾' : '▸';
+    hd.appendChild(car);
+    const t = document.createElement('span'); t.textContent = L.icon + ' ' + L.title;
+    hd.appendChild(t);
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = mem.length;
+    hd.appendChild(n);
+    hd.onclick = () => { laneOpen[L.i] = !open; renderList(); };
+    box.appendChild(hd);
+    if (open) {
+      const body = document.createElement('div'); body.className = 'body';
+      mem.forEach(a => body.appendChild(agentCard(a)));
+      box.appendChild(body);
+    }
+    el.appendChild(box);
+  });
+  if (!shown) { el.classList.add('mid'); el.appendChild(emptyCard('kanban')); }
 }
 let termTimer = null;
+// ポーリングは**ビューが増えても 1 本のまま**。端末を見ているときは /api/term、
+// 一覧を見ているときは /api/agents を同じ間隔で叩く (合計回数は増えない)。
+// 見ていないビューのために PTY を読ませない。
 async function pollTerm() {
+  clearTimeout(termTimer);
   if (view !== 'agent') return;
   try {
-    const r = await api('/api/term');
-    const el = $('scr');
-    if (r.ok) {
-      const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
-      el.classList.remove('empty');
-      el.textContent = r.text;
-      if (stick) el.scrollTop = el.scrollHeight;
+    if (aview === 'term') {
+      const r = await api('/api/term');
+      const el = $('scr');
+      if (r.ok) {
+        const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+        el.classList.remove('empty');
+        el.textContent = r.text;
+        if (stick) el.scrollTop = el.scrollHeight;
+      } else {
+        el.classList.add('empty');
+        el.textContent = T('remote.no_agents_hint', 'エージェントがいません — ＋ 起動 から始められます');
+      }
     } else {
-      el.classList.add('empty');
-      el.textContent = 'エージェントがいません — ＋ 起動 から始められます';
+      const r = await api('/api/agents');
+      if (r.ok) { alist = r.agents || []; alanes = r.lanes || []; renderList(); }
     }
   } catch (e) {}
-  clearTimeout(termTimer);
   termTimer = setTimeout(pollTerm, 1500);
 }
 // 送信 = テキスト + Enter。入れる = テキストのみ (PC 側で内容を見て Enter)
+// 宛先は bulkMode が決める。1 体宛て / 全員 / 待機だけ のどれも同じ入口を通る
+// ので、「1 体には届くのに一括だけ挙動が違う」が起きない。
 async function sendInput(submit) {
   const v = $('ti').value.trim();
   if (!v) return;
-  if (voiceAgent >= 0) {
+  if (!bulkCount()) { toast(T('remote.bulk_none', '送れる宛先がいません')); return; }
+  if (bulkMode === 'one' && voiceAgent >= 0) {
     // 音声モード中は、選んだエージェントへ確実に届くようフォーカスし直す
     await api('/api/cmd', {name:'agent_focus', arg:voiceAgent}).catch(() => {});
   }
-  await api('/api/term', {text: v, raw: !submit}).catch(() => {});
+  let r = null;
+  try { r = await api('/api/bulk', {text: v, mode: bulkMode, submit: submit}); } catch (e) { return; }
+  if (!r.ok) { toast(r.error || T('remote.bulk_failed', '送信できませんでした')); return; }
   $('ti').value = ''; lastInterim = '';
-  toast(submit ? '送信しました' : 'PC の入力欄に入れました (Enter で送信)');
+  if (bulkMode === 'one') {
+    toast(submit
+      ? T('remote.sent', '送信しました')
+      : T('remote.put_done', 'PC の入力欄に入れました (Enter で送信)'));
+  } else {
+    toast((submit
+      ? T('remote.bulk_sent', '\u{1F4E3} {n} 体へ送信しました')
+      : T('remote.bulk_put', '\u{1F4E3} {n} 体の入力欄に入れました')).replace('{n}', r.sent));
+  }
 }
 $('tsend').onclick = () => sendInput(true);
 $('tput').onclick = () => sendInput(false);
@@ -1330,14 +1927,20 @@ $('ti').addEventListener('keydown', e => { if (e.key === 'Enter') sendInput(true
 
 // ─── コマンド ───
 const CMDS = [
-  ['\u{1F4BE} 保存', 'save'], ['\u{1F4C4} 新規ファイル', 'new'],
-  ['❌ タブを閉じる', 'close_tab'], ['\u{1F5A5} ターミナル', 'terminal'],
-  ['\u{1F4C1} サイドバー', 'sidebar'], ['\u{1F39b} Cockpit', 'cockpit'],
-  ['\u{1F50D} ズーム +', 'zoom_in'], ['\u{1F50D} ズーム −', 'zoom_out'],
-  ['\u{1F50D} ズーム 100%', 'zoom_reset'],
-  ['\u{1F332} ツリー更新', 'tree'], ['\u{1F6e1} 承認モード', 'approval_ask'],
-  ['⚡ 全自動モード', 'approval_auto'], ['\u{1F916} Agent優先モード', 'approval_agent'],
-  ['\u{1F6e1} 権限切替(全Agent)', 'permission_cycle'],
+  [T('remote.save', '\u{1F4BE} 保存'), 'save'],
+  [T('remote.cmd_new', '\u{1F4C4} 新規ファイル'), 'new'],
+  [T('remote.cmd_close_tab', '❌ タブを閉じる'), 'close_tab'],
+  [T('remote.cmd_terminal', '\u{1F5A5} ターミナル'), 'terminal'],
+  [T('remote.cmd_sidebar', '\u{1F4C1} サイドバー'), 'sidebar'],
+  [T('remote.cmd_cockpit', '\u{1F39b} Cockpit'), 'cockpit'],
+  [T('remote.cmd_zoom_in', '\u{1F50D} ズーム +'), 'zoom_in'],
+  [T('remote.cmd_zoom_out', '\u{1F50D} ズーム −'), 'zoom_out'],
+  [T('remote.cmd_zoom_reset', '\u{1F50D} ズーム 100%'), 'zoom_reset'],
+  [T('remote.cmd_tree', '\u{1F332} ツリー更新'), 'tree'],
+  [T('remote.cmd_approval_ask', '\u{1F6e1} 承認モード'), 'approval_ask'],
+  [T('remote.cmd_approval_auto', '⚡ 全自動モード'), 'approval_auto'],
+  [T('remote.cmd_approval_agent', '\u{1F916} Agent優先モード'), 'approval_agent'],
+  [T('remote.cmd_permission_cycle', '\u{1F6e1} 権限切替(全Agent)'), 'permission_cycle'],
 ];
 function renderCmds() {
   const el = $('cmds');
@@ -1347,12 +1950,16 @@ function renderCmds() {
     b.className = 'btn' + (name === 'approval_auto' ? ' warn' : '');
     b.textContent = label;
     b.onclick = () => api('/api/cmd', {name: name, arg: 0})
-      .then(r => toast(r.ok ? label + ' を実行' : (r.error || '失敗しました')))
+      .then(r => toast(r.ok
+        ? T('remote.cmd_done', '{label} を実行').replace('{label}', label)
+        : (r.error || T('remote.failed', '失敗しました'))))
       .catch(() => {});
     el.appendChild(b);
   });
 }
 
+applyI18n();
+renderSeg();
 pollState();
 setInterval(pollState, 2500);
 </script>
@@ -1372,7 +1979,8 @@ const VOICE_PAGE: &str = r##"<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0d1117">
-<title>Zaivern 音声入力</title>
+<title data-i18n="remote.voice_page_title">Zaivern 音声入力</title>
+<script>/*__ZV_I18N__*/</script>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
@@ -1427,21 +2035,23 @@ const VOICE_PAGE: &str = r##"<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <span class="logo">&#9889; ZAIVERN &#127908; 音声入力</span>
+  <span class="logo">&#9889; ZAIVERN &#127908; <span data-i18n="remote.voice_header">音声入力</span></span>
   <span id="dot"></span>
 </header>
 <main>
-  <h2>送信先 (クリックで切替 — 話している途中でも変更できます)</h2>
+  <h2 data-i18n="remote.voice_target_heading">送信先 (クリックで切替 — 話している途中でも変更できます)</h2>
   <div class="chips" id="targets"></div>
   <button id="mic">&#127908;</button>
-  <div id="hint">マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります</div>
+  <div id="hint" data-i18n="remote.voice_hint">マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります</div>
   <div id="interim"></div>
-  <textarea id="draft" placeholder="話した内容がここに溜まります。直してから送信できます。"></textarea>
+  <textarea id="draft" data-i18n-ph="remote.voice_draft_placeholder"
+    placeholder="話した内容がここに溜まります。直してから送信できます。"></textarea>
   <div class="row">
-    <button class="btn" id="clear">&#128465; 消す</button>
+    <button class="btn" id="clear" data-i18n="remote.voice_clear">&#128465; 消す</button>
     <span class="grow"></span>
-    <button class="btn" id="put" title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入力欄へ入れる</button>
-    <button class="btn pri" id="send">&#9654; 送信 (Enter まで送る)</button>
+    <button class="btn" id="put" data-i18n="remote.voice_put" data-i18n-title="remote.put_title"
+      title="Enter を送らずに入力欄へ入れるだけ">&#10549; 入力欄へ入れる</button>
+    <button class="btn pri" id="send" data-i18n="remote.voice_send">&#9654; 送信 (Enter まで送る)</button>
   </div>
   <div id="log"></div>
 </main>
@@ -1453,7 +2063,31 @@ let target = qs.get('target') || 'all';  // 'all' またはセッション id
 // voiceFatal = 復帰不能なエラーで止めた印。立っている間は onend で再開しない
 let agents = [], active = false, recog = null, voiceFatal = false;
 const $ = id => document.getElementById(id);
-const HINT0 = 'マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります';
+// ─── 多言語 (Language Pack) ───
+// 文言はサーバが <head> の window.ZVI18N へ 1 回だけ注入する。
+// 第 2 引数 d は日本語の原文フォールバック — 辞書が届かなくても画面は壊れない。
+const T = (k, d) => (window.ZVI18N && window.ZVI18N[k]) || d;
+// 静的な文言は HTML 側に data-i18n 属性で宣言しておき、起動時に一括で差し込む。
+// 差し込み先は属性ごとに分ける (本文 / placeholder / title)。
+// 訳が無いときは HTML に書いてある原文をそのまま残す (上書きしない)。
+function applyI18n() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const v = T(el.dataset.i18n, ''); if (v) el.textContent = v;
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+    const v = T(el.dataset.i18nPh, ''); if (v) el.placeholder = v;
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const v = T(el.dataset.i18nTitle, ''); if (v) el.title = v;
+  });
+}
+// 音声認識の言語は画面の言語に合わせる (英語 UI なのに日本語を聞き取ろうとしない)。
+// ja だけは地域つきの ja-JP が明確に良いので特別扱いする。
+function speechLang() {
+  const l = document.documentElement.lang || 'ja';
+  return l === 'ja' ? 'ja-JP' : l;
+}
+const HINT0 = T('remote.voice_hint', 'マイクボタンを押して話しかけてください — 内容を確認してからボタンで送ります');
 
 async function api(path, body) {
   const opt = body
@@ -1468,7 +2102,7 @@ function renderTargets() {
   el.innerHTML = '';
   const all = document.createElement('button');
   all.className = 'chip' + (target === 'all' ? ' act' : '');
-  all.textContent = '\u{1F4E3} 全エージェントへブロードキャスト';
+  all.textContent = T('remote.voice_broadcast', '\u{1F4E3} 全エージェントへブロードキャスト');
   all.onclick = () => { target = 'all'; renderTargets(); };
   el.appendChild(all);
   agents.forEach(a => {
@@ -1490,7 +2124,7 @@ async function poll() {
   } catch (e) { $('dot').classList.remove('on'); }
 }
 function targetName() {
-  if (target === 'all') return '\u{1F4E3} 全エージェント';
+  if (target === 'all') return T('remote.voice_all_agents', '\u{1F4E3} 全エージェント');
   const a = agents.find(x => String(x.id) === String(target));
   return a ? a.icon + ' ' + a.title : '?';
 }
@@ -1510,12 +2144,16 @@ async function send(submit) {
   try {
     const r = await api('/api/voice', {text: text, id: id, submit: submit});
     if (r.ok) {
-      addLog((submit ? '▶ 送信 ' : '⤵ 入力欄へ ') + name + ' ← ' + text);
+      addLog(T(submit ? 'remote.voice_log_sent' : 'remote.voice_log_put',
+        submit ? '▶ 送信 {target} ← {text}' : '⤵ 入力欄へ {target} ← {text}')
+        .replace('{target}', name).replace('{text}', text));
       $('draft').value = '';
     } else {
-      addLog('⚠ ' + (r.error || '失敗') + ': ' + text);
+      addLog('⚠ ' + (r.error || T('remote.voice_log_failed', '失敗')) + ': ' + text);
     }
-  } catch (e) { addLog('⚠ 送信に失敗しました: ' + text); }
+  } catch (e) {
+    addLog(T('remote.voice_send_failed', '⚠ 送信に失敗しました: {text}').replace('{text}', text));
+  }
 }
 $('send').onclick = () => send(true);
 $('put').onclick = () => send(false);
@@ -1538,13 +2176,14 @@ function dictationHint(reason) {
   // /voice の API はトークンを要るので、いま持っているものを付けて渡す
   const p = location.port || '8899';
   const u = 'http://127.0.0.1:' + p + '/voice' + (TOK ? '?t=' + encodeURIComponent(TOK) : '');
-  const how = 'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
-    + 'PC からは ' + u + ' で連続認識が使えます。';
+  const how = T('remote.dictation_how',
+    'キーボードの \u{1F3A4} を押して、入力欄に話しかけてください（送信は手動 Enter）。'
+    + 'PC からは {url} で連続認識が使えます。').replace('{url}', u);
   const why = reason === 'unsupported'
-    ? 'このブラウザは音声認識 (Web Speech API) に未対応です。'
+    ? T('remote.speech_unsupported', 'このブラウザは音声認識 (Web Speech API) に未対応です。')
     : reason === 'network'
-    ? '音声認識サーバーに接続できませんでした（http 接続では利用できません）。'
-    : 'この接続 (http) ではブラウザの音声認識が使えません。';
+    ? T('remote.speech_network', '音声認識サーバーに接続できませんでした（http 接続では利用できません）。')
+    : T('remote.speech_insecure', 'この接続 (http) ではブラウザの音声認識が使えません。');
   return why + how;
 }
 // 認識が使えないときの代替: 下書き欄へフォーカスしてキーボード音声入力へ誘導する。
@@ -1553,7 +2192,7 @@ function keyboardDictation(reason) {
   const d = $('draft');
   d.focus();
   try { d.setSelectionRange(d.value.length, d.value.length); } catch (e) {}
-  d.placeholder = '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動';
+  d.placeholder = T('remote.dictation_placeholder', '\u{1F3A4} キーボードの音声入力で話しかけてください — 送信は手動');
   $('hint').textContent = dictationHint(reason);
 }
 // 復帰不能なエラー。再開させずに止め、理由を残す
@@ -1569,7 +2208,7 @@ function stopVoice() {
   $('mic').classList.remove('rec');
   $('hint').textContent = HINT0;
   $('interim').textContent = '';
-  $('draft').placeholder = '話した内容がここに溜まります。直してから送信できます。';
+  $('draft').placeholder = T('remote.voice_draft_placeholder', '話した内容がここに溜まります。直してから送信できます。');
 }
 function startVoice() {
   // 使えない環境では死んだエラーを出さず、キーボード音声入力へ逃がす
@@ -1579,7 +2218,7 @@ function startVoice() {
   voiceFatal = false;
   const r = new C();
   recog = r; active = true;
-  r.lang = 'ja-JP';
+  r.lang = speechLang();
   r.continuous = true;
   r.interimResults = true;
   r.onresult = ev => {
@@ -1601,14 +2240,14 @@ function startVoice() {
     const e = ev.error;
     if (e === 'no-speech') return;             // 無音だけ: onend の自動再開に任せる
     if (e === 'not-allowed' || e === 'service-not-allowed') {
-      fatalVoiceStop('マイクが許可されていません — アドレスバーのマイク設定を確認してください');
+      fatalVoiceStop(T('remote.voice_mic_not_allowed', 'マイクが許可されていません — アドレスバーのマイク設定を確認してください'));
     } else if (e === 'network') {
       // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
       voiceFatal = true;
       stopVoice();
       keyboardDictation('network');
     } else if (e === 'audio-capture') {
-      fatalVoiceStop('マイクが見つかりません');
+      fatalVoiceStop(T('remote.mic_not_found', 'マイクが見つかりません'));
     } else if (e === 'aborted') {
       stopVoice();                             // 明示停止・画面遷移。黙って終わる
     }
@@ -1619,11 +2258,12 @@ function startVoice() {
     if (voiceFatal) return;
     if (recog === r && active) { try { r.start(); } catch (e) { stopVoice(); } }
   };
-  try { r.start(); } catch (e) { $('hint').textContent = '音声認識を開始できません'; stopVoice(); return; }
+  try { r.start(); } catch (e) { $('hint').textContent = T('remote.voice_recog_start_failed', '音声認識を開始できません'); stopVoice(); return; }
   $('mic').classList.add('rec');
-  $('hint').textContent = '\u{1F3A4} 認識中 — もう一度押すと停止します';
+  $('hint').textContent = T('remote.voice_listening', '\u{1F3A4} 認識中 — もう一度押すと停止します');
 }
 $('mic').onclick = () => (active ? stopVoice() : startVoice());
+applyI18n();
 poll();
 setInterval(poll, 2500);
 </script>
@@ -1943,6 +2583,163 @@ mod tests {
         assert_eq!(find_subslice(b"abc", b"\r\n\r\n"), None);
     }
 
+    /// 一括操作の宛先を表で固定する。
+    ///
+    /// 送信・停止・件数表示の 3 つがこの 1 本を通るので、ここがずれると
+    /// 「3 体と出ているのに 5 体へ飛んだ」になる。
+    #[test]
+    fn 一括操作の宛先はモードで決まる() {
+        let pick = |id, running, stalled, active| AgentPick {
+            id,
+            running,
+            stalled,
+            active,
+        };
+        // 1: 動いていて止まっている / 2: 動いていて働いている (選択中)
+        // 3: 終了済み (止まっている扱いでも宛先にしない)
+        let all = [
+            pick(1, true, true, false),
+            pick(2, true, false, true),
+            pick(3, false, true, false),
+        ];
+        let table: &[(BulkMode, &[u64])] = &[
+            (BulkMode::All, &[1, 2]),
+            (BulkMode::Stalled, &[1]),
+            (BulkMode::One, &[2]),
+        ];
+        for (mode, want) in table {
+            assert_eq!(
+                bulk_targets(*mode, &all),
+                want.to_vec(),
+                "mode={}",
+                mode.as_str()
+            );
+        }
+        // 終了済みしか居なければ、どのモードでも宛先はゼロ
+        let dead = [pick(3, false, true, true)];
+        for mode in [BulkMode::All, BulkMode::Stalled, BulkMode::One] {
+            assert!(
+                bulk_targets(mode, &dead).is_empty(),
+                "終了済みを宛先に数えている: {}",
+                mode.as_str()
+            );
+        }
+        // 誰も居なければ空 (0 体表示 → 送信ボタンを塞ぐ側の入力になる)
+        assert!(bulk_targets(BulkMode::All, &[]).is_empty());
+    }
+
+    /// 知らない宛先の語は**送らずに断る**。既定で「全員」へ落とすと、
+    /// 綴りを 1 文字間違えただけで全エージェントへ誤爆する。
+    #[test]
+    fn 知らない宛先モードは受け付けない() {
+        assert_eq!(BulkMode::parse("all"), Some(BulkMode::All));
+        assert_eq!(BulkMode::parse("stalled"), Some(BulkMode::Stalled));
+        assert_eq!(BulkMode::parse("one"), Some(BulkMode::One));
+        for bad in ["", "ALL", "everyone", "全員", "al", "broadcast"] {
+            assert_eq!(BulkMode::parse(bad), None, "{bad} を受けてしまった");
+        }
+        // as_str → parse は往復する (ページと API が同じ語を使う保証)
+        for m in [BulkMode::All, BulkMode::Stalled, BulkMode::One] {
+            assert_eq!(BulkMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    /// 「待ち」一覧に載せるレーンを表で固定する。
+    ///
+    /// バッジ (`/api/state` の waiting) と一覧 (`/api/agents` の waiting) が
+    /// この 1 本を共有するので、ここがずれると「バッジ 3 なのに一覧は 5 件」になる。
+    #[test]
+    fn 待ち一覧に載せるレーンを表で固定する() {
+        use crate::kanban::Column;
+        let table: &[(Column, bool)] = &[
+            // 人の手が要る 2 本 + 指示待ちの 1 本だけ
+            (Column::Ready, true),
+            (Column::Approval, true),
+            (Column::Trouble, true),
+            // 動いているものは載せない (見ても何もすることが無い)
+            (Column::Thinking, false),
+            (Column::Editing, false),
+            (Column::Running, false),
+            (Column::Verifying, false),
+            (Column::Done, false),
+        ];
+        for (col, want) in table {
+            assert_eq!(is_waiting_lane(*col), *want, "{:?}", col);
+        }
+        // 表が 8 本すべてを覆っていること (レーンが増えたら気付く)
+        assert_eq!(table.len(), crate::kanban::LANES);
+    }
+
+    /// 行の操作は知らない語を実行しない (押していない承認を飛ばさない)。
+    #[test]
+    fn 知らない行操作は受け付けない() {
+        assert_eq!(AgentAct::parse("approve"), Some(AgentAct::Approve));
+        assert_eq!(AgentAct::parse("stop"), Some(AgentAct::Stop));
+        for bad in ["", "Approve", "yes", "kill", "承認"] {
+            assert_eq!(AgentAct::parse(bad), None, "{bad} を受けてしまった");
+        }
+    }
+
+    /// スマホから「待ち一覧 / デッキ / 看板」へ届くこと。
+    ///
+    /// UI から到達できない実装は未完成なので、入口 (セグメント) と
+    /// 取得先 (API) の両方が埋め込みページに居ることを固定する。
+    #[test]
+    fn page_contains_agent_views() {
+        assert!(PAGE.contains("/api/agents"), "一覧の取得先が無い");
+        assert!(PAGE.contains("/api/agent_act"), "行内の操作が無い");
+        assert!(PAGE.contains("id=\"aseg\""), "ビュー切替が無い");
+        assert!(PAGE.contains("id=\"alist\""), "一覧の入れ物が無い");
+        for v in ["'term'", "'wait'", "'deck'", "'kanban'"] {
+            assert!(PAGE.contains(v), "ビュー {v} が無い");
+        }
+        // 下部ナビは増やさない (エディタ/ファイル/エージェント/コマンドの 4 つのまま)
+        assert_eq!(
+            PAGE.matches("data-v=\"").count(),
+            4,
+            "下部ナビのタブが増えている"
+        );
+        // 看板のレーンはサーバ (kanban.rs) から来たものを出す。
+        // スマホ側でレーン名やしきい値を作り直していないこと
+        assert!(
+            PAGE.contains("alanes.forEach"),
+            "レーンをサーバから出していない"
+        );
+        for ng in ["承認待ち", "停滞・異常", "思考中", "検証中"] {
+            assert!(
+                !PAGE.contains(ng),
+                "レーン名 {ng} をページ側で作り直している"
+            );
+        }
+        // 空状態は利用可能領域の中央に 1 枚のカードで出す
+        assert!(PAGE.contains("mid-card"));
+        assert!(PAGE.contains("classList.add('mid')"));
+        // 一覧を見ている間は /api/term を叩かない (ポーリングを増やさない)
+        assert!(PAGE.contains("if (aview === 'term') {"));
+    }
+
+    /// スマホから一括操作へ届けること。**件数を見せずに送らせない**。
+    #[test]
+    fn page_contains_bulk_actions() {
+        assert!(PAGE.contains("/api/bulk"), "一括送信の入口が無い");
+        assert!(PAGE.contains("/api/bulk_stop"), "一括停止の入口が無い");
+        // 「全員 / 待機 / 選択中」の 3 粒度
+        for m in ["'all'", "'stalled'", "'one'"] {
+            assert!(PAGE.contains(m), "宛先モード {m} が無い");
+        }
+        // 既定はいちばん狭い宛先 (開いた瞬間に全員宛てだと誤爆する)
+        assert!(
+            PAGE.contains("let bulkMode = 'one';"),
+            "既定が 1 体宛てでない"
+        );
+        // 送信前に件数を見せ、0 体なら押せないこと
+        assert!(PAGE.contains("bulkCount()"));
+        assert!(PAGE.contains("$('tsend').disabled = n === 0;"));
+        assert!(PAGE.contains("$('tput').disabled = n === 0;"));
+        // 件数は PC が数えた値をそのまま出す (スマホ側で数え直さない)
+        assert!(PAGE.contains("state.bulk"), "件数を PC 側から取っていない");
+    }
+
     #[test]
     fn page_contains_required_parts() {
         // 埋め込みページが最低限の構造を持つこと (生文字列の破損検知)
@@ -2060,6 +2857,190 @@ mod tests {
         }
     }
 
+    // ─── 多言語化 (Language Pack) ───────────────────────────────────
+
+    /// 属性値 (`data-i18n="…"`) を全部集める。**正規表現は使わない**
+    /// (この 1 個のために依存を増やさない・見て分かる形にする)。
+    fn attr_values<'a>(src: &'a str, needle: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(needle) {
+            let after = &rest[i + needle.len()..];
+            match after.find('"') {
+                Some(e) => out.push(&after[..e]),
+                None => break,
+            }
+            rest = after;
+        }
+        out
+    }
+
+    /// `T('…'` の第 1 引数を集める。直前が識別子の一部なら別物 (`setTimeout(` 等)
+    /// なので飛ばす。
+    fn t_call_keys(src: &str) -> Vec<&str> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(p) = src[i..].find("T('") {
+            let at = i + p;
+            let prev = if at == 0 { b' ' } else { b[at - 1] };
+            let part_of_ident =
+                prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' || prev == b'.';
+            if !part_of_ident {
+                if let Some(e) = src[at + 3..].find('\'') {
+                    out.push(&src[at + 3..at + 3 + e]);
+                }
+            }
+            i = at + 3;
+        }
+        out
+    }
+
+    /// 画面に出す文言の ID は必ず `remote.` 接頭辞を持つ。
+    /// (`i18n::export_prefix("remote.")` で書き出す辞書に入らない ID を
+    /// 書いてしまうと、その文言だけ**永久に翻訳されない**まま静かに残る)
+    #[test]
+    fn 画面文言のidはremoteで始まる() {
+        for p in [PAGE, VOICE_PAGE] {
+            let mut ids: Vec<&str> = Vec::new();
+            for n in ["data-i18n=\"", "data-i18n-ph=\"", "data-i18n-title=\""] {
+                ids.extend(attr_values(p, n));
+            }
+            assert!(!ids.is_empty(), "data-i18n が 1 つも無い");
+            for id in &ids {
+                assert!(id.starts_with("remote."), "接頭辞が違う: {id}");
+            }
+            let keys = t_call_keys(p);
+            assert!(
+                keys.len() >= 10,
+                "T() の呼び出しが少なすぎる: {}",
+                keys.len()
+            );
+            for k in &keys {
+                assert!(k.starts_with("remote."), "接頭辞が違う: {k}");
+            }
+        }
+    }
+
+    /// フォールバック (第 2 引数) を書き忘れると、辞書が届かない言語で
+    /// **空文字のボタン**が出る。全ての `T(` が 2 引数であることまでは
+    /// 構文解析なしに見られないので、少なくとも空の既定値が無いことを見る。
+    #[test]
+    fn t呼び出しに空のフォールバックが無い() {
+        for p in [PAGE, VOICE_PAGE] {
+            assert!(!p.contains("', '')"), "フォールバックが空の T( がある");
+        }
+    }
+
+    #[test]
+    fn localize_pageは言語idをlang属性へ入れる() {
+        let out = localize_page(PAGE, "{}", "zh-CN");
+        assert!(out.contains("<html lang=\"zh-CN\">"));
+        assert!(!out.contains("<html lang=\"ja\">"));
+        // 言語 ID は利用者の locales 由来。属性を抜け出せないこと
+        let bad = localize_page(PAGE, "{}", "ja\"><script>x()</script>");
+        assert!(bad.contains("<html lang=\"jascriptxscript\">"));
+        assert!(!bad.contains("<script>x()"));
+        // 空 (あり得ないが) でも属性は壊れない
+        assert!(localize_page(PAGE, "{}", "").contains("<html lang=\"ja\">"));
+    }
+
+    #[test]
+    fn localize_pageは辞書を注入する() {
+        // 差し込み口はページごとにちょうど 1 つ
+        assert_eq!(PAGE.matches(I18N_SLOT).count(), 1);
+        assert_eq!(VOICE_PAGE.matches(I18N_SLOT).count(), 1);
+        let out = localize_page(PAGE, r#"{"remote.save":"Save"}"#, "en");
+        assert!(out.contains(r#"window.ZVI18N = {"remote.save":"Save"};"#));
+        assert!(!out.contains(I18N_SLOT), "差し込み口が残っている");
+        // JS 側の取り出し口も残っていること
+        assert!(out.contains("window.ZVI18N && window.ZVI18N[k]"));
+    }
+
+    /// 訳文に `</script>` が入っていても、そこでスクリプトが終わらないこと。
+    /// ブラウザは**文字列の途中でも** `</script>` を終端として扱うので、
+    /// エスケープを外すと任意のタグを注入できてしまう。
+    #[test]
+    fn 辞書のscript終端はページを壊さない() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "remote.save".to_string(),
+            "</script><img src=x onerror=alert(1)>".to_string(),
+        );
+        let json = serde_json::to_string(&m).unwrap();
+        let out = localize_page(PAGE, &json, "en");
+        assert!(!out.contains("</script><img"), "script を閉じられている");
+        assert!(out.contains("\\u003c/script>"), "< が退避されていない");
+        // <script> の数が増減していない = 構造が保たれている
+        assert_eq!(
+            out.matches("</script>").count(),
+            PAGE.matches("</script>").count()
+        );
+    }
+
+    #[test]
+    fn 壊れた辞書は空オブジェクトになる() {
+        // JSON でない・オブジェクトでない入力で JS 構文まで壊さない
+        for bad in ["", "not json", "[1,2]", "\"str\"", "null", "{"] {
+            let out = localize_page(PAGE, bad, "ja");
+            assert!(out.contains("window.ZVI18N = {};"), "入力={bad:?}");
+        }
+    }
+
+    /// 実際に配る経路 (i18n の辞書 → JSON → 差し込み) が繋がっていること。
+    /// HTTP は触らないので、サーバを起こさずに確かめられる。
+    #[test]
+    fn 同梱の全言語でスマホ画面の文言が入る() {
+        // 「PC で言語を変えたらスマホもその言語になる」の**中身**を見る。
+        // 仕組み (差し込み口があること) だけでなく、**同梱 6 言語ぶんの実際の
+        // 訳がページへ入ること**まで固定する。グローバル状態は触らない
+        // (並列に走る他のテストの tr() を揺らさないため、辞書は直に読む)。
+        for (id, _, _) in crate::locale::BUILTIN {
+            let mut errs = Vec::new();
+            let map = crate::locale::resolved(id, &[], &mut errs);
+            assert!(errs.is_empty(), "{id}: {errs:?}");
+            let dict: std::collections::BTreeMap<&String, &String> = map
+                .iter()
+                .filter(|(k, _)| k.starts_with("remote."))
+                .collect();
+            assert!(
+                dict.len() >= 50,
+                "{id}: remote.* が {} 件しかない",
+                dict.len()
+            );
+            let json = serde_json::to_string(&dict).expect("json");
+            let out = localize_page(PAGE, &json, id);
+
+            assert!(
+                out.contains(&format!("<html lang=\"{id}\">")),
+                "{id}: lang 属性"
+            );
+            // 代表的な 3 つの文言が、その言語の綴りで入っていること
+            for key in ["remote.save", "remote.tab_agent", "remote.send"] {
+                let Some(want) = map.get(key) else {
+                    panic!("{id}: {key} が辞書に無い");
+                };
+                let esc = serde_json::to_string(want).expect("json");
+                let esc = esc.trim_matches('"');
+                assert!(
+                    out.contains(esc),
+                    "{id}: {key} の訳 {want:?} がページに入っていない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 配信するページには辞書と言語が入っている() {
+        for p in [PAGE, VOICE_PAGE] {
+            let out = page_for_client(p);
+            assert!(out.contains("window.ZVI18N = {"));
+            assert!(!out.contains(I18N_SLOT));
+            assert!(out.contains("<html lang=\""));
+            assert!(out.contains("</html>"));
+        }
+    }
+
     // ─── Query の純粋ロジック ────────────────────────────────────────
 
     /// 全 variant を代表値で 1 つずつ構築する (網羅テスト用)。
@@ -2095,6 +3076,19 @@ mod tests {
                 id: -1,
                 submit: false,
             },
+            Query::Agents,
+            Query::AgentAct {
+                id: 7,
+                act: AgentAct::Approve,
+            },
+            Query::Bulk {
+                text: "まとめて".into(),
+                mode: BulkMode::All,
+                submit: true,
+            },
+            Query::BulkStop {
+                mode: BulkMode::Stalled,
+            },
         ]
     }
 
@@ -2111,7 +3105,14 @@ mod tests {
                 | Query::SetText { .. }
                 | Query::Tab(..)
                 | Query::Term
-                | Query::VoiceSend { .. } => false,
+                | Query::Agents
+                | Query::VoiceSend { .. }
+                // 一括操作は**何体へ届いたか**を返して誤爆を見せるので待つ
+                | Query::Bulk { .. }
+                | Query::BulkStop { .. }
+                // 承認は「効いたか」が返らないと、押したのに止まったままか
+                // 分からない (press_pet_approve_button は失敗しうる)
+                | Query::AgentAct { .. } => false,
                 // 一方向の指示はキューに積んだ時点で成功 (macOS 凍結対策)
                 Query::Notify(..)
                 | Query::SetPanel { .. }

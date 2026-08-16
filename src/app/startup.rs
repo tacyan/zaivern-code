@@ -562,24 +562,34 @@ impl ZaivernApp {
         self.plugins.apply_disabled(&self.cfg.plugins.disabled);
         self.plugins.apply_all_settings(&self.cfg.plugins.settings);
 
-        // UI 言語: 有効な言語プラグインの辞書を i18n へ入れる。無ければ None で
-        // 日本語へ戻す。複数あれば名前順の先頭 (scan_installed が名前順)。
+        // UI 言語 (旧形式): 有効な言語プラグインの TOML 辞書を i18n へ入れる。
+        // 無ければ None。複数あれば名前順の先頭 (scan_installed が名前順)。
+        // **Language Pack (locales/*.json) が訳を持つ文字列はそちらが勝つ** ので、
+        // これは「同梱に無い訳を足す」後方互換の層として残っている。
         // 読めない辞書は黙って捨てず、理由をトーストで見せる。
         let mut dict: Option<HashMap<String, String>> = None;
         let mut lang_err: Option<String> = None;
         for p in self.plugins.iter().filter(|p| p.active()) {
-            if let Some(lang) = &p.language {
-                match i18n::load_dict(&lang.dict) {
-                    Ok(d) => dict = Some(d),
-                    Err(e) => lang_err = Some(format!("{}: {e}", p.name)),
-                }
-                break;
+            let Some(lang) = &p.language else { continue };
+            let Some(path) = &lang.dict else { continue };
+            match i18n::load_dict(path) {
+                Ok(d) => dict = Some(d),
+                Err(e) => lang_err = Some(format!("{}: {e}", p.name)),
             }
+            break;
         }
         i18n::set_dict(dict);
         if let Some(e) = lang_err {
             self.toast(trf("⚠ UI 言語辞書を読めません — {e}", &[("e", e)]), false);
         }
+
+        // Language Pack。プラグインが `locales` を増やしていることがあるので、
+        // プラグインを組み直したあとで必ず引き直す。
+        // **有効な言語プラグインがあれば、それが選択そのもの** (プラグイン画面の
+        // 有効/無効と 🌐 の選択が食い違わないよう、`ui_language` へ写して
+        // 真実の在り処を 1 つに保つ)。
+        self.adopt_language_plugin_choice();
+        self.apply_ui_language();
 
         // 閉じたプラグインのパネル内容は残さない
         self.plugin_panels.retain(|(pl, id), _| {
@@ -667,6 +677,271 @@ impl ZaivernApp {
     }
 
     /// アクティブバッファでいま選択されているテキスト (無選択なら None)。
+    /// 同梱している言語プラグインの名前と言語 ID (`("korean-mode", "ko")` …)。
+    ///
+    /// **インストール済みのものだけ**を見る。名前を決め打ちしないので、
+    /// あとから言語プラグインが増えても、ここを触らずに追随する。
+    pub(super) fn language_plugins(&self) -> Vec<(String, String)> {
+        self.plugins
+            .iter()
+            .filter_map(|p| p.language.as_ref().map(|l| (p.name.clone(), l.id.clone())))
+            .collect()
+    }
+
+    /// プラグイン画面での有効/無効を `cfg.ui_language` へ写す。
+    ///
+    /// * 有効な言語プラグインがある → その言語を選んだことにする
+    /// * 1 つも無く、いま選んでいる言語の**プラグインが入っている** (= 人が
+    ///   無効にした) → 「自動」へ戻す
+    ///
+    /// 選んでいる言語にプラグインが存在しないとき (`~/.zaivern/locales/fr.json`
+    /// のようなコミュニティ言語) は**触らない**。プラグインが無いことを
+    /// 「無効にした」と読み違えると、選んだ言語が毎回勝手に戻ってしまう。
+    fn adopt_language_plugin_choice(&mut self) {
+        let installed = self.language_plugins();
+        let active: Option<String> = self
+            .plugins
+            .iter()
+            .filter(|p| p.active())
+            .find_map(|p| p.language.as_ref().map(|l| l.id.clone()));
+        // 手で config.toml を書くなどして**複数の言語パックが有効**になっている
+        // ことがある。先頭以外を無効へ倒して「同時に 1 つだけ」を回復する
+        // (放っておくと、画面では 2 つ有効なのに効いているのは片方、になる)。
+        if let Some(first) = active.clone() {
+            let mut fixed = false;
+            let mut seen = false;
+            for (name, lang) in &installed {
+                if !self.cfg.plugins.is_enabled(name) {
+                    continue;
+                }
+                if *lang == first && !seen {
+                    seen = true;
+                    continue;
+                }
+                self.cfg.plugins.set_enabled(name, false);
+                self.cfg.global_plugins.set_enabled(name, false);
+                fixed = true;
+            }
+            if fixed {
+                let _ = config::save_plugins_section(&self.cfg);
+                crate::plugins::PluginList::apply_disabled(
+                    self.plugins.as_mut_slice(),
+                    &self.cfg.plugins.disabled,
+                );
+            }
+        }
+        // **有効なものが無いときは何もしない。**
+        // 「無効にしたら自動へ戻す」は plugin パネルの切り替え側
+        // (`set_ui_language(auto)`) が既にやっている。ここでも同じ判断をすると、
+        // `zai lang set ko` のように**プラグインを使わずに言語を選んだ**設定を
+        // 起動のたびに `auto` へ書き戻してしまう (CLI で選べなくなる)。
+        let Some(want) = active else { return };
+        if self.cfg.ui_language == want {
+            return;
+        }
+        self.cfg.ui_language = want.clone();
+        let mut v = std::collections::BTreeMap::new();
+        v.insert(
+            "ui_language".to_string(),
+            config::SettingValue::Text(want).to_toml(),
+        );
+        if let Err(e) = config::save_settings(&v) {
+            self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false);
+        }
+    }
+
+    /// `~/.zaivern/locales` を作って開く (翻訳を始める人の入口)。
+    pub(crate) fn open_locales_dir(&mut self) {
+        let dir = config::zaivern_dir().join("locales");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast(
+                trf("置き場を作れません: {e}", &[("e", e.to_string())]),
+                false,
+            );
+            return;
+        }
+        self.open_path(&dir);
+        self.toast(
+            trf(
+                "🌐 {path} を開きました — ここに <言語ID>.json を置くと 🌐 の一覧に並びます",
+                &[("path", dir.display().to_string())],
+            ),
+            true,
+        );
+    }
+
+    /// いまの言語の**翻訳の雛形**を `~/.zaivern/locales/<id>.json` へ書き出して開く。
+    ///
+    /// 中身は「同梱 `en` の全キー」に、その言語の既訳が入っていれば入った状態。
+    /// **上書きはしない** — 既にあるファイルを消してしまうと、途中まで訳した
+    /// ものが黙って消える。既にあるときはそれをそのまま開く。
+    pub(crate) fn export_locale_template(&mut self) {
+        let id = i18n::current();
+        let dir = config::zaivern_dir().join("locales");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast(
+                trf("置き場を作れません: {e}", &[("e", e.to_string())]),
+                false,
+            );
+            return;
+        }
+        let path = dir.join(format!("{id}.json"));
+        if path.is_file() {
+            self.open_path(&path);
+            self.toast(
+                trf(
+                    "🌐 すでにあります: {path} (上書きしていません)",
+                    &[("path", path.display().to_string())],
+                ),
+                true,
+            );
+            return;
+        }
+        let mut errs = Vec::new();
+        let map = locale::resolved(&id, &self.plugin_locale_dirs(), &mut errs);
+        // BTreeMap にしてから書く — **ID 順に並んでいないと差分が読めない**
+        let sorted: std::collections::BTreeMap<&String, &String> = map.iter().collect();
+        let body = match serde_json::to_string_pretty(&sorted) {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast(trf("書き出しに失敗: {e}", &[("e", e.to_string())]), false);
+                return;
+            }
+        };
+        match std::fs::write(&path, body + "\n") {
+            Ok(()) => {
+                self.open_path(&path);
+                self.toast(
+                    trf(
+                        "🌐 雛形を書き出しました: {path} ({n} 件)",
+                        &[
+                            ("path", path.display().to_string()),
+                            ("n", map.len().to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+            Err(e) => self.toast(trf("書き出しに失敗: {e}", &[("e", e.to_string())]), false),
+        }
+    }
+
+    /// `tr()` が訳を引けなかった文字列を書き出す (訳漏れ探し)。
+    ///
+    /// 集めるのは `ZAIVERN_I18N_TRACE=1` で起動しているあいだだけ。
+    /// **既定で集めない**のは、要らない人に費用を払わせないため (設計原則 3)。
+    pub(crate) fn dump_missing_translations(&mut self) {
+        let keys = i18n::missing_keys();
+        if keys.is_empty() {
+            self.toast(
+                tr("訳漏れはまだ 0 件です (集めるには ZAIVERN_I18N_TRACE=1 を付けて起動)"),
+                false,
+            );
+            return;
+        }
+        let dir = config::zaivern_dir().join("locales");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("missing-{}.json", i18n::current()));
+        let body = serde_json::to_string_pretty(&keys).unwrap_or_default();
+        match std::fs::write(&path, body + "\n") {
+            Ok(()) => {
+                self.open_path(&path);
+                self.toast(
+                    trf(
+                        "🌐 訳が無い文字列を {n} 件書き出しました: {path}",
+                        &[
+                            ("n", keys.len().to_string()),
+                            ("path", path.display().to_string()),
+                        ],
+                    ),
+                    true,
+                );
+            }
+            Err(e) => self.toast(trf("書き出しに失敗: {e}", &[("e", e.to_string())]), false),
+        }
+    }
+
+    /// プラグインが供給する Language Pack ディレクトリ (`[language] locales`)。
+    ///
+    /// 有効なプラグインのぶんだけ。無効化した瞬間に言語一覧からも消える。
+    pub(super) fn plugin_locale_dirs(&self) -> Vec<PathBuf> {
+        self.plugins
+            .iter()
+            .filter(|p| p.active())
+            .filter_map(|p| p.language.as_ref().and_then(|l| l.locales.clone()))
+            .collect()
+    }
+
+    /// 選べる言語の一覧 (同梱 + `~/.zaivern/locales` + プラグイン)。
+    pub(super) fn available_locales(&self) -> Vec<locale::Info> {
+        locale::available(&self.plugin_locale_dirs())
+    }
+
+    /// `cfg.ui_language` を UI へ反映する。**再起動は要らない** —
+    /// 次のフレームから全ラベルが新しい言語で描き直される。
+    pub(super) fn apply_ui_language(&mut self) {
+        let extra = self.plugin_locale_dirs();
+        let known: Vec<String> = locale::available(&extra)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        let id = locale::resolve(
+            &self.cfg.ui_language,
+            locale::detected().as_deref(),
+            &known,
+            locale::SOURCE_LANG,
+        );
+        for e in i18n::set_locale(&id, &extra) {
+            self.toast(trf("⚠ 言語ファイルを読めません — {e}", &[("e", e)]), false);
+        }
+    }
+
+    /// 言語を選び直して保存する (🌐 ピッカー / コマンドパレットの入口)。
+    ///
+    /// `id` は `"auto"` か言語 ID。`config.toml` へも書き戻すので次の起動でも残る。
+    pub(super) fn set_ui_language(&mut self, id: &str, ctx: &egui::Context) {
+        self.cfg.ui_language = id.to_string();
+
+        // 言語プラグインの有効/無効を「選んだ 1 つだけ有効」へ揃える。
+        // ここを揃えないと、🌐 で韓国語にしたのにプラグイン画面では
+        // english-mode が「有効」のまま、という**画面ごとに違う真実**ができる。
+        let mut changed = false;
+        for (name, lang) in self.language_plugins() {
+            let want = lang == id;
+            if self.cfg.plugins.is_enabled(&name) != want {
+                self.cfg.plugins.set_enabled(&name, want);
+                self.cfg.global_plugins.set_enabled(&name, want);
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = config::save_plugins_section(&self.cfg) {
+                self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false);
+            }
+        }
+
+        let mut v = std::collections::BTreeMap::new();
+        v.insert(
+            "ui_language".to_string(),
+            config::SettingValue::Text(id.to_string()).to_toml(),
+        );
+        let saved = config::save_settings(&v);
+        // 有効/無効を書き換えたので登録内容を作り直す。ここで
+        // `apply_ui_language` まで走るので、次のフレームから全ラベルが変わる。
+        self.rebuild_plugins();
+        match saved {
+            Err(e) => self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false),
+            Ok(()) => {
+                let name = locale::display_name(&i18n::current());
+                self.toast(
+                    trf("🌐 表示言語を {name} にしました", &[("name", name)]),
+                    true,
+                );
+            }
+        }
+        crate::perf::repaint(ctx, "set_ui_language");
+    }
+
     pub(super) fn active_selection(&self, ctx: &egui::Context) -> Option<String> {
         let b = self.editor.active.map(|i| &self.editor.buffers[i])?;
         let ed_id = buf_edit_id(self.cur_pane, b.id);

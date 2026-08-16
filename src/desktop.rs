@@ -25,6 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::i18n::{tr, trf};
+
 /// アプリアイコンの原本 (main.rs のウィンドウアイコンと共用)。
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/Zaivern.png");
 
@@ -50,9 +52,12 @@ pub fn run(args: &[String]) -> i32 {
     let result = match sub {
         "install" => install(),
         "uninstall" | "remove" => uninstall(),
-        "" => Err("app のサブコマンドを指定してください: install / uninstall".to_string()),
-        other => Err(format!(
-            "不明な app サブコマンドです: {other} (install / uninstall)"
+        "" => Err(tr(
+            "app のサブコマンドを指定してください: install / uninstall",
+        )),
+        other => Err(trf(
+            "不明な app サブコマンドです: {other} (install / uninstall)",
+            &[("other", other.to_string())],
         )),
     };
     match result {
@@ -74,15 +79,19 @@ pub fn run(args: &[String]) -> i32 {
 /// 自分自身 (インストール済み zai) の絶対パス。
 /// シンボリックリンク経由でも実体を指すよう canonicalize する。
 fn resolve_bin() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("自分の実行ファイルの場所を特定できません: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        trf(
+            "自分の実行ファイルの場所を特定できません: {e}",
+            &[("e", e.to_string())],
+        )
+    })?;
     // `\\?\` 付きのまま .lnk の TargetPath 等へ渡すと表示・解決が崩れるので、
     // 素のパスに直す (pathx に一本化してある)。
     Ok(crate::pathx::plain(exe.canonicalize().unwrap_or(exe)))
 }
 
 fn home_dir() -> Result<PathBuf, String> {
-    dirs::home_dir().ok_or_else(|| "ホームディレクトリが見つかりません".to_string())
+    dirs::home_dir().ok_or_else(|| tr("ホームディレクトリが見つかりません"))
 }
 
 /// 埋め込み PNG を size×size に縮小して PNG バイト列にする。
@@ -91,13 +100,14 @@ fn png_square(src: &image::DynamicImage, size: u32) -> Result<Vec<u8>, String> {
     let mut cur = std::io::Cursor::new(Vec::new());
     resized
         .write_to(&mut cur, image::ImageFormat::Png)
-        .map_err(|e| format!("アイコン PNG の生成に失敗: {e}"))?;
+        .map_err(|e| trf("アイコン PNG の生成に失敗: {e}", &[("e", e.to_string())]))?;
     Ok(cur.into_inner())
 }
 
 #[allow(dead_code)] // 実行時に使うのは Linux のみ
 fn load_icon_image() -> Result<image::DynamicImage, String> {
-    image::load_from_memory(ICON_PNG).map_err(|e| format!("アイコン画像を読めません: {e}"))
+    image::load_from_memory(ICON_PNG)
+        .map_err(|e| trf("アイコン画像を読めません: {e}", &[("e", e.to_string())]))
 }
 
 // ───────────────────────── アイコン生成 (純関数) ─────────────────────────
@@ -107,7 +117,8 @@ fn load_icon_image() -> Result<image::DynamicImage, String> {
 /// 構造: "icns" + 全長(BE u32) + [タグ4B + チャンク長(BE u32, ヘッダ込み) + PNG]…
 #[allow(dead_code)] // 実行時に使うのは macOS のみ (テストは全 OS で走る)
 fn icns_bytes(png: &[u8]) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory(png).map_err(|e| format!("アイコン画像を読めません: {e}"))?;
+    let img = image::load_from_memory(png)
+        .map_err(|e| trf("アイコン画像を読めません: {e}", &[("e", e.to_string())]))?;
     let entries: &[(&[u8; 4], u32)] = &[(b"ic07", 128), (b"ic08", 256), (b"ic09", 512)];
     let mut chunks: Vec<u8> = Vec::new();
     for (tag, size) in entries {
@@ -126,12 +137,13 @@ fn icns_bytes(png: &[u8]) -> Result<Vec<u8>, String> {
 /// .ico を生成する (Windows のショートカットアイコン用、256×256)。
 #[allow(dead_code)] // 実行時に使うのは Windows のみ
 fn ico_bytes(png: &[u8]) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory(png).map_err(|e| format!("アイコン画像を読めません: {e}"))?;
+    let img = image::load_from_memory(png)
+        .map_err(|e| trf("アイコン画像を読めません: {e}", &[("e", e.to_string())]))?;
     let resized = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
     let mut cur = std::io::Cursor::new(Vec::new());
     resized
         .write_to(&mut cur, image::ImageFormat::Ico)
-        .map_err(|e| format!(".ico の生成に失敗: {e}"))?;
+        .map_err(|e| trf(".ico の生成に失敗: {e}", &[("e", e.to_string())]))?;
     Ok(cur.into_inner())
 }
 
@@ -139,6 +151,12 @@ fn ico_bytes(png: &[u8]) -> Result<Vec<u8>, String> {
 
 /// macOS の Info.plist。CFBundleExecutable はバンドル内の実体 [`MACOS_EXEC_NAME`]
 /// (ランチャースクリプトではない) — プロセス一覧に出る名前がこれで決まる。
+///
+/// **中の日本語は `tr()` へ通さない。** これは端末へ出すメッセージではなく
+/// ディスクへ書くファイルの中身で、`NS*UsageDescription` の多言語化は
+/// macOS 側の仕組み (`<lang>.lproj/InfoPlist.strings`) が担当する。
+/// ここを実行時の言語で書き換えると、その言語で `zai app install` した
+/// バンドルだけ別の文言を持つことになる。
 #[allow(dead_code)]
 fn info_plist(version: &str) -> String {
     format!(
@@ -182,6 +200,9 @@ enum LinkKind {
 
 #[allow(dead_code)]
 impl LinkKind {
+    /// 表示用の名前。**ここでは訳さず、画面へ出す側で `tr()` を通す**
+    /// (`&'static str` のまま返せるほうが呼び出し側の自由が利く。
+    /// `app/remote_api.rs` が `tr(p.headline())` としているのと同じ流儀)。
     fn label(self) -> &'static str {
         match self {
             LinkKind::Hard => "ハードリンク",
@@ -216,8 +237,12 @@ where
         return Ok(LinkKind::Hard);
     }
     if std::fs::symlink_metadata(dst).is_ok() {
-        std::fs::remove_file(dst)
-            .map_err(|e| format!("{} を置き換えられません: {e}", dst.display()))?;
+        std::fs::remove_file(dst).map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を置き換えられません: {e}", &[("e", e.to_string())]),
+                &[dst.display().to_string()],
+            )
+        })?;
     }
     // 段は**必ず遅延評価**する。配列リテラルに並べると 3 つとも実行され、
     // ハードリンク成功後に copy(src, dst) が「同じ実体へのコピー」になって
@@ -227,17 +252,16 @@ where
         ($kind:expr, $f:expr) => {
             match $f(src, dst) {
                 Ok(()) => return Ok($kind),
-                Err(e) => why.push(format!("{}: {e}", LinkKind::label($kind))),
+                Err(e) => why.push(format!("{}: {e}", tr(LinkKind::label($kind)))),
             }
         };
     }
     step!(LinkKind::Hard, hard);
     step!(LinkKind::Symlink, sym);
     step!(LinkKind::Copy, copy);
-    Err(format!(
-        "{} を用意できません — {}",
-        dst.display(),
-        why.join(" / ")
+    Err(crate::i18n::fill_positional(
+        &tr("{} を用意できません — {}"),
+        &[dst.display().to_string(), why.join(" / ")],
     ))
 }
 
@@ -297,6 +321,11 @@ pub fn normalize_app_launch_cwd() {
 
 /// Linux の .desktop エントリ。Icon 名と StartupWMClass は
 /// main.rs の `with_app_id("zaivern-code")` と一致させること。
+///
+/// **`Comment=` は `tr()` へ通さない。** ディスクへ書くファイルの中身で、
+/// .desktop 自身が多言語の仕組み (`Comment[en]=` 等の言語接尾辞) を持つ。
+/// 実行時の言語で 1 つだけ書き換えると、インストールした時の言語に
+/// 固定されたエントリができてしまう。
 #[allow(dead_code)]
 fn desktop_entry(bin: &Path, home: &Path) -> String {
     format!(
@@ -365,9 +394,14 @@ fn write_bundle(
     let res_dir = app.join("Contents/Resources");
     std::fs::create_dir_all(&macos_dir)
         .and_then(|_| std::fs::create_dir_all(&res_dir))
-        .map_err(|e| format!("{} を作成できません: {e}", app.display()))?;
+        .map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+                &[app.display().to_string()],
+            )
+        })?;
     std::fs::write(app.join("Contents/Info.plist"), info_plist(version))
-        .map_err(|e| format!("Info.plist を書けません: {e}"))?;
+        .map_err(|e| trf("Info.plist を書けません: {e}", &[("e", e.to_string())]))?;
     // 旧レイアウト (Contents/MacOS/zai のランチャースクリプト) の後始末。
     // 残しておくとバンドル内に使われない殻が居座るだけなので必ず消す。
     let legacy = macos_dir.join("zai");
@@ -398,7 +432,12 @@ fn remove_bundle(app: &Path) -> Result<bool, String> {
     if std::fs::symlink_metadata(app).is_err() {
         return Ok(false);
     }
-    std::fs::remove_dir_all(app).map_err(|e| format!("{} を削除できません: {e}", app.display()))?;
+    std::fs::remove_dir_all(app).map_err(|e| {
+        crate::i18n::fill_positional(
+            &trf("{} を削除できません: {e}", &[("e", e.to_string())]),
+            &[app.display().to_string()],
+        )
+    })?;
     Ok(true)
 }
 
@@ -413,10 +452,15 @@ fn install() -> Result<String, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    Ok(format!(
-        "✅ アプリとして登録しました: {} ({})\n   Launchpad / Spotlight から「{APP_NAME}」で起動でき、\n   アクティビティモニタ / `pgrep -i zaivern` には「{MACOS_EXEC_NAME}」で出ます。",
-        app.display(),
-        kind.label()
+    Ok(crate::i18n::fill_positional(
+        &trf(
+            "✅ アプリとして登録しました: {} ({})\n   Launchpad / Spotlight から「{APP_NAME}」で起動でき、\n   アクティビティモニタ / `pgrep -i zaivern` には「{MACOS_EXEC_NAME}」で出ます。",
+            &[
+                ("APP_NAME", APP_NAME.to_string()),
+                ("MACOS_EXEC_NAME", MACOS_EXEC_NAME.to_string()),
+            ],
+        ),
+        &[app.display().to_string(), tr(kind.label())],
     ))
 }
 
@@ -436,14 +480,17 @@ fn place_executable(src: &Path, dst: &Path) -> Result<LinkKind, String> {
 fn uninstall() -> Result<String, String> {
     let app = app_bundle_path()?;
     if !remove_bundle(&app)? {
-        return Ok("アプリ登録は見つかりませんでした (何もしていません)。".into());
+        return Ok(tr("アプリ登録は見つかりませんでした (何もしていません)。"));
     }
     let _ = std::process::Command::new(LSREGISTER)
         .args(["-u", &app.to_string_lossy()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    Ok(format!("🗑 アプリ登録を解除しました: {}", app.display()))
+    Ok(crate::i18n::fill_positional(
+        &tr("🗑 アプリ登録を解除しました: {}"),
+        &[app.display().to_string()],
+    ))
 }
 
 // ───────────────────────── Linux ─────────────────────────
@@ -462,17 +509,25 @@ fn install() -> Result<String, String> {
     let home = home_dir()?;
     let (desktop, icon) = linux_paths()?;
     if let Some(dir) = icon.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+                &[dir.display().to_string()],
+            )
+        })?;
     }
     let img = load_icon_image()?;
     std::fs::write(&icon, png_square(&img, 512)?)
-        .map_err(|e| format!("アイコンを書けません: {e}"))?;
+        .map_err(|e| trf("アイコンを書けません: {e}", &[("e", e.to_string())]))?;
     if let Some(dir) = desktop.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+                &[dir.display().to_string()],
+            )
+        })?;
         std::fs::write(&desktop, desktop_entry(&bin, &home))
-            .map_err(|e| format!(".desktop を書けません: {e}"))?;
+            .map_err(|e| trf(".desktop を書けません: {e}", &[("e", e.to_string())]))?;
         // メニューのキャッシュ更新は任意 (無いディストリでも登録自体は有効)
         let _ = std::process::Command::new("update-desktop-database")
             .arg(dir)
@@ -480,9 +535,12 @@ fn install() -> Result<String, String> {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    Ok(format!(
-        "✅ アプリとして登録しました: {}\n   アプリメニュー (アクティビティ等) から「{APP_NAME}」で起動できます。",
-        desktop.display()
+    Ok(crate::i18n::fill_positional(
+        &trf(
+            "✅ アプリとして登録しました: {}\n   アプリメニュー (アクティビティ等) から「{APP_NAME}」で起動できます。",
+            &[("APP_NAME", APP_NAME.to_string())],
+        ),
+        &[desktop.display().to_string()],
     ))
 }
 
@@ -491,12 +549,17 @@ fn uninstall() -> Result<String, String> {
     let (desktop, icon) = linux_paths()?;
     let existed = desktop.exists() || icon.exists();
     if !existed {
-        return Ok("アプリ登録は見つかりませんでした (何もしていません)。".into());
+        return Ok(tr("アプリ登録は見つかりませんでした (何もしていません)。"));
     }
     let _ = std::fs::remove_file(&icon);
     std::fs::remove_file(&desktop)
         .or_else(|e| if desktop.exists() { Err(e) } else { Ok(()) })
-        .map_err(|e| format!("{} を削除できません: {e}", desktop.display()))?;
+        .map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を削除できません: {e}", &[("e", e.to_string())]),
+                &[desktop.display().to_string()],
+            )
+        })?;
     if let Some(dir) = desktop.parent() {
         let _ = std::process::Command::new("update-desktop-database")
             .arg(dir)
@@ -504,7 +567,10 @@ fn uninstall() -> Result<String, String> {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    Ok(format!("🗑 アプリ登録を解除しました: {}", desktop.display()))
+    Ok(crate::i18n::fill_positional(
+        &tr("🗑 アプリ登録を解除しました: {}"),
+        &[desktop.display().to_string()],
+    ))
 }
 
 // ───────────────────────── Windows ─────────────────────────
@@ -512,7 +578,7 @@ fn uninstall() -> Result<String, String> {
 #[cfg(windows)]
 fn windows_paths() -> Result<(PathBuf, PathBuf), String> {
     let programs = dirs::data_dir()
-        .ok_or("APPDATA が見つかりません")?
+        .ok_or_else(|| tr("APPDATA が見つかりません"))?
         .join(r"Microsoft\Windows\Start Menu\Programs");
     let lnk = programs.join(format!("{APP_NAME}.lnk"));
     let ico = dirs::data_local_dir()
@@ -537,13 +603,15 @@ fn run_powershell(script: &str) -> Result<(), String> {
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|e| format!("powershell を実行できません: {e}"))?;
+        .map_err(|e| trf("powershell を実行できません: {e}", &[("e", e.to_string())]))?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "ショートカットの作成に失敗しました: {}",
-            crate::textenc::decode_output(&out.stderr).trim()
+        Err(crate::i18n::fill_positional(
+            &tr("ショートカットの作成に失敗しました: {}"),
+            &[crate::textenc::decode_output(&out.stderr)
+                .trim()
+                .to_string()],
         ))
     }
 }
@@ -554,18 +622,30 @@ fn install() -> Result<String, String> {
     let home = home_dir()?;
     let (lnk, ico) = windows_paths()?;
     if let Some(dir) = ico.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+                &[dir.display().to_string()],
+            )
+        })?;
     }
-    std::fs::write(&ico, ico_bytes(ICON_PNG)?).map_err(|e| format!(".ico を書けません: {e}"))?;
+    std::fs::write(&ico, ico_bytes(ICON_PNG)?)
+        .map_err(|e| trf(".ico を書けません: {e}", &[("e", e.to_string())]))?;
     if let Some(dir) = lnk.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を作成できません: {e}", &[("e", e.to_string())]),
+                &[dir.display().to_string()],
+            )
+        })?;
     }
     run_powershell(&shortcut_ps(&lnk, &bin, &home, &ico))?;
-    Ok(format!(
-        "✅ スタートメニューに登録しました: {}\n   スタートメニューから「{APP_NAME}」で起動できます。",
-        lnk.display()
+    Ok(crate::i18n::fill_positional(
+        &trf(
+            "✅ スタートメニューに登録しました: {}\n   スタートメニューから「{APP_NAME}」で起動できます。",
+            &[("APP_NAME", APP_NAME.to_string())],
+        ),
+        &[lnk.display().to_string()],
     ))
 }
 
@@ -573,31 +653,74 @@ fn install() -> Result<String, String> {
 fn uninstall() -> Result<String, String> {
     let (lnk, ico) = windows_paths()?;
     if !lnk.exists() && !ico.exists() {
-        return Ok("アプリ登録は見つかりませんでした (何もしていません)。".into());
+        return Ok(tr("アプリ登録は見つかりませんでした (何もしていません)。"));
     }
     let _ = std::fs::remove_file(&ico);
     std::fs::remove_file(&lnk)
         .or_else(|e| if lnk.exists() { Err(e) } else { Ok(()) })
-        .map_err(|e| format!("{} を削除できません: {e}", lnk.display()))?;
-    Ok(format!("🗑 アプリ登録を解除しました: {}", lnk.display()))
+        .map_err(|e| {
+            crate::i18n::fill_positional(
+                &trf("{} を削除できません: {e}", &[("e", e.to_string())]),
+                &[lnk.display().to_string()],
+            )
+        })?;
+    Ok(crate::i18n::fill_positional(
+        &tr("🗑 アプリ登録を解除しました: {}"),
+        &[lnk.display().to_string()],
+    ))
 }
 
 // ───────────────────────── その他 OS ─────────────────────────
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn install() -> Result<String, String> {
-    Err("この OS ではアプリ登録に対応していません。".into())
+    Err(tr("この OS ではアプリ登録に対応していません。"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn uninstall() -> Result<String, String> {
-    Err("この OS ではアプリ登録に対応していません。".into())
+    Err(tr("この OS ではアプリ登録に対応していません。"))
 }
 
 // ───────────────────────── テスト ─────────────────────────
 
 #[cfg(test)]
 mod tests {
+    /// 位置プレースホルダの埋め方を表で固定する。
+    /// **穴と値の数が食い違っても壊れない**ことまで見る — 訳文は外部
+    /// ファイルから来るので、翻訳者が `{}` を落としたり増やしたりしうる。
+    #[test]
+    fn 位置プレースホルダは順に埋まり数が食い違っても壊れない() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "{} を作成できません: x",
+                &["/a/b"],
+                "/a/b を作成できません: x",
+            ),
+            (
+                "{} を用意できません — {}",
+                &["/a", "理由"],
+                "/a を用意できません — 理由",
+            ),
+            // 訳文の穴が足りない: 余った値は捨てる
+            ("Cannot create {}", &["/a", "余り"], "Cannot create /a"),
+            // 訳文の穴が多い: 埋まらない穴はそのまま残す (panic しない)
+            ("{} と {}", &["/a"], "/a と {}"),
+            // 穴が無い訳文はそのまま
+            ("穴なし", &["/a"], "穴なし"),
+            // 埋めた値に `{}` が入っていても次の穴と取り違えない
+            ("{} / {}", &["a{}b", "後"], "a{}b / 後"),
+        ];
+        for (tpl, args, want) in cases {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                &crate::i18n::fill_positional(tpl, &owned),
+                want,
+                "template={tpl:?}"
+            );
+        }
+    }
+
     use super::*;
 
     // ── icns: Finder が読める最低限の構造を満たすこと ──

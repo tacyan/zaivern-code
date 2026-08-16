@@ -1,0 +1,22 @@
+# portuguese-mode — Zaivern Code の UI を Português (Brasil) で表示する言語パック。
+#
+# 有効にすると UI が Português (Brasil) になり、無効に戻すと「自動」(OS の言語) へ戻ります。
+# 言語パックは同時に 1 つだけ有効になります (別のものを有効にすると入れ替わります)。
+#
+# 訳の実体はバイナリ同梱の `locales/pt-BR.json` です。訳を直したいときは
+# `~/.zaivern/locales/pt-BR.json` に**同じキー**で置くと、そこだけ上書きできます
+# (再ビルド不要)。新しい言語を足したいときは `~/.zaivern/locales/<id>.json` を
+# 置くだけで 🌐 の一覧に並びます。
+
+[plugin]
+name = "portuguese-mode"
+version = "1.0.0"
+author = "Zaivern"
+description = "Portuguese (Brazil) — Exibe a interface em Português (Brasil)"
+api = 2
+# 入れただけで UI 言語が変わるのは驚きなので、初回は無効で入れる。
+default_enabled = false
+
+[language]
+id = "pt-BR"
+name = "Português (Brasil)"

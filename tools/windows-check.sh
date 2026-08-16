@@ -88,6 +88,11 @@ _verdict() {
 _WHY=''
 trap _verdict EXIT
 
+# **この先で `exec` を使わないこと。** プロセスを置き換えると上の EXIT トラップが
+# 発火せず、判定行が出ないまま終わる (`| tail` を挟むと「中止したのに緑」に見える)。
+# 以前ここは `exec env … cargo xwin check` で、実際に判定行が 1 行も出ていなかった。
+# 番人は `cli::tests::検証スクリプトは終了時に判定行を出す`。
+
 # プロジェクトのルート (このスクリプトの 1 つ上)。パスを直書きしない。
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
@@ -273,7 +278,7 @@ run_with_wine() {
     for w in wine64 wine; do
         if host_wine_ok "$w"; then
             echo "== ホストの $w で実行"
-            exec env WINEDEBUG=-all "$w" "$exe" "$@"
+            env WINEDEBUG=-all "$w" "$exe" "$@"
         fi
     done
     if ! docker info >/dev/null 2>&1; then
@@ -299,7 +304,7 @@ EOS
     echo "== docker ($wine_image) の wine で実行: $base $*"
     # XDG_RUNTIME_DIR が無いと wine が毎回エラー行を吐くので、
     # コンテナ内に 0700 の一時ディレクトリを作って渡す (/tmp は 1777 なので不可)。
-    exec docker run --rm \
+    docker run --rm \
         -v "$dir":/exe:ro \
         -v "$wine_prefix_vol":/wineprefix \
         -e WINEDEBUG=-all \
@@ -361,7 +366,7 @@ EOS
     # `-` を `_` にしたもの。ここを直書きせず $triple から作る。
     env_key=$(echo "$triple" | tr '-' '_')
     echo "== Windows ($triple, mingw) で実行: cargo check --all-targets"
-    exec env \
+    env \
         CARGO_TARGET_DIR="${target}-gnu" \
         "CC_${env_key}=$cc" \
         "AR_${env_key}=x86_64-w64-mingw32-ar" \
@@ -385,14 +390,14 @@ EOS
     # clippy_debt() は 1 行 1 引数。`set --` で位置パラメータへ展開する
     # (配列の無い POSIX sh でも安全に渡せる)。
     set -- $(clippy_debt)
-    exec env CARGO_TARGET_DIR="$target" \
+    env CARGO_TARGET_DIR="$target" \
         cargo xwin clippy --target "$triple" --all-targets --locked -- -D warnings "$@"
     ;;
 "")
     need_xwin
     ensure_std "$triple"
     echo "== Windows ($triple) で実行: cargo xwin check --all-targets"
-    exec env CARGO_TARGET_DIR="$target" \
+    env CARGO_TARGET_DIR="$target" \
         cargo xwin check --target "$triple" --all-targets
     ;;
 --wine)

@@ -265,6 +265,15 @@ impl ZaivernApp {
         // interval フックと interval 更新のパネルを回す
         self.tick_plugin_timers(ctx);
 
+        // OS の言語判定が遅れて届いたら、そこで初めて `auto` を引き直す。
+        // macOS は環境変数に言語を置かないので `defaults` を裏で起こしており、
+        // その結果がここへ来る。**毎フレームの費用は atomic の swap 1 回**
+        // (届いていないときは何もしない = アイドルのコストはゼロ)。
+        if locale::take_detection_update() {
+            self.apply_ui_language();
+            crate::perf::repaint(ctx, "locale-detected");
+        }
+
         // 外部(エージェント等)によるファイル書き換えを検知して自動リロードする。
         // 見張りは別スレッド (`watch_tick`)。ここは「見に行け」と言われたときと、
         // 入力等で回ったフレームのついで、の 2 通りで回る。

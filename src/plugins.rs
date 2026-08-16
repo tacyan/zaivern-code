@@ -395,8 +395,14 @@ pub struct PluginLanguage {
     /// 表示名 (例: "English")。
     #[allow(dead_code)]
     pub name: String,
-    /// 辞書のパス (解決済み)。ファイルまたはディレクトリ。
-    pub dict: PathBuf,
+    /// 旧形式の辞書 (日本語原文をキーにした TOML)。ファイルまたはディレクトリ。
+    /// `locales` だけを持つ言語パックでは None。
+    pub dict: Option<PathBuf>,
+    /// Language Pack のディレクトリ (`<id>.json` を並べる)。解決済み。
+    ///
+    /// **こちらが新しい形式**。安定 ID をキーにした JSON なので、
+    /// 1 プラグインで何言語でも配れる (`en.json` / `fr.json` / …)。
+    pub locales: Option<PathBuf>,
 }
 
 impl Plugin {
@@ -561,8 +567,12 @@ struct RawLanguage {
     /// 表示名 (例: "English")。省略時は id。
     #[serde(default)]
     name: String,
-    /// 辞書のパス (プラグインディレクトリ相対)。ファイルまたはディレクトリ。
+    /// 旧形式の辞書のパス (プラグインディレクトリ相対)。ファイルまたはディレクトリ。
+    #[serde(default)]
     dict: String,
+    /// Language Pack のディレクトリ (プラグイン相対)。直下に `<id>.json` を置く。
+    #[serde(default)]
+    locales: String,
 }
 
 #[derive(Deserialize)]
@@ -793,13 +803,17 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
     let language = match m.language {
         None => None,
         Some(l) => {
-            let id = l.id.trim().to_lowercase();
+            // **`to_lowercase()` では駄目。** `zh-CN` が `zh-cn` になり、同梱辞書
+            // (`locales/zh-CN.json`) と一致しなくなる = 有効にしても言語が
+            // 変わらない、という静かな壊れ方をする。正規化は 1 か所だけ。
+            let id = crate::locale::normalize(l.id.trim());
             if id.is_empty() {
                 return Err("[language] に id が必要です (例: \"en\")".into());
             }
-            if l.dict.trim().is_empty() {
-                return Err("[language] に dict (辞書のパス) が必要です".into());
-            }
+            // dict / locales はどちらも**省略できる**。
+            // 同梱言語 (`locales/<id>.json` がバイナリに入っているもの) を選ぶ
+            // ためだけの言語プラグインは、`id` 1 つで足りるため
+            // (辞書を持たせると同じ訳が 2 か所に増えて必ずずれる)。
             Some(PluginLanguage {
                 name: if l.name.trim().is_empty() {
                     id.clone()
@@ -807,7 +821,8 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
                     l.name.trim().to_string()
                 },
                 id,
-                dict: resolve_rel(dir, &l.dict),
+                dict: (!l.dict.trim().is_empty()).then(|| resolve_rel(dir, &l.dict)),
+                locales: (!l.locales.trim().is_empty()).then(|| resolve_rel(dir, &l.locales)),
             })
         }
     };
@@ -1380,6 +1395,41 @@ pub fn plugin_data_dir(name: &str) -> Option<PathBuf> {
 /// この表は `assets/plugins/` を走査して機械的に生成している。
 /// プラグインを足したら、同じ形式で 1 ブロック追記すること。
 const BUNDLED: &[(&str, &[(&str, &str)])] = &[
+    (
+        "chinese-mode",
+        &[(
+            "plugin.toml",
+            include_str!("../assets/plugins/chinese-mode/plugin.toml"),
+        )],
+    ),
+    (
+        "japanese-mode",
+        &[(
+            "plugin.toml",
+            include_str!("../assets/plugins/japanese-mode/plugin.toml"),
+        )],
+    ),
+    (
+        "korean-mode",
+        &[(
+            "plugin.toml",
+            include_str!("../assets/plugins/korean-mode/plugin.toml"),
+        )],
+    ),
+    (
+        "portuguese-mode",
+        &[(
+            "plugin.toml",
+            include_str!("../assets/plugins/portuguese-mode/plugin.toml"),
+        )],
+    ),
+    (
+        "spanish-mode",
+        &[(
+            "plugin.toml",
+            include_str!("../assets/plugins/spanish-mode/plugin.toml"),
+        )],
+    ),
     (
         "agent-compare",
         &[
@@ -2484,26 +2534,91 @@ dict = "lang"
         let l = p.language.expect("language section");
         assert_eq!(l.id, "en", "id は小文字化される");
         assert_eq!(l.name, "en", "name 省略時は id");
-        assert_eq!(l.dict, d.join("lang"), "dict はプラグイン相対で解決される");
+        assert_eq!(
+            l.dict,
+            Some(d.join("lang")),
+            "dict はプラグイン相対で解決される"
+        );
+        assert_eq!(l.locales, None, "locales は省略できる");
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn 言語パックのidとdictは必須() {
+    fn 言語パックはidだけ必須で辞書は省略できる() {
         let d = temp_dir("langbad");
+        // id は必須
         std::fs::write(
             d.join("plugin.toml"),
             "[plugin]\nname = \"x\"\n[language]\nid = \"\"\ndict = \"lang\"\n",
         )
         .unwrap();
         assert!(parse_manifest(&d).unwrap_err().contains("id"));
+
+        // **dict も locales も無くてよい。** 同梱言語 (`locales/<id>.json` が
+        // バイナリに入っているもの) を選ぶだけのプラグインがこの形で、
+        // 辞書を持たせると同じ訳が 2 か所に増えて必ずずれる。
         std::fs::write(
             d.join("plugin.toml"),
-            "[plugin]\nname = \"x\"\n[language]\nid = \"en\"\ndict = \"\"\n",
+            "[plugin]\nname = \"x\"\n[language]\nid = \"KO\"\nname = \"한국어\"\n",
         )
         .unwrap();
-        assert!(parse_manifest(&d).unwrap_err().contains("dict"));
+        let p = parse_manifest(&d).expect("id だけで通る");
+        let l = p.language.expect("language section");
+        assert_eq!(l.id, "ko", "id は小文字化される");
+        assert_eq!(l.name, "한국어");
+        assert_eq!(l.dict, None);
+        assert_eq!(l.locales, None);
+
+        // locales はプラグイン相対で解決される
+        std::fs::write(
+            d.join("plugin.toml"),
+            "[plugin]\nname = \"x\"\n[language]\nid = \"fr\"\nlocales = \"locales\"\n",
+        )
+        .unwrap();
+        let p = parse_manifest(&d).expect("locales だけでも通る");
+        let l = p.language.expect("language section");
+        assert_eq!(l.locales, Some(d.join("locales")));
+        assert_eq!(l.dict, None);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 同梱の 6 言語プラグインが健全で、`[language] id` が同梱辞書と一致すること。
+    /// **ここがずれると「有効にしたのに言語が変わらない」**という壊れ方をする。
+    #[test]
+    fn 同梱の言語プラグインは同梱辞書と対応している() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/plugins");
+        let builtin: Vec<&str> = crate::locale::BUILTIN.iter().map(|(i, _, _)| *i).collect();
+        let mut seen: Vec<String> = Vec::new();
+        for name in [
+            "english-mode",
+            "japanese-mode",
+            "chinese-mode",
+            "korean-mode",
+            "portuguese-mode",
+            "spanish-mode",
+        ] {
+            let p = parse_manifest(&root.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                !p.default_enabled,
+                "{name}: 入れただけで言語が変わってはいけない"
+            );
+            let l = p
+                .language
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: [language] が無い"));
+            assert!(
+                builtin.contains(&l.id.as_str()),
+                "{name}: id {} が同梱辞書に無い",
+                l.id
+            );
+            assert!(!seen.contains(&l.id), "{name}: id {} が重複", l.id);
+            seen.push(l.id.clone());
+        }
+        assert_eq!(
+            seen.len(),
+            builtin.len(),
+            "同梱言語ぶんのプラグインが揃っている"
+        );
     }
 
     /// 既存プラグイン (指定なし) の挙動が変わらないこと。
@@ -2526,7 +2641,8 @@ dict = "lang"
         assert!(!p.default_enabled, "初回は無効で入る (勝手に英語にしない)");
         let l = p.language.as_ref().expect("language section");
         assert_eq!(l.id, "en");
-        let dict = crate::i18n::load_dict(&l.dict).expect("辞書が読める");
+        let dict =
+            crate::i18n::load_dict(l.dict.as_ref().expect("dict あり")).expect("辞書が読める");
         assert!(
             dict.len() >= 20,
             "主要ラベルの訳が入っている (現在 {} 件)",

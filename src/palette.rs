@@ -116,6 +116,11 @@ pub enum Cmd {
     /// いまの相手の未読フラグを反転する。
     ToggleUnreadAgent,
     SetTheme(String),
+    /// UI の表示言語を切り替える。値は `"auto"` か言語 ID (`"ja"` / `"zh-CN"` …)。
+    ///
+    /// テーマと同じく**値を運ぶ**必要があるので `Cmd::Feature` では表せない
+    /// (機能 ID は文字列 1 本で、選ばれた言語を載せられない)。
+    SetUiLanguage(String),
     /// 設定画面 (検索できる一覧) を開く。VS Code の「設定を開く (UI)」相当。
     OpenSettings,
     /// config.toml をエディタで開く。GUI で表現しきれない設定はこちらから触る。
@@ -892,6 +897,7 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::TextSizeOut
         | Cmd::TextSizeReset
         | Cmd::SetTheme(_)
+        | Cmd::SetUiLanguage(_)
         | Cmd::ShowExplorer
         | Cmd::TogglePet
         | Cmd::SetPetImage

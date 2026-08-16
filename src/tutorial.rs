@@ -2821,6 +2821,91 @@ fn index_row_ui(ui: &mut egui::Ui, theme: &crate::theme::Theme, r: &IndexRow) ->
 
 #[cfg(test)]
 mod tests {
+    // ── 多言語 (Language Pack) の番人 ────────────────────────────
+    //
+    // チュートリアルと全機能ガイドの文言は `&'static str` の表に置かれていて、
+    // 表示時に `tr()` を通る。つまり **`locales/ja.json` に載っていないと
+    // 永久に日本語のまま**になる。`tr("…")` の直書きではないので
+    // `locale::tests::ソースのtrリテラルはすべて同梱辞書から引ける` は
+    // ここを見ない。だから専用の番人を置く。
+
+    /// 同梱 `ja.json` の「鍵」と「値」。ID でも原文でも引けることを見る。
+    fn ja_lookup() -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let mut errs = Vec::new();
+        let m = crate::locale::load_one(crate::locale::SOURCE_LANG, &[], &mut errs);
+        assert!(errs.is_empty(), "同梱 ja.json が読めない: {errs:?}");
+        (m.keys().cloned().collect(), m.values().cloned().collect())
+    }
+
+    fn assert_translatable(items: &[(&str, &str)]) {
+        let (keys, values) = ja_lookup();
+        let mut miss: Vec<String> = items
+            .iter()
+            .filter(|(_, text)| !text.trim().is_empty())
+            .filter(|(_, text)| !keys.contains(*text) && !values.contains(*text))
+            .map(|(where_, text)| format!("{where_}: {text:?}"))
+            .collect();
+        miss.sort();
+        miss.dedup();
+        let shown: Vec<&str> = miss.iter().take(15).map(|s| s.as_str()).collect();
+        assert!(
+            miss.is_empty(),
+            "{} 件が辞書に無い (その言語では日本語のまま出る):\n{}",
+            miss.len(),
+            shown.join("\n")
+        );
+    }
+
+    #[test]
+    fn チュートリアルの全文言が辞書にある() {
+        let mut items: Vec<(&str, &str)> = Vec::new();
+        for s in STEPS.iter().chain(EXTRA_STEPS.iter()) {
+            items.push(("step.title", s.title));
+            items.push(("step.body", s.body));
+            if let Some(h) = s.hint {
+                items.push(("step.hint", h));
+            }
+            items.push(("step.chapter", s.chapter.label()));
+        }
+        assert!(items.len() > 100, "抽出が退化している ({} 件)", items.len());
+        assert_translatable(&items);
+    }
+
+    #[test]
+    fn 章立てガイドの全文言が辞書にある() {
+        let mut items: Vec<(&str, &str)> = Vec::new();
+        for w in WALKTHROUGHS {
+            items.push(("walkthrough.title", w.title));
+            items.push(("walkthrough.summary", w.summary));
+        }
+        for (_, note) in FEATURE_NOTES {
+            items.push(("feature_note", note));
+        }
+        assert!(!items.is_empty());
+        assert_translatable(&items);
+    }
+
+    #[test]
+    fn 全機能索引の全行が辞書にある() {
+        // 索引は feature::REGISTRY と keybinds::ALL_ACTIONS から自動生成される。
+        // **機能を 1 つ足すだけで索引に載る**設計なので、その行の名前も
+        // 同じ規律で辞書に載っていないと、その 1 行だけ日本語で残る。
+        let mut items: Vec<(&str, &str)> = Vec::new();
+        for f in crate::feature::REGISTRY {
+            for e in f.entries {
+                items.push(("registry.label", e.label));
+            }
+        }
+        for a in crate::keybinds::ALL_ACTIONS {
+            items.push(("action.label", crate::keybinds::action_label(a)));
+        }
+        assert!(items.len() > 50, "抽出が退化している ({} 件)", items.len());
+        assert_translatable(&items);
+    }
+
     use super::*;
     use crate::test_util::unique_temp_dir;
 

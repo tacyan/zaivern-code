@@ -205,6 +205,10 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "status"
             | "state"
             | "plugin"
+            // UI 表示言語の確認と、翻訳ファイルの検査 (コミュニティ翻訳者の入口)
+            | "i18n"
+            // 言語パックの導入・切替 (GitHub から取ってくる)
+            | "lang"
             | "app"
             | "firewall"
             | "worktree"
@@ -290,6 +294,23 @@ Zaivern Code — CLI 制御チャネル
   zai status                            実行中の Zaivern Code を一覧 (終了コード: 0=あり 1=なし)
   zai status --json                     一覧を JSON で出力
   zai status --pid-only                 PID だけを 1 行ずつ (| xargs kill 用)
+
+表示言語 (Language Pack):
+  zai lang                              いまの言語と、選べる言語の一覧
+  zai lang list [--remote]              --remote で配布元にある言語も出す
+  zai lang install <id> [--from owner/repo] [--ref <branch>] [--force]
+                                        GitHub から取って ~/.zaivern/locales へ入れる
+  zai lang remove <id>                  入れた言語ファイルを消す (同梱は消さない)
+  zai lang set <id>|auto                表示言語を切り替える (config.toml へ保存)
+  zai lang check [<id>|<file.json>]     翻訳ファイルの過不足を検査 (合わなければ終了コード 1)
+  zai lang export <id> [<file.json>]    翻訳の雛形を書き出す (新しい言語はここから)
+  ※ `zai i18n …` は同じものの別名です
+
+保守 (このリポジトリで開発するとき):
+  zai lang missing [<srcディレクトリ>] [<out.json>]
+                                        画面に出るのに辞書へ無い文字列を出す
+  zai lang apply <shard.json> [<localesディレクトリ>]
+                                        訳を locales/*.json へ取り込む
 
 プラグイン (エディタが起動していなくても使えます):
   zai plugin list                       導入済みプラグインを一覧表示
@@ -424,6 +445,30 @@ const HELP_TAIL: &str = "\
 終了コード: 0 = 成功 / 1 = 実行時エラー / 2 = 引数の指定ミス
 ";
 
+/// CLI 経路の表示言語を決める。
+///
+/// GUI と同じ規則 (`config.toml` の `ui_language` → OS の判定 → 原文言語) で
+/// 引くが、**原文言語 (日本語) のままなら何も読まない** — `zai` は短命な
+/// プロセスなので、日本語で使う人に辞書の読み込み費用を払わせない。
+pub fn init_cli_locale() {
+    let choice = crate::config::ui_language_pref();
+    let known: Vec<String> = crate::locale::available(&[])
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    let id = crate::locale::resolve(
+        &choice,
+        crate::locale::detected().as_deref(),
+        &known,
+        crate::locale::SOURCE_LANG,
+    );
+    if id == crate::locale::SOURCE_LANG {
+        return;
+    }
+    // 読めない辞書があっても CLI は止めない (同梱ぶんで動く)。
+    let _ = crate::i18n::set_locale(&id, &[]);
+}
+
 /// CLI として処理したら `Some(終了コード)`、
 /// CLI 呼び出しではない (GUI を起動すべき) なら `None`。
 ///
@@ -479,6 +524,7 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             status_list_mode(rest).unwrap_or(StatusFmt::Table),
         ),
         "plugin" => run_plugin(rest),
+        "i18n" | "lang" => run_lang(rest),
         "app" => crate::desktop::run(rest),
         "firewall" => crate::firewall::run(rest),
         // ヘッドレス導線 (実行中インスタンスが無くても動くものが大半)
@@ -768,6 +814,741 @@ fn run_remote(cmd: &str, args: &[String]) -> Result<String, String> {
         }
         other => Err(format!("不明なサブコマンドです: {other}")),
     }
+}
+
+// ───────────────────────── i18n サブコマンド (インスタンス不要) ─────────────────────────
+
+/// `zai i18n` — 表示言語の確認と、翻訳ファイルの検査・雛形出力。
+///
+/// **コミュニティが言語を足すための入口**。GUI を起動しなくても、
+/// `~/.zaivern/locales/fr.json` が同梱 `en.json` と噛み合っているかを
+/// ここだけで確かめられる (噛み合っていなければ終了コード 1 = fail-closed)。
+fn run_lang(args: &[String]) -> i32 {
+    // フラグと位置引数を分ける (`--from owner/repo` はここで拾う)
+    let mut positional: Vec<String> = Vec::new();
+    let mut from: Option<String> = None;
+    let mut git_ref: Option<String> = None;
+    let mut force = false;
+    let mut remote = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--from" => from = it.next().cloned(),
+            // 既定ブランチ以外から取る (公開前の下見・自分のフォークの検証用)
+            "--ref" | "--branch" => git_ref = it.next().cloned(),
+            "--force" | "-f" => force = true,
+            "--remote" => remote = true,
+            other => positional.push(other.to_string()),
+        }
+    }
+    let sub = positional.first().map(|s| s.as_str()).unwrap_or("");
+    let arg = positional.get(1).cloned().unwrap_or_default();
+    let result = match sub {
+        "" | "list" | "status" => lang_list(remote, from.as_deref(), git_ref.as_deref()),
+        "install" | "add" => lang_install(&arg, from.as_deref(), git_ref.as_deref(), force),
+        "remove" | "uninstall" | "rm" => lang_remove(&arg),
+        "set" | "use" => lang_set(&arg),
+        "check" => i18n_check(&arg),
+        "export" => i18n_export(&arg, positional.get(2).map(String::as_str)),
+        "missing" => i18n_missing(&arg, positional.get(2).map(String::as_str)),
+        "apply" => i18n_apply(&arg, positional.get(2).map(String::as_str)),
+        other => Err(crate::i18n::trf(
+            "不明な lang サブコマンドです: {other} (list / install / remove / set / check / export)",
+            &[("other", other.to_string())],
+        )),
+    };
+    match result {
+        Ok(out) => {
+            if !out.is_empty() {
+                println!("{out}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// 端末の**表示幅**で右へ空白を足す。
+///
+/// `{:<8}` は**文字数**で数えるので、`日本語` (3 文字 / 6 桁) や `한국어` が
+/// 混ざると列がずれる。桁の数え方は端末グリッドと同じ [`crate::textenc::char_width`]
+/// (wcwidth) に合わせる。
+fn pad_display(s: &str, width: usize) -> String {
+    let w: usize = s.chars().map(crate::textenc::char_width).sum();
+    let mut out = s.to_string();
+    for _ in w..width {
+        out.push(' ');
+    }
+    out
+}
+
+/// 言語パックの配布元 (`owner/repo`)。
+///
+/// **決め打ちしない。** 既定はこのビルドの配布元 (`install.sh` から読む) で、
+/// `ZAIVERN_LANG_REPO` か `--from owner/repo` で差し替えられる。
+/// こうしておくと、コミュニティが自分のリポジトリで言語パックを配れる
+/// (`zai lang install fr --from someone/zaivern-lang-fr`)。
+fn lang_repo(from: Option<&str>) -> Result<String, String> {
+    if let Some(f) = from.map(str::trim).filter(|s| !s.is_empty()) {
+        return validate_slug(f);
+    }
+    if let Ok(v) = std::env::var("ZAIVERN_LANG_REPO") {
+        if !v.trim().is_empty() {
+            return validate_slug(v.trim());
+        }
+    }
+    distribution()
+        .map(|d| d.slug)
+        .map_err(|_| crate::i18n::tr("配布元が分からないので --from owner/repo で指定してください"))
+}
+
+/// `owner/repo` の形だけを通す (URL を組む前に必ず確かめる)。
+fn validate_slug(s: &str) -> Result<String, String> {
+    let parts: Vec<&str> = s.split('/').collect();
+    let ok = parts.len() == 2
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        });
+    if ok {
+        Ok(s.to_string())
+    } else {
+        Err(crate::i18n::trf(
+            "配布元は owner/repo の形で指定してください: {s}",
+            &[("s", s.to_string())],
+        ))
+    }
+}
+
+/// 配布元の `locales/` に何があるか。`(言語ID, 取得URL)` の一覧。
+///
+/// **既定ブランチを当てにしない** — GitHub の contents API は既定ブランチを
+/// 見てくれるので、`main` / `master` の違いで壊れない。
+fn lang_remote_index(slug: &str, git_ref: Option<&str>) -> Result<Vec<(String, String)>, String> {
+    let url = match git_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => {
+            // ブランチ名もそのまま URL へ入るので形を確かめる
+            if !r
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+            {
+                return Err(crate::i18n::trf(
+                    "ブランチ名に使えない文字が入っています: {r}",
+                    &[("r", r.to_string())],
+                ));
+            }
+            format!("https://api.github.com/repos/{slug}/contents/locales?ref={r}")
+        }
+        None => format!("https://api.github.com/repos/{slug}/contents/locales"),
+    };
+    let body = fetch_text(&url).map_err(|e| {
+        // 404 は「まだ locales/ を置いていない配布元」。原因が分かる案内にする
+        // (`Runtime("…")` のような Debug 表記をそのまま人へ見せない)。
+        if e.message().contains("404") {
+            crate::i18n::trf(
+                "{slug} に locales/ がありません (配布元を確かめてください: --from owner/repo)",
+                &[("slug", slug.to_string())],
+            )
+        } else {
+            e.message().to_string()
+        }
+    })?;
+    parse_lang_index(&body, slug)
+}
+
+/// GitHub contents API の応答から `(言語ID, 取得URL)` を取り出す**純関数**。
+///
+/// I/O を含まないので表で固定できる。`https` 以外の `download_url` は捨てる
+/// (応答が差し替えられても、こちらから平文で取りに行かない)。
+fn parse_lang_index(body: &str, slug: &str) -> Result<Vec<(String, String)>, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        crate::i18n::trf("配布元の応答を解釈できません: {e}", &[("e", e.to_string())])
+    })?;
+    let arr = v.as_array().ok_or_else(|| {
+        crate::i18n::trf(
+            "{slug} に locales/ がありません",
+            &[("slug", slug.to_string())],
+        )
+    })?;
+    let mut out: Vec<(String, String)> = arr
+        .iter()
+        .filter_map(|e| {
+            let name = e.get("name")?.as_str()?;
+            let dl = e.get("download_url")?.as_str()?;
+            if !dl.starts_with("https://") {
+                return None;
+            }
+            let id = name.strip_suffix(".json")?;
+            (!id.is_empty()).then(|| (crate::locale::normalize(id), dl.to_string()))
+        })
+        .collect();
+    out.sort();
+    out.dedup_by(|a, b| a.0 == b.0);
+    Ok(out)
+}
+
+/// 言語の一覧。`--remote` を付けると配布元にあるものも並べる。
+fn lang_list(remote: bool, from: Option<&str>, git_ref: Option<&str>) -> Result<String, String> {
+    let mut out = vec![i18n_status()];
+    if !remote {
+        out.push(String::new());
+        out.push(crate::i18n::tr(
+            "配布元にある言語も見るには: zai lang list --remote",
+        ));
+        return Ok(out.join("\n"));
+    }
+    let slug = lang_repo(from)?;
+    let idx = lang_remote_index(&slug, git_ref)?;
+    let here: std::collections::HashSet<String> = crate::locale::available(&[])
+        .into_iter()
+        .map(|i| i.id)
+        .collect();
+    out.push(String::new());
+    out.push(crate::i18n::trf(
+        "配布元 {slug} の言語 ({n} 件):",
+        &[("slug", slug), ("n", idx.len().to_string())],
+    ));
+    for (id, _) in &idx {
+        let mark = if here.contains(id) { "✓" } else { "+" };
+        out.push(format!(
+            "{mark} {} {}",
+            pad_display(id, 8),
+            crate::locale::display_name(id)
+        ));
+    }
+    out.push(String::new());
+    out.push(crate::i18n::tr("入れるには: zai lang install <id>"));
+    Ok(out.join("\n"))
+}
+
+/// 配布元から言語ファイルを取って `~/.zaivern/locales/` へ入れる。
+///
+/// **検証してから置く** — 壊れた JSON や、プレースホルダが基準と食い違う訳は
+/// 実行時に穴を開けるので、書き出す前に断る (fail-closed)。書き込みは
+/// 一時ファイル + rename で、途中で切れても半端なファイルを残さない。
+fn lang_install(
+    id: &str,
+    from: Option<&str>,
+    git_ref: Option<&str>,
+    force: bool,
+) -> Result<String, String> {
+    if id.trim().is_empty() {
+        return Err(crate::i18n::tr(
+            "入れる言語 ID を指定してください (例: zai lang install zh-CN)",
+        ));
+    }
+    let want = crate::locale::normalize(id);
+    let slug = lang_repo(from)?;
+    let idx = lang_remote_index(&slug, git_ref)?;
+    let Some((_, url)) = idx.iter().find(|(i, _)| *i == want) else {
+        let have: Vec<&str> = idx.iter().map(|(i, _)| i.as_str()).collect();
+        return Err(crate::i18n::trf(
+            "{slug} に {id}.json がありません (あるのは: {have})",
+            &[("slug", slug), ("id", want), ("have", have.join(" "))],
+        ));
+    };
+
+    let body = fetch_text(url).map_err(|e| e.message().to_string())?;
+    let map = crate::locale::parse_json(&body, &format!("{slug}:locales/{want}.json"))?;
+    if map.is_empty() {
+        return Err(crate::i18n::trf(
+            "{id}.json が空です",
+            &[("id", want.clone())],
+        ));
+    }
+    let mut errs = Vec::new();
+    let base = crate::locale::load_one(crate::locale::BASE, &[], &mut errs);
+    let report = crate::locale::compare(&base, &map);
+    if !report.placeholder.is_empty() {
+        let head: Vec<&str> = report
+            .placeholder
+            .iter()
+            .take(5)
+            .map(|s| s.as_str())
+            .collect();
+        return Err(crate::i18n::trf(
+            "{id}.json はプレースホルダが基準と違うので入れません ({n} 件: {head})",
+            &[
+                ("id", want.clone()),
+                ("n", report.placeholder.len().to_string()),
+                ("head", head.join(" ")),
+            ],
+        ));
+    }
+
+    let dir = crate::config::zaivern_dir().join("locales");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{} を作れません: {e}", dir.display()))?;
+    let dest = dir.join(format!("{want}.json"));
+    if dest.exists() && !force {
+        return Err(crate::i18n::trf(
+            "{path} は既にあります (上書きするなら --force)",
+            &[("path", dest.display().to_string())],
+        ));
+    }
+    let tmp = dir.join(format!(".{want}.json.tmp"));
+    std::fs::write(&tmp, &body).map_err(|e| format!("{} を書けません: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{} へ置けません: {e}", dest.display())
+    })?;
+
+    let mut out = vec![crate::i18n::trf(
+        "🌐 {name} ({id}) を入れました — {path} ({n} 件)",
+        &[
+            ("name", crate::locale::display_name(&want)),
+            ("id", want.clone()),
+            ("path", dest.display().to_string()),
+            ("n", map.len().to_string()),
+        ],
+    )];
+    if !report.missing.is_empty() {
+        out.push(crate::i18n::trf(
+            "  訳が無い項目が {n} 件あります (そこは英語で出ます)",
+            &[("n", report.missing.len().to_string())],
+        ));
+    }
+    out.push(crate::i18n::trf(
+        "  使うには: zai lang set {id}",
+        &[("id", want)],
+    ));
+    Ok(out.join("\n"))
+}
+
+/// 入れた言語ファイルを消す。**同梱の言語は消せない** (バイナリの中なので)。
+fn lang_remove(id: &str) -> Result<String, String> {
+    if id.trim().is_empty() {
+        return Err(crate::i18n::tr("消す言語 ID を指定してください"));
+    }
+    let want = crate::locale::normalize(id);
+    let mut removed = Vec::new();
+    for d in crate::locale::user_dirs() {
+        let p = d.join(format!("{want}.json"));
+        if p.is_file() {
+            std::fs::remove_file(&p).map_err(|e| format!("{} を消せません: {e}", p.display()))?;
+            removed.push(p.display().to_string());
+        }
+    }
+    if removed.is_empty() {
+        return Err(crate::i18n::trf(
+            "{id} は入っていません (同梱の言語はファイルではないので消せません)",
+            &[("id", want)],
+        ));
+    }
+    Ok(crate::i18n::trf(
+        "🗑 {id} を消しました: {paths}",
+        &[("id", want), ("paths", removed.join(" "))],
+    ))
+}
+
+/// 表示言語を切り替えて `config.toml` へ保存する。
+///
+/// **入っていない言語は断る** — 書けてしまうと、次の起動で黙って英語になり
+/// 「設定したのに効かない」になる。入れ方まで案内する。
+fn lang_set(id: &str) -> Result<String, String> {
+    if id.trim().is_empty() {
+        return Err(crate::i18n::tr(
+            "切り替える言語 ID を指定してください (auto も可)",
+        ));
+    }
+    let want = if id.eq_ignore_ascii_case(crate::locale::AUTO) {
+        crate::locale::AUTO.to_string()
+    } else {
+        let n = crate::locale::normalize(id);
+        let known: Vec<String> = crate::locale::available(&[])
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        if !known.contains(&n) {
+            return Err(crate::i18n::trf(
+                "{id} は入っていません — まず: zai lang install {id}",
+                &[("id", n)],
+            ));
+        }
+        n
+    };
+    let mut v = std::collections::BTreeMap::new();
+    v.insert(
+        "ui_language".to_string(),
+        crate::config::SettingValue::Text(want.clone()).to_toml(),
+    );
+    crate::config::save_settings(&v)?;
+    Ok(crate::i18n::trf(
+        "🌐 表示言語を {name} ({id}) にしました (起動中の窓は次のフレームから、では無く再読み込みで反映されます)",
+        &[
+            ("name", crate::locale::display_name(&want)),
+            ("id", want),
+        ],
+    ))
+}
+
+fn i18n_status() -> String {
+    let choice = crate::config::ui_language_pref();
+    let now = crate::i18n::current();
+    let mut out = vec![
+        crate::i18n::trf(
+            "設定: {choice} / いま使う言語: {now} ({name}){extra}",
+            &[
+                ("choice", choice),
+                ("now", now.clone()),
+                ("name", crate::locale::display_name(&now)),
+                (
+                    "extra",
+                    if crate::i18n::active() {
+                        String::new()
+                    } else {
+                        crate::i18n::tr(" — 原文のまま").to_string()
+                    },
+                ),
+            ],
+        ),
+        String::new(),
+    ];
+    for info in crate::locale::available(&[]) {
+        let mark = if info.id == now { "*" } else { " " };
+        let kind = if info.builtin {
+            crate::i18n::tr("同梱")
+        } else {
+            crate::i18n::tr("追加")
+        };
+        let where_ = info
+            .path
+            .map(|p| format!("  {}", p.display()))
+            .unwrap_or_default();
+        out.push(format!(
+            "{mark} {} {} {kind}{where_}",
+            pad_display(&info.id, 8),
+            pad_display(&info.name, 22)
+        ));
+    }
+    out.push(String::new());
+    for d in crate::locale::user_dirs() {
+        out.push(crate::i18n::trf(
+            "言語ファイルの置き場: {dir}",
+            &[("dir", d.display().to_string())],
+        ));
+    }
+    out.join("\n")
+}
+
+/// 言語 ID かファイルパスを受けて、同梱 `en` と突き合わせる。
+fn i18n_check(arg: &str) -> Result<String, String> {
+    if arg.trim().is_empty() {
+        return Err(crate::i18n::tr(
+            "検査する言語 ID かファイルを指定してください (例: zai i18n check fr)",
+        ));
+    }
+    let path = Path::new(arg);
+    let (label, map) = if path.is_file() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("{} を読めません: {e}", path.display()))?;
+        (
+            path.display().to_string(),
+            crate::locale::parse_json(&raw, &path.display().to_string())?,
+        )
+    } else {
+        let id = crate::locale::normalize(arg);
+        let mut errs = Vec::new();
+        let m = crate::locale::load_one(&id, &[], &mut errs);
+        if !errs.is_empty() {
+            return Err(errs.join("\n"));
+        }
+        if m.is_empty() {
+            return Err(crate::i18n::trf(
+                "{id} の辞書がありません (同梱にも ~/.zaivern/locales にもない)",
+                &[("id", id)],
+            ));
+        }
+        (id, m)
+    };
+
+    let mut errs = Vec::new();
+    let base = crate::locale::load_one(crate::locale::BASE, &[], &mut errs);
+    let report = crate::locale::compare(&base, &map);
+    let mut out = vec![crate::i18n::trf(
+        "{label}: {n} 件 (基準 {b} 件)",
+        &[
+            ("label", label),
+            ("n", map.len().to_string()),
+            ("b", base.len().to_string()),
+        ],
+    )];
+    for (title, list) in [
+        (crate::i18n::tr("訳が無い"), &report.missing),
+        (crate::i18n::tr("基準に無い鍵"), &report.extra),
+        (crate::i18n::tr("プレースホルダ不一致"), &report.placeholder),
+        (crate::i18n::tr("空の訳"), &report.empty),
+    ] {
+        if list.is_empty() {
+            continue;
+        }
+        out.push(format!("\n{title} ({}):", list.len()));
+        for k in list.iter().take(40) {
+            out.push(format!("  {k}"));
+        }
+        if list.len() > 40 {
+            out.push(crate::i18n::trf(
+                "  … ほか {n} 件",
+                &[("n", (list.len() - 40).to_string())],
+            ));
+        }
+    }
+    if report.is_clean() {
+        out.push(crate::i18n::tr("✅ 過不足なし"));
+        Ok(out.join("\n"))
+    } else {
+        // fail-closed: 「確かめられなかった」を成功にしない
+        Err(out.join("\n"))
+    }
+}
+
+/// 翻訳の雛形を書き出す。既存ファイルは**上書きしない**。
+fn i18n_export(id: &str, out_path: Option<&str>) -> Result<String, String> {
+    if id.trim().is_empty() {
+        return Err(crate::i18n::tr(
+            "書き出す言語 ID を指定してください (例: zai i18n export fr)",
+        ));
+    }
+    let id = crate::locale::normalize(id);
+    let dest = match out_path {
+        Some(p) => PathBuf::from(p),
+        None => crate::config::zaivern_dir()
+            .join("locales")
+            .join(format!("{id}.json")),
+    };
+    if dest.exists() {
+        return Err(crate::i18n::trf(
+            "{path} は既にあります (上書きしません)",
+            &[("path", dest.display().to_string())],
+        ));
+    }
+    if let Some(d) = dest.parent() {
+        std::fs::create_dir_all(d).map_err(|e| format!("{} を作れません: {e}", d.display()))?;
+    }
+    let mut errs = Vec::new();
+    let map = crate::locale::resolved(&id, &[], &mut errs);
+    let sorted: std::collections::BTreeMap<&String, &String> = map.iter().collect();
+    let body = serde_json::to_string_pretty(&sorted).map_err(|e| e.to_string())?;
+    std::fs::write(&dest, body + "\n")
+        .map_err(|e| format!("{} を書けません: {e}", dest.display()))?;
+    Ok(crate::i18n::trf(
+        "🌐 {path} に {n} 件の雛形を書き出しました",
+        &[
+            ("path", dest.display().to_string()),
+            ("n", map.len().to_string()),
+        ],
+    ))
+}
+
+/// 翻訳シャード 1 件。`zai i18n missing` が出し、翻訳して `apply` で戻す。
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct I18nRow {
+    /// ID の名前空間 (`<module>.<action>` の左側)。
+    #[serde(default)]
+    module: String,
+    /// 安定 ID。`missing` の出力では空で、翻訳する人が埋める。
+    #[serde(default)]
+    id: String,
+    /// 原文 (日本語)。**書き換えない**。
+    ja: String,
+    #[serde(default)]
+    en: String,
+    #[serde(default, rename = "zh-CN")]
+    zh_cn: String,
+    #[serde(default)]
+    ko: String,
+    #[serde(default, rename = "pt-BR")]
+    pt_br: String,
+    #[serde(default)]
+    es: String,
+}
+
+impl I18nRow {
+    fn get(&self, lang: &str) -> &str {
+        match lang {
+            "en" => &self.en,
+            "zh-CN" => &self.zh_cn,
+            "ko" => &self.ko,
+            "pt-BR" => &self.pt_br,
+            "es" => &self.es,
+            _ => &self.ja,
+        }
+    }
+}
+
+/// 画面に出るのに辞書へ載っていない `tr("…")` を探す。
+///
+/// **見つかったら終了コード 1**。「訳し忘れたまま出荷した」を静かに通さない。
+fn i18n_missing(dir: &str, out: Option<&str>) -> Result<String, String> {
+    let src = if dir.trim().is_empty() {
+        PathBuf::from("src")
+    } else {
+        PathBuf::from(dir)
+    };
+    if !src.is_dir() {
+        return Err(crate::i18n::trf(
+            "{dir} がありません (リポジトリの中で実行してください)",
+            &[("dir", src.display().to_string())],
+        ));
+    }
+    let mut errs = Vec::new();
+    let ja = crate::locale::load_one(crate::locale::SOURCE_LANG, &[], &mut errs);
+    let known: std::collections::HashSet<&str> = ja
+        .keys()
+        .map(|s| s.as_str())
+        .chain(ja.values().map(|s| s.as_str()))
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<I18nRow> = Vec::new();
+    for (module, lit) in crate::locale::scan_source_literals(&src) {
+        if lit.trim().is_empty()
+            || crate::locale::NOT_TRANSLATED.contains(&lit.as_str())
+            || known.contains(lit.as_str())
+            || !seen.insert(lit.clone())
+        {
+            continue;
+        }
+        rows.push(I18nRow {
+            module,
+            ja: lit,
+            ..Default::default()
+        });
+    }
+
+    if let Some(path) = out {
+        let body = serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?;
+        std::fs::write(path, body + "\n").map_err(|e| format!("{path} を書けません: {e}"))?;
+        let msg = crate::i18n::trf(
+            "{n} 件を {path} へ書き出しました",
+            &[("n", rows.len().to_string()), ("path", path.to_string())],
+        );
+        return if rows.is_empty() { Ok(msg) } else { Err(msg) };
+    }
+    if rows.is_empty() {
+        return Ok(crate::i18n::tr("✅ 訳が無い文字列はありません"));
+    }
+    let mut out_lines: Vec<String> = rows
+        .iter()
+        .map(|r| format!("{}\t{:?}", r.module, r.ja))
+        .collect();
+    out_lines.push(crate::i18n::trf(
+        "--- 訳が無い文字列: {n} 件",
+        &[("n", rows.len().to_string())],
+    ));
+    Err(out_lines.join("\n"))
+}
+
+/// 翻訳シャードを `locales/*.json` 6 枚へ取り込む。
+///
+/// **プレースホルダが合わない訳は採らない** — 実行時に穴が開くより、英語のまま
+/// 出るほうが害が小さい。ID が衝突したら `_2` を付けて分ける (先に居るほうを
+/// 動かさない)。
+fn i18n_apply(shard: &str, dir: Option<&str>) -> Result<String, String> {
+    if shard.trim().is_empty() {
+        return Err(crate::i18n::tr(
+            "取り込むシャード JSON を指定してください (zai i18n missing --out で作れます)",
+        ));
+    }
+    let raw = std::fs::read_to_string(shard).map_err(|e| format!("{shard} を読めません: {e}"))?;
+    let rows: Vec<I18nRow> =
+        serde_json::from_str(&raw).map_err(|e| format!("{shard} の解析に失敗: {e}"))?;
+    let root = PathBuf::from(dir.unwrap_or("locales"));
+    if !root.is_dir() {
+        return Err(crate::i18n::trf(
+            "{dir} がありません",
+            &[("dir", root.display().to_string())],
+        ));
+    }
+
+    let langs: Vec<&str> = crate::locale::BUILTIN.iter().map(|(i, _, _)| *i).collect();
+    let mut maps: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+        Default::default();
+    for lg in &langs {
+        let p = root.join(format!("{lg}.json"));
+        let body = std::fs::read_to_string(&p)
+            .map_err(|e| format!("{} を読めません: {e}", p.display()))?;
+        let m = crate::locale::parse_json(&body, &p.display().to_string())?;
+        maps.insert((*lg).to_string(), m.into_iter().collect());
+    }
+
+    let mut used: std::collections::HashSet<String> =
+        maps[crate::locale::SOURCE_LANG].keys().cloned().collect();
+    let mut warns = Vec::new();
+    let mut added = 0usize;
+    for r in &rows {
+        let base = if r.id.contains('.') {
+            r.id.clone()
+        } else if r.id.is_empty() {
+            format!(
+                "{}.x",
+                if r.module.is_empty() {
+                    "misc"
+                } else {
+                    &r.module
+                }
+            )
+        } else {
+            format!("{}.{}", r.module, r.id)
+        };
+        let mut ident = base.clone();
+        let mut n = 2;
+        while used.contains(&ident) {
+            ident = format!("{base}_{n}");
+            n += 1;
+        }
+        used.insert(ident.clone());
+
+        let want = crate::locale::placeholders(&r.ja);
+        let en = if r.en.trim().is_empty() {
+            r.ja.clone()
+        } else {
+            r.en.clone()
+        };
+        for lg in &langs {
+            let v = if *lg == crate::locale::SOURCE_LANG {
+                r.ja.clone()
+            } else {
+                let t = r.get(lg);
+                let t = if t.trim().is_empty() {
+                    en.clone()
+                } else {
+                    t.to_string()
+                };
+                if crate::locale::placeholders(&t) == want {
+                    t
+                } else {
+                    warns.push(format!("⚠ {ident} [{lg}] プレースホルダ不一致 — en で代替"));
+                    if crate::locale::placeholders(&en) == want {
+                        en.clone()
+                    } else {
+                        r.ja.clone()
+                    }
+                }
+            };
+            maps.get_mut(*lg).expect("lang").insert(ident.clone(), v);
+        }
+        added += 1;
+    }
+
+    for lg in &langs {
+        let p = root.join(format!("{lg}.json"));
+        let body = serde_json::to_string_pretty(&maps[*lg]).map_err(|e| e.to_string())?;
+        std::fs::write(&p, body + "\n")
+            .map_err(|e| format!("{} を書けません: {e}", p.display()))?;
+    }
+    let mut out = warns;
+    out.push(crate::i18n::trf(
+        "{n} 件を取り込みました (合計 {total} 件)",
+        &[
+            ("n", added.to_string()),
+            ("total", maps[crate::locale::SOURCE_LANG].len().to_string()),
+        ],
+    ));
+    Ok(out.join("\n"))
 }
 
 // ───────────────────────── plugin サブコマンド (インスタンス不要) ─────────────────────────
@@ -2635,6 +3416,81 @@ fn uninstall_dispatch(args: &[String]) -> CliOut {
 
 #[cfg(test)]
 mod tests {
+    // ── zai lang (言語パックの導入) ────────────────────────────────
+
+    #[test]
+    fn 配布元の指定はowner_repoの形だけ通す() {
+        assert_eq!(
+            validate_slug("tacyan/zaivern-code").unwrap(),
+            "tacyan/zaivern-code"
+        );
+        assert_eq!(validate_slug("a_b/c.d-e").unwrap(), "a_b/c.d-e");
+        // URL や空要素、余計な階層は通さない (そのまま URL へ埋めるため)
+        for bad in [
+            "https://github.com/a/b",
+            "a/b/c",
+            "a/",
+            "/b",
+            "a b/c",
+            "a/b?x=1",
+            "../../etc",
+            "",
+        ] {
+            assert!(validate_slug(bad).is_err(), "{bad:?} を通してはいけない");
+        }
+    }
+
+    #[test]
+    fn 配布元の一覧はjsonから言語idと取得urlを取る() {
+        let body = r#"[
+          {"name":"en.json","download_url":"https://raw.example/en.json"},
+          {"name":"zh_CN.json","download_url":"https://raw.example/zh_CN.json"},
+          {"name":"README.md","download_url":"https://raw.example/README.md"},
+          {"name":"ko.json","download_url":"http://insecure/ko.json"},
+          {"name":"fr.json"}
+        ]"#;
+        let got = parse_lang_index(body, "o/r").unwrap();
+        // .json 以外は落ちる / http は落ちる / download_url が無いものも落ちる
+        // ファイル名は正規化されて zh_CN → zh-CN になる
+        assert_eq!(
+            got,
+            vec![
+                ("en".to_string(), "https://raw.example/en.json".to_string()),
+                (
+                    "zh-CN".to_string(),
+                    "https://raw.example/zh_CN.json".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn 配布元の応答が配列でなければエラー() {
+        assert!(parse_lang_index(r#"{"message":"Not Found"}"#, "o/r").is_err());
+        assert!(parse_lang_index("not json", "o/r").is_err());
+        // 空の locales/ は「0 件」であってエラーではない
+        assert_eq!(parse_lang_index("[]", "o/r").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn 入っていない言語へは切り替えない() {
+        // 同梱にもユーザー置き場にも無い言語は断る (書けても効かないため)
+        let e = lang_set("xx").unwrap_err();
+        assert!(
+            e.contains("zai lang install"),
+            "入れ方を案内していない: {e}"
+        );
+        // 引数無しも断る
+        assert!(lang_set("").is_err());
+    }
+
+    #[test]
+    fn 入っていない言語は消せない() {
+        let e = lang_remove("xx").unwrap_err();
+        assert!(!e.is_empty());
+        assert!(lang_remove("").is_err());
+    }
+
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {
@@ -3514,9 +4370,18 @@ prunable gitdir file points to non-existent location
                 "{name}: 終了時の判定行が無い (パイプ越しに嘘の緑が出る)"
             );
             assert!(sh.contains("_LABEL="), "{name}: 判定行のラベルが無い");
+            // **行頭固定では足りない。** 実際に `    exec env … cargo xwin check`
+            // (字下げ + env 経由) がこの検査をすり抜けていて、
+            // `tools/windows-check.sh` は判定行を 1 行も出していなかった。
+            // 字下げを落として**行の先頭語**で見る。
+            let bad: Vec<&str> = sh
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("exec ") && !l.starts_with("exec wine"))
+                .collect();
             assert!(
-                !sh.contains("\nexec docker ") && !sh.contains("\nexec cargo "),
-                "{name}: exec でプロセスを置き換えると判定行が出ない"
+                bad.is_empty(),
+                "{name}: exec でプロセスを置き換えると判定行が出ない: {bad:?}"
             );
         }
     }

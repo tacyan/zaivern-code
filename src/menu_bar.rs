@@ -69,6 +69,46 @@ pub fn theme_menu_ui(ui: &mut egui::Ui, themes: &[ThemeEntry], cmds: &mut Vec<Cm
         });
 }
 
+/// メニューに 1 行として出る UI 表示言語。
+#[derive(Clone)]
+pub struct LanguageEntry {
+    /// `Cmd::SetUiLanguage` にそのまま渡す値 (`"auto"` か言語 ID)。
+    pub id: String,
+    /// 母語表記 (`日本語` / `简体中文` …)。**英語表記に直さない** —
+    /// 読めない言語になってしまった人が自分の言語を見つけられるように。
+    pub name: String,
+    pub selected: bool,
+    /// 同梱ではなく `~/.zaivern/locales/*.json` 由来か。
+    pub community: bool,
+}
+
+/// UI 表示言語の選択メニュー本体。トップバーの 🌐 と
+/// メニューバーの「表示 > 表示言語」で**同じ実装**を使う。
+///
+/// 並びは `locale::BUILTIN` の順 = 利用者が決めた優先順位
+/// (英語 → 日本語 → 简体中文 → 한국어 → Português (Brasil) → Español)。
+pub fn language_menu_ui(ui: &mut egui::Ui, langs: &[LanguageEntry], cmds: &mut Vec<Cmd>) {
+    ui.set_min_width(220.0);
+    egui::ScrollArea::vertical()
+        .id_salt("zv-lang-menu")
+        .max_height(420.0)
+        .show(ui, |ui| {
+            let mut community_shown = false;
+            for l in langs {
+                // コミュニティ言語は同梱と混ぜない (どれが公式かが分かるように)
+                if l.community && !community_shown {
+                    ui.separator();
+                    heading(ui, &tr("追加された言語 (~/.zaivern/locales)"));
+                    community_shown = true;
+                }
+                if ui.selectable_label(l.selected, &l.name).clicked() {
+                    cmds.push(Cmd::SetUiLanguage(l.id.clone()));
+                    ui.close_menu();
+                }
+            }
+        });
+}
+
 /// 表示メニューが受け取っている Git blame の状態。
 ///
 /// `MenuInfo::git_blame` はいま **on/off の 2 値しか運んでいない**
@@ -180,6 +220,8 @@ pub struct MenuInfo {
     pub agent_presets: Vec<(usize, String, String)>,
     /// 配色テーマの一覧 (同梱 + カスタム)。`ThemeEntry::group` で段に分かれる
     pub themes: Vec<ThemeEntry>,
+    /// UI 表示言語の一覧 (先頭が「自動」、続いて同梱 6 言語、最後に追加言語)
+    pub languages: Vec<LanguageEntry>,
     /// アクティブなタブの改行コード表示 (例 "CRLF")。タブが無ければ None
     pub line_ending: Option<String>,
     /// 画面全体のズーム倍率 (1.0 = 等倍)。表示メニューの「戻す」の有効/無効に使う
@@ -630,6 +672,9 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {
                 theme_menu_ui(ui, &info.themes, cmds);
+            });
+            ui.menu_button(tr("表示言語"), |ui| {
+                language_menu_ui(ui, &info.languages, cmds);
             });
             ui.separator();
             // ズームは二階建て。「画面全体」を先に置き、「このファイルだけ」を

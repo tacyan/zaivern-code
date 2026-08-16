@@ -7,7 +7,7 @@
 **Claude Code・Codex・Gemini CLI など、いま使っている AI コーディング CLI をひとつの操縦席へ。**<br>
 起動・監視・指示を、macOS・Windows・Linux で動くひとつのネイティブアプリから。
 
-[English](README.md) | [日本語](README.ja.md)
+[English](README.md) | **日本語** | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)
@@ -104,6 +104,32 @@ zai update --yes      # 確認を求めずに更新する
 削除は `zai uninstall`（`--dry-run` で消える対象を一覧表示）。削除の対象は
 実行ファイル本体と `~/.zaivern` だけで、`PATH` 上の別の `zai` は一覧に出すだけで
 消しません。
+
+## 表示言語
+
+同梱しているのは **English・日本語・简体中文・한국어・Português (Brasil)・Español** の
+6 言語です。切り替えに**再起動は要りません**。選んだ次のフレームから画面全体が
+入れ替わります。
+
+入口はツールバーの 🌐 メニュー、メニューバーの「表示 → 表示言語」、コマンドパレット、
+設定画面の「外観」。どこから変えても `~/.zaivern/config.toml` の `ui_language` へ
+集まります。既定の `"auto"` は OS の言語に従います。
+
+同梱していない言語は、アプリを作り直さずに GitHub から入れられます。
+
+```sh
+zai lang list --remote        # 配布元にある言語パックを見る
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+自分で作る場合は、`zai lang export fr` で雛形を `~/.zaivern/locales/fr.json` へ書き出し、
+編集したら `zai lang check fr` で過不足を検査して `zai lang set fr`。**同梱と同じ ID を
+1 行書けば、その 1 行だけを上書きできます**。1 語直すために辞書を丸ごと持つ必要は
+ありません。
+
+詳しくは [docs/i18n.md](docs/i18n.md) を参照してください。
 
 ## 主な機能
 

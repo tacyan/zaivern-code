@@ -51,6 +51,7 @@ mod keybinds;
 mod lease;
 mod license;
 mod local_history;
+mod locale;
 mod lockx;
 mod lsp;
 mod markdown;
@@ -140,6 +141,13 @@ fn main() -> eframe::Result<()> {
     // ps/top で見つけやすいプロセス名にする (Linux のみ実効。他 OS は
     // 実行ファイル名がそのままアクティビティモニタ等に出る)。
     instances::set_process_name();
+
+    // UI 言語の自動判定を起こす。**環境変数はここで即座に読む**が、macOS だけは
+    // `defaults` を起こす必要があるので裏のスレッドへ回る (UI を待たせない)。
+    // CLI 経路より先に置くのは、`zai` のサブコマンドが出す文言も同じ言語に
+    // したいから。
+    locale::begin_detection();
+    cli::init_cli_locale();
 
     // サブコマンド指定なら CLI として処理して終了する。
     // 引数なし / パス指定のときは None が返り、そのまま GUI 起動へ進む。

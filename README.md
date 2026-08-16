@@ -7,7 +7,7 @@
 **One cockpit for Claude Code, Codex, Gemini CLI, and the other AI coding CLIs you already use.**<br>
 Launch, watch, and steer them from a single native app on macOS, Windows, and Linux.
 
-[English](README.md) | [日本語](README.ja.md)
+**English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)
 [![CI](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml/badge.svg)](https://github.com/tacyan/zaivern-code/actions/workflows/test.yml)
@@ -103,6 +103,34 @@ thing.
 
 `zai uninstall` removes it (`--dry-run` lists what would go). Uninstalling touches only
 the executable and `~/.zaivern`; anything else on your `PATH` is listed, never deleted.
+
+## Language
+
+The interface ships in six languages — English, 日本語, 简体中文, 한국어,
+Português (Brasil), and Español — and a switch takes effect on the next frame,
+**with no restart**.
+
+Pick one from the 🌐 menu in the toolbar, from **View → Language** in the menu bar,
+from the command palette, or in Settings → Appearance. Whichever entry you use, the
+choice lands in `ui_language` in `~/.zaivern/config.toml`; the default `"auto"` follows
+the language of your OS.
+
+Languages that are not bundled install from a GitHub repository, without rebuilding the
+app:
+
+```sh
+zai lang list --remote        # language packs available from the source repo
+zai lang install zh-CN
+zai lang set zh-CN
+zai lang install fr --from someone/zaivern-lang-fr
+```
+
+To write your own, `zai lang export fr` writes a template to `~/.zaivern/locales/fr.json`;
+edit it, check it with `zai lang check fr`, then `zai lang set fr`. **Writing a single ID
+that a bundled language already has overrides just that one line**, so fixing one label
+does not mean carrying a whole dictionary.
+
+[docs/i18n.md](docs/i18n.md) covers the rest.
 
 ## Key Features
 

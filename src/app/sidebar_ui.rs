@@ -236,20 +236,41 @@ impl ZaivernApp {
 
         // 有効/無効の切り替えを保存し、登録内容を作り直す
         if let Some((name, enabled)) = pl.toggle {
-            self.cfg.plugins.set_enabled(&name, enabled);
-            self.cfg.global_plugins.set_enabled(&name, enabled);
-            if let Err(e) = config::save_plugins_section(&self.cfg) {
-                self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false);
+            // **言語パックは同時に 1 つだけ。** 素直に有効化すると
+            // english-mode と korean-mode が両方「有効」になり、どちらが効いて
+            // いるのかが画面から読み取れなくなる (実際に効くのは名前順の先頭で、
+            // 表示と食い違う)。言語パックの切り替えは「表示言語を選ぶ」ことに
+            // 読み替え、`set_ui_language` に一本化する — あちらが他の言語パックを
+            // 無効へ倒し、`config.toml` の `ui_language` まで揃えてくれる。
+            let as_language = self
+                .language_plugins()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, lang)| {
+                    if enabled {
+                        lang
+                    } else {
+                        locale::AUTO.to_string()
+                    }
+                });
+            if let Some(target) = as_language {
+                self.set_ui_language(&target, ctx);
+            } else {
+                self.cfg.plugins.set_enabled(&name, enabled);
+                self.cfg.global_plugins.set_enabled(&name, enabled);
+                if let Err(e) = config::save_plugins_section(&self.cfg) {
+                    self.toast(trf("設定の保存に失敗: {e}", &[("e", e)]), false);
+                }
+                self.rebuild_plugins();
+                let verb = tr(if enabled { "有効" } else { "無効" });
+                self.toast(
+                    trf(
+                        "🔌 {name} を{verb}にしました",
+                        &[("name", name), ("verb", verb)],
+                    ),
+                    true,
+                );
             }
-            self.rebuild_plugins();
-            let verb = tr(if enabled { "有効" } else { "無効" });
-            self.toast(
-                trf(
-                    "🔌 {name} を{verb}にしました",
-                    &[("name", name), ("verb", verb)],
-                ),
-                true,
-            );
         }
         // 設定値の変更を保存し、実行中のプラグインへも反映する
         if let Some((name, key, value)) = pl.setting {

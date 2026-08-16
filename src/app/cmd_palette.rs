@@ -1240,6 +1240,35 @@ impl ZaivernApp {
                 Cmd::SetTheme(path.clone()),
             ));
         }
+        // 表示言語。**母語表記と ID の両方を行に入れる** — 英語しか読めない画面から
+        // 日本語へ戻すとき「日本語」で絞り込めないと詰むし、逆も同じだから。
+        // 同梱 6 言語のあとに `~/.zaivern/locales/*.json` のコミュニティ言語が続く。
+        let current_lang = i18n::current();
+        cmds.push((
+            "🌐".into(),
+            trf(
+                "表示言語: 自動 (auto) — いまは {name}",
+                &[("name", locale::display_name(&current_lang))],
+            ),
+            String::new(),
+            Cmd::SetUiLanguage(locale::AUTO.into()),
+        ));
+        for info in self.available_locales() {
+            cmds.push((
+                if info.id == current_lang {
+                    "✓"
+                } else {
+                    "🌐"
+                }
+                .into(),
+                trf(
+                    "表示言語: {name} ({id})",
+                    &[("name", info.name.clone()), ("id", info.id.clone())],
+                ),
+                String::new(),
+                Cmd::SetUiLanguage(info.id.clone()),
+            ));
+        }
         for (pi, p) in self.plugins.iter().enumerate() {
             for (ci, c) in p.commands.iter().enumerate() {
                 cmds.push((

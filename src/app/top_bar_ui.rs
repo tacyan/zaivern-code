@@ -32,13 +32,15 @@ impl ZaivernApp {
                             // 装飾系 (テーマ / リモート / 音声 / ペット) は 1 つの
                             // 「⋯」へ畳む。エージェント操作だけは常に表に残す。
                             ui.menu_button("⋯", |ui| {
+                                self.top_bar_language_menu(ui, &mut cmds);
                                 self.top_bar_theme_menu(ui, &mut cmds);
                                 self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
                                 self.top_bar_pet_menu(ui, &mut cmds);
                             })
                             .response
-                            .on_hover_text(tr("テーマ・スマホリモート・音声・ペット"));
+                            .on_hover_text(tr("表示言語・テーマ・スマホリモート・音声・ペット"));
                         } else {
+                            self.top_bar_language_menu(ui, &mut cmds);
                             self.top_bar_theme_menu(ui, &mut cmds);
                             self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
                             self.top_bar_pet_menu(ui, &mut cmds);
@@ -672,6 +674,45 @@ impl ZaivernApp {
         tutorial::anchor(ui.ctx(), AnchorId::ThemeMenu, menu.response.rect);
         menu.response
             .on_hover_text(tr("テーマ（プラグインのカスタムテーマも使えます）"));
+    }
+
+    /// メニューに出す UI 表示言語の行を組む。
+    ///
+    /// 先頭は必ず「自動」。**いま何が選ばれているかは `cfg.ui_language` で判定する**
+    /// — 解決後の言語 (`i18n::current()`) で印を付けると、auto を選んでいる人の
+    /// 印が「日本語」に付いてしまい、auto へ戻せなくなる。
+    pub(super) fn language_entries(&self) -> Vec<menu_bar::LanguageEntry> {
+        let chosen = self.cfg.ui_language.trim();
+        let now = i18n::current();
+        let mut out = vec![menu_bar::LanguageEntry {
+            id: locale::AUTO.to_string(),
+            name: trf("自動 — {name}", &[("name", locale::display_name(&now))]),
+            selected: chosen.is_empty() || chosen.eq_ignore_ascii_case(locale::AUTO),
+            community: false,
+        }];
+        for i in self.available_locales() {
+            out.push(menu_bar::LanguageEntry {
+                selected: chosen == i.id,
+                name: i.name.clone(),
+                id: i.id,
+                community: !i.builtin,
+            });
+        }
+        out
+    }
+
+    /// トップバー: 🌐 UI 表示言語メニュー。
+    ///
+    /// 🎨 の隣に置く — 「見た目を変える」ものが 1 か所にまとまる。
+    pub(super) fn top_bar_language_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let langs = self.language_entries();
+        let menu = ui.menu_button("🌐", |ui| {
+            menu_bar::language_menu_ui(ui, &langs, cmds);
+        });
+        menu.response.on_hover_text(trf(
+            "表示言語 — いまは {name}（~/.zaivern/locales に JSON を置けば言語を足せます）",
+            &[("name", locale::display_name(&i18n::current()))],
+        ));
     }
 
     /// トップバー: 📱 スマホリモートと 🎤 音声入力まわり。
