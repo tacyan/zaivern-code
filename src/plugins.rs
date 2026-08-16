@@ -2602,7 +2602,10 @@ dict = "lang"
                 !p.default_enabled,
                 "{name}: 入れただけで言語が変わってはいけない"
             );
-            let l = p.language.as_ref().unwrap_or_else(|| panic!("{name}: [language] が無い"));
+            let l = p
+                .language
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: [language] が無い"));
             assert!(
                 builtin.contains(&l.id.as_str()),
                 "{name}: id {} が同梱辞書に無い",
@@ -2611,7 +2614,11 @@ dict = "lang"
             assert!(!seen.contains(&l.id), "{name}: id {} が重複", l.id);
             seen.push(l.id.clone());
         }
-        assert_eq!(seen.len(), builtin.len(), "同梱言語ぶんのプラグインが揃っている");
+        assert_eq!(
+            seen.len(),
+            builtin.len(),
+            "同梱言語ぶんのプラグインが揃っている"
+        );
     }
 
     /// 既存プラグイン (指定なし) の挙動が変わらないこと。
@@ -2634,7 +2641,8 @@ dict = "lang"
         assert!(!p.default_enabled, "初回は無効で入る (勝手に英語にしない)");
         let l = p.language.as_ref().expect("language section");
         assert_eq!(l.id, "en");
-        let dict = crate::i18n::load_dict(l.dict.as_ref().expect("dict あり")).expect("辞書が読める");
+        let dict =
+            crate::i18n::load_dict(l.dict.as_ref().expect("dict あり")).expect("辞書が読める");
         assert!(
             dict.len() >= 20,
             "主要ラベルの訳が入っている (現在 {} 件)",

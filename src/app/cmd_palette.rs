@@ -1255,7 +1255,12 @@ impl ZaivernApp {
         ));
         for info in self.available_locales() {
             cmds.push((
-                if info.id == current_lang { "✓" } else { "🌐" }.into(),
+                if info.id == current_lang {
+                    "✓"
+                } else {
+                    "🌐"
+                }
+                .into(),
                 trf(
                     "表示言語: {name} ({id})",
                     &[("name", info.name.clone()), ("id", info.id.clone())],

@@ -644,11 +644,15 @@ impl ZaivernApp {
             // 確定キーの再送・コスト上限・チェックポイントが全部そのまま効く。
             (remote::BulkMode::All, true) => match self.queue_submit_all(&text) {
                 // None = コスト上限。理由は送信側がトーストで説明済み
-                None => return json!({"ok": false, "error": tr("送信できませんでした")}).to_string(),
+                None => {
+                    return json!({"ok": false, "error": tr("送信できませんでした")}).to_string()
+                }
                 Some(n) => n,
             },
             (remote::BulkMode::Stalled, true) => match self.queue_submit_stalled(&text) {
-                None => return json!({"ok": false, "error": tr("送信できませんでした")}).to_string(),
+                None => {
+                    return json!({"ok": false, "error": tr("送信できませんでした")}).to_string()
+                }
                 Some(n) => n,
             },
             // 「入れるだけ」は Cockpit に対応する入口が無い (一斉送信は必ず確定する)
@@ -701,7 +705,10 @@ impl ZaivernApp {
         // Esc 1 バイト。端末キーの [Esc] と同じものを人数分だけ送る
         let n = self.bulk_write_raw(&targets, b"\x1b");
         self.toast(
-            trf("⏹ {n} セッションへ停止を送りました", &[("n", n.to_string())]),
+            trf(
+                "⏹ {n} セッションへ停止を送りました",
+                &[("n", n.to_string())],
+            ),
             true,
         );
         json!({"ok": true, "sent": n, "mode": mode.as_str()}).to_string()
@@ -1673,7 +1680,11 @@ mod bulk_wiring_tests {
     #[test]
     fn 一覧の状態は看板の判定をそのまま出す() {
         let body = body_of("pub(super) fn remote_reply_agents(");
-        for entry in ["kanban::column_for(", "kanban::state_label(", "remote::is_waiting_lane("] {
+        for entry in [
+            "kanban::column_for(",
+            "kanban::state_label(",
+            "remote::is_waiting_lane(",
+        ] {
             assert!(
                 body.contains(entry),
                 "一覧が {entry} を使っていない (状態を作り直している疑い)"

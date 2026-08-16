@@ -46,7 +46,11 @@ pub const BUILTIN: &[(&str, &str, &str)] = &[
     ("ja", "日本語", include_str!("../locales/ja.json")),
     ("zh-CN", "简体中文", include_str!("../locales/zh-CN.json")),
     ("ko", "한국어", include_str!("../locales/ko.json")),
-    ("pt-BR", "Português (Brasil)", include_str!("../locales/pt-BR.json")),
+    (
+        "pt-BR",
+        "Português (Brasil)",
+        include_str!("../locales/pt-BR.json"),
+    ),
     ("es", "Español", include_str!("../locales/es.json")),
 ];
 
@@ -55,7 +59,10 @@ pub const AUTO: &str = "auto";
 
 /// 同梱言語の生 JSON。
 pub fn builtin_json(id: &str) -> Option<&'static str> {
-    BUILTIN.iter().find(|(i, _, _)| *i == id).map(|(_, _, j)| *j)
+    BUILTIN
+        .iter()
+        .find(|(i, _, _)| *i == id)
+        .map(|(_, _, j)| *j)
 }
 
 /// 言語の表示名。同梱に無ければ ID をそのまま返す（コミュニティ言語）。
@@ -112,11 +119,19 @@ pub fn normalize(tag: &str) -> String {
         "zh" => {
             let hant = script == "Hant"
                 || (script.is_empty() && matches!(region.as_str(), "TW" | "HK" | "MO"));
-            if hant { "zh-TW".into() } else { "zh-CN".into() }
+            if hant {
+                "zh-TW".into()
+            } else {
+                "zh-CN".into()
+            }
         }
         // ポルトガル語は既定をブラジルにする (同梱が pt-BR のため)。
         "pt" => {
-            if region == "PT" { "pt-PT".into() } else { "pt-BR".into() }
+            if region == "PT" {
+                "pt-PT".into()
+            } else {
+                "pt-BR".into()
+            }
         }
         "" => String::new(),
         _ => lang,
@@ -881,7 +896,7 @@ mod tests {
         let other: HashMap<String, String> = [
             ("a.b", "{m} 件を保存"), // プレースホルダ違い
             ("a.c", "開く"),
-            ("a.d", "   "),  // 空
+            ("a.d", "   "),   // 空
             ("a.zz", "余分"), // 基準に無い
         ]
         .iter()
@@ -938,8 +953,11 @@ mod tests {
         let mut bad = Vec::new();
         for (text, ids) in by_text.iter().filter(|(_, v)| v.len() > 1) {
             for (lang, m) in &maps {
-                let vals: std::collections::BTreeSet<&str> =
-                    ids.iter().filter_map(|k| m.get(*k)).map(|s| s.as_str()).collect();
+                let vals: std::collections::BTreeSet<&str> = ids
+                    .iter()
+                    .filter_map(|k| m.get(*k))
+                    .map(|s| s.as_str())
+                    .collect();
                 if vals.len() > 1 {
                     bad.push(format!("{text:?} {ids:?} [{lang}] -> {vals:?}"));
                 }
@@ -947,7 +965,11 @@ mod tests {
         }
         bad.sort();
         bad.truncate(15);
-        assert!(bad.is_empty(), "同じ原文なのに訳が違う:\n{}", bad.join("\n"));
+        assert!(
+            bad.is_empty(),
+            "同じ原文なのに訳が違う:\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]

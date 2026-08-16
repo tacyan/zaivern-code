@@ -900,9 +900,9 @@ fn lang_repo(from: Option<&str>) -> Result<String, String> {
             return validate_slug(v.trim());
         }
     }
-    distribution().map(|d| d.slug).map_err(|_| {
-        crate::i18n::tr("配布元が分からないので --from owner/repo で指定してください")
-    })
+    distribution()
+        .map(|d| d.slug)
+        .map_err(|_| crate::i18n::tr("配布元が分からないので --from owner/repo で指定してください"))
 }
 
 /// `owner/repo` の形だけを通す (URL を組む前に必ず確かめる)。
@@ -1048,11 +1048,7 @@ fn lang_install(
         let have: Vec<&str> = idx.iter().map(|(i, _)| i.as_str()).collect();
         return Err(crate::i18n::trf(
             "{slug} に {id}.json がありません (あるのは: {have})",
-            &[
-                ("slug", slug),
-                ("id", want),
-                ("have", have.join(" ")),
-            ],
+            &[("slug", slug), ("id", want), ("have", have.join(" "))],
         ));
     };
 
@@ -1336,7 +1332,8 @@ fn i18n_export(id: &str, out_path: Option<&str>) -> Result<String, String> {
     let map = crate::locale::resolved(&id, &[], &mut errs);
     let sorted: std::collections::BTreeMap<&String, &String> = map.iter().collect();
     let body = serde_json::to_string_pretty(&sorted).map_err(|e| e.to_string())?;
-    std::fs::write(&dest, body + "\n").map_err(|e| format!("{} を書けません: {e}", dest.display()))?;
+    std::fs::write(&dest, body + "\n")
+        .map_err(|e| format!("{} を書けません: {e}", dest.display()))?;
     Ok(crate::i18n::trf(
         "🌐 {path} に {n} 件の雛形を書き出しました",
         &[
@@ -1472,22 +1469,28 @@ fn i18n_apply(shard: &str, dir: Option<&str>) -> Result<String, String> {
         Default::default();
     for lg in &langs {
         let p = root.join(format!("{lg}.json"));
-        let body = std::fs::read_to_string(&p).map_err(|e| format!("{} を読めません: {e}", p.display()))?;
+        let body = std::fs::read_to_string(&p)
+            .map_err(|e| format!("{} を読めません: {e}", p.display()))?;
         let m = crate::locale::parse_json(&body, &p.display().to_string())?;
         maps.insert((*lg).to_string(), m.into_iter().collect());
     }
 
-    let mut used: std::collections::HashSet<String> = maps[crate::locale::SOURCE_LANG]
-        .keys()
-        .cloned()
-        .collect();
+    let mut used: std::collections::HashSet<String> =
+        maps[crate::locale::SOURCE_LANG].keys().cloned().collect();
     let mut warns = Vec::new();
     let mut added = 0usize;
     for r in &rows {
         let base = if r.id.contains('.') {
             r.id.clone()
         } else if r.id.is_empty() {
-            format!("{}.x", if r.module.is_empty() { "misc" } else { &r.module })
+            format!(
+                "{}.x",
+                if r.module.is_empty() {
+                    "misc"
+                } else {
+                    &r.module
+                }
+            )
         } else {
             format!("{}.{}", r.module, r.id)
         };
@@ -1510,7 +1513,11 @@ fn i18n_apply(shard: &str, dir: Option<&str>) -> Result<String, String> {
                 r.ja.clone()
             } else {
                 let t = r.get(lg);
-                let t = if t.trim().is_empty() { en.clone() } else { t.to_string() };
+                let t = if t.trim().is_empty() {
+                    en.clone()
+                } else {
+                    t.to_string()
+                };
                 if crate::locale::placeholders(&t) == want {
                     t
                 } else {
@@ -1530,7 +1537,8 @@ fn i18n_apply(shard: &str, dir: Option<&str>) -> Result<String, String> {
     for lg in &langs {
         let p = root.join(format!("{lg}.json"));
         let body = serde_json::to_string_pretty(&maps[*lg]).map_err(|e| e.to_string())?;
-        std::fs::write(&p, body + "\n").map_err(|e| format!("{} を書けません: {e}", p.display()))?;
+        std::fs::write(&p, body + "\n")
+            .map_err(|e| format!("{} を書けません: {e}", p.display()))?;
     }
     let mut out = warns;
     out.push(crate::i18n::trf(
@@ -3412,7 +3420,10 @@ mod tests {
 
     #[test]
     fn 配布元の指定はowner_repoの形だけ通す() {
-        assert_eq!(validate_slug("tacyan/zaivern-code").unwrap(), "tacyan/zaivern-code");
+        assert_eq!(
+            validate_slug("tacyan/zaivern-code").unwrap(),
+            "tacyan/zaivern-code"
+        );
         assert_eq!(validate_slug("a_b/c.d-e").unwrap(), "a_b/c.d-e");
         // URL や空要素、余計な階層は通さない (そのまま URL へ埋めるため)
         for bad in [
@@ -3465,7 +3476,10 @@ mod tests {
     fn 入っていない言語へは切り替えない() {
         // 同梱にもユーザー置き場にも無い言語は断る (書けても効かないため)
         let e = lang_set("xx").unwrap_err();
-        assert!(e.contains("zai lang install"), "入れ方を案内していない: {e}");
+        assert!(
+            e.contains("zai lang install"),
+            "入れ方を案内していない: {e}"
+        );
         // 引数無しも断る
         assert!(lang_set("").is_err());
     }

@@ -686,10 +686,7 @@ impl ZaivernApp {
         let now = i18n::current();
         let mut out = vec![menu_bar::LanguageEntry {
             id: locale::AUTO.to_string(),
-            name: trf(
-                "自動 — {name}",
-                &[("name", locale::display_name(&now))],
-            ),
+            name: trf("自動 — {name}", &[("name", locale::display_name(&now))]),
             selected: chosen.is_empty() || chosen.eq_ignore_ascii_case(locale::AUTO),
             community: false,
         }];

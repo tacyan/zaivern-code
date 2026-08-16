@@ -2701,7 +2701,10 @@ mod tests {
         );
         // 看板のレーンはサーバ (kanban.rs) から来たものを出す。
         // スマホ側でレーン名やしきい値を作り直していないこと
-        assert!(PAGE.contains("alanes.forEach"), "レーンをサーバから出していない");
+        assert!(
+            PAGE.contains("alanes.forEach"),
+            "レーンをサーバから出していない"
+        );
         for ng in ["承認待ち", "停滞・異常", "思考中", "検証中"] {
             assert!(
                 !PAGE.contains(ng),
@@ -2725,7 +2728,10 @@ mod tests {
             assert!(PAGE.contains(m), "宛先モード {m} が無い");
         }
         // 既定はいちばん狭い宛先 (開いた瞬間に全員宛てだと誤爆する)
-        assert!(PAGE.contains("let bulkMode = 'one';"), "既定が 1 体宛てでない");
+        assert!(
+            PAGE.contains("let bulkMode = 'one';"),
+            "既定が 1 体宛てでない"
+        );
         // 送信前に件数を見せ、0 体なら押せないこと
         assert!(PAGE.contains("bulkCount()"));
         assert!(PAGE.contains("$('tsend').disabled = n === 0;"));
@@ -2983,6 +2989,47 @@ mod tests {
 
     /// 実際に配る経路 (i18n の辞書 → JSON → 差し込み) が繋がっていること。
     /// HTTP は触らないので、サーバを起こさずに確かめられる。
+    #[test]
+    fn 同梱の全言語でスマホ画面の文言が入る() {
+        // 「PC で言語を変えたらスマホもその言語になる」の**中身**を見る。
+        // 仕組み (差し込み口があること) だけでなく、**同梱 6 言語ぶんの実際の
+        // 訳がページへ入ること**まで固定する。グローバル状態は触らない
+        // (並列に走る他のテストの tr() を揺らさないため、辞書は直に読む)。
+        for (id, _, _) in crate::locale::BUILTIN {
+            let mut errs = Vec::new();
+            let map = crate::locale::resolved(id, &[], &mut errs);
+            assert!(errs.is_empty(), "{id}: {errs:?}");
+            let dict: std::collections::BTreeMap<&String, &String> = map
+                .iter()
+                .filter(|(k, _)| k.starts_with("remote."))
+                .collect();
+            assert!(
+                dict.len() >= 50,
+                "{id}: remote.* が {} 件しかない",
+                dict.len()
+            );
+            let json = serde_json::to_string(&dict).expect("json");
+            let out = localize_page(PAGE, &json, id);
+
+            assert!(
+                out.contains(&format!("<html lang=\"{id}\">")),
+                "{id}: lang 属性"
+            );
+            // 代表的な 3 つの文言が、その言語の綴りで入っていること
+            for key in ["remote.save", "remote.tab_agent", "remote.send"] {
+                let Some(want) = map.get(key) else {
+                    panic!("{id}: {key} が辞書に無い");
+                };
+                let esc = serde_json::to_string(want).expect("json");
+                let esc = esc.trim_matches('"');
+                assert!(
+                    out.contains(esc),
+                    "{id}: {key} の訳 {want:?} がページに入っていない"
+                );
+            }
+        }
+    }
+
     #[test]
     fn 配信するページには辞書と言語が入っている() {
         for p in [PAGE, VOICE_PAGE] {

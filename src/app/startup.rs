@@ -754,7 +754,10 @@ impl ZaivernApp {
     pub(crate) fn open_locales_dir(&mut self) {
         let dir = config::zaivern_dir().join("locales");
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.toast(trf("置き場を作れません: {e}", &[("e", e.to_string())]), false);
+            self.toast(
+                trf("置き場を作れません: {e}", &[("e", e.to_string())]),
+                false,
+            );
             return;
         }
         self.open_path(&dir);
@@ -776,7 +779,10 @@ impl ZaivernApp {
         let id = i18n::current();
         let dir = config::zaivern_dir().join("locales");
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.toast(trf("置き場を作れません: {e}", &[("e", e.to_string())]), false);
+            self.toast(
+                trf("置き場を作れません: {e}", &[("e", e.to_string())]),
+                false,
+            );
             return;
         }
         let path = dir.join(format!("{id}.json"));
@@ -875,7 +881,10 @@ impl ZaivernApp {
     /// 次のフレームから全ラベルが新しい言語で描き直される。
     pub(super) fn apply_ui_language(&mut self) {
         let extra = self.plugin_locale_dirs();
-        let known: Vec<String> = locale::available(&extra).into_iter().map(|i| i.id).collect();
+        let known: Vec<String> = locale::available(&extra)
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
         let id = locale::resolve(
             &self.cfg.ui_language,
             locale::detected().as_deref(),
