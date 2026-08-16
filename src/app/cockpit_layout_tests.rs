@@ -193,11 +193,15 @@ fn 八枚のときホイールでページがスクロールする() {
     );
 }
 
-/// Cockpit のミニターミナルは **hover_scroll=false** で描く。
+/// Cockpit のミニターミナルは **allow_resize=false / hover_scroll=false** で描く。
 ///
-/// true にすると、タイルの上でホイールを回したときに端末の履歴だけが動き、
-/// ページがスクロールできなくなる (タイルは画面の大半を覆っているので、
-/// 事実上「6 枚目以降が見られない」に戻る)。
+/// hover_scroll を true にすると、タイルの上でホイールを回したときに端末の
+/// 履歴だけが動き、ページがスクロールできなくなる (タイルは画面の大半を
+/// 覆っているので、事実上「6 枚目以降が見られない」に戻る)。
+///
+/// allow_resize は `app::deck_wiring_tests::ライブ枠は端末の大きさを持たない`
+/// の側で理由を書いている (小さな枠へ PTY を縮めると、CLI エージェントの
+/// 会話が履歴へ二重に積まれる)。
 #[test]
 fn ミニターミナルはホイールを外側へ譲る() {
     let src = crate::app::SRC.replace("\r\n", "\n");
@@ -212,7 +216,7 @@ fn ミニターミナルはホイールを外側へ譲る() {
     // 改行位置に依存しないよう空白を潰してから照合する
     let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("mini_font, true, true, false"),
+        flat.contains("mini_font, true, false, false"),
         "Cockpit のミニターミナルは hover_scroll=false (最後の引数) で描くこと"
     );
 }

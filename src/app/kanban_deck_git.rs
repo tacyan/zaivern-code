@@ -145,8 +145,13 @@ impl ZaivernApp {
                 return None;
             }
             // 1 枚が壊れてもフレーム全体を捨てないための印 (Cockpit と同じ)
+            // ライブ枠は**PTY の大きさを持たない** (`allow_resize = false`)。
+            // レーンの小さな枠に合わせて縮めると、枠より高いフレームを描き直す
+            // CLI エージェントの会話が履歴へ二重に積まれる
+            // (`terminal::grid_rect` の説明を参照)。枠が足りないぶんは
+            // いちばん下 (最新) を映すので、見え方は変わらない。
             Some(draw_subview(Subview::Session(sid), || {
-                terminal::draw(ui, s, &live_theme, mini_font, true, true, false)
+                terminal::draw(ui, s, &live_theme, mini_font, true, false, false)
             }))
         };
         let acts = kanban::ui(
@@ -371,8 +376,10 @@ impl ZaivernApp {
                 return None;
             }
             // 1 枚が壊れてもフレーム全体を捨てないための印 (Cockpit と同じ)
+            // 看板と同じ — ライブ枠は PTY の大きさを持たない
+            // (画面を切り替えただけで端末が縮み、履歴が二重になるのを防ぐ)。
             Some(draw_subview(Subview::Session(id), || {
-                terminal::draw(ui, s, &live_theme, mini_font, true, true, false)
+                terminal::draw(ui, s, &live_theme, mini_font, true, false, false)
             }))
         };
         let acts = deck::ui(
