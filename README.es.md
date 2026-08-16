@@ -130,7 +130,8 @@ Para hacer el tuyo, `zai lang export fr` escribe una plantilla en
 `zai lang set fr`. **Escribir un único ID que un idioma incluido ya tiene sobrescribe solo
 esa línea**, así que corregir una etiqueta no obliga a arrastrar un diccionario entero.
 
-[docs/i18n.md](docs/i18n.md) cubre el resto.
+**¿Quieres traducir Zaivern Code a tu idioma?** Sin Rust y sin recompilar: basta con dejar un
+archivo JSON: [docs/translating.md](docs/translating.md). Cómo funciona: [docs/i18n.md](docs/i18n.md).
 
 ## Funcionalidades principales
 

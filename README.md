@@ -130,7 +130,8 @@ edit it, check it with `zai lang check fr`, then `zai lang set fr`. **Writing a 
 that a bundled language already has overrides just that one line**, so fixing one label
 does not mean carrying a whole dictionary.
 
-[docs/i18n.md](docs/i18n.md) covers the rest.
+**Want to translate Zaivern Code into your language?** No Rust, no rebuild — drop one
+JSON file: [docs/translating.md](docs/translating.md). How it works: [docs/i18n.md](docs/i18n.md).
 
 ## Key Features
 

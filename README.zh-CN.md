@@ -122,7 +122,8 @@ zai lang install fr --from someone/zaivern-lang-fr
 `zai lang check fr` 检查缺漏，再 `zai lang set fr` 生效。**只要写一条和内置相同的 ID，
 就只覆盖那一条**，为了改一个词而抄一整本词典是不必要的。
 
-细节见 [docs/i18n.md](docs/i18n.md)。
+**想把 Zaivern Code 翻译成你的语言？** 不需要 Rust，也不需要重新构建 —— 放一个 JSON 文件即可：
+[docs/translating.md](docs/translating.md)。工作原理见 [docs/i18n.md](docs/i18n.md)。
 
 ## 主要功能
 
