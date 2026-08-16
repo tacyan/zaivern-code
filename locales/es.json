@@ -1968,6 +1968,7 @@
   "file_tree.level_page_size": "Este nivel muestra {n} elementos cada vez (ajuste tree_dir_page)",
   "file_tree.match_count": "{n} coincidencias",
   "file_tree.match_count_truncated": "{n} coincidencias (búsqueda interrumpida)",
+  "file_tree.match_count_scanning": "{n} coincidencias (buscando…)",
   "file_tree.modified": "Modificado (Modified)",
   "file_tree.more_items": "… {n} más",
   "file_tree.move_item": "➡ Mover {name}",

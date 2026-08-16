@@ -1968,6 +1968,7 @@
   "file_tree.level_page_size": "This level shows {n} items at a time (setting tree_dir_page)",
   "file_tree.match_count": "{n} matches",
   "file_tree.match_count_truncated": "{n} matches (scan stopped early)",
+  "file_tree.match_count_scanning": "{n} matches (searching…)",
   "file_tree.modified": "Modified",
   "file_tree.more_items": "… {n} more",
   "file_tree.move_item": "➡ Move {name}",

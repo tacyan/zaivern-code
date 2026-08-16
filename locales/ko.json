@@ -1968,6 +1968,7 @@
   "file_tree.level_page_size": "이 단계는 {n}개씩 표시합니다 (설정 tree_dir_page)",
   "file_tree.match_count": "{n}건 일치",
   "file_tree.match_count_truncated": "{n}건 일치 (검색을 중단했습니다)",
+  "file_tree.match_count_scanning": "{n}건 일치 (검색 중…)",
   "file_tree.modified": "변경됨 (Modified)",
   "file_tree.more_items": "… {n}개 더",
   "file_tree.move_item": "➡ {name} 이동",

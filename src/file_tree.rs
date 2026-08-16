@@ -260,6 +260,24 @@ pub fn dir_page(total: usize, page: usize, extra_pages: usize) -> (usize, usize)
     (shown, total - shown)
 }
 
+/// 絞り込みの走査で 1 フレームに辿ってよい件数。
+///
+/// **フレームを止めないための唯一の約束**。以前は 1 打鍵ごとに
+/// `scan_budget` (既定 50,000) 件を同期で辿り切っていたので、大きな
+/// リポジトリでは打つたびに数秒フリーズした (実際に「. と打つと
+/// くるくるになる」と報告された)。件数で刻めば、クエリが何であっても
+/// 1 フレームの費用は同じ。
+pub const FILTER_STEP: usize = 800;
+
+/// 一致をここで打ち切る。
+///
+/// `.` や `s` のような「ほぼ全部に当たる」クエリでは、一致そのものより
+/// **一致の祖先を全部展開して描くこと**が重い (フォルダを数千個開くと
+/// 可視行が数万行になる)。件数を有限にすれば、どんな文字列でも描画量が
+/// 頭打ちになる。ツリーの絞り込みは「目で見て選ぶ」ための道具なので、
+/// 300 件より先は見ない。
+pub const FILTER_MAX_HITS: usize = 300;
+
 /// ツリーの絞り込み結果 (クエリと、描いてよいパスの集合)。
 struct FilterHit {
     /// この結果を作ったクエリ(変わったら作り直す)。
@@ -268,7 +286,22 @@ struct FilterHit {
     keep: HashSet<PathBuf>,
     /// 一致した件数。
     matched: usize,
-    /// 走査を予算で打ち切ったか。
+    /// 走査を予算 (件数 / 一致数) で打ち切ったか。
+    truncated: bool,
+    /// まだ走査の途中か (打ち切りとは別物 — 待てば増える)。
+    scanning: bool,
+}
+
+/// 絞り込み走査の途中経過。フレームをまたいで持ち越す。
+struct FilterScan {
+    query: String,
+    pq: crate::fuzzy::PreparedQuery,
+    /// まだ辿っていないディレクトリ (深さつき)。
+    stack: Vec<(PathBuf, usize)>,
+    keep: HashSet<PathBuf>,
+    open_dirs: HashSet<PathBuf>,
+    matched: usize,
+    visited: usize,
     truncated: bool,
 }
 
@@ -341,6 +374,8 @@ pub struct FileTree {
     pub filter: String,
     /// 絞り込みの計算結果 (クエリが変わるまで使い回す)。
     filter_hit: Option<FilterHit>,
+    /// 走査の途中経過。`None` = 走っていない (完走済みか、クエリが空)。
+    filter_scan: Option<FilterScan>,
     /// 絞り込みの**走査専用**キャッシュ。`cache` と分けているのは、
     /// 走査で読んだ数千階層を `mtimes` に載せると `refresh_if_changed()` が
     /// 毎秒その数だけ stat を撃つことになるため (描画に使う階層だけを
@@ -386,6 +421,7 @@ impl FileTree {
             max_depth: crate::config::DEFAULT_INDEX_MAX_DEPTH,
             filter: String::new(),
             filter_hit: None,
+            filter_scan: None,
             scan_cache: HashMap::new(),
             #[cfg(test)]
             io_reads: 0,
@@ -405,6 +441,7 @@ impl FileTree {
             self.cache.clear();
             self.mtimes.clear();
             self.filter_hit = None;
+            self.filter_scan = None;
             self.scan_cache.clear();
         }
     }
@@ -416,6 +453,7 @@ impl FileTree {
         self.ignorer.clear();
         self.more_pages.clear();
         self.filter_hit = None;
+        self.filter_scan = None;
         self.scan_cache.clear();
         self.edit = None;
         self.sel.clear();
@@ -561,6 +599,7 @@ impl FileTree {
         self.ignorer.clear();
         self.more_pages.clear();
         self.filter_hit = None;
+        self.filter_scan = None;
         self.scan_cache.clear();
     }
 
@@ -701,66 +740,131 @@ impl FileTree {
         dir_page(total, self.dir_page, extra)
     }
 
-    /// 絞り込みを (必要なら) 計算し直し、一致した要素の祖先を展開する。
+    /// 絞り込みを (必要なら) 少しだけ進め、一致した要素の祖先を展開する。
     ///
-    /// クエリが変わるまで結果を使い回すので、毎フレーム走査はしない。
-    /// 走査は `scan_budget` 件・`max_depth` 段で打ち切る
-    /// (巨大リポジトリでも 1 フレームを食い潰さない)。
+    /// **1 フレームで辿るのは [`FILTER_STEP`] 件まで。** 以前は 1 打鍵ごとに
+    /// `scan_budget` (既定 50,000) 件を同期で辿り切っていたので、大きな
+    /// リポジトリでは打つたびに数秒フリーズした。走査を刻んで持ち越せば、
+    /// **どんな文字列が来ても 1 フレームの費用は同じ**になる。
+    ///
+    /// 一致は [`FILTER_MAX_HITS`] 件で打ち切る。`.` のように「ほぼ全部に
+    /// 当たる」クエリは、探すことよりも**一致の祖先を全部展開して描くこと**が
+    /// 重いので、件数を有限にして描画量を頭打ちにする。
+    ///
+    /// 走査中は途中経過をそのまま出す (真っ白にして待たせない)。
     fn recompute_filter(&mut self, ctx: &egui::Context) {
         let q = self.filter.trim().to_string();
         if q.is_empty() {
             self.filter_hit = None;
+            self.filter_scan = None;
             self.scan_cache.clear();
             return;
         }
-        if self.filter_hit.as_ref().is_some_and(|f| f.query == q) {
+        // 完走済みの結果はそのまま使い回す (毎フレーム走査しない)
+        if self.filter_scan.is_none() && self.filter_hit.as_ref().is_some_and(|f| f.query == q) {
             return;
         }
-        let pq = crate::fuzzy::PreparedQuery::new(&q);
-        let mut keep: HashSet<PathBuf> = HashSet::new();
-        let mut open_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut matched = 0usize;
-        let mut visited = 0usize;
-        let mut truncated = false;
+        // クエリが変わったら走査をやり直す (前の途中経過は捨てる)
+        if self.filter_scan.as_ref().is_none_or(|s| s.query != q) {
+            let mut stack: Vec<(PathBuf, usize)> =
+                self.roots.iter().map(|r| (r.clone(), 0usize)).collect();
+            stack.reverse();
+            self.filter_scan = Some(FilterScan {
+                query: q.clone(),
+                pq: crate::fuzzy::PreparedQuery::new(&q),
+                stack,
+                keep: HashSet::new(),
+                open_dirs: HashSet::new(),
+                matched: 0,
+                visited: 0,
+                truncated: false,
+            });
+        }
+        self.step_filter(ctx);
+    }
+
+    /// 走査を [`FILTER_STEP`] 件ぶんだけ進める。完走したら `filter_scan` を畳む。
+    fn step_filter(&mut self, ctx: &egui::Context) {
+        let Some(mut scan) = self.filter_scan.take() else {
+            return;
+        };
         let roots = self.roots.clone();
-        let mut stack: Vec<(PathBuf, usize)> = roots.iter().map(|r| (r.clone(), 0usize)).collect();
-        stack.reverse();
-        while let Some((dir, depth)) = stack.pop() {
+        let mut steps = 0usize;
+        // このフレームで新しく開くフォルダだけを集める
+        // (毎フレーム全部へ set_open を撃たない)。
+        let mut opened: Vec<PathBuf> = Vec::new();
+        while let Some((dir, depth)) = scan.stack.pop() {
             if depth >= self.max_depth {
                 continue;
             }
             for e in self.scan_entries(&dir) {
-                visited += 1;
-                if visited > self.scan_budget {
-                    truncated = true;
+                scan.visited += 1;
+                steps += 1;
+                if scan.visited > self.scan_budget {
+                    scan.truncated = true;
                     break;
                 }
-                if pq.score(&e.name).is_some() {
-                    matched += 1;
-                    keep.insert(e.path.clone());
+                if scan.pq.score(&e.name).is_some() {
+                    // 一致が多すぎるクエリは、ここで止める方が親切
+                    // (数千件を展開して描くと、目で選べる画面ではなくなる)。
+                    if scan.matched >= FILTER_MAX_HITS {
+                        scan.truncated = true;
+                        break;
+                    }
+                    scan.matched += 1;
+                    scan.keep.insert(e.path.clone());
                     // 祖先をたどって「見える道」を作る (ルートまで)
                     for anc in reveal_ancestors(&roots, &e.path) {
-                        keep.insert(anc.clone());
-                        open_dirs.insert(anc);
+                        scan.keep.insert(anc.clone());
+                        if scan.open_dirs.insert(anc.clone()) {
+                            opened.push(anc);
+                        }
                     }
                 }
-                if e.is_dir {
-                    stack.push((e.path.clone(), depth + 1));
+                // **無視フォルダの中までは探さない。**
+                //
+                // `.gitignore` に載っているフォルダは (薄表示の設定なら) 行としては
+                // 出るが、中身は「成果物」であって探し物ではない。
+                //
+                // 実測 (このリポジトリ自身・`target/` は 154GB): 降りると
+                // **予算 50,000 件を使い切っても `src/terminal.rs` へ届かない**
+                // (届くのに 258,332 件辿る必要があった)。つまり 1 打鍵ごとに
+                // 数秒固まったうえ、**肝心のソースは 1 件も出てこなかった**。
+                // 降りなければ全部で **7,011 件**、`src/terminal.rs` は
+                // **186 件目**で見つかる。
+                //
+                // 遅いだけでなく「探しているものが見つからない」ので、
+                // 打ち切りを増やして解決する話ではない。
+                //
+                // 中まで探したい人は「.gitignore を尊重する」を切る
+                // (そのとき `ignored` は全部 false になり、ここは素通りする)。
+                if e.is_dir && !e.ignored {
+                    scan.stack.push((e.path.clone(), depth + 1));
                 }
             }
-            if truncated {
+            if scan.truncated || steps >= FILTER_STEP {
                 break;
             }
         }
-        for d in &open_dirs {
+        for d in &opened {
             set_open(ctx, d, true);
         }
+        let done = scan.truncated || scan.stack.is_empty();
         self.filter_hit = Some(FilterHit {
-            query: q,
-            keep,
-            matched,
-            truncated,
+            query: scan.query.clone(),
+            keep: scan.keep.clone(),
+            matched: scan.matched,
+            truncated: scan.truncated,
+            scanning: !done,
         });
+        if done {
+            self.filter_scan = None;
+        } else {
+            self.filter_scan = Some(scan);
+            // 走査が残っている間だけ次のフレームを予約する
+            // (終わったら 1 枚も予約しない = アイドルの費用はゼロ)。
+            crate::perf::repaint(ctx, "tree_filter");
+        }
     }
 
     /// ツリー上部の絞り込み入力。一致件数は入力があるときだけ 1 行足す
@@ -780,12 +884,21 @@ impl FileTree {
             if !self.filter.is_empty() && ui.small_button("✖").clicked() {
                 self.filter.clear();
                 self.filter_hit = None;
+                self.filter_scan = None;
             }
         });
         let Some(f) = &self.filter_hit else {
             return; // 空のときは案内行を出さない (高さも取らない)
         };
-        let msg = if f.matched == 0 {
+        // 走査は刻んで進むので、途中は「探しています」と言い切る。
+        // 0 件と「まだ見つかっていない」を混ぜると、打った直後に必ず
+        // 「一致するファイルはありません」が一瞬出て嘘になる。
+        let msg = if f.scanning {
+            trf(
+                "{n} 件一致 (探しています…)",
+                &[("n", f.matched.to_string())],
+            )
+        } else if f.matched == 0 {
             trf(
                 "「{q}」に一致するファイルはありません",
                 &[("q", f.query.clone())],
@@ -3432,6 +3545,144 @@ mod tests {
         assert_eq!(hit.matched, 1);
         assert!(hit.keep.contains(&root.join("main_window.rs")));
         assert!(crate::fuzzy::score("mnwin", "main_window.rs").is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **無視フォルダ (`target/` `node_modules/` …) の中までは探さない。**
+    ///
+    /// 薄表示の設定 (既定) では無視フォルダも行としては出るので、以前は
+    /// 絞り込みの走査もそこへ降りていた。このリポジトリ自身の `target/` は
+    /// **154GB / 25 万件以上**あるので、1 文字打つたびに数秒固まったうえ、
+    /// 予算をそこで使い切って**肝心のソースまで辿り着かなかった**。
+    #[test]
+    fn 絞り込みは無視フォルダの中まで探さない() {
+        let root = unique_temp_dir("zaivern-tree-test", "filter-ignored");
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let t_dir = root.join("target");
+        std::fs::create_dir_all(t_dir.join("deep")).unwrap();
+        std::fs::write(t_dir.join("widget.rs"), "").unwrap();
+        std::fs::write(t_dir.join("deep").join("widget.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("widget.rs"), "").unwrap();
+
+        let cfg = crate::config::Config::default();
+        assert!(cfg.respect_gitignore, "既定は .gitignore を尊重する");
+        let mut t = tree_with(&root, &cfg);
+        let ctx = egui::Context::default();
+        t.filter = "widget".into();
+        while {
+            t.recompute_filter(&ctx);
+            t.filter_scan.is_some()
+        } {}
+        let hit = t.filter_hit.as_ref().expect("結果");
+        assert!(
+            hit.keep.contains(&root.join("src").join("widget.rs")),
+            "追跡しているファイルは見つかる"
+        );
+        assert!(
+            !hit.keep.contains(&t_dir.join("widget.rs")),
+            "無視フォルダの中まで探している"
+        );
+        assert!(
+            !hit.keep.contains(&t_dir.join("deep").join("widget.rs")),
+            "無視フォルダの奥まで降りている"
+        );
+        assert_eq!(hit.matched, 1);
+
+        // 尊重をやめれば中まで探す (「探せない」で終わらせない)
+        let mut cfg2 = cfg.clone();
+        cfg2.respect_gitignore = false;
+        let mut t2 = tree_with(&root, &cfg2);
+        t2.filter = "widget".into();
+        while {
+            t2.recompute_filter(&ctx);
+            t2.filter_scan.is_some()
+        } {}
+        assert_eq!(t2.filter_hit.as_ref().expect("結果").matched, 3);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **どんな文字列でも 1 フレームの費用は同じ。**
+    ///
+    /// `.` のように「ほぼ全部に当たる」クエリを打つと、以前は 1 打鍵ごとに
+    /// 予算 (既定 50,000 件) いっぱいまで同期で辿り切っていたので、大きな
+    /// リポジトリでは打つたびに数秒フリーズした。
+    ///
+    /// 見張るのは**実時間ではなく回数** (絶対時間の線は必ず嘘をつく):
+    ///   * 1 回の `recompute_filter` が辿る件数は [`FILTER_STEP`] + α で頭打ち
+    ///   * 一致は [`FILTER_MAX_HITS`] で頭打ち (展開して描く量が有限になる)
+    ///   * 何度か呼べば必ず終わる (走査が永久に走り続けない)
+    #[test]
+    fn 絞り込みは一度に少しだけ辿り一致も頭打ちにする() {
+        let root = unique_temp_dir("zaivern-tree-test", "filter-step");
+        // 1 階層あたりを小さくして「1 ディレクトリで予算を使い切る」影響を消す
+        // (刻めていることを見たいので、刻み目をまたぐ形にする)。
+        let per_dir = 40usize;
+        let dirs = 60usize;
+        for d in 0..dirs {
+            let sub = root.join(format!("d{d:03}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..per_dir {
+                std::fs::write(sub.join(format!("f{f:03}.txt")), "").unwrap();
+            }
+        }
+        let total = dirs * per_dir + dirs; // ファイル + ディレクトリ
+        assert!(total > FILTER_STEP, "刻み目をまたぐ大きさで試す");
+
+        let cfg = crate::config::Config::default();
+        let mut t = tree_with(&root, &cfg);
+        let ctx = egui::Context::default();
+
+        // "." はこのツリーのファイル全部に当たる (拡張子の点)
+        t.filter = ".".into();
+        t.recompute_filter(&ctx);
+        let first = t.filter_hit.as_ref().expect("途中でも結果を出す");
+        assert!(
+            first.scanning || first.truncated,
+            "1 回で全部辿り切っている (刻めていない)"
+        );
+        let visited_once = t.filter_scan.as_ref().map(|s| s.visited).unwrap_or(0);
+        if visited_once > 0 {
+            assert!(
+                visited_once <= FILTER_STEP + per_dir + 1,
+                "1 回で {visited_once} 件辿った (上限 {} 件)",
+                FILTER_STEP + per_dir + 1
+            );
+        }
+
+        // 何度呼んでも必ず終わる。終わったら走査は 1 本も残らない
+        let mut rounds = 0usize;
+        while t.filter_scan.is_some() {
+            t.recompute_filter(&ctx);
+            rounds += 1;
+            assert!(rounds < 1000, "走査が終わらない");
+        }
+        let hit = t.filter_hit.as_ref().expect("結果");
+        assert!(!hit.scanning, "終わったのに走査中のまま");
+        assert!(
+            hit.matched <= FILTER_MAX_HITS,
+            "一致が頭打ちになっていない ({} 件)",
+            hit.matched
+        );
+        assert!(hit.truncated, "打ち切ったことを伝えていない");
+
+        // 一致しないクエリでも、1 回あたりの費用は同じ (刻んで終わる)
+        t.filter = "。".into();
+        t.recompute_filter(&ctx);
+        let mut rounds = 0usize;
+        while t.filter_scan.is_some() {
+            t.recompute_filter(&ctx);
+            rounds += 1;
+            assert!(rounds < 1000, "走査が終わらない");
+        }
+        let hit = t.filter_hit.as_ref().expect("結果");
+        assert_eq!(hit.matched, 0);
+        assert!(!hit.scanning);
+
+        // 走査は打鍵ごとにやり直す。前のクエリの結果を引きずらない
+        assert_eq!(hit.query, "。");
+
         std::fs::remove_dir_all(&root).ok();
     }
 

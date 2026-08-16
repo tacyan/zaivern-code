@@ -1968,6 +1968,7 @@
   "file_tree.level_page_size": "この階層は {n} 件ずつ表示します (設定 tree_dir_page)",
   "file_tree.match_count": "{n} 件一致",
   "file_tree.match_count_truncated": "{n} 件一致 (走査を打ち切りました)",
+  "file_tree.match_count_scanning": "{n} 件一致 (探しています…)",
   "file_tree.modified": "変更あり (Modified)",
   "file_tree.more_items": "… さらに {n} 件",
   "file_tree.move_item": "➡ {name} を移動",

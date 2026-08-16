@@ -1968,6 +1968,7 @@
   "file_tree.level_page_size": "Este nível mostra {n} itens por vez (configuração tree_dir_page)",
   "file_tree.match_count": "{n} correspondências",
   "file_tree.match_count_truncated": "{n} correspondências (varredura interrompida)",
+  "file_tree.match_count_scanning": "{n} correspondências (procurando…)",
   "file_tree.modified": "Modificado (Modified)",
   "file_tree.more_items": "… mais {n}",
   "file_tree.move_item": "➡ Mover {name}",
