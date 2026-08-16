@@ -101,9 +101,14 @@ function agentCard(a) {
 // カードをタップ = 選んで端末へ入る。[✏ 指示] は一覧に留まったまま宛先だけ移す
 // (「一覧で見つけて、その場で 1 行送る」を 1 タップで終わらせる)
 function openAgent(a, stay) {
+  // 宛先だけ移して一覧に留まる場合以外は、チップと同じ入口を通る
+  // (「押した瞬間にその端末へ入る」を 1 か所だけで実装する)。
+  if (!stay) { selectAgent(a.idx); return; }
   bulkMode = 'one';
+  if (state) state.agent_active = a.idx;
+  renderAgents();
   api('/api/cmd', {name:'agent_focus', arg:a.idx}).then(pollState).catch(() => renderAgents());
-  if (stay) { $('ti').focus(); } else { setAView('term'); }
+  $('ti').focus();
 }
 // 行内の操作。承認キーは PC 側 (エージェントのカタログ) が知っているので、
 // スマホから当て推量の文字を送らない
@@ -118,8 +123,17 @@ async function agentAct(a, act) {
   } catch (e) {}
 }
 function renderList() {
-  if (aview === 'term') return;
   const el = $('alist');
+  // 一覧を出してよいのは待ち / デッキ / 看板の 3 つだけ。それ以外 (端末・
+  // 承認キュー) では中身を**残さない**。隠しているつもりでも中身が残ると、
+  // CSS の当たり方ひとつで端末と一覧が同時に見える (「エージェントが
+  // いません」が 2 枚出た)。出すのは常に 1 か所だけ。
+  if (!AVIEWS.some(([k]) => k === aview && k !== 'term')) {
+    el.innerHTML = '';
+    el.classList.remove('mid');
+    el.classList.remove('show');
+    return;
+  }
   // 1.5 秒ごとに作り直すので、読んでいる位置を必ず戻す
   // (戻さないと、スクロールした瞬間に毎回先頭へ跳ね上がる)
   const keep = el.scrollTop;

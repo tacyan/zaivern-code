@@ -429,7 +429,9 @@ function apprEnter() {
   // 動かさないので、レイアウトが激変しない
   $('scr').style.display = 'none';
   $('keys').style.display = 'none';
-  $('alist').classList.remove('show');
+  // 一覧は畳むだけでなく**中身も捨てる** (残すと 2 重表示の種になる)。
+  // 判定は renderList の 1 か所だけが持つ (ここで書き分けない)。
+  renderList();
   apprBox.classList.add('show');
   renderSeg();
   apprRender();

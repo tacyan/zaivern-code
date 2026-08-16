@@ -79,8 +79,12 @@
   /* 一覧 (待ち / デッキ / 看板 で共有する 1 枚の入れ物) */
   #alist { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; display:none; padding:8px 10px 12px; }
   #alist.show { display:block; }
-  /* 空状態は「利用可能領域の中央に 1 枚」。下や上に取り残さない */
-  #alist.mid { display:flex; align-items:center; justify-content:center; padding:16px; }
+  /* 空状態は「利用可能領域の中央に 1 枚」。下や上に取り残さない。
+     **必ず .show と併せて書く** — `#alist.mid` 単独だと詳細度が `#alist.show`
+     と同じで後ろにあるぶん強く、`display:none` を打ち消してしまう。
+     端末へ戻ったのに「エージェントがいません」が下に残り、端末と一覧が
+     同時に見える (= 2 重表示) 事故が実際に起きた。 */
+  #alist.show.mid { display:flex; align-items:center; justify-content:center; padding:16px; }
   .card {
     background:#161b22; border:1px solid #21262d; border-radius:10px;
     padding:10px 12px; margin-bottom:8px;

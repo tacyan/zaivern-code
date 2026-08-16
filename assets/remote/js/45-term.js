@@ -603,7 +603,23 @@
       const on = k === 'term';
       bar.style.display = on ? '' : 'none';
       find.style.display = (on && findOn) ? '' : 'none';
+      // 端末へ入り直したら必ず**生きている状態**に戻す。遡ったまま離れると
+      // 追従が止まっていてタイマーが 1 本も無く、戻ってきても画面が凍った
+      // ままになる (「押しても切り替わらない」の正体のひとつ)。
+      if (on && !follow) { follow = true; scrollBottom(); syncStatus(); }
     };
+    // 下部ナビの [エージェント] も同じ扱い。10-view.js は `pollTerm()` を
+    // 呼ぶだけで、遡って止まっている追従までは戻せない。
+    // capture で先に受けてから、既存のハンドラに素通しする。
+    const nav = document.getElementById('nav');
+    if (nav) {
+      nav.addEventListener('click', e => {
+        const b = e.target && e.target.closest ? e.target.closest('button') : null;
+        if (b && b.dataset && b.dataset.v === 'agent' && !follow) {
+          follow = true; scrollBottom(); syncStatus();
+        }
+      }, true);
+    }
     syncStatus();
   } catch (e) {
     // 端末の拡張で落ちても、この後ろの JS (キー列・音声・一覧・コマンド) は
