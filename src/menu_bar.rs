@@ -190,6 +190,8 @@ pub struct MenuInfo {
     pub kanban_open: bool,
     /// エージェントデッキ (縦 1 本のエージェント管理画面) を開いているか
     pub deck_open: bool,
+    /// 🗒 変更一覧を開いているか。
+    pub changes_open: bool,
     pub problems_open: bool,
     pub fullscreen: bool,
     pub auto_save: bool,
@@ -668,6 +670,15 @@ fn view_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec
             };
             if item(ui, &dk, &sc(keys, BindAction::ToggleDeck), true) {
                 cmds.push(Cmd::ToggleDeck);
+            }
+            let ch = if info.changes_open {
+                tr("✓ 変更一覧")
+            } else {
+                tr("変更一覧")
+            };
+            // 打鍵は割り当てていない (到達経路はトップバーの 🗒 とパレット)
+            if item(ui, &ch, "", true) {
+                cmds.push(Cmd::ToggleChanges);
             }
             ui.separator();
             ui.menu_button(tr("配色テーマ"), |ui| {

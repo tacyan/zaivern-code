@@ -142,6 +142,14 @@ impl ZaivernApp {
                 Cmd::ToggleDeck,
             ),
             (
+                "🗒".into(),
+                tr("変更一覧 — どのファイルのどの行が変わったかを一望"),
+                // 打鍵は割り当てない。到達経路はトップバーの 🗒 とこの行の
+                // 2 つで足りる (「機能を増やす前に減らせないか」の実践)。
+                String::new(),
+                Cmd::ToggleChanges,
+            ),
+            (
                 "🎯".into(),
                 tr("エージェントを追従 (編集中の行をエディタが追いかける)"),
                 fmt_key(BindAction::FollowAgent),

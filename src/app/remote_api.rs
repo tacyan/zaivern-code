@@ -2044,24 +2044,34 @@ impl ZaivernApp {
 // ══════════════════════════════════════════════════════════════════════
 
 /// 変更 1 ファイルぶん。`git` の出力から**裏のスレッドで**組み立てる。
-struct ChangeFile {
-    rel: String,
+pub(super) struct ChangeFile {
+    pub(super) rel: String,
     /// `"M"|"A"|"D"|"R"|"?"`
-    status: &'static str,
-    added: usize,
-    removed: usize,
-    binary: bool,
+    pub(super) status: &'static str,
+    pub(super) added: usize,
+    pub(super) removed: usize,
+    pub(super) binary: bool,
     /// 上限で切ったか (追跡外の巨大ファイルなど)。
-    truncated: bool,
-    hunks: Vec<crate::diff::Hunk>,
+    pub(super) truncated: bool,
+    pub(super) hunks: Vec<crate::diff::Hunk>,
 }
 
 /// 作業ツリー全体の控え。
-struct ChangesSnapshot {
-    files: Vec<ChangeFile>,
-    added: usize,
-    removed: usize,
-    truncated: bool,
+pub(super) struct ChangesSnapshot {
+    pub(super) files: Vec<ChangeFile>,
+    pub(super) added: usize,
+    pub(super) removed: usize,
+    pub(super) truncated: bool,
+}
+
+/// 控えを「古い」ことにする (次のフレームで裏スレッドが取り直す)。
+///
+/// **ここで git を起こさない。** [↻ 取り直し] を押した瞬間に走らせると
+/// UI スレッドが git を待つことになる (数秒返ってこないことがある)。
+pub(super) fn changes_invalidate() {
+    let cell = CHANGES.get_or_init(Default::default);
+    let mut c = crate::lockx::lock_ok(cell);
+    c.at = None;
 }
 
 #[derive(Default)]
@@ -2097,7 +2107,7 @@ const SEARCH_TTL: Duration = Duration::from_secs(15);
 ///
 /// **この関数は git を 1 度も起こさない。** 起こすのは spawn した先だけで、
 /// 呼び出し側 (UI スレッド) は必ず即座に戻る。
-fn changes_snapshot(repo: &Path) -> Option<Result<Arc<ChangesSnapshot>, String>> {
+pub(super) fn changes_snapshot(repo: &Path) -> Option<Result<Arc<ChangesSnapshot>, String>> {
     let cell = CHANGES.get_or_init(Default::default);
     let mut c = crate::lockx::lock_ok(cell);
     if c.repo != repo {

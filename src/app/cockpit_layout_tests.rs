@@ -403,27 +403,36 @@ fn トップバーは狭いとアイコンだけになる() {
 #[test]
 fn 中央ビューは常に一つだけ() {
     // 単独
-    assert_eq!(center_view(false, false, false), CenterView::Editor);
-    assert_eq!(center_view(true, false, false), CenterView::Cockpit);
-    assert_eq!(center_view(false, true, false), CenterView::Kanban);
-    assert_eq!(center_view(false, false, true), CenterView::Deck);
-    // 競合してもいずれか 1 つ (デッキ > Cockpit > 看板 > エディタ)
-    assert_eq!(center_view(true, true, false), CenterView::Cockpit);
-    assert_eq!(center_view(true, true, true), CenterView::Deck);
-    assert_eq!(center_view(false, true, true), CenterView::Deck);
-    assert_eq!(center_view(true, false, true), CenterView::Deck);
-    // 全 8 通りで必ず 1 つの値になる (= 重ねようがない)
+    assert_eq!(center_view(false, false, false, false), CenterView::Editor);
+    assert_eq!(center_view(true, false, false, false), CenterView::Cockpit);
+    assert_eq!(center_view(false, true, false, false), CenterView::Kanban);
+    assert_eq!(center_view(false, false, true, false), CenterView::Deck);
+    assert_eq!(center_view(false, false, false, true), CenterView::Changes);
+    // 競合してもいずれか 1 つ (変更一覧 > デッキ > Cockpit > 看板 > エディタ)
+    assert_eq!(center_view(true, true, false, false), CenterView::Cockpit);
+    assert_eq!(center_view(true, true, true, false), CenterView::Deck);
+    assert_eq!(center_view(false, true, true, false), CenterView::Deck);
+    assert_eq!(center_view(true, false, true, false), CenterView::Deck);
+    assert_eq!(center_view(true, true, true, true), CenterView::Changes);
+    // 全 16 通りで必ず 1 つの値になる (= 重ねようがない)
     for c in [false, true] {
         for k in [false, true] {
             for d in [false, true] {
-                let v = center_view(c, k, d);
-                let hits = [
-                    v == CenterView::Editor,
-                    v == CenterView::Cockpit,
-                    v == CenterView::Kanban,
-                    v == CenterView::Deck,
-                ];
-                assert_eq!(hits.iter().filter(|x| **x).count(), 1, "c={c} k={k} d={d}");
+                for g in [false, true] {
+                    let v = center_view(c, k, d, g);
+                    let hits = [
+                        v == CenterView::Editor,
+                        v == CenterView::Cockpit,
+                        v == CenterView::Kanban,
+                        v == CenterView::Deck,
+                        v == CenterView::Changes,
+                    ];
+                    assert_eq!(
+                        hits.iter().filter(|x| **x).count(),
+                        1,
+                        "c={c} k={k} d={d} g={g}"
+                    );
+                }
             }
         }
     }
@@ -557,12 +566,15 @@ fn 中央ビューの分岐はスナップショットを見る() {
         .nth(1)
         .expect("update_impl がある");
     assert!(
-        upd.contains("self.center = center_view(self.cockpit, self.kanban, self.deck);"),
+        upd.contains(
+            "self.center = center_view(self.cockpit, self.kanban, self.deck, self.changes);"
+        ),
         "フレーム冒頭で中央ビューを 1 つに畳んでいない"
     );
     // 中央パネルの分岐がスナップショットを見ている
     assert!(
-        src.contains("if self.center == CenterView::Deck {")
+        src.contains("if self.center == CenterView::Changes {")
+            && src.contains("} else if self.center == CenterView::Deck {")
             && src.contains("} else if self.center == CenterView::Kanban {")
             && src.contains("} else if self.center == CenterView::Cockpit {"),
         "中央パネルの分岐が生のフラグを見ている"
@@ -654,4 +666,59 @@ fn 見出し帯の矩形は重ならず領域内に収まる() {
             }
         }
     }
+}
+
+/// **🗒 変更一覧は UI から到達できる。**
+///
+/// 中央ビューを 1 つ足すと触る場所が 5 か所ある (フラグ / `center_view` /
+/// 描画の分岐 / トップバー / パレット)。どれか 1 つ抜けても
+/// 「作ったのに繋いでいない」になり、しかも**コンパイルは通る**。
+#[test]
+fn 変更一覧はuiから到達できる() {
+    let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
+    // 中央パネルは `self.center` だけを見る (生のフラグで描き分けない)
+    assert!(
+        src.contains("if self.center == CenterView::Changes {"),
+        "中央パネルが変更一覧を描いていない"
+    );
+    assert!(
+        src.contains(
+            "self.center = center_view(self.cockpit, self.kanban, self.deck, self.changes);"
+        ),
+        "changes フラグが中央ビューへ畳まれていない"
+    );
+    // 入口 (トップバー) — 押したら Cmd が飛ぶ
+    assert!(
+        src.contains("cmds.push(Cmd::ToggleChanges);"),
+        "トップバー / メニューから変更一覧へ入れない"
+    );
+    // 開いたら他の中央ビューを落とす (2 つのフラグが同時に立ったままにしない)
+    let body = src
+        .split("Cmd::ToggleChanges => {")
+        .nth(1)
+        .expect("ToggleChanges の腕がある");
+    for off in [
+        "self.cockpit = false;",
+        "self.kanban = false;",
+        "self.deck = false;",
+    ] {
+        assert!(
+            body[..body.find('}').unwrap_or(body.len())].contains(off),
+            "変更一覧を開いたときに {off} をしていない"
+        );
+    }
+    // 描くのは changes_view — ここで一覧を作り直していない
+    let glue = include_str!("changes_center.rs").replace("\r\n", "\n");
+    assert!(glue.contains("cv::ui(&mut self.changes_state, ui, theme, v)"));
+    for ng in ["working_tree_diff", "Command::new", "run_git_at"] {
+        assert!(
+            !glue.contains(ng),
+            "変更一覧が UI スレッドから git を起こしている ({ng})"
+        );
+    }
+    // 中身はスマホと同じ 1 本の控えを読む (件数が食い違わない)
+    assert!(
+        glue.contains("super::remote_api::changes_snapshot(&top)"),
+        "スマホと同じ控えを読んでいない (真実の在り処が 2 つになる)"
+    );
 }

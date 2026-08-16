@@ -1164,6 +1164,23 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleDeck);
         }
 
+        // 🗒 変更一覧 — 「どのファイルのどの行が変わったか」を一望する中央ビュー。
+        // Cockpit / 看板 / デッキと同じ場所に並べる (中央ビューの入口を 1 か所に集める)。
+        let changes = ui.selectable_label(
+            self.changes,
+            RichText::new(if compact {
+                "🗒".to_string()
+            } else {
+                tr("🗒 変更")
+            }),
+        );
+        if changes
+            .on_hover_text(tr("変更一覧 — 未コミットの変更を「どのファイルのどの行」で一望する\n行をクリックするとその場所へ飛べます"))
+            .clicked()
+        {
+            cmds.push(Cmd::ToggleChanges);
+        }
+
         let new_agent = ui.menu_button(if compact { "👾＋" } else { "👾 Agent ＋" }, |ui| {
             for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                 if ui.button(format!("{} {}", p.icon, p.name)).clicked() {

@@ -172,6 +172,8 @@ impl ZaivernApp {
             kanban_state: kanban::KanbanState::default(),
             deck: false,
             deck_state: deck::DeckState::default(),
+            changes: false,
+            changes_state: crate::changes_view::ChangesState::default(),
             deck_branches: HashMap::new(),
             deck_branch_pending: HashSet::new(),
             deck_branch_tx,

@@ -48,6 +48,7 @@ impl ZaivernApp {
             cockpit_open: self.cockpit,
             kanban_open: self.kanban,
             deck_open: self.deck,
+            changes_open: self.changes,
             problems_open: self.problems_open,
             fullscreen: ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
                 || self.fake_fullscreen.is_some(),
