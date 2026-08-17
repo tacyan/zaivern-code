@@ -4443,6 +4443,14 @@ prunable gitdir file points to non-existent location
                 "tools/windows-check.sh",
                 include_str!("../tools/windows-check.sh"),
             ),
+            (
+                "tools/remote-check.sh",
+                include_str!("../tools/remote-check.sh"),
+            ),
+            (
+                "tools/release-gate.sh",
+                include_str!("../tools/release-gate.sh"),
+            ),
         ] {
             // Windows のチェックアウトは CRLF なので正規化してから探す。
             let sh = src.replace("\r\n", "\n");
@@ -4466,6 +4474,378 @@ prunable gitdir file points to non-existent location
                 "{name}: exec でプロセスを置き換えると判定行が出ない: {bad:?}"
             );
         }
+    }
+
+    // ── 出荷前の関門とスマホ画面の番人 ──────────────────────────────
+    //
+    // 0.18 系で 4 件が出荷まで生き残った。共通点は「**誰も動かしていない層**に
+    // あった」こと — Rust のテストはソースの文字列を見るだけで、ブラウザの
+    // DOM も CSS も 1 度も評価していない。経緯は docs/preflight.md。
+    //
+    // ここに置く番人は 2 種類ある:
+    //   * 道具が**繋がっている**ことの検査 (このモジュール)
+    //   * 実際に**描いて**見る検査 (tools/remote-check.sh。node と Chromium が要る)
+    // 後者が使えない環境でも、下の CSS の法則だけは必ず効く。
+
+    /// `tools/remote-check.js` は `build.rs` と**同じ材料を同じ順序で**組む。
+    ///
+    /// ずれると「本番と違うページを検査して緑」という、いちばん質の悪い嘘に
+    /// なる。材料の名前を build.rs 側から取ってきて突き合わせる
+    /// (写経した一覧を持つと必ずずれるので持たない)。
+    #[test]
+    fn スマホ画面の検査はbuild_rsと同じ材料を読む() {
+        let build = include_str!("../build.rs").replace("\r\n", "\n");
+        let js = include_str!("../tools/remote-check.js").replace("\r\n", "\n");
+
+        // build.rs が `assets/remote/` から読んでいるファイル名を拾う。
+        let mut assets: Vec<&str> = Vec::new();
+        for line in build.lines() {
+            if let Some(rest) = line.split("assets/remote/").nth(1) {
+                // ファイル名として妥当な文字だけを取る (doc コメントの日本語や
+                // バッククォートを材料として数えない)。
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || "._-/".contains(c)))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                let 材料らしい = name.contains('.') || name == "js";
+                if 材料らしい && !assets.contains(&name) {
+                    assets.push(name);
+                }
+            }
+        }
+        assert!(
+            assets.len() >= 4,
+            "build.rs から材料を拾えていない (走査の書き方が変わった?): {assets:?}"
+        );
+        for a in &assets {
+            let leaf = a.rsplit('/').next().unwrap_or(a);
+            assert!(
+                js.contains(leaf),
+                "tools/remote-check.js が {leaf} を読んでいない \
+                 (build.rs は読んでいる = 本番と違うページを検査している)"
+            );
+        }
+        // 連結の順序も固定する。ここが逆になると CSS の後勝ちが変わる。
+        let i_head = js.find("page-head.html").expect("page-head.html");
+        let i_css = js.find("style.css").expect("style.css");
+        let i_body = js.find("body.html").expect("body.html");
+        assert!(
+            i_head < i_css && i_css < i_body,
+            "head → style.css → body の順で組むこと (順序が変わると詳細度の勝敗が変わる)"
+        );
+    }
+
+    /// 出荷前の関門は、**既にある検証を全部ぶら下げている**こと。
+    ///
+    /// 道具は揃っていたのに走らせ忘れたのが 0.18 系の教訓なので、入口は
+    /// 1 つに保つ。ここから漏れた道具は「無い」のと同じ扱いになる。
+    #[test]
+    fn 出荷前の関門は既存の検証を全部通す() {
+        let gate = include_str!("../tools/release-gate.sh").replace("\r\n", "\n");
+        for needle in [
+            "tools/verify.sh",
+            "tools/remote-check.sh",
+            "tools/gui-smoke.sh",
+            "tools/linux-test.sh",
+            "tools/windows-check.sh",
+            "i18n missing",
+        ] {
+            assert!(
+                gate.contains(needle),
+                "tools/release-gate.sh が {needle} を通していない \
+                 (入口から漏れた検査は、走らないので無いのと同じ)"
+            );
+        }
+        // `--lint` (clippy) を落とすと、CI だけが赤くなる経路が復活する。
+        assert!(
+            gate.contains("--lint"),
+            "関門は tools/verify.sh --lint を通すこと (cargo test が緑でも clippy は赤くなる)"
+        );
+        // 自己検査つきで回す。素通りする検査を関門に置かない。
+        assert!(
+            gate.contains("--self-test"),
+            "スマホ画面の検査は --self-test で回すこと (わざと壊して赤になることまで見る)"
+        );
+    }
+
+    // ── スマホの CSS: 「隠してあるものを、脇道から見せない」 ──────────
+    //
+    // 実際に出たバグ:
+    //
+    //     #alist          { display:none; }
+    //     #alist.show     { display:block; }   ← 見せる合図はこれ
+    //     #alist.mid      { display:flex;  }   ← **合図を経由せずに見えてしまう**
+    //
+    // `#alist.mid` は `#alist.show` と詳細度が同じで後ろにあるので、
+    // `.show` が付いていなくても `display:none` に勝つ。結果、端末 (`#scr`) と
+    // 一覧 (`#alist`) が同時に見えた。Rust のテストは 1 本も落ちていない。
+    //
+    // 法則にすると: **`display:none` で隠した要素を見せる規則たちは、
+    // クラス集合の包含で 1 本の鎖になっていなければならない。**
+    // 鎖なら「いちばん小さいもの = 見せる合図」が一意に決まり、他は必ずそれを
+    // 含む。枝分かれした瞬間、合図を通らない抜け道ができる。
+    //
+    // これはブラウザが無くても効く (`tools/remote-check.sh` が `[skip]` に
+    // なる環境の最後の砦)。
+
+    #[derive(Debug, Clone)]
+    struct 表示規則 {
+        prefix: String,
+        anchor: String,
+        classes: Vec<String>,
+        display: String,
+    }
+
+    /// `/* … */` を落とす (中に `{` や `display:` があると解析が狂う)。
+    fn cssのコメントを外す(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(i) = rest.find("/*") {
+            out.push_str(&rest[..i]);
+            match rest[i + 2..].find("*/") {
+                Some(j) => rest = &rest[i + 2 + j + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// JS に埋まっている CSS を取り出す。
+    ///
+    /// `style.css` を触らずに自分の CSS を足す流儀 (`css.textContent = [...]` /
+    /// テンプレートリテラル) なので、**そこも同じ法則で見る**。行を落とすと
+    /// 規則が半分になるだけなので、`{` `}` か「宣言らしい行」を広めに拾う。
+    fn jsからcssを抜き出す(src: &str) -> String {
+        let mut out = String::new();
+        let b: Vec<char> = src.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            let q = b[i];
+            if q == '`' || q == '\'' {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < b.len() && b[j] != q {
+                    if b[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if q == '\'' && b[j] == '\n' {
+                        break; // 素の '…' は行をまたがない = ここまでで打ち切り
+                    }
+                    lit.push(b[j]);
+                    j += 1;
+                }
+                if j < b.len() && b[j] == q {
+                    let cssっぽい = lit.contains('{')
+                        || lit.contains('}')
+                        || (lit.contains(':') && lit.contains(';'));
+                    if cssっぽい {
+                        out.push_str(&lit);
+                        out.push('\n');
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn display値(body: &str) -> Option<String> {
+        for decl in body.split(';') {
+            let (k, v) = decl.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("display") {
+                return Some(v.trim().to_ascii_lowercase());
+            }
+        }
+        None
+    }
+
+    fn 複合を解く(sel: &str, display: &str) -> Option<表示規則> {
+        let flat = sel.replace(['>', '+', '~'], " ");
+        let mut parts: Vec<&str> = flat.split_whitespace().collect();
+        let last = parts.pop()?;
+        // 擬似クラス・属性・万能は静的に到達可能性を決められないので見ない。
+        if last.contains(':') || last.contains('[') || last.contains('*') || last.is_empty() {
+            return None;
+        }
+        let mut it = last.split('.');
+        let anchor = it.next().unwrap_or("").to_string();
+        let classes: Vec<String> = it.filter(|c| !c.is_empty()).map(str::to_string).collect();
+        Some(表示規則 {
+            prefix: parts.join(" "),
+            anchor,
+            classes,
+            display: display.to_string(),
+        })
+    }
+
+    /// `display` を宣言している規則だけを集める。at-rule (`@media` 等) は見ない。
+    fn 表示規則を集める(css: &str) -> Vec<表示規則> {
+        let css = cssのコメントを外す(css);
+        let b: Vec<char> = css.chars().collect();
+        let mut out = Vec::new();
+        let (mut i, mut sel_start) = (0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                '{' => {
+                    let sel: String = b[sel_start..i].iter().collect();
+                    let mut depth = 1i32;
+                    let mut j = i + 1;
+                    while j < b.len() && depth > 0 {
+                        if b[j] == '{' {
+                            depth += 1;
+                        } else if b[j] == '}' {
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    let body: String = b[i + 1..j.saturating_sub(1).max(i + 1)].iter().collect();
+                    let sel = sel.trim();
+                    if !sel.starts_with('@') && !sel.is_empty() {
+                        if let Some(d) = display値(&body) {
+                            for one in sel.split(',') {
+                                if let Some(r) = 複合を解く(one, &d) {
+                                    out.push(r);
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                    sel_start = j;
+                }
+                '}' => {
+                    i += 1;
+                    sel_start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// 「隠したものを見せる規則」が鎖になっているか。破れている組を返す。
+    fn 見せ方の枝分かれ(rules: &[表示規則]) -> (usize, Vec<String>) {
+        let 含む = |a: &[String], b: &[String]| a.iter().all(|c| b.contains(c));
+        let mut bases = 0usize;
+        let mut ng = Vec::new();
+        for base in rules.iter().filter(|r| r.display == "none") {
+            let vis: Vec<&表示規則> = rules
+                .iter()
+                .filter(|r| {
+                    r.display != "none"
+                        && r.prefix == base.prefix
+                        && r.anchor == base.anchor
+                        && 含む(&base.classes, &r.classes)
+                        && r.classes.len() > base.classes.len()
+                })
+                .collect();
+            if vis.is_empty() {
+                continue;
+            }
+            bases += 1;
+            for i in 0..vis.len() {
+                for j in i + 1..vis.len() {
+                    let (a, b) = (vis[i], vis[j]);
+                    if !含む(&a.classes, &b.classes) && !含む(&b.classes, &a.classes) {
+                        ng.push(format!(
+                            "{}{}{} を隠しているのに、.{} と .{} の 2 通りで見えてしまう \
+                             (どちらも同じ詳細度なので、後ろにあるほうが display:none に勝つ)",
+                            if base.prefix.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{} ", base.prefix)
+                            },
+                            base.anchor,
+                            base.classes
+                                .iter()
+                                .map(|c| format!(".{c}"))
+                                .collect::<String>(),
+                            a.classes.join("."),
+                            b.classes.join("."),
+                        ));
+                    }
+                }
+            }
+        }
+        (bases, ng)
+    }
+
+    #[test]
+    fn スマホのcssは隠したものを脇道から見せない() {
+        let css = include_str!("../assets/remote/style.css").replace("\r\n", "\n");
+        let rules = 表示規則を集める(&css);
+        let (bases, ng) = 見せ方の枝分かれ(&rules);
+        assert!(
+            bases >= 4,
+            "style.css から display:none の土台を {bases} 個しか拾えていない \
+             (解析が壊れていると、この検査は永久に緑になる)"
+        );
+        assert!(
+            ng.is_empty(),
+            "assets/remote/style.css:\n  {}",
+            ng.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn スマホのjs内蔵cssも同じ法則に従う() {
+        // `style.css` を触らずに自分の CSS を足す流儀なので、そこも見る。
+        let files: [(&str, &str); 3] = [
+            (
+                "assets/remote/js/45-term.js",
+                include_str!("../assets/remote/js/45-term.js"),
+            ),
+            (
+                "assets/remote/js/47-approve.js",
+                include_str!("../assets/remote/js/47-approve.js"),
+            ),
+            (
+                "assets/remote/js/86-changes.js",
+                include_str!("../assets/remote/js/86-changes.js"),
+            ),
+        ];
+        let mut total_bases = 0;
+        for (name, src) in files {
+            let css = jsからcssを抜き出す(&src.replace("\r\n", "\n"));
+            let rules = 表示規則を集める(&css);
+            let (bases, ng) = 見せ方の枝分かれ(&rules);
+            total_bases += bases;
+            assert!(ng.is_empty(), "{name}:\n  {}", ng.join("\n  "));
+        }
+        assert!(
+            total_bases >= 1,
+            "JS に埋まった CSS から display:none の土台を 1 つも拾えていない \
+             (抜き出しが壊れている = この検査は空振りしている)"
+        );
+    }
+
+    /// **わざと壊すと赤になる**ことを、実装と同じ道具で確かめる。
+    ///
+    /// 空振りする検査を残さないための自己検査。ここが緑を返し続けるように
+    /// なったら、上の 2 本はもう何も見ていない。
+    #[test]
+    fn 脇道の検査はわざと壊すと赤になる() {
+        let 素 = "#alist { display:none; }\n#alist.show { display:block; }\n\
+                  #alist.show.mid { display:flex; }\n";
+        let (bases, ng) = 見せ方の枝分かれ(&表示規則を集める(素));
+        assert_eq!(bases, 1, "土台を数えられていない");
+        assert!(ng.is_empty(), "直っている形を赤にしてはいけない: {ng:?}");
+
+        // 0.18 で実際に出た形 (`.show` を落とした `#alist.mid`)
+        let 壊 = "#alist { display:none; }\n#alist.show { display:block; }\n\
+                  #alist.mid { display:flex; }\n";
+        let (_, ng) = 見せ方の枝分かれ(&表示規則を集める(壊));
+        assert_eq!(ng.len(), 1, "脇道を見逃した: {ng:?}");
+        assert!(ng[0].contains("show") && ng[0].contains("mid"), "{ng:?}");
+
+        // JS に埋め込まれた形でも同じ結論になること
+        let js = "css.textContent = [\n  '#zv { display:none; }',\n  \
+                  '#zv.show { display:flex; }',\n  '#zv.mid { display:block; }',\n].join('\\n');";
+        let (_, ng) = 見せ方の枝分かれ(&表示規則を集める(&jsからcssを抜き出す(js)));
+        assert_eq!(ng.len(), 1, "JS 内蔵の CSS で脇道を見逃した: {ng:?}");
     }
 
     // ── 供給網: インストーラは「展開する前に」SHA-256 を突き合わせる ──

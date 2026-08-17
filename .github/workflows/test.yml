@@ -568,3 +568,53 @@ jobs:
             echo ""
             echo "clippy の -A を 1 行消すごとに債務が 1 種類返済される (.github/workflows/test.yml)。"
           } >> "$GITHUB_STEP_SUMMARY"
+  # スマホ画面 (assets/remote/) を **本物のブラウザで描いて**検査する。
+  #
+  # ■ なぜ要るのか
+  #   0.18 系で「端末と一覧が同時に見える」が出荷まで生き残った。原因は
+  #   CSS の詳細度 (`#alist.mid` が `#alist{display:none}` に勝っていた) で、
+  #   Rust のテストは 1 本も落ちていない — **誰も CSS を評価していなかった**。
+  #   経緯と層の地図は docs/preflight.md。
+  #
+  # ■ 安い
+  #   Rust を 1 行もコンパイルしない (assets/remote/ は読むだけ)。
+  #   ubuntu ランナーには Chrome も Node も最初から入っており、
+  #   npm パッケージは 1 つも要らない (WebSocket も自前)。
+  #
+  # ■ `[skip]` を緑にしない
+  #   remote-check.sh は node / ブラウザが無いと **rc=0 のまま降りる**。
+  #   手元ではそれが正しいが、CI で通すと**何も描かないジョブが永久に緑**に
+  #   なる。ここは揃っている前提なので、降りたら赤にする。
+  remote-screen:
+    # fast / pty / msrv / installers / lint / gui-smoke と**同じ判定**にすること。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: mobile screen (chrome)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 使う道具の版を出す (降りた理由を後から辿れるように)
+        run: |
+          node --version
+          (google-chrome --version || chromium --version || echo 'ブラウザが見つかりません')
+
+      # わざと壊して赤になることまで確かめる (--self-test)。
+      # 素通りする検査を CI に置かない。
+      - name: スマホ画面を描いて不変条件を確かめる
+        run: |
+          rc=0
+          out=$(sh tools/remote-check.sh --self-test 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::スマホ画面の検査が赤 (rc=$rc)"
+            exit "$rc"
+          fi
+          if echo "$out" | grep -q '\[skip\]'; then
+            echo "::error::スマホ画面を 1 度も描かずに降りた (このジョブでは skip は不合格)"
+            exit 1
+          fi
