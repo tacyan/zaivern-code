@@ -33,6 +33,8 @@ pub enum Cmd {
     ToggleKanban,
     /// エージェントデッキ (稼働中 / ローカルのセッション / 新規 を縦 1 本で管理する画面) 切替
     ToggleDeck,
+    /// 🗒 変更一覧 (未コミットの変更を「どのファイルのどの行」で一望する画面) 切替
+    ToggleChanges,
     /// タスク作成フォームを開く (Cockpit も一緒に開く)
     NewTask,
     /// プロンプトレースの開始フォームを開く (Cockpit も一緒に開く)
@@ -929,7 +931,8 @@ fn group_of(cmd: &Cmd) -> Group {
         | Cmd::CompareWithSaved
         | Cmd::SelectForCompare
         | Cmd::CompareWithSelected
-        | Cmd::ToggleGitBlame => Group::Git,
+        | Cmd::ToggleGitBlame
+        | Cmd::ToggleChanges => Group::Git,
 
         // ── ターミナル・実行 ───────────────────────────────────────
         Cmd::ToggleTerminal

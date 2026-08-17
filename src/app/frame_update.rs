@@ -146,7 +146,7 @@ impl ZaivernApp {
         // 以降の描画判断はすべて `self.center` を見る。描画中にフラグが
         // 変わっても今フレームの絵は変わらないので、2 つのビューが重なって
         // 描かれることがない (切り替えは次のフレームから効く)。
-        self.center = center_view(self.cockpit, self.kanban, self.deck);
+        self.center = center_view(self.cockpit, self.kanban, self.deck, self.changes);
 
         // 音声入力が先。押している間だけ録音するキーは他所へ渡さない
         // (ターミナルが PTY へ転送してしまうため)
@@ -502,7 +502,9 @@ impl ZaivernApp {
                 // **ここで見るのは `self.center` だけ。** 生のフラグを見ると、
                 // 描画中に押された「看板」でフラグが変わり、同じフレームに
                 // 2 つのビューが描かれて重なる (実際に起きた不具合)。
-                if self.center == CenterView::Deck {
+                if self.center == CenterView::Changes {
+                    self.guarded_ui(Subview::Panel("changes"), ui, |me, ui| me.changes_ui(ui));
+                } else if self.center == CenterView::Deck {
                     let ctx = ui.ctx().clone();
                     self.guarded_ui(Subview::Panel("deck"), ui, |me, ui| me.deck_ui(ui, &ctx));
                 } else if self.center == CenterView::Kanban {

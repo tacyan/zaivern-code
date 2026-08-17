@@ -2369,6 +2369,79 @@ mod tests {
         assert!(PAGE.contains("if (aview === 'term') {"));
     }
 
+    /// **同じものを 2 か所に出さない。**
+    ///
+    /// 端末 (`#scr`) と一覧 (`#alist`) は同じ場所を共有していて、切り替えは
+    /// `.show` の付け外しでやる。ところが空状態の `#alist.mid` は詳細度が
+    /// `#alist.show` と同じで**後ろにある**ため、`display:none` を打ち消して
+    /// しまう。実際に「エージェントがいません」のカードが端末の下に残り、
+    /// 2 枚見えた (端末から看板へ行って戻るだけで再現した)。
+    ///
+    /// 直し方は 2 つとも要る — CSS は `.show` と併せて書き、JS は一覧を
+    /// 出さないビューでは**中身ごと捨てる**。片方だけでは、もう片方の
+    /// 書き換えで静かに戻る。
+    #[test]
+    fn 端末と一覧を同時に出さない() {
+        let page = PAGE.replace("\r\n", "\n");
+        assert!(
+            !page.contains("#alist.mid {"),
+            "#alist.mid 単独だと display:none を打ち消して 2 重表示になる"
+        );
+        assert!(
+            page.contains("#alist.show.mid {"),
+            "空状態の見た目が .show と併せて書かれていない"
+        );
+        // 一覧を出すのは待ち / デッキ / 看板のときだけ。それ以外は中身を捨てる
+        assert!(
+            page.contains("if (!AVIEWS.some(([k]) => k === aview && k !== 'term')) {"),
+            "一覧を出さないビューで中身を捨てていない"
+        );
+        for line in [
+            "el.innerHTML = '';",
+            "el.classList.remove('mid');",
+            "el.classList.remove('show');",
+        ] {
+            assert!(page.contains(line), "一覧の後片付けに {line} が無い");
+        }
+    }
+
+    /// **エージェントのチップは押した瞬間にその端末へ入る。**
+    ///
+    /// 応答 → `pollState` → 次のポーリングを待つ作りだと、履歴を遡って
+    /// 追従が止まっている間は次のポーリングが 1 本も無いので、押しても
+    /// 永久に切り替わらない (「Codex を選んだのに Claude Code のまま」)。
+    #[test]
+    fn エージェントを押したら即その端末へ入る() {
+        let page = PAGE.replace("\r\n", "\n");
+        assert!(
+            page.contains("function selectAgent(i) {"),
+            "チップの入口 selectAgent が無い"
+        );
+        assert!(
+            page.contains("c.onclick = () => selectAgent(i);"),
+            "チップが selectAgent を通っていない"
+        );
+        for line in [
+            // 応答を待たずに宛先を先に切り替える
+            "if (state) state.agent_active = i;",
+            // 一覧・承認キューから押しても端末へ入る
+            "setAView('term');   // 一覧・承認キューから押しても端末へ入る",
+            // 追従が止まっていても取り直す
+            "pollTerm();         // 追従を止めていても、ここで必ず取り直す",
+        ] {
+            assert!(page.contains(line), "selectAgent に {line} が無い");
+        }
+        // 端末へ入り直したら生きている状態へ戻す (凍ったまま返さない)
+        assert!(
+            page.contains("if (on && !follow) { follow = true; scrollBottom(); syncStatus(); }"),
+            "端末へ戻ったときに追従を再開していない"
+        );
+        assert!(
+            page.contains("b.dataset.v === 'agent' && !follow"),
+            "下部ナビの [エージェント] で追従を再開していない"
+        );
+    }
+
     /// スマホから一括操作へ届けること。**件数を見せずに送らせない**。
     #[test]
     fn page_contains_bulk_actions() {

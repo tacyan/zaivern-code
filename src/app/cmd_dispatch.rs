@@ -174,6 +174,7 @@ impl ZaivernApp {
             | Cmd::ToggleCockpit
             | Cmd::ToggleKanban
             | Cmd::ToggleDeck
+            | Cmd::ToggleChanges
             | Cmd::OpenAgentPicker
             | Cmd::NewTask
             | Cmd::OpenRace
@@ -865,6 +866,17 @@ impl ZaivernApp {
                 if self.deck {
                     self.cockpit = false;
                     self.kanban = false;
+                    self.changes = false;
+                }
+            }
+            // 変更一覧も同格の中央画面。開くときは他を落とす
+            // (畳むのは `center_view` が最後にやるが、フラグ自体も 1 つに保つ)。
+            Cmd::ToggleChanges => {
+                self.changes = !self.changes;
+                if self.changes {
+                    self.cockpit = false;
+                    self.kanban = false;
+                    self.deck = false;
                 }
             }
             Cmd::OpenAgentPicker => self.agent_picker.open(ctx),

@@ -377,6 +377,18 @@ pub struct Session {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// PTY リサイズの安定判定 (毎フレームの要求 → 送るべき 1 回に潰す)。
     resize_debounce: ResizeDebounce,
+    /// **主たる端末ビューがこの端末の大きさを決めたか。**
+    ///
+    /// デッキ / 看板 / Cockpit の小さなライブ枠は「見るだけ」の窓なので、
+    /// 主が一度決めたら以後 1 度も大きさを触らない。触らせると、画面を
+    /// 切り替えただけで PTY が縮み、Ink 系の CLI エージェント (Claude Code
+    /// など) が**枠より高いフレームを丸ごと描き直す**ため、同じ会話が履歴へ
+    /// もう一度積まれる (「コピーすると同じ文章が 2 回入る」の正体)。
+    ///
+    /// ただし**まだ誰も決めていない間だけ**はライブ枠に決めさせる。
+    /// デッキから起動してデッキで作業する人の端末が、起動時の 30×110 の
+    /// まま大きなペインの中で小さく残るのを避けるため。
+    size_owned: bool,
     /// リサイズを実際に撃つワーカー。初回のリサイズ確定時に遅延起動する。
     resizer: Option<ResizeCoalescer>,
     /// ワーカーの起動に失敗した (スレッドを作れなかった)。以後は再試行しない。
@@ -2097,6 +2109,7 @@ impl Session {
             writer,
             master: Arc::new(Mutex::new(pair.master)),
             resize_debounce: ResizeDebounce::settled((rows, cols)),
+            size_owned: false,
             resizer: None,
             resizer_spawn_failed: false,
             parser_rebuilt_notice: None,
@@ -4923,6 +4936,52 @@ mod tests {
             key_bytes(egui::Key::Backspace, egui::Modifiers::NONE, false),
             Some(vec![0x7f])
         );
+    }
+
+    /// **最新の行は必ず枠の下端に来る。**
+    ///
+    /// 枠がグリッドより低いときに上を映すと、入力欄も直近の出力も見えない
+    /// 「上半分の残骸」だけが出る。逆に低いグリッドを上へ貼ると、下に
+    /// 大きな空白が空く (デッキの全高ペインで目立つ)。
+    /// 行の対応はここ 1 か所 (`grid_rect`) だけが決めるので、描画と当たり
+    /// 判定がずれない (2 か所で計算すると、コピーだけが静かにずれる)。
+    #[test]
+    fn 最新の行は必ず枠の下端に来る() {
+        use super::{grid_rect, TERM_PADDING};
+        let pad = TERM_PADDING;
+        let cell_h = 10.0_f32;
+        // 枠に 20 行入る大きさ (padding は上下)
+        let h = 20.0 * cell_h + pad * 2.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(300.0, h));
+        // 表 (パーサ行数 → 原点のずれ行数。正 = 下へ / 負 = 上へ)
+        for (parser_rows, shift) in [
+            (0u16, 0i32), // 大きさが無いフレームは動かさない
+            (1, 19),      // 1 行しか無ければ下端に貼り付く
+            (19, 1),
+            (20, 0), // ちょうど収まる = 1 ピクセルも動かさない
+            (21, -1),
+            (45, -25), // 枠より高い = 上へはみ出して最新を映す
+        ] {
+            let g = grid_rect(rect, pad, cell_h, parser_rows);
+            assert_eq!(
+                g.min.y,
+                rect.min.y + shift as f32 * cell_h,
+                "parser_rows={parser_rows}"
+            );
+            // 横と下端は動かさない (枠の外へ文字が出ない)
+            assert_eq!(g.min.x, rect.min.x, "parser_rows={parser_rows}");
+            assert_eq!(g.max, rect.max, "parser_rows={parser_rows}");
+            // いちばん下の行 (parser_rows - 1) が枠の中に収まる
+            if parser_rows > 0 {
+                let last_top = g.min.y + pad + f32::from(parser_rows - 1) * cell_h;
+                assert!(
+                    last_top >= rect.min.y && last_top + cell_h <= rect.max.y + 0.001,
+                    "最新行が枠に収まらない parser_rows={parser_rows}"
+                );
+            }
+        }
+        // 0 割りしない (フォントが測れないフレームでも落ちない)
+        assert_eq!(grid_rect(rect, pad, 0.0, 40), rect);
     }
 
     #[test]
@@ -9247,6 +9306,37 @@ fn handle_links(
     }
 }
 
+/// セルのグリッドを置く矩形を決める。
+///
+/// **最後の行 (= 最新) が必ず枠の下端に来る**ように原点をずらす。
+/// 枠がパーサより低ければ上へはみ出し (`painter_at(rect)` が切る)、
+/// 高ければ余白は上に付く (端末は下から積み上がるので、これが自然)。
+///
+/// これが要るのは「枠の大きさ = PTY の大きさ」を崩すため。デッキ / 看板 /
+/// Cockpit の小さなライブ枠まで PTY を縮めると、Ink 系の CLI エージェント
+/// (Claude Code など) は**枠より高いフレームを丸ごと描き直す**ので、同じ
+/// 会話が履歴へもう一度積まれる (「コピーすると同じ文章が 2 回入る」の正体)。
+/// 実測: claude 2.1.233 の実ログを再生すると、同じ 1 行が履歴に並ぶ回数は
+/// **58 行なら 1 回・30 行だと 2 回・24 行だと 4 回**。
+///
+/// 行の対応をここ 1 か所で決めるので、描画・選択・リンク・検索の座標が
+/// ずれない (2 か所で計算すると、コピーだけが静かにずれる)。
+pub fn grid_rect(rect: egui::Rect, padding: f32, cell_h: f32, parser_rows: u16) -> egui::Rect {
+    if cell_h <= 0.0 || parser_rows == 0 {
+        return rect;
+    }
+    let fits = ((rect.height() - padding * 2.0) / cell_h).floor().max(0.0);
+    // ちょうど収まっているなら 1 ピクセルも動かさない
+    // (主たる端末ビューの見え方は 1 フレームも変えない)。
+    if (fits - f32::from(parser_rows)).abs() < 0.5 {
+        return rect;
+    }
+    // **最後の行が常に枠の下端に来る**ように原点をずらす。
+    // 高いグリッド → 上へはみ出す (切られる)。低いグリッド → 下に貼り付く。
+    let shift = (fits - f32::from(parser_rows)) * cell_h;
+    egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + shift), rect.max)
+}
+
 /// 画面グリッド(文字セル・選択ハイライト)、カーソル、IME オーバーレイの描画。
 #[allow(clippy::too_many_arguments)]
 fn draw_screen(
@@ -9266,8 +9356,19 @@ fn draw_screen(
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let origin = rect.min + egui::vec2(padding, padding);
+    // 実際に見えている枠。`rect` はグリッドの原点を決めるために上へ
+    // 伸びていることがあるので、切り取りと IME の位置はこちらで見る。
+    let view = painter.clip_rect();
 
     for r in 0..rows {
+        let row_y = origin.y + r as f32 * cell_h;
+        // 枠の上へ出た行は描かない (描いても切られる = 無駄なだけ)
+        if row_y + cell_h <= view.min.y {
+            continue;
+        }
+        if row_y + cell_h > rect.max.y {
+            break;
+        }
         for cix in 0..cols {
             let Some(cell) = screen.cell(r, cix) else {
                 continue;
@@ -9276,10 +9377,7 @@ fn draw_screen(
                 continue;
             }
             let x = origin.x + cix as f32 * cell_w;
-            let y = origin.y + r as f32 * cell_h;
-            if y + cell_h > rect.max.y {
-                break;
-            }
+            let y = row_y;
             if x >= rect.max.x {
                 continue;
             }
@@ -9391,7 +9489,12 @@ fn draw_screen(
         // 扱うので、そのままでも文字は端末へ入る。
         ui.ctx().output_mut(|o| {
             o.mutable_text_under_cursor = true;
-            o.ime = Some(egui::output::IMEOutput { rect, cursor_rect });
+            // IME の候補窓は**見えている枠**に合わせる (グリッド用に上へ
+            // 伸ばした矩形を渡すと、枠の外に候補が出る)。
+            o.ime = Some(egui::output::IMEOutput {
+                rect: view,
+                cursor_rect,
+            });
         });
 
         // IME 変換中の未確定文字列をカーソル位置にオーバーレイ表示。
@@ -9781,10 +9884,24 @@ pub fn draw(
     // 分割レイアウト側の [`apply_sizes`] と同じ値を使う (ずれると
     // 「描いた矩形と PTY のグリッド」が食い違う)。
     let padding = TERM_PADDING;
-    if allow_resize {
+    // **端末を縮めてよいのは主たる端末ビューだけ** (`allow_resize`)。
+    //
+    // ライブ枠 (デッキ / 看板 / Cockpit) は、まだ主が現れていない端末を
+    // **広げることだけ**できる。デッキから起動してデッキで作業する人の端末が
+    // 起動時の大きさのまま大きなペインに取り残されるのを避けつつ、画面を
+    // 切り替えただけで縮む (= CLI エージェントが会話を描き直して履歴が
+    // 二重になる) ことは起こさない。広げるぶんには描き直しても収まるので
+    // 二重にならない。
+    if allow_resize || !session.size_owned {
         let cols = ((rect.width() - padding * 2.0) / cell_w).floor() as u16;
         let rows = ((rect.height() - padding * 2.0) / cell_h).floor() as u16;
-        session.resize(rows, cols);
+        if allow_resize {
+            session.resize(rows, cols);
+            session.size_owned = true;
+        } else {
+            let (cur_r, cur_c) = session.size;
+            session.resize(rows.max(cur_r), cols.max(cur_c));
+        }
         if session.resize_pending() {
             // 安定カウント (RESIZE_STABLE_FRAMES) が完走する前に再描画が
             // 止まると、最終サイズが PTY へ届かないまま残る。完走するまで
@@ -9792,6 +9909,14 @@ pub fn draw(
             crate::perf::repaint(ui.ctx(), "term_focus");
         }
     }
+    // グリッドを置く矩形。**この枠が PTY を持たない (プレビュー) とき**や
+    // リサイズが届く前のフレームでは、パーサの行数のほうが多い。そのときは
+    // 上へ伸ばして**いちばん下 (最新) を映す** — 上を映すと、入力欄も直近の
+    // 出力も見えない「上半分の残骸」だけが出る。
+    let grid = {
+        let rows = lock_ok(&session.parser).screen().size().0;
+        grid_rect(rect, padding, cell_h, rows)
+    };
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
     // リンクを開いてよいかは「このクリックの前に選択があったか」で変わるが、
@@ -9807,7 +9932,7 @@ pub fn draw(
         if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
             session.links.press_at = Some(p);
         }
-        handle_mouse_selection(session, &response, rect, padding, cell_w, cell_h);
+        handle_mouse_selection(session, &response, grid, padding, cell_w, cell_h);
     }
 
     // 通常画面で履歴を遡ったまま代替画面のアプリ (vim / less / エージェント) が
@@ -9842,7 +9967,7 @@ pub fn draw(
         ui.input(|i| i.modifiers.shift),
     );
     if interactive && wheel_here && response.hovered() {
-        handle_wheel_scroll(ui, session, rect, padding, cell_w, cell_h);
+        handle_wheel_scroll(ui, session, grid, padding, cell_w, cell_h);
     }
 
     let painter = ui.painter_at(rect);
@@ -9853,11 +9978,11 @@ pub fn draw(
     session.ensure_parser_healthy();
 
     draw_screen(
-        ui, &painter, session, theme, &font_id, rect, padding, cell_w, cell_h, focused,
+        ui, &painter, session, theme, &font_id, grid, padding, cell_w, cell_h, focused,
     );
 
     // シェル統合の印と sticky 帯。マーカーが来ていなければ何も描かない。
-    draw_shell_decorations(ui, session, theme, rect, padding, cell_w, cell_h);
+    draw_shell_decorations(ui, session, theme, grid, padding, cell_w, cell_h);
 
     // リンク (URL / ファイル:行:桁) のホバー表示とクリック。
     // 走査するのはポインタ下の 1 行だけなので、静止中のコストは 0。
@@ -9868,7 +9993,7 @@ pub fn draw(
             session,
             theme,
             &response,
-            rect,
+            grid,
             padding,
             cell_w,
             cell_h,
@@ -9878,7 +10003,7 @@ pub fn draw(
 
     // 端末内検索 (Cmd+F): 表示中画面のヒットをハイライトし、バーを浮かせる
     if session.search.open && !session.search.query.is_empty() {
-        paint_search_highlights(&painter, session, theme, rect, padding, cell_w, cell_h);
+        paint_search_highlights(&painter, session, theme, grid, padding, cell_w, cell_h);
     }
     if interactive && session.search.open {
         terminal_search_bar_ui(ui, session, theme, rect);

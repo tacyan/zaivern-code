@@ -112,6 +112,7 @@ pub(crate) const SRC_IMPL: &str = concat!(
     include_str!("sidebar_ui.rs"),
     include_str!("bottom_panels.rs"),
     include_str!("cockpit.rs"),
+    include_str!("changes_center.rs"),
     include_str!("kanban_deck_git.rs"),
     include_str!("editor_layout.rs"),
     include_str!("file_viewers.rs"),
@@ -152,6 +153,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("sidebar_ui.rs"),
     include_str!("bottom_panels.rs"),
     include_str!("cockpit.rs"),
+    include_str!("changes_center.rs"),
     include_str!("kanban_deck_git.rs"),
     include_str!("editor_layout.rs"),
     include_str!("file_viewers.rs"),
@@ -1018,6 +1020,8 @@ enum CenterView {
     Kanban,
     /// 🗂 エージェントデッキ
     Deck,
+    /// 🗒 変更一覧 (どのファイルのどの行が変わったかを一望する)
+    Changes,
 }
 
 /// ズームジェスチャ (⌘+ホイール / ピンチ) を持っている中央ビューの種別。
@@ -1034,12 +1038,16 @@ enum ZoomArea {
     Image,
 }
 
-/// 3 本のフラグから「今フレーム描くビュー」を 1 つ決める (純関数)。
+/// 4 本のフラグから「今フレーム描くビュー」を 1 つ決める (純関数)。
 ///
-/// 優先順は デッキ > Cockpit > 看板 > エディタ。フラグが複数立っていても
-/// 返り値は必ず 1 つなので、2 つのビューが重なって描かれることはない。
-fn center_view(cockpit: bool, kanban: bool, deck: bool) -> CenterView {
-    if deck {
+/// 優先順は 変更一覧 > デッキ > Cockpit > 看板 > エディタ。フラグが複数
+/// 立っていても返り値は必ず 1 つなので、2 つのビューが重なって描かれることは
+/// **構造的に**起こらない (独立した bool を見て描き分けていた頃は、描画中に
+/// フラグが変わって 2 枚重なる事故が実際に起きた)。
+fn center_view(cockpit: bool, kanban: bool, deck: bool, changes: bool) -> CenterView {
+    if changes {
+        CenterView::Changes
+    } else if deck {
         CenterView::Deck
     } else if cockpit {
         CenterView::Cockpit
@@ -2313,6 +2321,7 @@ impl Subview {
             Subview::Panel("editor") => tr("エディタ"),
             Subview::Panel("cockpit") => tr("コックピット"),
             Subview::Panel("deck") => tr("エージェントデッキ"),
+            Subview::Panel("changes") => tr("変更一覧"),
             Subview::Panel("sidebar") => tr("サイドバー"),
             Subview::Panel("terminal") => tr("ターミナルパネル"),
             Subview::Panel(other) => (*other).to_string(),
@@ -3332,6 +3341,11 @@ pub struct ZaivernApp {
     deck: bool,
     /// デッキ画面の UI 状態 (選択・レイアウト・絞り込み・追跡)
     deck_state: deck::DeckState,
+    /// 🗒 変更一覧 (未コミットの変更を「どのファイルのどの行」で一望する)。
+    /// Cockpit / 看板 / デッキと同格の中央画面モード。
+    changes: bool,
+    /// 変更一覧の UI 状態 (絞り込み・展開)
+    changes_state: crate::changes_view::ChangesState,
     /// デッキの副題に出す「作業ディレクトリ → git ブランチ」。
     /// 値は (ブランチ名, 取得時刻)。空文字 = repo ではない (再問い合わせは TTL 後)。
     deck_branches: HashMap<PathBuf, (String, Instant)>,
@@ -4205,6 +4219,7 @@ fn build_file_index_with(
 
 mod agent_sessions;
 mod bottom_panels;
+mod changes_center;
 mod cmd_dispatch;
 mod cmd_palette;
 mod cockpit;

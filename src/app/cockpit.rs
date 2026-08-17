@@ -1188,8 +1188,13 @@ impl ZaivernApp {
                                     } else {
                                     let s = &mut self.agents.sessions[i];
                                     let term = draw_subview(Subview::Session(sid), || {
+                                        // ミニ端末は**PTY の大きさを持たない**
+                                        // (`allow_resize = false`)。小さな枠に
+                                        // 合わせて縮めると、枠より高いフレームを
+                                        // 描き直す CLI エージェントの会話が履歴へ
+                                        // 二重に積まれる (grid_rect の説明を参照)。
                                         terminal::draw(
-                                            ui, s, theme, mini_font, true, true, false,
+                                            ui, s, theme, mini_font, true, false, false,
                                         )
                                     });
                                     // ミニターミナルをクリックして入力を始めた
@@ -1341,7 +1346,7 @@ impl ZaivernApp {
                     return;
                 };
                 draw_subview(Subview::Session(pid), || {
-                    terminal::draw(ui, s, theme, mini_font, true, true, false);
+                    terminal::draw(ui, s, theme, mini_font, true, false, false);
                 });
             },
         );
