@@ -53,8 +53,140 @@ const net = require('net');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
+const NL = String.fromCharCode(10);
+
 const ROOT = path.resolve(__dirname, '..');
 const REMOTE = path.join(ROOT, 'assets', 'remote');
+
+// ─────────────────────────────────────────────────────────────────────
+// 0. 時限と進捗 — **黙って待ち続けない**
+// ─────────────────────────────────────────────────────────────────────
+// CI (ubuntu) で 15 分間**標準出力に 1 バイトも出ないまま**ジョブが打ち切られた。
+// 原因は「返らない待ち」がどれも予算を持っていなかったこと:
+//
+//   * CDP の 1 往復に時限が無い    → ブラウザが固まると永久に待つ
+//   * WebSocket の握手に時限が無い → 繋がらないまま永久に待つ
+//   * 偽サーバの close()           → keep-alive を握られたままだと**返らない**
+//   * 全体の時限が無い             → 上のどれかに落ちると誰も打ち切らない
+//
+// 時限は**入れ子**にする (1 往復 < 1 つの検査 < 全体)。予算は環境変数で
+// 変えられる — CI と手元で妥当な値が違うのに、直書きすると片方で必ず嘘になる。
+function envMs(name, dflt) {
+  const v = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(v) && v > 0 ? v : dflt;
+}
+const BUDGET = {
+  total: envMs('ZV_DEADLINE_MS', 12 * 60 * 1000), // 全体の上限 (ジョブの timeout より必ず短く)
+  stall: envMs('ZV_STALL_MS', 120 * 1000),        // **進捗が止まって**からの猶予
+  launch: envMs('ZV_LAUNCH_MS', 45 * 1000),       // ブラウザが CDP の口を開くまで
+  ws: envMs('ZV_WS_MS', 15 * 1000),               // WebSocket の握手
+  cdp: envMs('ZV_CDP_MS', 30 * 1000),             // CDP の 1 往復
+  load: envMs('ZV_LOAD_MS', 20 * 1000),           // ページの読み込み
+  close: envMs('ZV_CLOSE_MS', 5 * 1000),          // 後始末 (1 つあたり)
+  beat: envMs('ZV_HEARTBEAT_MS', 20 * 1000),      // 生存の合図 (0 で止める)
+};
+
+const T0 = Date.now();
+const elapsed = () => ((Date.now() - T0) / 1000).toFixed(1) + 's';
+// いま何をしているか。時限が撃ったときに**どこで止まったか**を言うために持つ。
+let PHASE = '起動前';
+let LAST_PROGRESS = Date.now();
+// **固定の予算だけでは必ず破綻する** (CLAUDE.md: 進捗が観測できる限り待ちを延ばす)。
+// 遅いランナーで正しく働いているだけの実行を殺さないため、時限は 2 段にする:
+//   touch()  … 進んだ。止まってからの猶予 (BUDGET.stall) を数え直す
+//   絶対上限 … それでも終わらない生きたループ用 (BUDGET.total)
+function touch() { LAST_PROGRESS = Date.now(); }
+function step(msg) {
+  PHASE = msg;
+  touch();
+  process.stdout.write('  [' + elapsed() + '] ' + msg + '\n');
+}
+
+// **process.exit() の直前は同期で書く。** stdout がパイプ (CI の tee や
+// `$(...)`) のとき process.stdout.write は非同期で、exit がバッファを
+// 捨てる。黙って消えると、いちばん要る 1 行だけが失われる。
+function sayNow(msg) {
+  try { fs.writeSync(1, msg); } catch (e) {
+    try { process.stdout.write(msg); } catch (x) { /* 書けないなら諦める */ }
+  }
+}
+
+// 時限が撃ったときの言い分。**理由を 1 行書いて赤で終わる** — 黙って消えない。
+function fireDeadline(why) {
+  sayNow(NL + '\u001b[1;31m✗ 時限切れ — ' + why + '\u001b[0m' + NL
+    + '  最後の段: ' + PHASE + ' (経過 ' + elapsed() + ')' + NL
+    + '  予算は ZV_DEADLINE_MS / ZV_STALL_MS / ZV_CDP_MS で変えられます' + NL);
+  runCleanup();
+  process.exit(3);
+}
+
+// 全体の見張り。**unref しない** — これが生きている限り event loop は
+// 回るので、他の待ちを unref しても「誰も居なくなって黙って終了」が起きない。
+function armWatchdog() {
+  const tick = setInterval(() => {
+    if (Date.now() - T0 > BUDGET.total) {
+      fireDeadline('全体で ' + Math.round(BUDGET.total / 1000) + ' 秒を超えました');
+    }
+    if (Date.now() - LAST_PROGRESS > BUDGET.stall) {
+      fireDeadline(Math.round(BUDGET.stall / 1000) + ' 秒のあいだ 1 つも進みませんでした');
+    }
+  }, 1000);
+  return tick;
+}
+
+// 生きている合図。**これが無いと CI のログは 15 分間まっさらになる** —
+// 実際にそうなって「何が起きたか分からない」まま打ち切られた。
+function armHeartbeat() {
+  if (BUDGET.beat <= 0) return null;
+  const t = setInterval(() => {
+    const idle = ((Date.now() - LAST_PROGRESS) / 1000).toFixed(1);
+    process.stdout.write('  … ' + elapsed() + ' 経過 / ' + PHASE + ' — 最後の進捗から ' + idle + 's\n');
+  }, BUDGET.beat);
+  if (t.unref) t.unref();
+  return t;
+}
+
+// プロセスをツリーごと畳む。**直接の子だけ殺すと孫が残る** —
+// CI のログの最後に chrome / chrome_crashpad_handler が並んでいたのがそれ。
+function killTree(proc) {
+  if (!proc || !proc.pid) return;
+  const pid = proc.pid;
+  if (process.platform === 'win32') {
+    try { spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); }
+    catch (e) { /* もう居ない */ }
+    try { proc.kill(); } catch (e) { /* もう居ない */ }
+    return;
+  }
+  // detached で起こしてあるので子はプロセスグループの長。負の PID で
+  // グループごと落とす。**pid <= 1 では絶対に撃たない** (kill(-1) は
+  // 自分の全プロセスを巻き込む)。
+  if (pid > 1) {
+    try { process.kill(-pid, 'SIGKILL'); } catch (e) { /* もう居ない */ }
+  }
+  try { proc.kill('SIGKILL'); } catch (e) { /* もう居ない */ }
+}
+
+// 後始末は投げっぱなしにしない。時限や signal で落ちるときも必ず通る。
+const CLEANUP = [];
+function runCleanup() {
+  while (CLEANUP.length) {
+    const f = CLEANUP.pop();
+    try { f(); } catch (e) { /* 後始末は失敗しても次へ進む */ }
+  }
+}
+
+// 1 つの待ちに予算を付ける。**超えたら理由を持った Error で返る** (黙らない)。
+function withTimeout(p, ms, what) {
+  let t = null;
+  const guard = new Promise((_res, rej) => {
+    t = setTimeout(() => rej(new Error(what + ' が ' + ms + 'ms で返りませんでした')), ms);
+    if (t.unref) t.unref();
+  });
+  return Promise.race([p, guard]).then(
+    v => { clearTimeout(t); return v; },
+    e => { clearTimeout(t); throw e; },
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // 1. ページを組む — **build.rs の generate_remote_assets と同じ順序**
@@ -189,6 +321,10 @@ function startServer(page, model, opt) {
       return;
     }
     if (p === '/favicon.ico') { res.writeHead(204); res.end(); return; }
+    // わざと返さない経路 (--hang server 専用)。**処理中の要求**を 1 本
+    // 抱えたままにすると、Node の server.close() はコールバックを呼ばない。
+    // 「後始末が返らない」を本物で再現するための仕込み。
+    if (p === '/zv-never') { return; }
     if (p === '/api/scrollback') {
       // 「この版には無い」経路も本番にある。opt.scrollback=false でそちらを通す。
       if (!opt.scrollback) { res.writeHead(404); res.end('no'); return; }
@@ -227,13 +363,42 @@ function startServer(page, model, opt) {
     }
     res.writeHead(404); res.end('no');
   });
+  // **握られたままの接続を数える。** Node の server.close() は
+  // 生きている接続が 1 本でもあると**コールバックを呼ばない**。ブラウザは
+  // keep-alive を張るので、閉じ損ねると後始末で永久に止まる (無音のまま
+  // ジョブが打ち切られた形はこれで説明が付く)。
+  const socks = new Set();
+  srv.on('connection', sk => {
+    socks.add(sk);
+    sk.on('close', () => socks.delete(sk));
+  });
+  const cutAll = () => {
+    for (const sk of socks) { try { sk.destroy(); } catch (e) { /* もう閉じている */ } }
+    socks.clear();
+  };
   return new Promise(resolve => {
     // ポートは 0 (空きを OS に選ばせる)。番号を直書きすると同時実行で衝突する。
     srv.listen(0, '127.0.0.1', () => {
       resolve({
         url: 'http://127.0.0.1:' + srv.address().port + '/',
         hits,
-        close: () => new Promise(r => srv.close(r)),
+        close: () => new Promise(resolve2 => {
+          let done = false;
+          const fin = note => { if (done) return; done = true; resolve2(note || null); };
+          const late = setTimeout(() => {
+            const n = socks.size;
+            cutAll();
+            fin('後始末: 握られたままの接続 ' + n + ' 本を切って進みました');
+          }, BUDGET.close);
+          if (late.unref) late.unref();
+          srv.close(() => { clearTimeout(late); fin(); });
+          // **時限が空回りしていないこと**を確かめるための仕込み
+          // (--hang server)。こちらから切らず、後ろの砦だけに任せる。
+          if (process.env.ZV_HOLD_SOCKETS === '1') return;
+          // 待たずにこちらから切る (Node 18.2+ なら本体の API を使う)。
+          if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+          else cutAll();
+        }),
       });
     });
   });
@@ -296,15 +461,40 @@ class Ws {
     this.handlers = [];
     this.frag = [];
     this.fragOp = 0;
+    this.closeHandlers = [];
     sock.on('data', d => { this.buf = Buffer.concat([this.buf, d]); this.drain(); });
     sock.on('error', () => { /* 終了時に閉じるので握り潰す */ });
+    // **閉じたことを黙って飲まない。** 待っている往復を予算いっぱい (30 秒)
+    // 待たせる代わりに、その場で「ブラウザが落ちた」と言う。
+    sock.on('close', () => {
+      for (const h of this.closeHandlers) { try { h(); } catch (e) { /* 続ける */ } }
+    });
   }
 
   static connect(url) {
+    // **握手にも時限が要る。** 繋がらない / 101 が返らないまま待ち続けると、
+    // ここだけで CI のジョブ時間を使い切る (実際にそう見える形で止まった)。
     return new Promise((res, rej) => {
       const u = new URL(url);
       const key = crypto.randomBytes(16).toString('base64');
-      const sock = net.connect({ host: u.hostname, port: Number(u.port || 80) }, () => {
+      let settled = false;
+      let sock = null;
+      const to = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { if (sock) sock.destroy(); } catch (e) { /* もう閉じている */ }
+        rej(new Error('CDP の WebSocket 握手が ' + BUDGET.ws + 'ms で終わりませんでした (' + url + ')'));
+      }, BUDGET.ws);
+      if (to.unref) to.unref();
+      const ok = v => { if (settled) return; settled = true; clearTimeout(to); res(v); };
+      const ng = e => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(to);
+        try { if (sock) sock.destroy(); } catch (x) { /* もう閉じている */ }
+        rej(e);
+      };
+      sock = net.connect({ host: u.hostname, port: Number(u.port || 80) }, () => {
         sock.write('GET ' + u.pathname + u.search + ' HTTP/1.1\r\n'
           + 'Host: ' + u.host + '\r\n'
           + 'Upgrade: websocket\r\n'
@@ -320,17 +510,17 @@ class Ws {
         sock.removeListener('data', onData);
         const status = head.slice(0, i).toString('latin1').split('\r\n')[0];
         if (status.indexOf(' 101') < 0) {
-          sock.destroy();
-          rej(new Error('WebSocket の握手に失敗: ' + status));
+          ng(new Error('WebSocket の握手に失敗: ' + status));
           return;
         }
         const ws = new Ws(sock);
         const rest = head.slice(i + 4);
-        res(ws);
+        ok(ws);
         if (rest.length) { ws.buf = rest; ws.drain(); }
       };
       sock.on('data', onData);
-      sock.on('error', e => rej(new Error('CDP へ繋げません (' + url + '): ' + e.message)));
+      sock.on('error', e => ng(new Error('CDP へ繋げません (' + url + '): ' + e.message)));
+      sock.on('close', () => ng(new Error('CDP の接続が握手の前に閉じました (' + url + ')')));
     });
   }
 
@@ -393,12 +583,20 @@ class Ws {
 
   send(s) { this.frame(0x1, Buffer.from(s, 'utf8')); }
   onMessage(fn) { this.handlers.push(fn); }
+  onClose(fn) { this.closeHandlers.push(fn); }
   close() { try { this.sock.destroy(); } catch (e) { /* 既に閉じている */ } }
 }
 
 class Cdp {
   constructor(ws) {
     this.ws = ws; this.id = 0; this.pending = new Map(); this.handlers = [];
+    this.dead = null;
+    // ブラウザが落ちたら、待っている往復を**その場で**失敗させる。
+    ws.onClose(() => {
+      this.dead = 'ブラウザとの接続が閉じました';
+      for (const [, w] of this.pending) w.rej(new Error(this.dead));
+      this.pending.clear();
+    });
     ws.onMessage(txt => {
       let m;
       try { m = JSON.parse(txt); } catch (e) { return; }
@@ -415,14 +613,24 @@ class Cdp {
   }
   static async connect(url) { return new Cdp(await Ws.connect(url)); }
   on(fn) { this.handlers.push(fn); }
+  // **1 往復ごとに予算を持たせる。** ここが無いと、ブラウザが固まった瞬間に
+  // 検査は「待っているだけ」になり、外からは死んだのか働いているのか分からない。
   send(method, params, sessionId) {
+    if (this.dead) return Promise.reject(new Error(this.dead + ' (' + method + ')'));
     const id = ++this.id;
     const msg = { id, method, params: params || {} };
     if (sessionId) msg.sessionId = sessionId;
-    this.ws.send(JSON.stringify(msg));
-    return new Promise((res, rej) => this.pending.set(id, { res, rej }));
+    const p = new Promise((res, rej) => this.pending.set(id, { res, rej }));
+    try { this.ws.send(JSON.stringify(msg)); } catch (e) {
+      this.pending.delete(id);
+      return Promise.reject(new Error('CDP へ送れません (' + method + '): ' + e.message));
+    }
+    return withTimeout(p, BUDGET.cdp, 'CDP ' + method).catch(e => {
+      this.pending.delete(id);
+      throw e;
+    });
   }
-  close() { this.ws.close(); }
+  close() { this.dead = this.dead || '検査側から閉じました'; this.ws.close(); }
 }
 
 async function launchBrowser(bin) {
@@ -431,26 +639,69 @@ async function launchBrowser(bin) {
     '--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run',
     '--no-default-browser-check', '--disable-extensions', '--disable-background-networking',
     '--disable-sync', '--disable-default-apps', '--mute-audio', '--hide-scrollbars',
+    // ── コンテナ / CI で固まらないため ──────────────────────────────
+    // /dev/shm が 64MB しか無い環境 (Docker の既定) では、共有メモリを
+    // 使い切ったレンダラが**応答を返さなくなる**。ファイル経由に落とす。
+    '--disable-dev-shm-usage',
+    // crashpad は**別プロセス**で、親を殺しても残る (CI のログの最後に
+    // chrome_crashpad_handler が並んでいた)。そもそも起こさない。
+    // **実物で確かめた綴りだけを書く** (CLAUDE.md: フラグを捏造しない)。
+    // Linux の chromium 151 を grep -a すると disable-breakpad は 1 件、
+    // disable-crash-reporter は **0 件** — 後者は無い綴りなので置かない。
+    '--disable-breakpad',
+    // ── 隠れたタブの時計を止めさせない ─────────────────────────────
+    // headless はタブを「見えていない」と見なすことがある。止まると
+    // ポーリング検査が「取りに行っていない」と誤判定し、乱歩は 1 状態も
+    // 進まない = 進捗ゼロのまま時限まで待つ、という形で間欠的に落ちる。
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    // 短い間隔で叩くので、IPC の絞り込みに引っかからないようにする。
+    '--disable-ipc-flooding-protection',
     '--remote-debugging-port=0', '--user-data-dir=' + profile, 'about:blank',
   ];
-  const proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  // **detached** で起こして子を独立したプロセスグループの長にする。
+  // こうしないと孫 (レンダラ / GPU / crashpad) をまとめて畳めない。
+  const proc = spawn(bin, args, {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    detached: process.platform !== 'win32',
+  });
+  let closed = false;
+  const wipe = () => {
+    if (closed) return;
+    closed = true;
+    killTree(proc);
+    try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) { /* 消せなくても続ける */ }
+  };
+  CLEANUP.push(wipe);
   const wsUrl = await new Promise((res, rej) => {
     let buf = '';
-    const to = setTimeout(() => rej(new Error('ブラウザが 20 秒で立ち上がりませんでした:\n' + buf)), 20000);
+    const to = setTimeout(
+      () => rej(new Error('ブラウザが ' + BUDGET.launch + 'ms で立ち上がりませんでした:\n' + buf)),
+      BUDGET.launch);
+    if (to.unref) to.unref();
     proc.stderr.on('data', d => {
-      buf += d.toString();
+      // 溜め続けるとログが長い版で膨らむので、末尾だけ持つ。
+      buf = (buf + d.toString()).slice(-8192);
       const m = buf.match(/ws:\/\/\S+/);
       if (m) { clearTimeout(to); res(m[0]); }
     });
+    proc.on('error', e => { clearTimeout(to); rej(new Error('ブラウザを起こせません: ' + e.message)); });
     proc.on('exit', c => { clearTimeout(to); rej(new Error('ブラウザが即終了しました (rc=' + c + ')\n' + buf)); });
-  });
-  const cdp = await Cdp.connect(wsUrl);
+  }).catch(e => { wipe(); throw e; });
+  const cdp = await Cdp.connect(wsUrl).catch(e => { wipe(); throw e; });
   return {
     cdp,
     async close() {
-      cdp.close();
-      try { proc.kill('SIGKILL'); } catch (e) { /* 既に死んでいる */ }
-      try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) { /* 消せなくても続ける */ }
+      try { cdp.close(); } catch (e) { /* もう閉じている */ }
+      const gone = new Promise(r => {
+        if (proc.exitCode !== null || proc.signalCode) { r(); return; }
+        proc.once('exit', () => r());
+      });
+      wipe();
+      // 死ぬまで待つ。**待たないと次の実行と重なる**が、待ち続けもしない。
+      await withTimeout(gone, BUDGET.close, 'ブラウザの終了')
+        .catch(() => { process.stdout.write('  … ブラウザが時間内に終わりませんでした (畳み込み済み)\n'); });
     },
   };
 }
@@ -796,8 +1047,9 @@ async function runOne(br, spec) {
     const loaded = new Promise(res => {
       br.cdp.on(m => { if (m.sessionId === sid && m.method === 'Page.loadEventFired') res(); });
     });
+    step(spec.name + ': ページを開く');
     await br.cdp.send('Page.navigate', { url: srv.url + '?t=zv-test' }, sid);
-    await Promise.race([loaded, wait(15000)]);
+    await Promise.race([loaded, wait(BUDGET.load)]);
 
     // 起動直後の /api/state が返るまで待つ (返る前に叩くと空の画面を検査する)
     for (let i = 0; i < 60; i++) {
@@ -808,6 +1060,7 @@ async function runOne(br, spec) {
     // (7) ポーリングが**実際に飛んでいる**か - 判定はページの中ではなく
     //     サーバ側の受信数で行う (ページの中の変数はいくらでも嘘をつける)。
     const pollV = [];
+    step(spec.name + ': ポーリングが飛んでいるか');
     await evalJs(br.cdp, sid,
       '(function(){var n=document.querySelector(\'#nav button[data-v="agent"]\');if(n)n.click();'
       + 'var v=document.getElementById("v-agent");var b=v&&v.querySelector(":scope > .seg > button");'
@@ -844,17 +1097,34 @@ async function runOne(br, spec) {
     // **固まったら黙って待たない。** 進み具合をページ側の window.__zv で見て、
     // 一定時間 1 状態も進まなければ「どこで止まったか」を添えて中止する。
     let done = false, out = null, err = null;
+    step(spec.name + ': 総当たり + 乱歩');
     evalJs(br.cdp, sid, src, true).then(v => { out = v; done = true; }, e => { err = e; done = true; });
-    let last = -1, still = 0;
+    let last = -1, blind = 0, cur = '?';
     const t0 = Date.now();
+    // **止まった時間は「回した数 × 500ms」ではなく壁時計で数える。**
+    // 1 往復が時限まで返らない局面では 1 周が 30 秒かかるので、回数で
+    // 数えると 25 秒の猶予が実際には 25 分になる (静かな嘘)。
+    let moved = Date.now();
     while (!done) {
       await wait(500);
-      let cur = null;
-      try { cur = await evalJs(br.cdp, sid, 'window.__zv ? window.__zv.steps + "|" + window.__zv.label : "?"'); }
-      catch (e) { cur = '?'; }
-      const n = parseInt(String(cur).split('|')[0], 10) || 0;
-      if (n !== last) { last = n; still = 0; } else { still += 500; }
-      if (still >= spec.stallMs) {
+      let seen = false;
+      try {
+        cur = await evalJs(br.cdp, sid, 'window.__zv ? window.__zv.steps + "|" + window.__zv.label : "?"');
+        blind = 0;
+        seen = true;
+      } catch (e) {
+        // **応えないのは「進んでいない」ではなく「壊れている」。**
+        // 読めなかったことを進捗と数えない (数えると永久に緑のまま待つ)。
+        cur = '? (' + e.message + ')';
+        if (++blind >= 3) {
+          throw new Error('ブラウザが進み具合に ' + blind + ' 回続けて応えません: ' + e.message);
+        }
+      }
+      if (seen) {
+        const n = parseInt(String(cur).split('|')[0], 10) || 0;
+        if (n !== last) { last = n; moved = Date.now(); touch(); }
+      }
+      if (Date.now() - moved >= spec.stallMs) {
         throw new Error('検査が ' + spec.stallMs + 'ms のあいだ 1 状態も進みませんでした (最後: ' + cur + ')');
       }
       if (Date.now() - t0 > spec.timeout) {
@@ -873,7 +1143,9 @@ async function runOne(br, spec) {
     if (targetId) {
       try { await br.cdp.send('Target.closeTarget', { targetId }); } catch (e) { /* もう閉じている */ }
     }
-    await srv.close();
+    // **ここが返らないと、検査は無音のまま止まる。** 予算つきで畳む。
+    const note = await srv.close();
+    if (note) process.stdout.write('  … ' + note + '\n');
   }
 }
 
@@ -882,7 +1154,7 @@ async function runOne(br, spec) {
 // ─────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const o = {
-    selfTest: false, inject: null, list: false, keep: false, help: false,
+    selfTest: false, inject: null, list: false, keep: false, help: false, hang: null,
     settle: 20, walk: 120, seed: 20260817, tapMin: 24, timeout: 240000, stallMs: 25000, lang: null,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -891,6 +1163,9 @@ function parseArgs(argv) {
     else if (a === '--list') o.list = true;
     else if (a === '--keep') o.keep = true;
     else if (a === '--inject') o.inject = argv[++i];
+    // **時限が空回りしていないことを確かめるための仕込み。**
+    // 「入れました」だけの時限は、効かないまま何年も残る。
+    else if (a === '--hang') o.hang = argv[++i];
     else if (a === '--seed') o.seed = parseInt(argv[++i], 10) || o.seed;
     else if (a === '--walk') o.walk = parseInt(argv[++i], 10);
     else if (a === '--lang') o.lang = argv[++i];
@@ -929,14 +1204,161 @@ function printViolations(v) {
 async function main() {
   const o = parseArgs(process.argv.slice(2));
   if (o.help) {
-    console.log('使い方: node tools/remote-check.js [--self-test|--inject <名前>|--list]'
+    console.log('使い方: node tools/remote-check.js [--self-test|--inject <名前>|--hang <名前>|--list]'
       + ' [--seed N] [--walk N] [--lang ja] [--keep]');
+    console.log('時限 (ms) は環境変数で変えられます:');
+    console.log('  ZV_DEADLINE_MS 全体の上限 / ZV_STALL_MS 進捗が止まってからの猶予');
+    console.log('  ZV_CDP_MS 1 往復 / ZV_WS_MS 握手 / ZV_LAUNCH_MS 起動 / ZV_LOAD_MS 読み込み');
+    console.log('  ZV_CLOSE_MS 後始末 / ZV_HEARTBEAT_MS 生存の合図 (0 で止める)');
     return 0;
   }
   if (o.list) {
     for (const k of Object.keys(INJECTIONS)) console.log(k.padEnd(14) + ' ' + INJECTIONS[k].desc);
+    console.log('--- わざと固める仕込み (--hang) ---');
+    for (const k of Object.keys(HANGS)) console.log(k.padEnd(14) + ' ' + HANGS[k]);
     return 0;
   }
+  // ここから先は「待つ」処理しかない。**見張りを立ててから**入る。
+  const watchdog = armWatchdog();
+  const beat = armHeartbeat();
+  try {
+    return await run(o);
+  } finally {
+    clearInterval(watchdog);
+    if (beat) clearInterval(beat);
+    runCleanup();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 8-2. わざと固める仕込み — **空回りする時限を残さない**
+// ─────────────────────────────────────────────────────────────────────
+// 「時限を入れました」だけでは、効いているかどうか誰も知らない。時限は
+// 普段 1 度も撃たないので、**壊れても気付けない**。だから固まる形を用意して、
+// 自己検査から毎回実際に撃つ。
+const HANGS = {
+  deadline: '全体の見張り: 何も進まないまま待ち続ける',
+  cdp: 'CDP の 1 往復: 返らない評価を撃つ',
+  server: '後始末: keep-alive を握ったまま偽サーバを閉じる',
+};
+
+// 偽サーバを keep-alive で握ったまま閉じる。ブラウザは要らない。
+// **CI で無音のまま止まった形はこれ** (Node の server.close() は生きている
+// 接続が 1 本でもあるとコールバックを呼ばない)。
+// 返らない要求を 1 本抱えた偽サーバを畳む。**2 段とも試す**:
+//   A: 普段の道 (自分から接続を切る) — すぐ返ること
+//   B: その道を塞いで**時限だけ**に任せる — 時限が空回りしていないこと
+async function hangServer() {
+  let rc = 0;
+  const round = async (label, hold) => {
+    if (hold) process.env.ZV_HOLD_SOCKETS = '1';
+    else delete process.env.ZV_HOLD_SOCKETS;
+    step('偽サーバ (' + label + '): 返らない要求を 1 本抱えさせる');
+    const srv = await startServer(
+      buildPage({ lang: null, appendJs: '', replace: [] }), makeModel(1), { scrollback: true });
+    const sock = net.connect({ host: '127.0.0.1', port: Number(new URL(srv.url).port) });
+    await new Promise((res, rej) => { sock.once('connect', res); sock.once('error', rej); });
+    sock.on('error', () => { /* 畳むときに切れる */ });
+    sock.write('GET /zv-never HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n');
+    await wait(300);
+    const t0 = Date.now();
+    step('後始末に入ります (' + label + ')');
+    const note = await srv.close();
+    const ms = Date.now() - t0;
+    console.log('  … ' + label + ': ' + ms + 'ms で返った'
+      + (note ? ' / ' + note : ' / 自分から接続を切りました'));
+    if (hold && !note) {
+      console.log('✗ 時限が撃っていません (後ろの砦が空回りしています)');
+      rc = 1;
+    }
+    try { sock.destroy(); } catch (e) { /* もう閉じている */ }
+  };
+  await round('普段の道', false);
+  await round('時限だけ', true);
+  step('後始末は 2 段とも返ってきました');
+  return rc;
+}
+
+async function hangWith(br, kind) {
+  if (kind === 'deadline') {
+    step('わざと止まります (進捗を止めて見張りを試す)');
+    await new Promise(() => { /* 永久に返らない */ });
+    return 1;
+  }
+  if (kind === 'cdp') {
+    step('わざと返らない CDP を撃ちます');
+    const t = await br.cdp.send('Target.createTarget', { url: 'about:blank' });
+    const sid = (await br.cdp.send(
+      'Target.attachToTarget', { targetId: t.targetId, flatten: true })).sessionId;
+    await br.cdp.send('Runtime.evaluate',
+      { expression: 'new Promise(function () {})', awaitPromise: true }, sid);
+    console.log('✗ 返らないはずの CDP が返ってきました (仕込みが効いていない)');
+    return 1;
+  }
+  console.error('知らない仕込み: ' + kind + ' (' + Object.keys(HANGS).join(' / ') + ')');
+  return 64;
+}
+
+// 自分自身を子プロセスとして起こす。**予算を小さくして** 待たずに済ませる。
+function runChild(args, env, capMs) {
+  return new Promise(resolve => {
+    const p = spawn(process.execPath, [__filename].concat(args), {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: Object.assign({}, process.env, env),
+      detached: process.platform !== 'win32',
+    });
+    let out = '';
+    const grab = d => { out = (out + d.toString()).slice(-16384); };
+    p.stdout.on('data', grab);
+    p.stderr.on('data', grab);
+    const t0 = Date.now();
+    let cut = false;
+    const cap = setTimeout(() => { cut = true; killTree(p); }, capMs);
+    p.on('error', e => {
+      clearTimeout(cap);
+      resolve({ code: -1, out: out + ' (' + e.message + ')', ms: Date.now() - t0, over: true });
+    });
+    p.on('exit', code => {
+      clearTimeout(cap);
+      resolve({ code: code === null ? -1 : code, out, ms: Date.now() - t0, over: cut });
+    });
+  });
+}
+
+// 仕込んだハングが**全部**時限に捕まること。1 つでも捕まらなければ赤。
+async function deadlinesBite() {
+  const cases = [
+    {
+      kind: 'deadline', red: true, cap: 90000,
+      env: { ZV_STALL_MS: '5000', ZV_DEADLINE_MS: '60000', ZV_HEARTBEAT_MS: '2000' },
+      want: '1 つも進みませんでした',
+    },
+    { kind: 'cdp', red: true, cap: 90000, env: { ZV_CDP_MS: '3000' }, want: 'ms で返りませんでした' },
+    { kind: 'server', red: false, cap: 90000, env: { ZV_CLOSE_MS: '1500' }, want: '握られたままの接続' },
+  ];
+  let ok = true;
+  for (const c of cases) {
+    step('時限の検査: --hang ' + c.kind);
+    const r = await runChild(['--hang', c.kind], c.env, c.cap);
+    const said = r.out.indexOf(c.want) >= 0;
+    const ended = !r.over;
+    const redOk = c.red ? r.code !== 0 : r.code === 0;
+    if (said && ended && redOk) {
+      console.log('✓ 時限 [' + c.kind + '] — ' + (r.ms / 1000).toFixed(1) + 's で'
+        + (c.red ? ' 赤 (rc=' + r.code + ') で' : ' 正常に') + '終わった: ' + HANGS[c.kind]);
+    } else {
+      ok = false;
+      console.log('✗ 時限 [' + c.kind + '] — 効いていない (rc=' + r.code + ' / '
+        + (r.ms / 1000).toFixed(1) + 's / 打ち切り=' + r.over + ' / 言い分=' + said + ')');
+      for (const l of r.out.split(NL).slice(-8)) console.log('    ' + l);
+    }
+  }
+  return ok;
+}
+
+async function run(o) {
+  // ブラウザが要らない仕込みは、探す前に済ませる。
+  if (o.hang === 'server') return hangServer();
   const bin = findBrowser();
   if (!bin) {
     console.log('[skip] Chromium 系のブラウザが見つかりません '
@@ -944,9 +1366,12 @@ async function main() {
     return 2;
   }
   console.log('ブラウザ: ' + bin);
+  step('ブラウザを起こす');
   const br = await launchBrowser(bin);
+  step('ブラウザが CDP の口を開きました');
   let rc = 0;
   try {
+    if (o.hang) return await hangWith(br, o.hang);
     if (o.selfTest) {
       const common = { settle: o.settle, walk: 40, seed: o.seed, tapMin: o.tapMin, timeout: o.timeout, stallMs: o.stallMs };
       // (1) まず素の状態が緑であること (赤しか出せない検査は検査ではない)
@@ -981,6 +1406,9 @@ async function main() {
           rc = 1;
         }
       }
+      // (3) **時限そのものが効くか。** 入れただけの時限は、効かなくなっても
+      //     普段 1 度も撃たないので誰も気付けない。毎回わざと固めて確かめる。
+      if (!(await deadlinesBite())) rc = 1;
       return rc;
     }
 
@@ -997,6 +1425,7 @@ async function main() {
     }
 
     for (const s of specs) {
+      step('検査: ' + s.name);
       const r = await runOne(br, s);
       for (const n of r.notes) console.log('  ... ' + n);
       if (r.violations.length) {
@@ -1018,7 +1447,17 @@ async function main() {
   return rc;
 }
 
-main().then(c => process.exit(c)).catch(e => {
+// 途中で止められても**ブラウザを置き去りにしない**。孫まで畳んでから降りる。
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    sayNow(NL + sig + ' を受けました — ブラウザを畳んで降ります' + NL);
+    runCleanup();
+    process.exit(130);
+  });
+}
+
+main().then(c => { runCleanup(); process.exit(c); }).catch(e => {
   console.error('検査そのものが失敗しました: ' + (e && e.stack ? e.stack : e));
+  runCleanup();
   process.exit(1);
 });

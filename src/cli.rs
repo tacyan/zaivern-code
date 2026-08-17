@@ -4568,6 +4568,156 @@ prunable gitdir file points to non-existent location
         );
     }
 
+    // ── 関門は「必ず終わる」 ──────────────────────────────────────
+    //
+    // CI (ubuntu) でスマホ画面の検査が **15 分間 1 バイトも出さないまま**
+    // 打ち切られた (`##[error]The operation was canceled.`)。
+    // **ランダムに止まる関門は、そのうち誰も見なくなる。**
+    //
+    // 原因は「返らない待ち」がどれも予算を持っていなかったこと。Docker の
+    // Linux で決定的に再現した: 検査の途中でブラウザを SIGSTOP で凍らせると、
+    // 旧実装は 180 秒経っても終わらず、出力も 2 行で止まったままだった。
+    // (応えないブラウザは落ちたブラウザより質が悪い — プロセスは生きている
+    //  ので exit イベントすら来ない。)
+    //
+    // 時限は 3 段。外ほど長く、**内側から順に理由を書いて赤で終わる**。
+
+    /// `tools/remote-check.js` は黙って待ち続けない。
+    ///
+    /// ここに並ぶどれか 1 つでも外すと「無音のまま打ち切り」が復活する。
+    /// **落ちたら直すのは道具であってテストではない。**
+    #[test]
+    fn スマホ画面の検査は必ず時限で終わる() {
+        // Windows のチェックアウトは CRLF なので正規化してから探す。
+        let js = include_str!("../tools/remote-check.js").replace("\r\n", "\n");
+        for (needle, why) in [
+            (
+                "ZV_DEADLINE_MS",
+                "全体の上限が無いと、どこで止まっても誰も打ち切らない",
+            ),
+            (
+                "ZV_STALL_MS",
+                "進捗が止まってからの猶予が無いと、遅いだけの実行を殺すか永久に待つかの二択になる",
+            ),
+            (
+                "BUDGET.cdp",
+                "CDP の 1 往復に予算が無いと、ブラウザが固まった瞬間に永久に待つ",
+            ),
+            (
+                "BUDGET.ws",
+                "WebSocket の握手に予算が無いと、繋がらないまま待ち続ける",
+            ),
+            (
+                "BUDGET.close",
+                "後始末に予算が無いと、処理中の要求を 1 本抱えたまま server.close() が返らない",
+            ),
+            (
+                "function killTree",
+                "直接の子だけ殺すと孫 (レンダラ / crashpad) が残る",
+            ),
+            (
+                "--disable-dev-shm-usage",
+                "/dev/shm が 64MB しか無い環境で Chrome が固まる (コンテナの定番)",
+            ),
+            (
+                "--disable-background-timer-throttling",
+                "隠れたタブの時計が止まると、ポーリング検査が誤判定して 1 状態も進まない",
+            ),
+        ] {
+            assert!(
+                js.contains(needle),
+                "tools/remote-check.js に {needle} が無い — {why}"
+            );
+        }
+        // **時限は「入れただけ」では効かない。** 普段 1 度も撃たないので、
+        // 壊れても誰も気付けない。自己検査が毎回わざと固めて確かめること。
+        assert!(
+            js.contains("deadlinesBite"),
+            "自己検査が時限を試していない (空回りする時限は、無い時限と同じ)"
+        );
+        assert!(
+            js.contains("--hang"),
+            "わざと固める仕込みが無い (時限が効くことを確かめる手が無い)"
+        );
+
+        let sh = include_str!("../tools/remote-check.sh").replace("\r\n", "\n");
+        assert!(
+            sh.contains("ZV_WALL_S"),
+            "tools/remote-check.sh に最後の砦が無い (js 自体が固まると誰も打ち切らない)"
+        );
+        // 打ち切り (rc=3) を「違反」と混ぜない。混ぜると、無い違反を探して
+        // 時間を溶かす。
+        assert!(
+            sh.contains("時限切れ"),
+            "打ち切りを違反と同じ言い分にしている (rc=3 は違反ではない)"
+        );
+        // 出力を変数へ溜めない。溜めると、固まったときに何も見えない。
+        assert!(
+            !sh.contains("out=$("),
+            "出力を変数へ溜めている (固まると 1 バイトも見えなくなる)"
+        );
+    }
+
+    /// CI のジョブは**道具より後に**時間切れになること。
+    ///
+    /// 逆だと `The operation was canceled.` だけが残り、**原因が 1 行も
+    /// 残らない**。実際にそれで分からなくなった。
+    #[test]
+    fn スマホ画面のジョブは道具より後に切れる() {
+        let wf = include_str!("../.github/workflows/test.yml").replace("\r\n", "\n");
+        let after = wf
+            .split_once("name: mobile screen (chrome)")
+            .expect("mobile screen (chrome) ジョブが無い")
+            .1;
+        // 次のジョブ (行頭 2 桁字下げの `xxx:`) の手前までを、このジョブと見なす。
+        let end = after
+            .match_indices('\n')
+            .find(|(i, _)| {
+                let l = after[i + 1..].lines().next().unwrap_or("");
+                l.starts_with("  ")
+                    && !l.starts_with("   ")
+                    && l.trim_end().ends_with(':')
+                    && !l.contains(' ')
+            })
+            .map_or(after.len(), |(i, _)| i);
+        let job = &after[..end];
+
+        // 数を文字列で照合すると、片方だけ動かしても緑のままになる。
+        // **順序そのもの**を見る。
+        let val = |key: &str| -> u64 {
+            let i = job
+                .find(key)
+                .unwrap_or_else(|| panic!("mobile screen ジョブに {key} が無い"));
+            job[i + key.len()..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{key} の値が読めない"))
+        };
+        let deadline_s = val("ZV_DEADLINE_MS:") / 1000;
+        let wall_s = val("ZV_WALL_S:");
+        let job_s = val("timeout-minutes:") * 60;
+        assert!(
+            deadline_s < wall_s,
+            "道具の中の時限 ({deadline_s}s) が最後の砦 ({wall_s}s) より後 — 砦が先に撃つと理由が残らない"
+        );
+        assert!(
+            wall_s < job_s,
+            "最後の砦 ({wall_s}s) がジョブの timeout ({job_s}s) より後 — ジョブが先に切れると理由が残らない"
+        );
+        // 出力を溜めない (溜めると、固まったときに 1 バイトも見えない)。
+        assert!(
+            !job.contains("out=$(sh tools/remote-check.sh"),
+            "検査の出力を変数へ溜めている (これで 15 分間まっさらなログになった)"
+        );
+        assert!(
+            job.contains("| tee "),
+            "検査の出力を素通ししていない (進み具合が見えないと、固まった場所が分からない)"
+        );
+    }
+
     // ── スマホの CSS: 「隠してあるものを、脇道から見せない」 ──────────
     //
     // 実際に出たバグ:

@@ -594,6 +594,9 @@ jobs:
         startsWith(github.event.pull_request.head.ref, 'night/'))
     name: mobile screen (chrome)
     runs-on: ubuntu-latest
+    # **最後の砦**。ここに来る前に、道具が自分で理由を書いて赤で終わること
+    # (ZV_DEADLINE_MS 10 分 < ZV_WALL_S 11 分 < ここ 15 分)。この順序を
+    # 崩すと「無音のまま打ち切り」に戻り、原因が 1 行も残らない。
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -602,19 +605,34 @@ jobs:
         run: |
           node --version
           (google-chrome --version || chromium --version || echo 'ブラウザが見つかりません')
+          # コンテナだと 64MB しか無いことがある (Chrome が固まる定番)。
+          df -h /dev/shm || true
+          nproc || true
 
       # わざと壊して赤になることまで確かめる (--self-test)。
       # 素通りする検査を CI に置かない。
+      #
+      # **出力を変数へ溜めない。** 以前は out=$(...) で溜めていたので、
+      # 固まると 15 分間 1 バイトも出ないまま打ち切られ、どこで止まったのか
+      # 1 行も残らなかった。tee で素通ししながら控えを取る。
       - name: スマホ画面を描いて不変条件を確かめる
+        env:
+          # ジョブの timeout より必ず短くする。**道具のほうが先に**
+          # 「なぜ終わらないか」を書いて赤で終わるのが要点。
+          ZV_DEADLINE_MS: '600000'
+          ZV_STALL_MS: '120000'
+          ZV_WALL_S: '660'
+          ZV_HEARTBEAT_MS: '20000'
         run: |
+          set -o pipefail
+          log=$(mktemp)
           rc=0
-          out=$(sh tools/remote-check.sh --self-test 2>&1) || rc=$?
-          echo "$out"
+          sh tools/remote-check.sh --self-test 2>&1 | tee "$log" || rc=$?
           if [ "$rc" -ne 0 ]; then
             echo "::error::スマホ画面の検査が赤 (rc=$rc)"
             exit "$rc"
           fi
-          if echo "$out" | grep -q '\[skip\]'; then
+          if grep -q '\[skip\]' "$log"; then
             echo "::error::スマホ画面を 1 度も描かずに降りた (このジョブでは skip は不合格)"
             exit 1
           fi

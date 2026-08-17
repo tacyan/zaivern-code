@@ -137,13 +137,16 @@ step() {
 
     printf '\n\033[1;36m▸ %s — %s\033[0m\n' "$name" "$d"
     log="$GATE_TMP/$name.log"
-    # **パイプを挟まない。** `| tee` を通すと `$?` がそちらのものになり、
-    # 「落ちたのに緑」を読んでしまう (実際に 2 度やった)。
+    # **溜めずに素通しする。** 全部終わってから `cat` すると、3 分かかる段は
+    # そのあいだ画面が真っ白で、固まったのか働いているのか分からない
+    # (CI で 15 分間まっさらなログになったのと同じ形)。
+    #
+    # ただし `| tee` を素で挟むと `$?` は tee のものになり「落ちたのに緑」を
+    # 読む (実際に 2 度やった)。**終了コードはパイプの内側で捕まえる。**
     set +e
-    "run_$name" > "$log" 2>&1
-    rc=$?
+    { "run_$name" 2>&1; echo "$?" > "$GATE_TMP/$name.rc"; } | tee "$log"
+    rc=$(cat "$GATE_TMP/$name.rc" 2>/dev/null || echo 1)
     set -e
-    cat "$log"
     if [ "$rc" -ne 0 ]; then
         record "$name" 'ng' "rc=$rc"
     elif grep -q '\[skip\]' "$log"; then
