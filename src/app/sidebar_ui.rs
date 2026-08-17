@@ -500,7 +500,7 @@ impl ZaivernApp {
                     // UiBuilder::sense で行の判定を先に登録する。
                     let fr = ui.scope_builder(
                         egui::UiBuilder::new()
-                            .id_salt(("agent-row", i))
+                            .id_salt(("agent-row", s.id))
                             .sense(egui::Sense::click()),
                         |ui| {
                             frame.show(ui, |ui| {
@@ -550,15 +550,28 @@ impl ZaivernApp {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if ui.small_button("✕").clicked() {
+                                            // **ボタンの ID はセッション ID から作る。**
+                                            // この行には出たり消えたりするラベル
+                                            // (◆ 未読 / ⏳ レート制限) と条件付きの 🛡
+                                            // が混ざっている。egui 0.29 の
+                                            // `small_button` は自動採番で ID を作るので、
+                                            // 押した瞬間と離した瞬間で 1 個ずれると
+                                            // **✕ を押したのに ⟳ が発火する**。
+                                            // 再現は `e2e::widget_id_shift_tests`。
+                                            let btn = |ui: &mut egui::Ui, key: &'static str, label: &str| {
+                                                ui.push_id((s.id, key), |ui| {
+                                                    ui.small_button(label)
+                                                })
+                                                .inner
+                                            };
+                                            if btn(ui, "close", "✕").clicked() {
                                                 *remove = Some(i);
                                             }
-                                            if ui.small_button("⟳").clicked() {
+                                            if btn(ui, "restart", "⟳").clicked() {
                                                 *restart = Some(i);
                                             }
                                             if let Some(hint) = permission_hint {
-                                                if ui
-                                                    .small_button("🛡")
+                                                if btn(ui, "perm", "🛡")
                                                     .on_hover_text(hint)
                                                     .clicked()
                                                 {

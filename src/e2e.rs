@@ -2175,3 +2175,121 @@ mod app_reachability_tests {
         assert!(painted.find("ZV-READY").is_some(), "描画が拾えない");
     }
 }
+
+/// **並ぶウィジェットの ID は「並び順」ではなく「そのものの ID」から作る。**
+///
+/// egui 0.29 の `SelectableLabel` / `Button` は `allocate_*` の**自動採番**から
+/// ID を作る (`src/panels.rs` の `egui_id_guard` の説明を参照)。採番は
+/// **その行に何個ウィジェットを置いたか**に依存するので、行の途中に
+/// 「状態で出たり消えたりするラベル」(未読の ◆ / レート制限の ⏳) があると、
+/// **その増減で以降の ID が全部ずれる**。
+///
+/// egui は押した (press) フレームで拾った ID を、離した (release) フレームで
+/// 照合して `clicked()` を立てる。エージェントは出力のたびに未読印が付いたり
+/// 消えたりするので、この 2 フレームの間に印が動くと**押したのとは別のタブが
+/// `clicked()` になる** — 「Codex のタブを押したのに Claude が選ばれ、打った
+/// 文章が Claude へ行く」の正体。
+#[cfg(test)]
+mod widget_id_shift_tests {
+    use super::*;
+
+    /// エージェントのタブ列と**同じ形**の行を 1 本描く。
+    /// 各タブは `[● 印] [タブ本体] (未読なら ◆)`。`marks` はどのタブに
+    /// 未読印が付いているか。押されたタブの添字を返す。
+    fn row(ui: &mut egui::Ui, n: usize, marks: &[bool], stable: bool) -> Option<usize> {
+        let mut hit = None;
+        ui.horizontal(|ui| {
+            for i in 0..n {
+                let mut draw = |ui: &mut egui::Ui| {
+                    ui.label("*");
+                    if ui.selectable_label(false, format!("tab{i}")).clicked() {
+                        hit = Some(i);
+                    }
+                    if marks.get(i).copied().unwrap_or(false) {
+                        ui.label("+");
+                    }
+                };
+                if stable {
+                    // ID を**セッションの id**から作る (並び順から切り離す)
+                    ui.push_id(1000 + i as u64, |ui| draw(ui));
+                } else {
+                    draw(ui);
+                }
+            }
+        });
+        hit
+    }
+
+    /// タブ 2 を押し、離すフレームで**タブ 0 の未読印が消える**。
+    /// 返りは「実際に選ばれたタブ」。
+    fn clicked_when_mark_vanishes(stable: bool) -> Option<usize> {
+        let n = 4;
+        let mut marks = vec![true, true, false, false];
+        let mut s = Screen::new(900.0, 200.0);
+        let mut cur = marks.clone();
+        let (_, painted) = s.settle(3, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                row(ui, n, &cur, stable);
+            });
+        });
+        let target = painted
+            .texts
+            .iter()
+            .find(|t| t.text == "tab2")
+            .expect("tab2 が描かれている")
+            .rect
+            .center();
+        s.run(
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    row(ui, n, &cur, stable);
+                });
+            },
+        );
+        // ここでエージェントの出力が届き、タブ 0 と 1 の未読印が消える
+        // (= 行の中身が 2 個減る)。
+        marks = vec![false, false, false, false];
+        cur = marks.clone();
+        let mut hit = None;
+        s.run(
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    hit = row(ui, n, &cur, stable);
+                });
+            },
+        );
+        hit
+    }
+
+    /// **壊れている側の再現**。これが緑になったら下の番人は空回りしている。
+    #[test]
+    fn 自動採番のままだと押したのと違うタブが選ばれる() {
+        let got = clicked_when_mark_vanishes(false);
+        assert_ne!(got, Some(2), "再現が効いていない (正しいタブが選ばれた)");
+    }
+
+    /// ID をセッション id から作れば、行の中身が増減しても押したタブが選ばれる。
+    #[test]
+    fn 行の中身が増減しても押したタブが選ばれる() {
+        assert_eq!(
+            clicked_when_mark_vanishes(true),
+            Some(2),
+            "未読印が増減しただけで別のタブが選ばれた"
+        );
+    }
+}

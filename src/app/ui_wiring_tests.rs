@@ -949,3 +949,72 @@ fn 空のプロンプトは入力欄へ入れない() {
     assert!(b.append_prompt("直して"));
     assert_eq!(b.text(), "直して");
 }
+
+// ─── 並ぶウィジェットの ID は「並び順」ではなく「そのものの ID」から作る ───
+//
+// egui 0.29 の `Button` / `SelectableLabel` は `allocate_*` の**自動採番**から
+// ID を作る。行の途中に「状態で出たり消えたりするラベル」(◆ 未読 /
+// ⏳ レート制限) や条件付きボタン (🛡 / ⊞) があると、その増減で
+// **以降のウィジェットの ID が全部ずれる**。
+//
+// egui は押した (press) フレームの ID を離した (release) フレームで照合して
+// `clicked()` を立てるので、その 2 フレームの間に印が動くと**押したのとは
+// 別のウィジェットが発火する**。エージェントは出力のたびに未読印が付いたり
+// 消えたりするので実際に踏む — 「Codex のタブを押したのに Claude が選ばれ、
+// 打った文章が Claude へ行く」がこれ。
+//
+// 仕組みそのものの再現と、直ったことの確認は `e2e::widget_id_shift_tests`。
+// ここは**実際の配線がその形になっているか**だけを見る (再現テストだけだと、
+// 実装が元へ戻っても緑のままになる)。
+
+/// 下部パネルのエージェントタブは、セッション ID で ID を固定する。
+#[test]
+fn エージェントタブのidはセッションidから作る() {
+    let src = &include_str!("../app/bottom_panels.rs").replace("\r\n", "\n");
+    let body = src
+        .split("for (i, s) in self.agents.sessions.iter().enumerate() {")
+        .nth(1)
+        .expect("タブ列のループがある");
+    let head = &body[..body
+        .find("if let Some(i) = set_unread")
+        .unwrap_or(body.len())];
+    assert!(
+        head.contains("ui\n                                        .push_id(s.id, |ui| {"),
+        "タブの ID が並び順の自動採番のまま (未読印が 1 個増減しただけで別のタブが選ばれる)"
+    );
+    // 出たり消えたりするラベルが、固定した ID の**内側**にあること。
+    let inner = &head[..head
+        .find("})\n                                        .inner")
+        .unwrap_or(head.len())];
+    for mark in ["s.has_unread()", "s.rate_limited"] {
+        assert!(
+            inner.contains(mark),
+            "{mark} の印が push_id の外にある (外に置くと結局 ID がずれる)"
+        );
+    }
+}
+
+/// Cockpit のタイル見出しと 💬 セッション一覧の行ボタンも同じ約束。
+/// ここが緩むと「✕ を押したのに ⟳ が発火する」になる。
+#[test]
+fn 行ごとのボタンのidはセッションidから作る() {
+    for (name, src) in [
+        ("cockpit.rs", include_str!("../app/cockpit.rs")),
+        ("sidebar_ui.rs", include_str!("../app/sidebar_ui.rs")),
+    ] {
+        let src = &src.replace("\r\n", "\n");
+        // ✕ (閉じる) と ⟳ (再起動) が素の `small_button` で並んでいないこと。
+        assert!(
+            !src.contains("ui.small_button(\"✕\")"),
+            "{name}: ✕ が自動採番のまま (隣のボタンが発火しうる)"
+        );
+        assert!(
+            !src.contains("ui.small_button(\"⟳\")"),
+            "{name}: ⟳ が自動採番のまま (隣のボタンが発火しうる)"
+        );
+        assert!(
+            src.contains("ui.push_id((s.id, key)") || src.contains("ui.push_id((sid, key)"),
+            "{name}: 行ボタンの ID をセッション ID から作っていない"
+        );
+    }
+}

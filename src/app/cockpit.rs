@@ -979,7 +979,7 @@ impl ZaivernApp {
                             // 登録するので、余白クリックだけを拾える。
                             let cell = ui.scope_builder(
                                 egui::UiBuilder::new()
-                                    .id_salt(("cockpit-cell-select", i))
+                                    .id_salt(("cockpit-cell-select", self.agents.sessions[i].id))
                                     .sense(egui::Sense::click()),
                                 |ui| {
                             egui::Frame::none()
@@ -1058,60 +1058,72 @@ impl ZaivernApp {
                                                 .color(theme.text_dim),
                                         );
                                         let permission_hint = s.permission_switch_hint();
+                                        // **ボタンの ID は並び順ではなくセッション ID から。**
+                                        // このヘッダには出たり消えたりするラベル
+                                        // (◆ 未読 / ⏳ レート制限) と条件付きボタン
+                                        // (🛡 / ⊞) が混ざっている。egui 0.29 の
+                                        // `small_button` は自動採番から ID を作るので、
+                                        // 押した瞬間と離した瞬間で 1 個ずれると
+                                        // **✕ を押したのに ⟳ が発火する**。
+                                        // 詳細と再現は `e2e::widget_id_shift_tests`。
+                                        ui.push_id((sid, "tile-hdr"), |ui| {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(
                                                 egui::Align::Center,
                                             ),
                                             |ui| {
-                                                if ui
-                                                    .small_button("✕")
-                                                    .on_hover_text(tr("閉じる"))
-                                                    .clicked()
-                                                {
+                                                // 1 個ずつ ID を固定する。この列は
+                                                // 🛡 と ⊞ が条件付きなので、まとめて
+                                                // 自動採番に任せると条件が変わった
+                                                // フレームで**押したのと違うボタンが
+                                                // 発火する**。
+                                                let btn = |ui: &mut egui::Ui,
+                                                           key: &'static str,
+                                                           label: String,
+                                                           hint: String| {
+                                                    ui.push_id((sid, key), |ui| {
+                                                        ui.small_button(label)
+                                                            .on_hover_text(hint)
+                                                            .clicked()
+                                                    })
+                                                    .inner
+                                                };
+                                                if btn(ui, "close", "✕".into(), tr("閉じる")) {
                                                     acts.remove = Some(i);
                                                 }
-                                                if ui
-                                                    .small_button("⟳")
-                                                    .on_hover_text(tr("再起動"))
-                                                    .clicked()
-                                                {
+                                                if btn(ui, "restart", "⟳".into(), tr("再起動")) {
                                                     acts.restart = Some(i);
                                                 }
                                                 if let Some(hint) = permission_hint {
-                                                    if ui
-                                                        .small_button("🛡")
-                                                        .on_hover_text(hint)
-                                                        .clicked()
-                                                    {
+                                                    if btn(ui, "perm", "🛡".into(), tr(hint)) {
                                                         acts.cycle = Some(i);
                                                     }
                                                 }
-                                                if ui
-                                                    .small_button("🔍")
-                                                    .on_hover_text(tr(
-                                                        "下部パネルにフォーカス",
-                                                    ))
-                                                    .clicked()
-                                                {
+                                                if btn(
+                                                    ui,
+                                                    "focus",
+                                                    "🔍".into(),
+                                                    tr("下部パネルにフォーカス"),
+                                                ) {
                                                     acts.focus = Some(i);
                                                 }
-                                                if ui
-                                                    .small_button(
-                                                        if self.voice.target == voice::Target::Session(sid)
-                                                            && self.voice.session.is_some()
-                                                        {
-                                                            "🔴"
-                                                        } else {
-                                                            "🎤"
-                                                        },
-                                                    )
-                                                    .on_hover_text(tr(
+                                                if btn(
+                                                    ui,
+                                                    "voice",
+                                                    if self.voice.target
+                                                        == voice::Target::Session(sid)
+                                                        && self.voice.session.is_some()
+                                                    {
+                                                        "🔴".into()
+                                                    } else {
+                                                        "🎤".into()
+                                                    },
+                                                    tr(
                                                         "このエージェントへ音声入力\n\
                                                          話した内容がこのタブの入力欄に入ります。\n\
                                                          送信されないので、確認して Enter を押してください",
-                                                    ))
-                                                    .clicked()
-                                                {
+                                                    ),
+                                                ) {
                                                     acts.voice = Some(sid);
                                                     acts.select = Some(i);
                                                 }
@@ -1134,9 +1146,11 @@ impl ZaivernApp {
                                                 // 狭いタイルでは畳む (ボタン列が
                                                 // 見切れない)。キー操作は残る。
                                                 if ui.available_width() >= 26.0
-                                                    && ui
-                                                    .small_button(split_label)
-                                                    .on_hover_text(tr(
+                                                    && btn(
+                                                        ui,
+                                                        "split",
+                                                        split_label,
+                                                        tr(
                                                         "このタイルを右へ分割して、新しいエージェントを起動\n\
                                                          起動するものは 👾 Agent ＋ からの新規起動と同じです\n\
                                                          (既定プリセット・作業フォルダはワークスペース)。\n\
@@ -1144,8 +1158,8 @@ impl ZaivernApp {
                                                          キーは ⌘⌥⇧→ 右へ分割 / ⌘⌥⇧↓ 下へ分割 / ⌘⌥N シェル /\n\
                                                          ⌘⌥W 閉じる / ⌘⌥←↑↓→ 移動 / ⌘⌥Z 拡大 / ⌘⌥E 等分 /\n\
                                                          ⌘⌥⇧H ⌘⌥⇧L 幅調整 (Windows・Linux は ⌘ の代わりに Ctrl)",
-                                                    ))
-                                                    .clicked()
+                                                        ),
+                                                    )
                                                 {
                                                     acts.split.push((
                                                         sid,
@@ -1157,6 +1171,7 @@ impl ZaivernApp {
                                                 }
                                             },
                                         );
+                                        });
                                     });
                                     }
                                     // 分割の操作キーは**アクティブなタイルだけ**が
