@@ -4443,6 +4443,14 @@ prunable gitdir file points to non-existent location
                 "tools/windows-check.sh",
                 include_str!("../tools/windows-check.sh"),
             ),
+            (
+                "tools/remote-check.sh",
+                include_str!("../tools/remote-check.sh"),
+            ),
+            (
+                "tools/release-gate.sh",
+                include_str!("../tools/release-gate.sh"),
+            ),
         ] {
             // Windows のチェックアウトは CRLF なので正規化してから探す。
             let sh = src.replace("\r\n", "\n");
@@ -4466,6 +4474,633 @@ prunable gitdir file points to non-existent location
                 "{name}: exec でプロセスを置き換えると判定行が出ない: {bad:?}"
             );
         }
+    }
+
+    // ── 出荷前の関門とスマホ画面の番人 ──────────────────────────────
+    //
+    // 0.18 系で 4 件が出荷まで生き残った。共通点は「**誰も動かしていない層**に
+    // あった」こと — Rust のテストはソースの文字列を見るだけで、ブラウザの
+    // DOM も CSS も 1 度も評価していない。経緯は docs/preflight.md。
+    //
+    // ここに置く番人は 2 種類ある:
+    //   * 道具が**繋がっている**ことの検査 (このモジュール)
+    //   * 実際に**描いて**見る検査 (tools/remote-check.sh。node と Chromium が要る)
+    // 後者が使えない環境でも、下の CSS の法則だけは必ず効く。
+
+    /// `tools/remote-check.js` は `build.rs` と**同じ材料を同じ順序で**組む。
+    ///
+    /// ずれると「本番と違うページを検査して緑」という、いちばん質の悪い嘘に
+    /// なる。材料の名前を build.rs 側から取ってきて突き合わせる
+    /// (写経した一覧を持つと必ずずれるので持たない)。
+    #[test]
+    fn スマホ画面の検査はbuild_rsと同じ材料を読む() {
+        let build = include_str!("../build.rs").replace("\r\n", "\n");
+        let js = include_str!("../tools/remote-check.js").replace("\r\n", "\n");
+
+        // build.rs が `assets/remote/` から読んでいるファイル名を拾う。
+        let mut assets: Vec<&str> = Vec::new();
+        for line in build.lines() {
+            if let Some(rest) = line.split("assets/remote/").nth(1) {
+                // ファイル名として妥当な文字だけを取る (doc コメントの日本語や
+                // バッククォートを材料として数えない)。
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || "._-/".contains(c)))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                let 材料らしい = name.contains('.') || name == "js";
+                if 材料らしい && !assets.contains(&name) {
+                    assets.push(name);
+                }
+            }
+        }
+        assert!(
+            assets.len() >= 4,
+            "build.rs から材料を拾えていない (走査の書き方が変わった?): {assets:?}"
+        );
+        for a in &assets {
+            let leaf = a.rsplit('/').next().unwrap_or(a);
+            assert!(
+                js.contains(leaf),
+                "tools/remote-check.js が {leaf} を読んでいない \
+                 (build.rs は読んでいる = 本番と違うページを検査している)"
+            );
+        }
+        // 連結の順序も固定する。ここが逆になると CSS の後勝ちが変わる。
+        let i_head = js.find("page-head.html").expect("page-head.html");
+        let i_css = js.find("style.css").expect("style.css");
+        let i_body = js.find("body.html").expect("body.html");
+        assert!(
+            i_head < i_css && i_css < i_body,
+            "head → style.css → body の順で組むこと (順序が変わると詳細度の勝敗が変わる)"
+        );
+    }
+
+    /// 出荷前の関門は、**既にある検証を全部ぶら下げている**こと。
+    ///
+    /// 道具は揃っていたのに走らせ忘れたのが 0.18 系の教訓なので、入口は
+    /// 1 つに保つ。ここから漏れた道具は「無い」のと同じ扱いになる。
+    #[test]
+    fn 出荷前の関門は既存の検証を全部通す() {
+        let gate = include_str!("../tools/release-gate.sh").replace("\r\n", "\n");
+        for needle in [
+            "tools/verify.sh",
+            "tools/remote-check.sh",
+            "tools/gui-smoke.sh",
+            "tools/linux-test.sh",
+            "tools/windows-check.sh",
+            "i18n missing",
+        ] {
+            assert!(
+                gate.contains(needle),
+                "tools/release-gate.sh が {needle} を通していない \
+                 (入口から漏れた検査は、走らないので無いのと同じ)"
+            );
+        }
+        // `--lint` (clippy) を落とすと、CI だけが赤くなる経路が復活する。
+        assert!(
+            gate.contains("--lint"),
+            "関門は tools/verify.sh --lint を通すこと (cargo test が緑でも clippy は赤くなる)"
+        );
+        // 自己検査つきで回す。素通りする検査を関門に置かない。
+        assert!(
+            gate.contains("--self-test"),
+            "スマホ画面の検査は --self-test で回すこと (わざと壊して赤になることまで見る)"
+        );
+    }
+
+    // ── 関門は「必ず終わる」 ──────────────────────────────────────
+    //
+    // CI (ubuntu) でスマホ画面の検査が **15 分間 1 バイトも出さないまま**
+    // 打ち切られた (`##[error]The operation was canceled.`)。
+    // **ランダムに止まる関門は、そのうち誰も見なくなる。**
+    //
+    // 原因は「返らない待ち」がどれも予算を持っていなかったこと。Docker の
+    // Linux で決定的に再現した: 検査の途中でブラウザを SIGSTOP で凍らせると、
+    // 旧実装は 180 秒経っても終わらず、出力も 2 行で止まったままだった。
+    // (応えないブラウザは落ちたブラウザより質が悪い — プロセスは生きている
+    //  ので exit イベントすら来ない。)
+    //
+    // 時限は 3 段。外ほど長く、**内側から順に理由を書いて赤で終わる**。
+
+    /// `tools/remote-check.js` は黙って待ち続けない。
+    ///
+    /// ここに並ぶどれか 1 つでも外すと「無音のまま打ち切り」が復活する。
+    /// **落ちたら直すのは道具であってテストではない。**
+    #[test]
+    fn スマホ画面の検査は必ず時限で終わる() {
+        // Windows のチェックアウトは CRLF なので正規化してから探す。
+        let js = include_str!("../tools/remote-check.js").replace("\r\n", "\n");
+        for (needle, why) in [
+            (
+                "ZV_DEADLINE_MS",
+                "全体の上限が無いと、どこで止まっても誰も打ち切らない",
+            ),
+            (
+                "ZV_STALL_MS",
+                "進捗が止まってからの猶予が無いと、遅いだけの実行を殺すか永久に待つかの二択になる",
+            ),
+            (
+                "BUDGET.cdp",
+                "CDP の 1 往復に予算が無いと、ブラウザが固まった瞬間に永久に待つ",
+            ),
+            (
+                "BUDGET.ws",
+                "WebSocket の握手に予算が無いと、繋がらないまま待ち続ける",
+            ),
+            (
+                "BUDGET.close",
+                "後始末に予算が無いと、処理中の要求を 1 本抱えたまま server.close() が返らない",
+            ),
+            (
+                "function killTree",
+                "直接の子だけ殺すと孫 (レンダラ / crashpad) が残る",
+            ),
+            (
+                "--disable-dev-shm-usage",
+                "/dev/shm が 64MB しか無い環境で Chrome が固まる (コンテナの定番)",
+            ),
+            (
+                "--disable-background-timer-throttling",
+                "隠れたタブの時計が止まると、ポーリング検査が誤判定して 1 状態も進まない",
+            ),
+        ] {
+            assert!(
+                js.contains(needle),
+                "tools/remote-check.js に {needle} が無い — {why}"
+            );
+        }
+        // **時限は「入れただけ」では効かない。** 普段 1 度も撃たないので、
+        // 壊れても誰も気付けない。自己検査が毎回わざと固めて確かめること。
+        assert!(
+            js.contains("deadlinesBite"),
+            "自己検査が時限を試していない (空回りする時限は、無い時限と同じ)"
+        );
+        assert!(
+            js.contains("--hang"),
+            "わざと固める仕込みが無い (時限が効くことを確かめる手が無い)"
+        );
+
+        let sh = include_str!("../tools/remote-check.sh").replace("\r\n", "\n");
+        assert!(
+            sh.contains("ZV_WALL_S"),
+            "tools/remote-check.sh に最後の砦が無い (js 自体が固まると誰も打ち切らない)"
+        );
+        // 打ち切り (rc=3) を「違反」と混ぜない。混ぜると、無い違反を探して
+        // 時間を溶かす。
+        assert!(
+            sh.contains("時限切れ"),
+            "打ち切りを違反と同じ言い分にしている (rc=3 は違反ではない)"
+        );
+        // 出力を変数へ溜めない。溜めると、固まったときに何も見えない。
+        assert!(
+            !sh.contains("out=$("),
+            "出力を変数へ溜めている (固まると 1 バイトも見えなくなる)"
+        );
+    }
+
+    /// CI のジョブは**道具より後に**時間切れになること。
+    ///
+    /// 逆だと `The operation was canceled.` だけが残り、**原因が 1 行も
+    /// 残らない**。実際にそれで分からなくなった。
+    #[test]
+    fn スマホ画面のジョブは道具より後に切れる() {
+        let wf = include_str!("../.github/workflows/test.yml").replace("\r\n", "\n");
+        let after = wf
+            .split_once("name: mobile screen (chrome)")
+            .expect("mobile screen (chrome) ジョブが無い")
+            .1;
+        // 次のジョブ (行頭 2 桁字下げの `xxx:`) の手前までを、このジョブと見なす。
+        let end = after
+            .match_indices('\n')
+            .find(|(i, _)| {
+                let l = after[i + 1..].lines().next().unwrap_or("");
+                l.starts_with("  ")
+                    && !l.starts_with("   ")
+                    && l.trim_end().ends_with(':')
+                    && !l.contains(' ')
+            })
+            .map_or(after.len(), |(i, _)| i);
+        let job = &after[..end];
+
+        // 数を文字列で照合すると、片方だけ動かしても緑のままになる。
+        // **順序そのもの**を見る。
+        let val = |key: &str| -> u64 {
+            let i = job
+                .find(key)
+                .unwrap_or_else(|| panic!("mobile screen ジョブに {key} が無い"));
+            job[i + key.len()..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|_| panic!("{key} の値が読めない"))
+        };
+        let deadline_s = val("ZV_DEADLINE_MS:") / 1000;
+        let wall_s = val("ZV_WALL_S:");
+        let job_s = val("timeout-minutes:") * 60;
+        assert!(
+            deadline_s < wall_s,
+            "道具の中の時限 ({deadline_s}s) が最後の砦 ({wall_s}s) より後 — 砦が先に撃つと理由が残らない"
+        );
+        assert!(
+            wall_s < job_s,
+            "最後の砦 ({wall_s}s) がジョブの timeout ({job_s}s) より後 — ジョブが先に切れると理由が残らない"
+        );
+        // 出力を溜めない (溜めると、固まったときに 1 バイトも見えない)。
+        assert!(
+            !job.contains("out=$(sh tools/remote-check.sh"),
+            "検査の出力を変数へ溜めている (これで 15 分間まっさらなログになった)"
+        );
+        assert!(
+            job.contains("| tee "),
+            "検査の出力を素通ししていない (進み具合が見えないと、固まった場所が分からない)"
+        );
+    }
+
+    // ── スマホの CSS: 「隠してあるものを、脇道から見せない」 ──────────
+    //
+    // 実際に出たバグ:
+    //
+    //     #alist          { display:none; }
+    //     #alist.show     { display:block; }   ← 見せる合図はこれ
+    //     #alist.mid      { display:flex;  }   ← **合図を経由せずに見えてしまう**
+    //
+    // `#alist.mid` は `#alist.show` と詳細度が同じで後ろにあるので、
+    // `.show` が付いていなくても `display:none` に勝つ。結果、端末 (`#scr`) と
+    // 一覧 (`#alist`) が同時に見えた。Rust のテストは 1 本も落ちていない。
+    //
+    // 法則にすると: **`display:none` で隠した要素を見せる規則たちは、
+    // クラス集合の包含で 1 本の鎖になっていなければならない。**
+    // 鎖なら「いちばん小さいもの = 見せる合図」が一意に決まり、他は必ずそれを
+    // 含む。枝分かれした瞬間、合図を通らない抜け道ができる。
+    //
+    // これはブラウザが無くても効く (`tools/remote-check.sh` が `[skip]` に
+    // なる環境の最後の砦)。
+
+    #[derive(Debug, Clone)]
+    struct 表示規則 {
+        prefix: String,
+        anchor: String,
+        classes: Vec<String>,
+        display: String,
+    }
+
+    /// `/* … */` を落とす (中に `{` や `display:` があると解析が狂う)。
+    fn cssのコメントを外す(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(i) = rest.find("/*") {
+            out.push_str(&rest[..i]);
+            match rest[i + 2..].find("*/") {
+                Some(j) => rest = &rest[i + 2 + j + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// JS に埋まっている CSS を取り出す。
+    ///
+    /// `style.css` を触らずに自分の CSS を足す流儀 (`css.textContent = [...]` /
+    /// テンプレートリテラル) なので、**そこも同じ法則で見る**。行を落とすと
+    /// 規則が半分になるだけなので、`{` `}` か「宣言らしい行」を広めに拾う。
+    fn jsからcssを抜き出す(src: &str) -> String {
+        let mut out = String::new();
+        let b: Vec<char> = src.chars().collect();
+        let mut i = 0;
+        while i < b.len() {
+            let q = b[i];
+            if q == '`' || q == '\'' {
+                let mut j = i + 1;
+                let mut lit = String::new();
+                while j < b.len() && b[j] != q {
+                    if b[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if q == '\'' && b[j] == '\n' {
+                        break; // 素の '…' は行をまたがない = ここまでで打ち切り
+                    }
+                    lit.push(b[j]);
+                    j += 1;
+                }
+                if j < b.len() && b[j] == q {
+                    let cssっぽい = lit.contains('{')
+                        || lit.contains('}')
+                        || (lit.contains(':') && lit.contains(';'));
+                    if cssっぽい {
+                        out.push_str(&lit);
+                        out.push('\n');
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn display値(body: &str) -> Option<String> {
+        for decl in body.split(';') {
+            let (k, v) = decl.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("display") {
+                return Some(v.trim().to_ascii_lowercase());
+            }
+        }
+        None
+    }
+
+    fn 複合を解く(sel: &str, display: &str) -> Option<表示規則> {
+        let flat = sel.replace(['>', '+', '~'], " ");
+        let mut parts: Vec<&str> = flat.split_whitespace().collect();
+        let last = parts.pop()?;
+        // 擬似クラス・属性・万能は静的に到達可能性を決められないので見ない。
+        if last.contains(':') || last.contains('[') || last.contains('*') || last.is_empty() {
+            return None;
+        }
+        let mut it = last.split('.');
+        let anchor = it.next().unwrap_or("").to_string();
+        let classes: Vec<String> = it.filter(|c| !c.is_empty()).map(str::to_string).collect();
+        Some(表示規則 {
+            prefix: parts.join(" "),
+            anchor,
+            classes,
+            display: display.to_string(),
+        })
+    }
+
+    /// `display` を宣言している規則だけを集める。at-rule (`@media` 等) は見ない。
+    fn 表示規則を集める(css: &str) -> Vec<表示規則> {
+        let css = cssのコメントを外す(css);
+        let b: Vec<char> = css.chars().collect();
+        let mut out = Vec::new();
+        let (mut i, mut sel_start) = (0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                '{' => {
+                    let sel: String = b[sel_start..i].iter().collect();
+                    let mut depth = 1i32;
+                    let mut j = i + 1;
+                    while j < b.len() && depth > 0 {
+                        if b[j] == '{' {
+                            depth += 1;
+                        } else if b[j] == '}' {
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    let body: String = b[i + 1..j.saturating_sub(1).max(i + 1)].iter().collect();
+                    let sel = sel.trim();
+                    if !sel.starts_with('@') && !sel.is_empty() {
+                        if let Some(d) = display値(&body) {
+                            for one in sel.split(',') {
+                                if let Some(r) = 複合を解く(one, &d) {
+                                    out.push(r);
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                    sel_start = j;
+                }
+                '}' => {
+                    i += 1;
+                    sel_start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// 「隠したものを見せる規則」が鎖になっているか。破れている組を返す。
+    fn 見せ方の枝分かれ(rules: &[表示規則]) -> (usize, Vec<String>) {
+        let 含む = |a: &[String], b: &[String]| a.iter().all(|c| b.contains(c));
+        let mut bases = 0usize;
+        let mut ng = Vec::new();
+        for base in rules.iter().filter(|r| r.display == "none") {
+            let vis: Vec<&表示規則> = rules
+                .iter()
+                .filter(|r| {
+                    r.display != "none"
+                        && r.prefix == base.prefix
+                        && r.anchor == base.anchor
+                        && 含む(&base.classes, &r.classes)
+                        && r.classes.len() > base.classes.len()
+                })
+                .collect();
+            if vis.is_empty() {
+                continue;
+            }
+            bases += 1;
+            for i in 0..vis.len() {
+                for j in i + 1..vis.len() {
+                    let (a, b) = (vis[i], vis[j]);
+                    if !含む(&a.classes, &b.classes) && !含む(&b.classes, &a.classes) {
+                        ng.push(format!(
+                            "{}{}{} を隠しているのに、.{} と .{} の 2 通りで見えてしまう \
+                             (どちらも同じ詳細度なので、後ろにあるほうが display:none に勝つ)",
+                            if base.prefix.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{} ", base.prefix)
+                            },
+                            base.anchor,
+                            base.classes
+                                .iter()
+                                .map(|c| format!(".{c}"))
+                                .collect::<String>(),
+                            a.classes.join("."),
+                            b.classes.join("."),
+                        ));
+                    }
+                }
+            }
+        }
+        (bases, ng)
+    }
+
+    /// **ソースを読む番人は、改行をまたぐ照合の前に必ず正規化する。**
+    ///
+    /// Windows のチェックアウトは CRLF なので、`"a\nb"` のようなパターンは
+    /// 素の `include_str!` / `PAGE` では**必ず外れる**。手元 (macOS/Linux) は
+    /// 緑のまま、**Windows の CI だけが赤くなる**ので気付くのが遅い
+    /// (実際にこの版で `remote::tests::音声の案内は閉じられて閉じたことを覚える`
+    /// が Windows でだけ落ちた)。
+    ///
+    /// 検査は「`.contains("…\n…")` を書くなら、その関数の中で
+    /// `replace("\r\n", "\n")` を通した値を使っていること」。
+    #[test]
+    fn 改行をまたぐ照合は正規化してから使う() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                let src = src.replace("\r\n", "\n");
+                for (n, line) in src.lines().enumerate() {
+                    // `.contains("… \n …")` の形だけを見る (メッセージ内の
+                    // `\n` は `,` の後ろに来るので拾わない)
+                    // コメントの中のパターンはコードではない (この検査自身の
+                    // 説明文を拾ってしまう)
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let Some(at) = line.find(".contains(\"") else {
+                        continue;
+                    };
+                    let arg = &line[at + ".contains(\"".len()..];
+                    let end = arg.find('"').unwrap_or(arg.len());
+                    if !arg[..end].contains("\\n") {
+                        continue;
+                    }
+                    // **見るのはソース由来の値だけ。** メモリ上で組み立てた
+                    // 文字列 (diff の生成結果など) は CRLF と無関係なので、
+                    // ここで数えると騒がしくなって誰も読まなくなる。
+                    let recv = line[..at]
+                        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                    // **見る範囲は「その関数の中」だけ。** 直前 N 行で探すと、
+                    // 同じファイルの**別のテスト**が書いた正規化を拾ってしまい、
+                    // わざと壊しても緑のまま = 空回りする (実際に踏んだ)。
+                    let lines: Vec<&str> = src.lines().collect();
+                    let start = (0..=n)
+                        .rev()
+                        .find(|&k| {
+                            lines[k].trim_start().starts_with("fn ")
+                                || lines[k].trim_start().starts_with("pub fn ")
+                                || lines[k].trim_start().starts_with("pub(super) fn ")
+                                || lines[k].trim_start().starts_with("pub(crate) fn ")
+                        })
+                        .unwrap_or(0);
+                    let near: String = lines[start..=n].join("\n");
+                    // その関数が**埋め込みソースを読んでいる**なら、改行を
+                    // またぐ照合は必ず正規化を通すこと。受け手が
+                    // `let page = PAGE.replace(..)` のような局所変数でも
+                    // 同じ関数の中なので拾える。
+                    let _ = recv;
+                    // この検査自身は除く (判定に使う語をコードとして持つため、
+                    // 自分で自分を拾ってしまう)
+                    if near.contains("fn 改行をまたぐ照合は正規化してから使う") {
+                        continue;
+                    }
+                    let from_source = ["PAGE", "VOICE_PAGE", "SRC_IMPL", "SRC", "include_str!("]
+                        .iter()
+                        .any(|k| near.contains(k));
+                    if !from_source {
+                        continue;
+                    }
+                    seen += 1;
+                    // 受け手が正規化済みか (同じ関数の中で)
+                    if !near.contains("replace(\"\\r\\n\", \"\\n\")") {
+                        bad.push(format!(
+                            "{}:{}: 改行をまたぐ照合の前に replace(\"\\r\\n\", \"\\n\") が無い",
+                            p.file_name().unwrap_or_default().to_string_lossy(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+        // 空振り検知 — 該当する書き方が 1 つも無いなら、この検査は何も見ていない
+        assert!(seen >= 3, "改行をまたぐ照合を {seen} 件しか見つけていない");
+        bad.sort();
+        bad.truncate(20);
+        assert!(bad.is_empty(), "CRLF で外れる照合:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn スマホのcssは隠したものを脇道から見せない() {
+        let css = include_str!("../assets/remote/style.css").replace("\r\n", "\n");
+        let rules = 表示規則を集める(&css);
+        let (bases, ng) = 見せ方の枝分かれ(&rules);
+        assert!(
+            bases >= 4,
+            "style.css から display:none の土台を {bases} 個しか拾えていない \
+             (解析が壊れていると、この検査は永久に緑になる)"
+        );
+        assert!(
+            ng.is_empty(),
+            "assets/remote/style.css:\n  {}",
+            ng.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn スマホのjs内蔵cssも同じ法則に従う() {
+        // `style.css` を触らずに自分の CSS を足す流儀なので、そこも見る。
+        let files: [(&str, &str); 3] = [
+            (
+                "assets/remote/js/45-term.js",
+                include_str!("../assets/remote/js/45-term.js"),
+            ),
+            (
+                "assets/remote/js/47-approve.js",
+                include_str!("../assets/remote/js/47-approve.js"),
+            ),
+            (
+                "assets/remote/js/86-changes.js",
+                include_str!("../assets/remote/js/86-changes.js"),
+            ),
+        ];
+        let mut total_bases = 0;
+        for (name, src) in files {
+            let css = jsからcssを抜き出す(&src.replace("\r\n", "\n"));
+            let rules = 表示規則を集める(&css);
+            let (bases, ng) = 見せ方の枝分かれ(&rules);
+            total_bases += bases;
+            assert!(ng.is_empty(), "{name}:\n  {}", ng.join("\n  "));
+        }
+        assert!(
+            total_bases >= 1,
+            "JS に埋まった CSS から display:none の土台を 1 つも拾えていない \
+             (抜き出しが壊れている = この検査は空振りしている)"
+        );
+    }
+
+    /// **わざと壊すと赤になる**ことを、実装と同じ道具で確かめる。
+    ///
+    /// 空振りする検査を残さないための自己検査。ここが緑を返し続けるように
+    /// なったら、上の 2 本はもう何も見ていない。
+    #[test]
+    fn 脇道の検査はわざと壊すと赤になる() {
+        let 素 = "#alist { display:none; }\n#alist.show { display:block; }\n\
+                  #alist.show.mid { display:flex; }\n";
+        let (bases, ng) = 見せ方の枝分かれ(&表示規則を集める(素));
+        assert_eq!(bases, 1, "土台を数えられていない");
+        assert!(ng.is_empty(), "直っている形を赤にしてはいけない: {ng:?}");
+
+        // 0.18 で実際に出た形 (`.show` を落とした `#alist.mid`)
+        let 壊 = "#alist { display:none; }\n#alist.show { display:block; }\n\
+                  #alist.mid { display:flex; }\n";
+        let (_, ng) = 見せ方の枝分かれ(&表示規則を集める(壊));
+        assert_eq!(ng.len(), 1, "脇道を見逃した: {ng:?}");
+        assert!(ng[0].contains("show") && ng[0].contains("mid"), "{ng:?}");
+
+        // JS に埋め込まれた形でも同じ結論になること
+        let js = "css.textContent = [\n  '#zv { display:none; }',\n  \
+                  '#zv.show { display:flex; }',\n  '#zv.mid { display:block; }',\n].join('\\n');";
+        let (_, ng) = 見せ方の枝分かれ(&表示規則を集める(&jsからcssを抜き出す(js)));
+        assert_eq!(ng.len(), 1, "JS 内蔵の CSS で脇道を見逃した: {ng:?}");
     }
 
     // ── 供給網: インストーラは「展開する前に」SHA-256 を突き合わせる ──

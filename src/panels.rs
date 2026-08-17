@@ -1773,16 +1773,15 @@ pub fn composer_target_chips(
                 // 居ないときは出さない (0 のバッジを常設しない)。
                 if show_stalled_chip(stalled, buf.target()) {
                     let ssel = buf.target() == ComposerTarget::Stalled;
-                    let stxt = RichText::new(trf(
-                        "⏸ 停止中 {n}",
-                        &[("n", stalled.to_string())],
-                    ))
-                    .size(11.5)
-                    .color(if ssel { theme.warn } else { theme.text_dim });
+                    let stxt = RichText::new(trf("⏸ 停止中 {n}", &[("n", stalled.to_string())]))
+                        .size(11.5)
+                        .color(if ssel { theme.warn } else { theme.text_dim });
                     if ui
                         .selectable_label(ssel, stxt)
                         .on_hover_text(tr(
-                            "待機・停滞・ループ・エラーで止まっているエージェントだけへ送ります。\n                             作業中のものは巻き込みません (承認待ちも対象外です —                              そちらは承認の口で答えてください)",
+                            "待機・停滞・ループ・エラーで止まっているエージェントだけへ送ります。\n\
+                             作業中のものは巻き込みません (承認待ちも対象外です — \
+                             そちらは承認の口で答えてください)",
                         ))
                         .clicked()
                     {

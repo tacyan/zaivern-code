@@ -4414,8 +4414,29 @@ mod tests {
         destructive.dedup();
         assert_eq!(
             destructive,
-            vec!["delete_permanently".to_string(), "replace_dest".to_string()],
-            "復元できない削除は delete_permanently / replace_dest の中だけに置くこと"
+            vec![
+                "delete_permanently".to_string(),
+                // スマホからの添付 — **自分がこの呼び出しで `create_new` した
+                // 書きかけのファイル**だけを、書き込みに失敗したときに片付ける。
+                // 利用者のファイルには決して当たらない (上書きしないので、
+                // 消せるのは常に「今できたばかりの半端な添付」1 個)。
+                // 残すほうが悪い — 壊れた添付のパスをエージェントへ渡すことになる。
+                "remote_reply_upload".to_string(),
+                "replace_dest".to_string(),
+            ],
+            "復元できない削除は delete_permanently / replace_dest / \
+             remote_reply_upload (自分が作った書きかけの後始末) の中だけに置くこと"
+        );
+        // 添付の後始末が「自分で作ったものだけ」であることを構造で押さえる。
+        // `create_new` を外して上書きにした日に、この検査が落ちる。
+        let upload = fns
+            .iter()
+            .find(|(n, _)| n == "remote_reply_upload")
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default();
+        assert!(
+            upload.contains(".create_new(true)"),
+            "添付が上書きで開いている (消してよいのは自分が作ったものだけ)"
         );
 
         // ② その 2 つへ至る経路は 1 本ずつしかない

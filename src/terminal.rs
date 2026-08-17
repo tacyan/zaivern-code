@@ -3036,13 +3036,47 @@ impl Session {
     }
 
     /// 相対スクロール。**実際に動いたら true** (自動スクロールの再描画要求用)。
+    ///
+    /// # 基準は「適用と同じロックの中」で読む
+    ///
+    /// 相対量の基準は**いま実際に効いている戻り量** ([`Session::scroll`] では
+    /// なくパーサの `scrollback()`)。以前はここが
+    ///
+    /// ```text
+    /// 取り込み                     // ロック 1: eff を読む
+    /// n = self.scroll + delta      // 目標を組み立てる
+    /// set_scroll(n)                // ロック 2 (もう一度取り込み)
+    ///                              // ロック 3: set_scrollback(n)
+    /// ```
+    ///
+    /// と**3 回に分けて**いた。読取スレッドは 1 回の `read` (8KB ≒ 130 行) を
+    /// **ロックを握ったまま**流すので、ロック 1 と 3 の隙間に M 行押し出されると
+    /// 目標 `n` は M 行ぶん古くなる。しかも `set_scroll` は入口でもう一度
+    /// 取り込んで `self.scroll` を最新へ直すのに、**直した値を捨てて古い `n` を
+    /// 撃つ**。結果、1 ノッチで動くのは `delta - M` 行 — `M > delta` なら
+    /// **上へ回したのに下へ戻る**。
+    ///
+    /// 実測 (20 ノッチ × `delta = 2`、期待 +40 行):
+    /// M=1 → +20 / M=3 → **-20** / M=8 → **-120** / M=130 → **-2560**。
+    /// 直したあとは最初の 1 ノッチ (live に貼り付いていて出力を追う正しい動き)
+    /// を除いて**毎回ちょうど 2 行**。
+    ///
+    /// 利用者からは「スクロールを何回かやったら、同じ文字が発生する」
+    /// (= 遡ったつもりが引き戻されて、さっき見た行がまた出てくる) に見える。
     pub fn adjust_scroll(&mut self, delta: i64) -> bool {
-        // 相対量の基準は**いま実際に効いている戻り量**。取り込まずに足すと、
-        // 出力が来ていた場合その行数ぶん画面が飛ぶ。
+        // 選択の絶対座標の基準を最新にする (ここは動かす前で構わない)。
         self.adopt_scrolled_output();
         let before = self.scroll;
-        let n = (self.scroll as i64 + delta).max(0) as usize;
-        self.set_scroll(n);
+        // **読み直しと適用を 1 回のロックで済ませる。** 割り込まれる隙が無い。
+        let eff = {
+            let mut p = lock_ok(&self.parser);
+            let base = p.screen().scrollback() as i64;
+            p.set_scrollback(base.saturating_add(delta).max(0) as usize);
+            p.screen().scrollback()
+        };
+        self.scroll = eff;
+        // 選択は絶対座標なので消さない。今の画面へ切り取り直すだけ。
+        self.sync_selection();
         self.scroll != before
     }
 
@@ -16181,12 +16215,17 @@ mod selection_scroll_tests {
             self.sync_selection();
         }
 
-        /// `Session::adjust_scroll`。
+        /// `Session::adjust_scroll`。**基準はパーサから読み直す**
+        /// (`self.scroll` から組み立てると、実物では組み立てと適用の隙間に
+        /// 読取スレッドが割り込む — その形をここにも残さない)。
         fn adjust_scroll(&mut self, delta: i64) -> bool {
             self.adopt();
             let before = self.scroll;
-            let n = (self.scroll as i64 + delta).max(0) as usize;
-            self.set_scroll(n);
+            let base = self.parser.screen().scrollback() as i64;
+            self.parser
+                .set_scrollback(base.saturating_add(delta).max(0) as usize);
+            self.scroll = self.parser.screen().scrollback();
+            self.sync_selection();
             self.scroll != before
         }
 
@@ -16505,6 +16544,101 @@ mod selection_scroll_tests {
                 );
             }
         }
+    }
+
+    /// **報告された不具合**: 「スクロールを何回かやったら、同じ文字が発生する」。
+    ///
+    /// ホイール 1 ノッチは**いま映っている位置から**ちょうど `delta` 行動く
+    /// こと。`Session::scroll` から目標を組み立てると、組み立てと適用の間に
+    /// 起きたこと (読取スレッドの押し出し / 代替画面への出入り) のぶんだけ
+    /// 目標が古くなり、**遡ったつもりが引き戻されて同じ行がまた出てくる**。
+    ///
+    /// ここは `scroll` と実際の戻り量がずれている状態を**決定的に**作って
+    /// 押さえる (時間にも並行実行にも依存しない)。ずれは実際に起きる:
+    /// 代替画面へ入ると vt100 は通常画面の戻り量を 0 へ落とすが、
+    /// [`adopt_scroll`] は**減る方向を写さない**ので `scroll` は残る。
+    #[test]
+    fn ホイール一ノッチは映っている位置からちょうど動く() {
+        let (rows, cols) = (5u16, 20u16);
+        let mut s = Model::new(rows, cols, 200);
+        s.feed_lines(0..60);
+        s.set_scroll(20);
+        assert_eq!(s.eff_scroll(), 20, "通常画面で遡れている");
+
+        // 代替画面へ入る。vt100 は通常画面の戻り量を 0 に落とすが、
+        // `Session::scroll` は 20 のまま残る (取り込みは下げない)。
+        s.feed(b"\x1b[?1049h");
+        s.feed_lines(100..160);
+        assert!(s.is_alt(), "代替画面に居る");
+        assert_eq!(s.eff_scroll(), 0, "代替画面では最新に貼り付いている");
+        assert_eq!(s.scroll, 20, "`scroll` は古いまま (ずれを作れている)");
+
+        // ここで 1 ノッチ (2 行) 上へ。**映っているのは 0 行目**なので 2。
+        assert!(s.adjust_scroll(2), "動いた");
+        assert_eq!(
+            s.eff_scroll(),
+            2,
+            "`scroll`(20) ではなく実際の戻り量(0)を基準にする"
+        );
+        // 続けて回しても 1 ノッチぶんずつ。
+        for want in [4usize, 6, 8] {
+            assert!(s.adjust_scroll(2), "動いた");
+            assert_eq!(s.eff_scroll(), want, "1 ノッチ = ちょうど 2 行");
+        }
+        // 下へも同じ。
+        assert!(s.adjust_scroll(-3), "動いた");
+        assert_eq!(s.eff_scroll(), 5, "下向きもちょうど 3 行");
+    }
+
+    /// **相対スクロールの基準は、適用と同じロックの中で読む。**
+    ///
+    /// 読取スレッドは 1 回の `read` (8KB ≒ 130 行) を**パーサのロックを
+    /// 握ったまま**流す。目標を `self.scroll` から組み立ててから
+    /// `set_scroll` へ渡すと、その間の 2 回のロック取得の隙間に M 行押し出され、
+    /// 1 ノッチで動くのは `delta - M` 行になる (`M > delta` なら**下へ戻る**)。
+    /// 実測 (20 ノッチ × `delta = 2`、期待 +40 行): M=1 → +20 /
+    /// M=3 → **-20** / M=8 → **-120** / M=130 → **-2560**。
+    ///
+    /// 並行実行に頼るテストは間欠になるので、**構造で**押さえる。
+    #[test]
+    fn 相対スクロールの基準は適用と同じロックの中で読む() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        let body = src
+            .split_once("pub fn adjust_scroll(&mut self, delta: i64) -> bool {")
+            .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+            .map(|(b, _)| b.to_string())
+            .expect("Session::adjust_scroll が居ない");
+        assert!(
+            !body.contains(concat!("self.scroll", " as i64")),
+            "目標を `self.scroll` から組み立てている (適用までに古くなる)"
+        );
+        assert!(
+            !body.contains(concat!("self.set_", "scroll(")),
+            "`set_scroll` へ渡している (中でもう一度取り込んでから古い目標を撃つ)"
+        );
+        // 基準の読み直しと適用が**同じロックの中**にあること。
+        let locked = body
+            .split_once(concat!("lock_ok(&self.", "parser)"))
+            .map(|(_, rest)| rest.to_string())
+            .expect("パーサのロックを取っていない");
+        for needle in ["screen().scrollback()", "set_scrollback("] {
+            assert!(
+                locked.contains(needle),
+                "`{needle}` がロックの外に出ている (割り込まれる隙ができる)"
+            );
+        }
+        // 試験用の写し (`Model`) も同じ形。ずれると番人だけが緑になる。
+        let model = src
+            .split_once(
+                "fn adjust_scroll(&mut self, delta: i64) -> bool {\n            self.adopt();",
+            )
+            .and_then(|(_, rest)| rest.split_once("\n        }\n"))
+            .map(|(b, _)| b.to_string())
+            .expect("Model::adjust_scroll が居ない");
+        assert!(
+            model.contains("self.parser.screen().scrollback()"),
+            "Model が `scroll` から目標を組み立てている (実物とずれる)"
+        );
     }
 
     /// **コピーと表示が同じ 1 点を通る**ことを構造で固定する。

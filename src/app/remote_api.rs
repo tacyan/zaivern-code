@@ -53,6 +53,9 @@ impl ZaivernApp {
                 self.remote_reply_bulk(text, *mode, *submit)
             }
             remote::Query::BulkStop { mode } => self.remote_reply_bulk_stop(*mode),
+            // 添付 (画像など) を作業フォルダの下へ保存する。届け先は決めない
+            // — 続けて呼ばれる `/api/bulk` が既存の仕組みで宛先を決める
+            remote::Query::Upload { name, data } => self.remote_reply_upload(name, data),
             remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
             // ─── スマホを PC と同じ土俵に載せる読み取り ───
             // git と横断検索は**必ず裏のスレッド**。ここでは控えを見るだけ
@@ -143,6 +146,9 @@ impl ZaivernApp {
                 "stalled": remote::bulk_targets(remote::BulkMode::Stalled, &picks).len(),
                 "one": remote::bulk_targets(remote::BulkMode::One, &picks).len(),
             },
+            // 添付 1 件の上限。**スマホ側に数字を持たせない** — 2 か所に
+            // 置くと「送れると出ているのに 413 で落ちる」がいずれ起きる
+            "upload_max": remote::UPLOAD_MAX_BYTES,
             // 音声入力ページ (スマホ) が参照する設定
             "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
         })
@@ -703,6 +709,135 @@ impl ZaivernApp {
         json!({"ok": true, "sent": sent, "mode": mode.as_str()}).to_string()
     }
 
+    /// remote_reply: Upload — スマホから届いた添付を**作業フォルダの下へ**保存する。
+    ///
+    /// CLI エージェントは画像をパスで受け取るので、「スマホから送る」は
+    /// (a) ここで保存 → (b) `@パス` を入力欄へ入れる、の 2 段になる。
+    /// (b) は既存の [`Self::remote_reply_bulk`] (`submit=false`) がそのまま
+    /// 担う — **宛先の決め方も届け方もここでは作り直さない**。
+    ///
+    /// 置き場は [`Self::agent_cwd`] (= これからエージェントを起こす作業
+    /// フォルダ) の下の [`remote::UPLOAD_DIR`]。パスを直書きしないので、
+    /// どの OS でも・どのワークスペースでも同じ場所に落ちる。
+    ///
+    /// 安全のためにやっていること:
+    /// * 名前は [`remote::upload_path`] で 1 要素へ畳む (`..` もドライブも通らない)
+    /// * 畳んだ**あとに実体でも**作業フォルダ配下であることを確かめる
+    ///   (シンボリックリンクで外へ抜けるのを塞ぐ)
+    /// * 上限 ([`remote::UPLOAD_MAX_BYTES`]) を超えたら**黙って切らずに断る**
+    /// * 既にある名前は上書きせず `-1`, `-2`… と番号で避ける
+    pub(super) fn remote_reply_upload(&mut self, name: &str, data: &str) -> String {
+        use base64::Engine as _;
+        use serde_json::json;
+        use std::io::Write as _;
+
+        let root = self.agent_cwd();
+        let Some(target) = remote::upload_path(&root, name) else {
+            return json!({"ok": false, "error": tr("ファイル名が受け取れません")}).to_string();
+        };
+        // base64 は data: URI の本体だけが届く前提。空白・改行は落としてから解く
+        let raw: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw.as_bytes()) else {
+            return json!({"ok": false, "error": tr("添付を読み取れませんでした")}).to_string();
+        };
+        if bytes.is_empty() {
+            return json!({"ok": false, "error": tr("添付が空です")}).to_string();
+        }
+        if bytes.len() > remote::UPLOAD_MAX_BYTES {
+            return json!({
+                "ok": false,
+                "error": trf(
+                    "添付が大きすぎます ({mb}MB まで)",
+                    &[("mb", (remote::UPLOAD_MAX_BYTES / (1024 * 1024)).to_string())],
+                ),
+            })
+            .to_string();
+        }
+        let Some(dir) = target.parent().map(|p| p.to_path_buf()) else {
+            return json!({"ok": false, "error": tr("保存先を作れませんでした")}).to_string();
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return json!({"ok": false, "error": format!("{}: {e}", tr("保存先を作れませんでした"))})
+                .to_string();
+        }
+        // 字句で畳んだうえに**実体でも**作業フォルダの下にあることを見る。
+        // (`.zaivern` がリンクで外を指していても、ここで止まる)
+        let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !canon_dir.starts_with(&canon_root) {
+            return json!({"ok": false, "error": tr("ワークスペース外へは保存できません")})
+                .to_string();
+        }
+        // 置き場を **git から隠す**。スマホから送った写真がワークスペースに
+        // 落ちるので、エージェントが `git add -A` した瞬間に利用者の写真が
+        // コミットへ混ざる。`*` は自分自身も無視するので 1 行で足りる。
+        // 既にあるものは触らない (利用者が書き換えていることがある)。
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            let _ = std::fs::write(&ignore, "*\n");
+        }
+        // 上書きしない。`create_new` なので「見てから書く」の隙間も無い
+        let base = target
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut saved = None;
+        for i in 0..remote::UPLOAD_UNIQUE_TRIES {
+            let p = dir.join(remote::nth_name(&base, i));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(&bytes) {
+                        let _ = std::fs::remove_file(&p);
+                        return json!({"ok": false, "error": format!("{}: {e}", tr("添付を保存できませんでした"))})
+                            .to_string();
+                    }
+                    saved = Some(p);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // Windows は削除待ちのファイルへ書くと ACCESS_DENIED を返す
+                // (CLAUDE.md の既知の罠)。取り合いとして次の綴りを試す
+                Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    continue
+                }
+                Err(e) => {
+                    return json!({"ok": false, "error": format!("{}: {e}", tr("添付を保存できませんでした"))})
+                        .to_string()
+                }
+            }
+        }
+        let Some(path) = saved else {
+            return json!({"ok": false, "error": tr("同じ名前の添付が多すぎます")}).to_string();
+        };
+        // 入力欄へ入れる本文。**綴りを決めるのはここ 1 か所**で、スマホ側は
+        // 受け取った文字列をそのまま `/api/bulk` へ流すだけ。宛先が複数
+        // (全員 / 待機) だと作業フォルダの違う相手も混ざるので、**必ず絶対パス**
+        // にする — 相対だと「一部のエージェントだけ開けない」が静かに起きる。
+        let text = format!("@{} ", path.display());
+        // トーストにはファイル名だけを出す (絶対パスを丸ごと出すと
+        // 1 行に収まらず、肝心の「何が届いたか」が省略で消える)。
+        self.toast(
+            trf(
+                "📎 {name} を受け取りました",
+                &[(
+                    "name",
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                )],
+            ),
+            true,
+        );
+        json!({
+            "ok": true,
+            "path": path.display().to_string(),
+            "text": text,
+            "bytes": bytes.len(),
+        })
+        .to_string()
+    }
+
     /// remote_reply: BulkStop — 宛先へ Esc を送っていまの作業を止める。
     ///
     /// セッションを殺す [`Cmd::StopAllAgents`] は PC 側に確認モーダルを開くので、
@@ -830,6 +965,14 @@ impl ZaivernApp {
         let token = old.token.clone();
         let prefer = old.port;
         let was = old.bind;
+        // **HTTPS モードから離れるなら、必ず `serve --https=443 off` を撃つ。**
+        // ここが後片付けの唯一の発火点である (やめるボタン / 同じ Wi-Fi へ戻す /
+        // SSH トンネルへ切り替え — どの経路もこの関数を通る)。撃ち忘れると
+        // 利用者の tailnet に proxy 設定が残り続ける。
+        // 立っていないときは何もしない (利用者の設定を勝手に触らない)。
+        if was == remote::Bind::TailscaleHttps && self.https.domain().is_some() {
+            self.https.stop();
+        }
         // 先に畳んでポートを解放する (Drop が accept の終了まで待つ)
         drop(old);
         match remote::RemoteServer::rebind(ctx.clone(), bind, token.clone(), prefer) {
@@ -868,6 +1011,59 @@ impl ZaivernApp {
         }
     }
 
+    /// tailnet の HTTPS 公開 (`tailscale serve`) の結果を取り込む。
+    ///
+    /// **📱 のウィンドウを閉じられても回す。** 証明書の取得は初回だけ 1 分
+    /// かかることがあり、その間ウィンドウを開けたままにする義理は利用者に無い
+    /// (ファイアウォールの `fw.poll` と同じ理由でここに置く)。
+    pub(super) fn poll_https(&mut self, ctx: &egui::Context) {
+        let Some(done) = self.https.poll() else {
+            return;
+        };
+        match done {
+            tailscale::HttpsDone::On { domain, warn } => {
+                // **`serve` が rc=0 で返ってからしか https の URL を配らない。**
+                if let Some(r) = self.remote.as_mut() {
+                    r.set_https_host(&domain);
+                }
+                self.qr_url.clear(); // URL が変わるので QR を作り直す
+                self.https_err = None;
+                self.toast(
+                    trf(
+                        "🔒 https://{d}/ で待ち受けています (スマホの音声入力が使えます)",
+                        &[("d", domain)],
+                    ),
+                    true,
+                );
+                // 証明書の先取りに失敗しても serve は立っている。
+                // 「最初の 1 接続が遅い / 1 度失敗する」ことだけを伝える。
+                if warn.is_some() {
+                    self.toast_warn(tr(tailscale::FIRST_CONNECT_NOTE));
+                }
+            }
+            tailscale::HttpsDone::Off => {
+                if let Some(r) = self.remote.as_mut() {
+                    r.clear_https_host();
+                }
+                self.qr_url.clear();
+            }
+            tailscale::HttpsDone::Blocked(b) => {
+                // 立てられなかったのに loopback だけで待ち受け続けると
+                // **どこからも繋がらない**。同じ Wi-Fi へ戻して手を残す。
+                if self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| r.bind == remote::Bind::TailscaleHttps)
+                {
+                    self.tunnel_err = self.rebind_remote(ctx, remote::Bind::Lan).err();
+                }
+                self.toast_warn(tr(b.headline()));
+                self.https_err = Some(b);
+            }
+        }
+        crate::perf::repaint(ctx, "ts_https");
+    }
+
     /// QR コード付きの接続ウィンドウ。📱 ボタンで開閉する。
     pub(super) fn remote_window(&mut self, ctx: &egui::Context) {
         if !self.remote_open {
@@ -880,7 +1076,10 @@ impl ZaivernApp {
         let url_full = self.remote.as_ref().and_then(|r| {
             tstate
                 .phone_url(&r.token)
-                .or_else(|| Some(format!("{}?t={}", r.url, r.token)))
+                // Tailscale の HTTPS 前面が立っていれば https の URL。
+                // **立つまでは平文のまま**なので、準備中は QR を出さない
+                // (`https_preparing` を参照)。
+                .or_else(|| Some(format!("{}?t={}", r.phone_url(), r.token)))
         });
 
         // QR テクスチャは URL が変わったときだけ作り直す
@@ -945,6 +1144,22 @@ impl ZaivernApp {
             .unwrap_or(remote::Bind::Lan);
         let lan_mode = bind == remote::Bind::Lan;
         let ts_mode = bind == remote::Bind::Tailscale;
+        // Tailscale が TLS を終端する前面越し。**スマホの音声入力が動く唯一の形**
+        // (`SpeechRecognition` はセキュアコンテキストでしか動かない)。
+        let https_mode = bind == remote::Bind::TailscaleHttps;
+        let https_ready = self.remote.as_ref().is_some_and(|r| r.https_ready());
+        let https_busy = self.https.busy();
+        // **解除に失敗すると、モードを戻した後も serve が立ったまま残る。**
+        // そのときは「やめる」ボタンを出し続ける — 出さないと、利用者は
+        // 自分の tailnet に残った proxy 設定を消す手を画面から失う。
+        let https_leftover = self.https.domain().is_some();
+        // 前面が立つまでの URL は `http://127.0.0.1:<port>` で、スマホからは
+        // 絶対に繋がらない。**その QR を出さない**のが唯一正しい振る舞い。
+        let https_preparing = https_mode && !https_ready;
+        let https_err = self.https_err.clone();
+        let mut ts_https_on = false;
+        let mut ts_https_off = false;
+        let mut https_copy_admin = false;
         // Tailscale の検出。**この画面が描かれている間だけ**測る
         // (スレッドもタイマーも持たない — 設計原則 3)。
         let ts = self.ts.get();
@@ -959,7 +1174,9 @@ impl ZaivernApp {
         // 同じように効く。ここを隠すと「QR は読めるのにスマホからだけ何も
         // 起きない」の原因が画面から消える。規則は「この実行ファイル +
         // TCP 8899-8919」でインタフェースを問わないので、そのまま直せる。
-        let fw_check = firewall::applicable() && (lan_mode || ts_mode);
+        // HTTPS 経由では受信するのは tailscaled であってこのプロセスではない。
+        // 判断は `Bind::needs_inbound_firewall` 1 か所だけに置く。
+        let fw_check = firewall::applicable() && bind.needs_inbound_firewall();
         let fw_busy = self.fw.busy();
         let fw_report = self.fw.report().cloned();
         let fw_error = self.fw.error.clone();
@@ -1009,6 +1226,7 @@ impl ZaivernApp {
                                         "同じ Wi-Fi のスマホで QR を読み取るだけで接続"
                                     }
                                     remote::Bind::Tailscale => tailscale::HEADLINE,
+                                    remote::Bind::TailscaleHttps => tailscale::HTTPS_HEADLINE,
                                     remote::Bind::Loopback => {
                                         "SSH トンネル経由 — 外出先のスマホで QR を読み取って接続"
                                     }
@@ -1268,21 +1486,39 @@ impl ZaivernApp {
                                 }
                             }
                             ui.add_space(8.0);
-                            if let Some(tex) = &qr_tex {
-                                ui.add(
-                                    egui::Image::new(tex)
-                                        .fit_to_exact_size(egui::vec2(240.0, 240.0)),
+                            // **準備中は QR も URL も出さない。** この間の URL は
+                            // `http://127.0.0.1:<port>` のままで、読み取ったスマホは
+                            // 必ず失敗する — 出さないほうが親切である。
+                            if https_preparing {
+                                ui.label(
+                                    RichText::new(tr(https_busy
+                                        .unwrap_or(tailscale::HttpsBusy::Starting)
+                                        .label()))
+                                    .size(12.0)
+                                    .color(theme.warn),
                                 );
-                            }
-                            ui.add_space(8.0);
-                            let mut u = url.clone();
-                            ui.add(
-                                egui::TextEdit::singleline(&mut u)
-                                    .desired_width(320.0)
-                                    .font(FontId::monospace(12.0)),
-                            );
-                            if ui.button(tr("📋 URL をコピー")).clicked() {
-                                copy = true;
+                                ui.label(
+                                    RichText::new(tr(tailscale::FIRST_CONNECT_NOTE))
+                                        .size(10.5)
+                                        .color(theme.text_dim),
+                                );
+                            } else {
+                                if let Some(tex) = &qr_tex {
+                                    ui.add(
+                                        egui::Image::new(tex)
+                                            .fit_to_exact_size(egui::vec2(240.0, 240.0)),
+                                    );
+                                }
+                                ui.add_space(8.0);
+                                let mut u = url.clone();
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut u)
+                                        .desired_width(320.0)
+                                        .font(FontId::monospace(12.0)),
+                                );
+                                if ui.button(tr("📋 URL をコピー")).clicked() {
+                                    copy = true;
+                                }
                             }
                             ui.add_space(6.0);
                             ui.label(
@@ -1302,7 +1538,11 @@ impl ZaivernApp {
                             // **入れていない人には 1 行も出さない** — 押せない
                             // ボタンと直せない警告を並べても場所を食うだけ。
                             // (繋がっていれば必ず検出できるので、使える人には出る)
-                            if ts.stage != tailscale::Stage::Missing || ts_mode {
+                            if ts.stage != tailscale::Stage::Missing
+                                || ts_mode
+                                || https_mode
+                                || https_leftover
+                            {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(tr("🔒 Tailscale VPN"))
@@ -1342,7 +1582,7 @@ impl ZaivernApp {
                                         .color(theme.text_dim),
                                 );
                                 ui.add_space(3.0);
-                                if ts_mode {
+                                if ts_mode || https_mode {
                                     if ui
                                         .button(tr("📶 同じ Wi-Fi に戻す"))
                                         .on_hover_text(tr(tailscale::BACK_HINT))
@@ -1350,11 +1590,13 @@ impl ZaivernApp {
                                     {
                                         ts_off = true;
                                     }
-                                    ui.label(
-                                        RichText::new(tr(tailscale::ONLY_TAILNET_NOTE))
-                                        .size(10.5)
-                                        .color(theme.text_dim),
-                                    );
+                                    if ts_mode {
+                                        ui.label(
+                                            RichText::new(tr(tailscale::ONLY_TAILNET_NOTE))
+                                                .size(10.5)
+                                                .color(theme.text_dim),
+                                        );
+                                    }
                                 } else if ui
                                     .add_enabled(
                                         ts.ready(),
@@ -1364,6 +1606,85 @@ impl ZaivernApp {
                                     .clicked()
                                 {
                                     ts_on = true;
+                                }
+
+                                // ── HTTPS (tailscale serve) ──────────
+                                // **スマホの音声入力が動く唯一の形。**
+                                // ブラウザの `SpeechRecognition` はセキュア
+                                // コンテキストでしか動かないので、平文の
+                                // tailnet に何を足しても 🎤 は生えない。
+                                ui.add_space(4.0);
+                                match https_busy {
+                                    // 進行中は押せない (二重に撃つと serve の
+                                    // 設定が競合して、どちらが残るか読めない)
+                                    Some(b) => {
+                                        ui.label(
+                                            RichText::new(tr(b.label()))
+                                                .size(11.0)
+                                                .color(theme.warn),
+                                        );
+                                    }
+                                    None if https_mode || https_leftover => {
+                                        if ui
+                                            .button(tr("🔓 HTTPS をやめる"))
+                                            .on_hover_text(tr(tailscale::HTTPS_OFF_HINT))
+                                            .clicked()
+                                        {
+                                            ts_https_off = true;
+                                        }
+                                    }
+                                    None => {
+                                        if ui
+                                            .add_enabled(
+                                                ts.ready(),
+                                                egui::Button::new(tr(
+                                                    "🎤 HTTPS で待ち受ける (スマホの音声入力が使えます)",
+                                                )),
+                                            )
+                                            .on_hover_text(tr(tailscale::HTTPS_ON_HINT))
+                                            .clicked()
+                                        {
+                                            ts_https_on = true;
+                                        }
+                                    }
+                                }
+                                // **できなかった理由は 4 通りある。**
+                                // 「できませんでした」で終わらせない —
+                                // 直し方がそれぞれ違う。
+                                if let Some(b) = &https_err {
+                                    ui.label(
+                                        RichText::new(tr(b.headline()))
+                                            .size(11.0)
+                                            .color(theme.err),
+                                    );
+                                    ui.label(
+                                        RichText::new(tr(b.hint()))
+                                            .size(10.5)
+                                            .color(theme.text_dim),
+                                    );
+                                    if *b == tailscale::HttpsBlock::CertsOff
+                                        && ui
+                                            .small_button(trf(
+                                                "📋 {url}",
+                                                &[("url", tailscale::ADMIN_DNS_URL.to_string())],
+                                            ))
+                                            .on_hover_text(tr(
+                                                "管理コンソールの URL をコピーします",
+                                            ))
+                                            .clicked()
+                                    {
+                                        https_copy_admin = true;
+                                    }
+                                    // 生の出力はそのまま出す (要約すると
+                                    // いちばん知りたい 1 行が消える)
+                                    if let Some(d) = b.detail() {
+                                        ui.label(
+                                            RichText::new(d)
+                                                .size(10.0)
+                                                .font(FontId::monospace(10.0))
+                                                .color(theme.text_dim),
+                                        );
+                                    }
                                 }
                                 ui.add_space(6.0);
                                 ui.separator();
@@ -1564,6 +1885,44 @@ impl ZaivernApp {
             }
             // 切り替えた直後の状態はもう古い (tailnet が落ちていたかもしれない)
             self.ts.invalidate();
+        }
+        // ── Tailscale の HTTPS 前面 ──
+        if ts_https_on {
+            // 経路は 1 本に決める (SSH トンネルを張ったままだと url_full が
+            // 踏み台の URL を優先するので、押しても何も変わらないように見える)
+            self.tunnel.disconnect();
+            self.https_err = None;
+            // **先に** 待ち受けを 127.0.0.1 へ絞る。TLS は Tailscale が終端して
+            // loopback へ流すので、tailnet の IP で平文を開けておく理由が無い。
+            match self.rebind_remote(ctx, remote::Bind::TailscaleHttps) {
+                Ok(port) => {
+                    self.tunnel_err = None;
+                    // ここから先は裏のスレッド。UI は 1 度も待たない
+                    // (証明書の取得は初回だけ 1 分かかることがある)
+                    self.https.start(port);
+                }
+                Err(e) => self.tunnel_err = Some(e),
+            }
+            self.ts.invalidate();
+        }
+        if ts_https_off {
+            self.https_err = None;
+            if bind == remote::Bind::TailscaleHttps {
+                // `rebind_remote` が離脱を見て `serve --https=443 off` を撃つ
+                // (**後片付けの発火点を 1 か所に集める** — 撃ち忘れると利用者の
+                //  tailnet に proxy 設定が残り続ける)
+                self.tunnel_err = self.rebind_remote(ctx, remote::Bind::Lan).err();
+            } else {
+                // 待ち受けは既に戻っているのに serve だけ残っている
+                // (前回の解除が失敗した)。`rebind_remote` は同じ bind なら
+                // 何もせずに帰るので、ここは直接もう一度撃つ。
+                self.https.stop();
+            }
+            self.ts.invalidate();
+        }
+        if https_copy_admin {
+            ctx.copy_text(tailscale::ADMIN_DNS_URL.to_string());
+            self.toast(tr("管理コンソールの URL をコピーしました"), true);
         }
         // ── SSH トンネルの操作 ──
         if tunnel_connect {
@@ -2406,6 +2765,44 @@ mod bulk_wiring_tests {
         assert!(
             body.contains("remote::bulk_targets(mode, &picks)"),
             "宛先の選び方を remote::bulk_targets 以外で決めている"
+        );
+    }
+
+    /// 添付は (a) 置き場を自分で綴らない (b) 上限を必ず見る (c) 上書きしない。
+    ///
+    /// どれも実行時には見えない (成功して見えるまま外へ書ける・古い添付を
+    /// 静かに潰す) ので、ソースで押さえる。
+    #[test]
+    fn 添付の置き場と上限は共有の判定を通る() {
+        let body = body_of("pub(super) fn remote_reply_upload(");
+        // 置き場は作業フォルダから導出する。パスを直書きしない
+        assert!(
+            body.contains("self.agent_cwd()") && body.contains("remote::upload_path(&root, name)"),
+            "添付の保存先を remote::upload_path 以外で決めている"
+        );
+        assert!(
+            !body.contains("/tmp") && !body.contains("C:\\"),
+            "添付の保存先にパスを直書きしている"
+        );
+        // 上限は黙って切らずに断る
+        assert!(
+            body.contains("bytes.len() > remote::UPLOAD_MAX_BYTES"),
+            "添付の上限を見ていない"
+        );
+        // 実体でも作業フォルダの下にいることを確かめる (リンクで外へ抜けない)
+        assert!(
+            body.contains("canon_dir.starts_with(&canon_root)"),
+            "実体での前方一致を見ていない"
+        );
+        // 既にある添付を上書きしない (`create_new` は「見てから書く」隙間も無い)
+        assert!(
+            body.contains("create_new(true)") && body.contains("remote::nth_name(&base, i)"),
+            "同名の添付を上書きしている疑い"
+        );
+        // 置き場を git から隠す (利用者の写真が `git add -A` で混ざらない)
+        assert!(
+            body.contains("dir.join(\".gitignore\")"),
+            "添付の置き場を git から隠していない"
         );
     }
 

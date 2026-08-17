@@ -398,6 +398,16 @@ pub fn compare(base: &HashMap<String, String>, other: &HashMap<String, String>) 
 ///
 /// 辞書は**実行時の値**で引くので、`\n` や `\u{1F310}` を戻さないと
 /// 一生一致しない。未知のエスケープは次の 1 文字をそのまま採る (落とさない)。
+///
+/// ## 行継続 (`\` + 改行) を必ず畳むこと
+///
+/// Rust は `\` の直後が改行なら、**その改行と次の行の先頭にある空白を
+/// 全部**読み飛ばす (Reference: String continuation escapes)。長い案内文を
+/// ソース上で折り返すために実際に使われている書き方で、畳み損ねると
+/// 辞書のキーが `"…\n\n                     …"` のように**実行時の文字列と
+/// 食い違う**。食い違えば `tr()` は原文をそのまま返すので、**その行は
+/// どの言語でも永久に日本語のまま**になる (画面には出るのに、番人も
+/// `zai i18n missing` も何も言わない — いちばん静かな壊れ方)。
 pub fn unescape_rust(raw: &str) -> String {
     let mut out = String::new();
     let mut it = raw.chars().peekable();
@@ -432,6 +442,23 @@ pub fn unescape_rust(raw: &str) -> String {
                     out.push(ch);
                 }
             }
+            // 行継続: `\` の直後が改行なら、改行と**次の行の先頭空白を全部**捨てる。
+            // ここを「知らないエスケープ」として 1 文字通すと、実行時の文字列と
+            // 食い違ったキーが辞書へ入り、その行は永久に日本語のまま残る。
+            Some('\n') | Some('\r') => {
+                // **飛ばすのは ASCII の空白だけ** (rustc の
+                // `rustc_lexer::unescape::skip_ascii_whitespace` と同じ)。
+                // `char::is_whitespace()` にすると全角スペース (U+3000) や
+                // VT まで食うが、rustc はそれらを**本文として残す**。
+                // 実際に UI の字下げへ全角スペースを使っている箇所があるので、
+                // 広げた瞬間に「辞書のキーだけ 1 文字短い」が静かに起きる。
+                while it
+                    .peek()
+                    .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+                {
+                    it.next();
+                }
+            }
             Some(other) => out.push(other),
             None => {}
         }
@@ -457,8 +484,17 @@ pub fn module_of(path: &Path) -> String {
 /// 戻り値は (module, 実行時の文字列)。`tr(&x)` のように変数を渡している所は
 /// 静的には辿れない — そちらは `ZAIVERN_I18N_TRACE=1` の実行時収集で拾う。
 pub fn scan_source_literals(dir: &Path) -> Vec<(String, String)> {
-    // 文字列リテラル 1 個。`\"` を含む本文を正しく food する
-    let Ok(re) = regex::Regex::new(r#"\b(?:tr|trf)\(\s*"((?:[^"\\]|\\.)*)""#) else {
+    // 文字列リテラル 1 個。`\"` を含む本文を正しく食う。
+    //
+    // **エスケープの受け皿は `(?s:.)` にすること。** 素の `.` は改行に当たらない
+    // ので、`\` + 改行 (行継続) を食えず、`[^"\\]` も `\` を食えないため、
+    // **閉じ `"` に到達できずマッチ自体が不成立**になる。つまりその `tr(` は
+    // 走査結果に 1 度も現れず、番人テストも `zai i18n missing` も何も言わない
+    // まま、その行はどの言語でも永久に日本語のまま残る。
+    // 実測: この 1 文字を直すだけで、これまで見えていなかった **71 箇所**が
+    // 走査に現れた (3436 → 3507 件。うち 40 箇所は辞書に正しい原文が
+    // 1 つも無く、どの言語でも永久に日本語のままだった)。
+    let Ok(re) = regex::Regex::new(r#"\b(?:tr|trf)\(\s*"((?:[^"\\]|\\(?s:.))*)""#) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -839,6 +875,109 @@ mod tests {
         assert!(bad.is_empty(), "同梱辞書の不整合:\n{}", bad.join("\n"));
         // 検査が空振りしていないこと
         assert!(with_ph > 100, "プレースホルダ付きが {with_ph} 件しかない");
+    }
+
+    /// **`\` + 改行 (行継続) は、改行と次行の先頭空白を全部捨てる。**
+    ///
+    /// Rust Reference の "String continuation escapes"。長い案内文をソース上で
+    /// 折り返すために実際に 68 箇所で使われている書き方で、ここを取り違えると
+    /// 辞書のキーが実行時の文字列と食い違い、**その行はどの言語でも永久に
+    /// 日本語のまま**になる (画面には出るのに番人も `zai i18n missing` も
+    /// 何も言わない — いちばん静かな壊れ方だった)。
+    #[test]
+    fn 行継続は改行と次行の先頭空白を捨てる() {
+        // (ソースの生表記, 実行時の値)
+        for (raw, want) in [
+            ("a\\\n   b", "ab"),          // 継続 + インデント
+            ("a\\n\\\n   b", "a\nb"),     // \n は残し、継続だけ畳む
+            ("a\\\n\\\nb", "ab"),         // 継続が続いても畳む
+            ("a\\\r\n  b", "ab"),         // CRLF
+            ("a\\\n", "a"),               // 継続の後が終端
+            ("a\\\n\tb", "ab"),           // タブも空白
+            ("a\\\\\nb", "a\\\nb"),       // \\ はバックスラッシュ (継続ではない)
+            ("a\\\n   b\\\n   c", "abc"), // 複数回
+        ] {
+            assert_eq!(unescape_rust(raw), want, "raw={raw:?}");
+        }
+        // **全角スペースは本文**。rustc が飛ばすのは ASCII の空白だけなので、
+        // ここを `is_whitespace()` にすると辞書のキーだけ 1 文字短くなる。
+        assert_eq!(unescape_rust("a\\\n\u{3000}b"), "a\u{3000}b");
+        assert_eq!(unescape_rust("a\\\n \u{3000}b"), "a\u{3000}b");
+    }
+
+    /// 走査器が**行継続を含む呼び出しを取りこぼさない**こと。
+    ///
+    /// 正規表現の `\\.` の `.` は既定で改行に当たらないので、素のままだと
+    /// `\` + 改行 を食えず、閉じ `"` に到達できずに**マッチ自体が不成立**に
+    /// なる。つまりその `tr(` は走査結果に 1 度も現れず、
+    /// [`ソースのtrリテラルはすべて同梱辞書から引ける`] も素通りする。
+    /// 実測: 1 文字直しただけで **68 箇所**が新たに現れた。
+    #[test]
+    fn 走査は行継続を含む呼び出しも拾う() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-locale-test", "scan-cont");
+        let src = concat!(
+            "fn a() { ui.on_hover_text(tr(\"あああ\\n\\\n",
+            "                 いいい\")); }\n",
+            "fn b() { let _ = tr(\"ふつう\"); }\n",
+        );
+        std::fs::write(dir.join("x.rs"), src).unwrap();
+        let got: Vec<String> = scan_source_literals(&dir)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert!(
+            got.contains(&"あああ\nいいい".to_string()),
+            "行継続を含む呼び出しを取りこぼした: {got:?}"
+        );
+        assert!(
+            got.contains(&"ふつう".to_string()),
+            "ふつうの呼び出しまで消えた"
+        );
+        assert_eq!(got.len(), 2, "余分に拾っている: {got:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **辞書に「行継続の焼き付き」が残っていないこと。**
+    ///
+    /// 値の中に「改行 + 3 個以上の空白」があるのは、ソースの字下げが本文へ
+    /// 混ざった跡。表示が崩れるうえ、ja の値は逆引きキーでもあるので
+    /// 実行時の文字列と食い違う。CLI の使い方 (`zai coedit --help` 等) だけは
+    /// 字下げが本物なので、**ja が持っているものは訳も持ってよい**。
+    #[test]
+    fn 辞書に行継続の焼き付きが残っていない() {
+        let ja: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(BUILTIN[1].2).expect("ja が読める");
+        let ok: std::collections::BTreeSet<&String> = ja
+            .iter()
+            .filter(|(_, v)| has_indent_run(v))
+            .map(|(k, _)| k)
+            .collect();
+        let mut bad: Vec<String> = Vec::new();
+        for (id, _, raw) in BUILTIN {
+            let d: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(raw).expect("読める");
+            for (k, v) in &d {
+                if has_indent_run(v) && !ok.contains(k) {
+                    bad.push(format!("{id}: {k}"));
+                }
+            }
+        }
+        bad.sort();
+        bad.truncate(20);
+        assert!(
+            bad.is_empty(),
+            "行継続の字下げが本文へ焼き付いている:\n{}",
+            bad.join("\n")
+        );
+        // 空振り検知: 本物の字下げ (CLI の使い方) は残っている
+        assert!(!ok.is_empty(), "検査が何も見ていない");
+    }
+
+    /// 値に「改行 + 3 個以上の空白」があるか。
+    fn has_indent_run(v: &str) -> bool {
+        let b: Vec<char> = v.chars().collect();
+        b.windows(4)
+            .any(|w| w[0] == '\n' && w[1..].iter().all(|c| *c == ' ' || *c == '\t'))
     }
 
     #[test]

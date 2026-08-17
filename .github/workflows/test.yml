@@ -568,3 +568,71 @@ jobs:
             echo ""
             echo "clippy の -A を 1 行消すごとに債務が 1 種類返済される (.github/workflows/test.yml)。"
           } >> "$GITHUB_STEP_SUMMARY"
+  # スマホ画面 (assets/remote/) を **本物のブラウザで描いて**検査する。
+  #
+  # ■ なぜ要るのか
+  #   0.18 系で「端末と一覧が同時に見える」が出荷まで生き残った。原因は
+  #   CSS の詳細度 (`#alist.mid` が `#alist{display:none}` に勝っていた) で、
+  #   Rust のテストは 1 本も落ちていない — **誰も CSS を評価していなかった**。
+  #   経緯と層の地図は docs/preflight.md。
+  #
+  # ■ 安い
+  #   Rust を 1 行もコンパイルしない (assets/remote/ は読むだけ)。
+  #   ubuntu ランナーには Chrome も Node も最初から入っており、
+  #   npm パッケージは 1 つも要らない (WebSocket も自前)。
+  #
+  # ■ `[skip]` を緑にしない
+  #   remote-check.sh は node / ブラウザが無いと **rc=0 のまま降りる**。
+  #   手元ではそれが正しいが、CI で通すと**何も描かないジョブが永久に緑**に
+  #   なる。ここは揃っている前提なので、降りたら赤にする。
+  remote-screen:
+    # fast / pty / msrv / installers / lint / gui-smoke と**同じ判定**にすること。
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !(github.event.pull_request.head.ref == 'main' ||
+        startsWith(github.event.pull_request.head.ref, 'night/'))
+    name: mobile screen (chrome)
+    runs-on: ubuntu-latest
+    # **最後の砦**。ここに来る前に、道具が自分で理由を書いて赤で終わること
+    # (ZV_DEADLINE_MS 10 分 < ZV_WALL_S 11 分 < ここ 15 分)。この順序を
+    # 崩すと「無音のまま打ち切り」に戻り、原因が 1 行も残らない。
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 使う道具の版を出す (降りた理由を後から辿れるように)
+        run: |
+          node --version
+          (google-chrome --version || chromium --version || echo 'ブラウザが見つかりません')
+          # コンテナだと 64MB しか無いことがある (Chrome が固まる定番)。
+          df -h /dev/shm || true
+          nproc || true
+
+      # わざと壊して赤になることまで確かめる (--self-test)。
+      # 素通りする検査を CI に置かない。
+      #
+      # **出力を変数へ溜めない。** 以前は out=$(...) で溜めていたので、
+      # 固まると 15 分間 1 バイトも出ないまま打ち切られ、どこで止まったのか
+      # 1 行も残らなかった。tee で素通ししながら控えを取る。
+      - name: スマホ画面を描いて不変条件を確かめる
+        env:
+          # ジョブの timeout より必ず短くする。**道具のほうが先に**
+          # 「なぜ終わらないか」を書いて赤で終わるのが要点。
+          ZV_DEADLINE_MS: '600000'
+          ZV_STALL_MS: '120000'
+          ZV_WALL_S: '660'
+          ZV_HEARTBEAT_MS: '20000'
+        run: |
+          set -o pipefail
+          log=$(mktemp)
+          rc=0
+          sh tools/remote-check.sh --self-test 2>&1 | tee "$log" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::スマホ画面の検査が赤 (rc=$rc)"
+            exit "$rc"
+          fi
+          if grep -q '\[skip\]' "$log"; then
+            echo "::error::スマホ画面を 1 度も描かずに降りた (このジョブでは skip は不合格)"
+            exit 1
+          fi
