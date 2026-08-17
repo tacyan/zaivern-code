@@ -13,6 +13,7 @@
 use std::hash::Hasher;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -319,6 +320,16 @@ pub enum Query {
     /// スマホから押すと**誰も押せないダイアログが PC に出たまま**になる。
     /// リモートから届くのは「Esc で止める」までに留める。
     BulkStop { mode: BulkMode },
+    /// スマホから届いた添付 (画像など) を作業フォルダの下へ保存する。
+    ///
+    /// CLI エージェントは画像を**パスで**受け取るので、「スマホから送る」の
+    /// 実体は (a) PC 側へ保存 (b) その `@パス` を入力欄へ入れる、の 2 段になる。
+    /// ここは (a) だけを担い、(b) は既存の [`Query::Bulk`] (submit=false) へ
+    /// そのまま流す — 宛先の選び方を作り直さないため。
+    ///
+    /// `data` は base64 (data: URI の本体部分)。復号後の大きさが
+    /// [`UPLOAD_MAX_BYTES`] を超えたら**黙って切らずに断る**。
+    Upload { name: String, data: String },
 
     // ─── ここから下はスマホの「PC と同じことができる」ための読み取り ───
     //
@@ -816,7 +827,15 @@ fn handle_conn(
             hdr_token = v.to_string();
         }
     }
-    if content_len > 2 * 1024 * 1024 {
+    // 通常の要求は [`BODY_MAX_BYTES`] まで。**添付だけ**は base64 のぶんを
+    // 広げる (`/api/upload`)。認証はこの先で済ませてからボディを読むので、
+    // 上限を広げても未認証の相手に大きなバッファリングを強制されはしない。
+    let body_cap = if path == "/api/upload" {
+        UPLOAD_BODY_MAX_BYTES
+    } else {
+        BODY_MAX_BYTES
+    };
+    if content_len > body_cap {
         return respond(&mut stream, 413, "text/plain", b"body too large");
     }
 
@@ -1106,6 +1125,12 @@ fn handle_conn(
                 }
             }
         }
+        // 添付 (画像など)。保存するだけで、どこへ届けるかは決めない
+        // (宛先は続けて呼ばれる /api/bulk が既存の仕組みで決める)。
+        ("POST", "/api/upload") => Query::Upload {
+            name: s("name"),
+            data: s("data"),
+        },
         ("POST", "/api/voice") => Query::VoiceSend {
             text: s("text"),
             id: json.get("id").and_then(|v| v.as_i64()).unwrap_or(-1),
@@ -1336,6 +1361,137 @@ pub fn safe_rel(raw: &str) -> Option<String> {
         }
     }
     (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  添付 (スマホ → PC) — 置き場と綴りの決め方
+//
+//  CLI エージェントは画像を**パスで**受け取る。だからスマホの「送る」は
+//  「PC 側の作業フォルダの下へ保存して、その `@パス` を入力欄へ入れる」に
+//  なる。ここに置くのは **綴りを決める純関数**だけで、実際に書くのは
+//  `app::remote_api::remote_reply_upload` (置き場は `agent_cwd()` から導出、
+//  直書きのパスはどこにも無い)。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 通常の API ボディの上限。
+const BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 添付 1 件の上限 (**復号後**のバイト数)。超えたら黙って切らずに断る。
+pub const UPLOAD_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+/// 添付を運ぶ POST ボディの上限。base64 は 4/3 に膨らむので、そのぶんと
+/// JSON の外枠 (キー名・ファイル名・引用符) の余白を足す。
+const UPLOAD_BODY_MAX_BYTES: usize = UPLOAD_MAX_BYTES / 3 * 4 + 8 * 1024;
+
+/// 添付の置き場 (作業フォルダからの相対)。`Path::join` は Windows でも
+/// `/` を区切りとして受けるので、綴りは 1 つで足りる。
+pub const UPLOAD_DIR: &str = ".zaivern/uploads";
+
+/// ファイル名として許す文字数の上限 (拡張子込み)。
+const UPLOAD_NAME_MAX: usize = 64;
+
+/// 同名があったときに試す番号の上限 (`a-1.png` … `a-99.png`)。
+pub const UPLOAD_UNIQUE_TRIES: usize = 100;
+
+/// 幹が 1 文字も残らなかったときの名前。捨てるより、番号で避けられる
+/// 綴りを 1 つ持っているほうがよい (「送ったのに何も起きない」を作らない)。
+const UPLOAD_FALLBACK_STEM: &str = "file";
+
+/// 名前の 1 要素を安全な綴りへ畳む。**英数字 (どの文字体系でも) と `_-`
+/// だけを残し**、他は `_` へ寄せて連続は 1 つに畳む。
+///
+/// 空白を落とすのは `@パス` が**シェルクオートを通らない**ため
+/// (`terminal.rs` のクリップボード画像と同じ理由)。逆に非 ASCII の文字は
+/// 落とさない — 分断の原因は空白であって文字体系ではないので、
+/// `写真.png` を `file.png` にしてしまうほうが利用者には損になる。
+fn fold_name_part(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() || matches!(c, '_' | '-') {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// 届いたファイル名を、**1 個の安全な要素**へ畳む (**純関数**)。
+///
+/// * ディレクトリ部分は捨てる (`a/b/c.png` → `c.png`、`C:\x\y.png` → `y.png`)
+/// * 幹と拡張子を分けてから畳む (拡張子を失わない)
+/// * 空白・引用符・制御文字・NUL は `_` へ寄せる ([`fold_name_part`])
+/// * 隠しファイルにならない (先頭の `.` は落ちる)
+/// * Windows の予約デバイス名は先頭に `_` を足して避ける
+/// * [`UPLOAD_NAME_MAX`] を超えたら**拡張子を残して**幹を詰める
+///
+/// `.` / `..` のような「点だけ」と空はお断り (`None`)。
+pub fn upload_file_name(raw: &str) -> Option<String> {
+    // 区切りはどちらの綴りでも切る (Windows の名前が unix へ届く)
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    if last.is_empty() || last.chars().all(|c| c == '.') {
+        return None;
+    }
+    // 先に幹と拡張子へ分ける。**畳んでから分けると拡張子が消える**
+    // (`写真.png` の `写真` が空になり、残った `.png` を隠しファイル対策で
+    //  削って `png` という名前ができてしまう)。
+    let body = last.trim_start_matches('.');
+    let (raw_stem, raw_ext) = match body.rfind('.') {
+        Some(i) if i > 0 => (&body[..i], &body[i + 1..]),
+        _ => (body, ""),
+    };
+    let mut stem = fold_name_part(raw_stem);
+    if stem.is_empty() {
+        stem = UPLOAD_FALLBACK_STEM.to_string();
+    }
+    let ext = fold_name_part(raw_ext);
+    // 拡張子だけで上限を食い尽くす綴りもあるので、幹には必ず 1 文字残す
+    let ext: String = ext.chars().take(UPLOAD_NAME_MAX / 2).collect();
+    let ext = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    let keep = UPLOAD_NAME_MAX.saturating_sub(ext.chars().count()).max(1);
+    let stem: String = stem.chars().take(keep).collect();
+    // Windows の予約デバイス名 (CON / PRN / AUX / NUL / COM1..9 / LPT1..9)。
+    // 拡張子が付いていても予約なので、幹だけを見て判定する。
+    let up = stem.to_ascii_uppercase();
+    let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((up.starts_with("COM") || up.starts_with("LPT"))
+            && up.len() == 4
+            && up.as_bytes()[3].is_ascii_digit()
+            && up.as_bytes()[3] != b'0');
+    Some(if reserved {
+        format!("_{stem}{ext}")
+    } else {
+        format!("{stem}{ext}")
+    })
+}
+
+/// n 個目の候補の綴り (**純関数**)。`0` はそのまま、以降は幹に `-n` を足す。
+/// 拡張子は必ず末尾に残す (`a.png` → `a-1.png`)。
+pub fn nth_name(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    match name.rfind('.') {
+        Some(i) if i > 0 => format!("{}-{n}{}", &name[..i], &name[i..]),
+        _ => format!("{name}-{n}"),
+    }
+}
+
+/// 添付の保存先を決める (**実体を触らない純関数**)。
+///
+/// 返すのは必ず `root/`[`UPLOAD_DIR`]`/<畳んだ名前>`。字句で `..` を畳んだ
+/// あとに `root` の下から出ていないことまで見るので、**どんな名前が来ても
+/// ワークスペースの外は指さない**。畳めない名前は `None`。
+pub fn upload_path(root: &Path, raw_name: &str) -> Option<PathBuf> {
+    let name = upload_file_name(raw_name)?;
+    let lex_root = crate::pathx::lexical(root);
+    let p = crate::pathx::lexical(&lex_root.join(UPLOAD_DIR).join(&name));
+    // 念のための二重の網 (`upload_file_name` が将来ゆるんでも外へ出さない)
+    (p.starts_with(&lex_root) && p != lex_root).then_some(p)
 }
 
 /// 件数の指定を「無指定なら既定・範囲外なら丸める」で受ける (**純関数**)。
@@ -2405,6 +2561,167 @@ mod tests {
         }
     }
 
+    /// **待ちのバッジと待ちの一覧は、同じ応答から作る。**
+    ///
+    /// 判定 ([`is_waiting_lane`]) は PC 側の 1 本で同じでも、バッジが
+    /// `/api/state` (2.5 秒)・一覧が `/api/agents` (1.5 秒) と**別の応答**から
+    /// 来ていたので、取得の時点が違うだけで食い違った。しかも `/api/agents`
+    /// が落ちたときだけ一覧が更新されないため、「⏳ 待ち ②」と出ているのに
+    /// 「待っているエージェントはいません」が**残り続けた** (利用者からの報告)。
+    ///
+    /// 実測 (Node で `70-boards.js` をそのまま回した決定的ハーネス、
+    /// 4 台本 10 検査): 修正前は **6 件**で食い違いを観測 —
+    /// 8 周ぶん取得に失敗した局面でバッジ 2 / 一覧「いません」、
+    /// `/api/state` が先に届いた瞬間にバッジ 1 / 一覧「いません」、
+    /// 応答が返ってこない局面ではポーリングのタイマーが **0 本**になって
+    /// 一覧が永久に凍った。修正後は 10 件すべて成立。
+    #[test]
+    fn 待ち件数と待ち一覧は同じ応答から作る() {
+        let page = PAGE.replace("\r\n", "\n");
+        // バッジは**一覧そのもの**を数える (一覧が画面にある間)
+        assert!(
+            page.contains("if (alistOk === true) return alist.filter(a => a.waiting).length;"),
+            "バッジが一覧と別の応答から来ている"
+        );
+        // 読めていないときは数字を出さない (0 とも言わない)
+        assert!(
+            page.contains("if (alistOk === false) return null;"),
+            "読めていないときに件数を騙っている"
+        );
+        // 一覧が画面に無いビューだけ /api/state を使う
+        assert!(
+            page.contains("return (state && state.waiting) || 0;"),
+            "端末・承認キューでの件数の出どころが無い"
+        );
+        // 一覧を取り直したらバッジも作り直す (件数だけ先に進まない)
+        assert!(
+            page.contains("if (waitCount() !== was) renderSeg();"),
+            "一覧を取り直してもバッジを作り直していない"
+        );
+        // 元の「バッジは常に /api/state」へ戻していないこと
+        assert!(
+            !page.contains("function waitCount() { return (state && state.waiting) || 0; }"),
+            "バッジが /api/state 固定へ戻っている"
+        );
+    }
+
+    /// **「読めていない」と「0 件」を混ぜない。**
+    ///
+    /// `/api/agents` が落ちた・返ってこないだけで
+    /// 「待っているエージェントはいません」と言い切ると、その嘘が次に
+    /// 読めるまで画面に残る。承認キューの `apprApi === false` と同じ扱いにする。
+    #[test]
+    fn 一覧が読めないときは0件と言わない() {
+        let page = PAGE.replace("\r\n", "\n");
+        // 三値 (まだ読んでいない / 読めた / 読めなかった) を持っていること
+        for line in [
+            "let alistOk = null, alistMiss = 0;",
+            "const LIST_MISS_MAX = 2;",
+            "if (alistOk !== true) { el.classList.add('mid'); el.appendChild(unreadCard()); return; }",
+            "else if (++alistMiss >= LIST_MISS_MAX) alistOk = false;",
+        ] {
+            assert!(page.contains(line), "一覧の読めぐあいの管理に {line} が無い");
+        }
+        // 成否によらず描き直す (読めたときだけ描き直すと古い空カードが残る)
+        assert!(
+            !page.contains(
+                "if (r.ok) { alist = r.agents || []; alanes = r.lanes || []; renderList(); }"
+            ),
+            "読めたときしか一覧を描き直していない"
+        );
+        // 返ってこない取得でポーリングごと死なないこと。fetch には時間制限が
+        // 無いので、締め切りを付けないと次の周回が始まらない
+        assert!(
+            page.contains("withDeadline(api('/api/agents')"),
+            "一覧の取得に締め切りが無い (無応答でポーリングが止まる)"
+        );
+        // 文言は辞書を通す
+        for id in ["remote.list_unreadable", "remote.list_loading"] {
+            assert!(page.contains(id), "{id} がページに無い");
+        }
+    }
+
+    /// **遡りの応答は「取ったときの前提」が変わっていたら捨てる。**
+    ///
+    /// `assets/remote/js/45-term.js` の `prependOlder()` は `await` を挟むが、
+    /// `loading` フラグは**遡り同士**しか守らない。await の間に追従
+    /// (`pollSb` → `applyTail`) が走ると `buf` の絶対行対応が動く —
+    /// 先頭が `MAX_ROWS` で間引かれる / `buf` ごと作り直される /
+    /// エージェントが切り替わる。そのまま繋ぐと `bufFrom` がずれたまま残り、
+    /// 次の追従が `from + i - bufFrom` で別の場所へ書き込んで
+    /// **同じ行を 2 度描く**。
+    ///
+    /// 実測 (Node で `45-term.js` をそのまま回した決定的ハーネス):
+    /// 遡りを飛ばしたまま追従を 2 回まわして先頭を 60 行間引かせると、
+    /// 直後に 60 行の穴が空き、次の追従で **60 行が二重**に出た。
+    /// 前提 (`epoch`) を応答に持たせて捨てると 0 行になる。
+    ///
+    /// ここで見張るのは 2 つ:
+    /// 1. 遡りが**取得前の `bufFrom` と `epoch` を控え**、戻って変わっていたら捨てる
+    /// 2. `bufFrom` を動かす行のそばに必ず `epoch++` がある
+    ///    (1 つでも忘れると、その経路だけ静かに二重描画へ戻る)
+    #[test]
+    fn 遡りの応答は前提が変わっていたら捨てる() {
+        let page = PAGE.replace("\r\n", "\n");
+        for line in [
+            // 取得の前に前提を控える
+            "const at = bufFrom, era = epoch;",
+            "const j = await fetchSb(CHUNK, at);",
+            // 戻ってきて前提が変わっていたら、この 1 回を捨てる
+            "if (era !== epoch) return;",
+            // 継ぎ足しの計算も**控えた値**で行う (await をまたいだ再読みをしない)
+            "if (!rows.length || from >= at) {",
+            "const head = rows.slice(0, Math.min(rows.length, at - from));",
+        ] {
+            assert!(page.contains(line), "遡りの前提検査に {line} が無い");
+        }
+        // 捨てた取得で `loading` を握りっぱなしにしない (握ったら二度と遡れない)。
+        // 「前提が変わったら立てない」と対で見る — 別の buf の話なら
+        // 「これより前は無い」ではないので `noTop` を立ててはいけない
+        assert!(
+            page.contains(concat!(
+                "        else if (e && e.none && era === epoch) noTop = true;\n",
+                "      } finally {\n",
+                "        loading = false;\n",
+                "      }\n"
+            )),
+            "遡りの後始末が finally に無い (途中で捨てると loading が戻らない)"
+        );
+
+        // `bufFrom` を動かす行の近く (±2 行) には必ず `epoch++` がある。
+        // コメント行と宣言 (`let bufFrom = 0;`) は動かす側ではないので除く
+        let lines: Vec<&str> = page.lines().collect();
+        let moves: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim();
+                if t.starts_with("//") || t.starts_with("let ") || t.starts_with("*") {
+                    return false;
+                }
+                t.contains("bufFrom++")
+                    || t.contains("bufFrom +=")
+                    || (t.contains("bufFrom =") && !t.contains("bufFrom =="))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // 検査が空回りしていないこと (変数名を変えると 0 件で静かに緑になる)
+        assert!(
+            moves.len() >= 5,
+            "bufFrom を動かす行が {} 件しか見つからない — 検査が空回りしている",
+            moves.len()
+        );
+        for i in moves {
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(lines.len());
+            assert!(
+                lines[lo..hi].iter().any(|l| l.contains("epoch++")),
+                "bufFrom を動かしているのに近くに epoch++ が無い: {}",
+                lines[i].trim()
+            );
+        }
+    }
+
     /// **エージェントのチップは押した瞬間にその端末へ入る。**
     ///
     /// 応答 → `pollState` → 次のポーリングを待つ作りだと、履歴を遡って
@@ -2462,6 +2779,139 @@ mod tests {
         assert!(PAGE.contains("$('tput').disabled = n === 0;"));
         // 件数は PC が数えた値をそのまま出す (スマホ側で数え直さない)
         assert!(PAGE.contains("state.bulk"), "件数を PC 側から取っていない");
+    }
+
+    /// **UI から到達できること。** 添付ボタンが入力欄の左に生えていて、
+    /// 宛先は既存の仕組み (`bulkMode` + `/api/bulk`) にそのまま乗ること。
+    #[test]
+    fn 添付ボタンは入力欄の左にあり既存の宛先に乗る() {
+        assert!(PAGE.contains("/api/upload"), "添付の入口が無い");
+        // 入力欄 (#ti) の**左**へ差し込む。右や別の場所ではない
+        assert!(
+            PAGE.contains("ti.parentNode.insertBefore(btn, ti)"),
+            "添付ボタンを入力欄の左へ入れていない"
+        );
+        // 宛先は既存の仕組みへ合流させる。新しい宛先の概念を作らない
+        assert!(
+            PAGE.contains("api('/api/bulk', {text: r.text, mode: bulkMode, submit: false})"),
+            "添付の宛先を /api/bulk + bulkMode 以外で決めている"
+        );
+        // 指で押せる大きさ (44px 以上) を **#tup 自身の規則で**確保していること。
+        // ページのどこかに 44px があるだけでは足りない (別の要素の規則を
+        // 数えてしまい、添付ボタンが小さいまま緑になる)。
+        let rule = PAGE
+            .split("#tup {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .unwrap_or("");
+        assert!(
+            rule.contains("min-width:44px") && rule.contains("min-height:44px"),
+            "添付ボタンが指で押せる大きさになっていない: {rule:?}"
+        );
+        // 上限は PC 側が配る値を見る (スマホ側で数字を持たない)
+        assert!(
+            PAGE.contains("state.upload_max"),
+            "添付の上限をスマホ側に直書きしている"
+        );
+    }
+
+    /// **ワークスペースの外へ書けないこと。** どんな名前が来ても
+    /// 保存先は必ず `root/`[`UPLOAD_DIR`] の下に収まる。
+    #[test]
+    fn 添付はワークスペースの外へ書けない() {
+        // 名前を 1 個の安全な要素へ畳む
+        for (raw, want) in [
+            ("photo.png", Some("photo.png")),
+            ("a/b/c.png", Some("c.png")),
+            ("../../etc/passwd", Some("passwd")),
+            ("..\\..\\windows\\system32\\cmd.exe", Some("cmd.exe")),
+            ("C:\\Users\\x\\a.png", Some("a.png")),
+            ("/etc/passwd", Some("passwd")),
+            // 空白・引用符・改行は `_` へ (シェルクオートを通らないため)
+            ("my photo (1).png", Some("my_photo_1.png")),
+            ("a\"b'c.png", Some("a_b_c.png")),
+            ("a\nb.png", Some("a_b.png")),
+            // 非 ASCII は落とさない (分断の原因は空白であって文字体系ではない)
+            ("写真.png", Some("写真.png")),
+            // 畳んだ結果が空なら既定の幹。拡張子は必ず残る
+            ("　.png", Some("file.png")),
+            ("!!!.jpeg", Some("file.jpeg")),
+            // 拡張子まで畳む (`a.p g` の空白も落ちる)
+            ("a.p g", Some("a.p_g")),
+            // 隠しファイル・点だけ・NUL・空はお断り or 点を落とす
+            (".bashrc", Some("bashrc")),
+            ("..", None),
+            (".", None),
+            ("...", None),
+            ("", None),
+            ("/", None),
+            ("a\0b.png", Some("a_b.png")),
+            // Windows の予約デバイス名は先頭に `_` を足して避ける
+            ("CON", Some("_CON")),
+            ("nul.txt", Some("_nul.txt")),
+            ("com1.png", Some("_com1.png")),
+            ("com0.png", Some("com0.png")),
+            ("lpt9", Some("_lpt9")),
+        ] {
+            assert_eq!(
+                upload_file_name(raw).as_deref(),
+                want,
+                "upload_file_name({raw:?}) が契約と違う"
+            );
+        }
+        // 長い名前は拡張子を残して詰める (上限を必ず守る)
+        let long = format!("{}.png", "a".repeat(500));
+        let got = upload_file_name(&long).expect("畳めるはず");
+        assert!(
+            got.chars().count() <= UPLOAD_NAME_MAX,
+            "上限を超えた: {got}"
+        );
+        assert!(got.ends_with(".png"), "拡張子が消えた: {got}");
+
+        // 保存先は**どんな名前でも** root/UPLOAD_DIR の下
+        let root = Path::new("/ws/proj");
+        let want_dir = crate::pathx::lexical(&root.join(UPLOAD_DIR));
+        for raw in [
+            "photo.png",
+            "../../etc/passwd",
+            "..\\..\\x.png",
+            "/etc/passwd",
+            "C:\\Windows\\system32\\a.dll",
+            "a/../../../b.png",
+            ".bashrc",
+        ] {
+            let p = upload_path(root, raw).unwrap_or_else(|| panic!("{raw:?} が畳めない"));
+            assert_eq!(p.parent(), Some(want_dir.as_path()), "{raw:?} → {p:?}");
+            assert!(p.starts_with(root), "{raw:?} がワークスペースの外を指した");
+        }
+        // 畳めない名前は保存先も作らない
+        for raw in ["", "..", ".", "///"] {
+            assert!(upload_path(root, raw).is_none(), "{raw:?} を受けてしまった");
+        }
+    }
+
+    #[test]
+    fn 同名の添付は番号で避ける() {
+        for (name, n, want) in [
+            ("a.png", 0, "a.png"),
+            ("a.png", 1, "a-1.png"),
+            ("a.b.png", 3, "a.b-3.png"),
+            ("noext", 2, "noext-2"),
+        ] {
+            assert_eq!(nth_name(name, n), want, "nth_name({name:?}, {n})");
+        }
+    }
+
+    #[test]
+    fn 添付のボディ上限はbase64の膨らみを見込む() {
+        // 4/3 に膨らむので、上限ぴったりの添付が**必ず**通ること
+        assert!(
+            UPLOAD_BODY_MAX_BYTES >= UPLOAD_MAX_BYTES / 3 * 4,
+            "上限ぴったりの添付が 413 で落ちる"
+        );
+        // 通常の要求まで広げていないこと
+        assert_eq!(BODY_MAX_BYTES, 2 * 1024 * 1024);
+        assert!(UPLOAD_BODY_MAX_BYTES > BODY_MAX_BYTES);
     }
 
     #[test]
@@ -2579,6 +3029,74 @@ mod tests {
             // 再開のたびにガードを解除していること (一度きりで死なない)
             assert!(p.contains("voiceFatal = false"));
         }
+    }
+
+    /// 音声が使えないことの案内は**消せる**。
+    ///
+    /// http の LAN 越しではブラウザが構造的にマイクを渡さない
+    /// (`MediaDevices` も `SpeechRecognition` もセキュアコンテキスト限定) ので、
+    /// 案内は「一度読めば終わり」の情報でしかない。それが出っぱなしになると
+    /// **中身の無い帯が永久に高さを取る**。閉じられること・閉じたことを
+    /// 覚えること・閉じたら高さごと消えることを固定する。
+    #[test]
+    fn 音声の案内は閉じられて閉じたことを覚える() {
+        // 閉じるボタンがあること (トーストと違い自分では消えないため)
+        assert!(PAGE.contains("vnote-x"));
+        assert!(PAGE.contains("remote.vnote_dismiss"));
+        // 覚える先は localStorage。例外を投げる環境 (プライベートブラウズ) でも
+        // 画面を壊さないよう try で包んであること
+        assert!(PAGE.contains("VNOTE_OFF_KEY"));
+        assert!(PAGE.contains("localStorage.setItem(VNOTE_OFF_KEY"));
+        assert!(PAGE.contains("localStorage.getItem(VNOTE_OFF_KEY)"));
+        // 消しているなら showNote は帯を出さずに降りること
+        assert!(PAGE.contains("if (noteMuted()) { hideNote(); return; }"));
+        // 閉じたら .show を外す = #vnote は display:none に戻り高さを取らない
+        assert!(PAGE.contains("n.classList.remove('show')"));
+        assert!(PAGE.contains("#vnote {\n    display:none;"));
+        // 指で押せる大きさ (44px 以上)
+        assert!(
+            PAGE.contains("min-width:44px; min-height:44px;"),
+            "閉じるボタンが指で押せる大きさになっていない"
+        );
+    }
+
+    /// 消した案内を**戻せる**こと。戻す経路が無いと、一度消した利用者は
+    /// 「なぜ 🎤 が効かないのか」を二度と知れなくなる。
+    #[test]
+    fn 消した案内はマイクの長押しで戻せる() {
+        assert!(PAGE.contains("micChipOf"));
+        assert!(PAGE.contains("setNoteMuted(false)"));
+        // 🎤 を描くのは別ファイルなので、捕捉フェーズで拾うこと
+        // (onclick を直に代入しているため、バブルでは止められない)
+        assert!(PAGE.contains("document.addEventListener('pointerdown'"));
+        assert!(PAGE.contains("}, true);"));
+        // 長押しの後のクリックは「押した」ことにしない
+        assert!(PAGE.contains("ev.stopPropagation();"));
+        assert!(PAGE.contains("remote.vnote_restore_hint"));
+    }
+
+    /// スマホ画面の `T('…')` の ID は**全部**同梱辞書に載っていること。
+    ///
+    /// 載っていない ID は第 2 引数のフォールバック (日本語の原文) で描かれる
+    /// ので、**画面は壊れず、どのテストも赤くならないまま、その 1 行だけが
+    /// 全言語で永久に日本語のまま残る**。`zai i18n missing` は `src/**.rs` の
+    /// `tr()` しか走査しないので、JS 側はここでしか気付けない。
+    #[test]
+    fn スマホ画面のt呼び出しidは同梱辞書にある() {
+        let mut errs = Vec::new();
+        let ja = crate::locale::load_one(crate::locale::SOURCE_LANG, &[], &mut errs);
+        assert!(errs.is_empty(), "{errs:?}");
+        let mut absent: Vec<&str> = Vec::new();
+        for p in [PAGE, VOICE_PAGE] {
+            for k in t_call_keys(p) {
+                if k.starts_with("remote.") && !ja.contains_key(k) {
+                    absent.push(k);
+                }
+            }
+        }
+        absent.sort_unstable();
+        absent.dedup();
+        assert!(absent.is_empty(), "辞書に無い ID: {absent:?}");
     }
 
     // ─── 多言語化 (Language Pack) ───────────────────────────────────
@@ -2812,6 +3330,10 @@ mod tests {
             },
             Query::BulkStop {
                 mode: BulkMode::Stalled,
+            },
+            Query::Upload {
+                name: "photo.png".into(),
+                data: "AAAA".into(),
             },
             Query::Changes,
             Query::Diff {
@@ -3088,6 +3610,8 @@ mod tests {
                 // 一括操作は**何体へ届いたか**を返して誤爆を見せるので待つ
                 | Query::Bulk { .. }
                 | Query::BulkStop { .. }
+                // 添付は**保存した綴り**を返さないと `@パス` を組み立てられない
+                | Query::Upload { .. }
                 // 承認は「効いたか」が返らないと、押したのに止まったままか
                 // 分からない (press_pet_approve_button は失敗しうる)
                 | Query::AgentAct { .. }

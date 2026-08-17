@@ -30,9 +30,54 @@ function dictationHint(reason) {
     : reason === 'network'
     ? T('remote.speech_network', '音声認識サーバーに接続できませんでした（http 接続では利用できません）。')
     : T('remote.speech_insecure', 'この接続 (http) ではブラウザの音声認識が使えません。');
-  return why + how;
+  // 「直す道がある」ことまで書く。ブラウザがマイクを渡さないのは端末や
+  // ブラウザの都合ではなく**オリジンが http だから**である:
+  //   MediaDevices も SpeechRecognition も IDL が [SecureContext] なので、
+  //   http://<LAN の IP>:<port>/ では存在すらしない (= MediaRecorder で録って
+  //   PC へ送る逃げ道も無い)。https のオリジンにすれば isSecureContext が真に
+  //   なり、このページのまま連続認識が動く。
+  const fix = reason === 'unsupported'
+    ? ''
+    : T('remote.speech_https_hint',
+        'https で開けば、スマホでもこのページのまま音声認識が使えます'
+        + '（例: tailscale serve で TLS を付ける）。');
+  return why + how + fix;
 }
-function showNote(m) { const n = $('vnote'); n.textContent = m; n.classList.add('show'); }
+// 案内を消したことを覚える鍵。消したら二度と出さない (🎤 の長押しで戻す)。
+// localStorage はプライベートブラウズで例外を投げることがあるので必ず包む。
+const VNOTE_OFF_KEY = 'zv_vnote_off';
+function noteMuted() {
+  try { return localStorage.getItem(VNOTE_OFF_KEY) === '1'; } catch (e) { return false; }
+}
+function setNoteMuted(on) {
+  try { localStorage.setItem(VNOTE_OFF_KEY, on ? '1' : '0'); } catch (e) {}
+}
+// 案内は消せる。消したら見出しごと消えて高さを 1px も取らない
+// (中身の無い帯を残さない)。閉じるボタンは指で押せる大きさ (CSS で 44px)。
+function showNote(m) {
+  const n = $('vnote');
+  if (noteMuted()) { hideNote(); return; }
+  n.textContent = '';
+  const msg = document.createElement('div');
+  msg.className = 'vnote-msg';
+  msg.textContent = m;
+  const x = document.createElement('button');
+  x.type = 'button';
+  x.className = 'vnote-x';
+  x.textContent = T('remote.vnote_dismiss', '✕ 閉じる');
+  const back = T('remote.vnote_restore_hint', '\u{1F3A4} を長押しすると、この案内をまた出せます');
+  x.title = back;
+  x.setAttribute('aria-label', back);
+  x.onclick = ev => {
+    ev.stopPropagation();
+    setNoteMuted(true);
+    hideNote();
+    toast(T('remote.vnote_dismissed', '案内を消しました — \u{1F3A4} の長押しで戻せます'));
+  };
+  n.appendChild(msg);
+  n.appendChild(x);
+  n.classList.add('show');
+}
 function hideNote() { const n = $('vnote'); n.textContent = ''; n.classList.remove('show'); }
 // 認識が使えないときの代替: 入力欄にフォーカスしてキーボード音声入力へ誘導する。
 // 自動送信はしないので、話した内容は入力欄に残ったままになる。
@@ -125,4 +170,41 @@ function startVoice(i) {
   toast(T('remote.voice_mode_on', '\u{1F3A4} 音声入力モード ON → {agent} (自動送信はしません)')
     .replace('{agent}', a ? a.title : ''));
 }
+// ─── 消した案内を戻す (🎤 の長押し) ───
+// 🎤 のボタンを描いているのは別のファイルなので、こちらからは document 側で
+// **捕捉フェーズ**に拾う (60-bulk.js が onclick を直に代入しているため、
+// 長押しの後に続くクリックはここで止めないと「押した」ことになってしまう)。
+let micHoldTimer = 0, micHoldFired = false, micHoldX = 0, micHoldY = 0;
+function micChipOf(t) { return t && t.closest ? t.closest('.chip.mic') : null; }
+function cancelMicHold() { clearTimeout(micHoldTimer); micHoldTimer = 0; }
+document.addEventListener('pointerdown', ev => {
+  if (!micChipOf(ev.target)) return;
+  micHoldFired = false;
+  micHoldX = ev.clientX; micHoldY = ev.clientY;
+  cancelMicHold();
+  micHoldTimer = setTimeout(() => {
+    micHoldFired = true;
+    setNoteMuted(false);
+    if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) {} }
+    const reason = speechBlockReason();
+    if (reason) showNote(dictationHint(reason));
+    else toast(T('remote.voice_available',
+      'この接続では音声認識が使えます — \u{1F3A4} を押してください'));
+  }, 600);
+}, true);
+document.addEventListener('pointermove', ev => {
+  if (!micHoldTimer) return;
+  // 指がずれたらスクロールなので長押しにしない
+  if (Math.abs(ev.clientX - micHoldX) > 10 || Math.abs(ev.clientY - micHoldY) > 10) cancelMicHold();
+}, true);
+['pointerup', 'pointercancel', 'scroll'].forEach(e =>
+  document.addEventListener(e, cancelMicHold, true));
+document.addEventListener('click', ev => {
+  if (!micHoldFired) return;
+  micHoldFired = false;
+  if (!micChipOf(ev.target)) return;
+  ev.stopPropagation();
+  ev.preventDefault();
+}, true);
+
 // ─── 一括操作 (宛先の粒度) ───

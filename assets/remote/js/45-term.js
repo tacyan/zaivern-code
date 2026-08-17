@@ -56,6 +56,12 @@
     let sbOff = false;   // /api/scrollback が無いサーバ
     let loading = false; // 上への継ぎ足し中
     let noTop = false;   // これ以上前は無い
+    // 「いま読んでいる行が絶対何行目か」の対応 (`bufFrom` と buf の並び) を
+    // 作り直した回数。**取得の前提**であり、await から戻ったときにこれが
+    // 変わっていたら、その応答はもう今の buf に繋がらない。
+    // 追い付き (applyTail の末尾追記) は対応を動かさないので数えない —
+    // 数えると出力が流れている端末では遡りが永久に成立しなくなる
+    let epoch = 0;
     let curAgent = -2;   // 表示中のエージェント (変わったら作り直す)
     let findOn = false, findQ = '', findTimer = null;
     // 一致はいまの buf 内の添字で持つが、**いま選んでいる 1 件だけは絶対行で覚える**。
@@ -222,7 +228,7 @@
     // 組み替えると、アイドルのはずの画面が毎秒仕事をする)
     function showEmpty() {
       if (!buf.length && SCR.classList.contains('zvmid')) return;
-      buf = []; bufFrom = 0; total = 0; plainSig = '';
+      buf = []; bufFrom = 0; total = 0; plainSig = ''; epoch++;
       hits = []; byRow = new Map(); cur = 0; curAbs = null;
       syncCount();
       clearBox();
@@ -466,7 +472,7 @@
     function applyTail(from, rows) {
       const rs = rows.map(norm);
       if (!buf.length || from > bufFrom + buf.length || from < bufFrom) {
-        bufFrom = from; buf = rs; noTop = false;
+        bufFrom = from; buf = rs; noTop = false; epoch++;
         fullRender();
         return true;
       }
@@ -483,6 +489,7 @@
           SCR.appendChild(mkRow(rs[i], null));
         }
       }
+      if (buf.length > MAX_ROWS) epoch++;   // 前を捨てる = 絶対行の対応が動く
       while (buf.length > MAX_ROWS) {
         buf.shift(); bufFrom++; changed = true;
         if (SCR.firstChild) SCR.removeChild(SCR.firstChild);
@@ -496,23 +503,35 @@
         return;
       }
       loading = true;
+      // **取ったときの前提を応答に持たせる。** `loading` は遡り同士しか守らない
+      // ので、await の間に追従 (`pollSb` → `applyTail`) が走りうる:
+      //   * 先頭が MAX_ROWS で間引かれる → `bufFrom` が増える
+      //   * 追い付けない量が出た / セッションが消えた → `buf` ごと作り直す
+      //   * 別のエージェントへ切り替わる (`syncAgent`)
+      // どれが起きても `from` はもう今の buf に繋がらない。それでも繋ぐと
+      // 絶対行が **ずれたまま** 残り、次の追従が `from + i - bufFrom` で
+      // 別の場所へ書き込んで **同じ行を 2 度描く** (実測 60 行)。
+      // 前提が変わっていたら **この 1 回の取得を捨てる** — `noTop` は立てない
+      // ので、次に上端へ触れば取り直せる (利用者から見た損失は 1 往復)。
+      const at = bufFrom, era = epoch;
       try {
-        const j = await fetchSb(CHUNK, bufFrom);
+        const j = await fetchSb(CHUNK, at);
+        if (era !== epoch) return;   // 前提が変わった — この応答は捨てる
         const from = j.from | 0;
         const rows = (j.rows || []).map(norm);
         if (typeof j.total === 'number') total = j.total;
-        if (!rows.length || from >= bufFrom) {
+        if (!rows.length || from >= at) {
           noTop = true;
           toast(T('remote.term_top_reached', 'これより前の記録はありません'));
         } else {
-          const head = rows.slice(0, Math.min(rows.length, bufFrom - from));
+          const head = rows.slice(0, Math.min(rows.length, at - from));
           // 読んでいた行が飛ばないように、増えたぶんだけ scrollTop をずらす
           const h0 = SCR.scrollHeight, t0 = SCR.scrollTop;
           const f = document.createDocumentFragment();
           for (let i = 0; i < head.length; i++) f.appendChild(mkRow(head[i], null));
           SCR.insertBefore(f, SCR.firstChild);
           buf = head.concat(buf);
-          bufFrom = from;
+          bufFrom = from; epoch++;
           SCR.scrollTop = t0 + (SCR.scrollHeight - h0);
           if (bufFrom <= 0) noTop = true;
           refreshHits(new Map());
@@ -520,9 +539,12 @@
         }
       } catch (e) {
         if (e && e.gone) sbOff = true;
-        else if (e && e.none) noTop = true;   // 今は返せない — 上端を叩き続けない
+        // 今は返せない — 上端を叩き続けない。ただし前提が変わっているなら
+        // それは「前が無い」ではなく「別の buf の話」なので立てない
+        else if (e && e.none && era === epoch) noTop = true;
+      } finally {
+        loading = false;
       }
-      loading = false;
     }
     async function pollSb() {
       let j;
@@ -550,7 +572,7 @@
       plainSig = text;
       const lines = text.split('\n');
       buf = lines.map(t => norm({ spans: [{ t: t }] }));
-      bufFrom = 0; total = buf.length; noTop = true;
+      bufFrom = 0; total = buf.length; noTop = true; epoch++;
       computeHits();
       fullRender();
       if (follow) scrollBottom();
@@ -562,7 +584,7 @@
       const a = agentIdx();
       if (a === curAgent) return;
       curAgent = a;
-      buf = []; bufFrom = 0; total = 0; plainSig = '';
+      buf = []; bufFrom = 0; total = 0; plainSig = ''; epoch++;
       noTop = false; follow = true;
       hits = []; byRow = new Map(); cur = 0; curAbs = null;
       clearBox();

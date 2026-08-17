@@ -155,3 +155,23 @@
   }
   #toast.show { opacity:1; }
   .empty { color:#8b949e; text-align:center; padding:40px 20px; font-size:13px; }
+  /* 音声の案内は「消せる」。#vnote は既定 display:none なので、消したら
+     見出しごと消えて高さを 1px も取らない (中身の無い帯を残さない)。
+     下の .show は上の block 版と同じ詳細度で後に来るので flex が採られる。 */
+  #vnote.show { display:flex; align-items:flex-start; gap:8px; }
+  .vnote-msg { flex:1; min-width:0; }
+  .vnote-x {
+    flex:none; min-width:44px; min-height:44px; padding:0 12px;
+    background:#4a3a1a; color:#f2dfb4; border:1px solid #d29922; border-radius:8px;
+    font-size:12px; font-weight:600; line-height:1.2; white-space:nowrap;
+  }
+  .vnote-x:active { background:#6a5323; }
+  /* 📎 添付 — 入力欄 (#ti) の左。指で押せる 44px 以上を必ず確保する
+     (絵文字 1 文字だと .btn の padding だけでは 44px に届かない)。
+     ファイル選択の input は見せない — 押すのは #tup のほうだけ。 */
+  #tup {
+    flex:none; min-width:44px; min-height:44px; padding:0 10px;
+    font-size:19px; line-height:1; text-align:center;
+  }
+  #tup:active { background:#1f3a5f; }
+  #tupf { display:none; }

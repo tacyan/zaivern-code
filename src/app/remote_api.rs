@@ -53,6 +53,9 @@ impl ZaivernApp {
                 self.remote_reply_bulk(text, *mode, *submit)
             }
             remote::Query::BulkStop { mode } => self.remote_reply_bulk_stop(*mode),
+            // 添付 (画像など) を作業フォルダの下へ保存する。届け先は決めない
+            // — 続けて呼ばれる `/api/bulk` が既存の仕組みで宛先を決める
+            remote::Query::Upload { name, data } => self.remote_reply_upload(name, data),
             remote::Query::Cmd(name, arg) => self.remote_reply_cmd(name, *arg, ctx),
             // ─── スマホを PC と同じ土俵に載せる読み取り ───
             // git と横断検索は**必ず裏のスレッド**。ここでは控えを見るだけ
@@ -143,6 +146,9 @@ impl ZaivernApp {
                 "stalled": remote::bulk_targets(remote::BulkMode::Stalled, &picks).len(),
                 "one": remote::bulk_targets(remote::BulkMode::One, &picks).len(),
             },
+            // 添付 1 件の上限。**スマホ側に数字を持たせない** — 2 か所に
+            // 置くと「送れると出ているのに 413 で落ちる」がいずれ起きる
+            "upload_max": remote::UPLOAD_MAX_BYTES,
             // 音声入力ページ (スマホ) が参照する設定
             "voice": {"kw": self.cfg.voice_keyword, "lang": self.cfg.voice_lang},
         })
@@ -701,6 +707,135 @@ impl ZaivernApp {
             );
         }
         json!({"ok": true, "sent": sent, "mode": mode.as_str()}).to_string()
+    }
+
+    /// remote_reply: Upload — スマホから届いた添付を**作業フォルダの下へ**保存する。
+    ///
+    /// CLI エージェントは画像をパスで受け取るので、「スマホから送る」は
+    /// (a) ここで保存 → (b) `@パス` を入力欄へ入れる、の 2 段になる。
+    /// (b) は既存の [`Self::remote_reply_bulk`] (`submit=false`) がそのまま
+    /// 担う — **宛先の決め方も届け方もここでは作り直さない**。
+    ///
+    /// 置き場は [`Self::agent_cwd`] (= これからエージェントを起こす作業
+    /// フォルダ) の下の [`remote::UPLOAD_DIR`]。パスを直書きしないので、
+    /// どの OS でも・どのワークスペースでも同じ場所に落ちる。
+    ///
+    /// 安全のためにやっていること:
+    /// * 名前は [`remote::upload_path`] で 1 要素へ畳む (`..` もドライブも通らない)
+    /// * 畳んだ**あとに実体でも**作業フォルダ配下であることを確かめる
+    ///   (シンボリックリンクで外へ抜けるのを塞ぐ)
+    /// * 上限 ([`remote::UPLOAD_MAX_BYTES`]) を超えたら**黙って切らずに断る**
+    /// * 既にある名前は上書きせず `-1`, `-2`… と番号で避ける
+    pub(super) fn remote_reply_upload(&mut self, name: &str, data: &str) -> String {
+        use base64::Engine as _;
+        use serde_json::json;
+        use std::io::Write as _;
+
+        let root = self.agent_cwd();
+        let Some(target) = remote::upload_path(&root, name) else {
+            return json!({"ok": false, "error": tr("ファイル名が受け取れません")}).to_string();
+        };
+        // base64 は data: URI の本体だけが届く前提。空白・改行は落としてから解く
+        let raw: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw.as_bytes()) else {
+            return json!({"ok": false, "error": tr("添付を読み取れませんでした")}).to_string();
+        };
+        if bytes.is_empty() {
+            return json!({"ok": false, "error": tr("添付が空です")}).to_string();
+        }
+        if bytes.len() > remote::UPLOAD_MAX_BYTES {
+            return json!({
+                "ok": false,
+                "error": trf(
+                    "添付が大きすぎます ({mb}MB まで)",
+                    &[("mb", (remote::UPLOAD_MAX_BYTES / (1024 * 1024)).to_string())],
+                ),
+            })
+            .to_string();
+        }
+        let Some(dir) = target.parent().map(|p| p.to_path_buf()) else {
+            return json!({"ok": false, "error": tr("保存先を作れませんでした")}).to_string();
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return json!({"ok": false, "error": format!("{}: {e}", tr("保存先を作れませんでした"))})
+                .to_string();
+        }
+        // 字句で畳んだうえに**実体でも**作業フォルダの下にあることを見る。
+        // (`.zaivern` がリンクで外を指していても、ここで止まる)
+        let canon_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !canon_dir.starts_with(&canon_root) {
+            return json!({"ok": false, "error": tr("ワークスペース外へは保存できません")})
+                .to_string();
+        }
+        // 置き場を **git から隠す**。スマホから送った写真がワークスペースに
+        // 落ちるので、エージェントが `git add -A` した瞬間に利用者の写真が
+        // コミットへ混ざる。`*` は自分自身も無視するので 1 行で足りる。
+        // 既にあるものは触らない (利用者が書き換えていることがある)。
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            let _ = std::fs::write(&ignore, "*\n");
+        }
+        // 上書きしない。`create_new` なので「見てから書く」の隙間も無い
+        let base = target
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut saved = None;
+        for i in 0..remote::UPLOAD_UNIQUE_TRIES {
+            let p = dir.join(remote::nth_name(&base, i));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                Ok(mut f) => {
+                    if let Err(e) = f.write_all(&bytes) {
+                        let _ = std::fs::remove_file(&p);
+                        return json!({"ok": false, "error": format!("{}: {e}", tr("添付を保存できませんでした"))})
+                            .to_string();
+                    }
+                    saved = Some(p);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                // Windows は削除待ちのファイルへ書くと ACCESS_DENIED を返す
+                // (CLAUDE.md の既知の罠)。取り合いとして次の綴りを試す
+                Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    continue
+                }
+                Err(e) => {
+                    return json!({"ok": false, "error": format!("{}: {e}", tr("添付を保存できませんでした"))})
+                        .to_string()
+                }
+            }
+        }
+        let Some(path) = saved else {
+            return json!({"ok": false, "error": tr("同じ名前の添付が多すぎます")}).to_string();
+        };
+        // 入力欄へ入れる本文。**綴りを決めるのはここ 1 か所**で、スマホ側は
+        // 受け取った文字列をそのまま `/api/bulk` へ流すだけ。宛先が複数
+        // (全員 / 待機) だと作業フォルダの違う相手も混ざるので、**必ず絶対パス**
+        // にする — 相対だと「一部のエージェントだけ開けない」が静かに起きる。
+        let text = format!("@{} ", path.display());
+        // トーストにはファイル名だけを出す (絶対パスを丸ごと出すと
+        // 1 行に収まらず、肝心の「何が届いたか」が省略で消える)。
+        self.toast(
+            trf(
+                "📎 {name} を受け取りました",
+                &[(
+                    "name",
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                )],
+            ),
+            true,
+        );
+        json!({
+            "ok": true,
+            "path": path.display().to_string(),
+            "text": text,
+            "bytes": bytes.len(),
+        })
+        .to_string()
     }
 
     /// remote_reply: BulkStop — 宛先へ Esc を送っていまの作業を止める。
@@ -2406,6 +2541,44 @@ mod bulk_wiring_tests {
         assert!(
             body.contains("remote::bulk_targets(mode, &picks)"),
             "宛先の選び方を remote::bulk_targets 以外で決めている"
+        );
+    }
+
+    /// 添付は (a) 置き場を自分で綴らない (b) 上限を必ず見る (c) 上書きしない。
+    ///
+    /// どれも実行時には見えない (成功して見えるまま外へ書ける・古い添付を
+    /// 静かに潰す) ので、ソースで押さえる。
+    #[test]
+    fn 添付の置き場と上限は共有の判定を通る() {
+        let body = body_of("pub(super) fn remote_reply_upload(");
+        // 置き場は作業フォルダから導出する。パスを直書きしない
+        assert!(
+            body.contains("self.agent_cwd()") && body.contains("remote::upload_path(&root, name)"),
+            "添付の保存先を remote::upload_path 以外で決めている"
+        );
+        assert!(
+            !body.contains("/tmp") && !body.contains("C:\\"),
+            "添付の保存先にパスを直書きしている"
+        );
+        // 上限は黙って切らずに断る
+        assert!(
+            body.contains("bytes.len() > remote::UPLOAD_MAX_BYTES"),
+            "添付の上限を見ていない"
+        );
+        // 実体でも作業フォルダの下にいることを確かめる (リンクで外へ抜けない)
+        assert!(
+            body.contains("canon_dir.starts_with(&canon_root)"),
+            "実体での前方一致を見ていない"
+        );
+        // 既にある添付を上書きしない (`create_new` は「見てから書く」隙間も無い)
+        assert!(
+            body.contains("create_new(true)") && body.contains("remote::nth_name(&base, i)"),
+            "同名の添付を上書きしている疑い"
+        );
+        // 置き場を git から隠す (利用者の写真が `git add -A` で混ざらない)
+        assert!(
+            body.contains("dir.join(\".gitignore\")"),
+            "添付の置き場を git から隠していない"
         );
     }
 

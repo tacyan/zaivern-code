@@ -6,15 +6,51 @@
 // レーンの定義・状態ラベルは **PC 側 (kanban.rs) が決めたものをそのまま出す**。
 // スマホ側で画面文字から状態を決め直さない (設計原則 4)。
 let aview = 'term', alist = [], alanes = [], laneOpen = {};
+// 一覧の**読めぐあい**。「読めていない」と「0 件」を混ぜない
+// (承認キューの `apprApi === false` と同じ扱い)。
+//   null  … このビューへ来てからまだ 1 度も読めていない
+//   true  … 読めた — `alist` が「いまの姿」
+//   false … 続けて読めなかった — **0 件ではない**
+// 混ぜると、取得に 1 度失敗しただけで「待っているエージェントはいません」と
+// 言い切ってしまい、その嘘が次に読めるまで画面に残る (実際に残った)。
+let alistOk = null, alistMiss = 0;
+// 一覧の取り直し間隔と、「読めていない」と言い切るまでの空振り回数。
+// 1 回の取りこぼしでカードを差し替えるとちらつくだけなので 2 回続けて見る。
+const LIST_POLL_MS = 1500;
+const LIST_MISS_MAX = 2;
 const AVIEWS = [
   ['term', () => T('remote.view_term', '\u{1F5A5} 端末')],
   ['wait', () => T('remote.view_wait', '⏳ 待ち')],
   ['deck', () => T('remote.view_deck', '\u{1F0CF} デッキ')],
   ['kanban', () => T('remote.view_kanban', '\u{1F4CB} 看板')],
 ];
-// 待ち件数は **PC が数えた state.waiting** をそのまま出す。一覧を開いていない
-// 間も /api/state だけで最新になるので、バッジのために余分に叩かない。
-function waitCount() { return (state && state.waiting) || 0; }
+// 一覧 (待ち / デッキ / 看板) を出しているビューか。**判定はここ 1 か所だけ**。
+function listView() {
+  if (!AVIEWS.some(([k]) => k === aview && k !== 'term')) {
+    return false;   // 端末・承認キュー — 一覧そのものが画面に無い
+  }
+  return true;
+}
+// 待ち件数。**バッジと一覧は必ず同じ応答から作る。**
+//
+// 以前はバッジが `/api/state` (2.5 秒)、一覧が `/api/agents` (1.5 秒) と
+// **別の応答**から来ていた。判定は PC 側の `remote::is_waiting_lane` 1 本で
+// 同じでも、**取得の時点が違う**ので食い違う。しかも `/api/agents` が
+// 落ちたときだけ一覧が更新されないので、「⏳ 待ち ②」と出ているのに
+// 「待っているエージェントはいません」が残り続けた。
+//
+// - 一覧を見ていて読めている → その応答 (`alist`) を数える。バッジと一覧が
+//   同じ配列から出るので、**食い違いは構造的に起こり得ない**
+// - 一覧を見ていて読めていない → `null` (数字を出さない)。0 とは言わない
+// - 一覧が画面に無い (端末・承認キュー) → 数える相手がいないので
+//   `/api/state` の値。矛盾する相手がそもそも無い
+function waitCount() {
+  if (listView()) {
+    if (alistOk === true) return alist.filter(a => a.waiting).length;
+    if (alistOk === false) return null;   // 読めていない — 件数を騙らない
+  }
+  return (state && state.waiting) || 0;
+}
 function renderSeg() {
   const el = $('aseg');
   el.innerHTML = '';
@@ -23,9 +59,10 @@ function renderSeg() {
     if (aview === k) b.className = 'act';
     b.appendChild(document.createTextNode(lab()));
     const n = k === 'wait' ? waitCount() : 0;
-    if (n) {
+    // n === null は「読めていない」。0 と書くと「待ちはいない」という嘘になる
+    if (n === null || n) {
       const s = document.createElement('span');
-      s.className = 'badge'; s.textContent = n;
+      s.className = 'badge'; s.textContent = n === null ? '…' : n;
       b.appendChild(s);
     }
     b.onclick = () => setAView(k);
@@ -34,7 +71,12 @@ function renderSeg() {
 }
 function setAView(k) {
   if (aview === k) return;
+  const wasList = listView();
   aview = k;
+  // 端末・承認キューを見ている間は /api/agents を叩いていない。その間に
+  // 古びた一覧を「いまの姿」として出さない (読み直すまでは読み込み中と出す)。
+  // 一覧どうしの行き来 (待ち ⇄ デッキ ⇄ 看板) は同じ応答を使い回す。
+  if (!wasList && listView()) { alist = []; alanes = []; alistOk = null; alistMiss = 0; }
   const term = k === 'term';
   // 端末と一覧は同じ場所を使う。切り替えで**上下のバーは動かさない**ので、
   // 画面が突然作り替わったようには見えない
@@ -60,6 +102,23 @@ function emptyCard(k) {
     : (k === 'wait'
       ? T('remote.wait_empty', '待っているエージェントはいません — 全員動いています')
       : T('remote.list_empty', '表示できるエージェントがいません'));
+  d.appendChild(t);
+  return d;
+}
+// 「読めていない」ときのカード。**0 件と同じ見た目にしない** —
+// 取得に失敗しただけで「待っているエージェントはいません」と言い切ると、
+// その嘘が次に読めるまで画面に残る (利用者からの報告そのもの)。
+function unreadCard() {
+  const d = document.createElement('div');
+  d.className = 'mid-card';
+  const b = document.createElement('span');
+  b.className = 'big';
+  b.textContent = alistOk === false ? '⚠' : '\u{23F3}';
+  d.appendChild(b);
+  const t = document.createElement('span');
+  t.textContent = alistOk === false
+    ? T('remote.list_unreadable', '一覧を読み込めませんでした — 取り直しています')
+    : T('remote.list_loading', '一覧を読み込んでいます…');
   d.appendChild(t);
   return d;
 }
@@ -128,7 +187,7 @@ function renderList() {
   // 承認キュー) では中身を**残さない**。隠しているつもりでも中身が残ると、
   // CSS の当たり方ひとつで端末と一覧が同時に見える (「エージェントが
   // いません」が 2 枚出た)。出すのは常に 1 か所だけ。
-  if (!AVIEWS.some(([k]) => k === aview && k !== 'term')) {
+  if (!listView()) {
     el.innerHTML = '';
     el.classList.remove('mid');
     el.classList.remove('show');
@@ -139,6 +198,9 @@ function renderList() {
   const keep = el.scrollTop;
   el.innerHTML = '';
   el.classList.remove('mid');
+  // まだ読めていない / 読めなかったときは、**件数を騙らない**。
+  // ここで空カードを出すと「0 件」と言ったことになる。
+  if (alistOk !== true) { el.classList.add('mid'); el.appendChild(unreadCard()); return; }
   // 「待ち」は PC 側の判定 (remote::is_waiting_lane) で印が付いたものだけ
   const rows = aview === 'wait' ? alist.filter(a => a.waiting) : alist;
   if (!rows.length) { el.classList.add('mid'); el.appendChild(emptyCard(aview)); return; }
@@ -175,6 +237,16 @@ function renderKanban(el, rows) {
   if (!shown) { el.classList.add('mid'); el.appendChild(emptyCard('kanban')); }
 }
 let termTimer = null;
+// 取得に締め切りを付ける。fetch には時間制限が無いので、電波が切り替わって
+// 接続が握られたままになると **この関数の続きが走らない** = 次の周回すら
+// 始まらず、一覧が永久に凍る (タイマーが 1 本も無い状態になる)。
+// 待つのをやめて次へ進めば、少なくともポーリングは生き続ける。
+function withDeadline(p, ms) {
+  return new Promise((res, rej) => {
+    const t = setTimeout(() => rej(0), ms);
+    p.then(v => { clearTimeout(t); res(v); }, e => { clearTimeout(t); rej(e); });
+  });
+}
 // ポーリングは**ビューが増えても 1 本のまま**。端末を見ているときは /api/term、
 // 一覧を見ているときは /api/agents を同じ間隔で叩く (合計回数は増えない)。
 // 見ていないビューのために PTY を読ませない。
@@ -195,11 +267,19 @@ async function pollTerm() {
         el.textContent = T('remote.no_agents_hint', 'エージェントがいません — ＋ 起動 から始められます');
       }
     } else {
-      const r = await api('/api/agents');
-      if (r.ok) { alist = r.agents || []; alanes = r.lanes || []; renderList(); }
+      const was = waitCount();
+      let r = null;
+      try { r = await withDeadline(api('/api/agents'), LIST_POLL_MS * 2); } catch (e) { r = null; }
+      if (r && r.ok) { alist = r.agents || []; alanes = r.lanes || []; alistOk = true; alistMiss = 0; }
+      else if (++alistMiss >= LIST_MISS_MAX) alistOk = false;
+      // **成否によらず必ず描き直す。** 読めたときだけ描き直していたので、
+      // 1 度失敗すると古い空カードがそのまま残った。
+      renderList();
+      // バッジも同じ応答から作り直す (件数だけ先に進むのを止める)
+      if (waitCount() !== was) renderSeg();
     }
   } catch (e) {}
-  termTimer = setTimeout(pollTerm, 1500);
+  termTimer = setTimeout(pollTerm, LIST_POLL_MS);
 }
 // 送信 = テキスト + Enter。入れる = テキストのみ (PC 側で内容を見て Enter)
 // 宛先は bulkMode が決める。1 体宛て / 全員 / 待機だけ のどれも同じ入口を通る
