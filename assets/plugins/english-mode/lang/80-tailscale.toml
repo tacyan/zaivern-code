@@ -34,3 +34,24 @@
 
 # ── 張り替えの失敗 ──
 "待ち受けの切り替えに失敗しました: {e} (元の待ち受けに戻しました)" = "Could not switch where we listen: {e} (restored the previous one)"
+
+# ── HTTPS (tailscale serve) — スマホの音声入力が動く唯一の形 ──
+"Tailscale の HTTPS 経由 — 🎤 音声入力が使えます (QR を読み取って接続)" = "Over Tailscale HTTPS — 🎤 voice input works (scan the QR to connect)"
+"Tailscale に TLS を終端させ、tailnet のホスト名で\n本物の証明書 (Let's Encrypt) を出します。スマホから見た URL が\nhttps になるので、ブラウザの音声認識が動きます\n(平文の http では、どの端末でも仕様上ぜったいに動きません)" = "Let Tailscale terminate TLS and issue a real certificate\n(Let's Encrypt) for your tailnet hostname. The phone then sees an\nhttps URL, so the browser's speech recognition works\n(over plain http it can never work, on any device)."
+"tailnet の HTTPS 公開 (tailscale serve) を解除して、\n同じ Wi-Fi から繋げるように戻します" = "Turns off HTTPS publishing (tailscale serve) on your tailnet\nand goes back to connecting from the same Wi-Fi"
+"※ 最初の 1 回だけ証明書の取得で待つことがあります\n　(失敗したらもう一度読み込んでください。2 回目からは一瞬です)" = "※ Only the very first connection may wait while the certificate is fetched\n　(if it fails, just reload — from the second time on it is instant)"
+"127.0.0.1 のみ (Tailscale の HTTPS 経由)" = "127.0.0.1 only (via Tailscale HTTPS)"
+"🔒 tailnet の HTTPS 公開を準備しています…" = "🔒 Preparing HTTPS publishing on your tailnet…"
+"🔒 証明書を取得しています… (初回だけ 1 分ほどかかることがあります)" = "🔒 Fetching the certificate… (the first time can take about a minute)"
+"🔓 tailnet の HTTPS 公開を解除しています…" = "🔓 Turning off HTTPS publishing on your tailnet…"
+"tailscale コマンドが見つかりません" = "The tailscale command was not found"
+"Tailscale アプリは見つかりましたが、CLI を実行できませんでした" = "The Tailscale app was found, but its CLI could not be run"
+"この tailnet では HTTPS 証明書が無効です" = "HTTPS certificates are disabled for this tailnet"
+"管理コンソールの DNS 画面で「HTTPS Certificates」を有効にしてください" = "Turn on \"HTTPS Certificates\" on the DNS page of the admin console"
+"Tailscale の HTTPS 公開に失敗しました" = "Tailscale could not publish over HTTPS"
+"下の出力がそのままの理由です" = "The output below is the reason, verbatim"
+"🔓 HTTPS をやめる" = "🔓 Turn off HTTPS"
+"🎤 HTTPS で待ち受ける (スマホの音声入力が使えます)" = "🎤 Listen over HTTPS (enables voice input on your phone)"
+"🔒 https://{d}/ で待ち受けています (スマホの音声入力が使えます)" = "🔒 Listening on https://{d}/ (voice input works on your phone)"
+"管理コンソールの URL をコピーします" = "Copies the admin console URL"
+"管理コンソールの URL をコピーしました" = "Copied the admin console URL"

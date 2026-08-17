@@ -37,6 +37,20 @@ pub enum Bind {
     /// tailnet に限る**ため。喫茶店や空港の Wi-Fi に居ても、その LAN からは
     /// ポートが見えない (経路も鍵も Tailscale が持つ)。
     Tailscale,
+    /// Tailscale が **TLS を終端する**前面越しに繋ぐ (`127.0.0.1` のみ)。
+    ///
+    /// `tailscale serve --https=443 http://127.0.0.1:<port>` が tailnet の
+    /// ホスト名で本物の証明書を出し、復号したものを loopback へ流す。
+    /// スマホから見た URL が `https://` になるので **`isSecureContext` が真**に
+    /// なり、ブラウザの音声認識 (`SpeechRecognition`) が動く — 平文では
+    /// どの端末でも仕様上ぜったいに動かない。
+    ///
+    /// **待ち受けは loopback だけにする。** TLS は Tailscale 側で終端して
+    /// `127.0.0.1` へ来るので、tailnet の IP で平文を開けておく理由が 1 つも無い。
+    /// 開けたままにすると「https でも http でも入れる」= 音声が使えない口が
+    /// 残り、しかもそちらを開いた人には理由が分からない
+    /// ([`Bind::Loopback`] が SSH を迂回させないのと同じ考え方)。
+    TailscaleHttps,
 }
 
 impl Bind {
@@ -69,7 +83,24 @@ impl Bind {
                 }
                 Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), ip])
             }
+            // TLS を終端した Tailscale が `127.0.0.1` へ流してくる。
+            // 平文の口を tailnet 側に残さない (型の説明を参照)。
+            Bind::TailscaleHttps => Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
         }
+    }
+
+    /// **OS の受信許可 (Windows のファイアウォール) が関係するか。**
+    ///
+    /// 関係しないモードで警告を出すと「直せない警告」を突きつけることになり、
+    /// 関係するモードで隠すと「QR は読めるのにスマホからだけ何も起きない」の
+    /// 原因が画面から消える。判断はここ 1 か所に置く。
+    ///
+    /// - [`Bind::Lan`] / [`Bind::Tailscale`]: 受信はこのプロセスの listener へ
+    ///   直接来る (tailnet のインタフェース越しでも規則は同じように効く) → 関係する
+    /// - [`Bind::Loopback`] / [`Bind::TailscaleHttps`]: 外から来た接続を受けるのは
+    ///   ssh / tailscaled であって**このプロセスではない** → 関係しない
+    pub fn needs_inbound_firewall(&self) -> bool {
+        matches!(self, Bind::Lan | Bind::Tailscale)
     }
 
     /// UI に出す 1 行 (呼び出し側で `tr()` を通すこと)。
@@ -81,6 +112,7 @@ impl Bind {
             Bind::Lan => "0.0.0.0 (同じ Wi-Fi から直接)",
             Bind::Loopback => "127.0.0.1 (SSH トンネル経由のみ)",
             Bind::Tailscale => "Tailscale の IP のみ (同じ tailnet から)",
+            Bind::TailscaleHttps => "127.0.0.1 のみ (Tailscale の HTTPS 経由)",
         }
     }
 }
@@ -458,12 +490,22 @@ pub struct RemoteServer {
     pub port: u16,
     pub token: String,
     /// トークンなしのベース URL (例: http://192.168.1.10:8899/)
+    ///
+    /// **PC 側 (CLI / 🎤) が使うのは常にこちら** — [`Bind::TailscaleHttps`] でも
+    /// 中身は `http://127.0.0.1:<port>/` のままで、変わるのは
+    /// スマホへ渡す [`RemoteServer::phone_url`] だけである。
     pub url: String,
     /// いまどこで待ち受けているか (UI に必ず出す)
     pub bind: Bind,
     /// 実際に待ち受けているアドレス (`Drop` が 1 本ずつ起こすので必要)。
     /// Tailscale モードでは loopback と tailnet の 2 本になる。
     pub addrs: Vec<SocketAddr>,
+    /// Tailscale が TLS を終端している公開ホスト名。
+    ///
+    /// **`serve` が実際に立ってからしか入らない。** ここに値を入れることが
+    /// 「https の URL を配ってよい」の唯一の合図なので、立つ前に入れると
+    /// **繋がらない QR** を配ることになる。
+    https_host: Option<String>,
     rx: mpsc::Receiver<Request>,
     reach: Arc<Mutex<Reach>>,
     /// accept ループの停止指示 (`Drop` で立てる)
@@ -529,6 +571,8 @@ impl RemoteServer {
         // もので、その間に Tailscale が落ちていれば bind は必ず失敗する。
         let ts = match bind {
             Bind::Tailscale => crate::tailscale::listen_ip(),
+            // TailscaleHttps は loopback しか掴まないので検出は要らない
+            // (掴めないと分かっているものを測りに行かない)
             _ => None,
         };
         let ips = bind.listen_ips(ts)?;
@@ -590,7 +634,8 @@ impl RemoteServer {
         // 「その URL では絶対に繋がらない」嘘の案内になる。
         let host = match bind {
             Bind::Lan => lan_ip(),
-            Bind::Loopback => "127.0.0.1".to_string(),
+            // TLS を終端する前面が立つまでは、確実に届く先はここだけ
+            Bind::Loopback | Bind::TailscaleHttps => "127.0.0.1".to_string(),
             // loopback 以外 = tailnet 側。スマホが読むのはこちら
             Bind::Tailscale => addrs
                 .iter()
@@ -667,6 +712,7 @@ impl RemoteServer {
             url,
             bind,
             addrs,
+            https_host: None,
             rx,
             reach,
             stop,
@@ -684,6 +730,41 @@ impl RemoteServer {
     /// 毒された Mutex でも UI を落とさないよう、取れなければ既定値を返す。
     pub fn reach(&self) -> Reach {
         self.reach.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    /// TLS を終端する前面 (Tailscale serve) が立ったことを記録する。
+    ///
+    /// **`serve` が rc=0 で返ってから呼ぶこと。** 呼んだ瞬間から
+    /// [`RemoteServer::phone_url`] が https を返すので、立つ前に呼ぶと
+    /// 繋がらない QR を配ることになる。
+    pub fn set_https_host(&mut self, host: &str) {
+        self.https_host = crate::tailscale::is_plausible_host(host).then(|| host.to_string());
+    }
+
+    /// 前面を下ろす (`serve --https=443 off` を撃った後)。
+    pub fn clear_https_host(&mut self) {
+        self.https_host = None;
+    }
+
+    /// スマホに読ませる URL。前面が立っていれば https、無ければ平文。
+    pub fn phone_url(&self) -> String {
+        phone_base_url(self.https_host.as_deref(), &self.url)
+    }
+
+    /// 前面が立っているか (QR を出してよいか)。
+    pub fn https_ready(&self) -> bool {
+        self.https_host.is_some()
+    }
+}
+
+/// スマホへ配るベース URL を決める**純関数**。
+///
+/// 前面 (`tailscale serve`) が立っているなら、そちらは **443 で待っている**ので
+/// ポート番号を書かない (書くと `https://host:8899/` になって必ず繋がらない)。
+pub fn phone_base_url(https_host: Option<&str>, plain: &str) -> String {
+    match https_host {
+        Some(h) => format!("https://{h}/"),
+        None => plain.to_string(),
     }
 }
 
@@ -2156,7 +2237,26 @@ mod tests {
             .listen_ips(Some("fd7a:115c:a1e0::1".parse().unwrap()))
             .is_ok());
 
-        for b in [Bind::Lan, Bind::Loopback, Bind::Tailscale] {
+        // Tailscale の HTTPS 前面は **loopback だけ**。TLS を終端した
+        // tailscaled が 127.0.0.1 へ流すので、tailnet の IP で平文を開けて
+        // おく理由が 1 つも無い (開けたままにすると「https でも http でも
+        // 入れる」= 音声が使えない口が残る)。
+        assert_eq!(
+            Bind::TailscaleHttps.listen_ips(None).unwrap(),
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        // 検出結果を渡されても増やさない (tailnet 側に平文の口を作らない)
+        assert_eq!(
+            Bind::TailscaleHttps.listen_ips(Some(ts)).unwrap(),
+            vec!["127.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+
+        for b in [
+            Bind::Lan,
+            Bind::Loopback,
+            Bind::Tailscale,
+            Bind::TailscaleHttps,
+        ] {
             assert!(!b.label().is_empty(), "{b:?} の説明が無い");
         }
         assert!(
@@ -2173,7 +2273,12 @@ mod tests {
     #[test]
     fn どのモードでもloopbackに届く() {
         let ts: IpAddr = "100.101.102.103".parse().unwrap();
-        for b in [Bind::Lan, Bind::Loopback, Bind::Tailscale] {
+        for b in [
+            Bind::Lan,
+            Bind::Loopback,
+            Bind::Tailscale,
+            Bind::TailscaleHttps,
+        ] {
             let ips = b.listen_ips(Some(ts)).expect("解決できる");
             let reaches_loopback = ips.iter().any(|ip| ip.is_loopback() || ip.is_unspecified());
             assert!(reaches_loopback, "{b:?} が 127.0.0.1 を捨てている: {ips:?}");
@@ -2189,6 +2294,71 @@ mod tests {
         assert_eq!(f("[::]:8899"), "[::1]:8899");
         assert_eq!(f("127.0.0.1:8899"), "127.0.0.1:8899");
         assert_eq!(f("100.101.102.103:8900"), "100.101.102.103:8900");
+    }
+
+    /// **受信許可 (Windows のファイアウォール) が関係するモードは 2 つだけ。**
+    /// 関係しないモードで警告を出すと「直せない警告」になり、関係するモードで
+    /// 隠すと「QR は読めるのにスマホからだけ何も起きない」の原因が画面から消える。
+    #[test]
+    fn 受信許可が関係するのは自分で受けるモードだけ() {
+        for (b, want) in [
+            (Bind::Lan, true),
+            (Bind::Tailscale, true),
+            // 外から受けるのは ssh / tailscaled であってこのプロセスではない
+            (Bind::Loopback, false),
+            (Bind::TailscaleHttps, false),
+        ] {
+            assert_eq!(b.needs_inbound_firewall(), want, "{b:?} の判定が違う");
+        }
+    }
+
+    /// **前面 (`tailscale serve`) が立つまでスマホへ https の URL を配らない。**
+    /// 立つ前に配ると、読み取ったスマホは必ず失敗する。
+    /// さらに https の URL に**ポートを書かない** — 443 で待っているので、
+    /// `https://host:8899/` を配ると 1 台も繋がらない。
+    #[test]
+    fn httpsのurlは前面が立ってからだけ配りポートを書かない() {
+        let plain = "http://127.0.0.1:8899/";
+        assert_eq!(phone_base_url(None, plain), plain);
+        assert_eq!(
+            phone_base_url(Some("macbook.example.ts.net"), plain),
+            "https://macbook.example.ts.net/"
+        );
+        assert!(
+            !phone_base_url(Some("h.example.ts.net"), plain).contains("8899"),
+            "https の URL に待ち受けポートを書いてはいけない"
+        );
+    }
+
+    /// **繋がらない QR を配らないための門番。** `serve` が返した値をそのまま
+    /// URL の host 部へ差し込むので、host として使えない文字列は撥ねる
+    /// (`evil.example/path` を通すと、QR の宛先ごと差し替えられる)。
+    #[test]
+    fn 前面のホスト名は使える形だけ受け付ける() {
+        let ctx = egui::Context::default();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let Ok(mut srv) = RemoteServer::start_on(ctx, Bind::TailscaleHttps, &[lo], None, None)
+        else {
+            eprintln!("[skip] 8899-8919 に空きが無い");
+            return;
+        };
+        assert!(!srv.https_ready(), "立つ前から https を配ってはいけない");
+        assert!(srv.phone_url().starts_with("http://127.0.0.1:"));
+        for bad in [
+            "",
+            "evil.example/path",
+            "host:1234",
+            "nodots",
+            "a..b.example",
+        ] {
+            srv.set_https_host(bad);
+            assert!(!srv.https_ready(), "{bad:?} を受け入れてはいけない");
+        }
+        srv.set_https_host("macbook-pro.tail4900de.ts.net");
+        assert!(srv.https_ready());
+        assert_eq!(srv.phone_url(), "https://macbook-pro.tail4900de.ts.net/");
+        srv.clear_https_host();
+        assert!(!srv.https_ready(), "下ろしたら平文へ戻る");
     }
 
     /// URL のホスト部は IPv6 だけ角括弧で包む (RFC 3986)。
@@ -3031,10 +3201,49 @@ mod tests {
         }
     }
 
+    /// **`isSecureContext` で先回りして機能を隠さない。**
+    ///
+    /// 実測 (Chrome / `http://<LAN の IP>:<port>/`):
+    /// `{"isSecureContext":false,"hasSpeechRecognition":true,"hasMediaDevices":false}`
+    /// — Chrome は**平文でも `webkitSpeechRecognition` を持っている**。
+    /// ここで「http だから使えない」と決めて隠すと、**実際には動く端末の
+    /// 利用者からも機能を取り上げる**ことになる。
+    ///
+    /// 逆に WebKit (iOS Safari) は IDL に `[SecureContext]` が付いているので
+    /// 平文では構造ごと存在しない。つまり**「在るか」だけを見れば両方の
+    /// ブラウザで正しく分かれる**。使えるかどうかは `start()` の結果
+    /// (`onerror` の `not-allowed` / `service-not-allowed`) で決める。
+    ///
+    /// 断られたときに「ブラウザ設定を確認」と出すのも嘘になる — 平文で
+    /// 断られた原因は設定ではなく**オリジンが http であること**なので、
+    /// 直し方 (https にする) の案内へ落とす。
+    #[test]
+    fn 音声は先回りで隠さず試した結果で決める() {
+        let page = PAGE.replace("\r\n", "\n");
+        // 事前判定は「API が在るか」だけ。isSecureContext で門前払いしない
+        assert!(
+            page.contains(
+                "function speechBlockReason() {\n  if (!speechAPI()) return 'unsupported';"
+            ),
+            "音声を isSecureContext で先回りして隠している"
+        );
+        // 断られたときの落とし先は「設定を確認」ではなく原因と直し方の案内
+        assert!(
+            page.contains("if (!window.isSecureContext) {")
+                && page.contains("keyboardDictation(i, 'insecure');"),
+            "平文で断られたのに「ブラウザ設定を確認」と出している"
+        );
+        // 長押しの案内も、使えると言い切るのはセキュアコンテキストのときだけ
+        assert!(
+            page.contains("else if (!window.isSecureContext) showNote(dictationHint('insecure'));"),
+            "使えるか分からない接続で「使えます」と言い切っている"
+        );
+    }
+
     /// 音声が使えないことの案内は**消せる**。
     ///
-    /// http の LAN 越しではブラウザが構造的にマイクを渡さない
-    /// (`MediaDevices` も `SpeechRecognition` もセキュアコンテキスト限定) ので、
+    /// http の LAN 越しでは iOS Safari が構造的にマイクを渡さない
+    /// (`SpeechRecognition` の IDL に `[SecureContext]` がある) ので、
     /// 案内は「一度読めば終わり」の情報でしかない。それが出っぱなしになると
     /// **中身の無い帯が永久に高さを取る**。閉じられること・閉じたことを
     /// 覚えること・閉じたら高さごと消えることを固定する。

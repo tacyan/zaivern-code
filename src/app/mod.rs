@@ -3563,6 +3563,10 @@ pub struct ZaivernApp {
     /// Tailscale の検出結果 (踏み台も Wi-Fi も要らない 3 本目の経路)。
     /// スレッドを持たず、📱 の画面が描かれたときだけ測り直す薄いキャッシュ。
     ts: tailscale::Probe,
+    /// tailnet の HTTPS 公開 (`tailscale serve`) を裏で回す係。
+    https: tailscale::Https,
+    /// 直近の「HTTPS にできなかった理由」。**4 通りを区別して出す**。
+    https_err: Option<tailscale::HttpsBlock>,
     /// Cockpit のコンポーザ (複数行・宛先つき)。宛先ごとの下書きもここが持つ。
     agent_input_buf: crate::agent_input::AgentInputBuffer,
     /// `@` コンテキスト参照 (mention.rs)。添付台帳と裏の走査を持つ。

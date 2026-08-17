@@ -6,11 +6,23 @@
 let voiceAgent = -1, recog = null, lastInterim = '', voiceFatal = false;
 function speechAPI() { return window.SpeechRecognition || window.webkitSpeechRecognition; }
 // 音声認識が使えるかを事前判定する。使えない理由コードを返す:
-//   'insecure'    … http 接続 = セキュアコンテキストでない (スマホから見る場合はこれ)
-//   'unsupported' … SpeechRecognition が無い (iOS Safari / Firefox など)
-//   ''            … 使える
+//   'unsupported' … SpeechRecognition がそもそも無い
+//   ''            … 少なくとも**試せる** (使えるかどうかは試して決める)
+//
+// **`isSecureContext` で先回りして諦めない。**
+//
+// 実測 (Chrome / `http://<LAN の IP>:<port>/`):
+//   {"isSecureContext":false,"hasSpeechRecognition":true,"hasMediaDevices":false}
+// つまり Chrome は平文でも `webkitSpeechRecognition` を**持っている**。
+// ここで「http だから」と隠すと、**動く端末の利用者からも機能を取り上げる**。
+//
+// 逆に WebKit (iOS Safari) は IDL に `[SecureContext]` が付いているので
+// 平文では**構造ごと存在しない** — `speechAPI()` が偽になり 'unsupported' へ
+// 落ちる。つまり「存在するか」だけを見れば、両方のブラウザで正しく分かれる。
+//
+// 実際に動くかは `start()` の結果で決める (`onerror` の `not-allowed` /
+// `service-not-allowed` で案内へ落とす)。**推測ではなく結果で判定する。**
 function speechBlockReason() {
-  if (!window.isSecureContext) return 'insecure';
   if (!speechAPI()) return 'unsupported';
   return '';
 }
@@ -145,6 +157,15 @@ function startVoice(i) {
     const e = ev.error;
     if (e === 'no-speech') return;              // 無音だけ: onend の自動再開に任せる
     if (e === 'not-allowed' || e === 'service-not-allowed') {
+      // 平文で断られたのなら、原因は「ブラウザの設定」ではなく**オリジンが
+      // http だから**。設定を見に行かせても直らないので、案内のほうへ落とす
+      // (https にすればこのページのまま動く、という直し方まで書いてある)。
+      if (!window.isSecureContext) {
+        voiceFatal = true;
+        stopVoice0(); renderAgents();
+        keyboardDictation(i, 'insecure');
+        return;
+      }
       fatalVoiceStop(T('remote.mic_not_allowed', 'マイクが許可されていません（ブラウザ設定を確認）'));
     } else if (e === 'network') {
       // 認識サーバーへ到達できない = http 経由ではほぼ復帰しない。案内して終わる
@@ -187,7 +208,11 @@ document.addEventListener('pointerdown', ev => {
     setNoteMuted(false);
     if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) {} }
     const reason = speechBlockReason();
+    // 「使えます」と言い切ってよいのはセキュアコンテキストのときだけ。
+    // 平文でも API は在る (Chrome) が、断られることもある — 押せば分かるので
+    // ここでは**約束せず**、原因と直し方の案内を出しておく。
     if (reason) showNote(dictationHint(reason));
+    else if (!window.isSecureContext) showNote(dictationHint('insecure'));
     else toast(T('remote.voice_available',
       'この接続では音声認識が使えます — \u{1F3A4} を押してください'));
   }, 600);

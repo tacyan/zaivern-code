@@ -728,10 +728,12 @@ impl ZaivernApp {
         // SSH トンネル中は 127.0.0.1 でしか待ち受けないので、受信許可は無関係。
         // それでも ⚠ を出すと「直せない警告」を突きつけることになる。
         // Tailscale は tailnet のインタフェース越しに受信するので**関係する**。
+        // Tailscale の HTTPS 経由は tailscaled が受けるので関係しない。
+        // 判断は `Bind::needs_inbound_firewall` 1 か所だけに置く。
         let lan_mode = self
             .remote
             .as_ref()
-            .map(|r| r.bind != remote::Bind::Loopback)
+            .map(|r| r.bind.needs_inbound_firewall())
             .unwrap_or(true);
         let blocked = lan_mode && self.fw.needs_allow();
         let mut icon = RichText::new(if blocked { "📱⚠" } else { "📱" });

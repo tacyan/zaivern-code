@@ -87,6 +87,10 @@ impl eframe::App for ZaivernApp {
         // SSH トンネルは必ず畳む。置き去りにすると踏み台の公開ポートを掴んだ
         // ssh が残り、次に繋ぐとき「ポート使用中」で失敗する。
         self.tunnel.disconnect();
+        // tailnet の HTTPS 公開も必ず畳む。置き去りにすると**利用者の tailnet に
+        // proxy 設定が残り続ける** (次に別のアプリが 443 を使おうとして詰まる)。
+        // この起動で立てていなければシステムコール 1 つも撃たない。
+        self.https.cleanup_on_exit();
         // 握っているファイル所有を返す。返し損ねても TTL で回収されるが、
         // 返せば次の担当がすぐ入れる (待たせる時間がそのまま損害になる)。
         crate::lease::release_all();
@@ -231,6 +235,11 @@ impl ZaivernApp {
                 self.toast_warn(format!("🛡 {err}"));
             }
         }
+
+        // tailnet の HTTPS 公開 (tailscale serve) の結果を取り込む。
+        // 証明書の取得は初回だけ長いので、📱 を閉じられても拾えるよう
+        // ウィンドウの描画とは切り離してここで回す
+        self.poll_https(ctx);
 
         // プラグインコマンドの実行結果をエディタへ反映する
         self.process_plugin_results(ctx);
