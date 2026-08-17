@@ -3261,7 +3261,11 @@ mod tests {
         assert!(PAGE.contains("if (noteMuted()) { hideNote(); return; }"));
         // 閉じたら .show を外す = #vnote は display:none に戻り高さを取らない
         assert!(PAGE.contains("n.classList.remove('show')"));
-        assert!(PAGE.contains("#vnote {\n    display:none;"));
+        // **改行をまたぐ照合は必ず正規化してから。** Windows のチェックアウトは
+        // CRLF なので、`\n` を含むパターンは素の `PAGE` では必ず外れる
+        // (実際に Windows の CI だけがここで赤くなった)。
+        let page = PAGE.replace("\r\n", "\n");
+        assert!(page.contains("#vnote {\n    display:none;"));
         // 指で押せる大きさ (44px 以上)
         assert!(
             PAGE.contains("min-width:44px; min-height:44px;"),

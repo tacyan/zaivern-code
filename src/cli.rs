@@ -4773,6 +4773,111 @@ prunable gitdir file points to non-existent location
         (bases, ng)
     }
 
+    /// **ソースを読む番人は、改行をまたぐ照合の前に必ず正規化する。**
+    ///
+    /// Windows のチェックアウトは CRLF なので、`"a\nb"` のようなパターンは
+    /// 素の `include_str!` / `PAGE` では**必ず外れる**。手元 (macOS/Linux) は
+    /// 緑のまま、**Windows の CI だけが赤くなる**ので気付くのが遅い
+    /// (実際にこの版で `remote::tests::音声の案内は閉じられて閉じたことを覚える`
+    /// が Windows でだけ落ちた)。
+    ///
+    /// 検査は「`.contains("…\n…")` を書くなら、その関数の中で
+    /// `replace("\r\n", "\n")` を通した値を使っていること」。
+    #[test]
+    fn 改行をまたぐ照合は正規化してから使う() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                let src = src.replace("\r\n", "\n");
+                for (n, line) in src.lines().enumerate() {
+                    // `.contains("… \n …")` の形だけを見る (メッセージ内の
+                    // `\n` は `,` の後ろに来るので拾わない)
+                    // コメントの中のパターンはコードではない (この検査自身の
+                    // 説明文を拾ってしまう)
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let Some(at) = line.find(".contains(\"") else {
+                        continue;
+                    };
+                    let arg = &line[at + ".contains(\"".len()..];
+                    let end = arg.find('"').unwrap_or(arg.len());
+                    if !arg[..end].contains("\\n") {
+                        continue;
+                    }
+                    // **見るのはソース由来の値だけ。** メモリ上で組み立てた
+                    // 文字列 (diff の生成結果など) は CRLF と無関係なので、
+                    // ここで数えると騒がしくなって誰も読まなくなる。
+                    let recv = line[..at]
+                        .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                    // **見る範囲は「その関数の中」だけ。** 直前 N 行で探すと、
+                    // 同じファイルの**別のテスト**が書いた正規化を拾ってしまい、
+                    // わざと壊しても緑のまま = 空回りする (実際に踏んだ)。
+                    let lines: Vec<&str> = src.lines().collect();
+                    let start = (0..=n)
+                        .rev()
+                        .find(|&k| {
+                            lines[k].trim_start().starts_with("fn ")
+                                || lines[k].trim_start().starts_with("pub fn ")
+                                || lines[k].trim_start().starts_with("pub(super) fn ")
+                                || lines[k].trim_start().starts_with("pub(crate) fn ")
+                        })
+                        .unwrap_or(0);
+                    let near: String = lines[start..=n].join("\n");
+                    // その関数が**埋め込みソースを読んでいる**なら、改行を
+                    // またぐ照合は必ず正規化を通すこと。受け手が
+                    // `let page = PAGE.replace(..)` のような局所変数でも
+                    // 同じ関数の中なので拾える。
+                    let _ = recv;
+                    // この検査自身は除く (判定に使う語をコードとして持つため、
+                    // 自分で自分を拾ってしまう)
+                    if near.contains("fn 改行をまたぐ照合は正規化してから使う") {
+                        continue;
+                    }
+                    let from_source = ["PAGE", "VOICE_PAGE", "SRC_IMPL", "SRC", "include_str!("]
+                        .iter()
+                        .any(|k| near.contains(k));
+                    if !from_source {
+                        continue;
+                    }
+                    seen += 1;
+                    // 受け手が正規化済みか (同じ関数の中で)
+                    if !near.contains("replace(\"\\r\\n\", \"\\n\")") {
+                        bad.push(format!(
+                            "{}:{}: 改行をまたぐ照合の前に replace(\"\\r\\n\", \"\\n\") が無い",
+                            p.file_name().unwrap_or_default().to_string_lossy(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+        // 空振り検知 — 該当する書き方が 1 つも無いなら、この検査は何も見ていない
+        assert!(seen >= 3, "改行をまたぐ照合を {seen} 件しか見つけていない");
+        bad.sort();
+        bad.truncate(20);
+        assert!(bad.is_empty(), "CRLF で外れる照合:\n{}", bad.join("\n"));
+    }
+
     #[test]
     fn スマホのcssは隠したものを脇道から見せない() {
         let css = include_str!("../assets/remote/style.css").replace("\r\n", "\n");
