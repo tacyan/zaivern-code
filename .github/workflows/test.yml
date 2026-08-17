@@ -3,11 +3,15 @@
 # ■ 設計目標: 全テストが CI で 5 分以内 (wall-clock) に完了する。
 #   - OS ごとに「fast (terminal:: 以外)」「pty (terminal:: のみ)」の 2 ジョブへ分割し
 #     並列実行する。wall-clock は 2 ジョブの max であり sum ではない。
-#   - 同一 OS の 2 ジョブは rust-cache の shared-key で同じキャッシュを共有する
+#   - **Windows の fast はさらに 3 分割**する。実測 6 run で 321〜496 秒と
+#     6 回とも予算を超えていた (テストの段だけで 390 秒)。nextest は
+#     テスト 1 件 = 1 プロセスなので、プロセス生成が高価な Windows では
+#     4,950 件ぶんの起動費が丸ごと効く。分けないと 1 台では削れない。
+#   - 同一 OS の各ジョブは rust-cache の shared-key で同じキャッシュを共有する
 #     (shared-key は自動のジョブ名ベースキーを置き換え、複数ジョブ間で安定 —
-#     両ジョブは同じ RUSTFLAGS / プロファイルでビルドするため成果物は完全に再利用可能)。
+#     全ジョブが同じ RUSTFLAGS / プロファイルでビルドするため完全に再利用可能)。
 #   - lint ジョブは ubuntu 1 台のみ。3 OS で回しても同じ診断しか出ないため無駄。
-#     7 本のテストジョブ (fast×3 + pty×3 + windows-lease×1) と並列に走るので
+#     9 本のテストジョブ (fast×5 + pty×3 + windows-lease×1) と並列に走るので
 #     wall-clock は増えない。
 #   - windows-lease は lease:: / instances:: を **素の cargo test** で回す
 #     Windows 専用の 1 本。nextest はテスト 1 件 = 1 プロセスなので、
@@ -15,8 +19,11 @@
 #     Windows で一度も走らない。そこだけを埋める (詳細はジョブのコメント)。
 #   - ハング時のコストは nextest の slow-timeout (terminate-after=1) で
 #     グローバル ~65 秒 / terminal:: ~50 秒に抑える (.config/nextest.toml)。
-#   - ジョブレベルの timeout-minutes は 10/12 分 — ランナーが固まっても
-#     30 分ではなく数分で表面化する。
+#   - **apt は道具 (`tools/ci-linux-deps.sh`) 越しに呼ぶ。** 素の apt は HTTP に
+#     時限を持たないので、詰まったミラーを掴むと無音のままジョブの上限まで待つ
+#     (実測: run 32078628866 の msrv が 13 分無反応。同時刻の fast は同じ apt が 58 秒)。
+#   - **timeout-minutes は実測の 2〜3 倍**に置く (5〜10 分)。15 分のままだと
+#     「5 分予算」と矛盾し、固まったときに 15 分待たされるだけになる。
 # ■ 唯一の例外: Cargo.lock 変更直後の初回 run はキャッシュ再構築のため
 #   フルビルドとなり 5 分を超えうる (デバッグ情報を落として最小化済み)。
 #
@@ -85,12 +92,32 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository ||
       !(github.event.pull_request.head.ref == 'main' ||
         startsWith(github.event.pull_request.head.ref, 'night/'))
+    # **Windows だけ 3 分割する。** 実測 6 run ぶんの wall-clock:
+    #   windows 321 / 387 / 387 / 389 / 470 / 496 秒 — **6 回とも 5 分超**
+    #   macos   194 / 204 / 235 / 266 / 270 / 313 秒
+    #   ubuntu  209 / 218 / 219 / 221 / 227 / 244 秒
+    # 内訳を見ると Windows は**テストの段だけで 390 秒**、固定費 (checkout +
+    # toolchain + cache + nextest 導入) が 100 秒。nextest は**テスト 1 件
+    # につき 1 プロセス**を起こすので、プロセス生成が高価な Windows では
+    # 4,950 件ぶんの起動費がそのまま効く。1 台では削れない。
+    #
+    # 分割すると固定費だけは各シャードに残るが、**並列なので wall-clock は
+    # max であって sum ではない**: 100 + 390/3 ≒ 230 秒。
+    # ubuntu / macos は 1 台のままで予算内なので分けない
+    # (macOS ランナーは課金 10 倍。効かない所に台数を足さない)。
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: ubuntu-latest, shard: 1, shards: 1 }
+          - { os: macos-latest, shard: 1, shards: 1 }
+          - { os: windows-latest, shard: 1, shards: 3 }
+          - { os: windows-latest, shard: 2, shards: 3 }
+          - { os: windows-latest, shard: 3, shards: 3 }
+    name: fast (${{ matrix.os }} ${{ matrix.shard }}/${{ matrix.shards }})
     runs-on: ${{ matrix.os }}
     # nextest の slow-timeout が効かない事態への最終防壁。
+    # 予算 5 分の倍 = 「遅い」と「固まった」を取り違えない余裕。
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,26 +140,27 @@ jobs:
       # release.yml で実績のある eframe/egui 0.29 + rfd (GTK3) 向けパッケージ一覧。
       - name: Linux deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
-          # 50MB 超の debug バイナリはリンクが支配的。lld があれば数十秒縮む。
-          # 見つからない場合は既定のリンカのまま (ビルドを壊さない)。
-          if command -v ld.lld >/dev/null 2>&1; then
-            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
-          fi
+        # 時限と再試行は道具の側に 1 本だけ置く (`--self-test` で毎回証明する)。
+        # 素の `apt-get` は HTTP に時限を持たないので、詰まったミラーを掴むと
+        # **無音のままジョブの timeout まで待つ** (実測 13 分。同時刻の別ジョブは 58 秒)。
+        run: sh tools/ci-linux-deps.sh --lld
 
       # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: nextest
 
+      # `--partition count:M/N` は nextest がテストを N 本へ振り分ける
+      # (シャード 1 台では走らないテストが必ずある = **全シャードが緑で
+      # 初めて全件緑**)。1/1 のときは今までと 1 件も変わらない。
       - name: Tests (実PTY 以外の全て)
-        run: cargo nextest run --locked --no-fail-fast --profile ci -E 'not test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
+        run: cargo nextest run --locked --no-fail-fast --profile ci --partition count:${{ matrix.shard }}/${{ matrix.shards }} -E 'not test(/^terminal::[a-z0-9_]*pty[a-z0-9_]*::/)'
 
       # vendor/vt100 はワークスペースメンバーではないため、明示的に走らせないと
       # 敵対的入力テスト (hostile.rs) が一切実行されない。
+      # 分割しても中身は同じなので**先頭のシャードだけ**が回す (12 秒 × 台数の無駄を避ける)。
       - name: vendored vt100 tests
+        if: matrix.shard == 1
         run: cargo test --manifest-path vendor/vt100/Cargo.toml
 
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
@@ -157,8 +185,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # 直列実行のためわずかに長めの防壁 (それでも旧 30 分の半分以下)。
-    timeout-minutes: 12
+    # 直列実行のためわずかに長めの防壁。実測 (6 run): windows 234s / macos 135s /
+    # ubuntu 118s が最大なので、8 分あれば「遅い」と「固まった」を取り違えない。
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -176,14 +205,10 @@ jobs:
 
       - name: Linux deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
-          # 50MB 超の debug バイナリはリンクが支配的。lld があれば数十秒縮む。
-          # 見つからない場合は既定のリンカのまま (ビルドを壊さない)。
-          if command -v ld.lld >/dev/null 2>&1; then
-            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
-          fi
+        # 時限と再試行は道具の側に 1 本だけ置く (`--self-test` で毎回証明する)。
+        # 素の `apt-get` は HTTP に時限を持たないので、詰まったミラーを掴むと
+        # **無音のままジョブの timeout まで待つ** (実測 13 分。同時刻の別ジョブは 58 秒)。
+        run: sh tools/ci-linux-deps.sh --lld
 
       # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
       - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
@@ -220,7 +245,7 @@ jobs:
         startsWith(github.event.pull_request.head.ref, 'night/'))
     name: windows (lease/instances)
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -263,7 +288,7 @@ jobs:
         startsWith(github.event.pull_request.head.ref, 'night/'))
     name: msrv (1.88.0)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -280,12 +305,10 @@ jobs:
           cache-on-failure: true
 
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
-          if command -v ld.lld >/dev/null 2>&1; then
-            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
-          fi
+        # 時限と再試行は道具の側に 1 本だけ置く (`--self-test` で毎回証明する)。
+        # 素の `apt-get` は HTTP に時限を持たないので、詰まったミラーを掴むと
+        # **無音のままジョブの timeout まで待つ** (実測 13 分。同時刻の別ジョブは 58 秒)。
+        run: sh tools/ci-linux-deps.sh --lld
 
       # Cargo.toml の rust-version と、ここで使う toolchain がずれていないことを
       # **ワークフロー自身に確かめさせる** (人間の同期に頼らない)。
@@ -394,7 +417,7 @@ jobs:
     name: gui smoke (macos)
     runs-on: macos-latest
     # ビルドが支配的。キャッシュが冷えた回だけ長くなるので少し厚めに取る。
-    timeout-minutes: 15
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -460,7 +483,7 @@ jobs:
         startsWith(github.event.pull_request.head.ref, 'night/'))
     name: lint (clippy)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -482,12 +505,10 @@ jobs:
       # eframe/egui + rfd のビルドスクリプトが pkg-config gtk+-3.0 を要求するため、
       # clippy (= 実際に型検査する) にも同じ依存が必要。
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
-          if command -v ld.lld >/dev/null 2>&1; then
-            echo "RUSTFLAGS=$RUSTFLAGS -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
-          fi
+        # 時限と再試行は道具の側に 1 本だけ置く (`--self-test` で毎回証明する)。
+        # 素の `apt-get` は HTTP に時限を持たないので、詰まったミラーを掴むと
+        # **無音のままジョブの timeout まで待つ** (実測 13 分。同時刻の別ジョブは 58 秒)。
+        run: sh tools/ci-linux-deps.sh --lld
 
       # 整形は全ファイル適用済み。ここを通しておけば二度と債務が溜まらない。
       # clippy より先に置くのは、失敗したときの直し方が最も自明だから
@@ -595,9 +616,9 @@ jobs:
     name: mobile screen (chrome)
     runs-on: ubuntu-latest
     # **最後の砦**。ここに来る前に、道具が自分で理由を書いて赤で終わること
-    # (ZV_DEADLINE_MS 10 分 < ZV_WALL_S 11 分 < ここ 15 分)。この順序を
+    # (ZV_DEADLINE_MS 6 分 < ZV_WALL_S 7 分 < ここ 8 分)。この順序を
     # 崩すと「無音のまま打ち切り」に戻り、原因が 1 行も残らない。
-    timeout-minutes: 15
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -619,9 +640,9 @@ jobs:
         env:
           # ジョブの timeout より必ず短くする。**道具のほうが先に**
           # 「なぜ終わらないか」を書いて赤で終わるのが要点。
-          ZV_DEADLINE_MS: '600000'
+          ZV_DEADLINE_MS: '360000'
           ZV_STALL_MS: '120000'
-          ZV_WALL_S: '660'
+          ZV_WALL_S: '420'
           ZV_HEARTBEAT_MS: '20000'
         run: |
           set -o pipefail

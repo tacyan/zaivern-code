@@ -67,9 +67,8 @@ jobs:
 
       - name: Install Linux build deps
         if: startsWith(matrix.label, 'linux')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+        # 時限と再試行は道具の側に 1 本だけ (`--self-test` で毎回証明する)。
+        run: sh tools/ci-linux-deps.sh
 
       # アーカイブ名・実行ファイル名を 1 か所で決める。
       # 以降のステップ (package / checksum / size / upload) はこの出力だけを見るので、

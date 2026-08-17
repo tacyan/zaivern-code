@@ -4718,6 +4718,112 @@ prunable gitdir file points to non-existent location
         );
     }
 
+    /// **CI の apt は必ず道具越し。** 素の `apt-get` を直に書かない。
+    ///
+    /// 素の apt は HTTP に既定の時限を持たないので、詰まったミラーを掴むと
+    /// **無音のままジョブの上限まで待つ**。実測: run 32078628866 の `msrv` が
+    /// 13 分以上無反応でキャンセルされた一方、**同じ瞬間の `fast (ubuntu)` は
+    /// 同じ apt が 58 秒**で終わっていた。ミラー 1 本が詰まっただけである。
+    ///
+    /// 同じ 2 行がワークフロー 3 本に**計 10 か所**複製されていたので、
+    /// 片方だけ直しても次はもう片方で固まる。道具 1 本に寄せて、
+    /// **ここで「使っているか」を見る** (作ったのに使っていない道具は、
+    /// 作っていないのと同じ意味しか持たない)。
+    #[test]
+    fn ciのaptは時限つきの道具越しに呼ぶ() {
+        let tool = include_str!("../tools/ci-linux-deps.sh").replace("\r\n", "\n");
+        // 道具の側に 3 段の守りが揃っていること。
+        assert!(
+            tool.contains("Acquire::http::Timeout"),
+            "apt 自身に時限を渡していない (詰まったミラーを掴むと永遠に待つ)"
+        );
+        assert!(
+            tool.contains("run_with_timeout") && tool.contains("124"),
+            "外側の時限が無い (apt が時限を無視したら誰も打ち切らない)"
+        );
+        assert!(
+            tool.contains("--self-test"),
+            "わざと固める仕込みが無い (時限が効くことを確かめる手が無い)"
+        );
+        // 判定は最後の 1 行に必ず書く (パイプ越しに読んでも嘘にならない)。
+        assert!(
+            tool.contains("✓ Linux 依存 緑") && tool.contains("✗ Linux 依存 赤"),
+            "判定行が無い (`| head` を挟むと $? はそちらのものになる)"
+        );
+
+        // GTK 一式を入れているワークフローは、1 本残らず道具越しであること。
+        for (name, wf) in [
+            ("test.yml", include_str!("../.github/workflows/test.yml")),
+            (
+                "release.yml",
+                include_str!("../.github/workflows/release.yml"),
+            ),
+            ("xplat.yml", include_str!("../.github/workflows/xplat.yml")),
+        ] {
+            let wf = &wf.replace("\r\n", "\n");
+            assert!(
+                !wf.contains("libgtk-3-dev"),
+                "{name}: GTK 一式を素の apt で入れている (時限が無い経路が残っている)"
+            );
+        }
+    }
+
+    /// **CI の待ちは実測の 2〜3 倍まで。** 15 分の上限は「5 分予算」と矛盾する。
+    ///
+    /// 固まったジョブは `The operation was canceled.` しか残さないので、
+    /// 上限が長いほど**何も分からないまま待たされる時間**が延びる。
+    /// 実測 (6 run): fast(win) 最大 496s / pty(win) 234s / lint 102s /
+    /// mobile 291s。どれも 10 分あれば「遅い」と「固まった」を取り違えない。
+    #[test]
+    fn ciのジョブ上限は予算の範囲に収まっている() {
+        let wf = include_str!("../.github/workflows/test.yml").replace("\r\n", "\n");
+        let mut seen = 0usize;
+        for line in wf.lines() {
+            let Some(v) = line.trim().strip_prefix("timeout-minutes:") else {
+                continue;
+            };
+            let m: u64 = v.trim().parse().expect("timeout-minutes が数でない");
+            assert!(
+                m <= 10,
+                "5 分予算のワークフローに {m} 分の上限がある \
+                 (固まったときに {m} 分待たされるだけになる): {line}"
+            );
+            seen += 1;
+        }
+        assert!(
+            seen >= 8,
+            "timeout-minutes を持たないジョブがある (見つかったのは {seen} 個)"
+        );
+    }
+
+    /// **Windows の fast は分割して回す。**
+    ///
+    /// 実測 6 run の wall-clock は 321 / 387 / 387 / 389 / 470 / 496 秒 —
+    /// **6 回とも 5 分予算を超えていた**。内訳はテストの段だけで 390 秒で、
+    /// nextest は**テスト 1 件につき 1 プロセス**を起こすため、プロセス生成が
+    /// 高価な Windows では 1 台に載せている限り削れない。
+    ///
+    /// 分割を外すと静かに 8 分へ戻るので、ここで固定する。
+    #[test]
+    fn windowsのテストは分割して五分予算に収める() {
+        let wf = include_str!("../.github/workflows/test.yml").replace("\r\n", "\n");
+        let shards = wf.matches("os: windows-latest, shard:").count();
+        assert!(
+            shards >= 3,
+            "Windows の fast が {shards} 分割しかない (1 台では 5 分に収まらない)"
+        );
+        assert!(
+            wf.contains("--partition count:${{ matrix.shard }}/${{ matrix.shards }}"),
+            "シャードを宣言しているのに nextest へ渡していない \
+             (全シャードが同じ全件を回すだけになり、遅くなる)"
+        );
+        // 分けた結果 1 件も走らない、を起こさない (`--no-fail-fast` は全シャード共通)。
+        assert!(
+            wf.contains("--no-fail-fast"),
+            "分割したのに fail-fast のまま (1 シャードの失敗で他が打ち切られる)"
+        );
+    }
+
     // ── スマホの CSS: 「隠してあるものを、脇道から見せない」 ──────────
     //
     // 実際に出たバグ:
