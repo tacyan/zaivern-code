@@ -25,8 +25,9 @@
 # 3 段で守る:
 #   1. apt 自身に時限と再試行 (`Acquire::*::Timeout` / `Acquire::Retries`)
 #      — 詰まったミラーを掴んでも十数秒で諦め、別のを引く
-#   2. コマンドごとの `timeout` — apt が時限を無視しても外から撃つ
-#   3. 試行回数の上限 — 合わせて必ず ATTEMPTS×(U+I) 秒以内に決着する
+#   2. 外側の `timeout` — apt が時限を無視しても外から撃つ
+#   3. 全体の予算 (BUDGET) — 段ごとの固定待ちにはしない。**遅いだけで
+#      進んでいる apt を殺さない**ため、残りを次の試行へ渡す
 #
 # ## 判定は最後の 1 行に必ず書く
 #
@@ -56,12 +57,32 @@ APT_OPTS="-o Acquire::Retries=3
           -o Acquire::https::Timeout=15
           -o Acquire::ftp::Timeout=15"
 
+# 2 段目: **段ごとの固定待ちにしない。全体に 1 つの予算を置く。**
+#
+# 最初は「update に 90 秒 / install に 210 秒」と段ごとに切ったが、
+# **進んでいる apt を殺した** — リリースの linux-x86_64 が実際に落ちた。
+# ログを読むと azure のミラーが死んで `archive.ubuntu.com` へ切り替わり、
+# 索引を落とし始めた 68 秒後に 90 秒の線へ当たっていた。**遅いだけで
+# 進んでいた**のに撃った形で、CLAUDE.md の
+# 「固定の待ちにすると遅いランナーを誤って殺す」をそのまま踏んだ。
+#
+# そこで、1 回ごとではなく**全体の予算**を持ち、残りを次の試行へ渡す。
+# 遅いランナーは予算を丸ごと使えるし、本当に固まったものは必ず
+# BUDGET 秒で決着する (無音の 15 分にはならない)。
+# 実測の目安: 健全なら 60 秒 / ミラーが 1 本死んだ日で 90 秒。
+BUDGET=360
 ATTEMPTS=2
-UPDATE_TIMEOUT=90    # 2 段目: 索引の取得
-INSTALL_TIMEOUT=210  # 2 段目: 取得 + 展開 (GTK 一式は 100MB 超ある)
 
 say() { printf '%s\n' "$*"; }
 verdict() { say "$1"; }
+
+_started=$(date +%s)
+# 残り予算 (秒)。5 秒を下回ったら 0 を返す = もう試さない。
+remaining() {
+  r=$((BUDGET - ($(date +%s) - _started)))
+  [ "$r" -lt 5 ] && r=0
+  echo "$r"
+}
 
 # 時限つきで 1 回走らせる。時限切れは 124 (timeout(1) と同じ約束)。
 #
@@ -93,11 +114,21 @@ run_with_timeout() {
   wait "$pid"
 }
 
-# $1=表示名 $2=時限 以降=コマンド。ATTEMPTS 回まで試す。
+# $1=表示名 $2=時限 (0 なら「残り予算」を使う) 以降=コマンド。
+# ATTEMPTS 回まで、**残り予算が尽きるまで**試す。
 retry() {
-  what="$1"; secs="$2"; shift 2
+  what="$1"; fixed="$2"; shift 2
   i=1
   while [ "$i" -le "$ATTEMPTS" ]; do
+    if [ "$fixed" -gt 0 ]; then
+      secs="$fixed"
+    else
+      secs=$(remaining)
+      if [ "$secs" = 0 ]; then
+        say "⏱ $what — 予算 ${BUDGET}s を使い切った (試行 $i/$ATTEMPTS)"
+        return 1
+      fi
+    fi
     # **`if …; then return 0; fi` の後で `$?` を読まないこと。**
     # 分岐が選ばれなかった `if` は 0 を返すので、時限切れ (124) が
     # 握り潰されて「失敗 rc=0」という意味不明な行になる (実際になった)。
@@ -134,20 +165,45 @@ if [ "$SELF_TEST" = 1 ]; then
     verdict "✗ 自己検査 赤 — 打ち切りに ${el}s かかった (時限が働いていない)"
     exit 1
   fi
-  verdict "✓ 自己検査 緑 — 固まったコマンドを ${el}s で打ち切った"
+  # ── 2 本目: **予算の経路**も撃つことを証明する ──────────────────
+  #
+  # 実際に apt を通るのはこちら (`retry … 0 …`)。固定の待ちだけを試して
+  # 満足すると、**本番で使う経路が一度も確かめられていない**まま残る。
+  # 下限 (5s) より大きくすること — 下回ると「使い切った」へ即落ちて
+  # **時限そのものを一度も試さない**まま緑になる (最初にそう書いて気付いた)。
+  BUDGET=8
+  _started=$(date +%s)
+  ATTEMPTS=3
+  t0=$(date +%s)
+  if retry "わざと固める (予算)" 0 sleep 30; then
+    verdict "✗ 自己検査 赤 — 予算の経路で固まったコマンドが成功として返った"
+    exit 1
+  fi
+  el=$(( $(date +%s) - t0 ))
+  # 予算 8 秒 + 撃つまでの余裕。使い切ったら**必ず**降りること
+  # (降りないと、試行回数ぶんだけ予算が伸びて意味が消える)。
+  if [ "$el" -lt 5 ]; then
+    verdict "✗ 自己検査 赤 — 予算の経路が ${el}s で終わった (時限を一度も試していない)"
+    exit 1
+  fi
+  if [ "$el" -gt 20 ]; then
+    verdict "✗ 自己検査 赤 — 予算 ${BUDGET}s なのに ${el}s かかった (残りを渡していない)"
+    exit 1
+  fi
+  verdict "✓ 自己検査 緑 — 固定の待ちと予算の両方が撃った (${el}s)"
   exit 0
 fi
 
 # shellcheck disable=SC2086  # APT_OPTS / PKGS は意図的に語分割する
-if ! retry "apt-get update" "$UPDATE_TIMEOUT" sudo apt-get $APT_OPTS update; then
-  verdict "✗ Linux 依存 赤 — apt-get update が $ATTEMPTS 回とも通らなかった"
+if ! retry "apt-get update" 0 sudo apt-get $APT_OPTS update; then
+  verdict "✗ Linux 依存 赤 — apt-get update が通らなかった (予算 ${BUDGET}s)"
   exit 1
 fi
 
 # shellcheck disable=SC2086
-if ! retry "apt-get install" "$INSTALL_TIMEOUT" \
+if ! retry "apt-get install" 0 \
   sudo apt-get $APT_OPTS install -y --no-install-recommends $PKGS; then
-  verdict "✗ Linux 依存 赤 — apt-get install が $ATTEMPTS 回とも通らなかった"
+  verdict "✗ Linux 依存 赤 — apt-get install が通らなかった (予算 ${BUDGET}s)"
   exit 1
 fi
 

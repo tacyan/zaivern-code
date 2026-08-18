@@ -4745,6 +4745,18 @@ prunable gitdir file points to non-existent location
             tool.contains("--self-test"),
             "わざと固める仕込みが無い (時限が効くことを確かめる手が無い)"
         );
+        // **段ごとの固定待ちへ戻さない。** 90 秒で切ったら、ミラーが 1 本
+        // 死んだ日に**進んでいる apt を殺して**リリースの linux-x86_64 が落ちた。
+        assert!(
+            tool.contains("BUDGET=") && tool.contains("remaining()"),
+            "全体の予算が無い (段ごとの固定待ちは、遅いだけのランナーを誤って殺す)"
+        );
+        // 走らせない検査は無いのと同じ。CI で毎回撃たせる。
+        let wf = include_str!("../.github/workflows/test.yml").replace("\r\n", "\n");
+        assert!(
+            wf.contains("sh tools/ci-linux-deps.sh --self-test"),
+            "時限の自己検査が CI に無い (消えても次に固まるまで気付けない)"
+        );
         // 判定は最後の 1 行に必ず書く (パイプ越しに読んでも嘘にならない)。
         assert!(
             tool.contains("✓ Linux 依存 緑") && tool.contains("✗ Linux 依存 赤"),

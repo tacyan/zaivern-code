@@ -392,6 +392,13 @@ jobs:
           shellcheck --shell=sh --severity=error tools/*.sh
           echo "tools/*.sh: ${n} 本すべて通過"
 
+      # **時限は毎回わざと撃たせて証明する。** 空回りする時限を残さない。
+      # これが無いと「時限が消えていること」に気付けるのは、次に固まった
+      # ときだけになる (そのときには 13 分待たされている)。
+      # `--self-test` は sudo も apt も要らないので 10 秒で終わる。
+      - name: Linux 依存の時限が効くこと (--self-test)
+        run: sh tools/ci-linux-deps.sh --self-test
+
   # GUI E2E の **層 2** — 実バイナリを起こして、生きていることを確かめる
   # (起動して指定秒数生存 / panic.log が 0 バイト / プロセスツリーごと片付く)。
   #
