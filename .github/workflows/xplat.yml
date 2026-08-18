@@ -265,9 +265,8 @@ jobs:
 
       - name: Linux deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+        # 時限と再試行は道具の側に 1 本だけ (`--self-test` で毎回証明する)。
+        run: sh tools/ci-linux-deps.sh
 
       - name: zai を作る
         run: cargo build --bin zai --locked
@@ -335,9 +334,8 @@ jobs:
 
       - name: Linux deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+        # 時限と再試行は道具の側に 1 本だけ (`--self-test` で毎回証明する)。
+        run: sh tools/ci-linux-deps.sh
 
       # ハーネスは cargo を 1 度も呼ばない。**先に作っておく必要がある**
       # (古い zai を掴むと「実装したのに直っていない」という嘘の結果が出るので、
@@ -386,9 +384,8 @@ jobs:
           cache-on-failure: true
 
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+        # 時限と再試行は道具の側に 1 本だけ (`--self-test` で毎回証明する)。
+        run: sh tools/ci-linux-deps.sh
 
       # **テストバイナリも作る。** `coordinator-bench.sh` は `--exact` で
       # テストを名指しして回すので、素の `zai` では足りない。
@@ -480,12 +477,8 @@ jobs:
           cache-on-failure: true
 
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev lld
-          if command -v ld.lld >/dev/null 2>&1; then
-            echo "RUSTFLAGS=${RUSTFLAGS:-} -C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
-          fi
+        # 時限と再試行は道具の側に 1 本だけ (`--self-test` で毎回証明する)。
+        run: sh tools/ci-linux-deps.sh --lld
 
       # ■ `--exact` と「1 件走ったか」の検査を必ず付けること。
       #   `cargo test <filter>` は **1 件も当たらなくても終了コード 0** を返す。

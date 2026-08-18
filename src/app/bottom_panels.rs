@@ -53,38 +53,57 @@ impl ZaivernApp {
                                 let mut set_unread: Option<usize> = None;
                                 let mut set_read: Option<usize> = None;
                                 for (i, s) in self.agents.sessions.iter().enumerate() {
-                                    let dot = if s.running() {
-                                        if s.attention {
-                                            RichText::new("●").size(10.0).color(theme.warn)
-                                        } else {
-                                            RichText::new("●").size(10.0).color(theme.ok)
-                                        }
-                                    } else {
-                                        RichText::new("○").size(10.0).color(theme.err)
-                                    };
-                                    ui.label(dot);
-                                    let badge = if s.is_permission_agent() {
-                                        s.approval_badge()
-                                    } else {
-                                        ""
-                                    };
-                                    let r = ui.selectable_label(
-                                        i == active_ix,
-                                        format!("{}{} {}", badge, s.icon, s.title),
-                                    );
-                                    if s.has_unread() && i != active_ix {
-                                        ui.label(
-                                            RichText::new("◆").size(9.0).color(theme.accent),
-                                        )
-                                        .on_hover_text(tr("最後に見てから新しい出力があります"));
-                                    }
-                                    if let Some(line) = &s.rate_limited {
-                                        ui.label(RichText::new("⏳").color(theme.warn))
-                                            .on_hover_text(trf(
-                                                "レート制限/使用上限: {line}",
-                                                &[("line", line.clone())],
-                                            ));
-                                    }
+                                    // **タブの ID は並び順ではなくセッション ID から作る。**
+                                    // egui 0.29 の `selectable_label` は `allocate_*` の
+                                    // 自動採番から ID を作るので、行の途中で
+                                    // 出たり消えたりする印 (◆ 未読 / ⏳ レート制限) が
+                                    // 1 個増減しただけで**以降のタブの ID が全部ずれる**。
+                                    // egui は「押したフレームの ID」を「離したフレーム」で
+                                    // 照合するため、その 2 フレームの間に印が動くと
+                                    // **押したのとは別のタブが選ばれ、打った文章が
+                                    // 別のエージェントへ行く**
+                                    // (`e2e::widget_id_shift_tests` が実際に再現している)。
+                                    let r = ui
+                                        .push_id(s.id, |ui| {
+                                            let dot = if s.running() {
+                                                if s.attention {
+                                                    RichText::new("●").size(10.0).color(theme.warn)
+                                                } else {
+                                                    RichText::new("●").size(10.0).color(theme.ok)
+                                                }
+                                            } else {
+                                                RichText::new("○").size(10.0).color(theme.err)
+                                            };
+                                            ui.label(dot);
+                                            let badge = if s.is_permission_agent() {
+                                                s.approval_badge()
+                                            } else {
+                                                ""
+                                            };
+                                            let r = ui.selectable_label(
+                                                i == active_ix,
+                                                format!("{}{} {}", badge, s.icon, s.title),
+                                            );
+                                            if s.has_unread() && i != active_ix {
+                                                ui.label(
+                                                    RichText::new("◆")
+                                                        .size(9.0)
+                                                        .color(theme.accent),
+                                                )
+                                                .on_hover_text(tr(
+                                                    "最後に見てから新しい出力があります",
+                                                ));
+                                            }
+                                            if let Some(line) = &s.rate_limited {
+                                                ui.label(RichText::new("⏳").color(theme.warn))
+                                                    .on_hover_text(trf(
+                                                        "レート制限/使用上限: {line}",
+                                                        &[("line", line.clone())],
+                                                    ));
+                                            }
+                                            r
+                                        })
+                                        .inner;
                                     if r.clicked() {
                                         set_active = Some(i);
                                     }

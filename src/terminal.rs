@@ -377,18 +377,6 @@ pub struct Session {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// PTY リサイズの安定判定 (毎フレームの要求 → 送るべき 1 回に潰す)。
     resize_debounce: ResizeDebounce,
-    /// **主たる端末ビューがこの端末の大きさを決めたか。**
-    ///
-    /// デッキ / 看板 / Cockpit の小さなライブ枠は「見るだけ」の窓なので、
-    /// 主が一度決めたら以後 1 度も大きさを触らない。触らせると、画面を
-    /// 切り替えただけで PTY が縮み、Ink 系の CLI エージェント (Claude Code
-    /// など) が**枠より高いフレームを丸ごと描き直す**ため、同じ会話が履歴へ
-    /// もう一度積まれる (「コピーすると同じ文章が 2 回入る」の正体)。
-    ///
-    /// ただし**まだ誰も決めていない間だけ**はライブ枠に決めさせる。
-    /// デッキから起動してデッキで作業する人の端末が、起動時の 30×110 の
-    /// まま大きなペインの中で小さく残るのを避けるため。
-    size_owned: bool,
     /// リサイズを実際に撃つワーカー。初回のリサイズ確定時に遅延起動する。
     resizer: Option<ResizeCoalescer>,
     /// ワーカーの起動に失敗した (スレッドを作れなかった)。以後は再試行しない。
@@ -2109,7 +2097,6 @@ impl Session {
             writer,
             master: Arc::new(Mutex::new(pair.master)),
             resize_debounce: ResizeDebounce::settled((rows, cols)),
-            size_owned: false,
             resizer: None,
             resizer_spawn_failed: false,
             parser_rebuilt_notice: None,
@@ -4987,7 +4974,8 @@ mod tests {
         // 枠に 20 行入る大きさ (padding は上下)
         let h = 20.0 * cell_h + pad * 2.0;
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(300.0, h));
-        // 表 (パーサ行数 → 原点のずれ行数。正 = 下へ / 負 = 上へ)
+        // 表 (パーサ行数 → 原点のずれ行数。正 = 下へ / 負 = 上へ)。
+        // ここでは画面が最後まで埋まっている場合 (live == parser_rows)。
         for (parser_rows, shift) in [
             (0u16, 0i32), // 大きさが無いフレームは動かさない
             (1, 19),      // 1 行しか無ければ下端に貼り付く
@@ -4996,7 +4984,7 @@ mod tests {
             (21, -1),
             (45, -25), // 枠より高い = 上へはみ出して最新を映す
         ] {
-            let g = grid_rect(rect, pad, cell_h, parser_rows);
+            let g = grid_rect(rect, pad, cell_h, parser_rows, parser_rows);
             assert_eq!(
                 g.min.y,
                 rect.min.y + shift as f32 * cell_h,
@@ -5015,7 +5003,99 @@ mod tests {
             }
         }
         // 0 割りしない (フォントが測れないフレームでも落ちない)
-        assert_eq!(grid_rect(rect, pad, 0.0, 40), rect);
+        assert_eq!(grid_rect(rect, pad, 0.0, 40, 40), rect);
+    }
+
+    /// **起動直後のエージェントでもタイルに中身が映る。**
+    ///
+    /// 代替画面をやめて出力を積む CLI (claude) は、起動直後グリッドの
+    /// 上のほうしか使わない。実測 (2.1.234): 40 行のグリッドに対し
+    /// **中身は 0〜17 行だけ・カーソルは 14 行目**。ここでグリッドの
+    /// 最終行 (39) を枠の下端に合わせると、20 行しか入らない枠には
+    /// **20〜39 行 = 空行だけ**が映る (Cockpit のタイルが全部真っ黒)。
+    #[test]
+    fn 空の下半分ではなく生きている最下行を下端に合わせる() {
+        use super::{grid_rect, TERM_PADDING};
+        let pad = TERM_PADDING;
+        let cell_h = 10.0_f32;
+        let h = 20.0 * cell_h + pad * 2.0; // 枠に 20 行
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(300.0, h));
+
+        // 実測どおりの形: 40 行のグリッドに 18 行だけ生きている。
+        let g = grid_rect(rect, pad, cell_h, 40, 18);
+        // 生きている最下行 (17) が枠の中に収まっていること。
+        let live_top = g.min.y + pad + 17.0 * cell_h;
+        assert!(
+            live_top >= rect.min.y - 0.001 && live_top + cell_h <= rect.max.y + 0.001,
+            "起動画面の最下行が枠の外にある (タイルが真っ黒になる)"
+        );
+        // 生きている行数が枠に入るなら、上へは持ち上げない
+        // (持ち上げても見える中身は増えず、下に空白が空くだけ)。
+        assert_eq!(g.min.y, rect.min.y, "枠に入るのに原点を動かした");
+        assert_eq!(g.max, rect.max);
+
+        // 生きている行数が枠より多ければ、その最下行が下端に来る。
+        let g = grid_rect(rect, pad, cell_h, 40, 30);
+        assert_eq!(g.min.y, rect.min.y + (20.0 - 30.0) * cell_h);
+        let live_top = g.min.y + pad + 29.0 * cell_h;
+        assert!(live_top + cell_h <= rect.max.y + 0.001);
+
+        // 画面が最後まで埋まっていれば今までと 1 ピクセルも変わらない。
+        assert_eq!(
+            grid_rect(rect, pad, cell_h, 40, 40),
+            grid_rect(rect, pad, cell_h, 40, 40)
+        );
+        assert_eq!(
+            grid_rect(rect, pad, cell_h, 40, 40).min.y,
+            rect.min.y + (20.0 - 40.0) * cell_h
+        );
+        // 変な値でも枠から出ない (0 行 / 行数超過)。
+        for live in [0u16, 1, 39, 40, 200] {
+            let g = grid_rect(rect, pad, cell_h, 40, live);
+            assert!(g.min.y <= rect.min.y + 0.001, "live={live}: 下へずれた");
+            assert_eq!(g.max, rect.max, "live={live}");
+        }
+    }
+
+    /// [`live_row_count`] は「カーソル行」と「中身のある最下行」の遠いほう。
+    #[test]
+    fn 生きている最下行はカーソルと中身の遠いほう() {
+        use super::live_row_count;
+        // 40 行のグリッドに 18 行ぶん書いて、カーソルは 15 行目 (0 起点 14)。
+        let mut p = vt100::Parser::new(40, 30, 0);
+        for i in 0..18 {
+            p.process(format!("row{i:02}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[15;3H"); // カーソルだけ上へ戻す (入力欄の位置)
+        assert_eq!(
+            live_row_count(p.screen()),
+            18,
+            "中身のある最下行を見ていない"
+        );
+
+        // カーソルが中身の 1 つ下なら、そこまで見せる (これから書かれる行)。
+        p.process(b"\x1b[19;1H");
+        assert_eq!(live_row_count(p.screen()), 19, "これから書かれる行を隠した");
+
+        // 描き終えてカーソルを隅へ寄せただけの CLI は追わない
+        // (追うと空行だけの下半分を映して、また真っ黒になる)。
+        p.process(b"\x1b[40;1H");
+        assert_eq!(
+            live_row_count(p.screen()),
+            19,
+            "離れたカーソルを追って空行の下半分を映した"
+        );
+
+        // 最後まで埋まっている画面は今までどおりグリッドの最終行。
+        let mut full = vt100::Parser::new(40, 30, 0);
+        for i in 0..60 {
+            full.process(format!("line{i:02}\r\n").as_bytes());
+        }
+        assert_eq!(live_row_count(full.screen()), 40);
+
+        // 真っさらな画面でも 0 を返さない (少なくともカーソル行は見せる)。
+        let empty = vt100::Parser::new(40, 30, 0);
+        assert_eq!(live_row_count(empty.screen()), 1);
     }
 
     #[test]
@@ -9340,9 +9420,47 @@ fn handle_links(
     }
 }
 
+/// 画面のうち **まだ中身がある** いちばん下の行 (1 起点の行数)。
+///
+/// 「グリッドの最終行」と同じではない。代替画面をやめて出力を積む CLI
+/// エージェントは、起動直後はグリッドの**上のほうしか使っていない**。
+/// 実測 (claude 2.1.234 / `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`):
+/// 40 行のグリッドに対し **中身は 0〜17 行だけ・カーソルは 14 行目**で、
+/// 18〜39 行は 1 文字も無い。ここで最終行を下端に合わせると、
+/// 15 行しか入らない Cockpit のタイルには**空行だけが映る = 真っ黒**になり、
+/// 「複数起動すると、起動しているのかどうか分からない」として現れる。
+///
+/// 実測はエージェントごとに違う (40 行のグリッド・空きの下端):
+/// **claude 22 行 / codex 31 行 / gemini 0 行**。gemini のように画面を
+/// 埋める CLI では今までと 1 ピクセルも変わらない。
+///
+/// 返すのは「中身のある最下行」と「カーソル行」の遠いほう + 1。ただし
+/// **カーソルは中身の 1 つ下までしか追わない** — 描き終えてカーソルを隅へ
+/// 寄せる CLI を追うと、結局は空行だけの下半分を映してしまう。
+pub fn live_row_count(screen: &vt100::Screen) -> u16 {
+    let (rows, cols) = screen.size();
+    if rows == 0 {
+        return 0;
+    }
+    // 中身のある最下行。下から見て最初に見つけた行で止まるので、満杯の
+    // 画面 (通常の端末・全画面 TUI) は 1 行見ただけで返る。
+    let last = (0..rows)
+        .rev()
+        .find(|r| (0..cols).any(|c| screen.cell(*r, c).is_some_and(|x| x.has_contents())));
+    let cur = screen.cursor_position().0;
+    // カーソルは「これから書かれる行」なので、中身の**1 つ下**までは見せる。
+    // それより下に離れたカーソル (描き終えて隅へ寄せただけの CLI) は追わない
+    // — 追うと、結局は空行だけの下半分を映してしまう。
+    let bottom = match last {
+        Some(l) => cur.min(l.saturating_add(1)).max(l),
+        None => cur,
+    };
+    bottom.saturating_add(1).clamp(1, rows)
+}
+
 /// セルのグリッドを置く矩形を決める。
 ///
-/// **最後の行 (= 最新) が必ず枠の下端に来る**ように原点をずらす。
+/// **生きている最下行が必ず枠の下端に来る**ように原点をずらす。
 /// 枠がパーサより低ければ上へはみ出し (`painter_at(rect)` が切る)、
 /// 高ければ余白は上に付く (端末は下から積み上がるので、これが自然)。
 ///
@@ -9353,9 +9471,20 @@ fn handle_links(
 /// 実測: claude 2.1.233 の実ログを再生すると、同じ 1 行が履歴に並ぶ回数は
 /// **58 行なら 1 回・30 行だと 2 回・24 行だと 4 回**。
 ///
+/// `live_rows` ([`live_row_count`]) は「グリッドの最終行」ではない。
+/// **空の下半分を下端に合わせると、タイルには空行しか映らない** —
+/// 縮めない代わりの受け皿がここなので、ここが最終行を見た瞬間に
+/// 「起動したエージェントが 1 体も見えない」に戻る。
+///
 /// 行の対応をここ 1 か所で決めるので、描画・選択・リンク・検索の座標が
 /// ずれない (2 か所で計算すると、コピーだけが静かにずれる)。
-pub fn grid_rect(rect: egui::Rect, padding: f32, cell_h: f32, parser_rows: u16) -> egui::Rect {
+pub fn grid_rect(
+    rect: egui::Rect,
+    padding: f32,
+    cell_h: f32,
+    parser_rows: u16,
+    live_rows: u16,
+) -> egui::Rect {
     if cell_h <= 0.0 || parser_rows == 0 {
         return rect;
     }
@@ -9365,9 +9494,19 @@ pub fn grid_rect(rect: egui::Rect, padding: f32, cell_h: f32, parser_rows: u16) 
     if (fits - f32::from(parser_rows)).abs() < 0.5 {
         return rect;
     }
-    // **最後の行が常に枠の下端に来る**ように原点をずらす。
-    // 高いグリッド → 上へはみ出す (切られる)。低いグリッド → 下に貼り付く。
-    let shift = (fits - f32::from(parser_rows)) * cell_h;
+    // 枠の下端に合わせる行。
+    //
+    // * グリッドが枠に**収まる**とき (fits > parser_rows) は最終行。
+    //   低いグリッドを上へ貼ると、下に大きな空白が空く (デッキの全高ペイン)。
+    // * 枠より**高い**ときは生きている最下行。ただし枠に入る行数より上へは
+    //   持ち上げない (`max(fits)`) — 持ち上げると下に空白が空くだけで、
+    //   見える中身は 1 行も増えない。
+    let bottom = if f32::from(parser_rows) > fits {
+        f32::from(live_rows.clamp(1, parser_rows)).max(fits)
+    } else {
+        f32::from(parser_rows)
+    };
+    let shift = (fits - bottom) * cell_h;
     egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.min.y + shift), rect.max)
 }
 
@@ -9919,23 +10058,39 @@ pub fn draw(
     // 「描いた矩形と PTY のグリッド」が食い違う)。
     let padding = TERM_PADDING;
     // **端末を縮めてよいのは主たる端末ビューだけ** (`allow_resize`)。
+    // ライブ枠 (デッキ / 看板 / Cockpit) は**広げることだけ**できる。
     //
-    // ライブ枠 (デッキ / 看板 / Cockpit) は、まだ主が現れていない端末を
-    // **広げることだけ**できる。デッキから起動してデッキで作業する人の端末が
-    // 起動時の大きさのまま大きなペインに取り残されるのを避けつつ、画面を
-    // 切り替えただけで縮む (= CLI エージェントが会話を描き直して履歴が
-    // 二重になる) ことは起こさない。広げるぶんには描き直しても収まるので
-    // 二重にならない。
-    if allow_resize || !session.size_owned {
+    // 以前はここに「主がまだ現れていない間だけ広げてよい」という一方向の
+    // ラッチ (`size_owned`) があった。ねらいは往復のリサイズを避けることだが、
+    // **一度でも下部パネルが小さい高さで描くと、その大きさが永久に固定される**。
+    // その後 Cockpit を全画面で開いても端末は小さいままなので、
+    // `grid_rect` が最終行を下端へ合わせて**枠の上 3/4 が空白**になる
+    // (「途中で全画面表示されなくなる」として報告された。変更タブを見た後に
+    //  起きやすいのは、あちらが端末パネルを畳んで高さを変えるため)。
+    //
+    // ラッチが守っていた「縮めると CLI が会話を描き直して履歴が二重になる」は
+    // **現行の claude では実測で再現しない**。実 PTY で計った再送回数
+    // (claude 2.1.234 / `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`):
+    //   動かさない … 0 回 (44B) / 50→15 行 … 0 回 (3.0KB) / 15→50 行 … 0 回 (4.1KB)
+    // Ink の静的出力は一度きりなので、描き直されるのは入力欄まわりだけ。
+    // 広げる側と縮める側の費用もほぼ同じだった。
+    // **横と縦で規則が違う。**
+    //
+    // * 横 (桁) は**必ずいま描いている枠に合わせる**。他のビューの幅を持ち越すと
+    //   文字が右へ見切れる。看板のライブペインは「全画面 (窓幅いっぱい)」と
+    //   「分割 (細い)」の 2 つの幅を持つ ([`crate::kanban::main_rects`]) ので、
+    //   持ち越しを許すと**看板を出していないときの幅**が Cockpit やパネルへ
+    //   そのまま残る (利用者からの報告)。見切れは UI の原則
+    //   (「どの幅でも見切れない」) に反するので、幅は常に今の枠が決める。
+    // * 縦 (行) はライブ枠からは**広げるだけ**。小さな枠に合わせて縮めると、
+    //   枠より高いフレームを描き直す CLI の会話が履歴へ二重に積まれる。
+    //   足りないぶんは [`grid_rect`] が「生きている最下行」を映して吸収する。
+    {
         let cols = ((rect.width() - padding * 2.0) / cell_w).floor() as u16;
         let rows = ((rect.height() - padding * 2.0) / cell_h).floor() as u16;
-        if allow_resize {
-            session.resize(rows, cols);
-            session.size_owned = true;
-        } else {
-            let (cur_r, cur_c) = session.size;
-            session.resize(rows.max(cur_r), cols.max(cur_c));
-        }
+        // 規則そのものは純関数 1 本 ([`next_pty_size`]) に置いて表で固定する。
+        let (r, c) = next_pty_size(session.size, (rows, cols), allow_resize);
+        session.resize(r, c);
         if session.resize_pending() {
             // 安定カウント (RESIZE_STABLE_FRAMES) が完走する前に再描画が
             // 止まると、最終サイズが PTY へ届かないまま残る。完走するまで
@@ -9945,11 +10100,19 @@ pub fn draw(
     }
     // グリッドを置く矩形。**この枠が PTY を持たない (プレビュー) とき**や
     // リサイズが届く前のフレームでは、パーサの行数のほうが多い。そのときは
-    // 上へ伸ばして**いちばん下 (最新) を映す** — 上を映すと、入力欄も直近の
-    // 出力も見えない「上半分の残骸」だけが出る。
+    // 上へ伸ばして**生きている最下行 (最新) を映す** — 上を映すと、入力欄も
+    // 直近の出力も見えない「上半分の残骸」だけが出るし、グリッドの最終行を
+    // 見ると起動直後の空の下半分だけが映って**タイルが真っ黒**になる。
     let grid = {
-        let rows = lock_ok(&session.parser).screen().size().0;
-        grid_rect(rect, padding, cell_h, rows)
+        let parser = lock_ok(&session.parser);
+        let screen = parser.screen();
+        grid_rect(
+            rect,
+            padding,
+            cell_h,
+            screen.size().0,
+            live_row_count(screen),
+        )
     };
 
     // ── マウスによる文字選択(ドラッグ=範囲 / ダブルクリック=語 / トリプルクリック=行) ──
@@ -16674,5 +16837,61 @@ mod selection_scroll_tests {
             5,
             "取り込みの入口が 5 つでない"
         );
+    }
+}
+
+/// **枠の大きさから PTY の大きさを決める規則** (純関数)。
+///
+/// 横と縦で規則が違う:
+///
+/// * **横 (桁) は必ずいま描いている枠に合わせる。** 他のビューの幅を持ち越すと
+///   文字が右へ見切れる。看板のライブペインは「全画面 (窓幅いっぱい)」と
+///   「分割 (細い)」の 2 通りの幅を持つので、持ち越しを許すと**看板を出して
+///   いないときの幅**が Cockpit や下部パネルへそのまま残る (利用者からの報告)。
+/// * **縦 (行) はライブ枠からは広げるだけ。** 小さな枠に合わせて縮めると、
+///   枠より高いフレームを描き直す CLI の会話が履歴へ二重に積まれる。
+///   足りないぶんは [`grid_rect`] が「生きている最下行」を映して吸収する。
+///
+/// `owner` = 主たる端末ビュー (下部パネル) か。主だけが縦を縮められる。
+pub fn next_pty_size(cur: (u16, u16), frame: (u16, u16), owner: bool) -> (u16, u16) {
+    if owner {
+        frame
+    } else {
+        (frame.0.max(cur.0), frame.1)
+    }
+}
+
+#[cfg(test)]
+mod pty_size_tests {
+    use super::next_pty_size;
+
+    /// 主 (下部パネル) は縦も横もそのまま持つ。
+    #[test]
+    fn 主は枠のとおりに持つ() {
+        assert_eq!(next_pty_size((50, 200), (15, 120), true), (15, 120));
+        assert_eq!(next_pty_size((15, 120), (50, 200), true), (50, 200));
+    }
+
+    /// ライブ枠は縦を縮めない (縮めると CLI が描き直して履歴が二重になる)。
+    #[test]
+    fn ライブ枠は縦を縮めない() {
+        assert_eq!(next_pty_size((50, 120), (15, 120), false).0, 50);
+        // 広げるのは許す — これが無いと、下部パネルが一度でも低い高さで
+        // 描いた端末は、Cockpit を全画面にしても小さいまま残り、
+        // 枠の上が空白になる (「途中で全画面表示されなくなる」)。
+        assert_eq!(next_pty_size((15, 120), (50, 120), false).0, 50);
+    }
+
+    /// **ライブ枠でも横は必ず今の枠に合わせる。**
+    /// 看板の全画面ライブペイン (窓幅いっぱい) の幅を持ち越すと、
+    /// 2 列の Cockpit タイルで文字が右へ見切れる。
+    #[test]
+    fn 横は他のビューの幅を持ち越さない() {
+        // 広い所で使った後、細い枠へ来たら細くなる
+        assert_eq!(next_pty_size((30, 230), (30, 100), false).1, 100);
+        // 細い所で使った後、広い枠へ来たら広がる
+        assert_eq!(next_pty_size((30, 60), (30, 200), false).1, 200);
+        // 主でも同じ
+        assert_eq!(next_pty_size((30, 230), (30, 100), true).1, 100);
     }
 }
