@@ -1972,6 +1972,11 @@ mod tests {
         /// CRLF 変換も止める (Windows で内容が化けると計測が嘘になる)。
         fn git(&self) -> Command {
             let mut c = Command::new("git");
+            // cwd も実験場へ固定する。継承した cwd がリポジトリ発見に失敗する
+            // 場所だと、リポジトリ不要の merge-file まで巻き添えで fatal する —
+            // 隔離ワークツリーを Docker へマウントすると `.git` (本体への
+            // 絶対パス参照ファイル) の先がコンテナに無く、まさにこれを踏んだ。
+            c.current_dir(&self.dir);
             c.env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", self.dir.join("no-such-gitconfig"))
                 .env("GIT_TERMINAL_PROMPT", "0")

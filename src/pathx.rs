@@ -535,24 +535,29 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 大小非区別の OS では綴りの大小でリンクを迂回できない。
-    /// **OS で分岐する既定値は、テストも OS 条件を明示する。**
+    /// 大小非区別の環境では綴りの大小でリンクを迂回できない。
+    ///
+    /// **期待値は cfg (OS) ではなく、製品と同じ探針で分岐する。**
+    /// 大小を畳むかは `worktree::fs_case_insensitive()` が実 FS を叩いて
+    /// 決める設計なので、cfg で期待すると「Linux なのにマウント元が
+    /// 大小非区別 (Docker-on-Mac の bind mount)」という実在環境でだけ
+    /// 落ちる — 製品は正しく畳んでいるのに、テストが嘘の赤を出していた。
     #[test]
     fn 大小の違いで別物にならない() {
         let root = tree("case");
         let mut r = LinkResolver::new(&root);
         let got = r.resolve("SRC/APP.RS");
-        if cfg!(any(windows, target_os = "macos")) {
+        if crate::worktree::fs_case_insensitive() {
             assert_eq!(
                 got,
                 Resolved::Inside(crate::lease::normalize_path("src/app.rs")),
-                "大小非区別の OS では同じ実体"
+                "大小を畳む環境では同じ実体"
             );
         } else {
             assert_eq!(
                 got,
                 Resolved::Inside("SRC/APP.RS".to_string()),
-                "大小区別の OS では別のパス"
+                "大小を区別する環境では別のパス"
             );
         }
         std::fs::remove_dir_all(&root).ok();
