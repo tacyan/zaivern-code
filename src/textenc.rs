@@ -1279,12 +1279,14 @@ fn decode_utf8_or_ansi(bytes: &[u8]) -> String {
 
 fn decode_utf16(bytes: &[u8], little: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if little {
-                u16::from_le_bytes([c[0], c[1]])
+                u16::from_le_bytes(*c)
             } else {
-                u16::from_be_bytes([c[0], c[1]])
+                u16::from_be_bytes(*c)
             }
         })
         .collect();
@@ -1933,7 +1935,9 @@ fn score_utf16(b: &[u8], little: bool) -> f32 {
     }
     let pairs = b.len() / 2;
     let hits = b
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter(|c| {
             let (zero, other) = if little { (c[1], c[0]) } else { (c[0], c[1]) };
             zero == 0 && (other == b'\n' || other == b'\r' || other == b'\t' || other >= 0x20)

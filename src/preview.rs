@@ -2051,7 +2051,13 @@ mod tests {
         // GIF の部分更新 (差分) が合成されずに返ってくると、更新されなかった
         // 領域が透明 (alpha 0) のまま残る。画面録画なので全面不透明が正しい。
         for (i, f) in a.frames.iter().enumerate() {
-            let clear = f.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+            let clear = f
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 0)
+                .count();
             assert_eq!(clear, 0, "{i} コマ目に透明画素が {clear} 個残っている");
         }
         // 全コマが同じ絵 = 前のコマが焼き付いて更新されていない、の検出。

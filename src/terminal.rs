@@ -862,7 +862,7 @@ fn recent_lines_has_question(text: &str) -> bool {
 /// 見送っても停滞ウォッチドッグ → 手動承認で拾えるが、誤って y を撃つと
 /// 入力欄へ素の文字が入って送信される (非対称なので見送り側に倒す)。
 fn yn_ask_line(line: &str) -> bool {
-    const YN_ASKS: [&str; 11] = [
+    const YN_ASKS: &[&str] = &[
         "(y/n)", "[y/N]", "[y/n]", "(Y/n)", "[Y/n]", "(y/N)", "(Y/N)", "[y/n/a]", "[Y/n/a]",
         "(yes/no)", "[yes/no]",
     ];
@@ -1237,7 +1237,8 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
 
 /// scan_attention の「承認待ちらしさ」検出パターン (応答表とは独立)。
 /// 答えを持たない画面でも、これに当たれば「承認待ち」として看板に出す。
-const ATTENTION_PATTERNS: [&str; 6] = [
+/// 長さは書かない (スライス) — 番人 `union::handcounted_len` の対象なので。
+const ATTENTION_PATTERNS: &[&str] = &[
     "Do you want",
     "Would you like to proceed",
     "❯ 1. Yes",
