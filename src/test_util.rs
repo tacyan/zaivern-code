@@ -273,15 +273,12 @@ pub fn source_digest(src_root: &Path) -> Option<(u64, usize, u64)> {
         *h = (*h ^ chunk).wrapping_mul(PRIME).rotate_left(29);
     }
     fn feed(h: &mut u64, bytes: &[u8]) {
-        let mut it = bytes.chunks_exact(8);
-        for c in &mut it {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(c);
-            mix(h, u64::from_le_bytes(w));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            mix(h, u64::from_le_bytes(*c));
         }
         let mut w = [0u8; 8];
-        let r = it.remainder();
-        w[..r.len()].copy_from_slice(r);
+        w[..rest.len()].copy_from_slice(rest);
         mix(h, u64::from_le_bytes(w));
     }
 

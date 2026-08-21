@@ -294,7 +294,7 @@ mod icon_tests {
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
         // 全面透明・全面単色ではない (縮小フィルタ変更でのつぶれ検出)。
         assert!(
-            icon.rgba.chunks_exact(4).any(|p| p[3] > 0),
+            icon.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0),
             "アイコンが完全に透明になっている"
         );
     }

@@ -797,20 +797,20 @@ fn auto_yes_reply_inner(
         return Some((b"1", "「1. Yes/Allow/はい」"));
     }
 
-    // (y/n), [y/N], (はい/いいえ) 等のテキスト問い合わせ
-    if text.contains("(y/n)")
-        || text.contains("[y/N]")
-        || text.contains("[y/n]")
-        || text.contains("(Y/n)")
-        || text.contains("[Y/n]")
-        || text.contains("(y/N)")
-        || text.contains("(Y/N)")
-        || text.contains("[y/n/a]")
-        || text.contains("[Y/n/a]")
-        || text.contains("(yes/no)")
-        || text.contains("[yes/no]")
-        || text.contains("(y/N)?")
-        || text.contains("[Y/n]?")
+    // (y/n), [y/N], (はい/いいえ) 等のテキスト問い合わせ。
+    // **画面全体ではなく末尾 4 行 (空行除く) だけ**を見る。本物の y/n プロンプトは
+    // カーソルが画面末尾で入力を待つ形でしか現れない一方、"(y/n)" という文字列
+    // そのものは会話本文・リリースノート・復元した旧画面に普通に写る。実際に
+    // Claude Code 起動画面のリリースノート (「`claude plugin install/update`
+    // ask `[y/N]` (or pass `-y`)」) へ y\r が撃ち込まれ、**何も入力していない
+    // 入力欄に y が入って送信される**事故が起きた (approvals.jsonl で確認)。
+    if text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(4)
+        .any(yn_ask_line)
     {
         return Some((b"y\r", "「y」"));
     }
@@ -855,20 +855,24 @@ fn recent_lines_has_question(text: &str) -> bool {
     false
 }
 
+/// 行が (y/n) 型のテキスト問い合わせか。
+///
+/// バッククォートを含む行はコード・引用 (「ask `[y/N]` (or pass `-y`)」の
+/// ような説明文) なので、末尾に見えていても質問とは見なさない。誤って
+/// 見送っても停滞ウォッチドッグ → 手動承認で拾えるが、誤って y を撃つと
+/// 入力欄へ素の文字が入って送信される (非対称なので見送り側に倒す)。
+fn yn_ask_line(line: &str) -> bool {
+    const YN_ASKS: &[&str] = &[
+        "(y/n)", "[y/N]", "[y/n]", "(Y/n)", "[Y/n]", "(y/N)", "(Y/N)", "[y/n/a]", "[Y/n/a]",
+        "(yes/no)", "[yes/no]",
+    ];
+    !line.contains('`') && YN_ASKS.iter().any(|m| line.contains(m))
+}
+
 /// YESモードで肯定する一般的な承認質問行か。
 fn is_question_line(line: &str) -> bool {
     let line = line.trim_end();
-    if line.ends_with('?')
-        || line.ends_with('？')
-        || line.contains("(y/n)")
-        || line.contains("[y/N]")
-        || line.contains("[y/n]")
-        || line.contains("(Y/n)")
-        || line.contains("(yes/no)")
-        || line.contains("[yes/no]")
-        || line.contains("(y/N)")
-        || line.contains("[Y/n]")
-    {
+    if line.ends_with('?') || line.ends_with('？') || yn_ask_line(line) {
         return true;
     }
 
@@ -1229,6 +1233,27 @@ pub fn numbered_menu_reply(text: &str) -> Option<(&'static [u8], &'static str)> 
         MenuPick::Rating => ans.rating,
     };
     Some((ans.key, desc))
+}
+
+/// scan_attention の「承認待ちらしさ」検出パターン (応答表とは独立)。
+/// 答えを持たない画面でも、これに当たれば「承認待ち」として看板に出す。
+/// 長さは書かない (スライス) — 番人 `union::handcounted_len` の対象なので。
+const ATTENTION_PATTERNS: &[&str] = &[
+    "Do you want",
+    "Would you like to proceed",
+    "❯ 1. Yes",
+    "1. Yes",
+    "(y/n)",
+    "[y/N]",
+];
+
+/// 画面に「承認待ちらしきもの」が写っているか。
+/// scan_attention の `present` 判定と、復元起動時の封印 (preload_scrollback) が
+/// 同じ定義を共有する — 別々に持つと「検知はするのに封印されない」隙間ができる。
+fn prompt_present_for(text: &str, agent: Option<&str>) -> bool {
+    auto_yes_reply_for(text, agent).is_some()
+        || ATTENTION_PATTERNS.iter().any(|p| text.contains(p))
+        || numbered_menu_prompt(text).is_some()
 }
 
 /// プロンプト指紋の対象となるマーカー。scan_attention の検出パターンに加え、
@@ -1858,20 +1883,32 @@ impl Session {
     /// 旧スクロールバックを見える状態にする。末尾に [`RESTORE_BANNER`] を足して
     /// 「どこからが今回か」を分かるようにする。spawn 直後 (エージェントの最初の
     /// 出力が届く前) に呼ぶ想定 — 読取スレッドとはパーサのロックで排他される。
-    pub fn preload_scrollback(&self, bytes: &[u8]) {
+    pub fn preload_scrollback(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         // 生ログは PTY のバイト列そのままなので、読取スレッドと**同じ**
         // 正規化を通す (通さないと復元した画面だけが化ける)。
-        let mut norm = crate::textenc::TermDecoder::new(term_encoding());
-        let mut p = lock_ok(&self.parser);
-        p.process(norm.feed(bytes));
-        let rest = norm.finish();
-        if !rest.is_empty() {
-            p.process(rest);
+        let text = {
+            let mut norm = crate::textenc::TermDecoder::new(term_encoding());
+            let mut p = lock_ok(&self.parser);
+            p.process(norm.feed(bytes));
+            let rest = norm.finish();
+            if !rest.is_empty() {
+                p.process(rest);
+            }
+            p.process(RESTORE_BANNER.as_bytes());
+            p.screen().contents()
+        };
+        // 再生した旧画面には、前回セッションが承認待ちのまま終わった
+        // プロンプトがそのまま写っていることがある。相手のプロセスは
+        // もう居ないので、これに自動YESや承認待ち検知が反応すると、
+        // **起動直後の新しいエージェントの空の入力欄へ y や Enter が
+        // 撃ち込まれる** (実際に起きた)。応答済みとして封をする —
+        // 新しいプロンプトは指紋が変わるので通常どおり検知される。
+        if prompt_present_for(&text, self.agent_bin()) {
+            self.answered_sig = Some(prompt_signature(&text));
         }
-        p.process(RESTORE_BANNER.as_bytes());
     }
 
     pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {
@@ -2257,22 +2294,14 @@ impl Session {
                 }
             }
         }
-        const PATTERNS: [&str; 6] = [
-            "Do you want",
-            "Would you like to proceed",
-            "❯ 1. Yes",
-            "1. Yes",
-            "(y/n)",
-            "[y/N]",
-        ];
         // 応答表の絞り込みに使うため、このセッションのエージェント名を渡す。
         // (Antigravity 用のルールが claude のセッションへ流れ込まない)
         let reply = auto_yes_reply_for(&text, self.agent_bin());
-        // 番号入力メニューは PATTERNS のどれにも当たらない形なので別に見る。
+        // 番号入力メニューは ATTENTION_PATTERNS のどれにも当たらない形なので別に見る。
         // 答えが決まらない画面 (評点しか無いアンケート等) でもここで検知され、
         // 「承認待ち」として看板/承認 UI に出る = 黙って止まったままにならない。
         let present = reply.is_some()
-            || PATTERNS.iter().any(|p| text.contains(p))
+            || ATTENTION_PATTERNS.iter().any(|p| text.contains(p))
             || numbered_menu_prompt(&text).is_some();
         // 応答済みエピソードの追跡: プロンプトが画面から消えた、または指紋が
         // 変わった(連続承認キューの次のダイアログ等)ら「応答済み」を下ろす。
@@ -2300,6 +2329,20 @@ impl Session {
         }
         if auto_yes && waiting {
             if let Some((bytes, desc)) = reply {
+                // **直前のスキャンから画面が動いている間は撃たない。**
+                // ダイアログの描画途中 (質問行だけが先に見えた瞬間) に先走って
+                // y を送ると、直後に出る選択肢 UI とずれて素の文字が入力欄へ
+                // 落ちる (実ログで「Switch model?」の直後に y\r → 次スキャンで
+                // Enter、と二重に撃った跡を確認)。本物のプロンプトは待って
+                // くれるので、1 スキャン (約 1 秒) 静止してから答える。
+                // semantic_hash はスピナー・経過秒を潰しているので、
+                // 「動いている」= 本当に内容が変わっているときだけ。
+                if self.cur_hash != self.prev_hash {
+                    // 承認待ち通知も出さない — 次のスキャンで自動応答する
+                    // 予定のものへバブルを出すと、答えた直後に消える通知が
+                    // 毎回瞬いてしまう。
+                    return None;
+                }
                 // 同じプロンプトへは一度だけ送る。画面に残っていても再送しない
                 // (再送は Claude 側の入力欄への Enter/y 連打事故になる)。
                 // 指紋が変わって別のプロンプトが来たときだけ、また一度応答する。
@@ -3517,6 +3560,46 @@ mod tests {
     /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
     fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         stalled_reply_for(text, None)
+    }
+
+    /// 起動直後に空の入力欄へ y が撃ち込まれたバグの再発防止。
+    /// Claude Code の起動画面はリリースノート本文に「`claude plugin
+    /// install/update` ask `[y/N]` (or pass `-y`)」を**そのまま**表示する。
+    /// これは質問ではないので、画面のどこにあっても y を送ってはいけない
+    /// (実ログ term_logs の再生と approvals.jsonl の監査で発火を確認した実物)。
+    #[test]
+    fn 起動画面のリリースノート本文のynには反応しない() {
+        let screen = "Claude Code v2.1.234\n\
+             │ What's new: `claude plugin install/update` ask `[y/N]` (or pass `-y`) │\n\
+             │ /release-notes for more │\n\
+             │ ~/dev/zaivern-code │";
+        assert!(
+            auto_yes_reply(screen).is_none(),
+            "リリースノート本文の [y/N] へ y を撃った"
+        );
+        // 描画が完了して入力欄が下に付いた形でも同じ。
+        let drawn = format!("{screen}\n─────\n❯ Try \"fix lint errors\"\n─────\n⏵⏵ auto mode on");
+        assert!(auto_yes_reply(&drawn).is_none());
+    }
+
+    /// (y/n) に y を送ってよいのは、末尾で入力を待っている本物のプロンプトだけ。
+    /// 画面上方の会話本文・復元した旧出力に写った "(y/n)" は対象外。
+    #[test]
+    fn ynプロンプトは末尾で待っているときだけ答える() {
+        // 末尾で待つ本物 → y\r
+        let real = "some output\nDo you want to proceed? (y/n) ";
+        let (bytes, _) = auto_yes_reply(real).unwrap();
+        assert_eq!(bytes, b"y\r");
+        // 末尾 4 行より上の本文に写っただけ → 無視
+        let ghost = "build output mentioning (y/n) here\n\
+             more output line\n\
+             another line\n\
+             final build line\n\
+             $ done";
+        assert!(
+            auto_yes_reply(ghost).is_none(),
+            "本文中の (y/n) へ y を撃った"
+        );
     }
 
     #[test]
@@ -6459,6 +6542,71 @@ mod tests {
                 Some(_) => panic!("ペット承認が 2 度目に発火した ({round} 回目)"),
             }
         }
+    }
+
+    // ── 起動直後 / 復元直後の迷い打鍵防止 ─────────────────────────────
+
+    /// 復元起動 (launch_restored) で再生した旧画面に、前回セッションが
+    /// 承認待ちのまま終わったプロンプトが写っていても、新しいエージェントへ
+    /// y や Enter を撃ち込まない。相手のプロセスはもう居ないので、届く先は
+    /// **起動直後の空の入力欄**になる (実際に y が入力・送信された)。
+    #[cfg(unix)]
+    #[test]
+    fn 復元で写った旧プロンプトへは自動yesを撃たない() {
+        use std::time::{Duration, Instant};
+
+        let mut s = spawn_prompt_session(9410, "sleep 10");
+        // 前回セッションの生ログの尾 (承認プロンプトが画面に残ったまま終了)。
+        s.preload_scrollback(b"$ deploy\r\nDo you want to proceed? (y/n) ");
+        // 判定に使う「いま」は全部こちらで刻む (実時間の閾値待ちをしない)。
+        let mut clock = Instant::now() + Duration::from_secs(1);
+        for round in 1..=5 {
+            assert!(
+                s.scan_attention_at(true, clock).is_none(),
+                "復元した旧画面のプロンプトに反応した ({round} 回目)"
+            );
+            clock += Duration::from_secs(1);
+        }
+        s.kill();
+    }
+
+    /// ダイアログの描画途中 (質問行だけが先に見えた瞬間) には答えない。
+    /// 1 スキャン静止してから、完成した画面に合ったキーで 1 度だけ答える。
+    /// (実ログで「Switch model?」の直後に y\r → 次スキャンで Enter と
+    ///  二重に撃ち、y だけが入力欄へ落ちて送信された跡を確認した)
+    #[cfg(unix)]
+    #[test]
+    fn 描画途中の質問行には静止を待ってから答える() {
+        use super::Attention;
+        use std::time::{Duration, Instant};
+
+        let mut s = spawn_prompt_session(9411, "sleep 10");
+        // 描画途中: 質問行だけが先に届いた瞬間。
+        s.parser.lock().unwrap().process(b"  Switch model?\r\n");
+        let t1 = Instant::now() + Duration::from_secs(1);
+        assert!(
+            s.scan_attention_at(true, t1).is_none(),
+            "描画途中の質問行へ先走って答えた"
+        );
+        // 続きが届いて選択肢 UI が完成した。まだ「動いた直後」なので撃たない。
+        s.parser
+            .lock()
+            .unwrap()
+            .process("  ❯ 1. Yes\r\n    2. No\r\n".as_bytes());
+        let t2 = t1 + Duration::from_secs(1);
+        assert!(
+            s.scan_attention_at(true, t2).is_none(),
+            "画面が動いた直後に撃った"
+        );
+        // 静止 1 スキャンを確認してから、完成形に合った Enter で 1 度だけ答える。
+        let t3 = t2 + Duration::from_secs(1);
+        match s.scan_attention_at(true, t3) {
+            Some(Attention::AutoReplied(desc)) => {
+                assert!(desc.contains("Enter"), "完成形と違う応答: {desc}")
+            }
+            _ => panic!("静止後も答えなかった"),
+        }
+        s.kill();
     }
 
     // ── 選択肢が画面外へスクロールした場合 ────────────────────────────
