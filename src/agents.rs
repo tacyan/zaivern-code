@@ -2053,7 +2053,7 @@ impl AgentManager {
     ) -> Result<(), String> {
         let id = self.next_id;
         self.next_id += 1;
-        let session = Session::spawn(id, spec, ctx.clone())?;
+        let mut session = Session::spawn(id, spec, ctx.clone())?;
         session.preload_scrollback(replay);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
