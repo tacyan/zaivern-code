@@ -25,8 +25,16 @@
 #   * `app::glyph_tests::*`                    slim イメージにフォントが無い
 #   * `cli::tests::instance_current_uses_own_pid`  PID 名前空間が違う
 #   * `terminal::reap_pty_tests::*`            コンテナ内の PTY / プロセスツリー
+#   * `features::guard::imp::tests::大きなコミットでも判定が線形に収まる`
+#     — 絶対時間 (1 秒) の線を持つ時間テスト。Docker VM が飽和していると
+#       跳ねる (単独では通る)。「絶対時間で線を引かない」の未返済分
 #
 # 判断に迷ったら、その 1 件を CI の ubuntu ジョブで確認する。
+#
+# なお「大小畳み」系 (pathx / guard) は cfg ではなく実 FS 探針
+# (`worktree::fs_case_insensitive`) で期待値を分岐している。ここのマウント
+# (/w = macOS の大小非区別 FS) は「Linux なのに大小非区別」という実在の
+# 混在環境なので、cfg で期待値を書き直すと**ここでだけ**嘘の赤が出る。
 set -eu
 _LABEL='Linux (Docker)'
 
@@ -174,11 +182,40 @@ fi
 # Linux 側の目的は**挙動の確認**でデバッガを当てることではないので落とす。
 # `exec` にしない — プロセスを置き換えると EXIT の判定行が出せない
 # (パイプ越しに読む人には「何も出ずに終わった」としか見えなくなる)。
-docker run --rm \
+# ── 隔離ワークツリーでも git が生きるようにする ────────────────────────
+# ワークツリーの `.git` は「本体 `.git/worktrees/<名前>` への**ホスト絶対
+# パス**参照ファイル」なので、ワークツリーだけをマウントすると、コンテナ内で
+# リポジトリ発見をする git が全部 `fatal: not a git repository` になる
+# (region の実 git テストで実際に踏んだ — cwd を継承した `git merge-file`
+# が、リポジトリ不要の操作なのに発見の失敗で巻き添え死した)。
+# 参照先の本体 `.git` を**同じ絶対パスへ read-only で**写して発見を成立させる。
+# ro なのは安全のため — テストが実リポジトリへ書くことは無い約束で、
+# 書こうとすれば ro が落とすので、それ自体が検出になる。
+main_git=''
+if [ -f "$root/.git" ]; then
+    gd=$(sed -n 's/^gitdir: *//p' "$root/.git")
+    case "$gd" in
+        */.git/worktrees/*) main_git="${gd%/worktrees/*}" ;;
+    esac
+    if [ -n "$main_git" ] && [ ! -d "$main_git" ]; then
+        main_git=''
+    fi
+    if [ -n "$main_git" ]; then
+        echo "   git dir:  $main_git (ワークツリーの参照先を ro で写す)"
+    else
+        echo "   git dir:  **参照先を解決できない — git のリポジトリ発見はコンテナ内で失敗します**" >&2
+    fi
+fi
+# 空白を含むパスでも壊れないよう、引数は set -- で組み立てる。
+set -- --rm \
     -v "$root":/w -w /w \
     -v "$target_mount":/target \
     -v "$registry_vol":/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target \
-    -e CARGO_PROFILE_TEST_DEBUG=0 \
+    -e CARGO_PROFILE_TEST_DEBUG=0
+if [ -n "$main_git" ]; then
+    set -- "$@" -v "$main_git":"$main_git":ro
+fi
+docker run "$@" \
     "$image" \
     sh -c "$cmd"

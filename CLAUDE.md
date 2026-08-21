@@ -221,7 +221,16 @@
     `CARGO_TARGET_DIR` を分けている
   - **Docker でだけ落ちるものは追わない**: `app::glyph_tests::*` (フォント無し) /
     `cli::tests::instance_current_uses_own_pid` (PID 名前空間) /
-    `terminal::reap_pty_tests::*` (コンテナ内 PTY)。CI の ubuntu では通る
+    `terminal::reap_pty_tests::*` (コンテナ内 PTY) /
+    `features::guard::…::大きなコミットでも判定が線形に収まる` (絶対時間 1 秒の線。
+    VM 飽和時だけ跳ねる)。CI の ubuntu では通る
+  - **隔離ワークツリーからでも回せる**。ワークツリーの `.git` は本体への
+    **ホスト絶対パス参照ファイル**なので、素朴にマウントするとコンテナ内の
+    git が全部 `not a git repository` になる (region の実 git テスト 3 本が
+    実際に落ちた)。`linux-test.sh` が参照先の本体 `.git` を同じ絶対パスへ
+    **read-only** で写して発見を成立させる。テスト側も、リポジトリ不要の
+    git 操作 (`merge-file` 等) に **cwd を継承させない** (`Lab::git` が
+    実験場へ固定する) — cwd の発見失敗はリポジトリ不要の操作まで巻き添えにする
 - **Windows 側は `tools/windows-check.sh` で確認する。** `#[cfg(windows)]` のコードは
   macOS のビルドで**一度もコンパイルされない** (src/ の 23 ファイルに 87 箇所ある)。
   手元の `cargo check` が全部緑でも、その中身は未検証のまま残る。
@@ -242,6 +251,11 @@
 - **OS で分岐する既定値は、テストも OS 条件を明示する。** `#[cfg(target_os = "macos")]` か
   `cfg!(...)` を期待値に入れる。macOS の予約表と突き合わせるテストを非 mac で走らせると、
   「その OS では使わない打鍵」を咎めるだけになる。
+  - ただし**探針で決まる既定値は、テストも同じ探針で分岐する**。パスの大小畳みは
+    cfg ではなく実 FS 検査 (`worktree::fs_case_insensitive`, プロセスに 1 回) で
+    決まるので、期待値を cfg で書くと「Linux なのにマウント元が大小非区別」
+    (Docker-on-Mac の bind mount) という実在環境でだけ嘘の赤が出る — 製品は
+    正しく畳んでいるのにテストが落ちる形で pathx / guard が実際に踏んだ。
 - `terminal::` は実 PTY テスト。1 つの `cargo test` プロセス内で走らせると子プロセスツリーが蓄積し **Linux ランナーを殺す**ため、CI は cargo-nextest（テスト毎プロセス + `pty` test-group で直列化 + slow-timeout のプロセスグループ kill）で実行する。設定は `.config/nextest.toml`。
 - ローカル実行例: `cargo nextest run --profile ci`（全量）/ `cargo test session::`（モジュール別）。
 - テストは `crate::test_util::unique_temp_dir` を使い、実 `~/.zaivern` に触れない。
@@ -335,6 +349,11 @@
     なっていること」。枝分かれ (`#alist.show` と `#alist.mid`) が抜け道になる
   - **`[skip]` は緑ではない。** 関門は最後に `緑 / 赤 / 未確認` を出す。
     CI では skip を不合格にする。経緯と層の地図は `docs/preflight.md`
+  - **公開 (`gh release create`) は、回した検査が全部出そろってから。**
+    0.22.1 で linux / windows の段を走らせたまま公開し、後から届いた赤の
+    切り分けを**出荷後に**やる羽目になった (幸い環境起因だったが、それは
+    結果論)。「CI が緑だから先に出す」をやると、追加で回した検査は
+    **出荷を止める力を失う** — 待てないなら最初から回さない、回したなら待つ
 
 ## UI の原則
 

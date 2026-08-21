@@ -3660,7 +3660,7 @@ mod tests {
     }
 
     /// `.` / `..` / 区切り / 大小の違いでゲートを迂回できないこと。
-    /// **OS で分岐する既定値は、テストも OS 条件を明示する。**
+    /// 大小の期待値は本文のとおり FS 探針で分岐する (cfg では書かない)。
     #[test]
     fn ドットと区切りと大小の違いでゲートを回避できない() {
         let Some((repo, _)) = repo_with_link("link-spelling") else {
@@ -3688,11 +3688,15 @@ mod tests {
         // 担当が居ないパスは通る (「常に止める」へ倒れていないこと)
         assert!(!deny("src/other.txt"));
 
-        // 大小非区別の OS だけ、綴りの大小でも同じ実体になる
+        // 大小を畳む環境だけ、綴りの大小でも同じ実体になる。
+        // 期待値は cfg (OS) ではなく**製品と同じ探針**で分岐する — 畳むかは
+        // `worktree::fs_case_insensitive()` (実 FS 検査・プロセスに 1 回) が
+        // 決めるので、cfg で書くと Docker-on-Mac (Linux + 大小非区別マウント)
+        // でだけ嘘の赤が出る (pathx::tests::大小の違いで別物にならない と同型)。
         assert_eq!(
             deny("SRC/F.TXT"),
-            cfg!(any(windows, target_os = "macos")),
-            "大小の扱いが OS の性質と食い違っている"
+            crate::worktree::fs_case_insensitive(),
+            "大小の扱いが FS 探針の答えと食い違っている"
         );
         // Windows の区切りでも迂回できない
         #[cfg(windows)]
