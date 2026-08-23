@@ -11815,6 +11815,262 @@ mod resize_tests {
     }
 }
 
+/// **最上段から始まるスクロール領域の押し出しが履歴へ積まれる**こと
+/// (vendor/vt100 のパッチ)。
+///
+/// codex の inline TUI (既定) は「入力欄を画面下端に固定し、その上の領域
+/// (`[1;29r` 等 — **上端は必ず row 1**) を LF で上へ流す」形で会話履歴を
+/// 端末へ送る。実測 (codex 0.149.0 / 120x40 / `/status` ×4):
+/// `?1049h` 0 回・LF 67 回・領域は `[1;29r` `[1;32r` `[1;35r` `[1;40r`。
+/// 実端末 (alacritty: "Only rotate the entire history if the active region
+/// starts at the top") はこの押し出しを履歴へ積むが、元の vt100 は
+/// 「領域が全画面でなければ捨てる」だったので、**codex の会話履歴だけが
+/// 1 行も遡れなかった** (Shell や gemini では遡れるのに、という差で報告された)。
+#[cfg(test)]
+mod region_scrollback_tests {
+    use super::count_around;
+
+    /// いま積まれている履歴の行数 (読むだけ。戻り量は元へ戻さない)。
+    fn sb_rows(p: &mut vt100::Parser) -> usize {
+        p.set_scrollback(usize::MAX);
+        let n = p.screen().scrollback();
+        p.set_scrollback(0);
+        n
+    }
+
+    /// 素の行流し (`\r\n` だけ)。`n` 行を続けて出す。
+    fn feed_plain(p: &mut vt100::Parser, n: usize) {
+        for i in 0..n {
+            p.process(format!("p{i}").as_bytes());
+            if i + 1 < n {
+                p.process(b"\r\n");
+            }
+        }
+    }
+
+    /// 下端 2 行を「入力欄」に見立て、その上の領域 1..=rows-2 を
+    /// `\r\n` で `n` 行流す (codex の inline 挿入と同じ形)。
+    fn feed_region_lines(p: &mut vt100::Parser, rows: u16, n: usize) {
+        p.process(format!("\x1b[{rows};1Hcomposer").as_bytes());
+        p.process(format!("\x1b[1;{}r", rows - 2).as_bytes());
+        for i in 0..n {
+            p.process(format!("h{i}").as_bytes());
+            if i + 1 < n {
+                p.process(b"\r\n");
+            }
+        }
+        p.process(b"\x1b[r");
+    }
+
+    /// 通常画面: 領域の上端 (row 1) から押し出された行は履歴に入り、
+    /// 領域の外 (下端の入力欄) は動かない。
+    #[test]
+    fn 通常画面は最上段から始まる領域スクロールを履歴へ積む() {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        // 領域は 1..=8 の 8 行。12 行流すと 4 行 (h0..h3) が押し出される。
+        feed_region_lines(&mut p, 10, 12);
+        let visible = p.screen().contents();
+        assert!(visible.contains("composer"), "入力欄が動いた: {visible:?}");
+        assert!(visible.contains("h11"), "最新行が見えない: {visible:?}");
+        assert!(!visible.contains("h0"), "押し出された行が画面に残っている");
+        p.set_scrollback(usize::MAX);
+        assert_eq!(p.screen().scrollback(), 4, "押し出した 4 行が履歴に無い");
+        let oldest = p.screen().contents();
+        assert!(
+            oldest.starts_with("h0"),
+            "履歴の先頭が押し出した最古の行でない: {oldest:?}"
+        );
+    }
+
+    /// 途中の行から始まる領域 (vim の下側分割など) は、どの実端末でも
+    /// 履歴へ積まないので従来どおり捨てる。
+    #[test]
+    fn 途中から始まる領域スクロールは履歴へ積まない() {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        p.process(b"\x1b[3;8r\x1b[3;1H");
+        for i in 0..12 {
+            p.process(format!("m{i}\r\n").as_bytes());
+        }
+        p.process(b"\x1b[r");
+        p.set_scrollback(usize::MAX);
+        assert_eq!(
+            p.screen().scrollback(),
+            0,
+            "途中領域の押し出しが履歴に入った"
+        );
+    }
+
+    /// 代替画面: 領域スクロールは履歴を汚さない (vim の分割スクロールを
+    /// 遡り履歴に混ぜないため。積むのは全画面のスクロールだけ)。
+    #[test]
+    fn 代替画面の領域スクロールは履歴を汚さない() {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        p.process(b"\x1b[?1049h");
+        feed_region_lines(&mut p, 10, 12);
+        p.set_scrollback(usize::MAX);
+        assert_eq!(
+            p.screen().scrollback(),
+            0,
+            "代替画面の領域押し出しが履歴に入った"
+        );
+    }
+
+    /// 押し出しは [`count_around`] にも数えられる (= `LineIndex` の台帳が進み、
+    /// 遡って選択した範囲が codex の出力のたびにずれない)。
+    #[test]
+    fn 領域スクロールの押し出しも台帳に数えられる() {
+        let mut p = vt100::Parser::new(10, 40, 100);
+        let (_, pushed) = count_around(&mut p, |p| feed_region_lines(p, 10, 12));
+        assert_eq!(pushed.moved, 4, "押し出した行数が数えられていない");
+        assert!(!pushed.alt, "通常画面の押し出しとして数える");
+    }
+
+    /// **エージェントごとに分岐しないための一覧。**
+    ///
+    /// 端末が面倒を見られるのは「実際に行が押し出される」方式だけで、
+    /// **押し出し方が何通りあっても扱いは 1 つ**にする — ここがその 1 箇所。
+    /// 新しいエージェントが増えても、方式がこの表のどれかなら**コードは 1 行も
+    /// 足さずに**遡れる (実測: codex は ②、gemini / droid / cursor-agent は ①)。
+    ///
+    /// 唯一どうにもならないのが⑤ — 代替画面のまま**同じ場所へ描き直す**アプリ
+    /// (Claude Code v2) で、端末には 1 行も届かない。ここだけは
+    /// [`crate::agents::TERMINAL_SCROLLBACK_ENV`] (カタログのデータ 1 箇所) で
+    /// アプリ側に全画面をやめさせる。**表に 0 と書いてあるのが、その根拠。**
+    #[test]
+    fn 押し出しのある方式はすべて履歴へ積む() {
+        // (方式の名前, 送り方, 期待する履歴行数)
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, Box<dyn Fn(&mut vt100::Parser)>, usize); 8] = [
+            (
+                "① 通常画面 + LF (gemini / droid / Shell)",
+                Box::new(|p| feed_plain(p, 40)),
+                30,
+            ),
+            (
+                "② 通常画面 + 上端固定の領域 + LF (codex の inline TUI)",
+                Box::new(|p| feed_region_lines(p, 10, 12)),
+                4,
+            ),
+            (
+                "③ 通常画面 + 上端固定の領域 + CSI S (同じ形で SU を使う実装)",
+                Box::new(|p| p.process(b"\x1b[1;8r\x1b[5S\x1b[r")),
+                5,
+            ),
+            (
+                "④ 代替画面 + LF (代替画面のまま流すエージェント)",
+                Box::new(|p| {
+                    p.process(b"\x1b[?1049h");
+                    feed_plain(p, 40);
+                }),
+                30,
+            ),
+            (
+                "⑤ 代替画面 + 同じ場所へ描き直し (Claude Code v2) — 端末には来ない",
+                Box::new(|p| {
+                    p.process(b"\x1b[?1049h");
+                    for i in 0..40 {
+                        p.process(format!("\x1b[1;1Hframe{i}").as_bytes());
+                    }
+                }),
+                0,
+            ),
+            (
+                "⑥ 途中から始まる領域 (vim の下側分割) — どの実端末も積まない",
+                Box::new(|p| {
+                    p.process(b"\x1b[3;8r\x1b[3;1H");
+                    for i in 0..12 {
+                        p.process(format!("m{i}\r\n").as_bytes());
+                    }
+                    p.process(b"\x1b[r");
+                }),
+                0,
+            ),
+            (
+                "⑦ 通常画面 + CUU で同じ枠を描き直し (Ink 系: cursor-agent) — \
+                 画面に収まるうちは押し出しが 1 行も無い (実端末も同じ)",
+                Box::new(|p| {
+                    feed_plain(p, 5); // 最初の枠 (5 行)。カーソルは 5 行目。
+                    for _ in 0..40 {
+                        // 枠の先頭へ戻して消し、同じ 5 行を描き直す。
+                        // カーソルの正味の移動が 0 なので画面は 1 行も流れない。
+                        p.process(b"\r\x1b[4A\x1b[J");
+                        feed_plain(p, 5);
+                    }
+                }),
+                0,
+            ),
+            (
+                "⑧ 同じ Ink 系でも、枠が画面を超えれば押し出す (= そこから遡れる)",
+                Box::new(|p| {
+                    feed_plain(p, 40);
+                    p.process(b"\r\x1b[4A\x1b[J");
+                }),
+                30,
+            ),
+        ];
+        for (name, feed, want) in cases {
+            let mut p = vt100::Parser::new(10, 40, 100);
+            feed(&mut p);
+            assert_eq!(sb_rows(&mut p), want, "{name}");
+        }
+    }
+
+    /// DoD: **PTY を通した実経路でも遡れる。**
+    ///
+    /// パーサ単体で積めていても、読取スレッド / `LineIndex` / `adjust_scroll`
+    /// のどこかで落とせば利用者からは「遡れない」ままになる
+    /// (「単体テストが全部緑でも実バイナリを回さないと分からない回帰」の予防)。
+    /// codex と同じ形をシェルから出すので、実 CLI もネットワークも要らず
+    /// どの環境でも決定的に走る。
+    #[test]
+    #[cfg(unix)]
+    fn 領域スクロールで流れた行はptyを通しても遡れる() {
+        use super::{lock_ok, Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        // 画面は 30 行。上端から 20 行を領域にして 60 行流す
+        // (= 41 行が押し出される)。最後は `read` で開いたまま待たせる。
+        let spec = SpawnSpec {
+            title: "region-scroll".into(),
+            preset_name: "test".into(),
+            icon: "◆".into(),
+            command: "printf '\\033[1;20r'; i=1; \
+                      while [ $i -le 60 ]; do printf 'R%d\\r\\n' $i; i=$((i+1)); done; \
+                      printf '\\033[r'; read _hold"
+                .into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(9967, spec, eframe::egui::Context::default()).expect("PTY起動");
+        let until = |f: &dyn Fn() -> bool| -> bool {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(20) {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        };
+        let arrived = until(&|| lock_ok(&s.parser).screen().contents().contains("R60"));
+        assert!(arrived, "最後の行が届かない");
+
+        // いちばん上まで遡る (上限は vt100 が畳む)。
+        assert!(
+            s.adjust_scroll(1000),
+            "履歴を遡れない (押し出しが捨てられている)"
+        );
+        let seen = lock_ok(&s.parser).screen().contents();
+        s.kill();
+        assert!(
+            seen.lines().any(|l| l.trim() == "R1"),
+            "遡った先に流れた行が無い: {seen:?}"
+        );
+    }
+}
+
 /// PTY リサイズが UI スレッドを止めないことの取り決め。
 ///
 /// Windows の `ResizePseudoConsole` は conhost への同期 RPC。Cockpit の

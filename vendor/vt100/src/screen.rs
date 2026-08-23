@@ -89,6 +89,12 @@ impl Screen {
     ) -> Self {
         let mut grid = crate::grid::Grid::new(size, scrollback_len);
         grid.allocate_rows();
+        // zaivern patch: 通常画面は**最上段から始まるスクロール領域**の押し出しも
+        // 履歴へ積む。実端末 (alacritty: "Only rotate the entire history if the
+        // active region starts at the top" / xterm.js 系) と同じ意味論で、
+        // codex 等の inline TUI (`[1;29r` + LF、入力欄は下端固定) はこれに
+        // 依存して履歴を流す。積まないと codex の会話履歴が 1 行も遡れない。
+        grid.save_region_scrolls = true;
         Self {
             grid,
             // zaivern patch: 代替画面にも**同じ長さの履歴**を持たせる。
@@ -103,8 +109,9 @@ impl Screen {
             // 過去の出力まで選択できるのに、エージェントでは画面に見えている
             // ぶんしか選択できない」という差になる (実際にそう報告された)。
             //
-            // 積むのは `Grid::scroll_up` の `!scroll_region_active()` の枝だけなので、
-            // **スクロール領域を使う全画面 TUI (vim / less) では 1 行も積まれない**。
+            // 代替画面で積むのは**全画面のスクロールだけ** (`save_region_scrolls`
+            // は false のまま)。スクロール領域を使う全画面 TUI (vim / less) の
+            // 分割スクロールでは 1 行も積まれない。
             // VecDeque は必要になってから伸びるため、積まないアプリの費用は 0。
             alternate_grid: crate::grid::Grid::new(size, scrollback_len),
 

@@ -4904,6 +4904,72 @@ mod tests {
         );
     }
 
+    /// **履歴のための env をカタログの外で組み立てないこと。**
+    ///
+    /// 「エージェントごとに個別対応しない」ための番人。遡れるかどうかの
+    /// 面倒は端末側 (vendor/vt100 + `Session`) が**押し出された行を積むだけ**で
+    /// 見ていて、そこはエージェントの名前を 1 つも知らない。
+    /// アプリ自身に全画面をやめさせるしかない場合 (代替画面のまま同じ場所へ
+    /// 描き直すので端末には 1 行も来ない) だけが例外で、その固有値は
+    /// [`TERMINAL_SCROLLBACK_ENV`] という**データ 1 箇所**に集める。
+    /// どこかで直に差し込むと、その CLI だけ別経路になって
+    /// 「なぜかこの子だけ遡れない/挙動が違う」が復活する。
+    #[test]
+    fn 履歴用envはカタログの外で組み立てない() {
+        // パスはビルド時のクレート位置から起こす (どのマシンでも動く)。
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        let (mut checked, mut hits) = (0usize, 0usize);
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                    continue;
+                }
+                // カタログ本体だけが対象外。
+                if path.file_name().and_then(|s| s.to_str()) == Some("agents.rs") {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Windows のチェックアウトは CRLF なので必ず正規化する。
+                let text = raw.replace("\r\n", "\n");
+                checked += 1;
+                for (at, _) in text.match_indices("ALTERNATE_SCREEN") {
+                    let ls = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                    let le = text[at..].find('\n').map_or(text.len(), |i| at + i);
+                    // コメント行は対象外 (説明に書くのは自由)。
+                    if text[ls..le].trim_start().starts_with("//") {
+                        continue;
+                    }
+                    hits += 1;
+                    // **囲っている関数の中だけを見る** (範囲を広げると空回りする)。
+                    let fs = text[..at]
+                        .rfind("\n    fn ")
+                        .or_else(|| text[..at].rfind("\nfn "))
+                        .unwrap_or(0);
+                    let fe = text[at..].find("\n    fn ").map_or(text.len(), |i| at + i);
+                    assert!(
+                        text[fs..fe].contains("merged_env")
+                            || text[fs..fe].contains("scrollback_env_for"),
+                        "{}: 履歴用 env をカタログの外で組み立てている。\
+                         agents::TERMINAL_SCROLLBACK_ENV へ足すこと。",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(checked > 10, "走査できていない (checked={checked})");
+        assert!(hits > 0, "照合対象が 1 つも無い — 番人が空回りしている");
+    }
+
     #[test]
     fn env_enables_auto_requires_exact_values() {
         let mut env = HashMap::new();
