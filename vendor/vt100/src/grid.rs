@@ -13,6 +13,16 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    // zaivern patch: **最上段から始まるスクロール領域**の押し出しも履歴へ積むか。
+    //
+    // 実端末 (alacritty / xterm.js 系) は「領域が row 0 から始まるなら、部分領域
+    // でも押し出した行を履歴へ積む」。codex のような inline TUI はこの意味論に
+    // 依存して履歴を流す (`[1;29r` + LF で上端から押し出し、下端の入力欄は固定)。
+    // 通常画面のグリッドだけ true にする (screen.rs)。**代替画面は false のまま** —
+    // vim は最下段のステータス行を残すため領域を `[1;rows-1 r` と**上端固定**で
+    // 取るので、ここを true にすると**画面を 1 行スクロールするたびに履歴へ積む**
+    // ことになる (alacritty も代替画面の履歴上限は 0 で、同じく積まない)。
+    pub(crate) save_region_scrolls: bool,
 }
 
 impl Grid {
@@ -29,6 +39,7 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            save_region_scrolls: false,
         }
     }
 
@@ -641,7 +652,16 @@ impl Grid {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
-            if self.scrollback_len > 0 && !self.scroll_region_active() {
+            // zaivern patch: 全画面のスクロールに加えて、**最上段 (row 0) から
+            // 始まる領域**の押し出しも履歴へ積む (`save_region_scrolls` のとき)。
+            // 実端末はこの形を履歴に積むので、codex 等の inline TUI が
+            // 「入力欄を下端に固定したまま上から履歴を流す」のに使っている。
+            // 途中の行から始まる領域 (vim の下側分割など) はどの端末でも
+            // 積まないので、従来どおり捨てる。
+            let saves = self.scrollback_len > 0
+                && (!self.scroll_region_active()
+                    || (self.save_region_scrolls && self.scroll_top == 0));
+            if saves {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
