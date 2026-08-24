@@ -457,6 +457,26 @@ pub fn bar_layout(available: f32, m: &BarMetrics) -> BarLayout {
     unreachable!("Density は 3 段すべて試している")
 }
 
+/// ヒット行を見せるための新しいスクロール位置。**もう見えているなら `None`**。
+///
+/// VS Code の "reveal" と同じ約束: 画面に入っている一致のために本文を動かさない。
+/// インクリメンタル検索は**打鍵のたびに**走るので、毎回中央へ寄せると 1 文字ごとに
+/// 本文が飛び跳ねて読めなくなる (「1 文字打つと検索へ行ってしまう」の半分はこれ)。
+///
+/// 見えていないときは画面の上から 4 割の位置へ寄せる (前後の文脈が見える)。
+/// 端に貼り付くと次の行が見えないので、**上下 1 行ぶんの余白**を要求する。
+pub fn reveal_scroll(line: usize, row_h: f32, scroll_y: f32, view_h: f32) -> Option<f32> {
+    let row_h = row_h.max(1.0);
+    let y = line as f32 * row_h;
+    let margin = row_h;
+    // 余白 2 行ぶんも取れない高さでは「見えている」と言えない (必ず寄せる)
+    let roomy = view_h >= margin * 3.0;
+    if roomy && y >= scroll_y + margin && y + row_h <= scroll_y + view_h - margin {
+        return None;
+    }
+    Some((y - view_h * 0.4).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,5 +859,51 @@ mod tests {
         assert!(full.show_glyph && !compact.show_glyph);
         assert!(compact.show_count && !minimal.show_count);
         assert!(compact.show_caret && !minimal.show_caret);
+    }
+
+    /// 見えている一致のために画面を動かさない (VS Code の reveal)。
+    /// 打鍵ごとに走る検索で毎回寄せると、本文が 1 文字ごとに飛び跳ねる。
+    #[test]
+    fn 見えている行では画面を動かさない() {
+        let (row_h, view_h) = (18.0_f32, 600.0_f32);
+        // 画面 = 行 10..43 (スクロール 180px, 高さ 600px)
+        let scroll = 10.0 * row_h;
+        // 表: (行, 期待)
+        for (line, visible) in [
+            (0usize, false), // ずっと上
+            (9, false),      // 上の余白 1 行に掛かる
+            (11, true),      // 余裕で見えている
+            (25, true),      // 真ん中
+            (41, true),      // 下の余白の内側
+            (42, false),     // 下の余白 1 行に掛かる
+            (500, false),    // ずっと下
+        ] {
+            let got = reveal_scroll(line, row_h, scroll, view_h);
+            assert_eq!(
+                got.is_none(),
+                visible,
+                "行 {line} の判定が違う (got={got:?})"
+            );
+        }
+    }
+
+    /// 見えていないときは上から 4 割の位置へ寄せ、先頭より上には行かない。
+    #[test]
+    fn 見えていない行は文脈が見える位置へ寄せる() {
+        let (row_h, view_h) = (18.0_f32, 600.0_f32);
+        let y = reveal_scroll(100, row_h, 0.0, view_h).expect("見えていないので寄せる");
+        assert_eq!(y, 100.0 * row_h - view_h * 0.4);
+        // 上の方の行では負にしない (0 で止める)
+        assert_eq!(reveal_scroll(1, row_h, 5000.0, view_h), Some(0.0));
+    }
+
+    /// 高さが 0 / 行高が 0 でも panic せず、必ず寄せる側に倒す。
+    #[test]
+    fn 潰れた画面でも判断を返す() {
+        assert!(reveal_scroll(5, 0.0, 0.0, 0.0).is_some());
+        assert!(
+            reveal_scroll(0, 18.0, 0.0, 20.0).is_some(),
+            "1 行ぶんの高さでは見えているとは言わない"
+        );
     }
 }

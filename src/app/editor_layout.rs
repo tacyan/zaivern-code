@@ -1141,12 +1141,25 @@ impl ZaivernApp {
                         step = Some(true);
                     }
                     if resp.lost_focus() {
-                        let (enter, shift) =
-                            ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift));
+                        // Esc は egui がフレーム頭でフォーカスを外すので、
+                        // `has_focus()` ではなく **lost_focus + 押下** で拾う
+                        // (`egui-0.29.1/src/memory/mod.rs` の Focus 処理)。
+                        let (enter, shift, esc) = ui.input(|i| {
+                            (
+                                i.key_pressed(egui::Key::Enter),
+                                i.modifiers.shift,
+                                i.key_pressed(egui::Key::Escape),
+                            )
+                        });
                         if enter {
                             step = Some(!shift);
                             // 続けて打てるようにフォーカスを戻す
                             self.find.focus = true;
+                        }
+                        // Esc で閉じる (VS Code と同じ)。検索欄から手を離さずに
+                        // 本文へ戻れる唯一の道なので、✕ のクリックと同じ扱いにする。
+                        if esc {
+                            close = true;
                         }
                     }
 
@@ -1252,11 +1265,29 @@ impl ZaivernApp {
                         } else {
                             tr("置換…")
                         };
-                        ui.add(
+                        let rep = ui.add(
                             egui::TextEdit::singleline(&mut self.find.replace)
                                 .desired_width(layout.query_width)
                                 .hint_text(hint),
                         );
+                        if rep.lost_focus() {
+                            // 置換欄も検索欄と同じ約束: Enter で 1 件置換、Esc で閉じる。
+                            // Enter の後はその場で打ち続けられるようフォーカスを戻す
+                            // (戻さないと、どこにも入らない打鍵になる)。
+                            let (enter, esc) = ui.input(|i| {
+                                (
+                                    i.key_pressed(egui::Key::Enter),
+                                    i.key_pressed(egui::Key::Escape),
+                                )
+                            });
+                            if enter {
+                                do_replace = true;
+                                rep.request_focus();
+                            }
+                            if esc {
+                                close = true;
+                            }
+                        }
                         let (one, all) = if minimal {
                             ("⇄".to_string(), "⇄⇄".to_string())
                         } else {
@@ -1291,6 +1322,19 @@ impl ZaivernApp {
             self.replace_all_in_active();
         }
         if close {
+            // 閉じるときだけフォーカスを本文へ返す。キャレットはいまのヒットへ
+            // 置くので、Esc を押した瞬間から「探していた場所」で編集を続けられる
+            // (VS Code と同じ)。ヒットが無ければ位置は動かさず、フォーカスだけ返す。
+            if let (Some(i), Some((s, e))) = (self.editor.active, self.find.current) {
+                let text = &self.editor.buffers[i].text;
+                self.pending_select = Some((
+                    find_buffer::byte_to_char(text, s),
+                    find_buffer::byte_to_char(text, e),
+                ));
+                self.pending_select_focus = true;
+            } else {
+                self.focus_editor_body(ui.ctx());
+            }
             self.find.open = false;
             self.find.replace_open = false;
             self.find.current = None;

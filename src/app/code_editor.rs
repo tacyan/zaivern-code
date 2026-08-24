@@ -66,6 +66,13 @@ impl ZaivernApp {
         let ws_color = theme_dim.gamma_multiply(0.55);
 
         let mut pending_select = self.pending_select.take();
+        // フォーカスまで本文へ移すかは、キャレットを動かした側が決める。
+        // 取り出しと同時に既定 (= 移す) へ戻すので、false は 1 回しか効かない。
+        let pending_focus = if pending_select.is_some() {
+            std::mem::replace(&mut self.pending_select_focus, true)
+        } else {
+            true
+        };
         let pending_scroll = self.pending_scroll.take();
 
         // Git 行マーク(バッファの可変借用前に取得)
@@ -944,14 +951,8 @@ impl ZaivernApp {
         let past_end = (view_h - row_h * 3.0).max(0.0);
 
         let body_ui = |ui: &mut egui::Ui| {
-            if let Some((s, e)) = pending_select {
-                let mut st = egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
-                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(s),
-                    egui::text::CCursor::new(e),
-                )));
-                st.store(ui.ctx(), ed_id);
-                ui.ctx().memory_mut(|m| m.request_focus(ed_id));
+            if let Some(sel) = pending_select {
+                apply_pending_select(ui.ctx(), ed_id, sel, pending_focus);
             }
 
             let mut cursor_out: Option<(usize, usize)> = None;

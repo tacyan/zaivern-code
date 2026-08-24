@@ -257,6 +257,7 @@ impl ZaivernApp {
             pending_transfer: None,
             file_history: FileHistory::default(),
             pending_select: None,
+            pending_select_focus: true,
             pending_scroll: None,
             undo_clock: Instant::now(),
             last_row_h: 18.0,

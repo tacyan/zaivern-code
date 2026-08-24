@@ -191,6 +191,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("crisp_text_tests.rs"),
     include_str!("quick_open_tests.rs"),
     include_str!("problems_tests.rs"),
+    include_str!("find_focus_tests.rs"),
 );
 
 /// `SRC` から切り出した「メソッド本文」の終わり (次のメソッドの手前)。
@@ -1108,6 +1109,26 @@ fn bottom_view(approvals: bool, mcp: bool, skills: bool, spec: bool) -> BottomVi
         BottomView::Spec
     } else {
         BottomView::Terminal
+    }
+}
+
+/// 予約済みのキャレット移動 (`pending_select`) を本文の `TextEdit` へ反映する。
+///
+/// **本文へキーボードフォーカスを渡す場所はここ 1 つだけ**にしてある
+/// (`app::find_focus_tests::本文の描画はフォーカスを直接要求しない` が番人)。
+///
+/// `focus` が false のときは位置だけ動かす。検索バーは本文より**先**に描かれる
+/// ので、インクリメンタル検索のたびにフォーカスまで移すと、1 文字打った次の
+/// 打鍵から**検索語ではなくファイルへ**入ってしまう (実際にそうなっていた)。
+fn apply_pending_select(ctx: &egui::Context, id: egui::Id, sel: (usize, usize), focus: bool) {
+    let mut st = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(sel.0),
+        egui::text::CCursor::new(sel.1),
+    )));
+    st.store(ctx, id);
+    if focus {
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 }
 
@@ -3508,6 +3529,14 @@ pub struct ZaivernApp {
     /// 完全削除は戻せないので**積まない**。
     file_history: FileHistory,
     pending_select: Option<(usize, usize)>,
+    /// `pending_select` を本文へ反映するとき、フォーカスも本文へ移すか。
+    ///
+    /// **検索欄で打っている最中だけ false** にする。true のまま奪うと、
+    /// 1 文字打った次のフレームには本文側の `TextEdit` がフォーカスを持つので、
+    /// **2 文字目からは検索語ではなくファイルへ入る** (実際にそうなっていた)。
+    /// 消費側 (`code_editor_ui`) が `pending_select` を取り出すときに true へ戻すので、
+    /// 既定は「フォーカスも移す」= 従来どおり。
+    pending_select_focus: bool,
     pending_scroll: Option<f32>,
     /// 取り消し履歴の「連続入力」判定に使う単調時計の原点。
     /// `SystemTime` ではなく `Instant` — 時刻がずれても粒度が壊れない。
@@ -5047,3 +5076,9 @@ mod quick_open_tests;
 /// UI を描かずに固定できるところは全部ここで固定する。
 #[cfg(test)]
 mod problems_tests;
+
+/// ファイル内検索 (⌘F) のフォーカスの居場所。
+///
+/// 検索欄へ打った 1 文字が本文にも入っていた不具合の番人 (実 egui で再現する)。
+#[cfg(test)]
+mod find_focus_tests;
