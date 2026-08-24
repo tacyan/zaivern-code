@@ -2419,14 +2419,58 @@ mod tests {
         drop(srv);
     }
 
+    /// この 1 本だけで使う空き番号を OS から借りる。
+    ///
+    /// **既定の 8899-8919 を当てにしない。** そこは「いま動いている Zaivern」が
+    /// 握っている番号でもあるので、開発機でテストを回すと製品が正しくても赤になる。
+    /// 返すのは **`0.0.0.0` と `127.0.0.1` の両方に順に張れる**番号 — unix は
+    /// `SO_REUSEADDR` で片方だけ塞がっている番号がありうるため、片方だけ見ても
+    /// 足りない (張り直し先が空いていない、がまさにその形)。
+    fn borrow_port_for_rebind() -> u16 {
+        for _ in 0..20 {
+            // 番号は OS に選ばせる (自分で決めると誰かと取り合う)
+            let Ok(l) = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
+                continue;
+            };
+            let Ok(a) = l.local_addr() else { continue };
+            let p = a.port();
+            drop(l);
+            // **テストと同じ順で**張れることまで確かめる
+            let Ok(lan) = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, p)) else {
+                continue;
+            };
+            drop(lan);
+            let Ok(lo) = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, p)) else {
+                continue;
+            };
+            drop(lo);
+            return p;
+        }
+        panic!("0.0.0.0 と 127.0.0.1 の両方に張れる空き番号を 20 回試して借りられませんでした");
+    }
+
     /// 張り直しでトークンが変わると、既に QR を読んだスマホが一斉に 401 になる。
     /// URL のホスト部も待ち受けに合わせて変える (繋がらない URL を出さない)。
+    ///
+    /// **既定の番号 (8899) から始めない。** `RemoteServer::start` は 8899 から
+    /// 走査するので、**別インスタンスの Zaivern が `127.0.0.1:8899` を握って
+    /// いるだけ**で張り直し先が 8900 へ流れ、番号の引き継ぎに失敗する。
+    /// 実際に出荷前の関門がこれで 1 段赤になった (`left: 8900 / right: 8899`)。
+    /// 製品は正しいのに、**開発機で本物のアプリが動いているというだけ**で
+    /// 落ちるテストは、そのうち「また環境のせいだろう」と読み飛ばされる。
+    /// 番号は OS に借りて、この 1 本だけで使う (隣の
+    /// `複数アドレスで待ち受けても両方応答して畳める` と同じ流儀)。
+    /// 張り直し (`rebind`) 自体は公開 API のまま通す — そこが試験対象なので。
     #[test]
     fn 張り直してもトークンは変わらずurlのホストだけ変わる() {
         let ctx = egui::Context::default();
-        let lan = RemoteServer::start(ctx.clone(), Bind::Lan).expect("LAN で起動できる");
+        let want = borrow_port_for_rebind();
+        let lan_ip: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let lan = RemoteServer::start_on(ctx.clone(), Bind::Lan, &[lan_ip], None, Some(want))
+            .expect("LAN で起動できる");
         let token = lan.token.clone();
         let port = lan.port;
+        assert_eq!(port, want, "借りた番号で待ち受けられている");
         assert_eq!(lan.bind, Bind::Lan);
         drop(lan); // Drop が accept を畳んでポートを解放するまで待つ
 
