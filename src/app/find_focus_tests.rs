@@ -16,6 +16,11 @@
 //! VS Code は検索中フォーカスを検索欄に置いたままヒットだけを動かす。
 //! 同じにするため、フォーカス移動は `apply_pending_select` の `focus` 引数に
 //! 閉じ、検索経路だけ false を渡す。
+//!
+//! その**二次被害**もここで見張る: 本文が同じフレームで変わると、検索ヒットは
+//! 1 フレーム古い本文の位置を指す。ズレた位置で CJK の途中を切ると epaint が
+//! 落ちる (利用者の `panic.log` に 7 回残っていた)。塗るのは「ヒットを数えた
+//! 本文」と「いま組む文字列」が一致するときだけにする。
 
 use super::*;
 
@@ -162,5 +167,39 @@ fn 検索バーはescで閉じられる() {
     assert!(
         code.contains("egui::Key::Escape"),
         "Esc で検索バーを閉じる経路が無い"
+    );
+}
+
+/// 検索ヒットの塗りは、**ヒットを数えた本文と一致するときだけ**当てる。
+///
+/// 無条件に当てると (1) 折りたたみ表示のような別の文字列へ当ててしまい
+/// (2) 本文が同じフレームで変わったときは CJK の途中を切って epaint が落ちる。
+/// 鍵に混ぜていないと、塗らずに組んだ galley が次のフレームも再利用されて
+/// ハイライトが永久に出なくなる — **両方**を見る。
+#[test]
+fn 検索ハイライトは同じ本文にしか当てない() {
+    let src = include_str!("code_editor.rs").replace("\r\n", "\n");
+    let at = src
+        .find("find_buffer::apply_hits(")
+        .expect("apply_hits の呼び出しがある");
+    // 遡る先は**文字境界へ寄せる** (このファイルは日本語のコメントだらけで、
+    // 素朴に引き算すると自分がいま直しているのと同じ形で落ちる)。
+    let mut from = at.saturating_sub(300);
+    while from < at && !src.is_char_boundary(from) {
+        from += 1;
+    }
+    let before = &src[from..at];
+    assert!(
+        before.contains("hits_fit"),
+        "apply_hits を無条件に呼んでいる (別の本文へ当たると epaint が落ちる)"
+    );
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        code.contains("find_text_hash,"),
+        "galley の鍵に find_text_hash が入っていない (塗らずに組んだ galley を使い回す)"
     );
 }

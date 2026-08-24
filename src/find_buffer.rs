@@ -243,7 +243,16 @@ pub fn apply_hits(
             }
             let s = h.start.max(at);
             let e = h.end.min(se);
-            if s >= e {
+            // **ヒットは 1 フレーム古い本文のものでありうる。**
+            // 打鍵と同じフレームで本文が変わる経路 (`TextEdit` 自身の編集 /
+            // 複数キャレット / スニペット展開 / 自動ペア) があり、そのフレームの
+            // ヒットは 1 つ前の本文の位置を指す。ズレた位置で切ると CJK の
+            // 途中に当たり、**epaint が panic する** (実際に 7 回落ちた:
+            // `end byte index N is not a char boundary; it is inside '（'`)。
+            // 境界に乗らないヒットは**塗らずに飛ばす** — 1 フレーム塗り遅れる
+            // だけで、次のフレームには正しい位置で塗られる。
+            // `is_char_boundary` は範囲外にも false を返すので長さの検査も兼ねる。
+            if s >= e || !job.text.is_char_boundary(s) || !job.text.is_char_boundary(e) {
                 continue;
             }
             if s > at {
@@ -743,6 +752,58 @@ mod tests {
             s.push_str(&job.text[sec.byte_range.clone()]);
         }
         s
+    }
+
+    /// **1 フレーム古いヒットで切っても、文字境界しか切らない。**
+    ///
+    /// 打鍵と同じフレームで本文が変わる経路 (`TextEdit` 自身の編集 / 複数
+    /// キャレット / スニペット展開 / 自動ペア) があり、そのフレームのヒットは
+    /// 1 つ前の本文の位置を指す。ズレた位置で CJK の途中を切ると
+    /// **epaint が落ちる** — 実際に利用者の `panic.log` に 7 回残っていた
+    /// (`end byte index N is not a char boundary; it is inside '（'`)。
+    #[test]
+    fn 古いヒットでも文字境界しか切らない() {
+        let before = "あいうえお かきくけこ あいうえお";
+        let (hits, _) = find_all(before, &m("あいうえお", lit()));
+        assert_eq!(hits.len(), 2, "前提: 2 件見つかっている");
+        // 本文の先頭へ ASCII が 1 文字入った = 以降のヒットが 1 バイトずれる。
+        // ずれた終端はすべて CJK の途中に来る (境界に乗らない)。
+        let after = format!("x{before}");
+        assert!(
+            hits.iter()
+                .any(|h| !after.is_char_boundary(h.end) || !after.is_char_boundary(h.start)),
+            "前提: ずらしたヒットは文字境界に乗っていない"
+        );
+        let job = apply_hits(job_of(&after), &hits, None, Color32::RED, Color32::GREEN);
+        for sec in &job.sections {
+            let (s0, e0) = (sec.byte_range.start, sec.byte_range.end);
+            assert!(
+                after.is_char_boundary(s0) && after.is_char_boundary(e0),
+                "文字境界でない範囲を切った: {s0}..{e0}"
+            );
+        }
+        assert_eq!(covered(&job), after, "本文は 1 バイトも欠けない");
+        // 実際に組んでも落ちないこと (epaint の要求そのものを踏む)
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            ctx.fonts(|f| {
+                let _ = f.layout_job(job.clone());
+            });
+        });
+    }
+
+    /// 境界に乗るヒットは今までどおり塗る (安全側へ倒しすぎない)。
+    #[test]
+    fn 境界に乗るヒットは従来どおり塗る() {
+        let text = "あいうえお かきくけこ あいうえお";
+        let (hits, _) = find_all(text, &m("あいうえお", lit()));
+        let job = apply_hits(job_of(text), &hits, None, Color32::RED, Color32::GREEN);
+        let painted = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == Color32::RED)
+            .count();
+        assert_eq!(painted, 2, "CJK でも 2 件とも塗る");
     }
 
     #[test]
