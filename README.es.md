@@ -4,8 +4,12 @@
 
 # Zaivern Code
 
-**Una sola cabina de mando para Claude Code, Codex, Gemini CLI y los demás CLIs de programación con IA que ya usas.**<br>
-Lánzalos, obsérvalos y dirígelos desde una única aplicación nativa en macOS, Windows y Linux.
+### 64 agentes de IA. Un repositorio. Cero conflictos de fusión.
+
+**La capa de coordinación para agentes de código en paralelo.**
+
+Ejecuta Claude Code, Codex, Gemini CLI y otros agentes de código sobre el mismo
+repositorio — sin el caos de los conflictos de fusión.
 
 [English](README.md) | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | **Español**
 
@@ -14,50 +18,66 @@ Lánzalos, obsérvalos y dirígelos desde una única aplicación nativa en macOS
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-[**Descargar**](https://github.com/tacyan/zaivern-code/releases/latest) ·
-[**Inicio rápido**](#inicio-rápido) ·
-[**Documentación**](#documentación) ·
-[**Sitio web**](https://zaivern.com/)
-
+<!-- TODO: Reemplazar por una demo de 15-20 s del benchmark:
+     64 agentes en un repositorio / git puro 132 hunks de conflicto / Zaivern 0.
+     El GIF de abajo muestra la cabina, no el resultado de la coordinación. -->
 <a href="https://zaivern.com/">
-  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code ejecutando Claude Code, Codex, Gemini CLI y otros agentes de programación lado a lado" />
+  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code ejecutando Claude Code, Codex, Gemini CLI y otros agentes de código en paralelo" />
 </a>
 
-<!-- 出典: docs/conflict-zero.md §3.12 — zaivern-code / 書き手 16 / zai 0.14.0:
-     素の git 26 ファイル・28 ハンク、zaivern あり 0/0・96/96 成立・拒否 0・30 件ずらし -->
-**16 agentes escribiendo en este repositorio en paralelo** — git a secas: **26 archivos en conflicto / 28 hunks**.<br>
-Con el lease ledger: **0 / 0**, y las **96 ediciones se aplicaron** — ninguna rechazada, y 30 de ellas se desplazaron a un rango de líneas libre.<br>
-[Ver las mediciones →](docs/conflict-zero.md)
+| 64 escritores · mismo repositorio · misma carga | Git puro | Zaivern Code |
+|---|---:|---:|
+| Fusiones con conflicto | 57 de 64 | **0** |
+| Hunks de conflicto | 132 | **0** |
 
-Si Zaivern Code te resulta útil, una ⭐ **Star** ayuda a su desarrollo.
+[Consulta la metodología, las concesiones y los límites →](docs/conflict-zero.md)
+
+[**Inicio rápido**](#inicio-rápido) ·
+[**Mediciones**](#mediciones) ·
+[**Documentación**](#documentación) ·
+[**Descarga**](https://github.com/tacyan/zaivern-code/releases/latest) ·
+[**Sitio web**](https://zaivern.com/)
 
 </div>
 
-## Por qué Zaivern Code
+## El problema
 
-Arrancar varios CLIs de programación con IA es fácil. Seguirles la pista no lo es. Cada
-agente vive en su propia pestaña de terminal, pide aprobación a su propio ritmo y edita
-archivos sin saber qué están haciendo los demás.
+Ejecutar un agente de código es fácil. Ejecutar cuatro, no. Con dos agentes editando el
+mismo archivo ya basta:
 
-<!-- 出典: docs/conflict-zero.md §3.3 — 書き手 64 / 重なり 0.5:
-     ベースラインは 57/64 のマージが衝突し 132 ハンク、ガード側は全規模で 0 ハンク -->
+- Editan las mismas líneas y te enteras al fusionar.
+- No ves cuál agente trabaja, cuál está bloqueado y cuál se detuvo en silencio.
+- Una petición de aprobación pasa en una pestaña que no estabas mirando.
+- La integración se convierte en tu trabajo — cada vez.
 
-| Sin una cabina de mando | Con Zaivern Code |
-|---|---|
-| Más agentes en paralelo, más conflictos de merge | Un ledger compartido mantiene a cada agente fuera de las líneas de los demás — 0 hunks en conflicto con 64 agentes, donde git a secas produjo 132 |
-| Recorrer pestañas para averiguar quién te necesita | Todos los agentes en una sola pantalla, con estado en vivo |
-| Pegar la misma instrucción en cada herramienta | Difúndela una vez a toda la flota, o dirígete a un solo agente |
-| Perder un aviso de aprobación y perder la ejecución | Notificaciones y aprobación con un clic |
-| Quedarte en el escritorio mientras los agentes trabajan | Consulta el progreso y aprueba desde el móvil |
+El cuello de botella no son los agentes, sino **la coordinación entre ellos**.
 
-Zaivern Code no es un modelo de IA ni incluye ninguno. Conduce los CLIs que ya tienes
-instalados y con la sesión iniciada — con uno basta para empezar.
+## La solución
+
+Zaivern Code coordina qué partes del repositorio puede editar con seguridad cada agente.
+En lugar de descubrir las colisiones al fusionar, detiene el trabajo solapado **antes de
+que la escritura conflictiva se materialice** — y reúne en un solo sitio la
+observación, el control y la recuperación de los agentes en marcha.
+
+```text
+Sin Zaivern                              Con Zaivern
+
+Agente 1  ─┐                             Agente 1  ─┐
+Agente 2  ─┤                             Agente 2  ─┤   ┌──────────────┐
+Agente 3  ─┼─→ mismos    ─→ conflictos   Agente 3  ─┼─→ │ registro de  │ ─→ integración
+   ...    ─┤    archivos    de fusión       ...    ─┤   │ rangos de    │    limpia
+Agente 64 ─┘                             Agente 64 ─┘   │ líneas       │
+                                                        └──────────────┘
+132 hunks de conflicto                   0 hunks de conflicto
+```
+
+**No hacen falta 64 agentes para que esto importe.** Dos agentes editando el mismo
+archivo bastan. Empieza con 2, escala a 64.
 
 ## Inicio rápido
 
-**Requisitos previos.** Instala e inicia sesión en al menos un CLI de programación con IA
-compatible. Zaivern Code incluye presets de lanzamiento para 33 de ellos, entre ellos
-Claude Code, Codex y Gemini CLI. No necesitas más de uno.
+Primero instala e inicia sesión en al menos una CLI de código con IA compatible —
+Zaivern Code incluye **33** preajustes de lanzamiento, y con uno basta para empezar.
 
 **macOS / Linux**
 
@@ -73,313 +93,178 @@ irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 zai .
 ```
 
-Ambos instaladores verifican el archivo de la release contra el `checksums.txt`
-publicado **antes de descomprimirlo**, y abortan sin extraer ni ejecutar nada si el
-SHA-256 no coincide — o si los checksums no se pueden descargar en absoluto.
+En la ventana: pulsa `+ Agent`, elige una CLI que ya tengas instalada y mándale una tarea.
 
-¿Prefieres no canalizar un script hacia tu shell? Descarga el archivo para tu plataforma
-desde [Releases](https://github.com/tacyan/zaivern-code/releases/latest), descomprímelo y
-coloca `zai` (o `zai.exe`) en algún lugar de tu `PATH`. Después ejecuta `zai .` en la
-carpeta de un proyecto. En [SECURITY.md](SECURITY.md) se explica cómo verificar la
-descarga a mano, comprobar la procedencia de la compilación o leer el SBOM.
-
-Una vez abierta la ventana:
-
-1. Pulsa `+ Agent` y elige un CLI que ya tengas instalado.
-2. Escribe una tarea en el campo de entrada y envíala.
-3. Añade un segundo agente cuando el primero te resulte cómodo.
-
-### Actualizar
+Activa la coordinación de conflictos en un repositorio:
 
 ```bash
-zai update            # busca una versión más reciente, muestra el comando y luego actualiza
-zai update --check    # solo mira; no cambia nada
+zai czero init      # instala el registro, los hooks de git y el merge driver, y se autodiagnostica
+zai czero verify    # crea un conflicto real en un repositorio desechable y comprueba que se detiene
+```
+
+Los instaladores verifican el archivo contra el `checksums.txt` publicado **antes de
+descomprimirlo** y abortan si no coincide.
+[Descarga manual, verificación de checksum, procedencia y SBOM →](SECURITY.md)
+
+### Actualización
+
+```bash
+zai update            # busca una versión nueva, muestra el comando y actualiza
+zai update --check    # solo comprueba; no cambia nada
 zai update --yes      # actualiza sin pedir confirmación
 ```
 
-`zai update` funciona esté o no el editor en ejecución, y actualiza in situ a través del
-script instalador de tu plataforma. Volver a ejecutar el one-liner de arriba hace lo
-mismo.
+Funciona con el editor abierto o cerrado. Para desinstalar, `zai uninstall`.
 
-`zai uninstall` lo elimina (`--dry-run` lista lo que se borraría). La desinstalación toca
-únicamente el ejecutable y `~/.zaivern`; cualquier otra cosa en tu `PATH` se lista, nunca
-se borra.
+## Funciones principales
 
-## Idioma
+### 1. Agentes en paralelo sin el caos de los conflictos de fusión
 
-La interfaz viene en seis idiomas — English, 日本語, 简体中文, 한국어, Português (Brasil) y
-Español — y el cambio surte efecto en el siguiente fotograma, **sin reiniciar**.
+Los agentes reservan archivos o rangos de líneas antes de editar. Si otro agente activo
+ya posee esa región, un hook de git rechaza la escritura conflictiva — en el momento de
+escribir, no al fusionar.
 
-Elige desde el menú 🌐 de la barra de herramientas, desde **Ver → Idioma** en la barra de
-menús, desde la paleta de comandos o en Ajustes → Apariencia. Vengas por donde vengas, la
-elección acaba en `ui_language`, dentro de `~/.zaivern/config.toml`; el valor por defecto
-`"auto"` sigue el idioma de tu sistema operativo.
+En el benchmark de 64 agentes con rangos disjuntos, los **64** escribieron sus cambios
+con **0** hunks de conflicto, donde un lease por archivo habría dejado pasar exactamente 1.
+[Cómo funciona la coordinación por rango de líneas →](docs/conflict-zero.md)
 
-Los idiomas que no vienen incluidos se instalan desde un repositorio de GitHub, sin
-recompilar la aplicación:
+### 2. Gestión de agentes en paralelo
 
-```sh
-zai lang list --remote        # paquetes de idioma disponibles en el repositorio de origen
-zai lang install zh-CN
-zai lang set zh-CN
-zai lang install fr --from someone/zaivern-lang-fr
-```
+Coloca varias CLIs en paralelo y ve de un vistazo cuál está pensando, editando,
+ejecutando o esperándote. Añadir un agente son dos clics, no un comando que recordar.
 
-Para hacer el tuyo, `zai lang export fr` escribe una plantilla en
-`~/.zaivern/locales/fr.json`; edítala, compruébala con `zai lang check fr` y aplícala con
-`zai lang set fr`. **Escribir un único ID que un idioma incluido ya tiene sobrescribe solo
-esa línea**, así que corregir una etiqueta no obliga a arrastrar un diccionario entero.
+### 3. Estado del agente y detección de bloqueo
 
-**¿Quieres traducir Zaivern Code a tu idioma?** Sin Rust y sin recompilar: basta con dejar un
-archivo JSON: [docs/translating.md](docs/translating.md). Cómo funciona: [docs/i18n.md](docs/i18n.md).
+Zaivern observa el progreso semántico, no los píxeles: un agente que deja de avanzar se
+reporta como **bloqueado**, y las salidas inesperadas aparecen como notificaciones.
 
-## Funcionalidades principales
+### 4. Instrucción masiva
 
-### Coordinación de conflictos (la razón de que esto exista)
+Envía una misma instrucción a todos los agentes en marcha desde un único campo, o dirígete
+a uno solo cuando quieras un control puntual.
 
-Los agentes reclaman los archivos — o los rangos de líneas concretos — que están a punto
-de editar en un ledger compartido por repositorio, y los git hooks rechazan una escritura
-que fuera a colisionar.
+### 5. Aprobaciones
 
-<!-- 出典: docs/conflict-zero.md §3.8.1 — --layout disjoint / 64 体:
-     B (ファイル単位の所有) 完了 1・拒否 63、Cref (行域) 完了 64・拒否 0・ハンク 0 -->
-Los rangos de líneas son lo que hace esto utilizable a escala. Apunta 64 agentes a un
-único archivo y un lease a nivel de archivo deja pasar exactamente a **1** de ellos
-mientras rechaza a los otros **63**; con propiedad por región de líneas pasan los **64**,
-no se rechaza nada, y el merge sigue produciendo **0** hunks en conflicto.
+El modo con aprobación obligatoria es el predeterminado. El Auto-YES se activa por sesión,
+la elevación de privilegios siempre la confirma una persona y los valores de las variables
+de entorno de MCP nunca se muestran.
 
-<!-- 出典: docs/conflict-zero.md §3.12.2 — 錨の誤マッチによる二重配布と、その修正 -->
-Una región se sigue mediante un ancla — el contenido de su primera y su última línea — en
-lugar de por número de línea, así que sobrevive a las ediciones hechas por encima de ella.
-Si al volver a resolver esa ancla se cae en un sitio distinto del que registró el ledger,
-esa lectura se descarta en vez de darse por buena, de modo que una reserva nunca migra en
-silencio a otra parte del archivo.
+### 6. Control desde el móvil
 
-Nada de esto detecta un conflicto semántico; la [sección de abajo](#coordinación-de-conflictos)
-detalla qué queda cubierto y qué no.
+Consulta el progreso, envía instrucciones, aprueba acciones y edita archivos desde el
+móvil. Con la misma Wi-Fi, con [Tailscale](https://tailscale.com/) o por un túnel SSH.
 
-### Agent Cockpit
+### 7. Editor integrado
 
-Coloca varios CLIs de IA en mosaico, uno al lado del otro, y ve de un vistazo cuál está
-pensando, editando, ejecutando o esperándote. Vienen incorporados presets de lanzamiento
-para 33 herramientas, así que añadir un agente es cuestión de dos clics en lugar de
-recordar una línea de comandos.
+Revisa el código y lo que cambiaron los agentes sin salir de Zaivern, incluidos Markdown,
+imágenes, PDF y CSV. Los búferes sin guardar se recuperan tras un fallo.
 
-### Broadcast
+También incluye: plugins y una interfaz disponible en seis idiomas.
+[Documentación de plugins](docs/plugins.md) · [Documentación de traducción](docs/translating.md)
 
-Envía una sola instrucción a todos los agentes en ejecución desde un único campo de
-entrada, o elige un agente cuando quieras un control más concreto. Útil cuando la misma
-corrección se aplica a toda la flota.
+## Cómo funciona
 
-### Estado, aprobaciones y notificaciones
+1. **Lanza** los agentes desde una sola ventana, o conéctate a los que ya ejecutas.
+2. **Reserva** archivos o rangos de líneas antes de editar, anclados al contenido contiguo.
+3. **Bloquea** — un hook de git rechaza la escritura solapada antes de que llegue a la fusión.
+4. **Integra** — los cambios que no se solapan se fusionan con git como siempre.
 
-Zaivern Code expone los avisos de permisos, los atascos y las salidas inesperadas como
-notificaciones sobre las que puedes actuar con un clic. La aprobación automática está
-desactivada por defecto y hay que activarla de forma deliberada.
+[Detalles técnicos →](docs/conflict-zero.md) ·
+[qué garantías valen para cada forma de repositorio →](docs/czero-repo-shapes.md)
 
-### Control remoto desde el móvil
+## Agentes compatibles
 
-Consulta el progreso, envía instrucciones, aprueba acciones y edita archivos desde tu
-móvil. La configuración más sencilla funciona dentro de la misma red Wi-Fi. Cuando no
-estés en ella, toma el relevo uno de estos dos transportes:
-**[Tailscale](https://tailscale.com/)**, si ambas máquinas ya están en la misma tailnet, o
-un túnel SSH a través de un host al que ya puedas llegar. Cambiar de transporte solo
-cambia dónde escucha el servidor — el token, el puerto y la página siguen siendo los
-mismos, así que un QR ya escaneado en el móvil sigue funcionando.
+Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
+**28 más** — 33 preajustes de lanzamiento en total, más 6 agentes manejables por ACP.
 
-El modo Tailscale no necesita bastión ni redirección de puertos: instala
-[Tailscale](https://tailscale.com/download) en el PC y en el móvil, inicia sesión en ambos
-dentro de la misma tailnet y pulsa **🔒 Listen on Tailscale** en la ventana del control
-remoto. Se enlaza a la dirección de la tailnet y a `127.0.0.1` y a nada más, así que la
-Wi-Fi de la cafetería o del aeropuerto en la que estés no puede ver el puerto en absoluto.
-Zaivern obtiene la dirección de la tailnet de la tabla de rutas del kernel y nunca invoca
-el comando `tailscale` — en macOS ese CLI es un envoltorio de shell que puede quedarse
-colgado para siempre cuando el daemon no es alcanzable, y un hijo colgado congelaría la
-interfaz.
+Zaivern Code no es un modelo de IA ni incluye ninguno: solo maneja las CLIs que ya tienes
+instaladas y con sesión iniciada. Cualquier combinación sirve, incluso un único agente.
+¿Falta la tuya? [Pide una integración](https://github.com/tacyan/zaivern-code/issues).
 
-### Editor integrado
+## Por qué Zaivern
 
-Lee código y revisa lo que cambiaron tus agentes sin salir de la aplicación, incluidos
-imágenes, PDFs, CSVs y Markdown. Los búferes sin guardar sobreviven a un cierre
-inesperado: el siguiente arranque los restaura y, si el archivo cambió en disco entretanto,
-se te muestra la diferencia en lugar de sobrescribirlo en silencio.
+|  | Multiplexor de terminal | Panel genérico de agentes | Zaivern Code |
+|---|:---:|:---:|:---:|
+| Ejecutar varios agentes a la vez | ✅ | ✅ | ✅ |
+| Una sola pantalla para todos | ❌ | ✅ | ✅ |
+| Conoce el estado (pensando / bloqueado / detenido) | ❌ | varía | ✅ |
+| Posesión de rangos de líneas + rechazo al escribir | ❌ | ❌ | ✅ |
+| Aprobaciones como notificaciones | ❌ | varía | ✅ |
+| Control móvil / remoto | ❌ | varía | ✅ |
+| Un solo binario nativo, sin runtime | varía | varía | ✅ |
 
-## Coordinación de conflictos
+## Mediciones
 
-Una reserva en el ledger no es un consejo: el hook rechaza la escritura que colisiona en
-el momento en que se intenta, así que el choque aflora ahí en lugar de en el momento del
-merge.
+**64 agentes, un repositorio, misma carga** (archivos = escritores × 6, 50% de
+solapamiento de archivos):
 
-<!-- 出典: docs/conflict-zero.md §3.16.6 — dup_lines=0 は常に成立 (内容に依存しない)、
-     conflict_files=0 は条件付き (帯 + 壁 + 昇順。反復的な内容では断ることがある) -->
-Hay dos garantías que se cumplen en distinto grado, y mezclarlas exageraría el caso.
-«A dos agentes nunca se les entregan las mismas líneas» es una propiedad del ledger y se
-cumple independientemente de lo que contengan los archivos. «Y luego el merge pasa a la
-primera» es condicional: necesita una banda de seguridad, una línea única entre las dos
-regiones y orden ascendente. El contenido repetitivo puede romper la segunda mientras la
-primera sigue en pie, y en ese caso la puerta rechaza en vez de adivinar.
-
-Lo que no puede detectar es un conflicto semántico: un agente cambia la firma de una
-función mientras otro sigue llamando a la antigua, en un archivo distinto, con un merge
-perfectamente limpio.
-
-```console
-$ zai czero init      # instala el ledger, los git hooks y el merge driver, y luego se autodiagnostica
-$ zai czero verify    # crea un conflicto real en un repositorio desechable y comprueba que se detiene
-```
-
-El alcance, los límites y las mediciones que hay detrás están en
-[docs/conflict-zero.md](docs/conflict-zero.md).
-
-## Uso de recursos
-
-<!-- 出典: docs/idle-cost.md §7 — 2026-08-15、同一マシン・同一セッションで
-     Zed 1.15.0 / zai 0.16.0 / zai 0.17.0 を交互に 3 ラウンド、9/9 VALID。
-     0.16.0 を陽性対照に入れてあるので「測定が生きていること」まで示せる。
-     0.17.0 は測定床に張り付いているので必ず「≤」で書くこと -->
-
-Un editor que dejas abierto todo el día no debería costar nada mientras no estás
-escribiendo. Medido en una misma máquina y en una misma sesión, alternando entre
-aplicaciones tres veces (macOS 26.5.2, conectado a la corriente, ventanas de observación
-de 180 segundos, un espacio de trabajo neutro de 4 archivos):
-
-| | Zed 1.15.0 | Zaivern Code 0.17.0 |
+| | Git puro | Zaivern Code |
 |---|---:|---:|
-| CPU en reposo (mediana de 3) | 0,761 % de un núcleo | **≤0,006 %** — en el suelo de medición |
-| Descarga | 424,6 MB (`.app`) | **28,7 MB** (un solo binario) |
-| RSS | 162,2 MB | 170,3 MB |
+| Fusiones con conflicto | 57 de 64 | **0** |
+| Hunks de conflicto | 132 | **0** |
 
-Dos cosas con las que esta tabla es cuidadosa:
+El cero se paga rechazando escrituras: de 384 ediciones planificadas entraron 202 y el
+resto se detuvo en la puerta. Cuando los rangos de líneas son realmente disjuntos, los 64
+agentes escriben y no se rechaza ninguna.
 
-- **`≤0,006 %` es un suelo, no una lectura.** `ps` resuelve el tiempo de CPU con una
-  precisión de 1/100 s, así que una ventana de 180 segundos no puede distinguir nada por
-  debajo de 0,006 %. Las tres rondas cayeron exactamente en un tick. La afirmación honesta
-  es «al menos 127 veces más bajo que Zed», no una proporción.
-- **El RSS no es una victoria, y no afirmamos que lo sea.** Zed también está escrito en
-  Rust; los dos están a menos de un 5 % uno del otro, lo cual es ruido. El número que
-  difiere en un orden de magnitud es el tamaño de la descarga.
+**Este repositorio, 16 agentes en paralelo** (zai 0.14.0): git puro produjo **26 archivos
+en conflicto / 28 hunks**. Con el registro: **0 / 0**, y las **96 ediciones entraron** —
+ninguna rechazada, 30 de ellas desplazadas a un rango de líneas libre.
 
-La misma ejecución midió Zaivern Code **0.16.0** en 8,933 % — ese es el control positivo.
-Sin una versión que produzca una lectura alta en la misma sesión, un resultado cercano a
-cero no se puede distinguir de una medición estropeada. El coste en reposo bajó en 0.17.0
-porque el tour guiado ya no reserva fotogramas de forma incondicional, y el repintado de
-mantenimiento de cada dos segundos ha desaparecido.
+### Qué significa "cero conflictos"
 
-Reprodúcelo con `tools/idle-duel.sh --vs Zed --out /tmp/duel.tsv`. El arnés se niega a
-medir cuando no puede medir con honestidad: verifica por pid que la aplicación está en
-primer plano, exige que la máquina esté sin tocar y registra la evidencia en cada fila. El
-método completo, los números en bruto y las trampas con las que nos topamos están en
-[docs/idle-cost.md](docs/idle-cost.md).
+- Zaivern puede **rechazar** una escritura solapada en lugar de dejar que se convierta en
+  un conflicto de fusión. El número de conflictos es 0; el rendimiento no.
+- Evita el solapamiento en la posesión de líneas. **No** detecta conflictos semánticos:
+  un agente cambia una firma, otro sigue llamando a la antigua y la fusión sale limpia.
+- Los rangos de líneas lo bastante separados nunca necesitaron ayuda: git puro ya los
+  fusiona sin conflictos. La posesión por rango devuelve el paralelismo que destruye un
+  lease por archivo.
+
+[Metodología completa, cifras por escala, latencia de la puerta y límites →](docs/conflict-zero.md)
 
 ## Plataformas compatibles
 
-| Elemento | Compatibilidad |
+| Elemento | Soporte |
 |---|---|
 | SO | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
-| CLIs de IA | 33 presets de lanzamiento, incluidos Claude Code, Codex y Gemini CLI |
-| Rust | 1.88+ — solo al compilar desde el código fuente |
+| CLIs de IA | 33 preajustes de lanzamiento, más 6 vía ACP |
+| Pruebas | 4.985, ejecutadas en macOS, Linux y Windows en CI |
 | Licencia | Apache-2.0 |
-
-Una configuración habitual es Claude Code implementando, Codex probando y Gemini CLI
-escribiendo documentación, pero nada en Zaivern Code da por supuesto ese reparto.
-Cualquier combinación funciona, incluida la de un solo agente.
-
-## Seguridad
-
-- El modo con aprobación obligatoria es el predeterminado; el Auto-YES se activa
-  explícitamente por sesión.
-- La escalada de privilegios siempre requiere aprobación manual.
-- Los valores de las variables de entorno de MCP nunca se muestran — solo si están
-  definidas o no.
-- Los procesos hijo se detienen cuando se destruye una sesión o la aplicación termina, así
-  que ningún agente huérfano sigue ejecutándose en segundo plano.
-
-## Preguntas frecuentes
-
-**¿En qué se diferencia esto de tmux con paneles divididos?**
-
-tmux coloca terminales en mosaico; no tiene ni idea de qué se está ejecutando dentro de
-ellos. Zaivern Code lee el estado de cada agente, así que puede mostrar cuál está pensando,
-editando o bloqueado en un aviso de aprobación, y convertir ese aviso en una notificación
-que respondes con un clic. La parte para la que tmux no tiene equivalente es el ledger
-compartido: dos agentes no pueden escribir físicamente en las mismas líneas, porque un git
-hook rechaza la segunda escritura en el momento en que se intenta, en lugar de dejar que
-se descubra en el merge.
-
-**¿El lease ledger ralentiza las cosas?**
-
-<!-- 出典: docs/conflict-zero.md §1「意味しないこと」4 / §3.3 (掃引: 4〜8 体 p50 40〜50ms、
-     64 体 p50 160ms、busy-deny 32 体 4 件・64 体 14 件) / §3.4 (ゲート 1536 回で p50 298.7ms)。
-     体数だけでは決まらないので、必ず担当表の大きさを添えること -->
-Sí, y empeora con la escala, porque la puerta se sitúa en la ruta de escritura. En el
-barrido estándar — N escritores sobre N×6 archivos — la latencia de la puerta es de p50
-40–50 ms con 4–8 agentes y de p50 160 ms con 64. El número de agentes no es la única
-variable: una tabla de asignación más pesada que llama a la puerta 1536 veces llega a p50
-298,7 ms con esos mismos 64 agentes, así que cualquier cifra suelta del tipo «con 64
-agentes cuesta X» queda incompleta sin el tamaño de la carga de trabajo. A partir de 32
-agentes, la puerta además empieza a responder `busy-deny` cuando no puede decidir a
-tiempo: rechaza en lugar de adivinar, y un reintento pasa, pero tú lo ves como un rechazo
-ocasional. Con uno o dos agentes, la puerta no está en tu ruta crítica.
-
-**¿Qué significa realmente «cero conflictos»?**
-
-Algo más estrecho de lo que suena, y a propósito:
-
-<!-- 出典: docs/conflict-zero.md §3.2 (書き手 8 / 重なり 1.00: 10/48 成立・38 件をゲートが停止)、
-     §3.8.1 (disjoint / 64 体: 素の git のハンクは全規模 0。B は完了 1、Cref は 64)、§3.16.6 -->
-- **El cero se compra rechazando escrituras.** Con ocho escritores apuntando todos a los
-  mismos archivos, 10 de las 48 ediciones previstas se escribieron y las otras 38 se
-  detuvieron en la puerta. El recuento de conflictos es 0; el rendimiento no.
-- **Los rangos de líneas suficientemente separados nunca necesitaron ayuda.** git a secas
-  ya los fusiona con cero conflictos. La propiedad por región de líneas no hace algo que
-  git no pueda hacer — devuelve el paralelismo que destruye un lease a nivel de archivo
-  (1 de 64 agentes pasa, frente a 64 de 64).
-- **Las dos garantías no son igual de fuertes.** «A dos agentes nunca se les dan las
-  mismas líneas» siempre se cumple; «el merge pasa a la primera» es condicional y puede
-  fallar con contenido repetitivo.
-
-[docs/conflict-zero.md](docs/conflict-zero.md) abre exactamente con esta frontera y
-recoge todas las mediciones que hay detrás, incluidas las afirmaciones que después fueron
-refutadas.
 
 ## Documentación
 
-| Documento | De qué trata |
+| Documento | Qué cubre |
 |---|---|
-| [docs/conflict-zero.md](docs/conflict-zero.md) | Qué afirma «libre de conflictos», qué no, y las mediciones que lo respaldan |
-| [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Qué garantías se cumplen para cada forma de repositorio |
+| [docs/conflict-zero.md](docs/conflict-zero.md) | Qué afirma "sin conflictos", qué no afirma y cada medición detrás de ello |
+| [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Qué garantías valen para cada forma de repositorio |
 | [docs/plugins.md](docs/plugins.md) | Cómo escribir plugins, con la [especificación del formato](docs/PLUGIN_SPEC.md) |
-| [docs/README.md](docs/README.md) | Índice de todos los demás documentos, agrupados por la afirmación que respaldan |
+| [docs/README.md](docs/README.md) | Índice del resto de documentos, agrupados por la afirmación que respaldan |
 
-Las notas de versión de cada release están en la
-[página de Releases](https://github.com/tacyan/zaivern-code/releases).
+[Mediciones de CPU en reposo y tamaño del binario →](docs/idle-cost.md) ·
+[Notas de versión](https://github.com/tacyan/zaivern-code/releases)
 
-## Contribuir
+## Pruébalo
 
-Los informes de errores, las peticiones de funcionalidades y los pull requests son
-bienvenidos. Antes de abrir uno nuevo, revisa
-[Issues](https://github.com/tacyan/zaivern-code/issues) por si ya existe el informe, y
-abre un [Pull Request](https://github.com/tacyan/zaivern-code/pulls) contra `main`.
+Si los agentes de código en paralelo forman parte de tu trabajo, ejecuta Zaivern Code en
+tu próxima tarea multiagente — `zai czero init` en el repositorio, luego pon dos agentes
+sobre el mismo archivo y observa cómo la segunda escritura se rechaza en vez de acabar en
+una mala fusión.
 
-```bash
-git clone https://github.com/tacyan/zaivern-code.git
-cd zaivern-code
-rustup update stable
-cargo run --release -- .
-```
+## Comunidad
 
-[CONTRIBUTING.md](CONTRIBUTING.md) cubre el resto: cómo verificar un cambio, cómo ejecutar
-las comprobaciones de Linux y Windows en local, y las convenciones que sigue este
-repositorio.
+- ¿Encontraste un caso límite de coordinación? [Abre una issue](https://github.com/tacyan/zaivern-code/issues).
+- ¿Usas un agente de código aún no compatible? [Pide una integración](https://github.com/tacyan/zaivern-code/issues).
+- ¿Ejecutas 8, 16, 32 o 64 agentes? Comparte tu medición — `tools/conflict-bench.sh` y
+  `tools/anyrepo-prove.sh` producen cifras comparables con las tablas de arriba.
+- ¿Construiste algo con Zaivern Code? Enséñanos tu configuración.
+
+Los pull requests son bienvenidos contra `main` — [CONTRIBUTING.md](CONTRIBUTING.md)
+explica cómo compilar desde el código (Rust 1.88+), cómo verificar un cambio y cómo
+ejecutar localmente las comprobaciones de Linux y Windows.
+
+Si Zaivern Code te resulta útil, una ⭐ **Star** ayuda a que otras personas lo encuentren.
 
 ## Licencia
 
 [Apache License 2.0](LICENSE)
-
----
-
-<div align="center">
-
-**Los agentes ya son rápidos. Ahora te toca a ti mandar más rápido.**
-
-</div>
