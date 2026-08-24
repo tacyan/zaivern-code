@@ -100,9 +100,22 @@ impl ZaivernApp {
         let cs = find_buffer::byte_to_char(text, hit.start);
         let ce = find_buffer::byte_to_char(text, hit.end);
         self.pending_select = Some((cs, ce));
-        // VS Code 同様、ヒット行が画面の中央付近に来るようにスクロールする
-        self.pending_scroll =
-            Some((hit.line as f32 * self.last_row_h - self.last_view_h * 0.4).max(0.0));
+        // **フォーカスは動かさない。** 検索は打鍵ごとに走る (インクリメンタル検索)
+        // ので、ここで本文へフォーカスを移すと 1 文字打った次のフレームには
+        // 本文が入力先になり、2 文字目以降が**ファイルへ打ち込まれる**。
+        // VS Code も検索中はフォーカスを検索欄に置いたままヒットだけを動かす。
+        self.pending_select_focus = false;
+        // **見えている一致のために画面を動かさない** (VS Code の reveal と同じ)。
+        // 打鍵ごとに走るので、毎回寄せると 1 文字ごとに本文が飛び跳ねる。
+        // 判断は `find_buffer::reveal_scroll` (純関数 + 表テスト) に閉じてある。
+        if let Some(y) = find_buffer::reveal_scroll(
+            hit.line,
+            self.last_row_h,
+            self.last_scroll_y,
+            self.last_view_h,
+        ) {
+            self.pending_scroll = Some(y);
+        }
     }
 
     /// 検索バーを開く。選択があればそれを検索語にする (VS Code と同じ)。
@@ -140,6 +153,19 @@ impl ZaivernApp {
         if with_replace {
             self.find.replace_open = true;
         }
+    }
+
+    /// エディタ本文へフォーカスを返す (検索バーを閉じたときなど)。
+    ///
+    /// キャレットを動かす用事が無いときの経路。位置も動かすなら
+    /// `pending_select` + `pending_select_focus = true` を使う
+    /// (フォーカス要求は本文の `TextEdit` を描くときに出る)。
+    pub(super) fn focus_editor_body(&self, ctx: &egui::Context) {
+        let Some(i) = self.editor.active else {
+            return;
+        };
+        let id = buf_edit_id(self.cur_pane, self.editor.buffers[i].id);
+        ctx.memory_mut(|m| m.request_focus(id));
     }
 
     /// アクティブバッファのカーソル位置をバイト範囲で返す。

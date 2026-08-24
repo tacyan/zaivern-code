@@ -66,6 +66,13 @@ impl ZaivernApp {
         let ws_color = theme_dim.gamma_multiply(0.55);
 
         let mut pending_select = self.pending_select.take();
+        // フォーカスまで本文へ移すかは、キャレットを動かした側が決める。
+        // 取り出しと同時に既定 (= 移す) へ戻すので、false は 1 回しか効かない。
+        let pending_focus = if pending_select.is_some() {
+            std::mem::replace(&mut self.pending_select_focus, true)
+        } else {
+            true
+        };
         let pending_scroll = self.pending_scroll.take();
 
         // Git 行マーク(バッファの可変借用前に取得)
@@ -92,6 +99,15 @@ impl ZaivernApp {
         let mm_search: std::sync::Arc<Vec<usize>> = match (find_on && mm_on, &self.find_hits) {
             (true, Some(c)) => c.mm_lines.clone(),
             _ => std::sync::Arc::new(Vec::new()),
+        };
+        // ヒットを**どの本文で数えたか**。塗る相手 (layouter に渡る文字列) が
+        // 違えば当てない — 折りたたみ表示は本文と別の文字列だし、打鍵と同じ
+        // フレームで本文が変わる経路もある。ズレたまま当てると、位置の狂った
+        // 箱を描くか、CJK の途中で切って epaint を落とす。
+        let find_text_hash: u64 = match (find_on, &self.find_hits) {
+            (true, Some(c)) => c.text_hash,
+            // 0 は「当てない」の印。空のヒット一覧なので当てても何も起きない。
+            _ => 0,
         };
         // ハイライトの色はテーマから作る (直書きしない)
         let find_hit_bg = find_buffer::hit_bg(&self.theme);
@@ -862,6 +878,12 @@ impl ZaivernApp {
         let (win_k0, win_k1) = galley_window_key(hl_windowed_prev, hl_win);
         let mut layouter = |ui: &egui::Ui, t: &str, wrap_w: f32| {
             let max_w = crate::editor::wrap_max_width(word_wrap, wrap_w);
+            // ヒットを数えた本文と、いま組む文字列が同じときだけ塗る。
+            // **鍵にも混ぜる** — 混ぜないと「塗らずに組んだ galley」が
+            // 次のフレーム (ヒットが追い付いた後) も鍵一致で使い回され、
+            // ハイライトが永久に出なくなる。
+            let text_key = hash_str(t);
+            let hits_fit = find_text_hash != 0 && find_text_hash == text_key;
             let key = [
                 hash_str(lang.as_str()),
                 hash_str(&syntect_theme),
@@ -871,11 +893,12 @@ impl ZaivernApp {
                 (word_wrap as u64) | ((show_ws as u64) << 1) | ((bracket_on as u64) << 2),
                 max_w.to_bits() as u64,
                 find_key,
+                find_text_hash,
                 win_k0 as u64,
                 win_k1 as u64,
             ]
             .into_iter()
-            .fold(hash_str(t), combine_hash);
+            .fold(text_key, combine_hash);
             match cache {
                 // ヒット時は Arc の参照カウント増加のみ。
                 // LayoutJob のコピーも egui 側の job ハッシュ計算も起きない。
@@ -907,7 +930,7 @@ impl ZaivernApp {
                     // 検索ヒットの背景は**空白可視化の前**に差す。
                     // whitespace_layout_job は ' ' → '·' でバイト長を変えるので、
                     // 後から当てるとバイト範囲がズレる (書式は引き継がれる)。
-                    if !find_hits.is_empty() {
+                    if hits_fit && !find_hits.is_empty() {
                         j = find_buffer::apply_hits(
                             j,
                             &find_hits,
@@ -944,14 +967,8 @@ impl ZaivernApp {
         let past_end = (view_h - row_h * 3.0).max(0.0);
 
         let body_ui = |ui: &mut egui::Ui| {
-            if let Some((s, e)) = pending_select {
-                let mut st = egui::TextEdit::load_state(ui.ctx(), ed_id).unwrap_or_default();
-                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(s),
-                    egui::text::CCursor::new(e),
-                )));
-                st.store(ui.ctx(), ed_id);
-                ui.ctx().memory_mut(|m| m.request_focus(ed_id));
+            if let Some(sel) = pending_select {
+                apply_pending_select(ui.ctx(), ed_id, sel, pending_focus);
             }
 
             let mut cursor_out: Option<(usize, usize)> = None;

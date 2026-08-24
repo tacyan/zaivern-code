@@ -243,7 +243,16 @@ pub fn apply_hits(
             }
             let s = h.start.max(at);
             let e = h.end.min(se);
-            if s >= e {
+            // **ヒットは 1 フレーム古い本文のものでありうる。**
+            // 打鍵と同じフレームで本文が変わる経路 (`TextEdit` 自身の編集 /
+            // 複数キャレット / スニペット展開 / 自動ペア) があり、そのフレームの
+            // ヒットは 1 つ前の本文の位置を指す。ズレた位置で切ると CJK の
+            // 途中に当たり、**epaint が panic する** (実際に 7 回落ちた:
+            // `end byte index N is not a char boundary; it is inside '（'`)。
+            // 境界に乗らないヒットは**塗らずに飛ばす** — 1 フレーム塗り遅れる
+            // だけで、次のフレームには正しい位置で塗られる。
+            // `is_char_boundary` は範囲外にも false を返すので長さの検査も兼ねる。
+            if s >= e || !job.text.is_char_boundary(s) || !job.text.is_char_boundary(e) {
                 continue;
             }
             if s > at {
@@ -455,6 +464,26 @@ pub fn bar_layout(available: f32, m: &BarMetrics) -> BarLayout {
         }
     }
     unreachable!("Density は 3 段すべて試している")
+}
+
+/// ヒット行を見せるための新しいスクロール位置。**もう見えているなら `None`**。
+///
+/// VS Code の "reveal" と同じ約束: 画面に入っている一致のために本文を動かさない。
+/// インクリメンタル検索は**打鍵のたびに**走るので、毎回中央へ寄せると 1 文字ごとに
+/// 本文が飛び跳ねて読めなくなる (「1 文字打つと検索へ行ってしまう」の半分はこれ)。
+///
+/// 見えていないときは画面の上から 4 割の位置へ寄せる (前後の文脈が見える)。
+/// 端に貼り付くと次の行が見えないので、**上下 1 行ぶんの余白**を要求する。
+pub fn reveal_scroll(line: usize, row_h: f32, scroll_y: f32, view_h: f32) -> Option<f32> {
+    let row_h = row_h.max(1.0);
+    let y = line as f32 * row_h;
+    let margin = row_h;
+    // 余白 2 行ぶんも取れない高さでは「見えている」と言えない (必ず寄せる)
+    let roomy = view_h >= margin * 3.0;
+    if roomy && y >= scroll_y + margin && y + row_h <= scroll_y + view_h - margin {
+        return None;
+    }
+    Some((y - view_h * 0.4).max(0.0))
 }
 
 #[cfg(test)]
@@ -725,6 +754,58 @@ mod tests {
         s
     }
 
+    /// **1 フレーム古いヒットで切っても、文字境界しか切らない。**
+    ///
+    /// 打鍵と同じフレームで本文が変わる経路 (`TextEdit` 自身の編集 / 複数
+    /// キャレット / スニペット展開 / 自動ペア) があり、そのフレームのヒットは
+    /// 1 つ前の本文の位置を指す。ズレた位置で CJK の途中を切ると
+    /// **epaint が落ちる** — 実際に利用者の `panic.log` に 7 回残っていた
+    /// (`end byte index N is not a char boundary; it is inside '（'`)。
+    #[test]
+    fn 古いヒットでも文字境界しか切らない() {
+        let before = "あいうえお かきくけこ あいうえお";
+        let (hits, _) = find_all(before, &m("あいうえお", lit()));
+        assert_eq!(hits.len(), 2, "前提: 2 件見つかっている");
+        // 本文の先頭へ ASCII が 1 文字入った = 以降のヒットが 1 バイトずれる。
+        // ずれた終端はすべて CJK の途中に来る (境界に乗らない)。
+        let after = format!("x{before}");
+        assert!(
+            hits.iter()
+                .any(|h| !after.is_char_boundary(h.end) || !after.is_char_boundary(h.start)),
+            "前提: ずらしたヒットは文字境界に乗っていない"
+        );
+        let job = apply_hits(job_of(&after), &hits, None, Color32::RED, Color32::GREEN);
+        for sec in &job.sections {
+            let (s0, e0) = (sec.byte_range.start, sec.byte_range.end);
+            assert!(
+                after.is_char_boundary(s0) && after.is_char_boundary(e0),
+                "文字境界でない範囲を切った: {s0}..{e0}"
+            );
+        }
+        assert_eq!(covered(&job), after, "本文は 1 バイトも欠けない");
+        // 実際に組んでも落ちないこと (epaint の要求そのものを踏む)
+        let ctx = eframe::egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            ctx.fonts(|f| {
+                let _ = f.layout_job(job.clone());
+            });
+        });
+    }
+
+    /// 境界に乗るヒットは今までどおり塗る (安全側へ倒しすぎない)。
+    #[test]
+    fn 境界に乗るヒットは従来どおり塗る() {
+        let text = "あいうえお かきくけこ あいうえお";
+        let (hits, _) = find_all(text, &m("あいうえお", lit()));
+        let job = apply_hits(job_of(text), &hits, None, Color32::RED, Color32::GREEN);
+        let painted = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == Color32::RED)
+            .count();
+        assert_eq!(painted, 2, "CJK でも 2 件とも塗る");
+    }
+
     #[test]
     fn ハイライトは本文を欠けさせない() {
         let text = "abc def abc";
@@ -839,5 +920,51 @@ mod tests {
         assert!(full.show_glyph && !compact.show_glyph);
         assert!(compact.show_count && !minimal.show_count);
         assert!(compact.show_caret && !minimal.show_caret);
+    }
+
+    /// 見えている一致のために画面を動かさない (VS Code の reveal)。
+    /// 打鍵ごとに走る検索で毎回寄せると、本文が 1 文字ごとに飛び跳ねる。
+    #[test]
+    fn 見えている行では画面を動かさない() {
+        let (row_h, view_h) = (18.0_f32, 600.0_f32);
+        // 画面 = 行 10..43 (スクロール 180px, 高さ 600px)
+        let scroll = 10.0 * row_h;
+        // 表: (行, 期待)
+        for (line, visible) in [
+            (0usize, false), // ずっと上
+            (9, false),      // 上の余白 1 行に掛かる
+            (11, true),      // 余裕で見えている
+            (25, true),      // 真ん中
+            (41, true),      // 下の余白の内側
+            (42, false),     // 下の余白 1 行に掛かる
+            (500, false),    // ずっと下
+        ] {
+            let got = reveal_scroll(line, row_h, scroll, view_h);
+            assert_eq!(
+                got.is_none(),
+                visible,
+                "行 {line} の判定が違う (got={got:?})"
+            );
+        }
+    }
+
+    /// 見えていないときは上から 4 割の位置へ寄せ、先頭より上には行かない。
+    #[test]
+    fn 見えていない行は文脈が見える位置へ寄せる() {
+        let (row_h, view_h) = (18.0_f32, 600.0_f32);
+        let y = reveal_scroll(100, row_h, 0.0, view_h).expect("見えていないので寄せる");
+        assert_eq!(y, 100.0 * row_h - view_h * 0.4);
+        // 上の方の行では負にしない (0 で止める)
+        assert_eq!(reveal_scroll(1, row_h, 5000.0, view_h), Some(0.0));
+    }
+
+    /// 高さが 0 / 行高が 0 でも panic せず、必ず寄せる側に倒す。
+    #[test]
+    fn 潰れた画面でも判断を返す() {
+        assert!(reveal_scroll(5, 0.0, 0.0, 0.0).is_some());
+        assert!(
+            reveal_scroll(0, 18.0, 0.0, 20.0).is_some(),
+            "1 行ぶんの高さでは見えているとは言わない"
+        );
     }
 }

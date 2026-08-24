@@ -372,6 +372,22 @@
 ## 既知の罠
 
 - egui-winit 0.29 はペーストコード（⌘V / Ctrl+V）の **press イベントを飲み込む** — クリップボード処理は release イベント側で検知する。
+- **egui 0.29 の `TextEdit` は、処理した打鍵をイベントキューから消さない。**
+  `builder.rs` は `has_focus` なら `filtered_events` を**読むだけ**なので、
+  同じフレームで**後から描くウィジェットに `request_focus` すると、
+  同じ 1 打鍵が両方に入る**。しかも `Memory::request_focus` は即時反映で、
+  その場から `has_focus` が true になる。
+  実害: ⌘F の検索欄に 1 文字打つと、検索語と**本文の両方**へ入っていた
+  (キャレットはヒットを選択した状態なので、打った文字がヒットを置き換える)。
+  2 文字目からは本文だけが受け取る。
+  - 本文へのフォーカス移動は `app::apply_pending_select` の `focus` 引数
+    1 か所に閉じてある。**打鍵のたびに走る経路 (インクリメンタル検索) は
+    フォーカスを動かさない** — VS Code も検索中は検索欄に置いたままにする
+  - 番人は `app::find_focus_tests` (**実 egui で不具合そのものを再現**して
+    比較する + 走査 3 本)
+- **`Escape` は egui がフレーム頭でフォーカスを外す** (`memory/mod.rs` の
+  Focus 処理)。だから `has_focus()` では拾えない —
+  **`lost_focus()` + `key_pressed(Escape)`** で見る (Enter と同じ形)。
 - **egui 0.29 は Shift+ホイールを水平へ寄せる。** `egui-0.29.1/src/input_state/mod.rs` が
   `if modifiers.shift { delta = vec2(delta.x + delta.y, 0.0) }` としているので、
   Shift を押している間 `raw_scroll_delta.y` は**常に 0**。⌘V の飲み込みと同じ型の罠で、
