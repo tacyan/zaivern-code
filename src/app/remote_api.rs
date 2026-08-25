@@ -114,16 +114,16 @@ impl ZaivernApp {
             .map(|p| json!({"name": p.name, "icon": p.icon}))
             .collect();
         // 「待ち」の件数。スマホのビュー切替バッジがこれを出す。
-        // **数え方は `/api/agents` と同じ 1 本** (`remote::is_waiting_lane`) —
-        // ここで別に数えると「バッジ 3 なのに一覧は 5 件」になる。
-        // レーンは `FleetStore` が既に決めてあるので、PTY は 1 バイトも読まない。
-        let waiting = self
-            .fleet
-            .snap()
-            .agents
-            .iter()
-            .filter(|a| remote::is_waiting_lane(a.lane))
-            .count();
+        //
+        // **数え方も絞り込みも `/api/agents` と同じ 1 本**
+        // (`projection::waiting_count` + `AgentKind::Pty`)。
+        // スマホの一覧は PTY セッションだけを返すので、ここで Fleet 全体
+        // (= ACP 込み) を数えると「バッジ 3 なのに一覧は 2 件」になる。
+        // レーンは `FleetStore` が既に決めてあるので PTY は 1 バイトも読まない。
+        let waiting = crate::fleet::projection::waiting_count(
+            self.fleet.snap(),
+            Some(crate::fleet::AgentKind::Pty),
+        );
         json!({
             "ok": true, "workspace": ws, "tabs": tabs,
             "active": self.editor.active, "file": file, "dirty": dirty,
@@ -423,9 +423,14 @@ impl ZaivernApp {
         // `Flow` の裏取りもヒステリシスも通らない最弱の入口だったので、
         // **同じ瞬間に PC とスマホで別のレーンが出ることが構造的に起こりえた**。
         let snap = self.fleet.snap();
-        let stalled: Vec<u64> = crate::fleet::projection::stuck_ids(snap);
+        // **一覧に並べるのと同じ絞り込みで数える。**
+        // スマホの操作 API はセッション index を宛先に使うので、この一覧は
+        // PTY セッションだけを返す。見出しの件数だけ Fleet 全体 (ACP 込み) を
+        // 数えると、見出しと行数が食い違う。
+        let kind = Some(crate::fleet::AgentKind::Pty);
+        let stalled = crate::fleet::projection::stuck_ids(snap, kind);
         // レーン別の件数。看板の見出しに出す (0 本の見出しはページ側が畳む)
-        let counts = crate::fleet::projection::lane_counts(snap);
+        let counts = crate::fleet::projection::lane_counts(snap, kind);
         // 一覧に出すのは **PTY セッションだけ** (スマホの操作 API は index で
         // セッションを指すので、ACP を混ぜると宛先がずれる)。Fleet の集計には
         // ACP も載っているが、この一覧の契約は 1 バイトも変えない。

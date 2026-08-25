@@ -35,6 +35,36 @@ use super::model::Observation;
 const NOISY_WINDOW_MS: u64 = 3_000;
 
 // ---------------------------------------------------------------------------
+// 費用の探針 (テスト専用)
+// ---------------------------------------------------------------------------
+//
+// 計算量は**絶対時間では測れない** (CLAUDE.md「絶対時間で性能テストの線を
+// 引かない。必ず嘘をつく」)。守りたい性質そのもの — 「掃除で見る候補の数が
+// エージェント数に比例すること」 — を数える。
+//
+// カウンタはプロセス共通の `static` にしない。同時に走っている他のテストの
+// 呼び出しまで混ざるため (CLAUDE.md の実測: 400 回のはずが 800 回になった)。
+
+#[cfg(test)]
+thread_local! {
+    /// 追跡表の掃除で見た候補の数 (このスレッドぶん)。
+    static PRUNE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 掃除で候補を 1 つ見た。**製品では何もしない** (`cfg(test)` の外では空)。
+#[inline]
+fn note_prune_probe() {
+    #[cfg(test)]
+    PRUNE_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+/// 数えた探針を取り出して 0 へ戻す (テスト用)。
+#[cfg(test)]
+pub(super) fn take_prune_probes() -> usize {
+    PRUNE_PROBES.with(|c| c.replace(0))
+}
+
+// ---------------------------------------------------------------------------
 // レーン移動ポリシー (デバウンス) — kanban.rs から**そのまま**移設
 // ---------------------------------------------------------------------------
 
@@ -340,7 +370,23 @@ pub(super) fn step_tracks(
     }
 
     // 消えたセッションの追跡は捨てる (無限に太らせない)。
-    tracks.retain(|id, _| obs.iter().any(|o| o.id == *id));
+    //
+    // **生きている ID の集合を 1 回だけ作る。** ここを
+    // `tracks.retain(|id, _| obs.iter().any(|o| o.id == *id))` と書くと、
+    // 追跡 1 本ごとに観測列を舐め直すので **O(N²)** になる
+    // (エージェント 100 体で 1 ティック 5,000 回の比較)。
+    // 「1 tick を O(N) に保つ」という約束は、この 1 行で守れるかどうかで決まる。
+    let live: std::collections::HashSet<u64> = obs
+        .iter()
+        .map(|o| {
+            note_prune_probe();
+            o.id
+        })
+        .collect();
+    tracks.retain(|id, _| {
+        note_prune_probe();
+        live.contains(id)
+    });
     (views, stats)
 }
 

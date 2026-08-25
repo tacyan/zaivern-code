@@ -390,6 +390,107 @@ fn acpも1本のレーンに入り総数に含まれる() {
     assert_eq!(failed.activity, Activity::Stalled);
 }
 
+/// **ACP を足してもスマホ向けの集計が 1 つも変わらない。**
+///
+/// レビュー指摘の回帰テスト。`lane_counts` / `stuck_ids` / `waiting_count` が
+/// `snap.agents` を全件数えていたため、スマホの一覧 (PTY のみ) と
+/// 見出しの件数・待ちバッジが食い違いうる状態だった。
+///
+/// **数える対象と並べる対象は必ず同じでなければならない。**
+#[test]
+fn acpを足してもスマホ向け集計は変わらない() {
+    use super::projection::{lane_counts, stuck_ids, waiting_count};
+    let pty_only = || {
+        vec![
+            {
+                // 検証中 = 「待ち」に数えられない 1 体。
+                // **見張りの判定を渡さないと `Starting` → `Ready` になり、
+                // `is_waiting_lane` は `Ready` も待ちに数える**ので、
+                // ここを空にすると「待ち 2」になってテストの主張がぼやける。
+                let mut o = with_tail(pty(1, true), &["⏺ Bash(cargo test)"]);
+                o.sup = Some(S::Working);
+                o
+            },
+            {
+                // 承認待ち = 「待ち」に数えられる 1 体
+                let mut o = with_tail(pty(2, true), &["Do you want to proceed?"]);
+                o.attention = true;
+                o
+            },
+        ]
+    };
+    let acp = |id: u64, phase: crate::acp::Phase| {
+        let mut o = pty(id, true);
+        o.kind = AgentKindOpt::acp();
+        o.ladder = Some(crate::supervisor::LadderRead {
+            rung: crate::supervisor::Rung::Protocol,
+            state: crate::acp::proto_state_of(&phase),
+            detail: phase.label(),
+        });
+        o.tail_lines = Some(Vec::new());
+        o.running = !matches!(phase, crate::acp::Phase::Ended);
+        o
+    };
+
+    // ── PTY 2 体だけ ──
+    let mut before = FleetStore::default();
+    before.update(&pty_only(), 0);
+    let b = before.snapshot();
+    let kind = Some(AgentKind::Pty);
+    let (b_counts, b_wait, b_stuck) = (
+        lane_counts(&b, kind),
+        waiting_count(&b, kind),
+        stuck_ids(&b, kind),
+    );
+
+    // ── ACP を 2 体足す (うち 1 体は Failed = 人を呼ぶレーン) ──
+    let mut after = FleetStore::default();
+    let mut obs = pty_only();
+    obs.push(acp(1 << 48, crate::acp::Phase::Running));
+    obs.push(acp((1 << 48) + 1, crate::acp::Phase::Failed("boom".into())));
+    after.update(&obs, 0);
+    let a = after.snapshot();
+    let (a_counts, a_wait, a_stuck) = (
+        lane_counts(&a, kind),
+        waiting_count(&a, kind),
+        stuck_ids(&a, kind),
+    );
+
+    // **スマホ向けの数字が 1 つも動かない。**
+    assert_eq!(
+        a_counts, b_counts,
+        "ACP を足してレーン見出しの件数が変わった"
+    );
+    assert_eq!(a_wait, b_wait, "ACP を足して待ちバッジが変わった");
+    assert_eq!(a_stuck, b_stuck, "ACP を足して停滞一覧が変わった");
+
+    // 依頼の必須条件を明示的に固定する。
+    assert_eq!(a_counts.iter().sum::<usize>(), 2, "見出しの合計が 2 でない");
+    assert_eq!(a.tally(kind).total, 2, "スマホ向けの総数が 2 でない");
+    assert_eq!(a_wait, 1, "待ちは承認待ちの 1 体だけのはず");
+    // 一覧に並ぶのは PTY セッションだけ (スマホの操作 API は index を宛先に使う)
+    let listed: Vec<u64> = a
+        .agents
+        .iter()
+        .filter(|v| v.kind == AgentKind::Pty)
+        .map(|v| v.id)
+        .collect();
+    assert_eq!(listed, vec![1, 2], "一覧の件数が 2 でない");
+
+    // **Fleet 全体は 4 体**。総数の顔と、スマホの一覧の顔を混ぜない。
+    assert_eq!(
+        a.tally(None).total,
+        4,
+        "Fleet 全体の総数に ACP が入っていない"
+    );
+    assert_eq!(a.tally(None).lane_sum(), 4);
+    // 全体で数えれば ACP の Failed が「待ち」へ入る (絞り込みの違いが効いている証拠)
+    assert!(
+        waiting_count(&a, None) > a_wait,
+        "絞り込みが効いていない (全体と PTY-only が同じ数)"
+    );
+}
+
 /// ACP の接続段 → 構造化状態の写像 (表で固定する)。
 #[test]
 fn acpの段の写像は表のとおり() {
@@ -412,14 +513,47 @@ fn acpの段の写像は表のとおり() {
 // 費用 (絶対時間で線を引かない — 守りたい性質そのものを測る)
 // ---------------------------------------------------------------------------
 
-/// **エージェント数 N に対して O(N)。**
+/// **1 ティックの費用がエージェント数 N に対して O(N) であること。**
+///
+/// 直す前のこの番人は「N 体入れたら N 個のビューが返る」しか見ておらず、
+/// **`step_tracks` が O(N²) のままでも緑だった** (レビューで指摘された)。
+/// 返り値の個数は計算量と何の関係も無いので、あれは計算量の番人ではなく
+/// 「取りこぼしが無い」の番人でしかなかった。
 ///
 /// CLAUDE.md の「絶対時間で性能テストの線を引かない。必ず嘘をつく」に従い、
-/// 秒数ではなく**件数を 2 倍にしたときの伸び**を見る。
-/// ここでは「1 ティックで作られるビューの数」がちょうど N であること
-/// (= 1 体につき 1 回しか判定していない) を固定する。
+/// 秒ではなく**件数を 2 倍にしたときの伸び**を見る。数えるのは追跡表の掃除で
+/// 見た候補の数 ([`super::engine::take_prune_probes`]) で、
+/// これは O(N) 実装ならちょうど 2N、追跡ごとに観測列を舐め直す O(N²) 実装なら
+/// N² 規模になる。
 #[test]
-fn 判定はエージェント数に線形() {
+fn 一ティックの費用はエージェント数に線形() {
+    // 生きている N 体を積んだ Store を作り、次のティックの掃除の費用を数える。
+    let probes = |n: u64| -> usize {
+        let mut fleet = FleetStore::default();
+        let obs: Vec<Observation> = (1..=n)
+            .map(|id| with_tail(pty(id, true), &["⏺ Bash(cargo test)"]))
+            .collect();
+        fleet.update(&obs, 0);
+        // ここまでの探針は捨てる (測りたいのは「追跡が N 本ある状態の 1 ティック」)。
+        let _ = super::engine::take_prune_probes();
+        fleet.update(&obs, 1_000);
+        super::engine::take_prune_probes()
+    };
+
+    let a = probes(50);
+    let b = probes(100);
+
+    // O(N): 生きている ID の集合を 1 回作る (N) + 追跡 1 本につき 1 回引く (N)。
+    assert_eq!(a, 100, "50 体の掃除が 2N になっていない");
+    assert_eq!(b, 200, "100 体の掃除が 2N になっていない");
+    // **伸びがちょうど 2 倍**。O(N²) ならここが 4 倍側へ跳ねる。
+    assert_eq!(b, a * 2, "件数を 2 倍にしたら費用も 2 倍 (線形) のはず");
+}
+
+/// 取りこぼしが無いこと (旧「線形」テストが実際に見ていた性質)。
+/// 計算量とは別の話なので、名前も別にして残す。
+#[test]
+fn 観測した体数だけビューが返る() {
     let run = |n: u64| -> usize {
         let mut fleet = FleetStore::default();
         let obs: Vec<Observation> = (1..=n)
@@ -428,11 +562,8 @@ fn 判定はエージェント数に線形() {
         fleet.update(&obs, 0);
         fleet.snap().agents.len()
     };
-    let a = run(50);
-    let b = run(100);
-    assert_eq!(a, 50);
-    assert_eq!(b, 100);
-    assert_eq!(b, a * 2, "件数を 2 倍にしたら判定も 2 倍 (線形) のはず");
+    assert_eq!(run(50), 50);
+    assert_eq!(run(100), 100);
 }
 
 /// **画面を読まないティックでも判定は落ちない** (前回サンプルを使い回す)。

@@ -15,7 +15,23 @@
 use crate::kanban::{Column, LANES};
 use crate::theme::Theme;
 
-use super::model::{AgentView, Snapshot};
+use super::model::{AgentKind, AgentView, Snapshot};
+
+/// **駆動方式で絞ったビュー列** — 集計系の入口はすべてこれを通す。
+///
+/// `None` は Fleet 全体 (`Total Agents` はこちら)。
+/// `Some(AgentKind::Pty)` は端末セッションだけ。
+///
+/// **絞り込みを引数にしたのは、既定を決め打つと必ず片方が嘘になるから。**
+/// スマホの一覧は PTY セッションだけを返す (操作 API がセッション index を
+/// 宛先に使うので ACP を混ぜられない) のに、見出しの件数を Fleet 全体で
+/// 数えると「見出しは 4 なのに行は 2 本」になる。数える対象と並べる対象は
+/// 必ず同じでなければならない。
+fn views(snap: &Snapshot, kind: Option<AgentKind>) -> impl Iterator<Item = &AgentView> {
+    snap.agents
+        .iter()
+        .filter(move |a| kind.is_none_or(|k| a.kind == k))
+}
 
 /// 一覧の丸印が示す「注意の度合い」。**色の決定はここ 1 か所**。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,21 +74,33 @@ impl Dot {
 }
 
 /// レーン別の人数 ([`Column::index`] 順)。スマホの見出しと KPI が読む。
-pub fn lane_counts(snap: &Snapshot) -> [usize; LANES] {
+///
+/// `kind` の意味は [`views`] を参照。**並べる対象と同じ絞り込みを渡すこと。**
+pub fn lane_counts(snap: &Snapshot, kind: Option<AgentKind>) -> [usize; LANES] {
     let mut counts = [0usize; LANES];
-    for a in &snap.agents {
+    for a in views(snap, kind) {
         counts[a.lane.index()] += 1;
     }
     counts
+}
+
+/// 「待ち」= 人の手が要るレーンに居る体数。
+///
+/// スマホは**バッジ (`/api/state`) と一覧 (`/api/agents`) で同じ数**を出す。
+/// 数え方が 2 つあると「バッジ 3 なのに一覧は 5 件」になるので、
+/// 判定 ([`crate::remote::is_waiting_lane`]) も絞り込みもここ 1 か所に置く。
+pub fn waiting_count(snap: &Snapshot, kind: Option<AgentKind>) -> usize {
+    views(snap, kind)
+        .filter(|a| crate::remote::is_waiting_lane(a.lane))
+        .count()
 }
 
 /// 「停止中 (= 生きているのに前へ進んでいない)」と見なす ID。
 ///
 /// 判定は [`crate::supervisor::SessionState::is_stuck`] が唯一の元だったが、
 /// レーンで見れば同じことが**床を通った後**で言える。
-pub fn stuck_ids(snap: &Snapshot) -> Vec<u64> {
-    snap.agents
-        .iter()
+pub fn stuck_ids(snap: &Snapshot, kind: Option<AgentKind>) -> std::collections::HashSet<u64> {
+    views(snap, kind)
         .filter(|a| a.running && matches!(a.lane, Column::Ready | Column::Trouble))
         .map(|a| a.id)
         .collect()
