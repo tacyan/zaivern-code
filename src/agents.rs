@@ -3309,7 +3309,7 @@ mod ladder_catalog_tests {
                     d.bin
                 );
                 assert!(
-                    !(r.sub_path.is_empty() && !r.sub_value.is_empty()),
+                    !r.sub_path.is_empty() || r.sub_value.is_empty(),
                     "{}: 絞り込み先の無い値が指定されている",
                     d.bin
                 );

@@ -16,7 +16,9 @@ impl ZaivernApp {
         // PTY 画面の読み直し (parser のロック) は看板が「今」と言ったフレームだけ。
         // 看板を開けっぱなしでもアイドル時のコストがゼロに近くなる。
         let now_ms = self.supervisor.elapsed_ms();
-        let fresh_tail = self.kanban_state.sample_due(now_ms);
+        // 状態・レーン・画面末尾は **FleetStore が持っている** ものを読む。
+        // 看板がここで判定し直すと、スマホ / デッキ / Cockpit と食い違う。
+        let snap = self.fleet.snapshot();
         let cards: Vec<kanban::Card> = self
             .agents
             .sessions
@@ -24,8 +26,7 @@ impl ZaivernApp {
             .enumerate()
             .map(|(i, s)| {
                 let running = s.running();
-                let sup = self.supervisor.state_of(s.id);
-                let rate_limited = s.rate_limited.is_some();
+                let view = snap.view(s.id);
                 // coordinator に割り当て中のタスクをカードのチップに出す
                 let task = self
                     .coordinator
@@ -43,17 +44,20 @@ impl ZaivernApp {
                     },
                     title: s.title.clone(),
                     active: i == active,
-                    column: kanban::column_for(running, s.attention, rate_limited, sup),
-                    state_label: tr(kanban::state_label(running, s.attention, rate_limited, sup)),
+                    // **Fleet のスナップショットをそのまま写す。**
+                    // 以前はここで `column_for` を呼んでいたが、あれは
+                    // ラダーも画面末尾も flow も渡さない最弱の入口だったので、
+                    // 構造化プロトコルが「編集中 ◆」と言っていても
+                    // 「思考中 ≈」になっていた。
+                    column: view.map(|v| v.lane).unwrap_or(kanban::Column::Ready),
+                    state_label: view
+                        .map(|v| v.state_label())
+                        .unwrap_or_else(|| tr(kanban::Activity::Starting.label())),
                     uptime: s.uptime(),
                     unread: s.has_unread(),
                     rate_limited: s.rate_limited.clone(),
                     attention: s.attention && running,
                     running,
-                    sup,
-                    // 状態ラダー上位 2 段 (構造化プロトコル / ベンダーフック)。
-                    // 生きている間は画面推定を一切使わない (CLAUDE.md 原則 #4)。
-                    ladder: self.supervisor.ladder_of(s.id),
                     permission_badge: if s.is_permission_agent() {
                         s.approval_badge()
                     } else {
@@ -82,14 +86,6 @@ impl ZaivernApp {
                     .flatten()
                     .reduce(|a, b| format!("{a}\n{b}")),
                     can_cycle: s.permission_switch_hint().is_some(),
-                    // カードの一言 + ホバープレビュー + アクティビティ分類の材料。
-                    // サンプリング周期のフレームだけ実際に PTY を読む
-                    // (それ以外は空 = kanban 側が前回ぶんを使い回す)。
-                    tail_lines: if fresh_tail {
-                        s.screen_tail_lines(10, 180)
-                    } else {
-                        Vec::new()
-                    },
                     task,
                 }
             })
@@ -117,7 +113,9 @@ impl ZaivernApp {
                     text: trf("が「{state}」になりました", &[("state", tr(t.to.label()))]),
                     detail: t.reason.clone(),
                     // 遷移先状態の列色で塗る (フラグは関与させない)
-                    column: kanban::column_for(true, false, false, Some(t.to)),
+                    // 遷移履歴の色は「その状態の素のレーン」で塗る
+                    // (履歴なのでヒステリシスも flow も関係しない)。
+                    column: kanban::lane_of_state(t.to),
                 });
             }
         }
@@ -162,7 +160,7 @@ impl ZaivernApp {
             &presets,
             &activity,
             now_ms,
-            fresh_tail,
+            &snap,
             &mut live,
         );
 
@@ -310,9 +308,10 @@ impl ZaivernApp {
     pub(super) fn deck_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let active = self.agents.active;
-        let now_ms = self.supervisor.elapsed_ms();
-        // PTY 画面の読み直しはデッキが「今」と言ったフレームだけ (看板と同じ作法)。
-        let fresh_tail = self.deck_state.sample_due(now_ms);
+        // 状態もサンプリング周期も **FleetStore が持っている** ものを読む。
+        // デッキが自前の追跡を持っていた頃は、ラダー無しの判定で回していたので
+        // 同じ 1 体が看板とデッキで違うレーンに居ることが構造的に起こりえた。
+        let snap = self.fleet.snapshot();
 
         // 副題のブランチだけ先に解決しておく (`&mut self` が要るので一覧の外で)。
         let cwds: Vec<PathBuf> = self.agents.sessions.iter().map(|s| s.cwd.clone()).collect();
@@ -332,16 +331,7 @@ impl ZaivernApp {
                 branch: branches.get(i).cloned().unwrap_or_default(),
                 cwd: s.cwd.clone(),
                 command: s.command.clone(),
-                running: s.running(),
-                attention: s.attention && s.running(),
-                rate_limited: s.rate_limited.is_some(),
-                sup: self.supervisor.state_of(s.id),
                 active: i == active,
-                tail_lines: if fresh_tail {
-                    s.screen_tail_lines(10, 180)
-                } else {
-                    Vec::new()
-                },
             })
             .collect();
         let launchers: Vec<deck::LauncherRow> = self
@@ -388,8 +378,7 @@ impl ZaivernApp {
             &theme,
             &live,
             &launchers,
-            now_ms,
-            fresh_tail,
+            &snap,
             scanning,
             &mut draw,
         );

@@ -116,20 +116,13 @@ impl ZaivernApp {
         // 「待ち」の件数。スマホのビュー切替バッジがこれを出す。
         // **数え方は `/api/agents` と同じ 1 本** (`remote::is_waiting_lane`) —
         // ここで別に数えると「バッジ 3 なのに一覧は 5 件」になる。
-        // PTY は読まない (`column_for` は画面末尾を使わない) ので、
-        // 一覧を開いていない間の費用はゼロのまま。
+        // レーンは `FleetStore` が既に決めてあるので、PTY は 1 バイトも読まない。
         let waiting = self
+            .fleet
+            .snap()
             .agents
-            .sessions
             .iter()
-            .filter(|s| {
-                remote::is_waiting_lane(kanban::column_for(
-                    s.running(),
-                    s.attention,
-                    s.rate_limited.is_some(),
-                    self.supervisor.state_of(s.id),
-                ))
-            })
+            .filter(|a| remote::is_waiting_lane(a.lane))
             .count();
         json!({
             "ok": true, "workspace": ws, "tabs": tabs,
@@ -423,10 +416,19 @@ impl ZaivernApp {
     /// `/api/term` しか叩かないので、一覧を開いていない間の費用はゼロ。
     pub(super) fn remote_reply_agents(&self) -> String {
         use serde_json::json;
-        let stalled = self.stalled_session_ids();
         let active = self.agents.active;
+        // **PC 側とまったく同じ 1 つのスナップショット**を読む。
+        // 以前はここで `kanban::column_for` を呼んでいたが、あれは
+        // ラダー (構造化プロトコル / フック / シェル統合) も画面末尾も
+        // `Flow` の裏取りもヒステリシスも通らない最弱の入口だったので、
+        // **同じ瞬間に PC とスマホで別のレーンが出ることが構造的に起こりえた**。
+        let snap = self.fleet.snap();
+        let stalled: Vec<u64> = crate::fleet::projection::stuck_ids(snap);
         // レーン別の件数。看板の見出しに出す (0 本の見出しはページ側が畳む)
-        let mut counts = [0usize; kanban::LANES];
+        let counts = crate::fleet::projection::lane_counts(snap);
+        // 一覧に出すのは **PTY セッションだけ** (スマホの操作 API は index で
+        // セッションを指すので、ACP を混ぜると宛先がずれる)。Fleet の集計には
+        // ACP も載っているが、この一覧の契約は 1 バイトも変えない。
         let agents: Vec<_> = self
             .agents
             .sessions
@@ -434,13 +436,8 @@ impl ZaivernApp {
             .enumerate()
             .map(|(i, s)| {
                 let running = s.running();
-                let col = kanban::column_for(
-                    running,
-                    s.attention,
-                    s.rate_limited.is_some(),
-                    self.supervisor.state_of(s.id),
-                );
-                counts[col.index()] += 1;
+                let view = snap.view(s.id);
+                let col = view.map(|v| v.lane).unwrap_or(crate::kanban::Column::Ready);
                 // 直近の出力は 2 行だけ。行あたりの桁も詰める
                 // (スマホの幅で折り返すと 1 行のカードが画面を埋める)
                 let tail = s.screen_tail_lines(2, 120);
@@ -453,12 +450,9 @@ impl ZaivernApp {
                     "active": i == active,
                     "unread": s.has_unread(),
                     "lane": col.index(),
-                    "state": tr(kanban::state_label(
-                        running,
-                        s.attention,
-                        s.rate_limited.is_some(),
-                        self.supervisor.state_of(s.id),
-                    )),
+                    "state": view
+                        .map(|v| v.state_label())
+                        .unwrap_or_else(|| tr(crate::kanban::Activity::Starting.label())),
                     // 「待ち」一覧に載せるか。判定は remote::is_waiting_lane 1 か所
                     "waiting": remote::is_waiting_lane(col),
                     "uptime": s.uptime(),
@@ -2816,11 +2810,17 @@ mod bulk_wiring_tests {
     }
 
     #[test]
-    fn 一覧の状態は看板の判定をそのまま出す() {
+    fn 一覧の状態はfleetのスナップショットをそのまま出す() {
         let body = body_of("pub(super) fn remote_reply_agents(");
+        // **PC 側とまったく同じ 1 つのスナップショットを読む。**
+        // かつてはここが `kanban::column_for` を呼んでいて、それは
+        // ラダーも画面末尾も flow もヒステリシスも通らない最弱の入口
+        // だったので、同じ瞬間に PC とスマホで別のレーンが出ていた。
         for entry in [
-            "kanban::column_for(",
-            "kanban::state_label(",
+            "self.fleet.snap()",
+            "snap.view(s.id)",
+            "v.lane",
+            "v.state_label()",
             "remote::is_waiting_lane(",
         ] {
             assert!(
@@ -2828,7 +2828,13 @@ mod bulk_wiring_tests {
                 "一覧が {entry} を使っていない (状態を作り直している疑い)"
             );
         }
-        // 画面文字の部分一致で状態を決めていないこと
+        // **自前で判定し直していないこと。** 弱い入口が復活したら赤にする。
+        for banned in ["kanban::column_for(", "kanban::state_label(", "classify"] {
+            assert!(
+                !body.contains(banned),
+                "一覧が {banned} を呼んでいる (Fleet の外で状態を作っている)"
+            );
+        } // 画面文字の部分一致で状態を決めていないこと
         assert!(
             !body.contains(".contains(\""),
             "画面テキストの部分一致で状態を決めている"

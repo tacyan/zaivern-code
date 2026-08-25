@@ -1813,7 +1813,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
     // 普段のマージまで変わった」が構造的に起こらない。
     let markers = has_marker(&bs, &os, &ts);
     let auto_only = opts.auto && !opts.whole_file && !markers;
-    if !opts.whole_file && !markers && !(opts.auto && auto_applies(&bs, &os, &ts)) {
+    if !(opts.whole_file || markers || opts.auto && auto_applies(&bs, &os, &ts)) {
         return delegate_to_git(o, a, b, opts.marker_size);
     }
 

@@ -30,6 +30,7 @@ use crate::file_tree::{
 };
 use crate::find_buffer;
 use crate::firewall;
+use crate::fleet;
 use crate::follow;
 use crate::fswatch;
 use crate::fuzzy;
@@ -119,6 +120,7 @@ pub(crate) const SRC_IMPL: &str = concat!(
     include_str!("code_editor.rs"),
     include_str!("cmd_palette.rs"),
     include_str!("file_ops.rs"),
+    include_str!("fleet_sync.rs"),
     include_str!("whichkey_voice.rs"),
     include_str!("remote_api.rs"),
     include_str!("orchestrate.rs"),
@@ -160,6 +162,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("code_editor.rs"),
     include_str!("cmd_palette.rs"),
     include_str!("file_ops.rs"),
+    include_str!("fleet_sync.rs"),
     include_str!("whichkey_voice.rs"),
     include_str!("remote_api.rs"),
     include_str!("orchestrate.rs"),
@@ -3357,6 +3360,12 @@ pub struct ZaivernApp {
     kanban: bool,
     /// 看板画面の UI 状態 (ブロードキャスト/指示の入力バッファ等)
     kanban_state: kanban::KanbanState,
+    /// **Fleet 状態の Single Source of Truth** (`crate::fleet`)。
+    ///
+    /// 看板・デッキ・Cockpit・サイドバー・スマホ一覧・ACP は、すべて
+    /// ここのスナップショットを読む。**画面ごとに状態を作り直さない。**
+    /// 書き込むのは [`ZaivernApp::fleet_tick`] 1 か所だけ。
+    pub(crate) fleet: fleet::FleetStore,
     /// エージェントデッキ (縦 1 本でエージェントを管理する画面)。
     /// Cockpit / 看板と同格の中央画面モードで、3 つ同時には出さない。
     deck: bool,
@@ -4261,6 +4270,7 @@ mod editor_layout;
 mod file_ops;
 mod file_viewers;
 mod find_nav;
+mod fleet_sync;
 mod kanban_deck_git;
 mod lsp_glue;
 mod open_prefs;

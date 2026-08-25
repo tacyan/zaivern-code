@@ -71,8 +71,6 @@
 //! 副作用 (PTY への書き込み・起動・再起動…) は `KanbanAction` で app.rs へ返す。
 //! ここでは Session を直接借りない (app.rs が `Card` へ写して渡す)。
 
-use std::collections::HashMap;
-
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Stroke};
 
 use crate::i18n::{tr, trf};
@@ -155,10 +153,10 @@ const WORK_HOLD_MS: u64 = FAST_SAMPLE_MS * 8;
 /// **本当に異常なら数秒では消えない**ので、この時間だけ続くことを求める。
 /// 続かないあいだカードは作業系レーン (= 処理中) に居る。
 /// 承認待ちと完了は人を待たせる/待たせないの判断が逆なので 0 のまま。
-const TROUBLE_HOLD_MS: u64 = 5_000;
+pub(crate) const TROUBLE_HOLD_MS: u64 = 5_000;
 
 /// 「新しいレーンへ着地した」ハイライトの寿命 (ms)。
-const LAND_HIGHLIGHT_MS: u64 = 900;
+pub(crate) const LAND_HIGHLIGHT_MS: u64 = 900;
 
 /// **指揮官 (スーパーエージェント) の印。** カード・左レール・ライブ見出しの
 /// 3 か所すべてで同じ字を使う (別の字を使うと「同じものだ」と分からない)。
@@ -841,7 +839,8 @@ pub fn classify_screen(tail: &[String]) -> Option<(Activity, String)> {
 ///
 /// 生の出力ストリームの観測を持たない呼び出し向け ([`Flow::Unknown`] 相当)。
 /// 看板本体は [`classify_flow`] を使う。
-pub fn classify(
+#[cfg(test)]
+fn classify(
     running: bool,
     attention: bool,
     rate_limited: bool,
@@ -862,7 +861,8 @@ pub fn classify(
 ///    (**「作業中なのに停滞・異常」の根治**)
 /// 5. supervisor が「動いていない」と言うなら待機 (画面の残骸に釣られない)
 /// 6. supervisor が「動いている」と言うときだけ、画面末尾で中身を推定
-pub fn classify_flow(
+#[cfg(test)]
+fn classify_flow(
     running: bool,
     attention: bool,
     rate_limited: bool,
@@ -973,13 +973,28 @@ pub fn classify_stream(
     }
 }
 
+/// **状態遷移履歴の 1 件を塗る色を決める** (純関数)。
+///
+/// これは「いまの状態」ではなく**過去に起きた遷移**なので、ヒステリシスも
+/// `Flow` の裏取りも関係しない (どちらも「いま」の話)。だから
+/// [`crate::fleet::FleetStore`] を経由せず、素の対応表を引く。
+///
+/// **これが `kanban` の外へ出す唯一のレーン判定である。**
+/// 「いまの状態」は必ず `FleetStore → Snapshot → AgentView` から読むこと。
+pub fn lane_of_state(state: supervisor::SessionState) -> Column {
+    classify_stream(true, false, false, None, Some(state), &[], Flow::Unknown).lane()
+}
+
 /// セッションの生存フラグ + supervisor 判定から列を決める **純関数**。
 ///
-/// 優先順位は app.rs `coordinator_state` と同じ
-/// (終了 > 承認待ち > レート制限 > supervisor 判定)。順序を揃えておかないと、
-/// 看板の見た目と coordinator の配達判断が食い違って混乱する。
-/// 確信度の床 ([`Read::lane`]) もここで通す。
-pub fn column_for(
+/// **`pub` ではない。** かつてはここが公開されていたので、
+/// スマホ (`app/remote_api.rs`) と看板カードの初期値が
+/// `ladder = None` / `tail = &[]` / `flow = Unknown` を渡して呼んでいた。
+/// 材料を渡さない呼び出しができる限り、構造化プロトコルが
+/// 「編集中 ◆」と言っていても「思考中 ≈」が返る経路が残る。
+/// いまは [`crate::fleet::engine`] だけが完全な材料つきで呼ぶ。
+#[cfg(test)]
+fn column_for(
     running: bool,
     attention: bool,
     rate_limited: bool,
@@ -988,8 +1003,9 @@ pub fn column_for(
     classify(running, attention, rate_limited, sup, &[]).lane()
 }
 
-/// カードに出す状態ラベル (tr のキーになる日本語原文)。優先順位は [`classify`] と同じ。
-pub fn state_label(
+/// カードに出す状態ラベル。**`pub` ではない** ([`column_for`] と同じ理由)。
+#[cfg(test)]
+fn state_label(
     running: bool,
     attention: bool,
     rate_limited: bool,
@@ -1004,82 +1020,14 @@ pub fn state_label(
 // レーン移動ポリシー (デバウンス)
 // ---------------------------------------------------------------------------
 
-/// 1 枚のカードのレーン位置を、ちらつかせずに動かす状態機械。
+/// レーン移動のヒステリシスは [`crate::fleet::engine::LaneTracker`] へ移した。
 ///
-/// - 判定が現在のレーンと同じなら何もしない (候補は取り下げ)
-/// - 違うレーンの判定が [`Column::hold_ms`] 以上続いたら初めて移動
-/// - 承認待ち・完了は `hold_ms == 0` なので即座に動く
-///   (「停滞・異常」だけは [`TROUBLE_HOLD_MS`] 続くことを求める)
-///
-/// 8 レーンでは 思考↔編集↔実行↔検証 の往復がそのままレーンをまたぐので、
-/// この機械がいちばん効く場所になる ([`WORK_HOLD_MS`])。
-/// 判定が 1 サンプル揺れただけでカードが飛ぶのを**構造的に不可能**にする。
-#[derive(Clone, Copy, Debug)]
-pub struct LaneTracker {
-    lane: Column,
-    /// 候補レーンと、その候補が続き始めた時刻
-    pending: Option<(Column, u64)>,
-    /// 現在のレーンへ着地した時刻 (ハイライト用)
-    landed_ms: u64,
-}
-
-impl LaneTracker {
-    pub fn new(lane: Column, now_ms: u64) -> Self {
-        Self {
-            lane,
-            pending: None,
-            landed_ms: now_ms,
-        }
-    }
-
-    pub fn lane(&self) -> Column {
-        self.lane
-    }
-
-    /// 現在のレーンへ着地した時刻 (テスト・デバッグ用)。
-    #[allow(dead_code)]
-    pub fn landed_ms(&self) -> u64 {
-        self.landed_ms
-    }
-
-    /// 着地ハイライトの強さ (1.0 → 0.0)。0.0 なら描かなくてよい。
-    pub fn land_glow(&self, now_ms: u64) -> f32 {
-        let age = now_ms.saturating_sub(self.landed_ms);
-        if age >= LAND_HIGHLIGHT_MS {
-            return 0.0;
-        }
-        1.0 - age as f32 / LAND_HIGHLIGHT_MS as f32
-    }
-
-    /// 望ましいレーン `want` を与えて 1 ステップ進める。移動したら true。
-    pub fn step(&mut self, want: Column, now_ms: u64) -> bool {
-        if want == self.lane {
-            self.pending = None;
-            return false;
-        }
-        let hold = want.hold_ms();
-        match self.pending {
-            Some((c, since)) if c == want => {
-                if now_ms.saturating_sub(since) >= hold {
-                    self.lane = want;
-                    self.landed_ms = now_ms;
-                    self.pending = None;
-                    return true;
-                }
-            }
-            _ => {
-                if hold == 0 {
-                    self.lane = want;
-                    self.landed_ms = now_ms;
-                    self.pending = None;
-                    return true;
-                }
-                self.pending = Some((want, now_ms));
-            }
-        }
-        false
-    }
-}
+/// 時間の関数である状態を看板 (ビュー) のメモリに置いていたため、
+/// **看板を閉じている間は 1 ミリ秒も進まず**、看板 → デッキ → 看板 と
+/// 切り替えるだけで「停滞・異常」の継続確認がリセットされていた。
+/// ここは既存の呼び出し (主にテスト) のための再輸出。
+#[allow(unused_imports)]
+pub use crate::fleet::engine::LaneTracker;
 
 // ---------------------------------------------------------------------------
 // 出力の勢い (スパークライン用の純粋な算術)
@@ -1560,6 +1508,7 @@ pub fn move_selection(order: &[u64], cur: Option<u64>, delta: i32) -> Option<u64
 
 /// セッション 1 件の看板カード。app.rs が毎フレーム写して渡す
 /// (`idx` は `AgentManager.sessions` のインデックスで、このフレーム内でのみ有効)。
+#[derive(Clone)]
 pub struct Card {
     pub idx: usize,
     pub id: u64,
@@ -1575,14 +1524,6 @@ pub struct Card {
     pub rate_limited: Option<String>,
     pub attention: bool,
     pub running: bool,
-    /// 見張り (supervisor.rs) の判定。[`classify`] が画面推定より優先して使う。
-    pub sup: Option<supervisor::SessionState>,
-    /// **状態ラダー上位 2 段の判定** (`supervisor::Supervisor::ladder_of`)。
-    ///
-    /// 構造化プロトコル / ベンダーフックから来た「画面を読まずに得た事実」。
-    /// 生きている間は [`classify_stream`] が見張りより優先して採る。
-    /// 上段が沈黙すると `None` になり、判定は自動的に下の段へ降りる。
-    pub ladder: Option<supervisor::LadderRead>,
     /// ⚡/🛡 (権限モード対応エージェントのみ、他は "")
     pub permission_badge: &'static str,
     /// **指名スーパーエージェント (指揮官) か** ([`config::SuperAgentConfig`])。
@@ -1593,11 +1534,6 @@ pub struct Card {
     pub commander: bool,
     /// 権限モード切替キーを送れるか
     pub can_cycle: bool,
-    /// 画面末尾の「意味のある行」たち (時系列順)。
-    ///
-    /// **サンプリングしたフレームだけ中身が入る** ([`KanbanState::sample_due`])。
-    /// 空のフレームでは [`KanbanState`] が前回ぶんを使うので、カードはちらつかない。
-    pub tail_lines: Vec<String>,
     /// coordinator に割り当て中のタスク名
     pub task: Option<String>,
     /// 他のエージェントと**同じファイルを取り合っている**か
@@ -1667,6 +1603,30 @@ impl Tally {
     }
 }
 
+impl Tally {
+    /// `(レーン, 生きているか)` の列から集計を作る (**唯一の組み立て口**)。
+    ///
+    /// 不変条件「レーン別人数の合計 == 総数」を、ここ 1 か所で守れるようにする
+    /// (フィールドを外から書ける形にすると、二重計上の経路がいつか生える)。
+    pub fn from_rows(rows: impl Iterator<Item = (Column, bool)>) -> Tally {
+        let mut t = Tally::default();
+        for (lane, running) in rows {
+            t.total += 1;
+            if running {
+                t.running += 1;
+            }
+            // 1 体はちょうど 1 本のレーンにだけ数える (二重計上しない)。
+            t.per[lane.index()] += 1;
+        }
+        debug_assert_eq!(
+            t.lane_sum(),
+            t.total,
+            "レーン集計が総数と合わない (二重計上か取りこぼし)"
+        );
+        t
+    }
+}
+
 /// カード一覧から列集計を作る純関数 (カード自身の素の列を使う)。
 /// 実描画は [`tally_lanes`] (デバウンス後のレーン) を使うので、こちらは
 /// 「素の判定だけ見たい」テスト・外部呼び出し向け。
@@ -1726,121 +1686,32 @@ const SAMPLE_MS: u64 = 2_000;
 const MAX_SAMPLES: usize = 240;
 
 /// 動いているエージェントが居るときの PTY 画面サンプリング間隔 (≈6.7Hz)。
-const FAST_SAMPLE_MS: u64 = 150;
+pub(crate) const FAST_SAMPLE_MS: u64 = 150;
 /// 誰も動いていないときのサンプリング間隔 (1Hz)。
-const SLOW_SAMPLE_MS: u64 = 1_000;
+pub(crate) const SLOW_SAMPLE_MS: u64 = 1_000;
 /// 全員終了しているときの再描画間隔 (実質何もしない)。
 const ASLEEP_REPAINT_MS: u64 = 2_000;
 /// 着地ハイライトが消えるまでのあいだの刻み (≈30fps)。
 /// 走るのは [`LAND_HIGHLIGHT_MS`] のあいだだけで、常時ではない。
 const LAND_ANIM_MS: u64 = 33;
 /// 出力の勢いスパークラインの窓 (30 秒) とバケツ数。
-const PULSE_WINDOW_MS: u64 = 30_000;
-const PULSE_BUCKETS: usize = 30;
+pub(crate) const PULSE_WINDOW_MS: u64 = 30_000;
+pub(crate) const PULSE_BUCKETS: usize = 30;
 
 /// 「進んでいる / 止まっている」を言い切るのに要る観測時間 (ms) — [`Track::flow`]。
 ///
 /// 見張りの停滞判定は 180 秒の窓を見るので、こちらはその 1/12 で足りる。
 /// 短すぎるとツール呼び出しの合間の数秒の静けさで「止まった」と言ってしまい、
 /// 長すぎると本当に固まった相手を見逃す。
-const FLOW_WINDOW_MS: u64 = 15_000;
+pub(crate) const FLOW_WINDOW_MS: u64 = 15_000;
 
-/// 1 セッションぶんの追跡状態 (レーン位置・アクティビティ・出力の勢い)。
-#[derive(Clone, Debug)]
-pub struct Track {
-    lane: LaneTracker,
-    /// いまのアクティビティと、それが始まった時刻 (経過タイマー)
-    activity: Activity,
-    since_ms: u64,
-    source: Source,
-    detail: String,
-    /// 段位不足で採らなかった見張りの異常判定 (カードに ⚠ で出す)
-    suspicion: Option<&'static str>,
-    /// 直近に触ったファイル / 走らせたコマンド (分かった時点で更新)
-    last_file: String,
-    last_cmd: String,
-    /// 最後にサンプルした画面末尾 (カードの一言・ホバープレビューの元)
-    tail: Vec<String>,
-    /// 最後にサンプルした画面末尾の**正規化表現** ([`norm_tail`])。
-    /// 「新しい中身が出たか」の判定はこちらで行う (スピナーに騙されない)。
-    norm: Vec<String>,
-    /// 最後に**意味のある進捗**があった時刻
-    progress_ms: Option<u64>,
-    /// このカードを最初に観測した時刻 (窓が埋まったかの判断に使う)
-    born_ms: u64,
-    /// 出力の勢い `(時刻, 新規文字数)`
-    pulse: Vec<(u64, u64)>,
-}
-
-impl Track {
-    fn new(read: &Read, now_ms: u64) -> Self {
-        Self {
-            lane: LaneTracker::new(read.lane(), now_ms),
-            activity: read.activity,
-            since_ms: now_ms,
-            source: read.source,
-            detail: read.detail.clone(),
-            suspicion: read.suspicion,
-            last_file: String::new(),
-            last_cmd: String::new(),
-            tail: Vec::new(),
-            norm: Vec::new(),
-            progress_ms: None,
-            born_ms: now_ms,
-            pulse: Vec::new(),
-        }
-    }
-
-    /// **生の出力ストリームの事実** — 見張りの異常判定の裏取りに使う ([`Flow`])。
-    ///
-    /// - 直近 [`FLOW_WINDOW_MS`] に新しい中身が出た → `Live`
-    /// - 同じ時間ぶん観測していて 1 行も増えていない → `Silent`
-    /// - まだ観測が足りない → `Unknown` (判断材料にしない = 従来通りの扱い)
-    pub fn flow(&self, now_ms: u64) -> Flow {
-        if self
-            .progress_ms
-            .is_some_and(|p| now_ms.saturating_sub(p) <= FLOW_WINDOW_MS)
-        {
-            return Flow::Live;
-        }
-        if now_ms.saturating_sub(self.born_ms) >= FLOW_WINDOW_MS && !self.norm.is_empty() {
-            return Flow::Silent;
-        }
-        Flow::Unknown
-    }
-
-    /// 現在のアクティビティが続いている時間 (ms)。
-    pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.since_ms)
-    }
-
-    /// 直近 30 秒の出力の勢い (古い → 新しい)。
-    pub fn pulse_series(&self, now_ms: u64) -> Vec<f32> {
-        bucket_series(&self.pulse, now_ms, PULSE_WINDOW_MS, PULSE_BUCKETS)
-    }
-
-    /// いまの判定を [`Read`] として組み直す (根拠の文言を 1 か所で作るため)。
-    fn read(&self) -> Read {
-        Read {
-            activity: self.activity,
-            source: self.source,
-            detail: self.detail.clone(),
-            suspicion: self.suspicion,
-        }
-    }
-
-    /// このカードを**いまのレーンへ入れた根拠** (ホバーで出す 1 行)。
-    pub fn reason(&self) -> String {
-        self.read().reason()
-    }
-
-    /// 直近 3 秒に新しい出力があったか (LIVE 表示・サンプリング速度の判断)。
-    fn recently_noisy(&self, now_ms: u64) -> bool {
-        self.pulse
-            .iter()
-            .any(|(t, v)| *v > 0 && now_ms.saturating_sub(*t) <= 3_000)
-    }
-}
+/// 1 セッションぶんの追跡状態は [`crate::fleet::engine::Track`] が持つ。
+///
+/// 看板が自分の `tracks` を持っていた頃は、**看板を開いているフレームしか
+/// 追跡が進まなかった**。いまは [`crate::fleet::FleetStore`] が所有し、
+/// 看板はそれを読むだけになっている。
+#[allow(unused_imports)]
+pub use crate::fleet::engine::Track;
 
 /// 看板画面の UI 状態 (app.rs が保持する)。
 #[derive(Default)]
@@ -1853,8 +1724,16 @@ pub struct KanbanState {
     prompt_focus: bool,
     /// スループット/スパークラインの履歴
     samples: Vec<Sample>,
-    /// セッション id → 追跡状態
-    tracks: HashMap<u64, Track>,
+    /// **このフレームで読む Fleet のスナップショット** (`Arc` のクローン 1 回)。
+    ///
+    /// 看板は自分では 1 つも判定しない。ここに入っている
+    /// [`crate::fleet::AgentView`] を読むだけである。
+    snap: std::sync::Arc<crate::fleet::Snapshot>,
+    /// 看板が一度でも Store のスナップショットを取り込んだか。
+    ///
+    /// 「初めて見るカード」を起動の合図として扱ってよいのは 2 回目以降だけ
+    /// (初回は全カードが初めて見るカードになる)。
+    adopted: bool,
     /// 選択中カード (**セッション id**。レーン移動でも消えない)
     selected: Option<u64>,
     /// 選択カードが最後に居た並び順の位置 (消えたときの寄せ先)
@@ -1886,8 +1765,6 @@ pub struct KanbanState {
     /// ライブペインの取り分 (0.2..0.7)。None = 永続メモリから未読込
     split: Option<f32>,
     split_dirty: bool,
-    /// 最後に PTY 画面をサンプルした時刻
-    last_sample_ms: Option<u64>,
     /// 直近のサンプルで「動いている」と判定したか (サンプリング速度に効く)
     busy: bool,
     /// 稼働中のセッションが 1 つでもあるか (居なければ寝る)
@@ -1929,25 +1806,9 @@ impl KanbanState {
         }
     }
 
-    /// **PTY 画面を読み直してよいフレームか。**
-    ///
-    /// app.rs はこれが false のあいだ `screen_tail_lines` を呼ばない
-    /// (= 看板を開けっぱなしでも毎フレーム parser をロックしない)。
-    /// 動いている間だけ速く回し、静かなら 1 秒に 1 回で足りる。
-    pub fn sample_due(&mut self, now_ms: u64) -> bool {
-        let interval = if self.busy {
-            FAST_SAMPLE_MS
-        } else {
-            SLOW_SAMPLE_MS
-        };
-        match self.last_sample_ms {
-            Some(last) if now_ms.saturating_sub(last) < interval => false,
-            _ => {
-                self.last_sample_ms = Some(now_ms);
-                true
-            }
-        }
-    }
+    /// PTY 画面の読み直しの間引きは [`crate::fleet::FleetStore::sample_due`] へ
+    /// 移した。**看板を開いているフレームしか進まない**のが問題だったので、
+    /// 看板が持っていてはいけない。
 
     /// 次に再描画を要求するまでの ms。**`None` なら 1 枚も予約しない。**
     /// 無条件の再描画をしないための唯一の窓口。
@@ -1998,100 +1859,21 @@ impl KanbanState {
         })
     }
 
-    /// 追跡状態を 1 ステップ進める。`fresh` が true のフレームだけ
-    /// `cards[..].tail_lines` に新しい画面が入っている。
+    /// **スナップショットを受け取って、看板固有の UI 状態だけを進める。**
+    ///
+    /// 判定・ヒステリシス・出力の勢いは [`crate::fleet::FleetStore`] が済ませて
+    /// あるので、ここに残るのは看板にしか意味の無いもの
+    /// (選択・スクロール追従・再描画の刻み) だけである。
     ///
     /// 戻り値は `lanes[i]` = `cards[i]` の**表示**レーン (デバウンス済み)。
-    pub fn update_tracks(&mut self, cards: &[Card], now_ms: u64, fresh: bool) -> Vec<Column> {
-        let mut lanes = Vec::with_capacity(cards.len());
-        let mut busy = false;
-        let mut animating = false;
-        let mut any_running = false;
-        // 追跡がまだ空 = 看板を開いた最初のフレーム。ここでは全カードが
-        // 「初めて見るカード」なので、**起動の合図として扱ってはいけない**。
-        let first_fill = self.tracks.is_empty();
-        // このフレームで初めて現れたカード。ループの中で選択を書き換えると
-        // 最後の 1 枚が必ず勝ってしまうので、数え終わってから決める。
-        let mut arrived: Vec<u64> = Vec::new();
-        for c in cards {
-            if c.running {
-                any_running = true;
-            }
-            // 画面が来ていないフレームは、前回サンプルした画面で判定する
-            // (構造化信号 — 生死・承認・レート制限 — は毎フレーム最新)。
-            // `Read` は所有値なので、ここで tracks の借用は閉じる (複製しない)。
-            let rl = c.rate_limited.is_some();
-            let read = {
-                let prev = self.tracks.get(&c.id);
-                // 生の出力ストリームの裏取り — 見張りの「停滞/エラー多発」が
-                // 実際の進捗と矛盾していないかを、ここで初めて突き合わせる。
-                let flow = prev.map(|t| t.flow(now_ms)).unwrap_or_default();
-                // ラダー上位段 (構造化プロトコル / ベンダーフック) が生きて
-                // いれば、画面末尾は最初から見ない (CLAUDE.md 原則 #4)。
-                let ld = c.ladder.as_ref();
-                match (fresh, prev) {
-                    (true, _) => {
-                        classify_stream(c.running, c.attention, rl, ld, c.sup, &c.tail_lines, flow)
-                    }
-                    (false, Some(t)) => {
-                        classify_stream(c.running, c.attention, rl, ld, c.sup, &t.tail, flow)
-                    }
-                    (false, None) => {
-                        classify_stream(c.running, c.attention, rl, ld, c.sup, &[], flow)
-                    }
-                }
-            };
-
-            if !self.tracks.contains_key(&c.id) {
-                arrived.push(c.id);
-            }
-            let track = self
-                .tracks
-                .entry(c.id)
-                .or_insert_with(|| Track::new(&read, now_ms));
-
-            if fresh {
-                let delta = tail_delta(&track.tail, &c.tail_lines);
-                track.pulse.push((now_ms, delta));
-                let from = now_ms.saturating_sub(PULSE_WINDOW_MS);
-                track.pulse.retain(|(t, _)| *t >= from);
-                track.tail = c.tail_lines.clone();
-                // **意味のある進捗**の時刻を更新する (スピナー/カウンタは潰す)。
-                let norm = norm_tail(&c.tail_lines);
-                if has_new_content(&track.norm, &norm) {
-                    track.progress_ms = Some(now_ms);
-                }
-                track.norm = norm;
-            }
-
-            if track.activity != read.activity {
-                track.activity = read.activity;
-                track.since_ms = now_ms;
-            }
-            track.source = read.source;
-            track.detail = read.detail.clone();
-            track.suspicion = read.suspicion;
-            match read.activity {
-                Activity::Editing if !read.detail.is_empty() => {
-                    track.last_file = read.detail.clone();
-                }
-                Activity::Running | Activity::Verifying if !read.detail.is_empty() => {
-                    track.last_cmd = read.detail.clone();
-                }
-                _ => {}
-            }
-
-            // **確信度の床を通したレーン**へ寄せる
-            // (画面推定だけで承認待ち/停滞・異常/完了にしない)。
-            track.lane.step(read.lane(), now_ms);
-            lanes.push(track.lane.lane());
-            if track.lane.land_glow(now_ms) > 0.0 {
-                animating = true;
-            }
-            if read.activity.is_busy() || track.recently_noisy(now_ms) {
-                busy = true;
-            }
-        }
+    /// スナップショットに居ないカードは、そのカード自身の素のレーンへ落とす
+    /// (起動直後の 1 フレームだけ起こりうる)。
+    pub fn sync_view(
+        &mut self,
+        cards: &[Card],
+        snap: &std::sync::Arc<crate::fleet::Snapshot>,
+    ) -> Vec<Column> {
+        self.snap = std::sync::Arc::clone(snap);
         // 新しく起動したエージェントは、**画面を組み替えず**選択とスクロールだけで
         // 「これが始まった」を示す (端末を勝手に開くと看板が半分に潰れる)。
         //
@@ -2099,17 +1881,21 @@ impl KanbanState {
         // 復元でまとめて現れたときにも書き換えていたため、ループの最後 =
         // 起動順で一番最後のエージェントが必ず選ばれ、ユーザーがどれを選んでも
         // そこへ吸われていた。誰の意思でもない選択は動かさない方が驚きが少ない。
-        if !first_fill && arrived.len() == 1 {
-            self.selected = Some(arrived[0]);
+        if !self.adopted {
+            // 看板を初めて開いたフレーム。Store 側は既に走っているので、
+            // ここでの「初めて見るカード」は起動の合図ではない。
+            self.adopted = true;
+        } else if !snap.first_fill && snap.arrived.len() == 1 {
+            self.selected = Some(snap.arrived[0]);
             self.scroll_to_sel = true;
         }
-        // 消えたセッションの追跡は捨てる (無限に太らせない)
-        self.tracks
-            .retain(|id, _| cards.iter().any(|c| c.id == *id));
-        self.busy = busy;
-        self.animating = animating;
-        self.any_running = any_running;
-        lanes
+        self.busy = snap.busy;
+        self.animating = snap.animating;
+        self.any_running = snap.any_running;
+        cards
+            .iter()
+            .map(|c| snap.view(c.id).map(|v| v.lane).unwrap_or(c.column))
+            .collect()
     }
 
     /// 選択中のセッション id (テスト・app.rs 用)。
@@ -2145,12 +1931,6 @@ impl KanbanState {
                 None
             }
         }
-    }
-
-    /// 追跡状態の参照 (テスト用。描画側は `tracks` を直接見る)。
-    #[allow(dead_code)]
-    pub fn track(&self, id: u64) -> Option<&Track> {
-        self.tracks.get(&id)
     }
 }
 
@@ -2258,8 +2038,8 @@ pub type LiveDraw<'a> = &'a mut dyn FnMut(&mut egui::Ui, usize) -> Option<egui::
 ///
 /// `now_ms` は supervisor の経過時計 (アプリ起動からの ms)。連続稼働表示・
 /// アクティビティの相対時刻・スループット履歴のサンプリングを全部この 1 本で賄う。
-/// `fresh_tail` は「このフレームの `cards[..].tail_lines` が新しいか」
-/// (app.rs が [`KanbanState::sample_due`] で決める)。
+/// `snap` は [`crate::fleet::FleetStore`] のスナップショット。
+/// **看板はここからしか状態を読まない** (自分で `classify` を呼ばない)。
 #[allow(clippy::too_many_arguments)]
 pub fn ui(
     st: &mut KanbanState,
@@ -2269,7 +2049,7 @@ pub fn ui(
     presets: &[(String, String)],
     activity: &[ActivityEntry],
     now_ms: u64,
-    fresh_tail: bool,
+    snap: &std::sync::Arc<crate::fleet::Snapshot>,
     live: LiveDraw<'_>,
 ) -> Vec<KanbanAction> {
     let mut acts: Vec<KanbanAction> = Vec::new();
@@ -2306,8 +2086,10 @@ pub fn ui(
         st.live_full_dirty = false;
     }
 
-    let lanes = st.update_tracks(cards, now_ms, fresh_tail);
-    let t = tally_lanes(cards, &lanes);
+    let lanes = st.sync_view(cards, snap);
+    // KPI タイルの数字も**同じスナップショット**から。レーンに並ぶのは PTY
+    // セッションなので `Pty` で数える (タイルと並んでいるカード数が必ず一致する)。
+    let t = snap.tally(Some(crate::fleet::AgentKind::Pty));
     st.record_sample(now_ms, t);
     // 再描画の予約は**描き終わってから**行う (末尾)。
     // 「秒で動く表示が画面に出ているか」は、ヘッダを畳んだか / カードが
@@ -2612,7 +2394,7 @@ fn live_pane_ui(
                             )
                             .truncate(),
                         );
-                        if let Some(tr_) = st.tracks.get(&id) {
+                        if let Some(tr_) = st.snap.view(id) {
                             chip(ui, color, &tr(tr_.activity.label()));
                         }
                         // ヘッダーのボタンはラベル文字列から Id を作るので、
@@ -3170,7 +2952,7 @@ fn rail_entry_ui(
     } else {
         Stroke::new(1.0_f32, Color32::TRANSPARENT)
     };
-    let (act_label, doing) = match st.tracks.get(&c.id) {
+    let (act_label, doing) = match st.snap.view(c.id) {
         Some(t) => (tr(t.activity.label()), status_line(t)),
         None => (c.state_label.clone(), String::new()),
     };
@@ -3230,7 +3012,7 @@ fn rail_entry_ui(
                                         .strong()
                                         .color(col_color),
                                 );
-                                if let Some(t) = st.tracks.get(&c.id) {
+                                if let Some(t) = st.snap.view(c.id) {
                                     ui.label(
                                         RichText::new(fmt_elapsed(t.elapsed_ms(now_ms)))
                                             .size(9.5)
@@ -3267,7 +3049,7 @@ fn rail_entry_ui(
 // ---------------------------------------------------------------------------
 
 /// カードの 1 行状態文 (「いま何をしているか」)。追跡状態から組み立てる純関数。
-pub fn status_line(t: &Track) -> String {
+pub fn status_line(t: &crate::fleet::AgentView) -> String {
     let label = tr(t.activity.label());
     let detail = t.detail.trim();
     if detail.is_empty() {
@@ -3571,9 +3353,9 @@ fn card_ui(
     let selected = st.selected == Some(c.id);
     // 着地ハイライト: 新しいレーンへ来た直後だけ枠が光って目を引く
     let glow = st
-        .tracks
-        .get(&c.id)
-        .map(|t| t.lane.land_glow(now_ms))
+        .snap
+        .view(c.id)
+        .map(|t| crate::fleet::engine::land_glow(t.landed_ms, now_ms))
         .unwrap_or(0.0);
     // 選択だけは常に最優先 (押した反応が消えると操作不能に見える)。
     // その次が指揮官 — 着地ハイライトやアクティブ枠より強く主張させて、
@@ -3598,7 +3380,7 @@ fn card_ui(
         theme.panel_alt
     };
 
-    let track = st.tracks.get(&c.id).cloned();
+    let track = st.snap.view(c.id).cloned();
     // 👁 ボタンでライブ表示を閉じたか。閉じた直後に外側のクリック判定が
     // 開き直してしまうのを防ぐため、内側から持ち帰る。
     let cell = ui.scope_builder(
@@ -3822,7 +3604,7 @@ fn card_ui(
 
                         // ── 出力の勢い (直近 30 秒) ──
                         if let Some(t) = &track {
-                            let series = t.pulse_series(now_ms);
+                            let series = t.pulse.clone();
                             if series.iter().any(|v| *v > 0.0) || c.running {
                                 pulse_bars(ui, if wide { 16.0 } else { 12.0 }, color, &series);
                             }
@@ -4243,6 +4025,7 @@ mod tests {
         for (why, cards, minimized, w, want) in cases {
             let ctx = egui::Context::default();
             let mut st = KanbanState::default();
+            let mut fleet = crate::fleet::FleetStore::default();
             let mut delay = std::time::Duration::MAX;
             let mut now = 10_000_u64;
             // 3 フレーム回す (初回は追跡が空で、着地アニメが走るため)。
@@ -4264,11 +4047,14 @@ mod tests {
                     .collect(),
                     ..Default::default()
                 };
+                let obs: Vec<crate::fleet::Observation> = cards.iter().map(plain_obs).collect();
+                fleet.update(&obs, now);
+                let snap = fleet.snapshot();
                 let out = ctx.run(raw, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let mut live = |_: &mut egui::Ui, _: usize| None;
                         let _ =
-                            super::ui(&mut st, ui, &theme, &cards, &[], &[], now, true, &mut live);
+                            super::ui(&mut st, ui, &theme, &cards, &[], &[], now, &snap, &mut live);
                     });
                 });
                 delay = out
@@ -5144,30 +4930,45 @@ mod tests {
             card_id(20, Column::Running),
             card_id(30, Column::Done),
         ];
-        assert_eq!(resolve_selection(Some(20), 1, &cards), Some((20, 1)));
+        assert_eq!(
+            resolve_selection(Some(20), 1, &plain(&cards)),
+            Some((20, 1))
+        );
         // 並べ替え: 位置は変わっても同じ ID が選ばれたまま
         let reordered = vec![
             card_id(30, Column::Done),
             card_id(20, Column::Running),
             card_id(10, Column::Ready),
         ];
-        assert_eq!(resolve_selection(Some(20), 1, &reordered), Some((20, 1)));
+        assert_eq!(
+            resolve_selection(Some(20), 1, &plain(&reordered)),
+            Some((20, 1))
+        );
         // 挿入で後ろへずれても追随する
         let inserted = vec![
             card_id(99, Column::Ready),
             card_id(10, Column::Ready),
             card_id(20, Column::Running),
         ];
-        assert_eq!(resolve_selection(Some(20), 1, &inserted), Some((20, 2)));
+        assert_eq!(
+            resolve_selection(Some(20), 1, &plain(&inserted)),
+            Some((20, 2))
+        );
     }
 
     #[test]
     fn selection_falls_back_when_card_removed() {
         let cards = vec![card_id(10, Column::Ready), card_id(30, Column::Done)];
         // 20 が消えた → 直前に居た位置 (1) のカードへ寄せる
-        assert_eq!(resolve_selection(Some(20), 1, &cards), Some((30, 1)));
+        assert_eq!(
+            resolve_selection(Some(20), 1, &plain(&cards)),
+            Some((30, 1))
+        );
         // 位置が範囲外なら末尾へ丸める
-        assert_eq!(resolve_selection(Some(20), 9, &cards), Some((30, 1)));
+        assert_eq!(
+            resolve_selection(Some(20), 9, &plain(&cards)),
+            Some((30, 1))
+        );
         // 1 枚も無ければ選択なし
         assert_eq!(resolve_selection(Some(20), 0, &[]), None);
     }
@@ -5285,7 +5086,7 @@ mod tests {
 
     #[test]
     fn sample_due_is_slow_while_idle_and_fast_while_busy() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         // 初回は必ずサンプルする
         assert!(st.sample_due(0));
         // 静かなら 1 秒に 1 回
@@ -5307,7 +5108,7 @@ mod tests {
 
     #[test]
     fn idle_board_sleeps_and_drops_dead_tracks() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         let mut a = card_id(1, Column::Done);
         a.running = false;
         let lanes = st.update_tracks(&[a], 0, true);
@@ -5333,10 +5134,10 @@ mod tests {
     #[test]
     fn 初回の取り込みは選択を最後のカードへ奪わない() {
         // 同名のエージェントを複製起動した並び (id だけが違う)
-        let deal = |ids: &[u64]| -> Vec<Card> {
+        let deal = |ids: &[u64]| -> Vec<TCard> {
             ids.iter().map(|id| card_id(*id, Column::Running)).collect()
         };
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
 
         st.update_tracks(&deal(&[1, 2, 3, 4]), 0, true);
         assert_eq!(
@@ -5367,7 +5168,7 @@ mod tests {
 
     #[test]
     fn tracks_debounce_lane_and_keep_last_file_and_command() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         let mk = |tail: &str| {
             let mut c = card_id(7, Column::Ready);
             c.sup = Some(S::Working);
@@ -5387,7 +5188,7 @@ mod tests {
         let lanes = st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 100 + WORK_HOLD_MS - 1, true);
         assert_eq!(lanes, vec![Column::Ready], "ホールド未満では動かない");
         st.update_tracks(&[mk("⏺ Update(src/a.rs)")], 100 + WORK_HOLD_MS, true);
-        assert_eq!(st.track(7).unwrap().lane.lane(), Column::Editing);
+        assert_eq!(st.track(7).unwrap().lane, Column::Editing);
         assert_eq!(st.track(7).unwrap().last_file, "src/a.rs");
         // **編集 → 実行 → 検証 と細かい中身が短時間で変わってもレーンは動かない。**
         // (400ms のころはここでカードが 3 回飛んでいた = 視覚的な雑音)
@@ -5416,7 +5217,7 @@ mod tests {
                 true,
             );
         }
-        assert_eq!(st.track(7).unwrap().lane.lane(), Column::Running);
+        assert_eq!(st.track(7).unwrap().lane, Column::Running);
         // 見張りが「動いていない」と言い続ければ、LANE_HOLD_MS 後に待機へ落ちる
         let start = base + 3_000;
         let lanes = st.update_tracks(&[idle()], start, true);
@@ -5432,7 +5233,7 @@ mod tests {
     /// 以前はこれで「停滞・異常」レーンへ飛んでいた (オーナー報告のバグ)。
     #[test]
     fn 動いているエージェントは停滞レーンへ入らない() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         // 見張りがエラー多発と判定した状態で、出力は毎サンプル増えていく
         let mk = |n: usize, lines: &[&str]| {
             let mut c = card_id(1, Column::Ready);
@@ -5480,7 +5281,7 @@ mod tests {
     /// スピナーだけが回っている画面は「進捗」ではない (経過秒に騙されない)。
     #[test]
     fn スピナーだけの画面は進捗と数えない() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         for i in 0..12u64 {
             let mut c = card_id(2, Column::Ready);
             c.sup = Some(S::Stalled);
@@ -5489,13 +5290,13 @@ mod tests {
         }
         // 表示は毎フレーム変わっているが、中身は 1 行も増えていない → 停滞は本物
         let t = st.track(2).expect("追跡あり");
-        assert_eq!(t.flow(33_000), Flow::Silent);
-        assert_eq!(t.lane.lane(), Column::Trouble);
+        assert_eq!(t.flow, Flow::Silent);
+        assert_eq!(t.lane, Column::Trouble);
     }
 
     #[test]
     fn stale_frames_reuse_last_sampled_screen() {
-        let mut st = KanbanState::default();
+        let mut st = Board::new();
         let mut c = card_id(3, Column::Ready);
         c.sup = Some(S::Working);
         c.tail_lines = vec!["⏺ Bash(cargo test)".to_string()];
@@ -5517,7 +5318,7 @@ mod tests {
             card_id(3, Column::Ready),
         ];
         let lanes = [Column::Running, Column::Verifying, Column::Trouble];
-        let t = tally_lanes(&cards, &lanes);
+        let t = tally_lanes(&plain(&cards), &lanes);
         assert_eq!(t.total, 3);
         // 素の列 (Ready) ではなく**デバウンス後のレーン**で数える
         assert_eq!(t.lane_count(Column::Running), 1);
@@ -5557,7 +5358,7 @@ mod tests {
             let cards: Vec<Card> = lanes
                 .iter()
                 .enumerate()
-                .map(|(i, col)| card_id(i as u64 + 1, *col))
+                .map(|(i, col)| card_id(i as u64 + 1, *col).card)
                 .collect();
             let t = tally_lanes(&cards, lanes);
             assert_eq!(t.total, lanes.len());
@@ -5599,9 +5400,8 @@ mod tests {
         ];
         for (activity, detail, want) in cases {
             let read = Read::new(*activity, Source::Supervisor, (*detail).to_string());
-            let mut track = Track::new(&read, 0);
-            track.detail = read.detail.clone();
-            assert_eq!(status_line(&track), *want, "{activity:?}");
+            let view = view_of(&read);
+            assert_eq!(status_line(&view), *want, "{activity:?}");
             // レーンは 8 本のどれか (ラベルと詳細はレーンとは別に必ず出る)
             assert!(COLUMNS.contains(&read.lane()));
         }
@@ -5625,6 +5425,7 @@ mod tests {
         let ctx = egui::Context::default();
         let theme = crate::theme::all().remove(0);
         let mut st = KanbanState::default();
+        let mut fleet = crate::fleet::FleetStore::default();
         let mut n = 0;
         // 2 フレーム: 1 枚目で追跡を作り、2 枚目で本描画 (初回はレーンが確定しない)
         for _ in 0..2 {
@@ -5636,10 +5437,23 @@ mod tests {
                 ..Default::default()
             };
             n = 0;
+            let obs: Vec<crate::fleet::Observation> = cards.iter().map(plain_obs).collect();
+            fleet.update(&obs, 1_000);
+            let snap = fleet.snapshot();
             let out = ctx.run(raw, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let mut live = |_: &mut egui::Ui, _: usize| None;
-                    let _ = super::ui(&mut st, ui, &theme, cards, &[], &[], 1_000, true, &mut live);
+                    let _ = super::ui(
+                        &mut st,
+                        ui,
+                        &theme,
+                        cards,
+                        &[],
+                        &[],
+                        1_000,
+                        &snap,
+                        &mut live,
+                    );
                 });
             });
             for c in &out.shapes {
@@ -5655,19 +5469,19 @@ mod tests {
     /// 画面を読まないと分からない状態だった。冠が出ていること自体を番人にする。
     #[test]
     fn 指揮官だけが冠付きで描かれる() {
-        let mut plain = vec![
-            card_id(1, Column::Running),
-            card_id(2, Column::Thinking),
-            card_id(3, Column::Ready),
+        let mut rows: Vec<Card> = vec![
+            card_id(1, Column::Running).card,
+            card_id(2, Column::Thinking).card,
+            card_id(3, Column::Ready).card,
         ];
         assert_eq!(
-            draw_and_count(&plain, COMMANDER_BADGE),
+            draw_and_count(&rows, COMMANDER_BADGE),
             0,
             "指名が無いのに冠が出ている"
         );
         // 2 番目を指揮官に指名する
-        plain[1].commander = true;
-        let n = draw_and_count(&plain, COMMANDER_BADGE);
+        rows[1].commander = true;
+        let n = draw_and_count(&rows, COMMANDER_BADGE);
         assert!(
             n > 0,
             "指揮官を指名したのに冠がどこにも描かれていない (カード / 左レール / ヘッダー)"
@@ -5690,22 +5504,165 @@ mod tests {
             rate_limited: None,
             attention: false,
             running,
-            sup: None,
-            ladder: None,
             permission_badge: "",
             commander: false,
             can_cycle: false,
-            tail_lines: Vec::new(),
             task: None,
             conflict: None,
         }
     }
 
+    // ── テスト用の駆動役 ────────────────────────────────────────────
+    //
+    // 追跡状態は [`crate::fleet::FleetStore`] が持つようになったので、
+    // 看板のテストも**実運用と同じ経路** (Store → Snapshot → 看板) を通す。
+    // ここで独自に判定を組み立てると、テストだけが通る嘘の緑になる。
+
+    /// 看板 1 面ぶんの駆動役。`KanbanState` へ `Deref` するので、
+    /// 既存のテスト本文 (`st.selected()` / `st.busy` / `st.next_repaint_ms`) は
+    /// そのまま書ける。
+    struct Board {
+        fleet: crate::fleet::FleetStore,
+        st: KanbanState,
+    }
+
+    impl std::ops::Deref for Board {
+        type Target = KanbanState;
+        fn deref(&self) -> &KanbanState {
+            &self.st
+        }
+    }
+    impl std::ops::DerefMut for Board {
+        fn deref_mut(&mut self) -> &mut KanbanState {
+            &mut self.st
+        }
+    }
+
+    impl Board {
+        fn new() -> Self {
+            Board {
+                fleet: crate::fleet::FleetStore::default(),
+                st: KanbanState::default(),
+            }
+        }
+
+        /// カードを観測へ写して Store を 1 ティック進め、看板へ流す。
+        fn update_tracks(&mut self, cards: &[TCard], now_ms: u64, fresh: bool) -> Vec<Column> {
+            let obs: Vec<crate::fleet::Observation> =
+                cards.iter().map(|c| card_obs(c, fresh)).collect();
+            self.fleet.update(&obs, now_ms);
+            let plain: Vec<Card> = cards.iter().map(|c| c.card.clone()).collect();
+            self.st.sync_view(&plain, &self.fleet.snapshot())
+        }
+
+        /// 1 体分の正準ビュー (旧 `KanbanState::track` の置き換え)。
+        fn track(&self, id: u64) -> Option<&crate::fleet::AgentView> {
+            self.fleet.snap().view(id)
+        }
+
+        fn sample_due(&mut self, now_ms: u64) -> bool {
+            self.fleet.sample_due(now_ms)
+        }
+    }
+
+    /// [`Read`] からビューを組む (表テスト用。時間依存の項目は既定値)。
+    fn view_of(read: &Read) -> crate::fleet::AgentView {
+        crate::fleet::AgentView {
+            id: 0,
+            kind: crate::fleet::AgentKind::Pty,
+            title: String::new(),
+            icon: String::new(),
+            lane: read.lane(),
+            activity: read.activity,
+            source: read.source,
+            detail: read.detail.clone(),
+            suspicion: read.suspicion,
+            flow: Flow::Unknown,
+            running: true,
+            attention: false,
+            rate_limited: None,
+            since_ms: 0,
+            landed_ms: 0,
+            uptime_ms: 0,
+            tail: Vec::new(),
+            last_file: String::new(),
+            last_cmd: String::new(),
+            pulse: Vec::new(),
+        }
+    }
+
+    /// 素の `Card` から観測を組む (状態の材料が要らない描画テスト用)。
+    fn plain_obs(c: &Card) -> crate::fleet::Observation {
+        crate::fleet::Observation {
+            id: c.id,
+            kind: crate::fleet::model::AgentKindOpt::pty(),
+            title: c.title.clone(),
+            icon: c.icon.clone(),
+            running: c.running,
+            attention: c.attention,
+            rate_limited: c.rate_limited.clone(),
+            tail_lines: Some(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    /// `TCard` の列を素の `Card` の列へ (描画・並び替えのテスト用)。
+    fn plain(cards: &[TCard]) -> Vec<Card> {
+        cards.iter().map(|c| c.card.clone()).collect()
+    }
+
+    /// カード → 観測。**実運用 (`app/fleet_sync.rs`) と同じ写し方**。
+    fn card_obs(c: &TCard, fresh: bool) -> crate::fleet::Observation {
+        crate::fleet::Observation {
+            id: c.card.id,
+            kind: crate::fleet::model::AgentKindOpt::pty(),
+            title: c.card.title.clone(),
+            icon: c.card.icon.clone(),
+            running: c.card.running,
+            attention: c.card.attention,
+            rate_limited: c.card.rate_limited.clone(),
+            sup: c.sup,
+            ladder: c.ladder.clone(),
+            tail_lines: fresh.then(|| c.tail_lines.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// **テスト用のカード + 観測材料。**
+    ///
+    /// `Card` は状態の材料 (見張りの判定 / ラダー / 画面末尾) を持たなくなった
+    /// — それらは `FleetStore` が観測として受け取るからである。テストは
+    /// 「材料を与えて、カードがどう並ぶか」を見たいので、両方をここで束ねる。
+    #[derive(Clone)]
+    struct TCard {
+        card: Card,
+        sup: Option<S>,
+        ladder: Option<crate::supervisor::LadderRead>,
+        tail_lines: Vec<String>,
+    }
+
+    impl std::ops::Deref for TCard {
+        type Target = Card;
+        fn deref(&self) -> &Card {
+            &self.card
+        }
+    }
+    impl std::ops::DerefMut for TCard {
+        fn deref_mut(&mut self) -> &mut Card {
+            &mut self.card
+        }
+    }
+
     /// id を指定したカード (選択安定性のテスト用)。
-    fn card_id(id: u64, column: Column) -> Card {
-        Card {
-            id,
-            ..card(column, true)
+    fn card_id(id: u64, column: Column) -> TCard {
+        TCard {
+            card: Card {
+                id,
+                ..card(column, true)
+            },
+            sup: None,
+            ladder: None,
+            tail_lines: Vec::new(),
         }
     }
 
@@ -5748,8 +5705,8 @@ mod tests {
         let lanes2 = [Column::Running, Column::Editing];
         let cards1 = vec![card_id(1, Column::Running)];
         let cards2 = vec![card_id(1, Column::Running), card_id(2, Column::Editing)];
-        let t1 = tally_lanes(&cards1, &lanes1);
-        let t2 = tally_lanes(&cards2, &lanes2);
+        let t1 = tally_lanes(&plain(&cards1), &lanes1);
+        let t2 = tally_lanes(&plain(&cards2), &lanes2);
         st.record_sample(0, t1);
         // 2 秒未満は最新点の上書き (点は増えない)
         st.record_sample(500, t2);
@@ -5788,6 +5745,8 @@ mod tests {
     struct PanelHarness {
         ctx: eframe::egui::Context,
         st: KanbanState,
+        /// 実運用と同じ経路を通すための Store (ハーネスが 1 つ持つ)。
+        fleet: crate::fleet::FleetStore,
         theme: crate::theme::Theme,
         t: f64,
         now_ms: u64,
@@ -5800,6 +5759,7 @@ mod tests {
             Self {
                 ctx: eframe::egui::Context::default(),
                 st: KanbanState::default(),
+                fleet: crate::fleet::FleetStore::default(),
                 theme: crate::theme::all().remove(0),
                 t: 0.0,
                 now_ms: 0,
@@ -5821,6 +5781,10 @@ mod tests {
         ) -> f32 {
             self.t += 1.0 / 60.0;
             self.now_ms += 16;
+            // 実運用と同じ順序: Store を 1 ティック進めてから看板を描く。
+            let obs: Vec<crate::fleet::Observation> = cards.iter().map(plain_obs).collect();
+            self.fleet.update(&obs, self.now_ms);
+            let snap = self.fleet.snapshot();
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
                 time: Some(self.t),
@@ -5865,7 +5829,7 @@ mod tests {
                         });
                         ui.add_space(4.0);
                         let mut live = |_: &mut egui::Ui, _: usize| None;
-                        let _ = super::ui(st, ui, theme, cards, &[], &[], now_ms, true, &mut live);
+                        let _ = super::ui(st, ui, theme, cards, &[], &[], now_ms, &snap, &mut live);
                     });
                 egui::CentralPanel::default().show(ctx, |ui| {
                     // エディタ/ターミナル相当: 全域が click_and_drag を持つ
@@ -6073,10 +6037,10 @@ mod tests {
     #[test]
     fn 全画面の出入りで選択とスクロールを失わない() {
         let mut h = PanelHarness::new();
-        let cards = vec![
-            card_id(11, Column::Ready),
-            card_id(22, Column::Editing),
-            card_id(33, Column::Verifying),
+        let cards: Vec<Card> = vec![
+            card_id(11, Column::Ready).card,
+            card_id(22, Column::Editing).card,
+            card_id(33, Column::Verifying).card,
         ];
         let none: Vec<egui::Event> = Vec::new();
         for _ in 0..3 {
@@ -6120,7 +6084,7 @@ mod tests {
         let mut h = PanelHarness::new();
         let mut c = card_id(1, Column::Done);
         c.running = false;
-        let cards = vec![c];
+        let cards = vec![c.card];
         let none: Vec<egui::Event> = Vec::new();
         h.frame(none.clone(), &cards);
         h.st.live_open = true;

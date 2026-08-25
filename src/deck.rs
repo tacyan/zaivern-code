@@ -39,7 +39,7 @@
 //! 下限・上限は**本文 1 行の高さ**を単位に決める (DPI・フォント設定に追従する)。
 //!
 //! ## 負荷 (アイドルで 1 枚も描かない)
-//! - PTY 画面の読み直しは [`DeckState::sample_due`] が真のフレームだけ。
+//! - PTY 画面の読み直しは [`crate::fleet::FleetStore::sample_due`] が決める。
 //! - 再描画要求は [`deck_repaint_ms`] が決める。**誰も出力していなければ
 //!   `None` = 1 枚も予約しない** — app.rs の `schedule_idle_repaint` に判断を返す。
 //!   ここが `Some` に固定されるとアイドル時の CPU が跳ねる (回帰テストあり)。
@@ -47,15 +47,12 @@
 //! 作法は kanban.rs / orchestration.rs と同じ: 判断と描画はこのモジュール、
 //! 副作用 (起動・停止・並べ替え) は [`DeckAction`] で app.rs へ返す。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 
 use crate::i18n::tr;
-use crate::kanban::{self, Activity};
-use crate::supervisor;
 use crate::theme::Theme;
 
 /// デッキ画面の記号 (パレット・メニュー・ヘッダーで共通に使う)。
@@ -86,15 +83,8 @@ pub struct LiveRow {
     pub branch: String,
     /// 起動コマンド (名前も場所も無いときの最後の手がかり)
     pub command: String,
-    pub running: bool,
-    pub attention: bool,
-    pub rate_limited: bool,
-    /// 見張り (supervisor.rs) の判定 — サンプリング周期の決定にだけ使う
-    pub sup: Option<supervisor::SessionState>,
     /// アクティブ (紫枠) のセッションか (初回選択の既定)
     pub active: bool,
-    /// 画面末尾の意味のある行。**サンプリングしたフレームだけ**中身が入る。
-    pub tail_lines: Vec<String>,
 }
 
 /// 起動プリセット 1 本 (レール上端の ＋ メニューに出る。**行にはしない**)。
@@ -618,14 +608,8 @@ pub fn dispatch(
 // サンプリングと再描画のリズム
 // ---------------------------------------------------------------------------
 
-/// 出力が動いているときの PTY 画面サンプリング間隔 (≈6.7Hz)。
-const FAST_SAMPLE_MS: u64 = 150;
-/// 静かなときのサンプリング間隔 (1Hz)。
-const SLOW_SAMPLE_MS: u64 = 1_000;
 /// 裏の問い合わせ (ブランチ解決) が飛んでいる間だけ回す刻み。
 const SCAN_POLL_MS: u64 = 250;
-/// 出力の勢いを覚えておく窓 (「まだ動いている」の判定にだけ使う)。
-const PULSE_WINDOW_MS: u64 = 30_000;
 
 /// 次に再描画を予約するまでの ms。**`None` なら 1 枚も予約しない**。
 ///
@@ -634,10 +618,10 @@ const PULSE_WINDOW_MS: u64 = 30_000;
 /// `schedule_idle_repaint` (= 完全アイドルなら 0 枚) に返す。
 pub fn deck_repaint_ms(busy: bool, any_running: bool, scanning: bool) -> Option<u64> {
     if busy {
-        return Some(FAST_SAMPLE_MS);
+        return Some(crate::kanban::FAST_SAMPLE_MS);
     }
     if any_running {
-        return Some(SLOW_SAMPLE_MS);
+        return Some(crate::kanban::SLOW_SAMPLE_MS);
     }
     if scanning {
         return Some(SCAN_POLL_MS);
@@ -646,31 +630,12 @@ pub fn deck_repaint_ms(busy: bool, any_running: bool, scanning: bool) -> Option<
 }
 
 /// 1 セッションぶんの追跡状態。**描画には一切使わない** —
-/// 「サンプリングをどれくらいの速さで回すか」を決めるためだけの内部モデル。
-#[derive(Clone, Debug)]
-struct Track {
-    activity: Activity,
-    tail: Vec<String>,
-    /// 出力の勢い `(時刻, 新規文字数)`
-    pulse: Vec<(u64, u64)>,
-}
-
-impl Track {
-    fn new(a: Activity) -> Self {
-        Self {
-            activity: a,
-            tail: Vec::new(),
-            pulse: Vec::new(),
-        }
-    }
-
-    /// 直近 3 秒に新しい出力があったか。
-    fn recently_noisy(&self, now_ms: u64) -> bool {
-        self.pulse
-            .iter()
-            .any(|(t, v)| *v > 0 && now_ms.saturating_sub(*t) <= 3_000)
-    }
-}
+/// 1 行ぶんの追跡状態は [`crate::fleet::engine::Track`] が持つ。
+///
+/// デッキが自前の `tracks` を持っていた頃は、**ラダー無しの判定** で
+/// 回していた (`kanban::classify` は構造化プロトコルもフックも見ない) ので、
+/// 同じ 1 体が看板とデッキで別のレーンに居ることが構造的に起こりえた。
+/// いまは [`crate::fleet::FleetStore`] のスナップショットを読むだけ。
 
 // ---------------------------------------------------------------------------
 // 画面の状態
@@ -696,14 +661,6 @@ pub struct DeckState {
     /// 左レールの取り分 (窓幅に対する割合)
     rail: Option<f32>,
     dirty: bool,
-    /// セッション id → 追跡状態 (サンプリング周期の決定用)
-    tracks: HashMap<u64, Track>,
-    /// 最後に PTY 画面をサンプルした時刻
-    last_sample_ms: Option<u64>,
-    /// 直近のサンプルで「動いている」と判定したか
-    busy: bool,
-    /// 稼働中のセッションが 1 つでもあるか
-    any_running: bool,
     /// 名前変更中のセッション
     rename_for: Option<u64>,
     rename_buf: String,
@@ -717,70 +674,8 @@ pub struct DeckState {
 }
 
 impl DeckState {
-    /// **PTY 画面を読み直してよいフレームか。**
-    /// これが false のあいだ app.rs は `screen_tail_lines` を呼ばない。
-    pub fn sample_due(&mut self, now_ms: u64) -> bool {
-        let interval = if self.busy {
-            FAST_SAMPLE_MS
-        } else {
-            SLOW_SAMPLE_MS
-        };
-        match self.last_sample_ms {
-            Some(last) if now_ms.saturating_sub(last) < interval => false,
-            _ => {
-                self.last_sample_ms = Some(now_ms);
-                true
-            }
-        }
-    }
-
-    /// 追跡状態を 1 ステップ進め、行ごとのアクティビティを返す。
-    /// 返り値は**描画には使わない** (サンプリング周期とテスト用)。
-    /// `fresh` が true のフレームだけ `live[..].tail_lines` に新しい画面が入っている。
-    pub fn update_tracks(&mut self, live: &[LiveRow], now_ms: u64, fresh: bool) -> Vec<Activity> {
-        let mut acts = Vec::with_capacity(live.len());
-        let mut busy = false;
-        let mut any_running = false;
-        for l in live {
-            if l.running {
-                any_running = true;
-            }
-            // 画面が来ていないフレームは前回サンプルした画面で判定する
-            // (生死・レート制限といった構造化信号は毎フレーム最新)
-            let read = match (fresh, self.tracks.get(&l.id)) {
-                (true, _) => {
-                    kanban::classify(l.running, l.attention, l.rate_limited, l.sup, &l.tail_lines)
-                }
-                (false, Some(t)) => {
-                    kanban::classify(l.running, l.attention, l.rate_limited, l.sup, &t.tail)
-                }
-                (false, None) => {
-                    kanban::classify(l.running, l.attention, l.rate_limited, l.sup, &[])
-                }
-            };
-            let track = self
-                .tracks
-                .entry(l.id)
-                .or_insert_with(|| Track::new(read.activity));
-            if fresh {
-                let delta = kanban::tail_delta(&track.tail, &l.tail_lines);
-                track.pulse.push((now_ms, delta));
-                let from = now_ms.saturating_sub(PULSE_WINDOW_MS);
-                track.pulse.retain(|(t, _)| *t >= from);
-                track.tail = l.tail_lines.clone();
-            }
-            track.activity = read.activity;
-            if read.activity.is_busy() || track.recently_noisy(now_ms) {
-                busy = true;
-            }
-            acts.push(read.activity);
-        }
-        // 消えたセッションの追跡は捨てる
-        self.tracks.retain(|id, _| live.iter().any(|l| l.id == *id));
-        self.busy = busy;
-        self.any_running = any_running;
-        acts
-    }
+    // PTY 画面の間引きも追跡も [`crate::fleet::FleetStore`] が持つ。
+    // デッキは [`crate::fleet::Snapshot`] を読むだけ。
 
     /// いまの選択 (テスト用)。
     #[cfg(test)]
@@ -792,12 +687,6 @@ impl DeckState {
     pub fn select(&mut self, id: u64) {
         self.selected = Some(id);
         self.dirty = true;
-    }
-
-    /// 追跡が生きているか (テスト用)。
-    #[cfg(test)]
-    fn tracked(&self, id: u64) -> bool {
-        self.tracks.contains_key(&id)
     }
 
     /// 停止の確認が出ているセッション (テスト用。UI は行の枠で示す)。
@@ -956,7 +845,8 @@ fn line_galley(
 /// デッキ画面を描き、押された操作を返す。
 ///
 /// `now_ms` は supervisor の経過時計 (アプリ起動からの ms)。
-/// `fresh_tail` は「このフレームの `live[..].tail_lines` が新しいか」。
+/// `snap` は [`crate::fleet::FleetStore`] のスナップショット。
+/// **デッキはここからしか状態を読まない** (自分で `classify` を呼ばない)。
 /// `scanning` は裏の問い合わせ (ブランチ解決) が飛んでいるか
 /// (再描画のリズムに効く。終わったら止まる)。
 #[allow(clippy::too_many_arguments)]
@@ -966,8 +856,7 @@ pub fn ui(
     theme: &Theme,
     live: &[LiveRow],
     launchers: &[LauncherRow],
-    now_ms: u64,
-    fresh_tail: bool,
+    snap: &std::sync::Arc<crate::fleet::Snapshot>,
     scanning: bool,
     draw: LiveDraw<'_>,
 ) -> Vec<DeckAction> {
@@ -993,11 +882,9 @@ pub fn ui(
         st.selected = (v != 0).then_some(v);
     }
 
-    // ── 判定 (PTY は sample_due のフレームだけ読まれている) ──
-    // 返ってくるアクティビティは**描かない**。サンプリング周期の材料。
-    st.update_tracks(live, now_ms, fresh_tail);
+    // ── 判定は **FleetStore が済ませてある**。ここは読むだけ ──
     // 無条件の再描画はしない。動きがあるときだけ回す (完全に静かなら 1 枚も出さない)。
-    if let Some(ms) = deck_repaint_ms(st.busy, st.any_running, scanning) {
+    if let Some(ms) = deck_repaint_ms(snap.busy, snap.any_running, scanning) {
         crate::perf::repaint_after(&ctx, std::time::Duration::from_millis(ms), "deck_anim");
     }
 
@@ -1788,7 +1675,6 @@ mod tests {
             cwd: PathBuf::from("/tmp/work"),
             branch: String::new(),
             command: "claude".into(),
-            running: true,
             ..Default::default()
         }
     }
@@ -2249,67 +2135,70 @@ mod tests {
 
     #[test]
     fn repaint_cadence_follows_activity() {
-        assert_eq!(deck_repaint_ms(true, true, false), Some(FAST_SAMPLE_MS));
-        assert_eq!(deck_repaint_ms(false, true, false), Some(SLOW_SAMPLE_MS));
+        assert_eq!(
+            deck_repaint_ms(true, true, false),
+            Some(crate::kanban::FAST_SAMPLE_MS)
+        );
+        assert_eq!(
+            deck_repaint_ms(false, true, false),
+            Some(crate::kanban::SLOW_SAMPLE_MS)
+        );
         // 裏の問い合わせ中だけは短く回して、届いたら止まる
         assert_eq!(deck_repaint_ms(false, false, true), Some(SCAN_POLL_MS));
         // 出力があるときは走っている扱いより優先
-        assert_eq!(deck_repaint_ms(true, false, true), Some(FAST_SAMPLE_MS));
+        assert_eq!(
+            deck_repaint_ms(true, false, true),
+            Some(crate::kanban::FAST_SAMPLE_MS)
+        );
     }
 
     /// 何も出力しておらず、誰も走っていないフレームは 0 枚。
+    ///
+    /// **判定は `FleetStore` が持つ**ので、デッキはそのスナップショットを
+    /// `deck_repaint_ms` へ渡すだけ。以前はデッキが自前の追跡を持っていて、
+    /// しかもラダー無しの判定で回していた (看板と食い違う原因だった)。
     #[test]
     fn a_deck_with_nothing_producing_output_schedules_nothing() {
-        let mut st = DeckState::default();
-        let l = vec![LiveRow {
-            idx: 0,
-            id: 1,
-            title: "a".into(),
-            running: false,
-            ..Default::default()
-        }];
-        st.update_tracks(&l, 10_000, true);
-        assert!(!st.any_running);
-        assert!(!st.busy);
-        assert_eq!(deck_repaint_ms(st.busy, st.any_running, false), None);
+        let mut fleet = crate::fleet::FleetStore::default();
+        fleet.update(
+            &[crate::fleet::Observation {
+                id: 1,
+                kind: crate::fleet::model::AgentKindOpt::pty(),
+                title: "a".into(),
+                running: false,
+                tail_lines: Some(Vec::new()),
+                ..Default::default()
+            }],
+            10_000,
+        );
+        let snap = fleet.snapshot();
+        assert!(!snap.any_running);
+        assert!(!snap.busy);
+        assert_eq!(deck_repaint_ms(snap.busy, snap.any_running, false), None);
     }
 
+    /// 走っているセッションがあれば「起きている」刻みになる。
     #[test]
-    fn sampling_is_throttled_and_speeds_up_when_busy() {
-        let mut st = DeckState::default();
-        assert!(st.sample_due(0), "初回は必ず読む");
-        assert!(!st.sample_due(10));
-        assert!(!st.sample_due(999));
-        assert!(st.sample_due(1_000), "静かなときは 1Hz");
-        st.busy = true;
-        assert!(!st.sample_due(1_100));
-        assert!(st.sample_due(1_150), "動いているときは ~6.7Hz");
-    }
-
-    #[test]
-    fn tracks_are_dropped_with_their_sessions() {
-        let mut st = DeckState::default();
-        let l = vec![live(0, 1, "a"), live(1, 2, "b")];
-        let a = st.update_tracks(&l, 0, true);
-        assert_eq!(a.len(), 2);
-        assert!(st.tracked(1) && st.tracked(2));
-        st.update_tracks(&l[..1], 100, true);
-        assert!(!st.tracked(2), "消えたセッションの追跡は捨てる");
-        assert!(st.any_running);
-    }
-
-    #[test]
-    fn tracks_reuse_the_last_screen_when_no_fresh_sample() {
-        let mut st = DeckState::default();
-        let mut l = live(0, 1, "a");
-        l.sup = Some(supervisor::SessionState::Working);
-        l.tail_lines = vec!["$ cargo test".into()];
-        let a1 = st.update_tracks(std::slice::from_ref(&l), 0, true);
-        // 次のフレームは tail が空 (サンプリングしていない) でも判定が落ちない
-        let mut l2 = l.clone();
-        l2.tail_lines.clear();
-        let a2 = st.update_tracks(std::slice::from_ref(&l2), 50, false);
-        assert_eq!(a1, a2, "サンプルしていないフレームで状態が揺れない");
+    fn a_running_session_keeps_the_deck_awake() {
+        let mut fleet = crate::fleet::FleetStore::default();
+        fleet.update(
+            &[crate::fleet::Observation {
+                id: 1,
+                kind: crate::fleet::model::AgentKindOpt::pty(),
+                title: "a".into(),
+                running: true,
+                sup: Some(crate::supervisor::SessionState::Idle),
+                tail_lines: Some(Vec::new()),
+                ..Default::default()
+            }],
+            0,
+        );
+        let snap = fleet.snapshot();
+        assert!(snap.any_running);
+        assert_eq!(
+            deck_repaint_ms(snap.busy, snap.any_running, false),
+            Some(crate::kanban::SLOW_SAMPLE_MS)
+        );
     }
 
     // ── 表示ヘルパ ──────────────────────────────────────────

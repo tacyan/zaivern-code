@@ -170,6 +170,7 @@ impl ZaivernApp {
             marks: marks::MarksState::new(&primary_root),
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
+            fleet: crate::fleet::FleetStore::default(),
             deck: false,
             deck_state: deck::DeckState::default(),
             changes: false,
