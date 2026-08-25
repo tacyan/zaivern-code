@@ -4,12 +4,14 @@
 
 # Zaivern Code
 
-### 64 AI Agents. One Repository. Zero Merge Conflicts.
+### Run Multiple Coding Agents Without Merge-Conflict Chaos.
 
-**The coordination layer for parallel coding agents.**
+**Start with 2 agents. Scale to 64.**
+Zaivern Code stops overlapping edits before they land, so they never become
+merge conflicts.
 
-Run Claude Code, Codex, Gemini CLI, and other coding agents on the same
-repository — without merge-conflict chaos.
+One window for Claude Code, Codex, Gemini CLI, and 30 other agent CLIs you have
+already installed. Single native binary — macOS, Linux, Windows.
 
 **English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
@@ -18,32 +20,84 @@ repository — without merge-conflict chaos.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
 
-<!-- TODO: Replace with a 15-20 sec benchmark demo:
-     64 agents on one repository / plain git 132 conflict hunks / Zaivern 0.
-     The GIF below shows the cockpit, not the coordination result. -->
+</div>
+
+**Install and launch**
+
+macOS / Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh | sh
+zai .
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
+zai .
+```
+
+Requires at least one supported coding CLI already installed and signed in.
+Zaivern Code drives your existing CLIs and includes no AI model or subscription.
+
+**Optional conflict coordination:**
+
+```bash
+zai czero init
+```
+
+This modifies the current Git repository.
+[Preview and verify the changes →](#enable-conflict-coordination) ·
+[Manual download and verification](SECURITY.md)
+
+<div align="center">
+
 <a href="https://zaivern.com/">
-  <img src="assets/zaivern-demo.gif" width="960" alt="Zaivern Code running Claude Code, Codex, Gemini CLI, and other coding agents side by side" />
+  <img src="assets/zaivern-demo.gif" width="960" alt="The Zaivern Code cockpit: several coding-agent CLIs running side by side in one window, with per-agent state" />
 </a>
 
-| 64 writers · same repository · same workload | Plain git | Zaivern Code |
-|---|---:|---:|
-| Merges that conflicted | 57 of 64 | **0** |
-| Conflict hunks | 132 | **0** |
-
-[See the methodology, trade-offs, and limitations →](docs/conflict-zero.md)
-
 [**Quick Start**](#quick-start) ·
-[**Benchmarks**](#benchmarks) ·
+[**Benchmarks**](#benchmarks-and-limitations) ·
 [**Docs**](#documentation) ·
 [**Download**](https://github.com/tacyan/zaivern-code/releases/latest) ·
 [**Website**](https://zaivern.com/)
 
 </div>
 
+*The clip above is the cockpit — several agent CLIs in one window. It does not show
+the conflict coordination; that is measured separately, right below.*
+
+## Proof
+
+**64 agents, one repository, one workload.** Files = writers × 6, half of them
+targeted by more than one agent. The same task list run twice: once through plain
+git, once through Zaivern Code's line-range ledger.
+
+| | Plain git | Zaivern Code |
+|---|---:|---:|
+| Merges that conflicted | 57 of 64 | **0 of 64** |
+| Conflict hunks left for a human | 132 | **0** |
+| Edits that landed | 384 of 384 | 202 of 384 |
+| Writes stopped before landing | 0 | 182 |
+
+**Zero is bought by refusing writes, not by merging both sides.** 182 of the 384
+planned edits were stopped at the gate because another live agent already owned
+those lines; 14 of the 182 were contention back-offs, which can succeed on retry.
+
+**When the ranges really are disjoint, nothing is refused.** 64 agents editing 64
+separate ranges of a *single* file land **64 of 64** edits with **0** refusals and
+**0** conflict hunks — where a file-level lease lands 1 and refuses 63.
+
+Semantic conflicts are **not** detected: one agent changing a signature while
+another keeps calling the old one is allowed, and git merges it cleanly.
+
+[Methodology, per-scale numbers, gate latency, and every open gap →](docs/conflict-zero.md)
+
 ## The problem
 
-Running one coding agent is easy. Running four is not. Two agents editing the same
-file is already enough:
+Running one coding agent is easy. Running four is not. **Two agents editing the
+same file is already enough:**
 
 - They edit the same lines, and you find out at merge time.
 - You cannot see which agent is working, blocked, or quietly stuck.
@@ -54,10 +108,10 @@ The agents are not the bottleneck. The coordination between them is.
 
 ## The solution
 
-Zaivern Code coordinates which parts of a repository each coding agent may safely edit.
-Instead of discovering collisions at merge time, it catches overlapping work **before
-the conflicting write lands** — and gives you one place to watch, steer, and recover
-the agents you have running.
+Zaivern Code coordinates which parts of a repository each agent may safely edit.
+Instead of discovering collisions at merge time, it catches overlapping work
+**before the conflicting write lands** — and gives you one place to watch, steer,
+and recover the agents you have running.
 
 ```text
 Without Zaivern                          With Zaivern
@@ -67,85 +121,83 @@ Agent 2  ─┤                              Agent 2  ─┤   ┌────�
 Agent 3  ─┼─→ same files ─→ merge        Agent 3  ─┼─→ │ line-range  │ ─→ clean
    ...   ─┤                conflicts        ...   ─┤   │   ledger    │    integration
 Agent 64 ─┘                              Agent 64 ─┘   └─────────────┘
-
-132 conflict hunks                       0 conflict hunks
 ```
-
-**You do not need 64 agents for this to matter.** Two agents editing the same file are
-enough. Start with 2, scale to 64.
 
 ## Quick Start
 
-Install and sign in to at least one supported AI coding CLI first — Zaivern Code ships
-**33** launch presets, and one is enough to start.
+### Launch the multi-agent cockpit
 
-**macOS / Linux**
+Install with the one-liner at the top of this page, then run `zai .` in a project
+folder. It opens the cockpit on that folder — agent tiles, editor, phone remote.
+Click `+ Agent`, pick a CLI you have installed, and send it a task.
+**This does not turn on conflict coordination**; that is the next step.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.sh | sh
-zai .
-```
-
-**Windows PowerShell**
-
-```powershell
-irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
-zai .
-```
-
-In the window: click `+ Agent`, pick a CLI you have installed, and send it a task.
-
-Enable conflict coordination for a repository:
-
-```bash
-zai czero init      # install the ledger, git hooks, and merge driver, then self-diagnose
-zai czero verify    # create a real conflict in a throwaway repo and check that it stops
-```
-
-The installers verify the archive against the published `checksums.txt` **before
-unpacking**, and abort if it does not match.
+The installers check the downloaded archive against the release's `checksums.txt`
+**before unpacking**, and abort if it does not match.
 [Manual download, checksum verification, provenance, and SBOM →](SECURITY.md)
+
+### Enable conflict coordination
+
+```bash
+zai czero init --dry-run  # preview the planned changes
+zai czero init            # install the ledger and Git integration
+zai czero verify          # verify it in throwaway repositories
+zai .                     # launch the cockpit
+```
+
+- **`zai czero init --dry-run`** previews the planned changes without modifying
+  the current repository.
+- **`zai czero init` modifies the current Git repository.** It sets up the
+  line-range ledger, adds the `pre-commit` / `pre-applypatch` / `pre-merge-commit`
+  git hooks, registers the union merge driver, and writes a managed
+  `.gitattributes` block — then self-diagnoses. It is idempotent.
+- **`zai czero verify`** creates real overlapping writes and real merges in
+  throwaway repositories and checks that each one is actually stopped. **It does
+  not modify the current repository.** The verdict is `verified` / `partial` /
+  `broken` — it will not report "verified" for a trial it could not run.
+- **`zai czero doctor`** diagnoses which layers are still active, and
+  **`zai czero uninstall`** removes exactly what `init` added.
 
 ### Updating
 
-```bash
-zai update            # check for a newer release, show the command, then upgrade
-zai update --check    # only look; changes nothing
-zai update --yes      # upgrade without the confirmation prompt
-```
-
-Works whether or not the editor is running. `zai uninstall` removes it.
+`zai update` shows the command it will run, then upgrades (`--check` only looks,
+`--yes` skips the prompt). Works whether or not the editor is running.
+`zai uninstall` removes it.
 
 ## Core features
 
-### 1. Run agents in parallel without merge-conflict chaos
+Ordered by how much they set Zaivern Code apart. The first one is why it exists.
 
-Agents claim files or line ranges before editing. If another live agent already owns
-that region, a git hook refuses the colliding write — at write time, not at merge time.
+### 1. File and line-range ownership, enforced at write time
 
-In the 64-agent disjoint-range benchmark, all **64** agents landed their edits with
-**0** conflict hunks, where a file-level lease would have let exactly 1 through.
+Agents claim files or line ranges before editing, anchored to the surrounding
+content rather than to line numbers. If another live agent already owns an
+overlapping region, a git hook refuses the write — at write time, not at merge
+time. Same file, different lines is allowed, which is what keeps agents parallel
+instead of serialising them behind a whole-file lock.
 [How line-range coordination works →](docs/conflict-zero.md)
 
-### 2. Parallel agent management
+### 2. One screen, and you can see what each agent is doing
 
-Tile several AI CLIs side by side and see at a glance which one is thinking, editing,
-running, or waiting on you. Adding an agent is two clicks, not a remembered command line.
+Tile several AI CLIs side by side and see at a glance which one is thinking,
+editing, running, or waiting on you. Adding an agent is two clicks, not a
+remembered command line.
 
-### 3. Agent health and stall detection
+### 3. Stall and exit detection
 
-Zaivern watches semantic progress, not pixels: an agent that stops making progress is
-reported as **stalled**, and unexpected exits surface as notifications.
+Zaivern Code watches semantic progress, not pixels: an agent that stops making
+progress is reported as **stalled**, and unexpected exits surface as notifications.
 
-### 4. Broadcast
+### 4. Broadcast and targeted instructions
 
-Send one instruction to every running agent from a single input box, or target one agent
-when you want focused control.
+Send one instruction to every running agent from a single input box, or target one
+agent when you want focused control.
 
 ### 5. Approvals
 
 Approval-required mode is the default. Auto-YES is opt-in per session, privilege
-escalation always needs a human, and MCP environment-variable values are never displayed.
+escalation always needs a human, and MCP environment-variable values are never
+displayed.
 
 ### 6. Phone remote
 
@@ -154,8 +206,8 @@ Use the same Wi-Fi, [Tailscale](https://tailscale.com/), or an SSH tunnel.
 
 ### 7. Built-in editor
 
-Review code and agent changes without leaving Zaivern, including Markdown, images, PDFs,
-and CSVs. Unsaved buffers are recovered after a crash.
+Review code and agent changes without leaving Zaivern Code, including Markdown,
+images, PDFs, and CSVs. Unsaved buffers are recovered after a crash.
 
 Also included: plugins, and a UI available in six languages.
 [Plugin docs](docs/plugins.md) · [Translation docs](docs/translating.md)
@@ -167,65 +219,71 @@ Also included: plugins, and a UI available in six languages.
 3. **Guard** — a git hook refuses an overlapping write before it reaches merge time.
 4. **Integrate** — non-overlapping changes merge through git as usual.
 
-[Technical details →](docs/conflict-zero.md) ·
-[which guarantees hold for which repository shape →](docs/czero-repo-shapes.md)
-
 ## Supported agents
 
 Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 **28 more** — 33 launch presets in total, plus 6 agents drivable over ACP.
 
-Zaivern Code is not an AI model and does not bundle one: it drives the CLIs you have
-already installed and signed in to. Any combination works, including a single agent.
+Any combination works, including a single agent.
 Missing yours? [Request an integration](https://github.com/tacyan/zaivern-code/issues).
 
 ## Why Zaivern
 
 |  | Terminal multiplexer | Generic agent dashboard | Zaivern Code |
 |---|:---:|:---:|:---:|
-| Run several agents at once | ✅ | ✅ | ✅ |
-| One screen for all of them | ❌ | ✅ | ✅ |
-| Knows agent state (thinking / blocked / stalled) | ❌ | varies | ✅ |
 | Line-range ownership + write-time refusal | ❌ | ❌ | ✅ |
+| Knows agent state (thinking / blocked / stalled) | ❌ | varies | ✅ |
+| One screen for every agent at once | ❌ | ✅ | ✅ |
 | Approvals as notifications | ❌ | varies | ✅ |
 | Phone / remote control | ❌ | varies | ✅ |
 | Single native binary, no runtime | varies | varies | ✅ |
 
-## Benchmarks
+## Benchmarks and limitations
 
-**64 agents, one repository, same workload** (files = writers × 6, 50% file overlap):
+The 64-agent table at the top is synthetic. On **real repositories**, cloned and
+replayed by `tools/anyrepo-prove.sh` with 16 writers (zai 0.14.0):
 
-| | Plain git | Zaivern Code |
-|---|---:|---:|
-| Merges that conflicted | 57 of 64 | **0** |
-| Conflict hunks | 132 | **0** |
+| Repository | Plain git | Zaivern Code |
+|---|---|---|
+| zaivern-code (Rust, 259 tracked files) | 26 conflicted files / 28 hunks | **0 / 0** — 96 of 96 edits landed, 0 refused, 30 shifted |
+| hyperframes (TS/HTML, 1,194 tracked files) | 26 / 28 | **0 / 0** — 96 of 96 landed, 0 refused, 32 shifted |
 
-Zero is bought by refusing writes: 202 of 384 planned edits landed, the rest were
-stopped at the gate. Where the line ranges are actually disjoint, all 64 agents land
-and nothing is refused.
-
-**This repository, 16 agents in parallel** (zai 0.14.0): plain git produced **26
-conflicted files / 28 hunks**. With the ledger: **0 / 0**, and all **96 edits landed** —
-none refused, 30 of them shifted to a free line range.
+Refusal is not the only outcome. When a claim collides, `--shift` moves it to the
+nearest free range of the same width — which is why both rows above land every
+edit and refuse none.
 
 ### What "zero conflicts" means
 
-- Zaivern may **refuse** an overlapping write rather than let it become a merge conflict.
-  The conflict count is 0; the throughput is not.
-- It prevents overlapping line ownership. It does **not** detect semantic conflicts —
-  one agent changing a signature while another keeps calling the old one merges cleanly.
-- Line ranges far enough apart never needed help: plain git already merges those at zero
-  conflicts. Line-range ownership gives back the parallelism a file-level lease destroys.
+- **Ownership always holds.** "No two agents are handed the same lines" depends
+  only on the ledger, not on file contents: `dup_lines = 0` in 126 of 126
+  independently re-run proofs.
+- **A clean merge is conditional.** In repetitive content — repeated code fences,
+  generated code, the same line over and over — git can still conflict even when
+  the claimed ranges are far enough apart. The gate refuses those claims instead
+  of promising a merge it cannot guarantee.
+- **Semantic conflicts are out of scope.** Overlapping line ownership is
+  prevented; a changed signature and a stale caller in another file are not.
+- **Disjoint work never needed help.** Ranges far enough apart already merge at
+  zero conflicts under plain git. Line-range ownership gives back the parallelism
+  that a file-level lease destroys — that is the comparison that matters.
+- **It only enforces where git can enforce.** `zai lease claim` also succeeds in a
+  non-git folder, but nothing is stopped there. `zai czero doctor` reports which
+  repository shapes (worktrees, submodules, sparse-checkout, LFS, bare) are
+  actually covered.
 
-[Full methodology, per-scale numbers, gate latency, and limitations →](docs/conflict-zero.md)
+Reproduce any of it: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
+`tools/anyrepo-prove.sh --repo .`
+[Full methodology and remaining gaps →](docs/conflict-zero.md) ·
+[which guarantees hold for which repository shape →](docs/czero-repo-shapes.md)
 
 ## Supported platforms
 
 | Item | Support |
 |---|---|
 | OS | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
+| Distribution | Single native binary, no runtime; checksums, SBOM, and build provenance per release |
 | AI CLIs | 33 launch presets, plus 6 over ACP |
-| Tests | 4,985, run on macOS, Linux, and Windows in CI |
+| Tests | 4,985 in v0.22.3, run on macOS, Linux, and Windows in CI |
 | License | Apache-2.0 |
 
 ## Documentation
@@ -234,31 +292,38 @@ none refused, 30 of them shifted to a free line range.
 |---|---|
 | [docs/conflict-zero.md](docs/conflict-zero.md) | What "conflict-free" claims, what it does not, and every measurement behind it |
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
+| [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU and binary size are measured |
 | [docs/plugins.md](docs/plugins.md) | Writing plugins, with the [format specification](docs/PLUGIN_SPEC.md) |
 | [docs/README.md](docs/README.md) | Index of every other document, grouped by the claim it backs |
 
-[Idle CPU and binary-size measurements →](docs/idle-cost.md) ·
-[Release notes](https://github.com/tacyan/zaivern-code/releases)
+[Release notes](https://github.com/tacyan/zaivern-code/releases) ·
+[Security policy](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## Try it
 
-If parallel coding agents are part of your workflow, run Zaivern Code on your next
-multi-agent task — `zai czero init` in the repository, then start two agents on the same
-file and watch the second write get refused instead of merged badly.
+Try Zaivern Code with two agents on the same repository:
+
+```bash
+zai czero init
+zai .
+```
+
+Start two agents, point both at the same file, and watch the second overlapping
+write get refused *before* it becomes a merge conflict. That is the whole idea, in
+about a minute.
+
+If it holds up for you, a ⭐ **Star** helps other people find it.
 
 ## Community
 
 - Found a coordination edge case? [Open an issue](https://github.com/tacyan/zaivern-code/issues).
 - Using a coding agent that is not supported yet? [Request an integration](https://github.com/tacyan/zaivern-code/issues).
-- Running 8, 16, 32, or 64 agents? Share your benchmark — `tools/conflict-bench.sh` and
-  `tools/anyrepo-prove.sh` produce numbers comparable to the tables above.
-- Built something with Zaivern Code? Show us your setup.
+- Running 8, 16, 32, or 64 agents? Share your numbers — `tools/conflict-bench.sh`
+  and `tools/anyrepo-prove.sh` produce results comparable to the tables above.
 
 Pull requests are welcome against `main` — [CONTRIBUTING.md](CONTRIBUTING.md) covers
-building from source (Rust 1.88+), verifying a change, and running the Linux and Windows
-checks locally.
-
-If Zaivern Code is useful to you, a ⭐ **Star** helps other people find it.
+building from source (Rust 1.88+), verifying a change, and running the Linux and
+Windows checks locally.
 
 ## License
 
