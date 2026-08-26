@@ -2847,6 +2847,52 @@ impl Default for AcpManager {
 }
 
 impl AcpManager {
+    /// **Fleet 集計へ載せるための読み取り** (`crate::fleet`)。
+    ///
+    /// ACP で駆動しているエージェントは、状態ラダーの**最上段**で動いている
+    /// のに、看板・デッキ・スマホのどこからも見えていなかった
+    /// (`Total Agents` が嘘になる、いちばん分かりやすい形の破れ)。
+    /// ここは**読み取り専用**で、ACP パネル側の経路には 1 バイトも触らない。
+    ///
+    /// 費用は接続本数 M に対して O(M)。接続 0 本なら空 `Vec` を返すだけ。
+    pub fn fleet_observations(&self, now: Instant) -> Vec<crate::fleet::Observation> {
+        self.clients
+            .iter()
+            .map(|c| crate::fleet::Observation {
+                id: c.id,
+                kind: crate::fleet::model::AgentKindOpt::acp(),
+                title: c.label.clone(),
+                icon: c.icon.to_string(),
+                // **`Ended` だけを「終わった」とする。**
+                //
+                // `Phase::Failed` も `is_dead()` は真だが、ここで `running:
+                // false` を渡すと `classify_stream` の最優先規則
+                // (「プロセスが居ない = 終了」) に当たって**完了レーンへ入る** —
+                // つまり「失敗したのに、見なくてよいことにされる」。
+                // 接続の失敗は人が始末する必要があるので、Fleet の上では
+                // まだ居る扱いにし、ラダーの `Failed` に人を呼ばせる。
+                running: !matches!(c.phase, Phase::Ended),
+                // 承認は統合承認キュー (`approvals`) 側が持つ。ここでは
+                // 画面推定を 1 文字もしない。
+                attention: false,
+                rate_limited: None,
+                sup: None,
+                // **最上段そのもの**。`Rung::Protocol` として渡すので、
+                // 看板の確信度の床 (`needs_strong_signal`) を正しく通る。
+                ladder: Some(crate::supervisor::LadderRead {
+                    rung: crate::supervisor::Rung::Protocol,
+                    state: proto_state_of(&c.phase),
+                    detail: c.phase.label(),
+                }),
+                // ACP は画面を持たない (JSON-RPC)。末尾行という概念が無いので、
+                // 「読んでいない」ではなく「空を読んだ」を渡す
+                // — そうしないと画面推定へ降りようとして永遠に材料待ちになる。
+                tail_lines: Some(Vec::new()),
+                uptime_ms: now.saturating_duration_since(c.started).as_millis() as u64,
+            })
+            .collect()
+    }
+
     /// 接続が 1 本も無いか (**0 本なら UI も同期も 1 ピクセルも動かない**)。
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
@@ -3563,6 +3609,29 @@ pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
 // ═══════════════════════════════════════════════════════════════════════
 //  テスト
 // ═══════════════════════════════════════════════════════════════════════
+
+/// ACP の接続段 → 構造化プロトコルの状態 (**純関数**)。
+///
+/// ACP は「エディタ ↔ エージェント」の規格なので、語彙が
+/// [`crate::supervisor::protocol::ProtoState`] と 1 対 1 では対応しない。
+/// 迷ったら**弱い方へ倒す** — 特に `Failed` を `Done` へ写すと
+/// 「失敗したのに完了レーンへ入って見なくてよいことにされる」ので、
+/// 人が見るべき側 (`Failed`) へ落とす (`kanban::activity_of` が
+/// `Activity::Stalled` へ写す)。
+pub fn proto_state_of(phase: &Phase) -> crate::supervisor::protocol::ProtoState {
+    use crate::supervisor::protocol::ProtoState as P;
+    match phase {
+        // ハンドシェイク中はまだ何もしていない
+        Phase::Initializing | Phase::CreatingSession => P::Starting,
+        // 手番が人へ戻っている
+        Phase::Idle => P::Idle,
+        // ターン実行中。ツール名までは持ち帰らない (Phase 1 の範囲外)
+        Phase::Running => P::Thinking,
+        // **完了ではない。** 人が見るべき状態へ落とす
+        Phase::Failed(_) => P::Failed,
+        Phase::Ended => P::Done,
+    }
+}
 
 #[cfg(test)]
 mod tests {

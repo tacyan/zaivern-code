@@ -478,6 +478,9 @@ impl ZaivernApp {
         remove: &mut Option<usize>,
         cycle: &mut Option<usize>,
     ) {
+        // **Fleet のスナップショット** (`Arc` のクローン 1 回)。
+        // サイドバーもここからしか状態を読まない。
+        let fleet_snap = self.fleet.snapshot();
         egui::ScrollArea::vertical()
             .id_salt("zv-agents")
             .auto_shrink(false)
@@ -505,14 +508,23 @@ impl ZaivernApp {
                         |ui| {
                             frame.show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let dot = if s.running() {
-                                        if s.attention {
-                                            RichText::new("●").color(theme.warn)
-                                        } else {
-                                            RichText::new("●").color(theme.ok)
+                                    // **Fleet のレーンから決める。**
+                                    // `running` と `attention` だけを見ていた頃は
+                                    // 見張りを 1 バイトも読まないので、
+                                    // 停滞中のエージェントが緑の ● で出ていた。
+                                    let dot = match fleet_snap.view(s.id) {
+                                        Some(v) => {
+                                            let d = crate::fleet::projection::Dot::of(v);
+                                            RichText::new(
+                                                if d == crate::fleet::projection::Dot::Dead {
+                                                    "○"
+                                                } else {
+                                                    "●"
+                                                },
+                                            )
+                                            .color(d.color(theme))
                                         }
-                                    } else {
-                                        RichText::new("○").color(theme.err)
+                                        None => RichText::new("○").color(theme.err),
                                     };
                                     ui.label(dot);
                                     let badge = if s.is_permission_agent() {

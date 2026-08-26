@@ -445,7 +445,7 @@ impl ZaivernApp {
         // 表示中のアクティブセッションを既読にする。未読 (◆) は
         // 「見ていない間に意味的な出力が変わった」セッションだけに残る。
         // 看板タブ表示中はパネルに端末が見えていないので既読にしない。
-        if (self.agents.panel_open && !self.kanban && !self.deck) || self.cockpit || self.deck {
+        if self.deck || self.cockpit || (self.agents.panel_open && !self.kanban) {
             let active = self.agents.active;
             if let Some(s) = self.agents.sessions.get_mut(active) {
                 s.mark_read();
@@ -480,6 +480,14 @@ impl ZaivernApp {
         self.reconcile_sessions();
         self.terminal_hooks(ctx, win_focused);
         self.supervise(ctx, win_focused);
+        // **Fleet の観測はどのフレームでも取り込む。**
+        // 看板を開いているかどうかに状態の前進を依存させない
+        // (依存させていたのが「Fleet の状態が信用できない」の主因だった)。
+        self.fleet_tick();
+        // **Fleet を読むリモート応答はここで作る。**
+        // `poll_remote` (フレーム前半) で答えると 1 つ前のスナップショットを
+        // 返すので、`/api/state` と `/api/agents` だけをここまで持ち越している。
+        self.flush_remote_fleet_reads(ctx);
         // 通知は「働いていたものが手を止めた瞬間」の 1 点だけ。
         // 見張りが段を更新した直後に見る (同じフレームの判定を使う)。
         self.notify_work_done(win_focused);

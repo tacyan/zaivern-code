@@ -909,6 +909,10 @@ impl ZaivernApp {
         // 分割レイアウトの正規化 (毎フレーム): 消えたセッションのリーフを落とし、
         // フォーカスを隣へ移し、1 枚に戻ったタイルは分割そのものを畳む。
         self.normalize_splits();
+        // **Fleet のスナップショット** (`Arc` のクローン 1 回)。Cockpit は
+        // ここからしか状態を読まない — 生の `running` / `attention` を直接
+        // 見ると、見張りもラダーも通らない 3 値へ独自に潰すことになる。
+        let fleet_snap = self.fleet.snapshot();
         // 分割の**子ペイン**はタイルとしては並べない (親タイルの中に描かれる)。
         // 分割が 1 つも無ければこの集合は空で、以降の並びは今日と完全に同じ。
         let tiles = self.cockpit_tiles();
@@ -1007,16 +1011,25 @@ impl ZaivernApp {
                                     // ここでスコープを閉じないと、分割タイルの
                                     // 描画 (複数セッションを触る) と衝突する。
                                     {
+                                    // **Fleet のレーンから決める。**
+                                    // 以前はここで `running` と `attention` だけを
+                                    // 見ていたので、見張りを 1 バイトも読まず
+                                    // **停滞中のエージェントが緑の ● で出ていた**。
+                                    let dot_kind = fleet_snap
+                                        .view(self.agents.sessions[i].id)
+                                        .map(crate::fleet::projection::Dot::of);
                                     let s = &mut self.agents.sessions[i];
                                     ui.horizontal(|ui| {
-                                        let dot = if s.running() {
-                                            if s.attention {
-                                                RichText::new("●").color(theme.warn)
+                                        let dot = match dot_kind {
+                                            Some(d) => RichText::new(if d
+                                                == crate::fleet::projection::Dot::Dead
+                                            {
+                                                "○"
                                             } else {
-                                                RichText::new("●").color(theme.ok)
-                                            }
-                                        } else {
-                                            RichText::new("○").color(theme.err)
+                                                "●"
+                                            })
+                                            .color(d.color(theme)),
+                                            None => RichText::new("○").color(theme.err),
                                         };
                                         ui.label(dot);
                                         let badge = if s.is_permission_agent() {
@@ -1304,6 +1317,7 @@ impl ZaivernApp {
             .get(&sid)
             .map(|l| l.leaves())
             .unwrap_or_default();
+        let pane_snap = self.fleet.snapshot();
         let panes: Vec<(u64, terminal::PaneChrome, bool)> = leaves
             .iter()
             .map(|pid| {
@@ -1316,13 +1330,14 @@ impl ZaivernApp {
                     .map(|s| terminal::PaneChrome {
                         icon: s.icon.clone(),
                         title: s.title.clone(),
-                        dot: Some(if !s.running() {
-                            theme.err
-                        } else if s.attention {
-                            theme.warn
-                        } else {
-                            theme.ok
-                        }),
+                        // ここも Fleet のレーン 1 本から (色の決定は
+                        // `fleet::projection::Dot` にしか無い)。
+                        dot: Some(
+                            pane_snap
+                                .view(*pid)
+                                .map(|v| crate::fleet::projection::Dot::of(v).color(theme))
+                                .unwrap_or(theme.err),
+                        ),
                     })
                     .unwrap_or_default();
                 (*pid, c, dead)
