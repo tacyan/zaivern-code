@@ -268,7 +268,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | 操作系统 | macOS arm64/x86_64、Linux x86_64/arm64、Windows x86_64 |
 | 分发 | 单个原生二进制、无需运行时；每个版本附带校验和、SBOM 与构建来源证明 |
 | AI CLI | 33 种启动预设，另有 6 种通过 ACP |
-| 测试 | v0.22.3 共 4,985 个，在 CI 的 macOS、Linux、Windows 上运行 |
+| 测试 | v0.23.0 共 5,005 个，在 CI 的 macOS、Linux、Windows 上运行 |
 | 许可证 | Apache-2.0 |
 
 ## 文档

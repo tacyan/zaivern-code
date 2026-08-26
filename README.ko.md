@@ -273,7 +273,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | OS | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
 | 배포 | 단일 네이티브 바이너리, 런타임 불필요. 릴리스마다 체크섬·SBOM·빌드 출처 증명 |
 | AI CLI | 실행 프리셋 33가지, ACP로 6가지 추가 |
-| 테스트 | v0.22.3 기준 4,985개, CI의 macOS·Linux·Windows에서 실행 |
+| 테스트 | v0.23.0 기준 5,005개, CI의 macOS·Linux·Windows에서 실행 |
 | 라이선스 | Apache-2.0 |
 
 ## 문서
