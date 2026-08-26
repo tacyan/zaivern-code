@@ -283,7 +283,7 @@ Reproduce cualquiera de estos datos: `tools/conflict-bench.sh`, `tools/coedit-be
 | SO | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
 | Distribución | Binario nativo único, sin runtime; checksums, SBOM y procedencia de compilación en cada release |
 | CLIs de IA | 33 preajustes de arranque, más 6 por ACP |
-| Pruebas | 4985 en la v0.22.3, ejecutadas en macOS, Linux y Windows en CI |
+| Pruebas | 5005 en la v0.23.0, ejecutadas en macOS, Linux y Windows en CI |
 | Licencia | Apache-2.0 |
 
 ## Documentación

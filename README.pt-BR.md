@@ -282,7 +282,7 @@ Reproduza qualquer um deles: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | SO | macOS arm64/x86_64, Linux x86_64/arm64, Windows x86_64 |
 | Distribuição | Binário nativo único, sem runtime; checksums, SBOM e proveniência de build a cada release |
 | CLIs de IA | 33 presets de inicialização, mais 6 por ACP |
-| Testes | 4.985 na v0.22.3, executados em macOS, Linux e Windows no CI |
+| Testes | 5.005 na v0.23.0, executados em macOS, Linux e Windows no CI |
 | Licença | Apache-2.0 |
 
 ## Documentação
