@@ -3366,6 +3366,13 @@ pub struct ZaivernApp {
     /// ここのスナップショットを読む。**画面ごとに状態を作り直さない。**
     /// 書き込むのは [`ZaivernApp::fleet_tick`] 1 か所だけ。
     pub(crate) fleet: fleet::FleetStore,
+    /// **Fleet のスナップショットを読むリモート要求の持ち越し。**
+    ///
+    /// `poll_remote` はフレーム前半に居るので、そこで答えると 1 つ前の
+    /// フレームのスナップショットを返してしまう。ここへ積んで
+    /// [`ZaivernApp::fleet_tick`] の後で答える (`flush_remote_fleet_reads`)。
+    /// 積むのは `/api/state` と `/api/agents` の 2 つだけ。
+    remote_fleet_reads: Vec<remote::Request>,
     /// エージェントデッキ (縦 1 本でエージェントを管理する画面)。
     /// Cockpit / 看板と同格の中央画面モードで、3 つ同時には出さない。
     deck: bool,

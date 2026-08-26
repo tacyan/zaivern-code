@@ -171,6 +171,7 @@ impl ZaivernApp {
             kanban: false,
             kanban_state: kanban::KanbanState::default(),
             fleet: crate::fleet::FleetStore::default(),
+            remote_fleet_reads: Vec::new(),
             deck: false,
             deck_state: deck::DeckState::default(),
             changes: false,

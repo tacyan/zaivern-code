@@ -189,3 +189,45 @@ fn ライブ枠は端末の大きさを持たない() {
         );
     }
 }
+
+/// **Fleet を読むリモート応答は、必ず `fleet_tick` の後で作る。**
+///
+/// `poll_remote` はフレーム前半 (`update_impl` の ~225 行目) に居るので、
+/// そこで `/api/agents` や `/api/state` に答えると **1 つ前のフレームの
+/// スナップショット**を返す。とくに初回フレームでは
+/// `agents.sessions` に 2 体居るのに `fleet.snap()` は空なので、
+/// `snap.view(id)` が `None` に落ちて `Column::Ready` / `Activity::Starting`
+/// の fallback が使われ、一覧は 2 件なのにレーン見出しの件数は 0 という
+/// 一時的な不整合が出る (Single Source of Truth の意味が消える)。
+#[test]
+fn fleetを読むリモート応答は更新後に作る() {
+    let src = &crate::app::SRC_IMPL.replace("\r\n", "\n");
+    let body = src
+        .split("pub(super) fn update_impl(")
+        .nth(1)
+        .expect("update_impl がある");
+
+    let at = |needle: &str| -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("{needle} が update_impl に無い"))
+    };
+    let supervise = at("self.supervise(ctx, win_focused);");
+    let tick = at("self.fleet_tick();");
+    let flush = at("self.flush_remote_fleet_reads(ctx);");
+    let poll = at("self.poll_remote(ctx);");
+
+    assert!(
+        supervise < tick,
+        "fleet_tick が supervise より先 (見張りの判定が 1 フレーム古くなる)"
+    );
+    assert!(
+        tick < flush,
+        "Fleet を読む応答が fleet_tick より先に作られている\n\
+         (初回フレームでは空のスナップショットを返す)"
+    );
+    assert!(
+        poll < tick,
+        "書き込み系のリモート要求が後ろへ回った\n\
+         (指示の配達・承認・起動が 1 フレーム遅れる)"
+    );
+}

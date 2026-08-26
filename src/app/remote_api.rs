@@ -1,13 +1,63 @@
 use super::*;
 
+/// **Fleet のスナップショットを読む要求か** (純関数)。
+///
+/// 該当するのは `self.fleet.snap()` を実際に読む応答だけ:
+///
+/// | 要求 | 読む場所 |
+/// |---|---|
+/// | [`remote::Query::State`] | `remote_reply_state` の「待ち」バッジ |
+/// | [`remote::Query::Agents`] | `remote_reply_agents` のレーン / 状態 / 件数 |
+///
+/// **ここを広げない。** 広げたぶんだけリモートの応答が 1 フレーム遅れる。
+/// 読まない要求まで持ち越しても、得るものが 1 つも無い。
+/// 表は `remote_fleet_read_tests` が `self.fleet.snap()` の実際の出現箇所と
+/// 突き合わせるので、片方だけ足すと落ちる。
+fn reads_fleet(q: &remote::Query) -> bool {
+    matches!(q, remote::Query::State | remote::Query::Agents)
+}
+
 impl ZaivernApp {
     /// リモートサーバに溜まったリクエストを処理して応答する。毎フレーム呼ぶ。
     pub(super) fn poll_remote(&mut self, ctx: &egui::Context) {
+        // 前フレームから持ち越しが残っていたら、まずここで答える。
+        // `update_impl` が途中で畳まれても **1 フレーム以上は待たせない**
+        // (`remote.rs` の待機は 3 秒なので、1 フレームは十分内側)。
+        self.flush_remote_fleet_reads(ctx);
         let reqs: Vec<remote::Request> = match &self.remote {
             Some(r) => r.poll(),
             None => return,
         };
         for req in reqs {
+            // **Fleet を読む要求だけ `fleet_tick` の後まで持ち越す。**
+            // ここはフレームの前半なので、いま答えると 1 つ前のフレームの
+            // スナップショットを返すことになる。初回フレームでは
+            // `agents.sessions` に居るのに `fleet.snap()` は空で、
+            // 一覧は N 件なのにレーン見出しは 0、という不整合が出る。
+            //
+            // **書き込み系は 1 つも遅らせない** — 指示の配達 (`submit_tick`)・
+            // 承認の検出 (`poll_events`)・起動の反映 (`reconcile_sessions`)・
+            // ファイアウォール / Tailscale の結果取り込みは、どれもこの
+            // 呼び出しより後ろに居るので、動かすと 1 フレーム遅れる。
+            if reads_fleet(&req.query) {
+                self.remote_fleet_reads.push(req);
+                continue;
+            }
+            let json = self.remote_reply(&req.query, ctx);
+            req.respond(json);
+        }
+    }
+
+    /// **Fleet 更新後**に、スナップショットを読む要求へ答える。
+    ///
+    /// 呼ぶのは `update_impl` の `fleet_tick()` の直後 1 か所だけ。
+    /// 持ち越しが空のフレームでは `Vec::is_empty` の検査 1 回で戻る
+    /// (アイドル時の追加コストはゼロ)。
+    pub(super) fn flush_remote_fleet_reads(&mut self, ctx: &egui::Context) {
+        if self.remote_fleet_reads.is_empty() {
+            return;
+        }
+        for req in std::mem::take(&mut self.remote_fleet_reads) {
             let json = self.remote_reply(&req.query, ctx);
             req.respond(json);
         }
@@ -3041,5 +3091,111 @@ mod changes_scan_tests {
         // 守る番人 (`file_tree::tests::破壊的なファイル操作は確認を経ずに呼ばれない`)
         // が **app の非テスト部分と区別できずに落ちる** — `app/*.rs` は
         // `SRC_IMPL` へ丸ごと入るので、テストの中の削除も同じ検査に載る。
+    }
+}
+
+/// [`reads_fleet`] の表が、**実際に `self.fleet.snap()` を読む応答**と
+/// 食い違っていないかをソースで固定する。
+///
+/// 片方だけ足すと 2 通りの壊れ方をする:
+///
+/// * 表に足し忘れる → その応答は 1 つ前のフレームのスナップショットを返す
+///   (初回フレームでは空。一覧は N 件なのにレーン見出しは 0)
+/// * 読まないのに表へ足す → 応答が 1 フレーム遅れるだけで、得るものが無い
+#[cfg(test)]
+mod remote_fleet_read_tests {
+    /// `self.fleet.snap()` を読んでいる応答関数の名前 (ソースから拾う)。
+    fn readers() -> Vec<String> {
+        const NEEDLE: &str = "self.fleet.snap()";
+        let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
+        let mut out = Vec::new();
+        for (i, _) in src.match_indices(NEEDLE) {
+            let head = &src[..i];
+            let line_start = head.rfind('\n').map(|n| n + 1).unwrap_or(0);
+            let rest = &src[line_start..];
+            let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+            // **コメント行は数えない。** doc コメントで綴りを書いただけの行を
+            // 実装と読むと、直後の無関係な `fn` を「読み手」として拾う
+            // (実際に `voice_target_label` を誤検出した)。
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            // **文字列リテラルの中も数えない。** 番人が自分の判定語を
+            // 自分で拾うと、わざと壊しても緑のままになる (この番人自身の
+            // 失敗メッセージが実際に引っかかった)。行頭からの `"` の数が
+            // 奇数なら、その出現は文字列の中に居る。
+            let before = &rest[..i - line_start];
+            if before.matches('"').count() % 2 == 1 {
+                continue;
+            }
+            // その出現を囲っている `fn 名前(` を後ろ向きに探す。
+            let Some(at) = head.rfind("fn ") else {
+                continue;
+            };
+            let name: String = src[at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn スナップショットを読む応答は表と一致する() {
+        // 表 (`reads_fleet`) が真を返す要求
+        let listed = [
+            (crate::remote::Query::State, "remote_reply_state"),
+            (crate::remote::Query::Agents, "remote_reply_agents"),
+        ];
+        for (q, name) in &listed {
+            assert!(super::reads_fleet(q), "{name} の要求が表に無い");
+        }
+        let mut want: Vec<String> = listed.iter().map(|(_, n)| n.to_string()).collect();
+        want.sort();
+        assert_eq!(
+            readers(),
+            want,
+            "`self.fleet.snap()` を読む応答と `reads_fleet` の表が食い違っている"
+        );
+    }
+
+    /// **読まない要求まで持ち越さない** (遅らせるだけ得が無い)。
+    #[test]
+    fn 読まない要求は持ち越さない() {
+        for (q, name) in [
+            (crate::remote::Query::File, "File"),
+            (crate::remote::Query::Files, "Files"),
+            (crate::remote::Query::Term, "Term"),
+            (crate::remote::Query::Approvals, "Approvals"),
+            (crate::remote::Query::Changes, "Changes"),
+            (crate::remote::Query::Tab(0), "Tab"),
+            (crate::remote::Query::SetStatus(String::new()), "SetStatus"),
+        ] {
+            assert!(!super::reads_fleet(&q), "{name} を持ち越している");
+        }
+    }
+
+    /// 持ち越しは**答えずに捨てない**。`poll_remote` の入口と
+    /// `fleet_tick` の直後の 2 か所で必ず掃ける。
+    #[test]
+    fn 持ち越しは必ず掃ける() {
+        let src = crate::app::SRC_IMPL.replace("\r\n", "\n");
+        let body = src
+            .split("pub(super) fn poll_remote(&mut self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("poll_remote がある");
+        let head = &body[..body.find("\n    }").unwrap_or(body.len())];
+        assert!(
+            head.contains("self.flush_remote_fleet_reads(ctx);"),
+            "poll_remote の入口で前フレームの持ち越しを掃いていない"
+        );
+        assert!(
+            head.contains("self.remote_fleet_reads.push(req);"),
+            "持ち越しの積み方が変わった"
+        );
     }
 }

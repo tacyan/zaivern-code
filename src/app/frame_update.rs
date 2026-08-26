@@ -484,6 +484,10 @@ impl ZaivernApp {
         // 看板を開いているかどうかに状態の前進を依存させない
         // (依存させていたのが「Fleet の状態が信用できない」の主因だった)。
         self.fleet_tick();
+        // **Fleet を読むリモート応答はここで作る。**
+        // `poll_remote` (フレーム前半) で答えると 1 つ前のスナップショットを
+        // 返すので、`/api/state` と `/api/agents` だけをここまで持ち越している。
+        self.flush_remote_fleet_reads(ctx);
         // 通知は「働いていたものが手を止めた瞬間」の 1 点だけ。
         // 見張りが段を更新した直後に見る (同じフレームの判定を使う)。
         self.notify_work_done(win_focused);

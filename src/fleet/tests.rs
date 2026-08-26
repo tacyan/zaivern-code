@@ -606,3 +606,64 @@ fn 画面の読み直しは間引かれる() {
     assert!(!fleet.sample_due(1_100));
     assert!(fleet.sample_due(1_200), "動いているときは ~6.7Hz");
 }
+
+// ---------------------------------------------------------------------------
+// 初回ティックの網羅性 (リモート応答が fallback へ落ちないこと)
+// ---------------------------------------------------------------------------
+
+/// **1 回目の更新で、観測した全員がスナップショットに載る。**
+///
+/// `remote_reply_agents` は `snap.view(s.id)` が `None` のとき
+/// `Column::Ready` / `Activity::Starting` へ落ちる。この fallback は
+/// 「Store がまだそのセッションを知らない」ときにしか使われてはいけない —
+/// 起動直後の 1 フレームで使われると、**一覧は N 件なのにレーン見出しは 0**
+/// という不整合になる (レビュー指摘)。
+///
+/// ここは「Store 側は 1 ティックで必ず全員を載せる」を固定する。
+/// 「リモートがそのティックの後に読む」ほうは
+/// `app::deck_wiring_tests::fleetを読むリモート応答は更新後に作る` が見る。
+#[test]
+fn 初回ティックで全エージェントがスナップショットに載る() {
+    let mut fleet = FleetStore::default();
+    // 復元直後を模す: 見張りの判定も画面もまだ何も無い 2 体。
+    let obs = vec![pty(1, true), pty(2, true)];
+    fleet.update(&obs, 0);
+
+    let snap = fleet.snapshot();
+    let kind = Some(AgentKind::Pty);
+
+    // 依頼の必須条件 1: 各エージェントが必ず居る (= fallback へ落ちない)
+    for o in &obs {
+        assert!(
+            snap.view(o.id).is_some(),
+            "id={} が初回スナップショットに居ない (fallback に落ちる)",
+            o.id
+        );
+    }
+    // 依頼の必須条件 2: agents.length == sum(counts)
+    let counts = super::projection::lane_counts(&snap, kind);
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        obs.len(),
+        "一覧の件数とレーン見出しの合計が食い違っている"
+    );
+    assert_eq!(snap.tally(kind).total, obs.len());
+    assert_eq!(snap.tally(kind).lane_sum(), obs.len());
+}
+
+/// 途中でエージェントが増えても、その**同じティック**で載る
+/// (次のティックまで一覧と見出しがずれない)。
+#[test]
+fn 増えたエージェントも同じティックで載る() {
+    let mut fleet = FleetStore::default();
+    fleet.update(&[pty(1, true)], 0);
+    assert_eq!(fleet.snap().agents.len(), 1);
+
+    fleet.update(&[pty(1, true), pty(2, true), pty(3, true)], 1_000);
+    let snap = fleet.snapshot();
+    for id in [1u64, 2, 3] {
+        assert!(snap.view(id).is_some(), "id={id} が載っていない");
+    }
+    let counts = super::projection::lane_counts(&snap, Some(AgentKind::Pty));
+    assert_eq!(counts.iter().sum::<usize>(), 3);
+}
