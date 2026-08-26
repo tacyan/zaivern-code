@@ -160,8 +160,8 @@ let rx = engine.spawn(req, move || ctx.request_repaint());
 ## ベンチマーク
 
 `tools/context-bench.sh [<token-slim-mcp の実行ファイル>]` が、同じ入力を
-両方へ流して `original / optimized / reduction% / 秒` を並べる。
-実測（2026-08-26, release ビルド）:
+両方へ流して `original / optimized / reduction% / reps / total_s` を並べる。
+実測（2026-08-26, release ビルド, Linux x86_64, `REPS=100`）:
 
 | 入力 | token-slim | Zaivern |
 |---|---|---|
@@ -172,8 +172,16 @@ let rx = engine.spawn(req, move || ctx.request_repaint());
 | 4000 行のログ (`aggressive`) | 34020 → 128 (-99%) | 34020 → 128 (-99%) |
 
 出力の中身は**打ち切りの印の文言以外バイト単位で同じ**だった（3 トークンの
-差はその文言の長さ）。この比較は外部リポジトリが要るので CI では回せない —
-だから床だけを `context::tests::削減率は代表入力で床を下回らない` に固定してある。
+差はその文言の長さ）。
+
+時間はどの段も**両側とも 100 回で 0〜1 秒**で、この分解能では差が出ない。
+per-op の ms を出さないのは、**POSIX に秒未満を測る移植性のある手段が無い**
+ため（`date +%s%N` は GNU 限定、`time` キーワードは bash 限定。最初 bash で
+書いて、CI の `sh -n` に落とされた）。両側を同じ回数・同じ測り方で回した
+**粗い比較**として読むこと。秒にはプロセス起動が入る。
+
+この比較は外部リポジトリが要るので CI では回せない — だから床だけを
+`context::tests::削減率は代表入力で床を下回らない` に固定してある。
 
 ## 将来 core crate として切り出すときの継ぎ目
 
