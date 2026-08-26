@@ -665,6 +665,41 @@ mod tests {
         assert_eq!(first_positional(&v(&["-"]), "パス").unwrap(), "-");
     }
 
+    /// **`--offset 0` / `--limit 0` は使い方の誤り (終了コード 2)。**
+    ///
+    /// 行番号は 1 始まりなので 0 は存在しない場所を指す。黙って 1 として
+    /// 扱うと、打った人はずれていることに気付かないまま読み続ける。
+    /// 判定は道具の側 (`tools::read::ReadParams::validate`) にあり、
+    /// ここでは**その理由が Usage へ写ること**を見る。
+    #[test]
+    fn 零の行域は使い方の誤りとして断る() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-ctx", "cli-zero");
+        let root = crate::pathx::canonical(&dir);
+        std::fs::write(root.join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let run_at = |args: &[&str]| -> Result<String, CliFail> {
+            let mut full = v(args);
+            full.push("--root".into());
+            full.push(root.to_string_lossy().into_owned());
+            run(full[0].clone().as_str(), &full[1..])
+        };
+        for args in [
+            vec!["read", "a.rs", "--limit", "0"],
+            vec!["read", "a.rs", "--offset", "0"],
+            vec!["read", "a.rs", "--offset", "0", "--limit", "0"],
+        ] {
+            match run_at(&args) {
+                Err(CliFail::Usage(m)) => assert!(m.contains("1 or more"), "{m}"),
+                other => panic!("{args:?} が Usage で断られない: {other:?}"),
+            }
+        }
+        // 1 以上なら通り、表記は開始..終了になる
+        let out = run_at(&["read", "a.rs", "--offset", "1", "--limit", "1"]).expect("読める");
+        assert!(out.contains("range=L1..1"), "{out}");
+        assert!(out.contains("fn a() {}"));
+        assert!(!out.contains("fn b() {}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 範囲外・引数の誤りが、それぞれ正しい終了コードへ写ること。
     #[test]
     fn 失敗の種類が終了コードへ写る() {

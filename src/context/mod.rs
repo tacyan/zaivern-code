@@ -223,7 +223,7 @@ pub(crate) mod tests_support {
         pub fn new(tag: &str) -> Self {
             let root =
                 crate::pathx::canonical(&crate::test_util::unique_temp_dir("zaivern-ctx", tag));
-            let ws = Workspace::new(&[root.clone()]).expect("実験場を根にできる");
+            let ws = Workspace::new(std::slice::from_ref(&root)).expect("実験場を根にできる");
             Self { root, ws }
         }
 
@@ -256,7 +256,16 @@ pub(crate) mod tests_support {
             params: tools::read::ReadParams,
             s: ContextStrategy,
         ) -> Rendered {
-            tools::read::run(&self.cx(), Path::new(rel), params, s).expect("読める")
+            self.read_result(rel, params, s).expect("読める")
+        }
+
+        pub fn read_result(
+            &self,
+            rel: &str,
+            params: tools::read::ReadParams,
+            s: ContextStrategy,
+        ) -> Result<Rendered, ContextError> {
+            tools::read::run(&self.cx(), Path::new(rel), params, s)
         }
 
         pub fn grep(&self, p: &tools::grep::SearchParams) -> Rendered {

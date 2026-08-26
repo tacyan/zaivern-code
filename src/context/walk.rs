@@ -412,7 +412,7 @@ mod tests {
     fn ワークスペースの外は読めない() {
         let root = lab("ws-escape");
         write(&root, "src/a.rs", "fn a() {}\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
 
         assert!(ws.resolve(Path::new("src/a.rs")).is_ok());
         assert!(ws.resolve(&root.join("src/a.rs")).is_ok());
@@ -451,7 +451,7 @@ mod tests {
         let sibling = base.join("proj-secrets");
         std::fs::create_dir_all(&root).unwrap();
         write(&sibling, "k.txt", "秘密\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         assert!(matches!(
             ws.resolve(&sibling.join("k.txt")),
             Err(ContextError::OutsideWorkspace { .. })
@@ -469,7 +469,7 @@ mod tests {
         write(&outside, "secret.rs", "fn secret() {}\n");
         write(&root, "src/a.rs", "fn a() {}\n");
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         let start = ws.resolve(Path::new(".")).unwrap();
         let w = collect(&ws, &start, &Filter::default());
         let rels: Vec<&str> = w.files.iter().map(|f| f.rel()).collect();
@@ -489,7 +489,7 @@ mod tests {
         write(&root, "target/debug/b.rs", "fn b() {}\n");
         write(&root, "node_modules/x/c.js", "let c\n");
         write(&root, ".git/config", "[core]\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         let start = ws.resolve(Path::new(".")).unwrap();
         let rels: Vec<String> = collect(&ws, &start, &Filter::default())
             .files
@@ -506,7 +506,7 @@ mod tests {
         write(&root, "src/a.rs", "fn a() {}\n");
         write(&root, "src/b.toml", "x = 1\n");
         write(&root, "tests/c.rs", "fn c() {}\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         let start = ws.resolve(Path::new(".")).unwrap();
 
         let only_rs = Filter::default().with_exts("rs");
@@ -540,7 +540,7 @@ mod tests {
         let root = lab("ws-read");
         std::fs::write(root.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
         write(&root, "ok.txt", "こんにちは\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         assert!(matches!(
             read_text(&ws.resolve(Path::new("bin.dat")).unwrap()),
             Err(ContextError::Binary(_))
@@ -563,7 +563,7 @@ mod tests {
     fn 相対パスは根からの形になる() {
         let root = lab("ws-rel");
         write(&root, "src/deep/a.rs", "fn a() {}\n");
-        let ws = Workspace::new(&[root.clone()]).unwrap();
+        let ws = Workspace::new(std::slice::from_ref(&root)).unwrap();
         let sp = ws.resolve(&root.join("src/deep/a.rs")).unwrap();
         assert_eq!(sp.rel(), "src/deep/a.rs");
         assert_eq!(sp.ext(), "rs");

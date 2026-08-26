@@ -30,6 +30,48 @@ pub struct ReadParams {
     pub strip_comments: bool,
 }
 
+impl ReadParams {
+    /// 受け付けられる指定かを見る。
+    ///
+    /// **行番号は 1 始まり**で、0 は「先頭の 1 つ前」という存在しない場所を
+    /// 指す。黙って 1 として扱うと、`--offset 0` と打った人は 1 始まりだと
+    /// 気付かないまま**ずっと 1 行ずれた読み方**を続ける。
+    /// `limit = 0` も同じで、返るのは空。断るほうが親切。
+    ///
+    /// **道具の側で見る**ので、CLI からでも API から直に
+    /// [`ReadParams`] を組んでも同じ規則が効く。
+    fn validate(&self) -> Result<(), ContextError> {
+        if self.offset == Some(0) {
+            return Err(ContextError::BadRequest(
+                "offset is 1-based: use 1 or more".into(),
+            ));
+        }
+        if self.limit == Some(0) {
+            return Err(ContextError::BadRequest("limit must be 1 or more".into()));
+        }
+        Ok(())
+    }
+}
+
+/// `range=L10..14` の表記。
+///
+/// **飽和演算で組む。** 表示のための計算で panic してはいけない
+/// (`offset = usize::MAX` / `limit = 5` で実際に
+///  "attempt to add with overflow" で落ちた)。
+/// [`ReadParams::validate`] が 0 を弾いているので下限側は起こり得ないが、
+/// **不変条件に頼らず**ここでも飽和させる — 表示の都合で落ちる経路を
+/// 1 本も残さない。
+fn range_label(offset: Option<usize>, limit: Option<usize>) -> String {
+    let start = offset.unwrap_or(1).max(1);
+    match limit {
+        Some(l) => format!(
+            " range=L{start}..{}",
+            start.saturating_add(l).saturating_sub(1)
+        ),
+        None => format!(" range=L{start}..end"),
+    }
+}
+
 impl Default for ReadParams {
     fn default() -> Self {
         Self {
@@ -47,6 +89,7 @@ pub fn run(
     params: ReadParams,
     strategy: ContextStrategy,
 ) -> Result<Rendered, ContextError> {
+    params.validate()?;
     let sp = cx.workspace.resolve(path)?;
     let text = walk::read_text(&sp)?;
     let total_lines = text.lines().count();
@@ -56,7 +99,7 @@ pub fn run(
         let off = params.offset.unwrap_or(1).max(1);
         let lim = params.limit.unwrap_or(usize::MAX);
         text.lines()
-            .skip(off - 1)
+            .skip(off.saturating_sub(1))
             .take(lim)
             .collect::<Vec<_>>()
             .join("\n")
@@ -95,14 +138,7 @@ pub fn run(
     };
 
     let range = if ranged {
-        format!(
-            " range=L{}..{}",
-            params.offset.unwrap_or(1).max(1),
-            params
-                .limit
-                .map(|l| (params.offset.unwrap_or(1).max(1) + l - 1).to_string())
-                .unwrap_or_else(|| "end".to_string())
-        )
+        range_label(params.offset, params.limit)
     } else {
         String::new()
     };
@@ -257,6 +293,75 @@ mod tests {
         );
     }
 
+    /// **0 は行番号ではない。** 1 始まりなので `offset = 0` は「先頭の 1 つ前」、
+    /// `limit = 0` は「0 行返す」を意味する。黙って直すと、打った人は
+    /// ずれていることに気付かないまま読み続ける。
+    ///
+    /// 見るのは**道具の側**なので、CLI からでも API から直に [`ReadParams`]
+    /// を組んでも同じ規則が効く。
+    #[test]
+    fn 零の行域は断る() {
+        let lab = Lab::new("read-zero");
+        lab.write("a.rs", "fn a() {}\nfn b() {}\n");
+        for (offset, limit) in [(Some(0), Some(1)), (Some(1), Some(0)), (Some(0), None)] {
+            let p = ReadParams {
+                offset,
+                limit,
+                ..ReadParams::default()
+            };
+            let e = lab
+                .read_result("a.rs", p, ContextStrategy::Raw)
+                .expect_err(&format!("offset={offset:?} limit={limit:?} が通った"));
+            assert!(matches!(e, ContextError::BadRequest(_)), "{e:?}");
+            assert!(
+                e.to_string().contains("1 or more"),
+                "直し方が書かれていない: {e}"
+            );
+        }
+    }
+
+    /// **表示のための計算で panic しない。**
+    ///
+    /// `offset = usize::MAX` / `limit = 5` は実際に
+    /// "attempt to add with overflow" で落ちていた (debug ビルド)。
+    /// 純関数に切り出してあるので、境界を表で固定できる。
+    #[test]
+    fn 行域の表記は飽和して落ちない() {
+        assert_eq!(range_label(Some(10), Some(5)), " range=L10..14");
+        assert_eq!(range_label(Some(1), Some(1)), " range=L1..1");
+        assert_eq!(range_label(None, None), " range=L1..end");
+        assert_eq!(range_label(Some(7), None), " range=L7..end");
+        // 上限付近でも足し算が回らない
+        assert_eq!(
+            range_label(Some(usize::MAX), Some(5)),
+            format!(" range=L{}..{}", usize::MAX, usize::MAX - 1)
+        );
+        assert_eq!(
+            range_label(Some(usize::MAX), Some(usize::MAX)),
+            format!(" range=L{}..{}", usize::MAX, usize::MAX - 1)
+        );
+        // 0 は validate が弾くので実際には来ないが、来ても落ちない
+        assert_eq!(range_label(Some(0), Some(0)), " range=L1..0");
+    }
+
+    /// 上限付近の `offset` を**道具の経路ごと**通しても落ちない
+    /// (`range_label` の表だけでは、走査側の `skip(off - 1)` を見ていない)。
+    #[test]
+    fn 上限付近の開始行でも落ちない() {
+        let lab = Lab::new("read-huge-offset");
+        lab.write("a.rs", "fn a() {}\n");
+        for off in [usize::MAX, usize::MAX - 1, usize::MAX / 2] {
+            let p = ReadParams {
+                offset: Some(off),
+                limit: Some(5),
+                ..ReadParams::default()
+            };
+            let r = lab.read("a.rs", p, ContextStrategy::Raw);
+            assert_eq!(r.body, "", "ファイルの外なのに中身が出た");
+            assert!(r.detail.contains("range=L"), "{}", r.detail);
+        }
+    }
+
     /// 空のファイル・行域が範囲外でも panic せず、正直な結果を返す。
     #[test]
     fn 空と範囲外でも落ちない() {
@@ -272,12 +377,12 @@ mod tests {
             ..ReadParams::default()
         };
         assert_eq!(lab.read("s.rs", p, ContextStrategy::Auto).body, "");
-        // offset=0 は 1 として扱う (1 始まりの契約)
-        let p0 = ReadParams {
-            offset: Some(0),
+        // 0 の扱いは `零の行域は断る` が持つ (ここでは範囲外だけを見る)
+        let p1 = ReadParams {
+            offset: Some(1),
             limit: Some(1),
             ..ReadParams::default()
         };
-        assert_eq!(lab.read("s.rs", p0, ContextStrategy::Raw).body, "fn a() {}");
+        assert_eq!(lab.read("s.rs", p1, ContextStrategy::Raw).body, "fn a() {}");
     }
 }
