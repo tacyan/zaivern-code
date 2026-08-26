@@ -209,6 +209,20 @@ Use the same Wi-Fi, [Tailscale](https://tailscale.com/), or an SSH tunnel.
 Review code and agent changes without leaving Zaivern Code, including Markdown,
 images, PDFs, and CSVs. Unsaved buffers are recovered after a crash.
 
+### 8. Context Engine — spend fewer tokens, whatever agent you run
+
+Reading a 7,000-line file costs ~85k tokens. `zai context read` returns its
+structure instead — the same file for ~3.4k tokens (-96%) — then you fetch just
+the function you need with `--offset/--limit`. Search, symbol references,
+directory maps, JSON and logs go through the same layer.
+
+It is **provider-independent by construction**: nothing in the core branches on
+which agent asked, so Claude Code, Codex, Gemini and the rest all get the same
+behaviour. Nothing extra to install, and it never types into an agent or edits
+your files — it runs only when you call it.
+
+[Context Engine docs](docs/context-engine.md)
+
 Also included: plugins, and a UI available in six languages.
 [Plugin docs](docs/plugins.md) · [Translation docs](docs/translating.md)
 
@@ -291,6 +305,7 @@ Reproduce any of it: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | Document | What it covers |
 |---|---|
 | [docs/conflict-zero.md](docs/conflict-zero.md) | What "conflict-free" claims, what it does not, and every measurement behind it |
+| [docs/context-engine.md](docs/context-engine.md) | The Context Engine: strategies, the workspace boundary, metrics, and the reduction benchmark |
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
 | [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU and binary size are measured |
 | [docs/plugins.md](docs/plugins.md) | Writing plugins, with the [format specification](docs/PLUGIN_SPEC.md) |

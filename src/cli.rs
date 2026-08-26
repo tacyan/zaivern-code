@@ -234,6 +234,8 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "czero"
             // git が custom merge driver として起動する入口 (人が打つものではない)
             | "merge-driver"
+            // AI へ渡す前に情報量を減らす共通基盤 (どのエージェントでも同じ)
+            | "context"
             | "update"
             | "uninstall"
             | "help"
@@ -261,6 +263,7 @@ fn yields_to_directory(word: &str) -> bool {
             | "guard"
             | "train"
             | "split"
+            | "context"
             | "help"
     )
 }
@@ -271,7 +274,7 @@ fn yields_to_directory(word: &str) -> bool {
 pub fn help_text() -> String {
     format!(
         "{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n\
-         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
+         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
     )
 }
 
@@ -391,6 +394,10 @@ lease (ファイル所有 — 並列エージェントの衝突を「起こさ�
 /// **本文は [`crate::guard`] 側の唯一の出所を指すだけ**。ここへ写経すると
 /// `zai guard --help` と `zai --help` が食い違う (それを戒めるテストが下にある)。
 pub const HELP_GUARD: &str = crate::features::guard::HELP;
+
+/// `zai context --help` のセクション。実体は `src/context/cli.rs`
+/// (写経すると必ず食い違う。`HELP_GUARD` と同じ方針)。
+pub const HELP_CONTEXT: &str = crate::features::context::HELP;
 
 /// 競合ゼロの導入・証明・プロセスメッシュ・交渉。
 ///
@@ -545,6 +552,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         }
         // git が `%O %A %B %L %P` を付けて起動する。実体は src/union.rs。
         "merge-driver" => crate::features::union::cli_main(rest),
+        // AI へ渡す前の情報量最適化。実体は src/context/。
+        "context" => crate::features::context::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
         "status" if status_list_mode(rest).is_some() => run_status_list(
@@ -3683,6 +3692,7 @@ mod tests {
             "negotiate",
             "czero",
             "merge-driver",
+            "context",
             "update",
             "uninstall",
             "i18n",
@@ -3715,6 +3725,7 @@ mod tests {
             HELP_GUARD,
             HELP_CZERO,
             HELP_TRAIN_SPLIT,
+            HELP_CONTEXT,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {
