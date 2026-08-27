@@ -81,6 +81,19 @@ ed25519-dalek = "3"
 # ライセンスキーの Base64URL 部分。0.22 は syntect → plist 経由で既にロックへ
 # 入っているため、直接依存にしても依存グラフは 1 つも増えない。
 base64 = "0.23"
+# Cloud Execution の Provider API (Hetzner 等) を叩く**同期**の HTTP client。
+# 呼ぶのは `src/features/cloud_execution/provider/http.rs` の 1 ファイルだけで、
+# 番人テスト (`ureqの名前はこのファイルにしか出ない`) がそれを強制する。
+#   * **同期**。Cloud API のためだけに tokio ランタイムを持ち込まない
+#   * 純 Rust + rustls。ネイティブの OpenSSL も実行時ダウンロードも要らず、
+#     素の `cargo build` が macOS / Windows / Linux で通る
+#   * TLS 検証あり。証明書を確かめない経路をこのアプリに作らない
+#   * MSRV 1.85 ≤ 本体の 1.88。増える依存は 11 crate だけ (実測)
+#   * `curl` / `Invoke-WebRequest` を子プロセスで呼ぶ形は採らない —
+#     外部コマンドの有無で挙動が変わるうえ、URL とトークンがコマンド行に載る
+#   * default-features を切っているのは gzip / json / cookies が要らないため
+#     (要るのは GET / POST / DELETE と Bearer ヘッダだけ)
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
