@@ -90,9 +90,20 @@ impl LaunchSpec {
         req
     }
 
-    /// 画面とログに出す 1 行。
+    /// 画面とログに出す 1 行。**秘密は伏せていない。**
+    ///
+    /// 残す・見せる用途では [`LaunchSpec::safe_display`] を使うこと。
     pub fn display(&self) -> String {
         self.to_request().display()
+    }
+
+    /// **記録・画面・ログへ出す 1 行** (§41)。
+    ///
+    /// 引数にはトークンが混ざる (`--password=…` / `Authorization: Bearer …`)。
+    /// 伏せ方は [`super::redact`] にだけ置き、ここは通すだけ — 2 か所に
+    /// 書くと必ずずれて、ずれた側から漏れる。
+    pub fn safe_display(&self) -> String {
+        super::redact::redact(&self.display())
     }
 }
 

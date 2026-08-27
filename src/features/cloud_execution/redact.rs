@@ -13,6 +13,7 @@
 //! | 登録された環境変数の**値** | `HCLOUD_TOKEN` の中身と一致する文字列 |
 //! | 秘密鍵の本文 | `-----BEGIN … PRIVATE KEY-----` から `END` まで |
 //! | URL / クエリのトークン | `?token=abc` / `access_token=abc` |
+//! | 鍵と値の組の値 | `--password=abc` / `client_secret=abc` |
 //!
 //! ## 何を伏せないか (伏せすぎない)
 //!
@@ -80,7 +81,16 @@ pub fn redact_with(text: &str, secret_values: &[String]) -> String {
     out = mask_after_marker(&out, "Authorization:");
     out = mask_after_marker(&out, "authorization:");
     out = mask_bearer(&out);
-    for key in ["token=", "access_token=", "api_key=", "apikey="] {
+    // **鍵と値の組は「鍵で終わる語」で拾う。** `client_secret=` や
+    // `--password=` のような接頭辞つきも、この形なら 1 行で覆える。
+    for key in [
+        "token=",
+        "access_token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+    ] {
         out = mask_query_value(&out, key);
     }
     for v in secret_values {
@@ -235,6 +245,20 @@ mod tests {
         let s = redact_with("https://api.example/x?token=abcdef12345&page=2", &[]);
         assert!(!s.contains("abcdef12345"), "{s}");
         assert!(s.contains("page=2"), "他の引数は残る: {s}");
+    }
+
+    #[test]
+    fn 合言葉と秘密の組を伏せる() {
+        let s = redact_with(
+            "run --password=hunter2hunter2 --client_secret=abcdefgh12",
+            &[],
+        );
+        assert!(!s.contains("hunter2hunter2"), "{s}");
+        assert!(!s.contains("abcdefgh12"), "{s}");
+        assert!(
+            s.contains("--password=") && s.contains("--client_secret="),
+            "鍵は残る: {s}"
+        );
     }
 
     #[test]

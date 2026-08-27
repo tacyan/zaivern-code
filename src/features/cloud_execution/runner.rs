@@ -55,7 +55,7 @@ pub fn run(spec: &JobSpec, sink: &mut dyn EventSink) -> Result<ExecutionJob, Clo
         id: job_id.clone(),
         target: spec.target.id.clone(),
         state: ExecutionJobState::Queued,
-        command: spec.launch.display(),
+        command: spec.launch.safe_display(),
         workspace: None,
         result_ref: String::new(),
                 result_oid: String::new(),
@@ -207,12 +207,21 @@ pub fn exec_once(
 }
 
 /// 記録を新しい順に返す。
+///
+/// **読む側でももう一度伏せる。** 書くときに伏せている ([`LaunchSpec::safe_display`])
+/// が、伏せる規則が増える前に書かれた記録がディスクに残っているので、
+/// 出口でも同じ [`super::redact`] を通す (同じ規則なので二重に掛けても変わらない)。
 pub fn recent_jobs(limit: usize) -> Result<Vec<ExecutionJob>, CloudError> {
     let mut jobs = store::load_jobs()?;
     jobs.reverse();
     jobs.truncate(limit);
+    for j in &mut jobs {
+        j.command = super::redact::redact(&j.command);
+        j.message = super::redact::redact(&j.message);
+    }
     Ok(jobs)
 }
+
 
 /// 走ったままになっている仕事を数える (`doctor` 用)。
 pub fn unfinished(jobs: &[ExecutionJob]) -> Vec<&ExecutionJob> {
@@ -272,6 +281,76 @@ mod tests {
         assert_eq!(jobs[0].id, job.id);
         // 走らせた中身が 1 行で残る
         assert!(jobs[0].command.contains("hello"), "{}", jobs[0].command);
+    }
+
+    /// **P1-1 の再現。** 記録に生の秘密が残ると、`jobs.json` を読める
+    /// 誰か (バックアップ・ログ収集・画面共有) に渡ってしまう。
+    #[test]
+    fn 記録に残るコマンドから秘密を伏せる() {
+        let _home = home_guard("runner-redact-store");
+        const SECRET: &str = "hcloud-live-abcdef1234567890";
+        let mut spec = echo("ok");
+        spec.launch = LaunchSpec::new(
+            "curl",
+            vec![
+                "-H".into(),
+                format!("Authorization: Bearer {SECRET}"),
+                format!("https://api.example/x?token={SECRET}"),
+                format!("--password={SECRET}"),
+                format!("--secret={SECRET}"),
+            ],
+        );
+        // 走らせずに記録だけ作る経路でも良いが、製品と同じ経路を通す
+        let _ = run_collecting(&spec).0;
+
+        let raw = std::fs::read_to_string(store::jobs_path()).expect("記録がある");
+        assert!(!raw.contains(SECRET), "jobs.json に生の秘密が残った: {raw}");
+        assert!(raw.contains(super::super::redact::MASK), "{raw}");
+    }
+
+    /// 一覧に出す側も同じ規則を通る (古い版が書いた記録も伏せられる)。
+    #[test]
+    fn 一覧に出すコマンドから秘密を伏せる() {
+        let _home = home_guard("runner-redact-list");
+        const SECRET: &str = "hcloud-live-abcdef1234567890";
+        // **記録を直に置く** — 伏せずに書かれた過去の記録を模す
+        let job = ExecutionJob {
+            id: JobId::new("j-old"),
+            target: crate::features::cloud_execution::model::TargetId::new("t-x"),
+            state: ExecutionJobState::Succeeded,
+            command: format!("curl -H 'Authorization: Bearer {SECRET}'"),
+            workspace: None,
+            result_ref: String::new(),
+            result_oid: String::new(),
+            started_unix: 1,
+            ended_unix: 2,
+            exit_code: Some(0),
+            message: String::new(),
+        };
+        store::upsert_job(&job).expect("書ける");
+
+        let jobs = recent_jobs(10).expect("読める");
+        assert!(!jobs[0].command.contains(SECRET), "{}", jobs[0].command);
+    }
+
+    /// **伏せすぎない。** ふつうのコマンドが `***` だらけになると
+    /// 「何を走らせたか」が記録から消えて、記録そのものが役に立たなくなる。
+    #[test]
+    fn ふつうのコマンドは伏せない() {
+        let _home = home_guard("runner-redact-plain");
+        let mut spec = echo("ok");
+        spec.launch = LaunchSpec::new(
+            "cargo",
+            vec![
+                "test".into(),
+                "--locked".into(),
+                "--bin".into(),
+                "zai".into(),
+            ],
+        );
+        let _ = run_collecting(&spec).0;
+        let jobs = recent_jobs(10).expect("読める");
+        assert_eq!(jobs[0].command, "cargo test --locked --bin zai");
     }
 
     #[test]
