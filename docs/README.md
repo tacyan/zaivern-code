@@ -27,6 +27,7 @@
 
 | 文書 | 何を保証するか |
 |---|---|
+| [context-engine.md](context-engine.md) | **AI へ渡す前の情報量最適化。** 4 つの畳み方、ワークスペース境界の強制、メトリクスの有界性、token-slim-mcp との削減率比較 |
 | [workspace-key.md](workspace-key.md) | `~/.zaivern` の置き場を決める 16 桁の導出規則と、旧キーの引き取り |
 | [licensing.md](licensing.md) | 完全オフラインのライセンス認証。**失効できない**ことを含む |
 | [plugins.md](plugins.md) | プラグイン開発ガイド (利用者向け) |

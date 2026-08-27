@@ -13,6 +13,8 @@ mod commander;
 mod config;
 mod conflict;
 mod coordinator;
+// AI へ渡す前に情報量を減らす共通基盤 (実体は src/context/、登録は src/features/context.rs)
+mod context;
 mod deck;
 mod desktop;
 mod diagnostician;

@@ -204,6 +204,21 @@ MCP の環境変数の値は 1 度も表示しません。
 Zaivern Code を離れずにコードとエージェントの変更を確認できます。Markdown・画像・
 PDF・CSV も。保存前のバッファはクラッシュ後に復元されます。
 
+### 8. コンテキストエンジン — どのエージェントでもトークンを減らす
+
+7,000 行のファイルを素直に読むと約 85k トークンかかります。`zai context read`
+は代わりにその**構造**を返すので、同じファイルが約 3.4k トークン (-96%)。
+そのうえで `--offset/--limit` で必要な関数だけを取りに行けます。検索・
+記号の参照・ディレクトリの地図・JSON・ログも同じ層を通ります。
+
+**Provider 非依存であることを構造で保証**しています。コアには「どの
+エージェントが要求したか」で分かれる処理が 1 つも無いので、Claude Code も
+Codex も Gemini も同じ挙動になります。追加インストールは不要で、
+エージェントへ勝手に入力することも、ファイルを書き換えることもありません
+(呼ばれたときにだけ動きます)。
+
+[コンテキストエンジン](docs/context-engine.md)
+
 さらに、プラグインと 6 言語の UI も入っています。
 [プラグイン](docs/plugins.md) · [翻訳](docs/translating.md)
 
@@ -283,6 +298,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | 文書 | 扱っていること |
 |---|---|
 | [docs/conflict-zero.md](docs/conflict-zero.md) | 「競合ゼロ」が何を主張し何を主張しないか、その裏の実測すべて |
+| [docs/context-engine.md](docs/context-engine.md) | コンテキストエンジン: 4 つの畳み方、ワークスペース境界の強制、メトリクス、削減率の比較 |
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | リポジトリの形ごとに何が保証されるか |
 | [docs/idle-cost.md](docs/idle-cost.md) | アイドル CPU とバイナリサイズの測り方 |
 | [docs/plugins.md](docs/plugins.md) | プラグインの書き方と[形式の仕様](docs/PLUGIN_SPEC.md) |
