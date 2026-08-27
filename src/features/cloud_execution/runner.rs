@@ -166,16 +166,15 @@ fn run_inner(
         &opts,
         spec.timeout,
     )?;
-    job.result_ref = collected.result_ref;
-    job.result_oid = collected.oid;
+    job.result_ref = collected.result_ref.clone();
+    job.result_oid = collected.oid.clone();
     if collected.snapshotted {
         job.message = "未コミットの変更を輸送用コミットにして持ち帰りました".to_string();
     }
 
     // ここまで来た = **OID の一致まで確かめた結果が手元にある**。
     // このときだけ片付ける (§30)。回収できていない worktree は残す。
-    debug_assert!(!job.result_oid.is_empty(), "回収を確かめずに片付けようとしている");
-    if let Err(e) = git_workspace::cleanup(transport.as_ref(), &spec.target, &ws) {
+    if let Err(e) = git_workspace::cleanup(transport.as_ref(), &spec.target, &ws, &collected) {
         // 片付けの失敗で仕事を失敗にしない (結果はもう手元にある)
         job.message = format!("{} / 片付けに失敗: {e}", job.message);
     }

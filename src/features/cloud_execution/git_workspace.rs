@@ -261,6 +261,20 @@ pub fn add_worktree_script(
 /// 未コミットの変更を持ち帰るためだけの commit にし、**いま HEAD が指して
 /// いるもの**を仕事専用の参照へ固定する sh の断片 (§29)。
 ///
+/// ## `--untracked-files=all` を明示する (この版で直した壊れ方)
+///
+/// 判定に素の `git status --porcelain` を使うと、リモートの git 設定が
+/// `status.showUntrackedFiles=no` のときに**新しく作ったファイルだけの成果が
+/// 「変更なし」になる**。そのまま古い HEAD を固定して持ち帰り、OID の照合も
+/// 通り、片付けまで進むので — **成果物が消えるのに、どこにもエラーが出ない**。
+/// この設定は global にも置けるので、こちらの手元では再現しない。
+///
+/// ## git の失敗を「変更なし」に化けさせない
+///
+/// `if [ -n "$(git status …)" ]` の形は、`git` が失敗しても出力が空になるだけで
+/// **条件式が偽になる** (`set -e` も条件の中では効かない)。だから先に変数へ
+/// 受けて、失敗はその場で止める。
+///
 /// **GitHub へ push するための commit ではない。** リモートから手元へ
 /// 安全に戻すための輸送用で、そのことをメッセージに書く。
 ///
@@ -289,7 +303,9 @@ pub fn snapshot_script(dir: &RemotePath, job_id: &str, result_ref: &str) -> Stri
     let rref = posix_quote(result_ref);
     format!(
         "set -e; cd {d}; \
-         if [ -n \"$(git status --porcelain)\" ]; then \
+         zv_st=$(git status --porcelain --untracked-files=all) || \
+           {{ echo 'zv_error=リモートで git status を実行できませんでした' >&2; exit 1; }}; \
+         if [ -n \"$zv_st\" ]; then \
            git add -A; \
            git -c user.name='Zaivern Cloud' -c user.email='cloud@zaivern.invalid' \
                commit -q -m {msg}; \
@@ -416,6 +432,8 @@ impl RemoteWorkspace {
 /// 持ち帰った結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedResult {
+    /// どの仕事の回収なのか。**片付けの相手を取り違えないため**に持つ。
+    pub job_id: String,
     /// 手元の追跡参照 (`refs/remotes/zaivern-cloud/<job>`)。
     pub result_ref: String,
     /// リモートで確定し、手元でも一致を確かめた OID。
@@ -629,6 +647,7 @@ pub fn collect(
     let ssh = git_ssh_command(target, opts)?;
     let result_ref = fetch_and_verify(local_repo, &url, ws, &oid, Some(&ssh), timeout)?;
     Ok(CollectedResult {
+        job_id: ws.job_id.clone(),
         result_ref,
         oid,
         snapshotted,
@@ -637,13 +656,31 @@ pub fn collect(
 
 /// worktree を片付ける。
 ///
-/// **結果を持ち帰れなかったときは呼ばない** (§30) — ディスクの節約より
+/// **結果を持ち帰れなかったときは呼べない** (§30) — ディスクの節約より
 /// データを失わないほうが大事。
+///
+/// 回収の証拠 ([`CollectedResult`]) を**引数で要求する**のが要。「呼ぶ前に
+/// 確かめる」を約束にすると、経路が増えた日に守られない側が必ず出る
+/// (実際、以前は `debug_assert!` だったので出荷ビルドでは何も見ていなかった)。
 pub fn cleanup(
     transport: &dyn ExecutionTransport,
     target: &ExecutionTarget,
     ws: &RemoteWorkspace,
+    collected: &CollectedResult,
 ) -> Result<(), CloudError> {
+    // **回収できたと言い張るだけでは片付けない。**
+    if !is_object_id(&collected.oid) {
+        return Err(CloudError::transport(format!(
+            "回収を確かめていないので片付けません (OID: {:?})",
+            collected.oid
+        )));
+    }
+    if collected.job_id != ws.job_id {
+        return Err(CloudError::transport(format!(
+            "別の仕事の回収結果で片付けようとしました ({} ≠ {})",
+            collected.job_id, ws.job_id
+        )));
+    }
     run_remote(
         transport,
         target,
@@ -1361,6 +1398,133 @@ mod live_git_tests {
         );
         let shown = git_ok(&lab.local, &["show", &format!("{dest}:{file}")]);
         assert_eq!(shown.trim(), body.trim(), "中身が違う");
+    }
+
+    // ───── 新しいファイルだけの成果を落とさない (P1-①) ─────
+
+    /// **これが指摘の本体。** リモートの git 設定が
+    /// `status.showUntrackedFiles=no` だと、素の `git status --porcelain` は
+    /// **新しく作ったファイルを 1 つも報告しない**。旧実装はそれを「変更なし」と
+    /// 読んで古い HEAD を固定し、OID の照合まで通って片付けへ進む —
+    /// 成果物が消えるのに、どこにもエラーが出ない。
+    ///
+    /// 実装が組んだ断片を**本物の sh と git で**走らせる (テスト側に写しを作らない)。
+    #[test]
+    fn 追跡外のファイルだけの成果も回収する() {
+        let lab = lab("live-untracked-off");
+        // リモート側の設定を「追跡外を見せない」にする (global にも置ける設定)
+        git_ok(
+            &lab.work,
+            &["config", "--local", "status.showUntrackedFiles", "no"],
+        );
+        // 素の porcelain では見えないことを、まず確かめる (再現条件の確認)
+        assert!(
+            git_ok(&lab.work, &["status", "--porcelain"]).is_empty(),
+            "再現条件が成立していない"
+        );
+
+        std::fs::write(lab.work.join("new.rs"), "fn main() {}\n").expect("書ける");
+        let before = lab.work_head();
+
+        let (oid, snapped) = lab.snapshot().expect("固定できる");
+        assert!(snapped, "新しいファイルを変更なしと読んだ");
+        assert_ne!(oid, before, "古い HEAD を固定した");
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "new.rs", "fn main() {}");
+    }
+
+    /// 追跡外を見せない設定でも、**削除**は従来どおり拾う (狭めすぎない)。
+    #[test]
+    fn 追跡外を見せない設定でも削除は拾う() {
+        let lab = lab("live-untracked-off-delete");
+        git_ok(
+            &lab.work,
+            &["config", "--local", "status.showUntrackedFiles", "no"],
+        );
+        std::fs::remove_file(lab.work.join("a.txt")).expect("消せる");
+        let (oid, snapped) = lab.snapshot().expect("固定できる");
+        assert!(snapped, "削除を拾えていない");
+        lab.fetch(&oid).expect("回収できる");
+        let dest = result_ref(&lab.ws.job_id).expect("組める");
+        let files = git_ok(&lab.local, &["ls-tree", "--name-only", "-r", &dest]);
+        assert!(!files.contains("a.txt"), "削除が入っていない: {files}");
+    }
+
+    /// **git の失敗を「変更なし」に化けさせない。**
+    ///
+    /// `git status` が失敗する状況をわざと作り (作業場を消す)、
+    /// 失敗として返ることを見る。旧実装は空文字を「変更なし」と読み、
+    /// そのまま古い HEAD を固定してしまう形だった。
+    #[test]
+    fn gitの判定に失敗したら止まる() {
+        let lab = lab("live-status-fails");
+        // **`git status` だけが失敗し、`git rev-parse HEAD` は通る**状況を作る。
+        // (作業場ごと消すと `cd` で落ちるので、判定の失敗を見ていない。
+        //  index を読めなくすると status だけが落ちる)
+        let idx = std::path::PathBuf::from(git_ok(&lab.work, &["rev-parse", "--absolute-git-dir"]))
+            .join("index");
+        std::fs::remove_file(&idx).expect("index を消せる");
+        std::fs::create_dir(&idx).expect("index の場所を塞げる");
+        assert!(
+            !git_at(&lab.work, &["status", "--porcelain"])
+                .status
+                .success(),
+            "再現条件が成立していない (status がまだ通る)"
+        );
+        assert!(
+            git_at(&lab.work, &["rev-parse", "HEAD"]).status.success(),
+            "再現条件が成立していない (HEAD まで読めない)"
+        );
+
+        // **判定に失敗したら止まる。** 空の出力を「変更なし」と読んで
+        // 古い HEAD を固定してしまうと、ここが成功して返る
+        let e = lab.snapshot().expect_err("止まる");
+        assert!(!format!("{e}").is_empty(), "理由が無い: {e:?}");
+    }
+
+    /// **回収を確かめていないのに片付けない。** 証拠を引数で要求する形に
+    /// してあるので、呼び出し側が忘れても通らない。
+    #[test]
+    fn 回収の証拠が無ければ片付けない() {
+        let lab = lab("live-cleanup-guard");
+        let tr = LocalTransport::new(timeout());
+        let t = ExecutionTarget::local(1);
+
+        // OID が空 (回収していない)
+        let empty = CollectedResult {
+            job_id: lab.ws.job_id.clone(),
+            result_ref: String::new(),
+            oid: String::new(),
+            snapshotted: false,
+        };
+        let e = cleanup(&tr, &t, &lab.ws, &empty).expect_err("断る");
+        assert!(format!("{e}").contains("確かめていない"), "{e}");
+        assert!(lab.work.is_dir(), "断ったのに片付けてしまった");
+
+        // 別の仕事の回収結果で片付けようとする
+        let other = CollectedResult {
+            job_id: "j-someone-else".into(),
+            result_ref: String::new(),
+            oid: "0".repeat(40),
+            snapshotted: false,
+        };
+        let e = cleanup(&tr, &t, &lab.ws, &other).expect_err("断る");
+        assert!(format!("{e}").contains("別の仕事"), "{e}");
+        assert!(lab.work.is_dir(), "断ったのに片付けてしまった");
+
+        // 本物の回収の後なら片付く
+        let head = commit_in_work(&lab, "c.txt", "done\n", "work");
+        let (oid, snapshotted) = lab.snapshot().expect("固定できる");
+        assert_eq!(oid, head);
+        let result_ref = lab.fetch(&oid).expect("回収できる");
+        let good = CollectedResult {
+            job_id: lab.ws.job_id.clone(),
+            result_ref,
+            oid,
+            snapshotted,
+        };
+        cleanup(&tr, &t, &lab.ws, &good).expect("片付く");
+        assert!(!lab.work.is_dir(), "片付いていない");
     }
 
     #[test]
