@@ -29,7 +29,9 @@
 use std::collections::BTreeMap;
 
 use super::model::{CloudError, ExecRequest, ExecutionTarget, TransportKind};
-use super::transport::ssh::{posix_quote, remote_script, ssh_command_line, SshOptions};
+use super::transport::ssh::{
+    posix_quote, remote_cwd_expr, remote_script, ssh_command_line, SshOptions,
+};
 
 /// 起動するもの。**上位 (Agent Provider) が組んで渡す。**
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,15 +241,14 @@ pub fn run_plan_for_spec(
 }
 
 /// リモートのシェルが受け取る 1 行 (`cd … && <利用者の行>`)。
+///
+/// `cd` の作り方は [`remote_cwd_expr`] が唯一の出所 — ここで組み直すと、
+/// 構造化された経路 ([`remote_script`]) と食い違う (実際に `~` の特別扱いが
+/// 片方だけ抜けていた)。
 fn remote_shell_line(original_command: &str, remote_cwd: Option<&str>) -> String {
     match remote_cwd {
         Some(dir) if !dir.is_empty() => {
-            let cd = if let Some(rest) = dir.strip_prefix("~/") {
-                format!("~/{}", posix_quote(rest))
-            } else {
-                posix_quote(dir)
-            };
-            format!("cd {cd} && {original_command}")
+            format!("cd {} && {original_command}", remote_cwd_expr(dir))
         }
         _ => original_command.to_string(),
     }
@@ -330,6 +331,104 @@ mod tests {
             !req.env.contains_key("HCLOUD_TOKEN"),
             "トークンを運ぼうとしている"
         );
+    }
+
+    // ───────── リモートの作業ディレクトリ (cwd) の表し方 ─────────
+
+    #[test]
+    fn remote_cwd_home_expands_tilde() {
+        let line = remote_shell_line("pwd", Some("~"));
+        assert_eq!(line, "cd ~ && pwd");
+    }
+
+    /// **表で固定する。** `~` だけ特別扱いを忘れる、が実際に起きた壊れ方
+    /// (片方の経路にはあって、もう片方に無かった)。
+    #[test]
+    fn リモートの作業ディレクトリの表し方() {
+        const CASES: &[(&str, &str)] = &[
+            // `~` はリモートに展開させる (引用すると別の場所になる)
+            ("~", "cd ~ && pwd"),
+            // `~/` の後ろは引用する (展開されるのは `~` だけ)
+            ("~/repo", "cd ~/'repo' && pwd"),
+            ("~/my work/repo", "cd ~/'my work/repo' && pwd"),
+            // 絶対パスは丸ごと引用する
+            ("/tmp/test", "cd '/tmp/test' && pwd"),
+            ("/tmp/a b", "cd '/tmp/a b' && pwd"),
+            // 単一引用符を含んでも壊れない
+            ("/tmp/it's", r"cd '/tmp/it'\''s' && pwd"),
+            // 危ない文字も字義どおり
+            ("/tmp/a;id", "cd '/tmp/a;id' && pwd"),
+            ("/tmp/$(id)", "cd '/tmp/$(id)' && pwd"),
+            ("~/a;id", "cd ~/'a;id' && pwd"),
+        ];
+        for (dir, want) in CASES {
+            assert_eq!(&remote_shell_line("pwd", Some(dir)), want, "cwd = {dir:?}");
+        }
+        // 指定が無ければ `cd` を足さない
+        assert_eq!(remote_shell_line("pwd", None), "pwd");
+        assert_eq!(remote_shell_line("pwd", Some("")), "pwd");
+    }
+
+    /// **2 つの経路が同じ答えを出す。**
+    ///
+    /// `--command` 形式 ([`remote_shell_line`]) と構造化形式
+    /// ([`remote_script`]) は別の関数だが、`cd` の作り方が食い違うと
+    /// 「片方だけ直っている」状態になる (実際にそうなっていた)。
+    #[test]
+    fn 二つの経路のcdの作り方が一致する() {
+        for dir in ["~", "~/repo", "~/my work", "/tmp/test", "/tmp/a b", "/tmp/it's"] {
+            let via_line = remote_shell_line("x", Some(dir));
+            let mut req = ExecRequest::new("x", vec![]);
+            req.cwd = Some(dir.to_string());
+            let via_script = super::super::transport::ssh::remote_script(&req).expect("組める");
+            let cd_of = |s: &str| s.split(" && ").next().unwrap_or_default().to_string();
+            assert_eq!(cd_of(&via_line), cd_of(&via_script), "cwd = {dir:?}");
+        }
+    }
+
+    /// **実の `sh` で、本当にホームへ移動することを確かめる。**
+    ///
+    /// 実験場の中に `~` という名前のディレクトリを置く。引用してしまうと
+    /// **そちら**へ入ってしまう — それがこの不具合の実害である。
+    #[cfg(unix)]
+    #[test]
+    fn 実際のシェルでホームへ移動する() {
+        let lab = crate::test_util::unique_temp_dir("zv-cloud", "cwd-tilde");
+        let trap = lab.join("~");
+        std::fs::create_dir_all(&trap).expect("罠を作れる");
+
+        let run = |script: &str| -> String {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(&lab)
+                .env("LC_ALL", "C")
+                .output()
+                .expect("sh を起動できる");
+            assert!(
+                out.status.success(),
+                "{script} が失敗: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let home = run("cd ~ && pwd");
+        let got = run(&remote_shell_line("pwd", Some("~")));
+        assert_eq!(got, home, "ホームへ移動していない");
+
+        // 罠のディレクトリ (`<実験場>/~`) へ入っていないこと
+        let trap_pwd = run("cd './~' && pwd");
+        assert_ne!(got, trap_pwd, "`~` という名前のディレクトリへ入っている");
+
+        // `~/` 形式と絶対パスも、実の sh で意味が合う
+        std::fs::create_dir_all(lab.join("a b")).expect("作れる");
+        let want = run(&format!("cd {} && pwd", posix_quote(&lab.join("a b").to_string_lossy())));
+        let got = run(&remote_shell_line(
+            "pwd",
+            Some(&lab.join("a b").to_string_lossy()),
+        ));
+        assert_eq!(got, want);
     }
 
     // ───────── ローカル起動とリモート引用の分離 (指摘 4) ─────────

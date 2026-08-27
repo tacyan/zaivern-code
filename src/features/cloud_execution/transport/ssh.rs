@@ -189,6 +189,36 @@ pub fn posix_quote(s: &str) -> String {
     out
 }
 
+/// リモートの `cd` に渡す表現を作る。
+///
+/// ## `~` を引用してはいけない
+///
+/// 引用すると `~` は展開されず、**`~` という名前のディレクトリ**を指す。
+/// そんなディレクトリが実在すれば、そちらへ入ってしまう — エラーも出ずに
+/// 別の場所で作業する、いちばん気付きにくい取り違えになる。
+///
+/// だから展開させるのは **`~` 自身と、`~/` の直後の `/` だけ**。
+/// 残りは必ず引用する (空白も `;` も `$(…)` も字義どおりになる)。
+///
+/// | 入力 | 出力 |
+/// |---|---|
+/// | `~` | `~` |
+/// | `~/repo` | `~/'repo'` |
+/// | `~/my work` | `~/'my work'` |
+/// | `/tmp/a b` | `'/tmp/a b'` |
+///
+/// **この判断はここ 1 か所に置く。** 2 か所に書いたせいで、片方だけ `~` の
+/// 特別扱いが抜けていた (`cd '~'` になっていた) のがこの版で直した壊れ方。
+pub fn remote_cwd_expr(dir: &str) -> String {
+    if dir == "~" {
+        return "~".to_string();
+    }
+    if let Some(rest) = dir.strip_prefix("~/") {
+        return format!("~/{}", posix_quote(rest));
+    }
+    posix_quote(dir)
+}
+
 /// [`ExecRequest`] を、リモートのシェルが受け取る 1 本の文字列へ畳む。
 ///
 /// **文字列を組むのはここだけ。** 呼び出し側は `program` と `args` を
@@ -200,16 +230,7 @@ pub fn remote_script(req: &ExecRequest) -> Result<String, CloudError> {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(cwd) = &req.cwd {
-        // `~` で始まるときだけリモートに展開させる (引用すると `~` が
-        // ディレクトリ名として扱われて必ず失敗する)。それ以外は必ず引用。
-        let arg = if let Some(rest) = cwd.strip_prefix("~/") {
-            format!("~/{}", strip_tilde_quote(rest))
-        } else if cwd == "~" {
-            "~".to_string()
-        } else {
-            posix_quote(cwd)
-        };
-        parts.push(format!("cd {arg}"));
+        parts.push(format!("cd {}", remote_cwd_expr(cwd)));
         parts.push("&&".to_string());
     }
 
@@ -226,12 +247,6 @@ pub fn remote_script(req: &ExecRequest) -> Result<String, CloudError> {
         parts.push(posix_quote(a));
     }
     Ok(parts.join(" "))
-}
-
-/// `~/` の後ろは展開させないので、単一引用符で包み直す。
-/// `~/'my dir'` の形になり、`~` だけが展開される。
-fn strip_tilde_quote(rest: &str) -> String {
-    posix_quote(rest)
 }
 
 // ───────────────────────── コマンドの組み立て ─────────────────────────
@@ -1015,6 +1030,124 @@ mod tests {
         assert!(joined.contains("IdentitiesOnly=yes"), "{joined}");
         // user@host へ畳んでいない
         assert!(joined.contains("-l zaivern"), "{joined}");
+    }
+
+    /// **組んだ接続の作法を、実の OpenSSH が受け付けることを確かめる。**
+    ///
+    /// `ssh -G` は接続せずに実効設定を出して終わるので、ネットワークも
+    /// 相手のサーバーも要らない。それでいて**実物の ssh が実際に解釈した
+    /// 結果**が読める。
+    ///
+    /// ここで見たいのは 4 つ:
+    ///
+    /// 1. どのオプションも**受理される** (`Bad configuration option` が出ない)
+    /// 2. host key の確認が **strict のまま**である
+    /// 3. **Zaivern 専用の known_hosts** が使われている
+    /// 4. 対話で止まらない (`BatchMode` と `ConnectTimeout` が効いている)
+    ///
+    /// **3 つの OS の CI で同じものが走る。** とくに Windows の OpenSSH が
+    /// `GlobalKnownHostsFile=/dev/null` を受け付けるかは、ここでしか分からない
+    /// (手元の Linux では永久に緑になる)。
+    ///
+    /// `ssh` が無い環境では**理由を書いて降りる** — `[skip]` は緑ではない。
+    #[test]
+    fn 実のsshが接続の作法を受け付ける() {
+        let Some(version) = ssh_version() else {
+            eprintln!(
+                "[skip] ssh が見つからないので、実オプションの検査はできません \
+                 (OpenSSH クライアントを入れると走ります)"
+            );
+            return;
+        };
+
+        // **空白を含む置き場**で試す (引用の取り違えが出るなら、ここで出る)
+        let kh = std::env::temp_dir().join("zaivern known hosts");
+        let opts = SshOptions {
+            known_hosts: kh.clone(),
+            ..SshOptions::default()
+        };
+        // 名前解決させない TLD を使う (`-G` は接続しないが、念のため)
+        let t = ssh_target("zaivern-test.invalid", TargetOpts::default());
+
+        let mut argv = vec!["-G".to_string()];
+        argv.extend(ssh_argv(&t, &opts).expect("組める"));
+        let mut cmd = crate::procx::hidden_command(SSH_PROGRAM);
+        cmd.args(&argv);
+        let mut sink = CollectSink::with_limit(256 * 1024);
+        // **永久待ちを作らない** (`-G` は接続しないので、これは保険)
+        let r = super::run_child(cmd, Duration::from_secs(60), "ssh", &mut sink)
+            .expect("ssh -G が走る");
+
+        let out = sink.stdout_text().to_lowercase();
+        let err = sink.stderr_text();
+        assert!(
+            r.ok(),
+            "ssh -G が {:?} で終了した。組んだオプションを実物が受け付けていない\n             version: {version}\nstderr: {err}\nargv: {argv:?}",
+            r.exit_code
+        );
+        // 受け付けられなかったオプションは、ここに出る
+        let low_err = err.to_lowercase();
+        for bad in ["bad configuration option", "unsupported option", "unknown option"] {
+            assert!(
+                !low_err.contains(bad),
+                "オプションが受理されていない ({bad})\nversion: {version}\n{err}"
+            );
+        }
+
+        // (2) host key の確認が**無効化されていない**こと。
+        //     値の綴りは OpenSSH が正規化する (`yes` を渡しても `true` と出る)
+        //     ので、綴りではなく**意味**で見る。
+        let strict = out
+            .lines()
+            .find(|l| l.starts_with("stricthostkeychecking"))
+            .unwrap_or_else(|| panic!("stricthostkeychecking が出ていない\n{out}"));
+        let value = strict.split_whitespace().nth(1).unwrap_or("");
+        assert!(
+            !matches!(value, "no" | "off" | "false"),
+            "host key の確認が無効になっている ({strict})\nversion: {version}"
+        );
+
+        // (3) Zaivern 専用の known_hosts が使われている
+        //     (パスの綴りは OS で変わるので、ファイル名の部分で見る)
+        assert!(
+            out.contains("userknownhostsfile") && out.contains("known hosts"),
+            "専用の known_hosts が使われていない\nversion: {version}\n{out}"
+        );
+
+        // (4) 対話で止まらない作法が効いている
+        assert!(out.contains("batchmode yes"), "{out}");
+        assert!(out.contains("connecttimeout"), "{out}");
+
+        // `GlobalKnownHostsFile` が**受理されている**こと。
+        // 値そのものは OS で綴りが変わりうるので一致までは求めない —
+        // 目的は「システム全体の known_hosts を見ない」ことで、
+        // 読めないパスは OpenSSH が空として扱うため、どちらでも達成される。
+        let gkh: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("globalknownhostsfile"))
+            .collect();
+        assert!(
+            !gkh.is_empty(),
+            "GlobalKnownHostsFile が受理されていない\nversion: {version}\n{out}"
+        );
+        // 実測を残す (Windows で何になるかは、この行が答えになる)
+        eprintln!("[実測] {version} / {}", gkh.join(" | "));
+    }
+
+    /// `ssh` の版 (無ければ `None`)。
+    fn ssh_version() -> Option<String> {
+        let out = crate::procx::hidden_command(SSH_PROGRAM)
+            .arg("-V")
+            .output()
+            .ok()?;
+        // OpenSSH は版を標準エラーへ出す
+        let text = String::from_utf8_lossy(&out.stderr);
+        let text = if text.trim().is_empty() {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        } else {
+            text.into_owned()
+        };
+        text.lines().next().map(|l| l.trim().to_string())
     }
 
     #[test]
