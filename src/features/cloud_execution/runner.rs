@@ -259,6 +259,16 @@ mod tests {
         }
     }
 
+    /// **実在しない道具の名前。** 記録の中身だけを見たいテストで使う。
+    ///
+    /// 走らせたい訳ではないのに製品の経路 ([`run`]) を通したいときに、
+    /// 実在する道具の名前を書くと**本当にそれが起動する** — `cargo` と
+    /// 書いたときは、テストの中から `cargo test` がもう 1 周走って
+    /// 4 コアを埋め、同時に走っていた別モジュールの実 git テストを
+    /// 巻き添えにして落とした。道具が無ければ 1 プロセスも起こさずに
+    /// 失敗し、記録だけが残る。
+    const MISSING_PROGRAM: &str = "zaivern-no-such-program-for-test";
+
     fn echo(text: &str) -> JobSpec {
         if cfg!(windows) {
             local_spec("cmd", vec!["/C".into(), format!("echo {text}")])
@@ -289,9 +299,9 @@ mod tests {
     fn 記録に残るコマンドから秘密を伏せる() {
         let _home = home_guard("runner-redact-store");
         const SECRET: &str = "hcloud-live-abcdef1234567890";
-        let mut spec = echo("ok");
+        let mut spec = local_spec(MISSING_PROGRAM, vec![]);
         spec.launch = LaunchSpec::new(
-            "curl",
+            MISSING_PROGRAM,
             vec![
                 "-H".into(),
                 format!("Authorization: Bearer {SECRET}"),
@@ -300,7 +310,8 @@ mod tests {
                 format!("--secret={SECRET}"),
             ],
         );
-        // 走らせずに記録だけ作る経路でも良いが、製品と同じ経路を通す
+        // **製品と同じ経路を通す。** 道具が無いので実行そのものは失敗するが、
+        // 記録は残る (失敗したことも記録の一部) — 見たいのはその中身。
         let _ = run_collecting(&spec).0;
 
         let raw = std::fs::read_to_string(store::jobs_path()).expect("記録がある");
@@ -338,9 +349,8 @@ mod tests {
     #[test]
     fn ふつうのコマンドは伏せない() {
         let _home = home_guard("runner-redact-plain");
-        let mut spec = echo("ok");
-        spec.launch = LaunchSpec::new(
-            "cargo",
+        let spec = local_spec(
+            MISSING_PROGRAM,
             vec![
                 "test".into(),
                 "--locked".into(),
@@ -350,7 +360,10 @@ mod tests {
         );
         let _ = run_collecting(&spec).0;
         let jobs = recent_jobs(10).expect("読める");
-        assert_eq!(jobs[0].command, "cargo test --locked --bin zai");
+        assert_eq!(
+            jobs[0].command,
+            format!("{MISSING_PROGRAM} test --locked --bin zai")
+        );
     }
 
     #[test]
