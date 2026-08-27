@@ -396,6 +396,59 @@ pub struct CollectedResult {
     pub snapshotted: bool,
 }
 
+/// **未コミットの変更があれば断る** (P1-2)。
+///
+/// ## なぜ黙って進めてはいけないのか
+///
+/// リモートへ送るのは `HEAD` なので、作業ツリーの編集も新しいファイルも
+/// **1 バイトも向こうへ行かない**。それでも `zai cloud job run` は成功し、
+/// 結果も持ち帰れてしまうので、利用者は「いまの作業ツリーで走った」と読む。
+/// 実際に走ったのは**最後のコミット**で、両者が食い違ったことは
+/// どの出力にも現れない — 静かに違うものを測る、いちばん質の悪い形になる。
+///
+/// v1 では自動で snapshot を取らず、**明示的に止める**。
+///
+/// ## 何を dirty と数えるか
+///
+/// `git status --porcelain` の 1 行でも出れば dirty。追跡中の変更・
+/// index に載せた変更・追跡していないファイルのどれも含み、
+/// `.gitignore` されたものは含まない。
+///
+/// **`-uall` を明示する。** `status.showUntrackedFiles=no` は global にも
+/// 置けるので、既定に任せると「その利用者の手元でだけ追跡外が見えない」
+/// という形で穴が開く (この差は手元では再現しない)。
+pub fn ensure_clean_worktree(repo: &Path) -> Result<(), CloudError> {
+    let mut cmd = crate::procx::hidden_command("git");
+    cmd.arg("-C")
+        .arg(repo)
+        .args(["status", "--porcelain", "--untracked-files=all"]);
+    let out = cmd
+        .output()
+        .map_err(|e| CloudError::config(format!("git を起動できません: {e}")))?;
+    if !out.status.success() {
+        return Err(CloudError::config(format!(
+            "git status を実行できません: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let dirty: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    // **何が引っ掛かったかを見せる。** 直せない拒否は拒否として役に立たない。
+    let shown: Vec<&str> = dirty.iter().take(10).copied().collect();
+    let more = if dirty.len() > shown.len() {
+        format!("\n  … 他 {} 件", dirty.len() - shown.len())
+    } else {
+        String::new()
+    };
+    Err(CloudError::config(format!(
+        "未コミットの変更があります。cloud job run は現在 HEAD の内容のみを送信します。\n         変更を commit するか stash してから再実行してください。\n         {}{more}",
+        shown.join("\n  ")
+    )))
+}
+
 /// 手元の HEAD をリモートの bare リポジトリへ押し込み、worktree を作る。
 pub fn prepare(
     transport: &dyn ExecutionTransport,
@@ -412,6 +465,9 @@ pub fn prepare(
             "分離した作業場はリモート (SSH) の実行先にだけ作れます",
         ));
     }
+    // **リモートを 1 バイトも触る前に確かめる。** 送るのは HEAD だけなので、
+    // 作業ツリーが汚れていたら「送ったつもりのもの」と食い違う (P1-2)。
+    ensure_clean_worktree(local_repo)?;
     run_remote(
         transport,
         target,
@@ -1049,7 +1105,110 @@ mod live_git_tests {
         }
     }
 
-    /// リモート側で 1 コミット積む (エージェントの作業を模す)。
+    // ───── 作業ツリーが汚れていたら断る (P1-2) ─────    // ───── 作業ツリーが汚れていたら断る (P1-2) ─────
+
+    /// コミット 1 つだけの、きれいなリポジトリ。
+    fn clean_repo(tag: &str) -> PathBuf {
+        let root = crate::test_util::unique_temp_dir("zv-cloud", tag);
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).expect("作れる");
+        git_ok(&local, &["init", "-q", "-b", "main", "."]);
+        git_ok(&local, &["config", "user.name", "Test"]);
+        git_ok(&local, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(local.join("a.txt"), b"hello\n").expect("書ける");
+        git_ok(&local, &["add", "-A"]);
+        git_ok(&local, &["commit", "-q", "-m", "initial"]);
+        local
+    }
+
+    #[test]
+    fn clean_worktree_can_prepare() {
+        let repo = clean_repo("clean-worktree");
+        ensure_clean_worktree(&repo).expect("きれいなら通る");
+    }
+
+    /// **P1-2 の再現。** 追跡中のファイルを書き換えただけでは HEAD が動かない
+    /// ので、黙って進むと**最後のコミット**がリモートで走る。
+    #[test]
+    fn dirty_worktree_is_not_silently_ignored() {
+        let repo = clean_repo("dirty-worktree");
+        std::fs::write(repo.join("a.txt"), b"edited\n").expect("書ける");
+
+        let e = ensure_clean_worktree(&repo).expect_err("断る");
+        let text = format!("{e}");
+        assert!(text.contains("未コミットの変更があります"), "{text}");
+        assert!(
+            text.contains("HEAD の内容のみ"),
+            "何が起きるか言っていない: {text}"
+        );
+        assert!(
+            text.contains("a.txt"),
+            "何が引っ掛かったか言っていない: {text}"
+        );
+    }
+
+    #[test]
+    fn untracked_file_is_rejected() {
+        let repo = clean_repo("untracked");
+        std::fs::write(repo.join("new.rs"), b"fn main() {}\n").expect("書ける");
+        let e = ensure_clean_worktree(&repo).expect_err("断る");
+        assert!(format!("{e}").contains("new.rs"), "{e}");
+    }
+
+    #[test]
+    fn staged_change_is_rejected() {
+        let repo = clean_repo("staged");
+        std::fs::write(repo.join("b.txt"), b"staged\n").expect("書ける");
+        git_ok(&repo, &["add", "b.txt"]);
+        let e = ensure_clean_worktree(&repo).expect_err("断る");
+        assert!(format!("{e}").contains("b.txt"), "{e}");
+    }
+
+    /// **`.gitignore` されたものは汚れではない。** ここを含めると
+    /// `target/` を持つふつうのリポジトリが 1 つも通らなくなる。
+    #[test]
+    fn ignored_file_is_not_dirty() {
+        let repo = clean_repo("ignored");
+        std::fs::write(repo.join(".gitignore"), b"build/\n").expect("書ける");
+        git_ok(&repo, &["add", ".gitignore"]);
+        git_ok(&repo, &["commit", "-q", "-m", "ignore build"]);
+        std::fs::create_dir_all(repo.join("build")).expect("作れる");
+        std::fs::write(repo.join("build/out.bin"), b"x").expect("書ける");
+        ensure_clean_worktree(&repo).expect("無視されたものは汚れではない");
+    }
+
+    /// **リモートを 1 バイトも触る前に断る。** 先に bare リポジトリを作って
+    /// から断ると、失敗しただけなのに向こうへ物が残る。
+    #[test]
+    fn prepare_rejects_dirty_worktree_before_touching_remote() {
+        use crate::features::cloud_execution::test_support::{FakeTransport, TargetOpts};
+
+        let repo = clean_repo("prepare-order");
+        std::fs::write(repo.join("a.txt"), b"edited\n").expect("書ける");
+
+        let tr = FakeTransport::default();
+        let t =
+            crate::features::cloud_execution::test_support::target("dev", TargetOpts::default());
+        let ws = RemoteWorkspace::new("0123456789abcdef", "j-order").expect("組める");
+        let e = prepare(
+            &tr,
+            &t,
+            &repo,
+            &ws,
+            &SshOptions::default(),
+            Duration::from_secs(5),
+        )
+        .expect_err("断る");
+
+        assert!(format!("{e}").contains("未コミットの変更があります"), "{e}");
+        assert!(
+            tr.commands().is_empty(),
+            "リモートを触ってしまった: {:?}",
+            tr.commands()
+        );
+    }
+
+    /// リモート側で 1 コミット積む (エージェントの作業を模す)。    /// リモート側で 1 コミット積む (エージェントの作業を模す)。
     fn commit_in_work(lab: &Lab, file: &str, body: &str, msg: &str) -> String {
         std::fs::write(lab.work.join(file), body).expect("書ける");
         git_ok(&lab.work, &["add", "-A"]);
