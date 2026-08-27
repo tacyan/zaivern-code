@@ -64,6 +64,10 @@ use crate::feature::{Entry, Feature, Setting, SettingValue};
 // **宣言側のディレクトリ (`src/features/`) から**探される — 素直に
 // `pub mod model;` と書くと `src/features/model.rs` を探して E0583 で落ちる。
 // `agents.rs` の `#[path = "approvals.rs"]` と同じ流儀。
+#[path = "cloud_execution/command.rs"]
+pub mod command;
+#[path = "cloud_execution/git_workspace.rs"]
+pub mod git_workspace;
 #[path = "cloud_execution/model.rs"]
 pub mod model;
 #[path = "cloud_execution/provider/mod.rs"]
@@ -72,6 +76,8 @@ pub mod provider;
 pub mod redact;
 #[path = "cloud_execution/registry.rs"]
 pub mod registry;
+#[path = "cloud_execution/runner.rs"]
+pub mod runner;
 #[path = "cloud_execution/scheduler.rs"]
 pub mod scheduler;
 #[path = "cloud_execution/store.rs"]
