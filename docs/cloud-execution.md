@@ -176,18 +176,27 @@ A: VM を消す                ← 走っている仕事ごと消える
 | `stopped` | 配らない | 止まっている・消えた |
 | `unknown` / `provisioning` / `draining` / `failed` | 配らない | まだ確かめていない・抜けかけ・故障 |
 
-**落ちた仕事の枠は、次の起動で返る。** 枠を返すのは `SlotGuard` の Drop だが、
-`kill -9` / OOM Killer / 電源断では Drop が呼ばれず、台帳に「走っている 1 本」が
-残る。`registry::reconcile_active_jobs` が `Registry::load` のたびに 2 段で片付ける:
+**枠は数ではなく「誰が握っているか」で持つ** (`TargetCapacity::holders`)。
+数だと、増やす操作も減らす操作も冪等にならない — 落ちた仕事の後始末が
+「仕事の台帳を `failed` にする」→「実行先の台帳から 1 引く」の 2 段になると、
+あいだで止まったときに枠が永久に返らず、順序を逆にすると二重に返しうる。
+**2 つのファイルにまたがる限り、どちらかが必ず壊れる。**
 
-1. 仕事の台帳のロックの中で、**持ち主の PID がもう居ない**未完了の記録だけを
-   `failed` へ移す (`ExecutionJob::owner_pid`)
-2. 実行先の台帳のロックの中で、**その本数だけ引く**
+持ち主 (`SlotHolder { job, pid }`) で持てば、足すのも外すのも**何度やっても
+同じ**になる。判定に要るもの (仕事 ID と PID) が `targets.json` の中に揃うので、
+`registry::reconcile_active_jobs` は**そのファイルのロックの中だけ**で終わる:
 
-**引き算しかしない**のが要で、1 と 2 のあいだに別のプロセスが枠を取っても
-その枠は消えない。だから後始末が `max_jobs` を超えさせることも、生きている
-仕事の枠を奪うこともない。判定は PID の生存だけなので、PID が再利用された
-ときは枠が返らないが、再利用した側が終われば次の後始末で返る。
+* 途中で止まっても、次の実行が同じ判定をやり直すだけ
+* 何度実行しても結果が変わらない
+* `jobs.json` の履歴上限で記録が押し出されても、枠は迷子にならない
+
+`jobs.json` を `failed` にするのは履歴の見た目を合わせるだけで、枠の正しさは
+それに依存しない。後始末は `Registry::load` のたびに走る (台帳を読むだけ)。
+
+**判定は手元の PID の生存だけ。** PID が再利用されていればその回は枠が返らない
+(再利用した側が終われば返る)。そして**手元のプロセスが死んでも、リモートで
+走っているコマンドが止まったとは限らない** — 枠を返すのは「手元がもう見て
+いない」という意味で、「向こうが止まった」ではない。
 
 **枠を配るのは `ready` だけ。** Scheduler も同じ判定 (`lifecycle == Ready`) を
 するが、あちらが見るのは*選んだ瞬間の写し*でしかない。選んでから載せるまでの
@@ -195,6 +204,14 @@ A: VM を消す                ← 走っている仕事ごと消える
 **最後にもう一度、台帳ロックの中で確かめる**のが `claim_slot`。
 Scheduler は説明つきで「どれが良いか」を選ぶ純関数のまま、
 「いま本当に載せてよいか」の 1 点だけがロックの中にある。
+
+**古い写しで状態を上書きしない。** `probe` は「読む → ネットワークで確かめる
+(数秒) → 書き戻す」の形なので、そのあいだに入った `destroy` の予約を古い写しで
+消しうる (消えると新しい仕事が枠を取り、その VM ごと消える)。ロックを数秒
+握り続けるのは答えではないので、**読んだときの世代 (`ExecutionTarget::generation`)
+を書く瞬間にロックの中で照合する** (`registry::write_back_if_current`)。
+`probe` / `wait_ready` / `refresh_from` / `destroy` の結果書き戻しがすべて
+この規則を通る。削除中のものは、SSH に入れたというだけでは `ready` へ戻さない。
 
 **走っている仕事がある実行先は一覧から外せない** (`remove_target`)。外すと
 `SlotGuard` の返す先が消えて、記録だけが孤児になる。`destroy` と同じく、
@@ -386,12 +403,19 @@ global に置いている利用者でも穴が開かない)。黙って進むと
 1. `git push <ssh-url> HEAD:refs/zaivern/base/<job>` — 手元の HEAD を送る
 2. `git worktree add -B zai/cloud/<job> <job の置き場> refs/zaivern/base/<job>`
 3. リモートでコマンド／エージェントが走る (**仕事ごとに別の worktree**)
-4. 終わったら `git status --porcelain` を見て、未コミットがあれば
+4. 終わったら `git status --porcelain --untracked-files=all` を見て、未コミットがあれば
    **輸送用コミット**を作る (`zaivern: snapshot cloud job <job>`)
+   (**`--untracked-files=all` はリモート側でも必須**。`status.showUntrackedFiles=no`
+   が置かれていると、新しく作ったファイルだけの成果が「変更なし」になり、
+   古い HEAD を固定して持ち帰り、OID の照合も通って片付けまで進む —
+   成果物が消えるのにエラーが 1 行も出ない。判定に使う `git` の失敗も
+   「変更なし」に化けさせない)
 5. **そのときの `HEAD` を、リモート側の動かない参照へ固定する**
    (`refs/zaivern/result/<job>`)
 6. 手元へ `git fetch <ssh-url> +refs/zaivern/result/<job>:refs/remotes/zaivern-cloud/<job>`
 7. **リモートで確定した OID と、手元に届いた OID が一致することを確かめる**
+   (OID の一致は「届いたものが同じ」の証明であって、「必要な変更をすべて
+   snapshot できた」の証明ではない。だから 4 の判定も別に守る)
 8. **一致したときだけ** worktree を片付ける
 
 ### なぜ枝ではなく参照へ固定するのか
@@ -425,6 +449,10 @@ git diff HEAD..refs/remotes/zaivern-cloud/<job>
 
 **結果を持ち帰れなかったら worktree を消さない。** ディスクの節約より
 データを失わないほうが大事。
+
+`cleanup` は回収の証拠 (`CollectedResult` の OID と仕事 ID) を**引数で要求する**。
+「呼ぶ前に確かめる」を約束にすると、経路が増えた日に守られない側が必ず出る
+(以前は `debug_assert!` だったので、出荷ビルドでは何も見ていなかった)。
 
 ---
 
@@ -463,7 +491,7 @@ pub fn select_target(
 
 1. `lifecycle == Ready`
 2. 能力を満たす (OS / arch / CPU / メモリ / GPU / 道具 / 札)
-3. 空き枠がある (`active_jobs < max_jobs`) — **手元 (`local`) も数える。
+3. 空き枠がある (`holders.len() < max_jobs`) — **手元 (`local`) も数える。
    上限は `default_max_jobs`**
 4. 利用者が名指しした実行先
 5. ローカル / リモートの好み
@@ -505,6 +533,27 @@ zai cloud launch --target dev-01 --command "<エージェントの起動行>" --
 貼れば、**既存の PTY セッションと Supervisor がそのまま見張る**。
 Cloud 専用の端末パーサも、第 2 の Agent 状態機械も作らない
 (Cloud が持つのは `ExecutionJobState` = 基盤の状態だけ)。
+
+**返るのは `zai cloud launch --run` を経由する行**で、素の `ssh …` ではない。
+素の行を貼ると、貼った先で**枠 (`max_jobs`) も仕事の記録も通らない** —
+上限を超えて起動でき、走っているのに `worker destroy` が通ってしまう。
+中で組む ssh の引数は 1 バイトも変わらない (通る門が増えるだけ)。
+素の行が見たいときは `--print-ssh` (診断用。枠を通らないと明示して出す)。
+
+### 枠 (`max_jobs`) を数える入口
+
+| 入口 | 枠 | なぜ |
+|---|---|---|
+| `zai cloud exec` | **数える** | 仕事 1 本 |
+| `zai cloud job run` | **数える** | 仕事 1 本 |
+| `zai cloud launch --run` | **数える** | エージェント 1 本が走り続ける |
+| `zai cloud launch` (表示だけ) | 数えない | まだ何も起こしていない |
+| `zai cloud shell` | 数えない | 人が入るためのもの。**詰まっているときこそ入りたい** |
+| `zai cloud copy` | 数えない | ファイル 1 つの送受信で、仕事ではない |
+
+数える入口は `runner::run` (出力を流す) と `runner::run_attached`
+(標準入出力を引き継ぐ) の 2 つに閉じてある。枠を取る・記録する・返すは
+その 2 か所だけで、入口が増えても取り忘れが起きない形にしてある。
 
 ### Context Engine
 
