@@ -1053,6 +1053,14 @@ mod tests {
     #[test]
     fn 実のsshが接続の作法を受け付ける() {
         let Some(version) = ssh_version() else {
+            // **CI では降りることを許さない。** `[skip]` は緑ではない —
+            // 許すと「Windows で確かめられた」のか「ssh が無くて飛ばした」のか
+            // 区別が付かないまま緑になる (この検査の存在意義が消える)。
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI に ssh が無い。実オプションの検査ができていないので、\
+                 緑にしてはいけない"
+            );
             eprintln!(
                 "[skip] ssh が見つからないので、実オプションの検査はできません \
                  (OpenSSH クライアントを入れると走ります)"
