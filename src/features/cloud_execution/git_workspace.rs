@@ -146,13 +146,45 @@ pub fn git_ssh_command(target: &ExecutionTarget, opts: &SshOptions) -> Result<St
 
 /// リモート側で bare リポジトリを用意する sh の断片。
 ///
-/// **何度呼んでも同じ結果になる** (すでに在れば何もしない) ので、
-/// 仕事のたびに気にせず呼べる。
+/// **何度呼んでも同じ結果になる**うえ、**同時に呼ばれても壊れない**。
+///
+/// ## なぜ鍵が要るのか (実測)
+///
+/// 最初の版は `git init --bare` と `git config` を毎回撃っていた。1 本ずつなら
+/// 通るが、**4 本を同時に走らせた実測で 1 本が落ちた**:
+///
+/// ```text
+/// error: could not lock config file config: File exists
+/// ```
+///
+/// git の config はファイルロックで直列化されるので、同じ瞬間に 2 つが
+/// 触ると片方が必ず負ける。しかもこれは**いちばん混んでいるとき = 並列で
+/// 走らせたいとき**にだけ出るので、1 本での試験では永久に見つからない。
+///
+/// `mkdir` は POSIX で原子的なので、それを鍵にして用意を 1 本へ絞る。
+/// すでに在れば鍵も取らずに帰る (ふつうの経路では待ちが 0)。
 pub fn init_bare_script(repo: &RemotePath) -> String {
     let q = quote_home(repo);
+    // 待ちの上限。`N 体が順に通るには N·t 要る`ので、64 体でも通る幅を取る
+    // (用意は 1 度きりなので、待つのは最初の 1 回だけ)。
     format!(
-        "set -e; mkdir -p {q}; if [ ! -d {q}/objects ]; then git init --bare -q {q}; fi; \
-         git -C {q} config receive.denyCurrentBranch ignore"
+        "set -e; \
+         if [ -d {q}/objects ]; then exit 0; fi; \
+         mkdir -p \"$(dirname {q})\"; \
+         lock={q}.lock; i=0; \
+         while ! mkdir \"$lock\" 2>/dev/null; do \
+           i=$((i+1)); \
+           if [ \"$i\" -gt 300 ]; then \
+             echo \"zv_error=リポジトリの用意が終わりません ($lock を消してください)\" >&2; exit 1; \
+           fi; \
+           sleep 0.1 2>/dev/null || sleep 1; \
+           if [ -d {q}/objects ]; then exit 0; fi; \
+         done; \
+         trap 'rmdir \"$lock\" 2>/dev/null || true' EXIT INT TERM; \
+         if [ ! -d {q}/objects ]; then \
+           git init --bare -q {q}; \
+           git -C {q} config receive.denyCurrentBranch ignore; \
+         fi"
     )
 }
 
@@ -542,6 +574,30 @@ mod tests {
         assert!(s.contains("~/'.zaivern/cloud/repos/0123456789abcdef.git'"), "{s}");
         // 何度呼んでも同じ結果になる形か
         assert!(s.contains("if [ ! -d"), "{s}");
+    }
+
+    /// **同時に用意されても壊れないこと**を、断片の形で固定する。
+    ///
+    /// 実測で 4 本中 1 本が `could not lock config file` で落ちた。
+    /// 1 本ずつの試験では永久に見つからない類の壊れ方なので、
+    /// 「鍵を取ってから触る」を構造として固定する。
+    #[test]
+    fn 用意は同時に呼ばれても壊れない() {
+        let s = init_bare_script(&bare_repo(KEY).expect("組める"));
+        // すでに在れば鍵も取らずに帰る (ふつうの経路で待たない)
+        assert!(s.contains("if [ -d") && s.contains("exit 0"), "{s}");
+        // 鍵は mkdir (POSIX で原子的)。`test -d` + `mkdir` に割ると競れる
+        assert!(s.contains("mkdir \"$lock\""), "{s}");
+        // **git を触るのは鍵を取った後だけ**
+        let at_lock = s.find("mkdir \"$lock\"").expect("鍵がある");
+        let at_init = s.find("git init --bare").expect("init がある");
+        assert!(at_lock < at_init, "鍵より先に git を触っている:\n{s}");
+        let at_config = s.find("git -C").expect("config がある");
+        assert!(at_lock < at_config, "鍵より先に config を触っている:\n{s}");
+        // 鍵は必ず外す (落ちても外れる)
+        assert!(s.contains("trap") && s.contains("rmdir"), "{s}");
+        // **永久には待たない**
+        assert!(s.contains("-gt 300"), "待ちに上限が無い:\n{s}");
     }
 
     #[test]

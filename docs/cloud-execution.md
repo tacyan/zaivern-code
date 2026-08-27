@@ -82,9 +82,23 @@ zai cloud target add ssh \
   --port 22 \
   --max-jobs 4
 
-zai cloud target probe dev-01     # 届くか・何者かを確かめる
+zai cloud target trust dev-01        # 相手の鍵の指紋を見る (まだ記録しない)
+zai cloud target trust dev-01 --yes  # 見比べて同じなら記録する
+zai cloud target probe dev-01        # 届くか・何者かを確かめる
 zai cloud exec --target dev-01 -- uname -a
 ```
+
+### なぜ `trust` が要るのか
+
+最初の接続では**必ず**「この鍵を知らない」になる。ここで自動的に受け入れる
+(`StrictHostKeyChecking=accept-new`) と、**その 1 回だけは中間者を検出できない**。
+かといって何も用意しないと、登録した実行先へ永久に繋がらない
+(実際に最初の版がそうなっていて、実機で確かめて分かった)。
+
+だから 3 段にする: **取ってくる → 指紋を見せる → 人が同意したら記録する**。
+`--yes` が無ければ見せるだけで止まる。すでに**違う鍵**を記録している相手は
+黙って上書きせず、断る (機械を作り直したのでなければ、中間者攻撃と区別が
+付かないため)。
 
 `probe` は `uname` / CPU / メモリ / ディスク / シェル / 道具 (`git` 等) を
 読んで台帳へ書き戻す。**`probe` が通るまで実行先は `Ready` にならない** ので、
@@ -386,6 +400,7 @@ Execution Provider を独立に交換できる。
 | 症状 | 見るところ |
 |---|---|
 | `zai cloud target list` に何も出ない | `local` は必ず 1 行出る。出ないなら置き場 (`zai cloud doctor`) |
+| `probe` が「この相手の鍵をまだ知りません」 | 最初の接続では必ずこうなる。`zai cloud target trust <名前>` で指紋を見て、合っていれば `--yes` で記録する |
 | `probe` が「ホスト鍵が既知のものと違います」 | 作り直した機械なら `~/.zaivern/cloud/known_hosts` の該当行を消す。**心当たりが無ければ繋がない** |
 | `probe` が「鍵で認証できませんでした」 | `ssh-agent` に鍵があるか、`--identity-file` を指定したか |
 | `exec` が「条件に合う実行先がありません」 | 出力に実行先ごとの理由が出る。`まだ届くことを確かめていません` なら `probe` |

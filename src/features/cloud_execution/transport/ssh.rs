@@ -511,10 +511,170 @@ impl ExecutionTransport for SshTransport {
     }
 }
 
+// ───────────────────────── known_hosts ─────────────────────────
+
+/// known_hosts の中で、その接続先を指す綴り。
+///
+/// **22 番以外は `[host]:port`** という OpenSSH の綴り方に合わせる
+/// (合わせないと、記録したのに「知らない鍵」と言われる)。
+pub fn known_hosts_pattern(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// 相手が名乗っている公開鍵を取ってくる (`ssh-keyscan`)。
+///
+/// **これは「信用する」ことではない。** 取ってきた鍵の指紋を人に見せて、
+/// 相手が示しているものと同じかを確かめてもらうための材料。
+pub fn scan_host_keys(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<Vec<String>, CloudError> {
+    validate_host(host)?;
+    let mut cmd = crate::procx::hidden_command("ssh-keyscan");
+    cmd.arg("-T")
+        .arg(timeout.as_secs().clamp(1, 60).to_string())
+        .arg("-p")
+        .arg(port.to_string())
+        // **`--` で以降を引数として固定する** (`-` で始まるホスト名は
+        // validate_host が既に断っているが、二重に守る)
+        .arg("--")
+        .arg(host);
+    let out = cmd.output().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CloudError::config("ssh-keyscan が見つかりません (openssh-client が要ります)")
+        } else {
+            CloudError::io(format!("ssh-keyscan を起動できません: {e}"))
+        }
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let keys: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    if keys.is_empty() {
+        return Err(CloudError::transport(format!(
+            "{host}:{port} から公開鍵を取れませんでした: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(keys)
+}
+
+/// 取ってきた鍵の指紋を人が読める形にする (`ssh-keygen -lf`)。
+///
+/// 取れなければ**空を返す** — 指紋が出せないことと、鍵が取れないことは別。
+pub fn fingerprints(entries: &[String], scratch_dir: &Path) -> Vec<String> {
+    let file = scratch_dir.join(format!(".keyscan-{}.tmp", std::process::id()));
+    if std::fs::create_dir_all(scratch_dir).is_err()
+        || std::fs::write(&file, entries.join("
+") + "
+").is_err()
+    {
+        return Vec::new();
+    }
+    let out = crate::procx::hidden_command("ssh-keygen")
+        .arg("-lf")
+        .arg(&file)
+        .output();
+    let _ = std::fs::remove_file(&file);
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// known_hosts の 1 行を `(接続先, 種別, 鍵)` へ割る。
+fn split_entry(line: &str) -> Option<(&str, &str, &str)> {
+    let mut it = line.split_whitespace();
+    Some((it.next()?, it.next()?, it.next()?))
+}
+
+/// **すでに別の鍵を記録している接続先か。** 記録済みの行を返す。
+///
+/// これが `Some` のときに黙って上書きすると、**中間者攻撃をそのまま通す**。
+/// 純関数にしてあるので、実際の鍵を用意せずに表で固定できる。
+pub fn conflicting_entry(existing: &str, pattern: &str, new_entries: &[String]) -> Option<String> {
+    for line in existing.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((host, kind, key)) = split_entry(line) else {
+            continue;
+        };
+        if host != pattern {
+            continue;
+        }
+        // 同じ種別の鍵が、違う中身で記録されている
+        let same_kind_differs = new_entries.iter().any(|e| {
+            split_entry(e)
+                .map(|(_, k2, key2)| k2 == kind && key2 != key)
+                .unwrap_or(false)
+        });
+        if same_kind_differs {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
+/// すでに 1 バイト違わず記録されている行を除く。
+pub fn new_entries_only(existing: &str, entries: &[String]) -> Vec<String> {
+    let known: Vec<&str> = existing.lines().map(str::trim).collect();
+    entries
+        .iter()
+        .filter(|e| !known.contains(&e.trim()))
+        .cloned()
+        .collect()
+}
+
+/// known_hosts へ書き足す。**追記した件数**を返す。
+pub fn append_known_hosts(path: &Path, entries: &[String]) -> Result<usize, CloudError> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let fresh = new_entries_only(&existing, entries);
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+    let mut body = existing;
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    for e in &fresh {
+        body.push_str(e.trim());
+        body.push('\n');
+    }
+    // **書きかけを残さない** (store と同じ tmp → rename)
+    crate::features::cloud_execution::store::write_atomic(path, body.as_bytes())?;
+    Ok(fresh.len())
+}
+
 /// `ssh` の失敗を、利用者が次に打つ手が分かる形へ言い換える。
 fn ssh_failure_hint(exit: Option<i32>, stderr: &str) -> String {
     let e = crate::features::cloud_execution::redact::redact(stderr.trim());
     let low = e.to_lowercase();
+    // **「まだ知らない」と「違う鍵だった」を混ぜない。** 前者は最初の 1 回に
+    // 必ず起きる普通のことで、後者は中間者攻撃と区別が付かない事態である。
+    // 同じ文面にすると、利用者は毎回の手順として鍵を消すようになる。
+    if low.contains("no ") && low.contains("host key is known") {
+        return format!(
+            "この相手の鍵をまだ知りません (最初の接続では必ずこうなります)。\n\
+             相手が示している指紋と見比べてから記録してください:\n\
+             \x20 zai cloud target trust <名前>        指紋を表示する\n\
+             \x20 zai cloud target trust <名前> --yes  記録する\n{e}"
+        );
+    }
     if low.contains("host key verification failed") || low.contains("remote host identification") {
         return format!(
             "ホスト鍵が既知のものと違います。中間者攻撃の可能性があるため接続しません。\n\

@@ -42,6 +42,8 @@ cloud (クラウド実行 — どのマシン・どのクラウドでも同じ�
                  [--port N] [--identity-file <パス>] [--max-jobs N]
                                         SSH で入れる Linux を実行先として登録
   zai cloud target probe <名前>          届くか・何者かを確かめて台帳を更新
+  zai cloud target trust <名前> [--yes]  相手の公開鍵の指紋を見せ、--yes で記録する
+                                        (最初の接続の前に 1 度だけ必要です)
   zai cloud target remove <名前>         一覧から外す (機械には触りません)
   zai cloud exec --target <名前|auto> -- <コマンド...>
                                         実行先でコマンドを 1 回走らせる
@@ -432,6 +434,7 @@ fn target_cmd(args: &[String]) -> Result<String, Fail> {
         "add" => target_add(rest),
         "probe" => target_probe(rest),
         "remove" | "rm" => target_remove(rest),
+        "trust" => target_trust(rest),
         other => Err(Fail::Usage(format!("知らない操作です: target {other}"))),
     }
 }
@@ -514,9 +517,12 @@ fn target_add(args: &[String]) -> Result<String, Fail> {
     reg.add_target(target.clone())?;
     Ok(format!(
         "実行先 {} を登録しました ({})。\n\
-         届くことを確かめるには: zai cloud target probe {}",
+         次にすること:\n\
+         \x20 1. zai cloud target trust {}        相手の鍵の指紋を見て記録する\n\
+         \x20 2. zai cloud target probe {}        届くことを確かめる",
         target.name,
         target.endpoint.summary(),
+        target.name,
         target.name
     ))
 }
@@ -573,6 +579,86 @@ fn target_remove(args: &[String]) -> Result<String, Fail> {
         "{} を一覧から外しました (機械には触っていません)",
         t.name
     ))
+}
+
+/// `zai cloud target trust <名前> [--yes]` — 相手の公開鍵を記録する。
+///
+/// ## なぜ `accept-new` を既定にしないのか
+///
+/// 最初の接続では**必ず**「この鍵を知らない」になる。ここで自動的に受け入れる
+/// (`StrictHostKeyChecking=accept-new`) と、**その 1 回だけは中間者を検出できない**。
+/// 一方で何の手段も用意しないと、`zai cloud target add ssh` した実行先へ
+/// 永久に繋がらない (実際に最初の版がそうなっていた)。
+///
+/// だから「取ってきて、指紋を見せて、人が同意したら記録する」の 3 段にする。
+/// `--yes` が無ければ**記録しない** — 見せるだけで止まる。
+fn target_trust(args: &[String]) -> Result<String, Fail> {
+    use super::transport::ssh;
+
+    let name = positional(args)
+        .ok_or_else(|| Fail::Usage("zai cloud target trust <名前> [--yes]".into()))?;
+    let reg = registry()?;
+    let target = reg.find(&name)?;
+    let super::model::TargetEndpoint::Ssh { host, port, .. } = &target.endpoint else {
+        return Err(Fail::Usage(
+            "手元の実行先にホスト鍵はありません".into(),
+        ));
+    };
+
+    let entries = ssh::scan_host_keys(host, *port, reg.ssh_timeout())?;
+    let dir = store::ensure_dir()?;
+    let path = store::known_hosts_path();
+    let pattern = ssh::known_hosts_pattern(host, *port);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // **すでに別の鍵を記録している相手は、黙って上書きしない。**
+    // ここで上書きすると、中間者攻撃をそのまま通すことになる。
+    if let Some(old) = ssh::conflicting_entry(&existing, &pattern, &entries) {
+        let kind = old.split_whitespace().nth(1).unwrap_or("?");
+        return Err(Fail::Cloud(CloudError::security(format!(
+            "{name} には、いまと違う {kind} の鍵がすでに記録されています。
+             機械を作り直したのでなければ、**中間者攻撃と区別が付きません**。
+             作り直したと確信できる場合だけ、{} の {pattern} の行を手で消してから
+             もう一度 trust してください",
+            path.display()
+        ))));
+    }
+
+    let prints = ssh::fingerprints(&entries, &dir);
+    let mut out = format!("{name} ({host}:{port}) が名乗っている鍵:\n");
+    if prints.is_empty() {
+        for e in &entries {
+            let kind = e.split_whitespace().nth(1).unwrap_or("?");
+            out.push_str(&format!("  {kind}\n"));
+        }
+        out.push_str("  (指紋は ssh-keygen が無いため出せません)\n");
+    } else {
+        for p in &prints {
+            out.push_str(&format!("  {p}\n"));
+        }
+    }
+
+    if !flag(args, "--yes") {
+        out.push_str(&format!(
+            "\nこの指紋が、相手 (VPS の管理画面やコンソール) の示すものと\n\
+             同じかを確かめてください。同じなら記録します:\n\
+             \x20 zai cloud target trust {name} --yes"
+        ));
+        return Ok(out);
+    }
+
+    let added = ssh::append_known_hosts(&path, &entries)?;
+    if added == 0 {
+        out.push_str("\nすでに記録済みでした (変更なし)");
+    } else {
+        out.push_str(&format!(
+            "\n{added} 件を {} へ記録しました。\n\
+             これ以降は厳密に照合します — 鍵が変わったら接続を断ります。\n\n\
+             届くことを確かめる: zai cloud target probe {name}",
+            path.display()
+        ));
+    }
+    Ok(out)
 }
 
 // ───────────────────────── exec / shell ─────────────────────────
@@ -848,8 +934,19 @@ fn job_list(args: &[String]) -> Result<String, Fail> {
         .unwrap_or(20);
     let jobs = runner::recent_jobs(limit)?;
     if flag(args, "--json") {
+        // 機械が読む側は **ID のまま** (名前は変わりうる)
         return Ok(serde_json::to_string_pretty(&jobs).unwrap_or_default());
     }
+    // **人が読む側は名前で出す。** 記録が持つのは ID (名前を変えても
+    // 同一性が続く) だが、一覧に生の ID が並んでもどれのことか分からない。
+    let names: std::collections::BTreeMap<String, String> = registry()
+        .and_then(|r| r.targets())
+        .map(|ts| {
+            ts.into_iter()
+                .map(|t| (t.id.as_str().to_string(), t.name))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out = format!(
         "{:<20} {:<12} {:<10} {:<6} {}\n",
         "ID", "実行先", "状態", "終了", "コマンド"
@@ -858,7 +955,11 @@ fn job_list(args: &[String]) -> Result<String, Fail> {
         out.push_str(&format!(
             "{:<20} {:<12} {:<10} {:<6} {}\n",
             j.id.as_str(),
-            j.target.as_str(),
+            names
+                .get(j.target.as_str())
+                .map(String::as_str)
+                // 一覧から外された実行先の仕事も残るので、そのときは ID を出す
+                .unwrap_or_else(|| j.target.as_str()),
             j.state.id(),
             j.exit_code
                 .map(|c| c.to_string())
@@ -1481,6 +1582,7 @@ mod tests {
             "zai cloud target list",
             "zai cloud target add ssh",
             "zai cloud target probe",
+            "zai cloud target trust",
             "zai cloud target remove",
             "zai cloud exec",
             "zai cloud shell",
