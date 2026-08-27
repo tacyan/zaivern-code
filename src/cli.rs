@@ -236,6 +236,9 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             | "merge-driver"
             // AI へ渡す前に情報量を減らす共通基盤 (どのエージェントでも同じ)
             | "context"
+            // 計算資源を差し替え可能にする実行層 (手元 / SSH / クラウド)。
+            // **門に足し忘れると `zai cloud doctor` が GUI の窓を開く**
+            | "cloud"
             | "update"
             | "uninstall"
             | "help"
@@ -264,6 +267,7 @@ fn yields_to_directory(word: &str) -> bool {
             | "train"
             | "split"
             | "context"
+            | "cloud"
             | "help"
     )
 }
@@ -274,7 +278,7 @@ fn yields_to_directory(word: &str) -> bool {
 pub fn help_text() -> String {
     format!(
         "{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n\
-         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
+         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_CLOUD}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
     )
 }
 
@@ -398,6 +402,10 @@ pub const HELP_GUARD: &str = crate::features::guard::HELP;
 /// `zai context --help` のセクション。実体は `src/context/cli.rs`
 /// (写経すると必ず食い違う。`HELP_GUARD` と同じ方針)。
 pub const HELP_CONTEXT: &str = crate::features::context::HELP;
+
+/// `zai cloud --help` のセクション。実体は
+/// `src/features/cloud_execution/cli.rs` (`HELP_GUARD` と同じ方針)。
+pub const HELP_CLOUD: &str = crate::features::cloud_execution::HELP;
 
 /// 競合ゼロの導入・証明・プロセスメッシュ・交渉。
 ///
@@ -554,6 +562,8 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "merge-driver" => crate::features::union::cli_main(rest),
         // AI へ渡す前の情報量最適化。実体は src/context/。
         "context" => crate::features::context::cli_main(rest),
+        // 計算資源の差し替え。実体は src/features/cloud_execution/。
+        "cloud" => crate::features::cloud_execution::cli_main(rest),
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
         "status" if status_list_mode(rest).is_some() => run_status_list(
@@ -3693,6 +3703,7 @@ mod tests {
             "czero",
             "merge-driver",
             "context",
+            "cloud",
             "update",
             "uninstall",
             "i18n",
@@ -3726,6 +3737,7 @@ mod tests {
             HELP_CZERO,
             HELP_TRAIN_SPLIT,
             HELP_CONTEXT,
+            HELP_CLOUD,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {

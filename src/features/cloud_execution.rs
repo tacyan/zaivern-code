@@ -64,12 +64,16 @@ use crate::feature::{Entry, Feature, Setting, SettingValue};
 // **宣言側のディレクトリ (`src/features/`) から**探される — 素直に
 // `pub mod model;` と書くと `src/features/model.rs` を探して E0583 で落ちる。
 // `agents.rs` の `#[path = "approvals.rs"]` と同じ流儀。
+#[path = "cloud_execution/cli.rs"]
+pub mod cli;
 #[path = "cloud_execution/command.rs"]
 pub mod command;
 #[path = "cloud_execution/git_workspace.rs"]
 pub mod git_workspace;
 #[path = "cloud_execution/model.rs"]
 pub mod model;
+#[path = "cloud_execution/panel.rs"]
+pub mod panel;
 #[path = "cloud_execution/provider/mod.rs"]
 pub mod provider;
 #[path = "cloud_execution/redact.rs"]
@@ -89,9 +93,7 @@ pub mod transport;
 #[path = "cloud_execution/test_support.rs"]
 pub mod test_support;
 
-// **平らに出すのは、この層の外が名前で呼ぶものだけ。** 使われていない
-// 再エクスポートを並べると「繋がっている」という嘘になる — 中の型は
-// `crate::features::cloud_execution::model::…` で届く。
+pub use cli::{cli_main, HELP};
 // **平らに出すのは、この層の外 (`src/cli.rs` / 将来の Orchestrator) が
 // 名前で呼ぶものだけ。** 使われていない再エクスポートを並べると
 // 「繋がっている」という嘘になる — 中の型は `crate::features::cloud_execution::model::…`
@@ -111,10 +113,19 @@ pub const KEY_DEFAULT_MAX_JOBS: &str = "cloud_execution.default_max_jobs";
 /// **実体は `panel.rs` / `cli.rs` にある。** ここは登録だけ。
 pub const FEATURE: Feature = Feature {
     module: "cloud_execution",
-    // **まだパレットには出さない。** 開く窓 (`panel.rs`) と CLI (`cli.rs`) が
-    // 入るまでは、押せる入口を作らない — 押しても何も起きない行は
-    // 「繋がっている」という嘘になる。
-    entries: &[],
+    entries: &[Entry {
+        icon: "☁",
+        label: "クラウド実行",
+        id: "cloud_execution.panel",
+    }],
+    dispatch: |_app, ctx, id| match id {
+        "cloud_execution.panel" => {
+            panel::open(ctx.clone());
+            true
+        }
+        _ => false,
+    },
+    draw: Some(panel::draw),
     settings: &[
         Setting {
             key: KEY_PREFER,
