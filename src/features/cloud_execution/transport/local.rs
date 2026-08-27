@@ -229,13 +229,32 @@ mod tests {
         std::fs::write(&src, b"hello").expect("書ける");
         let dst = dir.join("sub").join("b.txt");
         let t = ExecutionTarget::local(1);
-        let remote = RemotePath::new(dst.to_string_lossy().replace('\\', "/"))
-            .or_else(|_| RemotePath::new(format!("/{}", dst.display())))
-            .expect("作れる");
-        // Windows のパスは RemotePath の形に合わないので、その場合は飛ばす
-        if !cfg!(windows) {
-            transport().upload(&t, &src, &remote).expect("送れる");
-            assert_eq!(std::fs::read(&dst).expect("読める"), b"hello");
-        }
+
+        // [`RemotePath`] は POSIX の形しか受けない。Windows の一時パスは
+        // `C:\…` なのでその形にならず、**断られるのが正しい挙動**である
+        // (リモートへ `C:\…` を送ろうとするのを型で止めるための欄なので)。
+        //
+        // **`expect` を条件分岐より先に書かないこと。** 最初の版はそうなって
+        // いて、`cfg!(windows)` で飛ばすつもりの行が飛ばす前に panic した
+        // — macOS / Linux では永久に緑で、**Windows の CI だけが赤**になった。
+        let Ok(remote) = RemotePath::new(dst.to_string_lossy().replace('\\', "/")) else {
+            assert!(
+                cfg!(windows),
+                "POSIX のパスが断られた: {}",
+                dst.display()
+            );
+            // Windows でも「断ること」は確かめる (空振りする試験にしない)
+            assert!(RemotePath::new("C:/work/x.txt").is_err());
+            assert!(RemotePath::new("C:\\work\\x.txt").is_err());
+            return;
+        };
+
+        transport().upload(&t, &src, &remote).expect("送れる");
+        assert_eq!(std::fs::read(&dst).expect("読める"), b"hello");
+
+        // 受け取る側も同じ道を通る
+        let back = dir.join("back.txt");
+        transport().download(&t, &remote, &back).expect("受け取れる");
+        assert_eq!(std::fs::read(&back).expect("読める"), b"hello");
     }
 }
