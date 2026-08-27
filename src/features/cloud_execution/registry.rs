@@ -84,9 +84,22 @@ impl Registry {
     /// Provider API は呼ばない (一覧を出すたびにネットワークを叩くと、
     /// 電波の無いところで `zai cloud target list` が固まる)。
     /// Provider へ問い合わせたいときは [`Registry::refresh_from`] を明示的に呼ぶ。
+    /// **手元の枠だけは台帳から引き継ぐ。** 手元の実行先そのものは設定
+    /// (`default_max_jobs`) から毎回組み直すが、*いま何本走っているか*は
+    /// ロックの中で数えている値 ([`claim_local_slot`]) が正しい。
     pub fn targets(&self) -> Result<Vec<ExecutionTarget>, CloudError> {
-        let mut out = vec![ExecutionTarget::local(self.ctx.local_max_jobs)];
-        out.extend(store::load_targets()?);
+        let stored = store::load_targets()?;
+        let mut local = ExecutionTarget::local(self.ctx.local_max_jobs);
+        if let Some(s) = stored.iter().find(|t| t.id == local.id) {
+            local.capacity.active_jobs = s.capacity.active_jobs;
+        }
+        let mut out = vec![local];
+        // 台帳側の手元の行は**枠を数えるためだけ**に在るので、一覧では出さない
+        out.extend(
+            stored
+                .into_iter()
+                .filter(|t| t.transport != super::model::TransportKind::Local),
+        );
         Ok(out)
     }
 
@@ -420,30 +433,82 @@ pub fn apply_probe(target: &ExecutionTarget, probe: &ProbeResult) -> ExecutionTa
 ///
 /// ロックの中で確かめてから足すので、同時に呼ばれても上限を超えない。
 ///
-/// ## 呼び出し側の写しを信じない
+/// ## ここが「載せる」の最終確定点
+///
+/// Scheduler は**選ぶだけ**で、選んだ瞬間の写ししか見ていない。選んでから
+/// ここへ来るまでに実行先は準備中へ戻ることも、抜け始めることも、壊れることも
+/// ある (`probe` / `refresh` / `destroy` が別のスレッド・別のプロセスから
+/// 書き換える)。だから**確定させるのはここだけ**にして、
+/// [`TargetLifecycle::Ready`] **でなければ配らない**。
 ///
 /// 判定に使うのは**そのとき台帳に書いてあるもの**だけ。呼び出し側が
 /// 古い [`ExecutionTarget`] を握っていても、ここで読み直すので
 /// 「消えかけの実行先へ仕事を載せる」が起こらない
 /// ([`Registry::destroy`] の予約と同じロックを通る)。
+///
+/// Scheduler 側の判定 ([`super::scheduler::evaluate`]) を消すわけではない —
+/// あちらは「どれが良いか」を説明つきで選ぶための純関数で、こちらは
+/// 「いま本当に載せてよいか」の 1 点確認。**同じ規則を 2 度書くのではなく、
+/// 最後の 1 回だけがロックの中にある**という関係になっている。
 pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
     store::with_targets(|list| {
         let Some(t) = list.iter_mut().find(|t| &t.id == id) else {
             return Err(CloudError::config(format!("実行先 {id} が見つかりません")));
         };
-        // **消えかけ / 消えた実行先には枠を配らない。**
-        if t.lifecycle.blocks_new_jobs() {
+        // **Ready 以外へは配らない。** 消えかけ (`destroying`) も、
+        // まだ出来ていないもの (`provisioning` / `unknown`) も、抜けかけ
+        // (`draining`) も、壊れたもの (`failed`) も同じ扱いにする。
+        if t.lifecycle != TargetLifecycle::Ready {
+            let note = if t.note.is_empty() {
+                "zai cloud target probe で確かめ直してください".to_string()
+            } else {
+                t.note.clone()
+            };
             return Err(CloudError::no_capacity(format!(
-                "{} は {} なので新しい仕事を載せません ({})",
+                "{} は {} なので新しい仕事を載せません ({note})",
                 t.name,
                 t.lifecycle.id(),
-                t.note
             )));
         }
         if !t.capacity.has_room() {
             return Err(CloudError::no_capacity(format!(
                 "{} はすでに {} 本を実行中です (max_jobs = {})",
                 t.name, t.capacity.active_jobs, t.capacity.max_jobs
+            )));
+        }
+        t.capacity.active_jobs += 1;
+        Ok(())
+    })?
+}
+
+/// 手元の枠を 1 つ取る。**手元にも上限がある** (§31 の `default_max_jobs`)。
+///
+/// ## なぜ台帳の中で数えるのか
+///
+/// 手元の実行先は設定から組み直すので台帳には載っていない。だが枠の数え上げ
+/// だけは**プロセスをまたいで**合っていないと意味がない — `zai cloud exec` を
+/// 2 つの端末から叩けば、それは 2 つのプロセスである。数を覚える場所を新しく
+/// 作る (DB / 常駐) のではなく、**すでにロックのある台帳**へ手元の行を
+/// 1 つ置いて、遠隔の実行先とまったく同じ道 ([`store::with_targets`]) を通す。
+///
+/// 台帳の行が持つ意味は `capacity.active_jobs` **だけ**。上限も能力も
+/// 毎回設定から組み直す ([`Registry::targets`]) ので、古い値が残ることはない。
+pub fn claim_local_slot(max_jobs: u16) -> Result<(), CloudError> {
+    let local = ExecutionTarget::local(max_jobs);
+    store::with_targets(|list| {
+        let t = match list.iter_mut().position(|t| t.id == local.id) {
+            Some(i) => &mut list[i],
+            None => {
+                list.push(local.clone());
+                list.last_mut().expect("いま入れた")
+            }
+        };
+        // 上限は設定が正 (`config.toml` を書き換えたら次の仕事から効く)
+        t.capacity.max_jobs = max_jobs;
+        if !t.capacity.has_room() {
+            return Err(CloudError::no_capacity(format!(
+                "手元ではすでに {} 本を実行中です (default_max_jobs = {})",
+                t.capacity.active_jobs, t.capacity.max_jobs
             )));
         }
         t.capacity.active_jobs += 1;
@@ -489,12 +554,13 @@ impl SlotGuard {
         })
     }
 
-    /// ローカル (台帳に載っていない実行先) 用の、何もしない番人。
-    pub fn none(id: &TargetId) -> Self {
-        Self {
-            id: id.clone(),
-            active: false,
-        }
+    /// 手元の枠を取る。取れなければ [`CloudError::NoCapacity`]。
+    pub fn claim_local(max_jobs: u16) -> Result<Self, CloudError> {
+        claim_local_slot(max_jobs)?;
+        Ok(Self {
+            id: ExecutionTarget::local(max_jobs).id,
+            active: true,
+        })
     }
 }
 
@@ -576,6 +642,18 @@ mod tests {
         t
     }
 
+    /// 探りが通った状態にする。**枠を配るのは `Ready` だけ**なので、
+    /// 枠の試験は「探りが通った実行先」から始める必要がある
+    /// (製品では [`Registry::probe`] → [`apply_probe`] がここを付ける)。
+    fn mark_ready(id: &TargetId) {
+        store::with_targets(|l| {
+            if let Some(t) = l.iter_mut().find(|t| &t.id == id) {
+                t.lifecycle = TargetLifecycle::Ready;
+            }
+        })
+        .expect("書ける");
+    }
+
     #[test]
     fn 手元は設定しなくても一覧に出る() {
         let _home = home_guard("registry-local");
@@ -608,6 +686,7 @@ mod tests {
         let _home = home_guard("registry-slots");
         let reg = registry();
         let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
         let g1 = SlotGuard::claim(&t.id).expect("1 本目");
         let g2 = SlotGuard::claim(&t.id).expect("2 本目");
         let e = match SlotGuard::claim(&t.id) {
@@ -631,6 +710,7 @@ mod tests {
         let _home = home_guard("registry-slots-race");
         let reg = registry();
         let t = add(&reg, "dev-01", 4);
+        mark_ready(&t.id);
         // **8 本が同時に取りに行く。** 通ってよいのは 4 本だけ。
         let id = t.id.clone();
         let dir = store::cloud_dir();
@@ -969,6 +1049,38 @@ mod tests {
         assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
         assert_eq!(e.exit_code(), 4);
         let _ = id;
+    }
+
+    /// **P1-2 の再現。** Scheduler が選んだ瞬間と枠を取る瞬間のあいだに
+    /// 実行先の状態は変わりうる。枠取りが `Ready` を求めないと、
+    /// 準備中 / 抜けかけ / 壊れた機械へ仕事を載せてしまう。
+    #[test]
+    fn 選んだ後に準備中へ落ちたら枠を配らない() {
+        for (state, 名) in [
+            (TargetLifecycle::Provisioning, "provisioning"),
+            (TargetLifecycle::Draining, "draining"),
+            (TargetLifecycle::Failed, "failed"),
+            (TargetLifecycle::Unknown, "unknown"),
+        ] {
+            let _home = home_guard(&format!("claim-not-ready-{名}"));
+            let id = put_managed("w1");
+            // Scheduler が見たとき (= いま手元にある写し) は Ready
+            let snapshot = store::load_targets().expect("読める");
+            assert_eq!(snapshot[0].lifecycle, TargetLifecycle::Ready);
+
+            // …その後で状態が変わる (探りの失敗 / 抜け始め / 作り直し)
+            store::with_targets(|l| l[0].lifecycle = state).expect("書ける");
+
+            let e = match SlotGuard::claim(&id) {
+                Ok(_) => panic!("{名} の実行先へ枠を配ってしまった"),
+                Err(e) => e,
+            };
+            assert!(matches!(e, CloudError::NoCapacity(_)), "{名}: {e:?}");
+            assert!(format!("{e}").contains(state.id()), "{名}: {e}");
+            // 枠は 1 つも増えていない
+            let after = store::load_targets().expect("読める");
+            assert_eq!(after[0].capacity.active_jobs, 0, "{名}");
+        }
     }
 
     /// **結果が分からない失敗では、安易に Ready へ戻さない。**

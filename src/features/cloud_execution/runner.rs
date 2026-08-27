@@ -66,20 +66,21 @@ pub fn run(spec: &JobSpec, sink: &mut dyn EventSink) -> Result<ExecutionJob, Clo
     };
 
     // **枠を先に取る。** 取れなければ何も始めない (載せてから断ると、
-    // 用意だけ済んだ worktree が残る)。手元の実行先は台帳に載っていないので
-    // 枠も数えない。
-    let _slot = if spec.target.transport == TransportKind::Local {
-        SlotGuard::none(&spec.target.id)
+    // 用意だけ済んだ worktree が残る)。**手元も数える** — 上限を書けるのに
+    // 数えないと、`default_max_jobs` が何を書いても効かない飾りになる。
+    let claimed = if spec.target.transport == TransportKind::Local {
+        SlotGuard::claim_local(spec.target.capacity.max_jobs)
     } else {
-        match SlotGuard::claim(&spec.target.id) {
-            Ok(g) => g,
-            Err(e) => {
-                job.state = ExecutionJobState::Failed;
-                job.message = e.to_string();
-                job.ended_unix = store::now_unix();
-                let _ = store::upsert_job(&job);
-                return Err(e);
-            }
+        SlotGuard::claim(&spec.target.id)
+    };
+    let _slot = match claimed {
+        Ok(g) => g,
+        Err(e) => {
+            job.state = ExecutionJobState::Failed;
+            job.message = e.to_string();
+            job.ended_unix = store::now_unix();
+            let _ = store::upsert_job(&job);
+            return Err(e);
         }
     };
 
@@ -221,7 +222,6 @@ pub fn recent_jobs(limit: usize) -> Result<Vec<ExecutionJob>, CloudError> {
     }
     Ok(jobs)
 }
-
 
 /// 走ったままになっている仕事を数える (`doctor` 用)。
 pub fn unfinished(jobs: &[ExecutionJob]) -> Vec<&ExecutionJob> {
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn 枠が無ければ何も始めない() {
         let _home = home_guard("runner-no-capacity");
-        let t = make_target(&SshTargetSpec {
+        let mut t = make_target(&SshTargetSpec {
             name: "dev-01".into(),
             host: "example.com".into(),
             user: "zaivern".into(),
@@ -379,6 +379,8 @@ mod tests {
             ..SshTargetSpec::default()
         })
         .expect("組める");
+        // 枠を配るのは Ready だけ (製品では probe が付ける)
+        t.lifecycle = crate::features::cloud_execution::model::TargetLifecycle::Ready;
         store::save_targets(std::slice::from_ref(&t)).expect("書ける");
         // 1 枠を先に埋める
         let _held = SlotGuard::claim(&t.id).expect("取れる");
@@ -400,6 +402,60 @@ mod tests {
         let jobs = recent_jobs(10).expect("読める");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].state, ExecutionJobState::Failed);
+    }
+
+    /// **P2-1 の再現。** 手元の実行先にも `max_jobs` がある (`default_max_jobs`)
+    /// のに数えていないと、上限をいくつにしても無限に走り、機械が飽和する。
+    #[test]
+    fn 手元でも枠の上限を超えない() {
+        let _home = home_guard("runner-local-capacity");
+        // 上限 1 本の手元の実行先
+        let mut spec = echo("hello");
+        spec.target = ExecutionTarget::local(1);
+
+        // 1 本目の枠を先に押さえる (走っている仕事があるのと同じ状態)
+        let held = SlotGuard::claim_local(1).expect("1 本目は取れる");
+
+        let (out, sink) = run_collecting(&spec);
+        let e = out.expect_err("2 本目は断る");
+        assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
+        // **1 バイトも走らせていない** (載せてから断らない)
+        assert!(sink.stdout_text().is_empty(), "{}", sink.stdout_text());
+
+        // 返せば走る
+        drop(held);
+        let (out, sink) = run_collecting(&spec);
+        out.expect("返した分は走る");
+        assert!(sink.stdout_text().contains("hello"));
+
+        // 走り終えた後に枠が残っていない
+        let after = store::load_targets().expect("読める");
+        for t in &after {
+            assert_eq!(t.capacity.active_jobs, 0, "{} の枠が返っていない", t.name);
+        }
+    }
+
+    /// 同時に取り合っても上限を超えない (別プロセスも同じ台帳のロックを通る)。
+    #[test]
+    fn 手元の枠は同時に取り合っても上限を超えない() {
+        let _home = home_guard("runner-local-race");
+        let dir = store::cloud_dir();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    // 取れたら返さずに持ったまま数える
+                    SlotGuard::claim_local(3).map(std::mem::forget).is_ok()
+                })
+            })
+            .collect();
+        let granted = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(granted, 3, "上限を超えて配った");
     }
 
     #[test]
