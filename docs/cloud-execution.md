@@ -176,12 +176,29 @@ A: VM を消す                ← 走っている仕事ごと消える
 | `stopped` | 配らない | 止まっている・消えた |
 | `unknown` / `provisioning` / `draining` / `failed` | 配らない | まだ確かめていない・抜けかけ・故障 |
 
+**落ちた仕事の枠は、次の起動で返る。** 枠を返すのは `SlotGuard` の Drop だが、
+`kill -9` / OOM Killer / 電源断では Drop が呼ばれず、台帳に「走っている 1 本」が
+残る。`registry::reconcile_active_jobs` が `Registry::load` のたびに 2 段で片付ける:
+
+1. 仕事の台帳のロックの中で、**持ち主の PID がもう居ない**未完了の記録だけを
+   `failed` へ移す (`ExecutionJob::owner_pid`)
+2. 実行先の台帳のロックの中で、**その本数だけ引く**
+
+**引き算しかしない**のが要で、1 と 2 のあいだに別のプロセスが枠を取っても
+その枠は消えない。だから後始末が `max_jobs` を超えさせることも、生きている
+仕事の枠を奪うこともない。判定は PID の生存だけなので、PID が再利用された
+ときは枠が返らないが、再利用した側が終われば次の後始末で返る。
+
 **枠を配るのは `ready` だけ。** Scheduler も同じ判定 (`lifecycle == Ready`) を
 するが、あちらが見るのは*選んだ瞬間の写し*でしかない。選んでから載せるまでの
 あいだに `probe` の失敗や `destroy` の予約が入りうるので、
 **最後にもう一度、台帳ロックの中で確かめる**のが `claim_slot`。
 Scheduler は説明つきで「どれが良いか」を選ぶ純関数のまま、
 「いま本当に載せてよいか」の 1 点だけがロックの中にある。
+
+**走っている仕事がある実行先は一覧から外せない** (`remove_target`)。外すと
+`SlotGuard` の返す先が消えて、記録だけが孤児になる。`destroy` と同じく、
+名前を引くのも本数を数えるのも消すのも**同じ台帳ロックの中**で行う。
 
 ### 破棄が失敗したとき (回復方針)
 
@@ -314,6 +331,21 @@ Credential Broker は将来仕様。
      ├── worktree …
      └── …
 ```
+
+**送るのは `HEAD` だけ。** 未コミットの変更は 1 バイトも向こうへ行かないので、
+`zai cloud job run` は作業ツリーが汚れていたら**始める前に断る**
+(`git_workspace::ensure_clean_worktree`)。追跡中の変更・index に載せた変更・
+追跡していないファイルのどれでも断り、`.gitignore` されたものは数えない
+(`--untracked-files=all` を明示するので、`status.showUntrackedFiles=no` を
+global に置いている利用者でも穴が開かない)。黙って進むと「いまの作業ツリーで
+走った」と読まれたまま**最後のコミット**が走り、その食い違いはどの出力にも
+現れない。v1 では自動 snapshot は取らない。
+
+リモートの bare リポジトリの用意は **`mkdir` を鍵にして 1 本へ絞る**
+(4 本同時で `could not lock config file` が実測で出た)。`kill -9` や電源断では
+`trap` が発火せず鍵が残るので、**10 分より古い鍵は持ち主が死んだものとして
+回収する** (`git init --bare` は 1 秒とかからない)。鍵を取った直後に `owner` を
+書くので、たったいま取られた鍵が奪われることはない。
 
 1. `git push <ssh-url> HEAD:refs/zaivern/base/<job>` — 手元の HEAD を送る
 2. `git worktree add -B zai/cloud/<job> <job の置き場> refs/zaivern/base/<job>`
