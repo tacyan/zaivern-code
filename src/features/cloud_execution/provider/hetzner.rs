@@ -318,7 +318,7 @@ pub fn next_page_of(v: &Value) -> Option<u32> {
 }
 
 /// Hetzner の `{"error":{"message":…}}` から人が読む部分だけ取り出す。
-fn api_error_message(body: &str) -> String {
+pub fn api_error_message(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| {
@@ -773,6 +773,84 @@ mod tests {
             MAX_ATTEMPTS as usize,
             "上限どおりに止まっていない"
         );
+    }
+
+    // ───── 失敗の応答の本文 (実 HTTP でも失わない) ─────
+
+    /// **本文が届く前提を、状態コードごとに表で固定する。**
+    ///
+    /// 実 HTTP で本文が消えていた頃は、ここが緑でも運用では
+    /// 「401 でした」しか言えなかった (`http::tests::状態コードがエラーでも本文が残る`
+    /// が実物側の番人)。
+    #[test]
+    fn 失敗の応答から理由を取り出す() {
+        for (status, msg, retryable) in [
+            (401u16, "invalid token", false),
+            (403, "forbidden by policy", false),
+            (429, "rate limit exceeded", true),
+            (500, "internal server error", true),
+            (503, "service unavailable", true),
+        ] {
+            let e = classify(&HttpResponse {
+                status,
+                body: serde_json::json!({"error": {"message": msg}}).to_string(),
+            })
+            .expect_err("失敗する");
+            assert!(format!("{e}").contains(msg), "{status}: 理由が消えた: {e}");
+            assert_eq!(
+                e.retryable(),
+                retryable,
+                "{status}: 再試行の方針が違う: {e:?}"
+            );
+            if !retryable {
+                assert!(matches!(e, CloudError::Auth(_)), "{status}: {e:?}");
+                assert_eq!(retry_delay(1, &e), None, "{status}: 再試行してしまう");
+            }
+        }
+    }
+
+    /// 本文が読めなかったときでも、**分類は失われない**。
+    #[test]
+    fn 本文が読めなくても分類は残る() {
+        let e = classify(&HttpResponse {
+            status: 401,
+            body: crate::features::cloud_execution::provider::http::BODY_UNREADABLE.into(),
+        })
+        .expect_err("失敗する");
+        assert!(matches!(e, CloudError::Auth(_)), "{e:?}");
+        assert!(!e.retryable());
+    }
+
+    /// **本文に秘密らしい値が混ざっていても、外へ出ない。**
+    ///
+    /// 相手が返した本文をそのままエラー文へ載せるので、伏せ方が効いていないと
+    /// ここから漏れる。`CloudError` は作る時点で伏せる規則
+    /// ([`crate::features::cloud_execution::redact`]) を通るので、
+    /// `Debug` も `Display` も伏せた後しか出さない。
+    ///
+    /// **伏せられるのは「秘密と分かる形」だけ。** 見知らぬ文字列を
+    /// 手当たり次第に伏せることはできない (伏せ字だらけで診断できなくなる)
+    /// ので、ここで見るのは鍵と値の組と `Bearer` の 2 つ。
+    #[test]
+    fn 失敗の本文に混ざった秘密は漏れない() {
+        const SECRET: &str = "hcloud-live-abcdef1234567890";
+        for body in [
+            format!(r#"{{"error":{{"message":"token={SECRET} was rejected"}}}}"#),
+            format!(r#"{{"error":{{"message":"Bearer {SECRET} is not valid"}}}}"#),
+        ] {
+            let e = classify(&HttpResponse {
+                status: 403,
+                body: body.clone(),
+            })
+            .expect_err("失敗する");
+            assert!(!format!("{e}").contains(SECRET), "Display から漏れた: {e}");
+            assert!(
+                !format!("{e:?}").contains(SECRET),
+                "Debug から漏れた: {e:?}"
+            );
+            // 文脈は残る (何が起きたかは分かる)
+            assert!(format!("{e}").contains("403"), "{e}");
+        }
     }
 
     // ───── 一覧 API のページ送り ─────
