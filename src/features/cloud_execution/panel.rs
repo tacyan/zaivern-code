@@ -81,9 +81,9 @@ fn load_view() -> View {
 }
 
 fn load_targets_or_empty() -> Vec<ExecutionTarget> {
-    let mut out = vec![ExecutionTarget::local(1)];
-    out.extend(super::store::load_targets().unwrap_or_default());
-    out
+    // **組み立ては registry の 1 か所へ任せる。** 素朴に足すと、手元で
+    // 仕事が走った後 (台帳に枠を数える行が出来た後) に `local` が 2 行並ぶ。
+    super::registry::with_local(1, super::store::load_targets().unwrap_or_default())
 }
 
 /// 毎フレーム呼ばれる描画。

@@ -88,19 +88,7 @@ impl Registry {
     /// (`default_max_jobs`) から毎回組み直すが、*いま何本走っているか*は
     /// ロックの中で数えている値 ([`claim_local_slot`]) が正しい。
     pub fn targets(&self) -> Result<Vec<ExecutionTarget>, CloudError> {
-        let stored = store::load_targets()?;
-        let mut local = ExecutionTarget::local(self.ctx.local_max_jobs);
-        if let Some(s) = stored.iter().find(|t| t.id == local.id) {
-            local.capacity.active_jobs = s.capacity.active_jobs;
-        }
-        let mut out = vec![local];
-        // 台帳側の手元の行は**枠を数えるためだけ**に在るので、一覧では出さない
-        out.extend(
-            stored
-                .into_iter()
-                .filter(|t| t.transport != super::model::TransportKind::Local),
-        );
-        Ok(out)
+        Ok(with_local(self.ctx.local_max_jobs, store::load_targets()?))
     }
 
     /// 名前か ID で実行先を引く。
@@ -479,6 +467,26 @@ pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
         t.capacity.active_jobs += 1;
         Ok(())
     })?
+}
+
+/// 手元の実行先を先頭に置いた一覧を組む。
+///
+/// **台帳側の手元の行は枠を数えるためだけに在る** ([`claim_local_slot`]) ので、
+/// 上限も能力も毎回設定から組み直し、*いま何本走っているか*だけを引き継ぐ。
+/// 引き継がずに素朴へ足すと、**`local` が 2 行**並ぶ (画面と `find` の両方が
+/// 壊れる) ので、組み立ては**この 1 か所**だけにする。
+pub fn with_local(local_max_jobs: u16, stored: Vec<ExecutionTarget>) -> Vec<ExecutionTarget> {
+    let mut local = ExecutionTarget::local(local_max_jobs);
+    if let Some(s) = stored.iter().find(|t| t.id == local.id) {
+        local.capacity.active_jobs = s.capacity.active_jobs;
+    }
+    let mut out = vec![local];
+    out.extend(
+        stored
+            .into_iter()
+            .filter(|t| t.transport != super::model::TransportKind::Local),
+    );
+    out
 }
 
 /// 手元の枠を 1 つ取る。**手元にも上限がある** (§31 の `default_max_jobs`)。
@@ -1049,6 +1057,28 @@ mod tests {
         assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
         assert_eq!(e.exit_code(), 4);
         let _ = id;
+    }
+
+    /// **手元の行は台帳にも在るが、一覧には 1 行しか出ない。**
+    #[test]
+    fn 手元の実行先が二重に出ない() {
+        let _home = home_guard("registry-local-once");
+        let reg = registry();
+        // 手元で 1 本走った後の台帳を模す
+        claim_local_slot(2).expect("取れる");
+        let all = reg.targets().expect("数えられる");
+        assert_eq!(
+            all.iter()
+                .filter(|t| t.transport == super::super::model::TransportKind::Local)
+                .count(),
+            1,
+            "local が二重に出た: {all:#?}"
+        );
+        // 使用中の数は引き継ぎ、上限は設定から組み直す
+        assert_eq!(all[0].capacity.active_jobs, 1);
+        assert_eq!(all[0].capacity.max_jobs, reg.ctx.local_max_jobs);
+        // 名前でも 1 件に決まる (2 件あると find が断る)
+        reg.find("local").expect("引ける");
     }
 
     /// **P1-2 の再現。** Scheduler が選んだ瞬間と枠を取る瞬間のあいだに
