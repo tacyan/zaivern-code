@@ -310,11 +310,40 @@ fn registry() -> Result<Registry, CloudError> {
 
 // ───────────────────────── doctor ─────────────────────────
 
+/// 診断。**読めなかったことを「0 件」に化けさせない** (P2-2)。
+///
+/// 状態ファイルが壊れているのと、まだ何も登録していないのは**まったく違う**。
+/// 前者で「0 件」と出すと、利用者は登録し直そうとして**壊れたファイルを
+/// 上書きし、登録済みの内容を失う**。だから読めなかった段は件数を出さず、
+/// 理由 (どのファイルか) を出して、診断そのものを不合格にする。
 fn doctor(args: &[String]) -> Result<String, Fail> {
+    let (text, ok) = doctor_report(args);
+    if ok {
+        return Ok(text);
+    }
+    // 本文は標準出力へ (機械が `--json` を読む経路を壊さない)。
+    // 終了コードだけを不合格にする。
+    if !text.is_empty() {
+        println!("{text}");
+    }
+    Err(Fail::Code(EXIT_ERR, String::new()))
+}
+
+/// 診断の本文と合否。**読めなかった段があれば `false`。**
+fn doctor_report(args: &[String]) -> (String, bool) {
     let as_json = flag(args, "--json");
     let cfg = config();
-    let profiles = all_profiles(&store::load_providers().unwrap_or_default());
-    let targets = store::load_targets().unwrap_or_default();
+    // **`unwrap_or_default()` を使わない。** ここが P2-2 の急所で、
+    // 「読めなかった」を握り潰すと下流はすべて 0 件に見える。
+    let profiles = store::load_providers().map(|list| all_profiles(&list));
+    let targets = store::load_targets().map(|list| {
+        // 手元の行は枠を数えるためだけに台帳へ在る (registry::claim_local_slot)
+        list.into_iter()
+            .filter(|t| t.transport != TransportKind::Local)
+            .collect::<Vec<_>>()
+    });
+    let jobs = store::load_jobs();
+    let ok = profiles.is_ok() && targets.is_ok() && jobs.is_ok();
     let kh = store::known_hosts_path();
 
     let git = tool_version("git");
@@ -322,24 +351,44 @@ fn doctor(args: &[String]) -> Result<String, Fail> {
 
     if as_json {
         let v = json!({
+            // **合否を 1 つの欄で出す。** 機械は段ごとに見なくてよい
+            "ok": ok,
             "git": git,
             "ssh": ssh,
             "known_hosts": kh.display().to_string(),
             "known_hosts_exists": kh.exists(),
             "store": store::cloud_dir().display().to_string(),
-            "providers": profiles.iter().map(|p| json!({
-                "name": p.name,
-                "kind": p.kind.id(),
-                "token_env": p.token_env,
-                // **値は出さない。** あるか無いかだけ
-                "token_present": p.token_present(),
-            })).collect::<Vec<_>>(),
-            "targets": targets.len(),
+            "providers": match &profiles {
+                Ok(list) => json!({
+                    "status": "ok",
+                    "count": list.len(),
+                    "items": list.iter().map(|p| json!({
+                        "name": p.name,
+                        "kind": p.kind.id(),
+                        "token_env": p.token_env,
+                        // **値は出さない。** あるか無いかだけ
+                        "token_present": p.token_present(),
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(e) => read_error_json(e),
+            },
+            "targets": match &targets {
+                Ok(list) => json!({"status": "ok", "count": list.len()}),
+                Err(e) => read_error_json(e),
+            },
+            "jobs": match &jobs {
+                Ok(list) => json!({
+                    "status": "ok",
+                    "count": list.len(),
+                    "unfinished": runner::unfinished(list).len(),
+                }),
+                Err(e) => read_error_json(e),
+            },
             "prefer": super::prefer(&cfg).id(),
             "ssh_timeout_secs": super::ssh_timeout(&cfg).as_secs(),
             "api_timeout_secs": super::api_timeout(&cfg).as_secs(),
         });
-        return Ok(serde_json::to_string_pretty(&v).unwrap_or_default());
+        return (serde_json::to_string_pretty(&v).unwrap_or_default(), ok);
     }
 
     let mut out = String::new();
@@ -350,13 +399,21 @@ fn doctor(args: &[String]) -> Result<String, Fail> {
     ));
     out.push_str(&format!(
         "  ssh                {}\n",
-        ssh.as_deref().unwrap_or("見つかりません (SSH の実行先に必須)")
+        ssh.as_deref()
+            .unwrap_or("見つかりません (SSH の実行先に必須)")
     ));
-    out.push_str(&format!("  置き場              {}\n", store::cloud_dir().display()));
+    out.push_str(&format!(
+        "  置き場              {}\n",
+        store::cloud_dir().display()
+    ));
     out.push_str(&format!(
         "  known_hosts        {} ({})\n",
         kh.display(),
-        if kh.exists() { "あり" } else { "まだありません" }
+        if kh.exists() {
+            "あり"
+        } else {
+            "まだありません"
+        }
     ));
     out.push_str(&format!(
         "  待ち時間            SSH {} 秒 / API {} 秒\n",
@@ -367,40 +424,68 @@ fn doctor(args: &[String]) -> Result<String, Fail> {
         "  実行先の好み        {}\n",
         super::prefer(&cfg).id()
     ));
-    out.push_str(&format!("\n  Provider ({} 件)\n", profiles.len()));
-    for p in &profiles {
-        let token = if p.token_env.is_empty() {
-            "―".to_string()
-        } else if p.token_present() {
-            // **値は出さない。** 設定されているかどうかだけ
-            format!("{} = 設定あり", p.token_env)
-        } else {
-            format!("{} = 未設定", p.token_env)
-        };
-        out.push_str(&format!(
-            "    {:<16} {:<12} {token}\n",
-            p.name,
-            p.kind.id()
-        ));
+    match &profiles {
+        Ok(list) => {
+            out.push_str(&format!("\n  Provider ({} 件)\n", list.len()));
+            for p in list {
+                let token = if p.token_env.is_empty() {
+                    "―".to_string()
+                } else if p.token_present() {
+                    // **値は出さない。** 設定されているかどうかだけ
+                    format!("{} = 設定あり", p.token_env)
+                } else {
+                    format!("{} = 未設定", p.token_env)
+                };
+                out.push_str(&format!("    {:<16} {:<12} {token}\n", p.name, p.kind.id()));
+            }
+        }
+        Err(e) => out.push_str(&read_error_text("Provider", e)),
     }
-    out.push_str(&format!("\n  実行先 ({} 件 + local)\n", targets.len()));
-    for t in &targets {
-        out.push_str(&format!(
-            "    {:<16} {:<10} {}\n",
-            t.name,
-            t.lifecycle.id(),
-            t.endpoint.summary()
-        ));
+    match &targets {
+        Ok(list) => {
+            out.push_str(&format!("\n  実行先 ({} 件 + local)\n", list.len()));
+            for t in list {
+                out.push_str(&format!(
+                    "    {:<16} {:<10} {}\n",
+                    t.name,
+                    t.lifecycle.id(),
+                    t.endpoint.summary()
+                ));
+            }
+        }
+        Err(e) => out.push_str(&read_error_text("実行先", e)),
     }
-    let jobs = store::load_jobs().unwrap_or_default();
-    let stuck = runner::unfinished(&jobs);
-    if !stuck.is_empty() {
-        out.push_str(&format!(
-            "\n  ⚠ まだ終わっていない仕事が {} 件あります (zai cloud job list)\n",
-            stuck.len()
-        ));
+    match &jobs {
+        Ok(list) => {
+            let stuck = runner::unfinished(list);
+            if !stuck.is_empty() {
+                out.push_str(&format!(
+                    "\n  ⚠ まだ終わっていない仕事が {} 件あります (zai cloud job list)\n",
+                    stuck.len()
+                ));
+            }
+        }
+        Err(e) => out.push_str(&read_error_text("仕事の記録", e)),
     }
-    Ok(out)
+    if !ok {
+        out.push_str(
+            "\n  読めなかったファイルがあります。**登録し直す前に退避してください** —\n             \x20 上書きすると、読めていないだけの中身を失います。\n",
+        );
+    }
+    (out, ok)
+}
+
+/// 読めなかった段の JSON。**件数は出さない** (出すと 0 件に見える)。
+fn read_error_json(e: &CloudError) -> serde_json::Value {
+    json!({"status": "error", "error": e.to_string()})
+}
+
+/// 読めなかった段の本文。
+fn read_error_text(label: &str, e: &CloudError) -> String {
+    format!(
+        "\n  {label} (読めません)\n    {}\n",
+        e.to_string().replace('\n', "\n    ")
+    )
 }
 
 fn tool_version(program: &str) -> Option<String> {
@@ -1597,6 +1682,69 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
         assert!(v["known_hosts"].as_str().is_some());
         std::env::remove_var("HCLOUD_TOKEN");
+    }
+
+    /// **P2-2 の再現。** 壊れた状態ファイルを `unwrap_or_default()` で
+    /// 飲み込むと「0 件」と表示される。利用者から見て「まだ登録していない」と
+    /// 区別が付かないので、**次にすることが「登録する」になってしまう** —
+    /// 実際には登録済みの内容が読めていないだけで、そこで登録し直すと
+    /// 壊れたファイルを上書きして失う。
+    #[test]
+    fn 壊れた状態ファイルを零件と言わない() {
+        let _home = home_guard("cli-doctor-broken");
+        // 先にまともな内容を作ってから壊す (「まだ無い」と区別するため)
+        provider_add(
+            &["hetzner", "--name", "hetzner-eu"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("足せる");
+        std::fs::write(store::providers_path(), b"{ this is not json").expect("壊せる");
+        std::fs::write(store::targets_path(), b"[[[").expect("壊せる");
+        std::fs::write(store::jobs_path(), b"nope").expect("壊せる");
+
+        let (out, ok) = doctor_report(&[]);
+        assert!(!ok, "壊れているのに合格にしている: {out}");
+        assert!(!out.contains("Provider (0 件)"), "0 件と言っている: {out}");
+        assert!(out.contains("読めません"), "理由が出ていない: {out}");
+
+        let (js, _) = doctor_report(&["--json".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON として読める");
+        assert_eq!(v["providers"]["status"], "error", "{js}");
+        assert_eq!(v["targets"]["status"], "error", "{js}");
+        assert_eq!(v["jobs"]["status"], "error", "{js}");
+        assert!(
+            v["targets"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("targets.json"),
+            "どのファイルか分からない: {js}"
+        );
+        // 数は出さない (出すと 0 件に見える)
+        assert!(v["targets"]["count"].is_null(), "{js}");
+        // 診断としては不合格
+        assert_eq!(v["ok"], false, "{js}");
+        assert_eq!(
+            cli_main(&["doctor".to_string(), "--json".to_string()]),
+            EXIT_ERR,
+            "壊れているのに終了コードが 0"
+        );
+    }
+
+    /// 壊れていないときは、これまでどおり件数を出して合格にする。
+    #[test]
+    fn 読めているときは件数を出す() {
+        let _home = home_guard("cli-doctor-ok");
+        let (js, ok) = doctor_report(&["--json".to_string()]);
+        assert!(ok, "{js}");
+        let v: serde_json::Value = serde_json::from_str(&js).expect("JSON");
+        assert_eq!(v["targets"]["status"], "ok", "{js}");
+        assert_eq!(v["targets"]["count"], 0, "{js}");
+        assert_eq!(v["ok"], true, "{js}");
+        let out = doctor(&[]).expect("診断できる");
+        assert!(out.contains("実行先 (0 件"), "{out}");
+        assert!(!out.contains("読めません"), "{out}");
     }
 
     #[test]
