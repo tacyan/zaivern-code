@@ -281,6 +281,21 @@ pub fn save_jobs(jobs: &[ExecutionJob]) -> Result<(), CloudError> {
     )
 }
 
+/// 記録を読んで直して書く。**ロックで直列化する** ([`with_targets`] と同じ形)。
+///
+/// 落ちた仕事の後始末 ([`super::registry::reconcile_active_jobs`]) は、
+/// 「未完了の記録を Failed へ移す」と「その本数だけ枠を返す」の 2 段で、
+/// **前半がここで原子的に済む**ことに拠っている — 2 つのインスタンスが
+/// 同時に後始末を始めても、同じ 1 本を二重に数えない。
+pub fn with_jobs<T>(f: impl FnOnce(&mut Vec<ExecutionJob>) -> T) -> Result<T, CloudError> {
+    ensure_dir()?;
+    let _guard = FileLock::acquire(&cloud_dir().join("jobs.lock"))?;
+    let mut jobs = load_jobs()?;
+    let out = f(&mut jobs);
+    save_jobs(&jobs)?;
+    Ok(out)
+}
+
 /// 1 件を足すか、同じ ID があれば置き換える。
 pub fn upsert_job(job: &ExecutionJob) -> Result<(), CloudError> {
     ensure_dir()?;
@@ -494,6 +509,7 @@ mod tests {
                 workspace: None,
                 result_ref: String::new(),
                 result_oid: String::new(),
+                owner_pid: 0,
                 started_unix: 0,
                 ended_unix: 0,
                 exit_code: Some(0),

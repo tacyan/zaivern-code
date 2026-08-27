@@ -38,6 +38,10 @@ impl Registry {
     /// 設定から組む。
     pub fn load(cfg: &crate::config::Config) -> Result<Self, CloudError> {
         let ssh_timeout = super::ssh_timeout(cfg);
+        // **前回落ちた仕事の枠をここで返す** (P1-1)。台帳を 2 つ読むだけなので
+        // 安い。失敗しても組み立ては続ける — 後始末ができないことと、
+        // 実行先を一覧できないことは別の話。
+        let _ = reconcile_active_jobs();
         Ok(Self {
             profiles: store::load_providers()?,
             ctx: ProviderCtx::live(super::api_timeout(cfg), super::default_max_jobs(cfg)),
@@ -469,6 +473,103 @@ pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
     })?
 }
 
+// ─────────────── 落ちた仕事の後始末 (P1-1) ───────────────
+
+/// 後始末の結果 (`doctor` と試験が読む)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// 持ち主が居なくなっていた未完了の仕事の数。
+    pub stale_jobs: usize,
+    /// 返した枠の数。
+    pub freed_slots: usize,
+}
+
+/// **落ちた仕事が握ったままの枠を返す。**
+///
+/// ## なぜ要るのか
+///
+/// 枠を返すのは [`SlotGuard`] の Drop だが、`kill -9` / OOM Killer /
+/// 電源断 / OS 再起動では Drop が呼ばれない。すると `targets.json` には
+/// 「走っている 1 本」が残り、**実際には 0 件なのに `active_jobs == max_jobs`**
+/// になって、その実行先へ二度と仕事を載せられなくなる。
+///
+/// ## なぜ「未完了の本数を数え直す」ではいけないのか
+///
+/// 落ちたときは `jobs.json` の側にも `running` が残る。だから
+/// 「未完了の本数 = active_jobs」と置き直すと、**落ちた仕事の枠がそのまま
+/// 残る**か、逆に別のプロセスが今まさに取った枠を消してしまう。
+///
+/// ## 2 段で、引き算だけする
+///
+/// 1. 仕事の台帳のロックの中で、**持ち主のプロセスがもう居ない**未完了の
+///    記録だけを `Failed` へ移す。移せた本数がそのまま「返してよい枠の数」で、
+///    ロックの中なので 2 つのインスタンスが同じ 1 本を二重に数えない
+/// 2. 実行先の台帳のロックの中で、**その本数だけ引く** (絶対値で置き直さない)
+///
+/// 引き算だけにするのが要で、1 と 2 のあいだに別のプロセスが枠を取っても、
+/// その枠は消えない (足された分はそのまま残る)。だから
+/// **後始末が `max_jobs` を超えさせることも、生きている仕事の枠を奪うことも
+/// 構造的に起こらない**。
+///
+/// ## 残る穴 (正直に)
+///
+/// 判定は PID の生存だけなので、**PID が再利用された**ときは「まだ生きている」
+/// と読む。その場合は枠が返らないが、再利用した側のプロセスが終われば次の
+/// 後始末で返るので、永久には残らない。
+pub fn reconcile_active_jobs() -> Result<Reconciled, CloudError> {
+    use std::collections::BTreeMap;
+
+    // 1) 持ち主が居ない未完了の記録を Failed へ移す (仕事の台帳のロックの中)
+    let freed: BTreeMap<TargetId, u16> = store::with_jobs(|jobs| {
+        let mut freed: BTreeMap<TargetId, u16> = BTreeMap::new();
+        for j in jobs.iter_mut() {
+            if j.state.is_final() || owner_alive(j) {
+                continue;
+            }
+            j.state = super::model::ExecutionJobState::Failed;
+            j.message = "実行していたプロセスが終了したため、この仕事の枠を返しました".to_string();
+            if j.ended_unix == 0 {
+                j.ended_unix = store::now_unix();
+            }
+            let n = freed.entry(j.target.clone()).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+        freed
+    })?;
+
+    let stale_jobs: usize = freed.values().map(|n| *n as usize).sum();
+    if freed.is_empty() {
+        return Ok(Reconciled::default());
+    }
+
+    // 2) 片付けた本数だけ枠を引く (実行先の台帳のロックの中)
+    let freed_slots = store::with_targets(|list| {
+        let mut done = 0usize;
+        for t in list.iter_mut() {
+            if let Some(n) = freed.get(&t.id) {
+                let before = t.capacity.active_jobs;
+                t.capacity.active_jobs = before.saturating_sub(*n);
+                done += (before - t.capacity.active_jobs) as usize;
+            }
+        }
+        done
+    })?;
+
+    Ok(Reconciled {
+        stale_jobs,
+        freed_slots,
+    })
+}
+
+/// その仕事を握っていたプロセスは、まだ生きているか。
+///
+/// **`owner_pid == 0` は「分からない」ではなく「居ない」として扱う。**
+/// この欄が無かった頃の記録で、書いたプロセスはもう存在しない
+/// ([`crate::instances::pid_alive`] も 0 を偽で返す)。
+fn owner_alive(job: &super::model::ExecutionJob) -> bool {
+    crate::instances::pid_alive(job.owner_pid)
+}
+
 /// 手元の実行先を先頭に置いた一覧を組む。
 ///
 /// **台帳側の手元の行は枠を数えるためだけに在る** ([`claim_local_slot`]) ので、
@@ -619,7 +720,7 @@ pub fn all_profiles(stored: &[ProviderProfile]) -> Vec<ProviderProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::cloud_execution::model::{Capabilities, OsFamily};
+    use crate::features::cloud_execution::model::{Capabilities, ExecutionJobState, OsFamily};
     use crate::features::cloud_execution::provider::static_ssh::{make_target, SshTargetSpec};
     use crate::features::cloud_execution::test_support::{home_guard, target, TargetOpts};
 
@@ -1059,6 +1160,150 @@ mod tests {
         let _ = id;
     }
 
+    // ───── 落ちた仕事の後始末 (P1-1) ─────    // ───── 落ちた仕事の後始末 (P1-1) ─────
+
+    /// 仕事の記録を 1 件置く (`owner_pid` を指定できる)。
+    fn put_job(id: &str, target: &TargetId, state: ExecutionJobState, owner_pid: u32) {
+        store::upsert_job(&crate::features::cloud_execution::model::ExecutionJob {
+            id: crate::features::cloud_execution::model::JobId::new(id),
+            target: target.clone(),
+            state,
+            command: "true".into(),
+            workspace: None,
+            result_ref: String::new(),
+            result_oid: String::new(),
+            owner_pid,
+            started_unix: 1,
+            ended_unix: 0,
+            exit_code: None,
+            message: String::new(),
+        })
+        .expect("書ける");
+    }
+
+    /// **もう居ない PID。** 自分自身の PID から離れた大きな値を使い、
+    /// 生きていないことを確かめてから使う (偶然生きていたら試験が嘘になる)。
+    fn dead_pid() -> u32 {
+        for pid in [4_000_001u32, 4_000_003, 4_000_007, 4_000_011] {
+            if !crate::instances::pid_alive(pid) {
+                return pid;
+            }
+        }
+        panic!("死んでいる PID を選べない");
+    }
+
+    /// **P1-1 の再現。** `kill -9` / OOM / 電源断では [`SlotGuard`] の Drop が
+    /// 呼ばれないので、台帳に枠が残ったまま実行中の仕事は 0 件になる。
+    #[test]
+    fn stale_running_job_does_not_permanently_consume_slot() {
+        let _home = home_guard("reconcile-stale");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 1);
+        mark_ready(&t.id);
+
+        // 落ちたプロセスが残した状態: 枠は埋まったまま、記録は running のまま
+        std::mem::forget(SlotGuard::claim(&t.id).expect("取れる"));
+        put_job("j-dead", &t.id, ExecutionJobState::Running, dead_pid());
+        assert!(
+            claim_slot(&t.id).is_err(),
+            "後始末の前から枠が空いていては、再現になっていない"
+        );
+
+        let r = reconcile_active_jobs().expect("後始末できる");
+        assert_eq!(r.stale_jobs, 1, "{r:?}");
+        assert_eq!(r.freed_slots, 1, "{r:?}");
+
+        // 枠が返り、記録も終わったことになっている
+        assert_eq!(reg.find("dev-01").expect("引ける").capacity.active_jobs, 0);
+        SlotGuard::claim(&t.id).expect("また取れる");
+        let jobs = store::load_jobs().expect("読める");
+        assert_eq!(jobs[0].state, ExecutionJobState::Failed);
+        assert!(jobs[0].ended_unix > 0, "終わった時刻が入っていない");
+    }
+
+    /// **生きている仕事の枠は奪わない。**
+    #[test]
+    fn reconciliation_preserves_live_jobs() {
+        let _home = home_guard("reconcile-live");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 4);
+        mark_ready(&t.id);
+
+        // 生きている 1 本 (このプロセスが持ち主) と、落ちた 1 本
+        std::mem::forget(SlotGuard::claim(&t.id).expect("1 本目"));
+        std::mem::forget(SlotGuard::claim(&t.id).expect("2 本目"));
+        put_job(
+            "j-live",
+            &t.id,
+            ExecutionJobState::Running,
+            std::process::id(),
+        );
+        put_job("j-dead", &t.id, ExecutionJobState::Preparing, dead_pid());
+
+        let r = reconcile_active_jobs().expect("後始末できる");
+        assert_eq!(r.stale_jobs, 1, "生きている側まで片付けた: {r:?}");
+
+        assert_eq!(
+            reg.find("dev-01").expect("引ける").capacity.active_jobs,
+            1,
+            "生きている 1 本の枠まで返してしまった"
+        );
+        let jobs = store::load_jobs().expect("読める");
+        let live = jobs
+            .iter()
+            .find(|j| j.id.as_str() == "j-live")
+            .expect("在る");
+        assert_eq!(
+            live.state,
+            ExecutionJobState::Running,
+            "生きている記録を書き換えた"
+        );
+    }
+
+    /// **後始末は引き算しかしない** ので、途中で別のプロセスが枠を取っても
+    /// 上限を超えない / 取った枠が消えない。
+    #[test]
+    fn reconciliation_does_not_exceed_max_jobs() {
+        let _home = home_guard("reconcile-capacity");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+
+        // 落ちた 1 本ぶんの枠が残っている
+        std::mem::forget(SlotGuard::claim(&t.id).expect("取れる"));
+        put_job("j-dead", &t.id, ExecutionJobState::Running, dead_pid());
+
+        // 記録を片付けたあと・枠を返す前に、別のプロセスが枠を取った状況を作る
+        // (2 段のあいだに割り込まれても壊れないことを見る)
+        let stale = store::with_jobs(|jobs| {
+            for j in jobs.iter_mut() {
+                if !j.state.is_final() && !crate::instances::pid_alive(j.owner_pid) {
+                    j.state = ExecutionJobState::Failed;
+                }
+            }
+            1u16
+        })
+        .expect("書ける");
+        claim_slot(&t.id).expect("割り込みで 1 本取れる");
+        store::with_targets(|list| {
+            let c = &mut list[0].capacity;
+            c.active_jobs = c.active_jobs.saturating_sub(stale);
+        })
+        .expect("書ける");
+
+        let after = reg.find("dev-01").expect("引ける").capacity;
+        assert!(
+            after.active_jobs <= after.max_jobs,
+            "上限を超えた: {after:?}"
+        );
+        assert_eq!(after.active_jobs, 1, "割り込んだ側の枠が消えた: {after:?}");
+
+        // ここで後始末をもう一度呼んでも、二重には引かない
+        let r = reconcile_active_jobs().expect("後始末できる");
+        assert_eq!(r.stale_jobs, 0, "片付け済みの記録をもう一度数えた: {r:?}");
+        assert_eq!(reg.find("dev-01").expect("引ける").capacity.active_jobs, 1);
+    }
+
     /// **手元の行は台帳にも在るが、一覧には 1 行しか出ない。**
     #[test]
     fn 手元の実行先が二重に出ない() {
@@ -1069,7 +1314,8 @@ mod tests {
         let all = reg.targets().expect("数えられる");
         assert_eq!(
             all.iter()
-                .filter(|t| t.transport == super::super::model::TransportKind::Local)
+                .filter(|t| t.transport
+                    == crate::features::cloud_execution::model::TransportKind::Local)
                 .count(),
             1,
             "local が二重に出た: {all:#?}"

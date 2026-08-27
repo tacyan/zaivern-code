@@ -853,6 +853,21 @@ pub struct ExecutionJob {
     /// 「fetch は成功したが中身は古い」を区別できない。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub result_oid: String,
+    /// この仕事を握っているプロセスの PID。**0 は「分からない」**
+    /// (この欄が無かった頃の記録)。
+    ///
+    /// ## 何のために持つのか
+    ///
+    /// 枠 ([`TargetCapacity::active_jobs`]) を返すのは [`SlotGuard`] の Drop
+    /// だが、`kill -9` / OOM / 電源断では Drop が呼ばれない。すると台帳には
+    /// 「走っている 1 本」が残り続け、**実際には 0 件なのに枠が埋まったまま**
+    /// になる。持ち主の PID を残しておけば、次に起動したときに
+    /// 「このプロセスはもう居ない」と分かって枠を返せる
+    /// ([`super::registry::reconcile_active_jobs`])。
+    ///
+    /// [`SlotGuard`]: super::registry::SlotGuard
+    #[serde(default)]
+    pub owner_pid: u32,
     #[serde(default)]
     pub started_unix: u64,
     #[serde(default)]
