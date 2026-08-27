@@ -688,7 +688,7 @@ fn exec_cmd(args: &[String]) -> Result<String, Fail> {
     let target = pick_target(args, &reg)?;
     let launch = LaunchSpec::from_argv(&argv)?;
 
-    let mut sink = StdSink::default();
+    let mut sink = StdSink;
     let job = runner::exec_once(&target, &launch, reg.ssh_timeout(), &mut sink)?;
     match job.exit_code {
         Some(0) => Ok(String::new()),
@@ -810,7 +810,6 @@ fn copy_cmd(args: &[String]) -> Result<String, Fail> {
 }
 
 /// 標準出力／標準エラーへそのまま流す受け口。**溜めない。**
-#[derive(Default)]
 struct StdSink;
 
 impl super::model::EventSink for StdSink {
@@ -1301,7 +1300,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let e = provider_add(&args).err().expect("断る");
+        let e = provider_add(&args).expect_err("断る");
         match e {
             Fail::Cloud(c) => {
                 assert!(matches!(c, CloudError::Security(_)), "{c:?}");
@@ -1411,7 +1410,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         target_add(&add).expect("足せる");
-        let e = worker_destroy(&["dev-01".to_string()]).err().expect("断る");
+        let e = worker_destroy(&["dev-01".to_string()]).expect_err("断る");
         match e {
             Fail::Cloud(c) => assert!(format!("{c}").contains("--yes"), "{c}"),
             _ => panic!("同意を求めていない"),
@@ -1463,8 +1462,7 @@ mod tests {
         target_add(&add).expect("足せる");
         let reg = registry().expect("組める");
         let e = pick_target(&["--target".to_string(), "dev-01".to_string()], &reg)
-            .err()
-            .expect("選べない");
+            .expect_err("選べない");
         match e {
             Fail::Cloud(c) => {
                 assert_eq!(c.exit_code(), EXIT_NO_TARGET);

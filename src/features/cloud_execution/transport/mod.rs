@@ -140,9 +140,10 @@ pub(crate) fn run_child(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
                 return Ok(ExecResult {
                     exit_code: status.code(),
-                    duration_ms: started.elapsed().as_millis() as u64,
+                    duration_ms,
                 })
             }
             Ok(None) => {
@@ -247,7 +248,7 @@ pub(crate) fn parse_probe_output(text: &str) -> ProbeResult {
             arch: Architecture::from_uname(&arch),
             cpu_cores: cores,
             memory_mib: mem_mib,
-            disk_mib: disk_mib,
+            disk_mib,
             tools,
             ..Capabilities::default()
         },

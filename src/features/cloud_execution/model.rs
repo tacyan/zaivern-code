@@ -626,11 +626,16 @@ impl ExecRequest {
         }
     }
 
+    /// **試験のための組み立て。** 製品側は欄へ直に入れるので、出荷ビルドへ
+    /// 入れると「使われていない公開 API」になる (clippy がそれを咎める)。
+    #[cfg(test)]
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
+    /// **試験のための組み立て** ([`ExecRequest::with_cwd`] と同じ理由)。
+    #[cfg(test)]
     pub fn with_env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.insert(k.into(), v.into());
         self

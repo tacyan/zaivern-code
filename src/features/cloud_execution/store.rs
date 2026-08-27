@@ -476,7 +476,7 @@ mod tests {
         assert!(is_contended(&std::io::Error::from(ErrorKind::AlreadyExists)));
         // unix の権限エラーは本物の失敗 (待っても直らない)
         let denied = std::io::Error::from(ErrorKind::PermissionDenied);
-        assert_eq!(is_contended(&denied), false, "権限エラーを待ってしまう");
+        assert!(!is_contended(&denied), "権限エラーを待ってしまう");
     }
 
     #[test]

@@ -502,7 +502,6 @@ mod tests {
             .collect();
         let granted = handles
             .into_iter()
-            .filter(|h| h.is_finished() || true)
             .filter_map(|h| h.join().ok())
             .filter(|ok| *ok)
             .count();

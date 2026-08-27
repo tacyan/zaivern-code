@@ -63,11 +63,16 @@ impl LaunchSpec {
         Ok(Self::new(program.clone(), it.cloned().collect()))
     }
 
+    /// **試験のための組み立て。** 製品側は欄へ直に入れる (`spec.cwd = …`) ので、
+    /// ここを出荷ビルドへ入れると「使われていない公開 API」になる。
+    #[cfg(test)]
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 
+    /// **試験のための組み立て** ([`LaunchSpec::with_cwd`] と同じ理由)。
+    #[cfg(test)]
     pub fn with_env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.insert(k.into(), v.into());
         self
