@@ -573,8 +573,28 @@ impl ExecutionTarget {
 ///
 /// 型で包むのは、ローカルの [`PathBuf`] (Windows なら `\`) がそのまま
 /// リモートへ流れる事故を防ぐため。
+///
+/// ## 使ってよい文字を数えるほうを決める (§13 / P2-3)
+///
+/// `scp` のリモート側のパスは、**OpenSSH の版によって扱いが違う**。
+/// 9.0 より前の scp プロトコルでは、リモートで `scp -t <パス>` が
+/// *ログインシェル越しに*起こされるので、`;` `$( )` `` ` `` はそこで
+/// **展開される** — 転送のつもりでコマンドが走る。
+///
+/// 引用符で包む案は採らない。**版によって意味が変わる**からで、
+/// 9.0 以降の scp は SFTP を使うため `host:'/tmp/a b'` の引用符は
+/// *名前の一部*になり、古い版では消える。同じ入力が版で別の物を指すのは
+/// 安全でも正しくもない。
+///
+/// そこで**使ってよい文字を数え上げて、外れたら拒否する**。どの版でも
+/// 意味が 1 つに決まり、`scp` を SFTP に切り替えても、将来 rsync を
+/// 足しても、この保証は変わらない。
+/// (制御・空白・引用符・`;` `&` `|` `$` `` ` `` `*` `?` `( )` `< >` `:` などが外れる。)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RemotePath(String);
+
+/// 英数字のほかに [`RemotePath`] で使ってよい文字。
+pub const REMOTE_PATH_EXTRA: &str = "/._-+=@,~";
 
 impl RemotePath {
     /// 検査つきで作る。制御文字・`\` ・空を弾く。
@@ -598,6 +618,17 @@ impl RemotePath {
                 "リモートのパスは / か ~/ から始めてください",
             ));
         }
+        // **数え上げた文字だけを通す。** ここが scp の注入を塞ぐ 1 か所
+        // (`~` は先頭でしか意味が決まらないので、途中に在ったら拒む)。
+        if let Some((i, bad)) = s
+            .char_indices()
+            .find(|(i, c)| !is_remote_path_char(*c) || (*c == '~' && *i != 0))
+        {
+            return Err(CloudError::security(format!(
+                "リモートのパスに使えない文字があります: {bad:?} ({} 文字目)。\n                 英数字と {REMOTE_PATH_EXTRA} だけが使えます                  (空白や記号は scp の版によってリモートのシェルへ渡るため)",
+                i + 1
+            )));
+        }
         Ok(Self(s))
     }
 
@@ -610,6 +641,11 @@ impl RemotePath {
         &self.0
     }
 
+}
+
+/// リモートのパスに置いてよい 1 文字か。
+fn is_remote_path_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || REMOTE_PATH_EXTRA.contains(c)
 }
 
 impl fmt::Display for RemotePath {
@@ -1008,6 +1044,59 @@ mod tests {
             RemotePath::home(".zaivern/cloud").expect("作れる").as_str(),
             "~/.zaivern/cloud"
         );
+    }
+
+    /// **P2-3 の再現。** `scp` のリモート側パスは、OpenSSH の版によって
+    /// *リモートのシェルが展開する* (9.0 より前の scp プロトコル)。だから
+    /// `;` や `$(…)` を含むパスを受け取ると、**送受信のつもりでコマンドが走る**。
+    ///
+    /// ## なぜ引用符で包む案を採らないか
+    ///
+    /// 引用は**版によって意味が変わる**。OpenSSH 9.0 以降の scp は SFTP を
+    /// 使うので、`host:'/tmp/a b'` の引用符は**そのまま名前の一部**になる。
+    /// 古い版では展開されて `/tmp/a b` になる。同じ入力が版で別の物を指すのは、
+    /// 安全でも正しくもない。**受け取る形を狭めて拒否する**ほうが、どの版でも
+    /// 同じ 1 つの意味になる。
+    #[test]
+    fn リモートパスはシェルに解釈されうる文字を拒む() {
+        for bad in [
+            "/tmp/a;touch /tmp/pwned",
+            "/tmp/$(id)",
+            "/tmp/`id`",
+            "/tmp/a b",
+            "/tmp/it's",
+            "/tmp/a|b",
+            "/tmp/a&b",
+            "/tmp/a>b",
+            "/tmp/*",
+            "/tmp/a\"b",
+            // scp は最初の `:` で host と path を割るので、`:` は形そのものを壊す
+            "/tmp/other:/etc",
+            // `~` は先頭だけ (途中に置くと展開の対象が変わる)
+            "/tmp/~/x",
+        ] {
+            let e = RemotePath::new(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} を受け取ってしまった"));
+            assert!(matches!(e, CloudError::Security(_)), "{bad}: {e:?}");
+            // 何が駄目かを言う (直せない拒否は、拒否として役に立たない)
+            assert!(format!("{e}").contains("使えない文字"), "{bad}: {e}");
+        }
+    }
+
+    /// **狭めすぎない。** ふつうの作業場のパスは通る必要がある。
+    #[test]
+    fn ふつうのリモートパスは通る() {
+        for good in [
+            "/srv/work",
+            "~/work",
+            "~",
+            "~/.zaivern-cloud/1a2b3c4d5e6f7a8b/j-1m11ah0xx0ydw006",
+            "/tmp/zaivern-2026.08.27_v1.2.3+build/a-b_c.tar.gz",
+            "/srv/work/=+@,",
+        ] {
+            RemotePath::new(good).unwrap_or_else(|e| panic!("{good} を拒んだ: {e}"));
+        }
     }
 
     /// **仕込んだ秘密が Debug / Display のどちらからも出ない** (§57)。
