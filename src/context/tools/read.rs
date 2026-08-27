@@ -61,12 +61,21 @@ impl ReadParams {
 /// [`ReadParams::validate`] が 0 を弾いているので下限側は起こり得ないが、
 /// **不変条件に頼らず**ここでも飽和させる — 表示の都合で落ちる経路を
 /// 1 本も残さない。
+///
+/// ## 引く順序が意味を持つ
+///
+/// 終了行は `start + (limit - 1)` であって `(start + limit) - 1` ではない。
+/// 算術としては同じだが、**飽和させると同じにならない**:
+/// `start = usize::MAX` で前者は `MAX` に留まるのに対し、後者は足し算が
+/// `MAX` へ飽和したあと 1 引かれて `MAX - 1` になり、
+/// **終了行が開始行より小さい**という有り得ない範囲を表示する。
+/// 飽和は「上限で止める」だけなので、**止まったあとに引いてはいけない**。
 fn range_label(offset: Option<usize>, limit: Option<usize>) -> String {
     let start = offset.unwrap_or(1).max(1);
     match limit {
         Some(l) => format!(
             " range=L{start}..{}",
-            start.saturating_add(l).saturating_sub(1)
+            start.saturating_add(l.saturating_sub(1))
         ),
         None => format!(" range=L{start}..end"),
     }
@@ -320,28 +329,76 @@ mod tests {
         }
     }
 
-    /// **表示のための計算で panic しない。**
+    /// **表示のための計算で panic せず、範囲が逆向きにもならない。**
     ///
     /// `offset = usize::MAX` / `limit = 5` は実際に
     /// "attempt to add with overflow" で落ちていた (debug ビルド)。
+    /// それを飽和演算で塞いだあと、今度は**引く順序**で
+    /// `L18446744073709551615..18446744073709551614` という
+    /// 開始行より小さい終了行が出ていた。
     /// 純関数に切り出してあるので、境界を表で固定できる。
     #[test]
-    fn 行域の表記は飽和して落ちない() {
-        assert_eq!(range_label(Some(10), Some(5)), " range=L10..14");
-        assert_eq!(range_label(Some(1), Some(1)), " range=L1..1");
-        assert_eq!(range_label(None, None), " range=L1..end");
-        assert_eq!(range_label(Some(7), None), " range=L7..end");
-        // 上限付近でも足し算が回らない
-        assert_eq!(
-            range_label(Some(usize::MAX), Some(5)),
-            format!(" range=L{}..{}", usize::MAX, usize::MAX - 1)
-        );
-        assert_eq!(
-            range_label(Some(usize::MAX), Some(usize::MAX)),
-            format!(" range=L{}..{}", usize::MAX, usize::MAX - 1)
-        );
-        // 0 は validate が弾くので実際には来ないが、来ても落ちない
-        assert_eq!(range_label(Some(0), Some(0)), " range=L1..0");
+    fn 行域の表記は飽和して落ちず逆向きにもならない() {
+        let cases = [
+            (Some(10), Some(5), " range=L10..14".to_string()),
+            (Some(1), Some(1), " range=L1..1".to_string()),
+            (Some(7), None, " range=L7..end".to_string()),
+            (None, None, " range=L1..end".to_string()),
+            // 上限付近でも足し算が回らず、**開始行に留まる**
+            (
+                Some(usize::MAX),
+                Some(5),
+                format!(" range=L{}..{}", usize::MAX, usize::MAX),
+            ),
+            (
+                Some(usize::MAX),
+                Some(usize::MAX),
+                format!(" range=L{}..{}", usize::MAX, usize::MAX),
+            ),
+            (
+                Some(usize::MAX - 1),
+                Some(1),
+                format!(" range=L{}..{}", usize::MAX - 1, usize::MAX - 1),
+            ),
+            // 0 は validate が弾くので実際には来ないが、来ても
+            // 落ちず・逆向きにもならない
+            (Some(0), Some(0), " range=L1..1".to_string()),
+            (Some(0), Some(1), " range=L1..1".to_string()),
+        ];
+        for (offset, limit, want) in cases {
+            assert_eq!(
+                range_label(offset, limit),
+                want,
+                "offset={offset:?} limit={limit:?}"
+            );
+        }
+
+        // **終了行が開始行を下回る組が 1 つも無いこと**を、境界の総当たりで
+        // 見る (表に書き漏らした組を拾うのはこちら)。
+        let edges = [
+            1usize,
+            2,
+            3,
+            usize::MAX / 2,
+            usize::MAX - 2,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
+        for start in edges {
+            for l in edges {
+                let label = range_label(Some(start), Some(l));
+                let (lo, hi) = label
+                    .trim_start_matches(" range=L")
+                    .split_once("..")
+                    .expect("開始..終了 の形");
+                let (lo, hi) = (
+                    lo.parse::<usize>().expect("開始行"),
+                    hi.parse::<usize>().expect("終了行"),
+                );
+                assert!(hi >= lo, "逆向きの範囲: start={start} limit={l} → {label}");
+                assert_eq!(lo, start, "開始行が動いた: {label}");
+            }
+        }
     }
 
     /// 上限付近の `offset` を**道具の経路ごと**通しても落ちない
