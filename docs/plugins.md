@@ -421,12 +421,21 @@ GitHub にそのまま置いても構いませんし、フォルダを直接
 | `agent-compare` | 並列で走らせた結果を突き合わせ、変更量を並べて比較し、採用するものを選んで取り込む |
 | `diff-review` | 差分の行にコメントを溜め、まとめてエージェントへ返す |
 | `tasks` | 課題や変更依頼を一覧し、そこから作業ブランチを起こす。差分表示やコメント投稿も行う |
-| `remote-host` | 別のマシン上で実行・同期・エージェント起動を行う |
+| `remote-host` | 別のマシン上で実行・同期・エージェント起動を行う (**legacy adapter**。下記) |
 | `element-capture` | 画面上の要素を選び、その構造・スタイル・切り抜き画像をプロンプトへ渡す |
 | `usage-meter` | エージェントの利用状況をパネルに表示する |
 | `quick-actions` | プロジェクトの種類を判別し、テスト・ビルド・整形をすぐ実行する |
 | `syntax-pack` | syntect の既定に無い言語の構文ハイライトを足す (`[[syntax]]`) |
 | `english-mode` | UI を英語表示に切り替える言語パック (`[language]`)。**既定は無効** |
+
+> **`remote-host` は legacy adapter です。**
+> SSH の正準実装は Rust 側の Cloud Execution (`zai cloud …`) へ移りました
+> (`docs/cloud-execution.md`)。既存の利用者を壊さないためプラグインは残しますが、
+> **新機能はプラグイン側へ足しません。** プラグインの `ssh_opts` はシェル行へ
+> 連結され、host key の確認も known_hosts の指定もありません。Rust 側は
+> どちらも直してあり (引数配列・`StrictHostKeyChecking=yes`・専用 known_hosts)、
+> 対応は `exec.sh` → `zai cloud exec` / `push.sh` `pull.sh` → `zai cloud copy` /
+> `agent.sh` → `zai cloud launch` / `worktree.sh` → `zai cloud job run` です。
 
 自分の環境に合わないものは無効にして構いません。
 **足りないものは、このガイドの手順で足してください。**

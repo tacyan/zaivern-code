@@ -69,6 +69,13 @@ allow = [
     # option-ext (dirs の依存)。MPL-2.0 はファイル単位のコピーレフトで、
     # そのファイルを改変せず利用する限り Apache-2.0 の配布と両立する。
     "MPL-2.0",
+    # webpki-roots (ureq → rustls の依存)。中身は **Mozilla の CA ルート証明書の
+    # データ**であってコードではない。CDLA-Permissive-2.0 は Linux Foundation の
+    # データ用寛容ライセンスで、再配布に必要なのは受領者への同ライセンス提供のみ
+    # (コピーレフトも表示義務も無い) — Apache-2.0 の配布と両立する。
+    # 外す条件: ureq を外す日、または rustls が OS のトラストストアだけを見る
+    # 構成へ替える日。そのときはこの行を消して緑になることを確かめること。
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
