@@ -48,6 +48,9 @@ use crate::features::cloud_execution::model::{
 
 use super::{parse_probe_output, run_child, ExecutionTransport, PROBE_SCRIPT};
 
+/// 起動する OpenSSH クライアントの名前。**綴りを 1 か所に持つ。**
+pub const SSH_PROGRAM: &str = "ssh";
+
 /// host key の確かめ方。**`no` は無い** (型として持たない = 書けない)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostKeyPolicy {
@@ -316,7 +319,7 @@ pub fn ssh_command(
 ) -> Result<Command, CloudError> {
     let mut argv = ssh_argv(target, opts)?;
     argv.push(remote_script(req)?);
-    let mut cmd = crate::procx::hidden_command("ssh");
+    let mut cmd = crate::procx::hidden_command(SSH_PROGRAM);
     cmd.args(&argv);
     Ok(cmd)
 }
@@ -333,9 +336,40 @@ pub fn ssh_shell_command(
     // 対話ではパスフレーズを聞かれてよい (人が見ている)
     opts.batch = false;
     let argv = ssh_argv(target, &opts)?;
-    let mut cmd = crate::procx::hidden_command("ssh");
+    let mut cmd = crate::procx::hidden_command(SSH_PROGRAM);
     cmd.args(&argv);
     Ok(cmd)
+}
+
+/// 対話起動のための**引数配列** (リモートで走らせる中身を末尾に付ける)。
+///
+/// ## なぜ文字列に畳まないのか (この版で直した壊れ方)
+///
+/// 畳んだ 1 行をローカルのシェルへ渡すと、**そのシェルの引用規則で読み直される**。
+/// [`ssh_command_line`] が組むのは POSIX シェル向けの引用なので、
+/// `cmd.exe` へ渡すと単一引用符が引用として扱われず、引数が丸ごと壊れる
+/// (`'-o'` が文字どおり `'-o'` というホスト名扱いになる等)。
+///
+/// **起動するだけなら文字列にする理由が無い。** そのまま
+/// `Command::new(argv[0]).args(&argv[1..])` へ渡せば、ローカルのシェルは
+/// 1 枚も挟まらない。リモート側の引用 ([`remote_script`]) は末尾の 1 要素の
+/// 中だけで完結する。
+/// **先頭は起動するプログラム名 (`ssh`)** で、そのまま
+/// `Command::new(&argv[0]).args(&argv[1..])` へ渡せる形。
+pub fn ssh_interactive_argv(
+    target: &ExecutionTarget,
+    remote_script: &str,
+    opts: &SshOptions,
+) -> Result<Vec<String>, CloudError> {
+    let mut opts = opts.clone();
+    // 対話するので擬似端末を割り当てる (エージェントは端末を前提にしている)
+    opts.tty = true;
+    // 人が見ているのでパスフレーズを聞かれてよい
+    opts.batch = false;
+    let mut argv = vec![SSH_PROGRAM.to_string()];
+    argv.extend(ssh_argv(target, &opts)?);
+    argv.push(remote_script.to_string());
+    Ok(argv)
 }
 
 /// 既存の PTY セッション ([`crate::terminal::Session`]) へ渡すための**コマンド行**。
@@ -344,7 +378,7 @@ pub fn ssh_shell_command(
 /// 文字列へ畳む。畳み方は [`posix_quote`] と同じ規則を使う。
 pub fn ssh_command_line(target: &ExecutionTarget, opts: &SshOptions) -> Result<String, CloudError> {
     let argv = ssh_argv(target, opts)?;
-    let mut line = String::from("ssh");
+    let mut line = String::from(SSH_PROGRAM);
     for a in argv {
         line.push(' ');
         line.push_str(&posix_quote(&a));

@@ -67,6 +67,9 @@ impl Prefer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reject {
     NotReady,
+    /// 破棄を予約した / 結果が分からない実行先。**「未確認」と混ぜない** —
+    /// 利用者が次に打つ手が違う (probe で確かめ直すか、台帳から外すか)。
+    Destroying,
     Os,
     Arch,
     Cpu,
@@ -82,6 +85,7 @@ impl Reject {
     pub fn id(self) -> &'static str {
         match self {
             Self::NotReady => "not-ready",
+            Self::Destroying => "destroying",
             Self::Os => "os",
             Self::Arch => "arch",
             Self::Cpu => "cpu",
@@ -100,6 +104,9 @@ pub fn evaluate(
     req: &ExecutionRequirements,
     t: &ExecutionTarget,
 ) -> Result<(), Reject> {
+    if t.lifecycle == TargetLifecycle::Destroying {
+        return Err(Reject::Destroying);
+    }
     if t.lifecycle != TargetLifecycle::Ready {
         return Err(Reject::NotReady);
     }
@@ -306,6 +313,18 @@ mod tests {
             );
             assert_eq!(select_target(&ExecutionRequirements::default(), std::slice::from_ref(&t)), None);
         }
+    }
+
+    /// **削除中は「未確認」と別の理由で断る。** 次に打つ手が違うので、
+    /// 同じ文面にすると利用者が probe を繰り返すことになる。
+    #[test]
+    fn 削除中は専用の理由で断る() {
+        let mut t = target("a", TargetOpts::default());
+        t.lifecycle = TargetLifecycle::Destroying;
+        let req = ExecutionRequirements::default();
+        assert_eq!(evaluate(&req, &t), Err(Reject::Destroying));
+        assert_eq!(select_target(&req, std::slice::from_ref(&t)), None);
+        assert_eq!(explain(&req, &[t])[0].1.id(), "destroying");
     }
 
     #[test]

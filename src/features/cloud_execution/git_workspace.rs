@@ -38,6 +38,12 @@ use super::transport::ExecutionTransport;
 /// 持ち帰った枝を置く名前空間。**利用者の枝と混ざらない場所**。
 pub const RESULT_NAMESPACE: &str = "refs/remotes/zaivern-cloud";
 
+/// **リモート側**で結果を固定する参照の名前空間。
+///
+/// 枝ではなく参照に固定するのが要 — 枝は動くが、これは動かない
+/// ([`snapshot_script`] の説明を参照)。
+pub const REMOTE_RESULT_NAMESPACE: &str = "refs/zaivern/result";
+
 /// リモートの bare リポジトリ。ワークスペースキーで分ける
 /// ([`crate::history::workspace_key`] が真実の在り処)。
 pub fn bare_repo(workspace_key: &str) -> Result<RemotePath, CloudError> {
@@ -67,6 +73,22 @@ pub fn job_branch(job_id: &str) -> Result<String, CloudError> {
 pub fn result_ref(job_id: &str) -> Result<String, CloudError> {
     check_id(job_id)?;
     Ok(format!("{RESULT_NAMESPACE}/{job_id}"))
+}
+
+/// リモート側で結果 OID を固定する参照。
+pub fn remote_result_ref(job_id: &str) -> Result<String, CloudError> {
+    check_id(job_id)?;
+    Ok(format!("{REMOTE_RESULT_NAMESPACE}/{job_id}"))
+}
+
+/// git のオブジェクト ID として受け取ってよい形か。
+///
+/// **SHA-1 の 40 桁だけを前提にしない。** git は SHA-256 のリポジトリを
+/// 作れて、そこでは 64 桁になる。長さを 1 つに決め打つと、その日から
+/// 「回収したのに照合できない」になる。
+pub fn is_object_id(s: &str) -> bool {
+    let n = s.len();
+    (40..=64).contains(&n) && n.is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// 仕事 ID として受け取ってよい形か。
@@ -208,17 +230,35 @@ pub fn add_worktree_script(
     )
 }
 
-/// 未コミットの変更を、持ち帰るためだけの commit にする sh の断片 (§29)。
+/// 未コミットの変更を持ち帰るためだけの commit にし、**いま HEAD が指して
+/// いるもの**を仕事専用の参照へ固定する sh の断片 (§29)。
 ///
 /// **GitHub へ push するための commit ではない。** リモートから手元へ
 /// 安全に戻すための輸送用で、そのことをメッセージに書く。
-pub fn snapshot_script(dir: &RemotePath, job_id: &str) -> String {
+///
+/// ## なぜ枝ではなく参照へ固定するのか (この版で直した壊れ方)
+///
+/// 最初の版は「作った時の枝名 (`zai/cloud/<job>`) を fetch する」形だった。
+/// ところが **snapshot が付くのは枝ではなく HEAD** なので、
+///
+/// * エージェントが `git switch -c other` で別の枝へ移った
+/// * detached HEAD のまま作業した
+///
+/// のどちらでも、成果は HEAD 側に付き `zai/cloud/<job>` は**古いまま**残る。
+/// その枝は実在するので **fetch は成功し**、1 バイトも持ち帰らないまま
+/// 「成功」として worktree を片付けてしまう — 作業が消えるのに、
+/// どこにもエラーが出ない。いちばん静かな壊れ方である。
+///
+/// だから HEAD の OID をリモート側で**動かない参照**へ固定し、
+/// その参照を取りに行く ([`fetch_and_verify`] が OID の一致まで確かめる)。
+pub fn snapshot_script(dir: &RemotePath, job_id: &str, result_ref: &str) -> String {
     let d = quote_home(dir);
     let msg = posix_quote(&format!(
         "zaivern: snapshot cloud job {job_id}\n\n\
          リモートの作業を手元へ戻すための輸送用コミットです。\
          そのまま公開する前提のものではありません。"
     ));
+    let rref = posix_quote(result_ref);
     format!(
         "set -e; cd {d}; \
          if [ -n \"$(git status --porcelain)\" ]; then \
@@ -227,8 +267,41 @@ pub fn snapshot_script(dir: &RemotePath, job_id: &str) -> String {
                commit -q -m {msg}; \
            echo zv_snapshot=1; \
          else echo zv_snapshot=0; fi; \
-         git rev-parse HEAD"
+         zv_oid=$(git rev-parse HEAD); \
+         git update-ref {rref} \"$zv_oid\"; \
+         echo zv_result_oid=$zv_oid"
     )
+}
+
+/// [`snapshot_script`] の出力を読む。**純関数**なので表で固定できる。
+///
+/// 返すのは `(確定した OID, 輸送用コミットを作ったか)`。
+/// OID が出ていなければ**失敗として返す** — 「取れなかったが成功」に
+/// してしまうと、その先の照合が素通りする。
+pub fn parse_snapshot_output(text: &str) -> Result<(String, bool), CloudError> {
+    let text = text.replace("\r\n", "\n");
+    let mut oid: Option<String> = None;
+    let mut snapshotted = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "zv_snapshot=1" {
+            snapshotted = true;
+        }
+        if let Some(v) = line.strip_prefix("zv_result_oid=") {
+            oid = Some(v.trim().to_string());
+        }
+    }
+    let Some(oid) = oid else {
+        return Err(CloudError::transport(
+            "リモートで結果の位置を確定できませんでした (OID が返っていません)",
+        ));
+    };
+    if !is_object_id(&oid) {
+        return Err(CloudError::transport(format!(
+            "リモートが返した OID の形が違います: {oid}"
+        )));
+    }
+    Ok((oid, snapshotted))
 }
 
 /// worktree を片付ける sh の断片 (§30)。
@@ -295,6 +368,8 @@ pub struct RemoteWorkspace {
     pub branch: String,
     pub base: String,
     pub job_id: String,
+    /// リモート側で結果 OID を固定する参照。**枝と違って動かない。**
+    pub remote_result: String,
 }
 
 impl RemoteWorkspace {
@@ -305,8 +380,20 @@ impl RemoteWorkspace {
             branch: job_branch(job_id)?,
             base: base_ref(job_id)?,
             job_id: job_id.to_string(),
+            remote_result: remote_result_ref(job_id)?,
         })
     }
+}
+
+/// 持ち帰った結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedResult {
+    /// 手元の追跡参照 (`refs/remotes/zaivern-cloud/<job>`)。
+    pub result_ref: String,
+    /// リモートで確定し、手元でも一致を確かめた OID。
+    pub oid: String,
+    /// 未コミットの変更を輸送用コミットにしたか。
+    pub snapshotted: bool,
 }
 
 /// 手元の HEAD をリモートの bare リポジトリへ押し込み、worktree を作る。
@@ -361,37 +448,55 @@ pub fn prepare(
     Ok(())
 }
 
-/// 結果を持ち帰る。**利用者の枝には触らない。**
+/// リモートで snapshot を取り、**いまの HEAD** を仕事専用の参照へ固定する。
 ///
-/// 返すのは「持ち帰った参照」と「輸送用の commit を作ったか」。
-pub fn collect(
+/// 返すのは `(確定した OID, 輸送用コミットを作ったか)`。
+pub fn snapshot_and_pin(
     transport: &dyn ExecutionTransport,
     target: &ExecutionTarget,
-    local_repo: &Path,
     ws: &RemoteWorkspace,
-    opts: &SshOptions,
-    timeout: Duration,
 ) -> Result<(String, bool), CloudError> {
     let out = run_remote(
         transport,
         target,
-        &snapshot_script(&ws.dir, &ws.job_id),
+        &snapshot_script(&ws.dir, &ws.job_id, &ws.remote_result),
         "リモートの変更を確認",
     )?;
-    let snapshotted = out.lines().any(|l| l.trim() == "zv_snapshot=1");
+    parse_snapshot_output(&out)
+}
 
-    let url = ssh_git_url(target, &ws.repo)?;
-    let ssh = git_ssh_command(target, opts)?;
+/// 固定した参照を手元へ持ち帰り、**OID の一致まで確かめる**。
+///
+/// * 取りに行くのは枝ではなく [`RemoteWorkspace::remote_result`]
+/// * 置き先は手元の専用名前空間だけ (`refs/remotes/zaivern-cloud/<job>`)
+/// * **一致しなければ失敗として返す。** 失敗しても回収用の参照は消さない —
+///   消すと、手元に届いていたかもしれないものまで失う
+///
+/// `ssh_command` は `GIT_SSH_COMMAND` に入れる 1 行。ローカルのパスを
+/// `url` に渡すときは `None` でよい (試験がそうする)。
+pub fn fetch_and_verify(
+    local_repo: &Path,
+    url: &str,
+    ws: &RemoteWorkspace,
+    expected_oid: &str,
+    ssh_command: Option<&str>,
+    timeout: Duration,
+) -> Result<String, CloudError> {
+    if !is_object_id(expected_oid) {
+        return Err(CloudError::transport(format!(
+            "確定した OID の形が違います: {expected_oid}"
+        )));
+    }
     let dest = result_ref(&ws.job_id)?;
     let (r, sink) = run_local_git(
         local_repo,
         &[
             "fetch".into(),
             "--no-tags".into(),
-            url,
-            format!("+{}:{}", ws.branch, dest),
+            url.to_string(),
+            format!("+{}:{}", ws.remote_result, dest),
         ],
-        Some(&ssh),
+        ssh_command,
         timeout,
     )?;
     if !r.ok() {
@@ -400,7 +505,50 @@ pub fn collect(
             sink.stderr_text().trim()
         )));
     }
-    Ok((dest, snapshotted))
+
+    // **届いたものが、リモートで確定したものと同じかを確かめる。**
+    // fetch が成功したことは「何かを取った」しか意味しない。
+    let (rev, rev_sink) = run_local_git(
+        local_repo,
+        &["rev-parse".into(), dest.clone()],
+        None,
+        timeout,
+    )?;
+    if !rev.ok() {
+        return Err(CloudError::transport(format!(
+            "持ち帰った参照を読めませんでした: {}",
+            rev_sink.stderr_text().trim()
+        )));
+    }
+    let got = rev_sink.stdout_text().trim().to_string();
+    if got != expected_oid {
+        return Err(CloudError::transport(format!(
+            "持ち帰った結果がリモートで確定したものと違います \
+             (リモート {expected_oid} / 手元 {got})。\n\
+             リモートの作業場は片付けずに残します"
+        )));
+    }
+    Ok(dest)
+}
+
+/// 結果を持ち帰る。**利用者の枝には触らない。**
+pub fn collect(
+    transport: &dyn ExecutionTransport,
+    target: &ExecutionTarget,
+    local_repo: &Path,
+    ws: &RemoteWorkspace,
+    opts: &SshOptions,
+    timeout: Duration,
+) -> Result<CollectedResult, CloudError> {
+    let (oid, snapshotted) = snapshot_and_pin(transport, target, ws)?;
+    let url = ssh_git_url(target, &ws.repo)?;
+    let ssh = git_ssh_command(target, opts)?;
+    let result_ref = fetch_and_verify(local_repo, &url, ws, &oid, Some(&ssh), timeout)?;
+    Ok(CollectedResult {
+        result_ref,
+        oid,
+        snapshotted,
+    })
 }
 
 /// worktree を片付ける。
@@ -602,7 +750,11 @@ mod tests {
 
     #[test]
     fn 輸送用コミットはそう名乗る() {
-        let s = snapshot_script(&job_dir("j-abc").expect("組める"), "j-abc");
+        let s = snapshot_script(
+            &job_dir("j-abc").expect("組める"),
+            "j-abc",
+            &remote_result_ref("j-abc").expect("組める"),
+        );
         assert!(s.contains("zaivern: snapshot cloud job j-abc"), "{s}");
         assert!(s.contains("輸送用"), "{s}");
         // 変更が無ければ commit しない
@@ -674,6 +826,56 @@ mod tests {
     }
 
     #[test]
+    fn オブジェクトidは長さを決め打たない() {
+        // SHA-1 (40) と SHA-256 (64) の両方を受ける
+        assert!(is_object_id(&"a".repeat(40)));
+        assert!(is_object_id(&"0123456789abcdef".repeat(4)));
+        // 形が違うものは断る
+        assert!(!is_object_id(&"a".repeat(39)));
+        assert!(!is_object_id(&"a".repeat(65)));
+        assert!(!is_object_id(&"a".repeat(41)), "奇数長は無い");
+        assert!(!is_object_id(""));
+        assert!(!is_object_id(&format!("{}z", "a".repeat(39))), "hex でない");
+        assert!(!is_object_id("HEAD"));
+    }
+
+    #[test]
+    fn snapshotの出力からoidを読む() {
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let (got, snap) =
+            parse_snapshot_output(&format!("zv_snapshot=1\nzv_result_oid={oid}\n"))
+                .expect("読める");
+        assert_eq!(got, oid);
+        assert!(snap);
+
+        let (_, snap) = parse_snapshot_output(&format!("zv_snapshot=0\nzv_result_oid={oid}"))
+            .expect("読める");
+        assert!(!snap);
+
+        // CRLF でも読める (Windows 由来のシェルから返ることがある)
+        assert!(parse_snapshot_output(&format!("zv_snapshot=0\r\nzv_result_oid={oid}\r\n")).is_ok());
+
+        // **OID が無ければ失敗として返す。** 「取れなかったが成功」にすると
+        // その先の照合が素通りする
+        assert!(parse_snapshot_output("zv_snapshot=1\n").is_err());
+        assert!(parse_snapshot_output("").is_err());
+        assert!(parse_snapshot_output("zv_result_oid=nope").is_err());
+    }
+
+    #[test]
+    fn 結果は枝ではなく参照へ固定する() {
+        let ws = RemoteWorkspace::new(KEY, "j-abc").expect("組める");
+        assert_eq!(ws.remote_result, "refs/zaivern/result/j-abc");
+        let s = snapshot_script(&ws.dir, &ws.job_id, &ws.remote_result);
+        // HEAD を読んで、その OID を参照へ固定している
+        assert!(s.contains("zv_oid=$(git rev-parse HEAD)"), "{s}");
+        assert!(s.contains("git update-ref 'refs/zaivern/result/j-abc'"), "{s}");
+        assert!(s.contains("echo zv_result_oid=$zv_oid"), "{s}");
+        // 仕事 ID の検査は参照名にも効く
+        assert!(remote_result_ref("../evil").is_err());
+    }
+
+    #[test]
     fn sshでない実行先はgitの転送先にならない() {
         let local = ExecutionTarget::local(1);
         assert!(matches!(
@@ -701,5 +903,345 @@ mod tests {
         assert!(cmds[0].contains("git init --bare"), "{}", cmds[0]);
         assert!(cmds[1].contains("worktree add"), "{}", cmds[1]);
         assert!(cmds[1].contains("'zai/cloud/j-abc'"), "{}", cmds[1]);
+    }
+}
+
+/// **実の git で端から端まで確かめる試験。**
+///
+/// スクリプトの文字列を突き合わせるだけでは、この層のいちばん大事な性質
+/// (「エージェントが枝を移しても成果を取り違えない」) を 1 バイトも見て
+/// いない。実際に bare リポジトリと worktree を作り、リモート側の断片を
+/// 本物の `sh` で走らせ、本物の `git fetch` で持ち帰って確かめる。
+///
+/// **unix 限定。** [`RemotePath`] は POSIX の形しか受けないので、Windows の
+/// 一時パス (`C:\…`) では実験場そのものが作れない (断るのが正しい挙動)。
+/// Windows での担保は上の純関数の試験が受け持つ。
+#[cfg(all(test, unix))]
+mod live_git_tests {
+    use super::*;
+    use crate::features::cloud_execution::model::ExecutionTarget;
+    use crate::features::cloud_execution::transport::LocalTransport;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn timeout() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    /// 実験場の git を撃つ。
+    ///
+    /// * **cwd を継承させない** (`-C` で固定する)。継承させると、実験場の
+    ///   外のリポジトリを触りうる
+    /// * **利用者の設定を読ませない。** `core.hooksPath` のような global 設定は
+    ///   このリポジトリの挙動まで変える (CI にはあって手元に無い設定がある)
+    fn git_at(dir: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git を起動できる")
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = git_at(dir, args);
+        assert!(
+            out.status.success(),
+            "git {args:?} が失敗: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    struct Lab {
+        _root: PathBuf,
+        local: PathBuf,
+        bare: PathBuf,
+        work: PathBuf,
+        ws: RemoteWorkspace,
+    }
+
+    impl Lab {
+        /// リモート側で走らせる (本物の `sh` を通る)。
+        fn snapshot(&self) -> Result<(String, bool), CloudError> {
+            let tr = LocalTransport::new(timeout());
+            snapshot_and_pin(&tr, &ExecutionTarget::local(1), &self.ws)
+        }
+
+        /// 手元へ持ち帰る (本物の `git fetch` を通る)。
+        fn fetch(&self, expected: &str) -> Result<String, CloudError> {
+            fetch_and_verify(
+                &self.local,
+                self.bare.to_str().expect("utf-8"),
+                &self.ws,
+                expected,
+                None,
+                timeout(),
+            )
+        }
+
+        fn work_head(&self) -> String {
+            git_ok(&self.work, &["rev-parse", "HEAD"])
+        }
+    }
+
+    /// 手元 → bare → worktree まで、本番と同じ順で組む。
+    fn lab(tag: &str) -> Lab {
+        let root = crate::test_util::unique_temp_dir("zv-cloud", tag);
+        let local = root.join("local");
+        let bare = root.join("remote.git");
+        let work = root.join("job");
+        std::fs::create_dir_all(&local).expect("作れる");
+
+        git_ok(&local, &["init", "-q", "-b", "main", "."]);
+        git_ok(&local, &["config", "user.name", "Test"]);
+        git_ok(&local, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(local.join("a.txt"), b"hello\n").expect("書ける");
+        git_ok(&local, &["add", "-A"]);
+        git_ok(&local, &["commit", "-q", "-m", "initial"]);
+
+        let job = "j-live";
+        let ws = RemoteWorkspace {
+            repo: RemotePath::new(bare.to_str().expect("utf-8")).expect("作れる"),
+            dir: RemotePath::new(work.to_str().expect("utf-8")).expect("作れる"),
+            branch: job_branch(job).expect("組める"),
+            base: base_ref(job).expect("組める"),
+            job_id: job.to_string(),
+            remote_result: remote_result_ref(job).expect("組める"),
+        };
+
+        // 本番の `prepare` と同じ 3 段
+        let tr = LocalTransport::new(timeout());
+        run_remote(
+            &tr,
+            &ExecutionTarget::local(1),
+            &init_bare_script(&ws.repo),
+            "用意",
+        )
+        .expect("bare を作れる");
+        git_ok(
+            &local,
+            &[
+                "push",
+                "-q",
+                bare.to_str().expect("utf-8"),
+                &format!("HEAD:{}", ws.base),
+            ],
+        );
+        run_remote(
+            &tr,
+            &ExecutionTarget::local(1),
+            &add_worktree_script(&ws.repo, &ws.dir, &ws.branch, &ws.base),
+            "worktree",
+        )
+        .expect("worktree を作れる");
+
+        Lab {
+            _root: root,
+            local,
+            bare,
+            work,
+            ws,
+        }
+    }
+
+    /// リモート側で 1 コミット積む (エージェントの作業を模す)。
+    fn commit_in_work(lab: &Lab, file: &str, body: &str, msg: &str) -> String {
+        std::fs::write(lab.work.join(file), body).expect("書ける");
+        git_ok(&lab.work, &["add", "-A"]);
+        git_ok(
+            &lab.work,
+            &[
+                "-c",
+                "user.name=Agent",
+                "-c",
+                "user.email=agent@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ],
+        );
+        lab.work_head()
+    }
+
+    /// 回収したものが、リモートで確定したものと同じ内容かを確かめる。
+    fn assert_collected(lab: &Lab, oid: &str, file: &str, body: &str) {
+        let dest = result_ref(&lab.ws.job_id).expect("組める");
+        assert_eq!(
+            git_ok(&lab.local, &["rev-parse", &dest]),
+            oid,
+            "追跡参照が指す先が違う"
+        );
+        let shown = git_ok(&lab.local, &["show", &format!("{dest}:{file}")]);
+        assert_eq!(shown.trim(), body.trim(), "中身が違う");
+    }
+
+    #[test]
+    fn 元のジョブ枝で作業した成果を回収する() {
+        let lab = lab("live-same-branch");
+        let head = commit_in_work(&lab, "b.txt", "on-job-branch\n", "work on job branch");
+        let (oid, snapped) = lab.snapshot().expect("固定できる");
+        assert_eq!(oid, head);
+        assert!(!snapped, "未コミットは無いので輸送用コミットは作らない");
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "b.txt", "on-job-branch");
+    }
+
+    /// **これが指摘の本体。** 枝を移されると、旧実装は古い枝を取って
+    /// 「成功」してしまう (成果が 1 バイトも入っていない)。
+    #[test]
+    fn 別の枝へ移って作業した成果を回収する() {
+        let lab = lab("live-switch");
+        let before = lab.work_head();
+        git_ok(&lab.work, &["switch", "-q", "-c", "agent/side"]);
+        let head = commit_in_work(&lab, "b.txt", "on-side-branch\n", "work on side branch");
+        assert_ne!(head, before);
+
+        // 元のジョブ枝は**古いまま**である (旧実装はこれを取っていた)
+        let stale = git_ok(&lab.bare, &["rev-parse", &lab.ws.branch]);
+        assert_eq!(stale, before, "ジョブ枝が動いてしまっている (前提が崩れた)");
+
+        let (oid, _) = lab.snapshot().expect("固定できる");
+        assert_eq!(oid, head, "HEAD ではなく別のものを固定している");
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "b.txt", "on-side-branch");
+    }
+
+    #[test]
+    fn detached_headで作業した成果を回収する() {
+        let lab = lab("live-detached");
+        git_ok(&lab.work, &["switch", "-q", "--detach"]);
+        let head = commit_in_work(&lab, "b.txt", "on-detached\n", "work while detached");
+        // 枝はどこも指していない状態でも固定できる
+        let (oid, _) = lab.snapshot().expect("固定できる");
+        assert_eq!(oid, head);
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "b.txt", "on-detached");
+    }
+
+    #[test]
+    fn 未コミットの変更は輸送用コミットにして回収する() {
+        let lab = lab("live-dirty");
+        let before = lab.work_head();
+        std::fs::write(lab.work.join("c.txt"), "uncommitted\n").expect("書ける");
+        let (oid, snapped) = lab.snapshot().expect("固定できる");
+        assert!(snapped, "輸送用コミットを作っていない");
+        assert_ne!(oid, before);
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "c.txt", "uncommitted");
+        // 輸送用であることが読めば分かる
+        let msg = git_ok(&lab.local, &["log", "-1", "--format=%B", &oid]);
+        assert!(msg.contains("zaivern: snapshot cloud job"), "{msg}");
+    }
+
+    #[test]
+    fn detached_headでの未コミット変更も回収する() {
+        let lab = lab("live-detached-dirty");
+        git_ok(&lab.work, &["switch", "-q", "--detach"]);
+        std::fs::write(lab.work.join("c.txt"), "detached-dirty\n").expect("書ける");
+        let (oid, snapped) = lab.snapshot().expect("固定できる");
+        assert!(snapped);
+        lab.fetch(&oid).expect("回収できる");
+        assert_collected(&lab, &oid, "c.txt", "detached-dirty");
+    }
+
+    #[test]
+    fn oidが一致しなければ回収を成功にしない() {
+        let lab = lab("live-mismatch");
+        commit_in_work(&lab, "b.txt", "x\n", "work");
+        let (oid, _) = lab.snapshot().expect("固定できる");
+
+        // リモートで確定したものと違う OID を期待して回収する
+        let other = "0".repeat(oid.len());
+        let e = lab.fetch(&other).expect_err("断る");
+        assert!(matches!(e, CloudError::Transport(_)), "{e:?}");
+        assert!(format!("{e}").contains("片付けずに残します"), "{e}");
+
+        // **回収用の参照は消さない** (届いていたかもしれないものまで失う)
+        let dest = result_ref(&lab.ws.job_id).expect("組める");
+        assert_eq!(git_ok(&lab.local, &["rev-parse", &dest]), oid);
+    }
+
+    #[test]
+    fn 取りに行けなければ回収を成功にしない() {
+        let lab = lab("live-fetch-fail");
+        commit_in_work(&lab, "b.txt", "x\n", "work");
+        let (oid, _) = lab.snapshot().expect("固定できる");
+        let missing = lab._root.join("no-such-repo.git");
+        let e = fetch_and_verify(
+            &lab.local,
+            missing.to_str().expect("utf-8"),
+            &lab.ws,
+            &oid,
+            None,
+            timeout(),
+        )
+        .expect_err("断る");
+        assert!(matches!(e, CloudError::Transport(_)), "{e:?}");
+    }
+
+    /// **手元のものを 1 つも動かさない** (§28 / 要件 7)。
+    #[test]
+    fn 回収しても手元の枝とindexと作業ツリーは変わらない() {
+        let lab = lab("live-untouched");
+        // 手元を「作業中」の状態にしておく
+        std::fs::write(lab.local.join("wip.txt"), "work in progress\n").expect("書ける");
+        git_ok(&lab.local, &["add", "wip.txt"]);
+        std::fs::write(lab.local.join("a.txt"), "locally edited\n").expect("書ける");
+
+        let before_head = git_ok(&lab.local, &["rev-parse", "HEAD"]);
+        let before_branch = git_ok(&lab.local, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let before_status = git_ok(&lab.local, &["status", "--porcelain"]);
+        let before_index = git_ok(&lab.local, &["diff", "--cached", "--name-status"]);
+
+        commit_in_work(&lab, "b.txt", "remote work\n", "work");
+        let (oid, _) = lab.snapshot().expect("固定できる");
+        lab.fetch(&oid).expect("回収できる");
+
+        assert_eq!(git_ok(&lab.local, &["rev-parse", "HEAD"]), before_head, "HEAD が動いた");
+        assert_eq!(
+            git_ok(&lab.local, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            before_branch,
+            "枝が変わった"
+        );
+        assert_eq!(
+            git_ok(&lab.local, &["status", "--porcelain"]),
+            before_status,
+            "作業ツリーが変わった"
+        );
+        assert_eq!(
+            git_ok(&lab.local, &["diff", "--cached", "--name-status"]),
+            before_index,
+            "index が変わった"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lab.local.join("a.txt")).expect("読める"),
+            "locally edited\n",
+            "手元の編集が上書きされた"
+        );
+        // main は 1 バイトも動いていない
+        assert_eq!(git_ok(&lab.local, &["rev-parse", "main"]), before_head);
+    }
+
+    /// 回収した先は**専用の名前空間だけ**で、利用者の枝は増えていない。
+    #[test]
+    fn 回収先は専用の名前空間だけ() {
+        let lab = lab("live-namespace");
+        commit_in_work(&lab, "b.txt", "x\n", "work");
+        let (oid, _) = lab.snapshot().expect("固定できる");
+        lab.fetch(&oid).expect("回収できる");
+
+        let heads = git_ok(&lab.local, &["for-each-ref", "--format=%(refname)", "refs/heads/"]);
+        assert_eq!(heads, "refs/heads/main", "利用者の枝が増えた:\n{heads}");
+        let ours = git_ok(
+            &lab.local,
+            &["for-each-ref", "--format=%(refname)", RESULT_NAMESPACE],
+        );
+        assert_eq!(ours, format!("{RESULT_NAMESPACE}/{}", lab.ws.job_id));
     }
 }

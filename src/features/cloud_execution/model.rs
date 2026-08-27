@@ -373,6 +373,14 @@ pub enum TargetLifecycle {
     Ready,
     /// 新しい仕事を載せない (走っているものは終わらせる)。
     Draining,
+    /// **破棄を予約した。** Provider へ問い合わせている最中か、その結果が
+    /// 分からないまま残っている状態。
+    ///
+    /// この状態の実行先には**新しい枠を配らない** — 配ると、消えかけの
+    /// 機械へ仕事を載せることになる。回復は
+    /// `zai cloud target probe` (= Provider の状態を確かめ直す) か、
+    /// `zai cloud target remove` (= 台帳から外す)。
+    Destroying,
     /// 止まっている / 消えた。
     Stopped,
     /// 壊れている (理由付き)。
@@ -380,12 +388,22 @@ pub enum TargetLifecycle {
 }
 
 impl TargetLifecycle {
+    /// **新しい枠を配ってはいけない状態か。**
+    ///
+    /// 「能力が足りるか」「準備できているか」を決めるのは Scheduler の仕事で、
+    /// ここが見るのは**枠を配ると害がある**状態だけ (消えかけ / 消えた機械)。
+    /// 責務を混ぜると、同じ判断が 2 か所に分かれてずれる。
+    pub fn blocks_new_jobs(self) -> bool {
+        matches!(self, Self::Destroying | Self::Stopped)
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
             Self::Provisioning => "provisioning",
             Self::Ready => "ready",
             Self::Draining => "draining",
+            Self::Destroying => "destroying",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
         }
@@ -793,6 +811,12 @@ pub struct ExecutionJob {
     /// 結果を持ち帰った枝 (`refs/remotes/zaivern-cloud/<job>`)。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub result_ref: String,
+    /// リモートで確定し、手元でも一致を確かめた OID。
+    ///
+    /// **空でないことが「本当に持ち帰れた」の証拠**になる。参照名だけでは
+    /// 「fetch は成功したが中身は古い」を区別できない。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result_oid: String,
     #[serde(default)]
     pub started_unix: u64,
     #[serde(default)]

@@ -751,6 +751,7 @@ fn reject_text(r: scheduler::Reject) -> &'static str {
     use scheduler::Reject as R;
     match r {
         R::NotReady => "まだ届くことを確かめていません",
+        R::Destroying => "破棄の途中です (probe で確かめ直すか、target remove で外してください)",
         R::Os => "OS が合いません",
         R::Arch => "アーキテクチャが合いません",
         R::Cpu => "CPU が足りません",
@@ -830,12 +831,14 @@ fn launch_cmd(args: &[String]) -> Result<String, Fail> {
     // 2 通りの渡し方を持つ:
     //   --command "<行>"   … 既存カタログが組んだコマンド行をそのまま運ぶ
     //   -- <program> <引数> … 構造のまま渡す (空白や引用符で割れない)
-    let line = match (opt(args, "--command"), after_dashdash(args)) {
-        (Some(c), _) => super::command::session_command_line(&target, &c, cwd.as_deref(), &opts)?,
-        (None, Some(argv)) if !argv.is_empty() => {
-            let mut spec = LaunchSpec::from_argv(&argv)?;
-            spec.cwd = cwd;
-            super::command::launch_command_line(&target, &spec, &opts)?
+    let command = opt(args, "--command");
+    let argv = after_dashdash(args);
+    let spec = match (&command, &argv) {
+        (Some(_), _) => None,
+        (None, Some(a)) if !a.is_empty() => {
+            let mut spec = LaunchSpec::from_argv(a)?;
+            spec.cwd = cwd.clone();
+            Some(spec)
         }
         _ => {
             return Err(Fail::Usage(
@@ -846,23 +849,76 @@ fn launch_cmd(args: &[String]) -> Result<String, Fail> {
     };
 
     if !flag(args, "--run") {
+        // **貼るための 1 行。** どのシェル向けの引用かを必ず添える —
+        // POSIX 用の行を「どこでも使える」ように見せると、Windows の
+        // preset へ貼った人のところで静かに壊れる。
+        let line = match (&command, &spec) {
+            (Some(c), _) => super::command::session_command_line(&target, c, cwd.as_deref(), &opts)?,
+            (None, Some(s)) => super::command::launch_command_line(&target, s, &opts)?,
+            _ => unreachable!("上で使い方の誤りとして返している"),
+        };
+        // 注記は**標準エラーへ**。標準出力に混ぜると貼り付けに使えない
+        eprintln!(
+            "# 次の 1 行は POSIX シェル (sh / bash / zsh) 向けの引用です。\n\
+             # Windows の PowerShell / cmd.exe へはそのまま貼れません — \
+             その場で走らせるには --run を使ってください。"
+        );
         return Ok(line);
     }
-    // **その場で走らせる。** 対話するので標準入出力をそのまま渡す。
-    let mut cmd = crate::procx::hidden_command(if cfg!(windows) { "cmd" } else { "sh" });
-    if cfg!(windows) {
-        cmd.arg("/C").arg(&line);
-    } else {
-        cmd.arg("-c").arg(&line);
+
+    // **その場で走らせる。** ここでは表示用の 1 行を作らない —
+    // ローカルのシェルへ渡すと、その引用規則で読み直されて壊れる
+    // (`cmd.exe` は POSIX の単一引用符を引用として扱わない)。
+    let plan = match (&command, &spec) {
+        (Some(c), _) => super::command::run_plan_for_command(&target, c, cwd.as_deref(), &opts)?,
+        (None, Some(s)) => super::command::run_plan_for_spec(&target, s, &opts)?,
+        _ => unreachable!("上で使い方の誤りとして返している"),
+    };
+    let status = spawn_plan(&plan)?;
+    match status.code() {
+        Some(0) => Ok(String::new()),
+        // **相手の終了コードをそのまま返さない。** 1〜4 は Zaivern 自身の
+        // 意味を持つので、リモートの 2 が「使い方の誤り」に化ける。
+        // 代わりに 1 へ畳み、実際の値を標準エラーへ書く (`exec` と同じ)。
+        Some(code) => Err(Fail::Code(
+            EXIT_ERR,
+            format!("コマンドが {code} で終了しました"),
+        )),
+        None => Err(Fail::Code(EXIT_ERR, "コマンドが異常終了しました".into())),
     }
-    let status = cmd
-        .status()
-        .map_err(|e| CloudError::io(format!("起動できません: {e}")))?;
-    if status.success() {
-        Ok(String::new())
+}
+
+/// [`RunPlan`] を起動する。**標準入出力はそのまま引き継ぐ** (対話できる)。
+///
+/// `Command::status` は既定で親の stdin / stdout / stderr を継承するので、
+/// リダイレクトも終了コードもそのまま呼び出し元へ伝わる。
+fn spawn_plan(plan: &super::command::RunPlan) -> Result<std::process::ExitStatus, CloudError> {
+    let mut cmd = if plan.via_local_shell {
+        // 利用者が書いた 1 行を手元のシェルで走らせる場合だけ、シェルを挟む
+        let mut c = crate::procx::hidden_command(if cfg!(windows) { "cmd" } else { "sh" });
+        c.arg(if cfg!(windows) { "/C" } else { "-c" })
+            .arg(&plan.argv[0]);
+        c
     } else {
-        Err(Fail::Code(EXIT_ERR, String::new()))
+        let mut c = crate::procx::hidden_command(&plan.argv[0]);
+        c.args(&plan.argv[1..]);
+        c
+    };
+    if let Some(dir) = &plan.cwd {
+        cmd.current_dir(expand_local_home(dir));
     }
+    cmd.status()
+        .map_err(|e| CloudError::io(format!("{} を起動できません: {e}", plan.argv[0])))
+}
+
+/// 手元のパスの `~` を広げる。
+fn expand_local_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// `zai cloud copy` — ファイルを 1 つ送る / 受け取る。
@@ -1573,6 +1629,135 @@ mod tests {
             }
             _ => panic!("理由を言っていない"),
         }
+    }
+
+    // ───────── launch --run の起動経路 (指摘 4) ─────────
+
+    /// **終了コードがそのまま呼び出し元へ伝わる。**
+    #[test]
+    fn 起動計画の終了コードが伝わる() {
+        use super::super::command::RunPlan;
+        let plan = if cfg!(windows) {
+            RunPlan {
+                argv: vec!["cmd".into(), "/C".into(), "exit 3".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        } else {
+            RunPlan {
+                argv: vec!["sh".into(), "-c".into(), "exit 3".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        };
+        let status = spawn_plan(&plan).expect("起動できる");
+        assert_eq!(status.code(), Some(3));
+
+        // 成功も伝わる
+        let ok = if cfg!(windows) {
+            RunPlan {
+                argv: vec!["cmd".into(), "/C".into(), "exit 0".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        } else {
+            RunPlan {
+                argv: vec!["true".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        };
+        assert!(spawn_plan(&ok).expect("起動できる").success());
+    }
+
+    /// **相手の終了コードが失われない。**
+    ///
+    /// 実機で `sh -c 'exit 7'` を `--run` したら `rc=1` になり、7 がどこにも
+    /// 出ていなかった。1〜4 は Zaivern 自身の意味を持つので値をそのまま
+    /// 返すわけにはいかないが、**捨ててよいことにはならない**。
+    #[test]
+    fn 相手の終了コードは標準エラーへ残す() {
+        use super::super::command::RunPlan;
+        let plan = if cfg!(windows) {
+            RunPlan {
+                argv: vec!["cmd".into(), "/C".into(), "exit 7".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        } else {
+            RunPlan {
+                argv: vec!["sh".into(), "-c".into(), "exit 7".into()],
+                via_local_shell: false,
+                cwd: None,
+            }
+        };
+        let status = spawn_plan(&plan).expect("起動できる");
+        assert_eq!(status.code(), Some(7));
+
+        // CLI の層は 1 へ畳むが、値は文面に残す
+        let src = include_str!("cli.rs").replace("\r\n", "\n");
+        let body = src.split("#[cfg(test)]").next().unwrap_or_default();
+        let at = body.find("let status = spawn_plan(&plan)?;").expect("起動している");
+        let tail = &body[at..at + 700.min(body.len() - at)];
+        assert!(
+            tail.contains("コマンドが {code} で終了しました"),
+            "終了コードを捨てている:\n{tail}"
+        );
+    }
+
+    /// 起動できないものは、実行時の失敗として返る (黙って成功にしない)。
+    #[test]
+    fn 起動できなければ失敗として返る() {
+        use super::super::command::RunPlan;
+        let plan = RunPlan {
+            argv: vec!["zaivern-no-such-program-xyz".into()],
+            via_local_shell: false,
+            cwd: None,
+        };
+        assert!(spawn_plan(&plan).is_err());
+    }
+
+    /// **`--run` は POSIX 用の 1 行をローカルのシェルへ渡さない。**
+    ///
+    /// 渡していたのがこの版で直した壊れ方で、`cmd.exe` は POSIX の
+    /// 単一引用符を引用として扱わないため Windows で引数が壊れていた。
+    #[test]
+    fn runはposix用の行をローカルシェルへ渡さない() {
+        let src = include_str!("cli.rs").replace("\r\n", "\n");
+        let body = src.split("#[cfg(test)]").next().unwrap_or_default();
+        // 起動する関数の**中だけ**を見る (範囲を広げると空回りする)
+        let at = body.find("fn spawn_plan(").expect("起動する関数がある");
+        let end = body[at..]
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(body.len());
+        let spawn = &body[at..end];
+        // シェルを挟むのは via_local_shell のときだけ
+        assert!(
+            spawn.contains("if plan.via_local_shell"),
+            "シェルを挟む条件が無い:\n{spawn}"
+        );
+        let cmd_at = spawn.find("\"cmd\"").expect("windows 側の分岐がある");
+        let cond_at = spawn.find("if plan.via_local_shell").expect("条件がある");
+        assert!(cond_at < cmd_at, "条件より先にシェルを挟んでいる");
+        // **標準入出力を差し替えない** (対話とリダイレクトを壊さない)
+        for banned in ["Stdio::piped", "Stdio::null", "stdout(", "stderr(", "stdin("] {
+            assert!(!spawn.contains(banned), "{banned} が起動経路にある:\n{spawn}");
+        }
+
+        // 貼り付け用の行を出すときは、対象シェルを明示している
+        let launch_at = body.find("fn launch_cmd(").expect("launch がある");
+        let launch_end = body[launch_at..]
+            .find("\n/// [`RunPlan`]")
+            .map(|e| launch_at + e)
+            .unwrap_or(body.len());
+        let launch = &body[launch_at..launch_end];
+        assert!(
+            launch.contains("POSIX シェル"),
+            "どのシェル向けの行なのか言っていない"
+        );
+        // 注記は標準エラーへ (標準出力に混ぜると貼り付けに使えない)
+        assert!(launch.contains("eprintln!"), "注記を標準出力へ混ぜている");
     }
 
     #[test]

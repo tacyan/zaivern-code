@@ -203,15 +203,29 @@ impl ExecutionProvider for HetznerProvider {
                 super::MANAGED_BY_VALUE
             )));
         }
-        // 印の実行先 ID まで一致することを確かめる (別の Zaivern が作った
-        // ものを、たまたま同じ Provider だからと消さない)
-        if let Some(marked) = labels.get(LABEL_TARGET_ID) {
-            if marked != target.id.as_str() {
-                return Err(CloudError::security(format!(
-                    "サーバー {server_id} の印 ({marked}) が、消そうとしている実行先 ({}) と違います",
-                    target.id
-                )));
-            }
+        // **実行先 ID の印は「有れば見る」ではなく必須。**
+        //
+        // 最初の版は `if let Some(marked)` だったので、`managed_by` だけが
+        // 付いていて `zaivern_target_id` が無いサーバーは素通りして DELETE まで
+        // 進んでいた。印を失ったサーバーや、別の Zaivern が作ったものを
+        // 消しうる。**無い・空・食い違いは、どれも消さない理由**である
+        // (fail closed)。
+        let marked = labels
+            .get(LABEL_TARGET_ID)
+            .map(String::as_str)
+            .unwrap_or("")
+            .trim();
+        if marked.is_empty() {
+            return Err(CloudError::security(format!(
+                "サーバー {server_id} に {LABEL_TARGET_ID} の印がありません。\n\
+                 どの実行先のものか確かめられないので消しません"
+            )));
+        }
+        if marked != target.id.as_str() {
+            return Err(CloudError::security(format!(
+                "サーバー {server_id} の印 ({marked}) が、消そうとしている実行先 ({}) と違います",
+                target.id
+            )));
         }
         let url = format!("{}/servers/{server_id}", self.base());
         let t = self.timeout;
@@ -467,7 +481,9 @@ pub fn lifecycle_from_status(status: Option<&str>) -> TargetLifecycle {
     match status.unwrap_or("") {
         "running" => TargetLifecycle::Provisioning,
         "initializing" | "starting" | "migrating" | "rebuilding" => TargetLifecycle::Provisioning,
-        "off" | "stopping" | "deleting" => TargetLifecycle::Stopped,
+        // **Provider が消している最中なら、こちらも新しい枠を配らない。**
+        "deleting" => TargetLifecycle::Destroying,
+        "off" | "stopping" => TargetLifecycle::Stopped,
         "unknown" | "" => TargetLifecycle::Unknown,
         _ => TargetLifecycle::Unknown,
     }
@@ -579,7 +595,7 @@ mod tests {
     use super::*;
     use crate::features::cloud_execution::provider::http::HttpResponse;
     use crate::features::cloud_execution::provider::ProviderKind;
-    use crate::features::cloud_execution::test_support::FakeHttpClient;
+    use crate::features::cloud_execution::test_support::{FakeHttpClient, RecordedCall};
 
     /// 製品コードだけを残す (コメント行と `#[cfg(test)]` 以降を落とす)。
     fn product_code(src: &str) -> String {
@@ -820,6 +836,123 @@ mod tests {
             .expect("読める")
             .iter()
             .any(|c| c.method == "DELETE"));
+    }
+
+    /// 破棄を頼んだときに **DELETE が飛んだかどうか**を数える。
+    ///
+    /// 「エラーが返ること」だけを見ると、`DELETE` を撃ってからエラーを返す
+    /// 実装でも緑になる。**送った要求の中身**で確かめる。
+    fn destroy_with_labels(labels: Value, target_id: &str) -> (CloudError, Vec<RecordedCall>) {
+        std::env::set_var("ZAIVERN_TEST_HCLOUD_TOKEN", "super-secret-test-token");
+        let mut server = server_json();
+        server["labels"] = labels;
+        let http = FakeHttpClient::new(vec![
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({ "server": server }).to_string(),
+            },
+            // 破棄まで進んでしまったら、これが返って**テストが緑になってしまう**
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        ]);
+        let calls = http.calls();
+        let p = HetznerProvider::new(profile(), std::sync::Arc::new(http), Duration::from_secs(5));
+
+        let mut target = target_from_server(&server_json(), &profile()).expect("写せる");
+        target.id = TargetId::new(target_id);
+        // **手元の台帳は「Zaivern のもの」と言い張っている。**
+        // それだけで消せてはいけない (台帳はただのテキストファイルで、編集できる)
+        target.managed = true;
+        let e = p.destroy(&target).expect_err("断る");
+        let sent = calls.lock().expect("読める").clone();
+        (e, sent)
+    }
+
+    fn assert_no_delete(sent: &[RecordedCall]) {
+        assert!(
+            !sent.iter().any(|c| c.method == "DELETE"),
+            "DELETE を送ってしまっている: {sent:?}"
+        );
+        // 問い合わせの 1 本だけで止まっている
+        assert_eq!(sent.len(), 1, "余計な要求を送っている: {sent:?}");
+        assert_eq!(sent[0].method, "GET");
+    }
+
+    /// **実行先 ID の印が無ければ消さない。**
+    ///
+    /// 最初の版は「印が有れば一致を確かめる」だったので、`managed_by` だけ
+    /// 付いていて `zaivern_target_id` が無いサーバーは**素通りして DELETE**
+    /// まで進んでいた。別の Zaivern が作ったものや、印を途中で失ったものを
+    /// 消しうる。
+    #[test]
+    fn hetzner_requires_target_id_label_to_destroy() {
+        // (1) 管理の印そのものが無い
+        let (e, sent) = destroy_with_labels(serde_json::json!({ "owner": "someone-else" }), "t-abc");
+        assert!(matches!(e, CloudError::Security(_)), "{e:?}");
+        assert_no_delete(&sent);
+
+        // (2) 管理の印はあるが、実行先 ID の印が無い ← これが指摘の本体
+        let (e, sent) = destroy_with_labels(
+            serde_json::json!({ "managed_by": "zaivern", "zaivern_profile": "hetzner-eu" }),
+            "t-abc",
+        );
+        assert!(matches!(e, CloudError::Security(_)), "{e:?}");
+        assert!(
+            format!("{e}").contains(LABEL_TARGET_ID),
+            "何が足りないのか言っていない: {e}"
+        );
+        assert_no_delete(&sent);
+
+        // (3) 実行先 ID の印が空文字
+        let (e, sent) = destroy_with_labels(
+            serde_json::json!({ "managed_by": "zaivern", "zaivern_target_id": "" }),
+            "t-abc",
+        );
+        assert!(matches!(e, CloudError::Security(_)), "{e:?}");
+        assert_no_delete(&sent);
+
+        // (4) 実行先 ID が食い違う
+        let (e, sent) = destroy_with_labels(
+            serde_json::json!({ "managed_by": "zaivern", "zaivern_target_id": "t-other" }),
+            "t-abc",
+        );
+        assert!(matches!(e, CloudError::Security(_)), "{e:?}");
+        assert_no_delete(&sent);
+
+        // 断る理由に秘密が出ていないこと
+        assert!(!format!("{e}").contains("super-secret-test-token"), "{e}");
+    }
+
+    /// **両方の印が正しく揃ったときだけ、意図したサーバーへ 1 回だけ DELETE する。**
+    #[test]
+    fn hetzner_destroys_only_the_marked_server() {
+        std::env::set_var("ZAIVERN_TEST_HCLOUD_TOKEN", "super-secret-test-token");
+        let http = FakeHttpClient::new(vec![
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({ "server": server_json() }).to_string(),
+            },
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        ]);
+        let calls = http.calls();
+        let p = HetznerProvider::new(profile(), std::sync::Arc::new(http), Duration::from_secs(5));
+
+        let target = target_from_server(&server_json(), &profile()).expect("写せる");
+        assert_eq!(target.id.as_str(), "t-abc");
+        assert!(target.managed);
+        p.destroy(&target).expect("消せる");
+
+        let sent = calls.lock().expect("読める").clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0].method, "GET", "先に問い合わせていない");
+        assert_eq!(sent[1].method, "DELETE");
+        // **意図したサーバーへ**送っている (server_json の id は 42)
+        assert!(sent[1].url.ends_with("/servers/42"), "{}", sent[1].url);
     }
 
     #[test]

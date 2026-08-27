@@ -58,6 +58,7 @@ pub fn run(spec: &JobSpec, sink: &mut dyn EventSink) -> Result<ExecutionJob, Clo
         command: spec.launch.display(),
         workspace: None,
         result_ref: String::new(),
+                result_oid: String::new(),
         started_unix: store::now_unix(),
         ended_unix: 0,
         exit_code: None,
@@ -150,7 +151,10 @@ fn run_inner(
 
     // **実行が失敗しても持ち帰る。** 失敗したときこそ、何が起きたかが
     // 手元で見たいものになる。
-    let (result_ref, snapshotted) = git_workspace::collect(
+    //
+    // ここが `?` で降りたら、下の片付けには**辿り着かない**。
+    // 回収できていないのに worktree を消すと作業が消えるので、それが正しい。
+    let collected = git_workspace::collect(
         transport.as_ref(),
         &spec.target,
         &local_repo,
@@ -158,12 +162,15 @@ fn run_inner(
         &opts,
         spec.timeout,
     )?;
-    job.result_ref = result_ref;
-    if snapshotted {
+    job.result_ref = collected.result_ref;
+    job.result_oid = collected.oid;
+    if collected.snapshotted {
         job.message = "未コミットの変更を輸送用コミットにして持ち帰りました".to_string();
     }
 
-    // ここまで来た = 手元に結果がある。**このときだけ片付ける** (§30)。
+    // ここまで来た = **OID の一致まで確かめた結果が手元にある**。
+    // このときだけ片付ける (§30)。回収できていない worktree は残す。
+    debug_assert!(!job.result_oid.is_empty(), "回収を確かめずに片付けようとしている");
     if let Err(e) = git_workspace::cleanup(transport.as_ref(), &spec.target, &ws) {
         // 片付けの失敗で仕事を失敗にしない (結果はもう手元にある)
         job.message = format!("{} / 片付けに失敗: {e}", job.message);
@@ -371,6 +378,7 @@ mod tests {
                 command: String::new(),
                 workspace: None,
                 result_ref: String::new(),
+                result_oid: String::new(),
                 started_unix: 0,
                 ended_unix: 0,
                 exit_code: None,
@@ -383,6 +391,7 @@ mod tests {
                 command: String::new(),
                 workspace: None,
                 result_ref: String::new(),
+                result_oid: String::new(),
                 started_unix: 0,
                 ended_unix: 0,
                 exit_code: Some(0),

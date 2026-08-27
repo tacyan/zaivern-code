@@ -122,17 +122,7 @@ pub fn session_command_line(
     // リモートで走らせる中身。**元のコマンド行はシェルの文字列として
     // そのまま渡す** — これは利用者 (と既存カタログ) が組んだ行であって、
     // こちらが解釈してよいものではない。
-    let script = match remote_cwd {
-        Some(dir) if !dir.is_empty() => {
-            let cd = if let Some(rest) = dir.strip_prefix("~/") {
-                format!("~/{}", posix_quote(rest))
-            } else {
-                posix_quote(dir)
-            };
-            format!("cd {cd} && {original_command}")
-        }
-        _ => original_command.to_string(),
-    };
+    let script = remote_shell_line(original_command, remote_cwd);
     Ok(format!("{ssh} {}", posix_quote(&script)))
 }
 
@@ -155,6 +145,112 @@ pub fn launch_command_line(
     opts.batch = false;
     let ssh = ssh_command_line(target, &opts)?;
     Ok(format!("{ssh} {}", posix_quote(&remote_script(&req)?)))
+}
+
+/// `--run` で**実際に起動するもの**。
+///
+/// ## 表示用の 1 行と混ぜない
+///
+/// [`session_command_line`] / [`launch_command_line`] が返すのは
+/// **POSIX シェルへ貼るための文字列**で、これは**プロセス起動そのもの**。
+/// 混ぜると、貼るために組んだ引用をローカルのシェルがもう一度読み直す —
+/// `cmd.exe` は POSIX の単一引用符を引用として扱わないので、Windows で
+/// 引数が壊れる (この版で直した壊れ方)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlan {
+    /// 起動するプログラムと引数。**このまま `Command` へ渡す。**
+    pub argv: Vec<String>,
+    /// ローカルのシェルを 1 枚挟むか。
+    ///
+    /// **挟むのは「利用者が書いた 1 行」を手元で走らせるときだけ。**
+    /// こちらが組んだ ssh の引数配列には決して挟まない。
+    pub via_local_shell: bool,
+    /// 手元で走らせるときの作業ディレクトリ。
+    pub cwd: Option<String>,
+}
+
+impl RunPlan {
+    /// 起動するものを 1 行にしたもの。
+    ///
+    /// **表示にも起動にも使わない** — 起動は [`RunPlan::argv`] をそのまま
+    /// `Command` へ渡し、貼り付け用は [`session_command_line`] が別に組む。
+    /// ここは「畳んだ形」と「畳んでいない形」が違うことを試験で示すためだけ。
+    #[cfg(test)]
+    pub fn display(&self) -> String {
+        self.argv.join(" ")
+    }
+}
+
+/// `--command "<行>"` を実行先で走らせる計画。
+///
+/// リモートなら ssh の引数配列、手元なら利用者が書いた行をそのまま
+/// ローカルのシェルへ渡す (その行を引用したのは利用者自身なので、
+/// こちらが読み直す余地は無い)。
+pub fn run_plan_for_command(
+    target: &ExecutionTarget,
+    original_command: &str,
+    remote_cwd: Option<&str>,
+    opts: &SshOptions,
+) -> Result<RunPlan, CloudError> {
+    if original_command.trim().is_empty() {
+        return Err(CloudError::config("コマンドが空です"));
+    }
+    if target.transport == TransportKind::Local {
+        return Ok(RunPlan {
+            argv: vec![original_command.to_string()],
+            via_local_shell: true,
+            cwd: remote_cwd.map(str::to_string),
+        });
+    }
+    let script = remote_shell_line(original_command, remote_cwd);
+    Ok(RunPlan {
+        argv: super::transport::ssh::ssh_interactive_argv(target, &script, opts)?,
+        via_local_shell: false,
+        cwd: None,
+    })
+}
+
+/// `-- <program> <args…>` を実行先で走らせる計画。
+///
+/// 手元なら**シェルを 1 枚も挟まずに**そのまま起動する。
+pub fn run_plan_for_spec(
+    target: &ExecutionTarget,
+    spec: &LaunchSpec,
+    opts: &SshOptions,
+) -> Result<RunPlan, CloudError> {
+    let req = spec.to_request();
+    if req.program.is_empty() {
+        return Err(CloudError::config("実行するコマンドがありません"));
+    }
+    if target.transport == TransportKind::Local {
+        let mut argv = vec![req.program.clone()];
+        argv.extend(req.args.clone());
+        return Ok(RunPlan {
+            argv,
+            via_local_shell: false,
+            cwd: req.cwd.clone(),
+        });
+    }
+    Ok(RunPlan {
+        argv: super::transport::ssh::ssh_interactive_argv(target, &remote_script(&req)?, opts)?,
+        via_local_shell: false,
+        cwd: None,
+    })
+}
+
+/// リモートのシェルが受け取る 1 行 (`cd … && <利用者の行>`)。
+fn remote_shell_line(original_command: &str, remote_cwd: Option<&str>) -> String {
+    match remote_cwd {
+        Some(dir) if !dir.is_empty() => {
+            let cd = if let Some(rest) = dir.strip_prefix("~/") {
+                format!("~/{}", posix_quote(rest))
+            } else {
+                posix_quote(dir)
+            };
+            format!("cd {cd} && {original_command}")
+        }
+        _ => original_command.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +330,170 @@ mod tests {
             !req.env.contains_key("HCLOUD_TOKEN"),
             "トークンを運ぼうとしている"
         );
+    }
+
+    // ───────── ローカル起動とリモート引用の分離 (指摘 4) ─────────
+
+    /// 実行先が SSH で、鍵と known_hosts のパスに空白が入っている状況。
+    fn spacey_opts() -> SshOptions {
+        SshOptions {
+            known_hosts: std::path::PathBuf::from("/home/my user/.zaivern/cloud/known hosts"),
+            ..SshOptions::default()
+        }
+    }
+
+    fn spacey_target() -> ExecutionTarget {
+        target(
+            "dev-01",
+            TargetOpts {
+                identity_file: Some(std::path::PathBuf::from("/home/my user/.ssh/id ed25519")),
+                port: 2222,
+                ..TargetOpts::default()
+            },
+        )
+    }
+
+    /// **ssh へ渡す各引数に、余計な引用符が 1 つも残っていないこと。**
+    ///
+    /// 引数配列で起動するなら引用は要らない。残っていたら、それは
+    /// 「文字列に畳んでから割り直した」証拠で、Windows で壊れる形である。
+    fn assert_no_stray_quotes(argv: &[String]) {
+        for (i, a) in argv.iter().enumerate() {
+            // 末尾のリモートスクリプトだけは、リモートのシェル向けの引用を持つ
+            if i + 1 == argv.len() {
+                continue;
+            }
+            assert!(
+                !a.starts_with('\'') && !a.ends_with('\''),
+                "argv[{i}] に引用符が残っている: {a:?}\n全体: {argv:?}"
+            );
+            assert!(!a.contains("'\\''"), "argv[{i}] が二重に引用されている: {a:?}");
+        }
+    }
+
+    #[test]
+    fn 起動計画はsshを引数配列で組む() {
+        let t = spacey_target();
+        let spec = LaunchSpec::new("worker", vec!["--msg".into(), "hello world".into()]);
+        let plan = run_plan_for_spec(&t, &spec, &spacey_opts()).expect("組める");
+
+        assert!(!plan.via_local_shell, "ローカルのシェルを挟んでいる");
+        assert_eq!(plan.argv[0], "ssh");
+        assert_no_stray_quotes(&plan.argv);
+
+        // **空白を含むパスは 1 要素として渡る** (引用符では包まない)
+        assert!(
+            plan.argv.contains(&"/home/my user/.ssh/id ed25519".to_string()),
+            "{:?}",
+            plan.argv
+        );
+        assert!(
+            plan.argv
+                .contains(&"UserKnownHostsFile=/home/my user/.zaivern/cloud/known hosts".to_string()),
+            "{:?}",
+            plan.argv
+        );
+        // 接続の作法は既存の組み立てをそのまま使っている
+        assert!(plan.argv.contains(&"StrictHostKeyChecking=yes".to_string()));
+        assert!(plan.argv.contains(&"-p".to_string()) && plan.argv.contains(&"2222".to_string()));
+        // 対話できるよう擬似端末を割り当てている
+        assert!(plan.argv.contains(&"-tt".to_string()), "{:?}", plan.argv);
+
+        // 末尾がリモートで走る 1 行。**ここだけが POSIX 引用**
+        let script = plan.argv.last().expect("ある");
+        assert_eq!(script, "'worker' '--msg' 'hello world'");
+    }
+
+    /// 危ない文字を含む引数が、**リモートまで字義どおり**届く形で載っていること。
+    #[test]
+    fn 危ない文字を含む引数も一要素として載る() {
+        const CASES: &[&str] = &[
+            "a b",
+            "it's",
+            "say \"hi\"",
+            "a;id",
+            "a&&id",
+            "a|id",
+            "$(id)",
+            "`id`",
+            "a\nb",
+            "-rf",
+            "*",
+            "~/secret",
+            "🌏",
+        ];
+        for c in CASES {
+            let spec = LaunchSpec::new("worker", vec![(*c).to_string()]);
+            let plan =
+                run_plan_for_spec(&spacey_target(), &spec, &spacey_opts()).expect("組める");
+            assert_no_stray_quotes(&plan.argv);
+            let script = plan.argv.last().expect("ある");
+            // リモートのシェルが読むのは「引用された 1 語」
+            assert_eq!(
+                script,
+                &format!("'worker' {}", super::super::transport::ssh::posix_quote(c)),
+                "{c:?}"
+            );
+            // ローカルのシェルは 1 枚も挟まない
+            assert!(!plan.via_local_shell, "{c:?}");
+        }
+    }
+
+    /// `--command` 形式でも、リモートなら引数配列で起動する。
+    #[test]
+    fn コマンド行形式でもローカルシェルを挟まない() {
+        let t = spacey_target();
+        let plan = run_plan_for_command(&t, "some-agent --flag 'a b'", Some("~/my work"), &spacey_opts())
+            .expect("組める");
+        assert!(!plan.via_local_shell);
+        assert_eq!(plan.argv[0], "ssh");
+        assert_no_stray_quotes(&plan.argv);
+        let script = plan.argv.last().expect("ある");
+        // 利用者の行はそのまま、cd だけ足す
+        assert_eq!(script, "cd ~/'my work' && some-agent --flag 'a b'");
+    }
+
+    /// **手元の実行先では ssh を挟まず、そのまま起動する。**
+    #[test]
+    fn 手元の実行先はシェルを挟まず直に起動する() {
+        let local = ExecutionTarget::local(1);
+        let spec = LaunchSpec::new("echo", vec!["a;id".into(), "b c".into()]);
+        let plan = run_plan_for_spec(&local, &spec, &spacey_opts()).expect("組める");
+        assert!(!plan.via_local_shell, "手元でもシェルを挟まない");
+        assert_eq!(plan.argv, vec!["echo", "a;id", "b c"]);
+
+        // 利用者が書いた 1 行だけは、手元のシェルへ渡す (引用したのは利用者自身)
+        let plan = run_plan_for_command(&local, "echo hi && echo bye", None, &spacey_opts())
+            .expect("組める");
+        assert!(plan.via_local_shell);
+        assert_eq!(plan.argv, vec!["echo hi && echo bye"]);
+    }
+
+    #[test]
+    fn 空の指定は起動計画にならない() {
+        let t = spacey_target();
+        assert!(run_plan_for_command(&t, "   ", None, &spacey_opts()).is_err());
+        let empty = LaunchSpec::new("", vec![]);
+        assert!(run_plan_for_spec(&t, &empty, &spacey_opts()).is_err());
+    }
+
+    /// **表示用の 1 行と、起動する argv は別物。**
+    ///
+    /// 表示用は POSIX シェルへ貼るための引用を持つ。起動用は持たない。
+    /// 混ぜると Windows で壊れる。
+    #[test]
+    fn 表示用の行と起動用のargvを混ぜない() {
+        let t = spacey_target();
+        let spec = LaunchSpec::new("worker", vec!["a b".into()]);
+        let line = launch_command_line(&t, &spec, &spacey_opts()).expect("組める");
+        let plan = run_plan_for_spec(&t, &spec, &spacey_opts()).expect("組める");
+
+        // 表示用は「1 本の文字列」で、要素が引用されている
+        assert!(line.contains("'-tt'"), "{line}");
+        // 起動用は引用していない
+        assert!(plan.argv.contains(&"-tt".to_string()), "{:?}", plan.argv);
+        assert!(!plan.argv.contains(&"'-tt'".to_string()), "{:?}", plan.argv);
+        assert_ne!(line, plan.display());
     }
 
     #[test]

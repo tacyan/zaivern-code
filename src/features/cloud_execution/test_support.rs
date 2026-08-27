@@ -191,6 +191,109 @@ impl HttpClient for FakeHttpClient {
     }
 }
 
+/// **決めた場所で止まる HTTP。** 競合の順序を `sleep` ではなく門で作る。
+///
+/// ## なぜ `sleep` でも [`std::sync::Barrier`] でもないのか
+///
+/// * `sleep` で順序を作ると、遅い機械では順序が入れ替わって「たまに緑」になる
+/// * `Barrier` は**時限を持たない**。相手が門に辿り着かない書き方に壊した
+///   瞬間、テストが**永久に固まる** (実際にサボタージュ検証で固まった)。
+///   固まる関門は、そのうち誰も見なくなる
+///
+/// だから時限つきのチャネルで作る。**待ちきれなければ理由を書いて落ちる。**
+pub struct GatedHttpClient {
+    entered_tx: std::sync::mpsc::Sender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    gate_on: &'static str,
+    get_response: HttpResponse,
+    gated_response: HttpResponse,
+    calls: Arc<Mutex<Vec<RecordedCall>>>,
+}
+
+/// [`GatedHttpClient`] の外側 (試験本体が持つ)。
+pub struct Gate {
+    entered_rx: std::sync::mpsc::Receiver<()>,
+    release_tx: std::sync::mpsc::Sender<()>,
+}
+
+/// 門で待つ上限。**CI のジョブ上限より十分内側**で撃つ。
+const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Gate {
+    /// 相手が「止まる要求」に入るまで待つ。
+    pub fn wait_entered(&self) {
+        self.entered_rx
+            .recv_timeout(GATE_WAIT)
+            .expect("相手が門に入らないまま時間切れ (順序の前提が崩れている)");
+    }
+
+    /// 時限を指定して待つ。**この門が本当に諦めることを試験するための入口。**
+    pub fn wait_entered_within(&self, d: std::time::Duration) -> bool {
+        self.entered_rx.recv_timeout(d).is_ok()
+    }
+
+    /// 相手を解放する。
+    pub fn release(&self) {
+        // 相手がもう居なくても落とさない (先に失敗しているだけ)
+        let _ = self.release_tx.send(());
+    }
+}
+
+impl GatedHttpClient {
+    pub fn new(
+        gate_on: &'static str,
+        get_response: HttpResponse,
+        gated: HttpResponse,
+    ) -> (Self, Gate) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                entered_tx,
+                release_rx: Mutex::new(release_rx),
+                gate_on,
+                get_response,
+                gated_response: gated,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+            Gate {
+                entered_rx,
+                release_tx,
+            },
+        )
+    }
+
+    pub fn calls(&self) -> Arc<Mutex<Vec<RecordedCall>>> {
+        self.calls.clone()
+    }
+}
+
+impl HttpClient for GatedHttpClient {
+    fn send(&self, request: &HttpRequest) -> Result<HttpResponse, CloudError> {
+        self.calls
+            .lock()
+            .expect("記録できる")
+            .push(RecordedCall {
+                method: request.method,
+                url: request.url.clone(),
+                body: request.body.clone(),
+            });
+        if request.method == self.gate_on {
+            // 外へ「入った」と知らせ、解放されるまで待つ (**時限つき**)
+            let _ = self.entered_tx.send(());
+            let rx = self.release_rx.lock().expect("読める");
+            if rx.recv_timeout(GATE_WAIT).is_err() {
+                return Err(CloudError::timeout(
+                    "門が解放されないまま時間切れ (試験の順序が崩れている)",
+                ));
+            }
+        } else {
+            return Ok(self.get_response.clone());
+        }
+        Ok(self.gated_response.clone())
+    }
+}
+
 // ───────────────────── 偽 Transport ─────────────────────
 
 /// 実行の台本 1 件。
@@ -440,6 +543,63 @@ mod tests {
         assert!(r.ok());
         assert_eq!(sink.stdout_text(), "done");
         assert_eq!(t.commands(), vec!["rm -rf /"]);
+    }
+
+    /// **門は固まらない。** 相手が来なければ諦める。
+    ///
+    /// 最初の版は [`std::sync::Barrier`] で作っていて、相手が門へ辿り着かない
+    /// 書き方に壊した瞬間、テストが永久に固まった (サボタージュ検証で実際に
+    /// 固まった)。固まる関門は、そのうち誰も見なくなる。
+    #[test]
+    fn 門は相手が来なければ諦める() {
+        let (_http, gate) = GatedHttpClient::new(
+            "DELETE",
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        );
+        // 誰も門に入らない → 待ちきらずに false で戻る (固まらない)
+        assert!(!gate.wait_entered_within(Duration::from_millis(50)));
+        // 解放は、相手が居なくても落ちない
+        gate.release();
+    }
+
+    /// 門に入れば待たずに戻る (空振りしていないことの裏取り)。
+    #[test]
+    fn 門に入れば待たずに戻る() {
+        let (http, gate) = GatedHttpClient::new(
+            "DELETE",
+            HttpResponse {
+                status: 200,
+                body: "get".into(),
+            },
+            HttpResponse {
+                status: 200,
+                body: "deleted".into(),
+            },
+        );
+        let http = Arc::new(http);
+        let worker = {
+            let http = http.clone();
+            std::thread::spawn(move || {
+                http.send(&HttpRequest::delete("https://x/y", Duration::ZERO))
+            })
+        };
+        assert!(gate.wait_entered_within(Duration::from_secs(30)), "門に入っていない");
+        gate.release();
+        let res = worker.join().expect("終わる").expect("答える");
+        assert_eq!(res.body, "deleted");
+
+        // 止める対象でない方法は素通りする
+        let got = http
+            .send(&HttpRequest::get("https://x/y", Duration::ZERO))
+            .expect("答える");
+        assert_eq!(got.body, "get");
     }
 
     #[test]

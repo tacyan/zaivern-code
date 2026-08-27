@@ -493,6 +493,7 @@ mod tests {
                 command: String::new(),
                 workspace: None,
                 result_ref: String::new(),
+                result_oid: String::new(),
                 started_unix: 0,
                 ended_unix: 0,
                 exit_code: Some(0),

@@ -178,8 +178,12 @@ impl Registry {
                         let lifecycle = slot.lifecycle;
                         *slot = t.clone();
                         slot.capacity.active_jobs = active;
-                        // 一度 Ready と分かっているものを降格させない
-                        if lifecycle == TargetLifecycle::Ready {
+                        // 一度 Ready と分かっているものを降格させない。
+                        // **ただし Provider が「消えかけ / 消えた」と言うなら
+                        // そちらを採る** — 手元の記憶より、向こうの現状が正しい。
+                        if lifecycle == TargetLifecycle::Ready
+                            && !t.lifecycle.blocks_new_jobs()
+                        {
                             slot.lifecycle = TargetLifecycle::Ready;
                         }
                     }
@@ -214,24 +218,136 @@ impl Registry {
     }
 
     /// VM を消す。**Zaivern が作ったものだけ** (§22)。
+    ///
+    /// ## 3 段に分けてある理由 (この版で直した競合)
+    ///
+    /// 最初の版は「実行中 0 件を確かめる → Provider へ問い合わせる →
+    /// 台帳から消す」を**ロック無しで**並べていた。確認と削除のあいだに
+    /// 別のプロセスが [`claim_slot`] できるので、
+    ///
+    /// 1. A: `active_jobs == 0` を確認
+    /// 2. B: 枠を取って仕事を載せる
+    /// 3. A: VM を消す ← **走っている仕事ごと消える**
+    ///
+    /// が起こりうる。しかも Provider への往復は数秒あるので、窓は広い。
+    ///
+    /// だから **「確認」と「削除中への遷移」を台帳ロックの中で原子的に**
+    /// 行い ([`Registry::reserve_destroy`])、その後で**ロックを手放してから**
+    /// Provider を呼ぶ。[`claim_slot`] は同じロックの中で最新の状態を
+    /// 読み直すので、遷移後の枠取りは必ず断られる。
+    ///
+    /// ## 失敗したとき
+    ///
+    /// * **届いていないと確実に分かる失敗** (認証・設定・安全のための拒否) →
+    ///   元の状態へ戻す。サーバーは消えていない
+    /// * **届いたか分からない失敗** (時間切れ・通信・Provider の 5xx) →
+    ///   [`TargetLifecycle::Destroying`] のまま残す。**安易に Ready へ戻さない** —
+    ///   消えかけの機械へ次の仕事を載せるより、止まっているほうが安全。
+    ///   回復は `zai cloud target probe` (Provider の状態を確かめ直す) か
+    ///   `zai cloud target remove` (台帳から外す)
     pub fn destroy(&self, name_or_id: &str) -> Result<ExecutionTarget, CloudError> {
-        let target = self.find(name_or_id)?;
-        if !target.managed {
-            return Err(CloudError::security(format!(
-                "{name_or_id} は Zaivern が作った実行先ではないので消しません。\n\
-                 一覧から外すだけなら zai cloud target remove を使ってください"
-            )));
+        // 1) ロックの中で確かめて、削除中へ移す (ここまで原子的)
+        let target = self.reserve_destroy(name_or_id)?;
+
+        // 2) **ロックの外で** Provider を呼ぶ (数秒かかりうる)
+        let outcome = self
+            .provider(target.provider.as_str())
+            .and_then(|p| p.destroy(&target));
+
+        // 3) 結果で台帳を確定させる
+        match outcome {
+            Ok(()) => {
+                store::with_targets(|list| list.retain(|x| x.id != target.id))?;
+                Ok(target)
+            }
+            Err(e) if certainly_untried(&e) => {
+                self.release_destroy(&target, &e)?;
+                Err(e)
+            }
+            Err(e) => {
+                self.hold_destroying(&target, &e)?;
+                Err(e)
+            }
         }
-        if target.capacity.active_jobs > 0 {
-            return Err(CloudError::config(format!(
-                "{name_or_id} ではまだ {} 本の仕事が走っています",
-                target.capacity.active_jobs
-            )));
-        }
-        let p = self.provider(target.provider.as_str())?;
-        p.destroy(&target)?;
-        store::with_targets(|list| list.retain(|x| x.id != target.id))?;
-        Ok(target)
+    }
+
+    /// 台帳ロックの中で「消してよいか」を確かめ、[`TargetLifecycle::Destroying`]
+    /// へ移す。**名前の解決もこの中で行う** — 外で引いた写しを使うと、
+    /// 引いてから予約するまでのあいだに状態が変わりうる。
+    fn reserve_destroy(&self, name_or_id: &str) -> Result<ExecutionTarget, CloudError> {
+        store::with_targets(|list| {
+            let hits: Vec<usize> = list
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.name == name_or_id || t.id.as_str() == name_or_id)
+                .map(|(i, _)| i)
+                .collect();
+            match hits.len() {
+                0 => {
+                    return Err(CloudError::config(format!(
+                        "実行先 {name_or_id} が見つかりません (zai cloud target list で確認できます)"
+                    )))
+                }
+                1 => {}
+                n => {
+                    return Err(CloudError::config(format!(
+                        "{name_or_id} に {n} 件が一致します。ID で指定してください"
+                    )))
+                }
+            }
+            let t = &mut list[hits[0]];
+            if !t.managed {
+                return Err(CloudError::security(format!(
+                    "{name_or_id} は Zaivern が作った実行先ではないので消しません。\n\
+                     一覧から外すだけなら zai cloud target remove を使ってください"
+                )));
+            }
+            if t.lifecycle == TargetLifecycle::Destroying {
+                return Err(CloudError::config(format!(
+                    "{name_or_id} はすでに削除中です ({})",
+                    t.note
+                )));
+            }
+            // **ここが要。** 確認と遷移が同じロックの中にあるので、
+            // 「0 件だと確かめた直後に 1 本載る」が起こり得ない。
+            if t.capacity.active_jobs > 0 {
+                return Err(CloudError::config(format!(
+                    "{name_or_id} ではまだ {} 本の仕事が走っています",
+                    t.capacity.active_jobs
+                )));
+            }
+            let before = t.clone();
+            t.lifecycle = TargetLifecycle::Destroying;
+            t.note = "削除中 (Provider へ問い合わせています)".to_string();
+            Ok(before)
+        })?
+    }
+
+    /// 削除が**始まっていない**と分かったので、元の状態へ戻す。
+    fn release_destroy(&self, before: &ExecutionTarget, why: &CloudError) -> Result<(), CloudError> {
+        store::with_targets(|list| {
+            if let Some(t) = list.iter_mut().find(|t| t.id == before.id) {
+                // 自分が付けた予約だけを外す (別の誰かが動かしていたら触らない)
+                if t.lifecycle == TargetLifecycle::Destroying {
+                    t.lifecycle = before.lifecycle;
+                    t.note = crate::features::cloud_execution::redact::redact(&format!(
+                        "削除は行われませんでした: {why}"
+                    ));
+                }
+            }
+        })
+    }
+
+    /// 削除が**届いたか分からない**ので、削除中のまま留め置く。
+    fn hold_destroying(&self, before: &ExecutionTarget, why: &CloudError) -> Result<(), CloudError> {
+        store::with_targets(|list| {
+            if let Some(t) = list.iter_mut().find(|t| t.id == before.id) {
+                t.lifecycle = TargetLifecycle::Destroying;
+                t.note = crate::features::cloud_execution::redact::redact(&format!(
+                    "削除の結果が不明です: {why} / probe で確かめ直すまで新しい仕事は載せません"
+                ));
+            }
+        })
     }
 
     /// 作りたての実行先が**SSH で入れるようになるまで**待つ (§50)。
@@ -303,11 +419,27 @@ pub fn apply_probe(target: &ExecutionTarget, probe: &ProbeResult) -> ExecutionTa
 /// 枠を 1 つ取る。**上限を超えたら [`CloudError::NoCapacity`]** (§31)。
 ///
 /// ロックの中で確かめてから足すので、同時に呼ばれても上限を超えない。
+///
+/// ## 呼び出し側の写しを信じない
+///
+/// 判定に使うのは**そのとき台帳に書いてあるもの**だけ。呼び出し側が
+/// 古い [`ExecutionTarget`] を握っていても、ここで読み直すので
+/// 「消えかけの実行先へ仕事を載せる」が起こらない
+/// ([`Registry::destroy`] の予約と同じロックを通る)。
 pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
     store::with_targets(|list| {
         let Some(t) = list.iter_mut().find(|t| &t.id == id) else {
             return Err(CloudError::config(format!("実行先 {id} が見つかりません")));
         };
+        // **消えかけ / 消えた実行先には枠を配らない。**
+        if t.lifecycle.blocks_new_jobs() {
+            return Err(CloudError::no_capacity(format!(
+                "{} は {} なので新しい仕事を載せません ({})",
+                t.name,
+                t.lifecycle.id(),
+                t.note
+            )));
+        }
         if !t.capacity.has_room() {
             return Err(CloudError::no_capacity(format!(
                 "{} はすでに {} 本を実行中です (max_jobs = {})",
@@ -317,6 +449,19 @@ pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
         t.capacity.active_jobs += 1;
         Ok(())
     })?
+}
+
+/// **その失敗は「Provider へ届いていない」と確実に言えるか。**
+///
+/// 言えるものだけを元の状態へ戻す。言えないもの (時間切れ・通信・5xx) を
+/// 戻すと、実際には消えている機械を Ready として配ってしまう。
+fn certainly_untried(e: &CloudError) -> bool {
+    matches!(
+        e,
+        // 印が合わずに断った / トークンが無い / プロファイルが無い —
+        // どれも DELETE を送る前に止まっている
+        CloudError::Security(_) | CloudError::Auth(_) | CloudError::Config(_)
+    )
 }
 
 /// 枠を返す。**足りなくならないよう飽和で引く。**
@@ -632,6 +777,303 @@ mod tests {
             .provision("static-ssh", &ProvisionSpec::default())
             .expect_err("断る");
         assert!(matches!(e, CloudError::Unsupported(_)), "{e:?}");
+    }
+
+    // ───────── 削除と枠取得の排他 (指摘 3) ─────────
+
+    use crate::features::cloud_execution::provider::http::HttpResponse;
+    use crate::features::cloud_execution::provider::ProviderKind;
+    use crate::features::cloud_execution::test_support::{FakeHttpClient, GatedHttpClient};
+    use std::sync::Arc;
+
+    fn hetzner_profile() -> ProviderProfile {
+        ProviderProfile {
+            name: "hetzner-eu".into(),
+            kind: ProviderKind::Hetzner,
+            token_env: "ZAIVERN_TEST_HCLOUD_TOKEN".into(),
+            api_base: "https://api.example/v1".into(),
+            max_jobs: 2,
+            ..ProviderProfile::default()
+        }
+    }
+
+    /// Provider 側が返す「Zaivern が作った印つきの」サーバー。
+    fn managed_server(target_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": 42,
+            "name": "w1",
+            "status": "running",
+            "public_net": { "ipv4": { "ip": "203.0.113.10" } },
+            "server_type": { "name": "t", "cores": 2, "memory": 4.0, "disk": 40.0 },
+            "labels": {
+                "managed_by": "zaivern",
+                "zaivern_target_id": target_id,
+                "zaivern_profile": "hetzner-eu"
+            }
+        })
+    }
+
+    fn get_ok(target_id: &str) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: serde_json::json!({ "server": managed_server(target_id) }).to_string(),
+        }
+    }
+
+    /// 台帳へ「Zaivern が作った」実行先を 1 つ置く。
+    fn put_managed(name: &str) -> TargetId {
+        let mut t = target(name, TargetOpts::default());
+        t.provider = crate::features::cloud_execution::model::ProviderId::new("hetzner-eu");
+        t.managed = true;
+        t.provider_ref = Some("42".into());
+        t.lifecycle = TargetLifecycle::Ready;
+        let id = t.id.clone();
+        store::save_targets(&[t]).expect("書ける");
+        id
+    }
+
+    fn registry_with(http: Arc<dyn crate::features::cloud_execution::provider::HttpClient>) -> Registry {
+        std::env::set_var("ZAIVERN_TEST_HCLOUD_TOKEN", "super-secret-test-token");
+        Registry::with_ctx(
+            all_profiles(&[hetzner_profile()]),
+            ProviderCtx {
+                http,
+                timeout: Duration::from_secs(5),
+                local_max_jobs: 2,
+            },
+            Duration::from_secs(5),
+        )
+    }
+
+    /// 仕事が走っている実行先は、**Provider を 1 度も呼ばずに**断る。
+    #[test]
+    fn 実行中の仕事があれば削除処理を呼ばない() {
+        let _home = home_guard("destroy-busy-no-call");
+        let id = put_managed("w1");
+        let http = Arc::new(FakeHttpClient::new(vec![]));
+        let calls = http.calls();
+        let reg = registry_with(http.clone());
+
+        let _slot = SlotGuard::claim(&id).expect("枠を取れる");
+        let e = reg.destroy("w1").expect_err("断る");
+        assert!(format!("{e}").contains("1 本"), "{e}");
+        // **Provider へ 1 本も送っていない** (台本が空なので、送れば失敗する)
+        assert!(calls.lock().expect("読める").is_empty(), "Provider を呼んだ");
+        // 予約もしていない (状態は元のまま)
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Ready
+        );
+    }
+
+    /// **削除を予約したあと、Provider の応答を待っているあいだの枠取りは断られる。**
+    ///
+    /// 順序は `sleep` ではなく門で作る。判定も時間で見ない —
+    /// もし台帳ロックを握ったまま Provider を呼んでいたら、こちらの
+    /// `claim_slot` はロック待ちで時間切れ ([`CloudError::Timeout`]) になる。
+    /// **返ってきたのが `NoCapacity` であること自体が「ロックを手放している」
+    /// 証拠**になる。
+    #[test]
+    fn 削除予約中の枠取りは断られる() {
+        let _home = home_guard("destroy-gate-claim");
+        let dir = store::cloud_dir();
+        let id = put_managed("w1");
+
+        let (http, gate) = GatedHttpClient::new(
+            "DELETE",
+            get_ok(id.as_str()),
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        );
+        let http = Arc::new(http);
+        let calls = http.calls();
+
+        let reg = registry_with(http.clone());
+        let handle = std::thread::spawn(move || {
+            store::set_test_dir(Some(dir));
+            reg.destroy("w1")
+        });
+
+        // DELETE に入るまで待つ (= 予約は済み、ロックは手放している)
+        gate.wait_entered();
+
+        // 古い写しを持っている呼び出し側でも、ここで断られる
+        let e = claim_slot(&id).expect_err("断る");
+        assert!(
+            matches!(e, CloudError::NoCapacity(_)),
+            "ロックを握ったまま Provider を呼んでいる可能性がある: {e:?}"
+        );
+        assert!(format!("{e}").contains("destroying"), "{e}");
+
+        gate.release();
+        handle.join().expect("終わる").expect("消せる");
+
+        // 消えた実行先は台帳から居なくなる
+        assert!(store::load_targets().expect("読める").is_empty());
+        let sent = calls.lock().expect("読める").clone();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1].method, "DELETE");
+    }
+
+    /// 先に枠を取られていたら、削除側が断られる (逆順でも守る)。
+    #[test]
+    fn 先に枠を取られたら削除側が断られる() {
+        let _home = home_guard("destroy-lost-race");
+        let id = put_managed("w1");
+        let http = Arc::new(FakeHttpClient::new(vec![]));
+        let calls = http.calls();
+        let reg = registry_with(http);
+
+        let held = SlotGuard::claim(&id).expect("枠を取れる");
+        assert!(reg.destroy("w1").is_err());
+        assert!(calls.lock().expect("読める").is_empty());
+
+        // 枠を返せば消せる
+        drop(held);
+        let http2 = Arc::new(FakeHttpClient::new(vec![
+            get_ok(id.as_str()),
+            HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            },
+        ]));
+        let reg2 = registry_with(http2);
+        reg2.destroy("w1").expect("消せる");
+        assert!(store::load_targets().expect("読める").is_empty());
+    }
+
+    /// **古い写しでは削除予約を突破できない。**
+    #[test]
+    fn 古い写しでは削除予約を突破できない() {
+        let _home = home_guard("destroy-stale-view");
+        let id = put_managed("w1");
+        // 呼び出し側が持っている「まだ Ready で空きがある」写し
+        let stale = store::load_targets().expect("読める")[0].clone();
+        assert_eq!(stale.lifecycle, TargetLifecycle::Ready);
+        assert!(stale.capacity.has_room());
+
+        // 台帳の側だけが削除中になる
+        store::with_targets(|l| {
+            l[0].lifecycle = TargetLifecycle::Destroying;
+            l[0].note = "削除中".into();
+        })
+        .expect("書ける");
+
+        // 写しは Ready のままだが、枠取りは台帳を読み直すので断られる
+        let e = match SlotGuard::claim(&stale.id) {
+            Ok(_) => panic!("古い写しで削除中の実行先へ枠を配ってしまった"),
+            Err(e) => e,
+        };
+        assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
+        assert_eq!(e.exit_code(), 4);
+        let _ = id;
+    }
+
+    /// **結果が分からない失敗では、安易に Ready へ戻さない。**
+    #[test]
+    fn 削除の結果が不明なら削除中のまま留め置く() {
+        let _home = home_guard("destroy-unknown");
+        let id = put_managed("w1");
+        // GET は成功、DELETE は 5xx が続く (再試行の上限まで)
+        let mut script = vec![get_ok(id.as_str())];
+        for _ in 0..8 {
+            script.push(HttpResponse {
+                status: 503,
+                body: String::new(),
+            });
+        }
+        let reg = registry_with(Arc::new(FakeHttpClient::new(script)));
+        let e = reg.destroy("w1").expect_err("失敗する");
+        assert!(format!("{e}").contains("503"), "{e}");
+
+        let after = store::load_targets().expect("読める");
+        assert_eq!(after.len(), 1, "台帳から消してしまっている");
+        assert_eq!(
+            after[0].lifecycle,
+            TargetLifecycle::Destroying,
+            "Ready へ戻してしまっている"
+        );
+        assert!(after[0].note.contains("不明"), "{}", after[0].note);
+        // 新しい仕事は載らない
+        assert!(matches!(
+            claim_slot(&id),
+            Err(CloudError::NoCapacity(_))
+        ));
+    }
+
+    /// **届いていないと確実に分かる失敗なら、元の状態へ戻す。**
+    #[test]
+    fn 届いていないと分かる失敗なら元へ戻す() {
+        let _home = home_guard("destroy-untried");
+        let id = put_managed("w1");
+        // 認証で断られた = DELETE は送られていない
+        let reg = registry_with(Arc::new(FakeHttpClient::new(vec![HttpResponse {
+            status: 401,
+            body: r#"{"error":{"message":"unable to authenticate"}}"#.into(),
+        }])));
+        let e = reg.destroy("w1").expect_err("失敗する");
+        assert!(matches!(e, CloudError::Auth(_)), "{e:?}");
+
+        let after = store::load_targets().expect("読める");
+        assert_eq!(after[0].lifecycle, TargetLifecycle::Ready, "戻していない");
+        assert!(after[0].note.contains("削除は行われませんでした"), "{}", after[0].note);
+        // 元どおり枠を取れる
+        SlotGuard::claim(&id).expect("取れる");
+    }
+
+    /// **回復経路**: Provider の状態を確かめ直せば、また使えるようになる。
+    #[test]
+    fn 確かめ直せば削除中から復帰できる() {
+        let _home = home_guard("destroy-recover");
+        let id = put_managed("w1");
+        store::with_targets(|l| {
+            l[0].lifecycle = TargetLifecycle::Destroying;
+            l[0].note = "削除の結果が不明です".into();
+        })
+        .expect("書ける");
+        assert!(claim_slot(&id).is_err(), "削除中なのに取れてしまう");
+
+        // `zai cloud target probe` が通る = 機械は生きていた
+        let probe = ProbeResult {
+            reachable: true,
+            latency_ms: 3,
+            capabilities: Default::default(),
+            shell: "/bin/sh".into(),
+            kernel: "test".into(),
+            error: String::new(),
+        };
+        store::with_targets(|l| {
+            let fixed = apply_probe(&l[0], &probe);
+            l[0] = fixed;
+        })
+        .expect("書ける");
+
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Ready
+        );
+        SlotGuard::claim(&id).expect("また取れる");
+
+        // 台帳から外す道も残っている (機械には触らない)
+        let reg = registry_with(Arc::new(FakeHttpClient::new(vec![])));
+        reg.remove_target("w1").expect("外せる");
+    }
+
+    /// Scheduler は削除中の実行先を選ばない (要件 4)。
+    #[test]
+    fn schedulerは削除中の実行先を選ばない() {
+        use crate::features::cloud_execution::scheduler;
+        let mut t = target("w1", TargetOpts::default());
+        t.lifecycle = TargetLifecycle::Destroying;
+        let req = crate::features::cloud_execution::model::ExecutionRequirements::default();
+        assert_eq!(
+            scheduler::evaluate(&req, &t),
+            Err(scheduler::Reject::Destroying),
+            "「未確認」と混ぜている (次に打つ手が違う)"
+        );
+        assert_eq!(scheduler::select_target(&req, &[t]), None);
     }
 
     #[test]

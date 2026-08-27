@@ -150,6 +150,52 @@ Requested → Provisioning → Running → SSH Waiting → Ready
 
 `--wait` は SSH が開くまで待つ (上限 5 分。永久には待たない)。
 
+### 破棄と実行の排他 (`destroying`)
+
+**「実行中 0 件を確かめてから消す」だけでは足りない。** Provider への往復は
+数秒あるので、そのあいだに別のプロセスが枠を取って仕事を載せられる:
+
+```text
+A: active_jobs == 0 を確認
+                        B: 枠を取って仕事を載せる
+A: VM を消す                ← 走っている仕事ごと消える
+```
+
+だから **「確認」と「削除中への遷移」を台帳ロックの中で原子的に**行い、
+そのあと**ロックを手放してから** Provider を呼ぶ。枠取り (`claim_slot`) は
+同じロックの中で台帳を読み直すので、遷移後の要求は必ず断られる —
+**呼び出し側が古い `ExecutionTarget` を握っていても同じ**。
+
+`ExecutionTarget` のライフサイクルに `destroying` が加わる
+(第 2 の状態機械は作らない):
+
+| 状態 | 枠を配るか | 意味 |
+|---|---|---|
+| `ready` | 配る | 接続を確かめた |
+| `destroying` | **配らない** | 破棄を予約した / 結果が分からない |
+| `stopped` | **配らない** | 止まっている・消えた |
+| その他 | Scheduler が選ばない | 未確認・準備中・故障 |
+
+### 破棄が失敗したとき (回復方針)
+
+| 失敗 | 台帳の扱い | 理由 |
+|---|---|---|
+| 認証・設定・安全のための拒否 | **元の状態へ戻す** | `DELETE` を送る前に止まっている = サーバーは消えていない |
+| 時間切れ・通信・Provider の 5xx | **`destroying` のまま留める** | 届いたか分からない。`ready` へ戻すと消えかけの機械へ次の仕事を載せる |
+| プロセスが途中で死んだ | `destroying` のまま残る | 同上 |
+
+**`destroying` から戻す道は 2 つ:**
+
+```bash
+zai cloud target probe <名前>    # Provider / SSH の現状を確かめ直す
+                                 #   届く → ready へ戻る
+                                 #   届かない → failed (消えていた)
+zai cloud target remove <名前>   # 台帳から外すだけ (機械には触らない)
+```
+
+**自動では戻さない。** 「たぶん消えていないだろう」で `ready` に戻すのは、
+いちばんやってはいけない推測である。
+
 ### 消せるサーバー
 
 Zaivern が作ったサーバーには label が付く:
@@ -163,7 +209,10 @@ zaivern_profile=<プロファイル名>
 **印が無ければ消さない (fail closed)。** しかも手元の台帳の `managed` だけを
 信じない — 消す直前に Provider へ問い合わせ、**向こうの label** を確かめてから
 `DELETE` する (手元の台帳はテキストファイルで、編集できてしまうため)。
-実行先 ID まで一致しなければ、やはり消さない。
+
+**2 つの印は両方とも必須。** `managed_by` だけが付いていて
+`zaivern_target_id` が無い / 空 / 食い違うサーバーは、どれも消さない
+(「有れば照合する」にすると、印を失ったサーバーが素通りする)。
 
 ---
 
@@ -250,8 +299,24 @@ Credential Broker は将来仕様。
 3. リモートでコマンド／エージェントが走る (**仕事ごとに別の worktree**)
 4. 終わったら `git status --porcelain` を見て、未コミットがあれば
    **輸送用コミット**を作る (`zaivern: snapshot cloud job <job>`)
-5. 手元へ `git fetch <ssh-url> +zai/cloud/<job>:refs/remotes/zaivern-cloud/<job>`
-6. **持ち帰れたときだけ** worktree を片付ける
+5. **そのときの `HEAD` を、リモート側の動かない参照へ固定する**
+   (`refs/zaivern/result/<job>`)
+6. 手元へ `git fetch <ssh-url> +refs/zaivern/result/<job>:refs/remotes/zaivern-cloud/<job>`
+7. **リモートで確定した OID と、手元に届いた OID が一致することを確かめる**
+8. **一致したときだけ** worktree を片付ける
+
+### なぜ枝ではなく参照へ固定するのか
+
+snapshot が付くのは**枝ではなく `HEAD`** である。エージェントが
+`git switch -c` で別の枝へ移ったり、detached HEAD のまま作業すると、
+成果は `HEAD` 側に付き、作った時の枝 `zai/cloud/<job>` は**古いまま**残る。
+
+その枝は実在するので **`fetch` は成功する**。つまり、1 バイトも持ち帰らない
+まま「成功」として worktree を片付けてしまう — **作業が消えるのに、
+どこにもエラーが出ない**。いちばん静かな壊れ方である。
+
+だから「HEAD を動かない参照へ固定 → その参照を取る → OID を突き合わせる」
+の 3 段にしてある。OID の長さは決め打たない (SHA-256 のリポジトリでは 64 桁)。
 
 ```bash
 zai cloud job run --target dev-01 -- cargo test --workspace

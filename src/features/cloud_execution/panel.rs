@@ -314,6 +314,7 @@ fn lifecycle_badge(l: TargetLifecycle) -> (&'static str, egui::Color32) {
         TargetLifecycle::Ready => ("●", egui::Color32::from_rgb(0x5a, 0xb0, 0x6a)),
         TargetLifecycle::Provisioning => ("◐", egui::Color32::from_rgb(0xc0, 0xa0, 0x50)),
         TargetLifecycle::Draining => ("◑", egui::Color32::from_rgb(0xc0, 0xa0, 0x50)),
+        TargetLifecycle::Destroying => ("⊘", egui::Color32::from_rgb(0xd0, 0x60, 0x60)),
         TargetLifecycle::Failed => ("✗", egui::Color32::from_rgb(0xd0, 0x60, 0x60)),
         TargetLifecycle::Stopped => ("○", egui::Color32::GRAY),
         TargetLifecycle::Unknown => ("?", egui::Color32::GRAY),
@@ -439,6 +440,7 @@ mod tests {
         for l in [
             TargetLifecycle::Unknown,
             TargetLifecycle::Provisioning,
+            TargetLifecycle::Destroying,
             TargetLifecycle::Ready,
             TargetLifecycle::Draining,
             TargetLifecycle::Stopped,
