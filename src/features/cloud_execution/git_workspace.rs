@@ -185,8 +185,23 @@ pub fn git_ssh_command(target: &ExecutionTarget, opts: &SshOptions) -> Result<St
 ///
 /// `mkdir` は POSIX で原子的なので、それを鍵にして用意を 1 本へ絞る。
 /// すでに在れば鍵も取らずに帰る (ふつうの経路では待ちが 0)。
+///
+/// ## 持ち主が死んだ鍵を回収する (P2-1)
+///
+/// `trap` は `kill -9` / VM の停止 / 電源断では**発火しない**ので、鍵の
+/// ディレクトリが残る。残ると次からは待つだけになり、最後は
+/// 「手で消してください」で終わる — Zaivern が自分で治せない状態を作らない。
+///
+/// 判定は**鍵の古さ**で行う。`git init --bare` は 1 秒とかからないので、
+/// [`INIT_LOCK_STALE_MIN`] 分も動いていない鍵は持ち主が居ないと見てよい。
+/// 取った直後に `owner` を書くのでディレクトリの mtime は取得時刻になり、
+/// **生きている鍵 (= たった今取られた鍵) は決して奪われない**。
+///
+/// `find -mmin` を使うのは、`stat` の書式が GNU と BSD で違うため
+/// (`-mmin` はどちらにも、busybox にも在る)。
 pub fn init_bare_script(repo: &RemotePath) -> String {
     let q = quote_home(repo);
+    let stale = INIT_LOCK_STALE_MIN;
     // 待ちの上限。`N 体が順に通るには N·t 要る`ので、64 体でも通る幅を取る
     // (用意は 1 度きりなので、待つのは最初の 1 回だけ)。
     format!(
@@ -196,19 +211,32 @@ pub fn init_bare_script(repo: &RemotePath) -> String {
          lock={q}.lock; i=0; \
          while ! mkdir \"$lock\" 2>/dev/null; do \
            i=$((i+1)); \
+           if [ -n \"$(find \"$lock\" -maxdepth 0 -mmin +{stale} 2>/dev/null)\" ]; then \
+             rm -rf \"$lock\" 2>/dev/null || true; \
+             continue; \
+           fi; \
            if [ \"$i\" -gt 300 ]; then \
              echo \"zv_error=リポジトリの用意が終わりません ($lock を消してください)\" >&2; exit 1; \
            fi; \
            sleep 0.1 2>/dev/null || sleep 1; \
            if [ -d {q}/objects ]; then exit 0; fi; \
          done; \
-         trap 'rmdir \"$lock\" 2>/dev/null || true' EXIT INT TERM; \
+         trap 'rm -rf \"$lock\" 2>/dev/null || true' EXIT INT TERM; \
+         printf 'pid=%s\\n' \"$$\" > \"$lock/owner\" 2>/dev/null || true; \
          if [ ! -d {q}/objects ]; then \
            git init --bare -q {q}; \
            git -C {q} config receive.denyCurrentBranch ignore; \
          fi"
     )
 }
+
+/// これより古い用意の鍵は、持ち主が死んだものとして回収する (分)。
+///
+/// **`git init --bare` の実測は 1 秒未満。** それでも 10 分取るのは、
+/// 待ち側が 30 秒 (0.1 秒 × 300) で諦める作りなので、**回収が起きるのは
+/// 「1 度失敗して、しばらく経ってからまた走らせた」ときだけ**にしたいため。
+/// 短くすると、混んでいるときに生きている鍵を奪いかねない。
+pub const INIT_LOCK_STALE_MIN: u32 = 10;
 
 /// worktree を作る sh の断片。
 ///
@@ -798,10 +826,18 @@ mod tests {
         assert!(at_lock < at_init, "鍵より先に git を触っている:\n{s}");
         let at_config = s.find("git -C").expect("config がある");
         assert!(at_lock < at_config, "鍵より先に config を触っている:\n{s}");
-        // 鍵は必ず外す (落ちても外れる)
-        assert!(s.contains("trap") && s.contains("rmdir"), "{s}");
+        // 鍵は必ず外す (落ちても外れる)。中に owner を書くので rmdir では外れない
+        assert!(s.contains("trap") && s.contains("rm -rf \"$lock\""), "{s}");
         // **永久には待たない**
         assert!(s.contains("-gt 300"), "待ちに上限が無い:\n{s}");
+        // **持ち主が死んだ鍵は回収する** (trap は kill -9 では発火しない)
+        assert!(
+            s.contains(&format!("-mmin +{INIT_LOCK_STALE_MIN}")),
+            "古い鍵を回収しない:\n{s}"
+        );
+        // 回収の判定は待ちの中で行う (取った後に消しに行くと自分の鍵を消す)
+        let at_stale = s.find("-mmin").expect("回収がある");
+        assert!(at_stale < at_init, "鍵を取った後に回収している:\n{s}");
     }
 
     #[test]
@@ -1103,6 +1139,93 @@ mod live_git_tests {
             work,
             ws,
         }
+    }
+
+    // ───── 用意の鍵は持ち主が死んでも回収できる (P2-1) ─────
+
+    /// 実験場の `repo.git` を指す [`RemotePath`] と、その鍵のパス。
+    fn lock_lab(tag: &str) -> (PathBuf, RemotePath, PathBuf) {
+        let root = crate::test_util::unique_temp_dir("zv-cloud", tag);
+        let repo = root.join("repo.git");
+        let path = RemotePath::new(repo.to_str().expect("utf-8")).expect("作れる");
+        let lock = root.join("repo.git.lock");
+        (repo, path, lock)
+    }
+
+    /// 本物の `sh` で用意の断片を走らせる。
+    fn run_init(path: &RemotePath, timeout: Duration) -> Result<(), CloudError> {
+        let tr = LocalTransport::new(timeout);
+        run_remote(
+            &tr,
+            &ExecutionTarget::local(1),
+            &init_bare_script(path),
+            "用意",
+        )
+        .map(|_| ())
+    }
+
+    /// **P2-1 の再現。** `kill -9` / 電源断では `trap` が発火しないので鍵が残る。
+    /// 残ったままだと、次からは待つだけになって最後は手で消すしかなくなる。
+    #[test]
+    fn stale_init_lock_can_be_recovered() {
+        let (repo, path, lock) = lock_lab("init-lock-stale");
+        std::fs::create_dir_all(&lock).expect("鍵を作れる");
+        // 持ち主が死んでから十分に経った状態にする
+        let out = Command::new("touch")
+            .args(["-t", "202001010000"])
+            .arg(&lock)
+            .output()
+            .expect("touch を起動できる");
+        assert!(out.status.success(), "mtime を戻せない");
+
+        run_init(&path, Duration::from_secs(60)).expect("古い鍵は回収して用意できる");
+
+        assert!(repo.join("objects").is_dir(), "リポジトリが出来ていない");
+        assert!(!lock.exists(), "鍵が残っている");
+    }
+
+    /// **生きている鍵は奪わない。** 短い上限で切っても、鍵もリポジトリも
+    /// そのまま (奪っていれば、この時間内に用意が終わってしまう)。
+    #[test]
+    fn fresh_init_lock_is_not_stolen() {
+        let (repo, path, lock) = lock_lab("init-lock-fresh");
+        std::fs::create_dir_all(&lock).expect("鍵を作れる");
+
+        // いま取られたばかりの鍵。待つのが正しいので、短い上限で打ち切る
+        let _ = run_init(&path, Duration::from_secs(2));
+
+        assert!(lock.is_dir(), "生きている鍵を奪った");
+        assert!(
+            !repo.join("objects").is_dir(),
+            "鍵を持っていないのに用意を進めた"
+        );
+    }
+
+    /// **同時に呼ばれても直列化される。** 4 本が同時に走っても、
+    /// リポジトリは 1 つだけ出来て全部成功する。
+    #[test]
+    fn concurrent_init_still_serializes() {
+        let (repo, path, lock) = lock_lab("init-lock-race");
+        let results: Vec<Result<(), CloudError>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    sc.spawn(move || run_init(&path, Duration::from_secs(60)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("終わる"))
+                .collect()
+        });
+        for (i, r) in results.iter().enumerate() {
+            r.as_ref().unwrap_or_else(|e| panic!("{i} 本目が失敗: {e}"));
+        }
+        assert!(repo.join("objects").is_dir(), "リポジトリが出来ていない");
+        assert!(!lock.exists(), "鍵が残っている");
+        // config が二重に書かれて壊れていないこと (実測で落ちた形)
+        let v = git_ok(&repo, &["config", "receive.denyCurrentBranch"]);
+        assert_eq!(v, "ignore");
     }
 
     // ───── 作業ツリーが汚れていたら断る (P1-2) ─────    // ───── 作業ツリーが汚れていたら断る (P1-2) ─────
