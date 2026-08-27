@@ -47,6 +47,16 @@ pub const DEFAULT_API_BASE: &str = "https://api.hetzner.cloud/v1";
 /// 再試行の上限。**無限に繰り返さない** (§49)。
 pub const MAX_ATTEMPTS: u32 = 4;
 
+/// 一覧 API を 1 回で取る件数。Hetzner の上限は 50。
+pub const PER_PAGE: u32 = 50;
+
+/// 一覧 API を辿るページ数の上限。**相手が「次がある」と言い続けても止まる。**
+///
+/// `PER_PAGE` と掛けて 5000 件。これを超える台数を 1 つの Provider
+/// プロファイルで抱えることは想定していないので、ここまで来たら
+/// 相手か自分が壊れている。
+pub const MAX_PAGES: u32 = 100;
+
 /// 作った VM の SSH が開くまで待つ上限。
 pub const READY_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -100,6 +110,46 @@ impl HetznerProvider {
         self.call(move || HttpRequest::get(url.clone(), t))
     }
 
+    /// ページ付きの一覧を**最後まで**取る。
+    ///
+    /// ## なぜ要るのか
+    ///
+    /// Hetzner の一覧 API は既定で 25 件ずつしか返さない。1 ページしか読まないと、
+    /// **26 台目以降が Registry に入らない**。Scheduler から見れば存在しないので、
+    /// 台数を増やしたときにだけ静かに取りこぼす — 少ない台数の試験では
+    /// 永久に見つからない形になる。
+    ///
+    /// ## 終わり方を 3 重にする
+    ///
+    /// 相手の言うことだけを信じて回り続けないよう、止まる理由を 3 つ持つ:
+    ///
+    /// 1. `meta.pagination.next_page` が無い / null (**正規の終わり方**)
+    /// 2. 次のページ番号が**進んでいない** (壊れた応答で同じページを回り続けない)
+    /// 3. [`MAX_PAGES`] に達した (最後の砦)
+    ///
+    /// ページ番号を推測で増やさない — 次があると相手が言ったときだけ進む。
+    ///
+    /// **この処理は Provider の中だけに閉じる。** Hetzner のページ付けを
+    /// Scheduler や Registry が知る必要はない (知ると、次の Provider で
+    /// 同じ形が使えなくなる)。
+    fn get_all_pages(&self, path: &str, array_key: &str) -> Result<Vec<Value>, CloudError> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        for _ in 0..MAX_PAGES {
+            let v = self.get(&format!("{path}{sep}page={page}&per_page={PER_PAGE}"))?;
+            if let Some(a) = v.get(array_key).and_then(Value::as_array) {
+                out.extend(a.iter().cloned());
+            }
+            match next_page_of(&v) {
+                // 進んだときだけ次へ行く (同じ番号や戻る番号では止まる)
+                Some(n) if n > page => page = n,
+                _ => return Ok(out),
+            }
+        }
+        Ok(out)
+    }
+
     /// サーバーを 1 台読む (**破棄の前の照合に使う**)。
     pub fn get_server(&self, id: &str) -> Result<Value, CloudError> {
         let v = self.get(&format!("/servers/{id}"))?;
@@ -110,24 +160,17 @@ impl HetznerProvider {
 
     /// 使えるサーバー種別 (`zai cloud provider types`)。
     pub fn list_server_types(&self) -> Result<Vec<ServerType>, CloudError> {
-        let v = self.get("/server_types?per_page=50")?;
-        Ok(v.get("server_types")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(ServerType::from_json).collect())
-            .unwrap_or_default())
+        let all = self.get_all_pages("/server_types", "server_types")?;
+        Ok(all.iter().filter_map(ServerType::from_json).collect())
     }
 
     /// 使える場所。
     pub fn list_locations(&self) -> Result<Vec<String>, CloudError> {
-        let v = self.get("/locations")?;
-        Ok(v.get("locations")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+        let all = self.get_all_pages("/locations", "locations")?;
+        Ok(all
+            .iter()
+            .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect())
     }
 }
 
@@ -143,16 +186,15 @@ impl ExecutionProvider for HetznerProvider {
     /// **Zaivern が作ったものだけを数える。** 利用者が別の用途で持っている
     /// サーバーを一覧に出すと、そこへ仕事を載せてしまう。
     fn list_targets(&self) -> Result<Vec<ExecutionTarget>, CloudError> {
-        let v = self.get(&format!(
-            "/servers?label_selector={}%3D{}",
-            super::LABEL_MANAGED_BY,
-            super::MANAGED_BY_VALUE
-        ))?;
-        let servers = v
-            .get("servers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // **全ページ取る。** 1 ページ目だけだと 26 台目以降が居ないことになる。
+        let servers = self.get_all_pages(
+            &format!(
+                "/servers?label_selector={}%3D{}",
+                super::LABEL_MANAGED_BY,
+                super::MANAGED_BY_VALUE
+            ),
+            "servers",
+        )?;
         let mut out = Vec::new();
         for s in &servers {
             if let Ok(t) = target_from_server(s, &self.profile) {
@@ -262,6 +304,17 @@ pub fn classify(res: &super::http::HttpResponse) -> Result<Value, CloudError> {
             &api_error_message(&res.body),
         )),
     }
+}
+
+/// `meta.pagination.next_page` を読む。**無い / null なら `None`** (= 最後)。
+///
+/// 純関数なので、応答の形を表で固定できる。
+pub fn next_page_of(v: &Value) -> Option<u32> {
+    v.get("meta")?
+        .get("pagination")?
+        .get("next_page")?
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// Hetzner の `{"error":{"message":…}}` から人が読む部分だけ取り出す。
@@ -720,6 +773,196 @@ mod tests {
             MAX_ATTEMPTS as usize,
             "上限どおりに止まっていない"
         );
+    }
+
+    // ───── 一覧 API のページ送り ─────
+
+    /// `servers` を 1 ページぶん組む。`next` が次のページ番号 (無ければ null)。
+    fn page(key: &str, ids: &[u64], next: Option<u32>) -> HttpResponse {
+        let items: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                let mut s = server_json();
+                s["id"] = serde_json::json!(id);
+                s["name"] = serde_json::json!(format!("zai-worker-{id}"));
+                s["labels"][LABEL_TARGET_ID] = serde_json::json!(format!("t-{id}"));
+                s
+            })
+            .collect();
+        HttpResponse {
+            status: 200,
+            body: serde_json::json!({
+                key: items,
+                "meta": {"pagination": {
+                    "page": 1,
+                    "per_page": PER_PAGE,
+                    "next_page": next,
+                }},
+            })
+            .to_string(),
+        }
+    }
+
+    fn hetzner(http: FakeHttpClient) -> HetznerProvider {
+        std::env::set_var("ZAIVERN_TEST_HCLOUD_TOKEN", "super-secret-test-token");
+        HetznerProvider::new(profile(), std::sync::Arc::new(http), Duration::from_secs(5))
+    }
+
+    /// `next_page` の読み方を表で固定する (純関数)。
+    #[test]
+    fn 次のページ番号の読み方() {
+        let v = |j: Value| next_page_of(&j);
+        assert_eq!(
+            v(serde_json::json!({"meta":{"pagination":{"next_page":2}}})),
+            Some(2)
+        );
+        assert_eq!(
+            v(serde_json::json!({"meta":{"pagination":{"next_page":null}}})),
+            None
+        );
+        assert_eq!(v(serde_json::json!({"meta":{"pagination":{}}})), None);
+        assert_eq!(v(serde_json::json!({"meta":{}})), None);
+        assert_eq!(v(serde_json::json!({})), None);
+        // 数でないものは信じない
+        assert_eq!(
+            v(serde_json::json!({"meta":{"pagination":{"next_page":"2"}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn 一覧が一ページなら一度しか呼ばない() {
+        let http = FakeHttpClient::new(vec![page("servers", &[1, 2], None)]);
+        let calls = http.calls();
+        let p = hetzner(http);
+        assert_eq!(p.list_targets().expect("読める").len(), 2);
+        assert_eq!(calls.lock().expect("読める").len(), 1, "余計に呼んでいる");
+    }
+
+    /// **これが直したかった欠陥。** 2 ページ目以降のサーバーが
+    /// Registry に入らないと、Scheduler からは存在しないことになる。
+    #[test]
+    fn 一覧は二ページ目以降も返す() {
+        let http = FakeHttpClient::new(vec![
+            page("servers", &[1, 2], Some(2)),
+            page("servers", &[3, 4], Some(3)),
+            page("servers", &[5], None),
+        ]);
+        let calls = http.calls();
+        let p = hetzner(http);
+        let all = p.list_targets().expect("読める");
+        assert_eq!(all.len(), 5, "取りこぼした: {all:#?}");
+        // 2 ページ目以降の実行先が確かに居る (Scheduler の候補になれる)
+        for id in ["t-3", "t-4", "t-5"] {
+            assert!(all.iter().any(|t| t.id.as_str() == id), "{id} が居ない");
+        }
+        // ページ番号は推測ではなく応答に従っている
+        let urls: Vec<String> = calls
+            .lock()
+            .expect("読める")
+            .iter()
+            .map(|c| c.url.clone())
+            .collect();
+        assert_eq!(urls.len(), 3, "{urls:#?}");
+        assert!(
+            urls[0].contains("page=1") && urls[0].contains("per_page=50"),
+            "{urls:#?}"
+        );
+        assert!(urls[1].contains("page=2"), "{urls:#?}");
+        assert!(urls[2].contains("page=3"), "{urls:#?}");
+        // 元の絞り込みが落ちていない (label_selector は全ページに要る)
+        assert!(
+            urls.iter().all(|u| u.contains("label_selector")),
+            "{urls:#?}"
+        );
+    }
+
+    /// 途中のページが失敗したら、**半端な一覧を返さずに失敗を返す**。
+    /// 「一部だけ取れた」を成功にすると、消えた実行先と区別が付かない。
+    #[test]
+    fn 途中のページが失敗したら失敗を返す() {
+        let mut script = vec![page("servers", &[1], Some(2))];
+        // 500 は再試行の対象なので、上限まで用意して諦めさせる
+        for _ in 0..MAX_ATTEMPTS {
+            script.push(HttpResponse {
+                status: 500,
+                body: r#"{"error":{"message":"boom"}}"#.into(),
+            });
+        }
+        let p = hetzner(FakeHttpClient::new(script));
+        let e = p.list_targets().expect_err("失敗する");
+        assert!(format!("{e}").contains("500"), "{e}");
+    }
+
+    /// **空のページでも回り続けない。** 進まない `next_page` は終わりと見る。
+    #[test]
+    fn 空のページで回り続けない() {
+        // 相手が「次は 1 ページ目」と言い続ける壊れた応答
+        let http = FakeHttpClient::new(vec![page("servers", &[], Some(1))]);
+        let calls = http.calls();
+        let p = hetzner(http);
+        assert!(p.list_targets().expect("読める").is_empty());
+        assert_eq!(calls.lock().expect("読める").len(), 1, "回り続けている");
+    }
+
+    /// 戻る番号でも止まる (`next_page` が前のページを指す)。
+    #[test]
+    fn 進まないページ番号で止まる() {
+        let http = FakeHttpClient::new(vec![
+            page("servers", &[1], Some(2)),
+            page("servers", &[2], Some(2)),
+        ]);
+        let calls = http.calls();
+        let p = hetzner(http);
+        assert_eq!(p.list_targets().expect("読める").len(), 2);
+        assert_eq!(calls.lock().expect("読める").len(), 2, "回り続けている");
+    }
+
+    #[test]
+    fn サーバー種別と場所も全ページ取る() {
+        let types = FakeHttpClient::new(vec![
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "server_types": [{"name":"cx22","cores":2,"memory":4.0,"disk":40}],
+                    "meta": {"pagination": {"next_page": 2}},
+                })
+                .to_string(),
+            },
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "server_types": [{"name":"cx32","cores":4,"memory":8.0,"disk":80}],
+                    "meta": {"pagination": {"next_page": null}},
+                })
+                .to_string(),
+            },
+        ]);
+        let p = hetzner(types);
+        let got = p.list_server_types().expect("読める");
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert_eq!(got[1].name, "cx32");
+
+        let locs = FakeHttpClient::new(vec![
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "locations": [{"name":"fsn1"}],
+                    "meta": {"pagination": {"next_page": 2}},
+                })
+                .to_string(),
+            },
+            HttpResponse {
+                status: 200,
+                body: serde_json::json!({
+                    "locations": [{"name":"hel1"}],
+                    "meta": {"pagination": {"next_page": null}},
+                })
+                .to_string(),
+            },
+        ]);
+        let p = hetzner(locs);
+        assert_eq!(p.list_locations().expect("読める"), vec!["fsn1", "hel1"]);
     }
 
     #[test]
