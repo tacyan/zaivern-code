@@ -130,15 +130,53 @@ impl Registry {
     }
 
     /// 一覧から外す。**機械には触らない** (消すのは `worker destroy`)。
+    ///
+    /// ## 走っている仕事があれば断る (P2-2)
+    ///
+    /// 外した後も [`SlotGuard`] は枠を返そうとするが、実行先そのものが
+    /// 台帳に無いので**返す先が無い**。仕事が終わったことも枠が空いたことも
+    /// どこにも残らず、記録だけが「走っている実行先 X」を指したまま孤児になる。
+    ///
+    /// [`Registry::destroy`] と同じ考え方で、**引くのも数えるのも同じロックの
+    /// 中で**行う。外で `find` してから消すと、そのあいだに枠を取られる。
     pub fn remove_target(&self, name_or_id: &str) -> Result<ExecutionTarget, CloudError> {
-        let t = self.find(name_or_id)?;
-        if t.transport == super::model::TransportKind::Local {
-            return Err(CloudError::config(
-                "手元の機械は一覧から外せません",
-            ));
-        }
-        store::with_targets(|list| list.retain(|x| x.id != t.id))?;
-        Ok(t)
+        store::with_targets(|list| {
+            // 手元の実行先は台帳の行としては「枠の数」でしかないので、
+            // 名前で引く前に断る (行が在っても外す対象ではない)
+            if name_or_id == "local" {
+                return Err(CloudError::config("手元の機械は一覧から外せません"));
+            }
+            let hits: Vec<usize> = list
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    t.transport != super::model::TransportKind::Local
+                        && (t.name == name_or_id || t.id.as_str() == name_or_id)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            match hits.len() {
+                0 => {
+                    return Err(CloudError::config(format!(
+                        "実行先 {name_or_id} が見つかりません (zai cloud target list で確認できます)"
+                    )))
+                }
+                1 => {}
+                n => {
+                    return Err(CloudError::config(format!(
+                        "{name_or_id} に {n} 件が一致します。ID で指定してください"
+                    )))
+                }
+            }
+            let t = &list[hits[0]];
+            if t.capacity.active_jobs > 0 {
+                return Err(CloudError::config(format!(
+                    "{} ではまだ {} 本の仕事が走っています。終了後に一覧から外してください",
+                    t.name, t.capacity.active_jobs
+                )));
+            }
+            Ok(list.remove(hits[0]))
+        })?
     }
 
     /// 実行先を確かめて、分かったことを台帳へ書き戻す。
@@ -1158,6 +1196,86 @@ mod tests {
         assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
         assert_eq!(e.exit_code(), 4);
         let _ = id;
+    }
+
+    // ───── 走っている仕事がある実行先は外せない (P2-2) ─────
+
+    /// **P2-2 の再現。** 外した後も [`SlotGuard`] は枠を返そうとするが、
+    /// 返す先が無い。仕事の記録だけが孤児になり、台帳と食い違う。
+    #[test]
+    fn remove_target_rejects_active_jobs() {
+        let _home = home_guard("remove-active");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 4);
+        mark_ready(&t.id);
+        let _g1 = SlotGuard::claim(&t.id).expect("1 本目");
+        let _g2 = SlotGuard::claim(&t.id).expect("2 本目");
+
+        let e = reg.remove_target("dev-01").expect_err("断る");
+        let text = format!("{e}");
+        assert!(
+            text.contains("2 本"),
+            "何本走っているか言っていない: {text}"
+        );
+        assert!(text.contains("dev-01"), "{text}");
+        // 台帳から消えていない
+        assert!(reg.find("dev-01").is_ok(), "断ったのに消してしまった");
+    }
+
+    #[test]
+    fn remove_target_succeeds_when_idle() {
+        let _home = home_guard("remove-idle");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+        // 1 本走らせて、終わらせる
+        {
+            let _g = SlotGuard::claim(&t.id).expect("取れる");
+        }
+        let removed = reg.remove_target("dev-01").expect("空いていれば外せる");
+        assert_eq!(removed.id, t.id);
+        assert!(reg.find("dev-01").is_err(), "消えていない");
+    }
+
+    /// **引くのと数えるのが同じロックの中**なので、「空いていると読んでから
+    /// 消すまでの隙間」が無い。どちらが先に通っても、通ったほうだけが成る。
+    #[test]
+    fn remove_target_and_claim_slot_do_not_race() {
+        let _home = home_guard("remove-race");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 1);
+        mark_ready(&t.id);
+
+        let id = t.id.clone();
+        let dir = store::cloud_dir();
+        let (claimed, removed) = std::thread::scope(|sc| {
+            let a = {
+                let id = id.clone();
+                let dir = dir.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    claim_slot(&id).is_ok()
+                })
+            };
+            let b = {
+                let dir = dir.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    registry().remove_target("dev-01").is_ok()
+                })
+            };
+            (a.join().expect("終わる"), b.join().expect("終わる"))
+        });
+
+        let left = store::load_targets().expect("読める");
+        if removed {
+            // 外れたなら、枠を取れていてはいけない
+            assert!(!claimed, "外したのに枠も配った (どちらも成った)");
+            assert!(left.iter().all(|x| x.id != id), "外れていない");
+        } else {
+            // 外れなかったなら、実行先は残っている
+            assert!(left.iter().any(|x| x.id == id), "断ったのに消えている");
+        }
     }
 
     // ───── 落ちた仕事の後始末 (P1-1) ─────    // ───── 落ちた仕事の後始末 (P1-1) ─────
