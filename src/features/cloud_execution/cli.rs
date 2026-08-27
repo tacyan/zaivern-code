@@ -49,9 +49,10 @@ cloud (クラウド実行 — どのマシン・どのクラウドでも同じ�
                                         実行先でコマンドを 1 回走らせる
   zai cloud shell <名前>                 対話シェルを開く
   zai cloud launch --target <名前|auto> [--command \"<コマンド行>\" | -- <コマンド...>]
-                 [--cwd <リモートのパス>] [--run]
+                 [--cwd <リモートのパス>] [--run] [--print-ssh]
                                         エージェントをリモートで起動する 1 行を作る
                                         (エージェント設定の command に貼れます。--run でその場実行)
+                                        --print-ssh は診断用の素の ssh 行 (枠を通りません)
   zai cloud copy --target <名前> <手元のファイル> <リモートのパス>
   zai cloud copy --target <名前> --from <リモートのパス> <手元のファイル>
                                         ファイルを 1 つ送る / 受け取る
@@ -82,6 +83,8 @@ cloud (クラウド実行 — どのマシン・どのクラウドでも同じ�
 
   終了コード: 0 = 成功 / 1 = 実行時エラー / 2 = 使い方の誤り /
               3 = 認証・設定の誤り / 4 = 条件に合う実行先が無い
+  枠 (max_jobs) を数えるのは exec / job run / launch --run の 3 つです。
+  shell は人が入るためのものなので数えません (詰まっているときこそ入りたいため)。
   秘密は保存も表示もしません (保存するのは環境変数の名前とパスだけ)。
   --target auto は**すでに在る Ready な実行先から選ぶ**だけで、VM を勝手に作りません。
 ";
@@ -537,7 +540,7 @@ fn target_json(t: &ExecutionTarget) -> serde_json::Value {
         "cpu_cores": t.capabilities.cpu_cores,
         "memory_mib": t.capabilities.memory_mib,
         "max_jobs": t.capacity.max_jobs,
-        "active_jobs": t.capacity.active_jobs,
+        "active_jobs": t.capacity.active_jobs(),
         "managed": t.managed,
         "cost": t.billing.summary(),
     })
@@ -565,7 +568,7 @@ fn target_list(args: &[String]) -> Result<String, Fail> {
             t.provider.as_str(),
             t.lifecycle.id(),
             t.endpoint.summary(),
-            format!("{}/{}", t.capacity.active_jobs, t.capacity.max_jobs),
+            format!("{}/{}", t.capacity.active_jobs(), t.capacity.max_jobs),
         ));
     }
     Ok(out)
@@ -937,16 +940,36 @@ fn launch_cmd(args: &[String]) -> Result<String, Fail> {
         // **貼るための 1 行。** どのシェル向けの引用かを必ず添える —
         // POSIX 用の行を「どこでも使える」ように見せると、Windows の
         // preset へ貼った人のところで静かに壊れる。
-        let line = match (&command, &spec) {
-            (Some(c), _) => super::command::session_command_line(&target, c, cwd.as_deref(), &opts)?,
-            (None, Some(s)) => super::command::launch_command_line(&target, s, &opts)?,
-            _ => unreachable!("上で使い方の誤りとして返している"),
-        };
+        // **既定では ssh を直に貼らせない。** 貼った先で枠 (`max_jobs`) を
+        // 通らないと、上限を超えて起動でき、走っているのに `worker destroy` が
+        // 通ってしまう。素の ssh 行が要るのは中身を見たいときだけなので、
+        // `--print-ssh` を明示したときにだけ出す (枠を通らないと断ったうえで)。
+        if flag(args, "--print-ssh") {
+            let raw = match (&command, &spec) {
+                (Some(c), _) => {
+                    super::command::session_command_line(&target, c, cwd.as_deref(), &opts)?
+                }
+                (None, Some(s)) => super::command::launch_command_line(&target, s, &opts)?,
+                _ => unreachable!("上で使い方の誤りとして返している"),
+            };
+            eprintln!(
+                "# これは診断用の素の ssh 行です。**枠 (max_jobs) も仕事の記録も通りません。**\n\
+                 # preset へ貼るなら --print-ssh を外した行を使ってください。"
+            );
+            return Ok(raw);
+        }
+        let line = super::command::preset_command_line(
+            &target,
+            command.as_deref(),
+            spec.as_ref(),
+            cwd.as_deref(),
+        )?;
         // 注記は**標準エラーへ**。標準出力に混ぜると貼り付けに使えない
         eprintln!(
             "# 次の 1 行は POSIX シェル (sh / bash / zsh) 向けの引用です。\n\
              # Windows の PowerShell / cmd.exe へはそのまま貼れません — \
-             その場で走らせるには --run を使ってください。"
+             その場で走らせるには --run を使ってください。\n\
+             # zai を経由するので、貼った先でも枠 (max_jobs) と仕事の記録を通ります。"
         );
         return Ok(line);
     }
@@ -959,7 +982,9 @@ fn launch_cmd(args: &[String]) -> Result<String, Fail> {
         (None, Some(s)) => super::command::run_plan_for_spec(&target, s, &opts)?,
         _ => unreachable!("上で使い方の誤りとして返している"),
     };
-    let status = spawn_plan(&plan)?;
+    // **枠を取ってから起こす。** ここを素通りさせると `max_jobs` を超えて
+    // 起動でき、走っているのに `worker destroy` が通ってしまう。
+    let status = runner::run_attached(&target, &plan.display(), || spawn_plan(&plan))?;
     match status.code() {
         Some(0) => Ok(String::new()),
         // **相手の終了コードをそのまま返さない。** 1〜4 は Zaivern 自身の
@@ -1845,7 +1870,9 @@ mod tests {
         // CLI の層は 1 へ畳むが、値は文面に残す
         let src = include_str!("cli.rs").replace("\r\n", "\n");
         let body = src.split("#[cfg(test)]").next().unwrap_or_default();
-        let at = body.find("let status = spawn_plan(&plan)?;").expect("起動している");
+        let at = body
+            .find("runner::run_attached(&target, &plan.display(), || spawn_plan(&plan))")
+            .expect("枠を通してから起動している");
         let tail = &body[at..at + 700.min(body.len() - at)];
         assert!(
             tail.contains("コマンドが {code} で終了しました"),
@@ -1906,6 +1933,139 @@ mod tests {
         );
         // 注記は標準エラーへ (標準出力に混ぜると貼り付けに使えない)
         assert!(launch.contains("eprintln!"), "注記を標準出力へ混ぜている");
+    }
+
+    // ───── preset へ貼る行も枠を通る ─────
+
+    fn add_ssh_target(name: &str) {
+        let add: Vec<String> = [
+            "ssh", "--name", name, "--host", "example.com", "--user", "zaivern",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        target_add(&add).expect("足せる");
+        // 実行先として選ばれるには probe が通っている必要がある
+        store::with_targets(|l| {
+            for t in l.iter_mut() {
+                if t.name == name {
+                    t.lifecycle = TargetLifecycle::Ready;
+                }
+            }
+        })
+        .expect("書ける");
+    }
+
+    /// **P1 の再現。** 貼るための 1 行が素の `ssh` だと、貼った先で
+    /// 枠 (`max_jobs`) を通らない。上限を超えて起動でき、走っているのに
+    /// `worker destroy` が通ってしまう。
+    #[test]
+    fn 貼る行はzaiを経由する() {
+        let _home = home_guard("launch-preset-line");
+        add_ssh_target("dev-01");
+        let args: Vec<String> = ["--target", "dev-01", "--", "agent", "--serve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let line = launch_cmd(&args).expect("組める");
+
+        assert!(
+            line.contains("cloud launch") && line.contains("--run"),
+            "管理された経路を通っていない: {line}"
+        );
+        assert!(
+            !line.starts_with("ssh ") && !line.contains(" ssh "),
+            "素の ssh を貼らせている: {line}"
+        );
+        // 走らせる中身は落ちていない
+        assert!(line.contains("agent") && line.contains("--serve"), "{line}");
+        assert!(line.contains("dev-01"), "{line}");
+    }
+
+    /// **`--run` は枠を通ってから起こす。** 上限が埋まっていれば
+    /// 1 プロセスも起こさずに断る (CLI の入口から確かめる)。
+    #[test]
+    fn その場実行は枠が無ければ起こさない() {
+        let _home = home_guard("launch-run-capacity");
+        // **手元の上限ぶんを先に押さえる。** 上限は設定 (`default_max_jobs`)
+        // なので、そこから取る (決め打つと設定を変えた日に空回りする)
+        let max = crate::features::cloud_execution::default_max_jobs(&config());
+        let held: Vec<_> = (0..max)
+            .map(|i| {
+                super::super::registry::SlotGuard::claim_local(
+                    max,
+                    &super::super::model::JobId::new(format!("j-occupied-{i}")),
+                )
+                .expect("押さえられる")
+            })
+            .collect();
+
+        let args: Vec<String> = [
+            "--target",
+            "local",
+            "--run",
+            "--",
+            // 走ってしまったら分かるように、実在する道具にする
+            if cfg!(windows) { "cmd" } else { "true" },
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let e = launch_cmd(&args).expect_err("断る");
+        match e {
+            Fail::Cloud(c) => assert!(
+                matches!(c, CloudError::NoCapacity(_)),
+                "空き無し以外で断っている: {c:?}"
+            ),
+            other => panic!("枠を見ずに断っている: {other:?}"),
+        }
+
+        // 返せば通る
+        drop(held);
+        launch_cmd(&args).expect("返せば走る");
+        // 走り終えた後に枠が残っていない
+        for t in store::load_targets().expect("読める") {
+            assert_eq!(t.capacity.active_jobs(), 0, "{} の枠が返っていない", t.name);
+        }
+        // 記録に残っている (どの入口から走らせても仕事は記録される)
+        let jobs = runner::recent_jobs(10).expect("読める");
+        assert!(!jobs.is_empty(), "記録が無い");
+    }
+
+    /// 素の ssh 行は**明示したときだけ**出す (診断用)。
+    #[test]
+    fn 素のssh行は明示したときだけ出す() {
+        let _home = home_guard("launch-print-ssh");
+        add_ssh_target("dev-01");
+        let args: Vec<String> = [
+            "--target", "dev-01", "--print-ssh", "--", "agent", "--serve",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let line = launch_cmd(&args).expect("組める");
+        assert!(line.starts_with("ssh "), "診断用の行が出ていない: {line}");
+    }
+
+    /// **行を作るだけでは枠を取らない。** 取ってしまうと、貼る前に
+    /// 上限を食い潰す。
+    #[test]
+    fn 行を作るだけでは枠を取らない() {
+        let _home = home_guard("launch-display-only");
+        add_ssh_target("dev-01");
+        for extra in [vec![], vec!["--print-ssh"]] {
+            let mut args: Vec<String> = vec!["--target".into(), "dev-01".into()];
+            args.extend(extra.iter().map(|s| s.to_string()));
+            args.extend(["--".to_string(), "agent".to_string()]);
+            launch_cmd(&args).expect("組める");
+            for t in store::load_targets().expect("読める") {
+                assert_eq!(t.capacity.active_jobs(), 0, "{} の枠が増えた", t.name);
+            }
+            assert!(
+                runner::recent_jobs(10).expect("読める").is_empty(),
+                "走らせていないのに記録が増えた"
+            );
+        }
     }
 
     #[test]

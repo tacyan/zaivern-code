@@ -132,10 +132,7 @@ pub fn make_target(spec: &SshTargetSpec) -> Result<ExecutionTarget, CloudError> 
         // **能力はまだ分からない。** 分からないものを推測で埋めない —
         // 埋めると `probe` する前から「16GB ある」ことになる。
         capabilities: Capabilities::default(),
-        capacity: TargetCapacity {
-            max_jobs: spec.max_jobs.max(1),
-            active_jobs: 0,
-        },
+        capacity: TargetCapacity::new(spec.max_jobs.max(1)),
         // **まだ Ready ではない。** 届くことを確かめる前に Scheduler へ
         // 渡すと、最初の仕事が必ず失敗する (§50)。
         lifecycle: TargetLifecycle::Unknown,
@@ -144,6 +141,7 @@ pub fn make_target(spec: &SshTargetSpec) -> Result<ExecutionTarget, CloudError> 
         billing: Default::default(),
         provider_ref: None,
         note: String::new(),
+        generation: 0,
     })
 }
 

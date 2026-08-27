@@ -288,7 +288,7 @@ fn target_row(ui: &mut egui::Ui, p: &mut Panel, t: &ExecutionTarget, width: f32)
         "{icon} {}  ·  {}  ·  {}/{}  ·  {caps}",
         t.name,
         t.endpoint.summary(),
-        t.capacity.active_jobs,
+        t.capacity.active_jobs(),
         t.capacity.max_jobs
     );
     let resp = ui.add_sized(

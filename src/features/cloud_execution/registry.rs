@@ -20,7 +20,9 @@
 
 use std::time::Duration;
 
-use super::model::{CloudError, ExecutionTarget, ProbeResult, TargetId, TargetLifecycle};
+use super::model::{
+    CloudError, ExecutionTarget, JobId, ProbeResult, SlotHolder, TargetId, TargetLifecycle,
+};
 use super::provider::{
     self, ExecutionProvider, ProviderCtx, ProviderKind, ProviderProfile, ProvisionSpec,
 };
@@ -169,10 +171,11 @@ impl Registry {
                 }
             }
             let t = &list[hits[0]];
-            if t.capacity.active_jobs > 0 {
+            if t.capacity.active_jobs() > 0 {
                 return Err(CloudError::config(format!(
                     "{} ではまだ {} 本の仕事が走っています。終了後に一覧から外してください",
-                    t.name, t.capacity.active_jobs
+                    t.name,
+                    t.capacity.active_jobs()
                 )));
             }
             Ok(list.remove(hits[0]))
@@ -185,19 +188,28 @@ impl Registry {
     pub fn probe(&self, name_or_id: &str) -> Result<(ExecutionTarget, ProbeResult), CloudError> {
         let target = self.find(name_or_id)?;
         let tr = transport::for_target(&target, self.ssh_timeout);
+        self.probe_with(&target, tr.as_ref())
+    }
+
+    /// [`Registry::probe`] の本体。**Transport を差し替えられる**ので、
+    /// 「確かめているあいだに削除予約が入る」順序を試験が決定的に作れる。
+    pub(crate) fn probe_with(
+        &self,
+        target: &ExecutionTarget,
+        tr: &dyn ExecutionTransport,
+    ) -> Result<(ExecutionTarget, ProbeResult), CloudError> {
+        let target = target.clone();
         let probe = tr.probe(&target)?;
         let updated = apply_probe(&target, &probe);
         // 手元の機械は台帳に載っていないので書き戻さない
         if updated.transport != super::model::TransportKind::Local {
-            store::with_targets(|list| {
-                if let Some(slot) = list.iter_mut().find(|t| t.id == updated.id) {
-                    // **枠の使用中の数は上書きしない。** 探りの結果で
-                    // `active_jobs` を 0 に戻すと、走っている仕事が消える。
-                    let active = slot.capacity.active_jobs;
-                    *slot = updated.clone();
-                    slot.capacity.active_jobs = active;
-                }
-            })?;
+            // **読んだときから状態が変わっていたら書かない** (削除予約を消さない)
+            if write_back_if_current(&updated, target.generation)? == WriteBack::Stale {
+                return Err(CloudError::config(format!(
+                    "{} の状態が確認中に変わりました。もう一度 probe してください",
+                    target.name
+                )));
+            }
         }
         Ok((updated, probe))
     }
@@ -216,11 +228,20 @@ impl Registry {
             for t in &found {
                 match list.iter_mut().find(|x| x.id == t.id) {
                     Some(slot) => {
+                        // **削除中のものには触らない。** Provider の一覧は
+                        // 問い合わせた瞬間の写しで、そのあいだに入った削除予約より
+                        // 古い。ここで上書きすると予約が消える
+                        // (`destroy` は自分で結果を書き戻すので、待てばよい)。
+                        if slot.lifecycle == TargetLifecycle::Destroying {
+                            continue;
+                        }
                         // 接続情報と能力は Provider が正しい。枠の使用中は手元が正しい
-                        let active = slot.capacity.active_jobs;
+                        let holders = std::mem::take(&mut slot.capacity.holders);
                         let lifecycle = slot.lifecycle;
+                        let generation = slot.generation;
                         *slot = t.clone();
-                        slot.capacity.active_jobs = active;
+                        slot.capacity.holders = holders;
+                        slot.generation = generation;
                         // 一度 Ready と分かっているものを降格させない。
                         // **ただし Provider が「消えかけ / 消えた」と言うなら
                         // そちらを採る** — 手元の記憶より、向こうの現状が正しい。
@@ -229,6 +250,7 @@ impl Registry {
                         {
                             slot.lifecycle = TargetLifecycle::Ready;
                         }
+                        bump(slot);
                     }
                     None => {
                         list.push(t.clone());
@@ -290,7 +312,7 @@ impl Registry {
     ///   `zai cloud target remove` (台帳から外す)
     pub fn destroy(&self, name_or_id: &str) -> Result<ExecutionTarget, CloudError> {
         // 1) ロックの中で確かめて、削除中へ移す (ここまで原子的)
-        let target = self.reserve_destroy(name_or_id)?;
+        let (target, reserved_at) = self.reserve_destroy(name_or_id)?;
 
         // 2) **ロックの外で** Provider を呼ぶ (数秒かかりうる)
         let outcome = self
@@ -300,15 +322,31 @@ impl Registry {
         // 3) 結果で台帳を確定させる
         match outcome {
             Ok(()) => {
-                store::with_targets(|list| list.retain(|x| x.id != target.id))?;
+                // **自分の予約のときだけ消す。** 予約してから応答が返るまでに
+                // 別の操作が入っていたら、その新しい状態を上書きしない。
+                let removed = store::with_targets(|list| {
+                    match list.iter().position(|x| x.id == target.id) {
+                        Some(i) if list[i].generation == reserved_at => {
+                            list.remove(i);
+                            true
+                        }
+                        _ => false,
+                    }
+                })?;
+                if !removed {
+                    return Err(CloudError::config(format!(
+                        "{} は削除しましたが、そのあいだに台帳の状態が変わっていました。\n                         zai cloud target list で確かめてください",
+                        target.name
+                    )));
+                }
                 Ok(target)
             }
             Err(e) if certainly_untried(&e) => {
-                self.release_destroy(&target, &e)?;
+                self.release_destroy(&target, reserved_at, &e)?;
                 Err(e)
             }
             Err(e) => {
-                self.hold_destroying(&target, &e)?;
+                self.hold_destroying(&target, reserved_at, &e)?;
                 Err(e)
             }
         }
@@ -317,7 +355,7 @@ impl Registry {
     /// 台帳ロックの中で「消してよいか」を確かめ、[`TargetLifecycle::Destroying`]
     /// へ移す。**名前の解決もこの中で行う** — 外で引いた写しを使うと、
     /// 引いてから予約するまでのあいだに状態が変わりうる。
-    fn reserve_destroy(&self, name_or_id: &str) -> Result<ExecutionTarget, CloudError> {
+    fn reserve_destroy(&self, name_or_id: &str) -> Result<(ExecutionTarget, u64), CloudError> {
         store::with_targets(|list| {
             let hits: Vec<usize> = list
                 .iter()
@@ -353,42 +391,64 @@ impl Registry {
             }
             // **ここが要。** 確認と遷移が同じロックの中にあるので、
             // 「0 件だと確かめた直後に 1 本載る」が起こり得ない。
-            if t.capacity.active_jobs > 0 {
+            if t.capacity.active_jobs() > 0 {
                 return Err(CloudError::config(format!(
                     "{name_or_id} ではまだ {} 本の仕事が走っています",
-                    t.capacity.active_jobs
+                    t.capacity.active_jobs()
                 )));
             }
             let before = t.clone();
             t.lifecycle = TargetLifecycle::Destroying;
             t.note = "削除中 (Provider へ問い合わせています)".to_string();
-            Ok(before)
+            // **この予約の世代を返す。** 結果を書き戻すときに照合して、
+            // 古い削除処理の応答が新しい操作を上書きしないようにする。
+            bump(t);
+            Ok((before, t.generation))
         })?
     }
 
     /// 削除が**始まっていない**と分かったので、元の状態へ戻す。
-    fn release_destroy(&self, before: &ExecutionTarget, why: &CloudError) -> Result<(), CloudError> {
+    fn release_destroy(
+        &self,
+        before: &ExecutionTarget,
+        reserved_at: u64,
+        why: &CloudError,
+    ) -> Result<(), CloudError> {
         store::with_targets(|list| {
             if let Some(t) = list.iter_mut().find(|t| t.id == before.id) {
-                // 自分が付けた予約だけを外す (別の誰かが動かしていたら触らない)
-                if t.lifecycle == TargetLifecycle::Destroying {
+                // **自分が付けた予約だけを外す。** 世代で見るので、
+                // 別の操作が入った後の状態を上書きしない
+                // (状態だけを見ると、他人が入れた新しい予約まで外してしまう)。
+                if t.generation == reserved_at && t.lifecycle == TargetLifecycle::Destroying {
                     t.lifecycle = before.lifecycle;
                     t.note = crate::features::cloud_execution::redact::redact(&format!(
                         "削除は行われませんでした: {why}"
                     ));
+                    bump(t);
                 }
             }
         })
     }
 
     /// 削除が**届いたか分からない**ので、削除中のまま留め置く。
-    fn hold_destroying(&self, before: &ExecutionTarget, why: &CloudError) -> Result<(), CloudError> {
+    fn hold_destroying(
+        &self,
+        before: &ExecutionTarget,
+        reserved_at: u64,
+        why: &CloudError,
+    ) -> Result<(), CloudError> {
         store::with_targets(|list| {
             if let Some(t) = list.iter_mut().find(|t| t.id == before.id) {
+                // 自分の予約のままなら「結果不明」と書く。別の操作が
+                // 入っていたら触らない (新しいほうが正しい)
+                if t.generation != reserved_at {
+                    return;
+                }
                 t.lifecycle = TargetLifecycle::Destroying;
                 t.note = crate::features::cloud_execution::redact::redact(&format!(
                     "削除の結果が不明です: {why} / probe で確かめ直すまで新しい仕事は載せません"
                 ));
+                bump(t);
             }
         })
     }
@@ -414,13 +474,13 @@ impl Registry {
             let probe = tr.probe(&target)?;
             if probe.reachable {
                 let updated = apply_probe(&target, &probe);
-                store::with_targets(|list| {
-                    if let Some(slot) = list.iter_mut().find(|t| t.id == updated.id) {
-                        let active = slot.capacity.active_jobs;
-                        *slot = updated.clone();
-                        slot.capacity.active_jobs = active;
-                    }
-                })?;
+                // **待っているあいだに消されたなら、Ready にはしない。**
+                if write_back_if_current(&updated, target.generation)? == WriteBack::Stale {
+                    return Err(CloudError::config(format!(
+                        "{} の状態が待機中に変わりました (削除された可能性があります)",
+                        target.name
+                    )));
+                }
                 return Ok(updated);
             }
             if std::time::Instant::now() >= deadline {
@@ -439,6 +499,73 @@ impl Registry {
     pub fn ssh_timeout(&self) -> Duration {
         self.ssh_timeout
     }
+}
+
+// ─────────── 古い写しで状態を上書きしない (世代の照合) ───────────
+
+/// 状態を書き換えたことを記録する。**枠の増減では増やさない**
+/// (増やすと、仕事が 1 本載るたびに探りの書き戻しが落ちる)。
+pub fn bump(t: &mut ExecutionTarget) {
+    t.generation = t.generation.wrapping_add(1);
+}
+
+/// 書き戻しを断った理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBack {
+    /// 書けた。
+    Applied,
+    /// 読んでからのあいだに別の誰かが状態を変えた (自分の写しはもう古い)。
+    Stale,
+    /// もう台帳に居ない。
+    Gone,
+}
+
+/// **読んだときから状態が変わっていなければ**書き戻す。
+///
+/// ## なぜ要るのか (この版で直した壊れ方)
+///
+/// `probe` は「読む → ネットワークで確かめる (数秒) → 書き戻す」の形。
+/// そのあいだに別のプロセスが `destroy` を予約すると、
+///
+/// ```text
+/// A: probe が古い写しを読む (ready)
+///                       B: destroying を書いて Provider へ DELETE を送る
+/// A: probe が成功し、古い写しから作った ready を書き戻す ← 予約が消える
+///                       新しい仕事が枠を取り、その VM ごと消える
+/// ```
+///
+/// ロックを数秒握り続けるのは答えではない (そのあいだ他が全部止まる)。
+/// **読んだときの世代を覚えておき、書く瞬間にロックの中で照合する。**
+///
+/// 枠 (`capacity.holders`) は書き戻しの対象にしない — あれは「いま何本
+/// 走っているか」で、探りが持ち帰るものではない。
+fn write_back_if_current(
+    updated: &ExecutionTarget,
+    seen_generation: u64,
+) -> Result<WriteBack, CloudError> {
+    store::with_targets(|list| {
+        let Some(slot) = list.iter_mut().find(|t| t.id == updated.id) else {
+            return WriteBack::Gone;
+        };
+        if slot.generation != seen_generation {
+            return WriteBack::Stale;
+        }
+        // **削除中を上書きしない。** 世代が同じでも (= 読んだときすでに
+        // destroying だった場合)、SSH に入れたというだけで Ready へ戻さない。
+        // 戻してよいと言えるのは Provider へ確かめ直したときだけ。
+        if slot.lifecycle == TargetLifecycle::Destroying
+            && updated.lifecycle != TargetLifecycle::Destroying
+        {
+            return WriteBack::Stale;
+        }
+        let holders = std::mem::take(&mut slot.capacity.holders);
+        let generation = slot.generation;
+        *slot = updated.clone();
+        slot.capacity.holders = holders;
+        slot.generation = generation;
+        bump(slot);
+        WriteBack::Applied
+    })
 }
 
 /// 探りの結果を実行先へ当てはめる。**純関数**なので表で固定できる。
@@ -480,7 +607,7 @@ pub fn apply_probe(target: &ExecutionTarget, probe: &ProbeResult) -> ExecutionTa
 /// あちらは「どれが良いか」を説明つきで選ぶための純関数で、こちらは
 /// 「いま本当に載せてよいか」の 1 点確認。**同じ規則を 2 度書くのではなく、
 /// 最後の 1 回だけがロックの中にある**という関係になっている。
-pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
+pub fn claim_slot(id: &TargetId, job: &JobId) -> Result<(), CloudError> {
     store::with_targets(|list| {
         let Some(t) = list.iter_mut().find(|t| &t.id == id) else {
             return Err(CloudError::config(format!("実行先 {id} が見つかりません")));
@@ -500,25 +627,36 @@ pub fn claim_slot(id: &TargetId) -> Result<(), CloudError> {
                 t.lifecycle.id(),
             )));
         }
-        if !t.capacity.has_room() {
+        if !t.capacity.hold(holder(job)) {
             return Err(CloudError::no_capacity(format!(
                 "{} はすでに {} 本を実行中です (max_jobs = {})",
-                t.name, t.capacity.active_jobs, t.capacity.max_jobs
+                t.name,
+                t.capacity.active_jobs(),
+                t.capacity.max_jobs
             )));
         }
-        t.capacity.active_jobs += 1;
         Ok(())
     })?
 }
 
-// ─────────────── 落ちた仕事の後始末 (P1-1) ───────────────
+/// いま自分が握るときの印。**PID を一緒に置く**ので、落ちた後の後始末が
+/// `targets.json` だけで完結する ([`reconcile_active_jobs`])。
+fn holder(job: &JobId) -> SlotHolder {
+    SlotHolder {
+        job: job.clone(),
+        pid: std::process::id(),
+        since_unix: store::now_unix(),
+    }
+}
+
+// ─────────────── 落ちた仕事の後始末 ───────────────
 
 /// 後始末の結果 (`doctor` と試験が読む)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reconciled {
-    /// 持ち主が居なくなっていた未完了の仕事の数。
+    /// 持ち主が居なくなっていた枠の数。
     pub stale_jobs: usize,
-    /// 返した枠の数。
+    /// 返した枠の数 (= `stale_jobs`。分けて持つのは読む側のため)。
     pub freed_slots: usize,
 }
 
@@ -527,41 +665,64 @@ pub struct Reconciled {
 /// ## なぜ要るのか
 ///
 /// 枠を返すのは [`SlotGuard`] の Drop だが、`kill -9` / OOM Killer /
-/// 電源断 / OS 再起動では Drop が呼ばれない。すると `targets.json` には
-/// 「走っている 1 本」が残り、**実際には 0 件なのに `active_jobs == max_jobs`**
-/// になって、その実行先へ二度と仕事を載せられなくなる。
+/// 電源断 / OS 再起動では Drop が呼ばれない。すると台帳には「走っている 1 本」が
+/// 残り、**実際には 0 件なのに `active_jobs == max_jobs`** になって、
+/// その実行先へ二度と仕事を載せられなくなる。
 ///
-/// ## なぜ「未完了の本数を数え直す」ではいけないのか
+/// ## 1 つのファイル・1 つのロックで完結させる (この版で直した壊れ方)
 ///
-/// 落ちたときは `jobs.json` の側にも `running` が残る。だから
-/// 「未完了の本数 = active_jobs」と置き直すと、**落ちた仕事の枠がそのまま
-/// 残る**か、逆に別のプロセスが今まさに取った枠を消してしまう。
+/// 前の版は「`jobs.json` を Failed にする」→「`targets.json` から 1 引く」の
+/// **2 段**だった。あいだで止まると仕事だけが完了扱いになり、次回は
+/// `is_final()` で除外されて**枠が永久に返らない**。順序を逆にすると、
+/// 今度は同じ枠を二重に返しうる。**2 つのファイルにまたがる限り、どちらかが
+/// 必ず壊れる。**
 ///
-/// ## 2 段で、引き算だけする
+/// いまは枠を*数*ではなく**持ち主の集合** ([`SlotHolder`]) で持つので、
+/// 判定に要るもの (仕事 ID と PID) が `targets.json` の中に揃っている。
+/// 後始末は**そのファイルのロックの中だけ**で終わり、
 ///
-/// 1. 仕事の台帳のロックの中で、**持ち主のプロセスがもう居ない**未完了の
-///    記録だけを `Failed` へ移す。移せた本数がそのまま「返してよい枠の数」で、
-///    ロックの中なので 2 つのインスタンスが同じ 1 本を二重に数えない
-/// 2. 実行先の台帳のロックの中で、**その本数だけ引く** (絶対値で置き直さない)
+/// * 途中で止まっても、次の実行が同じ判定をやり直すだけ
+/// * 何度実行しても結果が変わらない (同じ id を 2 度外しても no-op)
+/// * `jobs.json` の履歴上限で記録が押し出されても、枠は迷子にならない
 ///
-/// 引き算だけにするのが要で、1 と 2 のあいだに別のプロセスが枠を取っても、
-/// その枠は消えない (足された分はそのまま残る)。だから
-/// **後始末が `max_jobs` を超えさせることも、生きている仕事の枠を奪うことも
-/// 構造的に起こらない**。
+/// `jobs.json` 側の記録を `failed` にするのは**履歴の見た目を合わせるだけ**で、
+/// 枠の正しさはそれに依存しない (失敗しても枠はもう返っている)。
 ///
 /// ## 残る穴 (正直に)
 ///
-/// 判定は PID の生存だけなので、**PID が再利用された**ときは「まだ生きている」
-/// と読む。その場合は枠が返らないが、再利用した側のプロセスが終われば次の
-/// 後始末で返るので、永久には残らない。
+/// 判定は**手元の PID の生存**だけ。だから
+///
+/// * PID が再利用されていると、その回は枠が返らない (再利用した側が終われば返る)
+/// * **手元のプロセスが死んでも、リモートで走っているコマンドは死なない。**
+///   枠を返すのは「手元がもう見ていない」という意味であって、
+///   「向こうが止まった」という意味ではない。SSH が切れれば向こうも
+///   終わるのが普通だが、`nohup` などで切り離されていれば残る。
+///   確実に止めたいなら `zai cloud shell` で入って確かめること
 pub fn reconcile_active_jobs() -> Result<Reconciled, CloudError> {
-    use std::collections::BTreeMap;
+    // **実行先の台帳のロックの中だけ**で判定して外す (ここが要)。
+    let dropped: Vec<JobId> = store::with_targets(|list| {
+        let mut dropped = Vec::new();
+        for t in list.iter_mut() {
+            t.capacity.holders.retain(|h| {
+                if crate::instances::pid_alive(h.pid) {
+                    return true;
+                }
+                dropped.push(h.job.clone());
+                false
+            });
+        }
+        dropped
+    })?;
 
-    // 1) 持ち主が居ない未完了の記録を Failed へ移す (仕事の台帳のロックの中)
-    let freed: BTreeMap<TargetId, u16> = store::with_jobs(|jobs| {
-        let mut freed: BTreeMap<TargetId, u16> = BTreeMap::new();
+    if dropped.is_empty() {
+        return Ok(Reconciled::default());
+    }
+
+    // 履歴の見た目を合わせる。**ここが失敗しても枠はもう返っている**ので、
+    // 後始末そのものは成功として返す (次に走らせても二重には返らない)。
+    let _ = store::with_jobs(|jobs| {
         for j in jobs.iter_mut() {
-            if j.state.is_final() || owner_alive(j) {
+            if j.state.is_final() || !dropped.contains(&j.id) {
                 continue;
             }
             j.state = super::model::ExecutionJobState::Failed;
@@ -569,43 +730,13 @@ pub fn reconcile_active_jobs() -> Result<Reconciled, CloudError> {
             if j.ended_unix == 0 {
                 j.ended_unix = store::now_unix();
             }
-            let n = freed.entry(j.target.clone()).or_insert(0);
-            *n = n.saturating_add(1);
         }
-        freed
-    })?;
-
-    let stale_jobs: usize = freed.values().map(|n| *n as usize).sum();
-    if freed.is_empty() {
-        return Ok(Reconciled::default());
-    }
-
-    // 2) 片付けた本数だけ枠を引く (実行先の台帳のロックの中)
-    let freed_slots = store::with_targets(|list| {
-        let mut done = 0usize;
-        for t in list.iter_mut() {
-            if let Some(n) = freed.get(&t.id) {
-                let before = t.capacity.active_jobs;
-                t.capacity.active_jobs = before.saturating_sub(*n);
-                done += (before - t.capacity.active_jobs) as usize;
-            }
-        }
-        done
-    })?;
+    });
 
     Ok(Reconciled {
-        stale_jobs,
-        freed_slots,
+        stale_jobs: dropped.len(),
+        freed_slots: dropped.len(),
     })
-}
-
-/// その仕事を握っていたプロセスは、まだ生きているか。
-///
-/// **`owner_pid == 0` は「分からない」ではなく「居ない」として扱う。**
-/// この欄が無かった頃の記録で、書いたプロセスはもう存在しない
-/// ([`crate::instances::pid_alive`] も 0 を偽で返す)。
-fn owner_alive(job: &super::model::ExecutionJob) -> bool {
-    crate::instances::pid_alive(job.owner_pid)
 }
 
 /// 手元の実行先を先頭に置いた一覧を組む。
@@ -617,7 +748,7 @@ fn owner_alive(job: &super::model::ExecutionJob) -> bool {
 pub fn with_local(local_max_jobs: u16, stored: Vec<ExecutionTarget>) -> Vec<ExecutionTarget> {
     let mut local = ExecutionTarget::local(local_max_jobs);
     if let Some(s) = stored.iter().find(|t| t.id == local.id) {
-        local.capacity.active_jobs = s.capacity.active_jobs;
+        local.capacity.holders = s.capacity.holders.clone();
     }
     let mut out = vec![local];
     out.extend(
@@ -638,9 +769,9 @@ pub fn with_local(local_max_jobs: u16, stored: Vec<ExecutionTarget>) -> Vec<Exec
 /// 作る (DB / 常駐) のではなく、**すでにロックのある台帳**へ手元の行を
 /// 1 つ置いて、遠隔の実行先とまったく同じ道 ([`store::with_targets`]) を通す。
 ///
-/// 台帳の行が持つ意味は `capacity.active_jobs` **だけ**。上限も能力も
+/// 台帳の行が持つ意味は `capacity.holders` **だけ**。上限も能力も
 /// 毎回設定から組み直す ([`Registry::targets`]) ので、古い値が残ることはない。
-pub fn claim_local_slot(max_jobs: u16) -> Result<(), CloudError> {
+pub fn claim_local_slot(max_jobs: u16, job: &JobId) -> Result<(), CloudError> {
     let local = ExecutionTarget::local(max_jobs);
     store::with_targets(|list| {
         let t = match list.iter_mut().position(|t| t.id == local.id) {
@@ -652,13 +783,13 @@ pub fn claim_local_slot(max_jobs: u16) -> Result<(), CloudError> {
         };
         // 上限は設定が正 (`config.toml` を書き換えたら次の仕事から効く)
         t.capacity.max_jobs = max_jobs;
-        if !t.capacity.has_room() {
+        if !t.capacity.hold(holder(job)) {
             return Err(CloudError::no_capacity(format!(
                 "手元ではすでに {} 本を実行中です (default_max_jobs = {})",
-                t.capacity.active_jobs, t.capacity.max_jobs
+                t.capacity.active_jobs(),
+                t.capacity.max_jobs
             )));
         }
-        t.capacity.active_jobs += 1;
         Ok(())
     })?
 }
@@ -676,11 +807,11 @@ fn certainly_untried(e: &CloudError) -> bool {
     )
 }
 
-/// 枠を返す。**足りなくならないよう飽和で引く。**
-pub fn release_slot(id: &TargetId) -> Result<(), CloudError> {
+/// 枠を返す。**何度呼んでも同じ** (持ち主の id で外すので冪等)。
+pub fn release_slot(id: &TargetId, job: &JobId) -> Result<(), CloudError> {
     store::with_targets(|list| {
         if let Some(t) = list.iter_mut().find(|t| &t.id == id) {
-            t.capacity.active_jobs = t.capacity.active_jobs.saturating_sub(1);
+            t.capacity.release(job);
         }
     })
 }
@@ -688,24 +819,30 @@ pub fn release_slot(id: &TargetId) -> Result<(), CloudError> {
 /// 枠の増減を、途中で失敗しても必ず返す形で包む。
 pub struct SlotGuard {
     id: TargetId,
+    job: JobId,
     active: bool,
 }
 
 impl SlotGuard {
     /// 取れたら番人を返す。取れなければ [`CloudError::NoCapacity`]。
-    pub fn claim(id: &TargetId) -> Result<Self, CloudError> {
-        claim_slot(id)?;
+    ///
+    /// **どの仕事が握るかを名前で渡す。** 数ではなく持ち主で持つので、
+    /// 返すのも後始末も同じ id で冪等に行える。
+    pub fn claim(id: &TargetId, job: &JobId) -> Result<Self, CloudError> {
+        claim_slot(id, job)?;
         Ok(Self {
             id: id.clone(),
+            job: job.clone(),
             active: true,
         })
     }
 
     /// 手元の枠を取る。取れなければ [`CloudError::NoCapacity`]。
-    pub fn claim_local(max_jobs: u16) -> Result<Self, CloudError> {
-        claim_local_slot(max_jobs)?;
+    pub fn claim_local(max_jobs: u16, job: &JobId) -> Result<Self, CloudError> {
+        claim_local_slot(max_jobs, job)?;
         Ok(Self {
             id: ExecutionTarget::local(max_jobs).id,
+            job: job.clone(),
             active: true,
         })
     }
@@ -716,7 +853,7 @@ impl Drop for SlotGuard {
         if self.active {
             // **失敗しても黙って落とす。** ここで panic すると、
             // 仕事の失敗が「後始末の失敗」に化けて原因が見えなくなる。
-            let _ = release_slot(&self.id);
+            let _ = release_slot(&self.id, &self.job);
         }
     }
 }
@@ -754,7 +891,6 @@ pub fn all_profiles(stored: &[ProviderProfile]) -> Vec<ProviderProfile> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +923,11 @@ mod tests {
         .expect("組める");
         reg.add_target(t.clone()).expect("足せる");
         t
+    }
+
+    /// 試験用の仕事 ID。**枠は持ち主の id で持つ**ので、1 本ごとに別の名前が要る。
+    fn jid(n: &str) -> JobId {
+        JobId::new(format!("j-test-{n}"))
     }
 
     /// 探りが通った状態にする。**枠を配るのは `Ready` だけ**なので、
@@ -834,9 +975,9 @@ mod tests {
         let reg = registry();
         let t = add(&reg, "dev-01", 2);
         mark_ready(&t.id);
-        let g1 = SlotGuard::claim(&t.id).expect("1 本目");
-        let g2 = SlotGuard::claim(&t.id).expect("2 本目");
-        let e = match SlotGuard::claim(&t.id) {
+        let g1 = SlotGuard::claim(&t.id, &jid("1")).expect("1 本目");
+        let g2 = SlotGuard::claim(&t.id, &jid("2")).expect("2 本目");
+        let e = match SlotGuard::claim(&t.id, &jid("3")) {
             Ok(_) => panic!("3 本目を通してしまった"),
             Err(e) => e,
         };
@@ -845,11 +986,11 @@ mod tests {
 
         // 返せばまた取れる
         drop(g1);
-        let _g3 = SlotGuard::claim(&t.id).expect("返した分は取れる");
+        let _g3 = SlotGuard::claim(&t.id, &jid("4")).expect("返した分は取れる");
         drop(g2);
         // 台帳の数と実際の番人の数が合っている
         let after = reg.find("dev-01").expect("引ける");
-        assert_eq!(after.capacity.active_jobs, 1);
+        assert_eq!(after.capacity.active_jobs(), 1);
     }
 
     #[test]
@@ -862,13 +1003,14 @@ mod tests {
         let id = t.id.clone();
         let dir = store::cloud_dir();
         let handles: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|i| {
                 let id = id.clone();
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     // 置き場の差し替えはスレッドごとなので、子でも指し直す
                     store::set_test_dir(Some(dir));
-                    claim_slot(&id).is_ok()
+                    // **1 本ごとに別の仕事 ID** (同じ id は 2 度数えないため)
+                    claim_slot(&id, &jid(&format!("race-{i}"))).is_ok()
                 })
             })
             .collect();
@@ -879,7 +1021,7 @@ mod tests {
             .count();
         assert_eq!(granted, 4, "上限を超えて配った");
         assert_eq!(
-            reg.find("dev-01").expect("引ける").capacity.active_jobs,
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
             4
         );
     }
@@ -924,17 +1066,20 @@ mod tests {
 
     #[test]
     fn 走っている仕事の数を探りで消さない() {
-        let mut t = target("dev-01", TargetOpts {
-            active_jobs: 2,
-            ..TargetOpts::default()
-        });
-        t.capacity.active_jobs = 2;
+        let mut t = target(
+            "dev-01",
+            TargetOpts {
+                active_jobs: 2,
+                ..TargetOpts::default()
+            },
+        );
+        t.capacity = crate::features::cloud_execution::model::TargetCapacity::busy(4, 2);
         let probe = ProbeResult {
             reachable: true,
             ..ProbeResult::default()
         };
         // apply_probe 自身は capacity を触らない
-        assert_eq!(apply_probe(&t, &probe).capacity.active_jobs, 2);
+        assert_eq!(apply_probe(&t, &probe).capacity.active_jobs(), 2);
     }
 
     #[test]
@@ -966,7 +1111,12 @@ mod tests {
         store::with_targets(|list| {
             let slot = list.iter_mut().find(|x| x.id == t.id).expect("居る");
             slot.managed = true;
-            slot.capacity.active_jobs = 1;
+            slot.capacity
+                .hold(crate::features::cloud_execution::model::SlotHolder {
+                    job: jid("busy"),
+                    pid: std::process::id(),
+                    since_unix: 0,
+                });
         })
         .expect("書ける");
         let e = reg.destroy("dev-01").expect_err("断る");
@@ -1081,7 +1231,7 @@ mod tests {
         let calls = http.calls();
         let reg = registry_with(http.clone());
 
-        let _slot = SlotGuard::claim(&id).expect("枠を取れる");
+        let _slot = SlotGuard::claim(&id, &jid("6")).expect("枠を取れる");
         let e = reg.destroy("w1").expect_err("断る");
         assert!(format!("{e}").contains("1 本"), "{e}");
         // **Provider へ 1 本も送っていない** (台本が空なので、送れば失敗する)
@@ -1127,7 +1277,7 @@ mod tests {
         gate.wait_entered();
 
         // 古い写しを持っている呼び出し側でも、ここで断られる
-        let e = claim_slot(&id).expect_err("断る");
+        let e = claim_slot(&id, &jid("7")).expect_err("断る");
         assert!(
             matches!(e, CloudError::NoCapacity(_)),
             "ロックを握ったまま Provider を呼んでいる可能性がある: {e:?}"
@@ -1153,7 +1303,7 @@ mod tests {
         let calls = http.calls();
         let reg = registry_with(http);
 
-        let held = SlotGuard::claim(&id).expect("枠を取れる");
+        let held = SlotGuard::claim(&id, &jid("8")).expect("枠を取れる");
         assert!(reg.destroy("w1").is_err());
         assert!(calls.lock().expect("読める").is_empty());
 
@@ -1189,7 +1339,7 @@ mod tests {
         .expect("書ける");
 
         // 写しは Ready のままだが、枠取りは台帳を読み直すので断られる
-        let e = match SlotGuard::claim(&stale.id) {
+        let e = match SlotGuard::claim(&stale.id, &jid("9")) {
             Ok(_) => panic!("古い写しで削除中の実行先へ枠を配ってしまった"),
             Err(e) => e,
         };
@@ -1208,8 +1358,8 @@ mod tests {
         let reg = registry();
         let t = add(&reg, "dev-01", 4);
         mark_ready(&t.id);
-        let _g1 = SlotGuard::claim(&t.id).expect("1 本目");
-        let _g2 = SlotGuard::claim(&t.id).expect("2 本目");
+        let _g1 = SlotGuard::claim(&t.id, &jid("10")).expect("1 本目");
+        let _g2 = SlotGuard::claim(&t.id, &jid("11")).expect("2 本目");
 
         let e = reg.remove_target("dev-01").expect_err("断る");
         let text = format!("{e}");
@@ -1230,7 +1380,7 @@ mod tests {
         mark_ready(&t.id);
         // 1 本走らせて、終わらせる
         {
-            let _g = SlotGuard::claim(&t.id).expect("取れる");
+            let _g = SlotGuard::claim(&t.id, &jid("12")).expect("取れる");
         }
         let removed = reg.remove_target("dev-01").expect("空いていれば外せる");
         assert_eq!(removed.id, t.id);
@@ -1254,7 +1404,7 @@ mod tests {
                 let dir = dir.clone();
                 sc.spawn(move || {
                     store::set_test_dir(Some(dir));
-                    claim_slot(&id).is_ok()
+                    claim_slot(&id, &jid("13")).is_ok()
                 })
             };
             let b = {
@@ -1278,12 +1428,197 @@ mod tests {
         }
     }
 
-    // ───── 落ちた仕事の後始末 (P1-1) ─────    // ───── 落ちた仕事の後始末 (P1-1) ─────
+    // ───── 確かめているあいだの削除予約を消さない ─────
 
-    /// 仕事の記録を 1 件置く (`owner_pid` を指定できる)。
+    /// **P1 の再現。** `probe` は「読む → ネットワークで確かめる → 書き戻す」
+    /// の形なので、そのあいだに入った削除予約を古い写しで消しうる。
+    /// 消えると新しい仕事が枠を取り、その VM ごと消える。
+    ///
+    /// 順序は門 (channel) で決定的に作る — 眠りの長さには頼らない。
+    #[test]
+    fn probeの書き戻しが削除予約を消さない() {
+        use crate::features::cloud_execution::test_support::GatedTransport;
+
+        let _home = home_guard("probe-vs-destroy");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+        store::with_targets(|l| l[0].managed = true).expect("書ける");
+        let target = reg.find("dev-01").expect("引ける");
+
+        let (tr, gate) = GatedTransport::new(ProbeResult {
+            reachable: true,
+            ..ProbeResult::default()
+        });
+
+        let dir = store::cloud_dir();
+        let id = t.id.clone();
+        let outcome = std::thread::scope(|sc| {
+            // 1) probe が古い写しを読み、確かめに入る (門で止まる)
+            let prober = {
+                let dir = dir.clone();
+                let target = target.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    let reg = registry();
+                    reg.probe_with(&target, &tr).map(|(t, _)| t.lifecycle)
+                })
+            };
+            gate.wait_entered();
+
+            // 2) そのあいだに削除を予約する (Provider は呼ばず、台帳だけ)
+            store::with_targets(|l| {
+                let slot = l.iter_mut().find(|x| x.id == id).expect("居る");
+                slot.lifecycle = TargetLifecycle::Destroying;
+                slot.note = "削除中".into();
+                bump(slot);
+            })
+            .expect("書ける");
+
+            // 3) probe を完了させる
+            gate.release();
+            prober.join().expect("終わる")
+        });
+
+        // 書き戻しは断られる (古い写しなので)
+        assert!(
+            outcome.is_err(),
+            "古い写しで書き戻してしまった: {outcome:?}"
+        );
+
+        // 台帳は削除中のまま
+        let after = store::load_targets().expect("読める");
+        assert_eq!(
+            after[0].lifecycle,
+            TargetLifecycle::Destroying,
+            "削除予約が消えた"
+        );
+        // 新しい仕事は載らない
+        assert!(
+            matches!(
+                claim_slot(&t.id, &jid("after-destroy")),
+                Err(CloudError::NoCapacity(_))
+            ),
+            "消えかけの実行先へ枠を配った"
+        );
+    }
+
+    /// 削除中の実行先は、**SSH に入れたというだけでは Ready へ戻さない。**
+    /// (「結果が不明で復旧待ち」からの復帰は `probe` が Provider を
+    /// 確かめ直す経路でしか起こしてはいけない。)
+    #[test]
+    fn 削除中はsshに入れてもreadyへ戻さない() {
+        use crate::features::cloud_execution::test_support::GatedTransport;
+
+        let _home = home_guard("probe-destroying-no-ready");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        store::with_targets(|l| {
+            l[0].lifecycle = TargetLifecycle::Destroying;
+            l[0].note = "削除の結果が不明です".into();
+        })
+        .expect("書ける");
+        let target = reg.find("dev-01").expect("引ける");
+        assert_eq!(target.lifecycle, TargetLifecycle::Destroying);
+
+        // 読んだときすでに destroying (= 世代は変わらない) でも戻さない
+        let (tr, gate) = GatedTransport::new(ProbeResult {
+            reachable: true,
+            ..ProbeResult::default()
+        });
+        gate.release(); // 止めずに通す
+        let out = reg.probe_with(&target, &tr);
+        assert!(out.is_err(), "削除中を Ready へ戻した: {out:?}");
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Destroying
+        );
+        let _ = t;
+    }
+
+    /// `wait_ready` も同じ (待っているあいだに消されたら Ready にしない)。
+    /// 世代の照合が 1 か所 (`write_back_if_current`) に在ることを、
+    /// 書き戻しの入口ごとに確かめる。
+    #[test]
+    fn 古い世代の書き戻しはどの入口でも断られる() {
+        let _home = home_guard("writeback-generation");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+        let seen = reg.find("dev-01").expect("引ける");
+
+        // 別の誰かが状態を進める
+        store::with_targets(|l| {
+            let slot = l.iter_mut().find(|x| x.id == t.id).expect("居る");
+            slot.lifecycle = TargetLifecycle::Draining;
+            bump(slot);
+        })
+        .expect("書ける");
+
+        let mut updated = seen.clone();
+        updated.lifecycle = TargetLifecycle::Ready;
+        assert_eq!(
+            write_back_if_current(&updated, seen.generation).expect("書ける"),
+            WriteBack::Stale,
+            "古い世代で書き戻せてしまった"
+        );
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Draining
+        );
+
+        // いまの世代なら書ける
+        let now = store::load_targets().expect("読める")[0].generation;
+        assert_eq!(
+            write_back_if_current(&updated, now).expect("書ける"),
+            WriteBack::Applied
+        );
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Ready
+        );
+    }
+
+    /// **古い削除処理の応答が、新しい操作の状態を上書きしない。**
+    #[test]
+    fn 古い削除の応答は新しい状態を上書きしない() {
+        let _home = home_guard("destroy-generation");
+        let id = put_managed("w1");
+
+        // 削除を予約した「つもり」の世代を覚える
+        let reserved_at = store::load_targets().expect("読める")[0].generation;
+
+        // そのあいだに別の操作が状態を進めた
+        store::with_targets(|l| {
+            l[0].lifecycle = TargetLifecycle::Draining;
+            l[0].note = "別の操作".into();
+            bump(l[0..1].iter_mut().next().expect("居る"));
+        })
+        .expect("書ける");
+
+        // 古い削除処理が「消えた」と言って戻ってきても、消さない
+        let removed = store::with_targets(|list| match list.iter().position(|x| x.id == id) {
+            Some(i) if list[i].generation == reserved_at => {
+                list.remove(i);
+                true
+            }
+            _ => false,
+        })
+        .expect("書ける");
+        assert!(!removed, "古い応答で消してしまった");
+        assert_eq!(
+            store::load_targets().expect("読める")[0].lifecycle,
+            TargetLifecycle::Draining,
+            "新しい状態が失われた"
+        );
+    }
+
+    // ───── 落ちた仕事の後始末 ─────
+
+    /// 仕事の記録を 1 件置く (履歴の見た目を見るテスト用)。
     fn put_job(id: &str, target: &TargetId, state: ExecutionJobState, owner_pid: u32) {
         store::upsert_job(&crate::features::cloud_execution::model::ExecutionJob {
-            id: crate::features::cloud_execution::model::JobId::new(id),
+            id: JobId::new(id),
             target: target.clone(),
             state,
             command: "true".into(),
@@ -1299,7 +1634,7 @@ mod tests {
         .expect("書ける");
     }
 
-    /// **もう居ない PID。** 自分自身の PID から離れた大きな値を使い、
+    /// **もう居ない PID。** 自分自身から離れた大きな値を使い、
     /// 生きていないことを確かめてから使う (偶然生きていたら試験が嘘になる)。
     fn dead_pid() -> u32 {
         for pid in [4_000_001u32, 4_000_003, 4_000_007, 4_000_011] {
@@ -1310,7 +1645,20 @@ mod tests {
         panic!("死んでいる PID を選べない");
     }
 
-    /// **P1-1 の再現。** `kill -9` / OOM / 電源断では [`SlotGuard`] の Drop が
+    /// 落ちたプロセスが握ったままの枠を、台帳へ直に置く。
+    fn put_stale_holder(id: &TargetId, job: &str) {
+        store::with_targets(|list| {
+            let t = list.iter_mut().find(|t| &t.id == id).expect("居る");
+            t.capacity.holders.push(SlotHolder {
+                job: JobId::new(job),
+                pid: dead_pid(),
+                since_unix: 1,
+            });
+        })
+        .expect("書ける");
+    }
+
+    /// **P1 の再現。** `kill -9` / OOM / 電源断では [`SlotGuard`] の Drop が
     /// 呼ばれないので、台帳に枠が残ったまま実行中の仕事は 0 件になる。
     #[test]
     fn stale_running_job_does_not_permanently_consume_slot() {
@@ -1320,10 +1668,10 @@ mod tests {
         mark_ready(&t.id);
 
         // 落ちたプロセスが残した状態: 枠は埋まったまま、記録は running のまま
-        std::mem::forget(SlotGuard::claim(&t.id).expect("取れる"));
+        put_stale_holder(&t.id, "j-dead");
         put_job("j-dead", &t.id, ExecutionJobState::Running, dead_pid());
         assert!(
-            claim_slot(&t.id).is_err(),
+            claim_slot(&t.id, &jid("stale-a")).is_err(),
             "後始末の前から枠が空いていては、再現になっていない"
         );
 
@@ -1331,12 +1679,13 @@ mod tests {
         assert_eq!(r.stale_jobs, 1, "{r:?}");
         assert_eq!(r.freed_slots, 1, "{r:?}");
 
-        // 枠が返り、記録も終わったことになっている
-        assert_eq!(reg.find("dev-01").expect("引ける").capacity.active_jobs, 0);
-        SlotGuard::claim(&t.id).expect("また取れる");
+        assert_eq!(
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
+            0
+        );
+        SlotGuard::claim(&t.id, &jid("stale-b")).expect("また取れる");
         let jobs = store::load_jobs().expect("読める");
-        assert_eq!(jobs[0].state, ExecutionJobState::Failed);
-        assert!(jobs[0].ended_unix > 0, "終わった時刻が入っていない");
+        assert_eq!(jobs[0].state, ExecutionJobState::Failed, "履歴が合っていない");
     }
 
     /// **生きている仕事の枠は奪わない。**
@@ -1348,78 +1697,152 @@ mod tests {
         mark_ready(&t.id);
 
         // 生きている 1 本 (このプロセスが持ち主) と、落ちた 1 本
-        std::mem::forget(SlotGuard::claim(&t.id).expect("1 本目"));
-        std::mem::forget(SlotGuard::claim(&t.id).expect("2 本目"));
-        put_job(
-            "j-live",
-            &t.id,
-            ExecutionJobState::Running,
-            std::process::id(),
+        std::mem::forget(SlotGuard::claim(&t.id, &jid("live")).expect("1 本目"));
+        put_stale_holder(&t.id, "j-dead");
+        assert_eq!(
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
+            2
         );
-        put_job("j-dead", &t.id, ExecutionJobState::Preparing, dead_pid());
 
         let r = reconcile_active_jobs().expect("後始末できる");
         assert_eq!(r.stale_jobs, 1, "生きている側まで片付けた: {r:?}");
-
         assert_eq!(
-            reg.find("dev-01").expect("引ける").capacity.active_jobs,
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
             1,
             "生きている 1 本の枠まで返してしまった"
         );
-        let jobs = store::load_jobs().expect("読める");
-        let live = jobs
-            .iter()
-            .find(|j| j.id.as_str() == "j-live")
-            .expect("在る");
+        // 生きている持ち主はそのまま残っている
+        let held = reg.find("dev-01").expect("引ける").capacity.holders;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].job, jid("live"));
+    }
+
+    /// **何度実行しても結果が変わらない** (冪等)。
+    ///
+    /// 前の版は 2 つのファイルにまたがっていたので、途中で止まると
+    /// 枠が永久に返らない / 二重に返る、のどちらかになった。
+    #[test]
+    fn reconciliation_is_idempotent() {
+        let _home = home_guard("reconcile-idempotent");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 3);
+        mark_ready(&t.id);
+        std::mem::forget(SlotGuard::claim(&t.id, &jid("alive")).expect("生きている 1 本"));
+        put_stale_holder(&t.id, "j-dead-1");
+        put_stale_holder(&t.id, "j-dead-2");
+
+        let first = reconcile_active_jobs().expect("1 回目");
+        assert_eq!(first.freed_slots, 2, "{first:?}");
+        let after = reg.find("dev-01").expect("引ける").capacity.active_jobs();
+        assert_eq!(after, 1);
+
+        for _ in 0..3 {
+            let again = reconcile_active_jobs().expect("何度でも呼べる");
+            assert_eq!(again.freed_slots, 0, "二重に返した: {again:?}");
+            assert_eq!(
+                reg.find("dev-01").expect("引ける").capacity.active_jobs(),
+                1,
+                "生きている枠を奪った"
+            );
+        }
+    }
+
+    /// **履歴の記録が失われても、枠は迷子にならない。**
+    ///
+    /// `jobs.json` は上限 ([`store::MAX_JOBS_KEPT`]) で古いものから押し出される。
+    /// 判定を履歴に頼っていると、押し出された仕事の枠が永久に残る。
+    #[test]
+    fn reconciliation_survives_lost_history() {
+        let _home = home_guard("reconcile-no-history");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+        put_stale_holder(&t.id, "j-forgotten");
+        // 履歴には 1 件も無い (押し出された後を模す)
+        assert!(store::load_jobs().expect("読める").is_empty());
+
+        let r = reconcile_active_jobs().expect("後始末できる");
+        assert_eq!(r.freed_slots, 1, "履歴が無いと枠を返せない: {r:?}");
         assert_eq!(
-            live.state,
-            ExecutionJobState::Running,
-            "生きている記録を書き換えた"
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
+            0
         );
     }
 
-    /// **後始末は引き算しかしない** ので、途中で別のプロセスが枠を取っても
-    /// 上限を超えない / 取った枠が消えない。
+    /// **履歴の書き込みに失敗しても、枠はもう返っている。**
+    ///
+    /// 枠の正しさが履歴に依存していないことを、`jobs.json` を書けない形
+    /// (ディレクトリで塞ぐ) にして確かめる。
+    #[test]
+    fn reconciliation_frees_slot_even_if_history_write_fails() {
+        let _home = home_guard("reconcile-history-fails");
+        let reg = registry();
+        let t = add(&reg, "dev-01", 2);
+        mark_ready(&t.id);
+        put_stale_holder(&t.id, "j-dead");
+
+        // 記録の置き場を塞ぐ (書き込みが必ず失敗する)
+        let p = store::jobs_path();
+        let _ = std::fs::remove_file(&p);
+        std::fs::create_dir(&p).expect("塞げる");
+
+        let r = reconcile_active_jobs().expect("枠は返せる");
+        assert_eq!(r.freed_slots, 1, "{r:?}");
+        assert_eq!(
+            reg.find("dev-01").expect("引ける").capacity.active_jobs(),
+            0
+        );
+    }
+
+    /// **後始末と新しい枠取りが競合しても、上限を超えず生きている枠を失わない。**
     #[test]
     fn reconciliation_does_not_exceed_max_jobs() {
         let _home = home_guard("reconcile-capacity");
         let reg = registry();
         let t = add(&reg, "dev-01", 2);
         mark_ready(&t.id);
+        put_stale_holder(&t.id, "j-dead");
 
-        // 落ちた 1 本ぶんの枠が残っている
-        std::mem::forget(SlotGuard::claim(&t.id).expect("取れる"));
-        put_job("j-dead", &t.id, ExecutionJobState::Running, dead_pid());
+        let id = t.id.clone();
+        let dir = store::cloud_dir();
+        // 後始末と、新しい枠取りを同時に走らせる
+        let (freed, claimed) = std::thread::scope(|sc| {
+            let a = {
+                let dir = dir.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    reconcile_active_jobs().map(|r| r.freed_slots).unwrap_or(0)
+                })
+            };
+            let b = {
+                let dir = dir.clone();
+                let id = id.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    claim_slot(&id, &JobId::new("j-newcomer")).is_ok()
+                })
+            };
+            (a.join().expect("終わる"), b.join().expect("終わる"))
+        });
 
-        // 記録を片付けたあと・枠を返す前に、別のプロセスが枠を取った状況を作る
-        // (2 段のあいだに割り込まれても壊れないことを見る)
-        let stale = store::with_jobs(|jobs| {
-            for j in jobs.iter_mut() {
-                if !j.state.is_final() && !crate::instances::pid_alive(j.owner_pid) {
-                    j.state = ExecutionJobState::Failed;
-                }
-            }
-            1u16
-        })
-        .expect("書ける");
-        claim_slot(&t.id).expect("割り込みで 1 本取れる");
-        store::with_targets(|list| {
-            let c = &mut list[0].capacity;
-            c.active_jobs = c.active_jobs.saturating_sub(stale);
-        })
-        .expect("書ける");
-
-        let after = reg.find("dev-01").expect("引ける").capacity;
+        let cap = reg.find("dev-01").expect("引ける").capacity;
         assert!(
-            after.active_jobs <= after.max_jobs,
-            "上限を超えた: {after:?}"
+            cap.active_jobs() <= cap.max_jobs,
+            "上限を超えた: {cap:?} (freed={freed} claimed={claimed})"
         );
-        assert_eq!(after.active_jobs, 1, "割り込んだ側の枠が消えた: {after:?}");
-
-        // ここで後始末をもう一度呼んでも、二重には引かない
-        let r = reconcile_active_jobs().expect("後始末できる");
-        assert_eq!(r.stale_jobs, 0, "片付け済みの記録をもう一度数えた: {r:?}");
-        assert_eq!(reg.find("dev-01").expect("引ける").capacity.active_jobs, 1);
+        if claimed {
+            assert!(
+                cap.holders.iter().any(|h| h.job.as_str() == "j-newcomer"),
+                "取れたはずの枠が消えている: {cap:?}"
+            );
+        }
+        // 落ちた側は、どちらの順序でも最後には返る
+        reconcile_active_jobs().expect("もう一度");
+        let cap = reg.find("dev-01").expect("引ける").capacity;
+        assert!(
+            !cap.holders.iter().any(|h| h.job.as_str() == "j-dead"),
+            "落ちた枠が残っている: {cap:?}"
+        );
     }
 
     /// **手元の行は台帳にも在るが、一覧には 1 行しか出ない。**
@@ -1428,7 +1851,7 @@ mod tests {
         let _home = home_guard("registry-local-once");
         let reg = registry();
         // 手元で 1 本走った後の台帳を模す
-        claim_local_slot(2).expect("取れる");
+        claim_local_slot(2, &jid("26")).expect("取れる");
         let all = reg.targets().expect("数えられる");
         assert_eq!(
             all.iter()
@@ -1439,7 +1862,7 @@ mod tests {
             "local が二重に出た: {all:#?}"
         );
         // 使用中の数は引き継ぎ、上限は設定から組み直す
-        assert_eq!(all[0].capacity.active_jobs, 1);
+        assert_eq!(all[0].capacity.active_jobs(), 1);
         assert_eq!(all[0].capacity.max_jobs, reg.ctx.local_max_jobs);
         // 名前でも 1 件に決まる (2 件あると find が断る)
         reg.find("local").expect("引ける");
@@ -1465,7 +1888,7 @@ mod tests {
             // …その後で状態が変わる (探りの失敗 / 抜け始め / 作り直し)
             store::with_targets(|l| l[0].lifecycle = state).expect("書ける");
 
-            let e = match SlotGuard::claim(&id) {
+            let e = match SlotGuard::claim(&id, &jid("21")) {
                 Ok(_) => panic!("{名} の実行先へ枠を配ってしまった"),
                 Err(e) => e,
             };
@@ -1473,8 +1896,78 @@ mod tests {
             assert!(format!("{e}").contains(state.id()), "{名}: {e}");
             // 枠は 1 つも増えていない
             let after = store::load_targets().expect("読める");
-            assert_eq!(after[0].capacity.active_jobs, 0, "{名}");
+            assert_eq!(after[0].capacity.active_jobs(), 0, "{名}");
         }
+    }
+
+    /// **走っている `launch --run` の最中は VM を消せない。**
+    ///
+    /// 枠を取るのが `run_attached` でも `run` でも同じ道なので、
+    /// 実行中は `destroy` が Provider を 1 度も呼ばずに断る。
+    #[test]
+    fn その場実行の最中はvmを消さない() {
+        let _home = home_guard("destroy-vs-attached");
+        let id = put_managed("w1");
+        let http = Arc::new(FakeHttpClient::new(vec![]));
+        let calls = http.calls();
+        let reg = registry_with(http.clone());
+        let target = store::load_targets().expect("読める")[0].clone();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+        let dir = store::cloud_dir();
+
+        std::thread::scope(|sc| {
+            let runner = {
+                let dir = dir.clone();
+                let target = target.clone();
+                sc.spawn(move || {
+                    store::set_test_dir(Some(dir));
+                    super::super::runner::run_attached(&target, "agent --serve", || {
+                        // 走り始めたことを知らせ、外から終わらせてもらうまで待つ
+                        let _ = started_tx.send(());
+                        let _ = finish_rx.recv_timeout(Duration::from_secs(30));
+                        // 「正常終了した」ことにする
+                        crate::procx::hidden_command(if cfg!(windows) { "cmd" } else { "true" })
+                            .args(if cfg!(windows) {
+                                vec!["/C", "exit", "0"]
+                            } else {
+                                vec![]
+                            })
+                            .status()
+                            .map_err(|e| CloudError::io(format!("{e}")))
+                    })
+                })
+            };
+            started_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("走り始める");
+
+            // 走っている最中は消せない
+            let e = reg.destroy("w1").expect_err("断る");
+            assert!(format!("{e}").contains("1 本"), "{e}");
+            assert!(
+                calls.lock().expect("読める").is_empty(),
+                "Provider へ DELETE を送った"
+            );
+            // 予約もされていない
+            assert_eq!(
+                store::load_targets().expect("読める")[0].lifecycle,
+                TargetLifecycle::Ready
+            );
+
+            let _ = finish_tx.send(());
+            runner.join().expect("終わる").expect("走り終える");
+        });
+
+        // 終われば枠は返る
+        assert_eq!(
+            store::load_targets().expect("読める")[0]
+                .capacity
+                .active_jobs(),
+            0
+        );
+        let _ = id;
     }
 
     /// **結果が分からない失敗では、安易に Ready へ戻さない。**
@@ -1504,7 +1997,7 @@ mod tests {
         assert!(after[0].note.contains("不明"), "{}", after[0].note);
         // 新しい仕事は載らない
         assert!(matches!(
-            claim_slot(&id),
+            claim_slot(&id, &jid("22")),
             Err(CloudError::NoCapacity(_))
         ));
     }
@@ -1526,7 +2019,7 @@ mod tests {
         assert_eq!(after[0].lifecycle, TargetLifecycle::Ready, "戻していない");
         assert!(after[0].note.contains("削除は行われませんでした"), "{}", after[0].note);
         // 元どおり枠を取れる
-        SlotGuard::claim(&id).expect("取れる");
+        SlotGuard::claim(&id, &jid("23")).expect("取れる");
     }
 
     /// **回復経路**: Provider の状態を確かめ直せば、また使えるようになる。
@@ -1539,7 +2032,10 @@ mod tests {
             l[0].note = "削除の結果が不明です".into();
         })
         .expect("書ける");
-        assert!(claim_slot(&id).is_err(), "削除中なのに取れてしまう");
+        assert!(
+            claim_slot(&id, &jid("24")).is_err(),
+            "削除中なのに取れてしまう"
+        );
 
         // `zai cloud target probe` が通る = 機械は生きていた
         let probe = ProbeResult {
@@ -1560,7 +2056,7 @@ mod tests {
             store::load_targets().expect("読める")[0].lifecycle,
             TargetLifecycle::Ready
         );
-        SlotGuard::claim(&id).expect("また取れる");
+        SlotGuard::claim(&id, &jid("25")).expect("また取れる");
 
         // 台帳から外す道も残っている (機械には触らない)
         let reg = registry_with(Arc::new(FakeHttpClient::new(vec![])));

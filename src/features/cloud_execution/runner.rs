@@ -72,9 +72,9 @@ pub fn run(spec: &JobSpec, sink: &mut dyn EventSink) -> Result<ExecutionJob, Clo
     // 用意だけ済んだ worktree が残る)。**手元も数える** — 上限を書けるのに
     // 数えないと、`default_max_jobs` が何を書いても効かない飾りになる。
     let claimed = if spec.target.transport == TransportKind::Local {
-        SlotGuard::claim_local(spec.target.capacity.max_jobs)
+        SlotGuard::claim_local(spec.target.capacity.max_jobs, &job_id)
     } else {
-        SlotGuard::claim(&spec.target.id)
+        SlotGuard::claim(&spec.target.id, &job_id)
     };
     let _slot = match claimed {
         Ok(g) => g,
@@ -179,6 +179,89 @@ fn run_inner(
         job.message = format!("{} / 片付けに失敗: {e}", job.message);
     }
     Ok(())
+}
+
+/// **標準入出力を引き継いだまま 1 本走らせる** (`zai cloud launch --run`)。
+///
+/// ## なぜ [`run`] と別なのか
+///
+/// [`run`] は出力を [`EventSink`] へ流す形なので、対話できない。
+/// エージェントをその場で起動する経路は端末をそのまま渡す必要がある。
+///
+/// ## それでも枠と記録は同じ道を通る (この版で直した壊れ方)
+///
+/// 以前は `launch --run` が [`SlotGuard`] も記録も取らずにプロセスを起こして
+/// いた。そのため
+///
+/// * `max_jobs` を超えて何本でも起動できた
+/// * 走っているのに `active_jobs` が増えないので、`worker destroy` が
+///   **実行中の VM を消せてしまった**
+///
+/// 入口が増えるたびに枠を取り忘れる形だったので、**枠を取る・記録する・
+/// 返す**をこの 1 か所へ寄せた。走らせ方 (`spawn`) だけを外から渡す。
+///
+/// `spawn` は「起動して終わるまで待つ」関数。標準入出力の扱いは呼び出し側の
+/// ままなので、対話も終了コードもそのまま通る。
+pub fn run_attached(
+    target: &ExecutionTarget,
+    command: &str,
+    spawn: impl FnOnce() -> Result<std::process::ExitStatus, CloudError>,
+) -> Result<std::process::ExitStatus, CloudError> {
+    let job_id = JobId::new(ids::new_id("j-"));
+    let mut job = ExecutionJob {
+        id: job_id.clone(),
+        target: target.id.clone(),
+        state: ExecutionJobState::Queued,
+        command: super::redact::redact(command),
+        workspace: None,
+        result_ref: String::new(),
+        result_oid: String::new(),
+        owner_pid: std::process::id(),
+        started_unix: store::now_unix(),
+        ended_unix: 0,
+        exit_code: None,
+        message: String::new(),
+    };
+
+    // **枠を先に取る。** 取れなければ 1 プロセスも起こさない。
+    let claimed = if target.transport == TransportKind::Local {
+        SlotGuard::claim_local(target.capacity.max_jobs, &job_id)
+    } else {
+        SlotGuard::claim(&target.id, &job_id)
+    };
+    let _slot = match claimed {
+        Ok(g) => g,
+        Err(e) => {
+            job.state = ExecutionJobState::Failed;
+            job.message = e.to_string();
+            job.ended_unix = store::now_unix();
+            let _ = store::upsert_job(&job);
+            return Err(e);
+        }
+    };
+
+    job.state = ExecutionJobState::Running;
+    let _ = store::upsert_job(&job);
+
+    let outcome = spawn();
+    job.ended_unix = store::now_unix();
+    match &outcome {
+        Ok(st) => {
+            job.exit_code = st.code();
+            job.state = if st.success() {
+                ExecutionJobState::Succeeded
+            } else {
+                ExecutionJobState::Failed
+            };
+        }
+        Err(e) => {
+            // **起動そのものに失敗しても枠は漏れない** (Drop で返る)
+            job.state = ExecutionJobState::Failed;
+            job.message = e.to_string();
+        }
+    }
+    let _ = store::upsert_job(&job);
+    outcome
 }
 
 /// SSH の呼び方 (仕事から使う分)。
@@ -399,7 +482,7 @@ mod tests {
         t.lifecycle = crate::features::cloud_execution::model::TargetLifecycle::Ready;
         store::save_targets(std::slice::from_ref(&t)).expect("書ける");
         // 1 枠を先に埋める
-        let _held = SlotGuard::claim(&t.id).expect("取れる");
+        let _held = SlotGuard::claim(&t.id, &JobId::new("j-held")).expect("取れる");
 
         let spec = JobSpec {
             target: t.clone(),
@@ -430,7 +513,7 @@ mod tests {
         spec.target = ExecutionTarget::local(1);
 
         // 1 本目の枠を先に押さえる (走っている仕事があるのと同じ状態)
-        let held = SlotGuard::claim_local(1).expect("1 本目は取れる");
+        let held = SlotGuard::claim_local(1, &JobId::new("j-held")).expect("1 本目は取れる");
 
         let (out, sink) = run_collecting(&spec);
         let e = out.expect_err("2 本目は断る");
@@ -447,7 +530,7 @@ mod tests {
         // 走り終えた後に枠が残っていない
         let after = store::load_targets().expect("読める");
         for t in &after {
-            assert_eq!(t.capacity.active_jobs, 0, "{} の枠が返っていない", t.name);
+            assert_eq!(t.capacity.active_jobs(), 0, "{} の枠が返っていない", t.name);
         }
     }
 
@@ -457,12 +540,15 @@ mod tests {
         let _home = home_guard("runner-local-race");
         let dir = store::cloud_dir();
         let handles: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|i| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     store::set_test_dir(Some(dir));
-                    // 取れたら返さずに持ったまま数える
-                    SlotGuard::claim_local(3).map(std::mem::forget).is_ok()
+                    // 取れたら返さずに持ったまま数える。**1 本ごとに別の仕事 ID**
+                    // (枠は持ち主の id で持つので、同じ id は 2 度数えない)
+                    SlotGuard::claim_local(3, &JobId::new(format!("j-race-{i}")))
+                        .map(std::mem::forget)
+                        .is_ok()
                 })
             })
             .collect();
@@ -472,6 +558,111 @@ mod tests {
             .filter(|ok| *ok)
             .count();
         assert_eq!(granted, 3, "上限を超えて配った");
+    }
+
+    // ───── その場実行 (launch --run) も枠を通る ─────
+
+    /// 手元の実行先で `run_attached` を回す (対話経路と同じ道)。
+    fn attached(program: &str, args: &[&str]) -> Result<std::process::ExitStatus, CloudError> {
+        let t = ExecutionTarget::local(1);
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        runner_attached_on(&t, program, &argv)
+    }
+
+    fn runner_attached_on(
+        t: &ExecutionTarget,
+        program: &str,
+        args: &[String],
+    ) -> Result<std::process::ExitStatus, CloudError> {
+        let program = program.to_string();
+        let args = args.to_vec();
+        run_attached(t, &format!("{program} {}", args.join(" ")), move || {
+            crate::procx::hidden_command(&program)
+                .args(&args)
+                .status()
+                .map_err(|e| CloudError::io(format!("起動できません: {e}")))
+        })
+    }
+
+    /// **P1 の再現。** `launch --run` は枠を取らずにプロセスを起こしていた。
+    /// 上限 1 本の実行先で 2 本目が通ってしまう。
+    #[test]
+    fn その場実行も上限を超えない() {
+        let _home = home_guard("attached-capacity");
+        let t = ExecutionTarget::local(1);
+        // 1 本目が走っている状態を作る
+        let held = SlotGuard::claim_local(1, &JobId::new("j-running")).expect("1 本目");
+
+        let e = attached(if cfg!(windows) { "cmd" } else { "true" }, &[]).expect_err("断る");
+        assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
+
+        // 返せば走る
+        drop(held);
+        let st = attached(if cfg!(windows) { "cmd" } else { "true" }, &["/C", "exit", "0"])
+            .or_else(|_| attached("true", &[]))
+            .expect("走る");
+        let _ = st;
+        // 走り終えた後に枠が残っていない
+        for x in store::load_targets().expect("読める") {
+            assert_eq!(x.capacity.active_jobs(), 0, "{} の枠が返っていない", x.name);
+        }
+        let _ = t;
+    }
+
+    /// **非ゼロ終了でも枠は漏れない。**
+    #[test]
+    fn その場実行は非ゼロ終了でも枠を返す() {
+        let _home = home_guard("attached-nonzero");
+        let st = if cfg!(windows) {
+            attached("cmd", &["/C", "exit", "7"])
+        } else {
+            attached("sh", &["-c", "exit 7"])
+        }
+        .expect("走る");
+        assert_eq!(st.code(), Some(7), "終了コードが変わっている");
+        for x in store::load_targets().expect("読める") {
+            assert_eq!(x.capacity.active_jobs(), 0, "枠が返っていない");
+        }
+        // 記録に残る (走ったことが分かる)
+        let jobs = recent_jobs(10).expect("読める");
+        assert_eq!(jobs[0].exit_code, Some(7));
+        assert_eq!(jobs[0].state, ExecutionJobState::Failed);
+    }
+
+    /// **起動そのものに失敗しても枠は漏れない。**
+    #[test]
+    fn その場実行は起動に失敗しても枠を返す() {
+        let _home = home_guard("attached-spawn-fails");
+        let e = attached(MISSING_PROGRAM, &[]).expect_err("起動できない");
+        assert!(!format!("{e}").is_empty());
+        for x in store::load_targets().expect("読める") {
+            assert_eq!(x.capacity.active_jobs(), 0, "枠が返っていない");
+        }
+        let jobs = recent_jobs(10).expect("読める");
+        assert_eq!(jobs[0].state, ExecutionJobState::Failed);
+    }
+
+    /// **最終確認は載せる瞬間に行う。** 削除中の実行先へは載せない。
+    #[test]
+    fn その場実行は削除中の実行先へ載せない() {
+        let _home = home_guard("attached-destroying");
+        let mut t = make_target(&SshTargetSpec {
+            name: "dev-01".into(),
+            host: "example.com".into(),
+            user: "zaivern".into(),
+            max_jobs: 2,
+            ..SshTargetSpec::default()
+        })
+        .expect("組める");
+        t.lifecycle = crate::features::cloud_execution::model::TargetLifecycle::Destroying;
+        t.note = "削除中".into();
+        store::save_targets(std::slice::from_ref(&t)).expect("書ける");
+
+        // 呼び出し側が握っている写しは Ready のまま (古い写しを信じない)
+        let mut stale = t.clone();
+        stale.lifecycle = crate::features::cloud_execution::model::TargetLifecycle::Ready;
+        let e = runner_attached_on(&stale, "true", &[]).expect_err("断る");
+        assert!(matches!(e, CloudError::NoCapacity(_)), "{e:?}");
     }
 
     #[test]
@@ -500,7 +691,7 @@ mod tests {
         assert!(out.is_err());
         // 枠が返っていること (返らないと実行先が 1 回ごとに痩せる)
         let after = store::load_targets().expect("読める");
-        assert_eq!(after[0].capacity.active_jobs, 0);
+        assert_eq!(after[0].capacity.active_jobs(), 0);
     }
 
     #[test]

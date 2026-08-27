@@ -107,6 +107,63 @@ impl LaunchSpec {
     }
 }
 
+/// **エージェント設定 (preset) へ貼るための 1 行。**
+///
+/// ## なぜ `ssh …` を直に貼らせないのか (この版で直した壊れ方)
+///
+/// 以前は `ssh <実行先> '<コマンド>'` をそのまま返していた。貼った人が
+/// エージェントを起動するたびに**枠 (`max_jobs`) を通らない**ので、
+///
+/// * 上限を超えて何本でも起動できる
+/// * 走っているのに `active_jobs` が増えず、`worker destroy` が
+///   実行中の VM を消せてしまう
+///
+/// `zai cloud launch --run` を経由する行にすれば、貼った先でも
+/// [`super::runner::run_attached`] を通る — 枠も記録も同じ道になる。
+/// 中で組む ssh の引数は 1 バイトも変わらない (通る門が増えるだけ)。
+///
+/// `zai` 自身の場所は**いま動いている実行ファイル**を使う。PATH に
+/// 入れていない人のところで壊れないため。
+pub fn preset_command_line(
+    target: &ExecutionTarget,
+    command: Option<&str>,
+    spec: Option<&LaunchSpec>,
+    cwd: Option<&str>,
+) -> Result<String, CloudError> {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "zai".to_string());
+    let mut out = format!(
+        "{} cloud launch --target {} --run",
+        posix_quote(&exe),
+        posix_quote(&target.name)
+    );
+    if let Some(c) = cwd {
+        out.push_str(&format!(" --cwd {}", posix_quote(c)));
+    }
+    match (command, spec) {
+        (Some(c), _) => {
+            if c.trim().is_empty() {
+                return Err(CloudError::config("コマンドが空です"));
+            }
+            out.push_str(&format!(" --command {}", posix_quote(c)));
+        }
+        (None, Some(s)) => {
+            if s.program.trim().is_empty() {
+                return Err(CloudError::config("実行するコマンドがありません"));
+            }
+            out.push_str(" --");
+            out.push_str(&format!(" {}", posix_quote(&s.program)));
+            for a in &s.args {
+                out.push_str(&format!(" {}", posix_quote(a)));
+            }
+        }
+        (None, None) => return Err(CloudError::config("実行するコマンドがありません")),
+    }
+    Ok(out)
+}
+
 /// **既存のセッション起動経路へ渡すコマンド行**を作る。
 ///
 /// 手元の実行先ならそのまま (書き換えない)。リモートなら `ssh …` で包む。
@@ -185,10 +242,11 @@ pub struct RunPlan {
 impl RunPlan {
     /// 起動するものを 1 行にしたもの。
     ///
-    /// **表示にも起動にも使わない** — 起動は [`RunPlan::argv`] をそのまま
-    /// `Command` へ渡し、貼り付け用は [`session_command_line`] が別に組む。
-    /// ここは「畳んだ形」と「畳んでいない形」が違うことを試験で示すためだけ。
-    #[cfg(test)]
+    /// **起動には使わない** — 起動は [`RunPlan::argv`] をそのまま `Command` へ
+    /// 渡し、貼り付け用は [`session_command_line`] が別に組む。ここは
+    /// 「何を走らせたか」を記録へ残すため (と、畳んだ形と畳んでいない形が
+    /// 違うことを試験で示すため)。**秘密は伏せてから残す**ので、呼び出し側は
+    /// [`super::redact::redact`] を通すこと ([`super::runner::run_attached`])。
     pub fn display(&self) -> String {
         self.argv.join(" ")
     }

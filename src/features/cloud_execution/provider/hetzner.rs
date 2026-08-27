@@ -218,10 +218,7 @@ impl ExecutionProvider for HetznerProvider {
         // label がまだ返らないことがある)
         target.id = target_id;
         target.name = spec.name.clone();
-        target.capacity = TargetCapacity {
-            max_jobs: spec.max_jobs.max(1),
-            active_jobs: 0,
-        };
+        target.capacity = TargetCapacity::new(spec.max_jobs.max(1));
         // **まだ Ready ではない。** SSH が開くのを待つのは呼び出し側 (§50)。
         target.lifecycle = TargetLifecycle::Provisioning;
         Ok(target)
@@ -510,16 +507,14 @@ pub fn target_from_server(
             disk_mib,
             ..Capabilities::default()
         },
-        capacity: TargetCapacity {
-            max_jobs: profile.max_jobs.max(1),
-            active_jobs: 0,
-        },
+        capacity: TargetCapacity::new(profile.max_jobs.max(1)),
         lifecycle: lifecycle_from_status(server.get("status").and_then(Value::as_str)),
         managed: is_managed(&labels),
         labels,
         billing: billing_from_prices(st.and_then(|s| s.get("prices"))),
         provider_ref: Some(server_id),
         note: String::new(),
+        generation: 0,
     })
 }
 

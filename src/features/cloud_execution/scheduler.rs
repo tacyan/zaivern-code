@@ -342,7 +342,6 @@ mod tests {
             "b",
             TargetOpts {
                 max_jobs: 4,
-                active_jobs: 0,
                 ..TargetOpts::default()
             },
         );

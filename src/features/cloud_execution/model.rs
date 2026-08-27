@@ -414,28 +414,104 @@ impl TargetLifecycle {
 ///
 /// v1 では `max_jobs` を利用者が決める。CPU / RAM からの自動推論を**強制しない**
 /// (推論は後で Scheduler 側へ足せる)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetCapacity {
     pub max_jobs: u16,
+    /// **いま枠を握っている本数ではなく、握っている「誰か」の一覧。**
+    ///
+    /// ## なぜ数ではないのか (P2 の要)
+    ///
+    /// 数だと、増やす操作と減らす操作が**冪等にならない**。落ちた仕事の
+    /// 後始末が「仕事の台帳を Failed にする」→「実行先の台帳から 1 引く」の
+    /// 2 段になっていると、あいだで止まったときに枠が永久に返らず、
+    /// 順序を逆にすると今度は二重に返しうる (どちらも実際に起こる)。
+    ///
+    /// 持ち主の id で持てば、**足すのも外すのも何度やっても同じ**になる。
+    /// しかも持ち主と PID が同じファイル・同じロックの中に在るので、
+    /// 後始末は `targets.json` だけを見れば済み、`jobs.json` の履歴上限で
+    /// 記録が押し出されても枠が迷子にならない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holders: Vec<SlotHolder>,
+}
+
+/// 枠を握っている 1 本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotHolder {
+    /// どの仕事が握っているか (**外す鍵**。同じ id で 2 度足さない)。
+    pub job: JobId,
+    /// 握っているプロセス。**0 は「分からない」** (後始末の判定に使う)。
     #[serde(default)]
-    pub active_jobs: u16,
+    pub pid: u32,
+    /// 握った時刻 (診断用)。
+    #[serde(default)]
+    pub since_unix: u64,
 }
 
 impl Default for TargetCapacity {
     fn default() -> Self {
         Self {
             max_jobs: 1,
-            active_jobs: 0,
+            holders: Vec::new(),
         }
     }
 }
 
 impl TargetCapacity {
-    pub fn free(&self) -> u16 {
-        self.max_jobs.saturating_sub(self.active_jobs)
+    pub fn new(max_jobs: u16) -> Self {
+        Self {
+            max_jobs,
+            holders: Vec::new(),
+        }
     }
+
+    /// いま走っている本数。**保存された数ではなく持ち主の数**。
+    pub fn active_jobs(&self) -> u16 {
+        u16::try_from(self.holders.len()).unwrap_or(u16::MAX)
+    }
+
+    pub fn free(&self) -> u16 {
+        self.max_jobs.saturating_sub(self.active_jobs())
+    }
+
     pub fn has_room(&self) -> bool {
         self.free() > 0
+    }
+
+    /// 枠を 1 つ握る。**同じ仕事で 2 度呼んでも増えない** (冪等)。
+    ///
+    /// 返すのは「新しく握ったか」。上限に達していれば `false` で、
+    /// 何も変えない。
+    pub fn hold(&mut self, holder: SlotHolder) -> bool {
+        if self.holders.iter().any(|h| h.job == holder.job) {
+            return true; // すでに握っている (再試行で二重に数えない)
+        }
+        if !self.has_room() {
+            return false;
+        }
+        self.holders.push(holder);
+        true
+    }
+
+    /// 枠を外す。**何度呼んでも同じ** (冪等)。返すのは「外したか」。
+    pub fn release(&mut self, job: &JobId) -> bool {
+        let before = self.holders.len();
+        self.holders.retain(|h| &h.job != job);
+        self.holders.len() != before
+    }
+
+    /// **試験のための組み立て。** 空きの計算を表で固定するのに使う。
+    #[cfg(test)]
+    pub fn busy(max_jobs: u16, active: u16) -> Self {
+        Self {
+            max_jobs,
+            holders: (0..active)
+                .map(|i| SlotHolder {
+                    job: JobId::new(format!("j-test-{i}")),
+                    pid: 0,
+                    since_unix: 0,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -532,6 +608,24 @@ pub struct ExecutionTarget {
     /// 最後の確認で分かったこと (画面と `doctor` 用。秘密は入らない)。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// **状態を書き換えるたびに 1 つ増える番号。**
+    ///
+    /// ## 何のために在るのか
+    ///
+    /// `probe` は「読む → ネットワークで確かめる (数秒) → 書き戻す」の形で、
+    /// そのあいだに別のプロセスが `destroy` の予約を入れられる。読んだときの
+    /// 写しから作った `Ready` をそのまま書き戻すと、**削除予約を消して**
+    /// 消えかけの機械へ新しい仕事を載せてしまう。
+    ///
+    /// ロックを数秒握り続けるのは答えではない (その間ほかが全部止まる)。
+    /// **読んだときの番号を覚えておき、書き戻す瞬間に変わっていないかを
+    /// ロックの中で見る** — 変わっていれば、自分の写しはもう古い。
+    ///
+    /// 増やすのは [`super::registry::bump`] を通る書き換えだけ
+    /// (枠の増減は状態ではないので増やさない — 増やすと、仕事が 1 本
+    /// 載るたびに探りの書き戻しが落ちる)。
+    #[serde(default)]
+    pub generation: u64,
 }
 
 fn lifecycle_unknown() -> TargetLifecycle {
@@ -548,16 +642,14 @@ impl ExecutionTarget {
             transport: TransportKind::Local,
             endpoint: TargetEndpoint::Local,
             capabilities: Capabilities::host(),
-            capacity: TargetCapacity {
-                max_jobs,
-                active_jobs: 0,
-            },
+            capacity: TargetCapacity::new(max_jobs),
             lifecycle: TargetLifecycle::Ready,
             managed: false,
             labels: BTreeMap::new(),
             billing: BillingModel::Free,
             provider_ref: None,
             note: String::new(),
+            generation: 0,
         }
     }
 
@@ -1156,12 +1248,15 @@ mod tests {
 
     #[test]
     fn 空き枠は飽和で数える() {
-        let c = TargetCapacity {
-            max_jobs: 2,
-            active_jobs: 5,
-        };
+        // 上限より多く握っている (壊れた台帳を読んだ場合)
+        let c = TargetCapacity::busy(2, 5);
         assert_eq!(c.free(), 0, "引き算で溢れない");
         assert!(!c.has_room());
+        // ふつうの数え方
+        let c = TargetCapacity::busy(2, 1);
+        assert_eq!(c.active_jobs(), 1);
+        assert_eq!(c.free(), 1);
+        assert!(c.has_room());
     }
 
     #[test]

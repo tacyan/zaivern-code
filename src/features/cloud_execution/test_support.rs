@@ -120,16 +120,14 @@ pub fn target(name: &str, opts: TargetOpts) -> ExecutionTarget {
             memory_mib: opts.memory_mib,
             ..Capabilities::default()
         },
-        capacity: TargetCapacity {
-            max_jobs: opts.max_jobs,
-            active_jobs: opts.active_jobs,
-        },
+        capacity: TargetCapacity::busy(opts.max_jobs, opts.active_jobs),
         lifecycle: opts.lifecycle,
         managed: false,
         labels: BTreeMap::new(),
         billing: super::model::BillingModel::Unknown,
         provider_ref: None,
         note: String::new(),
+        generation: 0,
     }
 }
 
@@ -236,6 +234,78 @@ impl Gate {
     pub fn release(&self) {
         // 相手がもう居なくても落とさない (先に失敗しているだけ)
         let _ = self.release_tx.send(());
+    }
+}
+
+/// 探りの途中で必ず止まる Transport。
+///
+/// **「読んでからネットワークで確かめ、書き戻す」あいだに別の操作が入る**
+/// という順序を、眠りの長さに頼らず決定的に作るために使う。
+pub struct GatedTransport {
+    entered_tx: std::sync::mpsc::Sender<()>,
+    release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    probe: ProbeResult,
+}
+
+impl GatedTransport {
+    /// 返すのは `(Transport, 門)`。`probe` に入ると門が開くのを待つ。
+    pub fn new(probe: ProbeResult) -> (Self, Gate) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                entered_tx,
+                release_rx: Mutex::new(release_rx),
+                probe,
+            },
+            Gate {
+                entered_rx,
+                release_tx,
+            },
+        )
+    }
+}
+
+impl super::transport::ExecutionTransport for GatedTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::Ssh
+    }
+
+    fn probe(&self, _target: &ExecutionTarget) -> Result<ProbeResult, CloudError> {
+        let _ = self.entered_tx.send(());
+        let _ = self
+            .release_rx
+            .lock()
+            .expect("読める")
+            .recv_timeout(GATE_WAIT);
+        Ok(self.probe.clone())
+    }
+
+    fn exec(
+        &self,
+        _target: &ExecutionTarget,
+        _request: &ExecRequest,
+        _sink: &mut dyn super::model::EventSink,
+    ) -> Result<super::model::ExecResult, CloudError> {
+        Err(CloudError::unsupported("門つきの Transport は実行しません"))
+    }
+
+    fn upload(
+        &self,
+        _target: &ExecutionTarget,
+        _source: &std::path::Path,
+        _destination: &RemotePath,
+    ) -> Result<(), CloudError> {
+        Err(CloudError::unsupported("門つきの Transport は送りません"))
+    }
+
+    fn download(
+        &self,
+        _target: &ExecutionTarget,
+        _source: &RemotePath,
+        _destination: &std::path::Path,
+    ) -> Result<(), CloudError> {
+        Err(CloudError::unsupported("門つきの Transport は受けません"))
     }
 }
 
