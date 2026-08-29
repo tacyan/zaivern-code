@@ -873,6 +873,12 @@ pub struct Decision {
     /// 別の経路で決めると、表示と実行がずれる。
     #[serde(default)]
     pub commands: Vec<String>,
+    /// この判断が縛っている検証の世代 (検証の実行承認だけが持つ)。
+    ///
+    /// **判断そのものに焼き付ける。** 承認が遅れて届いたとき、いまの世代を
+    /// 見て決めると「人が見たのとは別のコード」を通してしまう。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_generation: Option<u32>,
 }
 
 #[cfg(test)]

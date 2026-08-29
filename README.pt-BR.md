@@ -240,9 +240,12 @@ repositório (`cargo test`, `npm test`, `pytest`, `make`, `node`, `go test`)
 um `build.rs` ou um `Makefile` fazem tudo o que um shell faz. Toda execução tem
 timeout, é encerrada com a árvore de processos inteira quando você para a
 equipe, e sempre termina em um resultado: passou, falhou, estourou o tempo, foi
-cancelada, não pôde iniciar ou perdeu conexão com o executor. O Zaivern não
-isola o que você aprova — ele garante **o que foi iniciado**, não o que aquele
-processo faz depois. `push`, `merge`, `deploy`,
+cancelada, não pôde iniciar ou perdeu conexão com o executor. **Uma aprovação
+vale para uma execução de validação, não para um nome de comando**: outra
+tarefa, uma nova rodada depois de uma revisão que pediu mudanças, ou uma
+retentativa perguntam de novo, porque o código testado já não é o que você
+aprovou. O Zaivern não isola o que você aprova — ele garante **o que foi
+iniciado**, não o que aquele processo faz depois. `push`, `merge`, `deploy`,
 elevação de privilégio e comandos destrutivos nunca são executados
 automaticamente — viram uma decisão sua, na tela.
 

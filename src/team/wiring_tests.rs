@@ -333,6 +333,57 @@ fn cli起動とgui起動は同じruntimeを通る() {
 }
 
 #[test]
+fn 起動要求にworkspaceを決めさせない() {
+    // **未信頼データに置き場と cwd を決めさせない。** 投函箱の
+    // `workspace_root` を書き換えるだけで「別のフォルダを Team Run に
+    // する」ができてしまう。権限を持つのは、いま開いている workspace だけ。
+    //
+    // ここはソースを読む番人にしている — GUI 経路 (`ZaivernApp`) は
+    // ヘッドレスのテストから回せないので、これ以外に見張る場所が無い。
+    let s = src(GLUE);
+    let body = function_body(
+        &s,
+        s.find("fn team_take_launch_request").expect("受け口がある"),
+    );
+    assert!(
+        !body.contains("attach_workspace(&req."),
+        "要求の中の workspace を attach している:\n{body}"
+    );
+    assert!(
+        body.contains("p.attach_workspace(&ws)"),
+        "いま開いている workspace を使っていない:\n{body}"
+    );
+    // 境界の確認も、同じ「いまの workspace」で行っていること。
+    assert!(
+        body.contains("launch::take_in(&root, &ws, now)"),
+        "境界の確認に別の値を渡している:\n{body}"
+    );
+
+    // 受け取り側の判定が、要求の中の値を基準にしていないこと。
+    let l = src(LAUNCH);
+    let check = function_body(
+        &l,
+        l.find("pub fn request_matches_workspace").expect("境界の判定"),
+    );
+    assert!(
+        check.contains("let current = canon(workspace);")
+            && check.contains("canon(&req.workspace_root) != current")
+            && check.contains("canon(&req.spec_path).starts_with(&current)"),
+        "要求の中の workspace を権限として扱っている:\n{check}"
+    );
+    // `take_in` がその判定を通っていること。
+    let take = function_body(&l, l.find("pub fn take_in").expect("受け口"));
+    assert!(
+        take.contains("request_matches_workspace(&req, workspace)"),
+        "受け取り側が境界を確かめ直していない:\n{take}"
+    );
+    assert!(
+        !take.contains("req.spec_path.starts_with(&req.workspace_root)"),
+        "要求の中の値どうしを比べている (境界にならない)"
+    );
+}
+
+#[test]
 fn 起動要求はteam画面を選ぶ() {
     let s = src(GLUE);
     let body = function_body(&s, s.find("fn team_take_launch_request").expect("受け口がある"));

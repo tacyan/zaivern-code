@@ -39,7 +39,12 @@ use super::model::{Decision, TeamAgent, TeamEvent, TeamGoal, TeamGroup, TeamTask
 /// * 2 — Effect を「発行済み (Dispatched)」と「成功 (Completed)」の 2 段で
 ///   持つようにした。旧 `done_effects` は「成功済み」として引き取る
 ///   ([`RunDoc::migrate`])。
-pub const SCHEMA_VERSION: u32 = 2;
+/// * 3 — 検証の実行承認をコマンド文字列だけで持つのをやめ、
+///   **Run + タスク + 世代 + コマンド**で持つようにした
+///   ([`ValidationApproval`])。旧 `approved_validation` (文字列の一覧) は
+///   読まずに捨てる — 範囲が広すぎる承認を引き継ぐと、承認したときとは
+///   別のコードが人の同意なく走る。
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// events.jsonl の行数上限 (超えたら古い行から落とす)。
 pub const EVENT_LOG_MAX_LINES: usize = 5_000;
@@ -83,6 +88,30 @@ pub enum EffectState {
     Completed,
 }
 
+/// **人が承認した検証の実行 1 回ぶん。**
+///
+/// コマンド文字列だけで承認を覚えると、次の筋書きが通ってしまう:
+///
+/// 1. タスク A の `cargo test` を人が承認する
+/// 2. エージェントが `build.rs` / テスト本体 / `Makefile` を書き換える
+/// 3. タスク B や、差し戻し後の再試行で、また `cargo test` が要る
+/// 4. **文字列が同じというだけ**で承認済みとして実行される
+/// 5. 人が見て承認したのとは**別のコード**が走る
+///
+/// なので承認は「どの Run の・どのタスクの・どの検証回の・どのコマンドか」
+/// まで縛る。別タスク・差し戻し後・レビュー指摘後は、必ず聞き直す。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationApproval {
+    pub run_id: String,
+    pub task_id: super::model::TaskId,
+    /// 検証の世代 ([`super::model::ValidationState::generation`])。
+    /// **検証をやり直すたびに 1 つ進む**ので、前の回の承認は当たらない。
+    pub generation: u32,
+    pub command: String,
+    /// 承認した時刻 (Unix 秒)。監査のために残す。
+    pub at: u64,
+}
+
 /// Effect 1 件の進み具合。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectRecord {
@@ -114,14 +143,11 @@ pub struct RunDoc {
     /// Effect の進み具合 (版 2 以降)。**発行 = 完了ではない。**
     #[serde(default)]
     pub effects: Vec<EffectRecord>,
-    /// **人が実行を承認した検証コマンド。**
+    /// **人が実行を承認した検証 (1 回ぶん)。**
     ///
-    /// `cargo test` などはリポジトリ内の任意コードを実行しうるので、
-    /// 承認したものだけを走らせる ([`super::graph::ValidationRisk`])。
-    /// Run 単位で持つ — 同じコマンドを試行のたびに聞き直すと、承認が
-    /// 「はい」を押すだけの儀式になり、実際には読まれなくなる。
+    /// 文字列だけで持ってはいけない ([`ValidationApproval`] の doc を参照)。
     #[serde(default)]
-    pub approved_validation: Vec<String>,
+    pub validation_approvals: Vec<ValidationApproval>,
     /// 検証 1 本あたりの時間切れ (秒)。テストは短い値を注入する。
     #[serde(default = "default_validation_timeout")]
     pub validation_timeout_secs: u64,
@@ -476,7 +502,7 @@ mod tests {
                 stopped: false,
                 started_at: 100,
                 updated_at: 100,
-                approved_validation: Vec::new(),
+                validation_approvals: Vec::new(),
                 validation_timeout_secs: default_validation_timeout(),
                 effects: vec![EffectRecord {
                     key: "start:1".into(),

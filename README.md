@@ -253,8 +253,11 @@ anything that can execute code from the repository — `cargo test`, `npm test`,
 line runs**, because a test body, a `build.rs` or a `Makefile` can do anything
 a shell can. Every run has a timeout, is killed as a whole process tree when
 you stop the team, and always settles: passed, failed, timed out, cancelled,
-could not start, or runner disconnected. Zaivern does not sandbox what you
-approve — it guarantees what gets started, not what that process then does.
+could not start, or runner disconnected. **An approval covers one validation
+run, not a command name**: a different task, a re-run after a rejected review,
+or a retry all ask again, because the code being tested is no longer the code
+you approved. Zaivern does not sandbox what you approve — it guarantees what
+gets started, not what that process then does.
 
 The Organization Board shows the team lead, the specialist lanes, every parent
 and child agent, what each is doing right now, the task graph's progress, test

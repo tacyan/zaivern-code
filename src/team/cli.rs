@@ -360,7 +360,15 @@ pub fn status_json(s: &persistence::Saved) -> String {
         "agent_count": s.run.agent_count,
         // **人が実行を承認した検証コマンド。** GUI の Mission Panel と同じ
         // ものを CLI からも読めるようにする (別実装を作らない)。
-        "approved_validation": s.run.approved_validation,
+        // **人が実行を承認した検証。** GUI の Mission Panel と同じものを
+        // CLI からも読めるようにする (別実装を作らない)。承認は
+        // 「どのタスクの・どの検証回か」まで縛られている。
+        "validation_approvals": s.run.validation_approvals.iter().map(|a| serde_json::json!({
+            "task_id": a.task_id,
+            "generation": a.generation,
+            "command": a.command,
+            "at": a.at,
+        })).collect::<Vec<_>>(),
         "tasks": s.tasks.iter().map(|t| serde_json::json!({
             "id": t.id,
             "title": t.title,

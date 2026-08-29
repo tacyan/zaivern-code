@@ -33,7 +33,9 @@ use crate::coordinator::{self, Coordinator, SessionState};
 
 use super::graph;
 use super::model::*;
-use super::persistence::{EffectRecord, EffectState, RunDoc, Saved, SCHEMA_VERSION};
+use super::persistence::{
+    EffectRecord, EffectState, RunDoc, Saved, ValidationApproval, SCHEMA_VERSION,
+};
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
 use super::reviewer;
@@ -224,7 +226,7 @@ impl TeamRuntime {
                 stopped: false,
                 started_at: now,
                 updated_at: now,
-                approved_validation: Vec::new(),
+                validation_approvals: Vec::new(),
                 validation_timeout_secs: super::launch::VALIDATION_TIMEOUT_SECS,
                 effects: Vec::new(),
                 done_effects: Vec::new(),
@@ -865,6 +867,7 @@ impl TeamRuntime {
                         vec!["approve".into(), "reject".into()],
                         format!("stop-agents:{}", self.run.run_id),
                         Vec::new(),
+                        None,
                     );
                     if let Some(d) = d {
                         out.push(TeamEffect::RequestHumanApproval(d));
@@ -901,14 +904,13 @@ impl TeamRuntime {
                         }
                     }
                     if d.kind == DecisionKind::ValidationExecution {
-                        // **承認したコマンドだけ**を実行対象にする。
-                        for c in d.commands {
-                            if !self.run.approved_validation.contains(&c) {
-                                self.run.approved_validation.push(c);
-                            }
-                        }
-                        self.run.approved_validation =
-                            clamp_list(std::mem::take(&mut self.run.approved_validation));
+                        // **承認は「その 1 回」にしか効かない。**
+                        //
+                        // 判断に焼き付けた世代で記録する — いまの世代を見て
+                        // 決めると、遅れて届いた承認が「人が見たのとは別の
+                        // コード」を通してしまう。世代が既に進んでいれば、
+                        // ここで積んだ記録はどの実行にも当たらない。
+                        self.record_validation_approval(&d);
                     }
                 }
             }
@@ -926,8 +928,16 @@ impl TeamRuntime {
                         // `Validating` に置いたままにすると、誰も走らせない
                         // 検証を永久に待つ。人へ上げて手を渡す。
                         if let Some(tid) = d.task_id {
+                            // **前任の保持を解く。** 担当は自分から「終わった」と
+                            // 言って手を離しているので、既存調停層へ伝えてよい
+                            // (`release_after_self_report`)。伝えないと
+                            // `PreviousHolderNotStopped` で二度と配れず、
+                            // 人が Retry を押しても `Ready` のまま動かない。
+                            self.release_after_self_report(tid);
                             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == tid) {
                                 t.validation.running = false;
+                                t.assigned_agent = None;
+                                t.assigned_session = None;
                                 t.state =
                                     sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
                                 t.updated_at = now_secs();
@@ -1019,6 +1029,7 @@ impl TeamRuntime {
                             vec!["approve".into(), "reject".into()],
                             format!("reassign-stop:{id}"),
                             Vec::new(),
+                            None,
                         );
                         if let Some(d) = d {
                             out.push(TeamEffect::RequestHumanApproval(d));
@@ -1322,6 +1333,8 @@ impl TeamRuntime {
         let max = self.run.max_attempts;
         let mut escalate: Option<(TaskId, String)> = None;
         let mut release_after = false;
+        // 完了報告を受けたら、新しい検証回を始める (下で世代を 1 つ進める)。
+        let mut enter_validation = false;
 
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
@@ -1357,13 +1370,14 @@ impl TeamRuntime {
                     // 前回の実測は、今回の実装に対する証跡ではない。捨てる。
                     t.validation.runs.clear();
                     t.validation.running = false;
-                    // **表に無い遷移を素通りしない。** `Assigned → Validating`
-                    // は表に無いので、`Assigned → Running → Validating` の順で
-                    // 通す (割り当て直後に報告が来る筋書きがある)。
-                    t.state = sm::apply(t.state, TeamTaskState::Running).unwrap_or(t.state);
-                    t.state = sm::apply(t.state, TeamTaskState::Validating).unwrap_or(t.state);
+                    enter_validation = true;
                 }
             }
+        }
+        if enter_validation {
+            // **新しい検証回。** 世代が 1 つ進むので、前の回の承認は
+            // 当たらない (`begin_validation_round`)。
+            self.begin_validation_round(acc.task_id);
         }
 
         // **ここでは先へ進めない。** 完了報告が意味するのは「実装が終わったと
@@ -1488,11 +1502,7 @@ impl TeamRuntime {
         // 遷移になる。レビュータスクは `validation_commands` が空なので、
         // `Validating` へ入れれば `settle_validation` が「走らせるものが無い =
         // 決着」として `Reviewing → Completed` まで運ぶ。
-        if let Some(r) = self.tasks.iter_mut().find(|t| t.id == rev.id) {
-            r.state = sm::apply(r.state, TeamTaskState::Running).unwrap_or(r.state);
-            r.state = sm::apply(r.state, TeamTaskState::Validating).unwrap_or(r.state);
-            r.updated_at = now_secs();
-        }
+        self.begin_validation_round(rev.id);
         self.settle_validation(rev.id);
         self.log(
             TeamEventKind::ReviewCompleted,
@@ -1716,9 +1726,13 @@ impl TeamRuntime {
             if !self.accepting_work() {
                 continue;
             }
+            let generation = self
+                .task(task)
+                .map(|t| t.validation.generation)
+                .unwrap_or_default();
             let need_ok: Vec<String> = repo_code
                 .iter()
-                .filter(|c| !self.run.approved_validation.contains(*c))
+                .filter(|c| !self.validation_approved(task, generation, c))
                 .cloned()
                 .collect();
             if !need_ok.is_empty() {
@@ -1739,25 +1753,30 @@ impl TeamRuntime {
                     )
                     .into(),
                     vec!["approve".into(), "reject".into()],
-                    format!("validation-exec:{}:{}", self.run.run_id, listed),
+                    // **鍵にも世代を入れる。** 入れないと、次の検証回で
+                    // 「同じ鍵の判断が既にある」と見なされて聞き直せない。
+                    format!(
+                        "validation-exec:{}:{task}:{generation}:{listed}",
+                        self.run.run_id
+                    ),
                     need_ok.clone(),
+                    Some(generation),
                 );
                 if let Some(d) = d {
                     out.push(TeamEffect::RequestHumanApproval(d));
                 }
                 continue;
             }
-            // **世代を 1 つ進めてから発行する。** 戻ってきた結果がこの発行の
-            // ものかを、受け口 (`note_validation_for`) が突き合わせる。
-            let gen = {
+            // **世代はここでは進めない。** 進めるのは検証回の始まり
+            // (`begin_validation_round`) だけで、人が承認したのもその世代。
+            // ここで進めると、承認した世代と実際に走る世代がずれる。
+            {
                 let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) else {
                     continue;
                 };
                 t.validation.running = true;
-                t.validation.generation = t.validation.generation.saturating_add(1);
-                t.validation.generation
-            };
-            let execution = self.execution_id(task, gen);
+            }
+            let execution = self.execution_id(task, generation);
             self.log(
                 TeamEventKind::ValidationStarted,
                 None,
@@ -1793,6 +1812,61 @@ impl TeamRuntime {
                 execution,
             });
         }
+    }
+
+    /// **新しい検証回を始める** (`… → Running → Validating`)。
+    ///
+    /// ここが検証の世代を進める**唯一の場所**。世代は「人が承認した対象」の
+    /// 単位でもあるので、進め方が 2 通りあると承認の範囲がぼやける。
+    /// 差し戻し・レビュー指摘・再試行のあとは必ずここを通るので、
+    /// **前の回の承認は当たらない**。
+    fn begin_validation_round(&mut self, task: TaskId) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            // **表に無い遷移を素通りしない。** `Assigned → Validating` は
+            // 表に無いので `Assigned → Running → Validating` の順で通す
+            // (割り当て直後に報告が来る筋書きがある)。
+            t.state = sm::apply(t.state, TeamTaskState::Running).unwrap_or(t.state);
+            t.state = sm::apply(t.state, TeamTaskState::Validating).unwrap_or(t.state);
+            t.validation.running = false;
+            t.validation.generation = t.validation.generation.saturating_add(1);
+            t.updated_at = now_secs();
+        }
+    }
+
+    /// その検証回のそのコマンドを、人が承認しているか。
+    fn validation_approved(&self, task: TaskId, generation: u32, command: &str) -> bool {
+        self.run.validation_approvals.iter().any(|a| {
+            a.run_id == self.run.run_id
+                && a.task_id == task
+                && a.generation == generation
+                && a.command == command
+        })
+    }
+
+    /// 承認を記録する。**判断に焼き付けた世代で**積む。
+    fn record_validation_approval(&mut self, d: &Decision) {
+        let (Some(task), Some(generation)) = (d.task_id, d.validation_generation) else {
+            return;
+        };
+        let at = now_secs();
+        let run_id = self.run.run_id.clone();
+        for command in &d.commands {
+            if self.validation_approved(task, generation, command) {
+                continue;
+            }
+            self.run.validation_approvals.push(ValidationApproval {
+                run_id: run_id.clone(),
+                task_id: task,
+                generation,
+                command: clamp_text(command),
+                at,
+            });
+        }
+        // 際限なく溜めない (1 タスク 1 回あたりコマンド数ぶんしか増えない)。
+        while self.run.validation_approvals.len() > APPROVAL_CAP {
+            self.run.validation_approvals.remove(0);
+        }
+        self.dirty = true;
     }
 
     /// この検証実行の一意な ID。
@@ -2362,6 +2436,8 @@ impl TeamRuntime {
         key: String,
         // この判断が対象にしているコマンド (検証の実行承認だけが使う)。
         commands: Vec<String>,
+        // 縛っている検証の世代 (同上)。
+        validation_generation: Option<u32>,
     ) -> Option<Decision> {
         if self.decisions.iter().any(|d| d.idempotency_key == key) {
             return None;
@@ -2379,6 +2455,7 @@ impl TeamRuntime {
             options,
             idempotency_key: key,
             commands: clamp_list(commands),
+            validation_generation,
         };
         self.decisions.push(d.clone());
         self.decisions.sort_by(|a, b| {
@@ -2419,9 +2496,14 @@ impl TeamRuntime {
             options,
             key,
             Vec::new(),
+            None,
         );
     }
 }
+
+/// 承認の記録をいくつまで残すか。**上限が無いと、長い Run で無限に伸びる。**
+/// 1 タスク 1 検証回あたりコマンド数ぶんしか増えないので、十分に大きい。
+const APPROVAL_CAP: usize = 512;
 
 /// 起動オプション。
 #[derive(Clone, Debug, PartialEq, Eq)]

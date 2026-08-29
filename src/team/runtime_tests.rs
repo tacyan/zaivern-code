@@ -989,6 +989,276 @@ fn 再起動しても未完了の検証が再開される() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+//  検証の実行承認は「その 1 回」にしか効かない
+//
+//  コマンド文字列だけで承認を使い回すと、承認したときとは**別のコード**が
+//  走る。エージェントは build.rs / テスト本体 / Makefile を書き換えられる
+//  ので、「同じ `cargo test` だから承認済み」は成り立たない。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 保留中の検証実行許可を 1 件返す。
+fn pending_exec_decision(rt: &TeamRuntime, tid: TaskId) -> Option<Decision> {
+    rt.decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::ValidationExecution && d.task_id == Some(tid))
+        .cloned()
+}
+
+/// 2 本のタスクをそれぞれ担当へ割り当てた状態。
+fn two_assigned() -> (TeamRuntime, Vec<SessionId>, TaskId, TaskId) {
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let a = assignments(&rt);
+    assert!(a.len() >= 2, "実装 2 本が配られる前提が崩れた: {a:?}");
+    (rt, sids, a[0].1, a[1].1)
+}
+
+#[test]
+fn 保存ファイルの中のworkspaceは復元後のcwdを決めない() {
+    // 置き場のファイルも**未信頼**として扱う (書き換えられうる)。復元時の
+    // workspace は、いま開いているものだけが決める — `run.json` の中の
+    // 文字列で検証の実行場所が変わってはいけない。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let mut saved = rt.to_saved();
+    saved.run.workspace = if cfg!(windows) {
+        "C:\\Windows".to_string()
+    } else {
+        "/".to_string()
+    };
+    let trusted = ws();
+    let mut r = TeamRuntime::restore(saved, trusted.clone());
+    r.apply_action(TeamAction::Start);
+    let eff = r.tick(&obs(20, &[]));
+    let spec = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::RunValidation(v) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("復元後に検証が発行される");
+    assert_eq!(
+        spec.cwd, trusted,
+        "保存ファイルの中の workspace で検証を走らせている"
+    );
+}
+
+#[test]
+fn 別のタスクは同じコマンドでも再承認が要る() {
+    let (mut rt, sids, ta, tb) = two_assigned();
+    // 2 本とも同じ検証コマンドを持つ。
+    assert_eq!(
+        rt.task(ta).unwrap().validation_commands,
+        rt.task(tb).unwrap().validation_commands
+    );
+    report_and_collect(&mut rt, &sids, ta, 12);
+    let d = pending_exec_decision(&rt, ta).expect("A の実行許可");
+    rt.apply_action(TeamAction::ApproveDecision(d.id));
+
+    // B が報告しても、A の承認では走らない。
+    report_and_collect(&mut rt, &sids, tb, 13);
+    let eff = idle_tick(&mut rt, 14, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tb)),
+        "別タスクの承認を使い回した: {eff:?}"
+    );
+    assert!(
+        pending_exec_decision(&rt, tb).is_some(),
+        "B について改めて承認を求めていない"
+    );
+}
+
+#[test]
+fn 差し戻したあとの再検証は再承認が要る() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let gen1 = rt.task(tid).unwrap().validation.generation;
+    // 実測が落ちて差し戻される
+    note_outcome(&mut rt, tid, 1, ValidationOutcome::Failed);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Ready);
+    // もう一度配られ、実装し直して報告する
+    let e = idle_tick(&mut rt, 20, &sids);
+    let _ = e;
+    report_and_collect(&mut rt, &sids, tid, 21);
+    let gen2 = rt.task(tid).unwrap().validation.generation;
+    assert!(gen2 > gen1, "検証の世代が進んでいない ({gen1} → {gen2})");
+    let eff = idle_tick(&mut rt, 22, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "前回の承認で新しいコードを走らせた: {eff:?}"
+    );
+    assert!(
+        pending_exec_decision(&rt, tid).is_some(),
+        "作り直したのに承認を求めていない"
+    );
+}
+
+#[test]
+fn レビュー指摘のあとの再検証も再承認が要る() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    validate_ok(&mut rt, tid);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Reviewing);
+    // レビュー担当が配られるまで 1 tick 回す。
+    idle_tick(&mut rt, 13, &sids);
+    let rev_sid = rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(tid))
+        .and_then(|t| t.assigned_session)
+        .expect("レビュー担当セッション");
+    let block = review_block(tid, false);
+    tick_text(&mut rt, 14, &sids, rev_sid, &block);
+    assert!(
+        matches!(
+            rt.task(tid).unwrap().state,
+            TeamTaskState::Ready | TeamTaskState::Running
+        ),
+        "REQUEST_CHANGES で差し戻されていない: {:?}",
+        rt.task(tid).unwrap().state
+    );
+    // 直して再報告 → **もう一度承認が要る**
+    idle_tick(&mut rt, 15, &sids); // 配り直し
+    report_and_collect(&mut rt, &sids, tid, 16);
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "検証待ちになっていない (検査が空回りする)"
+    );
+    let eff = idle_tick(&mut rt, 17, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "指摘を直したコードを、前回の承認で走らせた: {eff:?}"
+    );
+    assert!(
+        pending_exec_decision(&rt, tid).is_some(),
+        "直したコードについて承認を求めていない"
+    );
+}
+
+#[test]
+fn 古い承認判断をあとから通しても現在の世代には効かない() {
+    // **判断が生き残ったまま世代が進む筋書き。** 承認待ちのあいだに担当の
+    // セッションが消えると、タスクは回収されて配り直される。そこで実装し
+    // 直した別のコードに対して、**前の回の承認要求**が人の画面に残る。
+    // それを押しても、いまの世代を通してはいけない。
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let stale = pending_exec_decision(&rt, tid).expect("最初の実行許可");
+    let dead = rt.task(tid).unwrap().assigned_session.expect("担当");
+
+    // 担当セッションが消える → 回収されて Ready へ戻る。
+    let alive: Vec<SessionId> = sids.iter().copied().filter(|s| *s != dead).collect();
+    let mut now = 13;
+    while rt.task(tid).unwrap().assigned_session.is_none() && now < 20 {
+        idle_tick(&mut rt, now, &alive);
+        now += 1;
+    }
+    // 配り直された先で、直したコードを報告する (= 新しい検証回)。
+    idle_tick(&mut rt, now, &alive);
+    now += 1;
+    report_and_collect(&mut rt, &alive, tid, now);
+    now += 1;
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "検証待ちになっていない (検査が空回りする)"
+    );
+    let now_gen = rt.task(tid).unwrap().validation.generation;
+    assert_ne!(
+        stale.validation_generation,
+        Some(now_gen),
+        "世代が進んでいないので検査にならない"
+    );
+    // **古い判断がまだ画面に残っている**ことを確かめてから押す。
+    assert!(
+        rt.decisions().iter().any(|d| d.id == stale.id),
+        "検査の前提 (古い判断が残っている) が崩れた"
+    );
+    rt.apply_action(TeamAction::ApproveDecision(stale.id));
+    let eff = idle_tick(&mut rt, now, &alive);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "古い承認で現在の世代を走らせた: {eff:?}"
+    );
+    assert!(
+        pending_exec_decision(&rt, tid).is_some(),
+        "いまの世代について、承認を求めたままになっていない"
+    );
+}
+
+#[test]
+fn 承認は保存され復元しても世代ごとに効く() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let d = pending_exec_decision(&rt, tid).expect("実行許可");
+    rt.apply_action(TeamAction::ApproveDecision(d.id));
+    let gen = rt.task(tid).unwrap().validation.generation;
+
+    let saved = rt.to_saved();
+    assert!(
+        saved
+            .run
+            .validation_approvals
+            .iter()
+            .any(|a| a.task_id == tid && a.generation == gen),
+        "承認が世代つきで保存されていない: {:?}",
+        saved.run.validation_approvals
+    );
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    // 検証待ちのまま復元されるので、聞き直さずに走る。
+    let eff = r.tick(&obs(20, &[]));
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "復元後に承認済みの検証が走らない: {eff:?}"
+    );
+    let _ = sids;
+}
+
+#[test]
+fn 実行しないと決まっているコマンドは承認しても走らない() {
+    let (mut rt, sids, tid) = to_assigned();
+    // 実行してはいけないコマンドを検証に混ぜる。
+    rt.set_validation_commands_for_test(tid, &["git push origin main"]);
+    report_and_collect(&mut rt, &sids, tid, 12);
+    // 承認できるものは全部承認してしまう (人が押し間違えた筋書き)。
+    let ids: Vec<u64> = rt.decisions().iter().map(|d| d.id).collect();
+    for id in ids {
+        rt.apply_action(TeamAction::ApproveDecision(id));
+    }
+    for now in 13..18 {
+        let eff = idle_tick(&mut rt, now, &sids);
+        assert!(
+            !eff.iter()
+                .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+            "禁止コマンドを承認で実行した: {eff:?}"
+        );
+    }
+}
+
+#[test]
+fn 安全なコマンドは承認を求めない() {
+    let (mut rt, sids, tid) = to_assigned();
+    rt.set_validation_commands_for_test(tid, &["rustfmt --check src/a.rs"]);
+    let eff = report_and_collect(&mut rt, &sids, tid, 12);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "リポジトリのコードを実行しないものにまで承認を求めた: {eff:?}"
+    );
+    assert!(pending_exec_decision(&rt, tid).is_none());
+}
+
+// ══════════════════════════════════════════════════════════════════════
 //  検証は必ず決着する — 時間切れ・停止・接続断・古い結果
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1376,33 +1646,21 @@ fn 承認を拒否したら実行せず人へ上げる() {
         !rt.task(tid).unwrap().validation.running,
         "実行していないのに running のまま"
     );
+    // **人が Retry を押せば動き出せる。** 前任の保持が解けていないと
+    // `PreviousHolderNotStopped` で二度と配れず、`Ready` のまま固まる。
+    rt.apply_action(TeamAction::RetryTask(tid));
+    let mut now = 14;
+    while rt.task(tid).unwrap().assigned_session.is_none() && now < 20 {
+        idle_tick(&mut rt, now, &sids);
+        now += 1;
+    }
+    assert!(
+        rt.task(tid).unwrap().assigned_session.is_some(),
+        "拒否したタスクが Retry でも動かない: {:?}",
+        rt.task(tid).unwrap().state
+    );
 }
 
-#[test]
-fn 承認は保存され復元後に聞き直さない() {
-    let (mut rt, sids, tid) = to_assigned();
-    report_and_collect(&mut rt, &sids, tid, 12);
-    let did = rt
-        .decisions()
-        .iter()
-        .find(|d| d.kind == DecisionKind::ValidationExecution)
-        .expect("実行許可")
-        .id;
-    rt.apply_action(TeamAction::ApproveDecision(did));
-    let saved = rt.to_saved();
-    let mut r = TeamRuntime::restore(saved, ws());
-    r.apply_action(TeamAction::Start);
-    // 復元後、担当は外れて Ready へ戻るが、承認そのものは残っている。
-    assert!(
-        r.to_saved()
-            .run
-            .approved_validation
-            .iter()
-            .any(|c| c.contains("cargo test")),
-        "承認が保存されていない"
-    );
-    let _ = (sids, tid);
-}
 
 #[test]
 fn 走っていた検証は復元後にもう一度走る() {

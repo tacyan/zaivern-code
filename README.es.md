@@ -241,8 +241,11 @@ línea**: el cuerpo de un test, un `build.rs` o un `Makefile` pueden hacer lo
 mismo que un shell. Cada ejecución tiene tiempo límite, se termina con todo el
 árbol de procesos cuando paras el equipo, y siempre acaba en un resultado:
 pasó, falló, se agotó el tiempo, se canceló, no pudo iniciarse o se perdió la
-conexión con el ejecutor. Zaivern no aísla lo que apruebas: garantiza **qué se
-inició**, no lo que ese proceso hace después. `push`, `merge`, `deploy`, la elevación
+conexión con el ejecutor. **Una aprobación cubre una ejecución de validación,
+no un nombre de comando**: otra tarea, una nueva pasada tras una revisión que
+pidió cambios, o un reintento vuelven a preguntar, porque el código que se
+prueba ya no es el que aprobaste. Zaivern no aísla lo que apruebas: garantiza
+**qué se inició**, no lo que ese proceso hace después. `push`, `merge`, `deploy`, la elevación
 de privilegios y los comandos destructivos nunca se ejecutan automáticamente:
 se convierten en una decisión tuya, en pantalla.
 

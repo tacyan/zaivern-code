@@ -119,7 +119,6 @@ impl ZaivernApp {
             return;
         };
         let opts = RunOptions {
-            run_id: format!("run-{}", req.requested_at),
             spec_source: req.spec_path.display().to_string(),
             agent_count: req.agent_count,
             ..RunOptions::default()
@@ -127,7 +126,12 @@ impl ZaivernApp {
         let auto = req.auto_start;
         let result = panel::with_panel(|p| {
             p.open = true;
-            p.attach_workspace(&req.workspace_root);
+            // **要求の中の workspace を attach しない。** 未信頼データに
+            // 置き場と cwd を決めさせると、投函箱を書き換えるだけで
+            // 「別のフォルダを Team Run にする」ができてしまう。
+            // 権限を持つのは**いま開いている workspace** だけ
+            // (`take_in` も同じ値で境界を確かめている)。
+            p.attach_workspace(&ws);
             p.form.open = false;
             p.tab = BoardTab::Organization;
             let r = p.plan(&req.spec_text, &opts.spec_source.clone(), opts);
@@ -489,7 +493,10 @@ impl ZaivernApp {
             (form.spec_text.clone(), tr("team.form.direct_source"))
         };
         let opts = RunOptions {
-            run_id: format!("run-{}", crate::features::team::imp::model::now_secs()),
+            // **秒だけで作らない。** 同じ秒に 2 回始めると ID が衝突し、
+            // 前の Run の検証結果や承認が新しい Run の同じ番号のタスクへ
+            // 当たりうる (`runtime::new_run_id`)。
+            run_id: crate::features::team::imp::runtime::new_run_id(),
             spec_source: source.clone(),
             agent_count: form.agents,
             max_attempts: form.max_attempts,

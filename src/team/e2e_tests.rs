@@ -382,6 +382,9 @@ fn 受入シナリオを最後まで通す() {
 
     // ── Task B: 完了 → REQUEST_CHANGES → 差し戻し → 再実装 → APPROVE ──
     lab.report_done(task_b);
+    // 承認 → 発行 → 実測が戻る、で 2 tick (検証はリポジトリのコードを
+    // 走らせるので、実物でも人の承認を通る)。
+    lab.idle();
     lab.idle();
     lab.report_review(task_b, false);
     let b = lab.rt.task(task_b).unwrap();
@@ -404,6 +407,9 @@ fn 受入シナリオを最後まで通す() {
         "再割り当てされていない"
     );
     lab.report_done(task_b);
+    // **やり直しの検証も、もう一度承認を通る。** 直したコードは前回
+    // 承認したものと別物なので、承認は世代ごとに聞き直す。
+    lab.idle();
     lab.idle();
     lab.report_review(task_b, true);
     assert_eq!(lab.rt.task(task_b).unwrap().state, TeamTaskState::Completed);
@@ -431,6 +437,7 @@ fn 受入シナリオを最後まで通す() {
 
     // ── 統合完了 → レビュー → Goal Completed ──
     lab.report_done(integ.id);
+    lab.idle();
     lab.idle();
     lab.report_review(integ.id, true);
     lab.idle();

@@ -147,6 +147,32 @@ Running → Validating → Reviewing → Completed
 Stop Team (全体停止) と同じ経路・同じ承認ゲートを共有していて、
 `Decision.task_id` が `Some` なら 1 体、`None` なら全体を指す。
 
+## workspace の権限
+
+**`zai team run` の投函 (`launch.json`) は未信頼データである。** ファイルは
+`~/.zaivern/team/<キー>/` にあり、そのマシンで動く任意のプロセスが書ける。
+
+```
+workspace の権限を持つのは、いま開いている workspace だけ
+```
+
+* 判定の基準は**呼び出し側が渡した現在の workspace**。要求の中の
+  `workspace_root` を基準にすると、それを `/` に書き換えるだけで
+  `spec_path.starts_with(workspace_root)` が必ず通る (境界にならない)
+* `launch::request_matches_workspace` が 2 つを見る:
+  `canon(req.workspace_root) == canon(現在の workspace)` と
+  `canon(req.spec_path).starts_with(canon(現在の workspace))`
+* 正規化は実在すれば `canonicalize` (symlink を辿り `..` を畳む)、
+  実在しなければ形だけ畳む (`lexical_normalize`)。**素のまま比べない** —
+  `a/../b` と `b` が別物のままだと、形の違いだけで通ったり落ちたりする
+* GUI 側は `attach_workspace(&req.workspace_root)` を**呼ばない**。
+  置き場 (`state_dir`) も検証の cwd (`ValidationSpec.cwd`) も
+  `panel.workspace` から決まるので、ここを要求に決めさせると
+  「投函箱を書き換えるだけで別のフォルダを Team Run にする」ができる
+* 番人は `launch::tests::要求の中のworkspaceは権限を持たない` ほか 5 本と、
+  `wiring_tests::起動要求にworkspaceを決めさせない` (GUI 経路はヘッドレスの
+  テストから回せないので、ソースの形で固定している)
+
 ## Effect の一生
 
 `TeamEffect` は Runtime が出す**要求**であって、出した時点では何も起きて
@@ -222,10 +248,30 @@ Pending (まだ出していない)
   (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は
   「検査するだけ」に見えても実行しうる
 
+### 承認は「その 1 回」にしか効かない
+
 承認は `DecisionKind::ValidationExecution` として既存の approval gate を
-通り、Run 単位で `run.approved_validation` に残る (試行のたびに聞き直すと、
-承認が読まれない儀式になる)。**拒否したら `NeedsUser`** — 実行しないまま
-`Validating` で待ち続ける経路は無い。
+通る。**コマンド文字列だけで覚えてはいけない** — エージェントは `build.rs` /
+テスト本体 / `Makefile` を書き換えられるので、「同じ `cargo test` だから
+承認済み」にすると、人が見て承認したのとは**別のコード**が走る。
+
+記録は `ValidationApproval { run_id, task_id, generation, command }`
+(`run.validation_approvals`)。`generation` は**検証回**の番号で、
+`begin_validation_round` — 検証回が始まる唯一の場所 — が 1 つ進める。
+
+| 場面 | 前の承認が効くか |
+| --- | --- |
+| 別のタスクの同じコマンド | **効かない** (`task_id` が違う) |
+| 差し戻し後の再検証 | **効かない** (世代が進む) |
+| レビュー指摘 → 修正 → 再検証 | **効かない** (同上) |
+| 別の Run の同じタスク番号 | **効かない** (`run_id` が違う) |
+| Stop で打ち切った検証の再開 | 効く (同じ検証回・コードは変わっていない) |
+
+* 承認要求 (`Decision`) には**その世代を焼き付ける** (`validation_generation`)。
+  いまの世代を見て決めると、遅れて届いた承認が新しいコードを通してしまう
+* 鍵にも世代を入れる。入れないと「同じ鍵の判断がある」と見なされて聞き直せない
+* **拒否したら `NeedsUser`** — 実行しないまま `Validating` で待ち続ける経路は
+  無い。拒否のときは前任の保持も解くので、人が Retry を押せば動き出せる
 
 **MVP で自動実行しないもの**: git push / PR 作成 / merge / rebase / reset /
 deploy / release / publish / 本番 DB 操作 / credential 操作 / 課金 /
@@ -281,9 +327,13 @@ Zaivern が保証できるのは「何を起動したか」までで、起動し
 * **壊れていても黙って初期化しない** — `<名前>.corrupt-<epoch>` へ退避して
   理由を返す
 * 版が新しすぎるときは読まずに残す
-* 人が承認した検証コマンド (`approved_validation`) と時間切れ
-  (`validation_timeout_secs`) も `run.json` に残る。**再起動しても
-  聞き直さない / 無期限には戻らない**
+* 人が承認した検証 (`validation_approvals`) と時間切れ
+  (`validation_timeout_secs`) も `run.json` に残る。承認は
+  Run + タスク + 世代 + コマンドで縛られているので、**復元しても
+  範囲は広がらない**
+* **保存ファイルの中の `workspace` は権限を持たない。** 復元時の
+  workspace は、いま開いているものだけが決める (書き換えられても
+  検証の実行場所は変わらない)
 * `events.jsonl` は追記専用で上限 5,000 行
 
 再起動時に未完了 Run があれば `Resume / Open Read Only / Discard` を出す。

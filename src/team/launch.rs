@@ -105,10 +105,67 @@ impl LaunchError {
 /// SPEC の上限 (バイト)。
 pub const SPEC_MAX_BYTES: u64 = 512 * 1024;
 
-/// パスを可能なかぎり正規化する。実在しない場合は `canonicalize` できないので
-/// 素のまま返す (検証は形でも行う)。
+/// パスを可能なかぎり正規化する。
+///
+/// 実在すれば `canonicalize` (symlink を辿り、`..` を畳み、Windows では
+/// ドライブ表記も揃う)。実在しないものは辿れないので、**形だけ**
+/// 畳んだものを返す ([`lexical_normalize`])。
+///
+/// **素のまま返してはいけない。** `a/../b` と `b` が別物のままだと、
+/// 「内側か」の判定 (`starts_with`) が形の違いだけで通ったり落ちたりする。
 fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    std::fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
+}
+
+/// ファイルシステムに触らずにパスを畳む (`.` を捨て、`..` を 1 つ戻す)。
+///
+/// 実在しないパスにも使えるのが要点。**先頭の `..` は残す** — 畳めない
+/// 脱出は「畳めなかった」まま残し、境界の判定で落とす。
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // 直前が普通の名前のときだけ戻せる。根や `..` の上は戻せない。
+                let pop = matches!(
+                    out.components().next_back(),
+                    Some(Component::Normal(_))
+                );
+                if pop {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// **投函の中の値は権限を持たない。**
+///
+/// 起動要求は未信頼データである。`spec_path` が要求の中の `workspace_root`
+/// の内側かを見ても意味が無い — `workspace_root` を `/` に書き換えれば
+/// どんな絶対パスでも「内側」になる。判定の基準は**いま開いている
+/// workspace** (呼び出し側が渡す信頼済みの値) だけ。
+///
+/// 戻り値は「この要求を、この workspace で受け取ってよいか」。
+pub fn request_matches_workspace(req: &TeamLaunchRequest, workspace: &Path) -> bool {
+    let current = canon(workspace);
+    // 要求は workspace を**宣言**できるが、それが権限になってはいけない。
+    // 宣言が現在の workspace と食い違うなら、その要求はここ宛てではない。
+    if canon(&req.workspace_root) != current {
+        return false;
+    }
+    // SPEC は**現在の** workspace の内側にあること (symlink の先まで見る)。
+    canon(&req.spec_path).starts_with(&current)
 }
 
 /// 起動要求を組み立てる。**ここで全部検証する。**
@@ -207,7 +264,9 @@ pub fn take_in(root: &Path, workspace: &Path, now: u64) -> Option<TeamLaunchRequ
         return None;
     }
     // **受け取り側でも境界を確かめ直す。** 投函箱を書き換えられても通さない。
-    if !req.spec_path.starts_with(&req.workspace_root) {
+    // 基準は要求の中の `workspace_root` ではなく、呼び出し側が渡した
+    // **いま開いている workspace** ([`request_matches_workspace`])。
+    if !request_matches_workspace(&req, workspace) {
         return None;
     }
     if req.spec_text.trim().is_empty() {
@@ -506,6 +565,151 @@ mod tests {
         post_in(&home, &req).unwrap();
         assert_eq!(take_in(&home, &req.workspace_root, req.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 投函箱を書き換えたうえで、**現在開いている workspace** へ持ち込もうと
+    /// する筋書き。判定の基準は要求の中の `workspace_root` ではなく、
+    /// 呼び出し側から渡された現在の workspace でなければならない。
+    fn forged(dir: &Path, mutate: impl FnOnce(&mut TeamLaunchRequest)) -> Option<TeamLaunchRequest> {
+        let spec = write_spec(dir, "# x\n- y\n");
+        let mut req = build(dir, &spec, 2, false).unwrap();
+        let home = test_home(dir);
+        mutate(&mut req);
+        // 投函先は**現在の workspace の箱**にする (攻撃者は自分の GUI が
+        // 見ている箱へ書ける)。
+        let path = launch_path_in(&home, dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&req).unwrap()).unwrap();
+        let at = req.requested_at;
+        take_in(&home, dir, at)
+    }
+
+    #[test]
+    fn 同じworkspaceの正しい要求は通る() {
+        let dir = ws("ws-ok");
+        assert!(forged(&dir, |_| {}).is_some(), "正しい要求を弾いた");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 要求の中のworkspaceは権限を持たない() {
+        // **`workspace_root` を書き換えれば境界を広げられる**、が成り立たない
+        // ことを見る。`/` にすれば `spec_path.starts_with(workspace_root)` は
+        // 必ず通るので、要求の中の値を基準にしてはいけない。
+        let dir = ws("ws-root");
+        let evil = dir.join("outside-spec.md");
+        std::fs::write(&evil, "# evil\n- y\n").unwrap();
+        for (name, mutate) in [
+            (
+                "root",
+                Box::new(|r: &mut TeamLaunchRequest| {
+                    r.workspace_root = PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+                    r.spec_path = PathBuf::from(if cfg!(windows) {
+                        "C:\\Windows\\evil.md"
+                    } else {
+                        "/etc/passwd"
+                    });
+                }) as Box<dyn FnOnce(&mut TeamLaunchRequest)>,
+            ),
+            (
+                "別の workspace",
+                Box::new(|r: &mut TeamLaunchRequest| {
+                    r.workspace_root = PathBuf::from(if cfg!(windows) {
+                        "C:\\other\\place"
+                    } else {
+                        "/other/place"
+                    });
+                    r.spec_path = r.workspace_root.join("SPEC.md");
+                }),
+            ),
+            (
+                "Windows のドライブ差し替え",
+                Box::new(|r: &mut TeamLaunchRequest| {
+                    r.workspace_root = PathBuf::from("D:\\elsewhere");
+                    r.spec_path = PathBuf::from("D:\\elsewhere\\SPEC.md");
+                }),
+            ),
+            (
+                "UNC",
+                Box::new(|r: &mut TeamLaunchRequest| {
+                    r.workspace_root = PathBuf::from("\\\\host\\share");
+                    r.spec_path = PathBuf::from("\\\\host\\share\\SPEC.md");
+                }),
+            ),
+        ] {
+            let got = forged(&dir, mutate);
+            assert!(got.is_none(), "{name} を通してしまった: {got:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace外のspecは拒否する() {
+        let dir = ws("ws-escape");
+        // `..` で外へ出る / 別の絶対パス / 現在 workspace の外の実在ファイル
+        let outside = dir.parent().map(|p| p.join("outside.md"));
+        if let Some(o) = &outside {
+            std::fs::write(o, "# x\n- y\n").ok();
+        }
+        let up = dir.join("..").join("outside.md");
+        for (name, path) in [
+            ("..", up),
+            (
+                "絶対パス",
+                PathBuf::from(if cfg!(windows) {
+                    "C:\\Windows\\evil.md"
+                } else {
+                    "/etc/passwd"
+                }),
+            ),
+        ] {
+            let got = forged(&dir, |r| r.spec_path = path);
+            assert!(got.is_none(), "{name} の SPEC を通してしまった: {got:?}");
+        }
+        if let Some(o) = outside {
+            std::fs::remove_file(o).ok();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// symlink で workspace の外を指す SPEC。**実体の位置で判定する。**
+    #[cfg(unix)]
+    #[test]
+    fn symlink越しにworkspace外を指すspecは拒否する() {
+        let dir = ws("ws-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside_dir = dir.join("..").join("zaivern-outside-symlink");
+        std::fs::create_dir_all(&outside_dir).ok();
+        let real = outside_dir.join("evil.md");
+        std::fs::write(&real, "# evil\n- y\n").unwrap();
+        let link = dir.join("linked-spec.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let got = forged(&dir, |r| r.spec_path = link);
+        assert!(got.is_none(), "symlink 越しに外を指す SPEC を通した: {got:?}");
+        std::fs::remove_dir_all(&outside_dir).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 別のworkspaceが開いているときは拾わない() {
+        // 投函は workspace ごとの箱に入るが、**箱の場所も未信頼**なので、
+        // 中身の `workspace_root` が現在の workspace と一致することまで見る。
+        let a = ws("ws-a");
+        let b = ws("ws-b");
+        let spec = write_spec(&a, "# x\n- y\n");
+        let req = build(&a, &spec, 2, false).unwrap();
+        let home = test_home(&a);
+        // A 宛ての要求を、B の箱へ置く。
+        let path = launch_path_in(&home, &b);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(
+            take_in(&home, &b, req.requested_at),
+            None,
+            "別の workspace 宛ての要求を拾った"
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
