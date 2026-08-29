@@ -38,6 +38,8 @@
 //! * **同じ入力に同じ割り当て。** [`scheduler`] は純関数。
 //! * **人へ上げる操作は自動実行しない。** push / merge / deploy /
 //!   権限昇格 / 破壊的操作は [`graph::check_command`] が止める。
+//!
+//! 使い方と設計の全体像は `docs/team.md`。
 
 pub mod cli;
 pub mod graph;

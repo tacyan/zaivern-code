@@ -15,6 +15,8 @@ const FEATURE: &str = include_str!("../features/team.rs");
 const CLI: &str = include_str!("../cli.rs");
 const BOARD: &str = include_str!("organization_board.rs");
 const INSPECTOR: &str = include_str!("inspector.rs");
+const TEAM_CLI: &str = include_str!("cli.rs");
+const PANEL: &str = include_str!("panel.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -275,4 +277,84 @@ mod meta {
         assert!(body.contains("let z = 3;"));
         assert!(!body.contains("w()"), "隣の関数まで拾っている");
     }
+}
+
+#[test]
+fn cli起動とgui起動は同じruntimeを通る() {
+    // **別々の実装を作らない。** CLI は起動要求を投函するだけで、計画も実行も
+    // GUI 側の 1 本 (`TeamPanel::plan` → `TeamRuntime`) を通る。
+    let cli = src(TEAM_CLI);
+    assert!(
+        !cli.contains("TeamRuntime::from_plan"),
+        "CLI が独自に Runtime を建てている (GUI と二重実装になる)"
+    );
+    assert!(
+        cli.contains("launch::post(&req)"),
+        "CLI が起動要求を投函していない"
+    );
+    // 計画の入口は Planner 1 本
+    assert!(
+        cli.contains("StaticPlanner") && cli.contains("plan_schema::TeamPlan"),
+        "CLI が Planner 境界を通っていない"
+    );
+
+    let glue = src(GLUE);
+    assert!(
+        glue.contains("p.plan(&req.spec_text"),
+        "GUI が投函された SPEC で計画していない"
+    );
+    // 投函経由も、GUI のフォーム経由も、同じ `TeamPanel::plan` を通る
+    assert!(
+        glue.matches("p.plan(").count() >= 2,
+        "CLI 経由と GUI 経由で入口が分かれている"
+    );
+
+    let panel = src(PANEL);
+    assert!(
+        panel.contains("TeamRuntime::from_plan"),
+        "Runtime を建てるのが TeamPanel::plan の 1 か所でない"
+    );
+    assert_eq!(
+        panel.matches("TeamRuntime::from_plan").count(),
+        1,
+        "Runtime を建てる場所が 2 つ以上ある"
+    );
+}
+
+#[test]
+fn 起動要求はteam画面を選ぶ() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_take_launch_request").expect("受け口がある"));
+    assert!(body.contains("p.open = true"), "Team 画面を開いていない");
+    assert!(
+        body.contains("p.tab = BoardTab::Organization"),
+        "Organization タブを選んでいない"
+    );
+    assert!(
+        body.contains("p.form.open = false"),
+        "Plan Preview ではなくフォームを出してしまう"
+    );
+    // `--yes` は **Start Team の確認だけ**を省く
+    assert!(
+        body.contains("if r.is_ok() && auto") && body.contains("TeamAction::Start"),
+        "--yes が Start Team を省く経路になっていない"
+    );
+}
+
+#[test]
+fn yesで省けるのはstart_teamの確認だけ() {
+    let s = src(TEAM_CLI);
+    let body = function_body(&s, s.find("pub fn cli_main").expect("入口がある"));
+    // `--yes` が権限昇格・破壊的操作・push/merge/deploy を素通ししないこと。
+    // それらは計画の検証 (graph::check_command) で止まるので、CLI 側で
+    // `--yes` を見て緩める分岐があってはいけない。
+    assert!(
+        !body.contains("opts.yes && "),
+        "--yes を別の判断に混ぜている:\n{body}"
+    );
+    // reset だけは削除の確認に --yes を使う (消す対象を出したうえで)
+    assert!(
+        body.contains("if opts.dry_run || !opts.yes"),
+        "reset が確認なしで消せてしまう"
+    );
 }

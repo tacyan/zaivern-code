@@ -209,6 +209,33 @@ Use o mesmo Wi-Fi, o [Tailscale](https://tailscale.com/) ou um túnel SSH.
 Revise código e mudanças dos agentes sem sair do Zaivern Code, incluindo Markdown,
 imagens, PDFs e CSVs. Buffers não salvos são recuperados depois de um crash.
 
+### 8. Execuções de equipe de IA — entregue um SPEC e receba uma equipe gerenciada
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+O Zaivern lê o SPEC, deriva um Goal e uma Definition of Done, monta um grafo de
+tarefas e mostra o plano. Ao pressionar **Start Team**, ele inicia apenas os
+agentes de que o plano realmente precisa, entrega a cada um a sua tarefa e
+conduz implementar → validar → revisar → corrigir → integrar até o fim.
+
+**Nada é dado como concluído só porque um agente disse que está.** Uma tarefa
+avança apenas por `Running → Validating → Reviewing → Completed`, e um relatório
+de conclusão é rejeitado se o id da tarefa ou do agente não bater, se arquivos
+fora do escopo foram tocados, se os comandos de validação não foram executados
+ou falharam, ou se ainda há um blocker aberto. As revisões vão para uma
+**sessão diferente** daquela que escreveu o código. `push`, `merge`, `deploy`,
+elevação de privilégio e comandos destrutivos nunca são executados
+automaticamente — viram uma decisão sua, na tela.
+
+O Organization Board mostra o líder da equipe, as raias de cada especialidade,
+todos os agentes pais e filhos, o que cada um está fazendo agora, o progresso do
+grafo de tarefas, os resultados de testes e revisões e **o que mais precisa da
+sua atenção**.
+
+[Docs da equipe de IA](docs/team.md)
+
 Também inclui: plugins e uma interface em seis idiomas.
 [Docs de plugins](docs/plugins.md) · [Docs de tradução](docs/translating.md)
 
@@ -293,6 +320,7 @@ Reproduza qualquer um deles: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Quais garantias valem para qual formato de repositório |
 | [docs/idle-cost.md](docs/idle-cost.md) | Como CPU em repouso e tamanho do binário são medidos |
 | [docs/plugins.md](docs/plugins.md) | Como escrever plugins, com a [especificação do formato](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: como um SPEC vira um grafo de tarefas, o que libera o "concluído" e o que nunca é executado automaticamente |
 | [docs/README.md](docs/README.md) | Índice de todos os outros documentos, agrupados pela afirmação que sustentam |
 
 [Notas de release](https://github.com/tacyan/zaivern-code/releases) ·

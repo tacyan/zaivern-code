@@ -223,6 +223,31 @@ your files — it runs only when you call it.
 
 [Context Engine docs](docs/context-engine.md)
 
+### 9. AI team runs — hand over a SPEC, get a managed development team
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern reads the SPEC, derives a Goal and a Definition of Done, builds a task
+graph, shows the plan, and — once you press **Start Team** — launches only the
+agents the plan actually needs, hands each one its task, and drives implement →
+validate → review → revise → integrate to completion.
+
+Nothing is marked complete because an agent said so. A task passes only through
+`Running → Validating → Reviewing → Completed`, and a completion report is
+rejected if the task id or agent id does not match, if it touched files outside
+its scope, if the validation commands were not run or failed, or if a blocker is
+still open. Reviews go to a **different session** than the one that wrote the
+code. `push`, `merge`, `deploy`, privilege escalation and destructive commands
+are never run automatically — they become a decision for you, on screen.
+
+The Organization Board shows the team lead, the specialist lanes, every parent
+and child agent, what each is doing right now, the task graph's progress, test
+and review results, and the one thing that most needs your attention.
+
+[AI team docs](docs/team.md)
+
 Also included: plugins, and a UI available in six languages.
 [Plugin docs](docs/plugins.md) · [Translation docs](docs/translating.md)
 
@@ -309,6 +334,7 @@ Reproduce any of it: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
 | [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU and binary size are measured |
 | [docs/plugins.md](docs/plugins.md) | Writing plugins, with the [format specification](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: how a SPEC becomes a task graph, what gates "complete", and what is never run automatically |
 | [docs/README.md](docs/README.md) | Index of every other document, grouped by the claim it backs |
 
 [Release notes](https://github.com/tacyan/zaivern-code/releases) ·

@@ -616,3 +616,110 @@ fn to_review_stage() -> (TeamRuntime, Vec<SessionId>, TaskId, SessionId) {
         .unwrap_or_else(|| *sids.iter().find(|s| **s != sid).unwrap_or(&sid));
     (rt, sids, tid, rev_sid)
 }
+
+#[test]
+fn 同じエージェントを複数チームへ重複登録しない() {
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let parent = rt
+        .agents()
+        .iter()
+        .find(|a| a.session_id == Some(sids[0]))
+        .map(|a| a.id.clone())
+        .expect("親");
+    let other = rt
+        .agents()
+        .iter()
+        .find(|a| a.session_id == Some(sids[1]))
+        .map(|a| a.id.clone())
+        .expect("別の親");
+    let ev = |parent: &AgentId| {
+        format!(
+            "{open}\n{{\"kind\":\"sub_agent_started\",\"agent_id\":\"dup-1\",\
+             \"parent_id\":\"{parent}\",\"role\":\"tester\"}}\n{close}",
+            open = rp::EVENT_OPEN,
+            close = rp::EVENT_CLOSE
+        )
+    };
+    tick_text(&mut rt, 12, &sids, sids[0], &ev(&parent));
+    let after_first = rt.agents().len();
+    // **別の親の下に同じ ID を作らせない。** 通すと組織図に同じ名前が
+    // 2 つ現れ、どちらが本物か分からなくなる。
+    tick_text(&mut rt, 13, &sids, sids[1], &ev(&other));
+    assert_eq!(rt.agents().len(), after_first, "同じ ID を二重登録した");
+    let dup_parent = rt
+        .agent(&AgentId::new("dup-1"))
+        .and_then(|a| a.parent_id.clone())
+        .expect("最初の登録は残る");
+    assert_eq!(dup_parent, parent, "親が乗っ取られた");
+    // 同じ親からの再報告は受け入れる (進捗の更新なので)
+    tick_text(&mut rt, 14, &sids, sids[0], &ev(&dup_parent));
+    assert_eq!(rt.agents().len(), after_first);
+}
+
+#[test]
+fn specとエージェント数が計画に反映される() {
+    // `zai team run SPEC.md --agents 4` と GUI の New Team Run は
+    // **同じ Planner と同じ Runtime** を通る。ここではその計画に SPEC の
+    // 中身と指定したエージェント数が効いていることを見る。
+    for agents in [1usize, 2, 4] {
+        let rt = {
+            let plan = StaticPlanner
+                .plan(PlanInput {
+                    spec: SPEC.to_string(),
+                    source: "SPEC.md".into(),
+                    agent_count: agents,
+                    review_required: true,
+                })
+                .expect("計画できるべき");
+            TeamRuntime::from_plan(
+                plan,
+                ws(),
+                RunOptions {
+                    agent_count: agents,
+                    ..RunOptions::default()
+                },
+            )
+        };
+        assert_eq!(rt.run().agent_count, agents);
+        assert_eq!(rt.goal().title, "認証機能");
+        assert!(
+            rt.goal().specification.contains("トークン更新"),
+            "SPEC の中身が計画へ入っていない"
+        );
+        // 起こすのは「計画に必要なぶんだけ」で、上限は超えない
+        let roster = rt
+            .agents()
+            .iter()
+            .filter(|a| a.kind == AgentKind::ManagedSession)
+            .count();
+        assert!(roster <= agents, "agents={agents} なのに {roster} 体並べた");
+        assert!(roster >= 1);
+    }
+}
+
+#[test]
+fn 計画しただけではエージェントを起こさない() {
+    // Plan Preview は「見せるだけ」。Start Team を押すまで 1 体も起きない。
+    let plan = StaticPlanner
+        .plan(PlanInput {
+            spec: SPEC.to_string(),
+            source: "SPEC.md".into(),
+            agent_count: 4,
+            review_required: true,
+        })
+        .unwrap();
+    let mut rt = TeamRuntime::from_plan(plan, ws(), RunOptions::default());
+    assert_eq!(rt.goal().status, GoalStatus::Ready);
+    let eff = rt.tick(&obs(1, &[]));
+    assert!(
+        !eff.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))),
+        "Start Team を押す前に起動要求が出た: {eff:?}"
+    );
+    rt.apply_action(TeamAction::Start);
+    let eff2 = rt.tick(&obs(2, &[]));
+    assert!(eff2.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))));
+}

@@ -202,6 +202,31 @@ Zaivern Code가 보는 것은 픽셀이 아니라 의미적 진행입니다. 더
 Zaivern Code를 벗어나지 않고 코드와 에이전트의 변경을 검토합니다. Markdown, 이미지,
 PDF, CSV까지. 저장하지 않은 버퍼는 크래시 후에 복구됩니다.
 
+### 8. AI 팀 실행 — SPEC 만 건네면 관리되는 개발 팀이 움직입니다
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern 이 SPEC 을 읽어 Goal 과 Definition of Done 을 세우고, 태스크 그래프를
+만들어 계획을 보여 줍니다. **Start Team** 을 누르면 계획에 필요한 만큼만
+에이전트를 띄우고 담당을 나눈 뒤, 구현 → 검증 → 리뷰 → 수정 → 통합까지
+끌고 갑니다.
+
+**에이전트가 "끝났다"고 말했다고 완료가 되지는 않습니다.** 태스크는
+`Running → Validating → Reviewing → Completed` 순서로만 진행되며, 태스크 ID 나
+에이전트 ID 가 담당과 다르거나, 담당 범위 밖 파일을 건드렸거나, 검증 명령을
+실행하지 않았거나 실패했거나, 남은 blocker 가 있으면 완료 보고는 거부됩니다.
+리뷰는 **코드를 쓴 세션과 다른 세션**이 맡습니다. push · merge · deploy ·
+권한 상승 · 파괴적 명령은 절대 자동으로 실행하지 않고, 화면 위에서 당신이
+판단할 항목이 됩니다.
+
+Organization Board 에는 팀 리드, 전문 팀 레인, 모든 부모/자식 에이전트, 각자가
+지금 무엇을 하고 있는지, 태스크 그래프의 진척, 테스트와 리뷰 결과, 그리고
+**지금 가장 당신의 판단을 기다리는 것**이 나옵니다.
+
+[AI 팀 문서](docs/team.md)
+
 이 밖에 플러그인과 6개 언어 UI도 들어 있습니다.
 [플러그인 문서](docs/plugins.md) · [번역 문서](docs/translating.md)
 
@@ -284,6 +309,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | 어떤 저장소 형태에서 무엇이 보장되는가 |
 | [docs/idle-cost.md](docs/idle-cost.md) | 유휴 CPU와 바이너리 크기를 측정하는 방법 |
 | [docs/plugins.md](docs/plugins.md) | 플러그인 작성법과 [형식 명세](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: SPEC 이 어떻게 태스크 그래프가 되는지, 무엇이 "완료"의 관문인지, 무엇을 자동 실행하지 않는지 |
 | [docs/README.md](docs/README.md) | 나머지 모든 문서의 색인, 뒷받침하는 주장별로 정리 |
 
 [릴리스 노트](https://github.com/tacyan/zaivern-code/releases) ·

@@ -219,6 +219,31 @@ Codex も Gemini も同じ挙動になります。追加インストールは不
 
 [コンテキストエンジン](docs/context-engine.md)
 
+### 9. AI チーム実行 — SPEC を渡すだけで、開発チームが動く
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern が SPEC を読んで Goal と Definition of Done を起こし、Task Graph を
+組み、計画を見せます。**Start Team** を押すと、計画に必要なぶんだけ
+エージェントを起こし、担当を配り、実装 → 検証 → レビュー → 修正 → 統合まで
+進めます。
+
+**「エージェントが完了と言った」では完了になりません。** タスクは
+`Running → Validating → Reviewing → Completed` の順にしか進めず、完了報告は
+タスク ID / エージェント ID が担当と違う・担当外のファイルを触った・検証
+コマンドを実行していない/失敗した・blocker が残っている、のどれかに当たると
+却下されます。レビューは**実装したのと別のセッション**が担当します。
+push / merge / deploy / 権限昇格 / 破壊的操作は自動実行せず、**画面上の
+あなたの判断**になります。
+
+Organization Board には、チームリード・専門チームのレーン・親子のエージェント・
+いま各自が何をしているか・Task Graph の進捗・テストとレビューの結果・
+そして**いま一番あなたの判断を待っているもの**が出ます。
+
+[AI チーム](docs/team.md)
+
 さらに、プラグインと 6 言語の UI も入っています。
 [プラグイン](docs/plugins.md) · [翻訳](docs/translating.md)
 
@@ -302,6 +327,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | リポジトリの形ごとに何が保証されるか |
 | [docs/idle-cost.md](docs/idle-cost.md) | アイドル CPU とバイナリサイズの測り方 |
 | [docs/plugins.md](docs/plugins.md) | プラグインの書き方と[形式の仕様](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: SPEC がどう Task Graph になるか、何が「完了」の関門か、何を自動実行しないか |
 | [docs/README.md](docs/README.md) | 残りの文書の索引（支えている主張ごとの並び） |
 
 [リリースノート](https://github.com/tacyan/zaivern-code/releases) ·

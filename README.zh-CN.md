@@ -199,6 +199,28 @@ MCP 环境变量的值一次也不会显示。
 不离开 Zaivern Code 就能审阅代码和智能体的改动，包括 Markdown、图片、PDF 和 CSV。
 未保存的缓冲区在崩溃后会被恢复。
 
+### 8. AI 团队运行 —— 交出一份 SPEC，得到一支受管理的开发团队
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern 读取 SPEC，推导出 Goal 与 Definition of Done，构建任务图并展示计划。
+按下 **Start Team** 后，它只启动计划真正需要的智能体，把任务分派下去，并推动
+实现 → 验证 → 评审 → 修改 → 集成直到完成。
+
+**不会因为智能体说“完成了”就算完成。** 任务只能沿着
+`Running → Validating → Reviewing → Completed` 前进；若任务 ID 或智能体 ID
+与分配不符、改动了负责范围之外的文件、没有运行或未通过验证命令、仍有未解决的
+blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**负责。
+push、merge、deploy、权限提升和破坏性命令永不自动执行——它们会变成屏幕上
+等待你决定的事项。
+
+组织看板会显示团队负责人、各专业小组的泳道、每个父/子智能体、他们此刻正在做
+什么、任务图的进度、测试与评审结果，以及**最需要你关注的那一件事**。
+
+[AI 团队文档](docs/team.md)
+
 另外还包含：插件，以及六种语言的界面。
 [插件文档](docs/plugins.md) · [翻译文档](docs/translating.md)
 
@@ -279,6 +301,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | 哪种仓库形态保证哪些性质 |
 | [docs/idle-cost.md](docs/idle-cost.md) | 空闲 CPU 与二进制体积的测量方法 |
 | [docs/plugins.md](docs/plugins.md) | 编写插件，以及[格式规范](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`：SPEC 如何变成任务图、什么才算“完成”、哪些操作永不自动执行 |
 | [docs/README.md](docs/README.md) | 其余全部文档的索引，按其支撑的主张分组 |
 
 [发布说明](https://github.com/tacyan/zaivern-code/releases) ·
