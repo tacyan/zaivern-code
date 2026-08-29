@@ -76,6 +76,21 @@ pub struct Observation {
 
 // ── 出力 ─────────────────────────────────────────────────────────────
 
+/// **Effect の持ち主** — どの Run の、どの workspace のものか。
+///
+/// Runtime が決めた実行コンテキストを、実行側 (app) が「いまの画面の値」で
+/// 取り直してはいけない。取り直すと、workspace を切り替えた瞬間に
+/// **前の Run の仕事が新しいフォルダで動く**。
+///
+/// そこで発行時に持ち主を焼き付け、実行の直前にもう一度突き合わせる。
+/// 一致しないものは実行しない (キューを空にするだけの偶然に頼らない)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOwner {
+    pub run_id: String,
+    /// この Run の workspace。**Runtime が持っている値そのもの。**
+    pub workspace: PathBuf,
+}
+
 /// エージェントを 1 体起こす要求。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentLaunchSpec {
@@ -197,6 +212,35 @@ pub struct TeamRuntime {
     registered: BTreeSet<SessionId>,
     /// 保存が要るか。
     dirty: bool,
+    /// **状態機械が拒否した遷移。** 借用の都合で、起きた場所では記録だけして
+    /// あとでまとめて事象へ落とす ([`TeamRuntime::drain_rejections`])。
+    ///
+    /// 拒否そのものは正しい動き (fail-closed) だが、**黙って無かったことに
+    /// しない** — 「押したのに何も起きない」を追えるようにする。
+    rejections: std::cell::RefCell<Vec<(TaskId, TeamTaskState, TeamTaskState)>>,
+}
+
+/// 状態を 1 つ進める。**進めなかったことを黙殺しない。**
+///
+/// 表に無い遷移は fail-closed で「そのまま」にする (完了したタスクへ古い
+/// 報告が来ても動かさない、など)。ただし起きたことは `sink` へ積んで、
+/// あとで事象として残す。
+fn step(
+    t: &mut TeamTask,
+    to: TeamTaskState,
+    sink: &std::cell::RefCell<Vec<(TaskId, TeamTaskState, TeamTaskState)>>,
+) -> bool {
+    match sm::apply(t.state, to) {
+        Ok(next) => {
+            t.state = next;
+            t.updated_at = now_secs();
+            true
+        }
+        Err(_) => {
+            sink.borrow_mut().push((t.id, t.state, to));
+            false
+        }
+    }
 }
 
 impl TeamRuntime {
@@ -239,6 +283,7 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: true,
+            rejections: Default::default(),
         };
         rt.plan_roster();
         rt.log(
@@ -364,6 +409,7 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: false,
+            rejections: Default::default(),
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
@@ -520,6 +566,56 @@ impl TeamRuntime {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
             t.validation_commands = cmds.iter().map(|s| s.to_string()).collect();
         }
+    }
+
+    /// **この Runtime が持つ実行コンテキスト。**
+    ///
+    /// 発行した Effect には必ずこれを添える。実行側は「いまの画面の値」では
+    /// なく、これと突き合わせてから動く。
+    pub fn owner(&self) -> RunOwner {
+        RunOwner {
+            run_id: self.run.run_id.clone(),
+            workspace: self.workspace.clone(),
+        }
+    }
+
+    /// 拒否された遷移を事象へ落とす。**黙って無かったことにしない。**
+    ///
+    /// 拒否そのものは正しい動き (完了したタスクへ古い報告が来ても動かさない)
+    /// だが、記録が無いと「押したのに何も起きない」を誰も追えない。
+    fn drain_rejections(&mut self) {
+        let pending: Vec<(TaskId, TeamTaskState, TeamTaskState)> =
+            std::mem::take(&mut self.rejections.borrow_mut());
+        for (task, from, to) in pending {
+            self.log(
+                TeamEventKind::TransitionRejected,
+                None,
+                None,
+                format!(
+                    "#{task} を {} から {} へは進められません (状態機械が拒否)",
+                    from.key(),
+                    to.key()
+                ),
+            );
+        }
+    }
+
+    /// 拒否された遷移の件数 (テストが「黙殺していない」ことを見る)。
+    #[cfg(test)]
+    pub fn rejected_transitions(&self) -> usize {
+        self.events
+            .iter()
+            .filter(|e| e.kind == TeamEventKind::TransitionRejected)
+            .count()
+    }
+
+    /// この Run の workspace (エージェントの cwd・検証の cwd はここから決まる)。
+    ///
+    /// 実行側は [`Self::owner`] 越しに受け取る。ここを直接読むのはテスト
+    /// (不変条件の照合) だけ。
+    #[cfg(test)]
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.workspace
     }
 
     /// 保存用のまとまり。
@@ -680,7 +776,7 @@ impl TeamRuntime {
             let rev = self.new_review_task(&t);
             let rid = rev.id;
             if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
-                x.state = sm::apply(x.state, TeamTaskState::Reviewing).unwrap_or(x.state);
+                step(x, TeamTaskState::Reviewing, &self.rejections);
                 x.review.running = true;
                 x.review.verdict = None;
                 x.review.findings.clear();
@@ -695,8 +791,8 @@ impl TeamRuntime {
         } else {
             // レビュー不要 (または自分がレビュータスク)。検証が通ったので完了。
             if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
-                x.state = sm::apply(x.state, TeamTaskState::Reviewing).unwrap_or(x.state);
-                x.state = sm::apply(x.state, TeamTaskState::Completed).unwrap_or(x.state);
+                step(x, TeamTaskState::Reviewing, &self.rejections);
+                step(x, TeamTaskState::Completed, &self.rejections);
             }
             let owner = self
                 .task(task)
@@ -766,9 +862,9 @@ impl TeamRuntime {
                 )));
             }
             t.context = clamp_list(std::mem::take(&mut t.context));
-            t.state = sm::apply(t.state, TeamTaskState::Failed).unwrap_or(t.state);
+            step(t, TeamTaskState::Failed, &self.rejections);
             if t.attempts >= max {
-                t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                step(t, TeamTaskState::NeedsUser, &self.rejections);
                 escalate = true;
             }
         }
@@ -780,7 +876,7 @@ impl TeamRuntime {
             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
                 t.assigned_agent = None;
                 t.assigned_session = None;
-                t.state = sm::apply(t.state, TeamTaskState::Ready).unwrap_or(t.state);
+                step(t, TeamTaskState::Ready, &self.rejections);
                 // **失敗した実測はここでは消さない。** 画面と次の担当が
                 // 「何が落ちたか」を読むための証跡なので、次に配るときまで残す
                 // (`dispatch` が配る瞬間に捨てる)。
@@ -938,9 +1034,7 @@ impl TeamRuntime {
                                 t.validation.running = false;
                                 t.assigned_agent = None;
                                 t.assigned_session = None;
-                                t.state =
-                                    sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
-                                t.updated_at = now_secs();
+                                step(t, TeamTaskState::NeedsUser, &self.rejections);
                             }
                             self.log(
                                 TeamEventKind::ValidationCompleted,
@@ -1047,6 +1141,7 @@ impl TeamRuntime {
                 self.dirty = true;
             }
         }
+        self.drain_rejections();
         self.dirty = true;
         out.push(TeamEffect::PersistState);
         self.dispatch_effects(out)
@@ -1083,6 +1178,7 @@ impl TeamRuntime {
         // 7) Goal の状態を更新する。
         self.update_goal();
 
+        self.drain_rejections();
         if self.dirty {
             out.push(TeamEffect::PersistState);
             self.dirty = false;
@@ -1343,16 +1439,16 @@ impl TeamRuntime {
             t.updated_at = now;
             match acc.status {
                 ReportedStatus::Blocked => {
-                    t.state = sm::apply(t.state, TeamTaskState::Blocked).unwrap_or(t.state);
+                    step(t, TeamTaskState::Blocked, &self.rejections);
                 }
                 ReportedStatus::Failed => {
                     release_after = true;
                     t.attempts = t.attempts.saturating_add(1);
                     if t.attempts >= max {
-                        t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                        step(t, TeamTaskState::NeedsUser, &self.rejections);
                         escalate = Some((t.id, "実装が上限回数まで失敗しました".to_string()));
                     } else {
-                        t.state = sm::apply(t.state, TeamTaskState::Failed).unwrap_or(t.state);
+                        step(t, TeamTaskState::Failed, &self.rejections);
                     }
                 }
                 ReportedStatus::Completed => {
@@ -1467,7 +1563,7 @@ impl TeamRuntime {
             t.updated_at = now_secs();
             match acc.verdict {
                 ReviewVerdict::Approve => {
-                    t.state = sm::apply(t.state, TeamTaskState::Completed).unwrap_or(t.state);
+                    step(t, TeamTaskState::Completed, &self.rejections);
                 }
                 ReviewVerdict::RequestChanges => {
                     t.attempts = t.attempts.saturating_add(1);
@@ -1475,13 +1571,12 @@ impl TeamRuntime {
                         t.context.push(c);
                     }
                     t.context = clamp_list(std::mem::take(&mut t.context));
-                    t.state =
-                        sm::apply(t.state, TeamTaskState::RevisionRequired).unwrap_or(t.state);
+                    step(t, TeamTaskState::RevisionRequired, &self.rejections);
                     if t.attempts >= max {
-                        t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                        step(t, TeamTaskState::NeedsUser, &self.rejections);
                         escalate = true;
                     } else {
-                        t.state = sm::apply(t.state, TeamTaskState::Ready).unwrap_or(t.state);
+                        step(t, TeamTaskState::Ready, &self.rejections);
                         released = true;
                         t.assigned_agent = None;
                         t.assigned_session = None;
@@ -1704,8 +1799,7 @@ impl TeamRuntime {
                 // 自動実行しないコマンドが混じっている。**黙って落とすと、
                 // そのコマンドは永久に成功せず Validating で止まる。**
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
-                    t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
-                    t.updated_at = now_secs();
+                    step(t, TeamTaskState::NeedsUser, &self.rejections);
                 }
                 self.raise(
                     DecisionKind::DangerousCommand,
@@ -1825,8 +1919,8 @@ impl TeamRuntime {
             // **表に無い遷移を素通りしない。** `Assigned → Validating` は
             // 表に無いので `Assigned → Running → Validating` の順で通す
             // (割り当て直後に報告が来る筋書きがある)。
-            t.state = sm::apply(t.state, TeamTaskState::Running).unwrap_or(t.state);
-            t.state = sm::apply(t.state, TeamTaskState::Validating).unwrap_or(t.state);
+            step(t, TeamTaskState::Running, &self.rejections);
+            step(t, TeamTaskState::Validating, &self.rejections);
             t.validation.running = false;
             t.validation.generation = t.validation.generation.saturating_add(1);
             t.updated_at = now_secs();
@@ -2032,9 +2126,8 @@ impl TeamRuntime {
                         t.reported_validation.clear();
                         t.assigned_agent = Some(a.agent.clone());
                         t.assigned_session = Some(session);
-                        t.state = sm::apply(t.state, TeamTaskState::Assigned).unwrap_or(t.state);
-                        t.state = sm::apply(t.state, TeamTaskState::Running).unwrap_or(t.state);
-                        t.updated_at = now_secs();
+                        step(t, TeamTaskState::Assigned, &self.rejections);
+                        step(t, TeamTaskState::Running, &self.rejections);
                     }
                     self.log(
                         TeamEventKind::TaskAssigned,

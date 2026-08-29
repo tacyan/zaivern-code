@@ -4645,6 +4645,8 @@
   "team.inspector.edit_hint": "Lo que debe saber el siguiente responsable",
   "team.inspector.edit_instruction": "Instrucción adicional",
   "team.inspector.failed": "falló",
+  "team.err.workspace_busy": "Hay un Team Run en curso ({agents} agente(s) / {validations} validación(es)). Detenlo o termínalo antes de cambiar de workspace.",
+  "team.notice.dropped_effects": "Se descartaron {n} acción(es) pendiente(s) del run anterior sin ejecutarlas.",
   "team.validation.timed_out": "tiempo agotado",
   "team.validation.cancelled": "detenido",
   "team.validation.spawn_failed": "no se pudo iniciar",

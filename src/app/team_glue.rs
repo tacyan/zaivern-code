@@ -38,25 +38,36 @@ impl ZaivernApp {
     /// 🏛 Team 画面を開く / 閉じる (コマンドパレットから)。
     pub(crate) fn toggle_team_board(&mut self) {
         let ws = self.agent_cwd();
-        panel::with_panel(|p| {
+        // **断られたら黙らない。** 実行中の Run があるときは workspace を
+        // 切り替えないので、画面には前の Run が出たままになる。理由を出す。
+        let refused = panel::with_panel(|p| {
             p.open = !p.open;
-            if p.open {
-                p.attach_workspace(&ws);
-                p.mark_dirty();
+            if !p.open {
+                return None;
             }
+            let r = p.attach_workspace(&ws).err();
+            p.mark_dirty();
+            r
         });
+        if let Some(why) = refused {
+            self.toast(why, false);
+        }
     }
 
     /// 🏛 New Team Run のフォームを開く。
     pub(crate) fn open_team_new_run(&mut self) {
         let ws = self.agent_cwd();
-        panel::with_panel(|p| {
+        let refused = panel::with_panel(|p| {
             p.open = true;
-            p.attach_workspace(&ws);
+            let r = p.attach_workspace(&ws).err();
             p.form.open = true;
-            p.form.error.clear();
+            p.form.error = r.clone().unwrap_or_default();
             p.mark_dirty();
+            r
         });
+        if let Some(why) = refused {
+            self.toast(why, false);
+        }
     }
 
     /// 毎フレーム呼ばれる Team の駆動。**閉じていても Run が動いていれば進める**
@@ -112,6 +123,14 @@ impl ZaivernApp {
             return;
         }
         let ws = self.agent_cwd();
+        // **実行中の Run を別のフォルダの要求で潰さない。** 投函は拾うと
+        // 消えるので、拾ってから断ると要求ごと失われる (利用者は
+        // `zai team run` をもう一度打つしかない)。TTL の間は置いておく。
+        let busy_elsewhere =
+            panel::with_panel(|p| p.live_work().is_busy() && p.workspace() != ws.as_path());
+        if busy_elsewhere {
+            return;
+        }
         let now = crate::features::team::imp::model::now_secs();
         // 根は明示して渡す (既定の決め所は persistence::default_home の 1 か所)。
         let root = crate::features::team::imp::persistence::default_home();
@@ -131,7 +150,9 @@ impl ZaivernApp {
             // 「別のフォルダを Team Run にする」ができてしまう。
             // 権限を持つのは**いま開いている workspace** だけ
             // (`take_in` も同じ値で境界を確かめている)。
-            p.attach_workspace(&ws);
+            // **実行中の Run があるなら乗っ取らない。** `zai team run` を
+            // 二重に叩いても、動いているチームを別の計画で潰さない。
+            p.attach_workspace(&ws)?;
             p.form.open = false;
             p.tab = BoardTab::Organization;
             let r = p.plan(&req.spec_text, &opts.spec_source.clone(), opts);
@@ -187,7 +208,7 @@ impl ZaivernApp {
         // と見なさないので、ここで落ちても次の起動で撃ち直される。
         let launches = panel::with_panel(|p| p.take_launches());
         for (key, spec) in launches {
-            match self.team_launch_agent(ctx) {
+            match self.team_launch_agent(&spec, ctx) {
                 Some(session) => {
                     panel::with_panel(|p| {
                         p.bind_session(&spec.agent_id, session);
@@ -248,21 +269,51 @@ impl ZaivernApp {
     }
 
     /// エージェントを 1 体起こす。戻りは新しいセッション ID。
-    fn team_launch_agent(&mut self, ctx: &egui::Context) -> Option<SessionId> {
-        // **AI CLI のプリセットを選ぶ。** 素のシェルではチームにならない。
-        let idx = self
+    /// エージェントを 1 体起こす。戻りは新しいセッション ID。
+    ///
+    /// **cwd は要求 (`spec.workspace_root`) が決める。** 画面のいまの
+    /// フォルダ (`agent_cwd()`) を見てはいけない — Run を作ったあとに
+    /// 利用者がフォルダを選び直すと、Team が面倒を見ているのとは違う
+    /// ところでエージェントが動き出す。
+    fn team_launch_agent(
+        &mut self,
+        spec: &crate::features::team::imp::runtime::AgentLaunchSpec,
+        ctx: &egui::Context,
+    ) -> Option<SessionId> {
+        // **役割に合うプリセットを選ぶ。** 判断は純関数 1 本
+        // (`roles::preset_for_role`) — 素のシェルではチームにならないので、
+        // AI CLI として使えるものだけが候補になる。
+        //
+        // **この版では役割ごとのプリセットを持たないので、実際には全員が
+        // 同じプリセットで動く。** 差し替え点をここ 1 か所に残してある。
+        let table: Vec<(String, bool)> = self
             .cfg
             .agents
             .iter()
-            .position(|p| crate::agents::spec_for_command(&p.command).is_some())?;
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    crate::agents::spec_for_command(&p.command).is_some(),
+                )
+            })
+            .collect();
+        let idx = crate::features::team::imp::roles::preset_for_role(&table, spec.role)?;
+        let command = self.cfg.agents.get(idx)?.command.clone();
         let before: std::collections::HashSet<SessionId> =
             self.agents.sessions.iter().map(|s| s.id).collect();
-        self.launch_preset(idx, ctx);
-        self.agents
+        self.launch_preset_with(idx, command, &spec.workspace_root, ctx);
+        let session = self
+            .agents
             .sessions
             .iter()
             .map(|s| s.id)
-            .find(|id| !before.contains(id))
+            .find(|id| !before.contains(id))?;
+        // **役割は指示文にも載る** (`prompt.rs`)。ここでは端末の名前として
+        // 見えるようにして、画面と実体がずれないようにする。
+        if let Some(t) = self.agents.sessions.iter_mut().find(|s| s.id == session) {
+            t.title = spec.name.clone();
+        }
+        Some(session)
     }
 
     /// 検証を裏で走らせる。
@@ -282,14 +333,22 @@ impl ZaivernApp {
         let cmds = v.commands.clone();
         let timeout = std::time::Duration::from_secs(v.timeout_secs.max(1));
         let cancel = launch::new_cancel_flag();
+        let pid = launch::new_pid_slot();
         let worker_cancel = cancel.clone();
+        let worker_pid = pid.clone();
         let worker_exec = execution.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("zai-team-validate-{task}"))
             .spawn(move || {
                 let mut runs: Vec<ValidationRun> = Vec::new();
                 for c in &cmds {
-                    let r = launch::run_validation_command(c, &cwd, timeout, &worker_cancel);
+                    let r = launch::run_validation_command(
+                        c,
+                        &cwd,
+                        timeout,
+                        &worker_cancel,
+                        &worker_pid,
+                    );
                     let stop = !r.ok();
                     runs.push(r);
                     // **1 本落ちたら残りは走らせない。** 落ちた後のコマンドを
@@ -311,6 +370,7 @@ impl ZaivernApp {
                     started_at: crate::features::team::imp::model::now_secs(),
                     timeout_secs: v.timeout_secs,
                     cancel,
+                    pid,
                     rx,
                 });
                 p.ack_done(&key);
@@ -473,8 +533,11 @@ impl ZaivernApp {
 
     /// フォームの内容で計画する。
     fn team_plan_from_form(&mut self) {
-        let ws = self.agent_cwd();
-        let form = panel::with_panel(|p| p.form.clone());
+        // **基準は画面のいまのフォルダではなく、Team が持っている workspace。**
+        // 実行中の Run があると切り替えを断るので、この 2 つは食い違いうる。
+        // `agent_cwd()` で SPEC を解決すると、Run の workspace と別の場所の
+        // ファイルを読んで計画してしまう。
+        let (ws, form) = panel::with_panel(|p| (p.workspace().to_path_buf(), p.form.clone()));
         let (spec_text, source) = if form.from_file {
             let path = if std::path::Path::new(&form.spec_path).is_absolute() {
                 std::path::PathBuf::from(&form.spec_path)

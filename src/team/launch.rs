@@ -324,6 +324,20 @@ pub fn new_cancel_flag() -> CancelFlag {
     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
 }
 
+/// **いま走っている子プロセスの PID** (0 = 走っていない)。
+///
+/// 札を立てるだけでは足りない場面がある — アプリを閉じるときは、札を見る
+/// はずの worker スレッドごと消えるので、**誰も木を落とさない**。子は自分の
+/// プロセスグループを持っているので親と一緒には死なない (`cargo test` が
+/// 残り続ける)。そこで PID を外から見えるところに置き、閉じる側が同期的に
+/// 落とせるようにする。
+pub type PidSlot = std::sync::Arc<std::sync::atomic::AtomicU32>;
+
+/// 空の PID 置き場を作る。
+pub fn new_pid_slot() -> PidSlot {
+    std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))
+}
+
 /// 生きている子を待つときの刻み。短すぎると空回りで CPU を食い、長すぎると
 /// 停止の反応が鈍る。
 const POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -345,6 +359,7 @@ pub fn run_validation_command(
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
+    pid_slot: &PidSlot,
 ) -> ValidationRun {
     if super::graph::check_command(cmd).is_err() {
         return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
@@ -354,7 +369,7 @@ pub fn run_validation_command(
         return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
     };
     let args: Vec<&str> = words.collect();
-    let out = run_words(head, &args, cwd, timeout, cancel);
+    let out = run_words(head, &args, cwd, timeout, cancel, pid_slot);
     ValidationRun::new(cmd, out.0, out.1)
 }
 
@@ -369,6 +384,7 @@ pub fn run_words(
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
+    pid_slot: &PidSlot,
 ) -> (i32, ValidationOutcome) {
     use std::sync::atomic::Ordering;
 
@@ -398,6 +414,10 @@ pub fn run_words(
         return (127, ValidationOutcome::SpawnFailed);
     };
     let pid = child.id();
+    // **外から落とせるようにする。** 閉じる側 (`on_exit`) は worker を
+    // 待てないので、PID を見て自分で木を落とす。
+    pid_slot.store(pid, Ordering::Relaxed);
+    let _clear_pid = PidGuard(pid_slot);
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -422,6 +442,15 @@ pub fn run_words(
             return (if why == ValidationOutcome::TimedOut { 124 } else { 130 }, why);
         }
         std::thread::sleep(POLL);
+    }
+}
+
+/// 抜けるときに PID 置き場を必ず空にする (`?` でも panic でも通る)。
+struct PidGuard<'a>(&'a PidSlot);
+
+impl Drop for PidGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -750,10 +779,10 @@ mod tests {
             ("false", vec![])
         };
         assert_eq!(
-            run_words(ok_head, &ok_args, &dir, t, &new_cancel_flag()),
+            run_words(ok_head, &ok_args, &dir, t, &new_cancel_flag(), &new_pid_slot()),
             (0, ValidationOutcome::Passed)
         );
-        let (code, out) = run_words(ng_head, &ng_args, &dir, t, &new_cancel_flag());
+        let (code, out) = run_words(ng_head, &ng_args, &dir, t, &new_cancel_flag(), &new_pid_slot());
         assert_eq!(out, ValidationOutcome::Failed);
         assert_ne!(code, 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -769,6 +798,7 @@ mod tests {
             &dir,
             std::time::Duration::from_secs(5),
             &new_cancel_flag(),
+            &new_pid_slot(),
         );
         assert_eq!(out, ValidationOutcome::SpawnFailed);
         assert_eq!(code, 127);
@@ -789,6 +819,7 @@ mod tests {
             &dir,
             std::time::Duration::from_millis(300),
             &new_cancel_flag(),
+            &new_pid_slot(),
         );
         assert_eq!(out, ValidationOutcome::TimedOut, "時間切れにならない");
         assert_eq!(code, 124);
@@ -819,6 +850,7 @@ mod tests {
             &dir,
             std::time::Duration::from_secs(60),
             &cancel,
+            &new_pid_slot(),
         );
         assert_eq!(out, ValidationOutcome::Cancelled);
         assert_eq!(code, 130);
@@ -853,6 +885,7 @@ mod tests {
             &dir,
             std::time::Duration::from_secs(60),
             &cancel,
+            &new_pid_slot(),
         );
         assert_eq!(out, ValidationOutcome::Cancelled);
         // 孫が生きていれば、この間にファイルを作る。
@@ -874,6 +907,7 @@ mod tests {
             &dir,
             std::time::Duration::from_secs(5),
             &new_cancel_flag(),
+            &new_pid_slot(),
         );
         assert_eq!(r.exit_code, 126, "危険なコマンドを実行してしまった");
         assert_eq!(r.outcome(), ValidationOutcome::SpawnFailed);

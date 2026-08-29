@@ -4645,6 +4645,8 @@
   "team.inspector.edit_hint": "다음 담당자에게 전할 내용을 적으세요",
   "team.inspector.edit_instruction": "추가 지시",
   "team.inspector.failed": "실패",
+  "team.err.workspace_busy": "Team Run 이 실행 중입니다 (에이전트 {agents} 개 / 검증 {validations} 건). 중지하거나 완료한 뒤에 워크스페이스를 변경하세요",
+  "team.notice.dropped_effects": "이전 Run 에 속한 미실행 작업 {n} 건을 실행하지 않고 버렸습니다",
   "team.validation.timed_out": "시간 초과",
   "team.validation.cancelled": "중지했습니다",
   "team.validation.spawn_failed": "실행할 수 없습니다",

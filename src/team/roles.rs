@@ -91,6 +91,27 @@ pub fn derive_agent_work_state(
     }
 }
 
+/// **役割に合うエージェントプリセットを選ぶ** (純関数)。
+///
+/// 渡すのは `(プリセット名, AI CLI として使えるか)` の一覧。戻りはその
+/// 添字。判断は 2 段だけ:
+///
+/// 1. 名前に役割の綴り (`reviewer` / `tester` …) を含む AI CLI があれば、それ
+/// 2. 無ければ**最初の AI CLI**
+///
+/// この版では設定に役割ごとのプリセットが無いので、実際にはほぼ 2 段目に
+/// 落ちる = **全員が同じプリセット**で動く。それでもここを 1 本の関数に
+/// してあるのは、Role → Capability → Provider → Execution Target という
+/// 差し替え点を 1 か所に残すため (画面に「選べるのに効かない設定」を
+/// 作らないこと、と対になる)。
+pub fn preset_for_role(presets: &[(String, bool)], role: TeamRole) -> Option<usize> {
+    let want = role.key();
+    let named = presets.iter().position(|(name, is_ai)| {
+        *is_ai && name.to_ascii_lowercase().contains(want)
+    });
+    named.or_else(|| presets.iter().position(|(_, is_ai)| *is_ai))
+}
+
 /// この役割は実装 (コードを書く) をするか。
 ///
 /// レビュアーに書かせないための判定で、指示文 ([`super::prompt`]) と
@@ -228,5 +249,29 @@ mod tests {
         assert!(!writes_code(TeamRole::Reviewer));
         assert!(is_review_role(TeamRole::Reviewer));
         assert!(!is_review_role(TeamRole::Implementer));
+    }
+
+    #[test]
+    fn 役割に合うプリセットを選ぶ() {
+        use TeamRole::*;
+        let presets = vec![
+            ("Shell".to_string(), false),
+            ("Claude".to_string(), true),
+            ("Reviewer bot".to_string(), true),
+        ];
+        // 名前に役割の綴りがあれば、それ
+        assert_eq!(preset_for_role(&presets, Reviewer), Some(2));
+        // 無ければ最初の AI CLI (**素のシェルは選ばない**)
+        assert_eq!(preset_for_role(&presets, Implementer), Some(1));
+        assert_eq!(preset_for_role(&presets, TeamLead), Some(1));
+        // AI CLI が 1 つも無ければ選べない
+        let none = vec![("Shell".to_string(), false)];
+        assert_eq!(preset_for_role(&none, Implementer), None);
+        // **この版では全員が同じプリセットになる** (役割名のプリセットは
+        // 既定の設定に無い)。それを明示しておく。
+        let plain = vec![("Claude".to_string(), true), ("Codex".to_string(), true)];
+        for r in TeamRole::ALL {
+            assert_eq!(preset_for_role(&plain, r), Some(0), "{r:?}");
+        }
     }
 }

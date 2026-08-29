@@ -19,6 +19,7 @@ const TEAM_CLI: &str = include_str!("cli.rs");
 const PANEL: &str = include_str!("panel.rs");
 const PERSISTENCE: &str = include_str!("persistence.rs");
 const LAUNCH: &str = include_str!("launch.rs");
+const FRAME: &str = include_str!("../app/frame_update.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -110,9 +111,19 @@ fn 起動要求は一度だけ処理する() {
 fn エージェント起動は既存経路を通る() {
     let s = src(GLUE);
     let body = function_body(&s, s.find("fn team_launch_agent").expect("起動の橋がある"));
+    // 既存の起動経路を使う (並行実装を作らない)。
+    //
+    // **`launch_preset(i, ctx)` ではなく `launch_preset_with(..., cwd, ..)`。**
+    // 前者は呼んだ瞬間の `agent_cwd()` を使うので、Run を作ったあとに利用者が
+    // フォルダを選び直すと、Team が面倒を見ているのとは違うところで
+    // エージェントが動き出す。cwd は**要求が運んできた値**で決める。
     assert!(
-        body.contains("self.launch_preset("),
-        "既存の起動経路を使っていない (並行実装を作らない)"
+        body.contains("self.launch_preset_with(idx, command, &spec.workspace_root, ctx)"),
+        "Run の workspace で起こしていない:\n{body}"
+    );
+    assert!(
+        !body.contains("self.agent_cwd()"),
+        "画面のいまのフォルダを見ている (Runtime が決めた実行先を上書きしている)"
     );
     assert!(
         body.contains("spec_for_command"),
@@ -329,6 +340,115 @@ fn cli起動とgui起動は同じruntimeを通る() {
         panel.matches("TeamRuntime::from_plan").count(),
         1,
         "Runtime を建てる場所が 2 つ以上ある"
+    );
+}
+
+#[test]
+fn 起動要求のフィールドはすべて使われている() {
+    // **飾りのメタデータを残さない。** 構造体にあるのに実行時は無視、は
+    // 「渡したつもり」の嘘になる (workspace_root がまさにそれだった)。
+    let glue = src(GLUE);
+    let body = function_body(
+        &glue,
+        glue.find("fn team_launch_agent").expect("起動の橋"),
+    );
+    for (field, used_as) in [
+        ("spec.workspace_root", "エージェントの cwd"),
+        ("spec.role", "プリセットの選択"),
+        ("spec.name", "端末の名前"),
+    ] {
+        assert!(
+            body.contains(field),
+            "`{field}` を使っていない ({used_as} にならない):\n{body}"
+        );
+    }
+    // agent_id はセッションの結び付けに使う (呼び出し側)。
+    let run = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
+    assert!(
+        run.contains("p.bind_session(&spec.agent_id, session)"),
+        "起動したセッションを要求のエージェントへ結び付けていない"
+    );
+}
+
+#[test]
+fn 実行コンテキストを画面のいまの値で取り直さない() {
+    // **今回いちばん固定したい不変条件。**
+    // Runtime が決めた実行先を、橋渡し層が current/global state から
+    // 取り直して上書きしてはいけない。
+    let glue = src(GLUE);
+    // 起動の橋: 画面のフォルダを見ない (上の番人と対)。
+    let launch = function_body(
+        &glue,
+        glue.find("fn team_launch_agent").expect("起動の橋"),
+    );
+    assert!(!launch.contains("agent_cwd"));
+    // 計画の入口: SPEC の解決も Team の workspace が基準。
+    let plan = function_body(
+        &glue,
+        glue.find("fn team_plan_from_form").expect("計画の入口"),
+    );
+    assert!(
+        plan.contains("p.workspace().to_path_buf()"),
+        "SPEC の解決に Team の workspace を使っていない:\n{plan}"
+    );
+    assert!(
+        !plan.contains("self.agent_cwd()"),
+        "画面のいまのフォルダで SPEC を解決している"
+    );
+    // 検証の実行先は要求が運んでくる値 (`v.cwd`)。
+    let val = function_body(
+        &glue,
+        glue.find("fn team_spawn_validation").expect("検証の委譲先"),
+    );
+    assert!(
+        val.contains("let cwd = v.cwd.clone();") && !val.contains("agent_cwd"),
+        "検証の cwd を取り直している:\n{val}"
+    );
+}
+
+#[test]
+fn 別のrunのeffectを実行させない構造がある() {
+    // キューを空にする偶然ではなく、**持ち主の照合**で防いでいること。
+    let p = src(PANEL);
+    let mine = function_body(&p, p.find("fn mine<T>").expect("選り分け"));
+    assert!(
+        mine.contains("now.as_ref() == Some(&owner)"),
+        "持ち主を照合していない:\n{mine}"
+    );
+    let absorb = function_body(&p, p.find("fn absorb").expect("受け取り"));
+    assert!(
+        absorb.contains("rt.owner()"),
+        "発行時に持ち主を焼き付けていない:\n{absorb}"
+    );
+    // 4 つの取り出し口すべてが `mine` を通ること。
+    for f in [
+        "pub fn take_launches",
+        "pub fn take_instructions",
+        "pub fn take_stops",
+        "pub fn take_validations",
+    ] {
+        let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
+        assert!(body.contains("self.mine(q)"), "{f} が持ち主を見ていない");
+    }
+}
+
+#[test]
+fn 閉じるときに検証を置き去りにしない() {
+    // 札を立てるだけでは死なない (worker ごと消えるので誰も木を落とさない)。
+    let f = src(FRAME);
+    let body = function_body(&f, f.find("fn on_exit").expect("終了処理"));
+    assert!(
+        body.contains("p.shutdown()"),
+        "終了時に Team の後始末をしていない:\n{body}"
+    );
+    let p = src(PANEL);
+    let now = function_body(
+        &p,
+        p.find("pub fn stop_all_validations_now").expect("その場で落とす"),
+    );
+    assert!(
+        now.contains("crate::procx::kill_tree(pid)"),
+        "既存のプロセスツリー停止を使っていない (第 2 のプロセス管理を作らない)"
     );
 }
 

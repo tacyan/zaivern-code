@@ -735,6 +735,8 @@ pub enum TeamEventKind {
     AgentFailed,
     SubAgentReported,
     DecisionRaised,
+    /// 状態機械が拒否した遷移 (**起こったこと自体を残す**)。
+    TransitionRejected,
     DecisionResolved,
     Rejected,
     GoalCompleted,
@@ -767,6 +769,7 @@ impl TeamEventKind {
             TeamEventKind::AgentFailed => "agent_failed",
             TeamEventKind::SubAgentReported => "sub_agent_reported",
             TeamEventKind::DecisionRaised => "decision_raised",
+            TeamEventKind::TransitionRejected => "transition_rejected",
             TeamEventKind::DecisionResolved => "decision_resolved",
             TeamEventKind::Rejected => "rejected",
             TeamEventKind::GoalCompleted => "goal_completed",

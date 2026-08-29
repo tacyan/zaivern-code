@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use super::model::*;
 use super::persistence::{self, LoadOutcome};
 use super::planner::{PlanInput, StaticPlanner, TeamPlanner};
-use super::runtime::{Observation, RunOptions, TeamAction, TeamEffect, TeamRuntime};
+use super::runtime::{Observation, RunOptions, RunOwner, TeamAction, TeamEffect, TeamRuntime};
 use super::view_model::{self, TeamSnapshot};
 
 /// 画面を走査する間隔。**毎フレームは舐めない** (UI スレッドで走るので、
@@ -197,8 +197,43 @@ pub struct ValidationJob {
     pub timeout_secs: u64,
     /// 停止の札。立てると実行器がプロセスツリーごと終了させる。
     pub cancel: super::launch::CancelFlag,
+    /// いま走っている子の PID (0 = 走っていない)。
+    ///
+    /// **札だけでは足りない場面がある。** アプリを閉じるときは worker ごと
+    /// 消えるので、誰も木を落とさない (子は自分のプロセスグループを持つので
+    /// 親と一緒には死なない)。閉じる側がここを見て自分で落とす。
+    pub pid: super::launch::PidSlot,
     /// 結果の受け口 (実行 ID, タスク, 実測)。
     pub rx: std::sync::mpsc::Receiver<(String, TaskId, Vec<ValidationRun>)>,
+}
+
+/// いま面倒を見ているものの数 (workspace を切り替えてよいかの判断)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveWork {
+    /// セッションが結び付いているエージェント。
+    pub agents: usize,
+    /// 走っている検証。
+    pub validations: usize,
+    /// まだ実行していない Effect。
+    pub effects: usize,
+}
+
+impl LiveWork {
+    /// 放置すると孤児になるものがあるか。
+    pub fn is_busy(&self) -> bool {
+        self.agents > 0 || self.validations > 0 || self.effects > 0
+    }
+
+    /// 断る理由 (そのまま画面に出す)。
+    pub fn why_blocked(&self) -> String {
+        crate::i18n::trf(
+            "team.err.workspace_busy",
+            &[
+                ("agents", self.agents.to_string()),
+                ("validations", self.validations.to_string()),
+            ],
+        )
+    }
 }
 
 /// Team 画面の状態。
@@ -225,13 +260,19 @@ pub struct TeamPanel {
     /// [`TeamRuntime::note_effect_done`] へ、失敗したら
     /// [`TeamRuntime::note_effect_failed`] へ返すため。返さない限り
     /// Runtime は「済んだ」と見なさないので、途中で落ちても失われない。
-    pending_launches: Vec<(String, super::runtime::AgentLaunchSpec)>,
+    /// **持ち主 (`RunOwner`) を必ず添える。** 実行の直前にもう一度
+    /// 突き合わせ、いまの Run のものでなければ実行しない — workspace を
+    /// 切り替えた瞬間に前の Run の仕事が新しいフォルダで動くのを、
+    /// キューを空にする偶然ではなく**構造で**防ぐ。
+    pending_launches: Vec<(RunOwner, String, super::runtime::AgentLaunchSpec)>,
     /// 実行を頼んだ検証。
-    pending_validations: Vec<(String, super::runtime::ValidationSpec)>,
+    pending_validations: Vec<(RunOwner, String, super::runtime::ValidationSpec)>,
     /// 停止を頼んだセッション。
-    pending_stops: Vec<(String, SessionId)>,
-    /// 送るべき指示 (冪等キー, セッション ID, 本文)。
-    pending_instructions: Vec<(String, SessionId, String)>,
+    pending_stops: Vec<(RunOwner, String, SessionId)>,
+    /// 送るべき指示 (持ち主, 冪等キー, セッション ID, 本文)。
+    pending_instructions: Vec<(RunOwner, String, (SessionId, String))>,
+    /// 別の Run のものとして捨てた Effect の数 (診断とテストが見る)。
+    dropped_effects: usize,
     /// 保存が要るか。
     needs_save: bool,
     workspace: PathBuf,
@@ -287,6 +328,7 @@ impl Default for TeamPanel {
             next_scan: None,
             next_launch_poll: None,
             validation_jobs: Vec::new(),
+            dropped_effects: 0,
         }
     }
 }
@@ -307,23 +349,83 @@ impl TeamPanel {
     }
 
     /// 状態の置き場 (`<根>/team/<ワークスペースキー>/`)。
+    /// いま面倒を見ている workspace。**計画も SPEC の解決もここを基準にする。**
+    ///
+    /// 画面の「いまのフォルダ」(`agent_cwd`) と食い違うことがある — 実行中の
+    /// Run があると切り替えを断るため。基準を 2 つ持つと、Run の workspace と
+    /// 違う場所の SPEC を読む・違う場所でエージェントを起こす、が起きる。
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     fn state_dir(&self) -> PathBuf {
         persistence::team_dir_in(&self.home, &self.workspace)
     }
 
-    /// ワークスペースを設定し、保存済みの Run があれば知らせる。
-    pub fn attach_workspace(&mut self, ws: &Path) {
-        if self.workspace == ws {
-            return;
+    /// **いま面倒を見ているものがあるか。**
+    ///
+    /// あるうちは workspace を切り替えない — 切り替えると Runtime への参照が
+    /// 消えて、**画面から消えたのに裏で動き続けるエージェントと検証**が残る
+    /// (誰も結果を受け取らず、誰も止められない)。
+    ///
+    /// **`runtime.is_some()` では広すぎる。** 計画しただけ・停止し終えた
+    /// Run で永久に切り替え不能になる。見るのは「放置すると孤児になるもの」:
+    ///
+    /// * セッションが結び付いているエージェント
+    /// * 走っている検証
+    /// * まだ実行していない Effect
+    pub fn live_work(&self) -> LiveWork {
+        let Some(rt) = self.runtime.as_ref() else {
+            return LiveWork::default();
+        };
+        LiveWork {
+            agents: rt
+                .agents()
+                .iter()
+                .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
+                .count(),
+            validations: self.validation_jobs.len(),
+            effects: self.pending_launches.len()
+                + self.pending_instructions.len()
+                + self.pending_stops.len()
+                + self.pending_validations.len(),
         }
+    }
+
+    /// ワークスペースを設定し、保存済みの Run があれば知らせる。
+    ///
+    /// **実行中のものがあれば切り替えない。** 断った理由をそのまま返す
+    /// (黙って無視すると、利用者は「押したのに何も起きない」を見る)。
+    pub fn attach_workspace(&mut self, ws: &Path) -> Result<(), String> {
+        if self.workspace == ws {
+            return Ok(());
+        }
+        let live = self.live_work();
+        if live.is_busy() {
+            let why = live.why_blocked();
+            self.notice = why.clone();
+            return Err(why);
+        }
+        // ここへ来るのは「面倒を見ているものが無い」ときだけ。それでも
+        // **捨てる前に後始末をする** — 走り出しかけた検証と、書き残しの
+        // 保存を置き去りにしない。
+        self.cancel_all_validations();
+        self.validation_jobs.clear();
+        self.pending_launches.clear();
+        self.pending_instructions.clear();
+        self.pending_stops.clear();
+        self.pending_validations.clear();
+        self.save_if_needed();
         self.workspace = ws.to_path_buf();
         self.runtime = None;
         self.snapshot = None;
+        self.read_only = false;
         self.restore = if persistence::has_run(&self.state_dir()) {
             RestorePrompt::Found
         } else {
             RestorePrompt::None
         };
+        Ok(())
     }
 
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
@@ -523,15 +625,25 @@ impl TeamPanel {
     }
 
     fn absorb(&mut self, effects: Vec<TeamEffect>) {
+        // **発行した瞬間の持ち主を焼き付ける。** あとから「いまの Runtime」を
+        // 見て決めると、切り替わった後の値になってしまう。
+        let Some(owner) = self.runtime.as_ref().map(|rt| rt.owner()) else {
+            return;
+        };
         for e in effects {
             let key = e.key();
             match e {
-                TeamEffect::StartAgent(s) => self.pending_launches.push((key, s)),
-                TeamEffect::SendInstruction { session, text, .. } => {
-                    self.pending_instructions.push((key, session, text))
+                TeamEffect::StartAgent(s) => {
+                    self.pending_launches.push((owner.clone(), key, s))
                 }
-                TeamEffect::StopAgent(s) => self.pending_stops.push((key, s)),
-                TeamEffect::RunValidation(v) => self.pending_validations.push((key, v)),
+                TeamEffect::SendInstruction { session, text, .. } => {
+                    self.pending_instructions
+                        .push((owner.clone(), key, (session, text)))
+                }
+                TeamEffect::StopAgent(s) => self.pending_stops.push((owner.clone(), key, s)),
+                TeamEffect::RunValidation(v) => {
+                    self.pending_validations.push((owner.clone(), key, v))
+                }
                 TeamEffect::RequestHumanApproval(_) => {
                     // 判断は Runtime が保持していて、画面が Mission Panel で出す。
                     // ここで別の入れ物へ写すと第 2 の真実になる。
@@ -569,21 +681,66 @@ impl TeamPanel {
         self.dirty = true;
     }
 
+    /// いまの Run の持ち主。Run が無ければ `None`。
+    pub fn owner(&self) -> Option<RunOwner> {
+        self.runtime.as_ref().map(|rt| rt.owner())
+    }
+
+    /// **いまの Run のものだけを渡す。** 持ち主が違うものは捨てる
+    /// (別の workspace / 別の Run で実行させない)。捨てた件数を数える。
+    fn mine<T>(&mut self, q: Vec<(RunOwner, String, T)>) -> Vec<(String, T)> {
+        let now = self.owner();
+        let mut out = Vec::with_capacity(q.len());
+        let mut dropped = 0usize;
+        for (owner, key, v) in q {
+            if now.as_ref() == Some(&owner) {
+                out.push((key, v));
+            } else {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            // **黙って捨てない。** 画面には「前の Run の仕事を実行しなかった」
+            // ことが出る (何も起きないまま消えると、利用者は理由を追えない)。
+            self.dropped_effects = self.dropped_effects.saturating_add(dropped);
+            self.notice = crate::i18n::trf(
+                "team.notice.dropped_effects",
+                &[("n", dropped.to_string())],
+            );
+        }
+        out
+    }
+
+    /// 別の Run のものとして捨てた Effect の数。
+    ///
+    /// 画面へは `notice` で出る (上の `mine`)。この数を読むのはテストだけ。
+    #[cfg(test)]
+    pub fn dropped_effects(&self) -> usize {
+        self.dropped_effects
+    }
+
     /// 起動してほしいエージェント (冪等キー付き。取り出したら消える)。
     pub fn take_launches(&mut self) -> Vec<(String, super::runtime::AgentLaunchSpec)> {
-        std::mem::take(&mut self.pending_launches)
+        let q = std::mem::take(&mut self.pending_launches);
+        self.mine(q)
     }
     /// 送ってほしい指示 (冪等キー付き。取り出したら消える)。
     pub fn take_instructions(&mut self) -> Vec<(String, SessionId, String)> {
-        std::mem::take(&mut self.pending_instructions)
+        let q = std::mem::take(&mut self.pending_instructions);
+        self.mine(q)
+            .into_iter()
+            .map(|(k, (s, t))| (k, s, t))
+            .collect()
     }
     /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
     pub fn take_stops(&mut self) -> Vec<(String, SessionId)> {
-        std::mem::take(&mut self.pending_stops)
+        let q = std::mem::take(&mut self.pending_stops);
+        self.mine(q)
     }
     /// 走らせてほしい検証 (冪等キー付き。取り出したら消える)。
     pub fn take_validations(&mut self) -> Vec<(String, super::runtime::ValidationSpec)> {
-        std::mem::take(&mut self.pending_validations)
+        let q = std::mem::take(&mut self.pending_validations);
+        self.mine(q)
     }
 
     /// 起動したセッションを結び付ける。
@@ -643,11 +800,54 @@ impl TeamPanel {
     }
 
     /// 走っている検証を全部止める (Run を閉じる / 破棄するとき)。戻りは件数。
+    ///
+    /// **札を立てるだけ。** worker が次の刻みで木を落として `Cancelled` を
+    /// 戻すので、結果を受け取る口はそのまま残す (捨てると Runtime が
+    /// 永久に待つ)。アプリを閉じるときだけは待てないので
+    /// [`Self::stop_all_validations_now`] を使う。
     pub fn cancel_all_validations(&mut self) -> usize {
         for j in &self.validation_jobs {
             j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.running_validations()
+    }
+
+    /// **アプリを閉じるときの後始末。**
+    ///
+    /// この状態は `thread_local!` に居るので、`ZaivernApp` より長生きする。
+    /// 生き残った Runtime を次のアプリが拾うと、**もう居ないセッションへ
+    /// 結び付いたまま**の状態を新しい画面が見ることになる。保存してから
+    /// 手放し、次回は保存経路 (`restore`) から入り直す — そこで結び付きは
+    /// 必ず外れる。走っている検証はその場で落とす (札だけでは死なない)。
+    pub fn shutdown(&mut self) -> usize {
+        let killed = self.stop_all_validations_now();
+        self.pending_launches.clear();
+        self.pending_instructions.clear();
+        self.pending_stops.clear();
+        self.pending_validations.clear();
+        self.save_if_needed();
+        self.runtime = None;
+        self.snapshot = None;
+        self.restore = RestorePrompt::None;
+        killed
+    }
+
+    /// **その場でプロセスツリーごと落とす** (アプリの終了時)。
+    ///
+    /// 札を立てて worker に任せる余裕が無いときに使う。戻りは落とした件数。
+    /// 既存の [`crate::procx::kill_tree`] を使う — Team 専用の第 2 の
+    /// プロセス管理は作らない。
+    pub fn stop_all_validations_now(&mut self) -> usize {
+        let mut killed = 0usize;
+        for j in std::mem::take(&mut self.validation_jobs) {
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            let pid = j.pid.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                crate::procx::kill_tree(pid);
+                killed += 1;
+            }
+        }
+        killed
     }
 
     /// 終わった検証を取り込む。**待たない** (`try_recv`)。
@@ -787,7 +987,7 @@ mod tests {
     fn panel_at(dir: &Path) -> TeamPanel {
         let mut p = TeamPanel::default();
         p.home = dir.join(".zaivern-test-home");
-        p.attach_workspace(dir);
+        p.attach_workspace(dir).expect("新しい画面は必ず attach できる");
         p
     }
 
@@ -843,6 +1043,217 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 起動要求が出るところまで進めた画面。
+    fn started_panel(dir: &Path) -> TeamPanel {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut p = panel_at(dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        p
+    }
+
+    #[test]
+    fn 起動要求はrunのworkspaceを運ぶ() {
+        // **Runtime が決めた実行先を、実行側が取り直さないための材料。**
+        // 要求そのものに workspace が載っていなければ、app は
+        // 「いまの画面のフォルダ」を見るしかなくなる。
+        let dir = ws("launch-ws");
+        let mut p = started_panel(&dir);
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "起動要求が出ていない");
+        for (_, spec) in &launches {
+            assert_eq!(
+                spec.workspace_root, p.workspace,
+                "起動要求が Run の workspace を運んでいない"
+            );
+            // 飾りのフィールドを残さない (役割と名前は指示文と端末名に出る)。
+            assert!(!spec.name.trim().is_empty(), "名前が空");
+            assert!(!spec.team_id.0.trim().is_empty(), "所属チームが空");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 実行中は別のworkspaceへ切り替えない() {
+        // **画面から消えたのに裏で動き続ける**エージェントと検証を作らない。
+        let a = ws("switch-a");
+        let b = ws("switch-b");
+        std::fs::create_dir_all(&b).unwrap();
+        let mut p = started_panel(&a);
+        // 起動要求が残っている = まだ面倒を見ている
+        assert!(p.live_work().is_busy(), "実行中と見なされていない");
+        let before = p.workspace.clone();
+        let err = p.attach_workspace(&b).expect_err("切り替えを許してしまった");
+        assert!(!err.trim().is_empty(), "断った理由が空");
+        assert_eq!(p.workspace, before, "workspace が変わってしまった");
+        assert!(p.has_run(), "Runtime を捨ててしまった");
+        assert!(!p.take_launches().is_empty(), "抱えていた仕事まで消えた");
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn 走っている検証があるうちは切り替えない() {
+        let a = ws("switch-val-a");
+        let b = ws("switch-val-b");
+        std::fs::create_dir_all(&b).unwrap();
+        let mut p = started_panel(&a);
+        // 仕事を全部片付けてから、検証だけを走らせる。
+        let _ = p.take_launches();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            task: 1,
+            execution: "x".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: super::super::launch::new_cancel_flag(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+        assert_eq!(p.live_work().validations, 1);
+        assert!(p.attach_workspace(&b).is_err(), "検証を孤児にした");
+        assert_eq!(p.running_validations(), 1, "検証の管理を手放した");
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn 面倒を見るものが無ければ切り替えられる() {
+        // **`runtime.is_some()` で永久に断らない。** 計画しただけの Run は
+        // 誰も動かしていないので、切り替えてよい。
+        let a = ws("switch-idle-a");
+        let b = ws("switch-idle-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut p = panel_at(&a);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        assert!(!p.live_work().is_busy(), "計画しただけで実行中と見なした");
+        p.attach_workspace(&b).expect("切り替えられるべき");
+        assert_eq!(p.workspace, b);
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn 別のrunのeffectは実行させない() {
+        // 切り替えを断る仕組みだけに頼らない。**持ち主が違う Effect は
+        // 渡さない**という構造の検査 (キューが空になる偶然に頼らない)。
+        let a = ws("owner-a");
+        let b = ws("owner-b");
+        std::fs::create_dir_all(&b).unwrap();
+        let mut p = started_panel(&a);
+        assert!(!p.pending_launches.is_empty());
+        // 別の Run へ差し替える (workspace ごと作り直す = 切り替えと同じ状況)。
+        p.workspace = b.clone();
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        assert!(
+            p.take_launches().is_empty(),
+            "前の Run の起動要求を新しい Run で実行しようとした"
+        );
+        assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
+        assert!(!p.notice.trim().is_empty(), "黙って捨てている");
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn 指示と停止と検証も持ち主で選り分ける() {
+        let a = ws("owner-all");
+        let b = ws("owner-all-b");
+        std::fs::create_dir_all(&b).unwrap();
+        let mut p = started_panel(&a);
+        // 4 つの口すべてに、前の Run のものを積む。
+        let owner = p.owner().expect("持ち主");
+        p.pending_instructions
+            .push((owner.clone(), "instr:x".into(), (7, "hi".into())));
+        p.pending_stops.push((owner.clone(), "stop:7".into(), 7));
+        p.pending_validations.push((
+            owner,
+            "validate:x".into(),
+            super::super::runtime::ValidationSpec {
+                task: 1,
+                execution: "x".into(),
+                commands: vec!["cargo test a".into()],
+                cwd: a.clone(),
+                timeout_secs: 600,
+            },
+        ));
+        p.workspace = b.clone();
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        assert!(p.take_launches().is_empty(), "起動が漏れた");
+        assert!(p.take_instructions().is_empty(), "指示が漏れた");
+        assert!(p.take_stops().is_empty(), "停止が漏れた");
+        assert!(p.take_validations().is_empty(), "検証が漏れた");
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn run破棄は走っている検証を先に止める() {
+        let dir = ws("discard-cancel");
+        let mut p = started_panel(&dir);
+        let cancel = super::super::launch::new_cancel_flag();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            task: 1,
+            execution: "x".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+        p.discard_run().expect("破棄できる");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "破棄したのに検証を止めていない (プロセスが残る)"
+        );
+        assert!(!p.has_run());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 閉じるときは保存して手放し検証も落とす() {
+        // **状態はアプリより長生きする** (`thread_local!`)。持ったまま次の
+        // アプリへ渡すと、もう居ないセッションへ結び付いた Runtime を
+        // 新しい画面が見ることになる。
+        let dir = ws("shutdown");
+        let mut p = started_panel(&dir);
+        let cancel = super::super::launch::new_cancel_flag();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            task: 1,
+            execution: "x".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+        assert!(p.has_run());
+        p.shutdown();
+        assert!(!p.has_run(), "Runtime を手放していない");
+        assert_eq!(p.running_validations(), 0, "検証を抱えたまま閉じた");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "検証を止めずに閉じた"
+        );
+        assert!(p.take_launches().is_empty(), "未実行の仕事が残っている");
+        // 保存はされているので、次回は復元から入り直せる。
+        assert!(
+            persistence::has_run(&persistence::team_dir_in(&p.home, &dir)),
+            "保存せずに手放した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn 実行側の返事が来るまで完了扱いにしない() {
         // **画面 (app) が Effect を実行し、成功を返して初めて済んだことになる。**
@@ -892,6 +1303,7 @@ mod tests {
             started_at: super::super::model::now_secs(),
             timeout_secs: 600,
             cancel: super::super::launch::new_cancel_flag(),
+            pid: super::super::launch::new_pid_slot(),
             rx,
         });
         tx
@@ -954,6 +1366,7 @@ mod tests {
                 .saturating_sub(60 + WATCHDOG_SLACK_SECS + 10),
             timeout_secs: 60,
             cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
             rx,
         });
         p.collect_validations();

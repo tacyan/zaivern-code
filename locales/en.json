@@ -4645,6 +4645,8 @@
   "team.inspector.edit_hint": "What the next assignee should know",
   "team.inspector.edit_instruction": "Extra instruction",
   "team.inspector.failed": "failed",
+  "team.err.workspace_busy": "A Team Run is still working ({agents} agent(s), {validations} validation(s)). Stop or finish it before changing workspace.",
+  "team.notice.dropped_effects": "Skipped {n} pending action(s) that belonged to the previous run.",
   "team.validation.timed_out": "timed out",
   "team.validation.cancelled": "cancelled",
   "team.validation.spawn_failed": "could not start",

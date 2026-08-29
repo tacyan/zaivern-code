@@ -4645,6 +4645,8 @@
   "team.inspector.edit_hint": "次の担当へ渡したいことを書く",
   "team.inspector.edit_instruction": "追加の指示",
   "team.inspector.failed": "失敗",
+  "team.err.workspace_busy": "Team Run が実行中です (エージェント {agents} 体 / 検証 {validations} 件)。停止または完了してからワークスペースを変更してください",
+  "team.notice.dropped_effects": "前の Run の未実行の仕事を {n} 件、実行せずに捨てました",
   "team.validation.timed_out": "時間切れ",
   "team.validation.cancelled": "停止しました",
   "team.validation.spawn_failed": "起動できませんでした",

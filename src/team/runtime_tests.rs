@@ -2018,6 +2018,240 @@ fn 検証の世代を進める場所は一つだけ() {
     );
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  実行コンテキストは、生成地点から実行地点まで運ぶ
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 断られた遷移は黙殺せず記録に残す() {
+    // **fail-closed で「そのまま」にするのは正しい。** ただし黙って
+    // 無かったことにすると「押したのに何も起きない」を誰も追えない。
+    let (mut rt, sids, tid) = to_assigned();
+    let before = rt.rejected_transitions();
+    // 完了したタスクへ、あとから報告が流れてくる筋書き。
+    rt.set_state_for_test(tid, TeamTaskState::Completed);
+    report_and_collect(&mut rt, &sids, tid, 12);
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Completed,
+        "完了から動いてしまった"
+    );
+    assert!(
+        rt.rejected_transitions() > before,
+        "断ったことを記録に残していない"
+    );
+    assert!(
+        rt.events()
+            .any(|e| e.kind == TeamEventKind::TransitionRejected),
+        "事象として見えない"
+    );
+}
+
+#[test]
+fn 復元後の状態を表で固定する() {
+    // **11 状態すべてについて、復元後にどうなるかを表で決める。**
+    // ここが曖昧だと「担当が居ないのに Running のまま待ち続ける」
+    // 「出来上がった成果を捨ててもう一度実装させる」が静かに起きる。
+    use TeamTaskState::*;
+    // (保存時の状態, 復元後の状態, 担当を外すか)
+    let table: [(TeamTaskState, TeamTaskState, bool); 11] = [
+        // 依存待ち・配布待ちはそのまま。
+        (Pending, Pending, false),
+        (Ready, Ready, false),
+        // **担当が居ないと進まない状態**は空けて Ready へ。
+        (Assigned, Ready, true),
+        (Running, Ready, true),
+        // 検証は Zaivern 自身が走らせるので、成果を捨てずに再開できる。
+        (Validating, Validating, true),
+        // レビュー待ちの本体はそのまま (レビュータスク側が配り直される)。
+        (Reviewing, Reviewing, true),
+        // 人・依存を待っている状態は動かさない。
+        (Blocked, Blocked, true),
+        (RevisionRequired, RevisionRequired, true),
+        (Failed, Failed, true),
+        (NeedsUser, NeedsUser, true),
+        (Completed, Completed, true),
+    ];
+    for (saved_state, want, _) in table {
+        let mut rt = started(4);
+        let e = rt.tick(&obs(10, &[]));
+        let mut next = 1;
+        let sids = bind_all(&mut rt, &e, &mut next);
+        idle_tick(&mut rt, 11, &sids);
+        let tid = assignments(&rt)[0].1;
+        rt.set_state_for_test(tid, saved_state);
+        let r = TeamRuntime::restore(rt.to_saved(), ws());
+        let t = r.task(tid).expect("タスク");
+        assert_eq!(
+            t.state, want,
+            "{saved_state:?} を復元したら {:?} になった (期待 {want:?})",
+            t.state
+        );
+        // **セッションはどれも生き残っていない。** 結び付きは必ず外れる。
+        assert_eq!(
+            t.assigned_session, None,
+            "{saved_state:?}: 死んだセッションを引き継いだ"
+        );
+        assert_eq!(t.coordinator_task, None, "{saved_state:?}: 調停層の紐が残った");
+        assert!(
+            !t.validation.running,
+            "{saved_state:?}: 走っていない検証を実行中のままにした"
+        );
+        for a in r.agents() {
+            assert_eq!(a.session_id, None, "{saved_state:?}: エージェントの結び付きが残った");
+        }
+    }
+}
+
+#[test]
+fn 復元しても死んだセッションへは指示を出さない() {
+    let (rt, sids, tid) = to_assigned();
+    let dead = rt.task(tid).unwrap().assigned_session.expect("担当");
+    let mut r = TeamRuntime::restore(rt.to_saved(), ws());
+    r.apply_action(TeamAction::Start);
+    // **観測に死んだセッションは出てこない。** それでも指示は出ない。
+    let eff = r.tick(&obs(20, &[]));
+    for x in &eff {
+        if let TeamEffect::SendInstruction { session, .. } = x {
+            assert_ne!(*session, dead, "復元後に死んだセッションへ指示を出した");
+        }
+    }
+    let _ = sids;
+}
+
+#[test]
+fn 起動要求はruntimeのworkspaceを運ぶ() {
+    // **不変条件**: `TeamRuntime.workspace == AgentLaunchSpec.workspace_root`。
+    // ここが崩れると、実行側は「いまの画面のフォルダ」を見るしかなくなる。
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let specs: Vec<_> = eff
+        .iter()
+        .filter_map(|e| match e {
+            TeamEffect::StartAgent(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!specs.is_empty(), "起動要求が出ていない");
+    for s in &specs {
+        assert_eq!(s.workspace_root, rt.workspace(), "Run の workspace と違う");
+        // 飾りのフィールドを残さない。
+        assert!(!s.name.trim().is_empty());
+        assert!(!s.agent_id.0.trim().is_empty());
+        assert!(!s.team_id.0.trim().is_empty());
+    }
+    // 持ち主も同じ workspace を指す。
+    assert_eq!(rt.owner().workspace, rt.workspace());
+    assert_eq!(rt.owner().run_id, rt.run().run_id);
+}
+
+#[test]
+fn 検証の実行先もruntimeのworkspaceになる() {
+    let (mut rt, sids, tid) = to_assigned();
+    let eff = report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let v = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::RunValidation(v) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("検証の発行");
+    assert_eq!(v.cwd, rt.workspace(), "検証を別の場所で走らせている");
+}
+
+#[test]
+fn 完了したタスクは自動では戻らない() {
+    // 状態機械の終端。**自動処理からは 1 経路も出られない。**
+    for to in [
+        TeamTaskState::Ready,
+        TeamTaskState::Assigned,
+        TeamTaskState::Running,
+        TeamTaskState::Validating,
+        TeamTaskState::Reviewing,
+        TeamTaskState::Failed,
+        TeamTaskState::NeedsUser,
+        TeamTaskState::Blocked,
+    ] {
+        assert!(
+            super::state_machine::apply(TeamTaskState::Completed, to).is_err(),
+            "Completed から {to:?} へ自動で戻れてしまう"
+        );
+    }
+    // 実物でも: 完了したタスクへ報告が来ても動かない。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    validate_ok(&mut rt, tid);
+    let rev = rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(tid))
+        .map(|t| t.id)
+        .expect("レビュータスク");
+    idle_tick(&mut rt, 13, &sids);
+    let rev_sid = rt
+        .task(rev)
+        .and_then(|t| t.assigned_session)
+        .unwrap_or(sids[0]);
+    tick_text(&mut rt, 14, &sids, rev_sid, &review_block(tid, true));
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Completed);
+    // もう一度同じ報告が流れてきても完了のまま。
+    tick_text(&mut rt, 15, &sids, rev_sid, &review_block(tid, false));
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Completed,
+        "完了したタスクが差し戻された"
+    );
+}
+
+#[test]
+fn レビューは実装したのと別のセッションが持つ() {
+    let (mut rt, sids, tid) = to_assigned();
+    let impl_sid = rt.task(tid).unwrap().assigned_session.expect("実装担当");
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    validate_ok(&mut rt, tid);
+    idle_tick(&mut rt, 13, &sids);
+    let rev = rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(tid))
+        .expect("レビュータスク")
+        .clone();
+    if let Some(rev_sid) = rev.assigned_session {
+        assert_ne!(
+            rev_sid, impl_sid,
+            "実装したセッションが自分のコードをレビューしている"
+        );
+    }
+}
+
+#[test]
+fn 調停層が断ったら指示も出さない() {
+    // **`coordinator` を迂回しない。** 断られたタスクは割り当てられず、
+    // 割り当てられていない相手へ指示を送らない。
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    let eff = idle_tick(&mut rt, 11, &sids);
+    let assigned: Vec<TaskId> = assignments(&rt).iter().map(|(_, t, _)| *t).collect();
+    for x in &eff {
+        if let TeamEffect::SendInstruction { session, .. } = x {
+            let owner = rt
+                .tasks()
+                .iter()
+                .find(|t| t.assigned_session == Some(*session))
+                .map(|t| t.id);
+            assert!(
+                owner.is_some_and(|t| assigned.contains(&t)),
+                "割り当てられていない相手へ指示を出した: session={session}"
+            );
+        }
+    }
+    // 依存が残っているタスクは配られず、指示も出ない。
+    let integ = rt.tasks().last().expect("統合タスク").id;
+    assert!(!assigned.contains(&integ));
+}
+
 #[test]
 fn 迂回してよい場所は二か所だけ() {
     // **`sm::force` を増やしたらここが赤くなる。** 増やすなら、その場所と
