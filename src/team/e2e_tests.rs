@@ -58,6 +58,7 @@ impl Lab {
                 source: "SPEC.md".into(),
                 agent_count: agents,
                 review_required: true,
+                roles: Vec::new(),
             })
             .expect("計画できるべき");
         let mut rt = TeamRuntime::from_plan(

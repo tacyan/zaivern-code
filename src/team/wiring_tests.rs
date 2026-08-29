@@ -307,13 +307,18 @@ fn cli起動とgui起動は同じruntimeを通る() {
         glue.contains("p.plan(&req.spec_text"),
         "GUI が投函された SPEC で計画していない"
     );
-    // 投函経由も、GUI のフォーム経由も、同じ `TeamPanel::plan` を通る
+    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本へ落ちる
     assert!(
-        glue.matches("p.plan(").count() >= 2,
+        glue.contains("p.plan(&req.spec_text") && glue.contains("p.plan_with("),
         "CLI 経由と GUI 経由で入口が分かれている"
     );
 
     let panel = src(PANEL);
+    // `plan` は `plan_with` へ委譲するだけ。計画を建てる本体は 1 つ。
+    assert!(
+        panel.contains("self.plan_with(spec_text, source, opts, Vec::new(), \"\")"),
+        "plan が plan_with へ委譲していない (実装が 2 本になる)"
+    );
     assert!(
         panel.contains("TeamRuntime::from_plan"),
         "Runtime を建てるのが TeamPanel::plan の 1 か所でない"
@@ -360,5 +365,48 @@ fn yesで省けるのはstart_teamの確認だけ() {
     assert!(
         body.contains("if opts.dry_run || !opts.yes"),
         "reset が確認なしで消せてしまう"
+    );
+}
+
+#[test]
+fn フォームの入力欄はすべて何かを変える() {
+    // **押せるのに何も起きない入力欄を残さない。** New Team Run の各項目が
+    // 実際にどこかへ渡っていることを、静的に固定する。
+    let glue = src(GLUE);
+    let body = function_body(&glue, glue.find("fn team_plan_from_form").expect("計画の橋"));
+    for (field, needle) in [
+        ("goal_name", "form.goal_name.clone()"),
+        ("roles", "form.roles.clone()"),
+        ("agents", "agent_count: form.agents"),
+        ("max_attempts", "max_attempts: form.max_attempts"),
+        ("review_required", "review_required: form.review_required"),
+        ("spec_path", "form.spec_path"),
+        ("spec_text", "form.spec_text.clone()"),
+        ("from_file", "if form.from_file"),
+        (
+            "approval_mode / cost_limit",
+            "self.set_team_guardrails(&form.approval_mode, form.cost_limit)",
+        ),
+    ] {
+        assert!(
+            body.contains(needle),
+            "フォームの `{field}` がどこにも渡っていない"
+        );
+    }
+    // 承認モードとコスト上限は**既存の設定**へ流す (第 2 の真実を作らない)
+    let guard = function_body(&glue, glue.find("fn set_team_guardrails").expect("反映の橋"));
+    assert!(guard.contains("self.cfg.approval_mode"), "既存の承認モードへ流していない");
+    assert!(
+        guard.contains("self.cfg.cost_limit_session"),
+        "既存のコスト上限へ流していない"
+    );
+    assert!(
+        guard.contains("crate::config::save_state(&self.cfg)"),
+        "既存の保存経路を使っていない"
+    );
+    // 未知の値は ask へ倒す
+    assert!(
+        guard.contains("\"auto\" | \"agent\" => approval_mode,") && guard.contains("_ => \"ask\","),
+        "読めない承認モードを自動側へ倒している"
     );
 }

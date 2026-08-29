@@ -432,8 +432,10 @@ impl ZaivernApp {
             max_attempts: form.max_attempts,
             review_required: form.review_required,
         };
+        let roles = form.roles.clone();
+        let title = form.goal_name.clone();
         let r = panel::with_panel(|p| {
-            let r = p.plan(&spec_text, &source, opts);
+            let r = p.plan_with(&spec_text, &source, opts, roles, &title);
             if r.is_ok() {
                 p.form.open = false;
                 p.form.error.clear();
@@ -442,8 +444,39 @@ impl ZaivernApp {
             r
         });
         match r {
-            Ok(()) => self.toast(tr("team.toast.plan_preview"), true),
+            Ok(()) => {
+                // **承認モードとコスト上限は既存の仕組みへ渡す。**
+                // Team 専用の第 2 の真実を作らない — 起動時の承認判定も
+                // 送信時のコスト遮断も、既存の 1 本がそのまま効く。
+                self.set_team_guardrails(&form.approval_mode, form.cost_limit);
+                self.toast(tr("team.toast.plan_preview"), true);
+            }
             Err(e) => panel::with_panel(|p| p.form.error = e),
+        }
+    }
+
+    /// フォームの承認モードとコスト上限を、**既存の設定**へ反映する。
+    ///
+    /// Team だけの承認判定やコスト判定を作らないのが要で、こうしておくと
+    /// 「Cockpit では止まるのに Team では止まらない」が構造的に起こらない。
+    fn set_team_guardrails(&mut self, approval_mode: &str, cost_limit: f32) {
+        // 未知の値は `ask` へ倒す (読めない設定を「自動でよい」と読まない)。
+        let mode = match approval_mode {
+            "auto" | "agent" => approval_mode,
+            _ => "ask",
+        };
+        let mut changed = self.cfg.approval_mode != mode;
+        self.cfg.approval_mode = mode.to_string();
+        self.cfg.global_approval_mode = mode.to_string();
+        // 0 は「上限なし」。既存の cost_limit_session と同じ意味。
+        let limit = cost_limit.max(0.0);
+        if (self.cfg.cost_limit_session - limit).abs() > f32::EPSILON {
+            self.cfg.cost_limit_session = limit;
+            changed = true;
+        }
+        if changed {
+            // 既存の保存経路をそのまま使う (Team だけ別の書き方をしない)。
+            crate::config::save_state(&self.cfg);
         }
     }
 

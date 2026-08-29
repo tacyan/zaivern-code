@@ -381,6 +381,7 @@ fn plan_from_spec(spec_path: &Path, ws: &Path, agents: usize) -> Result<TeamPlan
             source: spec_path.display().to_string(),
             agent_count: agents,
             review_required: true,
+            roles: Vec::new(),
         })
         .map_err(|e| e.detail())
 }
@@ -662,6 +663,7 @@ mod tests {
                 source: "SPEC.md".into(),
                 agent_count: 4,
                 review_required: true,
+                roles: Vec::new(),
             })
             .unwrap();
         let s = render_plan(&plan, 4);

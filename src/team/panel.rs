@@ -280,13 +280,25 @@ impl TeamPanel {
     }
 
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
-    pub fn plan(&mut self, spec_text: &str, source: &str, opts: RunOptions) -> Result<(), String> {
+    ///
+    /// `roles` はフォームの「エージェントプリセット」、`title_override` は
+    /// 「Goal 名」。**どちらも実際に計画へ効く** — 選べるのに何も変わらない
+    /// 入力欄を残さない。
+    pub fn plan_with(
+        &mut self,
+        spec_text: &str,
+        source: &str,
+        opts: RunOptions,
+        roles: Vec<TeamRole>,
+        title_override: &str,
+    ) -> Result<(), String> {
         let plan = StaticPlanner
             .plan(PlanInput {
                 spec: spec_text.to_string(),
                 source: source.to_string(),
                 agent_count: opts.agent_count,
                 review_required: opts.review_required,
+                roles,
             })
             .map_err(|e| e.detail())?;
         // **配る前に計画そのものを検証する。**
@@ -299,12 +311,22 @@ impl TeamPanel {
                 .join("\n"));
         }
         let ws = self.workspace.clone();
-        self.runtime = Some(TeamRuntime::from_plan(plan, ws, opts));
+        let mut rt = TeamRuntime::from_plan(plan, ws, opts);
+        let t = title_override.trim();
+        if !t.is_empty() {
+            rt.rename_goal(t);
+        }
+        self.runtime = Some(rt);
         self.read_only = false;
         self.restore = RestorePrompt::None;
         self.dirty = true;
         self.needs_save = true;
         Ok(())
+    }
+
+    /// 既定のプリセットで計画する (CLI 経由と、表題を SPEC から起こす場合)。
+    pub fn plan(&mut self, spec_text: &str, source: &str, opts: RunOptions) -> Result<(), String> {
+        self.plan_with(spec_text, source, opts, Vec::new(), "")
     }
 
     /// 保存された Run を復元する。
@@ -621,6 +643,41 @@ mod tests {
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Ready);
         p.act(TeamAction::Start);
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Running);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
+    }
+
+    #[test]
+    fn フォームの入力はすべて計画に効く() {
+        use super::super::model::TeamRole as R;
+        let mut p = TeamPanel::default();
+        let dir = ws("form-effect");
+        std::fs::create_dir_all(&dir).unwrap();
+        p.attach_workspace(&dir);
+        p.plan_with(
+            SPEC,
+            "SPEC.md",
+            RunOptions {
+                agent_count: 2,
+                max_attempts: 5,
+                review_required: false,
+                ..RunOptions::default()
+            },
+            vec![R::Architect, R::Implementer],
+            "私が付けた名前",
+        )
+        .unwrap();
+        let rt = p.runtime.as_ref().unwrap();
+        // Goal 名が効く
+        assert_eq!(rt.goal().title, "私が付けた名前");
+        // 役割の選択が効く (設計レーンが立つ)
+        assert!(rt.teams().iter().any(|t| t.id.as_str() == "architecture"));
+        // レビューを外したので QA レーンは立たない
+        assert!(!rt.teams().iter().any(|t| t.id.as_str() == "qa"));
+        // 最大試行回数と最大エージェント数が効く
+        assert_eq!(rt.run().max_attempts, 5);
+        assert_eq!(rt.run().agent_count, 2);
+        assert!(!rt.run().review_required);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }

@@ -42,6 +42,7 @@ pub fn started(agents: usize) -> TeamRuntime {
             source: "SPEC.md".into(),
             agent_count: agents,
             review_required: true,
+            roles: Vec::new(),
         })
         .expect("計画できるべき");
     let mut rt = TeamRuntime::from_plan(
@@ -528,6 +529,7 @@ fn 不正なspecでもpanicしない() {
         source: "SPEC.md".into(),
         agent_count: 4,
         review_required: true,
+        roles: Vec::new(),
     });
     assert!(bad.is_err());
     // 制御文字だらけの SPEC でも計画は作れるか、Err になるだけ
@@ -536,6 +538,7 @@ fn 不正なspecでもpanicしない() {
         source: "x".into(),
         agent_count: 1,
         review_required: true,
+        roles: Vec::new(),
     });
     assert!(weird.is_ok() || weird.is_err());
 }
@@ -673,6 +676,7 @@ fn specとエージェント数が計画に反映される() {
                     source: "SPEC.md".into(),
                     agent_count: agents,
                     review_required: true,
+                    roles: Vec::new(),
                 })
                 .expect("計画できるべき");
             TeamRuntime::from_plan(
@@ -710,6 +714,7 @@ fn 計画しただけではエージェントを起こさない() {
             source: "SPEC.md".into(),
             agent_count: 4,
             review_required: true,
+            roles: Vec::new(),
         })
         .unwrap();
     let mut rt = TeamRuntime::from_plan(plan, ws(), RunOptions::default());

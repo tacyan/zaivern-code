@@ -222,6 +222,20 @@ impl TeamRuntime {
         rt
     }
 
+    /// Goal の表題を差し替える (フォームの「Goal 名」)。
+    ///
+    /// **計画そのものは変えない。** 表題は人が読むためのものなので、
+    /// Task Graph にも Definition of Done にも影響させない。
+    pub fn rename_goal(&mut self, title: &str) {
+        let t = title.trim();
+        if t.is_empty() {
+            return;
+        }
+        self.goal.title = clamp_text(t);
+        self.goal.updated_at = now_secs();
+        self.dirty = true;
+    }
+
     /// 保存された状態から復元する。
     ///
     /// **Running / Assigned だったタスクを無条件に Running へ戻さない。**

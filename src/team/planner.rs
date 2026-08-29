@@ -28,6 +28,13 @@ pub struct PlanInput {
     pub agent_count: usize,
     /// レビューを必須にするか。
     pub review_required: bool,
+    /// チームに置く役割 (フォームの「エージェントプリセット」)。
+    ///
+    /// **空なら既定** (実装 + レビュー)。ここに `Tester` が入っていれば
+    /// テスト専任のレーンを立て、`Architect` が入っていれば設計タスクを
+    /// 先頭に置く。**選んだのに何も変わらない**のは、押せるのに何も
+    /// 起きないボタンと同じ嘘になる。
+    pub roles: Vec<super::model::TeamRole>,
 }
 
 /// 計画に失敗した理由。
@@ -333,26 +340,67 @@ impl StaticPlanner {
         let cap = input.agent_count.max(1).saturating_mul(2).clamp(2, 24);
         raw_tasks.truncate(cap);
 
-        let teams = vec![
-            TeamDoc {
-                key: "implementation".into(),
-                name: "Implementation".into(),
-                lead_role: "team_lead".into(),
-            },
-            TeamDoc {
+        // **選んだ役割でレーンが変わる。** 選択が計画に何の影響も与えない
+        // なら、その選択肢は嘘になる。
+        use super::model::TeamRole as R;
+        let roles = if input.roles.is_empty() {
+            vec![R::Implementer, R::Reviewer]
+        } else {
+            input.roles.clone()
+        };
+        let mut teams = vec![TeamDoc {
+            key: "implementation".into(),
+            name: "Implementation".into(),
+            lead_role: "team_lead".into(),
+        }];
+        if roles.contains(&R::Architect) {
+            teams.insert(
+                0,
+                TeamDoc {
+                    key: "architecture".into(),
+                    name: "Architecture".into(),
+                    lead_role: "architect".into(),
+                },
+            );
+        }
+        if roles.contains(&R::Reviewer) || roles.contains(&R::Tester) {
+            teams.push(TeamDoc {
                 key: "qa".into(),
                 name: "QA & Review".into(),
                 lead_role: "reviewer".into(),
-            },
-            TeamDoc {
-                key: "integration".into(),
-                name: "Integration".into(),
-                lead_role: "integrator".into(),
-            },
-        ];
+            });
+        }
+        teams.push(TeamDoc {
+            key: "integration".into(),
+            name: "Integration".into(),
+            lead_role: "integrator".into(),
+        });
 
         let mut tasks: Vec<TaskDoc> = Vec::new();
         let mut impl_keys: Vec<String> = Vec::new();
+        // 設計担当を選んだなら、実装の前に 1 本置く (実装はこれに依存する)。
+        let design_key = roles.contains(&R::Architect).then(|| {
+            let key = "design".to_string();
+            tasks.push(TaskDoc {
+                key: key.clone(),
+                title: format!("{title} の設計をまとめる"),
+                description: format!(
+                    "SPEC ({}) から、実装へ入る前に決めておくことを 1 枚にまとめる。",
+                    input.source
+                ),
+                team: "architecture".into(),
+                role: "architect".into(),
+                depends_on: Vec::new(),
+                files: Vec::new(),
+                required_caps: Vec::new(),
+                acceptance_criteria: vec![
+                    "実装が迷わない粒度まで決まっている".to_string(),
+                    "SPEC と矛盾していない".to_string(),
+                ],
+                validation_commands: validations.clone(),
+            });
+            key
+        });
         for (i, t) in raw_tasks.iter().enumerate() {
             let (label, files) = split_files(t);
             let key = format!("impl-{:02}", i + 1);
@@ -363,7 +411,7 @@ impl StaticPlanner {
                 description: format!("{}\n\n出典: {}", label, input.source),
                 team: "implementation".into(),
                 role: "implementer".into(),
-                depends_on: Vec::new(),
+                depends_on: design_key.iter().cloned().collect(),
                 files,
                 required_caps: Vec::new(),
                 acceptance_criteria: vec![
@@ -453,6 +501,7 @@ mod tests {
             source: "SPEC.md".into(),
             agent_count: 4,
             review_required: true,
+            roles: Vec::new(),
         }
     }
 
@@ -576,6 +625,45 @@ mod tests {
         let plan = StaticPlanner.plan(inp).unwrap();
         // 上限 2*2=4 の実装 + 統合 1
         assert_eq!(plan.tasks.len(), 5);
+    }
+
+    #[test]
+    fn 役割の選択が計画を変える() {
+        use super::super::model::TeamRole as R;
+        // 既定 (実装 + レビュー): 実装 / QA / 統合 の 3 レーン
+        let base = StaticPlanner.plan(input(SPEC)).unwrap();
+        let lanes: Vec<&str> = base.teams.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(lanes, vec!["implementation", "qa", "integration"]);
+        assert!(base.tasks.iter().all(|t| t.role != R::Architect));
+
+        // 設計担当を選ぶと、設計レーンと設計タスクが増え、実装がそれに依存する
+        let mut with_arch = input(SPEC);
+        with_arch.roles = vec![R::Architect, R::Implementer, R::Reviewer];
+        let p = StaticPlanner.plan(with_arch).unwrap();
+        let lanes: Vec<&str> = p.teams.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            lanes,
+            vec!["architecture", "implementation", "qa", "integration"]
+        );
+        let design = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Architect)
+            .expect("設計タスクが立つ");
+        for t in p.tasks.iter().filter(|t| t.role == R::Implementer) {
+            assert!(
+                t.dependencies.contains(&design.id),
+                "#{} が設計に依存していない",
+                t.id
+            );
+        }
+
+        // レビューを外すと QA レーンが消える
+        let mut no_qa = input(SPEC);
+        no_qa.roles = vec![R::Implementer];
+        let p2 = StaticPlanner.plan(no_qa).unwrap();
+        let lanes: Vec<&str> = p2.teams.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(lanes, vec!["implementation", "integration"]);
     }
 
     #[test]
