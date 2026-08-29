@@ -54,7 +54,9 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
         plan,
         ws(),
         RunOptions {
-            run_id: "run-test".into(),
+            // **Run ごとに別の ID。** 実物と同じ作り方を通す
+            // (固定値にすると、別 Run の結果が紛れ込む事故を再現できない)。
+            run_id: new_run_id(),
             spec_source: "SPEC.md".into(),
             agent_count: agents,
             max_attempts: 3,
@@ -1083,6 +1085,33 @@ fn 古い実行の結果は採用しない() {
         "古い結果を正式な証跡として採った: {:?}",
         t.validation.runs
     );
+}
+
+#[test]
+fn 別のrunの検証結果は同じタスク番号でも採らない() {
+    // タスク ID は Run ごとに 1 から振り直される。`run_id` を実行 ID へ
+    // 入れていないと、前の Run の結果が新しい Run の同じ番号のタスクへ
+    // 適用される (置き場はワークスペース単位なので実際に隣り合う)。
+    let (mut old, sids_a, tid) = to_assigned();
+    report_approve_and_collect(&mut old, &sids_a, tid, 12);
+    let from_old_run = old.current_execution(tid);
+
+    let (mut fresh, sids_b, tid2) = to_assigned();
+    assert_eq!(tid, tid2, "同じ番号のタスクで比べる前提が崩れた");
+    report_approve_and_collect(&mut fresh, &sids_b, tid2, 12);
+    let cmds = fresh.task(tid2).unwrap().validation_commands.clone();
+    fresh.note_validation_for(
+        &from_old_run,
+        tid2,
+        cmds.iter().map(ValidationRun::passed).collect(),
+    );
+    let t = fresh.task(tid2).unwrap();
+    assert!(
+        !t.validation.passed(&t.validation_commands),
+        "別の Run の結果を採った: {:?}",
+        t.validation.runs
+    );
+    assert_ne!(t.state, TeamTaskState::Reviewing);
 }
 
 #[test]

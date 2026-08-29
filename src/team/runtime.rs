@@ -2428,10 +2428,27 @@ pub struct RunOptions {
     pub review_required: bool,
 }
 
+/// 新しい Run の ID を作る。
+///
+/// **秒だけでは足りない。** 同じワークスペースで 1 秒以内に 2 回始めると
+/// 同じ ID になり、前の Run の検証結果が新しい Run の同じ番号のタスクへ
+/// 適用されうる (置き場はワークスペース単位なので実際に隣り合う)。
+/// プロセス ID と通し番号を混ぜて、同じ ID が 2 度出ないようにする。
+pub fn new_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "run-{}-{}-{}",
+        now_secs(),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
-            run_id: format!("run-{}", now_secs()),
+            run_id: new_run_id(),
             spec_source: String::new(),
             agent_count: 4,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
