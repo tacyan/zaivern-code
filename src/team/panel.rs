@@ -204,6 +204,11 @@ pub struct TeamPanel {
     /// 保存が要るか。
     needs_save: bool,
     workspace: PathBuf,
+    /// 状態の置き場の**根**。既定は `~/.zaivern`。
+    ///
+    /// テストはここを一時ディレクトリへ向ける (`ZAIVERN_HOME` を差し替えると
+    /// 並列に走る他のテストへ漏れるので使わない)。
+    home: PathBuf,
     /// セッションごとの「もう読んだ行」(順序つき・上限あり)。
     seen_order: HashMap<SessionId, VecDeque<u64>>,
     seen_set: HashMap<SessionId, HashSet<u64>>,
@@ -240,6 +245,7 @@ impl Default for TeamPanel {
             pending_instructions: Vec::new(),
             needs_save: false,
             workspace: PathBuf::new(),
+            home: persistence::default_home(),
             seen_order: HashMap::new(),
             seen_set: HashMap::new(),
             next_scan: None,
@@ -264,6 +270,11 @@ impl TeamPanel {
         self.snapshot.as_ref()
     }
 
+    /// 状態の置き場 (`<根>/team/<ワークスペースキー>/`)。
+    fn state_dir(&self) -> PathBuf {
+        persistence::team_dir_in(&self.home, &self.workspace)
+    }
+
     /// ワークスペースを設定し、保存済みの Run があれば知らせる。
     pub fn attach_workspace(&mut self, ws: &Path) {
         if self.workspace == ws {
@@ -272,7 +283,7 @@ impl TeamPanel {
         self.workspace = ws.to_path_buf();
         self.runtime = None;
         self.snapshot = None;
-        self.restore = if persistence::has_run(&persistence::team_dir(ws)) {
+        self.restore = if persistence::has_run(&self.state_dir()) {
             RestorePrompt::Found
         } else {
             RestorePrompt::None
@@ -331,7 +342,7 @@ impl TeamPanel {
 
     /// 保存された Run を復元する。
     pub fn restore_run(&mut self, read_only: bool) -> Result<(), String> {
-        let dir = persistence::team_dir(&self.workspace);
+        let dir = self.state_dir();
         match persistence::load(&dir) {
             LoadOutcome::Loaded(s) => {
                 self.runtime = Some(TeamRuntime::restore(*s, self.workspace.clone()));
@@ -353,7 +364,7 @@ impl TeamPanel {
 
     /// 保存された Run を消す (**確認済みの呼び出しだけ**)。
     pub fn discard_run(&mut self) -> Result<usize, String> {
-        let dir = persistence::team_dir(&self.workspace);
+        let dir = self.state_dir();
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
         self.runtime = None;
         self.snapshot = None;
@@ -574,7 +585,7 @@ impl TeamPanel {
         let Some(rt) = self.runtime.as_ref() else {
             return;
         };
-        let dir = persistence::team_dir(&self.workspace);
+        let dir = self.state_dir();
         if let Err(e) = persistence::save(&dir, &rt.to_saved()) {
             self.notice = e.detail();
         }
@@ -628,14 +639,24 @@ mod tests {
         crate::test_util::unique_temp_dir("zaivern-team-panel", name)
     }
 
+    /// **実 `~/.zaivern` に 1 バイトも触らない**パネルを作る。
+    ///
+    /// 置き場の根を一時ディレクトリへ向ける。`ZAIVERN_HOME` を差し替える手も
+    /// あるが、環境変数は並列に走る他のテストへ漏れるので採らない。
+    fn panel_at(dir: &Path) -> TeamPanel {
+        let mut p = TeamPanel::default();
+        p.home = dir.join(".zaivern-test-home");
+        p.attach_workspace(dir);
+        p
+    }
+
     const SPEC: &str = "# 認証\n## 要件\n- A を作る (src/a.rs)\n";
 
     #[test]
     fn 計画してから開始する() {
-        let mut p = TeamPanel::default();
         let dir = ws("plan");
         std::fs::create_dir_all(&dir).unwrap();
-        p.attach_workspace(&dir);
+        let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         assert!(p.has_run());
         // **計画しただけでは起動要求は出ない。**
@@ -643,17 +664,16 @@ mod tests {
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Ready);
         p.act(TeamAction::Start);
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Running);
+        // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]
     fn フォームの入力はすべて計画に効く() {
         use super::super::model::TeamRole as R;
-        let mut p = TeamPanel::default();
         let dir = ws("form-effect");
         std::fs::create_dir_all(&dir).unwrap();
-        p.attach_workspace(&dir);
+        let mut p = panel_at(&dir);
         p.plan_with(
             SPEC,
             "SPEC.md",
@@ -678,23 +698,22 @@ mod tests {
         assert_eq!(rt.run().max_attempts, 5);
         assert_eq!(rt.run().agent_count, 2);
         assert!(!rt.run().review_required);
+        // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]
     fn 読み取り専用では操作できない() {
-        let mut p = TeamPanel::default();
         let dir = ws("ro");
         std::fs::create_dir_all(&dir).unwrap();
-        p.attach_workspace(&dir);
+        let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         p.read_only = true;
         p.act(TeamAction::Start);
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Ready);
         assert!(p.notice.contains("読み取り専用"));
+        // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]
@@ -702,29 +721,26 @@ mod tests {
         let dir = ws("restore");
         std::fs::create_dir_all(&dir).unwrap();
         {
-            let mut p = TeamPanel::default();
-            p.attach_workspace(&dir);
+            let mut p = panel_at(&dir);
             p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
             p.act(TeamAction::Start);
             p.save_if_needed();
         }
-        let mut q = TeamPanel::default();
-        q.attach_workspace(&dir);
+        let mut q = panel_at(&dir);
         assert_eq!(q.restore, RestorePrompt::Found, "未完了 Run を検出していない");
         q.restore_run(false).unwrap();
         assert!(q.has_run());
         assert_eq!(q.restore, RestorePrompt::None);
         assert!(q.goal_status().is_some());
+        // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]
     fn 不正なspecは計画に失敗する() {
-        let mut p = TeamPanel::default();
         let dir = ws("bad");
         std::fs::create_dir_all(&dir).unwrap();
-        p.attach_workspace(&dir);
+        let mut p = panel_at(&dir);
         assert!(p.plan("   ", "SPEC.md", RunOptions::default()).is_err());
         assert!(!p.has_run(), "失敗したのに Run ができている");
         std::fs::remove_dir_all(&dir).ok();
@@ -732,10 +748,9 @@ mod tests {
 
     #[test]
     fn スナップショットは変わったときだけ作り直す() {
-        let mut p = TeamPanel::default();
         let dir = ws("snap");
         std::fs::create_dir_all(&dir).unwrap();
-        p.attach_workspace(&dir);
+        let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         p.refresh_snapshot(100);
         let a = p.snapshot().cloned().expect("スナップショット");
@@ -745,8 +760,8 @@ mod tests {
         p.act(TeamAction::Start);
         p.refresh_snapshot(102);
         assert_ne!(p.snapshot().unwrap().goal.status, a.goal.status);
+        // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]

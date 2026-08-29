@@ -41,11 +41,22 @@ pub const EVENT_LOG_MAX_LINES: usize = 5_000;
 /// 1 ファイルのバイト上限。これを超えたものは読まない (壊れているとみなす)。
 pub const FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// `~/.zaivern/team/<ワークスペースキー>/`。
-pub fn team_dir(workspace: &Path) -> PathBuf {
-    crate::config::zaivern_dir()
-        .join("team")
+/// 状態の置き場 = `<根>/team/<ワークスペースキー>/`。
+///
+/// **根を引数で受け取る** (`lease::store_path_in` と同じ流儀)。既定の根を
+/// 決めるのは [`default_home`] 1 か所だけで、**テストは自分の一時
+/// ディレクトリを渡す** — 素で `~/.zaivern` を指す入口を残すと、テストが
+/// 利用者の (あるいは同時に走っている別インスタンスの) 台帳の隣に
+/// ファイルを作る。`ZAIVERN_HOME` を差し替える手もあるが、**環境変数は
+/// 並列に走る他のテストへ漏れる**ので採らない。
+pub fn team_dir_in(root: &Path, workspace: &Path) -> PathBuf {
+    root.join("team")
         .join(crate::history::workspace_key(workspace))
+}
+
+/// 既定の根 (`~/.zaivern`)。**ここが唯一の既定の決め所。**
+pub fn default_home() -> PathBuf {
+    crate::config::zaivern_dir()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,11 +563,17 @@ mod tests {
 
     #[test]
     fn 置き場はワークスペースキーから決まる() {
-        let a = team_dir(Path::new("/tmp/ws-a"));
-        let b = team_dir(Path::new("/tmp/ws-b"));
+        // **`team_dir` は実 `~/.zaivern` を指すので、ここでは触らずに
+        // パスの導出だけを見る** (ディレクトリを 1 つも作らない)。
+        let root = Path::new("/nonexistent-root-for-path-derivation");
+        let a = team_dir_in(root, Path::new("/tmp/ws-a"));
+        let b = team_dir_in(root, Path::new("/tmp/ws-b"));
         assert_ne!(a, b);
         assert!(a.ends_with(crate::history::workspace_key(Path::new("/tmp/ws-a"))));
         // 同じワークスペースなら何度呼んでも同じ
-        assert_eq!(a, team_dir(Path::new("/tmp/ws-a")));
+        assert_eq!(a, team_dir_in(root, Path::new("/tmp/ws-a")));
+        // 既定の根も同じ導出を通る (根が違うだけ)
+        assert!(team_dir_in(&default_home(), Path::new("/tmp/ws-a"))
+            .ends_with(crate::history::workspace_key(Path::new("/tmp/ws-a"))));
     }
 }

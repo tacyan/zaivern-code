@@ -157,14 +157,17 @@ pub fn build(
     })
 }
 
-/// 投函先。
-pub fn launch_path(workspace: &Path) -> PathBuf {
-    super::persistence::team_dir(workspace).join("launch.json")
+/// 投函先 = `<根>/team/<ワークスペースキー>/launch.json`。
+///
+/// **根は必ず呼び出し側が渡す。** 素で `~/.zaivern` を指す入口を残すと、
+/// テストが利用者の置き場へ書いてしまう。
+pub fn launch_path_in(root: &Path, workspace: &Path) -> PathBuf {
+    super::persistence::team_dir_in(root, workspace).join("launch.json")
 }
 
 /// 起動要求を投函する (既存の GUI があればそれが拾う)。
-pub fn post(req: &TeamLaunchRequest) -> Result<PathBuf, LaunchError> {
-    let path = launch_path(&req.workspace_root);
+pub fn post_in(root: &Path, req: &TeamLaunchRequest) -> Result<PathBuf, LaunchError> {
+    let path = launch_path_in(root, &req.workspace_root);
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| LaunchError::Io(e.to_string()))?;
     let body = serde_json::to_string_pretty(req).map_err(|e| LaunchError::Io(e.to_string()))?;
@@ -180,8 +183,8 @@ pub fn post(req: &TeamLaunchRequest) -> Result<PathBuf, LaunchError> {
 /// 投函を 1 件だけ取り出す。**取り出したら必ず消す** (二重処理の防止)。
 ///
 /// 古すぎる投函・大きすぎる投函・版違いは拾わずに消す。
-pub fn take(workspace: &Path, now: u64) -> Option<TeamLaunchRequest> {
-    let path = launch_path(workspace);
+pub fn take_in(root: &Path, workspace: &Path, now: u64) -> Option<TeamLaunchRequest> {
+    let path = launch_path_in(root, workspace);
     let meta = std::fs::metadata(&path).ok()?;
     if meta.len() > LAUNCH_MAX_BYTES {
         let _ = std::fs::remove_file(&path);
@@ -297,6 +300,11 @@ mod tests {
         crate::test_util::unique_temp_dir("zaivern-team-launch", name)
     }
 
+    /// **実 `~/.zaivern` に 1 バイトも触らない**ための置き場。
+    fn test_home(dir: &Path) -> PathBuf {
+        dir.join(".zaivern-test-home")
+    }
+
     fn write_spec(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("SPEC.md");
         std::fs::write(&p, body).unwrap();
@@ -371,14 +379,14 @@ mod tests {
         let dir = ws("post-take");
         let spec = write_spec(&dir, "# x\n- y\n");
         let req = build(&dir, &spec, 2, true).unwrap();
-        post(&req).unwrap();
-        let got = take(&req.workspace_root, req.requested_at).expect("拾えるべき");
+        let home = test_home(&dir);
+        post_in(&home, &req).unwrap();
+        let got = take_in(&home, &req.workspace_root, req.requested_at).expect("拾えるべき");
         assert_eq!(got.agent_count, 2);
         assert!(got.auto_start);
         // 2 回目は無い (再描画のたびに再実行しない)
-        assert_eq!(take(&req.workspace_root, req.requested_at), None);
+        assert_eq!(take_in(&home, &req.workspace_root, req.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(super::super::persistence::team_dir(&req.workspace_root)).ok();
     }
 
     #[test]
@@ -386,11 +394,11 @@ mod tests {
         let dir = ws("stale");
         let spec = write_spec(&dir, "# x\n- y\n");
         let req = build(&dir, &spec, 2, false).unwrap();
-        post(&req).unwrap();
+        let home = test_home(&dir);
+        post_in(&home, &req).unwrap();
         let later = req.requested_at + LAUNCH_TTL_SECS + 1;
-        assert_eq!(take(&req.workspace_root, later), None);
+        assert_eq!(take_in(&home, &req.workspace_root, later), None);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(super::super::persistence::team_dir(&req.workspace_root)).ok();
     }
 
     #[test]
@@ -399,10 +407,10 @@ mod tests {
         let spec = write_spec(&dir, "# x\n- y\n");
         let mut req = build(&dir, &spec, 2, false).unwrap();
         req.version = LAUNCH_VERSION + 1;
-        post(&req).unwrap();
-        assert_eq!(take(&req.workspace_root, req.requested_at), None);
+        let home = test_home(&dir);
+        post_in(&home, &req).unwrap();
+        assert_eq!(take_in(&home, &req.workspace_root, req.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(super::super::persistence::team_dir(&req.workspace_root)).ok();
     }
 
     #[test]
@@ -412,10 +420,10 @@ mod tests {
         let mut req = build(&dir, &spec, 2, false).unwrap();
         // 投函箱を書き換えて「ワークスペース外の SPEC」を渡そうとする
         req.spec_path = PathBuf::from("/etc/passwd");
-        post(&req).unwrap();
-        assert_eq!(take(&req.workspace_root, req.requested_at), None);
+        let home = test_home(&dir);
+        post_in(&home, &req).unwrap();
+        assert_eq!(take_in(&home, &req.workspace_root, req.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(super::super::persistence::team_dir(&req.workspace_root)).ok();
     }
 
     #[test]

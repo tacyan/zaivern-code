@@ -146,6 +146,16 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 状態の置き場の**根**。`home` を渡せば差し替えられる (テスト用)。
+///
+/// **実 `~/.zaivern` を指すのは `None` のときだけ。** テストは必ず一時
+/// ディレクトリを渡す — 環境変数 (`ZAIVERN_HOME`) を差し替えると並列に走る
+/// 他のテストへ漏れる。
+fn state_root(home: Option<&Path>) -> PathBuf {
+    home.map(Path::to_path_buf)
+        .unwrap_or_else(persistence::default_home)
+}
+
 fn err(msg: impl std::fmt::Display) -> i32 {
     eprintln!("{msg}");
     EXIT_ERR
@@ -388,6 +398,11 @@ fn plan_from_spec(spec_path: &Path, ws: &Path, agents: usize) -> Result<TeamPlan
 
 /// `zai team <sub>` の本体。
 pub fn cli_main(argv: &[String]) -> i32 {
+    cli_main_in(argv, None)
+}
+
+/// 置き場の根を明示する版 (テストが一時ディレクトリを渡す)。
+pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
     if argv.is_empty() || argv.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", HELP.trim_end());
         return EXIT_OK;
@@ -398,6 +413,8 @@ pub fn cli_main(argv: &[String]) -> i32 {
         Err(e) => return err(e),
     };
     let ws = opts.workspace.clone().unwrap_or_else(cwd);
+    let root = state_root(home);
+    let dir_of = |ws: &Path| persistence::team_dir_in(&root, ws);
 
     match sub.as_str() {
         "plan" => {
@@ -446,7 +463,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
                 Ok(r) => r,
                 Err(e) => return err(e.detail()),
             };
-            if let Err(e) = launch::post(&req) {
+            if let Err(e) = launch::post_in(&root, &req) {
                 return err(e.detail());
             }
             println!(
@@ -465,7 +482,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
                 EXIT_LAUNCH_GUI
             }
         }
-        "status" => match persistence::load(&persistence::team_dir(&ws)) {
+        "status" => match persistence::load(&dir_of(&ws)) {
             LoadOutcome::Loaded(s) => {
                 if opts.json {
                     println!("{}", status_json(&s));
@@ -491,7 +508,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
             )),
         },
         "resume" => {
-            let dir = persistence::team_dir(&ws);
+            let dir = dir_of(&ws);
             if !persistence::has_run(&dir) {
                 return err("再開できる Team Run がありません。");
             }
@@ -504,7 +521,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
             }
         }
         "stop" => {
-            let dir = persistence::team_dir(&ws);
+            let dir = dir_of(&ws);
             match persistence::load(&dir) {
                 LoadOutcome::Loaded(mut s) => {
                     s.run.paused = true;
@@ -530,7 +547,7 @@ pub fn cli_main(argv: &[String]) -> i32 {
             }
         }
         "reset" => {
-            let dir = persistence::team_dir(&ws);
+            let dir = dir_of(&ws);
             let targets = persistence::reset_targets(&dir);
             if targets.is_empty() {
                 println!("消すものはありません。");
@@ -583,6 +600,20 @@ mod tests {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    /// **実 `~/.zaivern` に 1 バイトも触らずに CLI を回す。**
+    ///
+    /// 置き場の根をワークスペースの下へ向ける。`ZAIVERN_HOME` を差し替える手も
+    /// あるが、環境変数は並列に走る他のテストへ漏れる。
+    fn run_in(dir: &Path, args: &[&str]) -> i32 {
+        let home = dir.join(".zaivern-test-home");
+        cli_main_in(&v(args), Some(&home))
+    }
+
+    /// テスト用の置き場。
+    fn test_home(dir: &Path) -> PathBuf {
+        dir.join(".zaivern-test-home")
+    }
+
     #[test]
     fn 既定のエージェント数は4() {
         let o = parse_common(&v(&["SPEC.md"])).unwrap();
@@ -621,13 +652,16 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "headless");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SPEC.md"), "# a\n## 要件\n- x\n").unwrap();
-        let code = cli_main(&v(&[
-            "run",
-            "SPEC.md",
-            "--headless",
-            "--workspace",
-            &dir.display().to_string(),
-        ]));
+        let code = run_in(
+            &dir,
+            &[
+                "run",
+                "SPEC.md",
+                "--headless",
+                "--workspace",
+                &dir.display().to_string(),
+            ],
+        );
         assert_eq!(code, EXIT_UNSUPPORTED);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -641,18 +675,16 @@ mod tests {
             "# 認証\n## 要件\n- A を作る (src/a.rs)\n## 検証\n- cargo test\n",
         )
         .unwrap();
-        let code = cli_main(&v(&[
-            "plan",
-            "SPEC.md",
-            "--workspace",
-            &dir.display().to_string(),
-        ]));
+        let code = run_in(
+            &dir,
+            &["plan", "SPEC.md", "--workspace", &dir.display().to_string()],
+        );
         assert_eq!(code, EXIT_OK);
         // 投函箱も状態も作られない = 何も起動していない
-        assert!(!launch::launch_path(&dir).exists());
-        assert!(!persistence::has_run(&persistence::team_dir(&dir)));
+        let home = test_home(&dir);
+        assert!(!launch::launch_path_in(&home, &dir).exists());
+        assert!(!persistence::has_run(&persistence::team_dir_in(&home, &dir)));
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 
     #[test]
@@ -682,16 +714,19 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "status");
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(
-            cli_main(&v(&["status", "--workspace", &dir.display().to_string()])),
+            run_in(&dir, &["status", "--workspace", &dir.display().to_string()]),
             EXIT_OK
         );
         assert_eq!(
-            cli_main(&v(&[
-                "status",
-                "--json",
-                "--workspace",
-                &dir.display().to_string()
-            ])),
+            run_in(
+                &dir,
+                &[
+                    "status",
+                    "--json",
+                    "--workspace",
+                    &dir.display().to_string()
+                ]
+            ),
             EXIT_OK
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -701,41 +736,41 @@ mod tests {
     fn resetは確認なしでは消さない() {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "reset");
         std::fs::create_dir_all(&dir).unwrap();
-        let tdir = persistence::team_dir(&dir);
+        let tdir = persistence::team_dir_in(&test_home(&dir), &dir);
         std::fs::create_dir_all(&tdir).unwrap();
         std::fs::write(tdir.join("schema.json"), "{\"version\":1}").unwrap();
         std::fs::write(tdir.join("run.json"), "{}").unwrap();
         // --yes 無しでは消さない
         assert_eq!(
-            cli_main(&v(&["reset", "--workspace", &dir.display().to_string()])),
+            run_in(&dir, &["reset", "--workspace", &dir.display().to_string()]),
             EXIT_OK
         );
         assert!(tdir.join("run.json").exists(), "確認なしで消してしまった");
         // --dry-run も消さない
         assert_eq!(
-            cli_main(&v(&[
-                "reset",
-                "--dry-run",
-                "--yes",
-                "--workspace",
-                &dir.display().to_string()
-            ])),
+            run_in(
+                &dir,
+                &[
+                    "reset",
+                    "--dry-run",
+                    "--yes",
+                    "--workspace",
+                    &dir.display().to_string()
+                ]
+            ),
             EXIT_OK
         );
         assert!(tdir.join("run.json").exists(), "--dry-run で消してしまった");
         // --yes なら消す
         assert_eq!(
-            cli_main(&v(&[
-                "reset",
-                "--yes",
-                "--workspace",
-                &dir.display().to_string()
-            ])),
+            run_in(
+                &dir,
+                &["reset", "--yes", "--workspace", &dir.display().to_string()]
+            ),
             EXIT_OK
         );
         assert!(!tdir.join("run.json").exists());
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&tdir).ok();
     }
 
     #[test]
@@ -760,14 +795,17 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         let spec = b.join("SPEC.md");
         std::fs::write(&spec, "# x\n## 要件\n- y\n").unwrap();
-        let code = cli_main(&v(&[
-            "run",
-            &spec.display().to_string(),
-            "--workspace",
-            &a.display().to_string(),
-        ]));
+        let code = run_in(
+            &a,
+            &[
+                "run",
+                &spec.display().to_string(),
+                "--workspace",
+                &a.display().to_string(),
+            ],
+        );
         assert_eq!(code, EXIT_ERR);
-        assert!(!launch::launch_path(&a).exists());
+        assert!(!launch::launch_path_in(&test_home(&a), &a).exists());
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
     }
@@ -777,22 +815,28 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "run-post");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SPEC.md"), "# x\n## 要件\n- y を作る\n").unwrap();
-        let code = cli_main(&v(&[
-            "run",
-            "SPEC.md",
-            "--agents",
-            "3",
-            "--yes",
-            "--workspace",
-            &dir.display().to_string(),
-        ]));
+        let code = run_in(
+            &dir,
+            &[
+                "run",
+                "SPEC.md",
+                "--agents",
+                "3",
+                "--yes",
+                "--workspace",
+                &dir.display().to_string(),
+            ],
+        );
         // 実行中インスタンスの有無で 0 か EXIT_LAUNCH_GUI
         assert!(code == EXIT_OK || code == EXIT_LAUNCH_GUI, "{code}");
-        let req = launch::take(&std::fs::canonicalize(&dir).unwrap(), now_secs())
-            .expect("投函されているべき");
+        let req = launch::take_in(
+            &test_home(&dir),
+            &std::fs::canonicalize(&dir).unwrap(),
+            now_secs(),
+        )
+        .expect("投函されているべき");
         assert_eq!(req.agent_count, 3);
         assert!(req.auto_start);
         std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(persistence::team_dir(&dir)).ok();
     }
 }

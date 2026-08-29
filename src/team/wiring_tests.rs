@@ -17,6 +17,8 @@ const BOARD: &str = include_str!("organization_board.rs");
 const INSPECTOR: &str = include_str!("inspector.rs");
 const TEAM_CLI: &str = include_str!("cli.rs");
 const PANEL: &str = include_str!("panel.rs");
+const PERSISTENCE: &str = include_str!("persistence.rs");
+const LAUNCH: &str = include_str!("launch.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -91,8 +93,8 @@ fn 起動要求は一度だけ処理する() {
     // 別の関数が書いた文字列を拾って空回りする (CLAUDE.md の実例)。
     let body = function_body(&s, at);
     assert!(
-        body.contains("launch::take("),
-        "投函箱から取り出していない (take は取り出すと同時に消す)"
+        body.contains("launch::take_in("),
+        "投函箱から取り出していない (take_in は取り出すと同時に消す)"
     );
     assert!(
         body.contains("p.launch_poll_due(Instant::now())"),
@@ -293,7 +295,7 @@ fn cli起動とgui起動は同じruntimeを通る() {
         "CLI が独自に Runtime を建てている (GUI と二重実装になる)"
     );
     assert!(
-        cli.contains("launch::post(&req)"),
+        cli.contains("launch::post_in(&root, &req)"),
         "CLI が起動要求を投函していない"
     );
     // 計画の入口は Planner 1 本
@@ -353,7 +355,9 @@ fn 起動要求はteam画面を選ぶ() {
 #[test]
 fn yesで省けるのはstart_teamの確認だけ() {
     let s = src(TEAM_CLI);
-    let body = function_body(&s, s.find("pub fn cli_main").expect("入口がある"));
+    // **本体は `cli_main_in`。** `cli_main` は 1 行の委譲なので、そちらを
+    // 見ると中身が空で空回りする。
+    let body = function_body(&s, s.find("pub fn cli_main_in").expect("入口がある"));
     // `--yes` が権限昇格・破壊的操作・push/merge/deploy を素通ししないこと。
     // それらは計画の検証 (graph::check_command) で止まるので、CLI 側で
     // `--yes` を見て緩める分岐があってはいけない。
@@ -408,5 +412,60 @@ fn フォームの入力欄はすべて何かを変える() {
     assert!(
         guard.contains("\"auto\" | \"agent\" => approval_mode,") && guard.contains("_ => \"ask\","),
         "読めない承認モードを自動側へ倒している"
+    );
+}
+
+#[test]
+fn テストは実ホームへ書かない() {
+    // **`~/.zaivern` はユーザーのもので、別のインスタンスが動いている
+    // かもしれない場所**。テストがそこへ書くと、同時に動いている実機の
+    // 台帳の隣にファイルが生える (実際にこの版で `~/.zaivern/team/` を
+    // 作ってしまった)。根を差し替えられる形にしてあることを固定する。
+    // **根を受け取らない入口を 1 つも作らない。**
+    //
+    // 「テストの中を見て禁止語を探す」形にすると、同じファイル内では
+    // 修飾なしで呼べる (`post(&req)`) ので素通りする — 実際にわざと壊して
+    // 空回りした。**入口そのものを無くす**ほうが確実なので、根を既定で
+    // 埋める `pub fn` が存在しないことを見る。
+    for (name, s, forbidden) in [
+        (
+            "persistence",
+            src(PERSISTENCE),
+            &["pub fn team_dir(workspace: &Path)"][..],
+        ),
+        (
+            "launch",
+            src(LAUNCH),
+            &[
+                "pub fn launch_path(workspace: &Path)",
+                "pub fn post(req: &TeamLaunchRequest)",
+                "pub fn take(workspace: &Path",
+            ][..],
+        ),
+    ] {
+        for f in forbidden {
+            assert!(
+                !s.contains(f),
+                "{name} に根を受け取らない入口 `{f}` がある (テストが実 ~/.zaivern へ書ける)"
+            );
+        }
+    }
+    // 差し替え口が実在すること (無ければ上の検査は空回りする)
+    assert!(src(PERSISTENCE).contains("pub fn team_dir_in("));
+    assert!(src(PERSISTENCE).contains("pub fn default_home()"));
+    assert!(src(LAUNCH).contains("pub fn launch_path_in("));
+    assert!(src(LAUNCH).contains("pub fn post_in("));
+    assert!(src(LAUNCH).contains("pub fn take_in("));
+    assert!(src(TEAM_CLI).contains("pub fn cli_main_in("));
+
+    // **既定を決めるのは 1 か所だけ。** 増えると「どちらが効くのか」で
+    // 迷い、片方だけ直す事故が起きる。
+    let defaults: usize = [src(PERSISTENCE), src(LAUNCH), src(PANEL), src(TEAM_CLI)]
+        .iter()
+        .map(|s| s.matches("crate::config::zaivern_dir()").count())
+        .sum();
+    assert_eq!(
+        defaults, 1,
+        "既定の根を決めている場所が {defaults} 箇所ある (1 つにすること)"
     );
 }

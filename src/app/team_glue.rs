@@ -113,7 +113,9 @@ impl ZaivernApp {
         }
         let ws = self.agent_cwd();
         let now = crate::features::team::imp::model::now_secs();
-        let Some(req) = launch::take(&ws, now) else {
+        // 根は明示して渡す (既定の決め所は persistence::default_home の 1 か所)。
+        let root = crate::features::team::imp::persistence::default_home();
+        let Some(req) = launch::take_in(&root, &ws, now) else {
             return;
         };
         let opts = RunOptions {
