@@ -150,9 +150,12 @@ impl TeamEffect {
 pub enum TeamAction {
     /// 計画を承認して開始する。
     Start,
+    /// 新しい仕事を始めない (新規割り当ても、新しい検証も)。
+    /// **走っているものは走り切る。**
     Pause,
     Resume,
-    /// 新規割り当てを止める。実行中エージェントの kill は**承認ゲート**を通す。
+    /// 新規割り当てと**新しい検証**を止める。実行中エージェントの kill と
+    /// 走っている検証の打ち切りは**承認ゲート**を通す。
     Stop,
     /// 停止の承認が下りた。
     ApproveDecision(EventId),
@@ -828,7 +831,8 @@ impl TeamRuntime {
                         TeamEventKind::RunPaused,
                         None,
                         None,
-                        "一時停止しました (新規割り当てのみ停止)".into(),
+                        "一時停止しました (新しい仕事を始めません。走っているものは走り切ります)"
+                            .into(),
                     );
                 }
             }
@@ -1058,7 +1062,8 @@ impl TeamRuntime {
         // 5) 進んだタスクを先へ (検証 → レビュー → 完了)。
         self.advance(&mut out);
 
-        // 6) Pause / Stop 中は**新規割り当てをしない**。
+        // 6) Pause / Stop 中は**新規割り当てをしない** (新しい検証も
+        //    `advance` の中で同じ条件で止めている)。
         if self.accepting_work() {
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
