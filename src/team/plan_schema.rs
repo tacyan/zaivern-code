@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::validation_command::ValidationCommand;
+
 use super::model::{
     clamp_list, clamp_text, now_secs, GoalId, TeamGoal, TeamGroup, TeamId, TeamRole, TeamTask,
     TeamTaskState,
@@ -253,12 +255,15 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
                     .map(|s| s.trim().to_string())
                     .collect(),
             ),
-            validation_commands: clamp_list(
-                t.validation_commands
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .collect(),
-            ),
+            // **構造へ直してから持つ。** 文字列のまま内側へ入れない
+            // (判定した形と実行する形がずれる)。読めないものは落とす —
+            // `validate_plan` が「検証コマンドが無い」として弾く。
+            validation_commands: t
+                .validation_commands
+                .iter()
+                .take(super::model::LIST_MAX)
+                .filter_map(|s| ValidationCommand::parse(s).ok())
+                .collect(),
             state: TeamTaskState::Pending,
             assigned_agent: None,
             assigned_session: None,

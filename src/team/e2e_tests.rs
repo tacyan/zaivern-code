@@ -108,7 +108,7 @@ impl Lab {
                 .iter()
                 .map(|c| {
                     ValidationRun::new(
-                        c,
+                        c.display(),
                         code,
                         if code == 0 {
                             ValidationOutcome::Passed

@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::model::{TaskId, TeamTask, TeamTaskState};
+use super::validation_command::ValidationCommand;
 
 /// 計画の不備 1 件。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +99,11 @@ pub const FORBIDDEN_COMMAND_WORDS: &[&str] = &[
     "rm",
     "rmdir",
     "del",
-    "format",
+    // **`format` は入れない。** ディスクの初期化 (`format C:`) は実行体の
+    // 名前なので、許可リストに `format` が無い時点で通らない。引数として
+    // 見ると `ruff format --check .` / `dotnet format` のような**整形の
+    // サブコマンド**を巻き込むだけで、守りにならない (書き換えるかどうかは
+    // `read_only_mode` が旗で見る)。
     "mkfs",
     "dd",
     "shutdown",
@@ -125,38 +130,100 @@ pub const FORBIDDEN_COMMAND_WORDS: &[&str] = &[
 
 /// シェルのメタ文字。**コマンドは文字列として連結せず、語に分けて扱う**ので、
 /// これらが出てきた時点で「素のシェル文字列」と判断して拒否する。
-pub const SHELL_METACHARS: &[char] = &[';', '|', '&', '>', '<', '`', '$', '\n', '\r'];
+/// シェルのメタ文字。**コマンドは文字列として連結せず、語に分けて扱う**
+/// ので、これらが出てきた時点で「素のシェル文字列」と判断して拒否する。
+///
+/// **Windows の cmd.exe が特別扱いする字も入れる。** `.cmd` / `.bat` の
+/// 実行体はどうしても cmd.exe を経由するので (std がそう起こす)、
+/// `%VAR%` の展開・`^` の脱出・`!` の遅延展開が効く。判定した文字列と
+/// cmd.exe が解釈する文字列が別物になる経路を、最初から塞ぐ。
+pub const SHELL_METACHARS: &[char] = &[
+    ';', '|', '&', '>', '<', '`', '$', '\n', '\r', // unix
+    '%', '!', '^', '(', ')', '"', '\'', // windows の cmd.exe
+];
 
 /// 検証コマンドの危険度。**「安全か危険か」の 2 値では足りない。**
 ///
-/// `cargo test` にシェルのメタ文字は 1 つも無いが、`build.rs` /
-/// `#[test]` の中身 / `conftest.py` / `Makefile` / `package.json` の
-/// `scripts` を通じて**リポジトリ内の任意コードを実行できる**。ここを
-/// 「許可リストに載っているから安全」と畳むと、「破壊的操作は自動実行
-/// しない」という保証が成り立たなくなる。
+/// 名前だけでは決まらない、が要点:
+///
+/// * `cargo test` にシェルのメタ文字は 1 つも無いが、`build.rs` /
+///   `#[test]` の中身 / `conftest.py` / `Makefile` / `package.json` の
+///   `scripts` を通じて**リポジトリ内の任意コードを実行できる**
+/// * `black --check .` は読むだけだが、`black .` は**ファイルを書き換える**。
+///   同じ実行体で、旗ひとつで意味が変わる
+///
+/// なので判定は**実行体と引数の両方**を見る。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValidationRisk {
-    /// リポジトリ内の任意コードを実行しないと**明確に言える**もの。
-    Safe,
+    /// **読むだけ。** リポジトリのコードを実行せず、workspace も書き換えない。
+    /// 自動で実行してよい唯一の段。
+    ReadOnly,
     /// テスト・ビルド・スクリプトなど、**リポジトリ内のコードを実行しうる**もの。
     /// 隔離 (sandbox) が無い以上、人の承認を通してから実行する。
     RepositoryCodeExecution,
+    /// **workspace を書き換えうる。** 整形や自動修正。人の承認を通す。
+    WorkspaceMutation,
     /// 実行しない。パス指定・シェル・publish / deploy / push / sudo /
     /// 破壊的操作など。
     Forbidden,
 }
 
-/// リポジトリ内のコードを実行しないと言い切れるコマンド。
+impl ValidationRisk {
+    /// 人の承認なしで実行してよいか。
+    pub fn auto_runnable(self) -> bool {
+        self == ValidationRisk::ReadOnly
+    }
+
+    /// 承認を通せば実行してよいか (`Forbidden` は承認しても実行しない)。
+    pub fn needs_approval(self) -> bool {
+        matches!(
+            self,
+            ValidationRisk::RepositoryCodeExecution | ValidationRisk::WorkspaceMutation
+        )
+    }
+
+    /// 表示用の安定 ID。
+    pub fn key(self) -> &'static str {
+        match self {
+            ValidationRisk::ReadOnly => "read_only",
+            ValidationRisk::RepositoryCodeExecution => "repository_code_execution",
+            ValidationRisk::WorkspaceMutation => "workspace_mutation",
+            ValidationRisk::Forbidden => "forbidden",
+        }
+    }
+}
+
+/// **読むだけにできる道具**と、そう言える条件。
 ///
-/// **迷ったらここへ入れない。** 設定ファイルから任意のコードを読み込む
-/// もの (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン)
-/// は、名前が「検査するだけ」に見えても実行しうる。
-const SAFE_HEADS: &[&str] = &["rustfmt", "shellcheck", "black", "ruff"];
+/// ここに載るのは「リポジトリのコードを実行しない」ものだけ。そのうえで
+/// **旗しだいで書き換える**ので、読むだけだと言い切れる形を明示する。
+///
+/// 迷ったら載せない — 設定ファイルから任意のコードを読み込むもの
+/// (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は、
+/// 名前が「検査するだけ」に見えても実行しうる。
+fn read_only_mode(cmd: &ValidationCommand) -> Option<bool> {
+    match cmd.executable.as_str() {
+        // 読むだけ。書き換える旗を持たない。
+        "shellcheck" => Some(true),
+        // `--check` / `--diff` があれば読むだけ。無ければ書き換える。
+        "rustfmt" => Some(cmd.has_flag("--check")),
+        "black" => Some(cmd.has_flag("--check") || cmd.has_flag("--diff")),
+        // `ruff check` は読むだけだが `--fix` で書き換える。
+        // `ruff format` は `--check` / `--diff` が無ければ書き換える。
+        "ruff" => Some(match cmd.subcommand() {
+            Some("check") => !cmd.has_flag("--fix") && !cmd.has_flag("--unsafe-fixes"),
+            Some("format") => cmd.has_flag("--check") || cmd.has_flag("--diff"),
+            // サブコマンド無しの `ruff .` は既定が `check` だった版がある。
+            // **どちらとも言い切れないので書き換える側へ倒す。**
+            _ => false,
+        }),
+        _ => None,
+    }
+}
 
 /// 自動実行の対象にしてよいコマンド名 (実行ファイルの名前そのもの)。
 ///
-/// **ここに載っていても「安全」ではない** — 危険度は
-/// [`classify_command`] が決める。
+/// **ここに載っていても「安全」ではない** — 危険度は [`classify`] が決める。
 const ALLOWED_HEAD: &[&str] = &[
     "cargo",
     "rustc",
@@ -213,7 +280,8 @@ const ALLOWED_HEAD: &[&str] = &[
 /// **混ざっていたら実行しない。** basename だけで許可を決めると
 /// `/tmp/cargo test` が「`cargo` だから許可」になり、実際に起動されるのは
 /// `/tmp/cargo` — 攻撃者が置いた任意の実行体になる。PATH から解決される
-/// 素の名前だけを通す。
+/// 素の名前だけを通す (その解決も自分で行う:
+/// [`super::validation_command::resolve_in`])。
 fn head_has_path(head: &str) -> bool {
     if head.contains('/') || head.contains('\\') {
         return true;
@@ -228,27 +296,29 @@ fn head_has_path(head: &str) -> bool {
 }
 
 /// 検証コマンドの危険度を決める。**許可されたものだけを通す (allowlist)**。
-pub fn classify_command(cmd: &str) -> ValidationRisk {
-    classify_command_why(cmd).0
+pub fn classify(cmd: &ValidationCommand) -> ValidationRisk {
+    classify_why(cmd).0
 }
 
 /// 危険度と、`Forbidden` のときの理由。
-pub fn classify_command_why(cmd: &str) -> (ValidationRisk, String) {
+pub fn classify_why(cmd: &ValidationCommand) -> (ValidationRisk, String) {
     let no = |why: String| (ValidationRisk::Forbidden, why);
-    let trimmed = cmd.trim();
-    if trimmed.is_empty() {
+    let head = cmd.executable.trim();
+    if head.is_empty() {
         return no("空のコマンド".to_string());
     }
-    if trimmed.len() > 400 {
-        return no("コマンドが長すぎます".to_string());
+    if cmd.args.len() > super::validation_command::ARGS_MAX {
+        return no("引数が多すぎます".to_string());
     }
-    if let Some(c) = trimmed.chars().find(|c| SHELL_METACHARS.contains(c)) {
-        return no(format!("シェルのメタ文字 `{c}` は使えません"));
+    // **語のどこにもシェルのメタ文字を入れない。** 引用符で割ったあとの
+    // 語を見る — 「文字列としては安全に見えるが、どこかの層がもう一度
+    // 解釈する」形を残さないため。Windows の cmd.exe が特別扱いする字も
+    // 含める (`%VAR%` の展開で、判定した文字列と実行される文字列がずれる)。
+    for w in std::iter::once(head).chain(cmd.args.iter().map(|s| s.as_str())) {
+        if let Some(c) = w.chars().find(|c| SHELL_METACHARS.contains(c)) {
+            return no(format!("シェルのメタ文字 `{c}` は使えません"));
+        }
     }
-    let mut words = trimmed.split_whitespace();
-    let Some(head) = words.next() else {
-        return no("空のコマンド".to_string());
-    };
     // 実行するのは実体だけ。`sh -c "..."` のような入れ子は通さない。
     if head_has_path(head) {
         return no(format!(
@@ -259,29 +329,39 @@ pub fn classify_command_why(cmd: &str) -> (ValidationRisk, String) {
         return no(format!("`{head}` は自動実行を許可していないコマンドです"));
     }
     // 引数側に破壊的な語が混ざっていないか (`cargo publish` など)。
-    for w in trimmed.split_whitespace().skip(1) {
+    for w in &cmd.args {
         let w_low = w.trim_start_matches('-').to_ascii_lowercase();
         if FORBIDDEN_COMMAND_WORDS.contains(&w_low.as_str()) {
             return no(format!("`{w}` を含む操作は自動実行しません"));
         }
     }
-    if SAFE_HEADS.contains(&head) {
-        (ValidationRisk::Safe, String::new())
-    } else {
-        (ValidationRisk::RepositoryCodeExecution, String::new())
+    match read_only_mode(cmd) {
+        Some(true) => (ValidationRisk::ReadOnly, String::new()),
+        // 名前は読むだけの道具だが、この旗では書き換える。
+        Some(false) => (ValidationRisk::WorkspaceMutation, String::new()),
+        None => (ValidationRisk::RepositoryCodeExecution, String::new()),
     }
 }
 
 /// 検証コマンドとして**そもそも実行してよいか** (`Forbidden` でないか)。
 ///
 /// 返り値が `Err` なら、その文面をそのまま人へ見せる。
-/// **`Ok` は「安全」という意味ではない** — リポジトリのコードを実行しうる
-/// ものは [`ValidationRisk::RepositoryCodeExecution`] として承認を要求する。
-pub fn check_command(cmd: &str) -> Result<(), String> {
-    match classify_command_why(cmd) {
+/// **`Ok` は「安全」という意味ではない** — 承認が要るものも `Ok` になる。
+pub fn check_command(cmd: &ValidationCommand) -> Result<(), String> {
+    match classify_why(cmd) {
         (ValidationRisk::Forbidden, why) => Err(why),
         _ => Ok(()),
     }
+}
+
+/// 文字列 1 本を検証コマンドとして受け取る (SPEC / 旧形式の入口)。
+///
+/// **構造へ直してから判定する。** 文字列のまま判定して、あとで別の層が
+/// もう一度割ると、判定したものと実行するものがずれる。
+pub fn parse_command(line: &str) -> Result<ValidationCommand, String> {
+    let cmd = ValidationCommand::parse(line)?;
+    check_command(&cmd)?;
+    Ok(cmd)
 }
 
 /// 担当ファイルのパターンがワークスペースの内側に収まっているか。
@@ -365,7 +445,7 @@ pub fn validate_plan(tasks: &[TeamTask], definition_of_done: &[String]) -> Vec<P
             if check_command(c).is_err() {
                 issues.push(PlanIssue::DangerousCommand {
                     task: t.id,
-                    command: c.clone(),
+                    command: c.display(),
                 });
             }
         }
@@ -741,6 +821,15 @@ mod tests {
         }
     }
 
+    /// 文字列 1 本の危険度 (テストを読みやすくするための包み)。
+    fn risk(line: &str) -> ValidationRisk {
+        match ValidationCommand::parse(line) {
+            Ok(c) => classify(&c),
+            // 引用符が閉じていない等は、そもそも受け付けない。
+            Err(_) => ValidationRisk::Forbidden,
+        }
+    }
+
     #[test]
     fn 危険なコマンドを拒否する() {
         for bad in [
@@ -753,19 +842,10 @@ mod tests {
             "cargo test; echo done",
             "cargo test | head",
         ] {
-            assert!(check_command(bad).is_err(), "{bad} を通してしまった");
+            assert_eq!(risk(bad), ValidationRisk::Forbidden, "{bad} を通した");
         }
-        for ok in [
-            "cargo test auth",
-            "npm test",
-            "cargo fmt --check",
-            "just ci",
-        ] {
-            assert!(
-                check_command(ok).is_ok(),
-                "{ok} を弾いた: {:?}",
-                check_command(ok)
-            );
+        for ok in ["cargo test auth", "npm test", "cargo fmt --check", "just ci"] {
+            assert_ne!(risk(ok), ValidationRisk::Forbidden, "{ok} を弾いた");
         }
     }
 
@@ -782,17 +862,12 @@ mod tests {
             ".\\cargo.exe test",
             "C:cargo test",
         ] {
-            assert_eq!(
-                classify_command(bad),
-                ValidationRisk::Forbidden,
-                "{bad} を通してしまった"
-            );
-            assert!(check_command(bad).is_err(), "{bad} を通してしまった");
+            assert_eq!(risk(bad), ValidationRisk::Forbidden, "{bad} を通した");
         }
     }
 
     #[test]
-    fn リポジトリのコードを実行しうるものはsafeにしない() {
+    fn リポジトリのコードを実行しうるものは自動実行しない() {
         // ビルド・テスト・スクリプト実行系は、シェルのメタ文字が 1 つも
         // 無くても **リポジトリ内の任意コードを実行できる**
         // (build.rs / conftest.py / Makefile / package.json の scripts …)。
@@ -815,15 +890,63 @@ mod tests {
             "dotnet test",
             "go test ./...",
         ] {
-            assert_eq!(
-                classify_command(c),
-                ValidationRisk::RepositoryCodeExecution,
-                "{c} を安全と判定した"
-            );
+            let r = risk(c);
+            assert_eq!(r, ValidationRisk::RepositoryCodeExecution, "{c}");
+            assert!(!r.auto_runnable(), "{c} を人の承認なしで実行する");
+            assert!(r.needs_approval(), "{c} が承認を通らない");
         }
-        // 逆に、リポジトリのコードを実行しないと言い切れるものは Safe。
-        for c in ["rustfmt --check src/a.rs", "shellcheck tools/x.sh"] {
-            assert_eq!(classify_command(c), ValidationRisk::Safe, "{c} を弾いた");
+    }
+
+    #[test]
+    fn 書き換えるかどうかは旗で決まる() {
+        // **名前だけでは決まらない。** `black --check .` は読むだけだが
+        // `black .` はファイルをその場で書き換える。同じ実行体・同じ
+        // 許可リスト・シェルのメタ文字ゼロで、意味だけが違う。
+        let read_only = [
+            "shellcheck file.sh",
+            "black --check .",
+            "black --diff .",
+            "ruff check .",
+            "ruff format --check .",
+            "rustfmt --check src/main.rs",
+        ];
+        let mutating = [
+            "black .",
+            "ruff check --fix .",
+            "ruff check --unsafe-fixes .",
+            "ruff format .",
+            "ruff .",
+            "rustfmt src/main.rs",
+        ];
+        for c in read_only {
+            let r = risk(c);
+            assert_eq!(r, ValidationRisk::ReadOnly, "{c} を書き換える側にした");
+            assert!(r.auto_runnable(), "{c} を自動実行しない");
+        }
+        for c in mutating {
+            let r = risk(c);
+            assert_eq!(r, ValidationRisk::WorkspaceMutation, "{c} を読むだけにした");
+            assert!(!r.auto_runnable(), "{c} を人の承認なしで実行する");
+            assert!(r.needs_approval(), "{c} が承認を通らない");
+        }
+    }
+
+    #[test]
+    fn 自動実行してよいのは読むだけのものに限る() {
+        // **不変条件**: 自動実行 = 読むだけ。ここが崩れると、AI が書いた
+        // 計画が人の承認なしにファイルを書き換えられる。
+        for c in [
+            "cargo test",
+            "black .",
+            "rustfmt src/a.rs",
+            "ruff check --fix .",
+            "npm test",
+            "make",
+        ] {
+            assert!(
+                !risk(c).auto_runnable(),
+                "{c} を人の承認なしで実行してしまう"
+            );
         }
     }
 
@@ -840,11 +963,27 @@ mod tests {
             "sh -c 'echo hi'",
             "terraform apply",
         ] {
-            assert_eq!(
-                classify_command(bad),
-                ValidationRisk::Forbidden,
-                "{bad} を通してしまった"
-            );
+            assert_eq!(risk(bad), ValidationRisk::Forbidden, "{bad} を通した");
+        }
+    }
+
+    #[test]
+    fn windowsのシェル特殊文字も断る() {
+        // `.cmd` / `.bat` の実行体は std が cmd.exe 越しに起こすので、
+        // **cmd.exe の解釈が効く**。`%VAR%` の展開・`^` の脱出・`!` の
+        // 遅延展開で、判定した文字列と実行される文字列が別物になる。
+        for bad in [
+            "npm run %PATH%",
+            "npm run %COMSPEC%",
+            "npm run a^b",
+            "npm run a!b!",
+            "npm run (x)",
+            "cargo test a&b",
+            "cargo test a|b",
+            "cargo test a>b",
+            "cargo test a<b",
+        ] {
+            assert_eq!(risk(bad), ValidationRisk::Forbidden, "{bad} を通した");
         }
     }
 
@@ -888,7 +1027,7 @@ mod tests {
         a.validation
             .runs
             .push(super::super::model::ValidationRun::passed(
-                a.validation_commands[0].clone(),
+                a.validation_commands[0].display(),
             ));
         assert!(
             !goal_done(&[a.clone()], &["done".into()], true),

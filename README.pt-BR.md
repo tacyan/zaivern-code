@@ -237,7 +237,13 @@ quer que `/tmp/cargo` seja. push, merge, deploy, publish, elevação de privilé
 e comandos destrutivos são recusados. E tudo que pode executar código do
 repositório (`cargo test`, `npm test`, `pytest`, `make`, `node`, `go test`)
 **espera a sua aprovação antes de rodar uma única linha** — um corpo de teste,
-um `build.rs` ou um `Makefile` fazem tudo o que um shell faz. Toda execução tem
+um `build.rs` ou um `Makefile` fazem tudo o que um shell faz. O mesmo vale para
+o que **escreve nos seus arquivos**: `black .` e `rustfmt src/lib.rs` pedem
+aprovação, `black --check .` e `rustfmt --check src/lib.rs` não — quem decide é
+a flag, não o nome da ferramenta. O executável também é resolvido pelo próprio
+Zaivern em vez de deixar o SO procurar no `PATH`, então um `rustfmt` plantado
+dentro do workspace nunca substitui o real, e nenhum shell fica entre o que foi
+verificado e o que roda. Toda execução tem
 timeout, é encerrada com a árvore de processos inteira quando você para a
 equipe, e sempre termina em um resultado: passou, falhou, estourou o tempo, foi
 cancelada, não pôde iniciar ou perdeu conexão com o executor. **Uma aprovação

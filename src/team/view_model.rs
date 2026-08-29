@@ -239,7 +239,7 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
             attempts: t.attempts,
             files: t.files.clone(),
             acceptance_criteria: t.acceptance_criteria.clone(),
-            validation_commands: t.validation_commands.clone(),
+            validation_commands: t.validation_commands.iter().map(|c| c.display()).collect(),
             validation_ok: t.validation.passed(&t.validation_commands),
             validation_ran: !t.validation.runs.is_empty(),
             validation_failed: t.validation.failed(),

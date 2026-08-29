@@ -251,7 +251,13 @@ privilege escalation and destructive commands are refused outright. And
 anything that can execute code from the repository — `cargo test`, `npm test`,
 `pytest`, `make`, `node`, `go test` — **waits for your approval before a single
 line runs**, because a test body, a `build.rs` or a `Makefile` can do anything
-a shell can. Every run has a timeout, is killed as a whole process tree when
+a shell can. So does anything that would **write to your files**: `black .`
+and `rustfmt src/lib.rs` need approval, while `black --check .` and
+`rustfmt --check src/lib.rs` do not — the flag, not the tool's name, decides.
+Zaivern also resolves the executable itself instead of letting the OS search
+`PATH`, so a `rustfmt` planted inside the workspace can never stand in for the
+real one, and no shell (`sh -c`, `cmd /C`) is ever placed between what was
+checked and what runs. Every run has a timeout, is killed as a whole process tree when
 you stop the team, and always settles: passed, failed, timed out, cancelled,
 could not start, or runner disconnected. **An approval covers one validation
 run, not a command name**: a different task, a re-run after a rejected review,

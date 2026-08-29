@@ -221,7 +221,11 @@ blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**
 basename 就会真的去跑 `/tmp/cargo`。push、merge、deploy、publish、权限提升和
 破坏性操作直接拒绝。而**可能执行仓库内代码的命令** (`cargo test`、`npm test`、
 `pytest`、`make`、`node`、`go test`) **在你批准之前一行都不会运行**——测试本体、
-`build.rs`、`Makefile` 能做的事和 shell 一样多。每次执行都有超时，停止团队时会
+`build.rs`、`Makefile` 能做的事和 shell 一样多。**会写文件的命令**同理：
+`black .` 和 `rustfmt src/lib.rs` 需要批准，而 `black --check .` 和
+`rustfmt --check src/lib.rs` 不需要——决定的是参数而不是工具名。可执行文件
+也由 Zaivern 自己从 PATH 解析，所以放在工作区里的假 `rustfmt` 不会顶替真的，
+并且在"检查过的东西"和"实际运行的东西"之间不会插入任何 shell。每次执行都有超时，停止团队时会
 连同整个进程树一起结束，并且一定有结果：通过、失败、超时、已停止、无法启动或
 执行器断开。**一次批准只覆盖一次验证运行，而不是一个命令名**：换一个任务、
 评审要求修改后的重跑、打回后的重试，都会重新询问，因为被测试的代码已经不是

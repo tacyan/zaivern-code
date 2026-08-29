@@ -293,26 +293,57 @@ Organization Board は Architect / Implementer / Reviewer / QA / Integrator
 
 ### 検証コマンドは危険度で分ける
 
-**「許可リストに載っているから安全」ではない。** `cargo test` にシェルの
-メタ文字は 1 つも無いが、`build.rs` / テスト本体 / `conftest.py` /
-`Makefile` / `package.json` の `scripts` を通じて**リポジトリ内の任意コードを
-実行できる**。`graph::classify_command` は 3 つに分ける:
+**「許可リストに載っているから安全」でも「名前が整形ツールだから安全」でも
+ない。** `cargo test` にシェルのメタ文字は 1 つも無いが、`build.rs` /
+テスト本体 / `conftest.py` / `Makefile` / `package.json` の `scripts` を
+通じてリポジトリ内の任意コードを実行できる。`black --check .` は読むだけ
+だが `black .` は**ファイルをその場で書き換える** — 同じ実行体、同じ
+許可リスト、旗ひとつで意味が変わる。
+
+`graph::classify` は**実行体と引数の両方**を見て 4 段に分ける:
 
 | 危険度 | 意味 | 例 | 扱い |
 | --- | --- | --- | --- |
-| `Forbidden` | 実行しない | `git push` / `cargo publish` / `sudo` / `rm -rf` / `/tmp/cargo test` / シェルのメタ文字 | 計画に入れない。混ざっていたら `NeedsUser` |
-| `RepositoryCodeExecution` | リポジトリ内のコードを実行しうる | `cargo test` / `npm test` / `pytest` / `make` / `node` / `go test` | **人が承認するまで 1 行も実行しない** |
-| `Safe` | リポジトリのコードを実行しないと言い切れる | `rustfmt` / `shellcheck` / `black` / `ruff` | そのまま実行する |
+| `ReadOnly` | リポジトリのコードを実行せず、workspace も書き換えない | `shellcheck x.sh` / `black --check .` / `ruff check .` / `rustfmt --check src/a.rs` | **自動実行してよい唯一の段** |
+| `RepositoryCodeExecution` | リポジトリ内のコードを実行しうる | `cargo test` / `npm test` / `pytest` / `make` / `node` / `go test` | 人が承認するまで 1 行も実行しない |
+| `WorkspaceMutation` | workspace を書き換えうる | `black .` / `ruff check --fix .` / `ruff format .` / `rustfmt src/a.rs` | **MVP では自動実行しない。** 明示の承認を通す |
+| `Forbidden` | 実行しない | パス指定 / シェルのメタ文字 / `git push` / `cargo publish` / `sudo` / `rm -rf` | 承認しても実行しない |
 
-* **実行ファイルにパスが混ざっていたら実行しない** (`/tmp/cargo test` /
-  `./cargo test` / `tools/python x.py` / `C:\tools\cargo.exe test`)。
-  basename だけで許すと「`cargo` だから許可」で `/tmp/cargo` が起きる
-* 拡張子つきの指定 (`cargo.exe`) も PATH 解決の素の名前ではないので通さない
-* シェルのメタ文字 (`; | & > < \` $` 改行) を含む文字列は実行しない
-* コマンド・引数・cwd を分けて扱い、`sh -c` を挟まない
-* 迷ったら `Safe` に入れない — 設定ファイルから任意のコードを読み込むもの
-  (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は
+* 読むだけだと言い切れる形は表で持つ (`read_only_mode`)。`ruff` は
+  サブコマンドまで見る (`check` は読むだけ / `format` は `--check` が要る)。
+  **どちらとも言い切れないものは書き換える側へ倒す**
+* 迷ったら `ReadOnly` に入れない — 設定ファイルから任意のコードを読み込む
+  もの (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は
   「検査するだけ」に見えても実行しうる
+
+### 判定した実体と、OS が起こす実体を一致させる
+
+```
+Planner → ValidationCommand{executable, args}
+        → 実体の解決 (PATH を自分で引く)
+        → 危険度の判定
+        → 承認ゲート
+        → その実体 + argv + cwd で起動
+```
+
+* **コマンドは構造のまま運ぶ** (`ValidationCommand`)。文字列へ戻すのは
+  画面と台帳の見出しだけで、そこから実行経路へは戻らない。
+  `split_whitespace` は引用符を知らないので、
+  `cargo test --package "my package"` が 2 つの引数に割れる
+* **PATH は自分で引く** (`validation_command::resolve_in`)。
+  `Command::new("rustfmt")` に任せると OS がもう一度引くので、
+  `PATH=<workspace>/bin:$PATH` に偽物を置くだけで乗っ取られる。
+  確定した絶対パスをそのまま `Command` へ渡す
+* **信用しない場所**: workspace の内側 / 相対パス / 空の PATH 要素
+  (空は「カレント」を意味する)。見つけた時点で断る — 後ろの本物へ
+  黙って落ちると、OS が実行するのは前の偽物なのに判定は後ろのものに
+  なる
+* **シェルは 1 段も挟まない。** `sh -c` も `cmd /C` も使わない。
+  Windows の `.cmd` / `.bat` は `PATHEXT` で実体を解決し、そのパスを
+  std へ渡す (バッチの引数の逃がし方は std が持っている)
+* `SHELL_METACHARS` には **Windows の cmd.exe が特別扱いする字**も入れる
+  (`% ! ^ ( ) " '`)。`%VAR%` の展開で、判定した文字列と cmd.exe が
+  解釈する文字列が別物になる経路を最初から塞ぐ
 
 ### 承認は「その 1 回」にしか効かない
 

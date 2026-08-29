@@ -20,6 +20,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::validation_command::ValidationCommand;
+
 /// 既存の調停層と同じセッション ID (`terminal::Session::id`)。
 pub type SessionId = crate::coordinator::SessionId;
 
@@ -488,7 +490,10 @@ pub struct ValidationState {
 
 impl ValidationState {
     /// 全部走って全部成功したか。要求されたコマンドの一覧を渡す。
-    pub fn passed(&self, required: &[String]) -> bool {
+    ///
+    /// 照合は**見出し** (`ValidationCommand::display`) で行う。実行そのもの
+    /// は構造化した形で渡っているので、ここは台帳の突き合わせだけ。
+    pub fn passed(&self, required: &[ValidationCommand]) -> bool {
         if self.running {
             return false;
         }
@@ -497,9 +502,10 @@ impl ValidationState {
             // ここへ来るのは復元した壊れかけの状態だけ。安全側 (未検証) に倒す。
             return false;
         }
-        required
-            .iter()
-            .all(|c| self.runs.iter().any(|r| r.command == *c && r.ok()))
+        required.iter().all(|c| {
+            let label = c.display();
+            self.runs.iter().any(|r| r.command == label && r.ok())
+        })
     }
 
     /// 1 本でも失敗しているか。**人が止めたものは失敗に数えない**
@@ -521,7 +527,7 @@ impl ValidationState {
     /// 未実行と成功を混ぜないため。一方で**走らせるものが 1 本も無いタスクを
     /// 永久に `Validating` で止めてはいけない**ので、「先へ進んでよいか」は
     /// こちらで判断する。2 つを分けておかないと、どちらかの意味が必ず歪む。
-    pub fn settled(&self, required: &[String]) -> bool {
+    pub fn settled(&self, required: &[ValidationCommand]) -> bool {
         !self.running && (required.is_empty() || self.passed(required))
     }
 }
@@ -664,7 +670,14 @@ pub struct TeamTask {
     pub files: Vec<String>,
     pub required_caps: Vec<String>,
     pub acceptance_criteria: Vec<String>,
-    pub validation_commands: Vec<String>,
+    /// **構造のまま持つ** (実行体と引数)。
+    ///
+    /// 文字列で持つと、判定した文字列と実行する文字列が別物になりうる
+    /// (`split_whitespace` は引用符を知らない / cmd.exe は `%VAR%` を
+    /// 展開する)。文字列へ戻すのは画面と台帳の見出しだけ
+    /// ([`super::validation_command::ValidationCommand::display`])。
+    /// 旧版の文字列一覧も読める (serde が構造へ正規化する)。
+    pub validation_commands: Vec<ValidationCommand>,
     pub state: TeamTaskState,
     pub assigned_agent: Option<AgentId>,
     pub assigned_session: Option<SessionId>,
@@ -928,7 +941,10 @@ mod tests {
 
     #[test]
     fn 検証は要求された全コマンドの成功を要る() {
-        let req = vec!["cargo test a".to_string(), "cargo test b".to_string()];
+        let req = vec![
+            ValidationCommand::parse("cargo test a").unwrap(),
+            ValidationCommand::parse("cargo test b").unwrap(),
+        ];
         let mut v = ValidationState::default();
         assert!(!v.passed(&req), "未実行で通してはいけない");
         v.runs.push(ValidationRun::passed("cargo test a"));
@@ -947,13 +963,12 @@ mod tests {
 
     #[test]
     fn 実行中は通さない() {
-        let req = vec!["x".to_string()];
         let v = ValidationState {
             running: true,
             runs: vec![ValidationRun::passed("x")],
             generation: 0,
         };
-        assert!(!v.passed(&req));
+        assert!(!v.passed(&[ValidationCommand::parse("x").unwrap()]));
     }
 
     #[test]

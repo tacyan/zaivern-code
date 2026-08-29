@@ -238,7 +238,13 @@ elevación de privilegios y los comandos destructivos se rechazan. Y todo lo que
 puede ejecutar código del repositorio (`cargo test`, `npm test`, `pytest`,
 `make`, `node`, `go test`) **espera tu aprobación antes de ejecutar una sola
 línea**: el cuerpo de un test, un `build.rs` o un `Makefile` pueden hacer lo
-mismo que un shell. Cada ejecución tiene tiempo límite, se termina con todo el
+mismo que un shell. Lo mismo con lo que **escribe en tus archivos**: `black .` y
+`rustfmt src/lib.rs` piden aprobación, `black --check .` y
+`rustfmt --check src/lib.rs` no — lo decide la opción, no el nombre de la
+herramienta. El ejecutable también lo resuelve Zaivern en vez de dejar que el SO
+busque en `PATH`, así que un `rustfmt` colocado dentro del workspace nunca
+suplanta al real, y no hay ningún shell entre lo que se comprobó y lo que se
+ejecuta. Cada ejecución tiene tiempo límite, se termina con todo el
 árbol de procesos cuando paras el equipo, y siempre acaba en un resultado:
 pasó, falló, se agotó el tiempo, se canceló, no pudo iniciarse o se perdió la
 conexión con el ejecutor. **Una aprobación cubre una ejecución de validación,

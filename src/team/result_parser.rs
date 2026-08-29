@@ -276,8 +276,8 @@ pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectR
     let missing: Vec<String> = task
         .validation_commands
         .iter()
-        .filter(|c| !validation.iter().any(|v| v.command == **c))
-        .cloned()
+        .map(|c| c.display())
+        .filter(|label| !validation.iter().any(|v| v.command == *label))
         .collect();
     if !missing.is_empty() {
         return Err(RejectReason::ValidationMissing(missing));
@@ -551,7 +551,8 @@ mod tests {
         let mut t = task(12, "auth", &[]);
         t.assigned_agent = Some(AgentId::new("backend-api-1"));
         t.files = vec!["src/auth.rs".to_string()];
-        t.validation_commands = vec!["cargo test auth".to_string()];
+        t.validation_commands =
+        vec![super::super::validation_command::ValidationCommand::parse("cargo test auth").unwrap()];
         t
     }
 

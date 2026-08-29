@@ -14,6 +14,7 @@
 //! 示し、それ以外はすべて相対で書く (どのマシンでも同じ文面になる)。
 
 use super::model::{TeamGoal, TeamRole, TeamTask};
+use super::validation_command::ValidationCommand;
 
 /// 指示文の上限 (バイト)。長い指示は途中で切られて意味が壊れるので、
 /// **こちらで切ってから渡す**。
@@ -34,6 +35,13 @@ pub struct Brief<'a> {
     pub upstream: Vec<String>,
     /// このタスクが**触ってはいけない**ファイル (他タスクの担当範囲)。
     pub forbidden_files: Vec<String>,
+}
+
+/// 検証コマンドを**見出しの一覧**にする (指示文へ載せるため)。
+///
+/// 実行はここを通らない — 実行は構造化した形のまま実行器へ渡る。
+fn command_labels(cmds: &[ValidationCommand]) -> Vec<String> {
+    cmds.iter().map(|c| c.display()).collect()
 }
 
 fn bullets(items: &[String]) -> String {
@@ -125,7 +133,7 @@ pub fn implementer(b: &Brief<'_>) -> String {
         s.push_str(&bullets(&t.context));
     }
     s.push_str("\n## 実行する検証コマンド\n");
-    s.push_str(&bullets(&t.validation_commands));
+    s.push_str(&bullets(&command_labels(&t.validation_commands)));
     s.push_str(&format!(
         "\n## 体制\n  - あなたの ID: {}\n  - 親エージェント: {}\n  - ワークスペースルート: {}\n",
         b.agent_id,
@@ -217,7 +225,7 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
          \x20 4. 失敗したら、原因のタスク番号を blockers に書いて報告する\n",
     );
     s.push_str("\n## 実行する検証コマンド\n");
-    s.push_str(&bullets(&b.task.validation_commands));
+    s.push_str(&bullets(&command_labels(&b.task.validation_commands)));
     s.push_str("\n## 禁止事項\n");
     s.push_str(
         "  - git push / PR 作成 / merge / deploy / release は**行わない**\n\

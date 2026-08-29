@@ -41,6 +41,7 @@ use super::result_parser::{self as rp, ReportedStatus};
 use super::reviewer;
 use super::scheduler::{self, Candidate};
 use super::state_machine as sm;
+use super::validation_command::ValidationCommand;
 
 /// Activity Feed に残すイベント数の上限。
 pub const EVENT_CAP: usize = 500;
@@ -111,8 +112,11 @@ pub struct ValidationSpec {
     /// 結果を戻すときに必ず添える。添えないと、差し戻して配り直した後に
     /// 古い実行の結果が遅れて届いて、新しい試行の証跡を上書きする。
     pub execution: String,
-    /// 実行してよいと判定されたコマンド行 (実行側で語に割る)。
-    pub commands: Vec<String>,
+    /// 実行してよいと判定されたコマンド。**構造のまま渡す。**
+    ///
+    /// 実行側で語に割り直さない — 割り方が 1 文字でも違えば、判定した
+    /// ものと OS が実行するものがずれる。
+    pub commands: Vec<ValidationCommand>,
     pub cwd: PathBuf,
     /// 時間切れ (秒)。**無期限には待たない。**
     pub timeout_secs: u64,
@@ -576,7 +580,10 @@ impl TeamRuntime {
     #[cfg(test)]
     pub fn set_validation_commands_for_test(&mut self, task: TaskId, cmds: &[&str]) {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
-            t.validation_commands = cmds.iter().map(|s| s.to_string()).collect();
+            t.validation_commands = cmds
+                .iter()
+                .map(|s| ValidationCommand::parse(s).expect("テストのコマンドは組み立てられる"))
+                .collect();
         }
     }
 
@@ -1882,7 +1889,7 @@ impl TeamRuntime {
     /// **リポジトリのコードを実行しうるものは承認を求めてから**実行する。
     fn advance(&mut self, out: &mut Vec<TeamEffect>) {
         let cwd = self.workspace.clone();
-        let pending: Vec<(TaskId, Vec<String>)> = self
+        let pending: Vec<(TaskId, Vec<ValidationCommand>)> = self
             .tasks
             .iter()
             .filter(|t| t.state == TeamTaskState::Validating && !t.validation.running)
@@ -1895,14 +1902,21 @@ impl TeamRuntime {
                 self.settle_validation(task);
                 continue;
             }
-            // **危険度で分ける。** 「許可リストに載っている = 安全」ではない。
+            // **危険度で分ける。** 「許可リストに載っている = 安全」でも
+            // 「名前が整形ツールだから安全」でもない (`black --check .` は
+            // 読むだけだが `black .` は書き換える)。
             let mut forbidden: Vec<String> = Vec::new();
-            let mut repo_code: Vec<String> = Vec::new();
+            let mut needs_ok: Vec<(String, graph::ValidationRisk)> = Vec::new();
             for c in &commands {
-                match graph::classify_command(c) {
-                    graph::ValidationRisk::Forbidden => forbidden.push(c.clone()),
-                    graph::ValidationRisk::RepositoryCodeExecution => repo_code.push(c.clone()),
-                    graph::ValidationRisk::Safe => {}
+                let risk = graph::classify(c);
+                if risk.auto_runnable() {
+                    // 読むだけ。人に聞かずに走らせてよい唯一の段。
+                    continue;
+                }
+                if risk.needs_approval() {
+                    needs_ok.push((c.display(), risk));
+                } else {
+                    forbidden.push(c.display());
                 }
             }
             if !forbidden.is_empty() {
@@ -1934,28 +1948,51 @@ impl TeamRuntime {
                 .task(task)
                 .map(|t| t.validation.generation)
                 .unwrap_or_default();
-            let need_ok: Vec<String> = repo_code
+            let need_ok: Vec<String> = needs_ok
                 .iter()
-                .filter(|c| !self.validation_approved(task, generation, c))
-                .cloned()
+                .filter(|(c, _)| !self.validation_approved(task, generation, c))
+                .map(|(c, _)| c.clone())
                 .collect();
             if !need_ok.is_empty() {
                 // **承認を通るまで 1 行も実行しない。** sandbox を持たない
                 // 以上、`cargo test` は「リポジトリ内の任意コードの実行」と
                 // 同じ重さで扱う。承認は Run 単位で覚える (試行のたびに
                 // 聞き直すと、承認が読まれない儀式になる)。
+                //
+                // 書き換えるもの (`black .` / `rustfmt src/a.rs`) も同じ
+                // ゲートを通す。**MVP では自動実行しない** — 人が「これは
+                // 書き換えてよい」と言ったときだけ動く。
+                let mutating = needs_ok
+                    .iter()
+                    .any(|(_, r)| *r == graph::ValidationRisk::WorkspaceMutation);
                 let listed = need_ok.join(", ");
+                let (reason, impact) = if mutating {
+                    (
+                        format!("#{task} の検証はワークスペースを書き換えます: {listed}"),
+                        concat!(
+                            "整形や自動修正は、あなたのファイルをその場で書き換えます",
+                            " (`black .` / `rustfmt src/a.rs` / `ruff check --fix .`)。",
+                            "読むだけにするなら `--check` を付けてください"
+                        )
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        format!("#{task} の検証はリポジトリのコードを実行します: {listed}"),
+                        concat!(
+                            "テスト・ビルド・スクリプトはリポジトリ内の任意コードを実行できます",
+                            " (build.rs / テスト本体 / conftest.py / Makefile など)。",
+                            "隔離された環境ではないので、承認したものだけを実行します"
+                        )
+                        .to_string(),
+                    )
+                };
                 let d = self.make_decision(
                     DecisionKind::ValidationExecution,
                     Some(task),
                     None,
-                    format!("#{task} の検証はリポジトリのコードを実行します: {listed}"),
-                    concat!(
-                        "テスト・ビルド・スクリプトはリポジトリ内の任意コードを実行できます",
-                        " (build.rs / テスト本体 / conftest.py / Makefile など)。",
-                        "隔離された環境ではないので、承認したものだけを実行します"
-                    )
-                    .into(),
+                    reason,
+                    impact,
                     vec!["approve".into(), "reject".into()],
                     // **鍵にも世代を入れる。** 入れないと、次の検証回で
                     // 「同じ鍵の判断が既にある」と見なされて聞き直せない。

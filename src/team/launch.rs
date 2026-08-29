@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::model::{ValidationOutcome, ValidationRun};
+use super::validation_command::ValidationCommand;
 
 /// 起動要求の版。
 pub const LAUNCH_VERSION: u32 = 1;
@@ -277,34 +278,19 @@ pub fn take_in(root: &Path, workspace: &Path, now: u64) -> Option<TeamLaunchRequ
 
 // ── 検証コマンドの実行 ───────────────────────────────────────────────
 
-/// **Windows で `.cmd` / `.bat` として配られる実行体。**
+/// **Windows の `.cmd` / `.bat` は、拡張子を解決してから起こす。**
 ///
-/// `npm` / `yarn` / `pnpm` などは Windows では `npm.cmd` であり、
-/// `Command::new("npm")` は `NotFound` で落ちる (実体が `npm` という名前で
-/// 存在しないため)。**「見つからない」で検証が全部 127 になる**ので、
-/// この一覧に載っているものは `cmd /C` 越しに起こし直す。
+/// `npm` / `yarn` / `pnpm` などは Windows では `npm.cmd` なので、名前の
+/// ままでは見つからない。以前は `cmd /C npm` と**シェルを挟んで**いたが、
+/// それは cmd.exe にもう一度解釈させることでもあった (`%VAR%` の展開・
+/// `^` の脱出・`!` の遅延展開で、判定した文字列と実行される文字列が
+/// 別物になる)。
 ///
-/// **コマンド全体を 1 引数へ押し込まない。** Rust の `Command` は引数ごとに
-/// Windows の規則で引用するので、cmd 側の再解析とずれて失敗する
-/// (CLAUDE.md の既知の罠)。語に分けたまま渡す。
-pub const WINDOWS_SHIM_BINS: &[&str] = &[
-    "npm", "npx", "yarn", "pnpm", "bun", "tsc", "eslint", "prettier", "jest", "vitest", "biome",
-    "just", "gradle", "mvn", "flutter", "composer", "rake", "bundle", "tox",
-];
-
-/// この語は Windows で `cmd /C` 越しに起こす必要があるか (純関数)。
-///
-/// **判定を切り出してあるのは、Windows のビルドが手元で回らない環境でも
-/// 表で固定できるようにするため。** `#[cfg(windows)]` の中に埋めると、
-/// macOS / Linux では 1 度もコンパイルされない (CLAUDE.md の実測)。
-pub fn needs_windows_shim(head: &str) -> bool {
-    let base = head.rsplit(['/', '\\']).next().unwrap_or(head);
-    // 拡張子つきで書かれていたら、そのまま起こせる
-    if base.contains('.') {
-        return false;
-    }
-    WINDOWS_SHIM_BINS.contains(&base)
-}
+/// いまは [`super::validation_command::resolve_in`] が `PATHEXT` を見て
+/// `npm.cmd` の**実体**を確定し、そのパスをそのまま `Command` へ渡す。
+/// バッチファイルの引数の逃がし方は std が持っている (Rust 1.77.2 以降)。
+/// こちらは語に入りうるメタ文字を [`super::graph::SHELL_METACHARS`] で
+/// 先に断っているので、cmd.exe の解釈で意味が変わる余地を残さない。
 
 /// 検証の既定の時間切れ (秒)。
 ///
@@ -344,33 +330,74 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// 検証コマンド 1 本を実行する。
 ///
-/// **シェルを挟まない。** 語に分けて実体を直に起こす — `sh -c` を通すと
-/// 「コマンド、引数、cwd を分離して扱う」という約束が崩れる。
-/// 実行してはいけないもの ([`super::graph::check_command`]) は実行せず、
-/// 終了コード 126 (実行不可) を返す。
+/// **シェルを挟まない。** 実行体と引数は分かれたまま OS へ渡す — 文字列へ
+/// 連結し直すと、`sh -c` や `cmd /C` がもう一度解釈して、判定したものと
+/// 実行されるものがずれる。
+///
+/// **実体は自分で解決する。** `Command::new("rustfmt")` に任せると OS が
+/// もう一度 PATH を引くので、`PATH=<workspace>/bin:$PATH` に偽の実行体を
+/// 置くだけで乗っ取られる。ここで確定した絶対パスをそのまま渡すので、
+/// 判定した実体と OS が実行する実体が同じであることが構造的に決まる。
 ///
 /// **必ず決着する。** 時間切れ・停止・起動失敗のどれでも、対応する
 /// [`ValidationOutcome`] を持った結果を返す (返さない経路は無い)。
-///
-/// Windows で `.cmd` 配布の実行体だけは `cmd /C` を挟むが、そこでも
-/// **引数は分けたまま**渡す ([`needs_windows_shim`])。
 pub fn run_validation_command(
-    cmd: &str,
+    cmd: &ValidationCommand,
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
     pid_slot: &PidSlot,
 ) -> ValidationRun {
+    let path = std::env::var("PATH").ok();
+    let pathext = std::env::var("PATHEXT").ok();
+    run_validation_command_in(
+        cmd,
+        cwd,
+        timeout,
+        cancel,
+        pid_slot,
+        path.as_deref(),
+        pathext.as_deref(),
+    )
+}
+
+/// PATH を明示して実行する。
+///
+/// **探索の入力を引数にしてある。** 環境変数を差し替えるテストは並列に
+/// 走る他のテストへ漏れるので、`PATH` の先頭に workspace が入っている
+/// 状況は**この入口から**再現する (`team_dir_in` / `post_in` と同じ流儀)。
+#[allow(clippy::too_many_arguments)]
+pub fn run_validation_command_in(
+    cmd: &ValidationCommand,
+    cwd: &Path,
+    timeout: std::time::Duration,
+    cancel: &CancelFlag,
+    pid_slot: &PidSlot,
+    path_var: Option<&str>,
+    pathext: Option<&str>,
+) -> ValidationRun {
+    let label = cmd.display();
+    // 実行してはいけないものは、ここでも断る (呼ぶ側の判定を信じ切らない)。
     if super::graph::check_command(cmd).is_err() {
-        return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
+        return ValidationRun::new(label, 126, ValidationOutcome::SpawnFailed);
     }
-    let mut words = cmd.split_whitespace();
-    let Some(head) = words.next() else {
-        return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
-    };
-    let args: Vec<&str> = words.collect();
-    let out = run_words(head, &args, cwd, timeout, cancel, pid_slot);
-    ValidationRun::new(cmd, out.0, out.1)
+    // **実体を確定する。** 信用できない場所にあれば実行しない。
+    let program =
+        match super::validation_command::resolve_in(&cmd.executable, cwd, path_var, pathext) {
+            Ok(p) => p,
+            Err(e) => {
+                // **理由を残す。** 「見つからない」と「信用できない場所に
+                // あった」は直し方がまるで違う (入れるか、PATH を直すか)。
+                return ValidationRun::new(
+                    format!("{label}  ({})", e.detail()),
+                    127,
+                    ValidationOutcome::SpawnFailed,
+                );
+            }
+        };
+    let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
+    let out = run_resolved(&program, &args, cwd, timeout, cancel, pid_slot);
+    ValidationRun::new(label, out.0, out.1)
 }
 
 /// **検証コマンドの並びを順に実行する。**
@@ -383,7 +410,7 @@ pub fn run_validation_command(
 ///   コマンドが「誰も知らない子」として走り出す (自分のプロセスグループ
 ///   を持つので、アプリが終わっても死なない)
 pub fn run_validation_list(
-    commands: &[String],
+    commands: &[ValidationCommand],
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
@@ -401,13 +428,18 @@ pub fn run_validation_list(
     runs
 }
 
-/// 語に分けた 1 本を実行する (終了コードと終わり方を返す)。
+/// **解決済みの実体**を起こす (終了コードと終わり方を返す)。
 ///
-/// 分けてあるのは**時間切れと停止をテストするため**。許可リストに載っている
-/// コマンドは、どれも「確実に終わらない」形で起動できるとは限らないので、
-/// テストは実体 (`sleep` / `ping`) をここへ直接渡す。
-pub fn run_words(
-    head: &str,
+/// `Command::new` へ渡すのは絶対パス。**名前を渡さない** — 渡すと OS が
+/// PATH を引き直し、こちらが判定したのとは別の実体が動きうる。
+///
+/// Windows の `.cmd` / `.bat` は std が cmd.exe 越しに起こす (引数の
+/// 逃がし方も std が持っている)。**自分で `cmd /C` を組み立てない** —
+/// 組み立てると `%VAR%` の展開や `^` の脱出で、判定した文字列と
+/// cmd.exe が解釈する文字列が別物になる。語に入りうるメタ文字は
+/// [`super::graph::SHELL_METACHARS`] が先に断っている。
+pub fn run_resolved(
+    program: &Path,
     args: &[&str],
     cwd: &Path,
     timeout: std::time::Duration,
@@ -416,13 +448,7 @@ pub fn run_words(
 ) -> (i32, ValidationOutcome) {
     use std::sync::atomic::Ordering;
 
-    let mut command = if cfg!(windows) && needs_windows_shim(head) {
-        let mut c = crate::procx::hidden_command("cmd");
-        c.arg("/C").arg(head);
-        c
-    } else {
-        crate::procx::hidden_command(head)
-    };
+    let mut command = crate::procx::hidden_command(program);
     command
         .args(args)
         .current_dir(cwd)
@@ -438,8 +464,7 @@ pub fn run_words(
         command.process_group(0);
     }
     // **起こす前に札を見る。** 見ないと、停止を頼まれた後に始まった
-    // コマンドが「誰も知らない子」として走り出す (自分のプロセス
-    // グループを持つので、アプリが終わっても死なない)。
+    // コマンドが「誰も知らない子」として走り出す。
     if cancel.load(Ordering::Relaxed) {
         return (130, ValidationOutcome::Cancelled);
     }
@@ -484,7 +509,14 @@ pub fn run_words(
             crate::procx::kill_tree(pid);
             let _ = child.wait();
             pid_slot.store(0, Ordering::Relaxed);
-            return (if why == ValidationOutcome::TimedOut { 124 } else { 130 }, why);
+            return (
+                if why == ValidationOutcome::TimedOut {
+                    124
+                } else {
+                    130
+                },
+                why,
+            );
         }
         std::thread::sleep(POLL);
     }
@@ -786,17 +818,44 @@ mod tests {
         std::fs::remove_dir_all(&b).ok();
     }
 
-    #[test]
-    fn windowsで_cmd越しに起こす語を表で固定する() {
-        // **どの OS でも同じ表を検査する。** `#[cfg(windows)]` の中に判定を
-        // 埋めると macOS / Linux では 1 度もコンパイルされず、Windows の CI
-        // まで誰も気付かない (CLAUDE.md の実測)。
-        for yes in ["npm", "yarn", "pnpm", "tsc", "jest", "C:/tools/npm", "bin/npm"] {
-            assert!(needs_windows_shim(yes), "{yes} を素で起こしてしまう");
+
+    /// テスト用: 名前を PATH から素直に引いて `run_resolved` を呼ぶ。
+    ///
+    /// **本番はここを通らない** — 本番は `resolve` が信用できない場所を
+    /// 弾いてから同じ `run_resolved` を呼ぶ。ここで確かめたいのは
+    /// 「起こしてから畳むまで」の振る舞いだけなので、解決だけ素朴にする。
+    fn run_words(
+        head: &str,
+        args: &[&str],
+        cwd: &Path,
+        timeout: std::time::Duration,
+        cancel: &CancelFlag,
+        pid: &PidSlot,
+    ) -> (i32, ValidationOutcome) {
+        let program = which_for_test(head);
+        run_resolved(&program, args, cwd, timeout, cancel, pid)
+    }
+
+    /// PATH から素朴に引く (テスト専用)。見つからなければ名前のまま返す
+    /// (`spawn` が失敗して `SpawnFailed` になる、という筋書きに使う)。
+    fn which_for_test(name: &str) -> PathBuf {
+        let Ok(path) = std::env::var("PATH") else {
+            return PathBuf::from(name);
+        };
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for dir in path.split(sep) {
+            for ext in if cfg!(windows) {
+                vec!["", ".exe", ".cmd", ".bat"]
+            } else {
+                vec![""]
+            } {
+                let p = Path::new(dir).join(format!("{name}{ext}"));
+                if p.is_file() {
+                    return p;
+                }
+            }
         }
-        for no in ["cargo", "go", "python3", "npm.cmd", "npm.exe", "make"] {
-            assert!(!needs_windows_shim(no), "{no} に余計な cmd を挟む");
-        }
+        PathBuf::from(name)
     }
 
     /// 終わらないコマンド (OS ごとに実体が違う)。
@@ -924,8 +983,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let runs = run_validation_list(
             &[
-                "rustc --zzz-not-a-real-flag".to_string(),
-                "cargo --version".to_string(),
+                ValidationCommand::parse("rustc --zzz-not-a-real-flag").unwrap(),
+                ValidationCommand::parse("cargo --version").unwrap(),
             ],
             &dir,
             std::time::Duration::from_secs(60),
@@ -946,7 +1005,10 @@ mod tests {
         let cancel = new_cancel_flag();
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         let runs = run_validation_list(
-            &["cargo --version".to_string(), "cargo --version".to_string()],
+            &[
+                ValidationCommand::parse("cargo --version").unwrap(),
+                ValidationCommand::parse("cargo --version").unwrap(),
+            ],
             &dir,
             std::time::Duration::from_secs(60),
             &cancel,
@@ -1023,12 +1085,141 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// workspace の中に偽の実行体を置き、PATH の先頭に差し込む。
+    #[cfg(unix)]
+    fn plant_fake(ws: &Path, name: &str, marker: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = ws.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let p = bin.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n: > {}\nexit 0\n", marker.display())).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
+    /// **workspace 内の偽物を、名前を偽装しても実行しない。**
+    ///
+    /// `PATH=<workspace>/bin:$PATH` に `rustfmt` を置くだけで、
+    /// 「読むだけ」と判定されたコマンドが攻撃者の実行体になる。
+    #[cfg(unix)]
+    #[test]
+    fn workspace内の偽の実行体は自動実行しない() {
+        let ws = ws("hijack-exec");
+        std::fs::create_dir_all(&ws).unwrap();
+        let marker = ws.join("hijacked");
+        let orig = std::env::var("PATH").unwrap_or_default();
+        for name in ["rustfmt", "black", "ruff", "shellcheck"] {
+            plant_fake(&ws, name, &marker);
+        }
+        // このテストだけ PATH を差し替える。**プロセス共通なので、
+        // 実際に PATH を変える代わりに解決関数へ直接渡す**
+        // (環境変数の差し替えは並列に走る他のテストへ漏れる)。
+        let path = format!("{}:{}", ws.join("bin").display(), orig);
+        for name in ["rustfmt", "black", "ruff", "shellcheck"] {
+            let got = super::super::validation_command::resolve_in(name, &ws, Some(&path), None);
+            assert!(
+                matches!(
+                    got,
+                    Err(super::super::validation_command::ResolveError::Untrusted { .. })
+                ),
+                "{name} が workspace 内の偽物へ解決された: {got:?}"
+            );
+        }
+        // **実行器も、偽物の PATH を渡されても起こさない。**
+        let r = run_validation_command_in(
+            &ValidationCommand::parse("rustfmt --check src/a.rs").unwrap(),
+            &ws,
+            std::time::Duration::from_secs(10),
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            Some(&path),
+            None,
+        );
+        // **起動できなかった**こと自体が結果。実体を解決せずに OS へ
+        // 名前を渡していたら、本物の `rustfmt` が動いて `Failed` になる
+        // (この違いが「解決している / していない」の分かれ目)。
+        assert_eq!(
+            r.outcome(),
+            ValidationOutcome::SpawnFailed,
+            "実体を解決せずに起こした: {r:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "workspace 内の偽の実行体が動いた: {}",
+            marker.display()
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **読むだけと判定した検証は、workspace を 1 バイトも変えない。**
+    #[cfg(unix)]
+    #[test]
+    fn 読むだけの検証はworkspaceを変えない() {
+        let ws = ws("readonly-invariant");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("a.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(ws.join("b.txt"), "hello\n").unwrap();
+        let before = snapshot_dir(&ws);
+        // 許可リストにあり、この環境に実在しうる読むだけのもの。
+        // 実体が無ければ `SpawnFailed` になるが、**どちらでも workspace は
+        // 変わらない**ことが見たいもの。
+        for line in ["shellcheck a.sh", "black --check .", "ruff check ."] {
+            let cmd = ValidationCommand::parse(line).unwrap();
+            assert_eq!(
+                super::super::graph::classify(&cmd),
+                super::super::graph::ValidationRisk::ReadOnly,
+                "{line} が読むだけになっていない"
+            );
+            let _ = run_validation_command(
+                &cmd,
+                &ws,
+                std::time::Duration::from_secs(30),
+                &new_cancel_flag(),
+                &new_pid_slot(),
+            );
+        }
+        assert_eq!(
+            snapshot_dir(&ws),
+            before,
+            "読むだけの検証が workspace を変えた"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// ディレクトリの中身 (相対パスと内容) を並べたもの。
+    fn snapshot_dir(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, root, out);
+                } else if let Ok(b) = std::fs::read(&p) {
+                    let rel = p
+                        .strip_prefix(root)
+                        .unwrap_or(&p)
+                        .display()
+                        .to_string();
+                    out.push((rel, b));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
     #[test]
     fn 許可されていないコマンドは実行しない() {
         let dir = ws("exec");
         std::fs::create_dir_all(&dir).unwrap();
         let r = run_validation_command(
-            "rm -rf /",
+            &ValidationCommand::parse("rm -rf /").unwrap(),
             &dir,
             std::time::Duration::from_secs(5),
             &new_cancel_flag(),

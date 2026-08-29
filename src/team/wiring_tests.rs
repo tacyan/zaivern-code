@@ -453,6 +453,64 @@ fn 閉じるときに検証を置き去りにしない() {
 }
 
 #[test]
+fn 判定した実体とosが起こす実体を一致させる() {
+    // **`Command::new("rustfmt")` を残さない。** 名前を渡すと OS が
+    // もう一度 PATH を引くので、`PATH=<workspace>/bin:$PATH` に偽物を
+    // 置くだけで、判定したのとは別の実体が動く。
+    let l = src(LAUNCH);
+    let run = function_body(
+        &l,
+        l.find("pub fn run_validation_command_in").expect("実行"),
+    );
+    assert!(
+        run.contains("validation_command::resolve_in(&cmd.executable, cwd, path_var, pathext)"),
+        "実体を自分で解決していない:\n{run}"
+    );
+    assert!(
+        run.contains("run_resolved(&program, &args, cwd"),
+        "解決した実体をそのまま渡していない:\n{run}"
+    );
+    let resolved = function_body(&l, l.find("pub fn run_resolved").expect("起動"));
+    assert!(
+        resolved.contains("crate::procx::hidden_command(program)"),
+        "解決済みのパスで起こしていない:\n{resolved}"
+    );
+    // **シェルを組み立てない。** `sh -c` も `cmd /C` も通さない。
+    for bad in ["cmd\", \"/C", "sh -c", "\"/C\"", "needs_windows_shim"] {
+        assert!(
+            !resolved.contains(bad),
+            "シェルを挟んでいる (`{bad}`):\n{resolved}"
+        );
+    }
+}
+
+#[test]
+fn 検証コマンドは構造のまま実行地点まで運ぶ() {
+    // 文字列へ戻して割り直す場所を作らない。割り方が 1 文字違えば、
+    // 判定したものと OS が実行するものがずれる。
+    let r = src(RUNTIME);
+    assert!(
+        r.contains("pub commands: Vec<ValidationCommand>"),
+        "要求が文字列のまま渡っている"
+    );
+    let l = src(LAUNCH);
+    // 実行器は語に割り直さない。
+    assert!(
+        !l.contains("split_whitespace"),
+        "実行器が文字列を割り直している (判定した形と別物になりうる)"
+    );
+    // 文字列へ戻すのは見出しだけ。
+    let run = function_body(
+        &l,
+        l.find("pub fn run_validation_command_in").expect("実行"),
+    );
+    assert!(
+        run.contains("let label = cmd.display();"),
+        "見出しの作り方が 1 か所に無い"
+    );
+}
+
+#[test]
 fn 起動要求にworkspaceを決めさせない() {
     // **未信頼データに置き場と cwd を決めさせない。** 投函箱の
     // `workspace_root` を書き換えるだけで「別のフォルダを Team Run に

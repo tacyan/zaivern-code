@@ -798,7 +798,8 @@ fn report_and_collect(rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, now
     let agent = t.assigned_agent.clone().expect("担当").0;
     let files: Vec<String> = t.files.clone();
     let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-    let cmds: Vec<&str> = t.validation_commands.iter().map(|s| s.as_str()).collect();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
     let block = result_block(tid, &agent, &cmds, &fs);
     let rows: Vec<(SessionId, SessionState, &str)> = sids
         .iter()
@@ -1246,6 +1247,69 @@ fn 実行しないと決まっているコマンドは承認しても走らな�
 }
 
 #[test]
+fn 書き換える検証は承認前に走らない() {
+    // **`black .` は読むだけではない。** 名前が整形ツールでも、旗ひとつで
+    // ファイルをその場で書き換える。人の承認なしに AI の計画が
+    // workspace を書き換えられてはいけない。
+    let (mut rt, sids, tid) = to_assigned();
+    rt.set_validation_commands_for_test(tid, &["black ."]);
+    let eff = report_and_collect(&mut rt, &sids, tid, 12);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "承認前に書き換える検証を実行した: {eff:?}"
+    );
+    let d = pending_exec_decision(&rt, tid).expect("承認を求めていない");
+    assert!(
+        d.reason.contains("書き換え"),
+        "何が起きるのかを伝えていない: {}",
+        d.reason
+    );
+    // 何度回しても出ない。
+    for now in 13..17 {
+        let eff = idle_tick(&mut rt, now, &sids);
+        assert!(!eff
+            .iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))));
+    }
+    // 承認したら走る (永久に詰まらせない)。
+    rt.apply_action(TeamAction::ApproveDecision(d.id));
+    let eff = idle_tick(&mut rt, 17, &sids);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "承認しても走らない: {eff:?}"
+    );
+}
+
+#[test]
+fn 読むだけの検証は構造のまま実行器へ渡る() {
+    // **判定したものと、実行するものが同じ形であること。** 文字列へ
+    // 戻して実行側で割り直すと、引用符の扱い 1 つでずれる。
+    let (mut rt, sids, tid) = to_assigned();
+    rt.set_validation_commands_for_test(tid, &["shellcheck \"tools/my script.sh\""]);
+    // 報告の JSON を通さずに検証待ちへ入れる (この検査の主題は、発行された
+    // 要求が構造のままかどうか — 報告文の組み立ては別のテストが見ている)。
+    rt.set_state_for_test(tid, TeamTaskState::Validating);
+    let eff = idle_tick(&mut rt, 12, &sids);
+    let v = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::RunValidation(v) => Some(v.clone()),
+            _ => None,
+        })
+        .expect("読むだけなので承認なしで発行される");
+    assert_eq!(v.commands.len(), 1);
+    assert_eq!(v.commands[0].executable, "shellcheck");
+    assert_eq!(
+        v.commands[0].args,
+        vec!["tools/my script.sh".to_string()],
+        "引用符を跨いで割れている"
+    );
+    let _ = sids;
+}
+
+#[test]
 fn 安全なコマンドは承認を求めない() {
     let (mut rt, sids, tid) = to_assigned();
     rt.set_validation_commands_for_test(tid, &["rustfmt --check src/a.rs"]);
@@ -1271,7 +1335,7 @@ fn note_outcome(rt: &mut TeamRuntime, tid: TaskId, code: i32, out: ValidationOut
         .unwrap_or_default();
     let runs = cmds
         .iter()
-        .map(|c| ValidationRun::new(c, code, out))
+        .map(|c| ValidationRun::new(c.display(), code, out))
         .collect();
     rt.note_validation_for(&exec, tid, runs);
 }
@@ -1346,7 +1410,7 @@ fn 古い実行の結果は採用しない() {
     rt.note_validation_for(
         &stale,
         tid,
-        cmds.iter().map(ValidationRun::passed).collect(),
+        cmds.iter().map(|c| ValidationRun::passed(c.display())).collect(),
     );
     let t = rt.task(tid).unwrap();
     assert_ne!(t.state, TeamTaskState::Reviewing, "古い結果で先へ進めた");
@@ -1373,7 +1437,7 @@ fn 別のrunの検証結果は同じタスク番号でも採らない() {
     fresh.note_validation_for(
         &from_old_run,
         tid2,
-        cmds.iter().map(ValidationRun::passed).collect(),
+        cmds.iter().map(|c| ValidationRun::passed(c.display())).collect(),
     );
     let t = fresh.task(tid2).unwrap();
     assert!(

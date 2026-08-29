@@ -372,7 +372,7 @@ impl ZaivernApp {
                     owner,
                     task,
                     execution: execution.clone(),
-                    commands: v.commands.clone(),
+                    commands: v.commands.iter().map(|c| c.display()).collect(),
                     started_at: crate::features::team::imp::model::now_secs(),
                     timeout_secs: v.timeout_secs,
                     cancel,
@@ -389,7 +389,7 @@ impl ZaivernApp {
                     .iter()
                     .map(|c| {
                         ValidationRun::new(
-                            c,
+                            c.display(),
                             126,
                             crate::features::team::imp::model::ValidationOutcome::SpawnFailed,
                         )

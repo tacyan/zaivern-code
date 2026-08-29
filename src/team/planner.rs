@@ -297,12 +297,13 @@ impl StaticPlanner {
         }
 
         // 検証コマンド (SPEC が指定していれば使う。危険なものはここで落とす)
+        // **SPEC の文字列はここで構造へ直す。** 以降は構造のまま運ぶ。
         let mut validations: Vec<String> = sections
             .iter()
             .filter(|s| is_validation_heading(&s.title))
             .flat_map(|s| s.bullets.iter().chain(s.prose.iter()).cloned())
             .map(|s| s.trim_matches('`').trim().to_string())
-            .filter(|s| super::graph::check_command(s).is_ok())
+            .filter(|s| super::graph::parse_command(s).is_ok())
             .collect();
         validations.dedup();
         if validations.is_empty() {
@@ -555,7 +556,11 @@ mod tests {
         assert_eq!(plan.tasks[0].files, vec!["src/auth/login.rs".to_string()]);
         assert_eq!(plan.tasks[0].title, "ログイン API を実装する");
         assert_eq!(
-            plan.tasks[0].validation_commands,
+            plan.tasks[0]
+                .validation_commands
+                .iter()
+                .map(|c| c.display())
+                .collect::<Vec<_>>(),
             vec!["cargo test auth".to_string()]
         );
         // 統合は全実装に依存する
@@ -599,7 +604,9 @@ mod tests {
         let plan = StaticPlanner.plan(input(spec)).unwrap();
         for t in &plan.tasks {
             assert!(
-                !t.validation_commands.iter().any(|c| c.contains("push")),
+                !t.validation_commands
+                    .iter()
+                    .any(|c| c.display().contains("push")),
                 "危険なコマンドが計画へ入った: {:?}",
                 t.validation_commands
             );

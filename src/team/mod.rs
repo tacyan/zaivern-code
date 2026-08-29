@@ -58,6 +58,7 @@ pub mod roles;
 pub mod runtime;
 pub mod scheduler;
 pub mod state_machine;
+pub mod validation_command;
 pub mod view_model;
 
 #[cfg(test)]

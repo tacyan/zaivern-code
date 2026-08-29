@@ -234,7 +234,13 @@ pub fn plan_json(plan: &TeamPlan) -> String {
                 "files": t.files,
                 "required_caps": t.required_caps,
                 "acceptance_criteria": t.acceptance_criteria,
-                "validation_commands": t.validation_commands,
+                // **何をするコマンドなのかまで出す。** 「承認待ち」の理由が
+                // 画面と CLI で食い違わないようにする。
+                "validation_commands": t.validation_commands.iter().map(|c| serde_json::json!({
+                    "executable": c.executable,
+                    "args": c.args,
+                    "risk": super::graph::classify(c).key(),
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();

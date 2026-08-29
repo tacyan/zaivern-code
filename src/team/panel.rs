@@ -1321,7 +1321,10 @@ mod tests {
             super::super::runtime::ValidationSpec {
                 task: 1,
                 execution: "x".into(),
-                commands: vec!["cargo test a".into()],
+                commands: vec![super::super::validation_command::ValidationCommand::parse(
+                    "cargo test a",
+                )
+                .unwrap()],
                 cwd: a.clone(),
                 timeout_secs: 600,
             },

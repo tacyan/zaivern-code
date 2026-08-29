@@ -21,7 +21,10 @@ pub fn task(id: u64, key: &str, deps: &[u64]) -> TeamTask {
         files: Vec::new(),
         required_caps: Vec::new(),
         acceptance_criteria: vec!["動作する".to_string()],
-        validation_commands: vec!["cargo test".to_string()],
+        validation_commands: vec![super::validation_command::ValidationCommand::parse(
+            "cargo test",
+        )
+        .unwrap()],
         state: TeamTaskState::Pending,
         assigned_agent: None,
         assigned_session: None,
