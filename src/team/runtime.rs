@@ -89,9 +89,16 @@ pub struct AgentLaunchSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationSpec {
     pub task: TaskId,
-    /// 許可リストを通ったコマンド行 (実行側で語に割る)。
+    /// **この実行の一意な ID** (`run_id:task:attempt:generation`)。
+    ///
+    /// 結果を戻すときに必ず添える。添えないと、差し戻して配り直した後に
+    /// 古い実行の結果が遅れて届いて、新しい試行の証跡を上書きする。
+    pub execution: String,
+    /// 実行してよいと判定されたコマンド行 (実行側で語に割る)。
     pub commands: Vec<String>,
     pub cwd: PathBuf,
+    /// 時間切れ (秒)。**無期限には待たない。**
+    pub timeout_secs: u64,
 }
 
 /// Runtime が「やってほしい」こと。
@@ -106,6 +113,16 @@ pub enum TeamEffect {
     },
     StopAgent(SessionId),
     RunValidation(ValidationSpec),
+    /// 走っている検証を止める (**プロセスツリーごと**)。
+    ///
+    /// Runtime はプロセスを触らない。止めたいという意思だけを出し、
+    /// 実際の終了は実行側が [`crate::procx::kill_tree`] で行う。
+    CancelValidation {
+        task: TaskId,
+        /// 止める対象の実行 ID。世代がずれていたら既に別の実行なので無視する。
+        execution: String,
+        key: String,
+    },
     RequestHumanApproval(Decision),
     PersistState,
 }
@@ -117,7 +134,10 @@ impl TeamEffect {
             TeamEffect::StartAgent(s) => format!("start:{}", s.agent_id),
             TeamEffect::SendInstruction { key, .. } => key.clone(),
             TeamEffect::StopAgent(s) => format!("stop:{s}"),
-            TeamEffect::RunValidation(v) => format!("validate:{}", v.task),
+            // **実行ごとに別のキー。** 差し戻して配り直した後の再実行は
+            // 「同じタスクの検証」でも別物なので、世代を含めて区別する。
+            TeamEffect::RunValidation(v) => format!("validate:{}", v.execution),
+            TeamEffect::CancelValidation { key, .. } => key.clone(),
             TeamEffect::RequestHumanApproval(d) => format!("decide:{}", d.idempotency_key),
             // 保存だけは毎回出してよい (内容が変わるため)。
             TeamEffect::PersistState => String::new(),
@@ -201,6 +221,8 @@ impl TeamRuntime {
                 stopped: false,
                 started_at: now,
                 updated_at: now,
+                approved_validation: Vec::new(),
+                validation_timeout_secs: super::launch::VALIDATION_TIMEOUT_SECS,
                 effects: Vec::new(),
                 done_effects: Vec::new(),
             },
@@ -304,15 +326,17 @@ impl TeamRuntime {
         // `Completed` の記録だけが残る。その実行はプロセスごと消えているのに
         // 記録が新しい発行を止めるので、タスクは `Validating` のまま
         // **永久に止まる**。まだ決着していない検証の記録は引き継がない。
-        let unsettled: BTreeSet<String> = tasks
+        let unsettled: Vec<String> = tasks
             .iter()
             .filter(|t| t.state == TeamTaskState::Validating)
-            .map(|t| format!("validate:{}", t.id))
+            .map(|t| format!("validate:{}:{}:", saved.run.run_id, t.id))
             .collect();
         let mut effects: BTreeMap<String, EffectRecord> = BTreeMap::new();
         let mut effect_order = VecDeque::new();
         for r in &saved.run.effects {
-            if r.state != EffectState::Completed || unsettled.contains(&r.key) {
+            if r.state != EffectState::Completed
+                || unsettled.iter().any(|p| r.key.starts_with(p))
+            {
                 continue;
             }
             if effects.insert(r.key.clone(), r.clone()).is_none() {
@@ -543,7 +567,37 @@ impl TeamRuntime {
     ///
     /// ここへ入るものだけが正式な検証証跡になる。エージェントの自己申告は
     /// [`TeamTask::reported_validation`] に分けてあり、ここには入らない。
-    pub fn note_validation(&mut self, task: TaskId, runs: Vec<ValidationRun>) {
+    /// **いまそのタスクが待っている実行の ID。**
+    ///
+    /// 戻ってきた結果を採用してよいかは、これと一致するかだけで決まる。
+    pub fn current_execution(&self, task: TaskId) -> String {
+        let gen = self
+            .task(task)
+            .map(|t| t.validation.generation)
+            .unwrap_or_default();
+        self.execution_id(task, gen)
+    }
+
+    /// **実行 ID を照合してから**実測を受け取る。
+    ///
+    /// 照合しないと、差し戻して配り直した後に古い実行の結果が遅れて届き、
+    /// 新しい試行の証跡を上書きする (画面には「検証済み」と出るのに、
+    /// 実際に走ったのは 1 つ前のコードだった、という嘘になる)。別の Run の
+    /// 同じタスク ID も同じ理由で弾く (`run_id` を含めてある)。
+    pub fn note_validation_for(&mut self, execution: &str, task: TaskId, runs: Vec<ValidationRun>) {
+        let want = self.current_execution(task);
+        if execution != want {
+            self.log(
+                TeamEventKind::ValidationCompleted,
+                None,
+                None,
+                format!("#{task} の古い検証結果を無視しました ({execution})"),
+            );
+            // 記録は外す (その実行はもう終わっているので、再発行を妨げない)。
+            self.note_effect_failed(&format!("validate:{execution}"));
+            self.dirty = true;
+            return;
+        }
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) else {
             return;
         };
@@ -556,7 +610,23 @@ impl TeamRuntime {
         self.dirty = true;
         // 検証の Effect は 1 回の実行で完結する。差し戻し後のやり直しを
         // 発行できるよう、記録を外す。
-        self.note_effect_failed(&format!("validate:{task}"));
+        self.note_effect_failed(&format!("validate:{execution}"));
+        // **人が止めたぶんは失敗にしない。** 決着 (running = false) は
+        // ついているので永久には止まらず、再開すれば `advance` が撃ち直す。
+        if self
+            .task(task)
+            .map(|t| t.validation.cancelled())
+            .unwrap_or(false)
+        {
+            self.log(
+                TeamEventKind::ValidationCompleted,
+                None,
+                None,
+                format!("#{task} の検証を停止しました"),
+            );
+            self.dirty = true;
+            return;
+        }
         let passed = self
             .task(task)
             .map(|t| t.validation.passed(&t.validation_commands))
@@ -636,14 +706,27 @@ impl TeamRuntime {
     fn fail_validation(&mut self, task: TaskId) {
         let max = self.run.max_attempts;
         let mut escalate = false;
+        // **どう終わったかまで書く。** `exit_code: 1` だけでは、コードを直す
+        // のか・時間を延ばすのか・実行環境を直すのかが読み手に分からない。
         let failed: Vec<String> = self
             .task(task)
             .map(|t| {
                 t.validation
                     .runs
                     .iter()
-                    .filter(|r| r.exit_code != 0)
-                    .map(|r| r.command.clone())
+                    .filter(|r| !r.ok() && !r.outcome().is_cancelled())
+                    .map(|r| match r.outcome() {
+                        ValidationOutcome::TimedOut => {
+                            format!("{} (時間切れ)", r.command)
+                        }
+                        ValidationOutcome::SpawnFailed => {
+                            format!("{} (起動できませんでした)", r.command)
+                        }
+                        ValidationOutcome::RunnerDisconnected => {
+                            format!("{} (実行器との接続が切れました)", r.command)
+                        }
+                        _ => r.command.clone(),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -653,7 +736,13 @@ impl TeamRuntime {
             .map(|t| {
                 t.reported_validation
                     .iter()
-                    .filter(|r| r.exit_code == 0 && failed.contains(&r.command))
+                    .filter(|r| {
+                        r.exit_code == 0
+                            && t.validation
+                                .runs
+                                .iter()
+                                .any(|x| x.command == r.command && !x.ok())
+                    })
                     .map(|r| r.command.clone())
                     .collect()
             })
@@ -771,6 +860,7 @@ impl TeamRuntime {
                         "停止すると、進行中の作業は失われる可能性があります".into(),
                         vec!["approve".into(), "reject".into()],
                         format!("stop-agents:{}", self.run.run_id),
+                        Vec::new(),
                     );
                     if let Some(d) = d {
                         out.push(TeamEffect::RequestHumanApproval(d));
@@ -799,8 +889,22 @@ impl TeamRuntime {
                                 for s in self.agents.iter().filter_map(|a| a.session_id) {
                                     out.push(TeamEffect::StopAgent(s));
                                 }
+                                // **走っている検証も止める。** エージェントだけ
+                                // 止めて `cargo test` を残すと、止めたはずの
+                                // Run がリポジトリのコードを走らせ続ける。
+                                self.cancel_running_validations(&mut out);
                             }
                         }
+                    }
+                    if d.kind == DecisionKind::ValidationExecution {
+                        // **承認したコマンドだけ**を実行対象にする。
+                        for c in d.commands {
+                            if !self.run.approved_validation.contains(&c) {
+                                self.run.approved_validation.push(c);
+                            }
+                        }
+                        self.run.approved_validation =
+                            clamp_list(std::mem::take(&mut self.run.approved_validation));
                     }
                 }
             }
@@ -813,6 +917,25 @@ impl TeamRuntime {
                         None,
                         format!("却下しました: {}", d.reason),
                     );
+                    if d.kind == DecisionKind::ValidationExecution {
+                        // **実行しないなら、そのタスクは自動では終われない。**
+                        // `Validating` に置いたままにすると、誰も走らせない
+                        // 検証を永久に待つ。人へ上げて手を渡す。
+                        if let Some(tid) = d.task_id {
+                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == tid) {
+                                t.validation.running = false;
+                                t.state =
+                                    sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                                t.updated_at = now_secs();
+                            }
+                            self.log(
+                                TeamEventKind::ValidationCompleted,
+                                None,
+                                None,
+                                format!("#{tid} の検証は実行しません (人が拒否しました)"),
+                            );
+                        }
+                    }
                     if d.kind == DecisionKind::StopAgents {
                         match d.task_id {
                             // Reassign の拒否 — **元の担当も状態も壊さない。**
@@ -891,6 +1014,7 @@ impl TeamRuntime {
                                 .into(),
                             vec!["approve".into(), "reject".into()],
                             format!("reassign-stop:{id}"),
+                            Vec::new(),
                         );
                         if let Some(d) = d {
                             out.push(TeamEffect::RequestHumanApproval(d));
@@ -1534,7 +1658,8 @@ impl TeamRuntime {
     /// 検証の実行が要るタスクへ Effect を出す。
     ///
     /// **`Validating` のタスクを永久に止めない。** 走らせるものが無いなら
-    /// その場で決着させ、走らせてはいけないものが混じっているなら人へ上げる。
+    /// その場で決着させ、走らせてはいけないものが混じっているなら人へ上げ、
+    /// **リポジトリのコードを実行しうるものは承認を求めてから**実行する。
     fn advance(&mut self, out: &mut Vec<TeamEffect>) {
         let cwd = self.workspace.clone();
         let pending: Vec<(TaskId, Vec<String>)> = self
@@ -1550,13 +1675,17 @@ impl TeamRuntime {
                 self.settle_validation(task);
                 continue;
             }
-            // **許可リストを通ったものだけ**を実行側へ渡す。
-            let unsafe_cmds: Vec<String> = commands
-                .iter()
-                .filter(|c| graph::check_command(c).is_err())
-                .cloned()
-                .collect();
-            if !unsafe_cmds.is_empty() {
+            // **危険度で分ける。** 「許可リストに載っている = 安全」ではない。
+            let mut forbidden: Vec<String> = Vec::new();
+            let mut repo_code: Vec<String> = Vec::new();
+            for c in &commands {
+                match graph::classify_command(c) {
+                    graph::ValidationRisk::Forbidden => forbidden.push(c.clone()),
+                    graph::ValidationRisk::RepositoryCodeExecution => repo_code.push(c.clone()),
+                    graph::ValidationRisk::Safe => {}
+                }
+            }
+            if !forbidden.is_empty() {
                 // 自動実行しないコマンドが混じっている。**黙って落とすと、
                 // そのコマンドは永久に成功せず Validating で止まる。**
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
@@ -1569,16 +1698,61 @@ impl TeamRuntime {
                     None,
                     format!(
                         "#{task} の検証コマンドは自動実行しません: {}",
-                        unsafe_cmds.join(", ")
+                        forbidden.join(", ")
                     ),
                     "コマンドを直すか、人が実行して結果を戻してください".into(),
                     vec!["retry".into(), "reject".into()],
                 );
                 continue;
             }
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
-                t.validation.running = true;
+            // **人が止めている間は新しい検証を始めない。** 検証はリポジトリの
+            // コードを走らせる「仕事」なので、Pause / Stop の対象に含める
+            // (決着と後始末は止めない — 上の 2 つはここより前で済ませている)。
+            if !self.accepting_work() {
+                continue;
             }
+            let need_ok: Vec<String> = repo_code
+                .iter()
+                .filter(|c| !self.run.approved_validation.contains(*c))
+                .cloned()
+                .collect();
+            if !need_ok.is_empty() {
+                // **承認を通るまで 1 行も実行しない。** sandbox を持たない
+                // 以上、`cargo test` は「リポジトリ内の任意コードの実行」と
+                // 同じ重さで扱う。承認は Run 単位で覚える (試行のたびに
+                // 聞き直すと、承認が読まれない儀式になる)。
+                let listed = need_ok.join(", ");
+                let d = self.make_decision(
+                    DecisionKind::ValidationExecution,
+                    Some(task),
+                    None,
+                    format!("#{task} の検証はリポジトリのコードを実行します: {listed}"),
+                    concat!(
+                        "テスト・ビルド・スクリプトはリポジトリ内の任意コードを実行できます",
+                        " (build.rs / テスト本体 / conftest.py / Makefile など)。",
+                        "隔離された環境ではないので、承認したものだけを実行します"
+                    )
+                    .into(),
+                    vec!["approve".into(), "reject".into()],
+                    format!("validation-exec:{}:{}", self.run.run_id, listed),
+                    need_ok.clone(),
+                );
+                if let Some(d) = d {
+                    out.push(TeamEffect::RequestHumanApproval(d));
+                }
+                continue;
+            }
+            // **世代を 1 つ進めてから発行する。** 戻ってきた結果がこの発行の
+            // ものかを、受け口 (`note_validation_for`) が突き合わせる。
+            let gen = {
+                let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) else {
+                    continue;
+                };
+                t.validation.running = true;
+                t.validation.generation = t.validation.generation.saturating_add(1);
+                t.validation.generation
+            };
+            let execution = self.execution_id(task, gen);
             self.log(
                 TeamEventKind::ValidationStarted,
                 None,
@@ -1587,10 +1761,42 @@ impl TeamRuntime {
             );
             out.push(TeamEffect::RunValidation(ValidationSpec {
                 task,
+                execution,
                 commands,
                 cwd: cwd.clone(),
+                timeout_secs: self.run.validation_timeout_secs,
             }));
         }
+    }
+
+    /// 走っている検証を全部止めるよう頼む。
+    ///
+    /// Runtime はプロセスを触らない — 止めたい対象を Effect で伝えるだけで、
+    /// 実際の終了は実行側 (`app`) が既存の [`crate::procx::kill_tree`] で行う。
+    fn cancel_running_validations(&mut self, out: &mut Vec<TeamEffect>) {
+        let running: Vec<(TaskId, u32)> = self
+            .tasks
+            .iter()
+            .filter(|t| t.validation.running)
+            .map(|t| (t.id, t.validation.generation))
+            .collect();
+        for (task, gen) in running {
+            let execution = self.execution_id(task, gen);
+            out.push(TeamEffect::CancelValidation {
+                task,
+                key: format!("cancel-validate:{execution}"),
+                execution,
+            });
+        }
+    }
+
+    /// この検証実行の一意な ID。
+    ///
+    /// **Run・タスク・試行・世代**を全部入れる。古い実行の結果が、差し戻し後の
+    /// 新しい試行や、別の Run の同じタスク ID へ紛れ込まないため。
+    fn execution_id(&self, task: TaskId, generation: u32) -> String {
+        let attempt = self.task(task).map(|t| t.attempts).unwrap_or(0);
+        format!("{}:{task}:{attempt}:{generation}", self.run.run_id)
     }
 
     /// 必要なぶんだけエージェントを起こす。**無条件に N 体起こさない。**
@@ -2149,6 +2355,8 @@ impl TeamRuntime {
         impact: String,
         options: Vec<String>,
         key: String,
+        // この判断が対象にしているコマンド (検証の実行承認だけが使う)。
+        commands: Vec<String>,
     ) -> Option<Decision> {
         if self.decisions.iter().any(|d| d.idempotency_key == key) {
             return None;
@@ -2165,6 +2373,7 @@ impl TeamRuntime {
             impact: clamp_text(&impact),
             options,
             idempotency_key: key,
+            commands: clamp_list(commands),
         };
         self.decisions.push(d.clone());
         self.decisions.sort_by(|a, b| {
@@ -2196,7 +2405,16 @@ impl TeamRuntime {
             kind.key(),
             task_id.map(|t| t.to_string()).unwrap_or_default()
         );
-        self.make_decision(kind, task_id, agent_id, reason, impact, options, key);
+        self.make_decision(
+            kind,
+            task_id,
+            agent_id,
+            reason,
+            impact,
+            options,
+            key,
+            Vec::new(),
+        );
     }
 }
 

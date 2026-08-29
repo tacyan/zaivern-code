@@ -386,11 +386,88 @@ impl TeamAgent {
 
 // ── 検証とレビュー ───────────────────────────────────────────────────
 
+/// 検証 1 本が**どう終わったか**。
+///
+/// 終了コードだけでは「落ちた」と「そもそも走らなかった」を区別できない。
+/// 区別できないと、画面には同じ `exit_code: 1` が出るのに、直し方
+/// (コードを直す / 時間を延ばす / 実行環境を直す) がまったく違う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationOutcome {
+    /// 走って成功した。
+    Passed,
+    /// 走って失敗した。
+    Failed,
+    /// 時間切れで打ち切った (プロセスツリーごと終了させている)。
+    TimedOut,
+    /// 人が止めた (Stop / Run の破棄)。
+    Cancelled,
+    /// そもそも起動できなかった (コマンドが無い / 実行不可)。
+    SpawnFailed,
+    /// 実行器との接続が切れた (worker の panic など)。**結果は永久に来ない。**
+    RunnerDisconnected,
+}
+
+impl ValidationOutcome {
+    /// 表示用の安定 ID (i18n の鍵になる)。
+    pub fn key(self) -> &'static str {
+        match self {
+            ValidationOutcome::Passed => "passed",
+            ValidationOutcome::Failed => "failed",
+            ValidationOutcome::TimedOut => "timed_out",
+            ValidationOutcome::Cancelled => "cancelled",
+            ValidationOutcome::SpawnFailed => "spawn_failed",
+            ValidationOutcome::RunnerDisconnected => "runner_disconnected",
+        }
+    }
+
+    /// 人が止めたものか (**試行の失敗として数えない**)。
+    pub fn is_cancelled(self) -> bool {
+        self == ValidationOutcome::Cancelled
+    }
+}
+
 /// 検証コマンド 1 本の結果。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationRun {
     pub command: String,
     pub exit_code: i32,
+    /// 終わり方。**版 2 以前の記録には無い**ので `Option` で持ち、
+    /// 無いときは終了コードから導く ([`ValidationRun::outcome`])。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ValidationOutcome>,
+}
+
+impl ValidationRun {
+    /// 成功したものを作る。**テスト専用** — 本番の結果は必ず実行器
+    /// ([`super::launch::run_validation_command`]) が組み立てる。
+    #[cfg(test)]
+    pub fn passed(command: impl Into<String>) -> Self {
+        Self::new(command, 0, ValidationOutcome::Passed)
+    }
+
+    pub fn new(command: impl Into<String>, exit_code: i32, result: ValidationOutcome) -> Self {
+        Self {
+            command: command.into(),
+            exit_code,
+            result: Some(result),
+        }
+    }
+
+    /// 終わり方。**古い記録は終了コードから導く** (0 なら成功)。
+    pub fn outcome(&self) -> ValidationOutcome {
+        self.result.unwrap_or(if self.exit_code == 0 {
+            ValidationOutcome::Passed
+        } else {
+            ValidationOutcome::Failed
+        })
+    }
+
+    /// 成功しているか。**終了コード 0 だけでは足りない** — 打ち切りや
+    /// 接続断は 0 を返しうる実行器の都合に左右されてはいけない。
+    pub fn ok(&self) -> bool {
+        self.outcome() == ValidationOutcome::Passed && self.exit_code == 0
+    }
 }
 
 /// タスクの検証状態。
@@ -400,6 +477,13 @@ pub struct ValidationState {
     pub running: bool,
     /// 走らせた結果。**空 = 未実行**で、これだけで Completed にはしない。
     pub runs: Vec<ValidationRun>,
+    /// 実行の世代。発行のたびに 1 つ進む。
+    ///
+    /// **戻ってきた結果がこの発行のものか**を見分けるために使う。差し戻して
+    /// 配り直した後に、古い実行の結果が遅れて届くと、新しい試行の証跡が
+    /// 古い結果で上書きされる (しかも画面には「検証済み」と出る)。
+    #[serde(default)]
+    pub generation: u32,
 }
 
 impl ValidationState {
@@ -413,16 +497,22 @@ impl ValidationState {
             // ここへ来るのは復元した壊れかけの状態だけ。安全側 (未検証) に倒す。
             return false;
         }
-        required.iter().all(|c| {
-            self.runs
-                .iter()
-                .any(|r| r.command == *c && r.exit_code == 0)
-        })
+        required
+            .iter()
+            .all(|c| self.runs.iter().any(|r| r.command == *c && r.ok()))
     }
 
-    /// 1 本でも失敗しているか。
+    /// 1 本でも失敗しているか。**人が止めたものは失敗に数えない**
+    /// (Stop で打ち切ったのを「実装が悪い」と読み替えないため)。
     pub fn failed(&self) -> bool {
-        self.runs.iter().any(|r| r.exit_code != 0)
+        self.runs
+            .iter()
+            .any(|r| !r.ok() && !r.outcome().is_cancelled())
+    }
+
+    /// 人が止めた結果が入っているか。
+    pub fn cancelled(&self) -> bool {
+        self.runs.iter().any(|r| r.outcome().is_cancelled())
     }
 
     /// **検証の決着がついたか** (走らせるものが無い場合も含む)。
@@ -722,6 +812,12 @@ pub enum DecisionKind {
     PrivilegeEscalation,
     /// 実行中エージェントの停止 (既存 approval gate を通す)。
     StopAgents,
+    /// **リポジトリ内のコードを実行しうる検証コマンド**の実行許可。
+    ///
+    /// `cargo test` / `npm test` / `pytest` などは、シェルのメタ文字が
+    /// 無くてもリポジトリ内の任意コードを走らせる。隔離 (sandbox) を
+    /// 持たない以上、実行してよいかは人が決める。
+    ValidationExecution,
 }
 
 impl DecisionKind {
@@ -737,6 +833,7 @@ impl DecisionKind {
             DecisionKind::DestructiveChange => "destructive_change",
             DecisionKind::PrivilegeEscalation => "privilege_escalation",
             DecisionKind::StopAgents => "stop_agents",
+            DecisionKind::ValidationExecution => "validation_execution",
         }
     }
 
@@ -744,7 +841,9 @@ impl DecisionKind {
     pub fn priority(self) -> u8 {
         match self {
             DecisionKind::PrivilegeEscalation | DecisionKind::DestructiveChange => 0,
-            DecisionKind::DangerousCommand | DecisionKind::ReleaseOperation => 1,
+            DecisionKind::DangerousCommand
+            | DecisionKind::ReleaseOperation
+            | DecisionKind::ValidationExecution => 1,
             DecisionKind::CostLimit | DecisionKind::StopAgents => 2,
             DecisionKind::SpecConflict | DecisionKind::FileScopeOverlap => 3,
             DecisionKind::AttemptsExhausted | DecisionKind::NoCandidate => 4,
@@ -768,6 +867,12 @@ pub struct Decision {
     pub options: Vec<String>,
     /// 同じ判断を二重に積まないための鍵。
     pub idempotency_key: String,
+    /// この判断が対象にしているコマンド (検証の実行承認で使う)。
+    ///
+    /// **文面 (`reason`) から読み直さない。** 承認したものと実行するものを
+    /// 別の経路で決めると、表示と実行がずれる。
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 #[cfg(test)]
@@ -809,15 +914,10 @@ mod tests {
         let req = vec!["cargo test a".to_string(), "cargo test b".to_string()];
         let mut v = ValidationState::default();
         assert!(!v.passed(&req), "未実行で通してはいけない");
-        v.runs.push(ValidationRun {
-            command: "cargo test a".into(),
-            exit_code: 0,
-        });
+        v.runs.push(ValidationRun::passed("cargo test a"));
         assert!(!v.passed(&req), "一部だけで通してはいけない");
-        v.runs.push(ValidationRun {
-            command: "cargo test b".into(),
-            exit_code: 1,
-        });
+        v.runs
+            .push(ValidationRun::new("cargo test b", 1, ValidationOutcome::Failed));
         assert!(!v.passed(&req), "失敗があるのに通してはいけない");
         assert!(v.failed());
     }
@@ -833,10 +933,8 @@ mod tests {
         let req = vec!["x".to_string()];
         let v = ValidationState {
             running: true,
-            runs: vec![ValidationRun {
-                command: "x".into(),
-                exit_code: 0,
-            }],
+            runs: vec![ValidationRun::passed("x")],
+            generation: 0,
         };
         assert!(!v.passed(&req));
     }

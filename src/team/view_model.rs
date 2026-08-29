@@ -91,6 +91,9 @@ pub struct TaskView {
     /// 1 本でも失敗しているか。**「未実行」と「失敗」を混ぜない**
     /// (混ぜると、まだ走っていないタスクを赤く出してしまう)。
     pub validation_failed: bool,
+    /// 最初に成功しなかった実測の終わり方。**「失敗」だけでは直し方が
+    /// 分からない** (コードを直す / 時間を延ばす / 実行環境を直す)。
+    pub validation_result: Option<ValidationOutcome>,
     pub review_verdict: Option<ReviewVerdict>,
     pub review_findings: Vec<String>,
     pub blockers: Vec<String>,
@@ -240,6 +243,12 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
             validation_ok: t.validation.passed(&t.validation_commands),
             validation_ran: !t.validation.runs.is_empty(),
             validation_failed: t.validation.failed(),
+            validation_result: t
+                .validation
+                .runs
+                .iter()
+                .find(|r| !r.ok())
+                .map(|r| r.outcome()),
             review_verdict: t.review.verdict,
             review_findings: t.review.findings.clone(),
             blockers: t.blockers.clone(),

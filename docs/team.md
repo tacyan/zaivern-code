@@ -123,6 +123,8 @@ Running → Validating → Reviewing → Completed
   `Failed` → `Ready` へ戻す。上限に達したら `NeedsUser`
 * `validation_commands` が空なら「走らせるものが無い」ので即座に決着する
   (`ValidationState::settled`)。永久に `Validating` で止まらない
+* 実行そのものは危険度で分けて、リポジトリのコードを走らせるものは
+  **人の承認を通してから**動く (下の「安全条件」)
 * `review_required = false` でも、**実測が終わるまで `Completed` にしない**
 
 レビューは `REQUEST_CHANGES` なら指摘を文脈へ載せて `Ready` へ戻し、
@@ -197,20 +199,72 @@ Pending (まだ出していない)
 
 ## 安全条件
 
-`graph::check_command` が許可リスト方式で検証コマンドを絞る。
-**MVP で自動実行しないもの**:
+### 検証コマンドは危険度で分ける
 
-git push / PR 作成 / merge / rebase / reset / deploy / release / publish /
-本番 DB 操作 / credential 操作 / 課金 / `rm -rf` 等の破壊的操作 /
-`sudo` 等の権限昇格 / ワークスペース外への書き込み / 任意の shell 文字列。
+**「許可リストに載っているから安全」ではない。** `cargo test` にシェルの
+メタ文字は 1 つも無いが、`build.rs` / テスト本体 / `conftest.py` /
+`Makefile` / `package.json` の `scripts` を通じて**リポジトリ内の任意コードを
+実行できる**。`graph::classify_command` は 3 つに分ける:
 
+| 危険度 | 意味 | 例 | 扱い |
+| --- | --- | --- | --- |
+| `Forbidden` | 実行しない | `git push` / `cargo publish` / `sudo` / `rm -rf` / `/tmp/cargo test` / シェルのメタ文字 | 計画に入れない。混ざっていたら `NeedsUser` |
+| `RepositoryCodeExecution` | リポジトリ内のコードを実行しうる | `cargo test` / `npm test` / `pytest` / `make` / `node` / `go test` | **人が承認するまで 1 行も実行しない** |
+| `Safe` | リポジトリのコードを実行しないと言い切れる | `rustfmt` / `shellcheck` / `black` / `ruff` | そのまま実行する |
+
+* **実行ファイルにパスが混ざっていたら実行しない** (`/tmp/cargo test` /
+  `./cargo test` / `tools/python x.py` / `C:\tools\cargo.exe test`)。
+  basename だけで許すと「`cargo` だから許可」で `/tmp/cargo` が起きる
+* 拡張子つきの指定 (`cargo.exe`) も PATH 解決の素の名前ではないので通さない
 * シェルのメタ文字 (`; | & > < \` $` 改行) を含む文字列は実行しない
 * コマンド・引数・cwd を分けて扱い、`sh -c` を挟まない
-* SPEC がこれらを指定していても計画へは入らない
-* 必要になったら `NeedsUser` にして、理由・対象・影響・選択肢を出す
+* 迷ったら `Safe` に入れない — 設定ファイルから任意のコードを読み込むもの
+  (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は
+  「検査するだけ」に見えても実行しうる
 
-`Stop` は新規割当を即座に止めるが、**実行中エージェントの kill は
-承認ゲートを通す** (`Decision` を立てて人の承認を待つ)。
+承認は `DecisionKind::ValidationExecution` として既存の approval gate を
+通り、Run 単位で `run.approved_validation` に残る (試行のたびに聞き直すと、
+承認が読まれない儀式になる)。**拒否したら `NeedsUser`** — 実行しないまま
+`Validating` で待ち続ける経路は無い。
+
+**MVP で自動実行しないもの**: git push / PR 作成 / merge / rebase / reset /
+deploy / release / publish / 本番 DB 操作 / credential 操作 / 課金 /
+`rm -rf` 等の破壊的操作 / `sudo` 等の権限昇格 / ワークスペース外への
+書き込み / 任意の shell 文字列。
+
+### 隔離 (sandbox) は無い
+
+承認した `cargo test` が何をするかは、**リポジトリのコードが決める**。
+Zaivern が保証できるのは「何を起動したか」までで、起動したプロセスが
+その先で何をするかは保証できない。完全な隔離が要るなら、sandbox か
+使い捨てのコンテナで動かすこと。
+
+### 検証は必ず決着する
+
+* **時間切れがある** (既定 10 分 / `run.validation_timeout_secs`)。
+  無期限に待つと、そのタスクは永久に `Validating` に残る
+* 打ち切りは**プロセスツリーごと** (既存の `procx::kill_tree`)。
+  直接の子だけを殺すと孫が残る
+* 実行器との接続が切れたら `RunnerDisconnected` として失敗を記録する
+  (握り潰すと `validation.running` が true のまま残る)
+* 結果も切断も来ない worker は、パネル側の見張りが時限 + 余白で見切る
+* 終わり方は `ValidationOutcome` (`Passed` / `Failed` / `TimedOut` /
+  `Cancelled` / `SpawnFailed` / `RunnerDisconnected`) として保存され、
+  画面と `--json` の両方に出る
+* 結果には**実行 ID** (`run_id:task:attempt:generation`) が付く。一致しない
+  結果は採らない — 差し戻して配り直した後に古い実行の結果が届いて、
+  新しい試行の証跡を上書きするのを防ぐ
+
+### Pause と Stop
+
+* `Pause` — **新しい仕事を始めない**。新規割り当てに加えて、新しい検証も
+  始めない (検証はリポジトリのコードを走らせる「仕事」なので)。走っている
+  ものは走り切る。`Resume` で再開する
+* `Stop` — 新規割当を即座に止める。**実行中エージェントの kill は承認ゲートを
+  通す** (`Decision` を立てて人の承認を待つ)。承認されたら、エージェントと
+  **走っている検証のプロセスツリー**の両方を止める
+* 止めた Run へ遅れて「成功」が届いても、`accepting_work` が false なので
+  先へは進まない
 
 ## 永続化
 
@@ -227,6 +281,9 @@ git push / PR 作成 / merge / rebase / reset / deploy / release / publish /
 * **壊れていても黙って初期化しない** — `<名前>.corrupt-<epoch>` へ退避して
   理由を返す
 * 版が新しすぎるときは読まずに残す
+* 人が承認した検証コマンド (`approved_validation`) と時間切れ
+  (`validation_timeout_secs`) も `run.json` に残る。**再起動しても
+  聞き直さない / 無期限には戻らない**
 * `events.jsonl` は追記専用で上限 5,000 行
 
 再起動時に未完了 Run があれば `Resume / Open Read Only / Discard` を出す。

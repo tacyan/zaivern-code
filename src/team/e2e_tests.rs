@@ -51,6 +51,12 @@ struct Lab {
     /// 検証の実行結果 (偽の実行器)。**既定は成功**だが、ここを偽にすると
     /// 「エージェントは成功と言ったが実際は落ちた」を再現できる。
     validation_passes: bool,
+    /// 検証の実行許可を人が承認するか。**既定は承認する**。
+    ///
+    /// 偽にすると「承認していないので 1 行も走らない」を再現できる。
+    /// 実物でも `cargo test` はリポジトリ内のコードを実行するので、
+    /// 人が承認するまで走らない。
+    approve_validation: bool,
     /// 実行を頼まれた検証。**次の tick で返す** — 実物も裏のスレッドで
     /// 走らせて、終わったフレームで結果を戻す (同じ tick で即答すると、
     /// 「検証待ち」という状態が 1 度も観測されない筋書きになる)。
@@ -86,6 +92,7 @@ impl Lab {
             next_session: 1,
             now: 100,
             validation_passes: true,
+            approve_validation: true,
             queued_validations: Vec::new(),
         }
     }
@@ -99,12 +106,19 @@ impl Lab {
             let runs = v
                 .commands
                 .iter()
-                .map(|c| ValidationRun {
-                    command: c.clone(),
-                    exit_code: code,
+                .map(|c| {
+                    ValidationRun::new(
+                        c,
+                        code,
+                        if code == 0 {
+                            ValidationOutcome::Passed
+                        } else {
+                            ValidationOutcome::Failed
+                        },
+                    )
                 })
                 .collect();
-            self.rt.note_validation(v.task, runs);
+            self.rt.note_validation_for(&v.execution, v.task, runs);
         }
         let rows: Vec<SessionObs> = self
             .sessions
@@ -157,6 +171,19 @@ impl Lab {
         }
         // **検証は Zaivern が走らせる。** エージェントの自己申告ではない。
         self.queued_validations.extend(validations);
+        // 人の承認 (実物では画面のボタン)。承認しない限り検証は発行されない。
+        if self.approve_validation {
+            let ids: Vec<u64> = self
+                .rt
+                .decisions()
+                .iter()
+                .filter(|d| d.kind == DecisionKind::ValidationExecution)
+                .map(|d| d.id)
+                .collect();
+            for id in ids {
+                self.rt.apply_action(TeamAction::ApproveDecision(id));
+            }
+        }
         eff
     }
 
@@ -324,7 +351,9 @@ fn 受入シナリオを最後まで通す() {
         TeamTaskState::Validating,
         "報告だけでレビューへ進めてはいけない"
     );
-    lab.idle(); // ここで RunValidation が出て、偽の実行器が実測を返す
+    // 承認 → 発行 → 実測が戻る、で 2 tick。
+    lab.idle();
+    lab.idle();
     assert_eq!(
         lab.rt.task(task_a).unwrap().state,
         TeamTaskState::Reviewing,
@@ -492,6 +521,38 @@ fn 既存coordinatorの重なり判定を迂回しない() {
             seen.push(f.clone());
         }
     }
+}
+
+#[test]
+fn 承認しなければ検証は一行も走らずgoalは完了しない() {
+    // **`cargo test` はリポジトリ内の任意コードを実行できる。** sandbox を
+    // 持たない以上、人が承認するまで 1 行も走らせない。承認しなければ
+    // Goal も完了しない (自動で先へ進む抜け道が無い)。
+    let mut lab = Lab::new(4);
+    lab.approve_validation = false;
+    lab.idle();
+    lab.idle();
+    let work = lab.working();
+    assert!(!work.is_empty());
+    let (_, tid, _) = work[0].clone();
+    lab.report_done(tid);
+    for _ in 0..6 {
+        let eff = lab.idle();
+        assert!(
+            !eff.iter()
+                .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+            "承認していないのに検証を実行した: {eff:?}"
+        );
+    }
+    assert_eq!(lab.rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    assert!(
+        lab.rt
+            .decisions()
+            .iter()
+            .any(|d| d.kind == DecisionKind::ValidationExecution),
+        "承認を求めていない"
+    );
+    assert_ne!(lab.rt.goal().status, GoalStatus::Completed);
 }
 
 #[test]

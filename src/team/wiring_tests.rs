@@ -498,7 +498,10 @@ fn 自己申告を正式な検証証跡にしない() {
     );
 
     // 実測を受ける入口だけが決着をつける。
-    let nv = function_body(&s, s.find("pub fn note_validation").expect("実測の入口"));
+    let nv = function_body(
+        &s,
+        s.find("pub fn note_validation_for").expect("実測の入口"),
+    );
     assert!(
         nv.contains("self.settle_validation(task)"),
         "実測を受けても決着をつけていない"
@@ -576,7 +579,7 @@ fn effectは実行前に完了扱いにしない() {
     // 決着していない検証は、成功済みでも引き継がない (裏スレッドは
     // プロセスと一緒に消えているので、記録だけが残ると永久に止まる)。
     assert!(
-        restore.contains("unsettled.contains(&r.key)"),
+        restore.contains("unsettled.iter().any(|p| r.key.starts_with(p))"),
         "落ちた検証の記録を回収していない"
     );
     // 刈り取りは成功済みだけ。
@@ -648,5 +651,17 @@ fn 実行側は必ず成否を返す() {
     );
     for needle in ["p.ack_done(&key)", "p.ack_failed(&key)"] {
         assert!(spawn.contains(needle), "検証の委譲先が `{needle}` を返していない");
+    }
+    // **時限と停止の札を必ず渡す。** ここが抜けると実行器は無期限に待ち、
+    // 止める手も無くなる (GUI の経路なので、ここでしか見張れない)。
+    for needle in [
+        "Duration::from_secs(v.timeout_secs",
+        "launch::new_cancel_flag()",
+        "timeout_secs: v.timeout_secs",
+    ] {
+        assert!(
+            spawn.contains(needle),
+            "検証の実行に `{needle}` を渡していない:\n{spawn}"
+        );
     }
 }

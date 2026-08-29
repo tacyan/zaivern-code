@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::model::{ValidationOutcome, ValidationRun};
+
 /// 起動要求の版。
 pub const LAUNCH_VERSION: u32 = 1;
 /// 投函ファイルのバイト上限。
@@ -245,50 +247,130 @@ pub fn needs_windows_shim(head: &str) -> bool {
     WINDOWS_SHIM_BINS.contains(&base)
 }
 
+/// 検証の既定の時間切れ (秒)。
+///
+/// **無期限に待たない。** `cargo test` / `npm test` / `pytest` は、実装の
+/// 不具合ひとつで終わらなくなる。待ち続けると、そのタスクは永久に
+/// `Validating` に残り、Team Run 全体が静かに止まる。
+pub const VALIDATION_TIMEOUT_SECS: u64 = 600;
+
+/// 実行中の検証を外から止めるための札。
+///
+/// **スレッドを畳むだけでは子プロセスが残る。** 立てられた札を見た実行器が
+/// [`crate::procx::kill_tree`] でプロセスツリーごと終了させる。
+pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// 止まっていない札を 1 つ作る。
+pub fn new_cancel_flag() -> CancelFlag {
+    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+/// 生きている子を待つときの刻み。短すぎると空回りで CPU を食い、長すぎると
+/// 停止の反応が鈍る。
+const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// 検証コマンド 1 本を実行する。
 ///
 /// **シェルを挟まない。** 語に分けて実体を直に起こす — `sh -c` を通すと
 /// 「コマンド、引数、cwd を分離して扱う」という約束が崩れる。
-/// 許可リスト ([`super::graph::check_command`]) を通っていないものは
-/// 実行せず、終了コード 126 (実行不可) を返す。
+/// 実行してはいけないもの ([`super::graph::check_command`]) は実行せず、
+/// 終了コード 126 (実行不可) を返す。
+///
+/// **必ず決着する。** 時間切れ・停止・起動失敗のどれでも、対応する
+/// [`ValidationOutcome`] を持った結果を返す (返さない経路は無い)。
 ///
 /// Windows で `.cmd` 配布の実行体だけは `cmd /C` を挟むが、そこでも
 /// **引数は分けたまま**渡す ([`needs_windows_shim`])。
-pub fn run_validation_command(cmd: &str, cwd: &Path) -> super::model::ValidationRun {
-    let fail = |code: i32| super::model::ValidationRun {
-        command: cmd.to_string(),
-        exit_code: code,
-    };
+pub fn run_validation_command(
+    cmd: &str,
+    cwd: &Path,
+    timeout: std::time::Duration,
+    cancel: &CancelFlag,
+) -> ValidationRun {
     if super::graph::check_command(cmd).is_err() {
-        return fail(126);
+        return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
     }
     let mut words = cmd.split_whitespace();
     let Some(head) = words.next() else {
-        return fail(126);
+        return ValidationRun::new(cmd, 126, ValidationOutcome::SpawnFailed);
     };
     let args: Vec<&str> = words.collect();
+    let out = run_words(head, &args, cwd, timeout, cancel);
+    ValidationRun::new(cmd, out.0, out.1)
+}
+
+/// 語に分けた 1 本を実行する (終了コードと終わり方を返す)。
+///
+/// 分けてあるのは**時間切れと停止をテストするため**。許可リストに載っている
+/// コマンドは、どれも「確実に終わらない」形で起動できるとは限らないので、
+/// テストは実体 (`sleep` / `ping`) をここへ直接渡す。
+pub fn run_words(
+    head: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: std::time::Duration,
+    cancel: &CancelFlag,
+) -> (i32, ValidationOutcome) {
+    use std::sync::atomic::Ordering;
 
     let mut command = if cfg!(windows) && needs_windows_shim(head) {
-        let mut c = std::process::Command::new("cmd");
+        let mut c = crate::procx::hidden_command("cmd");
         c.arg("/C").arg(head);
         c
     } else {
-        std::process::Command::new(head)
+        crate::procx::hidden_command(head)
     };
-    let out = command
-        .args(&args)
+    command
+        .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match out {
-        // 127 = コマンドが見つからない (シェルの慣習に合わせる)
-        Err(_) => fail(127),
-        Ok(s) => super::model::ValidationRun {
-            command: cmd.to_string(),
-            exit_code: s.code().unwrap_or(1),
-        },
+        .stderr(std::process::Stdio::null());
+    // **unix では自分のプロセスグループを持たせる。** そうしないと
+    // `kill_tree` (killpg) が Zaivern 自身を巻き込む。孫まで届くのも
+    // グループがあってこそ。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    // 127 = コマンドが見つからない (シェルの慣習に合わせる)
+    let Ok(mut child) = command.spawn() else {
+        return (127, ValidationOutcome::SpawnFailed);
+    };
+    let pid = child.id();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return (st.code().unwrap_or(1), from_status(st)),
+            // 待っている相手が居ない = 取りこぼし。待ち続けない。
+            Err(_) => return (1, ValidationOutcome::RunnerDisconnected),
+            Ok(None) => {}
+        }
+        let stop = if cancel.load(Ordering::Relaxed) {
+            Some(ValidationOutcome::Cancelled)
+        } else if start.elapsed() >= timeout {
+            Some(ValidationOutcome::TimedOut)
+        } else {
+            None
+        };
+        if let Some(why) = stop {
+            // **木ごと落とす。** 直接の子だけを殺すと、孫が cwd を握ったまま
+            // 残る (既存の `procx::kill_tree` を使う — Team 専用の第 2 の
+            // プロセス管理を作らない)。
+            crate::procx::kill_tree(pid);
+            let _ = child.wait();
+            return (if why == ValidationOutcome::TimedOut { 124 } else { 130 }, why);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+fn from_status(st: std::process::ExitStatus) -> ValidationOutcome {
+    if st.success() {
+        ValidationOutcome::Passed
+    } else {
+        ValidationOutcome::Failed
     }
 }
 
@@ -439,12 +521,158 @@ mod tests {
         }
     }
 
+    /// 終わらないコマンド (OS ごとに実体が違う)。
+    fn forever() -> (&'static str, Vec<&'static str>) {
+        if cfg!(windows) {
+            ("ping", vec!["-n", "60", "127.0.0.1"])
+        } else {
+            ("sleep", vec!["60"])
+        }
+    }
+
+    #[test]
+    fn 正常終了と異常終了を見分ける() {
+        let dir = ws("exec-status");
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = std::time::Duration::from_secs(30);
+        let (ok_head, ok_args) = if cfg!(windows) {
+            ("cmd", vec!["/C", "exit", "0"])
+        } else {
+            ("true", vec![])
+        };
+        let (ng_head, ng_args) = if cfg!(windows) {
+            ("cmd", vec!["/C", "exit", "3"])
+        } else {
+            ("false", vec![])
+        };
+        assert_eq!(
+            run_words(ok_head, &ok_args, &dir, t, &new_cancel_flag()),
+            (0, ValidationOutcome::Passed)
+        );
+        let (code, out) = run_words(ng_head, &ng_args, &dir, t, &new_cancel_flag());
+        assert_eq!(out, ValidationOutcome::Failed);
+        assert_ne!(code, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 起動できないコマンドはspawn_failedになる() {
+        let dir = ws("exec-nospawn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (code, out) = run_words(
+            "zaivern-no-such-binary-9f3a",
+            &[],
+            &dir,
+            std::time::Duration::from_secs(5),
+            &new_cancel_flag(),
+        );
+        assert_eq!(out, ValidationOutcome::SpawnFailed);
+        assert_eq!(code, 127);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 終わらない検証は時間切れで打ち切る() {
+        // **無期限に待たない。** 待つと、そのタスクは永久に `Validating`
+        // に残り、Team Run 全体が静かに止まる。
+        let dir = ws("exec-timeout");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (head, args) = forever();
+        let start = std::time::Instant::now();
+        let (code, out) = run_words(
+            head,
+            &args,
+            &dir,
+            std::time::Duration::from_millis(300),
+            &new_cancel_flag(),
+        );
+        assert_eq!(out, ValidationOutcome::TimedOut, "時間切れにならない");
+        assert_eq!(code, 124);
+        // 「10 分待つテスト」にしない — 時限は注入する。
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "打ち切りに時間がかかりすぎ: {:?}",
+            start.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 停止の札を立てると打ち切る() {
+        let dir = ws("exec-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (head, args) = forever();
+        let cancel = new_cancel_flag();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            c2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let start = std::time::Instant::now();
+        let (code, out) = run_words(
+            head,
+            &args,
+            &dir,
+            std::time::Duration::from_secs(60),
+            &cancel,
+        );
+        assert_eq!(out, ValidationOutcome::Cancelled);
+        assert_eq!(code, 130);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **孫まで落ちることを、痕跡で確かめる。**
+    ///
+    /// 直接の子だけを殺すと孫が残り、「スレッドは畳んだが `cargo test` が
+    /// 走り続けている」になる。孫に「1 秒後にファイルを作る」仕事をさせて、
+    /// 打ち切った後もそのファイルが**現れないこと**を見る。
+    #[cfg(unix)]
+    #[test]
+    fn 打ち切ると孫プロセスも残らない() {
+        let dir = ws("exec-tree");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-was-alive");
+        let script = format!(
+            "sh -c 'sleep 1; : > {}' & sleep 60",
+            marker.display()
+        );
+        let cancel = new_cancel_flag();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            c2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let (_, out) = run_words(
+            "sh",
+            &["-c", &script],
+            &dir,
+            std::time::Duration::from_secs(60),
+            &cancel,
+        );
+        assert_eq!(out, ValidationOutcome::Cancelled);
+        // 孫が生きていれば、この間にファイルを作る。
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        assert!(
+            !marker.exists(),
+            "孫プロセスが生き残ってファイルを作った: {}",
+            marker.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn 許可されていないコマンドは実行しない() {
         let dir = ws("exec");
         std::fs::create_dir_all(&dir).unwrap();
-        let r = run_validation_command("rm -rf /", &dir);
+        let r = run_validation_command(
+            "rm -rf /",
+            &dir,
+            std::time::Duration::from_secs(5),
+            &new_cancel_flag(),
+        );
         assert_eq!(r.exit_code, 126, "危険なコマンドを実行してしまった");
+        assert_eq!(r.outcome(), ValidationOutcome::SpawnFailed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

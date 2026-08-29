@@ -242,8 +242,19 @@ still open. Reviews go to a **different session** than the one that wrote the
 code. The `validation` block an agent reports is kept as **reference only**:
 Zaivern runs the task's validation commands itself and advances to review only
 on its own measured results.
- `push`, `merge`, `deploy`, privilege escalation and destructive commands
-are never run automatically — they become a decision for you, on screen.
+
+Validation commands are **classified by risk**, not waved through by an
+allowlist. A path-qualified executable (`/tmp/cargo test`, `./cargo test`,
+`tools/python x.py`) is never run — matching on the basename alone would run
+whatever `/tmp/cargo` happens to be. `push`, `merge`, `deploy`, `publish`,
+privilege escalation and destructive commands are refused outright. And
+anything that can execute code from the repository — `cargo test`, `npm test`,
+`pytest`, `make`, `node`, `go test` — **waits for your approval before a single
+line runs**, because a test body, a `build.rs` or a `Makefile` can do anything
+a shell can. Every run has a timeout, is killed as a whole process tree when
+you stop the team, and always settles: passed, failed, timed out, cancelled,
+could not start, or runner disconnected. Zaivern does not sandbox what you
+approve — it guarantees what gets started, not what that process then does.
 
 The Organization Board shows the team lead, the specialist lanes, every parent
 and child agent, what each is doing right now, the task graph's progress, test

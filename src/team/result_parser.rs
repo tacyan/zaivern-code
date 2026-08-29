@@ -235,9 +235,12 @@ pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectR
     let validation: Vec<ValidationRun> = doc
         .validation
         .iter()
+        // **自己申告なので `result` は付けない。** 実測 (`ValidationOutcome`)
+        // と同じ形にすると、画面でも保存でも見分けが付かなくなる。
         .map(|v| ValidationRun {
             command: v.command.trim().to_string(),
             exit_code: v.exit_code,
+            result: None,
         })
         .collect();
 

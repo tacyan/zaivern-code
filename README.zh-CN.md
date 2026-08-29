@@ -215,6 +215,16 @@ Zaivern 读取 SPEC，推导出 Goal 与 Definition of Done，构建任务图并
 blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**负责。
 智能体报告的 `validation` 只作为**参考信息**保留：验证命令由 Zaivern 自己
 执行，只有它自己实测通过后才会进入评审。
+
+验证命令不会因为在允许列表里就被放行，而是**按风险分级**。带路径的可执行文件
+(`/tmp/cargo test`、`./cargo test`、`tools/python x.py`) 一律不执行——只看
+basename 就会真的去跑 `/tmp/cargo`。push、merge、deploy、publish、权限提升和
+破坏性操作直接拒绝。而**可能执行仓库内代码的命令** (`cargo test`、`npm test`、
+`pytest`、`make`、`node`、`go test`) **在你批准之前一行都不会运行**——测试本体、
+`build.rs`、`Makefile` 能做的事和 shell 一样多。每次执行都有超时，停止团队时会
+连同整个进程树一起结束，并且一定有结果：通过、失败、超时、已停止、无法启动或
+执行器断开。Zaivern 不会沙箱化你批准的东西——它保证的是**启动了什么**，而不是
+那个进程之后做了什么。
 push、merge、deploy、权限提升和破坏性命令永不自动执行——它们会变成屏幕上
 等待你决定的事项。
 

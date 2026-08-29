@@ -173,6 +173,34 @@ pub enum RestorePrompt {
     ConfirmDiscard,
 }
 
+/// 裏で走っている検証 1 件。**受け口と一緒に「何の実行か」を持つ。**
+///
+/// 送り手が消えたときに失敗として戻すには、タスク・実行 ID・コマンドが
+/// 要る。受け口だけを配列で持っていた頃は、切断を握り潰す以外に手が無く、
+/// `validation.running` が true のまま残っていた。
+/// 実行器の時限を過ぎてから、こちら側が見切るまでの余白 (秒)。
+pub const WATCHDOG_SLACK_SECS: u64 = 60;
+
+pub struct ValidationJob {
+    pub task: TaskId,
+    /// `run_id:task:attempt:generation`。結果の突き合わせに使う。
+    pub execution: String,
+    /// 走らせているコマンド (切断時に失敗として戻すため)。
+    pub commands: Vec<String>,
+    /// 開始時刻 (Unix 秒)。見張りの基準になる。
+    pub started_at: u64,
+    /// 実行器へ渡した時間切れ (秒)。
+    ///
+    /// 実行器が自分で打ち切れなかったとき (worker がブロックしたまま何も
+    /// 送らない) の**最後の砦**。これを持たないと「切断も来ない・結果も
+    /// 来ない」経路だけが永久に残る。
+    pub timeout_secs: u64,
+    /// 停止の札。立てると実行器がプロセスツリーごと終了させる。
+    pub cancel: super::launch::CancelFlag,
+    /// 結果の受け口 (実行 ID, タスク, 実測)。
+    pub rx: std::sync::mpsc::Receiver<(String, TaskId, Vec<ValidationRun>)>,
+}
+
 /// Team 画面の状態。
 pub struct TeamPanel {
     pub open: bool,
@@ -223,7 +251,12 @@ pub struct TeamPanel {
     ///
     /// **UI スレッドでブロッキング I/O をしない**ので、`try_recv` で
     /// 拾える形にして持つ。
-    validation_rx: Vec<std::sync::mpsc::Receiver<(TaskId, Vec<ValidationRun>)>>,
+    /// 走らせている検証。**受け口だけを持たない。**
+    ///
+    /// 送り手が消えたとき (worker の panic) に、どのタスクの・どの実行の・
+    /// 何のコマンドが失われたのかが分からないと、`validation.running` を
+    /// 下ろすことも失敗として記録することもできない。
+    validation_jobs: Vec<ValidationJob>,
 }
 
 impl Default for TeamPanel {
@@ -253,7 +286,7 @@ impl Default for TeamPanel {
             seen_set: HashMap::new(),
             next_scan: None,
             next_launch_poll: None,
-            validation_rx: Vec::new(),
+            validation_jobs: Vec::new(),
         }
     }
 }
@@ -366,7 +399,11 @@ impl TeamPanel {
     }
 
     /// 保存された Run を消す (**確認済みの呼び出しだけ**)。
+    ///
+    /// **走っている検証を置き去りにしない。** 記録だけ消して `cargo test` が
+    /// 走り続けると、誰も結果を受け取らないプロセスがリポジトリを触り続ける。
     pub fn discard_run(&mut self) -> Result<usize, String> {
+        self.cancel_all_validations();
         let dir = self.state_dir();
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
         self.runtime = None;
@@ -501,6 +538,13 @@ impl TeamPanel {
                     // **画面に出た時点で仕事は済んでいる**ので、そのまま成功を返す。
                     self.ack_done(&key);
                 }
+                TeamEffect::CancelValidation {
+                    execution, task, ..
+                } => {
+                    // 相手が居なくても目的は果たされている (走っていない)。
+                    let _ = (self.cancel_validation(&execution), task);
+                    self.ack_done(&key);
+                }
                 TeamEffect::PersistState => self.needs_save = true,
             }
             self.dirty = true;
@@ -559,39 +603,112 @@ impl TeamPanel {
     }
 
     /// 検証結果を戻す。
-    pub fn note_validation(&mut self, task: TaskId, runs: Vec<ValidationRun>) {
+    /// **実行 ID を添えて**実測を戻す (古い実行の結果を採らないため)。
+    pub fn note_validation_for(
+        &mut self,
+        execution: &str,
+        task: TaskId,
+        runs: Vec<ValidationRun>,
+    ) {
         if let Some(rt) = self.runtime.as_mut() {
-            rt.note_validation(task, runs);
+            rt.note_validation_for(execution, task, runs);
         }
+        self.needs_save = true;
         self.dirty = true;
     }
 
-/// 裏で走らせた検証の受け口を預かる。
-    pub fn watch_validation(
-        &mut self,
-        rx: std::sync::mpsc::Receiver<(TaskId, Vec<ValidationRun>)>,
-    ) {
-        self.validation_rx.push(rx);
+    /// 裏で走らせた検証を預かる。
+    pub fn watch_validation(&mut self, job: ValidationJob) {
+        self.validation_jobs.push(job);
+    }
+
+    /// 走っている検証の数 (UI とテストが見る)。
+    pub fn running_validations(&self) -> usize {
+        self.validation_jobs.len()
+    }
+
+    /// 指定した実行を止めるよう札を立てる。**プロセスは実行器が落とす。**
+    ///
+    /// 戻り値は「止める相手が居たか」。世代がずれていれば既に別の実行なので
+    /// 何もしない (古い停止要求で新しい検証を殺さない)。
+    pub fn cancel_validation(&mut self, execution: &str) -> bool {
+        let mut hit = false;
+        for j in &self.validation_jobs {
+            if j.execution == execution {
+                j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    /// 走っている検証を全部止める (Run を閉じる / 破棄するとき)。戻りは件数。
+    pub fn cancel_all_validations(&mut self) -> usize {
+        for j in &self.validation_jobs {
+            j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.running_validations()
     }
 
     /// 終わった検証を取り込む。**待たない** (`try_recv`)。
+    ///
+    /// **送り手が消えた場合を握り潰さない。** worker が panic すると結果は
+    /// 永久に来ないので、受け口を捨てるだけでは `validation.running` が
+    /// true のまま残り、そのタスクは二度と進まない。
     pub fn collect_validations(&mut self) {
-        if self.validation_rx.is_empty() {
+        if self.validation_jobs.is_empty() {
             return;
         }
+        let now = super::model::now_secs();
         let mut still = Vec::new();
-        let mut done: Vec<(TaskId, Vec<ValidationRun>)> = Vec::new();
-        for rx in std::mem::take(&mut self.validation_rx) {
-            match rx.try_recv() {
-                Ok(v) => done.push(v),
-                Err(std::sync::mpsc::TryRecvError::Empty) => still.push(rx),
-                // 送り手が消えた = 結果は来ない。待ち続けない。
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        let mut done: Vec<(String, TaskId, Vec<ValidationRun>)> = Vec::new();
+        for job in std::mem::take(&mut self.validation_jobs) {
+            // **最後の砦。** 実行器が自分で打ち切れず、切断も起きない
+            // (worker がブロックしたまま) 経路をここで決着させる。
+            // 猶予は実行器の時限 + コマンド数ぶん + 余白。
+            let limit = job
+                .timeout_secs
+                .saturating_mul(job.commands.len().max(1) as u64)
+                .saturating_add(WATCHDOG_SLACK_SECS);
+            if now.saturating_sub(job.started_at) > limit {
+                let runs = job
+                    .commands
+                    .iter()
+                    .map(|c| {
+                        ValidationRun::new(c, 124, super::model::ValidationOutcome::TimedOut)
+                    })
+                    .collect();
+                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                done.push((job.execution.clone(), job.task, runs));
+                continue;
+            }
+            match job.rx.try_recv() {
+                Ok((execution, task, runs)) => done.push((execution, task, runs)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => still.push(job),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 結果は来ない。**失敗として戻す** — 待ち続けない。
+                    let runs = job
+                        .commands
+                        .iter()
+                        .map(|c| {
+                            ValidationRun::new(
+                                c,
+                                125,
+                                super::model::ValidationOutcome::RunnerDisconnected,
+                            )
+                        })
+                        .collect();
+                    done.push((job.execution.clone(), job.task, runs));
+                }
             }
         }
-        self.validation_rx = still;
-        for (task, runs) in done {
-            self.note_validation(task, runs);
+        self.validation_jobs = still;
+        for (execution, task, runs) in done {
+            if let Some(rt) = self.runtime.as_mut() {
+                rt.note_validation_for(&execution, task, runs);
+            }
+            self.needs_save = true;
+            self.dirty = true;
         }
     }
 
@@ -758,6 +875,74 @@ mod tests {
             launches.len(),
             "失敗を返したのに再発行されない"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 検証 1 件を「走っている」状態で預ける (受け口だけ返す)。
+    fn queue_job(
+        p: &mut TeamPanel,
+        task: TaskId,
+        execution: &str,
+    ) -> std::sync::mpsc::Sender<(String, TaskId, Vec<ValidationRun>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            task,
+            execution: execution.to_string(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: super::super::launch::new_cancel_flag(),
+            rx,
+        });
+        tx
+    }
+
+    #[test]
+    fn 実行器との接続が切れたら失敗として戻す() {
+        // **握り潰さない。** 受け口を捨てるだけだと `validation.running` が
+        // true のまま残り、そのタスクは二度と進まない。
+        let dir = ws("disconnect");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let exec = p
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .current_execution(1);
+        let tx = queue_job(&mut p, 1, &exec);
+        assert_eq!(p.running_validations(), 1);
+        drop(tx); // worker が panic した状況
+        p.collect_validations();
+        assert_eq!(p.running_validations(), 0, "受け口を抱えたまま");
+        let t = p
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.task(1))
+            .expect("タスク")
+            .clone();
+        assert!(!t.validation.running, "実行中のまま残った");
+        assert!(
+            t.validation
+                .runs
+                .iter()
+                .any(|r| r.outcome() == super::super::model::ValidationOutcome::RunnerDisconnected),
+            "接続断を記録していない: {:?}",
+            t.validation.runs
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 停止の要求は走っている検証にだけ届く() {
+        let dir = ws("cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let _tx = queue_job(&mut p, 1, "run:1:0:1");
+        assert!(!p.cancel_validation("run:1:0:99"), "世代違いまで止めた");
+        assert!(p.cancel_validation("run:1:0:1"), "止められなかった");
+        assert_eq!(p.running_validations(), 1, "札を立てただけで捨てない");
         std::fs::remove_dir_all(&dir).ok();
     }
 

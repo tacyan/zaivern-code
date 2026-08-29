@@ -131,6 +131,7 @@ mod tests {
         let v = ValidationState {
             running: true,
             runs: Vec::new(),
+            generation: 0,
         };
         assert_eq!(
             derive_agent_work_state(SessionState::Stalled, Some(&task), Some(&v), None),
@@ -153,6 +154,7 @@ mod tests {
         let v = ValidationState {
             running: true,
             runs: Vec::new(),
+            generation: 0,
         };
         let r = ReviewState {
             running: true,
@@ -179,6 +181,7 @@ mod tests {
         let v = ValidationState {
             running: true,
             runs: Vec::new(),
+            generation: 0,
         };
         assert_eq!(
             derive_agent_work_state(SessionState::Working, Some(&task), Some(&v), None),

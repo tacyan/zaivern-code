@@ -262,29 +262,53 @@ impl ZaivernApp {
     }
 
     /// 検証を裏で走らせる。
+    ///
+    /// **UI スレッドで待たない。** 時間切れと停止の判断は実行器
+    /// ([`launch::run_words`]) が持ち、こちらは結果を受け取るだけ。
+    /// どの経路で終わっても、結果か失敗のどちらかが必ず Runtime へ戻る。
     fn team_spawn_validation(
         &mut self,
         key: String,
         v: crate::features::team::imp::runtime::ValidationSpec,
     ) {
-        let (tx, rx) = std::sync::mpsc::channel::<(TaskId, Vec<ValidationRun>)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, TaskId, Vec<ValidationRun>)>();
         let task = v.task;
+        let execution = v.execution.clone();
         let cwd = v.cwd.clone();
         let cmds = v.commands.clone();
+        let timeout = std::time::Duration::from_secs(v.timeout_secs.max(1));
+        let cancel = launch::new_cancel_flag();
+        let worker_cancel = cancel.clone();
+        let worker_exec = execution.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("zai-team-validate-{task}"))
             .spawn(move || {
-                let runs: Vec<ValidationRun> = cmds
-                    .iter()
-                    .map(|c| launch::run_validation_command(c, &cwd))
-                    .collect();
-                let _ = tx.send((task, runs));
+                let mut runs: Vec<ValidationRun> = Vec::new();
+                for c in &cmds {
+                    let r = launch::run_validation_command(c, &cwd, timeout, &worker_cancel);
+                    let stop = !r.ok();
+                    runs.push(r);
+                    // **1 本落ちたら残りは走らせない。** 落ちた後のコマンドを
+                    // 走らせても判定は変わらず、時間と資源を使うだけ。
+                    if stop {
+                        break;
+                    }
+                }
+                let _ = tx.send((worker_exec, task, runs));
             });
         match spawned {
             Ok(_) => panel::with_panel(|p| {
                 // 走らせ始めたので受け取った旨を返す。実測の結果は
-                // `note_validation` が別途 Runtime へ戻す。
-                p.watch_validation(rx);
+                // `collect_validations` が別途 Runtime へ戻す。
+                p.watch_validation(panel::ValidationJob {
+                    task,
+                    execution: execution.clone(),
+                    commands: v.commands.clone(),
+                    started_at: crate::features::team::imp::model::now_secs(),
+                    timeout_secs: v.timeout_secs,
+                    cancel,
+                    rx,
+                });
                 p.ack_done(&key);
             }),
             Err(e) => {
@@ -293,15 +317,18 @@ impl ZaivernApp {
                 let runs = v
                     .commands
                     .iter()
-                    .map(|c| ValidationRun {
-                        command: c.clone(),
-                        exit_code: 126,
+                    .map(|c| {
+                        ValidationRun::new(
+                            c,
+                            126,
+                            crate::features::team::imp::model::ValidationOutcome::SpawnFailed,
+                        )
                     })
                     .collect();
                 panel::with_panel(|p| {
                     // 走らせられなかった = 実行不可として記録する。
                     // 黙って未実行のままにすると永久に待つ。
-                    p.note_validation(task, runs);
+                    p.note_validation_for(&execution, task, runs);
                     p.ack_failed(&key);
                 });
                 self.toast(

@@ -228,7 +228,21 @@ fallaron, o si queda un blocker abierto. Las revisiones van a una **sesión
 distinta** de la que escribió el código. El bloque `validation` que informa el
 agente se guarda solo como **información de referencia**: es Zaivern quien
 ejecuta los comandos de validación y solo pasa a la revisión con los resultados
-que él mismo midió. `push`, `merge`, `deploy`, la elevación
+que él mismo midió.
+
+Los comandos de validación se **clasifican por riesgo**, no se dan por buenos
+por estar en una allowlist. Un ejecutable con ruta (`/tmp/cargo test`,
+`./cargo test`, `tools/python x.py`) nunca se ejecuta: mirar solo el basename
+ejecutaría lo que sea que sea `/tmp/cargo`. push, merge, deploy, publish, la
+elevación de privilegios y los comandos destructivos se rechazan. Y todo lo que
+puede ejecutar código del repositorio (`cargo test`, `npm test`, `pytest`,
+`make`, `node`, `go test`) **espera tu aprobación antes de ejecutar una sola
+línea**: el cuerpo de un test, un `build.rs` o un `Makefile` pueden hacer lo
+mismo que un shell. Cada ejecución tiene tiempo límite, se termina con todo el
+árbol de procesos cuando paras el equipo, y siempre acaba en un resultado:
+pasó, falló, se agotó el tiempo, se canceló, no pudo iniciarse o se perdió la
+conexión con el ejecutor. Zaivern no aísla lo que apruebas: garantiza **qué se
+inició**, no lo que ese proceso hace después. `push`, `merge`, `deploy`, la elevación
 de privilegios y los comandos destructivos nunca se ejecutan automáticamente:
 se convierten en una decisión tuya, en pantalla.
 

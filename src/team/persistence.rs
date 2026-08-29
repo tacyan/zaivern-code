@@ -92,6 +92,10 @@ pub struct EffectRecord {
     pub at: u64,
 }
 
+fn default_validation_timeout() -> u64 {
+    super::launch::VALIDATION_TIMEOUT_SECS
+}
+
 /// 実行そのものの記録。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDoc {
@@ -110,6 +114,17 @@ pub struct RunDoc {
     /// Effect の進み具合 (版 2 以降)。**発行 = 完了ではない。**
     #[serde(default)]
     pub effects: Vec<EffectRecord>,
+    /// **人が実行を承認した検証コマンド。**
+    ///
+    /// `cargo test` などはリポジトリ内の任意コードを実行しうるので、
+    /// 承認したものだけを走らせる ([`super::graph::ValidationRisk`])。
+    /// Run 単位で持つ — 同じコマンドを試行のたびに聞き直すと、承認が
+    /// 「はい」を押すだけの儀式になり、実際には読まれなくなる。
+    #[serde(default)]
+    pub approved_validation: Vec<String>,
+    /// 検証 1 本あたりの時間切れ (秒)。テストは短い値を注入する。
+    #[serde(default = "default_validation_timeout")]
+    pub validation_timeout_secs: u64,
     /// 版 1 の「処理済み Effect」。読むためだけに残す
     /// ([`RunDoc::migrate`] が `effects` へ移す)。**新しく書かない。**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -461,6 +476,8 @@ mod tests {
                 stopped: false,
                 started_at: 100,
                 updated_at: 100,
+                approved_validation: Vec::new(),
+                validation_timeout_secs: default_validation_timeout(),
                 effects: vec![EffectRecord {
                     key: "start:1".into(),
                     state: EffectState::Completed,

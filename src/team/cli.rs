@@ -358,6 +358,9 @@ pub fn status_json(s: &persistence::Saved) -> String {
         "paused": s.run.paused,
         "stopped": s.run.stopped,
         "agent_count": s.run.agent_count,
+        // **人が実行を承認した検証コマンド。** GUI の Mission Panel と同じ
+        // ものを CLI からも読めるようにする (別実装を作らない)。
+        "approved_validation": s.run.approved_validation,
         "tasks": s.tasks.iter().map(|t| serde_json::json!({
             "id": t.id,
             "title": t.title,
@@ -365,6 +368,13 @@ pub fn status_json(s: &persistence::Saved) -> String {
             "attempts": t.attempts,
             "assigned_agent": t.assigned_agent.as_ref().map(|a| a.0.clone()),
             "validation_ok": t.validation.passed(&t.validation_commands),
+            // **GUI と同じものを出す。** 片方にしか無い情報を作らない。
+            "validation_result": t
+                .validation
+                .runs
+                .iter()
+                .find(|r| !r.ok())
+                .map(|r| r.outcome().key()),
             "review_approved": t.review.approved(),
             "blockers": t.blockers,
         })).collect::<Vec<_>>(),

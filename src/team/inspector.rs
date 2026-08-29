@@ -197,7 +197,17 @@ fn task_section(ui: &mut egui::Ui, theme: &Theme, t: &TaskView, acts: &mut Vec<B
             } else if t.validation_ok {
                 tr("team.inspector.passed")
             } else {
-                tr("team.inspector.failed")
+                // **なぜ通らなかったのかまで出す。** 時間切れと実装の失敗を
+                // 同じ「失敗」で塗ると、直しようが無い。
+                match t.validation_result {
+                    Some(ValidationOutcome::TimedOut) => tr("team.validation.timed_out"),
+                    Some(ValidationOutcome::Cancelled) => tr("team.validation.cancelled"),
+                    Some(ValidationOutcome::SpawnFailed) => tr("team.validation.spawn_failed"),
+                    Some(ValidationOutcome::RunnerDisconnected) => {
+                        tr("team.validation.runner_disconnected")
+                    }
+                    _ => tr("team.inspector.failed"),
+                }
             });
             ui.end_row();
             ui.label(tr("team.inspector.review"));

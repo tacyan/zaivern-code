@@ -127,89 +127,161 @@ pub const FORBIDDEN_COMMAND_WORDS: &[&str] = &[
 /// これらが出てきた時点で「素のシェル文字列」と判断して拒否する。
 pub const SHELL_METACHARS: &[char] = &[';', '|', '&', '>', '<', '`', '$', '\n', '\r'];
 
-/// 検証コマンドとして許してよいか。**許可されたものだけを通す (allowlist)**。
+/// 検証コマンドの危険度。**「安全か危険か」の 2 値では足りない。**
 ///
-/// 返り値が `Err` なら、その文面をそのまま人へ見せる。
-pub fn check_command(cmd: &str) -> Result<(), String> {
+/// `cargo test` にシェルのメタ文字は 1 つも無いが、`build.rs` /
+/// `#[test]` の中身 / `conftest.py` / `Makefile` / `package.json` の
+/// `scripts` を通じて**リポジトリ内の任意コードを実行できる**。ここを
+/// 「許可リストに載っているから安全」と畳むと、「破壊的操作は自動実行
+/// しない」という保証が成り立たなくなる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationRisk {
+    /// リポジトリ内の任意コードを実行しないと**明確に言える**もの。
+    Safe,
+    /// テスト・ビルド・スクリプトなど、**リポジトリ内のコードを実行しうる**もの。
+    /// 隔離 (sandbox) が無い以上、人の承認を通してから実行する。
+    RepositoryCodeExecution,
+    /// 実行しない。パス指定・シェル・publish / deploy / push / sudo /
+    /// 破壊的操作など。
+    Forbidden,
+}
+
+/// リポジトリ内のコードを実行しないと言い切れるコマンド。
+///
+/// **迷ったらここへ入れない。** 設定ファイルから任意のコードを読み込む
+/// もの (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン)
+/// は、名前が「検査するだけ」に見えても実行しうる。
+const SAFE_HEADS: &[&str] = &["rustfmt", "shellcheck", "black", "ruff"];
+
+/// 自動実行の対象にしてよいコマンド名 (実行ファイルの名前そのもの)。
+///
+/// **ここに載っていても「安全」ではない** — 危険度は
+/// [`classify_command`] が決める。
+const ALLOWED_HEAD: &[&str] = &[
+    "cargo",
+    "rustc",
+    "rustfmt",
+    "clippy-driver",
+    "make",
+    "just",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "node",
+    "deno",
+    "python",
+    "python3",
+    "pytest",
+    "go",
+    "gradle",
+    "mvn",
+    "dotnet",
+    "swift",
+    "ruby",
+    "bundle",
+    "rake",
+    "php",
+    "composer",
+    "dart",
+    "flutter",
+    "zig",
+    "ctest",
+    "cmake",
+    "ninja",
+    "bazel",
+    "tox",
+    "mix",
+    "sbt",
+    "elixir",
+    "jest",
+    "vitest",
+    "eslint",
+    "prettier",
+    "tsc",
+    "biome",
+    "ruff",
+    "black",
+    "mypy",
+    "pylint",
+    "shellcheck",
+    "zai",
+];
+
+/// 実行ファイルの指定にパスが混ざっているか。
+///
+/// **混ざっていたら実行しない。** basename だけで許可を決めると
+/// `/tmp/cargo test` が「`cargo` だから許可」になり、実際に起動されるのは
+/// `/tmp/cargo` — 攻撃者が置いた任意の実行体になる。PATH から解決される
+/// 素の名前だけを通す。
+fn head_has_path(head: &str) -> bool {
+    if head.contains('/') || head.contains('\\') {
+        return true;
+    }
+    // Windows のドライブ指定 (`C:cargo` は「C: のカレント」からの相対)。
+    let b = head.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && (b[0] as char).is_ascii_alphabetic() {
+        return true;
+    }
+    // 拡張子つきの実行体指定も、PATH 解決の素の名前ではない。
+    head.contains('.')
+}
+
+/// 検証コマンドの危険度を決める。**許可されたものだけを通す (allowlist)**。
+pub fn classify_command(cmd: &str) -> ValidationRisk {
+    classify_command_why(cmd).0
+}
+
+/// 危険度と、`Forbidden` のときの理由。
+pub fn classify_command_why(cmd: &str) -> (ValidationRisk, String) {
+    let no = |why: String| (ValidationRisk::Forbidden, why);
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
-        return Err("空のコマンド".to_string());
+        return no("空のコマンド".to_string());
     }
     if trimmed.len() > 400 {
-        return Err("コマンドが長すぎます".to_string());
+        return no("コマンドが長すぎます".to_string());
     }
     if let Some(c) = trimmed.chars().find(|c| SHELL_METACHARS.contains(c)) {
-        return Err(format!("シェルのメタ文字 `{c}` は使えません"));
+        return no(format!("シェルのメタ文字 `{c}` は使えません"));
     }
     let mut words = trimmed.split_whitespace();
     let Some(head) = words.next() else {
-        return Err("空のコマンド".to_string());
+        return no("空のコマンド".to_string());
     };
     // 実行するのは実体だけ。`sh -c "..."` のような入れ子は通さない。
-    let head_base = head.rsplit(['/', '\\']).next().unwrap_or(head);
-    const ALLOWED_HEAD: &[&str] = &[
-        "cargo",
-        "rustc",
-        "rustfmt",
-        "clippy-driver",
-        "make",
-        "just",
-        "npm",
-        "pnpm",
-        "yarn",
-        "bun",
-        "node",
-        "deno",
-        "python",
-        "python3",
-        "pytest",
-        "go",
-        "gradle",
-        "mvn",
-        "dotnet",
-        "swift",
-        "ruby",
-        "bundle",
-        "rake",
-        "php",
-        "composer",
-        "dart",
-        "flutter",
-        "zig",
-        "ctest",
-        "cmake",
-        "ninja",
-        "bazel",
-        "tox",
-        "mix",
-        "sbt",
-        "elixir",
-        "jest",
-        "vitest",
-        "eslint",
-        "prettier",
-        "tsc",
-        "biome",
-        "ruff",
-        "black",
-        "mypy",
-        "pylint",
-        "shellcheck",
-        "zai",
-    ];
-    if !ALLOWED_HEAD.contains(&head_base) {
-        return Err(format!(
-            "`{head_base}` は自動実行を許可していないコマンドです"
+    if head_has_path(head) {
+        return no(format!(
+            "`{head}` はパス指定です。PATH から解決される名前だけを使ってください"
         ));
+    }
+    if !ALLOWED_HEAD.contains(&head) {
+        return no(format!("`{head}` は自動実行を許可していないコマンドです"));
     }
     // 引数側に破壊的な語が混ざっていないか (`cargo publish` など)。
     for w in trimmed.split_whitespace().skip(1) {
         let w_low = w.trim_start_matches('-').to_ascii_lowercase();
         if FORBIDDEN_COMMAND_WORDS.contains(&w_low.as_str()) {
-            return Err(format!("`{w}` を含む操作は自動実行しません"));
+            return no(format!("`{w}` を含む操作は自動実行しません"));
         }
     }
-    Ok(())
+    if SAFE_HEADS.contains(&head) {
+        (ValidationRisk::Safe, String::new())
+    } else {
+        (ValidationRisk::RepositoryCodeExecution, String::new())
+    }
+}
+
+/// 検証コマンドとして**そもそも実行してよいか** (`Forbidden` でないか)。
+///
+/// 返り値が `Err` なら、その文面をそのまま人へ見せる。
+/// **`Ok` は「安全」という意味ではない** — リポジトリのコードを実行しうる
+/// ものは [`ValidationRisk::RepositoryCodeExecution`] として承認を要求する。
+pub fn check_command(cmd: &str) -> Result<(), String> {
+    match classify_command_why(cmd) {
+        (ValidationRisk::Forbidden, why) => Err(why),
+        _ => Ok(()),
+    }
 }
 
 /// 担当ファイルのパターンがワークスペースの内側に収まっているか。
@@ -698,6 +770,85 @@ mod tests {
     }
 
     #[test]
+    fn パス付きの実行ファイルは拒否する() {
+        // **basename だけを見てはいけない。** `/tmp/cargo` は basename が
+        // `cargo` なので許可され、実際に起動されるのは `/tmp/cargo` だった。
+        for bad in [
+            "/tmp/cargo test",
+            "./cargo test",
+            "tools/python script.py",
+            "C:\\tools\\cargo.exe test",
+            "..\\bin\\cargo test",
+            ".\\cargo.exe test",
+            "C:cargo test",
+        ] {
+            assert_eq!(
+                classify_command(bad),
+                ValidationRisk::Forbidden,
+                "{bad} を通してしまった"
+            );
+            assert!(check_command(bad).is_err(), "{bad} を通してしまった");
+        }
+    }
+
+    #[test]
+    fn リポジトリのコードを実行しうるものはsafeにしない() {
+        // ビルド・テスト・スクリプト実行系は、シェルのメタ文字が 1 つも
+        // 無くても **リポジトリ内の任意コードを実行できる**
+        // (build.rs / conftest.py / Makefile / package.json の scripts …)。
+        for c in [
+            "cargo test auth",
+            "cargo build",
+            "npm test",
+            "pnpm test",
+            "yarn test",
+            "bun test",
+            "node malicious.js",
+            "deno test",
+            "python arbitrary.py",
+            "python3 arbitrary.py",
+            "pytest",
+            "make dangerous-target",
+            "just ci",
+            "gradle test",
+            "mvn verify",
+            "dotnet test",
+            "go test ./...",
+        ] {
+            assert_eq!(
+                classify_command(c),
+                ValidationRisk::RepositoryCodeExecution,
+                "{c} を安全と判定した"
+            );
+        }
+        // 逆に、リポジトリのコードを実行しないと言い切れるものは Safe。
+        for c in ["rustfmt --check src/a.rs", "shellcheck tools/x.sh"] {
+            assert_eq!(classify_command(c), ValidationRisk::Safe, "{c} を弾いた");
+        }
+    }
+
+    #[test]
+    fn 禁止されたコマンドはforbiddenになる() {
+        for bad in [
+            "cargo publish",
+            "git push origin main",
+            "npm publish",
+            "sudo make install",
+            "rm -rf /",
+            "kubectl apply -f x",
+            "cargo test && rm -rf x",
+            "sh -c 'echo hi'",
+            "terraform apply",
+        ] {
+            assert_eq!(
+                classify_command(bad),
+                ValidationRisk::Forbidden,
+                "{bad} を通してしまった"
+            );
+        }
+    }
+
+    #[test]
     fn フェーズはタスクグラフから決まる() {
         let mut impl_t = task(1, "impl", &[]);
         impl_t.role = super::super::model::TeamRole::Implementer;
@@ -734,10 +885,11 @@ mod tests {
     fn goalはレビュー承認まで完了しない() {
         let mut a = task(1, "a", &[]);
         a.state = TeamTaskState::Completed;
-        a.validation.runs.push(super::super::model::ValidationRun {
-            command: a.validation_commands[0].clone(),
-            exit_code: 0,
-        });
+        a.validation
+            .runs
+            .push(super::super::model::ValidationRun::passed(
+                a.validation_commands[0].clone(),
+            ));
         assert!(
             !goal_done(&[a.clone()], &["done".into()], true),
             "未承認で完了させない"

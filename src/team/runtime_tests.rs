@@ -133,19 +133,7 @@ fn review_block(target: TaskId, approve: bool) -> String {
 /// 自己申告 (`[ZAI-TEAM-RESULT]` の `validation`) は正式な証跡にならないので、
 /// テストでも必ずこちらを通す — 通さずに先へ進めるなら、それは実装の欠陥。
 fn validate_ok(rt: &mut TeamRuntime, tid: TaskId) {
-    let cmds = rt
-        .task(tid)
-        .map(|t| t.validation_commands.clone())
-        .unwrap_or_default();
-    rt.note_validation(
-        tid,
-        cmds.iter()
-            .map(|c| ValidationRun {
-                command: c.clone(),
-                exit_code: 0,
-            })
-            .collect(),
-    );
+    note_outcome(rt, tid, 0, ValidationOutcome::Passed);
 }
 
 /// いま割り当てられているタスクを (session, task_id, agent) で返す。
@@ -817,6 +805,36 @@ fn report_and_collect(rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, now
     rt.tick(&obs(now, &rows))
 }
 
+/// 報告 → **人が実行を承認** → 検証が発行される、まで進める。
+fn report_approve_and_collect(
+    rt: &mut TeamRuntime,
+    sids: &[SessionId],
+    tid: TaskId,
+    now: u64,
+) -> Vec<TeamEffect> {
+    report_and_collect(rt, sids, tid, now);
+    approve_validation(rt);
+    idle_tick(rt, now + 1, sids)
+}
+
+/// 保留中の「検証の実行許可」を人が承認する。
+///
+/// `cargo test` はリポジトリ内のコードを実行するので、**実物でも人が 1 度
+/// 承認しないと 1 行も走らない**。テストもその経路を通す (迂回する近道を
+/// 作らない)。承認した件数を返す。
+fn approve_validation(rt: &mut TeamRuntime) -> usize {
+    let ids: Vec<u64> = rt
+        .decisions()
+        .iter()
+        .filter(|d| d.kind == DecisionKind::ValidationExecution)
+        .map(|d| d.id)
+        .collect();
+    for id in &ids {
+        rt.apply_action(TeamAction::ApproveDecision(*id));
+    }
+    ids.len()
+}
+
 /// 実装 1 本を割り当てた状態を作る。
 fn to_assigned() -> (TeamRuntime, Vec<SessionId>, TaskId) {
     let mut rt = started(4);
@@ -831,8 +849,9 @@ fn to_assigned() -> (TeamRuntime, Vec<SessionId>, TaskId) {
 #[test]
 fn 自己申告の検証成功でもzaivernが自分で実行する() {
     let (mut rt, sids, tid) = to_assigned();
-    // エージェントは "cargo test auth / exit_code=0" を自己申告する
-    let eff = report_and_collect(&mut rt, &sids, tid, 12);
+    // エージェントは "cargo test auth / exit_code=0" を自己申告する。
+    // **実行はリポジトリのコードを走らせるので、人の承認を通る。**
+    let eff = report_approve_and_collect(&mut rt, &sids, tid, 12);
     // **Zaivern 自身の検証が必ず発行される。**
     assert!(
         eff.iter().any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
@@ -856,14 +875,10 @@ fn 自己申告の検証成功でもzaivernが自分で実行する() {
 fn 実測が失敗ならレビューへ進まない() {
     let (mut rt, sids, tid) = to_assigned();
     report_and_collect(&mut rt, &sids, tid, 12);
-    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    approve_validation(&mut rt);
+    idle_tick(&mut rt, 12, &sids);
     // 実測は失敗
-    rt.note_validation(
-        tid,
-        cmds.iter()
-            .map(|c| ValidationRun { command: c.clone(), exit_code: 1 })
-            .collect(),
-    );
+    note_outcome(&mut rt, tid, 1, ValidationOutcome::Failed);
     idle_tick(&mut rt, 13, &sids);
     let t = rt.task(tid).unwrap();
     assert_ne!(t.state, TeamTaskState::Reviewing, "失敗したのにレビューへ進んだ");
@@ -879,13 +894,9 @@ fn 実測が成功して初めてレビューへ進む() {
     let (mut rt, sids, tid) = to_assigned();
     report_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
-    let cmds = rt.task(tid).unwrap().validation_commands.clone();
-    rt.note_validation(
-        tid,
-        cmds.iter()
-            .map(|c| ValidationRun { command: c.clone(), exit_code: 0 })
-            .collect(),
-    );
+    approve_validation(&mut rt);
+    idle_tick(&mut rt, 12, &sids);
+    validate_ok(&mut rt, tid);
     let t = rt.task(tid).unwrap();
     assert_eq!(t.state, TeamTaskState::Reviewing, "実測成功後にレビューへ進まない");
     assert!(rt.tasks().iter().any(|x| x.review_of == Some(tid)));
@@ -905,13 +916,9 @@ fn レビュー不要でも実測成功前は完了しない() {
         TeamTaskState::Completed,
         "レビュー不要でも自己申告だけで完了させてはいけない"
     );
-    let cmds = rt.task(tid).unwrap().validation_commands.clone();
-    rt.note_validation(
-        tid,
-        cmds.iter()
-            .map(|c| ValidationRun { command: c.clone(), exit_code: 0 })
-            .collect(),
-    );
+    approve_validation(&mut rt);
+    idle_tick(&mut rt, 12, &sids);
+    validate_ok(&mut rt, tid);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Completed);
 }
 
@@ -920,20 +927,18 @@ fn 検証コマンドが複数なら全部成功しないと進まない() {
     let (mut rt, sids, tid) = to_assigned();
     rt.set_validation_commands_for_test(tid, &["cargo test a", "cargo test b"]);
     report_and_collect(&mut rt, &sids, tid, 12);
+    approve_validation(&mut rt);
+    idle_tick(&mut rt, 12, &sids);
     // 1 本だけ成功
-    rt.note_validation(
-        tid,
-        vec![ValidationRun { command: "cargo test a".into(), exit_code: 0 }],
-    );
+    let exec = rt.current_execution(tid);
+    rt.note_validation_for(&exec, tid, vec![ValidationRun::passed("cargo test a")]);
     assert_eq!(
         rt.task(tid).unwrap().state,
         TeamTaskState::Validating,
         "一部だけの成功で先へ進んだ"
     );
-    rt.note_validation(
-        tid,
-        vec![ValidationRun { command: "cargo test b".into(), exit_code: 0 }],
-    );
+    let exec = rt.current_execution(tid);
+    rt.note_validation_for(&exec, tid, vec![ValidationRun::passed("cargo test b")]);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Reviewing);
 }
 
@@ -942,14 +947,10 @@ fn 自己申告と実測が矛盾したら実測を採る() {
     let (mut rt, sids, tid) = to_assigned();
     // 自己申告は exit_code 0
     report_and_collect(&mut rt, &sids, tid, 12);
-    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    approve_validation(&mut rt);
+    idle_tick(&mut rt, 12, &sids);
     // 実測は 1
-    rt.note_validation(
-        tid,
-        cmds.iter()
-            .map(|c| ValidationRun { command: c.clone(), exit_code: 1 })
-            .collect(),
-    );
+    note_outcome(&mut rt, tid, 1, ValidationOutcome::Failed);
     let t = rt.task(tid).unwrap();
     assert!(t.validation.failed(), "実測の失敗が採られていない");
     assert!(!t.validation.passed(&t.validation_commands));
@@ -972,7 +973,7 @@ fn 検証コマンドが空でも止まらない() {
 #[test]
 fn 再起動しても未完了の検証が再開される() {
     let (mut rt, sids, tid) = to_assigned();
-    report_and_collect(&mut rt, &sids, tid, 12);
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
     let saved = rt.to_saved();
     let mut r = TeamRuntime::restore(saved, ws());
@@ -983,6 +984,169 @@ fn 再起動しても未完了の検証が再開される() {
         "復元後に未完了の検証が再開されない: {eff:?}"
     );
     let _ = sids;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  検証は必ず決着する — 時間切れ・停止・接続断・古い結果
+// ══════════════════════════════════════════════════════════════════════
+
+/// 実行 ID を添えて、指定した終わり方の実測を戻す (偽の実行器)。
+fn note_outcome(rt: &mut TeamRuntime, tid: TaskId, code: i32, out: ValidationOutcome) {
+    let exec = rt.current_execution(tid);
+    let cmds = rt
+        .task(tid)
+        .map(|t| t.validation_commands.clone())
+        .unwrap_or_default();
+    let runs = cmds
+        .iter()
+        .map(|c| ValidationRun::new(c, code, out))
+        .collect();
+    rt.note_validation_for(&exec, tid, runs);
+}
+
+#[test]
+fn 時間切れは失敗として決着する() {
+    // **`Validating` に残さない。** 残すと Team Run 全体が静かに止まる。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    assert!(rt.task(tid).unwrap().validation.running);
+    note_outcome(&mut rt, tid, 124, ValidationOutcome::TimedOut);
+    let t = rt.task(tid).unwrap();
+    assert!(!t.validation.running, "時間切れなのに実行中のまま");
+    assert_ne!(t.state, TeamTaskState::Validating, "永久に Validating に残った");
+    assert_ne!(t.state, TeamTaskState::Reviewing, "落ちたのに先へ進めた");
+    // 理由が次の担当へ伝わる。
+    assert!(
+        t.context.iter().any(|c| c.contains("時間切れ")),
+        "時間切れだと分かる形で残していない: {:?}",
+        t.context
+    );
+}
+
+#[test]
+fn 接続断も起動失敗も決着する() {
+    for (code, out) in [
+        (125, ValidationOutcome::RunnerDisconnected),
+        (126, ValidationOutcome::SpawnFailed),
+    ] {
+        let (mut rt, sids, tid) = to_assigned();
+        report_approve_and_collect(&mut rt, &sids, tid, 12);
+        note_outcome(&mut rt, tid, code, out);
+        let t = rt.task(tid).unwrap();
+        assert!(!t.validation.running, "{out:?} で実行中のまま");
+        assert_ne!(t.state, TeamTaskState::Validating, "{out:?} で止まった");
+        assert_ne!(t.state, TeamTaskState::Reviewing, "{out:?} で先へ進めた");
+    }
+}
+
+#[test]
+fn 停止による打ち切りは失敗として数えない() {
+    // 人が止めたのを「実装が悪い」と読み替えない。決着 (running=false) は
+    // つくので永久には止まらず、再開すればもう一度走る。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let before = rt.task(tid).unwrap().attempts;
+    note_outcome(&mut rt, tid, 130, ValidationOutcome::Cancelled);
+    let t = rt.task(tid).unwrap();
+    assert!(!t.validation.running, "打ち切ったのに実行中のまま");
+    assert_eq!(t.attempts, before, "人が止めたぶんを失敗として数えた");
+    assert_ne!(t.state, TeamTaskState::Reviewing, "打ち切ったのに先へ進めた");
+    // 再開すればもう一度発行される。
+    let eff = idle_tick(&mut rt, 20, &sids);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "打ち切った検証が再開されない: {eff:?}"
+    );
+}
+
+#[test]
+fn 古い実行の結果は採用しない() {
+    // 差し戻して配り直した後に、前の実行の結果が遅れて届く筋書き。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let stale = rt.current_execution(tid);
+    // 検証が落ちて差し戻される (試行が 1 つ進む)。
+    note_outcome(&mut rt, tid, 1, ValidationOutcome::Failed);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Ready);
+    // ここで**古い実行**が「成功しました」と戻ってくる。
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    rt.note_validation_for(
+        &stale,
+        tid,
+        cmds.iter().map(ValidationRun::passed).collect(),
+    );
+    let t = rt.task(tid).unwrap();
+    assert_ne!(t.state, TeamTaskState::Reviewing, "古い結果で先へ進めた");
+    assert!(
+        !t.validation.passed(&t.validation_commands),
+        "古い結果を正式な証跡として採った: {:?}",
+        t.validation.runs
+    );
+}
+
+#[test]
+fn stopを承認すると走っている検証も止める() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    assert!(rt.task(tid).unwrap().validation.running);
+    // **承認前は止めない。**
+    let e1 = rt.apply_action(TeamAction::Stop);
+    assert!(
+        !e1.iter()
+            .any(|e| matches!(e, TeamEffect::CancelValidation { .. })),
+        "承認前に検証を止めた: {e1:?}"
+    );
+    let did = rt
+        .decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::StopAgents)
+        .expect("停止承認")
+        .id;
+    let e2 = rt.apply_action(TeamAction::ApproveDecision(did));
+    assert!(
+        e2.iter()
+            .any(|e| matches!(e, TeamEffect::CancelValidation { task, .. } if *task == tid)),
+        "承認したのに検証を止めない: {e2:?}"
+    );
+    let _ = sids;
+}
+
+#[test]
+fn 止めたrunは遅れて届いた成功でも完了しない() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    rt.apply_action(TeamAction::Stop);
+    // 停止のあとで、走っていた検証が「成功」と戻ってくる。
+    note_outcome(&mut rt, tid, 0, ValidationOutcome::Passed);
+    idle_tick(&mut rt, 30, &sids);
+    assert_ne!(
+        rt.goal().status,
+        GoalStatus::Completed,
+        "止めた Run が完了した"
+    );
+}
+
+#[test]
+fn 一時停止中は新しい検証を始めない() {
+    // 検証はリポジトリのコードを走らせる「仕事」なので、Pause の対象。
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    approve_validation(&mut rt);
+    rt.apply_action(TeamAction::Pause);
+    let eff = idle_tick(&mut rt, 13, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "一時停止中に検証を始めた: {eff:?}"
+    );
+    rt.apply_action(TeamAction::Resume);
+    let eff = idle_tick(&mut rt, 14, &sids);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "再開しても検証が始まらない: {eff:?}"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1102,6 +1266,115 @@ fn 旧担当が居なければ即座に回収できる() {
 //  修正 3: Effect は実行前に「完了済み」と記録しない
 // ══════════════════════════════════════════════════════════════════════
 
+// ══════════════════════════════════════════════════════════════════════
+//  検証コマンドの実行は、リスクに応じて人の承認を通す
+//
+//  `cargo test` にシェルのメタ文字は 1 つも無いが、build.rs / テスト本体 /
+//  conftest.py / Makefile を通じて **リポジトリ内の任意コードを実行できる**。
+//  隔離が無い以上「許可リストに載っているから安全」とは言えない。
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn リポジトリコードを実行する検証は承認前に走らない() {
+    let (mut rt, sids, tid) = to_assigned();
+    let eff = report_and_collect(&mut rt, &sids, tid, 12);
+    // **RunValidation は出ない。** 代わりに承認を求める。
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "承認前に検証を実行しようとした: {eff:?}"
+    );
+    let d = rt
+        .decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::ValidationExecution)
+        .expect("実行許可を求めていない");
+    assert!(
+        d.commands.iter().any(|c| c.contains("cargo test")),
+        "何を実行するのかを判断へ載せていない: {:?}",
+        d.commands
+    );
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    // 承認しない限り、何度回しても出ない。
+    let again = idle_tick(&mut rt, 13, &sids);
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, TeamEffect::RunValidation(_))));
+}
+
+#[test]
+fn 承認したあとにだけ検証が発行される() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let did = rt
+        .decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::ValidationExecution)
+        .expect("実行許可")
+        .id;
+    rt.apply_action(TeamAction::ApproveDecision(did));
+    let eff = idle_tick(&mut rt, 13, &sids);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "承認したのに検証が発行されない: {eff:?}"
+    );
+}
+
+#[test]
+fn 承認を拒否したら実行せず人へ上げる() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let did = rt
+        .decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::ValidationExecution)
+        .expect("実行許可")
+        .id;
+    rt.apply_action(TeamAction::RejectDecision(did));
+    let eff = idle_tick(&mut rt, 13, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "拒否したのに実行した: {eff:?}"
+    );
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::NeedsUser,
+        "拒否したまま Validating で止めてはいけない"
+    );
+    assert!(
+        !rt.task(tid).unwrap().validation.running,
+        "実行していないのに running のまま"
+    );
+}
+
+#[test]
+fn 承認は保存され復元後に聞き直さない() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let did = rt
+        .decisions()
+        .iter()
+        .find(|d| d.kind == DecisionKind::ValidationExecution)
+        .expect("実行許可")
+        .id;
+    rt.apply_action(TeamAction::ApproveDecision(did));
+    let saved = rt.to_saved();
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    // 復元後、担当は外れて Ready へ戻るが、承認そのものは残っている。
+    assert!(
+        r.to_saved()
+            .run
+            .approved_validation
+            .iter()
+            .any(|c| c.contains("cargo test")),
+        "承認が保存されていない"
+    );
+    let _ = (sids, tid);
+}
+
 #[test]
 fn 走っていた検証は復元後にもう一度走る() {
     // **検証は裏スレッドで走る。** 実行側は「走らせ始めた」時点で成功を返す
@@ -1110,10 +1383,15 @@ fn 走っていた検証は復元後にもう一度走る() {
     // 復元後に誰も検証を発行せず、タスクは `Validating` で永久に止まる
     // (発行済みで止まるのと同じ事故が、成功済みの側から起きる)。
     let (mut rt, sids, tid) = to_assigned();
-    report_and_collect(&mut rt, &sids, tid, 12);
+    let eff = report_approve_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
     // 実行側が「走らせ始めた」と返す (結果はまだ戻っていない)。
-    rt.note_effect_done(&format!("validate:{tid}"));
+    let key = eff
+        .iter()
+        .find(|e| matches!(e, TeamEffect::RunValidation(_)))
+        .expect("検証の発行")
+        .key();
+    rt.note_effect_done(&key);
 
     let saved = rt.to_saved();
     let mut r = TeamRuntime::restore(saved, ws());
@@ -1275,7 +1553,7 @@ fn start_agent再試行で既存セッションを重複起動しない() {
 #[test]
 fn 検証は同時に二重実行しない() {
     let (mut rt, sids, tid) = to_assigned();
-    let e1 = report_and_collect(&mut rt, &sids, tid, 12);
+    let e1 = report_approve_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(
         e1.iter()
             .filter(|e| matches!(e, TeamEffect::RunValidation(_)))
