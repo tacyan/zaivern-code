@@ -1,0 +1,580 @@
+//! Planner 境界 — SPEC から [`super::plan_schema::TeamPlan`] を作る層。
+//!
+//! ## なぜトレイトにするのか
+//!
+//! Planner はいずれ LLM (Claude / Codex / Gemini) になる。**Provider 固有の
+//! 処理が Team Runtime へ滲み出すと、`match provider { … }` の巨大な分岐が
+//! Runtime の真ん中に生える** — 禁止事項に挙がっているとおり。
+//! だから入口を [`TeamPlanner`] 1 本にし、Runtime はトレイト越しにしか
+//! 呼ばない。
+//!
+//! ## StaticPlanner が本体である理由
+//!
+//! テストと CI が外部 LLM を要求してはいけない。[`StaticPlanner`] は
+//! SPEC.md の見出し・箇条書きを読んで決定的に計画を組む — **同じ入力なら
+//! 必ず同じ計画**になるので、E2E をネットワーク無しで再現できる。
+//! LLM Planner を足すときも、この出力形式 (`plan_schema`) を守らせる。
+
+use super::plan_schema::{self, GoalDoc, PlanDoc, SchemaError, TaskDoc, TeamDoc, TeamPlan};
+
+/// Planner へ渡す材料。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanInput {
+    /// SPEC の本文。
+    pub spec: String,
+    /// SPEC の出所 (ファイル名 / `"(直接入力)"`)。表示だけに使う。
+    pub source: String,
+    /// 最大同時 ManagedSession 数。計画の粒度の目安になる。
+    pub agent_count: usize,
+    /// レビューを必須にするか。
+    pub review_required: bool,
+}
+
+/// 計画に失敗した理由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanError {
+    /// SPEC が空 / 短すぎる。
+    EmptySpec,
+    /// SPEC が大きすぎる。
+    SpecTooLarge { bytes: usize, limit: usize },
+    /// Planner の出力が schema を満たさない。
+    Schema(SchemaError),
+    /// Planner そのものが失敗した (LLM の呼び出し失敗など)。
+    Backend(String),
+}
+
+impl PlanError {
+    pub fn detail(&self) -> String {
+        match self {
+            PlanError::EmptySpec => "SPEC が空です。実装したい内容を書いてください。".to_string(),
+            PlanError::SpecTooLarge { bytes, limit } => {
+                format!("SPEC が大きすぎます ({bytes} バイト / 上限 {limit})")
+            }
+            PlanError::Schema(e) => e.detail(),
+            PlanError::Backend(m) => format!("計画の生成に失敗しました: {m}"),
+        }
+    }
+}
+
+/// SPEC の上限。これを超えると Planner へ渡さない
+/// (LLM Planner でも文脈に収まらないし、静的解析でも意味を成さない)。
+pub const SPEC_MAX_BYTES: usize = 512 * 1024;
+
+/// 計画を作るもの。
+pub trait TeamPlanner {
+    fn plan(&self, input: PlanInput) -> Result<TeamPlan, PlanError>;
+    /// 表示用の名前。
+    fn name(&self) -> &'static str;
+}
+
+// ── SPEC.md の読み取り (純粋関数) ────────────────────────────────────
+
+/// 見出し 1 つと、その下の箇条書き。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecSection {
+    /// `#` の数 (1〜6)。
+    pub level: u8,
+    pub title: String,
+    /// 箇条書き (`-` / `*` / `1.`)。
+    pub bullets: Vec<String>,
+    /// フェンス外の地の文。
+    pub prose: Vec<String>,
+}
+
+/// SPEC.md を見出し単位に割る。**コードフェンスの中は読まない**
+/// (サンプルコードの `- foo` を要件と読むと、計画が汚染される)。
+pub fn parse_sections(spec: &str) -> Vec<SpecSection> {
+    let text = spec.replace("\r\n", "\n");
+    let mut out: Vec<SpecSection> = Vec::new();
+    let mut fence: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        // フェンスの開閉。``` と ~~~ の両方。
+        if let Some(open) = fence.clone() {
+            if trimmed.starts_with(&open) {
+                fence = None;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```".to_string());
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some("~~~".to_string());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let extra = rest.chars().take_while(|c| *c == '#').count();
+            let level = (1 + extra).min(6) as u8;
+            let title = rest[extra..].trim().to_string();
+            out.push(SpecSection {
+                level,
+                title,
+                bullets: Vec::new(),
+                prose: Vec::new(),
+            });
+            continue;
+        }
+        let Some(cur) = out.last_mut() else {
+            // 見出しより前の地の文は捨てずに「前書き」節へ入れる。
+            out.push(SpecSection {
+                level: 1,
+                title: String::new(),
+                bullets: Vec::new(),
+                prose: if trimmed.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![trimmed.to_string()]
+                },
+            });
+            continue;
+        };
+        if let Some(b) = bullet_text(trimmed) {
+            if !b.is_empty() {
+                cur.bullets.push(b);
+            }
+        } else if !trimmed.is_empty() {
+            cur.prose.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// 箇条書き行なら中身を返す。
+fn bullet_text(line: &str) -> Option<String> {
+    for p in ["- [ ] ", "- [x] ", "- ", "* ", "+ "] {
+        if let Some(r) = line.strip_prefix(p) {
+            return Some(r.trim().to_string());
+        }
+    }
+    // `1. ` / `12) `
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && digits <= 3 {
+        let rest = &line[digits..];
+        if let Some(r) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return Some(r.trim().to_string());
+        }
+    }
+    None
+}
+
+/// 見出しが「完了条件」を表しているか。日英どちらの書き方も拾う。
+fn is_dod_heading(title: &str) -> bool {
+    let t = title.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "definition of done",
+        "dod",
+        "acceptance",
+        "完了条件",
+        "受入",
+        "受け入れ",
+        "done",
+    ];
+    NEEDLES.iter().any(|n| t.contains(n))
+}
+
+/// 見出しが「やること (タスク)」を表しているか。
+fn is_task_heading(title: &str) -> bool {
+    let t = title.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "task",
+        "todo",
+        "requirement",
+        "feature",
+        "scope",
+        "work",
+        "タスク",
+        "要件",
+        "機能",
+        "作業",
+        "実装",
+    ];
+    NEEDLES.iter().any(|n| t.contains(n))
+}
+
+/// 見出しが「検証」を表しているか。
+fn is_validation_heading(title: &str) -> bool {
+    let t = title.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "validation",
+        "verify",
+        "test command",
+        "検証",
+        "テストコマンド",
+    ];
+    NEEDLES.iter().any(|n| t.contains(n))
+}
+
+/// タイトル行から、括弧書きのファイル指定を取り出す。
+///
+/// `認証APIを実装 (src/auth/**)` → (`認証APIを実装`, `["src/auth/**"]`)
+fn split_files(title: &str) -> (String, Vec<String>) {
+    let Some(open) = title.rfind(['(', '（']) else {
+        return (title.trim().to_string(), Vec::new());
+    };
+    let close = title.rfind([')', '）']);
+    let Some(close) = close else {
+        return (title.trim().to_string(), Vec::new());
+    };
+    if close < open {
+        return (title.trim().to_string(), Vec::new());
+    }
+    let inner = &title[open
+        + title[open..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1)..close];
+    // ファイルらしさ: `/` か `.` を含み、空白で区切られた語がパスに見える
+    let parts: Vec<String> = inner
+        .split([',', '、', ' '])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let looks_like_paths = !parts.is_empty()
+        && parts
+            .iter()
+            .all(|p| p.contains('/') || p.contains('.') || p.contains('*'));
+    if looks_like_paths {
+        (title[..open].trim().to_string(), parts)
+    } else {
+        (title.trim().to_string(), Vec::new())
+    }
+}
+
+/// SPEC を読んで計画を組む決定的 Planner。
+///
+/// **同じ SPEC なら必ず同じ計画**になる (時刻以外)。E2E とテストはこれを使う。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StaticPlanner;
+
+impl StaticPlanner {
+    /// SPEC → Planner 出力 JSON 相当の文書。
+    ///
+    /// LLM Planner を足すときも「この形を返す」のが契約になる。
+    pub fn compose(&self, input: &PlanInput) -> PlanDoc {
+        let sections = parse_sections(&input.spec);
+
+        // 表題: 最初の非空見出し。無ければ SPEC の最初の行。
+        let title = sections
+            .iter()
+            .find(|s| !s.title.is_empty())
+            .map(|s| s.title.clone())
+            .or_else(|| {
+                input
+                    .spec
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+            })
+            .unwrap_or_else(|| "Team Run".to_string());
+
+        // Definition of Done
+        let mut dod: Vec<String> = sections
+            .iter()
+            .filter(|s| is_dod_heading(&s.title))
+            .flat_map(|s| s.bullets.clone())
+            .collect();
+        if dod.is_empty() {
+            // SPEC が DoD を書いていないなら、**最低限の DoD を必ず持たせる**。
+            // 空のまま進めると「本人の申告で完了」になる。
+            dod = vec![
+                "必要な実装が完了している".to_string(),
+                "すべての受入基準を満たしている".to_string(),
+                "検証コマンドが成功している".to_string(),
+                "レビューが承認されている".to_string(),
+                "未解決の Critical 指摘が無い".to_string(),
+                "最終統合テストが成功している".to_string(),
+            ];
+        }
+
+        // 検証コマンド (SPEC が指定していれば使う。危険なものはここで落とす)
+        let mut validations: Vec<String> = sections
+            .iter()
+            .filter(|s| is_validation_heading(&s.title))
+            .flat_map(|s| s.bullets.iter().chain(s.prose.iter()).cloned())
+            .map(|s| s.trim_matches('`').trim().to_string())
+            .filter(|s| super::graph::check_command(s).is_ok())
+            .collect();
+        validations.dedup();
+        if validations.is_empty() {
+            validations = default_validations();
+        }
+        validations.truncate(4);
+
+        // タスク: 「タスク / 要件」見出しの箇条書き。無ければ全見出しの箇条書き。
+        let mut raw_tasks: Vec<String> = sections
+            .iter()
+            .filter(|s| is_task_heading(&s.title))
+            .flat_map(|s| s.bullets.clone())
+            .collect();
+        if raw_tasks.is_empty() {
+            raw_tasks = sections
+                .iter()
+                .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
+                .flat_map(|s| s.bullets.clone())
+                .collect();
+        }
+        if raw_tasks.is_empty() {
+            // 箇条書きが 1 つも無い SPEC でも、見出しをタスクにして進める。
+            raw_tasks = sections
+                .iter()
+                .filter(|s| s.level >= 2 && !s.title.is_empty())
+                .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
+                .map(|s| s.title.clone())
+                .collect();
+        }
+        if raw_tasks.is_empty() {
+            raw_tasks = vec![title.clone()];
+        }
+        // 実装タスクは「最大同時数の 2 倍」までに抑える。
+        // 細かく割りすぎると割り当てが往復するだけで進まない。
+        let cap = input.agent_count.max(1).saturating_mul(2).clamp(2, 24);
+        raw_tasks.truncate(cap);
+
+        let teams = vec![
+            TeamDoc {
+                key: "implementation".into(),
+                name: "Implementation".into(),
+                lead_role: "team_lead".into(),
+            },
+            TeamDoc {
+                key: "qa".into(),
+                name: "QA & Review".into(),
+                lead_role: "reviewer".into(),
+            },
+            TeamDoc {
+                key: "integration".into(),
+                name: "Integration".into(),
+                lead_role: "integrator".into(),
+            },
+        ];
+
+        let mut tasks: Vec<TaskDoc> = Vec::new();
+        let mut impl_keys: Vec<String> = Vec::new();
+        for (i, t) in raw_tasks.iter().enumerate() {
+            let (label, files) = split_files(t);
+            let key = format!("impl-{:02}", i + 1);
+            impl_keys.push(key.clone());
+            tasks.push(TaskDoc {
+                key,
+                title: label.clone(),
+                description: format!("{}\n\n出典: {}", label, input.source),
+                team: "implementation".into(),
+                role: "implementer".into(),
+                depends_on: Vec::new(),
+                files,
+                required_caps: Vec::new(),
+                acceptance_criteria: vec![
+                    format!("{label} が SPEC の記述どおりに動作する"),
+                    "正常系と異常系の両方がテストされている".to_string(),
+                ],
+                validation_commands: validations.clone(),
+            });
+        }
+
+        // 統合タスク。**全実装タスクの完了に依存する。**
+        tasks.push(TaskDoc {
+            key: "integrate".into(),
+            title: "最終統合と全体検証".into(),
+            description: "全タスクの成果を統合し、整形・ビルド・テストを通す。\
+                push / PR 作成 / merge / deploy は行わない。"
+                .into(),
+            team: "integration".into(),
+            role: "integrator".into(),
+            depends_on: impl_keys,
+            files: Vec::new(),
+            required_caps: Vec::new(),
+            acceptance_criteria: vec![
+                "すべてのタスクが完了している".to_string(),
+                "整形・ビルド・テストが成功する".to_string(),
+                "未解決のレビュー指摘が無い".to_string(),
+            ],
+            validation_commands: validations,
+        });
+
+        PlanDoc {
+            goal: GoalDoc {
+                title,
+                definition_of_done: dod,
+            },
+            teams,
+            tasks,
+        }
+    }
+}
+
+/// SPEC が検証コマンドを書いていないときの既定。
+///
+/// **リポジトリを見て決める**のが理想だが、MVP では Rust リポジトリを
+/// 前提にした無害な 2 本にする (どちらも許可リストを通る)。
+fn default_validations() -> Vec<String> {
+    vec!["cargo fmt --check".to_string(), "cargo test".to_string()]
+}
+
+impl TeamPlanner for StaticPlanner {
+    fn plan(&self, input: PlanInput) -> Result<TeamPlan, PlanError> {
+        if input.spec.trim().is_empty() {
+            return Err(PlanError::EmptySpec);
+        }
+        if input.spec.len() > SPEC_MAX_BYTES {
+            return Err(PlanError::SpecTooLarge {
+                bytes: input.spec.len(),
+                limit: SPEC_MAX_BYTES,
+            });
+        }
+        let doc = self.compose(&input);
+        plan_schema::validate(doc, &input.spec).map_err(PlanError::Schema)
+    }
+
+    fn name(&self) -> &'static str {
+        "static"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(spec: &str) -> PlanInput {
+        PlanInput {
+            spec: spec.to_string(),
+            source: "SPEC.md".into(),
+            agent_count: 4,
+            review_required: true,
+        }
+    }
+
+    const SPEC: &str = "\
+# 認証機能
+
+## 要件
+- ログイン API を実装する (src/auth/login.rs)
+- トークン更新 API を実装する (src/auth/refresh.rs)
+
+## 完了条件
+- 認証 API が動作する
+- テストが成功する
+
+## 検証
+- cargo test auth
+";
+
+    #[test]
+    fn 見出しと箇条書きを読む() {
+        let secs = parse_sections(SPEC);
+        assert_eq!(secs[0].title, "認証機能");
+        assert_eq!(secs[1].title, "要件");
+        assert_eq!(secs[1].bullets.len(), 2);
+        assert_eq!(secs[2].bullets.len(), 2);
+    }
+
+    #[test]
+    fn コードフェンスの中は読まない() {
+        let spec = "# t\n## 要件\n```\n- これはサンプル\n```\n- 本物\n";
+        let secs = parse_sections(spec);
+        let req = secs.iter().find(|s| s.title == "要件").unwrap();
+        assert_eq!(req.bullets, vec!["本物".to_string()], "{:?}", req.bullets);
+    }
+
+    #[test]
+    fn 静的プランナーは決定的() {
+        let p = StaticPlanner;
+        let a = p.compose(&input(SPEC));
+        let b = p.compose(&input(SPEC));
+        assert_eq!(a, b, "同じ SPEC で違う計画が出た");
+    }
+
+    #[test]
+    fn タスクとdodと検証を組み立てる() {
+        let plan = StaticPlanner.plan(input(SPEC)).expect("計画できるべき");
+        assert_eq!(plan.goal.title, "認証機能");
+        assert_eq!(plan.goal.definition_of_done.len(), 2);
+        // 実装 2 本 + 統合 1 本
+        assert_eq!(plan.tasks.len(), 3);
+        assert_eq!(plan.tasks[0].files, vec!["src/auth/login.rs".to_string()]);
+        assert_eq!(plan.tasks[0].title, "ログイン API を実装する");
+        assert_eq!(
+            plan.tasks[0].validation_commands,
+            vec!["cargo test auth".to_string()]
+        );
+        // 統合は全実装に依存する
+        let last = plan.tasks.last().unwrap();
+        assert_eq!(last.dependencies, vec![1, 2]);
+        assert_eq!(last.role, super::super::model::TeamRole::Integrator);
+    }
+
+    #[test]
+    fn dodが書かれていなければ既定を必ず入れる() {
+        let plan = StaticPlanner
+            .plan(input("# a\n\n## 要件\n- x を作る\n"))
+            .unwrap();
+        assert!(
+            plan.goal.definition_of_done.len() >= 6,
+            "既定 DoD が入っていない: {:?}",
+            plan.goal.definition_of_done
+        );
+    }
+
+    #[test]
+    fn 空のspecを拒否する() {
+        assert_eq!(
+            StaticPlanner.plan(input("   \n\n")),
+            Err(PlanError::EmptySpec)
+        );
+    }
+
+    #[test]
+    fn 巨大なspecを拒否する() {
+        let big = "a".repeat(SPEC_MAX_BYTES + 1);
+        assert!(matches!(
+            StaticPlanner.plan(input(&big)),
+            Err(PlanError::SpecTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn 危険な検証コマンドはspecにあっても採らない() {
+        let spec = "# a\n## 要件\n- x\n## 検証\n- git push origin main\n";
+        let plan = StaticPlanner.plan(input(spec)).unwrap();
+        for t in &plan.tasks {
+            assert!(
+                !t.validation_commands.iter().any(|c| c.contains("push")),
+                "危険なコマンドが計画へ入った: {:?}",
+                t.validation_commands
+            );
+        }
+    }
+
+    #[test]
+    fn 箇条書きが無いspecでも計画できる() {
+        let plan = StaticPlanner
+            .plan(input("# 目的\n本文だけ。\n\n## 設計\n説明。\n"))
+            .expect("計画できるべき");
+        assert!(!plan.tasks.is_empty());
+    }
+
+    #[test]
+    fn エージェント数でタスク数を抑える() {
+        let mut spec = String::from("# t\n## 要件\n");
+        for i in 0..50 {
+            spec.push_str(&format!("- 項目 {i}\n"));
+        }
+        let mut inp = input(&spec);
+        inp.agent_count = 2;
+        let plan = StaticPlanner.plan(inp).unwrap();
+        // 上限 2*2=4 の実装 + 統合 1
+        assert_eq!(plan.tasks.len(), 5);
+    }
+
+    #[test]
+    fn ファイル指定でない括弧は表題に残す() {
+        let (t, f) = split_files("ログイン API を実装する (重要)");
+        assert_eq!(t, "ログイン API を実装する (重要)");
+        assert!(f.is_empty());
+    }
+}

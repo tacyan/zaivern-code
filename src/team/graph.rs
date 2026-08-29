@@ -1,0 +1,829 @@
+//! Task Graph — 依存関係の検証・Ready 化・開発フェーズの算出。
+//!
+//! ## 何を守るのか
+//!
+//! 「並列に走らせたら後で衝突が見つかった」を作らないため、**配る前に**
+//! 計画そのものを検査する。ここで弾くのは次の 7 つ:
+//!
+//! 1. 循環依存 (誰も Ready にならず、静かに止まる)
+//! 2. 存在しない依存先 (永久に Pending のまま残る)
+//! 3. 自己依存 (同上)
+//! 4. 重複するタスクキー (依存の解決が先勝ちになる)
+//! 5. 空の受入基準 (完了判定が「本人の申告」だけになる)
+//! 6. ワークスペース外のファイル (境界を越えた書き込み)
+//! 7. 危険な検証コマンド (`rm -rf` / push / deploy など)
+//!
+//! **どれも「動かしてみれば分かる」類ではない** — 循環依存は
+//! 「なぜか誰も動かない」として現れ、原因が Task Graph だと気付くまでに
+//! 時間が溶ける。
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use super::model::{TaskId, TeamTask, TeamTaskState};
+
+/// 計画の不備 1 件。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanIssue {
+    /// 循環依存 (関わっているタスクを ID 順で並べる)。
+    Cycle(Vec<TaskId>),
+    /// 存在しない依存先。
+    MissingDependency { task: TaskId, missing: String },
+    /// 自分自身への依存。
+    SelfDependency(TaskId),
+    /// タスクキーの重複。
+    DuplicateKey(String),
+    /// タスク ID の重複。
+    DuplicateId(TaskId),
+    /// 受入基準が空。
+    NoAcceptanceCriteria(TaskId),
+    /// 検証コマンドが空。
+    NoValidationCommand(TaskId),
+    /// ワークスペースの外を指すファイル。
+    FileOutsideWorkspace { task: TaskId, path: String },
+    /// 危険な検証コマンド。
+    DangerousCommand { task: TaskId, command: String },
+    /// Definition of Done が空。
+    NoDefinitionOfDone,
+    /// タスクが 1 件も無い。
+    NoTasks,
+}
+
+impl PlanIssue {
+    /// 人へ出す説明。
+    pub fn detail(&self) -> String {
+        match self {
+            PlanIssue::Cycle(ids) => {
+                let list: Vec<String> = ids.iter().map(|i| format!("#{i}")).collect();
+                format!("依存が循環しています: {}", list.join(" → "))
+            }
+            PlanIssue::MissingDependency { task, missing } => {
+                format!("#{task} が存在しないタスク「{missing}」に依存しています")
+            }
+            PlanIssue::SelfDependency(t) => format!("#{t} が自分自身に依存しています"),
+            PlanIssue::DuplicateKey(k) => format!("タスクキー「{k}」が重複しています"),
+            PlanIssue::DuplicateId(i) => format!("タスク ID #{i} が重複しています"),
+            PlanIssue::NoAcceptanceCriteria(t) => {
+                format!("#{t} に受入基準がありません (完了を機械的に判定できません)")
+            }
+            PlanIssue::NoValidationCommand(t) => {
+                format!("#{t} に検証コマンドがありません (検証なしで完了にはしません)")
+            }
+            PlanIssue::FileOutsideWorkspace { task, path } => {
+                format!("#{task} の担当ファイル「{path}」がワークスペースの外を指しています")
+            }
+            PlanIssue::DangerousCommand { task, command } => {
+                format!("#{task} の検証コマンド「{command}」は自動実行しません")
+            }
+            PlanIssue::NoDefinitionOfDone => "Definition of Done が空です".to_string(),
+            PlanIssue::NoTasks => "タスクが 1 件もありません".to_string(),
+        }
+    }
+}
+
+/// **自動では絶対に走らせない語。**
+///
+/// MVP の安全条件 (push / merge / deploy / 破壊的操作 / 権限昇格) を
+/// 検証コマンドの中身で照合する。判定は語単位で、パス風のトークンは
+/// 素通しする — `src/deploy_test.rs` を「deploy」と読むと、まともな
+/// テストコマンドまで止まってしまう。
+pub const FORBIDDEN_COMMAND_WORDS: &[&str] = &[
+    "push",
+    "deploy",
+    "release",
+    "publish",
+    "merge",
+    "rebase",
+    "reset",
+    "clean",
+    "rm",
+    "rmdir",
+    "del",
+    "format",
+    "mkfs",
+    "dd",
+    "shutdown",
+    "reboot",
+    "sudo",
+    "su",
+    "doas",
+    "chmod",
+    "chown",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "kubectl",
+    "helm",
+    "terraform",
+    "aws",
+    "gcloud",
+    "az",
+    "docker",
+    "npm-publish",
+    "shred",
+];
+
+/// シェルのメタ文字。**コマンドは文字列として連結せず、語に分けて扱う**ので、
+/// これらが出てきた時点で「素のシェル文字列」と判断して拒否する。
+pub const SHELL_METACHARS: &[char] = &[';', '|', '&', '>', '<', '`', '$', '\n', '\r'];
+
+/// 検証コマンドとして許してよいか。**許可されたものだけを通す (allowlist)**。
+///
+/// 返り値が `Err` なら、その文面をそのまま人へ見せる。
+pub fn check_command(cmd: &str) -> Result<(), String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Err("空のコマンド".to_string());
+    }
+    if trimmed.len() > 400 {
+        return Err("コマンドが長すぎます".to_string());
+    }
+    if let Some(c) = trimmed.chars().find(|c| SHELL_METACHARS.contains(c)) {
+        return Err(format!("シェルのメタ文字 `{c}` は使えません"));
+    }
+    let mut words = trimmed.split_whitespace();
+    let Some(head) = words.next() else {
+        return Err("空のコマンド".to_string());
+    };
+    // 実行するのは実体だけ。`sh -c "..."` のような入れ子は通さない。
+    let head_base = head.rsplit(['/', '\\']).next().unwrap_or(head);
+    const ALLOWED_HEAD: &[&str] = &[
+        "cargo",
+        "rustc",
+        "rustfmt",
+        "clippy-driver",
+        "make",
+        "just",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "node",
+        "deno",
+        "python",
+        "python3",
+        "pytest",
+        "go",
+        "gradle",
+        "mvn",
+        "dotnet",
+        "swift",
+        "ruby",
+        "bundle",
+        "rake",
+        "php",
+        "composer",
+        "dart",
+        "flutter",
+        "zig",
+        "ctest",
+        "cmake",
+        "ninja",
+        "bazel",
+        "tox",
+        "mix",
+        "sbt",
+        "elixir",
+        "jest",
+        "vitest",
+        "eslint",
+        "prettier",
+        "tsc",
+        "biome",
+        "ruff",
+        "black",
+        "mypy",
+        "pylint",
+        "shellcheck",
+        "zai",
+    ];
+    if !ALLOWED_HEAD.contains(&head_base) {
+        return Err(format!(
+            "`{head_base}` は自動実行を許可していないコマンドです"
+        ));
+    }
+    // 引数側に破壊的な語が混ざっていないか (`cargo publish` など)。
+    for w in trimmed.split_whitespace().skip(1) {
+        let w_low = w.trim_start_matches('-').to_ascii_lowercase();
+        if FORBIDDEN_COMMAND_WORDS.contains(&w_low.as_str()) {
+            return Err(format!("`{w}` を含む操作は自動実行しません"));
+        }
+    }
+    Ok(())
+}
+
+/// 担当ファイルのパターンがワークスペースの内側に収まっているか。
+///
+/// 実際のファイルシステムには触らない (計画時点では存在しないファイルを
+/// 指してよい)。見るのは**形**だけ — 絶対パス・`..` での脱出・
+/// Windows のドライブ指定・UNC を弾く。
+pub fn path_inside_workspace(pat: &str) -> bool {
+    let p = pat.trim();
+    if p.is_empty() {
+        return false;
+    }
+    if p.starts_with('/') || p.starts_with('\\') {
+        return false;
+    }
+    // `C:\...` / `C:/...`
+    let bytes = p.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        return false;
+    }
+    if p.starts_with("~") {
+        return false;
+    }
+    // `..` を含む区間があれば脱出しうる。深さを数えず、形で断る (fail-closed)。
+    p.split(['/', '\\']).all(|seg| seg != "..")
+}
+
+/// 計画全体を検証する。**問題が 1 つでもあれば配らない。**
+pub fn validate_plan(tasks: &[TeamTask], definition_of_done: &[String]) -> Vec<PlanIssue> {
+    let mut issues = Vec::new();
+    if definition_of_done.is_empty() {
+        issues.push(PlanIssue::NoDefinitionOfDone);
+    }
+    if tasks.is_empty() {
+        issues.push(PlanIssue::NoTasks);
+        return issues;
+    }
+
+    let mut seen_keys: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_ids: BTreeSet<TaskId> = BTreeSet::new();
+    for t in tasks {
+        if !seen_keys.insert(t.key.as_str()) {
+            issues.push(PlanIssue::DuplicateKey(t.key.clone()));
+        }
+        if !seen_ids.insert(t.id) {
+            issues.push(PlanIssue::DuplicateId(t.id));
+        }
+    }
+
+    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    for t in tasks {
+        for d in &t.dependencies {
+            if *d == t.id {
+                issues.push(PlanIssue::SelfDependency(t.id));
+            } else if !ids.contains(d) {
+                issues.push(PlanIssue::MissingDependency {
+                    task: t.id,
+                    missing: format!("#{d}"),
+                });
+            }
+        }
+        // レビュータスクは実装タスクの受入基準を引き継ぐので、自前の
+        // 受入基準を要求しない (要求すると計画が二重に膨らむ)。
+        if t.review_of.is_none() {
+            if t.acceptance_criteria.is_empty() {
+                issues.push(PlanIssue::NoAcceptanceCriteria(t.id));
+            }
+            if t.validation_commands.is_empty() {
+                issues.push(PlanIssue::NoValidationCommand(t.id));
+            }
+        }
+        for f in &t.files {
+            if !path_inside_workspace(f) {
+                issues.push(PlanIssue::FileOutsideWorkspace {
+                    task: t.id,
+                    path: f.clone(),
+                });
+            }
+        }
+        for c in &t.validation_commands {
+            if check_command(c).is_err() {
+                issues.push(PlanIssue::DangerousCommand {
+                    task: t.id,
+                    command: c.clone(),
+                });
+            }
+        }
+    }
+
+    if let Some(cycle) = find_cycle(tasks) {
+        issues.push(PlanIssue::Cycle(cycle));
+    }
+    issues
+}
+
+/// 依存の循環を 1 つ見つける (無ければ `None`)。
+///
+/// 決定的にするため、走査は ID の昇順で行う。
+pub fn find_cycle(tasks: &[TeamTask]) -> Option<Vec<TaskId>> {
+    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    let deps: BTreeMap<TaskId, Vec<TaskId>> = tasks
+        .iter()
+        .map(|t| {
+            let mut d: Vec<TaskId> = t
+                .dependencies
+                .iter()
+                .copied()
+                .filter(|x| ids.contains(x) && *x != t.id)
+                .collect();
+            d.sort_unstable();
+            (t.id, d)
+        })
+        .collect();
+
+    // 色塗り DFS。0=未訪問 1=訪問中 2=完了
+    let mut color: BTreeMap<TaskId, u8> = ids.iter().map(|i| (*i, 0u8)).collect();
+    let mut stack: Vec<TaskId> = Vec::new();
+
+    fn dfs(
+        node: TaskId,
+        deps: &BTreeMap<TaskId, Vec<TaskId>>,
+        color: &mut BTreeMap<TaskId, u8>,
+        stack: &mut Vec<TaskId>,
+    ) -> Option<Vec<TaskId>> {
+        color.insert(node, 1);
+        stack.push(node);
+        for next in deps.get(&node).map(|v| v.as_slice()).unwrap_or(&[]) {
+            match color.get(next).copied().unwrap_or(0) {
+                0 => {
+                    if let Some(c) = dfs(*next, deps, color, stack) {
+                        return Some(c);
+                    }
+                }
+                1 => {
+                    // stack の中に next が居るので、そこから先が循環。
+                    let at = stack.iter().position(|x| x == next).unwrap_or(0);
+                    let mut cyc: Vec<TaskId> = stack[at..].to_vec();
+                    cyc.push(*next);
+                    return Some(cyc);
+                }
+                _ => {}
+            }
+        }
+        stack.pop();
+        color.insert(node, 2);
+        None
+    }
+
+    for id in &ids {
+        if color.get(id).copied().unwrap_or(0) == 0 {
+            if let Some(c) = dfs(*id, &deps, &mut color, &mut stack) {
+                return Some(c);
+            }
+            stack.clear();
+        }
+    }
+    None
+}
+
+/// 依存が全部 [`TeamTaskState::Completed`] のタスクを列挙する
+/// (いま `Pending` のものだけ)。**Ready 化はここでしか起きない。**
+pub fn newly_ready(tasks: &[TeamTask]) -> Vec<TaskId> {
+    let done: BTreeSet<TaskId> = tasks
+        .iter()
+        .filter(|t| t.state == TeamTaskState::Completed)
+        .map(|t| t.id)
+        .collect();
+    let mut out: Vec<TaskId> = tasks
+        .iter()
+        .filter(|t| t.state == TeamTaskState::Pending)
+        .filter(|t| t.dependencies.iter().all(|d| done.contains(d)))
+        .map(|t| t.id)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// クリティカルパス上のタスク (そこから続く仕事がいちばん長いもの) の
+/// 「深さ」。スケジューラの優先順位に使う。値が大きいほど先に着手すべき。
+pub fn critical_depth(tasks: &[TeamTask]) -> BTreeMap<TaskId, u32> {
+    let mut children: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
+    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    for t in tasks {
+        for d in &t.dependencies {
+            if ids.contains(d) {
+                children.entry(*d).or_default().push(t.id);
+            }
+        }
+    }
+    let mut depth: BTreeMap<TaskId, u32> = ids.iter().map(|i| (*i, 0u32)).collect();
+    // 循環があると収束しないので、上限つきで回す (検証済みなら 1 周で足りる)。
+    let limit = tasks.len().saturating_add(1);
+    for _ in 0..limit {
+        let mut changed = false;
+        for id in ids.iter().rev() {
+            let best = children
+                .get(id)
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| depth.get(c).copied().unwrap_or(0) + 1)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            if depth.get(id).copied().unwrap_or(0) < best {
+                depth.insert(*id, best);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    depth
+}
+
+/// 開発フェーズ。**Task Graph から計算する。手動の状態を別に持たない。**
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Phase {
+    GoalAnalysis,
+    Architecture,
+    Implementation,
+    Review,
+    Integration,
+    FinalValidation,
+}
+
+impl Phase {
+    pub fn key(self) -> &'static str {
+        match self {
+            Phase::GoalAnalysis => "goal_analysis",
+            Phase::Architecture => "architecture",
+            Phase::Implementation => "implementation",
+            Phase::Review => "review",
+            Phase::Integration => "integration",
+            Phase::FinalValidation => "final_validation",
+        }
+    }
+
+    pub const ALL: [Phase; 6] = [
+        Phase::GoalAnalysis,
+        Phase::Architecture,
+        Phase::Implementation,
+        Phase::Review,
+        Phase::Integration,
+        Phase::FinalValidation,
+    ];
+}
+
+/// フェーズの進み具合。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseStatus {
+    Waiting,
+    Running,
+    Done,
+}
+
+impl PhaseStatus {
+    pub fn key(self) -> &'static str {
+        match self {
+            PhaseStatus::Waiting => "waiting",
+            PhaseStatus::Running => "running",
+            PhaseStatus::Done => "done",
+        }
+    }
+}
+
+/// タスクがどのフェーズに属するか (役割で決まる)。
+fn phase_of(t: &TeamTask) -> Phase {
+    use super::model::TeamRole as R;
+    match t.role {
+        R::Planner | R::TeamLead => Phase::GoalAnalysis,
+        R::Architect => Phase::Architecture,
+        R::Implementer => Phase::Implementation,
+        R::Tester => Phase::Review,
+        R::Reviewer => Phase::Review,
+        R::Integrator => Phase::Integration,
+    }
+}
+
+/// フェーズ一覧と、それぞれの進み具合を Task Graph から算出する。
+///
+/// 最終検証 (`FinalValidation`) はタスクを持たない集約フェーズで、
+/// 「全タスク完了 + Goal の DoD 判定」がそのまま状態になる。
+pub fn phases(tasks: &[TeamTask], goal_completed: bool) -> Vec<(Phase, PhaseStatus)> {
+    let mut out = Vec::new();
+    for p in Phase::ALL {
+        if p == Phase::FinalValidation {
+            let all_done =
+                !tasks.is_empty() && tasks.iter().all(|t| t.state == TeamTaskState::Completed);
+            let st = if goal_completed {
+                PhaseStatus::Done
+            } else if all_done {
+                PhaseStatus::Running
+            } else {
+                PhaseStatus::Waiting
+            };
+            out.push((p, st));
+            continue;
+        }
+        let mine: Vec<&TeamTask> = tasks.iter().filter(|t| phase_of(t) == p).collect();
+        let st = if mine.is_empty() {
+            // タスクが無いフェーズは「通過済み」として扱う。
+            // 空のまま Waiting にすると、永久に待っているように見える。
+            PhaseStatus::Done
+        } else if mine.iter().all(|t| t.state == TeamTaskState::Completed) {
+            PhaseStatus::Done
+        } else if mine.iter().any(|t| t.state != TeamTaskState::Pending) {
+            PhaseStatus::Running
+        } else {
+            PhaseStatus::Waiting
+        };
+        out.push((p, st));
+    }
+    out
+}
+
+/// いま進行中のフェーズ (先頭の Running、無ければ最初の Waiting)。
+pub fn current_phase(tasks: &[TeamTask], goal_completed: bool) -> Phase {
+    let ps = phases(tasks, goal_completed);
+    ps.iter()
+        .find(|(_, s)| *s == PhaseStatus::Running)
+        .or_else(|| ps.iter().find(|(_, s)| *s == PhaseStatus::Waiting))
+        .map(|(p, _)| *p)
+        .unwrap_or(Phase::FinalValidation)
+}
+
+/// Goal を完了にしてよいか。**「エージェントが完了と言った」では通らない。**
+///
+/// 条件:
+/// 1. タスクが 1 件以上ある
+/// 2. 全タスクが `Completed`
+/// 3. 全タスクの検証が要求どおり成功している
+/// 4. 全タスクのレビューが承認されている (レビュー不要なタスクを除く)
+/// 5. Definition of Done が空でない
+pub fn goal_done(tasks: &[TeamTask], definition_of_done: &[String], review_required: bool) -> bool {
+    if tasks.is_empty() || definition_of_done.is_empty() {
+        return false;
+    }
+    tasks.iter().all(|t| {
+        if t.state != TeamTaskState::Completed {
+            return false;
+        }
+        // レビュータスク自身は「対象を見た」ことが仕事なので、自前の検証も
+        // レビューも要求しない (要求すると入れ子の無限後退になる)。
+        if t.review_of.is_some() {
+            return true;
+        }
+        t.validation.passed(&t.validation_commands) && (!review_required || t.review.approved())
+    })
+}
+
+/// 進捗率 (0.0〜1.0)。完了タスク数 / 全タスク数。
+pub fn progress(tasks: &[TeamTask]) -> f32 {
+    if tasks.is_empty() {
+        return 0.0;
+    }
+    let done = tasks
+        .iter()
+        .filter(|t| t.state == TeamTaskState::Completed)
+        .count();
+    done as f32 / tasks.len() as f32
+}
+
+/// 依存の到達順 (トポロジカル順)。循環があれば `None`。
+/// 決定的にするため、同点は ID 昇順。
+pub fn topological_order(tasks: &[TeamTask]) -> Option<Vec<TaskId>> {
+    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    let mut indeg: BTreeMap<TaskId, usize> = ids.iter().map(|i| (*i, 0)).collect();
+    let mut children: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
+    for t in tasks {
+        for d in t.dependencies.iter().filter(|d| ids.contains(d)) {
+            *indeg.entry(t.id).or_insert(0) += 1;
+            children.entry(*d).or_default().push(t.id);
+        }
+    }
+    let mut q: VecDeque<TaskId> = indeg
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(i, _)| *i)
+        .collect();
+    let mut out = Vec::new();
+    while let Some(n) = q.pop_front() {
+        out.push(n);
+        let mut next: Vec<TaskId> = Vec::new();
+        for c in children.get(&n).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let e = indeg.entry(*c).or_insert(0);
+            *e = e.saturating_sub(1);
+            if *e == 0 {
+                next.push(*c);
+            }
+        }
+        next.sort_unstable();
+        for c in next {
+            q.push_back(c);
+        }
+    }
+    if out.len() == ids.len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testkit::task;
+    use super::*;
+
+    #[test]
+    fn 依存が終わるまでreadyにならない() {
+        let a = task(1, "a", &[]);
+        let mut b = task(2, "b", &[1]);
+        b.state = TeamTaskState::Pending;
+        let tasks = vec![a, b];
+        assert_eq!(newly_ready(&tasks), vec![1], "b はまだ Ready にならない");
+    }
+
+    #[test]
+    fn 依存が完了したらreadyになる() {
+        let mut a = task(1, "a", &[]);
+        a.state = TeamTaskState::Completed;
+        let b = task(2, "b", &[1]);
+        assert_eq!(newly_ready(&[a, b]), vec![2]);
+    }
+
+    #[test]
+    fn 循環依存を見つける() {
+        let a = task(1, "a", &[2]);
+        let b = task(2, "b", &[1]);
+        let c = find_cycle(&[a.clone(), b.clone()]).expect("循環を見つけるべき");
+        assert!(c.contains(&1) && c.contains(&2), "{c:?}");
+        let issues = validate_plan(&[a, b], &["done".into()]);
+        assert!(issues.iter().any(|i| matches!(i, PlanIssue::Cycle(_))));
+    }
+
+    #[test]
+    fn 三つ巴の循環も見つける() {
+        let t = vec![task(1, "a", &[3]), task(2, "b", &[1]), task(3, "c", &[2])];
+        assert!(find_cycle(&t).is_some());
+    }
+
+    #[test]
+    fn 存在しない依存を拒否する() {
+        let a = task(1, "a", &[99]);
+        let issues = validate_plan(&[a], &["done".into()]);
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, PlanIssue::MissingDependency { .. })),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn 自己依存を拒否する() {
+        let a = task(1, "a", &[1]);
+        let issues = validate_plan(&[a], &["done".into()]);
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PlanIssue::SelfDependency(1))));
+    }
+
+    #[test]
+    fn 重複キーを拒否する() {
+        let a = task(1, "same", &[]);
+        let b = task(2, "same", &[]);
+        let issues = validate_plan(&[a, b], &["done".into()]);
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PlanIssue::DuplicateKey(_))));
+    }
+
+    #[test]
+    fn 受入基準が空なら拒否する() {
+        let mut a = task(1, "a", &[]);
+        a.acceptance_criteria.clear();
+        let issues = validate_plan(&[a], &["done".into()]);
+        assert!(issues
+            .iter()
+            .any(|i| matches!(i, PlanIssue::NoAcceptanceCriteria(1))));
+    }
+
+    #[test]
+    fn ワークスペース外のファイルを拒否する() {
+        for bad in [
+            "/etc/passwd",
+            "../outside/x.rs",
+            "C:\\Windows\\x.rs",
+            "~/secrets",
+            "a/../../b",
+        ] {
+            assert!(!path_inside_workspace(bad), "{bad} を通してしまった");
+        }
+        for ok in ["src/auth/**", "src/a.rs", "docs/x.md", "./src/b.rs"] {
+            assert!(path_inside_workspace(ok), "{ok} を弾いてしまった");
+        }
+    }
+
+    #[test]
+    fn 危険なコマンドを拒否する() {
+        for bad in [
+            "rm -rf /",
+            "git push origin main",
+            "cargo test && rm -rf x",
+            "sh -c 'echo hi'",
+            "cargo publish",
+            "kubectl apply -f x",
+            "cargo test; echo done",
+            "cargo test | head",
+        ] {
+            assert!(check_command(bad).is_err(), "{bad} を通してしまった");
+        }
+        for ok in [
+            "cargo test auth",
+            "npm test",
+            "cargo fmt --check",
+            "just ci",
+        ] {
+            assert!(
+                check_command(ok).is_ok(),
+                "{ok} を弾いた: {:?}",
+                check_command(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn フェーズはタスクグラフから決まる() {
+        let mut impl_t = task(1, "impl", &[]);
+        impl_t.role = super::super::model::TeamRole::Implementer;
+        let mut rev = task(2, "rev", &[1]);
+        rev.role = super::super::model::TeamRole::Reviewer;
+        let tasks = vec![impl_t, rev];
+        let ps = phases(&tasks, false);
+        assert_eq!(ps.len(), 6);
+        // 実装が Pending なので Implementation は Waiting、Review も Waiting
+        assert_eq!(ps[2], (Phase::Implementation, PhaseStatus::Waiting));
+        assert_eq!(ps[5].1, PhaseStatus::Waiting);
+        // 実装が走り出すと Implementation が Running
+        let mut tasks2 = tasks.clone();
+        tasks2[0].state = TeamTaskState::Running;
+        assert_eq!(
+            phases(&tasks2, false)[2],
+            (Phase::Implementation, PhaseStatus::Running)
+        );
+        assert_eq!(current_phase(&tasks2, false), Phase::Implementation);
+    }
+
+    #[test]
+    fn 全部完了して初めて最終検証が動く() {
+        let mut a = task(1, "a", &[]);
+        a.state = TeamTaskState::Completed;
+        let ps = phases(&[a], false);
+        assert_eq!(ps[5], (Phase::FinalValidation, PhaseStatus::Running));
+        let mut b = task(1, "a", &[]);
+        b.state = TeamTaskState::Completed;
+        assert_eq!(phases(&[b], true)[5].1, PhaseStatus::Done);
+    }
+
+    #[test]
+    fn goalはレビュー承認まで完了しない() {
+        let mut a = task(1, "a", &[]);
+        a.state = TeamTaskState::Completed;
+        a.validation.runs.push(super::super::model::ValidationRun {
+            command: a.validation_commands[0].clone(),
+            exit_code: 0,
+        });
+        assert!(
+            !goal_done(&[a.clone()], &["done".into()], true),
+            "未承認で完了させない"
+        );
+        a.review.verdict = Some(super::super::model::ReviewVerdict::Approve);
+        assert!(goal_done(&[a], &["done".into()], true));
+    }
+
+    #[test]
+    fn goalは検証未実行では完了しない() {
+        let mut a = task(1, "a", &[]);
+        a.state = TeamTaskState::Completed;
+        a.review.verdict = Some(super::super::model::ReviewVerdict::Approve);
+        assert!(!goal_done(&[a], &["done".into()], true));
+    }
+
+    #[test]
+    fn クリティカルパスの深さ() {
+        // 1 → 2 → 3, 1 → 4
+        let t = vec![
+            task(1, "a", &[]),
+            task(2, "b", &[1]),
+            task(3, "c", &[2]),
+            task(4, "d", &[1]),
+        ];
+        let d = critical_depth(&t);
+        assert_eq!(d[&1], 2);
+        assert_eq!(d[&2], 1);
+        assert_eq!(d[&3], 0);
+        assert_eq!(d[&4], 0);
+    }
+
+    #[test]
+    fn トポロジカル順は決定的() {
+        let t = vec![task(3, "c", &[1]), task(1, "a", &[]), task(2, "b", &[1])];
+        assert_eq!(topological_order(&t), Some(vec![1, 2, 3]));
+        let cyc = vec![task(1, "a", &[2]), task(2, "b", &[1])];
+        assert_eq!(topological_order(&cyc), None);
+    }
+
+    #[test]
+    fn 進捗率() {
+        assert_eq!(progress(&[]), 0.0);
+        let mut a = task(1, "a", &[]);
+        let b = task(2, "b", &[]);
+        a.state = TeamTaskState::Completed;
+        assert!((progress(&[a, b]) - 0.5).abs() < 1e-6);
+    }
+}
