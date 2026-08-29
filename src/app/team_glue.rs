@@ -178,11 +178,17 @@ impl ZaivernApp {
     /// Runtime が求めた副作用を実行する。
     fn team_run_effects(&mut self, ctx: &egui::Context) {
         // ── エージェントの起動 ──
+        //
+        // **成功したときだけ ACK を返す。** 返さない限り Runtime は「済んだ」
+        // と見なさないので、ここで落ちても次の起動で撃ち直される。
         let launches = panel::with_panel(|p| p.take_launches());
-        for spec in launches {
+        for (key, spec) in launches {
             match self.team_launch_agent(ctx) {
                 Some(session) => {
-                    panel::with_panel(|p| p.bind_session(&spec.agent_id, session));
+                    panel::with_panel(|p| {
+                        p.bind_session(&spec.agent_id, session);
+                        p.ack_done(&key);
+                    });
                     self.toast(
                         trf("team.toast.agent_started", &[("name", spec.name.clone())]),
                         true,
@@ -190,7 +196,10 @@ impl ZaivernApp {
                 }
                 None => {
                     let why = tr("team.err.no_agent_preset");
-                    panel::with_panel(|p| p.note_launch_failed(&spec.agent_id, &why));
+                    panel::with_panel(|p| {
+                        p.note_launch_failed(&spec.agent_id, &why);
+                        p.ack_failed(&key);
+                    });
                     self.toast(why, false);
                 }
             }
@@ -198,27 +207,38 @@ impl ZaivernApp {
 
         // ── 指示の送信 (**既存の送信経路 1 本**を通す) ──
         let instructions = panel::with_panel(|p| p.take_instructions());
-        for (session, text) in instructions {
+        for (key, session, text) in instructions {
             // 起動直後は Idle を待ってから送る (Ink 系 TUI の取りこぼし対策は
-            // `submit.rs` が持っている)。
-            self.queue_submit(crate::submit::Job::deferred(session, text, true));
+            // `submit.rs` が持っている)。積めなければ失敗として返し、
+            // 次の tick でもう一度出させる。
+            let queued = self.queue_submit(crate::submit::Job::deferred(session, text, true));
+            panel::with_panel(|p| {
+                if queued {
+                    p.ack_done(&key)
+                } else {
+                    p.ack_failed(&key)
+                }
+            });
         }
 
         // ── 停止 (承認済みのものだけがここへ来る) ──
         let stops = panel::with_panel(|p| p.take_stops());
-        for session in stops {
+        for (key, session) in stops {
             if let Some(i) = self.agents.sessions.iter().position(|s| s.id == session) {
                 self.close_agent(i);
             }
+            // 相手が既に居なくても目的は果たされている (止まっている)。
+            panel::with_panel(|p| p.ack_done(&key));
         }
 
         // ── 検証コマンドの実行 ──
         //
         // **UI スレッドでブロッキングしない。** 裏のスレッドで走らせて、
-        // 終わったら結果だけを戻す。
+        // 終わったら結果だけを戻す。ACK は結果を戻せたときに返す
+        // (`note_validation` が次の検証を発行できるよう記録を外す)。
         let validations = panel::with_panel(|p| p.take_validations());
-        for v in validations {
-            self.team_spawn_validation(v);
+        for (key, v) in validations {
+            self.team_spawn_validation(key, v);
         }
         panel::with_panel(|p| p.collect_validations());
     }
@@ -242,7 +262,11 @@ impl ZaivernApp {
     }
 
     /// 検証を裏で走らせる。
-    fn team_spawn_validation(&mut self, v: crate::features::team::imp::runtime::ValidationSpec) {
+    fn team_spawn_validation(
+        &mut self,
+        key: String,
+        v: crate::features::team::imp::runtime::ValidationSpec,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel::<(TaskId, Vec<ValidationRun>)>();
         let task = v.task;
         let cwd = v.cwd.clone();
@@ -257,7 +281,12 @@ impl ZaivernApp {
                 let _ = tx.send((task, runs));
             });
         match spawned {
-            Ok(_) => panel::with_panel(|p| p.watch_validation(rx)),
+            Ok(_) => panel::with_panel(|p| {
+                // 走らせ始めたので受け取った旨を返す。実測の結果は
+                // `note_validation` が別途 Runtime へ戻す。
+                p.watch_validation(rx);
+                p.ack_done(&key);
+            }),
             Err(e) => {
                 // スレッドを作れないなら「実行できなかった」として戻す
                 // (黙って未実行のままにすると永久に待つ)。
@@ -269,7 +298,12 @@ impl ZaivernApp {
                         exit_code: 126,
                     })
                     .collect();
-                panel::with_panel(|p| p.note_validation(task, runs));
+                panel::with_panel(|p| {
+                    // 走らせられなかった = 実行不可として記録する。
+                    // 黙って未実行のままにすると永久に待つ。
+                    p.note_validation(task, runs);
+                    p.ack_failed(&key);
+                });
                 self.toast(
                     trf("team.err.validation_spawn", &[("e", e.to_string())]),
                     false,

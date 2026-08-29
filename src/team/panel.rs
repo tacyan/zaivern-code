@@ -193,14 +193,17 @@ pub struct TeamPanel {
     /// スナップショットを作り直す必要があるか。
     /// **60fps で全件を作り直さない**ための印。
     dirty: bool,
-    /// 起動要求を出したが、まだセッションが結び付いていないもの。
-    pending_launches: Vec<super::runtime::AgentLaunchSpec>,
+    /// 実行側へ渡す仕事。**冪等キーを必ず添える** — 実行できたら
+    /// [`TeamRuntime::note_effect_done`] へ、失敗したら
+    /// [`TeamRuntime::note_effect_failed`] へ返すため。返さない限り
+    /// Runtime は「済んだ」と見なさないので、途中で落ちても失われない。
+    pending_launches: Vec<(String, super::runtime::AgentLaunchSpec)>,
     /// 実行を頼んだ検証。
-    pending_validations: Vec<super::runtime::ValidationSpec>,
+    pending_validations: Vec<(String, super::runtime::ValidationSpec)>,
     /// 停止を頼んだセッション。
-    pending_stops: Vec<SessionId>,
-    /// 送るべき指示 (セッション ID, 本文)。
-    pending_instructions: Vec<(SessionId, String)>,
+    pending_stops: Vec<(String, SessionId)>,
+    /// 送るべき指示 (冪等キー, セッション ID, 本文)。
+    pending_instructions: Vec<(String, SessionId, String)>,
     /// 保存が要るか。
     needs_save: bool,
     workspace: PathBuf,
@@ -484,16 +487,19 @@ impl TeamPanel {
 
     fn absorb(&mut self, effects: Vec<TeamEffect>) {
         for e in effects {
+            let key = e.key();
             match e {
-                TeamEffect::StartAgent(s) => self.pending_launches.push(s),
+                TeamEffect::StartAgent(s) => self.pending_launches.push((key, s)),
                 TeamEffect::SendInstruction { session, text, .. } => {
-                    self.pending_instructions.push((session, text))
+                    self.pending_instructions.push((key, session, text))
                 }
-                TeamEffect::StopAgent(s) => self.pending_stops.push(s),
-                TeamEffect::RunValidation(v) => self.pending_validations.push(v),
+                TeamEffect::StopAgent(s) => self.pending_stops.push((key, s)),
+                TeamEffect::RunValidation(v) => self.pending_validations.push((key, v)),
                 TeamEffect::RequestHumanApproval(_) => {
                     // 判断は Runtime が保持していて、画面が Mission Panel で出す。
                     // ここで別の入れ物へ写すと第 2 の真実になる。
+                    // **画面に出た時点で仕事は済んでいる**ので、そのまま成功を返す。
+                    self.ack_done(&key);
                 }
                 TeamEffect::PersistState => self.needs_save = true,
             }
@@ -501,20 +507,38 @@ impl TeamPanel {
         }
     }
 
-    /// 起動してほしいエージェント (取り出したら消える)。
-    pub fn take_launches(&mut self) -> Vec<super::runtime::AgentLaunchSpec> {
+    /// Effect の実行が成功したと Runtime へ返す。
+    pub fn ack_done(&mut self, key: &str) {
+        if let Some(rt) = self.runtime.as_mut() {
+            rt.note_effect_done(key);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
+    /// Effect の実行に失敗したと Runtime へ返す (次の tick で再発行される)。
+    pub fn ack_failed(&mut self, key: &str) {
+        if let Some(rt) = self.runtime.as_mut() {
+            rt.note_effect_failed(key);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
+    /// 起動してほしいエージェント (冪等キー付き。取り出したら消える)。
+    pub fn take_launches(&mut self) -> Vec<(String, super::runtime::AgentLaunchSpec)> {
         std::mem::take(&mut self.pending_launches)
     }
-    /// 送ってほしい指示 (取り出したら消える)。
-    pub fn take_instructions(&mut self) -> Vec<(SessionId, String)> {
+    /// 送ってほしい指示 (冪等キー付き。取り出したら消える)。
+    pub fn take_instructions(&mut self) -> Vec<(String, SessionId, String)> {
         std::mem::take(&mut self.pending_instructions)
     }
-    /// 止めてほしいセッション (取り出したら消える)。
-    pub fn take_stops(&mut self) -> Vec<SessionId> {
+    /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
+    pub fn take_stops(&mut self) -> Vec<(String, SessionId)> {
         std::mem::take(&mut self.pending_stops)
     }
-    /// 走らせてほしい検証 (取り出したら消える)。
-    pub fn take_validations(&mut self) -> Vec<super::runtime::ValidationSpec> {
+    /// 走らせてほしい検証 (冪等キー付き。取り出したら消える)。
+    pub fn take_validations(&mut self) -> Vec<(String, super::runtime::ValidationSpec)> {
         std::mem::take(&mut self.pending_validations)
     }
 
@@ -699,6 +723,41 @@ mod tests {
         assert_eq!(rt.run().agent_count, 2);
         assert!(!rt.run().review_required);
         // 置き場もワークスペースの下なので、これ 1 行で全部片付く
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 実行側の返事が来るまで完了扱いにしない() {
+        // **画面 (app) が Effect を実行し、成功を返して初めて済んだことになる。**
+        // 返す前に落ちても、次の起動でもう一度出る。
+        let dir = ws("ack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "起動要求が出ていない");
+        // 冪等キーが必ず添えられている (返せないと ACK もできない)
+        for (key, _) in &launches {
+            assert!(key.starts_with("start:"), "冪等キーが無い: {key}");
+        }
+        // 失敗を返せば、次の tick でもう一度出る
+        for (key, _) in &launches {
+            p.ack_failed(key);
+        }
+        p.pump(super::super::runtime::Observation {
+            now: 2,
+            sessions: Vec::new(),
+        });
+        assert_eq!(
+            p.take_launches().len(),
+            launches.len(),
+            "失敗を返したのに再発行されない"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

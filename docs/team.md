@@ -108,8 +108,64 @@ Running → Validating → Reviewing → Completed
 
 却下は黙って捨てず、理由をタスクの文脈へ足して本人へ返す。
 
+### 自己申告は証跡にならない
+
+報告の `validation` は**参考情報**として `reported_validation` へ入れるだけで、
+`validation.runs` (正式な証跡) には 1 件も入れない。報告を受けたタスクは
+`Validating` で止まり、**Zaivern 自身が `validation_commands` を実行した実測**
+(`note_validation`) だけが決着をつける。
+
+* 決着をつける場所は `settle_validation` **1 か所だけ**。レビュータスクを
+  作るのもここだけ (`runtime.rs` の他の場所からは作らない)
+* 実測が全部通ったときだけ `Reviewing` (レビュー不要なら `Completed`) へ進む
+* 1 つでも落ちたら `fail_validation` — 試行回数を 1 つ使い、
+  「報告では成功と書かれていたが実際には失敗した」旨を文脈へ足して
+  `Failed` → `Ready` へ戻す。上限に達したら `NeedsUser`
+* `validation_commands` が空なら「走らせるものが無い」ので即座に決着する
+  (`ValidationState::settled`)。永久に `Validating` で止まらない
+* `review_required = false` でも、**実測が終わるまで `Completed` にしない**
+
 レビューは `REQUEST_CHANGES` なら指摘を文脈へ載せて `Ready` へ戻し、
 最大試行回数 (既定 3) に達したら `NeedsUser` にして人へ上げる。
+
+### 配り直しは、旧担当が止まってから
+
+`Reassign` を押しても、その場で `Ready` へは戻さない。**「人が押した =
+止まっている」は成り立たない**ため、旧担当のセッションが生きているかを
+`live_session_of` で見て分岐する:
+
+* 居ない → その場で回収 (`free_task`)。誰も書いていないので安全
+* 居る → `reassign_pending` を立て、`DecisionKind::StopAgents` の
+  `Decision` を作って `RequestHumanApproval` を出す。承認されるまで
+  担当も状態もそのまま (拒否すればそのまま続行)
+* 承認後、`Observation` の観測でセッションが消えたことを確かめてから
+  `release_after_stop_confirmed` → `Ready` (`settle_reassign` が毎 tick 見る)
+
+`Decision` は永続化されるので、**承認待ちのまま再起動しても消えない**。
+Stop Team (全体停止) と同じ経路・同じ承認ゲートを共有していて、
+`Decision.task_id` が `Some` なら 1 体、`None` なら全体を指す。
+
+## Effect の一生
+
+`TeamEffect` は Runtime が出す**要求**であって、出した時点では何も起きて
+いない。実行するのは `app/team_glue.rs` で、**成否を必ず返す**。
+
+```
+Pending (まだ出していない)
+  → Dispatched (出した。実行側の返事待ち)
+     → Completed (成功の ACK が来た。二度と出さない)
+     → (失敗の ACK / 記録を外す) → 次の tick でもう一度出る
+```
+
+* 記録は `EffectRecord { key, state, at }` で、冪等キーは種類ごとに違う —
+  `start:{agent}` / `instr:{task}:{attempt}:{session}` / `stop:{session}` /
+  `validate:{task}` / `decide:{冪等キー}`。同じキーの二重発行はしない
+* **復元時に `Dispatched` を「済んだこと」にしない。** `Completed` だけを
+  引き継ぎ、`Dispatched` のまま落ちたものは記録が消えるので**撃ち直される**
+  (`done_effects` を丸ごと捨てるのではない — 成功したものは残す)
+* 起動だけは例外的に、セッションに紐づいていない ManagedSession が居る
+  ときに `start:{agent}` の記録を外す (孤児の回収)
+* 刈り取り (`prune_effects`) の対象は `Completed` だけ
 
 ## 構造化プロトコル
 

@@ -33,7 +33,7 @@ use crate::coordinator::{self, Coordinator, SessionState};
 
 use super::graph;
 use super::model::*;
-use super::persistence::{RunDoc, Saved, SCHEMA_VERSION};
+use super::persistence::{EffectRecord, EffectState, RunDoc, Saved, SCHEMA_VERSION};
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
 use super::reviewer;
@@ -42,7 +42,10 @@ use super::state_machine as sm;
 
 /// Activity Feed に残すイベント数の上限。
 pub const EVENT_CAP: usize = 500;
-/// 冪等キーの記憶数の上限。
+/// Effect の記憶数の上限。
+///
+/// **刈り取ってよいのは成功済みだけ。** 未完了 (`Dispatched`) を落とすと、
+/// 実行中の Effect が「知らないもの」に戻って二重に発行される。
 pub const EFFECT_KEY_CAP: usize = 2_000;
 /// 再試行の既定上限。
 pub const DEFAULT_MAX_ATTEMPTS: u8 = 3;
@@ -159,9 +162,10 @@ pub struct TeamRuntime {
     workspace: PathBuf,
     next_event_id: EventId,
     next_task_id: TaskId,
-    /// 済んだ Effect の冪等キー (順序つき・上限あり)。
-    done_effects: BTreeSet<String>,
-    done_order: VecDeque<String>,
+    /// Effect の進み具合 (キー → 記録)。**発行 = 完了ではない。**
+    effects: BTreeMap<String, EffectRecord>,
+    /// 成功済みを古い順に刈り取るための並び。
+    effect_order: VecDeque<String>,
     /// 既存の調停層。**割り当ての最終判断はここ。**
     co: Coordinator,
     /// 登録済みセッション。
@@ -197,13 +201,14 @@ impl TeamRuntime {
                 stopped: false,
                 started_at: now,
                 updated_at: now,
+                effects: Vec::new(),
                 done_effects: Vec::new(),
             },
             workspace,
             next_event_id: 1,
             next_task_id,
-            done_effects: BTreeSet::new(),
-            done_order: VecDeque::new(),
+            effects: BTreeMap::new(),
+            effect_order: VecDeque::new(),
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: true,
@@ -246,18 +251,39 @@ impl TeamRuntime {
         let next_event_id = saved.events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         let mut tasks = saved.tasks;
         for t in &mut tasks {
-            if t.state.is_held() {
-                // 担当は確認できていない。空けてから Ready に戻す。
-                t.assigned_agent = None;
-                t.assigned_session = None;
-                t.coordinator_task = None;
-                t.state = if t.attempts >= saved.run.max_attempts {
-                    TeamTaskState::NeedsUser
-                } else {
-                    TeamTaskState::Ready
-                };
-                t.validation.running = false;
-                t.review.running = false;
+            // セッションはどれも生き残っていない。結び付きは必ず外す。
+            t.assigned_session = None;
+            t.coordinator_task = None;
+            match t.state {
+                // **担当が居ないと進まない状態**は空けて `Ready` へ戻す。
+                // 「プロセスが生きているはず」で再開すると、居ないものを
+                // 待ち続けることになる。
+                TeamTaskState::Assigned | TeamTaskState::Running => {
+                    t.assigned_agent = None;
+                    t.reassign_pending = false;
+                    t.state = if t.attempts >= saved.run.max_attempts {
+                        TeamTaskState::NeedsUser
+                    } else {
+                        TeamTaskState::Ready
+                    };
+                    t.validation.running = false;
+                    t.review.running = false;
+                }
+                // **検証は Zaivern 自身が走らせるので、担当が居なくても再開
+                // できる。** ここを `Ready` へ落とすと、出来上がっている成果を
+                // 捨ててもう一度実装させることになる。走っていた実行は
+                // プロセスと一緒に消えているので、`running` だけ戻して
+                // `advance` にもう一度発行させる。
+                TeamTaskState::Validating => {
+                    t.validation.running = false;
+                }
+                // レビュー待ちの本体はそのまま。レビュータスク自体は
+                // `Assigned` / `Running` なので上の枝で `Ready` へ戻り、
+                // 別のセッションへ配り直される。
+                TeamTaskState::Reviewing => {
+                    t.validation.running = false;
+                }
+                _ => {}
             }
         }
         let mut agents = saved.agents;
@@ -267,11 +293,30 @@ impl TeamRuntime {
             a.current_task = None;
             a.state = AgentWorkState::Unknown;
         }
-        let mut done = BTreeSet::new();
-        let mut order = VecDeque::new();
-        for k in &saved.run.done_effects {
-            if done.insert(k.clone()) {
-                order.push_back(k.clone());
+        // **成功済みだけを引き継ぐ。** `Dispatched` は「渡したが成功の返事が
+        // 来ていない」= 実行される前に落ちたかもしれないので、記録ごと捨てて
+        // **もう一度発行させる**。二重実行にならないのは、各 Effect が
+        // 個別に冪等だから (`TeamEffect::key` の doc を参照)。
+        //
+        // **成功済みでも回収するものが 1 つある: 走っている途中の検証。**
+        // 実行側は「裏で走らせ始めた」時点で成功を返す (結果は
+        // `note_validation` が別途戻す) ので、結果が戻る前に落ちると
+        // `Completed` の記録だけが残る。その実行はプロセスごと消えているのに
+        // 記録が新しい発行を止めるので、タスクは `Validating` のまま
+        // **永久に止まる**。まだ決着していない検証の記録は引き継がない。
+        let unsettled: BTreeSet<String> = tasks
+            .iter()
+            .filter(|t| t.state == TeamTaskState::Validating)
+            .map(|t| format!("validate:{}", t.id))
+            .collect();
+        let mut effects: BTreeMap<String, EffectRecord> = BTreeMap::new();
+        let mut effect_order = VecDeque::new();
+        for r in &saved.run.effects {
+            if r.state != EffectState::Completed || unsettled.contains(&r.key) {
+                continue;
+            }
+            if effects.insert(r.key.clone(), r.clone()).is_none() {
+                effect_order.push_back(r.key.clone());
             }
         }
         let mut rt = Self {
@@ -285,8 +330,8 @@ impl TeamRuntime {
             workspace,
             next_event_id,
             next_task_id,
-            done_effects: done,
-            done_order: order,
+            effects,
+            effect_order,
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: false,
@@ -333,11 +378,131 @@ impl TeamRuntime {
         self.agents.iter().find(|a| a.id == *id)
     }
 
+    // ── テストと ACK のための入口 (この版ではまだ「発行 = 完了」のまま) ──
+
+    /// **Effect の実行が成功した**と実行側から伝える。
+    ///
+    /// ここで初めて「済んだ」ことになり、永続化されて再発行されなくなる。
+    ///
+    /// ## 「済んだ」が意味するものは Effect ごとに違う
+    ///
+    /// * `SendInstruction` / `RunValidation` — **結果が残る**。届いた指示も、
+    ///   記録した実測も再起動をまたいで有効なので、二度と出さない。
+    /// * `StartAgent` — 成果は**生きているセッション**そのもの。再起動すれば
+    ///   子プロセスは死んでいるので、ACK 済みでも起動し直す必要がある。
+    ///   その判断は [`ensure_agents`](Self::ensure_agents) が
+    ///   「結び付いたセッションがあるか」で行う (記録だけを見ない)。
+    /// * `StopAgent` — セッション ID は再起動で意味を失う。
+    /// * `RequestHumanApproval` — `decisions` 側が `idempotency_key` で守る。
+    pub fn note_effect_done(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        match self.effects.get_mut(key) {
+            Some(r) => {
+                r.state = EffectState::Completed;
+                r.at = now;
+            }
+            None => {
+                // 発行の記録が無いのに成功だけ来た (刈り取り後など)。
+                // 完了として残しておけば、少なくとも再発行はされない。
+                self.effects.insert(
+                    key.to_string(),
+                    EffectRecord {
+                        key: key.to_string(),
+                        state: EffectState::Completed,
+                        at: now,
+                    },
+                );
+                self.effect_order.push_back(key.to_string());
+            }
+        }
+        self.prune_effects();
+        self.dirty = true;
+    }
+
+    /// **Effect の実行に失敗した**と伝える。記録ごと捨てて再試行できるようにする。
+    pub fn note_effect_failed(&mut self, key: &str) {
+        if self.effects.remove(key).is_some() {
+            self.effect_order.retain(|k| k != key);
+            self.dirty = true;
+        }
+    }
+
+    /// その Effect は成功済みか。
+    pub fn effect_completed(&self, key: &str) -> bool {
+        self.effects
+            .get(key)
+            .is_some_and(|r| r.state == EffectState::Completed)
+    }
+
+    /// **成功済みだけを古い順に刈り取る。**
+    ///
+    /// 未完了を落とすと、実行中の Effect が「知らないもの」に戻って
+    /// 二重に発行される。
+    fn prune_effects(&mut self) {
+        while self.effects.len() > EFFECT_KEY_CAP {
+            let Some(pos) = self
+                .effect_order
+                .iter()
+                .position(|k| self.effects.get(k).is_some_and(|r| r.state == EffectState::Completed))
+            else {
+                // 全部が未完了。**1 件も落とさない** (落とすと二重実行になる)。
+                break;
+            };
+            if let Some(k) = self.effect_order.remove(pos) {
+                self.effects.remove(&k);
+            }
+        }
+    }
+
+    /// テスト用: 発行済みとして記録する。
+    #[cfg(test)]
+    pub fn note_effect_dispatched_for_test(&mut self, key: &str) {
+        let now = now_secs();
+        if self
+            .effects
+            .insert(
+                key.to_string(),
+                EffectRecord {
+                    key: key.to_string(),
+                    state: EffectState::Dispatched,
+                    at: now,
+                },
+            )
+            .is_none()
+        {
+            self.effect_order.push_back(key.to_string());
+        }
+    }
+
+    /// テスト用: 状態を直に置く (状態機械の検査そのものを書くため)。
+    #[cfg(test)]
+    pub fn set_state_for_test(&mut self, task: TaskId, state: TeamTaskState) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.state = state;
+        }
+    }
+
+    /// テスト用: 検証コマンドを差し替える。
+    #[cfg(test)]
+    pub fn set_validation_commands_for_test(&mut self, task: TaskId, cmds: &[&str]) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.validation_commands = cmds.iter().map(|s| s.to_string()).collect();
+        }
+    }
+
     /// 保存用のまとまり。
     pub fn to_saved(&self) -> Saved {
         Saved {
             run: RunDoc {
-                done_effects: self.done_order.iter().cloned().collect(),
+                effects: self
+                    .effect_order
+                    .iter()
+                    .filter_map(|k| self.effects.get(k).cloned())
+                    .collect(),
+                done_effects: Vec::new(),
                 updated_at: now_secs(),
                 ..self.run.clone()
             },
@@ -365,8 +530,7 @@ impl TeamRuntime {
     /// 起動に失敗した。次の tick でもう一度試せるよう、冪等キーを外す。
     pub fn note_launch_failed(&mut self, agent: &AgentId, why: &str) {
         let key = format!("start:{agent}");
-        self.done_effects.remove(&key);
-        self.done_order.retain(|k| k != &key);
+        self.note_effect_failed(&key);
         self.log(
             TeamEventKind::AgentFailed,
             Some(agent.clone()),
@@ -375,7 +539,10 @@ impl TeamRuntime {
         );
     }
 
-    /// 検証コマンドの結果を受け取る (app 側の実行器から)。
+    /// **Zaivern 自身が走らせた検証の結果**を受け取る (app 側の実行器から)。
+    ///
+    /// ここへ入るものだけが正式な検証証跡になる。エージェントの自己申告は
+    /// [`TeamTask::reported_validation`] に分けてあり、ここには入らない。
     pub fn note_validation(&mut self, task: TaskId, runs: Vec<ValidationRun>) {
         let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) else {
             return;
@@ -387,6 +554,9 @@ impl TeamRuntime {
         }
         t.updated_at = now_secs();
         self.dirty = true;
+        // 検証の Effect は 1 回の実行で完結する。差し戻し後のやり直しを
+        // 発行できるよう、記録を外す。
+        self.note_effect_failed(&format!("validate:{task}"));
         let passed = self
             .task(task)
             .map(|t| t.validation.passed(&t.validation_commands))
@@ -404,6 +574,141 @@ impl TeamRuntime {
                 }
             ),
         );
+        self.settle_validation(task);
+    }
+
+    /// **検証の決着をつける唯一の場所。**
+    ///
+    /// 実測 ([`ValidationState::runs`]) だけを見て、Reviewing へ進めるか、
+    /// 差し戻すか、人へ上げるかを決める。**ここを通らずに `Reviewing` /
+    /// `Completed` へ行く経路を作らないこと** — 作った瞬間に「エージェントが
+    /// 完了と言っただけで完了になる」が戻ってくる。
+    fn settle_validation(&mut self, task: TaskId) {
+        let Some(t) = self.task(task).cloned() else {
+            return;
+        };
+        if t.state != TeamTaskState::Validating || t.validation.running {
+            return;
+        }
+        if !t.validation.settled(&t.validation_commands) {
+            // 決着していない。失敗が出ているなら差し戻し、まだ結果が
+            // 揃っていないだけなら待つ (次の `note_validation` で決まる)。
+            if t.validation.failed() {
+                self.fail_validation(task);
+            }
+            return;
+        }
+
+        // ── ここから先は「実測で決着がついた」場合だけ ──
+        let review_required = self.run.review_required;
+        if review_required && t.review_of.is_none() {
+            let rev = self.new_review_task(&t);
+            let rid = rev.id;
+            if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
+                x.state = sm::apply(x.state, TeamTaskState::Reviewing).unwrap_or(x.state);
+                x.review.running = true;
+                x.review.verdict = None;
+                x.review.findings.clear();
+            }
+            self.tasks.push(rev);
+            self.log(
+                TeamEventKind::ReviewStarted,
+                None,
+                None,
+                format!("#{task} の検証が通ったのでレビュー (#{rid}) を作成しました"),
+            );
+        } else {
+            // レビュー不要 (または自分がレビュータスク)。検証が通ったので完了。
+            if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
+                x.state = sm::apply(x.state, TeamTaskState::Reviewing).unwrap_or(x.state);
+                x.state = sm::apply(x.state, TeamTaskState::Completed).unwrap_or(x.state);
+            }
+            let owner = self
+                .task(task)
+                .and_then(|x| x.assigned_agent.clone())
+                .unwrap_or_else(|| AgentId::new("(未割り当て)"));
+            self.complete_task(task, &owner);
+        }
+        self.dirty = true;
+    }
+
+    /// 検証が失敗した。**Reviewing へは進めず**、差し戻すか人へ上げる。
+    fn fail_validation(&mut self, task: TaskId) {
+        let max = self.run.max_attempts;
+        let mut escalate = false;
+        let failed: Vec<String> = self
+            .task(task)
+            .map(|t| {
+                t.validation
+                    .runs
+                    .iter()
+                    .filter(|r| r.exit_code != 0)
+                    .map(|r| r.command.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 申告と実測が食い違ったなら、それも次の担当へ渡す。
+        let lied: Vec<String> = self
+            .task(task)
+            .map(|t| {
+                t.reported_validation
+                    .iter()
+                    .filter(|r| r.exit_code == 0 && failed.contains(&r.command))
+                    .map(|r| r.command.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.attempts = t.attempts.saturating_add(1);
+            t.context.push(clamp_text(&format!(
+                "検証が失敗しました: {}",
+                failed.join(", ")
+            )));
+            if !lied.is_empty() {
+                t.context.push(clamp_text(&format!(
+                    "前回の報告では成功と書かれていましたが、実際には失敗しました: {}",
+                    lied.join(", ")
+                )));
+            }
+            t.context = clamp_list(std::mem::take(&mut t.context));
+            t.state = sm::apply(t.state, TeamTaskState::Failed).unwrap_or(t.state);
+            if t.attempts >= max {
+                t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                escalate = true;
+            }
+        }
+        if !escalate {
+            // 担当は自分から「終わった」と言って手を離しているので、前任の
+            // 停止は確認済みとして既存調停層へ伝えてよい
+            // (`release_after_self_report` の doc を参照)。
+            self.release_after_self_report(task);
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+                t.assigned_agent = None;
+                t.assigned_session = None;
+                t.state = sm::apply(t.state, TeamTaskState::Ready).unwrap_or(t.state);
+                // **失敗した実測はここでは消さない。** 画面と次の担当が
+                // 「何が落ちたか」を読むための証跡なので、次に配るときまで残す
+                // (`dispatch` が配る瞬間に捨てる)。
+            }
+        }
+        self.log(
+            TeamEventKind::ValidationCompleted,
+            None,
+            None,
+            format!("#{task} の検証が失敗したので差し戻しました"),
+        );
+        if escalate {
+            self.raise(
+                DecisionKind::AttemptsExhausted,
+                Some(task),
+                None,
+                format!("#{task} の検証が上限回数まで失敗しました"),
+                format!("失敗したコマンド: {}", failed.join(", ")),
+                vec!["retry".into(), "reassign".into(), "reject".into()],
+            );
+        }
+        self.dirty = true;
     }
 
     // ── 操作 ──
@@ -482,8 +787,19 @@ impl TeamRuntime {
                         format!("承認しました: {}", d.reason),
                     );
                     if d.kind == DecisionKind::StopAgents {
-                        for s in self.agents.iter().filter_map(|a| a.session_id) {
-                            out.push(TeamEffect::StopAgent(s));
+                        match d.task_id {
+                            // Reassign — そのタスクの担当だけを止める。
+                            Some(tid) => match self.live_session_of(tid) {
+                                Some(s) => out.push(TeamEffect::StopAgent(s)),
+                                // 承認するまでの間に消えていた。そのまま回収する。
+                                None => self.free_task(tid, false),
+                            },
+                            // Stop Team — 実行中を全部止める。
+                            None => {
+                                for s in self.agents.iter().filter_map(|a| a.session_id) {
+                                    out.push(TeamEffect::StopAgent(s));
+                                }
+                            }
                         }
                     }
                 }
@@ -498,36 +814,87 @@ impl TeamRuntime {
                         format!("却下しました: {}", d.reason),
                     );
                     if d.kind == DecisionKind::StopAgents {
-                        // 停止しないなら、止めた割り当ても戻す。
-                        self.run.stopped = false;
-                        self.run.paused = false;
+                        match d.task_id {
+                            // Reassign の拒否 — **元の担当も状態も壊さない。**
+                            Some(tid) => {
+                                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == tid) {
+                                    t.reassign_pending = false;
+                                    t.updated_at = now_secs();
+                                }
+                            }
+                            // Stop Team の拒否 — 止めた割り当てを戻す。
+                            None => {
+                                self.run.stopped = false;
+                                self.run.paused = false;
+                            }
+                        }
                     }
                 }
             }
             TeamAction::RetryTask(id) => {
                 let max = self.run.max_attempts;
-                self.release_coordinator(id);
+                // **ここで `confirm_stopped` は呼ばない。** Retry が動くのは
+                // `NeedsUser` / `Failed` のときだけで、どちらもその手前で
+                // 担当を解放済み。呼ぶと「人が押した = 停止済み」という
+                // 誤った前提を持ち込むことになる。
+                let mut retried = false;
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     if t.state == TeamTaskState::NeedsUser || t.state == TeamTaskState::Failed {
                         // 人が回すときは試行回数を 1 つ戻す (無限には回さない)。
                         t.attempts = t.attempts.min(max.saturating_sub(1));
+                        // **`NeedsUser` から出られるのは人の操作だけ**なので、
+                        // ここは意図的に表を迂回する (`sm::force` の存在理由)。
+                        // 自動処理からこの行へ来る経路は無い —
+                        // `state_machine::tests::人へはどこからでも上げられるが完了からは上げない`
+                        // と `runtime_tests::人の操作だけがneeds_userから戻せる` が番人。
                         t.state = sm::force(t.state, TeamTaskState::Ready);
                         t.assigned_agent = None;
                         t.assigned_session = None;
+                        t.reassign_pending = false;
                         t.updated_at = now_secs();
+                        retried = true;
                     }
                 }
-                self.decisions.retain(|d| d.task_id != Some(id));
+                // **効かなかった Retry で判断を消さない。** 実行中のタスクへ
+                // 撃っても状態は変わらないので、ここで承認待ちの停止要求まで
+                // 消すと「停止待ちの印だけが残り、承認する手段が画面から
+                // 消える」タスクができる (`runtime_tests::効かなかったretryは
+                // 停止承認を消さない`)。
+                if retried {
+                    self.decisions.retain(|d| d.task_id != Some(id));
+                }
                 self.dirty = true;
             }
             TeamAction::ReassignTask(id) => {
-                self.release_coordinator(id);
-                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                    if !t.state.is_terminal() {
-                        t.assigned_agent = None;
-                        t.assigned_session = None;
-                        t.state = sm::force(t.state, TeamTaskState::Ready);
-                        t.updated_at = now_secs();
+                // **旧担当が生きているうちは配り直さない。**
+                //
+                // 担当を外して `Ready` に戻すと、まだ編集しているかもしれない
+                // 旧担当と、新しい担当が同じファイルを同時に持つ。既存の
+                // 重なり判定は「占有しているタスク」を見るので、解放した
+                // 瞬間にすり抜ける。
+                match self.live_session_of(id) {
+                    None => {
+                        // 担当が居ない (未割り当て / 既に消えた) ので安全に回収できる。
+                        self.free_task(id, false);
+                    }
+                    Some(_) => {
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+                            t.reassign_pending = true;
+                            t.updated_at = now_secs();
+                        }
+                        let d = self.make_decision(
+                            DecisionKind::StopAgents,
+                            Some(id),
+                            None,
+                            format!("#{id} の担当を替えるため、いまの担当を停止しますか"),
+                            "停止するまで配り直しません (同じファイルを 2 人が同時に持たないため)"
+                                .into(),
+                            vec!["approve".into(), "reject".into()],
+                            format!("reassign-stop:{id}"),
+                        );
+                        if let Some(d) = d {
+                            out.push(TeamEffect::RequestHumanApproval(d));
+                        }
                     }
                 }
                 self.dirty = true;
@@ -543,7 +910,7 @@ impl TeamRuntime {
         }
         self.dirty = true;
         out.push(TeamEffect::PersistState);
-        self.filter_new(out)
+        self.dispatch_effects(out)
     }
 
     // ── 調停ループ ──
@@ -558,26 +925,29 @@ impl TeamRuntime {
         // 2) 報告の取り込み。**Pause 中でも読む** (状態更新は続ける)。
         self.harvest(obs);
 
-        // 3) 依存が済んだタスクを Ready にする。
+        // 3) 停止待ちの Reassign を決着させる (再起動をまたいでも進む)。
+        self.settle_reassign();
+
+        // 4) 依存が済んだタスクを Ready にする。
         self.promote_ready();
 
-        // 4) 進んだタスクを先へ (検証 → レビュー → 完了)。
+        // 5) 進んだタスクを先へ (検証 → レビュー → 完了)。
         self.advance(&mut out);
 
-        // 5) Pause / Stop 中は**新規割り当てをしない**。
+        // 6) Pause / Stop 中は**新規割り当てをしない**。
         if self.accepting_work() {
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
         }
 
-        // 6) Goal の状態を更新する。
+        // 7) Goal の状態を更新する。
         self.update_goal();
 
         if self.dirty {
             out.push(TeamEffect::PersistState);
             self.dirty = false;
         }
-        self.filter_new(out)
+        self.dispatch_effects(out)
     }
 
     /// 新しい仕事を配ってよい状態か。
@@ -601,9 +971,15 @@ impl TeamRuntime {
             )
     }
 
-    /// まだ出していない Effect だけを残す (冪等)。
-    fn filter_new(&mut self, effects: Vec<TeamEffect>) -> Vec<TeamEffect> {
+    /// まだ出していない Effect だけを残し、**発行済み**として記録する。
+    ///
+    /// **ここでは「完了」にしない。** 実行側が成功を返して
+    /// [`note_effect_done`](Self::note_effect_done) を呼んだときだけ完了になる。
+    /// 発行と実行の間で落ちた Effect は、次の起動で記録ごと捨てられて
+    /// もう一度発行される。
+    fn dispatch_effects(&mut self, effects: Vec<TeamEffect>) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        let now = now_secs();
         for e in effects {
             let k = e.key();
             if k.is_empty() {
@@ -613,16 +989,20 @@ impl TeamRuntime {
                 }
                 continue;
             }
-            if self.done_effects.contains(&k) {
+            // 発行済み (返事待ち) も、成功済みも、もう一度は出さない。
+            if self.effects.contains_key(&k) {
                 continue;
             }
-            self.done_effects.insert(k.clone());
-            self.done_order.push_back(k);
-            while self.done_order.len() > EFFECT_KEY_CAP {
-                if let Some(old) = self.done_order.pop_front() {
-                    self.done_effects.remove(&old);
-                }
-            }
+            self.effects.insert(
+                k.clone(),
+                EffectRecord {
+                    key: k.clone(),
+                    state: EffectState::Dispatched,
+                    at: now,
+                },
+            );
+            self.effect_order.push_back(k);
+            self.prune_effects();
             out.push(e);
         }
         out
@@ -704,29 +1084,23 @@ impl TeamRuntime {
         }
         let at = Instant::now();
         for (task_id, session) in orphaned {
+            // **順序を飛ばさない**: note_exited → confirm_stopped → 解放。
             self.co.note_exited(session, at);
-            if let Some(ct) = self.task(task_id).and_then(|t| t.coordinator_task) {
-                self.co.confirm_stopped(ct, at);
-            }
-            let max = self.run.max_attempts;
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                t.assigned_agent = None;
-                t.assigned_session = None;
-                t.attempts = t.attempts.saturating_add(1);
-                t.state = if t.attempts >= max {
-                    TeamTaskState::NeedsUser
-                } else {
-                    sm::force(t.state, TeamTaskState::Ready)
-                };
-                t.updated_at = now;
-            }
+            // 人が Reassign を押して止めたぶんは、失敗として数えない。
+            let asked = self.task(task_id).is_some_and(|t| t.reassign_pending);
+            self.free_task(task_id, !asked);
             self.log(
                 TeamEventKind::TaskFailed,
                 None,
                 None,
-                format!("#{task_id} の担当セッションが消えたため回収しました"),
+                if asked {
+                    format!("#{task_id} の担当が停止したので配り直せます")
+                } else {
+                    format!("#{task_id} の担当セッションが消えたため回収しました")
+                },
             );
         }
+        let _ = now;
         self.dirty = true;
     }
 
@@ -816,9 +1190,7 @@ impl TeamRuntime {
 
     fn apply_accepted(&mut self, agent: &AgentId, acc: rp::AcceptedResult) {
         let now = now_secs();
-        let review_required = self.run.review_required;
         let max = self.run.max_attempts;
-        let mut make_review: Option<TeamTask> = None;
         let mut escalate: Option<(TaskId, String)> = None;
         let mut release_after = false;
 
@@ -835,73 +1207,53 @@ impl TeamRuntime {
                     release_after = true;
                     t.attempts = t.attempts.saturating_add(1);
                     if t.attempts >= max {
-                        t.state = TeamTaskState::NeedsUser;
+                        t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
                         escalate = Some((t.id, "実装が上限回数まで失敗しました".to_string()));
                     } else {
                         t.state = sm::apply(t.state, TeamTaskState::Failed).unwrap_or(t.state);
                     }
                 }
                 ReportedStatus::Completed => {
-                    // 報告された検証結果を記録し、Running → Validating へ。
-                    for r in &acc.validation {
-                        t.validation.runs.retain(|x| x.command != r.command);
-                        t.validation.runs.push(r.clone());
-                    }
+                    // **自己申告は正式な検証証跡にしない。**
+                    //
+                    // `"cargo test / exit_code: 0"` は、実際にテストを走らせ
+                    // なくても書ける。ここで `validation.runs` へ入れると、
+                    // 次の判断が `passed()` を見た瞬間に**申告どおり成功**に
+                    // なり、「検証コマンドが実行され、成功しなければ完了に
+                    // しない」という中核の保証が空文になる。
+                    //
+                    // 参考情報としては残す — 実測と食い違ったときに、次の
+                    // 担当へ「前回はこう報告されていた」と渡すため。
+                    t.reported_validation = acc.validation.clone();
+                    // 前回の実測は、今回の実装に対する証跡ではない。捨てる。
+                    t.validation.runs.clear();
                     t.validation.running = false;
-                    if t.state == TeamTaskState::Running || t.state == TeamTaskState::Assigned {
-                        t.state = TeamTaskState::Validating;
-                    }
+                    // **表に無い遷移を素通りしない。** `Assigned → Validating`
+                    // は表に無いので、`Assigned → Running → Validating` の順で
+                    // 通す (割り当て直後に報告が来る筋書きがある)。
+                    t.state = sm::apply(t.state, TeamTaskState::Running).unwrap_or(t.state);
+                    t.state = sm::apply(t.state, TeamTaskState::Validating).unwrap_or(t.state);
                 }
             }
         }
 
-        // レビュータスクを立てる (レビュー必須のときだけ)。
+        // **ここでは先へ進めない。** 完了報告が意味するのは「実装が終わったと
+        // 本人が言った」までで、そこから Reviewing / Completed へ進むかは
+        // Zaivern 自身が走らせた検証の結果 ([`Self::settle_validation`]) が
+        // 決める。`advance` が `Validating` のタスクへ `RunValidation` を出し、
+        // `note_validation` が実測を受けて決着させる。
         if acc.status == ReportedStatus::Completed {
-            let t = self.tasks.iter().find(|t| t.id == acc.task_id).cloned();
-            if let Some(t) = t {
-                if t.state == TeamTaskState::Validating
-                    && review_required
-                    && t.review_of.is_none()
-                {
-                    make_review = Some(self.new_review_task(&t));
-                }
-            }
-        }
-
-        if let Some(rev) = make_review {
-            // 検証 → レビューへ進める。
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
-                t.state = sm::apply(t.state, TeamTaskState::Reviewing).unwrap_or(t.state);
-                t.review.running = true;
-                t.review.verdict = None;
-                t.review.findings.clear();
-            }
-            let rid = rev.id;
-            self.tasks.push(rev);
             self.log(
-                TeamEventKind::ReviewStarted,
+                TeamEventKind::ValidationStarted,
                 Some(agent.clone()),
                 None,
-                format!("#{} のレビュー (#{rid}) を作成しました", acc.task_id),
+                format!("#{} の完了報告を受けました。検証はこちらで実行します", acc.task_id),
             );
-        } else if acc.status == ReportedStatus::Completed {
-            // レビュー不要 — 検証が通っていれば完了にする。
-            let ok = self
-                .task(acc.task_id)
-                .map(|t| t.validation.passed(&t.validation_commands))
-                .unwrap_or(false);
-            if ok {
-                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
-                    t.state = sm::apply(t.state, TeamTaskState::Reviewing).unwrap_or(t.state);
-                    t.state = sm::apply(t.state, TeamTaskState::Completed).unwrap_or(t.state);
-                }
-                self.complete_task(acc.task_id, agent);
-            }
         }
 
         if release_after {
             // 失敗を自分から報告した = もう編集していない。
-            self.release_coordinator(acc.task_id);
+            self.release_after_self_report(acc.task_id);
             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
                 t.assigned_session = None;
                 t.assigned_agent = None;
@@ -983,15 +1335,14 @@ impl TeamRuntime {
                     t.state =
                         sm::apply(t.state, TeamTaskState::RevisionRequired).unwrap_or(t.state);
                     if t.attempts >= max {
-                        t.state = TeamTaskState::NeedsUser;
+                        t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
                         escalate = true;
                     } else {
                         t.state = sm::apply(t.state, TeamTaskState::Ready).unwrap_or(t.state);
                         released = true;
                         t.assigned_agent = None;
                         t.assigned_session = None;
-                        // 検証はやり直す。
-                        t.validation.runs.clear();
+                        // 検証はやり直す。証跡は次に配る瞬間 (`dispatch`) に捨てる。
                     }
                 }
             }
@@ -1000,13 +1351,20 @@ impl TeamRuntime {
             // 差し戻しは担当が自分から手を離した状態なので、前任の停止を
             // 確認済みとして既存調停層へ伝える (伝えないと引き渡しを断られ、
             // 差し戻したタスクが二度と配られない — 実測で詰まった)。
-            self.release_coordinator(target_id);
+            self.release_after_self_report(target_id);
         }
-        // レビュータスク自体を閉じる。
+        // レビュータスク自体も**同じ 1 本の経路**で締める。
+        //
+        // 直接 `Completed` を代入すると `Running → Completed` という表に無い
+        // 遷移になる。レビュータスクは `validation_commands` が空なので、
+        // `Validating` へ入れれば `settle_validation` が「走らせるものが無い =
+        // 決着」として `Reviewing → Completed` まで運ぶ。
         if let Some(r) = self.tasks.iter_mut().find(|t| t.id == rev.id) {
-            r.state = TeamTaskState::Completed;
+            r.state = sm::apply(r.state, TeamTaskState::Running).unwrap_or(r.state);
+            r.state = sm::apply(r.state, TeamTaskState::Validating).unwrap_or(r.state);
             r.updated_at = now_secs();
         }
+        self.settle_validation(rev.id);
         self.log(
             TeamEventKind::ReviewCompleted,
             Some(agent.clone()),
@@ -1174,6 +1532,9 @@ impl TeamRuntime {
     }
 
     /// 検証の実行が要るタスクへ Effect を出す。
+    ///
+    /// **`Validating` のタスクを永久に止めない。** 走らせるものが無いなら
+    /// その場で決着させ、走らせてはいけないものが混じっているなら人へ上げる。
     fn advance(&mut self, out: &mut Vec<TeamEffect>) {
         let cwd = self.workspace.clone();
         let pending: Vec<(TaskId, Vec<String>)> = self
@@ -1181,16 +1542,38 @@ impl TeamRuntime {
             .iter()
             .filter(|t| t.state == TeamTaskState::Validating && !t.validation.running)
             .filter(|t| !t.validation.passed(&t.validation_commands))
-            .filter(|t| !t.validation_commands.is_empty())
             .map(|t| (t.id, t.validation_commands.clone()))
             .collect();
         for (task, commands) in pending {
+            if commands.is_empty() {
+                // 走らせるものが無い = 検証の決着はここでつく。
+                self.settle_validation(task);
+                continue;
+            }
             // **許可リストを通ったものだけ**を実行側へ渡す。
-            let safe: Vec<String> = commands
-                .into_iter()
-                .filter(|c| graph::check_command(c).is_ok())
+            let unsafe_cmds: Vec<String> = commands
+                .iter()
+                .filter(|c| graph::check_command(c).is_err())
+                .cloned()
                 .collect();
-            if safe.is_empty() {
+            if !unsafe_cmds.is_empty() {
+                // 自動実行しないコマンドが混じっている。**黙って落とすと、
+                // そのコマンドは永久に成功せず Validating で止まる。**
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+                    t.state = sm::apply(t.state, TeamTaskState::NeedsUser).unwrap_or(t.state);
+                    t.updated_at = now_secs();
+                }
+                self.raise(
+                    DecisionKind::DangerousCommand,
+                    Some(task),
+                    None,
+                    format!(
+                        "#{task} の検証コマンドは自動実行しません: {}",
+                        unsafe_cmds.join(", ")
+                    ),
+                    "コマンドを直すか、人が実行して結果を戻してください".into(),
+                    vec!["retry".into(), "reject".into()],
+                );
                 continue;
             }
             if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
@@ -1204,7 +1587,7 @@ impl TeamRuntime {
             );
             out.push(TeamEffect::RunValidation(ValidationSpec {
                 task,
-                commands: safe,
+                commands,
                 cwd: cwd.clone(),
             }));
         }
@@ -1221,6 +1604,23 @@ impl TeamRuntime {
         if bound >= want {
             return;
         }
+        // **ACK は返ったのにセッションが結び付いていない**起動要求を拾い直す。
+        //
+        // 実行側が「起動した」と返してから `bind_session` を呼ぶまでの間に
+        // 落ちると、記録は成功のまま・エージェントは居ない、という状態が残る。
+        // 記録を外して撃ち直せるようにする (居るなら `session_id` が入って
+        // いるので、ここは通らない)。
+        let orphan_keys: Vec<String> = self
+            .agents
+            .iter()
+            .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_none())
+            .map(|a| format!("start:{}", a.id))
+            .filter(|k| self.effect_completed(k))
+            .collect();
+        for k in orphan_keys {
+            self.note_effect_failed(&k);
+        }
+
         let root = self.workspace.clone();
         let specs: Vec<AgentLaunchSpec> = self
             .agents
@@ -1340,6 +1740,11 @@ impl TeamRuntime {
                     self.co.note_running(coord_id, at);
                     let text = self.instruction_for(&task, &a.agent);
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == a.task) {
+                        // **前回の実測はこれから作るものへの証跡ではない。**
+                        // 配る瞬間に捨てる (1 か所に閉じる)。
+                        t.validation.runs.clear();
+                        t.validation.running = false;
+                        t.reported_validation.clear();
                         t.assigned_agent = Some(a.agent.clone());
                         t.assigned_session = Some(session);
                         t.state = sm::apply(t.state, TeamTaskState::Assigned).unwrap_or(t.state);
@@ -1425,18 +1830,107 @@ impl TeamRuntime {
         super::prompt::for_task(&brief, &self.tasks)
     }
 
+    /// 停止待ちの Reassign を決着させる。
+    ///
+    /// **再起動をまたいでも進む**のが要点。`reassign_pending` はタスクに、
+    /// 承認待ちは `decisions` に永続化されるので、復元後もここで続きから
+    /// 進む — 旧プロセスは再起動で死んでいるので、担当が居なくなった時点で
+    /// 安全に回収できる。
+    fn settle_reassign(&mut self) {
+        let waiting: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.reassign_pending)
+            .map(|t| t.id)
+            .collect();
+        for id in waiting {
+            if self.live_session_of(id).is_none() {
+                // 担当セッションはもう居ない = 停止を確認できた。
+                self.free_task(id, false);
+                self.log(
+                    TeamEventKind::TaskReady,
+                    None,
+                    None,
+                    format!("#{id} の担当が停止したので配り直せます"),
+                );
+            }
+        }
+    }
+
+    /// そのタスクの担当セッションのうち、**いま生きていると分かっている**もの。
+    ///
+    /// 「担当欄に値がある」だけでは足りない — セッションが消えていれば
+    /// 止める相手は居ない。判断は `agents` の結び付き (最後の観測) で行う。
+    fn live_session_of(&self, task: TaskId) -> Option<SessionId> {
+        let sid = self.task(task)?.assigned_session?;
+        self.agents
+            .iter()
+            .any(|a| a.session_id == Some(sid))
+            .then_some(sid)
+    }
+
+    /// タスクの担当を解いて `Ready` へ戻す。
+    ///
+    /// `count_attempt` が真のときだけ試行回数を数える (セッションが落ちた
+    /// 場合は数え、人が配り直した場合は数えない — 人の操作を失敗として
+    /// 記録すると、上限に早く当たって使えなくなる)。
+    fn free_task(&mut self, task: TaskId, count_attempt: bool) {
+        let max = self.run.max_attempts;
+        self.release_after_stop_confirmed(task);
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            if t.state.is_terminal() {
+                t.reassign_pending = false;
+                return;
+            }
+            if count_attempt {
+                t.attempts = t.attempts.saturating_add(1);
+            }
+            t.assigned_agent = None;
+            t.assigned_session = None;
+            t.reassign_pending = false;
+            t.validation.running = false;
+            t.review.running = false;
+            t.state = if t.attempts >= max {
+                TeamTaskState::NeedsUser
+            } else {
+                // **人の操作 / 観測済みの消滅による解放。** 状態機械の表には
+                // 「Running → Ready」が無い (自動処理には許さない) ので、
+                // ここは意図的に `force` を通る。根拠は上の 2 つに限られ、
+                // どちらも「もう誰も触っていない」ことが確認済み。
+                sm::force(t.state, TeamTaskState::Ready)
+            };
+            t.updated_at = now_secs();
+        }
+        self.decisions.retain(|d| {
+            !(d.kind == DecisionKind::StopAgents && d.task_id == Some(task))
+        });
+        self.dirty = true;
+    }
+
+    /// 停止が確認できたタスクについて、既存調停層へ引き渡してよいと伝える。
+    fn release_after_stop_confirmed(&mut self, task: TaskId) {
+        if let Some(ct) = self.task(task).and_then(|t| t.coordinator_task) {
+            self.co.confirm_stopped(ct, Instant::now());
+        }
+    }
+
     /// **既存調停層に「前任者はもう触っていない」と伝える。**
     ///
     /// `coordinator` は前任者の停止が未確認のタスクを引き渡さない
-    /// (同時編集で成果物が壊れるため)。ここで確認を通すのは、次の 2 つの
-    /// 場合だけ:
+    /// (同時編集で成果物が壊れるため)。ここで確認を通してよいのは
+    /// **担当が自分から手を離したと分かっている場合だけ**:
     ///
-    /// * 担当が**自分から完了/失敗を報告した** — もう編集していない
-    /// * 人が明示的に配り直した — 停止は人の判断
+    /// * 担当が完了 / 失敗を報告した — もう編集していない
+    /// * 担当が出した成果に対する検証が失敗した — 同上
+    ///
+    /// **「人が Reassign を押した」は根拠にならない。** 押した時点では
+    /// 旧担当はまだ動いていて、ファイルを編集しているかもしれない。その
+    /// 経路は [`TeamAction::ReassignTask`] が停止承認 → `StopAgent` →
+    /// セッション消滅の観測、という順で通す。
     ///
     /// セッションが消えた場合は [`release_dead`](Self::release_dead) が
     /// `note_exited` → `confirm_stopped` の順で通す。**順序は飛ばさない。**
-    fn release_coordinator(&mut self, task_id: TaskId) {
+    fn release_after_self_report(&mut self, task_id: TaskId) {
         if let Some(ct) = self.task(task_id).and_then(|t| t.coordinator_task) {
             self.co.confirm_stopped(ct, Instant::now());
         }
@@ -1496,6 +1990,8 @@ impl TeamRuntime {
             validation: ValidationState::default(),
             review: ReviewState::default(),
             context: Vec::new(),
+            reported_validation: Vec::new(),
+            reassign_pending: false,
             last_summary: String::new(),
             changed_files: Vec::new(),
             blockers: Vec::new(),

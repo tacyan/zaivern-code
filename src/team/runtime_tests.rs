@@ -36,12 +36,17 @@ fn ws() -> PathBuf {
 
 /// 計画から Runtime を作り、開始済みにする。
 pub fn started(agents: usize) -> TeamRuntime {
+    started_with(agents, true)
+}
+
+/// レビュー要否を指定して作る。
+pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
     let plan = StaticPlanner
         .plan(PlanInput {
             spec: SPEC.to_string(),
             source: "SPEC.md".into(),
             agent_count: agents,
-            review_required: true,
+            review_required,
             roles: Vec::new(),
         })
         .expect("計画できるべき");
@@ -53,7 +58,7 @@ pub fn started(agents: usize) -> TeamRuntime {
             spec_source: "SPEC.md".into(),
             agent_count: agents,
             max_attempts: 3,
-            review_required: true,
+            review_required,
         },
     );
     rt.apply_action(TeamAction::Start);
@@ -121,6 +126,26 @@ fn review_block(target: TaskId, approve: bool) -> String {
             close = reviewer::REVIEW_CLOSE
         )
     }
+}
+
+/// **Zaivern 自身の検証**が成功したことにする (実行器の代わり)。
+///
+/// 自己申告 (`[ZAI-TEAM-RESULT]` の `validation`) は正式な証跡にならないので、
+/// テストでも必ずこちらを通す — 通さずに先へ進めるなら、それは実装の欠陥。
+fn validate_ok(rt: &mut TeamRuntime, tid: TaskId) {
+    let cmds = rt
+        .task(tid)
+        .map(|t| t.validation_commands.clone())
+        .unwrap_or_default();
+    rt.note_validation(
+        tid,
+        cmds.iter()
+            .map(|c| ValidationRun {
+                command: c.clone(),
+                exit_code: 0,
+            })
+            .collect(),
+    );
 }
 
 /// いま割り当てられているタスクを (session, task_id, agent) で返す。
@@ -233,7 +258,14 @@ fn 完了報告だけでは完了にならずレビューへ進む() {
     let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let block = result_block(tid, &agent, &["cargo test auth"], &fs);
     tick_text(&mut rt, 12, &sids, sid, &block);
-    // **Completed にはならない。** レビュー待ちになる。
+    // **Completed にも Reviewing にもならない。** Zaivern 自身の検証待ち。
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    assert!(
+        !rt.tasks().iter().any(|t| t.review_of == Some(tid)),
+        "検証前にレビュータスクを作った"
+    );
+    // 実測が通って初めてレビューへ進む。
+    validate_ok(&mut rt, tid);
     assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Reviewing);
     assert!(rt.tasks().iter().any(|t| t.review_of == Some(tid)));
 }
@@ -307,6 +339,7 @@ fn レビュアーは実装担当と別セッションになる() {
     let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let block = result_block(tid, &agent, &["cargo test auth"], &fs);
     tick_text(&mut rt, 12, &sids, sid, &block);
+    validate_ok(&mut rt, tid);
     idle_tick(&mut rt, 13, &sids);
     let rev = rt
         .tasks()
@@ -371,6 +404,7 @@ fn 上限まで差し戻すと人へ上げる() {
         let block = result_block(tid, &agent, &["cargo test auth"], &fs);
         tick_text(&mut rt, now, &sids, sid, &block);
         now += 1;
+        validate_ok(&mut rt, tid);
         idle_tick(&mut rt, now, &sids);
         now += 1;
         rev_sid = rt
@@ -565,21 +599,48 @@ fn 保存して復元しても実行中タスクを勝手に走らせない() {
 }
 
 #[test]
-fn 冪等キーは復元後も効く() {
+fn 起動済みのエージェントへ同じ起動要求を撃ち直さない() {
+    // 同じプロセスの中では、ACK が返ってセッションが結び付いた時点で完了。
     let mut rt = started(4);
     let first = rt.tick(&obs(10, &[]));
     assert!(first.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))));
-    let restored_effects = {
-        let saved = rt.to_saved();
-        let mut r = TeamRuntime::restore(saved, ws());
-        r.apply_action(TeamAction::Start);
-        r.tick(&obs(11, &[]))
-    };
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &first, &mut next);
+    for e in &first {
+        let k = e.key();
+        if !k.is_empty() {
+            rt.note_effect_done(&k);
+        }
+    }
+    let again = idle_tick(&mut rt, 11, &sids);
     assert!(
-        !restored_effects
-            .iter()
-            .any(|e| matches!(e, TeamEffect::StartAgent(_))),
-        "復元後に同じ起動要求を撃ち直した: {restored_effects:?}"
+        !again.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))),
+        "起動済みなのに撃ち直した: {again:?}"
+    );
+}
+
+#[test]
+fn 再起動後はackが返っていてもエージェントを起こし直す() {
+    // **`StartAgent` の成果は「生きているセッション」**なので、再起動すれば
+    // 子プロセスは死んでいる。ACK の記録だけを見て「済んだ」と判断すると、
+    // 復元後にエージェントが 1 体も居ないまま止まる。
+    let mut rt = started(4);
+    let first = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    bind_all(&mut rt, &first, &mut next);
+    for e in &first {
+        let k = e.key();
+        if !k.is_empty() {
+            rt.note_effect_done(&k);
+        }
+    }
+    let saved = rt.to_saved();
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    let after = r.tick(&obs(11, &[]));
+    assert!(
+        after.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))),
+        "再起動後にエージェントを起こし直さない: {after:?}"
     );
 }
 
@@ -610,6 +671,8 @@ fn to_review_stage() -> (TeamRuntime, Vec<SessionId>, TaskId, SessionId) {
     let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
     let block = result_block(tid, &agent, &["cargo test auth"], &fs);
     tick_text(&mut rt, 12, &sids, sid, &block);
+    // **Zaivern 自身の検証が通って初めてレビューへ進む。**
+    validate_ok(&mut rt, tid);
     idle_tick(&mut rt, 13, &sids);
     let rev_sid = rt
         .tasks()
@@ -727,4 +790,655 @@ fn 計画しただけではエージェントを起こさない() {
     rt.apply_action(TeamAction::Start);
     let eff2 = rt.tick(&obs(2, &[]));
     assert!(eff2.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  修正 1: 検証結果の信頼境界
+//
+//  **エージェントの自己申告を正式な検証証跡にしない。** Zaivern 自身が
+//  実行し、`note_validation` で戻ってきた実測結果だけを採る。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 完了報告を出した直後の状態と、そのとき出た Effect。
+fn report_and_collect(rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, now: u64)
+    -> Vec<TeamEffect>
+{
+    let t = rt.task(tid).expect("タスク").clone();
+    let sid = t.assigned_session.expect("担当セッション");
+    let agent = t.assigned_agent.clone().expect("担当").0;
+    let files: Vec<String> = t.files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let cmds: Vec<&str> = t.validation_commands.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &fs);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(now, &rows))
+}
+
+/// 実装 1 本を割り当てた状態を作る。
+fn to_assigned() -> (TeamRuntime, Vec<SessionId>, TaskId) {
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let tid = assignments(&rt)[0].1;
+    (rt, sids, tid)
+}
+
+#[test]
+fn 自己申告の検証成功でもzaivernが自分で実行する() {
+    let (mut rt, sids, tid) = to_assigned();
+    // エージェントは "cargo test auth / exit_code=0" を自己申告する
+    let eff = report_and_collect(&mut rt, &sids, tid, 12);
+    // **Zaivern 自身の検証が必ず発行される。**
+    assert!(
+        eff.iter().any(|e| matches!(e, TeamEffect::RunValidation(v) if v.task == tid)),
+        "自己申告を信じて検証を実行しなかった: {eff:?}"
+    );
+    // まだレビューへは進まない
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    assert!(
+        !rt.tasks().iter().any(|t| t.review_of == Some(tid)),
+        "検証前にレビュータスクを作った"
+    );
+    // 正式な検証証跡は 1 件も無い (自己申告は入っていない)
+    assert!(
+        rt.task(tid).unwrap().validation.runs.is_empty(),
+        "自己申告が正式な検証結果として入っている: {:?}",
+        rt.task(tid).unwrap().validation.runs
+    );
+}
+
+#[test]
+fn 実測が失敗ならレビューへ進まない() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    // 実測は失敗
+    rt.note_validation(
+        tid,
+        cmds.iter()
+            .map(|c| ValidationRun { command: c.clone(), exit_code: 1 })
+            .collect(),
+    );
+    idle_tick(&mut rt, 13, &sids);
+    let t = rt.task(tid).unwrap();
+    assert_ne!(t.state, TeamTaskState::Reviewing, "失敗したのにレビューへ進んだ");
+    assert_ne!(t.state, TeamTaskState::Completed, "失敗したのに完了した");
+    assert!(
+        !rt.tasks().iter().any(|x| x.review_of == Some(tid)),
+        "失敗したのにレビュータスクを作った"
+    );
+}
+
+#[test]
+fn 実測が成功して初めてレビューへ進む() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    rt.note_validation(
+        tid,
+        cmds.iter()
+            .map(|c| ValidationRun { command: c.clone(), exit_code: 0 })
+            .collect(),
+    );
+    let t = rt.task(tid).unwrap();
+    assert_eq!(t.state, TeamTaskState::Reviewing, "実測成功後にレビューへ進まない");
+    assert!(rt.tasks().iter().any(|x| x.review_of == Some(tid)));
+}
+
+#[test]
+fn レビュー不要でも実測成功前は完了しない() {
+    let mut rt = started_with(4, false);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let tid = assignments(&rt)[0].1;
+    report_and_collect(&mut rt, &sids, tid, 12);
+    assert_ne!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Completed,
+        "レビュー不要でも自己申告だけで完了させてはいけない"
+    );
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    rt.note_validation(
+        tid,
+        cmds.iter()
+            .map(|c| ValidationRun { command: c.clone(), exit_code: 0 })
+            .collect(),
+    );
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Completed);
+}
+
+#[test]
+fn 検証コマンドが複数なら全部成功しないと進まない() {
+    let (mut rt, sids, tid) = to_assigned();
+    rt.set_validation_commands_for_test(tid, &["cargo test a", "cargo test b"]);
+    report_and_collect(&mut rt, &sids, tid, 12);
+    // 1 本だけ成功
+    rt.note_validation(
+        tid,
+        vec![ValidationRun { command: "cargo test a".into(), exit_code: 0 }],
+    );
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "一部だけの成功で先へ進んだ"
+    );
+    rt.note_validation(
+        tid,
+        vec![ValidationRun { command: "cargo test b".into(), exit_code: 0 }],
+    );
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Reviewing);
+}
+
+#[test]
+fn 自己申告と実測が矛盾したら実測を採る() {
+    let (mut rt, sids, tid) = to_assigned();
+    // 自己申告は exit_code 0
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    // 実測は 1
+    rt.note_validation(
+        tid,
+        cmds.iter()
+            .map(|c| ValidationRun { command: c.clone(), exit_code: 1 })
+            .collect(),
+    );
+    let t = rt.task(tid).unwrap();
+    assert!(t.validation.failed(), "実測の失敗が採られていない");
+    assert!(!t.validation.passed(&t.validation_commands));
+    assert_ne!(t.state, TeamTaskState::Reviewing);
+}
+
+#[test]
+fn 検証コマンドが空でも止まらない() {
+    let (mut rt, sids, tid) = to_assigned();
+    rt.set_validation_commands_for_test(tid, &[]);
+    report_and_collect(&mut rt, &sids, tid, 12);
+    // 空 = 走らせるものが無い。**永久に Validating で止めない。**
+    let st = rt.task(tid).unwrap().state;
+    assert!(
+        matches!(st, TeamTaskState::Reviewing | TeamTaskState::Completed),
+        "検証コマンドが空のタスクが {st:?} で止まっている"
+    );
+}
+
+#[test]
+fn 再起動しても未完了の検証が再開される() {
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    let saved = rt.to_saved();
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    let eff = r.tick(&obs(20, &[]));
+    assert!(
+        eff.iter().any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "復元後に未完了の検証が再開されない: {eff:?}"
+    );
+    let _ = sids;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  修正 2: Reassign は旧担当の停止を確認してから
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 実行中のreassignは即座にreadyにしない() {
+    let (mut rt, _sids, tid) = to_assigned();
+    let before = rt.task(tid).unwrap().clone();
+    assert!(before.assigned_session.is_some());
+    let eff = rt.apply_action(TeamAction::ReassignTask(tid));
+    let t = rt.task(tid).unwrap();
+    assert_ne!(t.state, TeamTaskState::Ready, "旧担当が生きているのに Ready へ戻した");
+    assert_eq!(t.assigned_session, before.assigned_session, "担当を先に外した");
+    // 承認前に kill しない
+    assert!(
+        !eff.iter().any(|e| matches!(e, TeamEffect::StopAgent(_))),
+        "承認前に StopAgent を発行した: {eff:?}"
+    );
+    // 承認要求は出る
+    assert!(
+        eff.iter().any(|e| matches!(e, TeamEffect::RequestHumanApproval(_))),
+        "停止承認を求めていない: {eff:?}"
+    );
+}
+
+#[test]
+fn reassignは承認後にstop_agentを出す() {
+    let (mut rt, _sids, tid) = to_assigned();
+    let sid = rt.task(tid).unwrap().assigned_session.unwrap();
+    rt.apply_action(TeamAction::ReassignTask(tid));
+    let d = rt
+        .decisions()
+        .iter()
+        .find(|d| d.task_id == Some(tid))
+        .expect("停止承認の判断が積まれる")
+        .clone();
+    let eff = rt.apply_action(TeamAction::ApproveDecision(d.id));
+    assert!(
+        eff.iter().any(|e| matches!(e, TeamEffect::StopAgent(s) if *s == sid)),
+        "承認後に StopAgent が出ない: {eff:?}"
+    );
+}
+
+#[test]
+fn セッションが生きている間は別担当へ配らない() {
+    let (mut rt, sids, tid) = to_assigned();
+    let sid = rt.task(tid).unwrap().assigned_session.unwrap();
+    rt.apply_action(TeamAction::ReassignTask(tid));
+    let d = rt.decisions().iter().find(|d| d.task_id == Some(tid)).unwrap().id;
+    rt.apply_action(TeamAction::ApproveDecision(d));
+    // セッションはまだ生きている
+    idle_tick(&mut rt, 13, &sids);
+    let t = rt.task(tid).unwrap();
+    assert_eq!(
+        t.assigned_session,
+        Some(sid),
+        "セッションが生きているのに担当を外した"
+    );
+    // 消滅を観測して初めて解放される
+    let alive: Vec<SessionId> = sids.iter().copied().filter(|s| *s != sid).collect();
+    idle_tick(&mut rt, 14, &alive);
+    let t = rt.task(tid).unwrap();
+    assert_ne!(t.assigned_session, Some(sid), "消滅後も旧担当が残っている");
+}
+
+#[test]
+fn reassignを拒否したら元の担当と状態が残る() {
+    let (mut rt, _sids, tid) = to_assigned();
+    let before = rt.task(tid).unwrap().clone();
+    rt.apply_action(TeamAction::ReassignTask(tid));
+    let d = rt.decisions().iter().find(|d| d.task_id == Some(tid)).unwrap().id;
+    rt.apply_action(TeamAction::RejectDecision(d));
+    let after = rt.task(tid).unwrap();
+    assert_eq!(after.state, before.state, "拒否したのに状態が変わった");
+    assert_eq!(after.assigned_session, before.assigned_session);
+    assert_eq!(after.assigned_agent, before.assigned_agent);
+}
+
+#[test]
+fn reassignの途中で再起動しても継続できる() {
+    let (mut rt, _sids, tid) = to_assigned();
+    rt.apply_action(TeamAction::ReassignTask(tid));
+    let saved = rt.to_saved();
+    let r = TeamRuntime::restore(saved, ws());
+    assert!(
+        r.decisions().iter().any(|d| d.task_id == Some(tid)),
+        "停止承認待ちが復元されない"
+    );
+}
+
+#[test]
+fn 旧担当が居なければ即座に回収できる() {
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    // 依存待ちの統合タスク (担当が居ない)
+    let integ = rt
+        .tasks()
+        .iter()
+        .find(|t| t.role == TeamRole::Integrator)
+        .map(|t| t.id)
+        .expect("統合タスク");
+    assert_eq!(rt.task(integ).unwrap().assigned_session, None);
+    let eff = rt.apply_action(TeamAction::ReassignTask(integ));
+    assert!(
+        !eff.iter().any(|e| matches!(e, TeamEffect::RequestHumanApproval(_))),
+        "担当が居ないのに承認を求めた"
+    );
+    assert!(rt.decisions().iter().all(|d| d.task_id != Some(integ)));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  修正 3: Effect は実行前に「完了済み」と記録しない
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 走っていた検証は復元後にもう一度走る() {
+    // **検証は裏スレッドで走る。** 実行側は「走らせ始めた」時点で成功を返す
+    // ので `validate:{task}` は `Completed` になるが、結果が戻る前に落ちれば
+    // その実行はプロセスごと消えている。ここで記録を残したままにすると、
+    // 復元後に誰も検証を発行せず、タスクは `Validating` で永久に止まる
+    // (発行済みで止まるのと同じ事故が、成功済みの側から起きる)。
+    let (mut rt, sids, tid) = to_assigned();
+    report_and_collect(&mut rt, &sids, tid, 12);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+    // 実行側が「走らせ始めた」と返す (結果はまだ戻っていない)。
+    rt.note_effect_done(&format!("validate:{tid}"));
+
+    let saved = rt.to_saved();
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    let e = r.tick(&obs(20, &[]));
+    assert_eq!(
+        r.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "検証待ちの成果を捨てている"
+    );
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, TeamEffect::RunValidation(v) if v.task == tid)),
+        "落ちた検証が復元後に発行されない (永久に Validating): {e:?}"
+    );
+}
+
+#[test]
+fn 実行前にクラッシュしたeffectは復元後に再発行される() {
+    // **判別できる Effect で見る。** `StartAgent` は「ACK 済みでもセッションが
+    // 無ければ撃ち直す」という別の規則にも守られているので、発行と完了を
+    // 取り違えても素通りしてしまう (実際にこの検査は最初その形で空回りした)。
+    // 指示 (`instr:`) は成果が残る側なので、記録の意味がそのまま出る。
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    for x in &e {
+        let k = x.key();
+        if !k.is_empty() {
+            rt.note_effect_done(&k);
+        }
+    }
+    let e2 = idle_tick(&mut rt, 11, &sids);
+    let sent: Vec<String> = e2
+        .iter()
+        .map(|x| x.key())
+        .filter(|k| k.starts_with("instr:"))
+        .collect();
+    assert!(!sent.is_empty(), "指示が 1 通も出ていない");
+
+    // **ACK を返さずに**保存 → クラッシュ → 復元。
+    let saved = rt.to_saved();
+    for k in &sent {
+        assert!(
+            !saved.run.effects.iter().any(|r| &r.key == k
+                && r.state == super::persistence::EffectState::Completed),
+            "実行していない指示が完了として保存された: {k}"
+        );
+    }
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    // 復元後は担当が外れて配り直しになるので、同じ指示がもう一度出る。
+    let e3 = r.tick(&obs(12, &[]));
+    let mut next2 = 1;
+    let sids2 = bind_all(&mut r, &e3, &mut next2);
+    let e4 = idle_tick(&mut r, 13, &sids2);
+    let again: Vec<String> = e4
+        .iter()
+        .map(|x| x.key())
+        .filter(|k| k.starts_with("instr:"))
+        .collect();
+    assert!(
+        !again.is_empty(),
+        "実行前にクラッシュした指示が復元後に再発行されない"
+    );
+    for k in &again {
+        assert!(
+            !r.effect_completed(k),
+            "実行していない指示が完了扱いのままだった: {k}"
+        );
+    }
+}
+
+#[test]
+fn 成功ackした指示は復元後に再送されない() {
+    // **成果が残る Effect** (届いた指示) は、ACK 後は二度と出さない。
+    // `StartAgent` は成果が「生きているセッション」なので別扱い
+    // (下の 2 本を参照)。
+    let mut rt = started(4);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    for x in &e {
+        let k = x.key();
+        if !k.is_empty() {
+            rt.note_effect_done(&k);
+        }
+    }
+    let e2 = idle_tick(&mut rt, 11, &sids);
+    let sent: Vec<String> = e2
+        .iter()
+        .map(|x| x.key())
+        .filter(|k| k.starts_with("instr:"))
+        .collect();
+    assert!(!sent.is_empty(), "指示が 1 通も出ていない");
+    for k in &sent {
+        rt.note_effect_done(k);
+    }
+    let saved = rt.to_saved();
+    let mut r = TeamRuntime::restore(saved, ws());
+    r.apply_action(TeamAction::Start);
+    let e3 = r.tick(&obs(12, &[]));
+    for k in &sent {
+        assert!(
+            r.effect_completed(k),
+            "ACK 済みの指示が復元されていない: {k}"
+        );
+    }
+    assert!(
+        !e3.iter().any(|x| x.key().starts_with("instr:") && sent.contains(&x.key())),
+        "ACK 済みの指示を再送した: {e3:?}"
+    );
+}
+
+#[test]
+fn 失敗ackしたeffectは再試行される() {
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let first: Vec<String> = eff
+        .iter()
+        .map(|e| e.key())
+        .filter(|k| k.starts_with("start:"))
+        .collect();
+    assert!(!first.is_empty());
+    for k in &first {
+        rt.note_effect_failed(k);
+    }
+    let eff2 = rt.tick(&obs(11, &[]));
+    let again: Vec<String> = eff2
+        .iter()
+        .map(|e| e.key())
+        .filter(|k| k.starts_with("start:"))
+        .collect();
+    assert_eq!(again, first, "失敗 ACK 後に再試行されない");
+}
+
+#[test]
+fn start_agent再試行で既存セッションを重複起動しない() {
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &eff, &mut next);
+    assert!(!sids.is_empty());
+    // 結び付いた後は、失敗 ACK を撃っても起動要求は出ない
+    for e in &eff {
+        let k = e.key();
+        if k.starts_with("start:") {
+            rt.note_effect_failed(&k);
+        }
+    }
+    let eff2 = idle_tick(&mut rt, 11, &sids);
+    assert!(
+        !eff2.iter().any(|e| matches!(e, TeamEffect::StartAgent(_))),
+        "既にセッションが居るのに起動要求を出した: {eff2:?}"
+    );
+}
+
+#[test]
+fn 検証は同時に二重実行しない() {
+    let (mut rt, sids, tid) = to_assigned();
+    let e1 = report_and_collect(&mut rt, &sids, tid, 12);
+    assert_eq!(
+        e1.iter()
+            .filter(|e| matches!(e, TeamEffect::RunValidation(_)))
+            .count(),
+        1
+    );
+    // 実行中はもう 1 本出さない
+    let e2 = idle_tick(&mut rt, 13, &sids);
+    assert!(
+        !e2.iter().any(|e| matches!(e, TeamEffect::RunValidation(_))),
+        "検証を二重に発行した: {e2:?}"
+    );
+}
+
+#[test]
+fn effectの状態が保存復元される() {
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let keys: Vec<String> = eff.iter().map(|e| e.key()).filter(|k| !k.is_empty()).collect();
+    assert!(!keys.is_empty());
+    // 1 件だけ ACK して保存
+    rt.note_effect_done(&keys[0]);
+    let saved = rt.to_saved();
+    let r = TeamRuntime::restore(saved, ws());
+    assert!(r.effect_completed(&keys[0]), "完了した Effect が復元されない");
+    for k in &keys[1..] {
+        assert!(
+            !r.effect_completed(k),
+            "ACK していない Effect が完了扱いで復元された: {k}"
+        );
+    }
+}
+
+#[test]
+fn effect履歴の上限処理で未完了を消さない() {
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let pending: Vec<String> = eff.iter().map(|e| e.key()).filter(|k| !k.is_empty()).collect();
+    assert!(!pending.is_empty());
+    // 完了済みを大量に積んで刈り取りを起こす
+    for i in 0..(EFFECT_KEY_CAP + 100) {
+        let k = format!("synthetic:{i}");
+        rt.note_effect_dispatched_for_test(&k);
+        rt.note_effect_done(&k);
+    }
+    for k in &pending {
+        assert!(
+            !rt.effect_completed(k),
+            "未完了の Effect が刈り取りで完了扱いになった: {k}"
+        );
+    }
+}
+
+#[test]
+fn ack後に結び付けられなかった起動要求は撃ち直される() {
+    // 実行側が「起動した」と返してから `bind_session` を呼ぶまでの間に
+    // 落ちると、記録は成功のまま・エージェントは居ない、という状態になる。
+    // **そこで諦めると、そのエージェントは永久に起動されない。**
+    let mut rt = started(4);
+    let eff = rt.tick(&obs(10, &[]));
+    let keys: Vec<String> = eff
+        .iter()
+        .map(|e| e.key())
+        .filter(|k| k.starts_with("start:"))
+        .collect();
+    assert!(!keys.is_empty());
+    // ACK だけ返して、結び付けは行わない
+    for k in &keys {
+        rt.note_effect_done(k);
+    }
+    let eff2 = rt.tick(&obs(11, &[]));
+    let again: Vec<String> = eff2
+        .iter()
+        .map(|e| e.key())
+        .filter(|k| k.starts_with("start:"))
+        .collect();
+    assert_eq!(again, keys, "結び付いていない起動要求が撃ち直されない");
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  状態機械を迂回してよい場所を、理由ごと固定する
+//
+//  `sm::force` は表に無い遷移を通す唯一の抜け道なので、**どこで・なぜ**
+//  使ってよいかをテストで留めておく。増えたらここが赤くなる。
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 人の操作だけがneeds_userから戻せる() {
+    // 自動処理に `NeedsUser → Ready` は無い (表が拒否する)。
+    assert!(super::state_machine::apply(
+        TeamTaskState::NeedsUser,
+        TeamTaskState::Ready
+    )
+    .is_err());
+
+    // 人が Retry を押したときだけ戻る。
+    let (mut rt, _sids, tid) = to_assigned();
+    rt.set_state_for_test(tid, TeamTaskState::NeedsUser);
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Ready);
+}
+
+#[test]
+fn 停止を確認できたときだけ実行中から回収できる() {
+    // 自動処理に `Running → Ready` は無い。
+    assert!(super::state_machine::apply(
+        TeamTaskState::Running,
+        TeamTaskState::Ready
+    )
+    .is_err());
+
+    // セッションの消滅を観測したときだけ回収する (free_task)。
+    let (mut rt, sids, tid) = to_assigned();
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Running);
+    let dead = rt.task(tid).unwrap().assigned_session.unwrap();
+    let alive: Vec<SessionId> = sids.iter().copied().filter(|s| *s != dead).collect();
+    idle_tick(&mut rt, 12, &alive);
+    assert_ne!(rt.task(tid).unwrap().assigned_session, Some(dead));
+}
+
+#[test]
+fn 効かなかったretryは停止承認を消さない() {
+    // Retry が効くのは `NeedsUser` / `Failed` のときだけ。実行中のタスクへ
+    // 撃っても状態は変わらないが、**承認待ちの Decision まで一緒に消える**と
+    // 「停止待ちの印だけが残り、誰も止めない」タスクができる (画面からは
+    // 承認ボタンが消えているので、人からは手が出せない)。
+    let (mut rt, sids, tid) = to_assigned();
+    rt.apply_action(TeamAction::ReassignTask(tid));
+    assert!(
+        rt.decisions().iter().any(|d| d.task_id == Some(tid)),
+        "停止承認を求めていない"
+    );
+    rt.apply_action(TeamAction::RetryTask(tid));
+    let pending = rt.task(tid).unwrap().reassign_pending;
+    let asked = rt.decisions().iter().any(|d| d.task_id == Some(tid));
+    assert_eq!(
+        pending, asked,
+        "停止待ちの印と承認要求が食い違っている (pending={pending} / decision={asked})"
+    );
+    // 承認できるなら、承認は今も通る。
+    if asked {
+        let did = rt.decisions().iter().find(|d| d.task_id == Some(tid)).unwrap().id;
+        let out = rt.apply_action(TeamAction::ApproveDecision(did));
+        assert!(
+            out.iter().any(|e| matches!(e, TeamEffect::StopAgent(_))),
+            "承認しても停止しない"
+        );
+    }
+    let _ = sids;
+}
+
+#[test]
+fn 迂回してよい場所は二か所だけ() {
+    // **`sm::force` を増やしたらここが赤くなる。** 増やすなら、その場所と
+    // 「なぜ確認済みと言えるか」をこのテストにも書くこと。
+    let src = include_str!("runtime.rs").replace("\r\n", "\n");
+    let n = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("sm::force("))
+        .count();
+    assert_eq!(
+        n, 2,
+        "状態機械を迂回している箇所が {n} 個ある (人の Retry と、停止確認後の回収だけのはず)"
+    );
 }

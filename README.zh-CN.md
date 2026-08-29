@@ -213,6 +213,8 @@ Zaivern 读取 SPEC，推导出 Goal 与 Definition of Done，构建任务图并
 `Running → Validating → Reviewing → Completed` 前进；若任务 ID 或智能体 ID
 与分配不符、改动了负责范围之外的文件、没有运行或未通过验证命令、仍有未解决的
 blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**负责。
+智能体报告的 `validation` 只作为**参考信息**保留：验证命令由 Zaivern 自己
+执行，只有它自己实测通过后才会进入评审。
 push、merge、deploy、权限提升和破坏性命令永不自动执行——它们会变成屏幕上
 等待你决定的事项。
 

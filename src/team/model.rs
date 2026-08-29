@@ -424,6 +424,16 @@ impl ValidationState {
     pub fn failed(&self) -> bool {
         self.runs.iter().any(|r| r.exit_code != 0)
     }
+
+    /// **検証の決着がついたか** (走らせるものが無い場合も含む)。
+    ///
+    /// [`passed`](Self::passed) が「必須コマンドが空 = 未検証」に倒すのは、
+    /// 未実行と成功を混ぜないため。一方で**走らせるものが 1 本も無いタスクを
+    /// 永久に `Validating` で止めてはいけない**ので、「先へ進んでよいか」は
+    /// こちらで判断する。2 つを分けておかないと、どちらかの意味が必ず歪む。
+    pub fn settled(&self, required: &[String]) -> bool {
+        !self.running && (required.is_empty() || self.passed(required))
+    }
 }
 
 /// レビューの判定。
@@ -578,6 +588,24 @@ pub struct TeamTask {
     pub review: ReviewState,
     /// 次の担当へ渡す追加文脈 (レビュー指摘など)。
     pub context: Vec<String>,
+    /// **エージェントが自己申告した検証結果 (参考情報)。**
+    ///
+    /// ここは `validation` とは別の入れ物である。エージェントは
+    /// 「`cargo test` は exit_code 0 だった」と**書くだけ**で書けてしまう
+    /// ので、これを正式な証跡にすると「検証コマンドが実行され、成功しなければ
+    /// 完了にしない」という中核の保証が空文になる。正式な証跡は Zaivern 自身が
+    /// 実行して [`ValidationState::runs`] へ入れたものだけ。
+    ///
+    /// 捨てずに残すのは、**申告と実測が食い違ったときに次の担当へ渡す**ため。
+    #[serde(default)]
+    pub reported_validation: Vec<ValidationRun>,
+    /// **旧担当の停止を待っている** (人が Reassign を押した)。
+    ///
+    /// 停止承認 → `StopAgent` → セッション消滅の観測、が済むまで担当を
+    /// 外さない。外してしまうと、まだ編集している旧担当と新担当が同じ
+    /// ファイルを同時に持つ。
+    #[serde(default)]
+    pub reassign_pending: bool,
     /// 直近の完了報告の要約。
     pub last_summary: String,
     /// 直近報告で変更されたファイル。担当外を触っていないかの照合に使う。

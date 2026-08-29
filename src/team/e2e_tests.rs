@@ -48,6 +48,13 @@ struct Lab {
     sessions: Vec<SessionId>,
     next_session: SessionId,
     now: u64,
+    /// 検証の実行結果 (偽の実行器)。**既定は成功**だが、ここを偽にすると
+    /// 「エージェントは成功と言ったが実際は落ちた」を再現できる。
+    validation_passes: bool,
+    /// 実行を頼まれた検証。**次の tick で返す** — 実物も裏のスレッドで
+    /// 走らせて、終わったフレームで結果を戻す (同じ tick で即答すると、
+    /// 「検証待ち」という状態が 1 度も観測されない筋書きになる)。
+    queued_validations: Vec<super::runtime::ValidationSpec>,
 }
 
 impl Lab {
@@ -78,12 +85,27 @@ impl Lab {
             sessions: Vec::new(),
             next_session: 1,
             now: 100,
+            validation_passes: true,
+            queued_validations: Vec::new(),
         }
     }
 
     /// 1 tick 回す。`target` に指定したセッションにだけテキストを見せる。
     fn tick(&mut self, target: Option<SessionId>, text: &str) -> Vec<TeamEffect> {
         self.now += 1;
+        // 前の tick で頼まれた検証の結果を、いま戻す (裏のスレッドの模擬)。
+        let code = i32::from(!self.validation_passes);
+        for v in std::mem::take(&mut self.queued_validations) {
+            let runs = v
+                .commands
+                .iter()
+                .map(|c| ValidationRun {
+                    command: c.clone(),
+                    exit_code: code,
+                })
+                .collect();
+            self.rt.note_validation(v.task, runs);
+        }
         let rows: Vec<SessionObs> = self
             .sessions
             .iter()
@@ -103,16 +125,38 @@ impl Lab {
             now: self.now,
             sessions: rows,
         });
-        // **起動要求は必ず実際の起動として応える** (返事をしないと
-        // 「起動したことになっているのに居ない」状態が生まれる)。
+        // **要求には必ず応える。** 応えないと「発行したのに誰も実行しない」
+        // 状態になり、テストが実物と違う筋書きを回すことになる。
+        //
+        // 実行側は成功したら ACK を返す。返さない限り Runtime は「済んだ」
+        // と見なさないので、ここでの ACK は実物の app と同じ責務。
+        let mut acks: Vec<String> = Vec::new();
+        let mut validations: Vec<super::runtime::ValidationSpec> = Vec::new();
         for e in &eff {
-            if let TeamEffect::StartAgent(s) = e {
-                let sid = self.next_session;
-                self.next_session += 1;
-                self.rt.bind_session(&s.agent_id, sid);
-                self.sessions.push(sid);
+            match e {
+                TeamEffect::StartAgent(s) => {
+                    let sid = self.next_session;
+                    self.next_session += 1;
+                    self.rt.bind_session(&s.agent_id, sid);
+                    self.sessions.push(sid);
+                    acks.push(e.key());
+                }
+                TeamEffect::RunValidation(v) => {
+                    // 受け取ったので ACK。結果は次の tick で返す。
+                    validations.push(v.clone());
+                    acks.push(e.key());
+                }
+                TeamEffect::PersistState => {}
+                _ => acks.push(e.key()),
             }
         }
+        for k in acks {
+            if !k.is_empty() {
+                self.rt.note_effect_done(&k);
+            }
+        }
+        // **検証は Zaivern が走らせる。** エージェントの自己申告ではない。
+        self.queued_validations.extend(validations);
         eff
     }
 
@@ -274,10 +318,17 @@ fn 受入シナリオを最後まで通す() {
 
     // ── Task A: 完了 → 検証 → レビュー → APPROVE → 完了 ──
     lab.report_done(task_a);
+    // **報告だけでは進まない。** Zaivern 自身の検証を待つ。
+    assert_eq!(
+        lab.rt.task(task_a).unwrap().state,
+        TeamTaskState::Validating,
+        "報告だけでレビューへ進めてはいけない"
+    );
+    lab.idle(); // ここで RunValidation が出て、偽の実行器が実測を返す
     assert_eq!(
         lab.rt.task(task_a).unwrap().state,
         TeamTaskState::Reviewing,
-        "報告だけで完了させてはいけない"
+        "実測が通ったのにレビューへ進まない"
     );
     assert!(lab
         .rt
@@ -441,4 +492,44 @@ fn 既存coordinatorの重なり判定を迂回しない() {
             seen.push(f.clone());
         }
     }
+}
+
+#[test]
+fn 自己申告が嘘でも実測が通らなければgoalは完了しない() {
+    // エージェントは「`cargo test auth` は成功した」と報告するが、
+    // **Zaivern が実際に走らせると落ちる**という筋書き。
+    let mut lab = Lab::new(4);
+    lab.validation_passes = false;
+    lab.idle();
+    lab.idle();
+    let work = lab.working();
+    assert!(!work.is_empty());
+    let (_, tid, _) = work[0].clone();
+    lab.report_done(tid);
+    assert_eq!(
+        lab.rt.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "報告だけで先へ進んだ"
+    );
+    lab.idle(); // RunValidation → 次の tick で失敗が返る
+    lab.idle();
+    let t = lab.rt.task(tid).unwrap();
+    assert_ne!(t.state, TeamTaskState::Reviewing, "実測が落ちたのにレビューへ進んだ");
+    assert_ne!(t.state, TeamTaskState::Completed, "実測が落ちたのに完了した");
+    assert!(
+        !lab.rt.tasks().iter().any(|x| x.review_of == Some(tid)),
+        "実測が落ちたのにレビュータスクを作った"
+    );
+    // 食い違いは次の担当へ伝わる
+    assert!(
+        lab.rt
+            .task(tid)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("実際には失敗")),
+        "申告と実測の食い違いを次の担当へ渡していない: {:?}",
+        lab.rt.task(tid).unwrap().context
+    );
+    assert_ne!(lab.rt.goal().status, GoalStatus::Completed);
 }

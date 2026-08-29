@@ -225,7 +225,10 @@ avança apenas por `Running → Validating → Reviewing → Completed`, e um re
 de conclusão é rejeitado se o id da tarefa ou do agente não bater, se arquivos
 fora do escopo foram tocados, se os comandos de validação não foram executados
 ou falharam, ou se ainda há um blocker aberto. As revisões vão para uma
-**sessão diferente** daquela que escreveu o código. `push`, `merge`, `deploy`,
+**sessão diferente** daquela que escreveu o código. O bloco `validation`
+relatado pelo agente fica apenas como **informação de referência**: o próprio
+Zaivern executa os comandos de validação e só avança para a revisão com os
+resultados que ele mesmo mediu. `push`, `merge`, `deploy`,
 elevação de privilégio e comandos destrutivos nunca são executados
 automaticamente — viram uma decisão sua, na tela.
 

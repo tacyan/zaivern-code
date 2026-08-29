@@ -225,7 +225,10 @@ avanza por `Running → Validating → Reviewing → Completed`, y un informe de
 finalización se rechaza si el id de la tarea o del agente no coincide, si tocó
 archivos fuera de su alcance, si los comandos de validación no se ejecutaron o
 fallaron, o si queda un blocker abierto. Las revisiones van a una **sesión
-distinta** de la que escribió el código. `push`, `merge`, `deploy`, la elevación
+distinta** de la que escribió el código. El bloque `validation` que informa el
+agente se guarda solo como **información de referencia**: es Zaivern quien
+ejecuta los comandos de validación y solo pasa a la revisión con los resultados
+que él mismo midió. `push`, `merge`, `deploy`, la elevación
 de privilegios y los comandos destructivos nunca se ejecutan automáticamente:
 se convierten en una decisión tuya, en pantalla.
 

@@ -469,3 +469,184 @@ fn テストは実ホームへ書かない() {
         "既定の根を決めている場所が {defaults} 箇所ある (1 つにすること)"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  レビューで見つかった 3 件が戻ってこないことを、ソースの形で固定する
+// ══════════════════════════════════════════════════════════════════════
+
+const RUNTIME: &str = include_str!("runtime.rs");
+
+#[test]
+fn 自己申告を正式な検証証跡にしない() {
+    let s = src(RUNTIME);
+    let body = function_body(&s, s.find("fn apply_accepted").expect("報告の受け口"));
+    // 自己申告は参考情報の欄へ入れる。
+    assert!(
+        body.contains("t.reported_validation = acc.validation.clone();"),
+        "自己申告を参考情報として分けていない"
+    );
+    // **正式な証跡 (`validation.runs`) へ自己申告を入れない。**
+    assert!(
+        !body.contains("t.validation.runs.push(r.clone())")
+            && !body.contains("t.validation.runs = acc.validation"),
+        "自己申告を正式な検証証跡へ入れている:\n{body}"
+    );
+    // 報告を受けた時点でレビューへ進めない。
+    assert!(
+        !body.contains("new_review_task"),
+        "完了報告の時点でレビュータスクを作っている"
+    );
+
+    // 実測を受ける入口だけが決着をつける。
+    let nv = function_body(&s, s.find("pub fn note_validation").expect("実測の入口"));
+    assert!(
+        nv.contains("self.settle_validation(task)"),
+        "実測を受けても決着をつけていない"
+    );
+    // レビュータスクを作る場所は 1 つだけ (決着の中)。
+    let settle = function_body(&s, s.find("fn settle_validation").expect("決着"));
+    assert!(settle.contains("self.new_review_task(&t)"));
+    assert_eq!(
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("self.new_review_task(&"))
+            .count(),
+        1,
+        "レビュータスクを作る場所が 2 つ以上ある"
+    );
+}
+
+#[test]
+fn reassignは停止を確認してから配り直す() {
+    let s = src(RUNTIME);
+    let body = function_body(&s, s.find("TeamAction::ReassignTask").expect("Reassign"));
+    // 旧担当が生きているかを見てから分岐する。
+    assert!(
+        body.contains("self.live_session_of(id)"),
+        "旧担当が生きているかを見ていない"
+    );
+    // 生きているなら承認を求める。
+    assert!(
+        body.contains("DecisionKind::StopAgents") && body.contains("RequestHumanApproval"),
+        "停止承認を求めていない"
+    );
+    // **その場で `confirm_stopped` を呼ばない。**
+    assert!(
+        !body.contains("confirm_stopped") && !body.contains("release_after_self_report"),
+        "承認前に前任の停止を確認済みとして扱っている:\n{body}"
+    );
+
+    // 「人が押した = 停止済み」という前提が残っていない。
+    assert!(
+        !s.contains("fn release_coordinator"),
+        "誤った前提の名前が残っている"
+    );
+    // `confirm_stopped` を呼ぶ場所は、自己申告後と停止確認後の 2 つだけ。
+    assert_eq!(
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("self.co.confirm_stopped("))
+            .count(),
+        2,
+        "前任の停止を確認済みとする場所が 2 つを超えている"
+    );
+}
+
+#[test]
+fn effectは実行前に完了扱いにしない() {
+    let s = src(RUNTIME);
+    let body = function_body(&s, s.find("fn dispatch_effects").expect("発行"));
+    assert!(
+        body.contains("state: EffectState::Dispatched"),
+        "発行した Effect をいきなり完了として記録している:\n{body}"
+    );
+    assert!(
+        !body.contains("EffectState::Completed"),
+        "発行の時点で完了にしている"
+    );
+    // 完了になるのは ACK を受けたときだけ。
+    let done = function_body(&s, s.find("pub fn note_effect_done").expect("ACK"));
+    assert!(done.contains("EffectState::Completed"));
+    // 復元は成功済みだけを引き継ぐ。
+    let restore = function_body(&s, s.find("pub fn restore(").expect("復元"));
+    assert!(
+        restore.contains("r.state != EffectState::Completed"),
+        "復元で未完了の Effect を成功扱いにしている"
+    );
+    // 決着していない検証は、成功済みでも引き継がない (裏スレッドは
+    // プロセスと一緒に消えているので、記録だけが残ると永久に止まる)。
+    assert!(
+        restore.contains("unsettled.contains(&r.key)"),
+        "落ちた検証の記録を回収していない"
+    );
+    // 刈り取りは成功済みだけ。
+    let prune = function_body(&s, s.find("fn prune_effects").expect("刈り取り"));
+    assert!(
+        prune.contains("r.state == EffectState::Completed"),
+        "未完了の Effect まで刈り取っている:\n{prune}"
+    );
+}
+
+#[test]
+fn 実行側は必ず成否を返す() {
+    // GUI 側 (app) が「渡されたら返す」を守っていること。返さないと
+    // Runtime は永久に発行済みのままになる。
+    //
+    // **1 つの関数の中に ACK が 1 つでもあれば緑、では番人にならない。**
+    // 4 つの取り出し口はそれぞれ別の Effect を消費するので、**口ごとに**
+    // 成否が返っていることを見る (実際に、起動の失敗側から `ack_failed` を
+    // 消しても素通りした)。
+    let glue = src(GLUE);
+    let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
+
+    // (取り出し口のループ見出し, その区画に必ず要るもの)
+    let loops: [(&str, &[&str]); 4] = [
+        (
+            "for (key, spec) in launches",
+            &["p.ack_done(&key)", "p.ack_failed(&key)"],
+        ),
+        (
+            "for (key, session, text) in instructions",
+            &["p.ack_done(&key)", "p.ack_failed(&key)"],
+        ),
+        ("for (key, session) in stops", &["p.ack_done(&key)"]),
+        // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
+        (
+            "for (key, v) in validations",
+            &["self.team_spawn_validation(key, v)"],
+        ),
+    ];
+    // 見出しの位置で区画に割り、**その区画の中だけ**を見る。
+    let mut starts: Vec<(usize, usize)> = loops
+        .iter()
+        .enumerate()
+        .map(|(i, (head, _))| {
+            (
+                body.find(head)
+                    .unwrap_or_else(|| panic!("冪等キーを受け取っていない: {head}")),
+                i,
+            )
+        })
+        .collect();
+    starts.sort_unstable();
+    for (n, &(at, i)) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).map(|&(a, _)| a).unwrap_or(body.len());
+        let seg = &body[at..end];
+        for needle in loops[i].1 {
+            assert!(
+                seg.contains(needle),
+                "`{}` の区画が `{needle}` を返していない:\n{seg}",
+                loops[i].0
+            );
+        }
+    }
+
+    // 委譲先も、走らせられたときと作れなかったときの両方を返す。
+    let spawn = function_body(
+        &glue,
+        glue.find("fn team_spawn_validation").expect("検証の委譲先"),
+    );
+    for needle in ["p.ack_done(&key)", "p.ack_failed(&key)"] {
+        assert!(spawn.contains(needle), "検証の委譲先が `{needle}` を返していない");
+    }
+}

@@ -34,7 +34,12 @@ use serde::{Deserialize, Serialize};
 use super::model::{Decision, TeamAgent, TeamEvent, TeamGoal, TeamGroup, TeamTask};
 
 /// 保存形式の版。**上げたら移行を書く。**
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// * 1 — 初版
+/// * 2 — Effect を「発行済み (Dispatched)」と「成功 (Completed)」の 2 段で
+///   持つようにした。旧 `done_effects` は「成功済み」として引き取る
+///   ([`RunDoc::migrate`])。
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// events.jsonl の行数上限 (超えたら古い行から落とす)。
 pub const EVENT_LOG_MAX_LINES: usize = 5_000;
@@ -64,6 +69,29 @@ struct SchemaDoc {
     version: u32,
 }
 
+/// Effect がどこまで進んだか。
+///
+/// **発行しただけで「済んだ」ことにしない。** 発行と実行の間でプロセスが
+/// 落ちると、済んだ扱いのまま二度と実行されない Effect が残る
+/// (エージェントが永久に起動されない、指示が届かない、検証が走らない)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectState {
+    /// 実行側へ渡した。**まだ成功していない。**
+    Dispatched,
+    /// 実行側が成功を返した。
+    Completed,
+}
+
+/// Effect 1 件の進み具合。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectRecord {
+    pub key: String,
+    pub state: EffectState,
+    /// 記録した時刻 (Unix 秒)。回収の判断に使う。
+    pub at: u64,
+}
+
 /// 実行そのものの記録。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDoc {
@@ -79,9 +107,37 @@ pub struct RunDoc {
     pub stopped: bool,
     pub started_at: u64,
     pub updated_at: u64,
-    /// 処理済み Effect の冪等キー (再送を防ぐ)。
+    /// Effect の進み具合 (版 2 以降)。**発行 = 完了ではない。**
     #[serde(default)]
+    pub effects: Vec<EffectRecord>,
+    /// 版 1 の「処理済み Effect」。読むためだけに残す
+    /// ([`RunDoc::migrate`] が `effects` へ移す)。**新しく書かない。**
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_effects: Vec<String>,
+}
+
+impl RunDoc {
+    /// 旧版で保存された `done_effects` を `effects` へ引き取る。
+    ///
+    /// 旧版は「発行 = 完了」だったので、**成功済みとして扱うしかない**
+    /// (どれが未実行だったかは記録に残っていない)。ここで失われるのは
+    /// 「旧版でクラッシュした直前の 1 件」だけで、それ以降は新しい 2 段の
+    /// 記録が守る。
+    pub fn migrate(&mut self) {
+        if self.done_effects.is_empty() {
+            return;
+        }
+        let at = super::model::now_secs();
+        for k in std::mem::take(&mut self.done_effects) {
+            if !self.effects.iter().any(|e| e.key == k) {
+                self.effects.push(EffectRecord {
+                    key: k,
+                    state: EffectState::Completed,
+                    at,
+                });
+            }
+        }
+    }
 }
 
 /// 保存する状態のまとまり。
@@ -289,7 +345,9 @@ pub fn load(dir: &Path) -> LoadOutcome {
         }};
     }
 
-    let run = read_json!("run.json", RunDoc);
+    let mut run = read_json!("run.json", RunDoc);
+    // 旧版で保存されたものをここで引き取る (読めたものは必ず今の形にする)。
+    run.migrate();
     let goal = read_json!("goal.json", TeamGoal);
     let teams = read_json!("teams.json", Vec<TeamGroup>);
     let tasks = read_json!("tasks.json", Vec<TeamTask>);
@@ -403,7 +461,12 @@ mod tests {
                 stopped: false,
                 started_at: 100,
                 updated_at: 100,
-                done_effects: vec!["start:1".into()],
+                effects: vec![EffectRecord {
+                    key: "start:1".into(),
+                    state: EffectState::Completed,
+                    at: 100,
+                }],
+                done_effects: Vec::new(),
             },
             goal: mkgoal(),
             teams: super::super::plan_schema::default_lanes(),
@@ -432,6 +495,20 @@ mod tests {
             other => panic!("読めなかった: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 旧版のdone_effectsを成功済みとして引き取る() {
+        let mut run = saved().run;
+        run.effects.clear();
+        run.done_effects = vec!["start:agent-1".into(), "instr:1".into()];
+        run.migrate();
+        assert!(run.done_effects.is_empty(), "旧欄を残したままにしない");
+        assert_eq!(run.effects.len(), 2);
+        assert!(run.effects.iter().all(|e| e.state == EffectState::Completed));
+        // 2 度呼んでも増えない
+        run.migrate();
+        assert_eq!(run.effects.len(), 2);
     }
 
     #[test]

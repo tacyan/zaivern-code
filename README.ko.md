@@ -217,7 +217,10 @@ Zaivern 이 SPEC 을 읽어 Goal 과 Definition of Done 을 세우고, 태스크
 `Running → Validating → Reviewing → Completed` 순서로만 진행되며, 태스크 ID 나
 에이전트 ID 가 담당과 다르거나, 담당 범위 밖 파일을 건드렸거나, 검증 명령을
 실행하지 않았거나 실패했거나, 남은 blocker 가 있으면 완료 보고는 거부됩니다.
-리뷰는 **코드를 쓴 세션과 다른 세션**이 맡습니다. push · merge · deploy ·
+리뷰는 **코드를 쓴 세션과 다른 세션**이 맡습니다.
+에이전트가 보고한 `validation` 은 **참고 정보로만** 남기고, 검증 명령은
+Zaivern 이 직접 실행합니다. 리뷰로 넘어가는 것은 **직접 측정한 결과가
+통과했을 때뿐**입니다. push · merge · deploy ·
 권한 상승 · 파괴적 명령은 절대 자동으로 실행하지 않고, 화면 위에서 당신이
 판단할 항목이 됩니다.
 

@@ -239,7 +239,10 @@ Nothing is marked complete because an agent said so. A task passes only through
 rejected if the task id or agent id does not match, if it touched files outside
 its scope, if the validation commands were not run or failed, or if a blocker is
 still open. Reviews go to a **different session** than the one that wrote the
-code. `push`, `merge`, `deploy`, privilege escalation and destructive commands
+code. The `validation` block an agent reports is kept as **reference only**:
+Zaivern runs the task's validation commands itself and advances to review only
+on its own measured results.
+ `push`, `merge`, `deploy`, privilege escalation and destructive commands
 are never run automatically — they become a decision for you, on screen.
 
 The Organization Board shows the team lead, the specialist lanes, every parent
