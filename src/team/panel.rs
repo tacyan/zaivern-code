@@ -934,6 +934,54 @@ mod tests {
     }
 
     #[test]
+    fn 結果も切断も来ない検証は見張りが決着させる() {
+        // 実行器が自分で打ち切れず、送り手も生きたまま黙っている経路
+        // (worker がブロックした)。**ここを開けたままにすると、
+        // `validation.running` が永久に true のまま残る。**
+        let dir = ws("watchdog");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let exec = p.runtime.as_ref().expect("runtime").current_execution(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = super::super::launch::new_cancel_flag();
+        p.watch_validation(ValidationJob {
+            task: 1,
+            execution: exec,
+            commands: vec!["cargo test a".into()],
+            // 時限 + 余白より前に始まっている = もう見切ってよい。
+            started_at: super::super::model::now_secs()
+                .saturating_sub(60 + WATCHDOG_SLACK_SECS + 10),
+            timeout_secs: 60,
+            cancel: cancel.clone(),
+            rx,
+        });
+        p.collect_validations();
+        assert_eq!(p.running_validations(), 0, "見切っていない");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "見切ったのに停止の札を立てていない (プロセスが残る)"
+        );
+        let t = p
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.task(1))
+            .expect("タスク")
+            .clone();
+        assert!(!t.validation.running);
+        assert!(
+            t.validation
+                .runs
+                .iter()
+                .any(|r| r.outcome() == super::super::model::ValidationOutcome::TimedOut),
+            "時間切れとして記録していない: {:?}",
+            t.validation.runs
+        );
+        drop(tx);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn 停止の要求は走っている検証にだけ届く() {
         let dir = ws("cancel");
         std::fs::create_dir_all(&dir).unwrap();
