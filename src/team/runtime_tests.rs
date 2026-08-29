@@ -1993,6 +1993,32 @@ fn 効かなかったretryは停止承認を消さない() {
 }
 
 #[test]
+fn 検証の世代を進める場所は一つだけ() {
+    // **承認の範囲は世代で決まる。** 進める場所が 2 つあると、片方だけを
+    // 通った検証が「前の回の承認」で走ってしまう。増やすなら、なぜそこでも
+    // 進めてよいのかをこのテストにも書くこと。
+    let src = include_str!("runtime.rs").replace("\r\n", "\n");
+    let n = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .filter(|l| l.contains("validation.generation = "))
+        .count();
+    assert_eq!(n, 1, "検証の世代を進めている場所が {n} 個ある");
+    // その 1 か所は検証回の始まり。
+    let f = src
+        .find("fn begin_validation_round")
+        .expect("検証回の始まりが無い");
+    let end = src[f..]
+        .find("\n    }\n")
+        .map(|i| f + i)
+        .unwrap_or(src.len());
+    assert!(
+        src[f..end].contains("validation.generation = "),
+        "世代を進めているのが `begin_validation_round` の外にある"
+    );
+}
+
+#[test]
 fn 迂回してよい場所は二か所だけ() {
     // **`sm::force` を増やしたらここが赤くなる。** 増やすなら、その場所と
     // 「なぜ確認済みと言えるか」をこのテストにも書くこと。
