@@ -66,3 +66,6 @@ mod e2e_tests;
 
 #[cfg(test)]
 mod runtime_tests;
+
+#[cfg(test)]
+mod wiring_tests;

@@ -845,10 +845,11 @@ impl TeamRuntime {
         if acc.status == ReportedStatus::Completed {
             let t = self.tasks.iter().find(|t| t.id == acc.task_id).cloned();
             if let Some(t) = t {
-                if t.state == TeamTaskState::Validating {
-                    if review_required && t.review_of.is_none() {
-                        make_review = Some(self.new_review_task(&t));
-                    }
+                if t.state == TeamTaskState::Validating
+                    && review_required
+                    && t.review_of.is_none()
+                {
+                    make_review = Some(self.new_review_task(&t));
                 }
             }
         }

@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "Concluído",
   "team.phase_status.running": "Em execução",
   "team.phase_status.waiting": "Aguardando",
+  "team.registry.new_run": "New Team Run — entregue um SPEC e monte uma equipe",
+  "team.registry.open": "Team — abrir o quadro da equipe de desenvolvimento de IA",
   "team.restore.cancel": "Cancelar",
   "team.restore.confirm_discard": "Descartar mesmo? O Team Run salvo não pode ser recuperado",
   "team.restore.discard": "Descartar",

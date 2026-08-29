@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "完了",
   "team.phase_status.running": "進行中",
   "team.phase_status.waiting": "待ち",
+  "team.registry.new_run": "New Team Run — SPEC を渡してチームを編成する",
+  "team.registry.open": "Team — AI 開発チームの組織図を開く",
   "team.restore.cancel": "やめる",
   "team.restore.confirm_discard": "本当に捨てますか。保存された Team Run は戻せません",
   "team.restore.discard": "捨てる",

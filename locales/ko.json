@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "완료",
   "team.phase_status.running": "진행 중",
   "team.phase_status.waiting": "대기",
+  "team.registry.new_run": "New Team Run — SPEC 을 건네 팀을 편성",
+  "team.registry.open": "Team — AI 개발 팀 조직도 열기",
   "team.restore.cancel": "취소",
   "team.restore.confirm_discard": "정말 버리시겠습니까. 저장된 Team Run 은 되돌릴 수 없습니다",
   "team.restore.discard": "버리기",

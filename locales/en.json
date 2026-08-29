@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "Done",
   "team.phase_status.running": "Running",
   "team.phase_status.waiting": "Waiting",
+  "team.registry.new_run": "New Team Run — hand over a SPEC and form a team",
+  "team.registry.open": "Team — open the AI development team board",
   "team.restore.cancel": "Cancel",
   "team.restore.confirm_discard": "Really discard it? The saved Team Run cannot be brought back",
   "team.restore.discard": "Discard",

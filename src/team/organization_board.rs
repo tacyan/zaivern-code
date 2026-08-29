@@ -54,8 +54,11 @@ fn glyph_label(ui: &mut egui::Ui, theme: &Theme, s: AgentWorkState) {
     let on = (t / (BLINK_PERIOD / 2.0)) as i64 % 2 == 0;
     let col = if on { col } else { theme.text_dim };
     ui.label(RichText::new(s.glyph()).color(col));
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_secs_f64(BLINK_PERIOD / 2.0));
+    crate::perf::repaint_after(
+        ui.ctx(),
+        std::time::Duration::from_secs_f64(BLINK_PERIOD / 2.0),
+        "team-blink",
+    );
 }
 
 /// 状態に対応する色。**色は補助**で、意味は記号が持つ。
@@ -620,8 +623,12 @@ fn child_row(ui: &mut egui::Ui, theme: &Theme, c: &TeamAgentView, acts: &mut Vec
 
 // ── Tasks タブ ───────────────────────────────────────────────────────
 
-/// Kanban の列。**状態そのものではなく、人が読む 5 段**へ畳む。
-const TASK_COLUMNS: [(&str, &[TeamTaskState]); 5] = [
+/// Kanban の列。**状態そのものではなく、人が読む段**へ畳む。
+///
+/// **長さを人が書かない。** 固定長配列にすると、複数の枝が 1 列ずつ足した
+/// ときに全員が同じ `N+1` を書き、git は衝突を出さないのに要素数が合わなく
+/// なる (`keybinds::ALL_ACTIONS` で実際に起きた)。
+const TASK_COLUMNS: &[(&str, &[TeamTaskState])] = &[
     (
         "team.col.waiting",
         &[TeamTaskState::Pending, TeamTaskState::Ready],
@@ -660,7 +667,7 @@ fn tasks_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                for (key, states) in TASK_COLUMNS {
+                for (key, states) in TASK_COLUMNS.iter() {
                     let rows: Vec<&view_model::TaskView> =
                         s.tasks.iter().filter(|t| states.contains(&t.state)).collect();
                     ui.allocate_ui(egui::vec2(w, ui.available_height()), |ui| {
@@ -1150,7 +1157,7 @@ mod tests {
     fn かんばんの列は全状態を漏れなく一度だけ拾う() {
         let mut seen = std::collections::BTreeSet::new();
         for (_, states) in TASK_COLUMNS {
-            for s in states {
+            for s in states.iter() {
                 assert!(seen.insert(*s), "{} が 2 つの列に出る", s.key());
             }
         }

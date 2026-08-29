@@ -95,7 +95,10 @@ impl ZaivernApp {
         //    動かしたときだけ開発が進む」になる。逆に Run が無いときは
         //    1 回も頼まない (設計原則 3: アイドルのコストはゼロ)。
         if self.team_is_active() {
-            ctx.request_repaint_after(panel::SCAN_INTERVAL);
+            // **出所を記録して頼む。** `ZAIVERN_PERF=1` の集計で
+            // 「誰が再描画を要求したか」が見えないと、アイドルの費用を
+            // 数字で追えない (設計原則 3 はここで守る)。
+            crate::perf::repaint_after(ctx, panel::SCAN_INTERVAL, "team");
         }
     }
 

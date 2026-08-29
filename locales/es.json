@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "Completado",
   "team.phase_status.running": "En curso",
   "team.phase_status.waiting": "Esperando",
+  "team.registry.new_run": "New Team Run — entrega un SPEC y forma un equipo",
+  "team.registry.open": "Team — abrir el panel del equipo de desarrollo con IA",
   "team.restore.cancel": "Cancelar",
   "team.restore.confirm_discard": "¿Seguro que quieres descartarlo? El Team Run guardado no se puede recuperar",
   "team.restore.discard": "Descartar",

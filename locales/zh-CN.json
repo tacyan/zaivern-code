@@ -4681,6 +4681,8 @@
   "team.phase_status.done": "完成",
   "team.phase_status.running": "进行中",
   "team.phase_status.waiting": "等待",
+  "team.registry.new_run": "New Team Run — 提供 SPEC 并组建团队",
+  "team.registry.open": "Team — 打开 AI 开发团队的组织图",
   "team.restore.cancel": "取消",
   "team.restore.confirm_discard": "确定要丢弃吗？已保存的 Team Run 无法恢复",
   "team.restore.discard": "丢弃",
