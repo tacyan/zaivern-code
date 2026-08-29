@@ -193,6 +193,8 @@ TeamRuntime.workspace
   いまのフォルダと食い違いうる — 実行中は切り替えを断るため
 * 番人は `wiring_tests::実行コンテキストを画面のいまの値で取り直さない` と
   `runtime_tests::起動要求はruntimeのworkspaceを運ぶ`
+* 指示も同じで、**宛先のタスクを運ぶ** (`SendInstruction.task`)。実行側が
+  セッションから引き直すと、間に 1 tick 入っただけで別のタスクを指す
 
 ### Effect には持ち主がいる
 
@@ -234,8 +236,12 @@ Pending (まだ出していない)
 ```
 
 * 記録は `EffectRecord { key, state, at }` で、冪等キーは種類ごとに違う —
-  `start:{agent}` / `instr:{task}:{attempt}:{session}` / `stop:{session}` /
-  `validate:{task}` / `decide:{冪等キー}`。同じキーの二重発行はしない
+  `start:{agent}` / `instr:{task}:{agent}:{attempt}:{配った回数}` / `stop:{session}` /
+  `validate:{実行 ID}` / `decide:{冪等キー}`。同じキーの二重発行はしない
+* **指示の鍵には「配った回数」(`dispatch_seq`) を混ぜる。** 試行回数は
+  失敗のときしか増えないので、同じ担当へ同じ試行回数で配り直すと鍵が
+  一致し、**指示が 1 行も届かないまま `Running`** になる (`Blocked` からの
+  Retry で実際に踏んだ)
 * **復元時に `Dispatched` を「済んだこと」にしない。** `Completed` だけを
   引き継ぎ、`Dispatched` のまま落ちたものは記録が消えるので**撃ち直される**
   (`done_effects` を丸ごと捨てるのではない — 成功したものは残す)
@@ -360,6 +366,17 @@ Zaivern が保証できるのは「何を起動したか」までで、起動し
 * 結果には**実行 ID** (`run_id:task:attempt:generation`) が付く。一致しない
   結果は採らない — 差し戻して配り直した後に古い実行の結果が届いて、
   新しい試行の証跡を上書きするのを防ぐ
+
+### 人が戻せる状態は、必ず配り直せる
+
+`RetryTask` は「その手前で担当を解放済み」を前提にしている。解放し忘れた
+経路を足すと、押しても `Ready` のまま動かない
+(`PreviousHolderNotStopped` で永久に断られる)。
+
+* 戻せる状態は `NeedsUser` / `Failed` / `Blocked` の 3 つ
+* どれも、その手前で `release_after_self_report` を通っていること
+* 番人は `runtime_tests::人が戻せる状態はどれも配り直せる` — **状態が
+  変わっただけでは合格にしない**。指示が実際に飛ぶところまで見る
 
 ### Pause と Stop と Discard
 
