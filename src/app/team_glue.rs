@@ -106,6 +106,11 @@ impl ZaivernApp {
     ///
     /// **一度しか処理しない** ([`launch::take`] が拾うと同時に消す)。
     fn team_take_launch_request(&mut self) {
+        // **毎フレーム `stat` を撃たない。** 画面が動いている間はここが
+        // 60fps で呼ばれる (設計原則 3: アイドル時のコストはゼロ)。
+        if !panel::with_panel(|p| p.launch_poll_due(Instant::now())) {
+            return;
+        }
         let ws = self.agent_cwd();
         let now = crate::features::team::imp::model::now_secs();
         let Some(req) = launch::take(&ws, now) else {

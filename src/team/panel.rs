@@ -32,6 +32,14 @@ use super::view_model::{self, TeamSnapshot};
 /// 64 体ぶんの画面を 60fps で解析すると確実にフレームが落ちる)。
 pub const SCAN_INTERVAL: Duration = Duration::from_millis(400);
 
+/// 起動要求 (`zai team run` の投函) を見に行く間隔。
+///
+/// **毎フレーム `stat` を撃たない。** 画面が動いている間は 60fps で
+/// 呼ばれるので、1 フレームに 1 回のシステムコールでも積み上がる
+/// (設計原則 3: アイドル時のコストはゼロ)。人が `zai team run` を打って
+/// から 1 秒以内に反応すれば、待たされたとは感じない。
+pub const LAUNCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// セッションごとに覚えておく「もう読んだ行」の数。
 pub const SEEN_LINES_CAP: usize = 600;
 
@@ -201,6 +209,8 @@ pub struct TeamPanel {
     seen_set: HashMap<SessionId, HashSet<u64>>,
     /// 次に走査してよい時刻。**`Instant` は永続化しない。**
     next_scan: Option<Instant>,
+    /// 次に起動要求を見に行ってよい時刻。
+    next_launch_poll: Option<Instant>,
     /// 裏で走らせている検証の受け口。
     ///
     /// **UI スレッドでブロッキング I/O をしない**ので、`try_recv` で
@@ -233,6 +243,7 @@ impl Default for TeamPanel {
             seen_order: HashMap::new(),
             seen_set: HashMap::new(),
             next_scan: None,
+            next_launch_poll: None,
             validation_rx: Vec::new(),
         }
     }
@@ -348,6 +359,17 @@ impl TeamPanel {
             Some(t) if now < t => false,
             _ => {
                 self.next_scan = Some(now + SCAN_INTERVAL);
+                true
+            }
+        }
+    }
+
+    /// 起動要求を見に行ってよい時刻か。**毎フレームは撃たない。**
+    pub fn launch_poll_due(&mut self, now: Instant) -> bool {
+        match self.next_launch_poll {
+            Some(t) if now < t => false,
+            _ => {
+                self.next_launch_poll = Some(now + LAUNCH_POLL_INTERVAL);
                 true
             }
         }
@@ -732,6 +754,15 @@ mod tests {
         assert!(p.seen_set.contains_key(&1));
         p.forget_session(1);
         assert!(!p.seen_set.contains_key(&1));
+    }
+
+    #[test]
+    fn 起動要求の確認も間隔を空ける() {
+        let mut p = TeamPanel::default();
+        let t0 = Instant::now();
+        assert!(p.launch_poll_due(t0), "初回は見に行く");
+        assert!(!p.launch_poll_due(t0), "毎フレーム stat を撃たない");
+        assert!(p.launch_poll_due(t0 + LAUNCH_POLL_INTERVAL + Duration::from_millis(1)));
     }
 
     #[test]

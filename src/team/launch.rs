@@ -213,12 +213,44 @@ pub fn take(workspace: &Path, now: u64) -> Option<TeamLaunchRequest> {
 
 // ── 検証コマンドの実行 ───────────────────────────────────────────────
 
+/// **Windows で `.cmd` / `.bat` として配られる実行体。**
+///
+/// `npm` / `yarn` / `pnpm` などは Windows では `npm.cmd` であり、
+/// `Command::new("npm")` は `NotFound` で落ちる (実体が `npm` という名前で
+/// 存在しないため)。**「見つからない」で検証が全部 127 になる**ので、
+/// この一覧に載っているものは `cmd /C` 越しに起こし直す。
+///
+/// **コマンド全体を 1 引数へ押し込まない。** Rust の `Command` は引数ごとに
+/// Windows の規則で引用するので、cmd 側の再解析とずれて失敗する
+/// (CLAUDE.md の既知の罠)。語に分けたまま渡す。
+pub const WINDOWS_SHIM_BINS: &[&str] = &[
+    "npm", "npx", "yarn", "pnpm", "bun", "tsc", "eslint", "prettier", "jest", "vitest", "biome",
+    "just", "gradle", "mvn", "flutter", "composer", "rake", "bundle", "tox",
+];
+
+/// この語は Windows で `cmd /C` 越しに起こす必要があるか (純関数)。
+///
+/// **判定を切り出してあるのは、Windows のビルドが手元で回らない環境でも
+/// 表で固定できるようにするため。** `#[cfg(windows)]` の中に埋めると、
+/// macOS / Linux では 1 度もコンパイルされない (CLAUDE.md の実測)。
+pub fn needs_windows_shim(head: &str) -> bool {
+    let base = head.rsplit(['/', '\\']).next().unwrap_or(head);
+    // 拡張子つきで書かれていたら、そのまま起こせる
+    if base.contains('.') {
+        return false;
+    }
+    WINDOWS_SHIM_BINS.contains(&base)
+}
+
 /// 検証コマンド 1 本を実行する。
 ///
 /// **シェルを挟まない。** 語に分けて実体を直に起こす — `sh -c` を通すと
 /// 「コマンド、引数、cwd を分離して扱う」という約束が崩れる。
 /// 許可リスト ([`super::graph::check_command`]) を通っていないものは
 /// 実行せず、終了コード 126 (実行不可) を返す。
+///
+/// Windows で `.cmd` 配布の実行体だけは `cmd /C` を挟むが、そこでも
+/// **引数は分けたまま**渡す ([`needs_windows_shim`])。
 pub fn run_validation_command(cmd: &str, cwd: &Path) -> super::model::ValidationRun {
     let fail = |code: i32| super::model::ValidationRun {
         command: cmd.to_string(),
@@ -232,7 +264,15 @@ pub fn run_validation_command(cmd: &str, cwd: &Path) -> super::model::Validation
         return fail(126);
     };
     let args: Vec<&str> = words.collect();
-    let out = std::process::Command::new(head)
+
+    let mut command = if cfg!(windows) && needs_windows_shim(head) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(head);
+        c
+    } else {
+        std::process::Command::new(head)
+    };
+    let out = command
         .args(&args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -376,6 +416,19 @@ mod tests {
         assert_eq!(take(&req.workspace_root, req.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(super::super::persistence::team_dir(&req.workspace_root)).ok();
+    }
+
+    #[test]
+    fn windowsで_cmd越しに起こす語を表で固定する() {
+        // **どの OS でも同じ表を検査する。** `#[cfg(windows)]` の中に判定を
+        // 埋めると macOS / Linux では 1 度もコンパイルされず、Windows の CI
+        // まで誰も気付かない (CLAUDE.md の実測)。
+        for yes in ["npm", "yarn", "pnpm", "tsc", "jest", "C:/tools/npm", "bin/npm"] {
+            assert!(needs_windows_shim(yes), "{yes} を素で起こしてしまう");
+        }
+        for no in ["cargo", "go", "python3", "npm.cmd", "npm.exe", "make"] {
+            assert!(!needs_windows_shim(no), "{no} に余計な cmd を挟む");
+        }
     }
 
     #[test]

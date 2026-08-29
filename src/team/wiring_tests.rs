@@ -95,6 +95,10 @@ fn 起動要求は一度だけ処理する() {
         "投函箱から取り出していない (take は取り出すと同時に消す)"
     );
     assert!(
+        body.contains("p.launch_poll_due(Instant::now())"),
+        "毎フレーム投函箱を stat している"
+    );
+    assert!(
         !body.contains("launch::launch_path"),
         "投函ファイルを自分で読んでいる (二重処理の温床)"
     );

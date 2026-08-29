@@ -136,15 +136,37 @@ fn write_atomic(path: &Path, body: &str) -> Result<(), SaveError> {
         stamp
     ));
     std::fs::write(&tmp, body).map_err(|e| SaveError::Io(e.to_string()))?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Windows は宛先が開かれていると rename が失敗する。残骸を消して伝える。
-            let _ = std::fs::remove_file(&tmp);
-            Err(SaveError::Io(e.to_string()))
+    // **Windows では置き換えが一時的に断られる。**
+    //
+    // 宛先を誰かが開いている間 (`zai team stop` が読んでいる最中など) は
+    // `MoveFileEx` が ACCESS_DENIED を返す。1 回で諦めると「いちばん混んで
+    // いるとき = いちばん保存したいとき」にだけ台帳が書けなくなるので、
+    // 短い待ちで数回だけ試す。unix では 1 回目で通るので費用はゼロ。
+    //
+    // **上限を持つ。** 進まないものを待ち続けても人を待たせるだけなので、
+    // 諦めたら理由を返して呼び出し側に見せる。
+    let mut last = None;
+    for attempt in 0..RENAME_RETRIES {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e.to_string());
+                if attempt + 1 < RENAME_RETRIES {
+                    std::thread::sleep(RENAME_BACKOFF * (attempt + 1));
+                }
+            }
         }
     }
+    let _ = std::fs::remove_file(&tmp);
+    Err(SaveError::Io(
+        last.unwrap_or_else(|| "置き換えに失敗しました".to_string()),
+    ))
 }
+
+/// 置き換えを試す回数。
+const RENAME_RETRIES: u32 = 4;
+/// 試行の間隔 (回数に比例して伸ばす)。
+const RENAME_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
 
 fn read_capped(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
