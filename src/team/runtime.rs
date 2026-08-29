@@ -1113,9 +1113,13 @@ impl TeamRuntime {
             TeamAction::RetryTask(id) => {
                 let max = self.run.max_attempts;
                 // **ここで `confirm_stopped` は呼ばない。** Retry が動くのは
-                // `NeedsUser` / `Failed` のときだけで、どちらもその手前で
-                // 担当を解放済み。呼ぶと「人が押した = 停止済み」という
-                // 誤った前提を持ち込むことになる。
+                // `NeedsUser` / `Failed` / `Blocked` のときだけで、**どれも
+                // その手前で担当を解放済み** (`fail_validation` /
+                // `apply_accepted` の Failed・Blocked の枝 /
+                // `note_instruction_balanced` …)。呼ぶと「人が押した =
+                // 停止済み」という誤った前提を持ち込むことになる。
+                // 解放し忘れた経路を足すと、ここが静かに壊れる —
+                // `runtime_tests::人が戻せる状態はどれも配り直せる` が番人。
                 let mut retried = false;
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     // **`Blocked` からも戻せる。** 戻す手が無いと、
@@ -1319,8 +1323,22 @@ impl TeamRuntime {
             self.co.unregister_session(id);
         }
 
+        // 終わったタスクの一覧 (報告されたサブエージェントの表示に使う)。
+        let finished: BTreeSet<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.state.is_terminal())
+            .map(|t| t.id)
+            .collect();
         for a in &mut self.agents {
             let Some(sid) = a.session_id else {
+                // **セッションを持たないもの** (親が報告してきたサブ
+                // エージェント) も、終わったタスクを名乗らせない。
+                // こちらはセッションが無いので上の枝を一度も通らず、
+                // 放っておくと完了後もそのタスクを持ち続ける。
+                if a.current_task.is_some_and(|t| finished.contains(&t)) {
+                    a.current_task = None;
+                }
                 continue;
             };
             match live.get(&sid) {
@@ -1500,6 +1518,11 @@ impl TeamRuntime {
             t.updated_at = now;
             match acc.status {
                 ReportedStatus::Blocked => {
+                    // **前任の保持を解く。** 「進められない」と言った時点で
+                    // 手は離れている。解かないと `PreviousHolderNotStopped`
+                    // で二度と配れず、`RetryTask` を押しても `Ready` のまま
+                    // 動かない (`RetryTask` は解放済みを前提にしている)。
+                    release_after = true;
                     step(t, TeamTaskState::Blocked, &self.rejections);
                     blocked = true;
                 }
@@ -2170,9 +2193,18 @@ impl TeamRuntime {
                 }
                 scheduler::Unassigned::CapsMissing { .. } => {
                     // **黙って毎 tick 断り続けない。** 能力は計画で決まる
-                    // ので、次の tick でも同じ結果になる。人が計画を直すか
-                    // 能力を足すまで進まないことを、そのまま見せる。
-                    self.raise(
+                    // ので、次の tick でも同じ結果になる。
+                    //
+                    // **`Ready` のまま判断だけ出すと、その判断の `retry` が
+                    // 効かない** (`RetryTask` は `Ready` を動かさない) うえ、
+                    // `reject` で消しても次の tick に同じものが出る。人へ
+                    // 渡す状態 (`NeedsUser`) まで動かして手を止める。
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == subject) {
+                        step(t, TeamTaskState::NeedsUser, &self.rejections);
+                    }
+                    // 鍵は `ReviewerWouldBeAuthor` と分ける (同じ種類・同じ
+                    // タスクなので、共用すると片方の理由が黙って消える)。
+                    self.make_decision(
                         DecisionKind::NoCandidate,
                         Some(subject),
                         None,
@@ -2180,6 +2212,9 @@ impl TeamRuntime {
                         "計画の必要能力を見直すか、その能力を持つエージェントを足してください"
                             .into(),
                         vec!["retry".into(), "reject".into()],
+                        format!("caps-missing:{subject}"),
+                        Vec::new(),
+                        None,
                     );
                 }
                 // 候補が居ないだけなら黙る (**次の tick で解決しうる** —
@@ -2229,6 +2264,10 @@ impl TeamRuntime {
                         t.reported_validation.clear();
                         t.assigned_agent = Some(a.agent.clone());
                         t.assigned_session = Some(session);
+                        // **配るたびに進める。** 指示の鍵に混ざるので、
+                        // 同じ担当へ同じ試行回数で配り直しても、指示は
+                        // ちゃんと新しい鍵で出る。
+                        t.dispatch_seq = t.dispatch_seq.saturating_add(1);
                         step(t, TeamTaskState::Assigned, &self.rejections);
                         step(t, TeamTaskState::Running, &self.rejections);
                     }
@@ -2244,7 +2283,10 @@ impl TeamRuntime {
                         // **試行回数まで含めて鍵にする。** これが無いと
                         // 差し戻し後の再指示が「同じ指示」として抑止される。
                         task: a.task,
-                        key: format!("instr:{}:{}:{}", a.task, a.agent, task.attempts),
+                        key: format!(
+                            "instr:{}:{}:{}:{}",
+                            a.task, a.agent, task.attempts, task.dispatch_seq
+                        ),
                     });
                     self.dirty = true;
                 }
@@ -2473,6 +2515,7 @@ impl TeamRuntime {
             review: ReviewState::default(),
             context: Vec::new(),
             reported_validation: Vec::new(),
+            dispatch_seq: 0,
             reassign_pending: false,
             last_summary: String::new(),
             changed_files: Vec::new(),

@@ -182,6 +182,12 @@ pub enum RestorePrompt {
 pub const WATCHDOG_SLACK_SECS: u64 = 60;
 
 pub struct ValidationJob {
+    /// **持ち主。** 戻ってきた結果を、いまの Run のものだけに限る。
+    ///
+    /// 実行 ID にも `run_id` が入っているので二重の守りだが、外向きの
+    /// 4 つの口と同じ形にしておく — 片方だけ文字列の一致に頼っていると、
+    /// 書式を変えた日に静かに守りが消える。
+    pub owner: RunOwner,
     pub task: TaskId,
     /// `run_id:task:attempt:generation`。結果の突き合わせに使う。
     pub execution: String,
@@ -273,6 +279,11 @@ pub struct TeamPanel {
     pending_instructions: Vec<(RunOwner, String, (TaskId, SessionId, String))>,
     /// 別の Run のものとして捨てた Effect の数 (診断とテストが見る)。
     dropped_effects: usize,
+    /// **テスト専用**: 「実行中だから断る」を黙らせる。
+    ///
+    /// 断りの有無と**別に**、持ち主の照合が効くことを確かめるため。
+    #[cfg(test)]
+    bypass_busy: bool,
     /// 保存が要るか。
     needs_save: bool,
     workspace: PathBuf,
@@ -329,6 +340,8 @@ impl Default for TeamPanel {
             next_launch_poll: None,
             validation_jobs: Vec::new(),
             dropped_effects: 0,
+            #[cfg(test)]
+            bypass_busy: false,
         }
     }
 }
@@ -375,15 +388,21 @@ impl TeamPanel {
     /// * 走っている検証
     /// * まだ実行していない Effect
     pub fn live_work(&self) -> LiveWork {
-        let Some(rt) = self.runtime.as_ref() else {
-            return LiveWork::default();
-        };
         LiveWork {
-            agents: rt
-                .agents()
-                .iter()
-                .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
-                .count(),
+            // エージェントは Runtime が知っている。
+            agents: self
+                .runtime
+                .as_ref()
+                .map(|rt| {
+                    rt.agents()
+                        .iter()
+                        .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
+                        .count()
+                })
+                .unwrap_or(0),
+            // **検証と未実行の仕事は画面側の持ち物。** Runtime が無い
+            // ときに 0 と答えると、`discard_run` の直後 (Runtime は捨てた
+            // が子プロセスはまだ畳んでいる) に「空いている」と嘘をつく。
             validations: self.validation_jobs.len(),
             effects: self.pending_launches.len()
                 + self.pending_instructions.len()
@@ -459,6 +478,10 @@ impl TeamPanel {
                 .collect::<Vec<_>>()
                 .join("\n"));
         }
+        // **動いているチームを別の計画で潰さない。** 置き換えると、走って
+        // いる検証と起動済みのエージェントの面倒を見る相手が消える
+        // (結果は `run_id` 違いで捨てられ、プロセスだけが残る)。
+        self.refuse_if_busy()?;
         let ws = self.workspace.clone();
         let mut rt = TeamRuntime::from_plan(plan, ws, opts);
         let t = title_override.trim();
@@ -471,6 +494,32 @@ impl TeamPanel {
         self.dirty = true;
         self.needs_save = true;
         Ok(())
+    }
+
+    /// 面倒を見ているものがあるなら断る (理由をそのまま返す)。
+    fn refuse_if_busy(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.bypass_busy {
+            return Ok(());
+        }
+        let live = self.live_work();
+        if !live.is_busy() {
+            return Ok(());
+        }
+        let why = live.why_blocked();
+        self.notice = why.clone();
+        Err(why)
+    }
+
+    /// **テスト専用**: 実行中でも Run を作り直せるようにする。
+    ///
+    /// 「前の Run の仕事が新しい Run で実行されない」ことは、**断りの有無と
+    /// 別に**成り立っていなければならない。断りを外しても持ち主の照合が
+    /// 効くことを確かめられるように、検査だけを黙らせる口を残す
+    /// (Runtime を建てるのは `plan_with` の 1 か所のまま)。
+    #[cfg(test)]
+    pub fn allow_replace_run_for_test(&mut self) {
+        self.bypass_busy = true;
     }
 
     /// 既定のプリセットで計画する (CLI 経由と、表題を SPEC から起こす場合)。
@@ -895,6 +944,13 @@ impl TeamPanel {
                 done.push((job.execution.clone(), job.task, runs));
                 continue;
             }
+            // **別の Run のものは採らない。** 発行と同じ形で持ち主を見る。
+            if self.owner().as_ref() != Some(&job.owner) {
+                job.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.dropped_effects = self.dropped_effects.saturating_add(1);
+                continue;
+            }
             match job.rx.try_recv() {
                 Ok((execution, task, runs)) => done.push((execution, task, runs)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => still.push(job),
@@ -1119,6 +1175,7 @@ mod tests {
         let _ = p.take_launches();
         let (_tx, rx) = std::sync::mpsc::channel();
         p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
             task: 1,
             execution: "x".into(),
             commands: vec!["cargo test a".into()],
@@ -1153,6 +1210,74 @@ mod tests {
     }
 
     #[test]
+    fn 別のrunの検証結果は受け取らない() {
+        // 外向きの 4 つの口と同じ形で、**戻ってくる側にも持ち主を見る**。
+        // 実行 ID にも `run_id` は入っているが、そちらは文字列の書式に
+        // 頼った守りなので、構造でも止める。
+        let dir = ws("owner-validation");
+        let mut p = started_panel(&dir);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = super::super::launch::new_cancel_flag();
+        p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
+            task: 1,
+            execution: "old".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+        // Run を作り直す (検査だけ黙らせる — 本番は `plan` が断る)。
+        p.allow_replace_run_for_test();
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        // 前の Run の worker が結果を返してくる。
+        tx.send(("old".into(), 1, vec![ValidationRun::passed("cargo test a")]))
+            .unwrap();
+        p.collect_validations();
+        assert_eq!(p.running_validations(), 0, "前の Run のジョブを抱えたまま");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "手放すのに止めていない (プロセスが残る)"
+        );
+        let t = p
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.task(1))
+            .expect("タスク")
+            .clone();
+        assert!(
+            t.validation.runs.is_empty(),
+            "別の Run の実測を採った: {:?}",
+            t.validation.runs
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 実行中のrunを別の計画で潰さない() {
+        // 置き換えると、走っている検証と起動済みのエージェントの面倒を
+        // 見る相手が消える (結果は `run_id` 違いで捨てられ、プロセスだけが
+        // 残る)。同じ workspace なので `attach_workspace` では守れない。
+        let dir = ws("replace-busy");
+        let mut p = started_panel(&dir);
+        assert!(p.live_work().is_busy());
+        let before = p.owner().expect("持ち主");
+        let err = p
+            .plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect_err("実行中なのに作り直せてしまった");
+        assert!(!err.trim().is_empty(), "断った理由が空");
+        assert_eq!(p.owner().as_ref(), Some(&before), "Run が入れ替わった");
+        // 片付ければ作り直せる (永久に作れないわけではない)。
+        let _ = p.take_launches();
+        assert!(!p.live_work().is_busy());
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("片付けたら作り直せるべき");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn 別のrunのeffectは実行させない() {
         // 切り替えを断る仕組みだけに頼らない。**持ち主が違う Effect は
         // 渡さない**という構造の検査 (キューが空になる偶然に頼らない)。
@@ -1162,8 +1287,13 @@ mod tests {
         let mut p = started_panel(&a);
         assert!(!p.pending_launches.is_empty());
         // 別の Run へ差し替える (workspace ごと作り直す = 切り替えと同じ状況)。
+        // 断りを外しても**持ち主の照合が効く**ことを見たいので、検査だけを
+        // 黙らせて Run を作り直す (本番は `plan` が断る)。
+        let stale = p.pending_launches.clone();
         p.workspace = b.clone();
+        p.allow_replace_run_for_test();
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.pending_launches = stale;
         assert!(
             p.take_launches().is_empty(),
             "前の Run の起動要求を新しい Run で実行しようとした"
@@ -1196,8 +1326,19 @@ mod tests {
                 timeout_secs: 600,
             },
         ));
+        let stale = (
+            p.pending_launches.clone(),
+            p.pending_instructions.clone(),
+            p.pending_stops.clone(),
+            p.pending_validations.clone(),
+        );
         p.workspace = b.clone();
+        p.allow_replace_run_for_test();
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.pending_launches = stale.0;
+        p.pending_instructions = stale.1;
+        p.pending_stops = stale.2;
+        p.pending_validations = stale.3;
         assert!(p.take_launches().is_empty(), "起動が漏れた");
         assert!(p.take_instructions().is_empty(), "指示が漏れた");
         assert!(p.take_stops().is_empty(), "停止が漏れた");
@@ -1213,6 +1354,7 @@ mod tests {
         let cancel = super::super::launch::new_cancel_flag();
         let (_tx, rx) = std::sync::mpsc::channel();
         p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
             task: 1,
             execution: "x".into(),
             commands: vec!["cargo test a".into()],
@@ -1228,6 +1370,61 @@ mod tests {
             "破棄したのに検証を止めていない (プロセスが残る)"
         );
         assert!(!p.has_run());
+        // **Runtime を捨てても、まだ畳んでいないものは「面倒を見ている」。**
+        // ここで 0 と答えると、直後の workspace 切り替えが通ってしまい、
+        // 走っているプロセスの管理を手放す。
+        assert_eq!(p.live_work().validations, 1, "破棄した瞬間に空と答えた");
+        assert!(p.live_work().is_busy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **実物のプロセスを 1 つ走らせて**、閉じたときに落ちることを見る。
+    ///
+    /// worker スレッドは**わざと置かない**。アプリを閉じる瞬間は、札を見る
+    /// はずの worker ごと消える — そこで誰が木を落とすのか、が要点なので、
+    /// worker が生きていると検査が空回りする (実際に、`kill_tree` を外して
+    /// も worker が自分で落としてしまい緑のままだった)。
+    #[cfg(unix)]
+    #[test]
+    fn 閉じると実際に検証プロセスが落ちる() {
+        use std::os::unix::process::CommandExt;
+        let dir = ws("shutdown-kill");
+        let mut p = started_panel(&dir);
+        let marker = dir.join("still-alive");
+        // 落とすのは `stop_all_validations_now` の仕事なので、こちらでは
+        // `wait` しない (clippy はそれを疑うので、意図を書いて許す)。
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 1; : > {}", marker.display()))
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("子を起こせる");
+        let pid = super::super::launch::new_pid_slot();
+        pid.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
+            task: 1,
+            execution: "x".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: super::super::launch::new_cancel_flag(),
+            pid,
+            rx,
+        });
+        assert_eq!(p.stop_all_validations_now(), 1, "落とした件数が合わない");
+        // 生き残っていれば 1 秒後にファイルを作る。
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        assert!(
+            !marker.exists(),
+            "閉じたのに検証プロセスが生き残った: {}",
+            marker.display()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1241,6 +1438,7 @@ mod tests {
         let cancel = super::super::launch::new_cancel_flag();
         let (_tx, rx) = std::sync::mpsc::channel();
         p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
             task: 1,
             execution: "x".into(),
             commands: vec!["cargo test a".into()],
@@ -1310,6 +1508,7 @@ mod tests {
     ) -> std::sync::mpsc::Sender<(String, TaskId, Vec<ValidationRun>)> {
         let (tx, rx) = std::sync::mpsc::channel();
         p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
             task,
             execution: execution.to_string(),
             commands: vec!["cargo test a".into()],
@@ -1371,6 +1570,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = super::super::launch::new_cancel_flag();
         p.watch_validation(ValidationJob {
+            owner: p.owner().expect("Run がある"),
             task: 1,
             execution: exec,
             commands: vec!["cargo test a".into()],

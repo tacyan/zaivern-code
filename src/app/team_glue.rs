@@ -126,9 +126,9 @@ impl ZaivernApp {
         // **実行中の Run を別のフォルダの要求で潰さない。** 投函は拾うと
         // 消えるので、拾ってから断ると要求ごと失われる (利用者は
         // `zai team run` をもう一度打つしかない)。TTL の間は置いておく。
-        let busy_elsewhere =
-            panel::with_panel(|p| p.live_work().is_busy() && p.workspace() != ws.as_path());
-        if busy_elsewhere {
+        // **同じフォルダでも拾わない。** 拾ったあと `plan` が断るので、
+        // 要求だけが消えて何も起きない (利用者はもう一度打つしかない)。
+        if panel::with_panel(|p| p.live_work().is_busy()) {
             return;
         }
         let now = crate::features::team::imp::model::now_secs();
@@ -353,30 +353,23 @@ impl ZaivernApp {
         let spawned = std::thread::Builder::new()
             .name(format!("zai-team-validate-{task}"))
             .spawn(move || {
-                let mut runs: Vec<ValidationRun> = Vec::new();
-                for c in &cmds {
-                    let r = launch::run_validation_command(
-                        c,
-                        &cwd,
-                        timeout,
-                        &worker_cancel,
-                        &worker_pid,
-                    );
-                    let stop = !r.ok();
-                    runs.push(r);
-                    // **1 本落ちたら残りは走らせない。** 落ちた後のコマンドを
-                    // 走らせても判定は変わらず、時間と資源を使うだけ。
-                    if stop {
-                        break;
-                    }
-                }
+                // 並べ方の決まりごと (どこで打ち切るか) は実行器が持つ。
+                let runs =
+                    launch::run_validation_list(&cmds, &cwd, timeout, &worker_cancel, &worker_pid);
                 let _ = tx.send((worker_exec, task, runs));
             });
         match spawned {
             Ok(_) => panel::with_panel(|p| {
                 // 走らせ始めたので受け取った旨を返す。実測の結果は
                 // `collect_validations` が別途 Runtime へ戻す。
+                let Some(owner) = p.owner() else {
+                    // Run が入れ替わった。**渡さない** (走らせ始めたものは
+                    // 札が立っているので、次の刻みで自分から畳む)。
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                };
                 p.watch_validation(panel::ValidationJob {
+                    owner,
                     task,
                     execution: execution.clone(),
                     commands: v.commands.clone(),

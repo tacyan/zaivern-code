@@ -32,6 +32,7 @@ pub fn task(id: u64, key: &str, deps: &[u64]) -> TeamTask {
         review: Default::default(),
         context: Vec::new(),
         reported_validation: Vec::new(),
+        dispatch_seq: 0,
         reassign_pending: false,
         last_summary: String::new(),
         changed_files: Vec::new(),

@@ -2022,6 +2022,70 @@ fn 検証の世代を進める場所は一つだけ() {
 //  実行コンテキストは、生成地点から実行地点まで運ぶ
 // ══════════════════════════════════════════════════════════════════════
 
+/// `tid` が配り直されて、指示が実際に飛ぶまで回す。
+///
+/// **状態が変わっただけでは足りない。** 前任の保持が解けていないと
+/// `PreviousHolderNotStopped` で永久に配れず、冪等キーが完了のままだと
+/// 指示が届かない — どちらも「Retry を押したのに何も起きない」になる。
+fn runs_again(rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, from: u64) -> bool {
+    let mut now = from;
+    let mut sent = false;
+    while now < from + 10 && !sent {
+        let eff = idle_tick(rt, now, sids);
+        sent = eff
+            .iter()
+            .any(|e| matches!(e, TeamEffect::SendInstruction { task, .. } if *task == tid));
+        now += 1;
+    }
+    sent && rt.task(tid).is_some_and(|t| t.assigned_session.is_some())
+}
+
+#[test]
+fn 人が戻せる状態はどれも配り直せる() {
+    // **`RetryTask` は「その手前で担当を解放済み」を前提にしている。**
+    // 解放し忘れた経路を足すと、押しても `Ready` のまま動かなくなる
+    // (状態だけ見るテストでは素通りする)。3 つの入口を全部通す。
+    let report = |rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, status: &str, now: u64| {
+        let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap().0;
+        let sid = rt.task(tid).unwrap().assigned_session.unwrap();
+        let block = format!(
+            "{open}\n{{\"task_id\":{tid},\"agent_id\":\"{agent}\",\"status\":\"{status}\",\
+             \"summary\":\"だめでした\",\"changed_files\":[],\"validation\":[],\
+             \"blockers\":[\"詰まりました\"]}}\n{close}",
+            open = rp::RESULT_OPEN,
+            close = rp::RESULT_CLOSE
+        );
+        tick_text(rt, now, sids, sid, &block);
+    };
+
+    // 1) エージェントが「進められない」と報告した
+    let (mut rt, sids, tid) = to_assigned();
+    report(&mut rt, &sids, tid, "blocked", 12);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Blocked);
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert!(
+        runs_again(&mut rt, &sids, tid, 13),
+        "blocked から戻せない: state={:?} session={:?} co={:?}",
+        rt.task(tid).unwrap().state,
+        rt.task(tid).unwrap().assigned_session,
+        rt.task(tid).unwrap().coordinator_task
+    );
+
+    // 2) エージェントが「失敗した」と報告した
+    let (mut rt, sids, tid) = to_assigned();
+    report(&mut rt, &sids, tid, "failed", 12);
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert!(runs_again(&mut rt, &sids, tid, 13), "failed から戻せない");
+
+    // 3) 実測が落ちて上限まで行った (NeedsUser)
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    note_outcome(&mut rt, tid, 1, ValidationOutcome::Failed);
+    rt.set_state_for_test(tid, TeamTaskState::NeedsUser);
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert!(runs_again(&mut rt, &sids, tid, 20), "needs_user から戻せない");
+}
+
 #[test]
 fn 進められないという報告は行き止まりにしない() {
     // `Blocked` から自動で出る経路は無い (依存が解けるのは `Pending` だけ)。

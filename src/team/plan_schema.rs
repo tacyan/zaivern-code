@@ -269,6 +269,7 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
             review: Default::default(),
             context: Vec::new(),
             reported_validation: Vec::new(),
+            dispatch_seq: 0,
             reassign_pending: false,
             last_summary: String::new(),
             changed_files: Vec::new(),

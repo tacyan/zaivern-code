@@ -689,6 +689,14 @@ pub struct TeamTask {
     /// 捨てずに残すのは、**申告と実測が食い違ったときに次の担当へ渡す**ため。
     #[serde(default)]
     pub reported_validation: Vec<ValidationRun>,
+    /// **配った回数。** 配るたびに 1 つ進む。
+    ///
+    /// 指示の冪等キーに混ぜる。混ぜないと「同じ担当へ・同じ試行回数で」
+    /// 配り直したときに鍵が一致し、**指示が 1 行も届かないまま `Running`**
+    /// になる (`Blocked` からの Retry で実際に踏んだ)。試行回数は失敗の
+    /// ときしか増えないので、これとは別物。
+    #[serde(default)]
+    pub dispatch_seq: u32,
     /// **旧担当の停止を待っている** (人が Reassign を押した)。
     ///
     /// 停止承認 → `StopAgent` → セッション消滅の観測、が済むまで担当を

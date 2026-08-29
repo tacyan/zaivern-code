@@ -621,27 +621,25 @@ fn resolve(ws: &Path, spec: &str) -> PathBuf {
     }
 }
 
-/// **その workspace を開いている Zaivern が居るか。**
+/// **置き場を書き換えてよいか。** 書けないなら理由を返す。
 ///
-/// 居るなら、置き場を書き換えても記憶から上書きされる。書いてから
-/// 「できました」と言わないために、先に断る理由を返す。
-/// 戻りが `None` なら CLI が権限を持つ。
-fn gui_owns(ws: &Path) -> Option<String> {
+/// GUI は Runtime を記憶に持っていて、次の保存で置き場を丸ごと書き戻す。
+/// だから画面が開いているあいだに CLI が書いても消える — 書いてから
+/// 「できました」と言うのは嘘になる。
+///
+/// **どの workspace を見ているかは当てにしない。** `instance.json` に載る
+/// のは GUI の「いまのフォルダ」で、Team が面倒を見ている workspace とは
+/// **ずれることがある** (実行中は切り替えを断るため、まさにずれる)。
+/// 比べようとすると、ずれているときに「別物だから書いてよい」と誤って
+/// 判断する。生きているインスタンスが 1 つでもあれば断る (fail-closed)。
+fn gui_owns(_ws: &Path) -> Option<String> {
     let inst = crate::cli::read_instance_file()?;
-    let same = std::fs::canonicalize(&inst.workspace)
-        .ok()
-        .zip(std::fs::canonicalize(ws).ok())
-        .map(|(a, b)| a == b)
-        .unwrap_or(false);
-    if !same {
-        return None;
-    }
-    Some(
-        "このワークスペースを開いている Zaivern が実行中です。\n\
-         Team 画面から操作してください (記憶が置き場を上書きするため、\n\
-         CLI から書き換えても反映されません)。"
-            .to_string(),
-    )
+    Some(format!(
+        "Zaivern が実行中です ({})。\n\
+         Team 画面から操作してください — 記憶が置き場を上書きするので、\n\
+         CLI から書き換えても反映されません。",
+        inst.workspace
+    ))
 }
 
 #[cfg(test)]

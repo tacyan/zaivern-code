@@ -373,6 +373,34 @@ pub fn run_validation_command(
     ValidationRun::new(cmd, out.0, out.1)
 }
 
+/// **検証コマンドの並びを順に実行する。**
+///
+/// 並べ方の決まりごと (どこで打ち切るか) は実行器の側に置く — GUI の
+/// 橋渡し層に書くと、テストから 1 度も通らない場所に判断が住むことになる。
+///
+/// * 1 本落ちたら残りは走らせない (判定は変わらず、時間と資源を使うだけ)
+/// * **1 本ごとに停止の札を見る。** 見ないと、止めた後に始まった次の
+///   コマンドが「誰も知らない子」として走り出す (自分のプロセスグループ
+///   を持つので、アプリが終わっても死なない)
+pub fn run_validation_list(
+    commands: &[String],
+    cwd: &Path,
+    timeout: std::time::Duration,
+    cancel: &CancelFlag,
+    pid_slot: &PidSlot,
+) -> Vec<ValidationRun> {
+    let mut runs = Vec::with_capacity(commands.len());
+    for c in commands {
+        let r = run_validation_command(c, cwd, timeout, cancel, pid_slot);
+        let stop = !r.ok();
+        runs.push(r);
+        if stop {
+            break;
+        }
+    }
+    runs
+}
+
 /// 語に分けた 1 本を実行する (終了コードと終わり方を返す)。
 ///
 /// 分けてあるのは**時間切れと停止をテストするため**。許可リストに載っている
@@ -409,6 +437,12 @@ pub fn run_words(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    // **起こす前に札を見る。** 見ないと、停止を頼まれた後に始まった
+    // コマンドが「誰も知らない子」として走り出す (自分のプロセス
+    // グループを持つので、アプリが終わっても死なない)。
+    if cancel.load(Ordering::Relaxed) {
+        return (130, ValidationOutcome::Cancelled);
+    }
     // 127 = コマンドが見つからない (シェルの慣習に合わせる)
     let Ok(mut child) = command.spawn() else {
         return (127, ValidationOutcome::SpawnFailed);
@@ -421,9 +455,19 @@ pub fn run_words(
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(st)) => return (st.code().unwrap_or(1), from_status(st)),
+            // **終わったと分かった瞬間に PID を伏せる。** 回収済みの PID へ
+            // 撃つと、OS が同じ番号を別のプロセスへ再利用していたときに
+            // 巻き添えにする (CLAUDE.md の「終了済みへ kill を撃たない」)。
+            // `PidGuard` は関数を抜けるときにも伏せるが、こちらのほうが早い。
+            Ok(Some(st)) => {
+                pid_slot.store(0, Ordering::Relaxed);
+                return (st.code().unwrap_or(1), from_status(st));
+            }
             // 待っている相手が居ない = 取りこぼし。待ち続けない。
-            Err(_) => return (1, ValidationOutcome::RunnerDisconnected),
+            Err(_) => {
+                pid_slot.store(0, Ordering::Relaxed);
+                return (1, ValidationOutcome::RunnerDisconnected);
+            }
             Ok(None) => {}
         }
         let stop = if cancel.load(Ordering::Relaxed) {
@@ -439,6 +483,7 @@ pub fn run_words(
             // プロセス管理を作らない)。
             crate::procx::kill_tree(pid);
             let _ = child.wait();
+            pid_slot.store(0, Ordering::Relaxed);
             return (if why == ValidationOutcome::TimedOut { 124 } else { 130 }, why);
         }
         std::thread::sleep(POLL);
@@ -829,6 +874,86 @@ mod tests {
             "打ち切りに時間がかかりすぎ: {:?}",
             start.elapsed()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 既に止まっているなら起こさない() {
+        // **起こす前に札を見る。** 見ないと、停止を頼まれた後に始まった
+        // コマンドが「誰も知らない子」として走り出す (自分のプロセス
+        // グループを持つので、アプリが終わっても死なない)。
+        let dir = ws("exec-precancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let cancel = new_cancel_flag();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // **痕跡の残るコマンドを使う。** 起こしてから札を見て畳んでも
+        // 戻り値は同じ `Cancelled` になるので、戻り値だけでは
+        // 「起こさなかった」ことを確かめられない。
+        let touch = format!(": > {}", marker.display());
+        let win = format!("type nul > {}", marker.display());
+        let (head, args): (&str, Vec<&str>) = if cfg!(windows) {
+            ("cmd", vec!["/C", win.as_str()])
+        } else {
+            ("sh", vec!["-c", touch.as_str()])
+        };
+        let (code, out) = run_words(
+            head,
+            &args,
+            &dir,
+            std::time::Duration::from_secs(30),
+            &cancel,
+            &new_pid_slot(),
+        );
+        assert_eq!(out, ValidationOutcome::Cancelled, "止まっているのに起こした");
+        assert_eq!(code, 130);
+        assert!(
+            !marker.exists(),
+            "止まっているのにコマンドが走った: {}",
+            marker.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 並びは落ちたところで止める() {
+        // 落ちた後のコマンドを走らせても判定は変わらず、時間と資源を
+        // 使うだけ。**打ち切りの決まりごとは実行器が持つ** (GUI の橋渡し
+        // 層に置くと、テストから 1 度も通らない場所に判断が住む)。
+        let dir = ws("exec-list-stop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = run_validation_list(
+            &[
+                "rustc --zzz-not-a-real-flag".to_string(),
+                "cargo --version".to_string(),
+            ],
+            &dir,
+            std::time::Duration::from_secs(60),
+            &new_cancel_flag(),
+            &new_pid_slot(),
+        );
+        assert_eq!(runs.len(), 1, "落ちたのに次を走らせた: {runs:?}");
+        assert!(!runs[0].ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 止まっているなら並びを一本も走らせない() {
+        // 停止のあとに始まったコマンドは「誰も知らない子」になる
+        // (自分のプロセスグループを持つので、アプリが終わっても死なない)。
+        let dir = ws("exec-list-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cancel = new_cancel_flag();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let runs = run_validation_list(
+            &["cargo --version".to_string(), "cargo --version".to_string()],
+            &dir,
+            std::time::Duration::from_secs(60),
+            &cancel,
+            &new_pid_slot(),
+        );
+        assert_eq!(runs.len(), 1, "止まっているのに何本も走らせた: {runs:?}");
+        assert_eq!(runs[0].outcome(), ValidationOutcome::Cancelled);
         std::fs::remove_dir_all(&dir).ok();
     }
 
