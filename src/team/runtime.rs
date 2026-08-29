@@ -123,6 +123,10 @@ pub struct ValidationSpec {
 pub enum TeamEffect {
     StartAgent(AgentLaunchSpec),
     SendInstruction {
+        /// **宛先のタスク。** 実行側が結果を戻すときに、セッションから
+        /// 引き直させない (引き直すと「いまそのセッションが持っている
+        /// タスク」になり、間に 1 tick 入っただけで別物を指す)。
+        task: TaskId,
         session: SessionId,
         text: String,
         /// 冪等キー。同じキーの指示は二度と出ない。
@@ -560,6 +564,14 @@ impl TeamRuntime {
         }
     }
 
+    /// テスト用: 必要能力を差し替える。
+    #[cfg(test)]
+    pub fn set_required_caps_for_test(&mut self, task: TaskId, caps: &[&str]) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.required_caps = caps.iter().map(|s| s.to_string()).collect();
+        }
+    }
+
     /// テスト用: 検証コマンドを差し替える。
     #[cfg(test)]
     pub fn set_validation_commands_for_test(&mut self, task: TaskId, cmds: &[&str]) {
@@ -649,6 +661,42 @@ impl TeamRuntime {
             a.last_activity_at = now_secs();
             a.state = AgentWorkState::Idle;
         }
+        self.dirty = true;
+    }
+
+    /// **指示を出せなかった** (既存のコスト上限などが止めた)。
+    ///
+    /// 再送を続けても同じ理由で止まるだけなので、**撃ち直さずに人へ上げる**。
+    /// そのまま `ack_failed` を返すと、毎 tick 送り直して毎 tick 同じ理由を
+    /// 出す (「操作が黙って無視される」の逆で、うるさいだけで前に進まない)。
+    ///
+    /// 上限を上げる・設定を戻す、といった手当てをしたら Retry で戻せる。
+    pub fn note_instruction_blocked(&mut self, task: TaskId, why: &str) {
+        if self.task(task).is_none() {
+            return;
+        }
+        // **前任の保持を解く。** 解かないと `PreviousHolderNotStopped` で
+        // 二度と配れず、人が Retry を押しても `Ready` のまま動かない
+        // (`RetryTask` は「その手前で解放済み」を前提にしている)。
+        // 指示は 1 行も届いていないので、担当は何も掴んでいない。
+        self.release_after_self_report(task);
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.context
+                .push(clamp_text(&format!("指示を送れませんでした: {why}")));
+            t.context = clamp_list(std::mem::take(&mut t.context));
+            t.assigned_agent = None;
+            t.assigned_session = None;
+            step(t, TeamTaskState::NeedsUser, &self.rejections);
+        }
+        self.raise(
+            DecisionKind::CostLimit,
+            Some(task),
+            None,
+            format!("#{task} へ指示を送れません: {why}"),
+            "上限を上げるか設定を戻してから、Retry で再開してください".into(),
+            vec!["retry".into(), "reject".into()],
+        );
+        self.drain_rejections();
         self.dirty = true;
     }
 
@@ -1070,7 +1118,12 @@ impl TeamRuntime {
                 // 誤った前提を持ち込むことになる。
                 let mut retried = false;
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                    if t.state == TeamTaskState::NeedsUser || t.state == TeamTaskState::Failed {
+                    // **`Blocked` からも戻せる。** 戻す手が無いと、
+                    // 「進められない」と報告したタスクが永久に残る。
+                    if matches!(
+                        t.state,
+                        TeamTaskState::NeedsUser | TeamTaskState::Failed | TeamTaskState::Blocked
+                    ) {
                         // 人が回すときは試行回数を 1 つ戻す (無限には回さない)。
                         t.attempts = t.attempts.min(max.saturating_sub(1));
                         // **`NeedsUser` から出られるのは人の操作だけ**なので、
@@ -1296,6 +1349,12 @@ impl TeamRuntime {
                     // (前任者の停止確認は下の release_dead が既存側へ通す)。
                     a.session_id = None;
                     a.state = AgentWorkState::Exited;
+                    // **画面に「まだ担当している」を残さない。** ここを
+                    // 残すと、消えたエージェントのカードが担当タスクを
+                    // 名乗り続け、Inspector が効かない Retry / Reassign を
+                    // 出す (`release_dead` が担当を外したあとも消えない —
+                    // 次の tick からは上の枝を通らないため)。
+                    a.current_task = None;
                 }
             }
         }
@@ -1431,6 +1490,8 @@ impl TeamRuntime {
         let mut release_after = false;
         // 完了報告を受けたら、新しい検証回を始める (下で世代を 1 つ進める)。
         let mut enter_validation = false;
+        // 「進められない」と言われたら、**人へ渡す**。
+        let mut blocked = false;
 
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
@@ -1440,6 +1501,7 @@ impl TeamRuntime {
             match acc.status {
                 ReportedStatus::Blocked => {
                     step(t, TeamTaskState::Blocked, &self.rejections);
+                    blocked = true;
                 }
                 ReportedStatus::Failed => {
                     release_after = true;
@@ -1474,6 +1536,31 @@ impl TeamRuntime {
             // **新しい検証回。** 世代が 1 つ進むので、前の回の承認は
             // 当たらない (`begin_validation_round`)。
             self.begin_validation_round(acc.task_id);
+        }
+        if blocked {
+            // **`Blocked` は行き止まりにしない。** 自動で `Blocked` から
+            // 出る経路は無い (依存が解けるのは `Pending` だけ) ので、
+            // 判断を出さないとそのタスクは永久に止まったまま、誰も
+            // 気付かない。人が Retry で戻せることも下の `RetryTask` で
+            // 効くようにしてある。
+            let why = self
+                .task(acc.task_id)
+                .map(|t| {
+                    if t.blockers.is_empty() {
+                        t.last_summary.clone()
+                    } else {
+                        t.blockers.join(", ")
+                    }
+                })
+                .unwrap_or_default();
+            self.raise(
+                DecisionKind::SpecConflict,
+                Some(acc.task_id),
+                Some(agent.clone()),
+                format!("#{} が進められないと報告しました: {why}", acc.task_id),
+                "詰まりを解いてから Retry してください".into(),
+                vec!["retry".into(), "reject".into()],
+            );
         }
 
         // **ここでは先へ進めない。** 完了報告が意味するのは「実装が終わったと
@@ -2081,7 +2168,23 @@ impl TeamRuntime {
                         vec!["retry".into(), "reject".into()],
                     );
                 }
-                _ => {}
+                scheduler::Unassigned::CapsMissing { .. } => {
+                    // **黙って毎 tick 断り続けない。** 能力は計画で決まる
+                    // ので、次の tick でも同じ結果になる。人が計画を直すか
+                    // 能力を足すまで進まないことを、そのまま見せる。
+                    self.raise(
+                        DecisionKind::NoCandidate,
+                        Some(subject),
+                        None,
+                        u.detail(),
+                        "計画の必要能力を見直すか、その能力を持つエージェントを足してください"
+                            .into(),
+                        vec!["retry".into(), "reject".into()],
+                    );
+                }
+                // 候補が居ないだけなら黙る (**次の tick で解決しうる** —
+                // ほかのタスクが終われば空きが出る)。
+                scheduler::Unassigned::NoCandidate(_) => {}
             }
         }
 
@@ -2140,6 +2243,7 @@ impl TeamRuntime {
                         text,
                         // **試行回数まで含めて鍵にする。** これが無いと
                         // 差し戻し後の再指示が「同じ指示」として抑止される。
+                        task: a.task,
                         key: format!("instr:{}:{}:{}", a.task, a.agent, task.attempts),
                     });
                     self.dirty = true;

@@ -367,6 +367,11 @@ pub enum EventReject {
     },
     /// 同じ ID のエージェントが既にいる (別の親の下に)。
     DuplicateAgent(String),
+    /// **報告元と関係のないエージェントの下へ生やそうとした。**
+    ForeignParent {
+        parent: String,
+        reporter: String,
+    },
     /// タスク ID が親の担当と違う。
     TaskMismatch {
         got: TaskId,
@@ -389,6 +394,9 @@ impl EventReject {
             EventReject::ParentCycle(a) => format!("親子関係が循環しています ({a})"),
             EventReject::TooDeep { depth } => format!("親子階層が深すぎます ({depth} 段)"),
             EventReject::DuplicateAgent(a) => format!("エージェント ID「{a}」が重複しています"),
+            EventReject::ForeignParent { parent, reporter } => {
+                format!("`{reporter}` は `{parent}` の下へサブエージェントを生やせません")
+            }
             EventReject::TaskMismatch { got, want } => {
                 format!("イベントのタスク #{got} が親の担当 #{want} と一致しません")
             }
@@ -449,6 +457,15 @@ pub fn check_event(
                 return Err(EventReject::DuplicateAgent(doc.agent_id.trim().to_string()));
             }
         }
+        // **報告元の系統の下にしか生やせない。** ここを「実在する親なら
+        // 誰でもよい」にすると、あるセッションが**別のエージェントの下へ
+        // 偽の子**をぶら下げられる (画面の組織図が嘘になる)。
+        if !is_self_or_descendant(known, parent, reporter) {
+            return Err(EventReject::ForeignParent {
+                parent: parent.to_string(),
+                reporter: reporter.0.clone(),
+            });
+        }
         // 親をたどって循環と深さを見る。
         let depth = ancestry_depth(known, parent, doc.agent_id.trim())?;
         if depth + 1 > MAX_DEPTH {
@@ -461,8 +478,35 @@ pub fn check_event(
             return Err(EventReject::TaskMismatch { got, want });
         }
     }
-    let _ = reporter;
     Ok(())
+}
+
+/// `parent` が `reporter` 自身か、その子孫か。
+///
+/// 入れ子のサブエージェントは、それを起こしたセッションが報告するので
+/// 「自分の系統の下」までは許す。系統をたどれない (親の鎖が切れている)
+/// ものは許さない — 迷ったら断る側へ倒す。
+fn is_self_or_descendant(
+    known: &[(AgentId, Option<AgentId>)],
+    parent: &str,
+    reporter: &AgentId,
+) -> bool {
+    if parent == reporter.0 {
+        return true;
+    }
+    let mut cur = parent.to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.insert(cur.clone()) {
+        let Some((_, up)) = known.iter().find(|(id, _)| id.0 == cur) else {
+            return false;
+        };
+        match up {
+            Some(p) if p.0 == reporter.0 => return true,
+            Some(p) => cur = p.0.clone(),
+            None => return false,
+        }
+    }
+    false
 }
 
 /// `parent` から根までたどった段数。途中に `child` が現れたら循環。
@@ -790,5 +834,43 @@ mod tests {
                       sub_agent_started backend-test-1\n";
         assert!(extract_blocks(screen, EVENT_OPEN, EVENT_CLOSE).is_empty());
         assert!(extract_blocks(screen, RESULT_OPEN, RESULT_CLOSE).is_empty());
+    }
+
+    #[test]
+    fn 他人の下へサブエージェントを生やせない() {
+        // **報告元と関係のないエージェントの下へは生やせない。** ここを
+        // 「実在する親なら誰でもよい」にすると、あるセッションが別の
+        // エージェントの下へ偽の子をぶら下げられる (組織図が嘘になる)。
+        let known = vec![
+            (AgentId::new("agent-1"), None),
+            (AgentId::new("agent-2"), None),
+            (AgentId::new("agent-1-sub"), Some(AgentId::new("agent-1"))),
+        ];
+        let doc = EventDoc {
+            kind: "sub_agent_started".into(),
+            agent_id: "fake".into(),
+            parent_id: "agent-2".into(),
+            task_id: None,
+            action: String::new(),
+            role: String::new(),
+        };
+        // agent-1 が agent-2 の下へ生やそうとする → 断る
+        let got = check_event(&doc, &known, &AgentId::new("agent-1"), None);
+        assert!(
+            matches!(got, Err(EventReject::ForeignParent { .. })),
+            "他人の下へ生やせてしまった: {got:?}"
+        );
+        // 自分の下なら通る
+        let mine = EventDoc {
+            parent_id: "agent-1".into(),
+            ..doc.clone()
+        };
+        assert!(check_event(&mine, &known, &AgentId::new("agent-1"), None).is_ok());
+        // 自分の子の下 (入れ子) も通る
+        let nested = EventDoc {
+            parent_id: "agent-1-sub".into(),
+            ..doc.clone()
+        };
+        assert!(check_event(&nested, &known, &AgentId::new("agent-1"), None).is_ok());
     }
 }

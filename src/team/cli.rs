@@ -539,6 +539,13 @@ pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
             }
         }
         "stop" => {
+            // **画面が開いているなら、置き場を書いても無駄。**
+            // GUI は Runtime を記憶に持っていて、次の保存で丸ごと上書き
+            // する。書いてから「停止しました」と言うと、実際には止まって
+            // いないのに止まったと表示する嘘になる。
+            if let Some(why) = gui_owns(&ws) {
+                return err(why);
+            }
             let dir = dir_of(&ws);
             match persistence::load(&dir) {
                 LoadOutcome::Loaded(mut s) => {
@@ -565,6 +572,10 @@ pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
             }
         }
         "reset" => {
+            // 画面が開いていると、消した直後に記憶から書き戻される。
+            if let Some(why) = gui_owns(&ws) {
+                return err(why);
+            }
             let dir = dir_of(&ws);
             let targets = persistence::reset_targets(&dir);
             if targets.is_empty() {
@@ -608,6 +619,29 @@ fn resolve(ws: &Path, spec: &str) -> PathBuf {
     } else {
         ws.join(p)
     }
+}
+
+/// **その workspace を開いている Zaivern が居るか。**
+///
+/// 居るなら、置き場を書き換えても記憶から上書きされる。書いてから
+/// 「できました」と言わないために、先に断る理由を返す。
+/// 戻りが `None` なら CLI が権限を持つ。
+fn gui_owns(ws: &Path) -> Option<String> {
+    let inst = crate::cli::read_instance_file()?;
+    let same = std::fs::canonicalize(&inst.workspace)
+        .ok()
+        .zip(std::fs::canonicalize(ws).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false);
+    if !same {
+        return None;
+    }
+    Some(
+        "このワークスペースを開いている Zaivern が実行中です。\n\
+         Team 画面から操作してください (記憶が置き場を上書きするため、\n\
+         CLI から書き換えても反映されません)。"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]

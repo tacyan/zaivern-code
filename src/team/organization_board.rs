@@ -922,10 +922,36 @@ fn current_action_bar(
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(a.glyph).color(col));
         let text = plain(&a.text);
-        let resp = ui.selectable_label(false, RichText::new(ellipsis(&text, 110)).color(col));
-        if resp.on_hover_text(&text).clicked() {
+        // **押しても何も起きないものを押せる見た目にしない。**
+        let clickable = match &a.focus {
+            ActionFocus::None => false,
+            ActionFocus::Decision(id) => s
+                .pending_decisions
+                .iter()
+                .any(|d| d.id == *id && d.task_id.is_some()),
+            _ => true,
+        };
+        let label = RichText::new(ellipsis(&text, 110)).color(col);
+        let resp = if clickable {
+            ui.selectable_label(false, label)
+        } else {
+            ui.label(label)
+        };
+        if clickable && resp.on_hover_text(&text).clicked() {
             match &a.focus {
-                ActionFocus::Decision(_) => {}
+                // 判断はタスクに紐づくので、そのタスクを開く。紐づかない
+                // ものは Mission Panel にしか出ないので、何もしない代わりに
+                // **押せる見た目にしない** (下の `clickable`)。
+                ActionFocus::Decision(id) => {
+                    if let Some(t) = s
+                        .pending_decisions
+                        .iter()
+                        .find(|d| d.id == *id)
+                        .and_then(|d| d.task_id)
+                    {
+                        acts.push(BoardAction::SelectTask(t));
+                    }
+                }
                 ActionFocus::Agent(id) => acts.push(BoardAction::Select(id.clone())),
                 ActionFocus::Task(t) => acts.push(BoardAction::SelectTask(*t)),
                 ActionFocus::None => {}

@@ -2023,6 +2023,148 @@ fn 検証の世代を進める場所は一つだけ() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn 進められないという報告は行き止まりにしない() {
+    // `Blocked` から自動で出る経路は無い (依存が解けるのは `Pending` だけ)。
+    // 判断を出さないと、そのタスクは永久に止まったまま誰も気付かない。
+    let (mut rt, sids, tid) = to_assigned();
+    let sid = rt.task(tid).unwrap().assigned_session.expect("担当");
+    let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap().0;
+    let block = format!(
+        "{open}\n{{\"task_id\":{tid},\"agent_id\":\"{agent}\",\"status\":\"blocked\",\
+         \"summary\":\"仕様が矛盾しています\",\"changed_files\":[],\"validation\":[],\
+         \"blockers\":[\"API の仕様が 2 つある\"]}}\n{close}",
+        open = rp::RESULT_OPEN,
+        close = rp::RESULT_CLOSE
+    );
+    tick_text(&mut rt, 12, &sids, sid, &block);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Blocked);
+    assert!(
+        rt.decisions().iter().any(|d| d.task_id == Some(tid)),
+        "止まったことを人へ上げていない"
+    );
+    // **人が Retry で戻せる。** 戻せないと画面のボタンが嘘になる。
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert_ne!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Blocked,
+        "Retry が効かない (画面のボタンが何もしない)"
+    );
+}
+
+#[test]
+fn 能力が足りないときは黙って断り続けない() {
+    // 能力は計画で決まるので、次の tick でも同じ結果になる。黙ると
+    // 「なぜか Ready のまま動かない」タスクができる。
+    let mut rt = started(4);
+    let tid = rt.tasks()[0].id;
+    rt.set_required_caps_for_test(tid, &["quantum-computing"]);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    idle_tick(&mut rt, 12, &sids);
+    assert!(
+        !assignments(&rt).iter().any(|(_, t, _)| *t == tid),
+        "能力が足りないのに配った"
+    );
+    assert!(
+        rt.decisions()
+            .iter()
+            .any(|d| d.kind == DecisionKind::NoCandidate && d.task_id == Some(tid)),
+        "黙って断り続けている: {:?}",
+        rt.decisions().iter().map(|d| (d.kind, d.task_id)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn 消えたエージェントは担当を名乗らない() {
+    // **画面と実体をずらさない。** セッションが消えたのにカードが担当を
+    // 名乗り続けると、Inspector が効かない Retry / Reassign を出す。
+    let (mut rt, sids, tid) = to_assigned();
+    let dead = rt.task(tid).unwrap().assigned_session.expect("担当");
+    let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap();
+    // 観測は割り当ての**次の** tick で担当を写す。
+    idle_tick(&mut rt, 12, &sids);
+    assert_eq!(
+        rt.agents()
+            .iter()
+            .find(|a| a.id == agent)
+            .and_then(|a| a.current_task),
+        Some(tid)
+    );
+    let alive: Vec<SessionId> = sids.iter().copied().filter(|s| *s != dead).collect();
+    idle_tick(&mut rt, 13, &alive);
+    let a = rt
+        .agents()
+        .iter()
+        .find(|a| a.id == agent)
+        .expect("エージェント");
+    assert_eq!(a.session_id, None);
+    assert_eq!(
+        a.current_task, None,
+        "消えたエージェントが担当を名乗ったままになっている"
+    );
+}
+
+#[test]
+fn 方針で止められた指示は撃ち直さず人へ上げる() {
+    // **同じ理由で止まるものを毎 tick 送り直さない。** 送り直すぶんだけ
+    // 同じ説明が出続けて、前へは 1 ミリも進まない (「エラーに回復経路が
+    // 無い」の典型)。人が手当てできる形 (判断) にして止める。
+    let (mut rt, sids, tid) = to_assigned();
+    let sid = rt.task(tid).unwrap().assigned_session.expect("担当");
+    // 実行側は**送れなかった鍵を完了にしない** (完了にすると、手当てして
+    // Retry したあとも同じ鍵が抑止されて指示が二度と届かない)。
+    let key = format!(
+        "instr:{tid}:{}:{}",
+        rt.task(tid).unwrap().assigned_agent.clone().unwrap().0,
+        rt.task(tid).unwrap().attempts
+    );
+    rt.note_effect_failed(&key);
+    rt.note_instruction_blocked(tid, "コスト上限に達しました");
+    let t = rt.task(tid).unwrap();
+    assert_eq!(t.state, TeamTaskState::NeedsUser, "人へ上げていない");
+    assert!(
+        t.context.iter().any(|c| c.contains("コスト上限")),
+        "理由が残っていない: {:?}",
+        t.context
+    );
+    assert!(
+        rt.decisions()
+            .iter()
+            .any(|d| d.kind == DecisionKind::CostLimit && d.task_id == Some(tid)),
+        "判断として出していない"
+    );
+    // 撃ち直さない。
+    let eff = idle_tick(&mut rt, 20, &sids);
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, TeamEffect::SendInstruction { session, .. } if *session == sid)),
+        "止められた指示を送り直した: {eff:?}"
+    );
+    // **手当てしたら Retry で本当に動き出せる。** 状態が変わるだけでは
+    // 足りない — 前任の保持が解けていないと `PreviousHolderNotStopped` で
+    // 永久に配れず、鍵が完了のままだと指示が届かない。
+    rt.apply_action(TeamAction::RetryTask(tid));
+    assert_ne!(rt.task(tid).unwrap().state, TeamTaskState::NeedsUser);
+    let mut now = 21;
+    let mut sent = false;
+    while now < 30 && !sent {
+        let eff = idle_tick(&mut rt, now, &sids);
+        sent = eff
+            .iter()
+            .any(|e| matches!(e, TeamEffect::SendInstruction { task, .. } if *task == tid));
+        now += 1;
+    }
+    assert!(
+        rt.task(tid).unwrap().assigned_session.is_some(),
+        "Retry のあと配り直されない: {:?}",
+        rt.task(tid).unwrap().state
+    );
+    assert!(sent, "配り直したのに指示が出ない (冪等キーが抑止している)");
+}
+
+#[test]
 fn 断られた遷移は黙殺せず記録に残す() {
     // **fail-closed で「そのまま」にするのは正しい。** ただし黙って
     // 無かったことにすると「押したのに何も起きない」を誰も追えない。

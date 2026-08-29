@@ -780,7 +780,8 @@ fn 実行側は必ず成否を返す() {
             &["p.ack_done(&key)", "p.ack_failed(&key)"],
         ),
         (
-            "for (key, session, text) in instructions",
+            // 宛先のタスクも運ぶ (セッションから引き直さない)。
+            "for (key, task, session, text) in instructions",
             &["p.ack_done(&key)", "p.ack_failed(&key)"],
         ),
         ("for (key, session) in stops", &["p.ack_done(&key)"]),

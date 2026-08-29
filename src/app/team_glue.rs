@@ -232,17 +232,30 @@ impl ZaivernApp {
 
         // ── 指示の送信 (**既存の送信経路 1 本**を通す) ──
         let instructions = panel::with_panel(|p| p.take_instructions());
-        for (key, session, text) in instructions {
+        for (key, task, session, text) in instructions {
             // 起動直後は Idle を待ってから送る (Ink 系 TUI の取りこぼし対策は
             // `submit.rs` が持っている)。積めなければ失敗として返し、
             // 次の tick でもう一度出させる。
-            let queued = self.queue_submit(crate::submit::Job::deferred(session, text, true));
-            panel::with_panel(|p| {
-                if queued {
-                    p.ack_done(&key)
-                } else {
-                    p.ack_failed(&key)
+            // **止められた理由が「方針」なら撃ち直さない。** コスト上限は
+            // 次の tick でも同じ理由で止まるので、送り直すぶんだけ同じ
+            // トーストが出続けて前に進まない。人が手当てできる形へ上げる
+            // (既存のコスト上限判定をそのまま使う — 第 2 の判定を作らない)。
+            let blocked = self.cost_block_reason();
+            let queued = if blocked.is_some() {
+                false
+            } else {
+                self.queue_submit(crate::submit::Job::deferred(session, text, true))
+            };
+            panel::with_panel(|p| match (&blocked, queued) {
+                (Some(why), _) => {
+                    // **成功として記録しない。** 1 行も送っていないので、
+                    // 冪等キーを完了にすると、人が手当てして Retry した
+                    // あとも同じ鍵が抑止されて指示が二度と届かない。
+                    p.ack_failed(&key);
+                    p.note_instruction_blocked(task, why);
                 }
+                (None, true) => p.ack_done(&key),
+                (None, false) => p.ack_failed(&key),
             });
         }
 
@@ -491,6 +504,10 @@ impl ZaivernApp {
             }
             BoardAction::SelectTask(t) => panel::with_panel(|p| {
                 p.selected_task = Some(t);
+                // **エージェントの選択は外す。** 残すと Inspector に
+                // 「同じラベルで別のタスクを指す Retry / Reassign」が
+                // 2 段並ぶ (どちらが効くのか読み手に分からない)。
+                p.selected_agent = None;
                 p.inspector_open = true;
             }),
             BoardAction::OpenTerminal(sid) => self.team_open_terminal(sid),
@@ -598,7 +615,9 @@ impl ZaivernApp {
             "auto" | "agent" => approval_mode,
             _ => "ask",
         };
-        let mut changed = self.cfg.approval_mode != mode;
+        // **両方を見る。** 片方だけで判定すると、`global_approval_mode`
+        // だけが変わったときに保存されず、記憶と設定ファイルがずれる。
+        let mut changed = self.cfg.approval_mode != mode || self.cfg.global_approval_mode != mode;
         self.cfg.approval_mode = mode.to_string();
         self.cfg.global_approval_mode = mode.to_string();
         // 0 は「上限なし」。既存の cost_limit_session と同じ意味。

@@ -270,7 +270,7 @@ pub struct TeamPanel {
     /// 停止を頼んだセッション。
     pending_stops: Vec<(RunOwner, String, SessionId)>,
     /// 送るべき指示 (持ち主, 冪等キー, セッション ID, 本文)。
-    pending_instructions: Vec<(RunOwner, String, (SessionId, String))>,
+    pending_instructions: Vec<(RunOwner, String, (TaskId, SessionId, String))>,
     /// 別の Run のものとして捨てた Effect の数 (診断とテストが見る)。
     dropped_effects: usize,
     /// 保存が要るか。
@@ -636,10 +636,11 @@ impl TeamPanel {
                 TeamEffect::StartAgent(s) => {
                     self.pending_launches.push((owner.clone(), key, s))
                 }
-                TeamEffect::SendInstruction { session, text, .. } => {
-                    self.pending_instructions
-                        .push((owner.clone(), key, (session, text)))
-                }
+                TeamEffect::SendInstruction {
+                    task, session, text, ..
+                } => self
+                    .pending_instructions
+                    .push((owner.clone(), key, (task, session, text))),
                 TeamEffect::StopAgent(s) => self.pending_stops.push((owner.clone(), key, s)),
                 TeamEffect::RunValidation(v) => {
                     self.pending_validations.push((owner.clone(), key, v))
@@ -667,6 +668,15 @@ impl TeamPanel {
     pub fn ack_done(&mut self, key: &str) {
         if let Some(rt) = self.runtime.as_mut() {
             rt.note_effect_done(key);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
+    /// **指示が方針で止められた**と Runtime へ返す (撃ち直さない)。
+    pub fn note_instruction_blocked(&mut self, task: TaskId, why: &str) {
+        if let Some(rt) = self.runtime.as_mut() {
+            rt.note_instruction_blocked(task, why);
         }
         self.needs_save = true;
         self.dirty = true;
@@ -725,11 +735,14 @@ impl TeamPanel {
         self.mine(q)
     }
     /// 送ってほしい指示 (冪等キー付き。取り出したら消える)。
-    pub fn take_instructions(&mut self) -> Vec<(String, SessionId, String)> {
+    ///
+    /// **宛先のタスクも一緒に渡す。** 実行側がセッションから引き直すと、
+    /// 間に 1 tick 入っただけで別のタスクを指す。
+    pub fn take_instructions(&mut self) -> Vec<(String, TaskId, SessionId, String)> {
         let q = std::mem::take(&mut self.pending_instructions);
         self.mine(q)
             .into_iter()
-            .map(|(k, (s, t))| (k, s, t))
+            .map(|(k, (task, s, t))| (k, task, s, t))
             .collect()
     }
     /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
@@ -1170,7 +1183,7 @@ mod tests {
         // 4 つの口すべてに、前の Run のものを積む。
         let owner = p.owner().expect("持ち主");
         p.pending_instructions
-            .push((owner.clone(), "instr:x".into(), (7, "hi".into())));
+            .push((owner.clone(), "instr:x".into(), (1, 7, "hi".into())));
         p.pending_stops.push((owner.clone(), "stop:7".into(), 7));
         p.pending_validations.push((
             owner,
