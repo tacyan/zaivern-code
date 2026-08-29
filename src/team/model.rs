@@ -506,6 +506,20 @@ impl TeamTaskState {
         matches!(self, TeamTaskState::Completed | TeamTaskState::NeedsUser)
     }
 
+    /// **その担当が今まさに手を動かしている**状態か。
+    ///
+    /// [`is_held`](Self::is_held) との違いが要るのは、レビュー待ちの
+    /// タスクは「ファイルは押さえたまま」だが「実装担当の手は空いている」
+    /// から。ここを一緒にすると、レビュー待ちが 1 本あるだけで実装担当が
+    /// 永久に忙しい扱いになり、**レビュー担当の候補が枯れて誰も進めない**
+    /// (2 体 2 タスクで実際に詰まった)。
+    pub fn is_working(self) -> bool {
+        matches!(
+            self,
+            TeamTaskState::Assigned | TeamTaskState::Running | TeamTaskState::Validating
+        )
+    }
+
     /// エージェントが握っている状態か (割り当て済み)。
     pub fn is_held(self) -> bool {
         matches!(

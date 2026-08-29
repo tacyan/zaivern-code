@@ -6,6 +6,15 @@
 #[path = "../team/mod.rs"]
 pub mod imp;
 
+/// `zai team <sub>` の入口。`src/cli.rs` の dispatch から呼ばれる。
+pub use imp::cli::cli_main;
+
+/// `zai team run` が「CLI ではなく GUI を起こしてほしい」と伝える値。
+pub use imp::cli::EXIT_LAUNCH_GUI;
+
+/// `zai help` に差し込むセクション。**実体は 1 か所** (`src/team/cli.rs`)。
+pub use imp::cli::HELP;
+
 pub const FEATURE: crate::feature::Feature = crate::feature::Feature {
     module: "team",
     entries: &[],

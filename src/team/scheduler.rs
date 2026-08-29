@@ -268,8 +268,14 @@ pub fn desired_sessions(tasks: &[TeamTask], max_agents: usize) -> usize {
         .iter()
         .filter(|t| t.dependencies.is_empty() && !t.state.is_terminal())
         .count();
-    // レビューは実装と別セッションが要るので、実装が 1 本でも最低 2 体は要る。
-    let need = parallel.max(if tasks.len() > 1 { 2 } else { 1 });
+    // **レビュー用に 1 体余分に見る。** 実装担当は自分のレビューをできない
+    // ので、並列実装数ぴったりだと「全員が実装中でレビューできない」状態が
+    // 生まれ、上限に当たるまで誰も先へ進めない (実測で詰まった)。
+    let need = if tasks.len() > 1 {
+        parallel.max(1) + 1
+    } else {
+        1
+    };
     need.min(max_agents)
 }
 

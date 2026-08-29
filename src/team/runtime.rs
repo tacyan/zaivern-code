@@ -495,6 +495,7 @@ impl TeamRuntime {
             }
             TeamAction::RetryTask(id) => {
                 let max = self.run.max_attempts;
+                self.release_coordinator(id);
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     if t.state == TeamTaskState::NeedsUser || t.state == TeamTaskState::Failed {
                         // 人が回すときは試行回数を 1 つ戻す (無限には回さない)。
@@ -502,7 +503,6 @@ impl TeamRuntime {
                         t.state = sm::force(t.state, TeamTaskState::Ready);
                         t.assigned_agent = None;
                         t.assigned_session = None;
-                        t.coordinator_task = None;
                         t.updated_at = now_secs();
                     }
                 }
@@ -510,11 +510,11 @@ impl TeamRuntime {
                 self.dirty = true;
             }
             TeamAction::ReassignTask(id) => {
+                self.release_coordinator(id);
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                     if !t.state.is_terminal() {
                         t.assigned_agent = None;
                         t.assigned_session = None;
-                        t.coordinator_task = None;
                         t.state = sm::force(t.state, TeamTaskState::Ready);
                         t.updated_at = now_secs();
                     }
@@ -554,7 +554,7 @@ impl TeamRuntime {
         self.advance(&mut out);
 
         // 5) Pause / Stop 中は**新規割り当てをしない**。
-        if !self.run.paused && !self.run.stopped && self.goal.status == GoalStatus::Running {
+        if self.accepting_work() {
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
         }
@@ -567,6 +567,27 @@ impl TeamRuntime {
             self.dirty = false;
         }
         self.filter_new(out)
+    }
+
+    /// 新しい仕事を配ってよい状態か。
+    ///
+    /// **`GoalStatus::Running` だけを見てはいけない。** Goal の状態は
+    /// 表示用に `Reviewing` / `Integrating` / `NeedsUser` へも動くので、
+    /// そこを条件にすると「レビュー待ちが 1 本あるだけで新しい割り当てが
+    /// 全部止まる」= レビュー担当さえ配れずに永久に止まる (実測で詰まった)。
+    /// 止めるのは**人が止めたとき**と**まだ始まっていない / もう終わった
+    /// とき**だけ。
+    fn accepting_work(&self) -> bool {
+        !self.run.paused
+            && !self.run.stopped
+            && !matches!(
+                self.goal.status,
+                GoalStatus::Planning
+                    | GoalStatus::Ready
+                    | GoalStatus::Paused
+                    | GoalStatus::Completed
+                    | GoalStatus::Failed
+            )
     }
 
     /// まだ出していない Effect だけを残す (冪等)。
@@ -788,6 +809,7 @@ impl TeamRuntime {
         let max = self.run.max_attempts;
         let mut make_review: Option<TeamTask> = None;
         let mut escalate: Option<(TaskId, String)> = None;
+        let mut release_after = false;
 
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
@@ -799,6 +821,7 @@ impl TeamRuntime {
                     t.state = sm::apply(t.state, TeamTaskState::Blocked).unwrap_or(t.state);
                 }
                 ReportedStatus::Failed => {
+                    release_after = true;
                     t.attempts = t.attempts.saturating_add(1);
                     if t.attempts >= max {
                         t.state = TeamTaskState::NeedsUser;
@@ -864,6 +887,15 @@ impl TeamRuntime {
             }
         }
 
+        if release_after {
+            // 失敗を自分から報告した = もう編集していない。
+            self.release_coordinator(acc.task_id);
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
+                t.assigned_session = None;
+                t.assigned_agent = None;
+            }
+        }
+
         if let Some((tid, why)) = escalate {
             self.raise(
                 DecisionKind::AttemptsExhausted,
@@ -880,10 +912,17 @@ impl TeamRuntime {
     /// レビュー報告 1 件。
     fn take_review(&mut self, agent: &AgentId, body: &str) {
         // このエージェントが担当しているレビュータスクを探す。
+        // **終わったレビュータスクを掴まない。** 同じ担当が同じ対象を 2 度
+        // レビューする (差し戻し → 再レビュー) と、閉じた 1 本目が先に
+        // 見つかって報告が迷子になる (実測で E2E が止まった)。
         let Some(rev) = self
             .tasks
             .iter()
-            .find(|t| t.assigned_agent.as_ref() == Some(agent) && t.review_of.is_some())
+            .find(|t| {
+                t.assigned_agent.as_ref() == Some(agent)
+                    && t.review_of.is_some()
+                    && !t.state.is_terminal()
+            })
             .cloned()
         else {
             self.log(
@@ -911,6 +950,7 @@ impl TeamRuntime {
 
         let max = self.run.max_attempts;
         let mut escalate = false;
+        let mut released = false;
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == target_id) {
             t.review.running = false;
             t.review.reviewer = Some(agent.clone());
@@ -935,14 +975,20 @@ impl TeamRuntime {
                         escalate = true;
                     } else {
                         t.state = sm::apply(t.state, TeamTaskState::Ready).unwrap_or(t.state);
+                        released = true;
                         t.assigned_agent = None;
                         t.assigned_session = None;
-                        t.coordinator_task = None;
                         // 検証はやり直す。
                         t.validation.runs.clear();
                     }
                 }
             }
+        }
+        if released {
+            // 差し戻しは担当が自分から手を離した状態なので、前任の停止を
+            // 確認済みとして既存調停層へ伝える (伝えないと引き渡しを断られ、
+            // 差し戻したタスクが二度と配られない — 実測で詰まった)。
+            self.release_coordinator(target_id);
         }
         // レビュータスク自体を閉じる。
         if let Some(r) = self.tasks.iter_mut().find(|t| t.id == rev.id) {
@@ -1185,10 +1231,13 @@ impl TeamRuntime {
                     session: sid,
                     state: work_to_session_state(a.state),
                     caps: vec![a.name.to_ascii_lowercase(), a.role.key().to_string()],
+                    // **レビュー待ちは「手が空いている」扱い。** 実装担当が
+                    // レビューの間ずっと忙しいことになると、レビュー候補が
+                    // 枯れて誰も進めなくなる。
                     holding: self
                         .tasks
                         .iter()
-                        .find(|t| t.assigned_agent.as_ref() == Some(&a.id) && t.state.is_held())
+                        .find(|t| t.assigned_agent.as_ref() == Some(&a.id) && t.state.is_working())
                         .map(|t| t.id),
                 })
             })
@@ -1344,6 +1393,23 @@ impl TeamRuntime {
             forbidden_files: forbidden,
         };
         super::prompt::for_task(&brief, &self.tasks)
+    }
+
+    /// **既存調停層に「前任者はもう触っていない」と伝える。**
+    ///
+    /// `coordinator` は前任者の停止が未確認のタスクを引き渡さない
+    /// (同時編集で成果物が壊れるため)。ここで確認を通すのは、次の 2 つの
+    /// 場合だけ:
+    ///
+    /// * 担当が**自分から完了/失敗を報告した** — もう編集していない
+    /// * 人が明示的に配り直した — 停止は人の判断
+    ///
+    /// セッションが消えた場合は [`release_dead`](Self::release_dead) が
+    /// `note_exited` → `confirm_stopped` の順で通す。**順序は飛ばさない。**
+    fn release_coordinator(&mut self, task_id: TaskId) {
+        if let Some(ct) = self.task(task_id).and_then(|t| t.coordinator_task) {
+            self.co.confirm_stopped(ct, Instant::now());
+        }
     }
 
     /// タスクを完了として締める。

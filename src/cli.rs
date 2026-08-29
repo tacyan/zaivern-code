@@ -239,6 +239,10 @@ pub fn is_cli_subcommand(word: &str) -> bool {
             // 計算資源を差し替え可能にする実行層 (手元 / SSH / クラウド)。
             // **門に足し忘れると `zai cloud doctor` が GUI の窓を開く**
             | "cloud"
+            // SPEC を渡して AI 開発チームを編成・実行する制御面。
+            // `zai team run` だけは CLI 処理のあと **GUI 起動へ落ちる**
+            // (try_run_cli が None を返す) ので、下の分岐も対で見ること。
+            | "team"
             | "update"
             | "uninstall"
             | "help"
@@ -268,6 +272,7 @@ fn yields_to_directory(word: &str) -> bool {
             | "split"
             | "context"
             | "cloud"
+            | "team"
             | "help"
     )
 }
@@ -278,7 +283,7 @@ fn yields_to_directory(word: &str) -> bool {
 pub fn help_text() -> String {
     format!(
         "{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n\
-         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_CLOUD}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
+         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_CLOUD}{HELP_TEAM}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
     )
 }
 
@@ -406,6 +411,10 @@ pub const HELP_CONTEXT: &str = crate::features::context::HELP;
 /// `zai cloud --help` のセクション。実体は
 /// `src/features/cloud_execution/cli.rs` (`HELP_GUARD` と同じ方針)。
 pub const HELP_CLOUD: &str = crate::features::cloud_execution::HELP;
+
+/// `zai team --help` のセクション。実体は `src/team/cli.rs`
+/// (`HELP_GUARD` と同じ方針 — 写経すると必ず食い違う)。
+pub const HELP_TEAM: &str = crate::features::team::HELP;
 
 /// 競合ゼロの導入・証明・プロセスメッシュ・交渉。
 ///
@@ -564,6 +573,19 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
         "context" => crate::features::context::cli_main(rest),
         // 計算資源の差し替え。実体は src/features/cloud_execution/。
         "cloud" => crate::features::cloud_execution::cli_main(rest),
+        // AI 開発チーム制御面。実体は src/team/。
+        //
+        // **`zai team run` はヘッドレスではない。** 起動要求を投函したあと
+        // GUI を起こす必要があるので、そのときだけ `None` を返して
+        // main.rs の GUI 起動経路へ落ちる (実行中インスタンスがあるときは
+        // そちらが投函を拾うので、ここで 0 を返して終わる)。
+        "team" => {
+            let code = crate::features::team::cli_main(rest);
+            if code == crate::features::team::EXIT_LAUNCH_GUI {
+                return None;
+            }
+            code
+        }
         // `zai status` (引数なし / --json のみ) はレジスタリ一覧 = 実行検知。
         // テキスト付きは従来どおりステータスバー更新 (下の run_remote へ落ちる)。
         "status" if status_list_mode(rest).is_some() => run_status_list(
@@ -3738,6 +3760,7 @@ mod tests {
             HELP_TRAIN_SPLIT,
             HELP_CONTEXT,
             HELP_CLOUD,
+            HELP_TEAM,
             HELP_UPDATE,
             HELP_UNINSTALL,
         ] {

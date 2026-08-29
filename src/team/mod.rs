@@ -39,6 +39,7 @@
 //! * **人へ上げる操作は自動実行しない。** push / merge / deploy /
 //!   権限昇格 / 破壊的操作は [`graph::check_command`] が止める。
 
+pub mod cli;
 pub mod graph;
 pub mod launch;
 pub mod model;
