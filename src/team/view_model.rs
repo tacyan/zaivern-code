@@ -626,7 +626,7 @@ mod tests {
                     used <= board + 0.5,
                     "w={w} lanes={lanes} 使用幅 {used} > 可用 {board}"
                 );
-                assert!(l.visible <= lanes.max(0));
+                assert!(l.visible <= lanes);
                 if lanes > 0 {
                     assert!(l.lane_w >= LANE_MIN_W - 0.5, "w={w} lanes={lanes}");
                     assert!(l.visible >= 1);

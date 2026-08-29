@@ -423,7 +423,7 @@ fn team_lead_card(
 ) {
     egui::Frame::none()
         .fill(theme.panel_alt)
-        .stroke(egui::Stroke::new(1.0, theme.border))
+        .stroke(egui::Stroke::new(1.0_f32, theme.border))
         .inner_margin(egui::Margin::symmetric(10.0, 6.0))
         .rounding(4.0)
         .show(ui, |ui| {
@@ -527,7 +527,7 @@ fn parent_card(
     egui::Frame::none()
         .fill(if is_sel { theme.panel_alt } else { theme.panel })
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             if is_sel { theme.accent } else { theme.border },
         ))
         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
@@ -704,7 +704,7 @@ fn task_card(
 ) {
     egui::Frame::none()
         .fill(theme.panel)
-        .stroke(egui::Stroke::new(1.0, theme.border))
+        .stroke(egui::Stroke::new(1.0_f32, theme.border))
         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
         .rounding(3.0)
         .show(ui, |ui| {
@@ -850,7 +850,7 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
                 for d in &s.pending_decisions {
                     egui::Frame::none()
                         .fill(theme.panel_alt)
-                        .stroke(egui::Stroke::new(1.0, theme.warn))
+                        .stroke(egui::Stroke::new(1.0_f32, theme.warn))
                         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
                         .rounding(3.0)
                         .show(ui, |ui| {
