@@ -39,8 +39,6 @@ pub enum PlanError {
     SpecTooLarge { bytes: usize, limit: usize },
     /// Planner の出力が schema を満たさない。
     Schema(SchemaError),
-    /// Planner そのものが失敗した (LLM の呼び出し失敗など)。
-    Backend(String),
 }
 
 impl PlanError {
@@ -51,7 +49,6 @@ impl PlanError {
                 format!("SPEC が大きすぎます ({bytes} バイト / 上限 {limit})")
             }
             PlanError::Schema(e) => e.detail(),
-            PlanError::Backend(m) => format!("計画の生成に失敗しました: {m}"),
         }
     }
 }
@@ -428,7 +425,17 @@ impl TeamPlanner for StaticPlanner {
             });
         }
         let doc = self.compose(&input);
-        plan_schema::validate(doc, &input.spec).map_err(PlanError::Schema)
+        // **JSON の境界を必ず通す。**
+        //
+        // LLM Planner は JSON 文字列を返すので、検証経路は
+        // [`plan_schema::parse`] になる。静的 Planner だけ型のまま
+        // [`plan_schema::validate`] へ渡すと、**その経路が製品では一度も
+        // 走らない** — 直列化できない形が入り込んでも誰も気付かず、
+        // LLM Planner を足した日に初めて壊れる。1 計画につき 1 回の
+        // 往復なので、費用より「同じ関門を通っている」ことを採る。
+        let json = serde_json::to_string(&doc)
+            .map_err(|e| PlanError::Schema(SchemaError::Json(e.to_string())))?;
+        plan_schema::parse(&json, &input.spec).map_err(PlanError::Schema)
     }
 
     fn name(&self) -> &'static str {

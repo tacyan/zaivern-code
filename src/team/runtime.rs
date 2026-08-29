@@ -306,9 +306,6 @@ impl TeamRuntime {
     pub fn run(&self) -> &RunDoc {
         &self.run
     }
-    pub fn workspace(&self) -> &std::path::Path {
-        &self.workspace
-    }
     pub fn is_paused(&self) -> bool {
         self.run.paused
     }
@@ -1129,18 +1126,34 @@ impl TeamRuntime {
             return;
         }
         for id in ready {
-            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
-                if let Ok(next) = sm::apply(t.state, TeamTaskState::Ready) {
-                    t.state = next;
-                    t.updated_at = now_secs();
-                }
+            // 遷移が断られたら**黙らない**。「なぜか Ready にならない」を
+            // 追えるように理由をそのまま残す。
+            let refused = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.id == id)
+                .and_then(|t| match sm::apply(t.state, TeamTaskState::Ready) {
+                    Ok(next) => {
+                        t.state = next;
+                        t.updated_at = now_secs();
+                        None
+                    }
+                    Err(e) => Some(e.detail()),
+                });
+            match refused {
+                Some(why) => self.log(
+                    TeamEventKind::TaskBlocked,
+                    None,
+                    None,
+                    format!("#{id} を Ready にできません: {why}"),
+                ),
+                None => self.log(
+                    TeamEventKind::TaskReady,
+                    None,
+                    None,
+                    format!("#{id} の依存が解決しました"),
+                ),
             }
-            self.log(
-                TeamEventKind::TaskReady,
-                None,
-                None,
-                format!("#{id} の依存が解決しました"),
-            );
         }
         self.dirty = true;
     }
@@ -1251,21 +1264,23 @@ impl TeamRuntime {
         for u in &plan.unassigned {
             // 候補が居ないだけなら黙る (次の tick で解決しうる)。
             // 重なりと「本人しか居ない」は人へ上げる価値がある。
+            // **どのタスクの話かは必ず添える** (理由だけでは追えない)。
+            let subject = u.task();
             match u {
-                scheduler::Unassigned::FileOverlap { task, .. } => {
+                scheduler::Unassigned::FileOverlap { .. } => {
                     self.raise(
                         DecisionKind::FileScopeOverlap,
-                        Some(*task),
+                        Some(subject),
                         None,
                         u.detail(),
                         "担当ファイルを分けるか、順番に実行してください".into(),
                         vec!["reassign".into(), "reject".into()],
                     );
                 }
-                scheduler::Unassigned::ReviewerWouldBeAuthor(task) => {
+                scheduler::Unassigned::ReviewerWouldBeAuthor(_) => {
                     self.raise(
                         DecisionKind::NoCandidate,
-                        Some(*task),
+                        Some(subject),
                         None,
                         u.detail(),
                         "レビューには実装担当と別のセッションが要ります".into(),

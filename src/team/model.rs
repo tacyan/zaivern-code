@@ -16,7 +16,6 @@
 //! `Instant` は**永続化できない** (プロセスを跨ぐと意味を失う)。Team は
 //! 再起動をまたいで状態を復元するので、記録は全部 `u64` の Unix 秒にする。
 
-use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -586,22 +585,6 @@ pub struct TeamTask {
     pub blockers: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
-}
-
-impl TeamTask {
-    /// 表示用の短い名前。
-    pub fn label(&self) -> String {
-        if self.title.is_empty() {
-            format!("#{}", self.id)
-        } else {
-            format!("#{} {}", self.id, self.title)
-        }
-    }
-
-    /// 担当ファイルの集合 (照合用)。
-    pub fn file_set(&self) -> BTreeSet<&str> {
-        self.files.iter().map(|s| s.as_str()).collect()
-    }
 }
 
 // ── イベント ─────────────────────────────────────────────────────────

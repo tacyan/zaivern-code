@@ -98,6 +98,12 @@ pub fn implementer(b: &Brief<'_>) -> String {
     }
     s.push_str("\n## 受入基準 (すべて満たすこと)\n");
     s.push_str(&bullets(&t.acceptance_criteria));
+    // **コードを書かない役割には編集範囲を出さない。** 出すと「触ってよい」
+    // と読まれる (レビュアーに変更させないための線)。
+    if !super::roles::writes_code(t.role) {
+        s.push_str("\n## このタスクではコードを変更しません\n");
+        s.push_str("  - 読んで判断するだけです\n");
+    }
     s.push_str("\n## 編集してよいファイル\n");
     if t.files.is_empty() {
         s.push_str("  (指定なし。ただしワークスペースの外へは絶対に書かないこと)\n");
@@ -223,19 +229,23 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
 }
 
 /// 役割に応じた指示文を作る。
+///
+/// 役割の分類は [`super::roles`] が持つ 1 本を通す — ここで `match` を
+/// 書き直すと、スケジューラ側の「実装担当とレビュアーを分ける」判断と
+/// ずれた瞬間に**レビュアーへ実装の指示が飛ぶ**。
 pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
-    match b.task.role {
-        TeamRole::Reviewer | TeamRole::Tester => {
-            let target = b
-                .task
-                .review_of
-                .and_then(|id| all.iter().find(|t| t.id == id))
-                .unwrap_or(b.task);
-            reviewer(b, target)
-        }
-        TeamRole::Integrator => integrator(b, all),
-        _ => implementer(b),
+    if super::roles::is_review_role(b.task.role) {
+        let target = b
+            .task
+            .review_of
+            .and_then(|id| all.iter().find(|t| t.id == id))
+            .unwrap_or(b.task);
+        return reviewer(b, target);
     }
+    if b.task.role == TeamRole::Integrator {
+        return integrator(b, all);
+    }
+    implementer(b)
 }
 
 #[cfg(test)]

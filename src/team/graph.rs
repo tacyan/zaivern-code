@@ -17,7 +17,7 @@
 //! 「なぜか誰も動かない」として現れ、原因が Task Graph だと気付くまでに
 //! 時間が溶ける。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::model::{TaskId, TeamTask, TeamTaskState};
 
@@ -574,46 +574,6 @@ pub fn progress(tasks: &[TeamTask]) -> f32 {
     done as f32 / tasks.len() as f32
 }
 
-/// 依存の到達順 (トポロジカル順)。循環があれば `None`。
-/// 決定的にするため、同点は ID 昇順。
-pub fn topological_order(tasks: &[TeamTask]) -> Option<Vec<TaskId>> {
-    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
-    let mut indeg: BTreeMap<TaskId, usize> = ids.iter().map(|i| (*i, 0)).collect();
-    let mut children: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
-    for t in tasks {
-        for d in t.dependencies.iter().filter(|d| ids.contains(d)) {
-            *indeg.entry(t.id).or_insert(0) += 1;
-            children.entry(*d).or_default().push(t.id);
-        }
-    }
-    let mut q: VecDeque<TaskId> = indeg
-        .iter()
-        .filter(|(_, n)| **n == 0)
-        .map(|(i, _)| *i)
-        .collect();
-    let mut out = Vec::new();
-    while let Some(n) = q.pop_front() {
-        out.push(n);
-        let mut next: Vec<TaskId> = Vec::new();
-        for c in children.get(&n).map(|v| v.as_slice()).unwrap_or(&[]) {
-            let e = indeg.entry(*c).or_insert(0);
-            *e = e.saturating_sub(1);
-            if *e == 0 {
-                next.push(*c);
-            }
-        }
-        next.sort_unstable();
-        for c in next {
-            q.push_back(c);
-        }
-    }
-    if out.len() == ids.len() {
-        Some(out)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::testkit::task;
@@ -808,14 +768,6 @@ mod tests {
         assert_eq!(d[&2], 1);
         assert_eq!(d[&3], 0);
         assert_eq!(d[&4], 0);
-    }
-
-    #[test]
-    fn トポロジカル順は決定的() {
-        let t = vec![task(3, "c", &[1]), task(1, "a", &[]), task(2, "b", &[1])];
-        assert_eq!(topological_order(&t), Some(vec![1, 2, 3]));
-        let cyc = vec![task(1, "a", &[2]), task(2, "b", &[1])];
-        assert_eq!(topological_order(&cyc), None);
     }
 
     #[test]

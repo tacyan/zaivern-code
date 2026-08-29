@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::graph;
+use super::graph::{self, PhaseStatus};
 use super::launch;
 use super::model::*;
 use super::persistence::{self, LoadOutcome};
@@ -160,7 +160,8 @@ pub fn render_plan(plan: &TeamPlan, agents: usize) -> String {
         s.push_str(&format!("  - {d}\n"));
     }
     s.push_str(&format!(
-        "\nチーム ({} レーン) / 最大 {} セッション\n",
+        "\nPlanner: {} / チーム {} レーン / 最大 {} セッション\n",
+        StaticPlanner.name(),
         plan.teams.len(),
         agents
     ));
@@ -217,7 +218,7 @@ pub fn plan_json(plan: &TeamPlan) -> String {
                 "id": t.id,
                 "key": t.key,
                 "title": t.title,
-                "team": t.team_id.0,
+                "team": t.team_id.as_str(),
                 "role": t.role.key(),
                 "depends_on": t.dependencies,
                 "files": t.files,
@@ -230,10 +231,11 @@ pub fn plan_json(plan: &TeamPlan) -> String {
     let teams: Vec<serde_json::Value> = plan
         .teams
         .iter()
-        .map(|t| serde_json::json!({"key": t.id.0, "name": t.name, "lead_role": t.lead_role.key()}))
+        .map(|t| serde_json::json!({"key": t.id.as_str(), "name": t.name, "lead_role": t.lead_role.key()}))
         .collect();
     serde_json::to_string_pretty(&serde_json::json!({
         "goal": {
+            "id": plan.goal.id.as_str(),
             "title": plan.goal.title,
             "definition_of_done": plan.goal.definition_of_done,
         },
@@ -312,8 +314,36 @@ pub fn render_status(s: &persistence::Saved) -> String {
 
 /// 保存された状態を JSON にする。
 pub fn status_json(s: &persistence::Saved) -> String {
+    // 状態ごとの件数。**全状態を必ず出す** (0 件の状態を落とすと、読む側が
+    // 「その状態が無い」のか「集計されていない」のか区別できない)。
+    let mut by_state = serde_json::Map::new();
+    for st in TeamTaskState::ALL {
+        let n = s.tasks.iter().filter(|t| t.state == st).count();
+        by_state.insert(st.key().to_string(), serde_json::json!(n));
+    }
+    let goal_completed = s.goal.status == GoalStatus::Completed;
+    let phases: Vec<serde_json::Value> = graph::phases(&s.tasks, goal_completed)
+        .into_iter()
+        .map(|(p, st)| {
+            serde_json::json!({
+                "phase": p.key(),
+                "status": st.key(),
+                "running": st == PhaseStatus::Running,
+            })
+        })
+        .collect();
+    let events: Vec<serde_json::Value> = s
+        .events
+        .iter()
+        .rev()
+        .take(20)
+        .map(|e| serde_json::json!({"at": e.at, "kind": e.kind.key(), "summary": e.summary}))
+        .collect();
     serde_json::to_string_pretty(&serde_json::json!({
         "run_id": s.run.run_id,
+        "by_state": by_state,
+        "phases": phases,
+        "events": events,
         "goal": {"title": s.goal.title, "status": s.goal.status.key()},
         "paused": s.run.paused,
         "stopped": s.run.stopped,

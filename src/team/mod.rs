@@ -41,8 +41,11 @@
 
 pub mod cli;
 pub mod graph;
+pub mod inspector;
 pub mod launch;
 pub mod model;
+pub mod organization_board;
+pub mod panel;
 pub mod persistence;
 pub mod plan_schema;
 pub mod planner;

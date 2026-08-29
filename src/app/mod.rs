@@ -4287,6 +4287,9 @@ mod remote_api;
 mod save_files;
 mod shortcuts;
 mod sidebar_ui;
+// 🏛 AI 開発チーム制御面 (実体は src/team/、登録は src/features/team.rs)。
+// ここに置くのは既存の起動・送信・停止・端末選択へ繋ぐ橋だけ。
+mod team_glue;
 mod top_bar_ui;
 mod whichkey_voice;
 

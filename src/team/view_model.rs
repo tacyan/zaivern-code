@@ -88,6 +88,9 @@ pub struct TaskView {
     pub validation_commands: Vec<String>,
     pub validation_ok: bool,
     pub validation_ran: bool,
+    /// 1 本でも失敗しているか。**「未実行」と「失敗」を混ぜない**
+    /// (混ぜると、まだ走っていないタスクを赤く出してしまう)。
+    pub validation_failed: bool,
     pub review_verdict: Option<ReviewVerdict>,
     pub review_findings: Vec<String>,
     pub blockers: Vec<String>,
@@ -127,6 +130,10 @@ pub struct TeamMetricsView {
     pub pending_decisions: usize,
     /// 0〜100 の整数 (浮動小数を画面に出さない)。
     pub progress_pct: u8,
+    /// 設定された最大同時セッション数。
+    pub agent_limit: usize,
+    /// 設定された最大試行回数。
+    pub max_attempts: u8,
 }
 
 /// GUI が読む不変スナップショット。
@@ -232,6 +239,7 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
             validation_commands: t.validation_commands.clone(),
             validation_ok: t.validation.passed(&t.validation_commands),
             validation_ran: !t.validation.runs.is_empty(),
+            validation_failed: t.validation.failed(),
             review_verdict: t.review.verdict,
             review_findings: t.review.findings.clone(),
             blockers: t.blockers.clone(),
@@ -289,6 +297,8 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
         reviews_approved: tasks.iter().filter(|t| t.review.approved()).count(),
         pending_decisions: rt.decisions().len(),
         progress_pct: (graph::progress(tasks) * 100.0).round() as u8,
+        agent_limit: rt.run().agent_count,
+        max_attempts: rt.run().max_attempts,
     };
 
     TeamSnapshot {
@@ -374,11 +384,7 @@ pub fn current_action(s: &TeamSnapshot) -> CurrentAction {
             urgent: false,
         };
     }
-    if let Some(t) = s
-        .tasks
-        .iter()
-        .find(|t| t.validation_ran && !t.validation_ok)
-    {
+    if let Some(t) = s.tasks.iter().find(|t| t.validation_failed) {
         return CurrentAction {
             glyph: AgentWorkState::Testing.glyph(),
             text: format!("#{} {} の検証が失敗しています", t.id, t.title),
