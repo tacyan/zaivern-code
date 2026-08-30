@@ -164,7 +164,10 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
     ));
     s.push_str("\n## 受入基準 (これを満たしているか)\n");
     s.push_str(&bullets(&target.acceptance_criteria));
-    s.push_str("\n## 変更されたファイル\n");
+    // **Zaivern が実測したもの**を渡す (`TeamTask::changed_files`)。
+    // 自己申告を渡すと、書き忘れたファイルはレビューの対象にすら
+    // ならない — レビュアーは「書いていないもの」を見られない。
+    s.push_str("\n## 変更されたファイル (Zaivern が実測)\n");
     s.push_str(&bullets(&target.changed_files));
     s.push_str("\n## 実装担当の報告\n");
     s.push_str(&format!(

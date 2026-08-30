@@ -41,6 +41,7 @@
 //!
 //! 使い方と設計の全体像は `docs/team.md`。
 
+pub mod changeset;
 pub mod cli;
 pub mod graph;
 pub mod inspector;
@@ -72,3 +73,7 @@ mod runtime_tests;
 
 #[cfg(test)]
 mod wiring_tests;
+
+#[cfg(test)]
+#[path = "changeset_tests.rs"]
+mod changeset_tests;

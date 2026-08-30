@@ -61,6 +61,50 @@ struct Lab {
     /// 走らせて、終わったフレームで結果を戻す (同じ tick で即答すると、
     /// 「検証待ち」という状態が 1 度も観測されない筋書きになる)。
     queued_validations: Vec<super::runtime::ValidationSpec>,
+    /// 実験場のワークスペース。**実 git リポジトリ**なら実測が本当に走る。
+    workspace: PathBuf,
+    real_git: bool,
+}
+
+/// 実験用の git リポジトリを 1 つ作る (作れなければ `None`)。
+fn git_repo() -> Option<PathBuf> {
+    let d = crate::test_util::unique_temp_dir("zaivern-team-e2e", "repo");
+    std::fs::create_dir_all(&d).ok()?;
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !run(&["init", "-q"]) {
+        std::fs::remove_dir_all(&d).ok();
+        return None;
+    }
+    // **利用者の設定に頼らない** (CI の runner には user.email が無い)。
+    run(&["config", "user.email", "t@example.invalid"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(d.join("README.md"), "e2e\n").ok()?;
+    if !run(&["add", "-A"]) || !run(&["commit", "-q", "-m", "init"]) {
+        std::fs::remove_dir_all(&d).ok();
+        return None;
+    }
+    Some(d)
+}
+
+impl Drop for Lab {
+    fn drop(&mut self) {
+        // **自分が作ったものだけ消す** (パターン検索で見つけたものは消さない)。
+        if self.real_git {
+            std::fs::remove_dir_all(&self.workspace).ok();
+        }
+        test_hooks::clear();
+    }
 }
 
 impl Lab {
@@ -74,9 +118,19 @@ impl Lab {
                 roles: Vec::new(),
             })
             .expect("計画できるべき");
+        // **受入シナリオは実リポジトリで回す。**
+        //
+        // 変更ファイルの実測は git を読む。ここを架空のパスにすると、
+        // 「実測できません」で完了報告が全部止まる筋書きしか通らず、
+        // 受入シナリオが受入シナリオでなくなる。git が無い環境では
+        // 架空のパスへ落として、実測の差し替えで先へ進める。
+        let (workspace, real_git) = match git_repo() {
+            Some(d) => (d, true),
+            None => (PathBuf::from("/zaivern-team-e2e"), false),
+        };
         let mut rt = TeamRuntime::from_plan(
             plan,
-            PathBuf::from("/zaivern-team-e2e"),
+            workspace.clone(),
             RunOptions {
                 run_id: "run-e2e".into(),
                 spec_source: "SPEC.md".into(),
@@ -86,6 +140,16 @@ impl Lab {
             },
         );
         rt.apply_action(TeamAction::Start);
+        if !real_git {
+            eprintln!("[skip] e2e: git を使えないので実測を差し替えます");
+            test_hooks::set_baseline(Some(super::changeset::FileBaseline {
+                complete: true,
+                ..Default::default()
+            }));
+            test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+                measured: Vec::new(),
+            }));
+        }
         Self {
             rt,
             sessions: Vec::new(),
@@ -94,7 +158,26 @@ impl Lab {
             validation_passes: true,
             approve_validation: true,
             queued_validations: Vec::new(),
+            workspace,
+            real_git,
         }
+    }
+
+    /// 実験場のワークスペース (実 git のときだけ意味がある)。
+    fn workspace(&self) -> &std::path::Path {
+        &self.workspace
+    }
+
+    /// エージェントの代わりにファイルを書く (実 git のときだけ)。
+    fn agent_writes(&self, rel: &str, body: &str) {
+        if !self.real_git {
+            return;
+        }
+        let p = self.workspace.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(p, body).ok();
     }
 
     /// 1 tick 回す。`target` に指定したセッションにだけテキストを見せる。

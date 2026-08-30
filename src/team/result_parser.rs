@@ -85,8 +85,14 @@ pub enum RejectReason {
     TaskMismatch { got: TaskId, want: TaskId },
     /// エージェント ID が割り当てと違う。
     AgentMismatch { got: String, want: String },
-    /// 担当外のファイルを変更している。
+    /// 担当外のファイルを変更している (**実測**)。
     OutOfScopeFiles(Vec<String>),
+    /// 自己申告で担当外のファイルを挙げている。
+    ///
+    /// 実測とは分けて出す — 直し方が違う (申告を直すのか、変更を戻すのか)。
+    OutOfScopeReported(Vec<String>),
+    /// **実測できなかった。** 担当範囲を守ったと言える根拠が無い。
+    EvidenceUnavailable(String),
     /// 受入基準に対する検証が実行されていない。
     ValidationMissing(Vec<String>),
     /// 検証が失敗している。
@@ -110,7 +116,18 @@ impl RejectReason {
                 format!("報告のエージェント「{got}」が担当「{want}」と一致しません")
             }
             RejectReason::OutOfScopeFiles(f) => {
-                format!("担当外のファイルを変更しています: {}", f.join(", "))
+                format!(
+                    "担当外のファイルが実際に変更されています: {}",
+                    f.join(", ")
+                )
+            }
+            RejectReason::OutOfScopeReported(f) => {
+                format!("担当外のファイルを変更したと報告しています: {}", f.join(", "))
+            }
+            RejectReason::EvidenceUnavailable(w) => {
+                format!(
+                    "変更されたファイルを実測できないので完了にできません: {w}"
+                )
             }
             RejectReason::ValidationMissing(c) => {
                 format!("検証コマンドが実行されていません: {}", c.join(", "))
@@ -130,6 +147,45 @@ pub enum ReportedStatus {
     Failed,
 }
 
+/// **Zaivern 自身が測った**変更ファイルの証跡。
+///
+/// これを [`accept`] へ渡すのが要点。渡さずにエージェントの
+/// `changed_files` だけで照合すると、**申告し忘れ・意図的な省略と
+/// 「本当に触っていない」が区別できない**ので、担当外を書き換えた
+/// タスクが素通りする (しかも台帳には「担当内だけ」と残る)。
+///
+/// 測るのは [`super::changeset`]。この型は測り方を知らない — 判定は
+/// 純関数のままにして、テストから両方の筋書きを作れるようにする。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileEvidence {
+    /// 測れた。**このタスクに帰属する**変更のパス (正規化済み)。
+    Measured {
+        /// 自分の担当範囲の中で実際に変わったもの。
+        mine: Vec<String>,
+        /// 自分のものと言わざるを得ないのに担当範囲の外にあるもの。
+        out_of_scope: Vec<String>,
+    },
+    /// 測れなかった (理由つき)。**完了は通さない。**
+    Unavailable(String),
+    /// このタスクに担当範囲が宣言されていない。
+    ///
+    /// 範囲が無ければ「範囲外」も無い。**測った事実は残すが、
+    /// 範囲の照合はできない**ことを型で言い切る (黙って空の
+    /// `Measured` にすると「担当内だけだった」と読める)。
+    NoScope { measured: Vec<String> },
+}
+
+impl FileEvidence {
+    /// 実測できた変更 (表示・台帳用)。
+    pub fn measured_paths(&self) -> &[String] {
+        match self {
+            FileEvidence::Measured { mine, .. } => mine,
+            FileEvidence::NoScope { measured } => measured,
+            FileEvidence::Unavailable(_) => &[],
+        }
+    }
+}
+
 /// 受理された報告。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedResult {
@@ -137,9 +193,38 @@ pub struct AcceptedResult {
     pub agent_id: AgentId,
     pub status: ReportedStatus,
     pub summary: String,
+    /// **実測した**変更ファイル。台帳と画面はこちらを「変更したファイル」
+    /// として扱う。
     pub changed_files: Vec<String>,
+    /// エージェントの**自己申告**。証跡ではなく参考情報。
+    ///
+    /// 実測と食い違ったら、その食い違い自体が読み手への情報になる
+    /// ([`Self::report_mismatch`])。
+    pub reported_files: Vec<String>,
     pub validation: Vec<ValidationRun>,
     pub blockers: Vec<String>,
+}
+
+impl AcceptedResult {
+    /// 自己申告と実測の食い違い (`申告し忘れ`, `申告だけあって実体が無い`)。
+    ///
+    /// **どちらも黙って捨てない。** 前者は「何を変えたか把握していない」
+    /// の印で、後者は「やったつもりで何も変わっていない」の印。
+    pub fn report_mismatch(&self) -> (Vec<String>, Vec<String>) {
+        let missing: Vec<String> = self
+            .changed_files
+            .iter()
+            .filter(|m| !self.reported_files.iter().any(|r| r == *m))
+            .cloned()
+            .collect();
+        let phantom: Vec<String> = self
+            .reported_files
+            .iter()
+            .filter(|r| !self.changed_files.iter().any(|m| m == *r))
+            .cloned()
+            .collect();
+        (missing, phantom)
+    }
 }
 
 /// 囲まれたブロックを全部取り出す (開始 → 終了の順で、入れ子は無いものとする)。
@@ -200,7 +285,11 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
 /// 報告を、割り当てられたタスクと突き合わせて受理するか決める。
 ///
 /// **ここが「完了」の関門**。落ちた理由はそのまま人へ出す。
-pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectReason> {
+pub fn accept(
+    doc: ResultDoc,
+    task: &TeamTask,
+    evidence: &FileEvidence,
+) -> Result<AcceptedResult, RejectReason> {
     if doc.task_id != task.id {
         return Err(RejectReason::TaskMismatch {
             got: doc.task_id,
@@ -252,24 +341,41 @@ pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectR
             task_id: task.id,
             agent_id: AgentId::new(doc.agent_id.trim()),
             status,
+            changed_files: evidence.measured_paths().to_vec(),
+            reported_files: changed,
             summary: super::model::clamp_text(&doc.summary),
-            changed_files: changed,
             validation,
             blockers: doc.blockers.clone(),
         });
     }
 
     // 1) 担当外のファイルを触っていないか。
-    //    **担当ファイルが未申告 (空) のタスクは照合しない** — 何を触ってよいかを
-    //    こちらが言っていないのに咎めるのは筋が通らない。
+    //
+    //    **根拠は実測**。自己申告 (`doc.changed_files`) は、書き忘れても
+    //    意図的に省いても同じ「空の配列」になるので、これを唯一の根拠に
+    //    すると担当外の変更が素通りする。
+    match evidence {
+        // 測れていない = 「担当範囲を守った」と言える根拠が無い。
+        // **通さない** (人へ渡す)。
+        FileEvidence::Unavailable(why) => {
+            return Err(RejectReason::EvidenceUnavailable(why.clone()));
+        }
+        FileEvidence::Measured { out_of_scope, .. } if !out_of_scope.is_empty() => {
+            return Err(RejectReason::OutOfScopeFiles(out_of_scope.clone()));
+        }
+        _ => {}
+    }
+    // 自己申告のほうも見る。**実測とは別に咎める** — 直し方が違う
+    // (申告を直すのか、変更を戻すのか)。担当範囲が空のタスクは
+    // 照合しない (何を触ってよいかこちらが言っていない)。
     if !task.files.is_empty() {
-        let out_of_scope: Vec<String> = changed
+        let bad: Vec<String> = changed
             .iter()
             .filter(|f| !task.files.iter().any(|p| crate::lease::overlaps(p, f)))
             .cloned()
             .collect();
-        if !out_of_scope.is_empty() {
-            return Err(RejectReason::OutOfScopeFiles(out_of_scope));
+        if !bad.is_empty() {
+            return Err(RejectReason::OutOfScopeReported(bad));
         }
     }
 
@@ -310,7 +416,10 @@ pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectR
         agent_id: AgentId::new(doc.agent_id.trim()),
         status,
         summary: super::model::clamp_text(&doc.summary),
-        changed_files: changed,
+        // **台帳へ載るのは実測のほう。** 自己申告を載せると、後から
+        // 見た人が「これが実際に変わったファイルだ」と読んでしまう。
+        changed_files: evidence.measured_paths().to_vec(),
+        reported_files: changed,
         validation,
         blockers: Vec::new(),
     })
@@ -557,6 +666,22 @@ mod tests {
         t
     }
 
+    /// 「担当内だけを変更した」と**実測できた**証跡。
+    fn clean() -> FileEvidence {
+        FileEvidence::Measured {
+            mine: vec!["src/auth.rs".to_string()],
+            out_of_scope: Vec::new(),
+        }
+    }
+
+    /// 担当外まで変更したと**実測できた**証跡。
+    fn dirty(out: &[&str]) -> FileEvidence {
+        FileEvidence::Measured {
+            mine: vec!["src/auth.rs".to_string()],
+            out_of_scope: out.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
     const GOOD: &str = r#"{
       "task_id": 12,
       "agent_id": "backend-api-1",
@@ -585,7 +710,7 @@ mod tests {
     #[test]
     fn 正しい報告を受理する() {
         let doc = parse_result(GOOD).unwrap();
-        let acc = accept(doc, &assigned()).expect("受理されるべき");
+        let acc = accept(doc, &assigned(), &clean()).expect("受理されるべき");
         assert_eq!(acc.status, ReportedStatus::Completed);
         assert_eq!(acc.changed_files, vec!["src/auth.rs".to_string()]);
     }
@@ -603,7 +728,7 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.task_id = 99;
         assert_eq!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::TaskMismatch { got: 99, want: 12 })
         );
     }
@@ -613,19 +738,163 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.agent_id = "someone-else".into();
         assert!(matches!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::AgentMismatch { .. })
         ));
     }
 
     #[test]
     fn 担当外ファイルの変更を拒否する() {
+        // 自己申告のほうに担当外が出ていたら、それも咎める
+        // (**実測とは別の理由**として出す — 直し方が違う)。
         let mut doc = parse_result(GOOD).unwrap();
         doc.changed_files.push("src/other.rs".into());
         assert_eq!(
-            accept(doc, &assigned()),
-            Err(RejectReason::OutOfScopeFiles(vec!["src/other.rs".into()]))
+            accept(doc, &assigned(), &clean()),
+            Err(RejectReason::OutOfScopeReported(vec!["src/other.rs".into()]))
         );
+    }
+
+    // ── 実測を根拠にする ─────────────────────────────────────────────
+
+    #[test]
+    fn 自己申告が空でも実測が担当外なら拒否する() {
+        // **これが中核。** 申告し忘れても、意図的に省いても、こちらから
+        // 見れば同じ「空の配列」になる。自己申告を唯一の根拠にすると、
+        // 担当外を書き換えたタスクが素通りする。
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files.clear();
+        assert_eq!(
+            accept(doc, &assigned(), &dirty(&["src/secret.rs"])),
+            Err(RejectReason::OutOfScopeFiles(vec!["src/secret.rs".into()])),
+            "申告さえしなければ担当外の変更が通ってしまう"
+        );
+    }
+
+    #[test]
+    fn 自己申告から担当外を省いても実測で拒否する() {
+        // 担当内のファイルだけを申告し、担当外の変更は黙っている形。
+        let doc = parse_result(GOOD).unwrap();
+        assert_eq!(doc.changed_files, vec!["src/auth.rs".to_string()]);
+        assert_eq!(
+            accept(doc, &assigned(), &dirty(&["../outside.rs", "docs/x.md"])),
+            Err(RejectReason::OutOfScopeFiles(vec![
+                "../outside.rs".into(),
+                "docs/x.md".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn 実測が担当内なら通り台帳には実測が載る() {
+        let mut doc = parse_result(GOOD).unwrap();
+        // 申告し忘れがあっても、実測が担当内なら完了そのものは通す。
+        doc.changed_files.clear();
+        let acc = accept(doc, &assigned(), &clean()).expect("受理されるべき");
+        assert_eq!(
+            acc.changed_files,
+            vec!["src/auth.rs".to_string()],
+            "台帳へ載るのは実測のほう"
+        );
+        assert!(acc.reported_files.is_empty(), "自己申告は自己申告として残す");
+        // 食い違いが見える形で残る。
+        let (missing, phantom) = acc.report_mismatch();
+        assert_eq!(missing, vec!["src/auth.rs".to_string()]);
+        assert!(phantom.is_empty());
+    }
+
+    #[test]
+    fn 申告だけあって実体が無いことも見える() {
+        // 「やったつもりで何も変わっていない」の印。
+        let doc = parse_result(GOOD).unwrap();
+        let acc = accept(
+            doc,
+            &assigned(),
+            &FileEvidence::Measured {
+                mine: Vec::new(),
+                out_of_scope: Vec::new(),
+            },
+        )
+        .expect("受理されるべき");
+        let (missing, phantom) = acc.report_mismatch();
+        assert!(missing.is_empty());
+        assert_eq!(phantom, vec!["src/auth.rs".to_string()]);
+    }
+
+    #[test]
+    fn 実測できないなら完了にしない() {
+        // **保証を偽らない。** 測れないのに通すと、台帳には「担当内だけ」
+        // と残る。人へ渡すのが正しい。
+        let doc = parse_result(GOOD).unwrap();
+        let got = accept(
+            doc,
+            &assigned(),
+            &FileEvidence::Unavailable("git 管理下ではありません".into()),
+        );
+        assert_eq!(
+            got,
+            Err(RejectReason::EvidenceUnavailable(
+                "git 管理下ではありません".into()
+            ))
+        );
+        assert!(
+            got.unwrap_err().detail().contains("git 管理下"),
+            "人へ理由が伝わらない"
+        );
+    }
+
+    #[test]
+    fn 実測できなくても完了以外はそのまま受け取る() {
+        // 「進められない」「失敗した」は、実測できるかどうかとは無関係。
+        // ここまで止めると、詰まったタスクが誰にも見えなくなる。
+        for st in ["blocked", "failed"] {
+            let mut doc = parse_result(GOOD).unwrap();
+            doc.status = st.into();
+            let acc = accept(doc, &assigned(), &FileEvidence::Unavailable("x".into()))
+                .unwrap_or_else(|e| panic!("{st} を止めた: {e:?}"));
+            assert_ne!(acc.status, ReportedStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn 担当範囲が無いタスクは範囲外を作らない() {
+        // 何を触ってよいかこちらが言っていないのに咎めるのは筋が通らない。
+        // ただし**測った事実は残す**。
+        let mut t = assigned();
+        t.files.clear();
+        let doc = parse_result(GOOD).unwrap();
+        let acc = accept(
+            doc,
+            &t,
+            &FileEvidence::NoScope {
+                measured: vec!["src/anything.rs".to_string()],
+            },
+        )
+        .expect("受理されるべき");
+        assert_eq!(acc.changed_files, vec!["src/anything.rs".to_string()]);
+    }
+
+    #[test]
+    fn 自己申告を書き換えるだけでは通らない() {
+        // **申告を「正直」にしても、実測が担当外なら通らない。**
+        // ここが通ってしまうと、結局は自己申告で結果が決まっている。
+        for reported in [
+            vec![],
+            vec!["src/auth.rs".to_string()],
+            vec!["src/auth.rs".to_string(), "src/other.rs".to_string()],
+        ] {
+            let mut doc = parse_result(GOOD).unwrap();
+            doc.changed_files = reported.clone();
+            let got = accept(doc, &assigned(), &dirty(&["src/other.rs"]));
+            assert!(
+                matches!(
+                    got,
+                    Err(RejectReason::OutOfScopeFiles(_))
+                        | Err(RejectReason::OutOfScopeReported(_))
+                ),
+                "申告を {reported:?} にしただけで通った: {got:?}"
+            );
+        }
     }
 
     #[test]
@@ -633,7 +902,7 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.validation.clear();
         assert_eq!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::ValidationMissing(vec![
                 "cargo test auth".into()
             ]))
@@ -645,7 +914,7 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.validation[0].exit_code = 1;
         assert_eq!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::ValidationFailed(vec![
                 "cargo test auth".into()
             ]))
@@ -657,7 +926,7 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.blockers.push("migration 仕様待ち".into());
         assert!(matches!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::BlockersRemain(_))
         ));
     }
@@ -667,7 +936,7 @@ mod tests {
         let mut doc = parse_result(GOOD).unwrap();
         doc.status = "almost".into();
         assert!(matches!(
-            accept(doc, &assigned()),
+            accept(doc, &assigned(), &clean()),
             Err(RejectReason::UnknownStatus(_))
         ));
     }

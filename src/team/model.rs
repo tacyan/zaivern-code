@@ -817,10 +817,26 @@ pub struct TeamTask {
     /// ファイルを同時に持つ。
     #[serde(default)]
     pub reassign_pending: bool,
+    /// **配る直前に取った、変更を測るための基準点。**
+    ///
+    /// これが無いと、完了報告の時点で「このタスクが何を変えたのか」を
+    /// こちらから言う手段が無くなり、照合はエージェントの自己申告に
+    /// 頼るしかなくなる (= 申告し忘れれば担当外の変更が素通りする)。
+    ///
+    /// タスクへ持たせて**保存する** — 再起動をまたいでも同じ基準で
+    /// 測れないと、再開した瞬間に全部が「実測できません」になる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<super::changeset::FileBaseline>,
     /// 直近の完了報告の要約。
     pub last_summary: String,
-    /// 直近報告で変更されたファイル。担当外を触っていないかの照合に使う。
+    /// **Zaivern が実測した**変更ファイル。担当外を触っていないかの照合に使う。
     pub changed_files: Vec<String>,
+    /// エージェントの**自己申告**。証跡ではなく、人が読むための参考情報。
+    ///
+    /// 実測 ([`Self::changed_files`]) と分けて持つ。混ぜると、後から
+    /// 見た人が自己申告を「実際に変わったファイル」として読む。
+    #[serde(default)]
+    pub reported_files: Vec<String>,
     pub blockers: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,

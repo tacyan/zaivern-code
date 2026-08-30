@@ -39,6 +39,8 @@ pub fn task(id: u64, key: &str, deps: &[u64]) -> TeamTask {
         reassign_pending: false,
         last_summary: String::new(),
         changed_files: Vec::new(),
+        reported_files: Vec::new(),
+        baseline: None,
         blockers: Vec::new(),
         created_at: 1,
         updated_at: 1,

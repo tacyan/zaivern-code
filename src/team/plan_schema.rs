@@ -272,6 +272,8 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
                 })
                 .collect(),
             state: TeamTaskState::Pending,
+            baseline: None,
+            reported_files: Vec::new(),
             assigned_agent: None,
             assigned_session: None,
             attempts: 0,

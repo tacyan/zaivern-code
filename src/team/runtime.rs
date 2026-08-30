@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::coordinator::{self, Coordinator, SessionState};
 
+use super::changeset;
 use super::graph;
 use super::model::*;
 use super::persistence::{
@@ -600,6 +601,25 @@ impl TeamRuntime {
                 .iter()
                 .map(|s| ValidationCommand::parse(s).expect("テストのコマンドは組み立てられる"))
                 .collect();
+        }
+    }
+
+    /// テスト用: 担当ファイルを差し替える (`StaticPlanner` は空で作る)。
+    #[cfg(test)]
+    pub fn set_files_for_test(&mut self, task: TaskId, files: &[&str]) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.files = files
+                .iter()
+                .map(|s| crate::lease::normalize_spec(s))
+                .collect();
+        }
+    }
+
+    /// テスト用: 状態を直接置く (**隣のタスクを「作業中」にするため**)。
+    #[cfg(test)]
+    pub fn force_state_for_test(&mut self, task: TaskId, state: TeamTaskState) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.state = state;
         }
     }
 
@@ -1530,7 +1550,10 @@ impl TeamRuntime {
             return;
         }
 
-        match rp::accept(doc, &task) {
+        // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
+        // は補助情報として持ち越すだけ。
+        let evidence = self.file_evidence(&task);
+        match rp::accept(doc, &task, &evidence) {
             Ok(acc) => self.apply_accepted(agent, acc),
             Err(e) => {
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
@@ -1563,11 +1586,32 @@ impl TeamRuntime {
         // 「進められない」と言われたら、**人へ渡す**。
         let mut blocked = false;
 
+        // **申告と実測の食い違いを黙って捨てない。** 前者は「何を変えたか
+        // 把握していない」の印、後者は「やったつもりで何も変わっていない」
+        // の印で、どちらも人が読むべき事実。
+        let (unreported, phantom) = acc.report_mismatch();
+
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
+            // **台帳へ載るのは実測。** 自己申告を載せると、後から見た人が
+            // 「これが実際に変わったファイルだ」と読んでしまう。
             t.changed_files = acc.changed_files.clone();
+            t.reported_files = acc.reported_files.clone();
             t.blockers = acc.blockers.clone();
             t.updated_at = now;
+            if !unreported.is_empty() {
+                t.context.push(clamp_text(&format!(
+                    "報告に無いが実際に変更されたファイル: {}",
+                    unreported.join(", ")
+                )));
+            }
+            if !phantom.is_empty() {
+                t.context.push(clamp_text(&format!(
+                    "変更したと報告されたが実際には変わっていないファイル: {}",
+                    phantom.join(", ")
+                )));
+            }
+            t.context = clamp_list(std::mem::take(&mut t.context));
             match acc.status {
                 ReportedStatus::Blocked => {
                     // **前任の保持を解く。** 「進められない」と言った時点で
@@ -1635,6 +1679,27 @@ impl TeamRuntime {
                 format!("#{} が進められないと報告しました: {why}", acc.task_id),
                 "詰まりを解いてから Retry してください".into(),
                 vec!["retry".into(), "reject".into()],
+            );
+        }
+
+        // **食い違いは事象としても残す。** タスクのコンテキストは次の担当が
+        // 読むもので、こちらは人が時系列で追うためのもの。
+        if !unreported.is_empty() || !phantom.is_empty() {
+            let mut why = String::new();
+            if !unreported.is_empty() {
+                why.push_str(&format!("報告に無い変更: {}", unreported.join(", ")));
+            }
+            if !phantom.is_empty() {
+                if !why.is_empty() {
+                    why.push_str(" / ");
+                }
+                why.push_str(&format!("報告だけの変更: {}", phantom.join(", ")));
+            }
+            self.log(
+                TeamEventKind::Rejected,
+                Some(agent.clone()),
+                None,
+                format!("#{} の報告と実測が食い違います ({why})", acc.task_id),
             );
         }
 
@@ -2347,7 +2412,15 @@ impl TeamRuntime {
                 Ok(session) => {
                     self.co.note_running(coord_id, at);
                     let text = self.instruction_for(&task, &a.agent);
+                    // **配る直前に基準点を取る。** ここで取らないと、完了
+                    // 報告の時点で「このタスクが何を変えたか」をこちらから
+                    // 言う手段が無くなり、照合が自己申告頼みになる。
+                    //
+                    // 取れなかった理由も持つ (`unavailable`) — 黙って空に
+                    // すると「何も汚れていなかった」と読める。
+                    let baseline = self.capture_baseline();
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == a.task) {
+                        t.baseline = Some(baseline);
                         // **前回の実測はこれから作るものへの証跡ではない。**
                         // 配る瞬間に捨てる (1 か所に閉じる)。
                         t.validation.runs.clear();
@@ -2401,6 +2474,61 @@ impl TeamRuntime {
                     }
                 }
             }
+        }
+    }
+
+    /// 配る直前の基準点を取る (取れなければ理由を持った基準点)。
+    ///
+    /// **失敗を握り潰さない。** 空の基準点を返すと、完了報告の時点で
+    /// 「何も汚れていなかった」と読めてしまい、担当外の変更が
+    /// 「担当内だけ」に化ける。
+    fn capture_baseline(&self) -> changeset::FileBaseline {
+        #[cfg(test)]
+        if let Some(b) = test_hooks::forced_baseline() {
+            return b;
+        }
+        match changeset::capture_baseline(&self.workspace) {
+            Ok(b) => b,
+            Err(e) => changeset::FileBaseline::unavailable(e.detail()),
+        }
+    }
+
+    /// 完了報告の時点で、このタスクに帰属する変更を測る。
+    ///
+    /// **並列作業を切り分ける。** 「作業ツリーと HEAD の差分」をそのまま
+    /// 成果にすると、隣のタスクの変更を自分のものとして数える。切り分けは
+    /// 既存のファイル所有リースの担当範囲で行う (`changeset::attribute`)。
+    fn file_evidence(&self, task: &TeamTask) -> rp::FileEvidence {
+        #[cfg(test)]
+        if let Some(e) = test_hooks::forced_evidence() {
+            return e;
+        }
+        let Some(base) = task.baseline.as_ref() else {
+            return rp::FileEvidence::Unavailable(
+                changeset::MeasureError::NoBaseline(String::new()).detail(),
+            );
+        };
+        let measured = match changeset::measure(&self.workspace, base) {
+            Ok(v) => v,
+            Err(e) => return rp::FileEvidence::Unavailable(e.detail()),
+        };
+        let paths: Vec<String> = measured.into_iter().map(|c| c.path).collect();
+        if task.files.is_empty() {
+            // **担当範囲が無ければ「範囲外」も無い。** 測った事実だけ残す。
+            return rp::FileEvidence::NoScope { measured: paths };
+        }
+        // いま**他のタスクが握っている**範囲。リースは範囲が互いに素で
+        // あることを保証しているので、ここの変更は自分のものではない。
+        let others: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|t| t.id != task.id && t.state.is_held())
+            .flat_map(|t| t.files.clone())
+            .collect();
+        let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);
+        rp::FileEvidence::Measured {
+            mine: mine.into_iter().cloned().collect(),
+            out_of_scope: out_of_scope.into_iter().cloned().collect(),
         }
     }
 
@@ -2610,6 +2738,8 @@ impl TeamRuntime {
             reassign_pending: false,
             last_summary: String::new(),
             changed_files: Vec::new(),
+            reported_files: Vec::new(),
+            baseline: None,
             blockers: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -2892,4 +3022,49 @@ fn task_id_as_agent(t: &TeamTask) -> AgentId {
     t.assigned_agent
         .clone()
         .unwrap_or_else(|| AgentId::new("(未割り当て)"))
+}
+
+/// **テストから実測の入口だけを差し替える口。**
+///
+/// 実測そのものは `changeset` の番人が実 git で確かめている。ここで
+/// 差し替えたいのは「測った結果をどう扱うか」(受理・却下・帰属) のほうで、
+/// そのために毎回 git リポジトリを作るのは実験を遅く・脆くするだけ。
+///
+/// **プロセス共通の `static` にしない。** 同時に走っている他のテストの
+/// 差し替えまで混ざる (CLAUDE.md の実績あり)。
+#[cfg(test)]
+pub mod test_hooks {
+    use std::cell::RefCell;
+
+    use super::changeset::FileBaseline;
+    use super::rp::FileEvidence;
+
+    thread_local! {
+        static BASELINE: RefCell<Option<FileBaseline>> = const { RefCell::new(None) };
+        static EVIDENCE: RefCell<Option<FileEvidence>> = const { RefCell::new(None) };
+    }
+
+    /// 配る瞬間に返す基準点を固定する。
+    pub fn set_baseline(b: Option<FileBaseline>) {
+        BASELINE.with(|c| *c.borrow_mut() = b);
+    }
+
+    /// 完了報告の瞬間に返す実測を固定する。
+    pub fn set_evidence(e: Option<FileEvidence>) {
+        EVIDENCE.with(|c| *c.borrow_mut() = e);
+    }
+
+    /// 差し替えを全部外す (テストの後始末)。
+    pub fn clear() {
+        set_baseline(None);
+        set_evidence(None);
+    }
+
+    pub(super) fn forced_baseline() -> Option<FileBaseline> {
+        BASELINE.with(|c| c.borrow().clone())
+    }
+
+    pub(super) fn forced_evidence() -> Option<FileEvidence> {
+        EVIDENCE.with(|c| c.borrow().clone())
+    }
 }

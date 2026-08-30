@@ -64,6 +64,24 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
         },
     );
     rt.apply_action(TeamAction::Start);
+    // **実測の入口だけを差し替える。**
+    //
+    // ここで確かめたいのは調停の判断 (受理・却下・差し戻し) であって、
+    // git の読み方ではない。測ること自体は `changeset_tests` が**実 git**
+    // で確かめ、Runtime が本当に測って本当に断ることは
+    // `実測で担当外を掴んだら完了にしない` が**実 git + 実タスク**で
+    // 確かめる。ここを実リポジトリにすると、判断のテスト 200 本ぶんの
+    // `git init` を毎回払うことになる。
+    //
+    // 既定は「測れた・担当範囲は宣言されていない」= StaticPlanner の
+    // 計画 (`files` が空) で実際に起きる形。
+    test_hooks::set_baseline(Some(super::changeset::FileBaseline {
+        complete: true,
+        ..Default::default()
+    }));
+    test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+        measured: Vec::new(),
+    }));
     rt
 }
 
@@ -1355,6 +1373,242 @@ fn 時間切れは失敗として決着する() {
     assert!(
         t.context.iter().any(|c| c.contains("時間切れ")),
         "時間切れだと分かる形で残していない: {:?}",
+        t.context
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  変更ファイルは実測する — 自己申告を証跡にしない
+// ══════════════════════════════════════════════════════════════════════
+
+/// 実 git のワークスペースを持つ Runtime (**差し替えを外す**)。
+///
+/// `changeset_tests` が測り方を、ここが**Runtime が本当に測って本当に
+/// 断ること**を確かめる。差し替えたままだと、繋いでいなくても緑になる。
+fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId, PathBuf)> {
+    let d = crate::test_util::unique_temp_dir("zaivern-team-rt-git", name);
+    std::fs::create_dir_all(&d).ok()?;
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&d)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !run(&["init", "-q"]) {
+        std::fs::remove_dir_all(&d).ok();
+        return None;
+    }
+    run(&["config", "user.email", "t@example.invalid"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(d.join("src/auth")).ok()?;
+    std::fs::write(d.join("src/auth/login.rs"), "fn login() {}\n").ok()?;
+    std::fs::write(d.join("secret.rs"), "fn secret() {}\n").ok()?;
+    if !run(&["add", "-A"]) || !run(&["commit", "-q", "-m", "init"]) {
+        std::fs::remove_dir_all(&d).ok();
+        return None;
+    }
+
+    let plan = StaticPlanner
+        .plan(PlanInput {
+            spec: SPEC.to_string(),
+            source: "SPEC.md".into(),
+            agent_count: 2,
+            review_required: false,
+            roles: Vec::new(),
+        })
+        .expect("計画できるべき");
+    let mut rt = TeamRuntime::from_plan(
+        plan,
+        d.clone(),
+        RunOptions {
+            run_id: new_run_id(),
+            spec_source: "SPEC.md".into(),
+            agent_count: 2,
+            max_attempts: 3,
+            review_required: false,
+        },
+    );
+    rt.apply_action(TeamAction::Start);
+    // **差し替えを外す** — ここは実測そのものを通す。
+    test_hooks::clear();
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let tid = assignments(&rt).first()?.1;
+    // 担当範囲を宣言する (StaticPlanner は `files` を空で作る)。
+    rt.set_files_for_test(tid, &["src/auth/"]);
+    Some((rt, sids, tid, d))
+}
+
+macro_rules! need_git_rt {
+    ($name:literal) => {
+        match real_repo_runtime($name) {
+            Some(v) => v,
+            None => {
+                eprintln!("[skip] {} — git を使えません", $name);
+                return;
+            }
+        }
+    };
+}
+
+#[test]
+fn 実測で担当外を掴んだら完了にしない() {
+    // **配線まで通して確かめる。** 実 git・実タスク・実 Runtime で、
+    // エージェントが担当外のファイルを書き換えたら完了報告が通らない。
+    let (mut rt, sids, tid, dir) = need_git_rt!("out-of-scope");
+    assert!(
+        rt.task(tid).unwrap().baseline.as_ref().is_some_and(|b| b.usable()),
+        "配る直前の基準点が取れていない"
+    );
+
+    // 担当内 1 つと、**担当外 1 つ**を書き換える。
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("secret.rs"), "fn secret() { stolen(); }\n").unwrap();
+
+    // **自己申告では担当内しか挙げない** (= 省いて隠す)。
+    let t = rt.task(tid).unwrap().clone();
+    let agent = t.assigned_agent.clone().unwrap().0;
+    let sid = t.assigned_session.unwrap();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(12, &rows));
+
+    let t = rt.task(tid).unwrap();
+    assert_ne!(
+        t.state,
+        TeamTaskState::Validating,
+        "担当外を書き換えたのに完了報告が通った"
+    );
+    assert_eq!(t.state, TeamTaskState::Running, "却下後は担当のまま");
+    // 理由が本人にも人にも伝わる。
+    assert!(
+        t.context.iter().any(|c| c.contains("secret.rs")),
+        "何が担当外だったかを伝えていない: {:?}",
+        t.context
+    );
+    assert!(
+        rt.events().any(|e| e.summary.contains("secret.rs")),
+        "却下が事象に残っていない"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 実測が担当内なら通り台帳には実測が載る() {
+    let (mut rt, sids, tid, dir) = need_git_rt!("in-scope");
+    // 担当内を 2 つ変える (1 つは新規)。**申告するのは 1 つだけ。**
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("src/auth/token.rs"), "fn token() {}\n").unwrap();
+
+    let t = rt.task(tid).unwrap().clone();
+    let agent = t.assigned_agent.clone().unwrap().0;
+    let sid = t.assigned_session.unwrap();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(12, &rows));
+
+    let t = rt.task(tid).unwrap();
+    assert_eq!(t.state, TeamTaskState::Validating, "担当内なのに通らない");
+    // **台帳へ載るのは実測。** 申告し忘れた `token.rs` も入る。
+    assert!(
+        t.changed_files.iter().any(|f| f.contains("token.rs")),
+        "申告し忘れたファイルが台帳に無い (自己申告をそのまま載せている): {:?}",
+        t.changed_files
+    );
+    assert_eq!(
+        t.reported_files,
+        vec!["src/auth/login.rs".to_string()],
+        "自己申告は自己申告として残す"
+    );
+    // 食い違いが人に見える。
+    assert!(
+        t.context.iter().any(|c| c.contains("報告に無いが実際に変更")),
+        "食い違いを黙って捨てた: {:?}",
+        t.context
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 別タスクが握っている範囲の変更は自分の成果にしない() {
+    // **並列作業の切り分け。** 隣のタスクの変更を担当外として咎めると、
+    // 複数エージェントの Run はまともに終わらない。
+    let (mut rt, sids, tid, dir) = need_git_rt!("parallel");
+    // 隣のタスクへ `secret.rs` の担当を持たせ、作業中にする。
+    let other = rt
+        .tasks()
+        .iter()
+        .map(|t| t.id)
+        .find(|id| *id != tid)
+        .expect("2 本目のタスク");
+    rt.set_files_for_test(other, &["secret.rs"]);
+    rt.force_state_for_test(other, TeamTaskState::Running);
+
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    // 隣のタスクの担当範囲が変わっている (隣のエージェントの仕事)。
+    std::fs::write(dir.join("secret.rs"), "fn secret() { theirs(); }\n").unwrap();
+
+    let t = rt.task(tid).unwrap().clone();
+    let agent = t.assigned_agent.clone().unwrap().0;
+    let sid = t.assigned_session.unwrap();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(12, &rows));
+
+    let t = rt.task(tid).unwrap();
+    assert_eq!(
+        t.state,
+        TeamTaskState::Validating,
+        "隣のタスクの変更を担当外として咎めた"
+    );
+    assert!(
+        !t.changed_files.iter().any(|f| f.contains("secret.rs")),
+        "隣のタスクの変更を自分の成果として数えた: {:?}",
+        t.changed_files
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 実測できないなら完了にせず人へ渡す() {
+    // git 管理外のワークスペース。**保証を偽らない。**
+    let (mut rt, sids, tid) = to_assigned();
+    test_hooks::set_evidence(Some(rp::FileEvidence::Unavailable(
+        "ワークスペースが Git 管理下ではありません".into(),
+    )));
+    report_and_collect(&mut rt, &sids, tid, 12);
+    let t = rt.task(tid).unwrap();
+    assert_ne!(
+        t.state,
+        TeamTaskState::Validating,
+        "実測できないのに完了報告を通した"
+    );
+    assert!(
+        t.context.iter().any(|c| c.contains("実測")),
+        "測れなかったことが伝わっていない: {:?}",
         t.context
     );
 }
