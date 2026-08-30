@@ -256,8 +256,14 @@ and `rustfmt src/lib.rs` need approval, while `black --check .` and
 `rustfmt --check src/lib.rs` do not — the flag, not the tool's name, decides.
 Zaivern also resolves the executable itself instead of letting the OS search
 `PATH`, so a `rustfmt` planted inside the workspace can never stand in for the
-real one, and no shell (`sh -c`, `cmd /C`) is ever placed between what was
-checked and what runs. Every run has a timeout, is killed as a whole process tree when
+real one. Being outside the workspace is not enough either: an agent runs with
+your own privileges, so it can write to `~/.local/bin`, `~/bin` or
+`%LOCALAPPDATA%`. Only an executable in a place that takes elevation to write
+(`/usr`, `/bin`, `/opt/homebrew`, `C:\Windows`, `C:\Program Files`) runs
+without an approval on file — anywhere else, even a read-only check waits for
+you. Zaivern never falls back from an untrusted executable early in `PATH` to a
+trusted one later, and no shell (`sh -c`, `cmd /C`) is ever placed between what
+was checked and what runs. Every run has a timeout, is killed as a whole process tree when
 you stop the team, and always settles: passed, failed, timed out, cancelled,
 could not start, or runner disconnected. **An approval covers one validation
 run, not a command name**: a different task, a re-run after a rejected review,

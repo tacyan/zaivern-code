@@ -470,6 +470,13 @@ fn 判定した実体とosが起こす実体を一致させる() {
         run.contains("run_resolved(&program, &args, cwd"),
         "解決した実体をそのまま渡していない:\n{run}"
     );
+    // **実体の信用区分を見ている。** 名前についた「読むだけ」の評価だけで
+    // 起こすと、`~/.local/bin/rustfmt` に置かれた偽物が無承認で走る
+    // (workspace の外にあることは、書き換えられないことを意味しない)。
+    assert!(
+        run.contains("found.trust.auto_runnable()") && run.contains("approved.contains(cmd)"),
+        "実体の信用区分と承認を突き合わせていない:\n{run}"
+    );
     let resolved = function_body(&l, l.find("pub fn run_resolved").expect("起動"));
     assert!(
         resolved.contains("crate::procx::hidden_command(program)"),

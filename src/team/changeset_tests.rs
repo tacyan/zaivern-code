@@ -299,3 +299,125 @@ fn 測れなかった理由はそのまま人へ出せる() {
         );
     }
 }
+
+
+/// 8MB を超える中身を作る (種で内容が変わる)。
+///
+/// **大きさは意図的に「1 ファイルを丸ごと読む上限」の外側**に取ってある。
+/// ここが上限の内側だと、大きいファイルを長さだけで見ていた不具合を
+/// この番人は 1 度も通らない。
+fn big(seed: u8) -> Vec<u8> {
+    const N: usize = 9 * 1024 * 1024;
+    let mut v = vec![0u8; N];
+    for (i, b) in v.iter_mut().enumerate() {
+        *b = ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed as u32) >> 13) as u8;
+    }
+    v
+}
+
+#[test]
+fn 大きなファイルの新規と変更も内容で見える() {
+    // 基準点では綺麗 → その後に汚れる、という素直な経路。
+    let d = need_repo!("big-added");
+    let base = capture_baseline(&d).expect("基準点");
+    assert!(base.entries.is_empty());
+
+    std::fs::write(d.join("big-new.bin"), big(1)).unwrap();
+    std::fs::write(d.join("a.rs"), big(2)).unwrap();
+
+    let got = measure(&d, &base).expect("実測");
+    let mut m: Vec<(&str, ChangeKind)> = got.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+    m.sort();
+    assert_eq!(
+        m,
+        vec![
+            ("a.rs", ChangeKind::Modified),
+            ("big-new.bin", ChangeKind::Added),
+        ]
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn 基準点で汚れていた大きなファイルの同サイズ書き換えも見える() {
+    // **この版で直した不具合そのもの。** 大きいものを「長さだけ」で見ると、
+    // 同じ長さの別の内容へ書き換えた変更が指紋として等しくなり、
+    // `git status` の状態文字も `??` のまま動かないので、**変更が
+    // 1 バイトも見えない**。担当外を書き換えたタスクが素通りする形。
+    let d = need_repo!("big-already-dirty");
+    let first = big(3);
+    let second = big(4);
+    assert_eq!(first.len(), second.len(), "同じ長さで比べないと意味が無い");
+    assert_ne!(first, second);
+
+    // **追跡済みのファイル**を汚しておく (`git status` は最初から最後まで
+    // `M` のまま。状態文字は 1 文字も動かない)。
+    std::fs::write(d.join("a.rs"), &first).unwrap();
+    let base = capture_baseline(&d).expect("基準点");
+    assert_eq!(base.entries.len(), 1, "汚れを拾えていない: {base:?}");
+
+    std::fs::write(d.join("a.rs"), &second).unwrap();
+    let got = measure(&d, &base).expect("実測");
+    assert_eq!(paths(&got), vec!["a.rs"], "同サイズの書き換えを見落とした");
+    assert_eq!(got[0].kind, ChangeKind::Modified);
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn 大きなファイルを元へ戻したら変更なしに戻る() {
+    // 逆向きも見る。**変更ありへ倒しておけば安全**ではない —
+    // いつでも「変わった」と言う実測は、担当範囲の照合を無意味にする。
+    let d = need_repo!("big-restored");
+    let original = big(5);
+    std::fs::write(d.join("big.bin"), &original).unwrap();
+    assert!(git(&d, &["add", "-A"]) && git(&d, &["commit", "-q", "-m", "big"]));
+
+    let base = capture_baseline(&d).expect("基準点");
+    assert!(base.entries.is_empty(), "commit 済みなのに汚れている: {base:?}");
+
+    std::fs::write(d.join("big.bin"), big(6)).unwrap();
+    assert_eq!(
+        paths(&measure(&d, &base).expect("実測")),
+        vec!["big.bin"],
+        "汚した時点で見えていない"
+    );
+
+    std::fs::write(d.join("big.bin"), &original).unwrap();
+    assert!(
+        measure(&d, &base).expect("実測").is_empty(),
+        "元へ戻したのに変更として残った"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn 読む予算を超えたら黙って途中までにせず測れないと言う() {
+    // 途中まで読んだ指紋を返すと、**先頭が同じ別の内容**が同じものになる。
+    // 予算切れは `TooLarge` (fail-closed) であって、部分一致ではない。
+    let d = lab("hash-budget");
+    std::fs::create_dir_all(&d).unwrap();
+    let f = d.join("x.bin");
+    std::fs::write(&f, vec![7u8; 4096]).unwrap();
+
+    // 予算が足りるとき: 中身のハッシュが返る。
+    let mut budget: u64 = 4096;
+    let got = fingerprint(&f, &mut budget).expect("測れるはず").expect("指紋");
+    assert_eq!(got.len, 4096);
+    assert_eq!(budget, 0, "読んだぶんだけ引くこと");
+
+    // 1 バイト足りないとき: 途中までの指紋を返さない。
+    let mut budget: u64 = 4095;
+    assert_eq!(
+        fingerprint(&f, &mut budget),
+        Err(MeasureError::TooLarge),
+        "予算切れを黙って部分ハッシュにした"
+    );
+
+    // 予算は複数ファイルで共有する — 2 つ目で尽きても同じ。
+    let g = d.join("y.bin");
+    std::fs::write(&g, vec![8u8; 4096]).unwrap();
+    let mut budget: u64 = 5000;
+    assert!(fingerprint(&f, &mut budget).is_ok());
+    assert_eq!(fingerprint(&g, &mut budget), Err(MeasureError::TooLarge));
+    std::fs::remove_dir_all(&d).ok();
+}

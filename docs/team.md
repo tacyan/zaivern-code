@@ -416,10 +416,26 @@ Planner → ValidationCommand{executable, args}
   `Command::new("rustfmt")` に任せると OS がもう一度引くので、
   `PATH=<workspace>/bin:$PATH` に偽物を置くだけで乗っ取られる。
   確定した絶対パスをそのまま `Command` へ渡す
-* **信用しない場所**: workspace の内側 / 相対パス / 空の PATH 要素
-  (空は「カレント」を意味する)。見つけた時点で断る — 後ろの本物へ
-  黙って落ちると、OS が実行するのは前の偽物なのに判定は後ろのものに
-  なる
+* **「workspace の外なら信用できる」は成り立たない。** エージェントは
+  Zaivern と同じ利用者権限で動くので、`~/.local/bin` / `~/bin` /
+  `%LOCALAPPDATA%` へ実行体を置ける
+  (`mkdir -p ~/.local/bin && cp evil ~/.local/bin/rustfmt`)。
+  置き場所は 4 つに分ける (`ExecTrust`):
+
+  | 区分 | 例 | 扱い |
+  |---|---|---|
+  | `Workspace` | workspace の内側 / 相対 / 空の PATH 要素 | **承認があっても起こさない** |
+  | `UserWritable` | `$HOME` 配下 / `/tmp` / `%LOCALAPPDATA%` / `%ProgramData%` | 承認の証跡が要る |
+  | `Unknown` | どれとも言えない場所 | 承認の証跡が要る |
+  | `SystemTrusted` | `/usr` `/bin` `/opt/homebrew` `C:\Windows` `C:\Program Files` | 危険度どおり |
+
+  区分は `classify_path` (**純関数**) が決め、Windows の規則も
+  `windows_policy` へ `env` を渡す形にして **macOS / Linux の CI から
+  そのまま試験する** (cfg で分けると Windows のランナーでしか動かない
+  判断が住み着く)
+* **後ろへ落ちない。** PATH の順に見て最初に見つかった実行体が答え。
+  前方の信用できないものを飛ばして後方の信用できるものを採ると、
+  OS が実行するのは前方なのに判定は後方のものになる
 * **見るのは置き場所だけではない。解決した実体そのものも見る。**
   `~/.local/bin` のような普通の PATH 要素から workspace の中へ
   シンボリックリンクを 1 本張れば、エージェントが書いたコードが
@@ -428,6 +444,11 @@ Planner → ValidationCommand{executable, args}
 * **承認ゲートは実行の直前にもある。** `ValidationSpec.approved` が承認の
   証跡を実行器まで運び、`ReadOnly` 以外はそこに載っているものだけ走る。
   ゲートが 1 か所にしか無い状態は、そこを迂回されたときに何も残らない
+* **危険度は名前についた評価。実体の区分と両方を見る。** 「読むだけ」と
+  判定されても、その名前がどの実体を指すかは PATH が決める。無承認で
+  起こしてよいのは **`SystemTrusted` の実体だけ**で、それ以外は
+  `ReadOnly` でも承認の証跡が要る (承認済みなら起こす —
+  「常に断る」にすると、承認そのものが意味を失う)
 * **シェルは 1 段も挟まない。** `sh -c` も `cmd /C` も使わない。
   Windows の `.cmd` / `.bat` は `PATHEXT` で実体を解決し、そのパスを
   std へ渡す (バッチの引数の逃がし方は std が持っている)。

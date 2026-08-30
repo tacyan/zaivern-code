@@ -53,8 +53,9 @@ pub const MAX_TRACKED_PATHS: usize = 2_000;
 /// 指紋を取るために読むファイルの合計バイト数の上限。
 pub const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 1 ファイルあたりの読み取り上限。これを超えるものは長さだけで見る。
-pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// 指紋を作るときに一度に読む大きさ。**ファイルの大きさとは無関係**に
+/// この量ずつ流すので、大きなファイルでもメモリは一定で済む。
+const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// `git status` を待つ上限。
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -514,7 +515,11 @@ fn fingerprint_all(
 
 /// 1 ファイルの指紋。**シンボリックリンクは辿らない** — リンクそのものの
 /// 向き先が変わったことを、内容の変化として見たい。
-fn fingerprint(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, MeasureError> {
+///
+/// 予算を引数で受けるのは、**予算切れの振る舞いを試験から直に引ける**ように
+/// するため (`MAX_HASH_BYTES` ぶんのファイルを書かないと試せない作りにすると、
+/// その関門は重すぎて誰も回さなくなる)。
+pub(crate) fn fingerprint(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, MeasureError> {
     let Ok(meta) = std::fs::symlink_metadata(abs) else {
         return Ok(None);
     };
@@ -529,21 +534,54 @@ fn fingerprint(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, Meas
             len: bytes.len() as u64,
         }));
     }
-    let len = meta.len();
-    if len > MAX_FILE_BYTES {
-        // 大きすぎるものは長さだけで見る (読むと実行時間が跳ねる)。
-        return Ok(Some(Fingerprint { hash: 0, len }));
-    }
-    if *budget < len {
-        return Err(MeasureError::TooLarge);
-    }
-    *budget -= len;
-    let Ok(body) = std::fs::read(abs) else {
+    // **大きくても内容で見る。** 「大きいものは長さだけ」にすると、
+    // 10MB のファイルを**同じ長さの別の内容**へ書き換えた変更が
+    // `Fingerprint` として等しくなり、「変更なし」と読める。それは
+    // 「自己申告ではなくこちらが測る」という保証そのものを崩す。
+    // 読む量は予算 (`MAX_HASH_BYTES`) で抑え、**足りなければ測れないと言う**。
+    hash_stream(abs, budget)
+}
+
+/// ファイルを**少しずつ読んで**指紋を作る。
+///
+/// 一括で読むと 1 ファイルぶんがそのままメモリに載るので、固定の
+/// バッファで流す。
+///
+/// 予算は**読んだぶんだけ**引き、判定も読みながら 1 か所でだけ行う。
+/// `symlink_metadata` の長さで先に断る形にすると、その分岐は
+/// 「メタ情報が嘘だったとき」にしか通らない枝を別に抱えることになる
+/// (通らない枝は、そのうち壊れても誰も気付かない)。読む総量は
+/// どちらにしても予算で抑えられている。
+fn hash_stream(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, MeasureError> {
+    use std::io::Read;
+
+    let Ok(file) = std::fs::File::open(abs) else {
         return Ok(None);
     };
+    let mut r = std::io::BufReader::new(file);
+    let mut buf = [0u8; HASH_CHUNK_BYTES];
+    let mut hasher = crate::history::Fnv1a64::default();
+    let mut len: u64 = 0;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(None),
+        };
+        let n64 = n as u64;
+        if *budget < n64 {
+            // 読み切れないまま指紋を返すと、**途中までが一致した別の内容**を
+            // 同じものとして扱うことになる。測れないと言う。
+            return Err(MeasureError::TooLarge);
+        }
+        *budget -= n64;
+        len += n64;
+        hasher.update(&buf[..n]);
+    }
     Ok(Some(Fingerprint {
-        hash: crate::history::fnv1a64(&body),
-        len: body.len() as u64,
+        hash: hasher.finish(),
+        len,
     }))
 }
 

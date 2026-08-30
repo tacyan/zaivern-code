@@ -402,20 +402,37 @@ pub fn run_validation_command_in(
             ValidationOutcome::SpawnFailed,
         );
     }
-    // **実体を確定する。** 信用できない場所にあれば実行しない。
-    let program =
-        match super::validation_command::resolve_in(&cmd.executable, cwd, path_var, pathext) {
-            Ok(p) => p,
-            Err(e) => {
-                // **理由を残す。** 「見つからない」と「信用できない場所に
-                // あった」は直し方がまるで違う (入れるか、PATH を直すか)。
-                return ValidationRun::new(
-                    format!("{label}  ({})", e.detail()),
-                    127,
-                    ValidationOutcome::SpawnFailed,
-                );
-            }
-        };
+    // **実体を確定する。** workspace の中にあれば、ここで実行しない。
+    let found = match super::validation_command::resolve_in(&cmd.executable, cwd, path_var, pathext)
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // **理由を残す。** 「見つからない」と「信用できない場所に
+            // あった」は直し方がまるで違う (入れるか、PATH を直すか)。
+            return ValidationRun::new(
+                format!("{label}  ({})", e.detail()),
+                127,
+                ValidationOutcome::SpawnFailed,
+            );
+        }
+    };
+    // **危険度だけでは足りない。** 「読むだけ」は*名前*についた評価で、
+    // その名前がどの実体を指すかは PATH が決める。エージェントは
+    // Zaivern と同じ権限で動くので `~/.local/bin/rustfmt` を置ける —
+    // workspace の外にあることは、書き換えられないことを意味しない。
+    // **昇格が要る場所にある実体だけ**が無承認で走ってよい。
+    if !found.trust.auto_runnable() && !approved.contains(cmd) {
+        return ValidationRun::new(
+            format!(
+                "{label}  (承認の証跡がありません: 実体 {} は{})",
+                found.path.display(),
+                found.trust.why()
+            ),
+            126,
+            ValidationOutcome::SpawnFailed,
+        );
+    }
+    let program = found.path;
     let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
     let (code, why, output) = run_resolved(&program, &args, cwd, timeout, cancel, pid_slot);
     ValidationRun::new(label, code, why).with_output(output)
@@ -1691,6 +1708,7 @@ mod tests {
         // 許可リストにあり、この環境に実在しうる読むだけのもの。
         // 実体が無ければ `SpawnFailed` になるが、**どちらでも workspace は
         // 変わらない**ことが見たいもの。
+        let mut ran = 0;
         for line in [
             "shellcheck a.sh",
             "black --check .",
@@ -1705,14 +1723,27 @@ mod tests {
                 super::super::graph::ValidationRisk::ReadOnly,
                 "{line} が読むだけになっていない"
             );
-            let _ = run_validation_command(
+            // **承認済みとして渡す。** これらの道具は多くの環境で
+            // `~/.local/bin` や `~/.cargo/bin` に居る = 利用者が書ける場所
+            // なので、実行器は無承認では起こさない (それが P1 の修正)。
+            // ここで見たいのは「起こしたときに workspace を変えないか」
+            // なので、**起こせないまま緑**にはしない。
+            let r = run_validation_command(
                 &cmd,
-                &[],
+                std::slice::from_ref(&cmd),
                 &ws,
                 std::time::Duration::from_secs(30),
                 &new_cancel_flag(),
                 &new_pid_slot(),
             );
+            if r.outcome() != ValidationOutcome::SpawnFailed {
+                ran += 1;
+            }
+        }
+        if ran == 0 {
+            // **空回りしたことを黙らない。** 道具が 1 つも無い環境では
+            // 「変えなかった」は何も確かめていないのと同じ。
+            eprintln!("[skip] 読むだけの検証はworkspaceを変えない — 道具が 1 つも無い");
         }
         assert_eq!(
             snapshot_dir(&ws),
@@ -1758,6 +1789,80 @@ mod tests {
         walk(root, root, &mut out);
         out.sort();
         out
+    }
+
+    /// **PATH の乗っ取りは workspace の中に限らない。**
+    ///
+    /// エージェントは Zaivern と同じ利用者権限で動くので、
+    /// `~/.local/bin` や `~/bin` へ実行体を置ける。「workspace の外なら
+    /// 信用できる」という判定は、この経路を丸ごと素通しにしていた。
+    #[cfg(unix)]
+    #[test]
+    fn 利用者が書ける場所の実行体は承認なしで起こさない() {
+        let ws = ws("userwritable-exec");
+        std::fs::create_dir_all(&ws).unwrap();
+        // **workspace の外**に置く (ここが今回の穴)。
+        let home = ws.parent().unwrap().join("uw-home-.local-bin");
+        let marker = ws.join("ran");
+        std::fs::create_dir_all(&home).unwrap();
+        plant_fake(&home, "rustfmt", &marker);
+        let path = home.join("bin").display().to_string();
+        let cmd = ValidationCommand::parse("rustfmt --check a.rs").unwrap();
+        // 前提: 名前から見た危険度は「読むだけ」= 承認が要らない側。
+        assert!(
+            super::super::graph::classify(&cmd).auto_runnable(),
+            "前提: 名前だけ見れば無承認で走る側のコマンド"
+        );
+        // **置き場所が利用者の書ける場所**だと分かるようにする
+        // (実験場は一時フォルダなので、そこが利用者側であること自体は
+        // 表が決める)。
+        assert!(
+            !super::super::validation_command::resolve_in(
+                "rustfmt",
+                &ws,
+                Some(&path),
+                None
+            )
+            .expect("解決はできる")
+            .trust
+            .auto_runnable(),
+            "一時フォルダの実行体を無承認で走ってよいと判定した"
+        );
+        let t = std::time::Duration::from_secs(30);
+        let r = run_validation_command_in(
+            &cmd,
+            &[],
+            &ws,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            Some(&path),
+            None,
+        );
+        assert_eq!(r.exit_code, 126, "無承認で起こした: {r:?}");
+        assert_eq!(r.outcome(), ValidationOutcome::SpawnFailed);
+        assert!(r.command.contains("承認"), "断った理由が残っていない: {r:?}");
+        assert!(
+            !marker.exists(),
+            "利用者が書ける場所の実行体が無承認で動いた: {}",
+            marker.display()
+        );
+        // **「常に断る」ではない。** 承認の証跡があれば起こす
+        // (人が見て通した実行まで止めると、承認そのものが意味を失う)。
+        let ok = run_validation_command_in(
+            &cmd,
+            std::slice::from_ref(&cmd),
+            &ws,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+            Some(&path),
+            None,
+        );
+        assert_eq!(ok.outcome(), ValidationOutcome::Passed, "{ok:?}");
+        assert!(marker.exists(), "承認済みなのに起こさなかった");
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

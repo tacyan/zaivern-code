@@ -320,13 +320,6 @@ fn is_executable_file(p: &Path) -> bool {
     }
 }
 
-/// `dir` が `root` の内側か (両方できるかぎり正規化してから比べる)。
-fn inside(dir: &Path, root: &Path) -> bool {
-    let a = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let b = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    a.starts_with(&b)
-}
-
 /// 名前に補う拡張子を、**試す順**に並べる (純関数)。
 ///
 /// **拡張子つきを先に見る。** Windows の cmd.exe も `PATHEXT` を先に当てる。
@@ -354,20 +347,266 @@ fn candidate_exts(pathext: Option<&str>, windows: bool) -> Vec<String> {
         .collect()
 }
 
-/// PATH の 1 要素は、実行体を探してよい場所か (純関数)。
+/// できるかぎり正規化した絶対パス (できなければそのまま)。
+fn canonical(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+// ── 実行体の信用区分 ─────────────────────────────────────────────────
+
+/// 実行体が**どこに置かれているか**の区分。
 ///
-/// **相対パスと空の要素は信用しない。** 空の要素は「カレント」を意味する
-/// ので、`PATH=:/usr/bin` で `.` が探索対象になる。
-pub fn path_entry_is_trusted(entry: &str, workspace: &Path) -> bool {
-    let e = entry.trim();
-    if e.is_empty() {
+/// **「workspace の外なら信用できる」は成り立たない。** エージェントは
+/// Zaivern と同じ利用者権限で動くので、`~/.local/bin` や `~/bin` に
+/// 実行体を置ける (`mkdir -p ~/.local/bin && cp evil ~/.local/bin/rustfmt`)。
+/// workspace の外にあることは、**書き換えられないことを 1 つも意味しない**。
+///
+/// **並びは弱い順。** [`Ord`] を導出していて、「置き場所から見た区分」と
+/// 「実体から見た区分」の**弱いほう**を [`Ord::min`] で採る。
+/// 順番を入れ替えると悲観側の選択が反転する
+/// (`validation_command::tests::信用の並びは弱い順` が固定する)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExecTrust {
+    /// workspace の中。**エージェントが書いたものそのもの**なので、
+    /// 承認があっても自動実行しない。
+    Workspace,
+    /// どの分類にも当てはまらない場所。**安全側に倒す** (承認が要る)。
+    Unknown,
+    /// 利用者の権限で書ける場所 (`$HOME` 配下 / `%LOCALAPPDATA%` / `/tmp`)。
+    /// エージェントも同じ権限で書けるので、無承認では実行しない。
+    UserWritable,
+    /// 書き換えに昇格が要る場所 (`/usr/bin`, `C:\Windows\System32`)。
+    SystemTrusted,
+}
+
+impl ExecTrust {
+    /// **承認の証跡なしで起こしてよいか。** `SystemTrusted` だけが true。
+    pub fn auto_runnable(self) -> bool {
+        self == ExecTrust::SystemTrusted
+    }
+
+    /// 承認があっても起こさないか (workspace の中の実行体)。
+    pub fn never_runnable(self) -> bool {
+        self == ExecTrust::Workspace
+    }
+
+    /// 人へ出す理由。
+    pub fn why(self) -> &'static str {
+        match self {
+            ExecTrust::Workspace => "ワークスペースの中にあります",
+            ExecTrust::Unknown => "信用できる場所か判断できません",
+            ExecTrust::UserWritable => "利用者の権限で書き換えられる場所にあります",
+            ExecTrust::SystemTrusted => "システムの場所にあります",
+        }
+    }
+}
+
+/// どこを「利用者が書ける場所」「昇格が要る場所」と見なすかの表。
+///
+/// **OS を跨いだ規則を、この 1 つの純粋なデータに落とす。** `cfg` で
+/// 分岐すると Windows の規則は Windows の CI でしか検査されない場所に住み、
+/// 「書いたが 1 度も動かしていない」状態のまま出荷される。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustPolicy {
+    workspace: String,
+    user_roots: Vec<String>,
+    system_roots: Vec<String>,
+    windows: bool,
+}
+
+impl TrustPolicy {
+    /// 表を組み立てる (根はすべて正規化して持つ)。
+    pub fn new(workspace: &Path, user_roots: &[&str], system_roots: &[&str], windows: bool) -> Self {
+        let n = |s: &str| norm_path(Path::new(s), windows);
+        Self {
+            workspace: norm_path(workspace, windows),
+            user_roots: user_roots.iter().map(|s| n(s)).filter(|s| !s.is_empty()).collect(),
+            system_roots: system_roots.iter().map(|s| n(s)).filter(|s| !s.is_empty()).collect(),
+            windows,
+        }
+    }
+
+    /// いまの OS の表 (`workspace` は正規化して持つ)。
+    ///
+    /// `HOME` が読めないときは [`dirs::home_dir`] へ落ちる。**どちらも
+    /// 読めなければ利用者の根が 1 つも無い**ことになるが、そのときは
+    /// 未分類 = `Unknown` になるだけで、緩む方向へは倒れない。
+    pub fn for_workspace(workspace: &Path) -> Self {
+        let env = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| match k {
+                    "HOME" | "USERPROFILE" => {
+                        dirs::home_dir().map(|h| h.display().to_string())
+                    }
+                    _ => None,
+                })
+        };
+        let ws = canonical(workspace);
+        if cfg!(windows) {
+            windows_policy(&ws, env)
+        } else {
+            unix_policy(&ws, env)
+        }
+    }
+}
+
+/// unix (macOS / Linux) の表。**`env` を引数に取る**ので、
+/// 中身は OS に依らず試験から固定できる。
+pub fn unix_policy(workspace: &Path, env: impl Fn(&str) -> Option<String>) -> TrustPolicy {
+    let home = env("HOME").unwrap_or_default();
+    let mut user: Vec<&str> = vec![
+        // **どの利用者のホームでも**同じ扱い (`HOME` が読めない場合の受け皿)。
+        "/home",
+        "/Users",
+        "/root",
+        // 誰でも書ける場所。
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+    ];
+    if !home.trim().is_empty() {
+        user.push(home.trim());
+    }
+    TrustPolicy::new(
+        workspace,
+        &user,
+        &[
+            // 書き換えに昇格が要る場所。**`/usr/local` を含む** —
+            // Homebrew (Intel mac) は管理者権限だけで書けるが、
+            // 「エージェントが無断で置ける」場所ではない。
+            "/usr", "/bin", "/sbin", "/opt/homebrew", "/opt/local",
+            "/Library/Developer", "/System", "/snap",
+        ],
+        false,
+    )
+}
+
+/// Windows の表。**`env` を引数に取る**ので、macOS / Linux の CI からも
+/// この規則そのものを試験できる (Windows でしか通らない判断を残さない)。
+pub fn windows_policy(workspace: &Path, env: impl Fn(&str) -> Option<String>) -> TrustPolicy {
+    let sys_root = env("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string());
+    let drive = env("SystemDrive").unwrap_or_else(|| "C:".to_string());
+    let mut user: Vec<String> = Vec::new();
+    for k in [
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+        "PUBLIC",
+        // 既定の ACL で認証済みの利用者が作成できる。
+        // (chocolatey などがここへ入る — 無承認では実行しない)
+        "ProgramData",
+    ] {
+        if let Some(v) = env(k) {
+            user.push(v);
+        }
+    }
+    user.push(format!(r"{drive}\Users"));
+    user.push(r"C:\Users".to_string());
+    let mut system: Vec<String> = vec![
+        sys_root.clone(),
+        format!(r"{sys_root}\System32"),
+        format!(r"{drive}\Windows"),
+        r"C:\Windows".to_string(),
+        r"C:\Program Files".to_string(),
+        r"C:\Program Files (x86)".to_string(),
+    ];
+    for k in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(v) = env(k) {
+            system.push(v);
+        }
+    }
+    let u: Vec<&str> = user.iter().map(|s| s.as_str()).collect();
+    let sy: Vec<&str> = system.iter().map(|s| s.as_str()).collect();
+    TrustPolicy::new(workspace, &u, &sy, true)
+}
+
+/// パスを比較できる形へ揃える (純関数)。
+///
+/// Windows 側は `\` を `/` へ寄せ、大小を畳み、`canonicalize` が付ける
+/// 拡張長プレフィクス (`\\?\`) を落とす。**`Path::starts_with` を使わない**
+/// のは、Windows 形式の文字列が unix ではただの 1 要素になり、
+/// macOS / Linux の CI から Windows の規則を試験できなくなるため。
+fn norm_path(p: &Path, windows: bool) -> String {
+    let mut s = p.to_string_lossy().into_owned();
+    if windows {
+        s = s.replace('\\', "/");
+        if let Some(rest) = s.strip_prefix("//?/") {
+            s = match rest.strip_prefix("UNC/").or_else(|| rest.strip_prefix("unc/")) {
+                Some(unc) => format!("//{unc}"),
+                None => rest.to_string(),
+            };
+        }
+        s = s.to_ascii_lowercase();
+    }
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+/// 正規化済みの絶対パスらしいか (`/usr/bin` / `c:/windows` / `//server/share`)。
+fn looks_absolute(s: &str) -> bool {
+    if s.starts_with('/') {
+        return true;
+    }
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
+}
+
+/// `child` が `root` の内側 (または同じ) か。
+fn under(child: &str, root: &str) -> bool {
+    if root.is_empty() || !child.starts_with(root) {
         return false;
     }
-    let p = Path::new(e);
-    if !p.is_absolute() {
-        return false;
+    let rest = &child[root.len()..];
+    rest.is_empty() || rest.starts_with('/') || root.ends_with('/')
+}
+
+/// パス 1 つの信用区分 (**純関数**、I/O をしない)。
+///
+/// 判定の順序が保証そのもの:
+/// workspace → 利用者が書ける場所 → 昇格が要る場所 → それ以外。
+/// 利用者の根を先に見るので、入れ子になっていても**緩い側へは倒れない**。
+pub fn classify_path(p: &Path, policy: &TrustPolicy) -> ExecTrust {
+    let s = norm_path(p, policy.windows);
+    if !looks_absolute(&s) {
+        // 相対の指定は「起動時のカレント」= workspace を指す。
+        return ExecTrust::Workspace;
     }
-    !inside(p, workspace)
+    if s.split('/').any(|seg| seg == "..") {
+        // 正規化していない `..` は、どの根の内側かを文字列では決められない。
+        return ExecTrust::Unknown;
+    }
+    if under(&s, &policy.workspace) {
+        return ExecTrust::Workspace;
+    }
+    if policy.user_roots.iter().any(|r| under(&s, r)) {
+        return ExecTrust::UserWritable;
+    }
+    if policy.system_roots.iter().any(|r| under(&s, r)) {
+        return ExecTrust::SystemTrusted;
+    }
+    ExecTrust::Unknown
+}
+
+/// PATH の 1 要素の信用区分 (**純関数**)。
+///
+/// **空の要素と相対パスは workspace 扱い。** 空は「カレント」を意味する
+/// ので `PATH=:/usr/bin` で作業フォルダが探索対象になる。
+pub fn path_entry_trust(entry: &str, policy: &TrustPolicy) -> ExecTrust {
+    classify_path(Path::new(entry.trim()), policy)
+}
+
+/// 解決した実体と、その信用区分。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: PathBuf,
+    pub trust: ExecTrust,
 }
 
 /// **PATH を自分で引いて、実体を確定する。**
@@ -378,12 +617,26 @@ pub fn path_entry_is_trusted(entry: &str, workspace: &Path) -> bool {
 ///
 /// ここで確定した絶対パスをそのまま `Command::new` へ渡すので、
 /// 「判定したもの」と「OS が実行するもの」が一致する。
+///
+/// **後ろへ落ちない。** PATH の順に見て**最初に見つかった実行体**が答え。
+/// 前方の信用できないものを飛ばして後方の信用できるものを採ると、
+/// OS が実行するのは前方のほうなので判定と実行がずれる。
 pub fn resolve_in(
     name: &str,
     workspace: &Path,
     path_var: Option<&str>,
     pathext: Option<&str>,
-) -> Result<PathBuf, ResolveError> {
+) -> Result<Resolved, ResolveError> {
+    resolve_with(name, &TrustPolicy::for_workspace(workspace), path_var, pathext)
+}
+
+/// [`resolve_in`] の本体 (表を差し替えられる形)。
+pub fn resolve_with(
+    name: &str,
+    policy: &TrustPolicy,
+    path_var: Option<&str>,
+    pathext: Option<&str>,
+) -> Result<Resolved, ResolveError> {
     // パス指定は解決しない (呼ぶ前に `Forbidden` で弾かれている)。
     if name.contains('/') || name.contains('\\') {
         return Err(ResolveError::Untrusted {
@@ -395,41 +648,35 @@ pub fn resolve_in(
         return Err(ResolveError::NoPath);
     };
     let exts = candidate_exts(pathext, cfg!(windows));
-    let mut untrusted: Option<PathBuf> = None;
     for entry in path_var.split(path_sep()) {
-        let trusted = path_entry_is_trusted(entry, workspace);
+        let entry_trust = path_entry_trust(entry, policy);
         let dir = Path::new(entry.trim());
         for ext in &exts {
             let cand = dir.join(format!("{name}{ext}"));
             if !is_executable_file(&cand) {
                 continue;
             }
-            // **実体そのものも見る。** 置き場所 (PATH の要素) だけを見ても
+            // **置き場所と実体の、弱いほうを採る。** 置き場所だけでは
             // 足りない — 信用できる場所に置かれた**シンボリックリンク**が
             // workspace の中を指していれば、エージェントが書いたコードが
             // 動く (`ln -s $WS/bin/evil ~/.local/bin/ruff`)。
             // `std::fs::metadata` はリンクを辿るので「そこにファイルが
-            // ある」だけでは判定にならない。`inside` は正規化するので、
-            // リンクをたどった先で判定できる。
-            if trusted && !inside(&cand, workspace) {
-                return Ok(cand);
+            // ある」だけでは判定にならない。`canonical` はリンクを解くので、
+            // たどった先で判定できる。
+            let trust = entry_trust.min(classify_path(&canonical(&cand), policy));
+            if trust.never_runnable() {
+                return Err(ResolveError::Untrusted {
+                    name: name.to_string(),
+                    found: cand,
+                });
             }
-            // **信用できない場所で見つけた。** ここで「次を探す」と、
-            // OS は先頭のこれを実行するのに、こちらは後ろの別物を判定した
-            // ことになる (判定と実行がずれる)。見つけた時点で断る。
-            untrusted.get_or_insert(cand);
-        }
-        if untrusted.is_some() {
-            break;
+            // **信用の区分を持って返す。** ここで「信用できない場所だから
+            // 次を探す」としてはいけない (OS は先頭のこれを実行する)。
+            // 起こしてよいかどうかは、承認と突き合わせる呼び出し側が決める。
+            return Ok(Resolved { path: cand, trust });
         }
     }
-    match untrusted {
-        Some(found) => Err(ResolveError::Untrusted {
-            name: name.to_string(),
-            found,
-        }),
-        None => Err(ResolveError::NotFound(name.to_string())),
-    }
+    Err(ResolveError::NotFound(name.to_string()))
 }
 
 
@@ -608,12 +855,16 @@ mod tests {
         );
         // **後ろの本物へ黙って落ちない。** OS は先頭を実行するので、
         // そこで「後ろの本物を判定した」ことにすると判定と実行がずれる。
-        assert_ne!(got, Ok(real.clone()));
+        assert!(got.is_err());
 
-        // workspace の外だけなら解決できる。
-        assert_eq!(
-            resolve_in("rustfmt", &ws, Some(&real_dir.display().to_string()), None),
-            Ok(real)
+        // workspace の外だけなら解決できる。**ただし一時フォルダは
+        // 利用者が書ける場所**なので、無承認で走ってよい区分にはしない。
+        let ok = resolve_in("rustfmt", &ws, Some(&real_dir.display().to_string()), None)
+            .expect("解決できるはず");
+        assert_eq!(ok.path, real);
+        assert!(
+            !ok.trust.auto_runnable(),
+            "一時フォルダの実行体を無承認で走ってよいと判定した: {ok:?}"
         );
         std::fs::remove_dir_all(&ws).ok();
         std::fs::remove_dir_all(&real_dir).ok();
@@ -654,12 +905,20 @@ mod tests {
     fn 相対pathと空の要素は信用しない() {
         let ws = tmp("relpath");
         std::fs::create_dir_all(&ws).unwrap();
-        assert!(!path_entry_is_trusted("", &ws), "空 = カレントを信用した");
-        assert!(!path_entry_is_trusted(".", &ws));
-        assert!(!path_entry_is_trusted("bin", &ws));
-        assert!(!path_entry_is_trusted("./bin", &ws));
-        assert!(!path_entry_is_trusted(&ws.display().to_string(), &ws));
-        assert!(path_entry_is_trusted("/usr/bin", &ws));
+        let pol = TrustPolicy::for_workspace(&ws);
+        // 空と相対は「起動時のカレント」= workspace を指す。
+        for e in ["", ".", "bin", "./bin"] {
+            assert_eq!(
+                path_entry_trust(e, &pol),
+                ExecTrust::Workspace,
+                "{e:?} を workspace の外と見た"
+            );
+        }
+        assert_eq!(
+            path_entry_trust(&ws.display().to_string(), &pol),
+            ExecTrust::Workspace
+        );
+        assert_eq!(path_entry_trust("/usr/bin", &pol), ExecTrust::SystemTrusted);
         std::fs::remove_dir_all(&ws).ok();
     }
 
@@ -680,6 +939,239 @@ mod tests {
         );
         std::fs::remove_dir_all(&ws).ok();
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn 信用の並びは弱い順() {
+        // `min` で「置き場所」と「実体」の悲観側を採るので、この並びが
+        // 保証そのもの。入れ替えると、workspace のリンクが
+        // `SystemTrusted` として通る。
+        assert!(ExecTrust::Workspace < ExecTrust::Unknown);
+        assert!(ExecTrust::Unknown < ExecTrust::UserWritable);
+        assert!(ExecTrust::UserWritable < ExecTrust::SystemTrusted);
+        assert_eq!(
+            ExecTrust::SystemTrusted.min(ExecTrust::Workspace),
+            ExecTrust::Workspace
+        );
+        // **無承認で走ってよいのは 1 つだけ。**
+        for t in [
+            ExecTrust::Workspace,
+            ExecTrust::Unknown,
+            ExecTrust::UserWritable,
+        ] {
+            assert!(!t.auto_runnable(), "{t:?} を無承認で走らせる判定にした");
+            assert!(!t.why().is_empty());
+        }
+        assert!(ExecTrust::SystemTrusted.auto_runnable());
+        // **承認があっても走らせないのは workspace だけ。**
+        assert!(ExecTrust::Workspace.never_runnable());
+        assert!(!ExecTrust::UserWritable.never_runnable());
+    }
+
+    /// 利用者が書ける場所の表 (unix)。**`$HOME` 配下は信用しない。**
+    #[test]
+    fn 利用者が書ける場所をシステムと同じに扱わない() {
+        // `~/.local/bin` / `~/bin` は、エージェントが Zaivern と同じ権限で
+        // 書ける (`mkdir -p ~/.local/bin && cp evil ~/.local/bin/rustfmt`)。
+        // ここを「workspace の外だから信用できる」と読むのが、直した穴。
+        let ws = Path::new("/work/repo");
+        // **ホームは既定の一覧の外**に置く。ここが `UserWritable` になるのは
+        // `$HOME` を見ているからで、`/home` や `/tmp` の一覧のおかげではない。
+        let home = "/opt/custom-home";
+        let pol = unix_policy(ws, |k| (k == "HOME").then(|| home.to_string()));
+        for p in [
+            "/opt/custom-home/.local/bin/rustfmt",
+            "/opt/custom-home/bin/rustfmt",
+            "/opt/custom-home/.cargo/bin/cargo",
+            "/home/alice/.local/bin/ruff",
+            "/Users/alice/bin/ruff",
+            "/root/bin/ruff",
+            "/tmp/evil/rustfmt",
+            "/var/tmp/evil/rustfmt",
+        ] {
+            assert_eq!(
+                classify_path(Path::new(p), &pol),
+                ExecTrust::UserWritable,
+                "{p} を利用者が書ける場所と見ていない"
+            );
+        }
+        // ホームが読めないときでも、**システム扱いにはならない**。
+        let blind = unix_policy(ws, |_| None);
+        assert_eq!(
+            classify_path(Path::new("/opt/custom-home/.local/bin/rustfmt"), &blind),
+            ExecTrust::Unknown,
+            "分類できない場所をシステム扱いにした"
+        );
+        assert!(!classify_path(Path::new("/opt/custom-home/.local/bin/rustfmt"), &blind).auto_runnable());
+        // 昇格が要る場所は、これまでどおり通す。
+        for p in [
+            "/usr/bin/rustfmt",
+            "/bin/sh",
+            "/usr/local/bin/ruff",
+            "/opt/homebrew/bin/ruff",
+        ] {
+            assert_eq!(
+                classify_path(Path::new(p), &pol),
+                ExecTrust::SystemTrusted,
+                "{p} まで断った"
+            );
+        }
+        // workspace が最優先 (システムの下に置かれていても)。
+        let nested = unix_policy(Path::new("/usr/local/src/repo"), |_| None);
+        assert_eq!(
+            classify_path(Path::new("/usr/local/src/repo/bin/rustfmt"), &nested),
+            ExecTrust::Workspace
+        );
+        // 正規化していない `..` は、文字列では根を決められない。
+        assert_eq!(
+            classify_path(Path::new("/usr/bin/../../tmp/evil/rustfmt"), &pol),
+            ExecTrust::Unknown
+        );
+    }
+
+    /// Windows の規則を **macOS / Linux の CI から**固定する。
+    ///
+    /// `cfg(windows)` で書くと、この表は Windows のランナーでしか
+    /// 動かない (= 手元では 1 度も検査されない)。
+    #[test]
+    fn windowsでも利用者が書ける場所をシステムと同じに扱わない() {
+        let env = |k: &str| {
+            Some(match k {
+                "USERPROFILE" => r"C:\Users\alice",
+                "LOCALAPPDATA" => r"C:\Users\alice\AppData\Local",
+                "APPDATA" => r"C:\Users\alice\AppData\Roaming",
+                "TEMP" | "TMP" => r"C:\Users\alice\AppData\Local\Temp",
+                "ProgramData" => r"C:\ProgramData",
+                "SystemRoot" => r"C:\Windows",
+                "SystemDrive" => "C:",
+                "ProgramFiles" => r"C:\Program Files",
+                "ProgramFiles(x86)" => r"C:\Program Files (x86)",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let pol = windows_policy(Path::new(r"C:\work\repo"), env);
+        let table: &[(&str, ExecTrust)] = &[
+            // 利用者が書ける場所 — **エージェントもここへ置ける**。
+            (r"C:\Users\alice\bin\rustfmt.exe", ExecTrust::UserWritable),
+            (
+                r"C:\Users\alice\AppData\Local\Microsoft\WindowsApps\ruff.exe",
+                ExecTrust::UserWritable,
+            ),
+            (
+                r"C:\Users\alice\AppData\Roaming\npm\npm.cmd",
+                ExecTrust::UserWritable,
+            ),
+            (r"C:\Users\alice\.cargo\bin\cargo.exe", ExecTrust::UserWritable),
+            (r"C:\ProgramData\chocolatey\bin\ruff.exe", ExecTrust::UserWritable),
+            (r"C:\Users\bob\bin\ruff.exe", ExecTrust::UserWritable),
+            // 昇格が要る場所。
+            (r"C:\Windows\System32\where.exe", ExecTrust::SystemTrusted),
+            (r"C:\Windows\py.exe", ExecTrust::SystemTrusted),
+            (r"C:\Program Files\Git\cmd\git.exe", ExecTrust::SystemTrusted),
+            (
+                r"C:\Program Files (x86)\tool\t.exe",
+                ExecTrust::SystemTrusted,
+            ),
+            // workspace の中。
+            (r"C:\work\repo\bin\rustfmt.exe", ExecTrust::Workspace),
+            (r"C:\work\repo\.venv\Scripts\black.exe", ExecTrust::Workspace),
+            // どちらとも言えない場所は、**システム扱いにしない**。
+            (r"D:\misc\tool.exe", ExecTrust::Unknown),
+            (r"\\server\share\tool.exe", ExecTrust::Unknown),
+        ];
+        for (p, want) in table {
+            assert_eq!(
+                classify_path(Path::new(p), &pol),
+                *want,
+                "{p} の区分が違う"
+            );
+        }
+        // **大小は畳む** (`C:\USERS\...` で抜けられない)。
+        assert_eq!(
+            classify_path(Path::new(r"C:\USERS\Alice\BIN\rustfmt.exe"), &pol),
+            ExecTrust::UserWritable
+        );
+        assert_eq!(
+            classify_path(Path::new(r"c:/windows/system32/where.exe"), &pol),
+            ExecTrust::SystemTrusted
+        );
+        // `canonicalize` が付ける拡張長プレフィクスでも同じ判定になる。
+        assert_eq!(
+            classify_path(Path::new(r"\\?\C:\work\repo\bin\rustfmt.exe"), &pol),
+            ExecTrust::Workspace
+        );
+        // **名前が接頭辞として似ているだけの場所を巻き込まない。**
+        assert_eq!(
+            classify_path(Path::new(r"C:\work\repo-other\bin\x.exe"), &pol),
+            ExecTrust::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 普通のシステムpathの道具はこれまでどおり無承認で走れる() {
+        // **締めすぎていないこと。** `/usr/bin` の道具まで承認待ちになると、
+        // 誰も承認しなくなって関門そのものが形骸化する。
+        let ws = tmp("system-path");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut checked = 0;
+        for (dir, name) in [("/usr/bin", "env"), ("/bin", "sh"), ("/usr/bin", "cat")] {
+            if !Path::new(dir).join(name).exists() {
+                continue;
+            }
+            let got = resolve_in(name, &ws, Some(dir), None).expect("解決できるはず");
+            assert_eq!(got.path, Path::new(dir).join(name));
+            assert_eq!(
+                got.trust,
+                ExecTrust::SystemTrusted,
+                "{dir}/{name} を無承認で走れない区分にした"
+            );
+            assert!(got.trust.auto_runnable());
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("[skip] 普通のシステムpathの道具 — /usr/bin も /bin も無い");
+        }
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 前方の信用できない実体から後方の信用できる実体へ落ちない() {
+        // **PATH の順がすべて。** 前方の `~/.local/bin/rustfmt` を飛ばして
+        // 後方の `/usr/bin/rustfmt` を「判定した実体」にすると、
+        // 判定と実行がずれる (利用者がシェルで打てば前方が動く)。
+        // ここでは *昇格が要る場所* を試験用の表で作って、その順序だけを見る。
+        let ws = tmp("no-fallback-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user_dir = tmp("no-fallback-user");
+        let sys_dir = tmp("no-fallback-sys");
+        let planted_user = put_exe(&user_dir, "zzz-probe");
+        let planted_sys = put_exe(&sys_dir, "zzz-probe");
+        let pol = TrustPolicy::new(
+            &ws,
+            &[&user_dir.display().to_string()],
+            &[&sys_dir.display().to_string()],
+            false,
+        );
+
+        // 信用できない側が前 → **そちらが答え**。後ろへ落ちない。
+        let front = format!("{}:{}", user_dir.display(), sys_dir.display());
+        let got = resolve_with("zzz-probe", &pol, Some(&front), None).expect("見つかるはず");
+        assert_eq!(got.path, planted_user, "後ろの信用できる実体へ落ちた");
+        assert_eq!(got.trust, ExecTrust::UserWritable);
+        assert!(!got.trust.auto_runnable(), "無承認で走らせる判定にした");
+
+        // 逆順なら前方が答え — **「常に断る」になっていない**ことの対照。
+        let back = format!("{}:{}", sys_dir.display(), user_dir.display());
+        let got = resolve_with("zzz-probe", &pol, Some(&back), None).expect("見つかるはず");
+        assert_eq!(got.path, planted_sys);
+        assert_eq!(got.trust, ExecTrust::SystemTrusted);
+
+        for d in [&ws, &user_dir, &sys_dir] {
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     #[test]

@@ -210,6 +210,35 @@ fn fnv1a64_seeded(seed: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// 少しずつ食わせる FNV-1a 64bit。**一度に読めない大きさ**のために置いてある。
+///
+/// `fnv1a64` と**同じ値を出す** — 実装を 2 つ持たないよう、1 塊ぶんの混ぜ方は
+/// [`fnv1a64_seeded`] を共有する (ずれると「全体で取った指紋」と
+/// 「分割して取った指紋」が食い違い、同じ内容が変更に見える)。
+/// 同値であることは `history::tests::分割して食わせても一括と同じ値になる` が固定する。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fnv1a64 {
+    h: u64,
+}
+
+impl Default for Fnv1a64 {
+    fn default() -> Self {
+        Self { h: FNV_OFFSET }
+    }
+}
+
+impl Fnv1a64 {
+    /// 続きを混ぜる。
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.h = fnv1a64_seeded(self.h, bytes);
+    }
+
+    /// いまの値。
+    pub(crate) fn finish(self) -> u64 {
+        self.h
+    }
+}
+
 /// 作業フォルダ → 16 桁 hex のワークスペースキー。
 ///
 /// 正規化の規則は [`normalized_workspace`] に、置き換えの経緯と移行は
@@ -1218,6 +1247,26 @@ mod tests {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn 分割して食わせても一括と同じ値になる() {
+        // 8MB 超のファイルは一度に読めないので分割して混ぜる。**分割の仕方で
+        // 値が変わったら**、同じ内容のファイルが「変わった」と見える。
+        let body: Vec<u8> = (0u32..5000).map(|i| (i % 251) as u8).collect();
+        for chunk in [1usize, 2, 7, 64, 4096, 8192] {
+            let mut inc = Fnv1a64::default();
+            for part in body.chunks(chunk) {
+                inc.update(part);
+            }
+            assert_eq!(
+                inc.finish(),
+                fnv1a64(&body),
+                "{chunk} バイトずつ食わせた値が一括と違う"
+            );
+        }
+        // 空でも初期値と一致すること (0 バイトのファイルが特別扱いにならない)。
+        assert_eq!(Fnv1a64::default().finish(), fnv1a64(b""));
     }
 
     #[test]
