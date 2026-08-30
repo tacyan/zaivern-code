@@ -1388,7 +1388,7 @@ fn 保存して復元しても未実行のeffectだけを撃ち直す() {
     use super::persistence;
 
     let dir = crate::test_util::unique_temp_dir("zaivern-team-restore", "effects");
-    let (mut rt, sids, tid) = to_assigned();
+    let (rt, sids, tid) = to_assigned();
     // 実測の差し替えは「復元後の Runtime」にも要る (別の Runtime なので)。
     let base = super::changeset::FileBaseline {
         complete: true,
@@ -1466,7 +1466,7 @@ fn 保存の途中で落ちても再開できる() {
 
     // 状態を進めてから、保存の途中で落とす。
     rt.apply_action(TeamAction::Pause);
-    fault_inject::fail_at(SavePhase::AfterPrevRename);
+    fault_inject::fail_at(SavePhase::PrevRetired);
     let r = persistence::save(&dir, &rt.to_saved());
     fault_inject::clear();
     assert!(r.is_err(), "落ちなかった");

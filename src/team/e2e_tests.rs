@@ -163,22 +163,6 @@ impl Lab {
         }
     }
 
-    /// 実験場のワークスペース (実 git のときだけ意味がある)。
-    fn workspace(&self) -> &std::path::Path {
-        &self.workspace
-    }
-
-    /// エージェントの代わりにファイルを書く (実 git のときだけ)。
-    fn agent_writes(&self, rel: &str, body: &str) {
-        if !self.real_git {
-            return;
-        }
-        let p = self.workspace.join(rel);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(p, body).ok();
-    }
 
     /// 1 tick 回す。`target` に指定したセッションにだけテキストを見せる。
     fn tick(&mut self, target: Option<SessionId>, text: &str) -> Vec<TeamEffect> {

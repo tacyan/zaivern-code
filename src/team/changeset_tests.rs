@@ -280,9 +280,22 @@ fn 帰属の判定は既存のリースの重なり判定を使う() {
 }
 
 #[test]
-fn 上限を超える汚れは測れないと言う() {
-    // 一部だけ持つと「担当内しか触っていない」という嘘が出る。
-    assert!(MAX_TRACKED_PATHS >= 100, "上限が低すぎると常用できない");
-    let e = MeasureError::TooMany(MAX_TRACKED_PATHS + 1);
-    assert!(e.detail().contains("実測できません"), "{}", e.detail());
+fn 測れなかった理由はそのまま人へ出せる() {
+    // **一部だけ持って黙る、をしない。** 一部だけ持つと
+    // 「担当内しか触っていない」という嘘が台帳に残る。
+    for e in [
+        MeasureError::TooMany(MAX_TRACKED_PATHS + 1),
+        MeasureError::TooLarge,
+        MeasureError::NotGitRepo,
+        MeasureError::GitFailed("fatal: not a repository".into()),
+        MeasureError::NoBaseline(String::new()),
+        MeasureError::Escapes("../outside.rs".into()),
+    ] {
+        let d = e.detail();
+        assert!(!d.is_empty(), "{e:?} の理由が空");
+        assert!(
+            d.contains("測れ") || d.contains("実測") || d.contains("外"),
+            "{e:?} → {d} (何が起きたのか伝わらない)"
+        );
+    }
 }

@@ -4,13 +4,22 @@
 //!
 //! ```text
 //! ~/.zaivern/team/<ワークスペースキー>/
-//!   schema.json     ← 版だけを持つ 1 ファイル
-//!   goal.json
-//!   tasks.json
-//!   agents.json
-//!   run.json
-//!   events.jsonl    ← 追記専用
+//!   state.json       ← Run 全体 (いまの世代)
+//!   state.prev.json  ← 直前の完全なスナップショット
 //! ```
+//!
+//! ## なぜ 1 ファイルなのか
+//!
+//! 版 3 までは 8 つのファイルを個別に原子的置換していた。**ファイル単体が
+//! 原子的でも、まとまりとしては原子的ではない** — 3 つ目まで書いたところで
+//! 電源が落ちれば、新しい `run.json` と古い `tasks.json` が同居する。
+//! しかもどちらも JSON としては正しいので、読む側は正常な状態として
+//! 読んでしまう (承認済みの検証が別のタスクへ当たる、Effect が二重に
+//! 出る、という形で現れる)。1 回の rename で全部が切り替わるなら、
+//! その隙間は存在しない。
+//!
+//! 版 3 以前の置き場も読める。次の保存で 1 ファイルへ移り、旧ファイルは
+//! `.legacy-<epoch>` へ退く (**2 つの真実を残さない**)。
 //!
 //! **ワークスペースキーは [`crate::history::workspace_key`] から取る。**
 //! CLAUDE.md の絶対ルール: 16 桁キーを自前で作らない (rustc を上げた日に
@@ -234,6 +243,10 @@ impl SaveError {
 /// 一時ファイルへ書いて rename する (原子的置き換え)。
 ///
 /// 途中で失敗しても**元のファイルはそのまま**残る。
+///
+/// **旧形式を書くためだけに残っている。** 製品の保存は [`save`] が
+/// スナップショット 1 つを置き換える。
+#[cfg(test)]
 fn write_atomic(path: &Path, body: &str) -> Result<(), SaveError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| SaveError::Io(e.to_string()))?;
@@ -323,11 +336,11 @@ pub const PREV_FILE: &str = "state.prev.json";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavePhase {
     /// 一時ファイルを書いた直後 (まだ誰も見ていない)。
-    AfterTmpWrite,
+    TmpWritten,
     /// いまのものを「直前」へ退けた直後 (`state.json` が一瞬無い)。
-    AfterPrevRename,
+    PrevRetired,
     /// 新しいものを `state.json` へ置いた直後。
-    AfterCommit,
+    Committed,
 }
 
 /// Run 全体を 1 つにまとめたスナップショット。
@@ -455,7 +468,7 @@ pub fn save(dir: &Path, s: &Saved) -> Result<(), SaveError> {
 
     let tmp = tmp_path(dir, STATE_FILE);
     write_synced(&tmp, &body)?;
-    fault(SavePhase::AfterTmpWrite)?;
+    fault(SavePhase::TmpWritten)?;
 
     let cur = dir.join(STATE_FILE);
     if cur.exists() {
@@ -463,14 +476,14 @@ pub fn save(dir: &Path, s: &Saved) -> Result<(), SaveError> {
         // `state.prev.json` から復旧できる。
         rename_retrying(&cur, &dir.join(PREV_FILE))?;
     }
-    fault(SavePhase::AfterPrevRename)?;
+    fault(SavePhase::PrevRetired)?;
 
     if let Err(e) = rename_retrying(&tmp, &cur) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     sync_dir(dir);
-    fault(SavePhase::AfterCommit)?;
+    fault(SavePhase::Committed)?;
 
     // 旧形式が残っていたら、移行が済んだのでどける (読む側が 2 つの
     // 真実を持たないように)。**消さずに退ける** — 中身は人のものなので。
@@ -573,10 +586,12 @@ pub mod fault_inject {
     }
 }
 
-/// イベントログの上限ぶんだけを残して保存する (旧形式の入口)。
+/// イベントログを版 3 以前の形 (`events.jsonl`) で書く。
 ///
-/// **新しい保存経路は [`save`] 1 つ。** ここは版 3 以前の置き場を
-/// 読み書きする道具として残っている呼び出し元のために置いてある。
+/// **製品の保存経路は [`save`] 1 つだけ。** ここは「旧形式で保存された
+/// 置き場」を実験で作るための道具なので、テストのときしか存在しない
+/// (残すと「まだ 2 つの書き口がある」という誤読を生む)。
+#[cfg(test)]
 pub fn save_events(dir: &Path, events: &[TeamEvent]) -> Result<(), SaveError> {
     let start = events.len().saturating_sub(EVENT_LOG_MAX_LINES);
     let mut body = String::new();
@@ -816,17 +831,6 @@ pub fn reset(dir: &Path) -> Result<usize, SaveError> {
 }
 
 /// `serde::Serialize` を型消去して `save` の中の重複を減らすための小道具。
-mod erased {
-    pub trait Ser {
-        fn to_json(&self) -> Result<String, String>;
-    }
-    impl<T: serde::Serialize> Ser for T {
-        fn to_json(&self) -> Result<String, String> {
-            serde_json::to_string_pretty(self).map_err(|e| e.to_string())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::testkit::{goal as mkgoal, task};
@@ -1065,9 +1069,9 @@ mod tests {
         // tasks が同居する。しかもどちらも JSON としては正しいので、
         // 読む側は正常な状態として読んでしまう。
         for phase in [
-            SavePhase::AfterTmpWrite,
-            SavePhase::AfterPrevRename,
-            SavePhase::AfterCommit,
+            SavePhase::TmpWritten,
+            SavePhase::PrevRetired,
+            SavePhase::Committed,
         ] {
             let dir = tmp(&format!("phase-{phase:?}"));
             // 1 世代目 (これが「旧」)。
@@ -1096,10 +1100,10 @@ mod tests {
             );
             // 切り替え前に落ちたなら旧、切り替え後なら新。
             match phase {
-                SavePhase::AfterTmpWrite | SavePhase::AfterPrevRename => {
+                SavePhase::TmpWritten | SavePhase::PrevRetired => {
                     assert!(is_old, "{phase:?} なのに新しい世代が見えた")
                 }
-                SavePhase::AfterCommit => assert!(is_new, "置いたのに見えない"),
+                SavePhase::Committed => assert!(is_new, "置いたのに見えない"),
             }
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -1197,7 +1201,7 @@ mod tests {
     #[test]
     fn 保存失敗を握り潰さない() {
         let dir = tmp("save-fail");
-        fault_inject::fail_at(SavePhase::AfterTmpWrite);
+        fault_inject::fail_at(SavePhase::TmpWritten);
         let r = save(&dir, &saved());
         fault_inject::clear();
         let e = r.expect_err("失敗を返していない");
@@ -1268,10 +1272,19 @@ mod tests {
         let dir = tmp("rename-retry");
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("no-such-source");
+        let start = std::time::Instant::now();
         let e = rename_retrying(&missing, &dir.join("dest"))
             .expect_err("存在しない元から置き換えられた");
+        let took = start.elapsed();
         assert!(matches!(e, SaveError::Io(_)));
-        assert!(RENAME_RETRIES >= 2, "1 回で諦めている");
+        // **1 回で諦めていないこと**を、こちら自身が入れた待ちの合計で見る。
+        // 上限 (絶対時間) は引かない — 遅い機械で嘘の赤になるので、
+        // **下限だけ**を見る (自分の `sleep` は短くはならない)。
+        let least: std::time::Duration = (1..RENAME_RETRIES).map(|i| RENAME_BACKOFF * i).sum();
+        assert!(
+            took >= least,
+            "1 回で諦めている (待ち {took:?} < 想定 {least:?})"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

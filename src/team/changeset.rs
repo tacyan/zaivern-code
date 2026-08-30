@@ -118,16 +118,6 @@ pub enum ChangeKind {
     Deleted,
 }
 
-impl ChangeKind {
-    pub fn key(self) -> &'static str {
-        match self {
-            ChangeKind::Added => "added",
-            ChangeKind::Modified => "modified",
-            ChangeKind::Deleted => "deleted",
-        }
-    }
-}
-
 /// 実測した変更 1 件。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasuredChange {
