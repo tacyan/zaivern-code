@@ -295,7 +295,7 @@ fn write_atomic(path: &Path, body: &str) -> Result<(), SaveError> {
     std::fs::write(&tmp, body).map_err(|e| SaveError::Io(e.to_string()))?;
     if let Err(e) = rename_retrying(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(SaveError::Io(e));
     }
     Ok(())
 }
@@ -309,7 +309,7 @@ fn write_atomic(path: &Path, body: &str) -> Result<(), SaveError> {
 ///
 /// **上限を持つ。** 進まないものを待ち続けても人を待たせるだけなので、
 /// 諦めたら理由を返して呼び出し側に見せる。
-fn rename_retrying(from: &Path, to: &Path) -> Result<(), SaveError> {
+pub(super) fn rename_retrying(from: &Path, to: &Path) -> Result<(), String> {
     let mut last = None;
     for attempt in 0..RENAME_RETRIES {
         match std::fs::rename(from, to) {
@@ -322,9 +322,7 @@ fn rename_retrying(from: &Path, to: &Path) -> Result<(), SaveError> {
             }
         }
     }
-    Err(SaveError::Io(
-        last.unwrap_or_else(|| "置き換えに失敗しました".to_string()),
-    ))
+    Err(last.unwrap_or_else(|| "置き換えに失敗しました".to_string()))
 }
 
 /// 置き換えを試す回数。
@@ -504,13 +502,13 @@ pub fn save(dir: &Path, s: &Saved) -> Result<(), SaveError> {
     if cur.exists() {
         // **直前の完全なスナップショットを必ず 1 つ残す。** ここで落ちても
         // `state.prev.json` から復旧できる。
-        rename_retrying(&cur, &dir.join(PREV_FILE))?;
+        rename_retrying(&cur, &dir.join(PREV_FILE)).map_err(SaveError::Io)?;
     }
     fault(SavePhase::PrevRetired)?;
 
     if let Err(e) = rename_retrying(&tmp, &cur) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(SaveError::Io(e));
     }
     sync_dir(dir);
     fault(SavePhase::Committed)?;
@@ -1307,7 +1305,7 @@ mod tests {
         let e = rename_retrying(&missing, &dir.join("dest"))
             .expect_err("存在しない元から置き換えられた");
         let took = start.elapsed();
-        assert!(matches!(e, SaveError::Io(_)));
+        assert!(!e.is_empty(), "理由が空");
         // **1 回で諦めていないこと**を、こちら自身が入れた待ちの合計で見る。
         // 上限 (絶対時間) は引かない — 遅い機械で嘘の赤になるので、
         // **下限だけ**を見る (自分の `sleep` は短くはならない)。

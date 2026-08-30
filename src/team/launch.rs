@@ -29,8 +29,50 @@ use super::validation_command::ValidationCommand;
 
 /// 起動要求の版。
 pub const LAUNCH_VERSION: u32 = 1;
-/// 投函ファイルのバイト上限。
-pub const LAUNCH_MAX_BYTES: u64 = 64 * 1024;
+
+// ── 投函ファイルの大きさ ─────────────────────────────────────────────
+//
+// **3 つの上限の関係を、定数の式そのもので見えるようにしてある。**
+//
+// ```text
+// build() が受理する SPEC 本文        SPEC_MAX_BYTES
+//   × JSON 文字列化で膨らむ最悪の倍率  LAUNCH_ESCAPE_FACTOR
+//   + 本文以外にかかる分               LAUNCH_OVERHEAD_MAX_BYTES
+//   ────────────────────────────────
+//   = take_in() が受け取るファイルの上限 LAUNCH_MAX_BYTES
+// ```
+//
+// この関係が崩れると、**送信は成功したのに受信側がサイズを理由に黙って
+// 捨てる**という、いちばん追いにくい壊れ方をする。実際に上限が 64 KiB
+// 固定だったころは、100 KiB の正しい SPEC が `zai team run` で
+// build 成功 → post 成功 → take で消滅、という経路をたどっていた。
+
+/// `build` が受理する SPEC 本文の上限 (バイト)。
+pub const SPEC_MAX_BYTES: u64 = 512 * 1024;
+
+/// JSON 文字列化で本文が膨らむ最悪の倍率。
+///
+/// `serde_json` は制御文字 (`< 0x20`) を `\u00XX` = **6 バイト**へ広げる
+/// (`\n` `\t` のように短縮形がある文字だけ 2 バイト)。`"` と `\` も
+/// 2 バイト。つまり 1 バイトが最大 6 バイトになる。UTF-8 の非 ASCII は
+/// そのまま出るので膨らまない。
+pub const LAUNCH_ESCAPE_FACTOR: u64 = 6;
+
+/// 本文以外にかかる分 (パス 2 本 + 数値 + 鍵の名前 + pretty の空白)。
+///
+/// パスは OS が上限を持つ (unix は `PATH_MAX` = 4 KiB、Windows は
+/// 32767 文字)。**最悪でも** 2 本 × 32767 × 6 ≒ 384 KiB なので、
+/// 512 KiB あれば足りる。
+pub const LAUNCH_OVERHEAD_MAX_BYTES: u64 = 512 * 1024;
+
+/// 投函ファイルのバイト上限。**`build` が受理した SPEC は必ず収まる。**
+///
+/// 収まらない値にすると「送れたのに受け取れない」が起きる (上の説明)。
+/// それでも越えるもの (`build` を通さず自前で組んだ要求など) は、
+/// [`post_in`] が [`LaunchError::RequestTooLarge`] で**明示的に断る** —
+/// 受け取り側で黙って消える経路は 1 つも残さない。
+pub const LAUNCH_MAX_BYTES: u64 =
+    SPEC_MAX_BYTES * LAUNCH_ESCAPE_FACTOR + LAUNCH_OVERHEAD_MAX_BYTES;
 /// 投函が古すぎたら拾わない (秒)。前回の実行の残骸で GUI が動き出さないため。
 pub const LAUNCH_TTL_SECS: u64 = 600;
 /// エージェント数の上限。
@@ -73,6 +115,14 @@ pub enum LaunchError {
         workspace: PathBuf,
     },
     BadAgentCount(usize),
+    /// **投函ファイルとして大きすぎる。** `build` を通した要求なら
+    /// [`LAUNCH_MAX_BYTES`] の作り方から必ず収まるので、ここへ来るのは
+    /// 自前で組んだ要求だけ。**黙って書かない** — 書いてしまうと、
+    /// 受け取り側がサイズを理由に消して「送ったのに何も起きない」になる。
+    RequestTooLarge {
+        bytes: u64,
+        limit: u64,
+    },
     Io(String),
 }
 
@@ -98,13 +148,15 @@ impl LaunchError {
             LaunchError::BadAgentCount(n) => {
                 format!("エージェント数 {n} は 1〜{MAX_AGENTS} の範囲で指定してください")
             }
+            LaunchError::RequestTooLarge { bytes, limit } => format!(
+                "起動要求が大きすぎます ({bytes} バイト / 上限 {limit})。\
+                 SPEC を小さくしてください"
+            ),
             LaunchError::Io(e) => format!("起動要求を渡せません: {e}"),
         }
     }
 }
 
-/// SPEC の上限 (バイト)。
-pub const SPEC_MAX_BYTES: u64 = 512 * 1024;
 
 /// パスを可能なかぎり正規化する。
 ///
@@ -287,12 +339,32 @@ pub fn post_in(root: &Path, req: &TeamLaunchRequest) -> Result<PathBuf, LaunchEr
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| LaunchError::Io(e.to_string()))?;
     let body = serde_json::to_string_pretty(req).map_err(|e| LaunchError::Io(e.to_string()))?;
+    // **書く前に、受け取り側と同じ上限で測る。**
+    //
+    // 送信側は「本文の長さ」を、受信側は「ファイルの大きさ」を見るので、
+    // 測るものが違うと片方だけが通る。ここで**実際に書くバイト列**を
+    // 測っておけば、`post_in` が Ok を返した投函は、サイズを理由に
+    // `take_in` が捨てることが構造的に起こらない (`LAUNCH_MAX_BYTES` の
+    // 作り方から、`build` を通った要求はそもそもここへ来ない)。
+    let bytes = body.len() as u64;
+    if bytes > LAUNCH_MAX_BYTES {
+        return Err(LaunchError::RequestTooLarge {
+            bytes,
+            limit: LAUNCH_MAX_BYTES,
+        });
+    }
     let tmp = dir.join(format!(".launch.{}.tmp", std::process::id()));
     std::fs::write(&tmp, body).map_err(|e| LaunchError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
+    // **未処理の投函があれば、新しいほうで上書きする** (最新が勝つ)。
+    //
+    // `zai team run` を 2 回打った人が期待するのは 2 回目のほう。OS ごとの
+    // `rename` の癖に任せない — Windows は置き換え先を握られていると
+    // *delete pending* で `ACCESS_DENIED` を返すので、既存の再試行
+    // ([`super::persistence::rename_retrying`]) を通す (第 2 の実装を作らない)。
+    if let Err(e) = super::persistence::rename_retrying(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
-        LaunchError::Io(e.to_string())
-    })?;
+        return Err(LaunchError::Io(e));
+    }
     Ok(path)
 }
 
@@ -302,6 +374,9 @@ pub fn post_in(root: &Path, req: &TeamLaunchRequest) -> Result<PathBuf, LaunchEr
 pub fn take_in(root: &Path, workspace: &Path, now: u64) -> Option<TeamLaunchRequest> {
     let path = launch_path_in(root, workspace);
     let meta = std::fs::metadata(&path).ok()?;
+    // **二重防御の受け側。** `post_in` が書く前に同じ上限で測っているので、
+    // こちらが正しい投函を捨てることはない (`LAUNCH_MAX_BYTES` の doc)。
+    // ここが効くのは、投函箱を外から書き換えられたときだけ。
     if meta.len() > LAUNCH_MAX_BYTES {
         let _ = std::fs::remove_file(&path);
         return None;
@@ -929,6 +1004,143 @@ mod tests {
             Err(LaunchError::BadAgentCount(_))
         ));
         assert!(build(&dir, &spec, MAX_AGENTS, false).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **送れたものは、必ず受け取れる。**
+    ///
+    /// `build` が受理した SPEC が、投函 → 受信の途中でサイズを理由に
+    /// 黙って消えてはいけない。上限が 64 KiB 固定だったころは、
+    /// 100 KiB の正しい SPEC が build 成功 → post 成功 → take で消滅、
+    /// という経路をたどっていた (`zai team run` の主経路が壊れる)。
+    fn 送受信できることを確かめる(name: &str, body: &str) {
+        let dir = ws(name);
+        let spec = write_spec(&dir, body);
+        let req = build(&dir, &spec, 2, false)
+            .unwrap_or_else(|e| panic!("{name}: 組み立てで断られた: {}", e.detail()));
+        assert_eq!(req.spec_text, body, "{name}: 読み込みで中身が変わった");
+        let home = test_home(&dir);
+        post_in(&home, &req)
+            .unwrap_or_else(|e| panic!("{name}: 投函で断られた: {}", e.detail()));
+        let got = take_in(&home, &req.workspace_root, req.requested_at)
+            .unwrap_or_else(|| panic!("{name}: 投函したものを受け取れない"));
+        assert_eq!(got.spec_text, body, "{name}: 受け渡しで中身が変わった");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 百kibのspecは投函から受信まで通る() {
+        // 「上限内なのに届かない」がいちばん見つけにくい壊れ方。
+        let body = format!("# 大きな SPEC\n## 要件\n{}\n", "- 項目 x\n".repeat(11_000));
+        assert!(body.len() > 100 * 1024, "前提: 100 KiB を超える");
+        assert!((body.len() as u64) < SPEC_MAX_BYTES, "前提: 上限の内側");
+        送受信できることを確かめる("post-100k", &body);
+    }
+
+    #[test]
+    fn 上限直前のspecも投函から受信まで通る() {
+        let head = "# 上限直前\n## 要件\n- x\n";
+        let pad = (SPEC_MAX_BYTES as usize) - 1024 - head.len();
+        let body = format!("{head}{}", "a".repeat(pad));
+        assert_eq!(body.len() as u64, SPEC_MAX_BYTES - 1024);
+        送受信できることを確かめる("post-near-max", &body);
+    }
+
+    #[test]
+    fn json_で膨らむspecも投函から受信まで通る() {
+        // **本文がそのまま JSON へ入る。** 引用符・逆スラッシュ・改行は
+        // 2 バイトへ、制御文字は `\u00XX` = 6 バイトへ広がるので、
+        // 元のファイルが上限の内側でも投函ファイルは何倍にもなる。
+        // ここを考えずに上限を決めると、正しい SPEC が受信側で消える。
+        let unit = "\"\\\n\u{1}\u{2}";
+        let body = format!(
+            "# 膨らむ SPEC\n## 要件\n- x\n{}",
+            unit.repeat((SPEC_MAX_BYTES as usize - 1024) / unit.len())
+        );
+        assert!((body.len() as u64) < SPEC_MAX_BYTES, "前提: 上限の内側");
+        // **本当に膨らむことを確かめてから**送る (空回りする検査にしない)。
+        let json = serde_json::to_string(&body).expect("JSON にできる");
+        assert!(
+            json.len() > body.len() * 3,
+            "前提: JSON で 3 倍以上に膨らむ本文 ({} → {})",
+            body.len(),
+            json.len()
+        );
+        送受信できることを確かめる("post-escaped", &body);
+    }
+
+    #[test]
+    fn 上限を超えるspecは組み立てで断る() {
+        let dir = ws("too-large");
+        let body = "a".repeat(SPEC_MAX_BYTES as usize + 1);
+        let spec = write_spec(&dir, &body);
+        assert!(
+            matches!(
+                build(&dir, &spec, 2, false),
+                Err(LaunchError::SpecTooLarge { .. })
+            ),
+            "上限を超える SPEC を受理した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 投函できないほど大きい要求は書く前に断る() {
+        // `build` を通さず自前で組んだ要求は上限を超えうる。**黙って
+        // 書かない** — 書くと受け取り側がサイズを理由に消して、
+        // 「送ったのに何も起きない」になる。
+        let dir = ws("post-too-large");
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = test_home(&dir);
+        let req = TeamLaunchRequest {
+            version: LAUNCH_VERSION,
+            workspace_root: dir.clone(),
+            spec_path: dir.join("SPEC.md"),
+            spec_text: "a".repeat(LAUNCH_MAX_BYTES as usize + 1),
+            agent_count: 2,
+            auto_start: false,
+            requested_at: super::super::model::now_secs(),
+        };
+        let e = post_in(&home, &req).expect_err("大きすぎる要求を書いてしまった");
+        assert!(
+            matches!(e, LaunchError::RequestTooLarge { .. }),
+            "断り方が違う: {e:?}"
+        );
+        assert!(!e.detail().trim().is_empty(), "理由が空");
+        // **書いていない。** 投函箱も、途中の一時ファイルも残さない。
+        assert!(
+            !launch_path_in(&home, &dir).exists(),
+            "断ったのに投函ファイルを残した"
+        );
+        let team_dir = super::super::persistence::team_dir_in(&home, &dir);
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(&team_dir)
+            .map(|it| it.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "一時ファイルが残った: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 未処理の投函は新しい要求で上書きする() {
+        // **OS ごとの `rename` の癖に任せない。** `zai team run` を 2 回
+        // 打った人が期待するのは 2 回目のほうで、それはどの OS でも同じ。
+        let dir = ws("post-overwrite");
+        let spec = write_spec(&dir, "# x\n## 要件\n- 1 回目\n");
+        let home = test_home(&dir);
+        let first = build(&dir, &spec, 2, false).unwrap();
+        post_in(&home, &first).expect("1 回目の投函");
+
+        // 拾う前に 2 回目を投函する。
+        std::fs::write(&spec, "# x\n## 要件\n- 2 回目\n").unwrap();
+        let second = build(&dir, &spec, 4, true).unwrap();
+        post_in(&home, &second).expect("2 回目の投函 (上書き)");
+
+        let got = take_in(&home, &dir, second.requested_at).expect("受け取れるべき");
+        assert!(got.spec_text.contains("2 回目"), "古い要求が残った: {got:?}");
+        assert_eq!(got.agent_count, 4, "古い要求の値で動こうとした");
+        assert!(got.auto_start, "古い要求の値で動こうとした");
+        // **溜まらない。** 2 回投函しても取り出せるのは 1 つだけ。
+        assert_eq!(take_in(&home, &dir, second.requested_at), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
