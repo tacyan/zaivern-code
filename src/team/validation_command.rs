@@ -934,24 +934,56 @@ mod tests {
         );
         assert_eq!(path_entry_trust("/usr/bin", &pol), ExecTrust::SystemTrusted);
 
-        // **リンクを経由した綴りでも同じ答えになる。** macOS の一時フォルダは
-        // `/var/folders/…` で実体が `/private/var/folders/…` なので、
-        // 解決した形しか持たないと「workspace そのものを PATH に書いたのに
-        // Workspace ではない」になる (実際に macOS の CI が落ちた)。
-        // ここでは同じ形を Linux でも作れるように、リンク越しの
-        // workspace で表を組む。
+        // **リンク越しに渡された workspace も、渡された綴りのまま分かる。**
+        // macOS の一時フォルダは `/var/folders/…` で実体が
+        // `/private/var/folders/…`。解決した形しか持たない表だと
+        // 「workspace そのものを PATH に書いたのに Workspace ではない」に
+        // なる (実際に macOS の CI が落ちた)。
         let link = tmp("relpath-link").join("as-link");
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&ws, &link).unwrap();
         let via_link = TrustPolicy::for_workspace(&link);
-        for spelled in [&link, &ws] {
-            assert_eq!(
-                path_entry_trust(&spelled.display().to_string(), &via_link),
-                ExecTrust::Workspace,
-                "{} を workspace と見ていない",
-                spelled.display()
-            );
-        }
+        assert_eq!(
+            path_entry_trust(&link.display().to_string(), &via_link),
+            ExecTrust::Workspace,
+            "{} を workspace と見ていない",
+            link.display()
+        );
+        std::fs::remove_dir_all(link.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **綴りが違っても、workspace の中の実行体は弾く。**
+    ///
+    /// PATH の要素だけを文字どおりに見る [`path_entry_trust`] は I/O を
+    /// しないので、`/var/folders/…` と `/private/var/folders/…` のような
+    /// 「同じ場所の別の綴り」までは分からない。そこを埋めているのが
+    /// **見つけた実体を解決してから分類する**ほう ([`resolve_with`]) で、
+    /// 保証はそちらが持っている。ここはその保証そのものを見る。
+    #[cfg(unix)]
+    #[test]
+    fn workspaceの別の綴りから見つけた実行体も弾く() {
+        let ws = tmp("spelling-ws");
+        let bin = ws.join("bin");
+        put_exe(&bin, "rustfmt");
+        // workspace を指すリンクを作り、**PATH にはリンク越しの綴り**を渡す。
+        let link = tmp("spelling-link").join("as-link");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&ws, &link).unwrap();
+
+        let via_link = link.join("bin").display().to_string();
+        let got = resolve_in("rustfmt", &ws, Some(&via_link), None);
+        assert!(
+            matches!(got, Err(ResolveError::Untrusted { .. })),
+            "別の綴りで書かれた workspace の実行体を使おうとした: {got:?}"
+        );
+        // 逆向き (表はリンク越しの綴りで組み、PATH には実体の綴り) も同じ。
+        let real = ws.join("bin").display().to_string();
+        let got = resolve_in("rustfmt", &link, Some(&real), None);
+        assert!(
+            matches!(got, Err(ResolveError::Untrusted { .. })),
+            "実体の綴りで書かれた workspace の実行体を使おうとした: {got:?}"
+        );
         std::fs::remove_dir_all(link.parent().unwrap()).ok();
         std::fs::remove_dir_all(&ws).ok();
     }
