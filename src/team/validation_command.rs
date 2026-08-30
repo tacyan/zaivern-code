@@ -408,7 +408,8 @@ impl ExecTrust {
 /// 「書いたが 1 度も動かしていない」状態のまま出荷される。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustPolicy {
-    workspace: String,
+    /// workspace の根。**素の形と解決した形の両方**を持つ (下記)。
+    workspace: Vec<String>,
     user_roots: Vec<String>,
     system_roots: Vec<String>,
     windows: bool,
@@ -416,10 +417,24 @@ pub struct TrustPolicy {
 
 impl TrustPolicy {
     /// 表を組み立てる (根はすべて正規化して持つ)。
+    ///
+    /// **workspace は素の形と `canonicalize` した形の両方を持つ。**
+    /// 片方だけだと、リンクを経由した書き方 (macOS の
+    /// `/var/folders/…` は実体が `/private/var/folders/…`) を、
+    /// 文字列だけを見る [`path_entry_trust`] が取り逃がす。実体側の
+    /// 照合は解決してから当たるので実害は出ないが、**どちらの綴りでも
+    /// 同じ答えになる**ほうが読み手に嘘がない (実際に macOS の CI が
+    /// 「workspace そのものを PATH に書いたのに Workspace ではない」で
+    /// 落ちた)。
     pub fn new(workspace: &Path, user_roots: &[&str], system_roots: &[&str], windows: bool) -> Self {
         let n = |s: &str| norm_path(Path::new(s), windows);
+        let mut ws = vec![norm_path(workspace, windows)];
+        let resolved = norm_path(&canonical(workspace), windows);
+        if !ws.contains(&resolved) {
+            ws.push(resolved);
+        }
         Self {
-            workspace: norm_path(workspace, windows),
+            workspace: ws.into_iter().filter(|w| !w.is_empty()).collect(),
             user_roots: user_roots.iter().map(|s| n(s)).filter(|s| !s.is_empty()).collect(),
             system_roots: system_roots.iter().map(|s| n(s)).filter(|s| !s.is_empty()).collect(),
             windows,
@@ -443,11 +458,10 @@ impl TrustPolicy {
                     _ => None,
                 })
         };
-        let ws = canonical(workspace);
         if cfg!(windows) {
-            windows_policy(&ws, env)
+            windows_policy(workspace, env)
         } else {
-            unix_policy(&ws, env)
+            unix_policy(workspace, env)
         }
     }
 }
@@ -582,7 +596,7 @@ pub fn classify_path(p: &Path, policy: &TrustPolicy) -> ExecTrust {
         // 正規化していない `..` は、どの根の内側かを文字列では決められない。
         return ExecTrust::Unknown;
     }
-    if under(&s, &policy.workspace) {
+    if policy.workspace.iter().any(|w| under(&s, w)) {
         return ExecTrust::Workspace;
     }
     if policy.user_roots.iter().any(|r| under(&s, r)) {
@@ -919,6 +933,26 @@ mod tests {
             ExecTrust::Workspace
         );
         assert_eq!(path_entry_trust("/usr/bin", &pol), ExecTrust::SystemTrusted);
+
+        // **リンクを経由した綴りでも同じ答えになる。** macOS の一時フォルダは
+        // `/var/folders/…` で実体が `/private/var/folders/…` なので、
+        // 解決した形しか持たないと「workspace そのものを PATH に書いたのに
+        // Workspace ではない」になる (実際に macOS の CI が落ちた)。
+        // ここでは同じ形を Linux でも作れるように、リンク越しの
+        // workspace で表を組む。
+        let link = tmp("relpath-link").join("as-link");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&ws, &link).unwrap();
+        let via_link = TrustPolicy::for_workspace(&link);
+        for spelled in [&link, &ws] {
+            assert_eq!(
+                path_entry_trust(&spelled.display().to_string(), &via_link),
+                ExecTrust::Workspace,
+                "{} を workspace と見ていない",
+                spelled.display()
+            );
+        }
+        std::fs::remove_dir_all(link.parent().unwrap()).ok();
         std::fs::remove_dir_all(&ws).ok();
     }
 
