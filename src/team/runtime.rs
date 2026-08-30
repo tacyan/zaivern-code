@@ -53,6 +53,15 @@ pub const EFFECT_KEY_CAP: usize = 2_000;
 /// 再試行の既定上限。
 pub const DEFAULT_MAX_ATTEMPTS: u8 = 3;
 
+/// 次の担当へ渡す診断出力の上限 (1 コマンドあたり・バイト)。
+///
+/// **保存してある末尾 (32〜64KiB) をそのまま指示文へ入れない。** 指示文は
+/// エージェントの入力欄へ 1 度に流し込まれるので、そこで詰まる。
+/// 直すのに要るのは最後のエラーだけなので、そこまで絞る。
+pub const VALIDATION_DIAGNOSTIC_BYTES: usize = 3_000;
+/// 診断を載せるコマンドの本数の上限 (先に落ちたものから)。
+pub const VALIDATION_DIAGNOSTIC_RUNS: usize = 2;
+
 // ── 入力 ─────────────────────────────────────────────────────────────
 
 /// 1 セッションの観測結果。
@@ -911,12 +920,41 @@ impl TeamRuntime {
             })
             .unwrap_or_default();
 
+        // **落ちた理由そのものを次の担当へ渡す。**
+        //
+        // 「`cargo test` が落ちた」だけでは直しようがない。どのテストが・
+        // どの行で・なぜ落ちたかは、道具が stdout / stderr に書いている。
+        // 実行器が拾った末尾をここでコンテキストへ積む (指示文
+        // (`prompt.rs`) が `context` をそのまま載せる)。
+        let diagnostics: Vec<String> = self
+            .task(task)
+            .map(|t| {
+                t.validation
+                    .runs
+                    .iter()
+                    .filter(|r| !r.ok() && !r.outcome().is_cancelled())
+                    .filter_map(|r| {
+                        let o = r.output.as_ref()?;
+                        let body = o.excerpt(VALIDATION_DIAGNOSTIC_BYTES);
+                        if body.is_empty() {
+                            return None;
+                        }
+                        Some(format!("`{}` の出力:\n{body}", r.command))
+                    })
+                    .take(VALIDATION_DIAGNOSTIC_RUNS)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
             t.attempts = t.attempts.saturating_add(1);
             t.context.push(clamp_text(&format!(
                 "検証が失敗しました: {}",
                 failed.join(", ")
             )));
+            for d in diagnostics {
+                t.context.push(clamp_text(&d));
+            }
             if !lied.is_empty() {
                 t.context.push(clamp_text(&format!(
                     "前回の報告では成功と書かれていましたが、実際には失敗しました: {}",

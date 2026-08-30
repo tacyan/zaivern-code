@@ -18,6 +18,12 @@ use super::runtime::TeamRuntime;
 
 /// 1 画面に並べるレーンの標準本数の上限。これを超えたら横スクロール。
 pub const MAX_LANES_ON_SCREEN: usize = 5;
+
+/// Inspector に出す診断出力の上限 (1 コマンドあたり・バイト)。
+///
+/// **画面へ 64KiB を流し込まない。** 出せば出すほど良いわけではなく、
+/// スクロールが効かなくなるだけ。全文は台帳 (`tasks.json`) に残る。
+pub const INSPECTOR_DIAGNOSTIC_BYTES: usize = 2_000;
 /// レーン 1 本の最小幅 (px)。これを割るなら本数を減らす。
 pub const LANE_MIN_W: f32 = 240.0;
 /// レーン 1 本の快適な幅 (px)。
@@ -94,6 +100,11 @@ pub struct TaskView {
     /// 最初に成功しなかった実測の終わり方。**「失敗」だけでは直し方が
     /// 分からない** (コードを直す / 時間を延ばす / 実行環境を直す)。
     pub validation_result: Option<ValidationOutcome>,
+    /// 失敗した検証が吐いた診断出力 (`コマンド` → 末尾)。
+    ///
+    /// **人にも読ませる。** エージェントへ渡すだけにすると、直せなかった
+    /// ときに人が同じことを手で再実行して確かめる羽目になる。
+    pub validation_diagnostics: Vec<String>,
     pub review_verdict: Option<ReviewVerdict>,
     pub review_findings: Vec<String>,
     pub blockers: Vec<String>,
@@ -249,6 +260,19 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
                 .iter()
                 .find(|r| !r.ok())
                 .map(|r| r.outcome()),
+            validation_diagnostics: t
+                .validation
+                .runs
+                .iter()
+                .filter(|r| !r.ok())
+                .filter_map(|r| {
+                    let body = r.output.as_ref()?.excerpt(INSPECTOR_DIAGNOSTIC_BYTES);
+                    if body.is_empty() {
+                        return None;
+                    }
+                    Some(format!("{}\n{body}", r.command))
+                })
+                .collect(),
             review_verdict: t.review.verdict,
             review_findings: t.review.findings.clone(),
             blockers: t.blockers.clone(),

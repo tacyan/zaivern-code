@@ -241,6 +241,7 @@ pub fn accept(doc: ResultDoc, task: &TeamTask) -> Result<AcceptedResult, RejectR
             command: v.command.trim().to_string(),
             exit_code: v.exit_code,
             result: None,
+            output: None,
         })
         .collect();
 

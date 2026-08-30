@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{ValidationOutcome, ValidationRun};
+use super::model::{ValidationOutcome, ValidationOutput, ValidationRun};
 use super::validation_command::ValidationCommand;
 
 /// 起動要求の版。
@@ -417,8 +417,8 @@ pub fn run_validation_command_in(
             }
         };
     let args: Vec<&str> = cmd.args.iter().map(|s| s.as_str()).collect();
-    let out = run_resolved(&program, &args, cwd, timeout, cancel, pid_slot);
-    ValidationRun::new(label, out.0, out.1)
+    let (code, why, output) = run_resolved(&program, &args, cwd, timeout, cancel, pid_slot);
+    ValidationRun::new(label, code, why).with_output(output)
 }
 
 /// **検証コマンドの並びを順に実行する。**
@@ -467,7 +467,7 @@ pub fn run_resolved(
     timeout: std::time::Duration,
     cancel: &CancelFlag,
     pid_slot: &PidSlot,
-) -> (i32, ValidationOutcome) {
+) -> (i32, ValidationOutcome, ValidationOutput) {
     use std::sync::atomic::Ordering;
 
     let mut command = crate::procx::hidden_command(program);
@@ -475,8 +475,10 @@ pub fn run_resolved(
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // **捨てない。** 捨てると「`cargo test` が落ちた」しか残らず、
+        // 直す担当は落ちたテストもコンパイルエラーも見られない。
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     // **unix では自分のプロセスグループを持たせる。** そうしないと
     // `kill_tree` (killpg) が Zaivern 自身を巻き込む。孫まで届くのも
     // グループがあってこそ。
@@ -488,13 +490,19 @@ pub fn run_resolved(
     // **起こす前に札を見る。** 見ないと、停止を頼まれた後に始まった
     // コマンドが「誰も知らない子」として走り出す。
     if cancel.load(Ordering::Relaxed) {
-        return (130, ValidationOutcome::Cancelled);
+        return (130, ValidationOutcome::Cancelled, ValidationOutput::default());
     }
     // 127 = コマンドが見つからない (シェルの慣習に合わせる)
     let Ok(mut child) = command.spawn() else {
-        return (127, ValidationOutcome::SpawnFailed);
+        return (127, ValidationOutcome::SpawnFailed, ValidationOutput::default());
     };
     let pid = child.id();
+    // **読み取りは実行中に並行して行う。** パイプのバッファは有限なので、
+    // 終わってから読もうとすると、たくさん出す子は書き込みで止まったまま
+    // 進まない (こちらは終了を待つ = 相互に待つ = 固まる)。
+    // 上限を超えた分は捨てながら**末尾だけ**を持つので、記憶は増えない。
+    let out_tail = spawn_reader(child.stdout.take(), STDOUT_TAIL_BYTES);
+    let err_tail = spawn_reader(child.stderr.take(), STDERR_TAIL_BYTES);
     // **外から落とせるようにする。** 閉じる側 (`on_exit`) は worker を
     // 待てないので、PID を見て自分で木を落とす。
     pid_slot.store(pid, Ordering::Relaxed);
@@ -508,12 +516,27 @@ pub fn run_resolved(
             // `PidGuard` は関数を抜けるときにも伏せるが、こちらのほうが早い。
             Ok(Some(st)) => {
                 pid_slot.store(0, Ordering::Relaxed);
-                return (st.code().unwrap_or(1), from_status(st));
+                let why = from_status(st);
+                // 成功したものの巨大なログは要らない (失敗の理由が要る)。
+                let cap = if why == ValidationOutcome::Passed {
+                    SUCCESS_TAIL_BYTES
+                } else {
+                    usize::MAX
+                };
+                return (
+                    st.code().unwrap_or(1),
+                    why,
+                    collect_output(out_tail, err_tail, cap),
+                );
             }
             // 待っている相手が居ない = 取りこぼし。待ち続けない。
             Err(_) => {
                 pid_slot.store(0, Ordering::Relaxed);
-                return (1, ValidationOutcome::RunnerDisconnected);
+                return (
+                    1,
+                    ValidationOutcome::RunnerDisconnected,
+                    collect_output(out_tail, err_tail, usize::MAX),
+                );
             }
             Ok(None) => {}
         }
@@ -531,6 +554,8 @@ pub fn run_resolved(
             crate::procx::kill_tree(pid);
             let _ = child.wait();
             pid_slot.store(0, Ordering::Relaxed);
+            // **打ち切っても、そこまでに出た分は残す。** 時間切れの
+            // 原因 (どのテストで止まったか) はたいてい末尾に出ている。
             return (
                 if why == ValidationOutcome::TimedOut {
                     124
@@ -538,10 +563,201 @@ pub fn run_resolved(
                     130
                 },
                 why,
+                collect_output(out_tail, err_tail, usize::MAX),
             );
         }
         std::thread::sleep(POLL);
     }
+}
+
+// ── 診断出力の取得 ───────────────────────────────────────────────────
+
+/// stdout として残す末尾のバイト数。
+pub const STDOUT_TAIL_BYTES: usize = 32 * 1024;
+/// stderr として残す末尾のバイト数。**stdout より多く取る** —
+/// コンパイルエラーはこちらに出る。
+pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
+/// 成功したコマンドから残す末尾のバイト数。
+///
+/// 成功の中身は誰も読まないが、**まったく残さないと「本当に走ったのか」**
+/// が分からなくなる。判断の材料になる程度だけ残す。
+pub const SUCCESS_TAIL_BYTES: usize = 2 * 1024;
+/// 読み取りスレッドの合流を待つ上限。
+///
+/// 木ごと落とした後でも、孫がパイプの書き手側を握ったままだと読み手は
+/// EOF を受け取れない。**待ち続けない** — ここで待つと、止めたはずの
+/// 検証が Team Run 全体を止める。
+const READER_JOIN_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// 読み取りスレッドが書き込む末尾バッファ。
+type TailBuf = std::sync::Arc<std::sync::Mutex<Tail>>;
+
+/// 末尾 `cap` バイトだけを持つバッファ。**超えた分は捨てる。**
+#[derive(Debug)]
+struct Tail {
+    buf: Vec<u8>,
+    cap: usize,
+    truncated: bool,
+}
+
+impl Tail {
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.len() >= self.cap {
+            self.truncated = true;
+            self.buf.clear();
+            self.buf.extend_from_slice(&chunk[chunk.len() - self.cap..]);
+            return;
+        }
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > self.cap {
+            let drop = self.buf.len() - self.cap;
+            self.buf.drain(..drop);
+            self.truncated = true;
+        }
+    }
+}
+
+/// 子のパイプを**実行中に**読み続けるスレッドを起こす。
+///
+/// 終わってからまとめて読む形にすると、パイプのバッファ (unix で 64KiB)
+/// が埋まった時点で子は書き込みで止まり、こちらは終了を待つので、
+/// 二度と進まない。実測で `cargo test` 級の出力は簡単にこれを超える。
+fn spawn_reader<R>(src: Option<R>, cap: usize) -> Option<(std::thread::JoinHandle<()>, TailBuf)>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let mut src = src?;
+    let tail: TailBuf = std::sync::Arc::new(std::sync::Mutex::new(Tail {
+        buf: Vec::new(),
+        cap,
+        truncated: false,
+    }));
+    let sink = tail.clone();
+    let handle = std::thread::Builder::new()
+        .name("zai-team-validate-io".into())
+        .spawn(move || {
+            let mut chunk = [0u8; 8 * 1024];
+            loop {
+                match src.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut t) = sink.lock() {
+                            t.push(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some((handle, tail))
+}
+
+/// 読み取りスレッドを畳んで、拾えた分を [`ValidationOutput`] にする。
+///
+/// **合流できなくても拾ったところまでは返す。** バッファは共有なので、
+/// スレッドが生きていても中身は読める。
+fn collect_output(
+    out: Option<(std::thread::JoinHandle<()>, TailBuf)>,
+    err: Option<(std::thread::JoinHandle<()>, TailBuf)>,
+    cap: usize,
+) -> ValidationOutput {
+    let take = |slot: Option<(std::thread::JoinHandle<()>, TailBuf)>| -> (String, bool) {
+        let Some((handle, tail)) = slot else {
+            return (String::new(), false);
+        };
+        join_briefly(handle);
+        let Ok(t) = tail.lock() else {
+            return (String::new(), false);
+        };
+        // **不正な UTF-8 で落とさない。** 末尾で切っている以上、
+        // 文字の途中で始まることが普通にある。
+        let text = String::from_utf8_lossy(&t.buf);
+        let kept = super::model::tail_chars(&text, cap.min(t.cap));
+        let cut = t.truncated || kept.len() < text.len();
+        (sanitize_output(kept), cut)
+    };
+    let (stdout, stdout_truncated) = take(out);
+    let (stderr, stderr_truncated) = take(err);
+    ValidationOutput {
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    }
+}
+
+/// 上限つきで合流する (待ち続けない)。
+fn join_briefly(handle: std::thread::JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + READER_JOIN_WAIT;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            // **置いていく。** バッファは `Arc` なので中身は読める。
+            // 木は既に落としてあるので、この読み手もじきに EOF で終わる。
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = handle.join();
+}
+
+/// 画面・台帳・指示文へ入れて安全な形に均す。
+///
+/// 3 つを潰す:
+///
+/// * **ANSI エスケープ** — 端末以外では意味を持たない上に、画面の
+///   レイアウトを壊す。色を落として本文だけ残す
+/// * **その他の制御文字** — `\n` と `\t` 以外は消す。`\r` は消して
+///   進捗バーの上書きを 1 行に潰す (残すと画面で行が重なる)
+/// * **報告ブロックのマーカー** — 検証の出力はエージェントが中身を
+///   決められる。そのまま指示文へ入れると `[ZAI-TEAM-RESULT]` を
+///   仕込んで**偽の完了報告**を通せる。マーカーだけ無害化する
+fn sanitize_output(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI (`ESC [ … 終端`) と OSC (`ESC ] … BEL`) を読み飛ばす。
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || c == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        if c == '\n' || c == '\t' {
+            out.push(c);
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        out.push(c);
+    }
+    // マーカーを無害化する (消さずに見える形へ倒す — 消すと、何が
+    // 起きたのか読んだ人に伝わらない)。
+    out.replace(super::result_parser::RESULT_OPEN, "[ZAI-TEAM-RESULT-QUOTED]")
+        .replace(
+            super::result_parser::RESULT_CLOSE,
+            "[/ZAI-TEAM-RESULT-QUOTED]",
+        )
+        .replace(super::result_parser::EVENT_OPEN, "[ZAI-TEAM-EVENT-QUOTED]")
+        .replace(super::result_parser::EVENT_CLOSE, "[/ZAI-TEAM-EVENT-QUOTED]")
 }
 
 /// 抜けるときに PID 置き場を必ず空にする (`?` でも panic でも通る)。
@@ -853,7 +1069,7 @@ mod tests {
         timeout: std::time::Duration,
         cancel: &CancelFlag,
         pid: &PidSlot,
-    ) -> (i32, ValidationOutcome) {
+    ) -> (i32, ValidationOutcome, ValidationOutput) {
         let program = which_for_test(head);
         run_resolved(&program, args, cwd, timeout, cancel, pid)
     }
@@ -906,9 +1122,9 @@ mod tests {
         };
         assert_eq!(
             run_words(ok_head, &ok_args, &dir, t, &new_cancel_flag(), &new_pid_slot()),
-            (0, ValidationOutcome::Passed)
+            (0, ValidationOutcome::Passed, ValidationOutput::default())
         );
-        let (code, out) = run_words(ng_head, &ng_args, &dir, t, &new_cancel_flag(), &new_pid_slot());
+        let (code, out, _io) = run_words(ng_head, &ng_args, &dir, t, &new_cancel_flag(), &new_pid_slot());
         assert_eq!(out, ValidationOutcome::Failed);
         assert_ne!(code, 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -918,7 +1134,7 @@ mod tests {
     fn 起動できないコマンドはspawn_failedになる() {
         let dir = ws("exec-nospawn");
         std::fs::create_dir_all(&dir).unwrap();
-        let (code, out) = run_words(
+        let (code, out, _io) = run_words(
             "zaivern-no-such-binary-9f3a",
             &[],
             &dir,
@@ -939,7 +1155,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (head, args) = forever();
         let start = std::time::Instant::now();
-        let (code, out) = run_words(
+        let (code, out, _io) = run_words(
             head,
             &args,
             &dir,
@@ -978,7 +1194,7 @@ mod tests {
         } else {
             ("sh", vec!["-c", touch.as_str()])
         };
-        let (code, out) = run_words(
+        let (code, out, _io) = run_words(
             head,
             &args,
             &dir,
@@ -1059,7 +1275,7 @@ mod tests {
             c2.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         let start = std::time::Instant::now();
-        let (code, out) = run_words(
+        let (code, out, _io) = run_words(
             head,
             &args,
             &dir,
@@ -1094,7 +1310,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(150));
             c2.store(true, std::sync::atomic::Ordering::Relaxed);
         });
-        let (_, out) = run_words(
+        let (_, out, _io) = run_words(
             "sh",
             &["-c", &script],
             &dir,
@@ -1111,6 +1327,281 @@ mod tests {
             marker.display()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── 診断出力 ─────────────────────────────────────────────────────
+
+    /// `sh -c` で実行して出力を取る (テスト専用の実験場)。
+    ///
+    /// **本番の経路は `sh` を通さない** — ここで確かめたいのは
+    /// 「子が吐いたものを拾えるか」だけなので、たくさん・自在に吐ける
+    /// 相手を使う。
+    #[cfg(unix)]
+    fn sh_out(
+        script: &str,
+        timeout: std::time::Duration,
+        cancel: &CancelFlag,
+    ) -> (i32, ValidationOutcome, ValidationOutput) {
+        let dir = ws("exec-io");
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = run_words(
+            "sh",
+            &["-c", script],
+            &dir,
+            timeout,
+            cancel,
+            &new_pid_slot(),
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 失敗した検証の出力を残す() {
+        // **`cargo test` が落ちた、だけでは直せない。** どのテストが・
+        // なぜ落ちたかは道具が stdout / stderr に書いている。
+        let (code, why, io) = sh_out(
+            "echo 'test auth::login ... FAILED'; echo 'error[E0308]: mismatched types' >&2; exit 1",
+            std::time::Duration::from_secs(30),
+            &new_cancel_flag(),
+        );
+        assert_eq!(code, 1);
+        assert_eq!(why, ValidationOutcome::Failed);
+        assert!(
+            io.stdout.contains("auth::login"),
+            "stdout の失敗内容が残っていない: {io:?}"
+        );
+        assert!(
+            io.stderr.contains("E0308"),
+            "stderr のコンパイルエラーが残っていない: {io:?}"
+        );
+        assert!(!io.stdout_truncated && !io.stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 大量出力でも詰まらず末尾を残す() {
+        // **パイプのバッファは有限。** 終わってから読む形にすると、子は
+        // 書き込みで止まり、こちらは終了を待つので二度と進まない。
+        // unix のパイプは 64KiB なので、その何倍も吐かせる。
+        let script = "i=0; while [ $i -lt 20000 ]; do \
+                      echo \"out $i 0123456789012345678901234567890123456789\"; \
+                      echo \"err $i 0123456789012345678901234567890123456789\" >&2; \
+                      i=$((i+1)); done; echo LAST_LINE; echo LAST_ERR >&2; exit 3";
+        let (code, why, io) = sh_out(
+            script,
+            std::time::Duration::from_secs(120),
+            &new_cancel_flag(),
+        );
+        assert_eq!(code, 3, "詰まって時間切れになった: {why:?}");
+        assert_eq!(why, ValidationOutcome::Failed);
+        // **末尾**が残る (失敗の理由は最後に出る)。
+        assert!(io.stdout.contains("LAST_LINE"), "末尾が残っていない");
+        assert!(io.stderr.contains("LAST_ERR"), "末尾が残っていない");
+        assert!(io.stdout_truncated, "切り詰めたのに印が立っていない");
+        assert!(io.stderr_truncated, "切り詰めたのに印が立っていない");
+        assert!(io.stdout.len() <= STDOUT_TAIL_BYTES, "上限を超えて持った");
+        assert!(io.stderr.len() <= STDERR_TAIL_BYTES, "上限を超えて持った");
+        // 先頭は捨てられている。
+        assert!(!io.stdout.contains("out 0 0123"), "先頭を残している");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 時間切れでもそこまでの出力を回収する() {
+        // **時限は余裕を持って引く。** 短く引くと、負荷の高いときに
+        // 「子が echo する前に打ち切った」だけで赤くなる (CLAUDE.md の
+        // 「絶対時間で線を引かない」)。ここで見たいのは打ち切りの速さ
+        // ではなく、打ち切っても出力を捨てないこと。
+        let (code, why, io) = sh_out(
+            "echo 'before the hang'; echo 'stderr before the hang' >&2; sleep 600",
+            std::time::Duration::from_secs(5),
+            &new_cancel_flag(),
+        );
+        assert_eq!(why, ValidationOutcome::TimedOut);
+        assert_eq!(code, 124);
+        assert!(
+            io.stdout.contains("before the hang"),
+            "打ち切ったら出力まで捨てた: {io:?}"
+        );
+        assert!(io.stderr.contains("stderr before the hang"), "{io:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 停止でもそこまでの出力を回収し孫を残さない() {
+        let dir = ws("exec-io-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild-was-alive");
+        // **止める合図は時間ではなく事実で出す。** 「200ms 待つ」にすると、
+        // 負荷が高い日には子が `echo` する前に止めてしまい、実装は
+        // 正しいのに赤くなる (CLAUDE.md の「絶対時間で線を引かない」)。
+        // 子が「出力した」と言ってから止める。
+        let spoke = dir.join("child-spoke");
+        let script = format!(
+            "echo 'partial output'; : > {}; sh -c 'sleep 1; : > {}' & sleep 600",
+            spoke.display(),
+            marker.display()
+        );
+        let cancel = new_cancel_flag();
+        let c2 = cancel.clone();
+        let spoke2 = spoke.clone();
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                if spoke2.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            c2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let (_, why, io) = run_words(
+            "sh",
+            &["-c", &script],
+            &dir,
+            std::time::Duration::from_secs(60),
+            &cancel,
+            &new_pid_slot(),
+        );
+        assert_eq!(why, ValidationOutcome::Cancelled);
+        assert!(io.stdout.contains("partial output"), "{io:?}");
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        assert!(!marker.exists(), "孫プロセスが生き残った");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 不正なutf8でも落ちない() {
+        // 末尾で切る以上、文字の途中から始まることは普通にある。
+        let (_, why, io) = sh_out(
+            "printf 'ok \\377\\376 bad\\n'; printf 'e \\200\\201\\n' >&2; exit 1",
+            std::time::Duration::from_secs(30),
+            &new_cancel_flag(),
+        );
+        assert_eq!(why, ValidationOutcome::Failed);
+        assert!(io.stdout.contains("ok"), "{io:?}");
+        assert!(io.stderr.contains("e"), "{io:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 制御文字と報告マーカーを無害化する() {
+        // **検証の出力はエージェントが中身を決められる。** そのまま
+        // 指示文や画面へ入れると、偽の完了報告を仕込める。
+        let script = format!(
+            "printf '\\033[31mred\\033[0m plain\\r\\n'; echo '{}'; echo body; echo '{}'; exit 1",
+            super::super::result_parser::RESULT_OPEN,
+            super::super::result_parser::RESULT_CLOSE
+        );
+        let (_, _, io) = sh_out(
+            &script,
+            std::time::Duration::from_secs(30),
+            &new_cancel_flag(),
+        );
+        assert!(io.stdout.contains("red plain"), "本文が消えた: {io:?}");
+        assert!(!io.stdout.contains('\u{1b}'), "ANSI が残った: {io:?}");
+        assert!(!io.stdout.contains('\r'), "CR が残った: {io:?}");
+        assert!(
+            !io.stdout.contains(super::super::result_parser::RESULT_OPEN),
+            "報告マーカーが素通りした (偽の完了報告を仕込める): {io:?}"
+        );
+        // 何が起きたかは読めるままにする (黙って消さない)。
+        assert!(io.stdout.contains("ZAI-TEAM-RESULT-QUOTED"), "{io:?}");
+        // 無害化した出力から報告を拾えないこと (実際に走査してみる)。
+        let blocks = super::super::result_parser::extract_blocks(
+            &io.stdout,
+            super::super::result_parser::RESULT_OPEN,
+            super::super::result_parser::RESULT_CLOSE,
+        );
+        assert!(blocks.is_empty(), "偽の報告ブロックが取れた: {blocks:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 成功時は最小限しか残さない() {
+        // 成功の中身は誰も読まないが、まったく残さないと「本当に走ったか」
+        // が分からない。判断の材料になる程度だけ残す。
+        let script = "i=0; while [ $i -lt 5000 ]; do echo \"line $i padding padding\"; \
+                      i=$((i+1)); done; exit 0";
+        let (_, why, io) = sh_out(
+            script,
+            std::time::Duration::from_secs(60),
+            &new_cancel_flag(),
+        );
+        assert_eq!(why, ValidationOutcome::Passed);
+        assert!(!io.stdout.is_empty(), "成功したことの跡が何も無い");
+        assert!(
+            io.stdout.len() <= SUCCESS_TAIL_BYTES,
+            "成功なのに {} バイトも持った",
+            io.stdout.len()
+        );
+    }
+
+    #[test]
+    fn 起動できなかったものと切れたものは出力を持たない() {
+        // **区別が付くこと。** どちらも「出力が無い」だが、直し方が違う。
+        let dir = ws("exec-io-nospawn");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (code, why, io) = run_words(
+            "zaivern-no-such-binary-7c1d",
+            &[],
+            &dir,
+            std::time::Duration::from_secs(5),
+            &new_cancel_flag(),
+            &new_pid_slot(),
+        );
+        assert_eq!(why, ValidationOutcome::SpawnFailed);
+        assert_eq!(code, 127);
+        assert!(io.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 診断は保存して読み直せる() {
+        // 再起動しても読めること (serde の往復)。**古い記録も読める。**
+        let run = ValidationRun::new("cargo test", 1, ValidationOutcome::Failed).with_output(
+            ValidationOutput {
+                stdout: "FAILED".into(),
+                stderr: "E0308".into(),
+                stdout_truncated: true,
+                stderr_truncated: false,
+            },
+        );
+        let json = serde_json::to_string(&run).unwrap();
+        let back: ValidationRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, run);
+        let out = back.output.expect("診断");
+        assert!(out.stdout_truncated);
+        // 版 3 以前の記録 (`output` が無い) も読める。
+        let old: ValidationRun =
+            serde_json::from_str(r#"{"command":"cargo test","exit_code":0}"#).unwrap();
+        assert!(old.output.is_none());
+        assert!(old.ok());
+    }
+
+    #[test]
+    fn 抜粋は両方の出所を出し予算を守る() {
+        let o = ValidationOutput {
+            stdout: "o".repeat(5_000),
+            stderr: "e".repeat(5_000),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let s = o.excerpt(600);
+        assert!(s.contains("stdout"), "stdout の出所が消えた");
+        assert!(s.contains("stderr"), "stderr の出所が消えた");
+        assert!(s.len() <= 700, "予算を大きく超えた: {}", s.len());
+        assert!(s.contains("(先頭を省略)"), "省略したことを言っていない");
+        // 片方が空なら、もう片方が予算を全部使う。
+        let only = ValidationOutput {
+            stdout: String::new(),
+            stderr: "e".repeat(5_000),
+            ..Default::default()
+        };
+        assert!(only.excerpt(600).len() > 500);
+        assert!(ValidationOutput::default().excerpt(600).is_empty());
     }
 
     /// workspace の中に偽の実行体を置き、PATH の先頭に差し込む。

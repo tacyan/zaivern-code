@@ -1360,6 +1360,109 @@ fn 時間切れは失敗として決着する() {
 }
 
 #[test]
+fn 失敗した検証の出力が次の担当へ渡る() {
+    // **「`cargo test` が落ちた」だけでは直せない。** どのテストが・
+    // なぜ落ちたかは道具が stdout / stderr に書いている。実行器が拾った
+    // ものを、次に配るときの指示文 (`context`) まで運ぶ。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let exec = rt.current_execution(tid);
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    let runs: Vec<ValidationRun> = cmds
+        .iter()
+        .map(|c| {
+            ValidationRun::new(c.display(), 1, ValidationOutcome::Failed).with_output(
+                ValidationOutput {
+                    stdout: "test auth::login ... FAILED\nfailures:\n    auth::login\n".into(),
+                    stderr: "error[E0308]: mismatched types\n  --> src/auth/login.rs:42:9\n".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    rt.note_validation_for(&exec, tid, runs);
+
+    let t = rt.task(tid).unwrap();
+    let ctx = t.context.join("\n");
+    assert!(
+        ctx.contains("auth::login"),
+        "落ちたテスト名が次の担当へ渡っていない: {:?}",
+        t.context
+    );
+    assert!(
+        ctx.contains("E0308") && ctx.contains("src/auth/login.rs:42"),
+        "stderr のコンパイルエラーが渡っていない: {:?}",
+        t.context
+    );
+    // **どちらに出たかも分かる。** 道具によって出し先が違う。
+    assert!(ctx.contains("stdout") && ctx.contains("stderr"), "{ctx}");
+    // **実際に配られる指示文へ載ることまで見る** (`context` を積んだだけで
+    // 満足しない — 積んだのに渡らない、が今回のような不具合の形)。
+    let eff = idle_tick(&mut rt, 30, &sids);
+    let text = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendInstruction { task, text, .. } if *task == tid => Some(text.clone()),
+            _ => None,
+        })
+        .expect("差し戻したタスクが配り直されない");
+    assert!(
+        text.contains("E0308") && text.contains("auth::login"),
+        "指示文へ載っていない (context は積んだのに渡っていない):\n{text}"
+    );
+    // **1 本ぶんが指示文を埋め尽くさない。**
+    assert!(
+        text.len() < 40_000,
+        "指示文が診断で肥大した: {} バイト",
+        text.len()
+    );
+}
+
+#[test]
+fn 診断は再起動しても読める() {
+    // 保存 → 読み直しで診断が消えると、再開した人は理由を見られない。
+    let (mut rt, sids, tid) = to_assigned();
+    report_approve_and_collect(&mut rt, &sids, tid, 12);
+    let exec = rt.current_execution(tid);
+    let cmds = rt.task(tid).unwrap().validation_commands.clone();
+    rt.note_validation_for(
+        &exec,
+        tid,
+        cmds.iter()
+            .map(|c| {
+                ValidationRun::new(c.display(), 1, ValidationOutcome::Failed).with_output(
+                    ValidationOutput {
+                        stderr: "error[E0432]: unresolved import".into(),
+                        stdout_truncated: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    );
+    let saved = rt.to_saved();
+    let json = serde_json::to_string(&saved.tasks).unwrap();
+    let back: Vec<TeamTask> = serde_json::from_str(&json).unwrap();
+    let t = back.iter().find(|t| t.id == tid).expect("タスク");
+    let out = t
+        .validation
+        .runs
+        .iter()
+        .find_map(|r| r.output.as_ref())
+        .expect("診断が保存されていない");
+    assert!(out.stderr.contains("E0432"));
+    assert!(out.stdout_truncated, "切り詰めた印が消えた");
+    // 画面 (Inspector) からも読める。
+    let vm = super::view_model::snapshot(&rt, now_secs());
+    let tv = vm.tasks.iter().find(|x| x.id == tid).expect("タスク");
+    assert!(
+        tv.validation_diagnostics.iter().any(|d| d.contains("E0432")),
+        "Inspector から読めない: {:?}",
+        tv.validation_diagnostics
+    );
+}
+
+#[test]
 fn 接続断も起動失敗も決着する() {
     for (code, out) in [
         (125, ValidationOutcome::RunnerDisconnected),

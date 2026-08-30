@@ -429,6 +429,92 @@ impl ValidationOutcome {
     }
 }
 
+/// 検証コマンドが吐いた**診断出力**の末尾。
+///
+/// ## なぜ末尾なのか
+///
+/// 失敗の理由は最後に出る。`cargo test` は落ちたテストの一覧を最後に、
+/// rustc はエラーを出したところで止まる。先頭を保つと「コンパイルを
+/// 開始しました」だけが残る。
+///
+/// ## なぜ上限があるのか
+///
+/// 出力は無限に出る (`--nocapture` の付いたテスト、暴走したループ)。
+/// 丸ごと持つと、台帳・画面・次のエージェントへ渡す指示文の 3 つが
+/// 同時に壊れる。**上限を超えたら [`Self::stdout_truncated`] を立てる** —
+/// 黙って切ると、読んだ人が「これで全部だ」と誤解する。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationOutput {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stderr_truncated: bool,
+}
+
+impl ValidationOutput {
+    /// 何も残っていないか (画面に空の枠を出さないため)。
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_empty() && self.stderr.is_empty()
+    }
+
+    /// 人とエージェントへ見せる 1 本の文面 (`max_bytes` 以内)。
+    ///
+    /// **stdout と stderr のどちらに出たかを明示する。** 道具によって
+    /// 出し先が違う (rustc は stderr、`cargo test` の失敗一覧は stdout)
+    /// ので、片方だけ見せると「何も出ていない」に見える。
+    ///
+    /// stderr を先に置く — コンパイルエラーはこちらに出るので、
+    /// 削るなら stdout の側から削れたほうがよい。
+    pub fn excerpt(&self, max_bytes: usize) -> String {
+        let mut out = String::new();
+        let mut push = |label: &str, body: &str, truncated: bool, budget: usize| {
+            if body.is_empty() || budget == 0 {
+                return;
+            }
+            let kept = tail_chars(body, budget);
+            let cut = truncated || kept.len() < body.len();
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(label);
+            if cut {
+                out.push_str(" (先頭を省略)");
+            }
+            out.push_str(":\n");
+            out.push_str(kept);
+        };
+        // stderr に 2/3、残りを stdout。どちらか空なら他方が全部使う。
+        let (e_budget, o_budget) = match (self.stderr.is_empty(), self.stdout.is_empty()) {
+            (true, true) => (0, 0),
+            (true, false) => (0, max_bytes),
+            (false, true) => (max_bytes, 0),
+            (false, false) => (max_bytes * 2 / 3, max_bytes / 3),
+        };
+        push("stderr", &self.stderr, self.stderr_truncated, e_budget);
+        push("stdout", &self.stdout, self.stdout_truncated, o_budget);
+        out
+    }
+}
+
+/// 末尾 `max` バイトを**文字境界で**切って返す。
+///
+/// バイト数で切ると UTF-8 の途中で割れる。割れた文字は画面でも
+/// JSON でも化けるので、境界まで前へ寄せる。
+pub fn tail_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// 検証コマンド 1 本の結果。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationRun {
@@ -438,6 +524,13 @@ pub struct ValidationRun {
     /// 無いときは終了コードから導く ([`ValidationRun::outcome`])。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ValidationOutcome>,
+    /// 実行器が拾った診断出力の末尾。**版 3 以前の記録には無い。**
+    ///
+    /// 無いと、エージェントは「`cargo test` が落ちた」以上のことを
+    /// 何も知らないまま直しにいく (どのテストが・どの行で・なぜ、が
+    /// 全部消えている)。それは「自動で直す」と言える状態ではない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ValidationOutput>,
 }
 
 impl ValidationRun {
@@ -453,7 +546,14 @@ impl ValidationRun {
             command: command.into(),
             exit_code,
             result: Some(result),
+            output: None,
         }
+    }
+
+    /// 診断出力を添える。
+    pub fn with_output(mut self, out: ValidationOutput) -> Self {
+        self.output = if out.is_empty() { None } else { Some(out) };
+        self
     }
 
     /// 終わり方。**古い記録は終了コードから導く** (0 なら成功)。

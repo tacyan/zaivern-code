@@ -232,6 +232,14 @@ fn task_section(ui: &mut egui::Ui, theme: &Theme, t: &TaskView, acts: &mut Vec<B
         "team.inspector.commands",
         &t.validation_commands,
     );
+    // **落ちた検証の出力を人にも見せる。** ここが無いと、直せなかった
+    // ときに人が同じコマンドを手で打ち直して確かめることになる。
+    section(
+        ui,
+        theme,
+        "team.inspector.diagnostics",
+        &t.validation_diagnostics,
+    );
     section(ui, theme, "team.inspector.findings", &t.review_findings);
     section(ui, theme, "team.inspector.context", &t.context);
     section(ui, theme, "team.inspector.blockers", &t.blockers);
