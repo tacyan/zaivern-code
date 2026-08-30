@@ -623,6 +623,57 @@ impl TeamRuntime {
         }
     }
 
+    /// テスト用: **Coordinator に**その範囲を押さえさせる。
+    ///
+    /// Team 側の `files` を置くだけでは所有にならない — 所有の真実は
+    /// Coordinator が持つ ([`coordinator::occupies`])。実験もそちらを
+    /// 通さないと、守っているつもりの経路を 1 度も踏まない。
+    #[cfg(test)]
+    pub fn grant_scope_for_test(&mut self, task: TaskId, files: &[&str], session: SessionId) {
+        self.set_files_for_test(task, files);
+        let at = std::time::Instant::now();
+        let Some(t) = self.tasks.iter().find(|t| t.id == task).cloned() else {
+            return;
+        };
+        let id = match t.coordinator_task {
+            Some(id) => id,
+            None => {
+                let id = self
+                    .co
+                    .add_task_with_files(t.title.clone(), String::new(), &[], files, at);
+                if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
+                    x.coordinator_task = Some(id);
+                }
+                id
+            }
+        };
+        self.co.set_task_files(id, files);
+        let infos = [coordinator::SessionInfo::new(
+            session,
+            SessionState::Idle,
+            &[],
+        )];
+        let _ = self.co.try_assign(id, &infos, at);
+        self.co.note_running(id, at);
+    }
+
+    /// テスト用: **Coordinator にその範囲を手放させる** (完了)。
+    #[cfg(test)]
+    pub fn release_scope_for_test(&mut self, task: TaskId) {
+        if let Some(id) = self.task(task).and_then(|t| t.coordinator_task) {
+            self.co.note_done(id, std::time::Instant::now());
+        }
+    }
+
+    /// テスト用: Coordinator から見て、そのタスクが範囲を押さえているか。
+    #[cfg(test)]
+    pub fn holds_scope_for_test(&self, task: TaskId) -> bool {
+        self.task(task)
+            .and_then(|t| t.coordinator_task)
+            .and_then(|id| self.co.tasks().iter().find(|x| x.id == id))
+            .is_some_and(coordinator::occupies)
+    }
+
     /// **この Runtime が持つ実行コンテキスト。**
     ///
     /// 発行した Effect には必ずこれを添える。実行側は「いまの画面の値」では
@@ -2533,18 +2584,28 @@ impl TeamRuntime {
             // **担当範囲が無ければ「範囲外」も無い。** 測った事実だけ残す。
             return rp::FileEvidence::NoScope { measured: paths };
         }
-        // **他のタスクの担当範囲**。リースは範囲が互いに素であることを
-        // 保証しているので、ここの変更は自分のものではない。
+        // **他人のものだと言い切れる範囲だけを除く。**
         //
-        // 「いま握っているもの」に絞らない。基準点はこのタスクが最初に
-        // 触る前に固定してあるので、そのあいだに**終わったタスク**が
-        // 自分の範囲を変えたぶんも差分に入る。握っている最中だけを見ると、
-        // 終わった隣人の変更を「誰の範囲でもない」と読んで、こちらを
-        // 永久に完了させなくなる。
+        // 計画に載っている他タスクの `files` を全部除いてはいけない。
+        // まだ 1 度も配られていないタスクの範囲まで「他人のもの」になり、
+        // そこへ書き込んだ違反が**担当外として検出されなくなる**
+        // (計画に `src/b.rs` を持つタスクが存在するだけで、誰でも
+        // `src/b.rs` を書き換えられる)。これは
+        // 「担当外を変更した完了報告は拒否する」という保証そのものを壊す。
+        //
+        // 所有の真実は**既存の Coordinator** が持っている
+        // ([`coordinator::occupies`] — `admit` が割り当ての可否に使うのと
+        // 同じ判定)。Team 側に 2 つ目の所有台帳を作らない。
+        //
+        // 証明できないものは除かない = 担当外として上げる (fail-closed)。
+        // 見逃しより誤検知のほうが軽い — 誤検知は人が見れば分かるが、
+        // 見逃した違反は台帳に「担当内だけ」と残って誰も気付けない。
+        let self_coord = task.coordinator_task;
         let others: Vec<String> = self
-            .tasks
+            .co
+            .tasks()
             .iter()
-            .filter(|t| t.id != task.id)
+            .filter(|t| Some(t.id) != self_coord && coordinator::occupies(t))
             .flat_map(|t| t.files.clone())
             .collect();
         let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);

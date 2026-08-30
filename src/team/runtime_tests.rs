@@ -1681,51 +1681,6 @@ fn 実測が担当内なら通り台帳には実測が載る() {
 }
 
 #[test]
-fn 別タスクが握っている範囲の変更は自分の成果にしない() {
-    // **並列作業の切り分け。** 隣のタスクの変更を担当外として咎めると、
-    // 複数エージェントの Run はまともに終わらない。
-    let (mut rt, sids, tid, dir) = need_git_rt!("parallel");
-    // 隣のタスクへ `secret.rs` の担当を持たせ、作業中にする。
-    let other = rt
-        .tasks()
-        .iter()
-        .map(|t| t.id)
-        .find(|id| *id != tid)
-        .expect("2 本目のタスク");
-    rt.set_files_for_test(other, &["secret.rs"]);
-    rt.force_state_for_test(other, TeamTaskState::Running);
-
-    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
-    // 隣のタスクの担当範囲が変わっている (隣のエージェントの仕事)。
-    std::fs::write(dir.join("secret.rs"), "fn secret() { theirs(); }\n").unwrap();
-
-    let t = rt.task(tid).unwrap().clone();
-    let agent = t.assigned_agent.clone().unwrap().0;
-    let sid = t.assigned_session.unwrap();
-    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
-    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
-    let rows: Vec<(SessionId, SessionState, &str)> = sids
-        .iter()
-        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
-        .collect();
-    rt.tick(&obs(12, &rows));
-
-    let t = rt.task(tid).unwrap();
-    assert_eq!(
-        t.state,
-        TeamTaskState::Validating,
-        "隣のタスクの変更を担当外として咎めた"
-    );
-    assert!(
-        !t.changed_files.iter().any(|f| f.contains("secret.rs")),
-        "隣のタスクの変更を自分の成果として数えた: {:?}",
-        t.changed_files
-    );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 fn 配り直しても最初の基準点を使う() {
     // **差し戻して再挑戦させるだけで違反が消える**、を作らない。
     //
@@ -1782,42 +1737,170 @@ fn 配り直しても最初の基準点を使う() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+
+// ── 所有の証明は Coordinator が持つ ──────────────────────────────────
+//
+// 「計画に載っている他タスクの `files`」を他人のものとして除くと、
+// **まだ 1 度も配られていないタスクの範囲へ書き込んだ違反が消える**。
+// 除いてよいのは、Coordinator が「いま押さえている」と言える範囲だけ。
+
+/// 隣のタスクへ**本当に**範囲を握らせる (Coordinator を通す)。
+fn grant_scope(rt: &mut TeamRuntime, task: TaskId, files: &[&str]) {
+    rt.grant_scope_for_test(task, files, 900);
+}
+
+/// 隣のタスクに範囲を手放させる (完了)。
+fn release_scope(rt: &mut TeamRuntime, task: TaskId) {
+    rt.release_scope_for_test(task);
+}
+
+/// Coordinator から見て、そのタスクが範囲を押さえているか。
+fn holds_scope(rt: &TeamRuntime, task: TaskId) -> bool {
+    rt.holds_scope_for_test(task)
+}
+
+/// `tid` の担当として完了報告を出し、tick を 1 回回す。
+fn report_complete(rt: &mut TeamRuntime, sids: &[SessionId], tid: TaskId, files: &[&str], now: u64) {
+    let t = rt.task(tid).expect("タスク").clone();
+    let agent = t.assigned_agent.clone().expect("担当").0;
+    let sid = t.assigned_session.expect("担当セッション");
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, files);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(now, &rows));
+}
+
 #[test]
-fn 終わった隣のタスクの変更で行き止まらない() {
-    // 基準点を最初に固定する以上、そのあいだに**終わった**タスクが
-    // 自分の範囲を変えたぶんも差分に入る。「いま握っているもの」だけを
-    // 隣人として見ると、終わった隣人の変更が「誰の範囲でもない」になり、
-    // こちらが永久に完了できなくなる。
-    let (mut rt, sids, tid, dir) = need_git_rt!("finished-neighbour");
+fn まだ配られていない他タスクの範囲は他人のものにしない() {
+    // **Test 1.** 計画に `src/b.rs` を持つタスクが存在するというだけで
+    // 誰でもそこを書き換えられる、という状態を作らない。
+    let (mut rt, sids, tid, dir) = need_git_rt!("unassigned-neighbour");
     let other = rt
         .tasks()
         .iter()
         .map(|t| t.id)
         .find(|id| *id != tid)
         .expect("2 本目のタスク");
+    // **隣はまだ配られていない。** 計画に `secret.rs` を持っているだけで、
+    // 所有権を渡した事実は無い (`real_repo_runtime` は最初の tick で配って
+    // しまうので、ここで確実に手放させる)。
+    release_scope(&mut rt, other);
     rt.set_files_for_test(other, &["secret.rs"]);
-    // 隣は**終わっている** (握っていない)。
-    rt.force_state_for_test(other, TeamTaskState::Completed);
+    rt.force_state_for_test(other, TeamTaskState::Pending);
+    assert!(
+        !holds_scope(&rt, other),
+        "前提: 隣はまだ何も押さえていない"
+    );
+
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("secret.rs"), "fn secret() { stolen(); }\n").unwrap();
+    report_complete(&mut rt, &sids, tid, &["src/auth/login.rs"], 12);
+
+    let t = rt.task(tid).unwrap();
+    assert_ne!(
+        t.state,
+        TeamTaskState::Validating,
+        "他タスクの「予定」範囲へ書いた違反が見逃された"
+    );
+    assert!(
+        t.context.iter().any(|c| c.contains("secret.rs")),
+        "何が担当外だったかを伝えていない: {:?}",
+        t.context
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 本当に並列実行中の隣の変更は誤検知しない() {
+    // **Test 2.** 隣が正当に押さえている範囲の変更を、こちらの違反として
+    // 数えない。数えると、複数エージェントの Run がまともに終わらない。
+    let (mut rt, sids, tid, dir) = need_git_rt!("parallel-holder");
+    let other = rt
+        .tasks()
+        .iter()
+        .map(|t| t.id)
+        .find(|id| *id != tid)
+        .expect("2 本目のタスク");
+    grant_scope(&mut rt, other, &["secret.rs"]);
+    assert!(holds_scope(&rt, other), "前提: 隣が押さえている");
 
     std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
     std::fs::write(dir.join("secret.rs"), "fn secret() { theirs(); }\n").unwrap();
+    report_complete(&mut rt, &sids, tid, &["src/auth/login.rs"], 12);
 
-    let t = rt.task(tid).unwrap().clone();
-    let agent = t.assigned_agent.clone().unwrap().0;
-    let sid = t.assigned_session.unwrap();
-    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
-    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
-    let rows: Vec<(SessionId, SessionState, &str)> = sids
-        .iter()
-        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
-        .collect();
-    rt.tick(&obs(12, &rows));
+    let t = rt.task(tid).unwrap();
     assert_eq!(
+        t.state,
+        TeamTaskState::Validating,
+        "並列実行中の隣の変更を自分の違反として咎めた"
+    );
+    assert!(
+        !t.changed_files.iter().any(|f| f.contains("secret.rs")),
+        "隣の変更を自分の成果として数えた: {:?}",
+        t.changed_files
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 隣が手放した範囲への変更は担当外になる() {
+    // **Test 3.** 隣が完了して手を離した後は、そこを押さえている者は
+    // 居ない。誰の範囲でもない変更は「自分ではない」と言い切れないので、
+    // 担当外へ倒す (fail-closed)。
+    let (mut rt, sids, tid, dir) = need_git_rt!("released-neighbour");
+    let other = rt
+        .tasks()
+        .iter()
+        .map(|t| t.id)
+        .find(|id| *id != tid)
+        .expect("2 本目のタスク");
+    grant_scope(&mut rt, other, &["secret.rs"]);
+    assert!(holds_scope(&rt, other), "前提: いったんは押さえている");
+    // 隣が完了して手放す (Coordinator へも伝える — ここが真実)。
+    release_scope(&mut rt, other);
+    assert!(!holds_scope(&rt, other), "前提: もう押さえていない");
+
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("secret.rs"), "fn secret() { later(); }\n").unwrap();
+    report_complete(&mut rt, &sids, tid, &["src/auth/login.rs"], 13);
+
+    assert_ne!(
         rt.task(tid).unwrap().state,
         TeamTaskState::Validating,
-        "終わった隣のタスクの変更で行き止まった"
+        "誰も押さえていない範囲への変更が見逃された"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 自己申告から省いても実測で担当外が出る() {
+    // **Test 4.** 申告を書き換えるだけでは通らない。
+    let (mut rt, sids, tid, dir) = need_git_rt!("hidden-report");
+    let other = rt
+        .tasks()
+        .iter()
+        .map(|t| t.id)
+        .find(|id| *id != tid)
+        .expect("2 本目のタスク");
+    release_scope(&mut rt, other);
+    rt.set_files_for_test(other, &["secret.rs"]);
+    rt.force_state_for_test(other, TeamTaskState::Pending);
+
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("secret.rs"), "fn secret() { stolen(); }\n").unwrap();
+    // **`secret.rs` を意図的に省いた**申告 (何なら空でもよい)。
+    for (n, reported) in [vec!["src/auth/login.rs"], vec![]].into_iter().enumerate() {
+        report_complete(&mut rt, &sids, tid, &reported, 12 + n as u64);
+        assert_ne!(
+            rt.task(tid).unwrap().state,
+            TeamTaskState::Validating,
+            "申告を {reported:?} にしただけで通った"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
