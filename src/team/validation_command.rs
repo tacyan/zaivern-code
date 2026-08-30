@@ -1147,26 +1147,36 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let user_dir = tmp("no-fallback-user");
         let sys_dir = tmp("no-fallback-sys");
-        let planted_user = put_exe(&user_dir, "zzz-probe");
-        let planted_sys = put_exe(&sys_dir, "zzz-probe");
-        let pol = TrustPolicy::new(
-            &ws,
-            &[&user_dir.display().to_string()],
-            &[&sys_dir.display().to_string()],
-            false,
-        );
+        put_exe(&user_dir, "zzz-probe");
+        put_exe(&sys_dir, "zzz-probe");
+        // **根は正規化して渡す。** macOS の一時フォルダは
+        // `/var/folders/…` → `/private/var/folders/…` へ解決されるので、
+        // 素のパスのままだと実体側の照合が外れて Unknown になる
+        // (製品は正しいのに、テストだけが OS で落ちる形)。
+        let canon = |p: &Path| {
+            std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string()
+        };
+        let (user_s, sys_s) = (canon(&user_dir), canon(&sys_dir));
+        let pol = TrustPolicy::new(&ws, &[&user_s], &[&sys_s], false);
 
         // 信用できない側が前 → **そちらが答え**。後ろへ落ちない。
-        let front = format!("{}:{}", user_dir.display(), sys_dir.display());
+        let front = format!("{user_s}:{sys_s}");
         let got = resolve_with("zzz-probe", &pol, Some(&front), None).expect("見つかるはず");
-        assert_eq!(got.path, planted_user, "後ろの信用できる実体へ落ちた");
+        assert_eq!(
+            got.path,
+            Path::new(&user_s).join("zzz-probe"),
+            "後ろの信用できる実体へ落ちた"
+        );
         assert_eq!(got.trust, ExecTrust::UserWritable);
         assert!(!got.trust.auto_runnable(), "無承認で走らせる判定にした");
 
         // 逆順なら前方が答え — **「常に断る」になっていない**ことの対照。
-        let back = format!("{}:{}", sys_dir.display(), user_dir.display());
+        let back = format!("{sys_s}:{user_s}");
         let got = resolve_with("zzz-probe", &pol, Some(&back), None).expect("見つかるはず");
-        assert_eq!(got.path, planted_sys);
+        assert_eq!(got.path, Path::new(&sys_s).join("zzz-probe"));
         assert_eq!(got.trust, ExecTrust::SystemTrusted);
 
         for d in [&ws, &user_dir, &sys_dir] {
