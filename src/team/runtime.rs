@@ -110,6 +110,16 @@ pub struct AgentLaunchSpec {
     pub role: TeamRole,
     pub team_id: TeamId,
     pub workspace_root: PathBuf,
+    /// **前に起こしたセッションの目印** ([`TeamAgent::session_identity`])。
+    ///
+    /// 入っていたら、実行側は**起こす前に**この目印を持つセッションが
+    /// 生きていないか見る。生きていれば結び直すだけで、新しくは起こさない
+    /// — 起動が成功したあと結び付けの永続化までの間に落ちると、次の起動で
+    /// 同じ logical agent の 2 体目が生まれるため。
+    ///
+    /// Runtime はこの文字列の意味を知らない (照合するのはセッションを
+    /// 持っている実行側)。第 2 のセッション台帳を作らないための形。
+    pub adopt: Option<String>,
 }
 
 /// 検証コマンドを走らせる要求。**コマンドは語に分けて渡す**
@@ -185,6 +195,18 @@ impl TeamEffect {
             TeamEffect::PersistState => String::new(),
         }
     }
+}
+
+/// 指示の冪等キー。**組み立てはここ 1 か所**。
+///
+/// 発行する側と、届かなかったことを照合する側が別々に組み立てると、
+/// 書式を変えた日に静かに照合が外れる (外れると、古い配達の結末で
+/// 新しい試行の担当を剥がすことになる)。
+///
+/// 試行回数と配布回数まで入れるのは、差し戻し後の再指示を「同じ指示」と
+/// して抑止しないため。
+pub fn instruction_key(task: TaskId, agent: &AgentId, attempts: u8, dispatch_seq: u32) -> String {
+    format!("instr:{task}:{agent}:{attempts}:{dispatch_seq}")
 }
 
 /// GUI / CLI からの操作。
@@ -488,10 +510,12 @@ impl TeamRuntime {
     ///
     /// * `SendInstruction` / `RunValidation` — **結果が残る**。届いた指示も、
     ///   記録した実測も再起動をまたいで有効なので、二度と出さない。
-    /// * `StartAgent` — 成果は**生きているセッション**そのもの。再起動すれば
-    ///   子プロセスは死んでいるので、ACK 済みでも起動し直す必要がある。
-    ///   その判断は [`ensure_agents`](Self::ensure_agents) が
-    ///   「結び付いたセッションがあるか」で行う (記録だけを見ない)。
+    /// * `StartAgent` — 成果は**生きているセッション**そのもの。セッション ID
+    ///   は再起動で意味を失うので、ACK 済みでも起動要求は出し直す。その判断は
+    ///   [`ensure_agents`](Self::ensure_agents) が「結び付いたセッションが
+    ///   あるか」で行う (記録だけを見ない)。**出し直しても 2 体にはならない**
+    ///   — 目印 ([`TeamAgent::session_identity`]) を `adopt` に載せるので、
+    ///   実行側は起こす前に引き取れるセッションを探す。
     /// * `StopAgent` — セッション ID は再起動で意味を失う。
     /// * `RequestHumanApproval` — `decisions` 側が `idempotency_key` で守る。
     pub fn note_effect_done(&mut self, key: &str) {
@@ -749,9 +773,24 @@ impl TeamRuntime {
     // ── 起動要求と結び付け ──
 
     /// 起動したセッションをエージェントへ結び付ける。
-    pub fn bind_session(&mut self, agent: &AgentId, session: SessionId) {
+    ///
+    /// `identity` は**再起動をまたぐ目印** ([`TeamAgent::session_identity`])。
+    /// これを一緒に覚えるので、次の起動で「もう起こしてある」と分かる。
+    /// 分からないと、Zaivern 自身が復元したセッションの隣に 2 体目を起こす。
+    pub fn bind_session(
+        &mut self,
+        agent: &AgentId,
+        session: SessionId,
+        identity: Option<String>,
+    ) {
         if let Some(a) = self.agents.iter_mut().find(|a| a.id == *agent) {
             a.session_id = Some(session);
+            // **目印は上書きしない。** 引き取り (adopt) では実行側が同じ
+            // 値を返すが、拾えなかったときに `None` で消すと、次の起動で
+            // また新しく起こすことになる。
+            if identity.is_some() {
+                a.session_identity = identity;
+            }
             a.last_activity_at = now_secs();
             a.state = AgentWorkState::Idle;
         }
@@ -792,6 +831,68 @@ impl TeamRuntime {
         );
         self.drain_rejections();
         self.dirty = true;
+    }
+
+    /// **指示を積んだのに、実際には届かなかった。**
+    ///
+    /// 送信経路 (`submit`) は「積めた」と「届いた」が別の時刻に決まる:
+    /// 積んだ後に相手が消えれば `Gone`、入力欄が空かないまま上限に達すれば
+    /// `GaveUp` になる。積めた時点で完了にすると、**そのどちらでも
+    /// Runtime は「指示は届いた」と信じたまま** タスクを `Running` で
+    /// 抱え続ける (冪等キーが完了なので、二度と出し直されない)。
+    ///
+    /// なので届かなかったことは必ずここへ戻す。担当を解いて配り直せる形に
+    /// し、**試行として数える** — 数えないと、同じ相手へ延々と積み直す
+    /// 無限ループになりうる (上限に達したら `NeedsUser` で人に上がる)。
+    pub fn note_instruction_undelivered(&mut self, task: TaskId, key: &str, why: &str) {
+        // **いま待っている指示の結末だけを採る。** 配達の結末は遅れて届く
+        // ので、その間にタスクが先へ進んでいることがある (相手は本当は
+        // 受け取っていて、もう検証まで来ている、など)。古い配達の結末で
+        // 担当を剥がすと、出来上がっている成果を捨てて作り直させることに
+        // なる — 検証結果を実行 ID で照合するのと同じ考え方。
+        if self.current_instruction_key(task).as_deref() != Some(key) {
+            self.log(
+                TeamEventKind::TaskFailed,
+                None,
+                None,
+                format!("#{task} の古い配達の結末を無視しました ({key})"),
+            );
+            self.dirty = true;
+            return;
+        }
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.context
+                .push(clamp_text(&format!("指示が届きませんでした: {why}")));
+            t.context = clamp_list(std::mem::take(&mut t.context));
+        }
+        self.log(
+            TeamEventKind::TaskFailed,
+            None,
+            None,
+            format!("#{task} へ指示が届きませんでした: {why}"),
+        );
+        // 既存の解放経路をそのまま使う (第 2 の解放規則を作らない)。
+        // 停止確認 → 担当を外す → 上限なら `NeedsUser`、そうでなければ
+        // `Ready` へ戻して配り直す。
+        self.free_task(task, true);
+        self.drain_rejections();
+        self.dirty = true;
+    }
+
+    /// **いまそのタスクが待っている指示の鍵。**
+    ///
+    /// 担当が付いていて、まだ本人が動いている段のときだけ意味がある。
+    /// 配達の結末を採ってよいかは、これと一致するかだけで決まる。
+    pub fn current_instruction_key(&self, task: TaskId) -> Option<String> {
+        let t = self.task(task)?;
+        if !matches!(
+            t.state,
+            TeamTaskState::Assigned | TeamTaskState::Running
+        ) {
+            return None;
+        }
+        let agent = t.assigned_agent.as_ref()?;
+        Some(instruction_key(t.id, agent, t.attempts, t.dispatch_seq))
     }
 
     /// 起動に失敗した。次の tick でもう一度試せるよう、冪等キーを外す。
@@ -1968,6 +2069,7 @@ impl TeamRuntime {
                     // **報告されただけ。実在するセッションとして描かない。**
                     kind: AgentKind::ReportedSubAgent,
                     session_id: None,
+                    session_identity: None,
                     provider: String::new(),
                     state,
                     current_task: doc.task_id,
@@ -2306,6 +2408,10 @@ impl TeamRuntime {
         // 落ちると、記録は成功のまま・エージェントは居ない、という状態が残る。
         // 記録を外して撃ち直せるようにする (居るなら `session_id` が入って
         // いるので、ここは通らない)。
+        //
+        // **撃ち直しても 2 体にはならない。** 目印 (`session_identity`) を
+        // `adopt` に載せて出すので、実行側は起こす前にそのセッションが
+        // 生きていないかを見る (下の `specs` を参照)。
         let orphan_keys: Vec<String> = self
             .agents
             .iter()
@@ -2329,6 +2435,10 @@ impl TeamRuntime {
                 role: a.role,
                 team_id: a.team_id.clone(),
                 workspace_root: root.clone(),
+                // **前に起こしたセッションの目印を必ず載せる。**
+                // 載せないと、再起動のあと実行側は「初めての起動」と
+                // 区別できず、復元済みのセッションの隣へ 2 体目を起こす。
+                adopt: a.session_identity.clone(),
             })
             .collect();
         for s in specs {
@@ -2484,6 +2594,12 @@ impl TeamRuntime {
                     } else {
                         None
                     };
+                    // **鍵は「いま台帳に書いた値」から組む** (下の `seq`)。
+                    // 配る前の写しから組むと、進めたばかりの `dispatch_seq`
+                    // と 1 ずれる。ずれると、配達の結末を照合する
+                    // [`Self::current_instruction_key`] と一致しなくなり、
+                    // 届かなかったことが**いつも無視される**。
+                    let mut seq = (task.attempts, task.dispatch_seq);
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == a.task) {
                         if let Some(b) = baseline {
                             t.baseline = Some(b);
@@ -2499,9 +2615,11 @@ impl TeamRuntime {
                         // 同じ担当へ同じ試行回数で配り直しても、指示は
                         // ちゃんと新しい鍵で出る。
                         t.dispatch_seq = t.dispatch_seq.saturating_add(1);
+                        seq = (t.attempts, t.dispatch_seq);
                         step(t, TeamTaskState::Assigned, &self.rejections);
                         step(t, TeamTaskState::Running, &self.rejections);
                     }
+                    let key = instruction_key(a.task, &a.agent, seq.0, seq.1);
                     self.log(
                         TeamEventKind::TaskAssigned,
                         None,
@@ -2514,10 +2632,7 @@ impl TeamRuntime {
                         // **試行回数まで含めて鍵にする。** これが無いと
                         // 差し戻し後の再指示が「同じ指示」として抑止される。
                         task: a.task,
-                        key: format!(
-                            "instr:{}:{}:{}:{}",
-                            a.task, a.agent, task.attempts, task.dispatch_seq
-                        ),
+                        key,
                     });
                     self.dirty = true;
                 }
@@ -2906,6 +3021,7 @@ impl TeamRuntime {
             parent_id: None,
             kind: AgentKind::ManagedSession,
             session_id: None,
+            session_identity: None,
             provider: String::new(),
             state: AgentWorkState::Idle,
             current_task: None,
@@ -2929,6 +3045,7 @@ impl TeamRuntime {
                 parent_id: Some(lead.clone()),
                 kind: AgentKind::ManagedSession,
                 session_id: None,
+                session_identity: None,
                 provider: String::new(),
                 state: AgentWorkState::Idle,
                 current_task: None,

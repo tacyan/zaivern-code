@@ -540,6 +540,10 @@ impl ZaivernApp {
         let mut next: Option<Duration> = None;
         let mut delivered: Vec<String> = Vec::new();
         let mut gave_up: Vec<String> = Vec::new();
+        // **終わり方を目印つきで拾う** (`(目印, 本当に届いたか)`)。
+        // 積めたことと届いたことは別の時刻に決まるので、頼んだ側へは
+        // ここでしか本当のことを返せない。
+        let mut outcomes: Vec<(String, bool)> = Vec::new();
         let mut queue = std::mem::take(&mut self.outbox);
         let sup = &self.supervisor;
         let agents = &mut self.agents;
@@ -547,7 +551,12 @@ impl ZaivernApp {
             let sid = p.job.session;
             let idle = matches!(sup.state_of(sid), Some(supervisor::SessionState::Idle));
             let Some(s) = agents.sessions.iter_mut().find(|s| s.id == sid) else {
-                return false; // セッションが消えた
+                // セッションが消えた。**黙って捨てない** — 頼んだ側は
+                // 「届いた」と思ったまま待ち続けることになる。
+                if let Some(t) = p.job.tag.clone() {
+                    outcomes.push((t, false));
+                }
+                return false;
             };
             let bracketed = s.running() && s.bracketed_paste();
             let peek = submit::Peek {
@@ -565,9 +574,25 @@ impl ZaivernApp {
                 next = Some(next.map_or(d, |n: Duration| n.min(d)));
             };
             match p.act(&peek, now) {
-                submit::Act::Gone | submit::Act::Done => false,
+                submit::Act::Done => {
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, true));
+                    }
+                    false
+                }
+                // **相手が消えた = 届いていない。** 本文を書いた後でも、
+                // 確定キーが効いたことは確かめられていない。
+                submit::Act::Gone => {
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
+                    false
+                }
                 submit::Act::GaveUp => {
                     gave_up.push(s.title.clone());
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
                     false
                 }
                 submit::Act::Wait(d) => {
@@ -598,6 +623,11 @@ impl ZaivernApp {
             }
         });
         self.outbox = queue;
+        // **配達の結末を頼んだ側へ 1 回だけ返す。** 送信経路は増やさない
+        // (ここは結果を伝えるだけで、PTY へは 1 バイトも書かない)。
+        if !outcomes.is_empty() {
+            self.team_note_delivery(outcomes);
+        }
         for title in delivered {
             self.toast(
                 trf("📋 {title} へ指示を配達しました", &[("title", title)]),

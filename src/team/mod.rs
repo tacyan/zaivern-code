@@ -75,5 +75,8 @@ mod runtime_tests;
 mod wiring_tests;
 
 #[cfg(test)]
+mod crash_tests;
+
+#[cfg(test)]
 #[path = "changeset_tests.rs"]
 mod changeset_tests;

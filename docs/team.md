@@ -480,6 +480,51 @@ Planner → ValidationCommand{executable, args}
   `Forbidden` → `NeedsUser` で行き止まる。**fail-closed でも
   「誰も直せない止まり方」は守りにならない**
 
+### 落ちても消えず、二度も走らない (Effect の台帳)
+
+Effect は**渡した瞬間には済んでいない**。台帳 (`RunDoc::effects`) は
+「渡した」と「成立した」を別の段で持つ:
+
+```text
+作る → Dispatched (渡した。まだ成立していない) → Completed (本当に成立した)
+                    ↓ 成立しなかった
+                  記録ごと外す (= もう一度出せる)
+```
+
+立て直し (`TeamRuntime::restore`) は **`Completed` だけを引き継ぐ**。
+`Dispatched` のまま落ちたものは記録が無いところから始まるので、もう一度出る。
+
+| Effect | 「成立した」とは | 落ちたとき |
+|---|---|---|
+| `SendInstruction` | 相手の端末へ**確定まで届いた** (`submit::Act::Done`) | 届いていなければ担当を解いて配り直す |
+| `StartAgent` | セッションへ結び付いた | 目印で引き取る (下記)。無ければ起こし直す |
+| `RunValidation` | 裏で走らせ始めた | **決着していない `Completed` は引き継がない** (引き継ぐと永久に止まる) |
+| `StopAgent` | 相手が居なくても目的は果たされている | セッション ID は再起動で意味を失う |
+| `CancelValidation` | 同上 | 同上 |
+| `RequestHumanApproval` | 画面に出た | `decisions` 側が `idempotency_key` で守る |
+| `PersistState` | 保存した | 鍵を持たない (毎回出してよい) |
+
+* **「積めた」を「届いた」にしない。** `queue_submit` が真を返すのは
+  配達待ちへ積めたということでしかない。そのあと相手が消えれば
+  `Act::Gone`、入力欄が空かないまま上限に達すれば `Act::GaveUp` になる。
+  積んだ時点で完了にすると、**どちらでも指示は消える**のに Runtime は
+  「送った」と信じたままタスクを抱え続ける (完了した鍵は二度と出ない)。
+  結末は `submit_tick` が目印つきで 1 回だけ返す — **送信経路は 1 本のまま**で、
+  返しているのは結果だけ
+* **同じ logical agent を 2 体起こさない。** 起動が成功してから結び付けが
+  保存されるまでの間に落ちると、記録には残らないのにセッションだけが残る
+  (Zaivern は自分のセッションを生ログごと復元するので、次の起動でも
+  生きている)。`TeamAgent::session_identity` (= 生ログの絶対パス。復元しても
+  綴りが変わらない) を覚えておき、起動要求へ `adopt` として載せる。実行側は
+  **起こす前に**引き取れるセッションを探す (`launch::adopt_choice` — 純関数)。
+  死んでいるもの・既に別の担当へ結び付いているものは選ばない
+* **古い結果は採らない。** 実行 ID (`run_id:task:attempt:generation`) が
+  いま待っているものと一致しない結果は、記録もせず捨てる。前の試行の
+  「成功」が遅れて届いて、新しい試行の証跡を上書きする事故を構造で防ぐ
+
+番人は `team::crash_tests` (落ちる瞬間を `to_saved()` → `restore()` で
+決定的に作る) と、実行側の配線を見る `team::wiring_tests`。
+
 ### 承認は「その 1 回」にしか効かない
 
 承認は `DecisionKind::ValidationExecution` として既存の approval gate を

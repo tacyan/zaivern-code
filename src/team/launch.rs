@@ -169,6 +169,62 @@ pub fn request_matches_workspace(req: &TeamLaunchRequest, workspace: &Path) -> b
     canon(&req.spec_path).starts_with(&current)
 }
 
+/// 引き取りの候補になるセッション 1 つぶん (**実行側が集めた事実だけ**)。
+///
+/// Team はセッションを持たないので、判断の材料は実行側から渡してもらう。
+/// ここに持つのは判断の**規則**だけで、第 2 のセッション台帳は作らない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionFact {
+    pub id: super::model::SessionId,
+    /// 再起動をまたぐ目印 (生ログの絶対パス)。取れなければ空。
+    pub identity: String,
+    /// タブの名前 (Team が起動時に付け、復元でも同じ綴りが戻る)。
+    pub title: String,
+    /// 作業フォルダ。
+    pub cwd: PathBuf,
+    /// PTY が生きているか。
+    pub running: bool,
+    /// 既に別の担当へ結び付いているか。
+    pub bound: bool,
+}
+
+/// **起こす前に、引き取れるセッションがないかを決める** (純関数)。
+///
+/// 起動が成功してから結び付けが保存されるまでの間に落ちると、記録には
+/// 残らないのにセッションだけが残る (Zaivern は自分のセッションを生ログごと
+/// 復元するので、次の起動でも生きている)。そこへ素直に起こし直すと、
+/// **同じ logical agent が 2 体**になり、同じタスクを 2 つの端末が持つ。
+///
+/// 優先順位:
+///
+/// 1. **目印が一致するもの** — 前に起こしたセッションそのもの
+/// 2. 同じ作業フォルダで同じタブ名のもの — 目印を残す前に落ちた窓の受け皿
+///
+/// **除外**: 死んでいるもの / 既に別の担当へ結び付いているもの
+/// (結び付いているものを選ぶと、2 体が同じ端末へ指示を書き込む)。
+pub fn adopt_choice(
+    want: Option<&str>,
+    name: &str,
+    workspace: &Path,
+    sessions: &[SessionFact],
+) -> Option<super::model::SessionId> {
+    let usable = |s: &&SessionFact| s.running && !s.bound;
+    if let Some(want) = want.map(str::trim).filter(|w| !w.is_empty()) {
+        if let Some(s) = sessions
+            .iter()
+            .filter(usable)
+            .find(|s| s.identity == want)
+        {
+            return Some(s.id);
+        }
+    }
+    sessions
+        .iter()
+        .filter(usable)
+        .find(|s| s.title == name && s.cwd == workspace)
+        .map(|s| s.id)
+}
+
 /// 起動要求を組み立てる。**ここで全部検証する。**
 pub fn build(
     workspace_root: &Path,

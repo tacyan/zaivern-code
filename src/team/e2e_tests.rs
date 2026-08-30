@@ -218,7 +218,7 @@ impl Lab {
                 TeamEffect::StartAgent(s) => {
                     let sid = self.next_session;
                     self.next_session += 1;
-                    self.rt.bind_session(&s.agent_id, sid);
+                    self.rt.bind_session(&s.agent_id, sid, None);
                     self.sessions.push(sid);
                     acks.push(e.key());
                 }

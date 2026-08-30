@@ -208,10 +208,30 @@ impl ZaivernApp {
         // と見なさないので、ここで落ちても次の起動で撃ち直される。
         let launches = panel::with_panel(|p| p.take_launches());
         for (key, spec) in launches {
+            // **起こす前に、もう居ないかを見る。** 起動に成功してから
+            // 結び付けが保存されるまでの間に落ちると、記録には残らないのに
+            // セッションだけが残る (Zaivern は自分のセッションを復元するので、
+            // 次の起動でも生きている)。そこへ素直に起こし直すと、同じ
+            // logical agent が 2 体になる。
+            if let Some((session, identity)) = self.team_adopt_session(&spec) {
+                panel::with_panel(|p| {
+                    p.bind_session(&spec.agent_id, session, Some(identity));
+                    p.ack_done(&key);
+                });
+                self.toast(
+                    trf("team.toast.agent_adopted", &[("name", spec.name.clone())]),
+                    true,
+                );
+                continue;
+            }
             match self.team_launch_agent(&spec, ctx) {
                 Some(session) => {
+                    // **目印を一緒に覚える。** 生ログのパスは復元しても
+                    // 同じものを使う (`session::AgentSessionRec::log_file`)
+                    // ので、次の起動でも同じセッションだと分かる。
+                    let identity = self.team_session_identity(session);
                     panel::with_panel(|p| {
-                        p.bind_session(&spec.agent_id, session);
+                        p.bind_session(&spec.agent_id, session, identity);
                         p.ack_done(&key);
                     });
                     self.toast(
@@ -244,7 +264,14 @@ impl ZaivernApp {
             let queued = if blocked.is_some() {
                 false
             } else {
-                self.queue_submit(crate::submit::Job::deferred(session, text, true))
+                // **配達の結末を受け取れるように目印を付ける。**
+                // 冪等キーに Run を添えるだけ (第 2 の ID 体系を作らない)。
+                // Run を添えないと、Run を作り直したあとに前の Run の配達が
+                // 終わったとき、**同じ番号の別のタスク**の指示を完了に
+                // してしまう (積んだ仕事は Run の切り替えでは消えない)。
+                let mut job = crate::submit::Job::deferred(session, text, true);
+                job.tag = panel::with_panel(|p| p.delivery_tag(&key));
+                self.queue_submit(job)
             };
             panel::with_panel(|p| match (&blocked, queued) {
                 (Some(why), _) => {
@@ -254,7 +281,10 @@ impl ZaivernApp {
                     p.ack_failed(&key);
                     p.note_instruction_blocked(task, why);
                 }
-                (None, true) => p.ack_done(&key),
+                // **積めた = 届いた、ではない。** ここでは何も返さない
+                // (Effect は「発行済み」のまま = 二重には出ない)。届いたか
+                // 消えたかは `team_note_delivery` が 1 回だけ返す。
+                (None, true) => {}
                 (None, false) => p.ack_failed(&key),
             });
         }
@@ -281,7 +311,79 @@ impl ZaivernApp {
         panel::with_panel(|p| p.collect_validations());
     }
 
-    /// エージェントを 1 体起こす。戻りは新しいセッション ID。
+    /// **配達の結末を Team へ返す** (`submit_tick` から 1 回だけ)。
+    ///
+    /// 積めたことを完了として記録すると、そのあと相手が消えても・入力欄が
+    /// 空かないまま上限に達しても、Runtime は「指示は届いた」と信じたまま
+    /// タスクを抱え続ける (冪等キーが完了なので二度と出し直されない)。
+    pub(crate) fn team_note_delivery(&mut self, outcomes: Vec<(String, bool)>) {
+        for (key, delivered) in outcomes {
+            let task = panel::with_panel(|p| p.note_delivery(&key, delivered));
+            if let Some(t) = task {
+                self.toast(
+                    trf(
+                        "team.err.instruction_undelivered",
+                        &[("task", t.to_string())],
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+
+    /// セッションの**再起動をまたぐ目印** (生ログの絶対パス)。
+    ///
+    /// 復元は同じログファイルへ書き戻す (`session::AgentSessionRec::log_file`)
+    /// ので、この綴りは次の起動でも変わらない。
+    fn team_session_identity(&self, session: SessionId) -> Option<String> {
+        self.agents
+            .sessions
+            .iter()
+            .find(|s| s.id == session)
+            .and_then(|s| s.log_path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// **この起動要求に対応する、既に生きているセッションを探す。**
+    ///
+    /// 見つかれば `(セッション ID, 目印)`。優先順位:
+    ///
+    /// 1. **目印が一致するもの** — 前に起こしたセッションそのもの。
+    ///    生ログのパスは復元をまたいで変わらないので、これが本命
+    /// 2. 同じ作業フォルダで同じタブ名のもの — 起動には成功したが、
+    ///    目印を残す前に落ちた窓の受け皿 (タブ名は Team が付けて復元される)
+    ///
+    /// **既に別の担当へ結び付いているセッションは選ばない。** 選ぶと 2 体の
+    /// エージェントが同じ端末を共有し、指示が混ざる。
+    fn team_adopt_session(
+        &self,
+        spec: &crate::features::team::imp::runtime::AgentLaunchSpec,
+    ) -> Option<(SessionId, String)> {
+        let bound = panel::with_panel(|p| p.bound_sessions());
+        // **判断の規則は Team 側の純関数 1 本** (`launch::adopt_choice`)。
+        // ここは事実を集めて渡すだけ — 規則を 2 か所に書かない。
+        let facts: Vec<launch::SessionFact> = self
+            .agents
+            .sessions
+            .iter()
+            .map(|s| launch::SessionFact {
+                id: s.id,
+                identity: self.team_session_identity(s.id).unwrap_or_default(),
+                title: s.title.clone(),
+                cwd: s.cwd.clone(),
+                running: s.running(),
+                bound: bound.contains(&s.id),
+            })
+            .collect();
+        let id = launch::adopt_choice(
+            spec.adopt.as_deref(),
+            &spec.name,
+            &spec.workspace_root,
+            &facts,
+        )?;
+        Some((id, self.team_session_identity(id)?))
+    }
+
     /// エージェントを 1 体起こす。戻りは新しいセッション ID。
     ///
     /// **cwd は要求 (`spec.workspace_root`) が決める。** 画面のいまの

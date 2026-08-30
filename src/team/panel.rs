@@ -806,11 +806,84 @@ impl TeamPanel {
     }
 
     /// 起動したセッションを結び付ける。
-    pub fn bind_session(&mut self, agent: &AgentId, session: SessionId) {
+    ///
+    /// `identity` は**再起動をまたぐ目印** (実行側が決める安定した文字列)。
+    /// 覚えておかないと、次の起動で同じ logical agent を 2 体起こす。
+    pub fn bind_session(
+        &mut self,
+        agent: &AgentId,
+        session: SessionId,
+        identity: Option<String>,
+    ) {
         if let Some(rt) = self.runtime.as_mut() {
-            rt.bind_session(agent, session);
+            rt.bind_session(agent, session, identity);
         }
         self.dirty = true;
+        self.needs_save = true;
+    }
+
+    /// **指示が実際に届いたか**を実行側から受け取る (`submit` の終わり方)。
+    ///
+    /// 届いたなら冪等キーを完了にする (もう出し直さない)。届かなかったなら
+    /// 完了にせず、担当を解いて配り直せる形へ戻す。**積めた時点で完了に
+    /// してしまうと、相手が消えた場合に指示が消えたまま Runtime だけが
+    /// 「送った」と信じ続ける。**
+    ///
+    /// 戻りは「届かなかったタスク」(画面へ理由を出すため)。
+    pub fn note_delivery(&mut self, tag: &str, delivered: bool) -> Option<TaskId> {
+        let (run, key) = tag.split_once('|')?;
+        // **前の Run の配達を、いまの Run へ効かせない。** 積んだ仕事は
+        // Run の切り替えでは消えないので、同じ番号の別のタスクを完了に
+        // してしまう (外向きの 4 つの口と同じ「持ち主で選り分ける」形)。
+        if self.owner().is_none_or(|o| o.run_id != run) {
+            return None;
+        }
+        let key = key.to_string();
+        let key = key.as_str();
+        let task = self.instruction_task_of(key)?;
+        if delivered {
+            self.ack_done(key);
+            return None;
+        }
+        self.ack_failed(key);
+        if let Some(rt) = self.runtime.as_mut() {
+            rt.note_instruction_undelivered(task, key, "宛先の端末が応答しませんでした");
+        }
+        self.needs_save = true;
+        self.dirty = true;
+        Some(task)
+    }
+
+    /// 配達の結末を受け取るための目印 (`<run_id>|<冪等キー>`)。
+    ///
+    /// Run を添えるのは、積んだ仕事が Run の切り替えでは消えないから
+    /// (前の Run の配達が、同じ番号の別のタスクを完了にしてしまう)。
+    /// Run が無ければ `None` = そもそも配達の結末を受け取らない。
+    pub fn delivery_tag(&self, key: &str) -> Option<String> {
+        self.owner().map(|o| format!("{}|{key}", o.run_id))
+    }
+
+    /// 冪等キーからタスク番号を読む (`instr:<task>:<agent>:<attempt>:<seq>`)。
+    ///
+    /// **鍵の綴りを 2 か所で組み立てない。** 発行側は
+    /// [`super::runtime`] の 1 か所だけで、ここは読むだけ。読めない綴り
+    /// (Team のものではない目印) は `None` になり、何も起きない。
+    fn instruction_task_of(&self, key: &str) -> Option<TaskId> {
+        let rest = key.strip_prefix("instr:")?;
+        let (task, _) = rest.split_once(':')?;
+        task.parse().ok()
+    }
+
+    /// いま担当へ結び付いているセッション。
+    ///
+    /// 実行側が「このセッションはもう別の担当のものか」を見るために使う
+    /// (**第 2 のセッション台帳を作らない** — 真実は Runtime の
+    /// エージェント一覧 1 か所)。
+    pub fn bound_sessions(&self) -> HashSet<SessionId> {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.agents().iter().filter_map(|a| a.session_id).collect())
+            .unwrap_or_default()
     }
 
     /// 起動に失敗した。
@@ -1930,7 +2003,7 @@ mod tests {
         // ── 4) セッションを結び付ける → 担当が付く ────────────────────────
         let sessions: Vec<SessionId> = (0..agents.len() as SessionId).map(|i| 100 + i).collect();
         for (a, s) in agents.iter().zip(&sessions) {
-            p.bind_session(a, *s);
+            p.bind_session(a, *s, None);
         }
         let rows = |target: Option<SessionId>, text: &str| -> Vec<SessionInput> {
             sessions
@@ -2024,6 +2097,95 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// **積めたことを「届いた」にしない。**
+    ///
+    /// 送信経路は「積めた」と「届いた」を別の時刻に決める。積んだ時点で
+    /// 冪等キーを完了にすると、そのあと相手が消えても・入力欄が空かない
+    /// まま上限に達しても、Runtime は「指示は届いた」と信じたままタスクを
+    /// 抱え続ける (二度と出し直されない = 指示が消える)。
+    #[test]
+    fn 届かなかった指示は完了にせず配り直せる形へ戻す() {
+        let dir = ws("delivery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "前提: 起動要求が出ている");
+        let mut sessions: Vec<SessionId> = Vec::new();
+        for (i, (key, spec)) in launches.iter().enumerate() {
+            p.ack_done(key);
+            let sid = 700 + i as SessionId;
+            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            sessions.push(sid);
+        }
+        let rows = || -> Vec<SessionInput> {
+            sessions
+                .iter()
+                .map(|s| SessionInput {
+                    id: *s,
+                    title: format!("agent{s}"),
+                    provider: "claude".into(),
+                    state: crate::coordinator::SessionState::Idle,
+                    tail: Vec::new(),
+                })
+                .collect()
+        };
+        p.pump_sessions(rows(), 2);
+        let sent = p.take_instructions();
+        assert!(!sent.is_empty(), "前提: 指示が出ている");
+        let (key, task, _, _) = sent[0].clone();
+        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+
+        // ── 届かなかった ────────────────────────────────────────────────
+        let hit = p.note_delivery(&tag, false);
+        assert_eq!(hit, Some(task), "どのタスクが届かなかったか返していない");
+        let rt = p.runtime.as_ref().expect("Runtime");
+        assert!(
+            !rt.effect_completed(&key),
+            "届いていないのに完了として記録した (二度と出し直されない)"
+        );
+        let t = rt.task(task).expect("タスク");
+        assert!(
+            t.assigned_session.is_none() && t.assigned_agent.is_none(),
+            "届かなかったのに担当を握ったまま: {t:?}"
+        );
+        assert!(
+            t.context.iter().any(|c| c.contains("届きません")),
+            "理由が残っていない: {:?}",
+            t.context
+        );
+
+        // ── 届いた ──────────────────────────────────────────────────────
+        p.pump_sessions(rows(), 3);
+        let again = p.take_instructions();
+        assert!(!again.is_empty(), "配り直しの指示が出ない");
+        let (key2, _, _, _) = again[0].clone();
+        let tag2 = p.delivery_tag(&key2).expect("目印");
+        assert_eq!(p.note_delivery(&tag2, true), None, "届いたのに理由を返した");
+        assert!(
+            p.runtime
+                .as_ref()
+                .expect("Runtime")
+                .effect_completed(&key2),
+            "届いたのに完了として記録していない (もう一度送ってしまう)"
+        );
+        // **Team のものではない目印は何も起こさない。**
+        assert_eq!(p.note_delivery("submit:someone-else", false), None);
+        // **別の Run の配達は、いまの Run へ効かない。**
+        let other = format!("run-other|{key2}");
+        assert_eq!(p.note_delivery(&other, false), None, "別の Run の配達を採った");
+        assert!(
+            p.runtime.as_ref().expect("Runtime").effect_completed(&key2),
+            "別の Run の配達でいまの Run の記録を壊した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn team_state_does_not_leak_across_workspaces_or_app_contexts() {
         // 状態は `thread_local!` に居て **`ZaivernApp` より長生きする**。
@@ -2046,7 +2208,7 @@ mod tests {
         for (i, (key, spec)) in launches.iter().enumerate() {
             p.ack_done(key);
             let sid = 900 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid);
+            p.bind_session(&spec.agent_id, sid, None);
             sessions.push(sid);
         }
         // **観測にも同じセッションを出す。** 出さないと「消えた」と見なされ、

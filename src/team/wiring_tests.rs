@@ -21,6 +21,7 @@ const PERSISTENCE: &str = include_str!("persistence.rs");
 const LAUNCH: &str = include_str!("launch.rs");
 const FRAME: &str = include_str!("../app/frame_update.rs");
 const STARTUP: &str = include_str!("../app/startup.rs");
+const SESSIONS: &str = include_str!("../app/agent_sessions.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -135,14 +136,70 @@ fn エージェント起動は既存経路を通る() {
 #[test]
 fn 指示の送信は既存の一本を通る() {
     let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_run_effects").expect("実行の橋"));
     assert!(
-        s.contains("self.queue_submit(crate::submit::Job::deferred("),
-        "既存の送信経路 (submit) を通っていない"
+        body.contains("crate::submit::Job::deferred(") && body.contains("self.queue_submit(job)"),
+        "既存の送信経路 (submit) を通っていない:\n{body}"
+    );
+    // **配達の結末を受け取れる形で積む。** 目印が無いと、積めたことしか
+    // 分からず、相手が消えても Runtime は「届いた」と信じ続ける。
+    assert!(
+        body.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        "配達の結末を受け取る目印を付けていない:\n{body}"
     );
     // PTY へ直接書く経路を作らない (Ink 系 TUI の取りこぼし対策は submit が持つ)
     assert!(
         !s.contains("write_bytes("),
         "PTY へ直に書いている (submit を迂回している)"
+    );
+}
+
+#[test]
+fn 積めたことを届いたことにしない() {
+    // **送信経路は「積めた」と「届いた」を別の時刻に決める。**
+    // 積んだ時点で冪等キーを完了にすると、そのあと相手が消えても
+    // (`Act::Gone`)、入力欄が空かないまま上限に達しても (`Act::GaveUp`)、
+    // Runtime は「指示は届いた」と信じたままタスクを抱え続ける
+    // (完了した鍵は二度と出し直されない = 指示が消える)。
+    let glue = src(GLUE);
+    let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
+    let at = body
+        .find("for (key, task, session, text) in instructions")
+        .expect("指示の取り出し口");
+    // 次の取り出し口 (停止) までが指示の区画。
+    let end = body[at..]
+        .find("for (key, session) in stops")
+        .map(|e| at + e)
+        .unwrap_or(body.len());
+    let seg = &body[at..end];
+    assert!(
+        !seg.contains("ack_done"),
+        "積めた時点で完了にしている (届かなくても消えなくなる):\n{seg}"
+    );
+    assert!(
+        seg.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        "配達の結末を受け取る目印を付けていない:\n{seg}"
+    );
+
+    // 配達の**終わり方**が、目印つきで必ず返ること。
+    let sessions = src(SESSIONS);
+    let tick = function_body(
+        &sessions,
+        sessions.find("fn submit_tick").expect("配達を進める唯一の経路"),
+    );
+    for (needle, why) in [
+        ("submit::Act::Done => {", "届いたことを他と区別していない"),
+        ("submit::Act::Gone => {", "相手が消えたことを他と区別していない"),
+        ("outcomes.push((t, true))", "届いたことを返していない"),
+        ("outcomes.push((t, false))", "届かなかったことを返していない"),
+        ("self.team_note_delivery(outcomes)", "結末を頼んだ側へ返していない"),
+    ] {
+        assert!(tick.contains(needle), "{why}:\n{tick}");
+    }
+    // **届かなかった側は 3 通りある** (消えた / 諦めた / セッションごと無い)。
+    assert!(
+        tick.matches("outcomes.push((t, false))").count() >= 3,
+        "届かなかった経路のどれかが黙って捨てている:\n{tick}"
     );
 }
 
@@ -366,8 +423,22 @@ fn 起動要求のフィールドはすべて使われている() {
     // agent_id はセッションの結び付けに使う (呼び出し側)。
     let run = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
     assert!(
-        run.contains("p.bind_session(&spec.agent_id, session)"),
-        "起動したセッションを要求のエージェントへ結び付けていない"
+        run.contains("p.bind_session(&spec.agent_id, session, identity)"),
+        "起動したセッションを要求のエージェントへ結び付けていない (目印つきで)"
+    );
+    // **adopt も使う。** 使わないと、再起動のあと同じ logical agent を
+    // 2 体起こす (起動成功から保存までの間に落ちた窓)。
+    assert!(
+        run.contains("self.team_adopt_session(&spec)"),
+        "起こす前に既存セッションを見ていない"
+    );
+    let adopt = function_body(
+        &glue,
+        glue.find("fn team_adopt_session").expect("引き取りの判断"),
+    );
+    assert!(
+        adopt.contains("launch::adopt_choice(") && adopt.contains("bound.contains"),
+        "引き取りの規則を Team 側の純関数へ通していない:\n{adopt}"
     );
 }
 
@@ -899,8 +970,13 @@ fn 実行側は必ず成否を返す() {
         ),
         (
             // 宛先のタスクも運ぶ (セッションから引き直さない)。
+            //
+            // **指示だけは「積めた時点」では返さない。** 積めたことと
+            // 届いたことは別の時刻に決まるので、成功は配達の結末
+            // (`team_note_delivery`) が返す。ここで見るのは
+            // 「積めなかったときに必ず失敗が返る」ことだけ。
             "for (key, task, session, text) in instructions",
-            &["p.ack_done(&key)", "p.ack_failed(&key)"],
+            &["p.ack_failed(&key)"],
         ),
         ("for (key, session) in stops", &["p.ack_done(&key)"]),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。

@@ -85,6 +85,23 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
     rt
 }
 
+/// 全セッションを Idle として観測する (crash_tests と共用)。
+///
+/// **観測の組み立てを 2 か所に書かない。** 書くと、片方だけがセッションを
+/// 載せ忘れて「消えた」と解釈される (実際に踏んだ罠)。
+pub fn obs_for_test(now: u64, sessions: &[SessionId]) -> Observation {
+    let rows: Vec<(SessionId, SessionState, &str)> = sessions
+        .iter()
+        .map(|s| (*s, SessionState::Idle, ""))
+        .collect();
+    obs(now, &rows)
+}
+
+/// 開始済みの Runtime (crash_tests と共用)。
+pub fn started_for_test(agents: usize) -> TeamRuntime {
+    started(agents)
+}
+
 fn obs(now: u64, sessions: &[(SessionId, SessionState, &str)]) -> Observation {
     Observation {
         now,
@@ -106,7 +123,7 @@ fn bind_all(rt: &mut TeamRuntime, effects: &[TeamEffect], next: &mut SessionId) 
     let mut out = Vec::new();
     for e in effects {
         if let TeamEffect::StartAgent(s) = e {
-            rt.bind_session(&s.agent_id, *next);
+            rt.bind_session(&s.agent_id, *next, None);
             out.push(*next);
             *next += 1;
         }

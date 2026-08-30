@@ -368,7 +368,24 @@ pub struct TeamAgent {
     pub parent_id: Option<AgentId>,
     pub kind: AgentKind,
     /// 実セッション。`ManagedSession` でも起動前は `None`。
+    ///
+    /// **再起動をまたがない。** セッション ID はプロセスごとに振り直される
+    /// ので、`TeamRuntime::restore` が必ず外す。
     pub session_id: Option<SessionId>,
+    /// **起こしたセッションの、再起動をまたぐ目印。**
+    ///
+    /// `session_id` は次の起動で必ず別の値になるので、これだけでは
+    /// 「もう起こしてあるのか」を再起動後に答えられない。答えられないと、
+    /// Zaivern 自身が復元したセッション (`session::AgentSessionRec` は
+    /// 生ログのパスまで持って復元する) の隣に、**同じ logical agent の
+    /// 2 体目**を起こしてしまう。
+    ///
+    /// 中身は実行側が決める安定した文字列 (いまは生ログの絶対パス —
+    /// 復元後も同じファイルへ追記されるので、綴りが変わらない)。
+    /// Runtime はこれを**照合の材料として運ぶだけ**で、意味は解釈しない
+    /// (第 2 のセッション台帳を作らないため)。
+    #[serde(default)]
+    pub session_identity: Option<String>,
     /// 使っている CLI (`claude` / `codex` など)。表示だけに使う。
     pub provider: String,
     pub state: AgentWorkState,
@@ -1098,6 +1115,7 @@ mod tests {
             kind: AgentKind::ReportedSubAgent,
             // 万一 session_id が入っていても開けない (kind が真実)
             session_id: Some(7),
+            session_identity: None,
             provider: "claude".into(),
             state: AgentWorkState::Working,
             current_task: None,
@@ -1115,6 +1133,7 @@ mod tests {
         let not_started = TeamAgent {
             kind: AgentKind::ManagedSession,
             session_id: None,
+            session_identity: None,
             ..a
         };
         assert!(!not_started.can_open_terminal());
