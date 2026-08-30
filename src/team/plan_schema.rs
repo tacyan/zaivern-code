@@ -256,13 +256,20 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
                     .collect(),
             ),
             // **構造へ直してから持つ。** 文字列のまま内側へ入れない
-            // (判定した形と実行する形がずれる)。読めないものは落とす —
-            // `validate_plan` が「検証コマンドが無い」として弾く。
+            // (判定した形と実行する形がずれる)。
+            //
+            // **語に割れなかった行も捨てない。** 捨てると、人が SPEC に
+            // 書いた 1 行が診断も出ないまま消える (残りの行が読めていれば
+            // `validate_plan` は「検証コマンドが無い」とも言わない)。
+            // 行を丸ごと実行体として持てば `classify` が `Forbidden` にし、
+            // `DangerousCommand` として理由つきで止まる。
             validation_commands: t
                 .validation_commands
                 .iter()
                 .take(super::model::LIST_MAX)
-                .filter_map(|s| ValidationCommand::parse(s).ok())
+                .map(|s| {
+                    ValidationCommand::parse(s).unwrap_or_else(|_| ValidationCommand::unparsed(s))
+                })
                 .collect(),
             state: TeamTaskState::Pending,
             assigned_agent: None,
@@ -452,5 +459,48 @@ mod tests {
             validate(doc, ""),
             Err(SchemaError::TooMany { what: "tasks", .. })
         ));
+    }
+
+    #[test]
+    fn 語に割れなかった検証コマンドを黙って捨てない() {
+        // **捨てると診断が 1 行も出ない。** 残りの行が読めていれば
+        // 「検証コマンドが無い」にもならないので、人が SPEC に書いた
+        // 1 行だけが何事も無かったように消える。
+        let doc = PlanDoc {
+            goal: GoalDoc {
+                title: "t".into(),
+                definition_of_done: vec!["done".into()],
+            },
+            teams: Vec::new(),
+            tasks: vec![TaskDoc {
+                key: "k".into(),
+                title: "t".into(),
+                description: String::new(),
+                team: String::new(),
+                role: String::new(),
+                depends_on: Vec::new(),
+                files: Vec::new(),
+                required_caps: Vec::new(),
+                acceptance_criteria: vec!["x".into()],
+                validation_commands: vec![
+                    "cargo test auth".into(),
+                    // 引用符が閉じていない = `parse` が断る行。
+                    "cargo test \"unclosed".into(),
+                ],
+            }],
+        };
+        let plan = validate(doc, "").expect("計画");
+        assert_eq!(
+            plan.tasks[0].validation_commands.len(),
+            2,
+            "読めなかった 1 行を黙って捨てた"
+        );
+        let issues = super::super::graph::validate_plan(&plan.tasks, &plan.goal.definition_of_done);
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, super::super::graph::PlanIssue::DangerousCommand { .. })),
+            "読めなかった行が理由つきで止まらない: {issues:?}"
+        );
     }
 }

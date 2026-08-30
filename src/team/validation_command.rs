@@ -16,11 +16,16 @@
 //!
 //! ```text
 //! Planner → ValidationCommand{executable, args}
+//!         → 危険度の判定 (名前と引数を見る: graph::classify)
+//!         → 承認ゲート (runtime::advance)
+//!         → 実行器で危険度と承認を**もう一度**確かめる (launch)
 //!         → 実体の解決 (PATH を自分で引き、信用できない場所を弾く)
-//!         → 危険度の判定 (解決した実体と引数を見る)
-//!         → 承認ゲート
 //!         → その実体 + argv + cwd で起動
 //! ```
+//!
+//! **判定は解決より前に来る。** 判定が見ているのは名前だけなので、
+//! 解決が「信用できない場所の実体」を返したらそこで実行を止める
+//! ([`resolve_in`])。名前で得た「読むだけ」の評価を、実体側へ持ち越さない。
 //!
 //! **文字列へ戻す場所は 1 つだけ** — 画面と台帳の見出し
 //! ([`ValidationCommand::display`])。そこから実行経路へは戻らない。
@@ -58,7 +63,12 @@ enum Wire {
 impl From<Wire> for ValidationCommand {
     fn from(w: Wire) -> Self {
         match w {
-            Wire::Parts { executable, args } => Self { executable, args },
+            // **実行体は必ず刈り込む。** 刈り込まないと、判定する側
+            // (`classify` は `trim()` してから許可リストを見る) と解決する側
+            // (`resolve_in` は文字どおりの名前で PATH を引く) が**別の
+            // 文字列**を見る。`{"executable":"cargo\u{a0}"}` は許可リストを
+            // `cargo` として通り抜け、実際には `cargo\u{a0}` を探しに行く。
+            Wire::Parts { executable, args } => Self::new(executable, args),
             // 旧形式。壊れていても落とさず、空の実行体として持つ
             // (危険度の判定が `Forbidden` にする)。
             Wire::Line(s) => Self::parse(&s).unwrap_or_else(|_| Self {
@@ -84,6 +94,29 @@ pub const COMMAND_MAX_CHARS: usize = 400;
 pub const ARGS_MAX: usize = 64;
 
 impl ValidationCommand {
+    /// 実行体と引数から組み立てる (**実行体の前後の空白は刈る**)。
+    ///
+    /// 組み立ての入口をここ 1 つにして、「判定した文字列」と
+    /// 「PATH を引く文字列」がずれないようにする。
+    pub fn new(executable: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            executable: executable.into().trim().to_string(),
+            args,
+        }
+    }
+
+    /// **語に割れなかった行**を、そのまま 1 つの実行体として持つ。
+    ///
+    /// 黙って捨てない — 捨てると、人が SPEC に書いた検証がどこにも
+    /// 出ないまま消える。ここへ入れておけば [`super::graph::classify`] が
+    /// `Forbidden` にし、`validate_plan` が理由つきで止める。
+    pub fn unparsed(line: &str) -> Self {
+        Self {
+            executable: line.trim().to_string(),
+            args: Vec::new(),
+        }
+    }
+
     /// 文字列から組み立てる (**引用符を尊重する**)。
     ///
     /// `cargo test --package "my package"` は 3 引数になる。
@@ -136,7 +169,7 @@ impl ValidationCommand {
         if args.len() > ARGS_MAX {
             return Err("引数が多すぎます".to_string());
         }
-        Ok(Self { executable, args })
+        Ok(Self::new(executable, args))
     }
 
     /// 画面と台帳に出す見出し。**ここから実行経路へは戻らない。**
@@ -157,19 +190,82 @@ impl ValidationCommand {
         s
     }
 
-    /// 引数に指定の旗が含まれるか (`--check` / `--check=x` の両方)。
-    pub fn has_flag(&self, flag: &str) -> bool {
+    /// 引数のどこかに指定の旗が**現れる**か (`--check` / `--check=x`)。
+    ///
+    /// **位置を見ない。** 値として食われた語も数えるので、
+    /// 「これがあったら危ない」(fail-closed) の判定にだけ使う。
+    /// 「これがあったら安全」の判定に使ってはいけない — 使うと
+    /// `black --extend-exclude --check .` の `--check` を旗と読み、
+    /// **workspace を丸ごと書き換えるコマンドを「読むだけ」にする**。
+    pub fn has_flag_anywhere(&self, flag: &str) -> bool {
         self.args
             .iter()
             .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
     }
 
-    /// 旗ではない最初の引数 (サブコマンド)。
-    pub fn subcommand(&self) -> Option<&str> {
-        self.args
-            .iter()
-            .find(|a| !a.starts_with('-'))
-            .map(|s| s.as_str())
+    /// **旗の位置にある語**だけを並べる (`--check=x` は `--check` として)。
+    ///
+    /// `takes_value` に載る旗は**次の語を値として食う**ので、食われた語は
+    /// 旗として数えない。`--` 以降は位置引数として扱う。
+    ///
+    /// これを間違えると、判定と実行がずれる。black は Click なので
+    /// `--extend-exclude --check .` の `--check` は**旗ではなく値**であり、
+    /// black は書き換えモードで動く。位置を見ない照合はこれを
+    /// 「`--check` がある = 読むだけ」と読む。
+    pub fn flags_in_flag_position(&self, takes_value: &[&str]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut skip_next = false;
+        let mut positional_only = false;
+        for a in &self.args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if positional_only {
+                continue;
+            }
+            if a == "--" {
+                positional_only = true;
+                continue;
+            }
+            if !a.starts_with('-') || a == "-" {
+                continue;
+            }
+            let (name, has_eq) = match a.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (a.as_str(), false),
+            };
+            out.push(name.to_string());
+            if !has_eq && takes_value.contains(&name) {
+                skip_next = true;
+            }
+        }
+        out
+    }
+
+    /// **旗でも値でもない最初の語** (サブコマンド)。
+    ///
+    /// `takes_value` を渡すのは、`ruff --config foo.toml check .` の
+    /// `foo.toml` をサブコマンドと読まないため。
+    pub fn first_positional(&self, takes_value: &[&str]) -> Option<&str> {
+        let mut skip_next = false;
+        for a in &self.args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if a == "--" {
+                continue;
+            }
+            if a.starts_with('-') && a != "-" {
+                if !a.contains('=') && takes_value.contains(&a.as_str()) {
+                    skip_next = true;
+                }
+                continue;
+            }
+            return Some(a.as_str());
+        }
+        None
     }
 }
 
@@ -244,6 +340,33 @@ fn inside(dir: &Path, root: &Path) -> bool {
     a.starts_with(&b)
 }
 
+/// 名前に補う拡張子を、**試す順**に並べる (純関数)。
+///
+/// **拡張子つきを先に見る。** Windows の cmd.exe も `PATHEXT` を先に当てる。
+/// 素の名前を先にすると、npm / yarn / pnpm のように「拡張子なしの sh
+/// スクリプト」と「`.cmd`」が同じディレクトリに並ぶ道具で、
+/// **CreateProcess が起こせない sh スクリプト**を選んでしまう
+/// (`ERROR_BAD_EXE_FORMAT`)。非 unix では実行権限を見られないぶん、
+/// 「ファイルがある」だけで選んでしまうのが効いてくる。
+/// 素の名前は最後の受け皿として残す。
+///
+/// `windows` を引数にしてあるのは、**この並び順を macOS / Linux の
+/// テストからも固定するため** (cfg で分けると、Windows の CI でしか
+/// 検査されない場所に判断が住む)。
+fn candidate_exts(pathext: Option<&str>, windows: bool) -> Vec<String> {
+    if !windows {
+        return vec![String::new()];
+    }
+    pathext
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_PATHEXT)
+        .split(';')
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .chain(std::iter::once(String::new()))
+        .collect()
+}
+
 /// PATH の 1 要素は、実行体を探してよい場所か (純関数)。
 ///
 /// **相対パスと空の要素は信用しない。** 空の要素は「カレント」を意味する
@@ -284,18 +407,7 @@ pub fn resolve_in(
     let Some(path_var) = path_var else {
         return Err(ResolveError::NoPath);
     };
-    let exts: Vec<String> = if cfg!(windows) {
-        let raw = pathext.unwrap_or(DEFAULT_PATHEXT);
-        std::iter::once(String::new())
-            .chain(
-                raw.split(';')
-                    .map(|e| e.trim().to_string())
-                    .filter(|e| !e.is_empty()),
-            )
-            .collect()
-    } else {
-        vec![String::new()]
-    };
+    let exts = candidate_exts(pathext, cfg!(windows));
     let mut untrusted: Option<PathBuf> = None;
     for entry in path_var.split(path_sep()) {
         let trusted = path_entry_is_trusted(entry, workspace);
@@ -305,7 +417,14 @@ pub fn resolve_in(
             if !is_executable_file(&cand) {
                 continue;
             }
-            if trusted {
+            // **実体そのものも見る。** 置き場所 (PATH の要素) だけを見ても
+            // 足りない — 信用できる場所に置かれた**シンボリックリンク**が
+            // workspace の中を指していれば、エージェントが書いたコードが
+            // 動く (`ln -s $WS/bin/evil ~/.local/bin/ruff`)。
+            // `std::fs::metadata` はリンクを辿るので「そこにファイルが
+            // ある」だけでは判定にならない。`inside` は正規化するので、
+            // リンクをたどった先で判定できる。
+            if trusted && !inside(&cand, workspace) {
                 return Ok(cand);
             }
             // **信用できない場所で見つけた。** ここで「次を探す」と、
@@ -391,11 +510,79 @@ mod tests {
     #[test]
     fn 旗とサブコマンドを読む() {
         let c = ValidationCommand::parse("ruff check --fix .").unwrap();
-        assert_eq!(c.subcommand(), Some("check"));
-        assert!(c.has_flag("--fix"));
-        assert!(!c.has_flag("--check"));
+        assert_eq!(c.first_positional(&[]), Some("check"));
+        assert!(c.has_flag_anywhere("--fix"));
+        assert!(!c.has_flag_anywhere("--check"));
         let d = ValidationCommand::parse("black --check=x .").unwrap();
-        assert!(d.has_flag("--check"));
+        assert!(d.has_flag_anywhere("--check"));
+        assert_eq!(d.flags_in_flag_position(&[]), vec!["--check"]);
+    }
+
+    #[test]
+    fn 値として食われた語を旗と読まない() {
+        // **これを読み違えると workspace が黙って書き換わる。**
+        // black は Click なので `--extend-exclude` は次の語を値として食う。
+        // `--check` は旗ではなく値になり、black は書き換えモードで動く。
+        let c = ValidationCommand::parse("black --extend-exclude --check .").unwrap();
+        assert!(
+            c.has_flag_anywhere("--check"),
+            "位置を見ない照合では見つかる (だから危ない)"
+        );
+        assert_eq!(
+            c.flags_in_flag_position(&["--extend-exclude"]),
+            vec!["--extend-exclude"],
+            "食われた `--check` を旗として数えた"
+        );
+        // `=` で書いたときは次の語を食わない。
+        let d = ValidationCommand::parse("black --extend-exclude=x --check .").unwrap();
+        assert_eq!(
+            d.flags_in_flag_position(&["--extend-exclude"]),
+            vec!["--extend-exclude", "--check"]
+        );
+        // `--` 以降は位置引数。
+        let e = ValidationCommand::parse("black -- --check").unwrap();
+        assert!(e.flags_in_flag_position(&[]).is_empty());
+        // サブコマンド探しも値を飛ばす。
+        let f = ValidationCommand::parse("ruff --config x.toml check .").unwrap();
+        assert_eq!(f.first_positional(&["--config"]), Some("check"));
+        assert_eq!(
+            f.first_positional(&[]),
+            Some("x.toml"),
+            "値を知らないと値をサブコマンドと読む"
+        );
+    }
+
+    #[test]
+    fn 実行体の前後の空白は組み立てで刈る() {
+        // **判定する側と解決する側で別の文字列を見ない。**
+        // `classify` は `trim()` してから許可リストを見るので、刈らずに
+        // 持つと `cargo\u{a0}` が `cargo` として許可を通り、PATH は
+        // `cargo\u{a0}` を探しに行く (= 判定と実行がずれる)。
+        let v: ValidationCommand =
+            serde_json::from_str(r#"{"executable":"cargo\u00a0","args":["test"]}"#).unwrap();
+        assert_eq!(v.executable, "cargo");
+        assert_eq!(ValidationCommand::new(" black ", vec![]).executable, "black");
+    }
+
+    #[test]
+    fn windowsでは拡張子つきを先に試す() {
+        // **素の名前を先に試すと npm が動かない。** npm / yarn / pnpm は
+        // 同じディレクトリに拡張子なしの sh スクリプトと `.cmd` を並べる。
+        // 非 unix では実行権限を見られないので、素の名前を先にすると
+        // sh スクリプトを選び、CreateProcess が `ERROR_BAD_EXE_FORMAT` で
+        // 落ちる (以前の `cmd /C npm` はここを PATHEXT で正しく解いていた)。
+        let e = candidate_exts(Some(".COM;.EXE;.BAT;.CMD"), true);
+        assert_eq!(e.first().map(String::as_str), Some(".COM"));
+        assert_eq!(
+            e.last().map(String::as_str),
+            Some(""),
+            "素の名前は最後の受け皿"
+        );
+        assert!(e.iter().position(|x| x == ".CMD").unwrap() < e.len() - 1);
+        // PATHEXT が読めない / 空のときは既定へ。
+        assert_eq!(candidate_exts(None, true), candidate_exts(Some(""), true));
+        // unix は拡張子を補わない。
+        assert_eq!(candidate_exts(Some(".EXE"), false), vec![String::new()]);
     }
 
     fn tmp(name: &str) -> PathBuf {
@@ -445,6 +632,36 @@ mod tests {
         );
         std::fs::remove_dir_all(&ws).ok();
         std::fs::remove_dir_all(&real_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 信用できる場所からworkspaceへ張られたリンクも使わない() {
+        // **置き場所だけを見ても足りない。** `~/.local/bin` のような
+        // 普通の PATH 要素に、workspace の中を指すシンボリックリンクを
+        // 1 本張るだけで、エージェントが書いたコードが「読むだけの
+        // 検証」として動いてしまう。`std::fs::metadata` はリンクを辿るので、
+        // 「そこにファイルがある」だけでは判定にならない。
+        let ws = tmp("symlink-ws");
+        let evil = put_exe(&ws.join("bin"), "evil");
+        let good_dir = tmp("symlink-bin");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::os::unix::fs::symlink(&evil, good_dir.join("ruff")).unwrap();
+
+        let got = resolve_in("ruff", &ws, Some(&good_dir.display().to_string()), None);
+        assert!(
+            matches!(got, Err(ResolveError::Untrusted { .. })),
+            "workspace の中を指すリンクを実行対象にした: {got:?}"
+        );
+        // 同じ場所の、workspace を指さない実体は使える (「常に断る」に
+        // なっていないこと)。
+        put_exe(&good_dir, "ruff2");
+        assert!(
+            resolve_in("ruff2", &ws, Some(&good_dir.display().to_string()), None).is_ok(),
+            "普通の実行体まで断った"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&good_dir).ok();
     }
 
     #[cfg(unix)]

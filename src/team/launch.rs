@@ -343,6 +343,7 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// [`ValidationOutcome`] を持った結果を返す (返さない経路は無い)。
 pub fn run_validation_command(
     cmd: &ValidationCommand,
+    approved: &[ValidationCommand],
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
@@ -352,6 +353,7 @@ pub fn run_validation_command(
     let pathext = std::env::var("PATHEXT").ok();
     run_validation_command_in(
         cmd,
+        approved,
         cwd,
         timeout,
         cancel,
@@ -366,9 +368,13 @@ pub fn run_validation_command(
 /// **探索の入力を引数にしてある。** 環境変数を差し替えるテストは並列に
 /// 走る他のテストへ漏れるので、`PATH` の先頭に workspace が入っている
 /// 状況は**この入口から**再現する (`team_dir_in` / `post_in` と同じ流儀)。
+///
+/// `approved` は**人が承認したコマンドの一覧**。読むだけ (`ReadOnly`)
+/// 以外は、ここに載っていなければ実行しない。
 #[allow(clippy::too_many_arguments)]
 pub fn run_validation_command_in(
     cmd: &ValidationCommand,
+    approved: &[ValidationCommand],
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
@@ -377,9 +383,21 @@ pub fn run_validation_command_in(
     pathext: Option<&str>,
 ) -> ValidationRun {
     let label = cmd.display();
-    // 実行してはいけないものは、ここでも断る (呼ぶ側の判定を信じ切らない)。
-    if super::graph::check_command(cmd).is_err() {
+    // **呼ぶ側の判定を信じ切らない。** ここは実行の直前なので、
+    // 危険度と承認の両方をもう一度見る。`Forbidden` だけを見ていると、
+    // 承認ゲートを通らずに実行器へ届いた `black .` が何の抵抗もなく走る
+    // — ゲートが 1 か所にしか無い状態は、そこを迂回されたときに
+    // 何も残らないということでもある。
+    let risk = super::graph::classify(cmd);
+    if risk == super::graph::ValidationRisk::Forbidden {
         return ValidationRun::new(label, 126, ValidationOutcome::SpawnFailed);
+    }
+    if !risk.auto_runnable() && !approved.contains(cmd) {
+        return ValidationRun::new(
+            format!("{label}  (承認の証跡がありません)"),
+            126,
+            ValidationOutcome::SpawnFailed,
+        );
     }
     // **実体を確定する。** 信用できない場所にあれば実行しない。
     let program =
@@ -411,6 +429,7 @@ pub fn run_validation_command_in(
 ///   を持つので、アプリが終わっても死なない)
 pub fn run_validation_list(
     commands: &[ValidationCommand],
+    approved: &[ValidationCommand],
     cwd: &Path,
     timeout: std::time::Duration,
     cancel: &CancelFlag,
@@ -418,7 +437,7 @@ pub fn run_validation_list(
 ) -> Vec<ValidationRun> {
     let mut runs = Vec::with_capacity(commands.len());
     for c in commands {
-        let r = run_validation_command(c, cwd, timeout, cancel, pid_slot);
+        let r = run_validation_command(c, approved, cwd, timeout, cancel, pid_slot);
         let stop = !r.ok();
         runs.push(r);
         if stop {
@@ -981,11 +1000,15 @@ mod tests {
         // 層に置くと、テストから 1 度も通らない場所に判断が住む)。
         let dir = ws("exec-list-stop");
         std::fs::create_dir_all(&dir).unwrap();
+        let cmds = [
+            ValidationCommand::parse("rustc --zzz-not-a-real-flag").unwrap(),
+            ValidationCommand::parse("cargo --version").unwrap(),
+        ];
         let runs = run_validation_list(
-            &[
-                ValidationCommand::parse("rustc --zzz-not-a-real-flag").unwrap(),
-                ValidationCommand::parse("cargo --version").unwrap(),
-            ],
+            &cmds,
+            // 承認済みとして渡す — 見たいのは**打ち切り方**であって、
+            // 承認ゲートで落ちて走らなかった、では確かめたことにならない。
+            &cmds,
             &dir,
             std::time::Duration::from_secs(60),
             &new_cancel_flag(),
@@ -1004,11 +1027,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cancel = new_cancel_flag();
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let cmds = [
+            ValidationCommand::parse("cargo --version").unwrap(),
+            ValidationCommand::parse("cargo --version").unwrap(),
+        ];
         let runs = run_validation_list(
-            &[
-                ValidationCommand::parse("cargo --version").unwrap(),
-                ValidationCommand::parse("cargo --version").unwrap(),
-            ],
+            &cmds,
+            &cmds,
             &dir,
             std::time::Duration::from_secs(60),
             &cancel,
@@ -1130,6 +1155,7 @@ mod tests {
         // **実行器も、偽物の PATH を渡されても起こさない。**
         let r = run_validation_command_in(
             &ValidationCommand::parse("rustfmt --check src/a.rs").unwrap(),
+            &[],
             &ws,
             std::time::Duration::from_secs(10),
             &new_cancel_flag(),
@@ -1161,11 +1187,24 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         std::fs::write(ws.join("a.sh"), "#!/bin/sh\necho hi\n").unwrap();
         std::fs::write(ws.join("b.txt"), "hello\n").unwrap();
+        // **道具に仕事をさせる。** 整形の対象が 1 つも無い実験場では
+        // 書き換える版でも書き換えないので、この検査は空回りする
+        // (前の版は `.py` も `.rs` も 1 つも無いまま緑だった)。
+        std::fs::write(ws.join("a.py"), "x=1\ny  =  2\n").unwrap();
+        std::fs::write(ws.join("b.py"), "import os,sys\nz   =3\n").unwrap();
+        std::fs::write(ws.join("a.rs"), "fn main(){let  x=1;}\n").unwrap();
         let before = snapshot_dir(&ws);
         // 許可リストにあり、この環境に実在しうる読むだけのもの。
         // 実体が無ければ `SpawnFailed` になるが、**どちらでも workspace は
         // 変わらない**ことが見たいもの。
-        for line in ["shellcheck a.sh", "black --check .", "ruff check ."] {
+        for line in [
+            "shellcheck a.sh",
+            "black --check .",
+            "black --diff .",
+            "ruff check .",
+            "ruff format --check .",
+            "rustfmt --check a.rs",
+        ] {
             let cmd = ValidationCommand::parse(line).unwrap();
             assert_eq!(
                 super::super::graph::classify(&cmd),
@@ -1174,6 +1213,7 @@ mod tests {
             );
             let _ = run_validation_command(
                 &cmd,
+                &[],
                 &ws,
                 std::time::Duration::from_secs(30),
                 &new_cancel_flag(),
@@ -1189,6 +1229,12 @@ mod tests {
     }
 
     /// ディレクトリの中身 (相対パスと内容) を並べたもの。
+    ///
+    /// **道具が作る隠しキャッシュは数えない。** `ruff check .` は
+    /// `.ruff_cache/` を、mypy は `.mypy_cache/` を作る。ここで守るのは
+    /// 「**人のファイルを書き換えない**」であって「1 バイトも増えない」
+    /// ではない (増えないことにするには `--no-cache` を強制するしかなく、
+    /// それは人が書いたコマンドを勝手に変えることになる)。
     fn snapshot_dir(root: &Path) -> Vec<(String, Vec<u8>)> {
         fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {
@@ -1196,6 +1242,12 @@ mod tests {
             };
             for e in rd.flatten() {
                 let p = e.path();
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with('.'))
+                {
+                    continue;
+                }
                 if p.is_dir() {
                     walk(&p, root, out);
                 } else if let Ok(b) = std::fs::read(&p) {
@@ -1215,11 +1267,52 @@ mod tests {
     }
 
     #[test]
+    fn 承認の証跡がなければ実行器が断る() {
+        // **ゲートを 1 か所にしか置かないと、そこを通らない経路が
+        // 何の抵抗もなく走る。** 実行の直前でもう一度、危険度と承認を見る。
+        let dir = ws("exec-unapproved");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd = ValidationCommand::parse("cargo --version").unwrap();
+        assert!(
+            super::super::graph::classify(&cmd).needs_approval(),
+            "前提: 承認が要るコマンド"
+        );
+        let t = std::time::Duration::from_secs(60);
+        let r = run_validation_command(&cmd, &[], &dir, t, &new_cancel_flag(), &new_pid_slot());
+        assert_eq!(r.exit_code, 126, "承認なしで走らせた: {r:?}");
+        assert_eq!(r.outcome(), ValidationOutcome::SpawnFailed);
+        assert!(r.command.contains("承認"), "断った理由が残っていない: {r:?}");
+        // 承認済みとして渡せば走る (断り方が「常に断る」になっていない)。
+        let ok = run_validation_command(
+            &cmd,
+            std::slice::from_ref(&cmd),
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+        );
+        assert_eq!(ok.outcome(), ValidationOutcome::Passed, "{ok:?}");
+        // **別のコマンドの承認を流用させない。**
+        let other = ValidationCommand::parse("cargo --locked --version").unwrap();
+        let r2 = run_validation_command(
+            &cmd,
+            std::slice::from_ref(&other),
+            &dir,
+            t,
+            &new_cancel_flag(),
+            &new_pid_slot(),
+        );
+        assert_eq!(r2.exit_code, 126, "他のコマンドの承認で走らせた: {r2:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn 許可されていないコマンドは実行しない() {
         let dir = ws("exec");
         std::fs::create_dir_all(&dir).unwrap();
         let r = run_validation_command(
             &ValidationCommand::parse("rm -rf /").unwrap(),
+            &[],
             &dir,
             std::time::Duration::from_secs(5),
             &new_cancel_flag(),

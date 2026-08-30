@@ -137,9 +137,18 @@ pub const FORBIDDEN_COMMAND_WORDS: &[&str] = &[
 /// 実行体はどうしても cmd.exe を経由するので (std がそう起こす)、
 /// `%VAR%` の展開・`^` の脱出・`!` の遅延展開が効く。判定した文字列と
 /// cmd.exe が解釈する文字列が別物になる経路を、最初から塞ぐ。
+///
+/// **入れるのは「std が安全に逃がせないもの」だけ。** `^` `(` `)` は
+/// std のバッチ用の逃がし方が面倒を見るうえ、検証コマンドの引数として
+/// ごく普通に出てくる (`pytest -k "not (slow or db)"` /
+/// `npm test -- --grep "^auth"`)。ここへ入れると、当たり前の SPEC が
+/// `Forbidden` → `NeedsUser` で行き止まる。**fail-closed なら安全、
+/// にはならない** — 誰も直せない止まり方をするだけである。
+/// `%` は std がバッチの引数として**逃がせずに拒否する**字なので、
+/// 分かりやすい理由をつけてこちらで先に断る。
 pub const SHELL_METACHARS: &[char] = &[
     ';', '|', '&', '>', '<', '`', '$', '\n', '\r', // unix
-    '%', '!', '^', '(', ')', '"', '\'', // windows の cmd.exe
+    '%', '!', '"', '\'', // windows の cmd.exe
 ];
 
 /// 検証コマンドの危険度。**「安全か危険か」の 2 値では足りない。**
@@ -201,24 +210,272 @@ impl ValidationRisk {
 /// 迷ったら載せない — 設定ファイルから任意のコードを読み込むもの
 /// (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は、
 /// 名前が「検査するだけ」に見えても実行しうる。
-fn read_only_mode(cmd: &ValidationCommand) -> Option<bool> {
+/// 「読むだけ」だと言い切れる形。**知っている旗だけで組まれているとき**に限る。
+///
+/// 危険な旗を数え上げる (deny) 形では守れない。実際に 4 つ漏れた:
+///
+/// * `rustfmt --check --print-config default out.toml` — `--print-config` は
+///   整形モードより**手前**で処理されるので `--check` では止まらず、
+///   指定したパスへファイルを書く (workspace の外でも書ける)
+/// * `black --extend-exclude --check .` — Click は次の語を値として食うので
+///   `--check` は旗ではなく値。black は書き換えモードで動く
+/// * `ruff check --fix-only .` / `--add-noqa .` — どちらも書き換えるが
+///   `--fix` とは綴りが違う
+/// * `shellcheck -x a.sh` — `# shellcheck source=…` を辿って
+///   ディスクのどこでも読むようになる
+///
+/// 数え上げる側を逆にする: **知っている旗の集合**を持ち、そこに無い旗が
+/// 1 つでもあれば「読むだけ」とは言わない (承認へ回す)。道具に新しい旗が
+/// 増えても、こちらが黙って通すことはない。
+struct ReadOnlyTool {
+    /// 「読むだけ」になるために**旗の位置で**必要な旗 (いずれか 1 つ)。
+    /// 空なら旗なしでも読むだけ。
+    requires_any: &'static [&'static str],
+    /// 知っている旗 (`requires_any` と `takes_value` も含める)。
+    known: &'static [&'static str],
+    /// **次の語を値として食う旗。** これを知らないと
+    /// `black --extend-exclude --check .` の `--check` を旗と読む。
+    takes_value: &'static [&'static str],
+}
+
+/// shellcheck — 既定で読むだけ。`-x` / `--source-path` (`-P`) は
+/// **ディスクのどこでも読む**ようになるので `known` に入れない。
+const SHELLCHECK: ReadOnlyTool = ReadOnlyTool {
+    requires_any: &[],
+    known: &[
+        "-a",
+        "--check-sourced",
+        "-C",
+        "--color",
+        "-e",
+        "--exclude",
+        "-f",
+        "--format",
+        "-i",
+        "--include",
+        "-o",
+        "--enable",
+        "-s",
+        "--shell",
+        "-S",
+        "--severity",
+        "--norc",
+        "--no-rc",
+        "--extended-analysis",
+    ],
+    takes_value: &[
+        "-e",
+        "--exclude",
+        "-f",
+        "--format",
+        "-i",
+        "--include",
+        "-o",
+        "--enable",
+        "-s",
+        "--shell",
+        "-S",
+        "--severity",
+    ],
+};
+
+/// rustfmt — `--check` があるときだけ読むだけ。`--print-config` / `--emit` /
+/// `--backup` は `--check` があっても書くので `known` に入れない。
+const RUSTFMT: ReadOnlyTool = ReadOnlyTool {
+    requires_any: &["--check"],
+    known: &[
+        "--check",
+        "--edition",
+        "--color",
+        "--config",
+        "--config-path",
+        "--files-with-diff",
+        "-l",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--unstable-features",
+    ],
+    takes_value: &["--edition", "--color", "--config", "--config-path"],
+};
+
+/// black — `--check` / `--diff` があるときだけ読むだけ。
+/// **値を食う旗を漏らさない** (`--extend-exclude --check .` で `--check` が
+/// 値として消え、workspace 全部が黙って書き換わる)。
+const BLACK: ReadOnlyTool = ReadOnlyTool {
+    requires_any: &["--check", "--diff"],
+    known: &[
+        "--check",
+        "--diff",
+        "--color",
+        "--no-color",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--fast",
+        "--safe",
+        "--preview",
+        "--skip-string-normalization",
+        "-S",
+        "--skip-magic-trailing-comma",
+        "-C",
+        "--line-length",
+        "-l",
+        "--target-version",
+        "-t",
+        "--include",
+        "--exclude",
+        "--extend-exclude",
+        "--force-exclude",
+        "--config",
+        "--workers",
+        "-W",
+        "--required-version",
+    ],
+    takes_value: &[
+        "--line-length",
+        "-l",
+        "--target-version",
+        "-t",
+        "--include",
+        "--exclude",
+        "--extend-exclude",
+        "--force-exclude",
+        "--config",
+        "--workers",
+        "-W",
+        "--required-version",
+        "--stdin-filename",
+        "--code",
+        "-c",
+    ],
+};
+
+/// ruff の値を食う旗。**サブコマンドを探す前にも要る** —
+/// `ruff --config x.toml check .` の `x.toml` をサブコマンドと読まないため。
+const RUFF_VALUE_FLAGS: &[&str] = &[
+    "--select",
+    "--ignore",
+    "--extend-select",
+    "--extend-ignore",
+    "--per-file-ignores",
+    "--exclude",
+    "--extend-exclude",
+    "--line-length",
+    "--target-version",
+    "--output-format",
+    "--config",
+    "--cache-dir",
+    "--stdin-filename",
+    "-e",
+    "-n",
+];
+
+/// `ruff check` — 既定で読むだけ。`--fix` / `--fix-only` / `--add-noqa` /
+/// `--unsafe-fixes` は書くので `known` に入れない。
+const RUFF_CHECK: ReadOnlyTool = ReadOnlyTool {
+    requires_any: &[],
+    known: &[
+        "--select",
+        "--ignore",
+        "--extend-select",
+        "--extend-ignore",
+        "--per-file-ignores",
+        "--exclude",
+        "--extend-exclude",
+        "--line-length",
+        "--target-version",
+        "--output-format",
+        "--config",
+        "--cache-dir",
+        "--no-cache",
+        "--statistics",
+        "--show-files",
+        "--show-settings",
+        "--diff",
+        "--quiet",
+        "-q",
+        "--silent",
+        "-s",
+        "--verbose",
+        "-v",
+        "--no-respect-gitignore",
+        "--respect-gitignore",
+        "--isolated",
+        "--preview",
+        "--no-preview",
+        "--exit-zero",
+        "--exit-non-zero-on-fix",
+        "-e",
+        "-n",
+    ],
+    takes_value: RUFF_VALUE_FLAGS,
+};
+
+/// `ruff format` — `--check` / `--diff` があるときだけ読むだけ。
+const RUFF_FORMAT: ReadOnlyTool = ReadOnlyTool {
+    requires_any: &["--check", "--diff"],
+    known: &[
+        "--check",
+        "--diff",
+        "--exclude",
+        "--extend-exclude",
+        "--line-length",
+        "--target-version",
+        "--config",
+        "--cache-dir",
+        "--no-cache",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--isolated",
+        "--preview",
+        "--no-preview",
+        "--respect-gitignore",
+        "--no-respect-gitignore",
+    ],
+    takes_value: RUFF_VALUE_FLAGS,
+};
+
+/// この実行体と引数で使う「読むだけ」の型を選ぶ。
+fn read_only_tool(cmd: &ValidationCommand) -> Option<&'static ReadOnlyTool> {
     match cmd.executable.as_str() {
-        // 読むだけ。書き換える旗を持たない。
-        "shellcheck" => Some(true),
-        // `--check` / `--diff` があれば読むだけ。無ければ書き換える。
-        "rustfmt" => Some(cmd.has_flag("--check")),
-        "black" => Some(cmd.has_flag("--check") || cmd.has_flag("--diff")),
-        // `ruff check` は読むだけだが `--fix` で書き換える。
-        // `ruff format` は `--check` / `--diff` が無ければ書き換える。
-        "ruff" => Some(match cmd.subcommand() {
-            Some("check") => !cmd.has_flag("--fix") && !cmd.has_flag("--unsafe-fixes"),
-            Some("format") => cmd.has_flag("--check") || cmd.has_flag("--diff"),
-            // サブコマンド無しの `ruff .` は既定が `check` だった版がある。
-            // **どちらとも言い切れないので書き換える側へ倒す。**
-            _ => false,
-        }),
+        "shellcheck" => Some(&SHELLCHECK),
+        "rustfmt" => Some(&RUSTFMT),
+        "black" => Some(&BLACK),
+        "ruff" => match cmd.first_positional(RUFF_VALUE_FLAGS) {
+            Some("check") => Some(&RUFF_CHECK),
+            Some("format") => Some(&RUFF_FORMAT),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+fn read_only_mode(cmd: &ValidationCommand) -> Option<bool> {
+    let tool = match read_only_tool(cmd) {
+        Some(t) => t,
+        // サブコマンド無しの `ruff .` は既定が `check` だった版がある。
+        // **どちらとも言い切れないので書き換える側へ倒す。**
+        None if cmd.executable == "ruff" => return Some(false),
+        None => return None,
+    };
+    let flags = cmd.flags_in_flag_position(tool.takes_value);
+    // **知らない旗が 1 つでもあれば、読むだけとは言わない。**
+    if flags.iter().any(|f| !tool.known.contains(&f.as_str())) {
+        return Some(false);
+    }
+    if tool.requires_any.is_empty() {
+        return Some(true);
+    }
+    Some(
+        flags
+            .iter()
+            .any(|f| tool.requires_any.contains(&f.as_str())),
+    )
 }
 
 /// 自動実行の対象にしてよいコマンド名 (実行ファイルの名前そのもの)。
@@ -932,6 +1189,54 @@ mod tests {
     }
 
     #[test]
+    fn 危険な旗を数え上げる形では守れない() {
+        // **どれも「`--check` がある = 読むだけ」を通り抜けて書く。**
+        // 旗を deny で数え上げていた版は、これを全部 `ReadOnly` にしていた。
+        for c in [
+            // `--print-config` は整形モードより手前で処理されるので
+            // `--check` では止まらない。指定したパスへファイルを書く
+            // (workspace の外でも書ける)。
+            "rustfmt --check --print-config default out.toml",
+            "rustfmt --check --emit files src/a.rs",
+            // black は Click。`--extend-exclude` が次の語を値として食うので
+            // `--check` は旗ではなく値になり、black は書き換えモードで動く。
+            "black --extend-exclude --check .",
+            "black --exclude --check .",
+            "black --config --check .",
+            // `--fix` とは綴りが違うが、どちらも書き換える。
+            "ruff check --fix-only .",
+            "ruff check --add-noqa .",
+            // `-x` は `# shellcheck source=…` を辿って
+            // ディスクのどこでも読むようになる。
+            "shellcheck -x a.sh",
+            "shellcheck --external-sources a.sh",
+            // **知らない旗**。道具に旗が増えても黙って通さない。
+            "black --check --zzz-new-flag .",
+            "ruff check --zzz-new-flag .",
+            "rustfmt --check --zzz-new-flag a.rs",
+            "shellcheck --zzz-new-flag a.sh",
+        ] {
+            let r = risk(c);
+            assert_ne!(r, ValidationRisk::ReadOnly, "{c} を読むだけにした");
+            assert!(!r.auto_runnable(), "{c} を人の承認なしで実行する");
+        }
+    }
+
+    #[test]
+    fn サブコマンド探しも値を飛ばす() {
+        // `--config` は次の語を食う。飛ばさないと `x.toml` を
+        // サブコマンドと読み、`ruff check` の型を選べずに
+        // `WorkspaceMutation` へ落ちる (行き止まりではないが、
+        // 読むだけのコマンドが毎回承認を求めるようになる)。
+        assert_eq!(
+            risk("ruff --config x.toml check ."),
+            ValidationRisk::ReadOnly
+        );
+        // `--` 以降は位置引数なので、`--check` は旗として数えない。
+        assert_eq!(risk("black -- --check ."), ValidationRisk::WorkspaceMutation);
+    }
+
+    #[test]
     fn 自動実行してよいのは読むだけのものに限る() {
         // **不変条件**: 自動実行 = 読むだけ。ここが崩れると、AI が書いた
         // 計画が人の承認なしにファイルを書き換えられる。
@@ -970,20 +1275,42 @@ mod tests {
     #[test]
     fn windowsのシェル特殊文字も断る() {
         // `.cmd` / `.bat` の実行体は std が cmd.exe 越しに起こすので、
-        // **cmd.exe の解釈が効く**。`%VAR%` の展開・`^` の脱出・`!` の
-        // 遅延展開で、判定した文字列と実行される文字列が別物になる。
+        // **cmd.exe の解釈が効く**。`%VAR%` の展開と `!` の遅延展開は
+        // std が逃がせないので、判定した文字列と実行される文字列が
+        // 別物になる余地を残さないよう先に断る。
         for bad in [
             "npm run %PATH%",
             "npm run %COMSPEC%",
-            "npm run a^b",
             "npm run a!b!",
-            "npm run (x)",
             "cargo test a&b",
             "cargo test a|b",
             "cargo test a>b",
             "cargo test a<b",
         ] {
             assert_eq!(risk(bad), ValidationRisk::Forbidden, "{bad} を通した");
+        }
+    }
+
+    #[test]
+    fn 当たり前の検証コマンドを行き止まりにしない() {
+        // **入れすぎた禁止は「fail-closed だから安全」では済まない。**
+        // `validate_plan` が `DangerousCommand` を出し、そのタスクは
+        // `NeedsUser` で止まる。ごく普通に書かれた SPEC の 1 行が、
+        // 誰も直せないまま Team Run を止める。
+        //
+        // `^` `(` `)` は std のバッチ用の逃がし方が面倒を見るので、
+        // ここで断る必要が無い (`%` と `!` は std が逃がせないので残す)。
+        for ok in [
+            "pytest -k \"not (slow or db)\"",
+            "jest --testPathPattern \"src/(auth)\"",
+            "npm test -- --grep \"^auth\"",
+            "cargo test -- --skip \"a::b (x)\"",
+        ] {
+            assert_ne!(
+                risk(ok),
+                ValidationRisk::Forbidden,
+                "{ok} を行き止まりにした"
+            );
         }
     }
 

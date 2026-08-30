@@ -1325,6 +1325,7 @@ mod tests {
                     "cargo test a",
                 )
                 .unwrap()],
+                approved: Vec::new(),
                 cwd: a.clone(),
                 timeout_secs: 600,
             },

@@ -344,6 +344,7 @@ impl ZaivernApp {
         let execution = v.execution.clone();
         let cwd = v.cwd.clone();
         let cmds = v.commands.clone();
+        let approved = v.approved.clone();
         let timeout = std::time::Duration::from_secs(v.timeout_secs.max(1));
         let cancel = launch::new_cancel_flag();
         let pid = launch::new_pid_slot();
@@ -354,8 +355,14 @@ impl ZaivernApp {
             .name(format!("zai-team-validate-{task}"))
             .spawn(move || {
                 // 並べ方の決まりごと (どこで打ち切るか) は実行器が持つ。
-                let runs =
-                    launch::run_validation_list(&cmds, &cwd, timeout, &worker_cancel, &worker_pid);
+                let runs = launch::run_validation_list(
+                    &cmds,
+                    &approved,
+                    &cwd,
+                    timeout,
+                    &worker_cancel,
+                    &worker_pid,
+                );
                 let _ = tx.send((worker_exec, task, runs));
             });
         match spawned {

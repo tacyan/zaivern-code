@@ -117,6 +117,13 @@ pub struct ValidationSpec {
     /// 実行側で語に割り直さない — 割り方が 1 文字でも違えば、判定した
     /// ものと OS が実行するものがずれる。
     pub commands: Vec<ValidationCommand>,
+    /// **人が承認したコマンド。** 読むだけ (`ReadOnly`) 以外は、ここに
+    /// 載っているものだけを実行してよい。
+    ///
+    /// 実行器へ「承認の証跡」を持って行くために添える。持って行かないと、
+    /// 承認ゲートは Runtime の中の 1 か所にしか無いことになり、そこを
+    /// 通らずに実行器へ届いた経路は何の抵抗もなく走る。
+    pub approved: Vec<ValidationCommand>,
     pub cwd: PathBuf,
     /// 時間切れ (秒)。**無期限には待たない。**
     pub timeout_secs: u64,
@@ -2024,10 +2031,19 @@ impl TeamRuntime {
                 None,
                 format!("#{task} の検証を開始します"),
             );
+            // **ここまで来た時点で、承認が要るものは全部承認済み**
+            // (`need_ok` が空でなければ上で `continue` している)。その事実を
+            // 実行器まで持って行く。
+            let approved: Vec<ValidationCommand> = commands
+                .iter()
+                .filter(|c| graph::classify(c).needs_approval())
+                .cloned()
+                .collect();
             out.push(TeamEffect::RunValidation(ValidationSpec {
                 task,
                 execution,
                 commands,
+                approved,
                 cwd: cwd.clone(),
                 timeout_secs: self.run.validation_timeout_secs,
             }));
