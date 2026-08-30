@@ -315,10 +315,14 @@ fn 検証コマンドの解析失敗を黙って捨てない() {
         "検証コマンドの可否を `is_ok()` で選り分けている (失敗が黙って消える)"
     );
     // 断るときは、**種類を分けて**返している。
+    //
+    // **自動決定できないことは断る理由ではない** (素の HTML など、走らせ
+    // られる検証が存在しないフォルダがある)。そちらは計画を通して
+    // 「検証なし」として進み、盤面がそれを出す。振る舞いの番人は
+    // `planner::tests::検証を自動決定できなくても計画は通るが検証は空のまま`。
     for want in [
         "PlanError::InvalidValidationCommand",
         "PlanError::ForbiddenValidationCommand",
-        "PlanError::ValidationUndetermined",
     ] {
         assert!(body.contains(want), "{want} で断る経路が無い");
     }

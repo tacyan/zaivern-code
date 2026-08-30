@@ -163,6 +163,20 @@ pub enum TeamEffect {
         /// 冪等キー。同じキーの指示は二度と出ない。
         key: String,
     },
+    /// 人が選んだエージェントへ、その場で送る 1 回きりの指示。
+    ///
+    /// **[`TeamEffect::SendInstruction`] と混ぜない。** あちらは Runtime が
+    /// タスクを配るときの指示で、宛先タスクの試行回数まで鍵に含める。
+    /// こちらは人が途中で足す発話なので、**タスクを持たないエージェント**
+    /// (Team Lead など) へも送れる必要がある。
+    SendManualInstruction {
+        agent: AgentId,
+        session: SessionId,
+        text: String,
+        /// 冪等キー (`manual:<agent>:<event_id>`)。**イベント ID は Run と
+        /// ともに保存される**ので、再起動をまたいでも重複しない。
+        key: String,
+    },
     StopAgent(SessionId),
     RunValidation(ValidationSpec),
     /// 走っている検証を止める (**プロセスツリーごと**)。
@@ -185,6 +199,7 @@ impl TeamEffect {
         match self {
             TeamEffect::StartAgent(s) => format!("start:{}", s.agent_id),
             TeamEffect::SendInstruction { key, .. } => key.clone(),
+            TeamEffect::SendManualInstruction { key, .. } => key.clone(),
             TeamEffect::StopAgent(s) => format!("stop:{s}"),
             // **実行ごとに別のキー。** 差し戻して配り直した後の再実行は
             // 「同じタスクの検証」でも別物なので、世代を含めて区別する。
@@ -209,6 +224,15 @@ pub fn instruction_key(task: TaskId, agent: &AgentId, attempts: u8, dispatch_seq
     format!("instr:{task}:{agent}:{attempts}:{dispatch_seq}")
 }
 
+/// 人が出した指示の冪等キー。
+///
+/// **`instr:` と別の名前空間にする。** 同じ前置きにすると
+/// [`super::panel::TeamPanel`] の `instruction_task_of` が
+/// 「タスク番号のつもりでエージェント名を読む」ことになる。
+pub fn manual_instruction_key(agent: &AgentId, event_id: EventId) -> String {
+    format!("manual:{agent}:{event_id}")
+}
+
 /// GUI / CLI からの操作。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TeamAction {
@@ -231,6 +255,14 @@ pub enum TeamAction {
     /// タスクへ追加の指示を足す。
     AddContext {
         task: TaskId,
+        text: String,
+    },
+    /// **人が選んだエージェントへ、その場で指示を送る。**
+    ///
+    /// 走っている端末へ 1 回だけ流す。担当タスクがあるなら、同じ文言を
+    /// タスクの文脈にも残す (配り直しで消えないように)。
+    InstructAgent {
+        agent: AgentId,
         text: String,
     },
 }
@@ -1419,6 +1451,67 @@ impl TeamRuntime {
                     t.context.push(clamp_text(&text));
                     t.context = clamp_list(std::mem::take(&mut t.context));
                     t.updated_at = now_secs();
+                }
+                self.dirty = true;
+            }
+            TeamAction::InstructAgent { agent, text } => {
+                // **借用を先に切る。** `self.log` は `&mut self` を取るので、
+                // エージェントの参照を持ったままでは呼べない。
+                // **担当タスクは台帳の側から引く。** `TeamAgent::current_task`
+                // は観測が回ってから埋まるので、配った直後は空のことがある。
+                // 空のまま進むと、文脈へ残す経路だけが静かに死ぬ。
+                let held = self
+                    .tasks
+                    .iter()
+                    .find(|t| t.assigned_agent.as_ref() == Some(&agent) && t.state.is_held())
+                    .map(|t| t.id);
+                let target = self
+                    .agents
+                    .iter()
+                    .find(|a| a.id == agent)
+                    .map(|a| (a.session_id, a.current_task.or(held)));
+                let text = clamp_text(text.trim());
+                match target {
+                    // **空の指示は 1 バイトも送らない。**
+                    _ if text.is_empty() => {}
+                    // **届かないものを「送った」と記録しない。**
+                    None => self.log(
+                        TeamEventKind::HumanInstruction,
+                        None,
+                        None,
+                        format!("{agent} は居ないので指示を送れませんでした"),
+                    ),
+                    Some((None, _)) => self.log(
+                        TeamEventKind::HumanInstruction,
+                        None,
+                        Some(agent.clone()),
+                        format!("{agent} は端末を持っていないので指示を送れませんでした"),
+                    ),
+                    Some((Some(session), task)) => {
+                        // **鍵は、これから積むイベントの ID から作る。**
+                        // `log` が採番するので、先に読んでから記録する。
+                        let key = manual_instruction_key(&agent, self.next_event_id);
+                        self.log(
+                            TeamEventKind::HumanInstruction,
+                            None,
+                            Some(agent.clone()),
+                            format!("{agent} へ指示を送りました: {text}"),
+                        );
+                        // 端末へ流すのは 1 回きり。担当タスクがあるなら
+                        // **配り直しでも効くように**文脈へも残す。
+                        if let Some(t) = task.and_then(|id| self.tasks.iter_mut().find(|t| t.id == id))
+                        {
+                            t.context.push(text.clone());
+                            t.context = clamp_list(std::mem::take(&mut t.context));
+                            t.updated_at = now_secs();
+                        }
+                        out.push(TeamEffect::SendManualInstruction {
+                            agent,
+                            session,
+                            text,
+                            key,
+                        });
+                    }
                 }
                 self.dirty = true;
             }

@@ -966,6 +966,8 @@ pub enum TeamEventKind {
     AgentFailed,
     SubAgentReported,
     DecisionRaised,
+    /// 人がエージェントへ直接出した指示 (**監査のために必ず残す**)。
+    HumanInstruction,
     /// 状態機械が拒否した遷移 (**起こったこと自体を残す**)。
     TransitionRejected,
     DecisionResolved,
@@ -1000,6 +1002,7 @@ impl TeamEventKind {
             TeamEventKind::AgentFailed => "agent_failed",
             TeamEventKind::SubAgentReported => "sub_agent_reported",
             TeamEventKind::DecisionRaised => "decision_raised",
+            TeamEventKind::HumanInstruction => "human_instruction",
             TeamEventKind::TransitionRejected => "transition_rejected",
             TeamEventKind::DecisionResolved => "decision_resolved",
             TeamEventKind::Rejected => "rejected",

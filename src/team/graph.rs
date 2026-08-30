@@ -703,6 +703,10 @@ pub fn validate_plan(tasks: &[TeamTask], definition_of_done: &[String]) -> Vec<P
         issues.push(PlanIssue::NoTasks);
         return issues;
     }
+    // **「検証を 1 本も持たない計画」と「1 本だけ抜けている計画」を分ける。**
+    // 前者は道具が無いだけ (素の HTML など) なので通す。後者は抜け穴なので
+    // 従来どおり断る。
+    let any_validation = tasks.iter().any(|t| !t.validation_commands.is_empty());
 
     let mut seen_keys: BTreeSet<&str> = BTreeSet::new();
     let mut seen_ids: BTreeSet<TaskId> = BTreeSet::new();
@@ -733,7 +737,17 @@ pub fn validate_plan(tasks: &[TeamTask], definition_of_done: &[String]) -> Vec<P
             if t.acceptance_criteria.is_empty() {
                 issues.push(PlanIssue::NoAcceptanceCriteria(t.id));
             }
-            if t.validation_commands.is_empty() {
+            // **検証コマンドが 1 本も無い計画そのものは通す。**
+            //
+            // 素の HTML やデザインだけのフォルダには、走らせられる検証が
+            // 存在しない。そこで断ると Team がその手の仕事に使えなくなる。
+            // 完了は**レビュー承認だけ**で決まる状態になるので、盤面が
+            // それを出す (`TeamSnapshot::unvalidated`)。
+            //
+            // **道具がある計画では、従来どおり全タスクに要求する。**
+            // 1 本でも検証を持つ計画で「このタスクだけ検証なし」を許すと、
+            // 検証の抜け穴を 1 タスク作るだけで完了を素通りさせられる。
+            if any_validation && t.validation_commands.is_empty() {
                 issues.push(PlanIssue::NoValidationCommand(t.id));
             }
         }
@@ -1442,5 +1456,43 @@ mod tests {
         let b = task(2, "b", &[]);
         a.state = TeamTaskState::Completed;
         assert!((progress(&[a, b]) - 0.5).abs() < 1e-6);
+    }
+
+    /// **検証コマンドが 1 本も無い計画は通す。**
+    ///
+    /// 素の HTML やデザインだけのフォルダには、走らせられる検証が存在しない。
+    /// そこで断ると Team がその手の仕事にまったく使えなくなる
+    /// (実際に「綺麗な美容室の HTML を作って」で行き止まりになった)。
+    /// 完了は**レビュー承認だけ**で決まる状態になり、盤面がそれを出す。
+    #[test]
+    fn 検証が1本も無い計画は通す() {
+        let mut a = super::super::testkit::task(1, "a", &[]);
+        let mut b = super::super::testkit::task(2, "b", &[]);
+        a.validation_commands.clear();
+        b.validation_commands.clear();
+        let issues = validate_plan(&[a, b], &["動く".to_string()]);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| matches!(i, PlanIssue::NoValidationCommand(_))),
+            "道具が無いだけで断った: {issues:?}"
+        );
+    }
+
+    /// **1 本でも検証を持つ計画で「このタスクだけ検証なし」は断る。**
+    ///
+    /// 抜け穴を 1 タスク作るだけで完了を素通りさせられるため。
+    #[test]
+    fn 検証を持つ計画で抜けているタスクは断る() {
+        let a = super::super::testkit::task(1, "a", &[]);
+        let mut b = super::super::testkit::task(2, "b", &[]);
+        b.validation_commands.clear();
+        let issues = validate_plan(&[a, b], &["動く".to_string()]);
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, PlanIssue::NoValidationCommand(2))),
+            "抜け穴を通してしまった: {issues:?}"
+        );
     }
 }

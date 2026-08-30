@@ -3231,3 +3231,124 @@ fn 迂回してよい場所は二か所だけ() {
         "状態機械を迂回している箇所が {n} 個ある (人の Retry と、停止確認後の回収だけのはず)"
     );
 }
+
+// ── 人が出した指示 ───────────────────────────────────────────────────
+
+/// 出た `SendManualInstruction` を読みやすい形で取り出す。
+fn manual_sends(effects: &[TeamEffect]) -> Vec<(String, SessionId, String, String)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            TeamEffect::SendManualInstruction {
+                agent,
+                session,
+                text,
+                key,
+            } => Some((agent.0.clone(), *session, text.clone(), key.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 担当が付いた状態を作る。返すのは (runtime, その担当のセッション, タスク, 担当名)。
+///
+/// **既存の [`to_assigned`] を土台にする** (組み立てを 2 か所に書かない)。
+fn to_instructable() -> (TeamRuntime, SessionId, TaskId, String) {
+    let (rt, _, _) = to_assigned();
+    let (sid, tid, agent) = assignments(&rt)[0].clone();
+    (rt, sid, tid, agent)
+}
+
+/// **人の指示は、選んだ相手の端末へその場で出る。**
+///
+/// `AddContext` は「次に配るときの文脈」を足すだけで、いま動いている端末へは
+/// 1 バイトも届かない。途中で口を出せることを、実際に Effect が出ることで見る。
+#[test]
+fn 人の指示は選んだエージェントの端末へ出る() {
+    let (mut rt, sid, tid, agent) = to_instructable();
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: AgentId(agent.clone()),
+        text: "  テストを先に書いて  ".into(),
+    });
+    let sent = manual_sends(&out);
+    assert_eq!(sent.len(), 1, "1 通だけ出るべき: {out:?}");
+    assert_eq!(sent[0].0, agent, "宛先が違う");
+    assert_eq!(sent[0].1, sid, "端末が違う");
+    assert_eq!(sent[0].2, "テストを先に書いて", "前後の空白を落としていない");
+    assert!(
+        sent[0].3.starts_with("manual:"),
+        "鍵は manual: 名前空間であるべき: {}",
+        sent[0].3
+    );
+    // **配り直しでも効くように、担当タスクの文脈にも残す。**
+    assert!(
+        rt.task(tid)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("テストを先に書いて")),
+        "タスクの文脈へ残っていない"
+    );
+    // 監査のために出来事が 1 件残る。
+    assert!(
+        rt.events()
+            .any(|e| e.kind == TeamEventKind::HumanInstruction),
+        "人の指示が記録されていない"
+    );
+}
+
+/// **空の指示は 1 バイトも送らない。** 空白だけも同じ。
+#[test]
+fn 空の指示は送らない() {
+    let (mut rt, _, _, agent) = to_instructable();
+    for text in ["", "   ", "\n\t "] {
+        let out = rt.apply_action(TeamAction::InstructAgent {
+            agent: AgentId(agent.clone()),
+            text: text.into(),
+        });
+        assert!(manual_sends(&out).is_empty(), "空の指示が出た: {text:?}");
+    }
+}
+
+/// **端末を持たない相手へは送らない。** ただし理由は残す
+/// (押せるのに何も起きない、を記録の側でも作らない)。
+#[test]
+fn 端末が無い相手へは送らずに理由を残す() {
+    // 起動前 — まだどの担当にもセッションが結び付いていない。
+    let mut rt = started(4);
+    let agent = rt.agents()[0].id.clone();
+    assert!(
+        rt.agents()[0].session_id.is_none(),
+        "前提が崩れている (もう端末を持っている)"
+    );
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: agent.clone(),
+        text: "いまどう?".into(),
+    });
+    assert!(manual_sends(&out).is_empty(), "端末が無いのに送った: {out:?}");
+    assert!(
+        rt.events()
+            .any(|e| e.kind == TeamEventKind::HumanInstruction),
+        "送れなかったことが記録されていない"
+    );
+}
+
+/// **同じ相手へ 2 回送ったら、鍵は必ず別になる。**
+///
+/// 同じ鍵だと 2 通目が「もう出した指示」として黙って落ちる。
+#[test]
+fn 人の指示の鍵は毎回変わる() {
+    let (mut rt, _, _, agent) = to_instructable();
+    let mut keys = Vec::new();
+    for i in 0..5 {
+        let out = rt.apply_action(TeamAction::InstructAgent {
+            agent: AgentId(agent.clone()),
+            text: format!("指示 {i}"),
+        });
+        let sent = manual_sends(&out);
+        assert_eq!(sent.len(), 1, "{i} 通目が出ていない");
+        keys.push(sent[0].3.clone());
+    }
+    let uniq: std::collections::BTreeSet<&String> = keys.iter().collect();
+    assert_eq!(uniq.len(), keys.len(), "鍵が重複した: {keys:?}");
+}

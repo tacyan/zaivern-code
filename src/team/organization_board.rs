@@ -33,6 +33,18 @@ use super::view_model::{
 /// 子エージェント行を 1 枚のカードに出す上限。**超えたぶんは「他 N 件」**
 /// (64 体でも縦に伸び続けないための線)。
 pub const CHILD_ROWS_MAX: usize = 6;
+/// 窓と画面のあいだに残す余白 (片側)。**0 にすると角が画面の縁に張り付く。**
+const WINDOW_MARGIN: f32 = 16.0;
+/// 窓の枠 (内側余白とタイトルバー) が外形に足すぶん。
+///
+/// **`max_width` / `max_height` が縛るのは中身**なので、枠を引かずに
+/// 「画面 − 余白」を渡すと外形はそのぶんだけ画面をはみ出す。値は実測
+/// (横 12px / 縦 44px) に余裕を足したもので、**正しさを保つのは定数ではなく
+/// `team画面はどの画面幅でも画面に収まる`** — テーマや egui の余白が変われば
+/// そちらが落ちる。
+const WINDOW_CHROME_W: f32 = 16.0;
+const WINDOW_CHROME_H: f32 = 48.0;
+
 /// Activity Feed に描く行数。
 pub const FEED_ROWS: usize = 12;
 
@@ -59,6 +71,28 @@ fn glyph_label(ui: &mut egui::Ui, theme: &Theme, s: AgentWorkState) {
         std::time::Duration::from_secs_f64(BLINK_PERIOD / 2.0),
         "team-blink",
     );
+}
+
+
+/// 状態を色つきの小さな札で出す。
+///
+/// **色は補助**で、意味は記号 ([`AgentWorkState::glyph`]) と文字が持つ。
+/// カードの中で「記号・文字・色」が 3 か所に散っていると、状態を読むのに
+/// 目が 3 回動く。1 つの札にまとめると 1 回で済む。
+fn state_chip(ui: &mut egui::Ui, theme: &Theme, s: AgentWorkState) {
+    let col = state_color(theme, s);
+    egui::Frame::none()
+        .fill(col.linear_multiply(0.16))
+        .stroke(egui::Stroke::new(1.0_f32, col.linear_multiply(0.55)))
+        .inner_margin(egui::Margin::symmetric(5.0, 1.0))
+        .rounding(7.0)
+        .show(ui, |ui| {
+            // 札の中は横並び (`Frame` は親のレイアウトを継承するので明示する)。
+            ui.horizontal(|ui| {
+                glyph_label(ui, theme, s);
+                ui.label(RichText::new(work_state_label(s)).color(col));
+            });
+        });
 }
 
 /// 状態に対応する色。**色は補助**で、意味は記号が持つ。
@@ -210,15 +244,28 @@ pub fn board_window(
         return acts;
     }
     let mut win_open = true;
+    // **画面より広い窓を作らない。** 中身 (レーン + Mission Panel) が
+    // 既定幅を超えると `resizable` な窓は伸びる。中央寄せなので伸びたぶんは
+    // **左右へ均等にはみ出し**、見出しが両端で切れる (実際にそうなっていた)。
+    // 上限を画面から取れば、あふれるぶんは横スクロールへ逃げる
+    // (CLAUDE.md「どの幅でも見切れない」)。
+    let screen = ctx.screen_rect();
+    let max_w = (screen.width() - WINDOW_MARGIN * 2.0 - WINDOW_CHROME_W).max(160.0);
+    let max_h = (screen.height() - WINDOW_MARGIN * 2.0 - WINDOW_CHROME_H).max(160.0);
     egui::Window::new(tr("team.window_title"))
         .open(&mut win_open)
         .collapsible(false)
         .resizable(true)
-        .default_width(1180.0)
-        .default_height(760.0)
+        .default_width(max_w.min(1180.0))
+        .default_height(max_h.min(760.0))
+        .max_width(max_w)
+        .max_height(max_h)
+        .constrain_to(screen)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            body(ui, theme, snap, tab, form, restore, selected, notice, &mut acts);
+            body(
+                ui, theme, snap, tab, form, restore, selected, notice, &mut acts,
+            );
         });
     if !win_open {
         acts.push(BoardAction::Close);
@@ -283,7 +330,14 @@ fn body(
         } else {
             avail.x
         };
-        ui.allocate_ui(egui::vec2(board_w, content_h), |ui| match tab {
+        // **`allocate_ui` は親のレイアウトを継承する。**
+        // `egui-0.29.1/src/ui.rs:1340` が `self.allocate_ui_with_layout(.., *self.layout(), ..)`
+        // なので、`horizontal_top` の中で呼ぶと**中の子も左→右に並ぶ**。
+        // これで組織図は「Team Lead カードとレーン群が横に並ぶ」、Mission Panel は
+        // 「開発フェーズが 1 行に伸びて画面外へ見切れる」という崩れ方をしていた。
+        // 縦積みは明示する (継承させない)。
+        let column = egui::Layout::top_down(egui::Align::Min);
+        ui.allocate_ui_with_layout(egui::vec2(board_w, content_h), column, |ui| match tab {
             BoardTab::Organization => organization_tab(ui, theme, s, &layout, selected, acts),
             BoardTab::Tasks => tasks_tab(ui, theme, s, acts),
             BoardTab::Terminals => terminals_tab(ui, theme, s, acts),
@@ -291,9 +345,13 @@ fn body(
         });
         if layout.mission_panel {
             ui.separator();
-            ui.allocate_ui(egui::vec2(MISSION_PANEL_W - 12.0, content_h), |ui| {
-                mission_panel(ui, theme, s, acts);
-            });
+            ui.allocate_ui_with_layout(
+                egui::vec2(MISSION_PANEL_W - 12.0, content_h),
+                column,
+                |ui| {
+                    mission_panel(ui, theme, s, acts);
+                },
+            );
         }
     });
 
@@ -303,17 +361,24 @@ fn body(
 
 // ── Top Command Bar ──────────────────────────────────────────────────
 
-fn top_command_bar(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<BoardAction>) {
+fn top_command_bar(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    s: &TeamSnapshot,
+    acts: &mut Vec<BoardAction>,
+) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new(ellipsis(&s.goal.title, 44)).color(theme.text).strong())
-            .on_hover_text(&s.goal.title);
+        ui.label(
+            RichText::new(ellipsis(&s.goal.title, 44))
+                .color(theme.text)
+                .strong(),
+        )
+        .on_hover_text(&s.goal.title);
         ui.label(
             RichText::new(format!("[{}]", goal_status_label(s.goal.status)))
                 .color(goal_color(theme, s.goal.status)),
         );
-        ui.label(
-            RichText::new(phase_label(s.goal.phase)).color(theme.text_dim),
-        );
+        ui.label(RichText::new(phase_label(s.goal.phase)).color(theme.text_dim));
         ui.separator();
         let m = &s.metrics;
         ui.label(trf(
@@ -327,7 +392,21 @@ fn top_command_bar(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mu
                 ("total", m.tasks_total.to_string()),
             ],
         ));
-        ui.label(trf("team.metrics.agents", &[("n", m.agents_active.to_string())]));
+        ui.label(trf(
+            "team.metrics.agents",
+            &[("n", m.agents_active.to_string())],
+        ));
+        // **自動検証が 1 本も無いことを、常に見えるところへ出す。**
+        // 通知は上書きで消えるが、これは状態から導くので消えない。
+        // 完了を決めるのがレビュー承認だけになる、という重い意味を持つ。
+        if s.unvalidated {
+            ui.label(
+                RichText::new(tr("team.chip.unvalidated"))
+                    .color(theme.warn)
+                    .strong(),
+            )
+            .on_hover_text(tr("team.chip.unvalidated_hint"));
+        }
         // **常に 0 のバッジを出さない** (CLAUDE.md: 減らせないかを先に考える)。
         if m.blocked > 0 {
             ui.label(
@@ -337,8 +416,11 @@ fn top_command_bar(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mu
         }
         if m.tests_passed > 0 {
             ui.label(
-                RichText::new(trf("team.metrics.tests", &[("n", m.tests_passed.to_string())]))
-                    .color(theme.ok),
+                RichText::new(trf(
+                    "team.metrics.tests",
+                    &[("n", m.tests_passed.to_string())],
+                ))
+                .color(theme.ok),
             );
         }
         if m.reviews_approved > 0 {
@@ -364,6 +446,19 @@ fn top_command_bar(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mu
         }
         if s.goal.status == GoalStatus::Ready && ui.button(tr("team.btn.start")).clicked() {
             acts.push(BoardAction::Start);
+        }
+        // **途中で口を出す入口。** 相手は開いた先の一覧から選ぶので、
+        // 盤面のカードを探し当てる必要が無い。端末を持つ相手が 1 体も
+        // 居ないときは、押せるのに何も起きないボタンにしない。
+        let live = s.agents.iter().any(|a| a.can_open_terminal);
+        let b = ui.add_enabled(live, egui::Button::new(tr("team.btn.instruct")));
+        let b = if live {
+            b.on_hover_text(tr("team.btn.instruct_hint"))
+        } else {
+            b.on_disabled_hover_text(tr("team.terminal.not_started"))
+        };
+        if b.clicked() {
+            acts.push(BoardAction::OpenInstruct);
         }
     });
 }
@@ -406,9 +501,14 @@ fn organization_tab(
     scroll.show(ui, |ui| {
         ui.horizontal_top(|ui| {
             for lane in &s.teams {
-                ui.allocate_ui(egui::vec2(layout.lane_w - 8.0, ui.available_height()), |ui| {
-                    lane_ui(ui, theme, s, lane, selected, layout.compact, acts);
-                });
+                // 縦積みを明示する (`allocate_ui` は親の横並びを継承してしまう)。
+                ui.allocate_ui_with_layout(
+                    egui::vec2(layout.lane_w - 8.0, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        lane_ui(ui, theme, s, lane, selected, layout.compact, acts);
+                    },
+                );
             }
         });
     });
@@ -442,10 +542,7 @@ fn team_lead_card(
                     ui.label(RichText::new(&lead.provider).color(theme.text_dim));
                 }
                 ui.label(work_state_label(lead.state));
-                ui.label(trf(
-                    "team.lead.teams",
-                    &[("n", s.teams.len().to_string())],
-                ));
+                ui.label(trf("team.lead.teams", &[("n", s.teams.len().to_string())]));
                 if !s.pending_decisions.is_empty() {
                     ui.label(
                         RichText::new(trf(
@@ -456,8 +553,7 @@ fn team_lead_card(
                     );
                 }
                 ui.label(
-                    RichText::new(view_model::elapsed_label(lead.idle_secs))
-                        .color(theme.text_dim),
+                    RichText::new(view_model::elapsed_label(lead.idle_secs)).color(theme.text_dim),
                 );
             });
             let action = if lead.current_action.is_empty() {
@@ -481,17 +577,34 @@ fn lane_ui(
 ) {
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(ellipsis(&lane.name, 20)).color(theme.text).strong())
-                .on_hover_text(&lane.name);
+            ui.label(
+                RichText::new(ellipsis(&lane.name, 20))
+                    .color(theme.text)
+                    .strong(),
+            )
+            .on_hover_text(&lane.name);
             // **常に 0 のバッジを出さない。**
             if lane.total > 0 {
                 ui.label(
-                    RichText::new(format!("{}/{}", lane.done, lane.total))
-                        .color(theme.text_dim),
+                    RichText::new(format!("{}/{}", lane.done, lane.total)).color(theme.text_dim),
                 );
             }
         });
-        ui.separator();
+        // **進み具合は数字より先に「形」で分かるようにする。**
+        // 仕事が 1 つも無い列にバーを出すと、無いものを「0%」と言うことに
+        // なるので出さない (区切り線で代える)。アニメーションはしない
+        // (設計原則 3: アイドルのコストはゼロ)。
+        if lane.total > 0 {
+            ui.add(
+                egui::ProgressBar::new(lane.done as f32 / lane.total as f32)
+                    .desired_height(3.0)
+                    .rounding(2.0)
+                    .fill(theme.accent),
+            );
+            ui.add_space(3.0);
+        } else {
+            ui.separator();
+        }
         let parents: Vec<&TeamAgentView> = s
             .agents
             .iter()
@@ -535,17 +648,20 @@ fn parent_card(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                glyph_label(ui, theme, a.state);
                 if ui
-                    .selectable_label(is_sel, RichText::new(ellipsis(&a.name, 18)).color(theme.text))
+                    .selectable_label(
+                        is_sel,
+                        RichText::new(ellipsis(&a.name, 18)).color(theme.text).strong(),
+                    )
+                    .on_hover_text(tr("team.card.click_to_instruct"))
                     .clicked()
                 {
                     acts.push(BoardAction::Select(a.id.clone()));
                 }
+                state_chip(ui, theme, a.state);
                 if !compact {
                     ui.label(RichText::new(role_label(a.role)).color(theme.text_dim));
                 }
-                ui.label(RichText::new(work_state_label(a.state)).color(state_color(theme, a.state)));
             });
             if !compact && !a.provider.is_empty() {
                 ui.label(RichText::new(&a.provider).color(theme.text_dim));
@@ -607,7 +723,10 @@ fn parent_card(
 fn child_row(ui: &mut egui::Ui, theme: &Theme, c: &TeamAgentView, acts: &mut Vec<BoardAction>) {
     ui.horizontal(|ui| {
         glyph_label(ui, theme, c.state);
-        let name = ui.selectable_label(false, RichText::new(ellipsis(&c.name, 14)).color(theme.text));
+        let name = ui.selectable_label(
+            false,
+            RichText::new(ellipsis(&c.name, 14)).color(theme.text),
+        );
         if name.clicked() {
             acts.push(BoardAction::Select(c.id.clone()));
         }
@@ -668,29 +787,37 @@ fn tasks_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 for (key, states) in TASK_COLUMNS.iter() {
-                    let rows: Vec<&view_model::TaskView> =
-                        s.tasks.iter().filter(|t| states.contains(&t.state)).collect();
-                    ui.allocate_ui(egui::vec2(w, ui.available_height()), |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!("{} ({})", tr(key), rows.len()))
-                                    .color(theme.text)
-                                    .strong(),
-                            );
-                            ui.separator();
-                            if rows.is_empty() {
-                                return;
-                            }
-                            egui::ScrollArea::vertical()
-                                .id_salt(format!("team-col-{key}"))
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for t in rows {
-                                        task_card(ui, theme, t, acts);
-                                    }
-                                });
-                        });
-                    });
+                    let rows: Vec<&view_model::TaskView> = s
+                        .tasks
+                        .iter()
+                        .filter(|t| states.contains(&t.state))
+                        .collect();
+                    // 縦積みを明示する (`allocate_ui` は親の横並びを継承してしまう)。
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(w, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{} ({})", tr(key), rows.len()))
+                                        .color(theme.text)
+                                        .strong(),
+                                );
+                                ui.separator();
+                                if rows.is_empty() {
+                                    return;
+                                }
+                                egui::ScrollArea::vertical()
+                                    .id_salt(format!("team-col-{key}"))
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        for t in rows {
+                                            task_card(ui, theme, t, acts);
+                                        }
+                                    });
+                            });
+                        },
+                    );
                 }
             });
         });
@@ -826,16 +953,39 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
         .id_salt("team-mission")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.label(RichText::new(tr("team.mission.phase")).color(theme.text).strong());
+            ui.label(
+                RichText::new(tr("team.mission.phase"))
+                    .color(theme.text)
+                    .strong(),
+            );
+            // **段は上から下へ 1 行ずつ。** 記号で状態が読めるので、
+            // 「完了 / 待ち」の文字は重ねて出さない (走っている段だけ、
+            // どこに居るかが要るので添える)。**色だけに頼らない**。
             for (i, (p, st)) in s.phases.iter().enumerate() {
+                let col = match st {
+                    PhaseStatus::Done => theme.ok,
+                    PhaseStatus::Running => theme.accent,
+                    PhaseStatus::Waiting => theme.text_dim,
+                };
+                let mark = match st {
+                    PhaseStatus::Done => "✓",
+                    PhaseStatus::Running => "▶",
+                    PhaseStatus::Waiting => "・",
+                };
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{}.", i + 1)).color(theme.text_dim));
-                    ui.label(RichText::new(phase_label(*p)).color(match st {
-                        PhaseStatus::Done => theme.ok,
-                        PhaseStatus::Running => theme.accent,
-                        PhaseStatus::Waiting => theme.text_dim,
-                    }));
-                    ui.label(RichText::new(phase_status_label(*st)).color(theme.text_dim));
+                    ui.label(RichText::new(mark).color(col));
+                    let name = format!("{}. {}", i + 1, phase_label(*p));
+                    let name = if *st == PhaseStatus::Running {
+                        RichText::new(name).color(col).strong()
+                    } else {
+                        RichText::new(name).color(col)
+                    };
+                    ui.label(name).on_hover_text(phase_status_label(*st));
+                    if *st == PhaseStatus::Running {
+                        ui.label(
+                            RichText::new(phase_status_label(*st)).color(theme.text_dim),
+                        );
+                    }
                 });
             }
 
@@ -896,13 +1046,24 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
             // ── Activity Feed ──
             if !s.events.is_empty() {
                 ui.separator();
-                ui.label(RichText::new(tr("team.mission.activity")).color(theme.text).strong());
+                ui.label(
+                    RichText::new(tr("team.mission.activity"))
+                        .color(theme.text)
+                        .strong(),
+                );
                 for e in s.events.iter().take(FEED_ROWS) {
                     let text = plain(&e.summary);
-                    ui.horizontal_wrapped(|ui| {
+                    // **文字数で切らない。** 「何文字なら入るか」は日本語と
+                    // 英語で違ううえ、パネル幅にも依る (44 文字で切っても
+                    // 右端で 1 文字ぶん欠けていた)。**残り幅で切る**のは
+                    // egui にやらせる。全文はホバーで出す。
+                    ui.horizontal(|ui| {
                         ui.label(RichText::new(clock(e.at)).color(theme.text_dim));
-                        ui.label(RichText::new(ellipsis(&text, 44)).color(theme.text_dim))
-                            .on_hover_text(text);
+                        ui.add(
+                            egui::Label::new(RichText::new(&text).color(theme.text_dim))
+                                .truncate(),
+                        )
+                        .on_hover_text(&text);
                     });
                 }
             }
@@ -981,7 +1142,11 @@ fn empty_card(ui: &mut egui::Ui, theme: &Theme, acts: &mut Vec<BoardAction>) {
         egui::Layout::centered_and_justified(egui::Direction::TopDown),
         |ui| {
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(tr("team.empty.title")).color(theme.text).strong());
+                ui.label(
+                    RichText::new(tr("team.empty.title"))
+                        .color(theme.text)
+                        .strong(),
+                );
                 ui.label(RichText::new(tr("team.empty.hint")).color(theme.text_dim));
                 ui.add_space(6.0);
                 if ui.button(tr("team.btn.new_run")).clicked() {
@@ -1050,7 +1215,11 @@ fn new_run_form(
     form: &mut NewRunForm,
     acts: &mut Vec<BoardAction>,
 ) {
-    ui.label(RichText::new(tr("team.form.title")).color(theme.text).strong());
+    ui.label(
+        RichText::new(tr("team.form.title"))
+            .color(theme.text)
+            .strong(),
+    );
     ui.separator();
     egui::Grid::new("team-new-run")
         .num_columns(2)
@@ -1101,13 +1270,17 @@ fn new_run_form(
 
             ui.label(tr("team.form.approval_mode"));
             ui.horizontal(|ui| {
-                for (id, key) in [
-                    ("ask", "team.form.approval_ask"),
-                    ("auto", "team.form.approval_auto"),
-                    ("agent", "team.form.approval_agent"),
+                // **`tr` には素の文字列リテラルを渡す。** 変数越しに渡すと
+                // `zai i18n missing` の走査に 1 度も現れず、辞書から抜けても
+                // 誰も気付かないまま**全言語で ID がそのまま画面に出る**
+                // (実際にこの 3 つがその状態だった)。
+                for (id, label) in [
+                    ("ask", tr("team.form.approval_ask")),
+                    ("auto", tr("team.form.approval_auto")),
+                    ("agent", tr("team.form.approval_agent")),
                 ] {
                     if ui
-                        .selectable_label(form.approval_mode == id, tr(key))
+                        .selectable_label(form.approval_mode == id, label)
                         .clicked()
                     {
                         form.approval_mode = id.to_string();
@@ -1161,6 +1334,139 @@ fn new_run_form(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **どの画面幅でも、Team 画面が画面の外へはみ出さない。**
+    ///
+    /// 中身 (レーン + Mission Panel) が既定幅を超えると `resizable` な窓は
+    /// 伸びる。中央寄せなので伸びたぶんは**左右へ均等にはみ出し**、
+    /// 見出しが両端で切れる (実際にそうなっていた: 「Implementation」が
+    /// 「mplementation」に、Mission Panel の行が右端で欠けていた)。
+    ///
+    /// **実 egui で 1 枚描いて、描かれた矩形が画面に収まることを見る。**
+    #[test]
+    fn team画面はどの画面幅でも画面に収まる() {
+        let rt = super::super::runtime_tests::started(4);
+        let snap = view_model::snapshot(&rt, 100);
+        let theme = crate::theme::all().remove(0);
+        // 極端な形も混ぜる (CLAUDE.md: 900×700 / 1200×300 のような比)。
+        for (w, h) in [
+            (900.0_f32, 700.0_f32),
+            (1200.0, 300.0),
+            (1720.0, 1148.0),
+            (700.0, 480.0),
+        ] {
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut form = NewRunForm::default();
+            let mut used = egui::Rect::NOTHING;
+            // **数フレーム回す。** 窓の大きさは 1 フレーム目には決まらない。
+            for _ in 0..4 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    board_window(
+                        ctx,
+                        &theme,
+                        true,
+                        Some(&snap),
+                        BoardTab::Organization,
+                        &mut form,
+                        RestorePrompt::None,
+                        None,
+                        "",
+                    );
+                });
+                used = ctx.used_rect();
+            }
+            assert!(
+                used.left() >= screen.left() - 1.0 && used.right() <= screen.right() + 1.0,
+                "画面 {w}×{h} で横にはみ出した: used={used:?} screen={screen:?}"
+            );
+            assert!(
+                used.top() >= screen.top() - 1.0 && used.bottom() <= screen.bottom() + 1.0,
+                "画面 {w}×{h} で縦にはみ出した: used={used:?} screen={screen:?}"
+            );
+        }
+    }
+
+    /// **`allocate_ui` は親のレイアウトを継承する** (egui 0.29)。
+    ///
+    /// これが Team 画面の崩れの正体だった。`egui-0.29.1/src/ui.rs:1340` が
+    /// `self.allocate_ui_with_layout(.., *self.layout(), ..)` なので、
+    /// `horizontal_top` の中で呼ぶと**中の子まで左→右に並ぶ**。実害は
+    /// 「Team Lead カードとレーン群が横に並ぶ」「開発フェーズが 1 行に
+    /// 伸びて画面外へ見切れる」の 2 つ。
+    ///
+    /// **不具合そのものを実 egui で再現して比べる。** egui 側が振る舞いを
+    /// 変えたら、前半が落ちて気付ける。
+    #[test]
+    fn 横並びの中では縦積みを明示しないと横に並ぶ() {
+        fn two_labels(explicit: bool) -> (egui::Rect, egui::Rect) {
+            let ctx = egui::Context::default();
+            let (mut a, mut b) = (egui::Rect::NOTHING, egui::Rect::NOTHING);
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal_top(|ui| {
+                        let size = egui::vec2(220.0, 120.0);
+                        let body = |ui: &mut egui::Ui| {
+                            a = ui.label("1").rect;
+                            b = ui.label("2").rect;
+                        };
+                        if explicit {
+                            ui.allocate_ui_with_layout(
+                                size,
+                                egui::Layout::top_down(egui::Align::Min),
+                                body,
+                            );
+                        } else {
+                            ui.allocate_ui(size, body);
+                        }
+                    });
+                });
+            });
+            (a, b)
+        }
+
+        // 素の呼び方 — 2 つが**同じ行**に並ぶ (これが崩れの正体)。
+        let (a, b) = two_labels(false);
+        assert!(
+            (a.top() - b.top()).abs() < 0.5 && b.left() > a.left(),
+            "egui 0.29 の継承が変わった (崩れを再現できていない): a={a:?} b={b:?}"
+        );
+        // 明示すれば縦へ積む。
+        let (a, b) = two_labels(true);
+        assert!(
+            b.top() >= a.bottom() - 0.5 && (a.left() - b.left()).abs() < 0.5,
+            "縦積みになっていない: a={a:?} b={b:?}"
+        );
+    }
+
+    /// **この画面では素の `allocate_ui` を使わない。**
+    ///
+    /// 縦積みは必ず `allocate_ui_with_layout` で明示する。判定に使う綴りは
+    /// **実行時に組み立てる** — ソースへ書くと、この行自身を拾って
+    /// 「わざと壊しても緑」の空回りする番人になる。テスト節は見ない
+    /// (上の比較テストは、わざと素の呼び方をするため)。
+    #[test]
+    fn 縦積みは必ず明示する() {
+        let src = include_str!("organization_board.rs").replace("\r\n", "\n");
+        let prod = src.split("\n#[cfg(test)]\n").next().unwrap_or(src.as_str());
+        let needle = format!("ui.{}(", "allocate_ui");
+        let bad: Vec<usize> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(&needle))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "素の allocate_ui が残っている (行: {bad:?})。\
+             親が横並びだと中身まで横に並ぶので allocate_ui_with_layout を使うこと"
+        );
+    }
 
     #[test]
     fn 省略は元より長くならない() {

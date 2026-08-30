@@ -291,6 +291,34 @@ impl ZaivernApp {
             });
         }
 
+        // ── 人が出した指示 (**Runtime の指示と同じ送信経路 1 本**を通す) ──
+        //
+        // 宛先はタスクではなくエージェント。冪等キーは `manual:` 名前空間で、
+        // 届かなかったときは **1 回だけ**知らせて撃ち直さない (人がもう一度
+        // 打てばよい — 自動で撃ち直すと同じ文言が二重に届く)。
+        let manual = panel::with_panel(|p| p.take_manual_instructions());
+        for (key, agent, session, text) in manual {
+            if let Some(why) = self.team_cost_block_reason() {
+                panel::with_panel(|p| {
+                    p.ack_failed(&key);
+                    p.notice = why.clone();
+                });
+                self.toast(why, false);
+                continue;
+            }
+            let mut job = crate::submit::Job::deferred(session, text, true);
+            job.tag = panel::with_panel(|p| p.delivery_tag(&key));
+            if !self.queue_submit(job) {
+                panel::with_panel(|p| p.ack_failed(&key));
+                self.toast(
+                    trf(
+                        "team.err.manual_not_queued",
+                        &[("agent", agent.to_string())],
+                    ),
+                    false,
+                );
+            }
+        }
         // ── 停止 (承認済みのものだけがここへ来る) ──
         let stops = panel::with_panel(|p| p.take_stops());
         for (key, session) in stops {
@@ -613,6 +641,10 @@ impl ZaivernApp {
             }),
             BoardAction::AddContext { task, text } => {
                 panel::with_panel(|p| p.act(TeamAction::AddContext { task, text }));
+            }
+            BoardAction::OpenInstruct => panel::with_panel(|p| p.inspector_open = true),
+            BoardAction::InstructAgent { agent, text } => {
+                panel::with_panel(|p| p.act(TeamAction::InstructAgent { agent, text }));
             }
             BoardAction::SelectTask(t) => panel::with_panel(|p| {
                 p.selected_task = Some(t);

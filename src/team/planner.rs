@@ -58,8 +58,6 @@ pub enum PlanError {
     InvalidValidationCommand { command: String, reason: String },
     /// SPEC に書かれた検証コマンドが**実行を許されていない**。
     ForbiddenValidationCommand { command: String, reason: String },
-    /// SPEC に指定が無く、リポジトリからも候補を決められない。
-    ValidationUndetermined { reason: String },
 }
 
 impl PlanError {
@@ -78,7 +76,6 @@ impl PlanError {
             PlanError::ForbiddenValidationCommand { command, reason } => {
                 format!("検証コマンドを実行できません: `{command}` ({reason})")
             }
-            PlanError::ValidationUndetermined { reason } => reason.clone(),
         }
     }
 }
@@ -309,18 +306,6 @@ impl StaticPlanner {
             .filter(|s| is_dod_heading(&s.title))
             .flat_map(|s| s.bullets.clone())
             .collect();
-        if dod.is_empty() {
-            // SPEC が DoD を書いていないなら、**最低限の DoD を必ず持たせる**。
-            // 空のまま進めると「本人の申告で完了」になる。
-            dod = vec![
-                "必要な実装が完了している".to_string(),
-                "すべての受入基準を満たしている".to_string(),
-                "検証コマンドが成功している".to_string(),
-                "レビューが承認されている".to_string(),
-                "未解決の Critical 指摘が無い".to_string(),
-                "最終統合テストが成功している".to_string(),
-            ];
-        }
 
         // 検証コマンド (SPEC が指定していれば使う。危険なものはここで落とす)
         // **SPEC の文字列はここで構造へ直す。** 以降は構造のまま運ぶ。
@@ -342,44 +327,66 @@ impl StaticPlanner {
         for raw in &spelled {
             match super::graph::parse_command(raw) {
                 Ok(_) => validations.push(raw.clone()),
-                Err(super::graph::CommandReject::Syntax(reason)) => {
-                    return Err(PlanError::InvalidValidationCommand {
-                        command: raw.clone(),
-                        reason,
-                    })
-                }
-                Err(super::graph::CommandReject::Forbidden(reason)) => {
-                    return Err(PlanError::ForbiddenValidationCommand {
-                        command: raw.clone(),
-                        reason,
-                    })
+                // 断り方は種類で分けるが、**理由の文面は 1 か所** (`CommandReject`)
+                // から取る。ここで組み直すと、同じ不許可に 2 通りの説明ができる。
+                Err(e) => {
+                    let reason = e.reason().to_string();
+                    let command = raw.clone();
+                    return Err(match e {
+                        super::graph::CommandReject::Syntax(_) => {
+                            PlanError::InvalidValidationCommand { command, reason }
+                        }
+                        super::graph::CommandReject::Forbidden(_) => {
+                            PlanError::ForbiddenValidationCommand { command, reason }
+                        }
+                    });
                 }
             }
         }
 
         // 指定が無いときだけ、**リポジトリの実体を見て**候補を決める。
+        //
+        // **決められなくても計画は止めない。** 素の HTML やデザインだけの
+        // フォルダには Cargo.toml も package.json も無い。そこで断ると
+        // 「検証コマンドを書いてください」以外に進みようがなくなり、
+        // Team がその手の仕事にまったく使えなくなる (実際に
+        // 「綺麗な美容室の HTML を作って」で詰まった)。
+        //
+        // **代わりに、検証なしであることを隠さない。** 検証 0 本の計画は
+        // [`super::graph::validate_plan`] が通すが、完了は**レビュー承認
+        // だけ**で決まる状態になるので、盤面がそれを出す
+        // ([`super::view_model::TeamSnapshot::unvalidated`])。
         if validations.is_empty() {
-            validations = super::validation_defaults::detect(&input.workspace_root).map_err(
-                |e| PlanError::ValidationUndetermined {
-                    reason: e.detail(),
-                },
-            )?;
+            validations = super::validation_defaults::detect(&input.workspace_root)
+                .unwrap_or_default();
             // 候補は自動生成なので、**ここでも同じ関門を通す**
             // (許可リストの外にある候補を作ってしまったら、それは
             //  候補の作り方の不具合であって、通してよい理由にならない)。
-            for raw in &validations {
-                if let Err(e) = super::graph::parse_command(raw) {
-                    return Err(PlanError::ValidationUndetermined {
-                        reason: format!(
-                            "自動決定した検証コマンド `{raw}` を実行できません ({})。\
-                             SPEC の「検証」セクションに検証コマンドを書いてください",
-                            e.reason()
-                        ),
-                    });
-                }
-            }
+            validations = runnable_only(validations);
         }
         validations.truncate(4);
+
+        // 既定の DoD は、**検証コマンドが決まってから**組む。
+        //
+        // 走らせるものが 1 本も無いのに「検証コマンドが成功している」を
+        // 残すと、DoD はレビューの照合表なので**達成できない条件**を毎回
+        // 突きつけることになる。無いものを「成功している」と書かない。
+        if dod.is_empty() {
+            // SPEC が DoD を書いていないなら、**最低限の DoD を必ず持たせる**。
+            // 空のまま進めると「本人の申告で完了」になる。
+            dod = vec![
+                "必要な実装が完了している".to_string(),
+                "すべての受入基準を満たしている".to_string(),
+            ];
+            if !validations.is_empty() {
+                dod.push("検証コマンドが成功している".to_string());
+            }
+            dod.push("レビューが承認されている".to_string());
+            dod.push("未解決の Critical 指摘が無い".to_string());
+            if !validations.is_empty() {
+                dod.push("最終統合テストが成功している".to_string());
+            }
+        }
 
         // タスク: 「タスク / 要件」見出しの箇条書き。無ければ全見出しの箇条書き。
         let mut raw_tasks: Vec<String> = sections
@@ -522,6 +529,21 @@ impl StaticPlanner {
             tasks,
         })
     }
+}
+
+
+/// 自動決定した候補のうち、**実行できるものだけ**を残す。
+///
+/// **SPEC が書いた指定には使わない。** 人が書いたものを黙って落とすと
+/// 「書いたのに走らない」が理由なしで起きるので、そちらは `compose` が
+/// 種類を分けて断る (`InvalidValidationCommand` / `ForbiddenValidationCommand`)。
+/// ここで落ちるのは**こちらが勝手に作った候補**だけなので、黙って捨ててよい。
+///
+/// `compose` の外に置くのは、番人 (`wiring_tests::検証コマンドの断り方を種類で分けている`)
+/// が `compose` の本体に `is_ok()` が現れないことを見ているため。
+fn runnable_only(mut v: Vec<String>) -> Vec<String> {
+    v.retain(|raw| super::graph::parse_command(raw).is_ok());
+    v
 }
 
 impl TeamPlanner for StaticPlanner {
@@ -839,21 +861,22 @@ mod tests {
     }
 
     #[test]
-    fn 検証を自動決定できないときは断る() {
+    fn 検証を自動決定できなくても計画は通るが検証は空のまま() {
         // 目印が 1 つも無いなら、**Rust だと決めつけない**。
+        // ただし**計画そのものは止めない** — 素の HTML やデザインだけの
+        // フォルダには走らせられる検証が存在しないので、断ると Team が
+        // その手の仕事にまったく使えなくなる。
         let d = tmp_ws("unknown");
-        let e = StaticPlanner
+        let plan = StaticPlanner
             .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
-            .expect_err("目印が無いのに計画できてしまった");
-        assert!(
-            matches!(e, PlanError::ValidationUndetermined { .. }),
-            "断り方が違う: {e:?}"
-        );
-        assert!(
-            !e.detail().contains("cargo"),
-            "cargo へ落ちた形跡がある: {}",
-            e.detail()
-        );
+            .expect("道具が無いだけで計画を断ってはいけない");
+        for t in &plan.tasks {
+            assert!(
+                t.validation_commands.is_empty(),
+                "検証を勝手に作った: {:?}",
+                t.validation_commands
+            );
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -862,13 +885,16 @@ mod tests {
         let d = tmp_ws("node-nodefs");
         std::fs::write(d.join("package.json"), "{\"scripts\":{\"dev\":\"next dev\"}}").unwrap();
         std::fs::write(d.join("package-lock.json"), "{}").unwrap();
-        let e = StaticPlanner
+        let plan = StaticPlanner
             .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
-            .expect_err("存在しない script を候補にしてしまった");
-        assert!(
-            matches!(e, PlanError::ValidationUndetermined { .. }),
-            "断り方が違う: {e:?}"
-        );
+            .expect("script が無いだけで計画を断ってはいけない");
+        for t in &plan.tasks {
+            assert!(
+                t.validation_commands.is_empty(),
+                "定義されていない npm script を候補にした: {:?}",
+                t.validation_commands
+            );
+        }
         std::fs::remove_dir_all(&d).ok();
     }
 

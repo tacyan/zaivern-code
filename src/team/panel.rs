@@ -104,6 +104,13 @@ pub enum BoardAction {
     Select(AgentId),
     /// タスクへ追加の指示を足す (Inspector の Edit Instruction)。
     AddContext { task: TaskId, text: String },
+    /// 指示パネル (Inspector) を開く。**相手は開いてから選べる。**
+    OpenInstruct,
+    /// **選んだエージェントへ、その場で指示を送る。**
+    ///
+    /// `AddContext` は「次に配るときの文脈」を足すだけで、いま動いている
+    /// 端末には 1 バイトも届かない。途中で口を出すにはこちらを使う。
+    InstructAgent { agent: AgentId, text: String },
     SelectTask(TaskId),
     /// 実際の端末を開く。**`ManagedSession` のときだけ**。
     OpenTerminal(SessionId),
@@ -277,6 +284,11 @@ pub struct TeamPanel {
     pending_stops: Vec<(RunOwner, String, SessionId)>,
     /// 送るべき指示 (持ち主, 冪等キー, セッション ID, 本文)。
     pending_instructions: Vec<(RunOwner, String, (TaskId, SessionId, String))>,
+    /// **人が出した指示** (持ち主, 冪等キー, 宛先エージェント, セッション, 本文)。
+    ///
+    /// Runtime が配る指示と**別の列**にする。混ぜると `take_instructions`
+    /// の受け手が「宛先タスクがある」前提で書けなくなる。
+    pending_manual: Vec<(RunOwner, String, (AgentId, SessionId, String))>,
     /// 別の Run のものとして捨てた Effect の数 (診断とテストが見る)。
     dropped_effects: usize,
     /// **テスト専用**: 「実行中だから断る」を黙らせる。
@@ -331,6 +343,7 @@ impl Default for TeamPanel {
             pending_validations: Vec::new(),
             pending_stops: Vec::new(),
             pending_instructions: Vec::new(),
+            pending_manual: Vec::new(),
             needs_save: false,
             workspace: PathBuf::new(),
             home: persistence::default_home(),
@@ -406,6 +419,7 @@ impl TeamPanel {
             validations: self.validation_jobs.len(),
             effects: self.pending_launches.len()
                 + self.pending_instructions.len()
+                + self.pending_manual.len()
                 + self.pending_stops.len()
                 + self.pending_validations.len(),
         }
@@ -432,6 +446,7 @@ impl TeamPanel {
         self.validation_jobs.clear();
         self.pending_launches.clear();
         self.pending_instructions.clear();
+        self.pending_manual.clear();
         self.pending_stops.clear();
         self.pending_validations.clear();
         self.save_if_needed();
@@ -493,6 +508,8 @@ impl TeamPanel {
             .map_err(|e| e.detail())?;
         // **配る前に計画そのものを検証する。**
         let issues = super::graph::validate_plan(&plan.tasks, &plan.goal.definition_of_done);
+        // 検証コマンドが 1 本も無い計画か (`plan` はこの後 Runtime へ渡すので先に見る)。
+        let no_validation = plan.tasks.iter().all(|t| t.validation_commands.is_empty());
         if !issues.is_empty() {
             return Err(issues
                 .iter()
@@ -513,6 +530,23 @@ impl TeamPanel {
         self.runtime = Some(rt);
         self.read_only = false;
         self.restore = RestorePrompt::None;
+        // **検証なしで進むことを隠さない。**
+        //
+        // 道具が無いフォルダ (素の HTML など) では検証コマンドを決められない。
+        // 計画は通すが、そのとき完了を決めるのは**レビュー承認だけ**になる。
+        // 理由は検出器に言わせる (同じ説明を 2 か所に書かない)。
+        if no_validation {
+            let why = super::validation_defaults::detect(&self.workspace)
+                .err()
+                .map(|e| e.detail())
+                .unwrap_or_default();
+            let head = crate::i18n::tr("team.notice.no_validation");
+            self.notice = if why.is_empty() {
+                head
+            } else {
+                format!("{head} — {why}")
+            };
+        }
         self.dirty = true;
         self.needs_save = true;
         Ok(())
@@ -712,6 +746,14 @@ impl TeamPanel {
                 } => self
                     .pending_instructions
                     .push((owner.clone(), key, (task, session, text))),
+                TeamEffect::SendManualInstruction {
+                    agent,
+                    session,
+                    text,
+                    ..
+                } => self
+                    .pending_manual
+                    .push((owner.clone(), key, (agent, session, text))),
                 TeamEffect::StopAgent(s) => self.pending_stops.push((owner.clone(), key, s)),
                 TeamEffect::RunValidation(v) => {
                     self.pending_validations.push((owner.clone(), key, v))
@@ -816,6 +858,18 @@ impl TeamPanel {
             .map(|(k, (task, s, t))| (k, task, s, t))
             .collect()
     }
+    /// **人が出した指示** (冪等キー付き。取り出したら消える)。
+    ///
+    /// 宛先はタスクではなく**エージェント**。タスクを持たない相手
+    /// (Team Lead など) へも送れる。
+    pub fn take_manual_instructions(&mut self) -> Vec<(String, AgentId, SessionId, String)> {
+        let q = std::mem::take(&mut self.pending_manual);
+        self.mine(q)
+            .into_iter()
+            .map(|(k, (a, s, t))| (k, a, s, t))
+            .collect()
+    }
+
     /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
     pub fn take_stops(&mut self) -> Vec<(String, SessionId)> {
         let q = std::mem::take(&mut self.pending_stops);
@@ -862,6 +916,21 @@ impl TeamPanel {
         }
         let key = key.to_string();
         let key = key.as_str();
+        // **人が出した指示は、タスクの機構へ流さない。** 宛先タスクが無い
+        // ことがあるし、あっても「いま待っている指示」ではないので
+        // `note_instruction_undelivered` の照合が必ず外れ、届かなかった
+        // 事実が「古い配達」として毎回捨てられる。
+        if key.starts_with("manual:") {
+            if delivered {
+                self.ack_done(key);
+            } else {
+                self.ack_failed(key);
+                self.notice = crate::i18n::tr("team.err.manual_undelivered");
+            }
+            self.needs_save = true;
+            self.dirty = true;
+            return None;
+        }
         let task = self.instruction_task_of(key)?;
         if delivered {
             self.ack_done(key);
@@ -980,6 +1049,7 @@ impl TeamPanel {
         let killed = self.stop_all_validations_now();
         self.pending_launches.clear();
         self.pending_instructions.clear();
+        self.pending_manual.clear();
         self.pending_stops.clear();
         self.pending_validations.clear();
         self.save_if_needed();
@@ -1459,10 +1529,17 @@ mod tests {
         let b = ws("owner-all-b");
         std::fs::create_dir_all(&b).unwrap();
         let mut p = started_panel(&a);
-        // 4 つの口すべてに、前の Run のものを積む。
+        // **外向きの口すべて**に、前の Run のものを積む。
+        // 口を 1 つ足したらここへも足すこと (足し忘れると、前の Run の
+        // 指示が新しい Run の相手へ届く)。
         let owner = p.owner().expect("持ち主");
         p.pending_instructions
             .push((owner.clone(), "instr:x".into(), (1, 7, "hi".into())));
+        p.pending_manual.push((
+            owner.clone(),
+            "manual:a:1".into(),
+            (AgentId("a".into()), 7, "hi".into()),
+        ));
         p.pending_stops.push((owner.clone(), "stop:7".into(), 7));
         p.pending_validations.push((
             owner,
@@ -1484,6 +1561,7 @@ mod tests {
             p.pending_instructions.clone(),
             p.pending_stops.clone(),
             p.pending_validations.clone(),
+            p.pending_manual.clone(),
         );
         p.workspace = b.clone();
         p.allow_replace_run_for_test();
@@ -1492,10 +1570,12 @@ mod tests {
         p.pending_instructions = stale.1;
         p.pending_stops = stale.2;
         p.pending_validations = stale.3;
+        p.pending_manual = stale.4;
         assert!(p.take_launches().is_empty(), "起動が漏れた");
         assert!(p.take_instructions().is_empty(), "指示が漏れた");
         assert!(p.take_stops().is_empty(), "停止が漏れた");
         assert!(p.take_validations().is_empty(), "検証が漏れた");
+        assert!(p.take_manual_instructions().is_empty(), "人の指示が漏れた");
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
     }
@@ -2482,5 +2562,80 @@ mod tests {
         with_panel(|p| p.notice = "hello".into());
         with_panel(|p| assert_eq!(p.notice, "hello"));
         with_panel(|p| p.notice.clear());
+    }
+
+    /// **人が出した指示は、タスクの機構へ流さない。**
+    ///
+    /// 宛先タスクが無いことがあるし、あっても「いま待っている指示」では
+    /// ないので、`note_instruction_undelivered` の照合は必ず外れる。
+    /// そこへ流すと、届かなかった事実が毎回「古い配達」として捨てられて
+    /// **画面にも記録にも 1 行も残らない**。
+    #[test]
+    fn 人の指示は端末まで出て届かなければ知らせる() {
+        let dir = ws("manual-delivery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "前提: 起動要求が出ている");
+        let mut first: Option<(AgentId, SessionId)> = None;
+        for (i, (key, spec)) in launches.iter().enumerate() {
+            p.ack_done(key);
+            let sid = 800 + i as SessionId;
+            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            if first.is_none() {
+                first = Some((spec.agent_id.clone(), sid));
+            }
+        }
+        let (agent, sid) = first.expect("1 体は起きている");
+
+        // ── 人が指示を出す ──────────────────────────────────────────────
+        p.act(TeamAction::InstructAgent {
+            agent: agent.clone(),
+            text: "先にテストを書いて".into(),
+        });
+        let sent = p.take_manual_instructions();
+        assert_eq!(sent.len(), 1, "人の指示が口まで出ていない: {sent:?}");
+        let (key, to, session, text) = sent[0].clone();
+        assert_eq!(to, agent, "宛先が違う");
+        assert_eq!(session, sid, "端末が違う");
+        assert_eq!(text, "先にテストを書いて");
+        assert!(key.starts_with("manual:"), "鍵の名前空間が違う: {key}");
+        // **Runtime の指示の口には 1 通も漏れない。**
+        assert!(
+            p.take_instructions().is_empty(),
+            "人の指示が Runtime 側の口へ紛れた"
+        );
+
+        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+
+        // ── 届かなかった ────────────────────────────────────────────────
+        assert_eq!(
+            p.note_delivery(&tag, false),
+            None,
+            "人の指示をタスクの結末として返している"
+        );
+        assert!(
+            !p.notice.trim().is_empty(),
+            "届かなかったのに黙っている (画面にも記録にも残らない)"
+        );
+
+        // ── 届いた ──────────────────────────────────────────────────────
+        p.notice.clear();
+        p.act(TeamAction::InstructAgent {
+            agent,
+            text: "もう 1 つ".into(),
+        });
+        let sent = p.take_manual_instructions();
+        let tag = p.delivery_tag(&sent[0].0).expect("目印");
+        assert_eq!(p.note_delivery(&tag, true), None);
+        assert!(p.notice.trim().is_empty(), "届いたのに苦情を出している");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

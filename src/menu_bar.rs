@@ -1157,6 +1157,18 @@ fn run_menu(ui: &mut egui::Ui, info: &MenuInfo, keys: &Keybinds, cmds: &mut Vec<
                 cmds.push(Cmd::OpenAgentPicker);
             }
         });
+
+        // ── 🏛 AI 開発チーム ──
+        //
+        // **パレットと同じ `Cmd::Feature` を押す。** ここで独自の Cmd を
+        // 足すと「同じ操作に 2 つの実装」ができ、片方だけ直る事故になる。
+        ui.separator();
+        if item(ui, &tr("menu_bar.team_new_run"), "", true) {
+            cmds.push(Cmd::Feature("team.new_run"));
+        }
+        if item(ui, &tr("menu_bar.team_board"), "", true) {
+            cmds.push(Cmd::Feature("team.open"));
+        }
     });
 }
 

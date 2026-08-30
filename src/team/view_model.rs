@@ -165,6 +165,12 @@ pub struct TeamSnapshot {
     pub stopped: bool,
     /// Activity Feed に出す件数の上限 (超えたぶんは切ってある)。
     pub feed_cap: usize,
+    /// **この Run には自動検証が 1 本も無い。**
+    ///
+    /// 道具の無いフォルダ (素の HTML など) では検証コマンドを決められない。
+    /// そのときの完了は**レビュー承認だけ**で決まるので、盤面が常に出す
+    /// (通知は上書きで消えるが、これは状態から導くので消えない)。
+    pub unvalidated: bool,
 }
 
 /// Activity Feed に出す件数。**上限を持たないと 64 体で描画が破綻する。**
@@ -362,6 +368,16 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
         paused: rt.is_paused(),
         stopped: rt.is_stopped(),
         feed_cap: FEED_CAP,
+        // **実装タスクを見る。** レビュータスクはもともと検証コマンドを
+        // 持たないので、混ぜると常に「検証なし」になってしまう。
+        unvalidated: {
+            let mut impl_tasks = tasks.iter().filter(|t| t.review_of.is_none()).peekable();
+            impl_tasks.peek().is_some()
+                && tasks
+                    .iter()
+                    .filter(|t| t.review_of.is_none())
+                    .all(|t| t.validation_commands.is_empty())
+        },
     }
 }
 
@@ -566,6 +582,7 @@ mod tests {
             paused: false,
             stopped: false,
             feed_cap: FEED_CAP,
+            unvalidated: false,
         }
     }
 
