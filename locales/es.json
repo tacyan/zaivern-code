@@ -4650,7 +4650,7 @@
   "team.inspector.commands": "Comandos de validación",
   "team.inspector.diagnostics": "Salida de la validación que falló",
   "team.inspector.findings": "Observaciones de la revisión",
-  "team.inspector.context": "Notas de traspaso",
+  "team.inspector.context": "Traspaso",
   "team.inspector.blockers": "Bloqueos",
   "team.err.workspace_busy": "Hay un Team Run en curso ({agents} agente(s) / {validations} validación(es)). Detenlo o termínalo antes de cambiar de workspace.",
   "team.notice.dropped_effects": "Se descartaron {n} acción(es) pendiente(s) del run anterior sin ejecutarlas.",

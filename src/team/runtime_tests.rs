@@ -1378,6 +1378,130 @@ fn 時間切れは失敗として決着する() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+//  保存 → プロセス終了 → 復元 → 再調停
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 保存して復元しても未実行のeffectだけを撃ち直す() {
+    // **ディスクを本当に通す。** 「保存したつもり」で復元経路が動いて
+    // いなければ、再起動のたびに Run が静かに壊れる。
+    use super::persistence;
+
+    let dir = crate::test_util::unique_temp_dir("zaivern-team-restore", "effects");
+    let (mut rt, sids, tid) = to_assigned();
+    // 実測の差し替えは「復元後の Runtime」にも要る (別の Runtime なので)。
+    let base = super::changeset::FileBaseline {
+        complete: true,
+        ..Default::default()
+    };
+
+    // 指示が飛んだところまで進める。
+    let t = rt.task(tid).unwrap();
+    assert_eq!(t.state, TeamTaskState::Running, "配られていない");
+    let dispatched: Vec<String> = rt
+        .to_saved()
+        .run
+        .effects
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert!(!dispatched.is_empty(), "Effect が 1 件も記録されていない");
+
+    persistence::save(&dir, &rt.to_saved()).expect("保存");
+    drop(rt); // プロセスが落ちたのと同じ
+
+    // 復元する。
+    let saved = match persistence::load(&dir) {
+        persistence::LoadOutcome::Loaded(s) => *s,
+        other => panic!("復元できない: {other:?}"),
+    };
+    let mut back = TeamRuntime::restore(saved, PathBuf::from("/zaivern-team-test-workspace"));
+    test_hooks::set_baseline(Some(base));
+    test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+        measured: Vec::new(),
+    }));
+
+    // **端末は落ちているので、起動はやり直す** (プロセスは戻ってこない)。
+    // やり直してはいけないのは「もう届いた指示」のほう。
+    let e = back.tick(&obs(20, &[]));
+    let mut next2 = 100;
+    let sids2 = bind_all(&mut back, &e, &mut next2);
+    let again = idle_tick(&mut back, 21, &sids2);
+
+    // 状態は保たれている。
+    assert_eq!(back.task(tid).unwrap().state, TeamTaskState::Running);
+    assert!(
+        back.task(tid).unwrap().assigned_agent.is_some(),
+        "担当が消えた"
+    );
+    // **同じ鍵の指示は二度と出ない。** 出ると、エージェントは同じ仕事を
+    // もう一度させられる (しかも本人は 1 回目の続きのつもりでいる)。
+    let sent: Vec<String> = again
+        .iter()
+        .filter_map(|e| match e {
+            TeamEffect::SendInstruction { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    for k in &sent {
+        assert!(
+            !dispatched.contains(k),
+            "再起動後に同じ Effect をもう一度撃った: {k}\n記録: {dispatched:?}"
+        );
+    }
+    let _ = &sids;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 保存の途中で落ちても再開できる() {
+    // **保存の途中で電源が落ちる**筋書き。新旧が混ざったものを読むと、
+    // 承認済みの検証が別のタスクへ当たったり Effect が二重に出たりする。
+    use super::persistence::{self, fault_inject, SavePhase};
+
+    let dir = crate::test_util::unique_temp_dir("zaivern-team-restore", "crash");
+    let (mut rt, sids, tid) = to_assigned();
+    persistence::save(&dir, &rt.to_saved()).expect("1 世代目");
+    let title_before = rt.task(tid).unwrap().title.clone();
+
+    // 状態を進めてから、保存の途中で落とす。
+    rt.apply_action(TeamAction::Pause);
+    fault_inject::fail_at(SavePhase::AfterPrevRename);
+    let r = persistence::save(&dir, &rt.to_saved());
+    fault_inject::clear();
+    assert!(r.is_err(), "落ちなかった");
+
+    // **前の世代がそのまま読める。**
+    let saved = match persistence::load(&dir) {
+        persistence::LoadOutcome::Loaded(s) => *s,
+        other => panic!("復元できない: {other:?}"),
+    };
+    assert!(!saved.run.paused, "書き切れていない世代を読んだ");
+    let mut back = TeamRuntime::restore(saved, PathBuf::from("/zaivern-team-test-workspace"));
+    test_hooks::set_baseline(Some(super::changeset::FileBaseline {
+        complete: true,
+        ..Default::default()
+    }));
+    test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+        measured: Vec::new(),
+    }));
+    assert_eq!(back.task(tid).unwrap().title, title_before);
+    // **再調停が動く** (止まらない)。端末を建て直せば、そのタスクは
+    // また配られる。
+    let e = back.tick(&obs(20, &[]));
+    let mut next2 = 100;
+    let sids2 = bind_all(&mut back, &e, &mut next2);
+    idle_tick(&mut back, 21, &sids2);
+    assert_eq!(
+        back.task(tid).unwrap().state,
+        TeamTaskState::Running,
+        "復元したあと誰にも配られないまま止まった"
+    );
+    let _ = &sids;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
 //  変更ファイルは実測する — 自己申告を証跡にしない
 // ══════════════════════════════════════════════════════════════════════
 
