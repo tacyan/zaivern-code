@@ -485,6 +485,32 @@ fn 判定した実体とosが起こす実体を一致させる() {
 }
 
 #[test]
+fn 実行の直前にも危険度と承認を見る() {
+    // **ゲートが 1 か所にしか無い状態は、そこを迂回されたときに
+    // 何も残らないということ。** `Forbidden` だけを見ていると、承認
+    // ゲートを通らずに実行器へ届いた `black .` が黙って走る。
+    let l = src(LAUNCH);
+    let run = function_body(
+        &l,
+        l.find("pub fn run_validation_command_in").expect("実行"),
+    );
+    assert!(
+        run.contains("let risk = super::graph::classify(cmd);"),
+        "実行器が危険度を見ていない:\n{run}"
+    );
+    assert!(
+        run.contains("!risk.auto_runnable() && !approved.contains(cmd)"),
+        "実行器が承認の証跡を見ていない:\n{run}"
+    );
+    // 承認の証跡は Runtime が発行時に焼き付けて運ぶ。
+    let r = src(RUNTIME);
+    assert!(
+        r.contains("pub approved: Vec<ValidationCommand>"),
+        "承認の証跡が実行要求に載っていない"
+    );
+}
+
+#[test]
 fn 検証コマンドは構造のまま実行地点まで運ぶ() {
     // 文字列へ戻して割り直す場所を作らない。割り方が 1 文字違えば、
     // 判定したものと OS が実行するものがずれる。
