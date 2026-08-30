@@ -2418,9 +2418,25 @@ impl TeamRuntime {
                     //
                     // 取れなかった理由も持つ (`unavailable`) — 黙って空に
                     // すると「何も汚れていなかった」と読める。
-                    let baseline = self.capture_baseline();
+                    //
+                    // **配り直しでは取り直さない。** 取り直すと、1 回目に
+                    // 書いた担当外のファイルが 2 回目の基準点へ焼き込まれ、
+                    // **その違反は二度と見えなくなる** (差し戻して再挑戦
+                    // させるだけで、担当外の変更を持ったまま完了できる)。
+                    // 基準点は「このタスクが最初に触る前」に固定する。
+                    let need_baseline = self
+                        .task(a.task)
+                        .map(|t| !t.baseline.as_ref().is_some_and(|b| b.usable()))
+                        .unwrap_or(true);
+                    let baseline = if need_baseline {
+                        Some(self.capture_baseline())
+                    } else {
+                        None
+                    };
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == a.task) {
-                        t.baseline = Some(baseline);
+                        if let Some(b) = baseline {
+                            t.baseline = Some(b);
+                        }
                         // **前回の実測はこれから作るものへの証跡ではない。**
                         // 配る瞬間に捨てる (1 か所に閉じる)。
                         t.validation.runs.clear();
@@ -2517,12 +2533,18 @@ impl TeamRuntime {
             // **担当範囲が無ければ「範囲外」も無い。** 測った事実だけ残す。
             return rp::FileEvidence::NoScope { measured: paths };
         }
-        // いま**他のタスクが握っている**範囲。リースは範囲が互いに素で
-        // あることを保証しているので、ここの変更は自分のものではない。
+        // **他のタスクの担当範囲**。リースは範囲が互いに素であることを
+        // 保証しているので、ここの変更は自分のものではない。
+        //
+        // 「いま握っているもの」に絞らない。基準点はこのタスクが最初に
+        // 触る前に固定してあるので、そのあいだに**終わったタスク**が
+        // 自分の範囲を変えたぶんも差分に入る。握っている最中だけを見ると、
+        // 終わった隣人の変更を「誰の範囲でもない」と読んで、こちらを
+        // 永久に完了させなくなる。
         let others: Vec<String> = self
             .tasks
             .iter()
-            .filter(|t| t.id != task.id && t.state.is_held())
+            .filter(|t| t.id != task.id)
             .flat_map(|t| t.files.clone())
             .collect();
         let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);

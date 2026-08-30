@@ -1567,7 +1567,16 @@ fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId,
     idle_tick(&mut rt, 11, &sids);
     let tid = assignments(&rt).first()?.1;
     // 担当範囲を宣言する (StaticPlanner は `files` を空で作る)。
+    //
+    // **他のタスクにも別の範囲を与える。** 範囲が空のタスクは
+    // `lease::overlaps` から見ると「どこでも重なる」ので、1 本だけに
+    // 範囲を付けると配り直しが「担当ファイルが重なる」で永久に止まる
+    // (実験を組み立てる側の話で、製品の判定は正しい)。
     rt.set_files_for_test(tid, &["src/auth/"]);
+    let others: Vec<TaskId> = rt.tasks().iter().map(|t| t.id).filter(|i| *i != tid).collect();
+    for (n, id) in others.iter().enumerate() {
+        rt.set_files_for_test(*id, &[&format!("other-{n}/")]);
+    }
     Some((rt, sids, tid, d))
 }
 
@@ -1712,6 +1721,102 @@ fn 別タスクが握っている範囲の変更は自分の成果にしない()
         !t.changed_files.iter().any(|f| f.contains("secret.rs")),
         "隣のタスクの変更を自分の成果として数えた: {:?}",
         t.changed_files
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 配り直しても最初の基準点を使う() {
+    // **差し戻して再挑戦させるだけで違反が消える**、を作らない。
+    //
+    // 配り直しのたびに基準点を取り直すと、前の試行で書いた担当外の
+    // ファイルが次の基準点へ焼き込まれ、**二度と見えなくなる**。
+    // 基準点は「このタスクが最初に触る前」に固定する。
+    let (mut rt, sids, tid, dir) = need_git_rt!("baseline-sticky");
+    let first = rt.task(tid).unwrap().baseline.clone().expect("基準点");
+    let seq1 = rt.task(tid).unwrap().dispatch_seq;
+
+    // 担当内だけを変えて完了報告 → 受理されて Validating。
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { v1(); }\n").unwrap();
+    let t = rt.task(tid).unwrap().clone();
+    let agent = t.assigned_agent.clone().unwrap().0;
+    let sid = t.assigned_session.unwrap();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(12, &rows));
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Validating);
+
+    // 検証が落ちる → 差し戻して配り直す。
+    let exec = rt.current_execution(tid);
+    let cmds2 = rt.task(tid).unwrap().validation_commands.clone();
+    rt.note_validation_for(
+        &exec,
+        tid,
+        cmds2
+            .iter()
+            .map(|c| ValidationRun::new(c.display(), 1, ValidationOutcome::Failed))
+            .collect(),
+    );
+    for now in 13..25 {
+        if rt.task(tid).unwrap().dispatch_seq > seq1 {
+            break;
+        }
+        idle_tick(&mut rt, now, &sids);
+    }
+    assert!(
+        rt.task(tid).unwrap().dispatch_seq > seq1,
+        "配り直されていない (この筋書きが成立していない)"
+    );
+
+    // **基準点は最初のまま。**
+    assert_eq!(
+        rt.task(tid).unwrap().baseline.as_ref(),
+        Some(&first),
+        "配り直しで基準点を取り直した (前の試行の違反が見えなくなる)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn 終わった隣のタスクの変更で行き止まらない() {
+    // 基準点を最初に固定する以上、そのあいだに**終わった**タスクが
+    // 自分の範囲を変えたぶんも差分に入る。「いま握っているもの」だけを
+    // 隣人として見ると、終わった隣人の変更が「誰の範囲でもない」になり、
+    // こちらが永久に完了できなくなる。
+    let (mut rt, sids, tid, dir) = need_git_rt!("finished-neighbour");
+    let other = rt
+        .tasks()
+        .iter()
+        .map(|t| t.id)
+        .find(|id| *id != tid)
+        .expect("2 本目のタスク");
+    rt.set_files_for_test(other, &["secret.rs"]);
+    // 隣は**終わっている** (握っていない)。
+    rt.force_state_for_test(other, TeamTaskState::Completed);
+
+    std::fs::write(dir.join("src/auth/login.rs"), "fn login() { ok(); }\n").unwrap();
+    std::fs::write(dir.join("secret.rs"), "fn secret() { theirs(); }\n").unwrap();
+
+    let t = rt.task(tid).unwrap().clone();
+    let agent = t.assigned_agent.clone().unwrap().0;
+    let sid = t.assigned_session.unwrap();
+    let labels: Vec<String> = t.validation_commands.iter().map(|c| c.display()).collect();
+    let cmds: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &cmds, &["src/auth/login.rs"]);
+    let rows: Vec<(SessionId, SessionState, &str)> = sids
+        .iter()
+        .map(|s| (*s, SessionState::Idle, if *s == sid { block.as_str() } else { "" }))
+        .collect();
+    rt.tick(&obs(12, &rows));
+    assert_eq!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Validating,
+        "終わった隣のタスクの変更で行き止まった"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
