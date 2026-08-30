@@ -375,6 +375,55 @@ Organization Board は Architect / Implementer / Reviewer / QA / Integrator
 
 ## 安全条件
 
+### 検証コマンドは、書いてあればそれを使う。書いていなければリポジトリを見る
+
+**Zaivern は任意のリポジトリで動く。** 0.23 までは SPEC が検証を書いて
+いないと `cargo fmt --check` / `cargo test` の 2 本を固定で返していたので、
+**Next.js のリポジトリで `cargo test` を走らせる**という嘘が出ていた。
+しかも「検証を実行した」という記録だけは残るので、完了の関門が素通りになる。
+
+決め方は 2 通りしかない。
+
+1. **SPEC の「検証」節に書かれていれば、それだけを使う。**
+   自動決定した候補を足さない (`明示指定は自動決定より優先する`)。
+2. **書かれていなければ、ワークスペースの目印から決める**
+   (`team::validation_defaults::detect`)。
+
+| 目印 | 候補 |
+| --- | --- |
+| `Cargo.toml` | `cargo fmt --check` / `cargo test` |
+| `go.mod` | `go test ./...` |
+| `package.json` | `scripts` に**実在する** `test` / `lint` / `typecheck` / `check` だけ。パッケージマネージャは lockfile から (`pnpm-lock.yaml` → pnpm、`yarn.lock` → yarn、`bun.lock(b)` → bun、`package-lock.json` → npm) |
+| `pyproject.toml` / `pytest.ini` / `setup.cfg` / `requirements.txt` | **pytest を使うと言い切れるときだけ** `pytest` |
+
+**決められないときは決めない。**
+
+* 目印が 1 つも無いリポジトリを、勝手に Rust 扱いにしない。
+  `PlanError::ValidationUndetermined` を返し、SPEC の「検証」節に
+  書くよう求める
+* `package.json` はあるが `test` 系の script が無いなら、**存在しない
+  `npm test` を作らない**。lockfile が無い / 2 つ以上あるなら
+  パッケージマネージャを選ばない。`package.json` が壊れていれば
+  「読めない」と言う (黙って「目印が無い」と同じ扱いにしない)
+* `requirements.txt` があるだけでは Python のテスト方法を決めない
+  (Django の `manage.py test` かもしれない)
+
+**不正な検証コマンドを黙って無視しない。** 以前は
+`filter(|s| parse_command(s).is_ok())` と書いていたので、
+`npm test && npm run lint` のような行が消えて既定へ落ちていた —
+利用者から見ると「書いた検証と違うものが走る」。いまは 1 件ずつ見て、
+**理由の種類を分けて**断る。
+
+| SPEC の行 | 返る誤り | 意味 |
+| --- | --- | --- |
+| `npm test && npm run lint` / `"abc` / 空行 | `InvalidValidationCommand` | **書き方**の問題。1 行 1 コマンドに直せば通る |
+| `git push` / `sudo make test` | `ForbiddenValidationCommand` | **方針**の問題。何をしても通らない |
+
+混ぜると、直せる人が直さなくなる。
+
+自動決定した候補も、SPEC が書いた行と**同じ関門**(`graph::parse_command`)
+を通る。危険度の判定と承認ゲートは下の表のまま — 第 2 の判定は作らない。
+
 ### 検証コマンドは危険度で分ける
 
 **「許可リストに載っているから安全」でも「名前が整形ツールだから安全」でも

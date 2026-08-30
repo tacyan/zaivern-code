@@ -248,6 +248,18 @@ Planner は差し替えられる境界 (`TeamPlanner`) なので、LLM Planner �
 コマンドは Zaivern 自身が実行します。レビューへ進むのは**実測が通った**
 ときだけです。
 
+どのコマンドを走らせるかは、まず SPEC が決めます。「検証」節にコマンドが
+書いてあれば**それだけ**を使い、何も足しません。書いていなければ Zaivern が
+リポジトリを読みます — `Cargo.toml` なら `cargo fmt --check` と `cargo test`、
+`go.mod` なら `go test ./...`、`package.json` なら**実在する** script
+(`test` / `lint` / `typecheck` / `check`) だけを lockfile が示す
+パッケージマネージャで、pytest はそれを使うと言い切れるときだけ。目印が
+1 つも無ければ、**Zaivern は当て推量をしません** — Next.js のリポジトリで
+`cargo test` を走らせる代わりに、SPEC へコマンドを書くよう求めます。
+解釈できない検証コマンドも黙って捨てません。`npm test && npm run lint` は
+「直せるシェル記法の誤り」として返り、何をしても通らない `git push` とは
+別の種類で区別されます。
+
 検証コマンドは許可リストで素通しにせず、**危険度で分けます**。パス付きの
 実行ファイル (`/tmp/cargo test` / `./cargo test` / `tools/python x.py`) は
 実行しません — basename だけで見ると `/tmp/cargo` が起きてしまうからです。

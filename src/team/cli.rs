@@ -415,6 +415,7 @@ fn plan_from_spec(spec_path: &Path, ws: &Path, agents: usize) -> Result<TeamPlan
             source: spec_path.display().to_string(),
             agent_count: agents,
             review_required: true,
+            workspace_root: ws.to_path_buf(),
             roles: Vec::new(),
         })
         .map_err(|e| e.detail())
@@ -708,6 +709,8 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "headless");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SPEC.md"), "# a\n## 要件\n- x\n").unwrap();
+        // 検証は**リポジトリの目印**から決まる (SPEC が書いていないので)。
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
         let code = run_in(
             &dir,
             &[
@@ -745,12 +748,17 @@ mod tests {
 
     #[test]
     fn planの表示に必要な情報が出る() {
+        // SPEC が検証を書いていないので、**リポジトリの目印から決まる**。
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "render");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let plan = StaticPlanner
             .plan(PlanInput {
                 spec: "# 認証\n## 要件\n- A を作る (src/a.rs)\n".into(),
                 source: "SPEC.md".into(),
                 agent_count: 4,
                 review_required: true,
+                workspace_root: dir.clone(),
                 roles: Vec::new(),
             })
             .unwrap();
@@ -763,6 +771,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&j).unwrap();
         assert_eq!(parsed["goal"]["title"], "認証");
         assert!(parsed["tasks"].as_array().unwrap().len() >= 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -871,6 +880,7 @@ mod tests {
         let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "run-post");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SPEC.md"), "# x\n## 要件\n- y を作る\n").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         let code = run_in(
             &dir,
             &[

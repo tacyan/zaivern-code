@@ -225,6 +225,16 @@ blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**
 智能体报告的 `validation` 只作为**参考信息**保留：验证命令由 Zaivern 自己
 执行，只有它自己实测通过后才会进入评审。
 
+运行哪些命令首先由 SPEC 决定。如果「验证」一节列出了命令，Zaivern 就**只**用
+这些，不会额外添加。如果没有列出，Zaivern 会读取仓库 — 有 `Cargo.toml` 就用
+`cargo fmt --check` 和 `cargo test`；有 `go.mod` 就用 `go test ./...`；有
+`package.json` 就只用**确实存在的** script（`test` / `lint` / `typecheck` /
+`check`），并按 lockfile 指明的包管理器运行；只有在确实使用 pytest 时才用
+pytest。如果这些标记一个都没有，**Zaivern 不会猜** — 它会请你在 SPEC 里写明
+命令，而不是在 Next.js 仓库里跑 `cargo test`。无法解析的验证命令同样不会被
+悄悄丢弃：`npm test && npm run lint` 会作为可修复的 shell 语法错误返回，与
+无论怎么写都会被拒绝的 `git push` 区分开。
+
 验证命令不会因为在允许列表里就被放行，而是**按风险分级**。带路径的可执行文件
 (`/tmp/cargo test`、`./cargo test`、`tools/python x.py`) 一律不执行——只看
 basename 就会真的去跑 `/tmp/cargo`。push、merge、deploy、publish、权限提升和

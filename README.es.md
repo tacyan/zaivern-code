@@ -240,6 +240,19 @@ agente se guarda solo como **información de referencia**: es Zaivern quien
 ejecuta los comandos de validación y solo pasa a la revisión con los resultados
 que él mismo midió.
 
+Qué comandos se ejecutan lo decide primero el SPEC. Si su sección **Validación**
+lista comandos, Zaivern usa exactamente esos y no añade nada. Si no lista
+ninguno, Zaivern lee el repositorio — `Cargo.toml` → `cargo fmt --check` y
+`cargo test`; `go.mod` → `go test ./...`; `package.json` → solo los scripts que
+realmente existen (`test`, `lint`, `typecheck`, `check`), con el gestor de
+paquetes que indique el lockfile; pytest solo cuando el proyecto lo usa de
+forma clara. Si no hay ninguna de esas marcas, **Zaivern no adivina** — te pide
+que nombres los comandos en el SPEC en lugar de ejecutar `cargo test` en un
+repositorio Next.js. Un comando de validación que no puede interpretar tampoco
+se descarta en silencio: `npm test && npm run lint` vuelve como un error de
+sintaxis de shell que puedes corregir, distinto de `git push`, que se rechaza
+por política se escriba como se escriba.
+
 Los comandos de validación se **clasifican por riesgo**, no se dan por buenos
 por estar en una allowlist. Un ejecutable con ruta (`/tmp/cargo test`,
 `./cargo test`, `tools/python x.py`) nunca se ejecuta: mirar solo el basename

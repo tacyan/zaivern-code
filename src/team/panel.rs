@@ -487,6 +487,7 @@ impl TeamPanel {
                 source: source.to_string(),
                 agent_count: opts.agent_count,
                 review_required: opts.review_required,
+                workspace_root: self.workspace.clone(),
                 roles,
             })
             .map_err(|e| e.detail())?;
@@ -1204,7 +1205,11 @@ mod tests {
         p
     }
 
-    const SPEC: &str = "# 認証\n## 要件\n- A を作る (src/a.rs)\n";
+    /// **検証を明示する SPEC。**
+    ///
+    /// ここで見たいのは画面の筋道であって、検証コマンドの自動決定ではない。
+    /// 自動決定そのものは `validation_defaults` と `planner` の番人が見る。
+    const SPEC: &str = "# 認証\n## 要件\n- A を作る (src/a.rs)\n## 検証\n- cargo test\n";
 
     #[test]
     fn 計画してから開始する() {

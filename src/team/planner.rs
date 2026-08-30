@@ -28,6 +28,12 @@ pub struct PlanInput {
     pub agent_count: usize,
     /// レビューを必須にするか。
     pub review_required: bool,
+    /// ワークスペースの根。
+    ///
+    /// **SPEC が検証コマンドを書いていないとき、ここを見て候補を決める**
+    /// ([`super::validation_defaults::detect`])。固定値にすると
+    /// Next.js のリポジトリで `cargo test` を走らせることになる。
+    pub workspace_root: std::path::PathBuf,
     /// チームに置く役割 (フォームの「エージェントプリセット」)。
     ///
     /// **空なら既定** (実装 + レビュー)。ここに `Tester` が入っていれば
@@ -46,6 +52,14 @@ pub enum PlanError {
     SpecTooLarge { bytes: usize, limit: usize },
     /// Planner の出力が schema を満たさない。
     Schema(SchemaError),
+    /// SPEC に書かれた検証コマンドが**語に割れない**。
+    ///
+    /// 黙って捨てると既定へ落ちて、利用者が書いたものと違う検証が走る。
+    InvalidValidationCommand { command: String, reason: String },
+    /// SPEC に書かれた検証コマンドが**実行を許されていない**。
+    ForbiddenValidationCommand { command: String, reason: String },
+    /// SPEC に指定が無く、リポジトリからも候補を決められない。
+    ValidationUndetermined { reason: String },
 }
 
 impl PlanError {
@@ -56,6 +70,15 @@ impl PlanError {
                 format!("SPEC が大きすぎます ({bytes} バイト / 上限 {limit})")
             }
             PlanError::Schema(e) => e.detail(),
+            PlanError::InvalidValidationCommand { command, reason } => format!(
+                "検証コマンドを解釈できません: `{command}` ({reason})。\
+                 シェルの記法 (`&&` `|` `;` など) は使えません。\
+                 1 行に 1 コマンドで書いてください"
+            ),
+            PlanError::ForbiddenValidationCommand { command, reason } => {
+                format!("検証コマンドを実行できません: `{command}` ({reason})")
+            }
+            PlanError::ValidationUndetermined { reason } => reason.clone(),
         }
     }
 }
@@ -259,7 +282,10 @@ impl StaticPlanner {
     /// SPEC → Planner 出力 JSON 相当の文書。
     ///
     /// LLM Planner を足すときも「この形を返す」のが契約になる。
-    pub fn compose(&self, input: &PlanInput) -> PlanDoc {
+    ///
+    /// **検証コマンドを決められないときは文書を作らない。** 決められない
+    /// まま先へ進めると、既定へ落ちるか空のまま配ることになる。
+    pub fn compose(&self, input: &PlanInput) -> Result<PlanDoc, PlanError> {
         let sections = parse_sections(&input.spec);
 
         // 表題: 最初の非空見出し。無ければ SPEC の最初の行。
@@ -298,16 +324,60 @@ impl StaticPlanner {
 
         // 検証コマンド (SPEC が指定していれば使う。危険なものはここで落とす)
         // **SPEC の文字列はここで構造へ直す。** 以降は構造のまま運ぶ。
-        let mut validations: Vec<String> = sections
+        let mut spelled: Vec<String> = sections
             .iter()
             .filter(|s| is_validation_heading(&s.title))
             .flat_map(|s| s.bullets.iter().chain(s.prose.iter()).cloned())
             .map(|s| s.trim_matches('`').trim().to_string())
-            .filter(|s| super::graph::parse_command(s).is_ok())
             .collect();
-        validations.dedup();
+        spelled.dedup();
+
+        // **SPEC の指定が最優先。1 件でも通らなければ計画を作らない。**
+        //
+        // 以前はここで `filter(|s| parse_command(s).is_ok())` と書いて
+        // いたので、`npm test && npm run lint` のような行が**黙って消え**、
+        // 残りが 0 件になると既定 (`cargo test`) へ落ちていた。
+        // 利用者から見ると「書いた検証と違うものが走る」ことになる。
+        let mut validations: Vec<String> = Vec::new();
+        for raw in &spelled {
+            match super::graph::parse_command(raw) {
+                Ok(_) => validations.push(raw.clone()),
+                Err(super::graph::CommandReject::Syntax(reason)) => {
+                    return Err(PlanError::InvalidValidationCommand {
+                        command: raw.clone(),
+                        reason,
+                    })
+                }
+                Err(super::graph::CommandReject::Forbidden(reason)) => {
+                    return Err(PlanError::ForbiddenValidationCommand {
+                        command: raw.clone(),
+                        reason,
+                    })
+                }
+            }
+        }
+
+        // 指定が無いときだけ、**リポジトリの実体を見て**候補を決める。
         if validations.is_empty() {
-            validations = default_validations();
+            validations = super::validation_defaults::detect(&input.workspace_root).map_err(
+                |e| PlanError::ValidationUndetermined {
+                    reason: e.detail(),
+                },
+            )?;
+            // 候補は自動生成なので、**ここでも同じ関門を通す**
+            // (許可リストの外にある候補を作ってしまったら、それは
+            //  候補の作り方の不具合であって、通してよい理由にならない)。
+            for raw in &validations {
+                if let Err(e) = super::graph::parse_command(raw) {
+                    return Err(PlanError::ValidationUndetermined {
+                        reason: format!(
+                            "自動決定した検証コマンド `{raw}` を実行できません ({})。\
+                             SPEC の「検証」セクションに検証コマンドを書いてください",
+                            e.reason()
+                        ),
+                    });
+                }
+            }
         }
         validations.truncate(4);
 
@@ -443,23 +513,15 @@ impl StaticPlanner {
             validation_commands: validations,
         });
 
-        PlanDoc {
+        Ok(PlanDoc {
             goal: GoalDoc {
                 title,
                 definition_of_done: dod,
             },
             teams,
             tasks,
-        }
+        })
     }
-}
-
-/// SPEC が検証コマンドを書いていないときの既定。
-///
-/// **リポジトリを見て決める**のが理想だが、MVP では Rust リポジトリを
-/// 前提にした無害な 2 本にする (どちらも許可リストを通る)。
-fn default_validations() -> Vec<String> {
-    vec!["cargo fmt --check".to_string(), "cargo test".to_string()]
 }
 
 impl TeamPlanner for StaticPlanner {
@@ -473,7 +535,7 @@ impl TeamPlanner for StaticPlanner {
                 limit: SPEC_MAX_BYTES,
             });
         }
-        let doc = self.compose(&input);
+        let doc = self.compose(&input)?;
         // **JSON の境界を必ず通す。**
         //
         // LLM Planner は JSON 文字列を返すので、検証経路は
@@ -496,14 +558,35 @@ impl TeamPlanner for StaticPlanner {
 mod tests {
     use super::*;
 
+    /// **ワークスペースを持たない入力。**
+    ///
+    /// 空のパスは「どのリポジトリでもない」なので、検証の自動決定は
+    /// 必ず断られる (`detect` が相対パスを cwd 基準で解決してしまう事故を
+    /// 防ぐため、空は明示的に弾いてある)。だからここを使うテストの SPEC は
+    /// 検証を自分で書く。自動決定そのものは `検証を自動決定する` 群が見る。
     fn input(spec: &str) -> PlanInput {
         PlanInput {
             spec: spec.to_string(),
             source: "SPEC.md".into(),
             agent_count: 4,
             review_required: true,
+            workspace_root: std::path::PathBuf::new(),
             roles: Vec::new(),
         }
+    }
+
+    /// 目印つきの一時ワークスペースを持つ入力。
+    fn input_in(spec: &str, ws: &std::path::Path) -> PlanInput {
+        PlanInput {
+            workspace_root: ws.to_path_buf(),
+            ..input(spec)
+        }
+    }
+
+    fn tmp_ws(name: &str) -> std::path::PathBuf {
+        let d = crate::test_util::unique_temp_dir("zaivern-team-planner", name);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     const SPEC: &str = "\
@@ -541,8 +624,8 @@ mod tests {
     #[test]
     fn 静的プランナーは決定的() {
         let p = StaticPlanner;
-        let a = p.compose(&input(SPEC));
-        let b = p.compose(&input(SPEC));
+        let a = p.compose(&input(SPEC)).unwrap();
+        let b = p.compose(&input(SPEC)).unwrap();
         assert_eq!(a, b, "同じ SPEC で違う計画が出た");
     }
 
@@ -572,7 +655,7 @@ mod tests {
     #[test]
     fn dodが書かれていなければ既定を必ず入れる() {
         let plan = StaticPlanner
-            .plan(input("# a\n\n## 要件\n- x を作る\n"))
+            .plan(input("# a\n\n## 要件\n- x を作る\n## 検証\n- cargo test\n"))
             .unwrap();
         assert!(
             plan.goal.definition_of_done.len() >= 6,
@@ -600,23 +683,199 @@ mod tests {
 
     #[test]
     fn 危険な検証コマンドはspecにあっても採らない() {
+        // **黙って消さない。** 以前はここで落として既定へ落ちていたので、
+        // 「`git push` と書いたのに `cargo test` が走る」ことになっていた。
         let spec = "# a\n## 要件\n- x\n## 検証\n- git push origin main\n";
-        let plan = StaticPlanner.plan(input(spec)).unwrap();
-        for t in &plan.tasks {
+        let e = StaticPlanner
+            .plan(input(spec))
+            .expect_err("危険なコマンドを含む SPEC を受理した");
+        match &e {
+            PlanError::ForbiddenValidationCommand { command, .. } => {
+                assert!(command.contains("git push"), "どれが駄目なのか言わない: {e:?}");
+            }
+            other => panic!("方針の拒否として返っていない: {other:?}"),
+        }
+        assert!(e.detail().contains("git push"), "説明に原文が無い");
+    }
+
+    #[test]
+    fn 解釈できない検証コマンドは黙って捨てない() {
+        // `&&` はシェルの記法。**書き方を直せば通る**ので、方針の拒否とは
+        // 別の種類で返す (混ぜると、直せる人が直さなくなる)。
+        let spec = "# a\n## 要件\n- x\n## 検証\n- npm test && npm run lint\n";
+        let e = StaticPlanner
+            .plan(input(spec))
+            .expect_err("シェル記法を含む SPEC を受理した");
+        match &e {
+            PlanError::InvalidValidationCommand { command, .. } => {
+                assert!(command.contains("&&"), "原文が入っていない: {e:?}");
+            }
+            other => panic!("構文の誤りとして返っていない: {other:?}"),
+        }
+        // **既定へ落ちていない。**
+        assert!(
+            !e.detail().contains("cargo"),
+            "既定へ落ちた形跡がある: {}",
+            e.detail()
+        );
+    }
+
+    #[test]
+    fn 閉じていない引用符も黙って捨てない() {
+        let spec = "# a\n## 要件\n- x\n## 検証\n- cargo test \"abc\n";
+        assert!(
+            matches!(
+                StaticPlanner.plan(input(spec)),
+                Err(PlanError::InvalidValidationCommand { .. })
+            ),
+            "閉じていない引用符を受理した"
+        );
+    }
+
+    #[test]
+    fn 空の検証コマンドも黙って捨てない() {
+        // **落とし穴を残さない。** 「空なら無視」と書くと、空だけの
+        // 検証節が「何も書かれていない」と同じ扱いになり、既定へ落ちる。
+        // 割れないものはすべて構文の誤りとして返す。
+        for raw in ["", "   ", "\u{a0}"] {
+            let cmd = format!("# a\n## 要件\n- x\n## 検証\n{raw}\n");
+            let secs = parse_sections(&cmd);
+            let has = secs
+                .iter()
+                .filter(|s| is_validation_heading(&s.title))
+                .any(|s| !s.bullets.is_empty() || !s.prose.is_empty());
+            if !has {
+                // その綴りは検証節に 1 行も残らない = 「書いていない」。
+                continue;
+            }
             assert!(
-                !t.validation_commands
-                    .iter()
-                    .any(|c| c.display().contains("push")),
-                "危険なコマンドが計画へ入った: {:?}",
-                t.validation_commands
+                matches!(
+                    StaticPlanner.plan(input(&cmd)),
+                    Err(PlanError::InvalidValidationCommand { .. })
+                        | Err(PlanError::ForbiddenValidationCommand { .. })
+                ),
+                "空の検証コマンド {raw:?} を黙って捨てた"
             );
         }
     }
 
     #[test]
+    fn 明示指定は自動決定より優先する() {
+        // Rust の目印があるワークスペースでも、SPEC が書いたものだけを使う。
+        let d = tmp_ws("explicit");
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let spec = "# a\n## 要件\n- x\n## 検証\n- go test ./...\n";
+        let plan = StaticPlanner.plan(input_in(spec, &d)).unwrap();
+        let cmds: Vec<String> = plan
+            .tasks
+            .iter()
+            .flat_map(|t| t.validation_commands.iter().map(|c| c.display()))
+            .collect();
+        assert!(cmds.iter().any(|c| c.contains("go test")), "{cmds:?}");
+        assert!(
+            !cmds.iter().any(|c| c.contains("cargo")),
+            "明示指定があるのに既定を足した: {cmds:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// 目印から候補が決まることを、計画まで通して見る。
+    fn 自動決定される(name: &str, mark: &[(&str, &str)], want: &str, deny: &str) {
+        let d = tmp_ws(name);
+        for (f, body) in mark {
+            std::fs::write(d.join(f), body).unwrap();
+        }
+        let spec = "# a\n## 要件\n- x を作る\n";
+        let plan = StaticPlanner
+            .plan(input_in(spec, &d))
+            .unwrap_or_else(|e| panic!("{name}: 計画できるべき: {}", e.detail()));
+        let cmds: Vec<String> = plan
+            .tasks
+            .iter()
+            .flat_map(|t| t.validation_commands.iter().map(|c| c.display()))
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c.contains(want)),
+            "{name}: `{want}` が出ない: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains(deny)),
+            "{name}: `{deny}` が混ざった: {cmds:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn 検証を自動決定する_rust() {
+        自動決定される(
+            "rust",
+            &[("Cargo.toml", "[package]\nname = \"x\"\n")],
+            "cargo test",
+            // `"go test"` は **`car-go test`** に部分一致してしまうので使わない。
+            "npm",
+        );
+    }
+
+    #[test]
+    fn 検証を自動決定する_go() {
+        // **`cargo` が 1 文字も出てこないこと**が、この番人の要点。
+        自動決定される("go", &[("go.mod", "module x\n")], "go test ./...", "cargo");
+    }
+
+    #[test]
+    fn 検証を自動決定する_node() {
+        自動決定される(
+            "node",
+            &[
+                (
+                    "package.json",
+                    "{\"scripts\":{\"test\":\"vitest run\",\"lint\":\"eslint .\"}}",
+                ),
+                ("package-lock.json", "{}"),
+            ],
+            "npm run test",
+            "cargo",
+        );
+    }
+
+    #[test]
+    fn 検証を自動決定できないときは断る() {
+        // 目印が 1 つも無いなら、**Rust だと決めつけない**。
+        let d = tmp_ws("unknown");
+        let e = StaticPlanner
+            .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
+            .expect_err("目印が無いのに計画できてしまった");
+        assert!(
+            matches!(e, PlanError::ValidationUndetermined { .. }),
+            "断り方が違う: {e:?}"
+        );
+        assert!(
+            !e.detail().contains("cargo"),
+            "cargo へ落ちた形跡がある: {}",
+            e.detail()
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn testスクリプトが無いnodeでは勝手にnpm_testを作らない() {
+        let d = tmp_ws("node-nodefs");
+        std::fs::write(d.join("package.json"), "{\"scripts\":{\"dev\":\"next dev\"}}").unwrap();
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        let e = StaticPlanner
+            .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
+            .expect_err("存在しない script を候補にしてしまった");
+        assert!(
+            matches!(e, PlanError::ValidationUndetermined { .. }),
+            "断り方が違う: {e:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
     fn 箇条書きが無いspecでも計画できる() {
         let plan = StaticPlanner
-            .plan(input("# 目的\n本文だけ。\n\n## 設計\n説明。\n"))
+            .plan(input("# 目的\n本文だけ。\n\n## 設計\n説明。\n## 検証\n- cargo test\n"))
             .expect("計画できるべき");
         assert!(!plan.tasks.is_empty());
     }
@@ -627,6 +886,7 @@ mod tests {
         for i in 0..50 {
             spec.push_str(&format!("- 項目 {i}\n"));
         }
+        spec.push_str("## 検証\n- cargo test\n");
         let mut inp = input(&spec);
         inp.agent_count = 2;
         let plan = StaticPlanner.plan(inp).unwrap();

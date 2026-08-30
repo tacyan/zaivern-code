@@ -230,6 +230,17 @@ Goal 과 Definition of Done 을 세우고 태스크 그래프를 만들어 계�
 Zaivern 이 직접 실행합니다. 리뷰로 넘어가는 것은 **직접 측정한 결과가
 통과했을 때뿐**입니다.
 
+어떤 명령을 실행할지는 먼저 SPEC이 정합니다. 「검증」 절에 명령이 적혀 있으면
+Zaivern은 **그것만** 쓰고 아무것도 더하지 않습니다. 적혀 있지 않으면 저장소를
+읽습니다 — `Cargo.toml`이면 `cargo fmt --check`와 `cargo test`, `go.mod`이면
+`go test ./...`, `package.json`이면 **실제로 있는** script(`test` / `lint` /
+`typecheck` / `check`)만 lockfile이 가리키는 패키지 매니저로, pytest는 그것을
+쓴다고 단정할 수 있을 때만. 이 표시가 하나도 없으면 **Zaivern은 추측하지
+않습니다** — Next.js 저장소에서 `cargo test`를 돌리는 대신, SPEC에 명령을
+적어 달라고 요청합니다. 해석할 수 없는 검증 명령도 조용히 버리지 않습니다.
+`npm test && npm run lint`는 고칠 수 있는 셸 문법 오류로 돌아오며, 어떻게
+써도 거부되는 `git push`와는 다른 종류로 구분됩니다.
+
 검증 명령은 허용 목록으로 그냥 통과시키지 않고 **위험도로 나눕니다**. 경로가
 붙은 실행 파일 (`/tmp/cargo test`, `./cargo test`, `tools/python x.py`) 은
 실행하지 않습니다 — basename 만 보면 실제로 `/tmp/cargo` 가 실행되기

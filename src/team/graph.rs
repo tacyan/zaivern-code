@@ -571,10 +571,13 @@ pub fn classify_why(cmd: &ValidationCommand) -> (ValidationRisk, String) {
     // 語を見る — 「文字列としては安全に見えるが、どこかの層がもう一度
     // 解釈する」形を残さないため。Windows の cmd.exe が特別扱いする字も
     // 含める (`%VAR%` の展開で、判定した文字列と実行される文字列がずれる)。
-    for w in std::iter::once(head).chain(cmd.args.iter().map(|s| s.as_str())) {
-        if let Some(c) = w.chars().find(|c| SHELL_METACHARS.contains(c)) {
-            return no(format!("シェルのメタ文字 `{c}` は使えません"));
-        }
+    //
+    // 判定そのものは [`shell_syntax_reason`] 1 か所にある。Planner は
+    // 同じ関数を呼んで**構文の誤り**として扱う (人が直せるように) が、
+    // ここでは従来どおり `Forbidden` — 二重の防御であって、**判定の
+    // 実装は 1 つ**である。
+    if let Some(why) = shell_syntax_reason(cmd) {
+        return no(why);
     }
     // 実行するのは実体だけ。`sh -c "..."` のような入れ子は通さない。
     if head_has_path(head) {
@@ -600,6 +603,60 @@ pub fn classify_why(cmd: &ValidationCommand) -> (ValidationRisk, String) {
     }
 }
 
+/// シェルとしての再解釈が要る形になっていないか。
+///
+/// **`None` なら「割れている」だけで、実行してよいという意味ではない。**
+/// 危険度は [`classify_why`] が決める。
+///
+/// ここを [`classify_why`] と Planner の両方が呼ぶ。2 つ持つと、
+/// 「Planner は通したのに実行時に断られる」というずれが出る。
+pub fn shell_syntax_reason(cmd: &ValidationCommand) -> Option<String> {
+    let head = cmd.executable.trim();
+    for w in std::iter::once(head).chain(cmd.args.iter().map(|s| s.as_str())) {
+        if let Some(c) = w.chars().find(|c| SHELL_METACHARS.contains(c)) {
+            return Some(format!("シェルのメタ文字 `{c}` は使えません"));
+        }
+    }
+    None
+}
+
+/// 受け取れない理由。**構文の問題と、方針の問題を分ける。**
+///
+/// 混ぜると利用者が直しようがない。`npm test && npm run lint` は
+/// **書き方**を直せば通る (2 行に分ける) が、`git push` は何をしても
+/// 通らない — 同じ「拒否」で返すと、前者を直せる人が直さなくなる。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandReject {
+    /// 語に割れない / シェルの解釈が要る。**書き方の問題。**
+    Syntax(String),
+    /// 割れたが、実行を許していない。**方針の問題。**
+    Forbidden(String),
+}
+
+impl CommandReject {
+    pub fn reason(&self) -> &str {
+        match self {
+            CommandReject::Syntax(s) | CommandReject::Forbidden(s) => s,
+        }
+    }
+}
+
+/// 文字列 1 本を検証コマンドとして受け取る (SPEC / 自動決定の入口)。
+///
+/// **構造へ直してから判定する。** 文字列のまま判定して、あとで別の層が
+/// もう一度割ると、判定したものと実行するものがずれる。
+///
+/// 断る理由は [`CommandReject`] で**種類を分けて**返す — 呼び出し側が
+/// 「書き方を直せば通る」と「何をしても通らない」を区別できるように。
+pub fn parse_command(line: &str) -> Result<ValidationCommand, CommandReject> {
+    let cmd = ValidationCommand::parse(line).map_err(CommandReject::Syntax)?;
+    if let Some(why) = shell_syntax_reason(&cmd) {
+        return Err(CommandReject::Syntax(why));
+    }
+    check_command(&cmd).map_err(CommandReject::Forbidden)?;
+    Ok(cmd)
+}
+
 /// 検証コマンドとして**そもそも実行してよいか** (`Forbidden` でないか)。
 ///
 /// 返り値が `Err` なら、その文面をそのまま人へ見せる。
@@ -609,16 +666,6 @@ pub fn check_command(cmd: &ValidationCommand) -> Result<(), String> {
         (ValidationRisk::Forbidden, why) => Err(why),
         _ => Ok(()),
     }
-}
-
-/// 文字列 1 本を検証コマンドとして受け取る (SPEC / 旧形式の入口)。
-///
-/// **構造へ直してから判定する。** 文字列のまま判定して、あとで別の層が
-/// もう一度割ると、判定したものと実行するものがずれる。
-pub fn parse_command(line: &str) -> Result<ValidationCommand, String> {
-    let cmd = ValidationCommand::parse(line)?;
-    check_command(&cmd)?;
-    Ok(cmd)
 }
 
 /// 担当ファイルのパターンがワークスペースの内側に収まっているか。

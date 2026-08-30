@@ -47,6 +47,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
             source: "SPEC.md".into(),
             agent_count: agents,
             review_required,
+            workspace_root: ws(),
             roles: Vec::new(),
         })
         .expect("計画できるべき");
@@ -589,6 +590,7 @@ fn 不正なspecでもpanicしない() {
         source: "SPEC.md".into(),
         agent_count: 4,
         review_required: true,
+        workspace_root: ws(),
         roles: Vec::new(),
     });
     assert!(bad.is_err());
@@ -598,6 +600,7 @@ fn 不正なspecでもpanicしない() {
         source: "x".into(),
         agent_count: 1,
         review_required: true,
+        workspace_root: ws(),
         roles: Vec::new(),
     });
     assert!(weird.is_ok() || weird.is_err());
@@ -765,6 +768,7 @@ fn specとエージェント数が計画に反映される() {
                     source: "SPEC.md".into(),
                     agent_count: agents,
                     review_required: true,
+                    workspace_root: ws(),
                     roles: Vec::new(),
                 })
                 .expect("計画できるべき");
@@ -803,6 +807,7 @@ fn 計画しただけではエージェントを起こさない() {
             source: "SPEC.md".into(),
             agent_count: 4,
             review_required: true,
+            workspace_root: ws(),
             roles: Vec::new(),
         })
         .unwrap();
@@ -1562,6 +1567,7 @@ fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId,
             source: "SPEC.md".into(),
             agent_count: 2,
             review_required: false,
+            workspace_root: d.clone(),
             roles: Vec::new(),
         })
         .expect("計画できるべき");

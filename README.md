@@ -253,6 +253,19 @@ code. The `validation` block an agent reports is kept as **reference only**:
 Zaivern runs the task's validation commands itself and advances to review only
 on its own measured results.
 
+Which commands run comes from the SPEC first. If its **Validation** section
+lists commands, Zaivern uses exactly those and adds nothing. If it lists none,
+Zaivern reads the repository — `Cargo.toml` → `cargo fmt --check` and
+`cargo test`; `go.mod` → `go test ./...`; `package.json` → only the scripts
+that actually exist (`test`, `lint`, `typecheck`, `check`), run through the
+package manager the lockfile names; pytest only when the project clearly uses
+it. If none of those markers is there, **Zaivern does not guess** — it asks you
+to name the commands in the SPEC rather than running someone else's `cargo
+test` against a Next.js repository. A validation command it cannot parse is
+never silently dropped either: `npm test && npm run lint` comes back as a
+shell-syntax error you can fix, kept distinct from `git push`, which is refused
+on policy no matter how it is written.
+
 Validation commands are **classified by risk**, not waved through by an
 allowlist. A path-qualified executable (`/tmp/cargo test`, `./cargo test`,
 `tools/python x.py`) is never run — matching on the basename alone would run

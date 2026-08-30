@@ -22,6 +22,7 @@ const LAUNCH: &str = include_str!("launch.rs");
 const FRAME: &str = include_str!("../app/frame_update.rs");
 const STARTUP: &str = include_str!("../app/startup.rs");
 const SESSIONS: &str = include_str!("../app/agent_sessions.rs");
+const PLANNER: &str = include_str!("planner.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -295,6 +296,48 @@ fn 走査は間隔を空けてから行う() {
     assert!(
         body.contains("if self.team_is_active()"),
         "走っていないときも再描画を頼んでいる"
+    );
+}
+
+#[test]
+fn 検証コマンドの解析失敗を黙って捨てない() {
+    // **元の不具合そのもの。** `filter(|s| parse_command(s).is_ok())` と
+    // 書くと、SPEC に書かれた検証が黙って消え、残りが 0 件になると
+    // 既定へ落ちる — 利用者から見て「書いたものと違う検証が走る」。
+    //
+    // 見るのは `compose` の中だけ。ファイル全体を見ると、この番人の
+    // 説明文や別の関数の `is_ok()` を拾って空回りする。
+    let s = src(PLANNER);
+    let at = s.find("pub fn compose").expect("compose が無い");
+    let body = function_body(&s, at);
+    assert!(
+        !body.contains("is_ok()"),
+        "検証コマンドの可否を `is_ok()` で選り分けている (失敗が黙って消える)"
+    );
+    // 断るときは、**種類を分けて**返している。
+    for want in [
+        "PlanError::InvalidValidationCommand",
+        "PlanError::ForbiddenValidationCommand",
+        "PlanError::ValidationUndetermined",
+    ] {
+        assert!(body.contains(want), "{want} で断る経路が無い");
+    }
+}
+
+#[test]
+fn 既定の検証コマンドを綴りで固定していない() {
+    // `cargo` を綴りで持つのは**リポジトリ判定の中だけ**。Planner が
+    // 直に持つと、Next.js のリポジトリで `cargo test` が走る。
+    let s = src(PLANNER);
+    assert!(
+        !s.contains("cargo fmt --check"),
+        "Planner が Rust の検証コマンドを直に持っている"
+    );
+    let at = s.find("pub fn compose").expect("compose が無い");
+    let body = function_body(&s, at);
+    assert!(
+        body.contains("validation_defaults::detect"),
+        "リポジトリを見て決める経路を通っていない"
     );
 }
 

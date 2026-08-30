@@ -109,15 +109,6 @@ impl Drop for Lab {
 
 impl Lab {
     fn new(agents: usize) -> Self {
-        let plan = StaticPlanner
-            .plan(PlanInput {
-                spec: SPEC.to_string(),
-                source: "SPEC.md".into(),
-                agent_count: agents,
-                review_required: true,
-                roles: Vec::new(),
-            })
-            .expect("計画できるべき");
         // **受入シナリオは実リポジトリで回す。**
         //
         // 変更ファイルの実測は git を読む。ここを架空のパスにすると、
@@ -128,6 +119,16 @@ impl Lab {
             Some(d) => (d, true),
             None => (PathBuf::from("/zaivern-team-e2e"), false),
         };
+        let plan = StaticPlanner
+            .plan(PlanInput {
+                spec: SPEC.to_string(),
+                source: "SPEC.md".into(),
+                agent_count: agents,
+                review_required: true,
+                workspace_root: workspace.clone(),
+                roles: Vec::new(),
+            })
+            .expect("計画できるべき");
         let mut rt = TeamRuntime::from_plan(
             plan,
             workspace.clone(),
