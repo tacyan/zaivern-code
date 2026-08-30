@@ -755,16 +755,15 @@ impl ZaivernApp {
         if let Some(why) = self.cost_block_reason() {
             return Some(why);
         }
-        let run = panel::with_panel(|p| p.run_guardrails().unwrap_or_default().cost_limit);
-        if run <= 0.0 {
+        // **読むのは 1 回だけ。** 2 度読むと、間に Run が入れ替わったときに
+        // 「上限は 5 だが、遮断は 25 で判断した」のような食い違いが起こる。
+        let run = panel::with_panel(|p| p.run_guardrails()).unwrap_or_default();
+        if run.cost_limit <= 0.0 {
             return None;
         }
         let (session, today) = self.cost_spent;
         let mut limits = self.cfg.cost_limits();
-        limits.session = f64::from(
-            panel::with_panel(|p| p.run_guardrails().unwrap_or_default())
-                .effective_cost_limit(self.cfg.cost_limit_session),
-        );
+        limits.session = f64::from(run.effective_cost_limit(self.cfg.cost_limit_session));
         let blocked = limits.blocks(session, today)?;
         Some(trf(
             "team.err.run_cost_limit",

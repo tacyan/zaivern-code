@@ -647,14 +647,11 @@ fn measured_trust(path: &Path, trust: ExecTrust, my_uid: Option<u32>) -> ExecTru
     if trust != ExecTrust::SystemTrusted {
         return trust;
     }
-    // 実体と、その置き場の**両方**を見る。置き場に書ければ、実体を
-    // 差し替えられる (消して置き直せる) ので同じこと。
-    let mut targets = vec![path.to_path_buf()];
-    if let Some(dir) = path.parent() {
-        targets.push(dir.to_path_buf());
-    }
-    for t in targets {
-        let Ok(meta) = std::fs::metadata(&t) else {
+    // **実体と、そこへ至る置き場を全部見る。** 置き場に書ければ実体を
+    // 差し替えられる (消して置き直せる) し、その 1 つ上に書ければ置き場ごと
+    // 挿げ替えられる。`path` は正規化済みなので、辿る先はリンクの解けた形。
+    for t in std::iter::once(path).chain(path.ancestors().skip(1)) {
+        let Ok(meta) = std::fs::metadata(t) else {
             // 見られないものは判断しない。**綴りだけで通さない。**
             return ExecTrust::Unknown;
         };
