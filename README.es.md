@@ -209,6 +209,88 @@ móvil. Usa la misma Wi-Fi, [Tailscale](https://tailscale.com/) o un túnel SSH.
 Revisa el código y los cambios de los agentes sin salir de Zaivern Code, incluidos
 Markdown, imágenes, PDF y CSV. Los búferes sin guardar se recuperan tras un fallo.
 
+### 8. Ejecuciones de equipo con IA — entrega un SPEC y obtén un equipo gestionado
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern lee el SPEC y —hoy, mediante un **`StaticPlanner` determinista, no un
+LLM**— deriva un Goal y una Definition of Done, construye un grafo de tareas y
+muestra el plan; el mismo SPEC produce siempre el mismo plan. La planificación
+es una frontera intercambiable (`TeamPlanner`), y un planificador con LLM entra
+después detrás del mismo `TeamPlan` validado:
+
+```text
+hoy:     SPEC → StaticPlanner (determinista) → TeamPlan validado → grafo
+futuro:  SPEC → LLM TeamPlanner              → el mismo TeamPlan → grafo
+```
+
+Al pulsar **Start Team**, arranca solo los agentes que el plan realmente
+necesita, entrega a cada uno su tarea y lleva el trabajo de implementar →
+validar → revisar → corregir → integrar hasta el final.
+
+**Nada se marca como completado porque un agente lo diga.** Una tarea solo
+avanza por `Running → Validating → Reviewing → Completed`, y un informe de
+finalización se rechaza si el id de la tarea o del agente no coincide, si tocó
+archivos fuera de su alcance, si los comandos de validación no se ejecutaron o
+fallaron, o si queda un blocker abierto. Las revisiones van a una **sesión
+distinta** de la que escribió el código. El bloque `validation` que informa el
+agente se guarda solo como **información de referencia**: es Zaivern quien
+ejecuta los comandos de validación y solo pasa a la revisión con los resultados
+que él mismo midió.
+
+Qué comandos se ejecutan lo decide primero el SPEC. Si su sección **Validación**
+lista comandos, Zaivern usa exactamente esos y no añade nada. Si no lista
+ninguno, Zaivern lee el repositorio — `Cargo.toml` → `cargo fmt --check` y
+`cargo test`; `go.mod` → `go test ./...`; `package.json` → solo los scripts que
+realmente existen (`test`, `lint`, `typecheck`, `check`), con el gestor de
+paquetes que indique el lockfile; pytest solo cuando el proyecto lo usa de
+forma clara. Si no hay ninguna de esas marcas, **Zaivern no adivina** — te pide
+que nombres los comandos en el SPEC en lugar de ejecutar `cargo test` en un
+repositorio Next.js. Un comando de validación que no puede interpretar tampoco
+se descarta en silencio: `npm test && npm run lint` vuelve como un error de
+sintaxis de shell que puedes corregir, distinto de `git push`, que se rechaza
+por política se escriba como se escriba.
+
+Los comandos de validación se **clasifican por riesgo**, no se dan por buenos
+por estar en una allowlist. Un ejecutable con ruta (`/tmp/cargo test`,
+`./cargo test`, `tools/python x.py`) nunca se ejecuta: mirar solo el basename
+ejecutaría lo que sea que sea `/tmp/cargo`. push, merge, deploy, publish, la
+elevación de privilegios y los comandos destructivos se rechazan. Y todo lo que
+puede ejecutar código del repositorio (`cargo test`, `npm test`, `pytest`,
+`make`, `node`, `go test`) **espera tu aprobación antes de ejecutar una sola
+línea**: el cuerpo de un test, un `build.rs` o un `Makefile` pueden hacer lo
+mismo que un shell. Lo mismo con lo que **escribe en tus archivos**: `black .` y
+`rustfmt src/lib.rs` piden aprobación, `black --check .` y
+`rustfmt --check src/lib.rs` no — lo decide la opción, no el nombre de la
+herramienta. El ejecutable también lo resuelve Zaivern en vez de dejar que el SO
+busque en `PATH` — y estar fuera del workspace no basta: el agente se ejecuta
+con tus privilegios, así que puede escribir en `~/.local/bin` y también en
+`/opt/homebrew` y `/usr/local`, que Homebrew deja bajo tu propiedad. Solo un
+ejecutable en un lugar que exige elevación (`/usr/bin`, `/bin`, `/sbin`,
+`C:\Windows`, `C:\Program Files`) se ejecuta sin aprobación, y si en la práctica
+resulta escribible por ti, su clasificación solo baja, nunca sube. Así, un
+`rustfmt` colocado dentro del workspace nunca
+suplanta al real, y no hay ningún shell entre lo que se comprobó y lo que se
+ejecuta. Cada ejecución tiene tiempo límite, se termina con todo el
+árbol de procesos cuando paras el equipo, y siempre acaba en un resultado:
+pasó, falló, se agotó el tiempo, se canceló, no pudo iniciarse o se perdió la
+conexión con el ejecutor. **Una aprobación cubre una ejecución de validación,
+no un nombre de comando**: otra tarea, una nueva pasada tras una revisión que
+pidió cambios, o un reintento vuelven a preguntar, porque el código que se
+prueba ya no es el que aprobaste. Zaivern no aísla lo que apruebas: garantiza
+**qué se inició**, no lo que ese proceso hace después. `push`, `merge`, `deploy`, la elevación
+de privilegios y los comandos destructivos nunca se ejecutan automáticamente:
+se convierten en una decisión tuya, en pantalla.
+
+El Organization Board muestra al líder del equipo, los carriles de cada
+especialidad, todos los agentes padres e hijos, qué está haciendo cada uno ahora
+mismo, el progreso del grafo de tareas, los resultados de pruebas y revisiones y
+**lo que más necesita tu atención**.
+
+[Documentación del equipo de IA](docs/team.md)
+
 También se incluyen: plugins y una interfaz en seis idiomas.
 [Documentación de plugins](docs/plugins.md) · [Documentación de traducción](docs/translating.md)
 
@@ -294,6 +376,7 @@ Reproduce cualquiera de estos datos: `tools/conflict-bench.sh`, `tools/coedit-be
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Qué garantías valen para cada forma de repositorio |
 | [docs/idle-cost.md](docs/idle-cost.md) | Cómo se miden la CPU en reposo y el tamaño del binario |
 | [docs/plugins.md](docs/plugins.md) | Cómo escribir plugins, con la [especificación del formato](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: cómo un SPEC se convierte en un grafo de tareas, qué habilita el "completado" y qué nunca se ejecuta automáticamente |
 | [docs/README.md](docs/README.md) | Índice de todos los demás documentos, agrupados por la afirmación que respaldan |
 
 [Notas de la versión](https://github.com/tacyan/zaivern-code/releases) ·

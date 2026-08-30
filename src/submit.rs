@@ -226,6 +226,17 @@ pub struct Job {
     pub tries: u8,
     /// 表示用のラベル (トースト)
     pub title: String,
+    /// **配達の結果を知りたい呼び出し元の目印** (無ければ `None`)。
+    ///
+    /// 積めたこと (`queue_submit` が真) と、実際に届いたこと
+    /// (`Act::Done`) は**別の時刻に決まる**。積んだ時点で「送った」と
+    /// 記録すると、その後に相手が消えても (`Act::Gone`)、入力欄が空かない
+    /// まま上限に達しても (`Act::GaveUp`)、呼び出し元は永久に気付けない。
+    /// ここに目印を入れておくと、終わり方が呼び出し元へ 1 回だけ返る。
+    ///
+    /// **送信経路は増やさない。** 目印を運ぶだけで、書き込みはこれまで
+    /// どおり `submit_tick` の 1 か所しかない。
+    pub tag: Option<String>,
 }
 
 impl Job {
@@ -239,6 +250,7 @@ impl Job {
             stage: Stage::Ready,
             tries: 0,
             title: String::new(),
+            tag: None,
         }
     }
 
@@ -252,6 +264,7 @@ impl Job {
             stage: Stage::Ready,
             tries: 0,
             title: String::new(),
+            tag: None,
         }
     }
 }

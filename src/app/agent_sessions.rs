@@ -287,6 +287,25 @@ impl ZaivernApp {
         cwd: &Path,
         ctx: &egui::Context,
     ) {
+        // 既定は**いまの設定**の承認モード。
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        self.launch_preset_as(i, command, cwd, approval, ctx);
+    }
+
+    /// **承認モードを明示して**起こす。
+    ///
+    /// Team の Run は「この Run にだけ効く締め具合」を持つ (既存のグローバル
+    /// 設定は書き換えない)。その値をここへ渡す — 設定を書き換えてから
+    /// 起こす形にすると、Run を 1 本作る操作で Zaivern 全体の承認モードが
+    /// 変わってしまう。
+    pub(super) fn launch_preset_as(
+        &mut self,
+        i: usize,
+        command: String,
+        cwd: &Path,
+        approval: crate::agents::Approval,
+        ctx: &egui::Context,
+    ) {
         use crate::agents::{
             apply_approval, command_is_bypass, env_enables_auto, merged_env, spec_for_command,
             Approval,
@@ -297,7 +316,6 @@ impl ZaivernApp {
         // 再開・フォルダ指定はコマンドと cwd だけ差し替える (名前・アイコン・env は据え置き)
         p.command = command;
         p.cwd = Some(cwd.display().to_string());
-        let approval = Approval::from_mode(&self.cfg.approval_mode);
         // 実際に起動されるコマンドで bypass かどうかを判定する
         // (Agent優先モードではプリセットのフラグがそのまま効く)
         //
@@ -540,6 +558,10 @@ impl ZaivernApp {
         let mut next: Option<Duration> = None;
         let mut delivered: Vec<String> = Vec::new();
         let mut gave_up: Vec<String> = Vec::new();
+        // **終わり方を目印つきで拾う** (`(目印, 本当に届いたか)`)。
+        // 積めたことと届いたことは別の時刻に決まるので、頼んだ側へは
+        // ここでしか本当のことを返せない。
+        let mut outcomes: Vec<(String, bool)> = Vec::new();
         let mut queue = std::mem::take(&mut self.outbox);
         let sup = &self.supervisor;
         let agents = &mut self.agents;
@@ -547,7 +569,12 @@ impl ZaivernApp {
             let sid = p.job.session;
             let idle = matches!(sup.state_of(sid), Some(supervisor::SessionState::Idle));
             let Some(s) = agents.sessions.iter_mut().find(|s| s.id == sid) else {
-                return false; // セッションが消えた
+                // セッションが消えた。**黙って捨てない** — 頼んだ側は
+                // 「届いた」と思ったまま待ち続けることになる。
+                if let Some(t) = p.job.tag.clone() {
+                    outcomes.push((t, false));
+                }
+                return false;
             };
             let bracketed = s.running() && s.bracketed_paste();
             let peek = submit::Peek {
@@ -565,9 +592,25 @@ impl ZaivernApp {
                 next = Some(next.map_or(d, |n: Duration| n.min(d)));
             };
             match p.act(&peek, now) {
-                submit::Act::Gone | submit::Act::Done => false,
+                submit::Act::Done => {
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, true));
+                    }
+                    false
+                }
+                // **相手が消えた = 届いていない。** 本文を書いた後でも、
+                // 確定キーが効いたことは確かめられていない。
+                submit::Act::Gone => {
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
+                    false
+                }
                 submit::Act::GaveUp => {
                     gave_up.push(s.title.clone());
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
                     false
                 }
                 submit::Act::Wait(d) => {
@@ -598,6 +641,11 @@ impl ZaivernApp {
             }
         });
         self.outbox = queue;
+        // **配達の結末を頼んだ側へ 1 回だけ返す。** 送信経路は増やさない
+        // (ここは結果を伝えるだけで、PTY へは 1 バイトも書かない)。
+        if !outcomes.is_empty() {
+            self.team_note_delivery(outcomes);
+        }
         for title in delivered {
             self.toast(
                 trf("📋 {title} へ指示を配達しました", &[("title", title)]),

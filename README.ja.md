@@ -219,6 +219,81 @@ Codex も Gemini も同じ挙動になります。追加インストールは不
 
 [コンテキストエンジン](docs/context-engine.md)
 
+### 9. AI チーム実行 — SPEC を渡すだけで、開発チームが動く
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern が SPEC を読み、**いまは決定的な `StaticPlanner`** が Goal と
+Definition of Done を起こし、Task Graph を組んで計画を見せます
+(LLM に意味を解釈させてはいないので、同じ SPEC からは必ず同じ計画が出ます)。
+Planner は差し替えられる境界 (`TeamPlanner`) なので、LLM Planner は同じ
+検証済み `TeamPlan` を返す実装として後から入ります:
+
+```text
+いま:     SPEC → StaticPlanner (決定的) → 検証済み TeamPlan → Task Graph
+これから: SPEC → LLM TeamPlanner        → 同じ TeamPlan     → Task Graph
+```
+
+**Start Team** を押すと、計画に必要なぶんだけエージェントを起こし、担当を
+配り、実装 → 検証 → レビュー → 修正 → 統合まで進めます。
+
+**「エージェントが完了と言った」では完了になりません。** タスクは
+`Running → Validating → Reviewing → Completed` の順にしか進めず、完了報告は
+タスク ID / エージェント ID が担当と違う・担当外のファイルを触った・検証
+コマンドを実行していない/失敗した・blocker が残っている、のどれかに当たると
+却下されます。レビューは**実装したのと別のセッション**が担当します。
+エージェントが報告した `validation` は**参考情報として脇に置き**、検証
+コマンドは Zaivern 自身が実行します。レビューへ進むのは**実測が通った**
+ときだけです。
+
+どのコマンドを走らせるかは、まず SPEC が決めます。「検証」節にコマンドが
+書いてあれば**それだけ**を使い、何も足しません。書いていなければ Zaivern が
+リポジトリを読みます — `Cargo.toml` なら `cargo fmt --check` と `cargo test`、
+`go.mod` なら `go test ./...`、`package.json` なら**実在する** script
+(`test` / `lint` / `typecheck` / `check`) だけを lockfile が示す
+パッケージマネージャで、pytest はそれを使うと言い切れるときだけ。目印が
+1 つも無ければ、**Zaivern は当て推量をしません** — Next.js のリポジトリで
+`cargo test` を走らせる代わりに、SPEC へコマンドを書くよう求めます。
+解釈できない検証コマンドも黙って捨てません。`npm test && npm run lint` は
+「直せるシェル記法の誤り」として返り、何をしても通らない `git push` とは
+別の種類で区別されます。
+
+検証コマンドは許可リストで素通しにせず、**危険度で分けます**。パス付きの
+実行ファイル (`/tmp/cargo test` / `./cargo test` / `tools/python x.py`) は
+実行しません — basename だけで見ると `/tmp/cargo` が起きてしまうからです。
+push / merge / deploy / publish / 権限昇格 / 破壊的操作は拒否します。そして
+**リポジトリのコードを実行しうるもの** (`cargo test` / `npm test` /
+`pytest` / `make` / `node` / `go test`) は、**人が承認するまで 1 行も
+走りません** — テスト本体・`build.rs`・`Makefile` はシェルにできることを
+何でもできるからです。**ファイルを書き換えるもの**も同じで、`black .` や
+`rustfmt src/lib.rs` は承認が要り、`black --check .` や
+`rustfmt --check src/lib.rs` は要りません — 決めるのは道具の名前ではなく
+旗です。実行体も Zaivern 自身が PATH から解決するので、ワークスペースの中に
+置かれた偽の `rustfmt` が本物の代わりに動くことはありません。**外なら安全、
+でもありません** — エージェントはあなたと同じ権限で動くので、`~/.local/bin`
+にも、Homebrew があなたの所有にした `/opt/homebrew` や `/usr/local` にも
+書けます。無承認で走るのは**昇格が要る場所** (`/usr/bin` `/bin` `/sbin`
+`C:\Windows` `C:\Program Files`) の実行体だけで、しかも実際に書き換えられると
+分かれば区分は下がります (上がることはありません)。前方の信用できない実行体を
+飛ばして後方の本物へ落ちることもなく、判定したものと実行するものの間に
+シェル (`sh -c` / `cmd /C`) を 1 段も挟みません。実行には時間切れがあり、停止すればプロセスツリーごと
+終了し、成功・失敗・時間切れ・停止・起動不可・接続断のどれかで必ず決着します。
+**承認が効くのは「その 1 回」だけ**で、コマンド名に対してではありません —
+別のタスク、レビュー指摘のあとのやり直し、差し戻し後の再試行では、
+検証されるコードが承認したときと別物なので、必ず聞き直します。
+承認したものの中身までは隔離しません — Zaivern が保証するのは**何を起動したか**
+であって、そのプロセスがその先で何をするかではありません。
+push / merge / deploy / 権限昇格 / 破壊的操作は自動実行せず、**画面上の
+あなたの判断**になります。
+
+Organization Board には、チームリード・専門チームのレーン・親子のエージェント・
+いま各自が何をしているか・Task Graph の進捗・テストとレビューの結果・
+そして**いま一番あなたの判断を待っているもの**が出ます。
+
+[AI チーム](docs/team.md)
+
 さらに、プラグインと 6 言語の UI も入っています。
 [プラグイン](docs/plugins.md) · [翻訳](docs/translating.md)
 
@@ -302,6 +377,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | リポジトリの形ごとに何が保証されるか |
 | [docs/idle-cost.md](docs/idle-cost.md) | アイドル CPU とバイナリサイズの測り方 |
 | [docs/plugins.md](docs/plugins.md) | プラグインの書き方と[形式の仕様](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: SPEC がどう Task Graph になるか、何が「完了」の関門か、何を自動実行しないか |
 | [docs/README.md](docs/README.md) | 残りの文書の索引（支えている主張ごとの並び） |
 
 [リリースノート](https://github.com/tacyan/zaivern-code/releases) ·

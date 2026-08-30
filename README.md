@@ -223,6 +223,87 @@ your files — it runs only when you call it.
 
 [Context Engine docs](docs/context-engine.md)
 
+### 9. AI team runs — hand over a SPEC, get a managed development team
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern reads the SPEC and — today, through a **deterministic `StaticPlanner`,
+not an LLM** — derives a Goal and a Definition of Done, builds a task graph and
+shows the plan, so the same SPEC always yields the same plan. Planning is a
+swappable boundary (`TeamPlanner`), and an LLM planner drops in behind the same
+validated `TeamPlan`:
+
+```text
+today:   SPEC → StaticPlanner (deterministic) → validated TeamPlan → task graph
+planned: SPEC → LLM TeamPlanner               → the same TeamPlan  → task graph
+```
+
+Once you press **Start Team**, Zaivern launches only the agents the plan
+actually needs, hands each one its task, and drives implement → validate →
+review → revise → integrate to completion.
+
+Nothing is marked complete because an agent said so. A task passes only through
+`Running → Validating → Reviewing → Completed`, and a completion report is
+rejected if the task id or agent id does not match, if it touched files outside
+its scope, if the validation commands were not run or failed, or if a blocker is
+still open. Reviews go to a **different session** than the one that wrote the
+code. The `validation` block an agent reports is kept as **reference only**:
+Zaivern runs the task's validation commands itself and advances to review only
+on its own measured results.
+
+Which commands run comes from the SPEC first. If its **Validation** section
+lists commands, Zaivern uses exactly those and adds nothing. If it lists none,
+Zaivern reads the repository — `Cargo.toml` → `cargo fmt --check` and
+`cargo test`; `go.mod` → `go test ./...`; `package.json` → only the scripts
+that actually exist (`test`, `lint`, `typecheck`, `check`), run through the
+package manager the lockfile names; pytest only when the project clearly uses
+it. If none of those markers is there, **Zaivern does not guess** — it asks you
+to name the commands in the SPEC rather than running someone else's `cargo
+test` against a Next.js repository. A validation command it cannot parse is
+never silently dropped either: `npm test && npm run lint` comes back as a
+shell-syntax error you can fix, kept distinct from `git push`, which is refused
+on policy no matter how it is written.
+
+Validation commands are **classified by risk**, not waved through by an
+allowlist. A path-qualified executable (`/tmp/cargo test`, `./cargo test`,
+`tools/python x.py`) is never run — matching on the basename alone would run
+whatever `/tmp/cargo` happens to be. `push`, `merge`, `deploy`, `publish`,
+privilege escalation and destructive commands are refused outright. And
+anything that can execute code from the repository — `cargo test`, `npm test`,
+`pytest`, `make`, `node`, `go test` — **waits for your approval before a single
+line runs**, because a test body, a `build.rs` or a `Makefile` can do anything
+a shell can. So does anything that would **write to your files**: `black .`
+and `rustfmt src/lib.rs` need approval, while `black --check .` and
+`rustfmt --check src/lib.rs` do not — the flag, not the tool's name, decides.
+Zaivern also resolves the executable itself instead of letting the OS search
+`PATH`, so a `rustfmt` planted inside the workspace can never stand in for the
+real one. Being outside the workspace is not enough either: an agent runs with
+your own privileges, so it can write to `~/.local/bin`, `~/bin` or
+`%LOCALAPPDATA%`. Only an executable in a place that takes elevation to write
+(`/usr/bin`, `/bin`, `/sbin`, `C:\Windows`, `C:\Program Files`) runs without an
+approval on file — anywhere else, even a read-only check waits for you. That
+excludes Homebrew: it makes `/opt/homebrew` (Apple Silicon) and `/usr/local`
+(Intel) yours to write, so an agent can rewrite `/opt/homebrew/bin/rustfmt`
+just as easily as `~/.local/bin/rustfmt`. And spelling alone never decides —
+if the file or its directory turns out to be writable by you, its trust is
+downgraded, never raised. Zaivern never falls back from an untrusted executable early in `PATH` to a
+trusted one later, and no shell (`sh -c`, `cmd /C`) is ever placed between what
+was checked and what runs. Every run has a timeout, is killed as a whole process tree when
+you stop the team, and always settles: passed, failed, timed out, cancelled,
+could not start, or runner disconnected. **An approval covers one validation
+run, not a command name**: a different task, a re-run after a rejected review,
+or a retry all ask again, because the code being tested is no longer the code
+you approved. Zaivern does not sandbox what you approve — it guarantees what
+gets started, not what that process then does.
+
+The Organization Board shows the team lead, the specialist lanes, every parent
+and child agent, what each is doing right now, the task graph's progress, test
+and review results, and the one thing that most needs your attention.
+
+[AI team docs](docs/team.md)
+
 Also included: plugins, and a UI available in six languages.
 [Plugin docs](docs/plugins.md) · [Translation docs](docs/translating.md)
 
@@ -309,6 +390,7 @@ Reproduce any of it: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Which guarantees hold for which repository shape |
 | [docs/idle-cost.md](docs/idle-cost.md) | How idle CPU and binary size are measured |
 | [docs/plugins.md](docs/plugins.md) | Writing plugins, with the [format specification](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: how a SPEC becomes a task graph, what gates "complete", and what is never run automatically |
 | [docs/README.md](docs/README.md) | Index of every other document, grouped by the claim it backs |
 
 [Release notes](https://github.com/tacyan/zaivern-code/releases) ·

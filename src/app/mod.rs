@@ -124,6 +124,7 @@ pub(crate) const SRC_IMPL: &str = concat!(
     include_str!("whichkey_voice.rs"),
     include_str!("remote_api.rs"),
     include_str!("orchestrate.rs"),
+    include_str!("team_glue.rs"),
     include_str!("frame_update.rs"),
     include_str!("helpers.rs"),
     include_str!("workbench.rs"),
@@ -166,6 +167,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("whichkey_voice.rs"),
     include_str!("remote_api.rs"),
     include_str!("orchestrate.rs"),
+    include_str!("team_glue.rs"),
     include_str!("frame_update.rs"),
     include_str!("unread_cursor_tests.rs"),
     include_str!("cost_limit_wiring_tests.rs"),
@@ -4287,6 +4289,9 @@ mod remote_api;
 mod save_files;
 mod shortcuts;
 mod sidebar_ui;
+// 🏛 AI 開発チーム制御面 (実体は src/team/、登録は src/features/team.rs)。
+// ここに置くのは既存の起動・送信・停止・端末選択へ繋ぐ橋だけ。
+mod team_glue;
 mod top_bar_ui;
 mod whichkey_voice;
 

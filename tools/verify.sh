@@ -89,6 +89,25 @@ cargo fmt --all --check
 # **もう一度フルコンパイルが走る**から。push の直前だけ払う。
 if [ "$LINT" = 1 ]; then
   step "clippy (CI と同じ債務リスト)"
+  # ## 手元の版を必ず出す — **緑が誰の緑かを言えるようにする**
+  #
+  # CI は `dtolnay/rust-toolchain` の **stable** を引くので、手元が古いと
+  # 「新しい lint がまだ無い」だけで緑になる。実測: rustc 1.94 で
+  # `tools/verify.sh --lint` が緑だったコミットが、CI (1.98) では
+  # `float_literal_f32_fallback` 4 件と `unnecessary_min_or_max` 1 件で赤に
+  # なった。**版を出していれば「手元が古い」と気付けた**ので、判定と一緒に
+  # 必ず 1 行出す。
+  #
+  # 版そのものを検査にはしない (どの版が CI に居るかは、ここからは
+  # 見えない)。`rustup check` が使えるときだけ、更新があることを添える。
+  printf '  %s\n' "$(cargo clippy --version 2>/dev/null || echo 'clippy 版不明')"
+  if command -v rustup >/dev/null 2>&1; then
+    STALE=$(rustup check 2>/dev/null | grep -E '^stable-.*Update available' || true)
+    if [ -n "$STALE" ]; then
+      printf '\033[1;33m  ! stable に更新があります。CI は最新の stable を引くので、\n'
+      printf '    手元だけ緑になることがあります (rustup update stable)\033[0m\n'
+    fi
+  fi
   # 債務リストは **ワークフローが唯一の出所**。ここへ写経すると必ずずれる。
   DEBT=$(sed -n '/DEBT=(/,/^ *)/p' .github/workflows/test.yml \
          | grep -oE -- '-A clippy::[a-z_]+' | tr '\n' ' ')

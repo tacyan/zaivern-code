@@ -199,6 +199,70 @@ MCP 环境变量的值一次也不会显示。
 不离开 Zaivern Code 就能审阅代码和智能体的改动，包括 Markdown、图片、PDF 和 CSV。
 未保存的缓冲区在崩溃后会被恢复。
 
+### 8. AI 团队运行 —— 交出一份 SPEC，得到一支受管理的开发团队
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern 读取 SPEC，**目前由确定性的 `StaticPlanner`（不是 LLM）**推导出 Goal
+与 Definition of Done，构建任务图并展示计划——同一份 SPEC 永远得到同一个计划。
+规划本身是可替换的边界（`TeamPlanner`），LLM 规划器将来会以相同的、经过校验的
+`TeamPlan` 接入：
+
+```text
+现在: SPEC → StaticPlanner（确定性） → 校验过的 TeamPlan → 任务图
+将来: SPEC → LLM TeamPlanner         → 同一个 TeamPlan   → 任务图
+```
+
+按下 **Start Team** 后，它只启动计划真正需要的智能体，把任务分派下去，并推动
+实现 → 验证 → 评审 → 修改 → 集成直到完成。
+
+**不会因为智能体说“完成了”就算完成。** 任务只能沿着
+`Running → Validating → Reviewing → Completed` 前进；若任务 ID 或智能体 ID
+与分配不符、改动了负责范围之外的文件、没有运行或未通过验证命令、仍有未解决的
+blocker，完成报告都会被拒绝。评审由**与写代码不同的会话**负责。
+智能体报告的 `validation` 只作为**参考信息**保留：验证命令由 Zaivern 自己
+执行，只有它自己实测通过后才会进入评审。
+
+运行哪些命令首先由 SPEC 决定。如果「验证」一节列出了命令，Zaivern 就**只**用
+这些，不会额外添加。如果没有列出，Zaivern 会读取仓库 — 有 `Cargo.toml` 就用
+`cargo fmt --check` 和 `cargo test`；有 `go.mod` 就用 `go test ./...`；有
+`package.json` 就只用**确实存在的** script（`test` / `lint` / `typecheck` /
+`check`），并按 lockfile 指明的包管理器运行；只有在确实使用 pytest 时才用
+pytest。如果这些标记一个都没有，**Zaivern 不会猜** — 它会请你在 SPEC 里写明
+命令，而不是在 Next.js 仓库里跑 `cargo test`。无法解析的验证命令同样不会被
+悄悄丢弃：`npm test && npm run lint` 会作为可修复的 shell 语法错误返回，与
+无论怎么写都会被拒绝的 `git push` 区分开。
+
+验证命令不会因为在允许列表里就被放行，而是**按风险分级**。带路径的可执行文件
+(`/tmp/cargo test`、`./cargo test`、`tools/python x.py`) 一律不执行——只看
+basename 就会真的去跑 `/tmp/cargo`。push、merge、deploy、publish、权限提升和
+破坏性操作直接拒绝。而**可能执行仓库内代码的命令** (`cargo test`、`npm test`、
+`pytest`、`make`、`node`、`go test`) **在你批准之前一行都不会运行**——测试本体、
+`build.rs`、`Makefile` 能做的事和 shell 一样多。**会写文件的命令**同理：
+`black .` 和 `rustfmt src/lib.rs` 需要批准，而 `black --check .` 和
+`rustfmt --check src/lib.rs` 不需要——决定的是参数而不是工具名。可执行文件
+也由 Zaivern 自己从 PATH 解析，所以放在工作区里的假 `rustfmt` 不会顶替真的。
+**在工作区之外也不等于安全**：智能体以你的权限运行，既能写 `~/.local/bin`，
+也能写 Homebrew 归你所有的 `/opt/homebrew` 与 `/usr/local`。只有位于需要提权
+才能写入的位置（`/usr/bin`、`/bin`、`/sbin`、`C:\Windows`、`C:\Program Files`）
+的可执行文件才会免审批运行，而且一旦实测发现可被你改写，等级只会下调、不会上调。
+Zaivern 也不会跳过 `PATH` 前面不可信的可执行文件去用后面的那个，
+并且在"检查过的东西"和"实际运行的东西"之间不会插入任何 shell。每次执行都有超时，停止团队时会
+连同整个进程树一起结束，并且一定有结果：通过、失败、超时、已停止、无法启动或
+执行器断开。**一次批准只覆盖一次验证运行，而不是一个命令名**：换一个任务、
+评审要求修改后的重跑、打回后的重试，都会重新询问，因为被测试的代码已经不是
+你批准时的那份了。Zaivern 不会沙箱化你批准的东西——它保证的是**启动了什么**，
+而不是那个进程之后做了什么。
+push、merge、deploy、权限提升和破坏性命令永不自动执行——它们会变成屏幕上
+等待你决定的事项。
+
+组织看板会显示团队负责人、各专业小组的泳道、每个父/子智能体、他们此刻正在做
+什么、任务图的进度、测试与评审结果，以及**最需要你关注的那一件事**。
+
+[AI 团队文档](docs/team.md)
+
 另外还包含：插件，以及六种语言的界面。
 [插件文档](docs/plugins.md) · [翻译文档](docs/translating.md)
 
@@ -279,6 +343,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | 哪种仓库形态保证哪些性质 |
 | [docs/idle-cost.md](docs/idle-cost.md) | 空闲 CPU 与二进制体积的测量方法 |
 | [docs/plugins.md](docs/plugins.md) | 编写插件，以及[格式规范](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`：SPEC 如何变成任务图、什么才算“完成”、哪些操作永不自动执行 |
 | [docs/README.md](docs/README.md) | 其余全部文档的索引，按其支撑的主张分组 |
 
 [发布说明](https://github.com/tacyan/zaivern-code/releases) ·

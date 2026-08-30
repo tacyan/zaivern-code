@@ -209,6 +209,88 @@ Use o mesmo Wi-Fi, o [Tailscale](https://tailscale.com/) ou um túnel SSH.
 Revise código e mudanças dos agentes sem sair do Zaivern Code, incluindo Markdown,
 imagens, PDFs e CSVs. Buffers não salvos são recuperados depois de um crash.
 
+### 8. Execuções de equipe de IA — entregue um SPEC e receba uma equipe gerenciada
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+O Zaivern lê o SPEC e — hoje, por meio de um **`StaticPlanner` determinístico,
+não de um LLM** — deriva um Goal e uma Definition of Done, monta um grafo de
+tarefas e mostra o plano; o mesmo SPEC sempre produz o mesmo plano. O
+planejamento é uma fronteira substituível (`TeamPlanner`), e um planejador com
+LLM entra depois atrás do mesmo `TeamPlan` validado:
+
+```text
+hoje:    SPEC → StaticPlanner (determinístico) → TeamPlan validado → grafo
+futuro:  SPEC → LLM TeamPlanner                → o mesmo TeamPlan  → grafo
+```
+
+Ao pressionar **Start Team**, ele inicia apenas os agentes de que o plano
+realmente precisa, entrega a cada um a sua tarefa e conduz implementar →
+validar → revisar → corrigir → integrar até o fim.
+
+**Nada é dado como concluído só porque um agente disse que está.** Uma tarefa
+avança apenas por `Running → Validating → Reviewing → Completed`, e um relatório
+de conclusão é rejeitado se o id da tarefa ou do agente não bater, se arquivos
+fora do escopo foram tocados, se os comandos de validação não foram executados
+ou falharam, ou se ainda há um blocker aberto. As revisões vão para uma
+**sessão diferente** daquela que escreveu o código. O bloco `validation`
+relatado pelo agente fica apenas como **informação de referência**: o próprio
+Zaivern executa os comandos de validação e só avança para a revisão com os
+resultados que ele mesmo mediu.
+
+Quais comandos rodam vem primeiro do SPEC. Se a seção **Validação** lista
+comandos, o Zaivern usa exatamente esses e não acrescenta nada. Se não lista
+nenhum, o Zaivern lê o repositório — `Cargo.toml` → `cargo fmt --check` e
+`cargo test`; `go.mod` → `go test ./...`; `package.json` → apenas os scripts
+que realmente existem (`test`, `lint`, `typecheck`, `check`), pelo gerenciador
+de pacotes que o lockfile indica; pytest só quando o projeto claramente o usa.
+Se nenhum desses marcadores está lá, **o Zaivern não adivinha** — ele pede que
+você nomeie os comandos no SPEC em vez de rodar `cargo test` em um repositório
+Next.js. Um comando de validação que ele não consegue interpretar também nunca
+é descartado em silêncio: `npm test && npm run lint` volta como um erro de
+sintaxe de shell que você pode corrigir, mantido distinto de `git push`, que é
+recusado por política não importa como seja escrito.
+
+Os comandos de validação são **classificados por risco**, não liberados por uma
+allowlist. Um executável com caminho (`/tmp/cargo test`, `./cargo test`,
+`tools/python x.py`) nunca é executado — olhar só o basename executaria o que
+quer que `/tmp/cargo` seja. push, merge, deploy, publish, elevação de privilégio
+e comandos destrutivos são recusados. E tudo que pode executar código do
+repositório (`cargo test`, `npm test`, `pytest`, `make`, `node`, `go test`)
+**espera a sua aprovação antes de rodar uma única linha** — um corpo de teste,
+um `build.rs` ou um `Makefile` fazem tudo o que um shell faz. O mesmo vale para
+o que **escreve nos seus arquivos**: `black .` e `rustfmt src/lib.rs` pedem
+aprovação, `black --check .` e `rustfmt --check src/lib.rs` não — quem decide é
+a flag, não o nome da ferramenta. O executável também é resolvido pelo próprio
+Zaivern em vez de deixar o SO procurar no `PATH` — e estar fora do workspace
+não basta: o agente roda com os seus privilégios, então pode escrever em
+`~/.local/bin` e também em `/opt/homebrew` e `/usr/local`, que o Homebrew
+deixa sob sua propriedade. Só um executável em um lugar que exige elevação
+(`/usr/bin`, `/bin`, `/sbin`, `C:\Windows`, `C:\Program Files`) roda sem
+aprovação, e se na prática ele for gravável por você, a classificação só cai,
+nunca sobe. Assim, um `rustfmt` plantado
+dentro do workspace nunca substitui o real, e nenhum shell fica entre o que foi
+verificado e o que roda. Toda execução tem
+timeout, é encerrada com a árvore de processos inteira quando você para a
+equipe, e sempre termina em um resultado: passou, falhou, estourou o tempo, foi
+cancelada, não pôde iniciar ou perdeu conexão com o executor. **Uma aprovação
+vale para uma execução de validação, não para um nome de comando**: outra
+tarefa, uma nova rodada depois de uma revisão que pediu mudanças, ou uma
+retentativa perguntam de novo, porque o código testado já não é o que você
+aprovou. O Zaivern não isola o que você aprova — ele garante **o que foi
+iniciado**, não o que aquele processo faz depois. `push`, `merge`, `deploy`,
+elevação de privilégio e comandos destrutivos nunca são executados
+automaticamente — viram uma decisão sua, na tela.
+
+O Organization Board mostra o líder da equipe, as raias de cada especialidade,
+todos os agentes pais e filhos, o que cada um está fazendo agora, o progresso do
+grafo de tarefas, os resultados de testes e revisões e **o que mais precisa da
+sua atenção**.
+
+[Docs da equipe de IA](docs/team.md)
+
 Também inclui: plugins e uma interface em seis idiomas.
 [Docs de plugins](docs/plugins.md) · [Docs de tradução](docs/translating.md)
 
@@ -293,6 +375,7 @@ Reproduza qualquer um deles: `tools/conflict-bench.sh`, `tools/coedit-bench.sh`,
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | Quais garantias valem para qual formato de repositório |
 | [docs/idle-cost.md](docs/idle-cost.md) | Como CPU em repouso e tamanho do binário são medidos |
 | [docs/plugins.md](docs/plugins.md) | Como escrever plugins, com a [especificação do formato](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: como um SPEC vira um grafo de tarefas, o que libera o "concluído" e o que nunca é executado automaticamente |
 | [docs/README.md](docs/README.md) | Índice de todos os outros documentos, agrupados pela afirmação que sustentam |
 
 [Notas de release](https://github.com/tacyan/zaivern-code/releases) ·

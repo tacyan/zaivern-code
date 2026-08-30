@@ -9,6 +9,12 @@ impl ZaivernApp {
         open_files: Vec<PathBuf>,
     ) -> Self {
         install_fonts(&cc.egui_ctx);
+        // 🏛 Team の状態は `thread_local!` に居るので**アプリより長生きする**。
+        // 前のアプリが `on_exit` を通らずに消えていると、生き残った Runtime を
+        // この新しいアプリがそのまま拾ってしまう (もう自分のものではない
+        // セッションへ結び付いた Run を操作できる)。暗黙の引き継ぎはここで
+        // 断つ — 保存してから手放すので、続きは復元の案内から入り直せる。
+        crate::features::team::imp::panel::begin_app_context();
         // 空で渡されても決して空のままにしない (roots[0] が常に存在する不変条件)
         let roots = if roots.is_empty() {
             vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]

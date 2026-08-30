@@ -94,6 +94,16 @@ impl eframe::App for ZaivernApp {
         // 握っているファイル所有を返す。返し損ねても TTL で回収されるが、
         // 返せば次の担当がすぐ入れる (待たせる時間がそのまま損害になる)。
         crate::lease::release_all();
+        // Team が走らせている検証を**その場で**落とす。子は自分のプロセス
+        // グループを持っている (孫まで届かせるため) ので、親が終わっても
+        // 死なない — 閉じたのに `cargo test` が走り続ける、を防ぐ。
+        // 札を立てるだけでは足りない: 札を見る worker ごと消えるため。
+        // 状態は `thread_local!` に居てアプリより長生きするので、保存して
+        // から手放す (次回は保存経路から入り直す — そこで死んだセッションの
+        // 結び付きが必ず外れる)。
+        crate::features::team::imp::panel::with_panel(|p| {
+            p.shutdown();
+        });
         for s in std::mem::take(&mut self.agents.sessions) {
             crate::terminal::abandon(s);
         }

@@ -202,6 +202,80 @@ Zaivern Code가 보는 것은 픽셀이 아니라 의미적 진행입니다. 더
 Zaivern Code를 벗어나지 않고 코드와 에이전트의 변경을 검토합니다. Markdown, 이미지,
 PDF, CSV까지. 저장하지 않은 버퍼는 크래시 후에 복구됩니다.
 
+### 8. AI 팀 실행 — SPEC 만 건네면 관리되는 개발 팀이 움직입니다
+
+```sh
+zai team run SPEC.md --agents 4
+```
+
+Zaivern 이 SPEC 을 읽고, **지금은 LLM 이 아니라 결정적인 `StaticPlanner`** 가
+Goal 과 Definition of Done 을 세우고 태스크 그래프를 만들어 계획을 보여 줍니다.
+같은 SPEC 이면 언제나 같은 계획이 나옵니다. 플래너는 갈아 끼울 수 있는
+경계(`TeamPlanner`)이며, LLM 플래너는 같은 검증된 `TeamPlan` 뒤로 들어옵니다:
+
+```text
+지금:   SPEC → StaticPlanner (결정적) → 검증된 TeamPlan → 태스크 그래프
+앞으로: SPEC → LLM TeamPlanner        → 같은 TeamPlan   → 태스크 그래프
+```
+
+**Start Team** 을 누르면 계획에 필요한 만큼만 에이전트를 띄우고 담당을 나눈 뒤,
+구현 → 검증 → 리뷰 → 수정 → 통합까지 끌고 갑니다.
+
+**에이전트가 "끝났다"고 말했다고 완료가 되지는 않습니다.** 태스크는
+`Running → Validating → Reviewing → Completed` 순서로만 진행되며, 태스크 ID 나
+에이전트 ID 가 담당과 다르거나, 담당 범위 밖 파일을 건드렸거나, 검증 명령을
+실행하지 않았거나 실패했거나, 남은 blocker 가 있으면 완료 보고는 거부됩니다.
+리뷰는 **코드를 쓴 세션과 다른 세션**이 맡습니다.
+에이전트가 보고한 `validation` 은 **참고 정보로만** 남기고, 검증 명령은
+Zaivern 이 직접 실행합니다. 리뷰로 넘어가는 것은 **직접 측정한 결과가
+통과했을 때뿐**입니다.
+
+어떤 명령을 실행할지는 먼저 SPEC이 정합니다. 「검증」 절에 명령이 적혀 있으면
+Zaivern은 **그것만** 쓰고 아무것도 더하지 않습니다. 적혀 있지 않으면 저장소를
+읽습니다 — `Cargo.toml`이면 `cargo fmt --check`와 `cargo test`, `go.mod`이면
+`go test ./...`, `package.json`이면 **실제로 있는** script(`test` / `lint` /
+`typecheck` / `check`)만 lockfile이 가리키는 패키지 매니저로, pytest는 그것을
+쓴다고 단정할 수 있을 때만. 이 표시가 하나도 없으면 **Zaivern은 추측하지
+않습니다** — Next.js 저장소에서 `cargo test`를 돌리는 대신, SPEC에 명령을
+적어 달라고 요청합니다. 해석할 수 없는 검증 명령도 조용히 버리지 않습니다.
+`npm test && npm run lint`는 고칠 수 있는 셸 문법 오류로 돌아오며, 어떻게
+써도 거부되는 `git push`와는 다른 종류로 구분됩니다.
+
+검증 명령은 허용 목록으로 그냥 통과시키지 않고 **위험도로 나눕니다**. 경로가
+붙은 실행 파일 (`/tmp/cargo test`, `./cargo test`, `tools/python x.py`) 은
+실행하지 않습니다 — basename 만 보면 실제로 `/tmp/cargo` 가 실행되기
+때문입니다. push, merge, deploy, publish, 권한 상승, 파괴적 조작은 거부합니다.
+그리고 **저장소 안의 코드를 실행할 수 있는 것** (`cargo test`, `npm test`,
+`pytest`, `make`, `node`, `go test`) 은 **사람이 승인하기 전까지 한 줄도
+실행되지 않습니다** — 테스트 본문, `build.rs`, `Makefile` 은 셸이 할 수 있는
+일을 모두 할 수 있습니다. **파일을 고치는 것**도 마찬가지로, `black .` 과
+`rustfmt src/lib.rs` 는 승인이 필요하고 `black --check .` 과
+`rustfmt --check src/lib.rs` 는 필요 없습니다 — 결정하는 것은 도구 이름이
+아니라 플래그입니다. 실행 파일도 Zaivern 이 직접 PATH 에서 찾습니다.
+**워크스페이스 밖이라고 안전한 것도 아닙니다** — 에이전트는 여러분과 같은
+권한으로 돌아가므로 `~/.local/bin` 은 물론, Homebrew 가 여러분 소유로 만든
+`/opt/homebrew` 와 `/usr/local` 에도 쓸 수 있습니다. 승인 없이 실행되는 것은
+권한 상승이 필요한 위치(`/usr/bin` `/bin` `/sbin` `C:\Windows`
+`C:\Program Files`)의 실행 파일뿐이고, 실제로 쓰기 가능하다고 밝혀지면 등급은
+내려가기만 합니다. `PATH` 앞쪽의 믿을 수 없는 실행 파일을 건너뛰고 뒤쪽의
+진짜를 쓰지도 않으며,
+워크스페이스 안에 놓인 가짜 `rustfmt` 가 진짜를 대신할 수 없고, 검사한
+것과 실행되는 것 사이에 셸을 한 단계도 두지 않습니다. 실행에는 시간 제한이 있고, 팀을 멈추면 프로세스
+트리째 종료되며, 성공·실패·시간 초과·중지·실행 불가·실행기 연결 끊김 중
+하나로 반드시 끝납니다. 승인한 것의 내부까지 격리하지는 않습니다 — Zaivern 이
+보장하는 것은 **무엇을 실행했는가**이지, 그 프로세스가 그 뒤에 무엇을 하는지가
+아닙니다. **승인은 그 한 번의 검증에만 적용되며, 명령 이름에 적용되지
+않습니다**: 다른 태스크, 리뷰 지적 후의 재검증, 되돌린 뒤의 재시도는 모두 다시
+묻습니다 — 검증되는 코드가 승인했을 때와 다른 것이기 때문입니다. push · merge · deploy ·
+권한 상승 · 파괴적 명령은 절대 자동으로 실행하지 않고, 화면 위에서 당신이
+판단할 항목이 됩니다.
+
+Organization Board 에는 팀 리드, 전문 팀 레인, 모든 부모/자식 에이전트, 각자가
+지금 무엇을 하고 있는지, 태스크 그래프의 진척, 테스트와 리뷰 결과, 그리고
+**지금 가장 당신의 판단을 기다리는 것**이 나옵니다.
+
+[AI 팀 문서](docs/team.md)
+
 이 밖에 플러그인과 6개 언어 UI도 들어 있습니다.
 [플러그인 문서](docs/plugins.md) · [번역 문서](docs/translating.md)
 
@@ -284,6 +358,7 @@ Claude Code · Codex · Gemini CLI · Cursor Agent · GitHub Copilot CLI ·
 | [docs/czero-repo-shapes.md](docs/czero-repo-shapes.md) | 어떤 저장소 형태에서 무엇이 보장되는가 |
 | [docs/idle-cost.md](docs/idle-cost.md) | 유휴 CPU와 바이너리 크기를 측정하는 방법 |
 | [docs/plugins.md](docs/plugins.md) | 플러그인 작성법과 [형식 명세](docs/PLUGIN_SPEC.md) |
+| [docs/team.md](docs/team.md) | `zai team`: SPEC 이 어떻게 태스크 그래프가 되는지, 무엇이 "완료"의 관문인지, 무엇을 자동 실행하지 않는지 |
 | [docs/README.md](docs/README.md) | 나머지 모든 문서의 색인, 뒷받침하는 주장별로 정리 |
 
 [릴리스 노트](https://github.com/tacyan/zaivern-code/releases) ·

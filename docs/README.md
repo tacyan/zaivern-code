@@ -27,6 +27,7 @@
 
 | 文書 | 何を保証するか |
 |---|---|
+| [team.md](team.md) | **AI 開発チーム制御面 (`zai team`)。** SPEC がどう Task Graph になるか、何が「完了」の関門か、何を自動実行しないか、CLI と GUI が同じ Runtime を通ること |
 | [context-engine.md](context-engine.md) | **AI へ渡す前の情報量最適化。** 4 つの畳み方、ワークスペース境界の強制、メトリクスの有界性、token-slim-mcp との削減率比較 |
 | [workspace-key.md](workspace-key.md) | `~/.zaivern` の置き場を決める 16 桁の導出規則と、旧キーの引き取り |
 | [licensing.md](licensing.md) | 完全オフラインのライセンス認証。**失効できない**ことを含む |
