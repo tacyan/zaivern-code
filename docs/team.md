@@ -312,17 +312,33 @@ Organization Board は Architect / Implementer / Reviewer / QA / Integrator
 * 読むだけだと言い切れる形は表で持つ (`read_only_mode`)。`ruff` は
   サブコマンドまで見る (`check` は読むだけ / `format` は `--check` が要る)。
   **どちらとも言い切れないものは書き換える側へ倒す**
+* **危険な旗を数え上げる (deny) 形では守れない。** 実際に 4 通り抜けた:
+  `rustfmt --check --print-config default out.toml` (整形モードより手前で
+  処理されるので `--check` で止まらず、指定パスへ書く) /
+  `black --extend-exclude --check .` (Click が次の語を値として食うので
+  `--check` は旗ではない) / `ruff check --fix-only .` と `--add-noqa .`
+  (`--fix` とは綴りが違う) / `shellcheck -x a.sh` (`# shellcheck source=…`
+  を辿ってディスクのどこでも読む)。
+  数える側を逆にして、道具ごとに**知っている旗の集合**を持つ —
+  そこに無い旗が 1 つでもあれば「読むだけ」とは言わない。
+  値を食う旗も表に持ち、`flags_in_flag_position` が食われた語を旗と
+  読まない
 * 迷ったら `ReadOnly` に入れない — 設定ファイルから任意のコードを読み込む
   もの (`eslint` / `prettier` の JS 設定、`mypy` / `pylint` のプラグイン) は
   「検査するだけ」に見えても実行しうる
+* `ReadOnly` が守るのは「**人のファイルを書き換えない**」。道具が自分の
+  キャッシュ (`ruff check` の `.ruff_cache/` など) を作るのは止めない —
+  止めるには `--no-cache` を強制するしかなく、それは人が書いたコマンドを
+  勝手に変えることになる
 
 ### 判定した実体と、OS が起こす実体を一致させる
 
 ```
 Planner → ValidationCommand{executable, args}
+        → 危険度の判定 (名前と引数を見る: graph::classify)
+        → 承認ゲート (runtime::advance)
+        → 実行器で危険度と承認を**もう一度**確かめる (launch)
         → 実体の解決 (PATH を自分で引く)
-        → 危険度の判定
-        → 承認ゲート
         → その実体 + argv + cwd で起動
 ```
 
@@ -338,12 +354,26 @@ Planner → ValidationCommand{executable, args}
   (空は「カレント」を意味する)。見つけた時点で断る — 後ろの本物へ
   黙って落ちると、OS が実行するのは前の偽物なのに判定は後ろのものに
   なる
+* **見るのは置き場所だけではない。解決した実体そのものも見る。**
+  `~/.local/bin` のような普通の PATH 要素から workspace の中へ
+  シンボリックリンクを 1 本張れば、エージェントが書いたコードが
+  「読むだけの検証」として動く (`std::fs::metadata` はリンクを辿るので、
+  「そこにファイルがある」は判定にならない)
+* **承認ゲートは実行の直前にもある。** `ValidationSpec.approved` が承認の
+  証跡を実行器まで運び、`ReadOnly` 以外はそこに載っているものだけ走る。
+  ゲートが 1 か所にしか無い状態は、そこを迂回されたときに何も残らない
 * **シェルは 1 段も挟まない。** `sh -c` も `cmd /C` も使わない。
   Windows の `.cmd` / `.bat` は `PATHEXT` で実体を解決し、そのパスを
-  std へ渡す (バッチの引数の逃がし方は std が持っている)
-* `SHELL_METACHARS` には **Windows の cmd.exe が特別扱いする字**も入れる
-  (`% ! ^ ( ) " '`)。`%VAR%` の展開で、判定した文字列と cmd.exe が
-  解釈する文字列が別物になる経路を最初から塞ぐ
+  std へ渡す (バッチの引数の逃がし方は std が持っている)。
+  **`PATHEXT` は素の名前より先に当てる** — 逆にすると、npm / yarn /
+  pnpm のように「拡張子なしの sh スクリプト」と `.cmd` が同じ場所に
+  並ぶ道具で、CreateProcess が起こせない側を選ぶ
+* `SHELL_METACHARS` に入れるのは **std が安全に逃がせない字だけ**
+  (`% !` と改行、それに unix の `; | & > < ` $`)。
+  `^ ( )` は入れない — std のバッチ用の逃がし方が面倒を見るうえ、
+  `pytest -k "not (slow or db)"` のような当たり前の SPEC が
+  `Forbidden` → `NeedsUser` で行き止まる。**fail-closed でも
+  「誰も直せない止まり方」は守りにならない**
 
 ### 承認は「その 1 回」にしか効かない
 

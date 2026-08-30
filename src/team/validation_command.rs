@@ -190,19 +190,6 @@ impl ValidationCommand {
         s
     }
 
-    /// 引数のどこかに指定の旗が**現れる**か (`--check` / `--check=x`)。
-    ///
-    /// **位置を見ない。** 値として食われた語も数えるので、
-    /// 「これがあったら危ない」(fail-closed) の判定にだけ使う。
-    /// 「これがあったら安全」の判定に使ってはいけない — 使うと
-    /// `black --extend-exclude --check .` の `--check` を旗と読み、
-    /// **workspace を丸ごと書き換えるコマンドを「読むだけ」にする**。
-    pub fn has_flag_anywhere(&self, flag: &str) -> bool {
-        self.args
-            .iter()
-            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
-    }
-
     /// **旗の位置にある語**だけを並べる (`--check=x` は `--check` として)。
     ///
     /// `takes_value` に載る旗は**次の語を値として食う**ので、食われた語は
@@ -511,10 +498,8 @@ mod tests {
     fn 旗とサブコマンドを読む() {
         let c = ValidationCommand::parse("ruff check --fix .").unwrap();
         assert_eq!(c.first_positional(&[]), Some("check"));
-        assert!(c.has_flag_anywhere("--fix"));
-        assert!(!c.has_flag_anywhere("--check"));
+        assert_eq!(c.flags_in_flag_position(&[]), vec!["--fix"]);
         let d = ValidationCommand::parse("black --check=x .").unwrap();
-        assert!(d.has_flag_anywhere("--check"));
         assert_eq!(d.flags_in_flag_position(&[]), vec!["--check"]);
     }
 
@@ -525,7 +510,7 @@ mod tests {
         // `--check` は旗ではなく値になり、black は書き換えモードで動く。
         let c = ValidationCommand::parse("black --extend-exclude --check .").unwrap();
         assert!(
-            c.has_flag_anywhere("--check"),
+            c.args.iter().any(|a| a == "--check"),
             "位置を見ない照合では見つかる (だから危ない)"
         );
         assert_eq!(
