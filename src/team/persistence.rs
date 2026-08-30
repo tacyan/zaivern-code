@@ -149,7 +149,7 @@ fn default_validation_timeout() -> u64 {
 }
 
 /// 実行そのものの記録。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunDoc {
     pub version: u32,
     /// 実行 ID。**同じ Run を二重に開始しない**ための鍵。
@@ -189,6 +189,13 @@ pub struct RunDoc {
     /// 検証 1 本あたりの時間切れ (秒)。テストは短い値を注入する。
     #[serde(default = "default_validation_timeout")]
     pub validation_timeout_secs: u64,
+    /// **この Run にだけ効く安全側の設定** ([`super::model::RunGuardrails`])。
+    ///
+    /// 既存のグローバル設定は 1 バイトも書き換えない。ここに持つのは
+    /// 「この Run では、それに加えてどこまで締めるか」だけ。
+    /// `serde(default)` なので、この欄が無い旧 Run もそのまま読める。
+    #[serde(default)]
+    pub guardrails: super::model::RunGuardrails,
     /// 版 1 の「処理済み Effect」。読むためだけに残す
     /// ([`RunDoc::migrate`] が `effects` へ移す)。**新しく書かない。**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -220,7 +227,7 @@ impl RunDoc {
 }
 
 /// 保存する状態のまとまり。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Saved {
     pub run: RunDoc,
     pub goal: TeamGoal,
@@ -232,7 +239,7 @@ pub struct Saved {
 }
 
 /// 読み込みの結末。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LoadOutcome {
     /// 何も保存されていない。
     Empty,
@@ -378,7 +385,7 @@ pub enum SavePhase {
 /// 現れる)。
 ///
 /// **1 回の rename で全部が切り替わる**なら、その隙間は存在しない。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StateDoc {
     pub version: u32,
     /// 保存のたびに 1 つ進む。**どちらが新しいか**を mtime に頼らずに言う。
@@ -875,6 +882,7 @@ mod tests {
                 updated_at: 100,
                 validation_approvals: Vec::new(),
                 validation_timeout_secs: default_validation_timeout(),
+                guardrails: Default::default(),
                 effects: vec![EffectRecord {
                     key: "start:1".into(),
                     state: EffectState::Completed,

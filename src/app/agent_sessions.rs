@@ -287,6 +287,25 @@ impl ZaivernApp {
         cwd: &Path,
         ctx: &egui::Context,
     ) {
+        // 既定は**いまの設定**の承認モード。
+        let approval = crate::agents::Approval::from_mode(&self.cfg.approval_mode);
+        self.launch_preset_as(i, command, cwd, approval, ctx);
+    }
+
+    /// **承認モードを明示して**起こす。
+    ///
+    /// Team の Run は「この Run にだけ効く締め具合」を持つ (既存のグローバル
+    /// 設定は書き換えない)。その値をここへ渡す — 設定を書き換えてから
+    /// 起こす形にすると、Run を 1 本作る操作で Zaivern 全体の承認モードが
+    /// 変わってしまう。
+    pub(super) fn launch_preset_as(
+        &mut self,
+        i: usize,
+        command: String,
+        cwd: &Path,
+        approval: crate::agents::Approval,
+        ctx: &egui::Context,
+    ) {
         use crate::agents::{
             apply_approval, command_is_bypass, env_enables_auto, merged_env, spec_for_command,
             Approval,
@@ -297,7 +316,6 @@ impl ZaivernApp {
         // 再開・フォルダ指定はコマンドと cwd だけ差し替える (名前・アイコン・env は据え置き)
         p.command = command;
         p.cwd = Some(cwd.display().to_string());
-        let approval = Approval::from_mode(&self.cfg.approval_mode);
         // 実際に起動されるコマンドで bypass かどうかを判定する
         // (Agent優先モードではプリセットのフラグがそのまま効く)
         //

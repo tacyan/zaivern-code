@@ -269,9 +269,13 @@ Zaivern also resolves the executable itself instead of letting the OS search
 real one. Being outside the workspace is not enough either: an agent runs with
 your own privileges, so it can write to `~/.local/bin`, `~/bin` or
 `%LOCALAPPDATA%`. Only an executable in a place that takes elevation to write
-(`/usr`, `/bin`, `/opt/homebrew`, `C:\Windows`, `C:\Program Files`) runs
-without an approval on file — anywhere else, even a read-only check waits for
-you. Zaivern never falls back from an untrusted executable early in `PATH` to a
+(`/usr/bin`, `/bin`, `/sbin`, `C:\Windows`, `C:\Program Files`) runs without an
+approval on file — anywhere else, even a read-only check waits for you. That
+excludes Homebrew: it makes `/opt/homebrew` (Apple Silicon) and `/usr/local`
+(Intel) yours to write, so an agent can rewrite `/opt/homebrew/bin/rustfmt`
+just as easily as `~/.local/bin/rustfmt`. And spelling alone never decides —
+if the file or its directory turns out to be writable by you, its trust is
+downgraded, never raised. Zaivern never falls back from an untrusted executable early in `PATH` to a
 trusted one later, and no shell (`sh -c`, `cmd /C`) is ever placed between what
 was checked and what runs. Every run has a timeout, is killed as a whole process tree when
 you stop the team, and always settles: passed, failed, timed out, cancelled,

@@ -252,7 +252,13 @@ mismo que un shell. Lo mismo con lo que **escribe en tus archivos**: `black .` y
 `rustfmt src/lib.rs` piden aprobación, `black --check .` y
 `rustfmt --check src/lib.rs` no — lo decide la opción, no el nombre de la
 herramienta. El ejecutable también lo resuelve Zaivern en vez de dejar que el SO
-busque en `PATH`, así que un `rustfmt` colocado dentro del workspace nunca
+busque en `PATH` — y estar fuera del workspace no basta: el agente se ejecuta
+con tus privilegios, así que puede escribir en `~/.local/bin` y también en
+`/opt/homebrew` y `/usr/local`, que Homebrew deja bajo tu propiedad. Solo un
+ejecutable en un lugar que exige elevación (`/usr/bin`, `/bin`, `/sbin`,
+`C:\Windows`, `C:\Program Files`) se ejecuta sin aprobación, y si en la práctica
+resulta escribible por ti, su clasificación solo baja, nunca sube. Así, un
+`rustfmt` colocado dentro del workspace nunca
 suplanta al real, y no hay ningún shell entre lo que se comprobó y lo que se
 ejecuta. Cada ejecución tiene tiempo límite, se termina con todo el
 árbol de procesos cuando paras el equipo, y siempre acaba en un resultado:

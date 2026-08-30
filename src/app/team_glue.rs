@@ -57,6 +57,8 @@ impl ZaivernApp {
     /// 🏛 New Team Run のフォームを開く。
     pub(crate) fn open_team_new_run(&mut self) {
         let ws = self.agent_cwd();
+        // **既存設定を初期値として読む** (書き換えない)。
+        self.seed_team_form();
         let refused = panel::with_panel(|p| {
             p.open = true;
             let r = p.attach_workspace(&ws).err();
@@ -260,7 +262,7 @@ impl ZaivernApp {
             // 次の tick でも同じ理由で止まるので、送り直すぶんだけ同じ
             // トーストが出続けて前に進まない。人が手当てできる形へ上げる
             // (既存のコスト上限判定をそのまま使う — 第 2 の判定を作らない)。
-            let blocked = self.cost_block_reason();
+            let blocked = self.team_cost_block_reason();
             let queued = if blocked.is_some() {
                 false
             } else {
@@ -416,7 +418,15 @@ impl ZaivernApp {
         let command = self.cfg.agents.get(idx)?.command.clone();
         let before: std::collections::HashSet<SessionId> =
             self.agents.sessions.iter().map(|s| s.id).collect();
-        self.launch_preset_with(idx, command, &spec.workspace_root, ctx);
+        // **承認モードは Run の値で締める。** 既存設定を書き換えるのではなく、
+        // この起動に効かせるだけ (`team_approval` が厳しいほうを採る)。
+        self.launch_preset_as(
+            idx,
+            command,
+            &spec.workspace_root,
+            self.team_approval(),
+            ctx,
+        );
         let session = self
             .agents
             .sessions
@@ -613,10 +623,15 @@ impl ZaivernApp {
                 p.inspector_open = true;
             }),
             BoardAction::OpenTerminal(sid) => self.team_open_terminal(sid),
-            BoardAction::OpenNewRun => panel::with_panel(|p| {
-                p.form.open = true;
-                p.form.error.clear();
-            }),
+            BoardAction::OpenNewRun => {
+                // **ここでも既存設定を初期値として読む** (フォームを開く
+                // 入口が 2 つあるので、片方だけだと既定値のまま計画できる)。
+                self.seed_team_form();
+                panel::with_panel(|p| {
+                    p.form.open = true;
+                    p.form.error.clear();
+                });
+            }
             BoardAction::PlanFromForm => self.team_plan_from_form(),
             BoardAction::ResumeRun => {
                 let r = panel::with_panel(|p| {
@@ -683,6 +698,14 @@ impl ZaivernApp {
             agent_count: form.agents,
             max_attempts: form.max_attempts,
             review_required: form.review_required,
+            // **この Run にだけ効く締め具合。** 既存のグローバル設定
+            // (`approval_mode` / `cost_limit_session`) は 1 バイトも
+            // 書き換えない — Run を 1 本作る操作で、Zaivern 全体の安全設定が
+            // 黙って変わってよいはずがない。効くのは締める方向だけ。
+            guardrails: crate::features::team::imp::model::RunGuardrails {
+                approval_mode: form.approval_mode.clone(),
+                cost_limit: form.cost_limit,
+            },
         };
         let roles = form.roles.clone();
         let title = form.goal_name.clone();
@@ -696,42 +719,57 @@ impl ZaivernApp {
             r
         });
         match r {
-            Ok(()) => {
-                // **承認モードとコスト上限は既存の仕組みへ渡す。**
-                // Team 専用の第 2 の真実を作らない — 起動時の承認判定も
-                // 送信時のコスト遮断も、既存の 1 本がそのまま効く。
-                self.set_team_guardrails(&form.approval_mode, form.cost_limit);
-                self.toast(tr("team.toast.plan_preview"), true);
-            }
+            Ok(()) => self.toast(tr("team.toast.plan_preview"), true),
             Err(e) => panel::with_panel(|p| p.form.error = e),
         }
     }
 
-    /// フォームの承認モードとコスト上限を、**既存の設定**へ反映する。
+    /// **いまの設定をフォームの初期値として渡す。**
     ///
-    /// Team だけの承認判定やコスト判定を作らないのが要で、こうしておくと
-    /// 「Cockpit では止まるのに Team では止まらない」が構造的に起こらない。
-    fn set_team_guardrails(&mut self, approval_mode: &str, cost_limit: f32) {
-        // 未知の値は `ask` へ倒す (読めない設定を「自動でよい」と読まない)。
-        let mode = match approval_mode {
-            "auto" | "agent" => approval_mode,
-            _ => "ask",
-        };
-        // **両方を見る。** 片方だけで判定すると、`global_approval_mode`
-        // だけが変わったときに保存されず、記憶と設定ファイルがずれる。
-        let mut changed = self.cfg.approval_mode != mode || self.cfg.global_approval_mode != mode;
-        self.cfg.approval_mode = mode.to_string();
-        self.cfg.global_approval_mode = mode.to_string();
-        // 0 は「上限なし」。既存の cost_limit_session と同じ意味。
-        let limit = cost_limit.max(0.0);
-        if (self.cfg.cost_limit_session - limit).abs() > f32::EPSILON {
-            self.cfg.cost_limit_session = limit;
-            changed = true;
+    /// フォームは既定で `ask` / `0` を持つ。`0` は**このコードベースでは
+    /// 「上限なし」**なので、既存設定を読まずにそのまま計画へ流すと、
+    /// `agent` / `25` で使っている人の環境で Team のフォームを開いただけで
+    /// 承認モードが下がり、課金の上限が外れる。読むのはここ 1 か所。
+    fn seed_team_form(&self) {
+        let mode = self.cfg.approval_mode.clone();
+        let limit = self.cfg.cost_limit_session.max(0.0);
+        panel::with_panel(|p| p.seed_guardrails(&mode, limit));
+    }
+
+    /// **この Run で実際に効く承認モード。** 既存設定と Run の**厳しいほう**。
+    ///
+    /// 判断は純関数 (`RunGuardrails::effective_approval`) に置いてある。
+    fn team_approval(&self) -> crate::agents::Approval {
+        let mode = panel::with_panel(|p| {
+            p.run_guardrails()
+                .unwrap_or_default()
+                .effective_approval(&self.cfg.approval_mode)
+        });
+        crate::agents::Approval::from_mode(&mode)
+    }
+
+    /// **この Run で実際に効くコスト遮断。** 既存の判定をそのまま使い、
+    /// セッション上限だけを Run 側の値で**締める**
+    /// (第 2 のコスト判定を作らない)。
+    fn team_cost_block_reason(&self) -> Option<String> {
+        if let Some(why) = self.cost_block_reason() {
+            return Some(why);
         }
-        if changed {
-            // 既存の保存経路をそのまま使う (Team だけ別の書き方をしない)。
-            crate::config::save_state(&self.cfg);
+        let run = panel::with_panel(|p| p.run_guardrails().unwrap_or_default().cost_limit);
+        if run <= 0.0 {
+            return None;
         }
+        let (session, today) = self.cost_spent;
+        let mut limits = self.cfg.cost_limits();
+        limits.session = f64::from(
+            panel::with_panel(|p| p.run_guardrails().unwrap_or_default())
+                .effective_cost_limit(self.cfg.cost_limit_session),
+        );
+        let blocked = limits.blocks(session, today)?;
+        Some(trf(
+            "team.err.run_cost_limit",
+            &[("reason", self.cost_alert_message(&blocked))],
+        ))
     }
 
     /// エージェントの端末を開く (既存の選択経路をそのまま使う)。

@@ -319,6 +319,7 @@ impl TeamRuntime {
                 updated_at: now,
                 validation_approvals: Vec::new(),
                 validation_timeout_secs: super::launch::VALIDATION_TIMEOUT_SECS,
+                guardrails: opts.guardrails.clone(),
                 effects: Vec::new(),
                 done_effects: Vec::new(),
             },
@@ -3167,13 +3168,16 @@ impl TeamRuntime {
 const APPROVAL_CAP: usize = 512;
 
 /// 起動オプション。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunOptions {
     pub run_id: String,
     pub spec_source: String,
     pub agent_count: usize,
     pub max_attempts: u8,
     pub review_required: bool,
+    /// **この Run にだけ効く安全側の設定。** 既存のグローバル設定は
+    /// 書き換えない ([`RunGuardrails`] の doc を参照)。
+    pub guardrails: RunGuardrails,
 }
 
 /// 新しい Run の ID を作る。
@@ -3201,6 +3205,7 @@ impl Default for RunOptions {
             agent_count: 4,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             review_required: true,
+            guardrails: RunGuardrails::default(),
         }
     }
 }

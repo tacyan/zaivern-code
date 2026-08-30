@@ -137,6 +137,7 @@ impl Lab {
                 agent_count: agents,
                 max_attempts: 3,
                 review_required: true,
+                guardrails: Default::default(),
             },
         );
         rt.apply_action(TeamAction::Start);

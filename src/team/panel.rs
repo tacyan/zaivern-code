@@ -447,6 +447,27 @@ impl TeamPanel {
         Ok(())
     }
 
+    /// **いまの設定をフォームの初期値にする** (既存設定は書き換えない)。
+    ///
+    /// フォームの既定は `ask` / `0` で、`0` は「上限なし」を意味する。
+    /// 読まずに計画へ流すと、`agent` / `25` で使っている人の環境で
+    /// フォームを開いただけで承認モードが下がり、上限が外れる。
+    ///
+    /// **開いている間は上書きしない。** 人が選び直した値を、次のフレームの
+    /// 読み込みで元へ戻してしまう。
+    pub fn seed_guardrails(&mut self, approval_mode: &str, cost_limit: f32) {
+        if self.form.open {
+            return;
+        }
+        self.form.approval_mode = approval_mode.to_string();
+        self.form.cost_limit = cost_limit.max(0.0);
+    }
+
+    /// いまの Run にだけ効く締め具合 (Run が無ければ `None`)。
+    pub fn run_guardrails(&self) -> Option<RunGuardrails> {
+        self.runtime.as_ref().map(|rt| rt.run().guardrails.clone())
+    }
+
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
     ///
     /// `roles` はフォームの「エージェントプリセット」、`title_override` は
@@ -2095,6 +2116,135 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside_dir).ok();
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **Team Run の作成で、利用者のグローバル設定を変えない。**
+    ///
+    /// フォームの既定は `ask` / `0`。`0` は**このコードベースでは
+    /// 「上限なし」**なので、既存設定を読まずに流すと、`agent` / `25` で
+    /// 使っている人がフォームを開いて計画しただけで承認モードが下がり、
+    /// 課金の上限が永続的に外れる。
+    #[test]
+    fn team_runの計画は既存のguardrailsを初期値にして書き換えない() {
+        use super::super::model::RunGuardrails;
+
+        // ── ケース A: フォームは既存設定を初期値として持つ ───────────────
+        let dir = ws("guardrails");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        // 既定は「読んでいない」値のまま。
+        assert_eq!(p.form.approval_mode, "ask");
+        assert_eq!(p.form.cost_limit, 0.0);
+        p.seed_guardrails("agent", 25.0);
+        assert_eq!(p.form.approval_mode, "agent", "既存の承認モードを読んでいない");
+        assert_eq!(p.form.cost_limit, 25.0, "既存のコスト上限を読んでいない");
+        // **開いている間は上書きしない** (人が選び直した値を戻さない)。
+        p.form.open = true;
+        p.form.approval_mode = "ask".into();
+        p.seed_guardrails("agent", 25.0);
+        assert_eq!(p.form.approval_mode, "ask", "入力中の値を上書きした");
+        p.form.open = false;
+
+        // ── ケース B: Run 側で ask / 0 を選んでも、既存の値は緩まない ────
+        let run = RunGuardrails {
+            approval_mode: "ask".into(),
+            cost_limit: 0.0,
+        };
+        assert_eq!(
+            run.effective_approval("agent"),
+            "ask",
+            "Run 側の厳しい選択が効いていない"
+        );
+        assert_eq!(
+            run.effective_cost_limit(25.0),
+            25.0,
+            "Run 側の 0 で既存の上限が外れた (0 は「上限なし」)"
+        );
+
+        // **緩める方向には効かない。**
+        let loose = RunGuardrails {
+            approval_mode: "auto".into(),
+            cost_limit: 100.0,
+        };
+        assert_eq!(
+            loose.effective_approval("ask"),
+            "ask",
+            "Run 側の指定で承認モードが緩んだ"
+        );
+        assert_eq!(
+            loose.effective_cost_limit(25.0),
+            25.0,
+            "Run 側の大きい上限で既存の上限が緩んだ"
+        );
+        // 既存に上限が無ければ、Run 側の上限がそのまま効く (締める方向)。
+        assert_eq!(loose.effective_cost_limit(0.0), 100.0);
+        // 空 = 何も足さない。
+        let none = RunGuardrails::default();
+        assert_eq!(none.effective_approval("agent"), "agent");
+        assert_eq!(none.effective_cost_limit(25.0), 25.0);
+        // 読めない綴りは**いちばん厳しい側**に倒す。
+        let junk = RunGuardrails {
+            approval_mode: "yolo".into(),
+            cost_limit: 0.0,
+        };
+        assert!(
+            crate::agents::Approval::from_mode(&junk.effective_approval("auto"))
+                == crate::agents::Approval::Ask,
+            "読めない綴りを自動側へ倒している"
+        );
+        assert_eq!(
+            super::super::model::approval_looseness("yolo"),
+            super::super::model::approval_looseness("ask"),
+            "読めない綴りをいちばん厳しい側に置いていない"
+        );
+
+        // ── ケース C: Run 固有設定は保存・復元をまたいで同じ ──────────────
+        p.plan_with(
+            SPEC,
+            "SPEC.md",
+            RunOptions {
+                guardrails: RunGuardrails {
+                    approval_mode: "ask".into(),
+                    cost_limit: 5.0,
+                },
+                ..RunOptions::default()
+            },
+            Vec::new(),
+            "",
+        )
+        .expect("計画できる");
+        assert_eq!(
+            p.run_guardrails(),
+            Some(RunGuardrails {
+                approval_mode: "ask".into(),
+                cost_limit: 5.0,
+            }),
+            "Run へ運ばれていない"
+        );
+        p.act(TeamAction::Start);
+        p.save_if_needed();
+        let mut q = TeamPanel::default();
+        q.home = p.home.clone();
+        q.attach_workspace(&dir).expect("attach できる");
+        q.restore_run(false).expect("復元できる");
+        assert_eq!(
+            q.run_guardrails(),
+            Some(RunGuardrails {
+                approval_mode: "ask".into(),
+                cost_limit: 5.0,
+            }),
+            "復元で Run 固有設定が失われた"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **この欄が無い旧 Run も読める** (`serde(default)`)。
+    #[test]
+    fn guardrailsを持たない旧runも読める() {
+        let doc: super::super::persistence::RunDoc =
+            serde_json::from_str(r#"{"version":4,"run_id":"r","workspace":"/w","spec_source":"s","agent_count":2,"max_attempts":3,"review_required":true,"paused":false,"stopped":false,"started_at":0,"updated_at":0}"#)
+                .expect("旧 Run が読めない");
+        assert_eq!(doc.guardrails, super::super::model::RunGuardrails::default());
     }
 
     /// **積めたことを「届いた」にしない。**

@@ -443,9 +443,22 @@ Planner → ValidationCommand{executable, args}
   | 区分 | 例 | 扱い |
   |---|---|---|
   | `Workspace` | workspace の内側 / 相対 / 空の PATH 要素 | **承認があっても起こさない** |
-  | `UserWritable` | `$HOME` 配下 / `/tmp` / `%LOCALAPPDATA%` / `%ProgramData%` | 承認の証跡が要る |
+  | `UserWritable` | `$HOME` 配下 / `/tmp` / **`/usr/local` `/opt/homebrew` `/opt/local`** / `%LOCALAPPDATA%` / `%ProgramData%` | 承認の証跡が要る |
   | `Unknown` | どれとも言えない場所 | 承認の証跡が要る |
-  | `SystemTrusted` | `/usr` `/bin` `/opt/homebrew` `C:\Windows` `C:\Program Files` | 危険度どおり |
+  | `SystemTrusted` | `/usr/bin` `/bin` `/sbin` `C:\Windows` `C:\Program Files` | 危険度どおり |
+
+  **Homebrew の場所をシステム扱いにしない。** Homebrew は
+  `/opt/homebrew` (Apple Silicon) と `/usr/local` (Intel) を
+  **ログインユーザーの所有**にするので、エージェントは Zaivern と同じ権限で
+  `/opt/homebrew/bin/rustfmt` を書き換えられる — 「`~/.local/bin` は危ないが
+  Homebrew は安全」という区別は成り立たない。MacPorts の `/opt/local` と
+  Linuxbrew も同じ。`/usr/local` が `/usr` に含まれても通らないのは、
+  利用者の場所をシステムより**先に**見るため。
+
+  **綴りだけで決めない。** 表がシステムだと言っても、実体か置き場が
+  *実際に*書き換えられるなら降格する (`measured_trust` — 世界書き込み可か、
+  自分の uid が所有していて書き込み権がある場合)。**降格にだけ効く**ので、
+  綴りで断ったものが実測で通ることはない。
 
   区分は `classify_path` (**純関数**) が決め、Windows の規則も
   `windows_policy` へ `env` を渡す形にして **macOS / Linux の CI から

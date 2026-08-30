@@ -4610,6 +4610,7 @@
   "team.empty.no_terminals": "No agents running",
   "team.empty.title": "No Team Run yet",
   "team.err.no_agent_preset": "No AI agent preset found (add one from 👾 Agent+)",
+  "team.err.run_cost_limit": "⛔ {reason} — this Team Run's own cost limit stopped it. Raise the run's limit and retry.",
   "team.err.session_gone": "That session is gone",
   "team.err.instruction_undelivered": "The instruction for #{task} was not delivered. It will be handed out again.",
   "team.err.validation_spawn": "Could not start validation: {e}",

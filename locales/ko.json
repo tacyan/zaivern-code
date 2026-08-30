@@ -4610,6 +4610,7 @@
   "team.empty.no_terminals": "실행 중인 에이전트가 없습니다",
   "team.empty.title": "Team Run 이 없습니다",
   "team.err.no_agent_preset": "AI 에이전트 프리셋이 없습니다 (👾 Agent＋ 에서 추가하세요)",
+  "team.err.run_cost_limit": "⛔ {reason} — 이 Team Run 자체의 비용 상한에서 멈췄습니다. Run 의 상한을 올린 뒤 다시 시도하세요",
   "team.err.session_gone": "해당 세션이 이미 없습니다",
   "team.err.instruction_undelivered": "#{task} 에 대한 지시가 전달되지 않았습니다. 다시 배정합니다",
   "team.err.validation_spawn": "검증을 시작할 수 없습니다: {e}",

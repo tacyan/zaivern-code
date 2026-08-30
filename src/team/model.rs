@@ -203,6 +203,83 @@ impl TeamGoal {
     }
 }
 
+// ── Run 固有の締め具合 ───────────────────────────────────────────────
+
+/// **この Run にだけ効く安全側の設定。**
+///
+/// ## なぜ既存のグローバル設定を書き換えないのか
+///
+/// 以前は Team のフォームで選んだ承認モードとコスト上限を
+/// `config::save_state` でそのまま利用者の設定へ書き戻していた。フォームの
+/// 初期値は `ask` / `0`、そして**このコードベースでは `0` が「上限なし」**
+/// なので、既存の設定が `agent` / `25` の人が Team のフォームを**開いて
+/// 計画しただけ**で、承認モードが変わり、課金の上限が外れていた
+/// (それも永続的に)。Run を 1 本作る操作が、Zaivern 全体の安全設定を
+/// 黙って書き換えてよいはずがない。
+///
+/// ## 締める方向にだけ効く
+///
+/// この Run の値は**既存の設定を緩める方向には効かない**。
+///
+/// * 承認モード — 既存とこの Run の**厳しいほう**を採る
+///   (`ask` < `agent` < `auto`)。全体が `ask` の人の環境で、Run のフォームが
+///   `auto` を選んだからといって無人で走ってよい理由にはならない
+/// * コスト上限 — 0 でない**小さいほう**を採る (0 = この段では上限なし)。
+///   Run 側の 0 で既存の上限を外せない
+///
+/// 「今後の既定として保存する」明示操作は、必要になったら別に足す。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunGuardrails {
+    /// この Run で選んだ承認モード (`ask` / `auto` / `agent`)。
+    /// 空 = 既存の設定のまま。
+    #[serde(default)]
+    pub approval_mode: String,
+    /// この Run のセッション上限 (USD)。`0` = この段では上限を足さない。
+    #[serde(default)]
+    pub cost_limit: f32,
+}
+
+/// 承認モードの緩さ (**大きいほど緩い**)。
+///
+/// `ask` は毎回人に聞く。`agent` はプリセットの指定どおりなので、
+/// 指定しだいでは全自動になりうる。`auto` は常に全自動。
+/// 読めない綴りは**いちばん厳しい側**に倒す (「読めなかったので自動でよい」
+/// と読まない)。
+pub fn approval_looseness(mode: &str) -> u8 {
+    match mode.trim() {
+        "auto" => 2,
+        "agent" => 1,
+        _ => 0,
+    }
+}
+
+impl RunGuardrails {
+    /// 実際に効く承認モード。**厳しいほうを採る。**
+    pub fn effective_approval(&self, global: &str) -> String {
+        if self.approval_mode.trim().is_empty() {
+            return global.to_string();
+        }
+        if approval_looseness(&self.approval_mode) < approval_looseness(global) {
+            self.approval_mode.trim().to_string()
+        } else {
+            global.to_string()
+        }
+    }
+
+    /// 実際に効くセッション上限 (USD)。`0` = 上限なし。
+    ///
+    /// **0 で既存の上限を外さない。** 両方が 0 でないときは小さいほう。
+    pub fn effective_cost_limit(&self, global: f32) -> f32 {
+        let run = self.cost_limit.max(0.0);
+        let global = global.max(0.0);
+        match (run > 0.0, global > 0.0) {
+            (true, true) => run.min(global),
+            (true, false) => run,
+            _ => global,
+        }
+    }
+}
+
 // ── 専門チーム ───────────────────────────────────────────────────────
 
 /// 専門チーム 1 つ (Organization Board のレーン 1 本)。

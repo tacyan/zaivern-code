@@ -251,7 +251,13 @@ um `build.rs` ou um `Makefile` fazem tudo o que um shell faz. O mesmo vale para
 o que **escreve nos seus arquivos**: `black .` e `rustfmt src/lib.rs` pedem
 aprovação, `black --check .` e `rustfmt --check src/lib.rs` não — quem decide é
 a flag, não o nome da ferramenta. O executável também é resolvido pelo próprio
-Zaivern em vez de deixar o SO procurar no `PATH`, então um `rustfmt` plantado
+Zaivern em vez de deixar o SO procurar no `PATH` — e estar fora do workspace
+não basta: o agente roda com os seus privilégios, então pode escrever em
+`~/.local/bin` e também em `/opt/homebrew` e `/usr/local`, que o Homebrew
+deixa sob sua propriedade. Só um executável em um lugar que exige elevação
+(`/usr/bin`, `/bin`, `/sbin`, `C:\Windows`, `C:\Program Files`) roda sem
+aprovação, e se na prática ele for gravável por você, a classificação só cai,
+nunca sobe. Assim, um `rustfmt` plantado
 dentro do workspace nunca substitui o real, e nenhum shell fica entre o que foi
 verificado e o que roda. Toda execução tem
 timeout, é encerrada com a árvore de processos inteira quando você para a

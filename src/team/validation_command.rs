@@ -480,6 +480,21 @@ pub fn unix_policy(workspace: &Path, env: impl Fn(&str) -> Option<String>) -> Tr
         "/var/tmp",
         "/private/tmp",
         "/private/var/tmp",
+        // **パッケージ管理が利用者所有で置く場所。**
+        //
+        // Homebrew は `/opt/homebrew` (Apple Silicon) と `/usr/local`
+        // (Intel) を**いまのログインユーザーの所有**にする。MacPorts の
+        // `/opt/local` も同じ。つまりエージェントは Zaivern と同じ権限で
+        // `/opt/homebrew/bin/rustfmt` を**書き換えられる** — この PR の
+        // 脅威モデルそのものなので、昇格が要る場所として扱ってはいけない。
+        //
+        // `/usr/local` をここへ置くのが効くのは、利用者の場所を
+        // システムより**先に**見るため (`classify_path` の順序)。
+        // `/usr` に含まれるからといって `SystemTrusted` にはならない。
+        "/usr/local",
+        "/opt/homebrew",
+        "/opt/local",
+        "/home/linuxbrew/.linuxbrew",
     ];
     if !home.trim().is_empty() {
         user.push(home.trim());
@@ -488,11 +503,14 @@ pub fn unix_policy(workspace: &Path, env: impl Fn(&str) -> Option<String>) -> Tr
         workspace,
         &user,
         &[
-            // 書き換えに昇格が要る場所。**`/usr/local` を含む** —
-            // Homebrew (Intel mac) は管理者権限だけで書けるが、
-            // 「エージェントが無断で置ける」場所ではない。
-            "/usr", "/bin", "/sbin", "/opt/homebrew", "/opt/local",
-            "/Library/Developer", "/System", "/snap",
+            // 書き換えに昇格が要る場所。**上の利用者側の一覧が先に効く**
+            // ので、`/usr/local` はここに含まれない。
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/Library/Developer",
+            "/System",
+            "/snap",
         ],
         false,
     )
@@ -608,6 +626,76 @@ pub fn classify_path(p: &Path, policy: &TrustPolicy) -> ExecTrust {
     ExecTrust::Unknown
 }
 
+/// **実測して降格する** — 表が「システム」と言っても、実際に自分の権限で
+/// 書き換えられるなら信用しない。
+///
+/// 表 (`TrustPolicy`) は綴りしか見ないので、次の環境を取りこぼす:
+///
+/// * Homebrew が `/usr/local` をログインユーザー所有にしている
+/// * 誰かが `/usr/bin` を世界書き込み可にしてしまっている
+/// * 独自ビルドのシステム領域が自分の uid で作られている
+///
+/// **上げる方向には絶対に効かない。** ここが返すのは「そのままか、弱いか」
+/// だけ (`min`)。上げてしまうと、綴りで断ったものを実測で通すことになる。
+///
+/// `my_uid` は「いまのプロセスの利用者」。std だけでは取れないので、
+/// **ホームディレクトリの所有者**を使う (自分のホームは自分のもの)。
+/// 取れなければ所有者の比較はせず、世界書き込み可だけを見る。
+#[cfg(unix)]
+fn measured_trust(path: &Path, trust: ExecTrust, my_uid: Option<u32>) -> ExecTrust {
+    use std::os::unix::fs::MetadataExt;
+    if trust != ExecTrust::SystemTrusted {
+        return trust;
+    }
+    // 実体と、その置き場の**両方**を見る。置き場に書ければ、実体を
+    // 差し替えられる (消して置き直せる) ので同じこと。
+    let mut targets = vec![path.to_path_buf()];
+    if let Some(dir) = path.parent() {
+        targets.push(dir.to_path_buf());
+    }
+    for t in targets {
+        let Ok(meta) = std::fs::metadata(&t) else {
+            // 見られないものは判断しない。**綴りだけで通さない。**
+            return ExecTrust::Unknown;
+        };
+        let mode = meta.mode();
+        let world_writable = mode & 0o002 != 0;
+        // **uid 0 では所有者の比較をしない。** root はどこへでも書けるので、
+        // 所有者で見ると「システムの場所」が 1 つも無くなる — そこまで倒すと
+        // 全部が承認必須になり、人は中身を読まずに承認するようになる
+        // (守りとしては逆効果)。root で動かしているなら、そもそも区分は
+        // 守りにならない (残存する既知の制限として文書化してある)。
+        // 世界書き込み可だけは root でも見る。
+        let mine = my_uid.is_some_and(|u| u != 0 && meta.uid() == u) && mode & 0o200 != 0;
+        if world_writable || mine {
+            return ExecTrust::UserWritable;
+        }
+    }
+    trust
+}
+
+/// 非 unix では所有権を同じ形で読めないので、表の判断のまま。
+#[cfg(not(unix))]
+fn measured_trust(_path: &Path, trust: ExecTrust, _my_uid: Option<u32>) -> ExecTrust {
+    trust
+}
+
+/// いまの利用者の uid (**自分のホームの所有者**として読む)。
+///
+/// `libc` を足さずに取るための形。読めなければ `None` で、そのときは
+/// 世界書き込み可だけを見る (判断を諦めるのではなく、材料を減らす)。
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty())?;
+    std::fs::metadata(home).ok().map(|m| m.uid())
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
 /// PATH の 1 要素の信用区分 (**純関数**)。
 ///
 /// **空の要素と相対パスは workspace 扱い。** 空は「カレント」を意味する
@@ -678,6 +766,9 @@ pub fn resolve_with(
             // ある」だけでは判定にならない。`canonical` はリンクを解くので、
             // たどった先で判定できる。
             let trust = entry_trust.min(classify_path(&canonical(&cand), policy));
+            // **綴りで「システム」でも、実際に書き換えられるなら信用しない。**
+            // 上げる方向には効かない (`measured_trust` は同じか弱いかだけ)。
+            let trust = trust.min(measured_trust(&canonical(&cand), trust, current_uid()));
             if trust.never_runnable() {
                 return Err(ResolveError::Untrusted {
                     name: name.to_string(),
@@ -1070,17 +1161,32 @@ mod tests {
         );
         assert!(!classify_path(Path::new("/opt/custom-home/.local/bin/rustfmt"), &blind).auto_runnable());
         // 昇格が要る場所は、これまでどおり通す。
-        for p in [
-            "/usr/bin/rustfmt",
-            "/bin/sh",
-            "/usr/local/bin/ruff",
-            "/opt/homebrew/bin/ruff",
-        ] {
+        for p in ["/usr/bin/rustfmt", "/bin/sh", "/usr/sbin/foo", "/snap/bin/x"] {
             assert_eq!(
                 classify_path(Path::new(p), &pol),
                 ExecTrust::SystemTrusted,
                 "{p} まで断った"
             );
+        }
+        // **パッケージ管理が利用者所有で置く場所は、システム扱いにしない。**
+        //
+        // Homebrew は `/opt/homebrew` (Apple Silicon) と `/usr/local`
+        // (Intel) をログインユーザーの所有にする。つまりエージェントは
+        // Zaivern と同じ権限でそこの実行体を書き換えられる — この PR の
+        // 脅威モデルそのもの。`/usr` に含まれるからといって通してはいけない。
+        for p in [
+            "/usr/local/bin/ruff",
+            "/opt/homebrew/bin/rustfmt",
+            "/opt/local/bin/black",
+            "/home/linuxbrew/.linuxbrew/bin/ruff",
+        ] {
+            let got = classify_path(Path::new(p), &pol);
+            assert_ne!(
+                got,
+                ExecTrust::SystemTrusted,
+                "{p} を無条件にシステム扱いした"
+            );
+            assert!(!got.auto_runnable(), "{p} を無承認で走らせる判定にした");
         }
         // workspace が最優先 (システムの下に置かれていても)。
         let nested = unix_policy(Path::new("/usr/local/src/repo"), |_| None);
@@ -1211,6 +1317,80 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
     }
 
+    /// **綴りが「システム」でも、実際に書き換えられるなら信用しない。**
+    ///
+    /// 表は綴りしか見ない。Homebrew が `/usr/local` を利用者所有にする、
+    /// 誰かが `/usr/bin` を世界書き込み可にしてしまう、といった環境では
+    /// 綴りだけの判断が嘘になる。実測は**降格にだけ**効く。
+    #[cfg(unix)]
+    #[test]
+    fn 書き換えられるシステム領域は実測で降格する() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = tmp("measured-ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // 「システムの場所」として表に載せた実験場。**実際には自分のもの。**
+        let sys = tmp("measured-sys");
+        let exe = put_exe(&sys, "zzz-measured");
+        let canon = |p: &Path| {
+            std::fs::canonicalize(p)
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string()
+        };
+        let sys_s = canon(&sys);
+        let pol = TrustPolicy::new(&ws, &[], &[&sys_s], false);
+        // 綴りだけの判断は「システム」。
+        assert_eq!(
+            classify_path(&exe, &pol),
+            ExecTrust::SystemTrusted,
+            "前提: 表の上ではシステム"
+        );
+
+        // **世界書き込み可にすると、実測が降格させる。**
+        // (uid での比較は root では行わないので、どの環境でも効くこちらで見る)
+        let mut perm = std::fs::metadata(&exe).unwrap().permissions();
+        perm.set_mode(0o777);
+        std::fs::set_permissions(&exe, perm).unwrap();
+        let got = resolve_with("zzz-measured", &pol, Some(&sys_s), None).expect("見つかるはず");
+        assert_eq!(
+            got.trust,
+            ExecTrust::UserWritable,
+            "誰でも書ける実行体をシステム扱いのまま通した"
+        );
+        assert!(!got.trust.auto_runnable(), "無承認で走らせる判定にした");
+
+        // **置き場に書ければ、実体を差し替えられる** (消して置き直せる)。
+        let mut perm = std::fs::metadata(&exe).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&exe, perm).unwrap();
+        let mut dperm = std::fs::metadata(&sys).unwrap().permissions();
+        dperm.set_mode(0o777);
+        std::fs::set_permissions(&sys, dperm).unwrap();
+        let got = resolve_with("zzz-measured", &pol, Some(&sys_s), None).expect("見つかるはず");
+        assert_eq!(
+            got.trust,
+            ExecTrust::UserWritable,
+            "誰でも書ける置き場をシステム扱いのまま通した"
+        );
+
+        // **上げる方向には効かない。** 実測が何を言おうと、workspace の
+        // 中は workspace のまま (綴りの判断より緩くならない)。
+        let inside = put_exe(&ws.join("bin"), "zzz-measured");
+        let mut perm = std::fs::metadata(&inside).unwrap().permissions();
+        perm.set_mode(0o555);
+        std::fs::set_permissions(&inside, perm).unwrap();
+        let ws_bin = canon(&ws.join("bin"));
+        let got = resolve_with("zzz-measured", &pol, Some(&ws_bin), None);
+        assert!(
+            matches!(got, Err(ResolveError::Untrusted { .. })),
+            "実測で workspace の実行体が通ってしまった: {got:?}"
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&sys).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn 前方の信用できない実体から後方の信用できる実体へ落ちない() {
@@ -1249,10 +1429,13 @@ mod tests {
         assert!(!got.trust.auto_runnable(), "無承認で走らせる判定にした");
 
         // 逆順なら前方が答え — **「常に断る」になっていない**ことの対照。
+        //
+        // **区分そのものは実測で降格しうる** (実験場は動かしている人の
+        // 所有なので、表がシステムだと言っても書き換えられる)。ここで
+        // 見たいのは「どちらを選んだか」なので、選んだ実体で確かめる。
         let back = format!("{sys_s}:{user_s}");
         let got = resolve_with("zzz-probe", &pol, Some(&back), None).expect("見つかるはず");
         assert_eq!(got.path, Path::new(&sys_s).join("zzz-probe"));
-        assert_eq!(got.trust, ExecTrust::SystemTrusted);
 
         for d in [&ws, &user_dir, &sys_dir] {
             std::fs::remove_dir_all(d).ok();

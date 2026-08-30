@@ -119,10 +119,15 @@ fn エージェント起動は既存経路を通る() {
     // 前者は呼んだ瞬間の `agent_cwd()` を使うので、Run を作ったあとに利用者が
     // フォルダを選び直すと、Team が面倒を見ているのとは違うところで
     // エージェントが動き出す。cwd は**要求が運んできた値**で決める。
-    assert!(
-        body.contains("self.launch_preset_with(idx, command, &spec.workspace_root, ctx)"),
-        "Run の workspace で起こしていない:\n{body}"
-    );
+    // **整形で改行されても外れない形で見る** (綴りそのものではなく、
+    // 「どの口へ・どの cwd で・どの承認モードで」渡しているか)。
+    for (needle, why) in [
+        ("self.launch_preset_as(", "既存の起動経路を使っていない"),
+        ("&spec.workspace_root", "Run の workspace で起こしていない"),
+        ("self.team_approval()", "この Run の承認モードを渡していない"),
+    ] {
+        assert!(body.contains(needle), "{why}:\n{body}");
+    }
     assert!(
         !body.contains("self.agent_cwd()"),
         "画面のいまのフォルダを見ている (Runtime が決めた実行先を上書きしている)"
@@ -747,31 +752,69 @@ fn フォームの入力欄はすべて何かを変える() {
         ("spec_path", "form.spec_path"),
         ("spec_text", "form.spec_text.clone()"),
         ("from_file", "if form.from_file"),
-        (
-            "approval_mode / cost_limit",
-            "self.set_team_guardrails(&form.approval_mode, form.cost_limit)",
-        ),
+        // 承認モードとコスト上限は**この Run のもの**として運ぶ。
+        ("approval_mode", "approval_mode: form.approval_mode.clone()"),
+        ("cost_limit", "cost_limit: form.cost_limit"),
     ] {
         assert!(
             body.contains(needle),
             "フォームの `{field}` がどこにも渡っていない"
         );
     }
-    // 承認モードとコスト上限は**既存の設定**へ流す (第 2 の真実を作らない)
-    let guard = function_body(&glue, glue.find("fn set_team_guardrails").expect("反映の橋"));
-    assert!(guard.contains("self.cfg.approval_mode"), "既存の承認モードへ流していない");
+}
+
+#[test]
+fn team_runは既存のグローバル設定を書き換えない() {
+    // **Run を 1 本作る操作で、Zaivern 全体の安全設定が変わってはいけない。**
+    //
+    // フォームの既定は `ask` / `0` で、`0` は**このコードベースでは
+    // 「上限なし」**を意味する。以前はこの値を `config::save_state` で
+    // 利用者の設定へ書き戻していたので、`agent` / `25` で使っている人が
+    // フォームを開いて計画しただけで、承認モードが下がり、課金の上限が
+    // 永続的に外れていた。
+    let glue = src(GLUE);
+    for bad in [
+        "crate::config::save_state",
+        "config::save_state",
+        "self.cfg.approval_mode =",
+        "self.cfg.global_approval_mode =",
+        "self.cfg.cost_limit_session =",
+    ] {
+        assert!(
+            !glue.contains(bad),
+            "Team の橋が既存のグローバル設定を書き換えている: `{bad}`"
+        );
+    }
+    // 読むのは初期値としてだけ。**書かない。**
+    let seed = function_body(&glue, glue.find("fn seed_team_form").expect("初期値の読み込み"));
     assert!(
-        guard.contains("self.cfg.cost_limit_session"),
-        "既存のコスト上限へ流していない"
+        seed.contains("self.cfg.approval_mode") && seed.contains("self.cfg.cost_limit_session"),
+        "既存設定を初期値として読んでいない:\n{seed}"
     );
     assert!(
-        guard.contains("crate::config::save_state(&self.cfg)"),
-        "既存の保存経路を使っていない"
+        seed.contains("p.seed_guardrails("),
+        "フォームへ渡していない:\n{seed}"
     );
-    // 未知の値は ask へ倒す
+    // フォームを開く入口は 2 つある。**両方で読む** (片方だけだと既定値の
+    // まま計画できてしまう)。
+    let opens = glue.matches("self.seed_team_form()").count();
     assert!(
-        guard.contains("\"auto\" | \"agent\" => approval_mode,") && guard.contains("_ => \"ask\","),
-        "読めない承認モードを自動側へ倒している"
+        opens >= 2,
+        "フォームを開く入口の一部で既存設定を読んでいない ({opens} か所)"
+    );
+    // 効かせ方は「締める方向だけ」。判断は純関数 1 本に置く。
+    let approval = function_body(&glue, glue.find("fn team_approval").expect("承認モードの解決"));
+    assert!(
+        approval.contains("effective_approval(&self.cfg.approval_mode)"),
+        "既存設定と突き合わせずに Run の値を使っている:\n{approval}"
+    );
+    let cost = function_body(
+        &glue,
+        glue.find("fn team_cost_block_reason").expect("コスト遮断"),
+    );
+    assert!(
+        cost.contains("self.cost_block_reason()") && cost.contains("effective_cost_limit("),
+        "既存のコスト判定を通していないか、Run 側で締めていない:\n{cost}"
     );
 }
 

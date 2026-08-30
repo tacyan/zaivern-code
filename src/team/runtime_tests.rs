@@ -61,6 +61,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
             agent_count: agents,
             max_attempts: 3,
             review_required,
+            guardrails: Default::default(),
         },
     );
     rt.apply_action(TeamAction::Start);
@@ -1573,6 +1574,7 @@ fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId,
             agent_count: 2,
             max_attempts: 3,
             review_required: false,
+            guardrails: Default::default(),
         },
     );
     rt.apply_action(TeamAction::Start);

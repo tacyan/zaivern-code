@@ -4610,6 +4610,7 @@
   "team.empty.no_terminals": "没有运行中的智能体",
   "team.empty.title": "还没有 Team Run",
   "team.err.no_agent_preset": "找不到 AI 智能体预设（请从 👾 Agent＋ 添加）",
+  "team.err.run_cost_limit": "⛔ {reason} — 已按本次 Team Run 自己的费用上限停止。请提高该 Run 的上限后重试",
   "team.err.session_gone": "该会话已不存在",
   "team.err.instruction_undelivered": "#{task} 的指令未送达，将重新分派",
   "team.err.validation_spawn": "无法开始验证：{e}",

@@ -4610,6 +4610,7 @@
   "team.empty.no_terminals": "Nenhum agente em execução",
   "team.empty.title": "Nenhum Team Run ainda",
   "team.err.no_agent_preset": "Nenhum preset de agente de IA encontrado (adicione em 👾 Agent+)",
+  "team.err.run_cost_limit": "⛔ {reason} — o limite de custo desta Team Run interrompeu o envio. Aumente o limite da run e tente de novo.",
   "team.err.session_gone": "Essa sessão não existe mais",
   "team.err.instruction_undelivered": "A instrução da #{task} não foi entregue. Ela será redistribuída.",
   "team.err.validation_spawn": "Não foi possível iniciar a validação: {e}",
