@@ -1337,9 +1337,11 @@ mod tests {
         };
         let sys_s = canon(&sys);
         let pol = TrustPolicy::new(&ws, &[], &[&sys_s], false);
-        // 綴りだけの判断は「システム」。
+        // 綴りだけの判断は「システム」。**解決した綴りで見る** — macOS の
+        // 一時フォルダは `/var/folders/…` で実体が `/private/var/folders/…`
+        // なので、素の綴りのままだと表と照合できない (実際に CI が落ちた)。
         assert_eq!(
-            classify_path(&exe, &pol),
+            classify_path(Path::new(&canon(&exe)), &pol),
             ExecTrust::SystemTrusted,
             "前提: 表の上ではシステム"
         );
