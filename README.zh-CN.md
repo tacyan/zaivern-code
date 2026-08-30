@@ -205,7 +205,16 @@ MCP 环境变量的值一次也不会显示。
 zai team run SPEC.md --agents 4
 ```
 
-Zaivern 读取 SPEC，推导出 Goal 与 Definition of Done，构建任务图并展示计划。
+Zaivern 读取 SPEC，**目前由确定性的 `StaticPlanner`（不是 LLM）**推导出 Goal
+与 Definition of Done，构建任务图并展示计划——同一份 SPEC 永远得到同一个计划。
+规划本身是可替换的边界（`TeamPlanner`），LLM 规划器将来会以相同的、经过校验的
+`TeamPlan` 接入：
+
+```text
+现在: SPEC → StaticPlanner（确定性） → 校验过的 TeamPlan → 任务图
+将来: SPEC → LLM TeamPlanner         → 同一个 TeamPlan   → 任务图
+```
+
 按下 **Start Team** 后，它只启动计划真正需要的智能体，把任务分派下去，并推动
 实现 → 验证 → 评审 → 修改 → 集成直到完成。
 

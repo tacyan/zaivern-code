@@ -225,10 +225,19 @@ Codex も Gemini も同じ挙動になります。追加インストールは不
 zai team run SPEC.md --agents 4
 ```
 
-Zaivern が SPEC を読んで Goal と Definition of Done を起こし、Task Graph を
-組み、計画を見せます。**Start Team** を押すと、計画に必要なぶんだけ
-エージェントを起こし、担当を配り、実装 → 検証 → レビュー → 修正 → 統合まで
-進めます。
+Zaivern が SPEC を読み、**いまは決定的な `StaticPlanner`** が Goal と
+Definition of Done を起こし、Task Graph を組んで計画を見せます
+(LLM に意味を解釈させてはいないので、同じ SPEC からは必ず同じ計画が出ます)。
+Planner は差し替えられる境界 (`TeamPlanner`) なので、LLM Planner は同じ
+検証済み `TeamPlan` を返す実装として後から入ります:
+
+```text
+いま:     SPEC → StaticPlanner (決定的) → 検証済み TeamPlan → Task Graph
+これから: SPEC → LLM TeamPlanner        → 同じ TeamPlan     → Task Graph
+```
+
+**Start Team** を押すと、計画に必要なぶんだけエージェントを起こし、担当を
+配り、実装 → 検証 → レビュー → 修正 → 統合まで進めます。
 
 **「エージェントが完了と言った」では完了になりません。** タスクは
 `Running → Validating → Reviewing → Completed` の順にしか進めず、完了報告は

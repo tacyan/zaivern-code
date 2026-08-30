@@ -215,10 +215,20 @@ imagens, PDFs e CSVs. Buffers não salvos são recuperados depois de um crash.
 zai team run SPEC.md --agents 4
 ```
 
-O Zaivern lê o SPEC, deriva um Goal e uma Definition of Done, monta um grafo de
-tarefas e mostra o plano. Ao pressionar **Start Team**, ele inicia apenas os
-agentes de que o plano realmente precisa, entrega a cada um a sua tarefa e
-conduz implementar → validar → revisar → corrigir → integrar até o fim.
+O Zaivern lê o SPEC e — hoje, por meio de um **`StaticPlanner` determinístico,
+não de um LLM** — deriva um Goal e uma Definition of Done, monta um grafo de
+tarefas e mostra o plano; o mesmo SPEC sempre produz o mesmo plano. O
+planejamento é uma fronteira substituível (`TeamPlanner`), e um planejador com
+LLM entra depois atrás do mesmo `TeamPlan` validado:
+
+```text
+hoje:    SPEC → StaticPlanner (determinístico) → TeamPlan validado → grafo
+futuro:  SPEC → LLM TeamPlanner                → o mesmo TeamPlan  → grafo
+```
+
+Ao pressionar **Start Team**, ele inicia apenas os agentes de que o plano
+realmente precisa, entrega a cada um a sua tarefa e conduz implementar →
+validar → revisar → corrigir → integrar até o fim.
 
 **Nada é dado como concluído só porque um agente disse que está.** Uma tarefa
 avança apenas por `Running → Validating → Reviewing → Completed`, e um relatório

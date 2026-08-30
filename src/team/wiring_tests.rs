@@ -20,6 +20,7 @@ const PANEL: &str = include_str!("panel.rs");
 const PERSISTENCE: &str = include_str!("persistence.rs");
 const LAUNCH: &str = include_str!("launch.rs");
 const FRAME: &str = include_str!("../app/frame_update.rs");
+const STARTUP: &str = include_str!("../app/startup.rs");
 
 #[test]
 fn cliのteamサブコマンドが門に登録されている() {
@@ -449,6 +450,32 @@ fn 閉じるときに検証を置き去りにしない() {
     assert!(
         now.contains("crate::procx::kill_tree(pid)"),
         "既存のプロセスツリー停止を使っていない (第 2 のプロセス管理を作らない)"
+    );
+}
+
+#[test]
+fn 立ち上がるときに前のアプリのrunを引き継がない() {
+    // **状態は `thread_local!` に居てアプリより長生きする。** 閉じる側の
+    // 後始末 (`on_exit` の `shutdown`) は、前のアプリが落ちた日には通らない。
+    // その日に生き残った Runtime を新しいアプリが拾うと、**もう自分のもの
+    // ではないセッションへ結び付いた Run** を操作できてしまう。
+    // 立ち上がる側でも断つ (閉じる側と対にする)。
+    let s = src(STARTUP);
+    let body = function_body(&s, s.find("pub fn new(").expect("アプリの生成"));
+    assert!(
+        body.contains("panel::begin_app_context()"),
+        "立ち上がりで Team の引き継ぎを断っていない:\n{body}"
+    );
+    // 断り方の実体 — 手放して、`workspace` も空へ戻す (戻さないと
+    // 「同じフォルダだから何もしない」で保存済み Run の案内すら出ない)。
+    let p = src(PANEL);
+    let adopt = function_body(
+        &p,
+        p.find("pub fn adopt_new_app_context").expect("引き継ぎの拒否"),
+    );
+    assert!(
+        adopt.contains("self.shutdown()") && adopt.contains("self.workspace = PathBuf::new()"),
+        "手放していないか、入り直せる形になっていない:\n{adopt}"
     );
 }
 

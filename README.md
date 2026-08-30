@@ -229,10 +229,20 @@ your files — it runs only when you call it.
 zai team run SPEC.md --agents 4
 ```
 
-Zaivern reads the SPEC, derives a Goal and a Definition of Done, builds a task
-graph, shows the plan, and — once you press **Start Team** — launches only the
-agents the plan actually needs, hands each one its task, and drives implement →
-validate → review → revise → integrate to completion.
+Zaivern reads the SPEC and — today, through a **deterministic `StaticPlanner`,
+not an LLM** — derives a Goal and a Definition of Done, builds a task graph and
+shows the plan, so the same SPEC always yields the same plan. Planning is a
+swappable boundary (`TeamPlanner`), and an LLM planner drops in behind the same
+validated `TeamPlan`:
+
+```text
+today:   SPEC → StaticPlanner (deterministic) → validated TeamPlan → task graph
+planned: SPEC → LLM TeamPlanner               → the same TeamPlan  → task graph
+```
+
+Once you press **Start Team**, Zaivern launches only the agents the plan
+actually needs, hands each one its task, and drives implement → validate →
+review → revise → integrate to completion.
 
 Nothing is marked complete because an agent said so. A task passes only through
 `Running → Validating → Reviewing → Completed`, and a completion report is

@@ -1142,6 +1142,15 @@ mod tests {
             // workspace の中。
             (r"C:\work\repo\bin\rustfmt.exe", ExecTrust::Workspace),
             (r"C:\work\repo\.venv\Scripts\black.exe", ExecTrust::Workspace),
+            // **`PATHEXT` で拾う綴りも同じ扱い。** `.cmd` / `.bat` は
+            // `CreateProcess` が cmd.exe 越しに起こす経路なので、ここが
+            // 緩むと workspace の中のバッチが「読むだけの検証」として動く。
+            (r"C:\work\repo\bin\rustfmt.cmd", ExecTrust::Workspace),
+            (r"C:\work\repo\tools\check.bat", ExecTrust::Workspace),
+            (
+                r"C:\Users\alice\AppData\Roaming\npm\npx.cmd",
+                ExecTrust::UserWritable,
+            ),
             // どちらとも言えない場所は、**システム扱いにしない**。
             (r"D:\misc\tool.exe", ExecTrust::Unknown),
             (r"\\server\share\tool.exe", ExecTrust::Unknown),

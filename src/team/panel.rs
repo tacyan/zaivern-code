@@ -894,6 +894,47 @@ impl TeamPanel {
         killed
     }
 
+    /// **新しいアプリ文脈がこのスレッドに現れた**ときの引き継ぎ拒否。
+    ///
+    /// 状態は `thread_local!` に居るので `ZaivernApp` より長生きする。
+    /// [`Self::shutdown`] は終わる側が呼ぶが、**呼ばれないまま次のアプリが
+    /// 立つ経路がある** (前のアプリが落ちた / 同じスレッドで 2 つ目が
+    /// 立った)。そのとき生き残った Runtime をそのまま拾うと、新しい画面が
+    /// **もう自分のものではないセッションへ結び付いた Run** を操作できて
+    /// しまう (起動済みエージェントも走っている検証も、前のアプリのもの)。
+    ///
+    /// なので**暗黙の引き継ぎを構造で断つ**: 閉じるときと同じ後始末をして
+    /// 手放し、`workspace` も空へ戻す。新しいアプリは必ず
+    /// `attach_workspace` → 保存経路 (`restore`) から入り直すので、
+    /// 復元した Run はそのアプリのセッションへ結び直される。
+    ///
+    /// 戻りは「前のアプリの状態が残っていたか」。**普通の起動では false**
+    /// (何も無いところから始まるので、1 命令も走らない)。
+    pub fn adopt_new_app_context(&mut self) -> bool {
+        if self.runtime.is_none()
+            && self.workspace.as_os_str().is_empty()
+            && self.validation_jobs.is_empty()
+        {
+            return false;
+        }
+        // 走っている検証は落とす。**渡さないなら面倒を見る相手が居ない**
+        // ので、札を立てるだけでは孤児のプロセスが残る。
+        self.shutdown();
+        // **`workspace` も空へ戻す。** 残すと、同じフォルダを開いた次の
+        // アプリの `attach_workspace` が「同じだから何もしない」で早々に
+        // 返り、保存済み Run の案内 (`RestorePrompt`) すら出ない。
+        self.workspace = PathBuf::new();
+        self.read_only = false;
+        self.notice.clear();
+        self.dropped_effects = 0;
+        self.seen_order.clear();
+        self.seen_set.clear();
+        self.next_scan = None;
+        self.next_launch_poll = None;
+        self.dirty = true;
+        true
+    }
+
     /// **その場でプロセスツリーごと落とす** (アプリの終了時)。
     ///
     /// 札を立てて worker に任せる余裕が無いときに使う。戻りは落とした件数。
@@ -1039,6 +1080,15 @@ thread_local! {
 /// UI スレッドの Team 状態へ触る。
 pub fn with_panel<R>(f: impl FnOnce(&mut TeamPanel) -> R) -> R {
     PANEL.with(|p| f(&mut p.borrow_mut()))
+}
+
+/// **アプリが立ち上がったことを Team 状態へ知らせる** (`ZaivernApp::new`)。
+///
+/// この状態はアプリより長生きするので、前のアプリの Run が残っていることが
+/// ありうる。[`TeamPanel::adopt_new_app_context`] が暗黙の引き継ぎを断つ。
+/// 戻りは「残っていたものを手放したか」。
+pub fn begin_app_context() -> bool {
+    with_panel(|p| p.adopt_new_app_context())
 }
 
 #[cfg(test)]
@@ -1766,6 +1816,348 @@ mod tests {
         assert!(p.scan_due(t0), "初回は走る");
         assert!(!p.scan_due(t0), "同じ瞬間に二度は走らない");
         assert!(p.scan_due(t0 + SCAN_INTERVAL + Duration::from_millis(1)));
+    }
+
+    /// **制御面を投函から再開まで 1 本で通す** (どの OS でも同じ経路)。
+    ///
+    /// GUI そのものは描けないので、GUI の直下 — 起動要求 / 計画 / 開始 /
+    /// 起動 Effect / 担当割当 / 検証 Effect / 停止と再開 / 保存と復元 —
+    /// を繋げて確かめる。**`cfg` で OS を分けない**ので、Windows の CI でも
+    /// そのまま走る: パスの区切り (`\`) と、`~/.zaivern` 配下の置き場と、
+    /// JSON へ往復するパスの綴りが、この 1 本で全部通ることになる。
+    ///
+    /// 個々の段の細かい振る舞いはそれぞれの番人が見ているので、ここは
+    /// **鎖が繋がっていること**だけを見る (どこかが切れたら落ちる)。
+    #[test]
+    fn 制御面は投函から再開までどのosでも通る() {
+        use super::super::launch;
+
+        let dir = ws("os-chain");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("a.rs"), "fn a() {}\n").unwrap();
+        // **検証は「読むだけ」のものにする。** リポジトリのコードを走らせる
+        // ものだと承認待ちで止まり、検証 Effect まで届かない。
+        let spec_body = "# 認証\n## 要件\n- A を作る (src/a.rs)\n## 検証\n- rustfmt --check src/a.rs\n";
+        let spec_path = dir.join("SPEC.md");
+        std::fs::write(&spec_path, spec_body).unwrap();
+        // **置き場は workspace の外**に置く。中に置くと自分の書いた記録が
+        // `git status` に出て、実測が「担当外の変更」として拾ってしまう。
+        let home = ws("os-chain-home");
+        let now = super::super::model::now_secs();
+
+        // 完了報告は**実測**を通る (`git` が要る)。綺麗なリポジトリから
+        // 始めるので、報告そのものの受理まで届く。
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            eprintln!("[skip] 制御面は投函から再開まで — git を使えません");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        git(&["config", "user.email", "t@example.invalid"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        assert!(
+            git(&["add", "-A"]) && git(&["commit", "-q", "-m", "init"]),
+            "実験場を commit できない"
+        );
+
+        // ── 1) 投函 → 拾える。境界の外の SPEC は組み立てで断る ───────────
+        let req = launch::build(&dir, &spec_path, 2, false).expect("投函を組み立てられる");
+        assert_eq!(req.agent_count, 2);
+        assert!(
+            launch::request_matches_workspace(&req, &dir),
+            "この workspace 宛ての要求を受け取れない"
+        );
+        launch::post_in(&home, &req).expect("投函できる");
+        let got = launch::take_in(&home, &dir, now).expect("投函を拾えない");
+        assert_eq!(got.spec_text, spec_body, "SPEC の中身が変わった");
+        assert!(
+            launch::take_in(&home, &dir, now).is_none(),
+            "同じ投函を二度拾った"
+        );
+        let outside_dir = ws("os-chain-outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("SPEC.md");
+        std::fs::write(&outside, spec_body).unwrap();
+        assert!(
+            launch::build(&dir, &outside, 2, false).is_err(),
+            "workspace の外の SPEC を受理した"
+        );
+
+        // ── 2) 計画 (agents=2) ────────────────────────────────────────────
+        let mut p = TeamPanel::default();
+        p.home = home.clone();
+        p.attach_workspace(&dir).expect("attach できる");
+        p.plan(
+            &got.spec_text,
+            "SPEC.md",
+            RunOptions {
+                agent_count: 2,
+                ..RunOptions::default()
+            },
+        )
+        .expect("計画できる");
+        assert_eq!(p.runtime.as_ref().expect("Runtime").run().agent_count, 2);
+
+        // ── 3) 開始 → 起動要求。パスはこの OS の綴りのまま運ばれる ───────
+        p.act(TeamAction::Start);
+        assert_eq!(p.goal_status(), Some(GoalStatus::Running));
+        // 開始しただけでは何も起きない。**調停ループが 1 度回って**初めて
+        // 「誰を起こすか」が決まる (押した瞬間に副作用を出さない)。
+        p.pump(super::super::runtime::Observation {
+            now,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "起動要求が 1 つも出ない");
+        let mut agents = Vec::new();
+        for (key, spec) in &launches {
+            assert_eq!(spec.workspace_root, dir, "起動先の workspace がずれた");
+            agents.push(spec.agent_id.clone());
+            p.ack_done(key);
+        }
+
+        // ── 4) セッションを結び付ける → 担当が付く ────────────────────────
+        let sessions: Vec<SessionId> = (0..agents.len() as SessionId).map(|i| 100 + i).collect();
+        for (a, s) in agents.iter().zip(&sessions) {
+            p.bind_session(a, *s);
+        }
+        let rows = |target: Option<SessionId>, text: &str| -> Vec<SessionInput> {
+            sessions
+                .iter()
+                .map(|s| SessionInput {
+                    id: *s,
+                    title: format!("agent{s}"),
+                    provider: "claude".into(),
+                    state: crate::coordinator::SessionState::Idle,
+                    tail: if Some(*s) == target {
+                        text.lines().map(|l| l.to_string()).collect()
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect()
+        };
+        p.pump_sessions(rows(None, ""), now + 1);
+        let working: Vec<(TaskId, SessionId, String)> = p
+            .runtime
+            .as_ref()
+            .expect("Runtime")
+            .tasks()
+            .iter()
+            .filter(|t| t.state.is_working())
+            .filter_map(|t| {
+                Some((
+                    t.id,
+                    t.assigned_session?,
+                    t.assigned_agent.as_ref()?.0.clone(),
+                ))
+            })
+            .collect();
+        assert!(!working.is_empty(), "担当が 1 つも付かない");
+
+        // ── 5) 完了報告 → 検証 Effect (cwd はこの workspace) ──────────────
+        let (tid, sid, agent) = working[0].clone();
+        let t = p.runtime.as_ref().unwrap().task(tid).expect("タスク").clone();
+        let files: Vec<String> = t.files.iter().map(|x| format!("\"{x}\"")).collect();
+        let vs: Vec<String> = t
+            .validation_commands
+            .iter()
+            .map(|c| format!("{{\"command\":\"{c}\",\"exit_code\":0}}"))
+            .collect();
+        let report = format!(
+            "{open}\n{{\"task_id\":{tid},\"agent_id\":\"{agent}\",\"status\":\"completed\",\
+             \"summary\":\"実装しました\",\"changed_files\":[{f}],\"validation\":[{v}],\"blockers\":[]}}\n{close}",
+            open = super::super::result_parser::RESULT_OPEN,
+            close = super::super::result_parser::RESULT_CLOSE,
+            f = files.join(","),
+            v = vs.join(","),
+        );
+        p.pump_sessions(rows(Some(sid), &report), now + 2);
+        let validations = p.take_validations();
+        assert!(!validations.is_empty(), "検証の要求が出ない");
+        assert_eq!(validations[0].1.cwd, dir, "検証の cwd がずれた");
+        assert!(
+            !validations[0].1.commands.is_empty(),
+            "空の検証を頼んでいる"
+        );
+
+        // ── 6) 停止と再開が状態機械の上で成立する ─────────────────────────
+        p.act(TeamAction::Pause);
+        assert_eq!(p.goal_status(), Some(GoalStatus::Paused), "止まらない");
+        p.act(TeamAction::Resume);
+        assert_eq!(p.goal_status(), Some(GoalStatus::Running), "戻らない");
+        p.act(TeamAction::Stop);
+        assert!(
+            p.runtime.as_ref().expect("Runtime").run().stopped,
+            "停止が効かない"
+        );
+
+        // ── 7) 保存して復元できる (パスの綴りごと往復する) ────────────────
+        p.save_if_needed();
+        let saved_ws = p.workspace().to_path_buf();
+        drop(p);
+        let mut q = TeamPanel::default();
+        q.home = home.clone();
+        q.attach_workspace(&dir).expect("attach できる");
+        assert_eq!(q.restore, RestorePrompt::Found, "保存済み Run を見つけられない");
+        q.restore_run(false).expect("復元できる");
+        assert!(q.has_run(), "復元しても Run が無い");
+        assert_eq!(
+            q.owner().expect("持ち主").workspace,
+            saved_ws,
+            "往復で workspace の綴りが変わった"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn team_state_does_not_leak_across_workspaces_or_app_contexts() {
+        // 状態は `thread_local!` に居て **`ZaivernApp` より長生きする**。
+        // 「UI スレッドあたり 1 インスタンス」という前提が破れた日
+        // (前のアプリが `on_exit` を通らずに消えた / 同じスレッドに 2 つ目が
+        // 立った) に、新しいアプリが前の Run を暗黙に引き継がないことを見る。
+        let a = ws("leak-a");
+        let b = ws("leak-b");
+        std::fs::create_dir_all(&b).unwrap();
+
+        // ── アプリ A: workspace A で Run を作り、セッションまで結び付ける ──
+        let mut p = started_panel(&a);
+        let owner_a = p.owner().expect("A の持ち主");
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "前提: 起動要求が出ている");
+        // **アプリ A のセッションへ結び付ける。** ここを省くと「復元しても
+        // 前のアプリのセッションへ結び付かない」の検査が空回りする
+        // (結び付いていないものは、外れていて当たり前)。
+        let mut sessions: Vec<SessionId> = Vec::new();
+        for (i, (key, spec)) in launches.iter().enumerate() {
+            p.ack_done(key);
+            let sid = 900 + i as SessionId;
+            p.bind_session(&spec.agent_id, sid);
+            sessions.push(sid);
+        }
+        // **観測にも同じセッションを出す。** 出さないと「消えた」と見なされ、
+        // 結び付きが解かれてしまう (この検査が空回りする)。
+        p.pump_sessions(
+            sessions
+                .iter()
+                .map(|s| SessionInput {
+                    id: *s,
+                    title: format!("agent{s}"),
+                    provider: "claude".into(),
+                    state: crate::coordinator::SessionState::Idle,
+                    tail: Vec::new(),
+                })
+                .collect(),
+            2,
+        );
+        assert!(
+            p.runtime
+                .as_ref()
+                .expect("Runtime")
+                .agents()
+                .iter()
+                .any(|ag| ag.session_id.is_some()),
+            "前提: アプリ A のセッションへ結び付いている"
+        );
+        let cancel = super::super::launch::new_cancel_flag();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        p.watch_validation(ValidationJob {
+            owner: owner_a.clone(),
+            task: 1,
+            execution: "x".into(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+        assert!(p.live_work().is_busy(), "前提: 面倒を見ているものがある");
+
+        // ── workspace 軸: 走っている間は別の workspace へ渡さない ────────
+        let err = p
+            .attach_workspace(&b)
+            .expect_err("実行中なのに別の workspace へ渡した");
+        assert!(!err.trim().is_empty(), "断った理由が空");
+        assert_eq!(p.owner().as_ref(), Some(&owner_a), "Run が入れ替わった");
+
+        // ── アプリ文脈の軸: 新しいアプリは前の Run を引き継がない ────────
+        assert!(p.adopt_new_app_context(), "残っていたものを手放していない");
+        assert!(!p.has_run(), "新しいアプリが前の Run を握ったままになった");
+        assert_eq!(p.owner(), None, "持ち主が残っている");
+        assert_eq!(p.running_validations(), 0, "検証を抱えたまま引き継いだ");
+        assert!(
+            cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "面倒を見る相手が居なくなったのに検証を止めていない"
+        );
+        // **保存はされている。** 続きは復元の案内から入り直せる
+        // (「引き継がない」は「捨てる」ではない)。
+        assert!(
+            persistence::has_run(&persistence::team_dir_in(&p.home, &a)),
+            "保存せずに手放した"
+        );
+
+        // ── 引き継ぎ後: 同じ workspace を開き直しても、入り直しになる ────
+        // `workspace` を空へ戻していないと「同じだから何もしない」で
+        // 早々に返り、保存済み Run の案内すら出ない。
+        p.attach_workspace(&a).expect("新しいアプリは attach できる");
+        assert!(!p.has_run(), "attach しただけで前の Run が復活した");
+        assert_eq!(
+            p.restore,
+            RestorePrompt::Found,
+            "保存済み Run の案内が出ない (入り直せない)"
+        );
+
+        // ── 復元しても、前のアプリのセッションへは結び付かない ───────────
+        // ここが「引き継がない」ことの実質。`run_id` は同じ Run なので
+        // 引き継ぐが (それが復元の意味)、**プロセスへの結び付きは全部外れる**
+        // ので、新しいアプリが前のアプリの端末を操作することはない。
+        p.restore_run(false).expect("復元できるべき");
+        let rt = p.runtime.as_ref().expect("復元した Runtime");
+        assert!(
+            rt.tasks()
+                .iter()
+                .all(|t| t.assigned_session.is_none() && t.coordinator_task.is_none()),
+            "前のアプリのセッションへ結び付いたまま復元した: {:?}",
+            rt.tasks()
+                .iter()
+                .map(|t| (t.id, t.assigned_session))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            rt.agents().iter().all(|a| a.session_id.is_none()),
+            "前のアプリのセッションを持つエージェントが残った"
+        );
+        // 前のアプリが残した仕事も 1 つも持っていない。
+        assert!(
+            p.take_launches().is_empty(),
+            "前のアプリの起動要求が残っている"
+        );
+        assert!(p.take_validations().is_empty(), "前のアプリの検証が残っている");
+
+        // ── 普通の起動 (何も残っていない) では 1 命令も走らない ──────────
+        let mut fresh = TeamPanel::default();
+        assert!(
+            !fresh.adopt_new_app_context(),
+            "何も無いのに後始末を走らせた"
+        );
+
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]

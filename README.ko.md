@@ -208,10 +208,18 @@ PDF, CSV까지. 저장하지 않은 버퍼는 크래시 후에 복구됩니다.
 zai team run SPEC.md --agents 4
 ```
 
-Zaivern 이 SPEC 을 읽어 Goal 과 Definition of Done 을 세우고, 태스크 그래프를
-만들어 계획을 보여 줍니다. **Start Team** 을 누르면 계획에 필요한 만큼만
-에이전트를 띄우고 담당을 나눈 뒤, 구현 → 검증 → 리뷰 → 수정 → 통합까지
-끌고 갑니다.
+Zaivern 이 SPEC 을 읽고, **지금은 LLM 이 아니라 결정적인 `StaticPlanner`** 가
+Goal 과 Definition of Done 을 세우고 태스크 그래프를 만들어 계획을 보여 줍니다.
+같은 SPEC 이면 언제나 같은 계획이 나옵니다. 플래너는 갈아 끼울 수 있는
+경계(`TeamPlanner`)이며, LLM 플래너는 같은 검증된 `TeamPlan` 뒤로 들어옵니다:
+
+```text
+지금:   SPEC → StaticPlanner (결정적) → 검증된 TeamPlan → 태스크 그래프
+앞으로: SPEC → LLM TeamPlanner        → 같은 TeamPlan   → 태스크 그래프
+```
+
+**Start Team** 을 누르면 계획에 필요한 만큼만 에이전트를 띄우고 담당을 나눈 뒤,
+구현 → 검증 → 리뷰 → 수정 → 통합까지 끌고 갑니다.
 
 **에이전트가 "끝났다"고 말했다고 완료가 되지는 않습니다.** 태스크는
 `Running → Validating → Reviewing → Completed` 순서로만 진행되며, 태스크 ID 나

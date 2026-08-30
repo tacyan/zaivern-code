@@ -215,10 +215,20 @@ Markdown, imágenes, PDF y CSV. Los búferes sin guardar se recuperan tras un fa
 zai team run SPEC.md --agents 4
 ```
 
-Zaivern lee el SPEC, deriva un Goal y una Definition of Done, construye un grafo
-de tareas y muestra el plan. Al pulsar **Start Team**, arranca solo los agentes
-que el plan realmente necesita, entrega a cada uno su tarea y lleva el trabajo
-de implementar → validar → revisar → corregir → integrar hasta el final.
+Zaivern lee el SPEC y —hoy, mediante un **`StaticPlanner` determinista, no un
+LLM**— deriva un Goal y una Definition of Done, construye un grafo de tareas y
+muestra el plan; el mismo SPEC produce siempre el mismo plan. La planificación
+es una frontera intercambiable (`TeamPlanner`), y un planificador con LLM entra
+después detrás del mismo `TeamPlan` validado:
+
+```text
+hoy:     SPEC → StaticPlanner (determinista) → TeamPlan validado → grafo
+futuro:  SPEC → LLM TeamPlanner              → el mismo TeamPlan → grafo
+```
+
+Al pulsar **Start Team**, arranca solo los agentes que el plan realmente
+necesita, entrega a cada uno su tarea y lleva el trabajo de implementar →
+validar → revisar → corregir → integrar hasta el final.
 
 **Nada se marca como completado porque un agente lo diga.** Una tarea solo
 avanza por `Running → Validating → Reviewing → Completed`, y un informe de

@@ -46,11 +46,29 @@ Zaivern → コマンドパレット → 🏛 Team
 `TeamPanel::plan` → `TeamRuntime` の 1 本を通る
 (`team::wiring_tests::cli起動とgui起動は同じruntimeを通る` が番人)。
 
+## 計画を作るのは誰か
+
+**LLM ではない。** 現在の `TeamPlanner` の実装は決定的な `StaticPlanner`
+1 つだけで、SPEC の見出し・箇条書き・「完了条件」「検証」節を**構文として**
+読む。意味を解釈しないので、同じ SPEC からは必ず同じ計画が出る
+(番人: `planner::tests::静的プランナーは決定的`)。
+
+```text
+いま:     SPEC → StaticPlanner (決定的) → validate_plan → TeamPlan → Task Graph
+これから: SPEC → LLM TeamPlanner        → validate_plan → 同じ TeamPlan → Task Graph
+```
+
+`TeamPlanner` は trait なので、LLM 実装は**同じ `TeamPlan` を返す**形で
+後ろに入る。差し替えても `validate_plan` の関門と Task Graph から先は
+1 バイトも変わらない — 「AI が仕様を理解して分解する」ようになる日が来ても、
+配る前の検証は同じ場所で効く。
+
 ## 層
 
 ```
 SPEC / Goal
-    ↓  planner.rs        (LLM に差し替え可能な境界。既定は決定的な StaticPlanner)
+    ↓  planner.rs        (差し替え可能な境界。**いまある実装は決定的な
+                          StaticPlanner 1 つだけ** — LLM Planner は未実装)
 TeamPlan / Task Graph     plan_schema.rs / graph.rs / model.rs
     ↓  runtime.rs         (Reconciliation Loop。egui を知らない)
 Deterministic Scheduler   scheduler.rs
