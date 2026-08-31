@@ -233,6 +233,18 @@ pub fn manual_instruction_key(agent: &AgentId, event_id: EventId) -> String {
     format!("manual:{agent}:{event_id}")
 }
 
+/// 人の指示の鍵から宛先を読む。**綴りを知っているのはここ 1 か所**
+/// ([`manual_instruction_key`] の逆)。
+///
+/// エージェント名に `:` が入りうるので、**末尾のイベント ID から切る**
+/// (前から切ると名前の途中で割れる)。
+pub fn manual_instruction_agent(key: &str) -> Option<AgentId> {
+    let rest = key.strip_prefix("manual:")?;
+    let (agent, event) = rest.rsplit_once(':')?;
+    event.parse::<EventId>().ok()?;
+    (!agent.is_empty()).then(|| AgentId(agent.to_string()))
+}
+
 /// GUI / CLI からの操作。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TeamAction {
@@ -259,8 +271,13 @@ pub enum TeamAction {
     },
     /// **人が選んだエージェントへ、その場で指示を送る。**
     ///
-    /// 走っている端末へ 1 回だけ流す。担当タスクがあるなら、同じ文言を
-    /// タスクの文脈にも残す (配り直しで消えないように)。
+    /// 走っている端末へ 1 回だけ流す。**タスクの文脈は 1 バイトも触らない。**
+    ///
+    /// 画面の 2 つのボタンは送り先が違う ([`super::inspector`]):
+    /// 「いま送る」= 動いている端末へ 1 回 / 「次の配布に足す」=
+    /// [`TeamAction::AddContext`] でタスクの文脈へ。**ここで文脈へも
+    /// 残すと、その区別が消える** — 一度きりのつもりで送った文言が、
+    /// 配り直した次の担当へも黙って渡る。
     InstructAgent {
         agent: AgentId,
         text: String,
@@ -912,6 +929,46 @@ impl TeamRuntime {
         self.dirty = true;
     }
 
+    /// **人が出した指示の結末**を実行側から受け取る (`submit` の終わり方)。
+    ///
+    /// `InstructAgent` が積むのは「送信キューへ追加しました」までで、
+    /// **そこは配送の成功を意味しない**。積んだ後に相手が消えれば `Gone`、
+    /// 入力欄が空かないまま上限に達すれば `GaveUp` になる。監査で
+    /// queued / delivered / failed を区別できるよう、結末はここで 1 件だけ
+    /// 足す。
+    ///
+    /// **撃ち直さない。** 人の発話を自動で再送すると同じ文言が二重に届く
+    /// (`panel::TeamPanel::note_delivery` が画面へ 1 回だけ知らせる)。
+    /// タスクの文脈は行きも帰りも触らない — 送り先の区別は
+    /// [`TeamAction::AddContext`] 側が持つ。
+    pub fn note_manual_delivery(&mut self, key: &str, delivered: bool, why: &str) {
+        let agent = manual_instruction_agent(key);
+        let who = agent
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "エージェント".into());
+        if delivered {
+            self.note_effect_done(key);
+            self.log(
+                TeamEventKind::HumanInstruction,
+                None,
+                agent,
+                format!("{who} への指示が届きました"),
+            );
+        } else {
+            // 記録ごと捨てるのは、人がもう一度打てるようにするため
+            // (自動では出し直さない)。
+            self.note_effect_failed(key);
+            self.log(
+                TeamEventKind::HumanInstruction,
+                None,
+                agent,
+                format!("{who} への指示を送れませんでした: {why}"),
+            );
+        }
+        self.dirty = true;
+    }
+
     /// **いまそのタスクが待っている指示の鍵。**
     ///
     /// 担当が付いていて、まだ本人が動いている段のときだけ意味がある。
@@ -1455,23 +1512,15 @@ impl TeamRuntime {
                 self.dirty = true;
             }
             TeamAction::InstructAgent { agent, text } => {
+                // **これは「いま送る」だけの操作。** タスクの文脈は
+                // [`TeamAction::AddContext`] だけが持ち、ここは触らない
+                // (`runtime_tests::今すぐ送る指示はタスク文脈へ残らない`)。
+                //
                 // **借用を先に切る。** `self.log` は `&mut self` を取るので、
                 // エージェントの参照を持ったままでは呼べない。
-                // **担当タスクは台帳の側から引く。** `TeamAgent::current_task`
-                // は観測が回ってから埋まるので、配った直後は空のことがある。
-                // 空のまま進むと、文脈へ残す経路だけが静かに死ぬ。
-                let held = self
-                    .tasks
-                    .iter()
-                    .find(|t| t.assigned_agent.as_ref() == Some(&agent) && t.state.is_held())
-                    .map(|t| t.id);
-                let target = self
-                    .agents
-                    .iter()
-                    .find(|a| a.id == agent)
-                    .map(|a| (a.session_id, a.current_task.or(held)));
+                let session = self.agents.iter().find(|a| a.id == agent).map(|a| a.session_id);
                 let text = clamp_text(text.trim());
-                match target {
+                match session {
                     // **空の指示は 1 バイトも送らない。**
                     _ if text.is_empty() => {}
                     // **届かないものを「送った」と記録しない。**
@@ -1481,30 +1530,27 @@ impl TeamRuntime {
                         None,
                         format!("{agent} は居ないので指示を送れませんでした"),
                     ),
-                    Some((None, _)) => self.log(
+                    Some(None) => self.log(
                         TeamEventKind::HumanInstruction,
                         None,
                         Some(agent.clone()),
                         format!("{agent} は端末を持っていないので指示を送れませんでした"),
                     ),
-                    Some((Some(session), task)) => {
+                    Some(Some(session)) => {
                         // **鍵は、これから積むイベントの ID から作る。**
                         // `log` が採番するので、先に読んでから記録する。
                         let key = manual_instruction_key(&agent, self.next_event_id);
+                        // **まだ届いていない。** ここで「送りました」と
+                        // 書くと、この後 `queue_submit` が失敗しても記録は
+                        // 成功したままになる。結末は
+                        // [`note_manual_delivery`](Self::note_manual_delivery)
+                        // が 1 件だけ足す (queued → delivered / failed)。
                         self.log(
                             TeamEventKind::HumanInstruction,
                             None,
                             Some(agent.clone()),
-                            format!("{agent} へ指示を送りました: {text}"),
+                            format!("{agent} への指示を送信キューへ追加しました: {text}"),
                         );
-                        // 端末へ流すのは 1 回きり。担当タスクがあるなら
-                        // **配り直しでも効くように**文脈へも残す。
-                        if let Some(t) = task.and_then(|id| self.tasks.iter_mut().find(|t| t.id == id))
-                        {
-                            t.context.push(text.clone());
-                            t.context = clamp_list(std::mem::take(&mut t.context));
-                            t.updated_at = now_secs();
-                        }
                         out.push(TeamEffect::SendManualInstruction {
                             agent,
                             session,

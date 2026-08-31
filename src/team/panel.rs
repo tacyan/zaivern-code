@@ -786,6 +786,20 @@ impl TeamPanel {
         self.dirty = true;
     }
 
+    /// **人が出した指示が、配送に届く前に落ちた**と Runtime へ返す
+    /// (コスト上限で止まった / 送信キューへ積めなかった)。
+    ///
+    /// `ack_failed` だけで済ませると、記録には「送信キューへ追加しました」
+    /// が残ったまま結末が 1 件も無い状態になる。**撃ち直さない**のは
+    /// `note_delivery` の失敗と同じ理由 (人の発話を自動で再送しない)。
+    pub fn note_manual_failed(&mut self, key: &str, why: &str) {
+        if let Some(rt) = self.runtime.as_mut() {
+            rt.note_manual_delivery(key, false, why);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
     /// **指示が方針で止められた**と Runtime へ返す (撃ち直さない)。
     pub fn note_instruction_blocked(&mut self, task: TaskId, why: &str) {
         if let Some(rt) = self.runtime.as_mut() {
@@ -921,10 +935,13 @@ impl TeamPanel {
         // `note_instruction_undelivered` の照合が必ず外れ、届かなかった
         // 事実が「古い配達」として毎回捨てられる。
         if key.starts_with("manual:") {
-            if delivered {
-                self.ack_done(key);
-            } else {
-                self.ack_failed(key);
+            // **結末を監査へ残す。** 発行時の記録は「送信キューへ追加した」
+            // までなので、ここを素の ack で済ませると delivered と failed が
+            // 記録の上で見分けられない。
+            if let Some(rt) = self.runtime.as_mut() {
+                rt.note_manual_delivery(key, delivered, "宛先の端末が応答しませんでした");
+            }
+            if !delivered {
                 self.notice = crate::i18n::tr("team.err.manual_undelivered");
             }
             self.needs_save = true;

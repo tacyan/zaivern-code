@@ -3265,7 +3265,7 @@ fn to_instructable() -> (TeamRuntime, SessionId, TaskId, String) {
 /// 1 バイトも届かない。途中で口を出せることを、実際に Effect が出ることで見る。
 #[test]
 fn 人の指示は選んだエージェントの端末へ出る() {
-    let (mut rt, sid, tid, agent) = to_instructable();
+    let (mut rt, sid, _tid, agent) = to_instructable();
     let out = rt.apply_action(TeamAction::InstructAgent {
         agent: AgentId(agent.clone()),
         text: "  テストを先に書いて  ".into(),
@@ -3279,15 +3279,6 @@ fn 人の指示は選んだエージェントの端末へ出る() {
         sent[0].3.starts_with("manual:"),
         "鍵は manual: 名前空間であるべき: {}",
         sent[0].3
-    );
-    // **配り直しでも効くように、担当タスクの文脈にも残す。**
-    assert!(
-        rt.task(tid)
-            .unwrap()
-            .context
-            .iter()
-            .any(|c| c.contains("テストを先に書いて")),
-        "タスクの文脈へ残っていない"
     );
     // 監査のために出来事が 1 件残る。
     assert!(
@@ -3352,3 +3343,237 @@ fn 人の指示の鍵は毎回変わる() {
     let uniq: std::collections::BTreeSet<&String> = keys.iter().collect();
     assert_eq!(uniq.len(), keys.len(), "鍵が重複した: {keys:?}");
 }
+
+// ── 「いま送る」と「次の配布に足す」を混ぜない ───────────────────────
+//
+// 画面のボタンは 2 つあり、送り先が違う:
+//
+// * `InstructAgent` — 「いま送る」= 動いている端末へ 1 回だけ
+// * `AddContext`    — 「次の配布に足す」= タスクの文脈へ
+//
+// **`InstructAgent` が文脈へも残すと、この区別が消える。** 一度きりの
+// つもりで送った文言が、配り直した次の担当へも黙って渡ってしまう
+// (人から見ると「取り消せない指示」になる)。
+
+/// **今すぐ送る指示は、タスクの文脈へ 1 バイトも残らない。**
+#[test]
+fn 今すぐ送る指示はタスク文脈へ残らない() {
+    let (mut rt, _, tid, agent) = to_instructable();
+    let before = rt.task(tid).unwrap().context.clone();
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: AgentId(agent),
+        text: "テストを先に書いて".into(),
+    });
+    assert_eq!(manual_sends(&out).len(), 1, "端末へ出ていない: {out:?}");
+    assert!(
+        !rt.task(tid)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("テストを先に書いて")),
+        "即時送信した指示がタスク文脈へ残っている"
+    );
+    assert_eq!(
+        rt.task(tid).unwrap().context,
+        before,
+        "文脈が 1 行でも動いている"
+    );
+}
+
+/// **次の配布に足す指示は、端末へは 1 通も出ない。**
+///
+/// 上のテストと対 — 片方だけだと「両方とも何もしない」実装が緑になる。
+#[test]
+fn 次の配布に足す指示は端末へ出ない() {
+    let (mut rt, _, tid, _) = to_instructable();
+    let out = rt.apply_action(TeamAction::AddContext {
+        task: tid,
+        text: "命名は snake_case で".into(),
+    });
+    assert!(
+        manual_sends(&out).is_empty(),
+        "文脈へ足しただけなのに端末へ送った: {out:?}"
+    );
+    assert!(
+        rt.task(tid)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("命名は snake_case で")),
+        "タスクの文脈へ足されていない"
+    );
+}
+
+/// **配り直した次の担当へ、その場の指示は渡らない。**
+///
+/// `context` を覗くだけの検査は「文脈の綴りを変えた」実装でも緑になる。
+/// ここは**実際に配られる指示文**まで見る (積んだのに渡らない / 積んで
+/// いないのに渡る、はどちらもこの層でしか出ない)。
+///
+/// 対照として `AddContext` の文言は**必ず渡る**ことも同時に見る。これが
+/// 無いと、配り直しが起きていないだけの空振りが緑になってしまう。
+#[test]
+fn 今すぐ送る指示は次の担当へ渡らない() {
+    let (mut rt, sids, tid) = to_assigned();
+    let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap();
+    rt.apply_action(TeamAction::AddContext {
+        task: tid,
+        text: "次の担当にも渡す約束".into(),
+    });
+    rt.apply_action(TeamAction::InstructAgent {
+        agent,
+        text: "この場かぎりの指示".into(),
+    });
+
+    // 担当の端末が消えた → 既存の回収経路で回収され、生きている別の
+    // エージェントへ**同じ tick で**配り直される。
+    let dead = rt.task(tid).unwrap().assigned_session.unwrap();
+    let alive: Vec<SessionId> = sids.iter().copied().filter(|s| *s != dead).collect();
+    let eff = idle_tick(&mut rt, 12, &alive);
+    assert_ne!(
+        rt.task(tid).unwrap().assigned_session,
+        Some(dead),
+        "回収されていない (前提が崩れている)"
+    );
+    let text = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendInstruction { task, text, .. } if *task == tid => Some(text.clone()),
+            _ => None,
+        })
+        .expect("回収したタスクが配り直されない (前提が崩れている)");
+    assert!(
+        text.contains("次の担当にも渡す約束"),
+        "「次の配布に足す」が指示文へ渡っていない:\n{text}"
+    );
+    assert!(
+        !text.contains("この場かぎりの指示"),
+        "「いま送る」で送った指示が、次の担当の指示文へ紛れている:\n{text}"
+    );
+}
+
+/// **送信に失敗しても、タスクの文脈は汚れない。**
+///
+/// 「積めた = 届いた」ではないので、結末は遅れて戻る。そのどちらの道でも
+/// 文脈を触らないことを見る (失敗の側だけ文脈へ書く実装を許さない)。
+#[test]
+fn 送信に失敗しても文脈は汚れない() {
+    let (mut rt, _, tid, agent) = to_instructable();
+    let before = rt.task(tid).unwrap().context.clone();
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: AgentId(agent),
+        text: "届かない指示".into(),
+    });
+    let key = manual_sends(&out)[0].3.clone();
+    rt.note_manual_delivery(&key, false, "宛先の端末が応答しませんでした");
+    assert_eq!(
+        rt.task(tid).unwrap().context,
+        before,
+        "配送に失敗した指示がタスク文脈へ残っている"
+    );
+    // **撃ち直さない。** 記録を捨てるので冪等キーは完了になっていない。
+    assert!(
+        !rt.effect_completed(&key),
+        "届かなかった指示が完了として残っている"
+    );
+}
+
+/// **監査では queued / delivered / failed が見分けられる。**
+///
+/// 発行の時点では配送は終わっていないので、そこへ「送りました」と書くと
+/// この後 `queue_submit` が失敗しても記録は成功のままになる。
+#[test]
+fn 人の指示の記録は積んだ時点と届いた時点を分ける() {
+    let (mut rt, _, _, agent) = to_instructable();
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: AgentId(agent.clone()),
+        text: "先にテストを書いて".into(),
+    });
+    let key = manual_sends(&out)[0].3.clone();
+    let queued: Vec<String> = human_instructions(&rt);
+    assert_eq!(queued.len(), 1, "積んだ記録が 1 件ではない: {queued:?}");
+    assert!(
+        !queued[0].contains("送りました"),
+        "まだ届いていないのに「送りました」と書いている: {}",
+        queued[0]
+    );
+    assert!(
+        queued[0].contains("キュー"),
+        "積んだだけであることが記録から読めない: {}",
+        queued[0]
+    );
+
+    // 届いた。
+    rt.note_manual_delivery(&key, true, "");
+    let done = human_instructions(&rt);
+    assert_eq!(done.len(), 2, "結末が記録されていない: {done:?}");
+    assert!(done[1].contains("届きました"), "{}", done[1]);
+    assert!(rt.effect_completed(&key), "届いたのに完了になっていない");
+
+    // 失敗の側は理由まで残る。
+    let out = rt.apply_action(TeamAction::InstructAgent {
+        agent: AgentId(agent),
+        text: "もう 1 つ".into(),
+    });
+    let key = manual_sends(&out)[0].3.clone();
+    rt.note_manual_delivery(&key, false, "送信キューへ積めませんでした");
+    let all = human_instructions(&rt);
+    let last = all.last().unwrap();
+    assert!(
+        last.contains("送れませんでした") && last.contains("送信キューへ積めませんでした"),
+        "失敗の理由が記録から読めない: {last}"
+    );
+}
+
+/// **鍵から宛先を読み直せる。** 名前に `:` が入っていても割れない
+/// (前から切ると「エージェント名の途中」で割れる)。
+#[test]
+fn 人の指示の鍵から宛先を読み直せる() {
+    for name in ["dev-1", "team:lead", "a:b:c"] {
+        let id = AgentId(name.into());
+        let key = manual_instruction_key(&id, 42);
+        assert_eq!(
+            manual_instruction_agent(&key),
+            Some(id),
+            "鍵から宛先を読めない: {key}"
+        );
+    }
+    // Team のものではない目印は読まない (何も起きない)。
+    for key in ["instr:1:dev-1:0:0", "manual:", "manual:dev-1", "start:dev-1"] {
+        assert_eq!(manual_instruction_agent(key), None, "読めてはいけない: {key}");
+    }
+}
+
+/// **空の指示は、送信も文脈更新もしない。**
+#[test]
+fn 空の指示は文脈も動かさない() {
+    let (mut rt, _, tid, agent) = to_instructable();
+    let before = rt.task(tid).unwrap().context.clone();
+    let events_before = rt.events().count();
+    for text in ["", "   ", "\n\t "] {
+        let out = rt.apply_action(TeamAction::InstructAgent {
+            agent: AgentId(agent.clone()),
+            text: text.into(),
+        });
+        assert!(manual_sends(&out).is_empty(), "空の指示が出た: {text:?}");
+    }
+    assert_eq!(
+        rt.task(tid).unwrap().context,
+        before,
+        "空の指示でタスク文脈が動いた"
+    );
+    assert_eq!(
+        rt.events().count(),
+        events_before,
+        "空の指示で記録が増えた (押していないものを押したことにしている)"
+    );
+}
+
+/// 人の指示として残った記録の本文を、古い順に取り出す。
+fn human_instructions(rt: &TeamRuntime) -> Vec<String> {
+    rt.events()
+        .filter(|e| e.kind == TeamEventKind::HumanInstruction)
+        .map(|e| e.summary.clone())
+        .collect()
+}
+

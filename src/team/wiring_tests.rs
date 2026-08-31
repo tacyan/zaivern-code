@@ -1053,7 +1053,7 @@ fn 実行側は必ず成否を返す() {
     let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
 
     // (取り出し口のループ見出し, その区画に必ず要るもの)
-    let loops: [(&str, &[&str]); 4] = [
+    let loops: [(&str, &[&str]); 5] = [
         (
             "for (key, spec) in launches",
             &["p.ack_done(&key)", "p.ack_failed(&key)"],
@@ -1067,6 +1067,15 @@ fn 実行側は必ず成否を返す() {
             // 「積めなかったときに必ず失敗が返る」ことだけ。
             "for (key, task, session, text) in instructions",
             &["p.ack_failed(&key)"],
+        ),
+        (
+            // 人が出した指示。**成功は指示と同じく配達の結末が返す**ので、
+            // ここで見るのは届く前に落ちた 2 つ (コスト上限で止まった /
+            // 送信キューへ積めなかった) だけ。素の `ack_failed` で済ませると
+            // 監査は「送信キューへ追加しました」のまま結末を 1 件も持たない
+            // — queued と failed が記録の上で区別できなくなる。
+            "for (key, agent, session, text) in manual",
+            &["p.note_manual_failed(&key,"],
         ),
         ("for (key, session) in stops", &["p.ack_done(&key)"]),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。

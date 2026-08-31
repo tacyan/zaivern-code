@@ -300,7 +300,7 @@ impl ZaivernApp {
         for (key, agent, session, text) in manual {
             if let Some(why) = self.team_cost_block_reason() {
                 panel::with_panel(|p| {
-                    p.ack_failed(&key);
+                    p.note_manual_failed(&key, &why);
                     p.notice = why.clone();
                 });
                 self.toast(why, false);
@@ -309,7 +309,7 @@ impl ZaivernApp {
             let mut job = crate::submit::Job::deferred(session, text, true);
             job.tag = panel::with_panel(|p| p.delivery_tag(&key));
             if !self.queue_submit(job) {
-                panel::with_panel(|p| p.ack_failed(&key));
+                panel::with_panel(|p| p.note_manual_failed(&key, "送信キューへ積めませんでした"));
                 self.toast(
                     trf(
                         "team.err.manual_not_queued",
