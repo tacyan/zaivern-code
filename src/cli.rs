@@ -42,7 +42,19 @@ impl Instance {
 }
 
 pub fn instance_path() -> PathBuf {
-    zaivern_dir().join("instance.json")
+    instance_path_in(&zaivern_dir())
+}
+
+/// 指定した置き場の `instance.json`。
+///
+/// **置き場を引数で受ける口を必ず 1 つ持たせる。** 置き場を
+/// [`zaivern_dir`] からしか取れないと、置き場を差し替えて動く呼び手
+/// (`zai team --workspace ...` のテスト、隔離した検査) が**実
+/// `~/.zaivern` を読んでしまう**。実際にそれで
+/// `team::cli::tests::resetは確認なしでは消さない` が「開発機で
+/// Zaivern が動いているときだけ赤」になっていた。
+pub fn instance_path_in(home: &std::path::Path) -> PathBuf {
+    home.join("instance.json")
 }
 
 /// 起動時に呼ぶ。`~/.zaivern/instance.json` を書き出す。
@@ -62,7 +74,16 @@ pub fn remove_instance_file() {
 /// `~/.zaivern/instance.json` を読む。ファイルが無い・壊れている・
 /// `pid` が既に死んでいる場合は `None`。
 pub fn read_instance_file() -> Option<Instance> {
-    let raw = std::fs::read_to_string(instance_path()).ok()?;
+    read_instance_file_in(&zaivern_dir())
+}
+
+/// 指定した置き場の `instance.json` を読む。
+///
+/// **見る置き場は、呼び手が操作している置き場と同じにする。** ずらすと
+/// 「一時ディレクトリを相手にしているつもりが、判定だけ実 `~/.zaivern`」
+/// という嘘の関門ができる。
+pub fn read_instance_file_in(home: &std::path::Path) -> Option<Instance> {
+    let raw = std::fs::read_to_string(instance_path_in(home)).ok()?;
     let inst: Instance = serde_json::from_str(&raw).ok()?;
     if !pid_alive(inst.pid) {
         return None;
