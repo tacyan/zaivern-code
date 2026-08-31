@@ -550,7 +550,7 @@ pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
             // GUI は Runtime を記憶に持っていて、次の保存で丸ごと上書き
             // する。書いてから「停止しました」と言うと、実際には止まって
             // いないのに止まったと表示する嘘になる。
-            if let Some(why) = gui_owns(&ws) {
+            if let Some(why) = gui_owns(&root) {
                 return err(why);
             }
             let dir = dir_of(&ws);
@@ -580,7 +580,7 @@ pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
         }
         "reset" => {
             // 画面が開いていると、消した直後に記憶から書き戻される。
-            if let Some(why) = gui_owns(&ws) {
+            if let Some(why) = gui_owns(&root) {
                 return err(why);
             }
             let dir = dir_of(&ws);
@@ -639,8 +639,13 @@ fn resolve(ws: &Path, spec: &str) -> PathBuf {
 /// **ずれることがある** (実行中は切り替えを断るため、まさにずれる)。
 /// 比べようとすると、ずれているときに「別物だから書いてよい」と誤って
 /// 判断する。生きているインスタンスが 1 つでもあれば断る (fail-closed)。
-fn gui_owns(_ws: &Path) -> Option<String> {
-    let inst = crate::cli::read_instance_file()?;
+fn gui_owns(root: &Path) -> Option<String> {
+    // **見る置き場は、この呼び出しが操作している置き場と同じにする。**
+    // 実 `~/.zaivern` を決め打ちで読むと、`--workspace` を一時ディレクトリ
+    // へ向けた検査まで**開発機で動いている Zaivern**に断られる
+    // (`resetは確認なしでは消さない` が実際にそれで赤になっていた)。
+    // 本番は `state_root(None)` = `zaivern_dir()` なので振る舞いは変わらない。
+    let inst = crate::cli::read_instance_file_in(root)?;
     Some(format!(
         "Zaivern が実行中です ({})。\n\
          Team 画面から操作してください — 記憶が置き場を上書きするので、\n\
@@ -903,6 +908,48 @@ mod tests {
         .expect("投函されているべき");
         assert_eq!(req.agent_count, 3);
         assert!(req.auto_start);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+
+    /// **画面が持っているかの判定は、渡された置き場だけを見る。**
+    ///
+    /// 実 `~/.zaivern` を決め打ちで読んでいたので、`--workspace` を一時
+    /// ディレクトリへ向けた検査まで**開発機で動いている Zaivern** に断られて
+    /// いた (`resetは確認なしでは消さない` が「Zaivern を閉じないと緑に
+    /// ならない」状態だった。そういうテストは、そのうち閉じずに読み飛ばされる)。
+    ///
+    /// **環境に条件を課さない形で見る。** 見るのは「居る置き場」と
+    /// 「居ない置き場」で**答えが変わること**。決め打ちで実 `~/.zaivern` を
+    /// 読む実装は、実インスタンスが動いていれば後半で、動いていなければ
+    /// 前半で落ちる — **どちらに転んでも必ず赤になる**。
+    ///
+    /// pid には自分自身を書く (必ず生きていて、他人のプロセスを巻き込まない)。
+    #[test]
+    fn 画面が持っているかの判定は渡された置き場だけを見る() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "own-home");
+        let live = dir.join("live");
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        let inst = serde_json::json!({
+            "port": 8899u16,
+            "token": "t",
+            "workspace": dir.display().to_string(),
+            "pid": std::process::id(),
+        })
+        .to_string();
+        std::fs::write(crate::cli::instance_path_in(&live), inst).unwrap();
+
+        assert!(
+            gui_owns(&live).is_some(),
+            "生きたインスタンスが居る置き場なのに断らなかった"
+        );
+        assert!(
+            gui_owns(&empty).is_none(),
+            "インスタンスの居ない置き場なのに断った (渡された置き場を見ていない)"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -315,12 +315,43 @@ fn 検証コマンドの解析失敗を黙って捨てない() {
         "検証コマンドの可否を `is_ok()` で選り分けている (失敗が黙って消える)"
     );
     // 断るときは、**種類を分けて**返している。
+    //
+    // **自動決定できないことは断る理由ではない** (素の HTML など、走らせ
+    // られる検証が存在しないフォルダがある)。そちらは計画を通して
+    // 「検証なし」として進み、盤面がそれを出す。振る舞いの番人は
+    // `planner::tests::検証を自動決定できなくても計画は通るが検証は空のまま`。
     for want in [
         "PlanError::InvalidValidationCommand",
         "PlanError::ForbiddenValidationCommand",
-        "PlanError::ValidationUndetermined",
     ] {
         assert!(body.contains(want), "{want} で断る経路が無い");
+    }
+}
+
+#[test]
+fn 検出の失敗理由を握り潰していない() {
+    // **回帰そのもの。** `detect()` の戻りを `unwrap_or_default()` で畳むと、
+    // 「読めない」(`DetectError::Unreadable`) が「候補なし」と同じ空配列に
+    // なる。壊れた `package.json` のリポジトリが検証なしで走り、完了が
+    // **レビュー承認だけ**で決まる状態のまま素通りする。
+    //
+    // 振る舞いの番人は `planner::tests::壊れたpackage_jsonは検証なしとして通さない`。
+    // ここが見るのは**握り潰す書き方が戻っていないか**だけ。
+    let s = src(PLANNER);
+    let at = s.find("pub fn compose").expect("compose が無い");
+    let body = function_body(&s, at);
+    assert!(
+        !body.contains("unwrap_or_default()"),
+        "detect() の失敗理由を握り潰している"
+    );
+    // **variant を名指しで**分けている (文字列で理由を判定していない)。
+    for want in [
+        "DetectError::Undetermined",
+        "DetectError::NoCandidate",
+        "DetectError::Unreadable",
+        "PlanError::ValidationDetectionFailed",
+    ] {
+        assert!(body.contains(want), "{want} を名指しで扱っていない");
     }
 }
 
@@ -1049,7 +1080,7 @@ fn 実行側は必ず成否を返す() {
     let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
 
     // (取り出し口のループ見出し, その区画に必ず要るもの)
-    let loops: [(&str, &[&str]); 4] = [
+    let loops: [(&str, &[&str]); 5] = [
         (
             "for (key, spec) in launches",
             &["p.ack_done(&key)", "p.ack_failed(&key)"],
@@ -1063,6 +1094,15 @@ fn 実行側は必ず成否を返す() {
             // 「積めなかったときに必ず失敗が返る」ことだけ。
             "for (key, task, session, text) in instructions",
             &["p.ack_failed(&key)"],
+        ),
+        (
+            // 人が出した指示。**成功は指示と同じく配達の結末が返す**ので、
+            // ここで見るのは届く前に落ちた 2 つ (コスト上限で止まった /
+            // 送信キューへ積めなかった) だけ。素の `ack_failed` で済ませると
+            // 監査は「送信キューへ追加しました」のまま結末を 1 件も持たない
+            // — queued と failed が記録の上で区別できなくなる。
+            "for (key, agent, session, text) in manual",
+            &["p.note_manual_failed(&key,"],
         ),
         ("for (key, session) in stops", &["p.ack_done(&key)"]),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
