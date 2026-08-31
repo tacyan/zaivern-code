@@ -567,6 +567,22 @@ impl ZaivernApp {
         }
         let now = crate::features::team::imp::model::now_secs();
         let theme = self.theme.clone();
+        let font = self.cfg.terminal_font_size;
+        // **端末を盤面の中に描く口。** セッションを持っているのは app 側
+        // なので、盤面には場所だけ用意させて、実体はここで描く。
+        // 見つからなければ `false` を返し、盤面は文字だけの控えへ落ちる
+        // (端末が終わったあとも「何をしていたか」は読めるべきなので)。
+        let sessions = &mut self.agents.sessions;
+        let mut term = |ui: &mut egui::Ui, sid: SessionId| -> bool {
+            let Some(s) = sessions.iter_mut().find(|s| s.id == sid) else {
+                return false;
+            };
+            // **触れる端末にする** (interactive)。見るだけなら「中身を見る」で
+            // 足りるので、ここまで開いた人は打てて当然と考える。
+            // 大きさは札が決めるので、こちらからは変えない (allow_resize = false)。
+            crate::terminal::draw(ui, s, &theme, font, true, false, true);
+            true
+        };
         let acts = panel::with_panel(|p| {
             p.refresh_snapshot(now);
             let mut form = p.form.clone();
@@ -583,6 +599,7 @@ impl ZaivernApp {
                 &p.run_tabs(),
                 p.active_run(),
                 &p.notice,
+                &mut term,
             );
             p.form = form;
             // Inspector は別窓 (盤面を狭めない)。

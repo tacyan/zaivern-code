@@ -25,7 +25,7 @@
 //! `scheduler` が「行ける」と言っても、`coordinator` が断ったら**配らない**。
 //! ファイルの重なり・前任者の停止未確認・再試行上限は既存側の判断に従う。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -325,6 +325,26 @@ pub struct TeamRuntime {
     /// 永続化しない (`persistence::Saved` に無い) — 再起動後に「前の実行の
     /// 画面」が残っていると、動いていないものが動いて見える。
     previews: BTreeMap<AgentId, String>,
+    /// **一度取り込んだ塊。** 同じ報告を毎 tick 読み直さないための記憶。
+    ///
+    /// 以前は画面側 (`panel::new_lines`) が**行**の重複を落としていたが、
+    /// それでは**報告そのものが分断される**。指示のエコーで
+    /// `[ZAI-TEAM-RESULT]` や `"blockers": []` は既に「見た行」になっている
+    /// ので、本物の報告が来ても**開始マーカーごと消えて**解析器に届かない。
+    /// 実機ではこれで、Team Lead が完了報告を出しているのに却下も受理も
+    /// 記録されないまま止まっていた。
+    ///
+    /// 重複は**意味の単位 (塊) で**落とす。保存しない — 再起動後に同じ塊が
+    /// 来ても、状態機械が fail-closed で弾く。
+    ///
+    /// **タスクの状態が動いたら忘れる。** 内容だけで落とし続けると、
+    /// 差し戻しのあとに同じ文面で出し直された報告まで捨ててしまい、
+    /// 「直したのに永久に受け取られない」になる (再検証・再レビューの
+    /// 経路が実際にそうなった)。動いた = 話が進んだ、なので同じ文面でも
+    /// 別の提出として扱ってよい。
+    seen_blocks: HashSet<u64>,
+    /// 古い順に捨てるための並び (上限 [`SEEN_BLOCKS_CAP`])。
+    seen_block_order: VecDeque<u64>,
     /// **配達待ちのエージェント間伝言。**
     ///
     /// `harvest` は `&mut self` を持っているので Effect の入れ物を
@@ -335,6 +355,12 @@ pub struct TeamRuntime {
 
 /// エージェント 1 体ぶんの画面プレビューに残す文字数。
 pub const PREVIEW_MAX_CHARS: usize = 4_000;
+
+/// 「もう読んだ」と覚えておく塊の数。
+///
+/// 上限が無いと、長く走った Run のぶんだけ記憶が太る。塊は報告・レビュー・
+/// 事象・伝言の 4 種類しかないので、この数で十分足りる。
+pub const SEEN_BLOCKS_CAP: usize = 512;
 
 /// 計画が必要としている役割を、枠 `slots` ぶんだけ並べる (純関数)。
 ///
@@ -465,6 +491,8 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            seen_blocks: HashSet::new(),
+            seen_block_order: VecDeque::new(),
         };
         rt.plan_roster();
         rt.log(
@@ -593,6 +621,8 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            seen_blocks: HashSet::new(),
+            seen_block_order: VecDeque::new(),
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
@@ -1659,6 +1689,9 @@ impl TeamRuntime {
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        // 話が進んだかを見るための控え (**状態が動いたら塊の記憶を忘れる**)。
+        let states_before: Vec<(TaskId, TeamTaskState)> =
+            self.tasks.iter().map(|t| (t.id, t.state)).collect();
 
         // 1) 観測 — セッションの状態をエージェントへ写す。
         self.sync_sessions(obs);
@@ -1688,6 +1721,35 @@ impl TeamRuntime {
         // 8) エージェント同士の伝言を配る。**Pause 中でも配る** —
         //    伝言は新しい仕事ではなく、既に起きたことの共有なので。
         out.append(&mut std::mem::take(&mut self.pending_msgs));
+
+        // 9) **また出してよい状態へ動いたら**、塊の記憶を忘れる。
+        //
+        //    差し戻しや配り直しのあとは、同じ文面で出し直されることがある。
+        //    内容だけで落とし続けると「直したのに永久に受け取られない」に
+        //    なる (再検証・再レビューの経路が実際にそうなった)。
+        //
+        //    **却下や完了で忘れない。** そこで忘れると、画面に残っている
+        //    同じ報告を次の tick でまた読み、却下が何十件も並ぶ。
+        let reopened = self.tasks.iter().any(|t| {
+            let was = states_before
+                .iter()
+                .find(|(id, _)| *id == t.id)
+                .map(|(_, st)| *st);
+            was.is_some_and(|w| {
+                w != t.state
+                    && matches!(
+                        t.state,
+                        TeamTaskState::Ready
+                            | TeamTaskState::Assigned
+                            | TeamTaskState::Running
+                            | TeamTaskState::RevisionRequired
+                    )
+            })
+        });
+        if reopened {
+            self.seen_blocks.clear();
+            self.seen_block_order.clear();
+        }
 
         self.drain_rejections();
         if self.dirty {
@@ -1952,6 +2014,15 @@ impl TeamRuntime {
             if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
                 continue;
             }
+            // **同じ塊は一度しか取り込まない。** 画面は同じ報告を何度も
+            // 映すので、これが無いと 1 通の完了報告が毎 tick 読み直される。
+            let results = self.take_unseen(results);
+            let reviews = self.take_unseen(reviews);
+            let events = self.take_unseen(events);
+            let msgs = self.take_unseen(msgs);
+            if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
+                continue;
+            }
             picked.push(Picked {
                 agent,
                 results,
@@ -2054,6 +2125,25 @@ impl TeamRuntime {
             .collect();
         let from = kept.len().saturating_sub(lines);
         kept[from..].join("\n")
+    }
+
+    /// まだ取り込んでいない塊だけを返す (取り込んだ印も付ける)。
+    fn take_unseen(&mut self, blocks: Vec<String>) -> Vec<String> {
+        let mut out = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let h = crate::history::fnv1a64(b.as_bytes());
+            if !self.seen_blocks.insert(h) {
+                continue;
+            }
+            self.seen_block_order.push_back(h);
+            while self.seen_block_order.len() > SEEN_BLOCKS_CAP {
+                if let Some(old) = self.seen_block_order.pop_front() {
+                    self.seen_blocks.remove(&old);
+                }
+            }
+            out.push(b);
+        }
+        out
     }
 
     /// このエージェントへ送った指示の文面 (echo 判定用)。

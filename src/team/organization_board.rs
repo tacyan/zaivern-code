@@ -244,6 +244,10 @@ pub fn board_window(
     runs: &[(String, bool)],
     active_run: usize,
     notice: &str,
+    // 端末 1 枚を「ここへ」描く口。描けたら true。
+    // **実体は app 側にある** (セッションを持っているのはあちら) ので、
+    // 盤面は場所だけ用意して呼ぶ。
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) -> Vec<BoardAction> {
     let mut acts = Vec::new();
     if !open {
@@ -278,7 +282,7 @@ pub fn board_window(
         .show(ctx, |ui| {
             body(
                 ui, theme, snap, tab, form, restore, selected, expanded, runs, active_run,
-                notice, &mut acts,
+                notice, &mut acts, term,
             );
         });
     if !win_open {
@@ -303,6 +307,7 @@ fn body(
     active_run: usize,
     notice: &str,
     acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) {
     if !notice.is_empty() {
         ui.colored_label(theme.warn, plain(notice));
@@ -360,7 +365,7 @@ fn body(
         ui.allocate_ui_with_layout(egui::vec2(board_w, content_h), column, |ui| match tab {
             BoardTab::Organization => organization_tab(ui, theme, s, &layout, selected, acts),
             BoardTab::Tasks => tasks_tab(ui, theme, s, acts),
-            BoardTab::Terminals => terminals_tab(ui, theme, s, expanded, acts),
+            BoardTab::Terminals => terminals_tab(ui, theme, s, expanded, acts, term),
             BoardTab::Timeline => timeline_tab(ui, theme, s),
         });
         if layout.mission_panel {
@@ -898,6 +903,12 @@ fn task_card(
     ui.add_space(3.0);
 }
 
+/// 札の中に本物の端末を描くときの高さ。
+///
+/// **画面を占領しない大きさにする。** 高くすると他の担当が視界から
+/// 消えるので、「チームを見ながら 1 人を覗く」ができなくなる。
+const TERMINAL_CARD_H: f32 = 320.0;
+
 // ── Terminals タブ ───────────────────────────────────────────────────
 
 /// **端末タブ = デッキ。** 名前とボタンだけでは「何をしているか」が分からない。
@@ -914,6 +925,7 @@ fn terminals_tab(
     s: &TeamSnapshot,
     expanded: Option<&AgentId>,
     acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) {
     let managed: Vec<&TeamAgentView> = s
         .agents
@@ -931,7 +943,7 @@ fn terminals_tab(
             let w = ui.available_width();
             for a in managed {
                 let open = expanded == Some(&a.id);
-                agent_deck_card(ui, theme, a, w, open, acts);
+                agent_deck_card(ui, theme, a, w, open, acts, term);
                 ui.add_space(6.0);
             }
         });
@@ -945,6 +957,7 @@ fn agent_deck_card(
     width: f32,
     open: bool,
     acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) {
     egui::Frame::none()
         .fill(theme.panel)
@@ -999,6 +1012,27 @@ fn agent_deck_card(
                 return;
             }
             ui.add_space(4.0);
+            // **開いたら本物の端末をここへ描く。**
+            //
+            // 画面を切り替えて裏で見るのではなく、チームの盤面の中で
+            // そのまま見えること — 「端末を開く」で中央ビューが入れ替わると、
+            // 「ちょっと様子を見たい」に対して代償が大きすぎる。
+            if open {
+                if let Some(sid) = a.session_id {
+                    let mut drawn = false;
+                    egui::Frame::none()
+                        .fill(theme.bg)
+                        .rounding(6.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_height(TERMINAL_CARD_H);
+                            drawn = term(ui, sid);
+                        });
+                    if drawn {
+                        return;
+                    }
+                }
+            }
             let all: Vec<&str> = body.lines().collect();
             // 畳んでいるときは末尾だけ (札が縦に伸びて一覧にならなくなる)。
             let from = if open {
@@ -1635,6 +1669,9 @@ mod tests {
                         &[],
                         0,
                         "",
+                        // 端末は描かない (ヘッドレスにセッションは無い)。
+                        // **描けなかったときの経路**もここで踏まれる。
+                        &mut |_ui, _sid| false,
                     );
                 });
                 used = ctx.used_rect();

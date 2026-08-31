@@ -18,7 +18,7 @@
 //! [`BoardAction`] を返すだけで、プロセス起動もファイル書き込みもしない。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,9 +39,6 @@ pub const SCAN_INTERVAL: Duration = Duration::from_millis(400);
 /// (設計原則 3: アイドル時のコストはゼロ)。人が `zai team run` を打って
 /// から 1 秒以内に反応すれば、待たされたとは感じない。
 pub const LAUNCH_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// セッションごとに覚えておく「もう読んだ行」の数。
-pub const SEEN_LINES_CAP: usize = 600;
 
 /// 1 回の走査で読む画面の行数。
 pub const SCAN_ROWS: usize = 200;
@@ -378,9 +375,6 @@ pub struct TeamPanel {
     /// テストはここを一時ディレクトリへ向ける (`ZAIVERN_HOME` を差し替えると
     /// 並列に走る他のテストへ漏れるので使わない)。
     home: PathBuf,
-    /// セッションごとの「もう読んだ行」(順序つき・上限あり)。
-    seen_order: HashMap<SessionId, VecDeque<u64>>,
-    seen_set: HashMap<SessionId, HashSet<u64>>,
     /// 次に走査してよい時刻。**`Instant` は永続化しない。**
     next_scan: Option<Instant>,
     /// 次に起動要求を見に行ってよい時刻。
@@ -424,8 +418,6 @@ impl Default for TeamPanel {
             needs_save: false,
             workspace: PathBuf::new(),
             home: persistence::default_home(),
-            seen_order: HashMap::new(),
-            seen_set: HashMap::new(),
             next_scan: None,
             next_launch_poll: None,
             validation_jobs: Vec::new(),
@@ -844,56 +836,27 @@ impl TeamPanel {
         }
     }
 
-    /// セッションが消えたら、その記憶も捨てる (無制限に溜めない)。
-    pub fn forget_session(&mut self, id: SessionId) {
-        self.seen_order.remove(&id);
-        self.seen_set.remove(&id);
-    }
-
-    /// **前回以降に増えた行だけ**を取り出す。
-    ///
-    /// 画面は同じ行を何度も映すので、これが無いと 1 通の完了報告が毎回
-    /// 読み直される (却下が何十件も並ぶ)。
-    fn new_lines(&mut self, id: SessionId, tail: &[String]) -> String {
-        let mut out = String::new();
-        for line in tail {
-            let h = fnv1a(line.as_bytes());
-            let set = self.seen_set.entry(id).or_default();
-            if !set.insert(h) {
-                continue;
-            }
-            let order = self.seen_order.entry(id).or_default();
-            order.push_back(h);
-            while order.len() > SEEN_LINES_CAP {
-                if let Some(old) = order.pop_front() {
-                    self.seen_set.entry(id).or_default().remove(&old);
-                }
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-
     /// app から観測を受け取って 1 tick 進める。**描画の外で呼ぶこと。**
     pub fn pump_sessions(&mut self, rows: Vec<SessionInput>, now: u64) {
         if self.rt().is_none() || self.read_only {
             return;
         }
-        let live: HashSet<SessionId> = rows.iter().map(|r| r.id).collect();
-        let gone: Vec<SessionId> = self
-            .seen_set
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
-            .collect();
-        for id in gone {
-            self.forget_session(id);
-        }
         let sessions = rows
             .into_iter()
             .map(|r| {
-                let text = self.new_lines(r.id, &r.tail);
+                // **画面をそのまま渡す。**
+                //
+                // 以前はここで「前回以降に増えた行だけ」に絞っていたが、
+                // それでは**報告そのものが分断される**。指示のエコーで
+                // `[ZAI-TEAM-RESULT]` や `"blockers": []` は既に「見た行」に
+                // なっているので、本物の報告が来ても開始マーカーごと消えて
+                // 解析器に届かない (実機で、完了報告を出しているのに却下も
+                // 受理も記録されないまま止まっていた)。
+                //
+                // 重複は**意味の単位 (塊)** で Runtime が落とす
+                // (`TeamRuntime::take_unseen`)。走査量は `SCAN_MAX_BYTES` が
+                // 抑えるので、毎フレーム全履歴を舐めることにはならない。
+                let text = r.tail.join("\n");
                 super::runtime::SessionObs {
                     id: r.id,
                     title: r.title,
@@ -1394,8 +1357,6 @@ impl TeamPanel {
         self.read_only = false;
         self.notice.clear();
         self.dropped_effects = 0;
-        self.seen_order.clear();
-        self.seen_set.clear();
         self.next_scan = None;
         self.next_launch_poll = None;
         self.dirty = true;
@@ -1541,17 +1502,6 @@ impl TeamPanel {
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
-}
-
-/// FNV-1a 64bit。**版に依存しない**ハッシュ (`DefaultHasher` は rustc を
-/// 上げると値が変わる — ここは 1 プロセス内でしか使わないが、揃えておく)。
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 thread_local! {
@@ -2353,36 +2303,125 @@ mod tests {
         }
     }
 
+    /// **エコーの後に届いた本物の報告が、ちゃんと解析器へ届く。**
+    ///
+    /// 実機で止まっていた形をそのまま置く。指示は PTY へ打ち込むので
+    /// エージェントの TUI がひな型ごと描き返し、`[ZAI-TEAM-RESULT]` や
+    /// `"blockers": []` は**先に「見た行」になる**。行で重複を落としていた
+    /// 頃は、本物の報告が来ても**開始マーカーごと消えて**解析器に届かず、
+    /// 却下も受理も記録されないまま止まっていた。
+    ///
+    /// 「届いたこと」は**居ないタスク番号**で見る。`#99` を名指しした
+    /// 断りは、その塊が解析器を通ったときにしか出ない — 通らなければ
+    /// 事象は 1 件も増えないので、空回りしない検査になる。
     #[test]
-    fn 同じ行を二度読まない() {
-        let mut p = TeamPanel::default();
-        let tail = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(p.new_lines(1, &tail), "a\nb\n");
-        // 2 回目は 1 行も返さない (毎フレーム同じ報告を読み直さない)
-        assert_eq!(p.new_lines(1, &tail), "");
-        let more = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert_eq!(p.new_lines(1, &more), "c\n");
-        // 別のセッションは独立
-        assert_eq!(p.new_lines(2, &tail), "a\nb\n");
-    }
-
-    #[test]
-    fn 記憶は上限を超えない() {
-        let mut p = TeamPanel::default();
-        for i in 0..(SEEN_LINES_CAP + 100) {
-            p.new_lines(1, &[format!("line {i}")]);
+    fn エコーの後の本物の報告が届く() {
+        let dir = ws("echo-then-real");
+        let mut p = started_panel(&dir);
+        let boot = p.take_launches();
+        let mut sid: SessionId = 1;
+        for (_, spec) in &boot {
+            p.bind_session(&spec.agent_id, sid, None);
+            sid += 1;
         }
-        assert!(p.seen_order[&1].len() <= SEEN_LINES_CAP);
-        assert!(p.seen_set[&1].len() <= SEEN_LINES_CAP);
+        let open = super::super::result_parser::RESULT_OPEN;
+        let close = super::super::result_parser::RESULT_CLOSE;
+        let block = |task: u64, summary: &str| {
+            format!(
+                "{open}\n{{\"task_id\": {task}, \"agent_id\": \"team-lead\", \
+                 \"status\": \"completed\", \"summary\": \"{summary}\", \
+                 \"changed_files\": [], \"validation\": [], \"blockers\": []}}\n{close}"
+            )
+        };
+        let rows = |text: &str| -> Vec<SessionInput> {
+            vec![SessionInput {
+                id: 1,
+                title: "a".into(),
+                provider: "claude".into(),
+                state: crate::coordinator::SessionState::Idle,
+                tail: text.lines().map(str::to_string).collect(),
+            }]
+        };
+        let saw_99 = |p: &TeamPanel| -> bool {
+            p.rt()
+                .is_some_and(|r| r.events().any(|e| e.summary.contains("#99")))
+        };
+        // 1) 指示のエコー (ひな型) が先に画面へ出る。
+        let echo = block(1, "何をしたかの 1 行");
+        p.pump_sessions(rows(&echo), 100);
+        assert!(!saw_99(&p), "まだ本物は来ていない");
+        // 2) そのあとに本物が積み上がる。**行の多くはエコーと同じ。**
+        p.pump_sessions(rows(&format!("{echo}\n{}", block(99, "本物"))), 101);
+        assert!(
+            saw_99(&p),
+            "エコーの後に届いた本物の報告が解析器へ届いていない (実機で止まっていた形)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **同じ報告を二度取り込まない。**
+    ///
+    /// 以前はここで「行」の重複を落としていたが、それでは報告そのものが
+    /// 分断される — 指示のエコーで `[ZAI-TEAM-RESULT]` は既に「見た行」に
+    /// なっているので、本物の報告が来ても開始マーカーごと消えて解析器に
+    /// 届かない (実機で、完了報告を出しているのに却下も受理も記録されない
+    /// まま止まっていた)。重複は**意味の単位 (塊)** で落とす。
     #[test]
-    fn 消えたセッションの記憶は捨てる() {
-        let mut p = TeamPanel::default();
-        p.new_lines(1, &["x".to_string()]);
-        assert!(p.seen_set.contains_key(&1));
-        p.forget_session(1);
-        assert!(!p.seen_set.contains_key(&1));
+    fn 同じ報告を二度取り込まない() {
+        let dir = ws("seen-blocks");
+        let mut p = started_panel(&dir);
+        let boot = p.take_launches();
+        let mut sid: SessionId = 1;
+        for (_, spec) in &boot {
+            p.bind_session(&spec.agent_id, sid, None);
+            sid += 1;
+        }
+        // 完了報告を含む画面を**2 回**渡す。取り込みは 1 回だけ。
+        let block = format!(
+            "{}\n{{\"task_id\": 1, \"agent_id\": \"team-lead\", \"status\": \"completed\", \
+             \"summary\": \"やった\", \"changed_files\": [], \"validation\": [], \"blockers\": []}}\n{}",
+            super::super::result_parser::RESULT_OPEN,
+            super::super::result_parser::RESULT_CLOSE
+        );
+        let rows = |text: &str| -> Vec<SessionInput> {
+            vec![SessionInput {
+                id: 1,
+                title: "a".into(),
+                provider: "claude".into(),
+                state: crate::coordinator::SessionState::Idle,
+                tail: text.lines().map(str::to_string).collect(),
+            }]
+        };
+        // 報告の取り込みで出る事象だけを数える (割り当てなどは別に進む)。
+        let report_events = |p: &TeamPanel| -> usize {
+            p.rt()
+                .map(|r| {
+                    r.events()
+                        .filter(|e| {
+                            matches!(
+                                e.kind,
+                                TeamEventKind::Rejected | TeamEventKind::TaskCompleted
+                            )
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        // **割り当てが落ち着いてから**報告を渡す (配られた直後は、また
+        // 出してよい状態へ動いたばかりなので記憶を持たない — それが正しい)。
+        p.pump_sessions(rows(""), 99);
+        p.pump_sessions(rows(""), 99);
+        p.pump_sessions(rows(&block), 100);
+        let after_first = report_events(&p);
+        assert!(after_first > 0, "1 回目で報告が取り込まれていない");
+        // **同じ画面をもう一度渡しても、報告の事象は増えない。**
+        p.pump_sessions(rows(&block), 101);
+        assert_eq!(
+            after_first,
+            report_events(&p),
+            "同じ報告を二度取り込んでいる (却下や受理が二重に並ぶ)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

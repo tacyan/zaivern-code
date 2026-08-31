@@ -238,6 +238,9 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
         close = super::reviewer::REVIEW_CLOSE,
         id = target.id,
     ));
+    // **レビューこそ伝える相手が要る。** 指摘を書いても、直す本人へ
+    // 届かなければ盤面に残るだけになる。
+    s.push_str(&teammates_section(&b.teammates));
     cap(s)
 }
 
@@ -310,6 +313,40 @@ mod tests {
             forbidden_files: vec!["src/other/**".into()],
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
         }
+    }
+
+    /// **どの役割の指示文にも、仲間の一覧と伝言の作法が載る。**
+    ///
+    /// 載っていない役割は**一生伝言を使わない** (機能があっても到達経路が
+    /// 無いのと同じ)。実際にレビュー担当だけ抜けていた — いちばん伝える
+    /// 必要がある役割なのに。
+    #[test]
+    fn どの役割にも伝言の作法が載る() {
+        let g = goal();
+        let mut t = task(1, "a", &[]);
+        t.assigned_agent = Some(super::super::model::AgentId::new("impl-1"));
+        let mut b = brief(&g, &t);
+        b.teammates = vec![
+            ("agent-2".into(), "Reviewer".into()),
+            ("agent-3".into(), "Tester".into()),
+        ];
+        for (name, text) in [
+            ("実装", implementer(&b)),
+            ("レビュー", reviewer(&b, &t)),
+            ("統合", integrator(&b, std::slice::from_ref(&t))),
+        ] {
+            assert!(
+                text.contains(super::super::result_parser::MSG_OPEN),
+                "{name}担当の指示文に伝言の作法が無い"
+            );
+            assert!(
+                text.contains("agent-2") && text.contains("Reviewer"),
+                "{name}担当の指示文に仲間の一覧が無い"
+            );
+        }
+        // 仲間が居なければ**出さない** (宛先の無い作法は書かせない)。
+        b.teammates.clear();
+        assert!(!implementer(&b).contains(super::super::result_parser::MSG_OPEN));
     }
 
     #[test]
