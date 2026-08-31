@@ -927,11 +927,10 @@ fn terminals_tab(
     acts: &mut Vec<BoardAction>,
     term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) {
-    let managed: Vec<&TeamAgentView> = s
-        .agents
-        .iter()
-        .filter(|a| a.kind == AgentKind::ManagedSession)
-        .collect();
+    // **サブエージェントも並べる。** 端末は持たないが、親が知らせてきた
+    // 「いま何をしているか」は出す — 出さないと、盤面には居るのに
+    // ここでは消えてしまい、「誰が動いているか」が 2 つの画面で食い違う。
+    let managed: Vec<&TeamAgentView> = s.agents.iter().collect();
     if managed.is_empty() {
         centered_note(ui, theme, &tr("team.empty.no_terminals"));
         return;
@@ -972,34 +971,43 @@ fn agent_deck_card(
                 ui.label(RichText::new(role_label(a.role)).color(theme.text_dim));
                 // ボタンは右端へ寄せる (狭いときも本文を押し出さない)。
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match a.session_id {
-                        Some(sid) if a.can_open_terminal => {
-                            // **切り替えずに見る**のが既定。画面が入れ替わると
-                            // 「ちょっと様子を見たい」に対して代償が大きい。
-                            let label = if open {
-                                tr("team.btn.fold_output")
-                            } else {
-                                tr("team.btn.show_output")
-                            };
-                            if ui.button(label).clicked() {
-                                acts.push(BoardAction::ToggleAgentOutput(a.id.clone()));
-                            }
-                            if ui
-                                .button(tr("team.btn.open_terminal"))
-                                .on_hover_text(tr("team.btn.open_terminal_hint"))
-                                .clicked()
-                            {
-                                acts.push(BoardAction::OpenTerminal(sid));
-                            }
+                    // **ボタンは 1 つだけ。**
+                    //
+                    // 以前は「端末を開く」も並べていたが、あれは中央ビューを
+                    // 入れ替える操作で、画面いっぱいの Team 窓の**裏側**で
+                    // 起きるので「押しても何も起きない」ように見えた
+                    // (実際にそう報告された)。同じ場所で中身が見えるなら、
+                    // 2 つ目の到達経路は要らない (CLAUDE.md「増やす前に減らす」)。
+                    if a.can_open_terminal {
+                        let label = if open {
+                            tr("team.btn.fold_output")
+                        } else {
+                            tr("team.btn.show_output")
+                        };
+                        if ui.button(label).clicked() {
+                            acts.push(BoardAction::ToggleAgentOutput(a.id.clone()));
                         }
-                        _ => {
-                            // **開けないボタンは無効にして理由を出す。**
-                            ui.add_enabled(false, egui::Button::new(tr("team.btn.open_terminal")))
-                                .on_disabled_hover_text(tr("team.terminal.not_started"));
-                        }
+                    } else {
+                        // **押せないボタンは無効にして理由を出す。**
+                        ui.add_enabled(false, egui::Button::new(tr("team.btn.show_output")))
+                            .on_disabled_hover_text(tr("team.terminal.not_started"));
                     }
                 });
             });
+            // 親が居れば示す (サブエージェントは誰の下かが要る)。
+            if let Some(parent) = &a.parent_id {
+                ui.label(
+                    RichText::new(trf("team.child.of", &[("parent", parent.0.clone())]))
+                        .color(theme.text_dim)
+                        .size(11.0),
+                );
+            }
+            // 端末を持たない相手は、親が知らせてきた行動を出す。
+            if !a.can_open_terminal && !a.current_action.is_empty() {
+                let act = plain(&a.current_action);
+                ui.label(RichText::new(ellipsis(&act, 90)).color(theme.text_dim))
+                    .on_hover_text(act);
+            }
             // いま何のタスクを持っているか (無ければ行ごと出さない)。
             if !a.current_task_title.is_empty() {
                 let t = plain(&a.current_task_title);
@@ -1019,15 +1027,23 @@ fn agent_deck_card(
             // 「ちょっと様子を見たい」に対して代償が大きすぎる。
             if open {
                 if let Some(sid) = a.session_id {
+                    // **大きさをここで確定させてから描く。**
+                    //
+                    // 外側は縦スクロール領域なので `available_size()` は
+                    // 画面より大きくなりうる。端末はそれを行数だと解釈して
+                    // 描くので、渡す領域を確定しないと**行が重なって崩れる**
+                    // (実際に「スクロールすると表示がバグる」として報告された)。
+                    let size = egui::vec2(ui.available_width(), TERMINAL_CARD_H);
                     let mut drawn = false;
-                    egui::Frame::none()
-                        .fill(theme.bg)
-                        .rounding(6.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_height(TERMINAL_CARD_H);
+                    ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_size(size);
+                            ui.set_max_size(size);
                             drawn = term(ui, sid);
-                        });
+                        },
+                    );
                     if drawn {
                         return;
                     }
@@ -1624,6 +1640,58 @@ fn spec_draft_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **端末タブはサブエージェントも並べる。**
+    ///
+    /// 端末は持たないが、親が知らせてきた「いま何をしているか」は出す。
+    /// 出さないと、組織タブには居るのに端末タブでは消えてしまい、
+    /// 「誰が動いているか」が 2 つの画面で食い違う。
+    #[test]
+    fn 端末タブはサブエージェントも並べる() {
+        let src = include_str!("organization_board.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn terminals_tab(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("端末タブの関数がある");
+        assert!(
+            !body.contains("kind == AgentKind::ManagedSession"),
+            "端末を持つ相手だけに絞っている (サブエージェントが消える):\n{body}"
+        );
+        // 札のほうは、親と行動を出していること。
+        let card = src
+            .split("fn agent_deck_card(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("札の関数がある");
+        assert!(card.contains("a.parent_id"), "誰の下かを出していない");
+        assert!(card.contains("a.current_action"), "何をしているかを出していない");
+    }
+
+    /// **表から引く ID も、辞書に必ずある。**
+    ///
+    /// `tr()` に**変数**を渡す経路 (`tr(col.0)`) は `zai i18n missing` の
+    /// 走査に現れない。だから辞書から漏れても誰も言わないまま、画面に
+    /// `team.col.waiting` という **ID がそのまま出る** — 実機でそうなった
+    /// (CLAUDE.md「走査に現れない文字列は永久に日本語 (ここでは ID) で出る」)。
+    ///
+    /// 表で持つ ID は、ここで**表ごと**辞書と突き合わせる。
+    #[test]
+    fn 列の見出しはすべて辞書から引ける() {
+        // **同梱辞書を直に見る。** `tr()` は言語パックが載っていないと
+        // ID をそのまま返すので、テストからは判定に使えない。
+        for (lang, _, raw) in crate::locale::BUILTIN {
+            let map: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(raw).expect("同梱辞書は読める");
+            for (id, _) in TASK_COLUMNS {
+                let got = map.get(*id);
+                assert!(
+                    got.is_some_and(|v| !v.trim().is_empty()),
+                    "{lang}: {id} が辞書に無い (画面に ID がそのまま出る)"
+                );
+            }
+        }
+    }
 
     /// **どの画面幅でも、Team 画面が画面の外へはみ出さない。**
     ///

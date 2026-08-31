@@ -35,6 +35,8 @@ pub struct Brief<'a> {
     pub upstream: Vec<String>,
     /// このタスクが**触ってはいけない**ファイル (他タスクの担当範囲)。
     pub forbidden_files: Vec<String>,
+    /// 報告を書き出すフォルダ (**画面ではなくここから読む**)。
+    pub outbox: std::path::PathBuf,
     /// **同じチームの顔ぶれ** `(ID, 役割の表示名)`。
     ///
     /// 誰が居るか分からなければ伝言のしようがない (宛先を捏造するだけ)。
@@ -71,9 +73,23 @@ fn cap(s: String) -> String {
 }
 
 /// 完了報告のひな型。**全役割で同じ 1 本**を使う。
-fn result_format(task_id: u64, agent_id: &str) -> String {
+fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> String {
+    // **ファイルへ書かせるのが本線。** 画面へ出すだけだと、カーソル移動で
+    // 描く CLI (Claude Code v2) では行が潰れて届かない。画面にも出させるのは
+    // 人が読むためで、こちらは控え。
+    let file = if outbox.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "**まず次のファイルへ同じ JSON を書いてください** (これが正式な提出です)。\n\
+             `{}/{agent_id}.json`\n\
+             フォルダが無ければ作ってください。書けたら、下の形で画面にも出してください\n\
+             (画面のほうは人が読むための控えです)。\n\n",
+            outbox.display()
+        )
+    };
     format!(
-        "作業が終わったら、次の形式を**そのまま**出力してください (前後に説明を書いてよい)。\n\
+        "{file}作業が終わったら、次の形式を**そのまま**出力してください (前後に説明を書いてよい)。\n\
          この形式以外での完了報告は受け付けません。\n\n\
          {open}\n\
          {{\n\
@@ -91,6 +107,33 @@ fn result_format(task_id: u64, agent_id: &str) -> String {
          * 進められない場合は status を \"blocked\" にし、blockers に理由を書くこと\n",
         open = super::result_parser::RESULT_OPEN,
         close = super::result_parser::RESULT_CLOSE,
+    )
+}
+
+/// **自分が中で使ったサブエージェントの知らせ方。**
+///
+/// Zaivern は `[ZAI-TEAM-EVENT]` を読んで盤面へ子として並べる仕組みを
+/// 持っているのに、**指示文がそれを一言も伝えていなかった**ので、誰も
+/// 報告せず、盤面には一度も現れなかった (作ってあるのに繋がっていない)。
+///
+/// 出させるのは**始まりと終わり**だけ。実況中継させると、盤面が流れて
+/// 「いま誰が何をしているか」が読めなくなる。
+fn subagents_section(agent_id: &str) -> String {
+    format!(
+        "\n## 中で誰かに手伝わせたとき\n\
+         あなたが内部でサブエージェントを使ったら、**始めたときと終えたとき**に\n\
+         次を出してください (Zaivern の盤面へ、あなたの下にぶら下がって出ます)。\n\n\
+         {open}\n\
+         {{\"kind\": \"sub_agent_started\", \"agent_id\": \"<子の名前>\", \
+         \"parent_id\": \"{agent_id}\", \"role\": \"implementer\", \
+         \"action\": \"何をさせるか 1 行\"}}\n\
+         {close}\n\n\
+         終えたら同じ形で `\"kind\": \"sub_agent_completed\"` を出してください\n\
+         (失敗なら `sub_agent_failed`、詰まったなら `sub_agent_blocked`)。\n\
+         * 実況中継はしない。始まりと終わりだけ\n\
+         * `parent_id` は必ず `{agent_id}` (あなた自身)\n",
+        open = super::result_parser::EVENT_OPEN,
+        close = super::result_parser::EVENT_CLOSE,
     )
 }
 
@@ -181,8 +224,9 @@ pub fn implementer(b: &Brief<'_>) -> String {
          \x20 - 破壊的な削除 (rm -rf 等) を行わない\n",
     );
     s.push_str("\n## 完了報告\n");
-    s.push_str(&result_format(t.id, b.agent_id));
+    s.push_str(&result_format(t.id, b.agent_id, &b.outbox));
     s.push_str(&teammates_section(&b.teammates));
+    s.push_str(&subagents_section(b.agent_id));
     cap(s)
 }
 
@@ -241,6 +285,7 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
     // **レビューこそ伝える相手が要る。** 指摘を書いても、直す本人へ
     // 届かなければ盤面に残るだけになる。
     s.push_str(&teammates_section(&b.teammates));
+    s.push_str(&subagents_section(b.agent_id));
     cap(s)
 }
 
@@ -272,8 +317,9 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
          \x20 - 本番環境・課金・credential に触れない\n",
     );
     s.push_str("\n## 完了報告\n");
-    s.push_str(&result_format(b.task.id, b.agent_id));
+    s.push_str(&result_format(b.task.id, b.agent_id, &b.outbox));
     s.push_str(&teammates_section(&b.teammates));
+    s.push_str(&subagents_section(b.agent_id));
     cap(s)
 }
 
@@ -311,7 +357,44 @@ mod tests {
             workspace_root: "<ワークスペース>",
             upstream: vec!["#1 の成果: API の骨格".into()],
             forbidden_files: vec!["src/other/**".into()],
+            outbox: std::path::PathBuf::from("/tmp/zv-outbox"),
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
+        }
+    }
+
+    /// **サブエージェントの知らせ方を、指示文が必ず伝える。**
+    ///
+    /// `[ZAI-TEAM-EVENT]` を読んで盤面へ子として並べる仕組みは前からあったのに、
+    /// **指示文がそれを一言も伝えていなかった**ので誰も報告せず、盤面には
+    /// 一度も現れなかった (作ってあるのに繋がっていない)。
+    #[test]
+    fn どの役割にもサブエージェントの知らせ方が載る() {
+        let g = goal();
+        let mut t = task(1, "a", &[]);
+        t.assigned_agent = Some(super::super::model::AgentId::new("impl-1"));
+        let b = brief(&g, &t);
+        for (name, text) in [
+            ("実装", implementer(&b)),
+            ("レビュー", reviewer(&b, &t)),
+            ("統合", integrator(&b, std::slice::from_ref(&t))),
+        ] {
+            assert!(
+                text.contains(super::super::result_parser::EVENT_OPEN),
+                "{name}担当の指示文にサブエージェントの知らせ方が無い"
+            );
+            // **表に有る語だけを教える** (捏造した種別は `check_event` が断る)。
+            for kind in ["sub_agent_started", "sub_agent_completed"] {
+                assert!(
+                    text.contains(kind),
+                    "{name}担当の指示文に {kind} が無い"
+                );
+                assert!(
+                    super::super::result_parser::EVENT_KINDS.contains(&kind),
+                    "{kind} は受け付けない語なのに教えている"
+                );
+            }
+            // 親は必ず自分 (`parent_id` を取り違えると木が繋がらない)。
+            assert!(text.contains("impl-1"), "{name}担当の指示文に自分の ID が無い");
         }
     }
 

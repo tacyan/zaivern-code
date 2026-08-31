@@ -18,7 +18,7 @@
 //! [`BoardAction`] を返すだけで、プロセス起動もファイル書き込みもしない。
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -152,6 +152,20 @@ pub enum DraftState {
 
 /// Run ごとの保存先を束ねるフォルダ名 (`<workspace>/runs/<run_id>/`)。
 pub const RUNS_DIR: &str = "runs";
+
+/// **報告を受け取るフォルダ**の名前 (`<state_dir>/outbox/<run_id>/`)。
+///
+/// 画面から読むのをやめてここから読む。Claude Code v2 は報告を改行ではなく
+/// カーソル移動で描くので、画面のグリッドでは行が潰れて**構造的に**
+/// 取りこぼす (実測)。`ZAIVERN_HOME` の下に置くのは、ワークスペースへ
+/// 置くと `changeset` が「担当外を変更した」と測って報告ごと却下されるため。
+pub const OUTBOX_DIR: &str = "outbox";
+
+/// 1 回の tick で取り込む報告ファイルの数の上限。
+///
+/// 上限が無いと、暴走したエージェントが吐いた数千個のファイルを
+/// 1 フレームで読み切ろうとして画面が止まる。
+pub const OUTBOX_PER_TICK: usize = 32;
 
 /// **同時に走らせてよい Run の本数。**
 ///
@@ -669,6 +683,8 @@ impl TeamPanel {
         if !t.is_empty() {
             rt.rename_goal(t);
         }
+        let dir = self.outbox_dir(&rt.run().run_id);
+        rt.set_outbox(dir);
         self.runs.push(rt);
         self.active = self.runs.len() - 1;
         self.read_only = false;
@@ -746,7 +762,9 @@ impl TeamPanel {
             dirs.sort();
             for d in dirs {
                 if let LoadOutcome::Loaded(s) = persistence::load(&d) {
-                    let rt = TeamRuntime::restore(*s, self.workspace.clone());
+                    let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
+                    let dir = self.outbox_dir(&rt.run().run_id);
+                    rt.set_outbox(dir);
                     if seen.insert(rt.run().run_id.clone()) {
                         self.runs.push(rt);
                         loaded += 1;
@@ -764,7 +782,10 @@ impl TeamPanel {
         let dir = root;
         match persistence::load(&dir) {
             LoadOutcome::Loaded(s) => {
-                self.runs.push(TeamRuntime::restore(*s, self.workspace.clone()));
+                let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
+                let dir = self.outbox_dir(&rt.run().run_id);
+                rt.set_outbox(dir);
+                self.runs.push(rt);
                 self.active = self.runs.len() - 1;
                 self.read_only = read_only;
                 self.restore = RestorePrompt::None;
@@ -836,11 +857,85 @@ impl TeamPanel {
         }
     }
 
+    /// この Run の報告置き場。
+    fn outbox_dir(&self, run_id: &str) -> PathBuf {
+        self.state_dir().join(OUTBOX_DIR).join(run_id)
+    }
+
+    /// **置き場に届いた報告を読み、読んだファイルは消す。**
+    ///
+    /// 戻りは「どのセッションの画面テキストへ足すか」。画面から読む経路と
+    /// 同じ入口へ流すので、受理・却下の判断は 1 か所のまま
+    /// (第 2 の取り込み経路を作らない)。
+    ///
+    /// **消してから渡す。** 消さずに渡すと、次の tick でも同じ報告を読み、
+    /// 却下が並ぶ。読めなかったファイルも消す — 壊れた 1 個が残り続けて
+    /// 毎 tick 同じ失敗を出すほうが困る。
+    fn drain_outbox(&mut self) -> HashMap<SessionId, String> {
+        let mut out: HashMap<SessionId, String> = HashMap::new();
+        // エージェント ID → セッション (どの Run のものかもここで決まる)。
+        let mut who: HashMap<String, SessionId> = HashMap::new();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for rt in &self.runs {
+            if rt.outbox().as_os_str().is_empty() {
+                continue;
+            }
+            dirs.push(rt.outbox().to_path_buf());
+            for a in rt.agents() {
+                if let Some(sid) = a.session_id {
+                    who.insert(a.id.0.clone(), sid);
+                }
+            }
+        }
+        let mut taken = 0usize;
+        for dir in dirs {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut files: Vec<PathBuf> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            files.sort();
+            for f in files {
+                if taken >= OUTBOX_PER_TICK {
+                    break;
+                }
+                taken += 1;
+                let body = std::fs::read_to_string(&f).unwrap_or_default();
+                let _ = std::fs::remove_file(&f);
+                let Some(stem) = f.file_stem().and_then(|x| x.to_str()) else {
+                    continue;
+                };
+                // `<agent-id>.json` / `<agent-id>-<何か>.json` のどちらも受ける。
+                let Some(sid) = who.get(stem).or_else(|| {
+                    who.iter()
+                        .find(|(id, _)| stem.starts_with(id.as_str()))
+                        .map(|(_, s)| s)
+                }) else {
+                    continue;
+                };
+                // 画面から読むのと**同じ形**にして渡す (入口を 1 つに保つ)。
+                let text = out.entry(*sid).or_default();
+                text.push('\n');
+                text.push_str(super::result_parser::RESULT_OPEN);
+                text.push('\n');
+                text.push_str(body.trim());
+                text.push('\n');
+                text.push_str(super::result_parser::RESULT_CLOSE);
+                text.push('\n');
+            }
+        }
+        out
+    }
+
     /// app から観測を受け取って 1 tick 進める。**描画の外で呼ぶこと。**
     pub fn pump_sessions(&mut self, rows: Vec<SessionInput>, now: u64) {
         if self.rt().is_none() || self.read_only {
             return;
         }
+        let inbox = self.drain_outbox();
         let sessions = rows
             .into_iter()
             .map(|r| {
@@ -856,7 +951,13 @@ impl TeamPanel {
                 // 重複は**意味の単位 (塊)** で Runtime が落とす
                 // (`TeamRuntime::take_unseen`)。走査量は `SCAN_MAX_BYTES` が
                 // 抑えるので、毎フレーム全履歴を舐めることにはならない。
-                let text = r.tail.join("\n");
+                let mut text = r.tail.join("\n");
+                // **置き場に届いた報告を合流させる。** 画面と同じ入口へ
+                // 流すので、受理・却下の判断は 1 か所のまま。
+                if let Some(extra) = inbox.get(&r.id) {
+                    text.push('\n');
+                    text.push_str(extra);
+                }
                 super::runtime::SessionObs {
                     id: r.id,
                     title: r.title,

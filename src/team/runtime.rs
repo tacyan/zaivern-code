@@ -345,6 +345,17 @@ pub struct TeamRuntime {
     seen_blocks: HashSet<u64>,
     /// 古い順に捨てるための並び (上限 [`SEEN_BLOCKS_CAP`])。
     seen_block_order: VecDeque<u64>,
+    /// **報告を受け取るフォルダ。** 画面ではなくここから読む。
+    ///
+    /// Claude Code v2 は報告を改行ではなく**カーソル移動**
+    /// (`\e[2C` / `\e[1B`) で描く。だから `{` と `"task_id"` は別の行・
+    /// 別の桁に置かれ、再描画で潰れる — 画面から読む限り、報告は
+    /// **構造的に**取りこぼす (実測: 生ログで確認)。
+    ///
+    /// 置き場は `ZAIVERN_HOME` の下。**ワークスペースの中に置かない** —
+    /// 置くと `changeset` が「担当外のファイルを変更した」と測って、
+    /// 報告そのものが却下される。
+    outbox: PathBuf,
     /// **配達待ちのエージェント間伝言。**
     ///
     /// `harvest` は `&mut self` を持っているので Effect の入れ物を
@@ -491,6 +502,7 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
         };
@@ -621,6 +633,7 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
         };
@@ -2110,6 +2123,16 @@ impl TeamRuntime {
         self.effects.contains_key(key)
     }
 
+    /// 報告を受け取るフォルダを教える (画面の外から渡す)。
+    pub fn set_outbox(&mut self, dir: PathBuf) {
+        self.outbox = dir;
+    }
+
+    /// 報告を受け取るフォルダ。
+    pub fn outbox(&self) -> &std::path::Path {
+        &self.outbox
+    }
+
     /// エージェントの直近の画面 (端末タブが「中身」を出すために使う)。
     ///
     /// **末尾から `lines` 行だけ**返す。全部返すと、盤面が毎フレーム
@@ -3259,6 +3282,7 @@ impl TeamRuntime {
             forbidden_files: forbidden,
             // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
             // 届けられない相手を宛先の候補に出すと、断りが記録されるだけ。
+            outbox: self.outbox.clone(),
             teammates: self
                 .agents
                 .iter()

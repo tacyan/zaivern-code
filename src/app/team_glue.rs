@@ -577,10 +577,14 @@ impl ZaivernApp {
             let Some(s) = sessions.iter_mut().find(|s| s.id == sid) else {
                 return false;
             };
-            // **触れる端末にする** (interactive)。見るだけなら「中身を見る」で
-            // 足りるので、ここまで開いた人は打てて当然と考える。
-            // 大きさは札が決めるので、こちらからは変えない (allow_resize = false)。
-            crate::terminal::draw(ui, s, &theme, font, true, false, true);
+            // **読むだけにする。**
+            //
+            // 触れる端末にすると、外側の縦スクロールと端末自身のスクロールが
+            // 取り合いになり、行が重なって崩れる (実際にそう報告された)。
+            // 打ちたい人はエージェントのタブへ行けばよいので、盤面は
+            // 「見るだけ」に徹する — `interactive` も `hover_scroll` も false。
+            // 大きさは札が確定させるので、こちらからは変えない。
+            crate::terminal::draw(ui, s, &theme, font, false, false, false);
             true
         };
         let acts = panel::with_panel(|p| {

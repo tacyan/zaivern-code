@@ -1296,6 +1296,7 @@ mod tests {
             workspace_root: "<ワークスペースルート>",
             upstream: Vec::new(),
             forbidden_files: Vec::new(),
+            outbox: std::path::PathBuf::new(),
             teammates: Vec::new(),
         };
         super::super::prompt::for_task(&brief, std::slice::from_ref(&t))

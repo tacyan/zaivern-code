@@ -257,10 +257,17 @@ fn エージェントをクリックすると実際の端末が開く() {
 
 #[test]
 fn 報告されたサブエージェントの端末ボタンは無効になる() {
-    for (name, s) in [("board", src(BOARD)), ("inspector", src(INSPECTOR))] {
+    // 盤面は「中身を見る」、Inspector は「端末を開く」— **同じ性質を
+    // 別のボタンで守る**ので、名前も別になる (押せない相手には出さない)。
+    for (name, s, label) in [
+        ("board", src(BOARD), "team.btn.show_output"),
+        ("inspector", src(INSPECTOR), "team.btn.open_terminal"),
+    ] {
         assert!(
-            s.contains("add_enabled(false, egui::Button::new(tr(\"team.btn.open_terminal\")))"),
-            "{name}: 開けない端末のボタンを無効にしていない"
+            s.contains(&format!(
+                "add_enabled(false, egui::Button::new(tr(\"{label}\")))"
+            )),
+            "{name}: 開けない相手のボタンを無効にしていない"
         );
         assert!(
             s.contains("on_disabled_hover_text"),
