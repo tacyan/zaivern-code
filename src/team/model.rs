@@ -692,8 +692,10 @@ impl ValidationState {
             return false;
         }
         if required.is_empty() {
-            // **検証コマンドが 1 本も無い計画は validate_plan が弾く**ので、
-            // ここへ来るのは復元した壊れかけの状態だけ。安全側 (未検証) に倒す。
+            // **検証コマンドが 1 本も無い計画も通る** (走らせられる検証が
+            // 存在しないフォルダがあるため。`graph::validate_plan` 参照)。
+            // だからここは実際に通る道で、**未実行と成功を混ぜない**ために
+            // 安全側 (未検証) へ倒す。先へ進んでよいかは [`settled`] が見る。
             return false;
         }
         required.iter().all(|c| {

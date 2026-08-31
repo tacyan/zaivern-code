@@ -396,15 +396,21 @@ Organization Board は Architect / Implementer / Reviewer / QA / Integrator
 | `package.json` | `scripts` に**実在する** `test` / `lint` / `typecheck` / `check` だけ。パッケージマネージャは lockfile から (`pnpm-lock.yaml` → pnpm、`yarn.lock` → yarn、`bun.lock(b)` → bun、`package-lock.json` → npm) |
 | `pyproject.toml` / `pytest.ini` / `setup.cfg` / `requirements.txt` | **pytest を使うと言い切れるときだけ** `pytest` |
 
-**決められないときは決めない。**
+**決められないときは決めない。ただし「決められない」と「読めない」は別物。**
 
-* 目印が 1 つも無いリポジトリを、勝手に Rust 扱いにしない。
-  `PlanError::ValidationUndetermined` を返し、SPEC の「検証」節に
-  書くよう求める
+* 目印が 1 つも無いリポジトリを、勝手に Rust 扱いにしない
+  (`DetectError::Undetermined`)。**それでも計画は止めない** — 素の HTML や
+  デザインだけのフォルダには走らせられる検証がそもそも存在しないので、
+  ここで断ると Team がその手の仕事にまったく使えなくなる。代わりに検証
+  0 本で進むことを隠さない (`TeamSnapshot::unvalidated` が盤面に出す)
 * `package.json` はあるが `test` 系の script が無いなら、**存在しない
-  `npm test` を作らない**。lockfile が無い / 2 つ以上あるなら
-  パッケージマネージャを選ばない。`package.json` が壊れていれば
-  「読めない」と言う (黙って「目印が無い」と同じ扱いにしない)
+  `npm test` を作らない** (`DetectError::NoCandidate`)。lockfile が無い /
+  2 つ以上あるならパッケージマネージャを選ばない。これも検証なしで進む
+* **`package.json` が読めなければ断る** (`DetectError::Unreadable` →
+  `PlanError::ValidationDetectionFailed`)。読めないものまで空の候補へ
+  畳むと、壊れた設定のリポジトリが「道具の無いフォルダ」と同じ扱いに
+  なり、**壊れたまま検証なしで走って、レビュー承認だけで完了できる**
+  (番人は `planner::tests::壊れたpackage_jsonは検証なしとして通さない`)
 * `requirements.txt` があるだけでは Python のテスト方法を決めない
   (Django の `manage.py test` かもしれない)
 

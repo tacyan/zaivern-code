@@ -329,6 +329,33 @@ fn 検証コマンドの解析失敗を黙って捨てない() {
 }
 
 #[test]
+fn 検出の失敗理由を握り潰していない() {
+    // **回帰そのもの。** `detect()` の戻りを `unwrap_or_default()` で畳むと、
+    // 「読めない」(`DetectError::Unreadable`) が「候補なし」と同じ空配列に
+    // なる。壊れた `package.json` のリポジトリが検証なしで走り、完了が
+    // **レビュー承認だけ**で決まる状態のまま素通りする。
+    //
+    // 振る舞いの番人は `planner::tests::壊れたpackage_jsonは検証なしとして通さない`。
+    // ここが見るのは**握り潰す書き方が戻っていないか**だけ。
+    let s = src(PLANNER);
+    let at = s.find("pub fn compose").expect("compose が無い");
+    let body = function_body(&s, at);
+    assert!(
+        !body.contains("unwrap_or_default()"),
+        "detect() の失敗理由を握り潰している"
+    );
+    // **variant を名指しで**分けている (文字列で理由を判定していない)。
+    for want in [
+        "DetectError::Undetermined",
+        "DetectError::NoCandidate",
+        "DetectError::Unreadable",
+        "PlanError::ValidationDetectionFailed",
+    ] {
+        assert!(body.contains(want), "{want} を名指しで扱っていない");
+    }
+}
+
+#[test]
 fn 既定の検証コマンドを綴りで固定していない() {
     // `cargo` を綴りで持つのは**リポジトリ判定の中だけ**。Planner が
     // 直に持つと、Next.js のリポジトリで `cargo test` が走る。

@@ -16,6 +16,7 @@
 //! LLM Planner を足すときも、この出力形式 (`plan_schema`) を守らせる。
 
 use super::plan_schema::{self, GoalDoc, PlanDoc, SchemaError, TaskDoc, TeamDoc, TeamPlan};
+use super::validation_defaults::DetectError;
 
 /// Planner へ渡す材料。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +59,15 @@ pub enum PlanError {
     InvalidValidationCommand { command: String, reason: String },
     /// SPEC に書かれた検証コマンドが**実行を許されていない**。
     ForbiddenValidationCommand { command: String, reason: String },
+    /// 検証コマンドの自動決定が、**設定ファイルを読めずに**失敗した。
+    ///
+    /// 「目印が無い」([`DetectError::Undetermined`]) と「目印はあるが候補を
+    /// 出せない」([`DetectError::NoCandidate`]) は道具が無いだけなので検証
+    /// なしで進んでよいが、**読めない設定ファイルは別物**である。壊れた
+    /// `package.json` を空の候補へ畳むと、走らせられる検証が存在しない
+    /// フォルダ (素の HTML など) と区別が付かなくなり、完了が**レビュー
+    /// 承認だけ**で決まる状態のまま素通りする。
+    ValidationDetectionFailed { reason: String },
 }
 
 impl PlanError {
@@ -76,6 +86,9 @@ impl PlanError {
             PlanError::ForbiddenValidationCommand { command, reason } => {
                 format!("検証コマンドを実行できません: `{command}` ({reason})")
             }
+            // 文面は検出器 ([`DetectError::detail`]) から来たものをそのまま
+            // 使う。**同じ失敗に 2 通りの説明を作らない。**
+            PlanError::ValidationDetectionFailed { reason } => reason.clone(),
         }
     }
 }
@@ -280,8 +293,10 @@ impl StaticPlanner {
     ///
     /// LLM Planner を足すときも「この形を返す」のが契約になる。
     ///
-    /// **検証コマンドを決められないときは文書を作らない。** 決められない
-    /// まま先へ進めると、既定へ落ちるか空のまま配ることになる。
+    /// **検証コマンドの扱いは 3 通りに分かれる。** SPEC に書かれた指定が
+    /// 1 件でも通らなければ断る。指定が無いときは自動決定を試し、
+    /// 道具が無いだけなら検証なしで通し、**設定ファイルが読めないときは
+    /// 断る** ([`PlanError::ValidationDetectionFailed`])。
     pub fn compose(&self, input: &PlanInput) -> Result<PlanDoc, PlanError> {
         let sections = parse_sections(&input.spec);
 
@@ -346,7 +361,7 @@ impl StaticPlanner {
 
         // 指定が無いときだけ、**リポジトリの実体を見て**候補を決める。
         //
-        // **決められなくても計画は止めない。** 素の HTML やデザインだけの
+        // **道具が無いだけなら計画は止めない。** 素の HTML やデザインだけの
         // フォルダには Cargo.toml も package.json も無い。そこで断ると
         // 「検証コマンドを書いてください」以外に進みようがなくなり、
         // Team がその手の仕事にまったく使えなくなる (実際に
@@ -356,13 +371,29 @@ impl StaticPlanner {
         // [`super::graph::validate_plan`] が通すが、完了は**レビュー承認
         // だけ**で決まる状態になるので、盤面がそれを出す
         // ([`super::view_model::TeamSnapshot::unvalidated`])。
+        //
+        // **ただし「決められない」と「読めない」は別物である。**
+        // `unwrap_or_default()` で全部を空へ畳むと、壊れた `package.json` の
+        // リポジトリが「道具の無いフォルダ」と同じ扱いになり、**壊れた設定の
+        // まま検証なしで走って、レビュー承認だけで完了できる**。
+        // だから [`DetectError`] は variant ごとに分けて扱う。
         if validations.is_empty() {
-            validations = super::validation_defaults::detect(&input.workspace_root)
-                .unwrap_or_default();
-            // 候補は自動生成なので、**ここでも同じ関門を通す**
-            // (許可リストの外にある候補を作ってしまったら、それは
-            //  候補の作り方の不具合であって、通してよい理由にならない)。
-            validations = runnable_only(validations);
+            match super::validation_defaults::detect(&input.workspace_root) {
+                // 候補は自動生成なので、**ここでも同じ関門を通す**
+                // (許可リストの外にある候補を作ってしまったら、それは
+                //  候補の作り方の不具合であって、通してよい理由にならない)。
+                Ok(found) => validations = runnable_only(found),
+                // 目印が無い / 目印はあるが候補を出せない。走らせられる
+                // 検証がそもそも存在しないので、**検証なしのまま進む**。
+                Err(DetectError::Undetermined | DetectError::NoCandidate { .. }) => {}
+                // **読めないものを黙って無視しない。** 理由は検出器に
+                // 言わせる (同じ説明を 2 か所に書かない)。
+                Err(e @ DetectError::Unreadable { .. }) => {
+                    return Err(PlanError::ValidationDetectionFailed {
+                        reason: e.detail(),
+                    });
+                }
+            }
         }
         validations.truncate(4);
 
@@ -860,13 +891,43 @@ mod tests {
         );
     }
 
+    /// 計画に載った検証コマンドを、見出しの一覧で返す。
+    fn 載った検証(plan: &TeamPlan) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in &plan.tasks {
+            for c in &t.validation_commands {
+                let d = c.display();
+                if !out.contains(&d) {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn 検証を自動決定できなくても計画は通るが検証は空のまま() {
         // 目印が 1 つも無いなら、**Rust だと決めつけない**。
         // ただし**計画そのものは止めない** — 素の HTML やデザインだけの
         // フォルダには走らせられる検証が存在しないので、断ると Team が
         // その手の仕事にまったく使えなくなる。
-        let d = tmp_ws("unknown");
+        let d = tmp_ws("plain-html");
+        std::fs::write(d.join("index.html"), "<!doctype html>\n<h1>salon</h1>\n").unwrap();
+        std::fs::write(d.join("style.css"), "h1 { color: teal; }\n").unwrap();
+        // **本当にどの目印も無いこと**を先に確かめる。目印を置いたまま
+        // 「検証が空だ」と言っても、それは別の話をしている。
+        for marker in [
+            "Cargo.toml",
+            "go.mod",
+            "package.json",
+            "pyproject.toml",
+            "pytest.ini",
+            "setup.cfg",
+            "setup.py",
+            "requirements.txt",
+        ] {
+            assert!(!d.join(marker).exists(), "{marker} が残っている");
+        }
         let plan = StaticPlanner
             .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
             .expect("道具が無いだけで計画を断ってはいけない");
@@ -882,9 +943,23 @@ mod tests {
 
     #[test]
     fn testスクリプトが無いnodeでは勝手にnpm_testを作らない() {
+        // `DetectError::NoCandidate` の側。**目印はあるが走らせられる検証が
+        // 無い**だけなので、検証なしで計画は通る。
         let d = tmp_ws("node-nodefs");
-        std::fs::write(d.join("package.json"), "{\"scripts\":{\"dev\":\"next dev\"}}").unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            "{\"scripts\":{\"dev\":\"next dev\",\"build\":\"next build\",\"start\":\"next start\"}}",
+        )
+        .unwrap();
         std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        // test / lint / typecheck / check は 1 つも無い。
+        let body = std::fs::read_to_string(d.join("package.json")).unwrap();
+        for name in ["test", "lint", "typecheck", "check"] {
+            assert!(
+                !body.contains(&format!("\"{name}\"")),
+                "{name} を書いてしまっている"
+            );
+        }
         let plan = StaticPlanner
             .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
             .expect("script が無いだけで計画を断ってはいけない");
@@ -895,6 +970,126 @@ mod tests {
                 t.validation_commands
             );
         }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn 正常なnodeプロジェクトでは自動検証が計画に残る() {
+        // 「読めないものを断る」ようにした結果、**読めるものまで断って
+        // いない**ことを見る。壊すのは簡単なので、対になる番人を置く。
+        let d = tmp_ws("node-healthy");
+        std::fs::write(
+            d.join("package.json"),
+            "{\"scripts\":{\"test\":\"vitest run\",\"lint\":\"eslint .\",\"dev\":\"next dev\"}}",
+        )
+        .unwrap();
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        let plan = StaticPlanner
+            .plan(input_in("# a\n## 要件\n- x を作る\n", &d))
+            .expect("正常な package.json で計画できない");
+        assert_eq!(
+            載った検証(&plan),
+            vec!["npm run test".to_string(), "npm run lint".to_string()],
+            "自動検証が消えた / 順序が変わった"
+        );
+        for t in &plan.tasks {
+            assert!(
+                !t.validation_commands.is_empty(),
+                "検証の無いタスクが混ざった: {}",
+                t.title
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn 壊れたpackage_jsonは検証なしとして通さない() {
+        // **回帰そのもの。** `detect()` の戻りを `unwrap_or_default()` で
+        // 畳むと、`DetectError::Unreadable` が「候補なし」と同じ空配列に
+        // なる。壊れた Node.js プロジェクトが**検証なし・レビュー承認だけ**
+        // で完了できてしまうので、ここは必ず計画エラーにする。
+        let d = tmp_ws("broken-package");
+        std::fs::write(d.join("package.json"), "{broken").unwrap();
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+
+        let result = StaticPlanner.plan(input_in("# a\n## 要件\n- x を作る\n", &d));
+
+        assert!(
+            matches!(result, Err(PlanError::ValidationDetectionFailed { .. })),
+            "壊れた package.json を検証なしとして通してはいけない: {result:?}"
+        );
+        let why = result.unwrap_err().detail();
+        // **どのファイルが読めなかったのか**を言う。
+        assert!(
+            why.contains("package.json"),
+            "どれが読めないのか言わない: {why}"
+        );
+        // **解析が失敗した理由**を、検出器の文面のまま持っている
+        // (ここで組み直すと、同じ失敗に 2 通りの説明ができる)。
+        let parse_err = serde_json::from_str::<serde_json::Value>("{broken")
+            .expect_err("この綴りは JSON として壊れている")
+            .to_string();
+        assert!(
+            why.contains(&parse_err),
+            "解析失敗の理由が落ちている: {why} / 期待: {parse_err}"
+        );
+        // 「目印が見つからない」(`Undetermined`) と混ぜていない。
+        assert!(
+            !why.contains("目印が見つかりません"),
+            "読めないのを目印無しと同じ説明にしている: {why}"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn 決められないのと読めないのを分けている() {
+        // 3 つの理由を**同じ入口から**通して、分岐が variant ごとに
+        // 分かれていることを振る舞いで見る (文字列判定ではない)。
+        use super::super::validation_defaults::{self, DetectError};
+        let spec = "# a\n## 要件\n- x を作る\n";
+
+        // 目印なし → Undetermined → 検証なしで通る
+        let d = tmp_ws("split-undetermined");
+        assert_eq!(validation_defaults::detect(&d), Err(DetectError::Undetermined));
+        assert!(StaticPlanner.plan(input_in(spec, &d)).is_ok(), "目印なしで断った");
+        std::fs::remove_dir_all(&d).ok();
+
+        // 目印あり・候補なし → NoCandidate → 検証なしで通る
+        let d = tmp_ws("split-nocandidate");
+        std::fs::write(d.join("package.json"), "{\"scripts\":{\"dev\":\"x\"}}").unwrap();
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        assert!(
+            matches!(
+                validation_defaults::detect(&d),
+                Err(DetectError::NoCandidate { .. })
+            ),
+            "前提が崩れている"
+        );
+        assert!(
+            StaticPlanner.plan(input_in(spec, &d)).is_ok(),
+            "候補が無いだけで断った"
+        );
+        std::fs::remove_dir_all(&d).ok();
+
+        // 読めない → Unreadable → 断る
+        let d = tmp_ws("split-unreadable");
+        std::fs::write(d.join("package.json"), "{ not json").unwrap();
+        std::fs::write(d.join("package-lock.json"), "{}").unwrap();
+        assert!(
+            matches!(
+                validation_defaults::detect(&d),
+                Err(DetectError::Unreadable { .. })
+            ),
+            "前提が崩れている"
+        );
+        assert!(
+            matches!(
+                StaticPlanner.plan(input_in(spec, &d)),
+                Err(PlanError::ValidationDetectionFailed { .. })
+            ),
+            "読めないものを通した"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
