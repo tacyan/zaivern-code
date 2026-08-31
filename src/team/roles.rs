@@ -91,25 +91,63 @@ pub fn derive_agent_work_state(
     }
 }
 
+/// エージェントプリセット 1 つぶんの手掛かり。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetRow {
+    /// 設定に書かれた名前 (`Claude Code` など)。
+    pub name: String,
+    /// AI CLI として使えるか (素のシェルは対象外)。
+    pub is_ai: bool,
+    /// **この PC で実際に起動できるか** (実体が PATH にある)。
+    ///
+    /// 入っていない CLI を割り当てると、その担当だけが永久に起動しない。
+    /// 「使える 1 本を全員で使う」ほうが、動かない担当を作るよりよい。
+    pub available: bool,
+}
+
 /// **役割に合うエージェントプリセットを選ぶ** (純関数)。
 ///
-/// 渡すのは `(プリセット名, AI CLI として使えるか)` の一覧。戻りはその
-/// 添字。判断は 2 段だけ:
+/// 判断は 3 段:
 ///
-/// 1. 名前に役割の綴り (`reviewer` / `tester` …) を含む AI CLI があれば、それ
-/// 2. 無ければ**最初の AI CLI**
+/// 1. 名前に役割の綴り (`reviewer` / `tester` …) を含む、起動できる AI CLI
+/// 2. **起動できる AI CLI を役割ごとに配る** — 同じものを全員に割り当てず、
+///    入っている CLI の数だけ担当を散らす
+/// 3. どれも起動できないなら、AI CLI のうち最初のもの (従来どおり)
 ///
-/// この版では設定に役割ごとのプリセットが無いので、実際にはほぼ 2 段目に
-/// 落ちる = **全員が同じプリセット**で動く。それでもここを 1 本の関数に
-/// してあるのは、Role → Capability → Provider → Execution Target という
-/// 差し替え点を 1 か所に残すため (画面に「選べるのに効かない設定」を
-/// 作らないこと、と対になる)。
-pub fn preset_for_role(presets: &[(String, bool)], role: TeamRole) -> Option<usize> {
+/// ## なぜ散らすか
+///
+/// 全員が同じ CLI だと、その CLI の癖 (見落とし・書き癖) がチーム全体に
+/// 同じ形で乗る。レビューを別の CLI にできるなら、**実装が見落としたものを
+/// 別の目が見る**。入っているものを使わない理由が無い。
+///
+/// ## 決め方は固定
+///
+/// 役割の並び順 ([`TeamRole::ALL`]) の中での位置を、使える CLI の本数で
+/// 割った余りにする。**同じ顔ぶれなら毎回同じ割り当て**になるので、
+/// 「今日は誰がどれ」で結果が変わらない。
+pub fn preset_for_role(presets: &[PresetRow], role: TeamRole) -> Option<usize> {
     let want = role.key();
-    let named = presets.iter().position(|(name, is_ai)| {
-        *is_ai && name.to_ascii_lowercase().contains(want)
-    });
-    named.or_else(|| presets.iter().position(|(_, is_ai)| *is_ai))
+    // 1) 役割の名前を持つプリセット (人が明示的に用意したもの)。
+    if let Some(i) = presets
+        .iter()
+        .position(|p| p.is_ai && p.available && p.name.to_ascii_lowercase().contains(want))
+    {
+        return Some(i);
+    }
+    // 2) 起動できるものを役割ごとに配る。
+    let usable: Vec<usize> = presets
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_ai && p.available)
+        .map(|(i, _)| i)
+        .collect();
+    if !usable.is_empty() {
+        let slot = TeamRole::ALL.iter().position(|r| *r == role).unwrap_or(0);
+        return Some(usable[slot % usable.len()]);
+    }
+    // 3) 起動できるものが 1 つも分からない (PATH を引けない等) —
+    //    従来どおり最初の AI CLI へ落とす。**担当を 0 体にしない。**
+    presets.iter().position(|p| p.is_ai)
 }
 
 /// この役割は実装 (コードを書く) をするか。
@@ -251,27 +289,76 @@ mod tests {
         assert!(!is_review_role(TeamRole::Implementer));
     }
 
+    fn row(name: &str, is_ai: bool, available: bool) -> PresetRow {
+        PresetRow {
+            name: name.to_string(),
+            is_ai,
+            available,
+        }
+    }
+
     #[test]
     fn 役割に合うプリセットを選ぶ() {
         use TeamRole::*;
         let presets = vec![
-            ("Shell".to_string(), false),
-            ("Claude".to_string(), true),
-            ("Reviewer bot".to_string(), true),
+            row("Shell", false, true),
+            row("Claude", true, true),
+            row("Reviewer bot", true, true),
         ];
         // 名前に役割の綴りがあれば、それ
         assert_eq!(preset_for_role(&presets, Reviewer), Some(2));
-        // 無ければ最初の AI CLI (**素のシェルは選ばない**)
-        assert_eq!(preset_for_role(&presets, Implementer), Some(1));
-        assert_eq!(preset_for_role(&presets, TeamLead), Some(1));
-        // AI CLI が 1 つも無ければ選べない
-        let none = vec![("Shell".to_string(), false)];
+        // AI CLI が 1 つも無ければ選べない (**素のシェルは選ばない**)
+        let none = vec![row("Shell", false, true)];
         assert_eq!(preset_for_role(&none, Implementer), None);
-        // **この版では全員が同じプリセットになる** (役割名のプリセットは
-        // 既定の設定に無い)。それを明示しておく。
-        let plain = vec![("Claude".to_string(), true), ("Codex".to_string(), true)];
+    }
+
+    /// **入っている CLI を役割ごとに配る。**
+    ///
+    /// 全員が同じ CLI だと、その CLI の癖がチーム全体に同じ形で乗る
+    /// (実装の見落としを、同じ見落とし方をする相手がレビューする)。
+    #[test]
+    fn 入っているclitを役割ごとに散らす() {
+        use TeamRole::*;
+        let two = vec![row("Claude", true, true), row("Codex", true, true)];
+        // 役割の並び順で交互に配る。**同じ顔ぶれなら毎回同じ割り当て。**
+        let got: Vec<Option<usize>> = TeamRole::ALL
+            .iter()
+            .map(|r| preset_for_role(&two, *r))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(0),
+                Some(1),
+                Some(0),
+                Some(1),
+                Some(0),
+                Some(1),
+                Some(0)
+            ]
+        );
+        // 2 回呼んでも同じ (決め方が固定されている)。
+        assert_eq!(preset_for_role(&two, Reviewer), preset_for_role(&two, Reviewer));
+        // 使えるものが 1 本しか無ければ、全員それになる。
+        let one = vec![row("Claude", true, true), row("Codex", true, false)];
         for r in TeamRole::ALL {
-            assert_eq!(preset_for_role(&plain, r), Some(0), "{r:?}");
+            assert_eq!(preset_for_role(&one, r), Some(0), "{r:?}");
         }
+    }
+
+    /// **入っていないものを割り当てない。** 割り当てると、その担当だけが
+    /// 永久に起動しない (画面には居るのに何も起きない)。
+    #[test]
+    fn 起動できないcliには配らない() {
+        use TeamRole::*;
+        // 名前が役割と一致していても、入っていなければ選ばない。
+        let p = vec![
+            row("Claude", true, true),
+            row("Reviewer bot", true, false),
+        ];
+        assert_eq!(preset_for_role(&p, Reviewer), Some(0));
+        // どれも起動を確かめられないときは、担当を 0 体にせず最初の AI CLI へ。
+        let unknown = vec![row("Shell", false, false), row("Claude", true, false)];
+        assert_eq!(preset_for_role(&unknown, Implementer), Some(1));
     }
 }

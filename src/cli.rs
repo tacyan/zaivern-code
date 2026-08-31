@@ -5108,6 +5108,83 @@ prunable gitdir file points to non-existent location
         (bases, ng)
     }
 
+    /// **画面に出す製品バージョンをベタ書きしない。**
+    ///
+    /// 0.23.0 の出荷時、ステータスバー右端だけが `"Zaivern v0.2"` という
+    /// **文字列リテラル**で、実際の版と 21 リリースぶんずれていた
+    /// (同じ版を出す他の 16 箇所は全部 `env!("CARGO_PKG_VERSION")` だった)。
+    /// この壊れ方は**版を上げても画面が変わらない**ので、
+    /// 「上げ忘れ」と見分けが付かない — 利用者から見ると
+    /// 「更新したのに古いまま」という嘘の報告になる。
+    ///
+    /// 検査は「app モジュールの**文字列リテラル**に `v<数字>.<数字>` が出ない」。
+    /// 版は必ず `env!("CARGO_PKG_VERSION")` から組み立てること。
+    #[test]
+    fn 画面のバージョン表記をベタ書きしていない() {
+        /// 行の中の文字列リテラルだけを取り出す (コメントの `v0.16` は対象外)。
+        fn literals_of(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let (mut cur, mut inside, mut esc) = (String::new(), false, false);
+            for c in line.chars() {
+                if inside {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        inside = false;
+                        out.push(std::mem::take(&mut cur));
+                        continue;
+                    }
+                    cur.push(c);
+                } else if c == '"' {
+                    inside = true;
+                }
+            }
+            out
+        }
+
+        /// `v` の直後に `数字 . 数字` が続くか (= 手で書いた版番号)。
+        fn looks_like_version(lit: &str) -> bool {
+            let c: Vec<char> = lit.chars().collect();
+            (0..c.len()).any(|i| {
+                if c[i] != 'v' && c[i] != 'V' {
+                    return false;
+                }
+                let mut j = i + 1;
+                while j < c.len() && c[j].is_ascii_digit() {
+                    j += 1;
+                }
+                j > i + 1 && j + 1 < c.len() && c[j] == '.' && c[j + 1].is_ascii_digit()
+            })
+        }
+
+        let mut bad: Vec<String> = Vec::new();
+        for (n, line) in crate::app::SRC_IMPL
+            .replace("\r\n", "\n")
+            .lines()
+            .enumerate()
+        {
+            let t = line.trim_start();
+            // 期待値として版を書くテストと、まるごとコメントの行は対象外。
+            if t.starts_with("//") || line.contains("assert") {
+                continue;
+            }
+            for lit in literals_of(line) {
+                if looks_like_version(&lit) {
+                    bad.push(format!("{n}: \"{lit}\""));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "画面に出す版を直書きしている ({} 件)。\n{}\n\
+             env!(\"CARGO_PKG_VERSION\") から組み立てること。",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
     /// **ソースを読む番人は、改行をまたぐ照合の前に必ず正規化する。**
     ///
     /// Windows のチェックアウトは CRLF なので、`"a\nb"` のようなパターンは

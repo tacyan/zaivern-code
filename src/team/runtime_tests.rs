@@ -3577,3 +3577,230 @@ fn human_instructions(rt: &TeamRuntime) -> Vec<String> {
         .collect()
 }
 
+// ── 編成 (誰が何の担当か) ─────────────────────────────────────────────
+
+/// **役割がそのまま担当と名前になる。**
+///
+/// 以前はリーダー以外が全員 `Implementer` の「Agent 1, 2, …」だったので、
+/// 設計担当やテスト担当を選んでも画面には実装担当しか並ばず、
+/// 「誰が何をする担当なのか」がどこにも出なかった。
+#[test]
+fn 編成は計画の役割から決まる() {
+    use super::model::TeamRole as R;
+    let t = |id: u64, role: R| {
+        let mut x = super::testkit::task(id, "k", &[]);
+        x.role = role;
+        x
+    };
+    let tasks = vec![
+        t(1, R::Architect),
+        t(2, R::Implementer),
+        t(3, R::Tester),
+        t(4, R::Integrator),
+    ];
+    // 枠が足りていれば、計画にある役割が 1 体ずつ並ぶ。
+    assert_eq!(
+        roster_roles(&tasks, &[], 4),
+        vec![R::Architect, R::Implementer, R::Tester, R::Integrator]
+    );
+    // 余った枠は実装へ寄せる (並列で効くのは実装なので)。
+    assert_eq!(
+        roster_roles(&tasks, &[], 6),
+        vec![
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Integrator,
+            R::Implementer,
+            R::Implementer
+        ]
+    );
+    // 枠が足りなければ依存順に前から (設計が無いと実装が始まらない)。
+    assert_eq!(roster_roles(&tasks, &[], 2), vec![R::Architect, R::Implementer]);
+    assert!(roster_roles(&tasks, &[], 0).is_empty());
+    // 役割の分からない計画でも、担当が 0 体にはならない。
+    assert_eq!(roster_roles(&[], &[], 2), vec![R::Implementer, R::Implementer]);
+}
+
+/// **1 体しか居ない役割に番号を付けない** (存在しない 2 体目を探させる)。
+#[test]
+fn 担当の名前は役割から作る() {
+    use super::model::TeamRole as R;
+    assert_eq!(agent_name(R::Architect, 1), "Architect");
+    assert_eq!(agent_name(R::Implementer, 2), "Implementer 2");
+    assert_eq!(agent_name(R::TeamLead, 1), "Team Lead");
+    // 役割は 7 つとも名前を持つ (増えたときに空欄が出ない)。
+    for r in R::ALL {
+        assert!(!agent_name(r, 1).is_empty(), "{r:?} に名前が無い");
+    }
+}
+
+/// **段を挟んでも、チームは必要な人数ぶん最初から立つ。**
+///
+/// 実測 (0.23.0): 既定の役割を 6 つにしたら計画が
+/// 「計画 → 設計 → 実装 8 件 → テスト → 統合」の段になり、
+/// `desired_sessions` が「依存が空のタスク数」で数えていたせいで
+/// **最後まで 2 体しか立たなかった** (盤面の「稼働 2」)。
+/// `dependencies` は静的な項目なので、依存が済んでも空にはならない。
+#[test]
+fn 段のある計画でも並列ぶんの担当が立つ() {
+    use super::graph::max_parallel_width;
+    use super::model::TeamRole as R;
+    let mut tasks = Vec::new();
+    // 計画 (1) → 設計 (2) → 実装 8 件 → テスト → 統合
+    let mut plan = super::testkit::task(1, "plan", &[]);
+    plan.role = R::Planner;
+    tasks.push(plan);
+    let mut design = super::testkit::task(2, "design", &[1]);
+    design.role = R::Architect;
+    tasks.push(design);
+    for i in 0..8u64 {
+        let mut t = super::testkit::task(10 + i, "impl", &[2]);
+        t.role = R::Implementer;
+        tasks.push(t);
+    }
+    let impls: Vec<u64> = (0..8u64).map(|i| 10 + i).collect();
+    let mut test = super::testkit::task(30, "test", &impls);
+    test.role = R::Tester;
+    tasks.push(test);
+    let mut integ = super::testkit::task(31, "integrate", &[30]);
+    integ.role = R::Integrator;
+    tasks.push(integ);
+
+    // いちばん広い段は実装の 8 件。
+    assert_eq!(max_parallel_width(&tasks), 8, "段の幅を取り違えている");
+    // 上限 4 なら 4 体 (上限 12 なら レビュー用の 1 体を足して 9 体)。
+    assert_eq!(super::scheduler::desired_sessions(&tasks, 4), 4);
+    assert_eq!(super::scheduler::desired_sessions(&tasks, 12), 9);
+    // **直った証拠**: 旧い数え方 (依存が空) だと 1 件しかない。
+    let old_way = tasks
+        .iter()
+        .filter(|t| t.dependencies.is_empty() && !t.state.is_terminal())
+        .count();
+    assert_eq!(old_way, 1, "旧い数え方では 1 = 2 体しか立たなかった");
+
+    // 終わった段は数に入れない (済んだぶん余分に立ち続けない)。
+    for t in tasks.iter_mut().filter(|t| t.role == R::Implementer) {
+        t.state = TeamTaskState::Completed;
+    }
+    assert_eq!(max_parallel_width(&tasks), 1, "残っているのは 1 段 1 件");
+}
+
+// ── エージェント同士のやり取り ───────────────────────────────────────
+
+/// **伝言は「言った」だけで終わらせない。相手の端末へ実際に届く。**
+///
+/// 端末の中だけで完結すると盤面に何も残らず、受け手も気付かない。
+/// `tick` を通して、(1) 出来事として残り (2) 配達の Effect が出ることを見る。
+#[test]
+fn エージェントの伝言は相手の端末へ届く() {
+    let mut rt = started(4);
+    // 端末が結び付いていないと伝言は配れない (偽の起動で結び付ける)。
+    let mut next: SessionId = 1;
+    let boot = rt.tick(&obs_for_test(1, &[]));
+    let bound = bind_all(&mut rt, &boot, &mut next);
+    let ids: Vec<AgentId> = rt
+        .agents()
+        .iter()
+        .filter(|a| a.kind == AgentKind::ManagedSession)
+        .map(|a| a.id.clone())
+        .collect();
+    assert!(ids.len() >= 2, "2 体以上居ないと伝言の相手が居ない");
+    let (from, to) = (ids[0].clone(), ids[1].clone());
+    let from_sid = rt.agent(&from).and_then(|a| a.session_id).expect("端末");
+    let to_sid = rt.agent(&to).and_then(|a| a.session_id).expect("端末");
+
+    let screen = format!(
+        "{}\n{{\"to\": \"{}\", \"text\": \"設計が終わった。次は実装に入って\"}}\n{}",
+        rp::MSG_OPEN, to.0, rp::MSG_CLOSE
+    );
+    // **全セッションを載せる。** 載せないと、載せなかったぶんは
+    // 「消えた」と解釈されて端末が外れる (受け手が居なくなる)。
+    let mut obs = obs_for_test(100, &bound);
+    for s in &mut obs.sessions {
+        if s.id == from_sid {
+            s.text = screen.clone();
+        }
+    }
+    let effects = rt.tick(&obs);
+    // (1) 出来事として残る (あとから誰が誰に何を言ったか追える)。
+    let logged = rt
+        .events()
+        .find(|e| e.kind == TeamEventKind::AgentMessage)
+        .expect("伝言が出来事に残っていない");
+    assert_eq!(logged.actor.as_ref(), Some(&from));
+    assert_eq!(logged.target.as_ref(), Some(&to));
+    assert!(logged.summary.contains("次は実装に入って"), "{}", logged.summary);
+
+    // (2) 相手の端末へ配る Effect が出る。
+    let sent = effects
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendManualInstruction {
+                agent,
+                session,
+                text,
+                ..
+            } if agent == &to => Some((*session, text.clone())),
+            _ => None,
+        })
+        .expect("配達の Effect が出ていない");
+    assert_eq!(sent.0, to_sid, "別の端末へ配ろうとしている");
+    assert!(sent.1.contains("次は実装に入って"), "{}", sent.1);
+    assert!(sent.1.contains("からの伝言"), "差出人が本文に無い: {}", sent.1);
+}
+
+/// **居ない相手への伝言は断る。** 通すと盤面には「伝えた」と出るのに
+/// 誰も受け取っていない、という嘘になる。
+#[test]
+fn 居ない相手への伝言は断る() {
+    let mut rt = started(4);
+    let mut next: SessionId = 1;
+    let boot = rt.tick(&obs_for_test(1, &[]));
+    let bound = bind_all(&mut rt, &boot, &mut next);
+    let from = rt
+        .agents()
+        .iter()
+        .find(|a| a.kind == AgentKind::ManagedSession)
+        .map(|a| a.id.clone())
+        .expect("担当");
+    let sid = rt.agent(&from).and_then(|a| a.session_id).expect("端末");
+    let screen = format!(
+        "{}\n{{\"to\": \"だれか\", \"text\": \"やあ\"}}\n{}",
+        rp::MSG_OPEN, rp::MSG_CLOSE
+    );
+    let mut obs = obs_for_test(100, &bound);
+    for s in &mut obs.sessions {
+        if s.id == sid {
+            s.text = screen.clone();
+        }
+    }
+    let effects = rt.tick(&obs);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, TeamEffect::SendManualInstruction { .. })),
+        "居ない相手へ配ろうとしている"
+    );
+    assert!(
+        rt.events()
+            .any(|e| e.kind == TeamEventKind::Rejected && e.summary.contains("居ません")),
+        "断った理由が残っていない"
+    );
+}
+
+/// **自分宛ては配らない。** 自分の端末へ自分の言葉を流しても何も起きない。
+#[test]
+fn allは自分を含めない() {
+    let known: Vec<(AgentId, String)> = vec![
+        (AgentId::new("a"), "implementer".into()),
+        (AgentId::new("b"), "reviewer".into()),
+    ];
+    let body = "{\"to\": \"all\", \"text\": \"できた\"}";
+    let (targets, _) = rp::check_message(body, &known, &AgentId::new("a")).unwrap();
+    assert_eq!(targets, vec![AgentId::new("b")]);
+    // 役割でも宛てられる。
+    let body = "{\"to\": \"reviewer\", \"text\": \"見て\"}";
+    let (targets, _) = rp::check_message(body, &known, &AgentId::new("a")).unwrap();
+    assert_eq!(targets, vec![AgentId::new("b")]);
+}

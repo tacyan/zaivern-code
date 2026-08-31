@@ -134,8 +134,20 @@ fn エージェント起動は既存経路を通る() {
         "画面のいまのフォルダを見ている (Runtime が決めた実行先を上書きしている)"
     );
     assert!(
-        body.contains("spec_for_command"),
-        "AI CLI のプリセットを選んでいない"
+        body.contains("self.team_preset_table()"),
+        "使えるプリセットの一覧を通していない:\n{body}"
+    );
+    // 一覧の作り方そのものも見る (**場所が移っただけで性質は同じ**)。
+    let table = function_body(&s, s.find("fn team_preset_table").expect("プリセット一覧"));
+    assert!(
+        table.contains("spec_for_command"),
+        "AI CLI かどうかを見ていない:\n{table}"
+    );
+    // **入っていない CLI を割り当てない。** 名前だけで決めると、その担当は
+    // 永久に起動しない (画面には居るのに何も起きない)。
+    assert!(
+        table.contains("resolve_in("),
+        "実体が PATH にあるかを確かめていない:\n{table}"
     );
 }
 
@@ -562,8 +574,11 @@ fn 別のrunのeffectを実行させない構造がある() {
     // キューを空にする偶然ではなく、**持ち主の照合**で防いでいること。
     let p = src(PANEL);
     let mine = function_body(&p, p.find("fn mine<T>").expect("選り分け"));
+    // **走っている Run のどれかのもの**なら実行し、それ以外は捨てる。
+    // (Run が複数走るようになったので「いまの Run だけ」では、画面に
+    //  出していないチームの仕事が全部捨てられる。)
     assert!(
-        mine.contains("now.as_ref() == Some(&owner)"),
+        mine.contains("live.contains(&owner)") && mine.contains("self.runs.iter()"),
         "持ち主を照合していない:\n{mine}"
     );
     let absorb = function_body(&p, p.find("fn absorb").expect("受け取り"));
@@ -654,7 +669,15 @@ fn 判定した実体とosが起こす実体を一致させる() {
         run.contains("found.trust.auto_runnable()") && run.contains("approved.contains(cmd)"),
         "実体の信用区分と承認を突き合わせていない:\n{run}"
     );
-    let resolved = function_body(&l, l.find("pub fn run_resolved").expect("起動"));
+    // **入口は委譲だけ。** ここで別の起こし方を書くと、番人が見ている
+    // 本体 (`run_resolved_capped`) を通らない第 2 の経路ができる。
+    let entry = function_body(&l, l.find("pub fn run_resolved(").expect("入口"));
+    assert!(
+        entry.contains("run_resolved_capped(") && !entry.contains("Command"),
+        "入口が委譲以外のことをしている:\n{entry}"
+    );
+    // 実際に起こしているのは本体のほう。**性質は同じ**で、場所だけが違う。
+    let resolved = function_body(&l, l.find("pub fn run_resolved_capped").expect("起動"));
     assert!(
         resolved.contains("crate::procx::hidden_command(program)"),
         "解決済みのパスで起こしていない:\n{resolved}"

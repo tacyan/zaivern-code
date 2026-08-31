@@ -3228,6 +3228,9 @@ struct HotExitConflict {
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
+    /// 起動時の最大化を済ませたか (`frame_update::maximize_once`)。
+    /// **1 回だけ**送るための札 — 毎フレーム送ると縮められなくなる。
+    did_initial_maximize: bool,
     /// ワークスペースのルート一覧。**常に 1 件以上**。`roots[0]` が primary。
     roots: Vec<PathBuf>,
     /// 「いま作業しているフォルダ」。これ以降に起動するエージェント / ターミナルの

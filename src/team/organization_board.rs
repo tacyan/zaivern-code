@@ -25,7 +25,8 @@ use crate::theme::Theme;
 
 use super::graph::{Phase, PhaseStatus};
 use super::model::*;
-use super::panel::{BoardAction, BoardTab, NewRunForm, RestorePrompt};
+use super::panel::{BoardAction, BoardTab, DraftState, NewRunForm, RestorePrompt};
+use super::planner;
 use super::view_model::{
     self, current_action, ActionFocus, TeamAgentView, TeamSnapshot, MISSION_PANEL_W,
 };
@@ -237,6 +238,11 @@ pub fn board_window(
     form: &mut NewRunForm,
     restore: RestorePrompt,
     selected: Option<&AgentId>,
+    // 端末タブで「その場で開いている」担当。
+    expanded: Option<&AgentId>,
+    // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
+    runs: &[(String, bool)],
+    active_run: usize,
     notice: &str,
 ) -> Vec<BoardAction> {
     let mut acts = Vec::new();
@@ -256,15 +262,23 @@ pub fn board_window(
         .open(&mut win_open)
         .collapsible(false)
         .resizable(true)
-        .default_width(max_w.min(1180.0))
-        .default_height(max_h.min(760.0))
+        // **最初から画面いっぱいで開く。**
+        //
+        // 既定を 1180x760 にしていたので、レーンや担当が増えるたびに窓が
+        // 少しずつ広がっていた (「徐々に画面が広がる」として報告された)。
+        // 上限 (`max_w` / `max_h`) と同じ値から始めれば、中身が増えても
+        // それ以上には広がらない = 開いた瞬間の大きさのまま落ち着く。
+        // `resizable` は残すので、狭めたい人は狭められる。
+        .default_width(max_w)
+        .default_height(max_h)
         .max_width(max_w)
         .max_height(max_h)
         .constrain_to(screen)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             body(
-                ui, theme, snap, tab, form, restore, selected, notice, &mut acts,
+                ui, theme, snap, tab, form, restore, selected, expanded, runs, active_run,
+                notice, &mut acts,
             );
         });
     if !win_open {
@@ -282,12 +296,18 @@ fn body(
     form: &mut NewRunForm,
     restore: RestorePrompt,
     selected: Option<&AgentId>,
+    // 端末タブで「その場で開いている」担当。
+    expanded: Option<&AgentId>,
+    // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
+    runs: &[(String, bool)],
+    active_run: usize,
     notice: &str,
     acts: &mut Vec<BoardAction>,
 ) {
     if !notice.is_empty() {
         ui.colored_label(theme.warn, plain(notice));
     }
+    run_tabs_row(ui, theme, runs, active_run, acts);
 
     // ── 未完了 Run の扱い ──
     if restore != RestorePrompt::None {
@@ -340,7 +360,7 @@ fn body(
         ui.allocate_ui_with_layout(egui::vec2(board_w, content_h), column, |ui| match tab {
             BoardTab::Organization => organization_tab(ui, theme, s, &layout, selected, acts),
             BoardTab::Tasks => tasks_tab(ui, theme, s, acts),
-            BoardTab::Terminals => terminals_tab(ui, theme, s, acts),
+            BoardTab::Terminals => terminals_tab(ui, theme, s, expanded, acts),
             BoardTab::Timeline => timeline_tab(ui, theme, s),
         });
         if layout.mission_panel {
@@ -880,7 +900,21 @@ fn task_card(
 
 // ── Terminals タブ ───────────────────────────────────────────────────
 
-fn terminals_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<BoardAction>) {
+/// **端末タブ = デッキ。** 名前とボタンだけでは「何をしているか」が分からない。
+///
+/// 以前ここは一覧とボタンだけで、走っている最中に中身を見るには端末を開く
+/// しか無かった (開くと中央ビューが切り替わるので、「ちょっと様子を見たい」
+/// に対して代償が大きい)。デッキと同じように、**1 体 1 枚の札**に直近の
+/// 出力を出す。
+///
+/// 幅は `ui.available_width()` に必ず収める (どの幅でも見切れない)。
+fn terminals_tab(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    s: &TeamSnapshot,
+    expanded: Option<&AgentId>,
+    acts: &mut Vec<BoardAction>,
+) {
     let managed: Vec<&TeamAgentView> = s
         .agents
         .iter()
@@ -894,14 +928,54 @@ fn terminals_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
         .id_salt(format!("team-scroll-{}", BoardTab::Terminals.key()))
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let w = ui.available_width();
             for a in managed {
-                ui.horizontal(|ui| {
-                    glyph_label(ui, theme, a.state);
-                    ui.label(RichText::new(ellipsis(&a.name, 20)).color(theme.text));
-                    ui.label(RichText::new(work_state_label(a.state)).color(theme.text_dim));
+                let open = expanded == Some(&a.id);
+                agent_deck_card(ui, theme, a, w, open, acts);
+                ui.add_space(6.0);
+            }
+        });
+}
+
+/// 端末タブの札 1 枚。
+fn agent_deck_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    a: &TeamAgentView,
+    width: f32,
+    open: bool,
+    acts: &mut Vec<BoardAction>,
+) {
+    egui::Frame::none()
+        .fill(theme.panel)
+        .stroke(egui::Stroke::new(1.0_f32, theme.border))
+        .inner_margin(egui::Margin::same(8.0))
+        .rounding(8.0)
+        .show(ui, |ui| {
+            ui.set_width((width - 16.0).max(120.0));
+            ui.horizontal(|ui| {
+                state_chip(ui, theme, a.state);
+                ui.label(RichText::new(ellipsis(&a.name, 24)).color(theme.text));
+                ui.label(RichText::new(role_label(a.role)).color(theme.text_dim));
+                // ボタンは右端へ寄せる (狭いときも本文を押し出さない)。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match a.session_id {
                         Some(sid) if a.can_open_terminal => {
-                            if ui.button(tr("team.btn.open_terminal")).clicked() {
+                            // **切り替えずに見る**のが既定。画面が入れ替わると
+                            // 「ちょっと様子を見たい」に対して代償が大きい。
+                            let label = if open {
+                                tr("team.btn.fold_output")
+                            } else {
+                                tr("team.btn.show_output")
+                            };
+                            if ui.button(label).clicked() {
+                                acts.push(BoardAction::ToggleAgentOutput(a.id.clone()));
+                            }
+                            if ui
+                                .button(tr("team.btn.open_terminal"))
+                                .on_hover_text(tr("team.btn.open_terminal_hint"))
+                                .clicked()
+                            {
                                 acts.push(BoardAction::OpenTerminal(sid));
                             }
                         }
@@ -912,7 +986,58 @@ fn terminals_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
                         }
                     }
                 });
+            });
+            // いま何のタスクを持っているか (無ければ行ごと出さない)。
+            if !a.current_task_title.is_empty() {
+                let t = plain(&a.current_task_title);
+                ui.label(RichText::new(ellipsis(&t, 90)).color(theme.text_dim))
+                    .on_hover_text(t);
             }
+            // 直近の出力。**空なら枠ごと出さない** (空白を作らない)。
+            let body = plain(&a.preview);
+            if body.trim().is_empty() {
+                return;
+            }
+            ui.add_space(4.0);
+            let all: Vec<&str> = body.lines().collect();
+            // 畳んでいるときは末尾だけ (札が縦に伸びて一覧にならなくなる)。
+            let from = if open {
+                0
+            } else {
+                all.len().saturating_sub(view_model::PREVIEW_LINES_FOLDED)
+            };
+            egui::Frame::none()
+                .fill(theme.bg)
+                .inner_margin(egui::Margin::same(6.0))
+                .rounding(6.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let draw = |ui: &mut egui::Ui| {
+                        for line in &all[from..] {
+                            ui.label(
+                                RichText::new(ellipsis(line, 160))
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(theme.text_dim),
+                            );
+                        }
+                    };
+                    if open {
+                        // **開いても画面を占領しない。** 上限を超えたぶんは
+                        // この枠の中でスクロールする (他の担当が見えなくならない)。
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("team-out-{}", a.id.0))
+                            .max_height(360.0)
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw(ui);
+                            });
+                    } else {
+                        draw(ui);
+                    }
+                });
         });
 }
 
@@ -1207,6 +1332,44 @@ fn restore_card(
     );
 }
 
+/// **同時に走っている Run の切り替え。**
+///
+/// 1 本しか無いときは**出さない** (常に 1 つしか無い選択肢は、
+/// 場所を取るだけで何も選ばせない)。
+fn run_tabs_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    runs: &[(String, bool)],
+    active: usize,
+    acts: &mut Vec<BoardAction>,
+) {
+    if runs.len() < 2 {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (i, (title, running)) in runs.iter().enumerate() {
+            // 進行中かどうかは記号で示す (色は補助)。
+            let mark = if *running { "▶" } else { "✓" };
+            let label = format!("{mark} {}", ellipsis(title, 20));
+            let r = ui.selectable_label(i == active, RichText::new(label).color(theme.text));
+            if r.clicked() {
+                acts.push(BoardAction::SelectRun(i));
+            }
+            // 閉じるのは**いま出している 1 本だけ**に出す。全部に出すと
+            // 押し間違いで別のチームを止めてしまう。
+            if i == active
+                && ui
+                    .small_button("✕")
+                    .on_hover_text(tr("team.btn.close_run"))
+                    .clicked()
+            {
+                acts.push(BoardAction::CloseRun(i));
+            }
+        }
+    });
+    ui.separator();
+}
+
 // ── New Team Run フォーム ────────────────────────────────────────────
 
 fn new_run_form(
@@ -1320,8 +1483,18 @@ fn new_run_form(
     if !form.error.is_empty() {
         ui.colored_label(theme.err, plain(&form.error));
     }
+    spec_draft_section(ui, theme, form, acts);
     ui.separator();
     ui.horizontal(|ui| {
+        // 下書きの確認中は、計画のボタンを出さない。
+        // **同じ瞬間に 2 つの進み方を見せない** (「これでいいですか？」に
+        // 答える前に計画へ進めると、確認の意味が無くなる)。
+        if matches!(form.draft, DraftState::Ready { .. }) {
+            if ui.button(tr("team.form.cancel")).clicked() {
+                form.open = false;
+            }
+            return;
+        }
         if ui.button(tr("team.form.plan_preview")).clicked() {
             acts.push(BoardAction::PlanFromForm);
         }
@@ -1329,6 +1502,89 @@ fn new_run_form(
             form.open = false;
         }
     });
+}
+
+/// **短い指示を仕様書へ書き換える段。**
+///
+/// 出るのは「このままでは実装タスクが 1 件にしかならない」ときだけ
+/// ([`planner::needs_spec_rewrite`])。分かれる SPEC を書いた人に
+/// 余計な段を見せない。
+fn spec_draft_section(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    form: &NewRunForm,
+    acts: &mut Vec<BoardAction>,
+) {
+    match &form.draft {
+        DraftState::Idle => {
+            // ファイル指定のときは中身を読まないと判定できないので、
+            // 直接入力の本文だけを見る (読み込みは押されてから)。
+            let short = form.from_file || planner::needs_spec_rewrite(&form.spec_text);
+            if !short {
+                return;
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.button")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                ui.label(RichText::new(tr("team.draft.hint")).color(theme.text_dim));
+            });
+        }
+        DraftState::Running { agent } => {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(trf("team.draft.running", &[("agent", agent.clone())]))
+                        .color(theme.text_dim),
+                );
+            });
+        }
+        DraftState::Ready { agent, text } => {
+            ui.separator();
+            ui.label(
+                RichText::new(trf("team.draft.question", &[("agent", agent.clone())]))
+                    .color(theme.text)
+                    .strong(),
+            );
+            // **中身を全部見せてから決めてもらう。** 折り畳んだまま
+            // 「はい」を押させると、確認したことにならない。
+            egui::ScrollArea::vertical()
+                .id_salt("team-draft-preview")
+                .max_height(260.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for line in text.lines() {
+                        ui.label(RichText::new(line).monospace().size(11.0).color(theme.text));
+                    }
+                });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.accept")).clicked() {
+                    acts.push(BoardAction::AcceptDraft);
+                }
+                if ui.button(tr("team.draft.retry")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                if ui.button(tr("team.draft.keep")).clicked() {
+                    acts.push(BoardAction::DiscardDraft);
+                }
+            });
+        }
+        DraftState::Failed { why } => {
+            ui.separator();
+            ui.colored_label(theme.warn, plain(why));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.retry")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                if ui.button(tr("team.draft.keep")).clicked() {
+                    acts.push(BoardAction::DiscardDraft);
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1375,6 +1631,9 @@ mod tests {
                         &mut form,
                         RestorePrompt::None,
                         None,
+                        None,
+                        &[],
+                        0,
                         "",
                     );
                 });

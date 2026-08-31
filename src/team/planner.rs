@@ -232,7 +232,7 @@ fn is_task_heading(title: &str) -> bool {
 }
 
 /// 見出しが「検証」を表しているか。
-fn is_validation_heading(title: &str) -> bool {
+pub fn is_validation_heading(title: &str) -> bool {
     let t = title.to_ascii_lowercase();
     const NEEDLES: &[&str] = &[
         "validation",
@@ -419,31 +419,8 @@ impl StaticPlanner {
             }
         }
 
-        // タスク: 「タスク / 要件」見出しの箇条書き。無ければ全見出しの箇条書き。
-        let mut raw_tasks: Vec<String> = sections
-            .iter()
-            .filter(|s| is_task_heading(&s.title))
-            .flat_map(|s| s.bullets.clone())
-            .collect();
-        if raw_tasks.is_empty() {
-            raw_tasks = sections
-                .iter()
-                .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
-                .flat_map(|s| s.bullets.clone())
-                .collect();
-        }
-        if raw_tasks.is_empty() {
-            // 箇条書きが 1 つも無い SPEC でも、見出しをタスクにして進める。
-            raw_tasks = sections
-                .iter()
-                .filter(|s| s.level >= 2 && !s.title.is_empty())
-                .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
-                .map(|s| s.title.clone())
-                .collect();
-        }
-        if raw_tasks.is_empty() {
-            raw_tasks = vec![title.clone()];
-        }
+        // タスクの見出し (選び方は `implementation_titles` に 1 本だけ置く)。
+        let mut raw_tasks = implementation_titles(&sections, &title);
         // 実装タスクは「最大同時数の 2 倍」までに抑える。
         // 細かく割りすぎると割り当てが往復するだけで進まない。
         let cap = input.agent_count.max(1).saturating_mul(2).clamp(2, 24);
@@ -462,6 +439,16 @@ impl StaticPlanner {
             name: "Implementation".into(),
             lead_role: "team_lead".into(),
         }];
+        if roles.contains(&R::Planner) {
+            teams.insert(
+                0,
+                TeamDoc {
+                    key: "planning".into(),
+                    name: "Planning".into(),
+                    lead_role: "planner".into(),
+                },
+            );
+        }
         if roles.contains(&R::Architect) {
             teams.insert(
                 0,
@@ -476,7 +463,14 @@ impl StaticPlanner {
             teams.push(TeamDoc {
                 key: "qa".into(),
                 name: "QA & Review".into(),
-                lead_role: "reviewer".into(),
+                // **選んだほうを頭に据える。** 固定で "reviewer" にすると、
+                // テスト担当だけを選んだ人の盤面に居ないはずのレビュー担当が
+                // 立ち、レビュー担当を外しても何も変わらない (選択の嘘)。
+                lead_role: if roles.contains(&R::Reviewer) {
+                    "reviewer".into()
+                } else {
+                    "tester".into()
+                },
             });
         }
         teams.push(TeamDoc {
@@ -487,6 +481,36 @@ impl StaticPlanner {
 
         let mut tasks: Vec<TaskDoc> = Vec::new();
         let mut impl_keys: Vec<String> = Vec::new();
+        // 計画担当を選んだなら、**いちばん先頭**に 1 本置く。
+        //
+        // 以前は Planner を選んでも lane もタスクも作られず、選択が計画に
+        // 何の影響も与えなかった (押せるのに何も起きないボタンと同じ嘘)。
+        // 盤面の「1. Goal の分析」も、担当するタスクが 1 件も無いせいで
+        // **何もしていないのに ✓** と出ていた ([`super::graph::phases`] は
+        // 空のフェーズを「通過済み」として扱う)。
+        let plan_key = roles.contains(&R::Planner).then(|| {
+            let key = "plan".to_string();
+            tasks.push(TaskDoc {
+                key: key.clone(),
+                title: format!("{title} の分割と受入基準を確定する"),
+                description: format!(
+                    "SPEC ({}) を読み、以降のタスクが迷わない粒度まで\
+                     分割と受入基準を確定する。コードは書かない。",
+                    input.source
+                ),
+                team: "planning".into(),
+                role: "planner".into(),
+                depends_on: Vec::new(),
+                files: Vec::new(),
+                required_caps: Vec::new(),
+                acceptance_criteria: vec![
+                    "SPEC の項目がすべてどれかのタスクに落ちている".to_string(),
+                    "各タスクの受入基準が、満たしたかどうかを測れる形になっている".to_string(),
+                ],
+                validation_commands: Vec::new(),
+            });
+            key
+        });
         // 設計担当を選んだなら、実装の前に 1 本置く (実装はこれに依存する)。
         let design_key = roles.contains(&R::Architect).then(|| {
             let key = "design".to_string();
@@ -499,7 +523,7 @@ impl StaticPlanner {
                 ),
                 team: "architecture".into(),
                 role: "architect".into(),
-                depends_on: Vec::new(),
+                depends_on: plan_key.iter().cloned().collect(),
                 files: Vec::new(),
                 required_caps: Vec::new(),
                 acceptance_criteria: vec![
@@ -520,7 +544,12 @@ impl StaticPlanner {
                 description: format!("{}\n\n出典: {}", label, input.source),
                 team: "implementation".into(),
                 role: "implementer".into(),
-                depends_on: design_key.iter().cloned().collect(),
+                // 設計が居ればそこへ、居なければ計画へ繋ぐ (先頭が浮かない)。
+                depends_on: design_key
+                    .clone()
+                    .or_else(|| plan_key.clone())
+                    .into_iter()
+                    .collect(),
                 files,
                 required_caps: Vec::new(),
                 acceptance_criteria: vec![
@@ -531,7 +560,40 @@ impl StaticPlanner {
             });
         }
 
+        // テストタスク。**「テスト担当」を選んだときだけ**置く。
+        //
+        // 以前は Tester を選んでも QA のレーンが空のまま立つだけで、
+        // **テスト担当の仕事が 1 件も作られなかった** (選べるのに何も
+        // 変わらない = 押せるのに何も起きないボタンと同じ嘘)。
+        let test_key = roles.contains(&R::Tester).then(|| {
+            let key = "test".to_string();
+            tasks.push(TaskDoc {
+                key: key.clone(),
+                title: format!("{title} のテストを書いて通す"),
+                description: "実装された振る舞いに対してテストを書き、\
+                     実際に走らせて通るところまで持っていく。\
+                     実装そのものは直さず、直しが要るなら blocker として挙げる。"
+                    .into(),
+                team: "qa".into(),
+                role: "tester".into(),
+                depends_on: impl_keys.clone(),
+                files: Vec::new(),
+                required_caps: Vec::new(),
+                acceptance_criteria: vec![
+                    "正常系と異常系の両方にテストがある".to_string(),
+                    "追加したテストが実際に成功する".to_string(),
+                ],
+                validation_commands: validations.clone(),
+            });
+            key
+        });
+
         // 統合タスク。**全実装タスクの完了に依存する。**
+        let integrate_deps: Vec<String> = impl_keys
+            .iter()
+            .cloned()
+            .chain(test_key.clone())
+            .collect();
         tasks.push(TaskDoc {
             key: "integrate".into(),
             title: "最終統合と全体検証".into(),
@@ -540,7 +602,7 @@ impl StaticPlanner {
                 .into(),
             team: "integration".into(),
             role: "integrator".into(),
-            depends_on: impl_keys,
+            depends_on: integrate_deps,
             files: Vec::new(),
             required_caps: Vec::new(),
             acceptance_criteria: vec![
@@ -562,6 +624,62 @@ impl StaticPlanner {
     }
 }
 
+
+/// SPEC から**実装タスクの見出し**を選ぶ (純関数)。
+///
+/// 「タスク / 要件」見出しの箇条書き → 全見出しの箇条書き → 見出しそのもの →
+/// 最後は表題 1 件、の順に降りる。
+///
+/// **`compose` から切り出してあるのは、「この SPEC では何件に分かれるか」を
+/// 計画を作らずに知りたい側が居るから** ([`needs_spec_rewrite`])。
+/// 物差しを 2 つ持つと、「短いと言われたのに計画は分かれた」/ その逆が起きる。
+pub fn implementation_titles(sections: &[SpecSection], title: &str) -> Vec<String> {
+    let mut raw: Vec<String> = sections
+        .iter()
+        .filter(|s| is_task_heading(&s.title))
+        .flat_map(|s| s.bullets.clone())
+        .collect();
+    if raw.is_empty() {
+        raw = sections
+            .iter()
+            .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
+            .flat_map(|s| s.bullets.clone())
+            .collect();
+    }
+    if raw.is_empty() {
+        // 箇条書きが 1 つも無い SPEC でも、見出しをタスクにして進める。
+        raw = sections
+            .iter()
+            .filter(|s| s.level >= 2 && !s.title.is_empty())
+            .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
+            .map(|s| s.title.clone())
+            .collect();
+    }
+    if raw.is_empty() {
+        raw = vec![title.to_string()];
+    }
+    raw
+}
+
+/// **この指示は「仕様書に書き換える」段を通したほうがよいか。**
+///
+/// 判定は「実装タスクが 2 件に分かれないこと」— 分かれない指示は、
+/// 何体エージェントを立てても**1 体しか働かない**。実機の
+/// 「かっこいい３DのWebページを作って」がまさにこれで、実装 1 件 + 統合 1 件
+/// にしかならず、起動した 2 体目は最後まで仕事ゼロだった。
+///
+/// 文字数では測らない。長くても箇条書きの無い散文は 1 件にしかならないし、
+/// 短くても箇条書きが 3 つあれば 3 件に分かれる。**計画と同じ読み取りで
+/// 数える**のが唯一ずれない物差しになる。
+pub fn needs_spec_rewrite(spec: &str) -> bool {
+    let sections = parse_sections(spec);
+    let title = sections
+        .iter()
+        .find(|s| !s.title.is_empty())
+        .map(|s| s.title.clone())
+        .unwrap_or_default();
+    implementation_titles(&sections, &title).len() < 2
+}
 
 /// 自動決定した候補のうち、**実行できるものだけ**を残す。
 ///
@@ -1152,6 +1270,86 @@ mod tests {
         let p2 = StaticPlanner.plan(no_qa).unwrap();
         let lanes: Vec<&str> = p2.teams.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(lanes, vec!["implementation", "integration"]);
+    }
+
+    /// **一行のゴールでも、役割ごとのチームになる。**
+    ///
+    /// 実機で「かっこいい３DのWebページを作って」と 1 行だけ入れた Run は、
+    /// 実装 1 件 + 統合 1 件の**2 タスク**にしかならず、しかも実装が
+    /// Team Lead へ渡ったので、起動した Agent 1 は最後まで仕事ゼロだった
+    /// (`state.json` の実物で確認)。既定の役割を 5 つにしたので、同じ
+    /// 1 行から設計・実装・テスト・統合が立つ。
+    #[test]
+    fn 一行のゴールでも役割ごとのタスクが立つ() {
+        use super::super::model::TeamRole as R;
+        let mut inp = input("かっこいい３DのWebページを作って");
+        inp.roles = super::super::panel::NewRunForm::default().roles;
+        assert_eq!(inp.roles.len(), 6, "既定は選べる 6 つ全部");
+        let p = StaticPlanner.plan(inp).unwrap();
+        for want in [
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Integrator,
+        ] {
+            assert!(
+                p.tasks.iter().any(|t| t.role == want),
+                "{want:?} の仕事が無い — 担当を立てても仕事が渡らない"
+            );
+        }
+        // 編成もその役割どおりになる (計画 → 編成が繋がっていること)。
+        // **レビュー担当はタスクを持たない**ので、レーンの頭として数える
+        // (数えないとレビューを頼む相手が 1 体も居なくなる)。
+        let roster = super::super::runtime::roster_roles(&p.tasks, &p.teams, 6);
+        assert_eq!(
+            roster,
+            vec![
+                R::Planner,
+                R::Architect,
+                R::Implementer,
+                R::Tester,
+                R::Reviewer,
+                R::Integrator
+            ]
+        );
+    }
+
+    /// **テスト担当を選んだら、テスト担当の仕事が立つ。**
+    ///
+    /// 以前は Tester を選ぶと QA のレーンが空で立つだけで、テスト用の
+    /// タスクは 1 件も作られなかった。選べるのに何も変わらないなら、
+    /// その選択肢は嘘になる。
+    #[test]
+    fn テスト担当を選ぶとテストのタスクが立つ() {
+        use super::super::model::TeamRole as R;
+        let mut no_test = input(SPEC);
+        no_test.roles = vec![R::Implementer, R::Reviewer];
+        let p = StaticPlanner.plan(no_test).unwrap();
+        assert!(p.tasks.iter().all(|t| t.role != R::Tester));
+
+        let mut with_test = input(SPEC);
+        with_test.roles = vec![R::Implementer, R::Tester, R::Reviewer];
+        let p = StaticPlanner.plan(with_test).unwrap();
+        let test = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Tester)
+            .expect("テストのタスクが立つ");
+        // 実装が終わってから走る (先に走っても対象が無い)。
+        for imp in p.tasks.iter().filter(|t| t.role == R::Implementer) {
+            assert!(test.dependencies.contains(&imp.id), "実装に依存していない");
+        }
+        // 統合はテストの完了も待つ (待たないとテスト前に締める)。
+        let integ = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Integrator)
+            .expect("統合のタスクが立つ");
+        assert!(
+            integ.dependencies.contains(&test.id),
+            "統合がテストを待っていない"
+        );
     }
 
     #[test]

@@ -114,15 +114,53 @@ pub enum BoardAction {
     SelectTask(TaskId),
     /// 実際の端末を開く。**`ManagedSession` のときだけ**。
     OpenTerminal(SessionId),
+    /// **その場で出力を開く / 閉じる。** 画面を切り替えずに中身を見る。
+    ToggleAgentOutput(AgentId),
     /// New Team Run のフォームを開く。
     OpenNewRun,
     /// フォームの内容で計画する。
     PlanFromForm,
+    /// **画面に出す Run を切り替える** (複数同時に走っているとき)。
+    SelectRun(usize),
+    /// **Run を 1 本閉じる** (止めて、記憶からも保存からも外す)。
+    CloseRun(usize),
+    /// **短い指示を仕様書へ書き換えてもらう。** 計画の手前の段。
+    DraftSpec,
+    /// 書き換えた下書きを採用して、そのまま計画へ進む。
+    AcceptDraft,
+    /// 下書きを捨てる (元の指示のまま進む / やり直す)。
+    DiscardDraft,
     /// 未完了 Run の扱い。
     ResumeRun,
     DiscardRun,
     OpenReadOnly,
 }
+
+/// 仕様書への書き換えの進み具合。
+///
+/// **チャネルは持たない。** 描画側は状態だけを見る (受け口は
+/// [`TeamPanel`] が持ち、毎フレーム移し替える)。持たせると、
+/// 画面を描くたびに受信を試すことになって真実の在り処が 2 つになる。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum DraftState {
+    #[default]
+    Idle,
+    /// 依頼中。`agent` は表示用の名前。
+    Running { agent: String },
+    /// 書き換わった。**まだ採用していない** — 人の確認を待つ。
+    Ready { agent: String, text: String },
+    /// 失敗した。理由はそのまま人へ出す。
+    Failed { why: String },
+}
+
+/// Run ごとの保存先を束ねるフォルダ名 (`<workspace>/runs/<run_id>/`)。
+pub const RUNS_DIR: &str = "runs";
+
+/// **同時に走らせてよい Run の本数。**
+///
+/// 上限が無いと、押した回数だけチームが増えて PC が沈む
+/// (1 本あたり最大 `agent_count` 体の CLI が常駐する)。
+pub const MAX_CONCURRENT_RUNS: usize = 4;
 
 /// New Team Run フォームの入力。
 #[derive(Clone, Debug, PartialEq)]
@@ -138,8 +176,18 @@ pub struct NewRunForm {
     pub review_required: bool,
     /// エージェントプリセット — チームに置く役割。
     ///
-    /// **既定は実装 + レビューの 2 つ。** 役割を増やすほど 1 体あたりの
-    /// 仕事は減るので、最大同時数を超える役割は選べない。
+    /// **既定は選べる 6 つ全部** (計画・設計・実装・テスト・レビュー・統合)。
+    /// 以前の既定は実装 + レビューの 2 つだったが、それだと編成が
+    /// 「実装 1 体 + 統合 1 体」にしかならず、**チームとして分担している
+    /// ようには一度も動かなかった**。選べる役割は全部既定で入れて、
+    /// 要らないものを外してもらう向きにする。
+    ///
+    /// **選択が計画を変えるのは 計画 / 設計 / テスト / レビュー の 4 つ。**
+    /// 実装と統合は選択に関わらず必ず作られる (実装しない開発も、統合しない
+    /// 完了も無いため)。外せてしまうのに外れないのは正直ではないが、
+    /// **この版では外せるように見えるだけ**である — 直すなら「常時オン」として
+    /// 描くほうで、既定を減らす方向ではない。
+    /// 効くほうの 4 つは `planner::tests::選んだ役割は必ず計画を変える` が見張る。
     pub roles: Vec<TeamRole>,
     /// 承認モード (`ask` / `auto` / `agent`)。既存の承認モードと同じ綴り。
     pub approval_mode: String,
@@ -147,6 +195,8 @@ pub struct NewRunForm {
     pub cost_limit: f32,
     /// 直近のエラー文面。
     pub error: String,
+    /// 仕様書への書き換えの進み具合。
+    pub draft: DraftState,
 }
 
 impl Default for NewRunForm {
@@ -161,10 +211,18 @@ impl Default for NewRunForm {
             agents: 4,
             max_attempts: 3,
             review_required: true,
-            roles: vec![TeamRole::Implementer, TeamRole::Reviewer],
+            roles: vec![
+                TeamRole::Planner,
+                TeamRole::Architect,
+                TeamRole::Implementer,
+                TeamRole::Tester,
+                TeamRole::Reviewer,
+                TeamRole::Integrator,
+            ],
             approval_mode: "ask".to_string(),
             cost_limit: 0.0,
             error: String::new(),
+            draft: DraftState::Idle,
         }
     }
 }
@@ -254,9 +312,14 @@ pub struct TeamPanel {
     pub open: bool,
     pub tab: BoardTab,
     pub form: NewRunForm,
+    /// 仕様書の書き換えの受け口。**フォームには持たせない**
+    /// (描画のたびに受信を試す形にすると真実の在り処が 2 つになる)。
+    draft_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub selected_agent: Option<AgentId>,
     pub selected_task: Option<TaskId>,
     pub inspector_open: bool,
+    /// 端末タブで**その場で開いている**担当 (`None` なら全部畳んだ状態)。
+    pub expanded_output: Option<AgentId>,
     /// Inspector の「追加の指示」入力欄。
     pub inspector_note: String,
     pub restore: RestorePrompt,
@@ -264,7 +327,18 @@ pub struct TeamPanel {
     pub read_only: bool,
     /// 直近の説明・エラー (画面の帯に出す)。
     pub notice: String,
-    runtime: Option<TeamRuntime>,
+    /// **同時に走っている Run。** 1 本とは限らない。
+    ///
+    /// 以前は `Option<TeamRuntime>` 1 本で、2 本目を作ろうとすると
+    /// `refuse_if_busy` が断っていた。チームを 2 つ立てて別々の目標を
+    /// 同時に進める、ができなかった。
+    ///
+    /// **画面が触るのは `active` の 1 本だけ**なので、既存の操作は
+    /// [`TeamPanel::rt`] / [`TeamPanel::rt_mut`] を通してそのまま動く。
+    /// 進行 (`tick`) と副作用の実行は**全部の Run**に対して回す。
+    runs: Vec<TeamRuntime>,
+    /// 画面に出している Run の位置 (`runs` の添字)。
+    active: usize,
     snapshot: Option<TeamSnapshot>,
     /// スナップショットを作り直す必要があるか。
     /// **60fps で全件を作り直さない**ための印。
@@ -328,6 +402,8 @@ impl Default for TeamPanel {
         Self {
             open: false,
             tab: BoardTab::default(),
+            draft_rx: None,
+            expanded_output: None,
             form: NewRunForm::default(),
             selected_agent: None,
             selected_task: None,
@@ -336,7 +412,8 @@ impl Default for TeamPanel {
             restore: RestorePrompt::None,
             read_only: false,
             notice: String::new(),
-            runtime: None,
+            runs: Vec::new(),
+            active: 0,
             snapshot: None,
             dirty: true,
             pending_launches: Vec::new(),
@@ -361,12 +438,12 @@ impl Default for TeamPanel {
 
 impl TeamPanel {
     pub fn has_run(&self) -> bool {
-        self.runtime.is_some()
+        self.rt().is_some()
     }
 
     /// いまの Goal の状態 (画面と操作の判断に使う唯一の入口)。
     pub fn goal_status(&self) -> Option<GoalStatus> {
-        self.runtime.as_ref().map(|r| r.goal().status)
+        self.rt().map(|r| r.goal().status)
     }
 
     /// 画面が読むスナップショット。無ければ `None`。
@@ -403,16 +480,18 @@ impl TeamPanel {
     pub fn live_work(&self) -> LiveWork {
         LiveWork {
             // エージェントは Runtime が知っている。
+            // **全部の Run を数える。** 画面に出していない Run の
+            // エージェントも実在するので、数えないと「居ないことになる」。
             agents: self
-                .runtime
-                .as_ref()
+                .runs
+                .iter()
                 .map(|rt| {
                     rt.agents()
                         .iter()
                         .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
                         .count()
                 })
-                .unwrap_or(0),
+                .sum(),
             // **検証と未実行の仕事は画面側の持ち物。** Runtime が無い
             // ときに 0 と答えると、`discard_run` の直後 (Runtime は捨てた
             // が子プロセスはまだ畳んでいる) に「空いている」と嘘をつく。
@@ -451,7 +530,8 @@ impl TeamPanel {
         self.pending_validations.clear();
         self.save_if_needed();
         self.workspace = ws.to_path_buf();
-        self.runtime = None;
+        self.runs.clear();
+        self.active = 0;
         self.snapshot = None;
         self.read_only = false;
         self.restore = if persistence::has_run(&self.state_dir()) {
@@ -480,7 +560,77 @@ impl TeamPanel {
 
     /// いまの Run にだけ効く締め具合 (Run が無ければ `None`)。
     pub fn run_guardrails(&self) -> Option<RunGuardrails> {
-        self.runtime.as_ref().map(|rt| rt.run().guardrails.clone())
+        self.rt().map(|rt| rt.run().guardrails.clone())
+    }
+
+    // ── 仕様書への書き換え ───────────────────────────────────────────
+
+    /// 書き換えを頼んだ (受け口を預かる)。
+    ///
+    /// **重ねて始めない。** 走っている最中にもう一度押されても、
+    /// 先に頼んだほうの結果を待つ (2 本目を起こすと 2 通の下書きが返り、
+    /// どちらを採ったのか誰にも分からなくなる)。
+    pub fn begin_draft(
+        &mut self,
+        agent: &str,
+        rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    ) {
+        if matches!(self.form.draft, DraftState::Running { .. }) {
+            return;
+        }
+        self.form.draft = DraftState::Running {
+            agent: agent.to_string(),
+        };
+        self.draft_rx = Some(rx);
+    }
+
+    /// 走っている書き換えがあるか (毎フレームの再描画要求に使う)。
+    pub fn drafting(&self) -> bool {
+        matches!(self.form.draft, DraftState::Running { .. })
+    }
+
+    /// 受け口を覗いて、届いていればフォームへ移す。**待たない。**
+    pub fn poll_draft(&mut self) {
+        let Some(rx) = self.draft_rx.as_ref() else {
+            return;
+        };
+        let got = match rx.try_recv() {
+            Ok(v) => v,
+            // 送り手が消えた = 作業スレッドが落ちた。黙って待ち続けない。
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(crate::i18n::tr("team.draft.lost"))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        };
+        self.draft_rx = None;
+        let agent = match &self.form.draft {
+            DraftState::Running { agent } => agent.clone(),
+            _ => String::new(),
+        };
+        self.form.draft = match got {
+            // **受け取る前に確かめる。** 1 件にしかならない下書きを通すと、
+            // 確認まで出しておいて結果は元と同じになる。
+            Ok(text) => match super::spec_writer::accept(&text) {
+                Ok(()) => DraftState::Ready { agent, text },
+                Err(why) => DraftState::Failed { why },
+            },
+            Err(why) => DraftState::Failed { why },
+        };
+    }
+
+    /// 下書きを採用する (SPEC は直接入力へ移す)。**採用は人が決める。**
+    pub fn accept_draft(&mut self) {
+        if let DraftState::Ready { text, .. } = std::mem::take(&mut self.form.draft) {
+            self.form.spec_text = text;
+            self.form.from_file = false;
+            self.form.error.clear();
+        }
+    }
+
+    /// 下書きを捨てる (元の指示のまま進む / やり直す)。
+    pub fn discard_draft(&mut self) {
+        self.form.draft = DraftState::Idle;
+        self.draft_rx = None;
     }
 
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
@@ -527,7 +677,8 @@ impl TeamPanel {
         if !t.is_empty() {
             rt.rename_goal(t);
         }
-        self.runtime = Some(rt);
+        self.runs.push(rt);
+        self.active = self.runs.len() - 1;
         self.read_only = false;
         self.restore = RestorePrompt::None;
         // **検証なしで進むことを隠さない。**
@@ -558,11 +709,18 @@ impl TeamPanel {
         if self.bypass_busy {
             return Ok(());
         }
-        let live = self.live_work();
-        if !live.is_busy() {
+        // **走っていても、上限までは並べてよい。**
+        //
+        // 以前はここで無条件に断っていたので、2 つの目標を同時に進める
+        // ことができなかった。断るのは本数の上限に当たったときだけにする
+        // (資源の心配は上限そのものが引き受ける)。
+        if self.runs.len() < MAX_CONCURRENT_RUNS {
             return Ok(());
         }
-        let why = live.why_blocked();
+        let why = crate::i18n::trf(
+            "team.err.too_many_runs",
+            &[("n", MAX_CONCURRENT_RUNS.to_string())],
+        );
         self.notice = why.clone();
         Err(why)
     }
@@ -585,10 +743,37 @@ impl TeamPanel {
 
     /// 保存された Run を復元する。
     pub fn restore_run(&mut self, read_only: bool) -> Result<(), String> {
-        let dir = self.state_dir();
+        let root = self.state_dir();
+        // **Run ごとの置き場を先に全部読む。** 1 本だけ読むと、
+        // 同時に走らせていた残りが再起動で消える。
+        let mut loaded = 0usize;
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir(root.join(RUNS_DIR)) {
+            let mut dirs: Vec<std::path::PathBuf> =
+                rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            dirs.sort();
+            for d in dirs {
+                if let LoadOutcome::Loaded(s) = persistence::load(&d) {
+                    let rt = TeamRuntime::restore(*s, self.workspace.clone());
+                    if seen.insert(rt.run().run_id.clone()) {
+                        self.runs.push(rt);
+                        loaded += 1;
+                    }
+                }
+            }
+        }
+        if loaded > 0 {
+            self.active = 0;
+            self.read_only = read_only;
+            self.restore = RestorePrompt::None;
+            self.dirty = true;
+            return Ok(());
+        }
+        let dir = root;
         match persistence::load(&dir) {
             LoadOutcome::Loaded(s) => {
-                self.runtime = Some(TeamRuntime::restore(*s, self.workspace.clone()));
+                self.runs.push(TeamRuntime::restore(*s, self.workspace.clone()));
+                self.active = self.runs.len() - 1;
                 self.read_only = read_only;
                 self.restore = RestorePrompt::None;
                 self.dirty = true;
@@ -613,7 +798,11 @@ impl TeamPanel {
         self.cancel_all_validations();
         let dir = self.state_dir();
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
-        self.runtime = None;
+        // **Run ごとの置き場も消す。** 残すと、次に開いたときに
+        // 消したはずの Run が戻ってくる。
+        let _ = std::fs::remove_dir_all(dir.join(RUNS_DIR));
+        self.runs.clear();
+        self.active = 0;
         self.snapshot = None;
         self.restore = RestorePrompt::None;
         Ok(n)
@@ -625,7 +814,7 @@ impl TeamPanel {
             self.notice = "読み取り専用で開いています (操作できません)".to_string();
             return;
         }
-        let Some(rt) = self.runtime.as_mut() else {
+        let Some(rt) = self.rt_mut() else {
             return;
         };
         let effects = rt.apply_action(action);
@@ -688,7 +877,7 @@ impl TeamPanel {
 
     /// app から観測を受け取って 1 tick 進める。**描画の外で呼ぶこと。**
     pub fn pump_sessions(&mut self, rows: Vec<SessionInput>, now: u64) {
-        if self.runtime.is_none() || self.read_only {
+        if self.rt().is_none() || self.read_only {
             return;
         }
         let live: HashSet<SessionId> = rows.iter().map(|r| r.id).collect();
@@ -722,19 +911,30 @@ impl TeamPanel {
         if self.read_only {
             return;
         }
-        let Some(rt) = self.runtime.as_mut() else {
-            return;
-        };
-        let effects = rt.tick(&obs);
-        self.absorb(effects);
+        // **全部の Run を進める。** 画面に出していない Run も走っている。
+        // 進めないと、そちらの担当は起動したまま何も配られない。
+        let batches: Vec<(RunOwner, Vec<TeamEffect>)> = self
+            .runs
+            .iter_mut()
+            .map(|rt| (rt.owner(), rt.tick(&obs)))
+            .collect();
+        for (owner, effects) in batches {
+            self.absorb_for(owner, effects);
+        }
     }
 
+    /// 画面に出している Run の副作用を取り込む。
     fn absorb(&mut self, effects: Vec<TeamEffect>) {
         // **発行した瞬間の持ち主を焼き付ける。** あとから「いまの Runtime」を
         // 見て決めると、切り替わった後の値になってしまう。
-        let Some(owner) = self.runtime.as_ref().map(|rt| rt.owner()) else {
+        let Some(owner) = self.rt().map(|rt| rt.owner()) else {
             return;
         };
+        self.absorb_for(owner, effects);
+    }
+
+    /// 持ち主を指定して取り込む (Run が複数あるときはこちら)。
+    fn absorb_for(&mut self, owner: RunOwner, effects: Vec<TeamEffect>) {
         for e in effects {
             let key = e.key();
             match e {
@@ -779,7 +979,7 @@ impl TeamPanel {
 
     /// Effect の実行が成功したと Runtime へ返す。
     pub fn ack_done(&mut self, key: &str) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.run_with_key_mut(key) {
             rt.note_effect_done(key);
         }
         self.needs_save = true;
@@ -793,7 +993,7 @@ impl TeamPanel {
     /// が残ったまま結末が 1 件も無い状態になる。**撃ち直さない**のは
     /// `note_delivery` の失敗と同じ理由 (人の発話を自動で再送しない)。
     pub fn note_manual_failed(&mut self, key: &str, why: &str) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.rt_mut() {
             rt.note_manual_delivery(key, false, why);
         }
         self.needs_save = true;
@@ -802,7 +1002,7 @@ impl TeamPanel {
 
     /// **指示が方針で止められた**と Runtime へ返す (撃ち直さない)。
     pub fn note_instruction_blocked(&mut self, task: TaskId, why: &str) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.rt_mut() {
             rt.note_instruction_blocked(task, why);
         }
         self.needs_save = true;
@@ -811,26 +1011,104 @@ impl TeamPanel {
 
     /// Effect の実行に失敗したと Runtime へ返す (次の tick で再発行される)。
     pub fn ack_failed(&mut self, key: &str) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.run_with_key_mut(key) {
             rt.note_effect_failed(key);
         }
         self.needs_save = true;
         self.dirty = true;
     }
 
+    /// 画面に出している Run。**無ければ `None`。**
+    pub(super) fn rt(&self) -> Option<&TeamRuntime> {
+        self.runs.get(self.active)
+    }
+
+    /// 画面に出している Run (書き換え用)。
+    pub(super) fn rt_mut(&mut self) -> Option<&mut TeamRuntime> {
+        self.runs.get_mut(self.active)
+    }
+
+    /// 走っている Run の一覧 `(表題, 進行中か)`。画面の切り替えに使う。
+    pub fn run_tabs(&self) -> Vec<(String, bool)> {
+        self.runs
+            .iter()
+            .map(|r| (r.goal().title.clone(), !r.goal().status.is_terminal()))
+            .collect()
+    }
+
+    /// 画面に出す Run を選ぶ。**範囲外は無視する** (押せない位置を作らない)。
+    pub fn select_run(&mut self, i: usize) {
+        if i < self.runs.len() && i != self.active {
+            self.active = i;
+            self.selected_agent = None;
+            self.expanded_output = None;
+            self.dirty = true;
+        }
+    }
+
+    /// いま画面に出している Run の位置。
+    pub fn active_run(&self) -> usize {
+        self.active
+    }
+
+    /// **Run を 1 本閉じる。**
+    ///
+    /// 複数走らせられるようになった以上、1 本だけ畳む手段が要る
+    /// (全部畳む `shutdown` しか無いと、終わった Run が並び続ける)。
+    ///
+    /// 閉じたら:
+    /// * その Run の**停止**を Runtime へ伝える (走っている担当を残さない)
+    /// * 記憶から外す — 以後、その Run が出した仕事は
+    ///   [`TeamPanel::mine`] を通らなくなる (**死んだ Run の仕事は実行しない**)
+    /// * 保存も消す (次に開いたときに戻ってこない)
+    pub fn close_run(&mut self, i: usize) -> Option<String> {
+        if i >= self.runs.len() {
+            return None;
+        }
+        // **止めてから外す。** 外してから止めると、止める相手が居なくなる。
+        let effects = self.runs[i].apply_action(TeamAction::Stop);
+        let owner = self.runs[i].owner();
+        self.absorb_for(owner, effects);
+        let rt = self.runs.remove(i);
+        let id = rt.run().run_id.clone();
+        let _ = std::fs::remove_dir_all(self.state_dir().join(RUNS_DIR).join(&id));
+        if self.runs.is_empty() {
+            self.active = 0;
+            self.snapshot = None;
+        } else if self.active >= self.runs.len() {
+            self.active = self.runs.len() - 1;
+        }
+        self.selected_agent = None;
+        self.expanded_output = None;
+        self.dirty = true;
+        self.needs_save = true;
+        Some(id)
+    }
+
+    /// **その仕事を出した Run** を鍵から引く。
+    ///
+    /// 実行側から返る返事は鍵しか持っていない。「いまの Run」へ返すと、
+    /// 画面を切り替えただけで返事が**別の Run の記録**に付く。
+    fn run_with_key_mut(&mut self, key: &str) -> Option<&mut TeamRuntime> {
+        self.runs.iter_mut().find(|r| r.has_effect(key))
+    }
+
     /// いまの Run の持ち主。Run が無ければ `None`。
     pub fn owner(&self) -> Option<RunOwner> {
-        self.runtime.as_ref().map(|rt| rt.owner())
+        self.rt().map(|rt| rt.owner())
     }
 
     /// **いまの Run のものだけを渡す。** 持ち主が違うものは捨てる
     /// (別の workspace / 別の Run で実行させない)。捨てた件数を数える。
     fn mine<T>(&mut self, q: Vec<(RunOwner, String, T)>) -> Vec<(String, T)> {
-        let now = self.owner();
+        // **走っている Run のどれかのものなら実行する。**
+        // 「いまの Run」だけで見ると、画面に出していない Run の仕事が
+        // 全部捨てられる (2 本目のチームが 1 つも動かない)。
+        let live: Vec<RunOwner> = self.runs.iter().map(|r| r.owner()).collect();
         let mut out = Vec::with_capacity(q.len());
         let mut dropped = 0usize;
         for (owner, key, v) in q {
-            if now.as_ref() == Some(&owner) {
+            if live.contains(&owner) {
                 out.push((key, v));
             } else {
                 dropped += 1;
@@ -905,7 +1183,13 @@ impl TeamPanel {
         session: SessionId,
         identity: Option<String>,
     ) {
-        if let Some(rt) = self.runtime.as_mut() {
+        // **その担当を起こした Run へ結び付ける。** エージェント ID は
+        // Run ごとに同じ綴り (`agent-1`) を使うので、名前だけでは決まらない。
+        // 起動要求の鍵 (`start:<agent>`) を持っている Run が持ち主。
+        let key = format!("start:{}", agent.0);
+        if let Some(rt) = self.run_with_key_mut(&key) {
+            rt.bind_session(agent, session, identity);
+        } else if let Some(rt) = self.rt_mut() {
             rt.bind_session(agent, session, identity);
         }
         self.dirty = true;
@@ -938,7 +1222,7 @@ impl TeamPanel {
             // **結末を監査へ残す。** 発行時の記録は「送信キューへ追加した」
             // までなので、ここを素の ack で済ませると delivered と failed が
             // 記録の上で見分けられない。
-            if let Some(rt) = self.runtime.as_mut() {
+            if let Some(rt) = self.rt_mut() {
                 rt.note_manual_delivery(key, delivered, "宛先の端末が応答しませんでした");
             }
             if !delivered {
@@ -954,7 +1238,7 @@ impl TeamPanel {
             return None;
         }
         self.ack_failed(key);
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.rt_mut() {
             rt.note_instruction_undelivered(task, key, "宛先の端末が応答しませんでした");
         }
         self.needs_save = true;
@@ -988,7 +1272,7 @@ impl TeamPanel {
     /// (**第 2 のセッション台帳を作らない** — 真実は Runtime の
     /// エージェント一覧 1 か所)。
     pub fn bound_sessions(&self) -> HashSet<SessionId> {
-        self.runtime
+        self.rt()
             .as_ref()
             .map(|rt| rt.agents().iter().filter_map(|a| a.session_id).collect())
             .unwrap_or_default()
@@ -996,7 +1280,7 @@ impl TeamPanel {
 
     /// 起動に失敗した。
     pub fn note_launch_failed(&mut self, agent: &AgentId, why: &str) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.rt_mut() {
             rt.note_launch_failed(agent, why);
         }
         self.dirty = true;
@@ -1010,7 +1294,7 @@ impl TeamPanel {
         task: TaskId,
         runs: Vec<ValidationRun>,
     ) {
-        if let Some(rt) = self.runtime.as_mut() {
+        if let Some(rt) = self.rt_mut() {
             rt.note_validation_for(execution, task, runs);
         }
         self.needs_save = true;
@@ -1070,7 +1354,8 @@ impl TeamPanel {
         self.pending_stops.clear();
         self.pending_validations.clear();
         self.save_if_needed();
-        self.runtime = None;
+        self.runs.clear();
+        self.active = 0;
         self.snapshot = None;
         self.restore = RestorePrompt::None;
         killed
@@ -1093,7 +1378,7 @@ impl TeamPanel {
     /// 戻りは「前のアプリの状態が残っていたか」。**普通の起動では false**
     /// (何も無いところから始まるので、1 命令も走らない)。
     pub fn adopt_new_app_context(&mut self) -> bool {
-        if self.runtime.is_none()
+        if self.rt().is_none()
             && self.workspace.as_os_str().is_empty()
             && self.validation_jobs.is_empty()
         {
@@ -1196,7 +1481,7 @@ impl TeamPanel {
         }
         self.validation_jobs = still;
         for (execution, task, runs) in done {
-            if let Some(rt) = self.runtime.as_mut() {
+            if let Some(rt) = self.rt_mut() {
                 rt.note_validation_for(&execution, task, runs);
             }
             self.needs_save = true;
@@ -1215,12 +1500,31 @@ impl TeamPanel {
             return;
         }
         self.needs_save = false;
-        let Some(rt) = self.runtime.as_ref() else {
+        if self.runs.is_empty() {
             return;
-        };
-        let dir = self.state_dir();
-        if let Err(e) = persistence::save(&dir, &rt.to_saved()) {
-            self.notice = e.detail();
+        }
+        // **全部の Run を保存する。** 画面に出していない Run も走っている
+        // ので、保存しないと再起動でそれだけが消える。
+        //
+        // 置き場は Run ごと (`runs/<run_id>/`)。1 か所に上書きすると、
+        // 2 本目が 1 本目を消す。
+        let root = self.state_dir();
+        let mut err: Option<String> = None;
+        for rt in &self.runs {
+            let dir = root.join(RUNS_DIR).join(&rt.run().run_id);
+            if let Err(e) = persistence::save(&dir, &rt.to_saved()) {
+                err = Some(e.detail());
+            }
+        }
+        // **いちばん古い 1 本は従来の場所にも置く。** 旧版で保存された
+        // Run を読む経路 (`restore_run`) をそのまま残すため。
+        if let Some(rt) = self.runs.first() {
+            if let Err(e) = persistence::save(&root, &rt.to_saved()) {
+                err = Some(e.detail());
+            }
+        }
+        if let Some(e) = err {
+            self.notice = e;
         }
     }
 
@@ -1230,7 +1534,7 @@ impl TeamPanel {
             return;
         }
         self.dirty = false;
-        self.snapshot = self.runtime.as_ref().map(|rt| view_model::snapshot(rt, now));
+        self.snapshot = self.rt().map(|rt| view_model::snapshot(rt, now));
     }
 
     /// 次のフレームでスナップショットを作り直す。
@@ -1333,7 +1637,7 @@ mod tests {
             "私が付けた名前",
         )
         .unwrap();
-        let rt = p.runtime.as_ref().unwrap();
+        let rt = p.rt().unwrap();
         // Goal 名が効く
         assert_eq!(rt.goal().title, "私が付けた名前");
         // 役割の選択が効く (設計レーンが立つ)
@@ -1478,8 +1782,7 @@ mod tests {
             "手放すのに止めていない (プロセスが残る)"
         );
         let t = p
-            .runtime
-            .as_ref()
+            .rt()
             .and_then(|rt| rt.task(1))
             .expect("タスク")
             .clone();
@@ -1492,24 +1795,35 @@ mod tests {
     }
 
     #[test]
+    /// **2 本目を作っても 1 本目を潰さない。**
+    ///
+    /// 以前はここで「実行中なら断る」ことを見ていた。同時に走らせられる
+    /// ようになったので、見るべき性質は**断ること**ではなく
+    /// 「**前の Run がそのまま生き残っていること**」に変わる
+    /// (置き換えると、走っている検証と起動済みの担当の面倒を見る相手が
+    ///  消えて、プロセスだけが残る)。上限に当たったときだけ断る。
     fn 実行中のrunを別の計画で潰さない() {
-        // 置き換えると、走っている検証と起動済みのエージェントの面倒を
-        // 見る相手が消える (結果は `run_id` 違いで捨てられ、プロセスだけが
-        // 残る)。同じ workspace なので `attach_workspace` では守れない。
         let dir = ws("replace-busy");
         let mut p = started_panel(&dir);
         assert!(p.live_work().is_busy());
         let before = p.owner().expect("持ち主");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("2 本目を並べられるべき");
+        assert_eq!(p.runs.len(), 2, "2 本目が増えていない");
+        assert!(
+            p.runs.iter().any(|r| r.owner() == before),
+            "前の Run が消えた (面倒を見る相手が居なくなる)"
+        );
+        // **上限までは並ぶ。上限を超えたら断る。**
+        while p.runs.len() < MAX_CONCURRENT_RUNS {
+            p.plan(SPEC, "SPEC.md", RunOptions::default())
+                .expect("上限までは並べられるべき");
+        }
         let err = p
             .plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect_err("実行中なのに作り直せてしまった");
+            .expect_err("上限を超えて並べてしまった");
         assert!(!err.trim().is_empty(), "断った理由が空");
-        assert_eq!(p.owner().as_ref(), Some(&before), "Run が入れ替わった");
-        // 片付ければ作り直せる (永久に作れないわけではない)。
-        let _ = p.take_launches();
-        assert!(!p.live_work().is_busy());
-        p.plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect("片付けたら作り直せるべき");
+        assert_eq!(p.runs.len(), MAX_CONCURRENT_RUNS);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1525,10 +1839,13 @@ mod tests {
         // 別の Run へ差し替える (workspace ごと作り直す = 切り替えと同じ状況)。
         // 断りを外しても**持ち主の照合が効く**ことを見たいので、検査だけを
         // 黙らせて Run を作り直す (本番は `plan` が断る)。
+        // **閉じた Run の仕事は実行しない。**
+        // 同時に走らせられるようになったので「作り直したら前のは死ぬ」では
+        // なくなった。死ぬのは**閉じたとき**なので、そこで確かめる。
         let stale = p.pending_launches.clone();
         p.workspace = b.clone();
-        p.allow_replace_run_for_test();
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale;
         assert!(
             p.take_launches().is_empty(),
@@ -1580,9 +1897,10 @@ mod tests {
             p.pending_validations.clone(),
             p.pending_manual.clone(),
         );
+        // **閉じた Run のものは、どの口からも出さない。**
         p.workspace = b.clone();
-        p.allow_replace_run_for_test();
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale.0;
         p.pending_instructions = stale.1;
         p.pending_stops = stale.2;
@@ -1595,6 +1913,69 @@ mod tests {
         assert!(p.take_manual_instructions().is_empty(), "人の指示が漏れた");
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    /// **2 本の Run が同時に進む。**
+    ///
+    /// 「並べられる」だけでは足りない — 画面に出していないほうも
+    /// `tick` が回り、その仕事が実行の口から出てくることまで見る
+    /// (回さないと、2 本目の担当は起動したまま何も配られない)。
+    #[test]
+    fn 二本のrunが同時に進む() {
+        let dir = ws("two-runs");
+        let mut p = started_panel(&dir);
+        let first = p.owner().expect("1 本目");
+        // 起動要求を片付けてから 2 本目を作る (口を空にして違いを見る)。
+        let _ = p.take_launches();
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("2 本目を並べられるべき");
+        let second = p.owner().expect("2 本目");
+        assert_ne!(first.run_id, second.run_id, "同じ Run になっている");
+
+        // **画面に出していないほうの仕事も実行の口から出る。**
+        //
+        // ここが壊れていると 2 本目は「並んでいるだけ」になる
+        // (以前は `mine` が「いまの Run」だけを通していたので、
+        //  画面に出していない Run の仕事は全部捨てられていた)。
+        let _ = p.take_launches();
+        p.pending_stops.push((first.clone(), "stop:1".into(), 1));
+        p.pending_stops.push((second.clone(), "stop:2".into(), 2));
+        let stops = p.take_stops();
+        assert_eq!(stops.len(), 2, "片方の Run の仕事が捨てられた: {stops:?}");
+        assert_eq!(p.dropped_effects(), 0, "生きている Run のものを捨てた");
+
+        // **閉じた Run のものは捨てる** (死んだ相手へ配らない)。
+        p.pending_stops.push((first.clone(), "stop:1".into(), 1));
+        p.close_run(0).expect("1 本目を閉じる");
+        assert!(p.take_stops().is_empty(), "閉じた Run の仕事を実行した");
+        assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
+        assert_eq!(p.runs.len(), 1);
+        assert_eq!(p.owner().as_ref(), Some(&second), "残ったほうが出ていない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 画面の切り替えだけを見る (上のテストと分ける — 落ちたときに
+    /// 「配達が壊れた」のか「切り替えが壊れた」のかが 1 行で分かる)。
+    #[test]
+    fn 画面を切り替えても両方の_run_が生きている() {
+        let dir = ws("two-runs-switch");
+        let mut p = started_panel(&dir);
+        let first = p.owner().expect("1 本目");
+        let _ = p.take_launches();
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("2 本目");
+        let second = p.owner().expect("2 本目");
+        assert_ne!(first.run_id, second.run_id);
+        assert_eq!(p.run_tabs().len(), 2, "切り替えの見出しが 2 つ出ない");
+        p.select_run(0);
+        assert_eq!(p.owner().as_ref(), Some(&first));
+        assert_eq!(p.runs.len(), 2, "切り替えで消えた");
+        p.select_run(1);
+        assert_eq!(p.owner().as_ref(), Some(&second));
+        // 範囲外は無視する (押せない位置を作らない)。
+        p.select_run(99);
+        assert_eq!(p.active_run(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1780,8 +2161,7 @@ mod tests {
         let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         let exec = p
-            .runtime
-            .as_ref()
+            .rt()
             .expect("runtime")
             .current_execution(1);
         let tx = queue_job(&mut p, 1, &exec);
@@ -1790,8 +2170,7 @@ mod tests {
         p.collect_validations();
         assert_eq!(p.running_validations(), 0, "受け口を抱えたまま");
         let t = p
-            .runtime
-            .as_ref()
+            .rt()
             .and_then(|rt| rt.task(1))
             .expect("タスク")
             .clone();
@@ -1816,7 +2195,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
-        let exec = p.runtime.as_ref().expect("runtime").current_execution(1);
+        let exec = p.rt().expect("runtime").current_execution(1);
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = super::super::launch::new_cancel_flag();
         p.watch_validation(ValidationJob {
@@ -1839,8 +2218,7 @@ mod tests {
             "見切ったのに停止の札を立てていない (プロセスが残る)"
         );
         let t = p
-            .runtime
-            .as_ref()
+            .rt()
             .and_then(|rt| rt.task(1))
             .expect("タスク")
             .clone();
@@ -1940,7 +2318,18 @@ mod tests {
         assert!(f.review_required);
         assert_eq!(f.approval_mode, "ask");
         // 既定のプリセットは実装 + レビュー
-        assert_eq!(f.roles, vec![TeamRole::Implementer, TeamRole::Reviewer]);
+        assert_eq!(
+            f.roles,
+            vec![
+                TeamRole::Planner,
+                TeamRole::Architect,
+                TeamRole::Implementer,
+                TeamRole::Tester,
+                TeamRole::Reviewer,
+                TeamRole::Integrator,
+            ],
+            "既定は選べる 6 つ全部 (2 つだとチームとして分担しない)"
+        );
     }
 
     #[test]
@@ -2103,7 +2492,7 @@ mod tests {
             },
         )
         .expect("計画できる");
-        assert_eq!(p.runtime.as_ref().expect("Runtime").run().agent_count, 2);
+        assert_eq!(p.rt().expect("Runtime").run().agent_count, 2);
 
         // ── 3) 開始 → 起動要求。パスはこの OS の綴りのまま運ばれる ───────
         p.act(TeamAction::Start);
@@ -2146,8 +2535,7 @@ mod tests {
         };
         p.pump_sessions(rows(None, ""), now + 1);
         let working: Vec<(TaskId, SessionId, String)> = p
-            .runtime
-            .as_ref()
+            .rt()
             .expect("Runtime")
             .tasks()
             .iter()
@@ -2164,7 +2552,7 @@ mod tests {
 
         // ── 5) 完了報告 → 検証 Effect (cwd はこの workspace) ──────────────
         let (tid, sid, agent) = working[0].clone();
-        let t = p.runtime.as_ref().unwrap().task(tid).expect("タスク").clone();
+        let t = p.rt().unwrap().task(tid).expect("タスク").clone();
         let files: Vec<String> = t.files.iter().map(|x| format!("\"{x}\"")).collect();
         let vs: Vec<String> = t
             .validation_commands
@@ -2195,7 +2583,7 @@ mod tests {
         assert_eq!(p.goal_status(), Some(GoalStatus::Running), "戻らない");
         p.act(TeamAction::Stop);
         assert!(
-            p.runtime.as_ref().expect("Runtime").run().stopped,
+            p.rt().expect("Runtime").run().stopped,
             "停止が効かない"
         );
 
@@ -2396,7 +2784,7 @@ mod tests {
         // ── 届かなかった ────────────────────────────────────────────────
         let hit = p.note_delivery(&tag, false);
         assert_eq!(hit, Some(task), "どのタスクが届かなかったか返していない");
-        let rt = p.runtime.as_ref().expect("Runtime");
+        let rt = p.rt().expect("Runtime");
         assert!(
             !rt.effect_completed(&key),
             "届いていないのに完了として記録した (二度と出し直されない)"
@@ -2420,8 +2808,7 @@ mod tests {
         let tag2 = p.delivery_tag(&key2).expect("目印");
         assert_eq!(p.note_delivery(&tag2, true), None, "届いたのに理由を返した");
         assert!(
-            p.runtime
-                .as_ref()
+            p.rt()
                 .expect("Runtime")
                 .effect_completed(&key2),
             "届いたのに完了として記録していない (もう一度送ってしまう)"
@@ -2432,7 +2819,7 @@ mod tests {
         let other = format!("run-other|{key2}");
         assert_eq!(p.note_delivery(&other, false), None, "別の Run の配達を採った");
         assert!(
-            p.runtime.as_ref().expect("Runtime").effect_completed(&key2),
+            p.rt().expect("Runtime").effect_completed(&key2),
             "別の Run の配達でいまの Run の記録を壊した"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -2479,8 +2866,7 @@ mod tests {
             2,
         );
         assert!(
-            p.runtime
-                .as_ref()
+            p.rt()
                 .expect("Runtime")
                 .agents()
                 .iter()
@@ -2541,7 +2927,7 @@ mod tests {
         // 引き継ぐが (それが復元の意味)、**プロセスへの結び付きは全部外れる**
         // ので、新しいアプリが前のアプリの端末を操作することはない。
         p.restore_run(false).expect("復元できるべき");
-        let rt = p.runtime.as_ref().expect("復元した Runtime");
+        let rt = p.rt().expect("復元した Runtime");
         assert!(
             rt.tasks()
                 .iter()

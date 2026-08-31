@@ -616,6 +616,35 @@ pub fn run_resolved(
     cancel: &CancelFlag,
     pid_slot: &PidSlot,
 ) -> (i32, ValidationOutcome, ValidationOutput) {
+    run_resolved_capped(
+        program,
+        args,
+        cwd,
+        timeout,
+        cancel,
+        pid_slot,
+        SUCCESS_TAIL_BYTES,
+    )
+}
+
+/// [`run_resolved`] の本体。**成功したときに残す stdout の量だけ差し替えられる。**
+///
+/// 検証コマンドは成功したら末尾しか要らない ([`SUCCESS_TAIL_BYTES`]) が、
+/// **出力そのものが成果物**の呼び出し (仕様書の下書き) は 1 文字も捨てては
+/// いけない — 先頭から切ると開始マーカーごと消えて、成功したのに
+/// 「読めませんでした」になる。
+///
+/// **第 2 のランナーを作らない**ためにここで分岐する。時間切れ・停止・
+/// 木ごとの後始末は 1 か所にしか無い状態を保つ。
+pub fn run_resolved_capped(
+    program: &Path,
+    args: &[&str],
+    cwd: &Path,
+    timeout: std::time::Duration,
+    cancel: &CancelFlag,
+    pid_slot: &PidSlot,
+    success_cap: usize,
+) -> (i32, ValidationOutcome, ValidationOutput) {
     use std::sync::atomic::Ordering;
 
     let mut command = crate::procx::hidden_command(program);
@@ -667,7 +696,7 @@ pub fn run_resolved(
                 let why = from_status(st);
                 // 成功したものの巨大なログは要らない (失敗の理由が要る)。
                 let cap = if why == ValidationOutcome::Passed {
-                    SUCCESS_TAIL_BYTES
+                    success_cap
                 } else {
                     usize::MAX
                 };

@@ -58,6 +58,7 @@ pub mod reviewer;
 pub mod roles;
 pub mod runtime;
 pub mod scheduler;
+pub mod spec_writer;
 pub mod state_machine;
 pub mod validation_command;
 pub mod validation_defaults;

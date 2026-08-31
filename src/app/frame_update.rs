@@ -114,7 +114,33 @@ impl ZaivernApp {
     /// 1 フレーム分の実処理 ([`eframe::App::update`] の本体)。
     /// 呼び出し側のパニックガードが囲うので、ここからの panic は
     /// アプリ終了ではなく「フレームのスキップ」になる。
+    /// **起動直後に 1 回だけ最大化する。**
+    ///
+    /// `ViewportBuilder::with_maximized(true)` は winit へ渡っているが、
+    /// macOS では起動時に効かない (実測: 指定しても 1480x940 のまま開く。
+    /// `inner_size` の適用が後に来るため)。効く OS では二度目の指定に
+    /// なるだけなので害は無い。
+    ///
+    /// **1 回だけ**なのが要点。毎フレーム送ると、人がウィンドウを小さく
+    /// しても次のフレームで戻され、二度と縮められなくなる。
+    ///
+    /// 最初のフレームでは送らない。送っても winit がまだウィンドウを
+    /// 出しておらず取りこぼす (`Title` と違い、こちらは取りこぼすと
+    /// 何も起きない)。数フレーム待ってから 1 回だけ撃つ。
+    fn maximize_once(&mut self, ctx: &egui::Context) {
+        if self.did_initial_maximize {
+            return;
+        }
+        if ctx.cumulative_pass_nr() < 2 {
+            crate::perf::repaint(ctx, "maximize_once");
+            return;
+        }
+        self.did_initial_maximize = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
+
     pub(super) fn update_impl(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.maximize_once(ctx);
         // **IME の確定文字列が `Text` としても届く環境の二重入力を潰す。**
         // 同フレームの `Ime::Commit("日本語")` と `Text("日本語")` を両方
         // 通すと、コマンドパレットの検索欄も検索置換もコードエディタ本体も

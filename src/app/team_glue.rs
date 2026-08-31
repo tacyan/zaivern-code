@@ -79,6 +79,18 @@ impl ZaivernApp {
         // 1) `zai team run` からの起動要求を拾う (**1 回だけ**)。
         self.team_take_launch_request();
 
+        // 仕様書の書き換えが返っていれば受け取る。**待たない** —
+        // 覗くだけなので、返ってきていなければ 1 マイクロ秒も止まらない。
+        let drafting = panel::with_panel(|p| {
+            p.poll_draft();
+            p.drafting()
+        });
+        if drafting {
+            // 入力が無くても状態が進むようフレームを回す (数分かかるので、
+            // 回さないと「押したのに何も起きない」に見える)。
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(250), "team_draft");
+        }
+
         let has_run = panel::with_panel(|p| p.has_run());
         if !has_run {
             self.team_board_ui(ctx);
@@ -429,19 +441,10 @@ impl ZaivernApp {
         // (`roles::preset_for_role`) — 素のシェルではチームにならないので、
         // AI CLI として使えるものだけが候補になる。
         //
-        // **この版では役割ごとのプリセットを持たないので、実際には全員が
-        // 同じプリセットで動く。** 差し替え点をここ 1 か所に残してある。
-        let table: Vec<(String, bool)> = self
-            .cfg
-            .agents
-            .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    crate::agents::spec_for_command(&p.command).is_some(),
-                )
-            })
-            .collect();
+        // **この PC に入っている CLI を役割ごとに配る。** 全員が同じ CLI だと、
+        // その CLI の癖がチーム全体に同じ形で乗る (実装の見落としを、同じ
+        // 見落とし方をする相手がレビューする)。
+        let table = self.team_preset_table();
         let idx = crate::features::team::imp::roles::preset_for_role(&table, spec.role)?;
         let command = self.cfg.agents.get(idx)?.command.clone();
         let before: std::collections::HashSet<SessionId> =
@@ -576,6 +579,9 @@ impl ZaivernApp {
                 &mut form,
                 p.restore,
                 p.selected_agent.as_ref(),
+                p.expanded_output.as_ref(),
+                &p.run_tabs(),
+                p.active_run(),
                 &p.notice,
             );
             p.form = form;
@@ -655,6 +661,29 @@ impl ZaivernApp {
                 p.inspector_open = true;
             }),
             BoardAction::OpenTerminal(sid) => self.team_open_terminal(sid),
+            BoardAction::SelectRun(i) => panel::with_panel(|p| p.select_run(i)),
+            BoardAction::CloseRun(i) => {
+                if panel::with_panel(|p| p.close_run(i)).is_some() {
+                    self.toast(tr("team.notice.run_closed"), false);
+                }
+            }
+            BoardAction::ToggleAgentOutput(id) => panel::with_panel(|p| {
+                // **1 体だけ開く。** 全部開けると一覧が縦に伸びて、
+                // 「どの担当が居るか」が一目で分からなくなる。
+                p.expanded_output = if p.expanded_output.as_ref() == Some(&id) {
+                    None
+                } else {
+                    Some(id.clone())
+                };
+            }),
+            BoardAction::DraftSpec => self.team_draft_spec(),
+            BoardAction::AcceptDraft => {
+                panel::with_panel(|p| p.accept_draft());
+                // **採用したら、そのまま計画へ進む。**「これでいいですか？」
+                // に「はい」と答えたのに、もう一度別のボタンを押させない。
+                self.team_plan_from_form();
+            }
+            BoardAction::DiscardDraft => panel::with_panel(|p| p.discard_draft()),
             BoardAction::OpenNewRun => {
                 // **ここでも既存設定を初期値として読む** (フォームを開く
                 // 入口が 2 つあるので、片方だけだと既定値のまま計画できる)。
@@ -695,6 +724,138 @@ impl ZaivernApp {
                 }
             }
         }
+    }
+
+    /// **短い指示を、使えるエージェントに仕様書へ書き換えてもらう。**
+    ///
+    /// 計画は SPEC の箇条書きを機械的に割るので、一行の指示では実装タスクが
+    /// 1 件にしかならず、何体立てても 1 体しか働かない。書き換えを挟むと
+    /// 分担できる形になる。**採用するかは人が決める** — 勝手に膨らませた
+    /// 仕様で走り出したら、頼んでいない物ができる。
+    ///
+    /// 実行は裏のスレッド。UI スレッドで待つと、考えている数分ぶん
+    /// フレームが止まる (CLAUDE.md「git は UI スレッドで待たない」と同じ理由)。
+    fn team_draft_spec(&mut self) {
+        let (ws, form) = panel::with_panel(|p| (p.workspace().to_path_buf(), p.form.clone()));
+        // 書き換えの材料は、計画へ渡すのと**同じ経路**で取る
+        // (別々に取ると「画面で見た指示」と「書き換えた指示」がずれる)。
+        let brief = if form.from_file {
+            let path = if std::path::Path::new(&form.spec_path).is_absolute() {
+                std::path::PathBuf::from(&form.spec_path)
+            } else {
+                ws.join(&form.spec_path)
+            };
+            match launch::build(&ws, &path, form.agents, false) {
+                Ok(req) => req.spec_text,
+                Err(e) => {
+                    panel::with_panel(|p| p.form.error = e.detail());
+                    return;
+                }
+            }
+        } else {
+            form.spec_text.clone()
+        };
+        if brief.trim().is_empty() {
+            panel::with_panel(|p| p.form.error = tr("team.draft.empty_brief"));
+            return;
+        }
+        // **使えるエージェント = ヘッドレスで走らせられるもの。**
+        // 対話 TUI しか持たない CLI をここで起こすと、返らないまま
+        // 時間切れを待つだけになる。
+        let Some((label, program, args)) = self.team_headless_agent() else {
+            panel::with_panel(|p| p.form.error = tr("team.draft.no_agent"));
+            return;
+        };
+        // **こちらが実際に走らせられる検証だけを見せる。** 見せないと
+        // エージェントは想像で書き、`tools/verify.sh --quick` のような
+        // パス指定が返ってきて計画がまるごと断られる (実測)。
+        let candidates =
+            crate::features::team::imp::validation_defaults::detect(&ws).unwrap_or_default();
+        let prompt = crate::features::team::imp::spec_writer::build_prompt(
+            &form.goal_name,
+            &brief,
+            form.agents,
+            &form.roles,
+            &candidates,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cwd = ws.clone();
+        // 送り手が落ちても受け側は `Disconnected` で決着する。
+        std::thread::spawn(move || {
+            let r = crate::features::team::imp::spec_writer::draft_with(
+                &program,
+                &args,
+                &cwd,
+                &prompt,
+                crate::features::team::imp::spec_writer::DRAFT_TIMEOUT,
+            );
+            let _ = tx.send(r);
+        });
+        panel::with_panel(|p| {
+            p.form.error.clear();
+            p.begin_draft(&label, rx);
+        });
+    }
+
+    /// **この PC で実際に起動できるプリセットの一覧。**
+    ///
+    /// 「入っているか」は名前ではなく**実体が PATH にあるか**で見る。
+    /// 設定に並んでいても入っていない CLI を割り当てると、その担当だけが
+    /// 永久に起動しない (画面には居るのに何も起きない)。
+    fn team_preset_table(&self) -> Vec<crate::features::team::imp::roles::PresetRow> {
+        let ws = panel::with_panel(|p| p.workspace().to_path_buf());
+        let path = std::env::var("PATH").ok();
+        let pathext = std::env::var("PATHEXT").ok();
+        self.cfg
+            .agents
+            .iter()
+            .map(|p| {
+                let spec = crate::agents::spec_for_command(&p.command);
+                let available = spec.is_some_and(|_| {
+                    let head = p.command.split_whitespace().next().unwrap_or_default();
+                    crate::features::team::imp::validation_command::resolve_in(
+                        head,
+                        &ws,
+                        path.as_deref(),
+                        pathext.as_deref(),
+                    )
+                    .is_ok()
+                });
+                crate::features::team::imp::roles::PresetRow {
+                    name: p.name.clone(),
+                    is_ai: spec.is_some(),
+                    available,
+                }
+            })
+            .collect()
+    }
+
+    /// ヘッドレスで走らせられるエージェントを 1 つ選ぶ。
+    ///
+    /// 選び方は設定のプリセット順 (先頭が既定)。**実体は絶対パスまで
+    /// 確定させる** — 名前のまま `Command` へ渡すと OS が PATH を引き直し、
+    /// 判定したのとは別の実体が動きうる。
+    fn team_headless_agent(&self) -> Option<(String, std::path::PathBuf, Vec<String>)> {
+        for p in &self.cfg.agents {
+            let Some(spec) = crate::agents::spec_for_command(&p.command) else {
+                continue;
+            };
+            let Ok((program, args)) = crate::diagnostician::build_invocation(&p.command, spec)
+            else {
+                continue;
+            };
+            let ws = panel::with_panel(|p| p.workspace().to_path_buf());
+            let Ok(found) = crate::features::team::imp::validation_command::resolve_in(
+                &program,
+                &ws,
+                std::env::var("PATH").ok().as_deref(),
+                std::env::var("PATHEXT").ok().as_deref(),
+            ) else {
+                continue;
+            };
+            return Some((p.name.clone(), found.path, args));
+        }
+        None
     }
 
     /// フォームの内容で計画する。

@@ -78,7 +78,22 @@ pub struct TeamAgentView {
     /// 端末を開けるか (`ReportedSubAgent` は開けない)。
     pub can_open_terminal: bool,
     pub blockers: Vec<String>,
+    /// **いま画面に出ている直近の出力** (末尾数行)。
+    ///
+    /// 端末タブが「名前とボタン」だけだったので、走っている最中に中身を
+    /// 見るには端末を開くしか無かった。開くと画面が切り替わるので、
+    /// 「ちょっと様子を見たい」に対して代償が大きすぎる。
+    pub preview: String,
 }
+
+/// 端末タブの札が**畳んでいるとき**に出す行数。
+pub const PREVIEW_LINES_FOLDED: usize = 8;
+/// 画面が持ち回る行数 (開いたときに出せる上限)。
+///
+/// 畳んだ札は末尾 [`PREVIEW_LINES_FOLDED`] 行だけを描く。**2 回取りに
+/// 行かない** — 開くたびに Runtime へ問い合わせる形にすると、描画から
+/// 状態を触ることになる。
+pub const PREVIEW_LINES: usize = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskView {
@@ -217,6 +232,7 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
                 assigned: mine.len(),
                 can_open_terminal: a.can_open_terminal(),
                 blockers: cur.map(|t| t.blockers.clone()).unwrap_or_default(),
+                preview: rt.preview_of(&a.id, PREVIEW_LINES),
             }
         })
         .collect();
@@ -606,6 +622,7 @@ mod tests {
             assigned: 1,
             can_open_terminal: true,
             blockers: Vec::new(),
+            preview: String::new(),
         }
     }
 

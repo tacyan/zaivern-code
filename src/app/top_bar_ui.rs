@@ -1536,7 +1536,7 @@ impl ZaivernApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(dim("Zaivern v0.2".into()));
+                        ui.label(dim(format!("Zaivern v{}", env!("CARGO_PKG_VERSION"))));
                         if let Some(tip) = &pro_badge {
                             ui.label(RichText::new("✨ Pro").size(11.5).color(theme.accent))
                                 .on_hover_text(tip.clone());

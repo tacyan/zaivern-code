@@ -314,6 +314,88 @@ pub struct TeamRuntime {
     /// 拒否そのものは正しい動き (fail-closed) だが、**黙って無かったことに
     /// しない** — 「押したのに何も起きない」を追えるようにする。
     rejections: std::cell::RefCell<Vec<(TaskId, TeamTaskState, TeamTaskState)>>,
+    /// **画面に出す「いま何をしているか」の直近の出力。** 保存しない。
+    ///
+    /// 端末タブが名前とボタンしか出していなかったので、走っている最中に
+    /// 中身を見る手段が「端末を開く」しか無かった (開くと画面が切り替わる)。
+    /// [`SessionObs::text`] は前回 tick からの差分なので、ここで**末尾だけ**
+    /// 積み直す。上限は [`PREVIEW_MAX_CHARS`] — 上限が無いと、長く走った
+    /// Run のぶんだけ際限なく太る。
+    ///
+    /// 永続化しない (`persistence::Saved` に無い) — 再起動後に「前の実行の
+    /// 画面」が残っていると、動いていないものが動いて見える。
+    previews: BTreeMap<AgentId, String>,
+    /// **配達待ちのエージェント間伝言。**
+    ///
+    /// `harvest` は `&mut self` を持っているので Effect の入れ物を
+    /// 受け取れない。次の `tick` の出口でまとめて出す (保存しない —
+    /// 届かなかった伝言を再起動後に蒸し返さない)。
+    pending_msgs: Vec<TeamEffect>,
+}
+
+/// エージェント 1 体ぶんの画面プレビューに残す文字数。
+pub const PREVIEW_MAX_CHARS: usize = 4_000;
+
+/// 計画が必要としている役割を、枠 `slots` ぶんだけ並べる (純関数)。
+///
+/// **役割はタスクから決まる。** フォームの選択は計画へ、計画は編成へ
+/// 伝わるので、真実の在り処が 1 つで済む (選択を直接見ると、計画が
+/// 作らなかった役割の担当を立てて「仕事の無い担当」が並ぶ)。
+///
+/// 並べ方: まず計画にある役割を 1 体ずつ (実装は最初の 1 体を先に置く)、
+/// 余った枠は実装で埋める。並列で効くのは実装なので余りをそこへ寄せる。
+pub fn roster_roles(tasks: &[TeamTask], teams: &[TeamGroup], slots: usize) -> Vec<TeamRole> {
+    if slots == 0 {
+        return Vec::new();
+    }
+    // 出現順は依存順 (計画 → 設計 → 実装 → テスト → レビュー → 統合)。
+    const ORDER: [TeamRole; 6] = [
+        TeamRole::Planner,
+        TeamRole::Architect,
+        TeamRole::Implementer,
+        TeamRole::Tester,
+        TeamRole::Reviewer,
+        TeamRole::Integrator,
+    ];
+    // **レーンの頭も数える。** レビューは「タスク」ではなく各タスクの
+    // 工程なので、担当のタスクが 1 件も無い。タスクだけを見ると
+    // レビュー担当が 1 体も立たず、**レビューを頼む相手が居なくなる**
+    // (`scheduler` は実装した本人にレビューさせない)。
+    let present: Vec<TeamRole> = ORDER
+        .into_iter()
+        .filter(|r| {
+            tasks.iter().any(|t| t.role == *r) || teams.iter().any(|g| g.lead_role == *r)
+        })
+        .collect();
+    if present.is_empty() {
+        return vec![TeamRole::Implementer; slots];
+    }
+    let mut out: Vec<TeamRole> = present.iter().copied().take(slots).collect();
+    while out.len() < slots {
+        out.push(TeamRole::Implementer);
+    }
+    out
+}
+
+/// 担当の表示名。**役割が名前になる** — 「Agent 3」では何の担当か分からない。
+///
+/// 同じ役割が複数居るときだけ番号を足す (1 体しか居ないのに「1」が付くと、
+/// 存在しない 2 体目を探させる)。
+pub fn agent_name(role: TeamRole, seq: usize) -> String {
+    let base = match role {
+        TeamRole::TeamLead => "Team Lead",
+        TeamRole::Planner => "Planner",
+        TeamRole::Architect => "Architect",
+        TeamRole::Implementer => "Implementer",
+        TeamRole::Tester => "Tester",
+        TeamRole::Reviewer => "Reviewer",
+        TeamRole::Integrator => "Integrator",
+    };
+    if seq <= 1 {
+        base.to_string()
+    } else {
+        format!("{base} {seq}")
+    }
 }
 
 /// 状態を 1 つ進める。**進めなかったことを黙殺しない。**
@@ -381,6 +463,8 @@ impl TeamRuntime {
             registered: BTreeSet::new(),
             dirty: true,
             rejections: Default::default(),
+            previews: BTreeMap::new(),
+            pending_msgs: Vec::new(),
         };
         rt.plan_roster();
         rt.log(
@@ -507,6 +591,8 @@ impl TeamRuntime {
             registered: BTreeSet::new(),
             dirty: false,
             rejections: Default::default(),
+            previews: BTreeMap::new(),
+            pending_msgs: Vec::new(),
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
@@ -1599,6 +1685,10 @@ impl TeamRuntime {
         // 7) Goal の状態を更新する。
         self.update_goal();
 
+        // 8) エージェント同士の伝言を配る。**Pause 中でも配る** —
+        //    伝言は新しい仕事ではなく、既に起きたことの共有なので。
+        out.append(&mut std::mem::take(&mut self.pending_msgs));
+
         self.drain_rejections();
         if self.dirty {
             out.push(TeamEffect::PersistState);
@@ -1669,6 +1759,31 @@ impl TeamRuntime {
     fn sync_sessions(&mut self, obs: &Observation) {
         let live: BTreeMap<SessionId, &SessionObs> =
             obs.sessions.iter().map(|s| (s.id, s)).collect();
+
+        // **画面プレビューを積む。** `SessionObs::text` は前回 tick からの
+        // 差分なので、末尾だけを持ち回して「いま何をしているか」を作る。
+        for a in &self.agents {
+            let Some(sid) = a.session_id else { continue };
+            let Some(o) = live.get(&sid) else { continue };
+            if o.text.is_empty() {
+                continue;
+            }
+            let buf = self.previews.entry(a.id.clone()).or_default();
+            buf.push_str(&o.text);
+            // 上限を超えたら**文字境界で**先頭を捨てる (バイトで切ると壊れる)。
+            let over = buf.chars().count().saturating_sub(PREVIEW_MAX_CHARS);
+            if over > 0 {
+                let cut = buf
+                    .char_indices()
+                    .nth(over)
+                    .map(|(i, _)| i)
+                    .unwrap_or(buf.len());
+                buf.drain(..cut);
+            }
+        }
+        // 居なくなったエージェントのぶんは捨てる (際限なく溜めない)。
+        let known: BTreeSet<AgentId> = self.agents.iter().map(|a| a.id.clone()).collect();
+        self.previews.retain(|id, _| known.contains(id));
 
         // 既存調停層への登録 (未登録のものだけ)。
         for id in live.keys() {
@@ -1782,7 +1897,22 @@ impl TeamRuntime {
     }
 
     /// 画面テキストから報告を取り込む。
+    ///
+    /// **自分が送った指示のエコーを、相手の報告として読まない。**
+    /// 指示は PTY へ打ち込むのでエージェントの TUI がそのまま描き返し、
+    /// 指示には報告のひな型がマーカーごと載っている。素直に拾うと
+    /// 「1 文字も作業していないのに完了報告が届いた」ことになる
+    /// (詳しくは [`rp::is_prompt_echo`])。
     fn harvest(&mut self, obs: &Observation) {
+        // 借用を分けるため、拾うところまでを先に済ませる。
+        struct Picked {
+            agent: AgentId,
+            results: Vec<String>,
+            reviews: Vec<String>,
+            events: Vec<String>,
+            msgs: Vec<String>,
+        }
+        let mut picked: Vec<Picked> = Vec::new();
         for s in &obs.sessions {
             if s.text.trim().is_empty() {
                 continue;
@@ -1795,16 +1925,146 @@ impl TeamRuntime {
             else {
                 continue;
             };
-            for body in rp::extract_blocks(&s.text, rp::RESULT_OPEN, rp::RESULT_CLOSE) {
-                self.take_result(&agent, &body);
+            // このエージェントへ送った指示 (同じ入力から同じ文面が出る)。
+            // 送っていなければひな型は画面に無いので、素通しでよい。
+            let sent = self.sent_instruction(&agent);
+            let keep = |body: &String, open: &str, close: &str| -> bool {
+                sent.as_deref()
+                    .is_none_or(|t| !rp::is_prompt_echo(body, t, open, close))
+            };
+            let results: Vec<String> = rp::extract_blocks(&s.text, rp::RESULT_OPEN, rp::RESULT_CLOSE)
+                .into_iter()
+                .filter(|b| keep(b, rp::RESULT_OPEN, rp::RESULT_CLOSE))
+                .collect();
+            let reviews: Vec<String> =
+                rp::extract_blocks(&s.text, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE)
+                    .into_iter()
+                    .filter(|b| keep(b, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE))
+                    .collect();
+            let events: Vec<String> = rp::extract_blocks(&s.text, rp::EVENT_OPEN, rp::EVENT_CLOSE)
+                .into_iter()
+                .filter(|b| keep(b, rp::EVENT_OPEN, rp::EVENT_CLOSE))
+                .collect();
+            let msgs: Vec<String> = rp::extract_blocks(&s.text, rp::MSG_OPEN, rp::MSG_CLOSE)
+                .into_iter()
+                .filter(|b| keep(b, rp::MSG_OPEN, rp::MSG_CLOSE))
+                .collect();
+            if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
+                continue;
             }
-            for body in rp::extract_blocks(&s.text, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE) {
-                self.take_review(&agent, &body);
+            picked.push(Picked {
+                agent,
+                results,
+                reviews,
+                events,
+                msgs,
+            });
+        }
+        for p in picked {
+            for body in p.results {
+                self.take_result(&p.agent, &body);
             }
-            for body in rp::extract_blocks(&s.text, rp::EVENT_OPEN, rp::EVENT_CLOSE) {
-                self.take_event(&agent, &body, obs.now);
+            for body in p.reviews {
+                self.take_review(&p.agent, &body);
+            }
+            for body in p.events {
+                self.take_event(&p.agent, &body, obs.now);
+            }
+            for body in p.msgs {
+                self.take_message(&p.agent, &body);
             }
         }
+    }
+
+    /// **エージェント同士のやり取り 1 通。**
+    ///
+    /// 端末の中だけで完結させない — 誰から誰へ何を言ったかを盤面へ残し
+    /// (`時系列` タブ)、**相手の端末へ実際に届ける**。届けないと
+    /// 「言った」だけになり、受け手は永久に気付かない。
+    ///
+    /// 配達は人の指示と同じ経路 (`SendManualInstruction`) を使う。
+    /// 第 2 の配達路を作ると、片方だけ届く状態が生まれる。
+    fn take_message(&mut self, from: &AgentId, body: &str) {
+        let known: Vec<(AgentId, String)> = self
+            .agents
+            .iter()
+            .filter(|a| a.kind == AgentKind::ManagedSession)
+            .map(|a| (a.id.clone(), a.role.key().to_string()))
+            .collect();
+        let (targets, text) = match rp::check_message(body, &known, from) {
+            Ok(v) => v,
+            Err(e) => {
+                self.log(TeamEventKind::Rejected, Some(from.clone()), None, e.detail());
+                return;
+            }
+        };
+        let sender = self
+            .agent(from)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| from.0.clone());
+        for to in targets {
+            let Some(session) = self.agent(&to).and_then(|a| a.session_id) else {
+                // 端末を持たない相手 (報告されたサブエージェント) には配れない。
+                // **黙って捨てない** — 送ったほうは届いた気になっている。
+                self.log(
+                    TeamEventKind::Rejected,
+                    Some(from.clone()),
+                    Some(to.clone()),
+                    format!("{} は端末を持っていないので伝言を渡せません", to.0),
+                );
+                continue;
+            };
+            let id = self.log_to(
+                TeamEventKind::AgentMessage,
+                Some(from.clone()),
+                Some(to.clone()),
+                format!("{sender} → {}: {text}", to.0),
+            );
+            self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                agent: to.clone(),
+                session,
+                // **誰からの伝言かを本文に残す。** 相手の端末には差出人が
+                // 出ないので、書かないと「誰かから何か来た」になる。
+                text: format!("[Zaivern] {sender} からの伝言:\n{text}"),
+                key: format!("manual:{}:{id}", to.0),
+            });
+        }
+    }
+
+    /// この Run が**その仕事を出したか** (冪等キーで見る)。
+    ///
+    /// Run が複数走っているとき、実行側から返る返事 (`ack_done` 等) は
+    /// 鍵しか持っていない。**出した本人へ返す**ための照合に使う。
+    pub fn has_effect(&self, key: &str) -> bool {
+        self.effects.contains_key(key)
+    }
+
+    /// エージェントの直近の画面 (端末タブが「中身」を出すために使う)。
+    ///
+    /// **末尾から `lines` 行だけ**返す。全部返すと、盤面が毎フレーム
+    /// 4000 文字 × 体数を整形することになる。
+    pub fn preview_of(&self, agent: &AgentId, lines: usize) -> String {
+        let Some(buf) = self.previews.get(agent) else {
+            return String::new();
+        };
+        let kept: Vec<&str> = buf
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let from = kept.len().saturating_sub(lines);
+        kept[from..].join("\n")
+    }
+
+    /// このエージェントへ送った指示の文面 (echo 判定用)。
+    ///
+    /// **保存しない。** 指示は `(タスク, エージェント)` から決まるので、
+    /// 同じ入力から同じ文面が出る。持ち回すと「送った文面」と「今の文面」の
+    /// 2 つの真実ができて、再起動でずれる。
+    fn sent_instruction(&self, agent: &AgentId) -> Option<String> {
+        let task_id = self.agent(agent).and_then(|a| a.current_task)?;
+        let task = self.tasks.iter().find(|t| t.id == task_id)?.clone();
+        Some(self.instruction_for(&task, agent))
     }
 
     /// 完了報告 1 件。
@@ -2907,6 +3167,14 @@ impl TeamRuntime {
             workspace_root: "<ワークスペースルート>",
             upstream,
             forbidden_files: forbidden,
+            // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
+            // 届けられない相手を宛先の候補に出すと、断りが記録されるだけ。
+            teammates: self
+                .agents
+                .iter()
+                .filter(|a| a.kind == AgentKind::ManagedSession && &a.id != agent)
+                .map(|a| (a.id.0.clone(), a.name.clone()))
+                .collect(),
         };
         super::prompt::for_task(&brief, &self.tasks)
     }
@@ -3144,6 +3412,15 @@ impl TeamRuntime {
     // ── 補助 ──
 
     /// 起動するエージェントの顔ぶれを決める (計画時に 1 回)。
+    ///
+    /// **計画が必要としている役割から編成する。**
+    /// 以前はリーダー以外を全員 `Implementer` の「Agent 1, 2, …」にしていた
+    /// ので、設計担当やテスト担当を選んでも**画面には実装担当しか並ばず**、
+    /// 「誰が何の担当なのか」がどこにも出なかった (役割を選ばせているのに
+    /// 選択が編成に効かない = 押せるのに何も起きないボタンと同じ嘘)。
+    ///
+    /// 順番は「まず計画にある役割を 1 体ずつ、余った枠は実装へ」。
+    /// 並列で効くのは実装なので、余りを実装に寄せる。
     fn plan_roster(&mut self) {
         let now = now_secs();
         let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(1);
@@ -3170,17 +3447,35 @@ impl TeamRuntime {
             created_at: now,
             last_activity_at: now,
         });
-        for i in 1..n {
+        let wanted = roster_roles(&self.tasks, &self.teams, n.saturating_sub(1));
+        // **1 体しか居ない役割に番号を付けない** (存在しない 2 体目を探させる)。
+        let mut total: BTreeMap<TeamRole, usize> = BTreeMap::new();
+        for r in &wanted {
+            *total.entry(*r).or_insert(0) += 1;
+        }
+        let mut seen: BTreeMap<TeamRole, usize> = BTreeMap::new();
+        for (i, role) in wanted.into_iter().enumerate() {
+            let i = i + 1;
+            // 役割に対応するレーンへ置く (無ければリーダーと同じレーン)。
             let team = self
                 .teams
-                .get(i % self.teams.len().max(1))
+                .iter()
+                .find(|t| t.lead_role == role)
+                .or_else(|| self.teams.first())
                 .map(|t| t.id.clone())
                 .unwrap_or_else(|| TeamId::new("implementation"));
             let id = AgentId::new(format!("agent-{i}"));
+            let seq = seen.entry(role).or_insert(0);
+            *seq += 1;
+            let seq = if total.get(&role).copied().unwrap_or(1) > 1 {
+                *seq
+            } else {
+                1
+            };
             self.agents.push(TeamAgent {
                 id: id.clone(),
-                name: format!("Agent {i}"),
-                role: TeamRole::Implementer,
+                name: agent_name(role, seq),
+                role,
                 team_id: team,
                 parent_id: Some(lead.clone()),
                 kind: AgentKind::ManagedSession,
@@ -3207,6 +3502,20 @@ impl TeamRuntime {
         target: Option<AgentId>,
         summary: String,
     ) {
+        let _ = self.log_to(kind, actor, target, summary);
+    }
+
+    /// [`log`] と同じだが、**積んだ出来事の ID を返す**。
+    ///
+    /// 伝言の配達は冪等キーに ID を要る (`manual:<agent>:<event_id>`)。
+    /// ID は Run と一緒に保存されるので、再起動をまたいでも重複しない。
+    fn log_to(
+        &mut self,
+        kind: TeamEventKind,
+        actor: Option<AgentId>,
+        target: Option<AgentId>,
+        summary: String,
+    ) -> EventId {
         let id = self.next_event_id;
         self.next_event_id += 1;
         self.events.push_back(TeamEvent {
@@ -3222,6 +3531,7 @@ impl TeamRuntime {
             self.events.pop_front();
         }
         self.dirty = true;
+        id
     }
 
     /// 判断を積む (同じ鍵のものは二重に積まない)。

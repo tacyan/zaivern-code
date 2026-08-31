@@ -264,10 +264,16 @@ pub fn desired_sessions(tasks: &[TeamTask], max_agents: usize) -> usize {
     if max_agents == 0 {
         return 0;
     }
-    let parallel = tasks
-        .iter()
-        .filter(|t| t.dependencies.is_empty() && !t.state.is_terminal())
-        .count();
+    // **同時に走りうる最大数**で見る。
+    //
+    // 以前は「依存が空のタスク数」で数えていたが、`dependencies` は
+    // 静的な項目なので、依存が済んでも空にはならない。段を 1 つでも
+    // 挟んだ計画では永久に 1 になり、実装が 8 件並べるのに**最後まで
+    // 2 体しか立たなかった** (実測: 盤面の「稼働 2」)。
+    //
+    // 幅で見れば、チームは最初から必要な人数ぶん立ち上がる —
+    // 上の段を待っている間も居るので、順番が来た瞬間に一斉に動ける。
+    let parallel = super::graph::max_parallel_width(tasks);
     // **レビュー用に 1 体余分に見る。** 実装担当は自分のレビューをできない
     // ので、並列実装数ぴったりだと「全員が実装中でレビューできない」状態が
     // 生まれ、上限に当たるまで誰も先へ進めない (実測で詰まった)。

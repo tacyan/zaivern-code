@@ -36,6 +36,15 @@ pub const RESULT_CLOSE: &str = "[/ZAI-TEAM-RESULT]";
 /// サブエージェントイベントの開始・終了マーカー。
 pub const EVENT_OPEN: &str = "[ZAI-TEAM-EVENT]";
 pub const EVENT_CLOSE: &str = "[/ZAI-TEAM-EVENT]";
+/// **エージェント同士のやり取り**の開始・終了マーカー。
+pub const MSG_OPEN: &str = "[ZAI-TEAM-MSG]";
+pub const MSG_CLOSE: &str = "[/ZAI-TEAM-MSG]";
+
+/// 1 通のメッセージに書ける本文の上限 (文字)。
+///
+/// **上限が無いと、相手の端末へ丸ごと流し込める。** 長文はそのまま
+/// 相手の作業を押し流すので、伝言は伝言の長さに留める。
+pub const MSG_MAX_CHARS: usize = 800;
 
 /// 1 ブロックの本文の上限 (バイト)。
 pub const BLOCK_MAX_BYTES: usize = 16 * 1024;
@@ -247,6 +256,59 @@ pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
     out
 }
 
+
+// ── 自分が送った指示のエコー ─────────────────────────────────────────
+
+/// 拾った塊が、**こちらが送った指示のひな型がそのまま画面に出ているだけ**か。
+///
+/// ## なぜ要るか (実測)
+///
+/// 指示は PTY へ打ち込むので、エージェントの TUI は**それをそのまま画面へ
+/// 描き返す**。指示には報告のひな型がマーカーごと載っているので、
+/// [`extract_blocks`] は **自分が送った文面を相手の報告として拾う**。
+///
+/// 0.23.0 の実機では、Team Run を開始した直後に必ず
+/// `報告の JSON を読めません: invalid type: string "task_id" …` が出ていた —
+/// 端末が枠を描き直している途中の、まだ `{` が無い状態を拾っていた。
+/// **落ちるほうがまだ軽い**: 全部描き終わってから拾うと、ひな型は
+/// `"status": "completed"` を持つ**正しい JSON**なので、1 文字も作業して
+/// いないのに完了報告として通ってしまう。
+///
+/// ## 判定を「一致」ではなく「部分」にする理由
+///
+/// 端末は行を詰め物で埋め、折り返し、描き直しの途中を見せる。実測の本文は
+/// 先頭の `{` を失っていた。だから空白を 1 個へ畳んだうえで
+/// **ひな型の部分列なら echo** とみなす。本物の報告はひな型と違う
+/// `summary` / `changed_files` を持つので、部分列にはならない
+/// (ひな型を 1 文字も埋めずに送り返してきた場合は echo 扱いで捨てるが、
+///  それは報告として受け取ってはいけないものなので正しい)。
+pub fn is_prompt_echo(body: &str, sent: &str, open: &str, close: &str) -> bool {
+    let b = squeeze_ws(body);
+    if b.is_empty() {
+        return true;
+    }
+    extract_blocks(sent, open, close)
+        .iter()
+        .any(|t| squeeze_ws(t).contains(&b))
+}
+
+/// 連続する空白を 1 個へ畳む (端末の詰め物・折り返しを無視するため)。
+fn squeeze_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut sp = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            sp = true;
+            continue;
+        }
+        if sp && !out.is_empty() {
+            out.push(' ');
+        }
+        sp = false;
+        out.push(c);
+    }
+    out
+}
 /// 末尾 `max` バイトを文字境界で切って返す。
 fn tail_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -441,6 +503,79 @@ pub struct EventDoc {
     pub task_id: Option<TaskId>,
     #[serde(default)]
     pub action: String,
+}
+
+/// エージェントが他のエージェントへ送る 1 通。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDoc {
+    /// 宛先のエージェント ID (`implementer-1` 等) か役割 (`reviewer`)、
+    /// または `all` (チーム全員)。
+    pub to: String,
+    /// 本文。
+    pub text: String,
+}
+
+/// メッセージを断った理由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageReject {
+    BadJson(String),
+    /// 宛先が空。
+    NoTarget,
+    /// 宛先が居ない。**捏造を通さない** (居ない相手に送ったことにしない)。
+    UnknownTarget(String),
+    /// 本文が空。
+    Empty,
+}
+
+impl MessageReject {
+    pub fn detail(&self) -> String {
+        match self {
+            MessageReject::BadJson(e) => format!("伝言の JSON を読めません: {e}"),
+            MessageReject::NoTarget => "伝言の宛先 (to) が空です".to_string(),
+            MessageReject::UnknownTarget(t) => {
+                format!("伝言の宛先 `{t}` は居ません")
+            }
+            MessageReject::Empty => "伝言の本文が空です".to_string(),
+        }
+    }
+}
+
+/// 伝言を読んで、宛先を**実在の担当**へ解決する。
+///
+/// `known` は `(エージェント ID, 役割キー)` の一覧。
+/// **表に無い宛先は断る** — 居ない相手へ送ったことにすると、盤面には
+/// 「伝えた」と出るのに誰も受け取っていない、という嘘になる。
+///
+/// `all` は自分以外の全員。宛先に自分を含めない (自分への伝言は
+/// 端末をもう一度自分で読むだけで、何も起きない)。
+pub fn check_message(
+    body: &str,
+    known: &[(AgentId, String)],
+    from: &AgentId,
+) -> Result<(Vec<AgentId>, String), MessageReject> {
+    let doc: MessageDoc =
+        serde_json::from_str(body).map_err(|e| MessageReject::BadJson(e.to_string()))?;
+    let to = doc.to.trim();
+    if to.is_empty() {
+        return Err(MessageReject::NoTarget);
+    }
+    let text: String = doc.text.trim().chars().take(MSG_MAX_CHARS).collect();
+    if text.is_empty() {
+        return Err(MessageReject::Empty);
+    }
+    let others = || known.iter().filter(|(id, _)| id != from);
+    let targets: Vec<AgentId> = if to.eq_ignore_ascii_case("all") {
+        others().map(|(id, _)| id.clone()).collect()
+    } else {
+        others()
+            .filter(|(id, role)| id.0 == to || role == to)
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err(MessageReject::UnknownTarget(to.to_string()));
+    }
+    Ok((targets, text))
 }
 
 /// 受け付けるイベント種別。**表に無い語は拒否する** (捏造を通さない)。
@@ -1143,5 +1278,79 @@ mod tests {
             ..doc.clone()
         };
         assert!(check_event(&nested, &known, &AgentId::new("agent-1"), None).is_ok());
+    }
+
+    // ── 自分が送った指示のエコー ─────────────────────────────────────
+
+    /// 送った指示の**実物**を組み立てる (ひな型は `prompt.rs` の 1 か所だけ)。
+    fn sent_instruction_sample() -> String {
+        let goal = super::super::testkit::goal();
+        let mut t = task(1, "web3d", &[]);
+        t.title = "かっこいい３DのWebページを作って".to_string();
+        t.assigned_agent = Some(AgentId::new("team-lead"));
+        let brief = super::super::prompt::Brief {
+            goal: &goal,
+            task: &t,
+            agent_id: "team-lead",
+            parent_id: None,
+            workspace_root: "<ワークスペースルート>",
+            upstream: Vec::new(),
+            forbidden_files: Vec::new(),
+            teammates: Vec::new(),
+        };
+        super::super::prompt::for_task(&brief, std::slice::from_ref(&t))
+    }
+
+    /// **実機で実際に出た壊れ方をそのまま固定する。**
+    ///
+    /// 0.23.0 の Team Run は、開始直後に必ず
+    /// `報告の JSON を読めません: invalid type: string "task_id" …` を出していた。
+    /// 正体は「端末が指示の枠を描き直している途中」— 先頭の `{` がまだ無い
+    /// 状態を、相手の報告として拾っていた。
+    #[test]
+    fn 描き直し途中のエコーを報告として拾わない() {
+        let sent = sent_instruction_sample();
+        // 実機のログから起こした本文 (先頭の `{` が無い)。
+        let body = "\"task_id\": 1,    \"agent_id\": \"team-lead\",    \
+                    \"status\": \"completed\",    \"summary\": \"何をしたかの 1 行\"";
+        assert!(
+            parse_result(body).is_err(),
+            "この本文は JSON として読めない (だから rejected が出ていた)"
+        );
+        assert!(
+            is_prompt_echo(body, &sent, RESULT_OPEN, RESULT_CLOSE),
+            "送った指示のひな型の一部なので、報告として扱ってはいけない"
+        );
+    }
+
+    /// **全部描き終わったエコーは、落ちるより悪い。**
+    ///
+    /// ひな型は `"status": "completed"` を持つ正しい JSON なので、素直に
+    /// 拾うと「1 文字も作業していないのに完了報告が届いた」ことになる。
+    #[test]
+    fn 描き終わったエコーは正しいjsonなので必ず弾く() {
+        let sent = sent_instruction_sample();
+        let body = extract_blocks(&sent, RESULT_OPEN, RESULT_CLOSE)
+            .into_iter()
+            .next()
+            .expect("指示には報告のひな型が載っている");
+        let doc = parse_result(&body).expect("ひな型はそれ自体が正しい JSON である");
+        assert_eq!(doc.status, "completed", "だから黙って完了になり得た");
+        assert!(is_prompt_echo(&body, &sent, RESULT_OPEN, RESULT_CLOSE));
+    }
+
+    /// **本物の報告は素通しする。** echo 判定が全部を飲み込んだら、
+    /// 今度は永久に完了しなくなる (直したつもりで別の壊し方になる)。
+    #[test]
+    fn 本物の報告はエコーとみなさない() {
+        let sent = sent_instruction_sample();
+        let body = "{\"task_id\": 1, \"agent_id\": \"team-lead\", \
+                    \"status\": \"completed\", \"summary\": \"index.html に three.js の球体を置いた\", \
+                    \"changed_files\": [\"index.html\"], \"validation\": [], \"blockers\": []}";
+        assert!(parse_result(body).is_ok());
+        assert!(
+            !is_prompt_echo(body, &sent, RESULT_OPEN, RESULT_CLOSE),
+            "中身がひな型と違うのだから echo ではない"
+        );
     }
 }
