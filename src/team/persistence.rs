@@ -157,15 +157,21 @@ pub struct RunDoc {
     pub workspace: String,
     pub spec_source: String,
     pub agent_count: usize,
-    /// **どのエージェントで動かすか** (プリセット名)。空なら「おまかせ」。
+    /// **どのエージェントで動かすか** (プリセット名の一覧)。空なら「おまかせ」。
     ///
-    /// 空のときは役割ごとに、入っている CLI を配る
-    /// ([`super::roles::preset_for_role`])。名前が入っていれば**全員が
-    /// それ 1 つ**で動く。Run に持たせるのは、再起動をまたいでも同じ
-    /// 顔ぶれで立て直すため (設定を後から変えても、走っている Run の
-    /// 編成は変わらない)。
+    /// | 選び方 | 動き |
+    /// |---|---|
+    /// | 空 | この PC に入っている CLI を、役割ごとに配る |
+    /// | 1 つ | 全員がそれで動く |
+    /// | 複数 | **選んだものの中だけ**で、役割ごとに配る |
+    ///
+    /// 1 つも複数も同じ仕組みで動く — 選ばれたものだけを候補にして
+    /// [`super::roles::preset_for_role`] を通すだけ (分岐を 2 つ作らない)。
+    ///
+    /// Run に持たせるのは、再起動をまたいでも同じ顔ぶれで立て直すため
+    /// (設定を後から変えても、走っている Run の編成は変わらない)。
     #[serde(default)]
-    pub agent_preset: String,
+    pub agent_presets: Vec<String>,
     pub max_attempts: u8,
     pub review_required: bool,
     pub paused: bool,
@@ -881,7 +887,7 @@ mod tests {
                 workspace: "ws".into(),
                 spec_source: "SPEC.md".into(),
                 agent_count: 4,
-                agent_preset: String::new(),
+                agent_presets: Vec::new(),
                 max_attempts: 3,
                 review_required: true,
                 paused: false,

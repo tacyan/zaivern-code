@@ -136,7 +136,7 @@ impl Lab {
                 run_id: "run-e2e".into(),
                 spec_source: "SPEC.md".into(),
                 agent_count: agents,
-                agent_preset: String::new(),
+                agent_presets: Vec::new(),
                 max_attempts: 3,
                 review_required: true,
                 guardrails: Default::default(),

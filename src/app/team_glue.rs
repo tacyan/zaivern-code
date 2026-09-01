@@ -283,19 +283,22 @@ impl ZaivernApp {
                 // Run を添えないと、Run を作り直したあとに前の Run の配達が
                 // 終わったとき、**同じ番号の別のタスク**の指示を完了に
                 // してしまう (積んだ仕事は Run の切り替えでは消えない)。
-                // **相手が手を止めるのを待ってから書く** (`Job::deferred`)。
+                // **本文はすぐ書き、確定キーだけ静かになってから撃つ。**
                 //
-                // 一度 `Job::user` (待たない) へ変えたが、それは間違いだった。
-                // 待たずに書くと**忙しい CLI の最中に本文と Enter が入る**ので、
-                // Codex は Enter を飲み込み、指示が入力欄に残ったまま止まった
-                // (実機で 2 通目以降が毎回そうなった)。1 通目が届いていたのは、
-                // 起動直後で相手が待機していたから — **同じ条件を毎回作る**のが
-                // 正しい。
+                // ここは 2 回間違えた。両方の失敗の形を残しておく:
                 //
-                // 待ちっぱなしにはならない: `Stage::Ready` は `READY_WAIT` を
-                // 超えたら書き、`Commit` / `Verify` は `GIVE_UP` を超えたら
-                // 人へ返す (`Act::GaveUp`)。
-                let mut job = crate::submit::Job::deferred(session, text, true);
+                // * `Job::user` だけ (待たない) — 忙しい CLI の最中に本文と
+                //   Enter が入り、**Codex が Enter を飲み込んだ**。指示が
+                //   入力欄に残ったまま止まる
+                // * `Job::deferred` (Idle を待って書く) — 起動直後の Claude Code
+                //   は見張りがまだ Idle と言わず、`⚠` の案内で `attention` にも
+                //   なるので、**本文が 1 バイトも書かれないまま**時間切れになった
+                //   (実機で 6 体中 5 体が空のプロンプトのまま止まった)
+                //
+                // 正しいのは分けること。書くのは待たない (起動直後の入力欄は
+                // 空なので、書いて困らない)。**待つのは確定キーだけ** —
+                // 飲み込まれるのはそちらなので ([`submit::COMMIT_IDLE_WAIT`])。
+                let mut job = crate::submit::Job::user(session, text);
                 job.tag = panel::with_panel(|p| p.delivery_tag(&key));
                 self.queue_submit(job)
             };
@@ -330,8 +333,8 @@ impl ZaivernApp {
                 self.toast(why, false);
                 continue;
             }
-            // 人が出した指示も同じ形で (相手が手を止めるのを待ってから書く)。
-            let mut job = crate::submit::Job::deferred(session, text, true);
+            // 人が出した指示も同じ形で (本文はすぐ、確定キーは静かになってから)。
+            let mut job = crate::submit::Job::user(session, text);
             job.tag = panel::with_panel(|p| p.delivery_tag(&key));
             if !self.queue_submit(job) {
                 panel::with_panel(|p| p.note_manual_failed(&key, "送信キューへ積めませんでした"));
@@ -462,17 +465,24 @@ impl ZaivernApp {
         // 選べるようにするための分岐で、真実の在り処は Run
         // (`RunDoc::agent_preset`) — 設定を後から変えても、走っている Run の
         // 顔ぶれは変わらない。
-        let pinned = panel::with_panel(|p| p.pinned_agent());
-        let idx = if pinned.trim().is_empty() {
-            crate::features::team::imp::roles::preset_for_role(&table, spec.role)?
-        } else {
-            // 名前が見つからない (設定から消された) ときは、おまかせへ落ちる。
-            // **担当を 0 体にしない** — 起動できないより、別の CLI で動くほうがよい。
-            match table.iter().position(|p| p.name == pinned && p.is_ai) {
-                Some(i) => i,
-                None => crate::features::team::imp::roles::preset_for_role(&table, spec.role)?,
+        // **選ばれたものだけを候補にして、役割ごとに配る。**
+        //
+        // 1 つでも複数でも同じ道を通る (分岐を 2 つ作らない):
+        // 1 つなら候補が 1 つなので全員それになり、複数なら
+        // `preset_for_role` がその中で配る。
+        let pinned = panel::with_panel(|p| p.pinned_agents());
+        let mut table = table;
+        if !pinned.is_empty() {
+            for row in &mut table {
+                row.available = row.available && pinned.iter().any(|n| *n == row.name);
             }
-        };
+            // **1 つも残らなければ、選択は無かったことにする。**
+            // (設定から消された等) 担当が 0 体になるより、別の CLI で動くほうがよい。
+            if !table.iter().any(|r| r.is_ai && r.available) {
+                table = self.team_preset_table();
+            }
+        }
+        let idx = crate::features::team::imp::roles::preset_for_role(&table, spec.role)?;
         let command = self.cfg.agents.get(idx)?.command.clone();
         let before: std::collections::HashSet<SessionId> =
             self.agents.sessions.iter().map(|s| s.id).collect();
@@ -957,7 +967,7 @@ impl ZaivernApp {
             spec_source: source.clone(),
             agent_count: form.agents,
             // 空なら「おまかせ」(役割ごとに配る)。名前が入っていれば全員それ。
-            agent_preset: form.agent_preset.clone(),
+            agent_presets: form.agent_presets.clone(),
             max_attempts: form.max_attempts,
             review_required: form.review_required,
             // **この Run にだけ効く締め具合。** 既存のグローバル設定

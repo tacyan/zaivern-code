@@ -202,12 +202,12 @@ pub struct NewRunForm {
     /// 描くほうで、既定を減らす方向ではない。
     /// 効くほうの 4 つは `planner::tests::選んだ役割は必ず計画を変える` が見張る。
     pub roles: Vec<TeamRole>,
-    /// **どのエージェントで動かすか** (プリセット名)。空なら「おまかせ」。
+    /// **どのエージェントで動かすか** (プリセット名の一覧)。空なら「おまかせ」。
     ///
-    /// 空 = 役割ごとに、この PC に入っている CLI を配る。
-    /// 名前が入っていれば**全員がそれ 1 つ**で動く。
-    /// 「1 種類だけで揃えたい」も「混ぜたい」も、ここ 1 か所で決まる。
-    pub agent_preset: String,
+    /// 空 = この PC に入っている CLI を役割ごとに配る。
+    /// 1 つ = 全員がそれ。複数 = **選んだものの中だけ**で配る。
+    /// 「揃えたい」も「この 2 つで混ぜたい」も、ここ 1 か所で決まる。
+    pub agent_presets: Vec<String>,
     /// 承認モード (`ask` / `auto` / `agent`)。既存の承認モードと同じ綴り。
     pub approval_mode: String,
     /// コスト上限 (USD)。0 なら上限なし。
@@ -230,7 +230,7 @@ impl Default for NewRunForm {
             agents: 4,
             max_attempts: 3,
             review_required: true,
-            agent_preset: String::new(),
+            agent_presets: Vec::new(),
             roles: vec![
                 TeamRole::Planner,
                 TeamRole::Architect,
@@ -1111,9 +1111,9 @@ impl TeamPanel {
     ///
     /// 真実の在り処は Run 側 (`RunDoc::agent_preset`)。設定を後から変えても、
     /// 走っている Run の顔ぶれは変わらない。
-    pub fn pinned_agent(&self) -> String {
+    pub fn pinned_agents(&self) -> Vec<String> {
         self.rt()
-            .map(|rt| rt.run().agent_preset.clone())
+            .map(|rt| rt.run().agent_presets.clone())
             .unwrap_or_default()
     }
 

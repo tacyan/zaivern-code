@@ -322,6 +322,7 @@ fn body(
     }
     run_tabs_row(ui, theme, runs, active_run, acts);
     git_needed_row(ui, theme, needs_git, acts);
+    ready_to_start_row(ui, theme, snap, acts);
 
     // ── 未完了 Run の扱い ──
     if restore != RestorePrompt::None {
@@ -1418,6 +1419,36 @@ fn restore_card(
     );
 }
 
+/// **計画ができたら、始め方をその場で言う。**
+///
+/// 開始のボタンはヘッダの奥 (一時停止・停止の隣) にあるので、初めての人は
+/// 「計画は出たが、次に何を押せばいいのか分からない」で止まる (実際にそう
+/// 報告された)。**押す場所を、計画のすぐ上に出す。**
+///
+/// 勝手には始めない。始めた瞬間にエージェントが動いて費用が発生するので、
+/// **1 回の明示的な操作**は残す (CLAUDE.md「画面が突然変わらない」)。
+fn ready_to_start_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    snap: Option<&TeamSnapshot>,
+    acts: &mut Vec<BoardAction>,
+) {
+    let Some(s) = snap else { return };
+    if s.goal.status != GoalStatus::Ready {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button(RichText::new(tr("team.btn.start")).color(theme.accent).strong())
+            .clicked()
+        {
+            acts.push(BoardAction::Start);
+        }
+        ui.label(RichText::new(tr("team.hint.start")).color(theme.text_dim));
+    });
+    ui.separator();
+}
+
 /// **Git が無いと 1 件も完了できないことを、走らせる前に出す。**
 ///
 /// 実測 (`changeset`) は git が出す差分を使うので、Git 管理下でない
@@ -1575,17 +1606,21 @@ fn new_run_form(
             ui.horizontal_wrapped(|ui| {
                 // **おまかせが既定。** 役割ごとに、入っている CLI を配る。
                 if ui
-                    .selectable_label(form.agent_preset.is_empty(), tr("team.form.agent_auto"))
+                    .selectable_label(form.agent_presets.is_empty(), tr("team.form.agent_auto"))
                     .on_hover_text(tr("team.form.agent_auto_hint"))
                     .clicked()
                 {
-                    form.agent_preset.clear();
+                    form.agent_presets.clear();
                 }
-                // **1 つ選べば全員それになる。** 混ぜたくない人のための道。
+                // **何個でも選べる。** 1 つなら全員それ、複数ならその中で配る。
                 for name in agents {
-                    let on = form.agent_preset == *name;
+                    let on = form.agent_presets.iter().any(|n| n == name);
                     if ui.selectable_label(on, ellipsis(name, 18)).clicked() {
-                        form.agent_preset = if on { String::new() } else { name.clone() };
+                        if on {
+                            form.agent_presets.retain(|n| n != name);
+                        } else {
+                            form.agent_presets.push(name.clone());
+                        }
                     }
                 }
             });

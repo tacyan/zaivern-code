@@ -155,20 +155,20 @@ fn エージェント起動は既存経路を通る() {
 fn 指示の送信は既存の一本を通る() {
     let s = src(GLUE);
     let body = function_body(&s, s.find("fn team_run_effects").expect("実行の橋"));
-    // **相手が手を止めるのを待ってから書く** (`Job::deferred`)。
+    // **本文はすぐ書く** (`Job::user`)。待って書く形 (`deferred`) にすると、
+    // 起動直後の Claude Code は見張りがまだ Idle と言わず `⚠` の案内で
+    // `attention` にもなるので、本文が 1 バイトも書かれないまま時間切れに
+    // なる (実機で 6 体中 5 体が空のプロンプトのまま止まった)。
     //
-    // 待たずに書くと、忙しい CLI の最中に本文と Enter が入って**確定キーが
-    // 飲み込まれる**。実機では 2 通目以降が毎回そうなった (1 通目だけ届いて
-    // いたのは、起動直後で相手が待機していたから)。待ちっぱなしにはならない
-    // — `Stage::Ready` は `READY_WAIT` で書き、`Commit` / `Verify` は
-    // `GIVE_UP` で人へ返す。
+    // 飲み込まれるのは**確定キー**のほうなので、待つのはそちらだけ
+    // (`submit::COMMIT_IDLE_WAIT` — `submit::tests::忙しい相手には確定キーを撃たない`)。
     assert!(
-        body.contains("crate::submit::Job::deferred(") && body.contains("self.queue_submit(job)"),
+        body.contains("crate::submit::Job::user(") && body.contains("self.queue_submit(job)"),
         "既存の送信経路 (submit) を通っていない:\n{body}"
     );
     assert!(
-        !body.contains("Job::user("),
-        "待たずに書く形が残っている (忙しい相手では確定キーが飲まれる):\n{body}"
+        !body.contains("Job::deferred("),
+        "書くのを待つ形が残っている (起動直後は Idle にならず届かない):\n{body}"
     );
     // **配達の結末を受け取れる形で積む。** 目印が無いと、積めたことしか
     // 分からず、相手が消えても Runtime は「届いた」と信じ続ける。
@@ -1228,8 +1228,9 @@ fn 盤面の端末は触れるがホイールは取り合わない() {
 
 /// **使うエージェントの選び方が、起動に効く。**
 ///
-/// 「おまかせ」なら役割ごとに配り、1 つ選べば全員それになる。選べるのに
-/// 起動が変わらないなら、その選択肢は嘘になる (CLAUDE.md)。
+/// 「おまかせ」なら入っているもの全部から、選べば**その中だけ**から、
+/// 役割ごとに配る (1 つだけ選べば候補が 1 つなので全員それになる)。
+/// 選べるのに起動が変わらないなら、その選択肢は嘘になる (CLAUDE.md)。
 #[test]
 fn 使うエージェントの選択が起動に効く() {
     let s = src(GLUE);
@@ -1239,20 +1240,19 @@ fn 使うエージェントの選択が起動に効く() {
         body.contains("roles::preset_for_role(&table, spec.role)"),
         "おまかせの道が無い:\n{body}"
     );
-    // 選ばれていればそれ 1 つ。真実の在り処は Run 側。
+    // 選ばれていれば、その中だけを候補にする。真実の在り処は Run 側。
     assert!(
-        body.contains("p.pinned_agent()"),
+        body.contains("p.pinned_agents()"),
         "Run が持っている選択を見ていない:\n{body}"
     );
     assert!(
-        body.contains("p.name == pinned"),
-        "選ばれた名前でプリセットを引いていない:\n{body}"
+        body.contains("pinned.iter().any(|n| *n == row.name)"),
+        "選ばれた名前で候補を絞っていない:\n{body}"
     );
-    // **担当を 0 体にしない。** 設定から消えていたら、おまかせへ落ちる。
-    let after = body.split("p.name == pinned").nth(1).unwrap_or_default();
+    // **担当を 0 体にしない。** 1 つも残らなければ、おまかせへ落ちる。
     assert!(
-        after.contains("preset_for_role"),
-        "選んだものが消えていたとき、担当が起動しないまま止まる:\n{body}"
+        body.contains("table = self.team_preset_table()"),
+        "選んだものが全部消えていたとき、担当が起動しないまま止まる:\n{body}"
     );
 }
 
@@ -1272,5 +1272,37 @@ fn 選べるエージェントは入っているものだけ() {
     assert!(
         list.contains("p.is_ai") && list.contains("p.available"),
         "入っているかを見ていない:\n{list}"
+    );
+}
+
+/// **計画ができたら、始め方がその場に出る。**
+///
+/// 開始のボタンはヘッダの奥 (一時停止・停止の隣) にあるので、初めての人は
+/// 「計画は出たが次に何を押せばいいか分からない」で止まる (実際にそう報告
+/// された)。ただし**勝手には始めない** — 始めた瞬間に費用が発生するので、
+/// 1 回の明示的な操作は残す。
+#[test]
+fn 計画ができたら始め方がその場に出る() {
+    let s = src(BOARD);
+    let body = function_body(&s, s.find("fn ready_to_start_row").expect("案内の関数"));
+    // 出るのは「始められる」ときだけ。走っている盤面に出し続けない。
+    assert!(
+        body.contains("GoalStatus::Ready"),
+        "始められるときだけ出す形になっていない:\n{body}"
+    );
+    assert!(
+        body.contains("BoardAction::Start"),
+        "押しても始まらない案内になっている:\n{body}"
+    );
+    // **自動では始めない。** 押されたときだけ `Start` を積むこと。
+    let auto = body.split("BoardAction::Start").next().unwrap_or_default();
+    assert!(
+        auto.contains(".clicked()"),
+        "押していないのに始めている:\n{body}"
+    );
+    // 盤面の本体から呼ばれていること (関数だけ作って繋がない、を防ぐ)。
+    assert!(
+        s.contains("ready_to_start_row(ui, theme, snap, acts)"),
+        "案内が盤面から呼ばれていない"
     );
 }
