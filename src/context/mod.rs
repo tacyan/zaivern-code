@@ -494,7 +494,9 @@ mod tests {
             .filter(|b| b.len() >= MIN_DISTINCTIVE)
             .collect();
         assert!(bins.len() >= 20, "見ている名前が {} 件しかない", bins.len());
-        assert!(bins.contains(&"claude") && bins.contains(&"codex") && bins.contains(&"gemini"));
+        assert!(
+            bins.contains(&"claude") && bins.contains(&"codex") && bins.contains(&"cursor-agent")
+        );
 
         // **番人が空回りしていないことを、先に証明する。**
         // わざと壊した入力で赤にならないなら、以下の走査は何も守っていない。

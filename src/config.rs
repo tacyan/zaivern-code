@@ -1609,7 +1609,7 @@ show_pet = true
 #   reply = "1"     番号キー (「1. Yes」形式で、カーソルが Yes に無いとき)
 #   reply = "3\r"   番号 + Enter (「番号を入力してください」形式のメニュー)
 #   agent = "agy"   そのエージェントのタブだけに効かせる (省略すると全部)
-#                   agy=Antigravity / claude / codex / gemini … (実行ファイル名)
+#                   agy=Antigravity / claude / codex / cursor-agent … (実行ファイル名)
 #
 # [[auto_yes_rules]]
 # pattern = "Allow access to this file?"
@@ -4879,15 +4879,14 @@ command = "agy"
             bare.agents.iter().any(|a| a.command == "agy"),
             "新しく足した CLI が既定に出てこない"
         );
-        // **既定から外した CLI は出てこない。** カタログには残してあるので、
-        // 自分で `config.toml` に書いている人の設定は今までどおり動く。
+        // **サービスが終わった CLI は、どこにも出てこない。**
         assert!(
             !bare.agents.iter().any(|a| a.command.starts_with("gemini")),
-            "既定から外した CLI が出ている"
+            "消した CLI が既定に出ている"
         );
         assert!(
-            agents::spec_for_bin("gemini").is_some(),
-            "カタログから消すと、既に設定している人のプリセットが解決できなくなる"
+            agents::spec_for_bin("gemini").is_none(),
+            "消した CLI がカタログに残っている"
         );
 
         // 新しい既定はそのまま書き出して読み戻せる (往復で欠けない)

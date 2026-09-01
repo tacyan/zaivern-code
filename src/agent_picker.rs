@@ -195,8 +195,6 @@ pub fn rows(installed: &Installed, presets: &[AgentPreset], filter: &str) -> Vec
     let existing: HashSet<String> = presets.iter().map(preset_key).collect();
     let mut rows: Vec<Row> = AGENT_CATALOG
         .iter()
-        // **もう選ばせない CLI は出さない** (カタログには残してある)。
-        .filter(|s| !crate::agents::is_retired(s.bin))
         .filter(|s| matches_filter(s, &q))
         .map(|spec| Row {
             spec,
@@ -345,14 +343,7 @@ pub fn ui(
                         "{found} / {total} 件がインストール済み",
                         &[
                             ("found", found.to_string()),
-                            (
-                                "total",
-                                AGENT_CATALOG
-                                    .iter()
-                                    .filter(|s| !crate::agents::is_retired(s.bin))
-                                    .count()
-                                    .to_string(),
-                            ),
+                            ("total", AGENT_CATALOG.len().to_string()),
                         ],
                     )
                 } else {
@@ -487,18 +478,12 @@ mod tests {
     #[test]
     fn every_catalog_agent_is_offered() {
         let rows = rows(&Installed::default(), &no_presets(), "");
-        // **退役したものを除く全件**が並ぶ (退役の扱いは
-        // `退役したcliは選択肢に出ない` が見ている)。
-        let offered: Vec<&AgentSpec> = AGENT_CATALOG
-            .iter()
-            .filter(|s| !crate::agents::is_retired(s.bin))
-            .collect();
         assert_eq!(
             rows.len(),
-            offered.len(),
+            AGENT_CATALOG.len(),
             "カタログ全件がピッカーに並ばなければならない"
         );
-        for spec in offered {
+        for spec in AGENT_CATALOG {
             assert!(
                 rows.iter().any(|r| r.spec.bin == spec.bin),
                 "{} がピッカーに出ていない",
@@ -508,10 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_thirty_three_agents() {
+    fn catalog_has_thirty_two_agents() {
         // 「カタログ全件を選べる」が要件なので、件数そのものを固定する。
         // orca (stablyai/orca) が起動対象にしている CLI を全て含む。
-        assert_eq!(AGENT_CATALOG.len(), 33);
+        assert_eq!(AGENT_CATALOG.len(), 32);
     }
 
     #[test]
@@ -821,36 +806,5 @@ mod tests {
         let picker = AgentPicker::default();
         assert!(!picker.open);
         assert!(!picker.is_installed("claude"));
-    }
-
-    /// **もう選ばせない CLI は選択肢に出ない。**
-    ///
-    /// カタログからは消さない — 消すと、既に `config.toml` へ書いている人の
-    /// プリセットが「AI CLI ではないもの」になり、承認モードの判定も
-    /// 自動承認フラグの付け外しも黙って効かなくなる。出さないだけにする。
-    #[test]
-    fn 退役したcliは選択肢に出ない() {
-        let installed = Installed::default();
-        let all = rows(&installed, &[], "");
-        for bin in crate::agents::RETIRED_BINS {
-            assert!(
-                !all.iter().any(|r| r.spec.bin == *bin),
-                "{bin} が選択肢に出ている"
-            );
-            // **カタログには残っている** (既存の設定が黙って別物にならない)。
-            assert!(
-                crate::agents::spec_for_bin(bin).is_some(),
-                "{bin} をカタログごと消している"
-            );
-        }
-        // 名前で探しても出てこない (絞り込みの抜け道を作らない)。
-        for bin in crate::agents::RETIRED_BINS {
-            assert!(
-                !rows(&installed, &[], bin)
-                    .iter()
-                    .any(|r| r.spec.bin == *bin),
-                "{bin} が絞り込みから出てくる"
-            );
-        }
     }
 }

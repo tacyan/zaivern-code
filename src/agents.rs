@@ -192,8 +192,6 @@ impl AgentSpec {
 const FILE_REF_SYNTAX: &[(&str, &str)] = &[
     // claude: `@path/to/file` で対象ファイルを読み込む (Claude Code の公式ドキュメント)
     ("claude", "@{path}"),
-    // gemini: `@path/to/file` でファイル/ディレクトリの内容をプロンプトへ差し込む
-    ("gemini", "@{path}"),
 ];
 
 /// 「フラグ + 値」の 2 トークンで自動承認になる指定の表。
@@ -207,7 +205,7 @@ const TWO_TOKEN_BYPASS: &[(&str, &[&str])] = &[
         "--permission-mode",
         &["bypassPermissions", "bypass", "yolo"],
     ),
-    // gemini / qwen — `--approval-mode yolo` (実機 `gemini --help` で確認)
+    // qwen — `--approval-mode yolo`
     ("--approval-mode", &["yolo"]),
 ];
 
@@ -290,11 +288,6 @@ const ACCOUNT_ENVS: &[(&str, &[&str], &[&str])] = &[
         "codex",
         &["CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
         &["CODEX_HOME"],
-    ),
-    (
-        "gemini",
-        &["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"],
-        &[],
     ),
     (
         "qwen",
@@ -382,19 +375,6 @@ pub fn launch_args_for(bin: &str) -> &'static str {
 /// (カタログごと消すと、その人のプリセットが黙って解決できなくなる)。
 pub const DEFAULT_PRESET_BINS: &[&str] = &["claude", "codex", "agy", "cursor-agent", "droid"];
 
-/// **選択肢に出さない CLI。**
-///
-/// カタログ ([`AGENT_CATALOG`]) からは消さない — 消すと、既に
-/// `config.toml` へ書いている人のプリセットが「AI CLI ではないもの」に
-/// なり、承認モードの判定も自動承認フラグの付け外しも効かなくなる
-/// (黙って別物になるのがいちばん困る)。**新しく選ばせないだけ**にする。
-pub const RETIRED_BINS: &[&str] = &["gemini"];
-
-/// この CLI はもう選択肢に出さないか。
-pub fn is_retired(bin: &str) -> bool {
-    RETIRED_BINS.contains(&bin)
-}
-
 /// 実行ファイル名の別名表。
 ///
 /// orca の `TuiAgent` ID / `detectCmdAliases` と、実際に PATH へ入る実行ファイル名の
@@ -412,7 +392,6 @@ const AGENT_ALIASES: &[(&str, &str, bool)] = &[
     ("antigravity", "agy", true),
     ("antigravity-cli", "agy", true),
     ("claude-code", "claude", true),
-    ("gemini-cli", "gemini", true),
     ("mimo-code", "mimo", true),      // orca の TuiAgent ID
     ("qwen-code", "qwen", true),      // orca の TuiAgent ID
     ("mistral-vibe", "vibe", true),   // orca detectCmdAliases
@@ -473,26 +452,6 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_keys: "/permissions\r",
         switch_hint: "権限モード切替 (/permissions)",
         resume_flag: "resume --last",
-    },
-    // Gemini CLI (Google)。**この機の `gemini --help` 実行結果から全項目を確認済み**。
-    // `--approval-mode yolo` (2 トークン) は TWO_TOKEN_BYPASS 表で除去される。
-    // `--resume` は「"latest" か番号」を取り、セッション ID は取らない (だから
-    // resume_id_flag は空 — orca は `gemini --resume <id>` を使うが、この機の
-    // gemini 0.52 の help とは食い違うため採用しない)。
-    AgentSpec {
-        bin: "gemini",
-        label: "Gemini CLI",
-        icon: "✨",
-        auto_flag: "--yolo",
-        auto_env: &[],
-        strip: &["--yolo", "-y", "--approval-mode=yolo"],
-        headless: "-p",
-        model_flag: "-m",
-        install: "npm i -g @google/gemini-cli",
-        note: "`--approval-mode` は default|auto_edit|yolo|plan。全自動は `--yolo`",
-        switch_keys: "",
-        switch_hint: "",
-        resume_flag: "--resume latest",
     },
     AgentSpec {
         bin: "grok",
@@ -1494,18 +1453,6 @@ pub const ACP_CATALOG: &[crate::acp::AcpEntry] = &[
         note: "session/new の結果に非標準の models が付く",
     },
     crate::acp::AcpEntry {
-        id: "gemini",
-        label: "Gemini CLI (ACP)",
-        icon: "✨",
-        // 本体が --acp を持つので、入っていれば直接起動する。
-        local_bin: "gemini",
-        local_args: &["--acp"],
-        npx_package: "@google/gemini-cli",
-        npx_version: "0.54.4",
-        npx_args: &["--acp"],
-        note: "sessionCapabilities を広告しない (再開・一覧は非対応)",
-    },
-    crate::acp::AcpEntry {
         id: "github-copilot",
         label: "GitHub Copilot (ACP)",
         icon: "🐙",
@@ -2498,26 +2445,6 @@ pub static HOOK_TARGETS: &[HookTarget] = &[
         deny: DENY_HOOK_SPECIFIC_OUTPUT,
         verified: "codex-cli 0.147.0 — 実在の ~/.codex/hooks.json と同じ形で発火を観測 (`codex exec` 実行中に PostToolUse / Stop のフックが走った) + `codex features list` に `hooks stable true` + 実行ファイルの strings に hookSpecificOutput/permissionDecision/permissionDecisionReason と *** Update File: 系マーカー",
     },
-    HookTarget {
-        bin: "gemini",
-        // gemini はフック専用ファイルを持たず、通常の設定ファイルに同居する。
-        settings_rel: ".gemini/settings.json",
-        // **イベント名が claude 系と全く違う** (Pre/Post ではなく Before/After)。
-        events: &[
-            ("SessionStart", ProtoState::Starting, false),
-            ("BeforeTool", ProtoState::Running, true),
-            ("AfterTool", ProtoState::Thinking, false),
-            ("SessionEnd", ProtoState::Done, false),
-        ],
-        gate_event: "BeforeTool",
-        tools: GEMINI_TOOLS,
-        write_path_keys: &["file_path"],
-        command_tools: GEMINI_COMMAND_TOOLS,
-        patch_tools: &[],
-        activation: GEMINI_ACTIVATION,
-        deny: DENY_TOP_LEVEL_DECISION,
-        verified: "gemini-cli 0.51.0 — 公式 docs/hooks/reference.md の settings.json スキーマ (hooks.<Event>[].hooks[] は claude と同形) と decision/reason 出力 + 実行ファイルの bundle に GEMINI_CLI_HOME / GEMINI_DIR / trustedFolders.json / TRUST_FOLDER・TRUST_PARENT・DO_NOT_TRUST + 実機で「信頼されていないフォルダではプロジェクト設定を読まない」旨のエラーを観測。**フック発火そのものはアカウント階層 (IneligibleTierError) で未観測**",
-    },
 ];
 
 // ── 拒否の返し方 (ひな形はここにしか無い) ──────────────────────────
@@ -2529,14 +2456,6 @@ pub static HOOK_TARGETS: &[HookTarget] = &[
 /// 正規の permission decision を使う (エラーではなく判断なので)。
 const DENY_HOOK_SPECIFIC_OUTPUT: DenyShape = DenyShape {
     template: r#"{"hookSpecificOutput":{"hookEventName":"{event}","permissionDecision":"deny","permissionDecisionReason":"{reason}"}}"#,
-    exit: 0,
-};
-
-/// gemini の `BeforeTool` 出力スキーマ (**top-level** に置く)。
-///
-/// claude 形の入れ子で返しても gemini は読まないので、**素通りする**。
-const DENY_TOP_LEVEL_DECISION: DenyShape = DenyShape {
-    template: r#"{"decision":"deny","reason":"{reason}"}"#,
     exit: 0,
 };
 
@@ -2585,34 +2504,6 @@ const CODEX_ACTIVATION: &[Activation] = &[Activation {
     file_rel: "config.toml",
     missing: "codex がこのフックをまだ承認していないため、書き込みは止まりません",
     how: "codex を起動して /hooks を実行し、Zaivern のフックを信頼 (trust) してください",
-}];
-
-// ── gemini ───────────────────────────────────────────────────────
-
-/// gemini のツール名 → 状態 (公式 docs/tools の名前と引数)。
-const GEMINI_TOOLS: &[(&str, ProtoState)] = &[
-    ("write_file", ProtoState::Editing),
-    ("replace", ProtoState::Editing),
-];
-
-/// gemini のコマンド文字列を持つツール。
-const GEMINI_COMMAND_TOOLS: &[(&str, &str)] = &[("run_shell_command", "command")];
-
-/// gemini は**信頼していないフォルダではプロジェクトの設定ファイルを読まない**。
-///
-/// 読まない = `.gemini/settings.json` に書いたフックも読まれない。
-/// 実機で観測したエラー:
-/// 「Gemini CLI is not running in a trusted directory.」
-const GEMINI_ACTIVATION: &[Activation] = &[Activation {
-    kind: ActivationKind::TrustedFolderJson {
-        trusted: &["TRUST_FOLDER"],
-        trusted_parent: "TRUST_PARENT",
-    },
-    home_env: "GEMINI_CLI_HOME",
-    home_rel: ".gemini",
-    file_rel: "trustedFolders.json",
-    missing: "gemini がこのフォルダを信頼していないため、プロジェクトの設定ごと読まれません",
-    how: "gemini を起動してこのフォルダを信頼するか、環境変数 GEMINI_CLI_TRUST_WORKSPACE=true で起動してください",
 }];
 
 /// フック設定の対象。持たないエージェントでは `None`。
@@ -3478,15 +3369,6 @@ mod ladder_catalog_tests {
                 assert_eq!(o["permissionDecision"], "deny");
                 assert_eq!(o["permissionDecisionReason"], r);
             }),
-            ("gemini", |v, r| {
-                // gemini は **top-level**。入れ子で返しても読まれない。
-                assert_eq!(v["decision"], "deny");
-                assert_eq!(v["reason"], r);
-                assert!(
-                    v.get("hookSpecificOutput").is_none(),
-                    "gemini に claude 形を混ぜている"
-                );
-            }),
         ];
         for (bin, check) in cases {
             let (json, exit) = deny_payload(bin, reason).expect("拒否を組み立てられない");
@@ -3557,38 +3439,6 @@ mod ladder_catalog_tests {
             hook_write_targets("codex", "Bash", &sh).paths,
             vec!["src/d.rs"]
         );
-    }
-
-    #[test]
-    fn geminiは自分のツール名とキーで書き込みを拾う() {
-        let write = serde_json::json!({
-            "tool_name": "write_file",
-            "tool_input": { "file_path": "/w/x.rs", "content": "…" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "write_file", &write).paths,
-            vec!["/w/x.rs"]
-        );
-        let replace = serde_json::json!({
-            "tool_name": "replace",
-            "tool_input": { "file_path": "/w/y.rs", "old_string": "a", "new_string": "b" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "replace", &replace).paths,
-            vec!["/w/y.rs"]
-        );
-        // シェルは claude の `Bash` ではなく `run_shell_command`
-        let sh = serde_json::json!({
-            "tool_name": "run_shell_command",
-            "tool_input": { "command": "sed -i '' s/a/b/ /w/z.rs" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "run_shell_command", &sh).paths,
-            vec!["/w/z.rs"]
-        );
-        // claude 名のツールで来ても gemini には無いので拾わない (取り違え防止)
-        assert!(hook_command_key("gemini", "Bash").is_none());
-        assert!(hook_tool_state("gemini", "Edit").is_none());
     }
 
     #[test]
@@ -3710,7 +3560,7 @@ mod ladder_catalog_tests {
         assert!(title_generator("そんなCLIは無い").is_none());
         assert!(title_generator_for_command("bash -lc ls").is_none());
         // 実行を観測できていない CLI は**意図的に**表へ入れていない。
-        for bin in ["gemini", "cursor-agent", "droid"] {
+        for bin in ["cursor-agent", "droid"] {
             assert!(
                 title_generator(bin).is_none(),
                 "{bin}: 実行を確認できていないのに命名器として宣言されている"
@@ -4397,7 +4247,6 @@ mod tests {
             "claude --model opus",
             "/usr/local/bin/claude",
             "codex",
-            "gemini",
             // シェル**経由で**エージェントを起こす形は「素のシェル」ではない…
             // わけではない: 先頭がシェルなら人が叩いている可能性のほうが高いので
             // 素のシェル扱いにする。取りこぼす側 (false negative) に倒すのは、
@@ -4710,7 +4559,6 @@ mod tests {
     fn alias_lookup_table() {
         let table: &[(&str, &str)] = &[
             ("claude-code", "claude"),
-            ("gemini-cli", "gemini"),
             ("antigravity", "agy"),
             ("antigravity-cli", "agy"),
             ("mimo-code", "mimo"),

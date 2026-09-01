@@ -3538,10 +3538,6 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme, acts: &mut Vec<AcpAction>) {
                     ui.add_space(space::SM);
                     ui.horizontal_wrapped(|ui| {
                         for e in crate::agents::ACP_CATALOG {
-                            // **もう選ばせない CLI は出さない** (表には残してある)。
-                            if crate::agents::is_retired(e.local_bin) {
-                                continue;
-                            }
                             catalog_button(ui, e, acts);
                         }
                     });
