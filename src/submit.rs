@@ -43,6 +43,18 @@ use std::time::{Duration, Instant};
 /// 安全側に倒して 120ms を採る。
 pub const COMMIT_DELAY: Duration = Duration::from_millis(120);
 
+/// **本文を書き直してよい回数の上限。**
+///
+/// 書き直しが効くのは「書き込みが落ちた」ときだけ。数回書いても入力欄に
+/// 見えないなら、落ちたのではなく**読めていない**ので、繰り返しても何も
+/// 変わらない。上限が無いと実機で**同じ指示文を 806 回**書き込み、相手の
+/// 入力欄をコピーで埋めて壊した。
+pub const MAX_BODY_WRITES: u8 = 3;
+
+/// 書き直しの間隔。詰めて撃つと、相手が描き終える前に次を書いて
+/// 「見えない」を自分で作る。
+pub const BODY_REWRITE_WAIT: Duration = Duration::from_millis(900);
+
 /// 確定キーを送ってから「入力欄が空になったか」を確かめるまでの待ち。
 pub const VERIFY_DELAY: Duration = Duration::from_millis(450);
 
@@ -304,6 +316,8 @@ pub struct Job {
     pub stage: Stage,
     /// 確定キーを送った回数
     pub tries: u8,
+    /// 本文を書いた回数 ([`MAX_BODY_WRITES`] で頭打ち)。
+    pub body_writes: u8,
     /// 表示用のラベル (トースト)
     pub title: String,
     /// **配達の結果を知りたい呼び出し元の目印** (無ければ `None`)。
@@ -329,6 +343,7 @@ impl Job {
             wait_idle: false,
             stage: Stage::Ready,
             tries: 0,
+            body_writes: 0,
             title: String::new(),
             tag: None,
         }
@@ -343,6 +358,7 @@ impl Job {
             wait_idle: true,
             stage: Stage::Ready,
             tries: 0,
+            body_writes: 0,
             title: String::new(),
             tag: None,
         }
@@ -493,9 +509,35 @@ pub fn decide(
             //
             // 入力欄に本文が見えないなら、書き直す。見えるようになれば
             // 下へ進んで確定する。
+            //
+            // **書き直しには固い上限が要る。** 実機で、この枝に上限が無い
+            // まま **同じ指示文を 806 回**書き込んだ (`COMMIT_DELAY` が
+            // 120ms なので、諦めるまでの 120 秒で 800 回撃てる)。相手の
+            // 入力欄は指示文のコピーで埋まり、**直そうとした当のものを
+            // 壊した**。入力ログ (`[Zaivern] input`) を足して初めて見えた。
+            //
+            // 書き直しが効くのは「書き込みが落ちた」ときだけ。数回書いても
+            // 見えないなら、**落ちたのではなく読めていない** — そこで
+            // 繰り返しても何も変わらないので、従来どおり確定へ進んで
+            // `Verify` に判定させる (そちらは入力欄の残りを見て撃ち直す)。
             if !peek.input_seen(&tail_key(&job.text)) {
                 if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
                     return Act::GaveUp;
+                }
+                // **上限に達したら人へ返す。確定へは進まない。**
+                //
+                // 進めると、`Verify` は空の入力欄を見て「届いた」と判断する —
+                // まさにこの枝が消そうとしていた嘘が戻ってくる。
+                // 入力欄が**読めているのに本文が無い**のは失敗の証拠なので、
+                // 証拠がある側では黙って完了にしない。
+                // (読めない相手は `input_seen(None) == true` でこの枝へ来ない。)
+                if job.body_writes >= MAX_BODY_WRITES {
+                    return Act::GaveUp;
+                }
+                // **間隔を空ける。** 詰めて撃つと、相手が描き終える前に
+                // 次を書いて「見えない」を自分で作る。
+                if since_stage < BODY_REWRITE_WAIT {
+                    return Act::Wait(BODY_REWRITE_WAIT - since_stage);
                 }
                 return Act::WriteBody;
             }
@@ -1144,6 +1186,10 @@ mod paste_placeholder_tests {
 mod write_confirm_tests {
     use super::*;
 
+    /// 書き直しの間隔 ([`BODY_REWRITE_WAIT`]) を越えた経過時間。
+    /// 越えていないと `Act::Wait` になり、書き直しの判断まで届かない。
+    const REWRITE_OK: Duration = BODY_REWRITE_WAIT.saturating_add(COMMIT_DELAY);
+
     fn job(text: &str) -> Job {
         let mut j = Job::user(1, text.to_string());
         j.stage = Stage::Commit;
@@ -1178,11 +1224,11 @@ mod write_confirm_tests {
         let j = job("実装してください。最後まで終わらせて報告してください");
         // 入力欄が空 = 書き込みが捨てられた。
         assert_eq!(
-            decide_quiet(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("")), REWRITE_OK, REWRITE_OK),
             Act::WriteBody
         );
         assert_eq!(
-            decide_quiet(&j, &peek(Some("❯ ")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("❯ ")), REWRITE_OK, REWRITE_OK),
             Act::WriteBody
         );
     }
@@ -1225,7 +1271,7 @@ mod write_confirm_tests {
         let mut j = job("実装してください");
         j.tries = MAX_COMMIT_TRIES;
         assert_eq!(
-            decide_quiet(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("")), REWRITE_OK, REWRITE_OK),
             Act::GaveUp
         );
         let j2 = job("実装してください");
@@ -1353,13 +1399,109 @@ mod startup_modal_tests {
         };
         assert!(holdup(&p.job, &dropped).is_none());
         // 書き直しを繰り返しても、同じ段なので時計は戻らない。
+        //
+        // **書き直しには上限がある** ([`MAX_BODY_WRITES`])。数えるのは
+        // 実際に書く呼び出し側なので、ここでも同じように増やす。
+        // 上限が無いと実機で 806 回書き込んだ (`body_write_cap_tests`)。
         let mut t = t0;
-        for _ in 0..5 {
-            t += COMMIT_DELAY;
+        for _ in 0..MAX_BODY_WRITES {
+            t += BODY_REWRITE_WAIT + COMMIT_DELAY;
             assert_eq!(p.act(&dropped, t), Act::WriteBody);
+            p.job.body_writes += 1;
             p.advance(Stage::Commit, t);
         }
-        // 沈黙の上限で止まる (輪が回り続けない)。
-        assert_eq!(p.act(&dropped, t0 + GIVE_UP), Act::GaveUp);
+        // **輪が回り続けない。** 上限に達したら、確定へ進まず人へ返る
+        // (進めると `Verify` が空の入力欄を「届いた」と読んでしまう)。
+        t += BODY_REWRITE_WAIT + COMMIT_DELAY;
+        assert_eq!(p.act(&dropped, t), Act::GaveUp);
+    }
+}
+
+#[cfg(test)]
+mod body_write_cap_tests {
+    use super::*;
+
+    fn peek_blank() -> Peek {
+        Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            input_ready: true,
+            // **入力欄が読めるのに本文が見えない** = 書き込みが落ちたか、
+            // 読み方が相手に合っていないか。区別は付かない。
+            input: Some(String::new()),
+            ..Default::default()
+        }
+    }
+
+    /// **書き直しは数回で打ち切る。**
+    ///
+    /// 実機で、この枝に上限が無いまま **同じ指示文を 806 回**書き込んだ
+    /// (`COMMIT_DELAY` 120ms × 諦めるまでの 120 秒)。相手の入力欄は
+    /// 指示文のコピーで埋まり、**直そうとした当のものを壊した**。
+    /// 入力ログを足して初めて見えた。
+    #[test]
+    fn 本文の書き直しは打ち切られる() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        // 上限までは書き直す。
+        for n in 0..MAX_BODY_WRITES {
+            j.body_writes = n;
+            assert_eq!(
+                decide(&j, &peek_blank(), long, long, long),
+                Act::WriteBody,
+                "{n} 回目の書き直しが止まっている"
+            );
+        }
+        // **上限に達したら人へ返す。** 確定へ進めると `Verify` が空の
+        // 入力欄を見て「届いた」と判断し、消そうとしていた嘘が戻る。
+        j.body_writes = MAX_BODY_WRITES;
+        assert_eq!(
+            decide(&j, &peek_blank(), long, long, long),
+            Act::GaveUp,
+            "上限に達しても書き直し続けている / 黙って完了にしている"
+        );
+    }
+
+    /// **間隔を空ける。** 詰めて撃つと、相手が描き終える前に次を書いて
+    /// 「見えない」を自分で作る。
+    #[test]
+    fn 書き直しの間隔を空ける() {
+        let mut j = Job::user(1, "実装してください".to_string());
+        j.stage = Stage::Commit;
+        j.body_writes = 1;
+        let soon = COMMIT_DELAY + Duration::from_millis(1);
+        assert!(
+            matches!(decide(&j, &peek_blank(), soon, soon, soon), Act::Wait(_)),
+            "間隔を空けずに書き直している"
+        );
+    }
+
+    /// **見えているなら書き直さない** (これまでどおり確定へ進む)。
+    #[test]
+    fn 見えていれば書き直さない() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let mut p = peek_blank();
+        p.input = Some(text.to_string());
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        assert_eq!(decide(&j, &p, long, long, long), Act::WriteCommit);
+    }
+
+    /// **数えているのは実際に書いた側。** 数え忘れると上限が効かない。
+    #[test]
+    fn 書いた回数を数えている() {
+        let src = include_str!("app/agent_sessions.rs").replace("\r\n", "\n");
+        let at = src.find("Act::WriteBody =>").expect("書き込みの腕がある");
+        let arm = &src[at..src[at..]
+            .find("Act::WriteCommit")
+            .map_or(src.len(), |i| at + i)];
+        assert!(
+            arm.contains("body_writes"),
+            "本文を書いた回数を数えていない (上限が効かない)"
+        );
     }
 }

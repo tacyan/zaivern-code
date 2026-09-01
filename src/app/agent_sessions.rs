@@ -631,6 +631,9 @@ impl ZaivernApp {
                     // 失敗切替で別プロファイルへ引き継ぐ材料として覚えておく。
                     s.note_prompt(&p.job.text);
                     s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
+                    // **書いた回数を数える。** 数えないと、入力欄が読めない
+                    // 相手へ延々と書き直し続ける (実機で 806 回)。
+                    p.job.body_writes = p.job.body_writes.saturating_add(1);
                     s.set_scroll(0);
                     if p.job.wait_idle {
                         delivered.push(s.title.clone());
