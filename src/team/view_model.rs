@@ -186,6 +186,12 @@ pub struct TeamSnapshot {
     /// そのときの完了は**レビュー承認だけ**で決まるので、盤面が常に出す
     /// (通知は上書きで消えるが、これは状態から導くので消えない)。
     pub unvalidated: bool,
+    /// **変更を実測できない**まま進んでいるか。
+    ///
+    /// Git 管理下でないフォルダでは差分を測れないので、「担当内だけを
+    /// 変更した」と言える根拠が無いまま完了することになる。止めると
+    /// **そのフォルダでは 1 件も完了できない**ので通すが、隠さない。
+    pub unmeasured: bool,
 }
 
 /// Activity Feed に出す件数。**上限を持たないと 64 体で描画が破綻する。**
@@ -386,6 +392,9 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
         feed_cap: FEED_CAP,
         // **実装タスクを見る。** レビュータスクはもともと検証コマンドを
         // 持たないので、混ぜると常に「検証なし」になってしまう。
+        // **測る手立てがあるかは、いま見て決める。** 途中で `git init` すれば
+        // 測れるようになるので、Run を作った時点の値を持ち回らない。
+        unmeasured: crate::git::discover_toplevel(rt.workspace()).is_none(),
         unvalidated: {
             let mut impl_tasks = tasks.iter().filter(|t| t.review_of.is_none()).peekable();
             impl_tasks.peek().is_some()
@@ -599,6 +608,7 @@ mod tests {
             stopped: false,
             feed_cap: FEED_CAP,
             unvalidated: false,
+            unmeasured: false,
         }
     }
 

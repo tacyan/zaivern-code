@@ -920,9 +920,11 @@ impl TeamRuntime {
 
     /// この Run の workspace (エージェントの cwd・検証の cwd はここから決まる)。
     ///
-    /// 実行側は [`Self::owner`] 越しに受け取る。ここを直接読むのはテスト
-    /// (不変条件の照合) だけ。
-    #[cfg(test)]
+    /// 実行側は [`Self::owner`] 越しに受け取る。**直接読むのは
+    /// 「測れるフォルダか」を見るときだけ** (`view_model` の `unmeasured`)
+    /// と、テストの不変条件の照合。cwd を決めるのに使わないこと —
+    /// 決めるのは `owner` の側で、そこを 2 つにすると Run を切り替えた
+    /// 瞬間に別のフォルダで動き出す。
     pub fn workspace(&self) -> &std::path::Path {
         &self.workspace
     }
@@ -3198,14 +3200,23 @@ impl TeamRuntime {
         if let Some(e) = test_hooks::forced_evidence() {
             return e;
         }
+        // **「測る手立てが無い」と「測れるはずが失敗した」を分ける。**
+        // Git 管理下でないフォルダは直しようが無いので、そこで止めると
+        // **1 件も完了できない**。前者は通し、盤面が「実測なし」を出す。
+        let no_git = crate::git::discover_toplevel(&self.workspace).is_none();
+        let cannot_measure = |e: changeset::MeasureError| -> rp::FileEvidence {
+            if no_git {
+                rp::FileEvidence::Unmeasurable(e.detail())
+            } else {
+                rp::FileEvidence::Unavailable(e.detail())
+            }
+        };
         let Some(base) = task.baseline.as_ref() else {
-            return rp::FileEvidence::Unavailable(
-                changeset::MeasureError::NoBaseline(String::new()).detail(),
-            );
+            return cannot_measure(changeset::MeasureError::NoBaseline(String::new()));
         };
         let measured = match changeset::measure(&self.workspace, base) {
             Ok(v) => v,
-            Err(e) => return rp::FileEvidence::Unavailable(e.detail()),
+            Err(e) => return cannot_measure(e),
         };
         let paths: Vec<String> = measured.into_iter().map(|c| c.path).collect();
         if task.files.is_empty() {

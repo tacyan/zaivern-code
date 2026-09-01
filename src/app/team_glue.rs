@@ -610,6 +610,7 @@ impl ZaivernApp {
                 p.expanded_output.as_ref(),
                 &p.run_tabs(),
                 p.active_run(),
+                p.needs_git,
                 &p.notice,
                 &mut term,
             );
@@ -691,6 +692,10 @@ impl ZaivernApp {
             }),
             BoardAction::OpenTerminal(sid) => self.team_open_terminal(sid),
             BoardAction::SelectRun(i) => panel::with_panel(|p| p.select_run(i)),
+            BoardAction::InitGit => match panel::with_panel(|p| p.init_git()) {
+                Ok(()) => self.toast(tr("team.git.done"), true),
+                Err(e) => self.toast(e, false),
+            },
             BoardAction::CloseRun(i) => {
                 if panel::with_panel(|p| p.close_run(i)).is_some() {
                     self.toast(tr("team.notice.run_closed"), false);

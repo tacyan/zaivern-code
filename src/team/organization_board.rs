@@ -243,6 +243,8 @@ pub fn board_window(
     // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
     runs: &[(String, bool)],
     active_run: usize,
+    // このワークスペースは Git 管理下でない (実測できない)。
+    needs_git: bool,
     notice: &str,
     // 端末 1 枚を「ここへ」描く口。描けたら true。
     // **実体は app 側にある** (セッションを持っているのはあちら) ので、
@@ -282,7 +284,7 @@ pub fn board_window(
         .show(ctx, |ui| {
             body(
                 ui, theme, snap, tab, form, restore, selected, expanded, runs, active_run,
-                notice, &mut acts, term,
+                needs_git, notice, &mut acts, term,
             );
         });
     if !win_open {
@@ -305,6 +307,8 @@ fn body(
     // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
     runs: &[(String, bool)],
     active_run: usize,
+    // このワークスペースは Git 管理下でない (実測できない)。
+    needs_git: bool,
     notice: &str,
     acts: &mut Vec<BoardAction>,
     term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
@@ -313,6 +317,7 @@ fn body(
         ui.colored_label(theme.warn, plain(notice));
     }
     run_tabs_row(ui, theme, runs, active_run, acts);
+    git_needed_row(ui, theme, needs_git, acts);
 
     // ── 未完了 Run の扱い ──
     if restore != RestorePrompt::None {
@@ -392,7 +397,16 @@ fn top_command_bar(
     s: &TeamSnapshot,
     acts: &mut Vec<BoardAction>,
 ) {
-    ui.horizontal_wrapped(|ui| {
+    // **ヘッダは 1 行に固定する。**
+    //
+    // 折り返すと窓が縦に伸びる。極端に低い画面 (1200x300) では、札を
+    // 1 枚足しただけではみ出した。横スクロールなら**中身は全部届く**まま
+    // 高さが変わらない (CLAUDE.md「どの幅でも見切れない」)。
+    egui::ScrollArea::horizontal()
+        .id_salt("team-header")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+    ui.horizontal(|ui| {
         ui.label(
             RichText::new(ellipsis(&s.goal.title, 44))
                 .color(theme.text)
@@ -424,13 +438,30 @@ fn top_command_bar(
         // **自動検証が 1 本も無いことを、常に見えるところへ出す。**
         // 通知は上書きで消えるが、これは状態から導くので消えない。
         // 完了を決めるのがレビュー承認だけになる、という重い意味を持つ。
+        //
+        // **2 つ出るときも 1 枚にまとめる。** 札を 1 枚増やすと、狭い画面で
+        // ヘッダが 2 行になり、窓が縦にはみ出す (1200x300 で実際に落ちた)。
+        // 意味は 2 つとも要るので、文言を繋いで 1 行に収める。
+        // 札は 1 枚・記号も 1 つ。**語だけを繋ぐ** — 記号ごと繰り返すと
+        // 幅が伸びて、狭い画面でヘッダが 2 行になる。
+        let mut warn: Vec<&str> = Vec::new();
+        let mut why: Vec<String> = Vec::new();
         if s.unvalidated {
-            ui.label(
-                RichText::new(tr("team.chip.unvalidated"))
-                    .color(theme.warn)
-                    .strong(),
-            )
-            .on_hover_text(tr("team.chip.unvalidated_hint"));
+            warn.push("validated");
+            why.push(tr("team.chip.unvalidated_hint"));
+        }
+        if s.unmeasured {
+            warn.push("measured");
+            why.push(tr("team.chip.unmeasured_hint"));
+        }
+        if !warn.is_empty() {
+            let label = match warn.as_slice() {
+                ["validated"] => tr("team.chip.unvalidated"),
+                ["measured"] => tr("team.chip.unmeasured"),
+                _ => tr("team.chip.unchecked"),
+            };
+            ui.label(RichText::new(label).color(theme.warn).strong())
+                .on_hover_text(why.join("\n"));
         }
         // **常に 0 のバッジを出さない** (CLAUDE.md: 減らせないかを先に考える)。
         if m.blocked > 0 {
@@ -486,6 +517,7 @@ fn top_command_bar(
             acts.push(BoardAction::OpenInstruct);
         }
     });
+        });
 }
 
 fn goal_color(theme: &Theme, s: GoalStatus) -> egui::Color32 {
@@ -1382,6 +1414,34 @@ fn restore_card(
     );
 }
 
+/// **Git が無いと 1 件も完了できないことを、走らせる前に出す。**
+///
+/// 実測 (`changeset`) は git が出す差分を使うので、Git 管理下でない
+/// フォルダでは**どの完了報告も却下される**。実機では 7 体が並列で
+/// 働いているのに 1 件も終わらなかった — 画面に何も出ていなければ、
+/// 利用者は「動いているのに進まない」としか分からない。
+fn git_needed_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    needs_git: bool,
+    acts: &mut Vec<BoardAction>,
+) {
+    if !needs_git {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(tr("team.git.needed")).color(theme.warn));
+        if ui
+            .button(tr("team.git.init"))
+            .on_hover_text(tr("team.git.init_hint"))
+            .clicked()
+        {
+            acts.push(BoardAction::InitGit);
+        }
+    });
+    ui.separator();
+}
+
 /// **同時に走っている Run の切り替え。**
 ///
 /// 1 本しか無いときは**出さない** (常に 1 つしか無い選択肢は、
@@ -1736,6 +1796,7 @@ mod tests {
                         None,
                         &[],
                         0,
+                        false,
                         "",
                         // 端末は描かない (ヘッドレスにセッションは無い)。
                         // **描けなかったときの経路**もここで踏まれる。

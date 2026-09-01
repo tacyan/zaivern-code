@@ -121,6 +121,8 @@ pub enum BoardAction {
     SelectRun(usize),
     /// **Run を 1 本閉じる** (止めて、記憶からも保存からも外す)。
     CloseRun(usize),
+    /// **このワークスペースを Git 管理下にする** (実測の基準点を作る)。
+    InitGit,
     /// **短い指示を仕様書へ書き換えてもらう。** 計画の手前の段。
     DraftSpec,
     /// 書き換えた下書きを採用して、そのまま計画へ進む。
@@ -331,6 +333,13 @@ pub struct TeamPanel {
     pub inspector_open: bool,
     /// 端末タブで**その場で開いている**担当 (`None` なら全部畳んだ状態)。
     pub expanded_output: Option<AgentId>,
+    /// **このワークスペースは Git 管理下でない。**
+    ///
+    /// 実測 (`changeset`) は git を使うので、Git が無いと**どの完了報告も
+    /// 受理できない**。実機では 7 体が並列で働いているのに、報告が全部
+    /// 「変更されたファイルを実測できないので完了にできません」で却下され、
+    /// 1 件も終わらなかった。**走らせてから気付かせない。**
+    pub needs_git: bool,
     /// Inspector の「追加の指示」入力欄。
     pub inspector_note: String,
     pub restore: RestorePrompt,
@@ -412,6 +421,7 @@ impl Default for TeamPanel {
             tab: BoardTab::default(),
             draft_rx: None,
             expanded_output: None,
+            needs_git: false,
             form: NewRunForm::default(),
             selected_agent: None,
             selected_task: None,
@@ -685,6 +695,9 @@ impl TeamPanel {
         }
         let dir = self.outbox_dir(&rt.run().run_id);
         rt.set_outbox(dir);
+        // **走らせる前に確かめる。** Git が無いと実測できず、どの完了報告も
+        // 受理できない (エージェントは働くのに 1 件も終わらない)。
+        self.needs_git = crate::git::discover_toplevel(&self.workspace).is_none();
         self.runs.push(rt);
         self.active = self.runs.len() - 1;
         self.read_only = false;
@@ -1113,6 +1126,54 @@ impl TeamPanel {
     /// いま画面に出している Run の位置。
     pub fn active_run(&self) -> usize {
         self.active
+    }
+
+    /// **このワークスペースを Git 管理下にする。**
+    ///
+    /// 実測の基準点は git が出すので、Git が無いと完了報告を 1 件も
+    /// 受理できない。**人が押したときだけ**走らせる — 利用者のフォルダを
+    /// 黙って変える操作なので、自動ではやらない。
+    ///
+    /// `init` だけでは足りない。コミットが 1 つも無いと `git status` に
+    /// 全ファイルが未追跡として並び、基準点が「全部汚れている」になる。
+    /// 最初のコミットまで打って、**いまの中身を綺麗な状態**にする。
+    pub fn init_git(&mut self) -> Result<(), String> {
+        let ws = self.workspace.clone();
+        if ws.as_os_str().is_empty() || !ws.is_dir() {
+            return Err(crate::i18n::tr("team.git.no_workspace"));
+        }
+        if crate::git::discover_toplevel(&ws).is_some() {
+            self.needs_git = false;
+            return Ok(());
+        }
+        let run = |args: &[&str]| -> Result<(), String> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ws)
+                .output()
+                .map_err(|e| format!("git: {e}"))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        };
+        run(&["init"])?;
+        run(&["add", "-A"])?;
+        // **作者名は Run のためだけに与える。** 利用者の global 設定を
+        // 触らない (`-c` はこの 1 コマンドにしか効かない)。
+        run(&[
+            "-c",
+            "user.name=Zaivern",
+            "-c",
+            "user.email=zaivern@localhost",
+            "commit",
+            "-m",
+            "Zaivern: Team Run の基準点",
+            "--allow-empty",
+        ])?;
+        self.needs_git = false;
+        self.dirty = true;
+        Ok(())
     }
 
     /// **Run を 1 本閉じる。**
@@ -1964,6 +2025,35 @@ mod tests {
         assert!(p.take_manual_instructions().is_empty(), "人の指示が漏れた");
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    /// **Git が無いフォルダでは、走らせる前に分かる。**
+    ///
+    /// 実測 (`changeset`) は git が出す差分を使うので、Git 管理下でない
+    /// フォルダでは**どの完了報告も却下される**。実機では 7 体が並列で
+    /// 働いているのに 1 件も終わらず、画面には理由が出ていなかった。
+    #[test]
+    fn git無しのワークスペースは計画の時点で分かる() {
+        let dir = ws("no-git");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = TeamPanel::default();
+        let _ = p.attach_workspace(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        assert!(p.needs_git, "Git が無いのに気付いていない");
+
+        // **押したら実測できるようになる。** (人が押したときだけ走る)
+        p.init_git().expect("Git を用意できる");
+        assert!(!p.needs_git, "用意したのに旗が残っている");
+        assert!(
+            crate::git::discover_toplevel(&dir).is_some(),
+            "git init が効いていない"
+        );
+        // コミットが 1 つ無いと `git status` に全部が未追跡で並び、
+        // 基準点が「全部汚れている」になる。最初のコミットまで打つこと。
+        let base = super::super::changeset::capture_baseline(&dir)
+            .expect("基準点を取れる");
+        assert!(base.usable(), "取れた基準点が使えない");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **2 本の Run が同時に進む。**

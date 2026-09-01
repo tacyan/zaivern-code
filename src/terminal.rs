@@ -5488,6 +5488,39 @@ mod tests {
         );
     }
 
+    /// **段落 (空行) を含む入力でも入力欄を見失わない。**
+    ///
+    /// 実機で踏んだ形をそのまま置く。Team の指示文は空行で段落を分けるので、
+    /// 空行で打ち切っていた頃は**入力欄そのものが見つからなかった**。
+    /// 見つからない = 確定キーが効いたかを確かめられない = 1 回撃って
+    /// 「届いた」と判断する。だから指示が入力欄に残ったまま何分も
+    /// 止まっていた (Codex で観測)。
+    #[test]
+    fn input_area_selection_paragraphs_with_blank_lines() {
+        let mut p = vt100::Parser::new(12, 60, 0);
+        p.process("\x1b[2;1H\u{203a}".as_bytes());
+        p.process("\x1b[3;1H  ## 中で誰かに手伝わせたとき".as_bytes());
+        p.process("\x1b[4;1H  あなたが内部でサブエージェントを使ったら".as_bytes());
+        // ← ここが空行。以前はこれで打ち切っていた。
+        p.process("\x1b[6;1H  * `parent_id` は必ず `agent-2`".as_bytes());
+        p.process("\x1b[8;1H  gpt-5.6-sol low fast".as_bytes());
+        p.process(b"\x1b[6;34H"); // カーソルは打ち終わった位置 (最後の本文行)
+        let (_, text) = input_area_selection(p.screen()).expect("空行があっても検出できる");
+        assert!(
+            text.contains("## 中で誰かに手伝わせたとき"),
+            "先頭の段落が入っていない: {text:?}"
+        );
+        assert!(
+            text.contains("`parent_id` は必ず `agent-2`"),
+            "空行の向こうの本文が入っていない: {text:?}"
+        );
+        // **カーソルより下は入力欄ではない。** 状態行を巻き込まない。
+        assert!(
+            !text.contains("gpt-5.6-sol"),
+            "下の状態行まで拾っている: {text:?}"
+        );
+    }
+
     #[test]
     fn input_area_selection_claude_style_box() {
         // Claude Code 風: 上下罫線に挟まれた「› 本文」行
@@ -8103,7 +8136,15 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
         }
         Some(i + 2)
     };
-    // カーソル行から上へマーカー行を探す (途中に空行・罫線があれば入力欄ではない)
+    // カーソル行から上へマーカー行を探す。
+    //
+    // **空行では打ち切らない。** 打ち切っていたので、段落を含む長い入力
+    // (Team の指示文がまさにそれ) では入力欄そのものを見失っていた。
+    // 見失う = 確定キーが効いたかを確かめられない = **1 回撃って
+    // 「届いた」と判断する**ので、実機では指示が入力欄に残ったまま
+    // 何分も止まっていた (Codex で観測)。
+    //
+    // 罫線では従来どおり打ち切る — そこは本当に入力欄の外側。
     let mut marker: Option<(u16, usize)> = None;
     let low = cur_r.saturating_sub(40);
     for r in (low..=cur_r).rev() {
@@ -8112,17 +8153,26 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
             marker = Some((r, col));
             break;
         }
-        if cs.is_empty() || is_border_row(&cs) {
+        if is_border_row(&cs) {
             break;
         }
     }
     let (m_row, body_col) = marker?;
-    // マーカー行から下へ続く本文行 (折返し・複数行入力)
+    // マーカー行から下へ続く本文行 (折返し・複数行入力)。
+    //
+    // **空行はまたぐ。ただしカーソル行まで。** カーソルは打ち終わった
+    // 位置なので、そこから先は入力欄ではない (下の状態行を巻き込まない)。
     let mut bottom = m_row;
     for r in m_row + 1..rows {
         let cs = row_chars(r);
-        if cs.is_empty() || is_border_row(&cs) || marker_body_col(&cs).is_some() {
+        if is_border_row(&cs) || marker_body_col(&cs).is_some() {
             break;
+        }
+        if cs.is_empty() {
+            if r >= cur_r {
+                break;
+            }
+            continue;
         }
         bottom = r;
     }

@@ -175,7 +175,19 @@ pub enum FileEvidence {
         out_of_scope: Vec<String>,
     },
     /// 測れなかった (理由つき)。**完了は通さない。**
+    ///
+    /// 「測れるはずなのに失敗した」場合。git はあるのに壊れている、
+    /// 変更が多すぎる、など — 直せば測れるので、人へ渡す。
     Unavailable(String),
+    /// **そもそも測る手立てが無い** (理由つき)。**完了は通す。**
+    ///
+    /// Git 管理下でないフォルダがこれ。直しようが無いので、ここで
+    /// 止めると**そのフォルダでは 1 件も完了できない**
+    /// (実機で 7 体が並列で働いているのに 1 件も終わらなかった)。
+    ///
+    /// **通すが、隠さない。** 「担当内だけを変更した」とは言えない状態
+    /// なので、盤面が「実測なし」を出す (検証なしで進む Run と同じ扱い)。
+    Unmeasurable(String),
     /// このタスクに担当範囲が宣言されていない。
     ///
     /// 範囲が無ければ「範囲外」も無い。**測った事実は残すが、
@@ -190,7 +202,7 @@ impl FileEvidence {
         match self {
             FileEvidence::Measured { mine, .. } => mine,
             FileEvidence::NoScope { measured } => measured,
-            FileEvidence::Unavailable(_) => &[],
+            FileEvidence::Unavailable(_) | FileEvidence::Unmeasurable(_) => &[],
         }
     }
 }
@@ -422,6 +434,10 @@ pub fn accept(
         FileEvidence::Unavailable(why) => {
             return Err(RejectReason::EvidenceUnavailable(why.clone()));
         }
+        // **測る手立てが無いなら、実測は求めない。**
+        // ここで止めると、Git 管理下でないフォルダでは 1 件も完了できない。
+        // 通すかわりに「実測なし」を盤面が出す (隠さない)。
+        FileEvidence::Unmeasurable(_) => {}
         FileEvidence::Measured { out_of_scope, .. } if !out_of_scope.is_empty() => {
             return Err(RejectReason::OutOfScopeFiles(out_of_scope.clone()));
         }
@@ -1308,6 +1324,37 @@ mod tests {
     /// `報告の JSON を読めません: invalid type: string "task_id" …` を出していた。
     /// 正体は「端末が指示の枠を描き直している途中」— 先頭の `{` がまだ無い
     /// 状態を、相手の報告として拾っていた。
+    /// **測る手立てが無いフォルダでも完了できる。**
+    ///
+    /// 実機で `~/dev/Sharp` (Git 管理下でない) を相手にしたとき、7 体が
+    /// 並列で働いているのに**どの完了報告も却下**され、1 件も終わらなかった:
+    /// 「変更されたファイルを実測できないので完了にできません」。
+    ///
+    /// 直しようが無い理由で止め続けるのは、そのフォルダでこの機能を
+    /// 使えなくするのと同じ。**通すが、盤面が「実測なし」を出す**。
+    #[test]
+    fn 測る手立てが無くても完了できる() {
+        let task = assigned();
+        let doc: ResultDoc = serde_json::from_str(GOOD).unwrap();
+        // 測れるはずなのに失敗した → **通さない** (直せば測れるので人へ渡す)。
+        let broken = FileEvidence::Unavailable("git が壊れています".into());
+        assert!(matches!(
+            accept(doc.clone(), &task, &broken),
+            Err(RejectReason::EvidenceUnavailable(_))
+        ));
+        // そもそも測る手立てが無い → **通す**。
+        let none = FileEvidence::Unmeasurable("Git 管理下ではありません".into());
+        let ok = accept(doc, &task, &none).expect("完了できる");
+        assert_eq!(ok.task_id, task.id);
+        // **測れていないことは隠さない。** 実測は空のまま残る
+        // (自己申告を実測に格上げしない)。
+        assert!(
+            ok.changed_files.is_empty(),
+            "測っていないのに実測として載せている"
+        );
+        assert!(!ok.reported_files.is_empty(), "自己申告は残る");
+    }
+
     #[test]
     fn 描き直し途中のエコーを報告として拾わない() {
         let sent = sent_instruction_sample();
