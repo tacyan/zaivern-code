@@ -521,6 +521,17 @@ pub fn decide(
             // 繰り返しても何も変わらないので、従来どおり確定へ進んで
             // `Verify` に判定させる (そちらは入力欄の残りを見て撃ち直す)。
             if !peek.input_seen(&tail_key(&job.text)) {
+                // **待つ理由が見えている間は、書き直しも諦めもしない。**
+                //
+                // 実機で、起動中の Codex (`Update available!` の案内が出た
+                // まま・MCP を立ち上げ中) へ 3 回書き直して諦め、配り直しては
+                // また諦めるのを繰り返した。「入力欄に本文が無い」のは
+                // 書き込みが落ちたからではなく、**まだ描いていない**だけ。
+                // 落ちたと決めてよいのは、相手が受け取れる状態だと
+                // 観測できているときに限る。
+                if holdup(job, peek).is_some() {
+                    return Act::Wait(POLL);
+                }
                 if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
                     return Act::GaveUp;
                 }
@@ -1503,5 +1514,73 @@ mod body_write_cap_tests {
             arm.contains("body_writes"),
             "本文を書いた回数を数えていない (上限が効かない)"
         );
+    }
+}
+
+#[cfg(test)]
+mod starting_agent_tests {
+    use super::*;
+
+    /// **起動中の相手へ書き直さない・諦めない。**
+    ///
+    /// 実機で、起動中の Codex (`Update available!` の案内が出たまま MCP を
+    /// 立ち上げ中) へ 3 回書き直して諦め、配り直してはまた諦めるのを
+    /// 繰り返した。入力ログで **19 件の書き込み**として見えた。
+    /// 「入力欄に本文が無い」のは書き込みが落ちたからではなく、
+    /// **まだ描いていない**だけである。
+    #[test]
+    fn 起動中は書き直しも諦めもしない() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let starting = Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            // **まだ受け取れない** (カタログの `input_ready_ms` が待たせている)。
+            input_ready: false,
+            input: Some(String::new()),
+            ..Default::default()
+        };
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        for n in 0..=MAX_BODY_WRITES {
+            j.body_writes = n;
+            assert!(
+                matches!(decide(&j, &starting, long, long, long), Act::Wait(_)),
+                "起動中に書き直し/諦めをしている ({n} 回目)"
+            );
+        }
+        // **承認待ちでも同じ** (Enter が承認への回答になるので書けない)。
+        let approving = Peek {
+            attention: true,
+            ..starting.clone()
+        };
+        j.body_writes = MAX_BODY_WRITES;
+        assert!(matches!(
+            decide(&j, &approving, long, long, long),
+            Act::Wait(_)
+        ));
+    }
+
+    /// **受け取れる状態なら、これまでどおり書き直して打ち切る。**
+    /// 待つ理由の判定で、失敗の検出そのものを殺してはいけない。
+    #[test]
+    fn 受け取れるのに見えないときは打ち切る() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let ready = Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            input_ready: true,
+            input: Some(String::new()),
+            ..Default::default()
+        };
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        j.body_writes = 0;
+        assert_eq!(decide(&j, &ready, long, long, long), Act::WriteBody);
+        j.body_writes = MAX_BODY_WRITES;
+        assert_eq!(decide(&j, &ready, long, long, long), Act::GaveUp);
     }
 }
