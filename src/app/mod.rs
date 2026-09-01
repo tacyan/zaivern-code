@@ -3225,9 +3225,23 @@ struct HotExitConflict {
     state: session::DiskState,
 }
 
+/// 伝言を拾うときに読む画面の行数・桁数。
+///
+/// **全履歴を舐めない。** 伝言は出した直後に画面へ出るので、末尾だけで足りる。
+pub const TALK_SCAN_ROWS: usize = 60;
+pub const TALK_SCAN_COLS: usize = 200;
+
+/// 「もう配った」と覚えておく伝言の数。上限が無いと記憶が際限なく太る。
+pub const TALK_SEEN_CAP: usize = 512;
+
 pub struct ZaivernApp {
     cfg: Config,
     theme: Theme,
+    /// **配り終えた伝言の指紋。** 画面は同じ伝言を何度も映すので、
+    /// 一度配ったものは覚えておく (上限 [`TALK_SEEN_CAP`])。
+    talk_seen: std::collections::HashSet<u64>,
+    /// 古い順に捨てるための並び。
+    talk_order: std::collections::VecDeque<u64>,
     /// 起動時の最大化を済ませたか (`frame_update::maximize_once`)。
     /// **1 回だけ**送るための札 — 毎フレーム送ると縮められなくなる。
     did_initial_maximize: bool,

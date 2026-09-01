@@ -1596,6 +1596,14 @@ impl TeamRuntime {
                 // 停止承認を消さない`)。
                 if retried {
                     self.decisions.retain(|d| d.task_id != Some(id));
+                } else {
+                    // **配置由来の札だけは、押したその場で下ろす。**
+                    // `Ready` のタスクは状態が動かないので上の枝へ来ない。
+                    // 理由がまだ成り立っているなら次の tick で出し直される
+                    // ので、消えっぱなしにはならない (人が答える種類の判断は
+                    // `SCHEDULING_KEYS` に無いので残る)。
+                    self.decisions
+                        .retain(|d| d.task_id != Some(id) || !is_scheduling_key(&d.idempotency_key));
                 }
                 self.dirty = true;
             }
@@ -2968,6 +2976,37 @@ impl TeamRuntime {
         }
     }
 
+    /// **もう成り立っていないスケジューリング由来の判断を取り下げる。**
+    ///
+    /// 重なり・能力不足・レビュー役不在は「いまの配置」から導かれる話なので、
+    /// 配置が変われば理由ごと消える。積みっぱなしにすると、解決したあとも
+    /// 札だけが画面に残り、`retry` を押しても消えない (`Ready` のタスクへの
+    /// `retry` は状態を動かさないので、判断も掃除されない)。
+    ///
+    /// 人へ渡した (`NeedsUser`) タスクの札は残す — そこは人が動かす番で、
+    /// 勝手に消すと手が出せなくなる。
+    fn withdraw_settled(&mut self, standing: &BTreeSet<String>) {
+        let parked: BTreeSet<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == TeamTaskState::NeedsUser)
+            .map(|t| t.id)
+            .collect();
+        let before = self.decisions.len();
+        self.decisions.retain(|d| {
+            if !is_scheduling_key(&d.idempotency_key) {
+                return true;
+            }
+            if standing.contains(&d.idempotency_key) {
+                return true;
+            }
+            d.task_id.is_some_and(|t| parked.contains(&t))
+        });
+        if self.decisions.len() != before {
+            self.dirty = true;
+        }
+    }
+
     /// Ready なタスクを配る。**既存 `coordinator` が断ったら配らない。**
     fn dispatch(&mut self, out: &mut Vec<TeamEffect>) {
         let candidates: Vec<Candidate> = self
@@ -2998,13 +3037,18 @@ impl TeamRuntime {
         let depth = graph::critical_depth(&self.tasks);
         let plan = scheduler::plan_assignments(&self.tasks, &candidates, &depth);
 
+        // **この tick で本当に成り立っている理由**の鍵。ここに無い
+        // スケジューリング由来の判断は、下で撤回する。
+        let mut standing: BTreeSet<String> = BTreeSet::new();
+
         for u in &plan.unassigned {
             // 候補が居ないだけなら黙る (次の tick で解決しうる)。
-            // 重なりと「本人しか居ない」は人へ上げる価値がある。
+            // 重なりと「他に居ない」は人へ上げる価値がある。
             // **どのタスクの話かは必ず添える** (理由だけでは追えない)。
             let subject = u.task();
             match u {
                 scheduler::Unassigned::FileOverlap { .. } => {
+                    standing.insert(format!("file_scope_overlap:{subject}"));
                     self.raise(
                         DecisionKind::FileScopeOverlap,
                         Some(subject),
@@ -3014,14 +3058,32 @@ impl TeamRuntime {
                         vec!["reassign".into(), "reject".into()],
                     );
                 }
-                scheduler::Unassigned::ReviewerWouldBeAuthor(_) => {
-                    self.raise(
+                // **混んでいるだけなら黙る。** ほかの担当が終われば配れる
+                // ので、人がすることは何も無い。ここで判断を積むと、
+                // 勝手に解決したあとも消えない札が溜まる (実機で 5 件)。
+                scheduler::Unassigned::ReviewerWouldBeAuthor(_) => {}
+                // **待っても解決しない**ほうだけ人へ上げる。実装担当以外の
+                // エージェントがこの Run に 1 体も居ないので、レビューは
+                // 永久に配れない。
+                //
+                // **`Ready` のまま置く** (`CapsMissing` と違って人へ渡さない)。
+                // 必要な能力は計画で固定だが、**エージェントの数は増える**
+                // ので、この理由はひとりでに消えうる。`NeedsUser` へ落とすと
+                // スケジューラが二度と見ないため、増えても永久に止まったまま
+                // になる。`Ready` に留めておけば、毎 tick 判定し直して
+                // 解決した瞬間に札が下りる (`withdraw_settled`)。
+                scheduler::Unassigned::NoOtherReviewer(_) => {
+                    standing.insert(format!("no-other-reviewer:{subject}"));
+                    self.make_decision(
                         DecisionKind::NoCandidate,
                         Some(subject),
                         None,
                         u.detail(),
-                        "レビューには実装担当と別のセッションが要ります".into(),
+                        "並列数を増やしてレビュー役を足すか、レビュー無しで進めてください".into(),
                         vec!["retry".into(), "reject".into()],
+                        format!("no-other-reviewer:{subject}"),
+                        Vec::new(),
+                        None,
                     );
                 }
                 scheduler::Unassigned::CapsMissing { .. } => {
@@ -3037,6 +3099,7 @@ impl TeamRuntime {
                     }
                     // 鍵は `ReviewerWouldBeAuthor` と分ける (同じ種類・同じ
                     // タスクなので、共用すると片方の理由が黙って消える)。
+                    standing.insert(format!("caps-missing:{subject}"));
                     self.make_decision(
                         DecisionKind::NoCandidate,
                         Some(subject),
@@ -3055,6 +3118,8 @@ impl TeamRuntime {
                 scheduler::Unassigned::NoCandidate(_) => {}
             }
         }
+
+        self.withdraw_settled(&standing);
 
         let at = Instant::now();
         for a in plan.assignments {
@@ -3736,6 +3801,26 @@ impl TeamRuntime {
             None,
         );
     }
+}
+
+/// **配置から導かれる判断**の鍵の頭。
+///
+/// この頭を持つ判断は「いまの配置ではこうなる」という*導出結果*なので、
+/// 配置が変われば黙って取り下げてよい ([`TeamRuntime::withdraw_settled`])。
+/// ここに無い判断 (停止承認・危険なコマンド・検証の実行許可…) は
+/// **人が答えるまで残す** — 勝手に消すと、答える手段が画面から消える。
+///
+/// 新しく配置由来の判断を足したら、必ずここへも足すこと。番人は
+/// `runtime_tests::配置から導く判断はすべて取り下げの対象`。
+pub(super) const SCHEDULING_KEYS: &[&str] = &[
+    "file_scope_overlap:",
+    "caps-missing:",
+    "no-other-reviewer:",
+];
+
+/// [`SCHEDULING_KEYS`] のどれかで始まるか。
+fn is_scheduling_key(key: &str) -> bool {
+    SCHEDULING_KEYS.iter().any(|p| key.starts_with(p))
 }
 
 /// 承認の記録をいくつまで残すか。**上限が無いと、長い Run で無限に伸びる。**

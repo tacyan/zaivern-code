@@ -5395,5 +5395,9 @@
   "worktree.agent_worktree_left_over": "エージェント専用の worktree ({branch}) が残っています。\n{dir}",
   "worktree.cannot_create_without_commits": "コミットが 1 つも無いリポジトリでは worktree を作れません: {e}",
   "worktree.no_uncommitted_changes": "未コミットの変更はありません。",
-  "worktree.uncommitted_changes_warning": "⚠ 未コミットの変更があります。削除するとその変更は失われます。"
+  "worktree.uncommitted_changes_warning": "⚠ 未コミットの変更があります。削除するとその変更は失われます。",
+  "エージェントが選ばれていません": "エージェントが選ばれていません",
+  "エージェント同士の伝言の使い方を送る": "エージェント同士の伝言の使い方を送る",
+  "伝言の相手が居ません (エージェントを 2 つ以上開いてください)": "伝言の相手が居ません (エージェントを 2 つ以上開いてください)",
+  "🗣 伝言の使い方を送りました": "🗣 伝言の使い方を送りました"
 }

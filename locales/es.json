@@ -5395,5 +5395,9 @@
   "worktree.agent_worktree_left_over": "Queda un worktree exclusivo del agente ({branch}).\n{dir}",
   "worktree.cannot_create_without_commits": "No se puede crear un worktree en un repositorio sin ningún commit: {e}",
   "worktree.no_uncommitted_changes": "No hay cambios sin commit.",
-  "worktree.uncommitted_changes_warning": "⚠ Hay cambios sin commit. Al eliminar se perderán."
+  "worktree.uncommitted_changes_warning": "⚠ Hay cambios sin commit. Al eliminar se perderán.",
+  "エージェントが選ばれていません": "No hay ningún agente seleccionado",
+  "エージェント同士の伝言の使い方を送る": "Enseñar a los agentes a enviarse mensajes",
+  "伝言の相手が居ません (エージェントを 2 つ以上開いてください)": "No hay a quién enviar (abre al menos dos agentes)",
+  "🗣 伝言の使い方を送りました": "🗣 Instrucciones de mensajería enviadas"
 }

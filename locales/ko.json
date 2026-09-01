@@ -5395,5 +5395,9 @@
   "worktree.agent_worktree_left_over": "에이전트 전용 worktree ({branch})가 남아 있습니다.\n{dir}",
   "worktree.cannot_create_without_commits": "커밋이 하나도 없는 리포지터리에서는 worktree를 만들 수 없습니다: {e}",
   "worktree.no_uncommitted_changes": "커밋하지 않은 변경이 없습니다.",
-  "worktree.uncommitted_changes_warning": "⚠ 커밋하지 않은 변경이 있습니다. 삭제하면 그 변경은 사라집니다."
+  "worktree.uncommitted_changes_warning": "⚠ 커밋하지 않은 변경이 있습니다. 삭제하면 그 변경은 사라집니다.",
+  "エージェントが選ばれていません": "에이전트가 선택되지 않았습니다",
+  "エージェント同士の伝言の使い方を送る": "에이전트 간 전언 사용법 보내기",
+  "伝言の相手が居ません (エージェントを 2 つ以上開いてください)": "전할 상대가 없습니다 (에이전트를 2개 이상 여세요)",
+  "🗣 伝言の使い方を送りました": "🗣 전언 사용법을 보냈습니다"
 }

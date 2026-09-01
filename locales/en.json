@@ -5395,5 +5395,9 @@
   "worktree.agent_worktree_left_over": "An agent-only worktree ({branch}) is left over.\n{dir}",
   "worktree.cannot_create_without_commits": "Cannot create a worktree in a repository with no commits: {e}",
   "worktree.no_uncommitted_changes": "There are no uncommitted changes.",
-  "worktree.uncommitted_changes_warning": "⚠ There are uncommitted changes. Deleting will lose them."
+  "worktree.uncommitted_changes_warning": "⚠ There are uncommitted changes. Deleting will lose them.",
+  "エージェントが選ばれていません": "No agent is selected",
+  "エージェント同士の伝言の使い方を送る": "Teach agents how to message each other",
+  "伝言の相手が居ません (エージェントを 2 つ以上開いてください)": "There is nobody to message (open at least two agents)",
+  "🗣 伝言の使い方を送りました": "🗣 Sent the messaging instructions"
 }

@@ -5395,5 +5395,9 @@
   "worktree.agent_worktree_left_over": "仍残留着 agent 专用的 worktree ({branch})。\n{dir}",
   "worktree.cannot_create_without_commits": "在没有任何提交的仓库中无法创建 worktree: {e}",
   "worktree.no_uncommitted_changes": "没有未提交的更改。",
-  "worktree.uncommitted_changes_warning": "⚠ 存在未提交的更改。删除后这些更改将丢失。"
+  "worktree.uncommitted_changes_warning": "⚠ 存在未提交的更改。删除后这些更改将丢失。",
+  "エージェントが選ばれていません": "未选择智能体",
+  "エージェント同士の伝言の使い方を送る": "教智能体如何互相传话",
+  "伝言の相手が居ません (エージェントを 2 つ以上開いてください)": "没有可传话的对象（请至少打开两个智能体）",
+  "🗣 伝言の使い方を送りました": "🗣 已发送传话说明"
 }

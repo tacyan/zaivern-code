@@ -3807,3 +3807,129 @@ fn allは自分を含めない() {
     let (targets, _) = rp::check_message(body, &known, &AgentId::new("a")).unwrap();
     assert_eq!(targets, vec![AgentId::new("b")]);
 }
+
+/// **混んでいるだけのレビューを人の判断待ちにしない。**
+///
+/// 実機で「実装した本人しかレビュー候補がいません」が 5 件積み上がり、
+/// 再試行を押しても消えなかった。原因は 2 つ:
+/// 1. **空集合へ `all` を撃っていた** — 誰も空いていないときも真になるので、
+///    ただ混んでいるだけのレビューが「本人しか居ない」に化けていた
+/// 2. 化けた札は `Ready` のまま積まれるので、`retry` が状態を動かさず
+///    掃除もされない (= 押しても消えない)
+#[test]
+fn 混んでいるだけのレビューは人へ上げない() {
+    // 2 体で回すと、1 本目のレビューが生まれた時点で **もう 1 体は別の
+    // 実装を握っている** ので、空いているのは著者だけ — 実機と同じ局面。
+    let mut rt = started(2);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let (sid, tid, agent) = assignments(&rt)[0].clone();
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 12, &sids, sid, &block);
+    validate_ok(&mut rt, tid);
+    for now in 13..18 {
+        idle_tick(&mut rt, now, &sids);
+    }
+    // **局面が作れたことを先に確かめる。** 作れていないと、この下の
+    // アサートは何も守らない (空回りするテストを残さない)。
+    let rev = rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(tid))
+        .expect("レビュータスクが生まれていない");
+    assert_eq!(
+        rev.state,
+        TeamTaskState::Ready,
+        "レビューが配れてしまい、混雑の局面になっていない"
+    );
+    assert!(
+        rt.tasks()
+            .iter()
+            .any(|t| t.assigned_session.is_some_and(|x| x != sid) && t.state.is_held()),
+        "もう 1 体が空いている (混雑の局面になっていない)"
+    );
+    let raised: Vec<&str> = rt
+        .decisions()
+        .iter()
+        .filter(|d| d.kind == DecisionKind::NoCandidate)
+        .map(|d| d.reason.as_str())
+        .collect();
+    assert!(
+        raised.is_empty(),
+        "混んでいるだけで人の判断待ちが出た: {raised:?}"
+    );
+}
+
+/// **レビュー役が本当に居ないときは、1 件だけ出して自分で消す。**
+///
+/// 1 体だけの Run では実装した本人しか居ないので、レビューは待っても
+/// 配れない。人に伝える価値があるのはこちらだけ。
+#[test]
+fn レビュー役が居ないときは一度だけ上げて再試行で下ろせる() {
+    let mut rt = started(1);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let (sid, tid, agent) = assignments(&rt)[0].clone();
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 12, &sids, sid, &block);
+    validate_ok(&mut rt, tid);
+    // 何 tick 回しても **1 件のまま** (毎 tick 積み増さない)。
+    for now in 13..18 {
+        idle_tick(&mut rt, now, &sids);
+    }
+    let stuck: Vec<(TaskId, u64)> = rt
+        .decisions()
+        .iter()
+        .filter(|d| d.kind == DecisionKind::NoCandidate)
+        .map(|d| (d.task_id.unwrap_or(0), d.id))
+        .collect();
+    assert_eq!(stuck.len(), 1, "レビュー役不在の札が増えている: {stuck:?}");
+    let rev = stuck[0].0;
+    // **再試行を押したら、その場で消える。**
+    // 押しても消えないと、人からは「壊れている」としか見えない。
+    rt.apply_action(TeamAction::RetryTask(rev));
+    assert!(
+        !rt.decisions()
+            .iter()
+            .any(|d| d.task_id == Some(rev) && d.kind == DecisionKind::NoCandidate),
+        "再試行を押しても札が残っている"
+    );
+}
+
+/// **配置から導く判断は、全部「取り下げの対象」に載せる。**
+///
+/// 載せ忘れると、理由が消えたあとも札だけが画面に残る (そして `retry` でも
+/// 消えないので、人には壊れているようにしか見えない)。
+#[test]
+fn 配置から導く判断はすべて取り下げの対象() {
+    let src = include_str!("runtime.rs").replace("\r\n", "\n");
+    let body = src
+        .split("fn dispatch(&mut self")
+        .nth(1)
+        .and_then(|t| t.split("\n    /// ").next())
+        .expect("dispatch がある");
+    // `dispatch` が `standing` へ入れる鍵は、必ず表の頭で始まること。
+    let mut seen = 0usize;
+    for line in body.lines() {
+        let l = line.trim_start();
+        if l.starts_with("//") || !l.contains("standing.insert(format!(\"") {
+            continue;
+        }
+        seen += 1;
+        let key = l.split("format!(\"").nth(1).and_then(|t| t.split('{').next());
+        let key = key.expect("鍵の頭が読める");
+        assert!(
+            super::runtime::SCHEDULING_KEYS.contains(&key),
+            "{key:?} が SCHEDULING_KEYS に無い (理由が消えても札が残る)"
+        );
+    }
+    assert!(seen >= 3, "配置由来の判断を読み落としている (seen={seen})");
+}

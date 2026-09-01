@@ -4498,6 +4498,46 @@ prunable gitdir file points to non-existent location
     /// 起動していないのに緑」と読み違えた)。どの経路で終わっても最後の 1 行に
     /// 判定を書くこと。`exec` で置き換えると EXIT の trap が発火しないので、
     /// そこも併せて禁じる。
+    /// **伝言の読み方も、作法の文面も、置き場は 1 つ。**
+    ///
+    /// Team Run と通常タブで別々に書くと、片方だけが手書き JSON の綴り
+    /// 間違いを拾えるようになる (実測で 19 通中 5 通が落ちていた形)。
+    /// 「Team では届くのに通常タブでは届かない」は、利用者からは
+    /// 説明が付かない。
+    #[test]
+    fn 伝言の読み手はひとつだけ() {
+        for (name, src) in [
+            ("agent_talk", include_str!("agent_talk.rs")),
+            ("prompt", include_str!("team/prompt.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("serde_json::from_str"),
+                "{name} が伝言の JSON を自前で読んでいる (read_message を使う)"
+            );
+            assert!(
+                !code.contains("MSG_MAX_CHARS"),
+                "{name} が伝言の整形を自前でしている (read_message が済ませる)"
+            );
+            assert!(
+                code.contains("message_howto("),
+                "{name} が伝言の作法を自前で組み立てている (message_howto を使う)"
+            );
+        }
+        // 読み手の実体はここ 1 つだけ。
+        let rp = include_str!("team/result_parser.rs").replace("\r\n", "\n");
+        assert_eq!(
+            rp.matches("fn lenient_message(").count(),
+            1,
+            "受け皿が 2 つある"
+        );
+    }
+
     #[test]
     fn 検証スクリプトは終了時に判定行を出す() {
         for (name, src) in [

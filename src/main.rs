@@ -3,6 +3,7 @@
 mod acp;
 mod agent_input;
 mod agent_picker;
+mod agent_talk;
 mod agents;
 mod app;
 mod breadcrumb;

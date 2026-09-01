@@ -118,6 +118,123 @@ impl ZaivernApp {
         }
     }
 
+    /// **エージェント同士の伝言を拾って、相手のタブへ届ける。**
+    ///
+    /// Team Run の中では前から動いていた仕組みを、普通に並べているタブへも
+    /// 広げたもの。読み取りも配達も**同じ部品**を使う (第 2 の経路を作らない):
+    /// 取り出しは `result_parser`、配達は `submit`。
+    ///
+    /// **同じ塊を二度配らない。** 画面は同じ伝言を何度も映すので、
+    /// 一度配ったものは覚えておく (上限つき)。
+    /// **その塊を初めて見たか。** 見たものは覚え、上限を超えたぶんから忘れる。
+    ///
+    /// 配った伝言と断った理由の**両方**がここを通る。片方だけ通すと、
+    /// 断りばかり出る画面で覚え書きが際限なく伸びる。
+    fn talk_once(&mut self, key: u64) -> bool {
+        if !self.talk_seen.insert(key) {
+            return false;
+        }
+        self.talk_order.push_back(key);
+        while self.talk_order.len() > crate::app::TALK_SEEN_CAP {
+            if let Some(old) = self.talk_order.pop_front() {
+                self.talk_seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn deliver_agent_talk(&mut self) {
+        use crate::agent_talk::{deliveries, Peer};
+        let peers: Vec<Peer> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| Peer {
+                id: s.id,
+                name: s.title.clone(),
+            })
+            .collect();
+        if peers.len() < 2 {
+            return; // 相手が居なければ何もしない
+        }
+        // **画面の読み取りを先に済ませてから配る。** 読みながら配ると
+        // `self` を同時に借りることになる (借用検査で落ちる)。
+        let mut read: Vec<(
+            Vec<crate::agent_talk::Delivery>,
+            Vec<crate::agent_talk::TalkReject>,
+        )> = Vec::new();
+        for s in self.agents.sessions.iter() {
+            if !s.running() {
+                continue;
+            }
+            let screen = s
+                .screen_tail_lines(crate::app::TALK_SCAN_ROWS, crate::app::TALK_SCAN_COLS)
+                .join("\n");
+            if !screen.contains(crate::features::team::imp::result_parser::MSG_OPEN) {
+                continue;
+            }
+            read.push(deliveries(&screen, s.id, &peers, s.last_prompt.as_deref()));
+        }
+        let mut jobs: Vec<(u64, String)> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for (out, bad) in read {
+            for d in out {
+                if self.talk_once(crate::history::fnv1a64(d.text.as_bytes()) ^ d.to) {
+                    jobs.push((d.to, d.text));
+                }
+            }
+            for e in bad {
+                if self.talk_once(crate::history::fnv1a64(e.detail().as_bytes())) {
+                    refused.push(e.detail());
+                }
+            }
+        }
+        for (to, text) in jobs {
+            let mut job = crate::submit::Job::user(to, text);
+            job.wait_idle = true; // 相手の作業を割らない
+            self.queue_submit(job);
+        }
+        for why in refused {
+            self.toast(why, false);
+        }
+    }
+
+    /// **いま選んでいるエージェントへ、伝言の作法を教える。**
+    ///
+    /// 通常タブには Team のような指示文が無いので、教えなければ
+    /// エージェントは一生この仕組みを使わない。送るのは人が押したときだけ。
+    pub(crate) fn teach_agent_talk(&mut self) {
+        use crate::agent_talk::Peer;
+        let peers: Vec<Peer> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| Peer {
+                id: s.id,
+                name: s.title.clone(),
+            })
+            .collect();
+        let Some(me) = self.agents.sessions.get(self.agents.active).map(|s| s.id) else {
+            self.toast(tr("エージェントが選ばれていません"), false);
+            return;
+        };
+        if peers.len() < 2 {
+            self.toast(
+                tr("伝言の相手が居ません (エージェントを 2 つ以上開いてください)"),
+                false,
+            );
+            return;
+        }
+        let text = crate::agent_talk::how_to(&peers, me);
+        let mut job = crate::submit::Job::user(me, text);
+        job.wait_idle = true;
+        if self.queue_submit(job) {
+            self.toast(tr("🗣 伝言の使い方を送りました"), true);
+        }
+    }
+
     /// セッションの増減を supervisor / coordinator へ反映する。
     ///
     /// 起動・削除・再起動 (再起動は ID が変わる) をここ 1 か所で拾うので、
@@ -204,6 +321,10 @@ impl ZaivernApp {
                 self.typed_sup.insert(s.id, true);
             }
         }
+
+        // **エージェント同士の伝言を配る。** 見張りが切られていても回す —
+        // 伝言は見張りの機能ではなく、エージェント同士の通信路なので。
+        self.deliver_agent_talk();
 
         if !self.cfg.supervisor.enabled {
             return;

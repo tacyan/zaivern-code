@@ -74,7 +74,17 @@ pub enum Unassigned {
     /// 担当ファイルが他タスクと重なる。
     FileOverlap { task: TaskId, with: TaskId },
     /// レビュー担当が実装担当と同じになってしまう。
+    ///
+    /// **一時的**。ほかのエージェントは居るが今は塞がっているだけなので、
+    /// 誰かが終われば配れる。人へ上げると、勝手に解決したあとも消えない
+    /// 判断が積み上がる。
     ReviewerWouldBeAuthor(TaskId),
+    /// 実装担当**以外のエージェントが 1 体も居ない**。
+    ///
+    /// [`Unassigned::ReviewerWouldBeAuthor`] と違い、**待っても解決しない**
+    /// (自分のレビューは禁止なので、この Run のままでは永久に配れない)。
+    /// 人が並列数を増やすか、レビュー無しにするしかない。
+    NoOtherReviewer(TaskId),
 }
 
 impl Unassigned {
@@ -83,7 +93,8 @@ impl Unassigned {
             Unassigned::NoCandidate(t)
             | Unassigned::CapsMissing { task: t, .. }
             | Unassigned::FileOverlap { task: t, .. }
-            | Unassigned::ReviewerWouldBeAuthor(t) => *t,
+            | Unassigned::ReviewerWouldBeAuthor(t)
+            | Unassigned::NoOtherReviewer(t) => *t,
         }
     }
 
@@ -101,6 +112,9 @@ impl Unassigned {
             }
             Unassigned::ReviewerWouldBeAuthor(t) => {
                 format!("#{t}: 実装した本人しかレビュー候補がいません")
+            }
+            Unassigned::NoOtherReviewer(t) => {
+                format!("#{t}: レビューできるエージェントが実装担当のほかに居ません")
             }
         }
     }
@@ -215,12 +229,28 @@ pub fn plan_assignments(
 
         if pool.is_empty() {
             // 候補が居ないのか、本人しか居ないのかを区別して伝える。
+            //
+            // **空集合に `all` を撃たない。** 「誰も空いていない」ときも
+            // `all` は真を返すので、素直に書くと*ただ混んでいるだけ*の
+            // レビューが「実装した本人しかレビュー候補がいません」になる。
+            // 実機ではこれが 5 件積み上がり、待っても消えなかった
+            // (混雑は次の tick で解ける — 人へ上げる話ではない)。
+            let free_now: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| c.free() && !taken.contains(&c.session))
+                .collect();
             let only_author = author_session.is_some()
-                && candidates
+                && !free_now.is_empty()
+                && free_now.iter().all(|c| Some(c.session) == author_session);
+            // **待っても解決しない**のは、実装担当以外が 1 体も居ないとき
+            // だけ (空いているかどうかではない)。
+            let no_other = author_session.is_some()
+                && !candidates
                     .iter()
-                    .filter(|c| c.free() && !taken.contains(&c.session))
-                    .all(|c| Some(c.session) == author_session);
-            out.unassigned.push(if only_author {
+                    .any(|c| Some(c.session) != author_session);
+            out.unassigned.push(if no_other {
+                Unassigned::NoOtherReviewer(t.id)
+            } else if only_author {
                 Unassigned::ReviewerWouldBeAuthor(t.id)
             } else {
                 Unassigned::NoCandidate(t.id)
@@ -393,10 +423,26 @@ mod tests {
         let mut rev = ready(2, "rev", &[]);
         rev.review_of = Some(1);
         let tasks = vec![impl_t, rev];
-        // 空きが実装担当 (session 1) だけ → 配らない
+        // **実装担当しか居ない → 待っても解決しない。**
         let only_author = vec![cand(1, SessionState::Idle, &[])];
         let p = plan_assignments(&tasks, &only_author, &BTreeMap::new());
-        assert_eq!(p.unassigned, vec![Unassigned::ReviewerWouldBeAuthor(2)]);
+        assert_eq!(p.unassigned, vec![Unassigned::NoOtherReviewer(2)]);
+        // **他は居るが今は塞がっている → 一時的。**
+        // 次の tick で空けば配れるので、`NoOtherReviewer` にしてはいけない。
+        let mut busy = cand(2, SessionState::Working, &[]);
+        busy.holding = Some(9);
+        let one_free = vec![cand(1, SessionState::Idle, &[]), busy];
+        let p3 = plan_assignments(&tasks, &one_free, &BTreeMap::new());
+        assert_eq!(p3.unassigned, vec![Unassigned::ReviewerWouldBeAuthor(2)]);
+        // **誰一人空いていない → ただ混んでいるだけ。**
+        // 空集合へ `all` を撃つと真になるので、素直に書くとここが
+        // 「実装した本人しか居ない」に化けて人の判断待ちが積み上がる。
+        let mut a = cand(1, SessionState::Working, &[]);
+        a.holding = Some(8);
+        let mut b = cand(2, SessionState::Working, &[]);
+        b.holding = Some(9);
+        let p4 = plan_assignments(&tasks, &[a, b], &BTreeMap::new());
+        assert_eq!(p4.unassigned, vec![Unassigned::NoCandidate(2)]);
         // 別のセッションが居れば、そちらへ配る
         let two = vec![
             cand(1, SessionState::Idle, &[]),

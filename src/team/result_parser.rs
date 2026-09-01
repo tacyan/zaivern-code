@@ -599,6 +599,191 @@ impl MessageReject {
     }
 }
 
+/// **エージェントが手で書く JSON は、素直には読めない。**
+///
+/// 実測 (Team Run 1 本・19 通) で 5 通が読めず、内訳は 4 通りだった:
+///
+/// | 実際に来たもの | serde の言い分 |
+/// |---|---|
+/// | `"text": "彼は "yes" と言った"` | `expected ',' or '}'` |
+/// | `"to": "a" "text": "b"` (カンマ抜け) | `expected ',' or '}'` |
+/// | `"text": "x",}` (末尾カンマ) | `trailing comma` |
+/// | `"text": "C:\path"` (Windows パス) | `invalid escape` |
+///
+/// どれも**人間が読めば意味は明らか**なのに、1 通まるごと捨てていた。
+/// 伝言が落ちると相手は待ち続けるので、落とす代償が大きい。
+///
+/// そこで JSON の文法には頼らず、`to` と `text` の値を直接取り出す。
+/// 鍵は 2 つしかないので、これで曖昧さは出ない:
+///
+/// * `to` — 短い識別子。**最初の**閉じ引用符まで
+/// * `text` — 自由文。**最後の**閉じ引用符まで (中の `"` を巻き込む)
+///
+/// **`serde` を置き換えない。** 正しい JSON は今までどおり `serde` が読む
+/// ([`check_message`] が先に試す)。ここは読めなかったときの受け皿で、
+/// 読めた振りをしない — 鍵が見つからなければ `None` を返して断りに戻す。
+fn lenient_message(s: &str) -> Option<MessageDoc> {
+    let to_at = key_value_start(s, "to")?;
+    let text_at = key_value_start(s, "text")?;
+    // `to` は最初の閉じ引用符まで (識別子に `"` は入らない)。
+    let to_end = closing_quote(s, to_at, false)?;
+    // `text` は最後の閉じ引用符まで。ただし `to` が後ろにあるなら、
+    // その手前で止める (`to` の値の引用符を巻き込まないため)。
+    //
+    // **括弧の外まで飲み込まない。** 塊の中に後書き (`}` のあとの一行など)
+    // が混じることがあり、そこに `"` があると本文が伸びてしまう。
+    let mut limit = s.rfind('}').unwrap_or(s.len());
+    if to_at > text_at {
+        limit = limit.min(key_pos(s, "to").unwrap_or(s.len()));
+    }
+    let limit = limit.max(text_at);
+    let text_end = closing_quote(&s[..limit], text_at, true)?;
+    Some(MessageDoc {
+        to: unescape_lenient(&s[to_at..to_end]),
+        text: unescape_lenient(&s[text_at..text_end]),
+    })
+}
+
+/// `"<key>"` という**鍵**の開始位置。値ではない。
+fn key_pos(s: &str, key: &str) -> Option<usize> {
+    let pat = format!("\"{key}\"");
+    let mut from = 0usize;
+    while let Some(i) = s[from..].find(&pat) {
+        let at = from + i;
+        // 鍵の後ろは `:` (空白は挟んでよい)。値の中の同じ綴りを拾わない。
+        let rest = s[at + pat.len()..].trim_start();
+        if rest.starts_with(':') {
+            return Some(at);
+        }
+        from = at + pat.len();
+    }
+    None
+}
+
+/// `"<key>": "` の**値の中身**が始まる位置。
+fn key_value_start(s: &str, key: &str) -> Option<usize> {
+    let at = key_pos(s, key)?;
+    let after = at + key.len() + 2;
+    let rest = &s[after..];
+    let colon = rest.find(':')?;
+    let tail = &rest[colon + 1..];
+    let quote = tail.len() - tail.trim_start().len();
+    if !tail[quote..].starts_with('"') {
+        return None;
+    }
+    Some(after + colon + 1 + quote + 1)
+}
+
+/// `from` から見て、**エスケープされていない** `"` の位置。
+///
+/// `last` なら最後のもの、そうでなければ最初のもの。
+fn closing_quote(s: &str, from: usize, last: bool) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut found = None;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                found = Some(i);
+                if !last {
+                    return found;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
+/// JSON のエスケープを解く。**知らない綴りはそのまま残す。**
+///
+/// `C:\path` の `\p` を「不正」として 1 通捨てるより、`\p` のまま
+/// 届けるほうが利用者の役に立つ。
+fn unescape_lenient(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let hex: String = it.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    // 読めなければ**元の綴りを残す** (黙って消さない)。
+                    None => {
+                        out.push('\\');
+                        out.push('u');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// **伝言 1 通を読む。ここが伝言の読み方の唯一の置き場。**
+///
+/// Team Run と通常タブで**同じ 1 つを使う** — 2 つ持つと、片方だけが
+/// 綴り間違いを拾えるようになって「Team では届くのに通常タブでは届かない」
+/// という説明できない差が出る。番人は
+/// `cli::tests::伝言の読み手はひとつだけ`。
+pub fn read_message(body: &str) -> Result<MessageDoc, MessageReject> {
+    // **正しい JSON はこれまでどおり `serde` が読む。**
+    // 読めなかったときだけ、鍵を直接拾う受け皿へ落ちる
+    // (`lenient_message` の表に、実際に来た 4 通りが載っている)。
+    let src = escape_raw_controls(body);
+    let mut doc: MessageDoc = match serde_json::from_str(&src) {
+        Ok(d) => d,
+        Err(e) => lenient_message(&src).ok_or(MessageReject::BadJson(e.to_string()))?,
+    };
+    // **整形もここで済ませる。** 呼ぶ側で `trim` と上限を書くと、
+    // 片方だけ上限が違う伝言が届く。
+    doc.to = doc.to.trim().to_string();
+    doc.text = doc.text.trim().chars().take(MSG_MAX_CHARS).collect();
+    Ok(doc)
+}
+
+/// **伝言の作法の文面。ここが唯一の置き場。**
+///
+/// Team の指示文 (`prompt::teammates_section`) と、通常タブへ教える文面
+/// (`agent_talk::how_to`) が同じものを使う。2 つ書くと、片方だけに
+/// 「エスケープの書き方」が載っている状態になって、そちらのエージェントだけ
+/// 伝言を落とす。
+///
+/// `target_hint` は宛先の書き方 (Team は ID / 役割、通常タブはタブの名前)。
+pub fn message_howto(target_hint: &str) -> String {
+    format!(
+        "{MSG_OPEN}\n\
+         {{\"to\": \"{target_hint}\", \"text\": \"伝えたいことを 1〜3 行で\"}}\n\
+         {MSG_CLOSE}\n\n\
+         * 伝えるのは**相手の仕事が変わるとき**だけ。実況中継はしない\n\
+         * 本文は {MSG_MAX_CHARS} 文字まで。長い成果物はファイルに書いて、場所だけ伝える\n\
+         * 相手が居ない宛先を書かない (届かず、こちらに断りが記録されます)\n\
+         * 本文の `\"` は `\\\"`、`\\` は `\\\\` と書く \
+         (Windows のパスは区切りを 2 つ重ねる)。書けていなくても読み取りますが、\
+         `\\t` などは制御文字として読まれます\n"
+    )
+}
+
 /// 伝言を読んで、宛先を**実在の担当**へ解決する。
 ///
 /// `known` は `(エージェント ID, 役割キー)` の一覧。
@@ -612,13 +797,12 @@ pub fn check_message(
     known: &[(AgentId, String)],
     from: &AgentId,
 ) -> Result<(Vec<AgentId>, String), MessageReject> {
-    let doc: MessageDoc = serde_json::from_str(&escape_raw_controls(body))
-        .map_err(|e| MessageReject::BadJson(e.to_string()))?;
-    let to = doc.to.trim();
+    let doc = read_message(body)?;
+    let to = doc.to.as_str();
     if to.is_empty() {
         return Err(MessageReject::NoTarget);
     }
-    let text: String = doc.text.trim().chars().take(MSG_MAX_CHARS).collect();
+    let text = doc.text;
     if text.is_empty() {
         return Err(MessageReject::Empty);
     }
@@ -1496,4 +1680,131 @@ mod tests {
         assert_eq!(escape_raw_controls(done), done, "二重にエスケープしている");
     }
 
+}
+
+
+#[cfg(test)]
+mod lenient_message_tests {
+    use super::*;
+
+    fn known() -> Vec<(AgentId, String)> {
+        vec![
+            (AgentId("reviewer-1".into()), "reviewer".into()),
+            (AgentId("impl-1".into()), "implementer".into()),
+        ]
+    }
+
+    fn read(body: &str) -> Result<(Vec<AgentId>, String), MessageReject> {
+        check_message(body, &known(), &AgentId("impl-1".into()))
+    }
+
+    /// **実測で落ちていた 4 通りが、全部届く。**
+    ///
+    /// Team Run 1 本 (19 通) のうち 5 通がこれで捨てられていた。
+    /// 伝言が落ちると相手は待ち続けるので、落とす代償が大きい。
+    #[test]
+    fn 手書きのjsonの綴り間違いでも届く() {
+        // 1) 本文に生の `"` (いちばん多い)
+        let (to, text) = read(r#"{"to": "reviewer-1", "text": "彼は "yes" と言った"}"#)
+            .expect("生の引用符で落ちた");
+        assert_eq!(to, vec![AgentId("reviewer-1".into())]);
+        assert_eq!(text, r#"彼は "yes" と言った"#);
+        // 2) 鍵の間のカンマ抜け
+        let (_, text) =
+            read(r#"{"to": "reviewer-1" "text": "カンマが無い"}"#).expect("カンマ抜けで落ちた");
+        assert_eq!(text, "カンマが無い");
+        // 3) 末尾カンマ
+        let (_, text) = read(r#"{"to": "reviewer-1", "text": "末尾カンマ",}"#)
+            .expect("末尾カンマで落ちた");
+        assert_eq!(text, "末尾カンマ");
+        // 4) Windows パス (`\U` / `\m` は JSON の不正エスケープ)
+        let (_, text) =
+            read(r#"{"to": "reviewer-1", "text": "C:\Users\me を見て"}"#).expect("パスで落ちた");
+        assert_eq!(text, r"C:\Users\me を見て", "知らない綴りを消してしまった");
+    }
+
+    /// **区別が付かないものは、付かないと認める。**
+    ///
+    /// `\t` / `\n` は JSON の正当なエスケープなので、`C:\temp` と
+    /// 「タブ + emp」を**入力からは見分けられない** (serde も同じ)。
+    /// ここは正しい JSON と同じ読み方に揃える — 1 通まるごと捨てるよりは、
+    /// 一部が化けても届いたほうが相手の仕事が進む。
+    ///
+    /// 直したいなら**入力の側**を変えるしかない (指示文で「パスは
+    /// `\\` で書く」と教える)。読み手側では決められない。
+    #[test]
+    fn 正当なエスケープと紛れるパスは化ける() {
+        let (_, text) =
+            read(r#"{"to": "reviewer-1", "text": "C:\temp の "log" を見て"}"#).unwrap();
+        assert_eq!(text, "C:\temp の \"log\" を見て".replace("\\t", "\t"));
+        assert!(text.contains('\t'), "タブとして読まれていない");
+        assert!(text.contains(r#""log""#), "伝言そのものは届いている");
+    }
+
+    /// **正しい JSON の読み方は 1 ミリも変えない。**
+    ///
+    /// 受け皿は「読めなかったとき」だけ通る。ここが変わると、いままで
+    /// 届いていた 14 通の意味が黙って変わる。
+    #[test]
+    fn 正しいjsonはこれまでどおり() {
+        let (to, text) = read(r#"{"to": "all", "text": "改行\nと \"引用符\" と \\ "}"#).unwrap();
+        assert_eq!(to, vec![AgentId("reviewer-1".into())], "all は自分を除く");
+        assert_eq!(text, "改行\nと \"引用符\" と \\");
+    }
+
+    /// **読めた振りをしない。** 鍵が無いものは今までどおり断る。
+    /// 拾えなかったものを黙って空の伝言にすると、盤面には「伝えた」と
+    /// 出るのに中身が無い、という嘘になる。
+    #[test]
+    fn 鍵が無いものは断る() {
+        assert!(matches!(
+            read(r#"{"dest": "reviewer-1", "body": "鍵の名前が違う"}"#),
+            Err(MessageReject::BadJson(_))
+        ));
+        assert!(matches!(read("ただの文章です"), Err(MessageReject::BadJson(_))));
+        // 宛先が空 / 本文が空は、受け皿を通っても断る。
+        assert!(matches!(
+            read(r#"{"to": "", "text": "宛先が空"}"#),
+            Err(MessageReject::NoTarget)
+        ));
+        assert!(matches!(
+            read(r#"{"to": "reviewer-1", "text": "  "}"#),
+            Err(MessageReject::Empty)
+        ));
+        // 居ない相手は捏造しない。
+        assert!(matches!(
+            read(r#"{"to": "居ない人", "text": "やあ "君" "}"#),
+            Err(MessageReject::UnknownTarget(_))
+        ));
+    }
+
+    /// **鍵の順番が逆でも読める。** `text` を「最後の引用符まで」と読むので、
+    /// 後ろに `to` があるとその値まで飲み込みかねない。
+    #[test]
+    fn 鍵の順番が逆でも本文を飲み込まない() {
+        let (to, text) =
+            read(r#"{"text": "先に本文 "引用" あり", "to": "reviewer-1"}"#).expect("読めない");
+        assert_eq!(to, vec![AgentId("reviewer-1".into())]);
+        assert_eq!(text, r#"先に本文 "引用" あり"#);
+    }
+
+    /// **括弧の外の文字を本文へ引き込まない。**
+    ///
+    /// 画面から切り出した塊には、`}` のあとに別の行が混じることがある。
+    /// 「最後の引用符まで」を素直にやると、そこまで本文になる。
+    #[test]
+    fn 括弧の外の後書きを飲み込まない() {
+        let (_, text) = read(
+            "{\"to\": \"reviewer-1\", \"text\": \"本文 \"引用\" あり\"}\n書き終わり \"余談\"",
+        )
+        .expect("読めない");
+        assert_eq!(text, "本文 \"引用\" あり");
+    }
+
+    /// **本文の中に鍵と同じ綴りがあっても惑わされない。**
+    #[test]
+    fn 本文の中の鍵らしい綴りを拾わない() {
+        let (_, text) = read(r#"{"to": "reviewer-1", "text": "\"to\": を説明する"}"#).unwrap();
+        assert_eq!(text, r#""to": を説明する"#);
+    }
 }

@@ -153,16 +153,8 @@ fn teammates_section(mates: &[(String, String)]) -> String {
         "\n## チームの仲間\n{list}\n\
          区切りが付いたときや、相手が待っていることが分かったときは、\
          次の形で**その相手へ直接伝えてください** (Zaivern が相手の端末へ届けます)。\n\n\
-         {open}\n\
-         {{\"to\": \"<上の ID か役割、全員なら all>\", \
-         \"text\": \"ここまで出来た / 次にこれをする、を 1〜3 行で\"}}\n\
-         {close}\n\n\
-         * 伝えるのは**相手の仕事が変わるとき**だけ。実況中継はしない\n\
-         * 本文は {max} 文字まで。長い成果物はファイルに書いて、場所だけ伝える\n\
-         * 相手が居ない ID を書かない (届かず、こちらに断りが記録されます)\n",
-        open = super::result_parser::MSG_OPEN,
-        close = super::result_parser::MSG_CLOSE,
-        max = super::result_parser::MSG_MAX_CHARS,
+         {howto}",
+        howto = super::result_parser::message_howto("<上の ID か役割、全員なら all>"),
     )
 }
 
