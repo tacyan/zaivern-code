@@ -1021,6 +1021,22 @@ pub static PROMPT_RULES: &[PromptRule] = &[
         reply: b"\r",
         desc: "Antigravity の編集受け入れに Enter",
     },
+    // **Claude Code のフォルダ信頼確認。既定は「No, exit」。**
+    //
+    // ここへ素の Enter を送ると**セッションが終了する** (実機で
+    // `× 終了 (code 1)` を観測。Team が新しいフォルダで担当を起こすたびに
+    // 起きる)。肯定は 1 つ下にあるので、**下へ移動してから確定**する。
+    //
+    // 汎用のヒューリスティックは "No, exit" を打ち消し語として持っている
+    // ので、この規則が無いと**誰も答えないまま終わる**。守りとしては
+    // 正しいが、答えないままでは進まない。
+    PromptRule {
+        agent: "claude",
+        needles: &["Yes, I trust this folder", "No, exit"],
+        avoid: &[],
+        reply: b"\x1b[B\r",
+        desc: "Claude Code のフォルダ信頼確認 (既定が No, exit なので下へ移動してから確定)",
+    },
     // フォルダ信頼確認 (起動直後)。肯定が既定選択。
     PromptRule {
         agent: "agy",

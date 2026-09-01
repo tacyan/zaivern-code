@@ -12939,6 +12939,35 @@ mod cjk_tests {
         assert_eq!(state, "にほ");
     }
 
+    /// **フォルダ信頼確認へ素の Enter を送らない (既定が「No, exit」)。**
+    ///
+    /// 実機で Team が新しいフォルダ (`~/dev/Test5`) に担当を起こすたび、
+    /// Claude Code が `× 終了 (code 1)` で落ちていた。**落としていたのは
+    /// Zaivern 自身**だった:
+    ///
+    /// 1. この画面が「承認待ち」と認識されない (`auto_yes_reply_for` が
+    ///    `None` を返し、`ATTENTION_PATTERNS` にも当たらない)
+    /// 2. だから指示の配達が止まらず、本文を打ち込んで確定キーを送る
+    /// 3. 既定の選択は `No, exit` なので、Enter は**終了**を選ぶ
+    ///
+    /// 肯定は 1 つ下にあるので、**下へ移動してから確定**する。
+    #[test]
+    fn claude_のフォルダ信頼確認は下へ移動してから確定する() {
+        let screen = "Accessing workspace:\n\n/Users/me/dev/Test5\n\n\
+             Quick safety check: Is this a project you created or one you trust?\n\n\
+             Claude Code'll be able to read, edit, and execute files here.\n\n\
+             Security guide\n\n\
+             \u{203a} No, exit\n  Yes, I trust this folder\n\n\
+             Enter to confirm \u{b7} Esc to cancel";
+        let (keys, _why) = super::auto_yes_reply_for(screen, Some("claude"))
+            .expect("承認待ちとして認識できる (認識しないと本文を打ち込んで終了させる)");
+        assert_eq!(
+            keys, b"\x1b[B\r",
+            "下へ移動してから確定していない (素の Enter は No, exit を選ぶ)"
+        );
+        assert_ne!(keys, b"\r", "素の Enter はセッションを終了させる");
+    }
+
     /// 変換中のキー (Enter / 矢印 / Escape) は IME に渡し、端末へは送らないこと。
     #[test]
     fn keys_during_composition_go_to_the_ime() {
