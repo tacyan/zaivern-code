@@ -329,6 +329,13 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             // 本文を書いてから確定までの間に承認プロンプトが出たら、
             // Enter は承認への回答になる。撃たずに落ち着くのを待つ。
             if peek.attention {
+                // **待ち続けない。** ここには上限が無かったので、承認待ちが
+                // 続く相手では**本文を入力欄に置いたまま永久に止まって**いた
+                // (実機: 指示が入力欄に見えているのに何分経っても送られない)。
+                // 送ってしまうと承認への回答になるので、送らずに**人へ返す**。
+                if since_queued >= GIVE_UP {
+                    return Act::GaveUp;
+                }
                 return Act::Wait(POLL);
             }
             Act::WriteCommit
@@ -337,15 +344,25 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             if since_stage < VERIFY_DELAY {
                 return Act::Wait(VERIFY_DELAY - since_stage);
             }
+            let stuck = still_pending(peek.input.as_deref(), &tail_key(&job.text));
             if job.tries >= MAX_COMMIT_TRIES {
-                return Act::Done;
+                // **届かなかったことを黙って完了にしない。** 入力欄に本文が
+                // 残っているなら、それは届いていない証拠。呼び出し元
+                // (Team の配達や Issue 着手) が撃ち直せるよう、失敗として返す。
+                return if stuck { Act::GaveUp } else { Act::Done };
             }
             // 撃ち直しは「承認プロンプトが出ていない」かつ
             // 「入力欄に本文がまだ見えている」ときだけ。
             if peek.attention {
-                return Act::Done;
+                return if stuck && since_queued >= GIVE_UP {
+                    Act::GaveUp
+                } else if stuck {
+                    Act::Wait(POLL)
+                } else {
+                    Act::Done
+                };
             }
-            if still_pending(peek.input.as_deref(), &tail_key(&job.text)) {
+            if stuck {
                 Act::WriteCommit
             } else {
                 Act::Done
@@ -578,7 +595,57 @@ mod tests {
             tries: MAX_COMMIT_TRIES,
             ..Job::user(1, text)
         };
-        assert_eq!(decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+        // **撃ち直しは止まる。ただし「完了」とは言わない。**
+        //
+        // 入力欄に本文が残っているのは届いていない証拠なので、
+        // 以前のように `Done` を返すと**届かなかったものを届いたことにする**。
+        // 呼び出し元は永久に気付けず、実機では指示が入力欄に見えたまま
+        // 何分も止まっていた。
+        let got = decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY);
+        assert_eq!(got, Act::GaveUp);
+        assert_ne!(got, Act::WriteCommit, "上限を超えて撃ち直している");
+        // 入力欄から消えていれば、届いたので完了でよい。
+        let sent = Peek {
+            input: Some(String::new()),
+            ..peek_ready()
+        };
+        assert_eq!(decide(&job, &sent, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+    }
+
+    /// **承認待ちのまま止まり続けない。**
+    ///
+    /// 本文を書いたあと確定キーを送る段には上限が無く、承認プロンプトが
+    /// 出ている相手では**入力欄に本文を置いたまま永久に待って**いた
+    /// (実機: 指示が見えているのに何分経っても送られない)。
+    /// 送ってしまうと承認への回答になるので、送らずに人へ返す。
+    #[test]
+    fn 承認待ちで止まったままにしない() {
+        let text = "やってください";
+        let peek = Peek {
+            attention: true,
+            input: Some(text.into()),
+            ..peek_ready()
+        };
+        for stage in [Stage::Commit, Stage::Verify] {
+            let job = Job {
+                stage,
+                ..Job::user(1, text)
+            };
+            // 上限までは待つ (承認が終われば送れるので、すぐ諦めない)。
+            assert!(
+                matches!(
+                    decide(&job, &peek, VERIFY_DELAY, Duration::from_secs(1)),
+                    Act::Wait(_)
+                ),
+                "stage={stage:?}: すぐ諦めている"
+            );
+            // 上限を超えたら**人へ返す** (黙って待ち続けない)。
+            assert_eq!(
+                decide(&job, &peek, VERIFY_DELAY, GIVE_UP),
+                Act::GaveUp,
+                "stage={stage:?}: 承認待ちのまま止まり続けている"
+            );
+        }
     }
 
     /// 入力欄が読めないときは撃ち直さない (誤爆より取りこぼしを選ぶ)。

@@ -155,9 +155,16 @@ fn エージェント起動は既存経路を通る() {
 fn 指示の送信は既存の一本を通る() {
     let s = src(GLUE);
     let body = function_body(&s, s.find("fn team_run_effects").expect("実行の橋"));
+    // **一括送信と同じ形で積む** (`Job::user` = Idle を待たない)。
+    // `deferred` は相手が Idle になるまで待つので、静かにならない CLI では
+    // 本文を書く前に待ち続ける — 実機で指示が何分経っても届かなかった。
     assert!(
-        body.contains("crate::submit::Job::deferred(") && body.contains("self.queue_submit(job)"),
+        body.contains("crate::submit::Job::user(") && body.contains("self.queue_submit(job)"),
         "既存の送信経路 (submit) を通っていない:\n{body}"
+    );
+    assert!(
+        !body.contains("Job::deferred("),
+        "Idle を待つ形が残っている (静かにならない相手へ永久に届かない):\n{body}"
     );
     // **配達の結末を受け取れる形で積む。** 目印が無いと、積めたことしか
     // 分からず、相手が消えても Runtime は「届いた」と信じ続ける。

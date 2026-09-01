@@ -1725,16 +1725,6 @@ icon = "⚡"
 command = "codex --dangerously-bypass-approvals-and-sandbox"
 
 [[agents]]
-name = "Gemini CLI"
-icon = "✨"
-command = "gemini"
-
-[[agents]]
-name = "Gemini CLI (全自動)"
-icon = "⚡"
-command = "gemini --yolo"
-
-[[agents]]
 name = "Antigravity"
 icon = "🚀"
 command = "agy"
@@ -4632,8 +4622,6 @@ mod tests {
                 "Claude Code (全自動)",
                 "Codex",
                 "Codex (全自動)",
-                "Gemini CLI",
-                "Gemini CLI (全自動)",
                 "Antigravity",
                 "Antigravity (全自動)",
                 "Cursor",
@@ -4699,15 +4687,7 @@ mod tests {
                 .filter(|a| !a.name.contains("全自動"))
                 .map(|a| a.command.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "claude",
-                "codex",
-                "gemini",
-                "agy",
-                "cursor-agent",
-                "droid",
-                ""
-            ]
+            vec!["claude", "codex", "agy", "cursor-agent", "droid", ""]
         );
     }
 
@@ -4896,8 +4876,18 @@ command = "agy"
         let bare: Config = toml::from_str("theme = \"zaivern-dark\"").expect("読める");
         assert_eq!(bare.agents.len(), default_agents().len());
         assert!(
-            bare.agents.iter().any(|a| a.command == "gemini"),
+            bare.agents.iter().any(|a| a.command == "agy"),
             "新しく足した CLI が既定に出てこない"
+        );
+        // **既定から外した CLI は出てこない。** カタログには残してあるので、
+        // 自分で `config.toml` に書いている人の設定は今までどおり動く。
+        assert!(
+            !bare.agents.iter().any(|a| a.command.starts_with("gemini")),
+            "既定から外した CLI が出ている"
+        );
+        assert!(
+            agents::spec_for_bin("gemini").is_some(),
+            "カタログから消すと、既に設定している人のプリセットが解決できなくなる"
         );
 
         // 新しい既定はそのまま書き出して読み戻せる (往復で欠けない)

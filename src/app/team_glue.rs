@@ -283,7 +283,14 @@ impl ZaivernApp {
                 // Run を添えないと、Run を作り直したあとに前の Run の配達が
                 // 終わったとき、**同じ番号の別のタスク**の指示を完了に
                 // してしまう (積んだ仕事は Run の切り替えでは消えない)。
-                let mut job = crate::submit::Job::deferred(session, text, true);
+                // **一括送信と同じ形で送る** (`Job::user` = Idle を待たない)。
+                //
+                // `deferred` は「相手が Idle になるまで待つ」ので、静かに
+                // ならない CLI では**本文を書く前に待ち続ける**。実機では
+                // 指示が何分経っても届かなかった。一斉送信 (Cockpit /
+                // スマホの一括送信) は前から `user` で送っていて確実に届く
+                // ので、同じ経路へ揃える。
+                let mut job = crate::submit::Job::user(session, text);
                 job.tag = panel::with_panel(|p| p.delivery_tag(&key));
                 self.queue_submit(job)
             };
@@ -318,7 +325,8 @@ impl ZaivernApp {
                 self.toast(why, false);
                 continue;
             }
-            let mut job = crate::submit::Job::deferred(session, text, true);
+            // 人が出した指示も一括送信と同じ形で (待たせない)。
+            let mut job = crate::submit::Job::user(session, text);
             job.tag = panel::with_panel(|p| p.delivery_tag(&key));
             if !self.queue_submit(job) {
                 panel::with_panel(|p| p.note_manual_failed(&key, "送信キューへ積めませんでした"));

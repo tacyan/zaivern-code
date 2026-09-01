@@ -375,8 +375,25 @@ pub fn launch_args_for(bin: &str) -> &'static str {
 /// [`AGENT_CATALOG`] 全件を出すので、いつでもプリセットに追加できる。
 /// 既定を短く保つのは、初回のプルダウンが 60 行になるのを避けるため。
 /// **この機で `--help` を実行して全項目を確認できた CLI だけ**を並べている。
-pub const DEFAULT_PRESET_BINS: &[&str] =
-    &["claude", "codex", "gemini", "agy", "cursor-agent", "droid"];
+///
+/// **gemini は外してある。** 利用者の判断でサービスを使わないため、既定の
+/// プルダウンには出さない。カタログ ([`AGENT_CATALOG`]) には残してあるので、
+/// 既に `config.toml` へ書いている人の設定は今までどおり動く
+/// (カタログごと消すと、その人のプリセットが黙って解決できなくなる)。
+pub const DEFAULT_PRESET_BINS: &[&str] = &["claude", "codex", "agy", "cursor-agent", "droid"];
+
+/// **選択肢に出さない CLI。**
+///
+/// カタログ ([`AGENT_CATALOG`]) からは消さない — 消すと、既に
+/// `config.toml` へ書いている人のプリセットが「AI CLI ではないもの」に
+/// なり、承認モードの判定も自動承認フラグの付け外しも効かなくなる
+/// (黙って別物になるのがいちばん困る)。**新しく選ばせないだけ**にする。
+pub const RETIRED_BINS: &[&str] = &["gemini"];
+
+/// この CLI はもう選択肢に出さないか。
+pub fn is_retired(bin: &str) -> bool {
+    RETIRED_BINS.contains(&bin)
+}
 
 /// 実行ファイル名の別名表。
 ///
