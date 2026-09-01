@@ -437,6 +437,25 @@ impl StaticPlanner {
         } else {
             input.roles.clone()
         };
+
+        // **SPEC が既に役割で割れているなら、同じ役割の仕事を二重に置かない。**
+        //
+        // 実機で 13 本の計画のうち 4 本 (`#1 分割と受入基準` / `#2 設計` /
+        // `#12 テスト` / `#13 最終統合`) が**まるごと重複**していた。SPEC 側に
+        // すでに `planner:` `architect:` `tester:` `integrator:` の担当が
+        // あったのに、その上へ同じ役割の骨組みをもう一度積んでいた。
+        //
+        // 害は本数だけではない。骨組みの `テスト` は**全実装の完了に依存し**、
+        // `最終統合` は**全部に依存する**ので、重複したぶんがそのまま
+        // *待ち*になる。1 時間かけてホームページの index.html すら
+        // 出来なかった Run で、この 4 本は**1 度も動かなかった**。
+        //
+        // 段取りが仕事より高くつくなら、そのチームは 1 体より遅い。
+        let covered: std::collections::BTreeSet<R> = raw_tasks
+            .iter()
+            .map(|t| super::plan_schema::role_of("", t))
+            .collect();
+        let want = |r: R| roles.contains(&r) && !covered.contains(&r);
         let mut teams = vec![TeamDoc {
             key: "implementation".into(),
             name: "Implementation".into(),
@@ -491,7 +510,7 @@ impl StaticPlanner {
         // 盤面の「1. Goal の分析」も、担当するタスクが 1 件も無いせいで
         // **何もしていないのに ✓** と出ていた ([`super::graph::phases`] は
         // 空のフェーズを「通過済み」として扱う)。
-        let plan_key = roles.contains(&R::Planner).then(|| {
+        let plan_key = want(R::Planner).then(|| {
             let key = "plan".to_string();
             tasks.push(TaskDoc {
                 key: key.clone(),
@@ -515,7 +534,7 @@ impl StaticPlanner {
             key
         });
         // 設計担当を選んだなら、実装の前に 1 本置く (実装はこれに依存する)。
-        let design_key = roles.contains(&R::Architect).then(|| {
+        let design_key = want(R::Architect).then(|| {
             let key = "design".to_string();
             tasks.push(TaskDoc {
                 key: key.clone(),
@@ -551,7 +570,11 @@ impl StaticPlanner {
                 title: label.clone(),
                 description: format!("{}\n\n出典: {}", label, input.source),
                 team: "implementation".into(),
-                role: "implementer".into(),
+                // **見出しが役割を名乗っているなら、その役割で立てる。**
+                // 一律 `implementer` にすると、テストにもレビューにも統合にも
+                // 「あなたは実装担当です」という指示文が飛ぶ
+                // (指示文を選ぶ根拠がこの欄しかない)。
+                role: super::plan_schema::role_of("", &label).key().to_string(),
                 // **既に分割されている SPEC では、実装を待たせない。**
                 //
                 // 計画 → 設計 → 実装 と直列に繋ぐと、実装が 8 件並べる計画でも
@@ -586,7 +609,7 @@ impl StaticPlanner {
         // 以前は Tester を選んでも QA のレーンが空のまま立つだけで、
         // **テスト担当の仕事が 1 件も作られなかった** (選べるのに何も
         // 変わらない = 押せるのに何も起きないボタンと同じ嘘)。
-        let test_key = roles.contains(&R::Tester).then(|| {
+        let test_key = want(R::Tester).then(|| {
             let key = "test".to_string();
             tasks.push(TaskDoc {
                 key: key.clone(),
@@ -619,6 +642,9 @@ impl StaticPlanner {
             .chain(plan_key.clone())
             .chain(design_key.clone())
             .collect();
+        // **統合は既定で置く** (役割の選択とは無関係)。SPEC 側に統合担当が
+        // 居るときだけ、二重になるので置かない。
+        if !covered.contains(&R::Integrator) {
         tasks.push(TaskDoc {
             key: "integrate".into(),
             title: "最終統合と全体検証".into(),
@@ -637,6 +663,7 @@ impl StaticPlanner {
             ],
             validation_commands: validations,
         });
+        }
 
         Ok(PlanDoc {
             goal: GoalDoc {
@@ -766,7 +793,7 @@ mod tests {
     /// 必ず断られる (`detect` が相対パスを cwd 基準で解決してしまう事故を
     /// 防ぐため、空は明示的に弾いてある)。だからここを使うテストの SPEC は
     /// 検証を自分で書く。自動決定そのものは `検証を自動決定する` 群が見る。
-    fn input(spec: &str) -> PlanInput {
+    pub(super) fn input(spec: &str) -> PlanInput {
         PlanInput {
             spec: spec.to_string(),
             source: "SPEC.md".into(),
@@ -1453,5 +1480,98 @@ mod tests {
         let (t, f) = split_files("ログイン API を実装する (重要)");
         assert_eq!(t, "ログイン API を実装する (重要)");
         assert!(f.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod no_double_planning_tests {
+    use super::tests::input;
+    use super::*;
+    use crate::features::team::imp::model::TeamRole as R;
+
+    /// 実機の SPEC。**見出しがそのまま役割の分担になっている** —
+    /// 仕様を書く担当が「誰が何をするか」まで書いたときの形。
+    const SPEC: &str = "\
+# かっこいい 3D の Zaivern ホームページ
+
+## planner: 依頼の中身を実装前に文章で固める
+Zaivern が何なのかを決め、ページの構成を決める。
+
+## architect: ファイル構成と 3D の実現方式を確定する
+3D ライブラリを使うか素の WebGL かを選ぶ。
+
+## implementer(markup): ページの HTML を書く
+3D キャンバスの置き場所を決めて index.html を書く。
+
+## implementer(style): スタイルを書く
+配色・タイポグラフィ・余白。
+
+## tester: 実際にブラウザで開いて確認する
+デスクトップ幅とモバイル幅の表示を見る。
+
+## integrator: 成果物を 1 つのサイトとして繋ぐ
+開き方とファイル構成をまとめる。
+";
+
+    /// **同じ役割の仕事を二重に置かない。**
+    ///
+    /// 実機では 13 本のうち 4 本 (`分割と受入基準` / `設計` / `テスト` /
+    /// `最終統合`) が丸ごと重複し、**1 度も動かないまま 1 時間**が過ぎた。
+    /// 害は本数だけではない — 骨組みの「テスト」は全実装の完了に依存し、
+    /// 「最終統合」は全部に依存するので、重複したぶんがそのまま*待ち*になる。
+    #[test]
+    fn specが役割で割れているなら骨組みを重ねない() {
+        let mut inp = input(SPEC);
+        inp.roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
+        let p = StaticPlanner.plan(inp).expect("計画できるべき");
+        let titles: Vec<&str> = p.tasks.iter().map(|t| t.title.as_str()).collect();
+        for dup in [
+            "の分割と受入基準を確定する",
+            "の設計をまとめる",
+            "のテストを書いて通す",
+            "最終統合と全体検証",
+        ] {
+            assert!(
+                !titles.iter().any(|t| t.contains(dup)),
+                "SPEC に担当が居るのに骨組みを重ねた: {dup} / {titles:?}"
+            );
+        }
+        // **SPEC の担当はそのまま役割として立つ** (全部 implementer に
+        // 潰れると、テストにもレビューにも実装担当の指示文が飛ぶ)。
+        for want in [R::Planner, R::Architect, R::Tester, R::Integrator] {
+            assert!(
+                p.tasks.iter().any(|t| t.role == want),
+                "{want:?} の担当が居ない: {:?}",
+                p.tasks.iter().map(|t| t.role).collect::<Vec<_>>()
+            );
+        }
+        // **待ちが減っている。** 全部に依存する締めのタスクが無い。
+        let n = p.tasks.len();
+        assert!(
+            !p.tasks.iter().any(|t| t.dependencies.len() >= n - 1),
+            "全部を待つタスクが残っている"
+        );
+    }
+
+    /// **役割を名乗らない SPEC では、これまでどおり骨組みを置く。**
+    /// 重複を消す話であって、段取りを無くす話ではない。
+    #[test]
+    fn 役割で割れていないspecには骨組みを置く() {
+        let mut inp = input("# 認証機能\n\n## ログイン API\n書く。\n\n## ログアウト API\n書く。\n");
+        inp.roles = vec![R::Planner, R::Architect, R::Implementer, R::Tester];
+        let p = StaticPlanner.plan(inp).expect("計画できるべき");
+        for want in [R::Planner, R::Architect, R::Tester, R::Integrator] {
+            assert!(
+                p.tasks.iter().any(|t| t.role == want),
+                "{want:?} の骨組みが消えた"
+            );
+        }
     }
 }

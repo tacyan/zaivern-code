@@ -3933,3 +3933,51 @@ fn 配置から導く判断はすべて取り下げの対象() {
     }
     assert!(seen >= 3, "配置由来の判断を読み落としている (seen={seen})");
 }
+
+/// **伝言で担当を投げ出させない。**
+///
+/// 実機で index.html を書く担当 (#5) が 1 時間止まった。伝言で CSS の
+/// 手直しへ移ってしまい、**ページの本体が最後まで作られなかった**
+/// (`~/dev/Test5` に css / js / docs はあるのに index.html が無い)。
+/// 相手の端末には「連絡」と「指示」の区別が無いので、こちらが毎回書く。
+#[test]
+fn 伝言には担当が変わっていないことを添える() {
+    let (mut rt, sids, tid) = to_assigned();
+    let to = rt.task(tid).unwrap().assigned_agent.clone().unwrap();
+    let from = rt
+        .agents()
+        .iter()
+        .map(|a| a.id.clone())
+        .find(|a| a != &to)
+        .expect("差出人");
+    let sender = from.0.clone();
+    let body = format!(
+        "{}\n{{\"to\": \"{}\", \"text\": \"CSS の手直しをお願いします\"}}\n{}",
+        rp::MSG_OPEN,
+        to.0,
+        rp::MSG_CLOSE
+    );
+    let from_sid = rt
+        .agents()
+        .iter()
+        .find(|a| a.id == from)
+        .and_then(|a| a.session_id)
+        .expect("差出人の端末");
+    let eff = tick_text(&mut rt, 30, &sids, from_sid, &body);
+    let sent = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendManualInstruction { agent, text, .. } if agent == &to => Some(text),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("伝言が届いていない (差出人 {sender})"));
+    assert!(sent.contains("CSS の手直し"), "本文が消えた");
+    assert!(
+        sent.contains(&format!("#{tid}")),
+        "いまの担当が添えられていない: {sent}"
+    );
+    assert!(
+        sent.contains("連絡") && sent.contains("指示ではありません"),
+        "連絡か指示かが区別できない: {sent}"
+    );
+}

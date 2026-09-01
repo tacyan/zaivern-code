@@ -2120,10 +2120,42 @@ impl TeamRuntime {
                 session,
                 // **誰からの伝言かを本文に残す。** 相手の端末には差出人が
                 // 出ないので、書かないと「誰かから何か来た」になる。
-                text: format!("[Zaivern] {sender} からの伝言:\n{text}"),
+                //
+                // **いまの担当も必ず添える。** 添えないと、受け取った側は
+                // 伝言を新しい指示として読んで**自分の担当を投げ出す**。
+                // 実機で index.html を書く担当 (#5) がこれで 1 時間止まった
+                // — 伝言で CSS の手直しへ移ってしまい、ページの本体が
+                // 最後まで作られなかった。
+                text: format!(
+                    "[Zaivern] {sender} からの伝言:\n{text}{}",
+                    self.standing_order(&to)
+                ),
                 key: format!("manual:{}:{id}", to.0),
             });
         }
+    }
+
+    /// **伝言の末尾に添える「あなたの担当は変わっていない」。**
+    ///
+    /// 伝言は*連絡*であって*指示*ではない。相手の端末には両者の区別が
+    /// 無いので、こちらが毎回書く。担当を持っていなければ何も足さない。
+    fn standing_order(&self, to: &AgentId) -> String {
+        let Some(t) = self
+            .tasks
+            .iter()
+            .find(|t| t.assigned_agent.as_ref() == Some(to) && t.state.is_held())
+        else {
+            return String::new();
+        };
+        format!(
+            "\n\n---\nこれは**連絡**です。指示ではありません。\n\
+             あなたの担当は #{} 「{}」のままです。\
+             まずこれを最後まで終わらせて報告してください。\n\
+             連絡の内容が担当と関わるなら取り込んで構いませんが、\
+             **担当を置いて別の作業へ移らないでください。**",
+            t.id,
+            t.title.chars().take(60).collect::<String>()
+        )
     }
 
     /// この Run が**その仕事を出したか** (冪等キーで見る)。
