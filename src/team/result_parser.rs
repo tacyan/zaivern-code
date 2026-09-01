@@ -685,12 +685,17 @@ pub enum EventReject {
     ActionTooLong,
     /// エージェント ID が空。
     AgentIdMissing,
+    /// **ひな型のまま**の名前 (`<子の名前>` など)。実在の担当にしない。
+    PlaceholderAgent(String),
 }
 
 impl EventReject {
     pub fn detail(&self) -> String {
         match self {
             EventReject::BadJson(e) => format!("イベントの JSON を読めません: {e}"),
+            EventReject::PlaceholderAgent(id) => format!(
+                "エージェント ID「{id}」はひな型のままです。実際に使った名前を書いてください"
+            ),
             EventReject::TooLarge { bytes } => format!("イベントが大きすぎます ({bytes} バイト)"),
             EventReject::UnknownKind(k) => format!("未知のイベント種別「{k}」"),
             EventReject::UnknownParent(p) => format!("親エージェント「{p}」が存在しません"),
@@ -741,6 +746,15 @@ pub fn check_event(
     if is_sub {
         if doc.agent_id.trim().is_empty() {
             return Err(EventReject::AgentIdMissing);
+        }
+        // **ひな型のまま送ってきたものを実在の担当にしない。**
+        //
+        // 指示文は `"agent_id": "<子の名前>"` という穴埋めを見せる。そのまま
+        // 出してくるエージェントが実際に居て、盤面に `<子の名前>` という
+        // 担当が並んだ (実機で観測)。山括弧は名前に使わないので、これで見分く。
+        let id = doc.agent_id.trim();
+        if id.starts_with('<') || id.ends_with('>') {
+            return Err(EventReject::PlaceholderAgent(id.to_string()));
         }
         let parent = doc.parent_id.trim();
         if parent.is_empty() {

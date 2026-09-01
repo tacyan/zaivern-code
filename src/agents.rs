@@ -1816,6 +1816,14 @@ const TERMINAL_SCROLLBACK_ENV: &[(&str, &[(&str, &str)])] =
 const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
     // Claude Code: 起動直後に書いても落ちる。実測で 3 秒あれば受け取る。
     ("claude", 3_000, b"\r"),
+    // Codex: MCP を立ち上げ終わるまで確定キーを飲み込む。実機で
+    // `⚠ MCP startup incomplete` が出ている間に撃つと、本文が入力欄に
+    // 残ったまま止まった。**落ちるのは最初の 1 通だけ**で、そのあとは
+    // 普通に動く (利用者の報告) ので、起動ぶんだけ待てばよい。
+    //
+    // 10 秒は実測から置いた**暫定値**。MCP の数だけ伸びるので、足りない
+    // 環境が出たらここを増やす — 送信側は 1 行も変えなくてよい。
+    ("codex", 10_000, b"\r"),
 ];
 
 /// この CLI が入力を受け取れるようになるまでの目安 (ミリ秒)。持たなければ 0。
@@ -5295,6 +5303,13 @@ mod tests {
         assert!(
             super::input_ready_ms("claude") > 0,
             "Claude Code の待ちが無い"
+        );
+        // **最初の 1 通で諦めない。** Codex は MCP を立ち上げ終わるまで確定キーを
+        // 飲み込む (実機で `⚠ MCP startup incomplete` の間に撃って止まった)。
+        // そのあとは普通に動くので、起動ぶんだけ待てばよい。
+        assert!(
+            super::input_ready_ms("codex") >= 5_000,
+            "Codex の起動待ちが短すぎる (最初の 1 通が落ちる)"
         );
         assert_eq!(
             super::input_ready_ms("そんなCLIは無い"),
