@@ -709,23 +709,14 @@ impl TeamPanel {
         self.active = self.runs.len() - 1;
         self.read_only = false;
         self.restore = RestorePrompt::None;
-        // **検証なしで進むことを隠さない。**
+        // **「検証なし」は帯で言わない。** 盤面のヘッダに「⚠ 検証なし」の札が
+        // 常時出ていて、ホバーで理由まで読める。帯にも同じことを長い文章で
+        // 出していたので、開くたびに 1 行まるごと占領して**同じことを 2 回**
+        // 言っていた (CLAUDE.md「増やす前に減らせないかを考える」)。
         //
-        // 道具が無いフォルダ (素の HTML など) では検証コマンドを決められない。
-        // 計画は通すが、そのとき完了を決めるのは**レビュー承認だけ**になる。
-        // 理由は検出器に言わせる (同じ説明を 2 か所に書かない)。
-        if no_validation {
-            let why = super::validation_defaults::detect(&self.workspace)
-                .err()
-                .map(|e| e.detail())
-                .unwrap_or_default();
-            let head = crate::i18n::tr("team.notice.no_validation");
-            self.notice = if why.is_empty() {
-                head
-            } else {
-                format!("{head} — {why}")
-            };
-        }
+        // 札のほうを残すのは、状態から導くので**消えない**から。帯は次の
+        // 通知で上書きされて消えるので、そもそも常設の警告には向かない。
+        let _ = no_validation;
         self.dirty = true;
         self.needs_save = true;
         Ok(())

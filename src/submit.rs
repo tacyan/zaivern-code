@@ -25,7 +25,8 @@
 //!    分割送信されるのを防ぐ。
 //! 4. **入力欄に本文が残っていたら CR を撃ち直す。** 1 と 2 で大半は消えるが、
 //!    起動直後の再描画と重なると 1 発目が落ちることがある。ただし撃ち直しは
-//!    **承認プロンプトが出ていないときだけ** ([`MAX_COMMIT_TRIES`] 回まで)。
+//!    **承認プロンプトが出ていないときだけ**、入力欄に本文が見えている
+//!    あいだ ([`GIVE_UP`] まで)。
 //!
 //! ## 判断はすべて純粋関数
 //!
@@ -48,8 +49,16 @@ pub const VERIFY_DELAY: Duration = Duration::from_millis(450);
 /// 確定キーを送る最大回数 (初回 + 撃ち直し)。
 ///
 /// 無制限に撃つと、相手がたまたま承認プロンプトを出した瞬間に
-/// Enter を送り続けて**勝手に承認してしまう**。上限で必ず止める。
-pub const MAX_COMMIT_TRIES: u8 = 3;
+/// Enter を送り続けて**勝手に承認してしまう**。上限で必ず止める
+/// (承認プロンプト中は `attention` で止まるが、上限は最後の砦として残す)。
+///
+/// **3 回では足りなかった。** 起動に手間取る相手 (MCP を立ち上げている
+/// Codex 等) では 3 回とも起動中に当たって終わる — 実機で、同じ Codex でも
+/// 起動が速かった側は動き出し、`⚠ MCP startup incomplete` が出ていた側は
+/// 本文を入力欄に抱えたまま止まっていた。間隔は回を追うごとに広がるので
+/// (`VERIFY_DELAY * 回数`、上限 [`COMMIT_RETRY_MAX`])、12 回で
+/// おおよそ 30 秒ぶん粘る。
+pub const MAX_COMMIT_TRIES: u8 = 12;
 
 /// 「落ち着くまで待つ」指示 (Issue 着手 / レース / 失敗切替の引き継ぎ) が
 /// Idle を待つ上限。これを過ぎたら承認待ちでない限り入れてしまう
@@ -66,6 +75,12 @@ pub const GIVE_UP: Duration = Duration::from_secs(120);
 /// `GIVE_UP` より十分短くする — 待ちで予算を使い切ると、撃ち直す機会が
 /// 1 度も来ない。
 pub const COMMIT_IDLE_WAIT: Duration = Duration::from_secs(20);
+
+/// 確定キーを撃ち直す間隔の上限。
+///
+/// 回を追うごとに間隔を広げる (`VERIFY_DELAY * 回数`) が、開きすぎると
+/// 相手が受け取れるようになってから届くまでが遅くなる。
+pub const COMMIT_RETRY_MAX: Duration = Duration::from_secs(3);
 
 /// 送れない状態のときに次を見に行く間隔。
 ///
@@ -381,28 +396,35 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
                 return Act::Wait(VERIFY_DELAY - since_stage);
             }
             let stuck = still_pending(peek.input.as_deref(), &tail_key(&job.text));
-            if job.tries >= MAX_COMMIT_TRIES {
-                // **届かなかったことを黙って完了にしない。** 入力欄に本文が
-                // 残っているなら、それは届いていない証拠。呼び出し元
-                // (Team の配達や Issue 着手) が撃ち直せるよう、失敗として返す。
-                return if stuck { Act::GaveUp } else { Act::Done };
+            // **残っている限り撃ち直す。上限は回数ではなく時間で決める。**
+            //
+            // 回数で切ると、起動に手間取る相手 (MCP を立ち上げている Codex 等)
+            // では**3 回とも起動中に当たって終わる**。実機で、同じ Codex でも
+            // 起動が速かった側は動き出し、`⚠ MCP startup incomplete` が出て
+            // いた側は本文を入力欄に抱えたまま止まっていた。
+            //
+            // 入力欄に本文が見えている = まだ届いていない、という**証拠**が
+            // あるので、撃ち直しても二重送信にはならない (届けば消える)。
+            if !stuck {
+                return Act::Done;
             }
-            // 撃ち直しは「承認プロンプトが出ていない」かつ
-            // 「入力欄に本文がまだ見えている」ときだけ。
+            if since_queued >= GIVE_UP || job.tries >= MAX_COMMIT_TRIES {
+                // **届かなかったことを黙って完了にしない。** 呼び出し元が
+                // 撃ち直せるよう、失敗として返す。
+                return Act::GaveUp;
+            }
+            // 撃ち直しは「承認プロンプトが出ていない」ときだけ
+            // (出ていれば Enter は承認への回答になる)。
             if peek.attention {
-                return if stuck && since_queued >= GIVE_UP {
-                    Act::GaveUp
-                } else if stuck {
-                    Act::Wait(POLL)
-                } else {
-                    Act::Done
-                };
+                return Act::Wait(POLL);
             }
-            if stuck {
-                Act::WriteCommit
-            } else {
-                Act::Done
+            // **間隔は少しずつ広げる。** 起動中の相手へ 450ms ごとに撃ち続けても
+            // 意味が無いので、回を追うごとに待つ (上限 [`COMMIT_RETRY_MAX`])。
+            let wait = (VERIFY_DELAY * (1 + u32::from(job.tries))).min(COMMIT_RETRY_MAX);
+            if since_stage < wait {
+                return Act::Wait(wait - since_stage);
             }
+            Act::WriteCommit
         }
     }
 }
@@ -599,10 +621,16 @@ mod tests {
             tries: 1,
             ..Job::user(1, text)
         };
+        // 間隔は回を追うごとに広がるので、その待ちを過ぎてから撃つ。
         assert_eq!(
-            decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY),
+            decide(&job, &peek, COMMIT_RETRY_MAX, VERIFY_DELAY),
             Act::WriteCommit
         );
+        // 待ちの途中では撃たない (起動中の相手へ連打しない)。
+        assert!(matches!(
+            decide(&job, &peek, Duration::ZERO, VERIFY_DELAY),
+            Act::Wait(_)
+        ));
     }
 
     #[test]
@@ -627,20 +655,34 @@ mod tests {
             input: Some(text.into()),
             ..peek_ready()
         };
+        // まだ余力のある回数 (上限より手前)。
         let job = Job {
             stage: Stage::Verify,
-            tries: MAX_COMMIT_TRIES,
+            tries: 1,
             ..Job::user(1, text)
         };
-        // **撃ち直しは止まる。ただし「完了」とは言わない。**
+        // **止めるのは回数ではなく時間。**
         //
-        // 入力欄に本文が残っているのは届いていない証拠なので、
-        // 以前のように `Done` を返すと**届かなかったものを届いたことにする**。
-        // 呼び出し元は永久に気付けず、実機では指示が入力欄に見えたまま
-        // 何分も止まっていた。
-        let got = decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY);
-        assert_eq!(got, Act::GaveUp);
-        assert_ne!(got, Act::WriteCommit, "上限を超えて撃ち直している");
+        // 回数で切ると、起動に手間取る相手 (MCP を立ち上げている Codex 等)
+        // では 3 回とも起動中に当たって終わる。入力欄に本文が見えている =
+        // まだ届いていない、という**証拠**があるうちは撃ち直す。
+        assert_eq!(
+            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            Act::WriteCommit,
+            "証拠があるのに撃ち直しをやめている"
+        );
+        // 時間の上限を過ぎたら**人へ返す** (黙って完了にしない)。
+        assert_eq!(decide(&job, &peek, COMMIT_RETRY_MAX, GIVE_UP), Act::GaveUp);
+        // 回数の上限でも止まる (**承認プロンプトへ撃ち続けないための最後の砦**)。
+        let spent = Job {
+            tries: MAX_COMMIT_TRIES,
+            ..job.clone()
+        };
+        assert_eq!(
+            decide(&spent, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            Act::GaveUp,
+            "回数の上限を超えて撃ち続けている"
+        );
         // 入力欄から消えていれば、届いたので完了でよい。
         let sent = Peek {
             input: Some(String::new()),
