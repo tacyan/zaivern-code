@@ -235,7 +235,23 @@ impl Peek {
     /// 従来どおり 1 回書いて進む。
     pub fn input_seen(&self, tail: &str) -> bool {
         match self.input.as_deref() {
+            // 読めていない = 証拠が無い。
             None => true,
+            // **空も証拠にならない。**
+            //
+            // 入力欄の読み取りは「カーソルから上へ辿って囲みを探す」形なので、
+            // **囲みを見つけられない CLI では空が返る**。それを「本文が
+            // 入っていない」と読むと、書き込みが届いていても届いていないと
+            // 判断してしまう。
+            //
+            // 実測: Codex には**確定キーが一度も送られず**、本文だけが
+            // 9 回書き込まれていた (入力ログで判明)。同じ Run で
+            // Antigravity は 本文 → `\r` と正しく流れている。
+            // Codex の囲みが読めないだけだった。
+            //
+            // 証拠にするのは「**読めていて、しかもこちらの本文ではない
+            // 何かが入っている**」ときだけ。そこは書き込みが落ちた証拠になる。
+            Some(t) if t.trim().is_empty() => true,
             Some(t) => still_pending(Some(t), tail),
         }
     }
@@ -1199,6 +1215,10 @@ mod write_confirm_tests {
 
     /// 書き直しの間隔 ([`BODY_REWRITE_WAIT`]) を越えた経過時間。
     /// 越えていないと `Act::Wait` になり、書き直しの判断まで届かない。
+    /// **落ちた証拠になる入力欄**: 読めていて、こちらの本文ではない
+    /// 何かが入っている。空は「囲みを読めなかった」と区別が付かない。
+    const DROPPED: &str = "❯ 人が別のことを打っている";
+
     const REWRITE_OK: Duration = BODY_REWRITE_WAIT.saturating_add(COMMIT_DELAY);
 
     fn job(text: &str) -> Job {
@@ -1235,11 +1255,11 @@ mod write_confirm_tests {
         let j = job("実装してください。最後まで終わらせて報告してください");
         // 入力欄が空 = 書き込みが捨てられた。
         assert_eq!(
-            decide_quiet(&j, &peek(Some("")), REWRITE_OK, REWRITE_OK),
+            decide_quiet(&j, &peek(Some(DROPPED)), REWRITE_OK, REWRITE_OK),
             Act::WriteBody
         );
         assert_eq!(
-            decide_quiet(&j, &peek(Some("❯ ")), REWRITE_OK, REWRITE_OK),
+            decide_quiet(&j, &peek(Some("❯ 別のこと")), REWRITE_OK, REWRITE_OK),
             Act::WriteBody
         );
     }
@@ -1282,12 +1302,12 @@ mod write_confirm_tests {
         let mut j = job("実装してください");
         j.tries = MAX_COMMIT_TRIES;
         assert_eq!(
-            decide_quiet(&j, &peek(Some("")), REWRITE_OK, REWRITE_OK),
+            decide_quiet(&j, &peek(Some(DROPPED)), REWRITE_OK, REWRITE_OK),
             Act::GaveUp
         );
         let j2 = job("実装してください");
         assert_eq!(
-            decide_quiet(&j2, &peek(Some("")), COMMIT_DELAY, GIVE_UP),
+            decide_quiet(&j2, &peek(Some(DROPPED)), COMMIT_DELAY, GIVE_UP),
             Act::GaveUp
         );
     }
@@ -1403,9 +1423,11 @@ mod startup_modal_tests {
         let mut p = Pending::new(Job::user(1, text), t0);
         // 書けた (Ready → Commit)。ここでは時計が進む。
         p.advance(Stage::Commit, t0);
-        // 入力欄は空のまま = 書き込みが捨てられている (証拠が無い)。
+        // **書き込みが捨てられた証拠**: 入力欄は読めていて、しかも
+        // こちらの本文ではない何かが入っている。空は「囲みを読めなかった」と
+        // 区別が付かないので証拠にしない ([`Peek::input_seen`])。
         let dropped = Peek {
-            input: Some(String::new()),
+            input: Some("❯ 人が別のことを打っている".to_string()),
             ..answered()
         };
         assert!(holdup(&p.job, &dropped).is_none());
@@ -1438,9 +1460,10 @@ mod body_write_cap_tests {
             idle: true,
             attention: false,
             input_ready: true,
-            // **入力欄が読めるのに本文が見えない** = 書き込みが落ちたか、
-            // 読み方が相手に合っていないか。区別は付かない。
-            input: Some(String::new()),
+            // **落ちた証拠になる入力欄** = 読めていて、しかもこちらの
+            // 本文ではない何かが入っている。空は「読めなかった」と
+            // 区別が付かないので証拠にしない ([`Peek::input_seen`])。
+            input: Some("❯ 人が別のことを打っている".to_string()),
             ..Default::default()
         }
     }
@@ -1539,7 +1562,7 @@ mod starting_agent_tests {
             attention: false,
             // **まだ受け取れない** (カタログの `input_ready_ms` が待たせている)。
             input_ready: false,
-            input: Some(String::new()),
+            input: Some("❯ 人が別のことを打っている".to_string()),
             ..Default::default()
         };
         let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
@@ -1574,7 +1597,7 @@ mod starting_agent_tests {
             idle: true,
             attention: false,
             input_ready: true,
-            input: Some(String::new()),
+            input: Some("❯ 人が別のことを打っている".to_string()),
             ..Default::default()
         };
         let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
@@ -1582,5 +1605,69 @@ mod starting_agent_tests {
         assert_eq!(decide(&j, &ready, long, long, long), Act::WriteBody);
         j.body_writes = MAX_BODY_WRITES;
         assert_eq!(decide(&j, &ready, long, long, long), Act::GaveUp);
+    }
+}
+
+#[cfg(test)]
+mod unreadable_composer_tests {
+    use super::*;
+
+    /// **囲みを読めない CLI へ、確定キーが一度も飛ばない状態を作らない。**
+    ///
+    /// 実測 (入力ログ): 同じ Run で Codex には**本文が 9 回**書かれただけで
+    /// `\r` が 1 度も送られず、Antigravity には 本文 → `\r` と正しく
+    /// 流れていた。入力欄の読み取りは「カーソルから上へ辿って囲みを探す」
+    /// 形なので、**囲みを見つけられない CLI では空が返る**。それを
+    /// 「本文が入っていない」と読むと、届いていても届いていないと判断する。
+    #[test]
+    fn 読めない入力欄では確定へ進む() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let base = Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            input_ready: true,
+            ..Default::default()
+        };
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        // 読めない (None) / 読めたが空 — どちらも証拠にならない。
+        for input in [None, Some(String::new()), Some("   \n".to_string())] {
+            let p = Peek {
+                input,
+                ..base.clone()
+            };
+            for n in 0..=MAX_BODY_WRITES {
+                j.body_writes = n;
+                assert_eq!(
+                    decide(&j, &p, long, long, long),
+                    Act::WriteCommit,
+                    "読めない入力欄を「落ちた」と決めつけている (書いた回数 {n})"
+                );
+            }
+        }
+    }
+
+    /// **証拠があるときは、これまでどおり落ちたと判断する。**
+    /// 空を証拠から外したせいで、失敗の検出そのものが死んではいけない。
+    #[test]
+    fn 本文でないものが入っていれば落ちたと判断する() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        let p = Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            input_ready: true,
+            input: Some("❯ 人が別のことを打っている".to_string()),
+            ..Default::default()
+        };
+        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
+        j.body_writes = 0;
+        assert_eq!(decide(&j, &p, long, long, long), Act::WriteBody);
+        j.body_writes = MAX_BODY_WRITES;
+        assert_eq!(decide(&j, &p, long, long, long), Act::GaveUp);
     }
 }
