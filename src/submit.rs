@@ -43,18 +43,6 @@ use std::time::{Duration, Instant};
 /// 安全側に倒して 120ms を採る。
 pub const COMMIT_DELAY: Duration = Duration::from_millis(120);
 
-/// **本文を書き直してよい回数の上限。**
-///
-/// 書き直しが効くのは「書き込みが落ちた」ときだけ。数回書いても入力欄に
-/// 見えないなら、落ちたのではなく**読めていない**ので、繰り返しても何も
-/// 変わらない。上限が無いと実機で**同じ指示文を 806 回**書き込み、相手の
-/// 入力欄をコピーで埋めて壊した。
-pub const MAX_BODY_WRITES: u8 = 3;
-
-/// 書き直しの間隔。詰めて撃つと、相手が描き終える前に次を書いて
-/// 「見えない」を自分で作る。
-pub const BODY_REWRITE_WAIT: Duration = Duration::from_millis(900);
-
 /// 確定キーを送ってから「入力欄が空になったか」を確かめるまでの待ち。
 pub const VERIFY_DELAY: Duration = Duration::from_millis(450);
 
@@ -224,38 +212,7 @@ fn normalize_ws(s: &str) -> String {
 /// `input` は端末画面から拾った「入力欄に見えている文字列」。取れなかった
 /// (`None`) ときは **残っていない扱い** にする — 見えないものを根拠に
 /// Enter を撃ち直すと、承認プロンプトへ誤爆する危険の方が大きい。
-impl Peek {
-    /// **本文が入力欄に見えているか** (= こちらの書き込みが届いた証拠)。
-    ///
-    /// 畳まれた貼り付け (`[Pasted Content 2329 chars]`) も「見えている」と
-    /// 数える — 中身は本文そのものなので、確定キーを撃ってよい。
-    ///
-    /// **読み取れないときは真を返す。** 入力欄を読めない相手で書き直しを
-    /// 繰り返すと、同じ本文が何度も入ることになる。証拠が無いなら、
-    /// 従来どおり 1 回書いて進む。
-    pub fn input_seen(&self, tail: &str) -> bool {
-        match self.input.as_deref() {
-            // 読めていない = 証拠が無い。
-            None => true,
-            // **空も証拠にならない。**
-            //
-            // 入力欄の読み取りは「カーソルから上へ辿って囲みを探す」形なので、
-            // **囲みを見つけられない CLI では空が返る**。それを「本文が
-            // 入っていない」と読むと、書き込みが届いていても届いていないと
-            // 判断してしまう。
-            //
-            // 実測: Codex には**確定キーが一度も送られず**、本文だけが
-            // 9 回書き込まれていた (入力ログで判明)。同じ Run で
-            // Antigravity は 本文 → `\r` と正しく流れている。
-            // Codex の囲みが読めないだけだった。
-            //
-            // 証拠にするのは「**読めていて、しかもこちらの本文ではない
-            // 何かが入っている**」ときだけ。そこは書き込みが落ちた証拠になる。
-            Some(t) if t.trim().is_empty() => true,
-            Some(t) => still_pending(Some(t), tail),
-        }
-    }
-}
+impl Peek {}
 
 pub fn still_pending(input: Option<&str>, tail: &str) -> bool {
     if tail.is_empty() {
@@ -332,8 +289,6 @@ pub struct Job {
     pub stage: Stage,
     /// 確定キーを送った回数
     pub tries: u8,
-    /// 本文を書いた回数 ([`MAX_BODY_WRITES`] で頭打ち)。
-    pub body_writes: u8,
     /// 表示用のラベル (トースト)
     pub title: String,
     /// **配達の結果を知りたい呼び出し元の目印** (無ければ `None`)。
@@ -359,7 +314,6 @@ impl Job {
             wait_idle: false,
             stage: Stage::Ready,
             tries: 0,
-            body_writes: 0,
             title: String::new(),
             tag: None,
         }
@@ -374,7 +328,6 @@ impl Job {
             wait_idle: true,
             stage: Stage::Ready,
             tries: 0,
-            body_writes: 0,
             title: String::new(),
             tag: None,
         }
@@ -525,49 +478,34 @@ pub fn decide(
             //
             // 入力欄に本文が見えないなら、書き直す。見えるようになれば
             // 下へ進んで確定する。
+            // ── ここにあった「本文が入力欄に見えなければ書き直す」は撤回した ──
             //
-            // **書き直しには固い上限が要る。** 実機で、この枝に上限が無い
-            // まま **同じ指示文を 806 回**書き込んだ (`COMMIT_DELAY` が
-            // 120ms なので、諦めるまでの 120 秒で 800 回撃てる)。相手の
-            // 入力欄は指示文のコピーで埋まり、**直そうとした当のものを
-            // 壊した**。入力ログ (`[Zaivern] input`) を足して初めて見えた。
+            // 入れた動機は正しかった (起動中の CLI が書き込みを捨てるのに、
+            // `Verify` は空の入力欄を見て「届いた」と判断していた)。
+            // しかし**入力欄の読み取りを証拠として使えなかった**。
             //
-            // 書き直しが効くのは「書き込みが落ちた」ときだけ。数回書いても
-            // 見えないなら、**落ちたのではなく読めていない** — そこで
-            // 繰り返しても何も変わらないので、従来どおり確定へ進んで
-            // `Verify` に判定させる (そちらは入力欄の残りを見て撃ち直す)。
-            if !peek.input_seen(&tail_key(&job.text)) {
-                // **待つ理由が見えている間は、書き直しも諦めもしない。**
-                //
-                // 実機で、起動中の Codex (`Update available!` の案内が出た
-                // まま・MCP を立ち上げ中) へ 3 回書き直して諦め、配り直しては
-                // また諦めるのを繰り返した。「入力欄に本文が無い」のは
-                // 書き込みが落ちたからではなく、**まだ描いていない**だけ。
-                // 落ちたと決めてよいのは、相手が受け取れる状態だと
-                // 観測できているときに限る。
-                if holdup(job, peek).is_some() {
-                    return Act::Wait(POLL);
-                }
-                if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
-                    return Act::GaveUp;
-                }
-                // **上限に達したら人へ返す。確定へは進まない。**
-                //
-                // 進めると、`Verify` は空の入力欄を見て「届いた」と判断する —
-                // まさにこの枝が消そうとしていた嘘が戻ってくる。
-                // 入力欄が**読めているのに本文が無い**のは失敗の証拠なので、
-                // 証拠がある側では黙って完了にしない。
-                // (読めない相手は `input_seen(None) == true` でこの枝へ来ない。)
-                if job.body_writes >= MAX_BODY_WRITES {
-                    return Act::GaveUp;
-                }
-                // **間隔を空ける。** 詰めて撃つと、相手が描き終える前に
-                // 次を書いて「見えない」を自分で作る。
-                if since_stage < BODY_REWRITE_WAIT {
-                    return Act::Wait(BODY_REWRITE_WAIT - since_stage);
-                }
-                return Act::WriteBody;
-            }
+            // 一晩の実測で 3 回退行を生み、確認できた利益はゼロだった:
+            //
+            // | 症状 | 実測 |
+            // |---|---|
+            // | 上限が無く同じ本文を書き続けた | Codex へ **806 回** |
+            // | 起動中を「落ちた」と誤認して諦めた | 書き込み 19 件・配り直しの繰り返し |
+            // | 読めない囲みを「落ちた」と誤認した | Codex に**確定キーが 0 回** (本文 9 回) |
+            //
+            // 最後のものは空を証拠から外しても直らなかった。Codex の入力欄は
+            // 空ではなく**こちらの本文でもないもの** (`Ask Codex to do anything` /
+            // `[Pasted …]` の囲み) を返すので、「読めていて別の何かがある」
+            // という*証拠らしきもの*が常に成立してしまう。
+            //
+            // 動機のほうは別の手で満たせている:
+            // * 起動中に書かない → `agents::input_ready_ms` (`Stage::Ready`)
+            // * 承認待ち・処理中に撃たない → `holdup`
+            // * 届いていない証拠で撃ち直す → `Stage::Verify` の `still_pending`
+            //   (畳まれた貼り付けも `agents::PASTE_PLACEHOLDERS` で拾う)
+            //
+            // **同じものを足し直さないこと。** 入力欄の読み取りは CLI ごとに
+            // 意味が違い、「本文が無い」を安全に言えない。番人は
+            // `submit::withdrawn_gate_tests::入力欄の読みを確定の関門にしない`。
             // **相手が手を動かしている間は撃たない。**
             //
             // 忙しい CLI は確定キーを飲み込む。実機の Codex では、本文は
@@ -1210,110 +1148,6 @@ mod paste_placeholder_tests {
 }
 
 #[cfg(test)]
-mod write_confirm_tests {
-    use super::*;
-
-    /// 書き直しの間隔 ([`BODY_REWRITE_WAIT`]) を越えた経過時間。
-    /// 越えていないと `Act::Wait` になり、書き直しの判断まで届かない。
-    /// **落ちた証拠になる入力欄**: 読めていて、こちらの本文ではない
-    /// 何かが入っている。空は「囲みを読めなかった」と区別が付かない。
-    const DROPPED: &str = "❯ 人が別のことを打っている";
-
-    const REWRITE_OK: Duration = BODY_REWRITE_WAIT.saturating_add(COMMIT_DELAY);
-
-    fn job(text: &str) -> Job {
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        j
-    }
-
-    fn peek(input: Option<&str>) -> Peek {
-        Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            input_ready: true,
-            input: input.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    /// 待ってよい理由が 1 つも無いまま `since` だけ経った (`mod tests` と同じ)。
-    fn decide_quiet(job: &Job, peek: &Peek, since_stage: Duration, since: Duration) -> Act {
-        decide(job, peek, since_stage, since, since)
-    }
-
-    /// **書けていないのに確定キーを撃たない。**
-    ///
-    /// 起動中の CLI は書き込みを捨てる。捨てられたことに気付かずに
-    /// 確定すると、`Verify` は「入力欄に本文が無い」を見て**届いた**と
-    /// 判断し、1 バイトも送っていないのに配達完了になる。
-    /// 実機 (Test6) では Claude Code 2 体が**指示の痕跡 0 件**のまま
-    /// 「作業中」と表示され、9 分で成果物が 1 つも出来なかった。
-    #[test]
-    fn 本文が入力欄に無ければ書き直す() {
-        let j = job("実装してください。最後まで終わらせて報告してください");
-        // 入力欄が空 = 書き込みが捨てられた。
-        assert_eq!(
-            decide_quiet(&j, &peek(Some(DROPPED)), REWRITE_OK, REWRITE_OK),
-            Act::WriteBody
-        );
-        assert_eq!(
-            decide_quiet(&j, &peek(Some("❯ 別のこと")), REWRITE_OK, REWRITE_OK),
-            Act::WriteBody
-        );
-    }
-
-    /// **見えていれば、これまでどおり確定する。**
-    #[test]
-    fn 本文が見えていれば確定する() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let j = job(text);
-        assert_eq!(
-            decide_quiet(&j, &peek(Some(text)), COMMIT_DELAY, COMMIT_DELAY),
-            Act::WriteCommit
-        );
-        // 畳まれた貼り付けも「見えている」。中身は本文そのもの。
-        assert_eq!(
-            decide_quiet(
-                &j,
-                &peek(Some("[Pasted Content 2329 chars]")),
-                COMMIT_DELAY,
-                COMMIT_DELAY
-            ),
-            Act::WriteCommit
-        );
-    }
-
-    /// **入力欄を読めない相手では、書き直しを繰り返さない。**
-    /// 証拠が無いなら 1 回書いて進む (同じ本文が何度も入るほうが害が大きい)。
-    #[test]
-    fn 入力欄が読めないなら従来どおり進む() {
-        let j = job("実装してください");
-        assert_eq!(
-            decide_quiet(&j, &peek(None), COMMIT_DELAY, COMMIT_DELAY),
-            Act::WriteCommit
-        );
-    }
-
-    /// **書き直しにも上限がある。** 永久に書き続けず、人へ返す。
-    #[test]
-    fn 書き直しにも上限がある() {
-        let mut j = job("実装してください");
-        j.tries = MAX_COMMIT_TRIES;
-        assert_eq!(
-            decide_quiet(&j, &peek(Some(DROPPED)), REWRITE_OK, REWRITE_OK),
-            Act::GaveUp
-        );
-        let j2 = job("実装してください");
-        assert_eq!(
-            decide_quiet(&j2, &peek(Some(DROPPED)), COMMIT_DELAY, GIVE_UP),
-            Act::GaveUp
-        );
-    }
-}
-
-#[cfg(test)]
 mod startup_modal_tests {
     use super::*;
 
@@ -1423,251 +1257,91 @@ mod startup_modal_tests {
         let mut p = Pending::new(Job::user(1, text), t0);
         // 書けた (Ready → Commit)。ここでは時計が進む。
         p.advance(Stage::Commit, t0);
-        // **書き込みが捨てられた証拠**: 入力欄は読めていて、しかも
-        // こちらの本文ではない何かが入っている。空は「囲みを読めなかった」と
-        // 区別が付かないので証拠にしない ([`Peek::input_seen`])。
-        let dropped = Peek {
-            input: Some("❯ 人が別のことを打っている".to_string()),
+        // **同じ段へ進めても沈黙の時計は戻らない。**
+        //
+        // 戻すと、同じ段で何かを繰り返す限り永久に諦められなくなる。
+        // (確定キーの手前で入力欄を読む関門は撤回した —
+        //  実機で 3 回退行を生み、利益はゼロだった。`withdrawn_gate_tests`)
+        let quiet = Peek {
+            idle: true,
             ..answered()
         };
-        assert!(holdup(&p.job, &dropped).is_none());
-        // 書き直しを繰り返しても、同じ段なので時計は戻らない。
-        //
-        // **書き直しには上限がある** ([`MAX_BODY_WRITES`])。数えるのは
-        // 実際に書く呼び出し側なので、ここでも同じように増やす。
-        // 上限が無いと実機で 806 回書き込んだ (`body_write_cap_tests`)。
-        let mut t = t0;
-        for _ in 0..MAX_BODY_WRITES {
-            t += BODY_REWRITE_WAIT + COMMIT_DELAY;
-            assert_eq!(p.act(&dropped, t), Act::WriteBody);
-            p.job.body_writes += 1;
-            p.advance(Stage::Commit, t);
-        }
-        // **輪が回り続けない。** 上限に達したら、確定へ進まず人へ返る
-        // (進めると `Verify` が空の入力欄を「届いた」と読んでしまう)。
-        t += BODY_REWRITE_WAIT + COMMIT_DELAY;
-        assert_eq!(p.act(&dropped, t), Act::GaveUp);
+        let before = p.quiet_at;
+        p.advance(Stage::Commit, t0 + COMMIT_DELAY);
+        assert_eq!(p.quiet_at, before, "同じ段への前進で時計が戻った");
+        // 段が変われば戻る (そこは進捗なので)。
+        p.advance(Stage::Verify, t0 + COMMIT_DELAY);
+        assert_ne!(p.quiet_at, before, "段が変わっても時計が戻らない");
+        // 入力欄に本文が残ったまま (= 届いていない) なら、最後の期限で人へ返る。
+        let landing = Peek {
+            input: Some(p.job.text.clone()),
+            idle: true,
+            ..answered()
+        };
+        assert_eq!(p.act(&landing, t0 + GIVE_UP_MAX), Act::GaveUp);
+        // 消えていれば届いたので完了 (撤回で失敗検出を殺していない)。
+        assert_eq!(p.act(&quiet, t0 + GIVE_UP_MAX), Act::Done);
     }
 }
 
 #[cfg(test)]
-mod body_write_cap_tests {
-    use super::*;
-
-    fn peek_blank() -> Peek {
-        Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            input_ready: true,
-            // **落ちた証拠になる入力欄** = 読めていて、しかもこちらの
-            // 本文ではない何かが入っている。空は「読めなかった」と
-            // 区別が付かないので証拠にしない ([`Peek::input_seen`])。
-            input: Some("❯ 人が別のことを打っている".to_string()),
-            ..Default::default()
-        }
-    }
-
-    /// **書き直しは数回で打ち切る。**
+mod withdrawn_gate_tests {
+    /// **入力欄の読みを、確定キーの関門にしない。**
     ///
-    /// 実機で、この枝に上限が無いまま **同じ指示文を 806 回**書き込んだ
-    /// (`COMMIT_DELAY` 120ms × 諦めるまでの 120 秒)。相手の入力欄は
-    /// 指示文のコピーで埋まり、**直そうとした当のものを壊した**。
-    /// 入力ログを足して初めて見えた。
+    /// 一晩の実測で 3 回退行を生み、確認できた利益はゼロだった:
+    ///
+    /// | 症状 | 実測 |
+    /// |---|---|
+    /// | 上限が無く同じ本文を書き続けた | Codex へ **806 回** |
+    /// | 起動中を「落ちた」と誤認して諦めた | 書き込み 19 件・配り直しの繰り返し |
+    /// | 読めない囲みを「落ちた」と誤認した | Codex に**確定キーが 0 回** (本文 9 回) |
+    ///
+    /// 入力欄の読み取りは CLI ごとに意味が違う。Codex は空ではなく
+    /// **こちらの本文でもないもの** (`Ask Codex to do anything` の囲み) を
+    /// 返すので、「読めていて別の何かがある」という*証拠らしきもの*が
+    /// 常に成立してしまい、確定へ一度も進まなかった。
+    ///
+    /// 動機のほうは別の手で満たしてある:
+    /// * 起動中に書かない → `agents::input_ready_ms` (`Stage::Ready`)
+    /// * 承認待ち・処理中に撃たない → `holdup`
+    /// * 届いていない証拠で撃ち直す → `Stage::Verify` の `still_pending`
+    ///
+    /// 同じ案が再提案されるのを防ぐため、**撤回した事実を番人で残す**
+    /// (CLAUDE.md「試して駄目だった案は消さずに残すこと」)。
     #[test]
-    fn 本文の書き直しは打ち切られる() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        // 上限までは書き直す。
-        for n in 0..MAX_BODY_WRITES {
-            j.body_writes = n;
-            assert_eq!(
-                decide(&j, &peek_blank(), long, long, long),
-                Act::WriteBody,
-                "{n} 回目の書き直しが止まっている"
-            );
-        }
-        // **上限に達したら人へ返す。** 確定へ進めると `Verify` が空の
-        // 入力欄を見て「届いた」と判断し、消そうとしていた嘘が戻る。
-        j.body_writes = MAX_BODY_WRITES;
-        assert_eq!(
-            decide(&j, &peek_blank(), long, long, long),
-            Act::GaveUp,
-            "上限に達しても書き直し続けている / 黙って完了にしている"
-        );
-    }
-
-    /// **間隔を空ける。** 詰めて撃つと、相手が描き終える前に次を書いて
-    /// 「見えない」を自分で作る。
-    #[test]
-    fn 書き直しの間隔を空ける() {
-        let mut j = Job::user(1, "実装してください".to_string());
-        j.stage = Stage::Commit;
-        j.body_writes = 1;
-        let soon = COMMIT_DELAY + Duration::from_millis(1);
+    fn 入力欄の読みを確定の関門にしない() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let body = src
+            .split("        Stage::Commit => {")
+            .nth(1)
+            .and_then(|t| t.split("\n        Stage::Verify => {").next())
+            .expect("Commit の腕がある");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            matches!(decide(&j, &peek_blank(), soon, soon, soon), Act::Wait(_)),
-            "間隔を空けずに書き直している"
+            !code.contains("input_seen") && !code.contains("still_pending"),
+            "確定の手前で入力欄を読んでいる (撤回した関門が戻っている)"
         );
+        // 撤回の経緯そのものが消えていないこと (消えると再提案される)。
+        assert!(body.contains("撤回した"), "撤回の理由が消えている");
     }
 
-    /// **見えているなら書き直さない** (これまでどおり確定へ進む)。
+    /// **`Verify` 側の判定は残っている。** 撤回で「届いていない証拠が
+    /// あっても撃ち直さない」まで戻してはいけない。
     #[test]
-    fn 見えていれば書き直さない() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let mut p = peek_blank();
-        p.input = Some(text.to_string());
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        assert_eq!(decide(&j, &p, long, long, long), Act::WriteCommit);
-    }
-
-    /// **数えているのは実際に書いた側。** 数え忘れると上限が効かない。
-    #[test]
-    fn 書いた回数を数えている() {
-        let src = include_str!("app/agent_sessions.rs").replace("\r\n", "\n");
-        let at = src.find("Act::WriteBody =>").expect("書き込みの腕がある");
-        let arm = &src[at..src[at..]
-            .find("Act::WriteCommit")
-            .map_or(src.len(), |i| at + i)];
+    fn 届いていない証拠での撃ち直しは残す() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let verify = src
+            .split("        Stage::Verify => {")
+            .nth(1)
+            .and_then(|t| t.split("\n    }\n}").next())
+            .expect("Verify の腕がある");
         assert!(
-            arm.contains("body_writes"),
-            "本文を書いた回数を数えていない (上限が効かない)"
+            verify.contains("still_pending"),
+            "入力欄に残っているかを見ていない"
         );
-    }
-}
-
-#[cfg(test)]
-mod starting_agent_tests {
-    use super::*;
-
-    /// **起動中の相手へ書き直さない・諦めない。**
-    ///
-    /// 実機で、起動中の Codex (`Update available!` の案内が出たまま MCP を
-    /// 立ち上げ中) へ 3 回書き直して諦め、配り直してはまた諦めるのを
-    /// 繰り返した。入力ログで **19 件の書き込み**として見えた。
-    /// 「入力欄に本文が無い」のは書き込みが落ちたからではなく、
-    /// **まだ描いていない**だけである。
-    #[test]
-    fn 起動中は書き直しも諦めもしない() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let starting = Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            // **まだ受け取れない** (カタログの `input_ready_ms` が待たせている)。
-            input_ready: false,
-            input: Some("❯ 人が別のことを打っている".to_string()),
-            ..Default::default()
-        };
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        for n in 0..=MAX_BODY_WRITES {
-            j.body_writes = n;
-            assert!(
-                matches!(decide(&j, &starting, long, long, long), Act::Wait(_)),
-                "起動中に書き直し/諦めをしている ({n} 回目)"
-            );
-        }
-        // **承認待ちでも同じ** (Enter が承認への回答になるので書けない)。
-        let approving = Peek {
-            attention: true,
-            ..starting.clone()
-        };
-        j.body_writes = MAX_BODY_WRITES;
-        assert!(matches!(
-            decide(&j, &approving, long, long, long),
-            Act::Wait(_)
-        ));
-    }
-
-    /// **受け取れる状態なら、これまでどおり書き直して打ち切る。**
-    /// 待つ理由の判定で、失敗の検出そのものを殺してはいけない。
-    #[test]
-    fn 受け取れるのに見えないときは打ち切る() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let ready = Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            input_ready: true,
-            input: Some("❯ 人が別のことを打っている".to_string()),
-            ..Default::default()
-        };
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        j.body_writes = 0;
-        assert_eq!(decide(&j, &ready, long, long, long), Act::WriteBody);
-        j.body_writes = MAX_BODY_WRITES;
-        assert_eq!(decide(&j, &ready, long, long, long), Act::GaveUp);
-    }
-}
-
-#[cfg(test)]
-mod unreadable_composer_tests {
-    use super::*;
-
-    /// **囲みを読めない CLI へ、確定キーが一度も飛ばない状態を作らない。**
-    ///
-    /// 実測 (入力ログ): 同じ Run で Codex には**本文が 9 回**書かれただけで
-    /// `\r` が 1 度も送られず、Antigravity には 本文 → `\r` と正しく
-    /// 流れていた。入力欄の読み取りは「カーソルから上へ辿って囲みを探す」
-    /// 形なので、**囲みを見つけられない CLI では空が返る**。それを
-    /// 「本文が入っていない」と読むと、届いていても届いていないと判断する。
-    #[test]
-    fn 読めない入力欄では確定へ進む() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let base = Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            input_ready: true,
-            ..Default::default()
-        };
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        // 読めない (None) / 読めたが空 — どちらも証拠にならない。
-        for input in [None, Some(String::new()), Some("   \n".to_string())] {
-            let p = Peek {
-                input,
-                ..base.clone()
-            };
-            for n in 0..=MAX_BODY_WRITES {
-                j.body_writes = n;
-                assert_eq!(
-                    decide(&j, &p, long, long, long),
-                    Act::WriteCommit,
-                    "読めない入力欄を「落ちた」と決めつけている (書いた回数 {n})"
-                );
-            }
-        }
-    }
-
-    /// **証拠があるときは、これまでどおり落ちたと判断する。**
-    /// 空を証拠から外したせいで、失敗の検出そのものが死んではいけない。
-    #[test]
-    fn 本文でないものが入っていれば落ちたと判断する() {
-        let text = "実装してください。最後まで終わらせて報告してください";
-        let mut j = Job::user(1, text.to_string());
-        j.stage = Stage::Commit;
-        let p = Peek {
-            running: true,
-            idle: true,
-            attention: false,
-            input_ready: true,
-            input: Some("❯ 人が別のことを打っている".to_string()),
-            ..Default::default()
-        };
-        let long = BODY_REWRITE_WAIT + COMMIT_DELAY;
-        j.body_writes = 0;
-        assert_eq!(decide(&j, &p, long, long, long), Act::WriteBody);
-        j.body_writes = MAX_BODY_WRITES;
-        assert_eq!(decide(&j, &p, long, long, long), Act::GaveUp);
     }
 }
