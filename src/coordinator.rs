@@ -196,7 +196,13 @@ pub fn deliverable(state: SessionState) -> bool {
 }
 
 /// タスクを割り当ててよい状態か(忙しくても割り当て自体は可能)。
-fn assignable(state: SessionState) -> bool {
+/// **配ってよい状態か。ここが唯一の決め所。**
+///
+/// スケジューラ ([`crate::features::team::imp::scheduler::Candidate::free`]) も
+/// この関数を通す。2 つ持つと、**スケジューラが提案して調停層が断る**組み合わせが
+/// 生まれ、毎 tick 「割り当てを見送りました」が記録される (実測で台帳が
+/// 500 件のそれだけで埋まり、他の記録が全部押し出された)。
+pub(crate) fn assignable(state: SessionState) -> bool {
     matches!(
         state,
         SessionState::Idle | SessionState::AwaitingInput | SessionState::Working

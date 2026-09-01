@@ -47,7 +47,13 @@ pub fn derive_agent_work_state(
     }
     // 3) 停滞。**Testing より優先**する。検証を始めた記録が残っていても、
     //    出力が動いていないなら止まっている。
-    if session == SessionState::Stalled {
+    // **停滞と呼ぶのは、仕事を持っているときだけ。**
+    //
+    // 持ち仕事が無い担当は出力が動かなくて当たり前なので、そのまま
+    // 「停滞」と読まれる。そして停滞には配らないので**二度と出力が
+    // 動かない** — 推測が自分で自分を裏付ける輪になる。実測で、空いている
+    // 担当が 3 体居るのにタスクが 5 本待ち続けた。
+    if session == SessionState::Stalled && task.is_some() {
         return AgentWorkState::Stalled;
     }
     // 4) タスクが詰まっている。
@@ -84,8 +90,13 @@ pub fn derive_agent_work_state(
         }
     }
     // 6) タスクを持っていない。
+    //
+    // **`Stalled` はここでは `Idle`。** 仕事が無いのだから出力が無いのは
+    // 当然で、配れる状態である。`Unknown` (画面が読めない) は据え置く —
+    // 読めない相手へ配ってよいかは調停層 (`coordinator::assignable`) が決める。
     match session {
-        SessionState::Idle => AgentWorkState::Idle,
+        SessionState::Idle | SessionState::Stalled => AgentWorkState::Idle,
+        SessionState::AwaitingInput => AgentWorkState::Idle,
         SessionState::Working => AgentWorkState::Working,
         _ => AgentWorkState::Unknown,
     }
@@ -168,7 +179,7 @@ mod tests {
     use super::super::testkit::task;
     use super::*;
 
-    fn t(state: TeamTaskState, role: TeamRole) -> TeamTask {
+    pub(super) fn t(state: TeamTaskState, role: TeamRole) -> TeamTask {
         let mut x = task(1, "a", &[]);
         x.state = state;
         x.role = role;
@@ -360,5 +371,47 @@ mod tests {
         // どれも起動を確かめられないときは、担当を 0 体にせず最初の AI CLI へ。
         let unknown = vec![row("Shell", false, false), row("Claude", true, false)];
         assert_eq!(preset_for_role(&unknown, Implementer), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod no_task_no_stall_tests {
+    use super::tests::t;
+    use super::*;
+
+    /// **仕事を持っていない担当は停滞ではない。**
+    ///
+    /// 実測の止まり方: Planner / Tester / Reviewer が `stalled` で、`ready` の
+    /// タスクが 5 本待っていた。持ち仕事が無ければ出力が動かなくて当たり前
+    /// なのに、それを停滞と読み、停滞には配らないので**二度と出力が動かない**。
+    /// 推測が自分で自分を裏付ける輪になっていた。
+    ///
+    /// ここが直し場である。スケジューラ側 (`Candidate::free`) を緩めて
+    /// 直そうとすると、調停層が別の規則で断り、**提案しては断られる**組み合わせで
+    /// 台帳が埋まる (実測 500 件)。
+    #[test]
+    fn 仕事が無い担当は停滞ではない() {
+        // 仕事を持っていない → 配れる状態として出す。
+        assert_eq!(
+            derive_agent_work_state(SessionState::Stalled, None, None, None),
+            AgentWorkState::Idle,
+            "手ぶらの担当を停滞と呼んでいる (二度と配られなくなる)"
+        );
+        assert_eq!(
+            derive_agent_work_state(SessionState::AwaitingInput, None, None, None),
+            AgentWorkState::Idle
+        );
+        // **仕事を持っているのに動かないのは、本当の停滞。**
+        let t = t(TeamTaskState::Running, TeamRole::Implementer);
+        assert_eq!(
+            derive_agent_work_state(SessionState::Stalled, Some(&t), None, None),
+            AgentWorkState::Stalled,
+            "担当を持ったまま止まっている相手を見逃している"
+        );
+        // 読めない相手は据え置く (配ってよいかは調停層が決める)。
+        assert_eq!(
+            derive_agent_work_state(SessionState::Unknown, None, None, None),
+            AgentWorkState::Unknown
+        );
     }
 }

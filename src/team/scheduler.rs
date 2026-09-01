@@ -74,11 +74,17 @@ impl Candidate {
     /// 設計原則 4「エージェントの状態を画面から推測しない」の具体形 —
     /// **何も配っていないという構造的な事実**のほうが、画面の読みより強い。
     fn free(&self) -> bool {
-        self.holding.is_none()
-            && !matches!(
-                self.state,
-                SessionState::Exited | SessionState::WaitingApproval
-            )
+        // **配ってよいかの判定は調停層の 1 本を借りる。**
+        //
+        // ここに別の規則を書くと、**提案しては断られる**組み合わせが生まれ、
+        // 毎 tick 「割り当てを見送りました」が記録される (実測で台帳が
+        // 500 件のそれだけで埋まった)。
+        //
+        // 「仕事を持っていない担当が停滞に見えて二度と配られない」問題は、
+        // ここを緩めて解くのではなく **`roles::derive_agent_work_state` が
+        // 停滞と呼ばない**ことで解く (持ち仕事が無ければ出力が動かなくて
+        // 当たり前なので、そもそも停滞ではない)。
+        self.holding.is_none() && crate::coordinator::assignable(self.state)
     }
 }
 
@@ -358,7 +364,7 @@ mod tests {
     use super::super::testkit::task;
     use super::*;
 
-    fn cand(id: u64, state: SessionState, caps: &[&str]) -> Candidate {
+    pub(super) fn cand(id: u64, state: SessionState, caps: &[&str]) -> Candidate {
         Candidate {
             agent: AgentId::new(format!("a{id}")),
             session: id,
@@ -517,27 +523,31 @@ mod tests {
         assert_eq!(p.unassigned, vec![Unassigned::NoCandidate(1)]);
     }
 
-    /// **仕事を持っていない担当は、画面が読めなくても空いている。**
+    /// **手ぶらの担当へは配れる。**
     ///
-    /// 実機の止まり方をそのまま置いた: Planner / Tester / Reviewer が
-    /// `stalled` で、`ready` のタスクが 5 本待っていた。停滞は
-    /// **画面から推し量った値**で、仕事を持っていない担当は出力が動かなくて
-    /// 当たり前 — そこで配るのをやめると、二度と出力が動かない。
-    /// 推測が自分で自分を裏付ける輪になる。
+    /// 実測の止まり方: Planner / Tester / Reviewer が `stalled` で、`ready` の
+    /// タスクが 5 本待っていた。空いている担当と待っている仕事が永久に
+    /// 出会えなかった。
+    ///
+    /// **最初はここ (`free()`) を緩めて直したが、それは誤りだった。**
+    /// 調停層は別の規則で断るので、**提案しては断られる**組み合わせが生まれ、
+    /// 毎 tick 「割り当てを見送りました」が積まれて台帳 500 件がそれだけに
+    /// なった。正しい直し場は `roles::derive_agent_work_state` — 仕事を
+    /// 持っていない担当を**そもそも停滞と呼ばない** (`roles::tests::
+    /// 仕事が無い担当は停滞ではない` が対の番人)。ここは配れることだけを見る。
     #[test]
-    fn 手ぶらの担当は状態が読めなくても配る() {
+    fn 手ぶらの担当へは配れる() {
         let tasks = vec![
             ready(1, "a", &[]),
             ready(2, "b", &[]),
             ready(3, "c", &[]),
             ready(4, "d", &[]),
-            ready(5, "e", &[]),
         ];
         let cands = vec![
-            cand(1, SessionState::Stalled, &[]),
-            cand(2, SessionState::Stalled, &[]),
-            cand(3, SessionState::Unknown, &[]),
-            cand(4, SessionState::AwaitingInput, &[]),
+            cand(1, SessionState::Idle, &[]),
+            cand(2, SessionState::Idle, &[]),
+            cand(3, SessionState::AwaitingInput, &[]),
+            cand(4, SessionState::Working, &[]),
         ];
         let p = plan_assignments(&tasks, &cands, &BTreeMap::new());
         assert_eq!(p.assignments.len(), 4, "手ぶらの担当へ配れていない");
@@ -580,5 +590,66 @@ mod tests {
         let p = plan_assignments(&tasks, &[], &BTreeMap::new());
         assert!(p.assignments.is_empty());
         assert_eq!(p.unassigned, vec![Unassigned::NoCandidate(1)]);
+    }
+}
+
+#[cfg(test)]
+mod one_rule_tests {
+    use super::tests::cand;
+    use super::*;
+
+    /// **配ってよいかの規則は 1 本だけ。**
+    ///
+    /// スケジューラと調停層が別々の規則を持つと、**提案しては断られる**
+    /// 組み合わせが生まれ、毎 tick 「割り当てを見送りました」が積まれる。
+    /// 実測で台帳 500 件がそれだけになり、計画も起動も伝言も押し出されて
+    /// 人には何が起きたか一切追えなくなった。
+    #[test]
+    fn 配ってよいかの規則は調停層と同じ() {
+        for st in [
+            SessionState::Idle,
+            SessionState::AwaitingInput,
+            SessionState::Working,
+            SessionState::WaitingApproval,
+            SessionState::Stalled,
+            SessionState::Exited,
+            SessionState::Unknown,
+        ] {
+            let c = cand(1, st, &[]);
+            assert_eq!(
+                c.free(),
+                crate::coordinator::assignable(st),
+                "{st:?} でスケジューラと調停層の判断が違う (提案しては断られる)"
+            );
+        }
+        // 保有中はどちらにせよ配らない。
+        let mut busy = cand(1, SessionState::Idle, &[]);
+        busy.holding = Some(9);
+        assert!(!busy.free(), "保有中の担当へ配ろうとしている");
+    }
+
+    /// **規則をスケジューラ側に書き写していない。**
+    /// 書き写すと、片方だけ直したときに静かにずれる。
+    #[test]
+    fn 規則を書き写していない() {
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn free(&self) -> bool {")
+            .nth(1)
+            .and_then(|t| t.split("\n    }\n").next())
+            .expect("free がある");
+        assert!(
+            body.contains("coordinator::assignable"),
+            "調停層の規則を借りていない"
+        );
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("SessionState::"),
+            "スケジューラ側に状態の一覧を書き写している"
+        );
     }
 }

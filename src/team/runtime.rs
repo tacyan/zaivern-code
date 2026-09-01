@@ -375,6 +375,12 @@ pub struct TeamRuntime {
     /// 保存しない — `previews` と同じ理由で、再起動後に前の実行の静けさを
     /// 引き継ぐと、起こし直したばかりの担当をいきなり停滞と呼ぶ。
     stalls: BTreeMap<AgentId, StallWatch>,
+    /// **一度書いた「割り当てを見送りました」の覚え書き。**
+    ///
+    /// 断りは配置から導かれるので、配置が変わるまで毎 tick 同じ行が出る。
+    /// 保存しない (`previews` / `stalls` と同じ) — 再起動後に 1 度書き直すのは
+    /// 害が無く、覚え書きを永続化すると「消えた理由が二度と出ない」ほうが困る。
+    blocked_notes: HashSet<String>,
 }
 
 /// エージェント 1 体ぶんの画面プレビューに残す文字数。
@@ -806,6 +812,7 @@ impl TeamRuntime {
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
             stalls: BTreeMap::new(),
+            blocked_notes: HashSet::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
@@ -936,6 +943,7 @@ impl TeamRuntime {
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
             stalls: BTreeMap::new(),
+            blocked_notes: HashSet::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
@@ -3773,12 +3781,21 @@ impl TeamRuntime {
                 }
                 Err(refusal) => {
                     // 既存側が断った。**回避しない。**
-                    self.log(
-                        TeamEventKind::TaskBlocked,
-                        None,
-                        None,
-                        format!("#{} の割り当てを見送りました: {}", a.task, refusal.label()),
-                    );
+                    //
+                    // ただし**同じ理由を毎 tick 書かない**。断りは配置から
+                    // 導かれる話なので、配置が変わるまで同じ行が出続ける。
+                    // 実測では 2 秒ごとに 2 件積まれ、**台帳 500 件がこれだけ**に
+                    // なって他の記録が全部押し出された (計画も起動も伝言も
+                    // 消えて、人には何が起きたか一切追えない)。
+                    let mark = format!("{}:{}", a.task, refusal.label());
+                    if self.blocked_notes.insert(mark) {
+                        self.log(
+                            TeamEventKind::TaskBlocked,
+                            None,
+                            None,
+                            format!("#{} の割り当てを見送りました: {}", a.task, refusal.label()),
+                        );
+                    }
                     if let coordinator::AssignRefusal::FileOverlap { with, .. } = refusal {
                         self.raise(
                             DecisionKind::FileScopeOverlap,
