@@ -1198,3 +1198,30 @@ fn 実行側は必ず成否を返す() {
         );
     }
 }
+
+/// **盤面に描く端末は、触れる。ただしホイールは取り合わない。**
+///
+/// 読むだけにしていたら `Yes, I trust this folder` のような**答えないと
+/// 先へ進めない確認**に答えられず、実機でセッションが `code 1` で終了した。
+/// 盤面の中で完結させるのが目的なのに、答えられないなら結局よそへ行くことになる。
+///
+/// 一方で `hover_scroll` を true にすると、外側の縦スクロールと端末自身の
+/// スクロールが取り合いになって行が重なる (実際にそう報告された)。
+#[test]
+fn 盤面の端末は触れるがホイールは取り合わない() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_board_ui").expect("盤面の描画"));
+    let call = body
+        .split("crate::terminal::draw(")
+        .nth(1)
+        .and_then(|t| t.split(')').next())
+        .expect("端末を描いている");
+    // 引数は (ui, s, theme, font, interactive, allow_resize, hover_scroll)
+    let args: Vec<&str> = call.split(',').map(str::trim).collect();
+    assert_eq!(args.len(), 7, "端末の描画引数が変わった: {call}");
+    assert_eq!(args[4], "true", "触れない端末になっている (確認に答えられない)");
+    assert_eq!(
+        args[6], "false",
+        "ホイールを取り合う設定になっている (行が重なって崩れる)"
+    );
+}

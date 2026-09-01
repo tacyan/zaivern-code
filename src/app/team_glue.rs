@@ -590,14 +590,19 @@ impl ZaivernApp {
             let Some(s) = sessions.iter_mut().find(|s| s.id == sid) else {
                 return false;
             };
-            // **読むだけにする。**
+            // **触れる端末にする。**
             //
-            // 触れる端末にすると、外側の縦スクロールと端末自身のスクロールが
-            // 取り合いになり、行が重なって崩れる (実際にそう報告された)。
-            // 打ちたい人はエージェントのタブへ行けばよいので、盤面は
-            // 「見るだけ」に徹する — `interactive` も `hover_scroll` も false。
-            // 大きさは札が確定させるので、こちらからは変えない。
-            crate::terminal::draw(ui, s, &theme, font, false, false, false);
+            // 読むだけにしていたら、`Yes, I trust this folder` のような
+            // **答えないと先へ進めない確認**に答えられなくなった (実機で
+            // セッションが `code 1` で終了した)。盤面の中で完結させるのが
+            // 目的なのに、答えられないなら結局よそへ行くことになる。
+            //
+            // ただし `hover_scroll` は false のまま。true にすると外側の
+            // 縦スクロールと端末自身のスクロールが取り合いになり、行が
+            // 重なって崩れる (実際にそう報告された)。崩れの本体は
+            // 「大きさを確定せずに描いていた」ことで、そちらは札の側で
+            // `allocate_ui_with_layout` により確定済み。
+            crate::terminal::draw(ui, s, &theme, font, true, false, false);
             true
         };
         let acts = panel::with_panel(|p| {
