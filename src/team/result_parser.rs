@@ -248,6 +248,49 @@ impl AcceptedResult {
     }
 }
 
+/// **文字列の中の生の制御文字を、JSON として読める形へ直す。**
+///
+/// エージェントは本文の中で**改行をそのまま**書いてくる。JSON の仕様では
+/// 文字列の中に生の制御文字を置けないので、`serde_json` は
+/// 「control character found while parsing a string」で断る。
+///
+/// 実機では**伝言 14 通が全部これで捨てられていた** — 仕組みは動いているのに
+/// 1 通も届かなかった。形式を守れと言い続けるより、こちらが読めるように
+/// するほうが速い (相手は毎回違うモデルで、こちらの都合は知らない)。
+///
+/// **文字列の中だけ**を直す。構造 (波括弧やカンマの間の改行) は JSON として
+/// 正しいので触らない。
+pub fn escape_raw_controls(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut in_str = false;
+    let mut esc = false;
+    for c in src.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_str => {
+                out.push(c);
+                esc = true;
+            }
+            '"' => {
+                in_str = !in_str;
+                out.push(c);
+            }
+            '\n' if in_str => out.push_str("\\n"),
+            '\r' if in_str => out.push_str("\\r"),
+            '\t' if in_str => out.push_str("\\t"),
+            c if in_str && (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// 囲まれたブロックを全部取り出す (開始 → 終了の順で、入れ子は無いものとする)。
 ///
 /// **上限つき。** 走査対象そのものも末尾 [`SCAN_MAX_BYTES`] だけを見る。
@@ -338,8 +381,8 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
     if body.len() > BLOCK_MAX_BYTES {
         return Err(RejectReason::TooLarge { bytes: body.len() });
     }
-    let doc: ResultDoc =
-        serde_json::from_str(body).map_err(|e| RejectReason::BadJson(e.to_string()))?;
+    let doc: ResultDoc = serde_json::from_str(&escape_raw_controls(body))
+        .map_err(|e| RejectReason::BadJson(e.to_string()))?;
     if doc.changed_files.len() > ARRAY_MAX {
         return Err(RejectReason::ArrayTooLong {
             field: "changed_files",
@@ -569,8 +612,8 @@ pub fn check_message(
     known: &[(AgentId, String)],
     from: &AgentId,
 ) -> Result<(Vec<AgentId>, String), MessageReject> {
-    let doc: MessageDoc =
-        serde_json::from_str(body).map_err(|e| MessageReject::BadJson(e.to_string()))?;
+    let doc: MessageDoc = serde_json::from_str(&escape_raw_controls(body))
+        .map_err(|e| MessageReject::BadJson(e.to_string()))?;
     let to = doc.to.trim();
     if to.is_empty() {
         return Err(MessageReject::NoTarget);
@@ -673,7 +716,8 @@ pub fn parse_event(body: &str) -> Result<EventDoc, EventReject> {
         return Err(EventReject::TooLarge { bytes: body.len() });
     }
     let doc: EventDoc =
-        serde_json::from_str(body).map_err(|e| EventReject::BadJson(e.to_string()))?;
+        serde_json::from_str(&escape_raw_controls(body))
+            .map_err(|e| EventReject::BadJson(e.to_string()))?;
     if !EVENT_KINDS.contains(&doc.kind.trim()) {
         return Err(EventReject::UnknownKind(doc.kind.clone()));
     }
@@ -1401,4 +1445,41 @@ mod tests {
             "中身がひな型と違うのだから echo ではない"
         );
     }
+
+    /// **本文に生の改行が入っていても伝言は届く。**
+    ///
+    /// 実機で伝言 14 通が全部「control character found while parsing a
+    /// string」で捨てられていた。仕組みは動いているのに 1 通も届いて
+    /// いなかった — エージェントは本文の改行をそのまま書いてくる。
+    #[test]
+    fn 本文に生の改行があっても伝言は届く() {
+        let known: Vec<(AgentId, String)> = vec![
+            (AgentId::new("a"), "implementer".into()),
+            (AgentId::new("b"), "reviewer".into()),
+        ];
+        // 生の改行入り (これが実機で来ていた形)。
+        let body = "{\"to\": \"b\", \"text\": \"設計が終わった。\n次は実装に入って\"}";
+        assert!(
+            serde_json::from_str::<MessageDoc>(body).is_err(),
+            "素の serde_json はこれを読めない (だから捨てられていた)"
+        );
+        let (to, text) = check_message(body, &known, &AgentId::new("a")).expect("届く");
+        assert_eq!(to, vec![AgentId::new("b")]);
+        assert!(text.contains("次は実装に入って"), "本文が欠けている: {text:?}");
+        assert!(text.contains('\n'), "改行が失われている: {text:?}");
+    }
+
+    /// **直すのは文字列の中だけ。** 構造の改行は JSON として正しいので触らない。
+    #[test]
+    fn 直すのは文字列の中だけ() {
+        let pretty = "{\n  \"to\": \"b\",\n  \"text\": \"ok\"\n}";
+        assert_eq!(escape_raw_controls(pretty), pretty, "構造を書き換えている");
+        // 文字列の中のタブは逃がす。
+        let raw = "{\"text\": \"a\tb\"}";
+        assert!(escape_raw_controls(raw).contains("\\t"));
+        // 既にエスケープ済みのものを二重にしない。
+        let done = "{\"text\": \"a\\nb\"}";
+        assert_eq!(escape_raw_controls(done), done, "二重にエスケープしている");
+    }
+
 }

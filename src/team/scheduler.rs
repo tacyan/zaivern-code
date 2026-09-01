@@ -157,9 +157,21 @@ pub fn plan_assignments(
         .filter(|t| t.state == TeamTaskState::Ready)
         .collect();
     ready.sort_by(|a, b| {
+        // **レビューを先に配る。**
+        //
+        // 後回しにすると、空いている担当が新しい実装で埋まってしまい、
+        // レビューの番が来たときには**実装した本人しか残っていない**
+        // (自分のレビューは禁止なので配れない)。実機ではこれで 8 件が
+        // 「実装した本人しかレビュー候補がいません」で人の判断待ちになり、
+        // Goal ごと止まった。
+        //
+        // レビューは実装より短く、終われば担当が空くので、先に通すほうが
+        // 全体も速い。
+        let ra = u8::from(a.review_of.is_none());
+        let rb = u8::from(b.review_of.is_none());
         let da = depth.get(&a.id).copied().unwrap_or(0);
         let db = depth.get(&b.id).copied().unwrap_or(0);
-        db.cmp(&da).then(a.id.cmp(&b.id))
+        ra.cmp(&rb).then(db.cmp(&da)).then(a.id.cmp(&b.id))
     });
 
     // すでに誰かが握っているファイル (このフレームで配ったぶんも足す)。
