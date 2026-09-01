@@ -3981,3 +3981,47 @@ fn 伝言には担当が変わっていないことを添える() {
         "連絡か指示かが区別できない: {sent}"
     );
 }
+
+/// **書いている途中の画面から報告を断らない。**
+///
+/// 実機 (Test6) で、担当が正しく報告しているのに
+/// `報告の JSON を読めません: invalid type: string "task_id"` が記録された。
+/// 1 tick が描画の途中に当たり、マーカーの間に `"task_id"` の断片しか
+/// 無かったため。断ると、落ち度の無い担当に却下が積まれ、人には
+/// 「エージェントが壊れた報告を出した」ように見える。
+#[test]
+fn 書き途中の報告は断らずに見送る() {
+    let (mut rt, sids, tid) = to_assigned();
+    let (sid, _, _) = assignments(&rt)[0].clone();
+    let before = rt.events().count();
+    // 描画の途中: 中身の断片しか無い。
+    // **指示文には無い断片**を使う (指示文に含まれる断片は、既存の
+    // エコー除去が先に落としてしまい、この番人が何も守らなくなる)。
+    let half = format!(
+        "{}\n  \"summary\": \"3D canvas と Hero を実装\",\n{}",
+        rp::RESULT_OPEN,
+        rp::RESULT_CLOSE
+    );
+    tick_text(&mut rt, 20, &sids, sid, &half);
+    let rejected: Vec<String> = rt
+        .events()
+        .skip(before)
+        .filter(|e| e.kind == TeamEventKind::Rejected)
+        .map(|e| e.summary.clone())
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "書き途中の画面で却下が記録された: {rejected:?}"
+    );
+    // **次の tick で全部揃えば、これまでどおり受け付ける。**
+    let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap().0;
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let full = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 21, &sids, sid, &full);
+    assert_ne!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Running,
+        "揃った報告まで見送っている"
+    );
+}

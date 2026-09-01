@@ -2015,6 +2015,11 @@ impl TeamRuntime {
             // 送っていなければひな型は画面に無いので、素通しでよい。
             let sent = self.sent_instruction(&agent);
             let keep = |body: &String, open: &str, close: &str| -> bool {
+                // **書いている途中の塊は見送る。** 断ると、落ち度の無い
+                // 担当に却下が記録される (`rp::looks_incomplete`)。
+                if rp::looks_incomplete(body) {
+                    return false;
+                }
                 sent.as_deref()
                     .is_none_or(|t| !rp::is_prompt_echo(body, t, open, close))
             };
