@@ -26,6 +26,13 @@
 //!
 //! `all` は自分以外の全員。**自分自身へは届けない** (自分の画面へ自分の
 //! 言葉を流しても何も起きないうえ、無限に往復しうる)。
+//!
+//! ## 届かなかったときの言い分け
+//!
+//! 断り文は Team 側と**同じ 1 つ** ([`TalkReject`] = `rp::MessageReject`)。
+//! 「相手が居ない」と「相手は居るが自分宛て」を混ぜると、エージェントは
+//! 綴りを疑って**同じ宛先を書き直す** (Team 側が実機で 2 回踏んだ)。
+//! ここに 2 つめの文面を置くと、同じ状況で説明が食い違う。
 
 use crate::features::team::imp::result_parser as rp;
 
@@ -45,28 +52,23 @@ pub struct Delivery {
     pub text: String,
 }
 
-/// 断った理由 (人へそのまま出す)。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TalkReject {
-    /// JSON として読めない。
-    BadJson(String),
-    /// 宛先が空 / 居ない。
-    NoTarget(String),
-    /// 本文が空。
-    Empty,
-}
-
-impl TalkReject {
-    pub fn detail(&self) -> String {
-        match self {
-            TalkReject::BadJson(e) => format!("伝言の JSON を読めません: {e}"),
-            TalkReject::NoTarget(t) => {
-                format!("伝言の宛先「{t}」に当たるエージェントが居ません")
-            }
-            TalkReject::Empty => "伝言の本文が空です".to_string(),
-        }
-    }
-}
+/// 断った理由 (人へそのまま出す)。**Team 側と同じ型をそのまま使う。**
+///
+/// 断り文を 2 つ持つと、片方にしか言い分けが入らない。実際にそうなった:
+/// Team は「その宛先はあなた自身です」と言えるのに、通常タブは同じ状況で
+/// 「居ません」のままで、**同じ状況の説明が食い違っていた**。
+///
+/// **借りているのは*文面*だけで、*宛先の照合*はこちらが持つ。**
+/// Team は ID / 役割の完全一致、通常タブはタブ名の大小無視 + 前方一致で、
+/// 規則そのものが違うため `rp::check_message` はそのままでは使えない
+/// (規則を Team に合わせると `codex` で `Codex (全自動)` を呼べなくなる)。
+///
+/// 将来ほんとうに 1 本へまとめるなら、`check_message` から照合を関数引数
+/// (`impl Fn(&T) -> bool`) として外へ出し、`(候補一覧, 自分, 照合)` →
+/// `Result<Vec<T>, MessageReject>` の 1 本にする。そうすれば**降り方**
+/// (`all` → 自分自身 → 表に無い) まで 1 か所になる。いまは
+/// `result_parser.rs` を触れないので、降り方だけ [`one`] に写している。
+pub type TalkReject = rp::MessageReject;
 
 /// 画面テキストから伝言を取り出して、届け先を決める (**純関数**)。
 ///
@@ -102,29 +104,51 @@ pub fn deliveries(
 fn one(body: &str, from: u64, peers: &[Peer], sender: &str) -> Result<Vec<Delivery>, TalkReject> {
     // **読み方は Team と同じ 1 つ** (`rp::read_message`)。ここに 2 つめの
     // パーサを置くと、手書き JSON の綴り間違いを拾えるのが片方だけになる。
-    let doc = rp::read_message(body).map_err(|e| TalkReject::BadJson(e.detail()))?;
+    let doc = rp::read_message(body)?;
     let to = doc.to.as_str();
     if to.is_empty() {
-        return Err(TalkReject::NoTarget(String::new()));
+        return Err(TalkReject::NoTarget);
     }
     let text = doc.text.clone();
     if text.is_empty() {
         return Err(TalkReject::Empty);
     }
-    let others = peers.iter().filter(|p| p.id != from);
-    let targets: Vec<&Peer> = if to.eq_ignore_ascii_case("all") {
-        others.collect()
+    // **照合はタブ固有** (大小無視 + 前方一致)。人が打つ名前は揺れるので、
+    // 揺れを吸収するのはこちら側の仕事 — Team の ID / 役割は完全一致で、
+    // ここを Team に合わせると `codex` で `Codex (全自動)` を呼べなくなる。
+    let want = to.to_lowercase();
+    let hits = |p: &Peer| {
+        let n = p.name.to_lowercase();
+        n == want || n.starts_with(&want) || want.starts_with(&n)
+    };
+    let all = to.eq_ignore_ascii_case("all");
+    let others = || peers.iter().filter(|p| p.id != from);
+    let targets: Vec<&Peer> = if all {
+        others().collect()
     } else {
-        let want = to.to_lowercase();
-        others
-            .filter(|p| {
-                let n = p.name.to_lowercase();
-                n == want || n.starts_with(&want) || want.starts_with(&n)
-            })
-            .collect()
+        others().filter(|p| hits(p)).collect()
     };
     if targets.is_empty() {
-        return Err(TalkReject::NoTarget(to.to_string()));
+        // **「居ません」は最後の枝。** 降り方は Team の `check_message` と
+        // 同じ順 (`all` → 自分自身 → 表に無い)。順番を変えると、相手は
+        // 居るのに「居ません」と言うことになり、エージェントは綴りを疑って
+        // 同じ宛先を書き直す (Team 側が実機で 2 回踏んだ)。
+        if all {
+            // 居ないのは相手ではなく「あなた以外のタブ」。
+            return Err(TalkReject::NoOtherAgents);
+        }
+        if peers.iter().any(|p| p.id == from && hits(p)) {
+            // **自分自身。** 相手が居ないのではなく、宛先が自分だから届かない。
+            // 判定には**相手を探したのと同じ照合**を使う (別の規則で見ると、
+            // 相手には当たらないのに自分にも当たらない宛先が出る)。
+            return Err(TalkReject::SelfTarget(to.to_string()));
+        }
+        // 表に無い宛先は今までどおり断る (捏造を通さない)。書けた宛先も
+        // 一緒に返す — 断るだけだと、送り主は同じ綴りを書き直すしかない。
+        return Err(TalkReject::UnknownTarget {
+            to: to.to_string(),
+            known: others().map(|p| p.name.clone()).collect(),
+        });
     }
     Ok(targets
         .into_iter()
@@ -272,16 +296,93 @@ mod tests {
         assert_eq!(ids, vec![1, 3], "自分 (2) が入っている");
     }
 
-    /// **居ない相手は断る。** 届いた気にさせない。
+    /// **居ない相手は断る。** 届いた気にさせない (捏造を通さない)。
     #[test]
     fn 居ない相手は断る() {
         let (d, bad) = deliveries(&msg("だれか", "やあ"), 1, &peers(), None);
         assert!(d.is_empty());
         assert!(
-            matches!(bad.as_slice(), [TalkReject::NoTarget(_)]),
+            matches!(bad.as_slice(), [TalkReject::UnknownTarget { .. }]),
             "{bad:?}"
         );
         assert!(bad[0].detail().contains("だれか"));
+        // **書けた宛先も返す。** 断るだけだと同じ綴りを書き直すしかない。
+        assert!(bad[0].detail().contains("Codex"), "{}", bad[0].detail());
+    }
+
+    /// **自分の名前を宛先に書いても「居ません」と言わない。**
+    ///
+    /// 実機で Team 側が踏んだのと同じ形 (役割 `tester` の担当が
+    /// `"to": "tester"` と書いた)。相手は居るのに「居ません」と返すと、
+    /// エージェントは綴りを疑って**同じ宛先を書き直す** — 2 回繰り返した。
+    #[test]
+    fn 自分の名前を宛先に書いたら自分自身だと言う() {
+        // `Claude Code` から `Claude Code` 宛て。他のタブには 1 つも当たらない。
+        let (d, bad) = deliveries(&msg("Claude Code", "頼む"), 1, &peers(), None);
+        assert!(d.is_empty(), "自分へ届けている: {d:?}");
+        assert!(
+            matches!(bad.as_slice(), [TalkReject::SelfTarget(t)] if t == "Claude Code"),
+            "{bad:?}"
+        );
+        // **文面も Team と同じ 1 つ。** ここで別の文を作ると食い違う。
+        assert_eq!(
+            bad[0].detail(),
+            rp::MessageReject::SelfTarget("Claude Code".to_string()).detail()
+        );
+        assert_ne!(
+            bad[0].detail(),
+            rp::MessageReject::UnknownTarget {
+                to: "Claude Code".to_string(),
+                known: vec!["Codex".to_string(), "Codex (全自動)".to_string()],
+            }
+            .detail(),
+            "「居ません」のままになっている"
+        );
+    }
+
+    /// **1 つしかタブが無いのに `all` と書いたとき、宛先を疑わせない。**
+    /// 居ないのは相手ではなく「あなた以外のタブ」なので、`all` の綴りを
+    /// 直させても永久に直らない。
+    #[test]
+    fn 自分しか居ないallは宛先のせいにしない() {
+        let only = vec![Peer {
+            id: 1,
+            name: "Claude Code".into(),
+        }];
+        let (d, bad) = deliveries(&msg("all", "できた"), 1, &only, None);
+        assert!(d.is_empty(), "{d:?}");
+        assert!(
+            matches!(bad.as_slice(), [TalkReject::NoOtherAgents]),
+            "{bad:?}"
+        );
+        assert_eq!(bad[0].detail(), rp::MessageReject::NoOtherAgents.detail());
+        assert_ne!(
+            bad[0].detail(),
+            rp::MessageReject::UnknownTarget {
+                to: "all".to_string(),
+                known: Vec::new(),
+            }
+            .detail(),
+            "all の綴りを疑わせている"
+        );
+    }
+
+    /// **断り文はこちらで作り直さない。** 2 つ持つと、片方にしか
+    /// 言い分けが入らず、同じ状況で説明が食い違う (実際にそうなった)。
+    #[test]
+    fn 断り文をこちらで作り直していない() {
+        let src = include_str!("agent_talk.rs").replace("\r\n", "\n");
+        // 見るのは**テストより手前だけ**。全体を見ると、この検査自身が
+        // 書いた文字列を拾って空回りする (わざと壊しても緑になる)。
+        let head = src.split("#[cfg(test)]").next().expect("本体がある");
+        assert!(
+            !head.contains("fn detail"),
+            "断り文をこちらで作り直している (Team と食い違う)"
+        );
+        assert!(
+            head.contains("pub type TalkReject = rp::MessageReject;"),
+            "断り理由の型が Team と別になっている"
+        );
     }
 
     /// **本文に生の改行が入っていても届く** (Team と同じ読み取りを通す)。

@@ -57,6 +57,34 @@ pub const ARRAY_MAX: usize = 64;
 /// 親子階層の深さ上限。
 pub const MAX_DEPTH: usize = 4;
 
+/// 却下文へ添える「使える語」の件数上限。
+///
+/// 表が伸びても却下文が端末を押し流さないための線。**切ったときは
+/// 切ったと書く** — 黙って落とすと、載らなかった語が「使えない語」に見える。
+pub const REJECT_HINT_MAX: usize = 12;
+
+/// 「表に無い」と断るときに添える一覧を、**表そのものから**組み立てる。
+///
+/// 実機の台帳に `#2 の完了報告を却下: 未知の status「probe」` とだけ残った。
+/// 断る判断は正しいが、**何なら使えるのかを 1 文字も言っていない**ので、
+/// エージェントは綴りを直しようがない (人が見ても直し方が分からない)。
+///
+/// 却下文へ語を書き写すと、表を増やした日から却下文だけが古い一覧を出し続ける。
+/// だからここは**表を受け取り**、文面を作るのはこの 1 か所だけにする。
+/// 番人は `tests::却下文に語を書き写していない`。
+fn accepted_line<'a>(lead: &str, words: impl IntoIterator<Item = &'a str>) -> String {
+    let all: Vec<&str> = words.into_iter().collect();
+    if all.is_empty() {
+        return String::new();
+    }
+    let shown = all.len().min(REJECT_HINT_MAX);
+    let mut list = all[..shown].join(" / ");
+    if all.len() > shown {
+        list.push_str(&format!(" ほか {} 件", all.len() - shown));
+    }
+    format!("。{lead} {list} です")
+}
+
 // ── 完了報告 ─────────────────────────────────────────────────────────
 
 /// 報告の JSON。
@@ -143,7 +171,10 @@ impl RejectReason {
             }
             RejectReason::ValidationFailed(c) => format!("検証が失敗しています: {}", c.join(", ")),
             RejectReason::BlockersRemain(b) => format!("未解決の blocker: {}", b.join(", ")),
-            RejectReason::UnknownStatus(s) => format!("未知の status「{s}」"),
+            RejectReason::UnknownStatus(s) => format!(
+                "未知の status「{s}」{}",
+                accepted_line("使えるのは", STATUS_WORDS.iter().map(|(w, _)| *w))
+            ),
         }
     }
 }
@@ -155,6 +186,20 @@ pub enum ReportedStatus {
     Blocked,
     Failed,
 }
+
+/// 受け付ける status。**表に無い語は拒否する** (捏造を通さない)。
+///
+/// 綴りの別名もここへ並べる。判定 ([`accept`]) と却下文
+/// ([`RejectReason::detail`]) が**同じ表**を読むので、語を足せば
+/// 断り文にも自動で載る。
+pub const STATUS_WORDS: &[(&str, ReportedStatus)] = &[
+    ("completed", ReportedStatus::Completed),
+    ("done", ReportedStatus::Completed),
+    ("complete", ReportedStatus::Completed),
+    ("blocked", ReportedStatus::Blocked),
+    ("failed", ReportedStatus::Failed),
+    ("error", ReportedStatus::Failed),
+];
 
 /// **Zaivern 自身が測った**変更ファイルの証跡。
 ///
@@ -583,11 +628,11 @@ pub fn accept(
         });
     }
 
-    let status = match doc.status.trim().to_ascii_lowercase().as_str() {
-        "completed" | "done" | "complete" => ReportedStatus::Completed,
-        "blocked" => ReportedStatus::Blocked,
-        "failed" | "error" => ReportedStatus::Failed,
-        other => return Err(RejectReason::UnknownStatus(other.to_string())),
+    // 受け付ける語は `STATUS_WORDS` の 1 か所だけ。却下文も同じ表を読む。
+    let spelled = doc.status.trim().to_ascii_lowercase();
+    let status = match STATUS_WORDS.iter().find(|(w, _)| *w == spelled) {
+        Some((_, st)) => *st,
+        None => return Err(RejectReason::UnknownStatus(spelled)),
     };
 
     let changed: Vec<String> = doc
@@ -739,7 +784,13 @@ pub enum MessageReject {
     /// 宛先が空。
     NoTarget,
     /// 宛先が居ない。**捏造を通さない** (居ない相手に送ったことにしない)。
-    UnknownTarget(String),
+    ///
+    /// `known` は**そのとき書けた宛先**。断るだけで誰が居るかを言わないと、
+    /// 送り主は同じ綴りを書き直すしかない (実機で 2 回繰り返された)。
+    UnknownTarget {
+        to: String,
+        known: Vec<String>,
+    },
     /// 宛先が**送り主自身**を指している (自分の ID か、自分の役割)。
     ///
     /// **`UnknownTarget` と混ぜてはいけない。** 相手は居るのだから
@@ -761,8 +812,11 @@ impl MessageReject {
         match self {
             MessageReject::BadJson(e) => format!("伝言の JSON を読めません: {e}"),
             MessageReject::NoTarget => "伝言の宛先 (to) が空です".to_string(),
-            MessageReject::UnknownTarget(t) => {
-                format!("伝言の宛先 `{t}` は居ません")
+            MessageReject::UnknownTarget { to, known } => {
+                format!(
+                    "伝言の宛先 `{to}` は居ません{}",
+                    accepted_line("いま居るのは", known.iter().map(String::as_str))
+                )
             }
             MessageReject::SelfTarget(t) => format!(
                 "伝言の宛先 `{t}` はあなた自身です。自分宛ての伝言は誰にも届きません — \
@@ -1013,7 +1067,19 @@ pub fn check_message(
             return Err(MessageReject::SelfTarget(to.to_string()));
         }
         // 表に無い宛先は今までどおり断る (捏造を通さない)。
-        return Err(MessageReject::UnknownTarget(to.to_string()));
+        // **書けた宛先を添える** — ID と役割の両方が宛先になるので両方見せる。
+        return Err(MessageReject::UnknownTarget {
+            to: to.to_string(),
+            known: others()
+                .map(|(id, role)| {
+                    if role.is_empty() || role == &id.0 {
+                        id.0.clone()
+                    } else {
+                        format!("{} ({role})", id.0)
+                    }
+                })
+                .collect(),
+        });
     }
     Ok((targets, text))
 }
@@ -1040,8 +1106,11 @@ pub enum EventReject {
         bytes: usize,
     },
     UnknownKind(String),
-    /// 親が実在しない。
-    UnknownParent(String),
+    /// 親が実在しない。**居る相手を添えて断る** (綴りを直せるように)。
+    UnknownParent {
+        parent: String,
+        known: Vec<String>,
+    },
     /// サブエージェントなのに親が指定されていない。
     ParentMissing,
     /// 親子が循環している。
@@ -1078,8 +1147,14 @@ impl EventReject {
                 "エージェント ID「{id}」はひな型のままです。実際に使った名前を書いてください"
             ),
             EventReject::TooLarge { bytes } => format!("イベントが大きすぎます ({bytes} バイト)"),
-            EventReject::UnknownKind(k) => format!("未知のイベント種別「{k}」"),
-            EventReject::UnknownParent(p) => format!("親エージェント「{p}」が存在しません"),
+            EventReject::UnknownKind(k) => format!(
+                "未知のイベント種別「{k}」{}",
+                accepted_line("使えるのは", EVENT_KINDS.iter().copied())
+            ),
+            EventReject::UnknownParent { parent, known } => format!(
+                "親エージェント「{parent}」が存在しません{}",
+                accepted_line("いま居るのは", known.iter().map(String::as_str))
+            ),
             EventReject::ParentMissing => "サブエージェントには親が必要です".to_string(),
             EventReject::ParentCycle(a) => format!("親子関係が循環しています ({a})"),
             EventReject::TooDeep { depth } => format!("親子階層が深すぎます ({depth} 段)"),
@@ -1141,7 +1216,10 @@ pub fn check_event(
         }
         // 親は実在するエージェントでなければならない。
         if !known.iter().any(|(id, _)| id.0 == parent) {
-            return Err(EventReject::UnknownParent(parent.to_string()));
+            return Err(EventReject::UnknownParent {
+                parent: parent.to_string(),
+                known: known.iter().map(|(id, _)| id.0.clone()).collect(),
+            });
         }
         // 自分が自分の親になれない。
         if parent == doc.agent_id.trim() {
@@ -1529,6 +1607,147 @@ mod tests {
         ));
     }
 
+    /// **実機の Run の台帳に残った却下そのもの。**
+    ///
+    /// `#2 の完了報告を却下: 未知の status「probe」` — 断る判断は正しいが、
+    /// 却下文が**何なら使えるのか**を 1 文字も言っていなかったので、
+    /// エージェントは綴りを直しようがなかった (人が見ても直し方が分からない)。
+    #[test]
+    fn 未知のstatusの却下文は使える語を並べる() {
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.status = "probe".into();
+        let err = accept(doc, &assigned(), &clean()).expect_err("表に無い語は通さない");
+        assert_eq!(
+            err,
+            RejectReason::UnknownStatus("probe".into()),
+            "断る判断は変えない"
+        );
+        let d = err.detail();
+        assert!(d.contains("probe"), "何を断ったか言えていない: {d}");
+        for (w, _) in STATUS_WORDS {
+            assert!(d.contains(w), "使える語 `{w}` が却下文に無い: {d}");
+        }
+        assert!(
+            d.len() <= super::super::model::TEXT_MAX,
+            "却下文が上限を超える ({} バイト)",
+            d.len()
+        );
+    }
+
+    /// 種別の断りも同じ扱い。一覧は [`EVENT_KINDS`] から出す。
+    #[test]
+    fn 未知の種別の却下文は使える語を並べる() {
+        let err = parse_event(r#"{"kind":"hack_the_planet","agent_id":"x"}"#)
+            .expect_err("表に無い種別は通さない");
+        assert_eq!(err, EventReject::UnknownKind("hack_the_planet".into()));
+        let d = err.detail();
+        for k in EVENT_KINDS.iter().take(REJECT_HINT_MAX) {
+            assert!(d.contains(k), "使える種別 `{k}` が却下文に無い: {d}");
+        }
+        if EVENT_KINDS.len() > REJECT_HINT_MAX {
+            let rest = EVENT_KINDS.len() - REJECT_HINT_MAX;
+            assert!(
+                d.contains(&format!("ほか {rest} 件")),
+                "省いたことが分からない: {d}"
+            );
+        }
+        assert!(d.len() <= super::super::model::TEXT_MAX, "却下文が長すぎる: {d}");
+    }
+
+    /// **長い表は切ってよいが、切ったと書く。**
+    ///
+    /// 黙って落とすと、載らなかった語が「使えない語」に見える。
+    #[test]
+    fn 使える語が多すぎるときは省いたと書く() {
+        let many: Vec<String> = (0..REJECT_HINT_MAX + 3).map(|i| format!("w{i}")).collect();
+        let line = accepted_line("使えるのは", many.iter().map(String::as_str));
+        assert!(line.contains("w0"), "先頭が無い: {line}");
+        let last = format!("w{}", REJECT_HINT_MAX - 1);
+        assert!(line.contains(&last), "上限まで並んでいない: {line}");
+        let over = format!("w{REJECT_HINT_MAX}");
+        assert!(!line.contains(&over), "上限を超えて並べた: {line}");
+        assert!(line.contains("ほか 3 件"), "省いたことが分からない: {line}");
+        // 表が空なら何も言わない (空の一覧を見せない)。
+        assert_eq!(accepted_line("使えるのは", Vec::<&str>::new()), "");
+    }
+
+    /// `fn detail` の**本体だけ**を切り出す (コメント行は落とす)。
+    ///
+    /// 範囲を広げると、同じファイルの別の場所に書いてある語を拾って
+    /// **わざと壊しても緑**になる。
+    ///
+    /// 目印を 2 つに割っているのは、`include_str!` が**このファイル自身**を
+    /// 読むため — 1 本の文字列リテラルで書くと、その目印自体が走査に
+    /// 引っかかって本体でない塊を拾う。
+    fn detail_bodies(src: &str) -> Vec<String> {
+        let head = ["fn detail(&self) -> String ", "{"].concat();
+        let src = src.replace("\r\n", "\n");
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(at) = src[from..].find(&head) {
+            let start = from + at + head.len();
+            let mut depth = 1usize;
+            let mut end = src.len();
+            for (i, c) in src[start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(
+                src[start..end]
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            from = end.max(start + 1);
+        }
+        out
+    }
+
+    /// **却下文へ語を書き写していない。**
+    ///
+    /// 写した瞬間、表を増やした日から却下文だけが古い一覧を出し続ける
+    /// (エージェントは「綴りを直せ」と言われても直しようがない)。
+    /// だから一覧は必ず表 ([`EVENT_KINDS`] / [`STATUS_WORDS`]) から作る。
+    #[test]
+    fn 却下文に語を書き写していない() {
+        let words: Vec<&str> = EVENT_KINDS
+            .iter()
+            .copied()
+            .chain(STATUS_WORDS.iter().map(|(w, _)| *w))
+            .collect();
+
+        // まず検出器そのものを試す (空回りする番人を残さない)。
+        let head = ["fn detail(&self) -> String ", "{"].concat();
+        let fake = format!("{head}\n    \"{}\".to_string()\n}}\n", words[0]);
+        let probe = detail_bodies(&fake);
+        assert_eq!(probe.len(), 1, "本体を切り出せていない: {probe:?}");
+        assert!(
+            probe[0].contains(words[0]),
+            "写した語を見落とす検出器: {probe:?}"
+        );
+
+        let bodies = detail_bodies(include_str!("result_parser.rs"));
+        assert!(bodies.len() >= 3, "detail を見つけられていない: {bodies:?}");
+        for body in &bodies {
+            for w in &words {
+                assert!(
+                    !body.contains(w),
+                    "却下文へ `{w}` を書き写している。EVENT_KINDS / STATUS_WORDS から組み立てること"
+                );
+            }
+        }
+    }
+
     #[test]
     fn 大きすぎる報告を拒否する() {
         let big = format!("{{\"x\":\"{}\"}}", "a".repeat(BLOCK_MAX_BYTES));
@@ -1592,10 +1811,18 @@ mod tests {
     fn 未知の親を拒否する() {
         let mut doc = parse_event(EV).unwrap();
         doc.parent_id = "ghost".into();
+        let err = check_event(&doc, &known(), &AgentId::new("backend-lead"), Some(12))
+            .expect_err("居ない親の下へ生やした");
         assert_eq!(
-            check_event(&doc, &known(), &AgentId::new("backend-lead"), Some(12)),
-            Err(EventReject::UnknownParent("ghost".into()))
+            err,
+            EventReject::UnknownParent {
+                parent: "ghost".into(),
+                known: vec!["backend-lead".to_string()],
+            }
         );
+        // 断るだけでなく、実在する親を添える。
+        let d = err.detail();
+        assert!(d.contains("backend-lead"), "居る親が却下文に無い: {d}");
     }
 
     #[test]
@@ -1969,7 +2196,7 @@ mod lenient_message_tests {
         // 居ない相手は捏造しない。
         assert!(matches!(
             read(r#"{"to": "居ない人", "text": "やあ "君" "}"#),
-            Err(MessageReject::UnknownTarget(_))
+            Err(MessageReject::UnknownTarget { .. })
         ));
     }
 
@@ -2049,10 +2276,21 @@ mod lenient_message_tests {
         let me = AgentId("agent-4".into());
         for to in ["designer", "agent-9", "tester-2", "TESTER"] {
             let body = format!(r#"{{"to": "{to}", "text": "やあ"}}"#);
+            let err = check_message(&body, &team, &me).expect_err("居ない相手へ届けた");
             assert_eq!(
-                check_message(&body, &team, &me).expect_err("居ない相手へ届けた"),
-                MessageReject::UnknownTarget(to.to_string()),
+                err,
+                MessageReject::UnknownTarget {
+                    to: to.to_string(),
+                    known: vec!["agent-3 (implementer)".to_string()],
+                },
                 "宛先 {to}"
+            );
+            // **断るだけで終わらない。** 誰へなら書けるのかを添える。
+            let d = err.detail();
+            assert!(d.contains("agent-3"), "書ける宛先が却下文に無い: {d}");
+            assert!(
+                !d.contains("agent-4"),
+                "自分自身を宛先として勧めている: {d}"
             );
         }
     }
