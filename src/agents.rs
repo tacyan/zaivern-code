@@ -1826,6 +1826,33 @@ const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
     ("codex", 10_000, b"\r"),
 ];
 
+/// **貼り付けを畳んで見せる CLI の、その見出し。**
+///
+/// 長い本文を貼ると、入力欄に本文ではなく要約を出す CLI がある:
+///
+/// | CLI | 入力欄に出るもの |
+/// |---|---|
+/// | Codex | `[Pasted Content 2329 chars]` |
+/// | Claude Code | `[Pasted text #3 +103 lines]` |
+///
+/// これは**送信の確認を丸ごと壊す**。確認は「本文の末尾が入力欄に
+/// 残っていないか」で届いたかを見るので、畳まれると**残っているのに
+/// 消えたように見え、送れていないのに「送信済み」と記録される**。
+/// 実機ではこれで 6 通中 2 通が入力欄に残ったまま「配達完了」になり、
+/// 担当は 1 文字も受け取らないまま「作業中」と表示されていた。
+///
+/// **CLI ごとの分岐は作らない。** 見出しの一覧をここに置き、
+/// [`crate::submit::still_pending`] が 1 か所で見る。
+pub const PASTE_PLACEHOLDERS: &[&str] = &["[pasted content", "[pasted text", "[pasted"];
+
+/// 入力欄のこの見え方は「貼っただけで、まだ送っていない」か。
+///
+/// 大小は問わない (CLI ごとに綴りが違う)。
+pub fn looks_like_pending_paste(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    PASTE_PLACEHOLDERS.iter().any(|p| lower.contains(p))
+}
+
 /// この CLI が入力を受け取れるようになるまでの目安 (ミリ秒)。持たなければ 0。
 pub fn input_ready_ms(bin: &str) -> u64 {
     SUBMIT_PROFILES

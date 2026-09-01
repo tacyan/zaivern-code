@@ -190,12 +190,41 @@ fn normalize_ws(s: &str) -> String {
 /// `input` は端末画面から拾った「入力欄に見えている文字列」。取れなかった
 /// (`None`) ときは **残っていない扱い** にする — 見えないものを根拠に
 /// Enter を撃ち直すと、承認プロンプトへ誤爆する危険の方が大きい。
+impl Peek {
+    /// **本文が入力欄に見えているか** (= こちらの書き込みが届いた証拠)。
+    ///
+    /// 畳まれた貼り付け (`[Pasted Content 2329 chars]`) も「見えている」と
+    /// 数える — 中身は本文そのものなので、確定キーを撃ってよい。
+    ///
+    /// **読み取れないときは真を返す。** 入力欄を読めない相手で書き直しを
+    /// 繰り返すと、同じ本文が何度も入ることになる。証拠が無いなら、
+    /// 従来どおり 1 回書いて進む。
+    pub fn input_seen(&self, tail: &str) -> bool {
+        match self.input.as_deref() {
+            None => true,
+            Some(t) => still_pending(Some(t), tail),
+        }
+    }
+}
+
 pub fn still_pending(input: Option<&str>, tail: &str) -> bool {
     if tail.is_empty() {
         return false;
     }
     match input {
-        Some(t) => normalize_ws(t).contains(tail),
+        Some(t) => {
+            // **畳まれた貼り付けは「残っている」。**
+            //
+            // 長い本文を貼ると、入力欄に本文ではなく見出しを出す CLI が
+            // ある (`[Pasted Content 2329 chars]`)。本文が消えたように
+            // 見えるので、そのまま読むと**送れていないのに「送信済み」**に
+            // なる。実機で 6 通中 2 通がこれで落ちた
+            // (一覧は `agents::PASTE_PLACEHOLDERS`)。
+            if crate::agents::looks_like_pending_paste(t) {
+                return true;
+            }
+            normalize_ws(t).contains(tail)
+        }
         None => false,
     }
 }
@@ -363,6 +392,26 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             }
             if since_stage < COMMIT_DELAY {
                 return Act::Wait(COMMIT_DELAY - since_stage);
+            }
+            // **書けたことを確かめてから確定する。**
+            //
+            // 起動中の CLI は書き込みを丸ごと捨てる。捨てられたことに
+            // 気付かずに確定キーを撃つと、`Verify` は「入力欄に本文が
+            // 残っていない」を見て**届いた**と判断する — 1 バイトも
+            // 送っていないのに配達完了になる。
+            //
+            // 実機 (Test6) の実測: 6 体のうち **Claude Code 2 体は
+            // 指示の痕跡が 0 件**のまま「作業中」と表示され、9 分間
+            // 成果物が 1 つも出来なかった。待ち時間を伸ばしても、
+            // 環境が変われば同じことが起きる — **確かめるほうが正しい。**
+            //
+            // 入力欄に本文が見えないなら、書き直す。見えるようになれば
+            // 下へ進んで確定する。
+            if !peek.input_seen(&tail_key(&job.text)) {
+                if since_queued >= GIVE_UP || job.tries >= MAX_COMMIT_TRIES {
+                    return Act::GaveUp;
+                }
+                return Act::WriteBody;
             }
             // **相手が手を動かしている間は撃たない。**
             //
@@ -850,5 +899,165 @@ mod tests {
         );
         // **待ちっぱなしにはしない。** 上限を過ぎたら人へ返す。
         assert_eq!(decide(&job, &not_yet, Duration::ZERO, GIVE_UP), Act::GaveUp);
+    }
+}
+
+#[cfg(test)]
+mod paste_placeholder_tests {
+    use super::*;
+
+    /// **畳まれた貼り付けを「届いた」と読まない。**
+    ///
+    /// 実機の画面そのもの。Codex は長い本文を
+    /// `[Pasted Content 2329 chars]` に畳んで見せるので、本文の末尾を
+    /// 探す確認は必ず外れる。外れると `Act::Done` = 送信済みとして
+    /// 記録され、**1 文字も届いていない担当が「作業中」と表示される**。
+    /// 実機で 6 通中 2 通がこの形で消えた。
+    #[test]
+    fn 畳まれた貼り付けはまだ届いていない() {
+        let tail = "最後まで終わらせて報告してください";
+        for shown in [
+            "[Pasted Content 2329 chars]",
+            "[Pasted Content 2306 chars]",
+            "[Pasted text #3 +103 lines]",
+            "> [pasted content 12 chars]",
+        ] {
+            assert!(
+                still_pending(Some(shown), tail),
+                "畳まれた貼り付けを届いたと読んだ: {shown}"
+            );
+        }
+    }
+
+    /// **本当に消えていれば届いている。** 畳みの検出で、正常な送信を
+    /// 「まだ残っている」と読み替えてはいけない (撃ち直しが止まらなくなる)。
+    #[test]
+    fn 入力欄が空なら届いている() {
+        let tail = "最後まで終わらせて報告してください";
+        assert!(!still_pending(Some(""), tail));
+        assert!(!still_pending(Some("❯ "), tail));
+        assert!(!still_pending(None, tail));
+        // 人が別のことを打っていても、こちらの本文ではない。
+        assert!(!still_pending(Some("git status を見せて"), tail));
+    }
+
+    /// **本文がそのまま見えている場合は、これまでどおり残っている扱い。**
+    #[test]
+    fn 本文が見えていれば残っている() {
+        let tail = "最後まで終わらせて報告してください";
+        assert!(still_pending(
+            Some("… 最後まで終わらせて報告してください"),
+            tail
+        ));
+    }
+
+    /// **畳みの見出しはカタログ 1 か所で持つ。**
+    /// 送信側に CLI ごとの分岐を作らない (増えるたびに 2 か所直すことになる)。
+    #[test]
+    fn 畳みの見出しはカタログが持つ() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn still_pending")
+            .nth(1)
+            .and_then(|t| t.split("\n}\n").next())
+            .expect("still_pending がある");
+        assert!(
+            body.contains("agents::looks_like_pending_paste"),
+            "畳みの判定を送信側に書いている"
+        );
+        // **送信側に CLI ごとの分岐を作らない**ことは
+        // `agents::tests::エージェントごとの癖はカタログにだけ置く` が
+        // リポジトリ全体で見張っている (ここで二重に持たない)。
+    }
+}
+
+#[cfg(test)]
+mod write_confirm_tests {
+    use super::*;
+
+    fn job(text: &str) -> Job {
+        let mut j = Job::user(1, text.to_string());
+        j.stage = Stage::Commit;
+        j
+    }
+
+    fn peek(input: Option<&str>) -> Peek {
+        Peek {
+            running: true,
+            idle: true,
+            attention: false,
+            input_ready: true,
+            input: input.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// **書けていないのに確定キーを撃たない。**
+    ///
+    /// 起動中の CLI は書き込みを捨てる。捨てられたことに気付かずに
+    /// 確定すると、`Verify` は「入力欄に本文が無い」を見て**届いた**と
+    /// 判断し、1 バイトも送っていないのに配達完了になる。
+    /// 実機 (Test6) では Claude Code 2 体が**指示の痕跡 0 件**のまま
+    /// 「作業中」と表示され、9 分で成果物が 1 つも出来なかった。
+    #[test]
+    fn 本文が入力欄に無ければ書き直す() {
+        let j = job("実装してください。最後まで終わらせて報告してください");
+        // 入力欄が空 = 書き込みが捨てられた。
+        assert_eq!(
+            decide(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            Act::WriteBody
+        );
+        assert_eq!(
+            decide(&j, &peek(Some("❯ ")), COMMIT_DELAY, COMMIT_DELAY),
+            Act::WriteBody
+        );
+    }
+
+    /// **見えていれば、これまでどおり確定する。**
+    #[test]
+    fn 本文が見えていれば確定する() {
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let j = job(text);
+        assert_eq!(
+            decide(&j, &peek(Some(text)), COMMIT_DELAY, COMMIT_DELAY),
+            Act::WriteCommit
+        );
+        // 畳まれた貼り付けも「見えている」。中身は本文そのもの。
+        assert_eq!(
+            decide(
+                &j,
+                &peek(Some("[Pasted Content 2329 chars]")),
+                COMMIT_DELAY,
+                COMMIT_DELAY
+            ),
+            Act::WriteCommit
+        );
+    }
+
+    /// **入力欄を読めない相手では、書き直しを繰り返さない。**
+    /// 証拠が無いなら 1 回書いて進む (同じ本文が何度も入るほうが害が大きい)。
+    #[test]
+    fn 入力欄が読めないなら従来どおり進む() {
+        let j = job("実装してください");
+        assert_eq!(
+            decide(&j, &peek(None), COMMIT_DELAY, COMMIT_DELAY),
+            Act::WriteCommit
+        );
+    }
+
+    /// **書き直しにも上限がある。** 永久に書き続けず、人へ返す。
+    #[test]
+    fn 書き直しにも上限がある() {
+        let mut j = job("実装してください");
+        j.tries = MAX_COMMIT_TRIES;
+        assert_eq!(
+            decide(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            Act::GaveUp
+        );
+        let j2 = job("実装してください");
+        assert_eq!(
+            decide(&j2, &peek(Some("")), COMMIT_DELAY, GIVE_UP),
+            Act::GaveUp
+        );
     }
 }
