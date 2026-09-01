@@ -51,8 +51,34 @@ impl Candidate {
     }
 
     /// いま新しい仕事を受けられるか。
+    ///
+    /// **持ち仕事が無いなら空いている。** ここが `Idle | Working` だけを
+    /// 見ていたので、実機で**空いている担当が 3 体居るのにタスクが 5 本
+    /// 待ち続ける**という止まり方をした (Planner / Tester / Reviewer が
+    /// `stalled`、#1 #2 #10 #11 #14 が `ready` のまま)。
+    ///
+    /// 状態は**画面から推し量った値**である。仕事を持っていない担当は
+    /// 出力が動かなくて当たり前なので、そのまま「停滞」と読まれる。
+    /// そして停滞と読まれた担当には配らないので、**二度と出力が動かない** —
+    /// 推測が自分で自分を裏付ける輪になっていた。
+    ///
+    /// 配らない理由になるのは、**推し量らなくても分かる 2 つ**だけ:
+    ///
+    /// * `Exited` — プロセスが居ない。曖昧さが無い
+    /// * `WaitingApproval` — 承認の返事として本文が解釈される。**絶対に
+    ///   注入しない** (`coordinator::SessionState` の doc を参照)
+    ///
+    /// 残りは配ってよい。**打ち込んでよい頃合いかどうかは `submit` が
+    /// 別に見ている** (入力欄の準備を待ち、駄目なら人へ返す) ので、
+    /// ここで二重に見張って止まるより、渡して確かめるほうが速い。
+    /// 設計原則 4「エージェントの状態を画面から推測しない」の具体形 —
+    /// **何も配っていないという構造的な事実**のほうが、画面の読みより強い。
     fn free(&self) -> bool {
-        self.holding.is_none() && matches!(self.state, SessionState::Idle | SessionState::Working)
+        self.holding.is_none()
+            && !matches!(
+                self.state,
+                SessionState::Exited | SessionState::WaitingApproval
+            )
     }
 }
 
@@ -477,18 +503,47 @@ mod tests {
     }
 
     #[test]
-    fn 保有中や停滞中のセッションへは配らない() {
+    fn 配らないのは保有中と居ない相手と承認待ちだけ() {
         let tasks = vec![ready(1, "a", &["src/a.rs"])];
         let mut busy = cand(1, SessionState::Idle, &[]);
         busy.holding = Some(9);
         let cands = vec![
             busy,
-            cand(2, SessionState::Stalled, &[]),
-            cand(3, SessionState::Exited, &[]),
+            cand(2, SessionState::Exited, &[]),
+            cand(3, SessionState::WaitingApproval, &[]),
         ];
         let p = plan_assignments(&tasks, &cands, &BTreeMap::new());
-        assert!(p.assignments.is_empty());
+        assert!(p.assignments.is_empty(), "配ってはいけない相手へ配った");
         assert_eq!(p.unassigned, vec![Unassigned::NoCandidate(1)]);
+    }
+
+    /// **仕事を持っていない担当は、画面が読めなくても空いている。**
+    ///
+    /// 実機の止まり方をそのまま置いた: Planner / Tester / Reviewer が
+    /// `stalled` で、`ready` のタスクが 5 本待っていた。停滞は
+    /// **画面から推し量った値**で、仕事を持っていない担当は出力が動かなくて
+    /// 当たり前 — そこで配るのをやめると、二度と出力が動かない。
+    /// 推測が自分で自分を裏付ける輪になる。
+    #[test]
+    fn 手ぶらの担当は状態が読めなくても配る() {
+        let tasks = vec![
+            ready(1, "a", &[]),
+            ready(2, "b", &[]),
+            ready(3, "c", &[]),
+            ready(4, "d", &[]),
+            ready(5, "e", &[]),
+        ];
+        let cands = vec![
+            cand(1, SessionState::Stalled, &[]),
+            cand(2, SessionState::Stalled, &[]),
+            cand(3, SessionState::Unknown, &[]),
+            cand(4, SessionState::AwaitingInput, &[]),
+        ];
+        let p = plan_assignments(&tasks, &cands, &BTreeMap::new());
+        assert_eq!(p.assignments.len(), 4, "手ぶらの担当へ配れていない");
+        let mut got: Vec<_> = p.assignments.iter().map(|a| a.session).collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3, 4], "配り先が偏っている");
     }
 
     #[test]

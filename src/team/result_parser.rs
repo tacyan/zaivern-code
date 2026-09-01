@@ -291,6 +291,149 @@ pub fn escape_raw_controls(src: &str) -> String {
     out
 }
 
+/// **手書きの JSON を、意味を変えずに直す。ここが唯一の直し場。**
+///
+/// 報告・レビュー・出来事・伝言の**すべて**がここを通る
+/// ([`parse_lenient`])。種類ごとに別々の直し方を持つと、片方だけが
+/// 直る = 「実装は届くのにレビューは落ちる」という説明できない差が出る。
+///
+/// 実測 (Team Run 1 本) で捨てられていたのは 3 通り。どれも**中身は正しく、
+/// 綴りだけが JSON になっていない**:
+///
+/// 1. **文字列の中の生の `"`** — いちばん多い。実物:
+///    `"command": "test -s a.md && test "$(rg -c '^x' a.md)" -eq 8"`
+///    シェルのコマンドを書けばまず入る
+/// 2. **鍵の間のカンマ抜け** — `{"to": "a" "text": "b"}`
+/// 3. **末尾カンマ** — `{"text": "x",}`
+///
+/// 捨てると、**正しく働いた担当が「報告していない」ことになって止まる**。
+/// 実機では 1 本の Run で 4 回続けて捨てていた。
+///
+/// 直すのは綴りだけで、**値は 1 文字も変えない**。閉じ引用符かどうかは
+/// 「その後に何が来るか」で決める — JSON で文字列の直後に来てよいのは
+/// `,` `}` `]` `:` と、次の鍵 (`"…":`) だけである。
+pub fn repair_json(src: &str) -> String {
+    let ch: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < ch.len() {
+        let c = ch[i];
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            // 3) 末尾カンマ — `,` の後に `}` / `]` しか無ければ落とす。
+            if c == ',' && next_is_close(&ch, i + 1) {
+                i += 1;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 文字列の中。
+        if c == '\\' {
+            out.push(c);
+            if let Some(&n) = ch.get(i + 1) {
+                out.push(n);
+            }
+            i += 2;
+            continue;
+        }
+        if c != '"' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match closer_kind(&ch, i + 1) {
+            // 閉じ引用符。
+            Closer::Plain => {
+                in_str = false;
+                out.push(c);
+            }
+            // 2) 閉じ引用符だが、次の鍵との間にカンマが無い。
+            Closer::NeedsComma => {
+                in_str = false;
+                out.push(c);
+                out.push(',');
+            }
+            // 1) 本文の中の `"`。エスケープして文字列を続ける。
+            Closer::No => out.push_str("\\\""),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `"` の後ろが何であるか。
+enum Closer {
+    /// 文字列を閉じてよい (`,` `}` `]` `:` か、入力の終わり)。
+    Plain,
+    /// 文字列を閉じてよいが、次の鍵との間にカンマが要る。
+    NeedsComma,
+    /// 閉じない (本文の中の `"`)。
+    No,
+}
+
+/// `from` から空白を飛ばして、`"` が閉じ引用符かを見る。
+fn closer_kind(ch: &[char], from: usize) -> Closer {
+    let Some(j) = skip_ws(ch, from) else {
+        return Closer::Plain; // 入力の終わり
+    };
+    match ch[j] {
+        ',' | '}' | ']' | ':' => Closer::Plain,
+        // 次が `"…":` なら、鍵の始まりなのでカンマが抜けている。
+        '"' if is_key_at(ch, j) => Closer::NeedsComma,
+        _ => Closer::No,
+    }
+}
+
+/// `,` の後ろが `}` / `]` か (= 末尾カンマ)。
+fn next_is_close(ch: &[char], from: usize) -> bool {
+    skip_ws(ch, from).is_some_and(|j| ch[j] == '}' || ch[j] == ']')
+}
+
+/// `at` の `"` から始まる文字列の直後が `:` か (= 鍵)。
+fn is_key_at(ch: &[char], at: usize) -> bool {
+    let mut i = at + 1;
+    while i < ch.len() {
+        match ch[i] {
+            '\\' => i += 2,
+            '"' => return skip_ws(ch, i + 1).is_some_and(|j| ch[j] == ':'),
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// 空白でない最初の位置。
+fn skip_ws(ch: &[char], from: usize) -> Option<usize> {
+    (from..ch.len()).find(|&i| !ch[i].is_whitespace())
+}
+
+/// **ブロック本文を読む。報告もレビューも出来事も伝言も、ここを通る。**
+///
+/// 1. まず素直に読む (正しい JSON はこれまでどおり `serde` が読む)
+/// 2. 読めなければ [`repair_json`] で綴りだけ直して、もう一度読む
+///
+/// **エラーは 1 回目のものを返す。** 直した後のエラーを返すと、こちらが
+/// 手を入れた文字列についての苦情になって、元の原因が見えなくなる。
+pub fn parse_lenient<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
+    let src = escape_raw_controls(body);
+    match serde_json::from_str(&src) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            // **直したものは、元と同じ制御文字の扱いで読み直す。**
+            let fixed = escape_raw_controls(&repair_json(&src));
+            serde_json::from_str(&fixed).map_err(|_| first.to_string())
+        }
+    }
+}
+
 /// 囲まれたブロックを全部取り出す (開始 → 終了の順で、入れ子は無いものとする)。
 ///
 /// **上限つき。** 走査対象そのものも末尾 [`SCAN_MAX_BYTES`] だけを見る。
@@ -381,8 +524,7 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
     if body.len() > BLOCK_MAX_BYTES {
         return Err(RejectReason::TooLarge { bytes: body.len() });
     }
-    let doc: ResultDoc = serde_json::from_str(&escape_raw_controls(body))
-        .map_err(|e| RejectReason::BadJson(e.to_string()))?;
+    let doc: ResultDoc = parse_lenient(body).map_err(RejectReason::BadJson)?;
     if doc.changed_files.len() > ARRAY_MAX {
         return Err(RejectReason::ArrayTooLong {
             field: "changed_files",
@@ -750,10 +892,13 @@ pub fn read_message(body: &str) -> Result<MessageDoc, MessageReject> {
     // **正しい JSON はこれまでどおり `serde` が読む。**
     // 読めなかったときだけ、鍵を直接拾う受け皿へ落ちる
     // (`lenient_message` の表に、実際に来た 4 通りが載っている)。
-    let src = escape_raw_controls(body);
-    let mut doc: MessageDoc = match serde_json::from_str(&src) {
+    // 1) `parse_lenient` (素直に読む → 綴りを直して読む) は報告と共通。
+    // 2) それでも駄目なら、伝言だけの受け皿 (鍵を 2 つ直接拾う) へ落ちる。
+    let mut doc: MessageDoc = match parse_lenient(body) {
         Ok(d) => d,
-        Err(e) => lenient_message(&src).ok_or(MessageReject::BadJson(e.to_string()))?,
+        Err(e) => {
+            lenient_message(&escape_raw_controls(body)).ok_or(MessageReject::BadJson(e))?
+        }
     };
     // **整形もここで済ませる。** 呼ぶ側で `trim` と上限を書くと、
     // 片方だけ上限が違う伝言が届く。
@@ -904,9 +1049,7 @@ pub fn parse_event(body: &str) -> Result<EventDoc, EventReject> {
     if body.len() > BLOCK_MAX_BYTES {
         return Err(EventReject::TooLarge { bytes: body.len() });
     }
-    let doc: EventDoc =
-        serde_json::from_str(&escape_raw_controls(body))
-            .map_err(|e| EventReject::BadJson(e.to_string()))?;
+    let doc: EventDoc = parse_lenient(body).map_err(EventReject::BadJson)?;
     if !EVENT_KINDS.contains(&doc.kind.trim()) {
         return Err(EventReject::UnknownKind(doc.kind.clone()));
     }
@@ -1806,5 +1949,134 @@ mod lenient_message_tests {
     fn 本文の中の鍵らしい綴りを拾わない() {
         let (_, text) = read(r#"{"to": "reviewer-1", "text": "\"to\": を説明する"}"#).unwrap();
         assert_eq!(text, r#""to": を説明する"#);
+    }
+}
+
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    /// **実機で捨てられていた報告が、そのまま通る。**
+    ///
+    /// これは作り物ではなく、Team Run で agent-1 (Planner) が実際に出した
+    /// 報告 (`~/.zaivern/term_logs` の生ログから起こしたもの)。台帳には
+    /// `報告の JSON を読めません` として 4 回残っていた。**中身は正しく、
+    /// シェルのコマンドに `"` が入っていただけ**で、正しく働いた担当が
+    /// 「報告していない」ことになって止まっていた。
+    const REAL: &str = r#"{
+  "task_id": 4,
+  "agent_id": "agent-1",
+  "status": "completed",
+  "summary": "3D方式、ローカル依存、ファイル責務を architecture.md に確定した",
+  "changed_files": ["docs/architecture.md"],
+  "validation": [
+    {
+      "command": "test -s docs/architecture.md && test "$(rg -c '^x' docs/architecture.md)" -eq 8",
+      "exit_code": 0
+    }
+  ],
+  "blockers": []
+}"#;
+
+    #[test]
+    fn 実機で捨てられた報告が通る() {
+        // 直す前は serde が断っていたことを、まず確かめる
+        // (直っていない入力でテストしても何も守れない)。
+        assert!(
+            serde_json::from_str::<ResultDoc>(&escape_raw_controls(REAL)).is_err(),
+            "この入力は素の serde でも通る (再現していない)"
+        );
+        let d = parse_result(REAL).expect("実機の報告が読めない");
+        assert_eq!(d.task_id, 4);
+        assert_eq!(d.status, "completed");
+        assert_eq!(d.changed_files, vec!["docs/architecture.md".to_string()]);
+        // **コマンドは 1 文字も変えない。** 直すのは綴りだけ。
+        assert_eq!(
+            d.validation[0].command,
+            r#"test -s docs/architecture.md && test "$(rg -c '^x' docs/architecture.md)" -eq 8"#
+        );
+        assert_eq!(d.validation[0].exit_code, 0);
+    }
+
+    /// **直すのは 3 通りだけ。それぞれ単独で効く。**
+    #[test]
+    fn 綴りの直しは三通り() {
+        // 1) 本文の中の生の `"`
+        let v: serde_json::Value =
+            parse_lenient(r#"{"a": "彼は "yes" と言った"}"#).expect("生の引用符");
+        assert_eq!(v["a"], r#"彼は "yes" と言った"#);
+        // 2) 鍵の間のカンマ抜け
+        let v: serde_json::Value = parse_lenient(r#"{"a": "x" "b": "y"}"#).expect("カンマ抜け");
+        assert_eq!(v["a"], "x");
+        assert_eq!(v["b"], "y");
+        // 3) 末尾カンマ (オブジェクトも配列も)
+        let v: serde_json::Value =
+            parse_lenient(r#"{"a": ["x","y",], "b": 1,}"#).expect("末尾カンマ");
+        assert_eq!(v["a"][1], "y");
+        assert_eq!(v["b"], 1);
+    }
+
+    /// **正しい JSON は 1 文字も変えない。**
+    ///
+    /// 直し場が正しい入力に手を出すと、いままで通っていた報告の意味が
+    /// 黙って変わる。ここが**いちばん壊してはいけない**性質。
+    #[test]
+    fn 正しいjsonには手を出さない() {
+        for good in [
+            r#"{"a":"x","b":[1,2],"c":{"d":null}}"#,
+            r#"{"a":"エス\"ケープ\\済み","b":"改行\nタブ\t"}"#,
+            r#"{"a":"記号 , } ] : を含む","b":"末尾が記号,"}"#,
+            r#"[{"a":1},{"a":2}]"#,
+            r#"{"empty":"","arr":[],"obj":{}}"#,
+        ] {
+            let want: serde_json::Value = serde_json::from_str(good).expect("元が正しい");
+            let got: serde_json::Value = parse_lenient(good).expect("直し場が壊した");
+            assert_eq!(got, want, "正しい JSON を書き換えた: {good}");
+            assert_eq!(repair_json(good), good, "文字列そのものを変えた: {good}");
+        }
+    }
+
+    /// **読めた振りをしない。** 直しても意味が取れないものは断る。
+    #[test]
+    fn 直しても駄目なものは断る() {
+        assert!(parse_lenient::<serde_json::Value>("ただの文章").is_err());
+        assert!(parse_lenient::<serde_json::Value>("{壊れて").is_err());
+        // **エラーは 1 回目のもの** (直した後の文字列への苦情を返さない)。
+        let e = parse_lenient::<ResultDoc>("{}").unwrap_err();
+        assert!(e.contains("task_id"), "元の原因が見えない: {e}");
+    }
+
+    /// **報告・レビュー・出来事・伝言が同じ直し場を通る。**
+    ///
+    /// 種類ごとに直し方が違うと「実装は届くのにレビューは落ちる」という
+    /// 説明できない差が出る。
+    #[test]
+    fn 四種類とも同じ直し場を通る() {
+        let src = include_str!("result_parser.rs").replace("\r\n", "\n");
+        let rev = include_str!("reviewer.rs").replace("\r\n", "\n");
+        for (name, body) in [
+            ("報告", fn_body(&src, "pub fn parse_result")),
+            ("出来事", fn_body(&src, "pub fn parse_event")),
+            ("伝言", fn_body(&src, "pub fn read_message")),
+            ("レビュー", fn_body(&rev, "pub fn parse_review")),
+        ] {
+            assert!(
+                body.contains("parse_lenient"),
+                "{name} が直し場を通っていない"
+            );
+            assert!(
+                !body.contains("serde_json::from_str"),
+                "{name} が自前で読んでいる"
+            );
+        }
+    }
+
+    /// 関数 1 本の中身だけを返す (範囲を広げると隣の関数を拾って空回りする)。
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("{sig} が無い"));
+        let rest = &src[at..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
     }
 }
