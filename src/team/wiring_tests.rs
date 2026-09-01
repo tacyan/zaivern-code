@@ -1225,3 +1225,52 @@ fn 盤面の端末は触れるがホイールは取り合わない() {
         "ホイールを取り合う設定になっている (行が重なって崩れる)"
     );
 }
+
+/// **使うエージェントの選び方が、起動に効く。**
+///
+/// 「おまかせ」なら役割ごとに配り、1 つ選べば全員それになる。選べるのに
+/// 起動が変わらないなら、その選択肢は嘘になる (CLAUDE.md)。
+#[test]
+fn 使うエージェントの選択が起動に効く() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_launch_agent").expect("起動の橋"));
+    // 空なら役割ごとに配る (従来の道)。
+    assert!(
+        body.contains("roles::preset_for_role(&table, spec.role)"),
+        "おまかせの道が無い:\n{body}"
+    );
+    // 選ばれていればそれ 1 つ。真実の在り処は Run 側。
+    assert!(
+        body.contains("p.pinned_agent()"),
+        "Run が持っている選択を見ていない:\n{body}"
+    );
+    assert!(
+        body.contains("p.name == pinned"),
+        "選ばれた名前でプリセットを引いていない:\n{body}"
+    );
+    // **担当を 0 体にしない。** 設定から消えていたら、おまかせへ落ちる。
+    let after = body.split("p.name == pinned").nth(1).unwrap_or_default();
+    assert!(
+        after.contains("preset_for_role"),
+        "選んだものが消えていたとき、担当が起動しないまま止まる:\n{body}"
+    );
+}
+
+/// **選べるのは、この PC に入っている AI CLI だけ。**
+///
+/// 入っていないものを選ばせると、その担当だけ永久に起動しない
+/// (画面には居るのに何も起きない)。
+#[test]
+fn 選べるエージェントは入っているものだけ() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_board_ui").expect("盤面の描画"));
+    let list = body
+        .split("let agents: Vec<String>")
+        .nth(1)
+        .and_then(|t| t.split(';').next())
+        .expect("選択肢の一覧を作っている");
+    assert!(
+        list.contains("p.is_ai") && list.contains("p.available"),
+        "入っているかを見ていない:\n{list}"
+    );
+}

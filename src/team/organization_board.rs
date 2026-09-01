@@ -245,6 +245,8 @@ pub fn board_window(
     active_run: usize,
     // このワークスペースは Git 管理下でない (実測できない)。
     needs_git: bool,
+    // 選べるエージェント (この PC に入っている AI CLI のプリセット名)。
+    agents: &[String],
     notice: &str,
     // 端末 1 枚を「ここへ」描く口。描けたら true。
     // **実体は app 側にある** (セッションを持っているのはあちら) ので、
@@ -284,7 +286,7 @@ pub fn board_window(
         .show(ctx, |ui| {
             body(
                 ui, theme, snap, tab, form, restore, selected, expanded, runs, active_run,
-                needs_git, notice, &mut acts, term,
+                needs_git, agents, notice, &mut acts, term,
             );
         });
     if !win_open {
@@ -309,6 +311,8 @@ fn body(
     active_run: usize,
     // このワークスペースは Git 管理下でない (実測できない)。
     needs_git: bool,
+    // 選べるエージェント (この PC に入っている AI CLI のプリセット名)。
+    agents: &[String],
     notice: &str,
     acts: &mut Vec<BoardAction>,
     term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
@@ -327,7 +331,7 @@ fn body(
 
     // ── New Team Run のフォーム ──
     if form.open {
-        new_run_form(ui, theme, form, acts);
+        new_run_form(ui, theme, form, agents, acts);
         return;
     }
 
@@ -1486,6 +1490,7 @@ fn new_run_form(
     ui: &mut egui::Ui,
     theme: &Theme,
     form: &mut NewRunForm,
+    agents: &[String],
     acts: &mut Vec<BoardAction>,
 ) {
     ui.label(
@@ -1564,6 +1569,26 @@ fn new_run_form(
 
             ui.label(tr("team.form.review_required"));
             ui.checkbox(&mut form.review_required, tr("team.form.review_hint"));
+            ui.end_row();
+
+            ui.label(tr("team.form.agent"));
+            ui.horizontal_wrapped(|ui| {
+                // **おまかせが既定。** 役割ごとに、入っている CLI を配る。
+                if ui
+                    .selectable_label(form.agent_preset.is_empty(), tr("team.form.agent_auto"))
+                    .on_hover_text(tr("team.form.agent_auto_hint"))
+                    .clicked()
+                {
+                    form.agent_preset.clear();
+                }
+                // **1 つ選べば全員それになる。** 混ぜたくない人のための道。
+                for name in agents {
+                    let on = form.agent_preset == *name;
+                    if ui.selectable_label(on, ellipsis(name, 18)).clicked() {
+                        form.agent_preset = if on { String::new() } else { name.clone() };
+                    }
+                }
+            });
             ui.end_row();
 
             ui.label(tr("team.form.roles"));
@@ -1797,6 +1822,7 @@ mod tests {
                         &[],
                         0,
                         false,
+                        &[],
                         "",
                         // 端末は描かない (ヘッドレスにセッションは無い)。
                         // **描けなかったときの経路**もここで踏まれる。

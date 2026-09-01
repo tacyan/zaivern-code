@@ -479,6 +479,7 @@ impl TeamRuntime {
                 workspace: workspace.display().to_string(),
                 spec_source: opts.spec_source.clone(),
                 agent_count: opts.agent_count,
+                agent_preset: opts.agent_preset.clone(),
                 max_attempts: opts.max_attempts,
                 review_required: opts.review_required,
                 paused: false,
@@ -3747,6 +3748,8 @@ pub struct RunOptions {
     pub run_id: String,
     pub spec_source: String,
     pub agent_count: usize,
+    /// どのエージェントで動かすか (プリセット名)。空なら「おまかせ」。
+    pub agent_preset: String,
     pub max_attempts: u8,
     pub review_required: bool,
     /// **この Run にだけ効く安全側の設定。** 既存のグローバル設定は
@@ -3776,6 +3779,7 @@ impl Default for RunOptions {
         Self {
             run_id: new_run_id(),
             spec_source: String::new(),
+            agent_preset: String::new(),
             agent_count: 4,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             review_required: true,

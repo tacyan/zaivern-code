@@ -60,6 +60,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
             run_id: new_run_id(),
             spec_source: "SPEC.md".into(),
             agent_count: agents,
+            agent_preset: String::new(),
             max_attempts: 3,
             review_required,
             guardrails: Default::default(),
@@ -777,6 +778,7 @@ fn specとエージェント数が計画に反映される() {
                 ws(),
                 RunOptions {
                     agent_count: agents,
+                    agent_preset: String::new(),
                     ..RunOptions::default()
                 },
             )
@@ -1578,6 +1580,7 @@ fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId,
             run_id: new_run_id(),
             spec_source: "SPEC.md".into(),
             agent_count: 2,
+            agent_preset: String::new(),
             max_attempts: 3,
             review_required: false,
             guardrails: Default::default(),

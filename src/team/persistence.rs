@@ -157,6 +157,15 @@ pub struct RunDoc {
     pub workspace: String,
     pub spec_source: String,
     pub agent_count: usize,
+    /// **どのエージェントで動かすか** (プリセット名)。空なら「おまかせ」。
+    ///
+    /// 空のときは役割ごとに、入っている CLI を配る
+    /// ([`super::roles::preset_for_role`])。名前が入っていれば**全員が
+    /// それ 1 つ**で動く。Run に持たせるのは、再起動をまたいでも同じ
+    /// 顔ぶれで立て直すため (設定を後から変えても、走っている Run の
+    /// 編成は変わらない)。
+    #[serde(default)]
+    pub agent_preset: String,
     pub max_attempts: u8,
     pub review_required: bool,
     pub paused: bool,
@@ -872,6 +881,7 @@ mod tests {
                 workspace: "ws".into(),
                 spec_source: "SPEC.md".into(),
                 agent_count: 4,
+                agent_preset: String::new(),
                 max_attempts: 3,
                 review_required: true,
                 paused: false,

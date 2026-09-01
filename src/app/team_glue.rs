@@ -458,7 +458,21 @@ impl ZaivernApp {
         // その CLI の癖がチーム全体に同じ形で乗る (実装の見落としを、同じ
         // 見落とし方をする相手がレビューする)。
         let table = self.team_preset_table();
-        let idx = crate::features::team::imp::roles::preset_for_role(&table, spec.role)?;
+        // **選ばれていればそれ 1 つ。** 「全員同じエージェントで」を
+        // 選べるようにするための分岐で、真実の在り処は Run
+        // (`RunDoc::agent_preset`) — 設定を後から変えても、走っている Run の
+        // 顔ぶれは変わらない。
+        let pinned = panel::with_panel(|p| p.pinned_agent());
+        let idx = if pinned.trim().is_empty() {
+            crate::features::team::imp::roles::preset_for_role(&table, spec.role)?
+        } else {
+            // 名前が見つからない (設定から消された) ときは、おまかせへ落ちる。
+            // **担当を 0 体にしない** — 起動できないより、別の CLI で動くほうがよい。
+            match table.iter().position(|p| p.name == pinned && p.is_ai) {
+                Some(i) => i,
+                None => crate::features::team::imp::roles::preset_for_role(&table, spec.role)?,
+            }
+        };
         let command = self.cfg.agents.get(idx)?.command.clone();
         let before: std::collections::HashSet<SessionId> =
             self.agents.sessions.iter().map(|s| s.id).collect();
@@ -585,6 +599,14 @@ impl ZaivernApp {
         // なので、盤面には場所だけ用意させて、実体はここで描く。
         // 見つからなければ `false` を返し、盤面は文字だけの控えへ落ちる
         // (端末が終わったあとも「何をしていたか」は読めるべきなので)。
+        // **選べるのは、この PC に入っている AI CLI だけ。**
+        // 入っていないものを選ばせると、その担当だけ永久に起動しない。
+        let agents: Vec<String> = self
+            .team_preset_table()
+            .into_iter()
+            .filter(|p| p.is_ai && p.available)
+            .map(|p| p.name)
+            .collect();
         let sessions = &mut self.agents.sessions;
         let mut term = |ui: &mut egui::Ui, sid: SessionId| -> bool {
             let Some(s) = sessions.iter_mut().find(|s| s.id == sid) else {
@@ -621,6 +643,7 @@ impl ZaivernApp {
                 &p.run_tabs(),
                 p.active_run(),
                 p.needs_git,
+                &agents,
                 &p.notice,
                 &mut term,
             );
@@ -933,6 +956,8 @@ impl ZaivernApp {
             run_id: crate::features::team::imp::runtime::new_run_id(),
             spec_source: source.clone(),
             agent_count: form.agents,
+            // 空なら「おまかせ」(役割ごとに配る)。名前が入っていれば全員それ。
+            agent_preset: form.agent_preset.clone(),
             max_attempts: form.max_attempts,
             review_required: form.review_required,
             // **この Run にだけ効く締め具合。** 既存のグローバル設定
