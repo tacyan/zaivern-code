@@ -325,7 +325,7 @@ jobs:
       #   新しい脆弱性が出たときに「自分の入れた zai は影響あるか」を、
       #   利用者がこちらの発表を待たずに判定できる。
       #   Cargo.lock を読むだけなのでビルド不要 = 数秒で終わる。
-      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
           tool: cargo-cyclonedx
 
