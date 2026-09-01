@@ -1061,14 +1061,47 @@ impl TeamPanel {
         self.dirty = true;
     }
 
+    /// **その Run の** Effect を成功として返す (位置が分かっているとき)。
+    ///
+    /// 冪等キーは Run をまたいで重なりうる — `instr:<task>:<agent>:…` の
+    /// タスク番号もエージェント名も Run ごとに 1 から数え直すので、同じ
+    /// SPEC を 2 本走らせると**綴りまで一致する**。鍵だけで探す
+    /// [`TeamPanel::ack_done`] は先に見つけた Run を採るため、配達の結末の
+    /// ように**持ち主が分かっている**場面では位置で返す。
+    fn ack_done_in(&mut self, pos: usize, key: &str) {
+        if let Some(rt) = self.runs.get_mut(pos) {
+            rt.note_effect_done(key);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
+    /// **その Run の** Effect を失敗として返す (位置が分かっているとき)。
+    fn ack_failed_in(&mut self, pos: usize, key: &str) {
+        if let Some(rt) = self.runs.get_mut(pos) {
+            rt.note_effect_failed(key);
+        }
+        self.needs_save = true;
+        self.dirty = true;
+    }
+
     /// **人が出した指示が、配送に届く前に落ちた**と Runtime へ返す
     /// (コスト上限で止まった / 送信キューへ積めなかった)。
     ///
     /// `ack_failed` だけで済ませると、記録には「送信キューへ追加しました」
     /// が残ったまま結末が 1 件も無い状態になる。**撃ち直さない**のは
     /// `note_delivery` の失敗と同じ理由 (人の発話を自動で再送しない)。
+    ///
+    /// **出した Run へ返す。** 画面に出している Run へ返すと、2 本目の
+    /// チームの指示が落ちたときに 1 本目の台帳へ書かれる (`note_delivery`
+    /// と同じ理由)。
     pub fn note_manual_failed(&mut self, key: &str, why: &str) {
-        if let Some(rt) = self.rt_mut() {
+        let pos = self
+            .runs
+            .iter()
+            .position(|r| r.has_effect(key))
+            .unwrap_or(self.active);
+        if let Some(rt) = self.runs.get_mut(pos) {
             rt.note_manual_delivery(key, false, why);
         }
         self.needs_save = true;
@@ -1339,14 +1372,17 @@ impl TeamPanel {
     /// 戻りは「届かなかったタスク」(画面へ理由を出すため)。
     pub fn note_delivery(&mut self, tag: &str, delivered: bool) -> Option<TaskId> {
         let (run, key) = tag.split_once('|')?;
-        // **前の Run の配達を、いまの Run へ効かせない。** 積んだ仕事は
-        // Run の切り替えでは消えないので、同じ番号の別のタスクを完了に
-        // してしまう (外向きの 4 つの口と同じ「持ち主で選り分ける」形)。
-        if self.owner().is_none_or(|o| o.run_id != run) {
-            return None;
-        }
-        let key = key.to_string();
-        let key = key.as_str();
+        // **出した Run へ返す。「いま画面に出している Run」ではない。**
+        //
+        // 実行するのは [`TeamPanel::mine`] = **走っている全 Run** の仕事なので、
+        // 結末も同じ範囲で受け取れなければ辻褄が合わない。ここを `owner()`
+        // (画面に出している 1 本) で照合していたので、Run が 2 本あるときと、
+        // 配達中に人がタブを切り替えたときに**結末が丸ごと消えて**いた
+        // (台帳に 1 行も残らず、担当は `running` のまま放置される)。
+        //
+        // 死んだ Run の配達はどの Run にも一致しないので、従来どおり効かない
+        // (前の Run の結末が、同じ番号の別のタスクを完了にしてしまわない)。
+        let pos = self.run_pos_of(run)?;
         // **人が出した指示は、タスクの機構へ流さない。** 宛先タスクが無い
         // ことがあるし、あっても「いま待っている指示」ではないので
         // `note_instruction_undelivered` の照合が必ず外れ、届かなかった
@@ -1355,9 +1391,7 @@ impl TeamPanel {
             // **結末を監査へ残す。** 発行時の記録は「送信キューへ追加した」
             // までなので、ここを素の ack で済ませると delivered と failed が
             // 記録の上で見分けられない。
-            if let Some(rt) = self.rt_mut() {
-                rt.note_manual_delivery(key, delivered, "宛先の端末が応答しませんでした");
-            }
+            self.runs[pos].note_manual_delivery(key, delivered, "宛先の端末が応答しませんでした");
             if !delivered {
                 self.notice = crate::i18n::tr("team.err.manual_undelivered");
             }
@@ -1367,16 +1401,21 @@ impl TeamPanel {
         }
         let task = self.instruction_task_of(key)?;
         if delivered {
-            self.ack_done(key);
+            self.ack_done_in(pos, key);
             return None;
         }
-        self.ack_failed(key);
-        if let Some(rt) = self.rt_mut() {
-            rt.note_instruction_undelivered(task, key, "宛先の端末が応答しませんでした");
-        }
+        self.ack_failed_in(pos, key);
+        self.runs[pos].note_instruction_undelivered(task, key, "宛先の端末が応答しませんでした");
         self.needs_save = true;
         self.dirty = true;
         Some(task)
+    }
+
+    /// **目印の run_id から Run の位置を引く。**
+    ///
+    /// 生きている Run だけが一致する (閉じた Run の配達は何も起こさない)。
+    fn run_pos_of(&self, run_id: &str) -> Option<usize> {
+        self.runs.iter().position(|r| r.run().run_id == run_id)
     }
 
     /// 配達の結末を受け取るための目印 (`<run_id>|<冪等キー>`)。
@@ -1384,8 +1423,22 @@ impl TeamPanel {
     /// Run を添えるのは、積んだ仕事が Run の切り替えでは消えないから
     /// (前の Run の配達が、同じ番号の別のタスクを完了にしてしまう)。
     /// Run が無ければ `None` = そもそも配達の結末を受け取らない。
+    ///
+    /// **添えるのは「その鍵を出した Run」であって、画面に出している Run
+    /// ではない。** 取り出し口 ([`TeamPanel::mine`]) は走っている全 Run の
+    /// 仕事を渡すので、`owner()` で目印を作ると **2 本目の Run の配達に
+    /// 1 本目の名札が付く**。名札が違えば結末は捨てられ、担当は `running`
+    /// のまま残る (実機で 6 体中 2 体が 28 分放置された形)。
     pub fn delivery_tag(&self, key: &str) -> Option<String> {
-        self.owner().map(|o| format!("{}|{key}", o.run_id))
+        let run = self
+            .runs
+            .iter()
+            .find(|r| r.has_effect(key))
+            .map(|r| r.run().run_id.clone())
+            // 記録が見当たらない鍵 (Team の外から来たもの) は、従来どおり
+            // 画面の Run を名乗る。Run が 1 本しか無い通常の場合と同じ。
+            .or_else(|| self.owner().map(|o| o.run_id))?;
+        Some(format!("{run}|{key}"))
     }
 
     /// 冪等キーからタスク番号を読む (`instr:<task>:<agent>:<attempt>:<seq>`)。
@@ -3060,6 +3113,184 @@ mod tests {
             p.rt().expect("Runtime").effect_completed(&key2),
             "別の Run の配達でいまの Run の記録を壊した"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **配達の結末は「出した Run」へ返る。画面に出している Run ではない。**
+    ///
+    /// 実行するのは `mine` = 走っている**全 Run** の仕事なので、結末も同じ
+    /// 範囲で受け取れなければ辻褄が合わない。ここが `owner()` (画面に出して
+    /// いる 1 本) だったので、Run が 2 本あるとき・配達中に人がタブを切り
+    /// 替えたときに**結末が丸ごと消えて**いた — 台帳に 1 行も残らず、担当は
+    /// `running` のまま放置される (実機で 6 体中 2 体が 28 分)。
+    #[test]
+    fn 画面に出していないrunの配達でも結末が返る() {
+        let dir = ws("delivery-two-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+
+        // ── 1 本目の Run を起こし、指示を口まで出す ──────────────────────
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "前提: 起動要求が出ている");
+        let mut sessions: Vec<SessionId> = Vec::new();
+        for (i, (key, spec)) in launches.iter().enumerate() {
+            p.ack_done(key);
+            let sid = 900 + i as SessionId;
+            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            sessions.push(sid);
+        }
+        let rows: Vec<SessionInput> = sessions
+            .iter()
+            .map(|s| SessionInput {
+                id: *s,
+                title: format!("agent{s}"),
+                provider: "claude".into(),
+                state: crate::coordinator::SessionState::Idle,
+                tail: Vec::new(),
+            })
+            .collect();
+        p.pump_sessions(rows, 2);
+        let sent = p.take_instructions();
+        assert!(!sent.is_empty(), "前提: 指示が出ている");
+        let (key, task, _, _) = sent[0].clone();
+
+        // **名札は「出した Run」のもの。**
+        let run_a = p.runs[0].run().run_id.clone();
+        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+        assert_eq!(
+            tag,
+            format!("{run_a}|{key}"),
+            "出した Run の名札が付いていない"
+        );
+
+        // ── 配達の途中で 2 本目の Run が立つ (= 画面がそちらへ移る) ──────
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
+        let run_b = p.runs[1].run().run_id.clone();
+        assert_ne!(run_a, run_b, "前提: Run の ID は別");
+        assert_eq!(
+            p.owner().expect("Run").run_id,
+            run_b,
+            "前提: 画面は 2 本目を出している"
+        );
+
+        // ── 届かなかった結末は、1 本目へ返らなければならない ─────────────
+        let hit = p.note_delivery(&tag, false);
+        assert_eq!(
+            hit,
+            Some(task),
+            "画面に出していない Run の配達の結末が消えた (台帳に 1 行も残らない)"
+        );
+        let rt = &p.runs[0];
+        assert!(
+            !rt.effect_completed(&key),
+            "届いていないのに完了として記録した (二度と出し直されない)"
+        );
+        let t = rt.task(task).expect("タスク");
+        assert!(
+            t.assigned_session.is_none() && t.assigned_agent.is_none(),
+            "届かなかったのに担当を握ったまま: {t:?}"
+        );
+        assert!(
+            t.context.iter().any(|c| c.contains("届きません")),
+            "台帳に理由が残っていない: {:?}",
+            t.context
+        );
+
+        // ── 2 本目 (画面に出している Run) は 1 バイトも触られていない ────
+        assert!(
+            p.runs[1]
+                .task(task)
+                .is_none_or(|t| t.context.iter().all(|c| !c.contains("届きません"))),
+            "別の Run の結末を、画面に出している Run の台帳へ書いた"
+        );
+
+        // ── 死んだ Run の配達は、どの Run にも効かない ───────────────────
+        assert_eq!(
+            p.note_delivery(&format!("run-gone|{key}"), false),
+            None,
+            "居ない Run の配達を採った"
+        );
+        assert_eq!(p.note_delivery("submit:someone-else", false), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **鍵は Run をまたいで綴りまで重なる。結末は名札の Run だけへ効く。**
+    ///
+    /// `instr:<task>:<agent>:<attempt>:<seq>` のタスク番号もエージェント名も
+    /// Run ごとに 1 から数え直すので、同じ SPEC を 2 本走らせると綴りが一致
+    /// する。鍵だけで持ち主を探すと**先に見つけた Run**へ結末が付き、本当の
+    /// 宛先はいつまでも返事を受け取れない。目印は Run を持っているので、
+    /// そちらで引き直せなければならない。
+    #[test]
+    fn 鍵が重なっても結末は名札のrunだけへ効く() {
+        let dir = ws("delivery-key-collision");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+
+        // ── 1 本目の Run が指示を出す ────────────────────────────────────
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        let launches = p.take_launches();
+        assert!(!launches.is_empty(), "前提: 起動要求が出ている");
+        let mut sessions: Vec<SessionId> = Vec::new();
+        for (i, (key, spec)) in launches.iter().enumerate() {
+            p.ack_done(key);
+            let sid = 1100 + i as SessionId;
+            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            sessions.push(sid);
+        }
+        let rows: Vec<SessionInput> = sessions
+            .iter()
+            .map(|s| SessionInput {
+                id: *s,
+                title: format!("agent{s}"),
+                provider: "claude".into(),
+                state: crate::coordinator::SessionState::Idle,
+                tail: Vec::new(),
+            })
+            .collect();
+        p.pump_sessions(rows, 2);
+        let sent = p.take_instructions();
+        assert!(!sent.is_empty(), "前提: 指示が出ている");
+        let (key, _, _, _) = sent[0].clone();
+
+        // ── 2 本目の Run が、**同じ綴りの鍵**を発行済みに持つ ────────────
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
+        let run_b = p.runs[1].run().run_id.clone();
+        p.runs[1].note_effect_dispatched_for_test(&key);
+        assert!(
+            p.runs[0].has_effect(&key) && p.runs[1].has_effect(&key),
+            "前提: 2 本とも同じ綴りの鍵を持っている"
+        );
+
+        // ── 2 本目の名札で「届いた」を返す ───────────────────────────────
+        assert_eq!(
+            p.note_delivery(&format!("{run_b}|{key}"), true),
+            None,
+            "届いたのに理由を返した"
+        );
+        assert!(
+            p.runs[1].effect_completed(&key),
+            "名札の Run へ完了が入っていない"
+        );
+        assert!(
+            !p.runs[0].effect_completed(&key),
+            "同じ綴りの鍵を持つ別の Run まで完了にした (鍵で先勝ちして取り違えている)"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

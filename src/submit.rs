@@ -65,8 +65,30 @@ pub const MAX_COMMIT_TRIES: u8 = 12;
 /// (スピナーの誤検知で永遠に待たないため)。
 pub const READY_WAIT: Duration = Duration::from_secs(45);
 
-/// 諦める上限。ここを過ぎたらユーザーへ知らせて捨てる。
+/// **理由の無い沈黙**が続いてよい上限。ここを過ぎたら人へ知らせて捨てる。
+///
+/// **積んでからの総時間ではない。** 総時間で切ると、起動時にモーダルを
+/// 出す CLI (フォルダ信頼確認) では**書く前に予算を使い切って諦める**。
+/// 実機で Antigravity の担当 2 体が、生ログ 3.5KB (起動表示のみ) のまま
+/// 1 文字も受け取れずに終わった — こちらは待っていただけで、相手は
+/// ちゃんと確認に答えて入力を待っていた。
+///
+/// 数えるのは [`holdup`] が「待ってよい理由」を 1 つも見つけられない
+/// 時間だけ。承認待ち・起動中・入力欄に本文が残っている、といった
+/// **観測できる理由がある間は延びる** (CLAUDE.md「進捗が観測できる限り
+/// 待ちを延ばす」)。
 pub const GIVE_UP: Duration = Duration::from_secs(120);
+
+/// **人へ返すまでの最後の上限** (理由が観測できていても、ここで諦める)。
+///
+/// [`GIVE_UP`] を沈黙時間へ移したので、承認プロンプトが永久に閉じない
+/// 相手では待ちが無限に延びうる。**待ち続けるのは黙って捨てるのと同じ**
+/// なので、ここで必ず人の手へ戻す。
+///
+/// これは配達の予算ではなく**引き渡しの期限**である (予算のほうは
+/// [`GIVE_UP`] が沈黙で測る)。人がモーダルへ答えるまでの時間を十分に
+/// 含める必要があるので、分の単位で取る。
+pub const GIVE_UP_MAX: Duration = Duration::from_secs(15 * 60);
 
 /// 確定キーを撃つ前に「相手が静かになる」のを待つ上限。
 ///
@@ -344,22 +366,86 @@ pub enum Act {
     Wait(Duration),
 }
 
+/// **待ってよい理由**。観測できているあいだ、沈黙の時計は進まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holdup {
+    /// 承認・フォルダ信頼確認などで止まっている。答えれば必ず先へ進む
+    Attention,
+    /// まだ起動中で入力を受け取れない (カタログの `input_ready_ms`)
+    Starting,
+    /// 手を動かしていて確定キーを飲み込む段にいる
+    Busy,
+    /// 入力欄に本文が見えている = **まだ届いていないという証拠**。
+    /// 撃ち直しに意味があるので待ってよい
+    Landing,
+}
+
+/// いま「待ってよい理由」が観測できるか (**純粋関数**)。
+///
+/// これが `Some` の間は [`GIVE_UP`] の時計を進めない。**理由が無いまま
+/// 静かなときだけ**諦める — 「何も起きていない時間」で切るのであって、
+/// 「積んでからの総時間」で切るのではない。
+///
+/// 相手ごとの分岐はここに書かない (`input_ready` はカタログが決めた真偽を
+/// 受け取るだけ)。
+pub fn holdup(job: &Job, peek: &Peek) -> Option<Holdup> {
+    if !peek.running {
+        return None;
+    }
+    // 承認待ちと起動中は、どの段でも「送れない理由」がはっきりしている。
+    if peek.attention {
+        return Some(Holdup::Attention);
+    }
+    if !peek.input_ready {
+        return Some(Holdup::Starting);
+    }
+    match job.stage {
+        // 書く前は、上の 2 つ以外に待つ理由が無い (書けるなら書く)。
+        Stage::Ready => None,
+        // 確定キーを飲み込む相手を待っている間 ([`COMMIT_IDLE_WAIT`] が
+        // 段そのものを打ち切るので、ここで無限には延びない)。
+        Stage::Commit => (!peek.idle).then_some(Holdup::Busy),
+        // 入力欄に本文が残っている = 届いていない証拠。撃ち直しの回数上限
+        // ([`MAX_COMMIT_TRIES`]) が別に効くので、ここでも無限には延びない。
+        Stage::Verify => {
+            still_pending(peek.input.as_deref(), &tail_key(&job.text)).then_some(Holdup::Landing)
+        }
+    }
+}
+
+/// 諦めるべきか (**純粋関数**)。
+///
+/// * 理由の無い沈黙が [`GIVE_UP`] 続いた → 諦める
+/// * 理由が観測できていても [`GIVE_UP_MAX`] を超えた → 人へ返す
+fn exhausted(since_quiet: Duration, since_queued: Duration) -> bool {
+    since_quiet >= GIVE_UP || since_queued >= GIVE_UP_MAX
+}
+
 /// 次の一手を決める (**純粋関数**)。
 ///
 /// * `since_stage` — いまの段に入ってからの経過
-/// * `since_queued` — 積まれてからの経過 (待ちの上限判定に使う)
+/// * `since_quiet` — **待ってよい理由 ([`holdup`]) が最後に見えてから**の経過。
+///   諦めの判定はこれで行う (積んでからの総時間ではない)
+/// * `since_queued` — 積まれてからの経過 ([`READY_WAIT`] と、人へ返す
+///   最後の期限 [`GIVE_UP_MAX`] だけに使う)
 ///
 /// 判断順序が意味を持つ:
 /// 1. 生きていなければ何もしない
 /// 2. **承認待ちなら絶対に送らない** (本文が承認への回答になってしまう)
 /// 3. それから段ごとの進行
-pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Duration) -> Act {
+pub fn decide(
+    job: &Job,
+    peek: &Peek,
+    since_stage: Duration,
+    since_quiet: Duration,
+    since_queued: Duration,
+) -> Act {
     if !peek.running {
         return Act::Gone;
     }
     match job.stage {
         Stage::Ready => {
-            if since_queued >= GIVE_UP {
+            if exhausted(since_quiet, since_queued) {
                 return Act::GaveUp;
             }
             // 承認プロンプトで止まっている間は何があっても送らない。
@@ -408,7 +494,7 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             // 入力欄に本文が見えないなら、書き直す。見えるようになれば
             // 下へ進んで確定する。
             if !peek.input_seen(&tail_key(&job.text)) {
-                if since_queued >= GIVE_UP || job.tries >= MAX_COMMIT_TRIES {
+                if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
                     return Act::GaveUp;
                 }
                 return Act::WriteBody;
@@ -433,7 +519,11 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
                 // 続く相手では**本文を入力欄に置いたまま永久に止まって**いた
                 // (実機: 指示が入力欄に見えているのに何分経っても送られない)。
                 // 送ってしまうと承認への回答になるので、送らずに**人へ返す**。
-                if since_queued >= GIVE_UP {
+                //
+                // ただし**承認待ちは「観測できる理由」**なので、[`GIVE_UP`]
+                // ではなく [`GIVE_UP_MAX`] が期限になる (人がモーダルへ
+                // 答えるまでの時間を、こちらの都合で打ち切らない)。
+                if exhausted(since_quiet, since_queued) {
                     return Act::GaveUp;
                 }
                 return Act::Wait(POLL);
@@ -457,7 +547,7 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             if !stuck {
                 return Act::Done;
             }
-            if since_queued >= GIVE_UP || job.tries >= MAX_COMMIT_TRIES {
+            if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
                 // **届かなかったことを黙って完了にしない。** 呼び出し元が
                 // 撃ち直せるよう、失敗として返す。
                 return Act::GaveUp;
@@ -484,10 +574,13 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub job: Job,
-    /// 積まれた時刻 (待ちの上限判定に使う)
+    /// 積まれた時刻 (人へ返す最後の期限 [`GIVE_UP_MAX`] に使う)
     queued: Instant,
     /// いまの段に入った時刻
     stage_at: Instant,
+    /// **待ってよい理由 ([`holdup`]) が最後に見えた時刻**、または段が
+    /// 進んだ時刻。諦めの判定はここからの経過で行う。
+    quiet_at: Instant,
 }
 
 impl Pending {
@@ -496,21 +589,37 @@ impl Pending {
             job,
             queued: now,
             stage_at: now,
+            quiet_at: now,
         }
     }
 
     /// 次の一手を尋ねる。
-    pub fn act(&self, peek: &Peek, now: Instant) -> Act {
+    ///
+    /// **理由が見えていれば沈黙の時計を打ち直す** — ここが「進捗が
+    /// 観測できる限り待ちを延ばす」の実体で、[`decide`] は純粋なまま
+    /// 保たれる (時計の管理はこちらの仕事)。
+    pub fn act(&mut self, peek: &Peek, now: Instant) -> Act {
+        if holdup(&self.job, peek).is_some() {
+            self.quiet_at = now;
+        }
         decide(
             &self.job,
             peek,
             now.saturating_duration_since(self.stage_at),
+            now.saturating_duration_since(self.quiet_at),
             now.saturating_duration_since(self.queued),
         )
     }
 
     /// 段を進める (経過時間の起点も一緒に打ち直す)。
+    ///
+    /// **同じ段への打ち直し (書き直し) では沈黙の時計を戻さない。**
+    /// 戻すと、証拠が 1 つも無いまま本文を書き続ける輪が
+    /// [`GIVE_UP`] で止まらなくなる (止まるのは [`GIVE_UP_MAX`] だけになる)。
     pub fn advance(&mut self, stage: Stage, now: Instant) {
+        if self.job.stage != stage {
+            self.quiet_at = now;
+        }
         self.job.stage = stage;
         self.stage_at = now;
     }
@@ -529,6 +638,16 @@ mod tests {
             bracketed: true,
             input: None,
         }
+    }
+
+    /// **待ってよい理由が 1 つも無いまま** `since` だけ経った、と読む。
+    ///
+    /// [`holdup`] が `None` の状況では沈黙の時計と総経過が一致するので、
+    /// この形が `Pending::act` の実際の呼び方と同じになる。理由がある
+    /// 状況 (承認待ち・起動中・入力欄に残留) は、時計が別々に進むので
+    /// [`decide`] を直接呼んで書き分ける。
+    fn decide_quiet(job: &Job, peek: &Peek, since_stage: Duration, since: Duration) -> Act {
+        decide(job, peek, since_stage, since, since)
     }
 
     #[test]
@@ -589,7 +708,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    decide(&job, &peek, Duration::from_secs(5), Duration::from_secs(5)),
+                    decide_quiet(&job, &peek, Duration::from_secs(5), Duration::from_secs(5)),
                     Act::Wait(_)
                 ),
                 "stage={stage:?} で送ろうとした"
@@ -606,7 +725,7 @@ mod tests {
         };
         let job = Job::user(1, "やって");
         assert_eq!(
-            decide(&job, &peek, Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek, Duration::ZERO, Duration::ZERO),
             Act::WriteBody
         );
     }
@@ -620,11 +739,11 @@ mod tests {
         };
         let job = Job::deferred(1, "やって", true);
         assert!(matches!(
-            decide(&job, &peek, Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek, Duration::ZERO, Duration::ZERO),
             Act::Wait(_)
         ));
         assert_eq!(
-            decide(&job, &peek, Duration::ZERO, READY_WAIT),
+            decide_quiet(&job, &peek, Duration::ZERO, READY_WAIT),
             Act::WriteBody
         );
     }
@@ -636,11 +755,11 @@ mod tests {
             ..Job::user(1, "やって")
         };
         assert!(matches!(
-            decide(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
             Act::Wait(_)
         ));
         assert_eq!(
-            decide(&job, &peek_ready(), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&job, &peek_ready(), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteCommit
         );
     }
@@ -652,7 +771,7 @@ mod tests {
             ..Job::deferred(1, "やって", false)
         };
         assert_eq!(
-            decide(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
             Act::Done
         );
     }
@@ -672,12 +791,12 @@ mod tests {
         };
         // 間隔は回を追うごとに広がるので、その待ちを過ぎてから撃つ。
         assert_eq!(
-            decide(&job, &peek, COMMIT_RETRY_MAX, VERIFY_DELAY),
+            decide_quiet(&job, &peek, COMMIT_RETRY_MAX, VERIFY_DELAY),
             Act::WriteCommit
         );
         // 待ちの途中では撃たない (起動中の相手へ連打しない)。
         assert!(matches!(
-            decide(&job, &peek, Duration::ZERO, VERIFY_DELAY),
+            decide_quiet(&job, &peek, Duration::ZERO, VERIFY_DELAY),
             Act::Wait(_)
         ));
     }
@@ -693,7 +812,10 @@ mod tests {
             tries: 1,
             ..Job::user(1, "やって")
         };
-        assert_eq!(decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+        assert_eq!(
+            decide_quiet(&job, &peek, VERIFY_DELAY, VERIFY_DELAY),
+            Act::Done
+        );
     }
 
     /// 撃ち直しは上限で必ず止まる (勝手に承認し続けない)。
@@ -716,19 +838,30 @@ mod tests {
         // では 3 回とも起動中に当たって終わる。入力欄に本文が見えている =
         // まだ届いていない、という**証拠**があるうちは撃ち直す。
         assert_eq!(
-            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            decide_quiet(&job, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
             Act::WriteCommit,
             "証拠があるのに撃ち直しをやめている"
         );
-        // 時間の上限を過ぎたら**人へ返す** (黙って完了にしない)。
-        assert_eq!(decide(&job, &peek, COMMIT_RETRY_MAX, GIVE_UP), Act::GaveUp);
+        // **入力欄に残っているのは「待ってよい理由」** ([`Holdup::Landing`])
+        // なので、沈黙の時計は進まない — `GIVE_UP` では諦めない。
+        assert_eq!(holdup(&job, &peek), Some(Holdup::Landing));
+        assert_eq!(
+            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::ZERO, GIVE_UP),
+            Act::WriteCommit,
+            "証拠があるのに積んでからの総時間で諦めている"
+        );
+        // 最後の期限を過ぎたら**人へ返す** (黙って完了にしない)。
+        assert_eq!(
+            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::ZERO, GIVE_UP_MAX),
+            Act::GaveUp
+        );
         // 回数の上限でも止まる (**承認プロンプトへ撃ち続けないための最後の砦**)。
         let spent = Job {
             tries: MAX_COMMIT_TRIES,
             ..job.clone()
         };
         assert_eq!(
-            decide(&spent, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            decide_quiet(&spent, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
             Act::GaveUp,
             "回数の上限を超えて撃ち続けている"
         );
@@ -737,7 +870,10 @@ mod tests {
             input: Some(String::new()),
             ..peek_ready()
         };
-        assert_eq!(decide(&job, &sent, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+        assert_eq!(
+            decide_quiet(&job, &sent, VERIFY_DELAY, VERIFY_DELAY),
+            Act::Done
+        );
     }
 
     /// **承認待ちのまま止まり続けない。**
@@ -759,17 +895,34 @@ mod tests {
                 stage,
                 ..Job::user(1, text)
             };
-            // 上限までは待つ (承認が終われば送れるので、すぐ諦めない)。
+            // **承認待ちは「観測できる理由」**なので、沈黙の時計は進まない。
+            assert_eq!(holdup(&job, &peek), Some(Holdup::Attention));
+            // 待つ (承認が終われば送れるので、すぐ諦めない)。
             assert!(
                 matches!(
-                    decide(&job, &peek, VERIFY_DELAY, Duration::from_secs(1)),
+                    decide(
+                        &job,
+                        &peek,
+                        VERIFY_DELAY,
+                        Duration::ZERO,
+                        Duration::from_secs(1)
+                    ),
                     Act::Wait(_)
                 ),
                 "stage={stage:?}: すぐ諦めている"
             );
-            // 上限を超えたら**人へ返す** (黙って待ち続けない)。
+            // **積んでから 120 秒経ったというだけでは諦めない** (相手は
+            // モーダルに答えれば受け取れる。ここで捨てると 1 文字も届かない)。
+            assert!(
+                matches!(
+                    decide(&job, &peek, VERIFY_DELAY, Duration::ZERO, GIVE_UP),
+                    Act::Wait(_)
+                ),
+                "stage={stage:?}: 理由が見えているのに総時間で諦めた"
+            );
+            // 最後の期限を超えたら**人へ返す** (黙って待ち続けない)。
             assert_eq!(
-                decide(&job, &peek, VERIFY_DELAY, GIVE_UP),
+                decide(&job, &peek, VERIFY_DELAY, Duration::ZERO, GIVE_UP_MAX),
                 Act::GaveUp,
                 "stage={stage:?}: 承認待ちのまま止まり続けている"
             );
@@ -785,7 +938,7 @@ mod tests {
             ..Job::user(1, "やって")
         };
         assert_eq!(
-            decide(&job, &peek_ready(), VERIFY_DELAY, VERIFY_DELAY),
+            decide_quiet(&job, &peek_ready(), VERIFY_DELAY, VERIFY_DELAY),
             Act::Done
         );
     }
@@ -797,7 +950,7 @@ mod tests {
             ..peek_ready()
         };
         assert_eq!(
-            decide(
+            decide_quiet(
                 &Job::user(1, "やって"),
                 &peek,
                 Duration::ZERO,
@@ -814,7 +967,10 @@ mod tests {
             ..peek_ready()
         };
         let job = Job::deferred(1, "やって", true);
-        assert_eq!(decide(&job, &peek, Duration::ZERO, GIVE_UP), Act::GaveUp);
+        assert_eq!(
+            decide_quiet(&job, &peek, Duration::ZERO, GIVE_UP),
+            Act::GaveUp
+        );
     }
 
     #[test]
@@ -850,14 +1006,14 @@ mod tests {
         // 手が動いている間は待つ。
         assert!(
             matches!(
-                decide(&job, &busy, COMMIT_DELAY, Duration::from_secs(1)),
+                decide_quiet(&job, &busy, COMMIT_DELAY, Duration::from_secs(1)),
                 Act::Wait(_)
             ),
             "忙しい相手へ撃っている"
         );
         // **待ちっぱなしにはしない。** 上限を過ぎたら撃って、効いたかを確かめる。
         assert_eq!(
-            decide(&job, &busy, COMMIT_IDLE_WAIT, Duration::from_secs(30)),
+            decide_quiet(&job, &busy, COMMIT_IDLE_WAIT, Duration::from_secs(30)),
             Act::WriteCommit,
             "静かにならない相手へ永久に届かない"
         );
@@ -867,7 +1023,7 @@ mod tests {
             ..busy.clone()
         };
         assert_eq!(
-            decide(&job, &quiet, COMMIT_DELAY, Duration::from_secs(1)),
+            decide_quiet(&job, &quiet, COMMIT_DELAY, Duration::from_secs(1)),
             Act::WriteCommit
         );
     }
@@ -887,18 +1043,31 @@ mod tests {
         };
         assert!(
             matches!(
-                decide(&job, &not_yet, Duration::ZERO, Duration::from_secs(1)),
+                decide_quiet(&job, &not_yet, Duration::ZERO, Duration::from_secs(1)),
                 Act::Wait(_)
             ),
             "受け取れない相手へ書いている"
         );
         // 受け取れるようになったら書く。
         assert_eq!(
-            decide(&job, &peek_ready(), Duration::ZERO, Duration::from_secs(1)),
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::from_secs(1)),
             Act::WriteBody
         );
-        // **待ちっぱなしにはしない。** 上限を過ぎたら人へ返す。
-        assert_eq!(decide(&job, &not_yet, Duration::ZERO, GIVE_UP), Act::GaveUp);
+        // **起動中は「観測できる理由」**なので、120 秒では諦めない
+        // (起動に手間取る相手を、こちらの都合で締め出さない)。
+        assert_eq!(holdup(&job, &not_yet), Some(Holdup::Starting));
+        assert!(
+            matches!(
+                decide(&job, &not_yet, Duration::ZERO, Duration::ZERO, GIVE_UP),
+                Act::Wait(_)
+            ),
+            "起動中と分かっているのに総時間で諦めた"
+        );
+        // **待ちっぱなしにはしない。** 最後の期限を過ぎたら人へ返す。
+        assert_eq!(
+            decide(&job, &not_yet, Duration::ZERO, Duration::ZERO, GIVE_UP_MAX),
+            Act::GaveUp
+        );
     }
 }
 
@@ -992,6 +1161,11 @@ mod write_confirm_tests {
         }
     }
 
+    /// 待ってよい理由が 1 つも無いまま `since` だけ経った (`mod tests` と同じ)。
+    fn decide_quiet(job: &Job, peek: &Peek, since_stage: Duration, since: Duration) -> Act {
+        decide(job, peek, since_stage, since, since)
+    }
+
     /// **書けていないのに確定キーを撃たない。**
     ///
     /// 起動中の CLI は書き込みを捨てる。捨てられたことに気付かずに
@@ -1004,11 +1178,11 @@ mod write_confirm_tests {
         let j = job("実装してください。最後まで終わらせて報告してください");
         // 入力欄が空 = 書き込みが捨てられた。
         assert_eq!(
-            decide(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteBody
         );
         assert_eq!(
-            decide(&j, &peek(Some("❯ ")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("❯ ")), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteBody
         );
     }
@@ -1019,12 +1193,12 @@ mod write_confirm_tests {
         let text = "実装してください。最後まで終わらせて報告してください";
         let j = job(text);
         assert_eq!(
-            decide(&j, &peek(Some(text)), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some(text)), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteCommit
         );
         // 畳まれた貼り付けも「見えている」。中身は本文そのもの。
         assert_eq!(
-            decide(
+            decide_quiet(
                 &j,
                 &peek(Some("[Pasted Content 2329 chars]")),
                 COMMIT_DELAY,
@@ -1040,7 +1214,7 @@ mod write_confirm_tests {
     fn 入力欄が読めないなら従来どおり進む() {
         let j = job("実装してください");
         assert_eq!(
-            decide(&j, &peek(None), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(None), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteCommit
         );
     }
@@ -1051,13 +1225,141 @@ mod write_confirm_tests {
         let mut j = job("実装してください");
         j.tries = MAX_COMMIT_TRIES;
         assert_eq!(
-            decide(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&j, &peek(Some("")), COMMIT_DELAY, COMMIT_DELAY),
             Act::GaveUp
         );
         let j2 = job("実装してください");
         assert_eq!(
-            decide(&j2, &peek(Some("")), COMMIT_DELAY, GIVE_UP),
+            decide_quiet(&j2, &peek(Some("")), COMMIT_DELAY, GIVE_UP),
             Act::GaveUp
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_modal_tests {
+    use super::*;
+
+    /// 実機の画面そのもの。起動直後に出るフォルダ信頼確認は、答えるまで
+    /// `attention` を立てたまま入力欄を塞ぐ。
+    fn modal_up() -> Peek {
+        Peek {
+            running: true,
+            // 起動したばかりなので、まだ受け取れない
+            input_ready: false,
+            idle: false,
+            // フォルダ信頼確認 (Yes, I trust this folder / No, exit)
+            attention: true,
+            bracketed: true,
+            input: None,
+        }
+    }
+
+    /// 確認に答え終わって、普通のプロンプトへ戻った状態。
+    fn answered() -> Peek {
+        Peek {
+            running: true,
+            input_ready: true,
+            idle: true,
+            attention: false,
+            bracketed: true,
+            input: None,
+        }
+    }
+
+    /// **起動時のモーダルで諦めない。**
+    ///
+    /// 実機 (Antigravity の担当 2 体): 端末の生ログが 3.5KB (起動表示のみ)
+    /// のまま 1 バイトも増えず、指示が 1 文字も届かないまま 28 分放置された。
+    /// 原因は諦めの予算が**積んでからの総時間 120 秒固定**だったこと —
+    /// モーダルが開いている間は書けないので、**書く前に予算を使い切る**。
+    ///
+    /// 時刻は論理時刻 (実時間を待たない)。`Instant` は起点にするだけで、
+    /// 進めるのは足し算。
+    #[test]
+    fn 起動時のモーダルで諦めない() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(Job::user(1, "実装して報告してください"), t0);
+        let modal = modal_up();
+
+        // モーダルが開いたまま、旧の予算 (120 秒) の 2 倍を過ぎるまで進める。
+        let mut t = t0;
+        let step = POLL;
+        while t.saturating_duration_since(t0) < GIVE_UP * 2 {
+            t += step;
+            let act = p.act(&modal, t);
+            assert!(
+                matches!(act, Act::Wait(_)),
+                "モーダルが開いている間に {act:?} を返した ({:?} 時点)",
+                t.saturating_duration_since(t0)
+            );
+        }
+
+        // 人がモーダルへ答えた。**ここで初めて書ける** — 旧の実装では
+        // すでに `GaveUp` 済みで、この一手が永久に来なかった。
+        let act = p.act(&answered(), t);
+        assert_eq!(
+            act,
+            Act::WriteBody,
+            "確認が終わったのに本文を書かない (諦めたまま)"
+        );
+    }
+
+    /// **理由が見えない沈黙は、これまでどおり [`GIVE_UP`] で切る。**
+    /// 「待ちを延ばす」が「永久に待つ」にならないことの裏取り。
+    #[test]
+    fn 理由の無い沈黙はこれまでどおり諦める() {
+        let t0 = Instant::now();
+        // 受け取れる・承認待ちでもない。それでも進まない相手 (Idle にならない
+        // 自動配達) は、待ってよい理由が 1 つも無い。
+        let quiet = Peek {
+            idle: false,
+            ..answered()
+        };
+        let mut p = Pending::new(Job::deferred(1, "実装して報告してください", true), t0);
+        assert!(holdup(&p.job, &quiet).is_none());
+        assert!(matches!(p.act(&quiet, t0 + POLL), Act::Wait(_)));
+        assert_eq!(p.act(&quiet, t0 + GIVE_UP), Act::GaveUp);
+    }
+
+    /// **理由が見えていても、人へ返す道は残す。**
+    /// モーダルが永久に閉じない相手を、黙って抱え続けない。
+    #[test]
+    fn 閉じないモーダルは最後に人へ返す() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(Job::user(1, "実装して報告してください"), t0);
+        let modal = modal_up();
+        // 途中は延び続ける。
+        assert!(matches!(p.act(&modal, t0 + GIVE_UP * 3), Act::Wait(_)));
+        // 最後の期限で必ず返る。
+        assert_eq!(p.act(&modal, t0 + GIVE_UP_MAX), Act::GaveUp);
+    }
+
+    /// **証拠の無い書き直しは、沈黙の時計を巻き戻さない。**
+    ///
+    /// 同じ段への打ち直し (`Commit` → `Commit`) で時計を戻すと、入力欄に
+    /// 何も現れないまま本文を書き続ける輪が [`GIVE_UP`] で止まらなくなる。
+    #[test]
+    fn 同じ段への書き直しでは沈黙の時計を戻さない() {
+        let t0 = Instant::now();
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut p = Pending::new(Job::user(1, text), t0);
+        // 書けた (Ready → Commit)。ここでは時計が進む。
+        p.advance(Stage::Commit, t0);
+        // 入力欄は空のまま = 書き込みが捨てられている (証拠が無い)。
+        let dropped = Peek {
+            input: Some(String::new()),
+            ..answered()
+        };
+        assert!(holdup(&p.job, &dropped).is_none());
+        // 書き直しを繰り返しても、同じ段なので時計は戻らない。
+        let mut t = t0;
+        for _ in 0..5 {
+            t += COMMIT_DELAY;
+            assert_eq!(p.act(&dropped, t), Act::WriteBody);
+            p.advance(Stage::Commit, t);
+        }
+        // 沈黙の上限で止まる (輪が回り続けない)。
+        assert_eq!(p.act(&dropped, t0 + GIVE_UP), Act::GaveUp);
     }
 }

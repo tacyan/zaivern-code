@@ -1063,3 +1063,88 @@ impl ZaivernApp {
         })
     }
 }
+
+/// **諦めた配達が台帳に残ることの番人。**
+///
+/// 実機で「指示が 1 文字も届かないのに、台帳に配達の失敗が 1 件も無い」が
+/// 起きたので、`Act::GaveUp` から台帳の記録までの鎖を 1 本ずつ固定する。
+/// どこか 1 つでも黙って捨てると、担当は `running` のまま放置され、
+/// **人が気付く手がかりが 1 つも残らない**。
+///
+/// 見るのは**囲っている関数 (または match の腕) の中だけ**。範囲を広げると
+/// 別のテストや別の関数が書いた文字列を拾って空回りする。
+#[cfg(test)]
+mod give_up_ledger_tests {
+    /// コメント行を落とす (自分の説明文を拾って誤検出しないため)。
+    fn code_only(s: &str) -> String {
+        s.replace("\r\n", "\n")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `at` に始まる区画を、次の `until` の手前まで切り出す。
+    fn segment<'a>(src: &'a str, at: &str, until: &str) -> &'a str {
+        let i = src.find(at).unwrap_or_else(|| panic!("見つからない: {at}"));
+        let rest = &src[i + at.len()..];
+        let end = rest.find(until).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 鎖の 1 本目: **諦めたことを目印つきで返す** (`submit_tick`)。
+    #[test]
+    fn 諦めた配達は目印つきで返る() {
+        let src = code_only(include_str!("agent_sessions.rs"));
+        let arm = segment(&src, "submit::Act::GaveUp => {", "submit::Act::");
+        assert!(
+            arm.contains("outcomes.push((t, false))"),
+            "諦めた配達を頼んだ側へ返していない (黙って消える):\n{arm}"
+        );
+    }
+
+    /// 鎖の 2 本目: **受け取った結末を Team へ渡す** (この橋)。
+    #[test]
+    fn 結末は_team_へ渡る() {
+        let src = code_only(include_str!("team_glue.rs"));
+        let body = segment(&src, "pub(crate) fn team_note_delivery", "\n    }\n");
+        assert!(
+            body.contains("p.note_delivery(&key, delivered)"),
+            "結末を Team へ渡していない:\n{body}"
+        );
+    }
+
+    /// 鎖の 3 本目: **届かなかった結末を Runtime へ流す** (`note_delivery`)。
+    #[test]
+    fn 届かなかった結末は_runtime_へ流れる() {
+        let src = code_only(include_str!("../team/panel.rs"));
+        let body = segment(&src, "pub fn note_delivery", "\n    }\n");
+        assert!(
+            body.contains("note_instruction_undelivered"),
+            "届かなかった結末を Runtime へ流していない:\n{body}"
+        );
+        assert!(
+            body.contains("note_manual_delivery"),
+            "人が出した指示の結末を Runtime へ流していない:\n{body}"
+        );
+    }
+
+    /// 鎖の 4 本目: **Runtime が台帳へ 1 件残す** (新しいイベント種別は増やさない)。
+    #[test]
+    fn 台帳に記録が残る() {
+        let src = code_only(include_str!("../team/runtime.rs"));
+        let body = segment(&src, "pub fn note_instruction_undelivered", "\n    }\n");
+        assert!(
+            body.contains("self.log("),
+            "諦めた配達が台帳に 1 行も残らない:\n{body}"
+        );
+        assert!(
+            body.contains("TeamEventKind::TaskFailed"),
+            "既存のイベント種別で記録していない:\n{body}"
+        );
+        assert!(
+            body.contains("free_task("),
+            "担当を解いていない (タスクが running のまま残る):\n{body}"
+        );
+    }
+}

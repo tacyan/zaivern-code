@@ -73,8 +73,16 @@ pub struct SessionObs {
     pub provider: String,
     /// 既存の [`crate::app`] が導出した調停層の状態。**ここが真実。**
     pub state: SessionState,
-    /// **前回 tick 以降に増えた画面テキスト**。全履歴を渡さないこと
-    /// (毎フレーム全部を解析すると、64 体でフレームが止まる)。
+    /// **いまの画面** (`screen_tail_lines` の末尾。差分ではない)。
+    ///
+    /// 差分に絞ると報告そのものが分断されるので、`panel::pump_sessions` は
+    /// 末尾をまるごと渡す。重複は意味の単位で [`TeamRuntime::take_unseen`] が
+    /// 落とす。
+    ///
+    /// **だから「空でないこと」は活動ではない。** 動いている TUI の画面は
+    /// 常に空でないので、ここを見て `last_activity_at` を進めると毎 tick
+    /// 進んでしまう (実機で 28 分止まった Run を誰も異常と言わなかった原因)。
+    /// 進捗は [`screen_fingerprint`] が**変わったとき**だけ数える。
     pub text: String,
 }
 
@@ -318,8 +326,8 @@ pub struct TeamRuntime {
     ///
     /// 端末タブが名前とボタンしか出していなかったので、走っている最中に
     /// 中身を見る手段が「端末を開く」しか無かった (開くと画面が切り替わる)。
-    /// [`SessionObs::text`] は前回 tick からの差分なので、ここで**末尾だけ**
-    /// 積み直す。上限は [`PREVIEW_MAX_CHARS`] — 上限が無いと、長く走った
+    /// [`SessionObs::text`] はいまの画面なので、ここへ末尾だけを積み直す。
+    /// 上限は [`PREVIEW_MAX_CHARS`] — 上限が無いと、長く走った
     /// Run のぶんだけ際限なく太る。
     ///
     /// 永続化しない (`persistence::Saved` に無い) — 再起動後に「前の実行の
@@ -362,6 +370,11 @@ pub struct TeamRuntime {
     /// 受け取れない。次の `tick` の出口でまとめて出す (保存しない —
     /// 届かなかった伝言を再起動後に蒸し返さない)。
     pending_msgs: Vec<TeamEffect>,
+    /// **担当 1 体ぶんの進捗の覚え書き** (画面の指紋と、静けさの長さ)。
+    ///
+    /// 保存しない — `previews` と同じ理由で、再起動後に前の実行の静けさを
+    /// 引き継ぐと、起こし直したばかりの担当をいきなり停滞と呼ぶ。
+    stalls: BTreeMap<AgentId, StallWatch>,
 }
 
 /// エージェント 1 体ぶんの画面プレビューに残す文字数。
@@ -372,6 +385,243 @@ pub const PREVIEW_MAX_CHARS: usize = 4_000;
 /// 上限が無いと、長く走った Run のぶんだけ記憶が太る。塊は報告・レビュー・
 /// 事象・伝言の 4 種類しかないので、この数で十分足りる。
 pub const SEEN_BLOCKS_CAP: usize = 512;
+
+// ── 停滞の検知 ───────────────────────────────────────────────────────
+//
+// **画面が空でないこと**を活動と数えてはいけない。[`SessionObs::text`] は
+// 端末の画面そのもの (`screen_tail_lines` の結果) なので、動いている TUI では
+// 常に空でない。実機の Run で 6 体が 28 分まったく進まなかったとき、台帳の
+// `last_activity_at` は毎 tick 更新されていた — **進捗の指標として働いて
+// いなかった**ので、誰も異常と言わなかった。
+//
+// ここでは「画面が**変わったとき**だけ活動」に直す。変化の判定は指紋
+// (正規化した画面のハッシュ) で行う。
+
+/// 画面の**指紋**。同じ値が続く = 何も進んでいない。
+///
+/// 正規化は [`crate::supervisor::normalize_line`] を借りる (`keep_digits =
+/// false` でスピナー字形・経過秒・トークン数・進捗 % が潰れる)。**2 本目を
+/// 書かない** — 別々に育つと、片方だけが「スピナーの再描画」を進捗と数える。
+///
+/// 畳むのは [`crate::history::Fnv1a64`]。`DefaultHasher` は rustc の版を
+/// またいで安定しないので、指紋を持ち回す用途では使わない。
+/// **正直な限界**: 桁だけが違う変化は進捗と数えない。
+///
+/// `● Edit(step1.rs)` → `● Edit(step2.rs)` は本当は進捗だが、数字を潰す
+/// ので同じ指紋になる。それでもこの畳み方を選ぶ理由は実測にある —
+/// 実機で 69 分止まっていた Run の画面は、**スピナーと経過秒とトークン数
+/// だけ**が動いていた (生バイトは 3 分前まで伸びていて「働いている」ように
+/// 見えた)。数字を残すと、この形が永久に進捗として通る。
+///
+/// 一方、本当に働いているエージェントは**行が増える** (道具を使うたびに
+/// `● Read(...)` が積まれる) ので、桁だけの違いを捨てても取りこぼさない。
+pub fn screen_fingerprint(text: &str) -> u64 {
+    let mut h = crate::history::Fnv1a64::default();
+    for line in text.lines() {
+        let n = crate::supervisor::normalize_line(line, false);
+        if n.is_empty() {
+            continue;
+        }
+        h.update(n.as_bytes());
+        // 行の切れ目も混ぜる (混ぜないと "ab" + "c" と "a" + "bc" が同値)。
+        h.update(b"\n");
+    }
+    h.finish()
+}
+
+/// **まだ 1 度も進捗を観測していない担当**に使う予算の下限 (秒)。
+///
+/// 値をここで決めない — 「意味的な進捗が無いまま何秒続いたら停滞か」は
+/// 既に [`crate::supervisor::SupervisorConfig`] の `stall_secs` が決めている
+/// (既定 180 秒)。2 つの層が別々の数字を持つと、片方だけ直した日に
+/// **同じ画面を一方は停滞と呼び、他方は呼ばない**。
+///
+/// なぜ下限が要るか: 起こしたばかりの CLI は MCP の立ち上げや初回応答待ちで
+/// 画面が数十秒〜数分まったく変わらない (`agents.rs` の確定キー再送が
+/// まさにその間を扱っている)。観測が 0 件の時点で短い線を引くと、
+/// **起動中の担当を全部「停滞」と呼ぶ**ことになる。
+pub fn stall_floor_secs() -> u64 {
+    crate::supervisor::SupervisorConfig::default().stall_secs
+}
+
+/// 観測した「静かだった最長の間隔」の何倍まで待つか。
+///
+/// **観測した最長そのものを線にしない。** そうすると、次にその 1 秒先まで
+/// 静かになっただけで停滞と呼ぶことになり、必ず嘘の赤を出す。
+///
+/// 2 ではなく 3 なのは、supervisor の `spinner_grace_factor` (= 2) が
+/// 「スピナーは動いている」間の猶予なのに対し、こちらは**画面が 1 文字も
+/// 変わらない**間の猶予だから — 1 段厚く取る。
+pub const STALL_QUIET_FACTOR: u64 = 3;
+
+/// 同じ担当・同じタスクで、はしごを何巡させるか。
+///
+/// **無限に回さない。** 上限に達したら回収を繰り返さず人へ上げる
+/// ([`DecisionKind::AttemptsExhausted`])。
+pub const STALL_MAX_ROUNDS: u8 = 2;
+
+/// 停滞の判定に要る材料。**時刻は全部引数**で受け取る。
+///
+/// `Instant::now()` を判定の中で呼ばない — 呼ぶと表で固定できなくなり、
+/// 実時間に依存したテスト (= このリポジトリが何度も嘘の赤を出した形) しか
+/// 書けなくなる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallInput {
+    /// 画面の指紋が最後に変わってからの秒数。
+    pub quiet_secs: u64,
+    /// **その担当が実際に働いていたときの**「静かだった最長の間隔」(秒)。
+    /// まだ観測していなければ 0。
+    pub longest_quiet_secs: u64,
+    /// 予算の下限 ([`stall_floor_secs`])。
+    pub floor_secs: u64,
+    /// この巡ですでに促しを送ったか。
+    pub nudged: bool,
+    /// 促しを送ってからの秒数 (`nudged` が偽なら見ない)。
+    pub since_nudge_secs: u64,
+    /// この担当・このタスクで済ませた巡の数。
+    pub rounds: u8,
+    /// 巡の上限 ([`STALL_MAX_ROUNDS`])。
+    pub max_rounds: u8,
+}
+
+/// 停滞のはしご 1 段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallVerdict {
+    /// 動いている (何もしない)。
+    Working,
+    /// 促しを 1 回送る。
+    Nudge,
+    /// 促しても変わらない — 担当を外して配り直せるようにする。
+    Reclaim,
+    /// 巡の上限に達した — 人へ上げる。
+    Escalate,
+}
+
+/// 待ち予算 (秒)。**固定値にしない。**
+///
+/// 固定の予算は N が増えれば必ず破綻するので、「進捗が観測できる限り
+/// 延ばす」形にする — その担当が実際に働いていたときの静けさの最長を覚え、
+/// その [`STALL_QUIET_FACTOR`] 倍を予算にする。観測が無いあいだだけ
+/// 下限 ([`stall_floor_secs`]) が効く。
+pub fn stall_budget_secs(longest_quiet_secs: u64, floor_secs: u64) -> u64 {
+    floor_secs.max(longest_quiet_secs.saturating_mul(STALL_QUIET_FACTOR))
+}
+
+/// 停滞のはしごを 1 段だけ決める (**純関数**)。
+///
+/// 促しは端末へ打ち込むので**画面が変わる** = 指紋も `quiet_secs` も一度
+/// 0 へ戻る。だから 2 段目は「促してから予算ぶん経っても、また静かなまま」で
+/// 判定する (促した直後の変化を「動き出した」と読まないため)。
+pub fn judge_stall(inp: StallInput) -> StallVerdict {
+    let budget = stall_budget_secs(inp.longest_quiet_secs, inp.floor_secs);
+    if inp.quiet_secs < budget {
+        return StallVerdict::Working;
+    }
+    if !inp.nudged {
+        return StallVerdict::Nudge;
+    }
+    if inp.since_nudge_secs < budget {
+        return StallVerdict::Working;
+    }
+    if inp.rounds.saturating_add(1) >= inp.max_rounds {
+        StallVerdict::Escalate
+    } else {
+        StallVerdict::Reclaim
+    }
+}
+
+/// 止まっている担当へ送る促しの文面 (**純関数**)。
+///
+/// **報告の囲みマーカーを 1 つも書かない。** 書くと、端末が描き返した
+/// エコーが「中身が壊れた報告」として拾われ、却下ログだけが積み上がる
+/// (`harvest` はマーカーの間を報告として読むため)。形式は最初の指示に
+/// 書いてあるので、ここでは思い出させるだけでよい。
+pub fn stall_nudge_text(task: TaskId, title: &str) -> String {
+    format!(
+        "[Zaivern] あなたの担当 #{task}「{title}」はまだ報告されていません。\n\
+         終わっていれば、最初の指示にある形式で報告してください。\n\
+         まだなら、いまどこで詰まっているかを 1〜2 行で教えてください\n\
+         (承認待ち・入力待ちで止まっているなら、その旨だけで構いません)。",
+        title = title.chars().take(60).collect::<String>()
+    )
+}
+/// 担当 1 体ぶんの進捗の覚え書き。**保存しない。**
+///
+/// 保存すると再起動後に「前の実行の静けさ」を引き継いで、起こし直した
+/// ばかりの担当をいきなり停滞と呼ぶ。`previews` と同じ扱いにする。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct StallWatch {
+    /// 1 度でも観測したか。**`changed_at == 0` を「未観測」の代わりに
+    /// 使わない** — 0 は実在しうる時刻で、番兵にすると初回だけ挙動が違う
+    /// 隠れた分岐になる。
+    seen: bool,
+    /// 直近の画面指紋。
+    fingerprint: u64,
+    /// 指紋が最後に変わった時刻 (秒)。
+    changed_at: u64,
+    /// **働いていたときの**静けさの最長 (秒)。促した巡のぶんは数えない。
+    longest_quiet: u64,
+    /// いま見ている担当タスク。変わったらはしごを最初から。
+    task: Option<TaskId>,
+    /// この巡で促しを送った時刻。
+    nudged_at: Option<u64>,
+    /// 済ませた巡の数。
+    rounds: u8,
+    /// 人へ上げたか。**上げたら、この担当・このタスクでは以後何もしない**
+    /// (同じ相手へ促しを撃ち続けない)。担当が替われば `retarget` が外す。
+    escalated: bool,
+}
+
+impl StallWatch {
+    /// 観測を 1 つ取り込む。**画面が変わったときだけ**活動として数える。
+    ///
+    /// 静けさを `longest_quiet` へ畳むのは**促していない巡だけ**。促した後の
+    /// 変化には、こちらが打ち込んだ文字が混ざっている — それを「この担当は
+    /// これだけ静かでも働いている」と学習すると、予算が促しのたびに伸びて
+    /// **二度と停滞と言えなくなる**。
+    fn observe(&mut self, fingerprint: u64, now: u64) {
+        if !self.seen {
+            self.seen = true;
+            self.fingerprint = fingerprint;
+            self.changed_at = now;
+            return;
+        }
+        if fingerprint == self.fingerprint {
+            return;
+        }
+        if self.nudged_at.is_none() {
+            self.longest_quiet = self.longest_quiet.max(now.saturating_sub(self.changed_at));
+        }
+        self.fingerprint = fingerprint;
+        self.changed_at = now;
+    }
+
+    /// 担当が替わったらはしごを最初から (別の仕事は別の話)。
+    fn retarget(&mut self, task: Option<TaskId>) {
+        if self.task != task {
+            self.task = task;
+            self.nudged_at = None;
+            self.rounds = 0;
+            self.escalated = false;
+        }
+    }
+
+    /// いまの材料を判定へ渡す形にする。
+    fn input(&self, now: u64, floor_secs: u64) -> StallInput {
+        StallInput {
+            quiet_secs: now.saturating_sub(self.changed_at),
+            longest_quiet_secs: self.longest_quiet,
+            floor_secs,
+            nudged: self.nudged_at.is_some(),
+            since_nudge_secs: self
+                .nudged_at
+                .map(|at| now.saturating_sub(at))
+                .unwrap_or_default(),
+            rounds: self.rounds,
+            max_rounds: STALL_MAX_ROUNDS,
+        }
+    }
+}
 
 /// 計画が必要としている役割を、枠 `slots` ぶんだけ並べる (純関数)。
 ///
@@ -555,6 +805,7 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            stalls: BTreeMap::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
@@ -684,6 +935,7 @@ impl TeamRuntime {
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
+            stalls: BTreeMap::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
             seen_block_order: VecDeque::new(),
@@ -1782,6 +2034,12 @@ impl TeamRuntime {
         // 6) Pause / Stop 中は**新規割り当てをしない** (新しい検証も
         //    `advance` の中で同じ条件で止めている)。
         if self.accepting_work() {
+            // **止まっている担当を起こす。** 配る前に見る — 促しが効いて
+            // 本人が報告すれば、そもそも配り直しは要らない。
+            //
+            // 止めている間 (Pause / Stop) は撃たない。人が止めたものを
+            // 「止まっている」と咎めることになるため。
+            self.nudge_stalled(obs.now, &mut out);
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
         }
@@ -1942,6 +2200,9 @@ impl TeamRuntime {
             .filter(|t| t.state.is_terminal())
             .map(|t| t.id)
             .collect();
+        // **進捗の覚え書きは借りて返す。** `self.agents` を可変で回している
+        // 間は `self.stalls` を触れないので、取り出してから戻す。
+        let mut stalls = std::mem::take(&mut self.stalls);
         for a in &mut self.agents {
             let Some(sid) = a.session_id else {
                 // **セッションを持たないもの** (親が報告してきたサブ
@@ -1970,7 +2231,18 @@ impl TeamRuntime {
                         a.state = next;
                         a.last_activity_at = obs.now;
                     }
-                    if !s.text.trim().is_empty() {
+                    // **画面が変わったときだけ活動。**
+                    //
+                    // ここを `!s.text.trim().is_empty()` にしてはいけない。
+                    // `s.text` は端末の画面そのものなので、動いている TUI では
+                    // 常に空でなく、`last_activity_at` が毎 tick 進む。実機の
+                    // Run で 6 体が 28 分まったく進まなかったとき、台帳は
+                    // 「たった今活動した」と言い続けていた。
+                    let w = stalls.entry(a.id.clone()).or_default();
+                    w.retarget(a.current_task);
+                    let before = w.changed_at;
+                    w.observe(screen_fingerprint(&s.text), obs.now);
+                    if w.changed_at != before {
                         a.last_activity_at = obs.now;
                     }
                 }
@@ -1985,10 +2257,167 @@ impl TeamRuntime {
                     // 出す (`release_dead` が担当を外したあとも消えない —
                     // 次の tick からは上の枝を通らないため)。
                     a.current_task = None;
+                    // **消えた担当の覚え書きは捨てる。** 起こし直したら
+                    // 別の画面・別の静けさなので、引き継ぐと起動中の担当を
+                    // いきなり停滞と呼ぶ。
+                    stalls.remove(&a.id);
                 }
             }
         }
+        // 居なくなった担当のぶんは捨てる (際限なく溜めない)。
+        let known_ids: BTreeSet<AgentId> = self.agents.iter().map(|a| a.id.clone()).collect();
+        stalls.retain(|id, _| known_ids.contains(id));
+        self.stalls = stalls;
         self.release_dead(obs.now);
+    }
+
+    /// **止まっている担当を起こす。** 促す → 回収する → 人へ上げる。
+    ///
+    /// 実機の Run で 6 体とも生きているのに 28 分まったく進まず、**誰も
+    /// それを異常と言わなかった**。ここが「言う」場所である。
+    ///
+    /// 判定そのものは純関数 [`judge_stall`] にあり、時刻は全部引数で渡す。
+    /// ここがやるのは材料集めと、段に応じた**既存経路の呼び分け**だけ:
+    ///
+    /// * 促し — 人の指示と同じ [`TeamEffect::SendManualInstruction`]。
+    ///   **第 2 の配達路を作らない。** 冪等キーも同じ名前空間なので、
+    ///   結末は [`note_manual_delivery`](Self::note_manual_delivery) が書く。
+    /// * 回収 — 人の Reassign と**同じ経路**。担当が生きているうちに
+    ///   `free_task` で `Ready` へ戻すと、まだ編集しているかもしれない旧担当と
+    ///   新担当が同じファイルを同時に持つ ([`TeamAction::ReassignTask`] の
+    ///   doc)。だから `reassign_pending` を立てて停止承認へ上げ、実際の解放は
+    ///   停止が観測できてから `settle_reassign` → `free_task` が行う。
+    /// * 人へ上げる — 既存の [`DecisionKind::AttemptsExhausted`]。
+    ///   **新しい種別は増やさない。**
+    fn nudge_stalled(&mut self, now: u64, out: &mut Vec<TeamEffect>) {
+        let floor = stall_floor_secs();
+        // 借用を分けるため、拾うところまでを先に済ませる。
+        struct Stalled {
+            agent: AgentId,
+            session: SessionId,
+            task: TaskId,
+            title: String,
+            quiet: u64,
+            verdict: StallVerdict,
+        }
+        let mut hits: Vec<Stalled> = Vec::new();
+        for a in &self.agents {
+            if a.kind != AgentKind::ManagedSession {
+                continue;
+            }
+            let Some(session) = a.session_id else {
+                continue;
+            };
+            let Some(w) = self.stalls.get(&a.id) else {
+                continue;
+            };
+            if w.escalated || !w.seen {
+                continue;
+            }
+            // **本人が動く番の担当だけ**を見る。`Validating` は Zaivern 自身が
+            // コマンドを走らせている段で、画面が静かなのが正しい。`Reviewing`
+            // も別の担当を待っている段なので数えない (どちらも「止まって
+            // いる」の意味が違う)。
+            let Some(t) = self.tasks.iter().find(|t| {
+                t.assigned_agent.as_ref() == Some(&a.id)
+                    && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+            }) else {
+                continue;
+            };
+            if t.reassign_pending || t.validation.running || t.review.running {
+                continue;
+            }
+            let verdict = judge_stall(w.input(now, floor));
+            if verdict == StallVerdict::Working {
+                continue;
+            }
+            hits.push(Stalled {
+                agent: a.id.clone(),
+                session,
+                task: t.id,
+                title: t.title.clone(),
+                quiet: now.saturating_sub(w.changed_at),
+                verdict,
+            });
+        }
+
+        for h in hits {
+            match h.verdict {
+                StallVerdict::Working => {}
+                StallVerdict::Nudge => {
+                    // **鍵は、これから積むイベントの ID から作る**
+                    // (人の指示と同じ組み立て — `manual_instruction_key`)。
+                    let id = self.log_to(
+                        TeamEventKind::AgentBlocked,
+                        None,
+                        Some(h.agent.clone()),
+                        format!(
+                            "{} の画面が {} 秒変わっていません。#{} の様子を尋ねます",
+                            h.agent, h.quiet, h.task
+                        ),
+                    );
+                    out.push(TeamEffect::SendManualInstruction {
+                        agent: h.agent.clone(),
+                        session: h.session,
+                        text: stall_nudge_text(h.task, &h.title),
+                        key: manual_instruction_key(&h.agent, id),
+                    });
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.nudged_at = Some(now);
+                    }
+                    self.dirty = true;
+                }
+                StallVerdict::Reclaim => {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == h.task) {
+                        t.reassign_pending = true;
+                        t.updated_at = now_secs();
+                    }
+                    // **鍵は人の Reassign と同じ。** 同じ話を 2 枚出さない。
+                    let d = self.make_decision(
+                        DecisionKind::StopAgents,
+                        Some(h.task),
+                        Some(h.agent.clone()),
+                        format!(
+                            "#{} の担当は促しても {} 秒画面が変わりません。停止して配り直しますか",
+                            h.task, h.quiet
+                        ),
+                        "停止するまで配り直しません (同じファイルを 2 人が同時に持たないため)"
+                            .into(),
+                        vec!["approve".into(), "reject".into()],
+                        format!("reassign-stop:{}", h.task),
+                        Vec::new(),
+                        None,
+                    );
+                    if let Some(d) = d {
+                        out.push(TeamEffect::RequestHumanApproval(d));
+                    }
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.rounds = w.rounds.saturating_add(1);
+                        w.nudged_at = None;
+                    }
+                    self.dirty = true;
+                }
+                StallVerdict::Escalate => {
+                    self.raise(
+                        DecisionKind::AttemptsExhausted,
+                        Some(h.task),
+                        Some(h.agent.clone()),
+                        format!(
+                            "#{} は促しても回収しても動きません ({} 秒画面が変わっていません)",
+                            h.task, h.quiet
+                        ),
+                        format!("担当: {}", h.agent),
+                        vec!["retry".into(), "reassign".into(), "reject".into()],
+                    );
+                    // **同じ相手へ撃ち続けない。** 担当が替わるまで降りる。
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.rounds = w.rounds.saturating_add(1);
+                        w.escalated = true;
+                    }
+                    self.dirty = true;
+                }
+            }
+        }
     }
 
     /// 消えたセッションが握っていたタスクを解放する。
@@ -4460,5 +4889,352 @@ mod stale_report_tests {
                 );
             }
         }
+    }
+}
+
+/// **止まっているのに誰も異常と言わない**ことの番人。
+///
+/// 入力は実機の Run そのもの — 6 体とも生きていて、画面には TUI が出ていて、
+/// スピナーと経過秒だけが動き、28 分どのタスクも進まない。以前はこの入力で
+/// `last_activity_at` が毎 tick 更新され、停滞は**構造的に**検知できなかった。
+///
+/// 時刻は全部**引数で渡す論理時刻**である。実時間で線を引くと、負荷の谷と山で
+/// 必ず嘘の赤が出る (このリポジトリで実績がある)。
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    /// 実機の画面。**スピナーの字形と経過秒とトークン数だけが動く。**
+    fn spinning(sec: u64) -> String {
+        const GLYPHS: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+        format!(
+            "{} Thinking… ({sec}s · {} tokens · esc to interrupt)\n\n> \n",
+            GLYPHS[(sec % 4) as usize],
+            300 + sec * 7
+        )
+    }
+
+    /// 本当に進んだ画面 (行が増える)。
+    /// **本当に進んでいる画面。** 実機のエージェントは、道具を使うたびに
+    /// **行が増える** (`● Read(...)` / `● Edit(...)` が積まれる)。
+    /// 桁だけが違う同じ行を出し続けるのは、スピナーと経過秒の再描画である。
+    fn working(step: u64) -> String {
+        let mut s = String::from("⠋ Working… (0s)\n");
+        for i in 1..=step {
+            s.push_str(&format!("● Read(src/auth/mod_{}.rs)\n", "x".repeat(i as usize)));
+        }
+        s.push_str("\n> \n");
+        s
+    }
+
+    fn obs_of(now: u64, rows: &[(SessionId, String)]) -> Observation {
+        Observation {
+            now,
+            sessions: rows
+                .iter()
+                .map(|(id, text)| SessionObs {
+                    id: *id,
+                    title: format!("agent{id}"),
+                    provider: "claude".into(),
+                    state: SessionState::Idle,
+                    text: text.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn rows_of(sessions: &[SessionId], text: &str) -> Vec<(SessionId, String)> {
+        sessions.iter().map(|s| (*s, text.to_string())).collect()
+    }
+
+    /// 担当が付いて動き出した Run と、そのセッション一覧。
+    ///
+    /// **実 `~/.zaivern` には触れない** — `runtime_tests::started` は
+    /// 一時的な作業フォルダしか使わず、実測の入口は `test_hooks` で
+    /// 差し替えてある (git も呼ばない)。
+    ///
+    /// 最後に 1 tick 余分に回して**担当の作業状態を落ち着かせる**。
+    /// 割り当ての tick では `sync_sessions` が先に走るので、`Working` へ
+    /// 変わるのは次の tick になる (その 1 回だけは正当な活動更新)。
+    fn dispatched() -> (TeamRuntime, Vec<SessionId>) {
+        let mut rt = super::super::runtime_tests::started(4);
+        let eff = rt.tick(&obs_of(1, &[]));
+        let mut sessions = Vec::new();
+        let mut next = 1;
+        for e in &eff {
+            if let TeamEffect::StartAgent(s) = e {
+                rt.bind_session(&s.agent_id, next, None);
+                sessions.push(next);
+                next += 1;
+            }
+        }
+        assert!(!sessions.is_empty(), "担当が 1 体も起きない");
+        rt.tick(&obs_of(2, &rows_of(&sessions, &spinning(0))));
+        rt.tick(&obs_of(3, &rows_of(&sessions, &spinning(0))));
+        assert!(
+            rt.tasks
+                .iter()
+                .any(|t| matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)),
+            "タスクが 1 件も配られない"
+        );
+        (rt, sessions)
+    }
+
+    /// 停滞の促しだけを拾う (人の指示・伝言と混ぜない)。
+    fn nudges_to(effects: &[TeamEffect]) -> Vec<AgentId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                TeamEffect::SendManualInstruction { agent, text, .. }
+                    if text.contains("まだ報告されていません") =>
+                {
+                    Some(agent.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stop_requests(rt: &TeamRuntime) -> Vec<TaskId> {
+        rt.decisions
+            .iter()
+            .filter(|d| d.kind == DecisionKind::StopAgents)
+            .filter_map(|d| d.task_id)
+            .collect()
+    }
+
+    /// 静かな画面のまま `mins` 分ぶん回し、その間に出た促しを返す。
+    fn run_quiet(rt: &mut TeamRuntime, sessions: &[SessionId], mins: u64) -> Vec<AgentId> {
+        let mut nudged = Vec::new();
+        for t in 1..=mins {
+            let now = 3 + t * 60;
+            let eff = rt.tick(&obs_of(now, &rows_of(sessions, &spinning(now))));
+            nudged.extend(nudges_to(&eff));
+        }
+        nudged
+    }
+
+    // ── 指紋 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn スピナーと経過秒だけの動きは進捗ではない() {
+        assert_eq!(
+            screen_fingerprint(&spinning(12)),
+            screen_fingerprint(&spinning(13)),
+            "スピナーと数字だけの差で指紋が変わってはいけない"
+        );
+        assert_ne!(
+            screen_fingerprint(&working(1)),
+            screen_fingerprint(&working(2)),
+            "行が増えたら指紋は変わる"
+        );
+        // **空でないこと**は活動ではない — どちらも空でないのに同じ指紋。
+        assert!(!spinning(12).trim().is_empty());
+        assert!(!spinning(13).trim().is_empty());
+    }
+
+    // ── 予算 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn 予算は観測が伸びれば伸びる() {
+        let floor = 180;
+        assert_eq!(stall_budget_secs(0, floor), floor, "観測が無ければ下限");
+        assert_eq!(
+            stall_budget_secs(10, floor),
+            floor,
+            "短い観測では下限のまま"
+        );
+        assert_eq!(
+            stall_budget_secs(400, floor),
+            400 * STALL_QUIET_FACTOR,
+            "観測が下限を超えたら、そちらへ伸びる"
+        );
+        // **固定の予算ではない**ことを 2 点の比較で固定する。
+        assert!(stall_budget_secs(1_000, floor) > stall_budget_secs(400, floor));
+    }
+
+    #[test]
+    fn 促した巡の静けさは学習しない() {
+        let mut w = StallWatch::default();
+        w.observe(1, 10);
+        // 促していない巡: 100 秒静かだった後に動いた → 学習する。
+        w.observe(2, 110);
+        assert_eq!(w.longest_quiet, 100);
+        // 促した巡: こちらが打ち込んだ文字で画面が動く → 学習しない。
+        w.nudged_at = Some(150);
+        w.observe(3, 900);
+        assert_eq!(
+            w.longest_quiet, 100,
+            "促しのエコーを「この担当はこれだけ静かでも働く」と学習してはいけない"
+        );
+    }
+
+    // ── はしごの表 ──────────────────────────────────────────────────
+
+    #[test]
+    fn 停滞のはしごを表で固定する() {
+        let base = StallInput {
+            quiet_secs: 0,
+            longest_quiet_secs: 0,
+            floor_secs: 180,
+            nudged: false,
+            since_nudge_secs: 0,
+            rounds: 0,
+            max_rounds: STALL_MAX_ROUNDS,
+        };
+        // (静けさ, 観測した最長, 促し済み, 促してから, 巡) → 段
+        let table: [(u64, u64, bool, u64, u8, StallVerdict); 7] = [
+            (179, 0, false, 0, 0, StallVerdict::Working),
+            (180, 0, false, 0, 0, StallVerdict::Nudge),
+            // 観測が伸びていれば、同じ静けさでもまだ働いている扱い。
+            (180, 400, false, 0, 0, StallVerdict::Working),
+            (1_680, 400, false, 0, 0, StallVerdict::Nudge),
+            // 促した直後は待つ (打ち込んだぶんで画面が動くため)。
+            (200, 0, true, 10, 0, StallVerdict::Working),
+            (400, 0, true, 200, 0, StallVerdict::Reclaim),
+            (400, 0, true, 200, 1, StallVerdict::Escalate),
+        ];
+        for (quiet, longest, nudged, since, rounds, want) in table {
+            let got = judge_stall(StallInput {
+                quiet_secs: quiet,
+                longest_quiet_secs: longest,
+                nudged,
+                since_nudge_secs: since,
+                rounds,
+                ..base
+            });
+            assert_eq!(
+                got, want,
+                "quiet={quiet} longest={longest} nudged={nudged} since={since} rounds={rounds}"
+            );
+        }
+    }
+
+    // ── 実機そのもの ────────────────────────────────────────────────
+
+    #[test]
+    fn 画面が空でないだけでは活動にならない() {
+        let (mut rt, sessions) = dispatched();
+        let before: Vec<(AgentId, u64)> = rt
+            .agents
+            .iter()
+            .map(|a| (a.id.clone(), a.last_activity_at))
+            .collect();
+        run_quiet(&mut rt, &sessions, 28);
+        let after: Vec<(AgentId, u64)> = rt
+            .agents
+            .iter()
+            .map(|a| (a.id.clone(), a.last_activity_at))
+            .collect();
+        assert_eq!(
+            before, after,
+            "画面が空でないだけで last_activity_at が進んではいけない"
+        );
+    }
+
+    #[test]
+    fn 二十八分変わらない担当は促されて回収要求まで進む() {
+        let (mut rt, sessions) = dispatched();
+        let nudged = run_quiet(&mut rt, &sessions, 28);
+        assert!(!nudged.is_empty(), "28 分止まっているのに誰も促されない");
+        let mut uniq = nudged.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            nudged.len(),
+            "同じ担当へ促しを何度も送っている: {nudged:?}"
+        );
+        assert!(
+            !stop_requests(&rt).is_empty(),
+            "促しても動かないのに回収要求が 1 件も出ない"
+        );
+    }
+
+    #[test]
+    fn 促した直後には回収しない() {
+        let (mut rt, sessions) = dispatched();
+        // 下限 (180 秒) は越えるが、促してからの猶予は越えない長さ。
+        let nudged = run_quiet(&mut rt, &sessions, 5);
+        assert!(!nudged.is_empty(), "下限を越えたのに促していない");
+        assert!(
+            stop_requests(&rt).is_empty(),
+            "促した直後に回収まで進んではいけない"
+        );
+    }
+
+    #[test]
+    fn 生きている担当のタスクを勝手に配り直さない() {
+        let (mut rt, sessions) = dispatched();
+        run_quiet(&mut rt, &sessions, 60);
+        let stops = stop_requests(&rt);
+        assert!(!stops.is_empty(), "回収要求が出ていない");
+        for tid in &stops {
+            let t = rt.task(*tid).expect("タスクが居る");
+            assert!(
+                t.reassign_pending,
+                "#{tid} に停止待ちの印が無いと、承認しても配り直せない"
+            );
+            // **停止が確認できるまで担当は外さない** (旧担当がまだ編集して
+            // いるかもしれない — `TeamAction::ReassignTask` と同じ約束)。
+            assert!(
+                t.assigned_agent.is_some(),
+                "#{tid} の担当を、停止を確認する前に外している"
+            );
+            assert!(
+                matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running),
+                "#{tid} を勝手に Ready へ戻している"
+            );
+        }
+    }
+
+    #[test]
+    fn 回収を断られ続けたら人へ上げてそこで止まる() {
+        let (mut rt, sessions) = dispatched();
+        for t in 1..=400u64 {
+            let now = 3 + t * 60;
+            rt.tick(&obs_of(now, &rows_of(&sessions, &spinning(now))));
+            // 人が「止めない」と答え続ける (印が下りて、はしごが次の巡へ)。
+            let pending: Vec<EventId> = rt
+                .decisions
+                .iter()
+                .filter(|d| d.kind == DecisionKind::StopAgents && d.task_id.is_some())
+                .map(|d| d.id)
+                .collect();
+            for id in pending {
+                rt.apply_action(TeamAction::RejectDecision(id));
+            }
+        }
+        assert!(
+            rt.decisions
+                .iter()
+                .any(|d| d.kind == DecisionKind::AttemptsExhausted),
+            "無限に回収を繰り返すだけで、人へ上げていない"
+        );
+        // 上げたあとは撃たない (促しを延々と送らない)。
+        let now = 3 + 401 * 60;
+        let eff = rt.tick(&obs_of(now, &rows_of(&sessions, &spinning(now))));
+        assert!(
+            nudges_to(&eff).is_empty(),
+            "人へ上げた後も促しを撃ち続けている"
+        );
+    }
+
+    #[test]
+    fn 働いている担当は促さない() {
+        let (mut rt, sessions) = dispatched();
+        for t in 1..=120u64 {
+            let now = 3 + t * 60;
+            // **毎回ちゃんと行が増える**画面。
+            let eff = rt.tick(&obs_of(now, &rows_of(&sessions, &working(t))));
+            assert!(
+                nudges_to(&eff).is_empty(),
+                "進んでいる担当を停滞と呼んではいけない (t={t})"
+            );
+        }
+        assert!(
+            stop_requests(&rt).is_empty(),
+            "進んでいる担当の回収要求が出てはいけない"
+        );
     }
 }
