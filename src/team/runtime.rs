@@ -2265,9 +2265,28 @@ impl TeamRuntime {
 
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
         // は補助情報として持ち越すだけ。
-        let evidence = self.file_evidence(&task);
+        let (evidence, attribution) = self.file_evidence(&task);
+        // **帰属できないことを黙って捨てない。** 却下ではないので
+        // `Rejected` では残さない (正しく働いた担当が却下ログに並ぶのが
+        // 元の不具合)。人が時系列で追えるように、事実として 1 行残す。
+        //
+        // 理由は `file_evidence` が組み立てたものをそのまま出す。**同じ
+        // 事実を 2 か所で言い直さない** — 言い直すと必ず片方がずれる
+        // (実際に、測れた件数を数え直して 0 件と書きかけた)。
+        if !attribution.can_claim() {
+            let why = match &evidence {
+                rp::FileEvidence::Unmeasurable(w) | rp::FileEvidence::Unavailable(w) => w.clone(),
+                e => attribution.why(e.measured_paths().len()).unwrap_or_default(),
+            };
+            self.log(
+                TeamEventKind::AgentProgress,
+                Some(agent.clone()),
+                None,
+                format!("#{task_id} は実測を照合していません: {why}"),
+            );
+        }
         match rp::accept(doc, &task, &evidence) {
-            Ok(acc) => self.apply_accepted(agent, acc),
+            Ok(acc) => self.apply_accepted(agent, acc, attribution),
             Err(e) => {
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
                 self.log(
@@ -2289,7 +2308,12 @@ impl TeamRuntime {
         }
     }
 
-    fn apply_accepted(&mut self, agent: &AgentId, acc: rp::AcceptedResult) {
+    fn apply_accepted(
+        &mut self,
+        agent: &AgentId,
+        acc: rp::AcceptedResult,
+        attribution: changeset::Attribution,
+    ) {
         let now = now_secs();
         let max = self.run.max_attempts;
         let mut escalate: Option<(TaskId, String)> = None;
@@ -2302,7 +2326,17 @@ impl TeamRuntime {
         // **申告と実測の食い違いを黙って捨てない。** 前者は「何を変えたか
         // 把握していない」の印、後者は「やったつもりで何も変わっていない」
         // の印で、どちらも人が読むべき事実。
-        let (unreported, phantom) = acc.report_mismatch();
+        //
+        // **ただし帰属できないなら主張しない。** 担当範囲が宣言されておらず
+        // 隣でも書かれているとき、作業ツリーの差分をこの 1 人の成果と読むと
+        // 「隣の担当が書いたファイル」を食い違いに数える
+        // ([`changeset::Attribution`])。実測できていないのだから、申告との
+        // 差も測れていない。
+        let (unreported, phantom) = if attribution.can_claim() {
+            acc.report_mismatch()
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
@@ -2397,23 +2431,8 @@ impl TeamRuntime {
 
         // **食い違いは事象としても残す。** タスクのコンテキストは次の担当が
         // 読むもので、こちらは人が時系列で追うためのもの。
-        if !unreported.is_empty() || !phantom.is_empty() {
-            let mut why = String::new();
-            if !unreported.is_empty() {
-                why.push_str(&format!("報告に無い変更: {}", unreported.join(", ")));
-            }
-            if !phantom.is_empty() {
-                if !why.is_empty() {
-                    why.push_str(" / ");
-                }
-                why.push_str(&format!("報告だけの変更: {}", phantom.join(", ")));
-            }
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                None,
-                format!("#{} の報告と実測が食い違います ({why})", acc.task_id),
-            );
+        if let Some(line) = mismatch_line(acc.task_id, attribution, &unreported, &phantom) {
+            self.log(TeamEventKind::Rejected, Some(agent.clone()), None, line);
         }
 
         // **ここでは先へ進めない。** 完了報告が意味するのは「実装が終わったと
@@ -3293,15 +3312,36 @@ impl TeamRuntime {
         }
     }
 
+    /// いま**別の担当**が手を入れているタスクの数。
+    ///
+    /// **安全側で数える。** 担当が付いていない進行中タスクも「別の担当」に
+    /// 数える — 数え落とすと、帰属できないのに帰属できると判定して
+    /// また誤った却下が出る。同じエージェントが 2 本持っているときだけ
+    /// 「同じ担当」として除く (その差分はどのみちこの人のもの)。
+    fn other_holders(&self, task: &TeamTask) -> usize {
+        let mine = task.assigned_agent.as_ref();
+        self.tasks
+            .iter()
+            .filter(|t| t.id != task.id && t.state.is_held())
+            .filter(|t| !matches!((mine, t.assigned_agent.as_ref()), (Some(a), Some(b)) if a == b))
+            .count()
+    }
+
     /// 完了報告の時点で、このタスクに帰属する変更を測る。
     ///
     /// **並列作業を切り分ける。** 「作業ツリーと HEAD の差分」をそのまま
     /// 成果にすると、隣のタスクの変更を自分のものとして数える。切り分けは
     /// 既存のファイル所有リースの担当範囲で行う (`changeset::attribute`)。
-    fn file_evidence(&self, task: &TeamTask) -> rp::FileEvidence {
+    ///
+    /// 担当範囲が 1 つも宣言されていないタスクには、その切り分けが当てられ
+    /// ない。同時に働いている担当が他に居るなら**帰属の根拠が無い**ので、
+    /// 測れなかったものとして返す ([`changeset::attribution`])。第 2 の戻り値
+    /// がその判定で、呼ぶ側は「食い違いを主張してよいか」に使う。
+    fn file_evidence(&self, task: &TeamTask) -> (rp::FileEvidence, changeset::Attribution) {
+        let attribution = changeset::attribution(task.files.len(), self.other_holders(task));
         #[cfg(test)]
         if let Some(e) = test_hooks::forced_evidence() {
-            return e;
+            return (e, attribution);
         }
         // **「測る手立てが無い」と「測れるはずが失敗した」を分ける。**
         // Git 管理下でないフォルダは直しようが無いので、そこで止めると
@@ -3315,16 +3355,29 @@ impl TeamRuntime {
             }
         };
         let Some(base) = task.baseline.as_ref() else {
-            return cannot_measure(changeset::MeasureError::NoBaseline(String::new()));
+            return (
+                cannot_measure(changeset::MeasureError::NoBaseline(String::new())),
+                attribution,
+            );
         };
         let measured = match changeset::measure(&self.workspace, base) {
             Ok(v) => v,
-            Err(e) => return cannot_measure(e),
+            Err(e) => return (cannot_measure(e), attribution),
         };
         let paths: Vec<String> = measured.into_iter().map(|c| c.path).collect();
         if task.files.is_empty() {
+            // **帰属できないなら、測れたことにしない。**
+            //
+            // 担当範囲が無いうえに隣でも書かれているとき、作業ツリーの差分を
+            // この 1 人の成果として台帳へ載せると「隣の担当が書いたファイル」
+            // が本人の変更として残り、申告との差が食い違いに化ける
+            // (実機で 6 件の誤った却下)。**通すが、隠さない** —
+            // `Unmeasurable` は完了を止めず、盤面が「実測なし」を出す。
+            if let Some(why) = attribution.why(paths.len()) {
+                return (rp::FileEvidence::Unmeasurable(why), attribution);
+            }
             // **担当範囲が無ければ「範囲外」も無い。** 測った事実だけ残す。
-            return rp::FileEvidence::NoScope { measured: paths };
+            return (rp::FileEvidence::NoScope { measured: paths }, attribution);
         }
         // **他人のものだと言い切れる範囲だけを除く。**
         //
@@ -3351,10 +3404,13 @@ impl TeamRuntime {
             .flat_map(|t| t.files.clone())
             .collect();
         let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);
-        rp::FileEvidence::Measured {
-            mine: mine.into_iter().cloned().collect(),
-            out_of_scope: out_of_scope.into_iter().cloned().collect(),
-        }
+        (
+            rp::FileEvidence::Measured {
+                mine: mine.into_iter().cloned().collect(),
+                out_of_scope: out_of_scope.into_iter().cloned().collect(),
+            },
+            attribution,
+        )
     }
 
     /// タスクの指示文を作る。
@@ -3922,6 +3978,41 @@ fn work_to_session_state(w: AgentWorkState) -> SessionState {
     }
 }
 
+/// 申告と実測の食い違いを 1 行にする。**純関数** — 表で固定できる。
+///
+/// **帰属できないときは何も言わない** (`None`)。実機の Run (6 体が同じ
+/// ワークスペース・計画に `files` が 1 つも無い) では、正しく働いた担当が
+/// この 1 行で却下ログに並んでいた:
+///
+/// ```text
+/// #3 の報告と実測が食い違います (報告に無い変更: index.html, main.js, output/browser_verified.png, plan.md)
+/// ```
+///
+/// 4 つのうち #3 が書いたのはその一部で、残りは隣の担当のもの。担当範囲が
+/// 宣言されていない以上こちらにその区別は付かないので、**食い違いを主張
+/// する根拠が無い**。帰属できるときは今までどおり 1 字も変えずに出す。
+fn mismatch_line(
+    task_id: TaskId,
+    attribution: changeset::Attribution,
+    unreported: &[String],
+    phantom: &[String],
+) -> Option<String> {
+    if !attribution.can_claim() || (unreported.is_empty() && phantom.is_empty()) {
+        return None;
+    }
+    let mut why = String::new();
+    if !unreported.is_empty() {
+        why.push_str(&format!("報告に無い変更: {}", unreported.join(", ")));
+    }
+    if !phantom.is_empty() {
+        if !why.is_empty() {
+            why.push_str(" / ");
+        }
+        why.push_str(&format!("報告だけの変更: {}", phantom.join(", ")));
+    }
+    Some(format!("#{task_id} の報告と実測が食い違います ({why})"))
+}
+
 /// 却下ログで「誰の担当か」を出すための小道具。
 fn task_id_as_agent(t: &TeamTask) -> AgentId {
     t.assigned_agent
@@ -3971,5 +4062,106 @@ pub mod test_hooks {
 
     pub(super) fn forced_evidence() -> Option<FileEvidence> {
         EVIDENCE.with(|c| c.borrow().clone())
+    }
+}
+
+/// **帰属できないときに食い違いを主張しない**ことの番人。
+///
+/// 入力は実機の Run で実際に却下ログへ並んだ文言そのもの。ソースの文字列を
+/// 眺めるのではなく、**その行を作った関数へ同じ材料を入れ直して**確かめる。
+#[cfg(test)]
+mod attribution_guard_tests {
+    use super::*;
+
+    /// 実機 (6 体が同じワークスペース・計画に `files` が 1 つも無い) で
+    /// 正しく働いた担当に対して出てしまった却下ログ。
+    const REAL_MISMATCH_LINES: [&str; 2] = [
+        "#3 の報告と実測が食い違います (報告に無い変更: index.html, main.js, output/browser_verified.png, plan.md)",
+        "#1 の報告と実測が食い違います (報告に無い変更: main.js, plan.md, styles.css)",
+    ];
+
+    /// 却下ログ 1 行から `(タスク ID, 報告に無い変更)` を読み解く。
+    fn parse_mismatch(line: &str) -> (TaskId, Vec<String>) {
+        let id = line
+            .trim_start_matches('#')
+            .split_once(' ')
+            .and_then(|(n, _)| n.parse::<TaskId>().ok())
+            .unwrap_or_else(|| panic!("タスク ID を読めない: {line}"));
+        let files: Vec<String> = line
+            .split_once("報告に無い変更: ")
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(list, _)| list.split(", ").map(|s| s.to_string()).collect())
+            .unwrap_or_else(|| panic!("ファイル一覧を読めない: {line}"));
+        (id, files)
+    }
+
+    #[test]
+    fn 帰属できないなら食い違いを主張しない() {
+        for line in REAL_MISMATCH_LINES {
+            let (id, files) = parse_mismatch(line);
+            assert!(files.len() >= 3, "入力を読み違えている: {files:?}");
+
+            // 実機と同じ形 — 担当範囲は 1 つも宣言されておらず、隣でも
+            // 5 体が同時に書いている。この差分を 1 人へ帰属する根拠は無い。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(0, 5), &files, &[]),
+                None,
+                "帰属できないのに食い違いを主張した: {line}"
+            );
+
+            // **検査は弱めない。** 担当範囲が宣言されていれば、同じ材料から
+            // これまでどおり 1 字も変えずに記録する。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(2, 5), &files, &[]).as_deref(),
+                Some(line),
+                "帰属できるのに検出しなくなった"
+            );
+            // 独りで働いているときも同じ (作業ツリーの差分はこの人のもの)。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(0, 0), &files, &[]).as_deref(),
+                Some(line),
+                "独りで働いているのに検出しなくなった"
+            );
+        }
+    }
+
+    #[test]
+    fn 帰属できないなら申告だけの変更も主張しない() {
+        // 帰属できないときの実測は空になるので、素通しすると**自己申告の
+        // すべて**が「報告だけの変更」に化ける — 却下ログの文面が変わる
+        // だけで、誤検知は 1 件も減らない。
+        let phantom = vec!["main.js".to_string(), "plan.md".to_string()];
+        assert_eq!(
+            mismatch_line(1, changeset::attribution(0, 5), &[], &phantom),
+            None,
+            "実測できていないのに「報告だけの変更」と言った"
+        );
+        // 帰属できるときは今までどおり出す。
+        assert_eq!(
+            mismatch_line(1, changeset::attribution(0, 0), &[], &phantom).as_deref(),
+            Some("#1 の報告と実測が食い違います (報告だけの変更: main.js, plan.md)")
+        );
+        // 両方あるときの並びも変えない。
+        let both = mismatch_line(
+            7,
+            changeset::attribution(1, 0),
+            &["a.rs".to_string()],
+            &["b.rs".to_string()],
+        );
+        assert_eq!(
+            both.as_deref(),
+            Some("#7 の報告と実測が食い違います (報告に無い変更: a.rs / 報告だけの変更: b.rs)")
+        );
+    }
+
+    #[test]
+    fn 食い違いが無ければ何も残さない() {
+        for att in [
+            changeset::attribution(1, 0),
+            changeset::attribution(0, 0),
+            changeset::attribution(0, 3),
+        ] {
+            assert_eq!(mismatch_line(1, att, &[], &[]), None, "{att:?}");
+        }
     }
 }

@@ -303,6 +303,78 @@ pub fn attribute<'a>(
     (ours, out_of_scope)
 }
 
+/// 実測した差分を「**この 1 人の成果**」として扱ってよいか。
+///
+/// [`attribute`] は「担当範囲が宣言されている」ことを前提にした切り分けで、
+/// 範囲が 1 つも無いタスクには当てられない。それでも作業ツリー全体の差分を
+/// そのまま持ち主の成果にすると、**隣の担当が書いたファイルまで「あなたが
+/// 報告し忘れた変更」に数える**。
+///
+/// 実機の Run (6 体が同じワークスペース・計画に `files` が 1 つも無い) で、
+/// 正しく働いた担当への誤った却下が 6 件出た:
+///
+/// ```text
+/// #3 の報告と実測が食い違います (報告に無い変更: index.html, main.js, output/browser_verified.png, plan.md)
+/// #1 の報告と実測が食い違います (報告に無い変更: main.js, plan.md, styles.css)
+/// ```
+///
+/// この module の原則「**測れないときは通さない・保証を偽らない**」を、
+/// 帰属にも当てる — 帰属できないなら食い違いを主張しない。**検査を
+/// 弱めるのではない**: 範囲が宣言されていれば ([`Attribution::ByScope`])、
+/// 同時に何人働いていても今までどおり照合する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attribution {
+    /// 担当範囲が宣言されている。[`attribute`] が切り分ける。
+    ByScope,
+    /// 範囲は無いが、**同時に働いている担当が他に居ない**。
+    /// 作業ツリーの差分はこの 1 人のものだと言い切れる。
+    SoleWorker,
+    /// 帰属の根拠が無い — 範囲が無いうえに、他に `others` 件の作業が
+    /// 同時に進んでいる。
+    Unattributable { others: usize },
+}
+
+impl Attribution {
+    /// 実測を「この担当が変えたもの」として照合・台帳に使ってよいか。
+    pub fn can_claim(self) -> bool {
+        !matches!(self, Attribution::Unattributable { .. })
+    }
+
+    /// 帰属できない理由 (人が読む 1 行)。使えるときは `None`。
+    ///
+    /// **黙って捨てない。** 何件を帰属できなかったのかまで出す
+    /// (`measured` = 実測できた変更の件数)。
+    pub fn why(self, measured: usize) -> Option<String> {
+        match self {
+            Attribution::Unattributable { others } => Some(format!(
+                "担当ファイルが宣言されておらず、他に {others} 件の作業が同時に進んでいるため、実測した {measured} 件の変更をこのタスクへ帰属できません"
+            )),
+            Attribution::ByScope | Attribution::SoleWorker => None,
+        }
+    }
+}
+
+/// 帰属できるかを決める。**I/O を持たない純関数** — 表で固定できる。
+///
+/// * `scope_len` — このタスクに宣言された担当範囲の数 (`TeamTask::files`)
+/// * `other_holders` — いま**別の担当**が手を入れているタスクの数
+///
+/// 呼ぶ側は `other_holders` を安全側で数えること (担当が分からない
+/// 進行中タスクは「別の担当」に数える) — 見落とすと、また誤った却下が出る。
+pub fn attribution(scope_len: usize, other_holders: usize) -> Attribution {
+    if scope_len > 0 {
+        // 範囲があるなら `attribute` が切り分ける。何人居ても関係ない。
+        Attribution::ByScope
+    } else if other_holders == 0 {
+        // 誰も同時に書いていない = 作業ツリーの差分はこの 1 人のもの。
+        Attribution::SoleWorker
+    } else {
+        Attribution::Unattributable {
+            others: other_holders,
+        }
+    }
+}
+
 /// パスがワークスペースの内側に**実際に**収まっているか。
 ///
 /// 形だけの検査 (`..` を数える) では足りない。ワークスペースの中に
@@ -585,3 +657,49 @@ fn hash_stream(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, Meas
     }))
 }
 
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    /// **表で固定する。** 判定はこの 3 つしかない — 分岐を増やすと
+    /// 「どういうときに食い違いを主張しているのか」が読めなくなる。
+    #[test]
+    fn 帰属できるかは担当範囲と同時に働く人数だけで決まる() {
+        // (担当範囲の数, 他に働いている担当の数, 期待, 照合してよいか)
+        let table: &[(usize, usize, Attribution, bool)] = &[
+            // 範囲があるなら `attribute` が切り分ける。**検査は弱めない** —
+            // 何人が同時に働いていても今までどおり照合する。
+            (1, 0, Attribution::ByScope, true),
+            (1, 5, Attribution::ByScope, true),
+            (3, 63, Attribution::ByScope, true),
+            // 範囲は無いが独りで働いている = 作業ツリーの差分はこの人のもの。
+            (0, 0, Attribution::SoleWorker, true),
+            // 範囲が無く、隣でも書かれている = 帰属の根拠が無い。
+            (0, 1, Attribution::Unattributable { others: 1 }, false),
+            (0, 5, Attribution::Unattributable { others: 5 }, false),
+        ];
+        for (scope, others, want, claim) in table {
+            let got = attribution(*scope, *others);
+            assert_eq!(got, *want, "scope={scope} others={others}");
+            assert_eq!(
+                got.can_claim(),
+                *claim,
+                "scope={scope} others={others} → {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 帰属できないときは理由が残る() {
+        // **黙って捨てない。** 何人が同時に働いていて、何件を帰属
+        // できなかったのかまで人へ出す。
+        let why = attribution(0, 5).why(4).expect("理由が空のまま捨てた");
+        assert!(why.contains('5'), "同時に働いている人数が出ていない: {why}");
+        assert!(why.contains('4'), "測れた件数が出ていない: {why}");
+        assert!(why.contains("帰属"), "何が起きたのか伝わらない: {why}");
+        // 帰属できるときは理由を出さない (出すと盤面が濁る)。
+        assert_eq!(attribution(2, 5).why(4), None, "範囲があるのに濁らせた");
+        assert_eq!(attribution(0, 0).why(4), None, "独りなのに濁らせた");
+    }
+}

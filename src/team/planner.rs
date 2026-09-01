@@ -282,6 +282,105 @@ fn split_files(title: &str) -> (String, Vec<String>) {
     }
 }
 
+/// 1 つの節から拾う担当ファイルの上限。
+///
+/// 節がファイル一覧を丸ごと列挙していると、そのタスクがリポジトリの
+/// ほとんどを抱え込む。担当が重なると [`super::scheduler`] は
+/// **重なった相手を同時に走らせない**ので、拾いすぎは並列そのものを殺す。
+const MAX_FILES_FROM_TEXT: usize = 8;
+
+/// 文面に**実際に現れた**ファイルらしいトークンを拾う (純関数)。
+///
+/// **でっち上げない。** 返すのは入力に出てくる部分文字列だけで、
+/// 「この節ならこのファイルだろう」という推測はしない。
+///
+/// 日本語は分かち書きしないので、空白では割れない (`index.htmlを書く`)。
+/// ASCII の英数字と `. / \ _ - *` だけを 1 つの塊として拾い、
+/// **非 ASCII (かな・漢字) が区切りになる**ようにしてある。
+///
+/// 採否は [`crate::kanban::looks_like_path`] (リポジトリで 1 本だけの
+/// 「パスらしさ」の規則) を土台に、散文向けの条件を 1 つ足す —
+/// **拡張子を持つこと**。報告行と違って散文には版番号や語がそのまま
+/// 混ざるので、`src/auth` のような拡張子なしまで採ると推測になる。
+fn files_in_text(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !is_token_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_token_char(chars[i]) {
+            i += 1;
+        }
+        let lead = start.checked_sub(1).map(|p| chars[p]);
+        let run: String = chars[start..i].iter().collect();
+        if let Some(p) = file_token(&run, lead) {
+            if !out.contains(&p) {
+                out.push(p);
+                if out.len() >= MAX_FILES_FROM_TEXT {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// パスを構成しうる文字か (ASCII のみ。かな・漢字は区切りになる)。
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '\\' | '_' | '-' | '*')
+}
+
+/// 1 つの塊を担当ファイルとして採るか。`lead` は塊の直前の文字。
+fn file_token(run: &str, lead: Option<char>) -> Option<String> {
+    // **URL とパッケージ指定の途中を拾わない。**
+    // `https://example.com/a.js` は `https` と `//example.com/a.js` に割れ、
+    // 後半の直前が `:` になる。`three@0.159.0/build/three.module.js` なら `@`。
+    if matches!(lead, Some(':') | Some('@')) {
+        return None;
+    }
+    // 強調の `*` と、英文の文末ピリオドは飾りなので落とす。
+    let tok = run.trim_matches('*').trim_end_matches('.');
+    if !crate::kanban::looks_like_path(tok) {
+        return None;
+    }
+    // **拡張子を持つものだけ。** 末尾の区間が `名前.拡張子` の形であること。
+    let last = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    let (stem, ext) = last.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 8 {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // 版番号 (`1.2.3` / `0.159.0`) を弾く。拡張子には必ず英字がある。
+    if !ext.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    // **正規化は台帳と同じ 1 本を通す** (`src\a.rs` と `./src/a.rs` を
+    // 別物のまま持つと、重なり判定を素通りする)。
+    let norm = crate::lease::normalize_path(tok);
+    (!norm.is_empty()).then_some(norm)
+}
+
+/// 実装タスク 1 件ぶんの素。**見出しと、その節の本文**。
+///
+/// 本文まで持ち回るのは、**担当ファイルが本文にしか書かれない SPEC が
+/// 実在するから**。実機の Run では 7 タスク全部が `files: (未申告)` になり、
+/// (1) ファイル所有リースが 1 本も張れず 6 体が同じファイルを触りうる
+/// (2) 変更の帰属ができず「報告と実測が食い違います」の誤った却下が 6 件
+/// 記録された。見出しだけを持ち回っていると、本文は二度と読めない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSeed {
+    /// 見出し (または箇条書き) の原文。ファイル指定の括弧も付いたまま。
+    pub title: String,
+    /// 見出しに続く地の文と箇条書き。箇条書きから起こした素では空。
+    pub body: String,
+}
+
 /// SPEC を読んで計画を組む決定的 Planner。
 ///
 /// **同じ SPEC なら必ず同じ計画**になる (時刻以外)。E2E とテストはこれを使う。
@@ -419,8 +518,8 @@ impl StaticPlanner {
             }
         }
 
-        // タスクの見出し (選び方は `implementation_titles` に 1 本だけ置く)。
-        let mut raw_tasks = implementation_titles(&sections, &title);
+        // タスクの見出しと本文 (選び方は `implementation_seeds` に 1 本だけ置く)。
+        let mut raw_tasks = implementation_seeds(&sections, &title);
         // **SPEC が既に分割されているか。** 分割済みなら実装を待たせない
         // (待たせると、8 件並べる計画でも最初の 2 段は 1 体しか動かない)。
         let broken_down = raw_tasks.len() >= MIN_PARALLEL_TASKS;
@@ -453,7 +552,7 @@ impl StaticPlanner {
         // 段取りが仕事より高くつくなら、そのチームは 1 体より遅い。
         let covered: std::collections::BTreeSet<R> = raw_tasks
             .iter()
-            .map(|t| super::plan_schema::role_of("", t))
+            .map(|t| super::plan_schema::role_of("", &t.title))
             .collect();
         let want = |r: R| roles.contains(&r) && !covered.contains(&r);
         let mut teams = vec![TeamDoc {
@@ -561,8 +660,48 @@ impl StaticPlanner {
             });
             key
         });
+        // **2 つ以上の節に出てくるファイルは、誰の持ち物でもない。**
+        //
+        // 散文から拾うと、書く側だけでなく**読む側の節にも同じ名前が出る**
+        // (`index.html` は markup が書き、style が合わせ、tester が開く)。
+        // ライブラリ名も同じで、`Three.js` は architect / markup / 3d の
+        // 3 節に現れる。これを全部「担当ファイル」にすると、重なり判定が
+        // 働いて**3 タスクが直列化する** — 実測で 5 本中 3 本が止まった。
+        // 「待っている役割が多すぎる」の再発そのものなので、**節をまたぐ
+        // 名前は落とす**。残るのは「その節にしか出てこない = 明らかに
+        // そこが書くもの」だけ。
+        let shared: std::collections::BTreeSet<String> = {
+            let mut seen: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for t in raw_tasks.iter() {
+                let (_, declared) = split_files(&t.title);
+                let found = if declared.is_empty() {
+                    files_in_text(&format!("{}\n{}", t.title, t.body))
+                } else {
+                    declared
+                };
+                for f in found.into_iter().collect::<std::collections::BTreeSet<_>>() {
+                    *seen.entry(f).or_insert(0) += 1;
+                }
+            }
+            seen.into_iter()
+                .filter(|(_, n)| *n >= 2)
+                .map(|(f, _)| f)
+                .collect()
+        };
         for (i, t) in raw_tasks.iter().enumerate() {
-            let (label, files) = split_files(t);
+            let (label, mut files) = split_files(&t.title);
+            // **見出しで見つからなければ、その節の文面から拾う。**
+            //
+            // 実機の SPEC は担当ファイルを括弧ではなく**説明の側**に書いて
+            // いた (`… index.html を書く。`)。見出しだけを見ていたので
+            // 7 タスク全部が `files: (未申告)` になり、リースが張れず、
+            // 変更の帰属もできなかった。**拾えなければ空のまま**にする —
+            // 埋めてよいのは文面に現れた文字列だけで、推測はしない。
+            if files.is_empty() {
+                files = files_in_text(&format!("{}\n{}", t.title, t.body));
+                files.retain(|f| !shared.contains(f));
+            }
             let key = format!("impl-{:02}", i + 1);
             impl_keys.push(key.clone());
             tasks.push(TaskDoc {
@@ -585,7 +724,23 @@ impl StaticPlanner {
                 //
                 // 分割されていない SPEC (実装 1 件) のときだけ、従来どおり
                 // 計画 → 設計 → 実装 と繋ぐ — そこでは分割そのものが仕事になる。
-                depends_on: if broken_down {
+                // **整合担当だけは他を待つ。** 実測で、依存を持たない
+                // `integrator:` の節が即座に配られ、「#1/#2/#4/#5/#6 が
+                // 未完了」という当然の理由で `blocked` → 人の判断待ちに
+                // なった (骨組みの重複を消したときに、依存を落としすぎた)。
+                // 待たせれば担当の席が空くので、そのぶんレビューへ回せる。
+                depends_on: if super::plan_schema::role_of("", &label)
+                    == super::model::TeamRole::Integrator
+                {
+                    (0..raw_tasks.len())
+                        .filter(|j| *j != i)
+                        .map(|j| format!("impl-{:02}", j + 1))
+                        // 骨組みの書き物も待つ (**まだ書かれていない設計を
+                        // 前提に締めない**)。既存の統合タスクと同じ考え方。
+                        .chain(plan_key.iter().cloned())
+                        .chain(design_key.iter().cloned())
+                        .collect()
+                } else if broken_down {
                     Vec::new()
                 } else {
                     design_key
@@ -692,29 +847,57 @@ pub const MIN_PARALLEL_TASKS: usize = 2;
 /// 計画を作らずに知りたい側が居るから** ([`needs_spec_rewrite`])。
 /// 物差しを 2 つ持つと、「短いと言われたのに計画は分かれた」/ その逆が起きる。
 pub fn implementation_titles(sections: &[SpecSection], title: &str) -> Vec<String> {
-    let mut raw: Vec<String> = sections
+    implementation_seeds(sections, title)
+        .into_iter()
+        .map(|s| s.title)
+        .collect()
+}
+
+/// [`implementation_titles`] と**同じ選び方**で、本文も一緒に返す。
+///
+/// 選び方を 2 か所に持つと「数えたときと違う分かれ方をする」ので、
+/// 数える側 ([`implementation_titles`]) はここを呼ぶだけにしてある。
+pub fn implementation_seeds(sections: &[SpecSection], title: &str) -> Vec<TaskSeed> {
+    /// 箇条書きから起こした素 (本文は持たない — 行そのものが全部)。
+    fn from_bullet(b: &str) -> TaskSeed {
+        TaskSeed {
+            title: b.to_string(),
+            body: String::new(),
+        }
+    }
+    let mut raw: Vec<TaskSeed> = sections
         .iter()
         .filter(|s| is_task_heading(&s.title))
-        .flat_map(|s| s.bullets.clone())
+        .flat_map(|s| s.bullets.iter().map(|b| from_bullet(b)))
         .collect();
     if raw.is_empty() {
         raw = sections
             .iter()
             .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
-            .flat_map(|s| s.bullets.clone())
+            .flat_map(|s| s.bullets.iter().map(|b| from_bullet(b)))
             .collect();
     }
     if raw.is_empty() {
         // 箇条書きが 1 つも無い SPEC でも、見出しをタスクにして進める。
+        // **このときだけ本文がある** — 見出しの下の地の文がその節の中身。
         raw = sections
             .iter()
             .filter(|s| s.level >= 2 && !s.title.is_empty())
             .filter(|s| !is_dod_heading(&s.title) && !is_validation_heading(&s.title))
-            .map(|s| s.title.clone())
+            .map(|s| TaskSeed {
+                title: s.title.clone(),
+                body: s
+                    .prose
+                    .iter()
+                    .chain(s.bullets.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            })
             .collect();
     }
     if raw.is_empty() {
-        raw = vec![title.to_string()];
+        raw = vec![from_bullet(title)];
     }
     raw
 }
@@ -1552,12 +1735,23 @@ Zaivern が何なのかを決め、ページの構成を決める。
                 p.tasks.iter().map(|t| t.role).collect::<Vec<_>>()
             );
         }
-        // **待ちが減っている。** 全部に依存する締めのタスクが無い。
-        let n = p.tasks.len();
-        assert!(
-            !p.tasks.iter().any(|t| t.dependencies.len() >= n - 1),
-            "全部を待つタスクが残っている"
-        );
+        // **待ちが減っている。** ただし「待ちゼロ」ではない。
+        //
+        // 最初に書いたこの番人は「全部を待つタスクが 1 つも無いこと」を
+        // 求めていた。**それは誤りだった** — 実機で、依存を持たない
+        // `integrator:` の節が即座に配られ、「他が未完了」という当然の
+        // 理由で `blocked` → 人の判断待ちになった。締めは待ってよい。
+        //
+        // 守るべきは「**実装が待たされないこと**」で、締めが待つことでは
+        // ない (`scope_and_order_tests::整合担当は他を待つ` が対の番人)。
+        for t in p.tasks.iter().filter(|t| t.role != R::Integrator) {
+            assert!(
+                t.dependencies.is_empty(),
+                "#{} ({:?}) が待たされている — 並列が死ぬ",
+                t.id,
+                t.role
+            );
+        }
     }
 
     /// **役割を名乗らない SPEC では、これまでどおり骨組みを置く。**
@@ -1572,6 +1766,254 @@ Zaivern が何なのかを決め、ページの構成を決める。
                 p.tasks.iter().any(|t| t.role == want),
                 "{want:?} の骨組みが消えた"
             );
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  担当ファイルは本文にも書かれる
+//
+//  実機の Run では 7 タスク全部が `files: (未申告)` だった。SPEC は
+//  担当ファイルを**見出しの括弧ではなく説明の側**に書いていたのに、
+//  読み取りが見出ししか見ていなかった。害は 2 つ — リースが 1 本も
+//  張れないので 6 体が同じファイルを同時に触りうること、変更の帰属が
+//  できず「報告と実測が食い違います」の誤った却下が 6 件出たこと。
+// ══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod files_from_prose_tests {
+    use super::tests::input;
+    use super::*;
+
+    /// 実機の SPEC。**見出しが役割の分担で、担当ファイルは本文の側**にある。
+    ///
+    /// `implementer(markup)` と `implementer(style)` の 2 節は実機の写し。
+    /// 残りは同じ Run の見出しに、拾ってはいけないもの (CDN の URL・
+    /// 版番号 `r159`・`3D` という語) を実機どおりの書き方で足してある。
+    const SPEC: &str = "\
+# かっこいい 3D の Zaivern ホームページ
+
+## planner: 依頼の中身を実装前に文章で固める
+Zaivern が何なのかを決め、ページの構成を docs/brief.md にまとめる。
+
+## architect: ファイル構成と 3D の実現方式を確定する
+3D ライブラリは CDN (https://unpkg.com/three@0.159.0/build/three.module.js) の r159 を読み込む。
+
+## implementer(markup): ページの HTML を書く
+3D キャンバスの置き場所とセクション構成を決めて index.html を書く。
+
+## implementer(style): スタイルを書く
+配色・タイポグラフィ・余白を css/style.css に書く。
+
+## implementer(script): 3D シーンを書く
+js/scene.js にシーン・カメラ・ライトを組む。
+
+## tester: 実際にブラウザで開いて確認する
+デスクトップ幅とモバイル幅の表示を見る。
+";
+
+    /// 見出しに `needle` を含むタスクの担当ファイル。
+    fn files_of(spec: &str, needle: &str) -> Vec<String> {
+        let plan = StaticPlanner.compose(&input(spec)).expect("計画できるべき");
+        let titles: Vec<&str> = plan.tasks.iter().map(|t| t.title.as_str()).collect();
+        plan.tasks
+            .iter()
+            .find(|t| t.title.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} のタスクが無い: {titles:?}"))
+            .files
+            .clone()
+    }
+
+    /// **本文にしか書かれていない担当ファイルを拾う。**
+    ///
+    /// これが空に戻ると、実機で起きた「7 タスク全部が未申告」に戻る。
+    #[test]
+    fn 本文に書かれた担当ファイルを拾う() {
+        assert_eq!(files_of(SPEC, "HTML を書く"), vec!["index.html".to_string()]);
+        assert_eq!(
+            files_of(SPEC, "スタイルを書く"),
+            vec!["css/style.css".to_string()]
+        );
+        assert_eq!(
+            files_of(SPEC, "シーンを書く"),
+            vec!["js/scene.js".to_string()]
+        );
+        assert_eq!(
+            files_of(SPEC, "文章で固める"),
+            vec!["docs/brief.md".to_string()]
+        );
+    }
+
+    /// **URL・版番号・ただの語は担当ファイルではない。**
+    #[test]
+    fn urlと版番号と語は拾わない() {
+        assert!(
+            files_of(SPEC, "実現方式").is_empty(),
+            "URL か版番号を担当ファイルにした: {:?}",
+            files_of(SPEC, "実現方式")
+        );
+    }
+
+    /// **拾えなかった節は空のまま。** 推測で埋めない。
+    #[test]
+    fn 拾えなかった節は空のまま() {
+        assert!(files_of(SPEC, "ブラウザで開いて").is_empty());
+    }
+
+    /// **でっち上げない。** 申告したファイルは必ず SPEC の文面に現れる。
+    #[test]
+    fn 文面に無いファイルを作らない() {
+        let plan = StaticPlanner.compose(&input(SPEC)).expect("計画できるべき");
+        for t in &plan.tasks {
+            for f in &t.files {
+                assert!(
+                    SPEC.contains(f.as_str()),
+                    "SPEC に無いファイルを申告した: {f} ({})",
+                    t.title
+                );
+            }
+        }
+    }
+
+    /// **見出しに指定があるときは、これまでどおりそちらを使う。**
+    /// 本文からの拾い上げは*見つからなかったときだけ*の後詰めである。
+    #[test]
+    fn 見出しの指定はこれまでどおり優先する() {
+        let spec = "\
+# 認証機能
+
+## 要件
+- ログイン API を実装する (src/auth/login.rs)
+- トークン更新 API を実装する (src/auth/refresh.rs)
+
+## 検証
+- cargo test auth
+";
+        assert_eq!(
+            files_of(spec, "ログイン API"),
+            vec!["src/auth/login.rs".to_string()]
+        );
+    }
+
+    /// 拾う / 拾わないを表で固定する (純関数なので入力を直に置ける)。
+    ///
+    /// **日本語は分かち書きしない。** 助詞が直に付いた `index.htmlを書く` を
+    /// 落とすと、実機の SPEC の半分が未申告のまま残る。
+    #[test]
+    fn 拾うものと拾わないものを表で固定する() {
+        let table: &[(&str, &[&str])] = &[
+            ("3D キャンバスの置き場所とセクション構成を決めて index.html を書く。", &["index.html"]),
+            ("配色・タイポグラフィ・余白を css/style.css に書く。", &["css/style.css"]),
+            ("js/scene.js にシーン・カメラ・ライトを組む。", &["js/scene.js"]),
+            ("ページの構成を docs/brief.md にまとめる。", &["docs/brief.md"]),
+            // 助詞が直に付く / 括弧や強調に包まれる
+            ("index.htmlを書く", &["index.html"]),
+            ("**index.html** を書く", &["index.html"]),
+            ("`docs/brief.md`にまとめる", &["docs/brief.md"]),
+            // 拾ってはいけないもの
+            ("https://unpkg.com/three@0.159.0/build/three.module.js から読み込む", &[]),
+            ("https://example.com/assets/app.js を参照", &[]),
+            ("three の r159 を使う", &[]),
+            ("3D キャンバスを置く", &[]),
+            ("バージョンは 1.2.3 に上げる", &[]),
+            // 拡張子が無いものは推測になるので採らない
+            ("src/auth のあたりを直す", &[]),
+            ("特にファイルの指定は無い", &[]),
+        ];
+        for (text, want) in table {
+            let got = files_in_text(text);
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_and_order_tests {
+    use super::tests::input;
+    use super::*;
+    use crate::features::team::imp::model::TeamRole as R;
+
+    /// 実機の形。ライブラリ名と、書く側・読む側の両方に出るファイル名を含む。
+    const SPEC: &str = "\
+# かっこいい 3D の Zaivern ホームページ
+
+## architect: ファイル構成と 3D の実現方式を確定する
+Three.js r159 をローカル同梱し、vendor/three.module.js から読み込む。docs/architecture.md に書く。
+
+## implementer(markup): ページの HTML を書く
+index.html を書く。Three.js は main.js から使う。
+
+## implementer(style): スタイルを書く
+css/style.css に書く。index.html のクラス名に合わせる。
+
+## implementer(3d): 3D シーンを実装する
+Three.js でシーンを組み、js/scene.js に書く。
+
+## tester: 実際にブラウザで開いて確認する
+index.html を開いて確認し、結果を docs/test.md に書く。
+
+## integrator: 成果物を 1 つのサイトとして繋ぐ
+README.md にまとめる。
+";
+
+    fn plan_of(spec: &str) -> Vec<crate::features::team::imp::model::TeamTask> {
+        let mut inp = input(spec);
+        inp.roles = vec![R::Planner, R::Architect, R::Implementer, R::Tester, R::Reviewer, R::Integrator];
+        StaticPlanner.plan(inp).expect("計画できるべき").tasks
+    }
+
+    /// **2 つ以上の節に出てくる名前を担当ファイルにしない。**
+    ///
+    /// 散文から拾うと、書く側だけでなく**読む側の節にも同じ名前が出る**。
+    /// 全部を担当にすると重なり判定が働き、実測で 5 本中 3 本が直列化した
+    /// (`three.js` が 3 節、`index.html` が 3 節)。
+    /// 「待っている役割が多すぎる」の再発そのもの。
+    #[test]
+    fn 節をまたぐ名前は誰の担当にもしない() {
+        let tasks = plan_of(SPEC);
+        let mut owner: std::collections::BTreeMap<&str, Vec<u64>> = Default::default();
+        for t in &tasks {
+            for f in &t.files {
+                owner.entry(f.as_str()).or_default().push(t.id);
+            }
+        }
+        for (f, ids) in &owner {
+            assert_eq!(ids.len(), 1, "{f} を {ids:?} が同時に持っている (直列化する)");
+        }
+        // **その節にしか出てこないものは、ちゃんと担当になる。**
+        let own: Vec<&str> = owner.keys().copied().collect();
+        for want in ["css/style.css", "js/scene.js", "docs/test.md"] {
+            assert!(own.contains(&want), "{want} が誰の担当にもなっていない: {own:?}");
+        }
+        // ライブラリ名は落ちる (3 節に出るので)。
+        assert!(!own.contains(&"three.js"), "ライブラリ名を担当にした: {own:?}");
+    }
+
+    /// **整合担当は他の全部を待つ。**
+    ///
+    /// 実測で、依存を持たない `integrator:` の節が即座に配られ、
+    /// 「他が未完了」という当然の理由で `blocked` → 人の判断待ちになった。
+    /// 待たせれば担当の席が空くので、そのぶん他へ回せる。
+    #[test]
+    fn 整合担当は他を待つ() {
+        let tasks = plan_of(SPEC);
+        let integ = tasks
+            .iter()
+            .find(|t| t.role == R::Integrator)
+            .expect("整合担当が居る");
+        for t in &tasks {
+            if t.id == integ.id || t.role == R::Integrator {
+                continue;
+            }
+            assert!(
+                integ.dependencies.contains(&t.id),
+                "整合担当が #{} を待っていない",
+                t.id
+            );
+        }
+        // **他は待たない** (実装は並列のまま)。
+        for t in tasks.iter().filter(|t| t.role != R::Integrator) {
+            assert!(t.dependencies.is_empty(), "#{} が待たされている", t.id);
         }
     }
 }

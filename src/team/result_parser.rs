@@ -740,6 +740,18 @@ pub enum MessageReject {
     NoTarget,
     /// 宛先が居ない。**捏造を通さない** (居ない相手に送ったことにしない)。
     UnknownTarget(String),
+    /// 宛先が**送り主自身**を指している (自分の ID か、自分の役割)。
+    ///
+    /// **`UnknownTarget` と混ぜてはいけない。** 相手は居るのだから
+    /// 「居ません」は嘘で、そう言われたエージェントは綴りを疑って
+    /// 同じ宛先を書き直す (実機で 2 回繰り返した: 役割 `tester` の担当が
+    /// `"to": "tester"` と書き、`伝言の宛先 tester は居ません` と返っていた)。
+    SelfTarget(String),
+    /// 宛先は `all` だが、**自分以外の担当が 1 人も居ない**。
+    ///
+    /// 居ないのは相手ではなく「あなた以外の担当」なので、
+    /// `UnknownTarget("all")` と言うと `all` の綴りを疑わせてしまう。
+    NoOtherAgents,
     /// 本文が空。
     Empty,
 }
@@ -752,6 +764,13 @@ impl MessageReject {
             MessageReject::UnknownTarget(t) => {
                 format!("伝言の宛先 `{t}` は居ません")
             }
+            MessageReject::SelfTarget(t) => format!(
+                "伝言の宛先 `{t}` はあなた自身です。自分宛ての伝言は誰にも届きません — \
+                 宛先には**相手**の ID か役割を書いてください (全員なら all)"
+            ),
+            MessageReject::NoOtherAgents => "宛先 `all` は「あなた以外の全員」です。\
+                 いまチームで動いているのはあなただけなので、受け取る担当が 1 人も居ません"
+                .to_string(),
             MessageReject::Empty => "伝言の本文が空です".to_string(),
         }
     }
@@ -939,6 +958,7 @@ pub fn message_howto(target_hint: &str) -> String {
          * 伝えるのは**相手の仕事が変わるとき**だけ。実況中継はしない\n\
          * 本文は {MSG_MAX_CHARS} 文字まで。長い成果物はファイルに書いて、場所だけ伝える\n\
          * 相手が居ない宛先を書かない (届かず、こちらに断りが記録されます)\n\
+         * 宛先は**相手**を書く。自分の ID や自分の役割を書いても誰にも届かない\n\
          * 本文の `\"` は `\\\"`、`\\` は `\\\\` と書く \
          (Windows のパスは区切りを 2 つ重ねる)。書けていなくても読み取りますが、\
          `\\t` などは制御文字として読まれます\n"
@@ -968,15 +988,31 @@ pub fn check_message(
         return Err(MessageReject::Empty);
     }
     let others = || known.iter().filter(|(id, _)| id != from);
-    let targets: Vec<AgentId> = if to.eq_ignore_ascii_case("all") {
+    let all = to.eq_ignore_ascii_case("all");
+    let hits = |id: &AgentId, role: &str| id.0 == to || role == to;
+    let targets: Vec<AgentId> = if all {
         others().map(|(id, _)| id.clone()).collect()
     } else {
         others()
-            .filter(|(id, role)| id.0 == to || role == to)
+            .filter(|(id, role)| hits(id, role))
             .map(|(id, _)| id.clone())
             .collect()
     };
     if targets.is_empty() {
+        // **「居ません」は最後の枝。** 宛先が自分自身のときにそう言うと、
+        // 相手は居るのに居ないと言われたことになり、綴りを疑って同じ
+        // 間違いを繰り返す (実機で 2 回起きた)。何が起きたかを言う。
+        if all {
+            return Err(MessageReject::NoOtherAgents);
+        }
+        let is_self = from.0 == to
+            || known
+                .iter()
+                .any(|(id, role)| id == from && hits(id, role.as_str()));
+        if is_self {
+            return Err(MessageReject::SelfTarget(to.to_string()));
+        }
+        // 表に無い宛先は今までどおり断る (捏造を通さない)。
         return Err(MessageReject::UnknownTarget(to.to_string()));
     }
     Ok((targets, text))
@@ -1935,6 +1971,90 @@ mod lenient_message_tests {
             read(r#"{"to": "居ない人", "text": "やあ "君" "}"#),
             Err(MessageReject::UnknownTarget(_))
         ));
+    }
+
+    /// **実機で 2 回記録された却下そのもの。**
+    ///
+    /// `actor=agent-4 : 伝言の宛先 \`tester\` は居ません` — ところが
+    /// agent-4 の役割がまさに `tester` だった。相手は居るのに「居ません」と
+    /// 言われたので、綴りを疑って同じ宛先を書き直し、また断られた。
+    ///
+    /// 断る判断は変えない (自分宛ての伝言は誰にも届かない) が、
+    /// **理由は実態に合わせる**。
+    #[test]
+    fn 自分の役割を宛先に書いたら居ないとは言わない() {
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let me = AgentId("agent-4".into());
+        let body = r#"{"to": "tester", "text": "テストを流します"}"#;
+        let err = check_message(body, &team, &me).expect_err("自分宛ては届かない");
+        assert_eq!(
+            err,
+            MessageReject::SelfTarget("tester".into()),
+            "自分自身なのに UnknownTarget と言っている"
+        );
+        let d = err.detail();
+        assert!(
+            !d.contains("居ません"),
+            "相手は居るのに「居ません」と言った: {d}"
+        );
+        assert!(d.contains("あなた自身"), "何が起きたか言えていない: {d}");
+        assert!(d.contains("相手"), "どうすればよいか言えていない: {d}");
+
+        // ID を書いた場合も同じ (綴り間違いではない、と伝わること)。
+        let err = check_message(r#"{"to": "agent-4", "text": "自分へ"}"#, &team, &me)
+            .expect_err("自分宛ては届かない");
+        assert_eq!(err, MessageReject::SelfTarget("agent-4".into()));
+
+        // **本物の宛先はこれまでどおり届く。**
+        let (targets, _) =
+            check_message(r#"{"to": "implementer", "text": "見て"}"#, &team, &me).unwrap();
+        assert_eq!(targets, vec![AgentId("agent-3".into())]);
+    }
+
+    /// **`all` で誰も居ないのは、宛先の綴りの問題ではない。**
+    ///
+    /// 居ないのは相手ではなく「あなた以外の担当」なので、
+    /// `all は居ません` と言うと `all` を疑わせてしまう。
+    #[test]
+    fn 自分しか居ないときのallは宛先のせいにしない() {
+        let alone = vec![(AgentId("agent-4".into()), "tester".to_string())];
+        let me = AgentId("agent-4".into());
+        let err = check_message(r#"{"to": "all", "text": "みんなへ"}"#, &alone, &me)
+            .expect_err("自分しか居ないので届かない");
+        assert_eq!(err, MessageReject::NoOtherAgents);
+        let d = err.detail();
+        assert!(d.contains("あなただけ"), "実態を言えていない: {d}");
+
+        // 相手が 1 人でも居れば、all はこれまでどおり届く。
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let (targets, _) =
+            check_message(r#"{"to": "all", "text": "みんなへ"}"#, &team, &me).unwrap();
+        assert_eq!(targets, vec![AgentId("agent-3".into())]);
+    }
+
+    /// **捏造した宛先は今までどおり断る。**
+    /// 自分自身の枝を足したせいで、表に無い宛先まで通ってはいけない。
+    #[test]
+    fn 表に無い宛先はこれまでどおり断る() {
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let me = AgentId("agent-4".into());
+        for to in ["designer", "agent-9", "tester-2", "TESTER"] {
+            let body = format!(r#"{{"to": "{to}", "text": "やあ"}}"#);
+            assert_eq!(
+                check_message(&body, &team, &me).expect_err("居ない相手へ届けた"),
+                MessageReject::UnknownTarget(to.to_string()),
+                "宛先 {to}"
+            );
+        }
     }
 
     /// **鍵の順番が逆でも読める。** `text` を「最後の引用符まで」と読むので、
