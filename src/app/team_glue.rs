@@ -283,14 +283,19 @@ impl ZaivernApp {
                 // Run を添えないと、Run を作り直したあとに前の Run の配達が
                 // 終わったとき、**同じ番号の別のタスク**の指示を完了に
                 // してしまう (積んだ仕事は Run の切り替えでは消えない)。
-                // **一括送信と同じ形で送る** (`Job::user` = Idle を待たない)。
+                // **相手が手を止めるのを待ってから書く** (`Job::deferred`)。
                 //
-                // `deferred` は「相手が Idle になるまで待つ」ので、静かに
-                // ならない CLI では**本文を書く前に待ち続ける**。実機では
-                // 指示が何分経っても届かなかった。一斉送信 (Cockpit /
-                // スマホの一括送信) は前から `user` で送っていて確実に届く
-                // ので、同じ経路へ揃える。
-                let mut job = crate::submit::Job::user(session, text);
+                // 一度 `Job::user` (待たない) へ変えたが、それは間違いだった。
+                // 待たずに書くと**忙しい CLI の最中に本文と Enter が入る**ので、
+                // Codex は Enter を飲み込み、指示が入力欄に残ったまま止まった
+                // (実機で 2 通目以降が毎回そうなった)。1 通目が届いていたのは、
+                // 起動直後で相手が待機していたから — **同じ条件を毎回作る**のが
+                // 正しい。
+                //
+                // 待ちっぱなしにはならない: `Stage::Ready` は `READY_WAIT` を
+                // 超えたら書き、`Commit` / `Verify` は `GIVE_UP` を超えたら
+                // 人へ返す (`Act::GaveUp`)。
+                let mut job = crate::submit::Job::deferred(session, text, true);
                 job.tag = panel::with_panel(|p| p.delivery_tag(&key));
                 self.queue_submit(job)
             };
@@ -325,8 +330,8 @@ impl ZaivernApp {
                 self.toast(why, false);
                 continue;
             }
-            // 人が出した指示も一括送信と同じ形で (待たせない)。
-            let mut job = crate::submit::Job::user(session, text);
+            // 人が出した指示も同じ形で (相手が手を止めるのを待ってから書く)。
+            let mut job = crate::submit::Job::deferred(session, text, true);
             job.tag = panel::with_panel(|p| p.delivery_tag(&key));
             if !self.queue_submit(job) {
                 panel::with_panel(|p| p.note_manual_failed(&key, "送信キューへ積めませんでした"));

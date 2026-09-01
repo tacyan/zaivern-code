@@ -59,6 +59,14 @@ pub const READY_WAIT: Duration = Duration::from_secs(45);
 /// 諦める上限。ここを過ぎたらユーザーへ知らせて捨てる。
 pub const GIVE_UP: Duration = Duration::from_secs(120);
 
+/// 確定キーを撃つ前に「相手が静かになる」のを待つ上限。
+///
+/// **忙しい CLI は確定キーを飲み込む** (実機の Codex)。かといって永久に
+/// 待つと届かないので、ここを過ぎたら撃って `Verify` で確かめる。
+/// `GIVE_UP` より十分短くする — 待ちで予算を使い切ると、撃ち直す機会が
+/// 1 度も来ない。
+pub const COMMIT_IDLE_WAIT: Duration = Duration::from_secs(20);
+
 /// 送れない状態のときに次を見に行く間隔。
 ///
 /// アイドル時のコストをゼロに保つため、呼び出し側はこの間隔で
@@ -325,6 +333,19 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             }
             if since_stage < COMMIT_DELAY {
                 return Act::Wait(COMMIT_DELAY - since_stage);
+            }
+            // **相手が手を動かしている間は撃たない。**
+            //
+            // 忙しい CLI は確定キーを飲み込む。実機の Codex では、本文は
+            // 入力欄に入っているのに Enter が効かず、2 通目以降が毎回
+            // 止まっていた。1 通目が届いていたのは起動直後で待機していた
+            // から — **同じ条件を作ってから撃つ**。
+            //
+            // 待ちっぱなしにはしない。[`COMMIT_IDLE_WAIT`] を過ぎたら
+            // 待たずに撃つ (取りこぼすより、撃って確かめるほうがよい。
+            // 効かなければ `Verify` が入力欄を見て撃ち直す)。
+            if !peek.idle && since_stage < COMMIT_IDLE_WAIT && !peek.attention {
+                return Act::Wait(POLL);
             }
             // 本文を書いてから確定までの間に承認プロンプトが出たら、
             // Enter は承認への回答になる。撃たずに落ち着くのを待つ。
@@ -700,5 +721,47 @@ mod tests {
     #[test]
     fn 空の本文は残留判定に使わない() {
         assert!(!still_pending(Some("なんでも"), ""));
+    }
+    /// **忙しい相手には確定キーを撃たない。**
+    ///
+    /// 実機の Codex は、手を動かしている最中の Enter を飲み込む。本文は
+    /// 入力欄に入っているのに送信されず、2 通目以降が毎回止まっていた
+    /// (1 通目だけ届いていたのは、起動直後で相手が待機していたから)。
+    /// **1 通目と同じ条件を毎回作ってから撃つ。**
+    #[test]
+    fn 忙しい相手には確定キーを撃たない() {
+        let text = "やってください";
+        let busy = Peek {
+            idle: false,
+            input: Some(text.into()),
+            ..peek_ready()
+        };
+        let job = Job {
+            stage: Stage::Commit,
+            ..Job::deferred(1, text, true)
+        };
+        // 手が動いている間は待つ。
+        assert!(
+            matches!(
+                decide(&job, &busy, COMMIT_DELAY, Duration::from_secs(1)),
+                Act::Wait(_)
+            ),
+            "忙しい相手へ撃っている"
+        );
+        // **待ちっぱなしにはしない。** 上限を過ぎたら撃って、効いたかを確かめる。
+        assert_eq!(
+            decide(&job, &busy, COMMIT_IDLE_WAIT, Duration::from_secs(30)),
+            Act::WriteCommit,
+            "静かにならない相手へ永久に届かない"
+        );
+        // 静かなら待たずに撃つ (1 通目と同じ道)。
+        let quiet = Peek {
+            idle: true,
+            ..busy.clone()
+        };
+        assert_eq!(
+            decide(&job, &quiet, COMMIT_DELAY, Duration::from_secs(1)),
+            Act::WriteCommit
+        );
     }
 }
