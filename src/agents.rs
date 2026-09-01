@@ -1793,6 +1793,49 @@ fn is_safe_session_id(id: &str) -> bool {
 const TERMINAL_SCROLLBACK_ENV: &[(&str, &[(&str, &str)])] =
     &[("claude", &[("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")])];
 
+/// **エージェントごとの「入力の受け取り方」。**
+///
+/// ここが 1 か所である意味は大きい。CLI ごとの癖を送信側 (`submit.rs`) に
+/// 散らすと、CLI が 1 つ増えるたびに送信の分岐が増えて、どれがどれのために
+/// 書かれた条件なのか誰にも分からなくなる。**癖はデータとして持つ**
+/// (CLAUDE.md「エージェント固有値はカタログにデータとして持つ」)。
+///
+/// | 項目 | 意味 |
+/// |---|---|
+/// | `ready_ms` | 起動から**入力を受け取れるようになるまで**の目安 (ミリ秒) |
+/// | `commit` | 送信を確定するキー列。既定は `\r` |
+///
+/// ## `ready_ms` が要る理由 (実測)
+///
+/// Claude Code v2 は起動直後の数秒、**stdin へ書いても画面に何も出ない**。
+/// Zaivern は書けたつもりで確定キーまで送り、配達を「完了」と記録するが、
+/// 相手には 1 文字も届いていない (実機: Antigravity のログには指示が 144 件
+/// 現れるのに、Claude Code のログには 0 件で、ログ自体が起動表示だけの 6KB)。
+///
+/// **待てば直る**ので、待つ時間を CLI ごとに持つ。0 の CLI は待たない。
+const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
+    // Claude Code: 起動直後に書いても落ちる。実測で 3 秒あれば受け取る。
+    ("claude", 3_000, b"\r"),
+];
+
+/// この CLI が入力を受け取れるようになるまでの目安 (ミリ秒)。持たなければ 0。
+pub fn input_ready_ms(bin: &str) -> u64 {
+    SUBMIT_PROFILES
+        .iter()
+        .find(|(b, _, _)| *b == bin)
+        .map(|(_, ms, _)| *ms)
+        .unwrap_or(0)
+}
+
+/// 送信を確定するキー列。持たなければ `\r`。
+pub fn commit_keys(bin: &str) -> &'static [u8] {
+    SUBMIT_PROFILES
+        .iter()
+        .find(|(b, _, _)| *b == bin)
+        .map(|(_, _, k)| *k)
+        .unwrap_or(b"\r")
+}
+
 /// `bin` に対応する履歴用 env を返す。持たない CLI は空。
 fn scrollback_env_for(bin: &str) -> &'static [(&'static str, &'static str)] {
     TERMINAL_SCROLLBACK_ENV
@@ -5237,6 +5280,41 @@ mod tests {
                     "死んだセッションへイベントが出た"
                 );
             }
+        }
+    }
+
+    /// **エージェントごとの癖は、カタログ 1 か所に置く。**
+    ///
+    /// 送信側 (`submit.rs` / `app::agent_sessions`) に CLI ごとの分岐を書くと、
+    /// CLI が 1 つ増えるたびに条件が増えて、どれがどれのために書かれたのか
+    /// 誰にも分からなくなる (CLAUDE.md「エージェント固有値はカタログにデータと
+    /// して持つ」)。
+    #[test]
+    fn エージェントごとの癖はカタログにだけ置く() {
+        // カタログは名前で引ける (持たない CLI には既定が返る)。
+        assert!(
+            super::input_ready_ms("claude") > 0,
+            "Claude Code の待ちが無い"
+        );
+        assert_eq!(
+            super::input_ready_ms("そんなCLIは無い"),
+            0,
+            "既定は待たない"
+        );
+        assert_eq!(
+            super::commit_keys("そんなCLIは無い"),
+            b"\r",
+            "既定の確定キーは Enter"
+        );
+
+        // **送信側に CLI 名を書かない。** 分岐が散り始める最初の兆候がこれ。
+        let submit = include_str!("submit.rs").replace("\r\n", "\n");
+        for bin in ["claude", "codex", "agy", "cursor-agent", "droid"] {
+            let needle = format!("\"{bin}\"");
+            assert!(
+                !submit.contains(&needle),
+                "submit.rs に CLI 名 {needle} が書かれている (癖はカタログへ)"
+            );
         }
     }
 }

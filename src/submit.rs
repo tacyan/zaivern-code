@@ -201,6 +201,12 @@ pub enum Stage {
 /// 相手のいまの様子。呼び出し側が毎フレーム集める。
 #[derive(Debug, Clone, Default)]
 pub struct Peek {
+    /// **この相手はもう入力を受け取れるか。**
+    ///
+    /// 起動直後の数秒は書いても落ちる CLI がある (Claude Code v2)。
+    /// 待つ長さは**カタログが持つ** (`agents::input_ready_ms`) ので、
+    /// ここは真偽だけを受け取る — 送信側に CLI ごとの分岐を作らない。
+    pub input_ready: bool,
     /// PTY が生きているか
     pub running: bool,
     /// 見張りが Idle と判定しているか
@@ -314,6 +320,15 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             }
             // 承認プロンプトで止まっている間は何があっても送らない。
             if peek.attention {
+                return Act::Wait(POLL);
+            }
+            // **まだ受け取れない相手には書かない。**
+            //
+            // 起動直後に書いても画面に 1 文字も出ない CLI がある。書けた
+            // つもりで確定キーまで送ると、配達は「完了」と記録されるのに
+            // 相手には何も届かない (実機の Claude Code)。待つ長さは
+            // カタログが持つ ([`crate::agents::input_ready_ms`])。
+            if !peek.input_ready {
                 return Act::Wait(POLL);
             }
             if !job.wait_idle {
@@ -436,6 +451,7 @@ mod tests {
 
     fn peek_ready() -> Peek {
         Peek {
+            input_ready: true,
             running: true,
             idle: true,
             attention: false,
@@ -763,5 +779,34 @@ mod tests {
             decide(&job, &quiet, COMMIT_DELAY, Duration::from_secs(1)),
             Act::WriteCommit
         );
+    }
+
+    /// **起動直後の相手には書かない。**
+    ///
+    /// 実機で Claude Code は起動から数秒、stdin へ書いても画面に 1 文字も
+    /// 出なかった。Zaivern は書けたつもりで確定キーまで送り、配達を「完了」と
+    /// 記録するのに、相手には何も届かない (Antigravity のログには指示が
+    /// 144 件現れるのに、Claude Code のログは起動表示だけの 6KB で 0 件だった)。
+    #[test]
+    fn 受け取れない相手には書かない() {
+        let job = Job::user(1, "やって");
+        let not_yet = Peek {
+            input_ready: false,
+            ..peek_ready()
+        };
+        assert!(
+            matches!(
+                decide(&job, &not_yet, Duration::ZERO, Duration::from_secs(1)),
+                Act::Wait(_)
+            ),
+            "受け取れない相手へ書いている"
+        );
+        // 受け取れるようになったら書く。
+        assert_eq!(
+            decide(&job, &peek_ready(), Duration::ZERO, Duration::from_secs(1)),
+            Act::WriteBody
+        );
+        // **待ちっぱなしにはしない。** 上限を過ぎたら人へ返す。
+        assert_eq!(decide(&job, &not_yet, Duration::ZERO, GIVE_UP), Act::GaveUp);
     }
 }

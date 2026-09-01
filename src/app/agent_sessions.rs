@@ -578,6 +578,15 @@ impl ZaivernApp {
             };
             let bracketed = s.running() && s.bracketed_paste();
             let peek = submit::Peek {
+                // **起動直後は書かない。** 待つ長さはカタログが持つので、
+                // ここに CLI ごとの分岐は作らない。
+                input_ready: s
+                    .agent_bin()
+                    .map(|b| {
+                        s.age()
+                            >= std::time::Duration::from_millis(crate::agents::input_ready_ms(b))
+                    })
+                    .unwrap_or(true),
                 running: s.running(),
                 idle,
                 attention: s.attention,
@@ -632,7 +641,12 @@ impl ZaivernApp {
                     true
                 }
                 submit::Act::WriteCommit => {
-                    s.write_bytes(submit::COMMIT);
+                    // 確定キーもカタログから引く (CLI ごとに違いうる)。
+                    let keys = s
+                        .agent_bin()
+                        .map(crate::agents::commit_keys)
+                        .unwrap_or(submit::COMMIT);
+                    s.write_bytes(keys);
                     p.job.tries = p.job.tries.saturating_add(1);
                     p.advance(submit::Stage::Verify, now);
                     soon(submit::VERIFY_DELAY);

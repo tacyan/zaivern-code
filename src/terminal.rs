@@ -2213,6 +2213,14 @@ impl Session {
     /// このセッションのエージェント名 (`agy` / `claude` …)。カタログ外なら None。
     /// 別名 (`antigravity` / `antigravity-cli`) はカタログ側で正規化されるので、
     /// ここでは常に正規の `bin` 名が返る。
+    /// このセッションが起きてからの経過。
+    ///
+    /// **起動直後に入力を書いても落ちる CLI がある**ので、送信側が
+    /// 「もう受け取れるか」を決めるのに使う (待つ長さはカタログが持つ)。
+    pub fn age(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
     pub fn agent_bin(&self) -> Option<&'static str> {
         self.spec().map(|s| s.bin)
     }
