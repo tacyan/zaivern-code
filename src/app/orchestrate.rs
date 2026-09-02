@@ -6,40 +6,6 @@ fn coordinator_delivery_tag(session: u64, msg_id: u64) -> String {
     format!("{COORDINATOR_DELIVERY_TAG}{session}:{msg_id}")
 }
 
-#[cfg(test)]
-mod coordinator_delivery_tag_tests {
-    use super::{
-        coordinator_delivery_tag, parse_coordinator_delivery_tag, COORDINATOR_DELIVERY_TAG,
-    };
-
-    #[test]
-    fn coordinator_tag_round_trips_exact_ids() {
-        let tag = coordinator_delivery_tag(u64::MAX - 1, u64::MAX);
-        assert_eq!(
-            parse_coordinator_delivery_tag(&tag),
-            Some((u64::MAX - 1, u64::MAX))
-        );
-    }
-
-    #[test]
-    fn coordinator_tag_rejects_malformed_or_ambiguous_values() {
-        for tag in [
-            "coordinator:",
-            "coordinator:1",
-            "coordinator::2",
-            "coordinator:1:",
-            "coordinator: 1:2",
-            "coordinator:+1:2",
-            "coordinator:1:2:3",
-            "coordinator:1:18446744073709551616",
-            "team:1:2",
-        ] {
-            assert_eq!(parse_coordinator_delivery_tag(tag), None, "{tag}");
-        }
-        assert!("coordinator:broken".starts_with(COORDINATOR_DELIVERY_TAG));
-    }
-}
-
 fn parse_coordinator_delivery_tag(tag: &str) -> Option<(u64, u64)> {
     let mut parts = tag.strip_prefix(COORDINATOR_DELIVERY_TAG)?.split(':');
     let session_text = parts.next()?;
@@ -1274,5 +1240,39 @@ impl ZaivernApp {
             // 隔離はそのまま (解くと崩れが戻るため)。表示だけ引っ込める
             self.frame_guard.banner = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod coordinator_delivery_tag_tests {
+    use super::{
+        coordinator_delivery_tag, parse_coordinator_delivery_tag, COORDINATOR_DELIVERY_TAG,
+    };
+
+    #[test]
+    fn coordinator_tag_round_trips_exact_ids() {
+        let tag = coordinator_delivery_tag(u64::MAX - 1, u64::MAX);
+        assert_eq!(
+            parse_coordinator_delivery_tag(&tag),
+            Some((u64::MAX - 1, u64::MAX))
+        );
+    }
+
+    #[test]
+    fn coordinator_tag_rejects_malformed_or_ambiguous_values() {
+        for tag in [
+            "coordinator:",
+            "coordinator:1",
+            "coordinator::2",
+            "coordinator:1:",
+            "coordinator: 1:2",
+            "coordinator:+1:2",
+            "coordinator:1:2:3",
+            "coordinator:1:18446744073709551616",
+            "team:1:2",
+        ] {
+            assert_eq!(parse_coordinator_delivery_tag(tag), None, "{tag}");
+        }
+        assert!("coordinator:broken".starts_with(COORDINATOR_DELIVERY_TAG));
     }
 }
