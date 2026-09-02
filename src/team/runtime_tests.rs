@@ -563,7 +563,12 @@ fn 報告されたサブエージェントは端末を開けない() {
         open = rp::EVENT_OPEN,
         close = rp::EVENT_CLOSE
     );
+    let generation = rt.snapshot_generation();
     tick_text(&mut rt, 12, &sids, sids[0], &ev);
+    assert!(
+        rt.snapshot_generation() > generation,
+        "ReportedSubAgent の追加が snapshot 世代へ反映されない"
+    );
     let sub = rt
         .agent(&AgentId::new("backend-test-1"))
         .expect("サブエージェントが登録されるべき");
@@ -573,6 +578,15 @@ fn 報告されたサブエージェントは端末を開けない() {
         "開けない端末のボタンを出してしまう"
     );
     assert_eq!(sub.parent_id, Some(parent));
+
+    // 同じ画面と同じ構造化ブロックは再取り込みしない。
+    let generation = rt.snapshot_generation();
+    tick_text(&mut rt, 13, &sids, sids[0], &ev);
+    assert_eq!(
+        rt.snapshot_generation(),
+        generation,
+        "同じ ReportedSubAgent 報告で snapshot 世代が進んだ"
+    );
 }
 
 #[test]

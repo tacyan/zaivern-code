@@ -38,10 +38,7 @@ fn cliのteamサブコマンドが門に登録されている() {
         gate.contains("| \"team\""),
         "is_cli_subcommand に team が無い"
     );
-    assert!(
-        s.contains("\"team\" => {"),
-        "dispatch に team の分岐が無い"
-    );
+    assert!(s.contains("\"team\" => {"), "dispatch に team の分岐が無い");
     assert!(
         s.contains("crate::features::team::cli_main(rest)"),
         "team の実体を呼んでいない"
@@ -57,9 +54,7 @@ fn team_runはgui起動へ落ちる経路を持つ() {
     let s = src(CLI);
     // `zai team run` はヘッドレスではない。実行中インスタンスが無いときは
     // CLI を終わらせず **GUI 起動へ落ちる** (main.rs が None を見て起こす)。
-    let at = s
-        .find("\"team\" => {")
-        .expect("team の分岐がある");
+    let at = s.find("\"team\" => {").expect("team の分岐がある");
     let body = &s[at..at + 600];
     assert!(
         body.contains("EXIT_LAUNCH_GUI") && body.contains("return None"),
@@ -125,7 +120,10 @@ fn エージェント起動は既存経路を通る() {
     for (needle, why) in [
         ("self.launch_preset_as(", "既存の起動経路を使っていない"),
         ("&spec.workspace_root", "Run の workspace で起こしていない"),
-        ("self.team_approval()", "この Run の承認モードを渡していない"),
+        (
+            "self.team_approval(owner)",
+            "この Run の承認モードを渡していない",
+        ),
     ] {
         assert!(body.contains(needle), "{why}:\n{body}");
     }
@@ -173,7 +171,7 @@ fn 指示の送信は既存の一本を通る() {
     // **配達の結末を受け取れる形で積む。** 目印が無いと、積めたことしか
     // 分からず、相手が消えても Runtime は「届いた」と信じ続ける。
     assert!(
-        body.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        body.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&owner, &key))"),
         "配達の結末を受け取る目印を付けていない:\n{body}"
     );
     // PTY へ直接書く経路を作らない (Ink 系 TUI の取りこぼし対策は submit が持つ)
@@ -193,11 +191,11 @@ fn 積めたことを届いたことにしない() {
     let glue = src(GLUE);
     let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
     let at = body
-        .find("for (key, task, session, text) in instructions")
+        .find("for (owner, key, task, session, text) in instructions")
         .expect("指示の取り出し口");
     // 次の取り出し口 (停止) までが指示の区画。
     let end = body[at..]
-        .find("for (key, session) in stops")
+        .find("for (owner, key, session) in stops")
         .map(|e| at + e)
         .unwrap_or(body.len());
     let seg = &body[at..end];
@@ -206,7 +204,7 @@ fn 積めたことを届いたことにしない() {
         "積めた時点で完了にしている (届かなくても消えなくなる):\n{seg}"
     );
     assert!(
-        seg.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        seg.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&owner, &key))"),
         "配達の結末を受け取る目印を付けていない:\n{seg}"
     );
 
@@ -214,14 +212,25 @@ fn 積めたことを届いたことにしない() {
     let sessions = src(SESSIONS);
     let tick = function_body(
         &sessions,
-        sessions.find("fn submit_tick").expect("配達を進める唯一の経路"),
+        sessions
+            .find("fn submit_tick")
+            .expect("配達を進める唯一の経路"),
     );
     for (needle, why) in [
         ("submit::Act::Done => {", "届いたことを他と区別していない"),
-        ("submit::Act::Gone => {", "相手が消えたことを他と区別していない"),
+        (
+            "submit::Act::Gone => {",
+            "相手が消えたことを他と区別していない",
+        ),
         ("outcomes.push((t, true))", "届いたことを返していない"),
-        ("outcomes.push((t, false))", "届かなかったことを返していない"),
-        ("self.team_note_delivery(outcomes)", "結末を頼んだ側へ返していない"),
+        (
+            "outcomes.push((t, false))",
+            "届かなかったことを返していない",
+        ),
+        (
+            "self.note_submit_delivery(outcomes)",
+            "結末を頼んだ側へ返していない",
+        ),
     ] {
         assert!(tick.contains(needle), "{why}:\n{tick}");
     }
@@ -237,7 +246,8 @@ fn 停止は承認ゲートを通る() {
     let s = src(GLUE);
     let body = function_body(
         &s,
-        s.find("fn team_apply_board_action").expect("操作の受け口がある"),
+        s.find("fn team_apply_board_action")
+            .expect("操作の受け口がある"),
     );
     // Stop は Runtime へ渡すだけ。**その場で kill しない。**
     assert!(
@@ -255,7 +265,10 @@ fn 停止は承認ゲートを通る() {
 #[test]
 fn エージェントをクリックすると実際の端末が開く() {
     let s = src(GLUE);
-    let body = function_body(&s, s.find("fn team_open_terminal").expect("端末を開く橋がある"));
+    let body = function_body(
+        &s,
+        s.find("fn team_open_terminal").expect("端末を開く橋がある"),
+    );
     assert!(
         body.contains("self.focus_agent_in_place(i)"),
         "既存の選択経路を使っていない"
@@ -515,10 +528,7 @@ fn 起動要求のフィールドはすべて使われている() {
     // **飾りのメタデータを残さない。** 構造体にあるのに実行時は無視、は
     // 「渡したつもり」の嘘になる (workspace_root がまさにそれだった)。
     let glue = src(GLUE);
-    let body = function_body(
-        &glue,
-        glue.find("fn team_launch_agent").expect("起動の橋"),
-    );
+    let body = function_body(&glue, glue.find("fn team_launch_agent").expect("起動の橋"));
     for (field, used_as) in [
         ("spec.workspace_root", "エージェントの cwd"),
         ("spec.role", "プリセットの選択"),
@@ -532,7 +542,7 @@ fn 起動要求のフィールドはすべて使われている() {
     // agent_id はセッションの結び付けに使う (呼び出し側)。
     let run = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
     assert!(
-        run.contains("p.bind_session(&spec.agent_id, session, identity)"),
+        run.contains("p.bind_session(&owner, &spec.agent_id, session, identity)"),
         "起動したセッションを要求のエージェントへ結び付けていない (目印つきで)"
     );
     // **adopt も使う。** 使わないと、再起動のあと同じ logical agent を
@@ -558,15 +568,13 @@ fn 実行コンテキストを画面のいまの値で取り直さない() {
     // 取り直して上書きしてはいけない。
     let glue = src(GLUE);
     // 起動の橋: 画面のフォルダを見ない (上の番人と対)。
-    let launch = function_body(
-        &glue,
-        glue.find("fn team_launch_agent").expect("起動の橋"),
-    );
+    let launch = function_body(&glue, glue.find("fn team_launch_agent").expect("起動の橋"));
     assert!(!launch.contains("agent_cwd"));
     // 計画の入口: SPEC の解決も Team の workspace が基準。
     let plan = function_body(
         &glue,
-        glue.find("fn team_plan_from_form").expect("計画の入口"),
+        glue.find("fn team_plan_from_form_inner")
+            .expect("計画の入口"),
     );
     assert!(
         plan.contains("p.workspace().to_path_buf()"),
@@ -628,7 +636,8 @@ fn 閉じるときに検証を置き去りにしない() {
     let p = src(PANEL);
     let now = function_body(
         &p,
-        p.find("pub fn stop_all_validations_now").expect("その場で落とす"),
+        p.find("pub fn stop_all_validations_now")
+            .expect("その場で落とす"),
     );
     assert!(
         now.contains("crate::procx::kill_tree(pid)"),
@@ -654,7 +663,8 @@ fn 立ち上がるときに前のアプリのrunを引き継がない() {
     let p = src(PANEL);
     let adopt = function_body(
         &p,
-        p.find("pub fn adopt_new_app_context").expect("引き継ぎの拒否"),
+        p.find("pub fn adopt_new_app_context")
+            .expect("引き継ぎの拒否"),
     );
     assert!(
         adopt.contains("self.shutdown()") && adopt.contains("self.workspace = PathBuf::new()"),
@@ -792,7 +802,8 @@ fn 起動要求にworkspaceを決めさせない() {
     let l = src(LAUNCH);
     let check = function_body(
         &l,
-        l.find("pub fn request_matches_workspace").expect("境界の判定"),
+        l.find("pub fn request_matches_workspace")
+            .expect("境界の判定"),
     );
     assert!(
         check.contains("let current = canon(workspace);")
@@ -815,15 +826,23 @@ fn 起動要求にworkspaceを決めさせない() {
 #[test]
 fn 起動要求はteam画面を選ぶ() {
     let s = src(GLUE);
-    let body = function_body(&s, s.find("fn team_take_launch_request").expect("受け口がある"));
+    let body = function_body(
+        &s,
+        s.find("fn team_take_launch_request").expect("受け口がある"),
+    );
     assert!(body.contains("p.open = true"), "Team 画面を開いていない");
     assert!(
         body.contains("p.tab = BoardTab::Organization"),
         "Organization タブを選んでいない"
     );
     assert!(
-        body.contains("p.form.open = false"),
-        "Plan Preview ではなくフォームを出してしまう"
+        body.contains("p.form.open = false") && body.contains("p.form.open = true"),
+        "通常SPECと短いSPECの表示先を分けていない"
+    );
+    assert!(
+        body.contains("planner::needs_spec_rewrite(&req.spec_text)")
+            && body.contains("self.team_draft_spec()"),
+        "CLI の短いSPECが仕様書作成を迂回している"
     );
     // `--yes` は **Start Team の確認だけ**を省く
     assert!(
@@ -857,7 +876,10 @@ fn フォームの入力欄はすべて何かを変える() {
     // **押せるのに何も起きない入力欄を残さない。** New Team Run の各項目が
     // 実際にどこかへ渡っていることを、静的に固定する。
     let glue = src(GLUE);
-    let body = function_body(&glue, glue.find("fn team_plan_from_form").expect("計画の橋"));
+    let body = function_body(
+        &glue,
+        glue.find("fn team_plan_from_form_inner").expect("計画の橋"),
+    );
     for (field, needle) in [
         ("goal_name", "form.goal_name.clone()"),
         ("roles", "form.roles.clone()"),
@@ -901,7 +923,10 @@ fn team_runは既存のグローバル設定を書き換えない() {
         );
     }
     // 読むのは初期値としてだけ。**書かない。**
-    let seed = function_body(&glue, glue.find("fn seed_team_form").expect("初期値の読み込み"));
+    let seed = function_body(
+        &glue,
+        glue.find("fn seed_team_form").expect("初期値の読み込み"),
+    );
     assert!(
         seed.contains("self.cfg.approval_mode") && seed.contains("self.cfg.cost_limit_session"),
         "既存設定を初期値として読んでいない:\n{seed}"
@@ -918,7 +943,10 @@ fn team_runは既存のグローバル設定を書き換えない() {
         "フォームを開く入口の一部で既存設定を読んでいない ({opens} か所)"
     );
     // 効かせ方は「締める方向だけ」。判断は純関数 1 本に置く。
-    let approval = function_body(&glue, glue.find("fn team_approval").expect("承認モードの解決"));
+    let approval = function_body(
+        &glue,
+        glue.find("fn team_approval").expect("承認モードの解決"),
+    );
     assert!(
         approval.contains("effective_approval(&self.cfg.approval_mode)"),
         "既存設定と突き合わせずに Run の値を使っている:\n{approval}"
@@ -1123,8 +1151,8 @@ fn 実行側は必ず成否を返す() {
     // (取り出し口のループ見出し, その区画に必ず要るもの)
     let loops: [(&str, &[&str]); 5] = [
         (
-            "for (key, spec) in launches",
-            &["p.ack_done(&key)", "p.ack_failed(&key)"],
+            "for (owner, key, spec) in launches",
+            &["p.ack_done(&owner, &key)", "p.ack_failed(&owner, &key)"],
         ),
         (
             // 宛先のタスクも運ぶ (セッションから引き直さない)。
@@ -1133,8 +1161,8 @@ fn 実行側は必ず成否を返す() {
             // 届いたことは別の時刻に決まるので、成功は配達の結末
             // (`team_note_delivery`) が返す。ここで見るのは
             // 「積めなかったときに必ず失敗が返る」ことだけ。
-            "for (key, task, session, text) in instructions",
-            &["p.ack_failed(&key)"],
+            "for (owner, key, task, session, text) in instructions",
+            &["p.ack_failed(&owner, &key)"],
         ),
         (
             // 人が出した指示。**成功は指示と同じく配達の結末が返す**ので、
@@ -1142,14 +1170,17 @@ fn 実行側は必ず成否を返す() {
             // 送信キューへ積めなかった) だけ。素の `ack_failed` で済ませると
             // 監査は「送信キューへ追加しました」のまま結末を 1 件も持たない
             // — queued と failed が記録の上で区別できなくなる。
-            "for (key, agent, session, text) in manual",
-            &["p.note_manual_failed(&key,"],
+            "for (owner, key, agent, session, text) in manual",
+            &["p.note_manual_failed(&owner, &key,"],
         ),
-        ("for (key, session) in stops", &["p.ack_done(&key)"]),
+        (
+            "for (owner, key, session) in stops",
+            &["p.ack_done(&owner, &key)"],
+        ),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
         (
-            "for (key, v) in validations",
-            &["self.team_spawn_validation(key, v)"],
+            "for (owner, key, v) in validations",
+            &["self.team_spawn_validation(owner, key, v)"],
         ),
     ];
     // 見出しの位置で区画に割り、**その区画の中だけ**を見る。
@@ -1182,8 +1213,11 @@ fn 実行側は必ず成否を返す() {
         &glue,
         glue.find("fn team_spawn_validation").expect("検証の委譲先"),
     );
-    for needle in ["p.ack_done(&key)", "p.ack_failed(&key)"] {
-        assert!(spawn.contains(needle), "検証の委譲先が `{needle}` を返していない");
+    for needle in ["p.ack_done(&owner, &key)", "p.ack_failed(&owner, &key)"] {
+        assert!(
+            spawn.contains(needle),
+            "検証の委譲先が `{needle}` を返していない"
+        );
     }
     // **時限と停止の札を必ず渡す。** ここが抜けると実行器は無期限に待ち、
     // 止める手も無くなる (GUI の経路なので、ここでしか見張れない)。
@@ -1219,7 +1253,10 @@ fn 盤面の端末は触れるがホイールは取り合わない() {
     // 引数は (ui, s, theme, font, interactive, allow_resize, hover_scroll)
     let args: Vec<&str> = call.split(',').map(str::trim).collect();
     assert_eq!(args.len(), 7, "端末の描画引数が変わった: {call}");
-    assert_eq!(args[4], "true", "触れない端末になっている (確認に答えられない)");
+    assert_eq!(
+        args[4], "true",
+        "触れない端末になっている (確認に答えられない)"
+    );
     assert_eq!(
         args[6], "false",
         "ホイールを取り合う設定になっている (行が重なって崩れる)"
@@ -1242,7 +1279,7 @@ fn 使うエージェントの選択が起動に効く() {
     );
     // 選ばれていれば、その中だけを候補にする。真実の在り処は Run 側。
     assert!(
-        body.contains("p.pinned_agents()"),
+        body.contains("p.pinned_agents_for(owner)"),
         "Run が持っている選択を見ていない:\n{body}"
     );
     assert!(

@@ -657,7 +657,7 @@ impl ZaivernApp {
         // **配達の結末を頼んだ側へ 1 回だけ返す。** 送信経路は増やさない
         // (ここは結果を伝えるだけで、PTY へは 1 バイトも書かない)。
         if !outcomes.is_empty() {
-            self.team_note_delivery(outcomes);
+            self.note_submit_delivery(outcomes);
         }
         for title in delivered {
             self.toast(

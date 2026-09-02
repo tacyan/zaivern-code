@@ -20,6 +20,13 @@ use super::validation_command::ValidationCommand;
 /// **こちらで切ってから渡す**。
 pub const PROMPT_MAX_BYTES: usize = 8_000;
 
+/// 必須契約の中で、仲間の**表示一覧だけ**に使ってよい上限。
+///
+/// Agent は最大数が増えても、MSG/EVENT/完了報告の書式を押し出しては
+/// いけない。ID の途中で切ると実在しない宛先を教えることになるため、
+/// 一覧は完全な行だけをこの予算へ収める。
+const TEAMMATES_LIST_MAX_BYTES: usize = 1_536;
+
 /// 指示に添える材料。
 #[derive(Clone, Debug)]
 pub struct Brief<'a> {
@@ -60,16 +67,41 @@ fn bullets(items: &[String]) -> String {
         .collect::<String>()
 }
 
-/// 上限で切る。切ったことが分かるようにする。
-fn cap(s: String) -> String {
-    if s.len() <= PROMPT_MAX_BYTES {
-        return s;
+/// 可変の本文だけを上限で切り、必須契約は必ず末尾へ残す。
+///
+/// 完成済みの文字列を先頭から単純に切ると、後ろに置いた完了報告・伝言・
+/// サブエージェント報告の形式から順に消える。すると長いタスクほど正式な
+/// 報告手段を失い、終わっていても Runtime は完了を受け取れない。
+///
+/// `required_tail` は固定の契約なので切らない。契約だけで上限を超えるのは
+/// プロンプト設計そのものの不整合であり、不完全な指示を黙って渡すより
+/// その場で検出する。
+fn cap(mut body: String, required_tail: String) -> String {
+    if body.len() + required_tail.len() <= PROMPT_MAX_BYTES {
+        body.push_str(&required_tail);
+        return body;
     }
-    let mut cut = PROMPT_MAX_BYTES;
-    while cut > 0 && !s.is_char_boundary(cut) {
+
+    assert!(
+        required_tail.len() <= PROMPT_MAX_BYTES,
+        "必須の報告契約だけでプロンプト上限を超えています"
+    );
+
+    const NOTICE: &str = "\n…(可変の指示本文が長いため切り詰めました)\n\n";
+    let notice = if required_tail.len() + NOTICE.len() <= PROMPT_MAX_BYTES {
+        NOTICE
+    } else {
+        ""
+    };
+    let mut cut = PROMPT_MAX_BYTES - required_tail.len() - notice.len();
+    cut = cut.min(body.len());
+    while cut > 0 && !body.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}\n…(指示が長いため切り詰めました)\n", &s[..cut])
+    body.truncate(cut);
+    body.push_str(notice);
+    body.push_str(&required_tail);
+    body
 }
 
 /// 完了報告のひな型。**全役割で同じ 1 本**を使う。
@@ -145,10 +177,35 @@ fn teammates_section(mates: &[(String, String)]) -> String {
     if mates.is_empty() {
         return String::new();
     }
-    let list: String = mates
-        .iter()
-        .map(|(id, role)| format!("* `{id}` — {role}\n"))
-        .collect();
+    const LINE_DECORATION_BYTES: usize = "* `` — \n".len();
+    const OMITTED: &str = "* …(仲間の一覧が長いため一部省略。全員への宛先 `all` は使えます)\n";
+    let full_len = mates.iter().fold(0usize, |total, (id, role)| {
+        total
+            .saturating_add(LINE_DECORATION_BYTES)
+            .saturating_add(id.len())
+            .saturating_add(role.len())
+    });
+    let omitted = full_len > TEAMMATES_LIST_MAX_BYTES;
+    let budget = if omitted {
+        TEAMMATES_LIST_MAX_BYTES.saturating_sub(OMITTED.len())
+    } else {
+        TEAMMATES_LIST_MAX_BYTES
+    };
+    let mut list = String::with_capacity(full_len.min(TEAMMATES_LIST_MAX_BYTES));
+    for (id, role) in mates {
+        let line_len = LINE_DECORATION_BYTES + id.len() + role.len();
+        // 宛先 ID を途中で切らない。収まらない 1 行は丸ごと省く。
+        if list.len() + line_len <= budget {
+            list.push_str("* `");
+            list.push_str(id);
+            list.push_str("` — ");
+            list.push_str(role);
+            list.push('\n');
+        }
+    }
+    if omitted {
+        list.push_str(OMITTED);
+    }
     format!(
         "\n## チームの仲間\n{list}\n\
          区切りが付いたときや、相手が待っていることが分かったときは、\
@@ -202,24 +259,25 @@ pub fn implementer(b: &Brief<'_>) -> String {
     }
     s.push_str("\n## 実行する検証コマンド\n");
     s.push_str(&bullets(&command_labels(&t.validation_commands)));
-    s.push_str(&format!(
+    let mut required_tail = String::new();
+    required_tail.push_str(&format!(
         "\n## 体制\n  - あなたの ID: {}\n  - 親エージェント: {}\n  - ワークスペースルート: {}\n",
         b.agent_id,
         b.parent_id.unwrap_or("(なし)"),
         b.workspace_root
     ));
-    s.push_str("\n## 禁止事項\n");
-    s.push_str(
+    required_tail.push_str("\n## 禁止事項\n");
+    required_tail.push_str(
         "  - git push / PR 作成 / merge / deploy / release は行わない\n\
          \x20 - 権限昇格 (sudo 等) を行わない\n\
          \x20 - ワークスペース外へ書き込まない\n\
          \x20 - 破壊的な削除 (rm -rf 等) を行わない\n",
     );
-    s.push_str("\n## 完了報告\n");
-    s.push_str(&result_format(t.id, b.agent_id, &b.outbox));
-    s.push_str(&teammates_section(&b.teammates));
-    s.push_str(&subagents_section(b.agent_id));
-    cap(s)
+    required_tail.push_str("\n## 完了報告\n");
+    required_tail.push_str(&result_format(t.id, b.agent_id, &b.outbox));
+    required_tail.push_str(&teammates_section(&b.teammates));
+    required_tail.push_str(&subagents_section(b.agent_id));
+    cap(s, required_tail)
 }
 
 /// レビュー担当への指示。**原則としてコードを変更させない。**
@@ -248,8 +306,9 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
             target.last_summary.as_str()
         }
     ));
-    s.push_str("\n## 確認する観点\n");
-    s.push_str(
+    let mut required_tail = String::new();
+    required_tail.push_str("\n## 確認する観点\n");
+    required_tail.push_str(
         "  - 仕様への適合 (受入基準を満たしているか)\n\
          \x20 - バグ (境界値・異常系・競合)\n\
          \x20 - テスト不足\n\
@@ -257,7 +316,7 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
          \x20 - 破壊的変更 (既存の振る舞いを壊していないか)\n\
          \x20 - 担当外ファイルの変更\n",
     );
-    s.push_str(&format!(
+    required_tail.push_str(&format!(
         "\n## 判定の出し方\n次の形式を**そのまま**出力してください。\n\n\
          {open}\n\
          {{\n\
@@ -276,9 +335,9 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
     ));
     // **レビューこそ伝える相手が要る。** 指摘を書いても、直す本人へ
     // 届かなければ盤面に残るだけになる。
-    s.push_str(&teammates_section(&b.teammates));
-    s.push_str(&subagents_section(b.agent_id));
-    cap(s)
+    required_tail.push_str(&teammates_section(&b.teammates));
+    required_tail.push_str(&subagents_section(b.agent_id));
+    cap(s, required_tail)
 }
 
 /// 統合担当への指示。
@@ -303,16 +362,17 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
     );
     s.push_str("\n## 実行する検証コマンド\n");
     s.push_str(&bullets(&command_labels(&b.task.validation_commands)));
-    s.push_str("\n## 禁止事項\n");
-    s.push_str(
+    let mut required_tail = String::new();
+    required_tail.push_str("\n## 禁止事項\n");
+    required_tail.push_str(
         "  - git push / PR 作成 / merge / deploy / release は**行わない**\n\
          \x20 - 本番環境・課金・credential に触れない\n",
     );
-    s.push_str("\n## 完了報告\n");
-    s.push_str(&result_format(b.task.id, b.agent_id, &b.outbox));
-    s.push_str(&teammates_section(&b.teammates));
-    s.push_str(&subagents_section(b.agent_id));
-    cap(s)
+    required_tail.push_str("\n## 完了報告\n");
+    required_tail.push_str(&result_format(b.task.id, b.agent_id, &b.outbox));
+    required_tail.push_str(&teammates_section(&b.teammates));
+    required_tail.push_str(&subagents_section(b.agent_id));
+    cap(s, required_tail)
 }
 
 /// 役割に応じた指示文を作る。
@@ -376,17 +436,17 @@ mod tests {
             );
             // **表に有る語だけを教える** (捏造した種別は `check_event` が断る)。
             for kind in ["sub_agent_started", "sub_agent_completed"] {
-                assert!(
-                    text.contains(kind),
-                    "{name}担当の指示文に {kind} が無い"
-                );
+                assert!(text.contains(kind), "{name}担当の指示文に {kind} が無い");
                 assert!(
                     super::super::result_parser::EVENT_KINDS.contains(&kind),
                     "{kind} は受け付けない語なのに教えている"
                 );
             }
             // 親は必ず自分 (`parent_id` を取り違えると木が繋がらない)。
-            assert!(text.contains("impl-1"), "{name}担当の指示文に自分の ID が無い");
+            assert!(
+                text.contains("impl-1"),
+                "{name}担当の指示文に自分の ID が無い"
+            );
         }
     }
 
@@ -506,8 +566,109 @@ mod tests {
         let mut t = task(1, "a", &[]);
         t.description = "あ".repeat(PROMPT_MAX_BYTES);
         let s = implementer(&brief(&g, &t));
-        assert!(s.len() <= PROMPT_MAX_BYTES + 64, "{}", s.len());
+        assert!(s.len() <= PROMPT_MAX_BYTES, "{}", s.len());
         assert!(s.contains("切り詰めました"));
+    }
+
+    /// Goal や description が長くても、先頭から完成品を切って契約を
+    /// 消してはいけない。全 role は `for_task` の三つの経路へ分類されるので、
+    /// `TeamRole::ALL` を通して完了・伝言・子エージェント報告を固定する。
+    #[test]
+    fn 長い可変本文でも全役割の必須契約は末尾に残る() {
+        let mut g = goal();
+        g.title = "長いゴール界".repeat(PROMPT_MAX_BYTES);
+        g.definition_of_done = vec!["長い完了条件界".repeat(PROMPT_MAX_BYTES)];
+
+        for role in TeamRole::ALL {
+            let mut target = task(1, "target", &[]);
+            target.title = "長いレビュー対象界".repeat(PROMPT_MAX_BYTES);
+            target.description = "長い対象説明界".repeat(PROMPT_MAX_BYTES);
+            target.acceptance_criteria = vec!["長い受入基準界".repeat(PROMPT_MAX_BYTES)];
+            target.last_summary = "長い実装報告界".repeat(PROMPT_MAX_BYTES);
+
+            let mut assigned = task(2, "assigned", &[]);
+            assigned.role = role;
+            assigned.review_of = Some(target.id);
+            assigned.title = "長い担当名界".repeat(PROMPT_MAX_BYTES);
+            assigned.description = "長い担当説明界".repeat(PROMPT_MAX_BYTES);
+            assigned.context = vec!["長い引き継ぎ界".repeat(PROMPT_MAX_BYTES)];
+
+            let all = vec![target, assigned.clone()];
+            let text = for_task(&brief(&g, &assigned), &all);
+            let name = role.key();
+
+            assert!(
+                text.len() <= PROMPT_MAX_BYTES,
+                "{name} の指示が上限を超えた: {} bytes",
+                text.len()
+            );
+            let notice = text
+                .find("切り詰めました")
+                .unwrap_or_else(|| panic!("{name} の長い可変本文が切り詰められていない"));
+            let completion = if super::super::roles::is_review_role(role) {
+                assert!(text.contains(super::super::reviewer::REVIEW_CLOSE));
+                text.find(super::super::reviewer::REVIEW_OPEN)
+            } else {
+                assert!(text.contains(super::super::result_parser::RESULT_CLOSE));
+                text.find(super::super::result_parser::RESULT_OPEN)
+            }
+            .unwrap_or_else(|| panic!("{name} の完了報告契約が消えた"));
+            let message = text
+                .find(super::super::result_parser::MSG_OPEN)
+                .unwrap_or_else(|| panic!("{name} の伝言契約が消えた"));
+            let event = text
+                .find(super::super::result_parser::EVENT_OPEN)
+                .unwrap_or_else(|| panic!("{name} のサブエージェント報告契約が消えた"));
+
+            assert!(text.contains(super::super::result_parser::MSG_CLOSE));
+            assert!(text.contains(super::super::result_parser::EVENT_CLOSE));
+            assert!(text.contains("sub_agent_started"));
+            assert!(text.contains("sub_agent_completed"));
+            assert!(
+                notice < completion && completion < message && message < event,
+                "{name} の必須契約が切詰め通知より後ろへ順番どおり残っていない"
+            );
+        }
+    }
+
+    /// 137 体を一度に見せても、可変の仲間一覧が必須契約を 8KB の外へ
+    /// 押し出さない。表示する ID は完全な行だけにし、MSG 自体は残す。
+    #[test]
+    fn 百三十七体の仲間がいても必須契約は上限内に残る() {
+        let g = goal();
+        let mut assigned = task(2, "assigned", &[]);
+        let target = task(1, "target", &[]);
+        let teammates: Vec<(String, String)> = (0..137)
+            .map(|i| (format!("agent-{i}"), "Implementer".to_string()))
+            .collect();
+
+        for role in TeamRole::ALL {
+            assigned.role = role;
+            assigned.review_of = Some(target.id);
+            let all = vec![target.clone(), assigned.clone()];
+            let mut b = brief(&g, &assigned);
+            b.teammates = teammates.clone();
+            let text = for_task(&b, &all);
+            let name = role.key();
+
+            assert!(
+                text.len() <= PROMPT_MAX_BYTES,
+                "{name} の137体プロンプトが上限を超えた: {} bytes",
+                text.len()
+            );
+            assert!(text.contains("仲間の一覧が長いため一部省略"));
+            assert!(text.contains(super::super::result_parser::MSG_OPEN));
+            assert!(text.contains(super::super::result_parser::MSG_CLOSE));
+            assert!(text.contains(super::super::result_parser::EVENT_OPEN));
+            assert!(text.contains(super::super::result_parser::EVENT_CLOSE));
+            if super::super::roles::is_review_role(role) {
+                assert!(text.contains(super::super::reviewer::REVIEW_OPEN));
+                assert!(text.contains(super::super::reviewer::REVIEW_CLOSE));
+            } else {
+                assert!(text.contains(super::super::result_parser::RESULT_OPEN));
+                assert!(text.contains(super::super::result_parser::RESULT_CLOSE));
+            }
+        }
     }
 
     #[test]

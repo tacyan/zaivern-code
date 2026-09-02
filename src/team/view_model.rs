@@ -12,6 +12,8 @@
 //! 固定する」に従い、レーン幅・折り返し・空状態の有無をここで決めて、
 //! `organization_board.rs` はその結果を描くだけにする。
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::graph::{self, Phase, PhaseStatus};
 use super::model::*;
 use super::runtime::TeamRuntime;
@@ -524,6 +526,308 @@ pub fn current_action(s: &TeamSnapshot) -> CurrentAction {
 
 // ── レイアウト (純関数) ──────────────────────────────────────────────
 
+/// 放射状組織図のローカル座標。左上が `(0, 0)`。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrganizationMapPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// 組織図上でのノードの役割。
+///
+/// `TeamLead` は中心の 1 体だけ。復元データに二重の
+/// TeamLead があっても、2 体目以降は `ManagedSession` として描く。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrganizationMapNodeKind {
+    TeamLead,
+    ManagedSession,
+    ReportedSubAgent,
+}
+
+/// 放射状組織図に描画する 1 エージェント。
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrganizationMapNode {
+    pub agent_id: AgentId,
+    pub team_id: TeamId,
+    pub parent_id: Option<AgentId>,
+    pub kind: OrganizationMapNodeKind,
+    pub center: OrganizationMapPoint,
+    /// 幅と高さの双方に対する描画安全半径。
+    pub radius: f32,
+}
+
+/// 組織図の親子関係。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrganizationMapEdge {
+    pub from: AgentId,
+    pub to: AgentId,
+}
+
+/// ローカルキャンバスに収まる放射状組織図。
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrganizationMapLayout {
+    pub width: f32,
+    pub height: f32,
+    pub nodes: Vec<OrganizationMapNode>,
+    pub edges: Vec<OrganizationMapEdge>,
+}
+
+fn finite_extent(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
+    }
+}
+
+fn organization_point(
+    width: f32,
+    height: f32,
+    radius: f32,
+    angle: f32,
+    ring: f32,
+) -> OrganizationMapPoint {
+    let center_x = width * 0.5;
+    let center_y = height * 0.5;
+    let orbit_x = (center_x - radius).max(0.0) * ring.clamp(0.0, 1.0);
+    let orbit_y = (center_y - radius).max(0.0) * ring.clamp(0.0, 1.0);
+    OrganizationMapPoint {
+        x: (center_x + angle.cos() * orbit_x).clamp(radius, width - radius),
+        y: (center_y + angle.sin() * orbit_y).clamp(radius, height - radius),
+    }
+}
+
+/// [`TeamSnapshot`] から放射状組織図を作る純関数。
+///
+/// - 中心: TeamLead
+/// - 内周: 各チームの ManagedSession
+/// - 外周: その親が報告した ReportedSubAgent
+///
+/// 並びは ID とチームだけで決めるため、作業状態が変わっても
+/// 座標が動かない。復元途中の孤児ノードも捨てず、中心の TeamLead
+/// に接続して描く。計算量はソートを含め `O(N log N)`。
+pub fn organization_map_layout(
+    snapshot: &TeamSnapshot,
+    available_width: f32,
+    available_height: f32,
+) -> OrganizationMapLayout {
+    let width = finite_extent(available_width);
+    let height = finite_extent(available_height);
+    if snapshot.agents.is_empty() {
+        return OrganizationMapLayout {
+            width,
+            height,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+    }
+
+    // 入力順と状態に依存しない安定順序。同一 ID は本来作られないが、
+    // 復元途中の破損データでも結果を決定的にするため安定キーを足す。
+    let mut ordered: Vec<usize> = (0..snapshot.agents.len()).collect();
+    ordered.sort_by(|&left, &right| {
+        let left = &snapshot.agents[left];
+        let right = &snapshot.agents[right];
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.team_id.cmp(&right.team_id))
+            .then_with(|| left.parent_id.cmp(&right.parent_id))
+            .then_with(|| left.role.cmp(&right.role))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let root = ordered
+        .iter()
+        .copied()
+        .find(|&index| {
+            let agent = &snapshot.agents[index];
+            agent.kind == AgentKind::ManagedSession && agent.role == TeamRole::TeamLead
+        })
+        .or_else(|| {
+            ordered
+                .iter()
+                .copied()
+                .find(|&index| snapshot.agents[index].kind == AgentKind::ManagedSession)
+        })
+        .unwrap_or(ordered[0]);
+
+    let min_side = width.min(height);
+    let population_scale = (snapshot.agents.len() as f32).sqrt().max(1.0);
+    let managed_radius = (min_side / (population_scale * 5.0 + 4.0))
+        .min(18.0)
+        .min(min_side * 0.5)
+        .max(0.0);
+    // 137 体が 1 親へ集中しても、子ノード同士が外周で潰れない大きさ。
+    // クリック領域は描画側が 24px を確保するため、小さくしても操作性は落ちない。
+    let reported_radius = (managed_radius * 0.55).max(2.5).min(managed_radius);
+    let root_radius = (managed_radius * 1.8).min(20.0).min(min_side * 0.5);
+    let mut centers = vec![None; snapshot.agents.len()];
+    centers[root] = Some(OrganizationMapPoint {
+        x: width * 0.5,
+        y: height * 0.5,
+    });
+
+    let mut managed_by_team: BTreeMap<TeamId, Vec<usize>> = BTreeMap::new();
+    let mut reported_by_team: BTreeMap<TeamId, Vec<usize>> = BTreeMap::new();
+    for &index in &ordered {
+        if index == root {
+            continue;
+        }
+        let agent = &snapshot.agents[index];
+        match agent.kind {
+            AgentKind::ManagedSession => managed_by_team
+                .entry(agent.team_id.clone())
+                .or_default()
+                .push(index),
+            AgentKind::ReportedSubAgent => {
+                reported_by_team
+                    .entry(agent.team_id.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+
+    let tau = std::f32::consts::TAU;
+    let team_ids: BTreeSet<TeamId> = managed_by_team
+        .keys()
+        .chain(reported_by_team.keys())
+        .cloned()
+        .collect();
+    let population: usize = team_ids
+        .iter()
+        .map(|team| {
+            managed_by_team.get(team).map_or(0, Vec::len)
+                + reported_by_team.get(team).map_or(0, Vec::len)
+        })
+        .sum();
+    let mut sector_start = -std::f32::consts::FRAC_PI_2;
+    if population > 0 {
+        for team in team_ids {
+            let parents = managed_by_team.get(&team).map(Vec::as_slice).unwrap_or(&[]);
+            let children = reported_by_team
+                .get(&team)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let team_population = parents.len() + children.len();
+            // 人口の多い部門へ広い弧を渡す。1 親に 136 体でも全周を使える。
+            let team_span = tau * team_population as f32 / population as f32;
+            let parent_cell = team_span / (parents.len() + 1) as f32;
+            for (parent_index, &index) in parents.iter().enumerate() {
+                let angle = sector_start + (parent_index + 1) as f32 * parent_cell;
+                centers[index] = Some(organization_point(
+                    width,
+                    height,
+                    managed_radius,
+                    angle,
+                    0.54,
+                ));
+            }
+            let child_cell = team_span / children.len().max(1) as f32;
+            for (child_index, &index) in children.iter().enumerate() {
+                let angle = sector_start + (child_index as f32 + 0.5) * child_cell;
+                centers[index] = Some(organization_point(
+                    width,
+                    height,
+                    reported_radius,
+                    angle,
+                    0.92,
+                ));
+            }
+            sector_start += team_span;
+        }
+    }
+
+    // parent_id が無い、または復元時に親が失われたサブエージェント。
+    // ここも agent の安定順序だけで決め、必ずキャンバス内へ戻す。
+    let leftovers: Vec<usize> = ordered
+        .iter()
+        .copied()
+        .filter(|&index| centers[index].is_none())
+        .collect();
+    for (position, index) in leftovers.iter().copied().enumerate() {
+        let angle =
+            -std::f32::consts::FRAC_PI_2 + tau * (position as f32 + 0.5) / leftovers.len() as f32;
+        centers[index] = Some(organization_point(
+            width,
+            height,
+            reported_radius,
+            angle,
+            0.92,
+        ));
+    }
+
+    let root_id = snapshot.agents[root].id.clone();
+    let managed_ids: BTreeSet<AgentId> = snapshot
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(index, agent)| *index != root && agent.kind == AgentKind::ManagedSession)
+        .map(|(_, agent)| agent.id.clone())
+        .collect();
+
+    let mut nodes: Vec<OrganizationMapNode> = ordered
+        .iter()
+        .copied()
+        .map(|index| {
+            let agent = &snapshot.agents[index];
+            OrganizationMapNode {
+                agent_id: agent.id.clone(),
+                team_id: agent.team_id.clone(),
+                parent_id: agent.parent_id.clone(),
+                kind: if index == root {
+                    OrganizationMapNodeKind::TeamLead
+                } else {
+                    match agent.kind {
+                        AgentKind::ManagedSession => OrganizationMapNodeKind::ManagedSession,
+                        AgentKind::ReportedSubAgent => OrganizationMapNodeKind::ReportedSubAgent,
+                    }
+                },
+                center: centers[index].expect("all organization nodes receive a position"),
+                radius: if index == root {
+                    root_radius
+                } else {
+                    match agent.kind {
+                        AgentKind::ManagedSession => managed_radius,
+                        AgentKind::ReportedSubAgent => reported_radius,
+                    }
+                },
+            }
+        })
+        .collect();
+    nodes.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+
+    let mut edges = Vec::with_capacity(snapshot.agents.len().saturating_sub(1));
+    for &index in &ordered {
+        if index == root {
+            continue;
+        }
+        let agent = &snapshot.agents[index];
+        let from = match (&agent.kind, &agent.parent_id) {
+            (AgentKind::ReportedSubAgent, Some(parent)) if managed_ids.contains(parent) => {
+                parent.clone()
+            }
+            _ => root_id.clone(),
+        };
+        edges.push(OrganizationMapEdge {
+            from,
+            to: agent.id.clone(),
+        });
+    }
+    edges.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| left.to.cmp(&right.to))
+    });
+
+    OrganizationMapLayout {
+        width,
+        height,
+        nodes,
+        edges,
+    }
+}
+
 /// レーンの並べ方。
 #[derive(Clone, Debug, PartialEq)]
 pub struct LaneLayout {
@@ -634,6 +938,236 @@ mod tests {
             blockers: Vec::new(),
             preview: String::new(),
         }
+    }
+
+    fn organization_agent(
+        id: &str,
+        team: &str,
+        role: TeamRole,
+        kind: AgentKind,
+        parent: Option<&str>,
+    ) -> TeamAgentView {
+        let mut view = agent(id, AgentWorkState::Working);
+        view.role = role;
+        view.team_id = TeamId::new(team);
+        view.parent_id = parent.map(AgentId::new);
+        view.kind = kind;
+        view.session_id = (kind == AgentKind::ManagedSession).then_some(1);
+        view.can_open_terminal = kind == AgentKind::ManagedSession;
+        view
+    }
+
+    fn organization_snapshot(total: usize) -> TeamSnapshot {
+        assert!(total >= 3);
+        let mut snapshot = snap();
+        snapshot.agents.push(organization_agent(
+            "lead",
+            "coordination",
+            TeamRole::TeamLead,
+            AgentKind::ManagedSession,
+            None,
+        ));
+
+        let managed_count = ((total - 1) / 3).max(1);
+        for index in 0..managed_count {
+            snapshot.agents.push(organization_agent(
+                &format!("managed-{index:03}"),
+                &format!("team-{:02}", index % 7),
+                TeamRole::Implementer,
+                AgentKind::ManagedSession,
+                Some("lead"),
+            ));
+        }
+        for index in 0..(total - managed_count - 1) {
+            let parent = format!("managed-{:03}", index % managed_count);
+            snapshot.agents.push(organization_agent(
+                &format!("reported-{index:03}"),
+                &format!("team-{:02}", (index % managed_count) % 7),
+                TeamRole::Implementer,
+                AgentKind::ReportedSubAgent,
+                Some(&parent),
+            ));
+        }
+        snapshot
+    }
+
+    fn assert_organization_inside(layout: &OrganizationMapLayout) {
+        assert!(layout.width.is_finite() && layout.width > 0.0);
+        assert!(layout.height.is_finite() && layout.height > 0.0);
+        for node in &layout.nodes {
+            assert!(node.center.x.is_finite(), "{}: x is NaN", node.agent_id.0);
+            assert!(node.center.y.is_finite(), "{}: y is NaN", node.agent_id.0);
+            assert!(
+                node.radius.is_finite(),
+                "{}: radius is NaN",
+                node.agent_id.0
+            );
+            assert!(node.radius >= 0.0);
+            assert!(node.center.x - node.radius >= -f32::EPSILON);
+            assert!(node.center.y - node.radius >= -f32::EPSILON);
+            assert!(node.center.x + node.radius <= layout.width + f32::EPSILON);
+            assert!(node.center.y + node.radius <= layout.height + f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn 放射状組織図は全agentと親子関係を1回ずつ返す() {
+        let mut snapshot = snap();
+        snapshot.agents = vec![
+            organization_agent(
+                "reported-b",
+                "frontend",
+                TeamRole::Tester,
+                AgentKind::ReportedSubAgent,
+                Some("managed-b"),
+            ),
+            organization_agent(
+                "managed-b",
+                "frontend",
+                TeamRole::Tester,
+                AgentKind::ManagedSession,
+                Some("lead"),
+            ),
+            organization_agent(
+                "lead",
+                "coordination",
+                TeamRole::TeamLead,
+                AgentKind::ManagedSession,
+                None,
+            ),
+            organization_agent(
+                "reported-a",
+                "backend",
+                TeamRole::Implementer,
+                AgentKind::ReportedSubAgent,
+                Some("managed-a"),
+            ),
+            organization_agent(
+                "managed-a",
+                "backend",
+                TeamRole::Implementer,
+                AgentKind::ManagedSession,
+                Some("lead"),
+            ),
+        ];
+
+        let layout = organization_map_layout(&snapshot, 900.0, 600.0);
+        assert_eq!(layout.nodes.len(), snapshot.agents.len());
+        let ids: BTreeSet<_> = layout.nodes.iter().map(|node| &node.agent_id).collect();
+        assert_eq!(ids.len(), snapshot.agents.len());
+        assert_eq!(layout.edges.len(), snapshot.agents.len() - 1);
+        assert!(layout.edges.contains(&OrganizationMapEdge {
+            from: AgentId::new("lead"),
+            to: AgentId::new("managed-a"),
+        }));
+        assert!(layout.edges.contains(&OrganizationMapEdge {
+            from: AgentId::new("lead"),
+            to: AgentId::new("managed-b"),
+        }));
+        assert!(layout.edges.contains(&OrganizationMapEdge {
+            from: AgentId::new("managed-a"),
+            to: AgentId::new("reported-a"),
+        }));
+        assert!(layout.edges.contains(&OrganizationMapEdge {
+            from: AgentId::new("managed-b"),
+            to: AgentId::new("reported-b"),
+        }));
+        let root = layout
+            .nodes
+            .iter()
+            .find(|node| node.kind == OrganizationMapNodeKind::TeamLead)
+            .unwrap();
+        assert_eq!(root.agent_id, AgentId::new("lead"));
+        assert_eq!(root.center, OrganizationMapPoint { x: 450.0, y: 300.0 });
+        assert_organization_inside(&layout);
+    }
+
+    #[test]
+    fn 放射状組織図の並びは状態と入力順で動かない() {
+        let snapshot = organization_snapshot(64);
+        let expected = organization_map_layout(&snapshot, 1280.0, 720.0);
+        let mut changed = snapshot.clone();
+        changed.agents.reverse();
+        for (index, agent) in changed.agents.iter_mut().enumerate() {
+            agent.state = if index % 2 == 0 {
+                AgentWorkState::Completed
+            } else {
+                AgentWorkState::Stalled
+            };
+            agent.current_action = format!("changed-{index}");
+        }
+        assert_eq!(organization_map_layout(&changed, 1280.0, 720.0), expected);
+    }
+
+    #[test]
+    fn 放射状組織図は64体と137体で範囲内に収まる() {
+        for total in [64, 137] {
+            let snapshot = organization_snapshot(total);
+            for (width, height) in [(360.0, 240.0), (1024.0, 768.0), (1920.0, 540.0)] {
+                let layout = organization_map_layout(&snapshot, width, height);
+                assert_eq!(layout.nodes.len(), total);
+                assert_eq!(layout.edges.len(), total - 1);
+                let ids: BTreeSet<_> = layout.nodes.iter().map(|node| &node.agent_id).collect();
+                assert_eq!(ids.len(), total);
+                assert_organization_inside(&layout);
+            }
+        }
+    }
+
+    #[test]
+    fn 一親に百三十五体集中しても子ノードは重ならない() {
+        let mut snapshot = snap();
+        snapshot.agents.push(organization_agent(
+            "lead",
+            "coordination",
+            TeamRole::TeamLead,
+            AgentKind::ManagedSession,
+            None,
+        ));
+        snapshot.agents.push(organization_agent(
+            "parent",
+            "dense",
+            TeamRole::Implementer,
+            AgentKind::ManagedSession,
+            Some("lead"),
+        ));
+        for index in 0..135 {
+            snapshot.agents.push(organization_agent(
+                &format!("child-{index:03}"),
+                "dense",
+                TeamRole::Implementer,
+                AgentKind::ReportedSubAgent,
+                Some("parent"),
+            ));
+        }
+        let layout = organization_map_layout(&snapshot, 680.0, 520.0);
+        let children: Vec<_> = layout
+            .nodes
+            .iter()
+            .filter(|n| n.kind == OrganizationMapNodeKind::ReportedSubAgent)
+            .collect();
+        assert_eq!(children.len(), 135);
+        for (index, left) in children.iter().enumerate() {
+            for right in &children[index + 1..] {
+                let dx = left.center.x - right.center.x;
+                let dy = left.center.y - right.center.y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                assert!(
+                    distance + f32::EPSILON >= left.radius + right.radius,
+                    "{} と {} が重なる: {distance}",
+                    left.agent_id,
+                    right.agent_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 放射状組織図は不正なキャンバス寸法でもnanを返さない() {
+        let snapshot = organization_snapshot(137);
+        let layout = organization_map_layout(&snapshot, f32::NAN, f32::INFINITY);
+        assert_eq!((layout.width, layout.height), (1.0, 1.0));
+        assert_organization_inside(&layout);
     }
 
     #[test]

@@ -100,14 +100,20 @@ pub enum BoardAction {
     /// エージェントを選ぶ (Inspector を開く)。
     Select(AgentId),
     /// タスクへ追加の指示を足す (Inspector の Edit Instruction)。
-    AddContext { task: TaskId, text: String },
+    AddContext {
+        task: TaskId,
+        text: String,
+    },
     /// 指示パネル (Inspector) を開く。**相手は開いてから選べる。**
     OpenInstruct,
     /// **選んだエージェントへ、その場で指示を送る。**
     ///
     /// `AddContext` は「次に配るときの文脈」を足すだけで、いま動いている
     /// 端末には 1 バイトも届かない。途中で口を出すにはこちらを使う。
-    InstructAgent { agent: AgentId, text: String },
+    InstructAgent {
+        agent: AgentId,
+        text: String,
+    },
     SelectTask(TaskId),
     /// 実際の端末を開く。**`ManagedSession` のときだけ**。
     OpenTerminal(SessionId),
@@ -392,11 +398,6 @@ pub struct TeamPanel {
     pending_manual: Vec<(RunOwner, String, (AgentId, SessionId, String))>,
     /// 別の Run のものとして捨てた Effect の数 (診断とテストが見る)。
     dropped_effects: usize,
-    /// **テスト専用**: 「実行中だから断る」を黙らせる。
-    ///
-    /// 断りの有無と**別に**、持ち主の照合が効くことを確かめるため。
-    #[cfg(test)]
-    bypass_busy: bool,
     /// 保存が要るか。
     needs_save: bool,
     workspace: PathBuf,
@@ -453,8 +454,6 @@ impl Default for TeamPanel {
             next_launch_poll: None,
             validation_jobs: Vec::new(),
             dropped_effects: 0,
-            #[cfg(test)]
-            bypass_busy: false,
         }
     }
 }
@@ -582,8 +581,15 @@ impl TeamPanel {
     }
 
     /// いまの Run にだけ効く締め具合 (Run が無ければ `None`)。
+    #[cfg(test)]
     pub fn run_guardrails(&self) -> Option<RunGuardrails> {
         self.rt().map(|rt| rt.run().guardrails.clone())
+    }
+
+    /// 指定した Run にだけ効く締め具合。
+    pub fn run_guardrails_for(&self, owner: &RunOwner) -> Option<RunGuardrails> {
+        let pos = self.run_pos_of_owner(owner)?;
+        Some(self.runs[pos].run().guardrails.clone())
     }
 
     // ── 仕様書への書き換え ───────────────────────────────────────────
@@ -724,10 +730,6 @@ impl TeamPanel {
 
     /// 面倒を見ているものがあるなら断る (理由をそのまま返す)。
     fn refuse_if_busy(&mut self) -> Result<(), String> {
-        #[cfg(test)]
-        if self.bypass_busy {
-            return Ok(());
-        }
         // **走っていても、上限までは並べてよい。**
         //
         // 以前はここで無条件に断っていたので、2 つの目標を同時に進める
@@ -742,17 +744,6 @@ impl TeamPanel {
         );
         self.notice = why.clone();
         Err(why)
-    }
-
-    /// **テスト専用**: 実行中でも Run を作り直せるようにする。
-    ///
-    /// 「前の Run の仕事が新しい Run で実行されない」ことは、**断りの有無と
-    /// 別に**成り立っていなければならない。断りを外しても持ち主の照合が
-    /// 効くことを確かめられるように、検査だけを黙らせる口を残す
-    /// (Runtime を建てるのは `plan_with` の 1 か所のまま)。
-    #[cfg(test)]
-    pub fn allow_replace_run_for_test(&mut self) {
-        self.bypass_busy = true;
     }
 
     /// 既定のプリセットで計画する (CLI 経由と、表題を SPEC から起こす場合)。
@@ -804,10 +795,9 @@ impl TeamPanel {
                 Ok(())
             }
             LoadOutcome::Empty => Err("保存された Team Run がありません".to_string()),
-            LoadOutcome::Corrupt { backed_up, reason } => Err(format!(
-                "{reason}\n退避しました: {}",
-                backed_up.join(", ")
-            )),
+            LoadOutcome::Corrupt { backed_up, reason } => {
+                Err(format!("{reason}\n退避しました: {}", backed_up.join(", ")))
+            }
             LoadOutcome::Newer { found } => Err(format!(
                 "保存された状態の版 ({found}) が新しすぎます。Zaivern を更新してください。"
             )),
@@ -846,7 +836,7 @@ impl TeamPanel {
         self.dirty = true;
     }
 
-/// 走査してよい時刻か。**毎フレームは走らせない。**
+    /// 走査してよい時刻か。**毎フレームは走らせない。**
     pub fn scan_due(&mut self, now: Instant) -> bool {
         match self.next_scan {
             Some(t) if now < t => false,
@@ -988,11 +978,28 @@ impl TeamPanel {
         }
         // **全部の Run を進める。** 画面に出していない Run も走っている。
         // 進めないと、そちらの担当は起動したまま何も配られない。
+        let active = self.active;
+        let mut active_snapshot_changed = false;
         let batches: Vec<(RunOwner, Vec<TeamEffect>)> = self
             .runs
             .iter_mut()
-            .map(|rt| (rt.owner(), rt.tick(&obs)))
+            .enumerate()
+            .map(|(index, rt)| {
+                let before = rt.snapshot_generation();
+                let owner = rt.owner();
+                let effects = rt.tick(&obs);
+                if index == active && rt.snapshot_generation() != before {
+                    active_snapshot_changed = true;
+                }
+                (owner, effects)
+            })
             .collect();
+        // 観測だけの tick は Effect を返さない。世代差を見ないと、端末の
+        // preview・状態・ReportedSubAgent が変わっても組織図が古いまま固まる。
+        // inactive Run は表示していないので、切替時の dirty に任せる。
+        if active_snapshot_changed {
+            self.dirty = true;
+        }
         for (owner, effects) in batches {
             self.absorb_for(owner, effects);
         }
@@ -1013,11 +1020,12 @@ impl TeamPanel {
         for e in effects {
             let key = e.key();
             match e {
-                TeamEffect::StartAgent(s) => {
-                    self.pending_launches.push((owner.clone(), key, s))
-                }
+                TeamEffect::StartAgent(s) => self.pending_launches.push((owner.clone(), key, s)),
                 TeamEffect::SendInstruction {
-                    task, session, text, ..
+                    task,
+                    session,
+                    text,
+                    ..
                 } => self
                     .pending_instructions
                     .push((owner.clone(), key, (task, session, text))),
@@ -1037,14 +1045,14 @@ impl TeamPanel {
                     // 判断は Runtime が保持していて、画面が Mission Panel で出す。
                     // ここで別の入れ物へ写すと第 2 の真実になる。
                     // **画面に出た時点で仕事は済んでいる**ので、そのまま成功を返す。
-                    self.ack_done(&key);
+                    self.ack_done(&owner, &key);
                 }
                 TeamEffect::CancelValidation {
                     execution, task, ..
                 } => {
                     // 相手が居なくても目的は果たされている (走っていない)。
                     let _ = (self.cancel_validation(&execution), task);
-                    self.ack_done(&key);
+                    self.ack_done(&owner, &key);
                 }
                 TeamEffect::PersistState => self.needs_save = true,
             }
@@ -1053,32 +1061,24 @@ impl TeamPanel {
     }
 
     /// Effect の実行が成功したと Runtime へ返す。
-    pub fn ack_done(&mut self, key: &str) {
-        if let Some(rt) = self.run_with_key_mut(key) {
-            rt.note_effect_done(key);
-        }
-        self.needs_save = true;
-        self.dirty = true;
-    }
-
-    /// **その Run の** Effect を成功として返す (位置が分かっているとき)。
+    /// **その Run の** Effect を成功として返す。
     ///
     /// 冪等キーは Run をまたいで重なりうる — `instr:<task>:<agent>:…` の
     /// タスク番号もエージェント名も Run ごとに 1 から数え直すので、同じ
     /// SPEC を 2 本走らせると**綴りまで一致する**。鍵だけで探す
-    /// [`TeamPanel::ack_done`] は先に見つけた Run を採るため、配達の結末の
-    /// ように**持ち主が分かっている**場面では位置で返す。
-    fn ack_done_in(&mut self, pos: usize, key: &str) {
-        if let Some(rt) = self.runs.get_mut(pos) {
+    pub fn ack_done(&mut self, owner: &RunOwner, key: &str) {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_effect_done(key);
         }
         self.needs_save = true;
         self.dirty = true;
     }
 
-    /// **その Run の** Effect を失敗として返す (位置が分かっているとき)。
-    fn ack_failed_in(&mut self, pos: usize, key: &str) {
-        if let Some(rt) = self.runs.get_mut(pos) {
+    /// **その Run の** Effect を失敗として返す。
+    pub fn ack_failed(&mut self, owner: &RunOwner, key: &str) {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_effect_failed(key);
         }
         self.needs_save = true;
@@ -1095,13 +1095,9 @@ impl TeamPanel {
     /// **出した Run へ返す。** 画面に出している Run へ返すと、2 本目の
     /// チームの指示が落ちたときに 1 本目の台帳へ書かれる (`note_delivery`
     /// と同じ理由)。
-    pub fn note_manual_failed(&mut self, key: &str, why: &str) {
-        let pos = self
-            .runs
-            .iter()
-            .position(|r| r.has_effect(key))
-            .unwrap_or(self.active);
-        if let Some(rt) = self.runs.get_mut(pos) {
+    pub fn note_manual_failed(&mut self, owner: &RunOwner, key: &str, why: &str) {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_manual_delivery(key, false, why);
         }
         self.needs_save = true;
@@ -1109,18 +1105,10 @@ impl TeamPanel {
     }
 
     /// **指示が方針で止められた**と Runtime へ返す (撃ち直さない)。
-    pub fn note_instruction_blocked(&mut self, task: TaskId, why: &str) {
-        if let Some(rt) = self.rt_mut() {
+    pub fn note_instruction_blocked(&mut self, owner: &RunOwner, task: TaskId, why: &str) {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_instruction_blocked(task, why);
-        }
-        self.needs_save = true;
-        self.dirty = true;
-    }
-
-    /// Effect の実行に失敗したと Runtime へ返す (次の tick で再発行される)。
-    pub fn ack_failed(&mut self, key: &str) {
-        if let Some(rt) = self.run_with_key_mut(key) {
-            rt.note_effect_failed(key);
         }
         self.needs_save = true;
         self.dirty = true;
@@ -1131,13 +1119,10 @@ impl TeamPanel {
         self.runs.get(self.active)
     }
 
-    /// **いまの Run で使うと決めたエージェント** (空なら「おまかせ」)。
-    ///
-    /// 真実の在り処は Run 側 (`RunDoc::agent_preset`)。設定を後から変えても、
-    /// 走っている Run の顔ぶれは変わらない。
-    pub fn pinned_agents(&self) -> Vec<String> {
-        self.rt()
-            .map(|rt| rt.run().agent_presets.clone())
+    /// 指定した Run で使うと決めたエージェント。
+    pub fn pinned_agents_for(&self, owner: &RunOwner) -> Vec<String> {
+        self.run_pos_of_owner(owner)
+            .map(|pos| self.runs[pos].run().agent_presets.clone())
             .unwrap_or_default()
     }
 
@@ -1251,22 +1236,15 @@ impl TeamPanel {
         Some(id)
     }
 
-    /// **その仕事を出した Run** を鍵から引く。
-    ///
-    /// 実行側から返る返事は鍵しか持っていない。「いまの Run」へ返すと、
-    /// 画面を切り替えただけで返事が**別の Run の記録**に付く。
-    fn run_with_key_mut(&mut self, key: &str) -> Option<&mut TeamRuntime> {
-        self.runs.iter_mut().find(|r| r.has_effect(key))
-    }
-
     /// いまの Run の持ち主。Run が無ければ `None`。
+    #[cfg(test)]
     pub fn owner(&self) -> Option<RunOwner> {
         self.rt().map(|rt| rt.owner())
     }
 
     /// **いまの Run のものだけを渡す。** 持ち主が違うものは捨てる
     /// (別の workspace / 別の Run で実行させない)。捨てた件数を数える。
-    fn mine<T>(&mut self, q: Vec<(RunOwner, String, T)>) -> Vec<(String, T)> {
+    fn mine<T>(&mut self, q: Vec<(RunOwner, String, T)>) -> Vec<(RunOwner, String, T)> {
         // **走っている Run のどれかのものなら実行する。**
         // 「いまの Run」だけで見ると、画面に出していない Run の仕事が
         // 全部捨てられる (2 本目のチームが 1 つも動かない)。
@@ -1275,7 +1253,9 @@ impl TeamPanel {
         let mut dropped = 0usize;
         for (owner, key, v) in q {
             if live.contains(&owner) {
-                out.push((key, v));
+                // **ここで owner を落とさない。** key は Run ごとに採番し直すので、
+                // 同じ SPEC の並列 Run では綴りが一致する。
+                out.push((owner, key, v));
             } else {
                 dropped += 1;
             }
@@ -1284,10 +1264,8 @@ impl TeamPanel {
             // **黙って捨てない。** 画面には「前の Run の仕事を実行しなかった」
             // ことが出る (何も起きないまま消えると、利用者は理由を追えない)。
             self.dropped_effects = self.dropped_effects.saturating_add(dropped);
-            self.notice = crate::i18n::trf(
-                "team.notice.dropped_effects",
-                &[("n", dropped.to_string())],
-            );
+            self.notice =
+                crate::i18n::trf("team.notice.dropped_effects", &[("n", dropped.to_string())]);
         }
         out
     }
@@ -1301,7 +1279,7 @@ impl TeamPanel {
     }
 
     /// 起動してほしいエージェント (冪等キー付き。取り出したら消える)。
-    pub fn take_launches(&mut self) -> Vec<(String, super::runtime::AgentLaunchSpec)> {
+    pub fn take_launches(&mut self) -> Vec<(RunOwner, String, super::runtime::AgentLaunchSpec)> {
         let q = std::mem::take(&mut self.pending_launches);
         self.mine(q)
     }
@@ -1309,32 +1287,34 @@ impl TeamPanel {
     ///
     /// **宛先のタスクも一緒に渡す。** 実行側がセッションから引き直すと、
     /// 間に 1 tick 入っただけで別のタスクを指す。
-    pub fn take_instructions(&mut self) -> Vec<(String, TaskId, SessionId, String)> {
+    pub fn take_instructions(&mut self) -> Vec<(RunOwner, String, TaskId, SessionId, String)> {
         let q = std::mem::take(&mut self.pending_instructions);
         self.mine(q)
             .into_iter()
-            .map(|(k, (task, s, t))| (k, task, s, t))
+            .map(|(owner, k, (task, s, t))| (owner, k, task, s, t))
             .collect()
     }
     /// **人が出した指示** (冪等キー付き。取り出したら消える)。
     ///
     /// 宛先はタスクではなく**エージェント**。タスクを持たない相手
     /// (Team Lead など) へも送れる。
-    pub fn take_manual_instructions(&mut self) -> Vec<(String, AgentId, SessionId, String)> {
+    pub fn take_manual_instructions(
+        &mut self,
+    ) -> Vec<(RunOwner, String, AgentId, SessionId, String)> {
         let q = std::mem::take(&mut self.pending_manual);
         self.mine(q)
             .into_iter()
-            .map(|(k, (a, s, t))| (k, a, s, t))
+            .map(|(owner, k, (a, s, t))| (owner, k, a, s, t))
             .collect()
     }
 
     /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
-    pub fn take_stops(&mut self) -> Vec<(String, SessionId)> {
+    pub fn take_stops(&mut self) -> Vec<(RunOwner, String, SessionId)> {
         let q = std::mem::take(&mut self.pending_stops);
         self.mine(q)
     }
     /// 走らせてほしい検証 (冪等キー付き。取り出したら消える)。
-    pub fn take_validations(&mut self) -> Vec<(String, super::runtime::ValidationSpec)> {
+    pub fn take_validations(&mut self) -> Vec<(RunOwner, String, super::runtime::ValidationSpec)> {
         let q = std::mem::take(&mut self.pending_validations);
         self.mine(q)
     }
@@ -1345,17 +1325,15 @@ impl TeamPanel {
     /// 覚えておかないと、次の起動で同じ logical agent を 2 体起こす。
     pub fn bind_session(
         &mut self,
+        owner: &RunOwner,
         agent: &AgentId,
         session: SessionId,
         identity: Option<String>,
     ) {
-        // **その担当を起こした Run へ結び付ける。** エージェント ID は
-        // Run ごとに同じ綴り (`agent-1`) を使うので、名前だけでは決まらない。
-        // 起動要求の鍵 (`start:<agent>`) を持っている Run が持ち主。
-        let key = format!("start:{}", agent.0);
-        if let Some(rt) = self.run_with_key_mut(&key) {
-            rt.bind_session(agent, session, identity);
-        } else if let Some(rt) = self.rt_mut() {
+        // **取り出した起動要求の owner へ結び付ける。** `agent-1` も
+        // `start:agent-1` も Run ごとに同じなので、名前や key から引き直さない。
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.bind_session(agent, session, identity);
         }
         self.dirty = true;
@@ -1401,10 +1379,12 @@ impl TeamPanel {
         }
         let task = self.instruction_task_of(key)?;
         if delivered {
-            self.ack_done_in(pos, key);
+            let owner = self.runs[pos].owner();
+            self.ack_done(&owner, key);
             return None;
         }
-        self.ack_failed_in(pos, key);
+        let owner = self.runs[pos].owner();
+        self.ack_failed(&owner, key);
         self.runs[pos].note_instruction_undelivered(task, key, "宛先の端末が応答しませんでした");
         self.needs_save = true;
         self.dirty = true;
@@ -1418,6 +1398,11 @@ impl TeamPanel {
         self.runs.iter().position(|r| r.run().run_id == run_id)
     }
 
+    /// 構造化された持ち主から Run の位置を引く。
+    fn run_pos_of_owner(&self, owner: &RunOwner) -> Option<usize> {
+        self.runs.iter().position(|r| r.owner() == *owner)
+    }
+
     /// 配達の結末を受け取るための目印 (`<run_id>|<冪等キー>`)。
     ///
     /// Run を添えるのは、積んだ仕事が Run の切り替えでは消えないから
@@ -1429,16 +1414,9 @@ impl TeamPanel {
     /// 仕事を渡すので、`owner()` で目印を作ると **2 本目の Run の配達に
     /// 1 本目の名札が付く**。名札が違えば結末は捨てられ、担当は `running`
     /// のまま残る (実機で 6 体中 2 体が 28 分放置された形)。
-    pub fn delivery_tag(&self, key: &str) -> Option<String> {
-        let run = self
-            .runs
-            .iter()
-            .find(|r| r.has_effect(key))
-            .map(|r| r.run().run_id.clone())
-            // 記録が見当たらない鍵 (Team の外から来たもの) は、従来どおり
-            // 画面の Run を名乗る。Run が 1 本しか無い通常の場合と同じ。
-            .or_else(|| self.owner().map(|o| o.run_id))?;
-        Some(format!("{run}|{key}"))
+    pub fn delivery_tag(&self, owner: &RunOwner, key: &str) -> Option<String> {
+        self.run_pos_of_owner(owner)?;
+        Some(format!("{}|{key}", owner.run_id))
     }
 
     /// 冪等キーからタスク番号を読む (`instr:<task>:<agent>:<attempt>:<seq>`)。
@@ -1458,15 +1436,16 @@ impl TeamPanel {
     /// (**第 2 のセッション台帳を作らない** — 真実は Runtime の
     /// エージェント一覧 1 か所)。
     pub fn bound_sessions(&self) -> HashSet<SessionId> {
-        self.rt()
-            .as_ref()
-            .map(|rt| rt.agents().iter().filter_map(|a| a.session_id).collect())
-            .unwrap_or_default()
+        self.runs
+            .iter()
+            .flat_map(|rt| rt.agents().iter().filter_map(|a| a.session_id))
+            .collect()
     }
 
     /// 起動に失敗した。
-    pub fn note_launch_failed(&mut self, agent: &AgentId, why: &str) {
-        if let Some(rt) = self.rt_mut() {
+    pub fn note_launch_failed(&mut self, owner: &RunOwner, agent: &AgentId, why: &str) {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_launch_failed(agent, why);
         }
         self.dirty = true;
@@ -1476,11 +1455,13 @@ impl TeamPanel {
     /// **実行 ID を添えて**実測を戻す (古い実行の結果を採らないため)。
     pub fn note_validation_for(
         &mut self,
+        owner: &RunOwner,
         execution: &str,
         task: TaskId,
         runs: Vec<ValidationRun>,
     ) {
-        if let Some(rt) = self.rt_mut() {
+        if let Some(pos) = self.run_pos_of_owner(owner) {
+            let rt = &mut self.runs[pos];
             rt.note_validation_for(execution, task, runs);
         }
         self.needs_save = true;
@@ -1615,7 +1596,8 @@ impl TeamPanel {
         }
         let now = super::model::now_secs();
         let mut still = Vec::new();
-        let mut done: Vec<(String, TaskId, Vec<ValidationRun>)> = Vec::new();
+        let live: Vec<RunOwner> = self.runs.iter().map(TeamRuntime::owner).collect();
+        let mut done: Vec<(RunOwner, String, TaskId, Vec<ValidationRun>)> = Vec::new();
         for job in std::mem::take(&mut self.validation_jobs) {
             // **最後の砦。** 実行器が自分で打ち切れず、切断も起きない
             // (worker がブロックしたまま) 経路をここで決着させる。
@@ -1628,23 +1610,23 @@ impl TeamPanel {
                 let runs = job
                     .commands
                     .iter()
-                    .map(|c| {
-                        ValidationRun::new(c, 124, super::model::ValidationOutcome::TimedOut)
-                    })
+                    .map(|c| ValidationRun::new(c, 124, super::model::ValidationOutcome::TimedOut))
                     .collect();
                 job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                done.push((job.execution.clone(), job.task, runs));
+                done.push((job.owner.clone(), job.execution.clone(), job.task, runs));
                 continue;
             }
-            // **別の Run のものは採らない。** 発行と同じ形で持ち主を見る。
-            if self.owner().as_ref() != Some(&job.owner) {
-                job.cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            // **閉じられた Run のものだけを止める。** 画面に出していないだけの
+            // 生きた Run は、そのまま走らせて持ち主へ結果を返す。
+            if !live.contains(&job.owner) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 self.dropped_effects = self.dropped_effects.saturating_add(1);
                 continue;
             }
             match job.rx.try_recv() {
-                Ok((execution, task, runs)) => done.push((execution, task, runs)),
+                Ok((execution, task, runs)) => {
+                    done.push((job.owner.clone(), execution, task, runs))
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => still.push(job),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     // 結果は来ない。**失敗として戻す** — 待ち続けない。
@@ -1659,13 +1641,14 @@ impl TeamPanel {
                             )
                         })
                         .collect();
-                    done.push((job.execution.clone(), job.task, runs));
+                    done.push((job.owner.clone(), job.execution.clone(), job.task, runs));
                 }
             }
         }
         self.validation_jobs = still;
-        for (execution, task, runs) in done {
-            if let Some(rt) = self.rt_mut() {
+        for (owner, execution, task, runs) in done {
+            if let Some(pos) = self.run_pos_of_owner(&owner) {
+                let rt = &mut self.runs[pos];
                 rt.note_validation_for(&execution, task, runs);
             }
             self.needs_save = true;
@@ -1765,7 +1748,8 @@ mod tests {
     fn panel_at(dir: &Path) -> TeamPanel {
         let mut p = TeamPanel::default();
         p.home = dir.join(".zaivern-test-home");
-        p.attach_workspace(dir).expect("新しい画面は必ず attach できる");
+        p.attach_workspace(dir)
+            .expect("新しい画面は必ず attach できる");
         p
     }
 
@@ -1847,7 +1831,7 @@ mod tests {
         let mut p = started_panel(&dir);
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "起動要求が出ていない");
-        for (_, spec) in &launches {
+        for (_, _, spec) in &launches {
             assert_eq!(
                 spec.workspace_root, p.workspace,
                 "起動要求が Run の workspace を運んでいない"
@@ -1869,7 +1853,9 @@ mod tests {
         // 起動要求が残っている = まだ面倒を見ている
         assert!(p.live_work().is_busy(), "実行中と見なされていない");
         let before = p.workspace.clone();
-        let err = p.attach_workspace(&b).expect_err("切り替えを許してしまった");
+        let err = p
+            .attach_workspace(&b)
+            .expect_err("切り替えを許してしまった");
         assert!(!err.trim().is_empty(), "断った理由が空");
         assert_eq!(p.workspace, before, "workspace が変わってしまった");
         assert!(p.has_run(), "Runtime を捨ててしまった");
@@ -1929,10 +1915,11 @@ mod tests {
         // 頼った守りなので、構造でも止める。
         let dir = ws("owner-validation");
         let mut p = started_panel(&dir);
+        let old_owner = p.owner().expect("Run がある");
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = super::super::launch::new_cancel_flag();
         p.watch_validation(ValidationJob {
-            owner: p.owner().expect("Run がある"),
+            owner: old_owner.clone(),
             task: 1,
             execution: "old".into(),
             commands: vec!["cargo test a".into()],
@@ -1942,8 +1929,7 @@ mod tests {
             pid: super::super::launch::new_pid_slot(),
             rx,
         });
-        // Run を作り直す (検査だけ黙らせる — 本番は `plan` が断る)。
-        p.allow_replace_run_for_test();
+        // 2 本目を作り、画面をそちらへ切り替える。
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         // 前の Run の worker が結果を返してくる。
         tx.send(("old".into(), 1, vec![ValidationRun::passed("cargo test a")]))
@@ -1951,18 +1937,24 @@ mod tests {
         p.collect_validations();
         assert_eq!(p.running_validations(), 0, "前の Run のジョブを抱えたまま");
         assert!(
-            cancel.load(std::sync::atomic::Ordering::Relaxed),
-            "手放すのに止めていない (プロセスが残る)"
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "生きている非active Runの正常完了をキャンセルした"
         );
-        let t = p
-            .rt()
-            .and_then(|rt| rt.task(1))
-            .expect("タスク")
-            .clone();
+        let t = p.rt().and_then(|rt| rt.task(1)).expect("タスク").clone();
         assert!(
             t.validation.runs.is_empty(),
             "別の Run の実測を採った: {:?}",
             t.validation.runs
+        );
+        let old = p
+            .runs
+            .iter()
+            .find(|rt| rt.owner() == old_owner)
+            .and_then(|rt| rt.task(1))
+            .expect("発行元Runのタスク");
+        assert!(
+            old.validation.runs.is_empty(),
+            "実行IDの違う結果を発行元Runへ採った"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2099,7 +2091,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut p = TeamPanel::default();
         let _ = p.attach_workspace(&dir);
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("計画");
         assert!(p.needs_git, "Git が無いのに気付いていない");
 
         // **押したら実測できるようになる。** (人が押したときだけ走る)
@@ -2111,8 +2104,7 @@ mod tests {
         );
         // コミットが 1 つ無いと `git status` に全部が未追跡で並び、
         // 基準点が「全部汚れている」になる。最初のコミットまで打つこと。
-        let base = super::super::changeset::capture_baseline(&dir)
-            .expect("基準点を取れる");
+        let base = super::super::changeset::capture_baseline(&dir).expect("基準点を取れる");
         assert!(base.usable(), "取れた基準点が使えない");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2164,7 +2156,8 @@ mod tests {
         let mut p = started_panel(&dir);
         let first = p.owner().expect("1 本目");
         let _ = p.take_launches();
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("2 本目");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("2 本目");
         let second = p.owner().expect("2 本目");
         assert_ne!(first.run_id, second.run_id);
         assert_eq!(p.run_tabs().len(), 2, "切り替えの見出しが 2 つ出ない");
@@ -2176,6 +2169,119 @@ mod tests {
         // 範囲外は無視する (押せない位置を作らない)。
         p.select_run(99);
         assert_eq!(p.active_run(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **同じ SPEC の Run は key も agent ID も同じになる。**
+    ///
+    /// 取り出したあと owner を落とすと、2 本目を先に処理しただけで 1 本目へ
+    /// ACK/bind される。実行順を意図的に逆にして、両方が独立することを見る。
+    #[test]
+    fn 同一spec二runの同じ起動keyをownerで分離する() {
+        let dir = ws("two-runs-same-key");
+        let mut p = started_panel(&dir);
+        let launches_a = p.take_launches();
+        assert!(!launches_a.is_empty(), "1 本目の起動要求が無い");
+
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("2 本目");
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 2,
+            sessions: Vec::new(),
+        });
+        let launches_b = p.take_launches();
+        assert!(!launches_b.is_empty(), "2 本目の起動要求が無い");
+
+        let (owner_a, key, spec_a) = launches_a[0].clone();
+        let (owner_b, _, spec_b) = launches_b
+            .into_iter()
+            .find(|(_, candidate, _)| candidate == &key)
+            .expect("同じ SPEC なら同じ起動 key が出る");
+        assert_ne!(owner_a, owner_b, "別 Run の owner が同じ");
+        assert_eq!(spec_a.agent_id, spec_b.agent_id, "前提: agent ID も同じ");
+
+        // 2 本目を先に処理する。key だけで先勝ちすると、ここで A が完了する。
+        p.bind_session(&owner_b, &spec_b.agent_id, 2202, None);
+        p.ack_done(&owner_b, &key);
+        let pos_a = p.run_pos_of_owner(&owner_a).expect("A");
+        let pos_b = p.run_pos_of_owner(&owner_b).expect("B");
+        assert!(p.runs[pos_b].effect_completed(&key), "B に ACK が入らない");
+        assert!(
+            !p.runs[pos_a].effect_completed(&key),
+            "同じ key の A を誤って ACK した"
+        );
+
+        p.bind_session(&owner_a, &spec_a.agent_id, 1101, None);
+        p.ack_done(&owner_a, &key);
+        let sid_a = p.runs[pos_a]
+            .agents()
+            .iter()
+            .find(|a| a.id == spec_a.agent_id)
+            .and_then(|a| a.session_id);
+        let sid_b = p.runs[pos_b]
+            .agents()
+            .iter()
+            .find(|a| a.id == spec_b.agent_id)
+            .and_then(|a| a.session_id);
+        assert_eq!(sid_a, Some(1101), "A の session が混線した");
+        assert_eq!(sid_b, Some(2202), "B の session が混線した");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 非activeは「閉じた」と同義ではない。結果は発行元 Run へ返す。
+    #[test]
+    fn 非active_runのvalidation結果を発行元へ返す() {
+        let dir = ws("validation-background-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("A");
+        let owner_a = p.owner().expect("A owner");
+        let pos_a = p.run_pos_of_owner(&owner_a).expect("A pos");
+        let execution = p.runs[pos_a].current_execution(1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = super::super::launch::new_cancel_flag();
+        p.watch_validation(ValidationJob {
+            owner: owner_a.clone(),
+            task: 1,
+            execution: execution.clone(),
+            commands: vec!["cargo test a".into()],
+            started_at: super::super::model::now_secs(),
+            timeout_secs: 600,
+            cancel: cancel.clone(),
+            pid: super::super::launch::new_pid_slot(),
+            rx,
+        });
+
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+        let owner_b = p.owner().expect("B owner");
+        let pos_b = p.run_pos_of_owner(&owner_b).expect("B pos");
+        assert_eq!(p.active_run(), pos_b, "前提: B が active ではない");
+        tx.send((execution, 1, vec![ValidationRun::passed("cargo test a")]))
+            .unwrap();
+        p.collect_validations();
+
+        assert_eq!(p.running_validations(), 0, "完了結果を抱えたまま");
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Relaxed),
+            "非activeというだけで生きた Run の検証を停止した"
+        );
+        assert!(
+            p.runs[pos_a].task(1).is_some_and(|t| t
+                .validation
+                .runs
+                .iter()
+                .any(|r| r.command == "cargo test a")),
+            "A に検証結果が返っていない"
+        );
+        assert!(
+            p.runs[pos_b]
+                .task(1)
+                .is_some_and(|t| t.validation.runs.is_empty()),
+            "activeなBへAの検証結果を誤帰属した"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2314,12 +2420,12 @@ mod tests {
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "起動要求が出ていない");
         // 冪等キーが必ず添えられている (返せないと ACK もできない)
-        for (key, _) in &launches {
+        for (_, key, _) in &launches {
             assert!(key.starts_with("start:"), "冪等キーが無い: {key}");
         }
         // 失敗を返せば、次の tick でもう一度出る
-        for (key, _) in &launches {
-            p.ack_failed(key);
+        for (owner, key, _) in &launches {
+            p.ack_failed(owner, key);
         }
         p.pump(super::super::runtime::Observation {
             now: 2,
@@ -2362,20 +2468,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
-        let exec = p
-            .rt()
-            .expect("runtime")
-            .current_execution(1);
+        let exec = p.rt().expect("runtime").current_execution(1);
         let tx = queue_job(&mut p, 1, &exec);
         assert_eq!(p.running_validations(), 1);
         drop(tx); // worker が panic した状況
         p.collect_validations();
         assert_eq!(p.running_validations(), 0, "受け口を抱えたまま");
-        let t = p
-            .rt()
-            .and_then(|rt| rt.task(1))
-            .expect("タスク")
-            .clone();
+        let t = p.rt().and_then(|rt| rt.task(1)).expect("タスク").clone();
         assert!(!t.validation.running, "実行中のまま残った");
         assert!(
             t.validation
@@ -2419,11 +2518,7 @@ mod tests {
             cancel.load(std::sync::atomic::Ordering::Relaxed),
             "見切ったのに停止の札を立てていない (プロセスが残る)"
         );
-        let t = p
-            .rt()
-            .and_then(|rt| rt.task(1))
-            .expect("タスク")
-            .clone();
+        let t = p.rt().and_then(|rt| rt.task(1)).expect("タスク").clone();
         assert!(!t.validation.running);
         assert!(
             t.validation
@@ -2475,7 +2570,11 @@ mod tests {
             p.save_if_needed();
         }
         let mut q = panel_at(&dir);
-        assert_eq!(q.restore, RestorePrompt::Found, "未完了 Run を検出していない");
+        assert_eq!(
+            q.restore,
+            RestorePrompt::Found,
+            "未完了 Run を検出していない"
+        );
         q.restore_run(false).unwrap();
         assert!(q.has_run());
         assert_eq!(q.restore, RestorePrompt::None);
@@ -2509,6 +2608,49 @@ mod tests {
         p.refresh_snapshot(102);
         assert_ne!(p.snapshot().unwrap().goal.status, a.goal.status);
         // 置き場もワークスペースの下なので、これ 1 行で全部片付く
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 観測だけの変化でもactive_runのスナップショットを更新する() {
+        let dir = ws("snapshot-observation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let owner = p.owner().expect("Run");
+        let agent = p.rt().unwrap().agents()[0].id.clone();
+        p.bind_session(&owner, &agent, 7, None);
+        p.refresh_snapshot(100);
+        assert!(!p.dirty);
+
+        let observation = super::super::runtime::Observation {
+            now: 101,
+            sessions: vec![super::super::runtime::SessionObs {
+                id: 7,
+                title: "worker".into(),
+                provider: "codex".into(),
+                state: crate::coordinator::SessionState::Working,
+                text: "HTML を実装中".into(),
+            }],
+        };
+        p.pump(observation.clone());
+        assert!(p.dirty, "Effect の無い観測変化でも dirty にする");
+        p.refresh_snapshot(101);
+        let view = p
+            .snapshot()
+            .unwrap()
+            .agents
+            .iter()
+            .find(|a| a.id == agent)
+            .expect("対象agent");
+        assert_eq!(view.provider, "codex");
+        assert!(view.preview.contains("HTML を実装中"));
+
+        p.pump(super::super::runtime::Observation {
+            now: 102,
+            ..observation
+        });
+        assert!(!p.dirty, "静止画で snapshot を作り直さない");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2572,8 +2714,8 @@ mod tests {
         let mut p = started_panel(&dir);
         let boot = p.take_launches();
         let mut sid: SessionId = 1;
-        for (_, spec) in &boot {
-            p.bind_session(&spec.agent_id, sid, None);
+        for (owner, _, spec) in &boot {
+            p.bind_session(owner, &spec.agent_id, sid, None);
             sid += 1;
         }
         let open = super::super::result_parser::RESULT_OPEN;
@@ -2624,8 +2766,8 @@ mod tests {
         let mut p = started_panel(&dir);
         let boot = p.take_launches();
         let mut sid: SessionId = 1;
-        for (_, spec) in &boot {
-            p.bind_session(&spec.agent_id, sid, None);
+        for (owner, _, spec) in &boot {
+            p.bind_session(owner, &spec.agent_id, sid, None);
             sid += 1;
         }
         // 完了報告を含む画面を**2 回**渡す。取り込みは 1 回だけ。
@@ -2713,7 +2855,8 @@ mod tests {
         std::fs::write(dir.join("src").join("a.rs"), "fn a() {}\n").unwrap();
         // **検証は「読むだけ」のものにする。** リポジトリのコードを走らせる
         // ものだと承認待ちで止まり、検証 Effect まで届かない。
-        let spec_body = "# 認証\n## 要件\n- A を作る (src/a.rs)\n## 検証\n- rustfmt --check src/a.rs\n";
+        let spec_body =
+            "# 認証\n## 要件\n- A を作る (src/a.rs)\n## 検証\n- rustfmt --check src/a.rs\n";
         let spec_path = dir.join("SPEC.md");
         std::fs::write(&spec_path, spec_body).unwrap();
         // **置き場は workspace の外**に置く。中に置くと自分の書いた記録が
@@ -2796,17 +2939,18 @@ mod tests {
         });
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "起動要求が 1 つも出ない");
+        let owner = launches[0].0.clone();
         let mut agents = Vec::new();
-        for (key, spec) in &launches {
+        for (launch_owner, key, spec) in &launches {
             assert_eq!(spec.workspace_root, dir, "起動先の workspace がずれた");
             agents.push(spec.agent_id.clone());
-            p.ack_done(key);
+            p.ack_done(launch_owner, key);
         }
 
         // ── 4) セッションを結び付ける → 担当が付く ────────────────────────
         let sessions: Vec<SessionId> = (0..agents.len() as SessionId).map(|i| 100 + i).collect();
         for (a, s) in agents.iter().zip(&sessions) {
-            p.bind_session(a, *s, None);
+            p.bind_session(&owner, a, *s, None);
         }
         let rows = |target: Option<SessionId>, text: &str| -> Vec<SessionInput> {
             sessions
@@ -2861,9 +3005,9 @@ mod tests {
         p.pump_sessions(rows(Some(sid), &report), now + 2);
         let validations = p.take_validations();
         assert!(!validations.is_empty(), "検証の要求が出ない");
-        assert_eq!(validations[0].1.cwd, dir, "検証の cwd がずれた");
+        assert_eq!(validations[0].2.cwd, dir, "検証の cwd がずれた");
         assert!(
-            !validations[0].1.commands.is_empty(),
+            !validations[0].2.commands.is_empty(),
             "空の検証を頼んでいる"
         );
 
@@ -2873,10 +3017,7 @@ mod tests {
         p.act(TeamAction::Resume);
         assert_eq!(p.goal_status(), Some(GoalStatus::Running), "戻らない");
         p.act(TeamAction::Stop);
-        assert!(
-            p.rt().expect("Runtime").run().stopped,
-            "停止が効かない"
-        );
+        assert!(p.rt().expect("Runtime").run().stopped, "停止が効かない");
 
         // ── 7) 保存して復元できる (パスの綴りごと往復する) ────────────────
         p.save_if_needed();
@@ -2885,7 +3026,11 @@ mod tests {
         let mut q = TeamPanel::default();
         q.home = home.clone();
         q.attach_workspace(&dir).expect("attach できる");
-        assert_eq!(q.restore, RestorePrompt::Found, "保存済み Run を見つけられない");
+        assert_eq!(
+            q.restore,
+            RestorePrompt::Found,
+            "保存済み Run を見つけられない"
+        );
         q.restore_run(false).expect("復元できる");
         assert!(q.has_run(), "復元しても Run が無い");
         assert_eq!(
@@ -2917,7 +3062,10 @@ mod tests {
         assert_eq!(p.form.approval_mode, "ask");
         assert_eq!(p.form.cost_limit, 0.0);
         p.seed_guardrails("agent", 25.0);
-        assert_eq!(p.form.approval_mode, "agent", "既存の承認モードを読んでいない");
+        assert_eq!(
+            p.form.approval_mode, "agent",
+            "既存の承認モードを読んでいない"
+        );
         assert_eq!(p.form.cost_limit, 25.0, "既存のコスト上限を読んでいない");
         // **開いている間は上書きしない** (人が選び直した値を戻さない)。
         p.form.open = true;
@@ -3025,7 +3173,10 @@ mod tests {
         let doc: super::super::persistence::RunDoc =
             serde_json::from_str(r#"{"version":4,"run_id":"r","workspace":"/w","spec_source":"s","agent_count":2,"max_attempts":3,"review_required":true,"paused":false,"stopped":false,"started_at":0,"updated_at":0}"#)
                 .expect("旧 Run が読めない");
-        assert_eq!(doc.guardrails, super::super::model::RunGuardrails::default());
+        assert_eq!(
+            doc.guardrails,
+            super::super::model::RunGuardrails::default()
+        );
     }
 
     /// **積めたことを「届いた」にしない。**
@@ -3048,10 +3199,10 @@ mod tests {
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "前提: 起動要求が出ている");
         let mut sessions: Vec<SessionId> = Vec::new();
-        for (i, (key, spec)) in launches.iter().enumerate() {
-            p.ack_done(key);
+        for (i, (owner, key, spec)) in launches.iter().enumerate() {
+            p.ack_done(owner, key);
             let sid = 700 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            p.bind_session(owner, &spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
             sessions.push(sid);
         }
         let rows = || -> Vec<SessionInput> {
@@ -3069,8 +3220,10 @@ mod tests {
         p.pump_sessions(rows(), 2);
         let sent = p.take_instructions();
         assert!(!sent.is_empty(), "前提: 指示が出ている");
-        let (key, task, _, _) = sent[0].clone();
-        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+        let (owner, key, task, _, _) = sent[0].clone();
+        let tag = p
+            .delivery_tag(&owner, &key)
+            .expect("Run があるので目印は作れる");
 
         // ── 届かなかった ────────────────────────────────────────────────
         let hit = p.note_delivery(&tag, false);
@@ -3095,20 +3248,22 @@ mod tests {
         p.pump_sessions(rows(), 3);
         let again = p.take_instructions();
         assert!(!again.is_empty(), "配り直しの指示が出ない");
-        let (key2, _, _, _) = again[0].clone();
-        let tag2 = p.delivery_tag(&key2).expect("目印");
+        let (owner2, key2, _, _, _) = again[0].clone();
+        let tag2 = p.delivery_tag(&owner2, &key2).expect("目印");
         assert_eq!(p.note_delivery(&tag2, true), None, "届いたのに理由を返した");
         assert!(
-            p.rt()
-                .expect("Runtime")
-                .effect_completed(&key2),
+            p.rt().expect("Runtime").effect_completed(&key2),
             "届いたのに完了として記録していない (もう一度送ってしまう)"
         );
         // **Team のものではない目印は何も起こさない。**
         assert_eq!(p.note_delivery("submit:someone-else", false), None);
         // **別の Run の配達は、いまの Run へ効かない。**
         let other = format!("run-other|{key2}");
-        assert_eq!(p.note_delivery(&other, false), None, "別の Run の配達を採った");
+        assert_eq!(
+            p.note_delivery(&other, false),
+            None,
+            "別の Run の配達を採った"
+        );
         assert!(
             p.rt().expect("Runtime").effect_completed(&key2),
             "別の Run の配達でいまの Run の記録を壊した"
@@ -3139,10 +3294,10 @@ mod tests {
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "前提: 起動要求が出ている");
         let mut sessions: Vec<SessionId> = Vec::new();
-        for (i, (key, spec)) in launches.iter().enumerate() {
-            p.ack_done(key);
+        for (i, (owner, key, spec)) in launches.iter().enumerate() {
+            p.ack_done(owner, key);
             let sid = 900 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            p.bind_session(owner, &spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
             sessions.push(sid);
         }
         let rows: Vec<SessionInput> = sessions
@@ -3158,11 +3313,13 @@ mod tests {
         p.pump_sessions(rows, 2);
         let sent = p.take_instructions();
         assert!(!sent.is_empty(), "前提: 指示が出ている");
-        let (key, task, _, _) = sent[0].clone();
+        let (owner, key, task, _, _) = sent[0].clone();
 
         // **名札は「出した Run」のもの。**
         let run_a = p.runs[0].run().run_id.clone();
-        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+        let tag = p
+            .delivery_tag(&owner, &key)
+            .expect("Run があるので目印は作れる");
         assert_eq!(
             tag,
             format!("{run_a}|{key}"),
@@ -3245,10 +3402,10 @@ mod tests {
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "前提: 起動要求が出ている");
         let mut sessions: Vec<SessionId> = Vec::new();
-        for (i, (key, spec)) in launches.iter().enumerate() {
-            p.ack_done(key);
+        for (i, (owner, key, spec)) in launches.iter().enumerate() {
+            p.ack_done(owner, key);
             let sid = 1100 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            p.bind_session(owner, &spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
             sessions.push(sid);
         }
         let rows: Vec<SessionInput> = sessions
@@ -3264,7 +3421,7 @@ mod tests {
         p.pump_sessions(rows, 2);
         let sent = p.take_instructions();
         assert!(!sent.is_empty(), "前提: 指示が出ている");
-        let (key, _, _, _) = sent[0].clone();
+        let (_owner, key, _, _, _) = sent[0].clone();
 
         // ── 2 本目の Run が、**同じ綴りの鍵**を発行済みに持つ ────────────
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
@@ -3313,10 +3470,10 @@ mod tests {
         // 前のアプリのセッションへ結び付かない」の検査が空回りする
         // (結び付いていないものは、外れていて当たり前)。
         let mut sessions: Vec<SessionId> = Vec::new();
-        for (i, (key, spec)) in launches.iter().enumerate() {
-            p.ack_done(key);
+        for (i, (owner, key, spec)) in launches.iter().enumerate() {
+            p.ack_done(owner, key);
             let sid = 900 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid, None);
+            p.bind_session(owner, &spec.agent_id, sid, None);
             sessions.push(sid);
         }
         // **観測にも同じセッションを出す。** 出さないと「消えた」と見なされ、
@@ -3383,7 +3540,8 @@ mod tests {
         // ── 引き継ぎ後: 同じ workspace を開き直しても、入り直しになる ────
         // `workspace` を空へ戻していないと「同じだから何もしない」で
         // 早々に返り、保存済み Run の案内すら出ない。
-        p.attach_workspace(&a).expect("新しいアプリは attach できる");
+        p.attach_workspace(&a)
+            .expect("新しいアプリは attach できる");
         assert!(!p.has_run(), "attach しただけで前の Run が復活した");
         assert_eq!(
             p.restore,
@@ -3416,7 +3574,10 @@ mod tests {
             p.take_launches().is_empty(),
             "前のアプリの起動要求が残っている"
         );
-        assert!(p.take_validations().is_empty(), "前のアプリの検証が残っている");
+        assert!(
+            p.take_validations().is_empty(),
+            "前のアプリの検証が残っている"
+        );
 
         // ── 普通の起動 (何も残っていない) では 1 命令も走らない ──────────
         let mut fresh = TeamPanel::default();
@@ -3456,10 +3617,10 @@ mod tests {
         let launches = p.take_launches();
         assert!(!launches.is_empty(), "前提: 起動要求が出ている");
         let mut first: Option<(AgentId, SessionId)> = None;
-        for (i, (key, spec)) in launches.iter().enumerate() {
-            p.ack_done(key);
+        for (i, (owner, key, spec)) in launches.iter().enumerate() {
+            p.ack_done(owner, key);
             let sid = 800 + i as SessionId;
-            p.bind_session(&spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
+            p.bind_session(owner, &spec.agent_id, sid, Some(format!("/logs/{sid}.log")));
             if first.is_none() {
                 first = Some((spec.agent_id.clone(), sid));
             }
@@ -3473,7 +3634,7 @@ mod tests {
         });
         let sent = p.take_manual_instructions();
         assert_eq!(sent.len(), 1, "人の指示が口まで出ていない: {sent:?}");
-        let (key, to, session, text) = sent[0].clone();
+        let (owner, key, to, session, text) = sent[0].clone();
         assert_eq!(to, agent, "宛先が違う");
         assert_eq!(session, sid, "端末が違う");
         assert_eq!(text, "先にテストを書いて");
@@ -3484,7 +3645,9 @@ mod tests {
             "人の指示が Runtime 側の口へ紛れた"
         );
 
-        let tag = p.delivery_tag(&key).expect("Run があるので目印は作れる");
+        let tag = p
+            .delivery_tag(&owner, &key)
+            .expect("Run があるので目印は作れる");
 
         // ── 届かなかった ────────────────────────────────────────────────
         assert_eq!(
@@ -3504,7 +3667,7 @@ mod tests {
             text: "もう 1 つ".into(),
         });
         let sent = p.take_manual_instructions();
-        let tag = p.delivery_tag(&sent[0].0).expect("目印");
+        let tag = p.delivery_tag(&sent[0].0, &sent[0].1).expect("目印");
         assert_eq!(p.note_delivery(&tag, true), None);
         assert!(p.notice.trim().is_empty(), "届いたのに苦情を出している");
 

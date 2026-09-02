@@ -59,6 +59,10 @@ pub const CONTEXT_CAP: usize = 32;
 pub const CONTEXT_ITEM_MAX: usize = 500;
 /// PTY へ注入する本文の最大文字数。
 pub const INJECT_BODY_MAX: usize = 600;
+/// submit キュー自体へ積めなかったときの再試行間隔。
+pub const DELIVERY_QUEUE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+/// submit キュー拒否の再試行上限。上限後は人へ返す。
+pub const DELIVERY_QUEUE_RETRY_MAX: u8 = 4;
 /// 追跡するペア数の上限(これを超えたら空の窓を掃除する)。
 const PAIR_TRACK_CAP: usize = 256;
 
@@ -384,12 +388,58 @@ impl Mailbox {
         evicted
     }
 
+    /// ACK 待ちの先頭だけは保護して積む。
+    ///
+    /// 通常は古い未配達メッセージを押し出す。`cap == 1` で先頭が
+    /// 予約中のときだけ、ACK まで最大 `cap + 1` 件を保持する。
+    /// その後の投函は予約中でない最古の 1 件と入れ替えるので、
+    /// メモリは常に有界である。
+    fn push_preserving_front(
+        &mut self,
+        msg: AgentMessage,
+        protected_msg_id: Option<u64>,
+    ) -> Option<AgentMessage> {
+        let front_is_protected = self
+            .front()
+            .is_some_and(|front| Some(front.id) == protected_msg_id);
+        if !front_is_protected || self.queue.len() < self.cap {
+            return self.push(msg);
+        }
+
+        let evicted = if self.queue.len() >= 2 {
+            self.dropped_oldest = self.dropped_oldest.saturating_add(1);
+            self.queue.remove(1)
+        } else {
+            // cap == 1: 予約中の 1 件を消すより、1 件だけ一時的に増やす。
+            None
+        };
+        self.queue.push_back(msg);
+        evicted
+    }
+
     fn pop(&mut self) -> Option<AgentMessage> {
         let m = self.queue.pop_front();
         if m.is_some() {
             self.delivered = self.delivered.saturating_add(1);
         }
         m
+    }
+
+    fn front(&self) -> Option<&AgentMessage> {
+        self.queue.front()
+    }
+
+    /// 予約した先頭メッセージを、ID が一致するときだけ完了する。
+    /// 成功 ACK のときだけ配達済み累計を増やす。
+    fn finish(&mut self, msg_id: u64, delivered: bool) -> bool {
+        if self.front().is_none_or(|m| m.id != msg_id) {
+            return false;
+        }
+        self.queue.pop_front();
+        if delivered {
+            self.delivered = self.delivered.saturating_add(1);
+        }
+        true
     }
 
     /// 溜まっている本数。
@@ -424,7 +474,7 @@ impl Mailbox {
 pub struct Delivery {
     pub session: SessionId,
     pub msg_id: u64,
-    /// PTY へそのまま書き込む文字列(末尾に確定用の CR を含む)。
+    /// 共通の submit キューへ渡す本文。確定キーは含まない。
     pub text: String,
 }
 
@@ -477,8 +527,15 @@ fn endpoint_label(e: Endpoint) -> String {
 /// 先頭に [`INJECT_PREFIX`] を置くので、端末を見ている人間には
 /// 「機械が入れた行」だと分かる。末尾の `\r` で 1 ターンとして確定させる。
 pub fn format_injection(msg: &AgentMessage) -> String {
+    let mut text = format_injection_body(msg);
+    text.push('\r');
+    text
+}
+
+/// 共通の submit キューへ渡す、確定キーを含まない注入本文。
+fn format_injection_body(msg: &AgentMessage) -> String {
     format!(
-        "{} #{} {}から({}): {}\r",
+        "{} #{} {}から({}): {}",
         INJECT_PREFIX,
         msg.id,
         endpoint_label(msg.from),
@@ -1051,6 +1108,12 @@ pub struct Coordinator {
 
     /// セッションごとの受信箱。ここに存在する = 登録済みセッション。
     mailboxes: HashMap<SessionId, Mailbox>,
+    /// submit キューへ予約済みの (宛先, メッセージID)。ACK 前には消さない。
+    deliveries_in_flight: HashMap<SessionId, u64>,
+    /// submit キュー自体へ積めなかったときの再試行時刻。毎フレーム連打を防ぐ。
+    delivery_retry_after: HashMap<SessionId, Instant>,
+    /// submit キュー拒否回数。同じ先頭 ID にだけ引き継ぐ。
+    delivery_retry_attempts: HashMap<SessionId, (u64, u8)>,
     supervisor_inbox: Mailbox,
     user_inbox: Mailbox,
 
@@ -1089,6 +1152,9 @@ impl Coordinator {
             next_msg_id: 1,
             next_task_id: 1,
             mailboxes: HashMap::new(),
+            deliveries_in_flight: HashMap::new(),
+            delivery_retry_after: HashMap::new(),
+            delivery_retry_attempts: HashMap::new(),
             supervisor_inbox: Mailbox::new(limits.mailbox_cap),
             user_inbox: Mailbox::new(limits.mailbox_cap),
             drop_log: VecDeque::new(),
@@ -1122,6 +1188,9 @@ impl Coordinator {
     /// 事前に [`Coordinator::mailbox`] で中身を UI へ出しておくとよい。
     pub fn unregister_session(&mut self, id: SessionId) {
         self.mailboxes.remove(&id);
+        self.deliveries_in_flight.remove(&id);
+        self.delivery_retry_after.remove(&id);
+        self.delivery_retry_attempts.remove(&id);
     }
 
     /// 登録済みセッションの受信箱。
@@ -1274,7 +1343,11 @@ impl Coordinator {
                     }
                     let mut copy = msg.clone();
                     copy.to = Endpoint::Session(id);
-                    let evicted = self.mailboxes.get_mut(&id).and_then(|mb| mb.push(copy));
+                    let protected = self.deliveries_in_flight.get(&id).copied();
+                    let evicted = self
+                        .mailboxes
+                        .get_mut(&id)
+                        .and_then(|mb| mb.push_preserving_front(copy, protected));
                     if let Some(old) = evicted {
                         self.record_drop(&old, DropReason::MailboxOverflow);
                     }
@@ -1297,7 +1370,11 @@ impl Coordinator {
                 let mid = msg.id;
                 self.global_window.push(now);
                 self.note_pair(&msg, now);
-                let evicted = self.mailboxes.get_mut(&id).and_then(|mb| mb.push(msg));
+                let protected = self.deliveries_in_flight.get(&id).copied();
+                let evicted = self
+                    .mailboxes
+                    .get_mut(&id)
+                    .and_then(|mb| mb.push_preserving_front(msg, protected));
                 if let Some(old) = evicted {
                     self.record_drop(&old, DropReason::MailboxOverflow);
                 }
@@ -1397,7 +1474,7 @@ impl Coordinator {
 
     // ── 配達 ────────────────────────────────────────────────────────
 
-    /// 注入して安全なセッションへ、**1 セッションにつき 1 通だけ**配達する。
+    /// 注入して安全なセッションへ、**1 セッションにつき 1 通だけ**予約する。
     ///
     /// 1 通ずつにするのは、プロンプトへ連続で流し込んで入力を壊さないため。
     /// 続きは次のフレームで配られる。
@@ -1405,23 +1482,121 @@ impl Coordinator {
     /// `states` は呼び出し側が毎フレーム組み立てる (セッション ID, 状態) の一覧。
     /// ここに載っていないセッションへは配達しない(状態不明 = 配達しない)。
     pub fn take_deliverable(&mut self, states: &[(SessionId, SessionState)]) -> Vec<Delivery> {
+        self.take_deliverable_at(states, Instant::now())
+    }
+
+    fn take_deliverable_at(
+        &mut self,
+        states: &[(SessionId, SessionState)],
+        now: Instant,
+    ) -> Vec<Delivery> {
         let mut out = Vec::new();
         for &(id, st) in states {
             if !deliverable(st) {
                 continue;
             }
-            let Some(mb) = self.mailboxes.get_mut(&id) else {
+            if self.deliveries_in_flight.contains_key(&id)
+                || self
+                    .delivery_retry_after
+                    .get(&id)
+                    .is_some_and(|at| *at > now)
+            {
+                continue;
+            }
+            let Some(msg) = self.mailboxes.get(&id).and_then(Mailbox::front) else {
                 continue;
             };
-            if let Some(msg) = mb.pop() {
-                out.push(Delivery {
-                    session: id,
-                    msg_id: msg.id,
-                    text: format_injection(&msg),
-                });
-            }
+            let msg_id = msg.id;
+            let text = format_injection_body(msg);
+            self.deliveries_in_flight.insert(id, msg_id);
+            out.push(Delivery {
+                session: id,
+                msg_id,
+                text,
+            });
         }
         out
+    }
+
+    /// submit キューへ積めなかった予約を戻す。
+    ///
+    /// 上限までは受信箱の本文を保持し、バックオフ後に再試行する。
+    /// 上限に達したら未配達のまま受信箱から外し、ユーザーへ 1 回だけ
+    /// エスカレーションする。戻り値は「最終失敗になったか」。
+    pub fn defer_delivery(&mut self, session: SessionId, msg_id: u64, now: Instant) -> bool {
+        if self.deliveries_in_flight.get(&session) != Some(&msg_id) {
+            return false;
+        }
+        self.deliveries_in_flight.remove(&session);
+
+        let attempts = self
+            .delivery_retry_attempts
+            .entry(session)
+            .and_modify(|state| {
+                if state.0 == msg_id {
+                    state.1 = state.1.saturating_add(1);
+                } else {
+                    *state = (msg_id, 1);
+                }
+            })
+            .or_insert((msg_id, 1))
+            .1;
+        if attempts < DELIVERY_QUEUE_RETRY_MAX {
+            self.delivery_retry_after
+                .insert(session, now + DELIVERY_QUEUE_RETRY_BACKOFF);
+            return false;
+        }
+
+        self.delivery_retry_after.remove(&session);
+        self.delivery_retry_attempts.remove(&session);
+        let discarded = self
+            .mailboxes
+            .get_mut(&session)
+            .is_some_and(|mb| mb.finish(msg_id, false));
+        if discarded {
+            self.escalate(
+                format!(
+                    "session:{session} への調停メッセージ #{msg_id} を submit キューへ {DELIVERY_QUEUE_RETRY_MAX} 回積めませんでした。コスト上限とセッション状態を確認してください。"
+                ),
+                now,
+            );
+        }
+        discarded
+    }
+
+    /// submit の最終結果を確定する。成功時だけ配達済みに数える。
+    ///
+    /// 失敗は submit 側が再送と入力欄検証を上限まで行った後にしか来ない。
+    /// そこで同じ指示を無限再投入せず、受信箱から外して人へ明示する。
+    pub fn finish_delivery(
+        &mut self,
+        session: SessionId,
+        msg_id: u64,
+        delivered: bool,
+        now: Instant,
+    ) -> bool {
+        if self.deliveries_in_flight.get(&session) != Some(&msg_id) {
+            return false;
+        }
+        self.deliveries_in_flight.remove(&session);
+        self.delivery_retry_after.remove(&session);
+        self.delivery_retry_attempts.remove(&session);
+        let confirmed = self
+            .mailboxes
+            .get_mut(&session)
+            .is_some_and(|mb| mb.finish(msg_id, delivered));
+        if delivered {
+            return confirmed;
+        }
+        if confirmed {
+            self.escalate(
+                format!(
+                    "session:{session} への調停メッセージ #{msg_id} を配達できませんでした。入力状態を確認してください。"
+                ),
+                now,
+            );
+        }
+        false
     }
 
     // ── タスク ──────────────────────────────────────────────────────
@@ -2437,7 +2612,7 @@ mod tests {
         assert_eq!(c.mailbox(2).unwrap().len(), 1);
     }
 
-    /// 待機中なら配達される。注入行には目印が付く。
+    /// 待機中なら予約され、ACK 後にだけ受信箱から消える。
     #[test]
     fn delivers_when_idle() {
         let mut c = Coordinator::new();
@@ -2452,10 +2627,37 @@ mod tests {
             out[0].text.starts_with(INJECT_PREFIX),
             "機械注入の目印が要る"
         );
-        assert!(out[0].text.ends_with('\r'), "1 ターンとして確定させる");
+        assert!(!out[0].text.ends_with('\r'), "確定キーは submit が別送する");
         assert!(out[0].text.contains("session:1"));
+        assert_eq!(c.mailbox(2).unwrap().len(), 1, "ACK 前には消さない");
+        assert_eq!(c.mailbox(2).unwrap().delivered(), 0);
+        assert!(
+            c.take_deliverable(&[(2, SessionState::Idle)]).is_empty(),
+            "同じ予約を二重送信しない"
+        );
+        assert!(c.finish_delivery(2, out[0].msg_id, true, t0()));
         assert_eq!(c.mailbox(2).unwrap().len(), 0);
         assert_eq!(c.mailbox(2).unwrap().delivered(), 1);
+    }
+
+    /// 予約 ID と違う ACK では受信箱を減らさない。
+    #[test]
+    fn mismatched_ack_never_pops_reserved_message() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        c.register_session(2);
+        c.enqueue(msg(1, 2, t0()));
+
+        let out = c.take_deliverable(&[(2, SessionState::Idle)]);
+        let msg_id = out[0].msg_id;
+        assert!(!c.finish_delivery(2, msg_id + 1, true, t0()));
+        assert_eq!(c.mailbox(2).unwrap().len(), 1);
+        assert_eq!(c.mailbox(2).unwrap().delivered(), 0);
+        assert!(
+            c.take_deliverable(&[(2, SessionState::Idle)]).is_empty(),
+            "正しい ACK まで同じ本文を二重予約しない"
+        );
+        assert!(c.finish_delivery(2, msg_id, true, t0()));
     }
 
     /// 1 フレームで 1 セッションにつき 1 通だけ配る(連打で入力を壊さない)。
@@ -2470,7 +2672,100 @@ mod tests {
 
         let out = c.take_deliverable(&[(2, SessionState::Idle)]);
         assert_eq!(out.len(), 1);
+        assert_eq!(c.mailbox(2).unwrap().len(), 2, "予約だけでは減らない");
+        assert!(c.finish_delivery(2, out[0].msg_id, true, t0()));
         assert_eq!(c.mailbox(2).unwrap().len(), 1);
+        assert_eq!(
+            c.take_deliverable(&[(2, SessionState::Idle)]).len(),
+            1,
+            "ACK 後に次の 1 通を予約できる"
+        );
+    }
+
+    /// submit が失敗した場合は無限再投入せず、人へ理由を返す。
+    #[test]
+    fn failed_delivery_is_escalated_once() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        c.register_session(2);
+        c.enqueue(msg(1, 2, t0()));
+
+        let out = c.take_deliverable(&[(2, SessionState::Idle)]);
+        assert_eq!(out.len(), 1);
+        assert!(!c.finish_delivery(2, out[0].msg_id, false, t0()));
+        assert!(c.mailbox(2).unwrap().is_empty());
+        assert_eq!(
+            c.mailbox(2).unwrap().delivered(),
+            0,
+            "失敗は配達数に入れない"
+        );
+        let notices = c.take_user_messages();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("配達できませんでした"));
+        assert!(c.take_deliverable(&[(2, SessionState::Idle)]).is_empty());
+    }
+
+    /// submit キュー拒否は連打せず、有界再試行の後に人へ返す。
+    #[test]
+    fn queue_rejection_backs_off_then_escalates_once() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        c.register_session(2);
+        let mut now = t0();
+        c.enqueue(msg(1, 2, now));
+
+        for attempt in 1..=DELIVERY_QUEUE_RETRY_MAX {
+            let out = c.take_deliverable_at(&[(2, SessionState::Idle)], now);
+            assert_eq!(out.len(), 1, "{attempt} 回目を予約できない");
+            let abandoned = c.defer_delivery(2, out[0].msg_id, now);
+            assert_eq!(abandoned, attempt == DELIVERY_QUEUE_RETRY_MAX);
+
+            if attempt < DELIVERY_QUEUE_RETRY_MAX {
+                assert_eq!(c.mailbox(2).unwrap().len(), 1, "再試行前は本文を保持");
+                assert!(
+                    c.take_deliverable_at(
+                        &[(2, SessionState::Idle)],
+                        now + DELIVERY_QUEUE_RETRY_BACKOFF - Duration::from_millis(1),
+                    )
+                    .is_empty(),
+                    "バックオフ中は予約しない"
+                );
+                now += DELIVERY_QUEUE_RETRY_BACKOFF;
+            }
+        }
+
+        assert!(c.mailbox(2).unwrap().is_empty());
+        assert_eq!(c.mailbox(2).unwrap().delivered(), 0);
+        let notices = c.take_user_messages();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("submit キュー"));
+        assert!(c.take_user_messages().is_empty(), "最終失敗は 1 回だけ表示");
+    }
+
+    /// 受信箱が溢れても ACK 待ちの先頭は押し出さない。
+    #[test]
+    fn mailbox_overflow_preserves_in_flight_front() {
+        let limits = Limits {
+            mailbox_cap: 1,
+            ..Limits::default()
+        };
+        let mut c = Coordinator::with_limits(limits);
+        c.register_session(1);
+        c.register_session(2);
+        c.register_session(3);
+        c.enqueue(msg(1, 2, t0()));
+
+        let reserved = c.take_deliverable(&[(2, SessionState::Idle)])[0].msg_id;
+        c.enqueue(msg(3, 2, t0()));
+        assert_eq!(
+            c.mailbox(2).unwrap().len(),
+            2,
+            "cap=1 でも予約中は 1 件だけ保護"
+        );
+        assert_eq!(c.mailbox(2).unwrap().iter().next().unwrap().id, reserved);
+        assert!(c.finish_delivery(2, reserved, true, t0()));
+        assert_eq!(c.mailbox(2).unwrap().len(), 1);
+        assert_eq!(c.mailbox(2).unwrap().delivered(), 1);
     }
 
     /// 注入本文の改行と制御文字は潰す(途中で送信されてしまうのを防ぐ)。

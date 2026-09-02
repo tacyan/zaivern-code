@@ -35,6 +35,50 @@
 //! ここに 2 つめの文面を置くと、同じ状況で説明が食い違う。
 
 use crate::features::team::imp::result_parser as rp;
+use std::time::{Duration, SystemTime};
+
+/// submit キューが受け付けなかった伝言を再試行する間隔。
+/// 毎フレーム同じコスト警告を出すのを防ぐ。
+pub const QUEUE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const DELIVERY_TAG_PREFIX: &str = "agent-talk:";
+
+/// submit outcome から元の伝言を復元するための識別子。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryIdentity {
+    pub from: u64,
+    pub to: u64,
+    pub message_identity: u64,
+}
+
+impl DeliveryIdentity {
+    pub fn delivered_key(self) -> u64 {
+        numeric_key(
+            b"agent-talk/delivered/v1",
+            &[self.from, self.to, self.message_identity],
+        )
+    }
+
+    pub fn in_flight_key(self) -> u64 {
+        numeric_key(
+            b"agent-talk/in-flight/v1",
+            &[self.from, self.to, self.message_identity],
+        )
+    }
+
+    pub fn queue_failure_notice_key(self) -> u64 {
+        numeric_key(
+            b"agent-talk/queue-failure-notice/v1",
+            &[self.from, self.to, self.message_identity],
+        )
+    }
+
+    pub fn outcome_failure_notice_key(self) -> u64 {
+        numeric_key(
+            b"agent-talk/outcome-failure-notice/v1",
+            &[self.from, self.to, self.message_identity],
+        )
+    }
+}
 
 /// 相手 1 人ぶんの宛先 (セッション ID とタブ名)。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,10 +90,120 @@ pub struct Peer {
 /// 届ける 1 通。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
+    /// 送り主のセッション。dedupe に必ず含める。
+    pub from: u64,
     /// 宛先のセッション。
     pub to: u64,
+    /// 元の `[ZAI-TEAM-MSG]` ブロックの安定した識別子。
+    pub message_identity: u64,
     /// 相手の端末へ流す本文 (差出人つき)。
     pub text: String,
+}
+
+impl Delivery {
+    pub fn identity(&self) -> DeliveryIdentity {
+        DeliveryIdentity {
+            from: self.from,
+            to: self.to,
+            message_identity: self.message_identity,
+        }
+    }
+
+    /// submit が実配送の成功 outcome を返した後だけ記録する配達済みキー。
+    pub fn delivered_key(&self) -> u64 {
+        self.identity().delivered_key()
+    }
+
+    /// submit の最終 outcome を待っている間のキー。
+    pub fn in_flight_key(&self) -> u64 {
+        self.identity().in_flight_key()
+    }
+
+    /// 同じ伝言を 1 再試行スロットで 1 回だけ積むためのキー。
+    pub fn attempt_key(&self, retry_slot: u64) -> u64 {
+        numeric_key(
+            b"agent-talk/attempt/v1",
+            &[self.from, self.to, self.message_identity, retry_slot],
+        )
+    }
+
+    /// キュー拒否の警告を同じ伝言で 1 回だけ表示するキー。
+    pub fn queue_failure_notice_key(&self) -> u64 {
+        self.identity().queue_failure_notice_key()
+    }
+
+    /// submit の outcome をこの伝言へ戻す厳密タグ。
+    pub fn delivery_tag(&self) -> String {
+        let id = self.identity();
+        format!(
+            "{DELIVERY_TAG_PREFIX}{}:{}:{}",
+            id.from, id.to, id.message_identity
+        )
+    }
+}
+
+/// agent-talk 専用タグを厳密に読む。余分な要素や符号は受け入れない。
+pub fn parse_delivery_tag(tag: &str) -> Option<DeliveryIdentity> {
+    let mut parts = tag.strip_prefix(DELIVERY_TAG_PREFIX)?.split(':');
+    let from = parse_tag_number(parts.next()?)?;
+    let to = parse_tag_number(parts.next()?)?;
+    let message_identity = parse_tag_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(DeliveryIdentity {
+        from,
+        to,
+        message_identity,
+    })
+}
+
+pub fn is_delivery_tag_namespace(tag: &str) -> bool {
+    tag.starts_with(DELIVERY_TAG_PREFIX)
+}
+
+fn parse_tag_number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// 現在時刻が属する再試行スロット。時計が UNIX epoch より前なら 0。
+pub fn retry_slot(now: SystemTime) -> u64 {
+    let width = QUEUE_RETRY_BACKOFF.as_secs().max(1);
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / width
+}
+
+/// 拒否マーカーの dedupe キー。同じ拒否文でも送り主が違えば別件。
+pub fn rejection_key(from: u64, rejection: &TalkReject) -> u64 {
+    let detail = rejection.detail();
+    text_key(b"agent-talk/rejection/v1", from, &detail)
+}
+
+fn message_identity(body: &str) -> u64 {
+    text_key(b"agent-talk/message/v1", 0, body)
+}
+
+fn numeric_key(domain: &[u8], values: &[u64]) -> u64 {
+    let mut hash = crate::history::Fnv1a64::default();
+    hash.update(domain);
+    for value in values {
+        hash.update(&value.to_le_bytes());
+    }
+    hash.finish()
+}
+
+fn text_key(domain: &[u8], prefix: u64, text: &str) -> u64 {
+    let mut hash = crate::history::Fnv1a64::default();
+    hash.update(domain);
+    hash.update(&prefix.to_le_bytes());
+    hash.update(&(text.len() as u64).to_le_bytes());
+    hash.update(text.as_bytes());
+    hash.finish()
 }
 
 /// 断った理由 (人へそのまま出す)。**Team 側と同じ型をそのまま使う。**
@@ -92,7 +246,7 @@ pub fn deliveries(
         if sent.is_some_and(|s| rp::is_prompt_echo(&body, s, rp::MSG_OPEN, rp::MSG_CLOSE)) {
             continue;
         }
-        match one(&body, from, peers, &sender) {
+        match one(&body, from, peers, &sender, message_identity(&body)) {
             Ok(mut v) => out.append(&mut v),
             Err(e) => bad.push(e),
         }
@@ -101,7 +255,13 @@ pub fn deliveries(
 }
 
 /// 伝言 1 件を届け先へ展開する。
-fn one(body: &str, from: u64, peers: &[Peer], sender: &str) -> Result<Vec<Delivery>, TalkReject> {
+fn one(
+    body: &str,
+    from: u64,
+    peers: &[Peer],
+    sender: &str,
+    message_identity: u64,
+) -> Result<Vec<Delivery>, TalkReject> {
     // **読み方は Team と同じ 1 つ** (`rp::read_message`)。ここに 2 つめの
     // パーサを置くと、手書き JSON の綴り間違いを拾えるのが片方だけになる。
     let doc = rp::read_message(body)?;
@@ -153,7 +313,9 @@ fn one(body: &str, from: u64, peers: &[Peer], sender: &str) -> Result<Vec<Delive
     Ok(targets
         .into_iter()
         .map(|p| Delivery {
+            from,
             to: p.id,
+            message_identity,
             // **誰からかを本文に残す。** 相手の端末には差出人が出ないので、
             // 書かないと「誰かから何か来た」になる。
             text: format!("[Zaivern] {sender} からの伝言:\n{text}"),
@@ -204,6 +366,41 @@ mod wiring {
             "既存の送信経路を通っていない"
         );
         assert!(!body.contains("write_bytes"), "PTY へ直接書いている");
+        let queued = body
+            .find("if self.queue_submit(job)")
+            .expect("submit キューの受理を確認していない");
+        let in_flight = body
+            .find("self.talk_once(in_flight_key)")
+            .expect("queue 中の重複投入を防いでいない");
+        assert!(queued < in_flight, "queue 受理前に配送中にしている");
+        assert!(
+            body.contains("job.tag = Some(delivery_tag)"),
+            "outcome の戻し先タグが無い"
+        );
+        assert!(
+            !body.contains("self.talk_once(delivered_key)"),
+            "submit の実配送 ACK 前に配達済みにしている"
+        );
+        assert!(
+            body.contains("attempt_key(retry_slot)") && body.contains("queue_failure_notice_key"),
+            "queue 拒否を毎フレーム連打するか、失敗を黙殺している"
+        );
+        let outcome = s
+            .split("pub(crate) fn note_submit_delivery")
+            .nth(1)
+            .and_then(|t| t.split("\n    /// ").next())
+            .expect("submit outcome の回収口が無い");
+        assert!(
+            outcome.contains("agent_talk::parse_delivery_tag")
+                && outcome.contains("talk_forget(identity.in_flight_key())")
+                && outcome.contains("if delivered")
+                && outcome.contains("talk_once(identity.delivered_key())"),
+            "実配送の成功時だけ delivered へ移す状態遷移が無い"
+        );
+        assert!(
+            outcome.contains("is_delivery_tag_namespace"),
+            "壊れた agent-talk タグが Team 側へ流れる"
+        );
         // **同じ塊を二度配らない。** 覚え書きは上限つきで、配った伝言と
         // 断った理由の両方が同じ口を通る (片方だけだと際限なく伸びる)。
         assert!(body.contains("talk_once("), "配り済みを覚えていない");
@@ -286,6 +483,123 @@ mod tests {
             "差出人が本文に無い: {:?}",
             d[0].text
         );
+        assert!(d.iter().all(|x| x.from == 1), "差出人 ID が欠けている");
+    }
+
+    /// 表示本文が同じでも、送り主・宛先・元ブロックのどれかが
+    /// 違えば別の配達として扱う。
+    #[test]
+    fn 配達キーは送信元_宛先_メッセージを全て含む() {
+        let same_names = vec![
+            Peer {
+                id: 1,
+                name: "Worker".into(),
+            },
+            Peer {
+                id: 2,
+                name: "Target".into(),
+            },
+            Peer {
+                id: 4,
+                name: "Worker".into(),
+            },
+        ];
+        let screen = msg("Target", "同じ本文");
+        let (from_one, bad) = deliveries(&screen, 1, &same_names, None);
+        assert!(bad.is_empty());
+        let (from_four, bad) = deliveries(&screen, 4, &same_names, None);
+        assert!(bad.is_empty());
+        assert_eq!(from_one[0].text, from_four[0].text, "旧キーが衝突する前提");
+        assert_ne!(
+            from_one[0].delivered_key(),
+            from_four[0].delivered_key(),
+            "同名の別送信者が衝突している"
+        );
+
+        let base = from_one[0].clone();
+        let mut other_target = base.clone();
+        other_target.to += 1;
+        assert_ne!(base.delivered_key(), other_target.delivered_key());
+
+        let mut other_message = base.clone();
+        other_message.message_identity ^= 1;
+        assert_ne!(base.delivered_key(), other_message.delivered_key());
+
+        let (again, _) = deliveries(&screen, 1, &same_names, None);
+        assert_eq!(
+            base.delivered_key(),
+            again[0].delivered_key(),
+            "同じ入力のキーが実行ごとに変わる"
+        );
+    }
+
+    /// 配達済み・再試行・失敗通知は同じ伝言でも別の名前空間を使う。
+    #[test]
+    fn 再試行キーは30秒ごとで配達済みと衝突しない() {
+        let (items, bad) = deliveries(&msg("Codex", "再試行"), 1, &peers(), None);
+        assert!(bad.is_empty());
+        let d = &items[0];
+        let delivered = d.delivered_key();
+        let in_flight = d.in_flight_key();
+        let queue_notice = d.queue_failure_notice_key();
+        let outcome_notice = d.identity().outcome_failure_notice_key();
+        let attempt_0 = d.attempt_key(0);
+        let attempt_1 = d.attempt_key(1);
+        assert_ne!(delivered, queue_notice);
+        assert_ne!(delivered, outcome_notice);
+        assert_ne!(delivered, in_flight);
+        assert_ne!(in_flight, queue_notice);
+        assert_ne!(queue_notice, outcome_notice);
+        assert_ne!(delivered, attempt_0);
+        assert_ne!(queue_notice, attempt_0);
+        assert_ne!(outcome_notice, attempt_0);
+        assert_ne!(attempt_0, attempt_1);
+
+        assert_eq!(
+            retry_slot(SystemTime::UNIX_EPOCH + Duration::from_secs(29)),
+            0
+        );
+        assert_eq!(
+            retry_slot(SystemTime::UNIX_EPOCH + Duration::from_secs(30)),
+            1
+        );
+    }
+
+    /// outcome タグは 3 つの ID を欠落・曖昧性なく復元する。
+    #[test]
+    fn agent_talk配送タグは厳密に往復する() {
+        let delivery = Delivery {
+            from: u64::MAX - 2,
+            to: u64::MAX - 1,
+            message_identity: u64::MAX,
+            text: "x".into(),
+        };
+        assert_eq!(
+            parse_delivery_tag(&delivery.delivery_tag()),
+            Some(delivery.identity())
+        );
+        for malformed in [
+            "agent-talk:",
+            "agent-talk:1:2",
+            "agent-talk:1:2:",
+            "agent-talk::2:3",
+            "agent-talk:+1:2:3",
+            "agent-talk: 1:2:3",
+            "agent-talk:1:2:3:4",
+            "agent-talk:1:2:18446744073709551616",
+            "team:1:2:3",
+        ] {
+            assert_eq!(parse_delivery_tag(malformed), None, "{malformed}");
+        }
+        assert!(is_delivery_tag_namespace("agent-talk:broken"));
+    }
+
+    /// 拒否マーカーの重複排除にも送信元を含める。
+    #[test]
+    fn 拒否キーは同じ理由の別送信者を潰さない() {
+        let rejection = TalkReject::NoOtherAgents;
+        assert_eq!(rejection_key(1, &rejection), rejection_key(1, &rejection));
+        assert_ne!(rejection_key(1, &rejection), rejection_key(2, &rejection));
     }
 
     /// **自分自身へは届けない。** 無限に往復しうる。

@@ -316,6 +316,12 @@ pub struct TeamRuntime {
     registered: BTreeSet<SessionId>,
     /// 保存が要るか。
     dirty: bool,
+    /// UI が読む値が実際に変わった世代。
+    ///
+    /// 永続化の `dirty` とは分ける。`previews` は保存しないが、
+    /// 画面は作り直す必要がある。逆に静止した端末を毎 tick
+    /// 全件 snapshot 化しないよう、実表示の変化時だけ進める。
+    snapshot_generation: u64,
     /// **状態機械が拒否した遷移。** 借用の都合で、起きた場所では記録だけして
     /// あとでまとめて事象へ落とす ([`TeamRuntime::drain_rejections`])。
     ///
@@ -326,7 +332,9 @@ pub struct TeamRuntime {
     ///
     /// 端末タブが名前とボタンしか出していなかったので、走っている最中に
     /// 中身を見る手段が「端末を開く」しか無かった (開くと画面が切り替わる)。
-    /// [`SessionObs::text`] はいまの画面なので、ここへ末尾だけを積み直す。
+    /// [`SessionObs::text`] はいまの画面なので、ここへ直近の画面を持つ。
+    /// 同じ正規化指紋は書き戻さない — スピナーや経過秒だけの
+    /// 再描画で snapshot を無効化し続けないため。
     /// 上限は [`PREVIEW_MAX_CHARS`] — 上限が無いと、長く走った
     /// Run のぶんだけ際限なく太る。
     ///
@@ -585,21 +593,22 @@ impl StallWatch {
     /// 変化には、こちらが打ち込んだ文字が混ざっている — それを「この担当は
     /// これだけ静かでも働いている」と学習すると、予算が促しのたびに伸びて
     /// **二度と停滞と言えなくなる**。
-    fn observe(&mut self, fingerprint: u64, now: u64) {
+    fn observe(&mut self, fingerprint: u64, now: u64) -> bool {
         if !self.seen {
             self.seen = true;
             self.fingerprint = fingerprint;
             self.changed_at = now;
-            return;
+            return true;
         }
         if fingerprint == self.fingerprint {
-            return;
+            return false;
         }
         if self.nudged_at.is_none() {
             self.longest_quiet = self.longest_quiet.max(now.saturating_sub(self.changed_at));
         }
         self.fingerprint = fingerprint;
         self.changed_at = now;
+        true
     }
 
     /// 担当が替わったらはしごを最初から (別の仕事は別の話)。
@@ -808,6 +817,7 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: true,
+            snapshot_generation: 0,
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
@@ -939,6 +949,7 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: false,
+            snapshot_generation: 0,
             rejections: Default::default(),
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
@@ -982,6 +993,13 @@ impl TeamRuntime {
     }
     pub fn is_stopped(&self) -> bool {
         self.run.stopped
+    }
+    /// UI 向けスナップショットの無効化世代。
+    ///
+    /// 引数なし `O(1)` で読める。描画側は前回値と違うときだけ
+    /// [`super::view_model::snapshot`] を作り直せばよい。
+    pub fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation
     }
     pub fn task(&self, id: TaskId) -> Option<&TeamTask> {
         self.tasks.iter().find(|t| t.id == id)
@@ -2158,31 +2176,8 @@ impl TeamRuntime {
     fn sync_sessions(&mut self, obs: &Observation) {
         let live: BTreeMap<SessionId, &SessionObs> =
             obs.sessions.iter().map(|s| (s.id, s)).collect();
-
-        // **画面プレビューを積む。** `SessionObs::text` は前回 tick からの
-        // 差分なので、末尾だけを持ち回して「いま何をしているか」を作る。
-        for a in &self.agents {
-            let Some(sid) = a.session_id else { continue };
-            let Some(o) = live.get(&sid) else { continue };
-            if o.text.is_empty() {
-                continue;
-            }
-            let buf = self.previews.entry(a.id.clone()).or_default();
-            buf.push_str(&o.text);
-            // 上限を超えたら**文字境界で**先頭を捨てる (バイトで切ると壊れる)。
-            let over = buf.chars().count().saturating_sub(PREVIEW_MAX_CHARS);
-            if over > 0 {
-                let cut = buf
-                    .char_indices()
-                    .nth(over)
-                    .map(|(i, _)| i)
-                    .unwrap_or(buf.len());
-                buf.drain(..cut);
-            }
-        }
-        // 居なくなったエージェントのぶんは捨てる (際限なく溜めない)。
-        let known: BTreeSet<AgentId> = self.agents.iter().map(|a| a.id.clone()).collect();
-        self.previews.retain(|id, _| known.contains(id));
+        let mut snapshot_changed = false;
+        let mut persistent_changed = false;
 
         // 既存調停層への登録 (未登録のものだけ)。
         for id in live.keys() {
@@ -2219,16 +2214,27 @@ impl TeamRuntime {
                 // 放っておくと完了後もそのタスクを持ち続ける。
                 if a.current_task.is_some_and(|t| finished.contains(&t)) {
                     a.current_task = None;
+                    snapshot_changed = true;
+                    persistent_changed = true;
                 }
                 continue;
             };
             match live.get(&sid) {
                 Some(s) => {
-                    a.provider = s.provider.clone();
+                    if a.provider != s.provider {
+                        a.provider = s.provider.clone();
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                    }
                     let task = self.tasks.iter().find(|t| {
                         t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
                     });
-                    a.current_task = task.map(|t| t.id);
+                    let current_task = task.map(|t| t.id);
+                    if a.current_task != current_task {
+                        a.current_task = current_task;
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                    }
                     let next = super::roles::derive_agent_work_state(
                         s.state,
                         task,
@@ -2237,7 +2243,11 @@ impl TeamRuntime {
                     );
                     if next != a.state {
                         a.state = next;
-                        a.last_activity_at = obs.now;
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                        if a.last_activity_at != obs.now {
+                            a.last_activity_at = obs.now;
+                        }
                     }
                     // **画面が変わったときだけ活動。**
                     //
@@ -2248,23 +2258,54 @@ impl TeamRuntime {
                     // 「たった今活動した」と言い続けていた。
                     let w = stalls.entry(a.id.clone()).or_default();
                     w.retarget(a.current_task);
-                    let before = w.changed_at;
-                    w.observe(screen_fingerprint(&s.text), obs.now);
-                    if w.changed_at != before {
-                        a.last_activity_at = obs.now;
+                    // 指紋は停滞判定と preview 無効化で 1 回だけ計算する。
+                    // 同じ正規化画面なら、スピナーや秒数が描き直されても
+                    // generation を進めない。
+                    let screen_changed = w.observe(screen_fingerprint(&s.text), obs.now);
+                    if screen_changed {
+                        if s.text.is_empty() {
+                            if self.previews.remove(&a.id).is_some() {
+                                snapshot_changed = true;
+                            }
+                        } else {
+                            let mut preview = s.text.clone();
+                            // 上限を超えたら**文字境界で**先頭を捨てる。
+                            let over = preview.chars().count().saturating_sub(PREVIEW_MAX_CHARS);
+                            if over > 0 {
+                                let cut = preview
+                                    .char_indices()
+                                    .nth(over)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(preview.len());
+                                preview.drain(..cut);
+                            }
+                            if self.previews.get(&a.id) != Some(&preview) {
+                                self.previews.insert(a.id.clone(), preview);
+                                snapshot_changed = true;
+                            }
+                        }
+                        if a.last_activity_at != obs.now {
+                            a.last_activity_at = obs.now;
+                            snapshot_changed = true;
+                            persistent_changed = true;
+                        }
                     }
                 }
                 None => {
                     // セッションが消えた。**担当を勝手に配り直さない**
                     // (前任者の停止確認は下の release_dead が既存側へ通す)。
                     a.session_id = None;
-                    a.state = AgentWorkState::Exited;
+                    if a.state != AgentWorkState::Exited {
+                        a.state = AgentWorkState::Exited;
+                    }
                     // **画面に「まだ担当している」を残さない。** ここを
                     // 残すと、消えたエージェントのカードが担当タスクを
                     // 名乗り続け、Inspector が効かない Retry / Reassign を
                     // 出す (`release_dead` が担当を外したあとも消えない —
                     // 次の tick からは上の枝を通らないため)。
                     a.current_task = None;
+                    snapshot_changed = true;
+                    persistent_changed = true;
                     // **消えた担当の覚え書きは捨てる。** 起こし直したら
                     // 別の画面・別の静けさなので、引き継ぐと起動中の担当を
                     // いきなり停滞と呼ぶ。
@@ -2275,8 +2316,15 @@ impl TeamRuntime {
         // 居なくなった担当のぶんは捨てる (際限なく溜めない)。
         let known_ids: BTreeSet<AgentId> = self.agents.iter().map(|a| a.id.clone()).collect();
         stalls.retain(|id, _| known_ids.contains(id));
+        self.previews.retain(|id, _| known_ids.contains(id));
         self.stalls = stalls;
         self.release_dead(obs.now);
+        if persistent_changed {
+            self.dirty = true;
+        }
+        if snapshot_changed {
+            self.snapshot_generation = self.snapshot_generation.saturating_add(1);
+        }
     }
 
     /// **止まっている担当を起こす。** 促す → 回収する → 人へ上げる。
@@ -2657,6 +2705,7 @@ impl TeamRuntime {
     ///
     /// Run が複数走っているとき、実行側から返る返事 (`ack_done` 等) は
     /// 鍵しか持っていない。**出した本人へ返す**ための照合に使う。
+    #[cfg(test)]
     pub fn has_effect(&self, key: &str) -> bool {
         self.effects.contains_key(key)
     }
@@ -4328,6 +4377,7 @@ impl TeamRuntime {
         while self.events.len() > EVENT_CAP {
             self.events.pop_front();
         }
+        self.snapshot_generation = self.snapshot_generation.saturating_add(1);
         self.dirty = true;
         id
     }
@@ -4938,7 +4988,10 @@ mod stall_tests {
     fn working(step: u64) -> String {
         let mut s = String::from("⠋ Working… (0s)\n");
         for i in 1..=step {
-            s.push_str(&format!("● Read(src/auth/mod_{}.rs)\n", "x".repeat(i as usize)));
+            s.push_str(&format!(
+                "● Read(src/auth/mod_{}.rs)\n",
+                "x".repeat(i as usize)
+            ));
         }
         s.push_str("\n> \n");
         s
@@ -5050,7 +5103,93 @@ mod stall_tests {
         assert!(!spinning(13).trim().is_empty());
     }
 
-    // ── 予算 ────────────────────────────────────────────────────────
+    // ── snapshot 無効化 ──
+
+    #[test]
+    fn snapshot世代は正規化画面が変わったときだけ進む() {
+        let (mut rt, sessions) = dispatched();
+        let target_session = sessions[0];
+        let target = rt
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == Some(target_session))
+            .map(|agent| agent.id.clone())
+            .expect("対象エージェント");
+        let generation = rt.snapshot_generation();
+        let preview = rt.preview_of(&target, 20);
+        let activity = rt.agent(&target).unwrap().last_activity_at;
+
+        // スピナー・経過秒・トークン数だけの差は静止画と同じ。
+        rt.sync_sessions(&obs_of(10, &rows_of(&sessions, &spinning(12))));
+        assert_eq!(rt.snapshot_generation(), generation);
+        assert_eq!(rt.preview_of(&target, 20), preview);
+        assert_eq!(rt.agent(&target).unwrap().last_activity_at, activity);
+
+        // 道具の行が増えたら preview と activity は更新し、世代は
+        // Agent 数ではなく観測バッチ 1 回ぶんだけ進む。
+        let rows: Vec<(SessionId, String)> = sessions
+            .iter()
+            .map(|session| {
+                (
+                    *session,
+                    if *session == target_session {
+                        working(1)
+                    } else {
+                        spinning(0)
+                    },
+                )
+            })
+            .collect();
+        rt.sync_sessions(&obs_of(11, &rows));
+        assert_eq!(rt.snapshot_generation(), generation + 1);
+        assert!(rt
+            .preview_of(&target, 20)
+            .contains("Read(src/auth/mod_x.rs)"));
+        assert_eq!(rt.agent(&target).unwrap().last_activity_at, 11);
+    }
+
+    #[test]
+    fn snapshot世代はsession状態とproviderの変化を1回に畳む() {
+        let (mut rt, sessions) = dispatched();
+        let target_session = sessions[0];
+        let target = rt
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == Some(target_session))
+            .map(|agent| agent.id.clone())
+            .expect("対象エージェント");
+        let generation = rt.snapshot_generation();
+        let observation = Observation {
+            now: 20,
+            sessions: sessions
+                .iter()
+                .map(|session| SessionObs {
+                    id: *session,
+                    title: format!("agent{session}"),
+                    provider: if *session == target_session {
+                        "codex".into()
+                    } else {
+                        "claude".into()
+                    },
+                    state: if *session == target_session {
+                        SessionState::WaitingApproval
+                    } else {
+                        SessionState::Idle
+                    },
+                    text: spinning(0),
+                })
+                .collect(),
+        };
+
+        rt.sync_sessions(&observation);
+        let agent = rt.agent(&target).unwrap();
+        assert_eq!(rt.snapshot_generation(), generation + 1);
+        assert_eq!(agent.provider, "codex");
+        assert_eq!(agent.state, AgentWorkState::WaitingApproval);
+        assert_eq!(agent.last_activity_at, 20);
+    }
+
+    // ── 予算 ──
 
     #[test]
     fn 予算は観測が伸びれば伸びる() {
