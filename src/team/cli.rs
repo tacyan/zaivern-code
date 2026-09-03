@@ -46,6 +46,13 @@ zai team — SPEC を渡して AI 開発チームを動かす
         未完了の Team Run を GUI で開き直す
   zai team stop
         新規割り当てを止める (実行中エージェントの停止は承認が要る)
+  zai team check [--json]
+        成果物が読み込むと言ったローカルファイルが実在するか、ブラウザの
+        コンソールにエラーが出ないかを確かめる (Chrome があれば実際に開く)
+  zai team draft <依頼>
+        1 枚の成果物 (HP / LP など) の SPEC をその場で書く (エージェント不要)
+  zai team shot
+        index.html を 1280px と 375px で描いて PNG に落とす (見て確かめる材料)
   zai team reset [--dry-run] [--yes]
         保存された Team Run を消す (既定は消す対象の表示のみ)
 
@@ -532,6 +539,140 @@ pub fn cli_main_in(argv: &[String], home: Option<&Path>) -> i32 {
                 "保存された状態の版 ({found}) が新しすぎます。Zaivern を更新してください。"
             )),
         },
+        // **成果物が読み込むと言ったものが実在するか。**
+        //
+        // 静的なサイトには `Cargo.toml` も `package.json` も無いので
+        // [`super::validation_defaults::detect`] は候補を返さない
+        // = 自動の関門が 1 つも無い。実機でこの穴を通って
+        // `index.html` が 404 を 2 本抱えたまま「完了」まで進んだ。
+        "check" => {
+            let mut bad_any = false;
+            let mut dangling_rows: Vec<serde_json::Value> = Vec::new();
+            match super::webcheck::scan(&ws) {
+                Ok(bad) if bad.is_empty() => {
+                    if !opts.json {
+                        println!("読み込む参照はすべて解決しました ({} を走査)", ws.display());
+                    }
+                }
+                Ok(bad) => {
+                    bad_any = true;
+                    if opts.json {
+                        dangling_rows = bad
+                            .iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "from": d.from, "raw": d.raw, "resolved": d.resolved,
+                                })
+                            })
+                            .collect();
+                    } else {
+                        eprintln!("読み込むと言ったファイルがありません ({} 件):", bad.len());
+                        for d in &bad {
+                            eprintln!("  {}", d.detail());
+                        }
+                        eprintln!(
+                            "\n持ち主の居ないファイルは誰も作りません。\
+                             SPEC のどれかのタスクの (files: ...) に足してください。"
+                        );
+                    }
+                }
+                Err(e) => return err(e.detail()),
+            }
+            // **コンソールも見る。** 「エラーが出ない」は完了条件に書かれる
+            // だけで、誰も測っていなかった。Chrome が無ければ**未確認**と
+            // 言う ([skip] は緑ではない)。
+            let mut console_rows = serde_json::Map::new();
+            for page in super::webcheck::entry_pages(&ws) {
+                match super::webcheck::console_errors(&ws, &page) {
+                    super::webcheck::ConsoleVerdict::Clean => {
+                        if opts.json {
+                            console_rows
+                                .insert(page, serde_json::json!({"ok": true, "errors": []}));
+                        } else {
+                            println!("{page}: コンソールのエラー 0 件");
+                        }
+                    }
+                    super::webcheck::ConsoleVerdict::Errors(errs) => {
+                        bad_any = true;
+                        if opts.json {
+                            console_rows
+                                .insert(page, serde_json::json!({"ok": false, "errors": errs}));
+                        } else {
+                            eprintln!("{page}: コンソールにエラー {} 件:", errs.len());
+                            for m in &errs {
+                                eprintln!("  {m}");
+                            }
+                        }
+                    }
+                    super::webcheck::ConsoleVerdict::Skipped(why) => {
+                        if opts.json {
+                            console_rows
+                                .insert(page, serde_json::json!({"ok": null, "skipped": why}));
+                        } else {
+                            eprintln!("{page}: コンソール検査は未確認 — {why}");
+                        }
+                    }
+                }
+            }
+            if opts.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": !bad_any, "dangling": dangling_rows, "console": console_rows,
+                    })
+                );
+            }
+            if bad_any {
+                EXIT_ERR
+            } else {
+                EXIT_OK
+            }
+        }
+        // **1 枚の成果物の SPEC をその場で書く** (GUI の「仕様書に書き換える」
+        // が使う雛形と同じ 1 つ)。エージェントに 5 分待つ理由が無い依頼を、
+        // CLI からも 0 秒で仕様書にできる。
+        "draft" => {
+            let brief = opts.rest.join(" ");
+            if brief.trim().is_empty() {
+                return err("依頼を書いてください: zai team draft かっこいいHPを作る");
+            }
+            let probe = super::composition::probe_workspace(&ws);
+            let rec = super::composition::recommend(&brief, &probe, launch::MAX_AGENTS);
+            match super::composition::spec_template(&brief, &brief, &rec) {
+                Some(spec) => {
+                    print!("{spec}");
+                    EXIT_OK
+                }
+                None => err(format!(
+                    "この依頼は 1 枚の成果物ではありません (形: {:?} / おすすめ {} 体)。\
+                     GUI の「仕様書に書き換える」を使ってください",
+                    rec.shape, rec.agents
+                )),
+            }
+        }
+        // **375px と 1280px の 2 枚を撮る** — 崩れは画像を見れば 5 秒で分かる。
+        "shot" => {
+            let pages = super::webcheck::entry_pages(&ws);
+            let Some(page) = pages.first() else {
+                return err("HTML がありません");
+            };
+            let out_dir = std::env::temp_dir().join(format!("zaivern-shot-{}", std::process::id()));
+            if let Err(e) = std::fs::create_dir_all(&out_dir) {
+                return err(e.to_string());
+            }
+            let mut rc = EXIT_OK;
+            for (w, h) in [(1280u32, 900u32), (375u32, 812u32)] {
+                let out = out_dir.join(format!("{}-{w}x{h}.png", page.replace('/', "_")));
+                match super::webcheck::screenshot(&ws, page, w, h, &out) {
+                    Ok(()) => println!("{}", out.display()),
+                    Err(e) => {
+                        eprintln!("{w}x{h}: {e}");
+                        rc = EXIT_ERR;
+                    }
+                }
+            }
+            rc
+        }
         "resume" => {
             let dir = dir_of(&ws);
             if !persistence::has_run(&dir) {
@@ -850,11 +991,48 @@ mod tests {
 
     #[test]
     fn ヘルプは全サブコマンドを載せる() {
-        for sub in ["plan", "run", "status", "resume", "stop", "reset"] {
+        for sub in ["plan", "run", "status", "resume", "stop", "check", "draft", "shot", "reset"] {
             assert!(HELP.contains(&format!("zai team {sub}")), "{sub} が無い");
         }
         assert_eq!(cli_main(&v(&["--help"])), EXIT_OK);
         assert_eq!(cli_main(&[]), EXIT_OK);
+    }
+
+    /// **`check` は実際に走って、壊れているものを壊れていると言う。**
+    /// ここが空回りすると、静的なサイトには関門が 1 つも無いままになる
+    /// (実機で `index.html` が 404 を 2 本抱えたまま完了まで進んだ)。
+    #[test]
+    fn checkは宙に浮いた参照を見つけて落ちる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-cli", "check");
+        std::fs::create_dir_all(dir.join("assets/js")).unwrap();
+        std::fs::write(dir.join("assets/js/scene.js"), "// ok\n").unwrap();
+        let ws = dir.display().to_string();
+
+        // 参照が全部そろっていれば通る。
+        std::fs::write(
+            dir.join("index.html"),
+            "<script src=\"./assets/js/scene.js\"></script>",
+        )
+        .unwrap();
+        assert_eq!(
+            run_in(&dir, &["check", "--workspace", &ws]),
+            EXIT_OK,
+            "揃っているのに落ちた"
+        );
+
+        // 1 本でも足りなければ落ちる。
+        std::fs::write(
+            dir.join("index.html"),
+            "<script src=\"./assets/js/scene.js\"></script>\
+             <script src=\"./assets/js/main.js\"></script>",
+        )
+        .unwrap();
+        assert_eq!(
+            run_in(&dir, &["check", "--workspace", &ws]),
+            EXIT_ERR,
+            "404 を見逃した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

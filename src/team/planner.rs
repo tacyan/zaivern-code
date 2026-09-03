@@ -264,6 +264,20 @@ fn split_files(title: &str) -> (String, Vec<String>) {
             .next()
             .map(|c| c.len_utf8())
             .unwrap_or(1)..close];
+    // `(files: a b)` / `(ファイル: a b)` の**札は剥がす**。spec_writer は
+    // この形を書かせているのに、ここが札を語として数えると「パスに見えない
+    // 語がある」で丸ごと捨て、本文走査の予備経路が拾った分だけが残る
+    // (`assets/vendor/**` のような glob は予備経路が拾えず、実機で落ちた)。
+    let inner = inner.trim();
+    let inner = ["files:", "file:", "ファイル:", "ファイル："]
+        .iter()
+        .find_map(|label| {
+            inner
+                .get(..label.len())
+                .filter(|head| head.eq_ignore_ascii_case(label))
+                .map(|_| &inner[label.len()..])
+        })
+        .unwrap_or(inner);
     // ファイルらしさ: `/` か `.` を含み、空白で区切られた語がパスに見える
     let parts: Vec<String> = inner
         .split([',', '、', ' '])
@@ -740,6 +754,26 @@ impl StaticPlanner {
                         .chain(plan_key.iter().cloned())
                         .chain(design_key.iter().cloned())
                         .collect()
+                } else if matches!(
+                    super::plan_schema::role_of("", &label),
+                    super::model::TeamRole::Tester | super::model::TeamRole::Reviewer
+                ) {
+                    // **確かめる担当は、確かめるものができてから配る。**
+                    //
+                    // 実測 (2 体の HP): 依存の無い `tester:` が実装と同時に配られ、
+                    // 「作業ツリーには SPEC.md しか無い」と伝言して待ちに入り、
+                    // 180 秒画面が動かないので**停滞として人へ上げられた**
+                    // (+496 秒で `needs_user`)。待っているだけの担当を停滞と
+                    // 呼ぶのは正しくないが、そもそも配らなければ起きない —
+                    // 席も 1 つ空き、そのぶんトークンも使わない。
+                    (0..raw_tasks.len())
+                        .filter(|j| {
+                            *j != i
+                                && super::plan_schema::role_of("", &raw_tasks[*j].title)
+                                    == super::model::TeamRole::Implementer
+                        })
+                        .map(|j| format!("impl-{:02}", j + 1))
+                        .collect()
                 } else if broken_down {
                     Vec::new()
                 } else {
@@ -971,6 +1005,103 @@ mod tests {
     use super::*;
 
     /// **ワークスペースを持たない入力。**
+
+    /// **SPEC が役割を名乗っていれば、同じ役割の骨組みを積まない。**
+    ///
+    /// 実機の Run (6 レーン) で、SPEC には既に「サイト構成を決める」
+    /// 「技術構成を決める」「動作確認手順」「統合と公開手順」があったのに、
+    /// その上へ `分割` / `設計` / `テスト` / `最終統合` がもう一度積まれて
+    /// 8 本の SPEC が **14 本**になった。重複した 4 本は全実装の完了に
+    /// 依存するので、そのまま*待ち*になり、25 分走って**1 度も動かなかった**。
+    ///
+    /// 原因は [`super::super::plan_schema::role_of`] が
+    /// **`<役割>:` の名乗りしか読まない**こと。SPEC を書くのは
+    /// [`super::super::spec_writer`] = こちらの製品なので、名乗らせる側を
+    /// 直した。ここはその取り決めが効いていることを固定する。
+    #[test]
+    fn 役割を名乗ったspecには骨組みを積まない() {
+        use super::super::model::TeamRole as R;
+        const BODY: &str = "\
+# ランディングページ
+
+## タスク
+- {P}サイト構成を決める (files: docs/PLAN.md)
+- {A}技術構成を決める (files: docs/ARCHITECTURE.md)
+- {I}ページ本体のマークアップ (files: index.html)
+- {I}スタイルの実装 (files: assets/css/style.css)
+- {T}動作確認手順 (files: docs/TEST.md)
+- {R}レビュー記録 (files: docs/REVIEW.md)
+- {G}統合と公開手順 (files: README.md)
+
+## 完了条件
+- index.html を開いてコンソールにエラーが出ない
+
+## 検証
+- `cargo test`
+";
+        let roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
+        let named = BODY
+            .replace("{P}", "planner: ")
+            .replace("{A}", "architect: ")
+            .replace("{I}", "implementer: ")
+            .replace("{T}", "tester: ")
+            .replace("{R}", "reviewer: ")
+            .replace("{G}", "integrator: ");
+        let bare = BODY
+            .replace("{P}", "")
+            .replace("{A}", "")
+            .replace("{I}", "")
+            .replace("{T}", "")
+            .replace("{R}", "")
+            .replace("{G}", "");
+
+        let with_roles = |spec: &str| {
+            let mut i = input(spec);
+            i.roles = roles.clone();
+            StaticPlanner.plan(i).expect("計画できる")
+        };
+        let named_plan = with_roles(&named);
+        let bare_plan = with_roles(&bare);
+
+        // 名乗っていれば SPEC の 7 本のまま (骨組みは 1 本も積まれない)。
+        assert_eq!(
+            named_plan.tasks.len(),
+            7,
+            "名乗っているのに骨組みが積まれた: {:?}",
+            named_plan.tasks.iter().map(|t| &t.title).collect::<Vec<_>>()
+        );
+        // 名乗りが無ければ従来どおり骨組みが要る (この検査が空回りしない証明)。
+        assert!(
+            bare_plan.tasks.len() > named_plan.tasks.len(),
+            "名乗りの有無で計画が変わらない (検査が空回りしている)"
+        );
+
+        // **役割も正しく付く。** 名乗りが無いと全部 implementer になり、
+        // レビュー担当を立てても実装担当がレビューを持つ。
+        let roles_of = |p: &super::super::plan_schema::TeamPlan| {
+            p.tasks.iter().map(|t| t.role).collect::<Vec<_>>()
+        };
+        for want in [R::Planner, R::Architect, R::Tester, R::Reviewer, R::Integrator] {
+            assert!(
+                roles_of(&named_plan).contains(&want),
+                "{:?} のタスクが 1 本も無い",
+                want
+            );
+        }
+        // **名乗りが無ければ、その役割のタスクは 1 本も無い。**
+        // ここが両方 true だと、上の検査は名乗りと無関係に通ってしまう。
+        assert!(
+            !roles_of(&bare_plan).contains(&R::Reviewer),
+            "名乗りが無いのにレビュー担当が付いた (検査が名乗りを見ていない)"
+        );
+    }
     ///
     /// 空のパスは「どのリポジトリでもない」なので、検証の自動決定は
     /// 必ず断られる (`detect` が相対パスを cwd 基準で解決してしまう事故を
@@ -1658,6 +1789,30 @@ mod tests {
         );
     }
 
+
+    /// **`(files: …)` の札を剥がして読む。** spec_writer が書かせる形そのもの。
+    /// 札を語として数えると丸ごと捨てて、glob (`assets/vendor/**`) が落ちる。
+    #[test]
+    fn filesの札つきでも担当ファイルを読む() {
+        let (t, f) = split_files(
+            "implementer: ページを作る (files: index.html assets/css/style.css assets/vendor/**)",
+        );
+        assert_eq!(t, "implementer: ページを作る");
+        assert_eq!(
+            f,
+            vec![
+                "index.html".to_string(),
+                "assets/css/style.css".to_string(),
+                "assets/vendor/**".to_string()
+            ]
+        );
+        let (_, f) = split_files("設計 (ファイル: docs/PLAN.md, docs/ARCH.md)");
+        assert_eq!(f, vec!["docs/PLAN.md".to_string(), "docs/ARCH.md".to_string()]);
+        // 札だけで中身が無いなら、ファイルは無い。
+        let (_, f) = split_files("x (files: )");
+        assert!(f.is_empty());
+    }
+
     #[test]
     fn ファイル指定でない括弧は表題に残す() {
         let (t, f) = split_files("ログイン API を実装する (重要)");
@@ -1744,13 +1899,36 @@ Zaivern が何なのかを決め、ページの構成を決める。
         //
         // 守るべきは「**実装が待たされないこと**」で、締めが待つことでは
         // ない (`scope_and_order_tests::整合担当は他を待つ` が対の番人)。
-        for t in p.tasks.iter().filter(|t| t.role != R::Integrator) {
+        //
+        // **確かめる担当 (tester / reviewer) は実装を待ってよい。** 依存の
+        // 無い `tester:` が実装と同時に配られ、「まだ何も無い」と待ちに
+        // 入って停滞扱いで人へ上げられた実測がある (2 体の HP、+496 秒)。
+        for t in p
+            .tasks
+            .iter()
+            .filter(|t| matches!(t.role, R::Implementer | R::Planner | R::Architect))
+        {
             assert!(
                 t.dependencies.is_empty(),
                 "#{} ({:?}) が待たされている — 並列が死ぬ",
                 t.id,
                 t.role
             );
+        }
+        let impls: Vec<_> = p
+            .tasks
+            .iter()
+            .filter(|t| t.role == R::Implementer)
+            .map(|t| t.id)
+            .collect();
+        for t in p.tasks.iter().filter(|t| t.role == R::Tester) {
+            for i in &impls {
+                assert!(
+                    t.dependencies.contains(i),
+                    "検証担当 #{} が実装 #{i} を待っていない (何も無いのに配られる)",
+                    t.id
+                );
+            }
         }
     }
 
@@ -2011,9 +2189,21 @@ README.md にまとめる。
                 t.id
             );
         }
-        // **他は待たない** (実装は並列のまま)。
-        for t in tasks.iter().filter(|t| t.role != R::Integrator) {
+        // **実装は待たない** (並列のまま)。確かめる担当は実装を待ってよい —
+        // 何も無いうちに配ると「まだ無い」と待って停滞扱いになる (実測)。
+        for t in tasks
+            .iter()
+            .filter(|t| matches!(t.role, R::Implementer | R::Planner | R::Architect))
+        {
             assert!(t.dependencies.is_empty(), "#{} が待たされている", t.id);
         }
+    }
+}
+
+/// テストが `split_files` を外から呼ぶための口 (実装は 1 つのまま)。
+#[cfg(test)]
+pub(super) mod tests_hook {
+    pub fn split_files_for_test(title: &str) -> (String, Vec<String>) {
+        super::split_files(title)
     }
 }

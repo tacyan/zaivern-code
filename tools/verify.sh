@@ -40,6 +40,7 @@ _LABEL='検証'
 # 最後の 1 行に結果を書き、パイプ越しでも嘘にならないようにする。
 _verdict() {
     _rc=$?
+    rm -f "${_ZV_LOG:-}" "${_ZV_RC:-}"
     if [ "$_rc" -eq 0 ]; then
         printf '\033[1;32m✓ %s 緑\033[0m\n' "$_LABEL"
     else
@@ -47,6 +48,10 @@ _verdict() {
             "$_LABEL" "$_rc" "${_WHY:+ — $_WHY}"
     fi
 }
+# テストの控え置き場。**trap は増やさない** — `trap ... EXIT` をもう 1 つ
+# 置くと `_verdict` が置き換わって、最後の判定行が出なくなる。
+_ZV_LOG="${TMPDIR:-/tmp}/zv-verify-$$.log"
+_ZV_RC="${TMPDIR:-/tmp}/zv-verify-$$.rc"
 _WHY=''
 trap _verdict EXIT
 
@@ -185,15 +190,56 @@ if [ -n "$FILTERS" ]; then
 fi
 
 # 引数が無ければ **git が見ている変更から対象モジュールを推測する**。
-# src/foo.rs を触ったなら foo:: を走らせる (どの環境でも同じ導出)。
+#
+# `src/foo.rs` は `foo::`、`src/team/spec_writer.rs` は `spec_writer::`。
+# **ディレクトリ名を混ぜない** — Rust のテスト名は*モジュール*の道で、
+# ファイルの道ではない。`src/features/` の下は `#[path]` で引き込まれて
+# いるので、実際の名前は `features::team::imp::spec_writer::…` になる。
+# ここを `team/spec_writer::` のまま渡すと**1 件も一致せず**、それでも
+# `cargo test` は成功で返るので、**0 件走らせて「緑」と出る**
+# (実際に team/ の 4 モジュールを触った回で起きた)。
 MODS=$(git status --porcelain -- 'src/*.rs' 2>/dev/null | awk '{print $NF}' \
-       | sed -e 's|^src/||' -e 's|\.rs$||' | sort -u)
+       | sed -e 's|.*/||' -e 's|\.rs$||' | sort -u)
 if [ -z "$MODS" ]; then
   printf '\n変更された src/*.rs が無いので、テストは走らせない (--all で全部)\n'
   _LABEL='検証 (テストは 1 件も走っていない)'
   exit 0
 fi
+# **1 件も走らなかったフィルタは黙って見逃さない。**
+#
+# `src/team/mod.rs` のように**テストを持たないファイル**は普通にあるので、
+# 0 件そのものは赤ではない。赤にするのは「全部のフィルタが 0 件」= この
+# 実行で 1 件もテストが走っていないのに緑と出る場合だけ。それ以外は
+# **どのフィルタが空振りしたかを名指しで出す** — 空回りしていることが
+# 画面に出ていれば、名前の付け間違いはその場で気付ける。
+_ran_total=0
+_empty=''
 for m in $MODS; do
   step "テスト: ${m}::"
-  cargo test --bin zai "${m}::"
+  # **溜めずに素通しする。** `_out=$(…)` で溜めると、固まったときに
+  # 1 バイトも出ないまま待つことになる。`tee` で流しながら控えを取る。
+  #
+  # パイプを挟むと `$?` は `tee` のものになるので (この scriptの冒頭に
+  # 書いてある罠と同じ)、cargo の終了コードは**別に受け取る**。
+  # `PIPESTATUS` は bash 専用で、ここは `#!/usr/bin/env sh` なので使えない。
+  ( cargo test --bin zai "${m}::" 2>&1; echo $? > "$_ZV_RC" ) | tee "$_ZV_LOG"
+  if [ "$(cat "$_ZV_RC")" != 0 ]; then
+    exit 1
+  fi
+  _n=$(sed -n 's/^running \([0-9]*\) tests*$/\1/p' "$_ZV_LOG" | head -1)
+  _n=${_n:-0}
+  _ran_total=$((_ran_total + _n))
+  if [ "$_n" = 0 ]; then
+    _empty="${_empty}${_empty:+, }${m}::"
+  fi
 done
+if [ -n "$_empty" ]; then
+  printf '\n\033[1;33m! 一致するテストが無かったフィルタ: %s\033[0m\n' "$_empty"
+  printf '  (テストを持たないファイルなら正常。持っているはずなら名前の付け方を確かめる —\n'
+  printf '   Rust のテスト名は*モジュール*の道で、ファイルの道ではない)\n'
+fi
+if [ "$_ran_total" = 0 ]; then
+  _WHY="どのフィルタも一致せず、テストが 1 件も走っていない (${_empty})"
+  exit 1
+fi
+printf '\n\033[1;32m✓ %s 件のテストが実際に走った\033[0m\n' "$_ran_total"

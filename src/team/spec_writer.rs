@@ -58,6 +58,7 @@ pub fn build_prompt(
     agents: usize,
     roles: &[TeamRole],
     validations: &[String],
+    shape: super::composition::WorkShape,
 ) -> String {
     let lanes: Vec<&str> = roles.iter().map(|r| r.key()).collect();
     let goal = goal.trim();
@@ -70,13 +71,15 @@ pub fn build_prompt(
          内容: {brief}\n\n\
          ## 編成\n\
          最大 {agents} 体が同時に動きます。用意する役割: {lanes}\n\n\
+         ## この依頼の形に合わせること\n\
+         {guidance}\n\n\
          ## 出力の形 (厳守)\n\
          下の 2 行のマーカーで挟んで、間に Markdown だけを書いてください。\n\
          マーカーの外に説明を書いてもかまいません。\n\n\
          {SPEC_OPEN}\n\
          # <表題>\n\n\
          ## タスク\n\
-         - <1 人が独立して進められる単位> (files: <担当ファイル>)\n\
+         - <役割>: <1 人が独立して進められる単位> (files: <担当ファイル>)\n\
          - <同上>\n\n\
          ## 完了条件\n\
          - <満たされたら完成と言える条件>\n\n\
@@ -86,8 +89,23 @@ pub fn build_prompt(
          ## 守ること\n\
          * 「## タスク」の箇条書きは **{min} 件以上 {max} 件以下**。\
            1 件だと分担にならず、多すぎると割り当てが往復するだけで進まない\n\
+         * **各タスクの先頭に担当役割を `<役割>: ` の形で書く。**\
+           使えるのは上の「用意する役割」に挙げた語だけ (例: `tester: 実際に\
+           ブラウザで開いて確認する`)。名乗りが無いタスクは全部**実装担当**に\
+           なるので、レビューもテストも実装担当が持つことになる\n\
          * 各タスクは**互いに別のファイル**を触るように割る \
            (`(files: index.html)` の形で書く)。同じファイルを 2 人に配ると衝突する\n\
+         * **文書だけを作るタスクを置かない。** 依頼が文書そのものを\
+           求めていない限り、`.md` しか作らないタスク (計画書・設計書・\
+           手順書・レビュー記録・README) は作らず、その役割の仕事は\
+           **成果物そのもの**に対して行わせる。実機の Run では 8 本中 5 本が\
+           文書になり、25 分かけてページは読み込みエラーのままだった\n\
+         * **1 枚の成果物を分けすぎない。** 分けるほど繋ぎ目が増え、\
+           繋ぎ目の品質は誰の担当でもなくなる。迷ったら**少ないほう**に割る\n\
+         * **成果物が参照するファイルは、必ずどれかのタスクが持つ。**\
+           `index.html` から読み込む JS / CSS / ライブラリ本体のように、\
+           後から要ると分かるファイルも最初から `(files: ...)` に載せる。\
+           誰も持たないファイルは**永久に作られない**\n\
          * 依頼に書いていない機能を足さない。分からないことは決めつけず、\
            その旨をタスクの文言に残す\n\
          * 「## 検証」は**下の「使える検証コマンド」からだけ**選ぶ。\
@@ -103,6 +121,9 @@ pub fn build_prompt(
         },
         min = MIN_TASKS,
         max = agents.max(2) * 2,
+        // **編成を決めた層の作法をそのまま貼る。** ここで別に書くと、
+        // 「2 体」と言いながら 8 本に割る依頼文になる。
+        guidance = super::composition::spec_guidance(shape),
         validations = validation_menu(validations),
     )
 }
@@ -324,13 +345,39 @@ mod tests {
     use crate::features::team::imp::model::TeamRole as R;
 
     fn prompt() -> String {
+        prompt_for(super::super::composition::WorkShape::SingleArtifact)
+    }
+
+    fn prompt_for(shape: super::super::composition::WorkShape) -> String {
         build_prompt(
             "テスト",
             "かっこいい３DのWebページを作って",
             4,
             &[R::Architect, R::Implementer, R::Tester],
             &["cargo fmt --check".to_string(), "cargo test".to_string()],
+            shape,
         )
+    }
+
+    /// **依頼の形ごとの作法が依頼文に載る。** 編成だけ 2 体にしても、
+    /// 作法が「別々のファイルに割れ」のままなら SPEC は 8 本に割れる。
+    #[test]
+    fn 依頼文は依頼の形に合わせた作法を載せる() {
+        use super::super::composition::WorkShape as S;
+        assert!(
+            prompt_for(S::SingleArtifact).contains("1 本のタスクにまとめる"),
+            "1 枚の成果物なのに 1 本にまとめろと言っていない"
+        );
+        assert!(
+            prompt_for(S::WideIndependent).contains("単位ごとに 1 本"),
+            "独立した単位なのに単位ごとに割れと言っていない"
+        );
+        assert!(
+            prompt_for(S::Research).contains("コードは書かない"),
+            "調査なのにコードを書くなと言っていない"
+        );
+        // 形ごとに違う依頼文になる (同じなら形を伝えていない)。
+        assert_ne!(prompt_for(S::SingleArtifact), prompt_for(S::WideIndependent));
     }
 
     /// **依頼文には、計画が読める形がそのまま載っている。**
@@ -344,6 +391,68 @@ mod tests {
         // 編成の情報が伝わっている (伝えないと粒度が決まらない)。
         assert!(p.contains("architect"), "役割が伝わっていない");
         assert!(p.contains("最大 4 体"), "同時数が伝わっていない");
+    }
+
+    /// **役割を名乗らせる。** 名乗りが無い表題は
+    /// [`super::super::plan_schema::role_of`] が全部 `implementer` に倒すので、
+    /// レビューもテストも統合も実装担当が持つ計画になる (実機の Run が
+    /// まさにそうで、14 本すべてが `implementer` だった)。
+    ///
+    /// さらに、名乗りが無いと計画側の重複検出 (`covered`) も効かず、
+    /// **SPEC に既にある仕事の骨組みをもう一度積む** — 実機で
+    /// `分割` / `設計` / `テスト` / `最終統合` の 4 本が二重になり、
+    /// そのどれも最後まで 1 度も動かなかった。
+    #[test]
+    fn 依頼文はタスクに役割を名乗らせる() {
+        let p = prompt();
+        assert!(
+            p.contains("<役割>: "),
+            "タスクの雛形が役割の名乗りを求めていない"
+        );
+        // 名乗ってよい語は**編成で渡した役割**。ここに固定の一覧を書くと、
+        // 役割を増やした日に依頼文だけが古いことに誰も気付けない。
+        for r in [R::Architect, R::Implementer, R::Tester] {
+            assert!(
+                p.contains(r.key()),
+                "使ってよい役割として {} が伝わっていない",
+                r.key()
+            );
+        }
+    }
+
+    /// **成果物が参照するファイルにも持ち主を付けさせる。**
+    ///
+    /// 実機の Run で `index.html` が `assets/js/main.js` と
+    /// `assets/vendor/three/three.min.js` を読み込んでいたのに、
+    /// どのタスクの `files` にも無かった。持ち主が居ないファイルは
+    /// 誰も作らないので、**出来上がったページは 2 本とも 404** だった。
+    #[test]
+    fn 依頼文は参照されるファイルにも持ち主を求める() {
+        let p = prompt();
+        assert!(
+            p.contains("成果物が参照するファイル"),
+            "参照されるファイルの持ち主について何も言っていない"
+        );
+    }
+
+    /// **文書づくりの仕事に化けさせない。**
+    ///
+    /// 実機の Run は「かっこいい HP を作る」から 8 本の SPEC を書いたが、
+    /// そのうち 5 本 (`PLAN.md` / `ARCHITECTURE.md` / `TEST.md` /
+    /// `REVIEW.md` / `README.md`) は**文書**で、動くものを作るのは 3 本
+    /// だけだった。さらに計画側が骨組みを 6 本積んで 14 本になり、
+    /// 25 分走って完了は 0 件、出来たページは読み込みエラーのままだった。
+    #[test]
+    fn 依頼文は文書だけのタスクを止める() {
+        let p = prompt();
+        assert!(
+            p.contains("文書だけを作るタスクを置かない"),
+            "文書に化けるのを止めていない"
+        );
+        assert!(
+            p.contains("分けすぎない"),
+            "1 枚の成果物を割りすぎるのを止めていない"
+        );
     }
 
     /// **依頼文のエコーを「書き換えた仕様書」として採らない。**

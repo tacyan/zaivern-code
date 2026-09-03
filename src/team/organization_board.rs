@@ -26,6 +26,7 @@ use crate::theme::Theme;
 use super::graph::{Phase, PhaseStatus};
 use super::model::*;
 use super::panel::{BoardAction, BoardTab, DraftState, NewRunForm, RestorePrompt};
+use super::composition;
 use super::planner;
 use super::view_model::{
     self, current_action, ActionFocus, TeamAgentView, TeamSnapshot, MISSION_PANEL_W,
@@ -1540,7 +1541,17 @@ fn new_run_form(
             }
 
             ui.label(tr("team.form.agents"));
-            ui.add(egui::Slider::new(&mut form.agents, 1..=16));
+            // **手で動かしたら、おすすめはもう当てない。** 人の判断を
+            // 計画のたびに上書きすると、動かした意味が無くなる。
+            if ui
+                .add(egui::Slider::new(
+                    &mut form.agents,
+                    1..=super::panel::FORM_MAX_AGENTS,
+                ))
+                .changed()
+            {
+                form.composition_touched = true;
+            }
             ui.end_row();
 
             ui.label(tr("team.form.max_attempts"));
@@ -1569,7 +1580,12 @@ fn new_run_form(
             ui.end_row();
 
             ui.label(tr("team.form.review_required"));
-            ui.checkbox(&mut form.review_required, tr("team.form.review_hint"));
+            if ui
+                .checkbox(&mut form.review_required, tr("team.form.review_hint"))
+                .changed()
+            {
+                form.composition_touched = true;
+            }
             ui.end_row();
 
             ui.label(tr("team.form.agent"));
@@ -1606,6 +1622,7 @@ fn new_run_form(
                     }
                     let on = form.roles.contains(&r);
                     if ui.selectable_label(on, role_label(r)).clicked() {
+                        form.composition_touched = true;
                         if on {
                             form.roles.retain(|x| *x != r);
                         } else {
@@ -1620,6 +1637,7 @@ fn new_run_form(
             ui.add(egui::DragValue::new(&mut form.cost_limit).range(0.0..=1000.0));
             ui.end_row();
         });
+    recommendation_section(ui, theme, form);
     if !form.error.is_empty() {
         ui.colored_label(theme.err, plain(&form.error));
     }
@@ -1642,6 +1660,116 @@ fn new_run_form(
             form.open = false;
         }
     });
+}
+
+/// **おすすめの編成** — 依頼の形から「何体・どの役割」を出す。
+///
+/// 6 役割・4 体の既定を何にでも当てると、1 枚の HP に 14 本の計画が立って
+/// 25 分で完了 0 件になる (実測)。ここは [`composition::recommend`] の判断を
+/// **理由つきで**見せる。人が手で変えていなければ、計画・書き換えの
+/// たびに同じ判断が自動で当たる (`app::team_glue`)。判断そのものは
+/// ここに書かない — 画面と実際に使う編成が食い違わないように、
+/// 表は `composition` 1 か所に置く。
+fn recommendation_section(ui: &mut egui::Ui, theme: &Theme, form: &mut NewRunForm) {
+    // ファイル指定のときは中身を読まないと形が分からない (読み込みは
+    // 押されてから)。Goal 名だけでも「HP」「移行」のような形は読める。
+    let brief = if form.from_file {
+        form.goal_name.clone()
+    } else {
+        format!("{}\n{}", form.goal_name, form.spec_text)
+    };
+    if brief.trim().is_empty() {
+        return;
+    }
+    let rec = composition::recommend(&brief, &form.probe, super::panel::FORM_MAX_AGENTS);
+    let same = form.agents == rec.agents
+        && form.roles == rec.roles
+        && form.review_required == rec.review_required;
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(tr("team.recommend.title"))
+                .color(theme.text)
+                .strong(),
+        );
+        ui.label(RichText::new(shape_label(rec.shape)).color(theme.accent));
+    });
+    let roles: Vec<String> = rec.roles.iter().map(|r| role_label(*r)).collect();
+    ui.label(
+        RichText::new(trf(
+            "team.recommend.summary",
+            &[
+                ("agents", rec.agents.to_string()),
+                ("roles", roles.join(" / ")),
+            ],
+        ))
+        .color(theme.text),
+    );
+    for why in &rec.reasons {
+        ui.label(
+            RichText::new(format!("• {}", reason_label(*why, rec.units)))
+                .size(11.0)
+                .color(theme.text_dim),
+        );
+    }
+    // 時間の予算と「レビュー専任を立てない」も編成の一部なので、ここに出す
+    // (出さないと、チェックが勝手に外れたように見える)。
+    if let Some(min) = rec.time_budget_min {
+        ui.label(
+            RichText::new(trf(
+                "team.recommend.time_budget",
+                &[("minutes", min.to_string())],
+            ))
+            .size(11.0)
+            .color(theme.text_dim),
+        );
+    }
+    if !rec.review_required {
+        ui.label(
+            RichText::new(tr("team.recommend.review_off"))
+                .size(11.0)
+                .color(theme.text_dim),
+        );
+    }
+    ui.horizontal_wrapped(|ui| {
+        if same {
+            ui.label(RichText::new(tr("team.recommend.in_use")).color(theme.ok));
+        } else {
+            if ui.button(tr("team.recommend.apply")).clicked() {
+                form.agents = rec.agents;
+                form.roles = rec.roles.clone();
+                form.review_required = rec.review_required;
+                form.composition_touched = false;
+            }
+            if form.composition_touched {
+                ui.label(RichText::new(tr("team.recommend.manual")).color(theme.text_dim));
+            }
+        }
+    });
+}
+
+fn shape_label(s: composition::WorkShape) -> String {
+    use composition::WorkShape as S;
+    // **`tr` には素の文字列リテラルを渡す** (`zai i18n missing` の走査に
+    // 現れるように)。
+    match s {
+        S::SingleArtifact => tr("team.recommend.shape.single_artifact"),
+        S::WideIndependent => tr("team.recommend.shape.wide_independent"),
+        S::FeatureInRepo => tr("team.recommend.shape.feature_in_repo"),
+        S::Research => tr("team.recommend.shape.research"),
+    }
+}
+
+fn reason_label(r: composition::Reason, units: usize) -> String {
+    use composition::Reason as R;
+    match r {
+        R::SingleArtifact => tr("team.recommend.why.single_artifact"),
+        R::WideUnits => trf("team.recommend.why.wide_units", &[("units", units.to_string())]),
+        R::ExistingRepo => tr("team.recommend.why.existing_repo"),
+        R::EmptyWorkspace => tr("team.recommend.why.empty_workspace"),
+        R::Research => tr("team.recommend.why.research"),
+        R::TokenCost => tr("team.recommend.why.token_cost"),
+    }
 }
 
 /// **短い指示を仕様書へ書き換える段。**

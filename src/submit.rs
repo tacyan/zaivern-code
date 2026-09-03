@@ -270,6 +270,19 @@ pub struct Peek {
     pub input: Option<String>,
 }
 
+/// **この相手はもう入力を受け取れるか** (純関数)。
+///
+/// 起動直後の数秒は書いても落ちる CLI がある。それだけでなく、**起動時
+/// プロンプト (フォルダ信頼確認) に答えた直後**も同じ — CLI は画面を
+/// 作り直すので、その最中に書いた本文は丸ごと捨てられる。実測 (Claude
+/// Code v2): 返事の 71ms 後に貼った 6.6KB の指示が消え、担当は 5 分間
+/// なにも受け取らないまま「作業中」と出ていた。だから時計は 2 本 —
+/// セッション開始からと、最後の自動応答からの**両方**が `ready` を
+/// 越えてから書く。待つ長さは 1 つ (カタログの `input_ready_ms`)。
+pub fn input_ready(age: Duration, since_reply: Option<Duration>, ready: Duration) -> bool {
+    age >= ready && since_reply.is_none_or(|d| d >= ready)
+}
+
 /// 送信 1 通。
 #[derive(Debug, Clone)]
 pub struct Job {
@@ -655,6 +668,34 @@ mod tests {
     /// [`decide`] を直接呼んで書き分ける。
     fn decide_quiet(job: &Job, peek: &Peek, since_stage: Duration, since: Duration) -> Act {
         decide(job, peek, since_stage, since, since)
+    }
+
+    /// **自動応答の直後は、セッションが古くても「まだ」。**
+    #[test]
+    fn 自動応答の直後は受け取れない() {
+        let ready = Duration::from_millis(3_000);
+        // 起動直後 = まだ。
+        assert!(!input_ready(Duration::from_millis(500), None, ready));
+        // 起動から十分 = 受け取れる。
+        assert!(input_ready(Duration::from_secs(10), None, ready));
+        // 起動から十分でも、信頼確認に答えた 71ms 後 = まだ (実測の穴)。
+        assert!(!input_ready(
+            Duration::from_secs(10),
+            Some(Duration::from_millis(71)),
+            ready
+        ));
+        // 答えてから十分 = 受け取れる。
+        assert!(input_ready(
+            Duration::from_secs(10),
+            Some(Duration::from_secs(4)),
+            ready
+        ));
+        // 待ち時間を持たない CLI (ready = 0) はいつでも受け取れる。
+        assert!(input_ready(
+            Duration::ZERO,
+            Some(Duration::ZERO),
+            Duration::ZERO
+        ));
     }
 
     #[test]

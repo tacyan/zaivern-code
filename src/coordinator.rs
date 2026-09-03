@@ -882,6 +882,32 @@ pub fn occupies(t: &Task) -> bool {
     t.assigned.is_some() && !t.state.is_terminal() && !t.files.is_empty()
 }
 
+/// そのタスクは、この Run で**実際に配られた**担当範囲を持っているか。
+///
+/// [`occupies`] との違いは**終端を含める**ことだけ。用途が違う:
+///
+/// * [`occupies`] — 「いま押さえているか」。割り当ての可否 ([`admit`]) はこちら。
+///   終わったタスクの範囲は次の担当へ配ってよい
+/// * `claimed` — 「その変更は誰の成果か」。**作業ツリーの変更は完了しても
+///   消えない**ので、終わった時点で範囲を手放すと、その後に報告した担当が
+///   「担当外を変更した」と咎められる
+///
+/// 実機の Run (6 体 / 同じワークスペース) で、この違いのせいで正しく働いた
+/// 担当への却下が 4 件出た。`#3` が `docs/plan.md` を書き終えて
+/// `Done` になった瞬間にその範囲が誰のものでもなくなり、`#3` より前に
+/// 基準点を取っていた `#4` と `#7` の実測に `docs/plan.md` が現れて、
+/// 両方が「担当外のファイルが実際に変更されています」で落ちた
+/// (25 分走って完了 0 件)。
+///
+/// **見逃しは増えない。** 範囲を持つタスクは割り当て中も [`occupies`] で
+/// 同じように遮蔽されているので、ここで延ばしているのは遮蔽の**期間**
+/// だけで、遮蔽の**種類**は増えていない。一度も配られていないタスクの
+/// 範囲は従来どおり誰のものでもない (`assigned.is_none()`) ので、
+/// そこへの書き込みは今までどおり担当外として上がる。
+pub fn claimed(t: &Task) -> bool {
+    t.assigned.is_some() && !t.files.is_empty()
+}
+
 /// 候補タスクを `to` へ割り当ててよいか。**I/O を持たない純粋関数**。
 ///
 /// - 既に**他のセッション**へ割り当て済みで実行中のタスクと重なったら `Overlap`
@@ -2535,6 +2561,59 @@ impl QuotaWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 所有: 「いま押さえている」と「この Run で配った」は別 ──────────
+
+    /// **`claimed` は終端を含み、`occupies` は含まない。**
+    ///
+    /// 割り当ての可否 ([`admit`]) は「いま押さえているか」で決める —
+    /// 終わったタスクの範囲は次の担当へ配ってよい。一方で「その変更は
+    /// 誰の成果か」を決めるときに終端を外すと、**書き終えた瞬間にその
+    /// ファイルが誰のものでもなくなる**。作業ツリーの変更は完了しても
+    /// 消えないので、後から報告した担当の実測にそのまま現れて
+    /// 「担当外を変更した」で落ちる (実機で 4 件・完了 0 件)。
+    #[test]
+    fn 配り終えた範囲は所有の証明としては残る() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        let now = t0();
+        let id = c.add_task_with_files("書く", "", &[], &["docs/plan.md"], now);
+
+        // まだ配られていない = どちらでもない (Test 1 の保証)。
+        let t = c.task(id).expect("タスク");
+        assert!(!occupies(t), "配る前から押さえていることになっている");
+        assert!(!claimed(t), "配る前から配ったことになっている");
+
+        c.try_assign(id, &[SessionInfo::new(1, SessionState::Idle, &[])], now)
+            .expect("配れる");
+        let t = c.task(id).expect("タスク");
+        assert!(occupies(t), "配った直後に押さえていない");
+        assert!(claimed(t), "配った直後に配ったことになっていない");
+
+        // 完了 = 手は離すが、書いたものは作業ツリーに残る。
+        c.note_done(id, now);
+        let t = c.task(id).expect("タスク");
+        assert!(!occupies(t), "終端なのに押さえたままになっている");
+        assert!(
+            claimed(t),
+            "書き終えた範囲が誰のものでもなくなった (次に報告した担当が落ちる)"
+        );
+    }
+
+    /// **範囲を持たないタスクは、どちらでも所有を主張しない。**
+    /// 範囲が空のまま所有を主張すると、全部が「他人のもの」になる。
+    #[test]
+    fn 範囲が空なら所有を主張しない() {
+        let mut c = Coordinator::new();
+        c.register_session(1);
+        let now = t0();
+        let id = c.add_task("範囲なし", "", &[], now);
+        c.try_assign(id, &[SessionInfo::new(1, SessionState::Idle, &[])], now)
+            .expect("配れる");
+        let t = c.task(id).expect("タスク");
+        assert!(!occupies(t));
+        assert!(!claimed(t));
+    }
 
     fn t0() -> Instant {
         Instant::now()

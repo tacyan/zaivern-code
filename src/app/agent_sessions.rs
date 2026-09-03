@@ -580,11 +580,17 @@ impl ZaivernApp {
             let peek = submit::Peek {
                 // **起動直後は書かない。** 待つ長さはカタログが持つので、
                 // ここに CLI ごとの分岐は作らない。
+                // 起動時プロンプトに答えた直後も同じだけ待つ (答えた 71ms 後に
+                // 貼った指示が丸ごと消えた実測がある)。判定は `submit::input_ready`
+                // 1 か所。
                 input_ready: s
                     .agent_bin()
                     .map(|b| {
-                        s.age()
-                            >= std::time::Duration::from_millis(crate::agents::input_ready_ms(b))
+                        submit::input_ready(
+                            s.age(),
+                            s.since_startup_reply(),
+                            std::time::Duration::from_millis(crate::agents::input_ready_ms(b)),
+                        )
                     })
                     .unwrap_or(true),
                 running: s.running(),

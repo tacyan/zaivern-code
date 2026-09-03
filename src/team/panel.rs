@@ -222,7 +222,21 @@ pub struct NewRunForm {
     pub error: String,
     /// 仕様書への書き換えの進み具合。
     pub draft: DraftState,
+    /// **人が体の数か役割を手で変えたか。**
+    ///
+    /// 偽のあいだは、計画・書き換えのたびに
+    /// [`super::composition::recommend`] の編成を当てる (依頼の形に合わせて
+    /// 2 体になったり 12 体になったりする)。真になったら二度と上書きしない —
+    /// 人の判断をおすすめで潰さない。
+    pub composition_touched: bool,
+    /// 作業場の観測結果 (おすすめの根拠。フォルダを切り替えたら取り直す)。
+    pub probe: super::composition::WorkspaceProbe,
 }
+
+/// フォームのスライダの上限 = おすすめが出せる体の数の上限。
+/// **2 か所に数を書かない** — スライダとおすすめが別の上限を持つと、
+/// 「おすすめは 20 体なのにスライダは 16 まで」のような嘘が出る。
+pub const FORM_MAX_AGENTS: usize = 16;
 
 impl Default for NewRunForm {
     fn default() -> Self {
@@ -249,6 +263,8 @@ impl Default for NewRunForm {
             cost_limit: 0.0,
             error: String::new(),
             draft: DraftState::Idle,
+            composition_touched: false,
+            probe: super::composition::WorkspaceProbe::default(),
         }
     }
 }
@@ -746,7 +762,9 @@ impl TeamPanel {
         Err(why)
     }
 
-    /// 既定のプリセットで計画する (CLI 経由と、表題を SPEC から起こす場合)。
+    /// 既定のプリセットで計画する (テストの足場。製品の入口は CLI 経由も
+    /// GUI 経由も [`Self::plan_with`] 1 本 — 投函の Run にも編成を当てるため)。
+    #[cfg(test)]
     pub fn plan(&mut self, spec_text: &str, source: &str, opts: RunOptions) -> Result<(), String> {
         self.plan_with(spec_text, source, opts, Vec::new(), "")
     }
@@ -2661,6 +2679,7 @@ mod tests {
         assert_eq!(f.max_attempts, 3);
         assert!(f.review_required);
         assert_eq!(f.approval_mode, "ask");
+        assert!(!f.composition_touched, "開いた直後は手で変えていない");
         // 既定のプリセットは実装 + レビュー
         assert_eq!(
             f.roles,

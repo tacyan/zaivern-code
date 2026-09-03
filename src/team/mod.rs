@@ -42,6 +42,7 @@
 //! 使い方と設計の全体像は `docs/team.md`。
 
 pub mod changeset;
+pub mod composition;
 pub mod cli;
 pub mod graph;
 pub mod inspector;
@@ -63,6 +64,7 @@ pub mod state_machine;
 pub mod validation_command;
 pub mod validation_defaults;
 pub mod view_model;
+pub mod webcheck;
 
 #[cfg(test)]
 mod testkit;

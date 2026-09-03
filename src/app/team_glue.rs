@@ -151,11 +151,23 @@ impl ZaivernApp {
         let Some(req) = launch::take_in(&root, &ws, now) else {
             return;
         };
+        // **CLI から来た Run にも、依頼の形に合わせた編成を当てる。**
+        // 画面のフォームだけで当てると、`zai team run` は既定の
+        // 「レビュー必須」のまま計画され、1 枚の HP に「#1 のレビュー」が
+        // 1 本増えて直列に 1 段延びる (実測: 試行 3)。体の数は `--agents` で
+        // 人が言ったものを尊重し、役割とレビューの有無だけを当てる。
+        let rec = {
+            use crate::features::team::imp::composition;
+            let probe = composition::probe_workspace(&ws);
+            composition::recommend(&req.spec_text, &probe, req.agent_count.max(1))
+        };
         let opts = RunOptions {
             spec_source: req.spec_path.display().to_string(),
             agent_count: req.agent_count,
+            review_required: rec.review_required,
             ..RunOptions::default()
         };
+        let roles = rec.roles.clone();
         let auto = req.auto_start;
         let rewrite_short = planner::needs_spec_rewrite(&req.spec_text);
         let approval_mode = self.cfg.approval_mode.clone();
@@ -184,7 +196,7 @@ impl ZaivernApp {
                 Ok(())
             } else {
                 p.form.open = false;
-                let r = p.plan(&req.spec_text, &opts.spec_source.clone(), opts);
+                let r = p.plan_with(&req.spec_text, &opts.spec_source.clone(), opts, roles, "");
                 if r.is_ok() && auto {
                     // `--yes` は **Start Team の確認だけ**を省く。仕様書の
                     // 書き換え確認までは省かない。
@@ -661,6 +673,16 @@ impl ZaivernApp {
         };
         let acts = panel::with_panel(|p| {
             p.refresh_snapshot(now);
+            // おすすめの根拠 (作業場の観測) は、**フォルダが変わったときだけ**
+            // 取り直す。毎フレーム read_dir すると、フォームを開いている間
+            // ずっとディスクを叩く (設計原則 3)。
+            if p.form.open {
+                let ws = p.workspace().display().to_string();
+                if p.form.probe.path != ws {
+                    p.form.probe =
+                        crate::features::team::imp::composition::probe_workspace(p.workspace());
+                }
+            }
             let mut form = p.form.clone();
             let mut acts = organization_board::board_window(
                 ctx,
@@ -841,7 +863,7 @@ impl ZaivernApp {
     /// 実行は裏のスレッド。UI スレッドで待つと、考えている数分ぶん
     /// フレームが止まる (CLAUDE.md「git は UI スレッドで待たない」と同じ理由)。
     fn team_draft_spec(&mut self) {
-        let (ws, form) = panel::with_panel(|p| (p.workspace().to_path_buf(), p.form.clone()));
+        let (ws, mut form) = panel::with_panel(|p| (p.workspace().to_path_buf(), p.form.clone()));
         // 書き換えの材料は、計画へ渡すのと**同じ経路**で取る
         // (別々に取ると「画面で見た指示」と「書き換えた指示」がずれる)。
         let brief = if form.from_file {
@@ -864,6 +886,27 @@ impl ZaivernApp {
             panel::with_panel(|p| p.form.error = tr("team.draft.empty_brief"));
             return;
         }
+        // **依頼の形に合わせた編成を当てる** (人が手で変えていなければ)。
+        // ここで当てないと、書き換え依頼文が「最大 4 体・6 役割」のまま
+        // 飛んで、1 枚の HP が 8 本の SPEC に割られる (実測)。
+        let rec = self.team_apply_recommendation(&mut form, &brief, &ws);
+        let shape = rec.shape;
+        // **1 枚の成果物は、仕様書をこちらで書く。** headless のエージェントに
+        // 最大 5 分待つ理由が無い (毎回同じ形: 実装 1 本 + 検証 1 本)。
+        // 10 分の予算の半分を「仕様書を書いてもらう」ことに使わない。
+        // 確認は従来どおり人がする (`DraftState::Ready`)。
+        if let Some(text) =
+            crate::features::team::imp::composition::spec_template(&form.goal_name, &brief, &rec)
+        {
+            panel::with_panel(|p| {
+                p.form.error.clear();
+                p.form.draft = panel::DraftState::Ready {
+                    agent: "Zaivern".to_string(),
+                    text,
+                };
+            });
+            return;
+        }
         // **使えるエージェント = ヘッドレスで走らせられるもの。**
         // 対話 TUI しか持たない CLI をここで起こすと、返らないまま
         // 時間切れを待つだけになる。
@@ -882,6 +925,7 @@ impl ZaivernApp {
             form.agents,
             &form.roles,
             &candidates,
+            shape,
         );
         let (tx, rx) = std::sync::mpsc::channel();
         let cwd = ws.clone();
@@ -900,6 +944,38 @@ impl ZaivernApp {
             p.form.error.clear();
             p.begin_draft(&label, rx);
         });
+    }
+
+    /// **依頼の形に合わせた編成をフォームへ当てる。** 戻り値は依頼の形
+    /// (書き換え依頼文の作法に使う)。
+    ///
+    /// 当てるのは人が体の数・役割を手で変えていないときだけ
+    /// (`composition_touched`)。当てた結果は画面のフォームにも書き戻す —
+    /// 「計画は 2 体で立ったのにフォームは 4 体のまま」を残さない。
+    /// 判断の表は `composition` 1 か所 (ここは当てるだけ)。
+    fn team_apply_recommendation(
+        &self,
+        form: &mut panel::NewRunForm,
+        brief: &str,
+        ws: &std::path::Path,
+    ) -> crate::features::team::imp::composition::Recommendation {
+        use crate::features::team::imp::composition;
+        let probe = composition::probe_workspace(ws);
+        let rec = composition::recommend(brief, &probe, panel::FORM_MAX_AGENTS);
+        if !form.composition_touched {
+            form.agents = rec.agents;
+            form.roles = rec.roles.clone();
+            // 1 枚の成果物ではテスト担当がレビューを兼ねる (別レーンは往復が増える)。
+            form.review_required = rec.review_required;
+            let (agents, roles, review) = (rec.agents, rec.roles.clone(), rec.review_required);
+            panel::with_panel(|p| {
+                p.form.agents = agents;
+                p.form.roles = roles;
+                p.form.review_required = review;
+                p.form.probe = probe;
+            });
+        }
+        rec
     }
 
     /// **この PC で実際に起動できるプリセットの一覧。**
@@ -1007,6 +1083,11 @@ impl ZaivernApp {
             self.team_draft_spec();
             return;
         }
+        // **計画にも同じ編成を当てる。** 書き換えの段だけで当てると、
+        // 書き換えを経ない (最初から分かれている) SPEC が既定の 6 役割・
+        // 4 体のまま計画され、画面のおすすめと実際の編成が食い違う。
+        let mut form = form;
+        self.team_apply_recommendation(&mut form, &spec_text, &ws);
         let opts = RunOptions {
             // **秒だけで作らない。** 同じ秒に 2 回始めると ID が衝突し、
             // 前の Run の検証結果や承認が新しい Run の同じ番号のタスクへ
@@ -1215,7 +1296,7 @@ mod short_spec_route_tests {
             .find("planner::needs_spec_rewrite(&req.spec_text)")
             .expect("CLI でも短い指示を判定している");
         let plan = body
-            .find("p.plan(&req.spec_text")
+            .find("p.plan_with(&req.spec_text")
             .expect("通常SPECの計画口");
         assert!(gate < plan, "計画より後に短さを判定している:\n{body}");
         assert!(body.contains("p.form = panel::NewRunForm::default()"));

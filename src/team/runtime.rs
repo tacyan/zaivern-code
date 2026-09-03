@@ -383,6 +383,9 @@ pub struct TeamRuntime {
     /// 保存しない — `previews` と同じ理由で、再起動後に前の実行の静けさを
     /// 引き継ぐと、起こし直したばかりの担当をいきなり停滞と呼ぶ。
     stalls: BTreeMap<AgentId, StallWatch>,
+    /// **時間の予算を越えたと 1 度だけ伝えた担当のタスク。** 保存しない
+    /// (再起動したら、もう 1 度だけ言えばよい)。
+    budget_nudged: std::collections::BTreeSet<TaskId>,
     /// **一度書いた「割り当てを見送りました」の覚え書き。**
     ///
     /// 断りは配置から導かれるので、配置が変わるまで毎 tick 同じ行が出る。
@@ -559,6 +562,44 @@ pub fn stall_nudge_text(task: TaskId, title: &str) -> String {
         title = title.chars().take(60).collect::<String>()
     )
 }
+/// 完了条件に書かれた時間の予算 (秒)。書いていなければ `None`。
+///
+/// 読むのは「**N 分以内**」の形だけ (雛形 [`super::composition::spec_template`]
+/// が書く形)。SPEC が真実で、Runtime に別の欄を増やさない — 欄を増やすと
+/// 「SPEC には 10 分と書いてあるのに Runtime は 15 分で数える」が起こりうる。
+pub fn time_budget_secs(definition_of_done: &[String]) -> Option<u64> {
+    for line in definition_of_done {
+        let Some(at) = line.find("分以内") else {
+            continue;
+        };
+        let head = &line[..at];
+        let digits: String = head
+            .chars()
+            .rev()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            if n > 0 {
+                return Some(n * 60);
+            }
+        }
+    }
+    None
+}
+
+/// 予算超過の促し。**報告の形式は最初の指示にある** (ここに二度書かない)。
+pub fn budget_nudge_text(task: TaskId, budget_min: u64) -> String {
+    format!(
+        "[Zaivern] ⏱ 開始から {budget_min} 分の予算を越えました。磨くのを止めて、\n\
+         いまの状態のまま #{task} を最初の指示にある形式で完了報告してください。\n\
+         直すべき点は検証担当が伝言で返します — 先に動くものを出すほうが速く良くなります。"
+    )
+}
+
 /// 担当 1 体ぶんの進捗の覚え書き。**保存しない。**
 ///
 /// 保存すると再起動後に「前の実行の静けさ」を引き継いで、起こし直した
@@ -822,6 +863,7 @@ impl TeamRuntime {
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
             stalls: BTreeMap::new(),
+            budget_nudged: std::collections::BTreeSet::new(),
             blocked_notes: HashSet::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
@@ -954,6 +996,7 @@ impl TeamRuntime {
             previews: BTreeMap::new(),
             pending_msgs: Vec::new(),
             stalls: BTreeMap::new(),
+            budget_nudged: std::collections::BTreeSet::new(),
             blocked_notes: HashSet::new(),
             outbox: PathBuf::new(),
             seen_blocks: HashSet::new(),
@@ -2066,6 +2109,11 @@ impl TeamRuntime {
             // 止めている間 (Pause / Stop) は撃たない。人が止めたものを
             // 「止まっている」と咎めることになるため。
             self.nudge_stalled(obs.now, &mut out);
+            // **時間の予算を越えたら、磨くのを止めて報告させる。** 動いている
+            // 担当は停滞ではないので `nudge_stalled` は黙っている — 実測で
+            // 1 枚の HP の実装担当が 10 分の予算を越えて 10 分以上
+            // 「Choreographing…」を続け、検証担当が 1 度も出番を得なかった。
+            self.nudge_over_budget(obs.now, &mut out);
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
         }
@@ -2345,6 +2393,54 @@ impl TeamRuntime {
     ///   停止が観測できてから `settle_reassign` → `free_task` が行う。
     /// * 人へ上げる — 既存の [`DecisionKind::AttemptsExhausted`]。
     ///   **新しい種別は増やさない。**
+    /// **時間の予算を越えた実装担当に、1 度だけ「いま報告して」と言う。**
+    ///
+    /// 予算は完了条件の「N 分以内」から読む ([`time_budget_secs`])。
+    /// 相手は実装担当だけ — 検証担当が予算を越えるのは実装が遅れたからで、
+    /// 急かしても直らない。促しは [`TeamEffect::SendManualInstruction`]
+    /// (人の指示と同じ経路) で、鍵はイベント ID から作る。
+    fn nudge_over_budget(&mut self, now: u64, out: &mut Vec<TeamEffect>) {
+        let Some(budget) = time_budget_secs(&self.goal.definition_of_done) else {
+            return;
+        };
+        if now.saturating_sub(self.run.started_at) < budget {
+            return;
+        }
+        let due: Vec<(TaskId, String, AgentId, SessionId)> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+                    && t.role == super::model::TeamRole::Implementer
+                    && !self.budget_nudged.contains(&t.id)
+            })
+            .filter_map(|t| {
+                let agent = t.assigned_agent.clone()?;
+                let session = t.assigned_session?;
+                Some((t.id, t.title.clone(), agent, session))
+            })
+            .collect();
+        for (task, _title, agent, session) in due {
+            let id = self.log_to(
+                TeamEventKind::AgentBlocked,
+                None,
+                Some(agent.clone()),
+                format!(
+                    "#{task} は予算 {} 分を越えました。いまの状態で報告するよう促します",
+                    budget / 60
+                ),
+            );
+            out.push(TeamEffect::SendManualInstruction {
+                agent: agent.clone(),
+                session,
+                text: budget_nudge_text(task, budget / 60),
+                key: manual_instruction_key(&agent, id),
+            });
+            self.budget_nudged.insert(task);
+            self.dirty = true;
+        }
+    }
+
     fn nudge_stalled(&mut self, now: u64, out: &mut Vec<TeamEffect>) {
         let floor = stall_floor_secs();
         // 借用を分けるため、拾うところまでを先に済ませる。
@@ -2826,26 +2922,66 @@ impl TeamRuntime {
                 format!("#{task_id} は実測を照合していません: {why}"),
             );
         }
-        match rp::accept(doc, &task, &evidence) {
+        // 受理の関門は 2 段: 報告の形と担当範囲 (`rp::accept`) と、
+        // Web の成果物なら読み込みの実在 (`web_gate`)。どちらで落ちても
+        // 本人へ同じ形で伝える。
+        let verdict = rp::accept(doc, &task, &evidence)
+            .map_err(|e| e.detail())
+            .and_then(|acc| match self.web_gate(&task, &acc) {
+                None => Ok(acc),
+                Some(why) => Err(why),
+            });
+        match verdict {
             Ok(acc) => self.apply_accepted(agent, acc, attribution),
-            Err(e) => {
+            Err(detail) => {
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
                 self.log(
                     TeamEventKind::Rejected,
                     Some(agent.clone()),
                     None,
-                    format!("#{task_id} の完了報告を却下: {}", e.detail()),
+                    format!("#{task_id} の完了報告を却下: {detail}"),
                 );
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.context.push(clamp_text(&format!(
-                        "前回の完了報告は却下されました: {}",
-                        e.detail()
+                        "前回の完了報告は却下されました: {detail}"
                     )));
                     t.context = clamp_list(std::mem::take(&mut t.context));
                     t.updated_at = now_secs();
                 }
                 self.dirty = true;
             }
+        }
+    }
+
+    /// **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
+    ///
+    /// 静的なサイトには検証コマンドが無い (`Cargo.toml` も `package.json` も
+    /// 無い) ので、ここを通さないと「`index.html` が 404 を 2 本抱えたまま
+    /// 完了」が起きる (実機)。走査は速い (存在だけを見る) ので、Web の
+    /// ファイルに触る完了報告に限って**その場で**見る。コンソールの検査は
+    /// Chrome を起こす (数秒) ので、描画スレッドのここではしない —
+    /// `zai team check` と検証担当の手に置く。
+    fn web_gate(&self, task: &TeamTask, acc: &rp::AcceptedResult) -> Option<String> {
+        if acc.status != ReportedStatus::Completed {
+            return None;
+        }
+        let touches_web = task
+            .files
+            .iter()
+            .chain(acc.changed_files.iter())
+            .chain(acc.reported_files.iter())
+            .any(|f| super::webcheck::is_web_path(f));
+        if !touches_web {
+            return None;
+        }
+        match super::webcheck::scan(&self.workspace) {
+            Ok(bad) if bad.is_empty() => None,
+            Ok(bad) => Some(format!(
+                "読み込むと言ったファイルがありません: {}",
+                bad.iter().map(|d| d.detail()).collect::<Vec<_>>().join(" / ")
+            )),
+            // 測れないときは止めない (大きすぎる作業場)。
+            Err(_) => None,
         }
     }
 
@@ -3953,18 +4089,24 @@ impl TeamRuntime {
         // 「担当外を変更した完了報告は拒否する」という保証そのものを壊す。
         //
         // 所有の真実は**既存の Coordinator** が持っている
-        // ([`coordinator::occupies`] — `admit` が割り当ての可否に使うのと
-        // 同じ判定)。Team 側に 2 つ目の所有台帳を作らない。
+        // ([`coordinator::claimed`])。Team 側に 2 つ目の所有台帳を作らない。
+        //
+        // **`occupies` ではなく `claimed` を使う。** `occupies` は「いま
+        // 押さえているか」なので、書き終えて `Done` になった瞬間に範囲が
+        // 誰のものでもなくなる。作業ツリーの変更は完了しても消えないので、
+        // その後に報告した担当が「担当外を変更した」で落ちる (実機で 4 件)。
         //
         // 証明できないものは除かない = 担当外として上げる (fail-closed)。
-        // 見逃しより誤検知のほうが軽い — 誤検知は人が見れば分かるが、
-        // 見逃した違反は台帳に「担当内だけ」と残って誰も気付けない。
+        // 見逃しより誤検知のほうが軽い — と考えていたが、実機では誤検知が
+        // **Run そのものを止めた** (25 分・6 体で完了 0 件)。一度も配られて
+        // いないタスクの範囲は今までどおり誰のものでもないので、そちらの
+        // 見逃しは増えていない。
         let self_coord = task.coordinator_task;
         let others: Vec<String> = self
             .co
             .tasks()
             .iter()
-            .filter(|t| Some(t.id) != self_coord && coordinator::occupies(t))
+            .filter(|t| Some(t.id) != self_coord && coordinator::claimed(t))
             .flat_map(|t| t.files.clone())
             .collect();
         let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);
@@ -5392,5 +5534,37 @@ mod stall_tests {
             stop_requests(&rt).is_empty(),
             "進んでいる担当の回収要求が出てはいけない"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// **完了条件の「N 分以内」だけを予算として読む。**
+    #[test]
+    fn 完了条件から時間の予算を読む() {
+        let dod = vec![
+            "`index.html` を開くとコンソールにエラーが出ない".to_string(),
+            "開始から 10 分以内に上の条件を満たしている".to_string(),
+        ];
+        assert_eq!(time_budget_secs(&dod), Some(600));
+        // 数字が無い・0・別の語は読まない。
+        assert_eq!(time_budget_secs(&["分以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&["0 分以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&["3 日以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&[]), None);
+        // 空白なしでも読む。
+        assert_eq!(time_budget_secs(&["15分以内に".to_string()]), Some(900));
+    }
+
+    /// 促しの文面は「いま報告しろ」と「磨きは後」を言い、形式は二度書かない。
+    #[test]
+    fn 予算超過の促しは報告を求める() {
+        let t = budget_nudge_text(3, 10);
+        assert!(t.contains("#3"));
+        assert!(t.contains("10 分"));
+        assert!(t.contains("完了報告"));
+        assert!(!t.contains("[ZAI-TEAM-RESULT]"), "形式をここに二度書いている");
     }
 }

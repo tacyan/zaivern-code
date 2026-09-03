@@ -497,12 +497,12 @@ fn cli起動とgui起動は同じruntimeを通る() {
 
     let glue = src(GLUE);
     assert!(
-        glue.contains("p.plan(&req.spec_text"),
+        glue.contains("p.plan_with(&req.spec_text"),
         "GUI が投函された SPEC で計画していない"
     );
-    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本へ落ちる
+    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本 (`plan_with`) へ落ちる。
     assert!(
-        glue.contains("p.plan(&req.spec_text") && glue.contains("p.plan_with("),
+        glue.matches("p.plan_with(").count() >= 2,
         "CLI 経由と GUI 経由で入口が分かれている"
     );
 
@@ -1342,4 +1342,108 @@ fn 計画ができたら始め方がその場に出る() {
         s.contains("ready_to_start_row(ui, theme, snap, acts)"),
         "案内が盤面から呼ばれていない"
     );
+}
+
+#[test]
+fn おすすめの編成は計画と書き換えの両方に当たる() {
+    // **画面のおすすめと、実際に使う編成を食い違わせない。** 書き換えの段
+    // だけで当てると、最初から分かれている SPEC は既定の 6 役割・4 体の
+    // まま計画される。計画の段だけで当てると、書き換え依頼文が 4 体・
+    // 6 役割のまま飛んで 1 枚の HP が 8 本に割られる (実測)。
+    let glue = src(GLUE);
+    for f in ["fn team_draft_spec", "fn team_plan_from_form_inner"] {
+        let body = function_body(&glue, glue.find(f).expect(f));
+        assert!(
+            body.contains("team_apply_recommendation("),
+            "{f} がおすすめの編成を当てていない"
+        );
+    }
+    let apply = function_body(
+        &glue,
+        glue.find("fn team_apply_recommendation")
+            .expect("おすすめを当てる口"),
+    );
+    // 人が手で変えた編成は上書きしない。
+    assert!(
+        apply.contains("if !form.composition_touched"),
+        "手で変えた編成を上書きしている"
+    );
+    // 当てた結果は画面へ書き戻す (計画は 2 体なのにフォームは 4 体、を残さない)。
+    assert!(
+        apply.contains("p.form.agents = ") && apply.contains("p.form.roles = "),
+        "画面のフォームへ書き戻していない"
+    );
+    let board = src(BOARD);
+    assert!(
+        board.contains("form.composition_touched = true"),
+        "手で変えたことを記録していない (おすすめが毎回上書きする)"
+    );
+    assert!(
+        board.contains("recommendation_section(ui, theme, form)"),
+        "おすすめの段が画面から呼ばれていない"
+    );
+}
+
+#[test]
+fn 一枚の成果物は仕様書をこちらで書きwebの完了は読み込みを確かめる() {
+    // **10 分の予算を、仕様書を書いてもらう 5 分で使わない。** 1 枚の成果物は
+    // 雛形が出るので、エージェントを起こす前に返す。
+    let glue = src(GLUE);
+    let body = function_body(&glue, glue.find("fn team_draft_spec").expect("書き換え"));
+    let tpl = body.find("spec_template(").expect("雛形を使っていない");
+    let agent = body.find("team_headless_agent()").expect("エージェントの選定");
+    assert!(tpl < agent, "雛形より先にエージェントを起こしている (5 分待つ)");
+    assert!(
+        body.contains("DraftState::Ready"),
+        "雛形を人の確認へ回していない (黙って採用している)"
+    );
+    // **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
+    let rt = src(include_str!("runtime.rs"));
+    assert!(
+        rt.contains("match self.web_gate(&task, &acc)"),
+        "完了報告の受理が読み込みの実在を見ていない"
+    );
+    let gate = function_body(&rt, rt.find("fn web_gate").expect("関門"));
+    assert!(
+        gate.contains("webcheck::scan("),
+        "関門が走査していない"
+    );
+}
+
+#[test]
+fn 予算を越えた実装担当は促される() {
+    // **動いている担当は停滞ではない**ので `nudge_stalled` は黙る。だから
+    // 予算の促しは別に要る。tick が両方を、止めている間は撃たない場所で呼ぶ。
+    let rt = src(include_str!("runtime.rs"));
+    let tick = rt.find("self.nudge_stalled(obs.now, &mut out);").expect("停滞の促し");
+    let budget = rt.find("self.nudge_over_budget(obs.now, &mut out);").expect("予算の促し");
+    assert!(budget > tick && budget - tick < 600, "予算の促しが停滞の促しの隣に無い");
+    let body = function_body(&rt, rt.find("fn nudge_over_budget").expect("関数"));
+    assert!(body.contains("time_budget_secs(&self.goal.definition_of_done)"), "予算を完了条件から読んでいない");
+    assert!(body.contains("TeamRole::Implementer"), "実装担当以外まで急かしている");
+    assert!(body.contains("budget_nudged"), "1 度だけ、になっていない");
+    assert!(body.contains("TeamEffect::SendManualInstruction"), "人の指示と同じ経路を使っていない");
+}
+
+#[test]
+fn cliから来たrunにもおすすめの編成が当たる() {
+    // **画面のフォームだけで当てない。** `zai team run` は既定の「レビュー
+    // 必須」のまま計画され、1 枚の HP に「#1 のレビュー」が 1 本増えて
+    // 直列に 1 段延びた (実測: 試行 3)。体の数は `--agents` を尊重し、
+    // 役割とレビューの有無だけを依頼の形から当てる。
+    let glue = src(GLUE);
+    let body = function_body(
+        &glue,
+        glue.find("fn team_take_launch_request").expect("投函の受け取り"),
+    );
+    assert!(body.contains("composition::recommend("), "投函の Run に編成を当てていない");
+    assert!(
+        body.contains("review_required: rec.review_required"),
+        "レビューの有無を当てていない (1 枚の HP にレビューが 1 段増える)"
+    );
+    assert!(
+        body.contains("agent_count: req.agent_count"),
+        "--agents で人が言った体の数を上書きしている"
+    );
+    assert!(body.contains("p.plan_with("), "役割を計画へ渡していない");
 }

@@ -471,6 +471,15 @@ pub struct Session {
     /// あとに立て、同じプロンプトが画面に残っていても二度目の応答・再検出をしない。
     /// プロンプトが画面から消える、または別のプロンプトに変わったら下ろす。
     answered_sig: Option<u64>,
+    /// **起動時プロンプト (フォルダ信頼確認など) に自動で答えた時刻。**
+    ///
+    /// 答えた直後、CLI は画面を作り直す (Claude Code は信頼確認のあとで
+    /// 起動画面を出し直す)。その最中に書いた本文は**丸ごと捨てられる** —
+    /// 実測: 信頼確認への返事の 71ms 後に 6.6KB の指示を貼り、起動画面は
+    /// その後に出た。担当は 5 分間なにも受け取らないまま「作業中」だった。
+    /// 「もう受け取れるか」の時計はセッション開始だけでなく**ここからも**
+    /// 数え直す ([`Self::since_startup_reply`])。
+    startup_reply_at: Option<Instant>,
     /// 自動YESの停滞監視: 自動応答したのにプロンプトが固まったままのとき、
     /// 「画面が意味的に変化していない時間」の起点。自動YESが送った応答にだけ立て、
     /// ユーザーの手動応答 (resolve_attention 経由) では None に戻す — 手動運転中に
@@ -2399,6 +2408,7 @@ impl Session {
             launched_bypass,
             last_scan: Instant::now(),
             answered_sig: None,
+            startup_reply_at: None,
             auto_stall_since: None,
             auto_stall_hash: 0,
             auto_yes_resend_after: Duration::from_secs(30),
@@ -2467,6 +2477,13 @@ impl Session {
     /// 「もう受け取れるか」を決めるのに使う (待つ長さはカタログが持つ)。
     pub fn age(&self) -> std::time::Duration {
         self.started.elapsed()
+    }
+
+    /// 起動時プロンプトに自動で答えてからの経過 (答えていなければ `None`)。
+    /// 送信側は [`Self::age`] と**両方**が待ち時間を越えてから書く
+    /// ([`crate::submit::input_ready`])。
+    pub fn since_startup_reply(&self) -> Option<std::time::Duration> {
+        self.startup_reply_at.map(|t| t.elapsed())
     }
 
     pub fn agent_bin(&self) -> Option<&'static str> {
@@ -2605,6 +2622,9 @@ impl Session {
                 self.answered_sig = sig;
                 self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
+                // 答えた瞬間から「受け取れるまで」を数え直す (CLI が画面を
+                // 作り直す間に書いた本文は捨てられる)。
+                self.startup_reply_at = Some(now);
                 self.write_bytes(bytes);
                 self.attention = false;
                 return Some(Attention::AutoReplied(desc));
