@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::model::*;
+use super::outbox::{self, Verdict};
 use super::persistence::{self, LoadOutcome};
 use super::planner::{PlanInput, StaticPlanner, TeamPlanner};
 use super::runtime::{Observation, RunOptions, RunOwner, TeamAction, TeamEffect, TeamRuntime};
@@ -161,18 +162,12 @@ pub enum DraftState {
 /// Run ごとの保存先を束ねるフォルダ名 (`<workspace>/runs/<run_id>/`)。
 pub const RUNS_DIR: &str = "runs";
 
-/// **報告を受け取るフォルダ**の名前 (`<state_dir>/outbox/<run_id>/`)。
-///
-/// 画面から読むのをやめてここから読む。Claude Code v2 は報告を改行ではなく
-/// カーソル移動で描くので、画面のグリッドでは行が潰れて**構造的に**
-/// 取りこぼす (実測)。`ZAIVERN_HOME` の下に置くのは、ワークスペースへ
-/// 置くと `changeset` が「担当外を変更した」と測って報告ごと却下されるため。
-pub const OUTBOX_DIR: &str = "outbox";
-
-/// 1 回の tick で取り込む報告ファイルの数の上限。
+/// 1 回の tick で見る報告ファイルの数の上限 (**全 Run 合わせて**)。
 ///
 /// 上限が無いと、暴走したエージェントが吐いた数千個のファイルを
-/// 1 フレームで読み切ろうとして画面が止まる。
+/// 1 フレームで読み切ろうとして画面が止まる。読み直し (書きかけ・壊れた
+/// ファイル) もこの数に入る — 数えないと、壊れた山の向こうの正しい報告が
+/// 永久に順番待ちになる。置き場の取り決めそのものは [`outbox`]。
 pub const OUTBOX_PER_TICK: usize = 32;
 
 /// **同時に走らせてよい Run の本数。**
@@ -436,6 +431,11 @@ pub struct TeamPanel {
     /// 何のコマンドが失われたのかが分からないと、`validation.running` を
     /// 下ろすことも失敗として記録することもできない。
     validation_jobs: Vec<ValidationJob>,
+    /// **読めなかった報告ファイルの台帳** (回数と、理由を出したか)。
+    ///
+    /// 保存しない — 再起動したら数え直せばよい。Run をまたいでパスで
+    /// 引くので、閉じた Run のぶんは「もう無いファイル」として落ちる。
+    outbox_ledger: outbox::Ledger,
 }
 
 impl Default for TeamPanel {
@@ -470,6 +470,7 @@ impl Default for TeamPanel {
             next_launch_poll: None,
             validation_jobs: Vec::new(),
             dropped_effects: 0,
+            outbox_ledger: outbox::Ledger::default(),
         }
     }
 }
@@ -831,8 +832,11 @@ impl TeamPanel {
         let dir = self.state_dir();
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
         // **Run ごとの置き場も消す。** 残すと、次に開いたときに
-        // 消したはずの Run が戻ってくる。
+        // 消したはずの Run が戻ってくる。報告置き場も同じ — 全 Run を捨てる
+        // ので `outbox/` ごと消してよい (Run 単位の関門は要らない)。
         let _ = std::fs::remove_dir_all(dir.join(RUNS_DIR));
+        let _ = std::fs::remove_dir_all(dir.join(outbox::DIR_NAME));
+        self.outbox_ledger.prune_missing();
         self.runs.clear();
         self.active = 0;
         self.snapshot = None;
@@ -876,77 +880,157 @@ impl TeamPanel {
         }
     }
 
-    /// この Run の報告置き場。
+    /// この Run の報告置き場 (`<state_dir>/outbox/<run_id>/`)。
+    ///
+    /// `run_id` が置き場の名前として安全でなければ**空** — 置き場を持たない
+    /// Run になる (画面から読む経路だけ)。作らないものは閉じるときも消さない
+    /// ので、作る側と消す側が同じ関門 ([`outbox::run_dir`]) を通る。
     fn outbox_dir(&self, run_id: &str) -> PathBuf {
-        self.state_dir().join(OUTBOX_DIR).join(run_id)
+        outbox::run_dir(&self.state_dir(), run_id).unwrap_or_default()
     }
 
-    /// **置き場に届いた報告を読み、読んだファイルは消す。**
+    /// **置き場に届いた報告を読み、取り込めたファイルだけ消す。**
     ///
     /// 戻りは「どのセッションの画面テキストへ足すか」。画面から読む経路と
     /// 同じ入口へ流すので、受理・却下の判断は 1 か所のまま
     /// (第 2 の取り込み経路を作らない)。
     ///
-    /// **消してから渡す。** 消さずに渡すと、次の tick でも同じ報告を読み、
-    /// 却下が並ぶ。読めなかったファイルも消す — 壊れた 1 個が残り続けて
-    /// 毎 tick 同じ失敗を出すほうが困る。
-    fn drain_outbox(&mut self) -> HashMap<SessionId, String> {
+    /// * **Run ごとに独立した表で配送先を引く。** 全 Run を 1 つの表に
+    ///   混ぜると、同じ ID の担当 (`team-lead` は毎 Run に居る) が後の Run の
+    ///   セッションで上書きされ、前の Run の報告が別の Run へ流れる
+    /// * **読んで・解析して・配送できたときだけ消す。** 以前は読む前に消して
+    ///   いたので、書きかけを読んだ瞬間にその報告は永久に失われていた
+    /// * 読めないファイルは残して次の tick で読み直す。上限
+    ///   ([`outbox::MAX_ATTEMPTS`]) で `rejected/` へ隔離し、理由を Run の
+    ///   記録へ残す (壊れた 1 個が残り続けて毎 tick 同じ失敗を出さない)
+    /// * 担当はファイル名と本文の両方で決める ([`outbox::judge`])。
+    ///   `agent-1` が `agent-10-…` を拾うことは無い
+    /// * 1 tick に見る数は全 Run 合わせて [`OUTBOX_PER_TICK`]
+    /// * `observed` は**今回の観測に載っているセッション**。載っていない
+    ///   セッション宛ては消さずに残す — 渡した先が無いのに消すと、その報告は
+    ///   誰にも読まれないまま失われる
+    fn drain_outbox(&mut self, observed: &HashSet<SessionId>) -> HashMap<SessionId, String> {
         let mut out: HashMap<SessionId, String> = HashMap::new();
-        // エージェント ID → セッション (どの Run のものかもここで決まる)。
-        let mut who: HashMap<String, SessionId> = HashMap::new();
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        for rt in &self.runs {
-            if rt.outbox().as_os_str().is_empty() {
+        let mut budget = OUTBOX_PER_TICK;
+        'runs: for run in 0..self.runs.len() {
+            let dir = self.runs[run].outbox().to_path_buf();
+            if dir.as_os_str().is_empty() {
                 continue;
             }
-            dirs.push(rt.outbox().to_path_buf());
-            for a in rt.agents() {
-                if let Some(sid) = a.session_id {
-                    who.insert(a.id.0.clone(), sid);
-                }
-            }
-        }
-        let mut taken = 0usize;
-        for dir in dirs {
-            let Ok(rd) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut files: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            // この Run の担当だけ。ID が同じ別 Run の担当は表に居ない。
+            let ids: Vec<AgentId> = self.runs[run]
+                .agents()
+                .iter()
+                .map(|a| a.id.clone())
                 .collect();
-            files.sort();
-            for f in files {
-                if taken >= OUTBOX_PER_TICK {
-                    break;
+            let sessions: HashMap<AgentId, SessionId> = self.runs[run]
+                .agents()
+                .iter()
+                .filter_map(|a| a.session_id.map(|s| (a.id.clone(), s)))
+                .collect();
+            for f in outbox::list_reports(&dir) {
+                if budget == 0 {
+                    break 'runs;
                 }
-                taken += 1;
-                let body = std::fs::read_to_string(&f).unwrap_or_default();
-                let _ = std::fs::remove_file(&f);
-                let Some(stem) = f.file_stem().and_then(|x| x.to_str()) else {
-                    continue;
+                budget -= 1;
+                let stem = f
+                    .file_stem()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // **読んで解析してから、消すかを決める。**
+                let (body, verdict) = match std::fs::read_to_string(&f) {
+                    Ok(body) => {
+                        let v = outbox::judge(&stem, &body, &ids);
+                        (body, v)
+                    }
+                    Err(e) => (String::new(), Verdict::Retry(format!("読めません: {e}"))),
                 };
-                // `<agent-id>.json` / `<agent-id>-<何か>.json` のどちらも受ける。
-                let Some(sid) = who.get(stem).or_else(|| {
-                    who.iter()
-                        .find(|(id, _)| stem.starts_with(id.as_str()))
-                        .map(|(_, s)| s)
-                }) else {
-                    continue;
-                };
-                // 画面から読むのと**同じ形**にして渡す (入口を 1 つに保つ)。
-                let text = out.entry(*sid).or_default();
-                text.push('\n');
-                text.push_str(super::result_parser::RESULT_OPEN);
-                text.push('\n');
-                text.push_str(body.trim());
-                text.push('\n');
-                text.push_str(super::result_parser::RESULT_CLOSE);
-                text.push('\n');
+                match verdict {
+                    Verdict::Deliver(agent) => match sessions.get(&agent) {
+                        Some(sid) if !observed.contains(sid) => self.outbox_retry(
+                            run,
+                            &f,
+                            format!("担当 {agent} のセッション #{sid} が今回の観測に無い"),
+                        ),
+                        Some(sid) => {
+                            // 画面から読むのと**同じ形**にして渡す (入口を 1 つに保つ)。
+                            let text = out.entry(*sid).or_default();
+                            text.push('\n');
+                            text.push_str(super::result_parser::RESULT_OPEN);
+                            text.push('\n');
+                            text.push_str(body.trim());
+                            text.push('\n');
+                            text.push_str(super::result_parser::RESULT_CLOSE);
+                            text.push('\n');
+                            // **取り込めたときだけ消す。** 消せなくても二重取り込みは
+                            // Runtime の `take_unseen` が防ぐが、残り続けるなら
+                            // 読み直しの上限で隔離して理由を残す。
+                            match std::fs::remove_file(&f) {
+                                Ok(()) => self.outbox_ledger.forget(&f),
+                                Err(e) => {
+                                    self.outbox_retry(run, &f, format!("配送したが消せません: {e}"))
+                                }
+                            }
+                        }
+                        None => self.outbox_retry(
+                            run,
+                            &f,
+                            format!("担当 {agent} にまだセッションが結び付いていません"),
+                        ),
+                    },
+                    Verdict::Retry(why) => self.outbox_retry(run, &f, why),
+                    Verdict::Reject { agent, why } => self.outbox_quarantine(run, &f, agent, why),
+                }
             }
         }
+        self.outbox_ledger.prune_missing();
         out
+    }
+
+    /// 読めなかった報告を数え、上限に達したら隔離する。
+    fn outbox_retry(&mut self, run: usize, file: &Path, why: String) {
+        let n = self.outbox_ledger.bump(file);
+        if n < outbox::MAX_ATTEMPTS {
+            return;
+        }
+        self.outbox_quarantine(
+            run,
+            file,
+            None,
+            format!("{n} 回読んでも取り込めませんでした — {why}"),
+        );
+    }
+
+    /// 取り込めない報告を `rejected/` へ移し、理由を Run の記録へ残す。
+    ///
+    /// 理由は**ファイルごとに 1 回**だけ出す (隔離に失敗して残ったファイルを
+    /// 毎 tick 言い直さない)。
+    fn outbox_quarantine(&mut self, run: usize, file: &Path, agent: Option<AgentId>, why: String) {
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let disposal = outbox::quarantine(file);
+        let announce = self.outbox_ledger.announce_once(file);
+        if disposal.is_ok() {
+            self.outbox_ledger.forget(file);
+        }
+        if !announce {
+            return;
+        }
+        let where_ = match disposal {
+            Ok(outbox::Disposal::Moved(dest)) => format!("{} へ隔離しました", dest.display()),
+            Ok(outbox::Disposal::Deleted) => "消しました".to_string(),
+            Err(e) => format!("隔離できませんでした: {e}"),
+        };
+        if let Some(rt) = self.runs.get_mut(run) {
+            rt.note_outbox_rejected(
+                agent,
+                format!("報告ファイル {name} を取り込めません: {why} ({where_})"),
+            );
+        }
     }
 
     /// app から観測を受け取って 1 tick 進める。**描画の外で呼ぶこと。**
@@ -954,7 +1038,8 @@ impl TeamPanel {
         if self.rt().is_none() || self.read_only {
             return;
         }
-        let inbox = self.drain_outbox();
+        let observed: HashSet<SessionId> = rows.iter().map(|r| r.id).collect();
+        let inbox = self.drain_outbox(&observed);
         let sessions = rows
             .into_iter()
             .map(|r| {
@@ -1230,6 +1315,16 @@ impl TeamPanel {
     /// * 記憶から外す — 以後、その Run が出した仕事は
     ///   [`TeamPanel::mine`] を通らなくなる (**死んだ Run の仕事は実行しない**)
     /// * 保存も消す (次に開いたときに戻ってこない)
+    /// * **報告置き場も消す** (`outbox/<run_id>/`)。残すと、同じ ID の担当が
+    ///   居る次の Run が前の Run の報告を拾う余地が残る
+    ///
+    /// 消すのは**この Run の 1 段だけ**。`run_id` が名前として安全でない
+    /// (空・`..`・区切り文字入り) なら [`outbox::safe_child`] が `None` を
+    /// 返すので、想定外の場所へは届かない。消せなかったことは帯 (`notice`)
+    /// へ出す — 黙って握り潰すと、残った置き場が次の Run を混乱させる。
+    ///
+    /// **[`Self::shutdown`] は置き場を消さない。** あちらは保存して次回の
+    /// 復元に備える経路なので、まだ読んでいない報告を消すと復元後に届かない。
     pub fn close_run(&mut self, i: usize) -> Option<String> {
         if i >= self.runs.len() {
             return None;
@@ -1240,7 +1335,23 @@ impl TeamPanel {
         self.absorb_for(owner, effects);
         let rt = self.runs.remove(i);
         let id = rt.run().run_id.clone();
-        let _ = std::fs::remove_dir_all(self.state_dir().join(RUNS_DIR).join(&id));
+        let state = self.state_dir();
+        // 保存と置き場は同じ関門を通す (`<state>/runs/<id>` と
+        // `<state>/outbox/<id>` の 1 段下だけ)。
+        if let Some(dir) = outbox::safe_child(&state.join(RUNS_DIR), &id) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(dir) = outbox::run_dir(&state, &id) {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    self.notice = crate::i18n::trf(
+                        "team.notice.outbox_cleanup_failed",
+                        &[("run", id.clone()), ("e", e.to_string())],
+                    );
+                }
+            }
+        }
+        self.outbox_ledger.prune_missing();
         if self.runs.is_empty() {
             self.active = 0;
             self.snapshot = None;
@@ -1531,6 +1642,11 @@ impl TeamPanel {
     /// 結び付いたまま**の状態を新しい画面が見ることになる。保存してから
     /// 手放し、次回は保存経路 (`restore`) から入り直す — そこで結び付きは
     /// 必ず外れる。走っている検証はその場で落とす (札だけでは死なない)。
+    ///
+    /// **報告置き場 (`outbox/<run_id>/`) は消さない。** Run は保存して次回
+    /// 復元するので、まだ読んでいない報告を消すと復元後に届かない。
+    /// 置き場を消すのは Run を閉じる ([`Self::close_run`]) か捨てる
+    /// ([`Self::discard_run`]) ときだけ。
     pub fn shutdown(&mut self) -> usize {
         let killed = self.stop_all_validations_now();
         self.pending_launches.clear();
@@ -3691,5 +3807,444 @@ mod tests {
         assert!(p.notice.trim().is_empty(), "届いたのに苦情を出している");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ── 報告置き場 (outbox) ────────────────────────────────────────────
+    ///
+    /// **実ファイル・実 Runtime・実セッション ID** で振る舞いを見る
+    /// (ソースの文字列を読むだけの番人にしない)。「届いた」は、居ない
+    /// タスク番号を名指しした報告が**その Run にだけ** `#<番号>` を含む却下を
+    /// 1 件残すことで見る — 解析器を通らなければ事象は 1 件も増えないので、
+    /// 空回りしない検査になる。
+    mod outbox_delivery {
+        use super::*;
+
+        /// 1 本の Run の、置き場テストに要るもの。
+        struct Lane {
+            owner: RunOwner,
+            /// この Run の置き場 (`outbox/<run_id>/`)。
+            dir: PathBuf,
+            /// `team-lead` のセッション。
+            sid: SessionId,
+            /// この Run に結び付けた全セッション。**観測には毎回これを全部載せる**
+            /// — 載っていないセッションは Runtime が「消えた」と扱って
+            /// 結び付きを外す (それが正しい動き)。
+            all: Vec<SessionId>,
+        }
+
+        /// 起動要求の担当へセッションを結び、その Run の [`Lane`] を返す。
+        fn bind_lane(
+            p: &mut TeamPanel,
+            boot: &[(RunOwner, String, super::super::super::runtime::AgentLaunchSpec)],
+            first_sid: SessionId,
+        ) -> Lane {
+            assert!(!boot.is_empty(), "起動要求が無い");
+            let owner = boot[0].0.clone();
+            let mut sid = first_sid;
+            let mut all = Vec::new();
+            for (o, _, spec) in boot {
+                assert_eq!(o, &owner, "1 回の起動要求に複数の Run が混ざった");
+                p.bind_session(o, &spec.agent_id, sid, None);
+                all.push(sid);
+                sid += 1;
+            }
+            let pos = p.run_pos_of_owner(&owner).expect("Run の位置");
+            let rt = &p.runs[pos];
+            let lead = rt
+                .agents()
+                .iter()
+                .find(|a| a.id.as_str() == "team-lead")
+                .expect("team-lead が居る");
+            assert!(!rt.outbox().as_os_str().is_empty(), "置き場が決まっていない");
+            std::fs::create_dir_all(rt.outbox()).expect("置き場を作れる");
+            Lane {
+                owner,
+                dir: rt.outbox().to_path_buf(),
+                sid: lead.session_id.expect("team-lead にセッション"),
+                all,
+            }
+        }
+
+        /// 2 本の Run を立て、両方の担当にセッションを結ぶ (A は 101〜、B は 201〜)。
+        /// **どちらにも `team-lead` が居る** — ID が同じでも混線しないことを見るため。
+        fn two_lanes(tag: &str) -> (TeamPanel, PathBuf, Lane, Lane) {
+            let dir = ws(tag);
+            let mut p = started_panel(&dir);
+            let boot_a = p.take_launches();
+            p.plan(SPEC, "SPEC.md", RunOptions::default())
+                .expect("2 本目");
+            p.act(TeamAction::Start);
+            // まだどのセッションも結んでいないので、空の観測で回してよい。
+            p.pump(super::super::super::runtime::Observation {
+                now: 2,
+                sessions: Vec::new(),
+            });
+            let boot_b = p.take_launches();
+            let a = bind_lane(&mut p, &boot_a, 101);
+            let b = bind_lane(&mut p, &boot_b, 201);
+            assert_ne!(a.owner, b.owner, "同じ Run になっている");
+            assert_ne!(a.dir, b.dir, "置き場が Run ごとに分かれていない");
+            assert_ne!(a.sid, b.sid);
+            (p, dir, a, b)
+        }
+
+        /// 観測 (画面は空。置き場の報告だけが流れる)。渡した Run の
+        /// **全セッション**を載せる。
+        fn rows(lanes: &[&Lane]) -> Vec<SessionInput> {
+            lanes
+                .iter()
+                .flat_map(|l| l.all.iter().copied())
+                .map(|id| SessionInput {
+                    id,
+                    title: "a".into(),
+                    provider: "claude".into(),
+                    state: crate::coordinator::SessionState::Idle,
+                    tail: Vec::new(),
+                })
+                .collect()
+        }
+
+        /// 居ないタスク番号を名指しした報告。届いた Run にだけ `#<task>` を
+        /// 含む却下が記録される。
+        fn report(agent: &str, task: u64) -> String {
+            format!(
+                "{{\"task_id\": {task}, \"agent_id\": \"{agent}\", \"status\": \"completed\", \
+                 \"summary\": \"置き場から\", \"changed_files\": [], \"validation\": [], \
+                 \"blockers\": []}}"
+            )
+        }
+
+        /// その Run の記録に `needle` を含む事象がいくつあるか。
+        fn saw(p: &TeamPanel, owner: &RunOwner, needle: &str) -> usize {
+            let pos = p.run_pos_of_owner(owner).expect("Run");
+            p.runs[pos]
+                .events()
+                .filter(|e| e.summary.contains(needle))
+                .count()
+        }
+
+        /// 取り決めどおりの提出: 一時ファイルへ書き切ってから改名する。
+        fn submit(dir: &Path, agent: &str, unique: &str, body: &str) -> PathBuf {
+            let tmp = dir.join(outbox::tmp_name(agent, unique));
+            let fin = dir.join(outbox::final_name(agent, unique));
+            std::fs::write(&tmp, body).unwrap();
+            std::fs::rename(&tmp, &fin).unwrap();
+            fin
+        }
+
+        fn name_of(f: &Path) -> String {
+            f.file_name().unwrap().to_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn 書きかけの一時ファイルは読まない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-tmp");
+            // 中身は完全な JSON でも、`.json.tmp` のうちは提出ではない
+            let tmp = a.dir.join(outbox::tmp_name("team-lead", "1"));
+            std::fs::write(&tmp, report("team-lead", 99)).unwrap();
+            for now in 100..105 {
+                p.pump_sessions(rows(&[&a, &b]), now);
+            }
+            assert!(tmp.exists(), "一時ファイルを消した");
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "一時ファイルを報告として取り込んだ");
+            assert!(
+                p.outbox_ledger.tracked().is_empty(),
+                "一時ファイルを読み直しの台帳に載せた"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 改名で公開した報告は一度だけ取り込む() {
+            let (mut p, dir, a, b) = two_lanes("outbox-rename-once");
+            let fin = submit(&a.dir, "team-lead", "1", &report("team-lead", 99));
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert_eq!(saw(&p, &a.owner, "#99"), 1, "改名した報告が届かない");
+            assert!(!fin.exists(), "取り込んだのに消していない");
+            // もう一度回しても増えない
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert_eq!(saw(&p, &a.owner, "#99"), 1, "同じ報告を二度取り込んだ");
+            assert_eq!(saw(&p, &b.owner, "#99"), 0, "別の Run へ流れた");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 旧手順のエージェント (`.json` へ直接書く) が書いている途中を読んでも、
+        /// その報告を失わない。
+        #[test]
+        fn 壊れたjsonは最初の読み取りで消えない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-broken-keep");
+            let full = report("team-lead", 99);
+            let f = a.dir.join(outbox::final_name("team-lead", "1"));
+            std::fs::write(&f, &full[..full.len() / 2]).unwrap();
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert!(f.exists(), "書きかけを 1 回目で消した (報告が永久に失われる)");
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "半分の JSON を解析器へ渡した");
+            assert_eq!(
+                saw(&p, &a.owner, "取り込めません"),
+                0,
+                "1 回読めなかっただけで却下を記録した"
+            );
+            // 書き終わったら、次の tick で届く
+            std::fs::write(&f, &full).unwrap();
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert_eq!(saw(&p, &a.owner, "#99"), 1, "書き終わった報告が届かない");
+            assert!(!f.exists(), "届いたのに消していない");
+            assert!(
+                p.outbox_ledger.tracked().is_empty(),
+                "片付いたのに台帳に残っている"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 壊れたjsonは上限で隔離され理由が一度だけ残る() {
+            let (mut p, dir, a, b) = two_lanes("outbox-broken-limit");
+            let f = a.dir.join(outbox::final_name("team-lead", "1"));
+            std::fs::write(&f, "{\"task_id\": 99, \"agent_id\": \"team-lead\"").unwrap();
+            let name = name_of(&f);
+            for i in 0..(outbox::MAX_ATTEMPTS - 1) {
+                p.pump_sessions(rows(&[&a, &b]), 100 + u64::from(i));
+                assert!(
+                    f.exists(),
+                    "{} 回目で消した (上限は {})",
+                    i + 1,
+                    outbox::MAX_ATTEMPTS
+                );
+            }
+            assert_eq!(saw(&p, &a.owner, &name), 0, "上限の手前で理由を出した");
+            p.pump_sessions(rows(&[&a, &b]), 200);
+            assert!(!f.exists(), "上限に達したのに置き場に残っている");
+            let pen = a.dir.join(outbox::REJECTED_DIR).join(&name);
+            assert!(pen.exists(), "隔離先に無い: {}", pen.display());
+            assert_eq!(saw(&p, &a.owner, &name), 1, "理由が記録されていない");
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "壊れた報告を解析器へ渡した");
+            // 隔離したものは二度と読まない・言い直さない
+            for now in 201..205 {
+                p.pump_sessions(rows(&[&a, &b]), now);
+            }
+            assert_eq!(saw(&p, &a.owner, &name), 1, "隔離したファイルを言い直した");
+            assert!(pen.exists(), "隔離したファイルが消えた");
+            assert!(p.outbox_ledger.tracked().is_empty(), "隔離したのに台帳に残っている");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 同じidの担当が居る二本のrunで報告が混線しない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-two-runs");
+            for lane in [&a, &b] {
+                let pos = p.run_pos_of_owner(&lane.owner).unwrap();
+                assert!(
+                    p.runs[pos].agents().iter().any(|x| x.id.as_str() == "team-lead"),
+                    "前提: どちらの Run にも team-lead が居る"
+                );
+            }
+            submit(&a.dir, "team-lead", "1", &report("team-lead", 98));
+            submit(&b.dir, "team-lead", "1", &report("team-lead", 99));
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert_eq!(saw(&p, &a.owner, "#98"), 1, "A の報告が A に届かない");
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "B の報告が B に届かない");
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "B の報告が A へ流れた");
+            assert_eq!(saw(&p, &b.owner, "#98"), 0, "A の報告が B へ流れた");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 配送先は**セッション**で決まる。B のセッションしか観測に無い tick では
+        /// A の報告は消さずに残し、A のセッションが観測に載った tick で届く。
+        /// A を閉じても B への配送は続く。
+        #[test]
+        fn 報告はそれぞれのrunのセッションへ届く() {
+            let (mut p, dir, a, b) = two_lanes("outbox-per-session");
+            let fa = submit(&a.dir, "team-lead", "1", &report("team-lead", 98));
+            let fb = submit(&b.dir, "team-lead", "1", &report("team-lead", 99));
+            // B のセッションだけ観測
+            p.pump_sessions(rows(&[&b]), 100);
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "B の報告が B のセッションへ届かない");
+            assert!(!fb.exists());
+            assert_eq!(saw(&p, &a.owner, "#98"), 0, "観測に無いセッション宛てを届けたことにした");
+            assert!(fa.exists(), "配送先が観測に無いのに消した (報告が失われる)");
+            // 観測に無かった A の担当は Runtime が「消えた」と扱って結び付きを
+            // 外す (それが正しい動き)。起こし直して結び直したら、残っていた
+            // 報告が A のセッションへ届く。
+            p.bind_session(&a.owner, &AgentId::new("team-lead"), a.sid, None);
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert_eq!(saw(&p, &a.owner, "#98"), 1, "A の報告が A のセッションへ届かない");
+            assert!(!fa.exists());
+            assert_eq!(saw(&p, &b.owner, "#98"), 0, "A の報告が B へ流れた");
+            // A を閉じても B の配送は続く
+            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
+            p.close_run(pos_a).expect("A を閉じる");
+            let fb2 = submit(&b.dir, "team-lead", "2", &report("team-lead", 97));
+            p.pump_sessions(rows(&[&a, &b]), 102);
+            assert_eq!(saw(&p, &b.owner, "#97"), 1, "A を閉じたら B へ届かなくなった");
+            assert!(!fb2.exists());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// `X-1` の担当に `X-10-…` の報告を配らない (実ファイル)。
+        #[test]
+        fn 担当idの前方一致で別の担当の報告を拾わない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-prefix");
+            let pos = p.run_pos_of_owner(&a.owner).unwrap();
+            let ids: Vec<String> = p.runs[pos]
+                .agents()
+                .iter()
+                .map(|x| x.id.0.clone())
+                .collect();
+            let short = ids
+                .iter()
+                .find(|id| id.ends_with("-1"))
+                .cloned()
+                .unwrap_or_else(|| panic!("`…-1` の担当が居ない: {ids:?}"));
+            let long = format!("{short}0");
+            assert!(!ids.contains(&long), "前提: {long} は居ない");
+            // ファイル名も本文も `X-10` (居ない担当) → `X-1` へ配らず、隔離して理由を残す
+            let f = submit(&a.dir, &long, "1", &report(&long, 99));
+            let name = name_of(&f);
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert_eq!(
+                saw(&p, &a.owner, "#99"),
+                0,
+                "{long} の報告を {short} の報告として取り込んだ"
+            );
+            assert!(!f.exists(), "置き場に残っている");
+            assert!(
+                a.dir.join(outbox::REJECTED_DIR).join(&name).exists(),
+                "隔離されていない"
+            );
+            assert_eq!(saw(&p, &a.owner, &name), 1, "理由が残っていない");
+            // ファイル名は `X-10-…` で本文だけ `X-1` を名乗っても、配らない
+            let f2 = submit(&a.dir, &long, "2", &report(&short, 99));
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "本文の名乗りだけで {short} へ配った");
+            assert!(!f2.exists() && a.dir.join(outbox::REJECTED_DIR).join(name_of(&f2)).exists());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 本文のagent_idが違う報告は配送しない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-claim-mismatch");
+            let pos = p.run_pos_of_owner(&a.owner).unwrap();
+            let other = p.runs[pos]
+                .agents()
+                .iter()
+                .map(|x| x.id.0.clone())
+                .find(|id| id != "team-lead")
+                .expect("team-lead 以外の担当");
+            // ファイル名は team-lead、本文は別の担当
+            let f = submit(&a.dir, "team-lead", "1", &report(&other, 99));
+            let name = name_of(&f);
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "担当の食い違う報告を配送した");
+            assert!(!f.exists(), "置き場に残っている");
+            assert!(
+                a.dir.join(outbox::REJECTED_DIR).join(&name).exists(),
+                "隔離されていない"
+            );
+            let why = p.runs[pos]
+                .events()
+                .find(|e| e.summary.contains(&name))
+                .map(|e| e.summary.clone())
+                .expect("理由が記録されていない");
+            assert!(
+                why.contains("team-lead") && why.contains(&other),
+                "理由に両方の担当が無い: {why}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn runを閉じるとその置き場だけ消える() {
+            let (mut p, dir, a, b) = two_lanes("outbox-close");
+            let fa = submit(&a.dir, "team-lead", "1", &report("team-lead", 98));
+            let fb = submit(&b.dir, "team-lead", "1", &report("team-lead", 99));
+            let state = p.state_dir();
+            p.save_if_needed();
+            let runs_a = state.join(RUNS_DIR).join(&a.owner.run_id);
+            let runs_b = state.join(RUNS_DIR).join(&b.owner.run_id);
+            assert!(runs_a.exists() && runs_b.exists(), "前提: 保存の置き場がある");
+            p.notice.clear();
+            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
+            p.close_run(pos_a).expect("A を閉じる");
+            assert!(!a.dir.exists(), "A の置き場が残っている");
+            assert!(!fa.exists());
+            assert!(!runs_a.exists(), "A の保存が残っている");
+            assert!(b.dir.exists() && fb.exists(), "B の置き場まで消した");
+            assert!(runs_b.exists(), "B の保存まで消した");
+            assert!(state.join(outbox::DIR_NAME).exists(), "親フォルダごと消した");
+            assert!(p.notice.trim().is_empty(), "消せたのに苦情を出した: {}", p.notice);
+            // 残った B にはまだ届く
+            p.pump_sessions(rows(&[&b]), 100);
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "A を閉じたら B へ届かない");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 置き場の名前にできない `run_id` では置き場を作らず、閉じても
+        /// 想定外の場所を消さない。
+        #[test]
+        fn 不正なrun_idでは置き場を作らず閉じても何も消さない() {
+            let dir = ws("outbox-bad-run-id");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = panel_at(&dir);
+            let state = p.state_dir();
+            std::fs::create_dir_all(state.join(outbox::DIR_NAME)).unwrap();
+            let canaries = [
+                dir.join("workspace-canary.txt"),
+                state.join("state-canary.txt"),
+                state.join(outbox::DIR_NAME).join("outbox-canary.txt"),
+            ];
+            for c in &canaries {
+                std::fs::write(c, "x").unwrap();
+            }
+            for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x"] {
+                p.plan(
+                    SPEC,
+                    "SPEC.md",
+                    RunOptions {
+                        run_id: bad.to_string(),
+                        ..RunOptions::default()
+                    },
+                )
+                .expect("計画はできる");
+                let rt = p.rt().unwrap();
+                assert!(
+                    rt.outbox().as_os_str().is_empty(),
+                    "{bad:?} で置き場を作った: {}",
+                    rt.outbox().display()
+                );
+                let pos = p.active_run();
+                p.close_run(pos).expect("閉じられる");
+                for c in &canaries {
+                    assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 1 tick に見る数の上限は残る (全 Run 合わせて)。残りは次の tick で片付く。
+        #[test]
+        fn 一tickで見る数の上限は残る() {
+            let (mut p, dir, a, b) = two_lanes("outbox-budget");
+            let extra = 8;
+            for i in 0..(OUTBOX_PER_TICK + extra) {
+                submit(
+                    &a.dir,
+                    "team-lead",
+                    &format!("{i:03}"),
+                    &report("team-lead", 90 + (i as u64 % 5)),
+                );
+            }
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert_eq!(
+                outbox::list_reports(&a.dir).len(),
+                extra,
+                "1 tick で上限を超えて読んだ"
+            );
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert!(
+                outbox::list_reports(&a.dir).is_empty(),
+                "残りが次の tick で片付かない"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

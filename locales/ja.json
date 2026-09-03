@@ -4742,6 +4742,7 @@
   "team.mission.phase": "開発フェーズ",
   "team.notice.dropped_effects": "前の Run の未実行の仕事を {n} 件、実行せずに捨てました",
   "team.notice.no_validation": "⚠ 自動検証なしで進みます。完了はレビュー承認だけで決まります",
+  "team.notice.outbox_cleanup_failed": "Team Run {run} の報告置き場を消せませんでした: {e}",
   "team.notice.run_closed": "Team Run を閉じました",
   "team.phase.architecture": "設計",
   "team.phase.final_validation": "最終検証",

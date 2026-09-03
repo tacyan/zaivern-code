@@ -720,27 +720,37 @@ impl LogSink {
 // (ある担当の入力欄に残っていた `7777` が、こちらの書き込みの成れの果てなのか
 //  相手の描画なのかを、記録からは判定できなかった。)
 //
-// ## 既定で有効にする。理由と、そのぶんの手当て
+// ## 既定は無効。`ZAIVERN_LOG_INPUT=1` で明示的に有効にする (opt-in)
 //
-// 1. **後から入れられない記録は、要るときに必ず無い。** どの Run が詰まるかは
-//    事前に分からないので、「詰まったら環境変数を足して再現する」は
-//    *再現しない失敗*を永久に取り逃がす。今回の詰まりがまさにそれだった。
-// 2. **ファイルの機微さの等級は変わらない。** 同じログには既に端末の出力が
+// 最初の版は既定で有効にしていた (「後から入れられない記録は、要るときに
+// 必ず無い」— 詰まりは再現しないので、詰まってから環境変数を足しても遅い)。
+// それでも既定を無効へ戻したのは、**記録に残るのが「こちらが PTY へ書いた
+// 全部」**だからである。チームの指示だけでなく、人が手で打った `sudo` の
+// パスワード・貼り付けたトークン・API キーも同じ経路 ([`WriteOrigin::Input`])
+// を通る。端末エミュレータからは子の termios が見えないので、echo を切って
+// 読まれている入力を自動で伏せる方法は無い。**画面に出ない入力を既定で
+// ディスクへ残す**のは、切り分けの便利さでは釣り合わない。
+//
+// 送り口は 1 種類 ([`WriteOrigin`] は `Input` / `Reply` の 2 値) で、
+// 「チームの自動送信」と「人の手入力」を区別する構造は**いま無い**。
+// 区別できるようになったら自動送信だけを既定で残す道はあるが、それまでは
+// まとめて opt-in にする。
+//
+// 有効にしたときの手当て (opt-in でも同じ):
+//
+// 1. **ファイルの機微さの等級は変わらない。** 同じログには既に端末の出力が
 //    そのまま入っている (エージェントが画面へ出した鍵も含めて)。置き場も
 //    権限も `~/.zaivern` のままで、外へは 1 バイトも出さない。
-// 3. **肥大は構造的に抑えてある。** ローテートは既存の [`LOG_CAP`] のまま、
+// 2. **肥大は構造的に抑えてある。** ローテートは既存の [`LOG_CAP`] のまま、
 //    1 件あたりは [`INPUT_RECORD_MAX_CHARS`] で頭と尻を残して畳む
 //    (長い指示文をまるごと二重に持たない。**末尾を残す**のは、確定の `\r` が
-//     付いていたかが今回の切り分けの本体だから)。
-// 4. **端末の自動返事は記録しない** ([`WriteOrigin::Reply`])。CSI 6n を
+//     付いていたかが切り分けの本体だから)。
+// 3. **端末の自動返事は記録しない** ([`WriteOrigin::Reply`])。CSI 6n を
 //    描画のたびに撃つ TUI が居ると、記録が返事だけで埋まって出力の履歴を
 //    ローテートで押し出す。
 //
-// 残る危険は 1 つだけ、正直に書く: **画面に出ない入力**(`sudo` の
-// パスワードのように子が termios で echo を切って読むもの)は、これまで
-// ログに残らなかったが、今後は残る。端末エミュレータからは子の termios が
-// 見えないので、これを自動で伏せる方法は無い。**そのための切り替えが
-// `ZAIVERN_LOG_INPUT=0`** ([`input_logging_enabled`])。
+// 切り替えの解釈は [`input_logging_enabled`] 1 か所。**知らない綴りは無効**
+// (安全側) — `ZAIVERN_LOG_INPUT=maybe` で記録が始まってはいけない。
 //
 // ## 書式
 //
@@ -768,16 +778,15 @@ const INPUT_RECORD_MAX_CHARS: usize = 1024;
 
 /// **PTY へ書いたバイト列の記録を有効にするか** (`ZAIVERN_LOG_INPUT` の解釈)。
 ///
-/// 純関数。未設定 = 有効 (上の「既定で有効にする理由」を参照)。
-/// `0` / `false` / `off` / `no` / 空文字 で無効 (大小・前後の空白は無視)。
+/// 純関数。**明示的に有効にしたときだけ有効** (opt-in。理由は上の節)。
+/// `1` / `true` / `on` / `yes` で有効 (大小・前後の空白は無視)。
+/// 未設定・空文字・`0` / `false` / `off` / `no`・**知らない綴り**は全部無効 —
+/// 迷ったら記録しない側へ倒す。
 pub(crate) fn input_logging_enabled(var: Option<&str>) -> bool {
-    match var {
-        None => true,
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off" | "no"
-        ),
-    }
+    matches!(
+        var.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
 }
 
 /// 1970-01-01 からのミリ秒。時計が壊れていても 0 で続行する。
@@ -2202,8 +2211,9 @@ impl Session {
             })
             .map(|s| Arc::new(Mutex::new(s)));
 
-        // PTY へ**書いた**バイト列も同じログへ残すか (既定は残す)。
-        // 判断の理由は [`input_logging_enabled`] の上の節を参照。
+        // PTY へ**書いた**バイト列も同じログへ残すか (**既定は残さない**。
+        // `ZAIVERN_LOG_INPUT=1` で残す)。判断の理由は
+        // [`input_logging_enabled`] の上の節を参照。
         let input_log = input_logging_enabled(std::env::var("ZAIVERN_LOG_INPUT").ok().as_deref())
             .then(|| log_sink.clone())
             .flatten();
@@ -11285,21 +11295,55 @@ mod input_log_tests {
         assert!(!input_log_record(b"y\r", 0, 0).contains("input-dropped"));
     }
 
-    /// 切り替えの解釈 (`ZAIVERN_LOG_INPUT`)。**未設定は有効**。
+    /// 切り替えの解釈 (`ZAIVERN_LOG_INPUT`)。**未設定は無効** (opt-in)。
+    ///
+    /// 手で打ったパスワードやトークンも同じ経路を通るので、記録は
+    /// 頼まれたときだけ。知らない綴りで記録が始まってはいけない。
     #[test]
-    fn 入力記録の切り替えは環境変数で覆せる() {
-        for on in [None, Some("1"), Some("yes"), Some("true"), Some("on")] {
-            assert!(input_logging_enabled(on), "{on:?} で無効になった");
+    fn 入力記録は明示的に有効にしたときだけ() {
+        // 有効にする綴りはこの 4 つだけ (大小・前後の空白は無視)
+        for on in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("on"),
+            Some("On"),
+            Some("yes"),
+            Some(" yes "),
+            Some("\tTrue\n"),
+        ] {
+            assert!(input_logging_enabled(on), "{on:?} で無効のままだった");
         }
+        // 未設定・空・明示的な無効
         for off in [
+            None,
+            Some(""),
+            Some("   "),
             Some("0"),
             Some("false"),
             Some("FALSE"),
             Some(" off "),
             Some("no"),
-            Some(""),
+            Some("No"),
         ] {
-            assert!(!input_logging_enabled(off), "{off:?} で有効のままだった");
+            assert!(!input_logging_enabled(off), "{off:?} で有効になった");
+        }
+        // **知らない綴りは安全側 (無効)**
+        for unknown in [
+            Some("maybe"),
+            Some("2"),
+            Some("-1"),
+            Some("yes please"),
+            Some("enabled"),
+            Some("y"),
+            Some("t"),
+            Some("１"),
+            Some("true false"),
+        ] {
+            assert!(
+                !input_logging_enabled(unknown),
+                "{unknown:?} で記録が始まった (知らない綴りは無効でなければならない)"
+            );
         }
     }
 

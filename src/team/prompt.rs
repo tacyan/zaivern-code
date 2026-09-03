@@ -112,12 +112,24 @@ fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> Stri
     let file = if outbox.as_os_str().is_empty() {
         String::new()
     } else {
+        // **取り決めは `outbox` が持つ。** 名前の形をここで別に書くと、
+        // 読む側が受け付けない名前を教える食い違いが黙って起きる。
+        let dir = outbox.display();
+        let tmp = super::outbox::tmp_name(agent_id, "<一意な値>");
+        let fin = super::outbox::final_name(agent_id, "<一意な値>");
+        let example_tmp = super::outbox::tmp_name(agent_id, "1712345678");
+        let example_fin = super::outbox::final_name(agent_id, "1712345678");
         format!(
-            "**まず次のファイルへ同じ JSON を書いてください** (これが正式な提出です)。\n\
-             `{}/{agent_id}.json`\n\
-             フォルダが無ければ作ってください。書けたら、下の形で画面にも出してください\n\
-             (画面のほうは人が読むための控えです)。\n\n",
-            outbox.display()
+            "**まず、同じ JSON をファイルとして提出してください** (これが正式な提出です)。\n\
+             提出先フォルダ: `{dir}` (無ければ作る)\n\
+             書きかけを読まれないための手順です。**必ずこの順で**:\n\
+             1. 一時ファイル `{dir}/{tmp}` へ JSON 全体を書き切る。\n\
+             \x20  `<一意な値>` は時刻や乱数など毎回違う値 (例: `{example_tmp}`)。\n\
+             2. 書き終えてから、**同じフォルダの中で** `.tmp` を外した名前 `{dir}/{fin}` へ改名する。\n\
+             \x20  macOS / Linux: `mv '{dir}/{example_tmp}' '{dir}/{example_fin}'`\n\
+             \x20  Windows (PowerShell): `Move-Item '{dir}\\{example_tmp}' '{dir}\\{example_fin}'`\n\
+             3. `.json` へ直接は書かない。`.tmp` のままのファイルは提出になりません。\n\
+             書けたら、下の形で画面にも出してください (画面のほうは人が読むための控えです)。\n\n"
         )
     };
     format!(
@@ -411,6 +423,58 @@ mod tests {
             forbidden_files: vec!["src/other/**".into()],
             outbox: std::path::PathBuf::from("/tmp/zv-outbox"),
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
+        }
+    }
+
+    /// **提出は「一時ファイルへ書いてから改名」。完了報告を出す役割の指示文に載る。**
+    ///
+    /// 読む側 (`panel::drain_outbox`) は `.json` だけを見る。指示文が
+    /// 「`.json` へ直接書け」と教えると、書いている途中を読まれて報告が
+    /// 半分になる (以前はそう教えていた)。名前は `outbox` の 1 か所から
+    /// 引くので、ここで教えた名前は必ず読む側の照合を通る。
+    #[test]
+    fn 提出は一時ファイルへ書いてから改名する手順で教える() {
+        let g = goal();
+        let mut t = task(1, "a", &[]);
+        t.assigned_agent = Some(super::super::model::AgentId::new("impl-1"));
+        let b = brief(&g, &t);
+        let dir = b.outbox.display().to_string();
+        let tmp = super::super::outbox::tmp_name("impl-1", "<一意な値>");
+        let fin = super::super::outbox::final_name("impl-1", "<一意な値>");
+        // 完了報告 (`[ZAI-TEAM-RESULT]`) を出すのは実装と統合。レビューの
+        // 判定は `[ZAI-TEAM-REVIEW]` で、置き場は使わない。
+        for (name, text) in [
+            ("実装", implementer(&b)),
+            ("統合", integrator(&b, std::slice::from_ref(&t))),
+        ] {
+            // 一時ファイル → 改名、の順で両方の名前が出る (正式な名前は一時
+            // ファイルの名前の接頭辞なので、閉じる ` まで含めて探す)
+            let at_tmp = text.find(&format!("{dir}/{tmp}`"));
+            let at_fin = text.find(&format!("{dir}/{fin}`"));
+            assert!(at_tmp.is_some(), "{name}担当の指示文に一時ファイルの名前が無い");
+            assert!(at_fin.is_some(), "{name}担当の指示文に正式な名前が無い");
+            assert!(at_tmp < at_fin, "{name}担当: 改名先が一時ファイルより先に出ている");
+            // 改名の手段が OS ごとに 1 つずつ
+            assert!(text.contains("mv '"), "{name}担当: unix の改名手順が無い");
+            assert!(text.contains("Move-Item"), "{name}担当: Windows の改名手順が無い");
+            // **`.json` へ直接書けとは教えない** (旧: `<dir>/impl-1.json`)
+            assert!(
+                !text.contains(&format!("{dir}/impl-1.json")),
+                "{name}担当: `.json` へ直接書く旧手順が残っている"
+            );
+            // 教えた例の名前は、読む側の照合を通る (取り決めが 1 か所)
+            let example = super::super::outbox::final_name("impl-1", "1712345678");
+            assert!(text.contains(&example), "{name}担当: 例が無い");
+            let stem = std::path::Path::new(&example)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap();
+            let ids = [super::super::model::AgentId::new("impl-1")];
+            assert_eq!(
+                super::super::outbox::candidates(stem, &ids).len(),
+                1,
+                "{name}担当: 教えた名前を読む側が受け付けない"
+            );
         }
     }
 

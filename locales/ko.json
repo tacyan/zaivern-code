@@ -4742,6 +4742,7 @@
   "team.mission.phase": "개발 단계",
   "team.notice.dropped_effects": "이전 Run 에 속한 미실행 작업 {n} 건을 실행하지 않고 버렸습니다",
   "team.notice.no_validation": "⚠ 자동 검증 없이 진행합니다. 완료는 리뷰 승인만으로 결정됩니다",
+  "team.notice.outbox_cleanup_failed": "Team Run {run} 의 보고 폴더를 삭제하지 못했습니다: {e}",
   "team.notice.run_closed": "Team Run을 닫았습니다",
   "team.phase.architecture": "설계",
   "team.phase.final_validation": "최종 검증",

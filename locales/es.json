@@ -4742,6 +4742,7 @@
   "team.mission.phase": "Fase de desarrollo",
   "team.notice.dropped_effects": "Se descartaron {n} acción(es) pendiente(s) del run anterior sin ejecutarlas.",
   "team.notice.no_validation": "⚠ Se continúa sin validación automática. La finalización se decide solo con la aprobación de la revisión",
+  "team.notice.outbox_cleanup_failed": "No se pudo eliminar la carpeta de informes del Team Run {run}: {e}",
   "team.notice.run_closed": "Team Run cerrado",
   "team.phase.architecture": "Arquitectura",
   "team.phase.final_validation": "Validación final",

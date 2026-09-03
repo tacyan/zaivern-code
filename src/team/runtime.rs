@@ -2816,6 +2816,16 @@ impl TeamRuntime {
         &self.outbox
     }
 
+    /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
+    ///
+    /// 黙って消さない。ファイル名と本文の担当が食い違った・上限まで読んでも
+    /// JSON にならなかった、はどれも「報告したのに何も起きない」に見える
+    /// ので、理由を時系列に 1 行残す。画面から読んだ報告の却下と同じ
+    /// `Rejected` に並べる (第 2 の記録場所を作らない)。
+    pub fn note_outbox_rejected(&mut self, agent: Option<AgentId>, why: String) {
+        self.log(TeamEventKind::Rejected, agent, None, why);
+    }
+
     /// エージェントの直近の画面 (端末タブが「中身」を出すために使う)。
     ///
     /// **末尾から `lines` 行だけ**返す。全部返すと、盤面が毎フレーム

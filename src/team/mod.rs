@@ -49,6 +49,7 @@ pub mod inspector;
 pub mod launch;
 pub mod model;
 pub mod organization_board;
+pub mod outbox;
 pub mod panel;
 pub mod persistence;
 pub mod plan_schema;

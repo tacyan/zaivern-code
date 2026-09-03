@@ -4742,6 +4742,7 @@
   "team.mission.phase": "Development phase",
   "team.notice.dropped_effects": "Skipped {n} pending action(s) that belonged to the previous run.",
   "team.notice.no_validation": "⚠ Running without automated validation. Completion is decided by review approval alone",
+  "team.notice.outbox_cleanup_failed": "Could not remove the report folder for Team Run {run}: {e}",
   "team.notice.run_closed": "Team Run closed",
   "team.phase.architecture": "Architecture",
   "team.phase.final_validation": "Final validation",

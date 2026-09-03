@@ -4742,6 +4742,7 @@
   "team.mission.phase": "开发阶段",
   "team.notice.dropped_effects": "已丢弃属于上一个 Run 的 {n} 项未执行操作",
   "team.notice.no_validation": "⚠ 将在没有自动验证的情况下推进。是否完成仅由评审批准决定",
+  "team.notice.outbox_cleanup_failed": "无法删除 Team Run {run} 的报告目录：{e}",
   "team.notice.run_closed": "已关闭 Team Run",
   "team.phase.architecture": "架构设计",
   "team.phase.final_validation": "最终验证",
