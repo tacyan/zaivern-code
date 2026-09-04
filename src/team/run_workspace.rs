@@ -155,6 +155,52 @@ fn existing(
     })
 }
 
+/// この [`create`] 呼び出しが `git worktree add` に成功した直後の後始末。
+/// 削除先は引数や保存データから受け取らず、同じ安全境界
+/// ([`expected_root`]) から再計算する。
+fn rollback_created(
+    home: &Path,
+    source_workspace: &Path,
+    repo: &Path,
+    run_id: &str,
+) -> Result<(), String> {
+    let target = expected_root(home, source_workspace, run_id)?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // 本体だけが先に消えた場合、今回の stale な Git 登録を掃く。
+            return crate::worktree::git_out(repo, &["worktree", "prune", "--expire", "now"])
+                .map(|_| ())
+                .map_err(|e| format!("git worktree prune に失敗: {e}"));
+        }
+        Err(e) => return Err(format!("作成したworktreeを確認できません: {e}")),
+    }
+    // relative を空にすると、対象rootそのものについて symlink / Git top-level /
+    // common git directory を既存の安全境界で検証できる。別repositoryや
+    // 作成後に置換されたフォルダには `git worktree remove` を実行しない。
+    existing(source_workspace, repo, Path::new(""), &target)
+        .map_err(|e| format!("作成したworktreeを安全に検証できないため削除しません: {e}"))?;
+
+    #[cfg(test)]
+    if fault_inject::take_rollback_failure() {
+        return Err("(テスト) 新規worktreeのロールバックに失敗".to_string());
+    }
+    let target_text = target.to_string_lossy().into_owned();
+    crate::worktree::git_out(
+        repo,
+        &["worktree", "remove", "--force", &target_text],
+    )
+    .map_err(|e| format!("git worktree remove --force に失敗: {e}"))?;
+    match std::fs::symlink_metadata(&target) {
+        Ok(_) => Err(format!(
+            "git が作成済みworktreeを削除しませんでした: {}",
+            target.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("worktreeの削除結果を確認できません: {e}")),
+    }
+}
+
 /// 元 workspace の HEAD から、Run 専用の detached worktree を作る。
 /// 元 workspace の index / working tree は読むだけで変更しない。
 pub fn create(home: &Path, source_workspace: &Path, run_id: &str) -> Result<RunWorkspace, String> {
@@ -177,7 +223,15 @@ pub fn create(home: &Path, source_workspace: &Path, run_id: &str) -> Result<RunW
     crate::worktree::git_out(&repo, &["worktree", "add", "--detach", &root_text, "HEAD"])
         .map_err(|e| format!("Run {run_id} の専用 worktree を作成できません: {e}"))?;
 
-    existing(&source, &repo, &relative, &root)
+    match existing(&source, &repo, &relative, &root) {
+        Ok(workspace) => Ok(workspace),
+        Err(original) => match rollback_created(home, &source, &repo, run_id) {
+            Ok(()) => Err(original),
+            Err(cleanup) => Err(format!(
+                "{original}\nRun {run_id} の新規worktreeの後始末にも失敗しました: {cleanup}"
+            )),
+        },
+    }
 }
 
 /// 保存された対応が、現在の元 workspace と決定的な配置先に
@@ -280,20 +334,35 @@ pub mod fault_inject {
 
     thread_local! {
         static FAIL_REMOVE: Cell<bool> = const { Cell::new(false) };
+        static FAIL_ROLLBACK: Cell<bool> = const { Cell::new(false) };
     }
 
     pub fn fail_remove_once() {
         FAIL_REMOVE.with(|flag| flag.set(true));
     }
 
+    pub fn fail_rollback_once() {
+        FAIL_ROLLBACK.with(|flag| flag.set(true));
+    }
+
     pub(super) fn take_remove_failure() -> bool {
         FAIL_REMOVE.with(|flag| flag.replace(false))
+    }
+
+    pub(super) fn take_rollback_failure() -> bool {
+        FAIL_ROLLBACK.with(|flag| flag.replace(false))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn force_remove_for_cleanup(repo: &Path, target: &Path) {
+        let target = target.to_string_lossy().into_owned();
+        let _ = crate::worktree::git_out(repo, &["worktree", "remove", "--force", &target]);
+        let _ = crate::worktree::git_out(repo, &["worktree", "prune"]);
+    }
 
     fn repo(tag: &str) -> Option<(PathBuf, PathBuf)> {
         let root = crate::test_util::unique_temp_dir("zai-team-worktree", tag);
@@ -340,6 +409,92 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("user-change.txt")).unwrap(), "keep\n");
         remove(&home, &root, "run-b", &b).expect("B 削除");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn headに無いsubdirの検証失敗は新規worktreeを戻し同じidで再試行できる() {
+        let Some((root, home)) = repo("rollback-missing-subdir") else {
+            return;
+        };
+        let source = root.join("draft");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("keep.txt"), "user change\n").unwrap();
+        let run_id = "run-missing-subdir";
+        let target = expected_root(&home, &source, run_id).unwrap();
+
+        let first = create(&home, &source, run_id).expect_err("HEADに無いsubdirは検証で止まる");
+        let target_remained = std::fs::symlink_metadata(&target).is_ok();
+        let listed_after_first = crate::worktree::git_out(
+            &root,
+            &["worktree", "list", "--porcelain"],
+        )
+        .unwrap();
+        let user_file = std::fs::read_to_string(source.join("keep.txt")).unwrap();
+
+        crate::worktree::git_out(&root, &["add", "draft/keep.txt"]).unwrap();
+        crate::worktree::git_out(&root, &["commit", "-q", "-m", "add draft"]).unwrap();
+        let retry = create(&home, &source, run_id);
+        let retry_ok = retry.is_ok();
+        if let Ok(created) = retry {
+            remove(&home, &source, run_id, &created).unwrap();
+        } else {
+            force_remove_for_cleanup(&root, &target);
+        }
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(first.contains("Run の実行 workspace"), "元の検証エラーが不明: {first}");
+        assert!(!target_remained, "検証に失敗した新規worktree本体が残った");
+        assert!(
+            !listed_after_first.contains(run_id),
+            "検証に失敗したworktreeのGit登録が残った: {listed_after_first}"
+        );
+        assert_eq!(user_file, "user change\n", "元workspaceの未コミット変更を壊した");
+        assert!(retry_ok, "残骸のため同じRun IDで再試行できない");
+    }
+
+    #[test]
+    fn 作成前からあるrootは検証に失敗しても削除しない() {
+        let Some((root, home)) = repo("preexisting-root") else {
+            return;
+        };
+        let run_id = "run-preexisting";
+        let target = expected_root(&home, &root, run_id).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let canary = target.join("canary.txt");
+        std::fs::write(&canary, "keep\n").unwrap();
+
+        let error = create(&home, &root, run_id).expect_err("既存rootを引き取ってはいけない");
+        let canary_after = std::fs::read_to_string(&canary).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(error.contains("既存フォルダ"), "検証エラーが不明: {error}");
+        assert_eq!(canary_after, "keep\n", "今回作っていないrootを削除した");
+    }
+
+    #[test]
+    fn 新規worktreeの検証とrollbackが両方失敗した理由を返す() {
+        let Some((root, home)) = repo("rollback-failure") else {
+            return;
+        };
+        let source = root.join("draft");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("keep.txt"), "user change\n").unwrap();
+        let run_id = "run-rollback-failure";
+        let target = expected_root(&home, &source, run_id).unwrap();
+        fault_inject::fail_rollback_once();
+
+        let error = create(&home, &source, run_id).expect_err("両方の失敗を返す");
+        let target_remained = std::fs::symlink_metadata(&target).is_ok();
+        force_remove_for_cleanup(&root, &target);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(error.contains("Run の実行 workspace"), "元エラーが消えた: {error}");
+        assert!(
+            error.contains("新規worktreeの後始末にも失敗")
+                && error.contains("ロールバックに失敗"),
+            "cleanupエラーが消えた: {error}"
+        );
+        assert!(target_remained, "fault injectionが後始末失敗を再現していない");
     }
 
     #[test]
