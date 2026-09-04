@@ -59,6 +59,7 @@ pub mod prompt;
 pub mod result_parser;
 pub mod reviewer;
 pub mod roles;
+pub mod run_workspace;
 pub mod runtime;
 pub mod scheduler;
 pub mod spec_writer;

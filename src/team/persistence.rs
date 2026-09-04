@@ -59,7 +59,9 @@ use super::model::{Decision, TeamAgent, TeamEvent, TeamGoal, TeamGroup, TeamTask
 ///   `run.json` と古い `tasks.json` が同居する — しかもどちらも JSON
 ///   としては正しいので、読む側は正常な状態として読んでしまう。
 ///   直前の完全なスナップショットは `state.prev.json` に残す。
-pub const SCHEMA_VERSION: u32 = 4;
+/// * 5 — 元 workspace と Run 専用 git worktree の対応を保存する。
+///   エージェント起動・検証・changeset 計測は後者、状態の置き場は前者を使う。
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// events.jsonl の行数上限 (超えたら古い行から落とす)。
 pub const EVENT_LOG_MAX_LINES: usize = 5_000;
@@ -154,7 +156,12 @@ pub struct RunDoc {
     pub version: u32,
     /// 実行 ID。**同じ Run を二重に開始しない**ための鍵。
     pub run_id: String,
+    /// ユーザーが Team を開始した元 workspace。旧版互換のため
+    /// フィールド名は維持する。
     pub workspace: String,
+    /// Run 専用 worktree と実行 workspace。`None` は旧保存形式。
+    #[serde(default)]
+    pub run_workspace: Option<super::run_workspace::RunWorkspace>,
     pub spec_source: String,
     pub agent_count: usize,
     /// **どのエージェントで動かすか** (プリセット名の一覧)。空なら「おまかせ」。
@@ -467,6 +474,26 @@ impl StateDoc {
     fn consistent(&self) -> Result<(), String> {
         if self.run.run_id.trim().is_empty() {
             return Err("run_id が空です".into());
+        }
+        if !super::outbox::valid_run_id(&self.run.run_id) {
+            return Err(format!("run_id が安全な名前ではありません: {:?}", self.run.run_id));
+        }
+        if self.run_id != self.run.run_id {
+            return Err(format!(
+                "スナップショットの run_id ({}) が Run ({}) と一致しません",
+                self.run_id, self.run.run_id
+            ));
+        }
+        if self.workspace != self.run.workspace {
+            return Err(format!(
+                "スナップショットの workspace ({}) が Run ({}) と一致しません",
+                self.workspace, self.run.workspace
+            ));
+        }
+        if let Some(run_workspace) = &self.run.run_workspace {
+            if run_workspace.source_workspace != self.run.workspace {
+                return Err("Run の元 workspace と worktree 対応が一致しません".into());
+            }
         }
         if let Some(t) = self.tasks.iter().find(|t| t.goal_id != self.goal.id) {
             return Err(format!(
@@ -1044,6 +1071,7 @@ mod tests {
                 version: SCHEMA_VERSION,
                 run_id: "run-1".into(),
                 workspace: "ws".into(),
+                run_workspace: None,
                 spec_source: "SPEC.md".into(),
                 agent_count: 4,
                 agent_presets: Vec::new(),
@@ -1088,6 +1116,23 @@ mod tests {
                 assert_eq!(got.goal, s.goal);
             }
             other => panic!("読めなかった: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 別runの外側メタデータを混ぜたスナップショットは拒否する() {
+        let dir = tmp("cross-run-state");
+        save(&dir, &saved()).unwrap();
+        let path = dir.join(STATE_FILE);
+        let mut doc = read_doc(&path).expect("読める");
+        doc.run_id = "run-other".into();
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        match load(&dir) {
+            LoadOutcome::Corrupt { reason, .. } => {
+                assert!(reason.contains("run_id"), "理由が分からない: {reason}");
+            }
+            other => panic!("別 Run の混在を受理した: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }

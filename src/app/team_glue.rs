@@ -34,6 +34,16 @@ use crate::i18n::{tr, trf};
 
 use super::ZaivernApp;
 
+/// 実行中Runがあるとき、別workspace宛てのCLI投函だけを保留する。
+/// 同じ元workspaceならRun専用worktreeへ隔離できるため、上限判定へ進める。
+fn defer_team_launch(
+    panel_workspace: &std::path::Path,
+    requested: &std::path::Path,
+    busy: bool,
+) -> bool {
+    busy && panel_workspace != requested
+}
+
 impl ZaivernApp {
     /// 🏛 Team 画面を開く / 閉じる (コマンドパレットから)。
     pub(crate) fn toggle_team_board(&mut self) {
@@ -148,9 +158,10 @@ impl ZaivernApp {
         // **実行中の Run を別のフォルダの要求で潰さない。** 投函は拾うと
         // 消えるので、拾ってから断ると要求ごと失われる (利用者は
         // `zai team run` をもう一度打つしかない)。TTL の間は置いておく。
-        // **同じフォルダでも拾わない。** 拾ったあと `plan` が断るので、
-        // 要求だけが消えて何も起きない (利用者はもう一度打つしかない)。
-        if panel::with_panel(|p| p.live_work().is_busy()) {
+        // 同じ元 workspace の要求は拾う。各 Run は Start 時に専用 worktree へ
+        // 隔離され、`plan_with` が4本の上限を守るので、ここで一律に止めると
+        // CLI だけ2本目を開始できなくなる。
+        if panel::with_panel(|p| defer_team_launch(p.workspace(), &ws, p.live_work().is_busy())) {
             return;
         }
         let now = crate::features::team::imp::model::now_secs();
@@ -1292,6 +1303,15 @@ mod give_up_ledger_tests {
 /// ここでは、その判定が GUI の通常導線へ本当に繋がっていることだけを見る。
 #[cfg(test)]
 mod short_spec_route_tests {
+    #[test]
+    fn cli投函は同じworkspaceの二本目を保留しない() {
+        let a = std::path::Path::new("/workspace/a");
+        let b = std::path::Path::new("/workspace/b");
+        assert!(!super::defer_team_launch(a, a, true));
+        assert!(super::defer_team_launch(a, b, true));
+        assert!(!super::defer_team_launch(a, b, false));
+    }
+
     #[test]
     fn cliの短い起動要求も直接planへ入れない() {
         let src = include_str!("team_glue.rs").replace("\r\n", "\n");

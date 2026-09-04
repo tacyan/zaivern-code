@@ -44,21 +44,22 @@ Zaivern → コマンドパレット → 🏛 Team
 
 ### 同時実行の安全制限
 
-同じ workspace で同時に実行できる Team Run は **1 本**。現行の changeset は
-workspace の Git 状態を実測するため、Run ごとの専用 worktree と競合を返す
-統合経路が無いまま複数Runを許すと、別Runの変更を自分の成果として受理し得る。
-その状態を「並列実行」として見せないため、2本目は開始前に具体的なエラーで
-断る。1 Run 内の複数エージェントは既存のファイル所有リースで並列に動く。
+同じ元 workspace で同時に実行できる Team Run は **最大4本**。Start時に
+Runごとのdetached git worktreeを `ZAIVERN_HOME/team-worktrees/` 配下へ作り、
+エージェント起動・指示・検証・changeset計測はすべてそのRun専用workspaceを
+使う。元workspaceの未コミット変更や、別Runの変更は混入しない。
 
-過去の版が保存した複数Runは壊さず残し、復元時には上限の1本だけを開く。
-残りは削除せず、先のRunを閉じた後に復元できる。
+5本目は既存Runを変えず、開始前に上限を示して拒否する。git repositoryでない、
+HEAD commitが無い、または安全な専用worktreeを作れないworkspaceではStartを
+拒否し、共有workspaceへフォールバックしない。Runを閉じると、そのRunの停止を
+先に配送し、専用worktreeだけをgit登録と決定パスの両方で検証して片付ける。
+削除に失敗した場合は墓標と診断を残し、次回起動で安全に再試行する。
 
-異なるRunが同じファイルを扱う場合も自動上書き・自動マージはしない。先行Runの
-成果を利用者が確認し、必要ならcommitまたは競合解消してから次のRunを開始する。
-次のRunはその時点のworkspaceをbaselineにするため、統合順序が明示される。
+異なるRunの成果は自動上書き・自動マージしない。各Runの成果を利用者が確認し、
+必要ならcommitまたは競合解消してから統合する。
 
 **CLI 起動と GUI 起動で別々の実装を作らない。** どちらも
-`TeamPanel::plan` → `TeamRuntime` の 1 本を通る
+`TeamPanel::plan_with` → `TeamRuntime` の 1 本を通る
 (`team::wiring_tests::cli起動とgui起動は同じruntimeを通る` が番人)。
 
 ## 計画を作るのは誰か

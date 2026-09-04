@@ -106,7 +106,9 @@ pub struct Observation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunOwner {
     pub run_id: String,
-    /// この Run の workspace。**Runtime が持っている値そのもの。**
+    /// ユーザーが Run を開始した元 workspace。保存と復元の所有軸。
+    pub source_workspace: PathBuf,
+    /// この Run 専用の実行 workspace。起動・検証・changeset の cwd。
     pub workspace: PathBuf,
 }
 
@@ -303,6 +305,9 @@ pub struct TeamRuntime {
     events: VecDeque<TeamEvent>,
     decisions: Vec<Decision>,
     run: RunDoc,
+    /// 状態保存と復元のキーに使う元 workspace。
+    source_workspace: PathBuf,
+    /// Run 専用 worktree 内の実行 workspace。
     workspace: PathBuf,
     next_event_id: EventId,
     next_task_id: TaskId,
@@ -907,6 +912,7 @@ impl TeamRuntime {
                 version: SCHEMA_VERSION,
                 run_id: opts.run_id.clone(),
                 workspace: workspace.display().to_string(),
+                run_workspace: None,
                 spec_source: opts.spec_source.clone(),
                 agent_count: opts.agent_count,
                 agent_presets: opts.agent_presets.clone(),
@@ -922,6 +928,7 @@ impl TeamRuntime {
                 effects: Vec::new(),
                 done_effects: Vec::new(),
             },
+            source_workspace: workspace.clone(),
             workspace,
             next_event_id: 1,
             next_task_id,
@@ -974,7 +981,13 @@ impl TeamRuntime {
     /// **Running / Assigned だったタスクを無条件に Running へ戻さない。**
     /// プロセスが生きているかは復元時点では分からないので、いったん
     /// `Ready` へ落とし、担当が確認できたときだけ再び進める。
+    #[cfg(test)]
     pub fn restore(saved: Saved, workspace: PathBuf) -> Self {
+        Self::restore_in(saved, workspace.clone(), workspace)
+    }
+
+    /// 保存状態を、検証済みの元 workspace / 実行 workspace 対応で復元する。
+    pub fn restore_in(saved: Saved, source_workspace: PathBuf, workspace: PathBuf) -> Self {
         let next_task_id = saved.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         let next_event_id = saved.events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
         let mut tasks = saved.tasks;
@@ -1055,6 +1068,7 @@ impl TeamRuntime {
             events: saved.events.into_iter().collect(),
             decisions: saved.decisions,
             run: saved.run,
+            source_workspace,
             workspace,
             next_event_id,
             next_task_id,
@@ -1328,8 +1342,19 @@ impl TeamRuntime {
     pub fn owner(&self) -> RunOwner {
         RunOwner {
             run_id: self.run.run_id.clone(),
+            source_workspace: self.source_workspace.clone(),
             workspace: self.workspace.clone(),
         }
+    }
+
+    /// 起動前に作った Run 専用 worktree へ、実行先を一度だけ切り替える。
+    pub fn set_run_workspace(&mut self, run_workspace: super::run_workspace::RunWorkspace) {
+        self.source_workspace = PathBuf::from(&run_workspace.source_workspace);
+        self.workspace = PathBuf::from(&run_workspace.execution_workspace);
+        self.run.workspace = run_workspace.source_workspace.clone();
+        self.run.run_workspace = Some(run_workspace);
+        self.run.updated_at = now_secs();
+        self.dirty = true;
     }
 
     /// 拒否された遷移を事象へ落とす。**黙って無かったことにしない。**

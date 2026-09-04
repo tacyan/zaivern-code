@@ -1173,7 +1173,7 @@ fn effectは実行前に完了扱いにしない() {
     let done = function_body(&s, s.find("pub fn note_effect_done").expect("ACK"));
     assert!(done.contains("EffectState::Completed"));
     // 復元は成功済みだけを引き継ぐ。
-    let restore = function_body(&s, s.find("pub fn restore(").expect("復元"));
+    let restore = function_body(&s, s.find("pub fn restore_in(").expect("復元本体"));
     assert!(
         restore.contains("r.state != EffectState::Completed"),
         "復元で未完了の Effect を成功扱いにしている"
@@ -1571,7 +1571,7 @@ fn 置き場のファイルは受理してから消す() {
             .expect("一ファイルの取り込み"),
     );
     let accept = body.find("accept_outbox").expect("受理を通していない");
-    let remove = body.find("remove_file").expect("消していない");
+    let remove = body.find("remove_report").expect("専用の削除口を通していない");
     assert!(
         accept < remove,
         "受理より先に消している (落ちた報告が戻らない):\n{body}"

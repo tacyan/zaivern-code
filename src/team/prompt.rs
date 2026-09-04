@@ -124,6 +124,21 @@ fn powershell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// workspace と報告置き場の境界。**outbox を使う全役割で同じ文面**
+/// を必須契約に入れる。役割ごとに書くと、レビュー担当だけ例外が
+/// 欠ける、といった差が必ず生まれる。
+fn filesystem_boundary(outbox: &std::path::Path) -> String {
+    if outbox.as_os_str().is_empty() {
+        return "  - workspace 外パスへの書込みは禁止\n".to_string();
+    }
+    format!(
+        "  - workspace 外への一般的な書込みは禁止\n\
+         \x20 - **Zaivern が指定したこの Run 専用 outbox だけが例外**: `{}`\n\
+         \x20 - outbox 以外の workspace 外パスへの書込みは禁止\n",
+        outbox.display()
+    )
+}
+
 fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> String {
     if outbox.as_os_str().is_empty() {
         return String::new();
@@ -141,6 +156,8 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
     let powershell_fin = powershell_single_quote(&ex_fin_path);
     format!(
         "\n## 提出のしかた (**これが正式な経路**)\n\
+         **指定されたこの Run 専用 outbox だけが例外**であり、workspace 外へのその他の書込みは禁止です。\n\
+         outbox 以外の workspace 外パスへの書込みは禁止です。\n\
          報告・判定・伝言・出来事は、下の JSON を**ファイルとして提出**してください。\n\
          画面にも出してよいですが、画面は人が読むための控えです。\n\n\
          提出先フォルダ: `{dir}` (無ければ作る)\n\
@@ -324,15 +341,15 @@ pub fn implementer(b: &Brief<'_>) -> String {
     }
     s.push_str("\n## 編集してよいファイル\n");
     if t.files.is_empty() {
-        s.push_str("  (指定なし。ただしワークスペースの外へは絶対に書かないこと)\n");
+        s.push_str("  (指定なし。編集対象は workspace 内のみ。正式報告は指定 outbox へ)\n");
     } else {
         s.push_str(&bullets(&t.files));
     }
     s.push_str("\n## 編集してはいけない範囲\n");
     if b.forbidden_files.is_empty() {
-        s.push_str("  - ワークスペースの外 (絶対パス・`..` での脱出)\n");
+        s.push_str("  - workspace 外 (指定 outbox への正式報告だけは除く)\n");
     } else {
-        s.push_str("  - ワークスペースの外 (絶対パス・`..` での脱出)\n");
+        s.push_str("  - workspace 外 (指定 outbox への正式報告だけは除く)\n");
         s.push_str(&bullets(&b.forbidden_files));
         s.push_str("    (上記は他の担当が同時に編集しています)\n");
     }
@@ -355,9 +372,9 @@ pub fn implementer(b: &Brief<'_>) -> String {
     required_tail.push_str(
         "  - git push / PR 作成 / merge / deploy / release は行わない\n\
          \x20 - 権限昇格 (sudo 等) を行わない\n\
-         \x20 - ワークスペース外へ書き込まない\n\
          \x20 - 破壊的な削除 (rm -rf 等) を行わない\n",
     );
+    required_tail.push_str(&filesystem_boundary(&b.outbox));
     required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str("\n## 完了報告\n");
     required_tail.push_str(&result_format(t.id, b.agent_id, &b.outbox));
@@ -402,6 +419,8 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
          \x20 - 破壊的変更 (既存の振る舞いを壊していないか)\n\
          \x20 - 担当外ファイルの変更\n",
     );
+    required_tail.push_str("\n## 禁止事項\n");
+    required_tail.push_str(&filesystem_boundary(&b.outbox));
     required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str(&format!(
         "\n## 判定の出し方\n{submit}次の形式を**そのまま**出力してください。\n\n\
@@ -456,6 +475,7 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
         "  - git push / PR 作成 / merge / deploy / release は**行わない**\n\
          \x20 - 本番環境・課金・credential に触れない\n",
     );
+    required_tail.push_str(&filesystem_boundary(&b.outbox));
     required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str("\n## 完了報告\n");
     required_tail.push_str(&result_format(b.task.id, b.agent_id, &b.outbox));
@@ -519,8 +539,7 @@ mod tests {
         let dir = b.outbox.display().to_string();
         let tmp = super::super::outbox::tmp_name("impl-1", "<一意な値>");
         let fin = super::super::outbox::final_name("impl-1", "<一意な値>");
-        // 完了報告 (`[ZAI-TEAM-RESULT]`) を出すのは実装と統合。レビューの
-        // 判定は `[ZAI-TEAM-REVIEW]` で、置き場は使わない。
+        // 完了報告を出す実装・統合の双方で同じ原子的提出契約を使う。
         for (name, text) in [
             ("実装", implementer(&b)),
             ("統合", integrator(&b, std::slice::from_ref(&t))),
@@ -569,27 +588,37 @@ mod tests {
         let mut b = brief(&g, &t);
         b.outbox = std::path::PathBuf::from("/tmp/Team's 日本語 outbox");
 
-        let text = implementer(&b);
         let tmp = super::super::outbox::tmp_name("impl-1", "1712345678");
         let fin = super::super::outbox::final_name("impl-1", "1712345678");
         let tmp_path = b.outbox.join(tmp).display().to_string();
         let fin_path = b.outbox.join(fin).display().to_string();
-        assert!(
-            text.contains(&format!(
-                "mv {} {}",
-                posix_single_quote(&tmp_path),
-                posix_single_quote(&fin_path)
-            )),
-            "POSIX shell の単一引用符として安全にエスケープされていない"
-        );
-        assert!(
-            text.contains(&format!(
-                "Move-Item {} {}",
-                powershell_single_quote(&tmp_path),
-                powershell_single_quote(&fin_path)
-            )),
-            "PowerShell の単一引用符として安全にエスケープされていない"
-        );
+        for role in TeamRole::ALL {
+            let mut assigned = t.clone();
+            assigned.role = role;
+            assigned.review_of = Some(t.id);
+            let all = vec![t.clone(), assigned.clone()];
+            let mut role_brief = b.clone();
+            role_brief.task = &assigned;
+            let text = for_task(&role_brief, &all);
+            assert!(
+                text.contains(&format!(
+                    "mv {} {}",
+                    posix_single_quote(&tmp_path),
+                    posix_single_quote(&fin_path)
+                )),
+                "{}: POSIX shell の単一引用符として安全でない",
+                role.key()
+            );
+            assert!(
+                text.contains(&format!(
+                    "Move-Item {} {}",
+                    powershell_single_quote(&tmp_path),
+                    powershell_single_quote(&fin_path)
+                )),
+                "{}: PowerShell の単一引用符として安全でない",
+                role.key()
+            );
+        }
     }
 
     /// **サブエージェントの知らせ方を、指示文が必ず伝える。**
@@ -806,6 +835,57 @@ mod tests {
                 notice < completion && completion < message && message < event,
                 "{name} の必須契約が切詰め通知より後ろへ順番どおり残っていない"
             );
+        }
+    }
+
+    /// outbox は workspace 外にあるが、Zaivern がこの Run に限って
+    /// 指定した報告先である。「workspace 外へ書くな」と「そこへ
+    /// 報告を書け」を同時に渡すと、安全側の Agent は報告を出さず
+    /// Run が永久に止まる。生成後の最終プロンプト全体を、全役割で
+    /// 検査する。
+    #[test]
+    fn 全役割の最終プロンプトはoutboxだけを外部書込みの例外にする() {
+        let mut g = goal();
+        g.title = "長いゴール".repeat(PROMPT_MAX_BYTES);
+        g.definition_of_done = vec!["長い完了条件".repeat(PROMPT_MAX_BYTES)];
+
+        for role in TeamRole::ALL {
+            let mut target = task(1, "target", &[]);
+            target.description = "長いレビュー対象".repeat(PROMPT_MAX_BYTES);
+            let mut assigned = task(2, "assigned", &[]);
+            assigned.role = role;
+            assigned.review_of = Some(target.id);
+            assigned.description = "長い担当説明".repeat(PROMPT_MAX_BYTES);
+            let all = vec![target, assigned.clone()];
+            let b = brief(&g, &assigned);
+            let text = for_task(&b, &all);
+            let name = role.key();
+
+            assert!(text.len() <= PROMPT_MAX_BYTES, "{name}: 8KB 上限超過");
+            assert!(
+                !text.contains("ワークスペース外へ書き込まない"),
+                "{name}: outbox と矛盾する無条件禁止が残っている"
+            );
+            assert!(
+                text.contains("指定されたこの Run 専用 outbox だけが例外"),
+                "{name}: outbox だけが例外と明記されていない"
+            );
+            assert!(
+                text.contains("outbox 以外の workspace 外パスへの書込みは禁止"),
+                "{name}: 例外が外部全体へ広がっている"
+            );
+            for contract in [
+                ".json.tmp",
+                "同じフォルダの中で",
+                "\"run_id\": \"run-1712345678-1-0\"",
+                "\"agent_id\": \"impl-1\"",
+                "`result` (完了報告)",
+                "`review` (レビュー判定)",
+                "`message` (仲間への伝言)",
+                "`event` (サブエージェントの出来事)",
+            ] {
+                assert!(text.contains(contract), "{name}: 必須契約 {contract:?} が欠落");
+            }
         }
     }
 

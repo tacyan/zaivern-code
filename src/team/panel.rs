@@ -171,12 +171,9 @@ pub const RUNS_DIR: &str = "runs";
 /// 永久に順番待ちになる。置き場の取り決めそのものは [`outbox`]。
 pub const OUTBOX_PER_TICK: usize = 32;
 
-/// 同じ workspace に同時に走らせてよい Run の本数。
-///
-/// Run 専用 worktree と競合を人へ返す統合経路がまだ無いので 1 本に固定する。
-/// 共有 workspace のまま数だけ増やすと、別 Run の変更を自分の changeset と
-/// 誤認する。旧保存形式の複数 Run は消さず、1 本ずつ復元する。
-pub const MAX_CONCURRENT_RUNS: usize = 1;
+/// 同じ元 workspace で同時に走らせてよい Run の本数。
+/// すべての Run は `run_workspace` で別々の git worktree へ隔離する。
+pub const MAX_CONCURRENT_RUNS: usize = 4;
 
 /// New Team Run フォームの入力。
 #[derive(Clone, Debug, PartialEq)]
@@ -373,8 +370,8 @@ pub struct TeamPanel {
     pub read_only: bool,
     /// 直近の説明・エラー (画面の帯に出す)。
     pub notice: String,
-    /// 保持している Run。本番は最大1本だが、旧保存の安全な順次復元と
-    /// Run所有権の内部検査のため、状態表現は複数本を扱える。
+    /// 保持している Run。同じ元 workspace につき最大4本で、各Runの実行先は
+    /// 専用git worktreeへ分離する。
     ///
     /// **画面が触るのは `active` の1本だけ**なので、既存の操作は
     /// [`TeamPanel::rt`] / [`TeamPanel::rt_mut`] を通してそのまま動く。
@@ -766,15 +763,17 @@ impl TeamPanel {
 
     /// 面倒を見ているものがあるなら断る (理由をそのまま返す)。
     fn refuse_if_busy(&mut self) -> Result<(), String> {
-        // Run 専用 worktree が無い間は 1 本だけ。既存 Run を置き換えず、
-        // 2 本目を開始前に断るので、別 Run の変更を成果へ混ぜない。
+        // 既存 Run を置き換えず、5本目は計画を作る前に断る。
         if self.runs.len() < MAX_CONCURRENT_RUNS {
             return Ok(());
         }
-        let why = crate::i18n::trf(
+        // 翻訳カタログがまだ初期化されていない起動早期でも、上限数だけは
+        // 必ず分かるようにする。キー文字列だけで断るのは製品エラーではない。
+        let translated = crate::i18n::trf(
             "team.err.too_many_runs",
             &[("n", MAX_CONCURRENT_RUNS.to_string())],
         );
+        let why = format!("{translated} (最大 {MAX_CONCURRENT_RUNS} Run)");
         self.notice = why.clone();
         Err(why)
     }
@@ -839,7 +838,13 @@ impl TeamPanel {
                     capped += 1;
                     continue;
                 }
-                let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
+                let mut rt = match self.restore_saved(*s, &d, read_only) {
+                    Ok(rt) => rt,
+                    Err(why) => {
+                        skipped.push(format!("{name:?} ({why})"));
+                        continue;
+                    }
+                };
                 let dir = self.outbox_dir(&rt.run().run_id);
                 rt.set_outbox(dir);
                 self.runs.push(rt);
@@ -896,7 +901,7 @@ impl TeamPanel {
                     self.restore = RestorePrompt::None;
                     return Err("保存された Team Run がありません".to_string());
                 }
-                let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
+                let mut rt = self.restore_saved(*s, &dir, read_only)?;
                 let dir = self.outbox_dir(&rt.run().run_id);
                 rt.set_outbox(dir);
                 self.runs.push(rt);
@@ -915,6 +920,58 @@ impl TeamPanel {
                 "保存された状態の版 ({found}) が新しすぎます。Zaivern を更新してください。"
             )),
         }
+    }
+
+    /// 保存された Run の元 workspace / 実行 workspace 対応を検査する。
+    /// 実行中だった旧形式に worktree 記録が無ければ、復元前に専用
+    /// worktree を作り、対応の保存が成功してから Runtime を返す。
+    fn restore_saved(
+        &self,
+        mut saved: persistence::Saved,
+        save_dir: &Path,
+        read_only: bool,
+    ) -> Result<TeamRuntime, String> {
+        let source = self
+            .workspace
+            .canonicalize()
+            .map_err(|e| format!("元 workspace を確認できません: {e}"))?;
+        let recorded = PathBuf::from(&saved.run.workspace)
+            .canonicalize()
+            .map_err(|e| format!("保存された元 workspace を確認できません: {e}"))?;
+        if source != recorded {
+            return Err("保存された Run は別の workspace のものです".to_string());
+        }
+
+        let execution = if let Some(run_workspace) = saved.run.run_workspace.as_ref() {
+            super::run_workspace::restore(
+                &self.home,
+                &source,
+                &saved.run.run_id,
+                run_workspace,
+            )?
+        } else if read_only || saved.goal.status == GoalStatus::Ready {
+            // まだ開始していない計画プレビューは、Start 時に worktree を作る。
+            source.clone()
+        } else {
+            let run_workspace =
+                super::run_workspace::create(&self.home, &source, &saved.run.run_id)?;
+            saved.run.workspace = run_workspace.source_workspace.clone();
+            saved.run.run_workspace = Some(run_workspace.clone());
+            if let Err(e) = persistence::save(save_dir, &saved) {
+                let cleanup = super::run_workspace::remove(
+                    &self.home,
+                    &source,
+                    &saved.run.run_id,
+                    &run_workspace,
+                )
+                .err()
+                .map(|why| format!(" / worktree の後始末も失敗: {why}"))
+                .unwrap_or_default();
+                return Err(format!("{}{cleanup}", e.detail()));
+            }
+            PathBuf::from(&run_workspace.execution_workspace)
+        };
+        Ok(TeamRuntime::restore_in(saved, source, execution))
     }
 
     /// 保存された Run を消す (**確認済みの呼び出しだけ**)。
@@ -936,13 +993,46 @@ impl TeamPanel {
         let dir = self.state_dir();
         // **消す前に、持っている Run 全部に墓標を書く。** 下の削除が途中で
         // 失敗しても、次の起動で復活しない (閉じる経路と同じ不変条件)。
-        let ids: Vec<String> = self.runs.iter().map(|r| r.run().run_id.clone()).collect();
+        let runs: Vec<(String, Option<super::run_workspace::RunWorkspace>)> = self
+            .runs
+            .iter()
+            .map(|r| (r.run().run_id.clone(), r.run().run_workspace.clone()))
+            .collect();
+        let ids: Vec<String> = runs.iter().map(|(id, _)| id.clone()).collect();
         for id in &ids {
             if let Err(e) = persistence::mark_closed(&dir, id) {
-                self.notice = crate::i18n::trf(
+                let why = crate::i18n::trf(
                     "team.notice.run_state_cleanup_failed",
                     &[("run", id.clone()), ("e", e.detail())],
                 );
+                self.notice = why.clone();
+                return Err(why);
+            }
+        }
+        // 保存された任意のパスは削除対象にしない。元 workspace・run_id から
+        // 決定パスを再計算し、同じ repository の登録済み worktree と確認できた
+        // Run だけを外す。失敗時は Runtime と保存を残すので、利用者が同じ
+        // 破棄操作を安全に再試行できる。
+        for (id, saved) in &runs {
+            let discovered;
+            let worktree = match saved.as_ref() {
+                Some(w) => Some(w),
+                None => {
+                    discovered = super::run_workspace::discover(&self.home, &self.workspace, id)
+                        .map_err(|e| {
+                            format!("Run {id} の専用 worktree を安全に確認できません: {e}")
+                        })?;
+                    discovered.as_ref()
+                }
+            };
+            if let Some(worktree) = worktree {
+                if let Err(e) =
+                    super::run_workspace::remove(&self.home, &self.workspace, id, worktree)
+                {
+                    let why = format!("Run {id} の専用 worktree を削除できません: {e}");
+                    self.notice = why.clone();
+                    return Err(why);
+                }
             }
         }
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
@@ -982,12 +1072,67 @@ impl TeamPanel {
             self.notice = "読み取り専用で開いています (操作できません)".to_string();
             return;
         }
+        if matches!(&action, TeamAction::Start) {
+            if let Err(why) = self.prepare_active_workspace() {
+                self.notice = why;
+                self.refresh_git_readiness();
+                self.dirty = true;
+                return;
+            }
+        }
         let Some(rt) = self.rt_mut() else {
             return;
         };
         let effects = rt.apply_action(action);
         self.absorb(effects);
         self.dirty = true;
+    }
+
+    /// active Run の専用 worktree を作り、対応を保存してから開始可能にする。
+    /// worktree 作成後の保存に失敗した場合は Runtime を共有 workspace へ
+    /// 向けず、そのまま Ready で止める。
+    fn prepare_active_workspace(&mut self) -> Result<(), String> {
+        let pos = self.active;
+        let Some(rt) = self.runs.get(pos) else {
+            return Err("Team Run がありません".to_string());
+        };
+        if let Some(saved) = rt.run().run_workspace.as_ref() {
+            let execution = super::run_workspace::restore(
+                &self.home,
+                &self.workspace,
+                &rt.run().run_id,
+                saved,
+            )?;
+            if execution != rt.workspace() {
+                return Err("Run の実行 workspace が保存された対応と違います".to_string());
+            }
+            return Ok(());
+        }
+
+        let id = rt.run().run_id.clone();
+        let run_workspace = super::run_workspace::create(&self.home, &self.workspace, &id)?;
+        // まず対応を含む完全なスナップショットを書く。これが成功するまで
+        // Runtime の cwd は切り替えないので、途中失敗で共有 workspace を走らない。
+        let mut saved = self.runs[pos].to_saved();
+        saved.run.workspace = run_workspace.source_workspace.clone();
+        saved.run.run_workspace = Some(run_workspace.clone());
+        let dir = persistence::run_dir_in(&self.state_dir(), &id)
+            .ok_or_else(|| format!("Run {id:?} の保存先を作れません"))?;
+        if let Err(e) = persistence::save(&dir, &saved) {
+            let cleanup = super::run_workspace::remove(
+                &self.home,
+                &self.workspace,
+                &id,
+                &run_workspace,
+            )
+            .err()
+            .map(|why| format!(" / worktree の後始末も失敗: {why}"))
+            .unwrap_or_default();
+            return Err(format!("{}{cleanup}", e.detail()));
+        }
+        self.runs[pos].set_run_workspace(run_workspace);
+        self.needs_save = true;
+        Ok(())
     }
 
     /// 走査してよい時刻か。**毎フレームは走らせない。**
@@ -1152,7 +1297,7 @@ impl TeamPanel {
         match verdict {
             Verdict::Deliver { agent, kind, body } => {
                 match self.runs[run].accept_outbox(&agent, kind, &body, now) {
-                    Ok(outcome) => match std::fs::remove_file(file) {
+                    Ok(outcome) => match outbox::remove_report(file) {
                         Ok(()) => {
                             self.outbox_ledger.forget(file);
                             return outcome == super::runtime::AcceptOutcome::Applied;
@@ -1527,7 +1672,7 @@ impl TeamPanel {
         self.absorb_for(owner, effects);
         let rt = self.runs.remove(i);
         let id = rt.run().run_id.clone();
-        self.cleanup_closed_run(&id);
+        self.cleanup_closed_run(&id, rt.run().run_workspace.as_ref());
         if self.runs.is_empty() {
             self.active = 0;
             self.snapshot = None;
@@ -1550,36 +1695,71 @@ impl TeamPanel {
     /// 順序が不変条件:
     /// 1. **消す前に墓標を書く** ([`persistence::mark_closed`])。削除が失敗しても
     ///    途中で落ちても、次の起動の `restore_run` は墓標を見て復元しない
-    /// 2. 保存 (`runs/<id>`) と報告置き場 (`outbox/<id>`) を消す。どちらも
+    /// 2. Run 専用 worktree を決定パスと git 登録の両方で検証して消す。
+    ///    失敗したら対応情報を持つ保存は残し、次回再試行できる。
+    /// 3. 保存 (`runs/<id>`) と報告置き場 (`outbox/<id>`) を消す。どちらも
     ///    `run_id` の関門 ([`outbox::safe_child`]) を通した 1 段下だけ。
     ///    失敗は**種類ごとに**帯へ出す (保存が残るのと置き場が残るのでは、
     ///    次に起きることが違う)
-    /// 3. 最後の 1 本なら根の控え (`state.json`) も消す。残すと `has_run` が
+    /// 4. 最後の 1 本なら根の控え (`state.json`) も消す。残すと `has_run` が
     ///    「保存がある」と案内し、復元経路がその控えを拾う
-    /// 4. 全部済んだときだけ墓標を片付ける。1 つでも残ったら墓標も残す —
+    /// 5. 全部済んだときだけ墓標を片付ける。1 つでも残ったら墓標も残す —
     ///    次の起動で `restore_run` が片付けを試し直す
-    fn cleanup_closed_run(&mut self, id: &str) {
+    fn cleanup_closed_run(
+        &mut self,
+        id: &str,
+        run_workspace: Option<&super::run_workspace::RunWorkspace>,
+    ) {
         let state = self.state_dir();
-        let mut state_err: Option<String> = None;
         if let Err(e) = persistence::mark_closed(&state, id) {
-            // 墓標が書けない = 削除に失敗したときの保険が無い。削除そのものは
-            // 続ける (成功すれば復活の余地は無い)。
-            state_err = Some(e.detail());
+            // 墓標が書けないまま削除を始めると、途中失敗時に次回の
+            // 復元が半分削除された Run を拾う。ここは何も消さず止める。
+            self.notice = crate::i18n::trf(
+                "team.notice.run_state_cleanup_failed",
+                &[("run", id.to_string()), ("e", e.detail())],
+            );
+            return;
         }
+
+        let discovered;
+        let worktree = match run_workspace {
+            Some(w) => Some(w),
+            None => match super::run_workspace::discover(&self.home, &self.workspace, id) {
+                Ok(found) => {
+                    discovered = found;
+                    discovered.as_ref()
+                }
+                Err(e) => {
+                    self.notice = format!(
+                        "Run {id} の専用 worktree を安全に確認できません: {e}"
+                    );
+                    return;
+                }
+            },
+        };
+        if let Some(worktree) = worktree {
+            if let Err(e) =
+                super::run_workspace::remove(&self.home, &self.workspace, id, worktree)
+            {
+                // 保存を残す。墓標で復元は防ぎ、次回起動で同じ対応を
+                // 使って後始末を再試行できる。
+                self.notice = format!("Run {id} の専用 worktree を削除できません: {e}");
+                return;
+            }
+        }
+
+        let mut errors = Vec::new();
         let mut all_gone = true;
         if let Some(dir) = persistence::run_dir_in(&state, id) {
             if let Err(e) = persistence::remove_dir_checked(&dir) {
                 all_gone = false;
-                state_err = Some(e);
+                errors.push(e);
             }
         }
         if let Some(dir) = outbox::run_dir(&state, id) {
             if let Err(e) = persistence::remove_dir_checked(&dir) {
                 all_gone = false;
-                self.notice = crate::i18n::trf(
-                    "team.notice.outbox_cleanup_failed",
-                    &[("run", id.to_string()), ("e", e)],
-                );
+                errors.push(e);
             }
         }
         // **根の控えが閉じた Run のものなら消す。** 控えは「いちばん古い 1 本」の
@@ -1588,13 +1768,13 @@ impl TeamPanel {
         if persistence::root_run_id(&state).as_deref() == Some(id) {
             if let Err(e) = persistence::reset(&state) {
                 all_gone = false;
-                state_err = Some(e.detail());
+                errors.push(e.detail());
             }
         }
-        if let Some(e) = state_err {
+        if !errors.is_empty() {
             self.notice = crate::i18n::trf(
                 "team.notice.run_state_cleanup_failed",
-                &[("run", id.to_string()), ("e", e)],
+                &[("run", id.to_string()), ("e", errors.join(" / "))],
             );
         }
         if all_gone {
@@ -1612,30 +1792,9 @@ impl TeamPanel {
     /// 残っているので、それを掃く。失敗しても復元は続ける — 掃除の失敗で
     /// 生きている Run の復元を止めない。
     fn sweep_closed_runs(&mut self, root: &Path) {
+        debug_assert_eq!(root, self.state_dir());
         for id in persistence::closed_run_ids(root) {
-            let mut all_gone = true;
-            for dir in [
-                persistence::run_dir_in(root, &id),
-                outbox::run_dir(root, &id),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if persistence::remove_dir_checked(&dir).is_err() {
-                    all_gone = false;
-                }
-            }
-            // **根の控えも同じ Run のものなら片付ける。** 残すと、下の復元が
-            // `runs/` に何も無いときの経路でその写しを拾い、閉じた Run が
-            // 戻ってくる (墓標を消した後は断る材料も無くなる)。
-            if persistence::root_run_id(root).as_deref() == Some(id.as_str())
-                && persistence::reset(root).is_err()
-            {
-                all_gone = false;
-            }
-            if all_gone {
-                let _ = persistence::unmark_closed(root, &id);
-            }
+            self.cleanup_closed_run(&id, None);
         }
     }
 
@@ -2197,6 +2356,8 @@ mod tests {
     /// 置き場の根を一時ディレクトリへ向ける。`ZAIVERN_HOME` を差し替える手も
     /// あるが、環境変数は並列に走る他のテストへ漏れるので採らない。
     fn panel_at(dir: &Path) -> TeamPanel {
+        std::fs::create_dir_all(dir).expect("テスト workspace を作れる");
+        gitinit::prepare(dir).expect("製品の Start 経路に必要な HEAD 付き git repo");
         let mut p = TeamPanel::default();
         p.home = dir.join(".zaivern-test-home");
         p.attach_workspace(dir)
@@ -2204,24 +2365,37 @@ mod tests {
         p
     }
 
-    /// 旧版が保存した複数 Run と配送分離を検査するためだけのフィクスチャ。
-    /// 製品の [`TeamPanel::plan`] は常に [`MAX_CONCURRENT_RUNS`] を守る。
-    /// 既存 Run を一時的に退避して同じ計画経路で 1 本作り、旧保存状態として
-    /// 並べることで、テストビルドの本番上限を緩めず複数 lane を再現する。
-    fn add_legacy_run(p: &mut TeamPanel) -> Result<(), String> {
-        let old_runs = std::mem::take(&mut p.runs);
-        let old_active = p.active;
-        let result = p.plan(SPEC, "SPEC.md", RunOptions::default());
-        let mut created = std::mem::take(&mut p.runs);
-        p.runs = old_runs;
-        if let Err(e) = result {
-            p.active = old_active.min(p.runs.len().saturating_sub(1));
-            return Err(e);
+    /// 製品の Run 開始経路で worktree 隔離を検査するための最小 repo。
+    fn git_repo(name: &str) -> Option<PathBuf> {
+        let dir = ws(name);
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(dir.join("seed.txt"), "seed\n").ok()?;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"])
+            || !git(&["config", "user.email", "team-test@example.invalid"])
+            || !git(&["config", "user.name", "Team Test"])
+            || !git(&["add", "seed.txt"])
+            || !git(&["commit", "-q", "-m", "seed"])
+        {
+            std::fs::remove_dir_all(&dir).ok();
+            return None;
         }
-        assert_eq!(created.len(), 1, "テスト用の追加で Run が1本以外作られた");
-        p.runs.push(created.remove(0));
-        p.active = p.runs.len() - 1;
-        Ok(())
+        Some(dir)
+    }
+
+    /// GUI/CLI と同じ製品経路で Run を追加する。
+    fn add_product_run(p: &mut TeamPanel) -> Result<(), String> {
+        p.plan_with(SPEC, "SPEC.md", RunOptions::default(), Vec::new(), "")
     }
 
     /// **検証を明示する SPEC。**
@@ -2284,7 +2458,7 @@ mod tests {
     fn started_panel(dir: &Path) -> TeamPanel {
         std::fs::create_dir_all(dir).unwrap();
         let mut p = panel_at(dir);
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_product_run(&mut p).unwrap();
         p.act(TeamAction::Start);
         p.pump(super::super::runtime::Observation {
             now: 1,
@@ -2304,9 +2478,11 @@ mod tests {
         assert!(!launches.is_empty(), "起動要求が出ていない");
         for (_, _, spec) in &launches {
             assert_eq!(
-                spec.workspace_root, p.workspace,
+                spec.workspace_root,
+                p.owner().expect("active Run").workspace,
                 "起動要求が Run の workspace を運んでいない"
             );
+            assert_ne!(spec.workspace_root, p.workspace, "元 workspace を共有した");
             // 飾りのフィールドを残さない (役割と名前は指示文と端末名に出る)。
             assert!(!spec.name.trim().is_empty(), "名前が空");
             assert!(!spec.team_id.0.trim().is_empty(), "所属チームが空");
@@ -2380,19 +2556,186 @@ mod tests {
     }
 
     #[test]
-    fn 専用worktreeが無い間は同一workspace二本目を開始前に断る() {
-        let dir = ws("single-run-limit");
+    fn 同一workspaceは四本まで計画でき五本目を開始前に断る() {
+        let dir = ws("four-run-limit");
         let mut p = panel_at(&dir);
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
-        let first = p.owner().expect("1本目");
+        for i in 0..MAX_CONCURRENT_RUNS {
+            p.plan(SPEC, "SPEC.md", RunOptions::default())
+                .unwrap_or_else(|e| panic!("{} 本目を計画できない: {e}", i + 1));
+        }
+        let before: Vec<String> = p.runs.iter().map(|r| r.run().run_id.clone()).collect();
         let err = p
             .plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect_err("2本目を作ってしまった");
+            .expect_err("5本目を作ってしまった");
         assert!(!err.trim().is_empty(), "拒否理由が空");
         assert_eq!(p.notice, err, "利用者へ拒否理由を表示していない");
-        assert_eq!(MAX_CONCURRENT_RUNS, 1, "安全上限が1本ではない");
+        assert_eq!(MAX_CONCURRENT_RUNS, 4, "製品上限が4本ではない");
         assert_eq!(p.runs.len(), MAX_CONCURRENT_RUNS);
-        assert_eq!(p.owner(), Some(first), "既存 Run を置き換えた");
+        assert_eq!(
+            p.runs
+                .iter()
+                .map(|r| r.run().run_id.clone())
+                .collect::<Vec<_>>(),
+            before,
+            "拒否で既存 Run を置き換えた"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 内部フィクスチャで `runs` を書き換えず、GUI/CLI が共通で使う
+    /// `plan` → `Start` だけで4本を開始できることを要求する。
+    #[test]
+    fn 製品経路から四本を別worktreeで開始し五本目を拒否する() {
+        let Some(dir) = git_repo("product-four-runs") else {
+            println!("[skip] git を使えません");
+            return;
+        };
+        // 開始前からある未コミット変更を、worktree 作成で触らない。
+        std::fs::write(dir.join("user-change.txt"), "keep me\n").unwrap();
+        let mut p = panel_at(&dir);
+        let mut owners = Vec::new();
+        for i in 0..4 {
+            add_product_run(&mut p)
+                .unwrap_or_else(|e| panic!("{} 本目の計画を作れない: {e}", i + 1));
+            p.act(TeamAction::Start);
+            assert_eq!(p.goal_status(), Some(GoalStatus::Running));
+            owners.push(p.owner().expect("開始した Run の持ち主"));
+        }
+        assert_eq!(MAX_CONCURRENT_RUNS, 4);
+        assert_eq!(p.runs.len(), 4);
+        let workspaces: std::collections::HashSet<PathBuf> =
+            owners.iter().map(|o| o.workspace.clone()).collect();
+        assert_eq!(workspaces.len(), 4, "Run 間で実行 workspace が共有された");
+        assert!(
+            workspaces.iter().all(|w| w != &dir && w.is_dir()),
+            "専用 worktree ではない: {workspaces:?}"
+        );
+        let before: Vec<String> = owners.iter().map(|o| o.run_id.clone()).collect();
+        let err = p
+            .plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect_err("5 本目を開始できてしまった");
+        assert!(err.contains('4'), "上限が分かる拒否理由でない: {err}");
+        assert_eq!(
+            p.runs
+                .iter()
+                .map(|r| r.run().run_id.clone())
+                .collect::<Vec<_>>(),
+            before,
+            "5 本目の拒否で既存 Run が壊れた"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("user-change.txt")).unwrap(),
+            "keep me\n",
+            "元 workspace の未コミット変更が壊れた"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 非git_workspaceは共有実行へfallbackせず開始前に拒否する() {
+        let dir = ws("start-non-git");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = TeamPanel::default();
+        p.home = dir.join(".zaivern-test-home");
+        p.attach_workspace(&dir).expect("attach");
+        add_product_run(&mut p).expect("計画までは作れる");
+        let source = p.owner().expect("Run").workspace;
+        p.act(TeamAction::Start);
+        assert_eq!(p.goal_status(), Some(GoalStatus::Ready), "共有workspaceで開始した");
+        assert_eq!(p.owner().expect("Run").workspace, source);
+        assert!(p.runs[0].run().run_workspace.is_none());
+        assert!(p.take_launches().is_empty(), "拒否したのに担当を起動した");
+        assert!(!p.notice.trim().is_empty(), "拒否理由を表示していない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 二本目のworktree対応保存失敗は一本目を壊さない() {
+        let Some(dir) = git_repo("worktree-save-failure") else {
+            println!("[skip] git を使えません");
+            return;
+        };
+        let mut p = panel_at(&dir);
+        add_product_run(&mut p).expect("A計画");
+        p.act(TeamAction::Start);
+        let a = p.owner().expect("A");
+        assert!(a.workspace.is_dir());
+        add_product_run(&mut p).expect("B計画");
+        let b_id = p.owner().expect("B").run_id;
+        persistence::fault_inject::fail_at(persistence::SavePhase::TmpWritten);
+        p.act(TeamAction::Start);
+        persistence::fault_inject::clear();
+        assert_eq!(p.goal_status(), Some(GoalStatus::Ready), "保存前にBを開始した");
+        assert!(p.runs[p.active].run().run_workspace.is_none());
+        assert!(a.workspace.is_dir(), "失敗でAのworktreeを消した");
+        let b_root = super::super::run_workspace::expected_root(&p.home, &dir, &b_id)
+            .expect("Bの決定パス");
+        assert!(!b_root.exists(), "保存に失敗したBのworktreeを残した");
+        assert_eq!(p.runs.len(), 2, "失敗で既存Runを消した");
+        let pos_a = p.run_pos_of_owner(&a).expect("A");
+        p.close_run(pos_a);
+        p.close_run(0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 作成済み未保存のworktreeをstartが再利用して既存runを壊さない() {
+        let Some(dir) = git_repo("worktree-created-before-save") else {
+            println!("[skip] git を使えません");
+            return;
+        };
+        let mut p = panel_at(&dir);
+        add_product_run(&mut p).expect("A計画");
+        p.act(TeamAction::Start);
+        let a = p.owner().expect("A");
+        add_product_run(&mut p).expect("B計画");
+        let b_id = p.owner().expect("B").run_id;
+        let orphan = super::super::run_workspace::create(&p.home, &dir, &b_id)
+            .expect("保存直前に落ちたworktreeを再現");
+
+        p.act(TeamAction::Start);
+        let b = p.owner().expect("B");
+        assert_eq!(b.workspace, PathBuf::from(&orphan.execution_workspace));
+        assert_eq!(p.goal_status(), Some(GoalStatus::Running));
+        assert!(a.workspace.is_dir(), "再利用時にAのworktreeを壊した");
+        p.close_run(p.run_pos_of_owner(&a).expect("A"));
+        p.close_run(0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree削除失敗は墓標と診断を残し別runを巻き込まず再試行する() {
+        let Some(dir) = git_repo("worktree-remove-retry") else {
+            println!("[skip] git を使えません");
+            return;
+        };
+        let mut p = panel_at(&dir);
+        add_product_run(&mut p).expect("A計画");
+        p.act(TeamAction::Start);
+        let a = p.owner().expect("A");
+        add_product_run(&mut p).expect("B計画");
+        p.act(TeamAction::Start);
+        let b = p.owner().expect("B");
+        p.save_if_needed();
+        let state = p.state_dir();
+
+        super::super::run_workspace::fault_inject::fail_remove_once();
+        p.close_run(p.run_pos_of_owner(&a).expect("A")).expect("Aを閉じる");
+        assert!(a.workspace.is_dir(), "削除失敗を成功扱いした");
+        assert!(b.workspace.is_dir(), "Aの失敗でBのworktreeを消した");
+        assert!(persistence::is_closed(&state, &a.run_id), "Aの墓標が無い");
+        assert!(p.notice.contains("削除に失敗"), "診断が残らない: {}", p.notice);
+
+        let mut q = TeamPanel::default();
+        q.home = p.home.clone();
+        q.attach_workspace(&dir).expect("再attach");
+        q.restore_run(false).expect("Bを復元");
+        assert!(!a.workspace.exists(), "再起動でAの削除を再試行していない");
+        assert!(b.workspace.is_dir(), "再試行でBのworktreeを消した");
+        assert_eq!(q.runs.len(), 1);
+        assert_eq!(q.owner().expect("B").run_id, b.run_id);
+        assert!(!persistence::is_closed(&state, &a.run_id), "清掃後も墓標が残った");
+        q.close_run(0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2402,7 +2745,7 @@ mod tests {
         let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         for _ in 1..3 {
-            add_legacy_run(&mut p).unwrap();
+            add_product_run(&mut p).unwrap();
         }
         let active_owner = p.runs[1].owner();
         p.select_run(1);
@@ -2418,7 +2761,7 @@ mod tests {
         let mut p = panel_at(&dir);
         p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
         let a = p.owner().unwrap();
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         let b = p.owner().unwrap();
         let cancel_a = super::super::launch::new_cancel_flag();
         let cancel_b = super::super::launch::new_cancel_flag();
@@ -2470,7 +2813,7 @@ mod tests {
             rx,
         });
         // 2 本目を作り、画面をそちらへ切り替える。
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         // 前の Run の worker が結果を返してくる。
         tx.send(("old".into(), 1, vec![ValidationRun::passed("cargo test a")]))
             .unwrap();
@@ -2500,18 +2843,20 @@ mod tests {
     }
 
     #[test]
-    /// **実行中の Run を2本目の計画で潰さない。**
-    fn 実行中のrunを別の計画で潰さない() {
+    /// **実行中の Run を2本目の計画で潰さず、別 Run として保持する。**
+    fn 実行中のrunを別の計画で潰さず並行runとして保持する() {
         let dir = ws("replace-busy");
         let mut p = started_panel(&dir);
         assert!(p.live_work().is_busy());
         let before = p.owner().expect("持ち主");
-        let err = p
-            .plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect_err("実行中なのに2本目を並べてしまった");
-        assert!(!err.trim().is_empty(), "断った理由が空");
-        assert_eq!(p.runs.len(), MAX_CONCURRENT_RUNS);
-        assert_eq!(p.owner(), Some(before), "実行中の Run を置き換えた");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("2本目を計画できる");
+        assert_eq!(p.runs.len(), 2);
+        assert!(
+            p.runs.iter().any(|rt| rt.owner() == before),
+            "実行中の Run を置き換えた"
+        );
+        assert_ne!(p.owner(), Some(before), "2本目が独立した Run になっていない");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2532,7 +2877,7 @@ mod tests {
         // なくなった。死ぬのは**閉じたとき**なので、そこで確かめる。
         let stale = p.pending_launches.clone();
         p.workspace = b.clone();
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale;
         assert!(
@@ -2587,7 +2932,7 @@ mod tests {
         );
         // **閉じた Run のものは、どの口からも出さない。**
         p.workspace = b.clone();
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale.0;
         p.pending_instructions = stale.1;
@@ -2736,7 +3081,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("1 本目の起動要求");
-        add_legacy_run(&mut p).expect("旧保存状態の2本目");
+        add_product_run(&mut p).expect("製品経路の2本目");
         let second = p.owner().expect("2 本目");
         assert_ne!(first.run_id, second.run_id, "同じ Run になっている");
 
@@ -2777,20 +3122,84 @@ mod tests {
         let dir = ws("two-runs-switch");
         let mut p = started_panel(&dir);
         let first = p.owner().expect("1 本目");
-        let _ = p.take_launches();
-        add_legacy_run(&mut p).expect("旧保存状態の2本目");
-        let second = p.owner().expect("2 本目");
+        let boot_a = p.take_launches();
+        p.plan_with(
+            SPEC,
+            "SPEC-B.md",
+            RunOptions::default(),
+            Vec::new(),
+            "Run B",
+        )
+        .expect("製品経路の2本目");
+        let second_id = p.owner().expect("2 本目").run_id;
+        p.act(TeamAction::Start);
+        let second = p.owner().expect("開始後の2 本目");
+        assert_eq!(second.run_id, second_id);
+        p.pump(super::super::runtime::Observation {
+            now: 2,
+            sessions: Vec::new(),
+        });
+        let boot_b = p.take_launches();
+        let spec_a = &boot_a.first().expect("Aの起動").2;
+        let spec_b = &boot_b.first().expect("Bの起動").2;
+        assert_eq!(spec_a.agent_id, spec_b.agent_id, "前提: 同じ担当ID");
+        p.bind_session(&first, &spec_a.agent_id, 1101, None);
+        p.bind_session(&second, &spec_b.agent_id, 2202, None);
+        p.pump(super::super::runtime::Observation {
+            now: 3,
+            sessions: vec![
+                super::super::runtime::SessionObs {
+                    id: 1101,
+                    title: "A terminal".into(),
+                    provider: "codex".into(),
+                    state: crate::coordinator::SessionState::Working,
+                    text: "Aだけのログ".into(),
+                },
+                super::super::runtime::SessionObs {
+                    id: 2202,
+                    title: "B terminal".into(),
+                    provider: "claude".into(),
+                    state: crate::coordinator::SessionState::Working,
+                    text: "Bだけのログ".into(),
+                },
+            ],
+        });
         assert_ne!(first.run_id, second.run_id);
         assert_eq!(p.run_tabs().len(), 2, "切り替えの見出しが 2 つ出ない");
         p.select_run(0);
+        p.refresh_snapshot(3);
         assert_eq!(p.owner().as_ref(), Some(&first));
         assert_eq!(p.runs.len(), 2, "切り替えで消えた");
+        let snap_a = p.snapshot().cloned().expect("Aの表示");
+        assert_ne!(snap_a.goal.title, "Run B");
+        assert!(snap_a.agents.iter().any(|a| a.preview.contains("Aだけのログ")));
+        assert!(!snap_a.agents.iter().any(|a| a.preview.contains("Bだけのログ")));
+        let tasks_a: Vec<String> = p.runs[0].tasks().iter().map(|t| t.title.clone()).collect();
+        assert_eq!(
+            snap_a.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            tasks_a,
+            "Aのタスク表示ではない"
+        );
+        p.expanded_output = Some(spec_a.agent_id.clone());
         p.select_run(1);
         assert_eq!(p.owner().as_ref(), Some(&second));
+        assert!(p.expanded_output.is_none(), "Aの展開端末をBへ持ち越した");
+        p.refresh_snapshot(3);
+        let snap_b = p.snapshot().expect("Bの表示");
+        assert_eq!(snap_b.goal.title, "Run B");
+        assert!(snap_b.agents.iter().any(|a| a.preview.contains("Bだけのログ")));
+        assert!(!snap_b.agents.iter().any(|a| a.preview.contains("Aだけのログ")));
+        let tasks_b: Vec<String> = p.runs[1].tasks().iter().map(|t| t.title.clone()).collect();
+        assert_eq!(
+            snap_b.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            tasks_b,
+            "Bのタスク表示ではない"
+        );
         // 範囲外は無視する (押せない位置を作らない)。
         p.select_run(99);
         assert_eq!(p.active_run(), 1);
-
+        p.close_run(1);
+        p.close_run(0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2805,7 +3214,7 @@ mod tests {
         let launches_a = p.take_launches();
         assert!(!launches_a.is_empty(), "1 本目の起動要求が無い");
 
-        add_legacy_run(&mut p).expect("旧保存状態の2本目");
+        add_product_run(&mut p).expect("製品経路の2本目");
         p.act(TeamAction::Start);
         p.pump(super::super::runtime::Observation {
             now: 2,
@@ -2875,7 +3284,7 @@ mod tests {
             rx,
         });
 
-        add_legacy_run(&mut p).expect("B");
+        add_product_run(&mut p).expect("B");
         let owner_b = p.owner().expect("B owner");
         let pos_b = p.run_pos_of_owner(&owner_b).expect("B pos");
         assert_eq!(p.active_run(), pos_b, "前提: B が active ではない");
@@ -3563,7 +3972,14 @@ mod tests {
         let owner = launches[0].0.clone();
         let mut agents = Vec::new();
         for (launch_owner, key, spec) in &launches {
-            assert_eq!(spec.workspace_root, dir, "起動先の workspace がずれた");
+            assert_eq!(
+                spec.workspace_root, owner.workspace,
+                "起動先が Run 専用 workspace と一致しない"
+            );
+            assert_ne!(
+                spec.workspace_root, owner.source_workspace,
+                "元 workspace を実行先として共有している"
+            );
             agents.push(spec.agent_id.clone());
             p.ack_done(launch_owner, key);
         }
@@ -3606,7 +4022,7 @@ mod tests {
             .collect();
         assert!(!working.is_empty(), "担当が 1 つも付かない");
 
-        // ── 5) 完了報告 → 検証 Effect (cwd はこの workspace) ──────────────
+        // ── 5) 完了報告 → 検証 Effect (cwd は Run 専用 workspace) ─────────
         let (tid, sid, agent) = working[0].clone();
         let t = p.rt().unwrap().task(tid).expect("タスク").clone();
         let files: Vec<String> = t.files.iter().map(|x| format!("\"{x}\"")).collect();
@@ -3626,7 +4042,10 @@ mod tests {
         p.pump_sessions(rows(Some(sid), &report), now + 2);
         let validations = p.take_validations();
         assert!(!validations.is_empty(), "検証の要求が出ない");
-        assert_eq!(validations[0].2.cwd, dir, "検証の cwd がずれた");
+        assert_eq!(
+            validations[0].2.cwd, owner.workspace,
+            "検証の cwd が Run 専用 workspace と一致しない"
+        );
         assert!(
             !validations[0].2.commands.is_empty(),
             "空の検証を頼んでいる"
@@ -3640,9 +4059,9 @@ mod tests {
         p.act(TeamAction::Stop);
         assert!(p.rt().expect("Runtime").run().stopped, "停止が効かない");
 
-        // ── 7) 保存して復元できる (パスの綴りごと往復する) ────────────────
+        // ── 7) 元/実行 workspace の対応を保存して復元できる ───────────────
         p.save_if_needed();
-        let saved_ws = p.workspace().to_path_buf();
+        let saved_owner = p.owner().expect("保存前の持ち主");
         drop(p);
         let mut q = TeamPanel::default();
         q.home = home.clone();
@@ -3654,11 +4073,13 @@ mod tests {
         );
         q.restore_run(false).expect("復元できる");
         assert!(q.has_run(), "復元しても Run が無い");
+        let restored = q.owner().expect("持ち主");
+        assert_eq!(restored.source_workspace, saved_owner.source_workspace);
         assert_eq!(
-            q.owner().expect("持ち主").workspace,
-            saved_ws,
-            "往復で workspace の綴りが変わった"
+            restored.workspace, saved_owner.workspace,
+            "往復で Run 専用 workspace の対応が変わった"
         );
+        q.close_run(0).expect("worktree を片付ける");
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside_dir).ok();
@@ -3948,7 +4369,7 @@ mod tests {
         );
 
         // ── 配達の途中で 2 本目の Run が立つ (= 画面がそちらへ移る) ──────
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
         let run_b = p.runs[1].run().run_id.clone();
         assert_ne!(run_a, run_b, "前提: Run の ID は別");
@@ -4045,7 +4466,7 @@ mod tests {
         let (_owner, key, _, _, _) = sent[0].clone();
 
         // ── 2 本目の Run が、**同じ綴りの鍵**を発行済みに持つ ────────────
-        add_legacy_run(&mut p).unwrap();
+        add_product_run(&mut p).unwrap();
         assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
         let run_b = p.runs[1].run().run_id.clone();
         p.runs[1].note_effect_dispatched_for_test(&key);
@@ -4355,7 +4776,7 @@ mod tests {
                 p.bind_session(o, &spec.agent_id, sid, None);
                 sids.push(sid);
             }
-            add_legacy_run(&mut p).expect("B");
+            add_product_run(&mut p).expect("B");
             let b = p.owner().expect("B");
             p.save_if_needed();
             let state = p.state_dir();
@@ -4415,9 +4836,11 @@ mod tests {
             let a = p.owner().expect("A");
             let boot_a = p.take_launches();
             assert!(!boot_a.is_empty(), "A の起動要求が無い");
-            add_legacy_run(&mut p).expect("B");
-            let b = p.owner().expect("B");
+            add_product_run(&mut p).expect("B");
+            let b_id = p.owner().expect("B").run_id;
             p.act(TeamAction::Start);
+            let b = p.owner().expect("開始後のB");
+            assert_eq!(b.run_id, b_id);
             p.pump(super::super::super::runtime::Observation {
                 now: 2,
                 sessions: Vec::new(),
@@ -4702,7 +5125,7 @@ mod tests {
             let mut p = panel_at(&dir);
             p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
             for _ in 1..4 {
-                add_legacy_run(&mut p).expect("旧版の複数Run");
+                add_product_run(&mut p).expect("製品経路の複数Run");
             }
             p.save_if_needed();
             let state = p.state_dir();
@@ -4869,7 +5292,7 @@ mod tests {
             let mut p = started_panel(&dir);
             let mut boots = vec![p.take_launches()];
             for i in 1..count {
-                add_legacy_run(&mut p)
+                add_product_run(&mut p)
                     .unwrap_or_else(|e| panic!("{} 本目: {e}", i + 1));
                 p.act(TeamAction::Start);
                 p.pump(super::super::super::runtime::Observation {
@@ -5002,6 +5425,34 @@ mod tests {
             p.pump_sessions(rows(&[&a, &b]), 101);
             assert_eq!(saw(&p, &a.owner, "#99"), 1, "同じ報告を二度取り込んだ");
             assert_eq!(saw(&p, &b.owner, "#99"), 0, "別の Run へ流れた");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 受理後の削除失敗を再処理しても状態を二重更新しない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-remove-retry");
+            let event = r#"{"kind":"sub_agent_started","agent_id":"remove-retry-child","parent_id":"team-lead","role":"tester","action":"一度だけ"}"#;
+            let file = submit(
+                &a.dir,
+                "team-lead",
+                "remove-fail",
+                &envelope(&a.owner.run_id, "team-lead", "event", event),
+            );
+            outbox::fault_inject::fail_remove_once();
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            assert!(file.exists(), "削除失敗なのにファイルが消えた");
+            let count = |panel: &TeamPanel| {
+                let pos = panel.run_pos_of_owner(&a.owner).expect("A");
+                panel.runs[pos]
+                    .agents()
+                    .iter()
+                    .filter(|agent| agent.id.as_str() == "remove-retry-child")
+                    .count()
+            };
+            assert_eq!(count(&p), 1, "初回の状態反映が無い");
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            assert!(!file.exists(), "再処理で受理済みファイルを片付けていない");
+            assert_eq!(count(&p), 1, "削除再試行で状態を二重更新した");
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5427,6 +5878,32 @@ mod tests {
         #[test]
         fn 二本のrunを並べて片方を閉じても他方は動き続ける() {
             let (mut p, dir, a, b) = two_lanes("outbox-multi-run-e2e");
+            let baseline_a = super::super::super::changeset::capture_baseline(&a.owner.workspace)
+                .expect("A の基準点");
+            let baseline_b = super::super::super::changeset::capture_baseline(&b.owner.workspace)
+                .expect("B の基準点");
+            std::fs::write(a.owner.workspace.join("only-a.txt"), "A\n").unwrap();
+            std::fs::write(b.owner.workspace.join("only-b.txt"), "B\n").unwrap();
+            let changed_a = super::super::super::changeset::measure(
+                &a.owner.workspace,
+                &baseline_a,
+            )
+            .expect("A の changeset");
+            let changed_b = super::super::super::changeset::measure(
+                &b.owner.workspace,
+                &baseline_b,
+            )
+            .expect("B の changeset");
+            assert_eq!(
+                changed_a.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                vec!["only-a.txt"],
+                "B の変更が A に混入した"
+            );
+            assert_eq!(
+                changed_b.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                vec!["only-b.txt"],
+                "A の変更が B に混入した"
+            );
             for lane in [&a, &b] {
                 let pos = p.run_pos_of_owner(&lane.owner).unwrap();
                 assert!(
@@ -5446,6 +5923,20 @@ mod tests {
                 .expect("宛先");
             submit(&a.dir, "team-lead", "r1", &report("team-lead", 91));
             submit(&b.dir, "team-lead", "r1", &report("team-lead", 92));
+            let event_a = r#"{"kind":"sub_agent_started","agent_id":"e2e-a","parent_id":"team-lead","role":"tester","action":"Aだけ"}"#;
+            let event_b = r#"{"kind":"sub_agent_started","agent_id":"e2e-b","parent_id":"team-lead","role":"reviewer","action":"Bだけ"}"#;
+            submit(
+                &a.dir,
+                "team-lead",
+                "ea",
+                &envelope(&a.owner.run_id, "team-lead", "event", event_a),
+            );
+            submit(
+                &b.dir,
+                "team-lead",
+                "eb",
+                &envelope(&b.owner.run_id, "team-lead", "event", event_b),
+            );
             submit(
                 &a.dir,
                 "team-lead",
@@ -5462,6 +5953,14 @@ mod tests {
             assert_eq!(saw(&p, &b.owner, "#92"), 1, "B の報告が届かない");
             assert_eq!(saw(&p, &a.owner, "#92"), 0, "B の報告が A へ流れた");
             assert_eq!(saw(&p, &b.owner, "#91"), 0, "A の報告が B へ流れた");
+            let has_agent = |panel: &TeamPanel, owner: &RunOwner, id: &str| {
+                let pos = panel.run_pos_of_owner(owner).expect("Run");
+                panel.runs[pos].agents().iter().any(|agent| agent.id.as_str() == id)
+            };
+            assert!(has_agent(&p, &a.owner, "e2e-a"), "A の状態が遷移しない");
+            assert!(has_agent(&p, &b.owner, "e2e-b"), "B の状態が遷移しない");
+            assert!(!has_agent(&p, &a.owner, "e2e-b"), "B の状態が A に混入した");
+            assert!(!has_agent(&p, &b.owner, "e2e-a"), "A の状態が B に混入した");
 
             // 画面を切り替えても両方生きている。
             assert_eq!(p.run_tabs().len(), 2);
@@ -5469,13 +5968,50 @@ mod tests {
             p.select_run(1);
             assert_eq!(p.runs.len(), 2, "切り替えで消えた");
 
-            // A を閉じる → B は動き続ける。
-            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
-            p.close_run(pos_a).expect("A を閉じる");
+            // 実際の再起動経路で2本とworkspace対応を復元する。
+            p.shutdown();
+            let mut q = TeamPanel::default();
+            q.home = p.home.clone();
+            q.attach_workspace(&dir).expect("再attach");
+            q.restore_run(false).expect("2本を復元");
+            assert_eq!(q.runs.len(), 2, "再起動でRunが消えた");
+            for lane in [&a, &b] {
+                let pos = q.run_pos_of(&lane.owner.run_id).expect("復元したRun");
+                assert_eq!(
+                    q.runs[pos].owner().workspace,
+                    lane.owner.workspace,
+                    "再起動で実行workspace対応が変わった"
+                );
+            }
+            assert!(has_agent(&q, &a.owner, "e2e-a"), "A の状態を復元できない");
+            assert!(has_agent(&q, &b.owner, "e2e-b"), "B の状態を復元できない");
+
+            // A を閉じる → A のworktreeだけ消え、Bは動き続ける。
+            let pos_a = q.run_pos_of_owner(&a.owner).unwrap();
+            q.close_run(pos_a).expect("A を閉じる");
             assert!(!a.dir.exists(), "閉じた Run の置き場が残っている");
-            submit(&b.dir, "team-lead", "r2", &report("team-lead", 93));
-            p.pump_sessions(rows(&[&b]), 601);
-            assert_eq!(saw(&p, &b.owner, "#93"), 1, "A を閉じたら B が止まった");
+            assert!(!a.owner.workspace.exists(), "A のworktreeが残っている");
+            assert!(b.owner.workspace.is_dir(), "B のworktreeまで削除した");
+            let event_b2 = r#"{"kind":"sub_agent_started","agent_id":"e2e-b2","parent_id":"team-lead","role":"tester","action":"継続"}"#;
+            submit(
+                &b.dir,
+                "team-lead",
+                "eb2",
+                &envelope(&b.owner.run_id, "team-lead", "event", event_b2),
+            );
+            q.pump_sessions(Vec::new(), 601);
+            assert!(has_agent(&q, &b.owner, "e2e-b2"), "A を閉じたら B が止まった");
+
+            // もう一度再起動しても閉じたAは戻らず、Bの対応は維持される。
+            q.shutdown();
+            let mut r = TeamPanel::default();
+            r.home = q.home.clone();
+            r.attach_workspace(&dir).expect("再々attach");
+            r.restore_run(false).expect("Bを復元");
+            assert_eq!(r.runs.len(), 1, "閉じたAが復元された");
+            assert_eq!(r.owner().expect("B").workspace, b.owner.workspace);
+            assert!(has_agent(&r, &b.owner, "e2e-b2"), "Bの継続状態が消えた");
+            r.close_run(0).expect("Bを片付ける");
             std::fs::remove_dir_all(&dir).ok();
         }
 

@@ -556,6 +556,36 @@ pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// 受理済み報告を片付ける唯一の口。テストでは「状態反映後に削除だけ失敗」
+/// をOS権限に依存せず再現する。
+pub fn remove_report(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if fault_inject::take_remove_failure() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "(テスト) 受理済み報告を削除できません",
+        ));
+    }
+    std::fs::remove_file(path)
+}
+
+#[cfg(test)]
+pub mod fault_inject {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_REMOVE_ONCE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn fail_remove_once() {
+        FAIL_REMOVE_ONCE.with(|flag| flag.set(true));
+    }
+
+    pub(super) fn take_remove_failure() -> bool {
+        FAIL_REMOVE_ONCE.with(|flag| flag.replace(false))
+    }
+}
+
 /// 隔離の結果。**取り込めなかった報告を消すことは無い。**
 ///
 /// 却下された報告は「エージェントが何を書いたか」の唯一の証拠なので、消すと
