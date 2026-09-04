@@ -19,6 +19,14 @@ pub struct RunWorkspace {
     pub execution_workspace: String,
 }
 
+/// Run worktree の未保存変更。`git status --porcelain=v1 -z` が1件でも
+///返したら dirty で、tracked / untracked / staged / deleted / renamed を含む。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeState {
+    Clean,
+    Dirty,
+}
+
 /// `ZAIVERN_HOME` 直下の専用親フォルダ。
 pub const DIR_NAME: &str = "team-worktrees";
 
@@ -79,7 +87,14 @@ fn ensure_plain_layout(home: &Path, keyed_base: &Path) -> Result<(), String> {
             Ok(meta) if !meta.is_dir() => {
                 return Err(format!("worktree 置き場がフォルダではありません: {}", p.display()));
             }
-            Ok(_) | Err(_) => {}
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "worktree 置き場を確認できません ({}): {e}",
+                    p.display()
+                ));
+            }
         }
     }
     Ok(())
@@ -280,12 +295,12 @@ pub fn discover(
 
 /// 指定 Run の worktree だけを git に外させる。保存されたパスを
 /// そのまま削除対象にはしない。
-pub fn remove(
+fn verified_for_removal(
     home: &Path,
     source_workspace: &Path,
     run_id: &str,
     saved: &RunWorkspace,
-) -> Result<(), String> {
+) -> Result<(PathBuf, PathBuf), String> {
     let (source, repo, relative) = source_layout(source_workspace)?;
     let expected = expected_root(home, &source, run_id)?;
     if Path::new(&saved.source_workspace) != source
@@ -305,8 +320,9 @@ pub fn remove(
     }
     match std::fs::symlink_metadata(&expected) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = crate::worktree::git_out(&repo, &["worktree", "prune"]);
-            return Ok(());
+            crate::worktree::git_out(&repo, &["worktree", "prune"])
+                .map_err(|e| format!("worktree 本体はありませんが Git 登録を掃除できません: {e}"))?;
+            return Ok((repo, expected));
         }
         Err(e) => return Err(format!("Run 専用 worktree を確認できません: {e}")),
         Ok(_) => {}
@@ -315,17 +331,102 @@ pub fn remove(
     if &verified != saved {
         return Err("Run の worktree 対応を完全には検証できないため削除しません".to_string());
     }
+    Ok((repo, expected))
+}
+
+/// 対象Runのworktree全体に未保存変更があるか、Gitの実測で確認する。
+pub fn change_state(
+    home: &Path,
+    source_workspace: &Path,
+    run_id: &str,
+    saved: &RunWorkspace,
+) -> Result<ChangeState, String> {
+    let (_, expected) = verified_for_removal(home, source_workspace, run_id, saved)?;
+    if !expected.exists() {
+        return Ok(ChangeState::Clean);
+    }
+    let status = crate::worktree::git_out(
+        &expected,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )?;
+    Ok(if status.is_empty() {
+        ChangeState::Clean
+    } else {
+        ChangeState::Dirty
+    })
+}
+
+/// 未保存変更が無いRunだけを削除する。検査と削除の間に変更が増えても、
+/// `--force`なしのGit自身の再検査が拒否する。
+pub fn remove_clean(
+    home: &Path,
+    source_workspace: &Path,
+    run_id: &str,
+    saved: &RunWorkspace,
+) -> Result<(), String> {
+    let (repo, expected) = verified_for_removal(home, source_workspace, run_id, saved)?;
+    if !expected.exists() {
+        return Ok(());
+    }
+    if change_state(home, source_workspace, run_id, saved)? == ChangeState::Dirty {
+        return Err("Run の worktree に未保存の成果物があるため削除しません".to_string());
+    }
+    #[cfg(test)]
+    if fault_inject::take_remove_failure() {
+        return Err("(テスト) git worktree の削除に失敗".to_string());
+    }
+    #[cfg(test)]
+    if fault_inject::take_dirty_before_remove() {
+        std::fs::write(expected.join("late-change.txt"), "late\n")
+            .map_err(|e| format!("(テスト) 競合変更を作れません: {e}"))?;
+    }
+    let dir = expected.to_string_lossy().into_owned();
+    crate::worktree::git_out(&repo, &["worktree", "remove", &dir])?;
+    crate::worktree::git_out(&repo, &["worktree", "prune"])?;
+    if std::fs::symlink_metadata(&expected).is_ok() {
+        return Err(format!("git が worktree を削除しませんでした: {}", expected.display()));
+    }
+    Ok(())
+}
+
+/// ユーザーが成果物の破棄を明示承認したRunだけを強制削除する。
+pub fn remove_discarded(
+    home: &Path,
+    source_workspace: &Path,
+    run_id: &str,
+    saved: &RunWorkspace,
+) -> Result<(), String> {
+    let (repo, expected) = verified_for_removal(home, source_workspace, run_id, saved)?;
+    if !expected.exists() {
+        return Ok(());
+    }
     #[cfg(test)]
     if fault_inject::take_remove_failure() {
         return Err("(テスト) git worktree の削除に失敗".to_string());
     }
     let dir = expected.to_string_lossy().into_owned();
     crate::worktree::git_out(&repo, &["worktree", "remove", "--force", &dir])?;
-    let _ = crate::worktree::git_out(&repo, &["worktree", "prune"]);
+    crate::worktree::git_out(&repo, &["worktree", "prune"])?;
     if std::fs::symlink_metadata(&expected).is_ok() {
         return Err(format!("git が worktree を削除しませんでした: {}", expected.display()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn remove(
+    home: &Path,
+    source_workspace: &Path,
+    run_id: &str,
+    saved: &RunWorkspace,
+) -> Result<(), String> {
+    remove_discarded(home, source_workspace, run_id, saved)
 }
 
 #[cfg(test)]
@@ -335,6 +436,7 @@ pub mod fault_inject {
     thread_local! {
         static FAIL_REMOVE: Cell<bool> = const { Cell::new(false) };
         static FAIL_ROLLBACK: Cell<bool> = const { Cell::new(false) };
+        static DIRTY_BEFORE_REMOVE: Cell<bool> = const { Cell::new(false) };
     }
 
     pub fn fail_remove_once() {
@@ -345,12 +447,20 @@ pub mod fault_inject {
         FAIL_ROLLBACK.with(|flag| flag.set(true));
     }
 
+    pub fn dirty_before_remove_once() {
+        DIRTY_BEFORE_REMOVE.with(|flag| flag.set(true));
+    }
+
     pub(super) fn take_remove_failure() -> bool {
         FAIL_REMOVE.with(|flag| flag.replace(false))
     }
 
     pub(super) fn take_rollback_failure() -> bool {
         FAIL_ROLLBACK.with(|flag| flag.replace(false))
+    }
+
+    pub(super) fn take_dirty_before_remove() -> bool {
+        DIRTY_BEFORE_REMOVE.with(|flag| flag.replace(false))
     }
 }
 
@@ -408,6 +518,77 @@ mod tests {
         assert!(Path::new(&b.worktree_root).is_dir(), "B まで削除した");
         assert_eq!(std::fs::read_to_string(root.join("user-change.txt")).unwrap(), "keep\n");
         remove(&home, &root, "run-b", &b).expect("B 削除");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn git_statusは全種類の未保存変更をdirtyとして検出する() {
+        let Some((root, home)) = repo("dirty-kinds") else {
+            return;
+        };
+        for (run_id, kind) in [
+            ("run-tracked", "tracked"),
+            ("run-untracked", "untracked"),
+            ("run-staged", "staged"),
+            ("run-deleted", "deleted"),
+            ("run-renamed", "renamed"),
+        ] {
+            let created = create(&home, &root, run_id).expect("worktreeを作れる");
+            let worktree = Path::new(&created.execution_workspace);
+            match kind {
+                "tracked" => std::fs::write(worktree.join("seed.txt"), "changed\n").unwrap(),
+                "untracked" => std::fs::write(worktree.join("new.txt"), "new\n").unwrap(),
+                "staged" => {
+                    std::fs::write(worktree.join("staged.txt"), "staged\n").unwrap();
+                    crate::worktree::git_out(worktree, &["add", "staged.txt"]).unwrap();
+                }
+                "deleted" => std::fs::remove_file(worktree.join("seed.txt")).unwrap(),
+                "renamed" => {
+                    crate::worktree::git_out(worktree, &["mv", "seed.txt", "renamed.txt"])
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                change_state(&home, &root, run_id, &created).unwrap(),
+                ChangeState::Dirty,
+                "{kind}を見落とした"
+            );
+            assert!(
+                remove_clean(&home, &root, run_id, &created).is_err(),
+                "{kind}を確認なしで削除した"
+            );
+            remove_discarded(&home, &root, run_id, &created).expect("明示破棄で片付く");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cleanは通常削除でき削除直前の変更は非force削除が拒否する() {
+        let Some((root, home)) = repo("clean-and-race") else {
+            return;
+        };
+        let clean = create(&home, &root, "run-clean").unwrap();
+        assert_eq!(
+            change_state(&home, &root, "run-clean", &clean).unwrap(),
+            ChangeState::Clean
+        );
+        remove_clean(&home, &root, "run-clean", &clean).expect("clean worktreeは削除できる");
+
+        let raced = create(&home, &root, "run-raced").unwrap();
+        fault_inject::dirty_before_remove_once();
+        assert!(
+            remove_clean(&home, &root, "run-raced", &raced).is_err(),
+            "再検査後に増えた成果物を削除した"
+        );
+        assert!(Path::new(&raced.worktree_root).exists(), "競合時にworktreeを消した");
+        assert!(
+            Path::new(&raced.execution_workspace)
+                .join("late-change.txt")
+                .exists(),
+            "競合で追加された成果物が残っていない"
+        );
+        remove_discarded(&home, &root, "run-raced", &raced).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 

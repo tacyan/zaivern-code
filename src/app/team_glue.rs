@@ -407,11 +407,15 @@ impl ZaivernApp {
         // ── 停止 (承認済みのものだけがここへ来る) ──
         let stops = panel::with_panel(|p| p.take_stops());
         for (owner, key, session) in stops {
-            if let Some(i) = self.agents.sessions.iter().position(|s| s.id == session) {
-                self.close_agent(i);
-            }
-            // 相手が既に居なくても目的は果たされている (止まっている)。
-            panel::with_panel(|p| p.ack_done(&owner, &key));
+            let handle = self
+                .agents
+                .sessions
+                .iter()
+                .position(|s| s.id == session)
+                .and_then(|i| self.close_agent_tracked(i));
+            // handleがある間はプロセスツリーとPTYの終了を待つ。相手が既に
+            // 居なければ停止済みとして、その場でACKされる。
+            panel::with_panel(|p| p.watch_stop(owner, key, handle));
         }
 
         // ── 検証コマンドの実行 ──
@@ -424,6 +428,7 @@ impl ZaivernApp {
             self.team_spawn_validation(owner, key, v);
         }
         panel::with_panel(|p| p.collect_validations());
+        panel::with_panel(|p| p.progress_close());
     }
 
     /// **配達の結末を Team へ返す** (`submit_tick` から 1 回だけ)。
@@ -711,6 +716,7 @@ impl ZaivernApp {
                 p.tab,
                 &mut form,
                 p.restore,
+                &p.close_prompt,
                 p.selected_agent.as_ref(),
                 p.expanded_output.as_ref(),
                 &p.run_tabs(),
@@ -803,10 +809,12 @@ impl ZaivernApp {
                 Err(e) => self.toast(e, false),
             },
             BoardAction::CloseRun(i) => {
-                if panel::with_panel(|p| p.close_run(i)).is_some() {
-                    self.toast(tr("team.notice.run_closed"), false);
-                }
+                panel::with_panel(|p| p.close_run(i));
             }
+            BoardAction::CloseRunKeep => panel::with_panel(|p| p.close_run_keep()),
+            BoardAction::CloseRunDiscard => panel::with_panel(|p| p.close_run_discard()),
+            BoardAction::CloseRunCancel => panel::with_panel(|p| p.close_run_cancel()),
+            BoardAction::RetryCloseRun => panel::with_panel(|p| p.retry_close_run()),
             BoardAction::ToggleAgentOutput(id) => panel::with_panel(|p| {
                 // **1 体だけ開く。** 全部開けると一覧が縦に伸びて、
                 // 「どの担当が居るか」が一目で分からなくなる。

@@ -844,97 +844,186 @@ impl MessageReject {
 /// どれも**人間が読めば意味は明らか**なのに、1 通まるごと捨てていた。
 /// 伝言が落ちると相手は待ち続けるので、落とす代償が大きい。
 ///
-/// そこで JSON の文法には頼らず、`to` と `text` の値を直接取り出す。
-/// 鍵は 2 つしかないので、これで曖昧さは出ない:
-///
-/// * `to` — 短い識別子。**最初の**閉じ引用符まで
-/// * `text` — 自由文。**最後の**閉じ引用符まで (中の `"` を巻き込む)
+/// そこで、小さな scanner で**トップレベル object の一意な文字列キーだけ**を
+/// 取り出す。文字列内や入れ子の `"to":` を検索で拾わず、重複・型違い・
+/// 切断された値は曖昧なまま通さない。
 ///
 /// **`serde` を置き換えない。** 正しい JSON は今までどおり `serde` が読む
 /// ([`check_message`] が先に試す)。ここは読めなかったときの受け皿で、
 /// 読めた振りをしない — 鍵が見つからなければ `None` を返して断りに戻す。
 fn lenient_message(s: &str) -> Option<MessageDoc> {
-    let to_at = key_value_start(s, "to")?;
-    let text_at = key_value_start(s, "text")?;
-    // `to` は最初の閉じ引用符まで (識別子に `"` は入らない)。
-    let to_end = closing_quote(s, to_at, false)?;
-    // `text` は最後の閉じ引用符まで。ただし `to` が後ろにあるなら、
-    // その手前で止める (`to` の値の引用符を巻き込まないため)。
-    //
-    // **括弧の外まで飲み込まない。** 塊の中に後書き (`}` のあとの一行など)
-    // が混じることがあり、そこに `"` があると本文が伸びてしまう。
-    let mut limit = s.rfind('}').unwrap_or(s.len());
-    if to_at > text_at {
-        limit = limit.min(key_pos(s, "to").unwrap_or(s.len()));
+    let bytes = s.as_bytes();
+    if bytes.len() > BLOCK_MAX_BYTES {
+        return None;
     }
-    let limit = limit.max(text_at);
-    let text_end = closing_quote(&s[..limit], text_at, true)?;
+    let mut i = skip_json_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut to = None;
+    let mut text = None;
+    loop {
+        i = skip_json_ws(bytes, i);
+        if bytes.get(i) == Some(&b'}') {
+            // 画面の囲みには `}` の後ろの行が混ざることがある。object は
+            // ここで完結しているので後書きは読まず、当然そこにある鍵も拾わない。
+            break;
+        }
+        let (key, after_key) = strict_string_at(s, i)?;
+        i = skip_json_ws(bytes, after_key);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        if key == "to" || key == "text" {
+            if (key == "to" && to.is_some()) || (key == "text" && text.is_some()) {
+                return None;
+            }
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            let (value, next) = lenient_string_at(s, i)?;
+            if key == "to" {
+                to = Some(value);
+            } else {
+                text = Some(value);
+            }
+            i = next;
+        } else {
+            i = skip_json_value(s, i)?;
+        }
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => {}
+            // 手書きで抜けやすい、次のトップレベルキー直前のカンマだけ救う。
+            Some(b'"') if strict_string_at(s, i).is_some() => {}
+            _ => return None,
+        }
+    }
     Some(MessageDoc {
-        to: unescape_lenient(&s[to_at..to_end]),
-        text: unescape_lenient(&s[text_at..text_end]),
+        to: to?,
+        text: text?,
     })
 }
 
-/// `"<key>"` という**鍵**の開始位置。値ではない。
-fn key_pos(s: &str, key: &str) -> Option<usize> {
-    let pat = format!("\"{key}\"");
-    let mut from = 0usize;
-    while let Some(i) = s[from..].find(&pat) {
-        let at = from + i;
-        // 鍵の後ろは `:` (空白は挟んでよい)。値の中の同じ綴りを拾わない。
-        let rest = s[at + pat.len()..].trim_start();
-        if rest.starts_with(':') {
-            return Some(at);
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while bytes
+        .get(i)
+        .is_some_and(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        i += 1;
+    }
+    i
+}
+
+/// JSON として正しい文字列を読む。キー名は曖昧な救済をしない。
+fn strict_string_at(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = i.checked_add(2)?;
+            }
+            b'"' => {
+                let end = i + 1;
+                let value = serde_json::from_str::<String>(&s[start..end]).ok()?;
+                return Some((value, end));
+            }
+            b if b < 0x20 => return None,
+            _ => i += 1,
         }
-        from = at + pat.len();
     }
     None
 }
 
-/// `"<key>": "` の**値の中身**が始まる位置。
-fn key_value_start(s: &str, key: &str) -> Option<usize> {
-    let at = key_pos(s, key)?;
-    let after = at + key.len() + 2;
-    let rest = &s[after..];
-    let colon = rest.find(':')?;
-    let tail = &rest[colon + 1..];
-    let quote = tail.len() - tail.trim_start().len();
-    if !tail[quote..].starts_with('"') {
+/// 値の文字列を読む。生の引用符は、後ろが値の境界でなければ本文として救う。
+fn lenient_string_at(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
         return None;
     }
-    Some(after + colon + 1 + quote + 1)
-}
-
-/// `from` から見て、**エスケープされていない** `"` の位置。
-///
-/// `last` なら最後のもの、そうでなければ最初のもの。
-fn closing_quote(s: &str, from: usize, last: bool) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut found = None;
-    let mut i = from;
+    let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2,
+            b'\\' => i = i.checked_add(2)?,
             b'"' => {
-                found = Some(i);
-                if !last {
-                    return found;
+                let after = skip_json_ws(bytes, i + 1);
+                let boundary = matches!(bytes.get(after), Some(b',') | Some(b'}'))
+                    || (bytes.get(after) == Some(&b'"')
+                        && strict_string_at(s, after).is_some_and(|(_, end)| {
+                            bytes.get(skip_json_ws(bytes, end)) == Some(&b':')
+                        }));
+                if boundary {
+                    return Some((unescape_lenient(&s[start + 1..i])?, i + 1));
                 }
                 i += 1;
             }
+            b if b < 0x20 => return None,
             _ => i += 1,
         }
     }
-    found
+    None
 }
 
-/// JSON のエスケープを解く。**知らない綴りはそのまま残す。**
-///
-/// `C:\path` の `\p` を「不正」として 1 通捨てるより、`\p` のまま
-/// 届けるほうが利用者の役に立つ。
-fn unescape_lenient(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars();
+/// 関係ないトップレベル欄を、入れ子と文字列の状態を追って飛ばす。
+fn skip_json_value(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    match bytes.get(start)? {
+        b'"' => lenient_string_at(s, start).map(|(_, end)| end),
+        b'{' | b'[' => {
+            let mut stack = vec![*bytes.get(start)?];
+            let mut i = start + 1;
+            let mut in_string = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if in_string => i = i.checked_add(2)?,
+                    b'"' => {
+                        in_string = !in_string;
+                        i += 1;
+                    }
+                    b'{' | b'[' if !in_string => {
+                        stack.push(bytes[i]);
+                        i += 1;
+                    }
+                    b'}' | b']' if !in_string => {
+                        let open = stack.pop()?;
+                        if !matches!((open, bytes[i]), (b'{', b'}') | (b'[', b']')) {
+                            return None;
+                        }
+                        i += 1;
+                        if stack.is_empty() {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < bytes.len() && !matches!(bytes[i], b',' | b'}') {
+                if bytes[i] == b'"' && i > start {
+                    break;
+                }
+                i += 1;
+            }
+            (i > start).then_some(i)
+        }
+    }
+}
+
+/// JSON のエスケープを解く。知らない綴りは Windows path の一部として残す。
+/// 壊れた Unicode escape と孤立 surrogate は値を捏造せず却下する。
+fn unescape_lenient(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len().min(BLOCK_MAX_BYTES));
+    let mut it = s.chars().peekable();
     while let Some(c) = it.next() {
         if c != '\\' {
             out.push(c);
@@ -950,25 +1039,40 @@ fn unescape_lenient(s: &str) -> String {
             Some('b') => out.push('\u{8}'),
             Some('f') => out.push('\u{c}'),
             Some('u') => {
-                let hex: String = it.by_ref().take(4).collect();
-                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                    Some(ch) => out.push(ch),
-                    // 読めなければ**元の綴りを残す** (黙って消さない)。
-                    None => {
-                        out.push('\\');
-                        out.push('u');
-                        out.push_str(&hex);
+                let mut code = 0u16;
+                for _ in 0..4 {
+                    code = code.checked_mul(16)?;
+                    code = code.checked_add(it.next()?.to_digit(16)? as u16)?;
+                }
+                if (0xd800..=0xdbff).contains(&code) {
+                    if it.next()? != '\\' || it.next()? != 'u' {
+                        return None;
                     }
+                    let mut low = 0u16;
+                    for _ in 0..4 {
+                        low = low.checked_mul(16)?;
+                        low = low.checked_add(it.next()?.to_digit(16)? as u16)?;
+                    }
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return None;
+                    }
+                    let scalar = 0x1_0000
+                        + (((code as u32 - 0xd800) << 10) | (low as u32 - 0xdc00));
+                    out.push(char::from_u32(scalar)?);
+                } else if (0xdc00..=0xdfff).contains(&code) {
+                    return None;
+                } else {
+                    out.push(char::from_u32(code as u32)?);
                 }
             }
             Some(other) => {
                 out.push('\\');
                 out.push(other);
             }
-            None => out.push('\\'),
+            None => return None,
         }
     }
-    out
+    Some(out)
 }
 
 /// **伝言 1 通を読む。ここが伝言の読み方の唯一の置き場。**
@@ -978,6 +1082,13 @@ fn unescape_lenient(s: &str) -> String {
 /// という説明できない差が出る。番人は
 /// `cli::tests::伝言の読み手はひとつだけ`。
 pub fn read_message(body: &str) -> Result<MessageDoc, MessageReject> {
+    if body.len() > BLOCK_MAX_BYTES {
+        return Err(MessageReject::BadJson(format!(
+            "伝言が大きすぎます ({} バイト。上限 {} バイト)",
+            body.len(),
+            BLOCK_MAX_BYTES
+        )));
+    }
     // **正しい JSON はこれまでどおり `serde` が読む。**
     // 読めなかったときだけ、鍵を直接拾う受け皿へ落ちる
     // (`lenient_message` の表に、実際に来た 4 通りが載っている)。
@@ -2119,6 +2230,84 @@ mod lenient_message_tests {
 
     fn read(body: &str) -> Result<(Vec<AgentId>, String), MessageReject> {
         check_message(body, &known(), &AgentId("impl-1".into()))
+    }
+
+    #[test]
+    fn fallbackはトップレベルの一意な文字列キーだけを読む() {
+        let cases = [
+            // 本文中の例を宛先として拾ってはいけない。
+            r#"{"text": "設定例は \"to\": \"all\" です"}"#,
+            // エスケープされていない引用符を救済する場合も同じ。
+            r#"{"text": "設定例は "to": "all" です"}"#,
+            // ネスト内のキーはトップレベルの宛先ではない。
+            r#"{"meta":{"to":"all"},"text":"本文"}"#,
+            r#"{"items":[{"to":"all"}],"text":"本文"}"#,
+            // 重複はどちらを採るか決められない。
+            r#"{"to":"reviewer-1","to":"all","text":"本文",}"#,
+            r#"{"to":"reviewer-1","text":"一つ","text":"二つ",}"#,
+            // 対象キーは文字列型だけを許可する。
+            r#"{"to":true,"text":"本文",}"#,
+            r#"{"to":"reviewer-1","text":["本文"],}"#,
+            // 途中で切れた値と壊れた Unicode escape は救済しない。
+            r#"{"to":"reviewer-1","text":"途中"#,
+            r#"{"to":"reviewer-1","text":"\u12xz",}"#,
+            r#"{"to":"reviewer-1","text":"\ud800",}"#,
+        ];
+        for body in cases {
+            assert!(
+                matches!(read(body), Err(MessageReject::BadJson(_))),
+                "曖昧な入力を伝言として採用した: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallbackは順序と安全に救済できる綴りだけを許す() {
+        let cases = [
+            (
+                r#"{"text":"Unicode 日本語 😀","to":"reviewer-1",}"#,
+                "Unicode 日本語 😀",
+            ),
+            (
+                r#"{"to":"reviewer-1" "text":"C:\Users\me\logs"}"#,
+                r"C:\Users\me\logs",
+            ),
+            (
+                "{\"to\":\"reviewer-1\",\"text\":\"一行目\n二行目\",}",
+                "一行目\n二行目",
+            ),
+            (
+                r#"{"to":"reviewer-1","text":"彼は "yes" と言った",}"#,
+                r#"彼は "yes" と言った"#,
+            ),
+        ];
+        for (body, want) in cases {
+            let (targets, text) = read(body).unwrap_or_else(|e| panic!("{body:?}: {e:?}"));
+            assert_eq!(targets, vec![AgentId("reviewer-1".into())], "{body:?}");
+            assert_eq!(text, want, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn fallbackは上限付近と大量の引用符でも線形に止まりpanicしない() {
+        let near_limit = format!(
+            "{{\"to\":\"reviewer-1\",\"text\":\"{}\",}}",
+            "\\\\\\\"日本語".repeat(BLOCK_MAX_BYTES / 16)
+        );
+        let _ = std::panic::catch_unwind(|| read(&near_limit)).expect("上限付近で panic した");
+
+        // 任意UTF-8相当の決定的な探針。構造文字・制御文字・Unicodeを混ぜる。
+        let alphabet = ['{', '}', '[', ']', '"', '\\', ':', ',', '\n', '\t', 'a', '日', '😀'];
+        let mut seed = 0x51_u64;
+        for len in 0..512usize {
+            let mut s = String::new();
+            for _ in 0..len {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                s.push(alphabet[(seed as usize) % alphabet.len()]);
+            }
+            let got = std::panic::catch_unwind(|| read(&s));
+            assert!(got.is_ok(), "任意UTF-8入力で panic: {s:?}");
+        }
     }
 
     /// **実測で落ちていた 4 通りが、全部届く。**

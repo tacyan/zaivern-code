@@ -3713,6 +3713,42 @@ pub fn reap(session: Session) {
     std::thread::spawn(move || reap_now(session));
 }
 
+/// Team Run のCloseが、PTYとプロセスツリーの後始末完了を非同期に確認する札。
+/// `false`の間はworktreeを削除してはいけない。
+#[derive(Clone)]
+pub struct ReapHandle {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReapHandle {
+    pub fn is_finished(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn for_test(finished: bool) -> Self {
+        Self {
+            done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(finished)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn finish_for_test(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// [`reap`]と同じ後始末を行い、完了を確認できる札を返す。
+pub fn reap_tracked(session: Session) -> ReapHandle {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_done = done.clone();
+    std::thread::spawn(move || {
+        reap_now(session);
+        worker_done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    ReapHandle { done }
+}
+
 /// [`reap`] の中身。**詰まり得る呼び出しを全部払う** ので、専用スレッドから
 /// だけ呼ぶこと。ここを直に呼ぶのは `reap` が起こすスレッドと、
 /// 「同じ後始末を呼び出し側で行えば必ず 1 回以上払う」ことを見せる番人テスト

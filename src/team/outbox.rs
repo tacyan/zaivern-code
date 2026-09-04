@@ -41,7 +41,7 @@
 //! ```
 //!
 //! * `kind` — `result` / `review` / `message` / `event`
-//! * `run_id` — 任意。書いてあれば**その Run のものだけ**受ける
+//! * `run_id` — 必須。**その Run のものだけ**受ける
 //! * `agent_id` — **送り主**。ファイル名の担当と一致すること
 //! * `payload` — 中身。画面の囲みに入っていたものと**同じ JSON**
 //!
@@ -69,8 +69,12 @@
 //! 作らない)。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::Deserialize;
 
 use super::model::AgentId;
 use super::result_parser as rp;
@@ -86,6 +90,12 @@ pub const TMP_SUFFIX: &str = ".json.tmp";
 
 /// 取り込めなかった報告を移す先 (置き場の中の 1 段下)。
 pub const REJECTED_DIR: &str = "rejected";
+/// 読み始める前に原本から分離した報告。クラッシュ後も再走査する。
+pub const PROCESSING_DIR: &str = "processing";
+/// 1 Runから一度に列挙する報告数。異常投入でUI tickを占有させない。
+pub const REPORT_LIST_MAX: usize = 256;
+/// Retry台帳の上限。超過分は保持せず直ちに隔離判定へ送る。
+pub const LEDGER_MAX: usize = 1_024;
 
 /// 読めないファイルを読み直す回数の上限。
 ///
@@ -144,6 +154,21 @@ pub fn safe_child(base: &Path, name: &str) -> Option<PathBuf> {
 /// (画面から読む経路だけになる) し、閉じるときも**消さない**。
 pub fn run_dir(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
     safe_child(&state_dir.join(DIR_NAME), run_id)
+}
+
+/// このRunのoutboxを、安全な親から1段ずつ作る。
+/// `state/outbox` がsymlinkへ差し替えられていれば、外部へ報告を書かせない。
+pub fn prepare_run_dir(state_dir: &Path, run_id: &str) -> Result<PathBuf, String> {
+    let dir = run_dir(state_dir, run_id)
+        .ok_or_else(|| format!("run_id {run_id:?} はoutboxの名前にできません"))?;
+    if let Some(parent) = state_dir.parent() {
+        super::persistence::ensure_plain_dir_created(parent).map_err(|e| e.detail())?;
+    }
+    super::persistence::ensure_plain_dir_created(state_dir).map_err(|e| e.detail())?;
+    let base = state_dir.join(DIR_NAME);
+    super::persistence::ensure_plain_dir_created(&base).map_err(|e| e.detail())?;
+    super::persistence::ensure_plain_dir_created(&dir).map_err(|e| e.detail())?;
+    Ok(dir)
 }
 
 /// ファイル名 (拡張子なし) が担当 `id` のものか。**境界を見る。**
@@ -340,23 +365,87 @@ pub fn read_report(path: &Path) -> ReadOutcome {
 /// `kind` と取り違えないよう**エンベロープは `payload` の有無で決める**
 /// ([`judge`])。
 pub fn infer_kind(v: &serde_json::Value) -> Option<Kind> {
+    let mut found = Vec::with_capacity(2);
     let has = |k: &str| v.get(k).is_some();
     if has("verdict") {
-        return Some(Kind::Review);
+        found.push(Kind::Review);
     }
     if has("to") && has("text") {
-        return Some(Kind::Message);
+        found.push(Kind::Message);
     }
     // 出来事の `kind` は表にある語だけ (`result` 等と紛れない)。
     if let Some(k) = v.get("kind").and_then(|k| k.as_str()) {
         if rp::EVENT_KINDS.contains(&k.trim()) {
-            return Some(Kind::Event);
+            found.push(Kind::Event);
         }
     }
     if has("task_id") && has("status") {
-        return Some(Kind::Result);
+        found.push(Kind::Result);
     }
-    None
+    (found.len() == 1).then(|| found[0])
+}
+
+struct StrictEnvelope {
+    kind: String,
+    run_id: String,
+    agent_id: String,
+    payload: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for StrictEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+        impl<'de> Visitor<'de> for EnvelopeVisitor {
+            type Value = StrictEnvelope;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a Team outbox envelope object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut kind = None;
+                let mut run_id = None;
+                let mut agent_id = None;
+                let mut payload = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "kind" if kind.is_none() => kind = Some(map.next_value::<String>()?),
+                        "run_id" if run_id.is_none() => {
+                            run_id = Some(map.next_value::<String>()?)
+                        }
+                        "agent_id" if agent_id.is_none() => {
+                            agent_id = Some(map.next_value::<String>()?)
+                        }
+                        "payload" if payload.is_none() => {
+                            payload = Some(map.next_value::<serde_json::Value>()?)
+                        }
+                        "kind" | "run_id" | "agent_id" | "payload" => {
+                            return Err(serde::de::Error::custom(format!(
+                                "duplicate top-level field {key:?}"
+                            )));
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(StrictEnvelope {
+                    kind: kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?,
+                    run_id: run_id.ok_or_else(|| serde::de::Error::missing_field("run_id"))?,
+                    agent_id: agent_id
+                        .ok_or_else(|| serde::de::Error::missing_field("agent_id"))?,
+                    payload: payload.ok_or_else(|| serde::de::Error::missing_field("payload"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
 }
 
 /// その種別の素の JSON から**送り主**を読む。
@@ -410,18 +499,24 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
     // **エンベロープかどうかは `payload` の有無で決める。**
     // 出来事の JSON も `kind` を持つので、`kind` だけでは見分けられない。
     let (kind, sender, payload) = match value.get("payload") {
-        Some(payload) => {
-            let Some(k) = value.get("kind").and_then(|k| k.as_str()) else {
-                return Verdict::Reject {
-                    agent: None,
-                    why: "エンベロープに kind がありません".to_string(),
-                };
+        Some(_) => {
+            // IdentityをValueから拾わない。重複キー・非文字列・欠落を区別して
+            // fail-closedにするため、トップレベルを一度だけ厳密に読む。
+            let envelope: StrictEnvelope = match serde_json::from_str(body) {
+                Ok(envelope) => envelope,
+                Err(e) => {
+                    return Verdict::Reject {
+                        agent: None,
+                        why: format!("エンベロープを厳密に読めません: {e}"),
+                    }
+                }
             };
-            let Some(kind) = Kind::from_key(k) else {
+            let Some(kind) = Kind::from_key(&envelope.kind) else {
                 return Verdict::Reject {
                     agent: None,
                     why: format!(
-                        "知らない kind です: {k} (使えるのは {})",
+                        "知らない kind です: {} (使えるのは {})",
+                        envelope.kind,
                         Kind::ALL
                             .iter()
                             .map(|x| x.key())
@@ -430,25 +525,17 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
                     ),
                 };
             };
-            // **別 Run 宛てを受け取らない。** 書いてあるときだけ見る
-            // (古い書き方には無いので、無いことは咎めない)。
-            if let Some(claimed_run) = value.get("run_id").and_then(|r| r.as_str()) {
-                let claimed_run = claimed_run.trim();
-                if !claimed_run.is_empty() && claimed_run != run_id {
-                    return Verdict::Reject {
-                        agent: None,
-                        why: format!(
-                            "別の Run 宛てです (本文 {claimed_run} / この置き場 {run_id})"
-                        ),
-                    };
-                }
+            let claimed_run = envelope.run_id.trim();
+            if claimed_run.is_empty() || claimed_run != run_id {
+                return Verdict::Reject {
+                    agent: None,
+                    why: format!(
+                        "別の Run 宛てです (本文 {claimed_run:?} / この置き場 {run_id})"
+                    ),
+                };
             }
-            let sender = value
-                .get("agent_id")
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let sender = (!envelope.agent_id.trim().is_empty())
+                .then(|| envelope.agent_id.trim().to_string());
             let Some(sender) = sender else {
                 return Verdict::Reject {
                     agent: None,
@@ -456,7 +543,7 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
                 };
             };
             // 中身は**そのまま**渡す (画面の囲みに入っていたものと同じ形)。
-            let text = match serde_json::to_string(payload) {
+            let text = match serde_json::to_string(&envelope.payload) {
                 Ok(t) => t,
                 Err(e) => {
                     return Verdict::Reject {
@@ -537,23 +624,110 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
 pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
     // Run の置き場自体が symlink / junction へ差し替えられても、リンク先の
     // ファイルを報告として読まない。metadata は必ずリンク非追従で見る。
+    let Some(parent) = dir.parent() else {
+        return Vec::new();
+    };
+    if !plain_directory(parent) {
+        return Vec::new();
+    }
     let Ok(meta) = std::fs::symlink_metadata(dir) else {
         return Vec::new();
     };
     if !meta.file_type().is_dir() {
         return Vec::new();
     }
+    let mut files = regular_reports_in(dir, REPORT_LIST_MAX);
+    let processing = dir.join(PROCESSING_DIR);
+    if files.len() < REPORT_LIST_MAX
+        && std::fs::symlink_metadata(&processing).is_ok_and(|m| m.file_type().is_dir())
+    {
+        let remaining = REPORT_LIST_MAX - files.len();
+        if let Ok(rd) = std::fs::read_dir(&processing) {
+            for slot in rd.filter_map(|e| e.ok()).take(remaining) {
+                if files.len() >= REPORT_LIST_MAX {
+                    break;
+                }
+                let Ok(kind) = slot.file_type() else { continue };
+                if kind.is_file() {
+                    let path = slot.path();
+                    if path.extension().is_some_and(|x| x == FINAL_EXT) {
+                        files.push(path);
+                    }
+                } else if kind.is_dir() {
+                    files.extend(regular_reports_in(
+                        &slot.path(),
+                        REPORT_LIST_MAX - files.len(),
+                    ));
+                }
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn plain_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
+fn regular_reports_in(dir: &Path, limit: usize) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut files: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
+    rd.filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == FINAL_EXT))
-        .collect();
-    files.sort();
-    files
+        .take(limit)
+        .collect()
+}
+
+/// 原本を読み始める前に同じfilesystem内のprocessingへ原子的に移す。
+/// 原本の名前へ次の報告が置かれても、後始末で新しい報告を消さない。
+pub fn claim_report(file: &Path) -> std::io::Result<PathBuf> {
+    let Some(dir) = file.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "報告の親フォルダがありません",
+        ));
+    };
+    if dir.file_name().is_some_and(|n| n == PROCESSING_DIR)
+        || dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == PROCESSING_DIR)
+    {
+        return Ok(file.to_path_buf());
+    }
+    let processing = dir.join(PROCESSING_DIR);
+    ensure_plain_dir(&processing)?;
+    let name = file.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "報告の名前がありません")
+    })?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    for n in 0..32u8 {
+        let slot = processing.join(format!("{}-{stamp}-{n}", std::process::id()));
+        match std::fs::create_dir(&slot) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let dest = slot.join(name);
+        match std::fs::rename(file, &dest) {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                let _ = std::fs::remove_dir(&slot);
+                return Err(e);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "processing内に安全な確保名を作れません",
+    ))
 }
 
 /// 受理済み報告を片付ける唯一の口。テストでは「状態反映後に削除だけ失敗」
@@ -566,7 +740,9 @@ pub fn remove_report(path: &Path) -> std::io::Result<()> {
             "(テスト) 受理済み報告を削除できません",
         ));
     }
-    std::fs::remove_file(path)
+    std::fs::remove_file(path)?;
+    remove_empty_claim_slot(path);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -603,21 +779,12 @@ pub enum Disposal {
     Kept(String),
 }
 
-fn path_entry_occupied(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        // 読めない状態を「空き」と見なすと rename が既存の証拠を潰し得る。
-        Err(_) => true,
-    }
-}
-
-fn collision_free_path(preferred: PathBuf) -> PathBuf {
-    if !path_entry_occupied(&preferred) {
-        return preferred;
-    }
+fn move_no_replace(file: &Path, preferred: PathBuf) -> std::io::Result<PathBuf> {
     let Some(parent) = preferred.parent() else {
-        return preferred;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "隔離先の親がありません",
+        ));
     };
     let base = preferred
         .file_name()
@@ -627,17 +794,31 @@ fn collision_free_path(preferred: PathBuf) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let mut n = 0u32;
-    loop {
-        let candidate = parent.join(format!(
-            "{base}.rejected-{}-{stamp}-{n}",
-            std::process::id()
-        ));
-        if !path_entry_occupied(&candidate) {
-            return candidate;
+    for n in 0..256u16 {
+        let candidate = if n == 0 {
+            preferred.clone()
+        } else {
+            parent.join(format!(
+                "{base}.rejected-{}-{stamp}-{n}",
+                std::process::id()
+            ))
+        };
+        match std::fs::hard_link(file, &candidate) {
+            Ok(()) => match std::fs::remove_file(file) {
+                Ok(()) => return Ok(candidate),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(e);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-        n = n.saturating_add(1);
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "隔離先の衝突上限に達しました",
+    ))
 }
 
 fn ensure_plain_dir(path: &Path) -> std::io::Result<()> {
@@ -673,32 +854,59 @@ fn ensure_plain_dir(path: &Path) -> std::io::Result<()> {
 /// どの段でも `remove_file` は呼ばない。「移せないから消す」は、いちばん
 /// 調べたいものをいちばん失いやすい形になる。
 pub fn quarantine(file: &Path) -> Disposal {
-    let Some(dir) = file.parent() else {
+    let Some(dir) = report_dir(file) else {
         return Disposal::Kept("親フォルダがありません".to_string());
     };
     let Some(name) = file.file_name() else {
         return Disposal::Kept("ファイル名がありません".to_string());
     };
     let pen = dir.join(REJECTED_DIR);
-    let moved = ensure_plain_dir(&pen).and_then(|()| {
-        let dest = collision_free_path(pen.join(name));
-        std::fs::rename(file, &dest).map(|()| dest)
-    });
+    let moved = ensure_plain_dir(&pen).and_then(|()| move_no_replace(file, pen.join(name)));
     match moved {
-        Ok(dest) => Disposal::Moved(dest),
+        Ok(dest) => {
+            remove_empty_claim_slot(file);
+            Disposal::Moved(dest)
+        }
         Err(e) => {
             // 隔離先へ移せない (権限・別ボリューム等)。**消さずに**、
-            // 同じ場所で読み直しの対象から外す。
-            let aside = collision_free_path(
-                file.with_extension(format!("{FINAL_EXT}.{REJECTED_DIR}")),
-            );
-            match std::fs::rename(file, &aside) {
-                Ok(()) => Disposal::Renamed(aside),
+            // Run直下で読み直しの対象から外す。
+            let aside = dir.join(format!("{}.{}", name.to_string_lossy(), REJECTED_DIR));
+            match move_no_replace(file, aside) {
+                Ok(aside) => {
+                    remove_empty_claim_slot(file);
+                    Disposal::Renamed(aside)
+                }
                 Err(e2) => Disposal::Kept(format!(
                     "{REJECTED_DIR}/ へ移せず ({e})、名前も変えられません ({e2})"
                 )),
             }
         }
+    }
+}
+
+fn report_dir(file: &Path) -> Option<&Path> {
+    let parent = file.parent()?;
+    if parent.file_name().is_some_and(|n| n == PROCESSING_DIR) {
+        return parent.parent();
+    }
+    if parent
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == PROCESSING_DIR)
+    {
+        return parent.parent()?.parent();
+    }
+    Some(parent)
+}
+
+fn remove_empty_claim_slot(file: &Path) {
+    let Some(parent) = file.parent() else { return };
+    if parent
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == PROCESSING_DIR)
+    {
+        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -723,13 +931,19 @@ pub struct Ledger {
 impl Ledger {
     /// 読み直しを 1 回数え、通算を返す。
     pub fn bump(&mut self, file: &Path) -> u32 {
+        if !self.entries.contains_key(file) && self.entries.len() >= LEDGER_MAX {
+            return MAX_ATTEMPTS;
+        }
         let e = self.entries.entry(file.to_path_buf()).or_default();
-        e.attempts += 1;
+        e.attempts = e.attempts.saturating_add(1);
         e.attempts
     }
 
     /// このファイルについて**初めて**理由を出すときだけ `true`。
     pub fn announce_once(&mut self, file: &Path) -> bool {
+        if !self.entries.contains_key(file) && self.entries.len() >= LEDGER_MAX {
+            return true;
+        }
         let e = self.entries.entry(file.to_path_buf()).or_default();
         let first = !e.announced;
         e.announced = true;
@@ -905,7 +1119,7 @@ mod tests {
         ));
     }
 
-    /// **別 Run 宛ての報告を受け取らない。** 書いてあるときだけ見る。
+    /// **別 Run 宛てとrun_id欠落のエンベロープを受け取らない。**
     #[test]
     fn 別のrun宛ての報告は配送しない() {
         let all = ids(&["impl-1"]);
@@ -915,14 +1129,64 @@ mod tests {
             Verdict::Reject { why, .. } => assert!(why.contains("run-OTHER"), "{why}"),
             other => panic!("別 Run 宛てを配送した: {other:?}"),
         }
-        // 書いていなければ咎めない (古い書き方との互換)
+        // エンベロープではrun_idが必須。素のJSONだけが旧形式互換。
         let env = format!(
             r#"{{"kind":"review","agent_id":"impl-1","payload":{payload}}}"#
         );
         assert!(matches!(
             judge("impl-1-9", &env, &all, RUN),
-            Verdict::Deliver { .. }
+            Verdict::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn エンベロープの重複identityと曖昧な素jsonは配送しない() {
+        let all = ids(&["impl-1"]);
+        let duplicate = format!(
+            r#"{{"kind":"message","run_id":"{RUN}","run_id":"other","agent_id":"impl-1","payload":{{"to":"all","text":"x"}}}}"#
+        );
+        assert!(matches!(
+            judge("impl-1-x", &duplicate, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+        for body in [
+            format!(
+                r#"{{"kind":"message","run_id":"{RUN}","agent_id":"impl-1","agent_id":"other","payload":{{"to":"all","text":"x"}}}}"#
+            ),
+            r#"{"kind":"message","run_id":1,"agent_id":"impl-1","payload":{"to":"all","text":"x"}}"#
+                .to_string(),
+        ] {
+            assert!(matches!(
+                judge("impl-1-x", &body, &all, RUN),
+                Verdict::Reject { .. }
+            ));
+        }
+        let ambiguous =
+            r#"{"task_id":1,"status":"completed","verdict":"APPROVE","agent_id":"impl-1"}"#;
+        assert!(matches!(
+            judge("impl-1-x", ambiguous, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn claim後に同名報告が来ても後始末で新しい報告を消さない() {
+        let dir = crate::test_util::unique_temp_dir("zai-team-outbox", "claim-replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("impl-1-same.json");
+        std::fs::write(&original, "first").unwrap();
+        let claimed = claim_report(&original).expect("原本を確保できる");
+        assert!(!original.exists());
+        assert_eq!(std::fs::read_to_string(&claimed).unwrap(), "first");
+
+        std::fs::write(&original, "second").unwrap();
+        remove_report(&claimed).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap(),
+            "second",
+            "確保後に届いた別報告を削除した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **素の JSON も受ける** (前の版の完了報告がそう書かれている)。
@@ -1232,6 +1496,31 @@ mod tests {
         assert!(list_reports(&linked).is_empty(), "symlink先の報告を列挙した");
         assert_eq!(std::fs::read_to_string(&report).unwrap(), "外の証拠");
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 置き場の親がsymlinkでもリンク先を走査しない() {
+        let state = crate::test_util::unique_temp_dir("zaivern-outbox", "parent-symlink");
+        let outside = crate::test_util::unique_temp_dir("zaivern-outbox", "outside-parent");
+        let run = outside.join("run-id");
+        std::fs::create_dir_all(&run).unwrap();
+        let report = run.join(final_name("agent-1", "outside"));
+        std::fs::write(&report, "外の証拠").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join(DIR_NAME)).unwrap();
+
+        let linked_run = state.join(DIR_NAME).join("run-id");
+        assert!(
+            prepare_run_dir(&state, "run-id").is_err(),
+            "symlinkの親へ正式な投函先を作った"
+        );
+        assert!(
+            list_reports(&linked_run).is_empty(),
+            "symlinkの親を経由して報告を列挙した"
+        );
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "外の証拠");
+        std::fs::remove_dir_all(&state).ok();
         std::fs::remove_dir_all(&outside).ok();
     }
 

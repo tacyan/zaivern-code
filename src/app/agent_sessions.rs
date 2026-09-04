@@ -372,6 +372,12 @@ impl ZaivernApp {
     /// (渡さないと入力の行き先が無くなり、「閉じたら操作を受け付けなくなった」
     /// ように見える)。
     pub(super) fn close_agent(&mut self, i: usize) {
+        let _ = self.close_agent_tracked(i);
+    }
+
+    /// Team RunのClose用。通常のUI後始末に加え、プロセスとPTYが実際に
+    ///畳まれたことを呼び出し側が確認できる札を返す。
+    pub(super) fn close_agent_tracked(&mut self, i: usize) -> Option<crate::terminal::ReapHandle> {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
         let mut freed: Option<worktree::AgentWorktree> = None;
@@ -406,7 +412,7 @@ impl ZaivernApp {
             }
             freed = self.agent_worktrees.remove(&id);
         }
-        self.agents.remove(i);
+        let reaping = self.agents.remove_tracked(i);
         // 隔離 worktree を持っていたなら、**残すか消すかをユーザーに選ばせる**。
         // 黙って消すと未コミットの成果ごと消える (git 自身の拒否も回避してしまう)。
         if let Some(wt) = freed {
@@ -419,6 +425,7 @@ impl ZaivernApp {
         if !self.agents.sessions.is_empty() {
             self.term_focus_pending = true;
         }
+        reaping
     }
 
     pub(super) fn send_to_agent(&mut self, text: String) {

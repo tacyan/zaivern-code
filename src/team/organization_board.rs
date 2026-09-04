@@ -25,7 +25,9 @@ use crate::theme::Theme;
 
 use super::graph::{Phase, PhaseStatus};
 use super::model::*;
-use super::panel::{BoardAction, BoardTab, DraftState, NewRunForm, RestorePrompt};
+use super::panel::{
+    BoardAction, BoardTab, ClosePrompt, DraftState, NewRunForm, RestorePrompt,
+};
 use super::composition;
 use super::planner;
 use super::view_model::{
@@ -238,6 +240,7 @@ pub fn board_window(
     tab: BoardTab,
     form: &mut NewRunForm,
     restore: RestorePrompt,
+    close: &ClosePrompt,
     selected: Option<&AgentId>,
     // 端末タブで「その場で開いている」担当。
     expanded: Option<&AgentId>,
@@ -286,7 +289,7 @@ pub fn board_window(
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             body(
-                ui, theme, snap, tab, form, restore, selected, expanded, runs, active_run,
+                ui, theme, snap, tab, form, restore, close, selected, expanded, runs, active_run,
                 needs_git, agents, notice, &mut acts, term,
             );
         });
@@ -304,6 +307,7 @@ fn body(
     tab: BoardTab,
     form: &mut NewRunForm,
     restore: RestorePrompt,
+    close: &ClosePrompt,
     selected: Option<&AgentId>,
     // 端末タブで「その場で開いている」担当。
     expanded: Option<&AgentId>,
@@ -328,6 +332,11 @@ fn body(
     // ── 未完了 Run の扱い ──
     if restore != RestorePrompt::None {
         restore_card(ui, theme, restore, acts);
+        return;
+    }
+
+    if *close != ClosePrompt::None {
+        close_card(ui, theme, close, acts);
         return;
     }
 
@@ -1391,6 +1400,79 @@ fn restore_card(
     );
 }
 
+fn close_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    close: &ClosePrompt,
+    acts: &mut Vec<BoardAction>,
+) {
+    let avail = ui.available_size();
+    ui.allocate_ui_with_layout(
+        avail,
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+        |ui| {
+            ui.vertical_centered(|ui| match close {
+                ClosePrompt::Confirm {
+                    run_id,
+                    artifact_path,
+                } => {
+                    ui.label(
+                        RichText::new(trf(
+                            "team.close.confirm_dirty",
+                            &[("run", run_id.clone())],
+                        ))
+                        .color(theme.err)
+                        .strong(),
+                    );
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("team.close.keep")).clicked() {
+                            acts.push(BoardAction::CloseRunKeep);
+                        }
+                        if ui.button(tr("team.close.discard")).clicked() {
+                            acts.push(BoardAction::CloseRunDiscard);
+                        }
+                        if ui.button(tr("team.close.cancel")).clicked() {
+                            acts.push(BoardAction::CloseRunCancel);
+                        }
+                    });
+                }
+                ClosePrompt::Stopping {
+                    run_id,
+                    artifact_path,
+                } => {
+                    ui.spinner();
+                    ui.label(trf(
+                        "team.close.stopping",
+                        &[("run", run_id.clone())],
+                    ));
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                }
+                ClosePrompt::Failed {
+                    artifact_path, why, ..
+                } => {
+                    ui.label(RichText::new(tr("team.close.failed")).color(theme.err).strong());
+                    ui.label(plain(why));
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                    if ui.button(tr("team.close.retry")).clicked() {
+                        acts.push(BoardAction::RetryCloseRun);
+                    }
+                }
+                ClosePrompt::None => {}
+            });
+        },
+    );
+}
+
 /// **計画ができたら、始め方をその場で言う。**
 ///
 /// 開始のボタンはヘッダの奥 (一時停止・停止の隣) にあるので、初めての人は
@@ -1953,6 +2035,7 @@ mod tests {
                         BoardTab::Organization,
                         &mut form,
                         RestorePrompt::None,
+                        &ClosePrompt::None,
                         None,
                         None,
                         &[],

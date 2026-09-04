@@ -654,7 +654,7 @@ fn 別のrunのeffectを実行させない構造がある() {
         "take_stops が生存 Run で選り分けている (閉じた Run の担当が止まらない):\n{stops}"
     );
     // 出す側: 閉じるときは承認ゲートを通さず、その場で全セッションを止める。
-    let close = function_body(&p, p.find("pub fn close_run").expect("Run を閉じる"));
+    let close = function_body(&p, p.find("fn begin_close").expect("Run を閉じる本体"));
     assert!(
         close.contains(".close()") && !close.contains("TeamAction::Stop"),
         "close_run が承認待ちの Stop を使っている (判断ごと消えて誰も承認できない):\n{close}"
@@ -1231,7 +1231,7 @@ fn 実行側は必ず成否を返す() {
         ),
         (
             "for (owner, key, session) in stops",
-            &["p.ack_done(&owner, &key)"],
+            &["self.close_agent_tracked(i)", "p.watch_stop(owner, key, handle)"],
         ),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
         (

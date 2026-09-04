@@ -2151,9 +2151,9 @@ impl AgentManager {
         Ok(())
     }
 
-    pub fn remove(&mut self, i: usize) {
+    fn take_removed(&mut self, i: usize) -> Option<Session> {
         if i >= self.sessions.len() {
-            return;
+            return None;
         }
         // 閉じたセッションの承認待ち・重複記録を捨てる。PID と同じく
         // セッション ID は再利用され得るので、残すと別セッションの
@@ -2164,7 +2164,7 @@ impl AgentManager {
         // 取り除いたセッションは**この場で drop しない**。ConPTY を閉じる
         // Drop は UI スレッドを止め得るので、後始末ごと reap に預ける
         // (crate::terminal::reap の説明を参照)。
-        crate::terminal::reap(self.sessions.remove(i));
+        let removed = self.sessions.remove(i);
         // active より左を閉じたら、フォーカス中セッションが左へ1つ詰まるので
         // active も詰める(でないとキーボード/リモート入力が隣のセッションへ流れる)。
         // i == active が最右のときは下のクランプが左隣へ寄せる(従来挙動のまま)。
@@ -2174,6 +2174,19 @@ impl AgentManager {
         if self.active >= self.sessions.len() && !self.sessions.is_empty() {
             self.active = self.sessions.len() - 1;
         }
+        Some(removed)
+    }
+
+    #[cfg(test)]
+    pub fn remove(&mut self, i: usize) {
+        if let Some(session) = self.take_removed(i) {
+            crate::terminal::reap(session);
+        }
+    }
+
+    /// Team RunのClose用。削除完了を待つ側へreaperの札を返す。
+    pub fn remove_tracked(&mut self, i: usize) -> Option<crate::terminal::ReapHandle> {
+        self.take_removed(i).map(crate::terminal::reap_tracked)
     }
 
     /// 稼働中のセッションを**全部**止める (タブは残す)。戻り値は止めに行った本数。

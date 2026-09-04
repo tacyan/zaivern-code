@@ -35,7 +35,8 @@ use super::changeset;
 use super::graph;
 use super::model::*;
 use super::persistence::{
-    EffectRecord, EffectState, RunDoc, Saved, ValidationApproval, SCHEMA_VERSION,
+    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval,
+    SCHEMA_VERSION,
 };
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
@@ -439,7 +440,7 @@ pub struct SeenKey {
     /// 送り主。**同じ文面でも担当が違えば別の報告。**
     agent: AgentId,
     /// 種別 (`result` / `review` / `message` / `event`)。
-    kind: &'static str,
+    kind: String,
     /// 対象タスク (本文から読めたときだけ)。読めなくても本文の指紋が効く。
     task: Option<TaskId>,
     /// 本文の指紋 (128bit) と長さ。
@@ -926,6 +927,7 @@ impl TeamRuntime {
                 validation_timeout_secs: super::launch::VALIDATION_TIMEOUT_SECS,
                 guardrails: opts.guardrails.clone(),
                 effects: Vec::new(),
+                seen_blocks: Vec::new(),
                 done_effects: Vec::new(),
             },
             source_workspace: workspace.clone(),
@@ -988,8 +990,21 @@ impl TeamRuntime {
 
     /// 保存状態を、検証済みの元 workspace / 実行 workspace 対応で復元する。
     pub fn restore_in(saved: Saved, source_workspace: PathBuf, workspace: PathBuf) -> Self {
-        let next_task_id = saved.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-        let next_event_id = saved.events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let next_task_id = saved
+            .tasks
+            .iter()
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let next_event_id = saved
+            .events
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let seen_records = saved.run.seen_blocks.clone();
         let mut tasks = saved.tasks;
         for t in &mut tasks {
             // セッションはどれも生き残っていない。結び付きは必ず外す。
@@ -1060,6 +1075,24 @@ impl TeamRuntime {
                 effect_order.push_back(r.key.clone());
             }
         }
+        let mut seen_blocks = HashSet::new();
+        let mut seen_block_order = VecDeque::new();
+        let keep_from = seen_records.len().saturating_sub(SEEN_BLOCKS_CAP);
+        for record in seen_records.into_iter().skip(keep_from) {
+            if super::outbox::Kind::from_key(&record.kind).is_none() {
+                continue;
+            }
+            let key = SeenKey {
+                agent: AgentId::new(record.agent_id),
+                kind: record.kind,
+                task: record.task_id,
+                digest: record.digest,
+                len: record.len,
+            };
+            if seen_blocks.insert(key.clone()) {
+                seen_block_order.push_back(key);
+            }
+        }
         let mut rt = Self {
             goal: saved.goal,
             teams: saved.teams,
@@ -1085,8 +1118,8 @@ impl TeamRuntime {
             budget_nudged: std::collections::BTreeSet::new(),
             blocked_notes: HashSet::new(),
             outbox: PathBuf::new(),
-            seen_blocks: HashSet::new(),
-            seen_block_order: VecDeque::new(),
+            seen_blocks,
+            seen_block_order,
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
@@ -1406,6 +1439,17 @@ impl TeamRuntime {
                     .effect_order
                     .iter()
                     .filter_map(|k| self.effects.get(k).cloned())
+                    .collect(),
+                seen_blocks: self
+                    .seen_block_order
+                    .iter()
+                    .map(|key| SeenBlockRecord {
+                        agent_id: key.agent.to_string(),
+                        kind: key.kind.clone(),
+                        task_id: key.task,
+                        digest: key.digest,
+                        len: key.len,
+                    })
                     .collect(),
                 done_effects: Vec::new(),
                 updated_at: now_secs(),
@@ -3055,7 +3099,7 @@ impl TeamRuntime {
         let (digest, len) = body_digest(trimmed);
         SeenKey {
             agent: agent.clone(),
-            kind: kind.key(),
+            kind: kind.key().to_string(),
             task: task_of_body(trimmed),
             digest,
             len,

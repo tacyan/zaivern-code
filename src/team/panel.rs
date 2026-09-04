@@ -129,6 +129,14 @@ pub enum BoardAction {
     SelectRun(usize),
     /// **Run を 1 本閉じる** (止めて、記憶からも保存からも外す)。
     CloseRun(usize),
+    /// dirty な Run の成果物を残して管理だけを閉じる。
+    CloseRunKeep,
+    /// dirty な Run の成果物を明示的に破棄して閉じる。
+    CloseRunDiscard,
+    /// Run を閉じる確認を取り消す。状態やプロセスには触れない。
+    CloseRunCancel,
+    /// 停止・削除に失敗した Close を再試行する。
+    RetryCloseRun,
     /// **このワークスペースを Git 管理下にする** (実測の基準点を作る)。
     InitGit,
     /// **短い指示を仕様書へ書き換えてもらう。** 計画の手前の段。
@@ -170,6 +178,10 @@ pub const RUNS_DIR: &str = "runs";
 /// ファイル) もこの数に入る — 数えないと、壊れた山の向こうの正しい報告が
 /// 永久に順番待ちになる。置き場の取り決めそのものは [`outbox`]。
 pub const OUTBOX_PER_TICK: usize = 32;
+
+/// 復元時に列挙するRun保存ディレクトリの上限。
+/// 壊れた状態ルートで起動時のI/Oとメモリを無制限にしない。
+const RESTORE_SCAN_MAX: usize = 256;
 
 /// 同じ元 workspace で同時に走らせてよい Run の本数。
 /// すべての Run は `run_workspace` で別々の git worktree へ隔離する。
@@ -274,6 +286,41 @@ pub enum RestorePrompt {
     ConfirmDiscard,
 }
 
+/// Run を閉じる確認・進行状態。UI はこの値だけを描き、副作用を起こさない。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum ClosePrompt {
+    #[default]
+    None,
+    Confirm {
+        run_id: String,
+        artifact_path: String,
+    },
+    Stopping {
+        run_id: String,
+        artifact_path: String,
+    },
+    Failed {
+        run_id: String,
+        artifact_path: String,
+        policy: persistence::ClosePolicy,
+        why: String,
+    },
+}
+
+#[derive(Clone)]
+struct PendingClose {
+    owner: RunOwner,
+    policy: persistence::ClosePolicy,
+    artifact_path: String,
+    started: Instant,
+}
+
+struct StopJob {
+    owner: RunOwner,
+    key: String,
+    handle: crate::terminal::ReapHandle,
+}
+
 /// 裏で走っている検証 1 件。**受け口と一緒に「何の実行か」を持つ。**
 ///
 /// 送り手が消えたときに失敗として戻すには、タスク・実行 ID・コマンドが
@@ -366,6 +413,8 @@ pub struct TeamPanel {
     /// Inspector の「追加の指示」入力欄。
     pub inspector_note: String,
     pub restore: RestorePrompt,
+    /// Close の確認・停止待ち・失敗。確認前には Run を一切変更しない。
+    pub close_prompt: ClosePrompt,
     /// 読み取り専用で開いているか (復元して眺めるだけ)。
     pub read_only: bool,
     /// 直近の説明・エラー (画面の帯に出す)。
@@ -396,6 +445,10 @@ pub struct TeamPanel {
     pending_validations: Vec<(RunOwner, String, super::runtime::ValidationSpec)>,
     /// 停止を頼んだセッション。
     pending_stops: Vec<(RunOwner, String, SessionId)>,
+    /// セッションのプロセスツリーとPTYが実際に畳まれるのを待つ札。
+    stop_jobs: Vec<StopJob>,
+    /// 明示的な選択を受けた Run だけが停止・後始末へ進む。
+    pending_close: Option<PendingClose>,
     /// 送るべき指示 (持ち主, 冪等キー, セッション ID, 本文)。
     pending_instructions: Vec<(RunOwner, String, (TaskId, SessionId, String))>,
     /// **人が出した指示** (持ち主, 冪等キー, 宛先エージェント, セッション, 本文)。
@@ -460,6 +513,7 @@ impl Default for TeamPanel {
             inspector_open: false,
             inspector_note: String::new(),
             restore: RestorePrompt::None,
+            close_prompt: ClosePrompt::None,
             read_only: false,
             notice: String::new(),
             runs: Vec::new(),
@@ -469,6 +523,8 @@ impl Default for TeamPanel {
             pending_launches: Vec::new(),
             pending_validations: Vec::new(),
             pending_stops: Vec::new(),
+            stop_jobs: Vec::new(),
+            pending_close: None,
             pending_instructions: Vec::new(),
             pending_manual: Vec::new(),
             needs_save: false,
@@ -550,7 +606,9 @@ impl TeamPanel {
                 + self.pending_instructions.len()
                 + self.pending_manual.len()
                 + self.pending_stops.len()
-                + self.pending_validations.len(),
+                + self.pending_validations.len()
+                + self.stop_jobs.len()
+                + usize::from(self.pending_close.is_some()),
         }
     }
 
@@ -577,6 +635,8 @@ impl TeamPanel {
         self.pending_instructions.clear();
         self.pending_manual.clear();
         self.pending_stops.clear();
+        self.stop_jobs.clear();
+        self.pending_close = None;
         self.pending_validations.clear();
         self.save_if_needed();
         self.workspace = ws.to_path_buf();
@@ -592,6 +652,7 @@ impl TeamPanel {
         } else {
             RestorePrompt::None
         };
+        self.close_prompt = ClosePrompt::None;
         Ok(())
     }
 
@@ -706,6 +767,28 @@ impl TeamPanel {
         roles: Vec<TeamRole>,
         title_override: &str,
     ) -> Result<(), String> {
+        // 上限とIDの所有権は、計画を組み立てる前に確定する。同じrun_idを
+        // 受け入れるとworktree・outbox・保存が同じ所有者になり、Run間分離が
+        // 構造から崩れる。
+        self.refuse_if_busy()?;
+        if !outbox::valid_run_id(&opts.run_id) {
+            return Err(format!(
+                "run_id {:?} は Team Run の識別子に使えません",
+                opts.run_id
+            ));
+        }
+        let state = self.state_dir();
+        let duplicate = self.runs.iter().any(|r| r.run().run_id == opts.run_id)
+            || persistence::is_closed(&state, &opts.run_id)
+            || persistence::run_dir_in(&state, &opts.run_id).is_some_and(|p| p.exists())
+            || super::run_workspace::expected_root(&self.home, &self.workspace, &opts.run_id)
+                .is_ok_and(|p| std::fs::symlink_metadata(p).is_ok());
+        if duplicate {
+            return Err(format!(
+                "run_id {:?} は既存または後始末待ちの Team Run が使用中です",
+                opts.run_id
+            ));
+        }
         let plan = StaticPlanner
             .plan(PlanInput {
                 spec: spec_text.to_string(),
@@ -730,7 +813,6 @@ impl TeamPanel {
         // **動いているチームを別の計画で潰さない。** 置き換えると、走って
         // いる検証と起動済みのエージェントの面倒を見る相手が消える
         // (結果は `run_id` 違いで捨てられ、プロセスだけが残る)。
-        self.refuse_if_busy()?;
         let ws = self.workspace.clone();
         let mut rt = TeamRuntime::from_plan(plan, ws, opts);
         let t = title_override.trim();
@@ -800,8 +882,18 @@ impl TeamPanel {
         let mut skipped: Vec<String> = Vec::new();
         let mut capped = 0usize;
         if let Ok(rd) = std::fs::read_dir(root.join(RUNS_DIR)) {
-            let mut dirs: Vec<std::path::PathBuf> =
-                rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            let mut entries = rd.filter_map(|e| e.ok());
+            let mut dirs: Vec<std::path::PathBuf> = entries
+                .by_ref()
+                .take(RESTORE_SCAN_MAX.saturating_add(1))
+                .map(|e| e.path())
+                .collect();
+            if dirs.len() > RESTORE_SCAN_MAX {
+                dirs.truncate(RESTORE_SCAN_MAX);
+                skipped.push(format!(
+                    "Run保存の走査上限{RESTORE_SCAN_MAX}件を超えました"
+                ));
+            }
             dirs.sort();
             for d in dirs {
                 let name = d
@@ -838,6 +930,13 @@ impl TeamPanel {
                     capped += 1;
                     continue;
                 }
+                let outbox_dir = match outbox::prepare_run_dir(&root, &name) {
+                    Ok(dir) => dir,
+                    Err(why) => {
+                        skipped.push(format!("{name:?} ({why})"));
+                        continue;
+                    }
+                };
                 let mut rt = match self.restore_saved(*s, &d, read_only) {
                     Ok(rt) => rt,
                     Err(why) => {
@@ -845,8 +944,7 @@ impl TeamPanel {
                         continue;
                     }
                 };
-                let dir = self.outbox_dir(&rt.run().run_id);
-                rt.set_outbox(dir);
+                rt.set_outbox(outbox_dir);
                 self.runs.push(rt);
                 loaded += 1;
             }
@@ -901,9 +999,9 @@ impl TeamPanel {
                     self.restore = RestorePrompt::None;
                     return Err("保存された Team Run がありません".to_string());
                 }
+                let outbox_dir = outbox::prepare_run_dir(&dir, &id)?;
                 let mut rt = self.restore_saved(*s, &dir, read_only)?;
-                let dir = self.outbox_dir(&rt.run().run_id);
-                rt.set_outbox(dir);
+                rt.set_outbox(outbox_dir);
                 self.runs.push(rt);
                 self.active = self.runs.len() - 1;
                 self.read_only = read_only;
@@ -960,7 +1058,7 @@ impl TeamPanel {
             saved.run.workspace = run_workspace.source_workspace.clone();
             saved.run.run_workspace = Some(run_workspace.clone());
             if let Err(e) = persistence::save(save_dir, &saved) {
-                let cleanup = super::run_workspace::remove(
+                let cleanup = super::run_workspace::remove_clean(
                     &self.home,
                     &source,
                     &saved.run.run_id,
@@ -1029,7 +1127,12 @@ impl TeamPanel {
             };
             if let Some(worktree) = worktree {
                 if let Err(e) =
-                    super::run_workspace::remove(&self.home, &self.workspace, id, worktree)
+                    super::run_workspace::remove_discarded(
+                        &self.home,
+                        &self.workspace,
+                        id,
+                        worktree,
+                    )
                 {
                     let why = format!("Run {id} の専用 worktree を削除できません: {e}");
                     self.notice = why.clone();
@@ -1112,6 +1215,7 @@ impl TeamPanel {
         }
 
         let id = rt.run().run_id.clone();
+        let outbox_dir = outbox::prepare_run_dir(&self.state_dir(), &id)?;
         let run_workspace = super::run_workspace::create(&self.home, &self.workspace, &id)?;
         // まず対応を含む完全なスナップショットを書く。これが成功するまで
         // Runtime の cwd は切り替えないので、途中失敗で共有 workspace を走らない。
@@ -1121,7 +1225,7 @@ impl TeamPanel {
         let dir = persistence::run_dir_in(&self.state_dir(), &id)
             .ok_or_else(|| format!("Run {id:?} の保存先を作れません"))?;
         if let Err(e) = persistence::save(&dir, &saved) {
-            let cleanup = super::run_workspace::remove(
+            let cleanup = super::run_workspace::remove_clean(
                 &self.home,
                 &self.workspace,
                 &id,
@@ -1133,6 +1237,7 @@ impl TeamPanel {
             return Err(format!("{}{cleanup}", e.detail()));
         }
         self.runs[pos].set_run_workspace(run_workspace);
+        self.runs[pos].set_outbox(outbox_dir);
         self.needs_save = true;
         Ok(())
     }
@@ -1197,9 +1302,11 @@ impl TeamPanel {
         let mut budget = OUTBOX_PER_TICK;
         let mut taken = 0usize;
 
+        let closing = self.pending_close.as_ref().map(|p| p.owner.run_id.as_str());
         let live: HashSet<String> = self
             .runs
             .iter()
+            .filter(|rt| Some(rt.run().run_id.as_str()) != closing)
             .map(|rt| rt.run().run_id.clone())
             .collect();
         self.outbox_file_cursors.retain(|run, _| live.contains(run));
@@ -1217,7 +1324,9 @@ impl TeamPanel {
             files: VecDeque<PathBuf>,
         }
 
-        let mut order: Vec<usize> = (0..self.runs.len()).collect();
+        let mut order: Vec<usize> = (0..self.runs.len())
+            .filter(|&i| Some(self.runs[i].run().run_id.as_str()) != closing)
+            .collect();
         if let Some(cursor) = self.outbox_run_cursor.as_deref() {
             if let Some(pos) = order
                 .iter()
@@ -1281,6 +1390,13 @@ impl TeamPanel {
     /// 1 ファイルだけを処理する。公平な選択と内容の検証を分け、異常な
     /// 1 ファイルが他 Run の順番まで巻き込まない。
     fn process_outbox_file(&mut self, run: usize, run_id: &str, file: &Path, now: u64) -> bool {
+        let file = match outbox::claim_report(file) {
+            Ok(file) => file,
+            Err(e) => {
+                self.outbox_retry(run, file, format!("報告を安全に確保できません: {e}"));
+                return false;
+            }
+        };
         let ids: Vec<AgentId> = self.runs[run]
             .agents()
             .iter()
@@ -1291,7 +1407,7 @@ impl TeamPanel {
             .and_then(|x| x.to_str())
             .unwrap_or_default()
             .to_string();
-        let verdict = match outbox::read_report(file) {
+        let verdict = match outbox::read_report(&file) {
             ReadOutcome::Body(body) => outbox::judge(&stem, &body, &ids, run_id),
             ReadOutcome::Retry(why) => Verdict::Retry(why),
             ReadOutcome::Reject(why) => Verdict::Reject { agent: None, why },
@@ -1299,24 +1415,46 @@ impl TeamPanel {
         match verdict {
             Verdict::Deliver { agent, kind, body } => {
                 match self.runs[run].accept_outbox(&agent, kind, &body, now) {
-                    Ok(outcome) => match outbox::remove_report(file) {
+                    Ok(outcome) => match self.persist_accepted_outbox(run) {
+                        Err(e) => self.outbox_retry(
+                            run,
+                            &file,
+                            format!("受理した状態を保存できません: {e}"),
+                        ),
+                        Ok(()) => match outbox::remove_report(&file) {
                         Ok(()) => {
-                            self.outbox_ledger.forget(file);
+                            self.outbox_ledger.forget(&file);
                             return outcome == super::runtime::AcceptOutcome::Applied;
                         }
                         Err(e) => self.outbox_retry(
                             run,
-                            file,
+                            &file,
                             format!("受理したが消せません: {e}"),
                         ),
                     },
-                    Err(why) => self.outbox_quarantine(run, file, Some(agent), why),
+                    },
+                    Err(why) => self.outbox_quarantine(run, &file, Some(agent), why),
                 }
             }
-            Verdict::Retry(why) => self.outbox_retry(run, file, why),
-            Verdict::Reject { agent, why } => self.outbox_quarantine(run, file, agent, why),
+            Verdict::Retry(why) => self.outbox_retry(run, &file, why),
+            Verdict::Reject { agent, why } => self.outbox_quarantine(run, &file, agent, why),
         }
         false
+    }
+
+    fn persist_accepted_outbox(&mut self, run: usize) -> Result<(), String> {
+        let rt = self
+            .runs
+            .get(run)
+            .ok_or_else(|| "受理したRunが見つかりません".to_string())?;
+        let root = self.state_dir();
+        let dir = persistence::run_dir_in(&root, &rt.run().run_id)
+            .ok_or_else(|| "受理したRunの安全な保存先を作れません".to_string())?;
+        persistence::save(&dir, &rt.to_saved()).map_err(|e| e.detail())?;
+        if run == 0 {
+            persistence::save(&root, &rt.to_saved()).map_err(|e| e.detail())?;
+        }
+        Ok(())
     }
 
     /// 読めなかった報告を数え、上限に達したら隔離する。
@@ -1358,6 +1496,11 @@ impl TeamPanel {
             // 動かせないときはその場に残す。ただし読み直しは止める —
             // 止めないと毎 tick 同じ却下を積む。
             outbox::Disposal::Kept(why) => {
+                if self.outbox_skip.len() >= outbox::LEDGER_MAX {
+                    if let Some(old) = self.outbox_skip.iter().next().cloned() {
+                        self.outbox_skip.remove(&old);
+                    }
+                }
                 self.outbox_skip.insert(file.to_path_buf());
                 format!("そのまま残しました (この起動では読み直しません): {why}")
             }
@@ -1421,11 +1564,13 @@ impl TeamPanel {
         // **全部の Run を進める。** 画面に出していない Run も走っている。
         // 進めないと、そちらの担当は起動したまま何も配られない。
         let active = self.active;
+        let closing = self.pending_close.as_ref().map(|p| p.owner.clone());
         let mut active_snapshot_changed = false;
         let batches: Vec<(RunOwner, Vec<TeamEffect>)> = self
             .runs
             .iter_mut()
             .enumerate()
+            .filter(|(_, rt)| closing.as_ref().is_none_or(|owner| rt.owner() != *owner))
             .map(|(index, rt)| {
                 let before = rt.snapshot_generation();
                 let owner = rt.owner();
@@ -1639,47 +1784,323 @@ impl TeamPanel {
         );
     }
 
-    /// **Run を1本閉じる。** 旧保存の複数本を内部で保持していても、
-    /// 指定した1本だけを安全に畳む。
-    ///
-    /// 閉じたら:
-    /// * その Run の**停止**を Runtime へ伝える (走っている担当を残さない)
-    /// * 記憶から外す — 以後、その Run が出した仕事は
-    ///   [`TeamPanel::mine`] を通らなくなる (**死んだ Run の仕事は実行しない**)
-    /// * 保存も消す (次に開いたときに戻ってこない)
-    /// * **報告置き場も消す** (`outbox/<run_id>/`)。残すと、同じ ID の担当が
-    ///   居る次の Run が前の Run の報告を拾う余地が残る
-    ///
-    /// 消すのは**この Run の 1 段だけ**。`run_id` が名前として安全でない
-    /// (空・`..`・区切り文字入り) なら [`outbox::safe_child`] が `None` を
-    /// 返すので、想定外の場所へは届かない。消せなかったことは帯 (`notice`)
-    /// へ出す — 黙って握り潰すと、残った置き場が次の Run を混乱させる。
-    ///
-    /// **[`Self::shutdown`] は置き場を消さない。** あちらは保存して次回の
-    /// 復元に備える経路なので、まだ読んでいない報告を消すと復元後に届かない。
+    /// Run を閉じる要求。dirtyなら確認を出すだけで、停止も削除もしない。
     pub fn close_run(&mut self, i: usize) -> Option<String> {
         if i >= self.runs.len() {
             return None;
         }
-        // **止めてから外す。** 外してから止めると、止める相手が居なくなる。
-        //
-        // `TeamAction::Stop` ではなく [`TeamRuntime::close`] — Stop は kill を
-        // 承認ゲートに通すので、判断が Run と一緒に消えて誰も承認できず、
-        // 担当のプロセスだけが残る。閉じる操作そのものが人の決定なので、
-        // 全セッションの停止を直接出す。出した停止は [`Self::take_stops`] が
-        // **Run が消えた後でも**実行側へ渡す。
-        let effects = self.runs[i].close();
-        let owner = self.runs[i].owner();
+        if self.pending_close.is_some()
+            || matches!(self.close_prompt, ClosePrompt::Stopping { .. })
+        {
+            self.notice = crate::i18n::tr("team.close.already_running");
+            return None;
+        }
+        let id = self.runs[i].run().run_id.clone();
+        let artifact_path = self.runs[i].workspace().display().to_string();
+        if let Some(saved) = self.runs[i].run().run_workspace.as_ref() {
+            match super::run_workspace::change_state(
+                &self.home,
+                &self.workspace,
+                &id,
+                saved,
+            ) {
+                Ok(super::run_workspace::ChangeState::Dirty) => {
+                    self.close_prompt = ClosePrompt::Confirm {
+                        run_id: id.clone(),
+                        artifact_path,
+                    };
+                    return Some(id);
+                }
+                Ok(super::run_workspace::ChangeState::Clean) => {}
+                Err(why) => {
+                    self.close_prompt = ClosePrompt::Failed {
+                        run_id: id.clone(),
+                        artifact_path,
+                        policy: persistence::ClosePolicy::CleanOnly,
+                        why: why.clone(),
+                    };
+                    self.notice = why;
+                    return Some(id);
+                }
+            }
+        }
+        self.begin_close(&id, persistence::ClosePolicy::CleanOnly);
+        Some(id)
+    }
+
+    /// dirty確認で選んだRunの成果物を残し、管理だけを閉じる。
+    pub fn close_run_keep(&mut self) {
+        if let ClosePrompt::Confirm { run_id, .. } = self.close_prompt.clone() {
+            self.begin_close(&run_id, persistence::ClosePolicy::Keep);
+        }
+    }
+
+    /// dirty確認で選んだRunだけを、明示承認として強制削除する。
+    pub fn close_run_discard(&mut self) {
+        if let ClosePrompt::Confirm { run_id, .. } = self.close_prompt.clone() {
+            self.begin_close(&run_id, persistence::ClosePolicy::Discard);
+        }
+    }
+
+    /// 確認の取消。確認前は何も変更していないので、表示を消すだけでよい。
+    pub fn close_run_cancel(&mut self) {
+        if matches!(self.close_prompt, ClosePrompt::Confirm { .. }) {
+            self.close_prompt = ClosePrompt::None;
+        }
+    }
+
+    /// 失敗したCloseを同じ方針で再試行する。成果物破棄の承認は保持する。
+    pub fn retry_close_run(&mut self) {
+        let ClosePrompt::Failed { run_id, policy, .. } = self.close_prompt.clone() else {
+            return;
+        };
+        if let Some(pending) = self.pending_close.as_mut() {
+            if pending.owner.run_id == run_id {
+                pending.started = Instant::now();
+                self.close_prompt = ClosePrompt::Stopping {
+                    run_id,
+                    artifact_path: pending.artifact_path.clone(),
+                };
+                self.progress_close();
+                return;
+            }
+        }
+        self.begin_close(&run_id, policy);
+    }
+
+    fn begin_close(&mut self, id: &str, policy: persistence::ClosePolicy) {
+        let Some(pos) = self.runs.iter().position(|r| r.run().run_id == id) else {
+            return;
+        };
+        let owner = self.runs[pos].owner();
+        let artifact_path = self.runs[pos].workspace().display().to_string();
+
+        // 停止後に新しい仕事を起動・送信しない。同じownerだけを対象にし、
+        // 別Runのキューはそのまま継続する。
+        let queued_before = self.pending_launches.len()
+            + self.pending_instructions.len()
+            + self.pending_manual.len()
+            + self.pending_validations.len();
+        self.pending_launches.retain(|(o, _, _)| o != &owner);
+        self.pending_instructions.retain(|(o, _, _)| o != &owner);
+        self.pending_manual.retain(|(o, _, _)| o != &owner);
+        self.pending_validations.retain(|(o, _, _)| o != &owner);
+        let queued_after = self.pending_launches.len()
+            + self.pending_instructions.len()
+            + self.pending_manual.len()
+            + self.pending_validations.len();
+        self.dropped_effects = self
+            .dropped_effects
+            .saturating_add(queued_before.saturating_sub(queued_after));
+        let effects = self.runs[pos].close();
         self.cancel_validations_for_owner(&owner);
-        self.absorb_for(owner, effects);
-        let rt = self.runs.remove(i);
-        let id = rt.run().run_id.clone();
-        self.cleanup_closed_run(&id, rt.run().run_workspace.as_ref());
+        self.absorb_for(owner.clone(), effects);
+        self.needs_save = true;
+
+        // 停止済みRuntimeを先に保存する。保存できない状態で墓標や成果物だけを
+        // 変更すると、再試行に必要な対応情報を失う。
+        if let Err(why) = self.save_all_state() {
+            self.close_prompt = ClosePrompt::Failed {
+                run_id: id.to_string(),
+                artifact_path,
+                policy,
+                why: why.clone(),
+            };
+            self.notice = why;
+            return;
+        }
+        let state = self.state_dir();
+        if let Err(e) = persistence::mark_close_state(
+            &state,
+            id,
+            policy,
+            persistence::ClosePhase::Stopping,
+            &artifact_path,
+        ) {
+            let why = e.detail();
+            self.close_prompt = ClosePrompt::Failed {
+                run_id: id.to_string(),
+                artifact_path,
+                policy,
+                why: why.clone(),
+            };
+            self.notice = why;
+            return;
+        }
+        self.pending_close = Some(PendingClose {
+            owner,
+            policy,
+            artifact_path: artifact_path.clone(),
+            started: Instant::now(),
+        });
+        self.close_prompt = ClosePrompt::Stopping {
+            run_id: id.to_string(),
+            artifact_path,
+        };
+        self.progress_close();
+    }
+
+    /// 実行側がセッション終了の追跡札を返す入口。
+    pub fn watch_stop(
+        &mut self,
+        owner: RunOwner,
+        key: String,
+        handle: Option<crate::terminal::ReapHandle>,
+    ) {
+        if let Some(handle) = handle {
+            self.stop_jobs.push(StopJob { owner, key, handle });
+        } else {
+            self.ack_done(&owner, &key);
+        }
+    }
+
+    /// セッションとvalidationの終了を確認してからだけ後始末へ進む。
+    pub fn progress_close(&mut self) {
+        let mut waiting = Vec::new();
+        let mut completed = Vec::new();
+        for job in std::mem::take(&mut self.stop_jobs) {
+            if job.handle.is_finished() {
+                completed.push((job.owner, job.key));
+            } else {
+                waiting.push(job);
+            }
+        }
+        self.stop_jobs = waiting;
+        for (owner, key) in completed {
+            self.ack_done(&owner, &key);
+        }
+
+        // cleanup/停止失敗後は、利用者がRetryを選ぶまで勝手に再実行しない。
+        // 特に明示破棄の方針を保持したまま毎tick進めると、診断を読む前に
+        // 成果物が消える可能性がある。
+        if matches!(self.close_prompt, ClosePrompt::Failed { .. }) {
+            return;
+        }
+
+        let Some(pending) = self.pending_close.clone() else {
+            return;
+        };
+        let owner = &pending.owner;
+        let busy = self.pending_stops.iter().any(|(o, _, _)| o == owner)
+            || self.stop_jobs.iter().any(|j| &j.owner == owner)
+            || self.validation_jobs.iter().any(|j| &j.owner == owner)
+            || self.pending_validations.iter().any(|(o, _, _)| o == owner);
+        if busy {
+            if pending.started.elapsed() > Duration::from_secs(30) {
+                let why = crate::i18n::tr("team.close.stop_timeout");
+                self.close_prompt = ClosePrompt::Failed {
+                    run_id: owner.run_id.clone(),
+                    artifact_path: pending.artifact_path,
+                    policy: pending.policy,
+                    why: why.clone(),
+                };
+                self.notice = why;
+            }
+            return;
+        }
+        self.finish_close(pending);
+    }
+
+    fn finish_close(&mut self, pending: PendingClose) {
+        let id = pending.owner.run_id.as_str();
+        let Some(pos) = self.run_pos_of_owner(&pending.owner) else {
+            self.pending_close = None;
+            return;
+        };
+        let saved = self.runs[pos].run().run_workspace.clone();
+
+        // cleanで開始した場合も削除直前に再実測する。ここで増えた成果物は
+        // 新しい確認なしには消さない。
+        if pending.policy == persistence::ClosePolicy::CleanOnly {
+            if let Some(worktree) = saved.as_ref() {
+                match super::run_workspace::change_state(
+                    &self.home,
+                    &self.workspace,
+                    id,
+                    worktree,
+                ) {
+                    Ok(super::run_workspace::ChangeState::Dirty) => {
+                        if let Err(e) = persistence::mark_close_state(
+                            &self.state_dir(),
+                            id,
+                            persistence::ClosePolicy::CleanOnly,
+                            persistence::ClosePhase::Stopping,
+                            &pending.artifact_path,
+                        ) {
+                            self.close_failed(&pending, e.detail());
+                            return;
+                        }
+                        self.pending_close = None;
+                        self.close_prompt = ClosePrompt::Confirm {
+                            run_id: id.to_string(),
+                            artifact_path: pending.artifact_path,
+                        };
+                        return;
+                    }
+                    Ok(super::run_workspace::ChangeState::Clean) => {}
+                    Err(why) => {
+                        self.close_failed(&pending, why);
+                        return;
+                    }
+                }
+            }
+        }
+
+        if let Err(e) = persistence::mark_close_state(
+            &self.state_dir(),
+            id,
+            pending.policy,
+            persistence::ClosePhase::Cleanup,
+            &pending.artifact_path,
+        ) {
+            self.close_failed(&pending, e.detail());
+            return;
+        }
+
+        if pending.policy != persistence::ClosePolicy::Keep {
+            if let Err(why) = self.cleanup_closed_run(id, saved.as_ref(), pending.policy) {
+                self.close_failed(&pending, why);
+                return;
+            }
+        }
+        self.remove_run_from_memory(&pending.owner);
+        self.pending_close = None;
+        if pending.policy == persistence::ClosePolicy::Keep {
+            self.notice = crate::i18n::trf(
+                "team.close.kept_notice",
+                &[("path", pending.artifact_path.clone())],
+            );
+        } else {
+            if let Err(e) = persistence::unmark_closed(&self.state_dir(), id) {
+                self.notice = e.detail();
+            } else {
+                self.notice = crate::i18n::tr("team.notice.run_closed");
+            }
+        }
+        self.close_prompt = ClosePrompt::None;
+        self.needs_save = true;
+        self.save_if_needed();
+    }
+
+    fn close_failed(&mut self, pending: &PendingClose, why: String) {
+        self.close_prompt = ClosePrompt::Failed {
+            run_id: pending.owner.run_id.clone(),
+            artifact_path: pending.artifact_path.clone(),
+            policy: pending.policy,
+            why: why.clone(),
+        };
+        self.notice = why;
+    }
+
+    fn remove_run_from_memory(&mut self, owner: &RunOwner) {
+        let Some(i) = self.run_pos_of_owner(owner) else {
+            return;
+        };
+        self.runs.remove(i);
         if self.runs.is_empty() {
             self.active = 0;
             self.snapshot = None;
         } else if i < self.active {
-            // active より前を消したら、同じ Run は 1 つ左へ移る。
             self.active -= 1;
         } else if self.active >= self.runs.len() {
             self.active = self.runs.len() - 1;
@@ -1687,42 +2108,16 @@ impl TeamPanel {
         self.selected_agent = None;
         self.expanded_output = None;
         self.dirty = true;
-        self.needs_save = true;
-        Some(id)
     }
 
-    /// **閉じた Run の保存と置き場を片付ける。** [`Self::close_run`] と
-    /// [`Self::discard_run`] の共通部分。
-    ///
-    /// 順序が不変条件:
-    /// 1. **消す前に墓標を書く** ([`persistence::mark_closed`])。削除が失敗しても
-    ///    途中で落ちても、次の起動の `restore_run` は墓標を見て復元しない
-    /// 2. Run 専用 worktree を決定パスと git 登録の両方で検証して消す。
-    ///    失敗したら対応情報を持つ保存は残し、次回再試行できる。
-    /// 3. 保存 (`runs/<id>`) と報告置き場 (`outbox/<id>`) を消す。どちらも
-    ///    `run_id` の関門 ([`outbox::safe_child`]) を通した 1 段下だけ。
-    ///    失敗は**種類ごとに**帯へ出す (保存が残るのと置き場が残るのでは、
-    ///    次に起きることが違う)
-    /// 4. 最後の 1 本なら根の控え (`state.json`) も消す。残すと `has_run` が
-    ///    「保存がある」と案内し、復元経路がその控えを拾う
-    /// 5. 全部済んだときだけ墓標を片付ける。1 つでも残ったら墓標も残す —
-    ///    次の起動で `restore_run` が片付けを試し直す
+    /// 墓標がCleanupで、方針が確定したRunだけを片付ける。
     fn cleanup_closed_run(
         &mut self,
         id: &str,
         run_workspace: Option<&super::run_workspace::RunWorkspace>,
-    ) {
+        policy: persistence::ClosePolicy,
+    ) -> Result<(), String> {
         let state = self.state_dir();
-        if let Err(e) = persistence::mark_closed(&state, id) {
-            // 墓標が書けないまま削除を始めると、途中失敗時に次回の
-            // 復元が半分削除された Run を拾う。ここは何も消さず止める。
-            self.notice = crate::i18n::trf(
-                "team.notice.run_state_cleanup_failed",
-                &[("run", id.to_string()), ("e", e.detail())],
-            );
-            return;
-        }
-
         let discovered;
         let worktree = match run_workspace {
             Some(w) => Some(w),
@@ -1732,22 +2127,29 @@ impl TeamPanel {
                     discovered.as_ref()
                 }
                 Err(e) => {
-                    self.notice = format!(
+                    return Err(format!(
                         "Run {id} の専用 worktree を安全に確認できません: {e}"
-                    );
-                    return;
+                    ));
                 }
             },
         };
         if let Some(worktree) = worktree {
-            if let Err(e) =
-                super::run_workspace::remove(&self.home, &self.workspace, id, worktree)
-            {
-                // 保存を残す。墓標で復元は防ぎ、次回起動で同じ対応を
-                // 使って後始末を再試行できる。
-                self.notice = format!("Run {id} の専用 worktree を削除できません: {e}");
-                return;
-            }
+            let result = match policy {
+                persistence::ClosePolicy::Discard => super::run_workspace::remove_discarded(
+                    &self.home,
+                    &self.workspace,
+                    id,
+                    worktree,
+                ),
+                persistence::ClosePolicy::CleanOnly => super::run_workspace::remove_clean(
+                    &self.home,
+                    &self.workspace,
+                    id,
+                    worktree,
+                ),
+                persistence::ClosePolicy::Keep => return Ok(()),
+            };
+            result.map_err(|e| format!("Run {id} の専用 worktree を削除できません: {e}"))?;
         }
 
         let mut errors = Vec::new();
@@ -1774,17 +2176,14 @@ impl TeamPanel {
             }
         }
         if !errors.is_empty() {
-            self.notice = crate::i18n::trf(
+            return Err(crate::i18n::trf(
                 "team.notice.run_state_cleanup_failed",
                 &[("run", id.to_string()), ("e", errors.join(" / "))],
-            );
-        }
-        if all_gone {
-            // 片付いたら墓標も要らない。消せなくても害は無い (次の復元で
-            // 「保存も置き場も無い墓標」として掃かれる)。
-            let _ = persistence::unmark_closed(&state, id);
+            ));
         }
         self.outbox_ledger.prune_missing();
+        debug_assert!(all_gone);
+        Ok(())
     }
 
     /// **墓標のある Run の片付けを試し直し、済んだ墓標を掃く** (復元の前に呼ぶ)。
@@ -1796,7 +2195,18 @@ impl TeamPanel {
     fn sweep_closed_runs(&mut self, root: &Path) {
         debug_assert_eq!(root, self.state_dir());
         for id in persistence::closed_run_ids(root) {
-            self.cleanup_closed_run(&id, None);
+            let Some(record) = persistence::close_record(root, &id) else {
+                self.notice = format!("Run {id} のClose記録が壊れているため自動削除しません");
+                continue;
+            };
+            if record.phase != persistence::ClosePhase::Cleanup
+                || record.policy == persistence::ClosePolicy::Keep
+            {
+                continue;
+            }
+            if self.cleanup_closed_run(&id, None, record.policy).is_ok() {
+                let _ = persistence::unmark_closed(root, &id);
+            }
         }
     }
 
@@ -2083,12 +2493,12 @@ impl TeamPanel {
         self.running_validations()
     }
 
-    /// 1 Run に属する検証だけを即時停止して管理から外す。
+    /// 1 Run に属する検証だけを即時停止する。受け口は終了確認まで残す。
     fn cancel_validations_for_owner(&mut self, owner: &RunOwner) -> usize {
         let mut stopped = 0usize;
-        self.validation_jobs.retain(|job| {
+        for job in &self.validation_jobs {
             if &job.owner != owner {
-                return true;
+                continue;
             }
             job.cancel
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2097,8 +2507,7 @@ impl TeamPanel {
                 crate::procx::kill_tree(pid);
             }
             stopped += 1;
-            false
-        });
+        }
         stopped
     }
 
@@ -2267,17 +2676,28 @@ impl TeamPanel {
         if !self.needs_save || self.read_only {
             return;
         }
-        self.needs_save = false;
         if self.runs.is_empty() {
+            self.needs_save = false;
             return;
         }
+        match self.save_all_state() {
+            Ok(()) => self.needs_save = false,
+            Err(e) => {
+                // 次のtickで必ず再試行する。失敗時に先にfalseへ落とすと、
+                // 永続化されていない状態を成功扱いして以後保存しなくなる。
+                self.needs_save = true;
+                self.notice = e;
+            }
+        }
+    }
+
+    fn save_all_state(&self) -> Result<(), String> {
         // **全部の Run を保存する。** 画面に出していない Run も走っている
         // ので、保存しないと再起動でそれだけが消える。
         //
         // 置き場は Run ごと (`runs/<run_id>/`)。1 か所に上書きすると、
         // 2 本目が 1 本目を消す。
         let root = self.state_dir();
-        let mut err: Option<String> = None;
         for rt in &self.runs {
             // **`run_id` をそのまま `join` しない。** 復元した保存の `run_id` は
             // 利用者のファイルから来るので、`..` や区切り文字が入っていれば
@@ -2285,26 +2705,19 @@ impl TeamPanel {
             // (`restore_run` は読まないので、ここへ来るのは計画の入口から
             // 変な ID を渡されたときだけ)。
             let Some(dir) = persistence::run_dir_in(&root, &rt.run().run_id) else {
-                err = Some(format!(
+                return Err(format!(
                     "Team Run {:?} は保存できません (保存の名前にできない ID)",
                     rt.run().run_id
                 ));
-                continue;
             };
-            if let Err(e) = persistence::save(&dir, &rt.to_saved()) {
-                err = Some(e.detail());
-            }
+            persistence::save(&dir, &rt.to_saved()).map_err(|e| e.detail())?;
         }
-        // **いちばん古い 1 本は従来の場所にも置く。** 旧版で保存された
-        // Run を読む経路 (`restore_run`) をそのまま残すため。
+        // Runごとの正本が全部成功した後だけ互換ミラーを書く。途中失敗時に
+        // 古い正本へ新しいミラーを被せない。
         if let Some(rt) = self.runs.first() {
-            if let Err(e) = persistence::save(&root, &rt.to_saved()) {
-                err = Some(e.detail());
-            }
+            persistence::save(&root, &rt.to_saved()).map_err(|e| e.detail())?;
         }
-        if let Some(e) = err {
-            self.notice = e;
-        }
+        Ok(())
     }
 
     /// スナップショットを作り直す (**変わったときだけ**)。
@@ -2467,6 +2880,16 @@ mod tests {
             sessions: Vec::new(),
         });
         p
+    }
+
+    fn finish_close_for_test(p: &mut TeamPanel) -> Vec<(RunOwner, String, SessionId)> {
+        let stops = p.take_stops();
+        for (owner, key, _) in stops.iter().cloned() {
+            p.watch_stop(owner, key, None);
+        }
+        p.collect_validations();
+        p.progress_close();
+        stops
     }
 
     #[test]
@@ -2723,6 +3146,7 @@ mod tests {
 
         super::super::run_workspace::fault_inject::fail_remove_once();
         p.close_run(p.run_pos_of_owner(&a).expect("A")).expect("Aを閉じる");
+        finish_close_for_test(&mut p);
         assert!(a.workspace.is_dir(), "削除失敗を成功扱いした");
         assert!(b.workspace.is_dir(), "Aの失敗でBのworktreeを消した");
         assert!(persistence::is_closed(&state, &a.run_id), "Aの墓標が無い");
@@ -2767,17 +3191,19 @@ mod tests {
         let b = p.owner().unwrap();
         let cancel_a = super::super::launch::new_cancel_flag();
         let cancel_b = super::super::launch::new_cancel_flag();
+        let mut senders = Vec::new();
         for (owner, cancel, execution) in [
             (a.clone(), cancel_a.clone(), "a"),
             (b.clone(), cancel_b.clone(), "b"),
         ] {
-            let (_tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = std::sync::mpsc::channel();
+            senders.push(tx);
             p.watch_validation(ValidationJob {
                 owner,
                 task: 1,
                 execution: execution.into(),
                 commands: vec!["cargo test".into()],
-                started_at: 1,
+                started_at: super::super::model::now_secs(),
                 timeout_secs: 60,
                 cancel,
                 pid: super::super::launch::new_pid_slot(),
@@ -2788,6 +3214,10 @@ mod tests {
         p.close_run(pos).expect("A を閉じる");
         assert!(cancel_a.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!cancel_b.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(p.running_validations(), 2, "停止完了前に検証記録を捨てた");
+        drop(senders.remove(0));
+        p.collect_validations();
+        p.progress_close();
         assert_eq!(p.running_validations(), 1);
         assert_eq!(p.validation_jobs[0].owner, b);
         std::fs::remove_dir_all(&dir).ok();
@@ -2867,8 +3297,6 @@ mod tests {
         // 切り替えを断る仕組みだけに頼らない。**持ち主が違う Effect は
         // 渡さない**という構造の検査 (キューが空になる偶然に頼らない)。
         let a = ws("owner-a");
-        let b = ws("owner-b");
-        std::fs::create_dir_all(&b).unwrap();
         let mut p = started_panel(&a);
         assert!(!p.pending_launches.is_empty());
         // 別の Run へ差し替える (workspace ごと作り直す = 切り替えと同じ状況)。
@@ -2878,9 +3306,9 @@ mod tests {
         // 同時に走らせられるようになったので「作り直したら前のは死ぬ」では
         // なくなった。死ぬのは**閉じたとき**なので、そこで確かめる。
         let stale = p.pending_launches.clone();
-        p.workspace = b.clone();
         add_product_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
+        finish_close_for_test(&mut p);
         p.pending_launches = stale;
         assert!(
             p.take_launches().is_empty(),
@@ -2889,14 +3317,11 @@ mod tests {
         assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
         assert!(!p.notice.trim().is_empty(), "黙って捨てている");
         std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
     fn 指示と停止と検証も持ち主で選り分ける() {
         let a = ws("owner-all");
-        let b = ws("owner-all-b");
-        std::fs::create_dir_all(&b).unwrap();
         let mut p = started_panel(&a);
         // **外向きの口すべて**に、前の Run のものを積む。
         // 口を 1 つ足したらここへも足すこと (足し忘れると、前の Run の
@@ -2933,9 +3358,9 @@ mod tests {
             p.pending_manual.clone(),
         );
         // **閉じた Run のものは、どの口からも出さない。**
-        p.workspace = b.clone();
         add_product_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
+        finish_close_for_test(&mut p);
         p.pending_launches = stale.0;
         p.pending_instructions = stale.1;
         p.pending_stops = stale.2;
@@ -2954,7 +3379,6 @@ mod tests {
         assert!(p.take_validations().is_empty(), "検証が漏れた");
         assert!(p.take_manual_instructions().is_empty(), "人の指示が漏れた");
         std::fs::remove_dir_all(&a).ok();
-        std::fs::remove_dir_all(&b).ok();
     }
 
     /// **Git が無いフォルダでは、走らせる前に分かる。**
@@ -3110,6 +3534,10 @@ mod tests {
             stops.iter().any(|(o, k, s)| o == &first && k == "stop:1" && *s == 1),
             "閉じた Run の停止が捨てられた (プロセスが残る): {stops:?}"
         );
+        for (owner, key, _) in stops.iter().cloned() {
+            p.watch_stop(owner, key, None);
+        }
+        p.progress_close();
         assert!(p.take_launches().is_empty(), "閉じた Run の起動を実行した");
         assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
         assert_eq!(p.runs.len(), 1);
@@ -4764,6 +5192,15 @@ mod tests {
             p.runs.iter().map(|r| r.run().run_id.clone()).collect()
         }
 
+        fn finish_pending_stops(p: &mut TeamPanel) -> Vec<(RunOwner, String, SessionId)> {
+            let stops = p.take_stops();
+            for (owner, key, _) in stops.iter().cloned() {
+                p.watch_stop(owner, key, None);
+            }
+            p.progress_close();
+            stops
+        }
+
         /// A (開始済み・担当にセッションを結んだ) と B (計画のみ) を保存した状態。
         /// 戻りは (画面, workspace, A, B, A に結んだセッション)。
         fn two_saved(tag: &str) -> (TeamPanel, PathBuf, RunOwner, RunOwner, Vec<SessionId>) {
@@ -4795,6 +5232,82 @@ mod tests {
         }
 
         #[test]
+        fn dirty_closeは取消と保持を選べ成果物を消さない() {
+            let dir = ws("close-dirty-keep");
+            let mut p = started_panel(&dir);
+            let owner = p.owner().unwrap();
+            let worktree = owner.workspace.clone();
+            let artifact = worktree.join("artifact.txt");
+            std::fs::write(&artifact, "valuable\n").unwrap();
+
+            p.close_run(0).expect("確認を開く");
+            assert!(matches!(p.close_prompt, ClosePrompt::Confirm { .. }));
+            assert!(p.has_run(), "確認前にRunを外した");
+            assert!(artifact.exists(), "確認前に成果物を消した");
+
+            p.close_run_cancel();
+            assert_eq!(p.close_prompt, ClosePrompt::None);
+            assert!(p.has_run(), "取消で状態を変えた");
+            assert!(artifact.exists(), "取消で成果物を消した");
+
+            p.close_run(0).expect("再確認を開く");
+            p.close_run_keep();
+            assert!(!p.has_run(), "保持を選んだRunの管理が閉じていない");
+            assert!(artifact.exists(), "保持を選んだ成果物を消した");
+            let record = persistence::close_record(&p.state_dir(), &owner.run_id).unwrap();
+            assert_eq!(record.policy, persistence::ClosePolicy::Keep);
+            assert_eq!(record.phase, persistence::ClosePhase::Cleanup);
+            assert_eq!(record.artifact_path, worktree.display().to_string());
+            assert!(!p.notice.is_empty(), "保持後の案内が無い");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 明示破棄はdirtyな対象runだけを削除する() {
+            let dir = ws("close-explicit-discard");
+            let mut p = started_panel(&dir);
+            let a = p.owner().unwrap();
+            std::fs::write(a.workspace.join("a-result.txt"), "a\n").unwrap();
+            add_product_run(&mut p).unwrap();
+            p.act(TeamAction::Start);
+            let b = p.owner().unwrap();
+            let pos = p.run_pos_of_owner(&a).unwrap();
+            p.close_run(pos).unwrap();
+            assert!(matches!(p.close_prompt, ClosePrompt::Confirm { .. }));
+            p.close_run_discard();
+            assert!(!a.workspace.exists(), "明示破棄したAが残った");
+            assert!(b.workspace.exists(), "Bのworkspaceまで消した");
+            assert_eq!(run_ids(&p), vec![b.run_id]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn セッション停止完了前と削除直前に増えた成果物は削除しない() {
+            let dir = ws("close-stop-and-toctou");
+            let mut p = started_panel(&dir);
+            let owner = p.owner().unwrap();
+            let (_, _, launch) = p.take_launches().into_iter().next().unwrap();
+            p.bind_session(&owner, &launch.agent_id, 700, None);
+
+            p.close_run(0).unwrap();
+            let stops = p.take_stops();
+            assert_eq!(stops.len(), 1);
+            let (stop_owner, key, _) = stops[0].clone();
+            let handle = crate::terminal::ReapHandle::for_test(false);
+            p.watch_stop(stop_owner, key, Some(handle.clone()));
+            p.progress_close();
+            assert!(owner.workspace.exists(), "セッション停止前にworktreeを削除した");
+
+            handle.finish_for_test();
+            std::fs::write(owner.workspace.join("late.txt"), "late\n").unwrap();
+            p.progress_close();
+            assert!(matches!(p.close_prompt, ClosePrompt::Confirm { .. }));
+            assert!(owner.workspace.join("late.txt").exists(), "競合成果物を削除した");
+            assert!(p.has_run(), "再確認前にRunを外した");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
         fn runを閉じると全セッションの停止が実行側へ届く() {
             let (mut p, dir, a, b, sids) = two_saved("close-stops");
             // 閉じる前に積まれていた A の「停止以外」の仕事。閉じた後は実行しない。
@@ -4808,9 +5321,9 @@ mod tests {
                 .push((a.clone(), "instr:x".into(), (1, sids[0], "hi".into())));
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
-            assert_eq!(run_ids(&p), vec![b.run_id.clone()], "A が記憶から外れていない");
-            // **Run が消えた後に取り出しても、停止は全部出る。**
-            let stops = p.take_stops();
+            assert_eq!(run_ids(&p), vec![a.run_id.clone(), b.run_id.clone()]);
+            // 実行側が停止完了を返すまではAもworktreeも保持する。
+            let stops = finish_pending_stops(&mut p);
             for sid in &sids {
                 assert!(
                     stops.iter().any(|(o, k, s)| o == &a && s == sid && k == &format!("stop:{sid}")),
@@ -4818,6 +5331,7 @@ mod tests {
                 );
             }
             assert_eq!(stops.len(), sids.len(), "余分な停止が出た: {stops:?}");
+            assert_eq!(run_ids(&p), vec![b.run_id.clone()], "停止完了後もAが残った");
             // 停止以外の古い仕事は実行しない (既存の保証はそのまま)。
             assert!(p.take_launches().is_empty(), "閉じた Run の起動を実行した");
             assert!(p.take_instructions().is_empty(), "閉じた Run の指示を送った");
@@ -4866,7 +5380,7 @@ mod tests {
             assert!(!a_sids.is_empty() && !b_sids.is_empty(), "前提: 両方に担当が居る");
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
-            let stops = p.take_stops();
+            let stops = finish_pending_stops(&mut p);
             let mut got: Vec<SessionId> = stops.iter().map(|(_, _, s)| *s).collect();
             got.sort_unstable();
             let mut want = a_sids.clone();
@@ -4942,13 +5456,18 @@ mod tests {
             p.notice.clear();
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
+            finish_pending_stops(&mut p);
             assert!(!a_dir.exists(), "A の保存が残っている");
             assert!(b_dir.exists(), "B の保存まで消した");
             assert!(
                 !persistence::is_closed(&state, &a.run_id),
                 "片付いたのに墓標が残っている"
             );
-            assert!(p.notice.trim().is_empty(), "消せたのに苦情を出した: {}", p.notice);
+            assert_eq!(
+                p.notice,
+                crate::i18n::tr("team.notice.run_closed"),
+                "成功以外の通知を出した"
+            );
             // 次の起動: B だけが戻る。
             let mut q = reopened(&p, &dir);
             assert_eq!(q.restore, RestorePrompt::Found, "B の案内が出ない");
@@ -4956,6 +5475,7 @@ mod tests {
             assert_eq!(run_ids(&q), vec![b.run_id.clone()], "閉じた A が復活した");
             // 最後の 1 本を閉じると根の控えも消え、案内そのものが出ない。
             q.close_run(0).expect("B を閉じる");
+            finish_pending_stops(&mut q);
             assert!(!persistence::has_run(&state), "根の控えが残っている (復活の温床)");
             let r = reopened(&q, &dir);
             assert_eq!(r.restore, RestorePrompt::None, "閉じた Run を案内した");
@@ -4976,6 +5496,7 @@ mod tests {
             p.notice.clear();
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
+            finish_pending_stops(&mut p);
             assert!(a_dir.exists(), "前提: 削除が失敗している");
             assert!(persistence::is_closed(&state, &a.run_id), "墓標が無い");
             // 帯には「保存」の失敗として出る (置き場の失敗とは別の文言)。
@@ -5019,7 +5540,12 @@ mod tests {
             p.notice.clear();
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
-            assert!(p.notice.trim().is_empty(), "NotFound を失敗として出した: {}", p.notice);
+            finish_pending_stops(&mut p);
+            assert_eq!(
+                p.notice,
+                crate::i18n::tr("team.notice.run_closed"),
+                "NotFound を失敗として出した"
+            );
             assert!(!persistence::is_closed(&state, &a.run_id), "墓標が残っている");
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -5042,9 +5568,9 @@ mod tests {
             assert_eq!(q.restore, RestorePrompt::None, "閉じた Run を案内した");
             assert!(q.restore_run(false).is_err(), "墓標のある Run を復元した");
             assert!(q.runs.is_empty());
-            // 掃除まで済む: 保存も墓標も残らない。
-            assert!(!a_dir.exists(), "墓標のある保存を片付けていない");
-            assert!(!persistence::is_closed(&state, &a.run_id), "済んだ墓標が残っている");
+            // 壊れた墓標から削除方針を推測しない。保存と診断材料を残す。
+            assert!(a_dir.exists(), "方針不明なのに保存を消した");
+            assert!(persistence::is_closed(&state, &a.run_id), "壊れた墓標を消した");
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5078,7 +5604,8 @@ mod tests {
             let before_state = entries(&state);
             let before_runs = entries(&state.join(RUNS_DIR));
             for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x"] {
-                p.plan(
+                let err = p
+                    .plan(
                     SPEC,
                     "SPEC.md",
                     RunOptions {
@@ -5086,15 +5613,8 @@ mod tests {
                         ..RunOptions::default()
                     },
                 )
-                .expect("計画はできる");
-                p.notice.clear();
-                p.save_if_needed();
-                assert!(
-                    !p.notice.trim().is_empty(),
-                    "{bad:?} を黙って保存した (どこへ書いたのか分からない)"
-                );
-                let pos = p.active_run();
-                p.close_run(pos).expect("閉じられる");
+                    .expect_err("不正IDを開始前に拒否する");
+                assert!(err.contains("run_id"), "理由が分からない: {err}");
                 for c in &canaries {
                     assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
                 }
@@ -5166,6 +5686,35 @@ mod tests {
             q.restore_run(false).expect("残したRunを復元");
             assert_eq!(q.runs.len(), MAX_CONCURRENT_RUNS);
             assert_ne!(q.owner().expect("次のRun").run_id, first);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 復元の保存列挙は上限で打ち切る() {
+            let dir = ws("restore-scan-cap");
+            let mut p = panel_at(&dir);
+            let runs = p.state_dir().join(RUNS_DIR);
+            std::fs::create_dir_all(&runs).unwrap();
+            for n in 0..=RESTORE_SCAN_MAX {
+                std::fs::create_dir(runs.join(format!("run-{n:04}"))).unwrap();
+            }
+
+            assert!(p.restore_run(false).is_err(), "中身の無い保存を復元した");
+            assert_eq!(
+                p.notice, "team.notice.restore_skipped",
+                "打ち切りの通知経路を通っていない"
+            );
+            for (lang, _, json) in crate::locale::BUILTIN {
+                let dict: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(json).expect("同梱辞書は JSON");
+                let text = dict
+                    .get("team.notice.restore_skipped")
+                    .unwrap_or_else(|| panic!("{lang} に復元skipの訳が無い"));
+                assert!(
+                    text.contains("{why}"),
+                    "{lang}: 打ち切り理由を表示できない: {text}"
+                );
+            }
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5327,6 +5876,14 @@ mod tests {
             (p, dir, a, b)
         }
 
+        fn finish_close(p: &mut TeamPanel) {
+            let stops = p.take_stops();
+            for (owner, key, _) in stops {
+                p.watch_stop(owner, key, None);
+            }
+            p.progress_close();
+        }
+
         /// 観測 (画面は空。置き場の報告だけが流れる)。渡した Run の
         /// **全セッション**を載せる。
         fn rows(lanes: &[&Lane]) -> Vec<SessionInput> {
@@ -5442,7 +5999,18 @@ mod tests {
             );
             outbox::fault_inject::fail_remove_once();
             p.pump_sessions(rows(&[&a, &b]), 100);
-            assert!(file.exists(), "削除失敗なのにファイルが消えた");
+            assert!(!file.exists(), "原本をprocessingへ確保していない");
+            assert!(
+                outbox::list_reports(&a.dir)
+                    .iter()
+                    .any(|path| {
+                        path.parent()
+                            .and_then(|slot| slot.parent())
+                            .and_then(|parent| parent.file_name())
+                            .is_some_and(|name| name == outbox::PROCESSING_DIR)
+                    }),
+                "削除失敗なのに確保済み報告が残っていない"
+            );
             let count = |panel: &TeamPanel| {
                 let pos = panel.run_pos_of_owner(&a.owner).expect("A");
                 panel.runs[pos]
@@ -5452,9 +6020,24 @@ mod tests {
                     .count()
             };
             assert_eq!(count(&p), 1, "初回の状態反映が無い");
-            p.pump_sessions(rows(&[&a, &b]), 101);
-            assert!(!file.exists(), "再処理で受理済みファイルを片付けていない");
-            assert_eq!(count(&p), 1, "削除再試行で状態を二重更新した");
+
+            // 再起動しても永続化済みseen台帳が二重反映を止める。
+            let mut q = TeamPanel::default();
+            q.home = p.home.clone();
+            q.attach_workspace(&dir).unwrap();
+            q.restore_run(false).unwrap();
+            q.pump_sessions(Vec::new(), 101);
+            let pos = q.run_pos_of_owner(&a.owner).expect("復元したA");
+            assert_eq!(
+                q.runs[pos]
+                    .agents()
+                    .iter()
+                    .filter(|agent| agent.id.as_str() == "remove-retry-child")
+                    .count(),
+                1,
+                "再起動後の削除再試行で状態を二重更新した"
+            );
+            assert!(outbox::list_reports(&a.dir).is_empty(), "受理済み報告を片付けていない");
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5465,9 +6048,15 @@ mod tests {
             let (mut p, dir, a, b) = two_lanes("outbox-broken-keep");
             let full = report("team-lead", 99);
             let f = a.dir.join(outbox::final_name("team-lead", "1"));
-            std::fs::write(&f, &full[..full.len() / 2]).unwrap();
+            let mut writer = std::fs::File::create(&f).unwrap();
+            use std::io::Write as _;
+            writer.write_all(&full.as_bytes()[..full.len() / 2]).unwrap();
+            writer.flush().unwrap();
             p.pump_sessions(rows(&[&a, &b]), 100);
-            assert!(f.exists(), "書きかけを 1 回目で消した (報告が永久に失われる)");
+            assert!(
+                !outbox::list_reports(&a.dir).is_empty(),
+                "書きかけを 1 回目で失った"
+            );
             assert_eq!(saw(&p, &a.owner, "#99"), 0, "半分の JSON を解析器へ渡した");
             assert_eq!(
                 saw(&p, &a.owner, "取り込めません"),
@@ -5475,7 +6064,8 @@ mod tests {
                 "1 回読めなかっただけで却下を記録した"
             );
             // 書き終わったら、次の tick で届く
-            std::fs::write(&f, &full).unwrap();
+            writer.write_all(&full.as_bytes()[full.len() / 2..]).unwrap();
+            writer.flush().unwrap();
             p.pump_sessions(rows(&[&a, &b]), 101);
             assert_eq!(saw(&p, &a.owner, "#99"), 1, "書き終わった報告が届かない");
             assert!(!f.exists(), "届いたのに消していない");
@@ -5495,7 +6085,7 @@ mod tests {
             for i in 0..(outbox::MAX_ATTEMPTS - 1) {
                 p.pump_sessions(rows(&[&a, &b]), 100 + u64::from(i));
                 assert!(
-                    f.exists(),
+                    !outbox::list_reports(&a.dir).is_empty(),
                     "{} 回目で消した (上限は {})",
                     i + 1,
                     outbox::MAX_ATTEMPTS
@@ -5562,6 +6152,7 @@ mod tests {
             // A を閉じても B の配送は続く
             let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
             p.close_run(pos_a).expect("A を閉じる");
+            finish_close(&mut p);
             let fb2 = submit(&b.dir, "team-lead", "2", &report("team-lead", 97));
             p.pump_sessions(rows(&[&b]), 102);
             assert_eq!(saw(&p, &b.owner, "#97"), 1, "A を閉じたら B へ届かなくなった");
@@ -5844,6 +6435,7 @@ mod tests {
             let (mut p, dir, a, b) = two_lanes("outbox-restart");
             let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
             p.close_run(pos_a).expect("A を閉じる");
+            finish_close(&mut p);
             // **まだ誰も読んでいない報告**を B の置き場へ置いて、保存して落ちる。
             let fb = submit(&b.dir, "team-lead", "pending", &report("team-lead", 95));
             p.save_if_needed();
@@ -5991,6 +6583,9 @@ mod tests {
             // A を閉じる → A のworktreeだけ消え、Bは動き続ける。
             let pos_a = q.run_pos_of_owner(&a.owner).unwrap();
             q.close_run(pos_a).expect("A を閉じる");
+            assert!(matches!(q.close_prompt, ClosePrompt::Confirm { .. }));
+            q.close_run_discard();
+            finish_close(&mut q);
             assert!(!a.dir.exists(), "閉じた Run の置き場が残っている");
             assert!(!a.owner.workspace.exists(), "A のworktreeが残っている");
             assert!(b.owner.workspace.is_dir(), "B のworktreeまで削除した");
@@ -6014,6 +6609,9 @@ mod tests {
             assert_eq!(r.owner().expect("B").workspace, b.owner.workspace);
             assert!(has_agent(&r, &b.owner, "e2e-b2"), "Bの継続状態が消えた");
             r.close_run(0).expect("Bを片付ける");
+            assert!(matches!(r.close_prompt, ClosePrompt::Confirm { .. }));
+            r.close_run_discard();
+            finish_close(&mut r);
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -6146,13 +6744,18 @@ mod tests {
             p.notice.clear();
             let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
             p.close_run(pos_a).expect("A を閉じる");
+            finish_close(&mut p);
             assert!(!a.dir.exists(), "A の置き場が残っている");
             assert!(!fa.exists());
             assert!(!runs_a.exists(), "A の保存が残っている");
             assert!(b.dir.exists() && fb.exists(), "B の置き場まで消した");
             assert!(runs_b.exists(), "B の保存まで消した");
             assert!(state.join(outbox::DIR_NAME).exists(), "親フォルダごと消した");
-            assert!(p.notice.trim().is_empty(), "消せたのに苦情を出した: {}", p.notice);
+            assert_eq!(
+                p.notice,
+                crate::i18n::tr("team.notice.run_closed"),
+                "成功以外の通知を出した"
+            );
             // 残った B にはまだ届く
             p.pump_sessions(rows(&[&b]), 100);
             assert_eq!(saw(&p, &b.owner, "#99"), 1, "A を閉じたら B へ届かない");
@@ -6177,23 +6780,16 @@ mod tests {
                 std::fs::write(c, "x").unwrap();
             }
             for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x"] {
-                p.plan(
+                let result = p.plan(
                     SPEC,
                     "SPEC.md",
                     RunOptions {
                         run_id: bad.to_string(),
                         ..RunOptions::default()
                     },
-                )
-                .expect("計画はできる");
-                let rt = p.rt().unwrap();
-                assert!(
-                    rt.outbox().as_os_str().is_empty(),
-                    "{bad:?} で置き場を作った: {}",
-                    rt.outbox().display()
                 );
-                let pos = p.active_run();
-                p.close_run(pos).expect("閉じられる");
+                assert!(result.is_err(), "危険なrun_id {bad:?}を計画に通した");
+                assert!(!p.has_run(), "拒否したrun_idでRunを残した");
                 for c in &canaries {
                     assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
                 }
