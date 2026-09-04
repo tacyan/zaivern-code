@@ -80,6 +80,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
     // 計画 (`files` が空) で実際に起きる形。
     test_hooks::set_baseline(Some(super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     }));
     test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
@@ -1431,6 +1432,7 @@ fn 保存して復元しても未実行のeffectだけを撃ち直す() {
     // 実測の差し替えは「復元後の Runtime」にも要る (別の Runtime なので)。
     let base = super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     };
 
@@ -1519,6 +1521,7 @@ fn 保存の途中で落ちても再開できる() {
     let mut back = TeamRuntime::restore(saved, PathBuf::from("/zaivern-team-test-workspace"));
     test_hooks::set_baseline(Some(super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     }));
     test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {

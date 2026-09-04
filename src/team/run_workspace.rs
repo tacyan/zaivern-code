@@ -17,10 +17,14 @@ pub struct RunWorkspace {
     pub repository_root: String,
     pub worktree_root: String,
     pub execution_workspace: String,
+    /// Run専用worktreeを作成した時点の元workspaceのHEAD。
+    /// 空は旧保存形式で、変更状態を安全に判定できないことを表す。
+    #[serde(default)]
+    pub base_commit: String,
 }
 
-/// Run worktree の未保存変更。`git status --porcelain=v1 -z` が1件でも
-///返したら dirty で、tracked / untracked / staged / deleted / renamed を含む。
+/// Run worktree の成果物。基準HEADから現在HEADが動いた場合、または
+/// `git status --porcelain=v1 -z` が1件でも返した場合にdirtyとする。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeState {
     Clean,
@@ -100,7 +104,7 @@ fn ensure_plain_layout(home: &Path, keyed_base: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn source_layout(source_workspace: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+fn source_layout(source_workspace: &Path) -> Result<(PathBuf, PathBuf, PathBuf, String), String> {
     let source = canonical_dir(source_workspace, "元 workspace")?;
     let repo = crate::worktree::repo_root(&source)?;
     let repo = canonical_dir(&repo, "git リポジトリ")?;
@@ -109,9 +113,9 @@ fn source_layout(source_workspace: &Path) -> Result<(PathBuf, PathBuf, PathBuf),
         .map_err(|_| "workspace が git リポジトリの内側にありません".to_string())?
         .to_path_buf();
     // HEAD の無い repo は worktree で隔離できない。
-    crate::worktree::git_out(&repo, &["rev-parse", "--verify", "HEAD^{commit}"])
+    let head = crate::worktree::git_out(&repo, &["rev-parse", "--verify", "HEAD^{commit}"])
         .map_err(|e| format!("コミットの無い workspace では Team Run を開始できません: {e}"))?;
-    Ok((source, repo, relative))
+    Ok((source, repo, relative, head))
 }
 
 fn plain_target(path: &Path) -> Result<(), String> {
@@ -134,6 +138,7 @@ fn existing(
     repo: &Path,
     relative: &Path,
     root: &Path,
+    base_commit: &str,
 ) -> Result<RunWorkspace, String> {
     plain_target(root)?;
     let actual_root = canonical_dir(root, "Run 専用 worktree")?;
@@ -167,6 +172,7 @@ fn existing(
         repository_root: repo.display().to_string(),
         worktree_root: actual_root.display().to_string(),
         execution_workspace: execution.display().to_string(),
+        base_commit: base_commit.to_string(),
     })
 }
 
@@ -193,7 +199,7 @@ fn rollback_created(
     // relative を空にすると、対象rootそのものについて symlink / Git top-level /
     // common git directory を既存の安全境界で検証できる。別repositoryや
     // 作成後に置換されたフォルダには `git worktree remove` を実行しない。
-    existing(source_workspace, repo, Path::new(""), &target)
+    existing(source_workspace, repo, Path::new(""), &target, "")
         .map_err(|e| format!("作成したworktreeを安全に検証できないため削除しません: {e}"))?;
 
     #[cfg(test)]
@@ -219,7 +225,7 @@ fn rollback_created(
 /// 元 workspace の HEAD から、Run 専用の detached worktree を作る。
 /// 元 workspace の index / working tree は読むだけで変更しない。
 pub fn create(home: &Path, source_workspace: &Path, run_id: &str) -> Result<RunWorkspace, String> {
-    let (source, repo, relative) = source_layout(source_workspace)?;
+    let (source, repo, relative, base_commit) = source_layout(source_workspace)?;
     let root = expected_root(home, &source, run_id)?;
     let base = root
         .parent()
@@ -228,17 +234,22 @@ pub fn create(home: &Path, source_workspace: &Path, run_id: &str) -> Result<RunW
     if std::fs::symlink_metadata(&root).is_ok() {
         // worktree 作成後、対応の保存前に落ちた残骸は、同じ repo /
         // 同じ決定パスの正しい worktree と検証できたときだけ引き継ぐ。
-        return existing(&source, &repo, &relative, &root);
+        // 作成前からあるworktreeの基準点は証明できない。現在HEADを基準として
+        // 捏造すると、そこにあるdetached commitをclean扱いできるため空にする。
+        return existing(&source, &repo, &relative, &root, "");
     }
     std::fs::create_dir_all(base)
         .map_err(|e| format!("worktree 置き場を作れません ({}): {e}", base.display()))?;
     ensure_plain_layout(home, base)?;
 
     let root_text = root.to_string_lossy().into_owned();
-    crate::worktree::git_out(&repo, &["worktree", "add", "--detach", &root_text, "HEAD"])
-        .map_err(|e| format!("Run {run_id} の専用 worktree を作成できません: {e}"))?;
+    crate::worktree::git_out(
+        &repo,
+        &["worktree", "add", "--detach", &root_text, &base_commit],
+    )
+    .map_err(|e| format!("Run {run_id} の専用 worktree を作成できません: {e}"))?;
 
-    match existing(&source, &repo, &relative, &root) {
+    match existing(&source, &repo, &relative, &root, &base_commit) {
         Ok(workspace) => Ok(workspace),
         Err(original) => match rollback_created(home, &source, &repo, run_id) {
             Ok(()) => Err(original),
@@ -257,7 +268,7 @@ pub fn restore(
     run_id: &str,
     saved: &RunWorkspace,
 ) -> Result<PathBuf, String> {
-    let (source, repo, relative) = source_layout(source_workspace)?;
+    let (source, repo, relative, _) = source_layout(source_workspace)?;
     let expected = expected_root(home, &source, run_id)?;
     if Path::new(&saved.source_workspace) != source
         || Path::new(&saved.repository_root) != repo
@@ -265,7 +276,13 @@ pub fn restore(
     {
         return Err("Run の worktree 対応が現在の workspace と一致しません".to_string());
     }
-    let verified = existing(&source, &repo, &relative, &expected)?;
+    let verified = existing(
+        &source,
+        &repo,
+        &relative,
+        &expected,
+        &saved.base_commit,
+    )?;
     if &verified != saved {
         return Err("Run の実行 workspace 対応が壊れています".to_string());
     }
@@ -287,8 +304,10 @@ pub fn discover(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("Run 専用 worktree を確認できません: {e}")),
         Ok(_) => {
-            let (_, repo, relative) = source_layout(&source)?;
-            existing(&source, &repo, &relative, &root).map(Some)
+            let (_, repo, relative, _) = source_layout(&source)?;
+            // 保存前に落ちたworktreeの作成時HEADは証明できないため、
+            // 後始末では常に成果物ありへ倒す。
+            existing(&source, &repo, &relative, &root, "").map(Some)
         }
     }
 }
@@ -301,7 +320,7 @@ fn verified_for_removal(
     run_id: &str,
     saved: &RunWorkspace,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let (source, repo, relative) = source_layout(source_workspace)?;
+    let (source, repo, relative, _) = source_layout(source_workspace)?;
     let expected = expected_root(home, &source, run_id)?;
     if Path::new(&saved.source_workspace) != source
         || Path::new(&saved.repository_root) != repo
@@ -327,7 +346,13 @@ fn verified_for_removal(
         Err(e) => return Err(format!("Run 専用 worktree を確認できません: {e}")),
         Ok(_) => {}
     }
-    let verified = existing(&source, &repo, &relative, &expected)?;
+    let verified = existing(
+        &source,
+        &repo,
+        &relative,
+        &expected,
+        &saved.base_commit,
+    )?;
     if &verified != saved {
         return Err("Run の worktree 対応を完全には検証できないため削除しません".to_string());
     }
@@ -344,6 +369,16 @@ pub fn change_state(
     let (_, expected) = verified_for_removal(home, source_workspace, run_id, saved)?;
     if !expected.exists() {
         return Ok(ChangeState::Clean);
+    }
+    if saved.base_commit.is_empty() {
+        return Ok(ChangeState::Dirty);
+    }
+    let head = crate::worktree::git_out(
+        &expected,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+    )?;
+    if head != saved.base_commit {
+        return Ok(ChangeState::Dirty);
     }
     let status = crate::worktree::git_out(
         &expected,
@@ -385,6 +420,18 @@ pub fn remove_clean(
     if fault_inject::take_dirty_before_remove() {
         std::fs::write(expected.join("late-change.txt"), "late\n")
             .map_err(|e| format!("(テスト) 競合変更を作れません: {e}"))?;
+    }
+    #[cfg(test)]
+    if fault_inject::take_commit_before_remove() {
+        std::fs::write(expected.join("late-commit.txt"), "late commit\n")
+            .map_err(|e| format!("(テスト) 競合commitを作れません: {e}"))?;
+        crate::worktree::git_out(&expected, &["add", "late-commit.txt"])?;
+        crate::worktree::git_out(&expected, &["commit", "-q", "-m", "late result"])?;
+    }
+    // 最初の実測後に増えた未commit変更だけでなく、Git自身の非force削除では
+    // 守れないdetached commitも直前にもう一度拒否する。
+    if change_state(home, source_workspace, run_id, saved)? == ChangeState::Dirty {
+        return Err("Run の worktree に成果物があるため削除しません".to_string());
     }
     let dir = expected.to_string_lossy().into_owned();
     crate::worktree::git_out(&repo, &["worktree", "remove", &dir])?;
@@ -437,6 +484,7 @@ pub mod fault_inject {
         static FAIL_REMOVE: Cell<bool> = const { Cell::new(false) };
         static FAIL_ROLLBACK: Cell<bool> = const { Cell::new(false) };
         static DIRTY_BEFORE_REMOVE: Cell<bool> = const { Cell::new(false) };
+        static COMMIT_BEFORE_REMOVE: Cell<bool> = const { Cell::new(false) };
     }
 
     pub fn fail_remove_once() {
@@ -451,6 +499,10 @@ pub mod fault_inject {
         DIRTY_BEFORE_REMOVE.with(|flag| flag.set(true));
     }
 
+    pub fn commit_before_remove_once() {
+        COMMIT_BEFORE_REMOVE.with(|flag| flag.set(true));
+    }
+
     pub(super) fn take_remove_failure() -> bool {
         FAIL_REMOVE.with(|flag| flag.replace(false))
     }
@@ -461,6 +513,10 @@ pub mod fault_inject {
 
     pub(super) fn take_dirty_before_remove() -> bool {
         DIRTY_BEFORE_REMOVE.with(|flag| flag.replace(false))
+    }
+
+    pub(super) fn take_commit_before_remove() -> bool {
+        COMMIT_BEFORE_REMOVE.with(|flag| flag.replace(false))
     }
 }
 
@@ -593,6 +649,107 @@ mod tests {
     }
 
     #[test]
+    fn 基準headを保存しcommit済み成果物はclean削除しない() {
+        let Some((root, home)) = repo("committed-result") else {
+            return;
+        };
+        let source_head = crate::worktree::git_out(&root, &["rev-parse", "HEAD"]).unwrap();
+        let source_index = crate::worktree::git_out(&root, &["diff", "--cached", "--name-only"])
+            .unwrap();
+        let a = create(&home, &root, "run-committed-a").expect("Aを作成");
+        let b = create(&home, &root, "run-committed-b").expect("Bを作成");
+        assert_eq!(a.base_commit, source_head, "作成時HEADを保存していない");
+
+        let a_root = Path::new(&a.execution_workspace);
+        std::fs::write(a_root.join("seed.txt"), "committed result\n").unwrap();
+        crate::worktree::git_out(a_root, &["add", "seed.txt"]).unwrap();
+        crate::worktree::git_out(a_root, &["commit", "-q", "-m", "result"]).unwrap();
+        assert!(
+            crate::worktree::git_out(a_root, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty(),
+            "前提: commit後はworking treeがclean"
+        );
+        assert_eq!(
+            change_state(&home, &root, "run-committed-a", &a).unwrap(),
+            ChangeState::Dirty,
+            "基準HEADから動いたdetached commitをclean扱いした"
+        );
+        assert!(
+            remove_clean(&home, &root, "run-committed-a", &a).is_err(),
+            "commit済み成果物を確認なしで削除した"
+        );
+        assert!(Path::new(&a.worktree_root).is_dir());
+        assert!(Path::new(&b.worktree_root).is_dir(), "別Runを巻き込んだ");
+        assert_eq!(
+            crate::worktree::git_out(&root, &["rev-parse", "HEAD"]).unwrap(),
+            source_head,
+            "元workspaceのHEADを動かした"
+        );
+        assert_eq!(
+            crate::worktree::git_out(&root, &["diff", "--cached", "--name-only"]).unwrap(),
+            source_index,
+            "元workspaceのindexを動かした"
+        );
+
+        remove_discarded(&home, &root, "run-committed-a", &a).expect("明示破棄なら削除できる");
+        assert!(Path::new(&b.worktree_root).is_dir(), "Aの破棄でBを削除した");
+        remove_discarded(&home, &root, "run-committed-b", &b).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 削除直前にheadが進んだらclean削除を中止する() {
+        let Some((root, home)) = repo("commit-race") else {
+            return;
+        };
+        let created = create(&home, &root, "run-commit-race").unwrap();
+        fault_inject::commit_before_remove_once();
+        assert!(
+            remove_clean(&home, &root, "run-commit-race", &created).is_err(),
+            "最初の確認後に作られたdetached commitを削除した"
+        );
+        assert!(Path::new(&created.worktree_root).is_dir());
+        assert_eq!(
+            change_state(&home, &root, "run-commit-race", &created).unwrap(),
+            ChangeState::Dirty
+        );
+        remove_discarded(&home, &root, "run-commit-race", &created).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_workspaceの基準headはserde後も残り旧形式は安全側になる() {
+        let Some((root, home)) = repo("base-persistence") else {
+            return;
+        };
+        let created = create(&home, &root, "run-persist-base").unwrap();
+        let encoded = serde_json::to_value(&created).unwrap();
+        let decoded: RunWorkspace = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.base_commit, created.base_commit);
+        assert_eq!(
+            restore(&home, &root, "run-persist-base", &decoded).unwrap(),
+            PathBuf::from(&created.execution_workspace)
+        );
+
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("base_commit");
+        let legacy: RunWorkspace = serde_json::from_value(legacy).expect("旧形式を読める");
+        assert!(legacy.base_commit.is_empty(), "無い基準SHAを捏造した");
+        assert_eq!(
+            change_state(&home, &root, "run-persist-base", &legacy).unwrap(),
+            ChangeState::Dirty,
+            "基準SHAの無い旧保存をclean扱いした"
+        );
+        assert!(
+            remove_clean(&home, &root, "run-persist-base", &legacy).is_err(),
+            "旧保存のworktreeを確認なしで削除した"
+        );
+        remove_discarded(&home, &root, "run-persist-base", &legacy).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn headに無いsubdirの検証失敗は新規worktreeを戻し同じidで再試行できる() {
         let Some((root, home)) = repo("rollback-missing-subdir") else {
             return;
@@ -699,6 +856,7 @@ mod tests {
                 repository_root: root.canonicalize().unwrap().display().to_string(),
                 worktree_root: target.display().to_string(),
                 execution_workspace: target.display().to_string(),
+                base_commit: String::new(),
             };
             assert!(remove(&home, &root, "run-link", &fake).is_err());
             assert!(outside.join("canary").exists(), "symlink の先を削除した");
@@ -720,6 +878,7 @@ mod tests {
             repository_root: root.canonicalize().unwrap().display().to_string(),
             worktree_root: rogue.canonicalize().unwrap().display().to_string(),
             execution_workspace: rogue.canonicalize().unwrap().display().to_string(),
+            base_commit: String::new(),
         };
         assert!(restore(&home, &root, "run-other-repo", &fake).is_err());
         assert!(remove(&home, &root, "run-other-repo", &fake).is_err());

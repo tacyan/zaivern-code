@@ -1343,8 +1343,7 @@ impl TeamPanel {
                 continue;
             }
             let run_id = self.runs[run].run().run_id.clone();
-            let mut files = outbox::list_reports(&dir);
-            files.retain(|f| !self.outbox_skip.contains(f));
+            let mut files = outbox::list_reports_skipping(&dir, &self.outbox_skip);
             if let Some(cursor) = self.outbox_file_cursors.get(&run_id) {
                 let next = files.partition_point(|f| f <= cursor);
                 if !files.is_empty() {
@@ -2204,7 +2203,22 @@ impl TeamPanel {
             {
                 continue;
             }
-            if self.cleanup_closed_run(&id, None, record.policy).is_ok() {
+            // 通常のClose失敗ではRun保存がまだ残っている。そこに記録した
+            // base_commitを使わずworktreeを再発見すると、基準不明としてDirtyに
+            // 倒れ、clean削除の再試行まで永久に止まる。保存値は削除先には使わず、
+            // cleanup_closed_run -> verified_for_removalで決定パスと再照合する。
+            let saved_workspace = persistence::run_dir_in(root, &id).and_then(|dir| {
+                match persistence::load(&dir) {
+                    persistence::LoadOutcome::Loaded(saved) if saved.run.run_id == id => {
+                        saved.run.run_workspace.clone()
+                    }
+                    _ => None,
+                }
+            });
+            if self
+                .cleanup_closed_run(&id, saved_workspace.as_ref(), record.policy)
+                .is_ok()
+            {
                 let _ = persistence::unmark_closed(root, &id);
             }
         }
@@ -5984,6 +5998,49 @@ mod tests {
             p.pump_sessions(rows(&[&a, &b]), 101);
             assert_eq!(saw(&p, &a.owner, "#99"), 1, "同じ報告を二度取り込んだ");
             assert_eq!(saw(&p, &b.owner, "#99"), 0, "別の Run へ流れた");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        fn skip上限の後ろを本番経路で取り込める(
+            p: &mut TeamPanel,
+            a: &Lane,
+            b: &Lane,
+            report_dir: &Path,
+            now: u64,
+        ) {
+            let mut all = Vec::new();
+            for i in 0..=outbox::REPORT_LIST_MAX {
+                let file = report_dir.join(outbox::final_name("team-lead", &format!("{i:04}")));
+                std::fs::write(&file, report("team-lead", 99)).unwrap();
+                all.push(file);
+            }
+            let selected = outbox::list_reports(&a.dir);
+            assert_eq!(selected.len(), outbox::REPORT_LIST_MAX);
+            p.outbox_skip.extend(selected.iter().cloned());
+            let omitted = all
+                .into_iter()
+                .find(|file| !p.outbox_skip.contains(file))
+                .expect("上限の後ろの正常報告");
+
+            p.pump_sessions(rows(&[a, b]), now);
+
+            assert_eq!(saw(p, &a.owner, "#99"), 1, "skipの後ろをRuntimeへ配送していない");
+            assert!(!omitted.exists(), "配送した報告を片付けていない");
+        }
+
+        #[test]
+        fn root直下のskip上限後方を本番経路で処理する() {
+            let (mut p, dir, a, b) = two_lanes("outbox-skip-product-root");
+            skip上限の後ろを本番経路で取り込める(&mut p, &a, &b, &a.dir, 100);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn processing配下のskip上限後方を本番経路で処理する() {
+            let (mut p, dir, a, b) = two_lanes("outbox-skip-product-processing");
+            let slot = a.dir.join(outbox::PROCESSING_DIR).join("recovered-slot");
+            std::fs::create_dir_all(&slot).unwrap();
+            skip上限の後ろを本番経路で取り込める(&mut p, &a, &b, &slot, 100);
             std::fs::remove_dir_all(&dir).ok();
         }
 

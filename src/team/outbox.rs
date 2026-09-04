@@ -68,7 +68,7 @@
 //! 構造で保証する — `run_id` が空・`..`・区切り文字入りなら置き場そのものを
 //! 作らない)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,9 @@ pub const PROCESSING_DIR: &str = "processing";
 pub const REPORT_LIST_MAX: usize = 256;
 /// Retry台帳の上限。超過分は保持せず直ちに隔離判定へ送る。
 pub const LEDGER_MAX: usize = 1_024;
+/// 1領域で1 tickに確認するdirectory entry数。skip台帳が上限まで埋まっても、
+/// その後ろの正常候補を少なくとも`REPORT_LIST_MAX`件選べる大きさにする。
+const REPORT_SCAN_MAX: usize = REPORT_LIST_MAX + LEDGER_MAX;
 
 /// 読めないファイルを読み直す回数の上限。
 ///
@@ -621,7 +624,13 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
 ///
 /// `.json.tmp` (拡張子が `tmp`) と `rejected/` (ディレクトリ) は
 /// 構造的に外れる。
+#[cfg(test)]
 pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
+    list_reports_skipping(dir, &HashSet::new())
+}
+
+/// この起動で再処理しない報告を、件数上限を適用する前に除いて並べる。
+pub fn list_reports_skipping(dir: &Path, skip: &HashSet<PathBuf>) -> Vec<PathBuf> {
     // Run の置き場自体が symlink / junction へ差し替えられても、リンク先の
     // ファイルを報告として読まない。metadata は必ずリンク非追従で見る。
     let Some(parent) = dir.parent() else {
@@ -636,33 +645,44 @@ pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
     if !meta.file_type().is_dir() {
         return Vec::new();
     }
-    let mut files = regular_reports_in(dir, REPORT_LIST_MAX);
+    let mut files = Vec::new();
+    let mut root_budget = REPORT_SCAN_MAX;
+    regular_reports_in(dir, skip, &mut root_budget, &mut files);
     let processing = dir.join(PROCESSING_DIR);
-    if files.len() < REPORT_LIST_MAX
-        && std::fs::symlink_metadata(&processing).is_ok_and(|m| m.file_type().is_dir())
-    {
-        let remaining = REPORT_LIST_MAX - files.len();
+    if std::fs::symlink_metadata(&processing).is_ok_and(|m| m.file_type().is_dir()) {
+        let mut slots = Vec::new();
+        let mut processing_budget = REPORT_SCAN_MAX;
         if let Ok(rd) = std::fs::read_dir(&processing) {
-            for slot in rd.filter_map(|e| e.ok()).take(remaining) {
-                if files.len() >= REPORT_LIST_MAX {
-                    break;
-                }
+            for slot in rd.filter_map(|e| e.ok()).take(REPORT_SCAN_MAX) {
                 let Ok(kind) = slot.file_type() else { continue };
                 if kind.is_file() {
                     let path = slot.path();
-                    if path.extension().is_some_and(|x| x == FINAL_EXT) {
+                    if path.extension().is_some_and(|x| x == FINAL_EXT)
+                        && !skip.contains(&path)
+                    {
                         files.push(path);
                     }
                 } else if kind.is_dir() {
-                    files.extend(regular_reports_in(
-                        &slot.path(),
-                        REPORT_LIST_MAX - files.len(),
-                    ));
+                    slots.push(slot.path());
                 }
             }
         }
+        slots.sort();
+        for slot in slots {
+            if processing_budget == 0 {
+                break;
+            }
+            regular_reports_in(
+                &slot,
+                skip,
+                &mut processing_budget,
+                &mut files,
+            );
+        }
     }
     files.sort();
+    files.dedup();
+    files.truncate(REPORT_LIST_MAX);
     files
 }
 
@@ -670,16 +690,28 @@ fn plain_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
-fn regular_reports_in(dir: &Path, limit: usize) -> Vec<PathBuf> {
+fn regular_reports_in(
+    dir: &Path,
+    skip: &HashSet<PathBuf>,
+    budget: &mut usize,
+    files: &mut Vec<PathBuf>,
+) {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return;
     };
-    rd.filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == FINAL_EXT))
-        .take(limit)
-        .collect()
+    for entry in rd.filter_map(|entry| entry.ok()) {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == FINAL_EXT) && !skip.contains(&path) {
+            files.push(path);
+        }
+    }
 }
 
 /// 原本を読み始める前に同じfilesystem内のprocessingへ原子的に移す。
@@ -1348,6 +1380,43 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["agent-1-2.json".to_string(), "agent-1.json".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn skip上限回帰(list_root: &Path, report_dir: &Path) {
+        let mut all = Vec::new();
+        for i in 0..=REPORT_LIST_MAX {
+            let path = report_dir.join(final_name("agent-1", &format!("{i:04}")));
+            std::fs::write(&path, "{}").unwrap();
+            all.push(path);
+        }
+        let first = list_reports(list_root);
+        assert_eq!(first.len(), REPORT_LIST_MAX, "前提: 列挙上限まで選ばれる");
+        let skip: HashSet<PathBuf> = first.into_iter().collect();
+        let omitted = all
+            .into_iter()
+            .find(|path| !skip.contains(path))
+            .expect("上限の後ろに1件ある");
+        let got = list_reports_skipping(list_root, &skip);
+        assert_eq!(got, vec![omitted], "skipの後ろの正常報告が飢餓した");
+    }
+
+    #[test]
+    fn root直下は列挙上限より前にskipを除く() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "skip-before-limit-root");
+        skip上限回帰(&dir, &dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn processing配下も列挙上限より前にskipを除く() {
+        let dir = crate::test_util::unique_temp_dir(
+            "zaivern-outbox",
+            "skip-before-limit-processing",
+        );
+        let slot = dir.join(PROCESSING_DIR).join("slot");
+        std::fs::create_dir_all(&slot).unwrap();
+        skip上限回帰(&dir, &slot);
         std::fs::remove_dir_all(&dir).ok();
     }
 

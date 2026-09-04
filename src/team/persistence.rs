@@ -61,7 +61,9 @@ use super::model::{Decision, TeamAgent, TeamEvent, TeamGoal, TeamGroup, TeamTask
 ///   直前の完全なスナップショットは `state.prev.json` に残す。
 /// * 5 — 元 workspace と Run 専用 git worktree の対応を保存する。
 ///   エージェント起動・検証・changeset 計測は後者、状態の置き場は前者を使う。
-pub const SCHEMA_VERSION: u32 = 5;
+/// * 6 — Run専用worktreeを作った基準commitを保存し、detached HEAD上で
+///   commitされた成果物も削除確認とchangesetの対象にする。
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// events.jsonl の行数上限 (超えたら古い行から落とす)。
 pub const EVENT_LOG_MAX_LINES: usize = 5_000;
@@ -1260,6 +1262,55 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         crate::test_util::unique_temp_dir("zaivern-team-persist", name)
+    }
+
+    #[test]
+    fn run_workspaceの基準commitを保存復元し旧schemaの欠落は空で読む() {
+        let dir = tmp("run-workspace-base");
+        let mut state = saved();
+        state.run.workspace = "source".into();
+        state.run.run_workspace = Some(super::super::run_workspace::RunWorkspace {
+            source_workspace: "source".into(),
+            repository_root: "repo".into(),
+            worktree_root: "worktree".into(),
+            execution_workspace: "execution".into(),
+            base_commit: "a".repeat(40),
+        });
+        save(&dir, &state).unwrap();
+        let loaded = match load(&dir) {
+            LoadOutcome::Loaded(saved) => *saved,
+            other => panic!("保存した基準commitを復元できない: {other:?}"),
+        };
+        assert_eq!(
+            loaded.run.run_workspace.as_ref().unwrap().base_commit,
+            "a".repeat(40)
+        );
+
+        let path = dir.join(STATE_FILE);
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["version"] = serde_json::Value::from(5);
+        raw["run"]["version"] = serde_json::Value::from(5);
+        raw["run"]["run_workspace"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_commit");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let legacy = match load(&dir) {
+            LoadOutcome::Loaded(saved) => *saved,
+            other => panic!("旧schemaを安全に読めない: {other:?}"),
+        };
+        assert!(
+            legacy
+                .run
+                .run_workspace
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .is_empty(),
+            "欠落した基準commitを現在値で捏造した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

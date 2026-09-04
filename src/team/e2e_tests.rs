@@ -179,6 +179,7 @@ impl Lab {
             eprintln!("[skip] e2e: git を使えないので実測を差し替えます");
             test_hooks::set_baseline(Some(super::changeset::FileBaseline {
                 complete: true,
+                head_commit: "0".repeat(40),
                 ..Default::default()
             }));
             test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {

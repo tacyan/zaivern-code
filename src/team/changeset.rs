@@ -79,6 +79,9 @@ pub struct FileBaseline {
     /// 取った時刻 (Unix 秒)。
     #[serde(default)]
     pub taken_at: u64,
+    /// 基準点を取った時点のHEAD。空は旧保存形式で、測定不能として扱う。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head_commit: String,
     /// 汚れていたファイルの指紋 (正規化済みの相対パス → 指紋)。
     #[serde(default)]
     pub entries: BTreeMap<String, Option<Fingerprint>>,
@@ -93,13 +96,14 @@ pub struct FileBaseline {
 impl FileBaseline {
     /// 測れる基準点か。
     pub fn usable(&self) -> bool {
-        self.complete
+        self.complete && valid_commit_id(&self.head_commit)
     }
 
     /// 測れなかったことを表す基準点。
     pub fn unavailable(why: impl Into<String>) -> Self {
         Self {
             taken_at: super::model::now_secs(),
+            head_commit: String::new(),
             entries: BTreeMap::new(),
             complete: false,
             why: why.into(),
@@ -173,16 +177,33 @@ impl MeasureError {
 
 /// 配る直前の基準点を取る。
 ///
-/// **失敗を `Err` で返す。** 空の基準点を返すと、呼び出し側が
-/// 「何も汚れていなかった」と読み違える。
+/// **失敗を `Err` で返す。** ただし`git init`直後のunborn branchは、
+/// 既存の準備処理が現在の汚れを確認できるよう、理由つきの測定不能な
+/// 基準点として返す。空の基準点を測定可能とは扱わない。
 pub fn capture_baseline(workspace: &Path) -> Result<FileBaseline, MeasureError> {
+    let (head_commit, complete, why) = match current_head(workspace) {
+        Ok(head) => (head, true, String::new()),
+        Err(_head_error)
+            if crate::worktree::git_out(workspace, &["symbolic-ref", "-q", "HEAD"]).is_ok() =>
+        {
+            // git init直後のunborn branch。従来どおり現在の汚れは記録するが、
+            // 比較元commitが無いのでこの基準点を測定可能とは扱わない。
+            (
+                String::new(),
+                false,
+                "Git HEADに基準commitがありません".to_string(),
+            )
+        }
+        Err(head_error) => return Err(head_error),
+    };
     let paths = dirty_paths(workspace)?;
     let entries = fingerprint_all(workspace, &paths)?;
     Ok(FileBaseline {
         taken_at: super::model::now_secs(),
+        head_commit,
         entries,
-        complete: true,
-        why: String::new(),
+        complete,
+        why,
     })
 }
 
@@ -208,9 +229,31 @@ pub fn capture_baseline(workspace: &Path) -> Result<FileBaseline, MeasureError> 
 /// 見えなくなる** (実際にそうなった)。
 pub fn measure(workspace: &Path, base: &FileBaseline) -> Result<Vec<MeasuredChange>, MeasureError> {
     if !base.usable() {
-        return Err(MeasureError::NoBaseline(base.why.clone()));
+        let why = if base.why.is_empty() && base.head_commit.is_empty() {
+            "基準HEADが保存されていません".to_string()
+        } else {
+            base.why.clone()
+        };
+        return Err(MeasureError::NoBaseline(why));
     }
-    let entries = dirty_paths(workspace)?;
+    // 基準commitから現在のindex/working treeまでを直接比較する。これにより、
+    // 途中でcommitされて現在の`git status`から消えた成果物も残る。
+    let mut merged: BTreeMap<String, [u8; 2]> = changed_paths(workspace, &base.head_commit)?
+        .into_iter()
+        .map(|entry| (entry.path, entry.code))
+        .collect();
+    // `git diff`に出ない未追跡ファイルを加える。既に基準commitとの差分に
+    // 出るパスは上書きせず、最終状態に対するChangeKindを維持する。
+    for entry in dirty_paths(workspace)? {
+        merged.entry(entry.path).or_insert(entry.code);
+    }
+    if merged.len() > MAX_TRACKED_PATHS {
+        return Err(MeasureError::TooMany(merged.len()));
+    }
+    let entries: Vec<DirtyEntry> = merged
+        .into_iter()
+        .map(|(path, code)| DirtyEntry { path, code })
+        .collect();
     let now = fingerprint_all(workspace, &entries)?;
     let codes: BTreeMap<&str, [u8; 2]> = entries
         .iter()
@@ -443,6 +486,74 @@ fn canon(p: &Path) -> PathBuf {
 
 // ── git ──────────────────────────────────────────────────────────────
 
+/// 現在のHEADを完全なcommit IDで取る。失敗・空値を基準点にしない。
+fn current_head(workspace: &Path) -> Result<String, MeasureError> {
+    if crate::git::discover_toplevel(workspace).is_none() {
+        return Err(MeasureError::NotGitRepo);
+    }
+    let out = run_git(workspace, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let head = std::str::from_utf8(&out)
+        .map_err(|_| MeasureError::GitFailed("HEADをUTF-8として読めません".into()))?
+        .trim()
+        .to_string();
+    if !valid_commit_id(&head) {
+        return Err(MeasureError::GitFailed("HEADの形式が不正です".into()));
+    }
+    Ok(head)
+}
+
+/// 保存データ由来の値をGitの引数へ渡せる、完全なSHA-1/SHA-256 IDか。
+fn valid_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// 基準commitと現在のindex/working treeの差分。renameは削除+追加に分ける。
+fn changed_paths(workspace: &Path, base_commit: &str) -> Result<Vec<DirtyEntry>, MeasureError> {
+    let out = run_git(
+        workspace,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            "--no-ext-diff",
+            "--relative",
+            base_commit,
+            "--",
+        ],
+    )?;
+    let mut fields = out.split(|byte| *byte == 0).filter(|field| !field.is_empty());
+    let mut entries = Vec::new();
+    while let Some(status) = fields.next() {
+        let path = fields.next().ok_or_else(|| {
+            MeasureError::GitFailed("git diffのname-status出力が途中で切れています".into())
+        })?;
+        if status.len() != 1 {
+            return Err(MeasureError::GitFailed(
+                "git diffの状態コードを解釈できません".into(),
+            ));
+        }
+        let path = std::str::from_utf8(path)
+            .map_err(|_| MeasureError::GitFailed("ファイル名をUTF-8として読めません".into()))?;
+        if path.is_empty() {
+            continue;
+        }
+        if !inside_workspace(workspace, path) {
+            return Err(MeasureError::Escapes(path.to_string()));
+        }
+        entries.push(DirtyEntry {
+            path: crate::lease::normalize_path(path),
+            code: [status[0], b' '],
+        });
+        if entries.len() > MAX_TRACKED_PATHS {
+            return Err(MeasureError::TooMany(entries.len()));
+        }
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.dedup_by(|a, b| a.path == b.path);
+    Ok(entries)
+}
+
 /// 作業ツリーで**HEAD と違うファイル**の一覧 (追跡外も含む)。
 ///
 /// `--no-renames` を付けるのは、rename を「消えた + 増えた」の 2 件として
@@ -460,6 +571,7 @@ fn dirty_paths(workspace: &Path) -> Result<Vec<DirtyEntry>, MeasureError> {
             "-z",
             "--untracked-files=all",
             "--no-renames",
+            "--ignore-submodules=none",
         ],
     )?;
     let mut entries: Vec<DirtyEntry> = Vec::new();
@@ -655,6 +767,107 @@ fn hash_stream(abs: &Path, budget: &mut u64) -> Result<Option<Fingerprint>, Meas
         hash: hasher.finish(),
         len,
     }))
+}
+
+#[cfg(test)]
+mod git_measure_tests {
+    use super::*;
+
+    fn repo(tag: &str) -> Option<PathBuf> {
+        let root = crate::test_util::unique_temp_dir("zai-team-changeset", tag);
+        std::fs::create_dir_all(&root).ok()?;
+        std::fs::write(root.join("modified.txt"), "before\n").ok()?;
+        std::fs::write(root.join("deleted.txt"), "delete me\n").ok()?;
+        let ok = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !ok(&["init", "-q"])
+            || !ok(&["config", "user.email", "team@example.invalid"])
+            || !ok(&["config", "user.name", "Team"])
+            || !ok(&["config", "commit.gpgsign", "false"])
+            || !ok(&["add", "modified.txt", "deleted.txt"])
+            || !ok(&["commit", "-q", "-m", "base"])
+        {
+            std::fs::remove_dir_all(&root).ok();
+            return None;
+        }
+        Some(root)
+    }
+
+    #[test]
+    fn commit済みのadd_modify_deleteと後続の未commit変更を重複なく測る() {
+        let Some(root) = repo("committed-and-working") else {
+            return;
+        };
+        let base = capture_baseline(&root).expect("基準点");
+        assert!(!base.head_commit.is_empty(), "基準HEADを保存していない");
+
+        std::fs::write(root.join("modified.txt"), "committed\n").unwrap();
+        std::fs::write(root.join("added.txt"), "added\n").unwrap();
+        std::fs::remove_file(root.join("deleted.txt")).unwrap();
+        run_git(&root, &["add", "-A"]).unwrap();
+        run_git(&root, &["commit", "-q", "-m", "result"]).unwrap();
+
+        let committed = measure(&root, &base).expect("commit済み差分を測れる");
+        assert_eq!(
+            committed,
+            vec![
+                MeasuredChange {
+                    path: "added.txt".into(),
+                    kind: ChangeKind::Added,
+                },
+                MeasuredChange {
+                    path: "deleted.txt".into(),
+                    kind: ChangeKind::Deleted,
+                },
+                MeasuredChange {
+                    path: "modified.txt".into(),
+                    kind: ChangeKind::Modified,
+                },
+            ],
+            "cleanなcommit済み成果物がchangesetから消えた"
+        );
+
+        std::fs::write(root.join("modified.txt"), "working\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+        let both = measure(&root, &base).expect("commit済みと未commitを一緒に測れる");
+        assert_eq!(
+            both.iter().filter(|c| c.path == "modified.txt").count(),
+            1,
+            "同じファイルをcommit済み差分と未commit差分で二重計上した"
+        );
+        assert!(both.iter().any(|c| c.path == "untracked.txt" && c.kind == ChangeKind::Added));
+        assert!(both.iter().any(|c| c.path == "added.txt" && c.kind == ChangeKind::Added));
+        assert!(both.iter().any(|c| c.path == "deleted.txt" && c.kind == ChangeKind::Deleted));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn 基準headが無い旧baselineと不正値はgitへ渡さず測定不能にする() {
+        let Some(root) = repo("legacy-baseline") else {
+            return;
+        };
+        for head_commit in [String::new(), "--output=/outside".to_string()] {
+            let old = FileBaseline {
+                taken_at: 1,
+                head_commit,
+                entries: BTreeMap::new(),
+                complete: true,
+                why: String::new(),
+            };
+            assert!(!old.usable());
+            assert!(matches!(measure(&root, &old), Err(MeasureError::NoBaseline(_))));
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 
