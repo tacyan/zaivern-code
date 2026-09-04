@@ -116,6 +116,14 @@ fn cap(mut body: String, required_tail: String) -> String {
 ///
 /// 名前と形の取り決めは [`super::outbox`] が持つ 1 か所から引く。ここで
 /// 別に綴ると、教えた名前を読む側が受け付けない食い違いが黙って起きる。
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> String {
     if outbox.as_os_str().is_empty() {
         return String::new();
@@ -125,6 +133,12 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
     let fin = super::outbox::final_name(agent_id, "<一意な値>");
     let ex_tmp = super::outbox::tmp_name(agent_id, "1712345678");
     let ex_fin = super::outbox::final_name(agent_id, "1712345678");
+    let ex_tmp_path = outbox.join(&ex_tmp).display().to_string();
+    let ex_fin_path = outbox.join(&ex_fin).display().to_string();
+    let posix_tmp = posix_single_quote(&ex_tmp_path);
+    let posix_fin = posix_single_quote(&ex_fin_path);
+    let powershell_tmp = powershell_single_quote(&ex_tmp_path);
+    let powershell_fin = powershell_single_quote(&ex_fin_path);
     format!(
         "\n## 提出のしかた (**これが正式な経路**)\n\
          報告・判定・伝言・出来事は、下の JSON を**ファイルとして提出**してください。\n\
@@ -134,8 +148,8 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
          1. 一時ファイル `{dir}/{tmp}` へ JSON 全体を書き切る\n\
          \x20  (`<一意な値>` は時刻や乱数など毎回違う値。例: `{ex_tmp}`)\n\
          2. 書き終えてから、**同じフォルダの中で** `.tmp` を外した名前 `{dir}/{fin}` へ改名する\n\
-         \x20  macOS / Linux: `mv '{dir}/{ex_tmp}' '{dir}/{ex_fin}'`\n\
-         \x20  Windows (PowerShell): `Move-Item '{dir}\\{ex_tmp}' '{dir}\\{ex_fin}'`\n\
+         \x20  macOS / Linux: `mv {posix_tmp} {posix_fin}`\n\
+         \x20  Windows (PowerShell): `Move-Item {powershell_tmp} {powershell_fin}`\n\
          3. `.json` へ直接は書かない。`.tmp` のままのファイルは提出になりません\n\n\
          中身は**この包み**にしてください。`payload` には下の各節が示す JSON を\n\
          そのまま入れます。\n\n\
@@ -540,6 +554,42 @@ mod tests {
                 "{name}担当: 教えた名前を読む側が受け付けない"
             );
         }
+    }
+
+    /// outbox の絶対パスは利用者が決める。空白や Unicode は引用だけで扱えるが、
+    /// シングルクォートをそのまま単一引用符の内側へ差し込むと、POSIX shell と
+    /// PowerShell のどちらでもそこで引用が終わり、例示した改名コマンドが壊れる。
+    #[test]
+    fn 提出先パスをposixとpowershellの規則で安全に引用する() {
+        assert_eq!(posix_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(powershell_single_quote("a'b"), "'a''b'");
+        let g = goal();
+        let mut t = task(1, "a", &[]);
+        t.assigned_agent = Some(super::super::model::AgentId::new("impl-1"));
+        let mut b = brief(&g, &t);
+        b.outbox = std::path::PathBuf::from("/tmp/Team's 日本語 outbox");
+
+        let text = implementer(&b);
+        let tmp = super::super::outbox::tmp_name("impl-1", "1712345678");
+        let fin = super::super::outbox::final_name("impl-1", "1712345678");
+        let tmp_path = b.outbox.join(tmp).display().to_string();
+        let fin_path = b.outbox.join(fin).display().to_string();
+        assert!(
+            text.contains(&format!(
+                "mv {} {}",
+                posix_single_quote(&tmp_path),
+                posix_single_quote(&fin_path)
+            )),
+            "POSIX shell の単一引用符として安全にエスケープされていない"
+        );
+        assert!(
+            text.contains(&format!(
+                "Move-Item {} {}",
+                powershell_single_quote(&tmp_path),
+                powershell_single_quote(&fin_path)
+            )),
+            "PowerShell の単一引用符として安全にエスケープされていない"
+        );
     }
 
     /// **サブエージェントの知らせ方を、指示文が必ず伝える。**

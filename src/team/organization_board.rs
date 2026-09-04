@@ -1448,10 +1448,7 @@ fn git_needed_row(ui: &mut egui::Ui, theme: &Theme, needs_git: bool, acts: &mut 
     ui.separator();
 }
 
-/// **同時に走っている Run の切り替え。**
-///
-/// 1 本しか無いときは**出さない** (常に 1 つしか無い選択肢は、
-/// 場所を取るだけで何も選ばせない)。
+/// Run の切り替えと終了。1 本でも終了ボタンは必要なので行を出す。
 fn run_tabs_row(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1459,7 +1456,7 @@ fn run_tabs_row(
     active: usize,
     acts: &mut Vec<BoardAction>,
 ) {
-    if runs.len() < 2 {
+    if runs.is_empty() {
         return;
     }
     ui.horizontal_wrapped(|ui| {
@@ -1467,8 +1464,11 @@ fn run_tabs_row(
             // 進行中かどうかは記号で示す (色は補助)。
             let mark = if *running { "▶" } else { "✓" };
             let label = format!("{mark} {}", ellipsis(title, 20));
-            let r = ui.selectable_label(i == active, RichText::new(label).color(theme.text));
-            if r.clicked() {
+            let r = ui.selectable_label(
+                runs.len() > 1 && i == active,
+                RichText::new(label).color(theme.text),
+            );
+            if runs.len() > 1 && r.clicked() {
                 acts.push(BoardAction::SelectRun(i));
             }
             // 閉じるのは**いま出している 1 本だけ**に出す。全部に出すと

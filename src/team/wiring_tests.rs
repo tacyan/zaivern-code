@@ -343,6 +343,26 @@ fn 走査は間隔を空けてから行う() {
 }
 
 #[test]
+fn 最後のrunを閉じた後も停止effectを実行する() {
+    // close_run は Runtime を先に外し、停止だけを pending_stops に残す。
+    // `has_run == false` で即 return すると、その停止は実行側へ一度も届かず
+    // 担当プロセスが孤児になる。Run 無し分岐でも live_work を見て Effect を
+    // drain する配線を番人にする。
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_tick").expect("駆動がある"));
+    let no_run = body
+        .split_once("if !has_run")
+        .map(|(_, rest)| rest)
+        .expect("Run 無し分岐が無い");
+    let before_return = no_run.split_once("return;").map(|(head, _)| head).unwrap();
+    assert!(
+        before_return.contains("p.live_work().is_busy()")
+            && before_return.contains("self.team_run_effects(ctx)"),
+        "Run が消えた直後の Stop/検証後始末を実行していない"
+    );
+}
+
+#[test]
 fn 検証コマンドの解析失敗を黙って捨てない() {
     // **元の不具合そのもの。** `filter(|s| parse_command(s).is_ok())` と
     // 書くと、SPEC に書かれた検証が黙って消え、残りが 0 件になると
@@ -1545,7 +1565,11 @@ fn 四種類とも置き場から受理する経路がある() {
 #[test]
 fn 置き場のファイルは受理してから消す() {
     let p = src(PANEL);
-    let body = function_body(&p, p.find("fn drain_outbox").expect("取り込み"));
+    let body = function_body(
+        &p,
+        p.find("fn process_outbox_file")
+            .expect("一ファイルの取り込み"),
+    );
     let accept = body.find("accept_outbox").expect("受理を通していない");
     let remove = body.find("remove_file").expect("消していない");
     assert!(
@@ -1582,7 +1606,16 @@ fn 指示文は四種類とも置き場へ出すよう教える() {
         assert!(sec.contains(k), "提出の作法が {k} を教えていない");
     }
     // 原子公開の手順 (OS ごと) と、包みの形。
-    for needle in ["tmp_name", "final_name", "mv '", "Move-Item", "payload", "run_id"] {
+    for needle in [
+        "tmp_name",
+        "final_name",
+        "posix_single_quote",
+        "mv {posix_tmp} {posix_fin}",
+        "powershell_single_quote",
+        "Move-Item {powershell_tmp} {powershell_fin}",
+        "payload",
+        "run_id",
+    ] {
         assert!(sec.contains(needle), "提出の作法に {needle} が無い:\n{sec}");
     }
     // 種別ごとの案内も繋がっていること。

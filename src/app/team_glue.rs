@@ -93,7 +93,15 @@ impl ZaivernApp {
 
         let has_run = panel::with_panel(|p| p.has_run());
         if !has_run {
+            // 最後の Run を閉じた直後も Stop やキャンセル中の検証は残る。
+            // `has_run` だけで戻ると、盤面から消えた子プロセスが孤児になる。
+            if panel::with_panel(|p| p.live_work().is_busy()) {
+                self.team_run_effects(ctx);
+            }
             self.team_board_ui(ctx);
+            if panel::with_panel(|p| p.live_work().is_busy()) {
+                crate::perf::repaint_after(ctx, panel::SCAN_INTERVAL, "team_cleanup");
+            }
             return;
         }
 

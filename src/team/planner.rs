@@ -534,9 +534,6 @@ impl StaticPlanner {
 
         // タスクの見出しと本文 (選び方は `implementation_seeds` に 1 本だけ置く)。
         let mut raw_tasks = implementation_seeds(&sections, &title);
-        // **SPEC が既に分割されているか。** 分割済みなら実装を待たせない
-        // (待たせると、8 件並べる計画でも最初の 2 段は 1 体しか動かない)。
-        let broken_down = raw_tasks.len() >= MIN_PARALLEL_TASKS;
         // 実装タスクは「最大同時数の 2 倍」までに抑える。
         // 細かく割りすぎると割り当てが往復するだけで進まない。
         let cap = input.agent_count.max(1).saturating_mul(2).clamp(2, 24);
@@ -614,6 +611,22 @@ impl StaticPlanner {
             lead_role: "integrator".into(),
         });
 
+        let raw_roles: Vec<R> = raw_tasks
+            .iter()
+            .map(|task| super::plan_schema::role_of("", &task.title))
+            .collect();
+        let raw_keys: Vec<String> = (0..raw_tasks.len())
+            .map(|i| format!("impl-{:02}", i + 1))
+            .collect();
+        let keys_for = |role: R| {
+            raw_roles
+                .iter()
+                .zip(&raw_keys)
+                .filter(|(candidate, _)| **candidate == role)
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>()
+        };
+
         let mut tasks: Vec<TaskDoc> = Vec::new();
         let mut impl_keys: Vec<String> = Vec::new();
         // 計画担当を選んだなら、**いちばん先頭**に 1 本置く。
@@ -646,6 +659,11 @@ impl StaticPlanner {
             });
             key
         });
+        let planning_keys: Vec<String> = plan_key
+            .iter()
+            .cloned()
+            .chain(keys_for(R::Planner))
+            .collect();
         // 設計担当を選んだなら、実装の前に 1 本置く (実装はこれに依存する)。
         let design_key = want(R::Architect).then(|| {
             let key = "design".to_string();
@@ -658,12 +676,9 @@ impl StaticPlanner {
                 ),
                 team: "architecture".into(),
                 role: "architect".into(),
-                // 分割済みなら計画担当と並行してよい (どちらも書き物)。
-                depends_on: if broken_down {
-                    Vec::new()
-                } else {
-                    plan_key.iter().cloned().collect()
-                },
+                // 分割済みでも、Planner が確定する前の設計を最終設計として
+                // 扱わない。役割を選んだ以上は依存を順序として表す。
+                depends_on: planning_keys.clone(),
                 files: Vec::new(),
                 required_caps: Vec::new(),
                 acceptance_criteria: vec![
@@ -674,6 +689,11 @@ impl StaticPlanner {
             });
             key
         });
+        let design_keys: Vec<String> = design_key
+            .iter()
+            .cloned()
+            .chain(keys_for(R::Architect))
+            .collect();
         // **2 つ以上の節に出てくるファイルは、誰の持ち物でもない。**
         //
         // 散文から拾うと、書く側だけでなく**読む側の節にも同じ名前が出る**
@@ -716,7 +736,8 @@ impl StaticPlanner {
                 files = files_in_text(&format!("{}\n{}", t.title, t.body));
                 files.retain(|f| !shared.contains(f));
             }
-            let key = format!("impl-{:02}", i + 1);
+            let key = raw_keys[i].clone();
+            let role = raw_roles[i];
             impl_keys.push(key.clone());
             tasks.push(TaskDoc {
                 key,
@@ -727,37 +748,26 @@ impl StaticPlanner {
                 // 一律 `implementer` にすると、テストにもレビューにも統合にも
                 // 「あなたは実装担当です」という指示文が飛ぶ
                 // (指示文を選ぶ根拠がこの欄しかない)。
-                role: super::plan_schema::role_of("", &label).key().to_string(),
-                // **既に分割されている SPEC では、実装を待たせない。**
-                //
-                // 計画 → 設計 → 実装 と直列に繋ぐと、実装が 8 件並べる計画でも
-                // 最初の 2 段のあいだ**1 体しか動かない** (実測: 「稼働 2 /
-                // Implementation 0/8 担当がいません」)。分割済みの SPEC では
-                // 計画担当と設計担当の仕事は**実装と並行してよい書き物**なので、
-                // 待たせる理由が無い (統合が両方を待つので、成果は取りこぼさない)。
-                //
-                // 分割されていない SPEC (実装 1 件) のときだけ、従来どおり
-                // 計画 → 設計 → 実装 と繋ぐ — そこでは分割そのものが仕事になる。
+                role: role.key().to_string(),
+                // Planner → Architect → Implementer の確定順を守る。分割済み
+                // SPEC でも、設計が未確定のまま実装を始めれば同じファイルを
+                // 作り直すか、互換性のない成果を最後に競合させることになる。
+                // 同じ段の実装タスク同士は依存させないので、設計後は並列。
                 // **整合担当だけは他を待つ。** 実測で、依存を持たない
                 // `integrator:` の節が即座に配られ、「#1/#2/#4/#5/#6 が
                 // 未完了」という当然の理由で `blocked` → 人の判断待ちに
                 // なった (骨組みの重複を消したときに、依存を落としすぎた)。
                 // 待たせれば担当の席が空くので、そのぶんレビューへ回せる。
-                depends_on: if super::plan_schema::role_of("", &label)
-                    == super::model::TeamRole::Integrator
-                {
+                depends_on: if role == R::Integrator {
                     (0..raw_tasks.len())
                         .filter(|j| *j != i)
-                        .map(|j| format!("impl-{:02}", j + 1))
+                        .map(|j| raw_keys[j].clone())
                         // 骨組みの書き物も待つ (**まだ書かれていない設計を
                         // 前提に締めない**)。既存の統合タスクと同じ考え方。
                         .chain(plan_key.iter().cloned())
                         .chain(design_key.iter().cloned())
                         .collect()
-                } else if matches!(
-                    super::plan_schema::role_of("", &label),
-                    super::model::TeamRole::Tester | super::model::TeamRole::Reviewer
-                ) {
+                } else if matches!(role, R::Tester | R::Reviewer) {
                     // **確かめる担当は、確かめるものができてから配る。**
                     //
                     // 実測 (2 体の HP): 依存の無い `tester:` が実装と同時に配られ、
@@ -768,20 +778,18 @@ impl StaticPlanner {
                     // 席も 1 つ空き、そのぶんトークンも使わない。
                     (0..raw_tasks.len())
                         .filter(|j| {
-                            *j != i
-                                && super::plan_schema::role_of("", &raw_tasks[*j].title)
-                                    == super::model::TeamRole::Implementer
+                            *j != i && raw_roles[*j] == R::Implementer
                         })
-                        .map(|j| format!("impl-{:02}", j + 1))
+                        .map(|j| raw_keys[j].clone())
                         .collect()
-                } else if broken_down {
+                } else if role == R::Planner {
                     Vec::new()
+                } else if role == R::Architect {
+                    planning_keys.clone()
+                } else if role == R::Implementer && !design_keys.is_empty() {
+                    design_keys.clone()
                 } else {
-                    design_key
-                        .clone()
-                        .or_else(|| plan_key.clone())
-                        .into_iter()
-                        .collect()
+                    planning_keys.clone()
                 },
                 files,
                 required_caps: Vec::new(),
@@ -809,7 +817,10 @@ impl StaticPlanner {
                     .into(),
                 team: "qa".into(),
                 role: "tester".into(),
-                depends_on: impl_keys.clone(),
+                // 実装成果だけを待つ。`impl_keys` には SPEC 側の Reviewer /
+                // Integrator も含まれるため全部を待つと、後段から Tester へ
+                // 戻る依存ができて循環する。設計は Implementer 経由で待てる。
+                depends_on: keys_for(R::Implementer),
                 files: Vec::new(),
                 required_caps: Vec::new(),
                 acceptance_criteria: vec![
@@ -820,6 +831,16 @@ impl StaticPlanner {
             });
             key
         });
+        // SPEC 自身が Integrator を持ち、Tester だけを骨組みで補った場合も、
+        // 最終テストより先に統合を配らない。raw task は test_key より先に
+        // 構築されるため、生成後に依存を結ぶ。
+        if let Some(test) = &test_key {
+            for task in tasks.iter_mut().filter(|task| task.role == R::Integrator.key()) {
+                if !task.depends_on.contains(test) {
+                    task.depends_on.push(test.clone());
+                }
+            }
+        }
 
         // 統合タスク。**全実装タスクの完了に依存する。**
         // **統合は全部を待つ。** 並行させた計画・設計の書き物も含める —
@@ -953,7 +974,7 @@ pub fn needs_spec_rewrite(spec: &str) -> bool {
         .find(|s| !s.title.is_empty())
         .map(|s| s.title.clone())
         .unwrap_or_default();
-    implementation_titles(&sections, &title).len() < 2
+    implementation_titles(&sections, &title).len() < MIN_PARALLEL_TASKS
 }
 
 /// 自動決定した候補のうち、**実行できるものだけ**を残す。
@@ -1693,13 +1714,9 @@ mod tests {
         );
     }
 
-    /// **分割済みの SPEC では、実装が最初から並列で動ける。**
-    ///
-    /// 実測 (0.23.0): Spec Writer が 9 タスクへ分割した SPEC でも、計画 →
-    /// 設計 → 実装 と直列に繋いでいたので、盤面は「**稼働 2 /
-    /// Implementation 0/8 担当がいません**」のまま最初の 2 段を待っていた。
+    /// **分割済みの SPEC は、設計確定後に実装が並列で動ける。**
     #[test]
-    fn 分割済みのspecでは実装が最初から動ける() {
+    fn 分割済みのspecは設計確定後に実装が並列で動ける() {
         use super::super::model::TeamRole as R;
         let mut inp = input(SPEC);
         inp.roles = super::super::panel::NewRunForm::default().roles;
@@ -1707,17 +1724,20 @@ mod tests {
         let impls: Vec<&super::super::model::TeamTask> =
             p.tasks.iter().filter(|t| t.role == R::Implementer).collect();
         assert!(impls.len() >= MIN_PARALLEL_TASKS, "SPEC が分割されていない");
-        for t in &impls {
-            assert!(
-                t.dependencies.is_empty(),
-                "#{} が待たされている — 分割済みなのに直列に繋いでいる",
-                t.id
-            );
-        }
-        // 計画・設計も互いを待たない (どちらも書き物なので並行してよい)。
-        for role in [R::Planner, R::Architect] {
-            let t = p.tasks.iter().find(|t| t.role == role).expect("居る");
-            assert!(t.dependencies.is_empty(), "{role:?} が待たされている");
+        let plan = p.tasks.iter().find(|t| t.role == R::Planner).expect("Planner");
+        let design = p.tasks.iter().find(|t| t.role == R::Architect).expect("Architect");
+        assert!(plan.dependencies.is_empty());
+        assert!(design.dependencies.contains(&plan.id));
+        for task in &impls {
+            assert!(task.dependencies.contains(&design.id));
+            for peer in &impls {
+                assert!(
+                    task.id == peer.id || !task.dependencies.contains(&peer.id),
+                    "実装 #{} が同段の #{} を待っている",
+                    task.id,
+                    peer.id
+                );
+            }
         }
         // **統合は全部を待つ。** 待たないと、まだ書かれていない設計を
         // 前提に締めることになる。
@@ -1729,11 +1749,11 @@ mod tests {
                 t.id
             );
         }
-        // これだけ並べれば、上限まで担当が立つ。
+        // 並列実装数 + レビュー余力だけを起動し、仕事の無い担当を増やさない。
         assert_eq!(
             super::super::scheduler::desired_sessions(&p.tasks, 4),
-            4,
-            "並列ぶんの担当が立たない"
+            (impls.len() + 1).min(4),
+            "実作業数と起動数が一致しない"
         );
     }
 
@@ -1890,43 +1910,33 @@ Zaivern が何なのかを決め、ページの構成を決める。
                 p.tasks.iter().map(|t| t.role).collect::<Vec<_>>()
             );
         }
-        // **待ちが減っている。** ただし「待ちゼロ」ではない。
-        //
-        // 最初に書いたこの番人は「全部を待つタスクが 1 つも無いこと」を
-        // 求めていた。**それは誤りだった** — 実機で、依存を持たない
-        // `integrator:` の節が即座に配られ、「他が未完了」という当然の
-        // 理由で `blocked` → 人の判断待ちになった。締めは待ってよい。
-        //
-        // 守るべきは「**実装が待たされないこと**」で、締めが待つことでは
-        // ない (`scope_and_order_tests::整合担当は他を待つ` が対の番人)。
-        //
-        // **確かめる担当 (tester / reviewer) は実装を待ってよい。** 依存の
-        // 無い `tester:` が実装と同時に配られ、「まだ何も無い」と待ちに
-        // 入って停滞扱いで人へ上げられた実測がある (2 体の HP、+496 秒)。
-        for t in p
+        // 役割ごとの節を骨組みで重複させなくても、確定順は失わない。
+        let planner = p.tasks.iter().find(|t| t.role == R::Planner).expect("Planner");
+        let architect = p
             .tasks
             .iter()
-            .filter(|t| matches!(t.role, R::Implementer | R::Planner | R::Architect))
-        {
-            assert!(
-                t.dependencies.is_empty(),
-                "#{} ({:?}) が待たされている — 並列が死ぬ",
-                t.id,
-                t.role
-            );
-        }
+            .find(|t| t.role == R::Architect)
+            .expect("Architect");
+        assert!(planner.dependencies.is_empty());
+        assert!(architect.dependencies.contains(&planner.id));
         let impls: Vec<_> = p
             .tasks
             .iter()
             .filter(|t| t.role == R::Implementer)
-            .map(|t| t.id)
             .collect();
+        for task in &impls {
+            assert!(task.dependencies.contains(&architect.id));
+            for peer in &impls {
+                assert!(task.id == peer.id || !task.dependencies.contains(&peer.id));
+            }
+        }
         for t in p.tasks.iter().filter(|t| t.role == R::Tester) {
-            for i in &impls {
+            for implementation in &impls {
                 assert!(
-                    t.dependencies.contains(i),
-                    "検証担当 #{} が実装 #{i} を待っていない (何も無いのに配られる)",
-                    t.id
+                    t.dependencies.contains(&implementation.id),
+                    "検証担当 #{} が実装 #{} を待っていない (何も無いのに配られる)",
+                    t.id,
+                    implementation.id
                 );
             }
         }
@@ -2189,14 +2199,78 @@ README.md にまとめる。
                 t.id
             );
         }
-        // **実装は待たない** (並列のまま)。確かめる担当は実装を待ってよい —
-        // 何も無いうちに配ると「まだ無い」と待って停滞扱いになる (実測)。
-        for t in tasks
+        // 同じ段の実装同士は待たせない。設計の確定だけを待ち、そこからは
+        // 並列に進めることで、安全性のために必要な直列化以上は増やさない。
+        let implementers: Vec<_> = tasks
             .iter()
-            .filter(|t| matches!(t.role, R::Implementer | R::Planner | R::Architect))
-        {
-            assert!(t.dependencies.is_empty(), "#{} が待たされている", t.id);
+            .filter(|t| t.role == R::Implementer)
+            .collect();
+        for task in &implementers {
+            for peer in &implementers {
+                if task.id != peer.id {
+                    assert!(
+                        !task.dependencies.contains(&peer.id),
+                        "実装 #{} が同段の実装 #{} を待っている",
+                        task.id,
+                        peer.id
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn 分割済みspecでも設計確定前に実装を先行させない() {
+        let tasks = plan_of(SPEC);
+        let planner = tasks
+            .iter()
+            .find(|t| t.role == R::Planner)
+            .expect("Planner");
+        let architect = tasks
+            .iter()
+            .find(|t| t.role == R::Architect)
+            .expect("Architect");
+        let implementers: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.role == R::Implementer)
+            .collect();
+        assert!(!implementers.is_empty(), "前提: 実装タスクが無い");
+        assert!(planner.dependencies.is_empty(), "Planner に先行依存がある");
+        assert!(
+            architect.dependencies.contains(&planner.id),
+            "Architect が Planner の確定を待たない"
+        );
+        for task in implementers {
+            assert!(
+                task.dependencies.contains(&architect.id),
+                "実装 #{} が設計確定前に先行する",
+                task.id
+            );
+        }
+    }
+
+    #[test]
+    fn spec側のintegratorも自動生成されたtesterを待つ() {
+        let spec = "# Site\n\n## implementer(markup): HTMLを作る\nindex.html\n\n\
+                    ## implementer(style): CSSを作る\nstyle.css\n\n\
+                    ## integrator: 全体を統合する\nREADME.md\n";
+        let tasks = plan_of(spec);
+        let tester = tasks
+            .iter()
+            .find(|t| t.role == R::Tester)
+            .expect("自動生成Tester");
+        let integrator = tasks
+            .iter()
+            .find(|t| t.role == R::Integrator)
+            .expect("SPEC側Integrator");
+        assert!(
+            integrator.dependencies.contains(&tester.id),
+            "Integrator が最終テストより先に走る"
+        );
+        assert!(
+            !tester.dependencies.contains(&integrator.id),
+            "Integrator と Tester が互いを待つ循環になっている"
+        );
     }
 }
 

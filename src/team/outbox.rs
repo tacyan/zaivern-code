@@ -69,6 +69,7 @@
 //! 作らない)。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::model::AgentId;
@@ -221,6 +222,115 @@ pub enum Verdict {
     Retry(String),
     /// 取り込まない。隔離して理由を残す。`agent` は記録の宛先 (分かれば)。
     Reject { agent: Option<AgentId>, why: String },
+}
+
+/// 報告ファイルを bounded read した結果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// 上限内の UTF-8 本文。
+    Body(String),
+    /// 消失・権限など、一時的かもしれない読み取り失敗。
+    Retry(String),
+    /// サイズ・種類・文字コードが取り決め違反。再読せず隔離する。
+    Reject(String),
+}
+
+fn report_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn open_report(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 一覧取得後に symlink / FIFO へ差し替えられても、リンク先を開かず
+        // FIFO の相手も待たない。open 後にも通常ファイルかを検査する。
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: symlink/junction のリンク先を開かない。
+        opts.custom_flags(0x0020_0000);
+    }
+    opts.open(path)
+}
+
+fn read_report_after(path: &Path, after_metadata: impl FnOnce()) -> ReadOutcome {
+    let name = report_name(path);
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) => return ReadOutcome::Retry(format!("{name} の metadata を読めません: {e}")),
+    };
+    if !before.file_type().is_file() {
+        return ReadOutcome::Reject(format!(
+            "{name} は通常ファイルではないため読みません (上限 {} バイト)",
+            rp::BLOCK_MAX_BYTES
+        ));
+    }
+    if before.len() > rp::BLOCK_MAX_BYTES as u64 {
+        return ReadOutcome::Reject(format!(
+            "{name} は {} バイトで上限 {} バイトを超えています",
+            before.len(),
+            rp::BLOCK_MAX_BYTES
+        ));
+    }
+
+    // テストでは metadata の直後に内容を増やし、TOCTOU 時も bounded read
+    // で止まることを実ファイルで確かめる。
+    after_metadata();
+
+    let file = match open_report(path) {
+        Ok(file) => file,
+        Err(e) => return ReadOutcome::Retry(format!("{name} を開けません: {e}")),
+    };
+    let opened = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return ReadOutcome::Retry(format!("{name} の metadata を読めません: {e}")),
+    };
+    if !opened.file_type().is_file() {
+        return ReadOutcome::Reject(format!(
+            "{name} は通常ファイルではないため読みません (上限 {} バイト)",
+            rp::BLOCK_MAX_BYTES
+        ));
+    }
+    if opened.len() > rp::BLOCK_MAX_BYTES as u64 {
+        return ReadOutcome::Reject(format!(
+            "{name} は {} バイトで上限 {} バイトを超えています",
+            opened.len(),
+            rp::BLOCK_MAX_BYTES
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len().min(rp::BLOCK_MAX_BYTES as u64) as usize);
+    let mut bounded = file.take(rp::BLOCK_MAX_BYTES as u64 + 1);
+    if let Err(e) = bounded.read_to_end(&mut bytes) {
+        return ReadOutcome::Retry(format!("{name} を読めません: {e}"));
+    }
+    if bytes.len() > rp::BLOCK_MAX_BYTES {
+        return ReadOutcome::Reject(format!(
+            "{name} は読み込み中に上限 {} バイトを超えました (少なくとも {} バイト)",
+            rp::BLOCK_MAX_BYTES,
+            bytes.len()
+        ));
+    }
+    match String::from_utf8(bytes) {
+        Ok(body) => ReadOutcome::Body(body),
+        Err(e) => ReadOutcome::Reject(format!(
+            "{name} は UTF-8 ではありません ({} バイト、上限 {} バイト): {e}",
+            opened.len(),
+            rp::BLOCK_MAX_BYTES
+        )),
+    }
+}
+
+/// metadata で事前検査し、さらに上限 + 1 バイトで止めて報告を読む。
+pub fn read_report(path: &Path) -> ReadOutcome {
+    read_report_after(path, || {})
 }
 
 /// 素の JSON の**形**から種別を決める。エンベロープが無いときだけ使う。
@@ -425,6 +535,14 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
 /// `.json.tmp` (拡張子が `tmp`) と `rejected/` (ディレクトリ) は
 /// 構造的に外れる。
 pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
+    // Run の置き場自体が symlink / junction へ差し替えられても、リンク先の
+    // ファイルを報告として読まない。metadata は必ずリンク非追従で見る。
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Vec::new();
+    };
+    if !meta.file_type().is_dir() {
+        return Vec::new();
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -455,6 +573,67 @@ pub enum Disposal {
     Kept(String),
 }
 
+fn path_entry_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // 読めない状態を「空き」と見なすと rename が既存の証拠を潰し得る。
+        Err(_) => true,
+    }
+}
+
+fn collision_free_path(preferred: PathBuf) -> PathBuf {
+    if !path_entry_occupied(&preferred) {
+        return preferred;
+    }
+    let Some(parent) = preferred.parent() else {
+        return preferred;
+    };
+    let base = preferred
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "report".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut n = 0u32;
+    loop {
+        let candidate = parent.join(format!(
+            "{base}.rejected-{}-{stamp}-{n}",
+            std::process::id()
+        ));
+        if !path_entry_occupied(&candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+    }
+}
+
+fn ensure_plain_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "隔離先が通常ディレクトリではありません",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "作成した隔離先が通常ディレクトリではありません",
+        ))
+    }
+}
+
 /// 取り込めなかった報告を読み直しの対象から外す。**消さない。**
 ///
 /// 1. `rejected/` へ移す (人が中身を見て直せる場所)
@@ -471,8 +650,8 @@ pub fn quarantine(file: &Path) -> Disposal {
         return Disposal::Kept("ファイル名がありません".to_string());
     };
     let pen = dir.join(REJECTED_DIR);
-    let moved = std::fs::create_dir_all(&pen).and_then(|()| {
-        let dest = pen.join(name);
+    let moved = ensure_plain_dir(&pen).and_then(|()| {
+        let dest = collision_free_path(pen.join(name));
         std::fs::rename(file, &dest).map(|()| dest)
     });
     match moved {
@@ -480,7 +659,9 @@ pub fn quarantine(file: &Path) -> Disposal {
         Err(e) => {
             // 隔離先へ移せない (権限・別ボリューム等)。**消さずに**、
             // 同じ場所で読み直しの対象から外す。
-            let aside = file.with_extension(format!("{FINAL_EXT}.{REJECTED_DIR}"));
+            let aside = collision_free_path(
+                file.with_extension(format!("{FINAL_EXT}.{REJECTED_DIR}")),
+            );
             match std::fs::rename(file, &aside) {
                 Ok(()) => Disposal::Renamed(aside),
                 Err(e2) => Disposal::Kept(format!(
@@ -955,5 +1136,194 @@ mod tests {
             "一時ファイルの拡張子が json になっている (読まれてしまう)"
         );
         assert_eq!(&tmp[..tmp.len() - 4], &fin, "`.tmp` を外すと正式な名前になる");
+    }
+
+    #[test]
+    fn 上限ちょうどは読み上限プラス一は本文を渡さず隔離判定になる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "bounded-size");
+        let exact = dir.join(final_name("agent-1", "exact"));
+        let over = dir.join(final_name("agent-1", "over"));
+        std::fs::write(&exact, vec![b'a'; rp::BLOCK_MAX_BYTES]).unwrap();
+        std::fs::write(&over, vec![b'b'; rp::BLOCK_MAX_BYTES + 1]).unwrap();
+
+        match read_report(&exact) {
+            ReadOutcome::Body(body) => assert_eq!(body.len(), rp::BLOCK_MAX_BYTES),
+            other => panic!("上限ちょうどを読まなかった: {other:?}"),
+        }
+        match read_report(&over) {
+            ReadOutcome::Reject(why) => {
+                assert!(why.contains("agent-1-over.json"), "ファイル名が無い: {why}");
+                assert!(why.contains(&(rp::BLOCK_MAX_BYTES + 1).to_string()), "実サイズが無い: {why}");
+                assert!(why.contains(&rp::BLOCK_MAX_BYTES.to_string()), "上限が無い: {why}");
+            }
+            other => panic!("上限超過の本文を渡した: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metadata確認後に増えても上限プラス一で読み止める() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "bounded-growth");
+        let file = dir.join(final_name("agent-1", "grow"));
+        std::fs::write(&file, b"{}").unwrap();
+        let grow = file.clone();
+        let got = read_report_after(&file, move || {
+            std::fs::write(&grow, vec![b'x'; rp::BLOCK_MAX_BYTES + 100]).unwrap();
+        });
+        match got {
+            ReadOutcome::Reject(why) => {
+                assert!(why.contains("agent-1-grow.json"), "{why}");
+                assert!(why.contains("上限"), "{why}");
+            }
+            other => panic!("差し替え後の巨大本文を渡した: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 非utf8は再試行せず隔離判定になる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "non-utf8");
+        let file = dir.join(final_name("agent-1", "bad"));
+        std::fs::write(&file, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(matches!(read_report(&file), ReadOutcome::Reject(why) if why.contains("UTF-8")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 置き場自体がsymlinkならリンク先を走査しない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "dir-symlink");
+        let outside = crate::test_util::unique_temp_dir("zaivern-outbox", "outside-dir");
+        let report = outside.join(final_name("agent-1", "outside"));
+        std::fs::write(&report, "外の証拠").unwrap();
+        let linked = dir.join("run-id");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        assert!(list_reports(&linked).is_empty(), "symlink先の報告を列挙した");
+        assert_eq!(std::fs::read_to_string(&report).unwrap(), "外の証拠");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readerもsymlinkと特殊ファイルを読まない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "special");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        let link = dir.join(final_name("agent-1", "link"));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(matches!(read_report(&link), ReadOutcome::Reject(_)));
+
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = dir.join(final_name("agent-1", "fifo"));
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `raw` は NUL 終端済みで呼び出し中も生存し、mode は通常の
+        // POSIX permission bits。作成先はこのテストだけの一時ディレクトリ。
+        let rc = unsafe { libc::mkfifo(raw.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        assert!(matches!(read_report(&fifo), ReadOutcome::Reject(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata確認後にsymlinkへ差し替えられてもリンク先を読まない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "symlink-swap");
+        let file = dir.join(final_name("agent-1", "swap"));
+        let outside = dir.join("outside.txt");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::write(&outside, "リンク先の秘密").unwrap();
+        let swap = file.clone();
+        let got = read_report_after(&file, move || {
+            std::fs::remove_file(&swap).unwrap();
+            std::os::unix::fs::symlink(&outside, &swap).unwrap();
+        });
+        assert!(
+            !matches!(got, ReadOutcome::Body(_)),
+            "metadata後に差し替えたsymlinkのリンク先を読んだ"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 隔離先に同名があっても既存の証拠を上書きしない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "quarantine-collision");
+        let rejected = dir.join(REJECTED_DIR);
+        std::fs::create_dir_all(&rejected).unwrap();
+        let file = dir.join(final_name("agent-1", "same"));
+        let occupied = rejected.join(file.file_name().unwrap());
+        std::fs::write(&occupied, "先の証拠").unwrap();
+        std::fs::write(&file, "後の証拠").unwrap();
+
+        let moved = match quarantine(&file) {
+            Disposal::Moved(path) => path,
+            other => panic!("隔離できなかった: {other:?}"),
+        };
+        assert_ne!(moved, occupied, "同名の証拠を上書きした");
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), "先の証拠");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "後の証拠");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 隔離フォールバックも同名の証拠を上書きしない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "aside-collision");
+        // ディレクトリ作成を失敗させ、同じ場所での拡張子変更へ進ませる。
+        std::fs::write(dir.join(REJECTED_DIR), "not a directory").unwrap();
+        let file = dir.join(final_name("agent-1", "same"));
+        let occupied = file.with_extension(format!("{FINAL_EXT}.{REJECTED_DIR}"));
+        std::fs::write(&occupied, "先の証拠").unwrap();
+        std::fs::write(&file, "後の証拠").unwrap();
+
+        let renamed = match quarantine(&file) {
+            Disposal::Renamed(path) => path,
+            other => panic!("その場で退避できなかった: {other:?}"),
+        };
+        assert_ne!(renamed, occupied, "フォールバック先の証拠を上書きした");
+        assert_eq!(std::fs::read_to_string(&occupied).unwrap(), "先の証拠");
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "後の証拠");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 隔離先のsymlinkを辿って外へ証拠を動かさない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "rejected-symlink");
+        let outside = crate::test_util::unique_temp_dir("zaivern-outbox", "outside");
+        std::os::unix::fs::symlink(&outside, dir.join(REJECTED_DIR)).unwrap();
+        let file = dir.join(final_name("agent-1", "same"));
+        std::fs::write(&file, "証拠").unwrap();
+
+        let renamed = match quarantine(&file) {
+            Disposal::Renamed(path) => path,
+            other => panic!("外を指す隔離先から同じ場所へ退避しなかった: {other:?}"),
+        };
+        assert!(renamed.starts_with(&dir));
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "証拠");
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 隔離先のdangling_symlinkも既存の証拠として上書きしない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "dangling-collision");
+        let rejected = dir.join(REJECTED_DIR);
+        std::fs::create_dir_all(&rejected).unwrap();
+        let file = dir.join(final_name("agent-1", "same"));
+        let occupied = rejected.join(file.file_name().unwrap());
+        std::os::unix::fs::symlink(dir.join("missing"), &occupied).unwrap();
+        std::fs::write(&file, "後の証拠").unwrap();
+
+        let moved = match quarantine(&file) {
+            Disposal::Moved(path) => path,
+            other => panic!("隔離できなかった: {other:?}"),
+        };
+        assert_ne!(moved, occupied, "dangling symlink を上書きした");
+        assert!(std::fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "後の証拠");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

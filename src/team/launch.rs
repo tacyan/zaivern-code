@@ -2057,6 +2057,7 @@ mod tests {
     /// 「**人のファイルを書き換えない**」であって「1 バイトも増えない」
     /// ではない (増えないことにするには `--no-cache` を強制するしかなく、
     /// それは人が書いたコマンドを勝手に変えることになる)。
+    #[cfg(unix)]
     fn snapshot_dir(root: &Path) -> Vec<(String, Vec<u8>)> {
         fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             let Ok(rd) = std::fs::read_dir(dir) else {

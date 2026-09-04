@@ -18,13 +18,13 @@
 //! [`BoardAction`] を返すだけで、プロセス起動もファイル書き込みもしない。
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::model::*;
 use super::gitinit;
-use super::outbox::{self, Verdict};
+use super::outbox::{self, ReadOutcome, Verdict};
 use super::persistence::{self, LoadOutcome};
 use super::planner::{PlanInput, StaticPlanner, TeamPlanner};
 use super::runtime::{Observation, RunOptions, RunOwner, TeamAction, TeamEffect, TeamRuntime};
@@ -171,11 +171,12 @@ pub const RUNS_DIR: &str = "runs";
 /// 永久に順番待ちになる。置き場の取り決めそのものは [`outbox`]。
 pub const OUTBOX_PER_TICK: usize = 32;
 
-/// **同時に走らせてよい Run の本数。**
+/// 同じ workspace に同時に走らせてよい Run の本数。
 ///
-/// 上限が無いと、押した回数だけチームが増えて PC が沈む
-/// (1 本あたり最大 `agent_count` 体の CLI が常駐する)。
-pub const MAX_CONCURRENT_RUNS: usize = 4;
+/// Run 専用 worktree と競合を人へ返す統合経路がまだ無いので 1 本に固定する。
+/// 共有 workspace のまま数だけ増やすと、別 Run の変更を自分の changeset と
+/// 誤認する。旧保存形式の複数 Run は消さず、1 本ずつ復元する。
+pub const MAX_CONCURRENT_RUNS: usize = 1;
 
 /// New Team Run フォームの入力。
 #[derive(Clone, Debug, PartialEq)]
@@ -372,15 +373,12 @@ pub struct TeamPanel {
     pub read_only: bool,
     /// 直近の説明・エラー (画面の帯に出す)。
     pub notice: String,
-    /// **同時に走っている Run。** 1 本とは限らない。
+    /// 保持している Run。本番は最大1本だが、旧保存の安全な順次復元と
+    /// Run所有権の内部検査のため、状態表現は複数本を扱える。
     ///
-    /// 以前は `Option<TeamRuntime>` 1 本で、2 本目を作ろうとすると
-    /// `refuse_if_busy` が断っていた。チームを 2 つ立てて別々の目標を
-    /// 同時に進める、ができなかった。
-    ///
-    /// **画面が触るのは `active` の 1 本だけ**なので、既存の操作は
+    /// **画面が触るのは `active` の1本だけ**なので、既存の操作は
     /// [`TeamPanel::rt`] / [`TeamPanel::rt_mut`] を通してそのまま動く。
-    /// 進行 (`tick`) と副作用の実行は**全部の Run**に対して回す。
+    /// 内部に複数本ある場合も、進行と副作用は持ち主を照合して全本へ回す。
     runs: Vec<TeamRuntime>,
     /// 画面に出している Run の位置 (`runs` の添字)。
     active: usize,
@@ -443,6 +441,12 @@ pub struct TeamPanel {
     /// 毎 tick 同じ却下を積む。保存しないのは、次の起動では権限が戻って
     /// いるかもしれないから (永久に諦めない)。
     outbox_skip: HashSet<PathBuf>,
+    /// 次の tick をどの Run から始めるか。添字ではなく安定した `run_id` を
+    /// 覚えるので、Run の追加・削除・並び替えで別物を指さない。
+    outbox_run_cursor: Option<String>,
+    /// Run ごとの最後に見たファイル。毎回ファイル名順の先頭から始めると、
+    /// 壊れた先頭ファイルより後ろが永久に読まれないため、次から再開する。
+    outbox_file_cursors: HashMap<String, PathBuf>,
 }
 
 impl Default for TeamPanel {
@@ -479,6 +483,8 @@ impl Default for TeamPanel {
             dropped_effects: 0,
             outbox_ledger: outbox::Ledger::default(),
             outbox_skip: HashSet::new(),
+            outbox_run_cursor: None,
+            outbox_file_cursors: HashMap::new(),
         }
     }
 }
@@ -760,11 +766,8 @@ impl TeamPanel {
 
     /// 面倒を見ているものがあるなら断る (理由をそのまま返す)。
     fn refuse_if_busy(&mut self) -> Result<(), String> {
-        // **走っていても、上限までは並べてよい。**
-        //
-        // 以前はここで無条件に断っていたので、2 つの目標を同時に進める
-        // ことができなかった。断るのは本数の上限に当たったときだけにする
-        // (資源の心配は上限そのものが引き受ける)。
+        // Run 専用 worktree が無い間は 1 本だけ。既存 Run を置き換えず、
+        // 2 本目を開始前に断るので、別 Run の変更を成果へ混ぜない。
         if self.runs.len() < MAX_CONCURRENT_RUNS {
             return Ok(());
         }
@@ -1041,73 +1044,132 @@ impl TeamPanel {
     /// * 消すのは [`TeamRuntime::accept_outbox`] が受理を返した後だけ。
     ///   途中で落ちてもファイルは残り、次の tick で読み直す
     fn drain_outbox(&mut self, now: u64) -> usize {
+        if self.read_only || self.runs.is_empty() {
+            return 0;
+        }
         let mut budget = OUTBOX_PER_TICK;
         let mut taken = 0usize;
-        'runs: for run in 0..self.runs.len() {
+
+        let live: HashSet<String> = self
+            .runs
+            .iter()
+            .map(|rt| rt.run().run_id.clone())
+            .collect();
+        self.outbox_file_cursors.retain(|run, _| live.contains(run));
+        if self
+            .outbox_run_cursor
+            .as_ref()
+            .is_some_and(|run| !live.contains(run))
+        {
+            self.outbox_run_cursor = None;
+        }
+
+        struct LaneQueue {
+            run: usize,
+            run_id: String,
+            files: VecDeque<PathBuf>,
+        }
+
+        let mut order: Vec<usize> = (0..self.runs.len()).collect();
+        if let Some(cursor) = self.outbox_run_cursor.as_deref() {
+            if let Some(pos) = order
+                .iter()
+                .position(|&i| self.runs[i].run().run_id == cursor)
+            {
+                let next = (pos + 1) % order.len();
+                order.rotate_left(next);
+            }
+        }
+        let mut lanes = Vec::with_capacity(order.len());
+        for run in order {
             let dir = self.runs[run].outbox().to_path_buf();
             if dir.as_os_str().is_empty() {
                 continue;
             }
-            // この Run の担当だけ。ID が同じ別 Run の担当は表に居ない。
-            let ids: Vec<AgentId> = self.runs[run]
-                .agents()
-                .iter()
-                .map(|a| a.id.clone())
-                .collect();
             let run_id = self.runs[run].run().run_id.clone();
-            for f in outbox::list_reports(&dir) {
+            let mut files = outbox::list_reports(&dir);
+            files.retain(|f| !self.outbox_skip.contains(f));
+            if let Some(cursor) = self.outbox_file_cursors.get(&run_id) {
+                let next = files.partition_point(|f| f <= cursor);
+                if !files.is_empty() {
+                    let len = files.len();
+                    files.rotate_left(next % len);
+                }
+            }
+            lanes.push(LaneQueue {
+                run,
+                run_id,
+                files: files.into(),
+            });
+        }
+
+        // 1 周につき各 Run から最大 1 ファイル。全体上限は維持したまま、
+        // 壊れた Run や大量投入の Run が後続を独占できない。
+        while budget > 0 {
+            let mut progressed = false;
+            for lane in &mut lanes {
                 if budget == 0 {
-                    break 'runs;
+                    break;
                 }
-                // 動かせなかった却下ファイルは読み直さない (残してはある)。
-                if self.outbox_skip.contains(&f) {
+                let Some(file) = lane.files.pop_front() else {
                     continue;
-                }
-                budget -= 1;
-                let stem = f
-                    .file_stem()
-                    .and_then(|x| x.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                // **読んで解析してから、消すかを決める。**
-                let verdict = match std::fs::read_to_string(&f) {
-                    Ok(body) => outbox::judge(&stem, &body, &ids, &run_id),
-                    Err(e) => Verdict::Retry(format!("読めません: {e}")),
                 };
-                match verdict {
-                    Verdict::Deliver { agent, kind, body } => {
-                        match self.runs[run].accept_outbox(&agent, kind, &body, now) {
-                            // **受理してから消す。** 消してから渡すと、途中で
-                            // 落ちた報告は二度と戻らない。適用済みも重複も
-                            // 「目的は果たされた」ので片付けてよい。
-                            Ok(outcome) => match std::fs::remove_file(&f) {
-                                Ok(()) => {
-                                    self.outbox_ledger.forget(&f);
-                                    if outcome == super::runtime::AcceptOutcome::Applied {
-                                        taken += 1;
-                                    }
-                                }
-                                // 受理済みなので二重取り込みは構造化キーが
-                                // 止める。残り続けるなら上限で隔離する。
-                                Err(e) => self.outbox_retry(
-                                    run,
-                                    &f,
-                                    format!("受理したが消せません: {e}"),
-                                ),
-                            },
-                            // **意味として却下された。** 消さずに隔離して
-                            // 理由を残す (直して出し直せるように、重複台帳へは
-                            // 入っていない)。
-                            Err(why) => self.outbox_quarantine(run, &f, Some(agent), why),
-                        }
-                    }
-                    Verdict::Retry(why) => self.outbox_retry(run, &f, why),
-                    Verdict::Reject { agent, why } => self.outbox_quarantine(run, &f, agent, why),
+                progressed = true;
+                budget -= 1;
+                self.outbox_run_cursor = Some(lane.run_id.clone());
+                self.outbox_file_cursors
+                    .insert(lane.run_id.clone(), file.clone());
+                if self.process_outbox_file(lane.run, &lane.run_id, &file, now) {
+                    taken += 1;
                 }
+            }
+            if !progressed {
+                break;
             }
         }
         self.outbox_ledger.prune_missing();
         taken
+    }
+
+    /// 1 ファイルだけを処理する。公平な選択と内容の検証を分け、異常な
+    /// 1 ファイルが他 Run の順番まで巻き込まない。
+    fn process_outbox_file(&mut self, run: usize, run_id: &str, file: &Path, now: u64) -> bool {
+        let ids: Vec<AgentId> = self.runs[run]
+            .agents()
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        let stem = file
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let verdict = match outbox::read_report(file) {
+            ReadOutcome::Body(body) => outbox::judge(&stem, &body, &ids, run_id),
+            ReadOutcome::Retry(why) => Verdict::Retry(why),
+            ReadOutcome::Reject(why) => Verdict::Reject { agent: None, why },
+        };
+        match verdict {
+            Verdict::Deliver { agent, kind, body } => {
+                match self.runs[run].accept_outbox(&agent, kind, &body, now) {
+                    Ok(outcome) => match std::fs::remove_file(file) {
+                        Ok(()) => {
+                            self.outbox_ledger.forget(file);
+                            return outcome == super::runtime::AcceptOutcome::Applied;
+                        }
+                        Err(e) => self.outbox_retry(
+                            run,
+                            file,
+                            format!("受理したが消せません: {e}"),
+                        ),
+                    },
+                    Err(why) => self.outbox_quarantine(run, file, Some(agent), why),
+                }
+            }
+            Verdict::Retry(why) => self.outbox_retry(run, file, why),
+            Verdict::Reject { agent, why } => self.outbox_quarantine(run, file, agent, why),
+        }
+        false
     }
 
     /// 読めなかった報告を数え、上限に達したら隔離する。
@@ -1430,10 +1492,8 @@ impl TeamPanel {
         );
     }
 
-    /// **Run を 1 本閉じる。**
-    ///
-    /// 複数走らせられるようになった以上、1 本だけ畳む手段が要る
-    /// (全部畳む `shutdown` しか無いと、終わった Run が並び続ける)。
+    /// **Run を1本閉じる。** 旧保存の複数本を内部で保持していても、
+    /// 指定した1本だけを安全に畳む。
     ///
     /// 閉じたら:
     /// * その Run の**停止**を Runtime へ伝える (走っている担当を残さない)
@@ -1463,6 +1523,7 @@ impl TeamPanel {
         // **Run が消えた後でも**実行側へ渡す。
         let effects = self.runs[i].close();
         let owner = self.runs[i].owner();
+        self.cancel_validations_for_owner(&owner);
         self.absorb_for(owner, effects);
         let rt = self.runs.remove(i);
         let id = rt.run().run_id.clone();
@@ -1470,6 +1531,9 @@ impl TeamPanel {
         if self.runs.is_empty() {
             self.active = 0;
             self.snapshot = None;
+        } else if i < self.active {
+            // active より前を消したら、同じ Run は 1 つ左へ移る。
+            self.active -= 1;
         } else if self.active >= self.runs.len() {
             self.active = self.runs.len() - 1;
         }
@@ -1664,6 +1728,7 @@ impl TeamPanel {
     pub fn take_stops(&mut self) -> Vec<(RunOwner, String, SessionId)> {
         std::mem::take(&mut self.pending_stops)
     }
+
     /// 走らせてほしい検証 (冪等キー付き。取り出したら消える)。
     pub fn take_validations(&mut self) -> Vec<(RunOwner, String, super::runtime::ValidationSpec)> {
         let q = std::mem::take(&mut self.pending_validations);
@@ -1855,6 +1920,25 @@ impl TeamPanel {
             j.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.running_validations()
+    }
+
+    /// 1 Run に属する検証だけを即時停止して管理から外す。
+    fn cancel_validations_for_owner(&mut self, owner: &RunOwner) -> usize {
+        let mut stopped = 0usize;
+        self.validation_jobs.retain(|job| {
+            if &job.owner != owner {
+                return true;
+            }
+            job.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let pid = job.pid.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                crate::procx::kill_tree(pid);
+            }
+            stopped += 1;
+            false
+        });
+        stopped
     }
 
     /// **アプリを閉じるときの後始末。**
@@ -2120,6 +2204,26 @@ mod tests {
         p
     }
 
+    /// 旧版が保存した複数 Run と配送分離を検査するためだけのフィクスチャ。
+    /// 製品の [`TeamPanel::plan`] は常に [`MAX_CONCURRENT_RUNS`] を守る。
+    /// 既存 Run を一時的に退避して同じ計画経路で 1 本作り、旧保存状態として
+    /// 並べることで、テストビルドの本番上限を緩めず複数 lane を再現する。
+    fn add_legacy_run(p: &mut TeamPanel) -> Result<(), String> {
+        let old_runs = std::mem::take(&mut p.runs);
+        let old_active = p.active;
+        let result = p.plan(SPEC, "SPEC.md", RunOptions::default());
+        let mut created = std::mem::take(&mut p.runs);
+        p.runs = old_runs;
+        if let Err(e) = result {
+            p.active = old_active.min(p.runs.len().saturating_sub(1));
+            return Err(e);
+        }
+        assert_eq!(created.len(), 1, "テスト用の追加で Run が1本以外作られた");
+        p.runs.push(created.remove(0));
+        p.active = p.runs.len() - 1;
+        Ok(())
+    }
+
     /// **検証を明示する SPEC。**
     ///
     /// ここで見たいのは画面の筋道であって、検証コマンドの自動決定ではない。
@@ -2276,6 +2380,75 @@ mod tests {
     }
 
     #[test]
+    fn 専用worktreeが無い間は同一workspace二本目を開始前に断る() {
+        let dir = ws("single-run-limit");
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let first = p.owner().expect("1本目");
+        let err = p
+            .plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect_err("2本目を作ってしまった");
+        assert!(!err.trim().is_empty(), "拒否理由が空");
+        assert_eq!(p.notice, err, "利用者へ拒否理由を表示していない");
+        assert_eq!(MAX_CONCURRENT_RUNS, 1, "安全上限が1本ではない");
+        assert_eq!(p.runs.len(), MAX_CONCURRENT_RUNS);
+        assert_eq!(p.owner(), Some(first), "既存 Run を置き換えた");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn activeより前のrunを閉じても同じactive_runを保つ() {
+        let dir = ws("close-before-active");
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        for _ in 1..3 {
+            add_legacy_run(&mut p).unwrap();
+        }
+        let active_owner = p.runs[1].owner();
+        p.select_run(1);
+        p.close_run(0).expect("先頭を閉じる");
+        assert_eq!(p.rt().map(TeamRuntime::owner), Some(active_owner));
+        assert_eq!(p.active_run(), 0, "同じ Run の新しい添字へ追従していない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runを閉じるとそのrunの検証だけを止める() {
+        let dir = ws("close-one-validation");
+        let mut p = panel_at(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        let a = p.owner().unwrap();
+        add_legacy_run(&mut p).unwrap();
+        let b = p.owner().unwrap();
+        let cancel_a = super::super::launch::new_cancel_flag();
+        let cancel_b = super::super::launch::new_cancel_flag();
+        for (owner, cancel, execution) in [
+            (a.clone(), cancel_a.clone(), "a"),
+            (b.clone(), cancel_b.clone(), "b"),
+        ] {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            p.watch_validation(ValidationJob {
+                owner,
+                task: 1,
+                execution: execution.into(),
+                commands: vec!["cargo test".into()],
+                started_at: 1,
+                timeout_secs: 60,
+                cancel,
+                pid: super::super::launch::new_pid_slot(),
+                rx,
+            });
+        }
+        let pos = p.run_pos_of_owner(&a).unwrap();
+        p.close_run(pos).expect("A を閉じる");
+        assert!(cancel_a.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!cancel_b.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(p.running_validations(), 1);
+        assert_eq!(p.validation_jobs[0].owner, b);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn 別のrunの検証結果は受け取らない() {
         // 外向きの 4 つの口と同じ形で、**戻ってくる側にも持ち主を見る**。
         // 実行 ID にも `run_id` は入っているが、そちらは文字列の書式に
@@ -2297,7 +2470,7 @@ mod tests {
             rx,
         });
         // 2 本目を作り、画面をそちらへ切り替える。
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_legacy_run(&mut p).unwrap();
         // 前の Run の worker が結果を返してくる。
         tx.send(("old".into(), 1, vec![ValidationRun::passed("cargo test a")]))
             .unwrap();
@@ -2327,35 +2500,18 @@ mod tests {
     }
 
     #[test]
-    /// **2 本目を作っても 1 本目を潰さない。**
-    ///
-    /// 以前はここで「実行中なら断る」ことを見ていた。同時に走らせられる
-    /// ようになったので、見るべき性質は**断ること**ではなく
-    /// 「**前の Run がそのまま生き残っていること**」に変わる
-    /// (置き換えると、走っている検証と起動済みの担当の面倒を見る相手が
-    ///  消えて、プロセスだけが残る)。上限に当たったときだけ断る。
+    /// **実行中の Run を2本目の計画で潰さない。**
     fn 実行中のrunを別の計画で潰さない() {
         let dir = ws("replace-busy");
         let mut p = started_panel(&dir);
         assert!(p.live_work().is_busy());
         let before = p.owner().expect("持ち主");
-        p.plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect("2 本目を並べられるべき");
-        assert_eq!(p.runs.len(), 2, "2 本目が増えていない");
-        assert!(
-            p.runs.iter().any(|r| r.owner() == before),
-            "前の Run が消えた (面倒を見る相手が居なくなる)"
-        );
-        // **上限までは並ぶ。上限を超えたら断る。**
-        while p.runs.len() < MAX_CONCURRENT_RUNS {
-            p.plan(SPEC, "SPEC.md", RunOptions::default())
-                .expect("上限までは並べられるべき");
-        }
         let err = p
             .plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect_err("上限を超えて並べてしまった");
+            .expect_err("実行中なのに2本目を並べてしまった");
         assert!(!err.trim().is_empty(), "断った理由が空");
         assert_eq!(p.runs.len(), MAX_CONCURRENT_RUNS);
+        assert_eq!(p.owner(), Some(before), "実行中の Run を置き換えた");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2376,7 +2532,7 @@ mod tests {
         // なくなった。死ぬのは**閉じたとき**なので、そこで確かめる。
         let stale = p.pending_launches.clone();
         p.workspace = b.clone();
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_legacy_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale;
         assert!(
@@ -2431,7 +2587,7 @@ mod tests {
         );
         // **閉じた Run のものは、どの口からも出さない。**
         p.workspace = b.clone();
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_legacy_run(&mut p).unwrap();
         p.close_run(0).expect("1 本目を閉じる");
         p.pending_launches = stale.0;
         p.pending_instructions = stale.1;
@@ -2580,8 +2736,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("1 本目の起動要求");
-        p.plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect("2 本目を並べられるべき");
+        add_legacy_run(&mut p).expect("旧保存状態の2本目");
         let second = p.owner().expect("2 本目");
         assert_ne!(first.run_id, second.run_id, "同じ Run になっている");
 
@@ -2623,8 +2778,7 @@ mod tests {
         let mut p = started_panel(&dir);
         let first = p.owner().expect("1 本目");
         let _ = p.take_launches();
-        p.plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect("2 本目");
+        add_legacy_run(&mut p).expect("旧保存状態の2本目");
         let second = p.owner().expect("2 本目");
         assert_ne!(first.run_id, second.run_id);
         assert_eq!(p.run_tabs().len(), 2, "切り替えの見出しが 2 つ出ない");
@@ -2651,8 +2805,7 @@ mod tests {
         let launches_a = p.take_launches();
         assert!(!launches_a.is_empty(), "1 本目の起動要求が無い");
 
-        p.plan(SPEC, "SPEC.md", RunOptions::default())
-            .expect("2 本目");
+        add_legacy_run(&mut p).expect("旧保存状態の2本目");
         p.act(TeamAction::Start);
         p.pump(super::super::runtime::Observation {
             now: 2,
@@ -2722,7 +2875,7 @@ mod tests {
             rx,
         });
 
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+        add_legacy_run(&mut p).expect("B");
         let owner_b = p.owner().expect("B owner");
         let pos_b = p.run_pos_of_owner(&owner_b).expect("B pos");
         assert_eq!(p.active_run(), pos_b, "前提: B が active ではない");
@@ -3795,7 +3948,7 @@ mod tests {
         );
 
         // ── 配達の途中で 2 本目の Run が立つ (= 画面がそちらへ移る) ──────
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_legacy_run(&mut p).unwrap();
         assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
         let run_b = p.runs[1].run().run_id.clone();
         assert_ne!(run_a, run_b, "前提: Run の ID は別");
@@ -3892,7 +4045,7 @@ mod tests {
         let (_owner, key, _, _, _) = sent[0].clone();
 
         // ── 2 本目の Run が、**同じ綴りの鍵**を発行済みに持つ ────────────
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).unwrap();
+        add_legacy_run(&mut p).unwrap();
         assert_eq!(p.runs.len(), 2, "前提: Run が 2 本ある");
         let run_b = p.runs[1].run().run_id.clone();
         p.runs[1].note_effect_dispatched_for_test(&key);
@@ -4202,7 +4355,7 @@ mod tests {
                 p.bind_session(o, &spec.agent_id, sid, None);
                 sids.push(sid);
             }
-            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+            add_legacy_run(&mut p).expect("B");
             let b = p.owner().expect("B");
             p.save_if_needed();
             let state = p.state_dir();
@@ -4262,7 +4415,7 @@ mod tests {
             let a = p.owner().expect("A");
             let boot_a = p.take_launches();
             assert!(!boot_a.is_empty(), "A の起動要求が無い");
-            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+            add_legacy_run(&mut p).expect("B");
             let b = p.owner().expect("B");
             p.act(TeamAction::Start);
             p.pump(super::super::super::runtime::Observation {
@@ -4547,8 +4700,9 @@ mod tests {
             let dir = ws("restore-cap-dedupe");
             std::fs::create_dir_all(&dir).unwrap();
             let mut p = panel_at(&dir);
-            while p.runs.len() < MAX_CONCURRENT_RUNS {
-                p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+            for _ in 1..4 {
+                add_legacy_run(&mut p).expect("旧版の複数Run");
             }
             p.save_if_needed();
             let state = p.state_dir();
@@ -4582,6 +4736,11 @@ mod tests {
             uniq.sort();
             uniq.dedup();
             assert_eq!(uniq.len(), MAX_CONCURRENT_RUNS);
+            // 上限で残した旧 Run は、先の1本を閉じれば次に復元できる。
+            let first = q.close_run(0).expect("先のRunを閉じる");
+            q.restore_run(false).expect("残したRunを復元");
+            assert_eq!(q.runs.len(), MAX_CONCURRENT_RUNS);
+            assert_ne!(q.owner().expect("次のRun").run_id, first);
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -4703,23 +4862,40 @@ mod tests {
             }
         }
 
+        /// 指定数の Run を立て、各担当に重ならないセッションを結ぶ。
+        fn many_lanes(tag: &str, count: usize) -> (TeamPanel, PathBuf, Vec<Lane>) {
+            assert!((1..=4).contains(&count));
+            let dir = ws(tag);
+            let mut p = started_panel(&dir);
+            let mut boots = vec![p.take_launches()];
+            for i in 1..count {
+                add_legacy_run(&mut p)
+                    .unwrap_or_else(|e| panic!("{} 本目: {e}", i + 1));
+                p.act(TeamAction::Start);
+                p.pump(super::super::super::runtime::Observation {
+                    now: 2 + i as u64,
+                    sessions: Vec::new(),
+                });
+                boots.push(p.take_launches());
+            }
+            let mut lanes = Vec::with_capacity(count);
+            for (i, boot) in boots.iter().enumerate() {
+                lanes.push(bind_lane(&mut p, boot, 101 + i as SessionId * 100));
+            }
+            let owners: HashSet<String> =
+                lanes.iter().map(|l| l.owner.run_id.clone()).collect();
+            let dirs: HashSet<PathBuf> = lanes.iter().map(|l| l.dir.clone()).collect();
+            assert_eq!(owners.len(), count, "Run の持ち主が衝突した");
+            assert_eq!(dirs.len(), count, "outbox が衝突した");
+            (p, dir, lanes)
+        }
+
         /// 2 本の Run を立て、両方の担当にセッションを結ぶ (A は 101〜、B は 201〜)。
         /// **どちらにも `team-lead` が居る** — ID が同じでも混線しないことを見るため。
         fn two_lanes(tag: &str) -> (TeamPanel, PathBuf, Lane, Lane) {
-            let dir = ws(tag);
-            let mut p = started_panel(&dir);
-            let boot_a = p.take_launches();
-            p.plan(SPEC, "SPEC.md", RunOptions::default())
-                .expect("2 本目");
-            p.act(TeamAction::Start);
-            // まだどのセッションも結んでいないので、空の観測で回してよい。
-            p.pump(super::super::super::runtime::Observation {
-                now: 2,
-                sessions: Vec::new(),
-            });
-            let boot_b = p.take_launches();
-            let a = bind_lane(&mut p, &boot_a, 101);
-            let b = bind_lane(&mut p, &boot_b, 201);
+            let (p, dir, mut lanes) = many_lanes(tag, 2);
+            let b = lanes.pop().unwrap();
+            let a = lanes.pop().unwrap();
             assert_ne!(a.owner, b.owner, "同じ Run になっている");
             assert_ne!(a.dir, b.dir, "置き場が Run ごとに分かれていない");
             assert_ne!(a.sid, b.sid);
@@ -5484,6 +5660,158 @@ mod tests {
                     assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
                 }
             }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 先頭の Run が毎 tick の上限を使い切っても、後続 Run の 1 通は
+        /// 同じ tick で処理される。Run の走査順を毎回 0 から始める実装では
+        /// B が永久に届かない。
+        #[test]
+        fn 先頭runが上限以上を投入しても後続runは飢餓しない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-round-robin");
+            for i in 0..(OUTBOX_PER_TICK + 8) {
+                submit(
+                    &a.dir,
+                    "team-lead",
+                    &format!("{i:03}"),
+                    &report("team-lead", 90 + (i as u64 % 5)),
+                );
+            }
+            let fb = submit(&b.dir, "team-lead", "only", &report("team-lead", 99));
+
+            p.pump_sessions(rows(&[&a, &b]), 100);
+
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "先頭 Run が予算を独占した");
+            assert!(!fb.exists(), "後続 Run の正常な報告が残っている");
+            let remaining = outbox::list_reports(&a.dir).len();
+            assert!(remaining > 0, "公平性のためでなく全件を読んでしまった");
+            assert_eq!(
+                remaining,
+                OUTBOX_PER_TICK + 8 - (OUTBOX_PER_TICK - 1),
+                "1 tick の全体上限が変わった"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 壊れたファイルは再試行対象でも 1 Run の列を占有させない。
+        #[test]
+        fn 壊れたファイルの山があっても後続runを止めない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-broken-fairness");
+            for i in 0..(OUTBOX_PER_TICK + 8) {
+                let f = a
+                    .dir
+                    .join(outbox::final_name("team-lead", &format!("{i:03}")));
+                std::fs::write(f, "{書きかけ").unwrap();
+            }
+            let fb = submit(&b.dir, "team-lead", "only", &report("team-lead", 99));
+
+            p.pump_sessions(rows(&[&a, &b]), 100);
+
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "壊れた Run が後続 Run を止めた");
+            assert!(!fb.exists());
+            assert_eq!(
+                p.outbox_ledger.tracked().len(),
+                OUTBOX_PER_TICK - 1,
+                "壊れたファイルを上限以上に読んだ"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 非 UTF-8 は書き足せば直る JSON ではない。20 tick 再読せず、最初の
+        /// bounded read で証拠を隔離する。
+        #[test]
+        fn 非utf8は一回で隔離して他runを止めない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-non-utf8");
+            let bad = a.dir.join(outbox::final_name("team-lead", "bad"));
+            std::fs::write(&bad, [0xff, 0xfe, 0xfd]).unwrap();
+            let good = submit(&b.dir, "team-lead", "good", &report("team-lead", 99));
+
+            p.pump_sessions(rows(&[&a, &b]), 100);
+
+            assert!(!bad.exists(), "非 UTF-8 を再試行のため残した");
+            assert!(
+                !outbox::list_reports(&a.dir).iter().any(|p| p == &bad),
+                "非 UTF-8 が次の tick の走査対象に残った"
+            );
+            assert_eq!(saw(&p, &b.owner, "#99"), 1);
+            assert!(!good.exists());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 巨大ファイルは一回で隔離し他runの正常報告を止めない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-huge");
+            let huge = a.dir.join(outbox::final_name("team-lead", "huge"));
+            std::fs::write(
+                &huge,
+                vec![b'x'; super::super::super::result_parser::BLOCK_MAX_BYTES + 1],
+            )
+            .unwrap();
+            let name = name_of(&huge);
+            let good = submit(&b.dir, "team-lead", "good", &report("team-lead", 99));
+
+            p.pump_sessions(rows(&[&a, &b]), 100);
+
+            assert!(!huge.exists(), "上限超過を再試行のため残した");
+            let rejected = a.dir.join(outbox::REJECTED_DIR).join(&name);
+            assert!(rejected.exists(), "巨大ファイルの証拠を隔離していない");
+            assert_eq!(quarantined(&p, &a.owner, &name), 1);
+            assert!(!p.outbox_ledger.tracked().contains(&huge), "再試行台帳へ載せた");
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "他Runの報告を止めた");
+            assert!(!good.exists());
+
+            for now in 101..101 + u64::from(outbox::MAX_ATTEMPTS) {
+                p.pump_sessions(rows(&[&a, &b]), now);
+            }
+            assert_eq!(
+                quarantined(&p, &a.owner, &name),
+                1,
+                "隔離後も20回読み直した"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 四runへ継続投入しても全runが有限tick内に処理される() {
+            let (mut p, dir, lanes) = many_lanes("outbox-four-runs", 4);
+            for tick in 0..4u64 {
+                for (lane_no, lane) in lanes.iter().enumerate() {
+                    for file_no in 0..(OUTBOX_PER_TICK / 2) {
+                        submit(
+                            &lane.dir,
+                            "team-lead",
+                            &format!("{tick:02}-{file_no:03}"),
+                            &report("team-lead", 90 + lane_no as u64),
+                        );
+                    }
+                }
+                let refs: Vec<&Lane> = lanes.iter().collect();
+                p.pump_sessions(rows(&refs), 100 + tick);
+            }
+            for (lane_no, lane) in lanes.iter().enumerate() {
+                assert!(
+                    saw(&p, &lane.owner, &format!("#{}", 90 + lane_no)) > 0,
+                    "Run {lane_no} が4 tick待っても一度も処理されない"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn ファイルcursorは壊れた名前順先頭の後ろへ進む() {
+            let (mut p, dir, a, b) = two_lanes("outbox-file-cursor");
+            for i in 0..(OUTBOX_PER_TICK + 8) {
+                let f = a
+                    .dir
+                    .join(outbox::final_name("team-lead", &format!("a-{i:03}")));
+                std::fs::write(f, "{壊れた").unwrap();
+            }
+            let valid = submit(&a.dir, "team-lead", "z-valid", &report("team-lead", 99));
+            for now in 100..103 {
+                p.pump_sessions(rows(&[&a, &b]), now);
+            }
+            assert_eq!(saw(&p, &a.owner, "#99"), 1, "名前順の後方が永久に読まれない");
+            assert!(!valid.exists());
             std::fs::remove_dir_all(&dir).ok();
         }
 
