@@ -270,6 +270,15 @@ pub fn prepare(ws: &Path) -> Result<Prepared, String> {
         git(ws, &["init"], None)?;
         // init 直後は必ず HEAD が無い。ここから先は `NoCommits` と同じ道。
     }
+    // **利用者の index を、何があっても元へ戻す。**
+    //
+    // 下の処理はどれも一時 index の上で動くので普通は触らない。それでも
+    // 番人を置くのは、`update-ref` が通った後で落ちる「部分成功」や、
+    // 将来ここへ index を触る処理が足された場合に、利用者の staging が
+    // 黙って消えるのを構造で防ぐため。Drop で戻すので、`?` で早期に
+    // 戻っても panic しても効く。
+    let guard = IndexGuard::capture(ws)?;
+
     // **危険そうな未追跡ファイルを黙って履歴へ入れない。**
     // `--exclude-standard` が `.gitignore` を尊重するので、除外済みは出ない。
     let untracked = git(ws, &["ls-files", "--others", "--exclude-standard"], None)?;
@@ -293,14 +302,33 @@ pub fn prepare(ws: &Path) -> Result<Prepared, String> {
         ));
     }
     // 一時 index の上で木を組む (利用者の index は 1 バイトも変えない)。
-    let tmp = tmp_index_path(ws);
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = tmp_index_path(ws)?;
     let built = (|| -> Result<String, String> {
         git(ws, &["add", "-A"], Some(&tmp))?;
         git(ws, &["write-tree"], Some(&tmp))
     })();
     let _ = std::fs::remove_file(&tmp);
     let tree = built?;
+
+    // **利用者が stage したものを失わないことを、コミットする前に確かめる。**
+    //
+    // 基準点を作った後は index が HEAD と噛み合っていないと、`git status` が
+    // 全ファイルを「staged deletion」として並べ、基準点が「全部汚れている」に
+    // なる (実測が意味を失う)。噛み合わせるには index を HEAD へ揃えるしか
+    // ないが、それは利用者の staging を書き換えることでもある。
+    //
+    // そこで**書き換えても何も失われないときだけ**進める:
+    //
+    // * index が空 — 守るものが無い (`git init` 直後。ほとんどはこれ)
+    // * index が新しい木と完全に一致 — 揃えても中身は変わらない
+    //
+    // どちらでもない (一部だけ stage した / `add -N` した / 削除や rename を
+    // stage した) なら**コミットを作らずに断る**。人が自分でコミットするか
+    // staging を畳めば、次に押したときは上のどちらかになる。
+    if let Some(why) = staged_conflict(ws, &tree)? {
+        return Err(why);
+    }
+
     // **作者名は Run のためだけに与える。** 利用者の global 設定を触らない
     // (`-c` はこの 1 コマンドにしか効かない)。
     let commit = git(
@@ -320,31 +348,148 @@ pub fn prepare(ws: &Path) -> Result<Prepared, String> {
     let head_ref =
         git(ws, &["symbolic-ref", "HEAD"], None).unwrap_or_else(|_| "refs/heads/main".to_string());
     git(ws, &["update-ref", &head_ref, &commit], None)?;
-    // ここまで来て初めて利用者の index を HEAD へ揃える。**揃えないと
-    // 「HEAD にあるのに index に無い」= 全ファイルが削除扱い**になる。
-    // 内容は作業ツリーのまま (`read-tree` は作業ツリーを触らない)。
+    // ここまで来て初めて index を HEAD へ揃える。上で「揃えても何も失われない」
+    // ことを確かめてあるので、利用者のものは 1 つも消えない。作業ツリーは
+    // 触らない (`read-tree` はファイルを書き換えない)。
     git(ws, &["read-tree", "HEAD"], None)?;
+    // 意図した書き換えなので、番人には戻させない。
+    guard.disarm();
     Ok(Prepared::Committed)
 }
 
+/// **index を HEAD へ揃えると失われるものがあるか** (`Some` = 断る理由)。
+///
+/// 比べるのは「index に載っている物」と「これから HEAD になる木」。
+/// 完全に一致するか、index が空なら失われるものは無い。
+fn staged_conflict(ws: &Path, tree: &str) -> Result<Option<String>, String> {
+    // `<mode> <oid> <stage>\t<path>` を `mode oid path` へ畳む
+    // (stage 番号は畳まない — 未解決マージがあれば必ず食い違って断る)。
+    let norm = |raw: &str| -> Vec<String> {
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.replace('\t', " "))
+            .collect()
+    };
+    let staged = norm(&git(ws, &["ls-files", "--stage"], None)?);
+    if staged.is_empty() {
+        return Ok(None);
+    }
+    // 木の側も同じ形にする (`ls-tree -r` は `<mode> blob <oid>\t<path>`)。
+    let tree_raw = git(ws, &["ls-tree", "-r", tree], None)?;
+    let mut in_tree: Vec<String> = tree_raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let (meta, path) = l.split_once('\t')?;
+            let mut it = meta.split_whitespace();
+            let mode = it.next()?;
+            let _kind = it.next()?;
+            let oid = it.next()?;
+            Some(format!("{mode} {oid} 0 {path}"))
+        })
+        .collect();
+    let mut staged = staged;
+    staged.sort();
+    in_tree.sort();
+    if staged == in_tree {
+        return Ok(None);
+    }
+    Ok(Some(
+        "このリポジトリにはコミットがまだ無く、staging に作業中の内容が残って          います。基準点を作ると staging を畳むことになるので中止しました。\n         先に自分でコミットするか、`git reset` で staging を空にしてから、         もう一度押してください (ファイルは 1 つも変更していません)"
+            .to_string(),
+    ))
+}
+
+/// **利用者の index を元へ戻す番人。**
+///
+/// 取ったときの中身を覚えておき、[`Self::disarm`] を呼ばずに落ちたら
+/// Drop で書き戻す。途中で失敗しても・`?` で早期に戻っても・panic しても
+/// 効くので、「すべてのエラー経路で復元する」を人の注意力ではなく構造で
+/// 満たす。
+struct IndexGuard {
+    path: PathBuf,
+    /// 取ったときの中身 (`None` = そもそも index が無かった)。
+    before: Option<Vec<u8>>,
+    armed: bool,
+}
+
+impl IndexGuard {
+    /// いまの index を覚える。**git ディレクトリは `git rev-parse` に訊く** —
+    /// linked worktree では `.git` はディレクトリではなくファイルなので、
+    /// `ws/.git/index` を決め打つと別のリポジトリの index を触る。
+    fn capture(ws: &Path) -> Result<Self, String> {
+        let dir = git_dir(ws)?;
+        let path = dir.join("index");
+        let before = match std::fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("index を読めません: {e}")),
+        };
+        Ok(Self {
+            path,
+            before,
+            armed: true,
+        })
+    }
+
+    /// 意図した書き換えなので戻さない。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for IndexGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match &self.before {
+            Some(bytes) => {
+                // 書き戻しは一時ファイル経由 (途中で落ちても壊れた index を残さない)。
+                let tmp = self.path.with_extension("zaivern-restore");
+                if std::fs::write(&tmp, bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &self.path);
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            // 無かったものは無い状態へ戻す。
+            None => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+/// このワークスペースの git ディレクトリ (linked worktree なら専用のほう)。
+fn git_dir(ws: &Path) -> Result<PathBuf, String> {
+    let raw = git(ws, &["rev-parse", "--absolute-git-dir"], None)?;
+    let p = PathBuf::from(raw.trim());
+    if p.as_os_str().is_empty() {
+        return Err("git ディレクトリを特定できません".to_string());
+    }
+    Ok(p)
+}
+
 /// 一時 index の置き場 (`.git` の中。同時に押しても衝突しない名前)。
-fn tmp_index_path(ws: &Path) -> PathBuf {
+/// 一時 index の置き場。**同時に 2 回走っても衝突しない名前**にする。
+///
+/// 置くのは git ディレクトリの中 (linked worktree でも正しいほう)。
+/// 名前は pid + ナノ秒 + プロセス内の通し番号。ナノ秒だけだと、同じ
+/// プロセスの 2 スレッドが同じ値を読みうる。
+fn tmp_index_path(ws: &Path) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    // `.git` が無い段 (init 前) では呼ばれないが、無ければ一時ディレクトリへ。
-    let base = ws.join(".git");
-    let dir = if base.is_dir() {
-        base
-    } else {
-        std::env::temp_dir()
-    };
-    dir.join(format!(
-        "zaivern-baseline-index.{}.{}",
+    let dir = git_dir(ws)?;
+    Ok(dir.join(format!(
+        "zaivern-baseline-index.{}.{}.{}",
         std::process::id(),
-        stamp
-    ))
+        stamp,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 #[cfg(test)]
@@ -729,6 +874,309 @@ mod tests {
             .filter(|n| n.starts_with("zaivern-baseline-index"))
             .collect();
         assert!(left.is_empty(), "一時 index が残った: {left:?}");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **利用者の index の写し** (`git ls-files --stage` と生バイト)。
+    fn index_snapshot(ws: &Path) -> (String, Option<Vec<u8>>) {
+        let listed = git(ws, &["ls-files", "--stage"], None).unwrap_or_default();
+        let raw = git_dir(ws).ok().and_then(|d| std::fs::read(d.join("index")).ok());
+        (listed, raw)
+    }
+
+    /// 作業ツリーの中身 (パス → 内容)。**ファイルを 1 つも壊していない**
+    /// ことを、内容そのもので確かめるため。
+    fn worktree(ws: &Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(
+            base: &Path,
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<String, String>,
+        ) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name();
+                if name == ".git" {
+                    continue;
+                }
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else if let Ok(body) = std::fs::read_to_string(&p) {
+                    if let Ok(rel) = p.strip_prefix(base) {
+                        out.insert(rel.to_string_lossy().replace('\\', "/"), body);
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(ws, ws, &mut out);
+        out
+    }
+
+    /// staging を残したまま `prepare` を呼び、**何も変わっていない**ことを見る。
+    ///
+    /// 戻りは `prepare` の結果 (呼び出し側が理由を確かめる)。
+    fn expect_index_preserved(ws: &Path) -> Result<Prepared, String> {
+        let (listed_before, raw_before) = index_snapshot(ws);
+        let cached_before = git(ws, &["diff", "--cached", "--name-status"], None).unwrap_or_default();
+        let unstaged_before = git(ws, &["diff", "--name-status"], None).unwrap_or_default();
+        let tree_before = worktree(ws);
+        let out = prepare(ws);
+        let (listed_after, raw_after) = index_snapshot(ws);
+        assert_eq!(listed_before, listed_after, "index の中身が変わった");
+        assert_eq!(raw_before, raw_after, "index のバイト列が変わった");
+        assert_eq!(
+            cached_before,
+            git(ws, &["diff", "--cached", "--name-status"], None).unwrap_or_default(),
+            "staged の差分が変わった"
+        );
+        assert_eq!(
+            unstaged_before,
+            git(ws, &["diff", "--name-status"], None).unwrap_or_default(),
+            "unstaged の差分が変わった"
+        );
+        assert_eq!(tree_before, worktree(ws), "作業ツリーのファイルが変わった");
+        out
+    }
+
+    /// 何か 1 つ stage した unborn HEAD のリポジトリ。
+    fn staged_lab(tag: &str) -> Option<PathBuf> {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return None;
+        }
+        let ws = lab(tag);
+        assert!(init_repo(&ws), "git init");
+        std::fs::write(ws.join("a.rs"), "one").unwrap();
+        std::fs::write(ws.join("b.rs"), "two").unwrap();
+        Some(ws)
+    }
+
+    /// **一部だけ stage 済みの unborn HEAD では、index を書き換えずに断る。**
+    ///
+    /// 基準点を作ると index を HEAD へ揃えることになり、利用者の staging が
+    /// 畳まれる。畳んでよいかはこちらでは決められないので、**コミットを
+    /// 作らずに断る**。ファイルも index も 1 バイトも変えない。
+    #[test]
+    fn 一部だけstage済みのunborn_headでは断る() {
+        let Some(ws) = staged_lab("staged-subset") else {
+            return;
+        };
+        assert!(run(&ws, &["add", "a.rs"]));
+        assert_eq!(probe(&ws).state, GitState::NoCommits);
+        let err = expect_index_preserved(&ws).expect_err("断るべき");
+        assert!(err.contains("staging"), "理由が伝わっていない: {err}");
+        assert_eq!(probe(&ws).state, GitState::NoCommits, "コミットを作った");
+        // **やり直せる。** staging を畳めば通る。
+        assert!(run(&ws, &["reset", "-q"]));
+        assert_eq!(prepare(&ws).expect("畳めば作れる"), Prepared::Committed);
+        assert_eq!(probe(&ws).state, GitState::CleanHead);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **staged と unstaged が混ざっていても壊さない。**
+    #[test]
+    fn stagedとunstagedが混ざっていても壊さない() {
+        let Some(ws) = staged_lab("staged-mixed") else {
+            return;
+        };
+        assert!(run(&ws, &["add", "a.rs"]));
+        // stage した後に書き換える (staged と working が違う状態)。
+        std::fs::write(ws.join("a.rs"), "one-edited").unwrap();
+        assert!(expect_index_preserved(&ws).is_err(), "断るべき");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **`git add -N` (intent-to-add) を壊さない。**
+    #[test]
+    fn intent_to_addを壊さない() {
+        let Some(ws) = staged_lab("intent-to-add") else {
+            return;
+        };
+        if !run(&ws, &["add", "-N", "a.rs"]) {
+            println!("[skip] add -N を使えません");
+            std::fs::remove_dir_all(&ws).ok();
+            return;
+        }
+        assert!(expect_index_preserved(&ws).is_err(), "断るべき");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **staged deletion と staged rename を壊さない** (HEAD がある側で)。
+    ///
+    /// HEAD があるリポジトリは `AlreadyReady` なので 1 コミットもしない。
+    /// 削除と rename を stage したまま押しても、何も変わらないことを見る。
+    #[test]
+    fn staged_deletionとrenameを壊さない() {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return;
+        }
+        let ws = lab("staged-del-rename");
+        assert!(init_repo(&ws), "git init");
+        std::fs::write(ws.join("a.rs"), "one").unwrap();
+        std::fs::write(ws.join("b.rs"), "two").unwrap();
+        assert!(run(&ws, &["add", "-A"]));
+        assert!(run(&ws, &["commit", "-qm", "first"]));
+        // 削除を stage
+        assert!(run(&ws, &["rm", "-q", "a.rs"]));
+        // rename を stage
+        std::fs::rename(ws.join("b.rs"), ws.join("c.rs")).unwrap();
+        assert!(run(&ws, &["add", "-A"]));
+        let staged = git(&ws, &["diff", "--cached", "--name-status", "-M"], None).expect("staged");
+        assert!(staged.contains('D') && staged.contains('R'), "前提: {staged}");
+        let head_before = git(&ws, &["rev-parse", "HEAD"], None).expect("HEAD");
+        assert_eq!(
+            expect_index_preserved(&ws).expect("HEAD があるので使える"),
+            Prepared::AlreadyReady
+        );
+        assert_eq!(
+            git(&ws, &["rev-parse", "HEAD"], None).expect("HEAD"),
+            head_before,
+            "既存のリポジトリへコミットした"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **番人が本当に戻すこと**を、わざと index を壊して確かめる。
+    ///
+    /// `update-ref` が通った後で落ちる「部分成功」でも index が残ることの
+    /// 保証は、この番人 ([`IndexGuard`]) が担う。空回りしていないことを
+    /// 実際に書き換えて見る。
+    #[test]
+    fn index番人は書き換えを元へ戻す() {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return;
+        }
+        let ws = lab("index-guard");
+        assert!(init_repo(&ws), "git init");
+        std::fs::write(ws.join("a.rs"), "one").unwrap();
+        assert!(run(&ws, &["add", "a.rs"]));
+        let (listed, raw) = index_snapshot(&ws);
+        assert!(!listed.trim().is_empty(), "前提: 何か stage されている");
+        {
+            let guard = IndexGuard::capture(&ws).expect("覚えられる");
+            // 番人が生きている間に index を壊す (別経路が触った、の再現)。
+            assert!(run(&ws, &["reset", "-q"]));
+            assert!(
+                git(&ws, &["ls-files", "--stage"], None)
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty(),
+                "前提: 壊せている"
+            );
+            drop(guard);
+        }
+        assert_eq!(index_snapshot(&ws), (listed, raw), "番人が戻していない");
+
+        // **disarm したら戻さない** (意図した書き換えを打ち消さない)。
+        {
+            let guard = IndexGuard::capture(&ws).expect("覚えられる");
+            assert!(run(&ws, &["reset", "-q"]));
+            guard.disarm();
+        }
+        assert!(
+            git(&ws, &["ls-files", "--stage"], None)
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "disarm したのに戻した"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **index が無かったなら、無い状態へ戻す。**
+    #[test]
+    fn index番人は無かった状態も戻す() {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return;
+        }
+        let ws = lab("index-guard-none");
+        assert!(init_repo(&ws), "git init");
+        std::fs::write(ws.join("a.rs"), "one").unwrap();
+        let idx = git_dir(&ws).expect("git dir").join("index");
+        let _ = std::fs::remove_file(&idx);
+        assert!(!idx.exists(), "前提: index が無い");
+        {
+            let guard = IndexGuard::capture(&ws).expect("覚えられる");
+            assert!(run(&ws, &["add", "a.rs"]));
+            assert!(idx.exists(), "前提: 作られている");
+            drop(guard);
+        }
+        assert!(!idx.exists(), "無かった index を消していない");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    /// **linked worktree でも、その worktree の index を触る。**
+    ///
+    /// `.git` はファイルなので `ws/.git/index` を決め打つと、別の
+    /// リポジトリの index を読み書きすることになる。
+    #[test]
+    fn linked_worktreeでは専用のgitディレクトリを使う() {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return;
+        }
+        let parent = lab("wt-gitdir");
+        assert!(init_repo(&parent), "git init");
+        std::fs::write(parent.join("a.rs"), "one").unwrap();
+        assert!(run(&parent, &["add", "-A"]));
+        assert!(run(&parent, &["commit", "-qm", "first"]));
+        let wt = parent.with_file_name(format!(
+            "{}-wt",
+            parent.file_name().and_then(|n| n.to_str()).unwrap_or("wt")
+        ));
+        if !run(
+            &parent,
+            &["worktree", "add", "-q", &wt.to_string_lossy(), "-b", "zv-wt"],
+        ) {
+            println!("[skip] worktree を作れませんでした");
+            std::fs::remove_dir_all(&parent).ok();
+            return;
+        }
+        assert!(wt.join(".git").is_file(), "前提: .git はファイル");
+        let wt_dir = git_dir(&wt).expect("worktree の git dir");
+        let parent_dir = git_dir(&parent).expect("親の git dir");
+        assert_ne!(wt_dir, parent_dir, "親の git ディレクトリを指している");
+        assert!(
+            wt_dir.starts_with(&parent_dir),
+            "worktree の git dir が親の下に無い: {}",
+            wt_dir.display()
+        );
+        // 一時 index も worktree 側へ置く。
+        let tmp = tmp_index_path(&wt).expect("一時 index");
+        assert!(tmp.starts_with(&wt_dir), "一時 index の置き場が違う");
+        // 親の staging を壊さない。
+        std::fs::write(parent.join("b.rs"), "two").unwrap();
+        assert!(run(&parent, &["add", "b.rs"]));
+        let parent_staged = git(&parent, &["ls-files", "--stage"], None).expect("親の index");
+        assert_eq!(prepare(&wt).expect("HEAD があるので使える"), Prepared::AlreadyReady);
+        assert_eq!(
+            git(&parent, &["ls-files", "--stage"], None).expect("親の index"),
+            parent_staged,
+            "親の index を触った"
+        );
+        let _ = run(&parent, &["worktree", "remove", "--force", &wt.to_string_lossy()]);
+        std::fs::remove_dir_all(&wt).ok();
+        std::fs::remove_dir_all(&parent).ok();
+    }
+
+    /// **一時 index の名前は同時に走っても衝突しない。**
+    #[test]
+    fn 一時indexの名前は衝突しない() {
+        if !git_available() {
+            println!("[skip] git がありません");
+            return;
+        }
+        let ws = lab("tmp-index-unique");
+        assert!(init_repo(&ws), "git init");
+        let a = tmp_index_path(&ws).expect("1 つ目");
+        let b = tmp_index_path(&ws).expect("2 つ目");
+        assert_ne!(a, b, "同じ名前を 2 度返した");
         std::fs::remove_dir_all(&ws).ok();
     }
 }

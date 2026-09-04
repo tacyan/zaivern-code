@@ -358,9 +358,13 @@ pub struct TeamRuntime {
     /// 「直したのに永久に受け取られない」になる (再検証・再レビューの
     /// 経路が実際にそうなった)。動いた = 話が進んだ、なので同じ文面でも
     /// 別の提出として扱ってよい。
-    seen_blocks: HashSet<u64>,
+    /// **本文だけで数えない。** 送り主・種別・宛先まで含めた構造化キー
+    /// ([`SeenKey`]) で覚える。本文だけにすると、別の担当が同じ文面を出した
+    /// だけで 2 通目が消える (実際にレビューの `{"verdict":"approve"}` が
+    /// これで落ち、タスクが `Reviewing` のまま止まりうる)。
+    seen_blocks: HashSet<SeenKey>,
     /// 古い順に捨てるための並び (上限 [`SEEN_BLOCKS_CAP`])。
-    seen_block_order: VecDeque<u64>,
+    seen_block_order: VecDeque<SeenKey>,
     /// **報告を受け取るフォルダ。** 画面ではなくここから読む。
     ///
     /// Claude Code v2 は報告を改行ではなく**カーソル移動**
@@ -402,6 +406,74 @@ pub const PREVIEW_MAX_CHARS: usize = 4_000;
 /// 上限が無いと、長く走った Run のぶんだけ記憶が太る。塊は報告・レビュー・
 /// 事象・伝言の 4 種類しかないので、この数で十分足りる。
 pub const SEEN_BLOCKS_CAP: usize = 512;
+
+/// **「もう取り込んだ」を数える単位。**
+///
+/// 本文だけで数えてはいけない。構造化報告は種類によっては送り主を本文に
+/// 持たない (`message` の `{"to":…,"text":…}`、`review` の
+/// `{"task_id":…,"verdict":…}`) ので、**別の担当が同じ文面を出しただけで
+/// 2 通目が黙って消える**。レビューがそれで落ちると、実装済みのタスクが
+/// `Reviewing` のまま止まる。
+///
+/// なので鍵は「誰が・どの種類で・どの対象へ・何を」の 4 つで持つ。
+/// 送り主・種別・対象は**そのまま**保持し (ハッシュしない)、本文だけを
+/// 指紋にする。
+///
+/// ## 本文の指紋を 64bit 1 本にしない
+///
+/// `fnv1a64` を 1 本だけ使うと、衝突した瞬間に**正しい報告が黙って消える**
+/// (消えたことは誰にも見えない)。ここでは
+///
+/// * 128bit ぶん (種の違う 2 本) の指紋
+/// * 本文の**バイト長**
+///
+/// を持つ。長さが違えば指紋が一致しても別物と分かるので、偶然の一致で
+/// 報告を落とすことは現実的に起こらない。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SeenKey {
+    /// 送り主。**同じ文面でも担当が違えば別の報告。**
+    agent: AgentId,
+    /// 種別 (`result` / `review` / `message` / `event`)。
+    kind: &'static str,
+    /// 対象タスク (本文から読めたときだけ)。読めなくても本文の指紋が効く。
+    task: Option<TaskId>,
+    /// 本文の指紋 (128bit) と長さ。
+    digest: (u64, u64),
+    len: u32,
+}
+
+/// 置き場の 1 通を取り込んだ結果 ([`TeamRuntime::accept_outbox`])。
+///
+/// **「適用した」と「もう適用してあった」を分ける。** どちらもファイルは
+/// 片付けてよいが、混ぜると「何も起きていないのに消えた」を追えなくなる。
+/// 意味としての却下は `Err` — ファイルは隔離して理由を残す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// 状態へ適用した。
+    Applied,
+    /// 同じ報告が既に適用済み (画面から先に届いていた等)。
+    Duplicate,
+}
+
+/// 本文の指紋 (128bit) と長さ。**種の違う 2 本**を取る。
+fn body_digest(body: &str) -> ((u64, u64), u32) {
+    let a = crate::history::fnv1a64(body.as_bytes());
+    // 2 本目は塩を混ぜて取る (同じ関数を 2 回呼んでも同じ値にならないように)。
+    let mut salted = Vec::with_capacity(body.len() + 8);
+    salted.extend_from_slice(b"zai-seen");
+    salted.extend_from_slice(body.as_bytes());
+    let b = crate::history::fnv1a64(&salted);
+    ((a, b), body.len().min(u32::MAX as usize) as u32)
+}
+
+/// 本文から対象タスクを読む (読めなければ `None`)。
+///
+/// `result` と `review` は `task_id` を持つ。**鍵に足すのは、同じ担当が
+/// 別のレビュー対象へ同じ文面を返したときに区別するため**。
+fn task_of_body(body: &str) -> Option<TaskId> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("task_id").and_then(|t| t.as_u64())
+}
 
 // ── 停滞の検知 ───────────────────────────────────────────────────────
 //
@@ -2674,10 +2746,10 @@ impl TeamRuntime {
             }
             // **同じ塊は一度しか取り込まない。** 画面は同じ報告を何度も
             // 映すので、これが無いと 1 通の完了報告が毎 tick 読み直される。
-            let results = self.take_unseen(results);
-            let reviews = self.take_unseen(reviews);
-            let events = self.take_unseen(events);
-            let msgs = self.take_unseen(msgs);
+            let results = self.take_unseen(&agent, super::outbox::Kind::Result, results);
+            let reviews = self.take_unseen(&agent, super::outbox::Kind::Review, reviews);
+            let events = self.take_unseen(&agent, super::outbox::Kind::Event, events);
+            let msgs = self.take_unseen(&agent, super::outbox::Kind::Message, msgs);
             if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
                 continue;
             }
@@ -2690,17 +2762,19 @@ impl TeamRuntime {
             });
         }
         for p in picked {
+            // **却下は画面経路でも記録済み** (`take_*` が理由を時系列へ残す)。
+            // ここで結果を捨ててよいのは、画面には再送の口が無いため。
             for body in p.results {
-                self.take_result(&p.agent, &body);
+                let _ = self.take_result(&p.agent, &body);
             }
             for body in p.reviews {
-                self.take_review(&p.agent, &body);
+                let _ = self.take_review(&p.agent, &body);
             }
             for body in p.events {
-                self.take_event(&p.agent, &body, obs.now);
+                let _ = self.take_event(&p.agent, &body, obs.now);
             }
             for body in p.msgs {
-                self.take_message(&p.agent, &body);
+                let _ = self.take_message(&p.agent, &body);
             }
         }
     }
@@ -2713,7 +2787,7 @@ impl TeamRuntime {
     ///
     /// 配達は人の指示と同じ経路 (`SendManualInstruction`) を使う。
     /// 第 2 の配達路を作ると、片方だけ届く状態が生まれる。
-    fn take_message(&mut self, from: &AgentId, body: &str) {
+    fn take_message(&mut self, from: &AgentId, body: &str) -> Result<(), String> {
         let known: Vec<(AgentId, String)> = self
             .agents
             .iter()
@@ -2722,32 +2796,28 @@ impl TeamRuntime {
             .collect();
         let (targets, text) = match rp::check_message(body, &known, from) {
             Ok(v) => v,
-            Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(from.clone()),
-                    None,
-                    e.detail(),
-                );
-                return;
-            }
+            Err(e) => return Err(self.reject(from, None, e.detail())),
         };
         let sender = self
             .agent(from)
             .map(|a| a.name.clone())
             .unwrap_or_else(|| from.0.clone());
+        // **1 通も渡せなければ却下。** 一部でも渡せたなら受理する
+        // (渡せなかった相手は下で個別に理由が残る)。
+        let mut delivered = 0usize;
+        let mut last_why: Option<String> = None;
         for to in targets {
             let Some(session) = self.agent(&to).and_then(|a| a.session_id) else {
                 // 端末を持たない相手 (報告されたサブエージェント) には配れない。
                 // **黙って捨てない** — 送ったほうは届いた気になっている。
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(from.clone()),
+                last_why = Some(self.reject(
+                    from,
                     Some(to.clone()),
                     format!("{} は端末を持っていないので伝言を渡せません", to.0),
-                );
+                ));
                 continue;
             };
+            delivered += 1;
             let id = self.log_to(
                 TeamEventKind::AgentMessage,
                 Some(from.clone()),
@@ -2772,6 +2842,11 @@ impl TeamRuntime {
                 key: format!("manual:{}:{id}", to.0),
             });
         }
+        if delivered == 0 {
+            return Err(last_why
+                .unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string()));
+        }
+        Ok(())
     }
 
     /// **伝言の末尾に添える「あなたの担当は変わっていない」。**
@@ -2862,37 +2937,50 @@ impl TeamRuntime {
     /// プロセスが終わった直後**に書かれた報告を落とす。ここは担当 ID だけで
     /// 届くので落ちない。
     ///
-    /// 二重取り込みは塊の指紋 (`take_unseen`) が止める。画面と置き場の両方に
-    /// 同じ報告があっても、**先に来たほうだけ**が効く。既に取り込んだ塊は
-    /// `Ok(())` を返す — 呼び出し側はファイルを消してよい (残すと毎 tick
-    /// 同じ塊を読み直す)。
+    /// 戻りは 3 通り。呼び出し側 (`panel::drain_outbox`) はこれで
+    /// 「消す / 消す / 隔離する」を決める:
     ///
-    /// `Err` はこの Run のものではないとき。呼び出し側が理由ごと隔離する。
+    /// | 戻り | 意味 | 置き場のファイル |
+    /// | --- | --- | --- |
+    /// | [`AcceptOutcome::Applied`] | 状態へ適用した | 消す |
+    /// | [`AcceptOutcome::Duplicate`] | 同じ報告が適用済み | 消す |
+    /// | `Err(理由)` | 意味として却下した | `rejected/` へ隔離 |
+    ///
+    /// **却下したものを重複台帳へ入れない。** 入れると、直して出し直した
+    /// 報告まで「もう見た」で捨てることになる (直したのに永久に届かない)。
+    /// 台帳へ入れるのは適用が成功した後だけ。
+    ///
+    /// 二重取り込みは構造化キー ([`SeenKey`]) が止める。画面と置き場の
+    /// 両方に同じ報告があっても、**先に来たほうだけ**が効く。
     pub fn accept_outbox(
         &mut self,
         agent: &AgentId,
         kind: super::outbox::Kind,
         body: &str,
         now: u64,
-    ) -> Result<(), String> {
+    ) -> Result<AcceptOutcome, String> {
         if !self.agents.iter().any(|a| a.id == *agent) {
             return Err(format!("{agent} はこの Run の担当ではありません"));
         }
         if rp::looks_incomplete(body) {
             return Err("JSON オブジェクトではありません".to_string());
         }
-        if self.take_unseen(vec![body.trim().to_string()]).is_empty() {
+        let key = Self::seen_key(agent, kind, body);
+        if self.is_seen(&key) {
             // 画面から先に取り込んでいた。**二度は効かせない**が、
             // ファイルは片付けてよい (目的は果たされている)。
-            return Ok(());
+            return Ok(AcceptOutcome::Duplicate);
         }
-        match kind {
+        let applied = match kind {
             super::outbox::Kind::Result => self.take_result(agent, body),
             super::outbox::Kind::Review => self.take_review(agent, body),
             super::outbox::Kind::Message => self.take_message(agent, body),
             super::outbox::Kind::Event => self.take_event(agent, body, now),
-        }
-        Ok(())
+        };
+        // **適用できたときだけ印を付ける。**
+        applied?;
+        self.mark_seen(key);
+        Ok(AcceptOutcome::Applied)
     }
 
     /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
@@ -2922,20 +3010,70 @@ impl TeamRuntime {
         kept[from..].join("\n")
     }
 
+    /// **却下を記録して、その理由を返す。**
+    ///
+    /// 記録と戻り値の綴りを 1 か所に閉じる。2 か所で書くと、時系列に出る
+    /// 文と隔離の理由がずれる (どちらが本当か追えなくなる)。
+    fn reject(&mut self, agent: &AgentId, target: Option<AgentId>, why: String) -> String {
+        self.log(
+            TeamEventKind::Rejected,
+            Some(agent.clone()),
+            target,
+            why.clone(),
+        );
+        why
+    }
+
+    /// 「誰が・どの種類で・どの対象へ・何を」の構造化キー ([`SeenKey`])。
+    fn seen_key(agent: &AgentId, kind: super::outbox::Kind, body: &str) -> SeenKey {
+        let trimmed = body.trim();
+        let (digest, len) = body_digest(trimmed);
+        SeenKey {
+            agent: agent.clone(),
+            kind: kind.key(),
+            task: task_of_body(trimmed),
+            digest,
+            len,
+        }
+    }
+
+    /// もう取り込んだ塊か。**印は付けない** (受理が決まってから付ける)。
+    fn is_seen(&self, key: &SeenKey) -> bool {
+        self.seen_blocks.contains(key)
+    }
+
+    /// 取り込んだ印を付ける。上限 ([`SEEN_BLOCKS_CAP`]) を超えたら古い順に忘れる。
+    fn mark_seen(&mut self, key: SeenKey) {
+        if !self.seen_blocks.insert(key.clone()) {
+            return;
+        }
+        self.seen_block_order.push_back(key);
+        while self.seen_block_order.len() > SEEN_BLOCKS_CAP {
+            if let Some(old) = self.seen_block_order.pop_front() {
+                self.seen_blocks.remove(&old);
+            }
+        }
+    }
+
     /// まだ取り込んでいない塊だけを返す (取り込んだ印も付ける)。
-    fn take_unseen(&mut self, blocks: Vec<String>) -> Vec<String> {
+    ///
+    /// **画面経路はここで印を付ける。** 画面のテキストは却下されても消えない
+    /// ので、印を付けないと毎 tick 同じ却下を積むことになる。置き場経路は
+    /// 逆に**受理が決まってから**付ける ([`Self::accept_outbox`]) — 却下した
+    /// 本文を印だけ付けて捨てると、直して出し直しても届かなくなる。
+    fn take_unseen(
+        &mut self,
+        agent: &AgentId,
+        kind: super::outbox::Kind,
+        blocks: Vec<String>,
+    ) -> Vec<String> {
         let mut out = Vec::with_capacity(blocks.len());
         for b in blocks {
-            let h = crate::history::fnv1a64(b.as_bytes());
-            if !self.seen_blocks.insert(h) {
+            let key = Self::seen_key(agent, kind, &b);
+            if self.is_seen(&key) {
                 continue;
             }
-            self.seen_block_order.push_back(h);
-            while self.seen_block_order.len() > SEEN_BLOCKS_CAP {
-                if let Some(old) = self.seen_block_order.pop_front() {
-                    self.seen_blocks.remove(&old);
-                }
-            }
+            self.mark_seen(key);
             out.push(b);
         }
         out
@@ -2953,38 +3091,27 @@ impl TeamRuntime {
     }
 
     /// 完了報告 1 件。
-    fn take_result(&mut self, agent: &AgentId, body: &str) {
+    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
         let doc = match rp::parse_result(body) {
             Ok(d) => d,
-            Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
-                    None,
-                    e.detail(),
-                );
-                return;
-            }
+            Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
         let task_id = doc.task_id;
         let Some(task) = self.tasks.iter().find(|t| t.id == task_id).cloned() else {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
+            return Err(self.reject(
+                agent,
                 None,
                 format!("報告のタスク #{task_id} は存在しません"),
-            );
-            return;
+            ));
         };
         // 担当していないタスクの報告は受け取らない。
         if task.assigned_agent.as_ref() != Some(agent) {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                Some(task_id_as_agent(&task)),
+            let target = task_id_as_agent(&task);
+            return Err(self.reject(
+                agent,
+                Some(target),
                 format!("#{task_id} はこのエージェントの担当ではありません"),
-            );
-            return;
+            ));
         }
 
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
@@ -3021,12 +3148,14 @@ impl TeamRuntime {
                 Some(why) => Err(why),
             });
         match verdict {
-            Ok(acc) => self.apply_accepted(agent, acc, attribution),
+            Ok(acc) => {
+                self.apply_accepted(agent, acc, attribution);
+                Ok(())
+            }
             Err(detail) => {
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
+                let why = self.reject(
+                    agent,
                     None,
                     format!("#{task_id} の完了報告を却下: {detail}"),
                 );
@@ -3038,6 +3167,7 @@ impl TeamRuntime {
                     t.updated_at = now_secs();
                 }
                 self.dirty = true;
+                Err(why)
             }
         }
     }
@@ -3253,7 +3383,7 @@ impl TeamRuntime {
     }
 
     /// レビュー報告 1 件。
-    fn take_review(&mut self, agent: &AgentId, body: &str) {
+    fn take_review(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
         // このエージェントが担当しているレビュータスクを探す。
         // **終わったレビュータスクを掴まない。** 同じ担当が同じ対象を 2 度
         // レビューする (差し戻し → 再レビュー) と、閉じた 1 本目が先に
@@ -3268,26 +3398,22 @@ impl TeamRuntime {
             })
             .cloned()
         else {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
+            return Err(self.reject(
+                agent,
                 None,
                 "レビュー報告が来ましたが、このエージェントはレビュー担当ではありません".into(),
-            );
-            return;
+            ));
         };
         let target_id = rev.review_of.unwrap_or(0);
         let parsed = reviewer::parse_review(body, target_id);
         let acc = match parsed {
             Ok(a) => a,
             Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
+                return Err(self.reject(
+                    agent,
                     None,
                     format!("レビュー報告を却下: {}", e.detail()),
-                );
-                return;
+                ))
             }
         };
 
@@ -3365,21 +3491,14 @@ impl TeamRuntime {
             );
         }
         self.dirty = true;
+        Ok(())
     }
 
     /// サブエージェントイベント 1 件。
-    fn take_event(&mut self, agent: &AgentId, body: &str, now: u64) {
+    fn take_event(&mut self, agent: &AgentId, body: &str, now: u64) -> Result<(), String> {
         let doc = match rp::parse_event(body) {
             Ok(d) => d,
-            Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
-                    None,
-                    e.detail(),
-                );
-                return;
-            }
+            Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
         let known: Vec<(AgentId, Option<AgentId>)> = self
             .agents
@@ -3392,13 +3511,7 @@ impl TeamRuntime {
             .find(|t| t.assigned_agent.as_ref() == Some(agent) && !t.state.is_terminal())
             .map(|t| t.id);
         if let Err(e) = rp::check_event(&doc, &known, agent, reporter_task) {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                None,
-                e.detail(),
-            );
-            return;
+            return Err(self.reject(agent, None, e.detail()));
         }
 
         if doc.kind.starts_with("sub_agent_") {
@@ -3465,6 +3578,7 @@ impl TeamRuntime {
             );
         }
         self.dirty = true;
+        Ok(())
     }
 
     /// 依存が済んだタスクを Ready にする。
@@ -5055,7 +5169,7 @@ mod stale_report_tests {
 
         // 1 通目 — 実装中に届く。これは効いて、検証回が始まる。
         put(&mut rt, 2, AGENT, TeamTaskState::Running);
-        rt.take_result(&agent, &body);
+        let _ = rt.take_result(&agent, &body);
         assert_eq!(
             rt.task(2).map(|t| t.state),
             Some(TeamTaskState::Validating),
@@ -5068,7 +5182,7 @@ mod stale_report_tests {
 
         // **同じ報告が、もう一度・さらにもう一度届く。**
         for _ in 0..2 {
-            rt.take_result(&agent, &body);
+            let _ = rt.take_result(&agent, &body);
         }
         assert_eq!(
             rt.task(2).map(|t| t.state),
@@ -5098,7 +5212,7 @@ mod stale_report_tests {
         let agent = AgentId::new(AGENT);
         // 担当だけ結び付いていて、まだ配っていない (`Pending`)。
         put(&mut rt, 1, AGENT, TeamTaskState::Pending);
-        rt.take_result(&agent, &report(1, AGENT));
+        let _ = rt.take_result(&agent, &report(1, AGENT));
         let (transitions, _) = counts(&mut rt);
         assert_eq!(
             transitions, 2,
@@ -5120,7 +5234,7 @@ mod stale_report_tests {
         // 終端へ遅れて届いた報告。**ここは見送らない** —
         // `runtime_tests::断られた遷移は黙殺せず記録に残す` と対になる。
         put(&mut rt, 2, AGENT, TeamTaskState::Completed);
-        rt.take_result(&agent, &report(2, AGENT));
+        let _ = rt.take_result(&agent, &report(2, AGENT));
         let (transitions, _) = counts(&mut rt);
         assert_eq!(transitions, 2, "完了したタスクへの報告まで見送った");
         assert_eq!(
@@ -5139,7 +5253,7 @@ mod stale_report_tests {
         // (見分けは受理より後にあるので、担当の検査を素通りしない)。
         put(&mut rt, 2, AGENT, TeamTaskState::Reviewing);
         let other = AgentId::new("implementer-9");
-        rt.take_result(&other, &report(2, "implementer-9"));
+        let _ = rt.take_result(&other, &report(2, "implementer-9"));
         let (transitions, rejected) = counts(&mut rt);
         assert_eq!(transitions, 0, "担当違いなのに遷移を試みた");
         assert_eq!(rejected, 1, "担当違いの報告を黙って捨てた");
@@ -5656,5 +5770,179 @@ mod budget_tests {
         assert!(t.contains("10 分"));
         assert!(t.contains("完了報告"));
         assert!(!t.contains("[ZAI-TEAM-RESULT]"), "形式をここに二度書いている");
+    }
+}
+
+
+/// **重複判定のスコープ** — 本文だけで数えると正しい報告が消える。
+///
+/// 実機で起きうる形をそのまま置く: 複数のレビュー担当が同じ文面
+/// (`{"verdict":"approve"}` のような、送り主も対象も本文に無い形) を返すと、
+/// 2 通目以降が「もう見た」で捨てられ、タスクが `Reviewing` のまま止まる。
+#[cfg(test)]
+mod seen_key_tests {
+    use super::super::testkit;
+    use super::*;
+    use super::super::outbox::Kind;
+
+    fn rt() -> TeamRuntime {
+        let ws = crate::test_util::unique_temp_dir("zaivern-team-seen", "key");
+        let plan = TeamPlan {
+            goal: testkit::goal(),
+            teams: vec![TeamGroup {
+                id: TeamId::new("implementation"),
+                name: "実装".to_string(),
+                lead_role: TeamRole::Implementer,
+            }],
+            tasks: vec![testkit::task(1, "t1", &[]), testkit::task(2, "t2", &[])],
+        };
+        TeamRuntime::from_plan(plan, ws, RunOptions::default())
+    }
+
+    /// **同じ本文でも、送り主・種別・対象が違えば別の報告。**
+    #[test]
+    fn 重複判定は送り主と種別と対象まで見る() {
+        let mut rt = rt();
+        let a = AgentId::new("reviewer-1");
+        let b = AgentId::new("reviewer-2");
+        // 送り主も対象も本文に無い形 (これがいちばん潰れやすい)。
+        let body = r#"{"verdict":"approve","findings":[]}"#;
+
+        let k_a = TeamRuntime::seen_key(&a, Kind::Review, body);
+        let k_b = TeamRuntime::seen_key(&b, Kind::Review, body);
+        assert_ne!(k_a, k_b, "別の担当の同じ文面を同じ報告として数えた");
+
+        let k_msg = TeamRuntime::seen_key(&a, Kind::Message, body);
+        assert_ne!(k_a, k_msg, "種別が違うのに同じ報告として数えた");
+
+        // 対象タスクが違えば別 (本文に task_id があるとき)。
+        let t1 = r#"{"task_id":1,"verdict":"approve","findings":[]}"#;
+        let t2 = r#"{"task_id":2,"verdict":"approve","findings":[]}"#;
+        assert_ne!(
+            TeamRuntime::seen_key(&a, Kind::Review, t1),
+            TeamRuntime::seen_key(&a, Kind::Review, t2),
+            "対象が違うのに同じ報告として数えた"
+        );
+        assert_eq!(
+            TeamRuntime::seen_key(&a, Kind::Review, t1).task,
+            Some(1),
+            "対象を鍵へ入れていない"
+        );
+
+        // まったく同じものは同じ (再送は 1 回だけ効く)。
+        assert_eq!(k_a, TeamRuntime::seen_key(&a, Kind::Review, body));
+        // 前後の空白は無視する (改行の付き方で別物にしない)。
+        assert_eq!(
+            k_a,
+            TeamRuntime::seen_key(&a, Kind::Review, &format!("\n{body}  \n"))
+        );
+
+        // 印は「見た」だけで付く。付けるまでは見ていない。
+        assert!(!rt.is_seen(&k_a));
+        rt.mark_seen(k_a.clone());
+        assert!(rt.is_seen(&k_a));
+        assert!(!rt.is_seen(&k_b), "別の担当まで「見た」にした");
+        test_hooks::clear();
+    }
+
+    /// **本文の指紋は 64bit 1 本にしない。** 長さと 128bit を持つ。
+    #[test]
+    fn 本文の指紋は長さと百二十八ビットで持つ() {
+        let a = AgentId::new("x");
+        let k1 = TeamRuntime::seen_key(&a, Kind::Result, r#"{"task_id":1}"#);
+        let k2 = TeamRuntime::seen_key(&a, Kind::Result, r#"{"task_id":2}"#);
+        assert_ne!(k1.digest, k2.digest);
+        assert_ne!(k1.digest.0, k1.digest.1, "2 本の指紋が同じ値になっている");
+        assert_eq!(k1.len, r#"{"task_id":1}"#.len() as u32);
+    }
+
+    /// **上限を超えても記憶は太らない。** 古い順に忘れる。
+    #[test]
+    fn 重複台帳は上限で古い順に忘れる() {
+        let mut rt = rt();
+        let a = AgentId::new("x");
+        let mut first = None;
+        for i in 0..(SEEN_BLOCKS_CAP + 50) {
+            let body = format!(r#"{{"task_id":{i}}}"#);
+            let k = TeamRuntime::seen_key(&a, Kind::Result, &body);
+            if i == 0 {
+                first = Some(k.clone());
+            }
+            rt.mark_seen(k);
+        }
+        assert_eq!(rt.seen_blocks.len(), SEEN_BLOCKS_CAP, "上限を超えて覚えている");
+        assert_eq!(rt.seen_block_order.len(), SEEN_BLOCKS_CAP);
+        assert!(
+            !rt.is_seen(&first.expect("最初の鍵")),
+            "いちばん古いものを忘れていない"
+        );
+        test_hooks::clear();
+    }
+
+    /// **却下された報告は重複台帳へ入らない。** 直して出し直せる。
+    #[test]
+    fn 却下した報告は重複台帳へ入れない() {
+        let mut rt = rt();
+        let agent = AgentId::new("team-lead");
+        rt.agents.push(TeamAgent {
+            id: agent.clone(),
+            name: "lead".into(),
+            role: TeamRole::TeamLead,
+            team_id: TeamId::new("implementation"),
+            parent_id: None,
+            kind: AgentKind::ManagedSession,
+            session_id: Some(1),
+            session_identity: None,
+            provider: "claude".into(),
+            state: AgentWorkState::Idle,
+            current_task: None,
+            current_action: String::new(),
+            children: Vec::new(),
+            created_at: 0,
+            last_activity_at: 0,
+        });
+        // 居ないタスクへの報告 → 意味として却下。
+        let bad = r#"{"task_id":99,"agent_id":"team-lead","status":"completed","summary":"x","changed_files":[],"validation":[],"blockers":[]}"#;
+        let err = rt
+            .accept_outbox(&agent, Kind::Result, bad, 100)
+            .expect_err("居ないタスクは却下されるべき");
+        assert!(err.contains("#99"), "理由が伝わっていない: {err}");
+        let key = TeamRuntime::seen_key(&agent, Kind::Result, bad);
+        assert!(
+            !rt.is_seen(&key),
+            "却下したのに重複台帳へ入れた (直して出し直しても届かなくなる)"
+        );
+        // 同じものをもう一度出しても、また却下として扱われる (黙って消えない)。
+        assert!(rt.accept_outbox(&agent, Kind::Result, bad, 101).is_err());
+
+        // **直したものは受理される。** (居るタスクへ、担当として)
+        rt.tasks[0].assigned_agent = Some(agent.clone());
+        rt.tasks[0].state = TeamTaskState::Running;
+        test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+            measured: Vec::new(),
+        }));
+        // 検証コマンドは実際に実行したことを申告する (関門はそこも見る)。
+        let cmds: Vec<String> = rt.tasks[0]
+            .validation_commands
+            .iter()
+            .map(|c| format!(r#"{{"command":"{}","exit_code":0}}"#, c.display()))
+            .collect();
+        let good = format!(
+            r#"{{"task_id":1,"agent_id":"team-lead","status":"completed","summary":"x","changed_files":[],"validation":[{}],"blockers":[]}}"#,
+            cmds.join(",")
+        );
+        let good = good.as_str();
+        assert_eq!(
+            rt.accept_outbox(&agent, Kind::Result, good, 102),
+            Ok(AcceptOutcome::Applied),
+            "直した報告が受理されない"
+        );
+        // 同じものの再送は二重に効かない。
+        assert_eq!(
+            rt.accept_outbox(&agent, Kind::Result, good, 103),
+            Ok(AcceptOutcome::Duplicate),
+            "再送が二重に適用された"
+        );
+        test_hooks::clear();
     }
 }

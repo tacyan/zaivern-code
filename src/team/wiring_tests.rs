@@ -1521,10 +1521,18 @@ fn 四種類とも置き場から受理する経路がある() {
     ] {
         assert!(body.contains(f), "accept_outbox が {f} を通していない:\n{body}");
     }
-    // **二重取り込みは塊の指紋で止める** (画面と置き場の両方に出ても 1 回)。
+    // **二重取り込みは構造化キーで止める** (画面と置き場の両方に出ても 1 回)。
     assert!(
-        body.contains("take_unseen"),
+        body.contains("seen_key") && body.contains("is_seen"),
         "accept_outbox が重複を落としていない:\n{body}"
+    );
+    // **却下したものを重複台帳へ入れない。** 入れると、直して出し直した
+    // 報告まで「もう見た」で捨てることになる。印は適用が済んでから。
+    let mark = body.find("mark_seen").expect("印を付けていない");
+    let applied = body.find("applied?").expect("適用の成否を見ていない");
+    assert!(
+        applied < mark,
+        "適用の前に重複台帳へ入れている (却下した本文を出し直せない):\n{body}"
     );
     // **セッションを見ない。** 見ると、未 bind・未観測・終了直後を落とす。
     assert!(
@@ -1548,6 +1556,18 @@ fn 置き場のファイルは受理してから消す() {
     assert!(
         body.contains("outbox_quarantine") && body.contains("outbox_retry"),
         "隔離と読み直しを区別していない:\n{body}"
+    );
+    // **却下された報告は隔離へ回す** (消して終わりにしない)。
+    assert!(
+        body.contains("Err(why) => self.outbox_quarantine"),
+        "Runtime が却下した報告を隔離していない:\n{body}"
+    );
+    // 隔離そのものがファイルを消さない (証拠を失わない)。
+    let o = src(OUTBOX);
+    let q = function_body(&o, o.find("pub fn quarantine").expect("隔離"));
+    assert!(
+        !q.contains("remove_file"),
+        "隔離が消しに回っている (却下された報告の中身を失う):\n{q}"
     );
 }
 

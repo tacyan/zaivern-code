@@ -438,31 +438,56 @@ pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 隔離の結果。
+/// 隔離の結果。**取り込めなかった報告を消すことは無い。**
+///
+/// 却下された報告は「エージェントが何を書いたか」の唯一の証拠なので、消すと
+/// 直しようが無くなる (人も、書いた本人も、何が悪かったのか確かめられない)。
+/// 移せないときも消さず、**読み直しの対象から外れる名前へ変える**だけにする。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposal {
     /// `rejected/` へ移した。
     Moved(PathBuf),
-    /// 移せなかったので消した (残すと毎 tick 同じ失敗を出す)。
-    Deleted,
+    /// `rejected/` へ移せなかったので、その場で拡張子を外した
+    /// (`…json` → `…json.rejected`)。[`list_reports`] には出ない。
+    Renamed(PathBuf),
+    /// どちらもできなかった。**ファイルはそのまま残る** — 呼び出し側が
+    /// 読み直しの対象から外し、理由を人へ出す。
+    Kept(String),
 }
 
-/// 取り込めなかった報告を `rejected/` へ移す。移せなければ消す。
+/// 取り込めなかった報告を読み直しの対象から外す。**消さない。**
 ///
-/// 移す先は同じ置き場の 1 段下なので、[`list_reports`] には二度と現れない。
-/// 人が中身を見て「何を書いたのか」を追えるように、消すより移すを先に試す。
-pub fn quarantine(file: &Path) -> std::io::Result<Disposal> {
-    let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_string());
-    let dir = file.parent().ok_or_else(|| bad("親フォルダが無い"))?;
-    let name = file.file_name().ok_or_else(|| bad("ファイル名が無い"))?;
+/// 1. `rejected/` へ移す (人が中身を見て直せる場所)
+/// 2. 作れなければ、その場で `.rejected` を付けて拡張子を外す
+/// 3. どちらも駄目なら、そのまま残して理由を返す
+///
+/// どの段でも `remove_file` は呼ばない。「移せないから消す」は、いちばん
+/// 調べたいものをいちばん失いやすい形になる。
+pub fn quarantine(file: &Path) -> Disposal {
+    let Some(dir) = file.parent() else {
+        return Disposal::Kept("親フォルダがありません".to_string());
+    };
+    let Some(name) = file.file_name() else {
+        return Disposal::Kept("ファイル名がありません".to_string());
+    };
     let pen = dir.join(REJECTED_DIR);
     let moved = std::fs::create_dir_all(&pen).and_then(|()| {
         let dest = pen.join(name);
         std::fs::rename(file, &dest).map(|()| dest)
     });
     match moved {
-        Ok(dest) => Ok(Disposal::Moved(dest)),
-        Err(_) => std::fs::remove_file(file).map(|()| Disposal::Deleted),
+        Ok(dest) => Disposal::Moved(dest),
+        Err(e) => {
+            // 隔離先へ移せない (権限・別ボリューム等)。**消さずに**、
+            // 同じ場所で読み直しの対象から外す。
+            let aside = file.with_extension(format!("{FINAL_EXT}.{REJECTED_DIR}"));
+            match std::fs::rename(file, &aside) {
+                Ok(()) => Disposal::Renamed(aside),
+                Err(e2) => Disposal::Kept(format!(
+                    "{REJECTED_DIR}/ へ移せず ({e})、名前も変えられません ({e2})"
+                )),
+            }
+        }
     }
 }
 
@@ -851,6 +876,32 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **symlink は報告として読まない。**
+    ///
+    /// `.json` の名前を付けた symlink を置かれても、読めば置き場の外を読み、
+    /// 消せば置き場の外を消すことになる。`DirEntry::file_type` は symlink を
+    /// 辿らないので、通常ファイルだけを通す形で構造的に外れる。
+    #[cfg(unix)]
+    #[test]
+    fn symlinkは報告として読まない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "symlink");
+        let outside = dir.join("secret.txt");
+        std::fs::write(&outside, "外のファイル").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(final_name("agent-1", "1"))).unwrap();
+        std::fs::write(dir.join(final_name("agent-1", "2")), "{}").unwrap();
+        let names: Vec<String> = list_reports(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["agent-1-2.json".to_string()],
+            "symlink を報告として読んだ"
+        );
+        assert!(outside.exists(), "symlink の先を消した");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// 隔離は同じ置き場の 1 段下へ。移した後は一覧から消える。
     #[test]
     fn 隔離したファイルは一覧から消える() {
@@ -858,9 +909,9 @@ mod tests {
         let f = dir.join(final_name("agent-1", "9"));
         std::fs::write(&f, "{broken").unwrap();
         assert_eq!(list_reports(&dir).len(), 1);
-        let dest = match quarantine(&f).expect("隔離できる") {
+        let dest = match quarantine(&f) {
             Disposal::Moved(d) => d,
-            Disposal::Deleted => panic!("移せる場所なのに消した"),
+            other => panic!("移せる場所なのに移さなかった: {other:?}"),
         };
         assert_eq!(dest.parent(), Some(dir.join(REJECTED_DIR).as_path()));
         assert!(dest.exists() && !f.exists());

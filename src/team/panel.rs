@@ -437,6 +437,12 @@ pub struct TeamPanel {
     /// 保存しない — 再起動したら数え直せばよい。Run をまたいでパスで
     /// 引くので、閉じた Run のぶんは「もう無いファイル」として落ちる。
     outbox_ledger: outbox::Ledger,
+    /// **この起動では読み直さない報告ファイル。**
+    ///
+    /// 隔離も改名もできなかったものが入る。消さずに残すので、そのままだと
+    /// 毎 tick 同じ却下を積む。保存しないのは、次の起動では権限が戻って
+    /// いるかもしれないから (永久に諦めない)。
+    outbox_skip: HashSet<PathBuf>,
 }
 
 impl Default for TeamPanel {
@@ -472,6 +478,7 @@ impl Default for TeamPanel {
             validation_jobs: Vec::new(),
             dropped_effects: 0,
             outbox_ledger: outbox::Ledger::default(),
+            outbox_skip: HashSet::new(),
         }
     }
 }
@@ -1052,6 +1059,10 @@ impl TeamPanel {
                 if budget == 0 {
                     break 'runs;
                 }
+                // 動かせなかった却下ファイルは読み直さない (残してはある)。
+                if self.outbox_skip.contains(&f) {
+                    continue;
+                }
                 budget -= 1;
                 let stem = f
                     .file_stem()
@@ -1067,13 +1078,16 @@ impl TeamPanel {
                     Verdict::Deliver { agent, kind, body } => {
                         match self.runs[run].accept_outbox(&agent, kind, &body, now) {
                             // **受理してから消す。** 消してから渡すと、途中で
-                            // 落ちた報告は二度と戻らない。
-                            Ok(()) => match std::fs::remove_file(&f) {
+                            // 落ちた報告は二度と戻らない。適用済みも重複も
+                            // 「目的は果たされた」ので片付けてよい。
+                            Ok(outcome) => match std::fs::remove_file(&f) {
                                 Ok(()) => {
                                     self.outbox_ledger.forget(&f);
-                                    taken += 1;
+                                    if outcome == super::runtime::AcceptOutcome::Applied {
+                                        taken += 1;
+                                    }
                                 }
-                                // 受理済みなので二重取り込みは `take_unseen` が
+                                // 受理済みなので二重取り込みは構造化キーが
                                 // 止める。残り続けるなら上限で隔離する。
                                 Err(e) => self.outbox_retry(
                                     run,
@@ -1081,6 +1095,9 @@ impl TeamPanel {
                                     format!("受理したが消せません: {e}"),
                                 ),
                             },
+                            // **意味として却下された。** 消さずに隔離して
+                            // 理由を残す (直して出し直せるように、重複台帳へは
+                            // 入っていない)。
                             Err(why) => self.outbox_quarantine(run, &f, Some(agent), why),
                         }
                     }
@@ -1119,17 +1136,26 @@ impl TeamPanel {
             .to_string();
         let disposal = outbox::quarantine(file);
         let announce = self.outbox_ledger.announce_once(file);
-        if disposal.is_ok() {
-            self.outbox_ledger.forget(file);
-        }
+        let where_ = match &disposal {
+            outbox::Disposal::Moved(dest) => {
+                self.outbox_ledger.forget(file);
+                format!("{} へ隔離しました", dest.display())
+            }
+            outbox::Disposal::Renamed(dest) => {
+                self.outbox_ledger.forget(file);
+                format!("{} へ名前を変えました (隔離先を作れませんでした)", dest.display())
+            }
+            // **消さない。** 中身は「何を書いたのか」の唯一の証拠なので、
+            // 動かせないときはその場に残す。ただし読み直しは止める —
+            // 止めないと毎 tick 同じ却下を積む。
+            outbox::Disposal::Kept(why) => {
+                self.outbox_skip.insert(file.to_path_buf());
+                format!("そのまま残しました (この起動では読み直しません): {why}")
+            }
+        };
         if !announce {
             return;
         }
-        let where_ = match disposal {
-            Ok(outbox::Disposal::Moved(dest)) => format!("{} へ隔離しました", dest.display()),
-            Ok(outbox::Disposal::Deleted) => "消しました".to_string(),
-            Err(e) => format!("隔離できませんでした: {e}"),
-        };
         if let Some(rt) = self.runs.get_mut(run) {
             rt.note_outbox_rejected(
                 agent,
@@ -4727,10 +4753,16 @@ mod tests {
         }
 
         /// その Run の記録に `needle` を含む事象がいくつあるか。
+        ///
+        /// **隔離の覚え書きは数えない。** 却下された報告は「Runtime が
+        /// 却下した 1 行」と「どこへ隔離したかの 1 行」の 2 つを残すので、
+        /// 素朴に数えると 1 通の報告が 2 通に見える。数えたいのは
+        /// 「解析器へ届いたか」なので、Runtime 側の 1 行だけを見る。
         fn saw(p: &TeamPanel, owner: &RunOwner, needle: &str) -> usize {
             let pos = p.run_pos_of_owner(owner).expect("Run");
             p.runs[pos]
                 .events()
+                .filter(|e| !e.summary.starts_with("報告ファイル "))
                 .filter(|e| e.summary.contains(needle))
                 .count()
         }
@@ -4742,6 +4774,16 @@ mod tests {
             std::fs::write(&tmp, body).unwrap();
             std::fs::rename(&tmp, &fin).unwrap();
             fin
+        }
+
+        /// 隔離の覚え書きの数 (`saw` が数えないほう)。
+        fn quarantined(p: &TeamPanel, owner: &RunOwner, name: &str) -> usize {
+            let pos = p.run_pos_of_owner(owner).expect("Run");
+            p.runs[pos]
+                .events()
+                .filter(|e| e.summary.starts_with("報告ファイル "))
+                .filter(|e| e.summary.contains(name))
+                .count()
         }
 
         /// 提出の包み (`outbox::judge` が読む形)。
@@ -4830,18 +4872,22 @@ mod tests {
                     outbox::MAX_ATTEMPTS
                 );
             }
-            assert_eq!(saw(&p, &a.owner, &name), 0, "上限の手前で理由を出した");
+            assert_eq!(quarantined(&p, &a.owner, &name), 0, "上限の手前で理由を出した");
             p.pump_sessions(rows(&[&a, &b]), 200);
             assert!(!f.exists(), "上限に達したのに置き場に残っている");
             let pen = a.dir.join(outbox::REJECTED_DIR).join(&name);
             assert!(pen.exists(), "隔離先に無い: {}", pen.display());
-            assert_eq!(saw(&p, &a.owner, &name), 1, "理由が記録されていない");
+            assert_eq!(quarantined(&p, &a.owner, &name), 1, "理由が記録されていない");
             assert_eq!(saw(&p, &a.owner, "#99"), 0, "壊れた報告を解析器へ渡した");
             // 隔離したものは二度と読まない・言い直さない
             for now in 201..205 {
                 p.pump_sessions(rows(&[&a, &b]), now);
             }
-            assert_eq!(saw(&p, &a.owner, &name), 1, "隔離したファイルを言い直した");
+            assert_eq!(
+                quarantined(&p, &a.owner, &name),
+                1,
+                "隔離したファイルを言い直した"
+            );
             assert!(pen.exists(), "隔離したファイルが消えた");
             assert!(p.outbox_ledger.tracked().is_empty(), "隔離したのに台帳に残っている");
             std::fs::remove_dir_all(&dir).ok();
@@ -5008,6 +5054,158 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
 
+        /// **意味として却下された報告は、消さずに隔離する。**
+        ///
+        /// 前は `accept_outbox` が無条件に `Ok` を返していたので、居ないタスク
+        /// への報告も「受理した」ことにしてファイルごと消えていた。書いた本人も
+        /// 人も、**何を書いたのか確かめる手立てが無くなる**。
+        #[test]
+        fn 却下された報告は消えずに隔離される() {
+            let (mut p, dir, a, b) = two_lanes("outbox-rejected");
+            let pos = p.run_pos_of_owner(&a.owner).unwrap();
+            let other = p.runs[pos]
+                .agents()
+                .iter()
+                .map(|x| x.id.0.clone())
+                .find(|id| id != "team-lead")
+                .expect("別の担当");
+            // 却下される 4 通 (種別ごとに 1 つずつ)。
+            let cases: Vec<(&str, String)> = vec![
+                // 居ないタスクへの完了報告
+                ("nores", report("team-lead", 99)),
+                // レビュー担当でないのにレビュー判定
+                (
+                    "norev",
+                    envelope(
+                        &a.owner.run_id,
+                        "team-lead",
+                        "review",
+                        r#"{"task_id": 1, "verdict": "APPROVE", "findings": []}"#,
+                    ),
+                ),
+                // 居ない宛先への伝言
+                (
+                    "nomsg",
+                    envelope(
+                        &a.owner.run_id,
+                        "team-lead",
+                        "message",
+                        r#"{"to": "who-is-this", "text": "やあ"}"#,
+                    ),
+                ),
+                // 表に無い種別の出来事
+                (
+                    "noev",
+                    envelope(
+                        &a.owner.run_id,
+                        "team-lead",
+                        "event",
+                        r#"{"kind": "sub_agent_started", "agent_id": "x-1", "parent_id": "someone-else"}"#,
+                    ),
+                ),
+            ];
+            let mut files = Vec::new();
+            for (tag, body) in &cases {
+                files.push(submit(&a.dir, "team-lead", tag, body));
+            }
+            p.pump_sessions(rows(&[&a, &b]), 700);
+            for f in &files {
+                let name = name_of(f);
+                assert!(!f.exists(), "{name} が置き場に残っている");
+                assert!(
+                    a.dir.join(outbox::REJECTED_DIR).join(&name).exists(),
+                    "{name} が隔離されていない (黙って消えた)"
+                );
+                assert_eq!(
+                    quarantined(&p, &a.owner, &name),
+                    1,
+                    "{name} の理由が残っていない"
+                );
+            }
+            // 却下は B へ流れない。
+            for f in &files {
+                assert_eq!(quarantined(&p, &b.owner, &name_of(f)), 0, "別 Run へ流れた");
+            }
+            let _ = other;
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **却下された本文は重複台帳へ入らないので、直せば通る。**
+        #[test]
+        fn 却下された報告は直して出し直せる() {
+            let (mut p, dir, a, b) = two_lanes("outbox-resend");
+            // 1) 表に無い親を名乗る出来事 → 却下。
+            let bad = envelope(
+                &a.owner.run_id,
+                "team-lead",
+                "event",
+                r#"{"kind": "sub_agent_started", "agent_id": "fix-1", "parent_id": "nobody"}"#,
+            );
+            let f1 = submit(&a.dir, "team-lead", "v1", &bad);
+            p.pump_sessions(rows(&[&a, &b]), 800);
+            assert!(a.dir.join(outbox::REJECTED_DIR).join(name_of(&f1)).exists());
+            let subs = |p: &TeamPanel| -> usize {
+                let pos = p.run_pos_of_owner(&a.owner).expect("Run");
+                p.runs[pos]
+                    .agents()
+                    .iter()
+                    .filter(|x| x.id.as_str() == "fix-1")
+                    .count()
+            };
+            assert_eq!(subs(&p), 0, "却下したのに盤面へ出した");
+
+            // 2) 直して出し直す → 受理される (「もう見た」で捨てられない)。
+            let good = envelope(
+                &a.owner.run_id,
+                "team-lead",
+                "event",
+                r#"{"kind": "sub_agent_started", "agent_id": "fix-1", "parent_id": "team-lead", "role": "tester", "action": "調査"}"#,
+            );
+            let f2 = submit(&a.dir, "team-lead", "v2", &good);
+            p.pump_sessions(rows(&[&a, &b]), 801);
+            assert!(!f2.exists(), "受理したのに消していない");
+            assert_eq!(subs(&p), 1, "直した報告が届かない");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **隔離先へ移せなくても、報告は消えない。**
+        ///
+        /// `rejected/` を**ファイル**で塞いでディレクトリを作れなくする。
+        /// そのときは同じ場所で拡張子を外し、それも駄目ならそのまま残す。
+        /// どの道でも `remove_file` は呼ばない。
+        #[test]
+        fn 隔離できなくても報告は消えない() {
+            let (mut p, dir, a, b) = two_lanes("outbox-quarantine-fail");
+            // `rejected` という名前の**ファイル**を置く → create_dir_all が失敗する。
+            std::fs::write(a.dir.join(outbox::REJECTED_DIR), "not a dir").unwrap();
+            let f = submit(&a.dir, "team-lead", "x1", &report("team-lead", 99));
+            let name = name_of(&f);
+            p.pump_sessions(rows(&[&a, &b]), 900);
+            assert!(!f.exists(), "拡張子を外していない");
+            let aside = a.dir.join(format!("{name}.{}", outbox::REJECTED_DIR));
+            assert!(
+                aside.exists(),
+                "報告が消えた (隔離先が塞がっていても残すこと): {}",
+                aside.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(&aside).unwrap(),
+                report("team-lead", 99),
+                "中身が変わった"
+            );
+            // 読み直しの対象からは外れている (毎 tick 却下を積まない)。
+            let before = quarantined(&p, &a.owner, &name);
+            for now in 901..905 {
+                p.pump_sessions(rows(&[&a, &b]), now);
+            }
+            assert_eq!(
+                quarantined(&p, &a.owner, &name),
+                before,
+                "外した報告を読み直している"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
         /// **再起動をまたいでも、未処理の報告は回収できる。**
         ///
         /// 置き場は Run ごとに残るので、閉じていない Run の報告は次の起動で
@@ -5106,15 +5304,19 @@ mod tests {
         }
 
         /// **画面と置き場に同じ報告があっても二重には入らない。**
+        ///
+        /// **適用される報告**で見る。却下されるものは重複台帳へ入れない
+        /// (直して出し直せるように) ので、二重に見えて当たり前になる。
+        /// 出来事は担当の割り当てに依らず適用できるので、両方の経路で通る。
         #[test]
         fn 画面と置き場の二重受理を防ぐ() {
             let (mut p, dir, a, b) = two_lanes("outbox-dedupe");
-            let json = report("team-lead", 99);
-            let f = submit(&a.dir, "team-lead", "1", &json);
+            let ev = r#"{"kind": "sub_agent_started", "agent_id": "twice-1", "parent_id": "team-lead", "role": "tester", "action": "調査"}"#;
+            let f = submit(&a.dir, "team-lead", "1", ev);
             // 画面にも**同じ塊**を出す (素直に読める形で)。
-            let open = super::super::super::result_parser::RESULT_OPEN;
-            let close = super::super::super::result_parser::RESULT_CLOSE;
-            let screen: Vec<String> = format!("{open}\n{json}\n{close}")
+            let open = super::super::super::result_parser::EVENT_OPEN;
+            let close = super::super::super::result_parser::EVENT_CLOSE;
+            let screen: Vec<String> = format!("{open}\n{ev}\n{close}")
                 .lines()
                 .map(str::to_string)
                 .collect();
@@ -5125,14 +5327,23 @@ mod tests {
                 }
             }
             // **同じ tick で両方に出ていても 1 回。** 置き場を先に取り込み、
-            // 画面側は塊の指紋で落ちる。
+            // 画面側は構造化キーで落ちる。
             p.pump_sessions(input, 400);
             assert!(!f.exists(), "受理したのに消していない");
+            let subs = |p: &TeamPanel, o: &RunOwner| -> usize {
+                let pos = p.run_pos_of_owner(o).expect("Run");
+                p.runs[pos]
+                    .agents()
+                    .iter()
+                    .filter(|x| x.id.as_str() == "twice-1")
+                    .count()
+            };
             assert_eq!(
-                saw(&p, &a.owner, "#99"),
+                subs(&p, &a.owner),
                 1,
                 "同じ報告が画面と置き場の両方から二重に入った"
             );
+            assert_eq!(subs(&p, &b.owner), 0, "別の Run へ流れた");
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5167,7 +5378,7 @@ mod tests {
                 a.dir.join(outbox::REJECTED_DIR).join(&name).exists(),
                 "隔離されていない"
             );
-            assert_eq!(saw(&p, &a.owner, &name), 1, "理由が残っていない");
+            assert_eq!(quarantined(&p, &a.owner, &name), 1, "理由が残っていない");
             // ファイル名は `X-10-…` で本文だけ `X-1` を名乗っても、配らない
             let f2 = submit(&a.dir, &long, "2", &report(&short, 99));
             p.pump_sessions(rows(&[&a, &b]), 101);
