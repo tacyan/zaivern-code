@@ -1483,3 +1483,143 @@ fn cliから来たrunにもおすすめの編成が当たる() {
     );
     assert!(body.contains("p.plan_with("), "役割を計画へ渡していない");
 }
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  構造化報告は画面ではなく置き場が正規の経路 (P1-1)
+// ══════════════════════════════════════════════════════════════════════
+
+const OUTBOX: &str = include_str!("outbox.rs");
+const PROMPT: &str = include_str!("prompt.rs");
+const GITINIT: &str = include_str!("gitinit.rs");
+
+/// **4 種類とも置き場を通れること**を構造で固定する。
+///
+/// 完了報告だけを置き場へ移しても根本解決にならない (レビューを落とすと
+/// タスクが `Reviewing` のまま止まる)。種別を 1 つ足したのに配送側の
+/// `match` を足し忘れる、を赤にする。
+#[test]
+fn 四種類とも置き場から受理する経路がある() {
+    let o = src(OUTBOX);
+    for k in ["Result", "Review", "Message", "Event"] {
+        assert!(
+            o.contains(&format!("Kind::{k}")),
+            "outbox が {k} を知らない"
+        );
+    }
+    // 受理は Runtime の 1 か所で、4 種類とも同じ判断関数へ落ちる。
+    let rt = src(RUNTIME);
+    let body = function_body(
+        &rt,
+        rt.find("pub fn accept_outbox").expect("置き場からの受理口"),
+    );
+    for f in [
+        "self.take_result(",
+        "self.take_review(",
+        "self.take_message(",
+        "self.take_event(",
+    ] {
+        assert!(body.contains(f), "accept_outbox が {f} を通していない:\n{body}");
+    }
+    // **二重取り込みは塊の指紋で止める** (画面と置き場の両方に出ても 1 回)。
+    assert!(
+        body.contains("take_unseen"),
+        "accept_outbox が重複を落としていない:\n{body}"
+    );
+    // **セッションを見ない。** 見ると、未 bind・未観測・終了直後を落とす。
+    assert!(
+        !body.contains("session_id") && !body.contains("SessionObs"),
+        "accept_outbox がセッションに依存している (未 bind の報告が落ちる):\n{body}"
+    );
+}
+
+/// **受理してからファイルを消す。** 先に消すと、途中で落ちた報告は戻らない。
+#[test]
+fn 置き場のファイルは受理してから消す() {
+    let p = src(PANEL);
+    let body = function_body(&p, p.find("fn drain_outbox").expect("取り込み"));
+    let accept = body.find("accept_outbox").expect("受理を通していない");
+    let remove = body.find("remove_file").expect("消していない");
+    assert!(
+        accept < remove,
+        "受理より先に消している (落ちた報告が戻らない):\n{body}"
+    );
+    // 一時的に届かないだけの正しい報告を、隔離で捨てない。
+    assert!(
+        body.contains("outbox_quarantine") && body.contains("outbox_retry"),
+        "隔離と読み直しを区別していない:\n{body}"
+    );
+}
+
+/// **指示文が 4 種類とも置き場へ出すよう教えている。**
+///
+/// 教えていない種別は一生画面にしか出ない (機能があっても到達経路が無い)。
+#[test]
+fn 指示文は四種類とも置き場へ出すよう教える() {
+    let p = src(PROMPT);
+    let sec = function_body(&p, p.find("fn outbox_section").expect("提出の作法"));
+    for k in ["result", "review", "message", "event"] {
+        assert!(sec.contains(k), "提出の作法が {k} を教えていない");
+    }
+    // 原子公開の手順 (OS ごと) と、包みの形。
+    for needle in ["tmp_name", "final_name", "mv '", "Move-Item", "payload", "run_id"] {
+        assert!(sec.contains(needle), "提出の作法に {needle} が無い:\n{sec}");
+    }
+    // 種別ごとの案内も繋がっていること。
+    for f in ["fn review_submit", "fn subagents_section", "fn teammates_section"] {
+        let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
+        assert!(
+            body.contains("提出のしかた"),
+            "{f} が置き場へ誘導していない:\n{body}"
+        );
+    }
+}
+
+/// **Git は「あるか」ではなく「使える基準点があるか」で見る (P1-2)。**
+#[test]
+fn git判定はheadの有無まで見る() {
+    let p = src(PANEL);
+    let init = function_body(&p, p.find("pub fn init_git").expect("Git の用意"));
+    assert!(
+        init.contains("gitinit::prepare"),
+        "init_git がやり直せる用意を通していない:\n{init}"
+    );
+    assert!(
+        !init.contains("discover_toplevel"),
+        "`.git` の有無で準備完了を決めている (HEAD 無しを見逃す):\n{init}"
+    );
+    let refresh = function_body(
+        &p,
+        p.find("fn refresh_git_readiness").expect("旗の決め所"),
+    );
+    assert!(
+        refresh.contains("gitinit::plan_for") && refresh.contains("gitinit::probe"),
+        "旗を状態から決めていない:\n{refresh}"
+    );
+    // **利用者のものを壊さない。** 破壊的な git 操作を持ち込まない。
+    //
+    // **コメントは除いて見る。** 「使わない」と書いた doc がそのまま
+    // 引っかかると、番人は自分の説明文を咎めるだけになる (この repo で
+    // 実際に 3 版続けて空回りした形)。
+    let g = src(GITINIT);
+    // 製品側だけを見る (テストは一時フォルダを片付けるので `remove_dir_all`
+    // を使う — そこまで咎めると番人が空回りする)。
+    let prod = g.split("#[cfg(test)]").next().unwrap_or(&g);
+    let code: String = prod
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for bad in ["--hard", "checkout", "\"clean\"", "remove_dir_all", "remove_file(ws"] {
+        assert!(
+            !code.contains(bad),
+            "gitinit が破壊的な操作 ({bad}) を使っている"
+        );
+    }
+    // index は一時ファイルの上で組む。
+    let prep = function_body(&g, g.find("pub fn prepare").expect("用意"));
+    assert!(
+        prep.contains("tmp_index_path") && prep.contains("risky_paths"),
+        "利用者の index を守る手立てと秘密情報の検査が無い:\n{prep}"
+    );
+}

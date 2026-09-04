@@ -44,6 +44,7 @@
 pub mod changeset;
 pub mod composition;
 pub mod cli;
+pub mod gitinit;
 pub mod graph;
 pub mod inspector;
 pub mod launch;

@@ -18,11 +18,12 @@
 //! [`BoardAction`] を返すだけで、プロセス起動もファイル書き込みもしない。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::model::*;
+use super::gitinit;
 use super::outbox::{self, Verdict};
 use super::persistence::{self, LoadOutcome};
 use super::planner::{PlanInput, StaticPlanner, TeamPlanner};
@@ -728,9 +729,11 @@ impl TeamPanel {
         }
         let dir = self.outbox_dir(&rt.run().run_id);
         rt.set_outbox(dir);
-        // **走らせる前に確かめる。** Git が無いと実測できず、どの完了報告も
+        // **走らせる前に確かめる。** 基準点が無いと実測できず、どの完了報告も
         // 受理できない (エージェントは働くのに 1 件も終わらない)。
-        self.needs_git = crate::git::discover_toplevel(&self.workspace).is_none();
+        // 見るのは `.git` の有無ではなく**使える基準点があるか** — HEAD の
+        // 無いリポジトリを「準備完了」と読むと、そのまま Run が走ってしまう。
+        self.refresh_git_readiness();
         self.runs.push(rt);
         self.active = self.runs.len() - 1;
         self.read_only = false;
@@ -862,6 +865,10 @@ impl TeamPanel {
             self.active = 0;
             self.read_only = read_only;
             self.restore = RestorePrompt::None;
+            // **Run が生きている間は `needs_git` が実態を映していること。**
+            // 復元でここを飛ばすと、基準点の無いフォルダで「準備完了」の
+            // まま走り出す (計画の入口と同じ関門をここにも置く)。
+            self.refresh_git_readiness();
             self.dirty = true;
             return Ok(());
         }
@@ -886,6 +893,7 @@ impl TeamPanel {
                 self.active = self.runs.len() - 1;
                 self.read_only = read_only;
                 self.restore = RestorePrompt::None;
+                self.refresh_git_readiness();
                 self.dirty = true;
                 Ok(())
             }
@@ -1020,12 +1028,14 @@ impl TeamPanel {
     /// * 担当はファイル名と本文の両方で決める ([`outbox::judge`])。
     ///   `agent-1` が `agent-10-…` を拾うことは無い
     /// * 1 tick に見る数は全 Run 合わせて [`OUTBOX_PER_TICK`]
-    /// * `observed` は**今回の観測に載っているセッション**。載っていない
-    ///   セッション宛ては消さずに残す — 渡した先が無いのに消すと、その報告は
-    ///   誰にも読まれないまま失われる
-    fn drain_outbox(&mut self, observed: &HashSet<SessionId>) -> HashMap<SessionId, String> {
-        let mut out: HashMap<SessionId, String> = HashMap::new();
+    /// * **セッションを見ない。** 担当 ID だけで Runtime へ渡すので、
+    ///   結び付く前・観測に載らない tick・プロセスが終わった直後に書かれた
+    ///   報告も落ちない (画面経由はそこで必ず落ちる)
+    /// * 消すのは [`TeamRuntime::accept_outbox`] が受理を返した後だけ。
+    ///   途中で落ちてもファイルは残り、次の tick で読み直す
+    fn drain_outbox(&mut self, now: u64) -> usize {
         let mut budget = OUTBOX_PER_TICK;
+        let mut taken = 0usize;
         'runs: for run in 0..self.runs.len() {
             let dir = self.runs[run].outbox().to_path_buf();
             if dir.as_os_str().is_empty() {
@@ -1037,11 +1047,7 @@ impl TeamPanel {
                 .iter()
                 .map(|a| a.id.clone())
                 .collect();
-            let sessions: HashMap<AgentId, SessionId> = self.runs[run]
-                .agents()
-                .iter()
-                .filter_map(|a| a.session_id.map(|s| (a.id.clone(), s)))
-                .collect();
+            let run_id = self.runs[run].run().run_id.clone();
             for f in outbox::list_reports(&dir) {
                 if budget == 0 {
                     break 'runs;
@@ -1053,53 +1059,38 @@ impl TeamPanel {
                     .unwrap_or_default()
                     .to_string();
                 // **読んで解析してから、消すかを決める。**
-                let (body, verdict) = match std::fs::read_to_string(&f) {
-                    Ok(body) => {
-                        let v = outbox::judge(&stem, &body, &ids);
-                        (body, v)
-                    }
-                    Err(e) => (String::new(), Verdict::Retry(format!("読めません: {e}"))),
+                let verdict = match std::fs::read_to_string(&f) {
+                    Ok(body) => outbox::judge(&stem, &body, &ids, &run_id),
+                    Err(e) => Verdict::Retry(format!("読めません: {e}")),
                 };
                 match verdict {
-                    Verdict::Deliver(agent) => match sessions.get(&agent) {
-                        Some(sid) if !observed.contains(sid) => self.outbox_retry(
-                            run,
-                            &f,
-                            format!("担当 {agent} のセッション #{sid} が今回の観測に無い"),
-                        ),
-                        Some(sid) => {
-                            // 画面から読むのと**同じ形**にして渡す (入口を 1 つに保つ)。
-                            let text = out.entry(*sid).or_default();
-                            text.push('\n');
-                            text.push_str(super::result_parser::RESULT_OPEN);
-                            text.push('\n');
-                            text.push_str(body.trim());
-                            text.push('\n');
-                            text.push_str(super::result_parser::RESULT_CLOSE);
-                            text.push('\n');
-                            // **取り込めたときだけ消す。** 消せなくても二重取り込みは
-                            // Runtime の `take_unseen` が防ぐが、残り続けるなら
-                            // 読み直しの上限で隔離して理由を残す。
-                            match std::fs::remove_file(&f) {
-                                Ok(()) => self.outbox_ledger.forget(&f),
-                                Err(e) => {
-                                    self.outbox_retry(run, &f, format!("配送したが消せません: {e}"))
+                    Verdict::Deliver { agent, kind, body } => {
+                        match self.runs[run].accept_outbox(&agent, kind, &body, now) {
+                            // **受理してから消す。** 消してから渡すと、途中で
+                            // 落ちた報告は二度と戻らない。
+                            Ok(()) => match std::fs::remove_file(&f) {
+                                Ok(()) => {
+                                    self.outbox_ledger.forget(&f);
+                                    taken += 1;
                                 }
-                            }
+                                // 受理済みなので二重取り込みは `take_unseen` が
+                                // 止める。残り続けるなら上限で隔離する。
+                                Err(e) => self.outbox_retry(
+                                    run,
+                                    &f,
+                                    format!("受理したが消せません: {e}"),
+                                ),
+                            },
+                            Err(why) => self.outbox_quarantine(run, &f, Some(agent), why),
                         }
-                        None => self.outbox_retry(
-                            run,
-                            &f,
-                            format!("担当 {agent} にまだセッションが結び付いていません"),
-                        ),
-                    },
+                    }
                     Verdict::Retry(why) => self.outbox_retry(run, &f, why),
                     Verdict::Reject { agent, why } => self.outbox_quarantine(run, &f, agent, why),
                 }
             }
         }
         self.outbox_ledger.prune_missing();
-        out
+        taken
     }
 
     /// 読めなかった報告を数え、上限に達したら隔離する。
@@ -1152,8 +1143,10 @@ impl TeamPanel {
         if self.rt().is_none() || self.read_only {
             return;
         }
-        let observed: HashSet<SessionId> = rows.iter().map(|r| r.id).collect();
-        let inbox = self.drain_outbox(&observed);
+        // **置き場を先に読む。** 画面より前に取り込むので、同じ報告が
+        // 両方にあっても効くのは置き場のほう (画面側は `take_unseen` が落とす)。
+        // 画面はカーソル移動で描く CLI で構造的に取りこぼすので、こちらが正規。
+        self.drain_outbox(now);
         let sessions = rows
             .into_iter()
             .map(|r| {
@@ -1169,13 +1162,10 @@ impl TeamPanel {
                 // 重複は**意味の単位 (塊)** で Runtime が落とす
                 // (`TeamRuntime::take_unseen`)。走査量は `SCAN_MAX_BYTES` が
                 // 抑えるので、毎フレーム全履歴を舐めることにはならない。
-                let mut text = r.tail.join("\n");
-                // **置き場に届いた報告を合流させる。** 画面と同じ入口へ
-                // 流すので、受理・却下の判断は 1 か所のまま。
-                if let Some(extra) = inbox.get(&r.id) {
-                    text.push('\n');
-                    text.push_str(extra);
-                }
+                //
+                // **画面は互換のための控え。** 正規の経路は置き場
+                // ([`Self::drain_outbox`]) で、そちらを先に取り込む。
+                let text = r.tail.join("\n");
                 super::runtime::SessionObs {
                     id: r.id,
                     title: r.title,
@@ -1371,52 +1361,47 @@ impl TeamPanel {
         self.active
     }
 
-    /// **このワークスペースを Git 管理下にする。**
+    /// **このワークスペースで Team Run の実測ができるようにする。**
     ///
-    /// 実測の基準点は git が出すので、Git が無いと完了報告を 1 件も
-    /// 受理できない。**人が押したときだけ**走らせる — 利用者のフォルダを
-    /// 黙って変える操作なので、自動ではやらない。
+    /// 実測 (`changeset`) は `git status` の「HEAD と同じか」をそのまま使う
+    /// ので、**コミットが 1 つも無いと基準点が成立しない**。だから見るのは
+    /// 「Git があるか」ではなく [`gitinit::GitState`] で、`init` 済み・HEAD
+    /// 無しは**準備完了にしない**。前の版はここを `.git` の有無だけで見て
+    /// いたので、コミットに失敗した後にもう一度押すと「準備完了」と表示し、
+    /// 基準点が無いまま Run が走っていた。
     ///
-    /// `init` だけでは足りない。コミットが 1 つも無いと `git status` に
-    /// 全ファイルが未追跡として並び、基準点が「全部汚れている」になる。
-    /// 最初のコミットまで打って、**いまの中身を綺麗な状態**にする。
+    /// **人が押したときだけ**走らせる (利用者のフォルダを黙って変える操作)。
+    /// 利用者の index にも作業ツリーにも触らない — 詳しくは [`gitinit`]。
     pub fn init_git(&mut self) -> Result<(), String> {
         let ws = self.workspace.clone();
         if ws.as_os_str().is_empty() || !ws.is_dir() {
             return Err(crate::i18n::tr("team.git.no_workspace"));
         }
-        if crate::git::discover_toplevel(&ws).is_some() {
-            self.needs_git = false;
-            return Ok(());
-        }
-        let run = |args: &[&str]| -> Result<(), String> {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&ws)
-                .output()
-                .map_err(|e| format!("git: {e}"))?;
-            if out.status.success() {
-                return Ok(());
+        match gitinit::prepare(&ws) {
+            Ok(_) => {
+                self.refresh_git_readiness();
+                self.dirty = true;
+                Ok(())
             }
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        };
-        run(&["init"])?;
-        run(&["add", "-A"])?;
-        // **作者名は Run のためだけに与える。** 利用者の global 設定を
-        // 触らない (`-c` はこの 1 コマンドにしか効かない)。
-        run(&[
-            "-c",
-            "user.name=Zaivern",
-            "-c",
-            "user.email=zaivern@localhost",
-            "commit",
-            "-m",
-            "Zaivern: Team Run の基準点",
-            "--allow-empty",
-        ])?;
-        self.needs_git = false;
-        self.dirty = true;
-        Ok(())
+            Err(why) => {
+                // **失敗したら準備完了にしない。** 次に押せば続きから作る。
+                self.refresh_git_readiness();
+                self.dirty = true;
+                self.notice = why.clone();
+                Err(why)
+            }
+        }
+    }
+
+    /// **実測に使える基準点があるか**を見直す (`needs_git` の唯一の決め所)。
+    ///
+    /// `git::discover_toplevel` の有無で決めない — それでは HEAD の無い
+    /// リポジトリを「準備完了」と読む。
+    fn refresh_git_readiness(&mut self) {
+        self.needs_git = !matches!(
+            gitinit::plan_for(&gitinit::probe(&self.workspace)),
+            gitinit::GitPlan::Ready
+        );
     }
 
     /// **Run を 1 本閉じる。**
@@ -2469,6 +2454,86 @@ mod tests {
         // 基準点が「全部汚れている」になる。最初のコミットまで打つこと。
         let base = super::super::changeset::capture_baseline(&dir).expect("基準点を取れる");
         assert!(base.usable(), "取れた基準点が使えない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **HEAD が無いリポジトリを「準備完了」と判定しない。**
+    ///
+    /// 前の版は `.git` の有無だけを見ていたので、基準点のコミットに失敗した
+    /// 後にもう一度押すと「準備完了」と表示し、基準点が無いまま Run が
+    /// 走っていた (完了報告の帰属判定も担当外変更の判定も壊れる)。
+    #[test]
+    fn head無しのリポジトリを準備完了と判定しない() {
+        let dir = ws("no-head");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        let git = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            println!("[skip] git を使えません");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        git(&["config", "user.email", "t@example.invalid"]);
+        git(&["config", "user.name", "t"]);
+        // `.git` はあるが HEAD が無い = commit に失敗した後の状態。
+        assert!(
+            crate::git::discover_toplevel(&dir).is_some(),
+            "前提: リポジトリはある"
+        );
+        let mut p = TeamPanel::default();
+        p.home = dir.join(".zaivern-test-home");
+        let _ = p.attach_workspace(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        assert!(
+            p.needs_git,
+            "HEAD が無いのに準備完了と判定した (基準点が無いまま走る)"
+        );
+        // **もう一度押せば続きから作れる。**
+        p.init_git().expect("続きから作れる");
+        assert!(!p.needs_git, "用意したのに旗が残っている");
+        let base = super::super::changeset::capture_baseline(&dir).expect("基準点");
+        assert!(base.usable() && base.entries.is_empty(), "基準点が綺麗でない");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **秘密情報らしいファイルを黙って履歴へ入れない。**
+    /// 断ったら準備完了にもしない (中途半端に進めない)。
+    #[test]
+    fn 秘密情報らしいファイルがあると準備を断る() {
+        let dir = ws("git-secrets");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=abc").unwrap();
+        let mut p = TeamPanel::default();
+        p.home = dir.join(".zaivern-test-home");
+        let _ = p.attach_workspace(&dir);
+        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        match p.init_git() {
+            Err(why) => {
+                assert!(why.contains(".env"), "何を止めたのか言っていない: {why}");
+                assert!(p.needs_git, "断ったのに準備完了にした");
+                assert!(!p.notice.trim().is_empty(), "画面に理由が出ていない");
+            }
+            Ok(()) => {
+                // git を使えない環境ではここへ来ない (使えれば必ず断る)。
+                panic!("秘密情報らしいファイルを黙ってコミットした");
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".env")).unwrap(),
+            "TOKEN=abc",
+            "利用者のファイルを触った"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -4679,6 +4744,13 @@ mod tests {
             fin
         }
 
+        /// 提出の包み (`outbox::judge` が読む形)。
+        fn envelope(run_id: &str, agent: &str, kind: &str, payload: &str) -> String {
+            format!(
+                r#"{{"kind": "{kind}", "run_id": "{run_id}", "agent_id": "{agent}", "payload": {payload}}}"#
+            )
+        }
+
         fn name_of(f: &Path) -> String {
             f.file_name().unwrap().to_str().unwrap().to_string()
         }
@@ -4803,27 +4875,264 @@ mod tests {
             let (mut p, dir, a, b) = two_lanes("outbox-per-session");
             let fa = submit(&a.dir, "team-lead", "1", &report("team-lead", 98));
             let fb = submit(&b.dir, "team-lead", "1", &report("team-lead", 99));
-            // B のセッションだけ観測
+            // **セッションの観測に依存しない。** B のセッションしか観測に
+            // 載せていなくても、A の報告は A の Run へ届く (画面経由なら
+            // ここで落ちる — 置き場は担当 ID だけで配るので落ちない)。
             p.pump_sessions(rows(&[&b]), 100);
-            assert_eq!(saw(&p, &b.owner, "#99"), 1, "B の報告が B のセッションへ届かない");
-            assert!(!fb.exists());
-            assert_eq!(saw(&p, &a.owner, "#98"), 0, "観測に無いセッション宛てを届けたことにした");
-            assert!(fa.exists(), "配送先が観測に無いのに消した (報告が失われる)");
-            // 観測に無かった A の担当は Runtime が「消えた」と扱って結び付きを
-            // 外す (それが正しい動き)。起こし直して結び直したら、残っていた
-            // 報告が A のセッションへ届く。
-            p.bind_session(&a.owner, &AgentId::new("team-lead"), a.sid, None);
-            p.pump_sessions(rows(&[&a, &b]), 101);
-            assert_eq!(saw(&p, &a.owner, "#98"), 1, "A の報告が A のセッションへ届かない");
-            assert!(!fa.exists());
+            assert_eq!(saw(&p, &b.owner, "#99"), 1, "B の報告が B へ届かない");
+            assert_eq!(saw(&p, &a.owner, "#98"), 1, "観測に無いだけで A の報告を落とした");
             assert_eq!(saw(&p, &b.owner, "#98"), 0, "A の報告が B へ流れた");
+            assert_eq!(saw(&p, &a.owner, "#99"), 0, "B の報告が A へ流れた");
+            assert!(!fa.exists() && !fb.exists(), "受理したのに消していない");
             // A を閉じても B の配送は続く
             let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
             p.close_run(pos_a).expect("A を閉じる");
             let fb2 = submit(&b.dir, "team-lead", "2", &report("team-lead", 97));
-            p.pump_sessions(rows(&[&a, &b]), 102);
+            p.pump_sessions(rows(&[&b]), 102);
             assert_eq!(saw(&p, &b.owner, "#97"), 1, "A を閉じたら B へ届かなくなった");
             assert!(!fb2.exists());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **セッションが 1 度も結び付いていなくても、報告は落ちない。**
+        ///
+        /// 画面経由は「観測に載っているセッション」からしか拾えないので、
+        /// 結び付く前・プロセスが終わった直後に書かれた報告を必ず落とす。
+        /// 8 秒 (`MAX_ATTEMPTS` × 走査間隔) で隔離してもいけない。
+        #[test]
+        fn 未bindでもプロセスが終わっていても報告は失われない() {
+            let dir = ws("outbox-unbound");
+            let mut p = started_panel(&dir);
+            let owner = p.owner().expect("Run");
+            let boot = p.take_launches();
+            let spec = &boot[0].2;
+            let pos = p.run_pos_of_owner(&owner).expect("Run");
+            let out = p.runs[pos].outbox().to_path_buf();
+            std::fs::create_dir_all(&out).unwrap();
+            // **一度も bind していない担当**の報告。
+            assert!(
+                p.runs[pos]
+                    .agents()
+                    .iter()
+                    .all(|x| x.session_id.is_none()),
+                "前提: まだ誰にもセッションが結び付いていない"
+            );
+            let f = submit(&out, spec.agent_id.as_str(), "1", &report(spec.agent_id.as_str(), 96));
+            // 観測は空 (プロセスが終わった直後と同じ状況)。
+            p.pump_sessions(Vec::new(), 100);
+            assert_eq!(saw(&p, &owner, "#96"), 1, "未 bind の報告を落とした");
+            assert!(!f.exists(), "受理したのに消していない");
+            // **8 秒ぶん回しても隔離されない** (残っていないので当然だが、
+            // 隔離の記録が 1 件も出ないことまで見る)。
+            for i in 0..(outbox::MAX_ATTEMPTS + 5) {
+                p.pump_sessions(Vec::new(), 101 + u64::from(i));
+            }
+            assert_eq!(
+                saw(&p, &owner, "取り込めません"),
+                0,
+                "正しい報告を隔離した"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **伝言と出来事も置き場から届き、二度は効かない。**
+        #[test]
+        fn 伝言と出来事も置き場から一度だけ届く() {
+            let (mut p, dir, a, b) = two_lanes("outbox-msg-event");
+            let pos = p.run_pos_of_owner(&a.owner).expect("A");
+            let others: Vec<String> = p.runs[pos]
+                .agents()
+                .iter()
+                .map(|x| x.id.0.clone())
+                .filter(|id| id != "team-lead")
+                .collect();
+            let to = others.first().cloned().expect("宛先");
+            // 伝言
+            let msg = format!(r#"{{"to": "{to}", "text": "レビューお願いします"}}"#);
+            let fm = submit(
+                &a.dir,
+                "team-lead",
+                "m1",
+                &envelope(&a.owner.run_id, "team-lead", "message", &msg),
+            );
+            // 出来事 (送り主は parent_id)
+            let ev = r#"{"kind": "sub_agent_started", "agent_id": "child-9", "parent_id": "team-lead", "role": "implementer", "action": "調査中"}"#;
+            let fe = submit(
+                &a.dir,
+                "team-lead",
+                "e1",
+                &envelope(&a.owner.run_id, "team-lead", "event", ev),
+            );
+            p.pump_sessions(rows(&[&a, &b]), 300);
+            assert!(!fm.exists() && !fe.exists(), "受理したのに消していない");
+            let msgs = |p: &TeamPanel, o: &RunOwner| -> usize {
+                let pos = p.run_pos_of_owner(o).expect("Run");
+                p.runs[pos]
+                    .events()
+                    .filter(|e| e.kind == TeamEventKind::AgentMessage)
+                    .count()
+            };
+            let subs = |p: &TeamPanel, o: &RunOwner| -> usize {
+                let pos = p.run_pos_of_owner(o).expect("Run");
+                p.runs[pos]
+                    .agents()
+                    .iter()
+                    .filter(|x| x.id.as_str() == "child-9")
+                    .count()
+            };
+            assert_eq!(msgs(&p, &a.owner), 1, "伝言が A に届いていない");
+            assert_eq!(subs(&p, &a.owner), 1, "サブエージェントが A に並んでいない");
+            assert_eq!(msgs(&p, &b.owner), 0, "伝言が B へ流れた");
+            assert_eq!(subs(&p, &b.owner), 0, "出来事が B へ流れた");
+            // **同じ中身のファイルが 2 つあっても 1 回しか効かない**
+            // (塊の指紋で落ちる)。両方ともその場で片付く。
+            let m2 = submit(
+                &a.dir,
+                "team-lead",
+                "m2",
+                &envelope(&a.owner.run_id, "team-lead", "message", &msg),
+            );
+            let m3 = submit(
+                &a.dir,
+                "team-lead",
+                "m3",
+                &envelope(&a.owner.run_id, "team-lead", "message", &msg),
+            );
+            p.pump_sessions(rows(&[&a, &b]), 301);
+            assert!(!m2.exists() && !m3.exists(), "重複を片付けていない");
+            assert_eq!(
+                msgs(&p, &a.owner),
+                2,
+                "同じ中身のファイル 2 つで 2 回反映した (1 回だけ効くべき)"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **再起動をまたいでも、未処理の報告は回収できる。**
+        ///
+        /// 置き場は Run ごとに残るので、閉じていない Run の報告は次の起動で
+        /// 届く。**閉じた Run のものは別 Run へ流れない** (置き場ごと消える)。
+        #[test]
+        fn 再起動後に未処理の報告を回収できる() {
+            let (mut p, dir, a, b) = two_lanes("outbox-restart");
+            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
+            p.close_run(pos_a).expect("A を閉じる");
+            // **まだ誰も読んでいない報告**を B の置き場へ置いて、保存して落ちる。
+            let fb = submit(&b.dir, "team-lead", "pending", &report("team-lead", 95));
+            p.save_if_needed();
+            p.shutdown();
+            assert!(fb.exists(), "終了で未処理の報告を消した");
+            assert!(!a.dir.exists(), "閉じた Run の置き場が残っている");
+
+            // 次の起動: B が戻り、残っていた報告が届く。
+            let mut q = TeamPanel::default();
+            q.home = p.home.clone();
+            q.attach_workspace(&dir).expect("attach");
+            q.restore_run(false).expect("B を復元");
+            assert_eq!(
+                q.runs
+                    .iter()
+                    .map(|r| r.run().run_id.clone())
+                    .collect::<Vec<_>>(),
+                vec![b.owner.run_id.clone()],
+                "閉じた A が復活した / B が戻らない"
+            );
+            // 復元直後はセッションが 1 つも結び付いていない (実際の再起動と同じ)。
+            assert!(
+                q.runs[0].agents().iter().all(|x| x.session_id.is_none()),
+                "前提: 復元でセッションの結び付きは外れる"
+            );
+            q.pump_sessions(Vec::new(), 500);
+            assert!(!fb.exists(), "再起動後に未処理の報告を回収できていない");
+            let owner_b = q.owner().expect("B");
+            assert_eq!(saw(&q, &owner_b, "#95"), 1, "残っていた報告が届かない");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **同じ ID の担当を持つ 2 本を並べ、片方を閉じても他方は動き続ける。**
+        #[test]
+        fn 二本のrunを並べて片方を閉じても他方は動き続ける() {
+            let (mut p, dir, a, b) = two_lanes("outbox-multi-run-e2e");
+            for lane in [&a, &b] {
+                let pos = p.run_pos_of_owner(&lane.owner).unwrap();
+                assert!(
+                    p.runs[pos]
+                        .agents()
+                        .iter()
+                        .any(|x| x.id.as_str() == "team-lead"),
+                    "前提: どちらにも team-lead が居る"
+                );
+            }
+            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
+            let to = p.runs[pos_a]
+                .agents()
+                .iter()
+                .map(|x| x.id.0.clone())
+                .find(|id| id != "team-lead")
+                .expect("宛先");
+            submit(&a.dir, "team-lead", "r1", &report("team-lead", 91));
+            submit(&b.dir, "team-lead", "r1", &report("team-lead", 92));
+            submit(
+                &a.dir,
+                "team-lead",
+                "m1",
+                &envelope(
+                    &a.owner.run_id,
+                    "team-lead",
+                    "message",
+                    &format!(r#"{{"to": "{to}", "text": "先に進めます"}}"#),
+                ),
+            );
+            p.pump_sessions(rows(&[&a, &b]), 600);
+            assert_eq!(saw(&p, &a.owner, "#91"), 1, "A の報告が届かない");
+            assert_eq!(saw(&p, &b.owner, "#92"), 1, "B の報告が届かない");
+            assert_eq!(saw(&p, &a.owner, "#92"), 0, "B の報告が A へ流れた");
+            assert_eq!(saw(&p, &b.owner, "#91"), 0, "A の報告が B へ流れた");
+
+            // 画面を切り替えても両方生きている。
+            assert_eq!(p.run_tabs().len(), 2);
+            p.select_run(0);
+            p.select_run(1);
+            assert_eq!(p.runs.len(), 2, "切り替えで消えた");
+
+            // A を閉じる → B は動き続ける。
+            let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
+            p.close_run(pos_a).expect("A を閉じる");
+            assert!(!a.dir.exists(), "閉じた Run の置き場が残っている");
+            submit(&b.dir, "team-lead", "r2", &report("team-lead", 93));
+            p.pump_sessions(rows(&[&b]), 601);
+            assert_eq!(saw(&p, &b.owner, "#93"), 1, "A を閉じたら B が止まった");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **画面と置き場に同じ報告があっても二重には入らない。**
+        #[test]
+        fn 画面と置き場の二重受理を防ぐ() {
+            let (mut p, dir, a, b) = two_lanes("outbox-dedupe");
+            let json = report("team-lead", 99);
+            let f = submit(&a.dir, "team-lead", "1", &json);
+            // 画面にも**同じ塊**を出す (素直に読める形で)。
+            let open = super::super::super::result_parser::RESULT_OPEN;
+            let close = super::super::super::result_parser::RESULT_CLOSE;
+            let screen: Vec<String> = format!("{open}\n{json}\n{close}")
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let mut input = rows(&[&a, &b]);
+            for r in &mut input {
+                if r.id == a.sid {
+                    r.tail = screen.clone();
+                }
+            }
+            // **同じ tick で両方に出ていても 1 回。** 置き場を先に取り込み、
+            // 画面側は塊の指紋で落ちる。
+            p.pump_sessions(input, 400);
+            assert!(!f.exists(), "受理したのに消していない");
+            assert_eq!(
+                saw(&p, &a.owner, "#99"),
+                1,
+                "同じ報告が画面と置き場の両方から二重に入った"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 

@@ -2851,6 +2851,50 @@ impl TeamRuntime {
         out
     }
 
+    /// **置き場から届いた 1 通を取り込む。**
+    ///
+    /// 判断は画面から読むのと**同じ関数** (`take_result` / `take_review` /
+    /// `take_message` / `take_event`)。違うのは経路だけで、解析器も状態も
+    /// 増やさない。
+    ///
+    /// セッションを一切見ないのが要点。画面経由は「観測に載っている
+    /// セッション」からしか拾えないので、**結び付く前・観測に載らない tick・
+    /// プロセスが終わった直後**に書かれた報告を落とす。ここは担当 ID だけで
+    /// 届くので落ちない。
+    ///
+    /// 二重取り込みは塊の指紋 (`take_unseen`) が止める。画面と置き場の両方に
+    /// 同じ報告があっても、**先に来たほうだけ**が効く。既に取り込んだ塊は
+    /// `Ok(())` を返す — 呼び出し側はファイルを消してよい (残すと毎 tick
+    /// 同じ塊を読み直す)。
+    ///
+    /// `Err` はこの Run のものではないとき。呼び出し側が理由ごと隔離する。
+    pub fn accept_outbox(
+        &mut self,
+        agent: &AgentId,
+        kind: super::outbox::Kind,
+        body: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        if !self.agents.iter().any(|a| a.id == *agent) {
+            return Err(format!("{agent} はこの Run の担当ではありません"));
+        }
+        if rp::looks_incomplete(body) {
+            return Err("JSON オブジェクトではありません".to_string());
+        }
+        if self.take_unseen(vec![body.trim().to_string()]).is_empty() {
+            // 画面から先に取り込んでいた。**二度は効かせない**が、
+            // ファイルは片付けてよい (目的は果たされている)。
+            return Ok(());
+        }
+        match kind {
+            super::outbox::Kind::Result => self.take_result(agent, body),
+            super::outbox::Kind::Review => self.take_review(agent, body),
+            super::outbox::Kind::Message => self.take_message(agent, body),
+            super::outbox::Kind::Event => self.take_event(agent, body, now),
+        }
+        Ok(())
+    }
+
     /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
     ///
     /// 黙って消さない。ファイル名と本文の担当が食い違った・上限まで読んでも
@@ -4204,6 +4248,7 @@ impl TeamRuntime {
             // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
             // 届けられない相手を宛先の候補に出すと、断りが記録されるだけ。
             outbox: self.outbox.clone(),
+            run_id: self.run.run_id.as_str(),
             teammates: self
                 .agents
                 .iter()

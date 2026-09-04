@@ -375,6 +375,28 @@ Organization Board は Architect / Implementer / Reviewer / QA / Integrator
 
 ## 安全条件
 
+### Git は「あるか」ではなく「使える基準点があるか」で見る
+
+実測 (`changeset`) は `git status` の「HEAD と同じか」をそのまま使うので、
+**コミットが 1 つも無いリポジトリでは基準点が成立しない** (全ファイルが
+未追跡として並び、「全部汚れている」になる)。`.git` の有無だけで判定すると、
+基準点のコミットに失敗した後にもう一度押したとき「準備完了」と表示したまま
+Run が走る。判定は `gitinit::GitState` (`Absent` / `NoCommits` / `CleanHead` /
+`DirtyHead` / `Bare` / `Unusable`) と `plan_for` の純関数 1 本。
+
+用意 (`gitinit::prepare`) はやり直せる。`NoCommits` は「準備完了」ではなく
+「続きから作れる」状態として扱い、成功するまで `needs_git` を下ろさない。
+利用者のものは壊さない:
+
+* 木は**一時 index** (`GIT_INDEX_FILE`) の上で組み、`commit-tree` +
+  `update-ref` で HEAD を作る。途中で失敗しても利用者の index は変わらない
+* 既に HEAD があるリポジトリへは**1 コミットもしない**
+* `reset --hard` / 強制 checkout / ファイルの削除は**一切しない**
+* `.gitignore` は `add -A` がそのまま尊重する
+* `.env` / 秘密鍵 / credential などの**明らかに危険な未追跡ファイル**が
+  あれば、黙って履歴へ入れずに名指しで断る (`.gitignore` へ足して押し直せる)
+* 親のリポジトリに HEAD が無いときは断る (ワークスペース外を巻き込まない)
+
 ### 検証コマンドは、書いてあればそれを使う。書いていなければリポジトリを見る
 
 **Zaivern は任意のリポジトリで動く。** 0.23 までは SPEC が検証を書いて
@@ -697,6 +719,26 @@ Zaivern が保証できるのは「何を起動したか」までで、起動し
   `agent_id` がそれと一致しなければ配送しない
 * 置き場は Run ごとなので、同じ ID の担当 (`team-lead`) を持つ Run を
   2 本同時に走らせても報告が混線しない
+* **4 種類とも置き場が正規の経路。** 完了報告だけを置き場へ移しても
+  根本解決にならない — レビュー (`review`) を取りこぼすと実装済みのタスクが
+  `Reviewing` のまま永久に止まる。伝言 (`message`) と出来事 (`event`) も
+  同じ描画に晒される。中身はエンベロープで名乗る:
+
+  ```json
+  {"kind":"review","run_id":"run-…","agent_id":"reviewer-1","payload":{ … }}
+  ```
+
+  `kind` は `result` / `review` / `message` / `event`。`agent_id` は送り主で、
+  ファイル名の担当と一致すること。`run_id` は書いてあれば照合する
+  (別 Run 宛てを受け取らない)。素の JSON も受ける (前の版の完了報告との
+  互換) — 種別は形から決め、送り主が本文にあるのは `result` (`agent_id`) と
+  `event` (`parent_id`) だけなので、`review` / `message` はファイル名から
+  一意に決まるときだけ受ける
+* **配送はセッションを見ない。** 担当 ID だけで `TeamRuntime::accept_outbox`
+  へ渡すので、結び付く前・観測に載らない tick・プロセスが終わった直後に
+  書かれた報告も落ちない。判断は画面から読むのと同じ関数を通る
+  (解析器も状態も 2 つにしない)。画面経路は互換のための控えで、同じ塊は
+  `take_unseen` が指紋で落とすので二重には入らない
 * **Run を閉じる (✕) と、結び付いている全セッションの停止が直接出る**
   (`TeamRuntime::close`)。`Stop` は kill を承認ゲートに通すが、閉じるときに
   それを使うと判断が Run と一緒に消えて誰も承認できず、担当のプロセスだけが

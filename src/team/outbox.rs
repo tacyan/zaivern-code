@@ -27,6 +27,36 @@
 //!    ([`stem_matches`])。本文の `agent_id` がファイル名の担当と食い違う
 //!    報告は配送しない
 //!
+//! ## 4 種類とも同じ道を通る
+//!
+//! 完了報告だけを置き場へ移しても**根本解決にならない**。レビュー・伝言・
+//! 出来事も同じ TUI の描画に晒されていて、取りこぼすと同じ形で止まる —
+//! とくにレビューを落とすと、実装が終わったタスクが `Reviewing` のまま
+//! 永久に動かない。だから 4 種類 ([`Kind`]) とも置き場を正規の経路にする。
+//!
+//! 種別はエンベロープで名乗る (**これが正しい書き方**):
+//!
+//! ```json
+//! {"kind":"review","run_id":"run-…","agent_id":"reviewer-1","payload":{ … }}
+//! ```
+//!
+//! * `kind` — `result` / `review` / `message` / `event`
+//! * `run_id` — 任意。書いてあれば**その Run のものだけ**受ける
+//! * `agent_id` — **送り主**。ファイル名の担当と一致すること
+//! * `payload` — 中身。画面の囲みに入っていたものと**同じ JSON**
+//!
+//! 素の JSON (エンベロープ無し) も受ける。完了報告は前の版でそう教えていた
+//! ので、受けないと移行の瞬間に報告が全部隔離される。種別は形から決める
+//! ([`infer_kind`])。**送り主が本文から分かるのは `result` と `event` だけ**
+//! (`review` / `message` の JSON に送り主の欄は無い) なので、素で書かれた
+//! その 2 種はファイル名から一意に決まるときだけ受ける。
+//!
+//! 解析器も状態も増やさない。ここがするのは**種別を決めて中身を取り出す**
+//! ことだけで、受理の判断は今までどおり Runtime 1 か所
+//! (`take_result` / `take_review` / `take_message` / `take_event`)。
+//! 画面から読む経路も残っているが、同じ塊は Runtime の
+//! `take_unseen` が塊の指紋で落とすので**二重には入らない**。
+//!
 //! ## 置き場は Run ごと
 //!
 //! `<state_dir>/outbox/<run_id>/`。**同じ ID の担当は毎 Run に居る**
@@ -136,15 +166,106 @@ pub fn candidates(stem: &str, ids: &[AgentId]) -> Vec<AgentId> {
         .collect()
 }
 
+/// 置き場で運ぶ 4 種類。**画面の囲みと 1 対 1** に対応する。
+///
+/// 対応を 1 か所に閉じておかないと、書く側 (指示文) と読む側 (配送) が
+/// 別の綴りを使い、種別が合わないまま黙って隔離される。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// 完了報告 (`[ZAI-TEAM-RESULT]`)。
+    Result,
+    /// レビュー結果 (`[ZAI-TEAM-REVIEW]`)。
+    Review,
+    /// エージェント間の伝言 (`[ZAI-TEAM-MSG]`)。
+    Message,
+    /// サブエージェントの出来事 (`[ZAI-TEAM-EVENT]`)。
+    Event,
+}
+
+impl Kind {
+    /// エンベロープの `kind` に書く綴り。
+    pub fn key(self) -> &'static str {
+        match self {
+            Kind::Result => "result",
+            Kind::Review => "review",
+            Kind::Message => "message",
+            Kind::Event => "event",
+        }
+    }
+
+    /// 綴りから引く (知らない語は `None` = 隔離)。
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "result" => Some(Kind::Result),
+            "review" => Some(Kind::Review),
+            "message" | "msg" => Some(Kind::Message),
+            "event" => Some(Kind::Event),
+            _ => None,
+        }
+    }
+
+    /// 全種別 (指示文と番人が舐める)。
+    pub const ALL: &'static [Kind] = &[Kind::Result, Kind::Review, Kind::Message, Kind::Event];
+}
+
 /// 1 つの報告ファイルをどう扱うか。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// この担当の報告として配送してよい。
-    Deliver(AgentId),
+    /// この担当の報告として配送してよい。`body` は囲みへ入れる中身。
+    Deliver {
+        agent: AgentId,
+        kind: Kind,
+        body: String,
+    },
     /// いまは取り込めない (書きかけ・読めない)。残して次の tick で読み直す。
     Retry(String),
     /// 取り込まない。隔離して理由を残す。`agent` は記録の宛先 (分かれば)。
     Reject { agent: Option<AgentId>, why: String },
+}
+
+/// 素の JSON の**形**から種別を決める。エンベロープが無いときだけ使う。
+///
+/// 見分けは「その種別にしかない欄」で行う。順序が意味を持つ — `event` の
+/// JSON も `kind` を持つ (`sub_agent_started` 等) ので、エンベロープの
+/// `kind` と取り違えないよう**エンベロープは `payload` の有無で決める**
+/// ([`judge`])。
+pub fn infer_kind(v: &serde_json::Value) -> Option<Kind> {
+    let has = |k: &str| v.get(k).is_some();
+    if has("verdict") {
+        return Some(Kind::Review);
+    }
+    if has("to") && has("text") {
+        return Some(Kind::Message);
+    }
+    // 出来事の `kind` は表にある語だけ (`result` 等と紛れない)。
+    if let Some(k) = v.get("kind").and_then(|k| k.as_str()) {
+        if rp::EVENT_KINDS.contains(&k.trim()) {
+            return Some(Kind::Event);
+        }
+    }
+    if has("task_id") && has("status") {
+        return Some(Kind::Result);
+    }
+    None
+}
+
+/// その種別の素の JSON から**送り主**を読む。
+///
+/// * `result` — `agent_id` が送り主
+/// * `event` — `parent_id` が送り主 (`agent_id` は*報告された子*なので、
+///   ここを送り主として照合すると必ず食い違う)
+/// * `review` / `message` — 送り主の欄が無い (エンベロープでしか名乗れない)
+fn bare_sender(kind: Kind, v: &serde_json::Value) -> Option<String> {
+    let field = match kind {
+        Kind::Result => "agent_id",
+        Kind::Event => "parent_id",
+        Kind::Review | Kind::Message => return None,
+    };
+    v.get(field)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// **ファイル名と本文の両方で担当を決める。** 純関数。
@@ -157,7 +278,7 @@ pub enum Verdict {
 ///
 /// 読み方は Runtime と同じ [`rp::parse_lenient`] (綴りの手直しまで同じ)。
 /// ここで読めたものは Runtime でも読める。
-pub fn judge(stem: &str, body: &str, ids: &[AgentId]) -> Verdict {
+pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
     if body.len() > rp::BLOCK_MAX_BYTES {
         // 囲みに入れて渡しても `extract_blocks` が黙って落とす大きさ。
         // 配送して消すと「届いたのに何も起きない」になるので、ここで断る。
@@ -174,30 +295,121 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId]) -> Verdict {
         Ok(v) => v,
         Err(e) => return Verdict::Retry(format!("JSON として読めません: {e}")),
     };
-    let claimed = value
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(claimed) = claimed else {
-        return Verdict::Reject {
-            agent: None,
-            why: "本文に agent_id がありません".to_string(),
-        };
+    let named = |claimed: &str| ids.iter().find(|id| id.as_str() == claimed).cloned();
+
+    // **エンベロープかどうかは `payload` の有無で決める。**
+    // 出来事の JSON も `kind` を持つので、`kind` だけでは見分けられない。
+    let (kind, sender, payload) = match value.get("payload") {
+        Some(payload) => {
+            let Some(k) = value.get("kind").and_then(|k| k.as_str()) else {
+                return Verdict::Reject {
+                    agent: None,
+                    why: "エンベロープに kind がありません".to_string(),
+                };
+            };
+            let Some(kind) = Kind::from_key(k) else {
+                return Verdict::Reject {
+                    agent: None,
+                    why: format!(
+                        "知らない kind です: {k} (使えるのは {})",
+                        Kind::ALL
+                            .iter()
+                            .map(|x| x.key())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                };
+            };
+            // **別 Run 宛てを受け取らない。** 書いてあるときだけ見る
+            // (古い書き方には無いので、無いことは咎めない)。
+            if let Some(claimed_run) = value.get("run_id").and_then(|r| r.as_str()) {
+                let claimed_run = claimed_run.trim();
+                if !claimed_run.is_empty() && claimed_run != run_id {
+                    return Verdict::Reject {
+                        agent: None,
+                        why: format!(
+                            "別の Run 宛てです (本文 {claimed_run} / この置き場 {run_id})"
+                        ),
+                    };
+                }
+            }
+            let sender = value
+                .get("agent_id")
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let Some(sender) = sender else {
+                return Verdict::Reject {
+                    agent: None,
+                    why: "エンベロープに agent_id (送り主) がありません".to_string(),
+                };
+            };
+            // 中身は**そのまま**渡す (画面の囲みに入っていたものと同じ形)。
+            let text = match serde_json::to_string(payload) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Verdict::Reject {
+                        agent: named(&sender),
+                        why: format!("payload を JSON にできません: {e}"),
+                    }
+                }
+            };
+            (kind, Some(sender), text)
+        }
+        None => {
+            let Some(kind) = infer_kind(&value) else {
+                return Verdict::Reject {
+                    agent: None,
+                    why: "種別を決められません (kind と payload のエンベロープで書いてください)"
+                        .to_string(),
+                };
+            };
+            (kind, bare_sender(kind, &value), body.trim().to_string())
+        }
     };
+
     let cands = candidates(stem, ids);
     if cands.is_empty() {
         return Verdict::Reject {
-            agent: ids.iter().find(|id| id.as_str() == claimed).cloned(),
+            agent: sender.as_deref().and_then(named),
             why: format!("ファイル名 `{stem}` はこの Run のどの担当にも一致しません"),
         };
     }
-    match cands.iter().find(|c| c.as_str() == claimed) {
-        Some(agent) => Verdict::Deliver(agent.clone()),
-        None => Verdict::Reject {
-            agent: ids.iter().find(|id| id.as_str() == claimed).cloned(),
+    // 送り主が本文から分かるなら、ファイル名と突き合わせる。
+    if let Some(claimed) = sender {
+        return match cands.iter().find(|c| c.as_str() == claimed) {
+            Some(agent) => Verdict::Deliver {
+                agent: agent.clone(),
+                kind,
+                body: payload,
+            },
+            None => Verdict::Reject {
+                agent: named(&claimed),
+                why: format!(
+                    "ファイル名の担当 ({}) と本文の送り主 ({claimed}) が一致しません",
+                    cands
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ),
+            },
+        };
+    }
+    // 本文に送り主が無い素の JSON (`review` / `message`)。ファイル名から
+    // **一意に決まるときだけ**受ける。2 人に当たるなら決め手が無い。
+    match cands.len() {
+        1 => Verdict::Deliver {
+            agent: cands[0].clone(),
+            kind,
+            body: payload,
+        },
+        _ => Verdict::Reject {
+            agent: None,
             why: format!(
-                "ファイル名の担当 ({}) と本文の agent_id ({claimed}) が一致しません",
+                "送り主を決められません (ファイル名が {} に当たり、本文に送り主がありません。\
+                 kind と agent_id のエンベロープで書いてください)",
                 cands
                     .iter()
                     .map(|c| c.as_str())
@@ -313,6 +525,21 @@ mod tests {
         list.iter().map(|s| AgentId::new(*s)).collect()
     }
 
+    /// この置き場の Run。
+    const RUN: &str = "run-1712345678-1-0";
+
+    fn deliver(agent: &str, kind: Kind, body: &str) -> Verdict {
+        Verdict::Deliver {
+            agent: AgentId::new(agent),
+            kind,
+            body: body.trim().to_string(),
+        }
+    }
+
+    fn envelope(kind: &str, run: &str, agent: &str, payload: &str) -> String {
+        format!(r#"{{"kind":"{kind}","run_id":"{run}","agent_id":"{agent}","payload":{payload}}}"#)
+    }
+
     fn report(agent: &str) -> String {
         format!(
             "{{\"task_id\": 1, \"agent_id\": \"{agent}\", \"status\": \"completed\", \
@@ -353,21 +580,21 @@ mod tests {
         }
     }
 
-    /// **本文の `agent_id` とファイル名の担当を突き合わせる。**
+    /// **本文の送り主とファイル名の担当を突き合わせる。**
     #[test]
     fn 本文とファイル名の担当が食い違う報告は配送しない() {
         let all = ids(&["agent-1", "agent-10", "agent-100"]);
         // 一致 → 配送
         assert_eq!(
-            judge("agent-10-abc", &report("agent-10"), &all),
-            Verdict::Deliver(AgentId::new("agent-10"))
+            judge("agent-10-abc", &report("agent-10"), &all, RUN),
+            deliver("agent-10", Kind::Result, &report("agent-10"))
         );
         assert_eq!(
-            judge("agent-1", &report("agent-1"), &all),
-            Verdict::Deliver(AgentId::new("agent-1"))
+            judge("agent-1", &report("agent-1"), &all, RUN),
+            deliver("agent-1", Kind::Result, &report("agent-1"))
         );
         // ファイル名は agent-10、本文は agent-1 → 却下 (どちらへも配らない)
-        match judge("agent-10-abc", &report("agent-1"), &all) {
+        match judge("agent-10-abc", &report("agent-1"), &all, RUN) {
             Verdict::Reject { agent, why } => {
                 assert_eq!(agent, Some(AgentId::new("agent-1")), "記録の宛先");
                 assert!(why.contains("agent-10") && why.contains("agent-1"), "{why}");
@@ -376,33 +603,171 @@ mod tests {
         }
         // ファイル名が誰にも当たらない → 却下
         assert!(matches!(
-            judge("stranger-1", &report("agent-1"), &all),
+            judge("stranger-1", &report("agent-1"), &all, RUN),
             Verdict::Reject { .. }
         ));
-        // 本文に agent_id が無い → 却下
+        // 種別を決められない JSON → 却下
         assert!(matches!(
-            judge("agent-1-x", "{\"task_id\": 1}", &all),
+            judge("agent-1-x", "{\"hello\": 1}", &all, RUN),
             Verdict::Reject { .. }
         ));
     }
 
-    /// **`a` と `a-b` のように境界を見ても 2 つ当たるときは、本文で決める。**
+    /// **4 種類とも、エンベロープで種別と送り主が決まる。**
+    ///
+    /// 完了報告だけを置き場へ移しても根本解決にならない (レビューを落とすと
+    /// タスクが `Reviewing` のまま止まる)。ここが 4 種類とも通ることを固定する。
     #[test]
-    fn 候補が二つあるときは本文のagent_idで決める() {
+    fn エンベロープは四種類とも種別と送り主で配送先が決まる() {
+        let all = ids(&["impl-1", "reviewer-1"]);
+        let table: &[(Kind, &str)] = &[
+            (Kind::Result, r#"{"task_id":1,"agent_id":"impl-1","status":"completed"}"#),
+            (Kind::Review, r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#),
+            (Kind::Message, r#"{"to":"impl-1","text":"できました"}"#),
+            (
+                Kind::Event,
+                r#"{"kind":"sub_agent_started","agent_id":"child-1","parent_id":"impl-1"}"#,
+            ),
+        ];
+        for (kind, payload) in table {
+            let env = envelope(kind.key(), RUN, "impl-1", payload);
+            match judge("impl-1-9", &env, &all, RUN) {
+                Verdict::Deliver { agent, kind: k, body } => {
+                    assert_eq!(agent, AgentId::new("impl-1"), "{kind:?}");
+                    assert_eq!(k, *kind, "{kind:?} の種別を取り違えた");
+                    // 中身は囲みへ入れる JSON そのもの (包みは剥がす)。
+                    let got: serde_json::Value = serde_json::from_str(&body).expect("payload");
+                    let want: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert_eq!(got, want, "{kind:?} の中身が変わった");
+                }
+                other => panic!("{kind:?} を配送しなかった: {other:?}"),
+            }
+        }
+        // 綴りの揺れ (大小・msg) は受ける。知らない綴りは隔離。
+        for k in ["Result", "REVIEW", "msg", "event"] {
+            let env = envelope(k, RUN, "impl-1", r#"{"task_id":1,"verdict":"APPROVE"}"#);
+            assert!(
+                matches!(judge("impl-1-9", &env, &all, RUN), Verdict::Deliver { .. }),
+                "{k} を受けなかった"
+            );
+        }
+        let env = envelope("hack", RUN, "impl-1", "{}");
+        assert!(matches!(
+            judge("impl-1-9", &env, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+        // payload はあるが kind が無い → 隔離
+        assert!(matches!(
+            judge("impl-1-9", r#"{"agent_id":"impl-1","payload":{}}"#, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+        // 送り主が違う → 配送しない
+        let env = envelope("review", RUN, "reviewer-1", r#"{"task_id":1,"verdict":"APPROVE"}"#);
+        assert!(matches!(
+            judge("impl-1-9", &env, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+    }
+
+    /// **別 Run 宛ての報告を受け取らない。** 書いてあるときだけ見る。
+    #[test]
+    fn 別のrun宛ての報告は配送しない() {
+        let all = ids(&["impl-1"]);
+        let payload = r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#;
+        let env = envelope("review", "run-OTHER", "impl-1", payload);
+        match judge("impl-1-9", &env, &all, RUN) {
+            Verdict::Reject { why, .. } => assert!(why.contains("run-OTHER"), "{why}"),
+            other => panic!("別 Run 宛てを配送した: {other:?}"),
+        }
+        // 書いていなければ咎めない (古い書き方との互換)
+        let env = format!(
+            r#"{{"kind":"review","agent_id":"impl-1","payload":{payload}}}"#
+        );
+        assert!(matches!(
+            judge("impl-1-9", &env, &all, RUN),
+            Verdict::Deliver { .. }
+        ));
+    }
+
+    /// **素の JSON も受ける** (前の版の完了報告がそう書かれている)。
+    ///
+    /// 送り主が本文から分かるのは `result` (`agent_id`) と `event`
+    /// (`parent_id`) だけ。出来事の `agent_id` は*報告された子*なので、
+    /// そこを送り主として照合すると必ず食い違う。
+    #[test]
+    fn 素のjsonは形から種別を決め送り主を正しく読む() {
+        let all = ids(&["impl-1", "child-1"]);
+        // result — agent_id が送り主
+        assert_eq!(
+            judge("impl-1-1", &report("impl-1"), &all, RUN),
+            deliver("impl-1", Kind::Result, &report("impl-1"))
+        );
+        // event — parent_id が送り主 (agent_id は子)
+        let ev = r#"{"kind":"sub_agent_started","agent_id":"child-1","parent_id":"impl-1"}"#;
+        assert_eq!(
+            judge("impl-1-2", ev, &all, RUN),
+            deliver("impl-1", Kind::Event, ev)
+        );
+        // 子の名前をファイル名にしたら食い違う (送り主は親)
+        assert!(matches!(
+            judge("child-1-2", ev, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+        // review / message — 送り主の欄が無いのでファイル名で決める
+        let rv = r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#;
+        assert_eq!(
+            judge("impl-1-3", rv, &all, RUN),
+            deliver("impl-1", Kind::Review, rv)
+        );
+        let ms = r#"{"to":"child-1","text":"やあ"}"#;
+        assert_eq!(
+            judge("impl-1-4", ms, &all, RUN),
+            deliver("impl-1", Kind::Message, ms)
+        );
+        // 種別の見分けは表の語だけ。知らない kind の素 JSON は隔離。
+        assert!(matches!(
+            judge("impl-1-5", r#"{"kind":"hack_the_planet","parent_id":"impl-1"}"#, &all, RUN),
+            Verdict::Reject { .. }
+        ));
+    }
+
+    /// **`a` と `a-b` のように 2 つ当たるときは、本文の送り主で決める。**
+    /// 送り主が無い種別 (`review` / `message`) は決め手が無いので隔離する。
+    #[test]
+    fn 候補が二つあるときは本文の送り主で決める() {
         let all = ids(&["a", "a-b"]);
         assert_eq!(candidates("a-b-x", &all).len(), 2, "前提: 2 つ当たる");
         assert_eq!(
-            judge("a-b-x", &report("a-b"), &all),
-            Verdict::Deliver(AgentId::new("a-b"))
+            judge("a-b-x", &report("a-b"), &all, RUN),
+            deliver("a-b", Kind::Result, &report("a-b"))
         );
         assert_eq!(
-            judge("a-b-x", &report("a"), &all),
-            Verdict::Deliver(AgentId::new("a"))
+            judge("a-b-x", &report("a"), &all, RUN),
+            deliver("a", Kind::Result, &report("a"))
         );
         assert!(matches!(
-            judge("a-b-x", &report("c"), &all),
+            judge("a-b-x", &report("c"), &all, RUN),
             Verdict::Reject { .. }
         ));
+        // 送り主の欄が無い素の review は、候補が 2 つなら決められない
+        let rv = r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#;
+        match judge("a-b-x", rv, &all, RUN) {
+            Verdict::Reject { why, .. } => assert!(why.contains("送り主"), "{why}"),
+            other => panic!("当てずっぽうで配送した: {other:?}"),
+        }
+        // エンベロープなら名乗れるので決まる (中身は同じ JSON)
+        let env = envelope("review", RUN, "a-b", rv);
+        match judge("a-b-x", &env, &all, RUN) {
+            Verdict::Deliver { agent, kind, body } => {
+                assert_eq!(agent, AgentId::new("a-b"));
+                assert_eq!(kind, Kind::Review);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(rv).unwrap()
+                );
+            }
+            other => panic!("名乗ったのに配送しない: {other:?}"),
+        }
     }
 
     /// **書きかけは Retry、大きすぎは Reject。** 途中で切れた JSON が
@@ -414,20 +779,20 @@ mod tests {
         for cut in [0, 1, 10, full.len() / 2, full.len() - 1] {
             let partial = &full[..cut];
             assert!(
-                matches!(judge("agent-1-x", partial, &all), Verdict::Retry(_)),
+                matches!(judge("agent-1-x", partial, &all, RUN), Verdict::Retry(_)),
                 "cut={cut} で Retry にならない: {partial:?}"
             );
         }
         assert!(matches!(
-            judge("agent-1-x", &full, &all),
-            Verdict::Deliver(_)
+            judge("agent-1-x", &full, &all, RUN),
+            Verdict::Deliver { .. }
         ));
         let huge = format!(
             "{{\"agent_id\":\"agent-1\",\"summary\":\"{}\"}}",
             "x".repeat(rp::BLOCK_MAX_BYTES)
         );
         assert!(matches!(
-            judge("agent-1-x", &huge, &all),
+            judge("agent-1-x", &huge, &all, RUN),
             Verdict::Reject { .. }
         ));
     }

@@ -44,6 +44,9 @@ pub struct Brief<'a> {
     pub forbidden_files: Vec<String>,
     /// 報告を書き出すフォルダ (**画面ではなくここから読む**)。
     pub outbox: std::path::PathBuf,
+    /// この Run の ID。提出の包みに書かせて、**別 Run 宛ての取り違えを断る**
+    /// ための材料 (`outbox::judge` が照合する)。
+    pub run_id: &'a str,
     /// **同じチームの顔ぶれ** `(ID, 役割の表示名)`。
     ///
     /// 誰が居るか分からなければ伝言のしようがない (宛先を捏造するだけ)。
@@ -104,6 +107,62 @@ fn cap(mut body: String, required_tail: String) -> String {
     body
 }
 
+/// **置き場への提出の作法。4 種類 (完了報告・レビュー・伝言・出来事) 共通。**
+///
+/// 画面へ出すだけでは届かない。Claude Code v2 のような TUI は改行ではなく
+/// カーソル移動で描くので、画面のグリッドでは行が潰れて**構造的に**
+/// 取りこぼす。完了報告だけをファイルにしても、レビューを落とせばタスクは
+/// `Reviewing` のまま止まる — だから 4 種類とも同じ道で出させる。
+///
+/// 名前と形の取り決めは [`super::outbox`] が持つ 1 か所から引く。ここで
+/// 別に綴ると、教えた名前を読む側が受け付けない食い違いが黙って起きる。
+fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> String {
+    if outbox.as_os_str().is_empty() {
+        return String::new();
+    }
+    let dir = outbox.display();
+    let tmp = super::outbox::tmp_name(agent_id, "<一意な値>");
+    let fin = super::outbox::final_name(agent_id, "<一意な値>");
+    let ex_tmp = super::outbox::tmp_name(agent_id, "1712345678");
+    let ex_fin = super::outbox::final_name(agent_id, "1712345678");
+    format!(
+        "\n## 提出のしかた (**これが正式な経路**)\n\
+         報告・判定・伝言・出来事は、下の JSON を**ファイルとして提出**してください。\n\
+         画面にも出してよいですが、画面は人が読むための控えです。\n\n\
+         提出先フォルダ: `{dir}` (無ければ作る)\n\
+         書きかけを読まれないための手順です。**必ずこの順で**:\n\
+         1. 一時ファイル `{dir}/{tmp}` へ JSON 全体を書き切る\n\
+         \x20  (`<一意な値>` は時刻や乱数など毎回違う値。例: `{ex_tmp}`)\n\
+         2. 書き終えてから、**同じフォルダの中で** `.tmp` を外した名前 `{dir}/{fin}` へ改名する\n\
+         \x20  macOS / Linux: `mv '{dir}/{ex_tmp}' '{dir}/{ex_fin}'`\n\
+         \x20  Windows (PowerShell): `Move-Item '{dir}\\{ex_tmp}' '{dir}\\{ex_fin}'`\n\
+         3. `.json` へ直接は書かない。`.tmp` のままのファイルは提出になりません\n\n\
+         中身は**この包み**にしてください。`payload` には下の各節が示す JSON を\n\
+         そのまま入れます。\n\n\
+         ```json\n\
+         {{\"kind\": \"result\", \"run_id\": \"{run_id}\", \"agent_id\": \"{agent_id}\", \"payload\": {{ … }}}}\n\
+         ```\n\n\
+         `kind` は `result` (完了報告) / `review` (レビュー判定) / \
+         `message` (仲間への伝言) / `event` (サブエージェントの出来事)。\n\
+         `agent_id` は**あなた自身**で、ファイル名の担当と一致していること。\n\
+         1 通ごとに別のファイルにしてください。\n"
+    )
+}
+
+/// レビュー判定を置き場へ出させる 1 行 (置き場が無ければ空)。
+///
+/// **レビューを画面依存のままにしない。** 落とすと、実装が終わったタスクが
+/// `Reviewing` のまま永久に止まる (完了報告だけを置き場へ移しても、
+/// ここが残っていれば同じ形で詰まる)。
+fn review_submit(outbox: &std::path::Path) -> String {
+    if outbox.as_os_str().is_empty() {
+        return String::new();
+    }
+    "**上の「提出のしかた」で `kind` を `review` にして提出してください** \
+     (これが正式な提出です)。下の形は `payload` の中身です。\n\n"
+        .to_string()
+}
+
 /// 完了報告のひな型。**全役割で同じ 1 本**を使う。
 fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> String {
     // **ファイルへ書かせるのが本線。** 画面へ出すだけだと、カーソル移動で
@@ -112,25 +171,10 @@ fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> Stri
     let file = if outbox.as_os_str().is_empty() {
         String::new()
     } else {
-        // **取り決めは `outbox` が持つ。** 名前の形をここで別に書くと、
-        // 読む側が受け付けない名前を教える食い違いが黙って起きる。
-        let dir = outbox.display();
-        let tmp = super::outbox::tmp_name(agent_id, "<一意な値>");
-        let fin = super::outbox::final_name(agent_id, "<一意な値>");
-        let example_tmp = super::outbox::tmp_name(agent_id, "1712345678");
-        let example_fin = super::outbox::final_name(agent_id, "1712345678");
-        format!(
-            "**まず、同じ JSON をファイルとして提出してください** (これが正式な提出です)。\n\
-             提出先フォルダ: `{dir}` (無ければ作る)\n\
-             書きかけを読まれないための手順です。**必ずこの順で**:\n\
-             1. 一時ファイル `{dir}/{tmp}` へ JSON 全体を書き切る。\n\
-             \x20  `<一意な値>` は時刻や乱数など毎回違う値 (例: `{example_tmp}`)。\n\
-             2. 書き終えてから、**同じフォルダの中で** `.tmp` を外した名前 `{dir}/{fin}` へ改名する。\n\
-             \x20  macOS / Linux: `mv '{dir}/{example_tmp}' '{dir}/{example_fin}'`\n\
-             \x20  Windows (PowerShell): `Move-Item '{dir}\\{example_tmp}' '{dir}\\{example_fin}'`\n\
-             3. `.json` へ直接は書かない。`.tmp` のままのファイルは提出になりません。\n\
-             書けたら、下の形で画面にも出してください (画面のほうは人が読むための控えです)。\n\n"
-        )
+        "**上の「提出のしかた」で `kind` を `result` にして提出してください** \
+         (これが正式な提出です)。下の形は `payload` の中身であり、\
+         画面へ出すときの形でもあります。\n\n"
+            .to_string()
     };
     format!(
         "{file}作業が終わったら、次の形式を**そのまま**出力してください (前後に説明を書いてよい)。\n\
@@ -162,11 +206,19 @@ fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> Stri
 ///
 /// 出させるのは**始まりと終わり**だけ。実況中継させると、盤面が流れて
 /// 「いま誰が何をしているか」が読めなくなる。
-fn subagents_section(agent_id: &str) -> String {
+fn subagents_section(agent_id: &str, outbox: &std::path::Path) -> String {
+    let submit = if outbox.as_os_str().is_empty() {
+        String::new()
+    } else {
+        "**上の「提出のしかた」で `kind` を `event` にして提出してください。**\n\
+         (画面へ出すだけだと、描き方によっては届きません。)\n\n"
+            .to_string()
+    };
     format!(
         "\n## 中で誰かに手伝わせたとき\n\
          あなたが内部でサブエージェントを使ったら、**始めたときと終えたとき**に\n\
          次を出してください (Zaivern の盤面へ、あなたの下にぶら下がって出ます)。\n\n\
+         {submit}\
          {open}\n\
          {{\"kind\": \"sub_agent_started\", \"agent_id\": \"<子の名前>\", \
          \"parent_id\": \"{agent_id}\", \"role\": \"implementer\", \
@@ -185,10 +237,17 @@ fn subagents_section(agent_id: &str) -> String {
 ///
 /// 伝言できることを指示文に書かなければ、エージェントは一生使わない
 /// (機能があっても到達経路が無いのと同じ)。
-fn teammates_section(mates: &[(String, String)]) -> String {
+fn teammates_section(mates: &[(String, String)], outbox: &std::path::Path) -> String {
     if mates.is_empty() {
         return String::new();
     }
+    let submit = if outbox.as_os_str().is_empty() {
+        String::new()
+    } else {
+        "**上の「提出のしかた」で `kind` を `message` にして提出してください。**\n\
+         (画面へ出すだけだと、描き方によっては届きません。)\n\n"
+            .to_string()
+    };
     const LINE_DECORATION_BYTES: usize = "* `` — \n".len();
     const OMITTED: &str = "* …(仲間の一覧が長いため一部省略。全員への宛先 `all` は使えます)\n";
     let full_len = mates.iter().fold(0usize, |total, (id, role)| {
@@ -222,7 +281,7 @@ fn teammates_section(mates: &[(String, String)]) -> String {
         "\n## チームの仲間\n{list}\n\
          区切りが付いたときや、相手が待っていることが分かったときは、\
          次の形で**その相手へ直接伝えてください** (Zaivern が相手の端末へ届けます)。\n\n\
-         {howto}",
+         {submit}{howto}",
         howto = super::result_parser::message_howto("<上の ID か役割、全員なら all>"),
     )
 }
@@ -285,10 +344,11 @@ pub fn implementer(b: &Brief<'_>) -> String {
          \x20 - ワークスペース外へ書き込まない\n\
          \x20 - 破壊的な削除 (rm -rf 等) を行わない\n",
     );
+    required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str("\n## 完了報告\n");
     required_tail.push_str(&result_format(t.id, b.agent_id, &b.outbox));
-    required_tail.push_str(&teammates_section(&b.teammates));
-    required_tail.push_str(&subagents_section(b.agent_id));
+    required_tail.push_str(&teammates_section(&b.teammates, &b.outbox));
+    required_tail.push_str(&subagents_section(b.agent_id, &b.outbox));
     cap(s, required_tail)
 }
 
@@ -328,8 +388,9 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
          \x20 - 破壊的変更 (既存の振る舞いを壊していないか)\n\
          \x20 - 担当外ファイルの変更\n",
     );
+    required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str(&format!(
-        "\n## 判定の出し方\n次の形式を**そのまま**出力してください。\n\n\
+        "\n## 判定の出し方\n{submit}次の形式を**そのまま**出力してください。\n\n\
          {open}\n\
          {{\n\
          \x20 \"task_id\": {id},\n\
@@ -341,14 +402,15 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
          * 指摘があるときは verdict を \"REQUEST_CHANGES\" にし、findings に\n\
          \x20 **具体的な指摘**を 1 件 1 行で書くこと (空では受け付けません)\n\
          * コードは変更しないこと\n",
+        submit = review_submit(&b.outbox),
         open = super::reviewer::REVIEW_OPEN,
         close = super::reviewer::REVIEW_CLOSE,
         id = target.id,
     ));
     // **レビューこそ伝える相手が要る。** 指摘を書いても、直す本人へ
     // 届かなければ盤面に残るだけになる。
-    required_tail.push_str(&teammates_section(&b.teammates));
-    required_tail.push_str(&subagents_section(b.agent_id));
+    required_tail.push_str(&teammates_section(&b.teammates, &b.outbox));
+    required_tail.push_str(&subagents_section(b.agent_id, &b.outbox));
     cap(s, required_tail)
 }
 
@@ -380,10 +442,11 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
         "  - git push / PR 作成 / merge / deploy / release は**行わない**\n\
          \x20 - 本番環境・課金・credential に触れない\n",
     );
+    required_tail.push_str(&outbox_section(b.agent_id, &b.outbox, b.run_id));
     required_tail.push_str("\n## 完了報告\n");
     required_tail.push_str(&result_format(b.task.id, b.agent_id, &b.outbox));
-    required_tail.push_str(&teammates_section(&b.teammates));
-    required_tail.push_str(&subagents_section(b.agent_id));
+    required_tail.push_str(&teammates_section(&b.teammates, &b.outbox));
+    required_tail.push_str(&subagents_section(b.agent_id, &b.outbox));
     cap(s, required_tail)
 }
 
@@ -422,6 +485,7 @@ mod tests {
             upstream: vec!["#1 の成果: API の骨格".into()],
             forbidden_files: vec!["src/other/**".into()],
             outbox: std::path::PathBuf::from("/tmp/zv-outbox"),
+            run_id: "run-1712345678-1-0",
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
         }
     }
