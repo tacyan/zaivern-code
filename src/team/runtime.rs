@@ -2816,6 +2816,41 @@ impl TeamRuntime {
         &self.outbox
     }
 
+    /// **Run を閉じる** (人が盤面の ✕ を押した)。
+    ///
+    /// [`TeamAction::Stop`] は kill を承認ゲートに通す — 「停止しますか」の
+    /// 判断を積んで人の承認を待ち、承認されて初めて [`TeamEffect::StopAgent`]
+    /// が出る。閉じるときにそれをそのまま使うと、**判断は Run と一緒に消えて
+    /// 誰も承認できず、担当のプロセスだけが残る** (実際に残っていた)。
+    /// 閉じる操作そのものが人の決定なので、ここでは結び付いている全セッションの
+    /// 停止と、走っている検証の取り消しを**直接**出す。
+    ///
+    /// 出す停止は具体的な `SessionId` を名指しする。結び付けは Run ごとなので、
+    /// 他の Run のセッションがここに混ざる余地は無い。同じセッションへ停止が
+    /// 2 度出ても害は無い (相手が居なければ実行側は何もしない)。
+    pub fn close(&mut self) -> Vec<TeamEffect> {
+        self.run.stopped = true;
+        self.run.paused = true;
+        let mut out: Vec<TeamEffect> = self
+            .agents
+            .iter()
+            .filter_map(|a| a.session_id)
+            .map(TeamEffect::StopAgent)
+            .collect();
+        let stopping = out.len();
+        // **走っている検証も止める。** 担当だけ止めて `cargo test` を残すと、
+        // 閉じたはずの Run がリポジトリのコードを走らせ続ける。
+        self.cancel_running_validations(&mut out);
+        self.log(
+            TeamEventKind::RunStopped,
+            None,
+            None,
+            format!("Run を閉じました (担当 {stopping} 体を停止)"),
+        );
+        self.dirty = true;
+        out
+    }
+
     /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
     ///
     /// 黙って消さない。ファイル名と本文の担当が食い違った・上限まで読んでも

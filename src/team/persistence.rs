@@ -612,6 +612,8 @@ pub mod fault_inject {
 
     thread_local! {
         static AT: Cell<Option<SavePhase>> = const { Cell::new(None) };
+        static REMOVE_UNDER: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// この段で `save` を失敗させる。
@@ -619,13 +621,26 @@ pub mod fault_inject {
         AT.with(|c| c.set(Some(phase)));
     }
 
+    /// **このパス (とその下) の削除を失敗させる** ([`super::remove_dir_checked`])。
+    ///
+    /// 権限エラーの再現は OS 依存 (root で走る CI や Windows では通ってしまう)
+    /// なので、削除の口を 1 つに絞ってそこで決定的に失敗させる。
+    pub fn fail_remove_under(path: &std::path::Path) {
+        REMOVE_UNDER.with(|c| *c.borrow_mut() = Some(path.to_path_buf()));
+    }
+
     /// 差し替えを外す。
     pub fn clear() {
         AT.with(|c| c.set(None));
+        REMOVE_UNDER.with(|c| *c.borrow_mut() = None);
     }
 
     pub(super) fn should_fail(phase: SavePhase) -> bool {
         AT.with(|c| c.get()) == Some(phase)
+    }
+
+    pub(super) fn should_fail_remove(dir: &std::path::Path) -> bool {
+        REMOVE_UNDER.with(|c| c.borrow().as_ref().is_some_and(|p| dir.starts_with(p)))
     }
 }
 
@@ -871,6 +886,150 @@ pub fn reset(dir: &Path) -> Result<usize, SaveError> {
         n += 1;
     }
     Ok(n)
+}
+
+// ── 閉じた Run の墓標 ─────────────────────────────────────────────────
+//
+// Run を閉じるとき、保存 (`runs/<run_id>/`) の削除は失敗しうる (Windows の
+// delete pending、権限、同期ツールが握っている、など)。削除だけに頼ると、
+// 失敗した Run は**次の起動で `restore_run` に拾われて勝手に復活する**。
+// そこで「閉じた」という事実を**消す前に**別の場所へ原子的に書き、復元は
+// それを先に見る。後始末が全部済んだら墓標も片付ける。
+//
+// 置き場は `<state_dir>/closed/<run_id>`。名前は [`super::outbox::safe_child`]
+// と同じ関門を通す (空・`..`・区切り文字入りの `run_id` は、書く側も消す側も
+// 通さない)。中身が壊れていても**存在すれば閉じた扱い** (安全側)。
+
+/// 閉じた Run の墓標を置くフォルダ名。
+pub const CLOSED_DIR: &str = "closed";
+
+/// Run ごとの保存フォルダ (`<state_dir>/runs/<run_id>/`)。
+///
+/// `run_id` が名前として安全でなければ `None` — 保存も削除もしない。
+/// 保存された JSON の `run_id` は利用者のファイルから来るので、そのまま
+/// `join` すると `runs/` の外へ書き出せてしまう。
+pub fn run_dir_in(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    super::outbox::safe_child(&state_dir.join(super::panel::RUNS_DIR), run_id)
+}
+
+/// 墓標のパス (`run_id` が安全なときだけ)。
+fn closed_marker(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    super::outbox::safe_child(&state_dir.join(CLOSED_DIR), run_id)
+}
+
+/// **閉じたと記す** (削除の前に呼ぶ)。書き方は保存と同じ「一時ファイルへ
+/// fsync → rename」なので、途中で落ちても半端な墓標は残らない。
+pub fn mark_closed(state_dir: &Path, run_id: &str) -> Result<(), SaveError> {
+    let marker = closed_marker(state_dir, run_id).ok_or_else(|| {
+        SaveError::Io(format!("run_id {run_id:?} は保存の名前にできません"))
+    })?;
+    let dir = state_dir.join(CLOSED_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| SaveError::Io(e.to_string()))?;
+    let body = format!(
+        "{{\"run_id\":{},\"closed_at\":{}}}",
+        serde_json::to_string(run_id).unwrap_or_else(|_| "\"\"".to_string()),
+        super::model::now_secs()
+    );
+    let tmp = tmp_path(&dir, run_id);
+    write_synced(&tmp, &body)?;
+    if let Err(e) = rename_retrying(&tmp, &marker) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Io(e));
+    }
+    sync_dir(&dir);
+    Ok(())
+}
+
+/// 根の控え (`state.json`) が持っている `run_id` (読めなければ `None`)。
+///
+/// 根の控えは「いちばん古い 1 本」の写しなので、その Run を閉じたら一緒に
+/// 片付けないと復元経路が拾い直す。
+pub fn root_run_id(state_dir: &Path) -> Option<String> {
+    read_doc(&state_dir.join(STATE_FILE))
+        .or_else(|| read_doc(&state_dir.join(PREV_FILE)))
+        .map(|d| d.run.run_id)
+}
+
+/// 閉じたと記されているか。**中身は見ない** — 壊れていても、有れば閉じた扱い。
+pub fn is_closed(state_dir: &Path, run_id: &str) -> bool {
+    closed_marker(state_dir, run_id).is_some_and(|p| p.exists())
+}
+
+/// 墓標を片付ける (後始末が済んだあと)。無ければ成功。
+pub fn unmark_closed(state_dir: &Path, run_id: &str) -> Result<(), SaveError> {
+    let Some(marker) = closed_marker(state_dir, run_id) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SaveError::Io(e.to_string())),
+    }
+}
+
+/// 墓標のある `run_id` の一覧 (名前順)。書きかけの一時ファイル (`.` 始まり) は
+/// [`super::outbox::valid_run_id`] が弾くので混ざらない。
+pub fn closed_run_ids(state_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(state_dir.join(CLOSED_DIR)) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| super::outbox::valid_run_id(n))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// **フォルダごと消す。無いのは成功。** それ以外の失敗は理由を返す。
+///
+/// 削除は `let _ =` で握り潰さない — 失敗を黙ると、消えなかった保存が次の
+/// 起動で復活する。テストは [`fault_inject::fail_remove_under`] で失敗を
+/// 決定的に起こせる (権限エラーの再現は OS 依存なので使わない)。
+pub fn remove_dir_checked(dir: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if fault_inject::should_fail_remove(dir) {
+        return Err("(テスト) 削除に失敗".to_string());
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// **復元できる保存が 1 つでもあるか** (起動時の「復元しますか」の根拠)。
+///
+/// [`has_run`] は根の `state.json` の有無しか見ないので、閉じた Run の
+/// 控えが根に残っているだけで「ある」と言ってしまう。墓標のある Run と、
+/// 名前が安全でない Run は数えない (復元しないものを案内しない)。
+pub fn has_restorable_run(state_dir: &Path) -> bool {
+    if has_run(state_dir) {
+        // 根の控えは「いちばん古い 1 本」。その Run が閉じられていなければ復元できる。
+        match read_doc(&state_dir.join(STATE_FILE))
+            .or_else(|| read_doc(&state_dir.join(PREV_FILE)))
+        {
+            Some(doc) => {
+                let id = doc.run.run_id.as_str();
+                if super::outbox::valid_run_id(id) && !is_closed(state_dir, id) {
+                    return true;
+                }
+            }
+            // 読めない (旧形式・壊れている) — 復元経路が退避と案内をする。
+            None => return true,
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(state_dir.join(super::panel::RUNS_DIR)) else {
+        return false;
+    };
+    rd.filter_map(|e| e.ok()).any(|e| {
+        let name = e.file_name();
+        let Some(id) = name.to_str() else {
+            return false;
+        };
+        super::outbox::valid_run_id(id) && !is_closed(state_dir, id) && has_run(&e.path())
+    })
 }
 
 /// `serde::Serialize` を型消去して `save` の中の重複を減らすための小道具。
@@ -1347,5 +1506,102 @@ mod tests {
         // 既定の根も同じ導出を通る (根が違うだけ)
         assert!(team_dir_in(&default_home(), Path::new("/tmp/ws-a"))
             .ends_with(crate::history::workspace_key(Path::new("/tmp/ws-a"))));
+    }
+
+    /// **墓標は原子的に置かれ、書きかけが残らない。**
+    ///
+    /// 保存と同じ「一時ファイルへ fsync → rename」を通るので、途中で落ちても
+    /// 半端な墓標は生まれない。走査 ([`closed_run_ids`]) は `.` 始まりの
+    /// 一時ファイルを拾わない。
+    #[test]
+    fn 墓標は原子的に置かれ一時ファイルを残さない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "atomic");
+        mark_closed(&dir, "run-1").expect("置ける");
+        assert!(is_closed(&dir, "run-1"));
+        let pen = dir.join(CLOSED_DIR);
+        let names: Vec<String> = std::fs::read_dir(&pen)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["run-1".to_string()], "一時ファイルが残っている");
+        assert_eq!(closed_run_ids(&dir), vec!["run-1".to_string()]);
+        // 二度置いても増えない (置き換え)。
+        mark_closed(&dir, "run-1").expect("置き直せる");
+        assert_eq!(closed_run_ids(&dir), vec!["run-1".to_string()]);
+        // 片付けは冪等 (無いものを消すのは成功)。
+        unmark_closed(&dir, "run-1").expect("消せる");
+        assert!(!is_closed(&dir, "run-1"));
+        unmark_closed(&dir, "run-1").expect("無くても成功");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **壊れた墓標でも「閉じた」と読む** (安全側)。中身は見ない。
+    #[test]
+    fn 壊れた墓標は閉じた扱いになる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "corrupt");
+        let pen = dir.join(CLOSED_DIR);
+        std::fs::create_dir_all(&pen).unwrap();
+        std::fs::write(pen.join("run-9"), b"\xff\xfe not json at all").unwrap();
+        assert!(is_closed(&dir, "run-9"), "読めない墓標を無視した");
+        assert_eq!(closed_run_ids(&dir), vec!["run-9".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **保存の名前にできない `run_id` は、書くのも読むのも消すのも断る。**
+    /// 断らないと `runs/` や `closed/` の外を触ることになる。
+    #[test]
+    fn 危険なrun_idは墓標にも保存先にもならない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "unsafe-id");
+        for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x", ".hidden"] {
+            assert!(mark_closed(&dir, bad).is_err(), "{bad:?} の墓標を書いた");
+            assert!(!is_closed(&dir, bad), "{bad:?} を閉じた扱いにした");
+            assert_eq!(run_dir_in(&dir, bad), None, "{bad:?} の保存先を作った");
+            // 消すほうも黙って成功にする (触る先が無いので害は無い)。
+            assert!(unmark_closed(&dir, bad).is_ok());
+        }
+        let ok = run_dir_in(&dir, "run-1").expect("正しい ID");
+        assert_eq!(ok.parent(), Some(dir.join(super::super::panel::RUNS_DIR).as_path()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 削除の口は 1 つ。**無いのは成功、それ以外の失敗は理由を返す。**
+    #[test]
+    fn 削除は無いのを成功にし失敗は理由を返す() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "remove");
+        let sub = dir.join("gone");
+        assert!(remove_dir_checked(&sub).is_ok(), "無いものの削除を失敗にした");
+        std::fs::create_dir_all(sub.join("deep")).unwrap();
+        std::fs::write(sub.join("deep/x.json"), "{}").unwrap();
+        fault_inject::fail_remove_under(&sub);
+        let err = remove_dir_checked(&sub).expect_err("仕込んだ失敗が返らない");
+        assert!(!err.trim().is_empty(), "理由が空");
+        assert!(sub.exists(), "失敗したのに消えている");
+        fault_inject::clear();
+        assert!(remove_dir_checked(&sub).is_ok());
+        assert!(!sub.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **復元できるものがあるかを、墓標まで見て答える。**
+    #[test]
+    fn 復元できる保存の有無は墓標まで見る() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "restorable");
+        assert!(!has_restorable_run(&dir), "何も無いのに有ると答えた");
+        let mut s = saved();
+        s.run.run_id = "run-a".into();
+        save(&run_dir_in(&dir, "run-a").unwrap(), &s).expect("保存");
+        assert!(has_restorable_run(&dir), "保存があるのに無いと答えた");
+        mark_closed(&dir, "run-a").expect("墓標");
+        assert!(!has_restorable_run(&dir), "閉じた Run を案内した");
+        // 根の控えも同じ扱い。
+        unmark_closed(&dir, "run-a").unwrap();
+        std::fs::remove_dir_all(dir.join(super::super::panel::RUNS_DIR)).unwrap();
+        save(&dir, &s).expect("根へ保存");
+        assert_eq!(root_run_id(&dir).as_deref(), Some("run-a"));
+        assert!(has_restorable_run(&dir), "根の控えを見落とした");
+        mark_closed(&dir, "run-a").expect("墓標");
+        assert!(!has_restorable_run(&dir), "閉じた Run の根の控えを案内した");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

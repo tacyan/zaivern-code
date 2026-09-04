@@ -573,7 +573,10 @@ impl TeamPanel {
         self.active = 0;
         self.snapshot = None;
         self.read_only = false;
-        self.restore = if persistence::has_run(&self.state_dir()) {
+        // **復元できるものがあるときだけ案内する。** 根の控えの有無 (`has_run`)
+        // だけで見ると、閉じた Run の控えが残っているだけで「保存がある」と
+        // 案内し、押した先で復元経路が墓標で断る (押せるのに何も起きない)。
+        self.restore = if persistence::has_restorable_run(&self.state_dir()) {
             RestorePrompt::Found
         } else {
             RestorePrompt::None
@@ -773,25 +776,87 @@ impl TeamPanel {
     /// 保存された Run を復元する。
     pub fn restore_run(&mut self, read_only: bool) -> Result<(), String> {
         let root = self.state_dir();
+        // **閉じた Run は復元しない。** 墓標 ([`persistence::mark_closed`]) は
+        // 削除の前に書かれるので、削除に失敗した Run もここで断れる。
+        // 片付けはここで試し直し、済んだら墓標を掃く。
+        self.sweep_closed_runs(&root);
         // **Run ごとの置き場を先に全部読む。** 1 本だけ読むと、
         // 同時に走らせていた残りが再起動で消える。
         let mut loaded = 0usize;
-        let mut seen: HashSet<String> = HashSet::new();
+        // 既に持っている Run と二重に持たない (復元は追加であって置き換えではない)。
+        let mut seen: HashSet<String> = self.runs.iter().map(|r| r.run().run_id.clone()).collect();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut capped = 0usize;
         if let Ok(rd) = std::fs::read_dir(root.join(RUNS_DIR)) {
             let mut dirs: Vec<std::path::PathBuf> =
                 rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
             dirs.sort();
             for d in dirs {
-                if let LoadOutcome::Loaded(s) = persistence::load(&d) {
-                    let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
-                    let dir = self.outbox_dir(&rt.run().run_id);
-                    rt.set_outbox(dir);
-                    if seen.insert(rt.run().run_id.clone()) {
-                        self.runs.push(rt);
-                        loaded += 1;
-                    }
+                let name = d
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // フォルダ名が保存の名前として安全でないなら**中を読まない**
+                // (読んだ `run_id` をパスに使う経路が後ろにある)。
+                if !outbox::valid_run_id(&name) {
+                    skipped.push(format!("{name:?} (安全でない名前)"));
+                    continue;
                 }
+                if persistence::is_closed(&root, &name) {
+                    continue;
+                }
+                let LoadOutcome::Loaded(s) = persistence::load(&d) else {
+                    continue;
+                };
+                // **保存の中の `run_id` はフォルダ名と一致していなければならない。**
+                // ずれていたら、置き場を移された・手で書き換えられたのどちらか。
+                // その `run_id` で保存し直すと別の場所へ書くので、復元しない。
+                if s.run.run_id != name {
+                    skipped.push(format!("{name:?} (中身の run_id が {:?})", s.run.run_id));
+                    continue;
+                }
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                // **同時に走らせられる本数を超えて復元しない。** 上限は
+                // 資源の約束 ([`MAX_CONCURRENT_RUNS`]) なので、復元でも守る。
+                // 超えたぶんは保存のまま残す (消さない)。
+                if self.runs.len() >= MAX_CONCURRENT_RUNS {
+                    capped += 1;
+                    continue;
+                }
+                let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
+                let dir = self.outbox_dir(&rt.run().run_id);
+                rt.set_outbox(dir);
+                self.runs.push(rt);
+                loaded += 1;
             }
+        }
+        // **どちらも黙らない。** 片方で上書きすると、読まなかった保存が
+        // あることを利用者が知る手立てが消える。
+        let mut notes: Vec<String> = Vec::new();
+        if !skipped.is_empty() {
+            notes.push(crate::i18n::trf(
+                "team.notice.restore_skipped",
+                &[
+                    ("n", skipped.len().to_string()),
+                    ("why", skipped.join(" / ")),
+                ],
+            ));
+        }
+        if capped > 0 {
+            notes.push(crate::i18n::trf(
+                "team.notice.restore_capped",
+                &[
+                    ("n", loaded.to_string()),
+                    ("rest", capped.to_string()),
+                    ("max", MAX_CONCURRENT_RUNS.to_string()),
+                ],
+            ));
+        }
+        if !notes.is_empty() {
+            self.notice = notes.join(" / ");
         }
         if loaded > 0 {
             self.active = 0;
@@ -800,9 +865,20 @@ impl TeamPanel {
             self.dirty = true;
             return Ok(());
         }
+        if !self.runs.is_empty() {
+            // 何も足せなかったが、持っている Run はある (上限か重複)。
+            self.restore = RestorePrompt::None;
+            return Ok(());
+        }
         let dir = root;
         match persistence::load(&dir) {
             LoadOutcome::Loaded(s) => {
+                let id = s.run.run_id.clone();
+                // 根の控えも同じ関門: 閉じた Run と安全でない名前は復元しない。
+                if !outbox::valid_run_id(&id) || persistence::is_closed(&dir, &id) {
+                    self.restore = RestorePrompt::None;
+                    return Err("保存された Team Run がありません".to_string());
+                }
                 let mut rt = TeamRuntime::restore(*s, self.workspace.clone());
                 let dir = self.outbox_dir(&rt.run().run_id);
                 rt.set_outbox(dir);
@@ -828,20 +904,58 @@ impl TeamPanel {
     /// **走っている検証を置き去りにしない。** 記録だけ消して `cargo test` が
     /// 走り続けると、誰も結果を受け取らないプロセスがリポジトリを触り続ける。
     pub fn discard_run(&mut self) -> Result<usize, String> {
+        // **閉じるのと同じ不変条件: 捨てる Run の担当へ停止が届く。**
+        // 記録だけ消して担当を残すと、盤面から消えたのに端末では動き続ける
+        // (誰も結果を受け取らないまま、リポジトリを触り続ける)。
+        // 効果を積むのは Run を手放す**前** — `absorb_for` は持ち主で引くので、
+        // 手放した後だと ACK の返し先が無くなる。
+        for i in 0..self.runs.len() {
+            let effects = self.runs[i].close();
+            let owner = self.runs[i].owner();
+            self.absorb_for(owner, effects);
+        }
         self.cancel_all_validations();
         let dir = self.state_dir();
+        // **消す前に、持っている Run 全部に墓標を書く。** 下の削除が途中で
+        // 失敗しても、次の起動で復活しない (閉じる経路と同じ不変条件)。
+        let ids: Vec<String> = self.runs.iter().map(|r| r.run().run_id.clone()).collect();
+        for id in &ids {
+            if let Err(e) = persistence::mark_closed(&dir, id) {
+                self.notice = crate::i18n::trf(
+                    "team.notice.run_state_cleanup_failed",
+                    &[("run", id.clone()), ("e", e.detail())],
+                );
+            }
+        }
         let n = persistence::reset(&dir).map_err(|e| e.detail())?;
         // **Run ごとの置き場も消す。** 残すと、次に開いたときに
         // 消したはずの Run が戻ってくる。報告置き場も同じ — 全 Run を捨てる
         // ので `outbox/` ごと消してよい (Run 単位の関門は要らない)。
-        let _ = std::fs::remove_dir_all(dir.join(RUNS_DIR));
-        let _ = std::fs::remove_dir_all(dir.join(outbox::DIR_NAME));
+        // 失敗は握り潰さない: 残った保存は墓標が復元を止めるが、残っている
+        // こと自体は人に見せる。
+        let runs_gone = persistence::remove_dir_checked(&dir.join(RUNS_DIR));
+        let outbox_gone = persistence::remove_dir_checked(&dir.join(outbox::DIR_NAME));
         self.outbox_ledger.prune_missing();
         self.runs.clear();
         self.active = 0;
         self.snapshot = None;
         self.restore = RestorePrompt::None;
-        Ok(n)
+        match (runs_gone, outbox_gone) {
+            (Ok(()), Ok(())) => {
+                for id in &ids {
+                    let _ = persistence::unmark_closed(&dir, id);
+                }
+                Ok(n)
+            }
+            (Err(e), _) => Err(crate::i18n::trf(
+                "team.notice.run_state_cleanup_failed",
+                &[("run", ids.join(", ")), ("e", e)],
+            )),
+            (Ok(()), Err(e)) => Err(crate::i18n::trf(
+                "team.notice.outbox_cleanup_failed",
+                &[("run", ids.join(", ")), ("e", e)],
+            )),
+        }
     }
 
     /// 人の操作を Runtime へ渡す。
@@ -1330,28 +1444,18 @@ impl TeamPanel {
             return None;
         }
         // **止めてから外す。** 外してから止めると、止める相手が居なくなる。
-        let effects = self.runs[i].apply_action(TeamAction::Stop);
+        //
+        // `TeamAction::Stop` ではなく [`TeamRuntime::close`] — Stop は kill を
+        // 承認ゲートに通すので、判断が Run と一緒に消えて誰も承認できず、
+        // 担当のプロセスだけが残る。閉じる操作そのものが人の決定なので、
+        // 全セッションの停止を直接出す。出した停止は [`Self::take_stops`] が
+        // **Run が消えた後でも**実行側へ渡す。
+        let effects = self.runs[i].close();
         let owner = self.runs[i].owner();
         self.absorb_for(owner, effects);
         let rt = self.runs.remove(i);
         let id = rt.run().run_id.clone();
-        let state = self.state_dir();
-        // 保存と置き場は同じ関門を通す (`<state>/runs/<id>` と
-        // `<state>/outbox/<id>` の 1 段下だけ)。
-        if let Some(dir) = outbox::safe_child(&state.join(RUNS_DIR), &id) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        if let Some(dir) = outbox::run_dir(&state, &id) {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    self.notice = crate::i18n::trf(
-                        "team.notice.outbox_cleanup_failed",
-                        &[("run", id.clone()), ("e", e.to_string())],
-                    );
-                }
-            }
-        }
-        self.outbox_ledger.prune_missing();
+        self.cleanup_closed_run(&id);
         if self.runs.is_empty() {
             self.active = 0;
             self.snapshot = None;
@@ -1363,6 +1467,101 @@ impl TeamPanel {
         self.dirty = true;
         self.needs_save = true;
         Some(id)
+    }
+
+    /// **閉じた Run の保存と置き場を片付ける。** [`Self::close_run`] と
+    /// [`Self::discard_run`] の共通部分。
+    ///
+    /// 順序が不変条件:
+    /// 1. **消す前に墓標を書く** ([`persistence::mark_closed`])。削除が失敗しても
+    ///    途中で落ちても、次の起動の `restore_run` は墓標を見て復元しない
+    /// 2. 保存 (`runs/<id>`) と報告置き場 (`outbox/<id>`) を消す。どちらも
+    ///    `run_id` の関門 ([`outbox::safe_child`]) を通した 1 段下だけ。
+    ///    失敗は**種類ごとに**帯へ出す (保存が残るのと置き場が残るのでは、
+    ///    次に起きることが違う)
+    /// 3. 最後の 1 本なら根の控え (`state.json`) も消す。残すと `has_run` が
+    ///    「保存がある」と案内し、復元経路がその控えを拾う
+    /// 4. 全部済んだときだけ墓標を片付ける。1 つでも残ったら墓標も残す —
+    ///    次の起動で `restore_run` が片付けを試し直す
+    fn cleanup_closed_run(&mut self, id: &str) {
+        let state = self.state_dir();
+        let mut state_err: Option<String> = None;
+        if let Err(e) = persistence::mark_closed(&state, id) {
+            // 墓標が書けない = 削除に失敗したときの保険が無い。削除そのものは
+            // 続ける (成功すれば復活の余地は無い)。
+            state_err = Some(e.detail());
+        }
+        let mut all_gone = true;
+        if let Some(dir) = persistence::run_dir_in(&state, id) {
+            if let Err(e) = persistence::remove_dir_checked(&dir) {
+                all_gone = false;
+                state_err = Some(e);
+            }
+        }
+        if let Some(dir) = outbox::run_dir(&state, id) {
+            if let Err(e) = persistence::remove_dir_checked(&dir) {
+                all_gone = false;
+                self.notice = crate::i18n::trf(
+                    "team.notice.outbox_cleanup_failed",
+                    &[("run", id.to_string()), ("e", e)],
+                );
+            }
+        }
+        // **根の控えが閉じた Run のものなら消す。** 控えは「いちばん古い 1 本」の
+        // 写しなので、その Run を閉じたのに残すと復元経路が拾い直す
+        // (墓標が断るが、案内だけ出て何も起きない状態になる)。
+        if persistence::root_run_id(&state).as_deref() == Some(id) {
+            if let Err(e) = persistence::reset(&state) {
+                all_gone = false;
+                state_err = Some(e.detail());
+            }
+        }
+        if let Some(e) = state_err {
+            self.notice = crate::i18n::trf(
+                "team.notice.run_state_cleanup_failed",
+                &[("run", id.to_string()), ("e", e)],
+            );
+        }
+        if all_gone {
+            // 片付いたら墓標も要らない。消せなくても害は無い (次の復元で
+            // 「保存も置き場も無い墓標」として掃かれる)。
+            let _ = persistence::unmark_closed(&state, id);
+        }
+        self.outbox_ledger.prune_missing();
+    }
+
+    /// **墓標のある Run の片付けを試し直し、済んだ墓標を掃く** (復元の前に呼ぶ)。
+    ///
+    /// 閉じたときに消せなかった保存・置き場は、ここでもう一度消す。まだ
+    /// 消せなければ墓標を残す (復元はしない)。何も残っていなければ墓標だけが
+    /// 残っているので、それを掃く。失敗しても復元は続ける — 掃除の失敗で
+    /// 生きている Run の復元を止めない。
+    fn sweep_closed_runs(&mut self, root: &Path) {
+        for id in persistence::closed_run_ids(root) {
+            let mut all_gone = true;
+            for dir in [
+                persistence::run_dir_in(root, &id),
+                outbox::run_dir(root, &id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if persistence::remove_dir_checked(&dir).is_err() {
+                    all_gone = false;
+                }
+            }
+            // **根の控えも同じ Run のものなら片付ける。** 残すと、下の復元が
+            // `runs/` に何も無いときの経路でその写しを拾い、閉じた Run が
+            // 戻ってくる (墓標を消した後は断る材料も無くなる)。
+            if persistence::root_run_id(root).as_deref() == Some(id.as_str())
+                && persistence::reset(root).is_err()
+            {
+                all_gone = false;
+            }
+            if all_gone {
+                let _ = persistence::unmark_closed(root, &id);
+            }
+        }
     }
 
     /// いまの Run の持ち主。Run が無ければ `None`。
@@ -1438,9 +1637,21 @@ impl TeamPanel {
     }
 
     /// 止めてほしいセッション (冪等キー付き。取り出したら消える)。
+    ///
+    /// **停止だけは生存 Run で選り分けない** ([`Self::mine`] を通さない)。
+    /// 閉じた Run の担当を止める命令は、Run を記憶から外した**後**に実行側が
+    /// 取り出す ([`Self::close_run`] の順序: 止める → 外す → 取り出す)。
+    /// ここで `mine` を通すと、閉じた Run の停止は「死んだ Run の仕事」として
+    /// 捨てられ、担当のプロセスだけが残る (実際に残っていた)。
+    ///
+    /// 通してよい理由 — 停止は具体的な `SessionId` を名指しする:
+    /// * 結び付けは Run ごとなので、別の Run のセッションが載ることは無い
+    /// * 相手が既に居なければ実行側は何もしない (二重実行は無害)
+    /// * 消えた Run への ACK は [`Self::ack_done`] が黙って落とす
+    /// * workspace を切り替える経路と終了は、取り出す前に列を空にする
+    ///   ([`Self::attach_workspace`] / [`Self::shutdown`])
     pub fn take_stops(&mut self) -> Vec<(RunOwner, String, SessionId)> {
-        let q = std::mem::take(&mut self.pending_stops);
-        self.mine(q)
+        std::mem::take(&mut self.pending_stops)
     }
     /// 走らせてほしい検証 (冪等キー付き。取り出したら消える)。
     pub fn take_validations(&mut self) -> Vec<(RunOwner, String, super::runtime::ValidationSpec)> {
@@ -1812,7 +2023,18 @@ impl TeamPanel {
         let root = self.state_dir();
         let mut err: Option<String> = None;
         for rt in &self.runs {
-            let dir = root.join(RUNS_DIR).join(&rt.run().run_id);
+            // **`run_id` をそのまま `join` しない。** 復元した保存の `run_id` は
+            // 利用者のファイルから来るので、`..` や区切り文字が入っていれば
+            // `runs/` の外へ書くことになる。安全でない名前の Run は保存しない
+            // (`restore_run` は読まないので、ここへ来るのは計画の入口から
+            // 変な ID を渡されたときだけ)。
+            let Some(dir) = persistence::run_dir_in(&root, &rt.run().run_id) else {
+                err = Some(format!(
+                    "Team Run {:?} は保存できません (保存の名前にできない ID)",
+                    rt.run().run_id
+                ));
+                continue;
+            };
             if let Err(e) = persistence::save(&dir, &rt.to_saved()) {
                 err = Some(e.detail());
             }
@@ -2207,7 +2429,14 @@ mod tests {
         p.pending_manual = stale.4;
         assert!(p.take_launches().is_empty(), "起動が漏れた");
         assert!(p.take_instructions().is_empty(), "指示が漏れた");
-        assert!(p.take_stops().is_empty(), "停止が漏れた");
+        // **停止だけは出る。** 閉じた Run の担当を止める命令は、閉じた後に
+        // 実行側が取り出す (捨てるとプロセスが残る)。具体的なセッションを
+        // 名指しするので、新しい Run の相手へ届く余地は無い。
+        let stops = p.take_stops();
+        assert!(
+            stops.iter().any(|(_, k, s)| k == "stop:7" && *s == 7),
+            "閉じた Run の停止まで捨てた (プロセスが残る): {stops:?}"
+        );
         assert!(p.take_validations().is_empty(), "検証が漏れた");
         assert!(p.take_manual_instructions().is_empty(), "人の指示が漏れた");
         std::fs::remove_dir_all(&a).ok();
@@ -2254,7 +2483,12 @@ mod tests {
         let mut p = started_panel(&dir);
         let first = p.owner().expect("1 本目");
         // 起動要求を片付けてから 2 本目を作る (口を空にして違いを見る)。
-        let _ = p.take_launches();
+        // 1 つは「閉じた Run の古い起動要求」として後で使う。
+        let stale_launch = p
+            .take_launches()
+            .into_iter()
+            .next()
+            .expect("1 本目の起動要求");
         p.plan(SPEC, "SPEC.md", RunOptions::default())
             .expect("2 本目を並べられるべき");
         let second = p.owner().expect("2 本目");
@@ -2272,10 +2506,18 @@ mod tests {
         assert_eq!(stops.len(), 2, "片方の Run の仕事が捨てられた: {stops:?}");
         assert_eq!(p.dropped_effects(), 0, "生きている Run のものを捨てた");
 
-        // **閉じた Run のものは捨てる** (死んだ相手へ配らない)。
+        // **閉じた Run のものは捨てる** (死んだ相手へ配らない) — ただし
+        // **停止だけは別**。閉じた Run の担当を止める命令は、閉じた後に
+        // 実行側が取り出すので、生存 Run で選り分けたら二度と届かない。
         p.pending_stops.push((first.clone(), "stop:1".into(), 1));
+        p.pending_launches.push(stale_launch.clone());
         p.close_run(0).expect("1 本目を閉じる");
-        assert!(p.take_stops().is_empty(), "閉じた Run の仕事を実行した");
+        let stops = p.take_stops();
+        assert!(
+            stops.iter().any(|(o, k, s)| o == &first && k == "stop:1" && *s == 1),
+            "閉じた Run の停止が捨てられた (プロセスが残る): {stops:?}"
+        );
+        assert!(p.take_launches().is_empty(), "閉じた Run の起動を実行した");
         assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
         assert_eq!(p.runs.len(), 1);
         assert_eq!(p.owner().as_ref(), Some(&second), "残ったほうが出ていない");
@@ -3807,6 +4049,511 @@ mod tests {
         assert!(p.notice.trim().is_empty(), "届いたのに苦情を出している");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ── Run を閉じる: 停止の配送と保存の後始末 ───────────────────────────
+    ///
+    /// 閉じた Run の担当を止める命令が実行側へ届くこと、閉じた Run が
+    /// 次の起動で復活しないことを、**実ファイル・実プロセス**で見る。
+    mod close_run_lifecycle {
+        use super::*;
+
+        /// OS 標準のスリーパーで「確かに生きている子」を作る。unix は
+        /// [`crate::procx::kill_tree`] がプロセスグループへ撃つので、実行側
+        /// (`launch.rs` / `terminal.rs`) と同じく自分のグループで起こす。
+        fn sleeper() -> std::process::Child {
+            #[cfg(windows)]
+            {
+                crate::procx::hidden_command("ping")
+                    .args(["-n", "30", "127.0.0.1"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn ping")
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn sleep")
+            }
+        }
+
+        /// 同じ home / workspace で「次の起動」を作る (前の画面の記憶は持たない)。
+        fn reopened(p: &TeamPanel, dir: &Path) -> TeamPanel {
+            let mut q = TeamPanel::default();
+            q.home = p.home.clone();
+            q.attach_workspace(dir).expect("新しい画面は attach できる");
+            q
+        }
+
+        fn run_ids(p: &TeamPanel) -> Vec<String> {
+            p.runs.iter().map(|r| r.run().run_id.clone()).collect()
+        }
+
+        /// A (開始済み・担当にセッションを結んだ) と B (計画のみ) を保存した状態。
+        /// 戻りは (画面, workspace, A, B, A に結んだセッション)。
+        fn two_saved(tag: &str) -> (TeamPanel, PathBuf, RunOwner, RunOwner, Vec<SessionId>) {
+            let dir = ws(tag);
+            let mut p = started_panel(&dir);
+            let a = p.owner().expect("A");
+            let boot = p.take_launches();
+            assert!(!boot.is_empty(), "A の起動要求が無い");
+            let mut sids = Vec::new();
+            for (i, (o, _, spec)) in boot.iter().enumerate() {
+                let sid = 300 + i as SessionId;
+                p.bind_session(o, &spec.agent_id, sid, None);
+                sids.push(sid);
+            }
+            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+            let b = p.owner().expect("B");
+            p.save_if_needed();
+            let state = p.state_dir();
+            for o in [&a, &b] {
+                assert!(
+                    persistence::run_dir_in(&state, &o.run_id)
+                        .expect("安全な ID")
+                        .exists(),
+                    "前提: {} の保存がある",
+                    o.run_id
+                );
+            }
+            (p, dir, a, b, sids)
+        }
+
+        #[test]
+        fn runを閉じると全セッションの停止が実行側へ届く() {
+            let (mut p, dir, a, b, sids) = two_saved("close-stops");
+            // 閉じる前に積まれていた A の「停止以外」の仕事。閉じた後は実行しない。
+            let stale_launch = {
+                let mut q = started_panel(&ws("close-stops-stale"));
+                q.take_launches().into_iter().next().expect("起動要求")
+            };
+            p.pending_launches
+                .push((a.clone(), stale_launch.1.clone(), stale_launch.2.clone()));
+            p.pending_instructions
+                .push((a.clone(), "instr:x".into(), (1, sids[0], "hi".into())));
+            let pos = p.run_pos_of_owner(&a).expect("A");
+            p.close_run(pos).expect("A を閉じる");
+            assert_eq!(run_ids(&p), vec![b.run_id.clone()], "A が記憶から外れていない");
+            // **Run が消えた後に取り出しても、停止は全部出る。**
+            let stops = p.take_stops();
+            for sid in &sids {
+                assert!(
+                    stops.iter().any(|(o, k, s)| o == &a && s == sid && k == &format!("stop:{sid}")),
+                    "セッション #{sid} の停止が出ていない (プロセスが残る): {stops:?}"
+                );
+            }
+            assert_eq!(stops.len(), sids.len(), "余分な停止が出た: {stops:?}");
+            // 停止以外の古い仕事は実行しない (既存の保証はそのまま)。
+            assert!(p.take_launches().is_empty(), "閉じた Run の起動を実行した");
+            assert!(p.take_instructions().is_empty(), "閉じた Run の指示を送った");
+            assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
+            // 消えた Run への ACK は落ちるだけで、残った Run を触らない。
+            p.ack_done(&a, "stop:300");
+            assert_eq!(run_ids(&p), vec![b.run_id.clone()]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 片方を閉じても止めるのは閉じたrunのセッションだけ() {
+            // **結ぶのは 2 本とも起動要求を取り終えてから。** 空の観測で tick を
+            // 回すと、Runtime は結んだセッションを「消えた」と見て結び付きを外す
+            // (それが正しい動き)。
+            let dir = ws("close-only-mine");
+            let mut p = started_panel(&dir);
+            let a = p.owner().expect("A");
+            let boot_a = p.take_launches();
+            assert!(!boot_a.is_empty(), "A の起動要求が無い");
+            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("B");
+            let b = p.owner().expect("B");
+            p.act(TeamAction::Start);
+            p.pump(super::super::super::runtime::Observation {
+                now: 2,
+                sessions: Vec::new(),
+            });
+            let boot_b = p.take_launches();
+            assert!(!boot_b.is_empty(), "B の起動要求が無い");
+            let mut a_sids = Vec::new();
+            for (i, (o, _, spec)) in boot_a.iter().enumerate() {
+                assert_eq!(o, &a, "A の起動要求に B が混ざった");
+                let sid = 300 + i as SessionId;
+                p.bind_session(o, &spec.agent_id, sid, None);
+                a_sids.push(sid);
+            }
+            let mut b_sids = Vec::new();
+            for (i, (o, _, spec)) in boot_b.iter().enumerate() {
+                assert_eq!(o, &b, "B の起動要求に A が混ざった");
+                let sid = 400 + i as SessionId;
+                p.bind_session(o, &spec.agent_id, sid, None);
+                b_sids.push(sid);
+            }
+            assert!(!a_sids.is_empty() && !b_sids.is_empty(), "前提: 両方に担当が居る");
+            let pos = p.run_pos_of_owner(&a).expect("A");
+            p.close_run(pos).expect("A を閉じる");
+            let stops = p.take_stops();
+            let mut got: Vec<SessionId> = stops.iter().map(|(_, _, s)| *s).collect();
+            got.sort_unstable();
+            let mut want = a_sids.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "止める相手が A のセッションと一致しない");
+            for s in &b_sids {
+                assert!(!got.contains(s), "B のセッション #{s} まで止めようとした");
+            }
+            assert!(stops.iter().all(|(o, _, _)| o == &a), "持ち主が A でない停止が混ざった");
+            // B はそのまま動く。
+            assert_eq!(run_ids(&p), vec![b.run_id.clone()]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **実物の子プロセスを起こして、閉じたら落ちることを見る。**
+        ///
+        /// 実行側 (`app/team_glue.rs`) は `take_stops` で受けたセッションを
+        /// `close_agent` で畳み、プロセスの木は [`crate::procx::kill_tree`] が
+        /// 落とす。ここでは同じ順序をそのまま踏む: 起こす → 結ぶ → 閉じる →
+        /// 取り出した停止のぶんだけ落とす。生き残りの検出は固定の sleep では
+        /// なく、期限つきの `try_wait` で見る。
+        #[test]
+        #[allow(clippy::zombie_processes)]
+        fn runを閉じると担当の実プロセスが終わる() {
+            let dir = ws("close-kills-children");
+            let mut p = started_panel(&dir);
+            let boot = p.take_launches();
+            assert!(!boot.is_empty(), "起動要求が無い");
+            let owner = boot[0].0.clone();
+            let mut children: Vec<(SessionId, std::process::Child)> = Vec::new();
+            for (i, (o, _, spec)) in boot.iter().take(2).enumerate() {
+                let sid = 500 + i as SessionId;
+                p.bind_session(o, &spec.agent_id, sid, None);
+                children.push((sid, sleeper()));
+            }
+            let pos = p.run_pos_of_owner(&owner).expect("Run");
+            p.close_run(pos).expect("閉じる");
+            let stops = p.take_stops();
+            for (sid, child) in &mut children {
+                assert!(
+                    stops.iter().any(|(o, _, s)| o == &owner && s == sid),
+                    "セッション #{sid} の停止が出ていない: {stops:?}"
+                );
+                assert!(
+                    child.try_wait().expect("try_wait").is_none(),
+                    "前提: 止める前に子が死んでいる"
+                );
+                // 実行側と同じ道具で落とす (生きていることを確かめてから)。
+                crate::procx::kill_tree(child.id());
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for (sid, child) in &mut children {
+                loop {
+                    if child.try_wait().expect("try_wait").is_some() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "セッション #{sid} の子プロセスが期限内に終わらない"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 閉じたrunは再起動後に復元されない() {
+            let (mut p, dir, a, b, _) = two_saved("close-no-resurrect");
+            let state = p.state_dir();
+            let a_dir = persistence::run_dir_in(&state, &a.run_id).unwrap();
+            let b_dir = persistence::run_dir_in(&state, &b.run_id).unwrap();
+            p.notice.clear();
+            let pos = p.run_pos_of_owner(&a).expect("A");
+            p.close_run(pos).expect("A を閉じる");
+            assert!(!a_dir.exists(), "A の保存が残っている");
+            assert!(b_dir.exists(), "B の保存まで消した");
+            assert!(
+                !persistence::is_closed(&state, &a.run_id),
+                "片付いたのに墓標が残っている"
+            );
+            assert!(p.notice.trim().is_empty(), "消せたのに苦情を出した: {}", p.notice);
+            // 次の起動: B だけが戻る。
+            let mut q = reopened(&p, &dir);
+            assert_eq!(q.restore, RestorePrompt::Found, "B の案内が出ない");
+            q.restore_run(false).expect("B を復元");
+            assert_eq!(run_ids(&q), vec![b.run_id.clone()], "閉じた A が復活した");
+            // 最後の 1 本を閉じると根の控えも消え、案内そのものが出ない。
+            q.close_run(0).expect("B を閉じる");
+            assert!(!persistence::has_run(&state), "根の控えが残っている (復活の温床)");
+            let r = reopened(&q, &dir);
+            assert_eq!(r.restore, RestorePrompt::None, "閉じた Run を案内した");
+            let mut r = r;
+            assert!(r.restore_run(false).is_err(), "閉じた Run を復元した");
+            assert!(r.runs.is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// **保存を消せなくても、閉じた Run は復活しない。** 失敗は種類が分かる
+        /// 形で帯に出て、次の起動が片付けを試し直す。
+        #[test]
+        fn 保存の削除に失敗しても閉じたrunは復元されない() {
+            let (mut p, dir, a, b, _) = two_saved("close-delete-fails");
+            let state = p.state_dir();
+            let a_dir = persistence::run_dir_in(&state, &a.run_id).unwrap();
+            persistence::fault_inject::fail_remove_under(&a_dir);
+            p.notice.clear();
+            let pos = p.run_pos_of_owner(&a).expect("A");
+            p.close_run(pos).expect("A を閉じる");
+            assert!(a_dir.exists(), "前提: 削除が失敗している");
+            assert!(persistence::is_closed(&state, &a.run_id), "墓標が無い");
+            // 帯には「保存」の失敗として出る (置き場の失敗とは別の文言)。
+            let want = crate::i18n::trf(
+                "team.notice.run_state_cleanup_failed",
+                &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+            );
+            assert_eq!(p.notice, want, "失敗が帯に出ていない / 種類が違う");
+            assert_ne!(
+                p.notice,
+                crate::i18n::trf(
+                    "team.notice.outbox_cleanup_failed",
+                    &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+                ),
+                "保存の失敗を置き場の失敗として出した"
+            );
+            // 失敗が続いている次の起動: A は戻らず、保存も墓標も残る。
+            let mut q = reopened(&p, &dir);
+            q.restore_run(false).expect("B を復元");
+            assert_eq!(run_ids(&q), vec![b.run_id.clone()], "消せなかった A が復活した");
+            assert!(a_dir.exists() && persistence::is_closed(&state, &a.run_id));
+            // 消せるようになった次の起動: 片付け直して墓標も掃く。
+            persistence::fault_inject::clear();
+            let mut r = reopened(&q, &dir);
+            r.restore_run(false).expect("B を復元");
+            assert_eq!(run_ids(&r), vec![b.run_id.clone()]);
+            assert!(!a_dir.exists(), "復元時に片付け直していない");
+            assert!(
+                !persistence::is_closed(&state, &a.run_id),
+                "片付いたのに墓標が残っている"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 無い保存を消すのはエラーにしない() {
+            let (mut p, dir, a, _b, _) = two_saved("close-notfound");
+            let state = p.state_dir();
+            let a_dir = persistence::run_dir_in(&state, &a.run_id).unwrap();
+            std::fs::remove_dir_all(&a_dir).unwrap();
+            p.notice.clear();
+            let pos = p.run_pos_of_owner(&a).expect("A");
+            p.close_run(pos).expect("A を閉じる");
+            assert!(p.notice.trim().is_empty(), "NotFound を失敗として出した: {}", p.notice);
+            assert!(!persistence::is_closed(&state, &a.run_id), "墓標が残っている");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 中身が壊れていても、墓標が**有れば**閉じた扱い (安全側)。
+        #[test]
+        fn 壊れた墓標でも閉じた扱いになる() {
+            let dir = ws("close-corrupt-tombstone");
+            let mut p = started_panel(&dir);
+            let a = p.owner().expect("A");
+            p.save_if_needed();
+            let state = p.state_dir();
+            let a_dir = persistence::run_dir_in(&state, &a.run_id).unwrap();
+            assert!(a_dir.exists());
+            let pen = state.join(persistence::CLOSED_DIR);
+            std::fs::create_dir_all(&pen).unwrap();
+            std::fs::write(pen.join(&a.run_id), b"\xff{not json").unwrap();
+            assert!(persistence::is_closed(&state, &a.run_id));
+            let mut q = reopened(&p, &dir);
+            assert_eq!(q.restore, RestorePrompt::None, "閉じた Run を案内した");
+            assert!(q.restore_run(false).is_err(), "墓標のある Run を復元した");
+            assert!(q.runs.is_empty());
+            // 掃除まで済む: 保存も墓標も残らない。
+            assert!(!a_dir.exists(), "墓標のある保存を片付けていない");
+            assert!(!persistence::is_closed(&state, &a.run_id), "済んだ墓標が残っている");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 不正な `run_id` は保存も削除も**状態ディレクトリの外へ出ない**。
+        #[test]
+        fn 不正なrun_idでは状態ディレクトリの外へ書きも消しもしない() {
+            let dir = ws("bad-run-id-io");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = panel_at(&dir);
+            let state = p.state_dir();
+            std::fs::create_dir_all(state.join(RUNS_DIR)).unwrap();
+            let canaries = [
+                dir.join("workspace-canary.txt"),
+                state.join("state-canary.txt"),
+                state.join(RUNS_DIR).join("runs-canary.txt"),
+            ];
+            for c in &canaries {
+                std::fs::write(c, "x").unwrap();
+            }
+            let entries = |d: &Path| -> Vec<String> {
+                let mut v: Vec<String> = std::fs::read_dir(d)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                v.sort();
+                v
+            };
+            let before_state = entries(&state);
+            let before_runs = entries(&state.join(RUNS_DIR));
+            for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x"] {
+                p.plan(
+                    SPEC,
+                    "SPEC.md",
+                    RunOptions {
+                        run_id: bad.to_string(),
+                        ..RunOptions::default()
+                    },
+                )
+                .expect("計画はできる");
+                p.notice.clear();
+                p.save_if_needed();
+                assert!(
+                    !p.notice.trim().is_empty(),
+                    "{bad:?} を黙って保存した (どこへ書いたのか分からない)"
+                );
+                let pos = p.active_run();
+                p.close_run(pos).expect("閉じられる");
+                for c in &canaries {
+                    assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
+                }
+                assert!(!state.join("x").exists(), "{bad:?} で runs/ の外へ書いた");
+                assert_eq!(
+                    entries(&state.join(RUNS_DIR)),
+                    before_runs,
+                    "{bad:?} で runs/ に何か作った"
+                );
+            }
+            // 根の控えは正当な置き場 (書かれてよい)。それ以外は増えていない。
+            let after_state: Vec<String> = entries(&state)
+                .into_iter()
+                .filter(|n| {
+                    n != persistence::STATE_FILE
+                        && n != persistence::PREV_FILE
+                        && n != persistence::CLOSED_DIR
+                })
+                .collect();
+            assert_eq!(after_state, before_state, "状態ディレクトリに想定外のものが増えた");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 復元は同時実行の上限を超えず、既に持っている Run と重複せず、
+        /// フォルダ名と中身の `run_id` が食い違う保存を読まない。
+        #[test]
+        fn 復元は上限と重複と名前の食い違いを守る() {
+            let dir = ws("restore-cap-dedupe");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = panel_at(&dir);
+            while p.runs.len() < MAX_CONCURRENT_RUNS {
+                p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+            }
+            p.save_if_needed();
+            let state = p.state_dir();
+            // 5 本目 (名前は末尾に並ぶ) と、中身の run_id が別物のフォルダ。
+            let mut extra = p.runs[0].to_saved();
+            extra.run.run_id = "zz-extra".to_string();
+            persistence::save(&persistence::run_dir_in(&state, "zz-extra").unwrap(), &extra)
+                .expect("保存");
+            persistence::save(
+                &persistence::run_dir_in(&state, "zz-mismatch").unwrap(),
+                &extra,
+            )
+            .expect("保存");
+            let mut q = reopened(&p, &dir);
+            q.restore_run(false).expect("復元");
+            assert_eq!(q.runs.len(), MAX_CONCURRENT_RUNS, "上限を超えて復元した");
+            let ids = run_ids(&q);
+            assert!(!ids.iter().any(|i| i == "zz-mismatch"), "名前の食い違う保存を復元した");
+            assert!(
+                persistence::run_dir_in(&state, "zz-mismatch").unwrap().exists(),
+                "読まなかった保存を消した"
+            );
+            assert!(
+                persistence::run_dir_in(&state, "zz-extra").unwrap().exists(),
+                "上限で残した保存を消した"
+            );
+            // もう一度復元しても増えない (重複しない)。
+            let _ = q.restore_run(false);
+            assert_eq!(q.runs.len(), MAX_CONCURRENT_RUNS, "同じ Run を二重に持った");
+            let mut uniq = run_ids(&q);
+            uniq.sort();
+            uniq.dedup();
+            assert_eq!(uniq.len(), MAX_CONCURRENT_RUNS);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// 破棄でも同じ不変条件: 担当へ停止が届き、消せなくても復活しない。
+        #[test]
+        fn 破棄で保存を消せなくても復活しない() {
+            let dir = ws("discard-delete-fails");
+            let mut p = started_panel(&dir);
+            let a = p.owner().expect("A");
+            let boot = p.take_launches();
+            let mut sids = Vec::new();
+            for (i, (o, _, spec)) in boot.iter().enumerate() {
+                let sid = 700 + i as SessionId;
+                p.bind_session(o, &spec.agent_id, sid, None);
+                sids.push(sid);
+            }
+            assert!(!sids.is_empty(), "前提: 担当にセッションが結び付いている");
+            p.save_if_needed();
+            let state = p.state_dir();
+            persistence::fault_inject::fail_remove_under(&state.join(RUNS_DIR));
+            let err = p.discard_run().expect_err("削除の失敗を返す");
+            // 画面へ出る文字列なので `trf` を通る (テストでは辞書が載っていない
+            // ので ID がそのまま返る)。**理由が人へ届くこと**は、同梱辞書の
+            // ひな型が `{e}` を持っていることで確かめる — 持っていなければ、
+            // 訳した瞬間に原因が消える。
+            assert_eq!(
+                err,
+                crate::i18n::trf(
+                    "team.notice.run_state_cleanup_failed",
+                    &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+                ),
+                "失敗の伝え方が変わっている"
+            );
+            for (lang, _, json) in crate::locale::BUILTIN {
+                let dict: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(json).expect("同梱辞書は JSON");
+                let t = dict
+                    .get("team.notice.run_state_cleanup_failed")
+                    .unwrap_or_else(|| panic!("{lang} に訳が無い"));
+                assert!(t.contains("{e}"), "{lang}: 原因 ({{e}}) が訳から落ちている: {t}");
+                assert!(t.contains("{run}"), "{lang}: どの Run か分からない: {t}");
+            }
+            assert!(persistence::is_closed(&state, &a.run_id), "墓標が無い");
+            assert!(!p.has_run());
+            // **捨てた Run の担当も止める。** 記録だけ消して担当を残すと、
+            // 盤面から消えたのに端末では動き続ける。
+            let stops = p.take_stops();
+            for sid in &sids {
+                assert!(
+                    stops.iter().any(|(_, _, s)| s == sid),
+                    "破棄したのにセッション #{sid} の停止が出ていない: {stops:?}"
+                );
+            }
+            persistence::fault_inject::clear();
+            let mut q = reopened(&p, &dir);
+            assert_eq!(q.restore, RestorePrompt::None, "破棄した Run を案内した");
+            assert!(q.restore_run(false).is_err(), "破棄した Run を復元した");
+            assert!(
+                !persistence::run_dir_in(&state, &a.run_id).unwrap().exists(),
+                "次の起動で片付け直していない"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// ── 報告置き場 (outbox) ────────────────────────────────────────────

@@ -4538,6 +4538,55 @@ prunable gitdir file points to non-existent location
         );
     }
 
+    /// **`tools/verify.sh` の判定そのものを、実際に回して確かめる。**
+    ///
+    /// verify.sh は「テストを走らせたか」を人へ報告する道具なので、ここが嘘を
+    /// つくと全部の緑が信用できなくなる。実際に嘘をついていた: 変更ファイルの
+    /// basename をフィルタにしていたので、`src/team/panel.rs` を触ると
+    /// `panel::` が渡り、**`context::panel` のテストが走っただけで緑**に
+    /// なっていた (team の panel が 0 件でも)。
+    ///
+    /// 検査の中身は `tools/verify-selftest.sh` — 偽の cargo と使い捨ての git
+    /// リポジトリで、どのフィルタが渡ったか・終了コード・一時ファイルの後始末を
+    /// 決定的に見る。**旧実装をわざと作り直して「捕まえられること」まで**
+    /// 確かめるので、空回りしない。
+    ///
+    /// ここから呼ぶのは、走らせるかどうかを人の記憶に委ねないため
+    /// (CLAUDE.md「道具は揃っていて、走らせるかどうかが人の記憶に委ねられて
+    /// いただけ」)。`sh` と `git` が要るので Windows では降りる。
+    #[cfg(unix)]
+    #[test]
+    fn verify_shは別モジュールのテストで緑にならない() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = match std::process::Command::new("sh")
+            .arg(root.join("tools/verify-selftest.sh"))
+            .current_dir(root)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                println!("[skip] sh を起動できません: {e}");
+                return;
+            }
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 検査そのものが動かない環境 (git が無い等) は skip。**緑にはしない** —
+        // 「何件成功したか」の行が出ていなければ、1 つも検査していない。
+        if !text.contains("件成功 /") {
+            println!("[skip] verify-selftest.sh を回せませんでした:\n{text}");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "tools/verify-selftest.sh が赤:\n{text}"
+        );
+        assert!(text.contains("0 件失敗"), "落ちた検査がある:\n{text}");
+    }
+
     #[test]
     fn 検証スクリプトは終了時に判定行を出す() {
         for (name, src) in [
@@ -4557,6 +4606,10 @@ prunable gitdir file points to non-existent location
             (
                 "tools/release-gate.sh",
                 include_str!("../tools/release-gate.sh"),
+            ),
+            (
+                "tools/verify-selftest.sh",
+                include_str!("../tools/verify-selftest.sh"),
             ),
         ] {
             // Windows のチェックアウトは CRLF なので正規化してから探す。

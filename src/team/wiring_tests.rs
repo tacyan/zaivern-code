@@ -612,15 +612,51 @@ fn 別のrunのeffectを実行させない構造がある() {
         absorb.contains("rt.owner()"),
         "発行時に持ち主を焼き付けていない:\n{absorb}"
     );
-    // 4 つの取り出し口すべてが `mine` を通ること。
+    // **仕事を出す口は `mine` を通る。停止だけが例外。**
     for f in [
         "pub fn take_launches",
         "pub fn take_instructions",
-        "pub fn take_stops",
+        "pub fn take_manual_instructions",
         "pub fn take_validations",
     ] {
         let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
         assert!(body.contains("self.mine(q)"), "{f} が持ち主を見ていない");
+    }
+    // **停止は逆。`mine` を通したら閉じた Run の担当が止まらない。**
+    //
+    // 閉じる順序は「止める → 記憶から外す → 実行側が取り出す」なので、
+    // 取り出す時点でその Run はもう `self.runs` に居ない。ここで生存 Run の
+    // 選り分けを通すと、停止だけが**必ず**捨てられて実プロセスが残る
+    // (実際に残っていた)。名指しの `SessionId` なので他 Run へは飛ばない。
+    let stops = function_body(&p, p.find("pub fn take_stops").expect("停止の取り出し口"));
+    assert!(
+        !stops.contains("self.mine("),
+        "take_stops が生存 Run で選り分けている (閉じた Run の担当が止まらない):\n{stops}"
+    );
+    // 出す側: 閉じるときは承認ゲートを通さず、その場で全セッションを止める。
+    let close = function_body(&p, p.find("pub fn close_run").expect("Run を閉じる"));
+    assert!(
+        close.contains(".close()") && !close.contains("TeamAction::Stop"),
+        "close_run が承認待ちの Stop を使っている (判断ごと消えて誰も承認できない):\n{close}"
+    );
+    let discard = function_body(&p, p.find("pub fn discard_run").expect("Run を捨てる"));
+    assert!(
+        discard.contains(".close()"),
+        "discard_run が担当を止めずに記録だけ消している:\n{discard}"
+    );
+    let rt = src(RUNTIME);
+    let rt_close = function_body(&rt, rt.find("pub fn close(&mut self)").expect("Runtime 側"));
+    assert!(
+        rt_close.contains("TeamEffect::StopAgent") && rt_close.contains("cancel_running_validations"),
+        "閉じるときに担当と検証の両方を止めていない:\n{rt_close}"
+    );
+    // 例外が漏れないこと: workspace の切り替えと終了は、取り出す前に列を空にする。
+    for f in ["pub fn attach_workspace", "pub fn shutdown"] {
+        let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
+        assert!(
+            body.contains("self.pending_stops.clear()"),
+            "{f} が停止の列を空にしていない (前の workspace の停止が持ち越される)"
+        );
     }
 }
 
