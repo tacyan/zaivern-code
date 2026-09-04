@@ -26,6 +26,10 @@ fn canonical_dir(path: &Path, what: &str) -> Result<PathBuf, String> {
     let p = path
         .canonicalize()
         .map_err(|e| format!("{what} を確認できません ({}): {e}", path.display()))?;
+    // Windows の canonicalize は `\\?\C:\...` を返す。これを文字列で
+    // Git for Windows へ渡すと MSYS が `//?/C:/...` に変換し、worktree の
+    // `.git` を作れない。実体解決は維持したまま共通の素の形へ戻す。
+    let p = crate::pathx::plain(p);
     if !p.is_dir() {
         return Err(format!("{what} がフォルダではありません: {}", p.display()));
     }
@@ -37,7 +41,7 @@ fn canonical_dir(path: &Path, what: &str) -> Result<PathBuf, String> {
 /// 前後で保存値と決定パスを食い違わせないため。
 fn normalized_home(home: &Path) -> Result<PathBuf, String> {
     if let Ok(path) = home.canonicalize() {
-        return Ok(path);
+        return Ok(crate::pathx::plain(path));
     }
     let name = home
         .file_name()
@@ -47,6 +51,7 @@ fn normalized_home(home: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "ZAIVERN_HOME の親を決められません".to_string())?
         .canonicalize()
         .map_err(|e| format!("ZAIVERN_HOME の親を確認できません: {e}"))?;
+    let parent = crate::pathx::plain(parent);
     Ok(parent.join(name))
 }
 
@@ -132,6 +137,7 @@ fn existing(
         let p = PathBuf::from(raw);
         let p = if p.is_absolute() { p } else { at.join(p) };
         p.canonicalize()
+            .map(crate::pathx::plain)
             .map_err(|e| format!("git common directory を確認できません: {e}"))
     };
     if common(repo)? != common(&actual_root)? {

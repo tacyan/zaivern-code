@@ -934,9 +934,11 @@ impl TeamPanel {
         let source = self
             .workspace
             .canonicalize()
+            .map(crate::pathx::plain)
             .map_err(|e| format!("元 workspace を確認できません: {e}"))?;
         let recorded = PathBuf::from(&saved.run.workspace)
             .canonicalize()
+            .map(crate::pathx::plain)
             .map_err(|e| format!("保存された元 workspace を確認できません: {e}"))?;
         if source != recorded {
             return Err("保存された Run は別の workspace のものです".to_string());
