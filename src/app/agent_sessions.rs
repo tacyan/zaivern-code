@@ -372,6 +372,12 @@ impl ZaivernApp {
     /// (渡さないと入力の行き先が無くなり、「閉じたら操作を受け付けなくなった」
     /// ように見える)。
     pub(super) fn close_agent(&mut self, i: usize) {
+        let _ = self.close_agent_tracked(i);
+    }
+
+    /// Team RunのClose用。通常のUI後始末に加え、プロセスとPTYが実際に
+    ///畳まれたことを呼び出し側が確認できる札を返す。
+    pub(super) fn close_agent_tracked(&mut self, i: usize) -> Option<crate::terminal::ReapHandle> {
         // セッション ID は再利用され得るので、フェイルオーバーの段も一緒に忘れる
         // (残すと別セッションの状態として読まれてしまう)。
         let mut freed: Option<worktree::AgentWorktree> = None;
@@ -406,7 +412,7 @@ impl ZaivernApp {
             }
             freed = self.agent_worktrees.remove(&id);
         }
-        self.agents.remove(i);
+        let reaping = self.agents.remove_tracked(i);
         // 隔離 worktree を持っていたなら、**残すか消すかをユーザーに選ばせる**。
         // 黙って消すと未コミットの成果ごと消える (git 自身の拒否も回避してしまう)。
         if let Some(wt) = freed {
@@ -419,6 +425,7 @@ impl ZaivernApp {
         if !self.agents.sessions.is_empty() {
             self.term_focus_pending = true;
         }
+        reaping
     }
 
     pub(super) fn send_to_agent(&mut self, text: String) {
@@ -578,13 +585,27 @@ impl ZaivernApp {
             };
             let bracketed = s.running() && s.bracketed_paste();
             let peek = submit::Peek {
+                // **起動直後は書かない。** 待つ長さはカタログが持つので、
+                // ここに CLI ごとの分岐は作らない。
+                // 起動時プロンプトに答えた直後も同じだけ待つ (答えた 71ms 後に
+                // 貼った指示が丸ごと消えた実測がある)。判定は `submit::input_ready`
+                // 1 か所。
+                input_ready: s
+                    .agent_bin()
+                    .map(|b| {
+                        submit::input_ready(
+                            s.age(),
+                            s.since_startup_reply(),
+                            std::time::Duration::from_millis(crate::agents::input_ready_ms(b)),
+                        )
+                    })
+                    .unwrap_or(true),
                 running: s.running(),
                 idle,
                 attention: s.attention,
                 bracketed,
-                // 入力欄の読み取りは **Verify 段だけ**。毎フレーム画面を舐めると
-                // アイドル時のコストがゼロでなくなる。
-                input: matches!(p.job.stage, submit::Stage::Verify)
+                // 入力欄の読み取りは [`peek_input_at`] が決める段だけ。
+                input: peek_input_at(p.job.stage, p.job.submit)
                     .then(|| s.input_text())
                     .flatten(),
             };
@@ -632,7 +653,12 @@ impl ZaivernApp {
                     true
                 }
                 submit::Act::WriteCommit => {
-                    s.write_bytes(submit::COMMIT);
+                    // 確定キーもカタログから引く (CLI ごとに違いうる)。
+                    let keys = s
+                        .agent_bin()
+                        .map(crate::agents::commit_keys)
+                        .unwrap_or(submit::COMMIT);
+                    s.write_bytes(keys);
                     p.job.tries = p.job.tries.saturating_add(1);
                     p.advance(submit::Stage::Verify, now);
                     soon(submit::VERIFY_DELAY);
@@ -644,7 +670,7 @@ impl ZaivernApp {
         // **配達の結末を頼んだ側へ 1 回だけ返す。** 送信経路は増やさない
         // (ここは結果を伝えるだけで、PTY へは 1 バイトも書かない)。
         if !outcomes.is_empty() {
-            self.team_note_delivery(outcomes);
+            self.note_submit_delivery(outcomes);
         }
         for title in delivered {
             self.toast(
@@ -661,5 +687,99 @@ impl ZaivernApp {
         if let Some(d) = next {
             crate::perf::repaint_after(ctx, d, "submit_tick");
         }
+    }
+}
+
+/// **その段で入力欄を読むか** (純関数)。
+///
+/// [`submit::Peek::input`] は「自分が書いた本文がまだ入力欄に残っているか」
+/// だけを見る材料で、読むには端末のパーサをロックして画面を走査する。
+/// だから**要る段だけ**で読む。
+///
+/// * [`submit::Stage::Ready`] — まだ 1 バイトも書いていないので、
+///   残っているかを問う意味が無い
+/// * [`submit::Stage::Commit`] — **読む** (`job.submit` のときだけ)。
+///   `submit` が偽なら [`submit::decide`] はその場で `Done` を返すので、
+///   読んでも捨てるだけ
+/// * [`submit::Stage::Verify`] — 読む (撃った確定キーが効いたかを見る)
+///
+/// **`Commit` を読んでいなかったことが、実機の「配達したことになっている
+/// のに 1 文字も届いていない」の片割れである。** `submit.rs` の `Commit` は
+/// 「本文が入力欄に見えなければ書き直す」判定を持っているのに、`input` が
+/// 常に `None` で渡っていた。`Peek::input_seen(None)` は**真**を返す設計
+/// (読めない相手で書き直しを繰り返さないため) なので、書き直しの枝は
+/// **実機で一度も通っていなかった** — 起動中の CLI が本文を捨てても
+/// そのまま確定キーへ進み、`Verify` は「入力欄に本文が残っていない」を見て
+/// **届いたと判断する**。1 バイトも送っていないのに配達完了になる。
+///
+/// アイドル時のコストは増えない: `submit_tick` は待ちが空なら最初の行で
+/// 帰るので、**読むのは配達中の 1 通につき 1 回**だけ。読む回数は
+/// `Verify` と同じ刻み ([`submit::POLL`]) で、増えるのは配達 1 通あたり
+/// 高々 `COMMIT_IDLE_WAIT / POLL` 回。
+pub(super) fn peek_input_at(stage: submit::Stage, submit: bool) -> bool {
+    match stage {
+        submit::Stage::Ready => false,
+        submit::Stage::Commit => submit,
+        submit::Stage::Verify => true,
+    }
+}
+
+/// **配達の 2 つの穴の番人。**
+///
+/// どちらも「台帳に 1 行も残らないまま担当が `running` で放置される」
+/// という同じ形で出る (実機: 6 体中 2 体・28 分)。
+#[cfg(test)]
+mod delivery_peek_tests {
+    use super::peek_input_at;
+    use crate::submit::Stage;
+
+    /// **`Commit` 段でも入力欄を読む。**
+    ///
+    /// ここが偽に戻ると、`submit.rs` の「本文が入力欄に見えなければ
+    /// 書き直す」判定 (`peek.input_seen`) は `input: None` を受け取り、
+    /// **必ず真**を返して発火しなくなる (`input_seen` は読めない相手で
+    /// 書き直しを繰り返さないよう `None` を真とする)。
+    #[test]
+    fn commit_段でも入力欄を読む() {
+        // (段, 確定キーまで送るか) → 読むか
+        let table = [
+            (Stage::Ready, true, false),
+            (Stage::Ready, false, false),
+            (Stage::Commit, true, true),
+            (Stage::Commit, false, false),
+            (Stage::Verify, true, true),
+            (Stage::Verify, false, true),
+        ];
+        for (stage, submit, want) in table {
+            assert_eq!(
+                peek_input_at(stage, submit),
+                want,
+                "{stage:?} / submit={submit} の読み取り判断が違う"
+            );
+        }
+    }
+
+    /// **判断を `submit_tick` が実際に通していること。**
+    ///
+    /// 純関数だけ直しても、呼び出し側が `matches!` を書き戻せば実機は
+    /// 元のままになる (「作ったのに繋いでいない」)。
+    #[test]
+    fn submit_tick_は入力欄の読み取りをこの判断へ委ねている() {
+        let src = include_str!("agent_sessions.rs").replace("\r\n", "\n");
+        let at = src
+            .find("pub(super) fn submit_tick")
+            .expect("submit_tick が無い");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("input: peek_input_at(p.job.stage, p.job.submit)"),
+            "入力欄の読み取りを段で決めていない (Commit で読まなくなる):\n{body}"
+        );
+        // **アイドル時のコストはゼロのまま。** 待ちが空なら読む前に帰る。
+        assert!(
+            body.contains("if self.outbox.is_empty() {"),
+            "待ちが空でも画面を舐めている:\n{body}"
+        );
     }
 }

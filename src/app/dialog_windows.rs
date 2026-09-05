@@ -1267,6 +1267,31 @@ impl ZaivernApp {
         );
     }
 
+    /// トークンのスリム化 (コンテキスト最適化) が有効か。
+    /// **真実源は `Config`** — 設定画面 (⚙) の「コンテキスト最適化を使う」
+    /// と同じ 1 つの値を読む。
+    pub(crate) fn context_slim_enabled(&self) -> bool {
+        self.cfg.feature_bool(crate::context::KEY_ENABLED)
+    }
+
+    /// トークンのスリム化のオン/オフ。**設定画面 (⚙) と同じ書き戻し経路**
+    /// (`config.toml` への保存まで) を通るので、ペットメニュー・パレット・
+    /// 設定画面のどこから変えても状態が 1 つに保たれる。
+    pub(crate) fn set_context_slim(&mut self, on: bool, ctx: &egui::Context) {
+        self.apply_settings(
+            vec![(crate::context::KEY_ENABLED, config::SettingValue::Bool(on))],
+            ctx,
+        );
+        self.toast(
+            if on {
+                tr("🧠 トークンのスリム化を有効にしました")
+            } else {
+                tr("🧠 トークンのスリム化を無効にしました")
+            },
+            true,
+        );
+    }
+
     /// 設定値を「いま見えているもの」へ効かせる。
     /// 設定画面から変えた直後と、config.toml を読み直した直後に通る。
     pub(super) fn apply_config_to_ui(&mut self, ctx: &egui::Context) {

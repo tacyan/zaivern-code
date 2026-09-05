@@ -1738,13 +1738,17 @@ mod tests {
     /// ここが無いと「一覧には出るのに再開しない」になる。
     #[test]
     fn 再開_id_が無ければ直前の会話を続けるフラグを付ける() {
-        let s = super::entries_to_sessions(vec![hist("gemini", 1, 1, 2, "x")])
+        // **会話 ID が空のとき**に通る道 (アプリ自身の履歴から起こした行は、
+        // ベンダーが ID を公開していないので空になる)。ID 指定を持つ CLI でも
+        // ここへ落ちる — 落ちなければ「一覧には出るのに再開しない」になる。
+        let s = super::entries_to_sessions(vec![hist("claude", 1, 1, 2, "x")])
             .pop()
             .expect("1 件");
-        let cmd = resume_command("gemini", &s);
-        let spec = crate::agents::spec_for_bin("gemini").expect("カタログにある");
-        assert_eq!(cmd, crate::agents::apply_resume("gemini", spec));
-        assert_ne!(cmd, "gemini", "素のコマンドのままでは再開にならない");
+        assert!(s.id.is_empty(), "この経路は ID が空のときのもの");
+        let cmd = resume_command("claude", &s);
+        let spec = crate::agents::spec_for_bin("claude").expect("カタログにある");
+        assert_eq!(cmd, crate::agents::apply_resume("claude", spec));
+        assert_ne!(cmd, "claude", "素のコマンドのままでは再開にならない");
     }
 
     /// 再開フラグを持たない CLI では素のコマンドのまま (作業フォルダだけ引き継ぐ)。

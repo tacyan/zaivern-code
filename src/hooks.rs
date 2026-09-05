@@ -173,16 +173,6 @@ pub enum ActivationKind {
         /// 明示的に無効化されたことを示すキー (`false` なら止まる)。
         enabled_key: &'static str,
     },
-    /// JSON の「信頼したフォルダ」表で、作業ツリーごとに可否が決まる形 (gemini)。
-    ///
-    /// 信頼されていないフォルダでは**プロジェクトの設定ファイルごと読まれない**
-    /// ので、フックも当然効かない。
-    TrustedFolderJson {
-        /// そのフォルダ自身が信頼されていることを示す値。
-        trusted: &'static [&'static str],
-        /// **配下も**信頼されることを示す値 (祖先に在れば足りる)。
-        trusted_parent: &'static str,
-    },
 }
 
 /// 満たされていない有効化条件 1 件 (UI に出すための材料)。
@@ -623,21 +613,6 @@ fn dotted<'a>(v: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
         .try_fold(v, |cur, k| cur.get(k))
 }
 
-/// 2 つのパスを「同じ場所」として比べるための正規化。
-///
-/// macOS / Windows の既定のファイルシステムは**大文字小文字を区別しない**ので
-/// 畳んで比べる (実際に `~/.gemini/trustedFolders.json` は `/Users/…` を
-/// `/users/…` と小文字で持っていた)。Linux は区別するのでそのまま。
-fn fold_path(p: &Path) -> String {
-    let s = p.to_string_lossy().replace('\\', "/");
-    let s = s.trim_end_matches('/').to_string();
-    if cfg!(target_os = "macos") || cfg!(windows) {
-        s.to_lowercase()
-    } else {
-        s
-    }
-}
-
 /// **設置してあるのに効かない**理由を全部挙げる。空なら実際に発火する。
 ///
 /// I/O をするので UI スレッドから毎フレーム呼ぶ相手ではない
@@ -716,32 +691,6 @@ fn activation_gaps_in(
                     })
                 });
                 if !all_ok {
-                    out.push(gap(a.missing));
-                }
-            }
-            ActivationKind::TrustedFolderJson {
-                trusted,
-                trusted_parent,
-            } => {
-                let map: Map<String, Value> = serde_json::from_str(&raw).unwrap_or_default();
-                // 設定ファイルの置き場所の親 = 作業ツリー。
-                let tree = plan
-                    .settings
-                    .parent()
-                    .and_then(Path::parent)
-                    .unwrap_or(Path::new("."));
-                let want = fold_path(tree);
-                let ok = map.iter().any(|(k, v)| {
-                    let Some(v) = v.as_str() else { return false };
-                    let k = fold_path(Path::new(k));
-                    if k == want {
-                        trusted.contains(&v) || v == *trusted_parent
-                    } else {
-                        // 祖先が「配下も信頼」なら足りる。
-                        v == *trusted_parent && want.starts_with(&format!("{k}/"))
-                    }
-                });
-                if !ok {
                     out.push(gap(a.missing));
                 }
             }
@@ -1224,61 +1173,6 @@ mod tests {
             !activation_gaps_in(&plan, &home_of).is_empty(),
             "codex: 1 件欠けているのに有効と言った"
         );
-
-        // ── gemini: 信頼フォルダ表 ────────────────────────────────
-        let gtree = dir.join("gproj");
-        let gplan = plan_for("gemini", &gtree, Path::new("zai-test-exe")).expect("計画");
-        install(&gplan).expect("設置");
-        let tf = home.join("trustedFolders.json");
-        let parent = dir.to_string_lossy().to_string();
-        let self_dir = gtree.to_string_lossy().to_string();
-        // **JSON は serde で組む。** `format!` で埋めると Windows の絶対パスの
-        // `\` がそのまま入り、`C:\Users\…` の `\U` が不正なエスケープになって
-        // JSON のパースごと落ちる (Windows でだけ落ちて他 OS では気付けない)。
-        let tj = |k: &str, v: &str| serde_json::json!({ k: v }).to_string();
-        let gcases: Vec<(String, bool, &str)> = vec![
-            ("{}".into(), false, "表が空なら未信頼"),
-            (
-                tj(&self_dir, "TRUST_FOLDER"),
-                true,
-                "そのフォルダ自身が信頼されていれば有効",
-            ),
-            (
-                tj(&self_dir, "DO_NOT_TRUST"),
-                false,
-                "明示的に拒否されていれば止まる",
-            ),
-            (
-                tj(&parent, "TRUST_PARENT"),
-                true,
-                "祖先が配下ごと信頼していれば有効",
-            ),
-            (
-                tj(&parent, "TRUST_FOLDER"),
-                false,
-                "祖先が自分だけ信頼でも配下には及ばない",
-            ),
-            (
-                tj(&self_dir.to_uppercase(), "TRUST_FOLDER"),
-                cfg!(target_os = "macos") || cfg!(windows),
-                "大文字小文字を区別しない OS でだけ畳んで一致する",
-            ),
-        ];
-        for (body, want_ok, why) in &gcases {
-            std::fs::write(&tf, body).expect("write");
-            assert_eq!(
-                activation_gaps_in(&gplan, &home_of).is_empty(),
-                *want_ok,
-                "gemini: {why}"
-            );
-        }
-
-        // 有効化条件を持たない claude は、この段でつまずかない。
-        let cplan =
-            plan_for("claude", &dir.join("cproj"), Path::new("zai-test-exe")).expect("計画");
-        install(&cplan).expect("設置");
-        assert!(activation_gaps_in(&cplan, &home_of).is_empty());
-        assert_eq!(status(&cplan), HookStatus::Installed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -25,7 +25,7 @@
 //! `scheduler` が「行ける」と言っても、`coordinator` が断ったら**配らない**。
 //! ファイルの重なり・前任者の停止未確認・再試行上限は既存側の判断に従う。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -35,7 +35,8 @@ use super::changeset;
 use super::graph;
 use super::model::*;
 use super::persistence::{
-    EffectRecord, EffectState, RunDoc, Saved, ValidationApproval, SCHEMA_VERSION,
+    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval,
+    SCHEMA_VERSION,
 };
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
@@ -73,8 +74,16 @@ pub struct SessionObs {
     pub provider: String,
     /// 既存の [`crate::app`] が導出した調停層の状態。**ここが真実。**
     pub state: SessionState,
-    /// **前回 tick 以降に増えた画面テキスト**。全履歴を渡さないこと
-    /// (毎フレーム全部を解析すると、64 体でフレームが止まる)。
+    /// **いまの画面** (`screen_tail_lines` の末尾。差分ではない)。
+    ///
+    /// 差分に絞ると報告そのものが分断されるので、`panel::pump_sessions` は
+    /// 末尾をまるごと渡す。重複は意味の単位で [`TeamRuntime::take_unseen`] が
+    /// 落とす。
+    ///
+    /// **だから「空でないこと」は活動ではない。** 動いている TUI の画面は
+    /// 常に空でないので、ここを見て `last_activity_at` を進めると毎 tick
+    /// 進んでしまう (実機で 28 分止まった Run を誰も異常と言わなかった原因)。
+    /// 進捗は [`screen_fingerprint`] が**変わったとき**だけ数える。
     pub text: String,
 }
 
@@ -98,7 +107,9 @@ pub struct Observation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunOwner {
     pub run_id: String,
-    /// この Run の workspace。**Runtime が持っている値そのもの。**
+    /// ユーザーが Run を開始した元 workspace。保存と復元の所有軸。
+    pub source_workspace: PathBuf,
+    /// この Run 専用の実行 workspace。起動・検証・changeset の cwd。
     pub workspace: PathBuf,
 }
 
@@ -295,6 +306,9 @@ pub struct TeamRuntime {
     events: VecDeque<TeamEvent>,
     decisions: Vec<Decision>,
     run: RunDoc,
+    /// 状態保存と復元のキーに使う元 workspace。
+    source_workspace: PathBuf,
+    /// Run 専用 worktree 内の実行 workspace。
     workspace: PathBuf,
     next_event_id: EventId,
     next_task_id: TaskId,
@@ -308,12 +322,499 @@ pub struct TeamRuntime {
     registered: BTreeSet<SessionId>,
     /// 保存が要るか。
     dirty: bool,
+    /// UI が読む値が実際に変わった世代。
+    ///
+    /// 永続化の `dirty` とは分ける。`previews` は保存しないが、
+    /// 画面は作り直す必要がある。逆に静止した端末を毎 tick
+    /// 全件 snapshot 化しないよう、実表示の変化時だけ進める。
+    snapshot_generation: u64,
     /// **状態機械が拒否した遷移。** 借用の都合で、起きた場所では記録だけして
     /// あとでまとめて事象へ落とす ([`TeamRuntime::drain_rejections`])。
     ///
     /// 拒否そのものは正しい動き (fail-closed) だが、**黙って無かったことに
     /// しない** — 「押したのに何も起きない」を追えるようにする。
     rejections: std::cell::RefCell<Vec<(TaskId, TeamTaskState, TeamTaskState)>>,
+    /// **画面に出す「いま何をしているか」の直近の出力。** 保存しない。
+    ///
+    /// 端末タブが名前とボタンしか出していなかったので、走っている最中に
+    /// 中身を見る手段が「端末を開く」しか無かった (開くと画面が切り替わる)。
+    /// [`SessionObs::text`] はいまの画面なので、ここへ直近の画面を持つ。
+    /// 同じ正規化指紋は書き戻さない — スピナーや経過秒だけの
+    /// 再描画で snapshot を無効化し続けないため。
+    /// 上限は [`PREVIEW_MAX_CHARS`] — 上限が無いと、長く走った
+    /// Run のぶんだけ際限なく太る。
+    ///
+    /// 永続化しない (`persistence::Saved` に無い) — 再起動後に「前の実行の
+    /// 画面」が残っていると、動いていないものが動いて見える。
+    previews: BTreeMap<AgentId, String>,
+    /// **一度取り込んだ塊。** 同じ報告を毎 tick 読み直さないための記憶。
+    ///
+    /// 以前は画面側 (`panel::new_lines`) が**行**の重複を落としていたが、
+    /// それでは**報告そのものが分断される**。指示のエコーで
+    /// `[ZAI-TEAM-RESULT]` や `"blockers": []` は既に「見た行」になっている
+    /// ので、本物の報告が来ても**開始マーカーごと消えて**解析器に届かない。
+    /// 実機ではこれで、Team Lead が完了報告を出しているのに却下も受理も
+    /// 記録されないまま止まっていた。
+    ///
+    /// 重複は**意味の単位 (塊) で**落とす。保存しない — 再起動後に同じ塊が
+    /// 来ても、状態機械が fail-closed で弾く。
+    ///
+    /// **タスクの状態が動いたら忘れる。** 内容だけで落とし続けると、
+    /// 差し戻しのあとに同じ文面で出し直された報告まで捨ててしまい、
+    /// 「直したのに永久に受け取られない」になる (再検証・再レビューの
+    /// 経路が実際にそうなった)。動いた = 話が進んだ、なので同じ文面でも
+    /// 別の提出として扱ってよい。
+    /// **本文だけで数えない。** 送り主・種別・宛先まで含めた構造化キー
+    /// ([`SeenKey`]) で覚える。本文だけにすると、別の担当が同じ文面を出した
+    /// だけで 2 通目が消える (実際にレビューの `{"verdict":"approve"}` が
+    /// これで落ち、タスクが `Reviewing` のまま止まりうる)。
+    seen_blocks: HashSet<SeenKey>,
+    /// 古い順に捨てるための並び (上限 [`SEEN_BLOCKS_CAP`])。
+    seen_block_order: VecDeque<SeenKey>,
+    /// **報告を受け取るフォルダ。** 画面ではなくここから読む。
+    ///
+    /// Claude Code v2 は報告を改行ではなく**カーソル移動**
+    /// (`\e[2C` / `\e[1B`) で描く。だから `{` と `"task_id"` は別の行・
+    /// 別の桁に置かれ、再描画で潰れる — 画面から読む限り、報告は
+    /// **構造的に**取りこぼす (実測: 生ログで確認)。
+    ///
+    /// 置き場は `ZAIVERN_HOME` の下。**ワークスペースの中に置かない** —
+    /// 置くと `changeset` が「担当外のファイルを変更した」と測って、
+    /// 報告そのものが却下される。
+    outbox: PathBuf,
+    /// **配達待ちのエージェント間伝言。**
+    ///
+    /// `harvest` は `&mut self` を持っているので Effect の入れ物を
+    /// 受け取れない。次の `tick` の出口でまとめて出す (保存しない —
+    /// 届かなかった伝言を再起動後に蒸し返さない)。
+    pending_msgs: Vec<TeamEffect>,
+    /// **担当 1 体ぶんの進捗の覚え書き** (画面の指紋と、静けさの長さ)。
+    ///
+    /// 保存しない — `previews` と同じ理由で、再起動後に前の実行の静けさを
+    /// 引き継ぐと、起こし直したばかりの担当をいきなり停滞と呼ぶ。
+    stalls: BTreeMap<AgentId, StallWatch>,
+    /// **時間の予算を越えたと 1 度だけ伝えた担当のタスク。** 保存しない
+    /// (再起動したら、もう 1 度だけ言えばよい)。
+    budget_nudged: std::collections::BTreeSet<TaskId>,
+    /// **一度書いた「割り当てを見送りました」の覚え書き。**
+    ///
+    /// 断りは配置から導かれるので、配置が変わるまで毎 tick 同じ行が出る。
+    /// 保存しない (`previews` / `stalls` と同じ) — 再起動後に 1 度書き直すのは
+    /// 害が無く、覚え書きを永続化すると「消えた理由が二度と出ない」ほうが困る。
+    blocked_notes: HashSet<String>,
+}
+
+/// エージェント 1 体ぶんの画面プレビューに残す文字数。
+pub const PREVIEW_MAX_CHARS: usize = 4_000;
+
+/// 「もう読んだ」と覚えておく塊の数。
+///
+/// 上限が無いと、長く走った Run のぶんだけ記憶が太る。塊は報告・レビュー・
+/// 事象・伝言の 4 種類しかないので、この数で十分足りる。
+pub const SEEN_BLOCKS_CAP: usize = 512;
+
+/// **「もう取り込んだ」を数える単位。**
+///
+/// 本文だけで数えてはいけない。構造化報告は種類によっては送り主を本文に
+/// 持たない (`message` の `{"to":…,"text":…}`、`review` の
+/// `{"task_id":…,"verdict":…}`) ので、**別の担当が同じ文面を出しただけで
+/// 2 通目が黙って消える**。レビューがそれで落ちると、実装済みのタスクが
+/// `Reviewing` のまま止まる。
+///
+/// なので鍵は「誰が・どの種類で・どの対象へ・何を」の 4 つで持つ。
+/// 送り主・種別・対象は**そのまま**保持し (ハッシュしない)、本文だけを
+/// 指紋にする。
+///
+/// ## 本文の指紋を 64bit 1 本にしない
+///
+/// `fnv1a64` を 1 本だけ使うと、衝突した瞬間に**正しい報告が黙って消える**
+/// (消えたことは誰にも見えない)。ここでは
+///
+/// * 128bit ぶん (種の違う 2 本) の指紋
+/// * 本文の**バイト長**
+///
+/// を持つ。長さが違えば指紋が一致しても別物と分かるので、偶然の一致で
+/// 報告を落とすことは現実的に起こらない。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SeenKey {
+    /// 送り主。**同じ文面でも担当が違えば別の報告。**
+    agent: AgentId,
+    /// 種別 (`result` / `review` / `message` / `event`)。
+    kind: String,
+    /// 対象タスク (本文から読めたときだけ)。読めなくても本文の指紋が効く。
+    task: Option<TaskId>,
+    /// 本文の指紋 (128bit) と長さ。
+    digest: (u64, u64),
+    len: u32,
+}
+
+/// 置き場の 1 通を取り込んだ結果 ([`TeamRuntime::accept_outbox`])。
+///
+/// **「適用した」と「もう適用してあった」を分ける。** どちらもファイルは
+/// 片付けてよいが、混ぜると「何も起きていないのに消えた」を追えなくなる。
+/// 意味としての却下は `Err` — ファイルは隔離して理由を残す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// 状態へ適用した。
+    Applied,
+    /// 同じ報告が既に適用済み (画面から先に届いていた等)。
+    Duplicate,
+}
+
+/// 本文の指紋 (128bit) と長さ。**種の違う 2 本**を取る。
+fn body_digest(body: &str) -> ((u64, u64), u32) {
+    let a = crate::history::fnv1a64(body.as_bytes());
+    // 2 本目は塩を混ぜて取る (同じ関数を 2 回呼んでも同じ値にならないように)。
+    let mut salted = Vec::with_capacity(body.len() + 8);
+    salted.extend_from_slice(b"zai-seen");
+    salted.extend_from_slice(body.as_bytes());
+    let b = crate::history::fnv1a64(&salted);
+    ((a, b), body.len().min(u32::MAX as usize) as u32)
+}
+
+/// 本文から対象タスクを読む (読めなければ `None`)。
+///
+/// `result` と `review` は `task_id` を持つ。**鍵に足すのは、同じ担当が
+/// 別のレビュー対象へ同じ文面を返したときに区別するため**。
+fn task_of_body(body: &str) -> Option<TaskId> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("task_id").and_then(|t| t.as_u64())
+}
+
+// ── 停滞の検知 ───────────────────────────────────────────────────────
+//
+// **画面が空でないこと**を活動と数えてはいけない。[`SessionObs::text`] は
+// 端末の画面そのもの (`screen_tail_lines` の結果) なので、動いている TUI では
+// 常に空でない。実機の Run で 6 体が 28 分まったく進まなかったとき、台帳の
+// `last_activity_at` は毎 tick 更新されていた — **進捗の指標として働いて
+// いなかった**ので、誰も異常と言わなかった。
+//
+// ここでは「画面が**変わったとき**だけ活動」に直す。変化の判定は指紋
+// (正規化した画面のハッシュ) で行う。
+
+/// 画面の**指紋**。同じ値が続く = 何も進んでいない。
+///
+/// 正規化は [`crate::supervisor::normalize_line`] を借りる (`keep_digits =
+/// false` でスピナー字形・経過秒・トークン数・進捗 % が潰れる)。**2 本目を
+/// 書かない** — 別々に育つと、片方だけが「スピナーの再描画」を進捗と数える。
+///
+/// 畳むのは [`crate::history::Fnv1a64`]。`DefaultHasher` は rustc の版を
+/// またいで安定しないので、指紋を持ち回す用途では使わない。
+/// **正直な限界**: 桁だけが違う変化は進捗と数えない。
+///
+/// `● Edit(step1.rs)` → `● Edit(step2.rs)` は本当は進捗だが、数字を潰す
+/// ので同じ指紋になる。それでもこの畳み方を選ぶ理由は実測にある —
+/// 実機で 69 分止まっていた Run の画面は、**スピナーと経過秒とトークン数
+/// だけ**が動いていた (生バイトは 3 分前まで伸びていて「働いている」ように
+/// 見えた)。数字を残すと、この形が永久に進捗として通る。
+///
+/// 一方、本当に働いているエージェントは**行が増える** (道具を使うたびに
+/// `● Read(...)` が積まれる) ので、桁だけの違いを捨てても取りこぼさない。
+pub fn screen_fingerprint(text: &str) -> u64 {
+    let mut h = crate::history::Fnv1a64::default();
+    for line in text.lines() {
+        let n = crate::supervisor::normalize_line(line, false);
+        if n.is_empty() {
+            continue;
+        }
+        h.update(n.as_bytes());
+        // 行の切れ目も混ぜる (混ぜないと "ab" + "c" と "a" + "bc" が同値)。
+        h.update(b"\n");
+    }
+    h.finish()
+}
+
+/// **まだ 1 度も進捗を観測していない担当**に使う予算の下限 (秒)。
+///
+/// 値をここで決めない — 「意味的な進捗が無いまま何秒続いたら停滞か」は
+/// 既に [`crate::supervisor::SupervisorConfig`] の `stall_secs` が決めている
+/// (既定 180 秒)。2 つの層が別々の数字を持つと、片方だけ直した日に
+/// **同じ画面を一方は停滞と呼び、他方は呼ばない**。
+///
+/// なぜ下限が要るか: 起こしたばかりの CLI は MCP の立ち上げや初回応答待ちで
+/// 画面が数十秒〜数分まったく変わらない (`agents.rs` の確定キー再送が
+/// まさにその間を扱っている)。観測が 0 件の時点で短い線を引くと、
+/// **起動中の担当を全部「停滞」と呼ぶ**ことになる。
+pub fn stall_floor_secs() -> u64 {
+    crate::supervisor::SupervisorConfig::default().stall_secs
+}
+
+/// 観測した「静かだった最長の間隔」の何倍まで待つか。
+///
+/// **観測した最長そのものを線にしない。** そうすると、次にその 1 秒先まで
+/// 静かになっただけで停滞と呼ぶことになり、必ず嘘の赤を出す。
+///
+/// 2 ではなく 3 なのは、supervisor の `spinner_grace_factor` (= 2) が
+/// 「スピナーは動いている」間の猶予なのに対し、こちらは**画面が 1 文字も
+/// 変わらない**間の猶予だから — 1 段厚く取る。
+pub const STALL_QUIET_FACTOR: u64 = 3;
+
+/// 同じ担当・同じタスクで、はしごを何巡させるか。
+///
+/// **無限に回さない。** 上限に達したら回収を繰り返さず人へ上げる
+/// ([`DecisionKind::AttemptsExhausted`])。
+pub const STALL_MAX_ROUNDS: u8 = 2;
+
+/// 停滞の判定に要る材料。**時刻は全部引数**で受け取る。
+///
+/// `Instant::now()` を判定の中で呼ばない — 呼ぶと表で固定できなくなり、
+/// 実時間に依存したテスト (= このリポジトリが何度も嘘の赤を出した形) しか
+/// 書けなくなる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallInput {
+    /// 画面の指紋が最後に変わってからの秒数。
+    pub quiet_secs: u64,
+    /// **その担当が実際に働いていたときの**「静かだった最長の間隔」(秒)。
+    /// まだ観測していなければ 0。
+    pub longest_quiet_secs: u64,
+    /// 予算の下限 ([`stall_floor_secs`])。
+    pub floor_secs: u64,
+    /// この巡ですでに促しを送ったか。
+    pub nudged: bool,
+    /// 促しを送ってからの秒数 (`nudged` が偽なら見ない)。
+    pub since_nudge_secs: u64,
+    /// この担当・このタスクで済ませた巡の数。
+    pub rounds: u8,
+    /// 巡の上限 ([`STALL_MAX_ROUNDS`])。
+    pub max_rounds: u8,
+}
+
+/// 停滞のはしご 1 段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallVerdict {
+    /// 動いている (何もしない)。
+    Working,
+    /// 促しを 1 回送る。
+    Nudge,
+    /// 促しても変わらない — 担当を外して配り直せるようにする。
+    Reclaim,
+    /// 巡の上限に達した — 人へ上げる。
+    Escalate,
+}
+
+/// 待ち予算 (秒)。**固定値にしない。**
+///
+/// 固定の予算は N が増えれば必ず破綻するので、「進捗が観測できる限り
+/// 延ばす」形にする — その担当が実際に働いていたときの静けさの最長を覚え、
+/// その [`STALL_QUIET_FACTOR`] 倍を予算にする。観測が無いあいだだけ
+/// 下限 ([`stall_floor_secs`]) が効く。
+pub fn stall_budget_secs(longest_quiet_secs: u64, floor_secs: u64) -> u64 {
+    floor_secs.max(longest_quiet_secs.saturating_mul(STALL_QUIET_FACTOR))
+}
+
+/// 停滞のはしごを 1 段だけ決める (**純関数**)。
+///
+/// 促しは端末へ打ち込むので**画面が変わる** = 指紋も `quiet_secs` も一度
+/// 0 へ戻る。だから 2 段目は「促してから予算ぶん経っても、また静かなまま」で
+/// 判定する (促した直後の変化を「動き出した」と読まないため)。
+pub fn judge_stall(inp: StallInput) -> StallVerdict {
+    let budget = stall_budget_secs(inp.longest_quiet_secs, inp.floor_secs);
+    if inp.quiet_secs < budget {
+        return StallVerdict::Working;
+    }
+    if !inp.nudged {
+        return StallVerdict::Nudge;
+    }
+    if inp.since_nudge_secs < budget {
+        return StallVerdict::Working;
+    }
+    if inp.rounds.saturating_add(1) >= inp.max_rounds {
+        StallVerdict::Escalate
+    } else {
+        StallVerdict::Reclaim
+    }
+}
+
+/// 止まっている担当へ送る促しの文面 (**純関数**)。
+///
+/// **報告の囲みマーカーを 1 つも書かない。** 書くと、端末が描き返した
+/// エコーが「中身が壊れた報告」として拾われ、却下ログだけが積み上がる
+/// (`harvest` はマーカーの間を報告として読むため)。形式は最初の指示に
+/// 書いてあるので、ここでは思い出させるだけでよい。
+pub fn stall_nudge_text(task: TaskId, title: &str) -> String {
+    format!(
+        "[Zaivern] あなたの担当 #{task}「{title}」はまだ報告されていません。\n\
+         終わっていれば、最初の指示にある形式で報告してください。\n\
+         まだなら、いまどこで詰まっているかを 1〜2 行で教えてください\n\
+         (承認待ち・入力待ちで止まっているなら、その旨だけで構いません)。",
+        title = title.chars().take(60).collect::<String>()
+    )
+}
+/// 完了条件に書かれた時間の予算 (秒)。書いていなければ `None`。
+///
+/// 読むのは「**N 分以内**」の形だけ (雛形 [`super::composition::spec_template`]
+/// が書く形)。SPEC が真実で、Runtime に別の欄を増やさない — 欄を増やすと
+/// 「SPEC には 10 分と書いてあるのに Runtime は 15 分で数える」が起こりうる。
+pub fn time_budget_secs(definition_of_done: &[String]) -> Option<u64> {
+    for line in definition_of_done {
+        let Some(at) = line.find("分以内") else {
+            continue;
+        };
+        let head = &line[..at];
+        let digits: String = head
+            .chars()
+            .rev()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if let Ok(n) = digits.parse::<u64>() {
+            if n > 0 {
+                return Some(n * 60);
+            }
+        }
+    }
+    None
+}
+
+/// 予算超過の促し。**報告の形式は最初の指示にある** (ここに二度書かない)。
+pub fn budget_nudge_text(task: TaskId, budget_min: u64) -> String {
+    format!(
+        "[Zaivern] ⏱ 開始から {budget_min} 分の予算を越えました。磨くのを止めて、\n\
+         いまの状態のまま #{task} を最初の指示にある形式で完了報告してください。\n\
+         直すべき点は検証担当が伝言で返します — 先に動くものを出すほうが速く良くなります。"
+    )
+}
+
+/// 担当 1 体ぶんの進捗の覚え書き。**保存しない。**
+///
+/// 保存すると再起動後に「前の実行の静けさ」を引き継いで、起こし直した
+/// ばかりの担当をいきなり停滞と呼ぶ。`previews` と同じ扱いにする。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct StallWatch {
+    /// 1 度でも観測したか。**`changed_at == 0` を「未観測」の代わりに
+    /// 使わない** — 0 は実在しうる時刻で、番兵にすると初回だけ挙動が違う
+    /// 隠れた分岐になる。
+    seen: bool,
+    /// 直近の画面指紋。
+    fingerprint: u64,
+    /// 指紋が最後に変わった時刻 (秒)。
+    changed_at: u64,
+    /// **働いていたときの**静けさの最長 (秒)。促した巡のぶんは数えない。
+    longest_quiet: u64,
+    /// いま見ている担当タスク。変わったらはしごを最初から。
+    task: Option<TaskId>,
+    /// この巡で促しを送った時刻。
+    nudged_at: Option<u64>,
+    /// 済ませた巡の数。
+    rounds: u8,
+    /// 人へ上げたか。**上げたら、この担当・このタスクでは以後何もしない**
+    /// (同じ相手へ促しを撃ち続けない)。担当が替われば `retarget` が外す。
+    escalated: bool,
+}
+
+impl StallWatch {
+    /// 観測を 1 つ取り込む。**画面が変わったときだけ**活動として数える。
+    ///
+    /// 静けさを `longest_quiet` へ畳むのは**促していない巡だけ**。促した後の
+    /// 変化には、こちらが打ち込んだ文字が混ざっている — それを「この担当は
+    /// これだけ静かでも働いている」と学習すると、予算が促しのたびに伸びて
+    /// **二度と停滞と言えなくなる**。
+    fn observe(&mut self, fingerprint: u64, now: u64) -> bool {
+        if !self.seen {
+            self.seen = true;
+            self.fingerprint = fingerprint;
+            self.changed_at = now;
+            return true;
+        }
+        if fingerprint == self.fingerprint {
+            return false;
+        }
+        if self.nudged_at.is_none() {
+            self.longest_quiet = self.longest_quiet.max(now.saturating_sub(self.changed_at));
+        }
+        self.fingerprint = fingerprint;
+        self.changed_at = now;
+        true
+    }
+
+    /// 担当が替わったらはしごを最初から (別の仕事は別の話)。
+    fn retarget(&mut self, task: Option<TaskId>) {
+        if self.task != task {
+            self.task = task;
+            self.nudged_at = None;
+            self.rounds = 0;
+            self.escalated = false;
+        }
+    }
+
+    /// いまの材料を判定へ渡す形にする。
+    fn input(&self, now: u64, floor_secs: u64) -> StallInput {
+        StallInput {
+            quiet_secs: now.saturating_sub(self.changed_at),
+            longest_quiet_secs: self.longest_quiet,
+            floor_secs,
+            nudged: self.nudged_at.is_some(),
+            since_nudge_secs: self
+                .nudged_at
+                .map(|at| now.saturating_sub(at))
+                .unwrap_or_default(),
+            rounds: self.rounds,
+            max_rounds: STALL_MAX_ROUNDS,
+        }
+    }
+}
+
+/// 計画が必要としている役割を、枠 `slots` ぶんだけ並べる (純関数)。
+///
+/// **役割はタスクから決まる。** フォームの選択は計画へ、計画は編成へ
+/// 伝わるので、真実の在り処が 1 つで済む (選択を直接見ると、計画が
+/// 作らなかった役割の担当を立てて「仕事の無い担当」が並ぶ)。
+///
+/// 並べ方: まず計画にある役割を 1 体ずつ (実装は最初の 1 体を先に置く)、
+/// 余った枠は実装で埋める。並列で効くのは実装なので余りをそこへ寄せる。
+pub fn roster_roles(tasks: &[TeamTask], teams: &[TeamGroup], slots: usize) -> Vec<TeamRole> {
+    if slots == 0 {
+        return Vec::new();
+    }
+    // 出現順は依存順 (計画 → 設計 → 実装 → テスト → レビュー → 統合)。
+    const ORDER: [TeamRole; 6] = [
+        TeamRole::Planner,
+        TeamRole::Architect,
+        TeamRole::Implementer,
+        TeamRole::Tester,
+        TeamRole::Reviewer,
+        TeamRole::Integrator,
+    ];
+    // **レーンの頭も数える。** レビューは「タスク」ではなく各タスクの
+    // 工程なので、担当のタスクが 1 件も無い。タスクだけを見ると
+    // レビュー担当が 1 体も立たず、**レビューを頼む相手が居なくなる**
+    // (`scheduler` は実装した本人にレビューさせない)。
+    let present: Vec<TeamRole> = ORDER
+        .into_iter()
+        .filter(|r| tasks.iter().any(|t| t.role == *r) || teams.iter().any(|g| g.lead_role == *r))
+        .collect();
+    if present.is_empty() {
+        return vec![TeamRole::Implementer; slots];
+    }
+    let mut out: Vec<TeamRole> = present.iter().copied().take(slots).collect();
+    while out.len() < slots {
+        out.push(TeamRole::Implementer);
+    }
+    out
+}
+
+/// 担当の表示名。**役割が名前になる** — 「Agent 3」では何の担当か分からない。
+///
+/// 同じ役割が複数居るときだけ番号を足す (1 体しか居ないのに「1」が付くと、
+/// 存在しない 2 体目を探させる)。
+pub fn agent_name(role: TeamRole, seq: usize) -> String {
+    let base = match role {
+        TeamRole::TeamLead => "Team Lead",
+        TeamRole::Planner => "Planner",
+        TeamRole::Architect => "Architect",
+        TeamRole::Implementer => "Implementer",
+        TeamRole::Tester => "Tester",
+        TeamRole::Reviewer => "Reviewer",
+        TeamRole::Integrator => "Integrator",
+    };
+    if seq <= 1 {
+        base.to_string()
+    } else {
+        format!("{base} {seq}")
+    }
 }
 
 /// 状態を 1 つ進める。**進めなかったことを黙殺しない。**
@@ -339,6 +840,60 @@ fn step(
     }
 }
 
+/// **その報告が「もう通り過ぎたもの」か。** 状態 × 報告の種類だけで決まる純関数。
+///
+/// エージェントは同じ完了報告を画面へ何度も出す。1 通目を受理してタスクを
+/// 先へ進めたあと、2 通目・3 通目が遅れて届く。このときタスクは報告が
+/// 動かそうとしている段より**先**にいるので、遷移は必ず断られる。
+/// [`step`] は断られるたびに 1 行積むので、実機では 1 回の再報告につき
+/// `reviewing → running` と `reviewing → validating` の **2 行**が並んだ
+/// (2 回の再報告で計 4 行)。**却下で埋まると本物の却下が埋もれる。**
+///
+/// 拒否そのものは正しい (fail-closed) ので、直すのは表ではなく
+/// **試みる前に見分ける**ことのほう。
+///
+/// # どこまでを「通り過ぎた」と見なすか
+///
+/// **検証を抜けてレビューへ渡した後** — `Reviewing` と `RevisionRequired`
+/// の 2 つだけ。実装担当の報告は `completed` も `blocked` も `failed` も
+/// 「実装を終える・止める」ための合図で、レビューへ渡した時点でその合図は
+/// **もう使い終わっている**。ここから先を動かすのは検証の決着とレビューの
+/// 判定であって、実装担当の報告ではない。
+///
+/// # 見送らないもの (今までどおり試みて、断られたら記録する)
+///
+/// * **配る前** (`Pending` / `Ready`) — 「まだ配ってもいないタスクへの
+///   完了報告」は本物の異常。黙らせない
+/// * **実装中** (`Assigned` / `Running` / `Validating`) — 報告が正しく効く段
+/// * **横へ逸れた状態** (`Blocked` / `Failed` / `NeedsUser`) — 先へ進んだ
+///   のではないので「通り過ぎた」ではない。とくに `NeedsUser` は人の判断を
+///   待っている最中で、そこへ報告が来ること自体が読む価値のある事実
+/// * **`Completed`** — レビューを通って締めた後に「終わりました」と言って
+///   くるのは、遅れた重複と同じ形をしていても**終端へ届いた報告**であって、
+///   ここを黙らせるのは既存の約束 (`runtime_tests::断られた遷移は黙殺せず
+///   記録に残す`) を壊す。**実機で並んだ 4 行はどれも `reviewing` 発**なので、
+///   直すのに `Completed` を含める必要も無い
+///
+/// なお**別の担当からの報告・存在しないタスクへの報告・status が読めない
+/// 報告**は、この関数の手前 ([`TeamRuntime::take_result`] と
+/// [`rp::accept`]) が却下として記録する。ここが見るのは**受理できた報告
+/// だけ**なので、それらを飲み込むことはない。
+fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
+    // レビューへ渡した後か (`RevisionRequired` はレビューの判定そのもの)。
+    let past_implementation = matches!(
+        state,
+        TeamTaskState::Reviewing | TeamTaskState::RevisionRequired
+    );
+    // **報告の種類ごとに明示する。** 種類が増えた日に「どちらでもない」を
+    // 選べないようにしておく (網羅で必ずコンパイルが止まる)。
+    match status {
+        // 「終わった」= 新しい検証回を始める合図 (`Running → Validating`)。
+        ReportedStatus::Completed => past_implementation,
+        // 「止まった」「失敗した」= 実装を止める合図。
+        ReportedStatus::Blocked | ReportedStatus::Failed => past_implementation,
+    }
+}
+
 impl TeamRuntime {
     /// 計画から新しい Run を作る。
     pub fn from_plan(plan: TeamPlan, workspace: PathBuf, opts: RunOptions) -> Self {
@@ -358,8 +913,10 @@ impl TeamRuntime {
                 version: SCHEMA_VERSION,
                 run_id: opts.run_id.clone(),
                 workspace: workspace.display().to_string(),
+                run_workspace: None,
                 spec_source: opts.spec_source.clone(),
                 agent_count: opts.agent_count,
+                agent_presets: opts.agent_presets.clone(),
                 max_attempts: opts.max_attempts,
                 review_required: opts.review_required,
                 paused: false,
@@ -370,8 +927,10 @@ impl TeamRuntime {
                 validation_timeout_secs: super::launch::VALIDATION_TIMEOUT_SECS,
                 guardrails: opts.guardrails.clone(),
                 effects: Vec::new(),
+                seen_blocks: Vec::new(),
                 done_effects: Vec::new(),
             },
+            source_workspace: workspace.clone(),
             workspace,
             next_event_id: 1,
             next_task_id,
@@ -380,7 +939,16 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: true,
+            snapshot_generation: 0,
             rejections: Default::default(),
+            previews: BTreeMap::new(),
+            pending_msgs: Vec::new(),
+            stalls: BTreeMap::new(),
+            budget_nudged: std::collections::BTreeSet::new(),
+            blocked_notes: HashSet::new(),
+            outbox: PathBuf::new(),
+            seen_blocks: HashSet::new(),
+            seen_block_order: VecDeque::new(),
         };
         rt.plan_roster();
         rt.log(
@@ -415,9 +983,28 @@ impl TeamRuntime {
     /// **Running / Assigned だったタスクを無条件に Running へ戻さない。**
     /// プロセスが生きているかは復元時点では分からないので、いったん
     /// `Ready` へ落とし、担当が確認できたときだけ再び進める。
+    #[cfg(test)]
     pub fn restore(saved: Saved, workspace: PathBuf) -> Self {
-        let next_task_id = saved.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-        let next_event_id = saved.events.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        Self::restore_in(saved, workspace.clone(), workspace)
+    }
+
+    /// 保存状態を、検証済みの元 workspace / 実行 workspace 対応で復元する。
+    pub fn restore_in(saved: Saved, source_workspace: PathBuf, workspace: PathBuf) -> Self {
+        let next_task_id = saved
+            .tasks
+            .iter()
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let next_event_id = saved
+            .events
+            .iter()
+            .map(|e| e.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let seen_records = saved.run.seen_blocks.clone();
         let mut tasks = saved.tasks;
         for t in &mut tasks {
             // セッションはどれも生き残っていない。結び付きは必ず外す。
@@ -481,13 +1068,29 @@ impl TeamRuntime {
         let mut effects: BTreeMap<String, EffectRecord> = BTreeMap::new();
         let mut effect_order = VecDeque::new();
         for r in &saved.run.effects {
-            if r.state != EffectState::Completed
-                || unsettled.iter().any(|p| r.key.starts_with(p))
-            {
+            if r.state != EffectState::Completed || unsettled.iter().any(|p| r.key.starts_with(p)) {
                 continue;
             }
             if effects.insert(r.key.clone(), r.clone()).is_none() {
                 effect_order.push_back(r.key.clone());
+            }
+        }
+        let mut seen_blocks = HashSet::new();
+        let mut seen_block_order = VecDeque::new();
+        let keep_from = seen_records.len().saturating_sub(SEEN_BLOCKS_CAP);
+        for record in seen_records.into_iter().skip(keep_from) {
+            if super::outbox::Kind::from_key(&record.kind).is_none() {
+                continue;
+            }
+            let key = SeenKey {
+                agent: AgentId::new(record.agent_id),
+                kind: record.kind,
+                task: record.task_id,
+                digest: record.digest,
+                len: record.len,
+            };
+            if seen_blocks.insert(key.clone()) {
+                seen_block_order.push_back(key);
             }
         }
         let mut rt = Self {
@@ -498,6 +1101,7 @@ impl TeamRuntime {
             events: saved.events.into_iter().collect(),
             decisions: saved.decisions,
             run: saved.run,
+            source_workspace,
             workspace,
             next_event_id,
             next_task_id,
@@ -506,7 +1110,16 @@ impl TeamRuntime {
             co: Coordinator::new(),
             registered: BTreeSet::new(),
             dirty: false,
+            snapshot_generation: 0,
             rejections: Default::default(),
+            previews: BTreeMap::new(),
+            pending_msgs: Vec::new(),
+            stalls: BTreeMap::new(),
+            budget_nudged: std::collections::BTreeSet::new(),
+            blocked_notes: HashSet::new(),
+            outbox: PathBuf::new(),
+            seen_blocks,
+            seen_block_order,
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
@@ -542,6 +1155,13 @@ impl TeamRuntime {
     }
     pub fn is_stopped(&self) -> bool {
         self.run.stopped
+    }
+    /// UI 向けスナップショットの無効化世代。
+    ///
+    /// 引数なし `O(1)` で読める。描画側は前回値と違うときだけ
+    /// [`super::view_model::snapshot`] を作り直せばよい。
+    pub fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation
     }
     pub fn task(&self, id: TaskId) -> Option<&TeamTask> {
         self.tasks.iter().find(|t| t.id == id)
@@ -617,11 +1237,11 @@ impl TeamRuntime {
     /// 二重に発行される。
     fn prune_effects(&mut self) {
         while self.effects.len() > EFFECT_KEY_CAP {
-            let Some(pos) = self
-                .effect_order
-                .iter()
-                .position(|k| self.effects.get(k).is_some_and(|r| r.state == EffectState::Completed))
-            else {
+            let Some(pos) = self.effect_order.iter().position(|k| {
+                self.effects
+                    .get(k)
+                    .is_some_and(|r| r.state == EffectState::Completed)
+            }) else {
                 // 全部が未完了。**1 件も落とさない** (落とすと二重実行になる)。
                 break;
             };
@@ -712,9 +1332,9 @@ impl TeamRuntime {
         let id = match t.coordinator_task {
             Some(id) => id,
             None => {
-                let id = self
-                    .co
-                    .add_task_with_files(t.title.clone(), String::new(), &[], files, at);
+                let id =
+                    self.co
+                        .add_task_with_files(t.title.clone(), String::new(), &[], files, at);
                 if let Some(x) = self.tasks.iter_mut().find(|x| x.id == task) {
                     x.coordinator_task = Some(id);
                 }
@@ -755,8 +1375,19 @@ impl TeamRuntime {
     pub fn owner(&self) -> RunOwner {
         RunOwner {
             run_id: self.run.run_id.clone(),
+            source_workspace: self.source_workspace.clone(),
             workspace: self.workspace.clone(),
         }
+    }
+
+    /// 起動前に作った Run 専用 worktree へ、実行先を一度だけ切り替える。
+    pub fn set_run_workspace(&mut self, run_workspace: super::run_workspace::RunWorkspace) {
+        self.source_workspace = PathBuf::from(&run_workspace.source_workspace);
+        self.workspace = PathBuf::from(&run_workspace.execution_workspace);
+        self.run.workspace = run_workspace.source_workspace.clone();
+        self.run.run_workspace = Some(run_workspace);
+        self.run.updated_at = now_secs();
+        self.dirty = true;
     }
 
     /// 拒否された遷移を事象へ落とす。**黙って無かったことにしない。**
@@ -791,9 +1422,11 @@ impl TeamRuntime {
 
     /// この Run の workspace (エージェントの cwd・検証の cwd はここから決まる)。
     ///
-    /// 実行側は [`Self::owner`] 越しに受け取る。ここを直接読むのはテスト
-    /// (不変条件の照合) だけ。
-    #[cfg(test)]
+    /// 実行側は [`Self::owner`] 越しに受け取る。**直接読むのは
+    /// 「測れるフォルダか」を見るときだけ** (`view_model` の `unmeasured`)
+    /// と、テストの不変条件の照合。cwd を決めるのに使わないこと —
+    /// 決めるのは `owner` の側で、そこを 2 つにすると Run を切り替えた
+    /// 瞬間に別のフォルダで動き出す。
     pub fn workspace(&self) -> &std::path::Path {
         &self.workspace
     }
@@ -806,6 +1439,17 @@ impl TeamRuntime {
                     .effect_order
                     .iter()
                     .filter_map(|k| self.effects.get(k).cloned())
+                    .collect(),
+                seen_blocks: self
+                    .seen_block_order
+                    .iter()
+                    .map(|key| SeenBlockRecord {
+                        agent_id: key.agent.to_string(),
+                        kind: key.kind.clone(),
+                        task_id: key.task,
+                        digest: key.digest,
+                        len: key.len,
+                    })
                     .collect(),
                 done_effects: Vec::new(),
                 updated_at: now_secs(),
@@ -827,12 +1471,7 @@ impl TeamRuntime {
     /// `identity` は**再起動をまたぐ目印** ([`TeamAgent::session_identity`])。
     /// これを一緒に覚えるので、次の起動で「もう起こしてある」と分かる。
     /// 分からないと、Zaivern 自身が復元したセッションの隣に 2 体目を起こす。
-    pub fn bind_session(
-        &mut self,
-        agent: &AgentId,
-        session: SessionId,
-        identity: Option<String>,
-    ) {
+    pub fn bind_session(&mut self, agent: &AgentId, session: SessionId, identity: Option<String>) {
         if let Some(a) = self.agents.iter_mut().find(|a| a.id == *agent) {
             a.session_id = Some(session);
             // **目印は上書きしない。** 引き取り (adopt) では実行側が同じ
@@ -975,10 +1614,7 @@ impl TeamRuntime {
     /// 配達の結末を採ってよいかは、これと一致するかだけで決まる。
     pub fn current_instruction_key(&self, task: TaskId) -> Option<String> {
         let t = self.task(task)?;
-        if !matches!(
-            t.state,
-            TeamTaskState::Assigned | TeamTaskState::Running
-        ) {
+        if !matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running) {
             return None;
         }
         let agent = t.assigned_agent.as_ref()?;
@@ -1464,6 +2100,15 @@ impl TeamRuntime {
                 // 停止承認を消さない`)。
                 if retried {
                     self.decisions.retain(|d| d.task_id != Some(id));
+                } else {
+                    // **配置由来の札だけは、押したその場で下ろす。**
+                    // `Ready` のタスクは状態が動かないので上の枝へ来ない。
+                    // 理由がまだ成り立っているなら次の tick で出し直される
+                    // ので、消えっぱなしにはならない (人が答える種類の判断は
+                    // `SCHEDULING_KEYS` に無いので残る)。
+                    self.decisions.retain(|d| {
+                        d.task_id != Some(id) || !is_scheduling_key(&d.idempotency_key)
+                    });
                 }
                 self.dirty = true;
             }
@@ -1518,7 +2163,11 @@ impl TeamRuntime {
                 //
                 // **借用を先に切る。** `self.log` は `&mut self` を取るので、
                 // エージェントの参照を持ったままでは呼べない。
-                let session = self.agents.iter().find(|a| a.id == agent).map(|a| a.session_id);
+                let session = self
+                    .agents
+                    .iter()
+                    .find(|a| a.id == agent)
+                    .map(|a| a.session_id);
                 let text = clamp_text(text.trim());
                 match session {
                     // **空の指示は 1 バイトも送らない。**
@@ -1573,6 +2222,9 @@ impl TeamRuntime {
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        // 話が進んだかを見るための控え (**状態が動いたら塊の記憶を忘れる**)。
+        let states_before: Vec<(TaskId, TeamTaskState)> =
+            self.tasks.iter().map(|t| (t.id, t.state)).collect();
 
         // 1) 観測 — セッションの状態をエージェントへ写す。
         self.sync_sessions(obs);
@@ -1592,12 +2244,56 @@ impl TeamRuntime {
         // 6) Pause / Stop 中は**新規割り当てをしない** (新しい検証も
         //    `advance` の中で同じ条件で止めている)。
         if self.accepting_work() {
+            // **止まっている担当を起こす。** 配る前に見る — 促しが効いて
+            // 本人が報告すれば、そもそも配り直しは要らない。
+            //
+            // 止めている間 (Pause / Stop) は撃たない。人が止めたものを
+            // 「止まっている」と咎めることになるため。
+            self.nudge_stalled(obs.now, &mut out);
+            // **時間の予算を越えたら、磨くのを止めて報告させる。** 動いている
+            // 担当は停滞ではないので `nudge_stalled` は黙っている — 実測で
+            // 1 枚の HP の実装担当が 10 分の予算を越えて 10 分以上
+            // 「Choreographing…」を続け、検証担当が 1 度も出番を得なかった。
+            self.nudge_over_budget(obs.now, &mut out);
             self.ensure_agents(&mut out);
             self.dispatch(&mut out);
         }
 
         // 7) Goal の状態を更新する。
         self.update_goal();
+
+        // 8) エージェント同士の伝言を配る。**Pause 中でも配る** —
+        //    伝言は新しい仕事ではなく、既に起きたことの共有なので。
+        out.append(&mut std::mem::take(&mut self.pending_msgs));
+
+        // 9) **また出してよい状態へ動いたら**、塊の記憶を忘れる。
+        //
+        //    差し戻しや配り直しのあとは、同じ文面で出し直されることがある。
+        //    内容だけで落とし続けると「直したのに永久に受け取られない」に
+        //    なる (再検証・再レビューの経路が実際にそうなった)。
+        //
+        //    **却下や完了で忘れない。** そこで忘れると、画面に残っている
+        //    同じ報告を次の tick でまた読み、却下が何十件も並ぶ。
+        let reopened = self.tasks.iter().any(|t| {
+            let was = states_before
+                .iter()
+                .find(|(id, _)| *id == t.id)
+                .map(|(_, st)| *st);
+            was.is_some_and(|w| {
+                w != t.state
+                    && matches!(
+                        t.state,
+                        TeamTaskState::Ready
+                            | TeamTaskState::Assigned
+                            | TeamTaskState::Running
+                            | TeamTaskState::RevisionRequired
+                    )
+            })
+        });
+        if reopened {
+            self.seen_blocks.clear();
+            self.seen_block_order.clear();
+        }
 
         self.drain_rejections();
         if self.dirty {
@@ -1669,6 +2365,8 @@ impl TeamRuntime {
     fn sync_sessions(&mut self, obs: &Observation) {
         let live: BTreeMap<SessionId, &SessionObs> =
             obs.sessions.iter().map(|s| (s.id, s)).collect();
+        let mut snapshot_changed = false;
+        let mut persistent_changed = false;
 
         // 既存調停層への登録 (未登録のものだけ)。
         for id in live.keys() {
@@ -1694,6 +2392,9 @@ impl TeamRuntime {
             .filter(|t| t.state.is_terminal())
             .map(|t| t.id)
             .collect();
+        // **進捗の覚え書きは借りて返す。** `self.agents` を可変で回している
+        // 間は `self.stalls` を触れないので、取り出してから戻す。
+        let mut stalls = std::mem::take(&mut self.stalls);
         for a in &mut self.agents {
             let Some(sid) = a.session_id else {
                 // **セッションを持たないもの** (親が報告してきたサブ
@@ -1702,16 +2403,27 @@ impl TeamRuntime {
                 // 放っておくと完了後もそのタスクを持ち続ける。
                 if a.current_task.is_some_and(|t| finished.contains(&t)) {
                     a.current_task = None;
+                    snapshot_changed = true;
+                    persistent_changed = true;
                 }
                 continue;
             };
             match live.get(&sid) {
                 Some(s) => {
-                    a.provider = s.provider.clone();
+                    if a.provider != s.provider {
+                        a.provider = s.provider.clone();
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                    }
                     let task = self.tasks.iter().find(|t| {
                         t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
                     });
-                    a.current_task = task.map(|t| t.id);
+                    let current_task = task.map(|t| t.id);
+                    if a.current_task != current_task {
+                        a.current_task = current_task;
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                    }
                     let next = super::roles::derive_agent_work_state(
                         s.state,
                         task,
@@ -1720,27 +2432,285 @@ impl TeamRuntime {
                     );
                     if next != a.state {
                         a.state = next;
-                        a.last_activity_at = obs.now;
+                        snapshot_changed = true;
+                        persistent_changed = true;
+                        if a.last_activity_at != obs.now {
+                            a.last_activity_at = obs.now;
+                        }
                     }
-                    if !s.text.trim().is_empty() {
-                        a.last_activity_at = obs.now;
+                    // **画面が変わったときだけ活動。**
+                    //
+                    // ここを `!s.text.trim().is_empty()` にしてはいけない。
+                    // `s.text` は端末の画面そのものなので、動いている TUI では
+                    // 常に空でなく、`last_activity_at` が毎 tick 進む。実機の
+                    // Run で 6 体が 28 分まったく進まなかったとき、台帳は
+                    // 「たった今活動した」と言い続けていた。
+                    let w = stalls.entry(a.id.clone()).or_default();
+                    w.retarget(a.current_task);
+                    // 指紋は停滞判定と preview 無効化で 1 回だけ計算する。
+                    // 同じ正規化画面なら、スピナーや秒数が描き直されても
+                    // generation を進めない。
+                    let screen_changed = w.observe(screen_fingerprint(&s.text), obs.now);
+                    if screen_changed {
+                        if s.text.is_empty() {
+                            if self.previews.remove(&a.id).is_some() {
+                                snapshot_changed = true;
+                            }
+                        } else {
+                            let mut preview = s.text.clone();
+                            // 上限を超えたら**文字境界で**先頭を捨てる。
+                            let over = preview.chars().count().saturating_sub(PREVIEW_MAX_CHARS);
+                            if over > 0 {
+                                let cut = preview
+                                    .char_indices()
+                                    .nth(over)
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(preview.len());
+                                preview.drain(..cut);
+                            }
+                            if self.previews.get(&a.id) != Some(&preview) {
+                                self.previews.insert(a.id.clone(), preview);
+                                snapshot_changed = true;
+                            }
+                        }
+                        if a.last_activity_at != obs.now {
+                            a.last_activity_at = obs.now;
+                            snapshot_changed = true;
+                            persistent_changed = true;
+                        }
                     }
                 }
                 None => {
                     // セッションが消えた。**担当を勝手に配り直さない**
                     // (前任者の停止確認は下の release_dead が既存側へ通す)。
                     a.session_id = None;
-                    a.state = AgentWorkState::Exited;
+                    if a.state != AgentWorkState::Exited {
+                        a.state = AgentWorkState::Exited;
+                    }
                     // **画面に「まだ担当している」を残さない。** ここを
                     // 残すと、消えたエージェントのカードが担当タスクを
                     // 名乗り続け、Inspector が効かない Retry / Reassign を
                     // 出す (`release_dead` が担当を外したあとも消えない —
                     // 次の tick からは上の枝を通らないため)。
                     a.current_task = None;
+                    snapshot_changed = true;
+                    persistent_changed = true;
+                    // **消えた担当の覚え書きは捨てる。** 起こし直したら
+                    // 別の画面・別の静けさなので、引き継ぐと起動中の担当を
+                    // いきなり停滞と呼ぶ。
+                    stalls.remove(&a.id);
                 }
             }
         }
+        // 居なくなった担当のぶんは捨てる (際限なく溜めない)。
+        let known_ids: BTreeSet<AgentId> = self.agents.iter().map(|a| a.id.clone()).collect();
+        stalls.retain(|id, _| known_ids.contains(id));
+        self.previews.retain(|id, _| known_ids.contains(id));
+        self.stalls = stalls;
         self.release_dead(obs.now);
+        if persistent_changed {
+            self.dirty = true;
+        }
+        if snapshot_changed {
+            self.snapshot_generation = self.snapshot_generation.saturating_add(1);
+        }
+    }
+
+    /// **止まっている担当を起こす。** 促す → 回収する → 人へ上げる。
+    ///
+    /// 実機の Run で 6 体とも生きているのに 28 分まったく進まず、**誰も
+    /// それを異常と言わなかった**。ここが「言う」場所である。
+    ///
+    /// 判定そのものは純関数 [`judge_stall`] にあり、時刻は全部引数で渡す。
+    /// ここがやるのは材料集めと、段に応じた**既存経路の呼び分け**だけ:
+    ///
+    /// * 促し — 人の指示と同じ [`TeamEffect::SendManualInstruction`]。
+    ///   **第 2 の配達路を作らない。** 冪等キーも同じ名前空間なので、
+    ///   結末は [`note_manual_delivery`](Self::note_manual_delivery) が書く。
+    /// * 回収 — 人の Reassign と**同じ経路**。担当が生きているうちに
+    ///   `free_task` で `Ready` へ戻すと、まだ編集しているかもしれない旧担当と
+    ///   新担当が同じファイルを同時に持つ ([`TeamAction::ReassignTask`] の
+    ///   doc)。だから `reassign_pending` を立てて停止承認へ上げ、実際の解放は
+    ///   停止が観測できてから `settle_reassign` → `free_task` が行う。
+    /// * 人へ上げる — 既存の [`DecisionKind::AttemptsExhausted`]。
+    ///   **新しい種別は増やさない。**
+    /// **時間の予算を越えた実装担当に、1 度だけ「いま報告して」と言う。**
+    ///
+    /// 予算は完了条件の「N 分以内」から読む ([`time_budget_secs`])。
+    /// 相手は実装担当だけ — 検証担当が予算を越えるのは実装が遅れたからで、
+    /// 急かしても直らない。促しは [`TeamEffect::SendManualInstruction`]
+    /// (人の指示と同じ経路) で、鍵はイベント ID から作る。
+    fn nudge_over_budget(&mut self, now: u64, out: &mut Vec<TeamEffect>) {
+        let Some(budget) = time_budget_secs(&self.goal.definition_of_done) else {
+            return;
+        };
+        if now.saturating_sub(self.run.started_at) < budget {
+            return;
+        }
+        let due: Vec<(TaskId, String, AgentId, SessionId)> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+                    && t.role == super::model::TeamRole::Implementer
+                    && !self.budget_nudged.contains(&t.id)
+            })
+            .filter_map(|t| {
+                let agent = t.assigned_agent.clone()?;
+                let session = t.assigned_session?;
+                Some((t.id, t.title.clone(), agent, session))
+            })
+            .collect();
+        for (task, _title, agent, session) in due {
+            let id = self.log_to(
+                TeamEventKind::AgentBlocked,
+                None,
+                Some(agent.clone()),
+                format!(
+                    "#{task} は予算 {} 分を越えました。いまの状態で報告するよう促します",
+                    budget / 60
+                ),
+            );
+            out.push(TeamEffect::SendManualInstruction {
+                agent: agent.clone(),
+                session,
+                text: budget_nudge_text(task, budget / 60),
+                key: manual_instruction_key(&agent, id),
+            });
+            self.budget_nudged.insert(task);
+            self.dirty = true;
+        }
+    }
+
+    fn nudge_stalled(&mut self, now: u64, out: &mut Vec<TeamEffect>) {
+        let floor = stall_floor_secs();
+        // 借用を分けるため、拾うところまでを先に済ませる。
+        struct Stalled {
+            agent: AgentId,
+            session: SessionId,
+            task: TaskId,
+            title: String,
+            quiet: u64,
+            verdict: StallVerdict,
+        }
+        let mut hits: Vec<Stalled> = Vec::new();
+        for a in &self.agents {
+            if a.kind != AgentKind::ManagedSession {
+                continue;
+            }
+            let Some(session) = a.session_id else {
+                continue;
+            };
+            let Some(w) = self.stalls.get(&a.id) else {
+                continue;
+            };
+            if w.escalated || !w.seen {
+                continue;
+            }
+            // **本人が動く番の担当だけ**を見る。`Validating` は Zaivern 自身が
+            // コマンドを走らせている段で、画面が静かなのが正しい。`Reviewing`
+            // も別の担当を待っている段なので数えない (どちらも「止まって
+            // いる」の意味が違う)。
+            let Some(t) = self.tasks.iter().find(|t| {
+                t.assigned_agent.as_ref() == Some(&a.id)
+                    && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+            }) else {
+                continue;
+            };
+            if t.reassign_pending || t.validation.running || t.review.running {
+                continue;
+            }
+            let verdict = judge_stall(w.input(now, floor));
+            if verdict == StallVerdict::Working {
+                continue;
+            }
+            hits.push(Stalled {
+                agent: a.id.clone(),
+                session,
+                task: t.id,
+                title: t.title.clone(),
+                quiet: now.saturating_sub(w.changed_at),
+                verdict,
+            });
+        }
+
+        for h in hits {
+            match h.verdict {
+                StallVerdict::Working => {}
+                StallVerdict::Nudge => {
+                    // **鍵は、これから積むイベントの ID から作る**
+                    // (人の指示と同じ組み立て — `manual_instruction_key`)。
+                    let id = self.log_to(
+                        TeamEventKind::AgentBlocked,
+                        None,
+                        Some(h.agent.clone()),
+                        format!(
+                            "{} の画面が {} 秒変わっていません。#{} の様子を尋ねます",
+                            h.agent, h.quiet, h.task
+                        ),
+                    );
+                    out.push(TeamEffect::SendManualInstruction {
+                        agent: h.agent.clone(),
+                        session: h.session,
+                        text: stall_nudge_text(h.task, &h.title),
+                        key: manual_instruction_key(&h.agent, id),
+                    });
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.nudged_at = Some(now);
+                    }
+                    self.dirty = true;
+                }
+                StallVerdict::Reclaim => {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == h.task) {
+                        t.reassign_pending = true;
+                        t.updated_at = now_secs();
+                    }
+                    // **鍵は人の Reassign と同じ。** 同じ話を 2 枚出さない。
+                    let d = self.make_decision(
+                        DecisionKind::StopAgents,
+                        Some(h.task),
+                        Some(h.agent.clone()),
+                        format!(
+                            "#{} の担当は促しても {} 秒画面が変わりません。停止して配り直しますか",
+                            h.task, h.quiet
+                        ),
+                        "停止するまで配り直しません (同じファイルを 2 人が同時に持たないため)"
+                            .into(),
+                        vec!["approve".into(), "reject".into()],
+                        format!("reassign-stop:{}", h.task),
+                        Vec::new(),
+                        None,
+                    );
+                    if let Some(d) = d {
+                        out.push(TeamEffect::RequestHumanApproval(d));
+                    }
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.rounds = w.rounds.saturating_add(1);
+                        w.nudged_at = None;
+                    }
+                    self.dirty = true;
+                }
+                StallVerdict::Escalate => {
+                    self.raise(
+                        DecisionKind::AttemptsExhausted,
+                        Some(h.task),
+                        Some(h.agent.clone()),
+                        format!(
+                            "#{} は促しても回収しても動きません ({} 秒画面が変わっていません)",
+                            h.task, h.quiet
+                        ),
+                        format!("担当: {}", h.agent),
+                        vec!["retry".into(), "reassign".into(), "reject".into()],
+                    );
+                    // **同じ相手へ撃ち続けない。** 担当が替わるまで降りる。
+                    if let Some(w) = self.stalls.get_mut(&h.agent) {
+                        w.rounds = w.rounds.saturating_add(1);
+                        w.escalated = true;
+                    }
+                    self.dirty = true;
+                }
+            }
+        }
     }
 
     /// 消えたセッションが握っていたタスクを解放する。
@@ -1782,7 +2752,22 @@ impl TeamRuntime {
     }
 
     /// 画面テキストから報告を取り込む。
+    ///
+    /// **自分が送った指示のエコーを、相手の報告として読まない。**
+    /// 指示は PTY へ打ち込むのでエージェントの TUI がそのまま描き返し、
+    /// 指示には報告のひな型がマーカーごと載っている。素直に拾うと
+    /// 「1 文字も作業していないのに完了報告が届いた」ことになる
+    /// (詳しくは [`rp::is_prompt_echo`])。
     fn harvest(&mut self, obs: &Observation) {
+        // 借用を分けるため、拾うところまでを先に済ませる。
+        struct Picked {
+            agent: AgentId,
+            results: Vec<String>,
+            reviews: Vec<String>,
+            events: Vec<String>,
+            msgs: Vec<String>,
+        }
+        let mut picked: Vec<Picked> = Vec::new();
         for s in &obs.sessions {
             if s.text.trim().is_empty() {
                 continue;
@@ -1795,80 +2780,517 @@ impl TeamRuntime {
             else {
                 continue;
             };
-            for body in rp::extract_blocks(&s.text, rp::RESULT_OPEN, rp::RESULT_CLOSE) {
-                self.take_result(&agent, &body);
+            // このエージェントへ送った指示 (同じ入力から同じ文面が出る)。
+            // 送っていなければひな型は画面に無いので、素通しでよい。
+            let sent = self.sent_instruction(&agent);
+            let keep = |body: &String, open: &str, close: &str| -> bool {
+                // **書いている途中の塊は見送る。** 断ると、落ち度の無い
+                // 担当に却下が記録される (`rp::looks_incomplete`)。
+                if rp::looks_incomplete(body) {
+                    return false;
+                }
+                sent.as_deref()
+                    .is_none_or(|t| !rp::is_prompt_echo(body, t, open, close))
+            };
+            let results: Vec<String> =
+                rp::extract_blocks(&s.text, rp::RESULT_OPEN, rp::RESULT_CLOSE)
+                    .into_iter()
+                    .filter(|b| keep(b, rp::RESULT_OPEN, rp::RESULT_CLOSE))
+                    .collect();
+            let reviews: Vec<String> =
+                rp::extract_blocks(&s.text, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE)
+                    .into_iter()
+                    .filter(|b| keep(b, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE))
+                    .collect();
+            let events: Vec<String> = rp::extract_blocks(&s.text, rp::EVENT_OPEN, rp::EVENT_CLOSE)
+                .into_iter()
+                .filter(|b| keep(b, rp::EVENT_OPEN, rp::EVENT_CLOSE))
+                .collect();
+            let msgs: Vec<String> = rp::extract_blocks(&s.text, rp::MSG_OPEN, rp::MSG_CLOSE)
+                .into_iter()
+                .filter(|b| keep(b, rp::MSG_OPEN, rp::MSG_CLOSE))
+                .collect();
+            if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
+                continue;
             }
-            for body in rp::extract_blocks(&s.text, reviewer::REVIEW_OPEN, reviewer::REVIEW_CLOSE) {
-                self.take_review(&agent, &body);
+            // **同じ塊は一度しか取り込まない。** 画面は同じ報告を何度も
+            // 映すので、これが無いと 1 通の完了報告が毎 tick 読み直される。
+            let results = self.take_unseen(&agent, super::outbox::Kind::Result, results);
+            let reviews = self.take_unseen(&agent, super::outbox::Kind::Review, reviews);
+            let events = self.take_unseen(&agent, super::outbox::Kind::Event, events);
+            let msgs = self.take_unseen(&agent, super::outbox::Kind::Message, msgs);
+            if results.is_empty() && reviews.is_empty() && events.is_empty() && msgs.is_empty() {
+                continue;
             }
-            for body in rp::extract_blocks(&s.text, rp::EVENT_OPEN, rp::EVENT_CLOSE) {
-                self.take_event(&agent, &body, obs.now);
+            picked.push(Picked {
+                agent,
+                results,
+                reviews,
+                events,
+                msgs,
+            });
+        }
+        for p in picked {
+            // **却下は画面経路でも記録済み** (`take_*` が理由を時系列へ残す)。
+            // ここで結果を捨ててよいのは、画面には再送の口が無いため。
+            for body in p.results {
+                let _ = self.take_result(&p.agent, &body);
+            }
+            for body in p.reviews {
+                let _ = self.take_review(&p.agent, &body);
+            }
+            for body in p.events {
+                let _ = self.take_event(&p.agent, &body, obs.now);
+            }
+            for body in p.msgs {
+                let _ = self.take_message(&p.agent, &body);
             }
         }
     }
 
+    /// **エージェント同士のやり取り 1 通。**
+    ///
+    /// 端末の中だけで完結させない — 誰から誰へ何を言ったかを盤面へ残し
+    /// (`時系列` タブ)、**相手の端末へ実際に届ける**。届けないと
+    /// 「言った」だけになり、受け手は永久に気付かない。
+    ///
+    /// 配達は人の指示と同じ経路 (`SendManualInstruction`) を使う。
+    /// 第 2 の配達路を作ると、片方だけ届く状態が生まれる。
+    fn take_message(&mut self, from: &AgentId, body: &str) -> Result<(), String> {
+        let known: Vec<(AgentId, String)> = self
+            .agents
+            .iter()
+            .filter(|a| a.kind == AgentKind::ManagedSession)
+            .map(|a| (a.id.clone(), a.role.key().to_string()))
+            .collect();
+        let (targets, text) = match rp::check_message(body, &known, from) {
+            Ok(v) => v,
+            Err(e) => return Err(self.reject(from, None, e.detail())),
+        };
+        let sender = self
+            .agent(from)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| from.0.clone());
+        // **1 通も渡せなければ却下。** 一部でも渡せたなら受理する
+        // (渡せなかった相手は下で個別に理由が残る)。
+        let mut delivered = 0usize;
+        let mut last_why: Option<String> = None;
+        for to in targets {
+            let Some(session) = self.agent(&to).and_then(|a| a.session_id) else {
+                // 端末を持たない相手 (報告されたサブエージェント) には配れない。
+                // **黙って捨てない** — 送ったほうは届いた気になっている。
+                last_why = Some(self.reject(
+                    from,
+                    Some(to.clone()),
+                    format!("{} は端末を持っていないので伝言を渡せません", to.0),
+                ));
+                continue;
+            };
+            delivered += 1;
+            let id = self.log_to(
+                TeamEventKind::AgentMessage,
+                Some(from.clone()),
+                Some(to.clone()),
+                format!("{sender} → {}: {text}", to.0),
+            );
+            self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                agent: to.clone(),
+                session,
+                // **誰からの伝言かを本文に残す。** 相手の端末には差出人が
+                // 出ないので、書かないと「誰かから何か来た」になる。
+                //
+                // **いまの担当も必ず添える。** 添えないと、受け取った側は
+                // 伝言を新しい指示として読んで**自分の担当を投げ出す**。
+                // 実機で index.html を書く担当 (#5) がこれで 1 時間止まった
+                // — 伝言で CSS の手直しへ移ってしまい、ページの本体が
+                // 最後まで作られなかった。
+                text: format!(
+                    "[Zaivern] {sender} からの伝言:\n{text}{}",
+                    self.standing_order(&to)
+                ),
+                key: format!("manual:{}:{id}", to.0),
+            });
+        }
+        if delivered == 0 {
+            return Err(last_why
+                .unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string()));
+        }
+        Ok(())
+    }
+
+    /// **伝言の末尾に添える「あなたの担当は変わっていない」。**
+    ///
+    /// 伝言は*連絡*であって*指示*ではない。相手の端末には両者の区別が
+    /// 無いので、こちらが毎回書く。担当を持っていなければ何も足さない。
+    fn standing_order(&self, to: &AgentId) -> String {
+        let Some(t) = self
+            .tasks
+            .iter()
+            .find(|t| t.assigned_agent.as_ref() == Some(to) && t.state.is_held())
+        else {
+            return String::new();
+        };
+        format!(
+            "\n\n---\nこれは**連絡**です。指示ではありません。\n\
+             あなたの担当は #{} 「{}」のままです。\
+             まずこれを最後まで終わらせて報告してください。\n\
+             連絡の内容が担当と関わるなら取り込んで構いませんが、\
+             **担当を置いて別の作業へ移らないでください。**",
+            t.id,
+            t.title.chars().take(60).collect::<String>()
+        )
+    }
+
+    /// この Run が**その仕事を出したか** (冪等キーで見る)。
+    ///
+    /// Run が複数走っているとき、実行側から返る返事 (`ack_done` 等) は
+    /// 鍵しか持っていない。**出した本人へ返す**ための照合に使う。
+    #[cfg(test)]
+    pub fn has_effect(&self, key: &str) -> bool {
+        self.effects.contains_key(key)
+    }
+
+    /// 報告を受け取るフォルダを教える (画面の外から渡す)。
+    pub fn set_outbox(&mut self, dir: PathBuf) {
+        self.outbox = dir;
+    }
+
+    /// 報告を受け取るフォルダ。
+    pub fn outbox(&self) -> &std::path::Path {
+        &self.outbox
+    }
+
+    /// **Run を閉じる** (人が盤面の ✕ を押した)。
+    ///
+    /// [`TeamAction::Stop`] は kill を承認ゲートに通す — 「停止しますか」の
+    /// 判断を積んで人の承認を待ち、承認されて初めて [`TeamEffect::StopAgent`]
+    /// が出る。閉じるときにそれをそのまま使うと、**判断は Run と一緒に消えて
+    /// 誰も承認できず、担当のプロセスだけが残る** (実際に残っていた)。
+    /// 閉じる操作そのものが人の決定なので、ここでは結び付いている全セッションの
+    /// 停止と、走っている検証の取り消しを**直接**出す。
+    ///
+    /// 出す停止は具体的な `SessionId` を名指しする。結び付けは Run ごとなので、
+    /// 他の Run のセッションがここに混ざる余地は無い。同じセッションへ停止が
+    /// 2 度出ても害は無い (相手が居なければ実行側は何もしない)。
+    pub fn close(&mut self) -> Vec<TeamEffect> {
+        self.run.stopped = true;
+        self.run.paused = true;
+        let mut out: Vec<TeamEffect> = self
+            .agents
+            .iter()
+            .filter_map(|a| a.session_id)
+            .map(TeamEffect::StopAgent)
+            .collect();
+        let stopping = out.len();
+        // **走っている検証も止める。** 担当だけ止めて `cargo test` を残すと、
+        // 閉じたはずの Run がリポジトリのコードを走らせ続ける。
+        self.cancel_running_validations(&mut out);
+        self.log(
+            TeamEventKind::RunStopped,
+            None,
+            None,
+            format!("Run を閉じました (担当 {stopping} 体を停止)"),
+        );
+        self.dirty = true;
+        out
+    }
+
+    /// **置き場から届いた 1 通を取り込む。**
+    ///
+    /// 判断は画面から読むのと**同じ関数** (`take_result` / `take_review` /
+    /// `take_message` / `take_event`)。違うのは経路だけで、解析器も状態も
+    /// 増やさない。
+    ///
+    /// セッションを一切見ないのが要点。画面経由は「観測に載っている
+    /// セッション」からしか拾えないので、**結び付く前・観測に載らない tick・
+    /// プロセスが終わった直後**に書かれた報告を落とす。ここは担当 ID だけで
+    /// 届くので落ちない。
+    ///
+    /// 戻りは 3 通り。呼び出し側 (`panel::drain_outbox`) はこれで
+    /// 「消す / 消す / 隔離する」を決める:
+    ///
+    /// | 戻り | 意味 | 置き場のファイル |
+    /// | --- | --- | --- |
+    /// | [`AcceptOutcome::Applied`] | 状態へ適用した | 消す |
+    /// | [`AcceptOutcome::Duplicate`] | 同じ報告が適用済み | 消す |
+    /// | `Err(理由)` | 意味として却下した | `rejected/` へ隔離 |
+    ///
+    /// **却下したものを重複台帳へ入れない。** 入れると、直して出し直した
+    /// 報告まで「もう見た」で捨てることになる (直したのに永久に届かない)。
+    /// 台帳へ入れるのは適用が成功した後だけ。
+    ///
+    /// 二重取り込みは構造化キー ([`SeenKey`]) が止める。画面と置き場の
+    /// 両方に同じ報告があっても、**先に来たほうだけ**が効く。
+    pub fn accept_outbox(
+        &mut self,
+        agent: &AgentId,
+        kind: super::outbox::Kind,
+        body: &str,
+        now: u64,
+    ) -> Result<AcceptOutcome, String> {
+        if !self.agents.iter().any(|a| a.id == *agent) {
+            return Err(format!("{agent} はこの Run の担当ではありません"));
+        }
+        if rp::looks_incomplete(body) {
+            return Err("JSON オブジェクトではありません".to_string());
+        }
+        let key = Self::seen_key(agent, kind, body);
+        if self.is_seen(&key) {
+            // 画面から先に取り込んでいた。**二度は効かせない**が、
+            // ファイルは片付けてよい (目的は果たされている)。
+            return Ok(AcceptOutcome::Duplicate);
+        }
+        let applied = match kind {
+            super::outbox::Kind::Result => self.take_result(agent, body),
+            super::outbox::Kind::Review => self.take_review(agent, body),
+            super::outbox::Kind::Message => self.take_message(agent, body),
+            super::outbox::Kind::Event => self.take_event(agent, body, now),
+        };
+        // **適用できたときだけ印を付ける。**
+        applied?;
+        self.mark_seen(key);
+        Ok(AcceptOutcome::Applied)
+    }
+
+    /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
+    ///
+    /// 黙って消さない。ファイル名と本文の担当が食い違った・上限まで読んでも
+    /// JSON にならなかった、はどれも「報告したのに何も起きない」に見える
+    /// ので、理由を時系列に 1 行残す。画面から読んだ報告の却下と同じ
+    /// `Rejected` に並べる (第 2 の記録場所を作らない)。
+    pub fn note_outbox_rejected(&mut self, agent: Option<AgentId>, why: String) {
+        self.log(TeamEventKind::Rejected, agent, None, why);
+    }
+
+    /// エージェントの直近の画面 (端末タブが「中身」を出すために使う)。
+    ///
+    /// **末尾から `lines` 行だけ**返す。全部返すと、盤面が毎フレーム
+    /// 4000 文字 × 体数を整形することになる。
+    pub fn preview_of(&self, agent: &AgentId, lines: usize) -> String {
+        let Some(buf) = self.previews.get(agent) else {
+            return String::new();
+        };
+        let kept: Vec<&str> = buf
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let from = kept.len().saturating_sub(lines);
+        kept[from..].join("\n")
+    }
+
+    /// **却下を記録して、その理由を返す。**
+    ///
+    /// 記録と戻り値の綴りを 1 か所に閉じる。2 か所で書くと、時系列に出る
+    /// 文と隔離の理由がずれる (どちらが本当か追えなくなる)。
+    fn reject(&mut self, agent: &AgentId, target: Option<AgentId>, why: String) -> String {
+        self.log(
+            TeamEventKind::Rejected,
+            Some(agent.clone()),
+            target,
+            why.clone(),
+        );
+        why
+    }
+
+    /// 「誰が・どの種類で・どの対象へ・何を」の構造化キー ([`SeenKey`])。
+    fn seen_key(agent: &AgentId, kind: super::outbox::Kind, body: &str) -> SeenKey {
+        let trimmed = body.trim();
+        let (digest, len) = body_digest(trimmed);
+        SeenKey {
+            agent: agent.clone(),
+            kind: kind.key().to_string(),
+            task: task_of_body(trimmed),
+            digest,
+            len,
+        }
+    }
+
+    /// もう取り込んだ塊か。**印は付けない** (受理が決まってから付ける)。
+    fn is_seen(&self, key: &SeenKey) -> bool {
+        self.seen_blocks.contains(key)
+    }
+
+    /// 取り込んだ印を付ける。上限 ([`SEEN_BLOCKS_CAP`]) を超えたら古い順に忘れる。
+    fn mark_seen(&mut self, key: SeenKey) {
+        if !self.seen_blocks.insert(key.clone()) {
+            return;
+        }
+        self.seen_block_order.push_back(key);
+        while self.seen_block_order.len() > SEEN_BLOCKS_CAP {
+            if let Some(old) = self.seen_block_order.pop_front() {
+                self.seen_blocks.remove(&old);
+            }
+        }
+    }
+
+    /// まだ取り込んでいない塊だけを返す (取り込んだ印も付ける)。
+    ///
+    /// **画面経路はここで印を付ける。** 画面のテキストは却下されても消えない
+    /// ので、印を付けないと毎 tick 同じ却下を積むことになる。置き場経路は
+    /// 逆に**受理が決まってから**付ける ([`Self::accept_outbox`]) — 却下した
+    /// 本文を印だけ付けて捨てると、直して出し直しても届かなくなる。
+    fn take_unseen(
+        &mut self,
+        agent: &AgentId,
+        kind: super::outbox::Kind,
+        blocks: Vec<String>,
+    ) -> Vec<String> {
+        let mut out = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let key = Self::seen_key(agent, kind, &b);
+            if self.is_seen(&key) {
+                continue;
+            }
+            self.mark_seen(key);
+            out.push(b);
+        }
+        out
+    }
+
+    /// このエージェントへ送った指示の文面 (echo 判定用)。
+    ///
+    /// **保存しない。** 指示は `(タスク, エージェント)` から決まるので、
+    /// 同じ入力から同じ文面が出る。持ち回すと「送った文面」と「今の文面」の
+    /// 2 つの真実ができて、再起動でずれる。
+    fn sent_instruction(&self, agent: &AgentId) -> Option<String> {
+        let task_id = self.agent(agent).and_then(|a| a.current_task)?;
+        let task = self.tasks.iter().find(|t| t.id == task_id)?.clone();
+        Some(self.instruction_for(&task, agent))
+    }
+
     /// 完了報告 1 件。
-    fn take_result(&mut self, agent: &AgentId, body: &str) {
+    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
         let doc = match rp::parse_result(body) {
             Ok(d) => d,
-            Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
-                    None,
-                    e.detail(),
-                );
-                return;
-            }
+            Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
         let task_id = doc.task_id;
         let Some(task) = self.tasks.iter().find(|t| t.id == task_id).cloned() else {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
+            return Err(self.reject(
+                agent,
                 None,
                 format!("報告のタスク #{task_id} は存在しません"),
-            );
-            return;
+            ));
         };
         // 担当していないタスクの報告は受け取らない。
         if task.assigned_agent.as_ref() != Some(agent) {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                Some(task_id_as_agent(&task)),
+            let target = task_id_as_agent(&task);
+            return Err(self.reject(
+                agent,
+                Some(target),
                 format!("#{task_id} はこのエージェントの担当ではありません"),
-            );
-            return;
+            ));
         }
 
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
         // は補助情報として持ち越すだけ。
-        let evidence = self.file_evidence(&task);
-        match rp::accept(doc, &task, &evidence) {
-            Ok(acc) => self.apply_accepted(agent, acc),
-            Err(e) => {
+        let (evidence, attribution) = self.file_evidence(&task);
+        // **帰属できないことを黙って捨てない。** 却下ではないので
+        // `Rejected` では残さない (正しく働いた担当が却下ログに並ぶのが
+        // 元の不具合)。人が時系列で追えるように、事実として 1 行残す。
+        //
+        // 理由は `file_evidence` が組み立てたものをそのまま出す。**同じ
+        // 事実を 2 か所で言い直さない** — 言い直すと必ず片方がずれる
+        // (実際に、測れた件数を数え直して 0 件と書きかけた)。
+        if !attribution.can_claim() {
+            let why = match &evidence {
+                rp::FileEvidence::Unmeasurable(w) | rp::FileEvidence::Unavailable(w) => w.clone(),
+                e => attribution
+                    .why(e.measured_paths().len())
+                    .unwrap_or_default(),
+            };
+            self.log(
+                TeamEventKind::AgentProgress,
+                Some(agent.clone()),
+                None,
+                format!("#{task_id} は実測を照合していません: {why}"),
+            );
+        }
+        // 受理の関門は 2 段: 報告の形と担当範囲 (`rp::accept`) と、
+        // Web の成果物なら読み込みの実在 (`web_gate`)。どちらで落ちても
+        // 本人へ同じ形で伝える。
+        let verdict = rp::accept(doc, &task, &evidence)
+            .map_err(|e| e.detail())
+            .and_then(|acc| match self.web_gate(&task, &acc) {
+                None => Ok(acc),
+                Some(why) => Err(why),
+            });
+        match verdict {
+            Ok(acc) => {
+                self.apply_accepted(agent, acc, attribution);
+                Ok(())
+            }
+            Err(detail) => {
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
+                let why = self.reject(
+                    agent,
                     None,
-                    format!("#{task_id} の完了報告を却下: {}", e.detail()),
+                    format!("#{task_id} の完了報告を却下: {detail}"),
                 );
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                     t.context.push(clamp_text(&format!(
-                        "前回の完了報告は却下されました: {}",
-                        e.detail()
+                        "前回の完了報告は却下されました: {detail}"
                     )));
                     t.context = clamp_list(std::mem::take(&mut t.context));
                     t.updated_at = now_secs();
                 }
                 self.dirty = true;
+                Err(why)
             }
         }
     }
 
-    fn apply_accepted(&mut self, agent: &AgentId, acc: rp::AcceptedResult) {
+    /// **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
+    ///
+    /// 静的なサイトには検証コマンドが無い (`Cargo.toml` も `package.json` も
+    /// 無い) ので、ここを通さないと「`index.html` が 404 を 2 本抱えたまま
+    /// 完了」が起きる (実機)。走査は速い (存在だけを見る) ので、Web の
+    /// ファイルに触る完了報告に限って**その場で**見る。コンソールの検査は
+    /// Chrome を起こす (数秒) ので、描画スレッドのここではしない —
+    /// `zai team check` と検証担当の手に置く。
+    fn web_gate(&self, task: &TeamTask, acc: &rp::AcceptedResult) -> Option<String> {
+        if acc.status != ReportedStatus::Completed {
+            return None;
+        }
+        let touches_web = task
+            .files
+            .iter()
+            .chain(acc.changed_files.iter())
+            .chain(acc.reported_files.iter())
+            .any(|f| super::webcheck::is_web_path(f));
+        if !touches_web {
+            return None;
+        }
+        match super::webcheck::scan(&self.workspace) {
+            Ok(bad) if bad.is_empty() => None,
+            Ok(bad) => Some(format!(
+                "読み込むと言ったファイルがありません: {}",
+                bad.iter().map(|d| d.detail()).collect::<Vec<_>>().join(" / ")
+            )),
+            // 測れないときは止めない (大きすぎる作業場)。
+            Err(_) => None,
+        }
+    }
+
+    fn apply_accepted(
+        &mut self,
+        agent: &AgentId,
+        acc: rp::AcceptedResult,
+        attribution: changeset::Attribution,
+    ) {
+        // **もう通り過ぎた報告は静かに見送る。**
+        //
+        // 遷移を試してから断られるのを待つと、断られた事実が台帳へ積まれる
+        // (実機で 1 回の再報告につき 2 行)。**試す前に**見分ける。
+        // 何を見送り、何を見送らないかは [`report_already_passed`] の doc。
+        if self
+            .tasks
+            .iter()
+            .any(|t| t.id == acc.task_id && report_already_passed(t.state, acc.status))
+        {
+            return;
+        }
         let now = now_secs();
         let max = self.run.max_attempts;
         let mut escalate: Option<(TaskId, String)> = None;
@@ -1881,7 +3303,17 @@ impl TeamRuntime {
         // **申告と実測の食い違いを黙って捨てない。** 前者は「何を変えたか
         // 把握していない」の印、後者は「やったつもりで何も変わっていない」
         // の印で、どちらも人が読むべき事実。
-        let (unreported, phantom) = acc.report_mismatch();
+        //
+        // **ただし帰属できないなら主張しない。** 担当範囲が宣言されておらず
+        // 隣でも書かれているとき、作業ツリーの差分をこの 1 人の成果と読むと
+        // 「隣の担当が書いたファイル」を食い違いに数える
+        // ([`changeset::Attribution`])。実測できていないのだから、申告との
+        // 差も測れていない。
+        let (unreported, phantom) = if attribution.can_claim() {
+            acc.report_mismatch()
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == acc.task_id) {
             t.last_summary = acc.summary.clone();
@@ -1976,23 +3408,8 @@ impl TeamRuntime {
 
         // **食い違いは事象としても残す。** タスクのコンテキストは次の担当が
         // 読むもので、こちらは人が時系列で追うためのもの。
-        if !unreported.is_empty() || !phantom.is_empty() {
-            let mut why = String::new();
-            if !unreported.is_empty() {
-                why.push_str(&format!("報告に無い変更: {}", unreported.join(", ")));
-            }
-            if !phantom.is_empty() {
-                if !why.is_empty() {
-                    why.push_str(" / ");
-                }
-                why.push_str(&format!("報告だけの変更: {}", phantom.join(", ")));
-            }
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                None,
-                format!("#{} の報告と実測が食い違います ({why})", acc.task_id),
-            );
+        if let Some(line) = mismatch_line(acc.task_id, attribution, &unreported, &phantom) {
+            self.log(TeamEventKind::Rejected, Some(agent.clone()), None, line);
         }
 
         // **ここでは先へ進めない。** 完了報告が意味するのは「実装が終わったと
@@ -2005,7 +3422,10 @@ impl TeamRuntime {
                 TeamEventKind::ValidationStarted,
                 Some(agent.clone()),
                 None,
-                format!("#{} の完了報告を受けました。検証はこちらで実行します", acc.task_id),
+                format!(
+                    "#{} の完了報告を受けました。検証はこちらで実行します",
+                    acc.task_id
+                ),
             );
         }
 
@@ -2032,7 +3452,7 @@ impl TeamRuntime {
     }
 
     /// レビュー報告 1 件。
-    fn take_review(&mut self, agent: &AgentId, body: &str) {
+    fn take_review(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
         // このエージェントが担当しているレビュータスクを探す。
         // **終わったレビュータスクを掴まない。** 同じ担当が同じ対象を 2 度
         // レビューする (差し戻し → 再レビュー) と、閉じた 1 本目が先に
@@ -2047,26 +3467,22 @@ impl TeamRuntime {
             })
             .cloned()
         else {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
+            return Err(self.reject(
+                agent,
                 None,
                 "レビュー報告が来ましたが、このエージェントはレビュー担当ではありません".into(),
-            );
-            return;
+            ));
         };
         let target_id = rev.review_of.unwrap_or(0);
         let parsed = reviewer::parse_review(body, target_id);
         let acc = match parsed {
             Ok(a) => a,
             Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
+                return Err(self.reject(
+                    agent,
                     None,
                     format!("レビュー報告を却下: {}", e.detail()),
-                );
-                return;
+                ))
             }
         };
 
@@ -2144,21 +3560,14 @@ impl TeamRuntime {
             );
         }
         self.dirty = true;
+        Ok(())
     }
 
     /// サブエージェントイベント 1 件。
-    fn take_event(&mut self, agent: &AgentId, body: &str, now: u64) {
+    fn take_event(&mut self, agent: &AgentId, body: &str, now: u64) -> Result<(), String> {
         let doc = match rp::parse_event(body) {
             Ok(d) => d,
-            Err(e) => {
-                self.log(
-                    TeamEventKind::Rejected,
-                    Some(agent.clone()),
-                    None,
-                    e.detail(),
-                );
-                return;
-            }
+            Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
         let known: Vec<(AgentId, Option<AgentId>)> = self
             .agents
@@ -2171,13 +3580,7 @@ impl TeamRuntime {
             .find(|t| t.assigned_agent.as_ref() == Some(agent) && !t.state.is_terminal())
             .map(|t| t.id);
         if let Err(e) = rp::check_event(&doc, &known, agent, reporter_task) {
-            self.log(
-                TeamEventKind::Rejected,
-                Some(agent.clone()),
-                None,
-                e.detail(),
-            );
-            return;
+            return Err(self.reject(agent, None, e.detail()));
         }
 
         if doc.kind.starts_with("sub_agent_") {
@@ -2244,6 +3647,7 @@ impl TeamRuntime {
             );
         }
         self.dirty = true;
+        Ok(())
     }
 
     /// 依存が済んだタスクを Ready にする。
@@ -2255,17 +3659,16 @@ impl TeamRuntime {
         for id in ready {
             // 遷移が断られたら**黙らない**。「なぜか Ready にならない」を
             // 追えるように理由をそのまま残す。
-            let refused = self
-                .tasks
-                .iter_mut()
-                .find(|t| t.id == id)
-                .and_then(|t| match sm::apply(t.state, TeamTaskState::Ready) {
-                    Ok(next) => {
-                        t.state = next;
-                        t.updated_at = now_secs();
-                        None
+            let refused =
+                self.tasks.iter_mut().find(|t| t.id == id).and_then(|t| {
+                    match sm::apply(t.state, TeamTaskState::Ready) {
+                        Ok(next) => {
+                            t.state = next;
+                            t.updated_at = now_secs();
+                            None
+                        }
+                        Err(e) => Some(e.detail()),
                     }
-                    Err(e) => Some(e.detail()),
                 });
             match refused {
                 Some(why) => self.log(
@@ -2592,6 +3995,37 @@ impl TeamRuntime {
         }
     }
 
+    /// **もう成り立っていないスケジューリング由来の判断を取り下げる。**
+    ///
+    /// 重なり・能力不足・レビュー役不在は「いまの配置」から導かれる話なので、
+    /// 配置が変われば理由ごと消える。積みっぱなしにすると、解決したあとも
+    /// 札だけが画面に残り、`retry` を押しても消えない (`Ready` のタスクへの
+    /// `retry` は状態を動かさないので、判断も掃除されない)。
+    ///
+    /// 人へ渡した (`NeedsUser`) タスクの札は残す — そこは人が動かす番で、
+    /// 勝手に消すと手が出せなくなる。
+    fn withdraw_settled(&mut self, standing: &BTreeSet<String>) {
+        let parked: BTreeSet<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == TeamTaskState::NeedsUser)
+            .map(|t| t.id)
+            .collect();
+        let before = self.decisions.len();
+        self.decisions.retain(|d| {
+            if !is_scheduling_key(&d.idempotency_key) {
+                return true;
+            }
+            if standing.contains(&d.idempotency_key) {
+                return true;
+            }
+            d.task_id.is_some_and(|t| parked.contains(&t))
+        });
+        if self.decisions.len() != before {
+            self.dirty = true;
+        }
+    }
+
     /// Ready なタスクを配る。**既存 `coordinator` が断ったら配らない。**
     fn dispatch(&mut self, out: &mut Vec<TeamEffect>) {
         let candidates: Vec<Candidate> = self
@@ -2622,13 +4056,18 @@ impl TeamRuntime {
         let depth = graph::critical_depth(&self.tasks);
         let plan = scheduler::plan_assignments(&self.tasks, &candidates, &depth);
 
+        // **この tick で本当に成り立っている理由**の鍵。ここに無い
+        // スケジューリング由来の判断は、下で撤回する。
+        let mut standing: BTreeSet<String> = BTreeSet::new();
+
         for u in &plan.unassigned {
             // 候補が居ないだけなら黙る (次の tick で解決しうる)。
-            // 重なりと「本人しか居ない」は人へ上げる価値がある。
+            // 重なりと「他に居ない」は人へ上げる価値がある。
             // **どのタスクの話かは必ず添える** (理由だけでは追えない)。
             let subject = u.task();
             match u {
                 scheduler::Unassigned::FileOverlap { .. } => {
+                    standing.insert(format!("file_scope_overlap:{subject}"));
                     self.raise(
                         DecisionKind::FileScopeOverlap,
                         Some(subject),
@@ -2638,14 +4077,32 @@ impl TeamRuntime {
                         vec!["reassign".into(), "reject".into()],
                     );
                 }
-                scheduler::Unassigned::ReviewerWouldBeAuthor(_) => {
-                    self.raise(
+                // **混んでいるだけなら黙る。** ほかの担当が終われば配れる
+                // ので、人がすることは何も無い。ここで判断を積むと、
+                // 勝手に解決したあとも消えない札が溜まる (実機で 5 件)。
+                scheduler::Unassigned::ReviewerWouldBeAuthor(_) => {}
+                // **待っても解決しない**ほうだけ人へ上げる。実装担当以外の
+                // エージェントがこの Run に 1 体も居ないので、レビューは
+                // 永久に配れない。
+                //
+                // **`Ready` のまま置く** (`CapsMissing` と違って人へ渡さない)。
+                // 必要な能力は計画で固定だが、**エージェントの数は増える**
+                // ので、この理由はひとりでに消えうる。`NeedsUser` へ落とすと
+                // スケジューラが二度と見ないため、増えても永久に止まったまま
+                // になる。`Ready` に留めておけば、毎 tick 判定し直して
+                // 解決した瞬間に札が下りる (`withdraw_settled`)。
+                scheduler::Unassigned::NoOtherReviewer(_) => {
+                    standing.insert(format!("no-other-reviewer:{subject}"));
+                    self.make_decision(
                         DecisionKind::NoCandidate,
                         Some(subject),
                         None,
                         u.detail(),
-                        "レビューには実装担当と別のセッションが要ります".into(),
+                        "並列数を増やしてレビュー役を足すか、レビュー無しで進めてください".into(),
                         vec!["retry".into(), "reject".into()],
+                        format!("no-other-reviewer:{subject}"),
+                        Vec::new(),
+                        None,
                     );
                 }
                 scheduler::Unassigned::CapsMissing { .. } => {
@@ -2661,6 +4118,7 @@ impl TeamRuntime {
                     }
                     // 鍵は `ReviewerWouldBeAuthor` と分ける (同じ種類・同じ
                     // タスクなので、共用すると片方の理由が黙って消える)。
+                    standing.insert(format!("caps-missing:{subject}"));
                     self.make_decision(
                         DecisionKind::NoCandidate,
                         Some(subject),
@@ -2679,6 +4137,8 @@ impl TeamRuntime {
                 scheduler::Unassigned::NoCandidate(_) => {}
             }
         }
+
+        self.withdraw_settled(&standing);
 
         let at = Instant::now();
         for a in plan.assignments {
@@ -2778,12 +4238,21 @@ impl TeamRuntime {
                 }
                 Err(refusal) => {
                     // 既存側が断った。**回避しない。**
-                    self.log(
-                        TeamEventKind::TaskBlocked,
-                        None,
-                        None,
-                        format!("#{} の割り当てを見送りました: {}", a.task, refusal.label()),
-                    );
+                    //
+                    // ただし**同じ理由を毎 tick 書かない**。断りは配置から
+                    // 導かれる話なので、配置が変わるまで同じ行が出続ける。
+                    // 実測では 2 秒ごとに 2 件積まれ、**台帳 500 件がこれだけ**に
+                    // なって他の記録が全部押し出された (計画も起動も伝言も
+                    // 消えて、人には何が起きたか一切追えない)。
+                    let mark = format!("{}:{}", a.task, refusal.label());
+                    if self.blocked_notes.insert(mark) {
+                        self.log(
+                            TeamEventKind::TaskBlocked,
+                            None,
+                            None,
+                            format!("#{} の割り当てを見送りました: {}", a.task, refusal.label()),
+                        );
+                    }
                     if let coordinator::AssignRefusal::FileOverlap { with, .. } = refusal {
                         self.raise(
                             DecisionKind::FileScopeOverlap,
@@ -2815,29 +4284,72 @@ impl TeamRuntime {
         }
     }
 
+    /// いま**別の担当**が手を入れているタスクの数。
+    ///
+    /// **安全側で数える。** 担当が付いていない進行中タスクも「別の担当」に
+    /// 数える — 数え落とすと、帰属できないのに帰属できると判定して
+    /// また誤った却下が出る。同じエージェントが 2 本持っているときだけ
+    /// 「同じ担当」として除く (その差分はどのみちこの人のもの)。
+    fn other_holders(&self, task: &TeamTask) -> usize {
+        let mine = task.assigned_agent.as_ref();
+        self.tasks
+            .iter()
+            .filter(|t| t.id != task.id && t.state.is_held())
+            .filter(|t| !matches!((mine, t.assigned_agent.as_ref()), (Some(a), Some(b)) if a == b))
+            .count()
+    }
+
     /// 完了報告の時点で、このタスクに帰属する変更を測る。
     ///
     /// **並列作業を切り分ける。** 「作業ツリーと HEAD の差分」をそのまま
     /// 成果にすると、隣のタスクの変更を自分のものとして数える。切り分けは
     /// 既存のファイル所有リースの担当範囲で行う (`changeset::attribute`)。
-    fn file_evidence(&self, task: &TeamTask) -> rp::FileEvidence {
+    ///
+    /// 担当範囲が 1 つも宣言されていないタスクには、その切り分けが当てられ
+    /// ない。同時に働いている担当が他に居るなら**帰属の根拠が無い**ので、
+    /// 測れなかったものとして返す ([`changeset::attribution`])。第 2 の戻り値
+    /// がその判定で、呼ぶ側は「食い違いを主張してよいか」に使う。
+    fn file_evidence(&self, task: &TeamTask) -> (rp::FileEvidence, changeset::Attribution) {
+        let attribution = changeset::attribution(task.files.len(), self.other_holders(task));
         #[cfg(test)]
         if let Some(e) = test_hooks::forced_evidence() {
-            return e;
+            return (e, attribution);
         }
+        // **「測る手立てが無い」と「測れるはずが失敗した」を分ける。**
+        // Git 管理下でないフォルダは直しようが無いので、そこで止めると
+        // **1 件も完了できない**。前者は通し、盤面が「実測なし」を出す。
+        let no_git = crate::git::discover_toplevel(&self.workspace).is_none();
+        let cannot_measure = |e: changeset::MeasureError| -> rp::FileEvidence {
+            if no_git {
+                rp::FileEvidence::Unmeasurable(e.detail())
+            } else {
+                rp::FileEvidence::Unavailable(e.detail())
+            }
+        };
         let Some(base) = task.baseline.as_ref() else {
-            return rp::FileEvidence::Unavailable(
-                changeset::MeasureError::NoBaseline(String::new()).detail(),
+            return (
+                cannot_measure(changeset::MeasureError::NoBaseline(String::new())),
+                attribution,
             );
         };
         let measured = match changeset::measure(&self.workspace, base) {
             Ok(v) => v,
-            Err(e) => return rp::FileEvidence::Unavailable(e.detail()),
+            Err(e) => return (cannot_measure(e), attribution),
         };
         let paths: Vec<String> = measured.into_iter().map(|c| c.path).collect();
         if task.files.is_empty() {
+            // **帰属できないなら、測れたことにしない。**
+            //
+            // 担当範囲が無いうえに隣でも書かれているとき、作業ツリーの差分を
+            // この 1 人の成果として台帳へ載せると「隣の担当が書いたファイル」
+            // が本人の変更として残り、申告との差が食い違いに化ける
+            // (実機で 6 件の誤った却下)。**通すが、隠さない** —
+            // `Unmeasurable` は完了を止めず、盤面が「実測なし」を出す。
+            if let Some(why) = attribution.why(paths.len()) {
+                return (rp::FileEvidence::Unmeasurable(why), attribution);
+            }
             // **担当範囲が無ければ「範囲外」も無い。** 測った事実だけ残す。
-            return rp::FileEvidence::NoScope { measured: paths };
+            return (rp::FileEvidence::NoScope { measured: paths }, attribution);
         }
         // **他人のものだと言い切れる範囲だけを除く。**
         //
@@ -2849,25 +4361,34 @@ impl TeamRuntime {
         // 「担当外を変更した完了報告は拒否する」という保証そのものを壊す。
         //
         // 所有の真実は**既存の Coordinator** が持っている
-        // ([`coordinator::occupies`] — `admit` が割り当ての可否に使うのと
-        // 同じ判定)。Team 側に 2 つ目の所有台帳を作らない。
+        // ([`coordinator::claimed`])。Team 側に 2 つ目の所有台帳を作らない。
+        //
+        // **`occupies` ではなく `claimed` を使う。** `occupies` は「いま
+        // 押さえているか」なので、書き終えて `Done` になった瞬間に範囲が
+        // 誰のものでもなくなる。作業ツリーの変更は完了しても消えないので、
+        // その後に報告した担当が「担当外を変更した」で落ちる (実機で 4 件)。
         //
         // 証明できないものは除かない = 担当外として上げる (fail-closed)。
-        // 見逃しより誤検知のほうが軽い — 誤検知は人が見れば分かるが、
-        // 見逃した違反は台帳に「担当内だけ」と残って誰も気付けない。
+        // 見逃しより誤検知のほうが軽い — と考えていたが、実機では誤検知が
+        // **Run そのものを止めた** (25 分・6 体で完了 0 件)。一度も配られて
+        // いないタスクの範囲は今までどおり誰のものでもないので、そちらの
+        // 見逃しは増えていない。
         let self_coord = task.coordinator_task;
         let others: Vec<String> = self
             .co
             .tasks()
             .iter()
-            .filter(|t| Some(t.id) != self_coord && coordinator::occupies(t))
+            .filter(|t| Some(t.id) != self_coord && coordinator::claimed(t))
             .flat_map(|t| t.files.clone())
             .collect();
         let (mine, out_of_scope) = changeset::attribute(&paths, &task.files, &others);
-        rp::FileEvidence::Measured {
-            mine: mine.into_iter().cloned().collect(),
-            out_of_scope: out_of_scope.into_iter().cloned().collect(),
-        }
+        (
+            rp::FileEvidence::Measured {
+                mine: mine.into_iter().cloned().collect(),
+                out_of_scope: out_of_scope.into_iter().cloned().collect(),
+            },
+            attribution,
+        )
     }
 
     /// タスクの指示文を作る。
@@ -2907,6 +4428,16 @@ impl TeamRuntime {
             workspace_root: "<ワークスペースルート>",
             upstream,
             forbidden_files: forbidden,
+            // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
+            // 届けられない相手を宛先の候補に出すと、断りが記録されるだけ。
+            outbox: self.outbox.clone(),
+            run_id: self.run.run_id.as_str(),
+            teammates: self
+                .agents
+                .iter()
+                .filter(|a| a.kind == AgentKind::ManagedSession && &a.id != agent)
+                .map(|a| (a.id.0.clone(), a.name.clone()))
+                .collect(),
         };
         super::prompt::for_task(&brief, &self.tasks)
     }
@@ -2982,9 +4513,8 @@ impl TeamRuntime {
             };
             t.updated_at = now_secs();
         }
-        self.decisions.retain(|d| {
-            !(d.kind == DecisionKind::StopAgents && d.task_id == Some(task))
-        });
+        self.decisions
+            .retain(|d| !(d.kind == DecisionKind::StopAgents && d.task_id == Some(task)));
         self.dirty = true;
     }
 
@@ -3144,6 +4674,15 @@ impl TeamRuntime {
     // ── 補助 ──
 
     /// 起動するエージェントの顔ぶれを決める (計画時に 1 回)。
+    ///
+    /// **計画が必要としている役割から編成する。**
+    /// 以前はリーダー以外を全員 `Implementer` の「Agent 1, 2, …」にしていた
+    /// ので、設計担当やテスト担当を選んでも**画面には実装担当しか並ばず**、
+    /// 「誰が何の担当なのか」がどこにも出なかった (役割を選ばせているのに
+    /// 選択が編成に効かない = 押せるのに何も起きないボタンと同じ嘘)。
+    ///
+    /// 順番は「まず計画にある役割を 1 体ずつ、余った枠は実装へ」。
+    /// 並列で効くのは実装なので、余りを実装に寄せる。
     fn plan_roster(&mut self) {
         let now = now_secs();
         let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(1);
@@ -3170,17 +4709,35 @@ impl TeamRuntime {
             created_at: now,
             last_activity_at: now,
         });
-        for i in 1..n {
+        let wanted = roster_roles(&self.tasks, &self.teams, n.saturating_sub(1));
+        // **1 体しか居ない役割に番号を付けない** (存在しない 2 体目を探させる)。
+        let mut total: BTreeMap<TeamRole, usize> = BTreeMap::new();
+        for r in &wanted {
+            *total.entry(*r).or_insert(0) += 1;
+        }
+        let mut seen: BTreeMap<TeamRole, usize> = BTreeMap::new();
+        for (i, role) in wanted.into_iter().enumerate() {
+            let i = i + 1;
+            // 役割に対応するレーンへ置く (無ければリーダーと同じレーン)。
             let team = self
                 .teams
-                .get(i % self.teams.len().max(1))
+                .iter()
+                .find(|t| t.lead_role == role)
+                .or_else(|| self.teams.first())
                 .map(|t| t.id.clone())
                 .unwrap_or_else(|| TeamId::new("implementation"));
             let id = AgentId::new(format!("agent-{i}"));
+            let seq = seen.entry(role).or_insert(0);
+            *seq += 1;
+            let seq = if total.get(&role).copied().unwrap_or(1) > 1 {
+                *seq
+            } else {
+                1
+            };
             self.agents.push(TeamAgent {
                 id: id.clone(),
-                name: format!("Agent {i}"),
-                role: TeamRole::Implementer,
+                name: agent_name(role, seq),
+                role,
                 team_id: team,
                 parent_id: Some(lead.clone()),
                 kind: AgentKind::ManagedSession,
@@ -3207,6 +4764,20 @@ impl TeamRuntime {
         target: Option<AgentId>,
         summary: String,
     ) {
+        let _ = self.log_to(kind, actor, target, summary);
+    }
+
+    /// [`log`] と同じだが、**積んだ出来事の ID を返す**。
+    ///
+    /// 伝言の配達は冪等キーに ID を要る (`manual:<agent>:<event_id>`)。
+    /// ID は Run と一緒に保存されるので、再起動をまたいでも重複しない。
+    fn log_to(
+        &mut self,
+        kind: TeamEventKind,
+        actor: Option<AgentId>,
+        target: Option<AgentId>,
+        summary: String,
+    ) -> EventId {
         let id = self.next_event_id;
         self.next_event_id += 1;
         self.events.push_back(TeamEvent {
@@ -3221,7 +4792,9 @@ impl TeamRuntime {
         while self.events.len() > EVENT_CAP {
             self.events.pop_front();
         }
+        self.snapshot_generation = self.snapshot_generation.saturating_add(1);
         self.dirty = true;
+        id
     }
 
     /// 判断を積む (同じ鍵のものは二重に積まない)。
@@ -3302,6 +4875,23 @@ impl TeamRuntime {
     }
 }
 
+/// **配置から導かれる判断**の鍵の頭。
+///
+/// この頭を持つ判断は「いまの配置ではこうなる」という*導出結果*なので、
+/// 配置が変われば黙って取り下げてよい ([`TeamRuntime::withdraw_settled`])。
+/// ここに無い判断 (停止承認・危険なコマンド・検証の実行許可…) は
+/// **人が答えるまで残す** — 勝手に消すと、答える手段が画面から消える。
+///
+/// 新しく配置由来の判断を足したら、必ずここへも足すこと。番人は
+/// `runtime_tests::配置から導く判断はすべて取り下げの対象`。
+pub(super) const SCHEDULING_KEYS: &[&str] =
+    &["file_scope_overlap:", "caps-missing:", "no-other-reviewer:"];
+
+/// [`SCHEDULING_KEYS`] のどれかで始まるか。
+fn is_scheduling_key(key: &str) -> bool {
+    SCHEDULING_KEYS.iter().any(|p| key.starts_with(p))
+}
+
 /// 承認の記録をいくつまで残すか。**上限が無いと、長い Run で無限に伸びる。**
 /// 1 タスク 1 検証回あたりコマンド数ぶんしか増えないので、十分に大きい。
 const APPROVAL_CAP: usize = 512;
@@ -3312,6 +4902,8 @@ pub struct RunOptions {
     pub run_id: String,
     pub spec_source: String,
     pub agent_count: usize,
+    /// どのエージェントで動かすか (プリセット名の一覧)。空なら「おまかせ」。
+    pub agent_presets: Vec<String>,
     pub max_attempts: u8,
     pub review_required: bool,
     /// **この Run にだけ効く安全側の設定。** 既存のグローバル設定は
@@ -3341,6 +4933,7 @@ impl Default for RunOptions {
         Self {
             run_id: new_run_id(),
             spec_source: String::new(),
+            agent_presets: Vec::new(),
             agent_count: 4,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             review_required: true,
@@ -3359,6 +4952,41 @@ fn work_to_session_state(w: AgentWorkState) -> SessionState {
         AgentWorkState::Unknown => SessionState::Unknown,
         _ => SessionState::Working,
     }
+}
+
+/// 申告と実測の食い違いを 1 行にする。**純関数** — 表で固定できる。
+///
+/// **帰属できないときは何も言わない** (`None`)。実機の Run (6 体が同じ
+/// ワークスペース・計画に `files` が 1 つも無い) では、正しく働いた担当が
+/// この 1 行で却下ログに並んでいた:
+///
+/// ```text
+/// #3 の報告と実測が食い違います (報告に無い変更: index.html, main.js, output/browser_verified.png, plan.md)
+/// ```
+///
+/// 4 つのうち #3 が書いたのはその一部で、残りは隣の担当のもの。担当範囲が
+/// 宣言されていない以上こちらにその区別は付かないので、**食い違いを主張
+/// する根拠が無い**。帰属できるときは今までどおり 1 字も変えずに出す。
+fn mismatch_line(
+    task_id: TaskId,
+    attribution: changeset::Attribution,
+    unreported: &[String],
+    phantom: &[String],
+) -> Option<String> {
+    if !attribution.can_claim() || (unreported.is_empty() && phantom.is_empty()) {
+        return None;
+    }
+    let mut why = String::new();
+    if !unreported.is_empty() {
+        why.push_str(&format!("報告に無い変更: {}", unreported.join(", ")));
+    }
+    if !phantom.is_empty() {
+        if !why.is_empty() {
+            why.push_str(" / ");
+        }
+        why.push_str(&format!("報告だけの変更: {}", phantom.join(", ")));
+    }
+    Some(format!("#{task_id} の報告と実測が食い違います ({why})"))
 }
 
 /// 却下ログで「誰の担当か」を出すための小道具。
@@ -3410,5 +5038,980 @@ pub mod test_hooks {
 
     pub(super) fn forced_evidence() -> Option<FileEvidence> {
         EVIDENCE.with(|c| c.borrow().clone())
+    }
+}
+
+/// **帰属できないときに食い違いを主張しない**ことの番人。
+///
+/// 入力は実機の Run で実際に却下ログへ並んだ文言そのもの。ソースの文字列を
+/// 眺めるのではなく、**その行を作った関数へ同じ材料を入れ直して**確かめる。
+#[cfg(test)]
+mod attribution_guard_tests {
+    use super::*;
+
+    /// 実機 (6 体が同じワークスペース・計画に `files` が 1 つも無い) で
+    /// 正しく働いた担当に対して出てしまった却下ログ。
+    const REAL_MISMATCH_LINES: [&str; 2] = [
+        "#3 の報告と実測が食い違います (報告に無い変更: index.html, main.js, output/browser_verified.png, plan.md)",
+        "#1 の報告と実測が食い違います (報告に無い変更: main.js, plan.md, styles.css)",
+    ];
+
+    /// 却下ログ 1 行から `(タスク ID, 報告に無い変更)` を読み解く。
+    fn parse_mismatch(line: &str) -> (TaskId, Vec<String>) {
+        let id = line
+            .trim_start_matches('#')
+            .split_once(' ')
+            .and_then(|(n, _)| n.parse::<TaskId>().ok())
+            .unwrap_or_else(|| panic!("タスク ID を読めない: {line}"));
+        let files: Vec<String> = line
+            .split_once("報告に無い変更: ")
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(list, _)| list.split(", ").map(|s| s.to_string()).collect())
+            .unwrap_or_else(|| panic!("ファイル一覧を読めない: {line}"));
+        (id, files)
+    }
+
+    #[test]
+    fn 帰属できないなら食い違いを主張しない() {
+        for line in REAL_MISMATCH_LINES {
+            let (id, files) = parse_mismatch(line);
+            assert!(files.len() >= 3, "入力を読み違えている: {files:?}");
+
+            // 実機と同じ形 — 担当範囲は 1 つも宣言されておらず、隣でも
+            // 5 体が同時に書いている。この差分を 1 人へ帰属する根拠は無い。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(0, 5), &files, &[]),
+                None,
+                "帰属できないのに食い違いを主張した: {line}"
+            );
+
+            // **検査は弱めない。** 担当範囲が宣言されていれば、同じ材料から
+            // これまでどおり 1 字も変えずに記録する。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(2, 5), &files, &[]).as_deref(),
+                Some(line),
+                "帰属できるのに検出しなくなった"
+            );
+            // 独りで働いているときも同じ (作業ツリーの差分はこの人のもの)。
+            assert_eq!(
+                mismatch_line(id, changeset::attribution(0, 0), &files, &[]).as_deref(),
+                Some(line),
+                "独りで働いているのに検出しなくなった"
+            );
+        }
+    }
+
+    #[test]
+    fn 帰属できないなら申告だけの変更も主張しない() {
+        // 帰属できないときの実測は空になるので、素通しすると**自己申告の
+        // すべて**が「報告だけの変更」に化ける — 却下ログの文面が変わる
+        // だけで、誤検知は 1 件も減らない。
+        let phantom = vec!["main.js".to_string(), "plan.md".to_string()];
+        assert_eq!(
+            mismatch_line(1, changeset::attribution(0, 5), &[], &phantom),
+            None,
+            "実測できていないのに「報告だけの変更」と言った"
+        );
+        // 帰属できるときは今までどおり出す。
+        assert_eq!(
+            mismatch_line(1, changeset::attribution(0, 0), &[], &phantom).as_deref(),
+            Some("#1 の報告と実測が食い違います (報告だけの変更: main.js, plan.md)")
+        );
+        // 両方あるときの並びも変えない。
+        let both = mismatch_line(
+            7,
+            changeset::attribution(1, 0),
+            &["a.rs".to_string()],
+            &["b.rs".to_string()],
+        );
+        assert_eq!(
+            both.as_deref(),
+            Some("#7 の報告と実測が食い違います (報告に無い変更: a.rs / 報告だけの変更: b.rs)")
+        );
+    }
+
+    #[test]
+    fn 食い違いが無ければ何も残さない() {
+        for att in [
+            changeset::attribution(1, 0),
+            changeset::attribution(0, 0),
+            changeset::attribution(0, 3),
+        ] {
+            assert_eq!(mismatch_line(1, att, &[], &[]), None, "{att:?}");
+        }
+    }
+}
+
+/// **同じ報告がもう一度届いても、台帳を却下で埋めない**ことの番人。
+///
+/// 入力は実機の Run にそのまま並んだ 4 行 — `#2` が `Reviewing` にいる
+/// ところへ、同じ完了報告が 2 度届いた。ソースの文字列を眺めるのではなく、
+/// **その行を作った経路へ同じ材料を入れ直して**確かめる。
+#[cfg(test)]
+mod stale_report_tests {
+    use super::super::testkit;
+    use super::*;
+
+    /// 実機の台帳に並んだ 4 行そのもの (時刻は落としてある)。
+    /// **1 回の再報告につき 2 行**が、2 回ぶん。
+    const REAL_REJECTED_LINES: [&str; 4] = [
+        "#2 を reviewing から running へは進められません (状態機械が拒否)",
+        "#2 を reviewing から validating へは進められません (状態機械が拒否)",
+        "#2 を reviewing から running へは進められません (状態機械が拒否)",
+        "#2 を reviewing から validating へは進められません (状態機械が拒否)",
+    ];
+
+    const AGENT: &str = "implementer-1";
+
+    /// 実機と同じ完了報告 1 通。**毎回まったく同じ文面**が届く。
+    ///
+    /// [`TeamRuntime::take_result`] が受け取るのは
+    /// [`rp::extract_blocks`] が囲みを外した後の中身なので、ここも中身
+    /// (JSON) だけを組み立てる。囲みが外れることは `rp` の番人の担当。
+    fn report(task: TaskId, agent: &str) -> String {
+        let body = format!(
+            "{{\"task_id\":{task},\"agent_id\":\"{agent}\",\
+             \"status\":\"completed\",\"summary\":\"実装しました\",\
+             \"changed_files\":[],\
+             \"validation\":[{{\"command\":\"cargo test\",\"exit_code\":0}}],\
+             \"blockers\":[]}}"
+        );
+        // 実機は囲みつきで画面に出る。**同じ 1 通**であることを、
+        // 取り出しを通して確かめてから使う。
+        let wrapped = format!("{}\n{body}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+        let mut blocks = rp::extract_blocks(&wrapped, rp::RESULT_OPEN, rp::RESULT_CLOSE);
+        assert_eq!(blocks.len(), 1, "報告を 1 通として取り出せない");
+        blocks.remove(0)
+    }
+
+    /// 実機と同じ形の Run (タスク 2 件)。
+    ///
+    /// **実 `~/.zaivern` には触れない** — ワークスペースは一時ディレクトリで、
+    /// 実測は [`test_hooks`] で差し替えるので git も呼ばない。
+    fn run_with_two_tasks() -> TeamRuntime {
+        let ws = crate::test_util::unique_temp_dir("zaivern-team-test", "stale-report");
+        let plan = TeamPlan {
+            goal: testkit::goal(),
+            teams: vec![TeamGroup {
+                id: TeamId::new("implementation"),
+                name: "実装".to_string(),
+                lead_role: TeamRole::Implementer,
+            }],
+            tasks: vec![testkit::task(1, "t1", &[]), testkit::task(2, "t2", &[])],
+        };
+        TeamRuntime::from_plan(plan, ws, RunOptions::default())
+    }
+
+    /// 担当と状態を、確かめたい局面へ合わせる。
+    fn put(rt: &mut TeamRuntime, task: TaskId, agent: &str, state: TeamTaskState) {
+        if let Some(t) = rt.tasks.iter_mut().find(|t| t.id == task) {
+            t.assigned_agent = Some(AgentId::new(agent));
+            t.state = state;
+        }
+    }
+
+    /// 溜まった拒否を台帳へ落としてから、`(拒否した遷移, 却下)` を数える。
+    fn counts(rt: &mut TeamRuntime) -> (usize, usize) {
+        rt.drain_rejections();
+        let rejected = rt
+            .events
+            .iter()
+            .filter(|e| e.kind == TeamEventKind::Rejected)
+            .count();
+        (rt.rejected_transitions(), rejected)
+    }
+
+    /// 実測を固定する (git を呼ばせない)。担当範囲は空・同時作業も無いので
+    /// 帰属できる = 食い違いの主張も出ない。
+    fn fix_evidence() {
+        test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+            measured: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn 先へ進んだタスクへの再報告で台帳を埋めない() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        let body = report(2, AGENT);
+
+        // 1 通目 — 実装中に届く。これは効いて、検証回が始まる。
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        let _ = rt.take_result(&agent, &body);
+        assert_eq!(
+            rt.task(2).map(|t| t.state),
+            Some(TeamTaskState::Validating),
+            "1 通目が効いていない (この実験は実機の局面を再現できていない)"
+        );
+        assert_eq!(counts(&mut rt), (0, 0), "1 通目で却下が出た");
+
+        // 検証が済んでレビューへ渡った — ここが実機の `#2` の局面。
+        rt.set_state_for_test(2, TeamTaskState::Reviewing);
+
+        // **同じ報告が、もう一度・さらにもう一度届く。**
+        for _ in 0..2 {
+            let _ = rt.take_result(&agent, &body);
+        }
+        assert_eq!(
+            rt.task(2).map(|t| t.state),
+            Some(TeamTaskState::Reviewing),
+            "見送るはずの報告がタスクを動かした"
+        );
+        assert_eq!(
+            counts(&mut rt),
+            (0, 0),
+            "通り過ぎた報告で台帳へ書いた (実機ではここに {} 行並んだ)",
+            REAL_REJECTED_LINES.len()
+        );
+        // 実機で並んだ文面が 1 行も残っていないこと。
+        for line in REAL_REJECTED_LINES {
+            assert!(
+                !rt.events.iter().any(|e| e.summary == line),
+                "実機と同じ行が残っている: {line}"
+            );
+        }
+        test_hooks::clear();
+    }
+
+    #[test]
+    fn まだ配っていないタスクへの完了報告は今までどおり記録する() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        // 担当だけ結び付いていて、まだ配っていない (`Pending`)。
+        put(&mut rt, 1, AGENT, TeamTaskState::Pending);
+        let _ = rt.take_result(&agent, &report(1, AGENT));
+        let (transitions, _) = counts(&mut rt);
+        assert_eq!(
+            transitions, 2,
+            "配る前の完了報告まで見送った (本物の異常が消える)"
+        );
+        assert_eq!(
+            rt.task(1).map(|t| t.state),
+            Some(TeamTaskState::Pending),
+            "配る前のタスクが報告だけで動いた"
+        );
+        test_hooks::clear();
+    }
+
+    #[test]
+    fn 完了したタスクへの報告は今までどおり記録する() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        // 終端へ遅れて届いた報告。**ここは見送らない** —
+        // `runtime_tests::断られた遷移は黙殺せず記録に残す` と対になる。
+        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
+        let _ = rt.take_result(&agent, &report(2, AGENT));
+        let (transitions, _) = counts(&mut rt);
+        assert_eq!(transitions, 2, "完了したタスクへの報告まで見送った");
+        assert_eq!(
+            rt.task(2).map(|t| t.state),
+            Some(TeamTaskState::Completed),
+            "終端から動いた"
+        );
+        test_hooks::clear();
+    }
+
+    #[test]
+    fn 別の担当からの報告は見送らない() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        // **通り過ぎた状態でも**、担当違いは却下として残る
+        // (見分けは受理より後にあるので、担当の検査を素通りしない)。
+        put(&mut rt, 2, AGENT, TeamTaskState::Reviewing);
+        let other = AgentId::new("implementer-9");
+        let _ = rt.take_result(&other, &report(2, "implementer-9"));
+        let (transitions, rejected) = counts(&mut rt);
+        assert_eq!(transitions, 0, "担当違いなのに遷移を試みた");
+        assert_eq!(rejected, 1, "担当違いの報告を黙って捨てた");
+        test_hooks::clear();
+    }
+
+    /// **状態 × 報告の種類 → 記録するか**を表で固定する。
+    ///
+    /// 見送るのは「レビューへ渡した後」の 3 つだけ。ここを広げると
+    /// 本物の異常まで消えるので、増減は必ずこの表の変更として現れる。
+    #[test]
+    fn 見送る状態を表で固定する() {
+        use TeamTaskState as S;
+        const TABLE: [(S, bool); 11] = [
+            (S::Pending, false),
+            (S::Ready, false),
+            (S::Assigned, false),
+            (S::Running, false),
+            (S::Blocked, false),
+            (S::Validating, false),
+            (S::Reviewing, true),
+            (S::RevisionRequired, true),
+            (S::Failed, false),
+            // **終端は含めない。** 完了したタスクへ遅れて届いた報告を
+            // 断ったことは、これまでどおり記録に残す
+            // (`runtime_tests::断られた遷移は黙殺せず記録に残す`)。
+            (S::Completed, false),
+            (S::NeedsUser, false),
+        ];
+        // 表が状態を 1 つ残らず覆っていること (状態を足したら必ず落ちる)。
+        assert_eq!(TABLE.len(), S::ALL.len(), "表と状態の数が合わない");
+        for s in S::ALL {
+            assert!(TABLE.iter().any(|(x, _)| *x == s), "{} が表に無い", s.key());
+        }
+        for (state, skip) in TABLE {
+            for status in [
+                ReportedStatus::Completed,
+                ReportedStatus::Blocked,
+                ReportedStatus::Failed,
+            ] {
+                assert_eq!(
+                    report_already_passed(state, status),
+                    skip,
+                    "{} × {status:?}",
+                    state.key()
+                );
+            }
+        }
+    }
+}
+
+/// **止まっているのに誰も異常と言わない**ことの番人。
+///
+/// 入力は実機の Run そのもの — 6 体とも生きていて、画面には TUI が出ていて、
+/// スピナーと経過秒だけが動き、28 分どのタスクも進まない。以前はこの入力で
+/// `last_activity_at` が毎 tick 更新され、停滞は**構造的に**検知できなかった。
+///
+/// 時刻は全部**引数で渡す論理時刻**である。実時間で線を引くと、負荷の谷と山で
+/// 必ず嘘の赤が出る (このリポジトリで実績がある)。
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    /// 実機の画面。**スピナーの字形と経過秒とトークン数だけが動く。**
+    fn spinning(sec: u64) -> String {
+        const GLYPHS: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+        format!(
+            "{} Thinking… ({sec}s · {} tokens · esc to interrupt)\n\n> \n",
+            GLYPHS[(sec % 4) as usize],
+            300 + sec * 7
+        )
+    }
+
+    /// 本当に進んだ画面 (行が増える)。
+    /// **本当に進んでいる画面。** 実機のエージェントは、道具を使うたびに
+    /// **行が増える** (`● Read(...)` / `● Edit(...)` が積まれる)。
+    /// 桁だけが違う同じ行を出し続けるのは、スピナーと経過秒の再描画である。
+    fn working(step: u64) -> String {
+        let mut s = String::from("⠋ Working… (0s)\n");
+        for i in 1..=step {
+            s.push_str(&format!(
+                "● Read(src/auth/mod_{}.rs)\n",
+                "x".repeat(i as usize)
+            ));
+        }
+        s.push_str("\n> \n");
+        s
+    }
+
+    fn obs_of(now: u64, rows: &[(SessionId, String)]) -> Observation {
+        Observation {
+            now,
+            sessions: rows
+                .iter()
+                .map(|(id, text)| SessionObs {
+                    id: *id,
+                    title: format!("agent{id}"),
+                    provider: "claude".into(),
+                    state: SessionState::Idle,
+                    text: text.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn rows_of(sessions: &[SessionId], text: &str) -> Vec<(SessionId, String)> {
+        sessions.iter().map(|s| (*s, text.to_string())).collect()
+    }
+
+    /// 担当が付いて動き出した Run と、そのセッション一覧。
+    ///
+    /// **実 `~/.zaivern` には触れない** — `runtime_tests::started` は
+    /// 一時的な作業フォルダしか使わず、実測の入口は `test_hooks` で
+    /// 差し替えてある (git も呼ばない)。
+    ///
+    /// 最後に 1 tick 余分に回して**担当の作業状態を落ち着かせる**。
+    /// 割り当ての tick では `sync_sessions` が先に走るので、`Working` へ
+    /// 変わるのは次の tick になる (その 1 回だけは正当な活動更新)。
+    fn dispatched() -> (TeamRuntime, Vec<SessionId>) {
+        let mut rt = super::super::runtime_tests::started(4);
+        let eff = rt.tick(&obs_of(1, &[]));
+        let mut sessions = Vec::new();
+        let mut next = 1;
+        for e in &eff {
+            if let TeamEffect::StartAgent(s) = e {
+                rt.bind_session(&s.agent_id, next, None);
+                sessions.push(next);
+                next += 1;
+            }
+        }
+        assert!(!sessions.is_empty(), "担当が 1 体も起きない");
+        rt.tick(&obs_of(2, &rows_of(&sessions, &spinning(0))));
+        rt.tick(&obs_of(3, &rows_of(&sessions, &spinning(0))));
+        assert!(
+            rt.tasks
+                .iter()
+                .any(|t| matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)),
+            "タスクが 1 件も配られない"
+        );
+        (rt, sessions)
+    }
+
+    /// 停滞の促しだけを拾う (人の指示・伝言と混ぜない)。
+    fn nudges_to(effects: &[TeamEffect]) -> Vec<AgentId> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                TeamEffect::SendManualInstruction { agent, text, .. }
+                    if text.contains("まだ報告されていません") =>
+                {
+                    Some(agent.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stop_requests(rt: &TeamRuntime) -> Vec<TaskId> {
+        rt.decisions
+            .iter()
+            .filter(|d| d.kind == DecisionKind::StopAgents)
+            .filter_map(|d| d.task_id)
+            .collect()
+    }
+
+    /// 静かな画面のまま `mins` 分ぶん回し、その間に出た促しを返す。
+    fn run_quiet(rt: &mut TeamRuntime, sessions: &[SessionId], mins: u64) -> Vec<AgentId> {
+        let mut nudged = Vec::new();
+        for t in 1..=mins {
+            let now = 3 + t * 60;
+            let eff = rt.tick(&obs_of(now, &rows_of(sessions, &spinning(now))));
+            nudged.extend(nudges_to(&eff));
+        }
+        nudged
+    }
+
+    // ── 指紋 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn スピナーと経過秒だけの動きは進捗ではない() {
+        assert_eq!(
+            screen_fingerprint(&spinning(12)),
+            screen_fingerprint(&spinning(13)),
+            "スピナーと数字だけの差で指紋が変わってはいけない"
+        );
+        assert_ne!(
+            screen_fingerprint(&working(1)),
+            screen_fingerprint(&working(2)),
+            "行が増えたら指紋は変わる"
+        );
+        // **空でないこと**は活動ではない — どちらも空でないのに同じ指紋。
+        assert!(!spinning(12).trim().is_empty());
+        assert!(!spinning(13).trim().is_empty());
+    }
+
+    // ── snapshot 無効化 ──
+
+    #[test]
+    fn snapshot世代は正規化画面が変わったときだけ進む() {
+        let (mut rt, sessions) = dispatched();
+        let target_session = sessions[0];
+        let target = rt
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == Some(target_session))
+            .map(|agent| agent.id.clone())
+            .expect("対象エージェント");
+        let generation = rt.snapshot_generation();
+        let preview = rt.preview_of(&target, 20);
+        let activity = rt.agent(&target).unwrap().last_activity_at;
+
+        // スピナー・経過秒・トークン数だけの差は静止画と同じ。
+        rt.sync_sessions(&obs_of(10, &rows_of(&sessions, &spinning(12))));
+        assert_eq!(rt.snapshot_generation(), generation);
+        assert_eq!(rt.preview_of(&target, 20), preview);
+        assert_eq!(rt.agent(&target).unwrap().last_activity_at, activity);
+
+        // 道具の行が増えたら preview と activity は更新し、世代は
+        // Agent 数ではなく観測バッチ 1 回ぶんだけ進む。
+        let rows: Vec<(SessionId, String)> = sessions
+            .iter()
+            .map(|session| {
+                (
+                    *session,
+                    if *session == target_session {
+                        working(1)
+                    } else {
+                        spinning(0)
+                    },
+                )
+            })
+            .collect();
+        rt.sync_sessions(&obs_of(11, &rows));
+        assert_eq!(rt.snapshot_generation(), generation + 1);
+        assert!(rt
+            .preview_of(&target, 20)
+            .contains("Read(src/auth/mod_x.rs)"));
+        assert_eq!(rt.agent(&target).unwrap().last_activity_at, 11);
+    }
+
+    #[test]
+    fn snapshot世代はsession状態とproviderの変化を1回に畳む() {
+        let (mut rt, sessions) = dispatched();
+        let target_session = sessions[0];
+        let target = rt
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == Some(target_session))
+            .map(|agent| agent.id.clone())
+            .expect("対象エージェント");
+        let generation = rt.snapshot_generation();
+        let observation = Observation {
+            now: 20,
+            sessions: sessions
+                .iter()
+                .map(|session| SessionObs {
+                    id: *session,
+                    title: format!("agent{session}"),
+                    provider: if *session == target_session {
+                        "codex".into()
+                    } else {
+                        "claude".into()
+                    },
+                    state: if *session == target_session {
+                        SessionState::WaitingApproval
+                    } else {
+                        SessionState::Idle
+                    },
+                    text: spinning(0),
+                })
+                .collect(),
+        };
+
+        rt.sync_sessions(&observation);
+        let agent = rt.agent(&target).unwrap();
+        assert_eq!(rt.snapshot_generation(), generation + 1);
+        assert_eq!(agent.provider, "codex");
+        assert_eq!(agent.state, AgentWorkState::WaitingApproval);
+        assert_eq!(agent.last_activity_at, 20);
+    }
+
+    // ── 予算 ──
+
+    #[test]
+    fn 予算は観測が伸びれば伸びる() {
+        let floor = 180;
+        assert_eq!(stall_budget_secs(0, floor), floor, "観測が無ければ下限");
+        assert_eq!(
+            stall_budget_secs(10, floor),
+            floor,
+            "短い観測では下限のまま"
+        );
+        assert_eq!(
+            stall_budget_secs(400, floor),
+            400 * STALL_QUIET_FACTOR,
+            "観測が下限を超えたら、そちらへ伸びる"
+        );
+        // **固定の予算ではない**ことを 2 点の比較で固定する。
+        assert!(stall_budget_secs(1_000, floor) > stall_budget_secs(400, floor));
+    }
+
+    #[test]
+    fn 促した巡の静けさは学習しない() {
+        let mut w = StallWatch::default();
+        w.observe(1, 10);
+        // 促していない巡: 100 秒静かだった後に動いた → 学習する。
+        w.observe(2, 110);
+        assert_eq!(w.longest_quiet, 100);
+        // 促した巡: こちらが打ち込んだ文字で画面が動く → 学習しない。
+        w.nudged_at = Some(150);
+        w.observe(3, 900);
+        assert_eq!(
+            w.longest_quiet, 100,
+            "促しのエコーを「この担当はこれだけ静かでも働く」と学習してはいけない"
+        );
+    }
+
+    // ── はしごの表 ──────────────────────────────────────────────────
+
+    #[test]
+    fn 停滞のはしごを表で固定する() {
+        let base = StallInput {
+            quiet_secs: 0,
+            longest_quiet_secs: 0,
+            floor_secs: 180,
+            nudged: false,
+            since_nudge_secs: 0,
+            rounds: 0,
+            max_rounds: STALL_MAX_ROUNDS,
+        };
+        // (静けさ, 観測した最長, 促し済み, 促してから, 巡) → 段
+        let table: [(u64, u64, bool, u64, u8, StallVerdict); 7] = [
+            (179, 0, false, 0, 0, StallVerdict::Working),
+            (180, 0, false, 0, 0, StallVerdict::Nudge),
+            // 観測が伸びていれば、同じ静けさでもまだ働いている扱い。
+            (180, 400, false, 0, 0, StallVerdict::Working),
+            (1_680, 400, false, 0, 0, StallVerdict::Nudge),
+            // 促した直後は待つ (打ち込んだぶんで画面が動くため)。
+            (200, 0, true, 10, 0, StallVerdict::Working),
+            (400, 0, true, 200, 0, StallVerdict::Reclaim),
+            (400, 0, true, 200, 1, StallVerdict::Escalate),
+        ];
+        for (quiet, longest, nudged, since, rounds, want) in table {
+            let got = judge_stall(StallInput {
+                quiet_secs: quiet,
+                longest_quiet_secs: longest,
+                nudged,
+                since_nudge_secs: since,
+                rounds,
+                ..base
+            });
+            assert_eq!(
+                got, want,
+                "quiet={quiet} longest={longest} nudged={nudged} since={since} rounds={rounds}"
+            );
+        }
+    }
+
+    // ── 実機そのもの ────────────────────────────────────────────────
+
+    #[test]
+    fn 画面が空でないだけでは活動にならない() {
+        let (mut rt, sessions) = dispatched();
+        let before: Vec<(AgentId, u64)> = rt
+            .agents
+            .iter()
+            .map(|a| (a.id.clone(), a.last_activity_at))
+            .collect();
+        run_quiet(&mut rt, &sessions, 28);
+        let after: Vec<(AgentId, u64)> = rt
+            .agents
+            .iter()
+            .map(|a| (a.id.clone(), a.last_activity_at))
+            .collect();
+        assert_eq!(
+            before, after,
+            "画面が空でないだけで last_activity_at が進んではいけない"
+        );
+    }
+
+    #[test]
+    fn 二十八分変わらない担当は促されて回収要求まで進む() {
+        let (mut rt, sessions) = dispatched();
+        let nudged = run_quiet(&mut rt, &sessions, 28);
+        assert!(!nudged.is_empty(), "28 分止まっているのに誰も促されない");
+        let mut uniq = nudged.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            nudged.len(),
+            "同じ担当へ促しを何度も送っている: {nudged:?}"
+        );
+        assert!(
+            !stop_requests(&rt).is_empty(),
+            "促しても動かないのに回収要求が 1 件も出ない"
+        );
+    }
+
+    #[test]
+    fn 促した直後には回収しない() {
+        let (mut rt, sessions) = dispatched();
+        // 下限 (180 秒) は越えるが、促してからの猶予は越えない長さ。
+        let nudged = run_quiet(&mut rt, &sessions, 5);
+        assert!(!nudged.is_empty(), "下限を越えたのに促していない");
+        assert!(
+            stop_requests(&rt).is_empty(),
+            "促した直後に回収まで進んではいけない"
+        );
+    }
+
+    #[test]
+    fn 生きている担当のタスクを勝手に配り直さない() {
+        let (mut rt, sessions) = dispatched();
+        run_quiet(&mut rt, &sessions, 60);
+        let stops = stop_requests(&rt);
+        assert!(!stops.is_empty(), "回収要求が出ていない");
+        for tid in &stops {
+            let t = rt.task(*tid).expect("タスクが居る");
+            assert!(
+                t.reassign_pending,
+                "#{tid} に停止待ちの印が無いと、承認しても配り直せない"
+            );
+            // **停止が確認できるまで担当は外さない** (旧担当がまだ編集して
+            // いるかもしれない — `TeamAction::ReassignTask` と同じ約束)。
+            assert!(
+                t.assigned_agent.is_some(),
+                "#{tid} の担当を、停止を確認する前に外している"
+            );
+            assert!(
+                matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running),
+                "#{tid} を勝手に Ready へ戻している"
+            );
+        }
+    }
+
+    #[test]
+    fn 回収を断られ続けたら人へ上げてそこで止まる() {
+        let (mut rt, sessions) = dispatched();
+        for t in 1..=400u64 {
+            let now = 3 + t * 60;
+            rt.tick(&obs_of(now, &rows_of(&sessions, &spinning(now))));
+            // 人が「止めない」と答え続ける (印が下りて、はしごが次の巡へ)。
+            let pending: Vec<EventId> = rt
+                .decisions
+                .iter()
+                .filter(|d| d.kind == DecisionKind::StopAgents && d.task_id.is_some())
+                .map(|d| d.id)
+                .collect();
+            for id in pending {
+                rt.apply_action(TeamAction::RejectDecision(id));
+            }
+        }
+        assert!(
+            rt.decisions
+                .iter()
+                .any(|d| d.kind == DecisionKind::AttemptsExhausted),
+            "無限に回収を繰り返すだけで、人へ上げていない"
+        );
+        // 上げたあとは撃たない (促しを延々と送らない)。
+        let now = 3 + 401 * 60;
+        let eff = rt.tick(&obs_of(now, &rows_of(&sessions, &spinning(now))));
+        assert!(
+            nudges_to(&eff).is_empty(),
+            "人へ上げた後も促しを撃ち続けている"
+        );
+    }
+
+    #[test]
+    fn 働いている担当は促さない() {
+        let (mut rt, sessions) = dispatched();
+        for t in 1..=120u64 {
+            let now = 3 + t * 60;
+            // **毎回ちゃんと行が増える**画面。
+            let eff = rt.tick(&obs_of(now, &rows_of(&sessions, &working(t))));
+            assert!(
+                nudges_to(&eff).is_empty(),
+                "進んでいる担当を停滞と呼んではいけない (t={t})"
+            );
+        }
+        assert!(
+            stop_requests(&rt).is_empty(),
+            "進んでいる担当の回収要求が出てはいけない"
+        );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// **完了条件の「N 分以内」だけを予算として読む。**
+    #[test]
+    fn 完了条件から時間の予算を読む() {
+        let dod = vec![
+            "`index.html` を開くとコンソールにエラーが出ない".to_string(),
+            "開始から 10 分以内に上の条件を満たしている".to_string(),
+        ];
+        assert_eq!(time_budget_secs(&dod), Some(600));
+        // 数字が無い・0・別の語は読まない。
+        assert_eq!(time_budget_secs(&["分以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&["0 分以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&["3 日以内".to_string()]), None);
+        assert_eq!(time_budget_secs(&[]), None);
+        // 空白なしでも読む。
+        assert_eq!(time_budget_secs(&["15分以内に".to_string()]), Some(900));
+    }
+
+    /// 促しの文面は「いま報告しろ」と「磨きは後」を言い、形式は二度書かない。
+    #[test]
+    fn 予算超過の促しは報告を求める() {
+        let t = budget_nudge_text(3, 10);
+        assert!(t.contains("#3"));
+        assert!(t.contains("10 分"));
+        assert!(t.contains("完了報告"));
+        assert!(!t.contains("[ZAI-TEAM-RESULT]"), "形式をここに二度書いている");
+    }
+}
+
+
+/// **重複判定のスコープ** — 本文だけで数えると正しい報告が消える。
+///
+/// 実機で起きうる形をそのまま置く: 複数のレビュー担当が同じ文面
+/// (`{"verdict":"approve"}` のような、送り主も対象も本文に無い形) を返すと、
+/// 2 通目以降が「もう見た」で捨てられ、タスクが `Reviewing` のまま止まる。
+#[cfg(test)]
+mod seen_key_tests {
+    use super::super::testkit;
+    use super::*;
+    use super::super::outbox::Kind;
+
+    fn rt() -> TeamRuntime {
+        let ws = crate::test_util::unique_temp_dir("zaivern-team-seen", "key");
+        let plan = TeamPlan {
+            goal: testkit::goal(),
+            teams: vec![TeamGroup {
+                id: TeamId::new("implementation"),
+                name: "実装".to_string(),
+                lead_role: TeamRole::Implementer,
+            }],
+            tasks: vec![testkit::task(1, "t1", &[]), testkit::task(2, "t2", &[])],
+        };
+        TeamRuntime::from_plan(plan, ws, RunOptions::default())
+    }
+
+    /// **同じ本文でも、送り主・種別・対象が違えば別の報告。**
+    #[test]
+    fn 重複判定は送り主と種別と対象まで見る() {
+        let mut rt = rt();
+        let a = AgentId::new("reviewer-1");
+        let b = AgentId::new("reviewer-2");
+        // 送り主も対象も本文に無い形 (これがいちばん潰れやすい)。
+        let body = r#"{"verdict":"approve","findings":[]}"#;
+
+        let k_a = TeamRuntime::seen_key(&a, Kind::Review, body);
+        let k_b = TeamRuntime::seen_key(&b, Kind::Review, body);
+        assert_ne!(k_a, k_b, "別の担当の同じ文面を同じ報告として数えた");
+
+        let k_msg = TeamRuntime::seen_key(&a, Kind::Message, body);
+        assert_ne!(k_a, k_msg, "種別が違うのに同じ報告として数えた");
+
+        // 対象タスクが違えば別 (本文に task_id があるとき)。
+        let t1 = r#"{"task_id":1,"verdict":"approve","findings":[]}"#;
+        let t2 = r#"{"task_id":2,"verdict":"approve","findings":[]}"#;
+        assert_ne!(
+            TeamRuntime::seen_key(&a, Kind::Review, t1),
+            TeamRuntime::seen_key(&a, Kind::Review, t2),
+            "対象が違うのに同じ報告として数えた"
+        );
+        assert_eq!(
+            TeamRuntime::seen_key(&a, Kind::Review, t1).task,
+            Some(1),
+            "対象を鍵へ入れていない"
+        );
+
+        // まったく同じものは同じ (再送は 1 回だけ効く)。
+        assert_eq!(k_a, TeamRuntime::seen_key(&a, Kind::Review, body));
+        // 前後の空白は無視する (改行の付き方で別物にしない)。
+        assert_eq!(
+            k_a,
+            TeamRuntime::seen_key(&a, Kind::Review, &format!("\n{body}  \n"))
+        );
+
+        // 印は「見た」だけで付く。付けるまでは見ていない。
+        assert!(!rt.is_seen(&k_a));
+        rt.mark_seen(k_a.clone());
+        assert!(rt.is_seen(&k_a));
+        assert!(!rt.is_seen(&k_b), "別の担当まで「見た」にした");
+        test_hooks::clear();
+    }
+
+    /// **本文の指紋は 64bit 1 本にしない。** 長さと 128bit を持つ。
+    #[test]
+    fn 本文の指紋は長さと百二十八ビットで持つ() {
+        let a = AgentId::new("x");
+        let k1 = TeamRuntime::seen_key(&a, Kind::Result, r#"{"task_id":1}"#);
+        let k2 = TeamRuntime::seen_key(&a, Kind::Result, r#"{"task_id":2}"#);
+        assert_ne!(k1.digest, k2.digest);
+        assert_ne!(k1.digest.0, k1.digest.1, "2 本の指紋が同じ値になっている");
+        assert_eq!(k1.len, r#"{"task_id":1}"#.len() as u32);
+    }
+
+    /// **上限を超えても記憶は太らない。** 古い順に忘れる。
+    #[test]
+    fn 重複台帳は上限で古い順に忘れる() {
+        let mut rt = rt();
+        let a = AgentId::new("x");
+        let mut first = None;
+        for i in 0..(SEEN_BLOCKS_CAP + 50) {
+            let body = format!(r#"{{"task_id":{i}}}"#);
+            let k = TeamRuntime::seen_key(&a, Kind::Result, &body);
+            if i == 0 {
+                first = Some(k.clone());
+            }
+            rt.mark_seen(k);
+        }
+        assert_eq!(rt.seen_blocks.len(), SEEN_BLOCKS_CAP, "上限を超えて覚えている");
+        assert_eq!(rt.seen_block_order.len(), SEEN_BLOCKS_CAP);
+        assert!(
+            !rt.is_seen(&first.expect("最初の鍵")),
+            "いちばん古いものを忘れていない"
+        );
+        test_hooks::clear();
+    }
+
+    /// **却下された報告は重複台帳へ入らない。** 直して出し直せる。
+    #[test]
+    fn 却下した報告は重複台帳へ入れない() {
+        let mut rt = rt();
+        let agent = AgentId::new("team-lead");
+        rt.agents.push(TeamAgent {
+            id: agent.clone(),
+            name: "lead".into(),
+            role: TeamRole::TeamLead,
+            team_id: TeamId::new("implementation"),
+            parent_id: None,
+            kind: AgentKind::ManagedSession,
+            session_id: Some(1),
+            session_identity: None,
+            provider: "claude".into(),
+            state: AgentWorkState::Idle,
+            current_task: None,
+            current_action: String::new(),
+            children: Vec::new(),
+            created_at: 0,
+            last_activity_at: 0,
+        });
+        // 居ないタスクへの報告 → 意味として却下。
+        let bad = r#"{"task_id":99,"agent_id":"team-lead","status":"completed","summary":"x","changed_files":[],"validation":[],"blockers":[]}"#;
+        let err = rt
+            .accept_outbox(&agent, Kind::Result, bad, 100)
+            .expect_err("居ないタスクは却下されるべき");
+        assert!(err.contains("#99"), "理由が伝わっていない: {err}");
+        let key = TeamRuntime::seen_key(&agent, Kind::Result, bad);
+        assert!(
+            !rt.is_seen(&key),
+            "却下したのに重複台帳へ入れた (直して出し直しても届かなくなる)"
+        );
+        // 同じものをもう一度出しても、また却下として扱われる (黙って消えない)。
+        assert!(rt.accept_outbox(&agent, Kind::Result, bad, 101).is_err());
+
+        // **直したものは受理される。** (居るタスクへ、担当として)
+        rt.tasks[0].assigned_agent = Some(agent.clone());
+        rt.tasks[0].state = TeamTaskState::Running;
+        test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
+            measured: Vec::new(),
+        }));
+        // 検証コマンドは実際に実行したことを申告する (関門はそこも見る)。
+        let cmds: Vec<String> = rt.tasks[0]
+            .validation_commands
+            .iter()
+            .map(|c| format!(r#"{{"command":"{}","exit_code":0}}"#, c.display()))
+            .collect();
+        let good = format!(
+            r#"{{"task_id":1,"agent_id":"team-lead","status":"completed","summary":"x","changed_files":[],"validation":[{}],"blockers":[]}}"#,
+            cmds.join(",")
+        );
+        let good = good.as_str();
+        assert_eq!(
+            rt.accept_outbox(&agent, Kind::Result, good, 102),
+            Ok(AcceptOutcome::Applied),
+            "直した報告が受理されない"
+        );
+        // 同じものの再送は二重に効かない。
+        assert_eq!(
+            rt.accept_outbox(&agent, Kind::Result, good, 103),
+            Ok(AcceptOutcome::Duplicate),
+            "再送が二重に適用された"
+        );
+        test_hooks::clear();
     }
 }

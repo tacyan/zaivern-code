@@ -1022,6 +1022,20 @@ impl ZaivernApp {
             if ui.checkbox(&mut auto_yes, tr("⚡ 自動YES")).clicked() {
                 cmds.push(Cmd::TogglePetAutoYes);
             }
+            // トークンのスリム化も `Config` (`context.enabled`) が真実源。
+            // ここは設定画面 (⚙) の「コンテキスト最適化を使う」への近道で
+            // あって、別の状態ではない (`set_context_slim` が同じ書き戻し
+            // 経路を通る)。
+            let mut slim = self.context_slim_enabled();
+            if ui
+                .checkbox(&mut slim, tr("🧠 トークンをスリム化"))
+                .on_hover_text(tr(
+                    "AI へ渡す前に情報量を減らします。⚙ 設定の「コンテキスト最適化を使う」と同じ設定です",
+                ))
+                .clicked()
+            {
+                cmds.push(Cmd::Feature(crate::features::context::ID_TOGGLE_ENABLED));
+            }
         })
         .response
         .on_hover_text(tr("デスクトップペット 🐾 の表示・画像変更"));
@@ -1536,7 +1550,7 @@ impl ZaivernApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(dim("Zaivern v0.2".into()));
+                        ui.label(dim(format!("Zaivern v{}", env!("CARGO_PKG_VERSION"))));
                         if let Some(tip) = &pro_badge {
                             ui.label(RichText::new("✨ Pro").size(11.5).color(theme.accent))
                                 .on_hover_text(tip.clone());

@@ -859,6 +859,54 @@ pub fn newly_ready(tasks: &[TeamTask]) -> Vec<TaskId> {
 
 /// クリティカルパス上のタスク (そこから続く仕事がいちばん長いもの) の
 /// 「深さ」。スケジューラの優先順位に使う。値が大きいほど先に着手すべき。
+/// **同時に走りうるタスクの最大数** (依存の段ごとの最大幅)。
+///
+/// 何体立てるかを決めるのに使う。「依存が空のタスク数」で測ると、
+/// 段を 1 つでも挟んだ計画では**永久に 1** になる — `dependencies` は
+/// 静的な項目なので、依存が済んでも空にはならない。実測では
+/// 「計画 → 設計 → 実装 8 件 → テスト → 統合」で、実装が 8 件並べるのに
+/// **最後まで 2 体しか立たなかった** (盤面の「稼働 2」)。
+///
+/// 段は根からの最長距離で決める (`critical_depth` は葉からの距離なので
+/// ここでは使えない — 幅を測るには根からの段が要る)。
+pub fn max_parallel_width(tasks: &[TeamTask]) -> usize {
+    let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
+    let mut level: BTreeMap<TaskId, u32> = ids.iter().map(|i| (*i, 0u32)).collect();
+    // 循環があっても止まるよう上限つきで回す (検証済みなら 1 周で足りる)。
+    let limit = tasks.len().saturating_add(1);
+    for _ in 0..limit {
+        let mut changed = false;
+        for t in tasks {
+            let best = t
+                .dependencies
+                .iter()
+                .filter(|d| ids.contains(d))
+                .map(|d| level.get(d).copied().unwrap_or(0) + 1)
+                .max()
+                .unwrap_or(0);
+            if level.get(&t.id).copied().unwrap_or(0) < best {
+                level.insert(t.id, best);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // **終わったタスクは数えない。** 数えると、済んだ段のぶんだけ
+    // 余分に立ち続ける。
+    let mut per_level: BTreeMap<u32, usize> = BTreeMap::new();
+    for t in tasks {
+        if t.state.is_terminal() {
+            continue;
+        }
+        *per_level
+            .entry(level.get(&t.id).copied().unwrap_or(0))
+            .or_insert(0) += 1;
+    }
+    per_level.values().copied().max().unwrap_or(0)
+}
+
 pub fn critical_depth(tasks: &[TeamTask]) -> BTreeMap<TaskId, u32> {
     let mut children: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
     let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();

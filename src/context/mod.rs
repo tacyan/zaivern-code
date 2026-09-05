@@ -102,19 +102,49 @@ pub const KEY_MAX_RESULTS: &str = "context.max_results";
 /// 利用者が選んだときだけにする。
 pub const KEY_PERSIST: &str = "context.persist_metrics";
 
-/// パレットから開く窓と、この機能が宣言する設定。
+/// [`KEY_ENABLED`] をその場で反転させる [`Entry::id`]。
+///
+/// **別の状態を作らない。** 指しているのは設定画面 (⚙) の
+/// 「コンテキスト最適化を使う」と**同じ 1 つの値**で、パレットと
+/// ペットメニューはそこへの近道でしかない (`notifications.toggle_sound`
+/// と同じ形)。削るべきなのは「別々の状態を持つ重複」であって、
+/// 同じ設定への近道ではない。
+pub const ID_TOGGLE_ENABLED: &str = "context.toggle_enabled";
+
+/// パレットから開く窓・オンオフの近道と、この機能が宣言する設定。
 ///
 /// **実体は `panel.rs` / `cli.rs` にある。** ここは登録だけ。
+/// 到達経路は 3 つ — 設定画面 (⚙) の行、パレット、ペットメニュー (🐾) の
+/// 「🧠 トークンをスリム化」。**どれも [`KEY_ENABLED`] という 1 つの値を指す**
+/// ので、増やしても状態が食い違わない。
 pub const FEATURE: Feature = Feature {
     module: "context",
-    entries: &[Entry {
-        icon: "🧠",
-        label: "コンテキストエンジン",
-        id: "context.panel",
-    }],
-    dispatch: |_app, ctx, id| match id {
+    entries: &[
+        Entry {
+            icon: "🧠",
+            label: "コンテキストエンジン",
+            id: "context.panel",
+        },
+        Entry {
+            icon: "🧠",
+            label: "トークンをスリム化 (オン/オフ)",
+            id: ID_TOGGLE_ENABLED,
+        },
+    ],
+    dispatch: |app, ctx, id| match id {
         "context.panel" => {
             panel::open(ctx.clone());
+            true
+        }
+        ID_TOGGLE_ENABLED => {
+            // いまの値は**設定から読む**。派生値 (窓が持つ写し) を真実源に
+            // 使うと向きが循環するので、書き戻す側は `Config` を見る。
+            let now = app.context_slim_enabled();
+            app.set_context_slim(!now, ctx);
+            // 窓が開いたままなら、次の描画で環境を読み直させる
+            // (`Env` は開いた 1 回だけ読む写しなので、放っておくと
+            //  「使う: はい」と嘘の要約を出し続ける)。
+            panel::forget_env();
             true
         }
         _ => false,
@@ -464,7 +494,9 @@ mod tests {
             .filter(|b| b.len() >= MIN_DISTINCTIVE)
             .collect();
         assert!(bins.len() >= 20, "見ている名前が {} 件しかない", bins.len());
-        assert!(bins.contains(&"claude") && bins.contains(&"codex") && bins.contains(&"gemini"));
+        assert!(
+            bins.contains(&"claude") && bins.contains(&"codex") && bins.contains(&"cursor-agent")
+        );
 
         // **番人が空回りしていないことを、先に証明する。**
         // わざと壊した入力で赤にならないなら、以下の走査は何も守っていない。
@@ -694,5 +726,65 @@ mod tests {
             assert!(!s.help.trim().is_empty(), "{:?} の説明が空", s.key);
         }
         assert_eq!(FEATURE.settings.len(), 5);
+    }
+
+    /// 囲っている関数の中だけを切り出す (行単位)。
+    ///
+    /// **窓 (「前後 N 行」) では見ない。** 同じファイルの**別の関数**が書いた
+    /// 文字列を拾って、わざと壊しても緑になる番人が実際に生まれた
+    /// (`cli::tests::改行をまたぐ照合は…` の最初の 2 版)。
+    fn enclosing_fn(src: &str, sig: &str) -> Option<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines.iter().position(|l| l.contains(sig))?;
+        let is_fn_head = |l: &str| {
+            let t = l.trim_start();
+            t.starts_with("fn ")
+                || t.starts_with("pub fn ")
+                || t.starts_with("pub(super) fn ")
+                || t.starts_with("pub(crate) fn ")
+        };
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| is_fn_head(l))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        Some(lines[start..end].join("\n"))
+    }
+
+    /// ペットメニューの「トークンをスリム化」が、設定画面 (⚙) と
+    /// **同じ 1 つの値**を指していること。
+    ///
+    /// 到達経路を増やすこと自体は良い (同じ真実源への近道)。禁じたいのは
+    /// **別の状態を作ること** — ペット側に専用の bool を持たせると、設定画面と
+    /// 食い違って「オンにしたのにコンテキストが畳まれない」が出る。しかも
+    /// 食い違いは画面のどちらか片方を見ているあいだは観測できない。
+    #[test]
+    fn ペットメニューの切り替えは設定と同じ値を指す() {
+        // Windows のチェックアウトは CRLF なので必ず正規化してから照合する
+        let src = include_str!("../app/top_bar_ui.rs").replace("\r\n", "\n");
+        let body = enclosing_fn(&src, "fn top_bar_pet_menu").expect("ペットメニューの関数がある");
+
+        /// 真実源が 1 つか — 読み出しは `Config` 由来の glue、書き込みは
+        /// レジストリの ID 経由。どちらか一方でも欠けたら偽。
+        fn single_source(body: &str) -> bool {
+            body.contains("self.context_slim_enabled()") && body.contains("ID_TOGGLE_ENABLED")
+        }
+
+        assert!(
+            single_source(&body),
+            "ペットメニューは `context_slim_enabled()` で読み、\
+             `ID_TOGGLE_ENABLED` を投げること (設定画面と同じ 1 つの値を指すため)"
+        );
+        // **空回りする番人を残さない。** 専用の状態を持たせた版を作って、
+        // この検査が実際に赤へ倒れることを同じテストの中で確かめる。
+        let broken = body.replace("self.context_slim_enabled()", "self.cfg.pet_token_slim");
+        assert_ne!(
+            broken, body,
+            "仕込みが当たっていない (照合する文字列がずれた)"
+        );
+        assert!(
+            !single_source(&broken),
+            "専用の状態を持たせても緑になる = 番人が空回りしている"
+        );
     }
 }

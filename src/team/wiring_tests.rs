@@ -38,10 +38,7 @@ fn cliのteamサブコマンドが門に登録されている() {
         gate.contains("| \"team\""),
         "is_cli_subcommand に team が無い"
     );
-    assert!(
-        s.contains("\"team\" => {"),
-        "dispatch に team の分岐が無い"
-    );
+    assert!(s.contains("\"team\" => {"), "dispatch に team の分岐が無い");
     assert!(
         s.contains("crate::features::team::cli_main(rest)"),
         "team の実体を呼んでいない"
@@ -57,9 +54,7 @@ fn team_runはgui起動へ落ちる経路を持つ() {
     let s = src(CLI);
     // `zai team run` はヘッドレスではない。実行中インスタンスが無いときは
     // CLI を終わらせず **GUI 起動へ落ちる** (main.rs が None を見て起こす)。
-    let at = s
-        .find("\"team\" => {")
-        .expect("team の分岐がある");
+    let at = s.find("\"team\" => {").expect("team の分岐がある");
     let body = &s[at..at + 600];
     assert!(
         body.contains("EXIT_LAUNCH_GUI") && body.contains("return None"),
@@ -125,7 +120,10 @@ fn エージェント起動は既存経路を通る() {
     for (needle, why) in [
         ("self.launch_preset_as(", "既存の起動経路を使っていない"),
         ("&spec.workspace_root", "Run の workspace で起こしていない"),
-        ("self.team_approval()", "この Run の承認モードを渡していない"),
+        (
+            "self.team_approval(owner)",
+            "この Run の承認モードを渡していない",
+        ),
     ] {
         assert!(body.contains(needle), "{why}:\n{body}");
     }
@@ -134,8 +132,20 @@ fn エージェント起動は既存経路を通る() {
         "画面のいまのフォルダを見ている (Runtime が決めた実行先を上書きしている)"
     );
     assert!(
-        body.contains("spec_for_command"),
-        "AI CLI のプリセットを選んでいない"
+        body.contains("self.team_preset_table()"),
+        "使えるプリセットの一覧を通していない:\n{body}"
+    );
+    // 一覧の作り方そのものも見る (**場所が移っただけで性質は同じ**)。
+    let table = function_body(&s, s.find("fn team_preset_table").expect("プリセット一覧"));
+    assert!(
+        table.contains("spec_for_command"),
+        "AI CLI かどうかを見ていない:\n{table}"
+    );
+    // **入っていない CLI を割り当てない。** 名前だけで決めると、その担当は
+    // 永久に起動しない (画面には居るのに何も起きない)。
+    assert!(
+        table.contains("resolve_in("),
+        "実体が PATH にあるかを確かめていない:\n{table}"
     );
 }
 
@@ -143,14 +153,25 @@ fn エージェント起動は既存経路を通る() {
 fn 指示の送信は既存の一本を通る() {
     let s = src(GLUE);
     let body = function_body(&s, s.find("fn team_run_effects").expect("実行の橋"));
+    // **本文はすぐ書く** (`Job::user`)。待って書く形 (`deferred`) にすると、
+    // 起動直後の Claude Code は見張りがまだ Idle と言わず `⚠` の案内で
+    // `attention` にもなるので、本文が 1 バイトも書かれないまま時間切れに
+    // なる (実機で 6 体中 5 体が空のプロンプトのまま止まった)。
+    //
+    // 飲み込まれるのは**確定キー**のほうなので、待つのはそちらだけ
+    // (`submit::COMMIT_IDLE_WAIT` — `submit::tests::忙しい相手には確定キーを撃たない`)。
     assert!(
-        body.contains("crate::submit::Job::deferred(") && body.contains("self.queue_submit(job)"),
+        body.contains("crate::submit::Job::user(") && body.contains("self.queue_submit(job)"),
         "既存の送信経路 (submit) を通っていない:\n{body}"
+    );
+    assert!(
+        !body.contains("Job::deferred("),
+        "書くのを待つ形が残っている (起動直後は Idle にならず届かない):\n{body}"
     );
     // **配達の結末を受け取れる形で積む。** 目印が無いと、積めたことしか
     // 分からず、相手が消えても Runtime は「届いた」と信じ続ける。
     assert!(
-        body.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        body.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&owner, &key))"),
         "配達の結末を受け取る目印を付けていない:\n{body}"
     );
     // PTY へ直接書く経路を作らない (Ink 系 TUI の取りこぼし対策は submit が持つ)
@@ -170,11 +191,11 @@ fn 積めたことを届いたことにしない() {
     let glue = src(GLUE);
     let body = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
     let at = body
-        .find("for (key, task, session, text) in instructions")
+        .find("for (owner, key, task, session, text) in instructions")
         .expect("指示の取り出し口");
     // 次の取り出し口 (停止) までが指示の区画。
     let end = body[at..]
-        .find("for (key, session) in stops")
+        .find("for (owner, key, session) in stops")
         .map(|e| at + e)
         .unwrap_or(body.len());
     let seg = &body[at..end];
@@ -183,7 +204,7 @@ fn 積めたことを届いたことにしない() {
         "積めた時点で完了にしている (届かなくても消えなくなる):\n{seg}"
     );
     assert!(
-        seg.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&key))"),
+        seg.contains("job.tag = panel::with_panel(|p| p.delivery_tag(&owner, &key))"),
         "配達の結末を受け取る目印を付けていない:\n{seg}"
     );
 
@@ -191,14 +212,25 @@ fn 積めたことを届いたことにしない() {
     let sessions = src(SESSIONS);
     let tick = function_body(
         &sessions,
-        sessions.find("fn submit_tick").expect("配達を進める唯一の経路"),
+        sessions
+            .find("fn submit_tick")
+            .expect("配達を進める唯一の経路"),
     );
     for (needle, why) in [
         ("submit::Act::Done => {", "届いたことを他と区別していない"),
-        ("submit::Act::Gone => {", "相手が消えたことを他と区別していない"),
+        (
+            "submit::Act::Gone => {",
+            "相手が消えたことを他と区別していない",
+        ),
         ("outcomes.push((t, true))", "届いたことを返していない"),
-        ("outcomes.push((t, false))", "届かなかったことを返していない"),
-        ("self.team_note_delivery(outcomes)", "結末を頼んだ側へ返していない"),
+        (
+            "outcomes.push((t, false))",
+            "届かなかったことを返していない",
+        ),
+        (
+            "self.note_submit_delivery(outcomes)",
+            "結末を頼んだ側へ返していない",
+        ),
     ] {
         assert!(tick.contains(needle), "{why}:\n{tick}");
     }
@@ -214,7 +246,8 @@ fn 停止は承認ゲートを通る() {
     let s = src(GLUE);
     let body = function_body(
         &s,
-        s.find("fn team_apply_board_action").expect("操作の受け口がある"),
+        s.find("fn team_apply_board_action")
+            .expect("操作の受け口がある"),
     );
     // Stop は Runtime へ渡すだけ。**その場で kill しない。**
     assert!(
@@ -232,7 +265,10 @@ fn 停止は承認ゲートを通る() {
 #[test]
 fn エージェントをクリックすると実際の端末が開く() {
     let s = src(GLUE);
-    let body = function_body(&s, s.find("fn team_open_terminal").expect("端末を開く橋がある"));
+    let body = function_body(
+        &s,
+        s.find("fn team_open_terminal").expect("端末を開く橋がある"),
+    );
     assert!(
         body.contains("self.focus_agent_in_place(i)"),
         "既存の選択経路を使っていない"
@@ -245,10 +281,17 @@ fn エージェントをクリックすると実際の端末が開く() {
 
 #[test]
 fn 報告されたサブエージェントの端末ボタンは無効になる() {
-    for (name, s) in [("board", src(BOARD)), ("inspector", src(INSPECTOR))] {
+    // 盤面は「中身を見る」、Inspector は「端末を開く」— **同じ性質を
+    // 別のボタンで守る**ので、名前も別になる (押せない相手には出さない)。
+    for (name, s, label) in [
+        ("board", src(BOARD), "team.btn.show_output"),
+        ("inspector", src(INSPECTOR), "team.btn.open_terminal"),
+    ] {
         assert!(
-            s.contains("add_enabled(false, egui::Button::new(tr(\"team.btn.open_terminal\")))"),
-            "{name}: 開けない端末のボタンを無効にしていない"
+            s.contains(&format!(
+                "add_enabled(false, egui::Button::new(tr(\"{label}\")))"
+            )),
+            "{name}: 開けない相手のボタンを無効にしていない"
         );
         assert!(
             s.contains("on_disabled_hover_text"),
@@ -296,6 +339,26 @@ fn 走査は間隔を空けてから行う() {
     assert!(
         body.contains("if self.team_is_active()"),
         "走っていないときも再描画を頼んでいる"
+    );
+}
+
+#[test]
+fn 最後のrunを閉じた後も停止effectを実行する() {
+    // close_run は Runtime を先に外し、停止だけを pending_stops に残す。
+    // `has_run == false` で即 return すると、その停止は実行側へ一度も届かず
+    // 担当プロセスが孤児になる。Run 無し分岐でも live_work を見て Effect を
+    // drain する配線を番人にする。
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_tick").expect("駆動がある"));
+    let no_run = body
+        .split_once("if !has_run")
+        .map(|(_, rest)| rest)
+        .expect("Run 無し分岐が無い");
+    let before_return = no_run.split_once("return;").map(|(head, _)| head).unwrap();
+    assert!(
+        before_return.contains("p.live_work().is_busy()")
+            && before_return.contains("self.team_run_effects(ctx)"),
+        "Run が消えた直後の Stop/検証後始末を実行していない"
     );
 }
 
@@ -454,12 +517,12 @@ fn cli起動とgui起動は同じruntimeを通る() {
 
     let glue = src(GLUE);
     assert!(
-        glue.contains("p.plan(&req.spec_text"),
+        glue.contains("p.plan_with(&req.spec_text"),
         "GUI が投函された SPEC で計画していない"
     );
-    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本へ落ちる
+    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本 (`plan_with`) へ落ちる。
     assert!(
-        glue.contains("p.plan(&req.spec_text") && glue.contains("p.plan_with("),
+        glue.matches("p.plan_with(").count() >= 2,
         "CLI 経由と GUI 経由で入口が分かれている"
     );
 
@@ -485,10 +548,7 @@ fn 起動要求のフィールドはすべて使われている() {
     // **飾りのメタデータを残さない。** 構造体にあるのに実行時は無視、は
     // 「渡したつもり」の嘘になる (workspace_root がまさにそれだった)。
     let glue = src(GLUE);
-    let body = function_body(
-        &glue,
-        glue.find("fn team_launch_agent").expect("起動の橋"),
-    );
+    let body = function_body(&glue, glue.find("fn team_launch_agent").expect("起動の橋"));
     for (field, used_as) in [
         ("spec.workspace_root", "エージェントの cwd"),
         ("spec.role", "プリセットの選択"),
@@ -502,7 +562,7 @@ fn 起動要求のフィールドはすべて使われている() {
     // agent_id はセッションの結び付けに使う (呼び出し側)。
     let run = function_body(&glue, glue.find("fn team_run_effects").expect("実行の橋"));
     assert!(
-        run.contains("p.bind_session(&spec.agent_id, session, identity)"),
+        run.contains("p.bind_session(&owner, &spec.agent_id, session, identity)"),
         "起動したセッションを要求のエージェントへ結び付けていない (目印つきで)"
     );
     // **adopt も使う。** 使わないと、再起動のあと同じ logical agent を
@@ -528,15 +588,13 @@ fn 実行コンテキストを画面のいまの値で取り直さない() {
     // 取り直して上書きしてはいけない。
     let glue = src(GLUE);
     // 起動の橋: 画面のフォルダを見ない (上の番人と対)。
-    let launch = function_body(
-        &glue,
-        glue.find("fn team_launch_agent").expect("起動の橋"),
-    );
+    let launch = function_body(&glue, glue.find("fn team_launch_agent").expect("起動の橋"));
     assert!(!launch.contains("agent_cwd"));
     // 計画の入口: SPEC の解決も Team の workspace が基準。
     let plan = function_body(
         &glue,
-        glue.find("fn team_plan_from_form").expect("計画の入口"),
+        glue.find("fn team_plan_from_form_inner")
+            .expect("計画の入口"),
     );
     assert!(
         plan.contains("p.workspace().to_path_buf()"),
@@ -562,8 +620,11 @@ fn 別のrunのeffectを実行させない構造がある() {
     // キューを空にする偶然ではなく、**持ち主の照合**で防いでいること。
     let p = src(PANEL);
     let mine = function_body(&p, p.find("fn mine<T>").expect("選り分け"));
+    // **走っている Run のどれかのもの**なら実行し、それ以外は捨てる。
+    // (Run が複数走るようになったので「いまの Run だけ」では、画面に
+    //  出していないチームの仕事が全部捨てられる。)
     assert!(
-        mine.contains("now.as_ref() == Some(&owner)"),
+        mine.contains("live.contains(&owner)") && mine.contains("self.runs.iter()"),
         "持ち主を照合していない:\n{mine}"
     );
     let absorb = function_body(&p, p.find("fn absorb").expect("受け取り"));
@@ -571,15 +632,51 @@ fn 別のrunのeffectを実行させない構造がある() {
         absorb.contains("rt.owner()"),
         "発行時に持ち主を焼き付けていない:\n{absorb}"
     );
-    // 4 つの取り出し口すべてが `mine` を通ること。
+    // **仕事を出す口は `mine` を通る。停止だけが例外。**
     for f in [
         "pub fn take_launches",
         "pub fn take_instructions",
-        "pub fn take_stops",
+        "pub fn take_manual_instructions",
         "pub fn take_validations",
     ] {
         let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
         assert!(body.contains("self.mine(q)"), "{f} が持ち主を見ていない");
+    }
+    // **停止は逆。`mine` を通したら閉じた Run の担当が止まらない。**
+    //
+    // 閉じる順序は「止める → 記憶から外す → 実行側が取り出す」なので、
+    // 取り出す時点でその Run はもう `self.runs` に居ない。ここで生存 Run の
+    // 選り分けを通すと、停止だけが**必ず**捨てられて実プロセスが残る
+    // (実際に残っていた)。名指しの `SessionId` なので他 Run へは飛ばない。
+    let stops = function_body(&p, p.find("pub fn take_stops").expect("停止の取り出し口"));
+    assert!(
+        !stops.contains("self.mine("),
+        "take_stops が生存 Run で選り分けている (閉じた Run の担当が止まらない):\n{stops}"
+    );
+    // 出す側: 閉じるときは承認ゲートを通さず、その場で全セッションを止める。
+    let close = function_body(&p, p.find("fn begin_close").expect("Run を閉じる本体"));
+    assert!(
+        close.contains(".close()") && !close.contains("TeamAction::Stop"),
+        "close_run が承認待ちの Stop を使っている (判断ごと消えて誰も承認できない):\n{close}"
+    );
+    let discard = function_body(&p, p.find("pub fn discard_run").expect("Run を捨てる"));
+    assert!(
+        discard.contains(".close()"),
+        "discard_run が担当を止めずに記録だけ消している:\n{discard}"
+    );
+    let rt = src(RUNTIME);
+    let rt_close = function_body(&rt, rt.find("pub fn close(&mut self)").expect("Runtime 側"));
+    assert!(
+        rt_close.contains("TeamEffect::StopAgent") && rt_close.contains("cancel_running_validations"),
+        "閉じるときに担当と検証の両方を止めていない:\n{rt_close}"
+    );
+    // 例外が漏れないこと: workspace の切り替えと終了は、取り出す前に列を空にする。
+    for f in ["pub fn attach_workspace", "pub fn shutdown"] {
+        let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
+        assert!(
+            body.contains("self.pending_stops.clear()"),
+            "{f} が停止の列を空にしていない (前の workspace の停止が持ち越される)"
+        );
     }
 }
 
@@ -595,7 +692,8 @@ fn 閉じるときに検証を置き去りにしない() {
     let p = src(PANEL);
     let now = function_body(
         &p,
-        p.find("pub fn stop_all_validations_now").expect("その場で落とす"),
+        p.find("pub fn stop_all_validations_now")
+            .expect("その場で落とす"),
     );
     assert!(
         now.contains("crate::procx::kill_tree(pid)"),
@@ -621,7 +719,8 @@ fn 立ち上がるときに前のアプリのrunを引き継がない() {
     let p = src(PANEL);
     let adopt = function_body(
         &p,
-        p.find("pub fn adopt_new_app_context").expect("引き継ぎの拒否"),
+        p.find("pub fn adopt_new_app_context")
+            .expect("引き継ぎの拒否"),
     );
     assert!(
         adopt.contains("self.shutdown()") && adopt.contains("self.workspace = PathBuf::new()"),
@@ -654,7 +753,15 @@ fn 判定した実体とosが起こす実体を一致させる() {
         run.contains("found.trust.auto_runnable()") && run.contains("approved.contains(cmd)"),
         "実体の信用区分と承認を突き合わせていない:\n{run}"
     );
-    let resolved = function_body(&l, l.find("pub fn run_resolved").expect("起動"));
+    // **入口は委譲だけ。** ここで別の起こし方を書くと、番人が見ている
+    // 本体 (`run_resolved_capped`) を通らない第 2 の経路ができる。
+    let entry = function_body(&l, l.find("pub fn run_resolved(").expect("入口"));
+    assert!(
+        entry.contains("run_resolved_capped(") && !entry.contains("Command"),
+        "入口が委譲以外のことをしている:\n{entry}"
+    );
+    // 実際に起こしているのは本体のほう。**性質は同じ**で、場所だけが違う。
+    let resolved = function_body(&l, l.find("pub fn run_resolved_capped").expect("起動"));
     assert!(
         resolved.contains("crate::procx::hidden_command(program)"),
         "解決済みのパスで起こしていない:\n{resolved}"
@@ -751,7 +858,8 @@ fn 起動要求にworkspaceを決めさせない() {
     let l = src(LAUNCH);
     let check = function_body(
         &l,
-        l.find("pub fn request_matches_workspace").expect("境界の判定"),
+        l.find("pub fn request_matches_workspace")
+            .expect("境界の判定"),
     );
     assert!(
         check.contains("let current = canon(workspace);")
@@ -774,15 +882,23 @@ fn 起動要求にworkspaceを決めさせない() {
 #[test]
 fn 起動要求はteam画面を選ぶ() {
     let s = src(GLUE);
-    let body = function_body(&s, s.find("fn team_take_launch_request").expect("受け口がある"));
+    let body = function_body(
+        &s,
+        s.find("fn team_take_launch_request").expect("受け口がある"),
+    );
     assert!(body.contains("p.open = true"), "Team 画面を開いていない");
     assert!(
         body.contains("p.tab = BoardTab::Organization"),
         "Organization タブを選んでいない"
     );
     assert!(
-        body.contains("p.form.open = false"),
-        "Plan Preview ではなくフォームを出してしまう"
+        body.contains("p.form.open = false") && body.contains("p.form.open = true"),
+        "通常SPECと短いSPECの表示先を分けていない"
+    );
+    assert!(
+        body.contains("planner::needs_spec_rewrite(&req.spec_text)")
+            && body.contains("self.team_draft_spec()"),
+        "CLI の短いSPECが仕様書作成を迂回している"
     );
     // `--yes` は **Start Team の確認だけ**を省く
     assert!(
@@ -816,7 +932,10 @@ fn フォームの入力欄はすべて何かを変える() {
     // **押せるのに何も起きない入力欄を残さない。** New Team Run の各項目が
     // 実際にどこかへ渡っていることを、静的に固定する。
     let glue = src(GLUE);
-    let body = function_body(&glue, glue.find("fn team_plan_from_form").expect("計画の橋"));
+    let body = function_body(
+        &glue,
+        glue.find("fn team_plan_from_form_inner").expect("計画の橋"),
+    );
     for (field, needle) in [
         ("goal_name", "form.goal_name.clone()"),
         ("roles", "form.roles.clone()"),
@@ -860,7 +979,10 @@ fn team_runは既存のグローバル設定を書き換えない() {
         );
     }
     // 読むのは初期値としてだけ。**書かない。**
-    let seed = function_body(&glue, glue.find("fn seed_team_form").expect("初期値の読み込み"));
+    let seed = function_body(
+        &glue,
+        glue.find("fn seed_team_form").expect("初期値の読み込み"),
+    );
     assert!(
         seed.contains("self.cfg.approval_mode") && seed.contains("self.cfg.cost_limit_session"),
         "既存設定を初期値として読んでいない:\n{seed}"
@@ -877,7 +999,10 @@ fn team_runは既存のグローバル設定を書き換えない() {
         "フォームを開く入口の一部で既存設定を読んでいない ({opens} か所)"
     );
     // 効かせ方は「締める方向だけ」。判断は純関数 1 本に置く。
-    let approval = function_body(&glue, glue.find("fn team_approval").expect("承認モードの解決"));
+    let approval = function_body(
+        &glue,
+        glue.find("fn team_approval").expect("承認モードの解決"),
+    );
     assert!(
         approval.contains("effective_approval(&self.cfg.approval_mode)"),
         "既存設定と突き合わせずに Run の値を使っている:\n{approval}"
@@ -1048,7 +1173,7 @@ fn effectは実行前に完了扱いにしない() {
     let done = function_body(&s, s.find("pub fn note_effect_done").expect("ACK"));
     assert!(done.contains("EffectState::Completed"));
     // 復元は成功済みだけを引き継ぐ。
-    let restore = function_body(&s, s.find("pub fn restore(").expect("復元"));
+    let restore = function_body(&s, s.find("pub fn restore_in(").expect("復元本体"));
     assert!(
         restore.contains("r.state != EffectState::Completed"),
         "復元で未完了の Effect を成功扱いにしている"
@@ -1082,8 +1207,8 @@ fn 実行側は必ず成否を返す() {
     // (取り出し口のループ見出し, その区画に必ず要るもの)
     let loops: [(&str, &[&str]); 5] = [
         (
-            "for (key, spec) in launches",
-            &["p.ack_done(&key)", "p.ack_failed(&key)"],
+            "for (owner, key, spec) in launches",
+            &["p.ack_done(&owner, &key)", "p.ack_failed(&owner, &key)"],
         ),
         (
             // 宛先のタスクも運ぶ (セッションから引き直さない)。
@@ -1092,8 +1217,8 @@ fn 実行側は必ず成否を返す() {
             // 届いたことは別の時刻に決まるので、成功は配達の結末
             // (`team_note_delivery`) が返す。ここで見るのは
             // 「積めなかったときに必ず失敗が返る」ことだけ。
-            "for (key, task, session, text) in instructions",
-            &["p.ack_failed(&key)"],
+            "for (owner, key, task, session, text) in instructions",
+            &["p.ack_failed(&owner, &key)"],
         ),
         (
             // 人が出した指示。**成功は指示と同じく配達の結末が返す**ので、
@@ -1101,14 +1226,17 @@ fn 実行側は必ず成否を返す() {
             // 送信キューへ積めなかった) だけ。素の `ack_failed` で済ませると
             // 監査は「送信キューへ追加しました」のまま結末を 1 件も持たない
             // — queued と failed が記録の上で区別できなくなる。
-            "for (key, agent, session, text) in manual",
-            &["p.note_manual_failed(&key,"],
+            "for (owner, key, agent, session, text) in manual",
+            &["p.note_manual_failed(&owner, &key,"],
         ),
-        ("for (key, session) in stops", &["p.ack_done(&key)"]),
+        (
+            "for (owner, key, session) in stops",
+            &["self.close_agent_tracked(i)", "p.watch_stop(owner, key, handle)"],
+        ),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
         (
-            "for (key, v) in validations",
-            &["self.team_spawn_validation(key, v)"],
+            "for (owner, key, v) in validations",
+            &["self.team_spawn_validation(owner, key, v)"],
         ),
     ];
     // 見出しの位置で区画に割り、**その区画の中だけ**を見る。
@@ -1141,8 +1269,11 @@ fn 実行側は必ず成否を返す() {
         &glue,
         glue.find("fn team_spawn_validation").expect("検証の委譲先"),
     );
-    for needle in ["p.ack_done(&key)", "p.ack_failed(&key)"] {
-        assert!(spawn.contains(needle), "検証の委譲先が `{needle}` を返していない");
+    for needle in ["p.ack_done(&owner, &key)", "p.ack_failed(&owner, &key)"] {
+        assert!(
+            spawn.contains(needle),
+            "検証の委譲先が `{needle}` を返していない"
+        );
     }
     // **時限と停止の札を必ず渡す。** ここが抜けると実行器は無期限に待ち、
     // 止める手も無くなる (GUI の経路なので、ここでしか見張れない)。
@@ -1156,4 +1287,392 @@ fn 実行側は必ず成否を返す() {
             "検証の実行に `{needle}` を渡していない:\n{spawn}"
         );
     }
+}
+
+/// **盤面に描く端末は、触れる。ただしホイールは取り合わない。**
+///
+/// 読むだけにしていたら `Yes, I trust this folder` のような**答えないと
+/// 先へ進めない確認**に答えられず、実機でセッションが `code 1` で終了した。
+/// 盤面の中で完結させるのが目的なのに、答えられないなら結局よそへ行くことになる。
+///
+/// 一方で `hover_scroll` を true にすると、外側の縦スクロールと端末自身の
+/// スクロールが取り合いになって行が重なる (実際にそう報告された)。
+#[test]
+fn 盤面の端末は触れるがホイールは取り合わない() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_board_ui").expect("盤面の描画"));
+    let call = body
+        .split("crate::terminal::draw(")
+        .nth(1)
+        .and_then(|t| t.split(')').next())
+        .expect("端末を描いている");
+    // 引数は (ui, s, theme, font, interactive, allow_resize, hover_scroll)
+    let args: Vec<&str> = call.split(',').map(str::trim).collect();
+    assert_eq!(args.len(), 7, "端末の描画引数が変わった: {call}");
+    assert_eq!(
+        args[4], "true",
+        "触れない端末になっている (確認に答えられない)"
+    );
+    assert_eq!(
+        args[6], "false",
+        "ホイールを取り合う設定になっている (行が重なって崩れる)"
+    );
+}
+
+/// **使うエージェントの選び方が、起動に効く。**
+///
+/// 「おまかせ」なら入っているもの全部から、選べば**その中だけ**から、
+/// 役割ごとに配る (1 つだけ選べば候補が 1 つなので全員それになる)。
+/// 選べるのに起動が変わらないなら、その選択肢は嘘になる (CLAUDE.md)。
+#[test]
+fn 使うエージェントの選択が起動に効く() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_launch_agent").expect("起動の橋"));
+    // 空なら役割ごとに配る (従来の道)。
+    assert!(
+        body.contains("roles::preset_for_role(&table, spec.role)"),
+        "おまかせの道が無い:\n{body}"
+    );
+    // 選ばれていれば、その中だけを候補にする。真実の在り処は Run 側。
+    assert!(
+        body.contains("p.pinned_agents_for(owner)"),
+        "Run が持っている選択を見ていない:\n{body}"
+    );
+    assert!(
+        body.contains("pinned.iter().any(|n| *n == row.name)"),
+        "選ばれた名前で候補を絞っていない:\n{body}"
+    );
+    // **担当を 0 体にしない。** 1 つも残らなければ、おまかせへ落ちる。
+    assert!(
+        body.contains("table = self.team_preset_table()"),
+        "選んだものが全部消えていたとき、担当が起動しないまま止まる:\n{body}"
+    );
+}
+
+/// **選べるのは、この PC に入っている AI CLI だけ。**
+///
+/// 入っていないものを選ばせると、その担当だけ永久に起動しない
+/// (画面には居るのに何も起きない)。
+#[test]
+fn 選べるエージェントは入っているものだけ() {
+    let s = src(GLUE);
+    let body = function_body(&s, s.find("fn team_board_ui").expect("盤面の描画"));
+    let list = body
+        .split("let agents: Vec<String>")
+        .nth(1)
+        .and_then(|t| t.split(';').next())
+        .expect("選択肢の一覧を作っている");
+    assert!(
+        list.contains("p.is_ai") && list.contains("p.available"),
+        "入っているかを見ていない:\n{list}"
+    );
+}
+
+/// **計画ができたら、始め方がその場に出る。**
+///
+/// 開始のボタンはヘッダの奥 (一時停止・停止の隣) にあるので、初めての人は
+/// 「計画は出たが次に何を押せばいいか分からない」で止まる (実際にそう報告
+/// された)。ただし**勝手には始めない** — 始めた瞬間に費用が発生するので、
+/// 1 回の明示的な操作は残す。
+#[test]
+fn 計画ができたら始め方がその場に出る() {
+    let s = src(BOARD);
+    let body = function_body(&s, s.find("fn ready_to_start_row").expect("案内の関数"));
+    // 出るのは「始められる」ときだけ。走っている盤面に出し続けない。
+    assert!(
+        body.contains("GoalStatus::Ready"),
+        "始められるときだけ出す形になっていない:\n{body}"
+    );
+    assert!(
+        body.contains("BoardAction::Start"),
+        "押しても始まらない案内になっている:\n{body}"
+    );
+    // **自動では始めない。** 押されたときだけ `Start` を積むこと。
+    let auto = body.split("BoardAction::Start").next().unwrap_or_default();
+    assert!(
+        auto.contains(".clicked()"),
+        "押していないのに始めている:\n{body}"
+    );
+    // 盤面の本体から呼ばれていること (関数だけ作って繋がない、を防ぐ)。
+    assert!(
+        s.contains("ready_to_start_row(ui, theme, snap, acts)"),
+        "案内が盤面から呼ばれていない"
+    );
+}
+
+#[test]
+fn おすすめの編成は計画と書き換えの両方に当たる() {
+    // **画面のおすすめと、実際に使う編成を食い違わせない。** 書き換えの段
+    // だけで当てると、最初から分かれている SPEC は既定の 6 役割・4 体の
+    // まま計画される。計画の段だけで当てると、書き換え依頼文が 4 体・
+    // 6 役割のまま飛んで 1 枚の HP が 8 本に割られる (実測)。
+    let glue = src(GLUE);
+    for f in ["fn team_draft_spec", "fn team_plan_from_form_inner"] {
+        let body = function_body(&glue, glue.find(f).expect(f));
+        assert!(
+            body.contains("team_apply_recommendation("),
+            "{f} がおすすめの編成を当てていない"
+        );
+    }
+    let apply = function_body(
+        &glue,
+        glue.find("fn team_apply_recommendation")
+            .expect("おすすめを当てる口"),
+    );
+    // 人が手で変えた編成は上書きしない。
+    assert!(
+        apply.contains("if !form.composition_touched"),
+        "手で変えた編成を上書きしている"
+    );
+    // 当てた結果は画面へ書き戻す (計画は 2 体なのにフォームは 4 体、を残さない)。
+    assert!(
+        apply.contains("p.form.agents = ") && apply.contains("p.form.roles = "),
+        "画面のフォームへ書き戻していない"
+    );
+    let board = src(BOARD);
+    assert!(
+        board.contains("form.composition_touched = true"),
+        "手で変えたことを記録していない (おすすめが毎回上書きする)"
+    );
+    assert!(
+        board.contains("recommendation_section(ui, theme, form)"),
+        "おすすめの段が画面から呼ばれていない"
+    );
+}
+
+#[test]
+fn 一枚の成果物は仕様書をこちらで書きwebの完了は読み込みを確かめる() {
+    // **10 分の予算を、仕様書を書いてもらう 5 分で使わない。** 1 枚の成果物は
+    // 雛形が出るので、エージェントを起こす前に返す。
+    let glue = src(GLUE);
+    let body = function_body(&glue, glue.find("fn team_draft_spec").expect("書き換え"));
+    let tpl = body.find("spec_template(").expect("雛形を使っていない");
+    let agent = body.find("team_headless_agent()").expect("エージェントの選定");
+    assert!(tpl < agent, "雛形より先にエージェントを起こしている (5 分待つ)");
+    assert!(
+        body.contains("DraftState::Ready"),
+        "雛形を人の確認へ回していない (黙って採用している)"
+    );
+    // **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
+    let rt = src(include_str!("runtime.rs"));
+    assert!(
+        rt.contains("match self.web_gate(&task, &acc)"),
+        "完了報告の受理が読み込みの実在を見ていない"
+    );
+    let gate = function_body(&rt, rt.find("fn web_gate").expect("関門"));
+    assert!(
+        gate.contains("webcheck::scan("),
+        "関門が走査していない"
+    );
+}
+
+#[test]
+fn 予算を越えた実装担当は促される() {
+    // **動いている担当は停滞ではない**ので `nudge_stalled` は黙る。だから
+    // 予算の促しは別に要る。tick が両方を、止めている間は撃たない場所で呼ぶ。
+    let rt = src(include_str!("runtime.rs"));
+    let tick = rt.find("self.nudge_stalled(obs.now, &mut out);").expect("停滞の促し");
+    let budget = rt.find("self.nudge_over_budget(obs.now, &mut out);").expect("予算の促し");
+    assert!(budget > tick && budget - tick < 600, "予算の促しが停滞の促しの隣に無い");
+    let body = function_body(&rt, rt.find("fn nudge_over_budget").expect("関数"));
+    assert!(body.contains("time_budget_secs(&self.goal.definition_of_done)"), "予算を完了条件から読んでいない");
+    assert!(body.contains("TeamRole::Implementer"), "実装担当以外まで急かしている");
+    assert!(body.contains("budget_nudged"), "1 度だけ、になっていない");
+    assert!(body.contains("TeamEffect::SendManualInstruction"), "人の指示と同じ経路を使っていない");
+}
+
+#[test]
+fn cliから来たrunにもおすすめの編成が当たる() {
+    // **画面のフォームだけで当てない。** `zai team run` は既定の「レビュー
+    // 必須」のまま計画され、1 枚の HP に「#1 のレビュー」が 1 本増えて
+    // 直列に 1 段延びた (実測: 試行 3)。体の数は `--agents` を尊重し、
+    // 役割とレビューの有無だけを依頼の形から当てる。
+    let glue = src(GLUE);
+    let body = function_body(
+        &glue,
+        glue.find("fn team_take_launch_request").expect("投函の受け取り"),
+    );
+    assert!(body.contains("composition::recommend("), "投函の Run に編成を当てていない");
+    assert!(
+        body.contains("review_required: rec.review_required"),
+        "レビューの有無を当てていない (1 枚の HP にレビューが 1 段増える)"
+    );
+    assert!(
+        body.contains("agent_count: req.agent_count"),
+        "--agents で人が言った体の数を上書きしている"
+    );
+    assert!(body.contains("p.plan_with("), "役割を計画へ渡していない");
+}
+
+
+// ══════════════════════════════════════════════════════════════════════
+//  構造化報告は画面ではなく置き場が正規の経路 (P1-1)
+// ══════════════════════════════════════════════════════════════════════
+
+const OUTBOX: &str = include_str!("outbox.rs");
+const PROMPT: &str = include_str!("prompt.rs");
+const GITINIT: &str = include_str!("gitinit.rs");
+
+/// **4 種類とも置き場を通れること**を構造で固定する。
+///
+/// 完了報告だけを置き場へ移しても根本解決にならない (レビューを落とすと
+/// タスクが `Reviewing` のまま止まる)。種別を 1 つ足したのに配送側の
+/// `match` を足し忘れる、を赤にする。
+#[test]
+fn 四種類とも置き場から受理する経路がある() {
+    let o = src(OUTBOX);
+    for k in ["Result", "Review", "Message", "Event"] {
+        assert!(
+            o.contains(&format!("Kind::{k}")),
+            "outbox が {k} を知らない"
+        );
+    }
+    // 受理は Runtime の 1 か所で、4 種類とも同じ判断関数へ落ちる。
+    let rt = src(RUNTIME);
+    let body = function_body(
+        &rt,
+        rt.find("pub fn accept_outbox").expect("置き場からの受理口"),
+    );
+    for f in [
+        "self.take_result(",
+        "self.take_review(",
+        "self.take_message(",
+        "self.take_event(",
+    ] {
+        assert!(body.contains(f), "accept_outbox が {f} を通していない:\n{body}");
+    }
+    // **二重取り込みは構造化キーで止める** (画面と置き場の両方に出ても 1 回)。
+    assert!(
+        body.contains("seen_key") && body.contains("is_seen"),
+        "accept_outbox が重複を落としていない:\n{body}"
+    );
+    // **却下したものを重複台帳へ入れない。** 入れると、直して出し直した
+    // 報告まで「もう見た」で捨てることになる。印は適用が済んでから。
+    let mark = body.find("mark_seen").expect("印を付けていない");
+    let applied = body.find("applied?").expect("適用の成否を見ていない");
+    assert!(
+        applied < mark,
+        "適用の前に重複台帳へ入れている (却下した本文を出し直せない):\n{body}"
+    );
+    // **セッションを見ない。** 見ると、未 bind・未観測・終了直後を落とす。
+    assert!(
+        !body.contains("session_id") && !body.contains("SessionObs"),
+        "accept_outbox がセッションに依存している (未 bind の報告が落ちる):\n{body}"
+    );
+}
+
+/// **受理してからファイルを消す。** 先に消すと、途中で落ちた報告は戻らない。
+#[test]
+fn 置き場のファイルは受理してから消す() {
+    let p = src(PANEL);
+    let body = function_body(
+        &p,
+        p.find("fn process_outbox_file")
+            .expect("一ファイルの取り込み"),
+    );
+    let accept = body.find("accept_outbox").expect("受理を通していない");
+    let remove = body.find("remove_report").expect("専用の削除口を通していない");
+    assert!(
+        accept < remove,
+        "受理より先に消している (落ちた報告が戻らない):\n{body}"
+    );
+    // 一時的に届かないだけの正しい報告を、隔離で捨てない。
+    assert!(
+        body.contains("outbox_quarantine") && body.contains("outbox_retry"),
+        "隔離と読み直しを区別していない:\n{body}"
+    );
+    // **却下された報告は隔離へ回す** (消して終わりにしない)。
+    assert!(
+        body.contains("Err(why) => self.outbox_quarantine"),
+        "Runtime が却下した報告を隔離していない:\n{body}"
+    );
+    // 隔離そのものがファイルを消さない (証拠を失わない)。
+    let o = src(OUTBOX);
+    let q = function_body(&o, o.find("pub fn quarantine").expect("隔離"));
+    assert!(
+        !q.contains("remove_file"),
+        "隔離が消しに回っている (却下された報告の中身を失う):\n{q}"
+    );
+}
+
+/// **指示文が 4 種類とも置き場へ出すよう教えている。**
+///
+/// 教えていない種別は一生画面にしか出ない (機能があっても到達経路が無い)。
+#[test]
+fn 指示文は四種類とも置き場へ出すよう教える() {
+    let p = src(PROMPT);
+    let sec = function_body(&p, p.find("fn outbox_section").expect("提出の作法"));
+    for k in ["result", "review", "message", "event"] {
+        assert!(sec.contains(k), "提出の作法が {k} を教えていない");
+    }
+    // 原子公開の手順 (OS ごと) と、包みの形。
+    for needle in [
+        "tmp_name",
+        "final_name",
+        "posix_single_quote",
+        "mv {posix_tmp} {posix_fin}",
+        "powershell_single_quote",
+        "Move-Item {powershell_tmp} {powershell_fin}",
+        "payload",
+        "run_id",
+    ] {
+        assert!(sec.contains(needle), "提出の作法に {needle} が無い:\n{sec}");
+    }
+    // 種別ごとの案内も繋がっていること。
+    for f in ["fn review_submit", "fn subagents_section", "fn teammates_section"] {
+        let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
+        assert!(
+            body.contains("提出のしかた"),
+            "{f} が置き場へ誘導していない:\n{body}"
+        );
+    }
+}
+
+/// **Git は「あるか」ではなく「使える基準点があるか」で見る (P1-2)。**
+#[test]
+fn git判定はheadの有無まで見る() {
+    let p = src(PANEL);
+    let init = function_body(&p, p.find("pub fn init_git").expect("Git の用意"));
+    assert!(
+        init.contains("gitinit::prepare"),
+        "init_git がやり直せる用意を通していない:\n{init}"
+    );
+    assert!(
+        !init.contains("discover_toplevel"),
+        "`.git` の有無で準備完了を決めている (HEAD 無しを見逃す):\n{init}"
+    );
+    let refresh = function_body(
+        &p,
+        p.find("fn refresh_git_readiness").expect("旗の決め所"),
+    );
+    assert!(
+        refresh.contains("gitinit::plan_for") && refresh.contains("gitinit::probe"),
+        "旗を状態から決めていない:\n{refresh}"
+    );
+    // **利用者のものを壊さない。** 破壊的な git 操作を持ち込まない。
+    //
+    // **コメントは除いて見る。** 「使わない」と書いた doc がそのまま
+    // 引っかかると、番人は自分の説明文を咎めるだけになる (この repo で
+    // 実際に 3 版続けて空回りした形)。
+    let g = src(GITINIT);
+    // 製品側だけを見る (テストは一時フォルダを片付けるので `remove_dir_all`
+    // を使う — そこまで咎めると番人が空回りする)。
+    let prod = g.split("#[cfg(test)]").next().unwrap_or(&g);
+    let code: String = prod
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for bad in ["--hard", "checkout", "\"clean\"", "remove_dir_all", "remove_file(ws"] {
+        assert!(
+            !code.contains(bad),
+            "gitinit が破壊的な操作 ({bad}) を使っている"
+        );
+    }
+    // index は一時ファイルの上で組む。
+    let prep = function_body(&g, g.find("pub fn prepare").expect("用意"));
+    assert!(
+        prep.contains("tmp_index_path") && prep.contains("risky_paths"),
+        "利用者の index を守る手立てと秘密情報の検査が無い:\n{prep}"
+    );
 }

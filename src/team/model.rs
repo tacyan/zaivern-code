@@ -970,6 +970,11 @@ pub enum TeamEventKind {
     DecisionRaised,
     /// 人がエージェントへ直接出した指示 (**監査のために必ず残す**)。
     HumanInstruction,
+    /// **エージェント同士のやり取り** (「ここまで出来たから次これするね」)。
+    ///
+    /// 誰から誰へ何を言ったかは、あとから追えないと意味が無い
+    /// (端末の中だけで完結すると、盤面には何も残らない)。
+    AgentMessage,
     /// 状態機械が拒否した遷移 (**起こったこと自体を残す**)。
     TransitionRejected,
     DecisionResolved,
@@ -1005,6 +1010,7 @@ impl TeamEventKind {
             TeamEventKind::SubAgentReported => "sub_agent_reported",
             TeamEventKind::DecisionRaised => "decision_raised",
             TeamEventKind::HumanInstruction => "human_instruction",
+            TeamEventKind::AgentMessage => "agent_message",
             TeamEventKind::TransitionRejected => "transition_rejected",
             TeamEventKind::DecisionResolved => "decision_resolved",
             TeamEventKind::Rejected => "rejected",

@@ -51,8 +51,40 @@ impl Candidate {
     }
 
     /// いま新しい仕事を受けられるか。
+    ///
+    /// **持ち仕事が無いなら空いている。** ここが `Idle | Working` だけを
+    /// 見ていたので、実機で**空いている担当が 3 体居るのにタスクが 5 本
+    /// 待ち続ける**という止まり方をした (Planner / Tester / Reviewer が
+    /// `stalled`、#1 #2 #10 #11 #14 が `ready` のまま)。
+    ///
+    /// 状態は**画面から推し量った値**である。仕事を持っていない担当は
+    /// 出力が動かなくて当たり前なので、そのまま「停滞」と読まれる。
+    /// そして停滞と読まれた担当には配らないので、**二度と出力が動かない** —
+    /// 推測が自分で自分を裏付ける輪になっていた。
+    ///
+    /// 配らない理由になるのは、**推し量らなくても分かる 2 つ**だけ:
+    ///
+    /// * `Exited` — プロセスが居ない。曖昧さが無い
+    /// * `WaitingApproval` — 承認の返事として本文が解釈される。**絶対に
+    ///   注入しない** (`coordinator::SessionState` の doc を参照)
+    ///
+    /// 残りは配ってよい。**打ち込んでよい頃合いかどうかは `submit` が
+    /// 別に見ている** (入力欄の準備を待ち、駄目なら人へ返す) ので、
+    /// ここで二重に見張って止まるより、渡して確かめるほうが速い。
+    /// 設計原則 4「エージェントの状態を画面から推測しない」の具体形 —
+    /// **何も配っていないという構造的な事実**のほうが、画面の読みより強い。
     fn free(&self) -> bool {
-        self.holding.is_none() && matches!(self.state, SessionState::Idle | SessionState::Working)
+        // **配ってよいかの判定は調停層の 1 本を借りる。**
+        //
+        // ここに別の規則を書くと、**提案しては断られる**組み合わせが生まれ、
+        // 毎 tick 「割り当てを見送りました」が記録される (実測で台帳が
+        // 500 件のそれだけで埋まった)。
+        //
+        // 「仕事を持っていない担当が停滞に見えて二度と配られない」問題は、
+        // ここを緩めて解くのではなく **`roles::derive_agent_work_state` が
+        // 停滞と呼ばない**ことで解く (持ち仕事が無ければ出力が動かなくて
+        // 当たり前なので、そもそも停滞ではない)。
+        self.holding.is_none() && crate::coordinator::assignable(self.state)
     }
 }
 
@@ -74,7 +106,17 @@ pub enum Unassigned {
     /// 担当ファイルが他タスクと重なる。
     FileOverlap { task: TaskId, with: TaskId },
     /// レビュー担当が実装担当と同じになってしまう。
+    ///
+    /// **一時的**。ほかのエージェントは居るが今は塞がっているだけなので、
+    /// 誰かが終われば配れる。人へ上げると、勝手に解決したあとも消えない
+    /// 判断が積み上がる。
     ReviewerWouldBeAuthor(TaskId),
+    /// 実装担当**以外のエージェントが 1 体も居ない**。
+    ///
+    /// [`Unassigned::ReviewerWouldBeAuthor`] と違い、**待っても解決しない**
+    /// (自分のレビューは禁止なので、この Run のままでは永久に配れない)。
+    /// 人が並列数を増やすか、レビュー無しにするしかない。
+    NoOtherReviewer(TaskId),
 }
 
 impl Unassigned {
@@ -83,7 +125,8 @@ impl Unassigned {
             Unassigned::NoCandidate(t)
             | Unassigned::CapsMissing { task: t, .. }
             | Unassigned::FileOverlap { task: t, .. }
-            | Unassigned::ReviewerWouldBeAuthor(t) => *t,
+            | Unassigned::ReviewerWouldBeAuthor(t)
+            | Unassigned::NoOtherReviewer(t) => *t,
         }
     }
 
@@ -101,6 +144,9 @@ impl Unassigned {
             }
             Unassigned::ReviewerWouldBeAuthor(t) => {
                 format!("#{t}: 実装した本人しかレビュー候補がいません")
+            }
+            Unassigned::NoOtherReviewer(t) => {
+                format!("#{t}: レビューできるエージェントが実装担当のほかに居ません")
             }
         }
     }
@@ -157,9 +203,21 @@ pub fn plan_assignments(
         .filter(|t| t.state == TeamTaskState::Ready)
         .collect();
     ready.sort_by(|a, b| {
+        // **レビューを先に配る。**
+        //
+        // 後回しにすると、空いている担当が新しい実装で埋まってしまい、
+        // レビューの番が来たときには**実装した本人しか残っていない**
+        // (自分のレビューは禁止なので配れない)。実機ではこれで 8 件が
+        // 「実装した本人しかレビュー候補がいません」で人の判断待ちになり、
+        // Goal ごと止まった。
+        //
+        // レビューは実装より短く、終われば担当が空くので、先に通すほうが
+        // 全体も速い。
+        let ra = u8::from(a.review_of.is_none());
+        let rb = u8::from(b.review_of.is_none());
         let da = depth.get(&a.id).copied().unwrap_or(0);
         let db = depth.get(&b.id).copied().unwrap_or(0);
-        db.cmp(&da).then(a.id.cmp(&b.id))
+        ra.cmp(&rb).then(db.cmp(&da)).then(a.id.cmp(&b.id))
     });
 
     // すでに誰かが握っているファイル (このフレームで配ったぶんも足す)。
@@ -203,12 +261,28 @@ pub fn plan_assignments(
 
         if pool.is_empty() {
             // 候補が居ないのか、本人しか居ないのかを区別して伝える。
+            //
+            // **空集合に `all` を撃たない。** 「誰も空いていない」ときも
+            // `all` は真を返すので、素直に書くと*ただ混んでいるだけ*の
+            // レビューが「実装した本人しかレビュー候補がいません」になる。
+            // 実機ではこれが 5 件積み上がり、待っても消えなかった
+            // (混雑は次の tick で解ける — 人へ上げる話ではない)。
+            let free_now: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| c.free() && !taken.contains(&c.session))
+                .collect();
             let only_author = author_session.is_some()
-                && candidates
+                && !free_now.is_empty()
+                && free_now.iter().all(|c| Some(c.session) == author_session);
+            // **待っても解決しない**のは、実装担当以外が 1 体も居ないとき
+            // だけ (空いているかどうかではない)。
+            let no_other = author_session.is_some()
+                && !candidates
                     .iter()
-                    .filter(|c| c.free() && !taken.contains(&c.session))
-                    .all(|c| Some(c.session) == author_session);
-            out.unassigned.push(if only_author {
+                    .any(|c| Some(c.session) != author_session);
+            out.unassigned.push(if no_other {
+                Unassigned::NoOtherReviewer(t.id)
+            } else if only_author {
                 Unassigned::ReviewerWouldBeAuthor(t.id)
             } else {
                 Unassigned::NoCandidate(t.id)
@@ -264,10 +338,16 @@ pub fn desired_sessions(tasks: &[TeamTask], max_agents: usize) -> usize {
     if max_agents == 0 {
         return 0;
     }
-    let parallel = tasks
-        .iter()
-        .filter(|t| t.dependencies.is_empty() && !t.state.is_terminal())
-        .count();
+    // **同時に走りうる最大数**で見る。
+    //
+    // 以前は「依存が空のタスク数」で数えていたが、`dependencies` は
+    // 静的な項目なので、依存が済んでも空にはならない。段を 1 つでも
+    // 挟んだ計画では永久に 1 になり、実装が 8 件並べるのに**最後まで
+    // 2 体しか立たなかった** (実測: 盤面の「稼働 2」)。
+    //
+    // 幅で見れば、チームは最初から必要な人数ぶん立ち上がる —
+    // 上の段を待っている間も居るので、順番が来た瞬間に一斉に動ける。
+    let parallel = super::graph::max_parallel_width(tasks);
     // **レビュー用に 1 体余分に見る。** 実装担当は自分のレビューをできない
     // ので、並列実装数ぴったりだと「全員が実装中でレビューできない」状態が
     // 生まれ、上限に当たるまで誰も先へ進めない (実測で詰まった)。
@@ -284,7 +364,7 @@ mod tests {
     use super::super::testkit::task;
     use super::*;
 
-    fn cand(id: u64, state: SessionState, caps: &[&str]) -> Candidate {
+    pub(super) fn cand(id: u64, state: SessionState, caps: &[&str]) -> Candidate {
         Candidate {
             agent: AgentId::new(format!("a{id}")),
             session: id,
@@ -375,10 +455,26 @@ mod tests {
         let mut rev = ready(2, "rev", &[]);
         rev.review_of = Some(1);
         let tasks = vec![impl_t, rev];
-        // 空きが実装担当 (session 1) だけ → 配らない
+        // **実装担当しか居ない → 待っても解決しない。**
         let only_author = vec![cand(1, SessionState::Idle, &[])];
         let p = plan_assignments(&tasks, &only_author, &BTreeMap::new());
-        assert_eq!(p.unassigned, vec![Unassigned::ReviewerWouldBeAuthor(2)]);
+        assert_eq!(p.unassigned, vec![Unassigned::NoOtherReviewer(2)]);
+        // **他は居るが今は塞がっている → 一時的。**
+        // 次の tick で空けば配れるので、`NoOtherReviewer` にしてはいけない。
+        let mut busy = cand(2, SessionState::Working, &[]);
+        busy.holding = Some(9);
+        let one_free = vec![cand(1, SessionState::Idle, &[]), busy];
+        let p3 = plan_assignments(&tasks, &one_free, &BTreeMap::new());
+        assert_eq!(p3.unassigned, vec![Unassigned::ReviewerWouldBeAuthor(2)]);
+        // **誰一人空いていない → ただ混んでいるだけ。**
+        // 空集合へ `all` を撃つと真になるので、素直に書くとここが
+        // 「実装した本人しか居ない」に化けて人の判断待ちが積み上がる。
+        let mut a = cand(1, SessionState::Working, &[]);
+        a.holding = Some(8);
+        let mut b = cand(2, SessionState::Working, &[]);
+        b.holding = Some(9);
+        let p4 = plan_assignments(&tasks, &[a, b], &BTreeMap::new());
+        assert_eq!(p4.unassigned, vec![Unassigned::NoCandidate(2)]);
         // 別のセッションが居れば、そちらへ配る
         let two = vec![
             cand(1, SessionState::Idle, &[]),
@@ -413,18 +509,51 @@ mod tests {
     }
 
     #[test]
-    fn 保有中や停滞中のセッションへは配らない() {
+    fn 配らないのは保有中と居ない相手と承認待ちだけ() {
         let tasks = vec![ready(1, "a", &["src/a.rs"])];
         let mut busy = cand(1, SessionState::Idle, &[]);
         busy.holding = Some(9);
         let cands = vec![
             busy,
-            cand(2, SessionState::Stalled, &[]),
-            cand(3, SessionState::Exited, &[]),
+            cand(2, SessionState::Exited, &[]),
+            cand(3, SessionState::WaitingApproval, &[]),
         ];
         let p = plan_assignments(&tasks, &cands, &BTreeMap::new());
-        assert!(p.assignments.is_empty());
+        assert!(p.assignments.is_empty(), "配ってはいけない相手へ配った");
         assert_eq!(p.unassigned, vec![Unassigned::NoCandidate(1)]);
+    }
+
+    /// **手ぶらの担当へは配れる。**
+    ///
+    /// 実測の止まり方: Planner / Tester / Reviewer が `stalled` で、`ready` の
+    /// タスクが 5 本待っていた。空いている担当と待っている仕事が永久に
+    /// 出会えなかった。
+    ///
+    /// **最初はここ (`free()`) を緩めて直したが、それは誤りだった。**
+    /// 調停層は別の規則で断るので、**提案しては断られる**組み合わせが生まれ、
+    /// 毎 tick 「割り当てを見送りました」が積まれて台帳 500 件がそれだけに
+    /// なった。正しい直し場は `roles::derive_agent_work_state` — 仕事を
+    /// 持っていない担当を**そもそも停滞と呼ばない** (`roles::tests::
+    /// 仕事が無い担当は停滞ではない` が対の番人)。ここは配れることだけを見る。
+    #[test]
+    fn 手ぶらの担当へは配れる() {
+        let tasks = vec![
+            ready(1, "a", &[]),
+            ready(2, "b", &[]),
+            ready(3, "c", &[]),
+            ready(4, "d", &[]),
+        ];
+        let cands = vec![
+            cand(1, SessionState::Idle, &[]),
+            cand(2, SessionState::Idle, &[]),
+            cand(3, SessionState::AwaitingInput, &[]),
+            cand(4, SessionState::Working, &[]),
+        ];
+        let p = plan_assignments(&tasks, &cands, &BTreeMap::new());
+        assert_eq!(p.assignments.len(), 4, "手ぶらの担当へ配れていない");
+        let mut got: Vec<_> = p.assignments.iter().map(|a| a.session).collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3, 4], "配り先が偏っている");
     }
 
     #[test]
@@ -461,5 +590,66 @@ mod tests {
         let p = plan_assignments(&tasks, &[], &BTreeMap::new());
         assert!(p.assignments.is_empty());
         assert_eq!(p.unassigned, vec![Unassigned::NoCandidate(1)]);
+    }
+}
+
+#[cfg(test)]
+mod one_rule_tests {
+    use super::tests::cand;
+    use super::*;
+
+    /// **配ってよいかの規則は 1 本だけ。**
+    ///
+    /// スケジューラと調停層が別々の規則を持つと、**提案しては断られる**
+    /// 組み合わせが生まれ、毎 tick 「割り当てを見送りました」が積まれる。
+    /// 実測で台帳 500 件がそれだけになり、計画も起動も伝言も押し出されて
+    /// 人には何が起きたか一切追えなくなった。
+    #[test]
+    fn 配ってよいかの規則は調停層と同じ() {
+        for st in [
+            SessionState::Idle,
+            SessionState::AwaitingInput,
+            SessionState::Working,
+            SessionState::WaitingApproval,
+            SessionState::Stalled,
+            SessionState::Exited,
+            SessionState::Unknown,
+        ] {
+            let c = cand(1, st, &[]);
+            assert_eq!(
+                c.free(),
+                crate::coordinator::assignable(st),
+                "{st:?} でスケジューラと調停層の判断が違う (提案しては断られる)"
+            );
+        }
+        // 保有中はどちらにせよ配らない。
+        let mut busy = cand(1, SessionState::Idle, &[]);
+        busy.holding = Some(9);
+        assert!(!busy.free(), "保有中の担当へ配ろうとしている");
+    }
+
+    /// **規則をスケジューラ側に書き写していない。**
+    /// 書き写すと、片方だけ直したときに静かにずれる。
+    #[test]
+    fn 規則を書き写していない() {
+        let src = include_str!("scheduler.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn free(&self) -> bool {")
+            .nth(1)
+            .and_then(|t| t.split("\n    }\n").next())
+            .expect("free がある");
+        assert!(
+            body.contains("coordinator::assignable"),
+            "調停層の規則を借りていない"
+        );
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("SessionState::"),
+            "スケジューラ側に状態の一覧を書き写している"
+        );
     }
 }

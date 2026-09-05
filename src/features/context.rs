@@ -7,4 +7,4 @@
 //!  — こうしておくと `crate::context::…` が**クレート内 API**として
 //!  他のモジュールからも呼べる。将来 Scheduler / Provider 層が使う面がここ。)
 
-pub use crate::context::{cli_main, FEATURE, HELP};
+pub use crate::context::{cli_main, FEATURE, HELP, ID_TOGGLE_ENABLED};

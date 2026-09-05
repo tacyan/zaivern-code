@@ -59,12 +59,18 @@ use super::model::{Decision, TeamAgent, TeamEvent, TeamGoal, TeamGroup, TeamTask
 ///   `run.json` と古い `tasks.json` が同居する — しかもどちらも JSON
 ///   としては正しいので、読む側は正常な状態として読んでしまう。
 ///   直前の完全なスナップショットは `state.prev.json` に残す。
-pub const SCHEMA_VERSION: u32 = 4;
+/// * 5 — 元 workspace と Run 専用 git worktree の対応を保存する。
+///   エージェント起動・検証・changeset 計測は後者、状態の置き場は前者を使う。
+/// * 6 — Run専用worktreeを作った基準commitを保存し、detached HEAD上で
+///   commitされた成果物も削除確認とchangesetの対象にする。
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// events.jsonl の行数上限 (超えたら古い行から落とす)。
 pub const EVENT_LOG_MAX_LINES: usize = 5_000;
 /// 1 ファイルのバイト上限。これを超えたものは読まない (壊れているとみなす)。
 pub const FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 墓標列挙の上限。外部入力で起動時メモリとI/Oを無制限に増やさない。
+pub const CLOSED_RUN_MAX: usize = 256;
 
 /// 状態の置き場 = `<根>/team/<ワークスペースキー>/`。
 ///
@@ -154,9 +160,29 @@ pub struct RunDoc {
     pub version: u32,
     /// 実行 ID。**同じ Run を二重に開始しない**ための鍵。
     pub run_id: String,
+    /// ユーザーが Team を開始した元 workspace。旧版互換のため
+    /// フィールド名は維持する。
     pub workspace: String,
+    /// Run 専用 worktree と実行 workspace。`None` は旧保存形式。
+    #[serde(default)]
+    pub run_workspace: Option<super::run_workspace::RunWorkspace>,
     pub spec_source: String,
     pub agent_count: usize,
+    /// **どのエージェントで動かすか** (プリセット名の一覧)。空なら「おまかせ」。
+    ///
+    /// | 選び方 | 動き |
+    /// |---|---|
+    /// | 空 | この PC に入っている CLI を、役割ごとに配る |
+    /// | 1 つ | 全員がそれで動く |
+    /// | 複数 | **選んだものの中だけ**で、役割ごとに配る |
+    ///
+    /// 1 つも複数も同じ仕組みで動く — 選ばれたものだけを候補にして
+    /// [`super::roles::preset_for_role`] を通すだけ (分岐を 2 つ作らない)。
+    ///
+    /// Run に持たせるのは、再起動をまたいでも同じ顔ぶれで立て直すため
+    /// (設定を後から変えても、走っている Run の編成は変わらない)。
+    #[serde(default)]
+    pub agent_presets: Vec<String>,
     pub max_attempts: u8,
     pub review_required: bool,
     pub paused: bool,
@@ -181,6 +207,9 @@ pub struct RunDoc {
     /// タスクが永久に `Validating` で固まる。
     #[serde(default)]
     pub effects: Vec<EffectRecord>,
+    /// 受理済み報告のbounded台帳。削除失敗と再起動が重なっても二重反映しない。
+    #[serde(default)]
+    pub seen_blocks: Vec<SeenBlockRecord>,
     /// **人が実行を承認した検証 (1 回ぶん)。**
     ///
     /// 文字列だけで持ってはいけない ([`ValidationApproval`] の doc を参照)。
@@ -200,6 +229,15 @@ pub struct RunDoc {
     /// ([`RunDoc::migrate`] が `effects` へ移す)。**新しく書かない。**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_effects: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeenBlockRecord {
+    pub agent_id: String,
+    pub kind: String,
+    pub task_id: Option<u64>,
+    pub digest: (u64, u64),
+    pub len: u32,
 }
 
 impl RunDoc {
@@ -453,10 +491,42 @@ impl StateDoc {
         if self.run.run_id.trim().is_empty() {
             return Err("run_id が空です".into());
         }
+        if !super::outbox::valid_run_id(&self.run.run_id) {
+            return Err(format!("run_id が安全な名前ではありません: {:?}", self.run.run_id));
+        }
+        if self.run_id != self.run.run_id {
+            return Err(format!(
+                "スナップショットの run_id ({}) が Run ({}) と一致しません",
+                self.run_id, self.run.run_id
+            ));
+        }
+        if self.workspace != self.run.workspace {
+            return Err(format!(
+                "スナップショットの workspace ({}) が Run ({}) と一致しません",
+                self.workspace, self.run.workspace
+            ));
+        }
+        if let Some(run_workspace) = &self.run.run_workspace {
+            if run_workspace.source_workspace != self.run.workspace {
+                return Err("Run の元 workspace と worktree 対応が一致しません".into());
+            }
+        }
         if let Some(t) = self.tasks.iter().find(|t| t.goal_id != self.goal.id) {
             return Err(format!(
                 "タスク #{} の goal ({}) が goal.json ({}) と一致しません",
                 t.id, t.goal_id.0, self.goal.id.0
+            ));
+        }
+        if self.tasks.iter().any(|t| t.id == u64::MAX) {
+            return Err("最大値のtask_idは次のIDを安全に採番できません".into());
+        }
+        if self.events.iter().any(|e| e.id == u64::MAX) {
+            return Err("最大値のevent_idは次のIDを安全に採番できません".into());
+        }
+        if self.run.seen_blocks.len() > super::runtime::SEEN_BLOCKS_CAP {
+            return Err(format!(
+                "受理済み報告台帳が上限{}件を超えています",
+                super::runtime::SEEN_BLOCKS_CAP
             ));
         }
         let ids: std::collections::BTreeSet<super::model::TaskId> =
@@ -487,7 +557,10 @@ impl StateDoc {
 /// どの段で落ちても、`state.json` か `state.prev.json` の**どちらかは
 /// 完全**なので、新旧が混ざった状態を読むことはない。
 pub fn save(dir: &Path, s: &Saved) -> Result<(), SaveError> {
-    std::fs::create_dir_all(dir).map_err(|e| SaveError::Io(e.to_string()))?;
+    if let Some(parent) = dir.parent() {
+        ensure_plain_dir_created(parent)?;
+    }
+    ensure_plain_dir_created(dir)?;
     let next = read_doc(&dir.join(STATE_FILE))
         .map(|d| d.generation.saturating_add(1))
         .unwrap_or(1);
@@ -597,6 +670,8 @@ pub mod fault_inject {
 
     thread_local! {
         static AT: Cell<Option<SavePhase>> = const { Cell::new(None) };
+        static REMOVE_UNDER: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// この段で `save` を失敗させる。
@@ -604,13 +679,26 @@ pub mod fault_inject {
         AT.with(|c| c.set(Some(phase)));
     }
 
+    /// **このパス (とその下) の削除を失敗させる** ([`super::remove_dir_checked`])。
+    ///
+    /// 権限エラーの再現は OS 依存 (root で走る CI や Windows では通ってしまう)
+    /// なので、削除の口を 1 つに絞ってそこで決定的に失敗させる。
+    pub fn fail_remove_under(path: &std::path::Path) {
+        REMOVE_UNDER.with(|c| *c.borrow_mut() = Some(path.to_path_buf()));
+    }
+
     /// 差し替えを外す。
     pub fn clear() {
         AT.with(|c| c.set(None));
+        REMOVE_UNDER.with(|c| *c.borrow_mut() = None);
     }
 
     pub(super) fn should_fail(phase: SavePhase) -> bool {
         AT.with(|c| c.get()) == Some(phase)
+    }
+
+    pub(super) fn should_fail_remove(dir: &std::path::Path) -> bool {
+        REMOVE_UNDER.with(|c| c.borrow().as_ref().is_some_and(|p| dir.starts_with(p)))
     }
 }
 
@@ -858,6 +946,278 @@ pub fn reset(dir: &Path) -> Result<usize, SaveError> {
     Ok(n)
 }
 
+// ── 閉じた Run の墓標 ─────────────────────────────────────────────────
+//
+// Run を閉じるとき、保存 (`runs/<run_id>/`) の削除は失敗しうる (Windows の
+// delete pending、権限、同期ツールが握っている、など)。削除だけに頼ると、
+// 失敗した Run は**次の起動で `restore_run` に拾われて勝手に復活する**。
+// そこで「閉じた」という事実を**消す前に**別の場所へ原子的に書き、復元は
+// それを先に見る。後始末が全部済んだら墓標も片付ける。
+//
+// 置き場は `<state_dir>/closed/<run_id>`。名前は [`super::outbox::safe_child`]
+// と同じ関門を通す (空・`..`・区切り文字入りの `run_id` は、書く側も消す側も
+// 通さない)。中身が壊れていても**存在すれば閉じた扱い** (安全側)。
+
+/// 閉じた Run の墓標を置くフォルダ名。
+pub const CLOSED_DIR: &str = "closed";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosePolicy {
+    /// 未保存変更が無い場合だけ削除する。旧墓標もこの扱い。
+    #[default]
+    CleanOnly,
+    /// ユーザーが未保存成果物の破棄を明示承認した。
+    Discard,
+    /// Run管理だけを閉じ、worktreeと成果物を残す。
+    Keep,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosePhase {
+    /// セッション／validationの停止完了をまだ確認していない。
+    Stopping,
+    /// 停止完了を確認済みで、policyに従うcleanupを再試行できる。
+    #[default]
+    Cleanup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseRecord {
+    pub run_id: String,
+    pub closed_at: u64,
+    #[serde(default)]
+    pub policy: ClosePolicy,
+    #[serde(default)]
+    pub phase: ClosePhase,
+    /// UI表示専用。削除対象は必ず`run_workspace::expected_root()`から再計算する。
+    #[serde(default)]
+    pub artifact_path: String,
+}
+
+/// Run ごとの保存フォルダ (`<state_dir>/runs/<run_id>/`)。
+///
+/// `run_id` が名前として安全でなければ `None` — 保存も削除もしない。
+/// 保存された JSON の `run_id` は利用者のファイルから来るので、そのまま
+/// `join` すると `runs/` の外へ書き出せてしまう。
+pub fn run_dir_in(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    super::outbox::safe_child(&state_dir.join(super::panel::RUNS_DIR), run_id)
+}
+
+/// 墓標のパス (`run_id` が安全なときだけ)。
+fn closed_marker(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
+    super::outbox::safe_child(&state_dir.join(CLOSED_DIR), run_id)
+}
+
+/// **閉じたと記す** (削除の前に呼ぶ)。書き方は保存と同じ「一時ファイルへ
+/// fsync → rename」なので、途中で落ちても半端な墓標は残らない。
+pub fn mark_closed(state_dir: &Path, run_id: &str) -> Result<(), SaveError> {
+    write_close_record(
+        state_dir,
+        &CloseRecord {
+            run_id: run_id.to_string(),
+            closed_at: super::model::now_secs(),
+            policy: ClosePolicy::CleanOnly,
+            phase: ClosePhase::Cleanup,
+            artifact_path: String::new(),
+        },
+    )
+}
+
+pub fn mark_close_state(
+    state_dir: &Path,
+    run_id: &str,
+    policy: ClosePolicy,
+    phase: ClosePhase,
+    artifact_path: &str,
+) -> Result<(), SaveError> {
+    write_close_record(
+        state_dir,
+        &CloseRecord {
+            run_id: run_id.to_string(),
+            closed_at: super::model::now_secs(),
+            policy,
+            phase,
+            artifact_path: artifact_path.to_string(),
+        },
+    )
+}
+
+fn write_close_record(state_dir: &Path, record: &CloseRecord) -> Result<(), SaveError> {
+    let run_id = record.run_id.as_str();
+    let marker = closed_marker(state_dir, run_id).ok_or_else(|| {
+        SaveError::Io(format!("run_id {run_id:?} は保存の名前にできません"))
+    })?;
+    let dir = state_dir.join(CLOSED_DIR);
+    if let Some(parent) = state_dir.parent() {
+        ensure_plain_dir_created(parent)?;
+    }
+    ensure_plain_dir_created(state_dir)?;
+    ensure_plain_dir_created(&dir)?;
+    let body = serde_json::to_string(record).map_err(|e| SaveError::Serialize(e.to_string()))?;
+    let tmp = tmp_path(&dir, run_id);
+    write_synced(&tmp, &body)?;
+    if let Err(e) = rename_retrying(&tmp, &marker) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Io(e));
+    }
+    sync_dir(&dir);
+    Ok(())
+}
+
+/// 墓標の内容を読む。壊れている場合は`None`だが、[`is_closed`]はtrueのまま。
+/// 呼び出し側は内容不明を自動削除してはいけない。
+pub fn close_record(state_dir: &Path, run_id: &str) -> Option<CloseRecord> {
+    let marker = closed_marker(state_dir, run_id)?;
+    let raw = read_capped(&marker)?;
+    let record: CloseRecord = serde_json::from_str(&raw).ok()?;
+    (record.run_id == run_id).then_some(record)
+}
+
+/// 根の控え (`state.json`) が持っている `run_id` (読めなければ `None`)。
+///
+/// 根の控えは「いちばん古い 1 本」の写しなので、その Run を閉じたら一緒に
+/// 片付けないと復元経路が拾い直す。
+pub fn root_run_id(state_dir: &Path) -> Option<String> {
+    read_doc(&state_dir.join(STATE_FILE))
+        .or_else(|| read_doc(&state_dir.join(PREV_FILE)))
+        .map(|d| d.run.run_id)
+}
+
+/// 閉じたと記されているか。**中身は見ない** — 壊れていても、有れば閉じた扱い。
+pub fn is_closed(state_dir: &Path, run_id: &str) -> bool {
+    closed_marker(state_dir, run_id).is_some_and(|p| p.exists())
+}
+
+/// 墓標を片付ける (後始末が済んだあと)。無ければ成功。
+pub fn unmark_closed(state_dir: &Path, run_id: &str) -> Result<(), SaveError> {
+    let Some(marker) = closed_marker(state_dir, run_id) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SaveError::Io(e.to_string())),
+    }
+}
+
+/// 墓標のある `run_id` の一覧 (名前順)。書きかけの一時ファイル (`.` 始まり) は
+/// [`super::outbox::valid_run_id`] が弾くので混ざらない。
+pub fn closed_run_ids(state_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(state_dir.join(CLOSED_DIR)) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| super::outbox::valid_run_id(n))
+        .take(CLOSED_RUN_MAX)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// **フォルダごと消す。無いのは成功。** それ以外の失敗は理由を返す。
+///
+/// 削除は `let _ =` で握り潰さない — 失敗を黙ると、消えなかった保存が次の
+/// 起動で復活する。テストは [`fault_inject::fail_remove_under`] で失敗を
+/// 決定的に起こせる (権限エラーの再現は OS 依存なので使わない)。
+pub fn remove_dir_checked(dir: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if fault_inject::should_fail_remove(dir) {
+        return Err("(テスト) 削除に失敗".to_string());
+    }
+    if let Some(parent) = dir.parent() {
+        ensure_plain_dir(parent).map_err(|e| e.detail())?;
+    }
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(format!("削除対象が通常のフォルダではありません: {}", dir.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => {}
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn ensure_plain_dir(dir: &Path) -> Result<(), SaveError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(SaveError::Io(format!(
+            "保存フォルダにsymlinkは使えません: {}",
+            dir.display()
+        ))),
+        Ok(meta) if !meta.is_dir() => Err(SaveError::Io(format!(
+            "保存先がフォルダではありません: {}",
+            dir.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(SaveError::Io(e.to_string())),
+    }
+}
+
+/// symlinkを辿らず、通常ディレクトリであることを確認して1段だけ作る。
+/// 呼び出し側は親から順に渡すため、`create_dir_all` で検査前の親を横断しない。
+pub(super) fn ensure_plain_dir_created(dir: &Path) -> Result<(), SaveError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => ensure_plain_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent = dir.parent().ok_or_else(|| {
+                SaveError::Io(format!("保存フォルダの親を決められません: {}", dir.display()))
+            })?;
+            // 足りない親だけを同じ関門で先に作る。最初に存在する
+            // 親で止まるため、OS側の `/var` 等の配置まで利用を禁止しない。
+            ensure_plain_dir_created(parent)?;
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(SaveError::Io(e.to_string())),
+            }
+            ensure_plain_dir(dir)
+        }
+        Err(e) => Err(SaveError::Io(e.to_string())),
+    }
+}
+
+/// **復元できる保存が 1 つでもあるか** (起動時の「復元しますか」の根拠)。
+///
+/// [`has_run`] は根の `state.json` の有無しか見ないので、閉じた Run の
+/// 控えが根に残っているだけで「ある」と言ってしまう。墓標のある Run と、
+/// 名前が安全でない Run は数えない (復元しないものを案内しない)。
+pub fn has_restorable_run(state_dir: &Path) -> bool {
+    if has_run(state_dir) {
+        // 根の控えは「いちばん古い 1 本」。その Run が閉じられていなければ復元できる。
+        match read_doc(&state_dir.join(STATE_FILE))
+            .or_else(|| read_doc(&state_dir.join(PREV_FILE)))
+        {
+            Some(doc) => {
+                let id = doc.run.run_id.as_str();
+                if super::outbox::valid_run_id(id) && !is_closed(state_dir, id) {
+                    return true;
+                }
+            }
+            // 読めない (旧形式・壊れている) — 復元経路が退避と案内をする。
+            None => return true,
+        }
+    }
+    let Ok(rd) = std::fs::read_dir(state_dir.join(super::panel::RUNS_DIR)) else {
+        return false;
+    };
+    rd.filter_map(|e| e.ok()).any(|e| {
+        let name = e.file_name();
+        let Some(id) = name.to_str() else {
+            return false;
+        };
+        super::outbox::valid_run_id(id) && !is_closed(state_dir, id) && has_run(&e.path())
+    })
+}
+
 /// `serde::Serialize` を型消去して `save` の中の重複を減らすための小道具。
 #[cfg(test)]
 mod tests {
@@ -870,8 +1230,10 @@ mod tests {
                 version: SCHEMA_VERSION,
                 run_id: "run-1".into(),
                 workspace: "ws".into(),
+                run_workspace: None,
                 spec_source: "SPEC.md".into(),
                 agent_count: 4,
+                agent_presets: Vec::new(),
                 max_attempts: 3,
                 review_required: true,
                 paused: false,
@@ -886,6 +1248,7 @@ mod tests {
                     state: EffectState::Completed,
                     at: 100,
                 }],
+                seen_blocks: Vec::new(),
                 done_effects: Vec::new(),
             },
             goal: mkgoal(),
@@ -902,6 +1265,55 @@ mod tests {
     }
 
     #[test]
+    fn run_workspaceの基準commitを保存復元し旧schemaの欠落は空で読む() {
+        let dir = tmp("run-workspace-base");
+        let mut state = saved();
+        state.run.workspace = "source".into();
+        state.run.run_workspace = Some(super::super::run_workspace::RunWorkspace {
+            source_workspace: "source".into(),
+            repository_root: "repo".into(),
+            worktree_root: "worktree".into(),
+            execution_workspace: "execution".into(),
+            base_commit: "a".repeat(40),
+        });
+        save(&dir, &state).unwrap();
+        let loaded = match load(&dir) {
+            LoadOutcome::Loaded(saved) => *saved,
+            other => panic!("保存した基準commitを復元できない: {other:?}"),
+        };
+        assert_eq!(
+            loaded.run.run_workspace.as_ref().unwrap().base_commit,
+            "a".repeat(40)
+        );
+
+        let path = dir.join(STATE_FILE);
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["version"] = serde_json::Value::from(5);
+        raw["run"]["version"] = serde_json::Value::from(5);
+        raw["run"]["run_workspace"]
+            .as_object_mut()
+            .unwrap()
+            .remove("base_commit");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let legacy = match load(&dir) {
+            LoadOutcome::Loaded(saved) => *saved,
+            other => panic!("旧schemaを安全に読めない: {other:?}"),
+        };
+        assert!(
+            legacy
+                .run
+                .run_workspace
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .is_empty(),
+            "欠落した基準commitを現在値で捏造した"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn 保存して読み戻せる() {
         let dir = tmp("roundtrip");
         let s = saved();
@@ -913,6 +1325,23 @@ mod tests {
                 assert_eq!(got.goal, s.goal);
             }
             other => panic!("読めなかった: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 別runの外側メタデータを混ぜたスナップショットは拒否する() {
+        let dir = tmp("cross-run-state");
+        save(&dir, &saved()).unwrap();
+        let path = dir.join(STATE_FILE);
+        let mut doc = read_doc(&path).expect("読める");
+        doc.run_id = "run-other".into();
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        match load(&dir) {
+            LoadOutcome::Corrupt { reason, .. } => {
+                assert!(reason.contains("run_id"), "理由が分からない: {reason}");
+            }
+            other => panic!("別 Run の混在を受理した: {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1238,6 +1667,24 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn 保存先の親がsymlinkなら外へ書かない() {
+        let state = tmp("save-parent-symlink");
+        let outside = tmp("save-parent-symlink-outside");
+        std::os::unix::fs::symlink(&outside, state.join(super::super::panel::RUNS_DIR)).unwrap();
+        let run = state.join(super::super::panel::RUNS_DIR).join("run-a");
+
+        let err = save(&run, &saved()).expect_err("symlinkの親を通って保存した");
+        assert!(err.detail().contains("symlink"), "{}", err.detail());
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "外部のフォルダへ状態を書いた"
+        );
+        std::fs::remove_dir_all(&state).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
     #[test]
     fn 世代は保存のたびに進む() {
         // どちらが新しいかを **mtime に頼らない** (コピーや同期で簡単に
@@ -1331,5 +1778,102 @@ mod tests {
         // 既定の根も同じ導出を通る (根が違うだけ)
         assert!(team_dir_in(&default_home(), Path::new("/tmp/ws-a"))
             .ends_with(crate::history::workspace_key(Path::new("/tmp/ws-a"))));
+    }
+
+    /// **墓標は原子的に置かれ、書きかけが残らない。**
+    ///
+    /// 保存と同じ「一時ファイルへ fsync → rename」を通るので、途中で落ちても
+    /// 半端な墓標は生まれない。走査 ([`closed_run_ids`]) は `.` 始まりの
+    /// 一時ファイルを拾わない。
+    #[test]
+    fn 墓標は原子的に置かれ一時ファイルを残さない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "atomic");
+        mark_closed(&dir, "run-1").expect("置ける");
+        assert!(is_closed(&dir, "run-1"));
+        let pen = dir.join(CLOSED_DIR);
+        let names: Vec<String> = std::fs::read_dir(&pen)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["run-1".to_string()], "一時ファイルが残っている");
+        assert_eq!(closed_run_ids(&dir), vec!["run-1".to_string()]);
+        // 二度置いても増えない (置き換え)。
+        mark_closed(&dir, "run-1").expect("置き直せる");
+        assert_eq!(closed_run_ids(&dir), vec!["run-1".to_string()]);
+        // 片付けは冪等 (無いものを消すのは成功)。
+        unmark_closed(&dir, "run-1").expect("消せる");
+        assert!(!is_closed(&dir, "run-1"));
+        unmark_closed(&dir, "run-1").expect("無くても成功");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **壊れた墓標でも「閉じた」と読む** (安全側)。中身は見ない。
+    #[test]
+    fn 壊れた墓標は閉じた扱いになる() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "corrupt");
+        let pen = dir.join(CLOSED_DIR);
+        std::fs::create_dir_all(&pen).unwrap();
+        std::fs::write(pen.join("run-9"), b"\xff\xfe not json at all").unwrap();
+        assert!(is_closed(&dir, "run-9"), "読めない墓標を無視した");
+        assert_eq!(closed_run_ids(&dir), vec!["run-9".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **保存の名前にできない `run_id` は、書くのも読むのも消すのも断る。**
+    /// 断らないと `runs/` や `closed/` の外を触ることになる。
+    #[test]
+    fn 危険なrun_idは墓標にも保存先にもならない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "unsafe-id");
+        for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x", ".hidden"] {
+            assert!(mark_closed(&dir, bad).is_err(), "{bad:?} の墓標を書いた");
+            assert!(!is_closed(&dir, bad), "{bad:?} を閉じた扱いにした");
+            assert_eq!(run_dir_in(&dir, bad), None, "{bad:?} の保存先を作った");
+            // 消すほうも黙って成功にする (触る先が無いので害は無い)。
+            assert!(unmark_closed(&dir, bad).is_ok());
+        }
+        let ok = run_dir_in(&dir, "run-1").expect("正しい ID");
+        assert_eq!(ok.parent(), Some(dir.join(super::super::panel::RUNS_DIR).as_path()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 削除の口は 1 つ。**無いのは成功、それ以外の失敗は理由を返す。**
+    #[test]
+    fn 削除は無いのを成功にし失敗は理由を返す() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "remove");
+        let sub = dir.join("gone");
+        assert!(remove_dir_checked(&sub).is_ok(), "無いものの削除を失敗にした");
+        std::fs::create_dir_all(sub.join("deep")).unwrap();
+        std::fs::write(sub.join("deep/x.json"), "{}").unwrap();
+        fault_inject::fail_remove_under(&sub);
+        let err = remove_dir_checked(&sub).expect_err("仕込んだ失敗が返らない");
+        assert!(!err.trim().is_empty(), "理由が空");
+        assert!(sub.exists(), "失敗したのに消えている");
+        fault_inject::clear();
+        assert!(remove_dir_checked(&sub).is_ok());
+        assert!(!sub.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **復元できるものがあるかを、墓標まで見て答える。**
+    #[test]
+    fn 復元できる保存の有無は墓標まで見る() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-team-closed", "restorable");
+        assert!(!has_restorable_run(&dir), "何も無いのに有ると答えた");
+        let mut s = saved();
+        s.run.run_id = "run-a".into();
+        save(&run_dir_in(&dir, "run-a").unwrap(), &s).expect("保存");
+        assert!(has_restorable_run(&dir), "保存があるのに無いと答えた");
+        mark_closed(&dir, "run-a").expect("墓標");
+        assert!(!has_restorable_run(&dir), "閉じた Run を案内した");
+        // 根の控えも同じ扱い。
+        unmark_closed(&dir, "run-a").unwrap();
+        std::fs::remove_dir_all(dir.join(super::super::panel::RUNS_DIR)).unwrap();
+        save(&dir, &s).expect("根へ保存");
+        assert_eq!(root_run_id(&dir).as_deref(), Some("run-a"));
+        assert!(has_restorable_run(&dir), "根の控えを見落とした");
+        mark_closed(&dir, "run-a").expect("墓標");
+        assert!(!has_restorable_run(&dir), "閉じた Run の根の控えを案内した");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

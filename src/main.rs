@@ -3,6 +3,7 @@
 mod acp;
 mod agent_input;
 mod agent_picker;
+mod agent_talk;
 mod agents;
 mod app;
 mod breadcrumb;
@@ -201,7 +202,15 @@ fn main() -> eframe::Result<()> {
     // 検知できる経路になる。書けなくても起動は止めない (fail-soft)。
     let instance_guard = instances::register_current(&roots);
 
+    // **最初から最大化して開く。** 1480x940 は Team / Cockpit / デッキの
+    // ように「列が横に並ぶ」画面には狭く、開くたびに人が手で広げることに
+    // なっていた (「ウィンドウが徐々に大きくなる」として報告された)。
+    // 最大化なら**そのモニタいっぱい**から始まる — 画面寸法を直書きしないので
+    // 4K でも 1280x800 のノートでも正しい。
+    //
+    // `inner_size` は最大化を解除したときに戻る大きさとして残す。
     let mut viewport = egui::ViewportBuilder::default()
+        .with_maximized(true)
         .with_inner_size([1480.0, 940.0])
         .with_min_inner_size([860.0, 560.0])
         .with_title("Zaivern Code")

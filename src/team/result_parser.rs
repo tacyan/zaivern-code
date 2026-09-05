@@ -36,6 +36,15 @@ pub const RESULT_CLOSE: &str = "[/ZAI-TEAM-RESULT]";
 /// サブエージェントイベントの開始・終了マーカー。
 pub const EVENT_OPEN: &str = "[ZAI-TEAM-EVENT]";
 pub const EVENT_CLOSE: &str = "[/ZAI-TEAM-EVENT]";
+/// **エージェント同士のやり取り**の開始・終了マーカー。
+pub const MSG_OPEN: &str = "[ZAI-TEAM-MSG]";
+pub const MSG_CLOSE: &str = "[/ZAI-TEAM-MSG]";
+
+/// 1 通のメッセージに書ける本文の上限 (文字)。
+///
+/// **上限が無いと、相手の端末へ丸ごと流し込める。** 長文はそのまま
+/// 相手の作業を押し流すので、伝言は伝言の長さに留める。
+pub const MSG_MAX_CHARS: usize = 800;
 
 /// 1 ブロックの本文の上限 (バイト)。
 pub const BLOCK_MAX_BYTES: usize = 16 * 1024;
@@ -47,6 +56,34 @@ pub const SCAN_MAX_BYTES: usize = 256 * 1024;
 pub const ARRAY_MAX: usize = 64;
 /// 親子階層の深さ上限。
 pub const MAX_DEPTH: usize = 4;
+
+/// 却下文へ添える「使える語」の件数上限。
+///
+/// 表が伸びても却下文が端末を押し流さないための線。**切ったときは
+/// 切ったと書く** — 黙って落とすと、載らなかった語が「使えない語」に見える。
+pub const REJECT_HINT_MAX: usize = 12;
+
+/// 「表に無い」と断るときに添える一覧を、**表そのものから**組み立てる。
+///
+/// 実機の台帳に `#2 の完了報告を却下: 未知の status「probe」` とだけ残った。
+/// 断る判断は正しいが、**何なら使えるのかを 1 文字も言っていない**ので、
+/// エージェントは綴りを直しようがない (人が見ても直し方が分からない)。
+///
+/// 却下文へ語を書き写すと、表を増やした日から却下文だけが古い一覧を出し続ける。
+/// だからここは**表を受け取り**、文面を作るのはこの 1 か所だけにする。
+/// 番人は `tests::却下文に語を書き写していない`。
+fn accepted_line<'a>(lead: &str, words: impl IntoIterator<Item = &'a str>) -> String {
+    let all: Vec<&str> = words.into_iter().collect();
+    if all.is_empty() {
+        return String::new();
+    }
+    let shown = all.len().min(REJECT_HINT_MAX);
+    let mut list = all[..shown].join(" / ");
+    if all.len() > shown {
+        list.push_str(&format!(" ほか {} 件", all.len() - shown));
+    }
+    format!("。{lead} {list} です")
+}
 
 // ── 完了報告 ─────────────────────────────────────────────────────────
 
@@ -134,7 +171,10 @@ impl RejectReason {
             }
             RejectReason::ValidationFailed(c) => format!("検証が失敗しています: {}", c.join(", ")),
             RejectReason::BlockersRemain(b) => format!("未解決の blocker: {}", b.join(", ")),
-            RejectReason::UnknownStatus(s) => format!("未知の status「{s}」"),
+            RejectReason::UnknownStatus(s) => format!(
+                "未知の status「{s}」{}",
+                accepted_line("使えるのは", STATUS_WORDS.iter().map(|(w, _)| *w))
+            ),
         }
     }
 }
@@ -146,6 +186,20 @@ pub enum ReportedStatus {
     Blocked,
     Failed,
 }
+
+/// 受け付ける status。**表に無い語は拒否する** (捏造を通さない)。
+///
+/// 綴りの別名もここへ並べる。判定 ([`accept`]) と却下文
+/// ([`RejectReason::detail`]) が**同じ表**を読むので、語を足せば
+/// 断り文にも自動で載る。
+pub const STATUS_WORDS: &[(&str, ReportedStatus)] = &[
+    ("completed", ReportedStatus::Completed),
+    ("done", ReportedStatus::Completed),
+    ("complete", ReportedStatus::Completed),
+    ("blocked", ReportedStatus::Blocked),
+    ("failed", ReportedStatus::Failed),
+    ("error", ReportedStatus::Failed),
+];
 
 /// **Zaivern 自身が測った**変更ファイルの証跡。
 ///
@@ -166,7 +220,19 @@ pub enum FileEvidence {
         out_of_scope: Vec<String>,
     },
     /// 測れなかった (理由つき)。**完了は通さない。**
+    ///
+    /// 「測れるはずなのに失敗した」場合。git はあるのに壊れている、
+    /// 変更が多すぎる、など — 直せば測れるので、人へ渡す。
     Unavailable(String),
+    /// **そもそも測る手立てが無い** (理由つき)。**完了は通す。**
+    ///
+    /// Git 管理下でないフォルダがこれ。直しようが無いので、ここで
+    /// 止めると**そのフォルダでは 1 件も完了できない**
+    /// (実機で 7 体が並列で働いているのに 1 件も終わらなかった)。
+    ///
+    /// **通すが、隠さない。** 「担当内だけを変更した」とは言えない状態
+    /// なので、盤面が「実測なし」を出す (検証なしで進む Run と同じ扱い)。
+    Unmeasurable(String),
     /// このタスクに担当範囲が宣言されていない。
     ///
     /// 範囲が無ければ「範囲外」も無い。**測った事実は残すが、
@@ -181,7 +247,7 @@ impl FileEvidence {
         match self {
             FileEvidence::Measured { mine, .. } => mine,
             FileEvidence::NoScope { measured } => measured,
-            FileEvidence::Unavailable(_) => &[],
+            FileEvidence::Unavailable(_) | FileEvidence::Unmeasurable(_) => &[],
         }
     }
 }
@@ -227,6 +293,208 @@ impl AcceptedResult {
     }
 }
 
+/// **文字列の中の生の制御文字を、JSON として読める形へ直す。**
+///
+/// エージェントは本文の中で**改行をそのまま**書いてくる。JSON の仕様では
+/// 文字列の中に生の制御文字を置けないので、`serde_json` は
+/// 「control character found while parsing a string」で断る。
+///
+/// 実機では**伝言 14 通が全部これで捨てられていた** — 仕組みは動いているのに
+/// 1 通も届かなかった。形式を守れと言い続けるより、こちらが読めるように
+/// するほうが速い (相手は毎回違うモデルで、こちらの都合は知らない)。
+///
+/// **文字列の中だけ**を直す。構造 (波括弧やカンマの間の改行) は JSON として
+/// 正しいので触らない。
+pub fn escape_raw_controls(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut in_str = false;
+    let mut esc = false;
+    for c in src.chars() {
+        if esc {
+            out.push(c);
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_str => {
+                out.push(c);
+                esc = true;
+            }
+            '"' => {
+                in_str = !in_str;
+                out.push(c);
+            }
+            '\n' if in_str => out.push_str("\\n"),
+            '\r' if in_str => out.push_str("\\r"),
+            '\t' if in_str => out.push_str("\\t"),
+            c if in_str && (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// **手書きの JSON を、意味を変えずに直す。ここが唯一の直し場。**
+///
+/// 報告・レビュー・出来事・伝言の**すべて**がここを通る
+/// ([`parse_lenient`])。種類ごとに別々の直し方を持つと、片方だけが
+/// 直る = 「実装は届くのにレビューは落ちる」という説明できない差が出る。
+///
+/// 実測 (Team Run 1 本) で捨てられていたのは 3 通り。どれも**中身は正しく、
+/// 綴りだけが JSON になっていない**:
+///
+/// 1. **文字列の中の生の `"`** — いちばん多い。実物:
+///    `"command": "test -s a.md && test "$(rg -c '^x' a.md)" -eq 8"`
+///    シェルのコマンドを書けばまず入る
+/// 2. **鍵の間のカンマ抜け** — `{"to": "a" "text": "b"}`
+/// 3. **末尾カンマ** — `{"text": "x",}`
+///
+/// 捨てると、**正しく働いた担当が「報告していない」ことになって止まる**。
+/// 実機では 1 本の Run で 4 回続けて捨てていた。
+///
+/// 直すのは綴りだけで、**値は 1 文字も変えない**。閉じ引用符かどうかは
+/// 「その後に何が来るか」で決める — JSON で文字列の直後に来てよいのは
+/// `,` `}` `]` `:` と、次の鍵 (`"…":`) だけである。
+pub fn repair_json(src: &str) -> String {
+    let ch: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut i = 0usize;
+    let mut in_str = false;
+    while i < ch.len() {
+        let c = ch[i];
+        if !in_str {
+            if c == '"' {
+                in_str = true;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            // 3) 末尾カンマ — `,` の後に `}` / `]` しか無ければ落とす。
+            if c == ',' && next_is_close(&ch, i + 1) {
+                i += 1;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // 文字列の中。
+        if c == '\\' {
+            out.push(c);
+            if let Some(&n) = ch.get(i + 1) {
+                out.push(n);
+            }
+            i += 2;
+            continue;
+        }
+        if c != '"' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match closer_kind(&ch, i + 1) {
+            // 閉じ引用符。
+            Closer::Plain => {
+                in_str = false;
+                out.push(c);
+            }
+            // 2) 閉じ引用符だが、次の鍵との間にカンマが無い。
+            Closer::NeedsComma => {
+                in_str = false;
+                out.push(c);
+                out.push(',');
+            }
+            // 1) 本文の中の `"`。エスケープして文字列を続ける。
+            Closer::No => out.push_str("\\\""),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `"` の後ろが何であるか。
+enum Closer {
+    /// 文字列を閉じてよい (`,` `}` `]` `:` か、入力の終わり)。
+    Plain,
+    /// 文字列を閉じてよいが、次の鍵との間にカンマが要る。
+    NeedsComma,
+    /// 閉じない (本文の中の `"`)。
+    No,
+}
+
+/// `from` から空白を飛ばして、`"` が閉じ引用符かを見る。
+fn closer_kind(ch: &[char], from: usize) -> Closer {
+    let Some(j) = skip_ws(ch, from) else {
+        return Closer::Plain; // 入力の終わり
+    };
+    match ch[j] {
+        ',' | '}' | ']' | ':' => Closer::Plain,
+        // 次が `"…":` なら、鍵の始まりなのでカンマが抜けている。
+        '"' if is_key_at(ch, j) => Closer::NeedsComma,
+        _ => Closer::No,
+    }
+}
+
+/// `,` の後ろが `}` / `]` か (= 末尾カンマ)。
+fn next_is_close(ch: &[char], from: usize) -> bool {
+    skip_ws(ch, from).is_some_and(|j| ch[j] == '}' || ch[j] == ']')
+}
+
+/// `at` の `"` から始まる文字列の直後が `:` か (= 鍵)。
+fn is_key_at(ch: &[char], at: usize) -> bool {
+    let mut i = at + 1;
+    while i < ch.len() {
+        match ch[i] {
+            '\\' => i += 2,
+            '"' => return skip_ws(ch, i + 1).is_some_and(|j| ch[j] == ':'),
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// 空白でない最初の位置。
+fn skip_ws(ch: &[char], from: usize) -> Option<usize> {
+    (from..ch.len()).find(|&i| !ch[i].is_whitespace())
+}
+
+/// **まだ読める形になっていない塊か。**
+///
+/// 画面は書いている途中でも見える。1 tick が描画の途中に当たると、
+/// 開きマーカーと閉じマーカーの間に**中身の断片**しか無いことがある
+/// (実機で `"task_id"` だけの塊を拾い、`invalid type: string "task_id"`
+/// として報告を断っていた)。
+///
+/// 断ると 2 つ困る。書いた本人には落ち度が無いのに却下が記録され、
+/// **人には「エージェントが壊れた報告を出した」ように見える**。
+/// 次の tick には全部揃うので、ここは黙って見送るのが正しい。
+///
+/// 判定は形だけで見る — JSON オブジェクトは `{` で始まる。
+pub fn looks_incomplete(body: &str) -> bool {
+    !body.trim_start().starts_with('{')
+}
+
+/// **ブロック本文を読む。報告もレビューも出来事も伝言も、ここを通る。**
+///
+/// 1. まず素直に読む (正しい JSON はこれまでどおり `serde` が読む)
+/// 2. 読めなければ [`repair_json`] で綴りだけ直して、もう一度読む
+///
+/// **エラーは 1 回目のものを返す。** 直した後のエラーを返すと、こちらが
+/// 手を入れた文字列についての苦情になって、元の原因が見えなくなる。
+pub fn parse_lenient<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, String> {
+    let src = escape_raw_controls(body);
+    match serde_json::from_str(&src) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            // **直したものは、元と同じ制御文字の扱いで読み直す。**
+            let fixed = escape_raw_controls(&repair_json(&src));
+            serde_json::from_str(&fixed).map_err(|_| first.to_string())
+        }
+    }
+}
+
 /// 囲まれたブロックを全部取り出す (開始 → 終了の順で、入れ子は無いものとする)。
 ///
 /// **上限つき。** 走査対象そのものも末尾 [`SCAN_MAX_BYTES`] だけを見る。
@@ -247,6 +515,59 @@ pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
     out
 }
 
+
+// ── 自分が送った指示のエコー ─────────────────────────────────────────
+
+/// 拾った塊が、**こちらが送った指示のひな型がそのまま画面に出ているだけ**か。
+///
+/// ## なぜ要るか (実測)
+///
+/// 指示は PTY へ打ち込むので、エージェントの TUI は**それをそのまま画面へ
+/// 描き返す**。指示には報告のひな型がマーカーごと載っているので、
+/// [`extract_blocks`] は **自分が送った文面を相手の報告として拾う**。
+///
+/// 0.23.0 の実機では、Team Run を開始した直後に必ず
+/// `報告の JSON を読めません: invalid type: string "task_id" …` が出ていた —
+/// 端末が枠を描き直している途中の、まだ `{` が無い状態を拾っていた。
+/// **落ちるほうがまだ軽い**: 全部描き終わってから拾うと、ひな型は
+/// `"status": "completed"` を持つ**正しい JSON**なので、1 文字も作業して
+/// いないのに完了報告として通ってしまう。
+///
+/// ## 判定を「一致」ではなく「部分」にする理由
+///
+/// 端末は行を詰め物で埋め、折り返し、描き直しの途中を見せる。実測の本文は
+/// 先頭の `{` を失っていた。だから空白を 1 個へ畳んだうえで
+/// **ひな型の部分列なら echo** とみなす。本物の報告はひな型と違う
+/// `summary` / `changed_files` を持つので、部分列にはならない
+/// (ひな型を 1 文字も埋めずに送り返してきた場合は echo 扱いで捨てるが、
+///  それは報告として受け取ってはいけないものなので正しい)。
+pub fn is_prompt_echo(body: &str, sent: &str, open: &str, close: &str) -> bool {
+    let b = squeeze_ws(body);
+    if b.is_empty() {
+        return true;
+    }
+    extract_blocks(sent, open, close)
+        .iter()
+        .any(|t| squeeze_ws(t).contains(&b))
+}
+
+/// 連続する空白を 1 個へ畳む (端末の詰め物・折り返しを無視するため)。
+fn squeeze_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut sp = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            sp = true;
+            continue;
+        }
+        if sp && !out.is_empty() {
+            out.push(' ');
+        }
+        sp = false;
+        out.push(c);
+    }
+    out
+}
 /// 末尾 `max` バイトを文字境界で切って返す。
 fn tail_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -264,8 +585,7 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
     if body.len() > BLOCK_MAX_BYTES {
         return Err(RejectReason::TooLarge { bytes: body.len() });
     }
-    let doc: ResultDoc =
-        serde_json::from_str(body).map_err(|e| RejectReason::BadJson(e.to_string()))?;
+    let doc: ResultDoc = parse_lenient(body).map_err(RejectReason::BadJson)?;
     if doc.changed_files.len() > ARRAY_MAX {
         return Err(RejectReason::ArrayTooLong {
             field: "changed_files",
@@ -308,11 +628,11 @@ pub fn accept(
         });
     }
 
-    let status = match doc.status.trim().to_ascii_lowercase().as_str() {
-        "completed" | "done" | "complete" => ReportedStatus::Completed,
-        "blocked" => ReportedStatus::Blocked,
-        "failed" | "error" => ReportedStatus::Failed,
-        other => return Err(RejectReason::UnknownStatus(other.to_string())),
+    // 受け付ける語は `STATUS_WORDS` の 1 か所だけ。却下文も同じ表を読む。
+    let spelled = doc.status.trim().to_ascii_lowercase();
+    let status = match STATUS_WORDS.iter().find(|(w, _)| *w == spelled) {
+        Some((_, st)) => *st,
+        None => return Err(RejectReason::UnknownStatus(spelled)),
     };
 
     let changed: Vec<String> = doc
@@ -360,6 +680,10 @@ pub fn accept(
         FileEvidence::Unavailable(why) => {
             return Err(RejectReason::EvidenceUnavailable(why.clone()));
         }
+        // **測る手立てが無いなら、実測は求めない。**
+        // ここで止めると、Git 管理下でないフォルダでは 1 件も完了できない。
+        // 通すかわりに「実測なし」を盤面が出す (隠さない)。
+        FileEvidence::Unmeasurable(_) => {}
         FileEvidence::Measured { out_of_scope, .. } if !out_of_scope.is_empty() => {
             return Err(RejectReason::OutOfScopeFiles(out_of_scope.clone()));
         }
@@ -443,6 +767,434 @@ pub struct EventDoc {
     pub action: String,
 }
 
+/// エージェントが他のエージェントへ送る 1 通。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageDoc {
+    /// 宛先のエージェント ID (`implementer-1` 等) か役割 (`reviewer`)、
+    /// または `all` (チーム全員)。
+    pub to: String,
+    /// 本文。
+    pub text: String,
+}
+
+/// メッセージを断った理由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageReject {
+    BadJson(String),
+    /// 宛先が空。
+    NoTarget,
+    /// 宛先が居ない。**捏造を通さない** (居ない相手に送ったことにしない)。
+    ///
+    /// `known` は**そのとき書けた宛先**。断るだけで誰が居るかを言わないと、
+    /// 送り主は同じ綴りを書き直すしかない (実機で 2 回繰り返された)。
+    UnknownTarget {
+        to: String,
+        known: Vec<String>,
+    },
+    /// 宛先が**送り主自身**を指している (自分の ID か、自分の役割)。
+    ///
+    /// **`UnknownTarget` と混ぜてはいけない。** 相手は居るのだから
+    /// 「居ません」は嘘で、そう言われたエージェントは綴りを疑って
+    /// 同じ宛先を書き直す (実機で 2 回繰り返した: 役割 `tester` の担当が
+    /// `"to": "tester"` と書き、`伝言の宛先 tester は居ません` と返っていた)。
+    SelfTarget(String),
+    /// 宛先は `all` だが、**自分以外の担当が 1 人も居ない**。
+    ///
+    /// 居ないのは相手ではなく「あなた以外の担当」なので、
+    /// `UnknownTarget("all")` と言うと `all` の綴りを疑わせてしまう。
+    NoOtherAgents,
+    /// 本文が空。
+    Empty,
+}
+
+impl MessageReject {
+    pub fn detail(&self) -> String {
+        match self {
+            MessageReject::BadJson(e) => format!("伝言の JSON を読めません: {e}"),
+            MessageReject::NoTarget => "伝言の宛先 (to) が空です".to_string(),
+            MessageReject::UnknownTarget { to, known } => {
+                format!(
+                    "伝言の宛先 `{to}` は居ません{}",
+                    accepted_line("いま居るのは", known.iter().map(String::as_str))
+                )
+            }
+            MessageReject::SelfTarget(t) => format!(
+                "伝言の宛先 `{t}` はあなた自身です。自分宛ての伝言は誰にも届きません — \
+                 宛先には**相手**の ID か役割を書いてください (全員なら all)"
+            ),
+            MessageReject::NoOtherAgents => "宛先 `all` は「あなた以外の全員」です。\
+                 いまチームで動いているのはあなただけなので、受け取る担当が 1 人も居ません"
+                .to_string(),
+            MessageReject::Empty => "伝言の本文が空です".to_string(),
+        }
+    }
+}
+
+/// **エージェントが手で書く JSON は、素直には読めない。**
+///
+/// 実測 (Team Run 1 本・19 通) で 5 通が読めず、内訳は 4 通りだった:
+///
+/// | 実際に来たもの | serde の言い分 |
+/// |---|---|
+/// | `"text": "彼は "yes" と言った"` | `expected ',' or '}'` |
+/// | `"to": "a" "text": "b"` (カンマ抜け) | `expected ',' or '}'` |
+/// | `"text": "x",}` (末尾カンマ) | `trailing comma` |
+/// | `"text": "C:\path"` (Windows パス) | `invalid escape` |
+///
+/// どれも**人間が読めば意味は明らか**なのに、1 通まるごと捨てていた。
+/// 伝言が落ちると相手は待ち続けるので、落とす代償が大きい。
+///
+/// そこで、小さな scanner で**トップレベル object の一意な文字列キーだけ**を
+/// 取り出す。文字列内や入れ子の `"to":` を検索で拾わず、重複・型違い・
+/// 切断された値は曖昧なまま通さない。
+///
+/// **`serde` を置き換えない。** 正しい JSON は今までどおり `serde` が読む
+/// ([`check_message`] が先に試す)。ここは読めなかったときの受け皿で、
+/// 読めた振りをしない — 鍵が見つからなければ `None` を返して断りに戻す。
+fn lenient_message(s: &str) -> Option<MessageDoc> {
+    let bytes = s.as_bytes();
+    if bytes.len() > BLOCK_MAX_BYTES {
+        return None;
+    }
+    let mut i = skip_json_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let mut to = None;
+    let mut text = None;
+    loop {
+        i = skip_json_ws(bytes, i);
+        if bytes.get(i) == Some(&b'}') {
+            // 画面の囲みには `}` の後ろの行が混ざることがある。object は
+            // ここで完結しているので後書きは読まず、当然そこにある鍵も拾わない。
+            break;
+        }
+        let (key, after_key) = strict_string_at(s, i)?;
+        i = skip_json_ws(bytes, after_key);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        if key == "to" || key == "text" {
+            if (key == "to" && to.is_some()) || (key == "text" && text.is_some()) {
+                return None;
+            }
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            let (value, next) = lenient_string_at(s, i)?;
+            if key == "to" {
+                to = Some(value);
+            } else {
+                text = Some(value);
+            }
+            i = next;
+        } else {
+            i = skip_json_value(s, i)?;
+        }
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') => {}
+            // 手書きで抜けやすい、次のトップレベルキー直前のカンマだけ救う。
+            Some(b'"') if strict_string_at(s, i).is_some() => {}
+            _ => return None,
+        }
+    }
+    Some(MessageDoc {
+        to: to?,
+        text: text?,
+    })
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while bytes
+        .get(i)
+        .is_some_and(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        i += 1;
+    }
+    i
+}
+
+/// JSON として正しい文字列を読む。キー名は曖昧な救済をしない。
+fn strict_string_at(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = i.checked_add(2)?;
+            }
+            b'"' => {
+                let end = i + 1;
+                let value = serde_json::from_str::<String>(&s[start..end]).ok()?;
+                return Some((value, end));
+            }
+            b if b < 0x20 => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 値の文字列を読む。生の引用符は、後ろが値の境界でなければ本文として救う。
+fn lenient_string_at(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i = i.checked_add(2)?,
+            b'"' => {
+                let after = skip_json_ws(bytes, i + 1);
+                let boundary = matches!(bytes.get(after), Some(b',') | Some(b'}'))
+                    || (bytes.get(after) == Some(&b'"')
+                        && strict_string_at(s, after).is_some_and(|(_, end)| {
+                            bytes.get(skip_json_ws(bytes, end)) == Some(&b':')
+                        }));
+                if boundary {
+                    return Some((unescape_lenient(&s[start + 1..i])?, i + 1));
+                }
+                i += 1;
+            }
+            b if b < 0x20 => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 関係ないトップレベル欄を、入れ子と文字列の状態を追って飛ばす。
+fn skip_json_value(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    match bytes.get(start)? {
+        b'"' => lenient_string_at(s, start).map(|(_, end)| end),
+        b'{' | b'[' => {
+            let mut stack = vec![*bytes.get(start)?];
+            let mut i = start + 1;
+            let mut in_string = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if in_string => i = i.checked_add(2)?,
+                    b'"' => {
+                        in_string = !in_string;
+                        i += 1;
+                    }
+                    b'{' | b'[' if !in_string => {
+                        stack.push(bytes[i]);
+                        i += 1;
+                    }
+                    b'}' | b']' if !in_string => {
+                        let open = stack.pop()?;
+                        if !matches!((open, bytes[i]), (b'{', b'}') | (b'[', b']')) {
+                            return None;
+                        }
+                        i += 1;
+                        if stack.is_empty() {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < bytes.len() && !matches!(bytes[i], b',' | b'}') {
+                if bytes[i] == b'"' && i > start {
+                    break;
+                }
+                i += 1;
+            }
+            (i > start).then_some(i)
+        }
+    }
+}
+
+/// JSON のエスケープを解く。知らない綴りは Windows path の一部として残す。
+/// 壊れた Unicode escape と孤立 surrogate は値を捏造せず却下する。
+fn unescape_lenient(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len().min(BLOCK_MAX_BYTES));
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let mut code = 0u16;
+                for _ in 0..4 {
+                    code = code.checked_mul(16)?;
+                    code = code.checked_add(it.next()?.to_digit(16)? as u16)?;
+                }
+                if (0xd800..=0xdbff).contains(&code) {
+                    if it.next()? != '\\' || it.next()? != 'u' {
+                        return None;
+                    }
+                    let mut low = 0u16;
+                    for _ in 0..4 {
+                        low = low.checked_mul(16)?;
+                        low = low.checked_add(it.next()?.to_digit(16)? as u16)?;
+                    }
+                    if !(0xdc00..=0xdfff).contains(&low) {
+                        return None;
+                    }
+                    let scalar = 0x1_0000
+                        + (((code as u32 - 0xd800) << 10) | (low as u32 - 0xdc00));
+                    out.push(char::from_u32(scalar)?);
+                } else if (0xdc00..=0xdfff).contains(&code) {
+                    return None;
+                } else {
+                    out.push(char::from_u32(code as u32)?);
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => return None,
+        }
+    }
+    Some(out)
+}
+
+/// **伝言 1 通を読む。ここが伝言の読み方の唯一の置き場。**
+///
+/// Team Run と通常タブで**同じ 1 つを使う** — 2 つ持つと、片方だけが
+/// 綴り間違いを拾えるようになって「Team では届くのに通常タブでは届かない」
+/// という説明できない差が出る。番人は
+/// `cli::tests::伝言の読み手はひとつだけ`。
+pub fn read_message(body: &str) -> Result<MessageDoc, MessageReject> {
+    if body.len() > BLOCK_MAX_BYTES {
+        return Err(MessageReject::BadJson(format!(
+            "伝言が大きすぎます ({} バイト。上限 {} バイト)",
+            body.len(),
+            BLOCK_MAX_BYTES
+        )));
+    }
+    // **正しい JSON はこれまでどおり `serde` が読む。**
+    // 読めなかったときだけ、鍵を直接拾う受け皿へ落ちる
+    // (`lenient_message` の表に、実際に来た 4 通りが載っている)。
+    // 1) `parse_lenient` (素直に読む → 綴りを直して読む) は報告と共通。
+    // 2) それでも駄目なら、伝言だけの受け皿 (鍵を 2 つ直接拾う) へ落ちる。
+    let mut doc: MessageDoc = match parse_lenient(body) {
+        Ok(d) => d,
+        Err(e) => {
+            lenient_message(&escape_raw_controls(body)).ok_or(MessageReject::BadJson(e))?
+        }
+    };
+    // **整形もここで済ませる。** 呼ぶ側で `trim` と上限を書くと、
+    // 片方だけ上限が違う伝言が届く。
+    doc.to = doc.to.trim().to_string();
+    doc.text = doc.text.trim().chars().take(MSG_MAX_CHARS).collect();
+    Ok(doc)
+}
+
+/// **伝言の作法の文面。ここが唯一の置き場。**
+///
+/// Team の指示文 (`prompt::teammates_section`) と、通常タブへ教える文面
+/// (`agent_talk::how_to`) が同じものを使う。2 つ書くと、片方だけに
+/// 「エスケープの書き方」が載っている状態になって、そちらのエージェントだけ
+/// 伝言を落とす。
+///
+/// `target_hint` は宛先の書き方 (Team は ID / 役割、通常タブはタブの名前)。
+pub fn message_howto(target_hint: &str) -> String {
+    format!(
+        "{MSG_OPEN}\n\
+         {{\"to\": \"{target_hint}\", \"text\": \"伝えたいことを 1〜3 行で\"}}\n\
+         {MSG_CLOSE}\n\n\
+         * 伝えるのは**相手の仕事が変わるとき**だけ。実況中継はしない\n\
+         * 本文は {MSG_MAX_CHARS} 文字まで。長い成果物はファイルに書いて、場所だけ伝える\n\
+         * 相手が居ない宛先を書かない (届かず、こちらに断りが記録されます)\n\
+         * 宛先は**相手**を書く。自分の ID や自分の役割を書いても誰にも届かない\n\
+         * 本文の `\"` は `\\\"`、`\\` は `\\\\` と書く \
+         (Windows のパスは区切りを 2 つ重ねる)。書けていなくても読み取りますが、\
+         `\\t` などは制御文字として読まれます\n"
+    )
+}
+
+/// 伝言を読んで、宛先を**実在の担当**へ解決する。
+///
+/// `known` は `(エージェント ID, 役割キー)` の一覧。
+/// **表に無い宛先は断る** — 居ない相手へ送ったことにすると、盤面には
+/// 「伝えた」と出るのに誰も受け取っていない、という嘘になる。
+///
+/// `all` は自分以外の全員。宛先に自分を含めない (自分への伝言は
+/// 端末をもう一度自分で読むだけで、何も起きない)。
+pub fn check_message(
+    body: &str,
+    known: &[(AgentId, String)],
+    from: &AgentId,
+) -> Result<(Vec<AgentId>, String), MessageReject> {
+    let doc = read_message(body)?;
+    let to = doc.to.as_str();
+    if to.is_empty() {
+        return Err(MessageReject::NoTarget);
+    }
+    let text = doc.text;
+    if text.is_empty() {
+        return Err(MessageReject::Empty);
+    }
+    let others = || known.iter().filter(|(id, _)| id != from);
+    let all = to.eq_ignore_ascii_case("all");
+    let hits = |id: &AgentId, role: &str| id.0 == to || role == to;
+    let targets: Vec<AgentId> = if all {
+        others().map(|(id, _)| id.clone()).collect()
+    } else {
+        others()
+            .filter(|(id, role)| hits(id, role))
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if targets.is_empty() {
+        // **「居ません」は最後の枝。** 宛先が自分自身のときにそう言うと、
+        // 相手は居るのに居ないと言われたことになり、綴りを疑って同じ
+        // 間違いを繰り返す (実機で 2 回起きた)。何が起きたかを言う。
+        if all {
+            return Err(MessageReject::NoOtherAgents);
+        }
+        let is_self = from.0 == to
+            || known
+                .iter()
+                .any(|(id, role)| id == from && hits(id, role.as_str()));
+        if is_self {
+            return Err(MessageReject::SelfTarget(to.to_string()));
+        }
+        // 表に無い宛先は今までどおり断る (捏造を通さない)。
+        // **書けた宛先を添える** — ID と役割の両方が宛先になるので両方見せる。
+        return Err(MessageReject::UnknownTarget {
+            to: to.to_string(),
+            known: others()
+                .map(|(id, role)| {
+                    if role.is_empty() || role == &id.0 {
+                        id.0.clone()
+                    } else {
+                        format!("{} ({role})", id.0)
+                    }
+                })
+                .collect(),
+        });
+    }
+    Ok((targets, text))
+}
+
 /// 受け付けるイベント種別。**表に無い語は拒否する** (捏造を通さない)。
 pub const EVENT_KINDS: &[&str] = &[
     "sub_agent_started",
@@ -465,8 +1217,11 @@ pub enum EventReject {
         bytes: usize,
     },
     UnknownKind(String),
-    /// 親が実在しない。
-    UnknownParent(String),
+    /// 親が実在しない。**居る相手を添えて断る** (綴りを直せるように)。
+    UnknownParent {
+        parent: String,
+        known: Vec<String>,
+    },
     /// サブエージェントなのに親が指定されていない。
     ParentMissing,
     /// 親子が循環している。
@@ -491,15 +1246,26 @@ pub enum EventReject {
     ActionTooLong,
     /// エージェント ID が空。
     AgentIdMissing,
+    /// **ひな型のまま**の名前 (`<子の名前>` など)。実在の担当にしない。
+    PlaceholderAgent(String),
 }
 
 impl EventReject {
     pub fn detail(&self) -> String {
         match self {
             EventReject::BadJson(e) => format!("イベントの JSON を読めません: {e}"),
+            EventReject::PlaceholderAgent(id) => format!(
+                "エージェント ID「{id}」はひな型のままです。実際に使った名前を書いてください"
+            ),
             EventReject::TooLarge { bytes } => format!("イベントが大きすぎます ({bytes} バイト)"),
-            EventReject::UnknownKind(k) => format!("未知のイベント種別「{k}」"),
-            EventReject::UnknownParent(p) => format!("親エージェント「{p}」が存在しません"),
+            EventReject::UnknownKind(k) => format!(
+                "未知のイベント種別「{k}」{}",
+                accepted_line("使えるのは", EVENT_KINDS.iter().copied())
+            ),
+            EventReject::UnknownParent { parent, known } => format!(
+                "親エージェント「{parent}」が存在しません{}",
+                accepted_line("いま居るのは", known.iter().map(String::as_str))
+            ),
             EventReject::ParentMissing => "サブエージェントには親が必要です".to_string(),
             EventReject::ParentCycle(a) => format!("親子関係が循環しています ({a})"),
             EventReject::TooDeep { depth } => format!("親子階層が深すぎます ({depth} 段)"),
@@ -521,8 +1287,7 @@ pub fn parse_event(body: &str) -> Result<EventDoc, EventReject> {
     if body.len() > BLOCK_MAX_BYTES {
         return Err(EventReject::TooLarge { bytes: body.len() });
     }
-    let doc: EventDoc =
-        serde_json::from_str(body).map_err(|e| EventReject::BadJson(e.to_string()))?;
+    let doc: EventDoc = parse_lenient(body).map_err(EventReject::BadJson)?;
     if !EVENT_KINDS.contains(&doc.kind.trim()) {
         return Err(EventReject::UnknownKind(doc.kind.clone()));
     }
@@ -547,13 +1312,25 @@ pub fn check_event(
         if doc.agent_id.trim().is_empty() {
             return Err(EventReject::AgentIdMissing);
         }
+        // **ひな型のまま送ってきたものを実在の担当にしない。**
+        //
+        // 指示文は `"agent_id": "<子の名前>"` という穴埋めを見せる。そのまま
+        // 出してくるエージェントが実際に居て、盤面に `<子の名前>` という
+        // 担当が並んだ (実機で観測)。山括弧は名前に使わないので、これで見分く。
+        let id = doc.agent_id.trim();
+        if id.starts_with('<') || id.ends_with('>') {
+            return Err(EventReject::PlaceholderAgent(id.to_string()));
+        }
         let parent = doc.parent_id.trim();
         if parent.is_empty() {
             return Err(EventReject::ParentMissing);
         }
         // 親は実在するエージェントでなければならない。
         if !known.iter().any(|(id, _)| id.0 == parent) {
-            return Err(EventReject::UnknownParent(parent.to_string()));
+            return Err(EventReject::UnknownParent {
+                parent: parent.to_string(),
+                known: known.iter().map(|(id, _)| id.0.clone()).collect(),
+            });
         }
         // 自分が自分の親になれない。
         if parent == doc.agent_id.trim() {
@@ -941,6 +1718,147 @@ mod tests {
         ));
     }
 
+    /// **実機の Run の台帳に残った却下そのもの。**
+    ///
+    /// `#2 の完了報告を却下: 未知の status「probe」` — 断る判断は正しいが、
+    /// 却下文が**何なら使えるのか**を 1 文字も言っていなかったので、
+    /// エージェントは綴りを直しようがなかった (人が見ても直し方が分からない)。
+    #[test]
+    fn 未知のstatusの却下文は使える語を並べる() {
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.status = "probe".into();
+        let err = accept(doc, &assigned(), &clean()).expect_err("表に無い語は通さない");
+        assert_eq!(
+            err,
+            RejectReason::UnknownStatus("probe".into()),
+            "断る判断は変えない"
+        );
+        let d = err.detail();
+        assert!(d.contains("probe"), "何を断ったか言えていない: {d}");
+        for (w, _) in STATUS_WORDS {
+            assert!(d.contains(w), "使える語 `{w}` が却下文に無い: {d}");
+        }
+        assert!(
+            d.len() <= super::super::model::TEXT_MAX,
+            "却下文が上限を超える ({} バイト)",
+            d.len()
+        );
+    }
+
+    /// 種別の断りも同じ扱い。一覧は [`EVENT_KINDS`] から出す。
+    #[test]
+    fn 未知の種別の却下文は使える語を並べる() {
+        let err = parse_event(r#"{"kind":"hack_the_planet","agent_id":"x"}"#)
+            .expect_err("表に無い種別は通さない");
+        assert_eq!(err, EventReject::UnknownKind("hack_the_planet".into()));
+        let d = err.detail();
+        for k in EVENT_KINDS.iter().take(REJECT_HINT_MAX) {
+            assert!(d.contains(k), "使える種別 `{k}` が却下文に無い: {d}");
+        }
+        if EVENT_KINDS.len() > REJECT_HINT_MAX {
+            let rest = EVENT_KINDS.len() - REJECT_HINT_MAX;
+            assert!(
+                d.contains(&format!("ほか {rest} 件")),
+                "省いたことが分からない: {d}"
+            );
+        }
+        assert!(d.len() <= super::super::model::TEXT_MAX, "却下文が長すぎる: {d}");
+    }
+
+    /// **長い表は切ってよいが、切ったと書く。**
+    ///
+    /// 黙って落とすと、載らなかった語が「使えない語」に見える。
+    #[test]
+    fn 使える語が多すぎるときは省いたと書く() {
+        let many: Vec<String> = (0..REJECT_HINT_MAX + 3).map(|i| format!("w{i}")).collect();
+        let line = accepted_line("使えるのは", many.iter().map(String::as_str));
+        assert!(line.contains("w0"), "先頭が無い: {line}");
+        let last = format!("w{}", REJECT_HINT_MAX - 1);
+        assert!(line.contains(&last), "上限まで並んでいない: {line}");
+        let over = format!("w{REJECT_HINT_MAX}");
+        assert!(!line.contains(&over), "上限を超えて並べた: {line}");
+        assert!(line.contains("ほか 3 件"), "省いたことが分からない: {line}");
+        // 表が空なら何も言わない (空の一覧を見せない)。
+        assert_eq!(accepted_line("使えるのは", Vec::<&str>::new()), "");
+    }
+
+    /// `fn detail` の**本体だけ**を切り出す (コメント行は落とす)。
+    ///
+    /// 範囲を広げると、同じファイルの別の場所に書いてある語を拾って
+    /// **わざと壊しても緑**になる。
+    ///
+    /// 目印を 2 つに割っているのは、`include_str!` が**このファイル自身**を
+    /// 読むため — 1 本の文字列リテラルで書くと、その目印自体が走査に
+    /// 引っかかって本体でない塊を拾う。
+    fn detail_bodies(src: &str) -> Vec<String> {
+        let head = ["fn detail(&self) -> String ", "{"].concat();
+        let src = src.replace("\r\n", "\n");
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(at) = src[from..].find(&head) {
+            let start = from + at + head.len();
+            let mut depth = 1usize;
+            let mut end = src.len();
+            for (i, c) in src[start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push(
+                src[start..end]
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            from = end.max(start + 1);
+        }
+        out
+    }
+
+    /// **却下文へ語を書き写していない。**
+    ///
+    /// 写した瞬間、表を増やした日から却下文だけが古い一覧を出し続ける
+    /// (エージェントは「綴りを直せ」と言われても直しようがない)。
+    /// だから一覧は必ず表 ([`EVENT_KINDS`] / [`STATUS_WORDS`]) から作る。
+    #[test]
+    fn 却下文に語を書き写していない() {
+        let words: Vec<&str> = EVENT_KINDS
+            .iter()
+            .copied()
+            .chain(STATUS_WORDS.iter().map(|(w, _)| *w))
+            .collect();
+
+        // まず検出器そのものを試す (空回りする番人を残さない)。
+        let head = ["fn detail(&self) -> String ", "{"].concat();
+        let fake = format!("{head}\n    \"{}\".to_string()\n}}\n", words[0]);
+        let probe = detail_bodies(&fake);
+        assert_eq!(probe.len(), 1, "本体を切り出せていない: {probe:?}");
+        assert!(
+            probe[0].contains(words[0]),
+            "写した語を見落とす検出器: {probe:?}"
+        );
+
+        let bodies = detail_bodies(include_str!("result_parser.rs"));
+        assert!(bodies.len() >= 3, "detail を見つけられていない: {bodies:?}");
+        for body in &bodies {
+            for w in &words {
+                assert!(
+                    !body.contains(w),
+                    "却下文へ `{w}` を書き写している。EVENT_KINDS / STATUS_WORDS から組み立てること"
+                );
+            }
+        }
+    }
+
     #[test]
     fn 大きすぎる報告を拒否する() {
         let big = format!("{{\"x\":\"{}\"}}", "a".repeat(BLOCK_MAX_BYTES));
@@ -1004,10 +1922,18 @@ mod tests {
     fn 未知の親を拒否する() {
         let mut doc = parse_event(EV).unwrap();
         doc.parent_id = "ghost".into();
+        let err = check_event(&doc, &known(), &AgentId::new("backend-lead"), Some(12))
+            .expect_err("居ない親の下へ生やした");
         assert_eq!(
-            check_event(&doc, &known(), &AgentId::new("backend-lead"), Some(12)),
-            Err(EventReject::UnknownParent("ghost".into()))
+            err,
+            EventReject::UnknownParent {
+                parent: "ghost".into(),
+                known: vec!["backend-lead".to_string()],
+            }
         );
+        // 断るだけでなく、実在する親を添える。
+        let d = err.detail();
+        assert!(d.contains("backend-lead"), "居る親が却下文に無い: {d}");
     }
 
     #[test]
@@ -1143,5 +2069,578 @@ mod tests {
             ..doc.clone()
         };
         assert!(check_event(&nested, &known, &AgentId::new("agent-1"), None).is_ok());
+    }
+
+    // ── 自分が送った指示のエコー ─────────────────────────────────────
+
+    /// 送った指示の**実物**を組み立てる (ひな型は `prompt.rs` の 1 か所だけ)。
+    fn sent_instruction_sample() -> String {
+        let goal = super::super::testkit::goal();
+        let mut t = task(1, "web3d", &[]);
+        t.title = "かっこいい３DのWebページを作って".to_string();
+        t.assigned_agent = Some(AgentId::new("team-lead"));
+        let brief = super::super::prompt::Brief {
+            goal: &goal,
+            task: &t,
+            agent_id: "team-lead",
+            parent_id: None,
+            workspace_root: "<ワークスペースルート>",
+            upstream: Vec::new(),
+            forbidden_files: Vec::new(),
+            outbox: std::path::PathBuf::new(),
+            run_id: "run-test",
+            teammates: Vec::new(),
+        };
+        super::super::prompt::for_task(&brief, std::slice::from_ref(&t))
+    }
+
+    /// **実機で実際に出た壊れ方をそのまま固定する。**
+    ///
+    /// 0.23.0 の Team Run は、開始直後に必ず
+    /// `報告の JSON を読めません: invalid type: string "task_id" …` を出していた。
+    /// 正体は「端末が指示の枠を描き直している途中」— 先頭の `{` がまだ無い
+    /// 状態を、相手の報告として拾っていた。
+    /// **測る手立てが無いフォルダでも完了できる。**
+    ///
+    /// 実機で `~/dev/Sharp` (Git 管理下でない) を相手にしたとき、7 体が
+    /// 並列で働いているのに**どの完了報告も却下**され、1 件も終わらなかった:
+    /// 「変更されたファイルを実測できないので完了にできません」。
+    ///
+    /// 直しようが無い理由で止め続けるのは、そのフォルダでこの機能を
+    /// 使えなくするのと同じ。**通すが、盤面が「実測なし」を出す**。
+    #[test]
+    fn 測る手立てが無くても完了できる() {
+        let task = assigned();
+        let doc: ResultDoc = serde_json::from_str(GOOD).unwrap();
+        // 測れるはずなのに失敗した → **通さない** (直せば測れるので人へ渡す)。
+        let broken = FileEvidence::Unavailable("git が壊れています".into());
+        assert!(matches!(
+            accept(doc.clone(), &task, &broken),
+            Err(RejectReason::EvidenceUnavailable(_))
+        ));
+        // そもそも測る手立てが無い → **通す**。
+        let none = FileEvidence::Unmeasurable("Git 管理下ではありません".into());
+        let ok = accept(doc, &task, &none).expect("完了できる");
+        assert_eq!(ok.task_id, task.id);
+        // **測れていないことは隠さない。** 実測は空のまま残る
+        // (自己申告を実測に格上げしない)。
+        assert!(
+            ok.changed_files.is_empty(),
+            "測っていないのに実測として載せている"
+        );
+        assert!(!ok.reported_files.is_empty(), "自己申告は残る");
+    }
+
+    #[test]
+    fn 描き直し途中のエコーを報告として拾わない() {
+        let sent = sent_instruction_sample();
+        // 実機のログから起こした本文 (先頭の `{` が無い)。
+        let body = "\"task_id\": 1,    \"agent_id\": \"team-lead\",    \
+                    \"status\": \"completed\",    \"summary\": \"何をしたかの 1 行\"";
+        assert!(
+            parse_result(body).is_err(),
+            "この本文は JSON として読めない (だから rejected が出ていた)"
+        );
+        assert!(
+            is_prompt_echo(body, &sent, RESULT_OPEN, RESULT_CLOSE),
+            "送った指示のひな型の一部なので、報告として扱ってはいけない"
+        );
+    }
+
+    /// **全部描き終わったエコーは、落ちるより悪い。**
+    ///
+    /// ひな型は `"status": "completed"` を持つ正しい JSON なので、素直に
+    /// 拾うと「1 文字も作業していないのに完了報告が届いた」ことになる。
+    #[test]
+    fn 描き終わったエコーは正しいjsonなので必ず弾く() {
+        let sent = sent_instruction_sample();
+        let body = extract_blocks(&sent, RESULT_OPEN, RESULT_CLOSE)
+            .into_iter()
+            .next()
+            .expect("指示には報告のひな型が載っている");
+        let doc = parse_result(&body).expect("ひな型はそれ自体が正しい JSON である");
+        assert_eq!(doc.status, "completed", "だから黙って完了になり得た");
+        assert!(is_prompt_echo(&body, &sent, RESULT_OPEN, RESULT_CLOSE));
+    }
+
+    /// **本物の報告は素通しする。** echo 判定が全部を飲み込んだら、
+    /// 今度は永久に完了しなくなる (直したつもりで別の壊し方になる)。
+    #[test]
+    fn 本物の報告はエコーとみなさない() {
+        let sent = sent_instruction_sample();
+        let body = "{\"task_id\": 1, \"agent_id\": \"team-lead\", \
+                    \"status\": \"completed\", \"summary\": \"index.html に three.js の球体を置いた\", \
+                    \"changed_files\": [\"index.html\"], \"validation\": [], \"blockers\": []}";
+        assert!(parse_result(body).is_ok());
+        assert!(
+            !is_prompt_echo(body, &sent, RESULT_OPEN, RESULT_CLOSE),
+            "中身がひな型と違うのだから echo ではない"
+        );
+    }
+
+    /// **本文に生の改行が入っていても伝言は届く。**
+    ///
+    /// 実機で伝言 14 通が全部「control character found while parsing a
+    /// string」で捨てられていた。仕組みは動いているのに 1 通も届いて
+    /// いなかった — エージェントは本文の改行をそのまま書いてくる。
+    #[test]
+    fn 本文に生の改行があっても伝言は届く() {
+        let known: Vec<(AgentId, String)> = vec![
+            (AgentId::new("a"), "implementer".into()),
+            (AgentId::new("b"), "reviewer".into()),
+        ];
+        // 生の改行入り (これが実機で来ていた形)。
+        let body = "{\"to\": \"b\", \"text\": \"設計が終わった。\n次は実装に入って\"}";
+        assert!(
+            serde_json::from_str::<MessageDoc>(body).is_err(),
+            "素の serde_json はこれを読めない (だから捨てられていた)"
+        );
+        let (to, text) = check_message(body, &known, &AgentId::new("a")).expect("届く");
+        assert_eq!(to, vec![AgentId::new("b")]);
+        assert!(text.contains("次は実装に入って"), "本文が欠けている: {text:?}");
+        assert!(text.contains('\n'), "改行が失われている: {text:?}");
+    }
+
+    /// **直すのは文字列の中だけ。** 構造の改行は JSON として正しいので触らない。
+    #[test]
+    fn 直すのは文字列の中だけ() {
+        let pretty = "{\n  \"to\": \"b\",\n  \"text\": \"ok\"\n}";
+        assert_eq!(escape_raw_controls(pretty), pretty, "構造を書き換えている");
+        // 文字列の中のタブは逃がす。
+        let raw = "{\"text\": \"a\tb\"}";
+        assert!(escape_raw_controls(raw).contains("\\t"));
+        // 既にエスケープ済みのものを二重にしない。
+        let done = "{\"text\": \"a\\nb\"}";
+        assert_eq!(escape_raw_controls(done), done, "二重にエスケープしている");
+    }
+
+}
+
+
+#[cfg(test)]
+mod lenient_message_tests {
+    use super::*;
+
+    fn known() -> Vec<(AgentId, String)> {
+        vec![
+            (AgentId("reviewer-1".into()), "reviewer".into()),
+            (AgentId("impl-1".into()), "implementer".into()),
+        ]
+    }
+
+    fn read(body: &str) -> Result<(Vec<AgentId>, String), MessageReject> {
+        check_message(body, &known(), &AgentId("impl-1".into()))
+    }
+
+    #[test]
+    fn fallbackはトップレベルの一意な文字列キーだけを読む() {
+        let cases = [
+            // 本文中の例を宛先として拾ってはいけない。
+            r#"{"text": "設定例は \"to\": \"all\" です"}"#,
+            // エスケープされていない引用符を救済する場合も同じ。
+            r#"{"text": "設定例は "to": "all" です"}"#,
+            // ネスト内のキーはトップレベルの宛先ではない。
+            r#"{"meta":{"to":"all"},"text":"本文"}"#,
+            r#"{"items":[{"to":"all"}],"text":"本文"}"#,
+            // 重複はどちらを採るか決められない。
+            r#"{"to":"reviewer-1","to":"all","text":"本文",}"#,
+            r#"{"to":"reviewer-1","text":"一つ","text":"二つ",}"#,
+            // 対象キーは文字列型だけを許可する。
+            r#"{"to":true,"text":"本文",}"#,
+            r#"{"to":"reviewer-1","text":["本文"],}"#,
+            // 途中で切れた値と壊れた Unicode escape は救済しない。
+            r#"{"to":"reviewer-1","text":"途中"#,
+            r#"{"to":"reviewer-1","text":"\u12xz",}"#,
+            r#"{"to":"reviewer-1","text":"\ud800",}"#,
+        ];
+        for body in cases {
+            assert!(
+                matches!(read(body), Err(MessageReject::BadJson(_))),
+                "曖昧な入力を伝言として採用した: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallbackは順序と安全に救済できる綴りだけを許す() {
+        let cases = [
+            (
+                r#"{"text":"Unicode 日本語 😀","to":"reviewer-1",}"#,
+                "Unicode 日本語 😀",
+            ),
+            (
+                r#"{"to":"reviewer-1" "text":"C:\Users\me\logs"}"#,
+                r"C:\Users\me\logs",
+            ),
+            (
+                "{\"to\":\"reviewer-1\",\"text\":\"一行目\n二行目\",}",
+                "一行目\n二行目",
+            ),
+            (
+                r#"{"to":"reviewer-1","text":"彼は "yes" と言った",}"#,
+                r#"彼は "yes" と言った"#,
+            ),
+        ];
+        for (body, want) in cases {
+            let (targets, text) = read(body).unwrap_or_else(|e| panic!("{body:?}: {e:?}"));
+            assert_eq!(targets, vec![AgentId("reviewer-1".into())], "{body:?}");
+            assert_eq!(text, want, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn fallbackは上限付近と大量の引用符でも線形に止まりpanicしない() {
+        let near_limit = format!(
+            "{{\"to\":\"reviewer-1\",\"text\":\"{}\",}}",
+            "\\\\\\\"日本語".repeat(BLOCK_MAX_BYTES / 16)
+        );
+        let _ = std::panic::catch_unwind(|| read(&near_limit)).expect("上限付近で panic した");
+
+        // 任意UTF-8相当の決定的な探針。構造文字・制御文字・Unicodeを混ぜる。
+        let alphabet = ['{', '}', '[', ']', '"', '\\', ':', ',', '\n', '\t', 'a', '日', '😀'];
+        let mut seed = 0x51_u64;
+        for len in 0..512usize {
+            let mut s = String::new();
+            for _ in 0..len {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                s.push(alphabet[(seed as usize) % alphabet.len()]);
+            }
+            let got = std::panic::catch_unwind(|| read(&s));
+            assert!(got.is_ok(), "任意UTF-8入力で panic: {s:?}");
+        }
+    }
+
+    /// **実測で落ちていた 4 通りが、全部届く。**
+    ///
+    /// Team Run 1 本 (19 通) のうち 5 通がこれで捨てられていた。
+    /// 伝言が落ちると相手は待ち続けるので、落とす代償が大きい。
+    #[test]
+    fn 手書きのjsonの綴り間違いでも届く() {
+        // 1) 本文に生の `"` (いちばん多い)
+        let (to, text) = read(r#"{"to": "reviewer-1", "text": "彼は "yes" と言った"}"#)
+            .expect("生の引用符で落ちた");
+        assert_eq!(to, vec![AgentId("reviewer-1".into())]);
+        assert_eq!(text, r#"彼は "yes" と言った"#);
+        // 2) 鍵の間のカンマ抜け
+        let (_, text) =
+            read(r#"{"to": "reviewer-1" "text": "カンマが無い"}"#).expect("カンマ抜けで落ちた");
+        assert_eq!(text, "カンマが無い");
+        // 3) 末尾カンマ
+        let (_, text) = read(r#"{"to": "reviewer-1", "text": "末尾カンマ",}"#)
+            .expect("末尾カンマで落ちた");
+        assert_eq!(text, "末尾カンマ");
+        // 4) Windows パス (`\U` / `\m` は JSON の不正エスケープ)
+        let (_, text) =
+            read(r#"{"to": "reviewer-1", "text": "C:\Users\me を見て"}"#).expect("パスで落ちた");
+        assert_eq!(text, r"C:\Users\me を見て", "知らない綴りを消してしまった");
+    }
+
+    /// **区別が付かないものは、付かないと認める。**
+    ///
+    /// `\t` / `\n` は JSON の正当なエスケープなので、`C:\temp` と
+    /// 「タブ + emp」を**入力からは見分けられない** (serde も同じ)。
+    /// ここは正しい JSON と同じ読み方に揃える — 1 通まるごと捨てるよりは、
+    /// 一部が化けても届いたほうが相手の仕事が進む。
+    ///
+    /// 直したいなら**入力の側**を変えるしかない (指示文で「パスは
+    /// `\\` で書く」と教える)。読み手側では決められない。
+    #[test]
+    fn 正当なエスケープと紛れるパスは化ける() {
+        let (_, text) =
+            read(r#"{"to": "reviewer-1", "text": "C:\temp の "log" を見て"}"#).unwrap();
+        assert_eq!(text, "C:\temp の \"log\" を見て".replace("\\t", "\t"));
+        assert!(text.contains('\t'), "タブとして読まれていない");
+        assert!(text.contains(r#""log""#), "伝言そのものは届いている");
+    }
+
+    /// **正しい JSON の読み方は 1 ミリも変えない。**
+    ///
+    /// 受け皿は「読めなかったとき」だけ通る。ここが変わると、いままで
+    /// 届いていた 14 通の意味が黙って変わる。
+    #[test]
+    fn 正しいjsonはこれまでどおり() {
+        let (to, text) = read(r#"{"to": "all", "text": "改行\nと \"引用符\" と \\ "}"#).unwrap();
+        assert_eq!(to, vec![AgentId("reviewer-1".into())], "all は自分を除く");
+        assert_eq!(text, "改行\nと \"引用符\" と \\");
+    }
+
+    /// **読めた振りをしない。** 鍵が無いものは今までどおり断る。
+    /// 拾えなかったものを黙って空の伝言にすると、盤面には「伝えた」と
+    /// 出るのに中身が無い、という嘘になる。
+    #[test]
+    fn 鍵が無いものは断る() {
+        assert!(matches!(
+            read(r#"{"dest": "reviewer-1", "body": "鍵の名前が違う"}"#),
+            Err(MessageReject::BadJson(_))
+        ));
+        assert!(matches!(read("ただの文章です"), Err(MessageReject::BadJson(_))));
+        // 宛先が空 / 本文が空は、受け皿を通っても断る。
+        assert!(matches!(
+            read(r#"{"to": "", "text": "宛先が空"}"#),
+            Err(MessageReject::NoTarget)
+        ));
+        assert!(matches!(
+            read(r#"{"to": "reviewer-1", "text": "  "}"#),
+            Err(MessageReject::Empty)
+        ));
+        // 居ない相手は捏造しない。
+        assert!(matches!(
+            read(r#"{"to": "居ない人", "text": "やあ "君" "}"#),
+            Err(MessageReject::UnknownTarget { .. })
+        ));
+    }
+
+    /// **実機で 2 回記録された却下そのもの。**
+    ///
+    /// `actor=agent-4 : 伝言の宛先 \`tester\` は居ません` — ところが
+    /// agent-4 の役割がまさに `tester` だった。相手は居るのに「居ません」と
+    /// 言われたので、綴りを疑って同じ宛先を書き直し、また断られた。
+    ///
+    /// 断る判断は変えない (自分宛ての伝言は誰にも届かない) が、
+    /// **理由は実態に合わせる**。
+    #[test]
+    fn 自分の役割を宛先に書いたら居ないとは言わない() {
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let me = AgentId("agent-4".into());
+        let body = r#"{"to": "tester", "text": "テストを流します"}"#;
+        let err = check_message(body, &team, &me).expect_err("自分宛ては届かない");
+        assert_eq!(
+            err,
+            MessageReject::SelfTarget("tester".into()),
+            "自分自身なのに UnknownTarget と言っている"
+        );
+        let d = err.detail();
+        assert!(
+            !d.contains("居ません"),
+            "相手は居るのに「居ません」と言った: {d}"
+        );
+        assert!(d.contains("あなた自身"), "何が起きたか言えていない: {d}");
+        assert!(d.contains("相手"), "どうすればよいか言えていない: {d}");
+
+        // ID を書いた場合も同じ (綴り間違いではない、と伝わること)。
+        let err = check_message(r#"{"to": "agent-4", "text": "自分へ"}"#, &team, &me)
+            .expect_err("自分宛ては届かない");
+        assert_eq!(err, MessageReject::SelfTarget("agent-4".into()));
+
+        // **本物の宛先はこれまでどおり届く。**
+        let (targets, _) =
+            check_message(r#"{"to": "implementer", "text": "見て"}"#, &team, &me).unwrap();
+        assert_eq!(targets, vec![AgentId("agent-3".into())]);
+    }
+
+    /// **`all` で誰も居ないのは、宛先の綴りの問題ではない。**
+    ///
+    /// 居ないのは相手ではなく「あなた以外の担当」なので、
+    /// `all は居ません` と言うと `all` を疑わせてしまう。
+    #[test]
+    fn 自分しか居ないときのallは宛先のせいにしない() {
+        let alone = vec![(AgentId("agent-4".into()), "tester".to_string())];
+        let me = AgentId("agent-4".into());
+        let err = check_message(r#"{"to": "all", "text": "みんなへ"}"#, &alone, &me)
+            .expect_err("自分しか居ないので届かない");
+        assert_eq!(err, MessageReject::NoOtherAgents);
+        let d = err.detail();
+        assert!(d.contains("あなただけ"), "実態を言えていない: {d}");
+
+        // 相手が 1 人でも居れば、all はこれまでどおり届く。
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let (targets, _) =
+            check_message(r#"{"to": "all", "text": "みんなへ"}"#, &team, &me).unwrap();
+        assert_eq!(targets, vec![AgentId("agent-3".into())]);
+    }
+
+    /// **捏造した宛先は今までどおり断る。**
+    /// 自分自身の枝を足したせいで、表に無い宛先まで通ってはいけない。
+    #[test]
+    fn 表に無い宛先はこれまでどおり断る() {
+        let team = vec![
+            (AgentId("agent-3".into()), "implementer".to_string()),
+            (AgentId("agent-4".into()), "tester".to_string()),
+        ];
+        let me = AgentId("agent-4".into());
+        for to in ["designer", "agent-9", "tester-2", "TESTER"] {
+            let body = format!(r#"{{"to": "{to}", "text": "やあ"}}"#);
+            let err = check_message(&body, &team, &me).expect_err("居ない相手へ届けた");
+            assert_eq!(
+                err,
+                MessageReject::UnknownTarget {
+                    to: to.to_string(),
+                    known: vec!["agent-3 (implementer)".to_string()],
+                },
+                "宛先 {to}"
+            );
+            // **断るだけで終わらない。** 誰へなら書けるのかを添える。
+            let d = err.detail();
+            assert!(d.contains("agent-3"), "書ける宛先が却下文に無い: {d}");
+            assert!(
+                !d.contains("agent-4"),
+                "自分自身を宛先として勧めている: {d}"
+            );
+        }
+    }
+
+    /// **鍵の順番が逆でも読める。** `text` を「最後の引用符まで」と読むので、
+    /// 後ろに `to` があるとその値まで飲み込みかねない。
+    #[test]
+    fn 鍵の順番が逆でも本文を飲み込まない() {
+        let (to, text) =
+            read(r#"{"text": "先に本文 "引用" あり", "to": "reviewer-1"}"#).expect("読めない");
+        assert_eq!(to, vec![AgentId("reviewer-1".into())]);
+        assert_eq!(text, r#"先に本文 "引用" あり"#);
+    }
+
+    /// **括弧の外の文字を本文へ引き込まない。**
+    ///
+    /// 画面から切り出した塊には、`}` のあとに別の行が混じることがある。
+    /// 「最後の引用符まで」を素直にやると、そこまで本文になる。
+    #[test]
+    fn 括弧の外の後書きを飲み込まない() {
+        let (_, text) = read(
+            "{\"to\": \"reviewer-1\", \"text\": \"本文 \"引用\" あり\"}\n書き終わり \"余談\"",
+        )
+        .expect("読めない");
+        assert_eq!(text, "本文 \"引用\" あり");
+    }
+
+    /// **本文の中に鍵と同じ綴りがあっても惑わされない。**
+    #[test]
+    fn 本文の中の鍵らしい綴りを拾わない() {
+        let (_, text) = read(r#"{"to": "reviewer-1", "text": "\"to\": を説明する"}"#).unwrap();
+        assert_eq!(text, r#""to": を説明する"#);
+    }
+}
+
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    /// **実機で捨てられていた報告が、そのまま通る。**
+    ///
+    /// これは作り物ではなく、Team Run で agent-1 (Planner) が実際に出した
+    /// 報告 (`~/.zaivern/term_logs` の生ログから起こしたもの)。台帳には
+    /// `報告の JSON を読めません` として 4 回残っていた。**中身は正しく、
+    /// シェルのコマンドに `"` が入っていただけ**で、正しく働いた担当が
+    /// 「報告していない」ことになって止まっていた。
+    const REAL: &str = r#"{
+  "task_id": 4,
+  "agent_id": "agent-1",
+  "status": "completed",
+  "summary": "3D方式、ローカル依存、ファイル責務を architecture.md に確定した",
+  "changed_files": ["docs/architecture.md"],
+  "validation": [
+    {
+      "command": "test -s docs/architecture.md && test "$(rg -c '^x' docs/architecture.md)" -eq 8",
+      "exit_code": 0
+    }
+  ],
+  "blockers": []
+}"#;
+
+    #[test]
+    fn 実機で捨てられた報告が通る() {
+        // 直す前は serde が断っていたことを、まず確かめる
+        // (直っていない入力でテストしても何も守れない)。
+        assert!(
+            serde_json::from_str::<ResultDoc>(&escape_raw_controls(REAL)).is_err(),
+            "この入力は素の serde でも通る (再現していない)"
+        );
+        let d = parse_result(REAL).expect("実機の報告が読めない");
+        assert_eq!(d.task_id, 4);
+        assert_eq!(d.status, "completed");
+        assert_eq!(d.changed_files, vec!["docs/architecture.md".to_string()]);
+        // **コマンドは 1 文字も変えない。** 直すのは綴りだけ。
+        assert_eq!(
+            d.validation[0].command,
+            r#"test -s docs/architecture.md && test "$(rg -c '^x' docs/architecture.md)" -eq 8"#
+        );
+        assert_eq!(d.validation[0].exit_code, 0);
+    }
+
+    /// **直すのは 3 通りだけ。それぞれ単独で効く。**
+    #[test]
+    fn 綴りの直しは三通り() {
+        // 1) 本文の中の生の `"`
+        let v: serde_json::Value =
+            parse_lenient(r#"{"a": "彼は "yes" と言った"}"#).expect("生の引用符");
+        assert_eq!(v["a"], r#"彼は "yes" と言った"#);
+        // 2) 鍵の間のカンマ抜け
+        let v: serde_json::Value = parse_lenient(r#"{"a": "x" "b": "y"}"#).expect("カンマ抜け");
+        assert_eq!(v["a"], "x");
+        assert_eq!(v["b"], "y");
+        // 3) 末尾カンマ (オブジェクトも配列も)
+        let v: serde_json::Value =
+            parse_lenient(r#"{"a": ["x","y",], "b": 1,}"#).expect("末尾カンマ");
+        assert_eq!(v["a"][1], "y");
+        assert_eq!(v["b"], 1);
+    }
+
+    /// **正しい JSON は 1 文字も変えない。**
+    ///
+    /// 直し場が正しい入力に手を出すと、いままで通っていた報告の意味が
+    /// 黙って変わる。ここが**いちばん壊してはいけない**性質。
+    #[test]
+    fn 正しいjsonには手を出さない() {
+        for good in [
+            r#"{"a":"x","b":[1,2],"c":{"d":null}}"#,
+            r#"{"a":"エス\"ケープ\\済み","b":"改行\nタブ\t"}"#,
+            r#"{"a":"記号 , } ] : を含む","b":"末尾が記号,"}"#,
+            r#"[{"a":1},{"a":2}]"#,
+            r#"{"empty":"","arr":[],"obj":{}}"#,
+        ] {
+            let want: serde_json::Value = serde_json::from_str(good).expect("元が正しい");
+            let got: serde_json::Value = parse_lenient(good).expect("直し場が壊した");
+            assert_eq!(got, want, "正しい JSON を書き換えた: {good}");
+            assert_eq!(repair_json(good), good, "文字列そのものを変えた: {good}");
+        }
+    }
+
+    /// **読めた振りをしない。** 直しても意味が取れないものは断る。
+    #[test]
+    fn 直しても駄目なものは断る() {
+        assert!(parse_lenient::<serde_json::Value>("ただの文章").is_err());
+        assert!(parse_lenient::<serde_json::Value>("{壊れて").is_err());
+        // **エラーは 1 回目のもの** (直した後の文字列への苦情を返さない)。
+        let e = parse_lenient::<ResultDoc>("{}").unwrap_err();
+        assert!(e.contains("task_id"), "元の原因が見えない: {e}");
+    }
+
+    /// **報告・レビュー・出来事・伝言が同じ直し場を通る。**
+    ///
+    /// 種類ごとに直し方が違うと「実装は届くのにレビューは落ちる」という
+    /// 説明できない差が出る。
+    #[test]
+    fn 四種類とも同じ直し場を通る() {
+        let src = include_str!("result_parser.rs").replace("\r\n", "\n");
+        let rev = include_str!("reviewer.rs").replace("\r\n", "\n");
+        for (name, body) in [
+            ("報告", fn_body(&src, "pub fn parse_result")),
+            ("出来事", fn_body(&src, "pub fn parse_event")),
+            ("伝言", fn_body(&src, "pub fn read_message")),
+            ("レビュー", fn_body(&rev, "pub fn parse_review")),
+        ] {
+            assert!(
+                body.contains("parse_lenient"),
+                "{name} が直し場を通っていない"
+            );
+            assert!(
+                !body.contains("serde_json::from_str"),
+                "{name} が自前で読んでいる"
+            );
+        }
+    }
+
+    /// 関数 1 本の中身だけを返す (範囲を広げると隣の関数を拾って空回りする)。
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("{sig} が無い"));
+        let rest = &src[at..];
+        let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+        &rest[..end]
     }
 }

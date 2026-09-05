@@ -10,8 +10,8 @@
 //!
 //! ## レイアウトの約束 (CLAUDE.md の UI 原則)
 //!
-//! * **どの幅でも見切れない** — レーン幅は [`super::view_model::lane_layout`]
-//!   が決め、入り切らないぶんは横スクロールへ逃がす
+//! * **どの幅でも見切れない** — 組織図は最小キャンバスを保ち、入り切らない
+//!   ぶんは両方向スクロールへ逃がす
 //! * **空白は作らない** — 中身の無いセクションは高さを 1px も取らない。
 //!   空状態は利用可能領域の**中央**に 1 枚のカードで出す
 //! * **点滅は停滞と緊急承認だけ** — 常時アニメーションはバッテリーのバグ
@@ -25,14 +25,19 @@ use crate::theme::Theme;
 
 use super::graph::{Phase, PhaseStatus};
 use super::model::*;
-use super::panel::{BoardAction, BoardTab, NewRunForm, RestorePrompt};
+use super::panel::{
+    BoardAction, BoardTab, ClosePrompt, DraftState, NewRunForm, RestorePrompt,
+};
+use super::composition;
+use super::planner;
 use super::view_model::{
     self, current_action, ActionFocus, TeamAgentView, TeamSnapshot, MISSION_PANEL_W,
 };
 
-/// 子エージェント行を 1 枚のカードに出す上限。**超えたぶんは「他 N 件」**
-/// (64 体でも縦に伸び続けないための線)。
-pub const CHILD_ROWS_MAX: usize = 6;
+/// 放射状組織図が読める最小キャンバス。狭い画面では縮めて潰さず、
+/// ScrollArea でこの大きさへ到達できるようにする。
+pub const ORGANIZATION_MAP_MIN_W: f32 = 680.0;
+pub const ORGANIZATION_MAP_MIN_H: f32 = 520.0;
 /// 窓と画面のあいだに残す余白 (片側)。**0 にすると角が画面の縁に張り付く。**
 const WINDOW_MARGIN: f32 = 16.0;
 /// 窓の枠 (内側余白とタイトルバー) が外形に足すぶん。
@@ -72,7 +77,6 @@ fn glyph_label(ui: &mut egui::Ui, theme: &Theme, s: AgentWorkState) {
         "team-blink",
     );
 }
-
 
 /// 状態を色つきの小さな札で出す。
 ///
@@ -236,8 +240,22 @@ pub fn board_window(
     tab: BoardTab,
     form: &mut NewRunForm,
     restore: RestorePrompt,
+    close: &ClosePrompt,
     selected: Option<&AgentId>,
+    // 端末タブで「その場で開いている」担当。
+    expanded: Option<&AgentId>,
+    // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
+    runs: &[(String, bool)],
+    active_run: usize,
+    // このワークスペースは Git 管理下でない (実測できない)。
+    needs_git: bool,
+    // 選べるエージェント (この PC に入っている AI CLI のプリセット名)。
+    agents: &[String],
     notice: &str,
+    // 端末 1 枚を「ここへ」描く口。描けたら true。
+    // **実体は app 側にある** (セッションを持っているのはあちら) ので、
+    // 盤面は場所だけ用意して呼ぶ。
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) -> Vec<BoardAction> {
     let mut acts = Vec::new();
     if !open {
@@ -256,15 +274,23 @@ pub fn board_window(
         .open(&mut win_open)
         .collapsible(false)
         .resizable(true)
-        .default_width(max_w.min(1180.0))
-        .default_height(max_h.min(760.0))
+        // **最初から画面いっぱいで開く。**
+        //
+        // 既定を 1180x760 にしていたので、レーンや担当が増えるたびに窓が
+        // 少しずつ広がっていた (「徐々に画面が広がる」として報告された)。
+        // 上限 (`max_w` / `max_h`) と同じ値から始めれば、中身が増えても
+        // それ以上には広がらない = 開いた瞬間の大きさのまま落ち着く。
+        // `resizable` は残すので、狭めたい人は狭められる。
+        .default_width(max_w)
+        .default_height(max_h)
         .max_width(max_w)
         .max_height(max_h)
         .constrain_to(screen)
         .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             body(
-                ui, theme, snap, tab, form, restore, selected, notice, &mut acts,
+                ui, theme, snap, tab, form, restore, close, selected, expanded, runs, active_run,
+                needs_git, agents, notice, &mut acts, term,
             );
         });
     if !win_open {
@@ -281,13 +307,27 @@ fn body(
     tab: BoardTab,
     form: &mut NewRunForm,
     restore: RestorePrompt,
+    close: &ClosePrompt,
     selected: Option<&AgentId>,
+    // 端末タブで「その場で開いている」担当。
+    expanded: Option<&AgentId>,
+    // 走っている Run の一覧 `(表題, 進行中か)` と、いま出している位置。
+    runs: &[(String, bool)],
+    active_run: usize,
+    // このワークスペースは Git 管理下でない (実測できない)。
+    needs_git: bool,
+    // 選べるエージェント (この PC に入っている AI CLI のプリセット名)。
+    agents: &[String],
     notice: &str,
     acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
 ) {
     if !notice.is_empty() {
         ui.colored_label(theme.warn, plain(notice));
     }
+    run_tabs_row(ui, theme, runs, active_run, acts);
+    git_needed_row(ui, theme, needs_git, acts);
+    ready_to_start_row(ui, theme, snap, acts);
 
     // ── 未完了 Run の扱い ──
     if restore != RestorePrompt::None {
@@ -295,9 +335,14 @@ fn body(
         return;
     }
 
+    if *close != ClosePrompt::None {
+        close_card(ui, theme, close, acts);
+        return;
+    }
+
     // ── New Team Run のフォーム ──
     if form.open {
-        new_run_form(ui, theme, form, acts);
+        new_run_form(ui, theme, form, agents, acts);
         return;
     }
 
@@ -338,9 +383,9 @@ fn body(
         // 縦積みは明示する (継承させない)。
         let column = egui::Layout::top_down(egui::Align::Min);
         ui.allocate_ui_with_layout(egui::vec2(board_w, content_h), column, |ui| match tab {
-            BoardTab::Organization => organization_tab(ui, theme, s, &layout, selected, acts),
+            BoardTab::Organization => organization_tab(ui, theme, s, selected, acts),
             BoardTab::Tasks => tasks_tab(ui, theme, s, acts),
-            BoardTab::Terminals => terminals_tab(ui, theme, s, acts),
+            BoardTab::Terminals => terminals_tab(ui, theme, s, expanded, acts, term),
             BoardTab::Timeline => timeline_tab(ui, theme, s),
         });
         if layout.mission_panel {
@@ -367,100 +412,127 @@ fn top_command_bar(
     s: &TeamSnapshot,
     acts: &mut Vec<BoardAction>,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(ellipsis(&s.goal.title, 44))
-                .color(theme.text)
-                .strong(),
-        )
-        .on_hover_text(&s.goal.title);
-        ui.label(
-            RichText::new(format!("[{}]", goal_status_label(s.goal.status)))
-                .color(goal_color(theme, s.goal.status)),
-        );
-        ui.label(RichText::new(phase_label(s.goal.phase)).color(theme.text_dim));
-        ui.separator();
-        let m = &s.metrics;
-        ui.label(trf(
-            "team.metrics.progress",
-            &[("pct", m.progress_pct.to_string())],
-        ));
-        ui.label(trf(
-            "team.metrics.tasks",
-            &[
-                ("done", m.tasks_done.to_string()),
-                ("total", m.tasks_total.to_string()),
-            ],
-        ));
-        ui.label(trf(
-            "team.metrics.agents",
-            &[("n", m.agents_active.to_string())],
-        ));
-        // **自動検証が 1 本も無いことを、常に見えるところへ出す。**
-        // 通知は上書きで消えるが、これは状態から導くので消えない。
-        // 完了を決めるのがレビュー承認だけになる、という重い意味を持つ。
-        if s.unvalidated {
-            ui.label(
-                RichText::new(tr("team.chip.unvalidated"))
-                    .color(theme.warn)
-                    .strong(),
-            )
-            .on_hover_text(tr("team.chip.unvalidated_hint"));
-        }
-        // **常に 0 のバッジを出さない** (CLAUDE.md: 減らせないかを先に考える)。
-        if m.blocked > 0 {
-            ui.label(
-                RichText::new(trf("team.metrics.blocked", &[("n", m.blocked.to_string())]))
-                    .color(theme.warn),
-            );
-        }
-        if m.tests_passed > 0 {
-            ui.label(
-                RichText::new(trf(
-                    "team.metrics.tests",
-                    &[("n", m.tests_passed.to_string())],
-                ))
-                .color(theme.ok),
-            );
-        }
-        if m.reviews_approved > 0 {
-            ui.label(trf(
-                "team.metrics.reviews",
-                &[("n", m.reviews_approved.to_string())],
-            ));
-        }
-        ui.separator();
-        if s.paused {
-            if ui.button(tr("team.btn.resume")).clicked() {
-                acts.push(BoardAction::Resume);
-            }
-        } else if ui.button(tr("team.btn.pause")).clicked() {
-            acts.push(BoardAction::Pause);
-        }
-        if ui
-            .button(tr("team.btn.stop"))
-            .on_hover_text(tr("team.btn.stop_hint"))
-            .clicked()
-        {
-            acts.push(BoardAction::Stop);
-        }
-        if s.goal.status == GoalStatus::Ready && ui.button(tr("team.btn.start")).clicked() {
-            acts.push(BoardAction::Start);
-        }
-        // **途中で口を出す入口。** 相手は開いた先の一覧から選ぶので、
-        // 盤面のカードを探し当てる必要が無い。端末を持つ相手が 1 体も
-        // 居ないときは、押せるのに何も起きないボタンにしない。
-        let live = s.agents.iter().any(|a| a.can_open_terminal);
-        let b = ui.add_enabled(live, egui::Button::new(tr("team.btn.instruct")));
-        let b = if live {
-            b.on_hover_text(tr("team.btn.instruct_hint"))
-        } else {
-            b.on_disabled_hover_text(tr("team.terminal.not_started"))
-        };
-        if b.clicked() {
-            acts.push(BoardAction::OpenInstruct);
-        }
-    });
+    // **ヘッダは 1 行に固定する。**
+    //
+    // 折り返すと窓が縦に伸びる。極端に低い画面 (1200x300) では、札を
+    // 1 枚足しただけではみ出した。横スクロールなら**中身は全部届く**まま
+    // 高さが変わらない (CLAUDE.md「どの幅でも見切れない」)。
+    egui::ScrollArea::horizontal()
+        .id_salt("team-header")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(ellipsis(&s.goal.title, 44))
+                        .color(theme.text)
+                        .strong(),
+                )
+                .on_hover_text(&s.goal.title);
+                ui.label(
+                    RichText::new(format!("[{}]", goal_status_label(s.goal.status)))
+                        .color(goal_color(theme, s.goal.status)),
+                );
+                ui.label(RichText::new(phase_label(s.goal.phase)).color(theme.text_dim));
+                ui.separator();
+                let m = &s.metrics;
+                ui.label(trf(
+                    "team.metrics.progress",
+                    &[("pct", m.progress_pct.to_string())],
+                ));
+                ui.label(trf(
+                    "team.metrics.tasks",
+                    &[
+                        ("done", m.tasks_done.to_string()),
+                        ("total", m.tasks_total.to_string()),
+                    ],
+                ));
+                ui.label(trf(
+                    "team.metrics.agents",
+                    &[("n", m.agents_active.to_string())],
+                ));
+                // **自動検証が 1 本も無いことを、常に見えるところへ出す。**
+                // 通知は上書きで消えるが、これは状態から導くので消えない。
+                // 完了を決めるのがレビュー承認だけになる、という重い意味を持つ。
+                //
+                // **2 つ出るときも 1 枚にまとめる。** 札を 1 枚増やすと、狭い画面で
+                // ヘッダが 2 行になり、窓が縦にはみ出す (1200x300 で実際に落ちた)。
+                // 意味は 2 つとも要るので、文言を繋いで 1 行に収める。
+                // 札は 1 枚・記号も 1 つ。**語だけを繋ぐ** — 記号ごと繰り返すと
+                // 幅が伸びて、狭い画面でヘッダが 2 行になる。
+                let mut warn: Vec<&str> = Vec::new();
+                let mut why: Vec<String> = Vec::new();
+                if s.unvalidated {
+                    warn.push("validated");
+                    why.push(tr("team.chip.unvalidated_hint"));
+                }
+                if s.unmeasured {
+                    warn.push("measured");
+                    why.push(tr("team.chip.unmeasured_hint"));
+                }
+                if !warn.is_empty() {
+                    let label = match warn.as_slice() {
+                        ["validated"] => tr("team.chip.unvalidated"),
+                        ["measured"] => tr("team.chip.unmeasured"),
+                        _ => tr("team.chip.unchecked"),
+                    };
+                    ui.label(RichText::new(label).color(theme.warn).strong())
+                        .on_hover_text(why.join("\n"));
+                }
+                // **常に 0 のバッジを出さない** (CLAUDE.md: 減らせないかを先に考える)。
+                if m.blocked > 0 {
+                    ui.label(
+                        RichText::new(trf("team.metrics.blocked", &[("n", m.blocked.to_string())]))
+                            .color(theme.warn),
+                    );
+                }
+                if m.tests_passed > 0 {
+                    ui.label(
+                        RichText::new(trf(
+                            "team.metrics.tests",
+                            &[("n", m.tests_passed.to_string())],
+                        ))
+                        .color(theme.ok),
+                    );
+                }
+                if m.reviews_approved > 0 {
+                    ui.label(trf(
+                        "team.metrics.reviews",
+                        &[("n", m.reviews_approved.to_string())],
+                    ));
+                }
+                ui.separator();
+                if s.paused {
+                    if ui.button(tr("team.btn.resume")).clicked() {
+                        acts.push(BoardAction::Resume);
+                    }
+                } else if ui.button(tr("team.btn.pause")).clicked() {
+                    acts.push(BoardAction::Pause);
+                }
+                if ui
+                    .button(tr("team.btn.stop"))
+                    .on_hover_text(tr("team.btn.stop_hint"))
+                    .clicked()
+                {
+                    acts.push(BoardAction::Stop);
+                }
+                if s.goal.status == GoalStatus::Ready && ui.button(tr("team.btn.start")).clicked() {
+                    acts.push(BoardAction::Start);
+                }
+                // **途中で口を出す入口。** 相手は開いた先の一覧から選ぶので、
+                // 盤面のカードを探し当てる必要が無い。端末を持つ相手が 1 体も
+                // 居ないときは、押せるのに何も起きないボタンにしない。
+                let live = s.agents.iter().any(|a| a.can_open_terminal);
+                let b = ui.add_enabled(live, egui::Button::new(tr("team.btn.instruct")));
+                let b = if live {
+                    b.on_hover_text(tr("team.btn.instruct_hint"))
+                } else {
+                    b.on_disabled_hover_text(tr("team.terminal.not_started"))
+                };
+                if b.clicked() {
+                    acts.push(BoardAction::OpenInstruct);
+                }
+            });
+        });
 }
 
 fn goal_color(theme: &Theme, s: GoalStatus) -> egui::Color32 {
@@ -478,266 +550,240 @@ fn organization_tab(
     ui: &mut egui::Ui,
     theme: &Theme,
     s: &TeamSnapshot,
-    layout: &view_model::LaneLayout,
     selected: Option<&AgentId>,
     acts: &mut Vec<BoardAction>,
 ) {
-    // ── Team Lead (画面上部中央) ──
-    if let Some(lead) = s.agents.iter().find(|a| a.role == TeamRole::TeamLead) {
-        team_lead_card(ui, theme, s, lead, acts);
-        ui.add_space(4.0);
-    }
-
-    if s.teams.is_empty() {
+    if s.agents.is_empty() {
         centered_note(ui, theme, &tr("team.empty.no_lanes"));
         return;
     }
-
-    let scroll = egui::ScrollArea::horizontal()
-        // **タブごとに ID を分ける。** `ScrollArea` は `make_persistent_id`
-        // 系なので、別のタブと同じ ID を使うとスクロール位置を取り合う。
+    // 小さな窓で縮尺を下げ続けると、137 体の点が同じ 1px に潰れる。
+    // 読める最小寸法を保ち、狭いぶんだけスクロールへ逃がす。
+    let canvas = egui::vec2(
+        ui.available_width().max(ORGANIZATION_MAP_MIN_W),
+        ui.available_height().max(ORGANIZATION_MAP_MIN_H),
+    );
+    egui::ScrollArea::both()
         .id_salt(format!("team-scroll-{}", BoardTab::Organization.key()))
-        .auto_shrink([false, false]);
-    scroll.show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            for lane in &s.teams {
-                // 縦積みを明示する (`allocate_ui` は親の横並びを継承してしまう)。
-                ui.allocate_ui_with_layout(
-                    egui::vec2(layout.lane_w - 8.0, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        lane_ui(ui, theme, s, lane, selected, layout.compact, acts);
-                    },
-                );
-            }
-        });
-    });
-}
-
-fn team_lead_card(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    s: &TeamSnapshot,
-    lead: &TeamAgentView,
-    acts: &mut Vec<BoardAction>,
-) {
-    egui::Frame::none()
-        .fill(theme.panel_alt)
-        .stroke(egui::Stroke::new(1.0_f32, theme.border))
-        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-        .rounding(4.0)
+        .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                glyph_label(ui, theme, lead.state);
-                let label = ui.selectable_label(
-                    false,
-                    RichText::new(format!("{} — {}", lead.name, role_label(lead.role)))
-                        .color(theme.text)
-                        .strong(),
-                );
-                if label.clicked() {
-                    acts.push(BoardAction::Select(lead.id.clone()));
-                }
-                if !lead.provider.is_empty() {
-                    ui.label(RichText::new(&lead.provider).color(theme.text_dim));
-                }
-                ui.label(work_state_label(lead.state));
-                ui.label(trf("team.lead.teams", &[("n", s.teams.len().to_string())]));
-                if !s.pending_decisions.is_empty() {
-                    ui.label(
-                        RichText::new(trf(
-                            "team.lead.decisions",
-                            &[("n", s.pending_decisions.len().to_string())],
-                        ))
-                        .color(theme.warn),
-                    );
-                }
-                ui.label(
-                    RichText::new(view_model::elapsed_label(lead.idle_secs)).color(theme.text_dim),
-                );
-            });
-            let action = if lead.current_action.is_empty() {
-                phase_label(s.goal.phase)
-            } else {
-                plain(&lead.current_action)
-            };
-            ui.label(RichText::new(ellipsis(&action, 90)).color(theme.text_dim))
-                .on_hover_text(action);
+            let (area, _) = ui.allocate_exact_size(canvas, egui::Sense::hover());
+            let layout = view_model::organization_map_layout(s, area.width(), area.height());
+            draw_organization_map(ui, theme, s, &layout, area, selected, acts);
         });
 }
 
-fn lane_ui(
+fn draw_organization_map(
     ui: &mut egui::Ui,
     theme: &Theme,
     s: &TeamSnapshot,
-    lane: &view_model::TeamView,
+    layout: &view_model::OrganizationMapLayout,
+    area: egui::Rect,
     selected: Option<&AgentId>,
-    compact: bool,
     acts: &mut Vec<BoardAction>,
 ) {
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(ellipsis(&lane.name, 20))
-                    .color(theme.text)
-                    .strong(),
-            )
-            .on_hover_text(&lane.name);
-            // **常に 0 のバッジを出さない。**
-            if lane.total > 0 {
-                ui.label(
-                    RichText::new(format!("{}/{}", lane.done, lane.total)).color(theme.text_dim),
-                );
-            }
-        });
-        // **進み具合は数字より先に「形」で分かるようにする。**
-        // 仕事が 1 つも無い列にバーを出すと、無いものを「0%」と言うことに
-        // なるので出さない (区切り線で代える)。アニメーションはしない
-        // (設計原則 3: アイドルのコストはゼロ)。
-        if lane.total > 0 {
-            ui.add(
-                egui::ProgressBar::new(lane.done as f32 / lane.total as f32)
-                    .desired_height(3.0)
-                    .rounding(2.0)
-                    .fill(theme.accent),
-            );
-            ui.add_space(3.0);
-        } else {
-            ui.separator();
-        }
-        let parents: Vec<&TeamAgentView> = s
-            .agents
+    use view_model::OrganizationMapNodeKind as NK;
+
+    let painter = ui.painter().with_clip_rect(area);
+    let at = |p: view_model::OrganizationMapPoint| area.min + egui::vec2(p.x, p.y);
+    let positions: std::collections::HashMap<&str, egui::Pos2> = layout
+        .nodes
+        .iter()
+        .map(|n| (n.agent_id.as_str(), at(n.center)))
+        .collect();
+    let agents: std::collections::HashMap<&str, &TeamAgentView> =
+        s.agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let center = layout
+        .nodes
+        .iter()
+        .find(|n| n.kind == NK::TeamLead)
+        .map(|n| at(n.center))
+        .unwrap_or_else(|| area.center());
+
+    // この画面の署名: 中央の指揮役から実働まで、現在の通信・指揮経路を
+    // 1 枚の星図として見せる。常時アニメーションはせず、静止時は再描画ゼロ。
+    let orbit = area.width().min(area.height()) * 0.205;
+    painter.circle_stroke(
+        center,
+        orbit,
+        egui::Stroke::new(1.0_f32, theme.border.gamma_multiply(0.45)),
+    );
+    painter.circle_stroke(
+        center,
+        orbit * 1.62,
+        egui::Stroke::new(1.0_f32, theme.border.gamma_multiply(0.28)),
+    );
+
+    // 線を先に描く。ノードを後から重ねることで接続端の荒れを隠す。
+    for edge in &layout.edges {
+        let (Some(&from), Some(&to)) = (
+            positions.get(edge.from.as_str()),
+            positions.get(edge.to.as_str()),
+        ) else {
+            continue;
+        };
+        let color = agents
+            .get(edge.to.as_str())
+            .map(|a| state_color(theme, a.state))
+            .unwrap_or(theme.border)
+            .gamma_multiply(0.48);
+        painter.line_segment([from, to], egui::Stroke::new(1.25_f32, color));
+    }
+
+    // 参考図の部門名。配置順ではなく TeamSnapshot の安定順で出す。
+    for team in &s.teams {
+        let group: Vec<egui::Pos2> = layout
+            .nodes
             .iter()
-            .filter(|a| a.team_id == lane.id && a.kind == AgentKind::ManagedSession)
+            .filter(|n| n.team_id == team.id && n.kind != NK::TeamLead)
+            .map(|n| at(n.center))
             .collect();
-        if parents.is_empty() {
-            // **空のセクションで高さを稼がない。** 1 行だけ薄く出す。
-            ui.label(RichText::new(tr("team.lane.no_agent")).color(theme.text_dim));
-            return;
+        if group.is_empty() {
+            continue;
         }
-        egui::ScrollArea::vertical()
-            .id_salt(format!("team-lane-{}", lane.id))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for p in parents {
-                    parent_card(ui, theme, s, p, selected, compact, acts);
-                    ui.add_space(4.0);
-                }
-            });
-    });
-}
-
-fn parent_card(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    s: &TeamSnapshot,
-    a: &TeamAgentView,
-    selected: Option<&AgentId>,
-    compact: bool,
-    acts: &mut Vec<BoardAction>,
-) {
-    let is_sel = selected == Some(&a.id);
-    egui::Frame::none()
-        .fill(if is_sel { theme.panel_alt } else { theme.panel })
-        .stroke(egui::Stroke::new(
-            1.0_f32,
-            if is_sel { theme.accent } else { theme.border },
-        ))
-        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-        .rounding(4.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .selectable_label(
-                        is_sel,
-                        RichText::new(ellipsis(&a.name, 18)).color(theme.text).strong(),
-                    )
-                    .on_hover_text(tr("team.card.click_to_instruct"))
-                    .clicked()
-                {
-                    acts.push(BoardAction::Select(a.id.clone()));
-                }
-                state_chip(ui, theme, a.state);
-                if !compact {
-                    ui.label(RichText::new(role_label(a.role)).color(theme.text_dim));
-                }
-            });
-            if !compact && !a.provider.is_empty() {
-                ui.label(RichText::new(&a.provider).color(theme.text_dim));
-            }
-            let line = if a.current_task.is_some() {
-                format!(
-                    "#{} {}",
-                    a.current_task.unwrap_or(0),
-                    if a.current_action.is_empty() {
-                        a.current_task_title.clone()
-                    } else {
-                        plain(&a.current_action)
-                    }
-                )
-            } else {
-                String::new()
-            };
-            if !line.is_empty() {
-                ui.label(RichText::new(ellipsis(&line, 40)).color(theme.text_dim))
-                    .on_hover_text(line);
-            }
-            ui.horizontal_wrapped(|ui| {
-                if a.assigned > 0 {
-                    ui.label(
-                        RichText::new(format!("{}/{}", a.done, a.assigned)).color(theme.text_dim),
-                    );
-                }
-                ui.label(
-                    RichText::new(view_model::elapsed_label(a.idle_secs)).color(theme.text_dim),
-                );
-            });
-            for b in a.blockers.iter().take(2) {
-                ui.label(RichText::new(ellipsis(&plain(b), 40)).color(theme.warn))
-                    .on_hover_text(plain(b));
-            }
-            // ── 子エージェント行 ──
-            let children: Vec<&TeamAgentView> = s
-                .agents
-                .iter()
-                .filter(|c| c.parent_id.as_ref() == Some(&a.id))
-                .collect();
-            if children.is_empty() {
-                return;
-            }
-            ui.separator();
-            for c in children.iter().take(CHILD_ROWS_MAX) {
-                child_row(ui, theme, c, acts);
-            }
-            let more = children.len().saturating_sub(CHILD_ROWS_MAX);
-            if more > 0 {
-                ui.label(
-                    RichText::new(trf("team.child.more", &[("n", more.to_string())]))
-                        .color(theme.text_dim),
-                );
-            }
-        });
-}
-
-fn child_row(ui: &mut egui::Ui, theme: &Theme, c: &TeamAgentView, acts: &mut Vec<BoardAction>) {
-    ui.horizontal(|ui| {
-        glyph_label(ui, theme, c.state);
-        let name = ui.selectable_label(
-            false,
-            RichText::new(ellipsis(&c.name, 14)).color(theme.text),
+        let sum = group
+            .iter()
+            .fold(egui::Vec2::ZERO, |v, p| v + (*p - center));
+        let dir = if sum.length_sq() > 0.01 {
+            sum.normalized()
+        } else {
+            egui::vec2(0.0, -1.0)
+        };
+        let label_pos = center + dir * (area.width().min(area.height()) * 0.455);
+        let text = if team.total > 0 {
+            format!("{}  {}/{}", ellipsis(&team.name, 18), team.done, team.total)
+        } else {
+            ellipsis(&team.name, 18)
+        };
+        painter.text(
+            label_pos,
+            Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(11.0),
+            theme.text_dim,
         );
-        if name.clicked() {
-            acts.push(BoardAction::Select(c.id.clone()));
+    }
+
+    for node in &layout.nodes {
+        let Some(a) = agents.get(node.agent_id.as_str()).copied() else {
+            continue;
+        };
+        let pos = at(node.center);
+        let color = state_color(theme, a.state);
+        let is_selected = selected == Some(&a.id);
+        let fill = if node.kind == NK::ReportedSubAgent {
+            color.gamma_multiply(0.72)
+        } else {
+            theme.panel_alt
+        };
+        if node.kind == NK::TeamLead {
+            painter.circle_stroke(
+                pos,
+                node.radius + 6.0,
+                egui::Stroke::new(1.5_f32, theme.accent.gamma_multiply(0.55)),
+            );
         }
-        ui.label(RichText::new(work_state_label(c.state)).color(theme.text_dim));
-        let action = plain(&c.current_action);
-        if !action.is_empty() {
-            ui.label(RichText::new(ellipsis(&action, 24)).color(theme.text_dim))
-                .on_hover_text(action);
+        painter.circle_filled(pos, node.radius, fill);
+        painter.circle_stroke(
+            pos,
+            node.radius,
+            egui::Stroke::new(
+                if is_selected { 2.8_f32 } else { 1.5_f32 },
+                if is_selected { theme.accent } else { color },
+            ),
+        );
+        // 色だけに頼らない。小さな子ノードにも同じ状態記号を置く。
+        painter.text(
+            pos,
+            Align2::CENTER_CENTER,
+            a.state.glyph(),
+            egui::FontId::proportional((node.radius * 0.9).clamp(7.0, 14.0)),
+            if node.kind == NK::ReportedSubAgent {
+                theme.panel
+            } else {
+                color
+            },
+        );
+
+        // 親エージェントと指揮役は名前と現在作業まで盤面上で読める。
+        if node.kind != NK::ReportedSubAgent {
+            let right = pos.x >= center.x;
+            let (align, offset) = if node.kind == NK::TeamLead {
+                (Align2::CENTER_TOP, egui::vec2(0.0, node.radius + 7.0))
+            } else if right {
+                (Align2::LEFT_CENTER, egui::vec2(node.radius + 7.0, 0.0))
+            } else {
+                (Align2::RIGHT_CENTER, egui::vec2(-node.radius - 7.0, 0.0))
+            };
+            let name = if node.kind == NK::TeamLead {
+                format!("{} — {}", ellipsis(&a.name, 20), role_label(a.role))
+            } else {
+                ellipsis(&a.name, 18)
+            };
+            painter.text(
+                pos + offset,
+                align,
+                name,
+                egui::FontId::proportional(12.0),
+                theme.text,
+            );
+            if node.kind == NK::ManagedSession {
+                let action = if a.current_action.is_empty() {
+                    work_state_label(a.state)
+                } else {
+                    ellipsis(&plain(&a.current_action), 24)
+                };
+                let detail_offset = offset + egui::vec2(0.0, 13.0);
+                painter.text(
+                    pos + detail_offset,
+                    align,
+                    action,
+                    egui::FontId::proportional(10.0),
+                    theme.text_dim,
+                );
+            }
         }
-        ui.label(RichText::new(view_model::elapsed_label(c.idle_secs)).color(theme.text_dim));
-    });
+
+        let hit_side = (node.radius * 2.0 + 10.0).max(24.0);
+        let hit = egui::Rect::from_center_size(pos, egui::Vec2::splat(hit_side));
+        let mut tip = format!(
+            "{} — {}\n{} {}\n{}",
+            a.name,
+            role_label(a.role),
+            a.state.glyph(),
+            work_state_label(a.state),
+            view_model::elapsed_label(a.idle_secs)
+        );
+        if let Some(task) = a.current_task {
+            tip.push_str(&format!("\n#{task} {}", a.current_task_title));
+        }
+        if !a.current_action.is_empty() {
+            tip.push_str(&format!("\n{}", plain(&a.current_action)));
+        }
+        if let Some(parent) = &a.parent_id {
+            tip.push_str(&format!("\n↳ {parent}"));
+        }
+        if ui
+            .interact(
+                hit,
+                egui::Id::new(("team-map-node", a.id.as_str())),
+                egui::Sense::click(),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        {
+            acts.push(BoardAction::Select(a.id.clone()));
+        }
+    }
+
+    // Goal は中心の意味。カードや大きな数値を重ねず、短い見出しだけ置く。
+    painter.text(
+        center - egui::vec2(0.0, 30.0),
+        Align2::CENTER_BOTTOM,
+        ellipsis(&s.goal.title, 34),
+        egui::FontId::proportional(13.0),
+        theme.text,
+    );
 }
 
 // ── Tasks タブ ───────────────────────────────────────────────────────
@@ -878,14 +924,34 @@ fn task_card(
     ui.add_space(3.0);
 }
 
+/// 札の中に本物の端末を描くときの高さ。
+///
+/// **画面を占領しない大きさにする。** 高くすると他の担当が視界から
+/// 消えるので、「チームを見ながら 1 人を覗く」ができなくなる。
+const TERMINAL_CARD_H: f32 = 320.0;
+
 // ── Terminals タブ ───────────────────────────────────────────────────
 
-fn terminals_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<BoardAction>) {
-    let managed: Vec<&TeamAgentView> = s
-        .agents
-        .iter()
-        .filter(|a| a.kind == AgentKind::ManagedSession)
-        .collect();
+/// **端末タブ = デッキ。** 名前とボタンだけでは「何をしているか」が分からない。
+///
+/// 以前ここは一覧とボタンだけで、走っている最中に中身を見るには端末を開く
+/// しか無かった (開くと中央ビューが切り替わるので、「ちょっと様子を見たい」
+/// に対して代償が大きい)。デッキと同じように、**1 体 1 枚の札**に直近の
+/// 出力を出す。
+///
+/// 幅は `ui.available_width()` に必ず収める (どの幅でも見切れない)。
+fn terminals_tab(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    s: &TeamSnapshot,
+    expanded: Option<&AgentId>,
+    acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
+) {
+    // **サブエージェントも並べる。** 端末は持たないが、親が知らせてきた
+    // 「いま何をしているか」は出す — 出さないと、盤面には居るのに
+    // ここでは消えてしまい、「誰が動いているか」が 2 つの画面で食い違う。
+    let managed: Vec<&TeamAgentView> = s.agents.iter().collect();
     if managed.is_empty() {
         centered_note(ui, theme, &tr("team.empty.no_terminals"));
         return;
@@ -894,25 +960,155 @@ fn terminals_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
         .id_salt(format!("team-scroll-{}", BoardTab::Terminals.key()))
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            let w = ui.available_width();
             for a in managed {
-                ui.horizontal(|ui| {
-                    glyph_label(ui, theme, a.state);
-                    ui.label(RichText::new(ellipsis(&a.name, 20)).color(theme.text));
-                    ui.label(RichText::new(work_state_label(a.state)).color(theme.text_dim));
-                    match a.session_id {
-                        Some(sid) if a.can_open_terminal => {
-                            if ui.button(tr("team.btn.open_terminal")).clicked() {
-                                acts.push(BoardAction::OpenTerminal(sid));
-                            }
+                let open = expanded == Some(&a.id);
+                agent_deck_card(ui, theme, a, w, open, acts, term);
+                ui.add_space(6.0);
+            }
+        });
+}
+
+/// 端末タブの札 1 枚。
+fn agent_deck_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    a: &TeamAgentView,
+    width: f32,
+    open: bool,
+    acts: &mut Vec<BoardAction>,
+    term: &mut dyn FnMut(&mut egui::Ui, SessionId) -> bool,
+) {
+    egui::Frame::none()
+        .fill(theme.panel)
+        .stroke(egui::Stroke::new(1.0_f32, theme.border))
+        .inner_margin(egui::Margin::same(8.0))
+        .rounding(8.0)
+        .show(ui, |ui| {
+            ui.set_width((width - 16.0).max(120.0));
+            ui.horizontal(|ui| {
+                state_chip(ui, theme, a.state);
+                ui.label(RichText::new(ellipsis(&a.name, 24)).color(theme.text));
+                ui.label(RichText::new(role_label(a.role)).color(theme.text_dim));
+                // ボタンは右端へ寄せる (狭いときも本文を押し出さない)。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // **ボタンは 1 つだけ。**
+                    //
+                    // 以前は「端末を開く」も並べていたが、あれは中央ビューを
+                    // 入れ替える操作で、画面いっぱいの Team 窓の**裏側**で
+                    // 起きるので「押しても何も起きない」ように見えた
+                    // (実際にそう報告された)。同じ場所で中身が見えるなら、
+                    // 2 つ目の到達経路は要らない (CLAUDE.md「増やす前に減らす」)。
+                    if a.can_open_terminal {
+                        let label = if open {
+                            tr("team.btn.fold_output")
+                        } else {
+                            tr("team.btn.show_output")
+                        };
+                        if ui.button(label).clicked() {
+                            acts.push(BoardAction::ToggleAgentOutput(a.id.clone()));
                         }
-                        _ => {
-                            // **開けないボタンは無効にして理由を出す。**
-                            ui.add_enabled(false, egui::Button::new(tr("team.btn.open_terminal")))
-                                .on_disabled_hover_text(tr("team.terminal.not_started"));
-                        }
+                    } else {
+                        // **押せないボタンは無効にして理由を出す。**
+                        ui.add_enabled(false, egui::Button::new(tr("team.btn.show_output")))
+                            .on_disabled_hover_text(tr("team.terminal.not_started"));
                     }
                 });
+            });
+            // 親が居れば示す (サブエージェントは誰の下かが要る)。
+            if let Some(parent) = &a.parent_id {
+                ui.label(
+                    RichText::new(trf("team.child.of", &[("parent", parent.0.clone())]))
+                        .color(theme.text_dim)
+                        .size(11.0),
+                );
             }
+            // 端末を持たない相手は、親が知らせてきた行動を出す。
+            if !a.can_open_terminal && !a.current_action.is_empty() {
+                let act = plain(&a.current_action);
+                ui.label(RichText::new(ellipsis(&act, 90)).color(theme.text_dim))
+                    .on_hover_text(act);
+            }
+            // いま何のタスクを持っているか (無ければ行ごと出さない)。
+            if !a.current_task_title.is_empty() {
+                let t = plain(&a.current_task_title);
+                ui.label(RichText::new(ellipsis(&t, 90)).color(theme.text_dim))
+                    .on_hover_text(t);
+            }
+            // 直近の出力。**空なら枠ごと出さない** (空白を作らない)。
+            let body = plain(&a.preview);
+            if body.trim().is_empty() {
+                return;
+            }
+            ui.add_space(4.0);
+            // **開いたら本物の端末をここへ描く。**
+            //
+            // 画面を切り替えて裏で見るのではなく、チームの盤面の中で
+            // そのまま見えること — 「端末を開く」で中央ビューが入れ替わると、
+            // 「ちょっと様子を見たい」に対して代償が大きすぎる。
+            if open {
+                if let Some(sid) = a.session_id {
+                    // **大きさをここで確定させてから描く。**
+                    //
+                    // 外側は縦スクロール領域なので `available_size()` は
+                    // 画面より大きくなりうる。端末はそれを行数だと解釈して
+                    // 描くので、渡す領域を確定しないと**行が重なって崩れる**
+                    // (実際に「スクロールすると表示がバグる」として報告された)。
+                    let size = egui::vec2(ui.available_width(), TERMINAL_CARD_H);
+                    let mut drawn = false;
+                    ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_size(size);
+                            ui.set_max_size(size);
+                            drawn = term(ui, sid);
+                        },
+                    );
+                    if drawn {
+                        return;
+                    }
+                }
+            }
+            let all: Vec<&str> = body.lines().collect();
+            // 畳んでいるときは末尾だけ (札が縦に伸びて一覧にならなくなる)。
+            let from = if open {
+                0
+            } else {
+                all.len().saturating_sub(view_model::PREVIEW_LINES_FOLDED)
+            };
+            egui::Frame::none()
+                .fill(theme.bg)
+                .inner_margin(egui::Margin::same(6.0))
+                .rounding(6.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let draw = |ui: &mut egui::Ui| {
+                        for line in &all[from..] {
+                            ui.label(
+                                RichText::new(ellipsis(line, 160))
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(theme.text_dim),
+                            );
+                        }
+                    };
+                    if open {
+                        // **開いても画面を占領しない。** 上限を超えたぶんは
+                        // この枠の中でスクロールする (他の担当が見えなくならない)。
+                        egui::ScrollArea::vertical()
+                            .id_salt(format!("team-out-{}", a.id.0))
+                            .max_height(360.0)
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw(ui);
+                            });
+                    } else {
+                        draw(ui);
+                    }
+                });
         });
 }
 
@@ -982,9 +1178,7 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
                     };
                     ui.label(name).on_hover_text(phase_status_label(*st));
                     if *st == PhaseStatus::Running {
-                        ui.label(
-                            RichText::new(phase_status_label(*st)).color(theme.text_dim),
-                        );
+                        ui.label(RichText::new(phase_status_label(*st)).color(theme.text_dim));
                     }
                 });
             }
@@ -1060,8 +1254,7 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(clock(e.at)).color(theme.text_dim));
                         ui.add(
-                            egui::Label::new(RichText::new(&text).color(theme.text_dim))
-                                .truncate(),
+                            egui::Label::new(RichText::new(&text).color(theme.text_dim)).truncate(),
                         )
                         .on_hover_text(&text);
                     });
@@ -1207,12 +1400,181 @@ fn restore_card(
     );
 }
 
+fn close_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    close: &ClosePrompt,
+    acts: &mut Vec<BoardAction>,
+) {
+    let avail = ui.available_size();
+    ui.allocate_ui_with_layout(
+        avail,
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+        |ui| {
+            ui.vertical_centered(|ui| match close {
+                ClosePrompt::Confirm {
+                    run_id,
+                    artifact_path,
+                } => {
+                    ui.label(
+                        RichText::new(trf(
+                            "team.close.confirm_dirty",
+                            &[("run", run_id.clone())],
+                        ))
+                        .color(theme.err)
+                        .strong(),
+                    );
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button(tr("team.close.keep")).clicked() {
+                            acts.push(BoardAction::CloseRunKeep);
+                        }
+                        if ui.button(tr("team.close.discard")).clicked() {
+                            acts.push(BoardAction::CloseRunDiscard);
+                        }
+                        if ui.button(tr("team.close.cancel")).clicked() {
+                            acts.push(BoardAction::CloseRunCancel);
+                        }
+                    });
+                }
+                ClosePrompt::Stopping {
+                    run_id,
+                    artifact_path,
+                } => {
+                    ui.spinner();
+                    ui.label(trf(
+                        "team.close.stopping",
+                        &[("run", run_id.clone())],
+                    ));
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                }
+                ClosePrompt::Failed {
+                    artifact_path, why, ..
+                } => {
+                    ui.label(RichText::new(tr("team.close.failed")).color(theme.err).strong());
+                    ui.label(plain(why));
+                    ui.label(trf(
+                        "team.close.artifact_path",
+                        &[("path", artifact_path.clone())],
+                    ));
+                    if ui.button(tr("team.close.retry")).clicked() {
+                        acts.push(BoardAction::RetryCloseRun);
+                    }
+                }
+                ClosePrompt::None => {}
+            });
+        },
+    );
+}
+
+/// **計画ができたら、始め方をその場で言う。**
+///
+/// 開始のボタンはヘッダの奥 (一時停止・停止の隣) にあるので、初めての人は
+/// 「計画は出たが、次に何を押せばいいのか分からない」で止まる (実際にそう
+/// 報告された)。**押す場所を、計画のすぐ上に出す。**
+///
+/// 勝手には始めない。始めた瞬間にエージェントが動いて費用が発生するので、
+/// **1 回の明示的な操作**は残す (CLAUDE.md「画面が突然変わらない」)。
+fn ready_to_start_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    snap: Option<&TeamSnapshot>,
+    acts: &mut Vec<BoardAction>,
+) {
+    let Some(s) = snap else { return };
+    if s.goal.status != GoalStatus::Ready {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button(
+                RichText::new(tr("team.btn.start"))
+                    .color(theme.accent)
+                    .strong(),
+            )
+            .clicked()
+        {
+            acts.push(BoardAction::Start);
+        }
+        ui.label(RichText::new(tr("team.hint.start")).color(theme.text_dim));
+    });
+    ui.separator();
+}
+
+/// **Git が無いと 1 件も完了できないことを、走らせる前に出す。**
+///
+/// 実測 (`changeset`) は git が出す差分を使うので、Git 管理下でない
+/// フォルダでは**どの完了報告も却下される**。実機では 7 体が並列で
+/// 働いているのに 1 件も終わらなかった — 画面に何も出ていなければ、
+/// 利用者は「動いているのに進まない」としか分からない。
+fn git_needed_row(ui: &mut egui::Ui, theme: &Theme, needs_git: bool, acts: &mut Vec<BoardAction>) {
+    if !needs_git {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(tr("team.git.needed")).color(theme.warn));
+        if ui
+            .button(tr("team.git.init"))
+            .on_hover_text(tr("team.git.init_hint"))
+            .clicked()
+        {
+            acts.push(BoardAction::InitGit);
+        }
+    });
+    ui.separator();
+}
+
+/// Run の切り替えと終了。1 本でも終了ボタンは必要なので行を出す。
+fn run_tabs_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    runs: &[(String, bool)],
+    active: usize,
+    acts: &mut Vec<BoardAction>,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        for (i, (title, running)) in runs.iter().enumerate() {
+            // 進行中かどうかは記号で示す (色は補助)。
+            let mark = if *running { "▶" } else { "✓" };
+            let label = format!("{mark} {}", ellipsis(title, 20));
+            let r = ui.selectable_label(
+                runs.len() > 1 && i == active,
+                RichText::new(label).color(theme.text),
+            );
+            if runs.len() > 1 && r.clicked() {
+                acts.push(BoardAction::SelectRun(i));
+            }
+            // 閉じるのは**いま出している 1 本だけ**に出す。全部に出すと
+            // 押し間違いで別のチームを止めてしまう。
+            if i == active
+                && ui
+                    .small_button("✕")
+                    .on_hover_text(tr("team.btn.close_run"))
+                    .clicked()
+            {
+                acts.push(BoardAction::CloseRun(i));
+            }
+        }
+    });
+    ui.separator();
+}
+
 // ── New Team Run フォーム ────────────────────────────────────────────
 
 fn new_run_form(
     ui: &mut egui::Ui,
     theme: &Theme,
     form: &mut NewRunForm,
+    agents: &[String],
     acts: &mut Vec<BoardAction>,
 ) {
     ui.label(
@@ -1261,7 +1623,17 @@ fn new_run_form(
             }
 
             ui.label(tr("team.form.agents"));
-            ui.add(egui::Slider::new(&mut form.agents, 1..=16));
+            // **手で動かしたら、おすすめはもう当てない。** 人の判断を
+            // 計画のたびに上書きすると、動かした意味が無くなる。
+            if ui
+                .add(egui::Slider::new(
+                    &mut form.agents,
+                    1..=super::panel::FORM_MAX_AGENTS,
+                ))
+                .changed()
+            {
+                form.composition_touched = true;
+            }
             ui.end_row();
 
             ui.label(tr("team.form.max_attempts"));
@@ -1290,7 +1662,36 @@ fn new_run_form(
             ui.end_row();
 
             ui.label(tr("team.form.review_required"));
-            ui.checkbox(&mut form.review_required, tr("team.form.review_hint"));
+            if ui
+                .checkbox(&mut form.review_required, tr("team.form.review_hint"))
+                .changed()
+            {
+                form.composition_touched = true;
+            }
+            ui.end_row();
+
+            ui.label(tr("team.form.agent"));
+            ui.horizontal_wrapped(|ui| {
+                // **おまかせが既定。** 役割ごとに、入っている CLI を配る。
+                if ui
+                    .selectable_label(form.agent_presets.is_empty(), tr("team.form.agent_auto"))
+                    .on_hover_text(tr("team.form.agent_auto_hint"))
+                    .clicked()
+                {
+                    form.agent_presets.clear();
+                }
+                // **何個でも選べる。** 1 つなら全員それ、複数ならその中で配る。
+                for name in agents {
+                    let on = form.agent_presets.iter().any(|n| n == name);
+                    if ui.selectable_label(on, ellipsis(name, 18)).clicked() {
+                        if on {
+                            form.agent_presets.retain(|n| n != name);
+                        } else {
+                            form.agent_presets.push(name.clone());
+                        }
+                    }
+                }
+            });
             ui.end_row();
 
             ui.label(tr("team.form.roles"));
@@ -1303,6 +1704,7 @@ fn new_run_form(
                     }
                     let on = form.roles.contains(&r);
                     if ui.selectable_label(on, role_label(r)).clicked() {
+                        form.composition_touched = true;
                         if on {
                             form.roles.retain(|x| *x != r);
                         } else {
@@ -1317,11 +1719,22 @@ fn new_run_form(
             ui.add(egui::DragValue::new(&mut form.cost_limit).range(0.0..=1000.0));
             ui.end_row();
         });
+    recommendation_section(ui, theme, form);
     if !form.error.is_empty() {
         ui.colored_label(theme.err, plain(&form.error));
     }
+    spec_draft_section(ui, theme, form, acts);
     ui.separator();
     ui.horizontal(|ui| {
+        // 書き換え中・確認中・失敗案内中は、計画のボタンを出さない。
+        // **同じ瞬間に 2 つの進み方を見せない**。ここから通常計画へ
+        // 抜けられると、短い指示を並列化する関門を迂回できてしまう。
+        if !matches!(form.draft, DraftState::Idle) {
+            if ui.button(tr("team.form.cancel")).clicked() {
+                form.open = false;
+            }
+            return;
+        }
         if ui.button(tr("team.form.plan_preview")).clicked() {
             acts.push(BoardAction::PlanFromForm);
         }
@@ -1331,9 +1744,257 @@ fn new_run_form(
     });
 }
 
+/// **おすすめの編成** — 依頼の形から「何体・どの役割」を出す。
+///
+/// 6 役割・4 体の既定を何にでも当てると、1 枚の HP に 14 本の計画が立って
+/// 25 分で完了 0 件になる (実測)。ここは [`composition::recommend`] の判断を
+/// **理由つきで**見せる。人が手で変えていなければ、計画・書き換えの
+/// たびに同じ判断が自動で当たる (`app::team_glue`)。判断そのものは
+/// ここに書かない — 画面と実際に使う編成が食い違わないように、
+/// 表は `composition` 1 か所に置く。
+fn recommendation_section(ui: &mut egui::Ui, theme: &Theme, form: &mut NewRunForm) {
+    // ファイル指定のときは中身を読まないと形が分からない (読み込みは
+    // 押されてから)。Goal 名だけでも「HP」「移行」のような形は読める。
+    let brief = if form.from_file {
+        form.goal_name.clone()
+    } else {
+        format!("{}\n{}", form.goal_name, form.spec_text)
+    };
+    if brief.trim().is_empty() {
+        return;
+    }
+    let rec = composition::recommend(&brief, &form.probe, super::panel::FORM_MAX_AGENTS);
+    let same = form.agents == rec.agents
+        && form.roles == rec.roles
+        && form.review_required == rec.review_required;
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(tr("team.recommend.title"))
+                .color(theme.text)
+                .strong(),
+        );
+        ui.label(RichText::new(shape_label(rec.shape)).color(theme.accent));
+    });
+    let roles: Vec<String> = rec.roles.iter().map(|r| role_label(*r)).collect();
+    ui.label(
+        RichText::new(trf(
+            "team.recommend.summary",
+            &[
+                ("agents", rec.agents.to_string()),
+                ("roles", roles.join(" / ")),
+            ],
+        ))
+        .color(theme.text),
+    );
+    for why in &rec.reasons {
+        ui.label(
+            RichText::new(format!("• {}", reason_label(*why, rec.units)))
+                .size(11.0)
+                .color(theme.text_dim),
+        );
+    }
+    // 時間の予算と「レビュー専任を立てない」も編成の一部なので、ここに出す
+    // (出さないと、チェックが勝手に外れたように見える)。
+    if let Some(min) = rec.time_budget_min {
+        ui.label(
+            RichText::new(trf(
+                "team.recommend.time_budget",
+                &[("minutes", min.to_string())],
+            ))
+            .size(11.0)
+            .color(theme.text_dim),
+        );
+    }
+    if !rec.review_required {
+        ui.label(
+            RichText::new(tr("team.recommend.review_off"))
+                .size(11.0)
+                .color(theme.text_dim),
+        );
+    }
+    ui.horizontal_wrapped(|ui| {
+        if same {
+            ui.label(RichText::new(tr("team.recommend.in_use")).color(theme.ok));
+        } else {
+            if ui.button(tr("team.recommend.apply")).clicked() {
+                form.agents = rec.agents;
+                form.roles = rec.roles.clone();
+                form.review_required = rec.review_required;
+                form.composition_touched = false;
+            }
+            if form.composition_touched {
+                ui.label(RichText::new(tr("team.recommend.manual")).color(theme.text_dim));
+            }
+        }
+    });
+}
+
+fn shape_label(s: composition::WorkShape) -> String {
+    use composition::WorkShape as S;
+    // **`tr` には素の文字列リテラルを渡す** (`zai i18n missing` の走査に
+    // 現れるように)。
+    match s {
+        S::SingleArtifact => tr("team.recommend.shape.single_artifact"),
+        S::WideIndependent => tr("team.recommend.shape.wide_independent"),
+        S::FeatureInRepo => tr("team.recommend.shape.feature_in_repo"),
+        S::Research => tr("team.recommend.shape.research"),
+    }
+}
+
+fn reason_label(r: composition::Reason, units: usize) -> String {
+    use composition::Reason as R;
+    match r {
+        R::SingleArtifact => tr("team.recommend.why.single_artifact"),
+        R::WideUnits => trf("team.recommend.why.wide_units", &[("units", units.to_string())]),
+        R::ExistingRepo => tr("team.recommend.why.existing_repo"),
+        R::EmptyWorkspace => tr("team.recommend.why.empty_workspace"),
+        R::Research => tr("team.recommend.why.research"),
+        R::TokenCost => tr("team.recommend.why.token_cost"),
+    }
+}
+
+/// **短い指示を仕様書へ書き換える段。**
+///
+/// 出るのは「このままでは実装タスクが 1 件にしかならない」ときだけ
+/// ([`planner::needs_spec_rewrite`])。分かれる SPEC を書いた人に
+/// 余計な段を見せない。
+fn spec_draft_section(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    form: &NewRunForm,
+    acts: &mut Vec<BoardAction>,
+) {
+    match &form.draft {
+        DraftState::Idle => {
+            // ファイル指定のときは中身を読まないと判定できないので、
+            // 直接入力の本文だけを見る (読み込みは押されてから)。
+            let short = form.from_file || planner::needs_spec_rewrite(&form.spec_text);
+            if !short {
+                return;
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.button")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                ui.label(RichText::new(tr("team.draft.hint")).color(theme.text_dim));
+            });
+        }
+        DraftState::Running { agent } => {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new(trf("team.draft.running", &[("agent", agent.clone())]))
+                        .color(theme.text_dim),
+                );
+            });
+        }
+        DraftState::Ready { agent, text } => {
+            ui.separator();
+            ui.label(
+                RichText::new(trf("team.draft.question", &[("agent", agent.clone())]))
+                    .color(theme.text)
+                    .strong(),
+            );
+            // **中身を全部見せてから決めてもらう。** 折り畳んだまま
+            // 「はい」を押させると、確認したことにならない。
+            egui::ScrollArea::vertical()
+                .id_salt("team-draft-preview")
+                .max_height(260.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    for line in text.lines() {
+                        ui.label(RichText::new(line).monospace().size(11.0).color(theme.text));
+                    }
+                });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.accept")).clicked() {
+                    acts.push(BoardAction::AcceptDraft);
+                }
+                if ui.button(tr("team.draft.retry")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                if ui.button(tr("team.draft.keep")).clicked() {
+                    acts.push(BoardAction::DiscardDraft);
+                }
+            });
+        }
+        DraftState::Failed { why } => {
+            ui.separator();
+            ui.colored_label(theme.warn, plain(why));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button(tr("team.draft.retry")).clicked() {
+                    acts.push(BoardAction::DraftSpec);
+                }
+                if ui.button(tr("team.draft.keep")).clicked() {
+                    acts.push(BoardAction::DiscardDraft);
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **端末タブはサブエージェントも並べる。**
+    ///
+    /// 端末は持たないが、親が知らせてきた「いま何をしているか」は出す。
+    /// 出さないと、組織タブには居るのに端末タブでは消えてしまい、
+    /// 「誰が動いているか」が 2 つの画面で食い違う。
+    #[test]
+    fn 端末タブはサブエージェントも並べる() {
+        let src = include_str!("organization_board.rs").replace("\r\n", "\n");
+        let body = src
+            .split("fn terminals_tab(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("端末タブの関数がある");
+        assert!(
+            !body.contains("kind == AgentKind::ManagedSession"),
+            "端末を持つ相手だけに絞っている (サブエージェントが消える):\n{body}"
+        );
+        // 札のほうは、親と行動を出していること。
+        let card = src
+            .split("fn agent_deck_card(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("札の関数がある");
+        assert!(card.contains("a.parent_id"), "誰の下かを出していない");
+        assert!(
+            card.contains("a.current_action"),
+            "何をしているかを出していない"
+        );
+    }
+
+    /// **表から引く ID も、辞書に必ずある。**
+    ///
+    /// `tr()` に**変数**を渡す経路 (`tr(col.0)`) は `zai i18n missing` の
+    /// 走査に現れない。だから辞書から漏れても誰も言わないまま、画面に
+    /// `team.col.waiting` という **ID がそのまま出る** — 実機でそうなった
+    /// (CLAUDE.md「走査に現れない文字列は永久に日本語 (ここでは ID) で出る」)。
+    ///
+    /// 表で持つ ID は、ここで**表ごと**辞書と突き合わせる。
+    #[test]
+    fn 列の見出しはすべて辞書から引ける() {
+        // **同梱辞書を直に見る。** `tr()` は言語パックが載っていないと
+        // ID をそのまま返すので、テストからは判定に使えない。
+        for (lang, _, raw) in crate::locale::BUILTIN {
+            let map: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(raw).expect("同梱辞書は読める");
+            for (id, _) in TASK_COLUMNS {
+                let got = map.get(*id);
+                assert!(
+                    got.is_some_and(|v| !v.trim().is_empty()),
+                    "{lang}: {id} が辞書に無い (画面に ID がそのまま出る)"
+                );
+            }
+        }
+    }
 
     /// **どの画面幅でも、Team 画面が画面の外へはみ出さない。**
     ///
@@ -1374,8 +2035,17 @@ mod tests {
                         BoardTab::Organization,
                         &mut form,
                         RestorePrompt::None,
+                        &ClosePrompt::None,
                         None,
+                        None,
+                        &[],
+                        0,
+                        false,
+                        &[],
                         "",
+                        // 端末は描かない (ヘッドレスにセッションは無い)。
+                        // **描けなかったときの経路**もここで踏まれる。
+                        &mut |_ui, _sid| false,
                     );
                 });
                 used = ctx.used_rect();
@@ -1506,9 +2176,30 @@ mod tests {
     }
 
     #[test]
-    fn 子エージェント行の上限がある() {
-        // 64 体でも縦に伸び続けないための線。
-        assert!(CHILD_ROWS_MAX <= 10);
+    fn 組織図は子エージェントもクリックできる一枚の地図() {
+        let src = include_str!("organization_board.rs").replace("\r\n", "\n");
+        let tab = src
+            .split("fn organization_tab(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn draw_organization_map").next())
+            .expect("Organization タブがある");
+        assert!(
+            tab.contains("organization_map_layout"),
+            "カード列へ戻っている:\n{tab}"
+        );
+        let map = src
+            .split("fn draw_organization_map(")
+            .nth(1)
+            .and_then(|s| s.split("\n// ── Tasks").next())
+            .expect("組織図の描画がある");
+        assert!(map.contains("ReportedSubAgent"), "子ノードを描いていない");
+        assert!(map.contains(".interact("), "ノードにクリック領域が無い");
+        assert!(
+            map.contains("BoardAction::Select(a.id.clone())"),
+            "Inspector へ繋がっていない"
+        );
+        assert!(ORGANIZATION_MAP_MIN_W >= 640.0);
+        assert!(ORGANIZATION_MAP_MIN_H >= 480.0);
         assert!(FEED_ROWS <= 20);
     }
 }

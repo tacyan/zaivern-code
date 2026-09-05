@@ -59,6 +59,9 @@ impl ZaivernApp {
             cfg.hot_exit_max_kb.saturating_mul(1024),
         );
         let mut app = Self {
+            did_initial_maximize: false,
+            talk_seen: Default::default(),
+            talk_order: Default::default(),
             tree: FileTree::new(roots.clone(), cfg.show_hidden_files),
             gitinfo: git::GitSet::new(roots.clone()),
             blame: git::Blame::default(),

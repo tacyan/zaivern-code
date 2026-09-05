@@ -60,6 +60,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
             run_id: new_run_id(),
             spec_source: "SPEC.md".into(),
             agent_count: agents,
+            agent_presets: Vec::new(),
             max_attempts: 3,
             review_required,
             guardrails: Default::default(),
@@ -79,6 +80,7 @@ pub fn started_with(agents: usize, review_required: bool) -> TeamRuntime {
     // 計画 (`files` が空) で実際に起きる形。
     test_hooks::set_baseline(Some(super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     }));
     test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
@@ -562,7 +564,12 @@ fn 報告されたサブエージェントは端末を開けない() {
         open = rp::EVENT_OPEN,
         close = rp::EVENT_CLOSE
     );
+    let generation = rt.snapshot_generation();
     tick_text(&mut rt, 12, &sids, sids[0], &ev);
+    assert!(
+        rt.snapshot_generation() > generation,
+        "ReportedSubAgent の追加が snapshot 世代へ反映されない"
+    );
     let sub = rt
         .agent(&AgentId::new("backend-test-1"))
         .expect("サブエージェントが登録されるべき");
@@ -572,6 +579,15 @@ fn 報告されたサブエージェントは端末を開けない() {
         "開けない端末のボタンを出してしまう"
     );
     assert_eq!(sub.parent_id, Some(parent));
+
+    // 同じ画面と同じ構造化ブロックは再取り込みしない。
+    let generation = rt.snapshot_generation();
+    tick_text(&mut rt, 13, &sids, sids[0], &ev);
+    assert_eq!(
+        rt.snapshot_generation(),
+        generation,
+        "同じ ReportedSubAgent 報告で snapshot 世代が進んだ"
+    );
 }
 
 #[test]
@@ -777,6 +793,7 @@ fn specとエージェント数が計画に反映される() {
                 ws(),
                 RunOptions {
                     agent_count: agents,
+                    agent_presets: Vec::new(),
                     ..RunOptions::default()
                 },
             )
@@ -1415,6 +1432,7 @@ fn 保存して復元しても未実行のeffectだけを撃ち直す() {
     // 実測の差し替えは「復元後の Runtime」にも要る (別の Runtime なので)。
     let base = super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     };
 
@@ -1503,6 +1521,7 @@ fn 保存の途中で落ちても再開できる() {
     let mut back = TeamRuntime::restore(saved, PathBuf::from("/zaivern-team-test-workspace"));
     test_hooks::set_baseline(Some(super::changeset::FileBaseline {
         complete: true,
+        head_commit: "0".repeat(40),
         ..Default::default()
     }));
     test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
@@ -1578,6 +1597,7 @@ fn real_repo_runtime(name: &str) -> Option<(TeamRuntime, Vec<SessionId>, TaskId,
             run_id: new_run_id(),
             spec_source: "SPEC.md".into(),
             agent_count: 2,
+            agent_presets: Vec::new(),
             max_attempts: 3,
             review_required: false,
             guardrails: Default::default(),
@@ -1762,12 +1782,18 @@ fn 配り直しても最初の基準点を使う() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-
 // ── 所有の証明は Coordinator が持つ ──────────────────────────────────
 //
 // 「計画に載っている他タスクの `files`」を他人のものとして除くと、
 // **まだ 1 度も配られていないタスクの範囲へ書き込んだ違反が消える**。
-// 除いてよいのは、Coordinator が「いま押さえている」と言える範囲だけ。
+// 除いてよいのは、Coordinator が「配った」と言える範囲だけ
+// ([`coordinator::claimed`])。
+//
+// **「いま押さえている」(`occupies`) では狭すぎる。** 作業ツリーの変更は
+// タスクが終わっても消えないので、隣が書き終えた瞬間にその範囲を
+// 誰のものでもなくすと、隣より前に基準点を取っていた担当の実測に
+// そのファイルが現れて「担当外」で落ちる。実機の Run (6 体 / 同じ
+// ワークスペース) で 4 件出て、25 分走って完了 0 件だった。
 
 /// 隣のタスクへ**本当に**範囲を握らせる (Coordinator を通す)。
 fn grant_scope(rt: &mut TeamRuntime, task: TaskId, files: &[&str]) {
@@ -1872,10 +1898,20 @@ fn 本当に並列実行中の隣の変更は誤検知しない() {
 }
 
 #[test]
-fn 隣が手放した範囲への変更は担当外になる() {
-    // **Test 3.** 隣が完了して手を離した後は、そこを押さえている者は
-    // 居ない。誰の範囲でもない変更は「自分ではない」と言い切れないので、
-    // 担当外へ倒す (fail-closed)。
+fn 隣が書き終えた範囲の変更を自分の違反にしない() {
+    // **Test 3.** 隣が完了して手を離しても、隣が書いたファイルは作業ツリーに
+    // 残り続ける。こちらの基準点が隣より前なら、その変更は**必ず**こちらの
+    // 実測に現れる。ここを「誰も押さえていない = 自分ではないと言えない」と
+    // 倒すと、**後から報告した担当が全員落ちる**。
+    //
+    // 実機の Run (6 体・同じワークスペース) で、`#3` が `docs/plan.md` を
+    // 書き終えた直後に `#4` と `#7` が同じ理由で却下され、25 分走って完了は
+    // 0 件だった。誤検知は「人が見れば分かる」では済まず、Run そのものを
+    // 止める。
+    //
+    // **見逃しは増えていない。** 隣が押さえている間も Test 2 のとおり
+    // 遮蔽されているので、延びたのは遮蔽の期間だけ。一度も配られていない
+    // 範囲は Test 1 のとおり今までどおり担当外へ倒れる。
     let (mut rt, sids, tid, dir) = need_git_rt!("released-neighbour");
     let other = rt
         .tasks()
@@ -1893,10 +1929,16 @@ fn 隣が手放した範囲への変更は担当外になる() {
     std::fs::write(dir.join("secret.rs"), "fn secret() { later(); }\n").unwrap();
     report_complete(&mut rt, &sids, tid, &["src/auth/login.rs"], 13);
 
-    assert_ne!(
-        rt.task(tid).unwrap().state,
+    let t = rt.task(tid).unwrap();
+    assert_eq!(
+        t.state,
         TeamTaskState::Validating,
-        "誰も押さえていない範囲への変更が見逃された"
+        "隣が書き終えた範囲の変更を自分の違反として咎めた"
+    );
+    assert!(
+        !t.changed_files.iter().any(|f| f.contains("secret.rs")),
+        "隣の変更を自分の成果として数えた: {:?}",
+        t.changed_files
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -3577,3 +3619,478 @@ fn human_instructions(rt: &TeamRuntime) -> Vec<String> {
         .collect()
 }
 
+// ── 編成 (誰が何の担当か) ─────────────────────────────────────────────
+
+/// **役割がそのまま担当と名前になる。**
+///
+/// 以前はリーダー以外が全員 `Implementer` の「Agent 1, 2, …」だったので、
+/// 設計担当やテスト担当を選んでも画面には実装担当しか並ばず、
+/// 「誰が何をする担当なのか」がどこにも出なかった。
+#[test]
+fn 編成は計画の役割から決まる() {
+    use super::model::TeamRole as R;
+    let t = |id: u64, role: R| {
+        let mut x = super::testkit::task(id, "k", &[]);
+        x.role = role;
+        x
+    };
+    let tasks = vec![
+        t(1, R::Architect),
+        t(2, R::Implementer),
+        t(3, R::Tester),
+        t(4, R::Integrator),
+    ];
+    // 枠が足りていれば、計画にある役割が 1 体ずつ並ぶ。
+    assert_eq!(
+        roster_roles(&tasks, &[], 4),
+        vec![R::Architect, R::Implementer, R::Tester, R::Integrator]
+    );
+    // 余った枠は実装へ寄せる (並列で効くのは実装なので)。
+    assert_eq!(
+        roster_roles(&tasks, &[], 6),
+        vec![
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Integrator,
+            R::Implementer,
+            R::Implementer
+        ]
+    );
+    // 枠が足りなければ依存順に前から (設計が無いと実装が始まらない)。
+    assert_eq!(roster_roles(&tasks, &[], 2), vec![R::Architect, R::Implementer]);
+    assert!(roster_roles(&tasks, &[], 0).is_empty());
+    // 役割の分からない計画でも、担当が 0 体にはならない。
+    assert_eq!(roster_roles(&[], &[], 2), vec![R::Implementer, R::Implementer]);
+}
+
+/// **1 体しか居ない役割に番号を付けない** (存在しない 2 体目を探させる)。
+#[test]
+fn 担当の名前は役割から作る() {
+    use super::model::TeamRole as R;
+    assert_eq!(agent_name(R::Architect, 1), "Architect");
+    assert_eq!(agent_name(R::Implementer, 2), "Implementer 2");
+    assert_eq!(agent_name(R::TeamLead, 1), "Team Lead");
+    // 役割は 7 つとも名前を持つ (増えたときに空欄が出ない)。
+    for r in R::ALL {
+        assert!(!agent_name(r, 1).is_empty(), "{r:?} に名前が無い");
+    }
+}
+
+/// **段を挟んでも、チームは必要な人数ぶん最初から立つ。**
+///
+/// 実測 (0.23.0): 既定の役割を 6 つにしたら計画が
+/// 「計画 → 設計 → 実装 8 件 → テスト → 統合」の段になり、
+/// `desired_sessions` が「依存が空のタスク数」で数えていたせいで
+/// **最後まで 2 体しか立たなかった** (盤面の「稼働 2」)。
+/// `dependencies` は静的な項目なので、依存が済んでも空にはならない。
+#[test]
+fn 段のある計画でも並列ぶんの担当が立つ() {
+    use super::graph::max_parallel_width;
+    use super::model::TeamRole as R;
+    let mut tasks = Vec::new();
+    // 計画 (1) → 設計 (2) → 実装 8 件 → テスト → 統合
+    let mut plan = super::testkit::task(1, "plan", &[]);
+    plan.role = R::Planner;
+    tasks.push(plan);
+    let mut design = super::testkit::task(2, "design", &[1]);
+    design.role = R::Architect;
+    tasks.push(design);
+    for i in 0..8u64 {
+        let mut t = super::testkit::task(10 + i, "impl", &[2]);
+        t.role = R::Implementer;
+        tasks.push(t);
+    }
+    let impls: Vec<u64> = (0..8u64).map(|i| 10 + i).collect();
+    let mut test = super::testkit::task(30, "test", &impls);
+    test.role = R::Tester;
+    tasks.push(test);
+    let mut integ = super::testkit::task(31, "integrate", &[30]);
+    integ.role = R::Integrator;
+    tasks.push(integ);
+
+    // いちばん広い段は実装の 8 件。
+    assert_eq!(max_parallel_width(&tasks), 8, "段の幅を取り違えている");
+    // 上限 4 なら 4 体 (上限 12 なら レビュー用の 1 体を足して 9 体)。
+    assert_eq!(super::scheduler::desired_sessions(&tasks, 4), 4);
+    assert_eq!(super::scheduler::desired_sessions(&tasks, 12), 9);
+    // **直った証拠**: 旧い数え方 (依存が空) だと 1 件しかない。
+    let old_way = tasks
+        .iter()
+        .filter(|t| t.dependencies.is_empty() && !t.state.is_terminal())
+        .count();
+    assert_eq!(old_way, 1, "旧い数え方では 1 = 2 体しか立たなかった");
+
+    // 終わった段は数に入れない (済んだぶん余分に立ち続けない)。
+    for t in tasks.iter_mut().filter(|t| t.role == R::Implementer) {
+        t.state = TeamTaskState::Completed;
+    }
+    assert_eq!(max_parallel_width(&tasks), 1, "残っているのは 1 段 1 件");
+}
+
+// ── エージェント同士のやり取り ───────────────────────────────────────
+
+/// **伝言は「言った」だけで終わらせない。相手の端末へ実際に届く。**
+///
+/// 端末の中だけで完結すると盤面に何も残らず、受け手も気付かない。
+/// `tick` を通して、(1) 出来事として残り (2) 配達の Effect が出ることを見る。
+#[test]
+fn エージェントの伝言は相手の端末へ届く() {
+    let mut rt = started(4);
+    // 端末が結び付いていないと伝言は配れない (偽の起動で結び付ける)。
+    let mut next: SessionId = 1;
+    let boot = rt.tick(&obs_for_test(1, &[]));
+    let bound = bind_all(&mut rt, &boot, &mut next);
+    let ids: Vec<AgentId> = rt
+        .agents()
+        .iter()
+        .filter(|a| a.kind == AgentKind::ManagedSession)
+        .map(|a| a.id.clone())
+        .collect();
+    assert!(ids.len() >= 2, "2 体以上居ないと伝言の相手が居ない");
+    let (from, to) = (ids[0].clone(), ids[1].clone());
+    let from_sid = rt.agent(&from).and_then(|a| a.session_id).expect("端末");
+    let to_sid = rt.agent(&to).and_then(|a| a.session_id).expect("端末");
+
+    let screen = format!(
+        "{}\n{{\"to\": \"{}\", \"text\": \"設計が終わった。次は実装に入って\"}}\n{}",
+        rp::MSG_OPEN, to.0, rp::MSG_CLOSE
+    );
+    // **全セッションを載せる。** 載せないと、載せなかったぶんは
+    // 「消えた」と解釈されて端末が外れる (受け手が居なくなる)。
+    let mut obs = obs_for_test(100, &bound);
+    for s in &mut obs.sessions {
+        if s.id == from_sid {
+            s.text = screen.clone();
+        }
+    }
+    let effects = rt.tick(&obs);
+    // (1) 出来事として残る (あとから誰が誰に何を言ったか追える)。
+    let logged = rt
+        .events()
+        .find(|e| e.kind == TeamEventKind::AgentMessage)
+        .expect("伝言が出来事に残っていない");
+    assert_eq!(logged.actor.as_ref(), Some(&from));
+    assert_eq!(logged.target.as_ref(), Some(&to));
+    assert!(logged.summary.contains("次は実装に入って"), "{}", logged.summary);
+
+    // (2) 相手の端末へ配る Effect が出る。
+    let sent = effects
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendManualInstruction {
+                agent,
+                session,
+                text,
+                ..
+            } if agent == &to => Some((*session, text.clone())),
+            _ => None,
+        })
+        .expect("配達の Effect が出ていない");
+    assert_eq!(sent.0, to_sid, "別の端末へ配ろうとしている");
+    assert!(sent.1.contains("次は実装に入って"), "{}", sent.1);
+    assert!(sent.1.contains("からの伝言"), "差出人が本文に無い: {}", sent.1);
+}
+
+/// **居ない相手への伝言は断る。** 通すと盤面には「伝えた」と出るのに
+/// 誰も受け取っていない、という嘘になる。
+#[test]
+fn 居ない相手への伝言は断る() {
+    let mut rt = started(4);
+    let mut next: SessionId = 1;
+    let boot = rt.tick(&obs_for_test(1, &[]));
+    let bound = bind_all(&mut rt, &boot, &mut next);
+    let from = rt
+        .agents()
+        .iter()
+        .find(|a| a.kind == AgentKind::ManagedSession)
+        .map(|a| a.id.clone())
+        .expect("担当");
+    let sid = rt.agent(&from).and_then(|a| a.session_id).expect("端末");
+    let screen = format!(
+        "{}\n{{\"to\": \"だれか\", \"text\": \"やあ\"}}\n{}",
+        rp::MSG_OPEN, rp::MSG_CLOSE
+    );
+    let mut obs = obs_for_test(100, &bound);
+    for s in &mut obs.sessions {
+        if s.id == sid {
+            s.text = screen.clone();
+        }
+    }
+    let effects = rt.tick(&obs);
+    assert!(
+        !effects
+            .iter()
+            .any(|e| matches!(e, TeamEffect::SendManualInstruction { .. })),
+        "居ない相手へ配ろうとしている"
+    );
+    assert!(
+        rt.events()
+            .any(|e| e.kind == TeamEventKind::Rejected && e.summary.contains("居ません")),
+        "断った理由が残っていない"
+    );
+}
+
+/// **自分宛ては配らない。** 自分の端末へ自分の言葉を流しても何も起きない。
+#[test]
+fn allは自分を含めない() {
+    let known: Vec<(AgentId, String)> = vec![
+        (AgentId::new("a"), "implementer".into()),
+        (AgentId::new("b"), "reviewer".into()),
+    ];
+    let body = "{\"to\": \"all\", \"text\": \"できた\"}";
+    let (targets, _) = rp::check_message(body, &known, &AgentId::new("a")).unwrap();
+    assert_eq!(targets, vec![AgentId::new("b")]);
+    // 役割でも宛てられる。
+    let body = "{\"to\": \"reviewer\", \"text\": \"見て\"}";
+    let (targets, _) = rp::check_message(body, &known, &AgentId::new("a")).unwrap();
+    assert_eq!(targets, vec![AgentId::new("b")]);
+}
+
+/// **混んでいるだけのレビューを人の判断待ちにしない。**
+///
+/// 実機で「実装した本人しかレビュー候補がいません」が 5 件積み上がり、
+/// 再試行を押しても消えなかった。原因は 2 つ:
+/// 1. **空集合へ `all` を撃っていた** — 誰も空いていないときも真になるので、
+///    ただ混んでいるだけのレビューが「本人しか居ない」に化けていた
+/// 2. 化けた札は `Ready` のまま積まれるので、`retry` が状態を動かさず
+///    掃除もされない (= 押しても消えない)
+#[test]
+fn 混んでいるだけのレビューは人へ上げない() {
+    // 2 体で回すと、1 本目のレビューが生まれた時点で **もう 1 体は別の
+    // 実装を握っている** ので、空いているのは著者だけ — 実機と同じ局面。
+    let mut rt = started(2);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let (sid, tid, agent) = assignments(&rt)[0].clone();
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 12, &sids, sid, &block);
+    validate_ok(&mut rt, tid);
+    for now in 13..18 {
+        idle_tick(&mut rt, now, &sids);
+    }
+    // **局面が作れたことを先に確かめる。** 作れていないと、この下の
+    // アサートは何も守らない (空回りするテストを残さない)。
+    let rev = rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(tid))
+        .expect("レビュータスクが生まれていない");
+    assert_eq!(
+        rev.state,
+        TeamTaskState::Ready,
+        "レビューが配れてしまい、混雑の局面になっていない"
+    );
+    assert!(
+        rt.tasks()
+            .iter()
+            .any(|t| t.assigned_session.is_some_and(|x| x != sid) && t.state.is_held()),
+        "もう 1 体が空いている (混雑の局面になっていない)"
+    );
+    let raised: Vec<&str> = rt
+        .decisions()
+        .iter()
+        .filter(|d| d.kind == DecisionKind::NoCandidate)
+        .map(|d| d.reason.as_str())
+        .collect();
+    assert!(
+        raised.is_empty(),
+        "混んでいるだけで人の判断待ちが出た: {raised:?}"
+    );
+}
+
+/// **レビュー役が本当に居ないときは、1 件だけ出して自分で消す。**
+///
+/// 1 体だけの Run では実装した本人しか居ないので、レビューは待っても
+/// 配れない。人に伝える価値があるのはこちらだけ。
+#[test]
+fn レビュー役が居ないときは一度だけ上げて再試行で下ろせる() {
+    let mut rt = started(1);
+    let e = rt.tick(&obs(10, &[]));
+    let mut next = 1;
+    let sids = bind_all(&mut rt, &e, &mut next);
+    idle_tick(&mut rt, 11, &sids);
+    let (sid, tid, agent) = assignments(&rt)[0].clone();
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let block = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 12, &sids, sid, &block);
+    validate_ok(&mut rt, tid);
+    // 何 tick 回しても **1 件のまま** (毎 tick 積み増さない)。
+    for now in 13..18 {
+        idle_tick(&mut rt, now, &sids);
+    }
+    let stuck: Vec<(TaskId, u64)> = rt
+        .decisions()
+        .iter()
+        .filter(|d| d.kind == DecisionKind::NoCandidate)
+        .map(|d| (d.task_id.unwrap_or(0), d.id))
+        .collect();
+    assert_eq!(stuck.len(), 1, "レビュー役不在の札が増えている: {stuck:?}");
+    let rev = stuck[0].0;
+    // **再試行を押したら、その場で消える。**
+    // 押しても消えないと、人からは「壊れている」としか見えない。
+    rt.apply_action(TeamAction::RetryTask(rev));
+    assert!(
+        !rt.decisions()
+            .iter()
+            .any(|d| d.task_id == Some(rev) && d.kind == DecisionKind::NoCandidate),
+        "再試行を押しても札が残っている"
+    );
+}
+
+/// **配置から導く判断は、全部「取り下げの対象」に載せる。**
+///
+/// 載せ忘れると、理由が消えたあとも札だけが画面に残る (そして `retry` でも
+/// 消えないので、人には壊れているようにしか見えない)。
+#[test]
+fn 配置から導く判断はすべて取り下げの対象() {
+    let src = include_str!("runtime.rs").replace("\r\n", "\n");
+    let body = src
+        .split("fn dispatch(&mut self")
+        .nth(1)
+        .and_then(|t| t.split("\n    /// ").next())
+        .expect("dispatch がある");
+    // `dispatch` が `standing` へ入れる鍵は、必ず表の頭で始まること。
+    let mut seen = 0usize;
+    for line in body.lines() {
+        let l = line.trim_start();
+        if l.starts_with("//") || !l.contains("standing.insert(format!(\"") {
+            continue;
+        }
+        seen += 1;
+        let key = l.split("format!(\"").nth(1).and_then(|t| t.split('{').next());
+        let key = key.expect("鍵の頭が読める");
+        assert!(
+            super::runtime::SCHEDULING_KEYS.contains(&key),
+            "{key:?} が SCHEDULING_KEYS に無い (理由が消えても札が残る)"
+        );
+    }
+    assert!(seen >= 3, "配置由来の判断を読み落としている (seen={seen})");
+}
+
+/// **伝言で担当を投げ出させない。**
+///
+/// 実機で index.html を書く担当 (#5) が 1 時間止まった。伝言で CSS の
+/// 手直しへ移ってしまい、**ページの本体が最後まで作られなかった**
+/// (`~/dev/Test5` に css / js / docs はあるのに index.html が無い)。
+/// 相手の端末には「連絡」と「指示」の区別が無いので、こちらが毎回書く。
+#[test]
+fn 伝言には担当が変わっていないことを添える() {
+    let (mut rt, sids, tid) = to_assigned();
+    let to = rt.task(tid).unwrap().assigned_agent.clone().unwrap();
+    let from = rt
+        .agents()
+        .iter()
+        .map(|a| a.id.clone())
+        .find(|a| a != &to)
+        .expect("差出人");
+    let sender = from.0.clone();
+    let body = format!(
+        "{}\n{{\"to\": \"{}\", \"text\": \"CSS の手直しをお願いします\"}}\n{}",
+        rp::MSG_OPEN,
+        to.0,
+        rp::MSG_CLOSE
+    );
+    let from_sid = rt
+        .agents()
+        .iter()
+        .find(|a| a.id == from)
+        .and_then(|a| a.session_id)
+        .expect("差出人の端末");
+    let eff = tick_text(&mut rt, 30, &sids, from_sid, &body);
+    let sent = eff
+        .iter()
+        .find_map(|e| match e {
+            TeamEffect::SendManualInstruction { agent, text, .. } if agent == &to => Some(text),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("伝言が届いていない (差出人 {sender})"));
+    assert!(sent.contains("CSS の手直し"), "本文が消えた");
+    assert!(
+        sent.contains(&format!("#{tid}")),
+        "いまの担当が添えられていない: {sent}"
+    );
+    assert!(
+        sent.contains("連絡") && sent.contains("指示ではありません"),
+        "連絡か指示かが区別できない: {sent}"
+    );
+}
+
+/// **書いている途中の画面から報告を断らない。**
+///
+/// 実機 (Test6) で、担当が正しく報告しているのに
+/// `報告の JSON を読めません: invalid type: string "task_id"` が記録された。
+/// 1 tick が描画の途中に当たり、マーカーの間に `"task_id"` の断片しか
+/// 無かったため。断ると、落ち度の無い担当に却下が積まれ、人には
+/// 「エージェントが壊れた報告を出した」ように見える。
+#[test]
+fn 書き途中の報告は断らずに見送る() {
+    let (mut rt, sids, tid) = to_assigned();
+    let (sid, _, _) = assignments(&rt)[0].clone();
+    let before = rt.events().count();
+    // 描画の途中: 中身の断片しか無い。
+    // **指示文には無い断片**を使う (指示文に含まれる断片は、既存の
+    // エコー除去が先に落としてしまい、この番人が何も守らなくなる)。
+    let half = format!(
+        "{}\n  \"summary\": \"3D canvas と Hero を実装\",\n{}",
+        rp::RESULT_OPEN,
+        rp::RESULT_CLOSE
+    );
+    tick_text(&mut rt, 20, &sids, sid, &half);
+    let rejected: Vec<String> = rt
+        .events()
+        .skip(before)
+        .filter(|e| e.kind == TeamEventKind::Rejected)
+        .map(|e| e.summary.clone())
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "書き途中の画面で却下が記録された: {rejected:?}"
+    );
+    // **次の tick で全部揃えば、これまでどおり受け付ける。**
+    let agent = rt.task(tid).unwrap().assigned_agent.clone().unwrap().0;
+    let files: Vec<String> = rt.task(tid).unwrap().files.clone();
+    let fs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let full = result_block(tid, &agent, &["cargo test auth"], &fs);
+    tick_text(&mut rt, 21, &sids, sid, &full);
+    assert_ne!(
+        rt.task(tid).unwrap().state,
+        TeamTaskState::Running,
+        "揃った報告まで見送っている"
+    );
+}
+
+/// **同じ断りで台帳を埋めない。**
+///
+/// 実測: 調停層の断り (`割り当て可能なセッションがいない`) が 2 秒ごとに
+/// 2 件積まれ、**台帳 500 件がそれだけ**になった。計画も起動も伝言も
+/// 押し出され、人には何が起きたか一切追えなくなった。
+/// 断りは配置から導かれるので、配置が変わるまで同じ行が出続ける。
+///
+/// 振る舞いで固定しようとしたが、**調停層に断らせる局面を作れず空回りした**
+/// (規則を 1 本に揃えた結果、`NoEligibleCandidate` が起きにくくなった)。
+/// 局面を作れないものを振る舞いで書くと「通っているのに何も守らない」
+/// テストになるので、**記録の入口が覚え書きを通っていること**を走査で見る。
+#[test]
+fn 同じ断りを毎tick記録しない() {
+    let src = include_str!("runtime.rs").replace("\r\n", "\n");
+    let at = src
+        .find("の割り当てを見送りました")
+        .expect("断りの記録場所がある");
+    // その直前 (同じ腕の中) に覚え書きの門があること。
+    let head = &src[at.saturating_sub(400)..at];
+    assert!(
+        head.contains("blocked_notes.insert("),
+        "断りが毎 tick 記録される (覚え書きの門を通っていない)"
+    );
+    // 覚え書きは保存しない (`previews` / `stalls` と同じ扱い)。
+    assert!(
+        !src.contains("blocked_notes:") || !src.contains("serde(default)]\n    blocked_notes"),
+        "覚え書きを永続化している"
+    );
+}

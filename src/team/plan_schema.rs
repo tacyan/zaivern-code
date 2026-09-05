@@ -232,7 +232,7 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
             title: clamp_text(t.title.trim()),
             description: clamp_text(t.description.trim()),
             team_id: TeamId::new(team_key),
-            role: TeamRole::parse(&t.role),
+            role: role_of(&t.role, &t.title),
             dependencies: deps,
             // **正規化は既存の台帳と同じ 1 本を通す。** `src\\a.rs` と
             // `./src/a.rs` を別パターンのまま持つと、重なり判定を素通りする。
@@ -304,6 +304,34 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
 }
 
 /// MVP の既定レーン。**1 画面の標準は 3〜5 本**なので 4 本に留める。
+/// **役割を決める。`role` が読めなければ表題の頭から拾う。**
+///
+/// 計画は LLM が書くので、役割を `role` 欄ではなく**表題の頭**に置くことが
+/// ある (`"tester: 実際にブラウザで開いて確認する"`)。[`TeamRole::parse`] は
+/// 知らない語を `Implementer` に倒すので、実機では **9 本すべてが
+/// `implementer`** になっていた。
+///
+/// 実害は表示ではなく**指示文**である。役割ごとに違う指示文
+/// (`prompt::implementer` / `tester` / `reviewer` …) を選ぶ根拠がここなので、
+/// テストにもレビューにも統合にも「あなたは実装担当です」と書いて送っていた。
+pub(super) fn role_of(role: &str, title: &str) -> TeamRole {
+    let parsed = TeamRole::parse(role);
+    // `role` 欄が実際に役割を名指ししているなら、それが最優先。
+    if parsed != TeamRole::Implementer || role.trim().eq_ignore_ascii_case("implementer") {
+        return parsed;
+    }
+    // 表題の頭 (`<役割>:` / `<役割>(補足):`) を見る。
+    let head = title.trim();
+    let Some(colon) = head.find(':') else {
+        return parsed;
+    };
+    let mut word = &head[..colon];
+    if let Some(paren) = word.find('(') {
+        word = &word[..paren];
+    }
+    TeamRole::parse(word)
+}
+
 pub fn default_lanes() -> Vec<TeamGroup> {
     vec![
         TeamGroup {
@@ -504,5 +532,56 @@ mod tests {
                 .any(|i| matches!(i, super::super::graph::PlanIssue::DangerousCommand { .. })),
             "読めなかった行が理由つきで止まらない: {issues:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod role_from_title_tests {
+    use super::*;
+
+    /// **実機の計画では 9 本すべてが `implementer` に潰れていた。**
+    ///
+    /// 表題は役割を名乗っているのに `role` 欄が読めず、
+    /// [`TeamRole::parse`] が既定の `Implementer` へ倒していた。実害は
+    /// 表示ではなく**指示文**で、テストにもレビューにも統合にも
+    /// 「あなたは実装担当です」と書いて送っていた。
+    #[test]
+    fn 表題が役割を名乗っていれば拾う() {
+        // 実機の表題そのもの。
+        for (title, want) in [
+            ("planner: 依頼にある中身を実装前に文章で固める", TeamRole::Planner),
+            ("architect: ファイル構成と 3D の実現方式を確定する", TeamRole::Architect),
+            ("implementer(markup): ページの HTML を書く", TeamRole::Implementer),
+            ("implementer(style): スタイルを書く", TeamRole::Implementer),
+            ("tester: 実際にブラウザで開いて確認する", TeamRole::Tester),
+            ("reviewer: index.html を読み、契約と照合する", TeamRole::Reviewer),
+            ("integrator: 各タスクの成果物を 1 つのサイトとして繋ぐ", TeamRole::Integrator),
+        ] {
+            assert_eq!(role_of("", title), want, "表題から拾えない: {title}");
+        }
+    }
+
+    /// **`role` 欄が名乗っているなら、そちらが優先。**
+    /// 表題の頭が偶然役割の語でも、欄の指定を上書きしない。
+    #[test]
+    fn 役割欄があればそちらを使う() {
+        assert_eq!(role_of("tester", "implementer: x"), TeamRole::Tester);
+        assert_eq!(role_of("reviewer", "planner: x"), TeamRole::Reviewer);
+        // 明示された implementer は、表題に引っ張られない。
+        assert_eq!(role_of("implementer", "tester: x"), TeamRole::Implementer);
+    }
+
+    /// **名乗っていないものは今までどおり実装担当。**
+    /// 勝手な読み替えで、普通のタスクの指示文を変えない。
+    #[test]
+    fn 名乗っていなければ実装担当のまま() {
+        for title in [
+            "ページの HTML を書く",
+            "3D: シーンを実装する",
+            "対応: ナビの折り返し",
+            "",
+        ] {
+            assert_eq!(role_of("", title), TeamRole::Implementer, "{title}");
+        }
     }
 }

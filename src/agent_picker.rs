@@ -493,10 +493,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_thirty_three_agents() {
+    fn catalog_has_thirty_two_agents() {
         // 「カタログ全件を選べる」が要件なので、件数そのものを固定する。
         // orca (stablyai/orca) が起動対象にしている CLI を全て含む。
-        assert_eq!(AGENT_CATALOG.len(), 33);
+        assert_eq!(AGENT_CATALOG.len(), 32);
     }
 
     #[test]

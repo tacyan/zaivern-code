@@ -47,7 +47,13 @@ pub fn derive_agent_work_state(
     }
     // 3) 停滞。**Testing より優先**する。検証を始めた記録が残っていても、
     //    出力が動いていないなら止まっている。
-    if session == SessionState::Stalled {
+    // **停滞と呼ぶのは、仕事を持っているときだけ。**
+    //
+    // 持ち仕事が無い担当は出力が動かなくて当たり前なので、そのまま
+    // 「停滞」と読まれる。そして停滞には配らないので**二度と出力が
+    // 動かない** — 推測が自分で自分を裏付ける輪になる。実測で、空いている
+    // 担当が 3 体居るのにタスクが 5 本待ち続けた。
+    if session == SessionState::Stalled && task.is_some() {
         return AgentWorkState::Stalled;
     }
     // 4) タスクが詰まっている。
@@ -84,32 +90,75 @@ pub fn derive_agent_work_state(
         }
     }
     // 6) タスクを持っていない。
+    //
+    // **`Stalled` はここでは `Idle`。** 仕事が無いのだから出力が無いのは
+    // 当然で、配れる状態である。`Unknown` (画面が読めない) は据え置く —
+    // 読めない相手へ配ってよいかは調停層 (`coordinator::assignable`) が決める。
     match session {
-        SessionState::Idle => AgentWorkState::Idle,
+        SessionState::Idle | SessionState::Stalled => AgentWorkState::Idle,
+        SessionState::AwaitingInput => AgentWorkState::Idle,
         SessionState::Working => AgentWorkState::Working,
         _ => AgentWorkState::Unknown,
     }
 }
 
+/// エージェントプリセット 1 つぶんの手掛かり。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresetRow {
+    /// 設定に書かれた名前 (`Claude Code` など)。
+    pub name: String,
+    /// AI CLI として使えるか (素のシェルは対象外)。
+    pub is_ai: bool,
+    /// **この PC で実際に起動できるか** (実体が PATH にある)。
+    ///
+    /// 入っていない CLI を割り当てると、その担当だけが永久に起動しない。
+    /// 「使える 1 本を全員で使う」ほうが、動かない担当を作るよりよい。
+    pub available: bool,
+}
+
 /// **役割に合うエージェントプリセットを選ぶ** (純関数)。
 ///
-/// 渡すのは `(プリセット名, AI CLI として使えるか)` の一覧。戻りはその
-/// 添字。判断は 2 段だけ:
+/// 判断は 3 段:
 ///
-/// 1. 名前に役割の綴り (`reviewer` / `tester` …) を含む AI CLI があれば、それ
-/// 2. 無ければ**最初の AI CLI**
+/// 1. 名前に役割の綴り (`reviewer` / `tester` …) を含む、起動できる AI CLI
+/// 2. **起動できる AI CLI を役割ごとに配る** — 同じものを全員に割り当てず、
+///    入っている CLI の数だけ担当を散らす
+/// 3. どれも起動できないなら、AI CLI のうち最初のもの (従来どおり)
 ///
-/// この版では設定に役割ごとのプリセットが無いので、実際にはほぼ 2 段目に
-/// 落ちる = **全員が同じプリセット**で動く。それでもここを 1 本の関数に
-/// してあるのは、Role → Capability → Provider → Execution Target という
-/// 差し替え点を 1 か所に残すため (画面に「選べるのに効かない設定」を
-/// 作らないこと、と対になる)。
-pub fn preset_for_role(presets: &[(String, bool)], role: TeamRole) -> Option<usize> {
+/// ## なぜ散らすか
+///
+/// 全員が同じ CLI だと、その CLI の癖 (見落とし・書き癖) がチーム全体に
+/// 同じ形で乗る。レビューを別の CLI にできるなら、**実装が見落としたものを
+/// 別の目が見る**。入っているものを使わない理由が無い。
+///
+/// ## 決め方は固定
+///
+/// 役割の並び順 ([`TeamRole::ALL`]) の中での位置を、使える CLI の本数で
+/// 割った余りにする。**同じ顔ぶれなら毎回同じ割り当て**になるので、
+/// 「今日は誰がどれ」で結果が変わらない。
+pub fn preset_for_role(presets: &[PresetRow], role: TeamRole) -> Option<usize> {
     let want = role.key();
-    let named = presets.iter().position(|(name, is_ai)| {
-        *is_ai && name.to_ascii_lowercase().contains(want)
-    });
-    named.or_else(|| presets.iter().position(|(_, is_ai)| *is_ai))
+    // 1) 役割の名前を持つプリセット (人が明示的に用意したもの)。
+    if let Some(i) = presets
+        .iter()
+        .position(|p| p.is_ai && p.available && p.name.to_ascii_lowercase().contains(want))
+    {
+        return Some(i);
+    }
+    // 2) 起動できるものを役割ごとに配る。
+    let usable: Vec<usize> = presets
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_ai && p.available)
+        .map(|(i, _)| i)
+        .collect();
+    if !usable.is_empty() {
+        let slot = TeamRole::ALL.iter().position(|r| *r == role).unwrap_or(0);
+        return Some(usable[slot % usable.len()]);
+    }
+    // 3) 起動できるものが 1 つも分からない (PATH を引けない等) —
+    //    従来どおり最初の AI CLI へ落とす。**担当を 0 体にしない。**
+    presets.iter().position(|p| p.is_ai)
 }
 
 /// この役割は実装 (コードを書く) をするか。
@@ -130,7 +179,7 @@ mod tests {
     use super::super::testkit::task;
     use super::*;
 
-    fn t(state: TeamTaskState, role: TeamRole) -> TeamTask {
+    pub(super) fn t(state: TeamTaskState, role: TeamRole) -> TeamTask {
         let mut x = task(1, "a", &[]);
         x.state = state;
         x.role = role;
@@ -251,27 +300,118 @@ mod tests {
         assert!(!is_review_role(TeamRole::Implementer));
     }
 
+    fn row(name: &str, is_ai: bool, available: bool) -> PresetRow {
+        PresetRow {
+            name: name.to_string(),
+            is_ai,
+            available,
+        }
+    }
+
     #[test]
     fn 役割に合うプリセットを選ぶ() {
         use TeamRole::*;
         let presets = vec![
-            ("Shell".to_string(), false),
-            ("Claude".to_string(), true),
-            ("Reviewer bot".to_string(), true),
+            row("Shell", false, true),
+            row("Claude", true, true),
+            row("Reviewer bot", true, true),
         ];
         // 名前に役割の綴りがあれば、それ
         assert_eq!(preset_for_role(&presets, Reviewer), Some(2));
-        // 無ければ最初の AI CLI (**素のシェルは選ばない**)
-        assert_eq!(preset_for_role(&presets, Implementer), Some(1));
-        assert_eq!(preset_for_role(&presets, TeamLead), Some(1));
-        // AI CLI が 1 つも無ければ選べない
-        let none = vec![("Shell".to_string(), false)];
+        // AI CLI が 1 つも無ければ選べない (**素のシェルは選ばない**)
+        let none = vec![row("Shell", false, true)];
         assert_eq!(preset_for_role(&none, Implementer), None);
-        // **この版では全員が同じプリセットになる** (役割名のプリセットは
-        // 既定の設定に無い)。それを明示しておく。
-        let plain = vec![("Claude".to_string(), true), ("Codex".to_string(), true)];
+    }
+
+    /// **入っている CLI を役割ごとに配る。**
+    ///
+    /// 全員が同じ CLI だと、その CLI の癖がチーム全体に同じ形で乗る
+    /// (実装の見落としを、同じ見落とし方をする相手がレビューする)。
+    #[test]
+    fn 入っているclitを役割ごとに散らす() {
+        use TeamRole::*;
+        let two = vec![row("Claude", true, true), row("Codex", true, true)];
+        // 役割の並び順で交互に配る。**同じ顔ぶれなら毎回同じ割り当て。**
+        let got: Vec<Option<usize>> = TeamRole::ALL
+            .iter()
+            .map(|r| preset_for_role(&two, *r))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(0),
+                Some(1),
+                Some(0),
+                Some(1),
+                Some(0),
+                Some(1),
+                Some(0)
+            ]
+        );
+        // 2 回呼んでも同じ (決め方が固定されている)。
+        assert_eq!(preset_for_role(&two, Reviewer), preset_for_role(&two, Reviewer));
+        // 使えるものが 1 本しか無ければ、全員それになる。
+        let one = vec![row("Claude", true, true), row("Codex", true, false)];
         for r in TeamRole::ALL {
-            assert_eq!(preset_for_role(&plain, r), Some(0), "{r:?}");
+            assert_eq!(preset_for_role(&one, r), Some(0), "{r:?}");
         }
+    }
+
+    /// **入っていないものを割り当てない。** 割り当てると、その担当だけが
+    /// 永久に起動しない (画面には居るのに何も起きない)。
+    #[test]
+    fn 起動できないcliには配らない() {
+        use TeamRole::*;
+        // 名前が役割と一致していても、入っていなければ選ばない。
+        let p = vec![
+            row("Claude", true, true),
+            row("Reviewer bot", true, false),
+        ];
+        assert_eq!(preset_for_role(&p, Reviewer), Some(0));
+        // どれも起動を確かめられないときは、担当を 0 体にせず最初の AI CLI へ。
+        let unknown = vec![row("Shell", false, false), row("Claude", true, false)];
+        assert_eq!(preset_for_role(&unknown, Implementer), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod no_task_no_stall_tests {
+    use super::tests::t;
+    use super::*;
+
+    /// **仕事を持っていない担当は停滞ではない。**
+    ///
+    /// 実測の止まり方: Planner / Tester / Reviewer が `stalled` で、`ready` の
+    /// タスクが 5 本待っていた。持ち仕事が無ければ出力が動かなくて当たり前
+    /// なのに、それを停滞と読み、停滞には配らないので**二度と出力が動かない**。
+    /// 推測が自分で自分を裏付ける輪になっていた。
+    ///
+    /// ここが直し場である。スケジューラ側 (`Candidate::free`) を緩めて
+    /// 直そうとすると、調停層が別の規則で断り、**提案しては断られる**組み合わせで
+    /// 台帳が埋まる (実測 500 件)。
+    #[test]
+    fn 仕事が無い担当は停滞ではない() {
+        // 仕事を持っていない → 配れる状態として出す。
+        assert_eq!(
+            derive_agent_work_state(SessionState::Stalled, None, None, None),
+            AgentWorkState::Idle,
+            "手ぶらの担当を停滞と呼んでいる (二度と配られなくなる)"
+        );
+        assert_eq!(
+            derive_agent_work_state(SessionState::AwaitingInput, None, None, None),
+            AgentWorkState::Idle
+        );
+        // **仕事を持っているのに動かないのは、本当の停滞。**
+        let t = t(TeamTaskState::Running, TeamRole::Implementer);
+        assert_eq!(
+            derive_agent_work_state(SessionState::Stalled, Some(&t), None, None),
+            AgentWorkState::Stalled,
+            "担当を持ったまま止まっている相手を見逃している"
+        );
+        // 読めない相手は据え置く (配ってよいかは調停層が決める)。
+        assert_eq!(
+            derive_agent_work_state(SessionState::Unknown, None, None, None),
+            AgentWorkState::Unknown
+        );
     }
 }

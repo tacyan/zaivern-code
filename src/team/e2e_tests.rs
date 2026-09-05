@@ -66,6 +66,38 @@ struct Lab {
     real_git: bool,
 }
 
+/// **カーソル移動だけで描いた画面**を作る (実 vt100 に通した結果)。
+///
+/// Claude Code v2 は報告を改行ではなく `\e[<行>;<桁>H` で位置を決めて描く。
+/// すると端末のグリッドでは JSON が桁の飛んだ断片になり、囲みごと潰れる —
+/// **画面から読む限り構造的に取りこぼす**。ここはその形を実物の端末
+/// エミュレータで再現する (文字列を手で崩した「それらしい」入力にしない)。
+fn cursor_drawn(open: &str, json: &str, close: &str) -> String {
+    let mut p = vt100::Parser::new(24, 120, 0);
+    p.process(b"\x1b[2J\x1b[H");
+    let mut row = 2u16;
+    let put = |p: &mut vt100::Parser, row: &mut u16, col: u16, text: &str| {
+        p.process(format!("\x1b[{};{}H", *row, col).as_bytes());
+        p.process(text.as_bytes());
+        *row += 1;
+    };
+    put(&mut p, &mut row, 3, open);
+    for (i, c) in json.as_bytes().chunks(11).enumerate() {
+        let Ok(part) = std::str::from_utf8(c) else {
+            continue;
+        };
+        put(&mut p, &mut row, 5 + (i as u16 % 7) * 3, part);
+    }
+    put(&mut p, &mut row, 3, close);
+    p.screen()
+        .contents()
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 実験用の git リポジトリを 1 つ作る (作れなければ `None`)。
 fn git_repo() -> Option<PathBuf> {
     let d = crate::test_util::unique_temp_dir("zaivern-team-e2e", "repo");
@@ -136,6 +168,7 @@ impl Lab {
                 run_id: "run-e2e".into(),
                 spec_source: "SPEC.md".into(),
                 agent_count: agents,
+                agent_presets: Vec::new(),
                 max_attempts: 3,
                 review_required: true,
                 guardrails: Default::default(),
@@ -146,6 +179,7 @@ impl Lab {
             eprintln!("[skip] e2e: git を使えないので実測を差し替えます");
             test_hooks::set_baseline(Some(super::changeset::FileBaseline {
                 complete: true,
+                head_commit: "0".repeat(40),
                 ..Default::default()
             }));
             test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
@@ -343,6 +377,42 @@ impl Lab {
             )
         };
         self.tick(Some(sid), &block);
+    }
+
+    /// **置き場 (outbox) 経由で 1 通届ける。** 画面には**カーソル移動で
+    /// 描いた同じ内容**を出す (Claude Code v2 の描き方)。画面からは
+    /// 構造的に読めないので、届いたなら置き場のおかげだと言い切れる。
+    fn deliver_via_outbox(
+        &mut self,
+        sid: SessionId,
+        kind: super::outbox::Kind,
+        payload: &str,
+        open: &str,
+        close: &str,
+    ) {
+        let agent = self
+            .rt
+            .agents()
+            .iter()
+            .find(|a| a.session_id == Some(sid))
+            .map(|a| a.id.clone())
+            .expect("セッションに担当が結び付いている");
+        // 画面はカーソル移動で描く (実 vt100 に通す)。
+        let screen = cursor_drawn(open, payload, close);
+        // **画面からは元の JSON を復元できない。** 囲みの中の断片を
+        // 拾えても、それを読むと元の値には戻らない (桁が飛んでいる)。
+        let want: serde_json::Value = serde_json::from_str(payload).expect("payload は JSON");
+        for b in rp::extract_blocks(&screen, open, close) {
+            let got = rp::parse_lenient::<serde_json::Value>(&b);
+            assert!(
+                got.map(|v| v != want).unwrap_or(true),
+                "前提が崩れている: カーソル描画の画面から JSON が復元できてしまう:\n{b}"
+            );
+        }
+        self.rt
+            .accept_outbox(&agent, kind, payload, self.now)
+            .expect("置き場からの受理");
+        self.tick(Some(sid), &screen);
     }
 
     /// 親エージェントがサブエージェントを報告する。
@@ -669,4 +739,206 @@ fn 自己申告が嘘でも実測が通らなければgoalは完了しない() {
         lab.rt.task(tid).unwrap().context
     );
     assert_ne!(lab.rt.goal().status, GoalStatus::Completed);
+}
+
+/// **画面から読めないレビューが、置き場からなら通って先へ進む。**
+///
+/// 完了報告だけを置き場へ移しても根本解決にならない。レビューを取りこぼすと、
+/// 実装が終わったタスクは `Reviewing` のまま永久に止まる。ここでは画面を
+/// 実 vt100 のカーソル移動描画にして「画面からは読めない」ことを前提として
+/// 確かめたうえで、置き場経由なら承認も差し戻しも通ることを見る。
+#[test]
+fn 画面から読めないレビューが置き場から通って先へ進む() {
+    let mut lab = Lab::new(4);
+    lab.idle();
+    lab.idle();
+    let work = lab.working();
+    assert_eq!(work.len(), 2, "並列に配られているべき: {work:?}");
+    let (_, task_a, _) = work[0].clone();
+
+    // 完了報告も置き場から (画面はカーソル移動で潰れている)。
+    let t = lab.rt.task(task_a).expect("タスク").clone();
+    let sid = t.assigned_session.expect("担当セッション");
+    let agent = t.assigned_agent.clone().expect("担当").0;
+    let v: Vec<String> = t
+        .validation_commands
+        .iter()
+        .map(|c| format!("{{\"command\":\"{c}\",\"exit_code\":0}}"))
+        .collect();
+    let files: Vec<String> = t.files.iter().map(|x| format!("\"{x}\"")).collect();
+    let done = format!(
+        "{{\"task_id\":{task_a},\"agent_id\":\"{agent}\",\"status\":\"completed\",\
+         \"summary\":\"実装しました\",\"changed_files\":[{f}],\"validation\":[{v}],\"blockers\":[]}}",
+        f = files.join(","),
+        v = v.join(","),
+    );
+    lab.deliver_via_outbox(
+        sid,
+        super::outbox::Kind::Result,
+        &done,
+        rp::RESULT_OPEN,
+        rp::RESULT_CLOSE,
+    );
+    // 検証が通ってレビューへ進む。
+    for _ in 0..6 {
+        if lab
+            .rt
+            .tasks()
+            .iter()
+            .any(|t| t.review_of == Some(task_a) && t.assigned_session.is_some())
+        {
+            break;
+        }
+        lab.idle();
+    }
+    let rev = lab
+        .rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(task_a) && t.assigned_session.is_some())
+        .cloned()
+        .expect("レビュー担当が配られているべき");
+    assert_eq!(
+        lab.rt.task(task_a).unwrap().state,
+        TeamTaskState::Reviewing,
+        "前提: レビュー待ち"
+    );
+
+    // ── 差し戻し (置き場経由) — 指摘が対象タスクへ戻る ──
+    let rsid = rev.assigned_session.expect("レビュー担当セッション");
+    let reject = format!(
+        "{{\"task_id\":{task_a},\"verdict\":\"REQUEST_CHANGES\",\
+         \"findings\":[\"異常系のテストが足りない\"],\"summary\":\"要修正\"}}"
+    );
+    lab.deliver_via_outbox(
+        rsid,
+        super::outbox::Kind::Review,
+        &reject,
+        reviewer::REVIEW_OPEN,
+        reviewer::REVIEW_CLOSE,
+    );
+    let t = lab.rt.task(task_a).expect("対象タスク").clone();
+    assert_eq!(
+        t.review.verdict,
+        Some(ReviewVerdict::RequestChanges),
+        "置き場から出した差し戻しが届いていない"
+    );
+    assert!(
+        t.review.findings.iter().any(|f| f.contains("異常系")),
+        "指摘が対象タスクへ戻っていない: {:?}",
+        t.review.findings
+    );
+    assert_ne!(
+        t.state,
+        TeamTaskState::Reviewing,
+        "差し戻したのに Reviewing のまま止まっている"
+    );
+
+    // ── 直して再報告 → 承認 (置き場経由) → 完了 ──
+    for _ in 0..8 {
+        if lab
+            .rt
+            .task(task_a)
+            .is_some_and(|t| t.state.is_working() && t.assigned_session.is_some())
+        {
+            break;
+        }
+        lab.idle();
+    }
+    let t = lab.rt.task(task_a).expect("タスク").clone();
+    let sid = t.assigned_session.expect("再割当のセッション");
+    lab.deliver_via_outbox(
+        sid,
+        super::outbox::Kind::Result,
+        &done,
+        rp::RESULT_OPEN,
+        rp::RESULT_CLOSE,
+    );
+    for _ in 0..8 {
+        if lab
+            .rt
+            .tasks()
+            .iter()
+            .any(|t| t.review_of == Some(task_a) && t.state.is_working())
+        {
+            break;
+        }
+        lab.idle();
+    }
+    let rev2 = lab
+        .rt
+        .tasks()
+        .iter()
+        .find(|t| t.review_of == Some(task_a) && t.state.is_working())
+        .cloned()
+        .expect("再レビューが配られているべき");
+    let approve = format!(
+        "{{\"task_id\":{task_a},\"verdict\":\"APPROVE\",\"findings\":[],\"summary\":\"問題なし\"}}"
+    );
+    lab.deliver_via_outbox(
+        rev2.assigned_session.expect("再レビューのセッション"),
+        super::outbox::Kind::Review,
+        &approve,
+        reviewer::REVIEW_OPEN,
+        reviewer::REVIEW_CLOSE,
+    );
+    assert_eq!(
+        lab.rt.task(task_a).unwrap().state,
+        TeamTaskState::Completed,
+        "置き場から出した承認で完了まで進まない"
+    );
+    test_hooks::clear();
+}
+
+/// **伝言と出来事も、画面から読めなくても置き場からなら届く。**
+#[test]
+fn 画面から読めない伝言と出来事が置き場から届く() {
+    let mut lab = Lab::new(4);
+    lab.idle();
+    lab.idle();
+    let work = lab.working();
+    assert_eq!(work.len(), 2, "並列に配られているべき: {work:?}");
+    let (sid_a, _, agent_a) = work[0].clone();
+    let (_, _, agent_b) = work[1].clone();
+
+    // 伝言 — 相手の端末へ届ける Effect が出る。
+    let msg = format!("{{\"to\":\"{agent_b}\",\"text\":\"レビューお願いします\"}}");
+    let before = lab
+        .rt
+        .events()
+        .filter(|e| e.kind == TeamEventKind::AgentMessage)
+        .count();
+    lab.deliver_via_outbox(
+        sid_a,
+        super::outbox::Kind::Message,
+        &msg,
+        rp::MSG_OPEN,
+        rp::MSG_CLOSE,
+    );
+    let after = lab
+        .rt
+        .events()
+        .filter(|e| e.kind == TeamEventKind::AgentMessage)
+        .count();
+    assert_eq!(after, before + 1, "置き場から出した伝言が届いていない");
+
+    // 出来事 — 盤面へ子として並ぶ (送り主は parent_id)。
+    let ev = format!(
+        "{{\"kind\":\"sub_agent_started\",\"agent_id\":\"outbox-child-1\",\
+         \"parent_id\":\"{agent_a}\",\"role\":\"tester\",\"action\":\"テスト中\"}}"
+    );
+    lab.deliver_via_outbox(
+        sid_a,
+        super::outbox::Kind::Event,
+        &ev,
+        rp::EVENT_OPEN,
+        rp::EVENT_CLOSE,
+    );
+    let sub = lab
+        .rt
+        .agent(&AgentId::new("outbox-child-1"))
+        .expect("置き場から出した出来事が盤面に出ていない");
+    assert_eq!(sub.kind, AgentKind::ReportedSubAgent);
+    assert_eq!(sub.parent_id, Some(AgentId::new(&agent_a)));
+    test_hooks::clear();
 }

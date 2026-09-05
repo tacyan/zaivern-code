@@ -4498,6 +4498,95 @@ prunable gitdir file points to non-existent location
     /// 起動していないのに緑」と読み違えた)。どの経路で終わっても最後の 1 行に
     /// 判定を書くこと。`exec` で置き換えると EXIT の trap が発火しないので、
     /// そこも併せて禁じる。
+    /// **伝言の読み方も、作法の文面も、置き場は 1 つ。**
+    ///
+    /// Team Run と通常タブで別々に書くと、片方だけが手書き JSON の綴り
+    /// 間違いを拾えるようになる (実測で 19 通中 5 通が落ちていた形)。
+    /// 「Team では届くのに通常タブでは届かない」は、利用者からは
+    /// 説明が付かない。
+    #[test]
+    fn 伝言の読み手はひとつだけ() {
+        for (name, src) in [
+            ("agent_talk", include_str!("agent_talk.rs")),
+            ("prompt", include_str!("team/prompt.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("serde_json::from_str"),
+                "{name} が伝言の JSON を自前で読んでいる (read_message を使う)"
+            );
+            assert!(
+                !code.contains("MSG_MAX_CHARS"),
+                "{name} が伝言の整形を自前でしている (read_message が済ませる)"
+            );
+            assert!(
+                code.contains("message_howto("),
+                "{name} が伝言の作法を自前で組み立てている (message_howto を使う)"
+            );
+        }
+        // 読み手の実体はここ 1 つだけ。
+        let rp = include_str!("team/result_parser.rs").replace("\r\n", "\n");
+        assert_eq!(
+            rp.matches("fn lenient_message(").count(),
+            1,
+            "受け皿が 2 つある"
+        );
+    }
+
+    /// **`tools/verify.sh` の判定そのものを、実際に回して確かめる。**
+    ///
+    /// verify.sh は「テストを走らせたか」を人へ報告する道具なので、ここが嘘を
+    /// つくと全部の緑が信用できなくなる。実際に嘘をついていた: 変更ファイルの
+    /// basename をフィルタにしていたので、`src/team/panel.rs` を触ると
+    /// `panel::` が渡り、**`context::panel` のテストが走っただけで緑**に
+    /// なっていた (team の panel が 0 件でも)。
+    ///
+    /// 検査の中身は `tools/verify-selftest.sh` — 偽の cargo と使い捨ての git
+    /// リポジトリで、どのフィルタが渡ったか・終了コード・一時ファイルの後始末を
+    /// 決定的に見る。**旧実装をわざと作り直して「捕まえられること」まで**
+    /// 確かめるので、空回りしない。
+    ///
+    /// ここから呼ぶのは、走らせるかどうかを人の記憶に委ねないため
+    /// (CLAUDE.md「道具は揃っていて、走らせるかどうかが人の記憶に委ねられて
+    /// いただけ」)。`sh` と `git` が要るので Windows では降りる。
+    #[cfg(unix)]
+    #[test]
+    fn verify_shは別モジュールのテストで緑にならない() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let out = match std::process::Command::new("sh")
+            .arg(root.join("tools/verify-selftest.sh"))
+            .current_dir(root)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                println!("[skip] sh を起動できません: {e}");
+                return;
+            }
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 検査そのものが動かない環境 (git が無い等) は skip。**緑にはしない** —
+        // 「何件成功したか」の行が出ていなければ、1 つも検査していない。
+        if !text.contains("件成功 /") {
+            println!("[skip] verify-selftest.sh を回せませんでした:\n{text}");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "tools/verify-selftest.sh が赤:\n{text}"
+        );
+        assert!(text.contains("0 件失敗"), "落ちた検査がある:\n{text}");
+    }
+
     #[test]
     fn 検証スクリプトは終了時に判定行を出す() {
         for (name, src) in [
@@ -4517,6 +4606,10 @@ prunable gitdir file points to non-existent location
             (
                 "tools/release-gate.sh",
                 include_str!("../tools/release-gate.sh"),
+            ),
+            (
+                "tools/verify-selftest.sh",
+                include_str!("../tools/verify-selftest.sh"),
             ),
         ] {
             // Windows のチェックアウトは CRLF なので正規化してから探す。
@@ -5106,6 +5199,83 @@ prunable gitdir file points to non-existent location
             }
         }
         (bases, ng)
+    }
+
+    /// **画面に出す製品バージョンをベタ書きしない。**
+    ///
+    /// 0.23.0 の出荷時、ステータスバー右端だけが `"Zaivern v0.2"` という
+    /// **文字列リテラル**で、実際の版と 21 リリースぶんずれていた
+    /// (同じ版を出す他の 16 箇所は全部 `env!("CARGO_PKG_VERSION")` だった)。
+    /// この壊れ方は**版を上げても画面が変わらない**ので、
+    /// 「上げ忘れ」と見分けが付かない — 利用者から見ると
+    /// 「更新したのに古いまま」という嘘の報告になる。
+    ///
+    /// 検査は「app モジュールの**文字列リテラル**に `v<数字>.<数字>` が出ない」。
+    /// 版は必ず `env!("CARGO_PKG_VERSION")` から組み立てること。
+    #[test]
+    fn 画面のバージョン表記をベタ書きしていない() {
+        /// 行の中の文字列リテラルだけを取り出す (コメントの `v0.16` は対象外)。
+        fn literals_of(line: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let (mut cur, mut inside, mut esc) = (String::new(), false, false);
+            for c in line.chars() {
+                if inside {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        inside = false;
+                        out.push(std::mem::take(&mut cur));
+                        continue;
+                    }
+                    cur.push(c);
+                } else if c == '"' {
+                    inside = true;
+                }
+            }
+            out
+        }
+
+        /// `v` の直後に `数字 . 数字` が続くか (= 手で書いた版番号)。
+        fn looks_like_version(lit: &str) -> bool {
+            let c: Vec<char> = lit.chars().collect();
+            (0..c.len()).any(|i| {
+                if c[i] != 'v' && c[i] != 'V' {
+                    return false;
+                }
+                let mut j = i + 1;
+                while j < c.len() && c[j].is_ascii_digit() {
+                    j += 1;
+                }
+                j > i + 1 && j + 1 < c.len() && c[j] == '.' && c[j + 1].is_ascii_digit()
+            })
+        }
+
+        let mut bad: Vec<String> = Vec::new();
+        for (n, line) in crate::app::SRC_IMPL
+            .replace("\r\n", "\n")
+            .lines()
+            .enumerate()
+        {
+            let t = line.trim_start();
+            // 期待値として版を書くテストと、まるごとコメントの行は対象外。
+            if t.starts_with("//") || line.contains("assert") {
+                continue;
+            }
+            for lit in literals_of(line) {
+                if looks_like_version(&lit) {
+                    bad.push(format!("{n}: \"{lit}\""));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "画面に出す版を直書きしている ({} 件)。\n{}\n\
+             env!(\"CARGO_PKG_VERSION\") から組み立てること。",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 
     /// **ソースを読む番人は、改行をまたぐ照合の前に必ず正規化する。**

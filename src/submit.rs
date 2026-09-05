@@ -25,7 +25,8 @@
 //!    分割送信されるのを防ぐ。
 //! 4. **入力欄に本文が残っていたら CR を撃ち直す。** 1 と 2 で大半は消えるが、
 //!    起動直後の再描画と重なると 1 発目が落ちることがある。ただし撃ち直しは
-//!    **承認プロンプトが出ていないときだけ** ([`MAX_COMMIT_TRIES`] 回まで)。
+//!    **承認プロンプトが出ていないときだけ**、入力欄に本文が見えている
+//!    あいだ ([`GIVE_UP`] まで)。
 //!
 //! ## 判断はすべて純粋関数
 //!
@@ -48,16 +49,60 @@ pub const VERIFY_DELAY: Duration = Duration::from_millis(450);
 /// 確定キーを送る最大回数 (初回 + 撃ち直し)。
 ///
 /// 無制限に撃つと、相手がたまたま承認プロンプトを出した瞬間に
-/// Enter を送り続けて**勝手に承認してしまう**。上限で必ず止める。
-pub const MAX_COMMIT_TRIES: u8 = 3;
+/// Enter を送り続けて**勝手に承認してしまう**。上限で必ず止める
+/// (承認プロンプト中は `attention` で止まるが、上限は最後の砦として残す)。
+///
+/// **3 回では足りなかった。** 起動に手間取る相手 (MCP を立ち上げている
+/// Codex 等) では 3 回とも起動中に当たって終わる — 実機で、同じ Codex でも
+/// 起動が速かった側は動き出し、`⚠ MCP startup incomplete` が出ていた側は
+/// 本文を入力欄に抱えたまま止まっていた。間隔は回を追うごとに広がるので
+/// (`VERIFY_DELAY * 回数`、上限 [`COMMIT_RETRY_MAX`])、12 回で
+/// おおよそ 30 秒ぶん粘る。
+pub const MAX_COMMIT_TRIES: u8 = 12;
 
 /// 「落ち着くまで待つ」指示 (Issue 着手 / レース / 失敗切替の引き継ぎ) が
 /// Idle を待つ上限。これを過ぎたら承認待ちでない限り入れてしまう
 /// (スピナーの誤検知で永遠に待たないため)。
 pub const READY_WAIT: Duration = Duration::from_secs(45);
 
-/// 諦める上限。ここを過ぎたらユーザーへ知らせて捨てる。
+/// **理由の無い沈黙**が続いてよい上限。ここを過ぎたら人へ知らせて捨てる。
+///
+/// **積んでからの総時間ではない。** 総時間で切ると、起動時にモーダルを
+/// 出す CLI (フォルダ信頼確認) では**書く前に予算を使い切って諦める**。
+/// 実機で Antigravity の担当 2 体が、生ログ 3.5KB (起動表示のみ) のまま
+/// 1 文字も受け取れずに終わった — こちらは待っていただけで、相手は
+/// ちゃんと確認に答えて入力を待っていた。
+///
+/// 数えるのは [`holdup`] が「待ってよい理由」を 1 つも見つけられない
+/// 時間だけ。承認待ち・起動中・入力欄に本文が残っている、といった
+/// **観測できる理由がある間は延びる** (CLAUDE.md「進捗が観測できる限り
+/// 待ちを延ばす」)。
 pub const GIVE_UP: Duration = Duration::from_secs(120);
+
+/// **人へ返すまでの最後の上限** (理由が観測できていても、ここで諦める)。
+///
+/// [`GIVE_UP`] を沈黙時間へ移したので、承認プロンプトが永久に閉じない
+/// 相手では待ちが無限に延びうる。**待ち続けるのは黙って捨てるのと同じ**
+/// なので、ここで必ず人の手へ戻す。
+///
+/// これは配達の予算ではなく**引き渡しの期限**である (予算のほうは
+/// [`GIVE_UP`] が沈黙で測る)。人がモーダルへ答えるまでの時間を十分に
+/// 含める必要があるので、分の単位で取る。
+pub const GIVE_UP_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// 確定キーを撃つ前に「相手が静かになる」のを待つ上限。
+///
+/// **忙しい CLI は確定キーを飲み込む** (実機の Codex)。かといって永久に
+/// 待つと届かないので、ここを過ぎたら撃って `Verify` で確かめる。
+/// `GIVE_UP` より十分短くする — 待ちで予算を使い切ると、撃ち直す機会が
+/// 1 度も来ない。
+pub const COMMIT_IDLE_WAIT: Duration = Duration::from_secs(20);
+
+/// 確定キーを撃ち直す間隔の上限。
+///
+/// 回を追うごとに間隔を広げる (`VERIFY_DELAY * 回数`) が、開きすぎると
+/// 相手が受け取れるようになってから届くまでが遅くなる。
+pub const COMMIT_RETRY_MAX: Duration = Duration::from_secs(3);
 
 /// 送れない状態のときに次を見に行く間隔。
 ///
@@ -167,12 +212,26 @@ fn normalize_ws(s: &str) -> String {
 /// `input` は端末画面から拾った「入力欄に見えている文字列」。取れなかった
 /// (`None`) ときは **残っていない扱い** にする — 見えないものを根拠に
 /// Enter を撃ち直すと、承認プロンプトへ誤爆する危険の方が大きい。
+impl Peek {}
+
 pub fn still_pending(input: Option<&str>, tail: &str) -> bool {
     if tail.is_empty() {
         return false;
     }
     match input {
-        Some(t) => normalize_ws(t).contains(tail),
+        Some(t) => {
+            // **畳まれた貼り付けは「残っている」。**
+            //
+            // 長い本文を貼ると、入力欄に本文ではなく見出しを出す CLI が
+            // ある (`[Pasted Content 2329 chars]`)。本文が消えたように
+            // 見えるので、そのまま読むと**送れていないのに「送信済み」**に
+            // なる。実機で 6 通中 2 通がこれで落ちた
+            // (一覧は `agents::PASTE_PLACEHOLDERS`)。
+            if crate::agents::looks_like_pending_paste(t) {
+                return true;
+            }
+            normalize_ws(t).contains(tail)
+        }
         None => false,
     }
 }
@@ -193,6 +252,12 @@ pub enum Stage {
 /// 相手のいまの様子。呼び出し側が毎フレーム集める。
 #[derive(Debug, Clone, Default)]
 pub struct Peek {
+    /// **この相手はもう入力を受け取れるか。**
+    ///
+    /// 起動直後の数秒は書いても落ちる CLI がある (Claude Code v2)。
+    /// 待つ長さは**カタログが持つ** (`agents::input_ready_ms`) ので、
+    /// ここは真偽だけを受け取る — 送信側に CLI ごとの分岐を作らない。
+    pub input_ready: bool,
     /// PTY が生きているか
     pub running: bool,
     /// 見張りが Idle と判定しているか
@@ -203,6 +268,19 @@ pub struct Peek {
     pub bracketed: bool,
     /// 入力欄に見えている文字列 (拾えなければ None)
     pub input: Option<String>,
+}
+
+/// **この相手はもう入力を受け取れるか** (純関数)。
+///
+/// 起動直後の数秒は書いても落ちる CLI がある。それだけでなく、**起動時
+/// プロンプト (フォルダ信頼確認) に答えた直後**も同じ — CLI は画面を
+/// 作り直すので、その最中に書いた本文は丸ごと捨てられる。実測 (Claude
+/// Code v2): 返事の 71ms 後に貼った 6.6KB の指示が消え、担当は 5 分間
+/// なにも受け取らないまま「作業中」と出ていた。だから時計は 2 本 —
+/// セッション開始からと、最後の自動応答からの**両方**が `ready` を
+/// 越えてから書く。待つ長さは 1 つ (カタログの `input_ready_ms`)。
+pub fn input_ready(age: Duration, since_reply: Option<Duration>, ready: Duration) -> bool {
+    age >= ready && since_reply.is_none_or(|d| d >= ready)
 }
 
 /// 送信 1 通。
@@ -286,26 +364,99 @@ pub enum Act {
     Wait(Duration),
 }
 
+/// **待ってよい理由**。観測できているあいだ、沈黙の時計は進まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holdup {
+    /// 承認・フォルダ信頼確認などで止まっている。答えれば必ず先へ進む
+    Attention,
+    /// まだ起動中で入力を受け取れない (カタログの `input_ready_ms`)
+    Starting,
+    /// 手を動かしていて確定キーを飲み込む段にいる
+    Busy,
+    /// 入力欄に本文が見えている = **まだ届いていないという証拠**。
+    /// 撃ち直しに意味があるので待ってよい
+    Landing,
+}
+
+/// いま「待ってよい理由」が観測できるか (**純粋関数**)。
+///
+/// これが `Some` の間は [`GIVE_UP`] の時計を進めない。**理由が無いまま
+/// 静かなときだけ**諦める — 「何も起きていない時間」で切るのであって、
+/// 「積んでからの総時間」で切るのではない。
+///
+/// 相手ごとの分岐はここに書かない (`input_ready` はカタログが決めた真偽を
+/// 受け取るだけ)。
+pub fn holdup(job: &Job, peek: &Peek) -> Option<Holdup> {
+    if !peek.running {
+        return None;
+    }
+    // 承認待ちと起動中は、どの段でも「送れない理由」がはっきりしている。
+    if peek.attention {
+        return Some(Holdup::Attention);
+    }
+    if !peek.input_ready {
+        return Some(Holdup::Starting);
+    }
+    match job.stage {
+        // 書く前は、上の 2 つ以外に待つ理由が無い (書けるなら書く)。
+        Stage::Ready => None,
+        // 確定キーを飲み込む相手を待っている間 ([`COMMIT_IDLE_WAIT`] が
+        // 段そのものを打ち切るので、ここで無限には延びない)。
+        Stage::Commit => (!peek.idle).then_some(Holdup::Busy),
+        // 入力欄に本文が残っている = 届いていない証拠。撃ち直しの回数上限
+        // ([`MAX_COMMIT_TRIES`]) が別に効くので、ここでも無限には延びない。
+        Stage::Verify => {
+            still_pending(peek.input.as_deref(), &tail_key(&job.text)).then_some(Holdup::Landing)
+        }
+    }
+}
+
+/// 諦めるべきか (**純粋関数**)。
+///
+/// * 理由の無い沈黙が [`GIVE_UP`] 続いた → 諦める
+/// * 理由が観測できていても [`GIVE_UP_MAX`] を超えた → 人へ返す
+fn exhausted(since_quiet: Duration, since_queued: Duration) -> bool {
+    since_quiet >= GIVE_UP || since_queued >= GIVE_UP_MAX
+}
+
 /// 次の一手を決める (**純粋関数**)。
 ///
 /// * `since_stage` — いまの段に入ってからの経過
-/// * `since_queued` — 積まれてからの経過 (待ちの上限判定に使う)
+/// * `since_quiet` — **待ってよい理由 ([`holdup`]) が最後に見えてから**の経過。
+///   諦めの判定はこれで行う (積んでからの総時間ではない)
+/// * `since_queued` — 積まれてからの経過 ([`READY_WAIT`] と、人へ返す
+///   最後の期限 [`GIVE_UP_MAX`] だけに使う)
 ///
 /// 判断順序が意味を持つ:
 /// 1. 生きていなければ何もしない
 /// 2. **承認待ちなら絶対に送らない** (本文が承認への回答になってしまう)
 /// 3. それから段ごとの進行
-pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Duration) -> Act {
+pub fn decide(
+    job: &Job,
+    peek: &Peek,
+    since_stage: Duration,
+    since_quiet: Duration,
+    since_queued: Duration,
+) -> Act {
     if !peek.running {
         return Act::Gone;
     }
     match job.stage {
         Stage::Ready => {
-            if since_queued >= GIVE_UP {
+            if exhausted(since_quiet, since_queued) {
                 return Act::GaveUp;
             }
             // 承認プロンプトで止まっている間は何があっても送らない。
             if peek.attention {
+                return Act::Wait(POLL);
+            }
+            // **まだ受け取れない相手には書かない。**
+            //
+            // 起動直後に書いても画面に 1 文字も出ない CLI がある。書けた
+            // つもりで確定キーまで送ると、配達は「完了」と記録されるのに
+            // 相手には何も届かない (実機の Claude Code)。待つ長さは
+            // カタログが持つ ([`crate::agents::input_ready_ms`])。
+            if !peek.input_ready {
                 return Act::Wait(POLL);
             }
             if !job.wait_idle {
@@ -326,9 +477,75 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             if since_stage < COMMIT_DELAY {
                 return Act::Wait(COMMIT_DELAY - since_stage);
             }
+            // **書けたことを確かめてから確定する。**
+            //
+            // 起動中の CLI は書き込みを丸ごと捨てる。捨てられたことに
+            // 気付かずに確定キーを撃つと、`Verify` は「入力欄に本文が
+            // 残っていない」を見て**届いた**と判断する — 1 バイトも
+            // 送っていないのに配達完了になる。
+            //
+            // 実機 (Test6) の実測: 6 体のうち **Claude Code 2 体は
+            // 指示の痕跡が 0 件**のまま「作業中」と表示され、9 分間
+            // 成果物が 1 つも出来なかった。待ち時間を伸ばしても、
+            // 環境が変われば同じことが起きる — **確かめるほうが正しい。**
+            //
+            // 入力欄に本文が見えないなら、書き直す。見えるようになれば
+            // 下へ進んで確定する。
+            // ── ここにあった「本文が入力欄に見えなければ書き直す」は撤回した ──
+            //
+            // 入れた動機は正しかった (起動中の CLI が書き込みを捨てるのに、
+            // `Verify` は空の入力欄を見て「届いた」と判断していた)。
+            // しかし**入力欄の読み取りを証拠として使えなかった**。
+            //
+            // 一晩の実測で 3 回退行を生み、確認できた利益はゼロだった:
+            //
+            // | 症状 | 実測 |
+            // |---|---|
+            // | 上限が無く同じ本文を書き続けた | Codex へ **806 回** |
+            // | 起動中を「落ちた」と誤認して諦めた | 書き込み 19 件・配り直しの繰り返し |
+            // | 読めない囲みを「落ちた」と誤認した | Codex に**確定キーが 0 回** (本文 9 回) |
+            //
+            // 最後のものは空を証拠から外しても直らなかった。Codex の入力欄は
+            // 空ではなく**こちらの本文でもないもの** (`Ask Codex to do anything` /
+            // `[Pasted …]` の囲み) を返すので、「読めていて別の何かがある」
+            // という*証拠らしきもの*が常に成立してしまう。
+            //
+            // 動機のほうは別の手で満たせている:
+            // * 起動中に書かない → `agents::input_ready_ms` (`Stage::Ready`)
+            // * 承認待ち・処理中に撃たない → `holdup`
+            // * 届いていない証拠で撃ち直す → `Stage::Verify` の `still_pending`
+            //   (畳まれた貼り付けも `agents::PASTE_PLACEHOLDERS` で拾う)
+            //
+            // **同じものを足し直さないこと。** 入力欄の読み取りは CLI ごとに
+            // 意味が違い、「本文が無い」を安全に言えない。番人は
+            // `submit::withdrawn_gate_tests::入力欄の読みを確定の関門にしない`。
+            // **相手が手を動かしている間は撃たない。**
+            //
+            // 忙しい CLI は確定キーを飲み込む。実機の Codex では、本文は
+            // 入力欄に入っているのに Enter が効かず、2 通目以降が毎回
+            // 止まっていた。1 通目が届いていたのは起動直後で待機していた
+            // から — **同じ条件を作ってから撃つ**。
+            //
+            // 待ちっぱなしにはしない。[`COMMIT_IDLE_WAIT`] を過ぎたら
+            // 待たずに撃つ (取りこぼすより、撃って確かめるほうがよい。
+            // 効かなければ `Verify` が入力欄を見て撃ち直す)。
+            if !peek.idle && since_stage < COMMIT_IDLE_WAIT && !peek.attention {
+                return Act::Wait(POLL);
+            }
             // 本文を書いてから確定までの間に承認プロンプトが出たら、
             // Enter は承認への回答になる。撃たずに落ち着くのを待つ。
             if peek.attention {
+                // **待ち続けない。** ここには上限が無かったので、承認待ちが
+                // 続く相手では**本文を入力欄に置いたまま永久に止まって**いた
+                // (実機: 指示が入力欄に見えているのに何分経っても送られない)。
+                // 送ってしまうと承認への回答になるので、送らずに**人へ返す**。
+                //
+                // ただし**承認待ちは「観測できる理由」**なので、[`GIVE_UP`]
+                // ではなく [`GIVE_UP_MAX`] が期限になる (人がモーダルへ
+                // 答えるまでの時間を、こちらの都合で打ち切らない)。
+                if exhausted(since_quiet, since_queued) {
+                    return Act::GaveUp;
+                }
                 return Act::Wait(POLL);
             }
             Act::WriteCommit
@@ -337,19 +554,36 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
             if since_stage < VERIFY_DELAY {
                 return Act::Wait(VERIFY_DELAY - since_stage);
             }
-            if job.tries >= MAX_COMMIT_TRIES {
+            let stuck = still_pending(peek.input.as_deref(), &tail_key(&job.text));
+            // **残っている限り撃ち直す。上限は回数ではなく時間で決める。**
+            //
+            // 回数で切ると、起動に手間取る相手 (MCP を立ち上げている Codex 等)
+            // では**3 回とも起動中に当たって終わる**。実機で、同じ Codex でも
+            // 起動が速かった側は動き出し、`⚠ MCP startup incomplete` が出て
+            // いた側は本文を入力欄に抱えたまま止まっていた。
+            //
+            // 入力欄に本文が見えている = まだ届いていない、という**証拠**が
+            // あるので、撃ち直しても二重送信にはならない (届けば消える)。
+            if !stuck {
                 return Act::Done;
             }
-            // 撃ち直しは「承認プロンプトが出ていない」かつ
-            // 「入力欄に本文がまだ見えている」ときだけ。
+            if exhausted(since_quiet, since_queued) || job.tries >= MAX_COMMIT_TRIES {
+                // **届かなかったことを黙って完了にしない。** 呼び出し元が
+                // 撃ち直せるよう、失敗として返す。
+                return Act::GaveUp;
+            }
+            // 撃ち直しは「承認プロンプトが出ていない」ときだけ
+            // (出ていれば Enter は承認への回答になる)。
             if peek.attention {
-                return Act::Done;
+                return Act::Wait(POLL);
             }
-            if still_pending(peek.input.as_deref(), &tail_key(&job.text)) {
-                Act::WriteCommit
-            } else {
-                Act::Done
+            // **間隔は少しずつ広げる。** 起動中の相手へ 450ms ごとに撃ち続けても
+            // 意味が無いので、回を追うごとに待つ (上限 [`COMMIT_RETRY_MAX`])。
+            let wait = (VERIFY_DELAY * (1 + u32::from(job.tries))).min(COMMIT_RETRY_MAX);
+            if since_stage < wait {
+                return Act::Wait(wait - since_stage);
             }
+            Act::WriteCommit
         }
     }
 }
@@ -360,10 +594,13 @@ pub fn decide(job: &Job, peek: &Peek, since_stage: Duration, since_queued: Durat
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub job: Job,
-    /// 積まれた時刻 (待ちの上限判定に使う)
+    /// 積まれた時刻 (人へ返す最後の期限 [`GIVE_UP_MAX`] に使う)
     queued: Instant,
     /// いまの段に入った時刻
     stage_at: Instant,
+    /// **待ってよい理由 ([`holdup`]) が最後に見えた時刻**、または段が
+    /// 進んだ時刻。諦めの判定はここからの経過で行う。
+    quiet_at: Instant,
 }
 
 impl Pending {
@@ -372,21 +609,37 @@ impl Pending {
             job,
             queued: now,
             stage_at: now,
+            quiet_at: now,
         }
     }
 
     /// 次の一手を尋ねる。
-    pub fn act(&self, peek: &Peek, now: Instant) -> Act {
+    ///
+    /// **理由が見えていれば沈黙の時計を打ち直す** — ここが「進捗が
+    /// 観測できる限り待ちを延ばす」の実体で、[`decide`] は純粋なまま
+    /// 保たれる (時計の管理はこちらの仕事)。
+    pub fn act(&mut self, peek: &Peek, now: Instant) -> Act {
+        if holdup(&self.job, peek).is_some() {
+            self.quiet_at = now;
+        }
         decide(
             &self.job,
             peek,
             now.saturating_duration_since(self.stage_at),
+            now.saturating_duration_since(self.quiet_at),
             now.saturating_duration_since(self.queued),
         )
     }
 
     /// 段を進める (経過時間の起点も一緒に打ち直す)。
+    ///
+    /// **同じ段への打ち直し (書き直し) では沈黙の時計を戻さない。**
+    /// 戻すと、証拠が 1 つも無いまま本文を書き続ける輪が
+    /// [`GIVE_UP`] で止まらなくなる (止まるのは [`GIVE_UP_MAX`] だけになる)。
     pub fn advance(&mut self, stage: Stage, now: Instant) {
+        if self.job.stage != stage {
+            self.quiet_at = now;
+        }
         self.job.stage = stage;
         self.stage_at = now;
     }
@@ -398,12 +651,51 @@ mod tests {
 
     fn peek_ready() -> Peek {
         Peek {
+            input_ready: true,
             running: true,
             idle: true,
             attention: false,
             bracketed: true,
             input: None,
         }
+    }
+
+    /// **待ってよい理由が 1 つも無いまま** `since` だけ経った、と読む。
+    ///
+    /// [`holdup`] が `None` の状況では沈黙の時計と総経過が一致するので、
+    /// この形が `Pending::act` の実際の呼び方と同じになる。理由がある
+    /// 状況 (承認待ち・起動中・入力欄に残留) は、時計が別々に進むので
+    /// [`decide`] を直接呼んで書き分ける。
+    fn decide_quiet(job: &Job, peek: &Peek, since_stage: Duration, since: Duration) -> Act {
+        decide(job, peek, since_stage, since, since)
+    }
+
+    /// **自動応答の直後は、セッションが古くても「まだ」。**
+    #[test]
+    fn 自動応答の直後は受け取れない() {
+        let ready = Duration::from_millis(3_000);
+        // 起動直後 = まだ。
+        assert!(!input_ready(Duration::from_millis(500), None, ready));
+        // 起動から十分 = 受け取れる。
+        assert!(input_ready(Duration::from_secs(10), None, ready));
+        // 起動から十分でも、信頼確認に答えた 71ms 後 = まだ (実測の穴)。
+        assert!(!input_ready(
+            Duration::from_secs(10),
+            Some(Duration::from_millis(71)),
+            ready
+        ));
+        // 答えてから十分 = 受け取れる。
+        assert!(input_ready(
+            Duration::from_secs(10),
+            Some(Duration::from_secs(4)),
+            ready
+        ));
+        // 待ち時間を持たない CLI (ready = 0) はいつでも受け取れる。
+        assert!(input_ready(
+            Duration::ZERO,
+            Some(Duration::ZERO),
+            Duration::ZERO
+        ));
     }
 
     #[test]
@@ -464,7 +756,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    decide(&job, &peek, Duration::from_secs(5), Duration::from_secs(5)),
+                    decide_quiet(&job, &peek, Duration::from_secs(5), Duration::from_secs(5)),
                     Act::Wait(_)
                 ),
                 "stage={stage:?} で送ろうとした"
@@ -481,7 +773,7 @@ mod tests {
         };
         let job = Job::user(1, "やって");
         assert_eq!(
-            decide(&job, &peek, Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek, Duration::ZERO, Duration::ZERO),
             Act::WriteBody
         );
     }
@@ -495,11 +787,11 @@ mod tests {
         };
         let job = Job::deferred(1, "やって", true);
         assert!(matches!(
-            decide(&job, &peek, Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek, Duration::ZERO, Duration::ZERO),
             Act::Wait(_)
         ));
         assert_eq!(
-            decide(&job, &peek, Duration::ZERO, READY_WAIT),
+            decide_quiet(&job, &peek, Duration::ZERO, READY_WAIT),
             Act::WriteBody
         );
     }
@@ -511,11 +803,11 @@ mod tests {
             ..Job::user(1, "やって")
         };
         assert!(matches!(
-            decide(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
             Act::Wait(_)
         ));
         assert_eq!(
-            decide(&job, &peek_ready(), COMMIT_DELAY, COMMIT_DELAY),
+            decide_quiet(&job, &peek_ready(), COMMIT_DELAY, COMMIT_DELAY),
             Act::WriteCommit
         );
     }
@@ -527,7 +819,7 @@ mod tests {
             ..Job::deferred(1, "やって", false)
         };
         assert_eq!(
-            decide(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::ZERO),
             Act::Done
         );
     }
@@ -545,10 +837,16 @@ mod tests {
             tries: 1,
             ..Job::user(1, text)
         };
+        // 間隔は回を追うごとに広がるので、その待ちを過ぎてから撃つ。
         assert_eq!(
-            decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY),
+            decide_quiet(&job, &peek, COMMIT_RETRY_MAX, VERIFY_DELAY),
             Act::WriteCommit
         );
+        // 待ちの途中では撃たない (起動中の相手へ連打しない)。
+        assert!(matches!(
+            decide_quiet(&job, &peek, Duration::ZERO, VERIFY_DELAY),
+            Act::Wait(_)
+        ));
     }
 
     #[test]
@@ -562,7 +860,10 @@ mod tests {
             tries: 1,
             ..Job::user(1, "やって")
         };
-        assert_eq!(decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+        assert_eq!(
+            decide_quiet(&job, &peek, VERIFY_DELAY, VERIFY_DELAY),
+            Act::Done
+        );
     }
 
     /// 撃ち直しは上限で必ず止まる (勝手に承認し続けない)。
@@ -573,12 +874,107 @@ mod tests {
             input: Some(text.into()),
             ..peek_ready()
         };
+        // まだ余力のある回数 (上限より手前)。
         let job = Job {
             stage: Stage::Verify,
-            tries: MAX_COMMIT_TRIES,
+            tries: 1,
             ..Job::user(1, text)
         };
-        assert_eq!(decide(&job, &peek, VERIFY_DELAY, VERIFY_DELAY), Act::Done);
+        // **止めるのは回数ではなく時間。**
+        //
+        // 回数で切ると、起動に手間取る相手 (MCP を立ち上げている Codex 等)
+        // では 3 回とも起動中に当たって終わる。入力欄に本文が見えている =
+        // まだ届いていない、という**証拠**があるうちは撃ち直す。
+        assert_eq!(
+            decide_quiet(&job, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            Act::WriteCommit,
+            "証拠があるのに撃ち直しをやめている"
+        );
+        // **入力欄に残っているのは「待ってよい理由」** ([`Holdup::Landing`])
+        // なので、沈黙の時計は進まない — `GIVE_UP` では諦めない。
+        assert_eq!(holdup(&job, &peek), Some(Holdup::Landing));
+        assert_eq!(
+            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::ZERO, GIVE_UP),
+            Act::WriteCommit,
+            "証拠があるのに積んでからの総時間で諦めている"
+        );
+        // 最後の期限を過ぎたら**人へ返す** (黙って完了にしない)。
+        assert_eq!(
+            decide(&job, &peek, COMMIT_RETRY_MAX, Duration::ZERO, GIVE_UP_MAX),
+            Act::GaveUp
+        );
+        // 回数の上限でも止まる (**承認プロンプトへ撃ち続けないための最後の砦**)。
+        let spent = Job {
+            tries: MAX_COMMIT_TRIES,
+            ..job.clone()
+        };
+        assert_eq!(
+            decide_quiet(&spent, &peek, COMMIT_RETRY_MAX, Duration::from_secs(5)),
+            Act::GaveUp,
+            "回数の上限を超えて撃ち続けている"
+        );
+        // 入力欄から消えていれば、届いたので完了でよい。
+        let sent = Peek {
+            input: Some(String::new()),
+            ..peek_ready()
+        };
+        assert_eq!(
+            decide_quiet(&job, &sent, VERIFY_DELAY, VERIFY_DELAY),
+            Act::Done
+        );
+    }
+
+    /// **承認待ちのまま止まり続けない。**
+    ///
+    /// 本文を書いたあと確定キーを送る段には上限が無く、承認プロンプトが
+    /// 出ている相手では**入力欄に本文を置いたまま永久に待って**いた
+    /// (実機: 指示が見えているのに何分経っても送られない)。
+    /// 送ってしまうと承認への回答になるので、送らずに人へ返す。
+    #[test]
+    fn 承認待ちで止まったままにしない() {
+        let text = "やってください";
+        let peek = Peek {
+            attention: true,
+            input: Some(text.into()),
+            ..peek_ready()
+        };
+        for stage in [Stage::Commit, Stage::Verify] {
+            let job = Job {
+                stage,
+                ..Job::user(1, text)
+            };
+            // **承認待ちは「観測できる理由」**なので、沈黙の時計は進まない。
+            assert_eq!(holdup(&job, &peek), Some(Holdup::Attention));
+            // 待つ (承認が終われば送れるので、すぐ諦めない)。
+            assert!(
+                matches!(
+                    decide(
+                        &job,
+                        &peek,
+                        VERIFY_DELAY,
+                        Duration::ZERO,
+                        Duration::from_secs(1)
+                    ),
+                    Act::Wait(_)
+                ),
+                "stage={stage:?}: すぐ諦めている"
+            );
+            // **積んでから 120 秒経ったというだけでは諦めない** (相手は
+            // モーダルに答えれば受け取れる。ここで捨てると 1 文字も届かない)。
+            assert!(
+                matches!(
+                    decide(&job, &peek, VERIFY_DELAY, Duration::ZERO, GIVE_UP),
+                    Act::Wait(_)
+                ),
+                "stage={stage:?}: 理由が見えているのに総時間で諦めた"
+            );
+            // 最後の期限を超えたら**人へ返す** (黙って待ち続けない)。
+            assert_eq!(
+                decide(&job, &peek, VERIFY_DELAY, Duration::ZERO, GIVE_UP_MAX),
+                Act::GaveUp,
+                "stage={stage:?}: 承認待ちのまま止まり続けている"
+            );
+        }
     }
 
     /// 入力欄が読めないときは撃ち直さない (誤爆より取りこぼしを選ぶ)。
@@ -590,7 +986,7 @@ mod tests {
             ..Job::user(1, "やって")
         };
         assert_eq!(
-            decide(&job, &peek_ready(), VERIFY_DELAY, VERIFY_DELAY),
+            decide_quiet(&job, &peek_ready(), VERIFY_DELAY, VERIFY_DELAY),
             Act::Done
         );
     }
@@ -602,7 +998,7 @@ mod tests {
             ..peek_ready()
         };
         assert_eq!(
-            decide(
+            decide_quiet(
                 &Job::user(1, "やって"),
                 &peek,
                 Duration::ZERO,
@@ -619,7 +1015,10 @@ mod tests {
             ..peek_ready()
         };
         let job = Job::deferred(1, "やって", true);
-        assert_eq!(decide(&job, &peek, Duration::ZERO, GIVE_UP), Act::GaveUp);
+        assert_eq!(
+            decide_quiet(&job, &peek, Duration::ZERO, GIVE_UP),
+            Act::GaveUp
+        );
     }
 
     #[test]
@@ -633,5 +1032,357 @@ mod tests {
     #[test]
     fn 空の本文は残留判定に使わない() {
         assert!(!still_pending(Some("なんでも"), ""));
+    }
+    /// **忙しい相手には確定キーを撃たない。**
+    ///
+    /// 実機の Codex は、手を動かしている最中の Enter を飲み込む。本文は
+    /// 入力欄に入っているのに送信されず、2 通目以降が毎回止まっていた
+    /// (1 通目だけ届いていたのは、起動直後で相手が待機していたから)。
+    /// **1 通目と同じ条件を毎回作ってから撃つ。**
+    #[test]
+    fn 忙しい相手には確定キーを撃たない() {
+        let text = "やってください";
+        let busy = Peek {
+            idle: false,
+            input: Some(text.into()),
+            ..peek_ready()
+        };
+        let job = Job {
+            stage: Stage::Commit,
+            ..Job::deferred(1, text, true)
+        };
+        // 手が動いている間は待つ。
+        assert!(
+            matches!(
+                decide_quiet(&job, &busy, COMMIT_DELAY, Duration::from_secs(1)),
+                Act::Wait(_)
+            ),
+            "忙しい相手へ撃っている"
+        );
+        // **待ちっぱなしにはしない。** 上限を過ぎたら撃って、効いたかを確かめる。
+        assert_eq!(
+            decide_quiet(&job, &busy, COMMIT_IDLE_WAIT, Duration::from_secs(30)),
+            Act::WriteCommit,
+            "静かにならない相手へ永久に届かない"
+        );
+        // 静かなら待たずに撃つ (1 通目と同じ道)。
+        let quiet = Peek {
+            idle: true,
+            ..busy.clone()
+        };
+        assert_eq!(
+            decide_quiet(&job, &quiet, COMMIT_DELAY, Duration::from_secs(1)),
+            Act::WriteCommit
+        );
+    }
+
+    /// **起動直後の相手には書かない。**
+    ///
+    /// 実機で Claude Code は起動から数秒、stdin へ書いても画面に 1 文字も
+    /// 出なかった。Zaivern は書けたつもりで確定キーまで送り、配達を「完了」と
+    /// 記録するのに、相手には何も届かない (Antigravity のログには指示が
+    /// 144 件現れるのに、Claude Code のログは起動表示だけの 6KB で 0 件だった)。
+    #[test]
+    fn 受け取れない相手には書かない() {
+        let job = Job::user(1, "やって");
+        let not_yet = Peek {
+            input_ready: false,
+            ..peek_ready()
+        };
+        assert!(
+            matches!(
+                decide_quiet(&job, &not_yet, Duration::ZERO, Duration::from_secs(1)),
+                Act::Wait(_)
+            ),
+            "受け取れない相手へ書いている"
+        );
+        // 受け取れるようになったら書く。
+        assert_eq!(
+            decide_quiet(&job, &peek_ready(), Duration::ZERO, Duration::from_secs(1)),
+            Act::WriteBody
+        );
+        // **起動中は「観測できる理由」**なので、120 秒では諦めない
+        // (起動に手間取る相手を、こちらの都合で締め出さない)。
+        assert_eq!(holdup(&job, &not_yet), Some(Holdup::Starting));
+        assert!(
+            matches!(
+                decide(&job, &not_yet, Duration::ZERO, Duration::ZERO, GIVE_UP),
+                Act::Wait(_)
+            ),
+            "起動中と分かっているのに総時間で諦めた"
+        );
+        // **待ちっぱなしにはしない。** 最後の期限を過ぎたら人へ返す。
+        assert_eq!(
+            decide(&job, &not_yet, Duration::ZERO, Duration::ZERO, GIVE_UP_MAX),
+            Act::GaveUp
+        );
+    }
+}
+
+#[cfg(test)]
+mod paste_placeholder_tests {
+    use super::*;
+
+    /// **畳まれた貼り付けを「届いた」と読まない。**
+    ///
+    /// 実機の画面そのもの。Codex は長い本文を
+    /// `[Pasted Content 2329 chars]` に畳んで見せるので、本文の末尾を
+    /// 探す確認は必ず外れる。外れると `Act::Done` = 送信済みとして
+    /// 記録され、**1 文字も届いていない担当が「作業中」と表示される**。
+    /// 実機で 6 通中 2 通がこの形で消えた。
+    #[test]
+    fn 畳まれた貼り付けはまだ届いていない() {
+        let tail = "最後まで終わらせて報告してください";
+        for shown in [
+            "[Pasted Content 2329 chars]",
+            "[Pasted Content 2306 chars]",
+            "[Pasted text #3 +103 lines]",
+            "> [pasted content 12 chars]",
+        ] {
+            assert!(
+                still_pending(Some(shown), tail),
+                "畳まれた貼り付けを届いたと読んだ: {shown}"
+            );
+        }
+    }
+
+    /// **本当に消えていれば届いている。** 畳みの検出で、正常な送信を
+    /// 「まだ残っている」と読み替えてはいけない (撃ち直しが止まらなくなる)。
+    #[test]
+    fn 入力欄が空なら届いている() {
+        let tail = "最後まで終わらせて報告してください";
+        assert!(!still_pending(Some(""), tail));
+        assert!(!still_pending(Some("❯ "), tail));
+        assert!(!still_pending(None, tail));
+        // 人が別のことを打っていても、こちらの本文ではない。
+        assert!(!still_pending(Some("git status を見せて"), tail));
+    }
+
+    /// **本文がそのまま見えている場合は、これまでどおり残っている扱い。**
+    #[test]
+    fn 本文が見えていれば残っている() {
+        let tail = "最後まで終わらせて報告してください";
+        assert!(still_pending(
+            Some("… 最後まで終わらせて報告してください"),
+            tail
+        ));
+    }
+
+    /// **畳みの見出しはカタログ 1 か所で持つ。**
+    /// 送信側に CLI ごとの分岐を作らない (増えるたびに 2 か所直すことになる)。
+    #[test]
+    fn 畳みの見出しはカタログが持つ() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let body = src
+            .split("pub fn still_pending")
+            .nth(1)
+            .and_then(|t| t.split("\n}\n").next())
+            .expect("still_pending がある");
+        assert!(
+            body.contains("agents::looks_like_pending_paste"),
+            "畳みの判定を送信側に書いている"
+        );
+        // **送信側に CLI ごとの分岐を作らない**ことは
+        // `agents::tests::エージェントごとの癖はカタログにだけ置く` が
+        // リポジトリ全体で見張っている (ここで二重に持たない)。
+    }
+}
+
+#[cfg(test)]
+mod startup_modal_tests {
+    use super::*;
+
+    /// 実機の画面そのもの。起動直後に出るフォルダ信頼確認は、答えるまで
+    /// `attention` を立てたまま入力欄を塞ぐ。
+    fn modal_up() -> Peek {
+        Peek {
+            running: true,
+            // 起動したばかりなので、まだ受け取れない
+            input_ready: false,
+            idle: false,
+            // フォルダ信頼確認 (Yes, I trust this folder / No, exit)
+            attention: true,
+            bracketed: true,
+            input: None,
+        }
+    }
+
+    /// 確認に答え終わって、普通のプロンプトへ戻った状態。
+    fn answered() -> Peek {
+        Peek {
+            running: true,
+            input_ready: true,
+            idle: true,
+            attention: false,
+            bracketed: true,
+            input: None,
+        }
+    }
+
+    /// **起動時のモーダルで諦めない。**
+    ///
+    /// 実機 (Antigravity の担当 2 体): 端末の生ログが 3.5KB (起動表示のみ)
+    /// のまま 1 バイトも増えず、指示が 1 文字も届かないまま 28 分放置された。
+    /// 原因は諦めの予算が**積んでからの総時間 120 秒固定**だったこと —
+    /// モーダルが開いている間は書けないので、**書く前に予算を使い切る**。
+    ///
+    /// 時刻は論理時刻 (実時間を待たない)。`Instant` は起点にするだけで、
+    /// 進めるのは足し算。
+    #[test]
+    fn 起動時のモーダルで諦めない() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(Job::user(1, "実装して報告してください"), t0);
+        let modal = modal_up();
+
+        // モーダルが開いたまま、旧の予算 (120 秒) の 2 倍を過ぎるまで進める。
+        let mut t = t0;
+        let step = POLL;
+        while t.saturating_duration_since(t0) < GIVE_UP * 2 {
+            t += step;
+            let act = p.act(&modal, t);
+            assert!(
+                matches!(act, Act::Wait(_)),
+                "モーダルが開いている間に {act:?} を返した ({:?} 時点)",
+                t.saturating_duration_since(t0)
+            );
+        }
+
+        // 人がモーダルへ答えた。**ここで初めて書ける** — 旧の実装では
+        // すでに `GaveUp` 済みで、この一手が永久に来なかった。
+        let act = p.act(&answered(), t);
+        assert_eq!(
+            act,
+            Act::WriteBody,
+            "確認が終わったのに本文を書かない (諦めたまま)"
+        );
+    }
+
+    /// **理由が見えない沈黙は、これまでどおり [`GIVE_UP`] で切る。**
+    /// 「待ちを延ばす」が「永久に待つ」にならないことの裏取り。
+    #[test]
+    fn 理由の無い沈黙はこれまでどおり諦める() {
+        let t0 = Instant::now();
+        // 受け取れる・承認待ちでもない。それでも進まない相手 (Idle にならない
+        // 自動配達) は、待ってよい理由が 1 つも無い。
+        let quiet = Peek {
+            idle: false,
+            ..answered()
+        };
+        let mut p = Pending::new(Job::deferred(1, "実装して報告してください", true), t0);
+        assert!(holdup(&p.job, &quiet).is_none());
+        assert!(matches!(p.act(&quiet, t0 + POLL), Act::Wait(_)));
+        assert_eq!(p.act(&quiet, t0 + GIVE_UP), Act::GaveUp);
+    }
+
+    /// **理由が見えていても、人へ返す道は残す。**
+    /// モーダルが永久に閉じない相手を、黙って抱え続けない。
+    #[test]
+    fn 閉じないモーダルは最後に人へ返す() {
+        let t0 = Instant::now();
+        let mut p = Pending::new(Job::user(1, "実装して報告してください"), t0);
+        let modal = modal_up();
+        // 途中は延び続ける。
+        assert!(matches!(p.act(&modal, t0 + GIVE_UP * 3), Act::Wait(_)));
+        // 最後の期限で必ず返る。
+        assert_eq!(p.act(&modal, t0 + GIVE_UP_MAX), Act::GaveUp);
+    }
+
+    /// **証拠の無い書き直しは、沈黙の時計を巻き戻さない。**
+    ///
+    /// 同じ段への打ち直し (`Commit` → `Commit`) で時計を戻すと、入力欄に
+    /// 何も現れないまま本文を書き続ける輪が [`GIVE_UP`] で止まらなくなる。
+    #[test]
+    fn 同じ段への書き直しでは沈黙の時計を戻さない() {
+        let t0 = Instant::now();
+        let text = "実装してください。最後まで終わらせて報告してください";
+        let mut p = Pending::new(Job::user(1, text), t0);
+        // 書けた (Ready → Commit)。ここでは時計が進む。
+        p.advance(Stage::Commit, t0);
+        // **同じ段へ進めても沈黙の時計は戻らない。**
+        //
+        // 戻すと、同じ段で何かを繰り返す限り永久に諦められなくなる。
+        // (確定キーの手前で入力欄を読む関門は撤回した —
+        //  実機で 3 回退行を生み、利益はゼロだった。`withdrawn_gate_tests`)
+        let quiet = Peek {
+            idle: true,
+            ..answered()
+        };
+        let before = p.quiet_at;
+        p.advance(Stage::Commit, t0 + COMMIT_DELAY);
+        assert_eq!(p.quiet_at, before, "同じ段への前進で時計が戻った");
+        // 段が変われば戻る (そこは進捗なので)。
+        p.advance(Stage::Verify, t0 + COMMIT_DELAY);
+        assert_ne!(p.quiet_at, before, "段が変わっても時計が戻らない");
+        // 入力欄に本文が残ったまま (= 届いていない) なら、最後の期限で人へ返る。
+        let landing = Peek {
+            input: Some(p.job.text.clone()),
+            idle: true,
+            ..answered()
+        };
+        assert_eq!(p.act(&landing, t0 + GIVE_UP_MAX), Act::GaveUp);
+        // 消えていれば届いたので完了 (撤回で失敗検出を殺していない)。
+        assert_eq!(p.act(&quiet, t0 + GIVE_UP_MAX), Act::Done);
+    }
+}
+
+#[cfg(test)]
+mod withdrawn_gate_tests {
+    /// **入力欄の読みを、確定キーの関門にしない。**
+    ///
+    /// 一晩の実測で 3 回退行を生み、確認できた利益はゼロだった:
+    ///
+    /// | 症状 | 実測 |
+    /// |---|---|
+    /// | 上限が無く同じ本文を書き続けた | Codex へ **806 回** |
+    /// | 起動中を「落ちた」と誤認して諦めた | 書き込み 19 件・配り直しの繰り返し |
+    /// | 読めない囲みを「落ちた」と誤認した | Codex に**確定キーが 0 回** (本文 9 回) |
+    ///
+    /// 入力欄の読み取りは CLI ごとに意味が違う。Codex は空ではなく
+    /// **こちらの本文でもないもの** (`Ask Codex to do anything` の囲み) を
+    /// 返すので、「読めていて別の何かがある」という*証拠らしきもの*が
+    /// 常に成立してしまい、確定へ一度も進まなかった。
+    ///
+    /// 動機のほうは別の手で満たしてある:
+    /// * 起動中に書かない → `agents::input_ready_ms` (`Stage::Ready`)
+    /// * 承認待ち・処理中に撃たない → `holdup`
+    /// * 届いていない証拠で撃ち直す → `Stage::Verify` の `still_pending`
+    ///
+    /// 同じ案が再提案されるのを防ぐため、**撤回した事実を番人で残す**
+    /// (CLAUDE.md「試して駄目だった案は消さずに残すこと」)。
+    #[test]
+    fn 入力欄の読みを確定の関門にしない() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let body = src
+            .split("        Stage::Commit => {")
+            .nth(1)
+            .and_then(|t| t.split("\n        Stage::Verify => {").next())
+            .expect("Commit の腕がある");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("input_seen") && !code.contains("still_pending"),
+            "確定の手前で入力欄を読んでいる (撤回した関門が戻っている)"
+        );
+        // 撤回の経緯そのものが消えていないこと (消えると再提案される)。
+        assert!(body.contains("撤回した"), "撤回の理由が消えている");
+    }
+
+    /// **`Verify` 側の判定は残っている。** 撤回で「届いていない証拠が
+    /// あっても撃ち直さない」まで戻してはいけない。
+    #[test]
+    fn 届いていない証拠での撃ち直しは残す() {
+        let src = include_str!("submit.rs").replace("\r\n", "\n");
+        let verify = src
+            .split("        Stage::Verify => {")
+            .nth(1)
+            .and_then(|t| t.split("\n    }\n}").next())
+            .expect("Verify の腕がある");
+        assert!(
+            verify.contains("still_pending"),
+            "入力欄に残っているかを見ていない"
+        );
     }
 }

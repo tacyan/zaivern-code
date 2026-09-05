@@ -1,5 +1,27 @@
 use super::*;
 
+const COORDINATOR_DELIVERY_TAG: &str = "coordinator:";
+
+fn coordinator_delivery_tag(session: u64, msg_id: u64) -> String {
+    format!("{COORDINATOR_DELIVERY_TAG}{session}:{msg_id}")
+}
+
+fn parse_coordinator_delivery_tag(tag: &str) -> Option<(u64, u64)> {
+    let mut parts = tag.strip_prefix(COORDINATOR_DELIVERY_TAG)?.split(':');
+    let session_text = parts.next()?;
+    let msg_id_text = parts.next()?;
+    if session_text.is_empty()
+        || msg_id_text.is_empty()
+        || !session_text.bytes().all(|b| b.is_ascii_digit())
+        || !msg_id_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let session = session_text.parse().ok()?;
+    let msg_id = msg_id_text.parse().ok()?;
+    parts.next().is_none().then_some((session, msg_id))
+}
+
 impl ZaivernApp {
     // ─── 監視・連携 (supervisor / coordinator / 端末フック) ──────────
 
@@ -118,6 +140,152 @@ impl ZaivernApp {
         }
     }
 
+    /// **エージェント同士の伝言を拾って、相手のタブへ届ける。**
+    ///
+    /// Team Run の中では前から動いていた仕組みを、普通に並べているタブへも
+    /// 広げたもの。読み取りも配達も**同じ部品**を使う (第 2 の経路を作らない):
+    /// 取り出しは `result_parser`、配達は `submit`。
+    ///
+    /// **同じ塊を二度配らない。** 画面は同じ伝言を何度も映すので、
+    /// submit の実配送 ACK が成功したものだけを配り済みとして覚える。
+    /// キュー拒否時は配り済みにせず、30 秒スロットごとに再試行する。
+    ///
+    /// 配った伝言と断った理由の**両方**がここを通る。片方だけ通すと、
+    /// 断りばかり出る画面で覚え書きが際限なく伸びる。
+    fn talk_once(&mut self, key: u64) -> bool {
+        if !self.talk_seen.insert(key) {
+            return false;
+        }
+        self.talk_order.push_back(key);
+        while self.talk_order.len() > crate::app::TALK_SEEN_CAP {
+            if let Some(old) = self.talk_order.pop_front() {
+                self.talk_seen.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// 配送中の一時札を外す。古い並びも同時に外さないと、
+    /// 同じキーを再試行した後に古い順番が新しい札を消してしまう。
+    fn talk_forget(&mut self, key: u64) {
+        self.talk_seen.remove(&key);
+        self.talk_order.retain(|queued| *queued != key);
+    }
+
+    fn deliver_agent_talk(&mut self) {
+        use crate::agent_talk::{deliveries, Peer};
+        let peers: Vec<Peer> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| Peer {
+                id: s.id,
+                name: s.title.clone(),
+            })
+            .collect();
+        if peers.len() < 2 {
+            return; // 相手が居なければ何もしない
+        }
+        // **画面の読み取りを先に済ませてから配る。** 読みながら配ると
+        // `self` を同時に借りることになる (借用検査で落ちる)。
+        let mut read: Vec<(
+            u64,
+            Vec<crate::agent_talk::Delivery>,
+            Vec<crate::agent_talk::TalkReject>,
+        )> = Vec::new();
+        for s in self.agents.sessions.iter() {
+            if !s.running() {
+                continue;
+            }
+            let screen = s
+                .screen_tail_lines(crate::app::TALK_SCAN_ROWS, crate::app::TALK_SCAN_COLS)
+                .join("\n");
+            if !screen.contains(crate::features::team::imp::result_parser::MSG_OPEN) {
+                continue;
+            }
+            let (deliveries, rejected) =
+                deliveries(&screen, s.id, &peers, s.last_prompt.as_deref());
+            read.push((s.id, deliveries, rejected));
+        }
+        let retry_slot = crate::agent_talk::retry_slot(std::time::SystemTime::now());
+        let mut jobs: Vec<crate::agent_talk::Delivery> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for (from, out, bad) in read {
+            for d in out {
+                let delivered_key = d.delivered_key();
+                if !self.talk_seen.contains(&delivered_key)
+                    && !self.talk_seen.contains(&d.in_flight_key())
+                    && self.talk_once(d.attempt_key(retry_slot))
+                {
+                    jobs.push(d);
+                }
+            }
+            for e in bad {
+                if self.talk_once(crate::agent_talk::rejection_key(from, &e)) {
+                    refused.push(e.detail());
+                }
+            }
+        }
+        for d in jobs {
+            let in_flight_key = d.in_flight_key();
+            let failure_notice_key = d.queue_failure_notice_key();
+            let delivery_tag = d.delivery_tag();
+            let mut job = crate::submit::Job::user(d.to, d.text);
+            job.wait_idle = true; // 相手の作業を割らない
+            job.tag = Some(delivery_tag);
+            if self.queue_submit(job) {
+                // ここではまだ「配達中」。submit::Act::Done の outcome だけが
+                // note_submit_delivery で配り済みを立てる。
+                self.talk_once(in_flight_key);
+            } else if self.talk_once(failure_notice_key) {
+                self.toast_warn(format!(
+                    "🗣 session:{} への伝言を配達待ちに積めませんでした。{} 秒後に再試行します",
+                    d.to,
+                    crate::agent_talk::QUEUE_RETRY_BACKOFF.as_secs()
+                ));
+            }
+        }
+        for why in refused {
+            self.toast(why, false);
+        }
+    }
+
+    /// **いま選んでいるエージェントへ、伝言の作法を教える。**
+    ///
+    /// 通常タブには Team のような指示文が無いので、教えなければ
+    /// エージェントは一生この仕組みを使わない。送るのは人が押したときだけ。
+    pub(crate) fn teach_agent_talk(&mut self) {
+        use crate::agent_talk::Peer;
+        let peers: Vec<Peer> = self
+            .agents
+            .sessions
+            .iter()
+            .filter(|s| s.running())
+            .map(|s| Peer {
+                id: s.id,
+                name: s.title.clone(),
+            })
+            .collect();
+        let Some(me) = self.agents.sessions.get(self.agents.active).map(|s| s.id) else {
+            self.toast(tr("エージェントが選ばれていません"), false);
+            return;
+        };
+        if peers.len() < 2 {
+            self.toast(
+                tr("伝言の相手が居ません (エージェントを 2 つ以上開いてください)"),
+                false,
+            );
+            return;
+        }
+        let text = crate::agent_talk::how_to(&peers, me);
+        let mut job = crate::submit::Job::user(me, text);
+        job.wait_idle = true;
+        if self.queue_submit(job) {
+            self.toast(tr("🗣 伝言の使い方を送りました"), true);
+        }
+    }
+
     /// セッションの増減を supervisor / coordinator へ反映する。
     ///
     /// 起動・削除・再起動 (再起動は ID が変わる) をここ 1 か所で拾うので、
@@ -204,6 +372,10 @@ impl ZaivernApp {
                 self.typed_sup.insert(s.id, true);
             }
         }
+
+        // **エージェント同士の伝言を配る。** 見張りが切られていても回す —
+        // 伝言は見張りの機能ではなく、エージェント同士の通信路なので。
+        self.deliver_agent_talk();
 
         if !self.cfg.supervisor.enabled {
             return;
@@ -340,12 +512,15 @@ impl ZaivernApp {
             })
             .collect();
 
-        // 2) 注入して安全なセッションへ 1 通ずつ配達する。
-        let mut delivered_to: Vec<u64> = Vec::new();
+        // 2) 注入して安全なセッションへ 1 通ずつ予約する。
+        // PTY へは直書きしない。本文→確定キー→入力欄検証の共通経路へ流し、
+        // 成功 ACK が返るまで coordinator の受信箱から消さない。
         for d in self.coordinator.take_deliverable(&states) {
-            if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == d.session) {
-                s.write_bytes(d.text.as_bytes());
-                delivered_to.push(d.session);
+            let mut job = crate::submit::Job::deferred(d.session, d.text, true);
+            job.tag = Some(coordinator_delivery_tag(d.session, d.msg_id));
+            if !self.queue_submit(job) {
+                self.coordinator
+                    .defer_delivery(d.session, d.msg_id, Instant::now());
             }
         }
 
@@ -363,7 +538,51 @@ impl ZaivernApp {
         // 5) 実際にプロセスが消えたものだけ「停止確認済み」にする。
         self.confirm_stopped_sessions();
         // 6) 発信マーカーの取り込みと、停止確認済みタスクの引き継ぎ。
-        self.orch_tick(&delivered_to);
+        self.orch_tick();
+    }
+
+    /// 共通 submit キューの結果を、目印ごとの所有者へ一度だけ返す。
+    pub(crate) fn note_submit_delivery(&mut self, outcomes: Vec<(String, bool)>) {
+        let now = Instant::now();
+        let mut team = Vec::new();
+        let mut coordinator_delivered = Vec::new();
+        for (tag, delivered) in outcomes {
+            if let Some((session, msg_id)) = parse_coordinator_delivery_tag(&tag) {
+                if self
+                    .coordinator
+                    .finish_delivery(session, msg_id, delivered, now)
+                {
+                    coordinator_delivered.push(session);
+                }
+            } else if tag.starts_with(COORDINATOR_DELIVERY_TAG) {
+                // coordinator 名前空間の壊れたタグを Team 側へ流すと、
+                // 無関係な Run の ACK として誤解釈され得る。配送は進めず人へ見せる。
+                self.toast_warn(format!("内部配送タグが壊れています: {tag}"));
+            } else if let Some(identity) = crate::agent_talk::parse_delivery_tag(&tag) {
+                self.talk_forget(identity.in_flight_key());
+                if delivered {
+                    // **ここが agent-talk の配り済み確定点。**
+                    // queue 受理ではなく、確定キーが効いたと検証できた後だけ立てる。
+                    self.talk_once(identity.delivered_key());
+                } else if self.talk_once(identity.outcome_failure_notice_key()) {
+                    self.toast_warn(format!(
+                        "🗣 session:{} への伝言を実配送できませんでした。次の再試行スロットでやり直します",
+                        identity.to
+                    ));
+                }
+            } else if crate::agent_talk::is_delivery_tag_namespace(&tag) {
+                // agent-talk 名前空間の壊れたタグも Team に渡さない。
+                self.toast_warn(format!("内部伝言タグが壊れています: {tag}"));
+            } else {
+                team.push((tag, delivered));
+            }
+        }
+        if !coordinator_delivered.is_empty() {
+            orchestration::note_delivered(&mut self.coordinator, &coordinator_delivered, now);
+        }
+        if !team.is_empty() {
+            self.team_note_delivery(team);
+        }
     }
 
     /// 停止提案 → [`coordinator::gate_for`] → 自動承認なら即実行 / 要確認なら待ち行列へ。
@@ -494,10 +713,10 @@ impl ZaivernApp {
 
     /// 毎フレーム: 発信マーカーの取り込みと、停止確認済みタスクの引き継ぎ。
     ///
-    /// `delivered_to` は今フレームで実際に本文が入力へ入ったセッション。
-    pub(super) fn orch_tick(&mut self, delivered_to: &[u64]) {
+    /// 配達完了の記録は submit の成功 ACK を受けた
+    /// [`ZaivernApp::note_submit_delivery`] だけが行う。
+    pub(super) fn orch_tick(&mut self) {
         let now = Instant::now();
-        orchestration::note_delivered(&mut self.coordinator, delivered_to, now);
 
         // 画面の走査は間引く。UI スレッドを塞がないため。
         if orchestration::scan_due(&mut self.orch, now) {
@@ -1021,5 +1240,39 @@ impl ZaivernApp {
             // 隔離はそのまま (解くと崩れが戻るため)。表示だけ引っ込める
             self.frame_guard.banner = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod coordinator_delivery_tag_tests {
+    use super::{
+        coordinator_delivery_tag, parse_coordinator_delivery_tag, COORDINATOR_DELIVERY_TAG,
+    };
+
+    #[test]
+    fn coordinator_tag_round_trips_exact_ids() {
+        let tag = coordinator_delivery_tag(u64::MAX - 1, u64::MAX);
+        assert_eq!(
+            parse_coordinator_delivery_tag(&tag),
+            Some((u64::MAX - 1, u64::MAX))
+        );
+    }
+
+    #[test]
+    fn coordinator_tag_rejects_malformed_or_ambiguous_values() {
+        for tag in [
+            "coordinator:",
+            "coordinator:1",
+            "coordinator::2",
+            "coordinator:1:",
+            "coordinator: 1:2",
+            "coordinator:+1:2",
+            "coordinator:1:2:3",
+            "coordinator:1:18446744073709551616",
+            "team:1:2",
+        ] {
+            assert_eq!(parse_coordinator_delivery_tag(tag), None, "{tag}");
+        }
+        assert!("coordinator:broken".starts_with(COORDINATOR_DELIVERY_TAG));
     }
 }

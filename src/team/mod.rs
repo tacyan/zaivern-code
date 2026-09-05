@@ -42,12 +42,15 @@
 //! 使い方と設計の全体像は `docs/team.md`。
 
 pub mod changeset;
+pub mod composition;
 pub mod cli;
+pub mod gitinit;
 pub mod graph;
 pub mod inspector;
 pub mod launch;
 pub mod model;
 pub mod organization_board;
+pub mod outbox;
 pub mod panel;
 pub mod persistence;
 pub mod plan_schema;
@@ -56,12 +59,15 @@ pub mod prompt;
 pub mod result_parser;
 pub mod reviewer;
 pub mod roles;
+pub mod run_workspace;
 pub mod runtime;
 pub mod scheduler;
+pub mod spec_writer;
 pub mod state_machine;
 pub mod validation_command;
 pub mod validation_defaults;
 pub mod view_model;
+pub mod webcheck;
 
 #[cfg(test)]
 mod testkit;

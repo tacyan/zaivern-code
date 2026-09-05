@@ -147,9 +147,32 @@ pub(crate) mod stall {
 /// 書き込みを待ち行列へ逃がせば、詰まるのは捨てて構わない writer スレッドだけで済む。
 #[derive(Clone)]
 struct PtyWriter {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
+    tx: std::sync::mpsc::Sender<PtyChunk>,
     /// まだ書けていないバイト数。青天井に溜め込まないための目安。
     queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// 上限超過で**捨てた**バイト数。writer スレッドが次に動いたときにログへ
+    /// 回収する。捨てたことを黙っていると、記録は「書いた」と言っているのに
+    /// 子には 1 バイトも届いていない、という**いちばん質の悪い嘘**になる。
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// PTY へ流す 1 塊と、その**出どころ**。
+struct PtyChunk {
+    bytes: Vec<u8>,
+    origin: WriteOrigin,
+}
+
+/// PTY へ書くバイト列の出どころ。記録するかどうかがここで決まる。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriteOrigin {
+    /// 人の打鍵・一斉送信・スマホ・自動YES・チーム調停の配達 —
+    /// **こちらの意思で送った入力**。生ログへ記録する。
+    Input,
+    /// 端末自身が問い合わせ (CSI 6n / OSC 10 など) へ返した返事。記録しない。
+    /// 人が書いたものではないうえ、描画のたびに問い合わせる TUI が居ると
+    /// 記録が返事だけで埋まり、[`LOG_CAP`] のローテートで**出力の履歴を
+    /// 押し出してしまう**。
+    Reply,
 }
 
 impl PtyWriter {
@@ -163,28 +186,52 @@ impl PtyWriter {
     /// 引数で受けるのは、テストが**この配線そのもの**を使えるようにするため —
     /// テスト側で似た配線を組み直すと、production が変わっても気付けない
     /// (「測っているつもりで何も測っていない」)。
-    fn spawn_for(w: impl std::io::Write + Send + 'static) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    ///
+    /// `log` を渡すと、**PTY へ実際に手渡す直前**のバイト列を同じ生ログへ
+    /// 記録する ([`input_log_record`])。ここが唯一の記録点なので、
+    /// 送り口が何本あっても (本文 / 確定キー / プロンプト応答 / スマホ)
+    /// **片方だけ記録されるという嘘が構造的に起こらない**。
+    fn spawn_for(
+        w: impl std::io::Write + Send + 'static,
+        log: Option<Arc<Mutex<LogSink>>>,
+    ) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<PtyChunk>();
         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = queued.clone();
-        std::thread::spawn(move || Self::pump(w, &rx, &counter));
-        Self { tx, queued }
+        let lost = dropped.clone();
+        std::thread::spawn(move || Self::pump(w, &rx, &counter, &lost, log.as_ref()));
+        Self {
+            tx,
+            queued,
+            dropped,
+        }
     }
 
     /// 待ち行列を PTY へ流し続けるループ。**詰まってよいのはこのスレッドだけ**。
     /// 送り手が全員居なくなると `recv` が切れて畳まれる。
     fn pump(
         mut w: impl std::io::Write,
-        rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+        rx: &std::sync::mpsc::Receiver<PtyChunk>,
         queued: &std::sync::atomic::AtomicUsize,
+        dropped: &std::sync::atomic::AtomicUsize,
+        log: Option<&Arc<Mutex<LogSink>>>,
     ) {
         while let Ok(chunk) = rx.recv() {
-            let n = chunk.len();
+            let n = chunk.bytes.len();
+            // 記録は**書く前**に、しかもログの錠を跨がずに済ませる。ここで
+            // 詰まってよいのはこのスレッドだけだが、ログの錠を握ったまま
+            // 詰まると、同じログを持つ**読取スレッドまで巻き添え**になる。
+            if let (Some(l), WriteOrigin::Input) = (log, chunk.origin) {
+                let lost = dropped.swap(0, Ordering::Relaxed);
+                let rec = input_log_record(&chunk.bytes, epoch_ms(), lost);
+                lock_ok(l).write(rec.as_bytes());
+            }
             // ここが「子が読まなければ永久に返ってこない」呼び出し。
             // 呼び出し側 (UI スレッド) の計器が 0 であることの裏返しとして数える。
             #[cfg(test)]
             stall::pty_write();
-            let ok = w.write_all(&chunk).is_ok() && w.flush().is_ok();
+            let ok = w.write_all(&chunk.bytes).is_ok() && w.flush().is_ok();
             queued.fetch_sub(n, Ordering::Relaxed);
             if !ok {
                 break; // PTY が閉じた。以降の入力は届かない。
@@ -193,12 +240,27 @@ impl PtyWriter {
     }
 
     fn send(&self, bytes: &[u8]) {
+        self.send_from(bytes, WriteOrigin::Input);
+    }
+
+    /// 端末自身が返す問い合わせへの返事 ([`WriteOrigin::Reply`])。
+    fn send_reply(&self, bytes: &[u8]) {
+        self.send_from(bytes, WriteOrigin::Reply);
+    }
+
+    fn send_from(&self, bytes: &[u8], origin: WriteOrigin) {
         use std::sync::atomic::Ordering as O;
         if self.queued.load(O::Relaxed) > Self::MAX_QUEUED {
+            // 捨てた事実を残す (writer スレッドが次の入力でログへ回収する)。
+            self.dropped.fetch_add(bytes.len(), O::Relaxed);
             return;
         }
         self.queued.fetch_add(bytes.len(), O::Relaxed);
-        if self.tx.send(bytes.to_vec()).is_err() {
+        let chunk = PtyChunk {
+            bytes: bytes.to_vec(),
+            origin,
+        };
+        if self.tx.send(chunk).is_err() {
             // writer スレッドが終わっている (PTY が閉じた)。数え戻しておく。
             self.queued.fetch_sub(bytes.len(), O::Relaxed);
         }
@@ -409,6 +471,15 @@ pub struct Session {
     /// あとに立て、同じプロンプトが画面に残っていても二度目の応答・再検出をしない。
     /// プロンプトが画面から消える、または別のプロンプトに変わったら下ろす。
     answered_sig: Option<u64>,
+    /// **起動時プロンプト (フォルダ信頼確認など) に自動で答えた時刻。**
+    ///
+    /// 答えた直後、CLI は画面を作り直す (Claude Code は信頼確認のあとで
+    /// 起動画面を出し直す)。その最中に書いた本文は**丸ごと捨てられる** —
+    /// 実測: 信頼確認への返事の 71ms 後に 6.6KB の指示を貼り、起動画面は
+    /// その後に出た。担当は 5 分間なにも受け取らないまま「作業中」だった。
+    /// 「もう受け取れるか」の時計はセッション開始だけでなく**ここからも**
+    /// 数え直す ([`Self::since_startup_reply`])。
+    startup_reply_at: Option<Instant>,
     /// 自動YESの停滞監視: 自動応答したのにプロンプトが固まったままのとき、
     /// 「画面が意味的に変化していない時間」の起点。自動YESが送った応答にだけ立て、
     /// ユーザーの手動応答 (resolve_attention 経由) では None に戻す — 手動運転中に
@@ -636,6 +707,184 @@ impl LogSink {
             self.written += chunk.len() as u64;
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// PTY へ**書いた**バイト列の記録 (入力ログ)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// 生ログ (`~/.zaivern/term_logs/<キー>/<名前>.log`) は長らく PTY の**出力**しか
+// 残していなかった。そのため「書いたのに入力欄へ入らない」— 実機のチーム Run で
+// `#2 へ指示が届きませんでした` が繰り返し出て、プロセスは 6 体とも生存、という
+// 状態を**こちら側が何を書いたのか 1 バイトも確認できなかった**。
+// (ある担当の入力欄に残っていた `7777` が、こちらの書き込みの成れの果てなのか
+//  相手の描画なのかを、記録からは判定できなかった。)
+//
+// ## 既定は無効。`ZAIVERN_LOG_INPUT=1` で明示的に有効にする (opt-in)
+//
+// 最初の版は既定で有効にしていた (「後から入れられない記録は、要るときに
+// 必ず無い」— 詰まりは再現しないので、詰まってから環境変数を足しても遅い)。
+// それでも既定を無効へ戻したのは、**記録に残るのが「こちらが PTY へ書いた
+// 全部」**だからである。チームの指示だけでなく、人が手で打った `sudo` の
+// パスワード・貼り付けたトークン・API キーも同じ経路 ([`WriteOrigin::Input`])
+// を通る。端末エミュレータからは子の termios が見えないので、echo を切って
+// 読まれている入力を自動で伏せる方法は無い。**画面に出ない入力を既定で
+// ディスクへ残す**のは、切り分けの便利さでは釣り合わない。
+//
+// 送り口は 1 種類 ([`WriteOrigin`] は `Input` / `Reply` の 2 値) で、
+// 「チームの自動送信」と「人の手入力」を区別する構造は**いま無い**。
+// 区別できるようになったら自動送信だけを既定で残す道はあるが、それまでは
+// まとめて opt-in にする。
+//
+// 有効にしたときの手当て (opt-in でも同じ):
+//
+// 1. **ファイルの機微さの等級は変わらない。** 同じログには既に端末の出力が
+//    そのまま入っている (エージェントが画面へ出した鍵も含めて)。置き場も
+//    権限も `~/.zaivern` のままで、外へは 1 バイトも出さない。
+// 2. **肥大は構造的に抑えてある。** ローテートは既存の [`LOG_CAP`] のまま、
+//    1 件あたりは [`INPUT_RECORD_MAX_CHARS`] で頭と尻を残して畳む
+//    (長い指示文をまるごと二重に持たない。**末尾を残す**のは、確定の `\r` が
+//     付いていたかが切り分けの本体だから)。
+// 3. **端末の自動返事は記録しない** ([`WriteOrigin::Reply`])。CSI 6n を
+//    描画のたびに撃つ TUI が居ると、記録が返事だけで埋まって出力の履歴を
+//    ローテートで押し出す。
+//
+// 切り替えの解釈は [`input_logging_enabled`] 1 か所。**知らない綴りは無効**
+// (安全側) — `ZAIVERN_LOG_INPUT=maybe` で記録が始まってはいけない。
+//
+// ## 書式
+//
+// ```text
+// ===== [Zaivern] input — `hello\r` (6 bytes, epoch 1756...ms) =====
+// ```
+//
+// 既存の読み手は壊さない。`term_logs` を読んでいるのは (a) 起動時の再生
+// ([`Session::preload_scrollback`] — 制御文字が 1 つも無いので画面は動かず、
+// ヘッダと同じくただの行として見える) (b) 見張りの構造化段
+// (`supervisor::pump_protocol` → `protocol::ProtoTracker::feed`。JSON にならない
+// 行は `bad_lines` に数えるだけで、その数を読む所は無い) (c) 一覧・掃除・
+// 容量計算 (ファイル単位)。**唯一の副作用**は、出力の途中に記録が挟まると
+// その 1 行の JSON が割れること — ただし構造化段が付くのは
+// `--output-format stream-json` を持つ**非対話**の起動だけで、そこへは
+// こちらから 1 バイトも書かない。
+//
+// 既存のヘッダ (`===== [Zaivern] <題> — …`) と同じ流儀にして、
+// **1 行完結・行頭から始まる**ようにしてある (制御文字は全部エスケープするので、
+// 記録が途中で改行することは無い)。**この行は翻訳しない** — ヘッダと同じく
+// 道具が読む機械可読な記録で、`ui_language` によって形が変わってはいけない。
+
+/// 入力記録 1 件の最大文字数 (エスケープ後)。超える分は真ん中を畳む。
+const INPUT_RECORD_MAX_CHARS: usize = 1024;
+
+/// **PTY へ書いたバイト列の記録を有効にするか** (`ZAIVERN_LOG_INPUT` の解釈)。
+///
+/// 純関数。**明示的に有効にしたときだけ有効** (opt-in。理由は上の節)。
+/// `1` / `true` / `on` / `yes` で有効 (大小・前後の空白は無視)。
+/// 未設定・空文字・`0` / `false` / `off` / `no`・**知らない綴り**は全部無効 —
+/// 迷ったら記録しない側へ倒す。
+pub(crate) fn input_logging_enabled(var: Option<&str>) -> bool {
+    matches!(
+        var.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// 1970-01-01 からのミリ秒。時計が壊れていても 0 で続行する。
+fn epoch_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// 1 文字ぶんのエスケープを積む。
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\u{1b}' => out.push_str("\\e"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            // C1 (U+0080..U+009F)。ここも素で書くと端末が解釈してしまう。
+            c if c.is_control() => out.push_str(&format!("\\u{{{:02x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+/// **PTY へ書いたバイト列を、ログへ書いても安全な形へ直す (純関数)。**
+///
+/// 生の `\r` / `\x1b[B` / bracketed paste の `\x1b[200~` をそのまま書くと、
+/// ログを `cat` した人の端末が壊れる (画面が動き、貼り付けモードに入る)。
+/// 返す文字列に制御文字は 1 つも含まれない。
+///
+/// **多バイト文字はそのまま残す。** 指示文はほとんどが日本語なので、
+/// `\xNN` に潰すと記録の用を成さない。UTF-8 として読めないバイト
+/// (`\r` を挟んで切れた途中・非 UTF-8 端末のバイト) だけを `\xNN` にする。
+pub(crate) fn escape_pty_input(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 4);
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                push_escaped(&mut out, s);
+                break;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                if good > 0 {
+                    push_escaped(&mut out, std::str::from_utf8(&rest[..good]).unwrap_or(""));
+                }
+                // `error_len() == None` は「末尾で切れている」。残り全部を出す。
+                let bad = e.error_len().unwrap_or(rest.len() - good).max(1);
+                let end = (good + bad).min(rest.len());
+                for b in &rest[good..end] {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+                rest = &rest[end..];
+            }
+        }
+    }
+    out
+}
+
+/// 長すぎる記録の**真ん中**を畳む (純関数)。頭と尻を残す。
+///
+/// 尻を残すのが肝: 「確定の `\r` が付いていたか」が切り分けの本体なので、
+/// 頭だけ残す畳み方だと、いちばん見たいバイトが毎回消える。
+fn clamp_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let head = max * 3 / 4;
+    let tail = max - head;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}[…{} chars omitted…]{t}", n - head - tail)
+}
+
+/// **入力記録 1 件を組み立てる (純関数)。**
+///
+/// `dropped` が 0 でなければ、待ち行列の上限超過で**捨てた**バイト数を
+/// 先に 1 行出す (捨てたのに記録が「書いた」とだけ言うと嘘になる)。
+pub(crate) fn input_log_record(bytes: &[u8], epoch_ms: u128, dropped: usize) -> String {
+    let mut rec = String::new();
+    if dropped > 0 {
+        rec.push_str(&format!(
+            "\n===== [Zaivern] input-dropped — {dropped} bytes (queue full) =====\n"
+        ));
+    }
+    let body = clamp_middle(&escape_pty_input(bytes), INPUT_RECORD_MAX_CHARS);
+    rec.push_str(&format!(
+        "\n===== [Zaivern] input — `{body}` ({} bytes, epoch {epoch_ms}ms) =====\n",
+        bytes.len()
+    ));
+    rec
 }
 
 /// 全自動YESモード用: 画面の承認プロンプトを分類し、送るキー列と説明を返す。
@@ -1945,9 +2194,36 @@ impl Session {
 
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
+        // 生ログの書き出し (F5: スクロールバック永続化)。ヘッダで起動を区切る。
+        // **出力の読取スレッドと入力の writer スレッドが同じ 1 本を共有する** —
+        // 片方だけが持つと、行の前後関係が記録から失われる。
+        let log_sink: Option<Arc<Mutex<LogSink>>> = spec
+            .log_path
+            .as_ref()
+            .and_then(|p| {
+                let header = format!(
+                    "\n===== [Zaivern] {} — `{}` (epoch {}) =====\n",
+                    spec.title,
+                    spec.command,
+                    epoch_ms() / 1000
+                );
+                LogSink::open(p, &header)
+            })
+            .map(|s| Arc::new(Mutex::new(s)));
+
+        // PTY へ**書いた**バイト列も同じログへ残すか (**既定は残さない**。
+        // `ZAIVERN_LOG_INPUT=1` で残す)。判断の理由は
+        // [`input_logging_enabled`] の上の節を参照。
+        let input_log = input_logging_enabled(std::env::var("ZAIVERN_LOG_INPUT").ok().as_deref())
+            .then(|| log_sink.clone())
+            .flatten();
+
         // PTY への書き込みは専用スレッドに任せる (PtyWriter の説明を参照)。
         // 送り手 (UI スレッド / 読取スレッド) が全員居なくなると recv が切れて畳まれる。
-        let writer = PtyWriter::spawn_for(pair.master.take_writer().map_err(|e| e.to_string())?);
+        let writer = PtyWriter::spawn_for(
+            pair.master.take_writer().map_err(|e| e.to_string())?,
+            input_log,
+        );
         let cursor_shape = Arc::new(AtomicU8::new(CursorShape::Block.to_u8()));
         let shell = Arc::new(Mutex::new(crate::shellint::Tracker::new()));
         let lines: Arc<LineIndex> = Arc::new(LineIndex::default());
@@ -1956,19 +2232,6 @@ impl Session {
         // 既定はダークテーマ寄りの色。app.rs から set_report_colors で上書きできる。
         let report_fg = Arc::new(AtomicU32::new(0xe6e6e6));
         let report_bg = Arc::new(AtomicU32::new(0x12141a));
-
-        // 生ログの書き出し (F5: スクロールバック永続化)。ヘッダで起動を区切る。
-        let log_sink: Option<LogSink> = spec.log_path.as_ref().and_then(|p| {
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let header = format!(
-                "\n===== [Zaivern] {} — `{}` (epoch {}) =====\n",
-                spec.title, spec.command, epoch
-            );
-            LogSink::open(p, &header)
-        });
 
         {
             let parser = parser.clone();
@@ -1982,7 +2245,7 @@ impl Session {
             let clipboard_pending = clipboard_pending.clone();
             let report_fg = report_fg.clone();
             let report_bg = report_bg.clone();
-            let mut log_sink = log_sink;
+            let log_sink = log_sink.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut scanner = QueryScanner::default();
@@ -2003,9 +2266,11 @@ impl Session {
                             break;
                         }
                         Ok(n) => {
-                            if let Some(l) = log_sink.as_mut() {
+                            if let Some(l) = log_sink.as_ref() {
                                 // 生ログは**生のまま**残す (再生時に同じ経路を通す)。
-                                l.write(&buf[..n]);
+                                // 錠は書き込みの間だけ (入力側と共有しているので、
+                                // 握ったまま何かを待つと writer を巻き添えにする)。
+                                lock_ok(l).write(&buf[..n]);
                             }
                             let mut reply: Vec<u8> = Vec::new();
                             let mut moved_total = 0u64;
@@ -2093,7 +2358,9 @@ impl Session {
                                 lock_ok(&shell).forget_before(oldest);
                             }
                             if !reply.is_empty() {
-                                writer.send(&reply);
+                                // 端末が返す問い合わせへの返事。入力ログには
+                                // 残さない ([`WriteOrigin::Reply`] の説明)。
+                                writer.send_reply(&reply);
                             }
                             crate::perf::repaint(&ctx, "pty_read");
                         }
@@ -2151,6 +2418,7 @@ impl Session {
             launched_bypass,
             last_scan: Instant::now(),
             answered_sig: None,
+            startup_reply_at: None,
             auto_stall_since: None,
             auto_stall_hash: 0,
             auto_yes_resend_after: Duration::from_secs(30),
@@ -2213,6 +2481,21 @@ impl Session {
     /// このセッションのエージェント名 (`agy` / `claude` …)。カタログ外なら None。
     /// 別名 (`antigravity` / `antigravity-cli`) はカタログ側で正規化されるので、
     /// ここでは常に正規の `bin` 名が返る。
+    /// このセッションが起きてからの経過。
+    ///
+    /// **起動直後に入力を書いても落ちる CLI がある**ので、送信側が
+    /// 「もう受け取れるか」を決めるのに使う (待つ長さはカタログが持つ)。
+    pub fn age(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// 起動時プロンプトに自動で答えてからの経過 (答えていなければ `None`)。
+    /// 送信側は [`Self::age`] と**両方**が待ち時間を越えてから書く
+    /// ([`crate::submit::input_ready`])。
+    pub fn since_startup_reply(&self) -> Option<std::time::Duration> {
+        self.startup_reply_at.map(|t| t.elapsed())
+    }
+
     pub fn agent_bin(&self) -> Option<&'static str> {
         self.spec().map(|s| s.bin)
     }
@@ -2349,6 +2632,9 @@ impl Session {
                 self.answered_sig = sig;
                 self.auto_stall_since = Some(now);
                 self.auto_stall_hash = self.cur_hash;
+                // 答えた瞬間から「受け取れるまで」を数え直す (CLI が画面を
+                // 作り直す間に書いた本文は捨てられる)。
+                self.startup_reply_at = Some(now);
                 self.write_bytes(bytes);
                 self.attention = false;
                 return Some(Attention::AutoReplied(desc));
@@ -2483,6 +2769,11 @@ impl Session {
     /// 直接書くと、子が標準入力を読まなくなった (固まった / 落ちかけている)
     /// ときにパイプが詰まって呼び出し側ごと止まる。呼び出し側は UI スレッドなので
     /// アプリ全体が固まる ([`PtyWriter`] の説明を参照)。
+    ///
+    /// **セッションから PTY へ書く口はここ 1 つだけ。** 本文・確定キー・
+    /// プロンプト応答・スマホ・チーム調停の配達は全部ここを通るので、
+    /// 記録 ([`input_log_record`]) も 1 か所で足りる —
+    /// 「片方の経路だけ記録されていて、無いものを無いと信じる」が起きない。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.writer.send(bytes);
     }
@@ -3420,6 +3711,42 @@ fn kill_tree_blocking(pid: Option<u32>) -> bool {
 /// 万一返らなくても止まるのは捨てるスレッドだけで、UI は動き続ける。
 pub fn reap(session: Session) {
     std::thread::spawn(move || reap_now(session));
+}
+
+/// Team Run のCloseが、PTYとプロセスツリーの後始末完了を非同期に確認する札。
+/// `false`の間はworktreeを削除してはいけない。
+#[derive(Clone)]
+pub struct ReapHandle {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReapHandle {
+    pub fn is_finished(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn for_test(finished: bool) -> Self {
+        Self {
+            done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(finished)),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn finish_for_test(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// [`reap`]と同じ後始末を行い、完了を確認できる札を返す。
+pub fn reap_tracked(session: Session) -> ReapHandle {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_done = done.clone();
+    std::thread::spawn(move || {
+        reap_now(session);
+        worker_done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    ReapHandle { done }
 }
 
 /// [`reap`] の中身。**詰まり得る呼び出しを全部払う** ので、専用スレッドから
@@ -5485,6 +5812,39 @@ mod tests {
         assert_eq!(
             selection_text(p.screen(), ((1, 5), (0, 6))),
             "world\nsecond"
+        );
+    }
+
+    /// **段落 (空行) を含む入力でも入力欄を見失わない。**
+    ///
+    /// 実機で踏んだ形をそのまま置く。Team の指示文は空行で段落を分けるので、
+    /// 空行で打ち切っていた頃は**入力欄そのものが見つからなかった**。
+    /// 見つからない = 確定キーが効いたかを確かめられない = 1 回撃って
+    /// 「届いた」と判断する。だから指示が入力欄に残ったまま何分も
+    /// 止まっていた (Codex で観測)。
+    #[test]
+    fn input_area_selection_paragraphs_with_blank_lines() {
+        let mut p = vt100::Parser::new(12, 60, 0);
+        p.process("\x1b[2;1H\u{203a}".as_bytes());
+        p.process("\x1b[3;1H  ## 中で誰かに手伝わせたとき".as_bytes());
+        p.process("\x1b[4;1H  あなたが内部でサブエージェントを使ったら".as_bytes());
+        // ← ここが空行。以前はこれで打ち切っていた。
+        p.process("\x1b[6;1H  * `parent_id` は必ず `agent-2`".as_bytes());
+        p.process("\x1b[8;1H  gpt-5.6-sol low fast".as_bytes());
+        p.process(b"\x1b[6;34H"); // カーソルは打ち終わった位置 (最後の本文行)
+        let (_, text) = input_area_selection(p.screen()).expect("空行があっても検出できる");
+        assert!(
+            text.contains("## 中で誰かに手伝わせたとき"),
+            "先頭の段落が入っていない: {text:?}"
+        );
+        assert!(
+            text.contains("`parent_id` は必ず `agent-2`"),
+            "空行の向こうの本文が入っていない: {text:?}"
+        );
+        // **カーソルより下は入力欄ではない。** 状態行を巻き込まない。
+        assert!(
+            !text.contains("gpt-5.6-sol"),
+            "下の状態行まで拾っている: {text:?}"
         );
     }
 
@@ -8103,7 +8463,15 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
         }
         Some(i + 2)
     };
-    // カーソル行から上へマーカー行を探す (途中に空行・罫線があれば入力欄ではない)
+    // カーソル行から上へマーカー行を探す。
+    //
+    // **空行では打ち切らない。** 打ち切っていたので、段落を含む長い入力
+    // (Team の指示文がまさにそれ) では入力欄そのものを見失っていた。
+    // 見失う = 確定キーが効いたかを確かめられない = **1 回撃って
+    // 「届いた」と判断する**ので、実機では指示が入力欄に残ったまま
+    // 何分も止まっていた (Codex で観測)。
+    //
+    // 罫線では従来どおり打ち切る — そこは本当に入力欄の外側。
     let mut marker: Option<(u16, usize)> = None;
     let low = cur_r.saturating_sub(40);
     for r in (low..=cur_r).rev() {
@@ -8112,17 +8480,26 @@ fn input_area_selection(screen: &vt100::Screen) -> Option<InputAreaSel> {
             marker = Some((r, col));
             break;
         }
-        if cs.is_empty() || is_border_row(&cs) {
+        if is_border_row(&cs) {
             break;
         }
     }
     let (m_row, body_col) = marker?;
-    // マーカー行から下へ続く本文行 (折返し・複数行入力)
+    // マーカー行から下へ続く本文行 (折返し・複数行入力)。
+    //
+    // **空行はまたぐ。ただしカーソル行まで。** カーソルは打ち終わった
+    // 位置なので、そこから先は入力欄ではない (下の状態行を巻き込まない)。
     let mut bottom = m_row;
     for r in m_row + 1..rows {
         let cs = row_chars(r);
-        if cs.is_empty() || is_border_row(&cs) || marker_body_col(&cs).is_some() {
+        if is_border_row(&cs) || marker_body_col(&cs).is_some() {
             break;
+        }
+        if cs.is_empty() {
+            if r >= cur_r {
+                break;
+            }
+            continue;
         }
         bottom = r;
     }
@@ -10600,10 +10977,18 @@ mod pty_writer_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 受け手が一切読まない writer を模して、送り側だけを見る。
-    fn stalled_writer() -> (PtyWriter, std::sync::mpsc::Receiver<Vec<u8>>) {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    fn stalled_writer() -> (PtyWriter, std::sync::mpsc::Receiver<PtyChunk>) {
+        let (tx, rx) = std::sync::mpsc::channel::<PtyChunk>();
         let queued = Arc::new(AtomicUsize::new(0));
-        (PtyWriter { tx, queued }, rx)
+        let dropped = Arc::new(AtomicUsize::new(0));
+        (
+            PtyWriter {
+                tx,
+                queued,
+                dropped,
+            },
+            rx,
+        )
     }
 
     /// **子が入力を 1 バイトも読まなくても、書き込みは呼び出し側に
@@ -10635,10 +11020,13 @@ mod pty_writer_tests {
         let gate = Arc::new(Mutex::new(()));
         let hold = lock_ok(&gate);
         let (wrote_tx, wrote_rx) = std::sync::mpsc::channel::<usize>();
-        let w = PtyWriter::spawn_for(StalledPty {
-            gate: gate.clone(),
-            wrote: wrote_tx,
-        });
+        let w = PtyWriter::spawn_for(
+            StalledPty {
+                gate: gate.clone(),
+                wrote: wrote_tx,
+            },
+            None,
+        );
 
         stall::reset();
         for _ in 0..N {
@@ -10714,6 +11102,24 @@ mod pty_writer_tests {
             !send.contains(write_all),
             "PtyWriter::send が直に書いている (呼び出し側が子の都合で止まる)"
         );
+        // ①' 送り口の実体 (`send` / `send_reply` が委譲する先) も同じ約束。
+        //     ここを見ないと、`send` を 1 行の委譲にするだけで①が空回りする。
+        let send_from = body_of(
+            "    fn send_from(&self, bytes: &[u8], origin: WriteOrigin) {",
+            "\n    }\n",
+            "PtyWriter::send_from",
+        );
+        assert!(
+            !send_from.contains(write_all),
+            "PtyWriter::send_from が直に書いている (呼び出し側が子の都合で止まる)"
+        );
+        // ①'' 記録も呼び出し側で取らない (ファイル書き込みは writer スレッドの仕事)。
+        for (name, body) in [("send", &send), ("send_from", &send_from)] {
+            assert!(
+                !body.contains("input_log_record("),
+                "PtyWriter::{name} が呼び出し側のスレッドでログを組み立てている"
+            );
+        }
 
         // ② 出荷側は必ず spawn_for 経由。ここが直書きへ戻ると、
         //    回数のテストは緑のままアプリだけが固まる。
@@ -10824,6 +11230,259 @@ mod pty_writer_tests {
         drop(rx);
         w.send(b"gone");
         assert_eq!(w.queued.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// **PTY へ書いたバイト列の記録**の取り決め (書式・切り替え・配線)。
+///
+/// 実 PTY は 1 つも起こさない。書式と切り替えは純関数、配線はソースの走査と
+/// [`PtyWriter::spawn_for`] (production と同じ配線) への差し込みで見る。
+#[cfg(test)]
+mod input_log_tests {
+    use super::*;
+
+    /// 制御文字が**生のまま**ログへ出ない。出すと、ログを `cat` した人の
+    /// 端末が動き出す (`\x1b[200~` は貼り付けモードに入れてしまう)。
+    /// 日本語はそのまま残す — 潰すと指示文の記録が用を成さない。
+    #[test]
+    fn 制御文字はエスケープされ多バイト文字はそのまま残る() {
+        let table: &[(&[u8], &str)] = &[
+            (b"hello", "hello"),
+            (b"y\r", "y\\r"),
+            (b"a\nb\tc", "a\\nb\\tc"),
+            (b"\x1b[B", "\\e[B"),
+            // bracketed paste の囲み (これが生で出ると読む人の端末が壊れる)
+            (b"\x1b[200~ok\x1b[201~", "\\e[200~ok\\e[201~"),
+            (b"\x00\x7f", "\\x00\\x7f"),
+            (b"back\\slash", "back\\\\slash"),
+            ("指示です\r".as_bytes(), "指示です\\r"),
+            // UTF-8 として読めないバイトだけ \xNN へ落ちる
+            (b"\xff\xfe", "\\xff\\xfe"),
+            // 多バイト文字の途中で切れて届いた場合 (打鍵は分割して届く)
+            (&[0xe3, 0x81], "\\xe3\\x81"),
+        ];
+        for (raw, want) in table {
+            assert_eq!(&escape_pty_input(raw), want, "raw={raw:?}");
+        }
+    }
+
+    /// **記録に制御文字は 1 つも残らない** (枠の改行を除く)。
+    /// 表に載せた例だけでなく、任意の 1 バイトについて成り立つこと。
+    #[test]
+    fn どんなバイト列でも記録に制御文字は残らない() {
+        for b in 0u8..=255 {
+            let rec = input_log_record(&[b, b'\r'], 0, 0);
+            let inner = rec.trim_matches('\n');
+            assert!(
+                !inner.chars().any(|c| c.is_control()),
+                "byte {b:#04x} の記録に制御文字が残った: {inner:?}"
+            );
+        }
+    }
+
+    /// 書式は既存の区切り行 (`===== [Zaivern] … =====`) と同じ流儀で、
+    /// **1 行完結**。後から読む道具が「これはこちらが書いた」と分かる。
+    #[test]
+    fn 記録は既存の区切り行と同じ流儀の一行になる() {
+        let rec = input_log_record("了解です\r".as_bytes(), 1_756_000_000_123, 0);
+        let lines: Vec<&str> = rec.trim_matches('\n').split('\n').collect();
+        assert_eq!(lines.len(), 1, "1 行に収まっていない: {rec:?}");
+        let line = lines[0];
+        assert!(line.starts_with("===== [Zaivern] input — `"), "{line}");
+        assert!(line.ends_with(" ====="), "{line}");
+        // 出どころ・中身・実バイト数・時刻がそろっている
+        assert!(line.contains("`了解です\\r`"), "{line}");
+        assert!(line.contains("(13 bytes, epoch 1756000000123ms)"), "{line}");
+        // 枠の改行は前後に 1 つずつ (行頭から始まり、出力と混ざらない)
+        assert!(rec.starts_with('\n') && rec.ends_with('\n'), "{rec:?}");
+    }
+
+    /// 長い指示文は真ん中を畳む。**尻を残す** — 確定の `\r` が付いていたかが
+    /// 切り分けの本体なので、頭だけ残す畳み方だと毎回それが消える。
+    /// 実バイト数は畳んでも嘘をつかない。
+    #[test]
+    fn 長い入力は真ん中を畳んで頭と尻を残す() {
+        let body = "あ".repeat(4000);
+        let raw = format!("{body}\r");
+        let rec = input_log_record(raw.as_bytes(), 0, 0);
+        assert!(rec.contains("chars omitted"), "畳まれていない");
+        assert!(rec.contains("`ああ"), "頭が残っていない");
+        assert!(rec.contains("\\r` ("), "尻 (確定キー) が残っていない");
+        assert!(
+            rec.contains(&format!("({} bytes,", raw.len())),
+            "畳んだのに実バイト数が変わっている"
+        );
+        assert!(
+            rec.chars().count() < 2000,
+            "畳んだのにログが太る: {} 文字",
+            rec.chars().count()
+        );
+    }
+
+    /// 待ち行列の上限で**捨てた**ぶんを黙らない。黙ると記録は「書いた」と
+    /// 言っているのに子には 1 バイトも届いていない、という嘘になる。
+    #[test]
+    fn 捨てたバイトは記録に残る() {
+        let rec = input_log_record(b"y\r", 0, 4096);
+        assert!(
+            rec.contains("===== [Zaivern] input-dropped — 4096 bytes (queue full) ====="),
+            "{rec}"
+        );
+        assert!(!input_log_record(b"y\r", 0, 0).contains("input-dropped"));
+    }
+
+    /// 切り替えの解釈 (`ZAIVERN_LOG_INPUT`)。**未設定は無効** (opt-in)。
+    ///
+    /// 手で打ったパスワードやトークンも同じ経路を通るので、記録は
+    /// 頼まれたときだけ。知らない綴りで記録が始まってはいけない。
+    #[test]
+    fn 入力記録は明示的に有効にしたときだけ() {
+        // 有効にする綴りはこの 4 つだけ (大小・前後の空白は無視)
+        for on in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("on"),
+            Some("On"),
+            Some("yes"),
+            Some(" yes "),
+            Some("\tTrue\n"),
+        ] {
+            assert!(input_logging_enabled(on), "{on:?} で無効のままだった");
+        }
+        // 未設定・空・明示的な無効
+        for off in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some(" off "),
+            Some("no"),
+            Some("No"),
+        ] {
+            assert!(!input_logging_enabled(off), "{off:?} で有効になった");
+        }
+        // **知らない綴りは安全側 (無効)**
+        for unknown in [
+            Some("maybe"),
+            Some("2"),
+            Some("-1"),
+            Some("yes please"),
+            Some("enabled"),
+            Some("y"),
+            Some("t"),
+            Some("１"),
+            Some("true false"),
+        ] {
+            assert!(
+                !input_logging_enabled(unknown),
+                "{unknown:?} で記録が始まった (知らない綴りは無効でなければならない)"
+            );
+        }
+    }
+
+    /// **production と同じ配線**で、書いたバイト列がログへ落ちること。
+    /// 実 PTY は起こさない ([`PtyWriter::spawn_for`] に偽の書き込み先を挿す)。
+    /// 端末の自動返事は落ちないことも同時に見る。
+    #[test]
+    fn 書いたバイト列は同じログへ落ち返事は落ちない() {
+        /// 書けた通知を返すだけの偽 PTY (時計もスピンも使わずに待つため)。
+        struct Fake(std::sync::mpsc::Sender<usize>);
+        impl std::io::Write for Fake {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(buf.len());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = crate::test_util::unique_temp_dir("zaivern", "input-log");
+        let path = dir.join("probe-1.log");
+        let sink = LogSink::open(&path, "===== [Zaivern] probe =====\n").expect("ログを開けない");
+        let log = Arc::new(Mutex::new(sink));
+
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let w = PtyWriter::spawn_for(Fake(tx), Some(log));
+        w.send("これで頼む\r".as_bytes());
+        w.send_reply(b"\x1b[12;3R");
+        // 2 本とも PTY へは届く (返事を握り潰したわけではない)
+        assert_eq!(rx.recv().expect("writer が畳まれた"), 16);
+        assert_eq!(rx.recv().expect("writer が畳まれた"), 7);
+
+        let text = std::fs::read_to_string(&path).expect("ログを読めない");
+        assert!(
+            text.contains("===== [Zaivern] input — `これで頼む\\r` (16 bytes,"),
+            "書いたバイト列がログに残っていない:\n{text}"
+        );
+        assert!(
+            !text.contains("[12;3R"),
+            "端末の自動返事まで記録している (履歴を押し出す):\n{text}"
+        );
+        // 出力側の区切りは壊していない
+        assert!(text.contains("===== [Zaivern] probe ====="));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **記録点が 1 か所であること**をソースで固定する。
+    ///
+    /// 送り口は本文・確定キー・プロンプト応答・スマホ・チーム調停と複数あるが、
+    /// PTY へ渡すのは [`Session::write_bytes`] → [`PtyWriter`] の 1 本きり。
+    /// ここが 2 本になると「片方だけ記録される」= 記録を見て「書いていない」と
+    /// 誤診する。散らばった瞬間に赤くする。
+    #[test]
+    fn ptyへ書く経路は記録を通る一本だけ() {
+        let src = include_str!("terminal.rs").replace("\r\n", "\n");
+        // 探す文字列をそのまま書くと**このテスト自身に当たる**ので分割する。
+        let session_send = concat!("self.writer", ".send(");
+        let record = concat!("input_log", "_record(");
+
+        let body_of = |sig: &str, name: &str| -> String {
+            let after = src
+                .split(sig)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} が見つからない"));
+            after
+                .split("\n    }\n")
+                .next()
+                .unwrap_or_else(|| panic!("{name} の本体の終端が見つからない"))
+                .to_string()
+        };
+
+        // ① 記録は writer スレッドの中。ここから消えると全部の経路が黙る。
+        let pump = body_of("    fn pump(", "PtyWriter::pump");
+        assert!(
+            pump.contains(record),
+            "writer スレッドが書いたバイト列を記録していない"
+        );
+
+        // ② セッションから PTY への送り口は write_bytes ただ 1 つ。
+        assert_eq!(
+            src.matches(session_send).count(),
+            1,
+            "PTY への送り口が増えている (片方だけ記録される嘘が生まれる)"
+        );
+        let wb = body_of(
+            "    pub fn write_bytes(&mut self, bytes: &[u8]) {",
+            "Session::write_bytes",
+        );
+        assert!(
+            wb.contains(session_send),
+            "write_bytes が PtyWriter を通していない"
+        );
+
+        // ③ 出荷側が writer へログを渡している (渡さないと②③とも空回り)。
+        let spawn = body_of(
+            "    pub fn spawn(id: u64, spec: SpawnSpec, ctx: egui::Context) -> Result<Self, String> {",
+            "Session::spawn",
+        );
+        assert!(
+            spawn.contains("input_logging_enabled(") && spawn.contains("input_log"),
+            "Session::spawn が writer へ生ログを渡していない"
+        );
     }
 }
 
@@ -12887,6 +13546,35 @@ mod cjk_tests {
             plan.out
         );
         assert_eq!(state, "にほ");
+    }
+
+    /// **フォルダ信頼確認へ素の Enter を送らない (既定が「No, exit」)。**
+    ///
+    /// 実機で Team が新しいフォルダ (`~/dev/Test5`) に担当を起こすたび、
+    /// Claude Code が `× 終了 (code 1)` で落ちていた。**落としていたのは
+    /// Zaivern 自身**だった:
+    ///
+    /// 1. この画面が「承認待ち」と認識されない (`auto_yes_reply_for` が
+    ///    `None` を返し、`ATTENTION_PATTERNS` にも当たらない)
+    /// 2. だから指示の配達が止まらず、本文を打ち込んで確定キーを送る
+    /// 3. 既定の選択は `No, exit` なので、Enter は**終了**を選ぶ
+    ///
+    /// 肯定は 1 つ下にあるので、**下へ移動してから確定**する。
+    #[test]
+    fn claude_のフォルダ信頼確認は下へ移動してから確定する() {
+        let screen = "Accessing workspace:\n\n/Users/me/dev/Test5\n\n\
+             Quick safety check: Is this a project you created or one you trust?\n\n\
+             Claude Code'll be able to read, edit, and execute files here.\n\n\
+             Security guide\n\n\
+             \u{203a} No, exit\n  Yes, I trust this folder\n\n\
+             Enter to confirm \u{b7} Esc to cancel";
+        let (keys, _why) = super::auto_yes_reply_for(screen, Some("claude"))
+            .expect("承認待ちとして認識できる (認識しないと本文を打ち込んで終了させる)");
+        assert_eq!(
+            keys, b"\x1b[B\r",
+            "下へ移動してから確定していない (素の Enter は No, exit を選ぶ)"
+        );
+        assert_ne!(keys, b"\r", "素の Enter はセッションを終了させる");
     }
 
     /// 変換中のキー (Enter / 矢印 / Escape) は IME に渡し、端末へは送らないこと。

@@ -89,7 +89,7 @@ pub fn parse_review(body: &str, want_task: TaskId) -> Result<AcceptedReview, Rev
         return Err(ReviewReject::TooLarge { bytes: body.len() });
     }
     let doc: ReviewDoc =
-        serde_json::from_str(body).map_err(|e| ReviewReject::BadJson(e.to_string()))?;
+        super::result_parser::parse_lenient(body).map_err(ReviewReject::BadJson)?;
     if doc.task_id != want_task {
         return Err(ReviewReject::TaskMismatch {
             got: doc.task_id,

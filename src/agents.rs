@@ -192,8 +192,6 @@ impl AgentSpec {
 const FILE_REF_SYNTAX: &[(&str, &str)] = &[
     // claude: `@path/to/file` で対象ファイルを読み込む (Claude Code の公式ドキュメント)
     ("claude", "@{path}"),
-    // gemini: `@path/to/file` でファイル/ディレクトリの内容をプロンプトへ差し込む
-    ("gemini", "@{path}"),
 ];
 
 /// 「フラグ + 値」の 2 トークンで自動承認になる指定の表。
@@ -207,7 +205,7 @@ const TWO_TOKEN_BYPASS: &[(&str, &[&str])] = &[
         "--permission-mode",
         &["bypassPermissions", "bypass", "yolo"],
     ),
-    // gemini / qwen — `--approval-mode yolo` (実機 `gemini --help` で確認)
+    // qwen — `--approval-mode yolo`
     ("--approval-mode", &["yolo"]),
 ];
 
@@ -292,11 +290,6 @@ const ACCOUNT_ENVS: &[(&str, &[&str], &[&str])] = &[
         &["CODEX_HOME"],
     ),
     (
-        "gemini",
-        &["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"],
-        &[],
-    ),
-    (
         "qwen",
         &["DASHSCOPE_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"],
         &[],
@@ -375,8 +368,12 @@ pub fn launch_args_for(bin: &str) -> &'static str {
 /// [`AGENT_CATALOG`] 全件を出すので、いつでもプリセットに追加できる。
 /// 既定を短く保つのは、初回のプルダウンが 60 行になるのを避けるため。
 /// **この機で `--help` を実行して全項目を確認できた CLI だけ**を並べている。
-pub const DEFAULT_PRESET_BINS: &[&str] =
-    &["claude", "codex", "gemini", "agy", "cursor-agent", "droid"];
+///
+/// **gemini は外してある。** 利用者の判断でサービスを使わないため、既定の
+/// プルダウンには出さない。カタログ ([`AGENT_CATALOG`]) には残してあるので、
+/// 既に `config.toml` へ書いている人の設定は今までどおり動く
+/// (カタログごと消すと、その人のプリセットが黙って解決できなくなる)。
+pub const DEFAULT_PRESET_BINS: &[&str] = &["claude", "codex", "agy", "cursor-agent", "droid"];
 
 /// 実行ファイル名の別名表。
 ///
@@ -395,7 +392,6 @@ const AGENT_ALIASES: &[(&str, &str, bool)] = &[
     ("antigravity", "agy", true),
     ("antigravity-cli", "agy", true),
     ("claude-code", "claude", true),
-    ("gemini-cli", "gemini", true),
     ("mimo-code", "mimo", true),      // orca の TuiAgent ID
     ("qwen-code", "qwen", true),      // orca の TuiAgent ID
     ("mistral-vibe", "vibe", true),   // orca detectCmdAliases
@@ -456,26 +452,6 @@ pub const AGENT_CATALOG: &[AgentSpec] = &[
         switch_keys: "/permissions\r",
         switch_hint: "権限モード切替 (/permissions)",
         resume_flag: "resume --last",
-    },
-    // Gemini CLI (Google)。**この機の `gemini --help` 実行結果から全項目を確認済み**。
-    // `--approval-mode yolo` (2 トークン) は TWO_TOKEN_BYPASS 表で除去される。
-    // `--resume` は「"latest" か番号」を取り、セッション ID は取らない (だから
-    // resume_id_flag は空 — orca は `gemini --resume <id>` を使うが、この機の
-    // gemini 0.52 の help とは食い違うため採用しない)。
-    AgentSpec {
-        bin: "gemini",
-        label: "Gemini CLI",
-        icon: "✨",
-        auto_flag: "--yolo",
-        auto_env: &[],
-        strip: &["--yolo", "-y", "--approval-mode=yolo"],
-        headless: "-p",
-        model_flag: "-m",
-        install: "npm i -g @google/gemini-cli",
-        note: "`--approval-mode` は default|auto_edit|yolo|plan。全自動は `--yolo`",
-        switch_keys: "",
-        switch_hint: "",
-        resume_flag: "--resume latest",
     },
     AgentSpec {
         bin: "grok",
@@ -1045,6 +1021,22 @@ pub static PROMPT_RULES: &[PromptRule] = &[
         reply: b"\r",
         desc: "Antigravity の編集受け入れに Enter",
     },
+    // **Claude Code のフォルダ信頼確認。既定は「No, exit」。**
+    //
+    // ここへ素の Enter を送ると**セッションが終了する** (実機で
+    // `× 終了 (code 1)` を観測。Team が新しいフォルダで担当を起こすたびに
+    // 起きる)。肯定は 1 つ下にあるので、**下へ移動してから確定**する。
+    //
+    // 汎用のヒューリスティックは "No, exit" を打ち消し語として持っている
+    // ので、この規則が無いと**誰も答えないまま終わる**。守りとしては
+    // 正しいが、答えないままでは進まない。
+    PromptRule {
+        agent: "claude",
+        needles: &["Yes, I trust this folder", "No, exit"],
+        avoid: &[],
+        reply: b"\x1b[B\r",
+        desc: "Claude Code のフォルダ信頼確認 (既定が No, exit なので下へ移動してから確定)",
+    },
     // フォルダ信頼確認 (起動直後)。肯定が既定選択。
     PromptRule {
         agent: "agy",
@@ -1477,18 +1469,6 @@ pub const ACP_CATALOG: &[crate::acp::AcpEntry] = &[
         note: "session/new の結果に非標準の models が付く",
     },
     crate::acp::AcpEntry {
-        id: "gemini",
-        label: "Gemini CLI (ACP)",
-        icon: "✨",
-        // 本体が --acp を持つので、入っていれば直接起動する。
-        local_bin: "gemini",
-        local_args: &["--acp"],
-        npx_package: "@google/gemini-cli",
-        npx_version: "0.54.4",
-        npx_args: &["--acp"],
-        note: "sessionCapabilities を広告しない (再開・一覧は非対応)",
-    },
-    crate::acp::AcpEntry {
         id: "github-copilot",
         label: "GitHub Copilot (ACP)",
         icon: "🐙",
@@ -1813,6 +1793,84 @@ fn is_safe_session_id(id: &str) -> bool {
 const TERMINAL_SCROLLBACK_ENV: &[(&str, &[(&str, &str)])] =
     &[("claude", &[("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")])];
 
+/// **エージェントごとの「入力の受け取り方」。**
+///
+/// ここが 1 か所である意味は大きい。CLI ごとの癖を送信側 (`submit.rs`) に
+/// 散らすと、CLI が 1 つ増えるたびに送信の分岐が増えて、どれがどれのために
+/// 書かれた条件なのか誰にも分からなくなる。**癖はデータとして持つ**
+/// (CLAUDE.md「エージェント固有値はカタログにデータとして持つ」)。
+///
+/// | 項目 | 意味 |
+/// |---|---|
+/// | `ready_ms` | 起動から**入力を受け取れるようになるまで**の目安 (ミリ秒) |
+/// | `commit` | 送信を確定するキー列。既定は `\r` |
+///
+/// ## `ready_ms` が要る理由 (実測)
+///
+/// Claude Code v2 は起動直後の数秒、**stdin へ書いても画面に何も出ない**。
+/// Zaivern は書けたつもりで確定キーまで送り、配達を「完了」と記録するが、
+/// 相手には 1 文字も届いていない (実機: Antigravity のログには指示が 144 件
+/// 現れるのに、Claude Code のログには 0 件で、ログ自体が起動表示だけの 6KB)。
+///
+/// **待てば直る**ので、待つ時間を CLI ごとに持つ。0 の CLI は待たない。
+const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
+    // Claude Code: 起動直後に書いても落ちる。実測で 3 秒あれば受け取る。
+    ("claude", 3_000, b"\r"),
+    // Codex: MCP を立ち上げ終わるまで確定キーを飲み込む。実機で
+    // `⚠ MCP startup incomplete` が出ている間に撃つと、本文が入力欄に
+    // 残ったまま止まった。**落ちるのは最初の 1 通だけ**で、そのあとは
+    // 普通に動く (利用者の報告) ので、起動ぶんだけ待てばよい。
+    //
+    // 10 秒は実測から置いた**暫定値**。MCP の数だけ伸びるので、足りない
+    // 環境が出たらここを増やす — 送信側は 1 行も変えなくてよい。
+    ("codex", 10_000, b"\r"),
+];
+
+/// **貼り付けを畳んで見せる CLI の、その見出し。**
+///
+/// 長い本文を貼ると、入力欄に本文ではなく要約を出す CLI がある:
+///
+/// | CLI | 入力欄に出るもの |
+/// |---|---|
+/// | Codex | `[Pasted Content 2329 chars]` |
+/// | Claude Code | `[Pasted text #3 +103 lines]` |
+///
+/// これは**送信の確認を丸ごと壊す**。確認は「本文の末尾が入力欄に
+/// 残っていないか」で届いたかを見るので、畳まれると**残っているのに
+/// 消えたように見え、送れていないのに「送信済み」と記録される**。
+/// 実機ではこれで 6 通中 2 通が入力欄に残ったまま「配達完了」になり、
+/// 担当は 1 文字も受け取らないまま「作業中」と表示されていた。
+///
+/// **CLI ごとの分岐は作らない。** 見出しの一覧をここに置き、
+/// [`crate::submit::still_pending`] が 1 か所で見る。
+pub const PASTE_PLACEHOLDERS: &[&str] = &["[pasted content", "[pasted text", "[pasted"];
+
+/// 入力欄のこの見え方は「貼っただけで、まだ送っていない」か。
+///
+/// 大小は問わない (CLI ごとに綴りが違う)。
+pub fn looks_like_pending_paste(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    PASTE_PLACEHOLDERS.iter().any(|p| lower.contains(p))
+}
+
+/// この CLI が入力を受け取れるようになるまでの目安 (ミリ秒)。持たなければ 0。
+pub fn input_ready_ms(bin: &str) -> u64 {
+    SUBMIT_PROFILES
+        .iter()
+        .find(|(b, _, _)| *b == bin)
+        .map(|(_, ms, _)| *ms)
+        .unwrap_or(0)
+}
+
+/// 送信を確定するキー列。持たなければ `\r`。
+pub fn commit_keys(bin: &str) -> &'static [u8] {
+    SUBMIT_PROFILES
+        .iter()
+        .find(|(b, _, _)| *b == bin)
+        .map(|(_, _, k)| *k)
+        .unwrap_or(b"\r")
+}
+
 /// `bin` に対応する履歴用 env を返す。持たない CLI は空。
 fn scrollback_env_for(bin: &str) -> &'static [(&'static str, &'static str)] {
     TERMINAL_SCROLLBACK_ENV
@@ -2093,9 +2151,9 @@ impl AgentManager {
         Ok(())
     }
 
-    pub fn remove(&mut self, i: usize) {
+    fn take_removed(&mut self, i: usize) -> Option<Session> {
         if i >= self.sessions.len() {
-            return;
+            return None;
         }
         // 閉じたセッションの承認待ち・重複記録を捨てる。PID と同じく
         // セッション ID は再利用され得るので、残すと別セッションの
@@ -2106,7 +2164,7 @@ impl AgentManager {
         // 取り除いたセッションは**この場で drop しない**。ConPTY を閉じる
         // Drop は UI スレッドを止め得るので、後始末ごと reap に預ける
         // (crate::terminal::reap の説明を参照)。
-        crate::terminal::reap(self.sessions.remove(i));
+        let removed = self.sessions.remove(i);
         // active より左を閉じたら、フォーカス中セッションが左へ1つ詰まるので
         // active も詰める(でないとキーボード/リモート入力が隣のセッションへ流れる)。
         // i == active が最右のときは下のクランプが左隣へ寄せる(従来挙動のまま)。
@@ -2116,6 +2174,19 @@ impl AgentManager {
         if self.active >= self.sessions.len() && !self.sessions.is_empty() {
             self.active = self.sessions.len() - 1;
         }
+        Some(removed)
+    }
+
+    #[cfg(test)]
+    pub fn remove(&mut self, i: usize) {
+        if let Some(session) = self.take_removed(i) {
+            crate::terminal::reap(session);
+        }
+    }
+
+    /// Team RunのClose用。削除完了を待つ側へreaperの札を返す。
+    pub fn remove_tracked(&mut self, i: usize) -> Option<crate::terminal::ReapHandle> {
+        self.take_removed(i).map(crate::terminal::reap_tracked)
     }
 
     /// 稼働中のセッションを**全部**止める (タブは残す)。戻り値は止めに行った本数。
@@ -2481,26 +2552,6 @@ pub static HOOK_TARGETS: &[HookTarget] = &[
         deny: DENY_HOOK_SPECIFIC_OUTPUT,
         verified: "codex-cli 0.147.0 — 実在の ~/.codex/hooks.json と同じ形で発火を観測 (`codex exec` 実行中に PostToolUse / Stop のフックが走った) + `codex features list` に `hooks stable true` + 実行ファイルの strings に hookSpecificOutput/permissionDecision/permissionDecisionReason と *** Update File: 系マーカー",
     },
-    HookTarget {
-        bin: "gemini",
-        // gemini はフック専用ファイルを持たず、通常の設定ファイルに同居する。
-        settings_rel: ".gemini/settings.json",
-        // **イベント名が claude 系と全く違う** (Pre/Post ではなく Before/After)。
-        events: &[
-            ("SessionStart", ProtoState::Starting, false),
-            ("BeforeTool", ProtoState::Running, true),
-            ("AfterTool", ProtoState::Thinking, false),
-            ("SessionEnd", ProtoState::Done, false),
-        ],
-        gate_event: "BeforeTool",
-        tools: GEMINI_TOOLS,
-        write_path_keys: &["file_path"],
-        command_tools: GEMINI_COMMAND_TOOLS,
-        patch_tools: &[],
-        activation: GEMINI_ACTIVATION,
-        deny: DENY_TOP_LEVEL_DECISION,
-        verified: "gemini-cli 0.51.0 — 公式 docs/hooks/reference.md の settings.json スキーマ (hooks.<Event>[].hooks[] は claude と同形) と decision/reason 出力 + 実行ファイルの bundle に GEMINI_CLI_HOME / GEMINI_DIR / trustedFolders.json / TRUST_FOLDER・TRUST_PARENT・DO_NOT_TRUST + 実機で「信頼されていないフォルダではプロジェクト設定を読まない」旨のエラーを観測。**フック発火そのものはアカウント階層 (IneligibleTierError) で未観測**",
-    },
 ];
 
 // ── 拒否の返し方 (ひな形はここにしか無い) ──────────────────────────
@@ -2512,14 +2563,6 @@ pub static HOOK_TARGETS: &[HookTarget] = &[
 /// 正規の permission decision を使う (エラーではなく判断なので)。
 const DENY_HOOK_SPECIFIC_OUTPUT: DenyShape = DenyShape {
     template: r#"{"hookSpecificOutput":{"hookEventName":"{event}","permissionDecision":"deny","permissionDecisionReason":"{reason}"}}"#,
-    exit: 0,
-};
-
-/// gemini の `BeforeTool` 出力スキーマ (**top-level** に置く)。
-///
-/// claude 形の入れ子で返しても gemini は読まないので、**素通りする**。
-const DENY_TOP_LEVEL_DECISION: DenyShape = DenyShape {
-    template: r#"{"decision":"deny","reason":"{reason}"}"#,
     exit: 0,
 };
 
@@ -2568,34 +2611,6 @@ const CODEX_ACTIVATION: &[Activation] = &[Activation {
     file_rel: "config.toml",
     missing: "codex がこのフックをまだ承認していないため、書き込みは止まりません",
     how: "codex を起動して /hooks を実行し、Zaivern のフックを信頼 (trust) してください",
-}];
-
-// ── gemini ───────────────────────────────────────────────────────
-
-/// gemini のツール名 → 状態 (公式 docs/tools の名前と引数)。
-const GEMINI_TOOLS: &[(&str, ProtoState)] = &[
-    ("write_file", ProtoState::Editing),
-    ("replace", ProtoState::Editing),
-];
-
-/// gemini のコマンド文字列を持つツール。
-const GEMINI_COMMAND_TOOLS: &[(&str, &str)] = &[("run_shell_command", "command")];
-
-/// gemini は**信頼していないフォルダではプロジェクトの設定ファイルを読まない**。
-///
-/// 読まない = `.gemini/settings.json` に書いたフックも読まれない。
-/// 実機で観測したエラー:
-/// 「Gemini CLI is not running in a trusted directory.」
-const GEMINI_ACTIVATION: &[Activation] = &[Activation {
-    kind: ActivationKind::TrustedFolderJson {
-        trusted: &["TRUST_FOLDER"],
-        trusted_parent: "TRUST_PARENT",
-    },
-    home_env: "GEMINI_CLI_HOME",
-    home_rel: ".gemini",
-    file_rel: "trustedFolders.json",
-    missing: "gemini がこのフォルダを信頼していないため、プロジェクトの設定ごと読まれません",
-    how: "gemini を起動してこのフォルダを信頼するか、環境変数 GEMINI_CLI_TRUST_WORKSPACE=true で起動してください",
 }];
 
 /// フック設定の対象。持たないエージェントでは `None`。
@@ -3461,15 +3476,6 @@ mod ladder_catalog_tests {
                 assert_eq!(o["permissionDecision"], "deny");
                 assert_eq!(o["permissionDecisionReason"], r);
             }),
-            ("gemini", |v, r| {
-                // gemini は **top-level**。入れ子で返しても読まれない。
-                assert_eq!(v["decision"], "deny");
-                assert_eq!(v["reason"], r);
-                assert!(
-                    v.get("hookSpecificOutput").is_none(),
-                    "gemini に claude 形を混ぜている"
-                );
-            }),
         ];
         for (bin, check) in cases {
             let (json, exit) = deny_payload(bin, reason).expect("拒否を組み立てられない");
@@ -3540,38 +3546,6 @@ mod ladder_catalog_tests {
             hook_write_targets("codex", "Bash", &sh).paths,
             vec!["src/d.rs"]
         );
-    }
-
-    #[test]
-    fn geminiは自分のツール名とキーで書き込みを拾う() {
-        let write = serde_json::json!({
-            "tool_name": "write_file",
-            "tool_input": { "file_path": "/w/x.rs", "content": "…" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "write_file", &write).paths,
-            vec!["/w/x.rs"]
-        );
-        let replace = serde_json::json!({
-            "tool_name": "replace",
-            "tool_input": { "file_path": "/w/y.rs", "old_string": "a", "new_string": "b" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "replace", &replace).paths,
-            vec!["/w/y.rs"]
-        );
-        // シェルは claude の `Bash` ではなく `run_shell_command`
-        let sh = serde_json::json!({
-            "tool_name": "run_shell_command",
-            "tool_input": { "command": "sed -i '' s/a/b/ /w/z.rs" },
-        });
-        assert_eq!(
-            hook_write_targets("gemini", "run_shell_command", &sh).paths,
-            vec!["/w/z.rs"]
-        );
-        // claude 名のツールで来ても gemini には無いので拾わない (取り違え防止)
-        assert!(hook_command_key("gemini", "Bash").is_none());
-        assert!(hook_tool_state("gemini", "Edit").is_none());
     }
 
     #[test]
@@ -3693,7 +3667,7 @@ mod ladder_catalog_tests {
         assert!(title_generator("そんなCLIは無い").is_none());
         assert!(title_generator_for_command("bash -lc ls").is_none());
         // 実行を観測できていない CLI は**意図的に**表へ入れていない。
-        for bin in ["gemini", "cursor-agent", "droid"] {
+        for bin in ["cursor-agent", "droid"] {
             assert!(
                 title_generator(bin).is_none(),
                 "{bin}: 実行を確認できていないのに命名器として宣言されている"
@@ -4380,7 +4354,6 @@ mod tests {
             "claude --model opus",
             "/usr/local/bin/claude",
             "codex",
-            "gemini",
             // シェル**経由で**エージェントを起こす形は「素のシェル」ではない…
             // わけではない: 先頭がシェルなら人が叩いている可能性のほうが高いので
             // 素のシェル扱いにする。取りこぼす側 (false negative) に倒すのは、
@@ -4693,7 +4666,6 @@ mod tests {
     fn alias_lookup_table() {
         let table: &[(&str, &str)] = &[
             ("claude-code", "claude"),
-            ("gemini-cli", "gemini"),
             ("antigravity", "agy"),
             ("antigravity-cli", "agy"),
             ("mimo-code", "mimo"),
@@ -5356,6 +5328,48 @@ mod tests {
                     "死んだセッションへイベントが出た"
                 );
             }
+        }
+    }
+
+    /// **エージェントごとの癖は、カタログ 1 か所に置く。**
+    ///
+    /// 送信側 (`submit.rs` / `app::agent_sessions`) に CLI ごとの分岐を書くと、
+    /// CLI が 1 つ増えるたびに条件が増えて、どれがどれのために書かれたのか
+    /// 誰にも分からなくなる (CLAUDE.md「エージェント固有値はカタログにデータと
+    /// して持つ」)。
+    #[test]
+    fn エージェントごとの癖はカタログにだけ置く() {
+        // カタログは名前で引ける (持たない CLI には既定が返る)。
+        assert!(
+            super::input_ready_ms("claude") > 0,
+            "Claude Code の待ちが無い"
+        );
+        // **最初の 1 通で諦めない。** Codex は MCP を立ち上げ終わるまで確定キーを
+        // 飲み込む (実機で `⚠ MCP startup incomplete` の間に撃って止まった)。
+        // そのあとは普通に動くので、起動ぶんだけ待てばよい。
+        assert!(
+            super::input_ready_ms("codex") >= 5_000,
+            "Codex の起動待ちが短すぎる (最初の 1 通が落ちる)"
+        );
+        assert_eq!(
+            super::input_ready_ms("そんなCLIは無い"),
+            0,
+            "既定は待たない"
+        );
+        assert_eq!(
+            super::commit_keys("そんなCLIは無い"),
+            b"\r",
+            "既定の確定キーは Enter"
+        );
+
+        // **送信側に CLI 名を書かない。** 分岐が散り始める最初の兆候がこれ。
+        let submit = include_str!("submit.rs").replace("\r\n", "\n");
+        for bin in ["claude", "codex", "agy", "cursor-agent", "droid"] {
+            let needle = format!("\"{bin}\"");
+            assert!(
+                !submit.contains(&needle),
+                "submit.rs に CLI 名 {needle} が書かれている (癖はカタログへ)"
+            );
         }
     }
 }
