@@ -2354,7 +2354,7 @@ impl TeamRuntime {
         &mut self,
         task: TaskId,
         session: SessionId,
-        pid: Option<u32>,
+        writer: Option<crate::terminal::writer_tree::Identity>,
     ) -> Result<(), String> {
         let Some(task) = self.task(task) else {
             return Err("配送先のタスクがありません".into());
@@ -2371,10 +2371,10 @@ impl TeamRuntime {
         let Some(hold) = hold.filter(|h| h.task == id && h.session == session) else {
             return Err("担当指示の所有権がありません".into());
         };
-        let pid = pid
-            .filter(|p| *p != 0)
+        let writer = writer
+            .filter(|w| w.pid != 0)
             .ok_or("統合担当のプロセスを確認できません")?;
-        hold.permit.handoff_writer(Some(pid))
+        hold.permit.handoff_identity(writer)
     }
 
     /// 配送の各段で照合する。停止中は保留、旧世代・旧担当は破棄する。
@@ -2394,10 +2394,13 @@ impl TeamRuntime {
             .worker_holds
             .iter()
             .filter_map(|(id, hold)| {
+                if hold.permit.writer_draining() {
+                    return None;
+                }
                 let session = obs.sessions.iter().find(|s| s.id == hold.session);
                 let exited = session.is_none_or(|s| s.state == SessionState::Exited);
                 if exited {
-                    return Some(*id);
+                    return hold.permit.writer_stopped().then_some(*id);
                 }
                 if self.run.stopped {
                     return None;
@@ -2505,11 +2508,17 @@ impl TeamRuntime {
         let Some(hold) = self.integration.as_ref() else {
             return;
         };
+        if hold.permit.writer_draining() {
+            return;
+        }
         let Some(task) = self.task(hold.task).cloned() else {
             return;
         };
         let session = obs.sessions.iter().find(|s| s.id == hold.session);
         let exited = session.is_none_or(|s| s.state == SessionState::Exited);
+        if exited && !hold.permit.writer_stopped() {
+            return;
+        }
         let idle = session.is_some_and(|s| coordinator::deliverable(s.state));
         let submitted = task.state == TeamTaskState::Submitted;
         let reported = task.state == TeamTaskState::Validating || submitted;
@@ -3118,6 +3127,7 @@ impl TeamRuntime {
             .iter()
             .filter(|t| t.state.is_held())
             .filter(|t| self.publication.as_ref().is_none_or(|job| job.task != t.id))
+            .filter(|t| !self.task_writer_pending(t.id))
             .filter_map(|t| t.assigned_session.map(|s| (t.id, s)))
             .filter(|(_, s)| !alive.contains(s))
             .collect();
@@ -5170,7 +5180,17 @@ impl TeamRuntime {
     /// `count_attempt` が真のときだけ試行回数を数える (セッションが落ちた
     /// 場合は数え、人が配り直した場合は数えない — 人の操作を失敗として
     /// 記録すると、上限に早く当たって使えなくなる)。
+    fn task_writer_pending(&self, task: TaskId) -> bool {
+        self.worker_holds
+            .get(&task)
+            .or_else(|| self.integration.as_ref().filter(|hold| hold.task == task))
+            .is_some_and(|hold| !hold.permit.writer_stopped())
+    }
+
     fn free_task(&mut self, task: TaskId, count_attempt: bool) {
+        if self.task_writer_pending(task) {
+            return;
+        }
         if let Some(job) = self.publication.as_ref().filter(|job| job.task == task) {
             if self.task(task).is_some_and(|t| t.reassign_pending) {
                 job.cancel.store(true, std::sync::atomic::Ordering::Release);
@@ -7101,6 +7121,10 @@ mod seen_key_tests {
 }
 
 #[cfg(test)]
+#[path = "descendant_tests.rs"]
+mod descendant_tests;
+
+#[cfg(test)]
 #[path = "integration_runtime_tests.rs"]
 mod integration_runtime_tests;
 #[cfg(test)]
@@ -7184,7 +7208,11 @@ mod worker_ownership_tests {
                 } = effect
                 {
                     self.rt
-                        .handoff_integration_writer(task, session, Some(std::process::id()))
+                        .handoff_integration_writer(
+                            task,
+                            session,
+                            crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+                        )
                         .unwrap();
                     self.rt.note_effect_done(&key);
                     assigned.push(task);
@@ -7206,6 +7234,97 @@ mod worker_ownership_tests {
         fn drop(&mut self) {
             drop(self.rt.take_integration_for_shutdown());
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn exited_parent_keeps_descendant_worker_ownership() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let task = c.rt.task(tasks[0]).unwrap().clone();
+        let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        let mut writer = super::descendant_tests::Descendant::spawn(
+            task.assigned_session.unwrap(),
+            &work,
+            "late.txt",
+        );
+        let session = writer.session.as_ref().unwrap();
+        c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+            .unwrap();
+        writer.exit_parent();
+        assert!(c.tick(SessionState::Exited).is_empty());
+        assert!(
+            c.locked(task.id),
+            "parent exit released ownership while its descendant could still write"
+        );
+        // A restored Run cannot bypass the old writer's actual part lease.
+        let mut restored = Case {
+            root: c.root.clone(),
+            rt: TeamRuntime::restore(c.rt.to_saved(), c.root.clone()),
+            sessions: vec![],
+        };
+        restored.bind();
+        assert!(!restored.tick(SessionState::Idle).contains(&task.id));
+        writer.finish_child();
+        assert_eq!(
+            std::fs::read_to_string(work.join("late.txt")).unwrap(),
+            "late writer"
+        );
+        c.tick(SessionState::Exited);
+        assert!(!c.locked(task.id));
+        assert!(restored.tick(SessionState::Idle).contains(&task.id));
+    }
+
+    #[test]
+    fn stopped_removed_or_discarded_parent_retains_descendant_custody() {
+        for mode in ["stop", "tab", "discard", "exit"] {
+            let mut c = Case::new();
+            c.bind();
+            let tasks = c.tick(SessionState::Idle);
+            let task = c.rt.task(tasks[0]).unwrap().clone();
+            let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer = super::descendant_tests::Descendant::spawn(
+                task.assigned_session.unwrap(),
+                &work,
+                "late.txt",
+            );
+            let session = writer.session.as_ref().unwrap();
+            c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+                .unwrap();
+            writer.exit_parent();
+            c.rt.apply_action(TeamAction::Stop);
+            c.tick(SessionState::Exited);
+            assert!(c.locked(task.id));
+            if mode == "discard" {
+                let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
+                drop(std::mem::replace(&mut c.rt, replacement));
+                assert!(c.locked(task.id));
+                writer.finish_child();
+            } else {
+                if mode == "stop" {
+                    writer.session.as_mut().unwrap().kill();
+                }
+                let handle = if mode == "exit" {
+                    crate::terminal::abandon_tracked(writer.session.take().unwrap())
+                } else {
+                    crate::terminal::reap_tracked(writer.session.take().unwrap())
+                };
+                c.sessions.clear();
+                c.tick(SessionState::Exited);
+                if !writer.tree.finished() {
+                    assert!(c.locked(task.id));
+                }
+                super::descendant_tests::wait_until(|| handle.is_finished());
+            }
+            super::descendant_tests::wait_until(|| {
+                c.tick(SessionState::Exited);
+                !c.locked(task.id)
+            });
         }
     }
 
@@ -7318,8 +7437,12 @@ mod worker_ownership_tests {
         }
         for id in &tasks {
             let session = c.rt.task(*id).unwrap().assigned_session.unwrap();
-            c.rt.handoff_integration_writer(*id, session, Some(child.0.id()))
-                .unwrap();
+            c.rt.handoff_integration_writer(
+                *id,
+                session,
+                crate::terminal::writer_tree::Identity::for_test(child.0.id()),
+            )
+            .unwrap();
         }
         let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
         drop(std::mem::replace(&mut c.rt, replacement));
@@ -7414,8 +7537,12 @@ mod worker_ownership_tests {
                 task, session, key, ..
             } = effect
             {
-                c.rt.handoff_integration_writer(task, session, Some(std::process::id()))
-                    .unwrap();
+                c.rt.handoff_integration_writer(
+                    task,
+                    session,
+                    crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+                )
+                .unwrap();
                 c.rt.note_effect_done(&key);
             }
         }
@@ -7449,8 +7576,12 @@ mod worker_ownership_tests {
                 _ => None,
             })
             .expect("後任の完了後に統合へ進む");
-        c.rt.handoff_integration_writer(assembly.0, assembly.1, Some(std::process::id()))
-            .unwrap();
+        c.rt.handoff_integration_writer(
+            assembly.0,
+            assembly.1,
+            crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+        )
+        .unwrap();
         c.rt.note_effect_done(&assembly.2);
         let task = c.rt.task(assembly.0).unwrap().clone();
         let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)

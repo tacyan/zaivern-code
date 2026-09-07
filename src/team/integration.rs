@@ -17,18 +17,46 @@ pub struct Permit {
     source: PathBuf,
     store: PathBuf,
     holder: Holder,
+    writer: Option<std::sync::Arc<crate::terminal::writer_tree::Tree>>,
 }
 
 impl Permit {
     /// Persist the actual writer tree alongside the publisher PID carried in the
     /// session token. Either may still write: the agent builds, the app publishes.
     pub fn handoff_writer(&mut self, pid: Option<u32>) -> Result<(), String> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        self.handoff(pid, None)
+    }
+
+    pub fn handoff_identity(
+        &mut self,
+        writer: crate::terminal::writer_tree::Identity,
+    ) -> Result<(), String> {
+        self.handoff(Some(writer.pid), writer.tree)
+    }
+
+    fn handoff(
+        &mut self,
+        pid: Option<u32>,
+        writer: Option<std::sync::Arc<crate::terminal::writer_tree::Tree>>,
+    ) -> Result<(), String> {
         // An already-exited terminal no longer exposes its PID. Do not erase
         // the writer recorded before delivery: it is still the recovery proof.
         let Some(pid) = pid.filter(|pid| *pid != 0) else {
             return Ok(());
         };
         let mut replacement = self.holder.clone();
+        #[cfg(windows)]
+        if let Some(tree) = &writer {
+            let token = self
+                .holder
+                .session
+                .rsplit_once('|')
+                .map_or(self.holder.session.as_str(), |(_, token)| token);
+            replacement.session = format!("{}|{token}", tree.job.name);
+        }
         replacement.agent = RETIRED.into();
         replacement.pid = pid;
         let updated = lease::with_store_retry(&self.store, |state| {
@@ -45,6 +73,7 @@ impl Permit {
         if !updated {
             return Err("統合の所有権を停止処理へ引き継げません".into());
         }
+        self.writer = writer;
         self.holder = replacement;
         Ok(())
     }
@@ -52,6 +81,14 @@ impl Permit {
     /// Ownership outlives the Runtime and the UI. On process exit the persistent
     /// writer PID protects the lease even if this waiting thread disappears.
     pub fn release_after(self, handle: crate::terminal::ReapHandle) {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|tree| !handle.tracks(tree))
+        {
+            self.release_when_writer_stops();
+            return;
+        }
         if handle.is_finished() {
             drop(self);
             return;
@@ -66,13 +103,28 @@ impl Permit {
 
     /// A discarded Runtime cannot publish anymore, but its writer may still
     /// be running until the queued Stop reaches the terminal/reaper.
+    pub fn writer_draining(&self) -> bool {
+        self.writer.as_ref().is_some_and(|tree| tree.draining())
+    }
+
+    pub fn writer_stopped(&self) -> bool {
+        if let Some(tree) = &self.writer {
+            return tree.finished();
+        }
+        #[cfg(test)]
+        if self.holder.pid == std::process::id() {
+            return true;
+        } // Synthetic SessionObs.
+        self.holder.agent != RETIRED || !crate::terminal::process_tree_alive(self.holder.pid)
+    }
+
     pub fn release_when_writer_stops(self) {
-        if self.holder.agent != RETIRED || !crate::terminal::process_tree_alive(self.holder.pid) {
+        if self.writer_stopped() {
             drop(self);
             return;
         }
         std::thread::spawn(move || {
-            while crate::terminal::process_tree_alive(self.holder.pid) {
+            while !self.writer_stopped() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             drop(self);
@@ -80,6 +132,14 @@ impl Permit {
     }
 
     pub fn retire(mut self, handle: crate::terminal::ReapHandle) -> Result<(), String> {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|tree| !handle.tracks(tree))
+        {
+            self.release_when_writer_stops();
+            return Ok(());
+        }
         if handle.is_finished() {
             return Ok(());
         }
@@ -138,6 +198,21 @@ pub fn try_acquire_task(
 ) -> Result<Option<Permit>, String> {
     let scope = task_workspace::scope(files).ok_or("隔離担当の所有範囲がありません")?;
     try_acquire_at(source, run_id, &format!("{scope}.lease.json"))
+}
+
+fn persisted_writer_alive(holder: &Holder) -> bool {
+    #[cfg(windows)]
+    {
+        // A legacy parent PID cannot prove that orphaned Windows writers died.
+        holder
+            .session
+            .split_once('|')
+            .is_none_or(|(job, _)| crate::terminal::writer_tree::windows::persisted_alive(job))
+    }
+    #[cfg(unix)]
+    {
+        crate::terminal::process_tree_alive(holder.pid)
+    }
 }
 
 fn try_acquire_at(
@@ -203,7 +278,7 @@ fn try_acquire_at(
                             .and_then(|pid| pid.parse::<u32>().ok());
                         // Unknown identity cannot prove that the publisher died.
                         publisher.is_none_or(|pid| pid == 0 || crate::instances::pid_alive(pid))
-                            || crate::terminal::process_tree_alive(l.holder.pid)
+                            || persisted_writer_alive(&l.holder)
                     }
                     _ => true,
                 }
@@ -227,6 +302,7 @@ fn try_acquire_at(
             source,
             store,
             holder,
+            writer: None,
         })),
         Claim::Refused { .. } => Ok(None),
     }
@@ -1546,7 +1622,21 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let mut permit = try_acquire(&f.0, "old-app").unwrap().unwrap();
+        #[cfg(unix)]
         permit.handoff_writer(Some(child.0.id())).unwrap();
+        #[cfg(windows)]
+        {
+            // The probe has acknowledged readiness and is blocked on stdin;
+            // unlike an arbitrary CLI it cannot fork before test assignment.
+            let job = crate::terminal::writer_tree::windows::Job::for_test_assign(child.0.id());
+            let tree = crate::terminal::writer_tree::Tree::register(Some(child.0.id()), job);
+            permit
+                .handoff_identity(crate::terminal::writer_tree::Identity {
+                    pid: child.0.id(),
+                    tree: Some(tree),
+                })
+                .unwrap();
+        }
         let permit = if publisher_alive {
             Some(permit)
         } else {
@@ -1559,7 +1649,12 @@ mod tests {
                     .find(|lease| lease.holder.same(&permit.holder))
                     .unwrap();
                 // Simulate the app process having disappeared while its writer survived.
-                owner.holder.session = format!("old-app:{dead_pid}:1");
+                let token = format!("old-app:{dead_pid}:1");
+                owner.holder.session = owner
+                    .holder
+                    .session
+                    .split_once('|')
+                    .map_or_else(|| token.clone(), |(job, _)| format!("{job}|{token}"));
             })
             .unwrap();
             std::mem::forget(permit);
@@ -1576,6 +1671,23 @@ mod tests {
             drop(permit);
         }
         assert!(try_acquire(&f.0, "new-app").unwrap().is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_parent_only_writer_identity_is_not_completion_proof() {
+        let f = Fixture::new("legacy-writer");
+        let permit = try_acquire(&f.0, "old-app").unwrap().unwrap();
+        let dead = u32::MAX / 2;
+        assert!(!crate::instances::pid_alive(dead));
+        lease::with_store(&permit.store, |state| {
+            state.leases[0].holder.agent = RETIRED.into();
+            state.leases[0].holder.pid = dead;
+            state.leases[0].holder.session = format!("old-app:{dead}:1");
+        })
+        .unwrap();
+        drop(permit); // The old token no longer matches the persisted legacy owner.
+        assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
     }
 
     #[test]

@@ -2529,12 +2529,12 @@ impl TeamPanel {
         owner: &RunOwner,
         task: TaskId,
         session: SessionId,
-        pid: Option<u32>,
+        writer: Option<crate::terminal::writer_tree::Identity>,
     ) -> Result<(), String> {
         let index = self
             .run_pos_of_owner(owner)
             .ok_or("配送先のRunがありません")?;
-        self.runs[index].handoff_integration_writer(task, session, pid)
+        self.runs[index].handoff_integration_writer(task, session, writer)
     }
 
     pub fn delivery_tag(&self, owner: &RunOwner, key: &str) -> Option<String> {

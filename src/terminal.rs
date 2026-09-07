@@ -6,12 +6,17 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+
+#[cfg(test)]
+use portable_pty::ChildKiller;
 
 use crate::i18n::{tr, trf};
 use crate::keybinds::{key_hint, BindAction};
 use crate::lockx::lock_ok;
 use crate::theme::Theme;
+
+pub(crate) mod writer_tree;
 
 pub struct SpawnSpec {
     pub title: String,
@@ -446,11 +451,13 @@ pub struct Session {
     /// パーサを作り直したときに一度だけ出すお知らせ (スクロールバック消失の告知)。
     /// UI が読み取ったら None に戻す。
     pub parser_rebuilt_notice: Option<String>,
+    #[cfg(test)]
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// PTY に直接ぶら下がっている子 (cmd.exe / ログインシェル) の PID。
     /// エージェント本体はその**孫**なので、畳むときはここを起点に
     /// プロセスツリーごと落とす ([`kill_tree_command`] の説明を参照)。
     child_pid: Option<u32>,
+    writer_tree: Arc<writer_tree::Tree>,
     pub exited: Arc<AtomicBool>,
     pub exit_code: Arc<Mutex<Option<u32>>>,
     pub started: Instant,
@@ -2179,13 +2186,25 @@ impl Session {
         // 実際の起動先と食い違わないようにするため)。
         let cwd = crate::pathx::launch_dir(&spec.cwd);
         let cmd = build_command(&spec.command, &cwd, &spec.env);
+        #[cfg(windows)]
+        let (cmd, job) = {
+            let mut cmd = cmd;
+            let job = writer_tree::windows::Job::prepare(&mut cmd)?;
+            (cmd, job)
+        };
         let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| trf("起動に失敗しました: {e}", &[("e", e.to_string())]))?;
+        #[cfg(test)]
         let killer = child.clone_killer();
         // child はこの後 wait 用スレッドへ渡してしまうので、PID は今のうちに取る。
         let child_pid = child.process_id();
+        let writer_tree = writer_tree::Tree::register(
+            child_pid,
+            #[cfg(windows)]
+            job,
+        );
         drop(pair.slave);
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_ROWS)));
@@ -2371,10 +2390,11 @@ impl Session {
             });
         }
         {
+            let writer_tree = writer_tree.clone();
             let exit_code = exit_code.clone();
             let exited = exited.clone();
             std::thread::spawn(move || {
-                if let Ok(status) = child.wait() {
+                if let Ok(status) = writer_tree::wait(&mut *child, &writer_tree, &exited) {
                     *lock_ok(&exit_code) = Some(status.exit_code());
                 }
                 exited.store(true, Ordering::SeqCst);
@@ -2404,8 +2424,10 @@ impl Session {
             resizer: None,
             resizer_spawn_failed: false,
             parser_rebuilt_notice: None,
+            #[cfg(test)]
             killer,
             child_pid,
+            writer_tree,
             exited,
             exit_code,
             started: Instant::now(),
@@ -3268,30 +3290,21 @@ impl Session {
             .map(|s| (s.rows, s.cols))
     }
 
-    /// エージェントを終了させる。孫まで落とすが**待たない**ので、
-    /// UI スレッドから呼んでよい。セッション自体は一覧に残る。
-    ///
-    /// 順序が肝: 先に `killer.kill()` で根 (シェル) を落とすと、
-    /// `taskkill /T` が根を見つけられず木を辿れなくなり、**孫だけが取り残される**。
-    /// 木を落としてから、取りこぼしの保険として根を撃つ。
-    /// Process whose tree owns this PTY. Never expose a recycled, already-waited PID.
+    /// 配送用の生きた親PID。終了表示後に古いPIDを再利用しない。
     pub fn live_process_id(&self) -> Option<u32> {
         kill_target(self.exited.load(Ordering::SeqCst), self.child_pid)
     }
 
+    pub fn writer_identity(&self) -> Option<writer_tree::Identity> {
+        self.live_process_id().map(|pid| writer_tree::Identity {
+            pid,
+            tree: Some(self.writer_tree.clone()),
+        })
+    }
+
+    /// Stopは待たない。終了済みの親にも、同じ追跡対象の子孫が残り得る。
     pub fn kill(&mut self) {
-        // 終了済みなら何もしない。wait 済みの child_pid は OS に返却されており、
-        // 無関係なプロセス (グループ) に再利用され得る — そこへ kill -KILL /
-        // taskkill /T /F を撃つとユーザーの別ジョブを巻き添えにする。
-        if self.exited.load(Ordering::SeqCst) {
-            return;
-        }
-        let pid = self.child_pid;
-        let mut killer = self.killer.clone_killer();
-        std::thread::spawn(move || {
-            kill_tree_blocking(pid);
-            let _ = killer.kill();
-        });
+        self.writer_tree.stop();
     }
 
     /// **出力で画面が流れたぶんを取り込む。**
@@ -3640,19 +3653,9 @@ impl Drop for Session {
         if let Some(r) = self.resizer.take() {
             r.shutdown();
         }
-        // [`reap`] / [`abandon`] を通らずに drop される経路 (テストや異常系) の
-        // 最後の砦。`killer.kill()` は PTY 直下の子 (シェル) にしか届かず、
-        // ログインシェルの子 (`bash -lc '…; sleep N'`) や孫が生き残って
-        // プロセスツリーが漏れる (CI ランナーを飢えさせた原因)。
-        // グループごと落としてから、保険として根も撃つ。
-        let exited = self.exited.load(Ordering::SeqCst);
-        if let Some(pid) = kill_target(exited, self.child_pid) {
-            crate::procx::kill_tree(pid);
-        }
-        if !exited {
-            // PID が取れなかったセッションでも根だけは落とす。
-            let _ = self.killer.kill();
-        }
+        // タブの寿命を越える同じ追跡対象へ停止を通知する。
+        // Unixの未回収PID／WindowsのJobハンドルで識別し、古いPIDを撃たない。
+        self.writer_tree.stop();
     }
 }
 
@@ -3667,6 +3670,7 @@ impl Drop for Session {
 /// `ClosePseudoConsole` (= master の Drop) が返ってこないためで、
 /// UI スレッドでセッションを drop するとウィンドウごと固まって戻らない。
 /// ([`reap`] の説明も参照)
+#[cfg(test)]
 fn kill_tree_command(pid: u32) -> std::process::Command {
     #[cfg(windows)]
     // /T = 子孫ごと、/F = 強制。PATH は要らない (System32 にある)。
@@ -3702,6 +3706,7 @@ fn kill_tree_command(pid: u32) -> std::process::Command {
 
 /// ツリーを落として、落ち切るまで待つ。**UI スレッドから呼んではいけない**。
 /// 木を辿れた (= 根がまだ生きていた) なら true。
+#[cfg(test)]
 fn kill_tree_blocking(pid: Option<u32>) -> bool {
     let Some(pid) = pid else { return false };
     // 木が消えるまで返ってこない。UI スレッドが払ってはいけない呼び出し。
@@ -3735,6 +3740,7 @@ pub fn reap(session: Session) {
 pub struct ReapHandle {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     process_id: Option<u32>,
+    tree: Option<Arc<writer_tree::Tree>>,
 }
 
 static REAPING: std::sync::Mutex<std::collections::BTreeMap<u64, ReapHandle>> =
@@ -3776,10 +3782,15 @@ pub fn process_tree_alive(pid: u32) -> bool {
     crate::instances::pid_alive(pid)
 }
 
-fn register_reaper(id: u64, process_id: Option<u32>) -> ReapHandle {
+fn register_reaper(
+    id: u64,
+    process_id: Option<u32>,
+    tree: Option<Arc<writer_tree::Tree>>,
+) -> ReapHandle {
     let handle = ReapHandle {
         done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         process_id,
+        tree,
     };
     REAPING
         .lock()
@@ -3813,6 +3824,11 @@ fn finish_reaper(id: u64, handle: &ReapHandle) {
 }
 
 impl ReapHandle {
+    pub fn tracks(&self, tree: &Arc<writer_tree::Tree>) -> bool {
+        self.tree
+            .as_ref()
+            .is_some_and(|tracked| Arc::ptr_eq(tracked, tree))
+    }
     pub fn process_id(&self) -> Option<u32> {
         self.process_id
     }
@@ -3826,6 +3842,7 @@ impl ReapHandle {
         Self {
             done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(finished)),
             process_id: None,
+            tree: None,
         }
     }
 
@@ -3845,11 +3862,12 @@ impl ReapHandle {
 /// [`reap`]と同じ後始末を行い、完了を確認できる札を返す。
 pub fn reap_tracked(session: Session) -> ReapHandle {
     let id = session.id;
-    let handle = register_reaper(id, session.live_process_id());
+    let tree = session.writer_tree.clone();
+    let handle = register_reaper(id, session.child_pid, Some(tree.clone()));
     let worker_handle = handle.clone();
     std::thread::spawn(move || {
         reap_now(session);
-        while worker_handle.process_id.is_some_and(process_tree_alive) {
+        while !tree.finished() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         finish_reaper(id, &worker_handle);
@@ -3862,55 +3880,31 @@ pub fn reap_tracked(session: Session) -> ReapHandle {
 /// 「同じ後始末を呼び出し側で行えば必ず 1 回以上払う」ことを見せる番人テスト
 /// ([`reap_pty_tests`]) だけ。
 fn reap_now(session: Session) {
-    let mut session = session;
-    // 既に終了したセッション (「終了しました」のタブを ✕ で閉じる等) には
-    // kill を撃たない。child_pid は wait 済みで OS に返却されており、
-    // 長時間稼働中なら**無関係なプロセス (グループ) に再利用され得る** —
-    // そこへ kill -KILL / taskkill /T /F を撃つとユーザーの別ジョブを
-    // 巻き添えにする。
-    if !session.exited.load(Ordering::SeqCst) {
-        // 木が先。根を先に落とすと taskkill が木を辿れず孫が残る
-        // ([`Session::kill`] の説明を参照)。
-        kill_tree_blocking(session.child_pid);
-        let _ = session.killer.kill();
-    }
-    // ここでようやく ConPTY を閉じる (この時点なら待たされない)。
+    session.writer_tree.stop();
     drop(session);
 }
 
-/// アプリ終了時にセッションを手放す。
-///
-/// [`reap`] と違って別スレッドに預けない — プロセスが消えるとスレッドも道連れに
-/// なるため、終了処理の途中で消える可能性のある場所に後始末を残せない。
-/// エージェントを落とすコマンドだけ先に**独立したプロセスとして**起こし、
-/// PTY のハンドルは OS に回収させる (drop すると `ClosePseudoConsole` で
-/// 終了処理そのものが止まり、ウィンドウが閉じないまま残る)。
+/// アプリ終了時にセッションを手放す。Unixは未回収のグループへ停止を通知し、
+/// WindowsはJobの最後のハンドルをOSが閉じる際にも子孫を終了する。
+/// ConPTYのDropはUIを止め得るため、ハンドルの回収はOSへ任せる。
 pub fn abandon(session: Session) {
     let _ = abandon_tracked(session);
 }
 
-/// Exit-safe reaping: start the independent tree killer before returning, keep
-/// ConPTY off the UI thread, and expose completion to integration ownership.
+/// Preserve the same writer identity across app exit and expose actual completion.
 pub fn abandon_tracked(session: Session) -> ReapHandle {
     let mut session = session;
     let id = session.id;
-    let pid = session.live_process_id();
-    let handle = register_reaper(id, pid);
+    let tree = session.writer_tree.clone();
+    let handle = register_reaper(id, session.child_pid, Some(tree.clone()));
     if let Some(r) = session.resizer.take() {
         r.shutdown();
     }
-    let killer = pid.and_then(|pid| kill_tree_command(pid).spawn().ok());
-    if pid.is_some() && killer.is_none() {
-        let _ = session.killer.kill();
-    }
+    tree.stop();
     std::mem::forget(session);
     let worker_handle = handle.clone();
     std::thread::spawn(move || {
-        if let Some(mut killer) = killer {
-            let _ = killer.wait();
-        }
-        // A failed tree-kill command is not proof of shutdown.
-        while pid.is_some_and(process_tree_alive) {
+        while !tree.finished() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         finish_reaper(id, &worker_handle);
@@ -18144,7 +18138,7 @@ mod reaper_registry_tests {
     #[test]
     fn 終了札まで削除済みセッションを終了待ちとして観測する() {
         let id = u64::MAX;
-        let handle = register_reaper(id, Some(std::process::id()));
+        let handle = register_reaper(id, Some(std::process::id()), None);
         assert!(!handle.is_finished());
         assert_eq!(
             reaping_session(id).unwrap().process_id(),
@@ -18160,8 +18154,8 @@ mod reaper_registry_tests {
     #[test]
     fn 古い終了札は同じidの新しい終了待ちを削除しない() {
         let id = u64::MAX - 1;
-        let old = register_reaper(id, None);
-        let new = register_reaper(id, None);
+        let old = register_reaper(id, None, None);
+        let new = register_reaper(id, None, None);
         finish_reaper(id, &old);
         assert!(!reaping_session(id).unwrap().is_finished());
         finish_reaper(id, &new);

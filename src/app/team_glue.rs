@@ -291,13 +291,13 @@ impl ZaivernApp {
             let blocked = self.team_cost_block_reason(&owner).or_else(|| {
                 // 配送前に実 writer の生存を永続化する。アプリが強制終了しても
                 // 生きている担当のロックを、次のアプリが回収してはいけない。
-                let pid = self
+                let writer = self
                     .agents
                     .sessions
                     .iter()
                     .find(|s| s.id == session)
-                    .and_then(|s| s.live_process_id());
-                panel::with_panel(|p| p.handoff_integration_writer(&owner, task, session, pid))
+                    .and_then(|s| s.writer_identity());
+                panel::with_panel(|p| p.handoff_integration_writer(&owner, task, session, writer))
                     .err()
             });
             let queued = if blocked.is_some() {

@@ -96,7 +96,11 @@ impl Harness {
                     task, session, key, ..
                 } => {
                     self.rt
-                        .handoff_integration_writer(task, session, Some(std::process::id()))
+                        .handoff_integration_writer(
+                            task,
+                            session,
+                            crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+                        )
                         .unwrap();
                     self.rt.note_effect_done(&key);
                     assigned.push(task);
@@ -921,4 +925,33 @@ pub(crate) fn closing_publication_fixture() -> (
         );
     }
     (h.rt, release, finish)
+}
+
+#[test]
+fn exited_assembly_parent_does_not_publish_a_live_descendants_candidate() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    let (work, _) = h.candidate(task);
+    let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
+    let mut writer = super::descendant_tests::Descendant::spawn(session_id, &work, "body.txt");
+    let session = writer.session.as_ref().unwrap();
+    h.rt.handoff_integration_writer(task, session_id, session.writer_identity())
+        .unwrap();
+    h.complete(task, "body.txt", "assembly before child");
+    writer.exit_parent();
+    h.pump(SessionState::Exited);
+    assert!(h.rt.publication.is_none());
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "元の本文"
+    );
+    assert!(locked(&root));
+    writer.finish_child();
+    h.pump(SessionState::Exited);
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "late writer"
+    );
+    assert!(!locked(&root));
 }
