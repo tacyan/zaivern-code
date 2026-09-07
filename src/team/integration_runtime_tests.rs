@@ -433,6 +433,33 @@ fn 未解決の統合候補は停止確認後に提出しても成功や承認�
 }
 
 #[test]
+fn 変更候補の容量超過はcompletedではなく理由付きsubmittedになる() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    let (candidate, _) = h.candidate(task);
+    std::fs::File::create(candidate.join("large-asset"))
+        .unwrap()
+        .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+        .unwrap();
+    h.complete(task, "body.txt", "candidate");
+    h.pump(SessionState::Idle);
+    let task = h.rt.task(task).unwrap();
+    assert_eq!(task.state, TeamTaskState::Submitted);
+    assert_eq!(h.rt.goal().status, GoalStatus::Submitted);
+    assert!(task
+        .blockers
+        .iter()
+        .any(|s| s.contains("64MiB") && s.contains("保留")));
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "元の本文"
+    );
+    assert!(!root.join("large-asset").exists());
+    assert!(!locked(&root));
+}
+
+#[test]
 fn 完了報告後に復元しても旧担当の停止と新たな統合所有権が必要() {
     let root = root();
     let mut original = Harness::new(&root, 1);

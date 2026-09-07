@@ -29,6 +29,8 @@ struct Ready {
     git: bool,
     #[serde(default)]
     baseline: Option<Snapshot>,
+    #[serde(default)]
+    excluded: std::collections::BTreeSet<PathBuf>,
 }
 
 pub(super) fn checked_root(source: &Path, scope: &str) -> Result<PathBuf, String> {
@@ -109,8 +111,96 @@ pub(super) fn skipped(name: &std::ffi::OsStr) -> bool {
     )
 }
 
+// Freeze exclusions once: only Git-ignored, untracked generated directories.
+// Ignored source/config/assets remain eligible; without Git retain everything
+// except the pre-existing internal/dependency exclusions above.
+fn generated_directory(name: &str) -> bool {
+    // The context list also includes IDE/config/vendor directories: those are
+    // not disposable publication artifacts even when ignored by Git.
+    (crate::context::walk::SKIP_DIRS.contains(&name)
+        && matches!(
+            name,
+            "dist" | "build" | "out" | ".next" | ".nuxt" | ".cache" | "coverage" | "__pycache__"
+        ))
+        || name == "target-msrv"
+}
+
+fn exclusions(source: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(tracked) = crate::worktree::git_out(source, &["ls-files", "-z", "--cached"]) else {
+        return out;
+    };
+    let mut candidates: std::collections::BTreeSet<PathBuf> = crate::context::walk::SKIP_DIRS
+        .iter()
+        .filter(|name| generated_directory(name))
+        .map(PathBuf::from)
+        .collect();
+    candidates.insert(PathBuf::from("target-msrv"));
+    if let Ok(ignored) = crate::worktree::git_out(
+        source,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+        ],
+    ) {
+        for path in ignored.split('\0').filter(|p| !p.is_empty()) {
+            for ancestor in Path::new(path).ancestors() {
+                if ancestor
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(generated_directory)
+                {
+                    candidates.insert(ancestor.to_path_buf());
+                }
+            }
+        }
+    }
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|path| {
+            !tracked
+                .split('\0')
+                .any(|p| !p.is_empty() && Path::new(p).starts_with(path))
+        })
+        .map(|path| format!("{}/", path.to_string_lossy().replace('\\', "/")))
+        .collect();
+    // Batch subprocesses. Unrepresentable/quoted output is conservatively retained.
+    for batch in candidates.chunks(128) {
+        let mut args = vec!["-c", "core.quotePath=false", "check-ignore", "--"];
+        args.extend(batch.iter().map(String::as_str));
+        if let Ok(ignored) = crate::worktree::git_out(source, &args) {
+            for path in ignored
+                .lines()
+                .filter(|p| batch.iter().any(|candidate| candidate == p))
+            {
+                out.insert(PathBuf::from(path.trim_end_matches('/')));
+            }
+        }
+    }
+    out
+}
+
+fn excluded(root: &Path, path: &Path, exclusions: &std::collections::BTreeSet<PathBuf>) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        exclusions.iter().any(|p| {
+            relative.starts_with(p)
+                && (relative != p || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+        })
+    })
+}
+
 // 新規隔離先へ現状を反映する。hard link は使わず、編集が元ファイルへ波及しないようにする。
-fn copy_current(source: &Path, destination: &Path, count: &mut usize) -> Result<(), String> {
+fn copy_current(
+    source: &Path,
+    destination: &Path,
+    count: &mut usize,
+    root: &Path,
+    exclusions: &std::collections::BTreeSet<PathBuf>,
+) -> Result<(), String> {
     if std::fs::symlink_metadata(destination)
         .is_ok_and(|m| m.file_type().is_symlink() || !m.is_dir())
     {
@@ -122,7 +212,11 @@ fn copy_current(source: &Path, destination: &Path, count: &mut usize) -> Result<
         if skipped(&entry.file_name()) {
             continue;
         }
-        if std::fs::symlink_metadata(source.join(entry.file_name())).is_err() {
+        // Staged deletions can still exist in the detached HEAD checkout.
+        // Remove excluded artifacts there too, keeping copy and scans aligned.
+        if excluded(root, &source.join(entry.file_name()), exclusions)
+            || std::fs::symlink_metadata(source.join(entry.file_name())).is_err()
+        {
             let ty = entry.file_type().map_err(|e| e.to_string())?;
             if ty.is_dir() {
                 std::fs::remove_dir_all(entry.path())
@@ -136,6 +230,7 @@ fn copy_current(source: &Path, destination: &Path, count: &mut usize) -> Result<
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
         if skipped(&name)
+            || excluded(root, &entry.path(), exclusions)
             || (source.file_name().is_some_and(|n| n == ".claude") && name == "worktrees")
         {
             continue;
@@ -162,7 +257,7 @@ fn copy_current(source: &Path, destination: &Path, count: &mut usize) -> Result<
         }
         let to = destination.join(name);
         if ty.is_dir() {
-            copy_current(&entry.path(), &to, count)?;
+            copy_current(&entry.path(), &to, count, root, exclusions)?;
         } else if ty.is_file() {
             if std::fs::symlink_metadata(&to).is_ok_and(|m| m.file_type().is_symlink()) {
                 std::fs::remove_file(&to).map_err(|e| e.to_string())?;
@@ -192,9 +287,16 @@ pub fn prepare(source: &Path, tasks: &[TeamTask]) -> Result<(), String> {
     let existing = tasks
         .iter()
         .find(|task| execution(&source, &task.files).is_ok_and(|v| v.is_some()));
+    let excluded = match existing {
+        Some(task) => read_ready(&source, &task.files)?.excluded,
+        None => exclusions(&source),
+    };
     let initial = match existing {
         Some(task) => baseline(&source, &task.files)?,
-        None => snapshot(&source)?,
+        None => snapshot(&source, &excluded)?
+            .into_iter()
+            .filter(|(_, e)| matches!(e, Entry::File { .. }))
+            .collect(),
     };
     for task in tasks {
         let Some(scope) = scope(&task.files) else {
@@ -235,13 +337,14 @@ pub fn prepare(source: &Path, tasks: &[TeamTask]) -> Result<(), String> {
             // Git 未導入・リポジトリ未作成・初回コミット前でも実装を開始できる。
             (false, PathBuf::new())
         };
-        copy_current(&source, &root.join(&relative), &mut 0)?;
-        if snapshot(&root.join(&relative))? != initial {
+        copy_current(&source, &root.join(&relative), &mut 0, &source, &excluded)?;
+        if snapshot(&root.join(&relative), &excluded)? != initial {
             return Err("隔離準備中に元フォルダが更新されました。以前の担当内容を保護するため準備を停止しました".into());
         }
         let metadata = serde_json::to_vec(&Ready {
             source: source.clone(),
             baseline: Some(initial.clone()),
+            excluded: excluded.clone(),
             relative,
             git,
         })
@@ -261,60 +364,92 @@ pub(super) enum Entry {
     File {
         fingerprint: super::changeset::Fingerprint,
         executable: bool,
+        // None identifies legacy baselines; never infer old Unix permissions.
+        #[serde(default)]
+        mode: Option<u32>,
     },
     Link(PathBuf),
 }
 
 pub(super) fn file_entry(bytes: &[u8], metadata: &std::fs::Metadata) -> Entry {
-    #[cfg(unix)]
-    let executable = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    };
-    #[cfg(not(unix))]
-    let executable = {
-        let _ = metadata;
-        false
-    };
-    Entry::File {
-        fingerprint: super::changeset::Fingerprint {
+    entry_with_fingerprint(
+        super::changeset::Fingerprint {
             hash: crate::history::fnv1a64(bytes),
             len: bytes.len() as u64,
         },
-        executable,
+        metadata,
+    )
+}
+
+fn entry_with_fingerprint(
+    fingerprint: super::changeset::Fingerprint,
+    metadata: &std::fs::Metadata,
+) -> Entry {
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o7777)
+    };
+    #[cfg(not(unix))]
+    let mode = {
+        let _ = metadata;
+        None
+    };
+    Entry::File {
+        fingerprint,
+        executable: mode.is_some_and(|m| m & 0o111 != 0),
+        mode,
     }
 }
 
-pub(super) fn snapshot(root: &Path) -> Result<Snapshot, String> {
-    Ok(frozen_files(root)?
-        .into_iter()
-        .filter(|(_, (entry, _))| matches!(entry, Entry::File { .. }))
-        .map(|(path, (entry, _))| (path, entry))
-        .collect())
+/// Hash with bounded memory, independently of the publication byte budget.
+pub(super) fn streamed_entry(path: &Path) -> Result<Entry, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let mut hash = crate::history::Fnv1a64::default();
+    let mut len = 0;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+        len += n as u64;
+    }
+    Ok(entry_with_fingerprint(
+        super::changeset::Fingerprint {
+            hash: hash.finish(),
+            len,
+        },
+        &meta,
+    ))
 }
 
-/// Freeze bytes before applying anything. Never follow links or special files.
-pub(super) fn frozen_files(
+pub(super) fn snapshot(
     root: &Path,
-) -> Result<std::collections::BTreeMap<String, (Entry, Vec<u8>)>, String> {
+    exclusions: &std::collections::BTreeSet<PathBuf>,
+) -> Result<Snapshot, String> {
     fn walk(
         root: &Path,
         dir: &Path,
-        out: &mut std::collections::BTreeMap<String, (Entry, Vec<u8>)>,
-        budget: &mut u64,
+        exclusions: &std::collections::BTreeSet<PathBuf>,
+        out: &mut Snapshot,
     ) -> Result<(), String> {
         for item in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let item = item.map_err(|e| e.to_string())?;
+            let path = item.path();
             if skipped(&item.file_name())
+                || excluded(root, &path, exclusions)
                 || (dir.file_name().is_some_and(|n| n == ".claude")
                     && item.file_name() == "worktrees")
             {
                 continue;
             }
-            let path = item.path();
             let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
             if meta.is_dir() {
-                walk(root, &path, out, budget)?;
+                walk(root, &path, exclusions, out)?;
                 continue;
             }
             #[cfg(not(windows))]
@@ -327,53 +462,85 @@ pub(super) fn frozen_files(
                 .to_str()
                 .ok_or("ファイル名を表現できません")?
                 .replace('\\', "/");
-            let (entry, bytes) = if meta.is_symlink() {
-                (
-                    Entry::Link(std::fs::read_link(&path).map_err(|e| e.to_string())?),
-                    Vec::new(),
-                )
+            let entry = if meta.is_symlink() {
+                Entry::Link(std::fs::read_link(&path).map_err(|e| e.to_string())?)
             } else if meta.is_file() {
-                if meta.len() > *budget {
-                    return Err("統合ファイルの読み取り上限を超えました".into());
-                }
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                std::fs::File::open(&path)
-                    .map_err(|e| e.to_string())?
-                    .take(*budget + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| e.to_string())?;
-                if bytes.len() as u64 > *budget {
-                    return Err("統合ファイルの読み取り上限を超えました".into());
-                }
-                *budget -= bytes.len() as u64;
-                (file_entry(&bytes, &meta), bytes)
+                streamed_entry(&path)?
             } else {
                 return Err(format!("通常ファイルではありません: {relative}"));
             };
             if out.len() >= 100_000 {
                 return Err("統合ファイル数の上限を超えました".into());
             }
-            out.insert(relative, (entry, bytes));
+            out.insert(relative, entry);
         }
         Ok(())
     }
-    let mut out = std::collections::BTreeMap::new();
-    let mut budget = super::changeset::MAX_HASH_BYTES;
-    walk(root, root, &mut out, &mut budget)?;
+    let mut out = Snapshot::new();
+    walk(root, root, exclusions, &mut out)?;
     Ok(out)
 }
 
-pub(super) fn baseline(source: &Path, files: &[String]) -> Result<Snapshot, String> {
+/// Keep only changed bytes, and compare the frozen bytes to the scanned entry.
+/// Failure happens before publication, never as a false empty difference.
+pub(super) fn frozen_files(
+    root: &Path,
+    source: &Path,
+    files: &[String],
+    baseline: &Snapshot,
+) -> Result<std::collections::BTreeMap<String, (Entry, Vec<u8>)>, String> {
+    use std::io::Read;
+    let scanned = snapshot(root, &read_ready(source, files)?.excluded)?;
+    let mut out = std::collections::BTreeMap::new();
+    let mut budget = super::changeset::MAX_HASH_BYTES;
+    for (relative, entry) in scanned {
+        let mut bytes = Vec::new();
+        if baseline.get(&relative) != Some(&entry) && matches!(entry, Entry::File { .. }) {
+            let path = checked_root(root, &relative)?;
+            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let meta = file.metadata().map_err(|e| e.to_string())?;
+            if meta.len() > budget {
+                return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
+            }
+            file.take(budget + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > budget {
+                return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
+            }
+            if file_entry(&bytes, &meta) != entry {
+                return Err(format!("統合候補の取得中に更新されました: {relative}"));
+            }
+            budget -= bytes.len() as u64;
+        }
+        out.insert(relative, (entry, bytes));
+    }
+    Ok(out)
+}
+
+fn read_ready(source: &Path, files: &[String]) -> Result<Ready, String> {
     let scope = scope(files).ok_or("隔離タスクではありません")?;
     let root = checked_root(source, scope)?;
-    let record: Ready = serde_json::from_slice(
+    serde_json::from_slice(
         &std::fs::read(root.with_extension("ready.json")).map_err(|e| e.to_string())?,
     )
-    .map_err(|e| e.to_string())?;
-    record.baseline.ok_or_else(|| {
-        "旧隔離先に統合の基準点がありません。元ファイルを保護するため統合を保留しました".into()
-    })
+    .map_err(|e| e.to_string())
+}
+
+pub(super) fn baseline(source: &Path, files: &[String]) -> Result<Snapshot, String> {
+    let baseline = read_ready(source, files)?.baseline.ok_or_else(|| {
+        "旧隔離先に統合の基準点がありません。元ファイルを保護するため統合を保留しました".to_string()
+    })?;
+    #[cfg(unix)]
+    if baseline
+        .values()
+        .any(|entry| matches!(entry, Entry::File { mode: None, .. }))
+    {
+        return Err(
+            "旧隔離先に権限の基準点がありません。元ファイルを保護するため統合を保留しました".into(),
+        );
+    }
+    Ok(baseline)
 }
 
 #[cfg(test)]
@@ -442,6 +609,18 @@ mod missing_git_tests {
                     b"untracked\n"
                 );
             }
+            let permit = super::super::integration::try_acquire(&source, "missing-git")
+                .unwrap()
+                .unwrap();
+            let outcome =
+                super::super::integration::publish(&permit, &source, &plan.tasks[0].files).unwrap();
+            assert!(outcome.conflicts.is_empty(), "{outcome:?}");
+            assert_eq!(outcome.changed, ["tracked.md", "untracked.md"]);
+            assert_eq!(
+                std::fs::read(source.join("tracked.md")).unwrap(),
+                b"worker edit\n"
+            );
+            assert!(!source.join("untracked.md").exists());
             std::fs::write(source.parent().unwrap().join("child-verified"), b"ok").unwrap();
             return;
         }
@@ -483,12 +662,9 @@ mod missing_git_tests {
         );
         assert_eq!(
             std::fs::read(source.join("tracked.md")).unwrap(),
-            b"local edit\n"
+            b"worker edit\n"
         );
-        assert_eq!(
-            std::fs::read(source.join("untracked.md")).unwrap(),
-            b"untracked\n"
-        );
+        assert!(!source.join("untracked.md").exists());
         assert!(!source.join("deleted.md").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

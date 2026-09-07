@@ -245,22 +245,7 @@ fn entry_at(path: &Path) -> Result<Option<Entry>, String> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
-        Ok(meta) if meta.is_file() => {
-            if meta.len() > super::changeset::MAX_HASH_BYTES {
-                return Err("統合ファイルが大きすぎます".into());
-            }
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .map_err(|e| e.to_string())?
-                .take(super::changeset::MAX_HASH_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            if bytes.len() as u64 > super::changeset::MAX_HASH_BYTES {
-                return Err("統合ファイルが大きすぎます".into());
-            }
-            Ok(Some(task_workspace::file_entry(&bytes, &meta)))
-        }
+        Ok(meta) if meta.is_file() => Ok(Some(task_workspace::streamed_entry(path)?)),
         Ok(_) => Err("通常ファイルではありません".into()),
     }
 }
@@ -402,7 +387,7 @@ fn publish_inner(
     let (workspace, _, _) = task_workspace::execution(&source, assemble_files)?
         .ok_or("統合担当が隔離されていません")?;
     let baseline = task_workspace::baseline(&source, assemble_files)?;
-    let candidate = task_workspace::frozen_files(&workspace)?;
+    let candidate = task_workspace::frozen_files(&workspace, &source, assemble_files, &baseline)?;
     let paths: BTreeSet<_> = baseline.keys().chain(candidate.keys()).cloned().collect();
     let mut outcome = Outcome::default();
     for relative in paths {
@@ -411,6 +396,19 @@ fn publish_inner(
         if before == after {
             continue;
         }
+        // Compare the full mode above to detect worker changes, but publication
+        // never grants special bits. This also makes retries match installed bytes.
+        let mut installed = after.cloned();
+        #[cfg(unix)]
+        if let Some(Entry::File {
+            mode: Some(mode), ..
+        }) = &mut installed
+        {
+            *mode &= 0o777;
+        }
+        #[cfg(not(unix))]
+        let _ = &mut installed;
+        let after = installed.as_ref();
         if matches!(before, Some(Entry::Link(_))) || matches!(after, Some(Entry::Link(_))) {
             outcome.conflicts.push(relative);
             continue;
@@ -464,25 +462,22 @@ fn publish_inner(
             let temporary = directory.join("candidate");
             if let Some((entry, bytes)) = candidate.get(&relative) {
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&temporary)
-                    .map_err(|e| e.to_string())?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&temporary).map_err(|e| e.to_string())?;
                 file.write_all(bytes).map_err(|e| e.to_string())?;
                 #[cfg(unix)]
-                if let Entry::File { executable, .. } = entry {
+                if let Entry::File { mode, .. } = entry {
                     use std::os::unix::fs::PermissionsExt;
-                    let mut mode = file
-                        .metadata()
-                        .map_err(|e| e.to_string())?
-                        .permissions()
-                        .mode();
-                    if *executable {
-                        mode |= 0o111;
-                    } else {
-                        mode &= !0o111;
-                    }
+                    // Exact ordinary bits, including intentional isolated chmod.
+                    // The baseline/current/captured comparisons protect concurrent chmod.
+                    // Never restore setuid/setgid/sticky bits on replacement content.
+                    let mode = mode.ok_or("統合候補の権限が不明です")? & 0o777;
                     file.set_permissions(std::fs::Permissions::from_mode(mode))
                         .map_err(|e| e.to_string())?;
                 }
@@ -597,6 +592,273 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_preserves_private_modes_and_detects_permission_conflicts() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o600, 0o700] {
+            let f = Fixture::new("private-mode");
+            f.write("file", "baseline");
+            std::fs::set_permissions(f.0.join("file"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            let (files, work) = f.isolate("run");
+            std::fs::write(work.join("file"), "candidate").unwrap();
+            std::fs::write(work.join("new"), "private").unwrap();
+            std::fs::set_permissions(work.join("new"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let result = publish(&permit, &f.0, &files).unwrap();
+            assert!(result.conflicts.is_empty(), "{result:?}");
+            assert_eq!(
+                std::fs::metadata(f.0.join("file"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                mode
+            );
+            assert_eq!(
+                std::fs::metadata(f.0.join("new"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600
+            );
+        }
+        for late in [false, true] {
+            let f = Fixture::new("permission-conflict");
+            f.write("file", "baseline");
+            std::fs::set_permissions(f.0.join("file"), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let (files, work) = f.isolate("run");
+            std::fs::write(work.join("file"), "candidate").unwrap();
+            if !late {
+                std::fs::set_permissions(f.0.join("file"), std::fs::Permissions::from_mode(0o640))
+                    .unwrap();
+            }
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let result = publish_inner(&permit, &f.0, &files, |stage, _| {
+                if late && stage == PublishStage::BeforeCapture {
+                    std::fs::set_permissions(
+                        f.0.join("file"),
+                        std::fs::Permissions::from_mode(0o640),
+                    )
+                    .unwrap();
+                }
+            })
+            .unwrap();
+            assert_eq!(result.conflicts, ["file"]);
+            assert_eq!(f.read("file"), "baseline");
+            assert_eq!(
+                std::fs::metadata(f.0.join("file"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn publish_small_change_with_large_unchanged_tree() {
+        for git in [false, true] {
+            let f = Fixture::new("large-baseline");
+            f.write("source", "committed");
+            if git {
+                super::super::gitinit::prepare(&f.0).unwrap();
+            }
+            f.write("source", "uncommitted");
+            f.write("untracked", "keep");
+            for name in ["asset-a", "asset-b"] {
+                std::fs::File::create(f.0.join(name))
+                    .unwrap()
+                    .set_len(33 * 1024 * 1024)
+                    .unwrap();
+            }
+            let (files, work) = f.isolate("run");
+            assert_eq!(
+                std::fs::read_to_string(work.join("source")).unwrap(),
+                "uncommitted"
+            );
+            assert_eq!(
+                std::fs::read_to_string(work.join("untracked")).unwrap(),
+                "keep"
+            );
+            std::fs::write(work.join("source"), "candidate").unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let result = publish(&permit, &f.0, &files).unwrap();
+            assert_eq!(result.changed, ["source"]);
+            assert!(result.conflicts.is_empty());
+            assert_eq!(f.read("source"), "candidate");
+            assert_eq!(f.read("untracked"), "keep");
+        }
+    }
+
+    #[test]
+    fn publish_excludes_only_frozen_generated_directories() {
+        for git in [false, true] {
+            let f = Fixture::new("generated-policy");
+            f.write("source", "baseline");
+            f.write("dist/source.rs", "tracked source");
+            f.write("build/old", "generated original");
+            if git {
+                super::super::gitinit::prepare(&f.0).unwrap();
+            }
+            f.write(
+                ".gitignore",
+                "dist/\nbuild/\n.next/\n.nuxt\ntarget-msrv/\n.env\nassets/\n",
+            );
+            if git {
+                crate::worktree::git_out(&f.0, &["rm", "--cached", "--", "build/old"]).unwrap();
+            }
+            f.write(".env", "private config");
+            f.write(".nuxt", "ordinary file, not a directory");
+            f.write("assets/local", "required asset");
+            let generated = if git { ".next" } else { "target" };
+            f.write(&format!("{generated}/existing"), "keep generated original");
+            let (files, work) = f.isolate("run");
+            assert!(!work.join(generated).exists());
+            assert_eq!(
+                std::fs::read_to_string(work.join(".nuxt")).unwrap(),
+                "ordinary file, not a directory"
+            );
+            if git {
+                assert!(!work.join("build").exists());
+            }
+            assert_eq!(
+                std::fs::read_to_string(work.join(".env")).unwrap(),
+                "private config"
+            );
+            assert_eq!(
+                std::fs::read_to_string(work.join("assets/local")).unwrap(),
+                "required asset"
+            );
+            std::fs::create_dir_all(work.join(generated)).unwrap();
+            std::fs::File::create(work.join(generated).join("large"))
+                .unwrap()
+                .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+                .unwrap();
+            if git {
+                std::fs::create_dir_all(work.join("target-msrv")).unwrap();
+                std::fs::File::create(work.join("target-msrv/large"))
+                    .unwrap()
+                    .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+                    .unwrap();
+            }
+            // Later ignore edits cannot change the frozen target set.
+            std::fs::write(work.join(".gitignore"), "").unwrap();
+            std::fs::write(work.join("dist/source.rs"), "edited source").unwrap();
+            std::fs::write(work.join("source"), "candidate").unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let result = publish(&permit, &f.0, &files).unwrap();
+            assert!(result.conflicts.is_empty(), "{result:?}");
+            assert_eq!(f.read("dist/source.rs"), "edited source");
+            assert_eq!(f.read("source"), "candidate");
+            assert_eq!(
+                f.read(&format!("{generated}/existing")),
+                "keep generated original"
+            );
+            assert!(!f.0.join(generated).join("large").exists());
+            assert_eq!(f.read("build/old"), "generated original");
+        }
+    }
+
+    #[test]
+    fn publish_oversize_changes_are_explicitly_held_before_any_write() {
+        for git in [false, true] {
+            let f = Fixture::new("oversize-change");
+            f.write("a-source", "baseline");
+            if git {
+                super::super::gitinit::prepare(&f.0).unwrap();
+            }
+            let (files, work) = f.isolate("run");
+            std::fs::write(work.join("a-source"), "candidate").unwrap();
+            std::fs::File::create(work.join("z-large"))
+                .unwrap()
+                .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+                .unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let error = publish(&permit, &f.0, &files).unwrap_err();
+            assert!(error.contains("64MiB") && error.contains("保留"), "{error}");
+            assert_eq!(f.read("a-source"), "baseline");
+            assert!(!f.0.join("z-large").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_intentional_chmod_and_legacy_baseline() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new("intentional-mode");
+        f.write("file", "baseline");
+        std::fs::set_permissions(f.0.join("file"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (files, work) = f.isolate("run");
+        std::fs::set_permissions(work.join("file"), std::fs::Permissions::from_mode(0o710))
+            .unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let result = publish(&permit, &f.0, &files).unwrap();
+        assert_eq!(result.changed, ["file"]);
+        assert_eq!(
+            std::fs::metadata(f.0.join("file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o710
+        );
+        assert!(publish(&permit, &f.0, &files).unwrap().conflicts.is_empty());
+        let record = work.with_extension("ready.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        json["baseline"]["file"]["File"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        json.as_object_mut().unwrap().remove("excluded");
+        std::fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(task_workspace::execution(&f.0, &files).unwrap().is_some());
+        assert!(publish(&permit, &f.0, &files)
+            .unwrap_err()
+            .contains("権限の基準点"));
+        assert_eq!(f.read("file"), "baseline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_freezes_bytes_and_drops_special_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new("frozen-private-candidate");
+        f.write("script", "baseline");
+        let (files, work) = f.isolate("run");
+        std::fs::write(work.join("script"), "frozen candidate").unwrap();
+        std::fs::set_permissions(work.join("script"), std::fs::Permissions::from_mode(0o6700))
+            .unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let result = publish_inner(&permit, &f.0, &files, |stage, _| {
+            if stage == PublishStage::BeforeInstall {
+                std::fs::write(work.join("script"), "late worker edit").unwrap();
+                std::fs::set_permissions(
+                    work.join("script"),
+                    std::fs::Permissions::from_mode(0o777),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(result.changed, ["script"]);
+        assert_eq!(f.read("script"), "frozen candidate");
+        assert_eq!(
+            std::fs::metadata(f.0.join("script"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
     }
 
     #[test]
