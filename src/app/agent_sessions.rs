@@ -572,8 +572,13 @@ impl ZaivernApp {
         let mut queue = std::mem::take(&mut self.outbox);
         let sup = &self.supervisor;
         let agents = &mut self.agents;
+        let mut delivery_turn = submit::DeliveryTurn::default();
         queue.retain_mut(|p| {
             let sid = p.job.session;
+            if !delivery_turn.enter(sid) {
+                next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
+                return true;
+            }
             let idle = matches!(sup.state_of(sid), Some(supervisor::SessionState::Idle));
             let Some(s) = agents.sessions.iter_mut().find(|s| s.id == sid) else {
                 // セッションが消えた。**黙って捨てない** — 頼んだ側は
@@ -599,7 +604,10 @@ impl ZaivernApp {
                             std::time::Duration::from_millis(crate::agents::input_ready_ms(b)),
                         )
                     })
-                    .unwrap_or(true),
+                    .unwrap_or(true)
+                    // 本文を書く前に起動画面の完成を確認する。貼り付け後の
+                    // 入力欄の読みを理由に本文を書き直すことはしない。
+                    && (p.job.stage != submit::Stage::Ready || s.input_surface_ready()),
                 running: s.running(),
                 idle,
                 attention: s.attention,
@@ -776,6 +784,7 @@ mod delivery_peek_tests {
             body.contains("input: peek_input_at(p.job.stage, p.job.submit)"),
             "入力欄の読み取りを段で決めていない (Commit で読まなくなる):\n{body}"
         );
+        assert!(body.contains("p.job.stage != submit::Stage::Ready || s.input_surface_ready()"));
         // **アイドル時のコストはゼロのまま。** 待ちが空なら読む前に帰る。
         assert!(
             body.contains("if self.outbox.is_empty() {"),

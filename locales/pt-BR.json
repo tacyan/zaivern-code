@@ -4693,6 +4693,8 @@
   "team.git.needed": "⚠ Esta pasta não é um repositório Git. As mudanças não podem ser medidas, então nenhum relatório de conclusão será aceito",
   "team.git.no_workspace": "Nenhum workspace definido",
   "team.goal.blocked": "Bloqueado",
+  "team.goal.submitted": "Entregue com pendências",
+  "team.task.submitted": "Entregue com pendências",
   "team.goal.completed": "Concluído",
   "team.goal.failed": "falhou",
   "team.goal.integrating": "Integrando",

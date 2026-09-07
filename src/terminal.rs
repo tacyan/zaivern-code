@@ -3065,6 +3065,17 @@ impl Session {
         lock_ok(&self.parser).screen().bracketed_paste()
     }
 
+    /// 起動時の入力画面が描画されたか。必要な CLI だけ現在画面を読む。
+    pub fn input_surface_ready(&self) -> bool {
+        let Some(bin) = self.agent_bin() else {
+            return true;
+        };
+        if crate::agents::input_ready_marker(bin).is_none() {
+            return true;
+        }
+        crate::agents::input_surface_ready(bin, &lock_ok(&self.parser).screen().contents())
+    }
+
     /// いま CLI の入力欄に見えている本文 (拾えなければ None)。
     ///
     /// 「送ったのに実行されず入力欄で待機している」を検出して確定キーを
@@ -6197,6 +6208,43 @@ mod tests {
 
     // 子が POSIX シェル (stty/printf/read) 前提の実PTY e2e。Windows では
     // cmd 経由で別物になるため unix 限定 (spawn_prompt_session 系と同じ制約)。
+    #[cfg(unix)]
+    #[test]
+    fn アンケートを実ptyでスキップして次のレビュー指示を受け取る() {
+        use super::{Session, SpawnSpec};
+        use std::collections::HashMap;
+        use std::time::Duration;
+        let cmd = r#"stty raw -echo; printf "How's the CLI experience so far? Help us improve:\r\n[1] Good  [2] Fine  [3] Bad  [0] Skip\r\n"; answer=$(dd bs=1 count=1 2>/dev/null); if [ "$answer" != 0 ]; then exit 1; fi; stty -raw; printf '\033[2J\033[H>\n? for shortcuts\n'; read task; if [ "$task" = REVIEW_NEXT ]; then printf 'REVIEW_RECEIVED\n'; fi"#;
+        let spec = SpawnSpec {
+            title: "survey-review-e2e".into(),
+            preset_name: "test".into(),
+            icon: "".into(),
+            command: cmd.into(),
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut s = Session::spawn(992, spec, eframe::egui::Context::default()).unwrap();
+        s.command = "agy".into();
+        let mut sent = false;
+        let mut received = false;
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(100));
+            s.scan_attention(true);
+            let screen = s.parser.lock().unwrap().screen().contents();
+            if !sent && s.input_surface_ready() {
+                s.write_bytes(b"REVIEW_NEXT\r");
+                sent = true;
+            }
+            if screen.contains("REVIEW_RECEIVED") {
+                received = true;
+                break;
+            }
+        }
+        s.kill();
+        assert!(sent && received, "アンケート後に次のレビューを受け取れない");
+    }
+
     #[cfg(unix)]
     #[test]
     fn auto_yes_visible_choice_is_received_by_child_process() {

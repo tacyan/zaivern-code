@@ -16,16 +16,19 @@
 use super::model::{TeamGoal, TeamRole, TeamTask};
 use super::validation_command::ValidationCommand;
 
-/// 指示文の上限 (バイト)。長い指示は途中で切られて意味が壊れるので、
-/// **こちらで切ってから渡す**。
+/// 指示文の目安 (バイト)。可変本文を切り詰め、報告契約は長いパスでも保持する。
 pub const PROMPT_MAX_BYTES: usize = 8_000;
+
+// 作業用パスはツール実行・内部報告に必要。配布物には持ち込ませない。
+// 工程を増やさず、実装担当と統合担当の両方へ同じ納品条件を渡す。
+const DELIVERY_QUALITY: &str = "\n納品品質: 依頼の用途・利用者・成果物数を守り、そのまま使う本体を作る。販売用なら対象顧客・解決する具体的な課題・収録内容・使い方・必要環境・制約を購入者向けに明記する。説明やJSONだけで実体を代用しない。スキルは選択されたエージェントに対応する形式で、SKILL.mdのname・descriptionと発動条件・入力・判断基準・具体的手順・出力形式・不足入力時の対応を備え、導入方法と呼出例、編集用テンプレート、完成見本を同梱する。見本は架空例と明示した具体的入力から作り、SVGやHTML/CSSなど依頼に合う形式の実ファイルを保存し、同じ入力と出力を利用例で結び付ける。例の必須値は埋め、テンプレートの差替箇所とは区別する。未提供の実績・権利・販売条件・売上見込みは捏造しない。\n配布物のパス: 本文・コード・設定・リンクには配布物内の相対パスを使い、参照元から実在する同梱先へ繋ぐ。個人名入り絶対パス、作業フォルダ名、一時領域、隔離先、内部報告先、実行IDを転記しない。導入説明は利用者が選ぶ保存先を基準に書く。利用者固有の外部パスが必須なら設定入力として分離する。この制約は配布物用であり、ツールのcwdと内部報告のchanged_filesには指定された実パスを使う。\n";
 
 /// 必須契約の中で、仲間の**表示一覧だけ**に使ってよい上限。
 ///
 /// Agent は最大数が増えても、MSG/EVENT/完了報告の書式を押し出しては
 /// いけない。ID の途中で切ると実在しない宛先を教えることになるため、
 /// 一覧は完全な行だけをこの予算へ収める。
-const TEAMMATES_LIST_MAX_BYTES: usize = 1_536;
+const TEAMMATES_LIST_MAX_BYTES: usize = 256;
 
 /// 指示に添える材料。
 #[derive(Clone, Debug)]
@@ -76,19 +79,19 @@ fn bullets(items: &[String]) -> String {
 /// サブエージェント報告の形式から順に消える。すると長いタスクほど正式な
 /// 報告手段を失い、終わっていても Runtime は完了を受け取れない。
 ///
-/// `required_tail` は固定の契約なので切らない。契約だけで上限を超えるのは
-/// プロンプト設計そのものの不整合であり、不完全な指示を黙って渡すより
-/// その場で検出する。
+/// `required_tail` は報告契約なので切らない。保存先パス等により契約だけで
+/// 目安の上限を超える場合も、契約を丸ごと残して進行を止めない。
 fn cap(mut body: String, required_tail: String) -> String {
     if body.len() + required_tail.len() <= PROMPT_MAX_BYTES {
         body.push_str(&required_tail);
         return body;
     }
 
-    assert!(
-        required_tail.len() <= PROMPT_MAX_BYTES,
-        "必須の報告契約だけでプロンプト上限を超えています"
-    );
+    // 保存先パスは利用者の環境で長くなる。目安の8KBを超えた契約も
+    // 切断・panicさせず残す。詳細仕様はexecution-contextから取得できる。
+    if required_tail.len() > PROMPT_MAX_BYTES {
+        return required_tail;
+    }
 
     const NOTICE: &str = "\n…(可変の指示本文が長いため切り詰めました)\n\n";
     let notice = if required_tail.len() + NOTICE.len() <= PROMPT_MAX_BYTES {
@@ -156,19 +159,20 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
     let powershell_fin = powershell_single_quote(&ex_fin_path);
     format!(
         "\n## 提出のしかた (**これが正式な経路**)\n\
-         **指定されたこの Run 専用 outbox だけが例外**であり、workspace 外へのその他の書込みは禁止です。\n\
+         指定されたこの Run 専用 outbox だけが例外。\n\
          outbox 以外の workspace 外パスへの書込みは禁止です。\n\
-         報告・判定・伝言・出来事は、下の JSON を**ファイルとして提出**してください。\n\
-         画面にも出してよいですが、画面は人が読むための控えです。\n\n\
+         報告・判定・伝言・出来事はJSONファイルで提出する。\n\
+         権限拒否時は迂回・昇格せず、各節のマーカー付きJSONを画面へ全文出力する。\n\n\
          提出先フォルダ: `{dir}` (無ければ作る)\n\
-         書きかけを読まれないための手順です。**必ずこの順で**:\n\
+         末尾のRunフォルダを省略しない。親のoutbox直下への提出は禁止。\n\
+         書きかけを読まれないよう、必ずこの順で提出する:\n\
          1. 一時ファイル `{dir}/{tmp}` へ JSON 全体を書き切る\n\
          \x20  (`<一意な値>` は時刻や乱数など毎回違う値。例: `{ex_tmp}`)\n\
-         2. 書き終えてから、**同じフォルダの中で** `.tmp` を外した名前 `{dir}/{fin}` へ改名する\n\
+         2. 書き終えてから、同じフォルダの中で `{dir}/{fin}` へ改名する\n\
          \x20  macOS / Linux: `mv {posix_tmp} {posix_fin}`\n\
          \x20  Windows (PowerShell): `Move-Item {powershell_tmp} {powershell_fin}`\n\
          3. `.json` へ直接は書かない。`.tmp` のままのファイルは提出になりません\n\n\
-         中身は**この包み**にしてください。`payload` には下の各節が示す JSON を\n\
+         中身はこの包み。`payload` は各節のJSONを\n\
          そのまま入れます。\n\n\
          ```json\n\
          {{\"kind\": \"result\", \"run_id\": \"{run_id}\", \"agent_id\": \"{agent_id}\", \"payload\": {{ … }}}}\n\
@@ -176,8 +180,21 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
          `kind` は `result` (完了報告) / `review` (レビュー判定) / \
          `message` (仲間への伝言) / `event` (サブエージェントの出来事)。\n\
          `agent_id` は**あなた自身**で、ファイル名の担当と一致していること。\n\
-         1 通ごとに別のファイルにしてください。\n"
+         1通ごとに別ファイルにする。\n"
     )
+}
+
+/// 本文の省略に影響されない、全文の参照先と実行方針。
+fn execution_context(b: &Brief<'_>) -> String {
+    let mut s = format!("\n## 全文の確認\n担当タスク ID: {}。これは現在の正式な割り当てです。以前の担当の完了待ち・待機指示より、この割り当てを優先してください。端末名や仲間からの伝言で担当を判断せず、このIDの作業を開始してください。\n", b.task.id);
+    if !b.outbox.as_os_str().is_empty() {
+        s.push_str(&format!(
+            "全文資料: `{}`。最初に末尾まで分割して読む。execution_policy・quality_policy に従い、goal.specification の仕様全文と tasks 内の担当詳細を確認する。本文の省略はこの資料で補う。資料は読み取り専用。\n",
+            super::outbox::context_path(&b.outbox).display()
+        ));
+    }
+    s.push_str("\n## 成果物の完成条件\n計画だけで完了せず、要求された本体・テンプレート・同梱物を保存し、種類と件数を照合する。編集禁止の担当は実物を読み不足を報告する。スキルは発動条件・入力・実行手順・具体的な出力例・失敗時対応を備える。入力を変えて期待結果と観測結果を比較し、自作JSONのPASSEDだけを証拠にしない。未実施・外部未確認を明記する。実績・推薦文は出典を示し、架空例・仮定と区別する。入力価格等を全出力に反映し、通常・変更・不足入力を検証する。依頼外の性能や売上を保証せず、開発環境の指示を商品の実績に転用しない。\n");
+    s
 }
 
 /// レビュー判定を置き場へ出させる 1 行 (置き場が無ければ空)。
@@ -361,7 +378,7 @@ pub fn implementer(b: &Brief<'_>) -> String {
     }
     s.push_str("\n## 実行する検証コマンド\n");
     s.push_str(&bullets(&command_labels(&t.validation_commands)));
-    let mut required_tail = String::new();
+    let mut required_tail = execution_context(b);
     required_tail.push_str(&format!(
         "\n## 体制\n  - あなたの ID: {}\n  - 親エージェント: {}\n  - ワークスペースルート: {}\n",
         b.agent_id,
@@ -409,7 +426,8 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
             target.last_summary.as_str()
         }
     ));
-    let mut required_tail = String::new();
+    let mut required_tail = execution_context(b);
+    required_tail.push_str(&format!("\nレビュー作業IDは #{}、判定対象IDは #{}。報告はRESULTでなくREVIEWのみ。JSONのtask_idは対象ID {}を使う。\n", b.task.id, target.id, target.id));
     required_tail.push_str("\n## 確認する観点\n");
     required_tail.push_str(
         "  - 仕様への適合 (受入基準を満たしているか)\n\
@@ -440,6 +458,9 @@ pub fn reviewer(b: &Brief<'_>, target: &TeamTask) -> String {
         close = super::reviewer::REVIEW_CLOSE,
         id = target.id,
     ));
+    if super::reviewer::requires_content_review(b.goal) {
+        required_tail.push_str("\n内容レビュー必須: requirements=要件と出力の全件照合、truthfulness=実績の出典または架空例の明示、deliverables=約束した同梱物の実在と件数、reproducibility=入力変更・不足入力の実行と期待/観測の比較、scope=依頼範囲と未検証事項。担当成果物に各観点を適用し、対象外なら具体的理由を記録。自己申告PASSEDだけでは承認しない。不足はREQUEST_CHANGESのfindingsで担当へ返す。APPROVEでは上のJSONにquality_checks配列を追加し、各観点を一件ずつ報告する。各要素の形式: {\"criterion\":\"requirements\",\"source_path\":\"skills/example/SKILL.md\",\"excerpt\":\"実ファイルからの具体的な原文引用\",\"expected\":\"仕様の要求\",\"actual\":\"検証手順と観測結果\"}。パスは作業フォルダ内の相対パス。引用は12バイト以上で実物と一致させる。再現性はテスト名でなく実入力・本体・観測出力の証跡を引用。\n");
+    }
     // **レビューこそ伝える相手が要る。** 指摘を書いても、直す本人へ
     // 届かなければ盤面に残るだけになる。
     required_tail.push_str(&teammates_section(&b.teammates, &b.outbox));
@@ -457,19 +478,21 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
     s.push_str("\n## 全タスクの状態\n");
     let list: Vec<String> = all
         .iter()
+        .filter(|t| t.id != b.task.id)
         .map(|t| format!("#{} {} — {}", t.id, t.title, t.state.key()))
         .collect();
     s.push_str(&bullets(&list));
     s.push_str("\n## やること\n");
     s.push_str(
-        "  1. 全タスクが完了しているか確認する\n\
-         \x20 2. 整形・ビルド・lint・テストを実行する\n\
+        "  1. 自分以外の前提タスクの成果物を開き、仕様全文の各要件を実物と照合する\n\
+         \x20 2. 成果物に適した検証を実行する。文書・スキルには不要なビルドを要求しない\n\
          \x20 3. 未解決のレビュー指摘が無いか確認する\n\
-         \x20 4. 失敗したら、原因のタスク番号を blockers に書いて報告する\n",
+         \x20 4. 不足は担当範囲で修正し、範囲外なら原因のタスク番号と不足を blockers に書いて報告する\n",
     );
     s.push_str("\n## 実行する検証コマンド\n");
     s.push_str(&bullets(&command_labels(&b.task.validation_commands)));
-    let mut required_tail = String::new();
+    let mut required_tail = execution_context(b);
+    required_tail.push_str("\n統合担当自身は現在実行中なので、自分の完了や進捗100％を待たない。既に完了した担当への伝言だけで終了せず、この担当タスクIDの正式完了報告を必ず提出する。\n");
     required_tail.push_str("\n## 禁止事項\n");
     required_tail.push_str(
         "  - git push / PR 作成 / merge / deploy / release は**行わない**\n\
@@ -484,13 +507,44 @@ pub fn integrator(b: &Brief<'_>, all: &[TeamTask]) -> String {
     cap(s, required_tail)
 }
 
-/// 役割に応じた指示文を作る。
-///
-/// 役割の分類は [`super::roles`] が持つ 1 本を通す — ここで `match` を
-/// 書き直すと、スケジューラ側の「実装担当とレビュアーを分ける」判断と
-/// ずれた瞬間に**レビュアーへ実装の指示が飛ぶ**。
+/// レビュー対象の有無で報告形式を決め、通常タスクは役割に応じた指示を作る。
+/// 役割名だけで REVIEW を要求すると、対象の無い報告を受信側が拒否して停止する。
 pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
-    if super::roles::is_review_role(b.task.role) {
+    if super::planner::implementation_only(&b.goal.specification) {
+        let body = format!(
+            "依頼:\n{}\n",
+            b.goal
+                .specification
+                .strip_prefix(super::planner::IMPLEMENTATION_ONLY)
+                .unwrap_or(&b.goal.specification)
+        );
+        let assignment = format!(
+            "作業フォルダ: {}\n担当 #{}: {}\n編集範囲:\n{}\n編集禁止:\n{}\n",
+            b.workspace_root,
+            b.task.id,
+            format!("{}\n{}", b.task.title, b.task.description),
+            bullets(&b.task.files),
+            bullets(&b.forbidden_files)
+        );
+        let isolation = match super::task_workspace::execution(std::path::Path::new(b.workspace_root), &b.task.files) {
+            Ok(Some((workspace, prefix, git))) => format!("\n実装用cwd: {}。{}。各ツールはこのディレクトリをcwdとして実行する。changed_filesは元フォルダ基準で {prefix}/ を先頭につける。変更・削除したファイルを要約に列挙し、作業用コピー全体を成果物として申告しない。\n", workspace.display(), if git { "隔離Gitワークツリーで直接実装する" } else { "Gitなしの独立コピーで直接実装する。Gitコマンドは不要" }),
+            _ => String::new(),
+        };
+        let assignment = format!("{assignment}{isolation}{DELIVERY_QUALITY}");
+        let report = serde_json::json!({"task_id": b.task.id, "agent_id": b.agent_id, "status": "completed", "summary": "作成した成果物の短い説明", "changed_files": [], "validation": [], "blockers": []});
+        let handoff = b.upstream.join("\n");
+        let task_scopes = all
+            .iter()
+            .map(|task| format!("#{} {}: {}", task.id, task.title, task.files.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let assignment = format!(
+            "{assignment}\n他担当の編集範囲（読み取り可）:\n{task_scopes}\n引継ぎ:\n{handoff}\n"
+        );
+        let tail = format!("\n{assignment}\n実装を直ちに開始する。計画書・テスト・レビュー・検証記録を追加しない。テストやブラウザ確認を開始条件にしない。通常の仕様の不足は合理的に補って進め、相談や途中報告だけで停止しない。HTMLの依頼ならHTML本体を保存する。JSONの完了報告は成果物の代わりにならない。指定フォルダと担当範囲で実装し、成果物を保存した後にだけcompletedを報告する。保存できなかった場合はfailedと理由を報告する。未実施のテストを成功と書かない。\n全文は {} の goal.specification、担当詳細は tasks を読む（本文が省略された場合も要件を落とさない）。\n{}\n{}\n最後に {}\n{}\n{} を出力する。changed_filesには実際に保存した相対パスを列挙する。validationは空配列。outboxへ書ける場合はkind=resultで同じ報告を保存する。書込みが拒否された場合は再試行で停止せず、上の端末出力で提出する。\n", super::outbox::context_path(&b.outbox).display(), filesystem_boundary(&b.outbox), outbox_section(b.agent_id, &b.outbox, b.run_id), super::result_parser::RESULT_OPEN, report, super::result_parser::RESULT_CLOSE);
+        return cap(body, tail);
+    }
+    if super::roles::is_review_task(b.task) {
         let target = b
             .task
             .review_of
@@ -509,6 +563,16 @@ mod tests {
     use super::super::testkit::{goal, task};
     use super::*;
 
+    #[test]
+    fn 長い保存先を含む必須契約で停止せず完了報告の形式を残す() {
+        let required = format!(
+            "{}\n正式完了報告",
+            "保存先の長いパス/".repeat(PROMPT_MAX_BYTES / 10)
+        );
+        assert!(required.len() > PROMPT_MAX_BYTES);
+        assert_eq!(cap("省略可能な説明".into(), required.clone()), required);
+    }
+
     fn brief<'a>(g: &'a TeamGoal, t: &'a TeamTask) -> Brief<'a> {
         Brief {
             goal: g,
@@ -521,6 +585,66 @@ mod tests {
             outbox: std::path::PathBuf::from("/tmp/zv-outbox"),
             run_id: "run-1712345678-1-0",
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
+        }
+    }
+
+    #[test]
+    fn 統合は自分の完了を待たず実物を検証して報告する() {
+        let g = goal();
+        let mut t = task(3, "integrate", &[1]);
+        t.role = TeamRole::Integrator;
+        let text = for_task(&brief(&g, &t), &[task(1, "artifact", &[]), t.clone()]);
+        assert!(!text.contains("#3 integrate —"));
+        assert!(text.contains("自分の完了や進捗100％を待たない"));
+        assert!(text.contains("自作JSONのPASSED"));
+        assert!(text.contains("具体的な出力例"));
+        assert!(text.contains("正式完了報告を必ず提出"));
+    }
+
+    #[test]
+    fn 検証資料の作成と対象付きレビューの報告形式を分ける() {
+        let g = goal();
+        let target = task(1, "implementation", &[]);
+        let mut assigned = task(2, "validation-checklist", &[1]);
+        assigned.role = TeamRole::Tester;
+        assigned.files = vec!["references/validation_checklist.md".to_string()];
+        let text = for_task(&brief(&g, &assigned), &[target.clone(), assigned.clone()]);
+        assert!(text.contains("references/validation_checklist.md"));
+        assert!(text.contains(super::super::result_parser::RESULT_OPEN));
+        assert!(!text.contains(super::super::reviewer::REVIEW_OPEN));
+        assert!(!text.contains("このタスクではコードを変更しません"));
+        assert!(!text.contains("コードを変更してはいけません"));
+
+        assigned.review_of = Some(target.id);
+        let text = for_task(&brief(&g, &assigned), &[target.clone(), assigned.clone()]);
+        assert_eq!(text, reviewer(&brief(&g, &assigned), &target));
+        assert!(text.contains(super::super::reviewer::REVIEW_OPEN));
+        assert!(!text.contains(super::super::result_parser::RESULT_OPEN));
+
+        assigned.role = TeamRole::Reviewer;
+        assigned.review_of = None;
+        let text = for_task(&brief(&g, &assigned), &[target, assigned.clone()]);
+        assert!(text.contains("このタスクではコードを変更しません"));
+        assert!(text.contains(super::super::result_parser::RESULT_OPEN));
+        assert!(!text.contains(super::super::reviewer::REVIEW_OPEN));
+    }
+
+    #[test]
+    fn 長文でも全文資料と継続方針と報告経路が残る() {
+        let mut g = goal();
+        g.title = "長い要件".repeat(8000);
+        let t = task(1, "制作", &[]);
+        let b = brief(&g, &t);
+        for p in [
+            implementer(&b),
+            reviewer(&b, &t),
+            integrator(&b, std::slice::from_ref(&t)),
+        ] {
+            assert!(p.len() <= PROMPT_MAX_BYTES);
+            assert!(p.contains("/tmp/zv-outbox/execution-context.md"));
+            assert!(p.contains("担当タスク ID: 1"));
+            assert!(p.contains("execution_policy"));
+            assert!(p.contains("権限拒否時は迂回・昇格せず"));
         }
     }
 
@@ -548,12 +672,21 @@ mod tests {
             // ファイルの名前の接頭辞なので、閉じる ` まで含めて探す)
             let at_tmp = text.find(&format!("{dir}/{tmp}`"));
             let at_fin = text.find(&format!("{dir}/{fin}`"));
-            assert!(at_tmp.is_some(), "{name}担当の指示文に一時ファイルの名前が無い");
+            assert!(
+                at_tmp.is_some(),
+                "{name}担当の指示文に一時ファイルの名前が無い"
+            );
             assert!(at_fin.is_some(), "{name}担当の指示文に正式な名前が無い");
-            assert!(at_tmp < at_fin, "{name}担当: 改名先が一時ファイルより先に出ている");
+            assert!(
+                at_tmp < at_fin,
+                "{name}担当: 改名先が一時ファイルより先に出ている"
+            );
             // 改名の手段が OS ごとに 1 つずつ
             assert!(text.contains("mv '"), "{name}担当: unix の改名手順が無い");
-            assert!(text.contains("Move-Item"), "{name}担当: Windows の改名手順が無い");
+            assert!(
+                text.contains("Move-Item"),
+                "{name}担当: Windows の改名手順が無い"
+            );
             // **`.json` へ直接書けとは教えない** (旧: `<dir>/impl-1.json`)
             assert!(
                 !text.contains(&format!("{dir}/impl-1.json")),
@@ -784,6 +917,7 @@ mod tests {
     fn 長い可変本文でも全役割の必須契約は末尾に残る() {
         let mut g = goal();
         g.title = "長いゴール界".repeat(PROMPT_MAX_BYTES);
+        g.specification = "SKILL.mdを作成".into();
         g.definition_of_done = vec!["長い完了条件界".repeat(PROMPT_MAX_BYTES)];
 
         for role in TeamRole::ALL {
@@ -795,7 +929,7 @@ mod tests {
 
             let mut assigned = task(2, "assigned", &[]);
             assigned.role = role;
-            assigned.review_of = Some(target.id);
+            assigned.review_of = (role == TeamRole::Reviewer).then_some(target.id);
             assigned.title = "長い担当名界".repeat(PROMPT_MAX_BYTES);
             assigned.description = "長い担当説明界".repeat(PROMPT_MAX_BYTES);
             assigned.context = vec!["長い引き継ぎ界".repeat(PROMPT_MAX_BYTES)];
@@ -812,8 +946,11 @@ mod tests {
             let notice = text
                 .find("切り詰めました")
                 .unwrap_or_else(|| panic!("{name} の長い可変本文が切り詰められていない"));
-            let completion = if super::super::roles::is_review_role(role) {
+            let completion = if super::super::roles::is_review_task(&assigned) {
                 assert!(text.contains(super::super::reviewer::REVIEW_CLOSE));
+                for criterion in super::super::reviewer::QUALITY_CRITERIA {
+                    assert!(text.contains(criterion));
+                }
                 text.find(super::super::reviewer::REVIEW_OPEN)
             } else {
                 assert!(text.contains(super::super::result_parser::RESULT_CLOSE));
@@ -854,7 +991,7 @@ mod tests {
             target.description = "長いレビュー対象".repeat(PROMPT_MAX_BYTES);
             let mut assigned = task(2, "assigned", &[]);
             assigned.role = role;
-            assigned.review_of = Some(target.id);
+            assigned.review_of = (role == TeamRole::Reviewer).then_some(target.id);
             assigned.description = "長い担当説明".repeat(PROMPT_MAX_BYTES);
             let all = vec![target, assigned.clone()];
             let b = brief(&g, &assigned);
@@ -884,7 +1021,10 @@ mod tests {
                 "`message` (仲間への伝言)",
                 "`event` (サブエージェントの出来事)",
             ] {
-                assert!(text.contains(contract), "{name}: 必須契約 {contract:?} が欠落");
+                assert!(
+                    text.contains(contract),
+                    "{name}: 必須契約 {contract:?} が欠落"
+                );
             }
         }
     }
@@ -893,7 +1033,8 @@ mod tests {
     /// 押し出さない。表示する ID は完全な行だけにし、MSG 自体は残す。
     #[test]
     fn 百三十七体の仲間がいても必須契約は上限内に残る() {
-        let g = goal();
+        let mut g = goal();
+        g.specification = "SKILL.mdを作成".into();
         let mut assigned = task(2, "assigned", &[]);
         let target = task(1, "target", &[]);
         let teammates: Vec<(String, String)> = (0..137)
@@ -902,7 +1043,7 @@ mod tests {
 
         for role in TeamRole::ALL {
             assigned.role = role;
-            assigned.review_of = Some(target.id);
+            assigned.review_of = (role == TeamRole::Reviewer).then_some(target.id);
             let all = vec![target.clone(), assigned.clone()];
             let mut b = brief(&g, &assigned);
             b.teammates = teammates.clone();
@@ -919,7 +1060,7 @@ mod tests {
             assert!(text.contains(super::super::result_parser::MSG_CLOSE));
             assert!(text.contains(super::super::result_parser::EVENT_OPEN));
             assert!(text.contains(super::super::result_parser::EVENT_CLOSE));
-            if super::super::roles::is_review_role(role) {
+            if super::super::roles::is_review_task(&assigned) {
                 assert!(text.contains(super::super::reviewer::REVIEW_OPEN));
                 assert!(text.contains(super::super::reviewer::REVIEW_CLOSE));
             } else {

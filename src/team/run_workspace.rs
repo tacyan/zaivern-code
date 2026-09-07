@@ -82,6 +82,7 @@ pub fn expected_root(home: &Path, source_workspace: &Path, run_id: &str) -> Resu
 
 /// Zaivern が作る中間ディレクトリに symlink を挟まない。
 /// `home` 自体はアプリが決めた信頼済みルートなので、その下の2段だけを見る。
+#[cfg(test)]
 fn ensure_plain_layout(home: &Path, keyed_base: &Path) -> Result<(), String> {
     for p in [home.join(DIR_NAME), keyed_base.to_path_buf()] {
         match std::fs::symlink_metadata(&p) {
@@ -179,6 +180,7 @@ fn existing(
 /// この [`create`] 呼び出しが `git worktree add` に成功した直後の後始末。
 /// 削除先は引数や保存データから受け取らず、同じ安全境界
 /// ([`expected_root`]) から再計算する。
+#[cfg(test)]
 fn rollback_created(
     home: &Path,
     source_workspace: &Path,
@@ -224,6 +226,7 @@ fn rollback_created(
 
 /// 元 workspace の HEAD から、Run 専用の detached worktree を作る。
 /// 元 workspace の index / working tree は読むだけで変更しない。
+#[cfg(test)]
 pub fn create(home: &Path, source_workspace: &Path, run_id: &str) -> Result<RunWorkspace, String> {
     let (source, repo, relative, base_commit) = source_layout(source_workspace)?;
     let root = expected_root(home, &source, run_id)?;

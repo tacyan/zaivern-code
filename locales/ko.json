@@ -4693,6 +4693,8 @@
   "team.git.needed": "⚠ 이 폴더는 Git 저장소가 아닙니다. 변경을 실측할 수 없어 어떤 완료 보고도 받을 수 없습니다",
   "team.git.no_workspace": "작업 공간이 정해지지 않았습니다",
   "team.goal.blocked": "차단됨",
+  "team.goal.submitted": "제출됨 (미해결 사항 있음)",
+  "team.task.submitted": "제출됨 (미해결 사항 있음)",
   "team.goal.completed": "완료",
   "team.goal.failed": "실패",
   "team.goal.integrating": "통합 중",

@@ -35,8 +35,7 @@ use super::changeset;
 use super::graph;
 use super::model::*;
 use super::persistence::{
-    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval,
-    SCHEMA_VERSION,
+    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval, SCHEMA_VERSION,
 };
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
@@ -629,12 +628,12 @@ pub fn judge_stall(inp: StallInput) -> StallVerdict {
 ///
 /// **報告の囲みマーカーを 1 つも書かない。** 書くと、端末が描き返した
 /// エコーが「中身が壊れた報告」として拾われ、却下ログだけが積み上がる
-/// (`harvest` はマーカーの間を報告として読むため)。形式は最初の指示に
-/// 書いてあるので、ここでは思い出させるだけでよい。
+/// (`harvest` はマーカーの間を報告として読むため)。現在の担当と報告先を
+/// 明示し、過去の担当指示へ戻らせない。
 pub fn stall_nudge_text(task: TaskId, title: &str) -> String {
     format!(
         "[Zaivern] あなたの担当 #{task}「{title}」はまだ報告されていません。\n\
-         終わっていれば、最初の指示にある形式で報告してください。\n\
+         過去の担当の完了待ちではなく、現在の担当 #{task} を進めてください。終わっていれば現在の割り当ての形式で報告してください。\n\
          まだなら、いまどこで詰まっているかを 1〜2 行で教えてください\n\
          (承認待ち・入力待ちで止まっているなら、その旨だけで構いません)。",
         title = title.chars().take(60).collect::<String>()
@@ -896,7 +895,14 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
 
 impl TeamRuntime {
     /// 計画から新しい Run を作る。
-    pub fn from_plan(plan: TeamPlan, workspace: PathBuf, opts: RunOptions) -> Self {
+    pub fn from_plan(plan: TeamPlan, workspace: PathBuf, mut opts: RunOptions) -> Self {
+        if super::planner::implementation_only(&plan.goal.specification) {
+            opts.review_required = false;
+            opts.agent_count = opts.agent_count.max(2);
+        } else if reviewer::requires_content_review(&plan.goal) {
+            opts.review_required = true;
+            opts.agent_count = opts.agent_count.max(2);
+        }
         let now = now_secs();
         let next_task_id = plan.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         let mut rt = Self {
@@ -1006,7 +1012,27 @@ impl TeamRuntime {
             .saturating_add(1);
         let seen_records = saved.run.seen_blocks.clone();
         let mut tasks = saved.tasks;
+        let orphaned_reviews: BTreeSet<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.review_of.is_none()
+                    && t.state == TeamTaskState::Reviewing
+                    && t.review.verdict.is_none()
+            })
+            .filter_map(|target| {
+                tasks
+                    .iter()
+                    .filter(|t| t.review_of == Some(target.id))
+                    .max_by_key(|t| t.id)
+            })
+            .filter(|review| review.state == TeamTaskState::Completed)
+            .map(|review| review.id)
+            .collect();
         for t in &mut tasks {
+            if orphaned_reviews.contains(&t.id) {
+                t.state = TeamTaskState::Running;
+                t.dispatch_seq = t.dispatch_seq.saturating_add(1);
+            }
             // セッションはどれも生き残っていない。結び付きは必ず外す。
             t.assigned_session = None;
             t.coordinator_task = None;
@@ -1381,6 +1407,7 @@ impl TeamRuntime {
     }
 
     /// 起動前に作った Run 専用 worktree へ、実行先を一度だけ切り替える。
+    #[cfg(test)]
     pub fn set_run_workspace(&mut self, run_workspace: super::run_workspace::RunWorkspace) {
         self.source_workspace = PathBuf::from(&run_workspace.source_workspace);
         self.workspace = PathBuf::from(&run_workspace.execution_workspace);
@@ -1749,6 +1776,7 @@ impl TeamRuntime {
                 x.review.running = true;
                 x.review.verdict = None;
                 x.review.findings.clear();
+                x.review.quality_checks.clear();
             }
             self.tasks.push(rev);
             self.log(
@@ -1887,13 +1915,9 @@ impl TeamRuntime {
             format!("#{task} の検証が失敗したので差し戻しました"),
         );
         if escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(task),
-                None,
-                format!("#{task} の検証が上限回数まで失敗しました"),
-                format!("失敗したコマンド: {}", failed.join(", ")),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+            self.submit_with_issues(
+                task,
+                &format!("検証が再試行上限に達しました: {}", failed.join(", ")),
             );
         }
         self.dirty = true;
@@ -2080,6 +2104,8 @@ impl TeamRuntime {
                     ) {
                         // 人が回すときは試行回数を 1 つ戻す (無限には回さない)。
                         t.attempts = t.attempts.min(max.saturating_sub(1));
+                        t.context
+                            .retain(|line| !line.starts_with("[report-repair:"));
                         // **`NeedsUser` から出られるのは人の操作だけ**なので、
                         // ここは意図的に表を迂回する (`sm::force` の存在理由)。
                         // 自動処理からこの行へ来る経路は無い —
@@ -2222,6 +2248,21 @@ impl TeamRuntime {
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        // 旧版で報告の修正上限により停止したRunも、同じ方針で続行する。
+        let pending: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.state == TeamTaskState::NeedsUser
+                    && t.context
+                        .iter()
+                        .any(|line| line.starts_with("[report-repair:"))
+            })
+            .map(|t| (t.id, t.blockers.join(" / ")))
+            .collect();
+        for (id, detail) in pending {
+            self.submit_with_issues(id, &detail);
+        }
         // 話が進んだかを見るための控え (**状態が動いたら塊の記憶を忘れる**)。
         let states_before: Vec<(TaskId, TeamTaskState)> =
             self.tasks.iter().map(|t| (t.id, t.state)).collect();
@@ -2321,6 +2362,7 @@ impl TeamRuntime {
                     | GoalStatus::Paused
                     | GoalStatus::Completed
                     | GoalStatus::Failed
+                    | GoalStatus::Submitted
             )
     }
 
@@ -2415,9 +2457,17 @@ impl TeamRuntime {
                         snapshot_changed = true;
                         persistent_changed = true;
                     }
-                    let task = self.tasks.iter().find(|t| {
-                        t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
-                    });
+                    let task = self
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
+                        })
+                        .min_by_key(|t| match t.state {
+                            TeamTaskState::Assigned | TeamTaskState::Running => 0,
+                            TeamTaskState::Validating => 1,
+                            _ => 2,
+                        });
                     let current_task = task.map(|t| t.id);
                     if a.current_task != current_task {
                         a.current_task = current_task;
@@ -2652,7 +2702,18 @@ impl TeamRuntime {
                     out.push(TeamEffect::SendManualInstruction {
                         agent: h.agent.clone(),
                         session: h.session,
-                        text: stall_nudge_text(h.task, &h.title),
+                        text: {
+                            let mut text = stall_nudge_text(h.task, &h.title);
+                            if let Some(t) = self.task(h.task) {
+                                text.push_str(&format!("\n最新の担当詳細は `{}` の tasks 内の ID {} を確認してください。仲間の完了連絡は担当変更ではありません。\n",
+                                    super::outbox::context_path(&self.outbox).display(), t.id));
+                                if let Some(target) = t.review_of {
+                                    text.push_str(&format!("現在はレビュー作業 #{}、判定対象 #{} です。実物を読み、APPROVE または REQUEST_CHANGES を判定し、現在のoutbox `{}` に kind=review、payload.task_id={} で提出してください。以前の実装タスクのレビュー待ちを続けないでください。判定できない点は findings に残してください。",
+                                        t.id, target, self.outbox.display(), target));
+                                }
+                            }
+                            text
+                        },
                         key: manual_instruction_key(&h.agent, id),
                     });
                     if let Some(w) = self.stalls.get_mut(&h.agent) {
@@ -2661,6 +2722,15 @@ impl TeamRuntime {
                     self.dirty = true;
                 }
                 StallVerdict::Reclaim => {
+                    // 読み取り専用レビューは担当を再配置せず、未判定を残して提出する。
+                    // 実装者の編集権を持つタスクには適用しない。
+                    if self
+                        .task(h.task)
+                        .is_some_and(|t| t.review_of.is_some() && t.files.is_empty())
+                    {
+                        self.submit_with_issues(h.task, "現在のレビュー担当を再通知しましたが、猶予時間内に判定が届きませんでした");
+                        continue;
+                    }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == h.task) {
                         t.reassign_pending = true;
                         t.updated_at = now_secs();
@@ -2912,8 +2982,9 @@ impl TeamRuntime {
             });
         }
         if delivered == 0 {
-            return Err(last_why
-                .unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string()));
+            return Err(
+                last_why.unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string())
+            );
         }
         Ok(())
     }
@@ -2923,11 +2994,10 @@ impl TeamRuntime {
     /// 伝言は*連絡*であって*指示*ではない。相手の端末には両者の区別が
     /// 無いので、こちらが毎回書く。担当を持っていなければ何も足さない。
     fn standing_order(&self, to: &AgentId) -> String {
-        let Some(t) = self
-            .tasks
-            .iter()
-            .find(|t| t.assigned_agent.as_ref() == Some(to) && t.state.is_held())
-        else {
+        let Some(t) = self.tasks.iter().find(|t| {
+            t.assigned_agent.as_ref() == Some(to)
+                && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+        }) else {
             return String::new();
         };
         format!(
@@ -2938,7 +3008,7 @@ impl TeamRuntime {
              **担当を置いて別の作業へ移らないでください。**",
             t.id,
             t.title.chars().take(60).collect::<String>()
-        )
+        ) + &t.review_of.map(|target| format!("\nこの担当はレビューです。RESULTではなく [ZAI-TEAM-REVIEW] を提出し、task_id は対象 #{target} にしてください。")).unwrap_or_default()
     }
 
     /// この Run が**その仕事を出したか** (冪等キーで見る)。
@@ -3183,6 +3253,15 @@ impl TeamRuntime {
             ));
         }
 
+        if task.review_of.is_some() {
+            let why = self.review_report_retry(
+                agent,
+                &task,
+                "レビューは通常のRESULTでは完了できません。明示的な判定が必要です",
+            );
+            return Err(why);
+        }
+
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
         // は補助情報として持ち越すだけ。
         let (evidence, attribution) = self.file_evidence(&task);
@@ -3210,8 +3289,25 @@ impl TeamRuntime {
         // 受理の関門は 2 段: 報告の形と担当範囲 (`rp::accept`) と、
         // Web の成果物なら読み込みの実在 (`web_gate`)。どちらで落ちても
         // 本人へ同じ形で伝える。
+        let finished_report = matches!(
+            doc.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "blocked"
+        );
         let verdict = rp::accept(doc, &task, &evidence)
             .map_err(|e| e.detail())
+            .and_then(|acc| {
+                if acc.status == rp::ReportedStatus::Completed
+                    && !super::planner::implementation_only(&self.goal.specification)
+                {
+                    super::acceptance::verify(
+                        &self.goal.specification,
+                        &self.workspace,
+                        &task.files,
+                        task.role == TeamRole::Integrator,
+                    )?;
+                }
+                Ok(acc)
+            })
             .and_then(|acc| match self.web_gate(&task, &acc) {
                 None => Ok(acc),
                 Some(why) => Err(why),
@@ -3222,6 +3318,11 @@ impl TeamRuntime {
                 Ok(())
             }
             Err(detail) => {
+                if finished_report && !self.allow_report_repair(agent, &task, &detail) {
+                    return Err(format!(
+                        "#{task_id}: 自動再提出の上限に達しました: {detail}"
+                    ));
+                }
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
                 let why = self.reject(
                     agent,
@@ -3234,6 +3335,21 @@ impl TeamRuntime {
                     )));
                     t.context = clamp_list(std::mem::take(&mut t.context));
                     t.updated_at = now_secs();
+                }
+                if let Some(session) = self
+                    .agent(agent)
+                    .and_then(|a| a.session_id)
+                    .or(task.assigned_session)
+                {
+                    self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                        agent: agent.clone(), session,
+                        key: manual_instruction_key(agent, self.next_event_id),
+                        text: if super::planner::implementation_only(&self.goal.specification) {
+                            format!("{why}\n担当 #{} の成果物を保存し、報告の形式・担当パスの不一致を修正して再提出してください。テストやレビューは不要です。", task.id)
+                        } else {
+                            format!("{why}\n担当 #{} は継続中です。実物の不一致を修正・再検証して正式完了報告を再提出してください。計画の検証条件を緩めて通さないでください。", task.id)
+                        },
+                    });
                 }
                 self.dirty = true;
                 Err(why)
@@ -3250,7 +3366,9 @@ impl TeamRuntime {
     /// Chrome を起こす (数秒) ので、描画スレッドのここではしない —
     /// `zai team check` と検証担当の手に置く。
     fn web_gate(&self, task: &TeamTask, acc: &rp::AcceptedResult) -> Option<String> {
-        if acc.status != ReportedStatus::Completed {
+        if super::planner::implementation_only(&self.goal.specification)
+            || acc.status != ReportedStatus::Completed
+        {
             return None;
         }
         let touches_web = task
@@ -3266,7 +3384,10 @@ impl TeamRuntime {
             Ok(bad) if bad.is_empty() => None,
             Ok(bad) => Some(format!(
                 "読み込むと言ったファイルがありません: {}",
-                bad.iter().map(|d| d.detail()).collect::<Vec<_>>().join(" / ")
+                bad.iter()
+                    .map(|d| d.detail())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
             )),
             // 測れないときは止めない (大きすぎる作業場)。
             Err(_) => None,
@@ -3417,7 +3538,11 @@ impl TeamRuntime {
         // Zaivern 自身が走らせた検証の結果 ([`Self::settle_validation`]) が
         // 決める。`advance` が `Validating` のタスクへ `RunValidation` を出し、
         // `note_validation` が実測を受けて決着させる。
-        if acc.status == ReportedStatus::Completed {
+        if acc.status == ReportedStatus::Completed
+            && super::planner::implementation_only(&self.goal.specification)
+        {
+            self.settle_validation(acc.task_id);
+        } else if acc.status == ReportedStatus::Completed {
             self.log(
                 TeamEventKind::ValidationStarted,
                 Some(agent.clone()),
@@ -3439,15 +3564,116 @@ impl TeamRuntime {
         }
 
         if let Some((tid, why)) = escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(tid),
+            self.submit_with_issues(tid, &why);
+        }
+        self.dirty = true;
+    }
+
+    /// 不正な報告では担当を閉じず、正しい報告契約を同じ端末に再通知する。
+    fn review_report_retry(&mut self, agent: &AgentId, task: &TeamTask, detail: &str) -> String {
+        if !self.allow_report_repair(agent, task, detail) {
+            return format!("#{}: 自動再提出の上限に達しました: {detail}", task.id);
+        }
+        let target = task.review_of.unwrap_or(task.id);
+        let why = format!("#{0} のレビュー報告を却下: {detail}", task.id);
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+            if t.context.iter().any(|c| c == &why) {
+                return why;
+            }
+            t.context.push(why.clone());
+        }
+        if let Some(session) = self
+            .agent(agent)
+            .and_then(|a| a.session_id)
+            .or(task.assigned_session)
+        {
+            let id = self.next_event_id;
+            self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                agent: agent.clone(), session,
+                key: manual_instruction_key(agent, id),
+                text: format!("{why}\nレビュー作業 #{} は継続中です。RESULTではなく [ZAI-TEAM-REVIEW] で task_id: {target}, verdict: APPROVE または REQUEST_CHANGES, findings, summary を報告してください。判定は実際の確認結果に基づけてください。", task.id),
+            });
+        }
+        self.dirty = true;
+        self.reject(agent, None, why)
+    }
+
+    /// 再提出の上限は保存されるtask contextに持つ。再起動でループを再開しない。
+    /// 作業終了報告後なので、既存の自己報告による解放経路を使う。
+    fn allow_report_repair(&mut self, _agent: &AgentId, task: &TeamTask, detail: &str) -> bool {
+        if matches!(
+            task.state,
+            TeamTaskState::NeedsUser | TeamTaskState::Submitted
+        ) {
+            return false;
+        }
+        let prefix = format!("[report-repair:{}]", task.attempts);
+        let limit = usize::from(self.run.max_attempts.clamp(1, 3));
+        let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) else {
+            return false;
+        };
+        let count = t
+            .context
+            .iter()
+            .filter(|line| line.starts_with(&prefix))
+            .count()
+            + 1;
+        t.context.push(clamp_text(&format!("{prefix} {detail}")));
+        t.context = clamp_list(std::mem::take(&mut t.context));
+        t.updated_at = now_secs();
+        self.dirty = true;
+        if count < limit {
+            return true;
+        }
+        self.submit_with_issues(task.id, detail);
+        false
+    }
+
+    /// 修正上限時は、合格を偽装せず現状提出として閉じ、後続作業を進める。
+    fn submit_with_issues(&mut self, id: TaskId, detail: &str) {
+        let target = self.task(id).and_then(|t| t.review_of);
+        let ids: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.id == id
+                    || Some(t.id) == target
+                    || (t.review_of == Some(id) && !t.state.is_held())
+            })
+            .filter(|t| !matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
+            .map(|t| t.id)
+            .collect();
+        for tid in &ids {
+            let agent = self.task(*tid).and_then(|t| t.assigned_agent.clone());
+            self.release_after_self_report(*tid);
+            if let Some(ct) = self.task(*tid).and_then(|t| t.coordinator_task) {
+                self.co.note_done(ct, Instant::now());
+            }
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == *tid) {
+                // ユーザー指定の現状提出。Completed/APPROVEにはしない。
+                t.state = sm::force(t.state, TeamTaskState::Submitted);
+                t.blockers = vec![clamp_text(detail)];
+                t.last_summary = clamp_text(&format!("未解決事項付きで提出: {detail}"));
+                t.validation.running = false;
+                t.review.running = false;
+                t.assigned_agent = None;
+                t.assigned_session = None;
+                t.updated_at = now_secs();
+            }
+            if let Some(agent) = agent {
+                self.pending_msgs.retain(|m| !matches!(m, TeamEffect::SendManualInstruction { agent: a, .. } if a == &agent));
+            }
+            self.log(
+                TeamEventKind::TaskCompleted,
                 None,
-                why,
-                format!("#{tid} は自動では進められません"),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+                None,
+                format!("#{tid} を未解決事項付きで提出しました: {detail}"),
             );
         }
+        self.decisions.retain(|d| {
+            !(d.kind == DecisionKind::AttemptsExhausted
+                && d.task_id.is_some_and(|id| ids.contains(&id)))
+        });
         self.dirty = true;
     }
 
@@ -3474,18 +3700,41 @@ impl TeamRuntime {
             ));
         };
         let target_id = rev.review_of.unwrap_or(0);
-        let parsed = reviewer::parse_review(body, target_id);
+        let parsed = reviewer::parse_review(body, target_id).or_else(|e| {
+            // 担当中のレビュー作業IDだけを別名として許容する。他の対象は拒否する。
+            if matches!(e, reviewer::ReviewReject::TaskMismatch { got, .. } if got == rev.id) {
+                reviewer::parse_review(body, rev.id).map(|mut acc| {
+                    acc.task_id = target_id;
+                    acc
+                })
+            } else {
+                Err(e)
+            }
+        });
         let acc = match parsed {
             Ok(a) => a,
-            Err(e) => {
-                return Err(self.reject(
-                    agent,
-                    None,
-                    format!("レビュー報告を却下: {}", e.detail()),
-                ))
-            }
+            Err(e) => return Err(self.review_report_retry(agent, &rev, &e.detail())),
         };
 
+        if acc.verdict == ReviewVerdict::Approve {
+            if let Some(target) = self.task(target_id) {
+                if let Err(detail) = super::acceptance::verify(
+                    &self.goal.specification,
+                    &self.workspace,
+                    &target.files,
+                    target.role == TeamRole::Integrator,
+                ) {
+                    // 成果物の不一致は報告書を直しても解決しない。実装者へ差し戻す。
+                    let body = serde_json::json!({"task_id":target_id,"verdict":"REQUEST_CHANGES","findings":[detail]});
+                    return self.take_review(agent, &body.to_string());
+                }
+            }
+        }
+        if reviewer::requires_content_review(&self.goal) {
+            if let Err(detail) = reviewer::validate_quality(&acc, &self.workspace) {
+                return Err(self.review_report_retry(agent, &rev, &detail));
+            }
+        }
         let max = self.run.max_attempts;
         let mut escalate = false;
         let mut released = false;
@@ -3495,6 +3744,7 @@ impl TeamRuntime {
             t.review.reviewer_session = rev.assigned_session;
             t.review.verdict = Some(acc.verdict);
             t.review.findings = acc.findings.clone();
+            t.review.quality_checks = acc.quality_checks.clone();
             t.updated_at = now_secs();
             match acc.verdict {
                 ReviewVerdict::Approve => {
@@ -3550,13 +3800,12 @@ impl TeamRuntime {
             self.complete_task(target_id, agent);
         }
         if escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(target_id),
-                None,
-                format!("#{target_id} が再試行の上限 ({max} 回) に達しました"),
-                "指摘が繰り返し解消されていません".into(),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+            self.submit_with_issues(
+                target_id,
+                &format!(
+                    "レビュー指摘が再試行上限に達しました: {}",
+                    acc.findings.join(" / ")
+                ),
             );
         }
         self.dirty = true;
@@ -3936,7 +4185,13 @@ impl TeamRuntime {
 
     /// 必要なぶんだけエージェントを起こす。**無条件に N 体起こさない。**
     fn ensure_agents(&mut self, out: &mut Vec<TeamEffect>) {
-        let want = scheduler::desired_sessions(&self.tasks, self.run.agent_count);
+        let want = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(
+            if self.run.review_required && self.run.agent_count >= 2 {
+                2
+            } else {
+                1
+            },
+        );
         let bound = self
             .agents
             .iter()
@@ -4190,7 +4445,7 @@ impl TeamRuntime {
                         .map(|t| !t.baseline.as_ref().is_some_and(|b| b.usable()))
                         .unwrap_or(true);
                     let baseline = if need_baseline {
-                        Some(self.capture_baseline())
+                        Some(self.capture_baseline(a.task))
                     } else {
                         None
                     };
@@ -4273,12 +4528,21 @@ impl TeamRuntime {
     /// **失敗を握り潰さない。** 空の基準点を返すと、完了報告の時点で
     /// 「何も汚れていなかった」と読めてしまい、担当外の変更が
     /// 「担当内だけ」に化ける。
-    fn capture_baseline(&self) -> changeset::FileBaseline {
+    fn capture_baseline(&self, task_id: TaskId) -> changeset::FileBaseline {
         #[cfg(test)]
         if let Some(b) = test_hooks::forced_baseline() {
             return b;
         }
-        match changeset::capture_baseline(&self.workspace) {
+        let isolated = self.task(task_id).and_then(|t| {
+            super::task_workspace::execution(&self.workspace, &t.files)
+                .ok()
+                .flatten()
+        });
+        let workspace = isolated
+            .as_ref()
+            .map(|(root, _, _)| root.as_path())
+            .unwrap_or(&self.workspace);
+        match changeset::capture_baseline(workspace) {
             Ok(b) => b,
             Err(e) => changeset::FileBaseline::unavailable(e.detail()),
         }
@@ -4315,10 +4579,41 @@ impl TeamRuntime {
         if let Some(e) = test_hooks::forced_evidence() {
             return (e, attribution);
         }
+        if super::task_workspace::scope(&task.files).is_some() {
+            let measured = (|| -> Result<rp::FileEvidence, String> {
+                let (workspace, prefix, git) =
+                    super::task_workspace::execution(&self.workspace, &task.files)?
+                        .ok_or("隔離先がありません")?;
+                if !git {
+                    return Ok(rp::FileEvidence::Unmeasurable(
+                        "Gitなしの隔離コピーで実装しています".into(),
+                    ));
+                }
+                let baseline = task.baseline.as_ref().ok_or("隔離先の基準点がありません")?;
+                let changes = changeset::measure(&workspace, baseline).map_err(|e| e.detail())?;
+                Ok(rp::FileEvidence::Measured {
+                    mine: changes
+                        .into_iter()
+                        .map(|c| format!("{prefix}/{}", c.path))
+                        .collect(),
+                    out_of_scope: vec![],
+                })
+            })();
+            return (
+                measured.unwrap_or_else(rp::FileEvidence::Unavailable),
+                attribution,
+            );
+        }
         // **「測る手立てが無い」と「測れるはずが失敗した」を分ける。**
         // Git 管理下でないフォルダは直しようが無いので、そこで止めると
         // **1 件も完了できない**。前者は通し、盤面が「実測なし」を出す。
-        let no_git = crate::git::discover_toplevel(&self.workspace).is_none();
+        let no_git = crate::git::discover_toplevel(&self.workspace).is_none()
+            || (super::planner::implementation_only(&self.goal.specification)
+                && crate::worktree::git_out(
+                    &self.workspace,
+                    &["rev-parse", "--verify", "HEAD^{commit}"],
+                )
+                .is_err());
         let cannot_measure = |e: changeset::MeasureError| -> rp::FileEvidence {
             if no_git {
                 rp::FileEvidence::Unmeasurable(e.detail())
@@ -4420,12 +4715,13 @@ impl TeamRuntime {
             .agent(agent)
             .and_then(|a| a.parent_id.clone())
             .map(|p| p.0);
+        let workspace_text = self.workspace.to_string_lossy();
         let brief = super::prompt::Brief {
             goal: &self.goal,
             task,
             agent_id: agent.as_str(),
             parent_id: parent.as_deref(),
-            workspace_root: "<ワークスペースルート>",
+            workspace_root: &workspace_text,
             upstream,
             forbidden_files: forbidden,
             // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
@@ -4624,7 +4920,19 @@ impl TeamRuntime {
             &self.goal.definition_of_done,
             self.run.review_required,
         );
-        let next = if done {
+        let delivered = !self.tasks.is_empty()
+            && self
+                .tasks
+                .iter()
+                .all(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted));
+        let next = if delivered
+            && self
+                .tasks
+                .iter()
+                .any(|t| t.state == TeamTaskState::Submitted)
+        {
+            GoalStatus::Submitted
+        } else if done {
             GoalStatus::Completed
         } else if !self.decisions.is_empty() {
             GoalStatus::NeedsUser
@@ -4660,6 +4968,14 @@ impl TeamRuntime {
             self.goal.status = next;
             self.goal.updated_at = now_secs();
             self.dirty = true;
+            if next == GoalStatus::Submitted {
+                self.log(
+                    TeamEventKind::GoalCompleted,
+                    None,
+                    None,
+                    "成果物を提出しました（未解決事項あり）。各タスクの指摘を確認できます".into(),
+                );
+            }
             if next == GoalStatus::Completed {
                 self.log(
                     TeamEventKind::GoalCompleted,
@@ -4685,7 +5001,13 @@ impl TeamRuntime {
     /// 並列で効くのは実装なので、余りを実装に寄せる。
     fn plan_roster(&mut self) {
         let now = now_secs();
-        let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(1);
+        let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(
+            if self.run.review_required && self.run.agent_count >= 2 {
+                2
+            } else {
+                1
+            },
+        );
         let lead_team = self
             .teams
             .first()
@@ -5152,6 +5474,67 @@ mod stale_report_tests {
     use super::super::testkit;
     use super::*;
 
+    #[test]
+    fn 修正上限で現状提出し後続も終われば未解決付き提出になる() {
+        let mut rt = run_with_two_tasks();
+        let agent = rt.agents[0].id.clone();
+        put(&mut rt, 1, agent.as_str(), TeamTaskState::Running);
+        rt.tasks[1].dependencies = vec![1];
+        rt.tasks[1].state = TeamTaskState::Pending;
+        rt.run.max_attempts = 3;
+        for i in 0..3 {
+            let task = rt.task(1).unwrap().clone();
+            assert_eq!(
+                rt.allow_report_repair(&agent, &task, "出力の引用が不一致"),
+                i < 2
+            );
+        }
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Submitted);
+        assert!(rt.decisions.is_empty());
+        rt.promote_ready();
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Ready);
+        rt.submit_with_issues(2, "残る検証不一致");
+        rt.update_goal();
+        assert_eq!(rt.goal.status, GoalStatus::Submitted);
+        assert_eq!(graph::progress(&rt.tasks), 1.0);
+        assert!(!graph::goal_done(
+            &rt.tasks,
+            &rt.goal.definition_of_done,
+            false
+        ));
+    }
+
+    #[test]
+    fn 保存済みの修正上限待ちは自動提出され繰り返さない() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::NeedsUser;
+        rt.tasks[0]
+            .context
+            .push("[report-repair:1] 引用不一致".into());
+        rt.tasks[0].blockers.push("引用不一致".into());
+        rt.tasks[1].state = TeamTaskState::Completed;
+        rt.goal.status = GoalStatus::NeedsUser;
+        rt.tick(&Observation::default());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Submitted);
+        assert_eq!(rt.goal.status, GoalStatus::Submitted);
+        let events = rt.events.len();
+        rt.tick(&Observation::default());
+        assert_eq!(rt.events.len(), events);
+        assert!(!rt.task(1).unwrap().blockers.is_empty());
+    }
+
+    #[test]
+    fn レビューの修正上限は対象も未解決付きで提出する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].state = TeamTaskState::Running;
+        rt.submit_with_issues(2, "引用の確認が完了しない");
+        assert!(rt.tasks.iter().all(|t| t.state == TeamTaskState::Submitted));
+        assert!(rt.tasks.iter().all(|t| !t.review.approved()));
+        assert!(rt.decisions.is_empty());
+    }
+
     /// 実機の台帳に並んだ 4 行そのもの (時刻は落としてある)。
     /// **1 回の再報告につき 2 行**が、2 回ぶん。
     const REAL_REJECTED_LINES: [&str; 4] = [
@@ -5227,6 +5610,241 @@ mod stale_report_tests {
         test_hooks::set_evidence(Some(rp::FileEvidence::NoScope {
             measured: Vec::new(),
         }));
+    }
+
+    fn artifact_contract() -> String {
+        format!(
+            "{}{}{}",
+            super::super::acceptance::OPEN,
+            r#"{"checks":[{"requirement":"REQ-01: 指定価格","paths":["output.json"],"kind":"json_equals","pointer":"/price","value":39800}]}"#,
+            super::super::acceptance::CLOSE
+        )
+    }
+
+    #[test]
+    fn 実物不一致を即通知し修正後の完了報告を受け取る() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = artifact_contract();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":1}"#).unwrap();
+        rt.tasks[0].files = vec!["output.json".into()];
+        rt.tasks[0].assigned_session = Some(42);
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        assert!(rt
+            .take_result(&AgentId::new(AGENT), &report(1, AGENT))
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Running);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":39800}"#).unwrap();
+        rt.take_result(&AgentId::new(AGENT), &report(1, AGENT))
+            .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Validating);
+    }
+
+    #[test]
+    fn 承認が来ても実物が壊れていれば作者へ差し戻す() {
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = artifact_contract();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":1}"#).unwrap();
+        rt.tasks[0].files = vec!["output.json".into()];
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"APPROVE"}"#)
+            .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(
+            rt.task(1).unwrap().review.verdict,
+            Some(ReviewVerdict::RequestChanges)
+        );
+        assert!(rt
+            .task(1)
+            .unwrap()
+            .context
+            .iter()
+            .any(|s| s.contains("指定価格")));
+    }
+
+    #[test]
+    fn 内容根拠の無い承認は再確認され不備は修正へ戻る() {
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = "SKILL.md を作成".into();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.tasks[1].assigned_session = Some(42);
+        assert!(rt
+            .take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"APPROVE"}"#)
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        rt.take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"REQUEST_CHANGES","findings":["バナーは3件必要だが2件のみ。売上5000万円の出典がなく、同梱PDFが存在しない。"]}"#).unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Completed);
+        assert!(rt
+            .task(1)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("同梱PDF")));
+    }
+
+    #[test]
+    fn スキル一件でも別担当レビューを必須にする() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks.truncate(1);
+        rt.goal.specification = "SKILL.md を作成".into();
+        let plan = TeamPlan {
+            goal: rt.goal,
+            teams: rt.teams,
+            tasks: rt.tasks,
+        };
+        let mut opts = RunOptions::default();
+        opts.review_required = false;
+        opts.agent_count = 1;
+        let mut rt = TeamRuntime::from_plan(plan, rt.workspace, opts);
+        assert!(rt.run.review_required);
+        assert!(rt.run.agent_count >= 2);
+        assert!(
+            rt.agents
+                .iter()
+                .filter(|a| a.kind == AgentKind::ManagedSession)
+                .count()
+                >= 2
+        );
+        rt.tasks[0].state = TeamTaskState::Validating;
+        rt.tasks[0].validation_commands.clear();
+        rt.settle_validation(1);
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert!(rt.tasks.iter().any(|t| t.review_of == Some(1)));
+    }
+
+    #[test]
+    fn 判定の無い完了レビューは復元時に最新の一件だけ再開する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].state = TeamTaskState::Completed;
+        let mut old = rt.tasks[1].clone();
+        old.id = 0;
+        rt.tasks.push(old);
+        let restored = TeamRuntime::restore(
+            rt.to_saved(),
+            crate::test_util::unique_temp_dir("zaivern-team-test", "orphan-review"),
+        );
+        assert_eq!(restored.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(restored.task(2).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(restored.task(0).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(restored.task(2).unwrap().dispatch_seq, 1);
+    }
+
+    #[test]
+    fn レビュー作業番号でも判定を受け取り対象と担当を完了する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.take_review(
+            &AgentId::new(AGENT),
+            r#"{"task_id":2,"verdict":"APPROVE","findings":[],"summary":"確認済み"}"#,
+        )
+        .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Completed);
+    }
+
+    #[test]
+    fn レビューへの通常完了報告を拒否し正しい判定を再要求する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[0].assigned_agent = Some(AgentId::new(AGENT));
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.tasks[1].assigned_session = Some(42);
+        assert!(rt
+            .take_result(&AgentId::new(AGENT), &report(2, AGENT))
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Running);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        assert!(rt.standing_order(&AgentId::new(AGENT)).contains("対象 #1"));
+        assert!(rt
+            .take_review(
+                &AgentId::new(AGENT),
+                r#"{"task_id":99,"verdict":"APPROVE"}"#
+            )
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+    }
+
+    #[test]
+    fn 検証担当の完了から統合を経てチーム全体が完了する() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        let agent_id = rt.agents[0].id.clone();
+        let agent = agent_id.as_str();
+        rt.run.review_required = false;
+        rt.tasks[0].role = TeamRole::Tester;
+        rt.tasks[1].role = TeamRole::Integrator;
+        rt.tasks[1].dependencies = vec![1];
+        // 文書作成タスク。外部コマンドの指定が無いケースを再現する。
+        for t in &mut rt.tasks {
+            t.validation_commands.clear();
+        }
+        rt.promote_ready();
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Pending);
+        for id in [1, 2] {
+            assert_eq!(rt.task(id).unwrap().state, TeamTaskState::Ready);
+            put(&mut rt, id, agent, TeamTaskState::Running);
+            let mut body: serde_json::Value = serde_json::from_str(&report(id, agent)).unwrap();
+            body["validation"] = serde_json::json!([]);
+            if id == 2 {
+                // 実際の停止例: 統合完了をRunの一段上へ任意名で提出していた。
+                let root =
+                    crate::test_util::unique_temp_dir("zaivern-integration", "misplaced-final");
+                let run_id = rt.run.run_id.clone();
+                let dir = super::super::outbox::prepare_run_dir(&root, &run_id).unwrap();
+                let file = dir.parent().unwrap().join("run-1788740010.json");
+                let envelope = serde_json::json!({"kind":"result","run_id":run_id,"agent_id":agent,"payload":body});
+                std::fs::write(&file, envelope.to_string()).unwrap();
+                let grouped = super::super::outbox::misplaced_reports(
+                    dir.parent().unwrap(),
+                    &Default::default(),
+                );
+                assert_eq!(grouped[&run_id], vec![file.clone()]);
+                let super::super::outbox::Verdict::Deliver { agent, kind, body } =
+                    super::super::outbox::judge_misplaced(
+                        file.file_stem().unwrap().to_str().unwrap(),
+                        &std::fs::read_to_string(&file).unwrap(),
+                        &[AgentId::new(agent)],
+                        &run_id,
+                    )
+                else {
+                    panic!("統合完了が配送されない");
+                };
+                rt.accept_outbox(&agent, kind, &body, 100).unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            } else {
+                rt.take_result(&AgentId::new(agent), &body.to_string())
+                    .unwrap();
+            }
+            rt.settle_validation(id);
+            assert_eq!(rt.task(id).unwrap().state, TeamTaskState::Completed);
+            rt.promote_ready();
+        }
+        rt.update_goal();
+        assert_eq!(rt.goal.status, GoalStatus::Completed);
+        assert_eq!(counts(&mut rt), (0, 0));
+        test_hooks::clear();
     }
 
     #[test]
@@ -5336,7 +5954,7 @@ mod stale_report_tests {
     #[test]
     fn 見送る状態を表で固定する() {
         use TeamTaskState as S;
-        const TABLE: [(S, bool); 11] = [
+        const TABLE: [(S, bool); 12] = [
             (S::Pending, false),
             (S::Ready, false),
             (S::Assigned, false),
@@ -5350,6 +5968,7 @@ mod stale_report_tests {
             // 断ったことは、これまでどおり記録に残す
             // (`runtime_tests::断られた遷移は黙殺せず記録に残す`)。
             (S::Completed, false),
+            (S::Submitted, false),
             (S::NeedsUser, false),
         ];
         // 表が状態を 1 つ残らず覆っていること (状態を足したら必ず落ちる)。
@@ -5519,6 +6138,39 @@ mod stall_tests {
     }
 
     // ── snapshot 無効化 ──
+
+    #[test]
+    fn レビュー待ちの旧タスクより実行中のレビューを現在の担当にする() {
+        let (mut rt, sessions) = dispatched();
+        let sid = sessions[0];
+        let agent = rt
+            .agents
+            .iter()
+            .find(|a| a.session_id == Some(sid))
+            .unwrap()
+            .id
+            .clone();
+        let original = rt
+            .tasks
+            .iter_mut()
+            .find(|t| t.assigned_agent.as_ref() == Some(&agent))
+            .unwrap();
+        original.state = TeamTaskState::Reviewing;
+        let original_id = original.id;
+        let mut review = super::super::testkit::task(100, "review-other", &[]);
+        review.role = TeamRole::Reviewer;
+        review.review_of = Some(200);
+        review.state = TeamTaskState::Running;
+        review.assigned_agent = Some(agent.clone());
+        review.assigned_session = Some(sid);
+        rt.tasks.push(review);
+        rt.sync_sessions(&obs_of(10, &rows_of(&sessions, "reviewing")));
+        assert_eq!(rt.agent(&agent).unwrap().current_task, Some(100));
+        assert_eq!(
+            rt.task(original_id).unwrap().state,
+            TeamTaskState::Reviewing
+        );
+    }
 
     #[test]
     fn snapshot世代は正規化画面が変わったときだけ進む() {
@@ -5704,6 +6356,38 @@ mod stall_tests {
     }
 
     #[test]
+    fn 停滞レビューは現在の対象を再通知し判断待ちにせず提出する() {
+        let (mut rt, sessions) = dispatched();
+        let active = rt
+            .tasks
+            .iter()
+            .find(|t| t.assigned_session.is_some())
+            .unwrap()
+            .id;
+        let target_id = rt.tasks.iter().map(|t| t.id).max().unwrap() + 1;
+        let mut target = rt.task(active).unwrap().clone();
+        target.id = target_id;
+        target.state = TeamTaskState::Reviewing;
+        target.assigned_agent = None;
+        target.assigned_session = None;
+        target.coordinator_task = None;
+        rt.tasks.push(target);
+        let t = rt.tasks.iter_mut().find(|t| t.id == active).unwrap();
+        t.review_of = Some(target_id);
+        t.files.clear();
+        let agent = t.assigned_agent.clone().unwrap();
+        run_quiet(&mut rt, &sessions, 28);
+        assert_eq!(rt.task(active).unwrap().state, TeamTaskState::Submitted);
+        assert_eq!(rt.task(target_id).unwrap().state, TeamTaskState::Submitted);
+        assert!(!rt.task(target_id).unwrap().review.approved());
+        assert!(!rt.decisions.iter().any(|d| d.task_id == Some(active)));
+        assert!(!rt
+            .tasks
+            .iter()
+            .any(|t| t.assigned_agent.as_ref() == Some(&agent) && t.id == active));
+    }
+
+    #[test]
     fn 二十八分変わらない担当は促されて回収要求まで進む() {
         let (mut rt, sessions) = dispatched();
         let nudged = run_quiet(&mut rt, &sessions, 28);
@@ -5838,10 +6522,12 @@ mod budget_tests {
         assert!(t.contains("#3"));
         assert!(t.contains("10 分"));
         assert!(t.contains("完了報告"));
-        assert!(!t.contains("[ZAI-TEAM-RESULT]"), "形式をここに二度書いている");
+        assert!(
+            !t.contains("[ZAI-TEAM-RESULT]"),
+            "形式をここに二度書いている"
+        );
     }
 }
-
 
 /// **重複判定のスコープ** — 本文だけで数えると正しい報告が消える。
 ///
@@ -5850,9 +6536,9 @@ mod budget_tests {
 /// 2 通目以降が「もう見た」で捨てられ、タスクが `Reviewing` のまま止まる。
 #[cfg(test)]
 mod seen_key_tests {
+    use super::super::outbox::Kind;
     use super::super::testkit;
     use super::*;
-    use super::super::outbox::Kind;
 
     fn rt() -> TeamRuntime {
         let ws = crate::test_util::unique_temp_dir("zaivern-team-seen", "key");
@@ -5939,7 +6625,11 @@ mod seen_key_tests {
             }
             rt.mark_seen(k);
         }
-        assert_eq!(rt.seen_blocks.len(), SEEN_BLOCKS_CAP, "上限を超えて覚えている");
+        assert_eq!(
+            rt.seen_blocks.len(),
+            SEEN_BLOCKS_CAP,
+            "上限を超えて覚えている"
+        );
         assert_eq!(rt.seen_block_order.len(), SEEN_BLOCKS_CAP);
         assert!(
             !rt.is_seen(&first.expect("最初の鍵")),

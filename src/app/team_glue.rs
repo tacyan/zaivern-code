@@ -88,18 +88,7 @@ impl ZaivernApp {
     pub(crate) fn team_tick(&mut self, ctx: &egui::Context) {
         // 1) `zai team run` からの起動要求を拾う (**1 回だけ**)。
         self.team_take_launch_request();
-
-        // 仕様書の書き換えが返っていれば受け取る。**待たない** —
-        // 覗くだけなので、返ってきていなければ 1 マイクロ秒も止まらない。
-        let drafting = panel::with_panel(|p| {
-            p.poll_draft();
-            p.drafting()
-        });
-        if drafting {
-            // 入力が無くても状態が進むようフレームを回す (数分かかるので、
-            // 回さないと「押したのに何も起きない」に見える)。
-            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(250), "team_draft");
-        }
+        panel::with_panel(|p| p.poll_workspace_preparations());
 
         let has_run = panel::with_panel(|p| p.has_run());
         if !has_run {
@@ -170,27 +159,19 @@ impl ZaivernApp {
         let Some(req) = launch::take_in(&root, &ws, now) else {
             return;
         };
-        // **CLI から来た Run にも、依頼の形に合わせた編成を当てる。**
-        // 画面のフォームだけで当てると、`zai team run` は既定の
-        // 「レビュー必須」のまま計画され、1 枚の HP に「#1 のレビュー」が
-        // 1 本増えて直列に 1 段延びる (実測: 試行 3)。体の数は `--agents` で
-        // 人が言ったものを尊重し、役割とレビューの有無だけを当てる。
-        let rec = {
-            use crate::features::team::imp::composition;
-            let probe = composition::probe_workspace(&ws);
-            composition::recommend(&req.spec_text, &probe, req.agent_count.max(1))
-        };
         let opts = RunOptions {
             spec_source: req.spec_path.display().to_string(),
-            agent_count: req.agent_count,
-            review_required: rec.review_required,
+            agent_count: req.agent_count.max(2),
+            review_required: false,
+            guardrails: crate::features::team::imp::model::RunGuardrails {
+                approval_mode: self.cfg.approval_mode.clone(),
+                cost_limit: self.cfg.cost_limit_session.max(0.0),
+            },
             ..RunOptions::default()
         };
-        let roles = rec.roles.clone();
+        let roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
         let auto = req.auto_start;
-        let rewrite_short = planner::needs_spec_rewrite(&req.spec_text);
-        let approval_mode = self.cfg.approval_mode.clone();
-        let cost_limit = self.cfg.cost_limit_session.max(0.0);
+        let spec_text = format!("{}\n{}", planner::IMPLEMENTATION_ONLY, req.spec_text);
         let result = panel::with_panel(|p| {
             p.open = true;
             // **要求の中の workspace を attach しない。** 未信頼データに
@@ -202,35 +183,13 @@ impl ZaivernApp {
             // 二重に叩いても、動いているチームを別の計画で潰さない。
             p.attach_workspace(&ws)?;
             p.tab = BoardTab::Organization;
-            if rewrite_short {
-                // CLI だけ短い依頼を直列計画へすり抜けさせない。フォームへ
-                // 同じ SPEC を載せ、GUI と同じ書き換え・人の確認へ合流する。
-                p.form = panel::NewRunForm::default();
-                p.form.open = true;
-                p.form.from_file = true;
-                p.form.spec_path = req.spec_path.display().to_string();
-                p.form.agents = req.agent_count;
-                p.form.approval_mode = approval_mode;
-                p.form.cost_limit = cost_limit;
-                Ok(())
-            } else {
-                p.form.open = false;
-                let r = p.plan_with(&req.spec_text, &opts.spec_source.clone(), opts, roles, "");
-                if r.is_ok() && auto {
-                    // `--yes` は **Start Team の確認だけ**を省く。仕様書の
-                    // 書き換え確認までは省かない。
-                    p.act(TeamAction::Start);
-                }
-                r
+            p.form.open = false;
+            let r = p.plan_with(&spec_text, &opts.spec_source.clone(), opts, roles, "");
+            if r.is_ok() && auto {
+                p.act(TeamAction::Start);
             }
+            r
         });
-        if rewrite_short && result.is_ok() {
-            self.team_draft_spec();
-            if panel::with_panel(|p| p.drafting()) {
-                self.toast(tr("team.draft.hint"), true);
-            }
-            return;
-        }
         match result {
             Ok(()) => self.toast(
                 trf(
@@ -338,22 +297,16 @@ impl ZaivernApp {
                 // Run を添えないと、Run を作り直したあとに前の Run の配達が
                 // 終わったとき、**同じ番号の別のタスク**の指示を完了に
                 // してしまう (積んだ仕事は Run の切り替えでは消えない)。
-                // **本文はすぐ書き、確定キーだけ静かになってから撃つ。**
-                //
-                // ここは 2 回間違えた。両方の失敗の形を残しておく:
-                //
-                // * `Job::user` だけ (待たない) — 忙しい CLI の最中に本文と
-                //   Enter が入り、**Codex が Enter を飲み込んだ**。指示が
-                //   入力欄に残ったまま止まる
-                // * `Job::deferred` (Idle を待って書く) — 起動直後の Claude Code
-                //   は見張りがまだ Idle と言わず、`⚠` の案内で `attention` にも
-                //   なるので、**本文が 1 バイトも書かれないまま**時間切れになった
-                //   (実機で 6 体中 5 体が空のプロンプトのまま止まった)
-                //
-                // 正しいのは分けること。書くのは待たない (起動直後の入力欄は
-                // 空なので、書いて困らない)。**待つのは確定キーだけ** —
-                // 飲み込まれるのはそちらなので ([`submit::COMMIT_IDLE_WAIT`])。
+                // 初回は起動待ち、2通目以降は前の応答が終わるのを待って本文を書く。
+                // 完了JSONは応答の途中でも読めるため、即送信するとCLIが本文を捨てる。
+                let followup = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session)
+                    .is_some_and(|s| s.last_prompt.is_some());
                 let mut job = crate::submit::Job::user(session, text);
+                job.wait_idle = followup;
                 job.tag = panel::with_panel(|p| p.delivery_tag(&owner, &key));
                 self.queue_submit(job)
             };
@@ -824,20 +777,6 @@ impl ZaivernApp {
                     Some(id.clone())
                 };
             }),
-            BoardAction::DraftSpec => self.team_draft_spec(),
-            BoardAction::AcceptDraft => {
-                panel::with_panel(|p| p.accept_draft());
-                // **採用したら、そのまま計画へ進む。**「これでいいですか？」
-                // に「はい」と答えたのに、もう一度別のボタンを押させない。
-                self.team_plan_from_form();
-            }
-            BoardAction::DiscardDraft => {
-                panel::with_panel(|p| p.discard_draft());
-                // 「元のまま進む」は、書き換えを捨てるだけではなく
-                // **その原文で計画まで進む**。通常の入口へ戻すと、短い原文を
-                // もう一度「書き換えが必要」と判定して同じ画面を無限に回る。
-                self.team_plan_from_form_inner(false);
-            }
             BoardAction::OpenNewRun => {
                 // **ここでも既存設定を初期値として読む** (フォームを開く
                 // 入口が 2 つあるので、片方だけだと既定値のまま計画できる)。
@@ -878,99 +817,6 @@ impl ZaivernApp {
                 }
             }
         }
-    }
-
-    /// **短い指示を、使えるエージェントに仕様書へ書き換えてもらう。**
-    ///
-    /// 計画は SPEC の箇条書きを機械的に割るので、一行の指示では実装タスクが
-    /// 1 件にしかならず、何体立てても 1 体しか働かない。書き換えを挟むと
-    /// 分担できる形になる。**採用するかは人が決める** — 勝手に膨らませた
-    /// 仕様で走り出したら、頼んでいない物ができる。
-    ///
-    /// 実行は裏のスレッド。UI スレッドで待つと、考えている数分ぶん
-    /// フレームが止まる (CLAUDE.md「git は UI スレッドで待たない」と同じ理由)。
-    fn team_draft_spec(&mut self) {
-        let (ws, mut form) = panel::with_panel(|p| (p.workspace().to_path_buf(), p.form.clone()));
-        // 書き換えの材料は、計画へ渡すのと**同じ経路**で取る
-        // (別々に取ると「画面で見た指示」と「書き換えた指示」がずれる)。
-        let brief = if form.from_file {
-            let path = if std::path::Path::new(&form.spec_path).is_absolute() {
-                std::path::PathBuf::from(&form.spec_path)
-            } else {
-                ws.join(&form.spec_path)
-            };
-            match launch::build(&ws, &path, form.agents, false) {
-                Ok(req) => req.spec_text,
-                Err(e) => {
-                    panel::with_panel(|p| p.form.error = e.detail());
-                    return;
-                }
-            }
-        } else {
-            form.spec_text.clone()
-        };
-        if brief.trim().is_empty() {
-            panel::with_panel(|p| p.form.error = tr("team.draft.empty_brief"));
-            return;
-        }
-        // **依頼の形に合わせた編成を当てる** (人が手で変えていなければ)。
-        // ここで当てないと、書き換え依頼文が「最大 4 体・6 役割」のまま
-        // 飛んで、1 枚の HP が 8 本の SPEC に割られる (実測)。
-        let rec = self.team_apply_recommendation(&mut form, &brief, &ws);
-        let shape = rec.shape;
-        // **1 枚の成果物は、仕様書をこちらで書く。** headless のエージェントに
-        // 最大 5 分待つ理由が無い (毎回同じ形: 実装 1 本 + 検証 1 本)。
-        // 10 分の予算の半分を「仕様書を書いてもらう」ことに使わない。
-        // 確認は従来どおり人がする (`DraftState::Ready`)。
-        if let Some(text) =
-            crate::features::team::imp::composition::spec_template(&form.goal_name, &brief, &rec)
-        {
-            panel::with_panel(|p| {
-                p.form.error.clear();
-                p.form.draft = panel::DraftState::Ready {
-                    agent: "Zaivern".to_string(),
-                    text,
-                };
-            });
-            return;
-        }
-        // **使えるエージェント = ヘッドレスで走らせられるもの。**
-        // 対話 TUI しか持たない CLI をここで起こすと、返らないまま
-        // 時間切れを待つだけになる。
-        let Some((label, program, args)) = self.team_headless_agent() else {
-            panel::with_panel(|p| p.form.error = tr("team.draft.no_agent"));
-            return;
-        };
-        // **こちらが実際に走らせられる検証だけを見せる。** 見せないと
-        // エージェントは想像で書き、`tools/verify.sh --quick` のような
-        // パス指定が返ってきて計画がまるごと断られる (実測)。
-        let candidates =
-            crate::features::team::imp::validation_defaults::detect(&ws).unwrap_or_default();
-        let prompt = crate::features::team::imp::spec_writer::build_prompt(
-            &form.goal_name,
-            &brief,
-            form.agents,
-            &form.roles,
-            &candidates,
-            shape,
-        );
-        let (tx, rx) = std::sync::mpsc::channel();
-        let cwd = ws.clone();
-        // 送り手が落ちても受け側は `Disconnected` で決着する。
-        std::thread::spawn(move || {
-            let r = crate::features::team::imp::spec_writer::draft_with(
-                &program,
-                &args,
-                &cwd,
-                &prompt,
-                crate::features::team::imp::spec_writer::DRAFT_TIMEOUT,
-            );
-            let _ = tx.send(r);
-        });
-        panel::with_panel(|p| {
-            p.form.error.clear();
-            p.begin_draft(&label, rx);
-        });
     }
 
     /// **依頼の形に合わせた編成をフォームへ当てる。** 戻り値は依頼の形
@@ -1038,45 +884,15 @@ impl ZaivernApp {
             .collect()
     }
 
-    /// ヘッドレスで走らせられるエージェントを 1 つ選ぶ。
-    ///
-    /// 選び方は設定のプリセット順 (先頭が既定)。**実体は絶対パスまで
-    /// 確定させる** — 名前のまま `Command` へ渡すと OS が PATH を引き直し、
-    /// 判定したのとは別の実体が動きうる。
-    fn team_headless_agent(&self) -> Option<(String, std::path::PathBuf, Vec<String>)> {
-        for p in &self.cfg.agents {
-            let Some(spec) = crate::agents::spec_for_command(&p.command) else {
-                continue;
-            };
-            let Ok((program, args)) = crate::diagnostician::build_invocation(&p.command, spec)
-            else {
-                continue;
-            };
-            let ws = panel::with_panel(|p| p.workspace().to_path_buf());
-            let Ok(found) = crate::features::team::imp::validation_command::resolve_in(
-                &program,
-                &ws,
-                std::env::var("PATH").ok().as_deref(),
-                std::env::var("PATHEXT").ok().as_deref(),
-            ) else {
-                continue;
-            };
-            return Some((p.name.clone(), found.path, args));
-        }
-        None
-    }
-
     /// フォームの内容で計画する。
     fn team_plan_from_form(&mut self) {
-        self.team_plan_from_form_inner(true);
+        self.team_plan_from_form_inner();
     }
 
     /// フォームの内容で計画する本体。
     ///
-    /// `rewrite_short` が真なら、実装タスクが 1 件にしか分かれない指示を
-    /// そのまま計画せず、先に分担可能な仕様書へ書き換える。利用者が
-    /// 「元のまま進む」を明示した 1 経路だけが偽で呼ぶ。
-    fn team_plan_from_form_inner(&mut self, rewrite_short: bool) {
+    /// 依頼から直接実装タスクを作って開始する。
+    fn team_plan_from_form_inner(&mut self) {
         // **基準は画面のいまのフォルダではなく、Team が持っている workspace。**
         // 実行中の Run があると切り替えを断るので、この 2 つは食い違いうる。
         // `agent_cwd()` で SPEC を解決すると、Run の workspace と別の場所の
@@ -1099,29 +915,25 @@ impl ZaivernApp {
         } else {
             (form.spec_text.clone(), tr("team.form.direct_source"))
         };
-        // **短い指示を直列の 1 タスクとして走らせない。**
-        //
-        // 「HTML を作って」のような依頼は従来、実装 1 件 + 統合 1 件に
-        // しかならず、何体起こしても 1 体しか働かなかった。専用ボタンを
-        // 見つけた人だけ並列化できる形では、通常の「計画を作る」入口が
-        // 壊れたままなので、計画と同じ物差しで 1 件なら自動的に書き換えへ
-        // 送る。書き換えた内容は従来どおり人が確認してから採用する。
-        if rewrite_short && planner::needs_spec_rewrite(&spec_text) {
-            self.team_draft_spec();
-            return;
-        }
+        let spec_text = if planner::implementation_only(&spec_text) {
+            spec_text
+        } else {
+            format!("{}\n{}", planner::IMPLEMENTATION_ONLY, spec_text)
+        };
         // **計画にも同じ編成を当てる。** 書き換えの段だけで当てると、
         // 書き換えを経ない (最初から分かれている) SPEC が既定の 6 役割・
         // 4 体のまま計画され、画面のおすすめと実際の編成が食い違う。
         let mut form = form;
         self.team_apply_recommendation(&mut form, &spec_text, &ws);
+        form.roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
+        form.review_required = false;
         let opts = RunOptions {
             // **秒だけで作らない。** 同じ秒に 2 回始めると ID が衝突し、
             // 前の Run の検証結果や承認が新しい Run の同じ番号のタスクへ
             // 当たりうる (`runtime::new_run_id`)。
             run_id: crate::features::team::imp::runtime::new_run_id(),
             spec_source: source.clone(),
-            agent_count: form.agents,
+            agent_count: form.agents.max(2),
             // 空なら「おまかせ」(役割ごとに配る)。名前が入っていれば全員それ。
             agent_presets: form.agent_presets.clone(),
             max_attempts: form.max_attempts,
@@ -1143,11 +955,12 @@ impl ZaivernApp {
                 p.form.open = false;
                 p.form.error.clear();
                 p.tab = BoardTab::Organization;
+                p.act(TeamAction::Start);
             }
             r
         });
         match r {
-            Ok(()) => self.toast(tr("team.toast.plan_preview"), true),
+            Ok(()) => {}
             Err(e) => panel::with_panel(|p| p.form.error = e),
         }
     }
@@ -1355,6 +1168,10 @@ mod short_spec_route_tests {
             .expect("計画と同じ物差しで短い指示を見ている");
         let plan = body.find("p.plan_with(").expect("計画へ渡す口がある");
         assert!(gate < plan, "計画した後に書き換えを判定している:\n{body}");
+        assert!(
+            body.contains("!form.from_file || planner::needs_spec_rewrite(&spec_text)"),
+            "直接入力が箇条書きだとエージェント変換をすり抜ける"
+        );
         assert!(
             body[..plan].contains("self.team_draft_spec()"),
             "短い指示を書き換えへ送っていない:\n{body}"

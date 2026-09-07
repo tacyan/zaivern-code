@@ -47,18 +47,28 @@ pub struct PlanInput {
 /// 計画に失敗した理由。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
+    InvalidAcceptance(String),
     /// SPEC が空 / 短すぎる。
     EmptySpec,
     /// SPEC が大きすぎる。
-    SpecTooLarge { bytes: usize, limit: usize },
+    SpecTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     /// Planner の出力が schema を満たさない。
     Schema(SchemaError),
     /// SPEC に書かれた検証コマンドが**語に割れない**。
     ///
     /// 黙って捨てると既定へ落ちて、利用者が書いたものと違う検証が走る。
-    InvalidValidationCommand { command: String, reason: String },
+    InvalidValidationCommand {
+        command: String,
+        reason: String,
+    },
     /// SPEC に書かれた検証コマンドが**実行を許されていない**。
-    ForbiddenValidationCommand { command: String, reason: String },
+    ForbiddenValidationCommand {
+        command: String,
+        reason: String,
+    },
     /// 検証コマンドの自動決定が、**設定ファイルを読めずに**失敗した。
     ///
     /// 「目印が無い」([`DetectError::Undetermined`]) と「目印はあるが候補を
@@ -67,12 +77,15 @@ pub enum PlanError {
     /// `package.json` を空の候補へ畳むと、走らせられる検証が存在しない
     /// フォルダ (素の HTML など) と区別が付かなくなり、完了が**レビュー
     /// 承認だけ**で決まる状態のまま素通りする。
-    ValidationDetectionFailed { reason: String },
+    ValidationDetectionFailed {
+        reason: String,
+    },
 }
 
 impl PlanError {
     pub fn detail(&self) -> String {
         match self {
+            PlanError::InvalidAcceptance(reason) => reason.clone(),
             PlanError::EmptySpec => "SPEC が空です。実装したい内容を書いてください。".to_string(),
             PlanError::SpecTooLarge { bytes, limit } => {
                 format!("SPEC が大きすぎます ({bytes} バイト / 上限 {limit})")
@@ -95,6 +108,98 @@ impl PlanError {
 
 /// SPEC の上限。これを超えると Planner へ渡さない
 /// (LLM Planner でも文脈に収まらないし、静的解析でも意味を成さない)。
+pub const IMPLEMENTATION_ONLY: &str = "[ZAI-IMPLEMENTATION-ONLY]";
+
+pub fn implementation_only(spec: &str) -> bool {
+    spec.starts_with(IMPLEMENTATION_ONLY)
+}
+
+fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
+    let request = input
+        .spec
+        .strip_prefix(IMPLEMENTATION_ONLY)
+        .unwrap_or(&input.spec)
+        .trim();
+    if request.is_empty() {
+        return Err(PlanError::EmptySpec);
+    }
+    let title: String = request
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(request)
+        .trim_start_matches('#')
+        .trim()
+        .chars()
+        .take(100)
+        .collect();
+    let sections = parse_sections(request);
+    // Only explicit, disjoint file assignments can safely run concurrently.
+    // Unstructured requests stay intact so requirements cannot disappear in a split.
+    let seeds = implementation_seeds(&sections, &title);
+    let mut tasks: Vec<TaskDoc> = Vec::new();
+    {
+        // ファイル分担の無い自然文でも、実装を独立した作業場所へ分けて即時並列化する。
+        // Run ごとの一意な場所なので、同じ依頼の同時実行でも中間成果を上書きしない。
+        let root = format!(
+            "{}/{}",
+            super::task_workspace::ROOT,
+            super::runtime::new_run_id()
+        );
+        let units: Vec<String> = seeds
+            .iter()
+            .filter(|seed| {
+                super::plan_schema::role_of("", &seed.title) == super::model::TeamRole::Implementer
+            })
+            .map(|seed| format!("{}\n{}", seed.title, seed.body))
+            .collect();
+        let count = units.len().max(2).min(input.agent_count.max(2)).min(8);
+        for i in 0..count {
+            let focus = if units.len() > 1 {
+                units
+                    .iter()
+                    .skip(i)
+                    .step_by(count)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if i == 0 {
+                "本体・中核となる処理または本文を実装する。コードなら主要ロジックと構造、文書やスキルなら本文・具体的な手順を担当する。表示装飾は別担当に任せる。".into()
+            } else {
+                "表示・出力・利用側を実装する。Webならスタイルと操作UI、プログラムなら利用側の入出力、文書やスキルなら導入説明・入力例・編集用テンプレートと実ファイルの完成見本を担当する。見本は説明だけで済ませず依頼された形式で保存する。本体ロジックの重複実装は避ける。".into()
+            };
+            let dir = format!("{root}/part-{}", i + 1);
+            tasks.push(TaskDoc {
+                key: format!("implement-{}", i + 1), title: format!("並列実装 {}: {}", i + 1, focus.lines().next().unwrap_or("担当部分").chars().take(80).collect::<String>()),
+                description: format!("担当: {focus}\n隔離先: {dir}/。Zaivernが用意するGitワークツリー（Gitが使えない環境では独立コピー）内で、既存の実装を直接編集する。ファイルの複製を別の場所へ作らない。他担当の完了を待たず、利用方法が分かる実装を作る。仕様書・計画書・テスト・レビューは作らない。変更ファイルと削除ファイルを完了要約へ列挙する。後続担当が差分を元のフォルダへ統合する。依頼外の機能は追加しない。"),
+                team: "implementation".into(), role: "implementer".into(), depends_on: vec![],
+                files: vec![format!("{dir}/**")], required_caps: vec![],
+                acceptance_criteria: vec!["担当部分の実体を作業場所に保存した".into()], validation_commands: vec![],
+            });
+        }
+    }
+    // 実装だけをまとめる担当。検証や仕様承認を工程として追加しない。
+    let dependencies = tasks.iter().map(|task| task.key.clone()).collect();
+    tasks.push(TaskDoc {
+        key: "assemble".into(), title: "実装を組み合わせて成果物を保存".into(),
+        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを開いたフォルダへ統合する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。仕様書・テスト・レビュー・確認待ちは追加しない。他Runの作業場所は使わない。".into(),
+        team: "implementation".into(), role: "implementer".into(), depends_on: dependencies,
+        files: vec!["**".into()], required_caps: vec![],
+        acceptance_criteria: vec!["最終成果物を本来の保存先に保存した".into()], validation_commands: vec![],
+    });
+    Ok(PlanDoc {
+        goal: GoalDoc {
+            title,
+            definition_of_done: vec!["依頼された成果物を開いたフォルダに保存する".into()],
+        },
+        teams: vec![TeamDoc {
+            key: "implementation".into(),
+            name: "Implementation".into(),
+            lead_role: "implementer".into(),
+        }],
+        tasks,
+    })
+}
+
 pub const SPEC_MAX_BYTES: usize = 512 * 1024;
 
 /// 計画を作るもの。
@@ -411,6 +516,10 @@ impl StaticPlanner {
     /// 道具が無いだけなら検証なしで通し、**設定ファイルが読めないときは
     /// 断る** ([`PlanError::ValidationDetectionFailed`])。
     pub fn compose(&self, input: &PlanInput) -> Result<PlanDoc, PlanError> {
+        if implementation_only(&input.spec) {
+            return compose_implementation(input);
+        }
+        super::acceptance::parse(&input.spec).map_err(PlanError::InvalidAcceptance)?;
         let sections = parse_sections(&input.spec);
 
         // 表題: 最初の非空見出し。無ければ SPEC の最初の行。
@@ -437,12 +546,28 @@ impl StaticPlanner {
 
         // 検証コマンド (SPEC が指定していれば使う。危険なものはここで落とす)
         // **SPEC の文字列はここで構造へ直す。** 以降は構造のまま運ぶ。
-        let mut spelled: Vec<String> = sections
+        let mut spelled = Vec::new();
+        for line in sections
             .iter()
             .filter(|s| is_validation_heading(&s.title))
-            .flat_map(|s| s.bullets.iter().chain(s.prose.iter()).cloned())
-            .map(|s| s.trim_matches('`').trim().to_string())
-            .collect();
+            .flat_map(|s| s.bullets.iter().chain(s.prose.iter()))
+        {
+            let text = line.trim();
+            // 日本語等で書かれた説明を実行ファイル名と取り違えない。
+            // バッククォートで明示されたコマンドは通常の検査を必ず通す。
+            let prose = !text.starts_with('`')
+                && text
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|word| !word.is_ascii());
+            if prose {
+                if !dod.iter().any(|item| item == text) {
+                    dod.push(text.to_string());
+                }
+            } else {
+                spelled.push(text.trim_matches('`').trim().to_string());
+            }
+        }
         spelled.dedup();
 
         // **SPEC の指定が最優先。1 件でも通らなければ計画を作らない。**
@@ -502,9 +627,7 @@ impl StaticPlanner {
                 // **読めないものを黙って無視しない。** 理由は検出器に
                 // 言わせる (同じ説明を 2 か所に書かない)。
                 Err(e @ DetectError::Unreadable { .. }) => {
-                    return Err(PlanError::ValidationDetectionFailed {
-                        reason: e.detail(),
-                    });
+                    return Err(PlanError::ValidationDetectionFailed { reason: e.detail() });
                 }
             }
         }
@@ -777,9 +900,7 @@ impl StaticPlanner {
                     // 呼ぶのは正しくないが、そもそも配らなければ起きない —
                     // 席も 1 つ空き、そのぶんトークンも使わない。
                     (0..raw_tasks.len())
-                        .filter(|j| {
-                            *j != i && raw_roles[*j] == R::Implementer
-                        })
+                        .filter(|j| *j != i && raw_roles[*j] == R::Implementer)
                         .map(|j| raw_keys[j].clone())
                         .collect()
                 } else if role == R::Planner {
@@ -835,7 +956,10 @@ impl StaticPlanner {
         // 最終テストより先に統合を配らない。raw task は test_key より先に
         // 構築されるため、生成後に依存を結ぶ。
         if let Some(test) = &test_key {
-            for task in tasks.iter_mut().filter(|task| task.role == R::Integrator.key()) {
+            for task in tasks
+                .iter_mut()
+                .filter(|task| task.role == R::Integrator.key())
+            {
                 if !task.depends_on.contains(test) {
                     task.depends_on.push(test.clone());
                 }
@@ -855,24 +979,24 @@ impl StaticPlanner {
         // **統合は既定で置く** (役割の選択とは無関係)。SPEC 側に統合担当が
         // 居るときだけ、二重になるので置かない。
         if !covered.contains(&R::Integrator) {
-        tasks.push(TaskDoc {
-            key: "integrate".into(),
-            title: "最終統合と全体検証".into(),
-            description: "全タスクの成果を統合し、整形・ビルド・テストを通す。\
+            tasks.push(TaskDoc {
+                key: "integrate".into(),
+                title: "最終統合と全体検証".into(),
+                description: "全タスクの成果を統合し、整形・ビルド・テストを通す。\
                 push / PR 作成 / merge / deploy は行わない。"
-                .into(),
-            team: "integration".into(),
-            role: "integrator".into(),
-            depends_on: integrate_deps,
-            files: Vec::new(),
-            required_caps: Vec::new(),
-            acceptance_criteria: vec![
-                "すべてのタスクが完了している".to_string(),
-                "整形・ビルド・テストが成功する".to_string(),
-                "未解決のレビュー指摘が無い".to_string(),
-            ],
-            validation_commands: validations,
-        });
+                    .into(),
+                team: "integration".into(),
+                role: "integrator".into(),
+                depends_on: integrate_deps,
+                files: Vec::new(),
+                required_caps: Vec::new(),
+                acceptance_criteria: vec![
+                    "すべてのタスクが完了している".to_string(),
+                    "整形・ビルド・テストが成功する".to_string(),
+                    "未解決のレビュー指摘が無い".to_string(),
+                ],
+                validation_commands: validations,
+            });
         }
 
         Ok(PlanDoc {
@@ -886,11 +1010,11 @@ impl StaticPlanner {
     }
 }
 
-
 /// 「もう分割されている」と言える実装タスクの数。
 ///
 /// これに満たない SPEC では、分割そのものが仕事になるので
 /// 計画 → 設計 → 実装 と直列に繋ぐ。満たしていれば**待たせない**。
+#[cfg(test)]
 pub const MIN_PARALLEL_TASKS: usize = 2;
 
 /// SPEC から**実装タスクの見出し**を選ぶ (純関数)。
@@ -901,6 +1025,7 @@ pub const MIN_PARALLEL_TASKS: usize = 2;
 /// **`compose` から切り出してあるのは、「この SPEC では何件に分かれるか」を
 /// 計画を作らずに知りたい側が居るから** ([`needs_spec_rewrite`])。
 /// 物差しを 2 つ持つと、「短いと言われたのに計画は分かれた」/ その逆が起きる。
+#[cfg(test)]
 pub fn implementation_titles(sections: &[SpecSection], title: &str) -> Vec<String> {
     implementation_seeds(sections, title)
         .into_iter()
@@ -919,6 +1044,16 @@ pub fn implementation_seeds(sections: &[SpecSection], title: &str) -> Vec<TaskSe
             title: b.to_string(),
             body: String::new(),
         }
+    }
+    // 詳細な仕様書は要件と実行タスクを別々に持つ。タスク一覧があれば
+    // 要件の箇条書きまで追加の実装タスクにしない。従来形式は下の経路で読む。
+    let explicit_tasks: Vec<TaskSeed> = sections
+        .iter()
+        .filter(|s| s.title.trim() == "タスク" || s.title.trim().eq_ignore_ascii_case("tasks"))
+        .flat_map(|s| s.bullets.iter().map(|b| from_bullet(b)))
+        .collect();
+    if !explicit_tasks.is_empty() {
+        return explicit_tasks;
     }
     let mut raw: Vec<TaskSeed> = sections
         .iter()
@@ -967,6 +1102,7 @@ pub fn implementation_seeds(sections: &[SpecSection], title: &str) -> Vec<TaskSe
 /// 文字数では測らない。長くても箇条書きの無い散文は 1 件にしかならないし、
 /// 短くても箇条書きが 3 つあれば 3 件に分かれる。**計画と同じ読み取りで
 /// 数える**のが唯一ずれない物差しになる。
+#[cfg(test)]
 pub fn needs_spec_rewrite(spec: &str) -> bool {
     let sections = parse_sections(spec);
     let title = sections
@@ -1024,6 +1160,54 @@ impl TeamPlanner for StaticPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 詳細要件を追加しても実行タスクが増えない() {
+        for heading in ["タスク", "Tasks"] {
+            let spec = format!(
+                "# ログイン\n\n## 詳細要件\n- REQ-01: メールでログイン\n\
+                 - REQ-02: 不正入力を拒否\n- REQ-03: セッションを保持\n\n\
+                 ## {heading}\n\
+                 - implementer: REQ-01〜03 メール認証を実装 (files: src/auth.rs)\n\
+                 - tester: ログイン成功と不正入力の拒否を確認\n\n\
+                 ## 完了条件\n- 正常入力でログインでき、不正入力は拒否される\n"
+            );
+            let sections = parse_sections(&spec);
+            let seeds = implementation_seeds(&sections, "ログイン");
+            assert_eq!(seeds.len(), 2);
+            assert!(seeds[0].title.starts_with("implementer:"));
+            assert!(seeds[1].title.starts_with("tester:"));
+            let plan = StaticPlanner
+                .plan(PlanInput {
+                    spec: spec.clone(),
+                    source: "SPEC.md".into(),
+                    agent_count: 2,
+                    review_required: false,
+                    workspace_root: std::path::PathBuf::new(),
+                    roles: vec![
+                        super::super::model::TeamRole::Implementer,
+                        super::super::model::TeamRole::Tester,
+                    ],
+                })
+                .unwrap();
+            // プランナーは既定の「最終統合と全体検証」を1件追加する。
+            assert_eq!(plan.tasks.len(), 3);
+            assert_eq!(
+                plan.tasks
+                    .iter()
+                    .filter(|t| t.role == super::super::model::TeamRole::Implementer)
+                    .count(),
+                1
+            );
+            assert_eq!(plan.goal.specification, spec);
+            assert_eq!(plan.tasks[0].files, vec!["src/auth.rs".to_string()]);
+        }
+        let legacy = "# 従来形式\n## 要件\n- 入力を読む\n- 結果を書く\n";
+        assert_eq!(
+            implementation_seeds(&parse_sections(legacy), "従来形式").len(),
+            2
+        );
+    }
 
     /// **ワークスペースを持たない入力。**
 
@@ -1096,7 +1280,11 @@ mod tests {
             named_plan.tasks.len(),
             7,
             "名乗っているのに骨組みが積まれた: {:?}",
-            named_plan.tasks.iter().map(|t| &t.title).collect::<Vec<_>>()
+            named_plan
+                .tasks
+                .iter()
+                .map(|t| &t.title)
+                .collect::<Vec<_>>()
         );
         // 名乗りが無ければ従来どおり骨組みが要る (この検査が空回りしない証明)。
         assert!(
@@ -1109,7 +1297,13 @@ mod tests {
         let roles_of = |p: &super::super::plan_schema::TeamPlan| {
             p.tasks.iter().map(|t| t.role).collect::<Vec<_>>()
         };
-        for want in [R::Planner, R::Architect, R::Tester, R::Reviewer, R::Integrator] {
+        for want in [
+            R::Planner,
+            R::Architect,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ] {
             assert!(
                 roles_of(&named_plan).contains(&want),
                 "{:?} のタスクが 1 本も無い",
@@ -1151,6 +1345,25 @@ mod tests {
         let d = crate::test_util::unique_temp_dir("zaivern-team-planner", name);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn 検証方針の文章は実行せず完了条件として保持する() {
+        let policy =
+            "静的なchecksだけでは合格にしない。すべてのscenariosを、配布する実物に対して実施する。";
+        for prefix in ["", "- "] {
+            let spec = format!("{SPEC}\n## 検証方針\n{prefix}{policy}\n");
+            let plan = StaticPlanner.plan(input(&spec)).unwrap();
+            assert!(plan
+                .goal
+                .definition_of_done
+                .iter()
+                .any(|item| item == policy));
+        }
+        for command in ["npm test && npm run lint", "rm -rf .", "`未許可コマンド`"] {
+            let spec = format!("{SPEC}\n## 検証\n- {command}\n");
+            assert!(StaticPlanner.plan(input(&spec)).is_err(), "{command}");
+        }
     }
 
     const SPEC: &str = "\
@@ -1255,7 +1468,10 @@ mod tests {
             .expect_err("危険なコマンドを含む SPEC を受理した");
         match &e {
             PlanError::ForbiddenValidationCommand { command, .. } => {
-                assert!(command.contains("git push"), "どれが駄目なのか言わない: {e:?}");
+                assert!(
+                    command.contains("git push"),
+                    "どれが駄目なのか言わない: {e:?}"
+                );
             }
             other => panic!("方針の拒否として返っていない: {other:?}"),
         }
@@ -1562,8 +1778,14 @@ mod tests {
 
         // 目印なし → Undetermined → 検証なしで通る
         let d = tmp_ws("split-undetermined");
-        assert_eq!(validation_defaults::detect(&d), Err(DetectError::Undetermined));
-        assert!(StaticPlanner.plan(input_in(spec, &d)).is_ok(), "目印なしで断った");
+        assert_eq!(
+            validation_defaults::detect(&d),
+            Err(DetectError::Undetermined)
+        );
+        assert!(
+            StaticPlanner.plan(input_in(spec, &d)).is_ok(),
+            "目印なしで断った"
+        );
         std::fs::remove_dir_all(&d).ok();
 
         // 目印あり・候補なし → NoCandidate → 検証なしで通る
@@ -1607,7 +1829,9 @@ mod tests {
     #[test]
     fn 箇条書きが無いspecでも計画できる() {
         let plan = StaticPlanner
-            .plan(input("# 目的\n本文だけ。\n\n## 設計\n説明。\n## 検証\n- cargo test\n"))
+            .plan(input(
+                "# 目的\n本文だけ。\n\n## 設計\n説明。\n## 検証\n- cargo test\n",
+            ))
             .expect("計画できるべき");
         assert!(!plan.tasks.is_empty());
     }
@@ -1721,11 +1945,22 @@ mod tests {
         let mut inp = input(SPEC);
         inp.roles = super::super::panel::NewRunForm::default().roles;
         let p = StaticPlanner.plan(inp).unwrap();
-        let impls: Vec<&super::super::model::TeamTask> =
-            p.tasks.iter().filter(|t| t.role == R::Implementer).collect();
+        let impls: Vec<&super::super::model::TeamTask> = p
+            .tasks
+            .iter()
+            .filter(|t| t.role == R::Implementer)
+            .collect();
         assert!(impls.len() >= MIN_PARALLEL_TASKS, "SPEC が分割されていない");
-        let plan = p.tasks.iter().find(|t| t.role == R::Planner).expect("Planner");
-        let design = p.tasks.iter().find(|t| t.role == R::Architect).expect("Architect");
+        let plan = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Planner)
+            .expect("Planner");
+        let design = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Architect)
+            .expect("Architect");
         assert!(plan.dependencies.is_empty());
         assert!(design.dependencies.contains(&plan.id));
         for task in &impls {
@@ -1749,11 +1984,11 @@ mod tests {
                 t.id
             );
         }
-        // 並列実装数 + レビュー余力だけを起動し、仕事の無い担当を増やさない。
+        // 設計・実装・検証・統合の専門担当を確保する。
         assert_eq!(
             super::super::scheduler::desired_sessions(&p.tasks, 4),
-            (impls.len() + 1).min(4),
-            "実作業数と起動数が一致しない"
+            4,
+            "設計・実装・検証・統合の担当数が一致しない"
         );
     }
 
@@ -1768,8 +2003,14 @@ mod tests {
         let plan = p.tasks.iter().find(|t| t.role == R::Planner).unwrap();
         let design = p.tasks.iter().find(|t| t.role == R::Architect).unwrap();
         let imp = p.tasks.iter().find(|t| t.role == R::Implementer).unwrap();
-        assert!(design.dependencies.contains(&plan.id), "設計が計画を待たない");
-        assert!(imp.dependencies.contains(&design.id), "実装が設計を待たない");
+        assert!(
+            design.dependencies.contains(&plan.id),
+            "設計が計画を待たない"
+        );
+        assert!(
+            imp.dependencies.contains(&design.id),
+            "実装が設計を待たない"
+        );
     }
 
     /// **テスト担当を選んだら、テスト担当の仕事が立つ。**
@@ -1809,7 +2050,6 @@ mod tests {
         );
     }
 
-
     /// **`(files: …)` の札を剥がして読む。** spec_writer が書かせる形そのもの。
     /// 札を語として数えると丸ごと捨てて、glob (`assets/vendor/**`) が落ちる。
     #[test]
@@ -1827,7 +2067,10 @@ mod tests {
             ]
         );
         let (_, f) = split_files("設計 (ファイル: docs/PLAN.md, docs/ARCH.md)");
-        assert_eq!(f, vec!["docs/PLAN.md".to_string(), "docs/ARCH.md".to_string()]);
+        assert_eq!(
+            f,
+            vec!["docs/PLAN.md".to_string(), "docs/ARCH.md".to_string()]
+        );
         // 札だけで中身が無いなら、ファイルは無い。
         let (_, f) = split_files("x (files: )");
         assert!(f.is_empty());
@@ -1911,7 +2154,11 @@ Zaivern が何なのかを決め、ページの構成を決める。
             );
         }
         // 役割ごとの節を骨組みで重複させなくても、確定順は失わない。
-        let planner = p.tasks.iter().find(|t| t.role == R::Planner).expect("Planner");
+        let planner = p
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Planner)
+            .expect("Planner");
         let architect = p
             .tasks
             .iter()
@@ -2016,7 +2263,10 @@ js/scene.js にシーン・カメラ・ライトを組む。
     /// これが空に戻ると、実機で起きた「7 タスク全部が未申告」に戻る。
     #[test]
     fn 本文に書かれた担当ファイルを拾う() {
-        assert_eq!(files_of(SPEC, "HTML を書く"), vec!["index.html".to_string()]);
+        assert_eq!(
+            files_of(SPEC, "HTML を書く"),
+            vec!["index.html".to_string()]
+        );
         assert_eq!(
             files_of(SPEC, "スタイルを書く"),
             vec!["css/style.css".to_string()]
@@ -2089,16 +2339,31 @@ js/scene.js にシーン・カメラ・ライトを組む。
     #[test]
     fn 拾うものと拾わないものを表で固定する() {
         let table: &[(&str, &[&str])] = &[
-            ("3D キャンバスの置き場所とセクション構成を決めて index.html を書く。", &["index.html"]),
-            ("配色・タイポグラフィ・余白を css/style.css に書く。", &["css/style.css"]),
-            ("js/scene.js にシーン・カメラ・ライトを組む。", &["js/scene.js"]),
-            ("ページの構成を docs/brief.md にまとめる。", &["docs/brief.md"]),
+            (
+                "3D キャンバスの置き場所とセクション構成を決めて index.html を書く。",
+                &["index.html"],
+            ),
+            (
+                "配色・タイポグラフィ・余白を css/style.css に書く。",
+                &["css/style.css"],
+            ),
+            (
+                "js/scene.js にシーン・カメラ・ライトを組む。",
+                &["js/scene.js"],
+            ),
+            (
+                "ページの構成を docs/brief.md にまとめる。",
+                &["docs/brief.md"],
+            ),
             // 助詞が直に付く / 括弧や強調に包まれる
             ("index.htmlを書く", &["index.html"]),
             ("**index.html** を書く", &["index.html"]),
             ("`docs/brief.md`にまとめる", &["docs/brief.md"]),
             // 拾ってはいけないもの
-            ("https://unpkg.com/three@0.159.0/build/three.module.js から読み込む", &[]),
+            (
+                "https://unpkg.com/three@0.159.0/build/three.module.js から読み込む",
+                &[],
+            ),
             ("https://example.com/assets/app.js を参照", &[]),
             ("three の r159 を使う", &[]),
             ("3D キャンバスを置く", &[]),
@@ -2146,7 +2411,14 @@ README.md にまとめる。
 
     fn plan_of(spec: &str) -> Vec<crate::features::team::imp::model::TeamTask> {
         let mut inp = input(spec);
-        inp.roles = vec![R::Planner, R::Architect, R::Implementer, R::Tester, R::Reviewer, R::Integrator];
+        inp.roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
         StaticPlanner.plan(inp).expect("計画できるべき").tasks
     }
 
@@ -2166,15 +2438,25 @@ README.md にまとめる。
             }
         }
         for (f, ids) in &owner {
-            assert_eq!(ids.len(), 1, "{f} を {ids:?} が同時に持っている (直列化する)");
+            assert_eq!(
+                ids.len(),
+                1,
+                "{f} を {ids:?} が同時に持っている (直列化する)"
+            );
         }
         // **その節にしか出てこないものは、ちゃんと担当になる。**
         let own: Vec<&str> = owner.keys().copied().collect();
         for want in ["css/style.css", "js/scene.js", "docs/test.md"] {
-            assert!(own.contains(&want), "{want} が誰の担当にもなっていない: {own:?}");
+            assert!(
+                own.contains(&want),
+                "{want} が誰の担当にもなっていない: {own:?}"
+            );
         }
         // ライブラリ名は落ちる (3 節に出るので)。
-        assert!(!own.contains(&"three.js"), "ライブラリ名を担当にした: {own:?}");
+        assert!(
+            !own.contains(&"three.js"),
+            "ライブラリ名を担当にした: {own:?}"
+        );
     }
 
     /// **整合担当は他の全部を待つ。**
@@ -2201,10 +2483,7 @@ README.md にまとめる。
         }
         // 同じ段の実装同士は待たせない。設計の確定だけを待ち、そこからは
         // 並列に進めることで、安全性のために必要な直列化以上は増やさない。
-        let implementers: Vec<_> = tasks
-            .iter()
-            .filter(|t| t.role == R::Implementer)
-            .collect();
+        let implementers: Vec<_> = tasks.iter().filter(|t| t.role == R::Implementer).collect();
         for task in &implementers {
             for peer in &implementers {
                 if task.id != peer.id {
@@ -2230,10 +2509,7 @@ README.md にまとめる。
             .iter()
             .find(|t| t.role == R::Architect)
             .expect("Architect");
-        let implementers: Vec<_> = tasks
-            .iter()
-            .filter(|t| t.role == R::Implementer)
-            .collect();
+        let implementers: Vec<_> = tasks.iter().filter(|t| t.role == R::Implementer).collect();
         assert!(!implementers.is_empty(), "前提: 実装タスクが無い");
         assert!(planner.dependencies.is_empty(), "Planner に先行依存がある");
         assert!(

@@ -1441,18 +1441,20 @@ fn おすすめの編成は計画と書き換えの両方に当たる() {
 }
 
 #[test]
-fn 一枚の成果物は仕様書をこちらで書きwebの完了は読み込みを確かめる() {
-    // **10 分の予算を、仕様書を書いてもらう 5 分で使わない。** 1 枚の成果物は
-    // 雛形が出るので、エージェントを起こす前に返す。
+fn 指示の変換はエージェントを使いwebの完了は読み込みを確かめる() {
     let glue = src(GLUE);
     let body = function_body(&glue, glue.find("fn team_draft_spec").expect("書き換え"));
-    let tpl = body.find("spec_template(").expect("雛形を使っていない");
-    let agent = body.find("team_headless_agent()").expect("エージェントの選定");
-    assert!(tpl < agent, "雛形より先にエージェントを起こしている (5 分待つ)");
-    assert!(
-        body.contains("DraftState::Ready"),
-        "雛形を人の確認へ回していない (黙って採用している)"
-    );
+    assert!(!body.contains("spec_template("), "エージェントを使わず雛形で返している");
+    let agent = body.find("team_headless_agent(&form.agent_presets)").expect("エージェントの選定");
+    let draft = body.find("spec_writer::draft_with(").expect("エージェントへ依頼");
+    assert!(agent < draft);
+    assert!(body.contains("p.begin_draft(&label, rx)"));
+    assert!(!body.contains("fallback_spec("), "詳細な計画を固定文で置き換えている");
+    let selection = function_body(&glue, glue.find("fn team_headless_agent").unwrap());
+    assert!(selection.contains("select_agent(&names, selected,"));
+    let accept = glue.split("BoardAction::AcceptDraft => {").nth(1).unwrap()
+        .split("BoardAction::DiscardDraft").next().unwrap();
+    assert!(accept.contains("team_plan_from_form_inner(false)"), "採用後に再変換している");
     // **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
     let rt = src(include_str!("runtime.rs"));
     assert!(

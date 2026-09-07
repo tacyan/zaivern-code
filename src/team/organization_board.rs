@@ -25,11 +25,7 @@ use crate::theme::Theme;
 
 use super::graph::{Phase, PhaseStatus};
 use super::model::*;
-use super::panel::{
-    BoardAction, BoardTab, ClosePrompt, DraftState, NewRunForm, RestorePrompt,
-};
-use super::composition;
-use super::planner;
+use super::panel::{BoardAction, BoardTab, ClosePrompt, NewRunForm, RestorePrompt};
 use super::view_model::{
     self, current_action, ActionFocus, TeamAgentView, TeamSnapshot, MISSION_PANEL_W,
 };
@@ -133,6 +129,7 @@ fn phase_status_label(s: PhaseStatus) -> String {
     match s {
         PhaseStatus::Waiting => tr("team.phase_status.waiting"),
         PhaseStatus::Running => tr("team.phase_status.running"),
+        PhaseStatus::Submitted => tr("team.task.submitted"),
         PhaseStatus::Done => tr("team.phase_status.done"),
     }
 }
@@ -146,6 +143,7 @@ fn goal_status_label(s: GoalStatus) -> String {
         GoalStatus::Blocked => tr("team.goal.blocked"),
         GoalStatus::Reviewing => tr("team.goal.reviewing"),
         GoalStatus::Integrating => tr("team.goal.integrating"),
+        GoalStatus::Submitted => tr("team.goal.submitted"),
         GoalStatus::Completed => tr("team.goal.completed"),
         GoalStatus::Failed => tr("team.goal.failed"),
         GoalStatus::NeedsUser => tr("team.goal.needs_user"),
@@ -163,6 +161,7 @@ fn task_state_label(s: TeamTaskState) -> String {
         TeamTaskState::Reviewing => tr("team.task.reviewing"),
         TeamTaskState::RevisionRequired => tr("team.task.revision_required"),
         TeamTaskState::Failed => tr("team.task.failed"),
+        TeamTaskState::Submitted => tr("team.task.submitted"),
         TeamTaskState::Completed => tr("team.task.completed"),
         TeamTaskState::NeedsUser => tr("team.task.needs_user"),
     }
@@ -326,7 +325,9 @@ fn body(
         ui.colored_label(theme.warn, plain(notice));
     }
     run_tabs_row(ui, theme, runs, active_run, acts);
-    git_needed_row(ui, theme, needs_git, acts);
+    let direct =
+        snap.is_some_and(|s| s.phases.len() == 1 && s.phases[0].0 == Phase::Implementation);
+    git_needed_row(ui, theme, needs_git && !direct && !form.open, acts);
     ready_to_start_row(ui, theme, snap, acts);
 
     // ── 未完了 Run の扱い ──
@@ -342,7 +343,11 @@ fn body(
 
     // ── New Team Run のフォーム ──
     if form.open {
-        new_run_form(ui, theme, form, agents, acts);
+        egui::ScrollArea::vertical()
+            .id_salt("team-new-run-scroll")
+            .max_height(ui.available_height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| new_run_form(ui, theme, form, agents, acts));
         return;
     }
 
@@ -539,7 +544,7 @@ fn goal_color(theme: &Theme, s: GoalStatus) -> egui::Color32 {
     match s {
         GoalStatus::Completed => theme.ok,
         GoalStatus::Failed | GoalStatus::Blocked | GoalStatus::NeedsUser => theme.err,
-        GoalStatus::Paused => theme.warn,
+        GoalStatus::Paused | GoalStatus::Submitted => theme.warn,
         _ => theme.accent,
     }
 }
@@ -819,6 +824,7 @@ const TASK_COLUMNS: &[(&str, &[TeamTaskState])] = &[
         ],
     ),
     ("team.col.done", &[TeamTaskState::Completed]),
+    ("team.task.submitted", &[TeamTaskState::Submitted]),
 ];
 
 fn tasks_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<BoardAction>) {
@@ -826,13 +832,18 @@ fn tasks_tab(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut Vec<
         centered_note(ui, theme, &tr("team.empty.no_tasks"));
         return;
     }
-    let w = (ui.available_width() / TASK_COLUMNS.len() as f32).max(140.0) - 8.0;
+    let implementation_only = s.phases.len() == 1 && s.phases[0].0 == Phase::Implementation;
+    let columns: Vec<_> = TASK_COLUMNS
+        .iter()
+        .filter(|(key, _)| !implementation_only || *key != "team.col.checking")
+        .collect();
+    let w = (ui.available_width() / columns.len() as f32).max(140.0) - 8.0;
     egui::ScrollArea::horizontal()
         .id_salt(format!("team-scroll-{}", BoardTab::Tasks.key()))
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_top(|ui| {
-                for (key, states) in TASK_COLUMNS.iter() {
+                for (key, states) in &columns {
                     let rows: Vec<&view_model::TaskView> = s
                         .tasks
                         .iter()
@@ -1159,11 +1170,13 @@ fn mission_panel(ui: &mut egui::Ui, theme: &Theme, s: &TeamSnapshot, acts: &mut 
             // どこに居るかが要るので添える)。**色だけに頼らない**。
             for (i, (p, st)) in s.phases.iter().enumerate() {
                 let col = match st {
+                    PhaseStatus::Submitted => theme.warn,
                     PhaseStatus::Done => theme.ok,
                     PhaseStatus::Running => theme.accent,
                     PhaseStatus::Waiting => theme.text_dim,
                 };
                 let mark = match st {
+                    PhaseStatus::Submitted => "!",
                     PhaseStatus::Done => "✓",
                     PhaseStatus::Running => "▶",
                     PhaseStatus::Waiting => "・",
@@ -1400,12 +1413,7 @@ fn restore_card(
     );
 }
 
-fn close_card(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    close: &ClosePrompt,
-    acts: &mut Vec<BoardAction>,
-) {
+fn close_card(ui: &mut egui::Ui, theme: &Theme, close: &ClosePrompt, acts: &mut Vec<BoardAction>) {
     let avail = ui.available_size();
     ui.allocate_ui_with_layout(
         avail,
@@ -1417,12 +1425,9 @@ fn close_card(
                     artifact_path,
                 } => {
                     ui.label(
-                        RichText::new(trf(
-                            "team.close.confirm_dirty",
-                            &[("run", run_id.clone())],
-                        ))
-                        .color(theme.err)
-                        .strong(),
+                        RichText::new(trf("team.close.confirm_dirty", &[("run", run_id.clone())]))
+                            .color(theme.err)
+                            .strong(),
                     );
                     ui.label(trf(
                         "team.close.artifact_path",
@@ -1445,10 +1450,7 @@ fn close_card(
                     artifact_path,
                 } => {
                     ui.spinner();
-                    ui.label(trf(
-                        "team.close.stopping",
-                        &[("run", run_id.clone())],
-                    ));
+                    ui.label(trf("team.close.stopping", &[("run", run_id.clone())]));
                     ui.label(trf(
                         "team.close.artifact_path",
                         &[("path", artifact_path.clone())],
@@ -1457,7 +1459,11 @@ fn close_card(
                 ClosePrompt::Failed {
                     artifact_path, why, ..
                 } => {
-                    ui.label(RichText::new(tr("team.close.failed")).color(theme.err).strong());
+                    ui.label(
+                        RichText::new(tr("team.close.failed"))
+                            .color(theme.err)
+                            .strong(),
+                    );
                     ui.label(plain(why));
                     ui.label(trf(
                         "team.close.artifact_path",
@@ -1614,11 +1620,22 @@ fn new_run_form(
                 ui.end_row();
             } else {
                 ui.label(tr("team.form.spec_text"));
-                ui.add(
-                    egui::TextEdit::multiline(&mut form.spec_text)
-                        .desired_rows(8)
-                        .desired_width(ui.available_width()),
-                );
+                // desired_rows は最低行数なので、長文では本文全体まで伸びる。
+                // Grid の一つのセル内にスクロール領域を置いて高さを固定する。
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("team-spec-editor-scroll")
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut form.spec_text)
+                                    .id_salt("team-spec-editor")
+                                    .desired_rows(8)
+                                    .desired_width(ui.available_width()),
+                            );
+                        });
+                });
                 ui.end_row();
             }
 
@@ -1628,7 +1645,7 @@ fn new_run_form(
             if ui
                 .add(egui::Slider::new(
                     &mut form.agents,
-                    1..=super::panel::FORM_MAX_AGENTS,
+                    2..=super::panel::FORM_MAX_AGENTS,
                 ))
                 .changed()
             {
@@ -1661,15 +1678,6 @@ fn new_run_form(
             });
             ui.end_row();
 
-            ui.label(tr("team.form.review_required"));
-            if ui
-                .checkbox(&mut form.review_required, tr("team.form.review_hint"))
-                .changed()
-            {
-                form.composition_touched = true;
-            }
-            ui.end_row();
-
             ui.label(tr("team.form.agent"));
             ui.horizontal_wrapped(|ui| {
                 // **おまかせが既定。** 役割ごとに、入っている CLI を配る。
@@ -1694,247 +1702,22 @@ fn new_run_form(
             });
             ui.end_row();
 
-            ui.label(tr("team.form.roles"));
-            ui.horizontal_wrapped(|ui| {
-                for r in TeamRole::ALL {
-                    // TeamLead は必ず 1 体居るので選択肢に出さない
-                    // (選べない選択肢を並べない)。
-                    if r == TeamRole::TeamLead {
-                        continue;
-                    }
-                    let on = form.roles.contains(&r);
-                    if ui.selectable_label(on, role_label(r)).clicked() {
-                        form.composition_touched = true;
-                        if on {
-                            form.roles.retain(|x| *x != r);
-                        } else {
-                            form.roles.push(r);
-                        }
-                    }
-                }
-            });
-            ui.end_row();
-
             ui.label(tr("team.form.cost_limit"));
             ui.add(egui::DragValue::new(&mut form.cost_limit).range(0.0..=1000.0));
             ui.end_row();
         });
-    recommendation_section(ui, theme, form);
     if !form.error.is_empty() {
         ui.colored_label(theme.err, plain(&form.error));
     }
-    spec_draft_section(ui, theme, form, acts);
     ui.separator();
     ui.horizontal(|ui| {
-        // 書き換え中・確認中・失敗案内中は、計画のボタンを出さない。
-        // **同じ瞬間に 2 つの進み方を見せない**。ここから通常計画へ
-        // 抜けられると、短い指示を並列化する関門を迂回できてしまう。
-        if !matches!(form.draft, DraftState::Idle) {
-            if ui.button(tr("team.form.cancel")).clicked() {
-                form.open = false;
-            }
-            return;
-        }
-        if ui.button(tr("team.form.plan_preview")).clicked() {
+        if ui.button(tr("team.btn.start")).clicked() {
             acts.push(BoardAction::PlanFromForm);
         }
         if ui.button(tr("team.form.cancel")).clicked() {
             form.open = false;
         }
     });
-}
-
-/// **おすすめの編成** — 依頼の形から「何体・どの役割」を出す。
-///
-/// 6 役割・4 体の既定を何にでも当てると、1 枚の HP に 14 本の計画が立って
-/// 25 分で完了 0 件になる (実測)。ここは [`composition::recommend`] の判断を
-/// **理由つきで**見せる。人が手で変えていなければ、計画・書き換えの
-/// たびに同じ判断が自動で当たる (`app::team_glue`)。判断そのものは
-/// ここに書かない — 画面と実際に使う編成が食い違わないように、
-/// 表は `composition` 1 か所に置く。
-fn recommendation_section(ui: &mut egui::Ui, theme: &Theme, form: &mut NewRunForm) {
-    // ファイル指定のときは中身を読まないと形が分からない (読み込みは
-    // 押されてから)。Goal 名だけでも「HP」「移行」のような形は読める。
-    let brief = if form.from_file {
-        form.goal_name.clone()
-    } else {
-        format!("{}\n{}", form.goal_name, form.spec_text)
-    };
-    if brief.trim().is_empty() {
-        return;
-    }
-    let rec = composition::recommend(&brief, &form.probe, super::panel::FORM_MAX_AGENTS);
-    let same = form.agents == rec.agents
-        && form.roles == rec.roles
-        && form.review_required == rec.review_required;
-    ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(tr("team.recommend.title"))
-                .color(theme.text)
-                .strong(),
-        );
-        ui.label(RichText::new(shape_label(rec.shape)).color(theme.accent));
-    });
-    let roles: Vec<String> = rec.roles.iter().map(|r| role_label(*r)).collect();
-    ui.label(
-        RichText::new(trf(
-            "team.recommend.summary",
-            &[
-                ("agents", rec.agents.to_string()),
-                ("roles", roles.join(" / ")),
-            ],
-        ))
-        .color(theme.text),
-    );
-    for why in &rec.reasons {
-        ui.label(
-            RichText::new(format!("• {}", reason_label(*why, rec.units)))
-                .size(11.0)
-                .color(theme.text_dim),
-        );
-    }
-    // 時間の予算と「レビュー専任を立てない」も編成の一部なので、ここに出す
-    // (出さないと、チェックが勝手に外れたように見える)。
-    if let Some(min) = rec.time_budget_min {
-        ui.label(
-            RichText::new(trf(
-                "team.recommend.time_budget",
-                &[("minutes", min.to_string())],
-            ))
-            .size(11.0)
-            .color(theme.text_dim),
-        );
-    }
-    if !rec.review_required {
-        ui.label(
-            RichText::new(tr("team.recommend.review_off"))
-                .size(11.0)
-                .color(theme.text_dim),
-        );
-    }
-    ui.horizontal_wrapped(|ui| {
-        if same {
-            ui.label(RichText::new(tr("team.recommend.in_use")).color(theme.ok));
-        } else {
-            if ui.button(tr("team.recommend.apply")).clicked() {
-                form.agents = rec.agents;
-                form.roles = rec.roles.clone();
-                form.review_required = rec.review_required;
-                form.composition_touched = false;
-            }
-            if form.composition_touched {
-                ui.label(RichText::new(tr("team.recommend.manual")).color(theme.text_dim));
-            }
-        }
-    });
-}
-
-fn shape_label(s: composition::WorkShape) -> String {
-    use composition::WorkShape as S;
-    // **`tr` には素の文字列リテラルを渡す** (`zai i18n missing` の走査に
-    // 現れるように)。
-    match s {
-        S::SingleArtifact => tr("team.recommend.shape.single_artifact"),
-        S::WideIndependent => tr("team.recommend.shape.wide_independent"),
-        S::FeatureInRepo => tr("team.recommend.shape.feature_in_repo"),
-        S::Research => tr("team.recommend.shape.research"),
-    }
-}
-
-fn reason_label(r: composition::Reason, units: usize) -> String {
-    use composition::Reason as R;
-    match r {
-        R::SingleArtifact => tr("team.recommend.why.single_artifact"),
-        R::WideUnits => trf("team.recommend.why.wide_units", &[("units", units.to_string())]),
-        R::ExistingRepo => tr("team.recommend.why.existing_repo"),
-        R::EmptyWorkspace => tr("team.recommend.why.empty_workspace"),
-        R::Research => tr("team.recommend.why.research"),
-        R::TokenCost => tr("team.recommend.why.token_cost"),
-    }
-}
-
-/// **短い指示を仕様書へ書き換える段。**
-///
-/// 出るのは「このままでは実装タスクが 1 件にしかならない」ときだけ
-/// ([`planner::needs_spec_rewrite`])。分かれる SPEC を書いた人に
-/// 余計な段を見せない。
-fn spec_draft_section(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    form: &NewRunForm,
-    acts: &mut Vec<BoardAction>,
-) {
-    match &form.draft {
-        DraftState::Idle => {
-            // ファイル指定のときは中身を読まないと判定できないので、
-            // 直接入力の本文だけを見る (読み込みは押されてから)。
-            let short = form.from_file || planner::needs_spec_rewrite(&form.spec_text);
-            if !short {
-                return;
-            }
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(tr("team.draft.button")).clicked() {
-                    acts.push(BoardAction::DraftSpec);
-                }
-                ui.label(RichText::new(tr("team.draft.hint")).color(theme.text_dim));
-            });
-        }
-        DraftState::Running { agent } => {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    RichText::new(trf("team.draft.running", &[("agent", agent.clone())]))
-                        .color(theme.text_dim),
-                );
-            });
-        }
-        DraftState::Ready { agent, text } => {
-            ui.separator();
-            ui.label(
-                RichText::new(trf("team.draft.question", &[("agent", agent.clone())]))
-                    .color(theme.text)
-                    .strong(),
-            );
-            // **中身を全部見せてから決めてもらう。** 折り畳んだまま
-            // 「はい」を押させると、確認したことにならない。
-            egui::ScrollArea::vertical()
-                .id_salt("team-draft-preview")
-                .max_height(260.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    for line in text.lines() {
-                        ui.label(RichText::new(line).monospace().size(11.0).color(theme.text));
-                    }
-                });
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(tr("team.draft.accept")).clicked() {
-                    acts.push(BoardAction::AcceptDraft);
-                }
-                if ui.button(tr("team.draft.retry")).clicked() {
-                    acts.push(BoardAction::DraftSpec);
-                }
-                if ui.button(tr("team.draft.keep")).clicked() {
-                    acts.push(BoardAction::DiscardDraft);
-                }
-            });
-        }
-        DraftState::Failed { why } => {
-            ui.separator();
-            ui.colored_label(theme.warn, plain(why));
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(tr("team.draft.retry")).clicked() {
-                    acts.push(BoardAction::DraftSpec);
-                }
-                if ui.button(tr("team.draft.keep")).clicked() {
-                    acts.push(BoardAction::DiscardDraft);
-                }
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2058,6 +1841,58 @@ mod tests {
                 used.top() >= screen.top() - 1.0 && used.bottom() <= screen.bottom() + 1.0,
                 "画面 {w}×{h} で縦にはみ出した: used={used:?} screen={screen:?}"
             );
+        }
+    }
+
+    #[test]
+    fn 長い仕様文でもフォームが画面からはみ出さず全文を保つ() {
+        let theme = crate::theme::all().remove(0);
+        for (w, h) in [(900.0, 700.0), (1200.0, 300.0)] {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h));
+            let mut form = NewRunForm::default();
+            form.open = true;
+            form.from_file = false;
+            let original = "日本語の詳細仕様と検証条件を保持する。\n".repeat(3000);
+            form.spec_text = original.clone();
+            for _ in 0..4 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        board_window(
+                            ctx,
+                            &theme,
+                            true,
+                            None,
+                            BoardTab::Organization,
+                            &mut form,
+                            RestorePrompt::None,
+                            &ClosePrompt::None,
+                            None,
+                            None,
+                            &[],
+                            0,
+                            false,
+                            &[],
+                            "",
+                            &mut |_, _| false,
+                        );
+                    },
+                );
+            }
+            let used = ctx.used_rect();
+            assert!(
+                used.top() >= -1.0 && used.bottom() <= h + 1.0,
+                "{w}x{h}: {used:?}"
+            );
+            assert!(
+                used.left() >= -1.0 && used.right() <= w + 1.0,
+                "{w}x{h}: {used:?}"
+            );
+            assert_eq!(form.spec_text, original);
         }
     }
 

@@ -412,14 +412,14 @@ fn request_changesで差し戻される() {
 }
 
 #[test]
-fn 上限まで差し戻すと人へ上げる() {
+fn 上限まで差し戻すと未解決付きで提出する() {
     let (mut rt, sids, tid, mut rev_sid) = to_review_stage();
     let mut now = 20;
     for round in 0..3 {
         let block = review_block(tid, false);
         tick_text(&mut rt, now, &sids, rev_sid, &block);
         now += 1;
-        if rt.task(tid).unwrap().state == TeamTaskState::NeedsUser {
+        if rt.task(tid).unwrap().state == TeamTaskState::Submitted {
             break;
         }
         // 再実装 → 再報告 → 再レビュー
@@ -443,12 +443,12 @@ fn 上限まで差し戻すと人へ上げる() {
             .and_then(|t| t.assigned_session)
             .unwrap_or(rev_sid);
     }
-    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::NeedsUser);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Submitted);
     assert!(
-        rt.decisions()
+        !rt.decisions()
             .iter()
             .any(|d| d.kind == DecisionKind::AttemptsExhausted),
-        "人へ上げていない: {:?}",
+        "人の判断が要求されている: {:?}",
         rt.decisions()
     );
 }
@@ -3259,7 +3259,7 @@ fn 調停層が断ったら指示も出さない() {
 }
 
 #[test]
-fn 迂回してよい場所は二か所だけ() {
+fn 迂回してよい場所は三か所だけ() {
     // **`sm::force` を増やしたらここが赤くなる。** 増やすなら、その場所と
     // 「なぜ確認済みと言えるか」をこのテストにも書くこと。
     let src = include_str!("runtime.rs").replace("\r\n", "\n");
@@ -3269,8 +3269,8 @@ fn 迂回してよい場所は二か所だけ() {
         .filter(|l| l.contains("sm::force("))
         .count();
     assert_eq!(
-        n, 2,
-        "状態機械を迂回している箇所が {n} 個ある (人の Retry と、停止確認後の回収だけのはず)"
+        n, 3,
+        "状態機械を迂回している箇所が {n} 個ある (人の Retry、停止確認後の回収、ユーザー指定の未解決付き提出だけのはず)"
     );
 }
 

@@ -356,7 +356,12 @@ pub fn desired_sessions(tasks: &[TeamTask], max_agents: usize) -> usize {
     } else {
         1
     };
-    need.min(max_agents)
+    // 直列の計画でも専門の担当を置く。依存の幅だけでは常に2体になる。
+    let specialties: std::collections::BTreeSet<_> = tasks.iter()
+        .filter(|t| t.review_of.is_none())
+        .map(|t| t.role)
+        .collect();
+    need.max(specialties.len()).min(max_agents)
 }
 
 #[cfg(test)]
@@ -379,6 +384,17 @@ mod tests {
         t.state = TeamTaskState::Ready;
         t.files = files.iter().map(|s| s.to_string()).collect();
         t
+    }
+
+    #[test]
+    fn 直列でも仕事内容に応じて専門担当数を変える() {
+        use super::super::model::TeamRole;
+        let mut tasks = vec![task(1, "implementation", &[]), task(2, "test", &[1]), task(3, "integration", &[2])];
+        tasks[1].role = TeamRole::Tester;
+        tasks[2].role = TeamRole::Integrator;
+        assert_eq!(desired_sessions(&tasks, 8), 3);
+        assert_eq!(desired_sessions(&tasks, 2), 2);
+        assert_eq!(desired_sessions(&tasks[..1], 8), 1);
     }
 
     #[test]

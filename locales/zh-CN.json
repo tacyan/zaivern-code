@@ -4693,6 +4693,8 @@
   "team.git.needed": "⚠ 此文件夹不在 Git 管理下。无法实测变更，因此任何完成报告都无法被接受",
   "team.git.no_workspace": "尚未确定工作区",
   "team.goal.blocked": "受阻",
+  "team.goal.submitted": "已提交（存在未解决问题）",
+  "team.task.submitted": "已提交（存在未解决问题）",
   "team.goal.completed": "完成",
   "team.goal.failed": "失败",
   "team.goal.integrating": "集成中",

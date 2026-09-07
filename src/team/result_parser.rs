@@ -499,7 +499,15 @@ pub fn parse_lenient<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, St
 ///
 /// **上限つき。** 走査対象そのものも末尾 [`SCAN_MAX_BYTES`] だけを見る。
 pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
-    let text = tail_bytes(text, SCAN_MAX_BYTES);
+    extract_blocks_with_limits(text, open, close, BLOCK_MAX_BYTES, SCAN_MAX_BYTES)
+}
+
+/// 計画など、報告とは上限が異なる文書も同じ抽出規則で読む。
+/// 呼び出し側が文書と走査の上限を指定する。通常の報告の制限は変えない。
+pub fn extract_blocks_with_limits(
+    text: &str, open: &str, close: &str, block_max: usize, scan_max: usize,
+) -> Vec<String> {
+    let text = tail_bytes(text, scan_max);
     let mut out = Vec::new();
     let mut rest = text;
     while out.len() < BLOCKS_PER_SCAN {
@@ -507,7 +515,7 @@ pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
         let after = &rest[i + open.len()..];
         let Some(j) = after.find(close) else { break };
         let body = &after[..j];
-        if body.len() <= BLOCK_MAX_BYTES {
+        if body.len() <= block_max {
             out.push(body.trim().to_string());
         }
         rest = &after[j + close.len()..];

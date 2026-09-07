@@ -163,7 +163,7 @@ pub struct RunDoc {
     /// ユーザーが Team を開始した元 workspace。旧版互換のため
     /// フィールド名は維持する。
     pub workspace: String,
-    /// Run 専用 worktree と実行 workspace。`None` は旧保存形式。
+    /// 旧版の Run 専用 worktree。`None` の Run は開いたフォルダで実行する。
     #[serde(default)]
     pub run_workspace: Option<super::run_workspace::RunWorkspace>,
     pub spec_source: String,

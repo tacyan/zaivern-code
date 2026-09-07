@@ -203,8 +203,15 @@ pub const FEED_CAP: usize = 60;
 pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
     let tasks = rt.tasks();
     let goal_done = rt.goal().status == GoalStatus::Completed;
-    let phases = graph::phases(tasks, goal_done);
-    let phase = graph::current_phase(tasks, goal_done);
+    let mut phases = graph::phases(tasks, goal_done);
+    if super::planner::implementation_only(&rt.goal().specification) {
+        phases.retain(|(phase, _)| *phase == Phase::Implementation);
+    }
+    let phase = if super::planner::implementation_only(&rt.goal().specification) {
+        Phase::Implementation
+    } else {
+        graph::current_phase(tasks, goal_done)
+    };
 
     let agents: Vec<TeamAgentView> = rt
         .agents()
@@ -216,7 +223,7 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
                 .collect();
             let done = mine
                 .iter()
-                .filter(|t| t.state == TeamTaskState::Completed)
+                .filter(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
                 .count();
             let cur = a
                 .current_task
@@ -261,7 +268,9 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
                     .collect(),
                 done: mine
                     .iter()
-                    .filter(|t| t.state == TeamTaskState::Completed)
+                    .filter(|t| {
+                        matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted)
+                    })
                     .count(),
                 total: mine.len(),
             }
@@ -329,7 +338,7 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
         tasks_total: tasks.len(),
         tasks_done: tasks
             .iter()
-            .filter(|t| t.state == TeamTaskState::Completed)
+            .filter(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
             .count(),
         agents_active: agents
             .iter()
@@ -399,7 +408,8 @@ pub fn snapshot(rt: &TeamRuntime, now: u64) -> TeamSnapshot {
         unmeasured: crate::git::discover_toplevel(rt.workspace()).is_none(),
         unvalidated: {
             let mut impl_tasks = tasks.iter().filter(|t| t.review_of.is_none()).peekable();
-            impl_tasks.peek().is_some()
+            !super::planner::implementation_only(&rt.goal().specification)
+                && impl_tasks.peek().is_some()
                 && tasks
                     .iter()
                     .filter(|t| t.review_of.is_none())
@@ -436,6 +446,14 @@ pub enum ActionFocus {
 /// 1. 人の承認 2. 停滞 3. 詰まり 4. テスト失敗 5. レビュー差し戻し
 /// 6. 統合中 7. 通常の作業 8. Goal Completed
 pub fn current_action(s: &TeamSnapshot) -> CurrentAction {
+    if s.goal.status == GoalStatus::Submitted {
+        return CurrentAction {
+            glyph: "!",
+            text: crate::i18n::tr("team.goal.submitted"),
+            focus: ActionFocus::None,
+            urgent: false,
+        };
+    }
     if let Some(d) = s.pending_decisions.first() {
         return CurrentAction {
             glyph: "!",

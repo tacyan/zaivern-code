@@ -41,6 +41,7 @@
 //!
 //! 使い方と設計の全体像は `docs/team.md`。
 
+pub mod acceptance;
 pub mod changeset;
 pub mod composition;
 pub mod cli;
@@ -60,8 +61,11 @@ pub mod result_parser;
 pub mod reviewer;
 pub mod roles;
 pub mod run_workspace;
+pub mod task_workspace;
 pub mod runtime;
 pub mod scheduler;
+// 旧仕様生成の回帰用。製品の実行経路からは除外する。
+#[cfg(test)]
 pub mod spec_writer;
 pub mod state_machine;
 pub mod validation_command;

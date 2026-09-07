@@ -4693,6 +4693,8 @@
   "team.git.needed": "⚠ このフォルダは Git 管理下ではありません。変更を実測できないので、どの完了報告も受理できません",
   "team.git.no_workspace": "ワークスペースが決まっていません",
   "team.goal.blocked": "進行不可",
+  "team.goal.submitted": "提出済み（未解決あり）",
+  "team.task.submitted": "提出済み（未解決あり）",
   "team.goal.completed": "完了",
   "team.goal.failed": "失敗",
   "team.goal.integrating": "統合中",

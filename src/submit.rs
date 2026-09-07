@@ -590,6 +590,16 @@ pub fn decide(
 
 // ── 待ち行列の 1 通 (時刻つき) ────────────────────────────────────────
 
+/// 1 tick 内で同じ端末の複数送信を進めない。別端末は並行して進める。
+#[derive(Default)]
+pub struct DeliveryTurn(std::collections::BTreeSet<u64>);
+
+impl DeliveryTurn {
+    pub fn enter(&mut self, session: u64) -> bool {
+        self.0.insert(session)
+    }
+}
+
 /// 送信待ちの 1 通。時刻の記帳だけを持ち、判断は [`decide`] に任せる。
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -642,6 +652,33 @@ impl Pending {
         }
         self.job.stage = stage;
         self.stage_at = now;
+    }
+}
+
+#[cfg(test)]
+mod delivery_turn_tests {
+    use super::*;
+
+    #[test]
+    fn 同じ端末の本文と確定を混ぜず別端末は進む() {
+        let mut queue = vec![
+            Job::user(1, "review"),
+            Job::user(1, "message"),
+            Job::user(2, "other"),
+        ];
+        for stage in [Stage::Ready, Stage::Commit, Stage::Verify] {
+            let mut turn = DeliveryTurn::default();
+            for job in &mut queue {
+                if turn.enter(job.session) {
+                    job.stage = stage;
+                }
+            }
+            assert_eq!(queue[1].stage, Stage::Ready);
+            assert_eq!(queue[2].stage, stage);
+        }
+        queue.remove(0);
+        let mut turn = DeliveryTurn::default();
+        assert!(turn.enter(queue[0].session));
     }
 }
 

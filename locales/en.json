@@ -4693,6 +4693,8 @@
   "team.git.needed": "⚠ This folder is not a Git repository. Changes cannot be measured, so no completion report can be accepted",
   "team.git.no_workspace": "No workspace is set",
   "team.goal.blocked": "Blocked",
+  "team.goal.submitted": "Submitted with unresolved issues",
+  "team.task.submitted": "Submitted with unresolved issues",
   "team.goal.completed": "Done",
   "team.goal.failed": "failed",
   "team.goal.integrating": "Integrating",

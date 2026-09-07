@@ -163,15 +163,15 @@ pub fn preset_for_role(presets: &[PresetRow], role: TeamRole) -> Option<usize> {
 
 /// この役割は実装 (コードを書く) をするか。
 ///
-/// レビュアーに書かせないための判定で、指示文 ([`super::prompt`]) と
-/// 割り当て ([`super::scheduler`]) の両方が同じ答えを見る。
+/// 検証担当はテストや検証資料も作成する。レビュー対象が指定された
+/// タスクの編集禁止は、役割ではなく `is_review_task` で判断する。
 pub fn writes_code(role: TeamRole) -> bool {
-    matches!(role, TeamRole::Implementer | TeamRole::Integrator)
+    matches!(role, TeamRole::Implementer | TeamRole::Integrator | TeamRole::Tester)
 }
 
-/// この役割はレビューか。
-pub fn is_review_role(role: TeamRole) -> bool {
-    matches!(role, TeamRole::Reviewer | TeamRole::Tester)
+/// 受信側と同じく、対象タスクが指定された仕事だけをレビューとして扱う。
+pub fn is_review_task(task: &TeamTask) -> bool {
+    task.review_of.is_some()
 }
 
 #[cfg(test)]
@@ -296,8 +296,14 @@ mod tests {
         assert!(writes_code(TeamRole::Implementer));
         assert!(writes_code(TeamRole::Integrator));
         assert!(!writes_code(TeamRole::Reviewer));
-        assert!(is_review_role(TeamRole::Reviewer));
-        assert!(!is_review_role(TeamRole::Implementer));
+        assert!(writes_code(TeamRole::Tester));
+        for role in TeamRole::ALL {
+            let mut t = task(2, "classification", &[]);
+            t.role = role;
+            assert!(!is_review_task(&t));
+            t.review_of = Some(1);
+            assert!(is_review_task(&t));
+        }
     }
 
     fn row(name: &str, is_ai: bool, available: bool) -> PresetRow {
