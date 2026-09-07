@@ -34,6 +34,9 @@ impl Permit {
         &mut self,
         writer: crate::terminal::writer_tree::Identity,
     ) -> Result<(), String> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
         self.handoff(Some(writer.pid), writer.tree)
     }
 
@@ -48,6 +51,15 @@ impl Permit {
             return Ok(());
         };
         let mut replacement = self.holder.clone();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(proof) = writer.as_ref().and_then(|tree| tree.proof()) {
+            let token = self
+                .holder
+                .session
+                .rsplit_once('|')
+                .map_or(self.holder.session.as_str(), |(_, token)| token);
+            replacement.session = format!("{proof}|{token}");
+        }
         #[cfg(windows)]
         if let Some(tree) = &writer {
             let token = self
@@ -101,12 +113,6 @@ impl Permit {
         });
     }
 
-    /// A discarded Runtime cannot publish anymore, but its writer may still
-    /// be running until the queued Stop reaches the terminal/reaper.
-    pub fn writer_draining(&self) -> bool {
-        self.writer.as_ref().is_some_and(|tree| tree.draining())
-    }
-
     pub fn writer_stopped(&self) -> bool {
         if let Some(tree) = &self.writer {
             return tree.finished();
@@ -115,7 +121,11 @@ impl Permit {
         if self.holder.pid == std::process::id() {
             return true;
         } // Synthetic SessionObs.
-        self.holder.agent != RETIRED || !crate::terminal::process_tree_alive(self.holder.pid)
+        self.holder.agent != RETIRED || !persisted_writer_alive(&self.holder)
+    }
+
+    pub fn has_session_writer(&self) -> bool {
+        self.writer.is_some()
     }
 
     pub fn release_when_writer_stops(self) {
@@ -143,7 +153,10 @@ impl Permit {
         if handle.is_finished() {
             return Ok(());
         }
-        let result = self.handoff_writer(handle.process_id());
+        let result = match handle.writer_identity() {
+            Some(writer) => self.handoff_identity(writer),
+            None => self.handoff_writer(handle.process_id()),
+        };
         self.release_after(handle);
         result
     }
@@ -211,6 +224,13 @@ fn persisted_writer_alive(holder: &Holder) -> bool {
     }
     #[cfg(unix)]
     {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some((proof, _)) = holder.session.rsplit_once('|') {
+            return crate::terminal::writer_tree::unix::persisted_alive(proof);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return true; // A legacy PID cannot prove that detached writers are gone.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         crate::terminal::process_tree_alive(holder.pid)
     }
 }
@@ -1585,6 +1605,7 @@ mod tests {
         let _ = std::io::stdin().read(&mut [0u8; 1]);
     }
 
+    #[cfg(windows)]
     fn check_writer_lifecycle(publisher_alive: bool) {
         struct Child(std::process::Child);
         impl Drop for Child {
@@ -1673,7 +1694,7 @@ mod tests {
         assert!(try_acquire(&f.0, "new-app").unwrap().is_some());
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn legacy_parent_only_writer_identity_is_not_completion_proof() {
         let f = Fixture::new("legacy-writer");
@@ -1688,6 +1709,131 @@ mod tests {
         .unwrap();
         drop(permit); // The old token no longer matches the persisted legacy owner.
         assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    fn check_writer_lifecycle(publisher_alive: bool) {
+        let f = Fixture::new("supervised-writer");
+        let mut writer = super::super::runtime::descendant_tests::Descendant::spawn_group(
+            91_000_000 + u64::from(publisher_alive),
+            &f.0,
+            "late.txt",
+            "setsid",
+        );
+        let mut permit = try_acquire(&f.0, "old-app").unwrap().unwrap();
+        permit
+            .handoff_identity(writer.session.as_ref().unwrap().writer_identity().unwrap())
+            .unwrap();
+        let permit = if publisher_alive {
+            Some(permit)
+        } else {
+            let dead = u32::MAX / 2;
+            assert!(!crate::instances::pid_alive(dead));
+            lease::with_store(&permit.store, |state| {
+                let owner = state
+                    .leases
+                    .iter_mut()
+                    .find(|lease| lease.holder.same(&permit.holder))
+                    .unwrap();
+                let token = format!("old-app:{dead}:1");
+                owner.holder.session = owner
+                    .holder
+                    .session
+                    .rsplit_once('|')
+                    .map_or_else(|| token.clone(), |(proof, _)| format!("{proof}|{token}"));
+            })
+            .unwrap();
+            // The changed persisted identity is now owned by crash recovery.
+            drop(permit);
+            None
+        };
+        writer.exit_parent();
+        writer.write_child();
+        assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
+        writer.finish_child();
+        if publisher_alive {
+            assert!(
+                try_acquire(&f.0, "new-app").unwrap().is_none(),
+                "writer exit cannot release an active publisher"
+            );
+            drop(permit);
+        }
+        assert!(try_acquire(&f.0, "new-app").unwrap().is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn undelivered_permit_retirement_persists_the_actual_reaper_writer_proof() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let f = Fixture::new("undelivered-retirement");
+        static NEXT: AtomicU64 = AtomicU64::new(91_200_000);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        struct SocketPath(PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = SocketPath(std::env::temp_dir().join(format!("zi{}-{id}", std::process::id())));
+        let listener = UnixListener::bind(&path.0).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut writer = super::super::runtime::descendant_tests::Descendant::spawn_group_with_env(
+            id,
+            &f.0,
+            "late.txt",
+            "setsid",
+            [(
+                "ZAIVERN_WRITER_TEST_TRACKING_SOCKET".into(),
+                path.0.to_string_lossy().into_owned(),
+            )]
+            .into(),
+        );
+        let mut fault = None;
+        super::super::runtime::descendant_tests::wait_until(|| match listener.accept() {
+            Ok((stream, _)) => {
+                fault = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("tracking handshake: {e}"),
+        });
+        let mut fault = fault.unwrap();
+        fault.set_nonblocking(false).unwrap();
+        fault
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // No delivery handoff has occurred: retire must capture the actual
+        // Session tree from the reaper, not persist only its numerical PID.
+        let permit = try_acquire(&f.0, "old-app").unwrap().unwrap();
+        assert!(!permit.has_session_writer());
+        let store = permit.store.clone();
+        writer.exit_parent();
+        let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+        permit.retire(handle.clone()).unwrap();
+        let mut acknowledgement = [0];
+        fault.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, *b"E");
+        writer.write_child();
+        let dead = u32::MAX / 2;
+        assert!(!crate::instances::pid_alive(dead));
+        lease::with_store(&store, |state| {
+            let holder = &mut state.leases[0].holder;
+            assert_eq!(holder.agent, RETIRED);
+            let (proof, _) = holder
+                .session
+                .rsplit_once('|')
+                .expect("actual writer proof");
+            holder.session = format!("{proof}|old-app:{dead}:1");
+        })
+        .unwrap();
+        // The changed publisher token models app death. The waiting Permit's
+        // later Drop cannot erase this identity; reacquisition needs the receipt.
+        assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
+        assert!(!handle.is_finished());
+        fault.write_all(b"R").unwrap();
+        super::super::runtime::descendant_tests::wait_until(|| handle.is_finished());
+        assert!(try_acquire(&f.0, "new-app").unwrap().is_some());
     }
 
     #[test]

@@ -140,6 +140,10 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if std::env::args().nth(1).as_deref() == Some("--zai-internal-writer-supervisor") {
+        terminal::writer_tree::unix::entry();
+    }
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--zai-internal-pty-job") {
         terminal::writer_tree::windows::entry();

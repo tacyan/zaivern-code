@@ -929,12 +929,29 @@ pub(crate) fn closing_publication_fixture() -> (
 
 #[test]
 fn exited_assembly_parent_does_not_publish_a_live_descendants_candidate() {
+    descendant_candidate("group");
+}
+
+#[cfg(unix)]
+#[test]
+fn setpgid_child_blocks_publication_until_exit() {
+    descendant_candidate("setpgid");
+}
+
+#[cfg(unix)]
+#[test]
+fn setsid_child_blocks_publication_until_exit() {
+    descendant_candidate("setsid");
+}
+
+fn descendant_candidate(group: &str) {
     let root = root();
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
     let (work, _) = h.candidate(task);
     let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
-    let mut writer = super::descendant_tests::Descendant::spawn(session_id, &work, "body.txt");
+    let mut writer =
+        super::descendant_tests::Descendant::spawn_group(session_id, &work, "body.txt", group);
     let session = writer.session.as_ref().unwrap();
     h.rt.handoff_integration_writer(task, session_id, session.writer_identity())
         .unwrap();
@@ -954,4 +971,67 @@ fn exited_assembly_parent_does_not_publish_a_live_descendants_candidate() {
         "late writer"
     );
     assert!(!locked(&root));
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_assembly_parent_stops_detached_writer_before_publication() {
+    for group in ["setpgid", "setsid"] {
+        let root = root();
+        let mut h = Harness::new(&root, 1);
+        let task = h.assembly();
+        let (work, _) = h.candidate(task);
+        let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
+        let mut writer =
+            super::descendant_tests::Descendant::spawn_group(session_id, &work, "body.txt", group);
+        h.rt.handoff_integration_writer(
+            task,
+            session_id,
+            writer.session.as_ref().unwrap().writer_identity(),
+        )
+        .unwrap();
+        h.complete(task, "body.txt", "assembly before child");
+        // The parent is still blocked on its control socket, while the child
+        // acknowledges a real write. Idle is an observation, not writer exit.
+        writer.write_child();
+        assert!(!writer
+            .session
+            .as_ref()
+            .unwrap()
+            .exited
+            .load(std::sync::atomic::Ordering::Acquire));
+        for session in &mut h.sessions {
+            session.state = SessionState::Idle;
+        }
+        let effects = h.rt.tick(&Observation {
+            now: h.now + 1,
+            sessions: h.sessions.clone(),
+        });
+        assert!(
+            h.rt.publication.is_none(),
+            "{group}: Idle published a live writer's candidate"
+        );
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, TeamEffect::StopAgent(id) if *id == session_id)));
+        assert!(locked(&root));
+        assert_ne!(h.rt.goal().status, GoalStatus::Completed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            "元の本文"
+        );
+        // The Stop effect has not executed yet: ownership must also protect
+        // writes which happen between the request and actual process teardown.
+        writer.write_child();
+        assert!(!writer.tree.finished());
+        writer.session.as_mut().unwrap().kill();
+        let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+        super::descendant_tests::wait_until(|| handle.is_finished());
+        h.pump(SessionState::Exited);
+        assert_eq!(
+            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            "late writer"
+        );
+        assert!(!locked(&root));
+    }
 }

@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
-#[cfg(test)]
-use portable_pty::ChildKiller;
-
 use crate::i18n::{tr, trf};
 use crate::keybinds::{key_hint, BindAction};
 use crate::lockx::lock_ok;
@@ -451,8 +448,6 @@ pub struct Session {
     /// パーサを作り直したときに一度だけ出すお知らせ (スクロールバック消失の告知)。
     /// UI が読み取ったら None に戻す。
     pub parser_rebuilt_notice: Option<String>,
-    #[cfg(test)]
-    killer: Box<dyn ChildKiller + Send + Sync>,
     /// PTY に直接ぶら下がっている子 (cmd.exe / ログインシェル) の PID。
     /// エージェント本体はその**孫**なので、畳むときはここを起点に
     /// プロセスツリーごと落とす ([`kill_tree_command`] の説明を参照)。
@@ -2186,6 +2181,12 @@ impl Session {
         // 実際の起動先と食い違わないようにするため)。
         let cwd = crate::pathx::launch_dir(&spec.cwd);
         let cmd = build_command(&spec.command, &cwd, &spec.env);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (cmd, supervisor) = {
+            let mut cmd = cmd;
+            let supervisor = writer_tree::unix::Prepared::prepare(&mut cmd)?;
+            (cmd, supervisor)
+        };
         #[cfg(windows)]
         let (cmd, job) = {
             let mut cmd = cmd;
@@ -2196,10 +2197,11 @@ impl Session {
             .slave
             .spawn_command(cmd)
             .map_err(|e| trf("起動に失敗しました: {e}", &[("e", e.to_string())]))?;
-        #[cfg(test)]
-        let killer = child.clone_killer();
         // child はこの後 wait 用スレッドへ渡してしまうので、PID は今のうちに取る。
         let child_pid = child.process_id();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let writer_tree = writer_tree::Tree::supervised(child_pid, supervisor);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let writer_tree = writer_tree::Tree::register(
             child_pid,
             #[cfg(windows)]
@@ -2424,8 +2426,6 @@ impl Session {
             resizer: None,
             resizer_spawn_failed: false,
             parser_rebuilt_notice: None,
-            #[cfg(test)]
-            killer,
             child_pid,
             writer_tree,
             exited,
@@ -3291,12 +3291,18 @@ impl Session {
     }
 
     /// 配送用の生きた親PID。終了表示後に古いPIDを再利用しない。
+    #[cfg(test)]
     pub fn live_process_id(&self) -> Option<u32> {
         kill_target(self.exited.load(Ordering::SeqCst), self.child_pid)
     }
 
     pub fn writer_identity(&self) -> Option<writer_tree::Identity> {
-        self.live_process_id().map(|pid| writer_tree::Identity {
+        // The shell can exit before delivery while a supervised child remains.
+        // Keep the captured tree identity until all writers, not only the display, exit.
+        if self.writer_tree.finished() {
+            return None;
+        }
+        self.child_pid.map(|pid| writer_tree::Identity {
             pid,
             tree: Some(self.writer_tree.clone()),
         })
@@ -3631,6 +3637,7 @@ fn truncate_cols(s: &str, max: usize) -> String {
 /// おり、無関係なプロセス (グループ) に再利用され得る。そこへ killpg /
 /// taskkill /T /F を撃つとユーザーの別ジョブを巻き添えにする
 /// ([`Session::kill`] / [`reap`] / [`abandon`] と同じガード)。
+#[cfg(test)]
 fn kill_target(exited: bool, child_pid: Option<u32>) -> Option<u32> {
     if exited {
         None
@@ -3766,6 +3773,7 @@ pub fn reaping_sessions() -> Vec<(u64, ReapHandle)> {
 }
 
 /// Unix descendants may retain the process group after its leader exits.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub fn process_tree_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -3831,6 +3839,13 @@ impl ReapHandle {
     }
     pub fn process_id(&self) -> Option<u32> {
         self.process_id
+    }
+
+    pub fn writer_identity(&self) -> Option<writer_tree::Identity> {
+        Some(writer_tree::Identity {
+            pid: self.process_id?,
+            tree: Some(self.tree.as_ref()?.clone()),
+        })
     }
 
     pub fn is_finished(&self) -> bool {
@@ -11746,45 +11761,26 @@ mod reap_pty_tests {
         );
     }
 
-    /// 木を辿るのは根 (シェル) が**生きているうち**でなければならない。
-    /// 先に根を落としてしまうと `taskkill /T` は根を見つけられず、
-    /// 孫がそのまま取り残される (= PTY を掴んだままになる)。
+    /// 起動時に捕捉した同じ所有対象を、実際の停止経路で最後まで回収する。
+    /// 監督プロセスを直接killすると、検査自身が子孫の所有関係を壊してしまう。
     #[test]
     fn the_tree_is_walked_while_the_root_is_still_alive() {
         let (mut session, probe) = spawn_with_a_noisy_grandchild("order");
-        if wait_until_growing(&probe).is_none() {
-            reap(session);
-            return;
+        assert!(wait_until_growing(&probe).is_some(), "writer did not start");
+        let tree = session.writer_tree.clone();
+        assert!(!tree.finished());
+        session.kill();
+        let handle = reap_tracked(session);
+        assert!(handle.tracks(&tree));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "owned writer tree did not stop");
+            std::thread::yield_now();
         }
-        // 根が生きている状態なら木を辿れる。
-        assert!(
-            kill_tree_blocking(session.child_pid),
-            "生きているセッションの木を辿れなかった"
-        );
-        // 木が消えた後は、同じ PID を渡しても辿れない — だから順序が要る。
-        //
-        // 消えるまでは待つ (固定 sleep にしない)。上の一撃で木は全員 SIGKILL
-        // されているが、実際に「居なくなる」のは wait/reap が済んでからで、
-        // 混んだ CI では孤児の引き取り (init への再ペアレント) が数百 ms 遅れる。
-        // ゾンビもプロセスグループの一員なので、その間は辿れて当然。
-        let _ = session.killer.kill();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut unreachable = false;
-        while Instant::now() < deadline {
-            if !kill_tree_blocking(session.child_pid) {
-                unreachable = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            unreachable,
-            "木が消えた後も辿れてしまう (pid={:?})。\
-             kill が到達性を正直に報告していない — Linux なら `kill -KILL -- -PID` の \
-             `--` が落ちて別グループを撃っている可能性が高い (kill_tree_command 参照)",
-            session.child_pid
-        );
-        reap(session);
+        assert!(tree.finished());
+        // Repeating Stop after completion must remain tied to this old identity.
+        tree.stop();
+        assert!(tree.finished());
     }
 
     /// 閉じたら**孫まで**止まること。孫が残ると PTY を掴んだままになり、

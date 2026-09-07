@@ -108,7 +108,9 @@ impl eframe::App for ZaivernApp {
             while let Some(index) = integration.iter().position(|(id, _)| *id == s.id) {
                 let (_, mut permit) = integration.swap_remove(index);
                 // Persist writer liveness before the independent killer starts.
-                let _ = permit.handoff_writer(s.live_process_id());
+                if let Some(writer) = s.writer_identity() {
+                    let _ = permit.handoff_identity(writer);
+                }
                 permits.push(permit);
             }
             if !permits.is_empty() {

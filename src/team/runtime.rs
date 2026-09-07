@@ -1819,6 +1819,9 @@ impl TeamRuntime {
     /// `Completed` へ行く経路を作らないこと** — 作った瞬間に「エージェントが
     /// 完了と言っただけで完了になる」が戻ってくる。
     fn settle_validation(&mut self, task: TaskId) {
+        if self.task_writer_pending(task) {
+            return;
+        }
         let Some(t) = self.task(task).cloned() else {
             return;
         };
@@ -2386,14 +2389,11 @@ impl TeamRuntime {
         current.then_some(!self.run.paused && !self.run.stopped)
     }
 
-    fn settle_workers(&mut self, obs: &Observation) {
+    fn settle_workers(&mut self, obs: &Observation, out: &mut Vec<TeamEffect>) {
         let finished: Vec<_> = self
             .worker_holds
             .iter()
             .filter_map(|(id, hold)| {
-                if hold.permit.writer_draining() {
-                    return None;
-                }
                 let session = obs.sessions.iter().find(|s| s.id == hold.session);
                 let exited = session.is_none_or(|s| s.state == SessionState::Exited);
                 if exited {
@@ -2405,12 +2405,21 @@ impl TeamRuntime {
                 let released_report = self.task(*id).is_some_and(|task| {
                     !task.state.is_held() || task.state == TeamTaskState::Validating
                 });
-                (released_report && session.is_some_and(|s| coordinator::deliverable(s.state)))
-                    .then_some(*id)
+                if released_report && session.is_some_and(|s| coordinator::deliverable(s.state)) {
+                    if hold.permit.writer_stopped() {
+                        // Keep the session fenced until Exited is observed;
+                        // this tick's Idle snapshot may predate completion.
+                        return (!hold.permit.has_session_writer()).then_some(*id);
+                    }
+                    // Idle and a report do not prove background writers stopped.
+                    out.push(TeamEffect::StopAgent(hold.session));
+                }
+                None
             })
             .collect();
         for id in finished {
             self.worker_holds.remove(&id);
+            self.settle_validation(id);
         }
     }
 
@@ -2497,7 +2506,7 @@ impl TeamRuntime {
         self.dirty = true;
     }
 
-    fn settle_integration(&mut self, obs: &Observation) {
+    fn settle_integration(&mut self, obs: &Observation, out: &mut Vec<TeamEffect>) {
         if self.publication.is_some() {
             self.collect_publication();
             return;
@@ -2505,9 +2514,6 @@ impl TeamRuntime {
         let Some(hold) = self.integration.as_ref() else {
             return;
         };
-        if hold.permit.writer_draining() {
-            return;
-        }
         let Some(task) = self.task(hold.task).cloned() else {
             return;
         };
@@ -2524,6 +2530,13 @@ impl TeamRuntime {
         }
         // 完了JSONが出てもWorkingなら待つ。Stopボタンだけでも解放しない。
         if !exited && !(idle && (reported || !task.state.is_held() || self.run.stopped)) {
+            return;
+        }
+        if !hold.permit.writer_stopped() {
+            out.push(TeamEffect::StopAgent(hold.session));
+            return;
+        }
+        if !exited && hold.permit.has_session_writer() {
             return;
         }
         if reported && !self.run.stopped && !self.run.paused {
@@ -2589,8 +2602,8 @@ impl TeamRuntime {
             });
         }
         // 消滅した担当を回収する前に、前tickの報告と今回の停止観測を照合する。
-        self.settle_workers(obs);
-        self.settle_integration(obs);
+        self.settle_workers(obs, &mut out);
+        self.settle_integration(obs, &mut out);
         // 1) 観測 — セッションの状態をエージェントへ写す。
         self.sync_sessions(obs);
 
@@ -4317,6 +4330,7 @@ impl TeamRuntime {
             .tasks
             .iter()
             .filter(|t| t.state == TeamTaskState::Validating && !t.validation.running)
+            .filter(|t| !self.task_writer_pending(t.id))
             .filter(|t| !t.validation.passed(&t.validation_commands))
             .map(|t| (t.id, t.validation_commands.clone()))
             .collect();
@@ -4658,6 +4672,14 @@ impl TeamRuntime {
             .filter(|a| a.kind == AgentKind::ManagedSession)
             .filter_map(|a| {
                 let sid = a.session_id?;
+                if self
+                    .worker_holds
+                    .values()
+                    .chain(self.integration.iter())
+                    .any(|hold| hold.session == sid)
+                {
+                    return None;
+                }
                 Some(Candidate {
                     agent: a.id.clone(),
                     session: sid,
@@ -7202,7 +7224,7 @@ mod seen_key_tests {
 
 #[cfg(test)]
 #[path = "descendant_tests.rs"]
-mod descendant_tests;
+pub(super) mod descendant_tests;
 
 #[cfg(test)]
 #[path = "integration_runtime_tests.rs"]
@@ -7216,7 +7238,8 @@ mod worker_ownership_tests {
     use super::*;
 
     // 終了監視の台帳はプロセス共通。別Caseの終了済みsessionと衝突させない。
-    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000_000);
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(10_000_000);
 
     struct Case {
         root: PathBuf,
@@ -7322,6 +7345,22 @@ mod worker_ownership_tests {
 
     #[test]
     fn exited_parent_keeps_descendant_worker_ownership() {
+        descendant_worker_ownership("group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setpgid_child_keeps_worker_ownership_until_exit() {
+        descendant_worker_ownership("setpgid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_child_keeps_worker_ownership_until_exit() {
+        descendant_worker_ownership("setsid");
+    }
+
+    fn descendant_worker_ownership(group: &str) {
         let mut c = Case::new();
         c.bind();
         let tasks = c.tick(SessionState::Idle);
@@ -7329,10 +7368,11 @@ mod worker_ownership_tests {
         let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
             .unwrap()
             .unwrap();
-        let mut writer = super::descendant_tests::Descendant::spawn(
+        let mut writer = super::descendant_tests::Descendant::spawn_group(
             task.assigned_session.unwrap(),
             &work,
             "late.txt",
+            group,
         );
         let session = writer.session.as_ref().unwrap();
         c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
@@ -7363,6 +7403,93 @@ mod worker_ownership_tests {
 
     #[test]
     fn stopped_removed_or_discarded_parent_retains_descendant_custody() {
+        descendant_custody("group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setpgid_child_stop_and_resume_preserve_custody() {
+        descendant_custody("setpgid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_child_stop_and_resume_preserve_custody() {
+        descendant_custody("setsid");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracking_error_retains_worker_until_supervisor_recovers() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let task = c.rt.task(tasks[0]).unwrap().clone();
+        let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        struct SocketPath(std::path::PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // Darwin's sockaddr_un is short; do not append to the workspace path.
+        let socket = SocketPath(std::env::temp_dir().join(format!(
+            "zw{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        let listener = UnixListener::bind(&socket.0).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut writer = super::descendant_tests::Descendant::spawn_group_with_env(
+            task.assigned_session.unwrap(),
+            &work,
+            "late.txt",
+            "setsid",
+            [(
+                "ZAIVERN_WRITER_TEST_TRACKING_SOCKET".into(),
+                socket.0.to_string_lossy().into_owned(),
+            )]
+            .into(),
+        );
+        let session = writer.session.as_ref().unwrap();
+        c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+            .unwrap();
+        let mut fault = None;
+        super::descendant_tests::wait_until(|| match listener.accept() {
+            Ok((stream, _)) => {
+                fault = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("tracking handshake: {e}"),
+        });
+        let mut fault = fault.unwrap();
+        fault.set_nonblocking(false).unwrap();
+        fault
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        writer.exit_parent();
+        writer.session.as_mut().unwrap().kill();
+        let mut acknowledgement = [0];
+        fault.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, *b"E");
+        writer.write_child();
+        c.tick(SessionState::Exited);
+        assert!(!writer.tree.finished());
+        assert!(c.locked(task.id), "tracking failure released a live writer");
+        fault.write_all(b"R").unwrap();
+        let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+        super::descendant_tests::wait_until(|| handle.is_finished());
+        c.tick(SessionState::Exited);
+        assert!(!c.locked(task.id), "recovered tracker stranded ownership");
+    }
+
+    fn descendant_custody(group: &str) {
         for mode in ["stop", "tab", "discard", "exit"] {
             let mut c = Case::new();
             c.bind();
@@ -7371,10 +7498,11 @@ mod worker_ownership_tests {
             let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
                 .unwrap()
                 .unwrap();
-            let mut writer = super::descendant_tests::Descendant::spawn(
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
                 task.assigned_session.unwrap(),
                 &work,
                 "late.txt",
+                group,
             );
             let session = writer.session.as_ref().unwrap();
             c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
@@ -7408,6 +7536,98 @@ mod worker_ownership_tests {
                 c.tick(SessionState::Exited);
                 !c.locked(task.id)
             });
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn idle_worker_parent_stops_detached_writer_before_completion_and_redispatch() {
+        for group in ["setpgid", "setsid"] {
+            let mut c = Case::new();
+            c.bind();
+            let tasks = c.tick(SessionState::Idle);
+            let task = c.rt.task(tasks[0]).unwrap().clone();
+            let session_id = task.assigned_session.unwrap();
+            let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer =
+                super::descendant_tests::Descendant::spawn_group(session_id, &work, "late.txt", group);
+            c.rt.handoff_integration_writer(
+                task.id,
+                session_id,
+                writer.session.as_ref().unwrap().writer_identity(),
+            )
+            .unwrap();
+            writer.write_child();
+            let agent = task.assigned_agent.as_ref().unwrap();
+            let report = serde_json::json!({
+                "task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+                "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/late.txt")],
+                "validation": [], "blockers": []
+            })
+            .to_string();
+            assert_eq!(
+                c.rt.accept_outbox(
+                    agent,
+                    super::super::outbox::Kind::Result,
+                    &report,
+                    now_secs(),
+                )
+                .unwrap(),
+                AcceptOutcome::Applied
+            );
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Validating);
+            assert!(!writer
+                .session
+                .as_ref()
+                .unwrap()
+                .exited
+                .load(std::sync::atomic::Ordering::Acquire));
+            for session in &mut c.sessions {
+                session.state = SessionState::Idle;
+            }
+            let effects = c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert!(effects
+                .iter()
+                .any(|effect| matches!(effect, TeamEffect::StopAgent(id) if *id == session_id)));
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                TeamEffect::SendInstruction { session, .. } if *session == session_id
+            )));
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Validating);
+            assert!(c.locked(task.id));
+            assert_ne!(c.rt.goal().status, GoalStatus::Completed);
+            writer.write_child();
+            assert!(!writer.tree.finished());
+            writer.session.as_mut().unwrap().kill();
+            let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+            super::descendant_tests::wait_until(|| handle.is_finished());
+            // The process has stopped, but this observation was sampled before
+            // the UI noticed its exit. Do not reuse that stale Idle session.
+            let stale_effects = c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert!(!stale_effects.iter().any(|effect| matches!(
+                effect,
+                TeamEffect::SendInstruction { session, .. } if *session == session_id
+            )));
+            assert!(c.locked(task.id));
+            c.sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .unwrap()
+                .state = SessionState::Exited;
+            c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Completed);
+            assert!(!c.locked(task.id));
         }
     }
 
@@ -7486,62 +7706,40 @@ mod worker_ownership_tests {
 
     #[test]
     fn runを破棄しても実writerが終了するまで担当の所有権を保持する() {
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
         let mut c = Case::new();
         c.bind();
         let tasks = c.tick(SessionState::Idle);
-        let ready = c.root.join("child-ready");
-        let module = module_path!().split_once("::").unwrap().1;
-        let team = module.split("::runtime::").next().unwrap();
-        let probe = format!("{team}::integration::tests::writer_process_probe");
-        let mut child = Child(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &probe, "--nocapture"])
-                .env("ZAI_INTEGRATION_WRITER_PROBE", &ready)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(child.0.try_wait().unwrap().is_none());
-            assert!(
-                std::time::Instant::now() < deadline,
-                "writerが起動しなかった"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let mut writers = Vec::new();
         for id in &tasks {
-            let session = c.rt.task(*id).unwrap().assigned_session.unwrap();
+            let task = c.rt.task(*id).unwrap().clone();
+            let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
+                task.assigned_session.unwrap(),
+                &work,
+                "late.txt",
+                "setsid",
+            );
             c.rt.handoff_integration_writer(
                 *id,
-                session,
-                crate::terminal::writer_tree::Identity::for_test(child.0.id()),
+                task.assigned_session.unwrap(),
+                writer.session.as_ref().unwrap().writer_identity(),
             )
             .unwrap();
+            writer.exit_parent();
+            writers.push(writer);
         }
         let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
         drop(std::mem::replace(&mut c.rt, replacement));
         for id in &tasks {
             assert!(c.locked(*id), "Run dropだけで旧writerから所有権を奪った");
         }
-        drop(child.0.stdin.take());
-        child.0.wait().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while tasks.iter().any(|id| c.locked(*id)) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "実終了後に所有権を返さなかった"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        for writer in &mut writers {
+            writer.write_child();
+            writer.finish_child();
         }
+        super::descendant_tests::wait_until(|| tasks.iter().all(|id| !c.locked(*id)));
     }
 
     #[test]

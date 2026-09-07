@@ -1,10 +1,18 @@
 //! A terminal's display lifetime is shorter than its writer lifetime.
-//! The wait thread owns the unreaped Unix leader, so its PID/PGID cannot be
-//! recycled while descendants are inspected or signalled. UI code only reads
-//! completion or requests cancellation; it never waits for a process scan.
+//! Supported Unix targets admit writers through a kernel-backed supervisor.
+//! UI code only reads completion or requests cancellation; the wait worker
+//! owns process observation and reaping.
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(windows)]
 #[path = "writer_tree/windows.rs"]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub use linux as unix;
+#[cfg(target_os = "macos")]
+pub use macos as unix;
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -34,8 +42,12 @@ impl Identity {
 #[derive(Debug)]
 pub struct Tree {
     pub done: AtomicBool,
+    #[cfg(all(test, unix))]
+    pub observation_epoch: std::sync::atomic::AtomicU64,
     parent_exited: AtomicBool,
     stop: AtomicBool,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    supervisor: Option<unix::Prepared>,
     #[cfg(unix)]
     pinned: Mutex<Option<u32>>,
     #[cfg(windows)]
@@ -45,11 +57,29 @@ pub struct Tree {
 static TREES: Mutex<BTreeMap<u32, Weak<Tree>>> = Mutex::new(BTreeMap::new());
 
 impl Tree {
+    #[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
     pub fn register(pid: Option<u32>, #[cfg(windows)] job: windows::Job) -> Arc<Self> {
+        Self::register_inner(
+            pid,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            None,
+            #[cfg(windows)]
+            job,
+        )
+    }
+    fn register_inner(
+        pid: Option<u32>,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] supervisor: Option<unix::Prepared>,
+        #[cfg(windows)] job: windows::Job,
+    ) -> Arc<Self> {
         let tree = Arc::new(Self {
             done: AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            observation_epoch: std::sync::atomic::AtomicU64::new(0),
             parent_exited: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            supervisor,
             #[cfg(unix)]
             pinned: Mutex::new(pid),
             #[cfg(windows)]
@@ -76,11 +106,19 @@ impl Tree {
     pub fn finished(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn supervised(pid: Option<u32>, prepared: unix::Prepared) -> Arc<Self> {
+        Self::register_inner(pid, Some(prepared))
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn proof(&self) -> Option<String> {
+        self.supervisor.as_ref().map(unix::Prepared::proof)
+    }
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
         #[cfg(windows)]
         self.job.request_stop();
-        #[cfg(unix)]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         self.signal_pinned(|pid| {
             // A kernel signal only: no process lookup or completion wait on UI.
             unsafe {
@@ -88,10 +126,7 @@ impl Tree {
             }
         });
     }
-    pub fn draining(&self) -> bool {
-        self.parent_exited.load(Ordering::Acquire) && !self.finished()
-    }
-    #[cfg(unix)]
+    #[cfg(all(unix, any(test, not(any(target_os = "linux", target_os = "macos")))))]
     fn signal_pinned(&self, mut signal: impl FnMut(u32)) {
         if let Ok(pinned) = self.pinned.try_lock() {
             if let Some(pid) = *pinned {
@@ -101,7 +136,7 @@ impl Tree {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn group_has_writers(pid: u32) -> Option<bool> {
     // ps works on both Darwin and Linux; this is exclusively a wait-thread call.
     // Ignore zombies: they cannot write and orphan reaping need not delay a Run.
@@ -126,7 +161,7 @@ fn group_has_writers(pid: u32) -> Option<bool> {
     Some(found)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub fn wait(
     child: &mut (dyn portable_pty::Child + Send + Sync),
     tree: &Tree,
@@ -158,16 +193,72 @@ pub fn wait(
         if unsafe { info.si_pid() } != 0 {
             tree.parent_exited.store(true, Ordering::Release);
             exited.store(true, Ordering::Release);
-            if group_has_writers(pid) == Some(false) {
+            let writers = group_has_writers(pid);
+            if writers == Some(false) {
                 let mut pinned = tree.pinned.lock().unwrap_or_else(|e| e.into_inner());
                 *pinned = None;
                 let status = child.wait()?;
                 tree.done.store(true, Ordering::Release);
+                #[cfg(test)]
+                tree.observation_epoch.fetch_add(1, Ordering::Release);
                 return Ok(status);
             }
+            #[cfg(test)]
+            tree.observation_epoch.fetch_add(1, Ordering::Release);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn wait(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    tree: &Tree,
+    exited: &AtomicBool,
+) -> std::io::Result<portable_pty::ExitStatus> {
+    let prepared = tree
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("writer supervisor unavailable"))?;
+    let pid = child
+        .process_id()
+        .ok_or_else(|| std::io::Error::other("writer supervisor identity unavailable"))?;
+    let supervisor = prepared.attach(pid);
+    loop {
+        if let Ok(supervisor) = &supervisor {
+            if tree.stop.load(Ordering::Acquire) {
+                supervisor.request_stop();
+            }
+            match supervisor.poll() {
+                Ok(observation) => {
+                    if observation.parent_exited {
+                        tree.parent_exited.store(true, Ordering::Release);
+                        exited.store(true, Ordering::Release);
+                    }
+                    if observation.done {
+                        break;
+                    }
+                    #[cfg(test)]
+                    tree.observation_epoch.fetch_add(1, Ordering::Release);
+                }
+                Err(_) if !unix::persisted_alive(&prepared.proof()) => break,
+                Err(_) => {}
+            }
+        } else if !unix::persisted_alive(&prepared.proof()) {
+            // Admission failed, but the supervisor proved it had no writers.
+            break;
+        }
+        // A channel/OS error is unknown. Retry; only kernel-backed proof closes custody.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    *tree.pinned.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let status = child.wait();
+    tree.parent_exited.store(true, Ordering::Release);
+    exited.store(true, Ordering::Release);
+    tree.done.store(true, Ordering::Release);
+    #[cfg(test)]
+    tree.observation_epoch.fetch_add(1, Ordering::Release);
+    status
 }
 
 #[cfg(windows)]
