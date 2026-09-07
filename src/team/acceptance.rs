@@ -8,7 +8,6 @@ use std::path::{Component, Path};
 pub const OPEN: &str = "[ZAI-ACCEPTANCE]";
 pub const CLOSE: &str = "[/ZAI-ACCEPTANCE]";
 /// 生成と補修で共用する、パーサーと同じ必須項目を持つ完全な例。
-#[cfg(test)]
 pub const EXAMPLE: &str = r#"{"checks":[{"requirement":"REQ-01","paths":["output.txt"],"kind":"contains","text":"依頼で確定した必須値"}],"scenarios":[{"requirement":"REQ-01","input":"依頼で指定された入力値を使用する","procedure":"実物を開いて入力に対応する出力値を照合する","expected":"出力値が原依頼の指定値と一致している","reject_when":"一時コピーの出力値を変更すると照合が不一致になる","artifacts":["output.txt"],"evidence":"tests/verification.md"}]}"#;
 pub const EVIDENCE_POLICY: &str = r#"各scenariosのevidenceは説明文だけでは不合格。JSON単体、またはMarkdown内の[ZAI-VERIFICATION]と[/ZAI-VERIFICATION]の間に次の形式を保存する。{"cases":[{"requirement":"REQ-01","input_path":"tests/input.json","output_path":"tests/output.txt","reproduce_path":"tests/reproduce.md","log_path":"tests/normal.log","mutation_log_path":"tests/mutation.log","expected":"30,000円","actual":"30,000円","normal_exit_code":0,"mutation_exit_code":1}]}。requirementは計画のシナリオと完全一致。全パスは作業フォルダ内の相対パスで、実在する別々の非空テキストファイル。画像等のバイナリは入出力記録から実ファイルを参照し、描画・計測結果をテキストで保存する。証跡自身や検証対象artifactsをこれら5ファイルの代わりにしない。reproduce_pathには使用ツール・版・実行コマンドまたは具体的な操作手順を記録し、誰でも追試できるようにする。正常時と破損時に同じ検査を実行して生ログを保存する。expectedとactualは具体的な比較値で一致させ、PASS/OK等の成功宣言にしない。output_pathには本体を実際に利用した出力を保存する。コード例や説明文の読み合わせを実動作確認と呼ばない。ログ・実行結果を捏造しない。未実行は未検証でありcompleted/APPROVEにしない。証跡と関連ファイルの生成をtesterタスクのfilesに含める。レビュー担当はreproduce_pathを使い独立して追試し、数値・エラー処理・説明と実装の一致を確認する。"#;
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
@@ -37,7 +36,6 @@ pub struct Scenario {
 
 /// 新しい生成計画の品質門。過去の保存済み計画の読み取りとは分離する。
 /// 文字数や網羅性だけでは意味上の妥当性を証明できないため、別実行の監査も必須。
-#[cfg(test)]
 pub fn audit(spec: &str) -> Result<(), String> {
     let contract =
         parse(spec)?.ok_or("成果物検証がありません。[ZAI-ACCEPTANCE] に条件を定義してください")?;

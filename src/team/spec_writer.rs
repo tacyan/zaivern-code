@@ -9,9 +9,8 @@
 //! 2 体目は最後まで仕事ゼロ)。
 //!
 //! そこで、計画を作る**前に**「使えるエージェント」へ一度だけ渡して、
-//! 指示を SPEC.md の形へ書き換えてもらう。書き換えた結果は**人に見せて
-//! 確認を取ってから**計画へ進む — 勝手に膨らませた仕様で走り出すと、
-//! 頼んでいない物ができる。
+//! 指示を担当と接続契約のある仕様へ変換し、構造を検査して自動で開始する。
+//! 原依頼は全文を最優先条件として保持し、要約による条件の脱落を防ぐ。
 //!
 //! ## ここに置くもの / 置かないもの
 //!
@@ -91,7 +90,38 @@ pub fn build_prompt(
     shape: super::composition::WorkShape,
 ) -> String {
     if roles == [TeamRole::Implementer] && validations.is_empty() {
-        return format!("{}\nあなたは開発チームの仕様書担当です。以下の依頼から、すぐ実装できる仕様書を一度だけ作成してください。実況・相談・外部調査・ツール実行は不要です。目的、具体的な入力と出力、必要な画面や動作、指定技術、成果物のファイル名、担当タスク、未指定事項の合理的な仮定を明確にしてください。元の条件・数値・URLは保持し、参照先を未読のまま確認済みと書かないでください。短い依頼は800〜1500字を目安に、重複を避けて必要な内容をまとめてください。テスト・検証・レビュー・承認待ちの工程や担当は作らないでください。実装作業は後続の担当が行います。\n最大同時担当数: {agents}。独立したファイルだけを並列分担し、共有ファイルは一つの担当にまとめます。単一成果物を無理に分割しないでください。\n出力形式:\n{SPEC_OPEN}\n# 仕様書: {goal}\n## 目的\n## 要件\n## 成果物\n## タスク\n- implementer: 具体的な成果物の作成 (files: 相対ファイルパス)\n## 仮定\n{SPEC_CLOSE}\n依頼:\n{brief}", super::planner::IMPLEMENTATION_ONLY);
+        return format!(
+            r#"{mode}
+あなたは並列開発の仕様担当です。原依頼を省略・弱化せず、実装担当が迷わず同時着手できる仕様を一度だけ返してください。実況・外部調査・ツール実行・実装は不要です。未知の参照先やAPIは未確認と明記し、実装担当が確認します。
+最大同時実行数は {agents}。これは実行枠の上限であり担当数の上限ではありません。独立した成果物は枠数を超えても別タスクに保ち、空いた枠へ順次配ります。人数を埋めるだけの分割は禁止。各タスクは担当ファイルを具体的な相対パスで列挙し、共有ファイルの編集者は一人だけにします。APIの入出力・関数名・データ形式・参照パスなど相互接続の契約を先に決め、各担当がその契約に従って独立実装できるようにしてください。未確定の内部詳細を創作して固定しないでください。
+依存のない担当は (deps: none)、依存する担当は (deps: T01,T02) と書き、(files: ...) は必ず行末に置きます。
+依存判断は各辺について次の順で行います:
+1. 後続の作成・担当内検証に必須の先行成果物（具体的なファイル・生成データ・確定する判断）と、それが無いと完了できない理由を特定します。depsを付ける場合は担当本文に「必須入力: T番号の成果物; 待機理由: ...」を必ず書きます。
+2. 名称・見た目・概念の整合、参考資料、APIの型・入出力の共有だけなら待機にしません。共有契約へ移して双方をdeps: noneにし、最終照合は統合担当へ渡します。ファイルが別という理由だけで、本当に必要なデータ依存を削除しません。
+3. 待機する接続部分と独立して作れる本体が分離可能なら、本体を先行成果待ちにせず、接続部分だけを後続へ分けます。単一成果物は無理に分割しません。要求された検証は省略しません。共有ファイルの編集は一人に集約し、複数担当の編集が不可避なら依存を残します。
+4. 出力前に全depsを再確認します。「独立・先行入力なし」と書いた担当のdeps、番号順・担当人数合わせ・念のための待機を除去します。依存先不明・循環を残さず、必須入力の無い担当はすべて同時着手可能にします。この見直しは同じ生成内で行い、別の計画作成・承認工程を増やしません。
+例: 独立したサムネイル、LP、ブランドの3スキルは3担当ともdeps: none。名称や配色の整合だけでT03をT01待ちにしません。一方、T01が生成する実データをT02が変換する場合は、そのデータを必須入力としてT02のdeps: T01を維持します。
+各担当には役割名だけでなく、所有成果物・対応要件・提供する入出力・担当内検証・次担当への引継ぎ事項を具体的に書きます。独立部分は他担当を待たず開始し、他担当の本体を重複実装しません。全体統合担当は実行側が一人追加し、各差分の取込み・接続確認・原依頼との照合を担うため、仕様に全体統合タスクを重複追加しません。
+原依頼の条件・数値・URL・指定技術・品質を保持。要件ごとの期待結果と担当を記載。要求された品質確認は実装担当自身の完了条件に含め、レビューや承認待ちの独立工程は増やしません。実装の代わりに仕様だけを成果物としないでください。
+出力形式:
+{SPEC_OPEN}
+{mode}
+# 仕様書: {goal}
+## 目的と要件
+原依頼の入力・出力・例外・制約
+## 共有契約
+担当間の接続と共有ファイルの所有者
+## タスク
+- implementer: T01 具体的な担当と成果物。完了条件: 観測できる期待結果 (deps: none) (files: 相対ファイルパス)
+## 完了条件
+要件を満たしたと判断できる実際の動作
+## 仮定
+未確定事項と確認する担当
+{SPEC_CLOSE}
+原依頼:
+{brief}"#,
+            mode = super::planner::IMPLEMENTATION_ONLY
+        );
     }
     let lanes: Vec<&str> = roles.iter().map(|r| r.key()).collect();
     let goal = goal.trim();
@@ -284,6 +314,10 @@ pub fn extract(stdout: &str, sent: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
+    // 並列仕様の検証条件は各担当が実装内で使う。旧ランナーの制限で削らない。
+    if super::planner::implementation_only(text) {
+        return Some(text.to_owned());
+    }
     // **走らせられない検証はここで落とす。** 落とさないと、検証 1 行の
     // ために書き換えた仕様書がまるごと断られる。
     let (clean, _dropped) = strip_unrunnable_validation(text);
@@ -369,6 +403,7 @@ pub fn accept(draft: &str) -> Result<(), String> {
 
 /// 生成内で見直しを行い、ローカル検査の不備がある場合だけ同じCLIに補修を依頼する。
 /// 最大3回・全体timeout内で補修し、失敗は成功に偽装しない。
+#[cfg(test)]
 fn audited_draft(
     original: &str,
     timeout: Duration,
@@ -431,10 +466,94 @@ fn draft_candidate(stdout: &str, sent: &str) -> Result<String, String> {
     Err(why_no_draft(stdout))
 }
 
+/// 既存の制限付きプロセスランナーで一度だけ生成し、原依頼を無損失で添付する。
+pub fn draft_with(
+    program: &std::path::Path,
+    args: &[String],
+    cwd: &std::path::Path,
+    prompt: &str,
+    original: &str,
+    cancel: &super::launch::CancelFlag,
+    pid: &super::launch::PidSlot,
+) -> Result<String, String> {
+    let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    argv.push(prompt);
+    let (code, outcome, output) = super::launch::run_resolved_capped(
+        program,
+        &argv,
+        cwd,
+        DRAFT_TIMEOUT,
+        cancel,
+        pid,
+        DRAFT_MAX_BYTES + 1,
+    );
+    if outcome != super::model::ValidationOutcome::Passed {
+        return Err(crate::i18n::trf(
+            "team.draft.failed",
+            &[
+                ("outcome", format!("{outcome:?}")),
+                ("code", code.to_string()),
+                (
+                    "detail",
+                    output.stderr.chars().take(500).collect::<String>(),
+                ),
+            ],
+        ));
+    }
+    let candidate = draft_candidate(&output.stdout, prompt)?;
+    finish_draft(&candidate, original)
+}
+
+fn finish_draft(candidate: &str, original: &str) -> Result<String, String> {
+    if !super::planner::has_task_assignments(candidate) {
+        return Err(crate::i18n::tr("team.draft.invalid"));
+    }
+    let body = candidate
+        .strip_prefix(super::planner::IMPLEMENTATION_ONLY)
+        .unwrap_or(candidate)
+        .trim();
+    let result = format!("{}\n{body}\n\n## 原依頼（最優先・省略禁止）\n以下は原文です。仕様の要約と不一致なら原依頼を優先してください。\n\n{original}", super::planner::IMPLEMENTATION_ONLY);
+    if result.len() > DRAFT_MAX_BYTES {
+        return Err(crate::i18n::tr("team.draft.too_large"));
+    }
+    accept(&result)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::features::team::imp::model::TeamRole as R;
+
+    #[test]
+    fn 並列仕様は原依頼を全文保持して担当を要求する() {
+        let original = "日本語とURL https://example.invalid を維持\n## タスク\n- 元の重要条件";
+        let draft = format!(
+            "{}\n# 仕様\n## タスク\n- implementer: T01 APIを作成 (deps: none) (files: src/api.rs)",
+            super::super::planner::IMPLEMENTATION_ONLY
+        );
+        let result = finish_draft(&draft, original).unwrap();
+        assert!(result.ends_with(original));
+        assert!(result.contains("原依頼（最優先・省略禁止）"));
+        assert!(finish_draft("# 担当がない要約", original).is_err());
+        assert!(finish_draft(&draft, &"x".repeat(DRAFT_MAX_BYTES)).is_err());
+        let prompt = build_prompt(
+            "API",
+            original,
+            4,
+            &[R::Implementer],
+            &[],
+            super::super::composition::WorkShape::WideIndependent,
+        );
+        for contract in [
+            "共有ファイルの編集者は一人",
+            "完了条件",
+            "deps: T01,T02",
+            "単一成果物は無理に分割",
+        ] {
+            assert!(prompt.contains(contract));
+        }
+    }
 
     #[test]
     fn 選択したエージェントだけを解決する() {

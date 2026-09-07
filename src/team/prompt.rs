@@ -162,7 +162,7 @@ fn outbox_section(agent_id: &str, outbox: &std::path::Path, run_id: &str) -> Str
          指定されたこの Run 専用 outbox だけが例外。\n\
          outbox 以外の workspace 外パスへの書込みは禁止です。\n\
          報告・判定・伝言・出来事はJSONファイルで提出する。\n\
-         権限拒否時は迂回・昇格せず、各節のマーカー付きJSONを画面へ全文出力する。\n\n\
+         提出成功後はJSONを再出力しない。権限拒否時は迂回・昇格せず、マーカー付きJSONを画面へ一度だけ全文出力する。\n\n\
          提出先フォルダ: `{dir}` (無ければ作る)\n\
          末尾のRunフォルダを省略しない。親のoutbox直下への提出は禁止。\n\
          書きかけを読まれないよう、必ずこの順で提出する:\n\
@@ -214,18 +214,17 @@ fn review_submit(outbox: &std::path::Path) -> String {
 /// 完了報告のひな型。**全役割で同じ 1 本**を使う。
 fn result_format(task_id: u64, agent_id: &str, outbox: &std::path::Path) -> String {
     // **ファイルへ書かせるのが本線。** 画面へ出すだけだと、カーソル移動で
-    // 描く CLI (Claude Code v2) では行が潰れて届かない。画面にも出させるのは
-    // 人が読むためで、こちらは控え。
+    // 描く CLI (Claude Code v2) では行が潰れて届かない。端末は失敗時の代替のみ。
     let file = if outbox.as_os_str().is_empty() {
         String::new()
     } else {
         "**上の「提出のしかた」で `kind` を `result` にして提出してください** \
          (これが正式な提出です)。下の形は `payload` の中身であり、\
-         画面へ出すときの形でもあります。\n\n"
+         書込み失敗時だけマーカー付きで画面へ一度出す形です。成功時は同じJSONを画面へ再出力しない。\n\n"
             .to_string()
     };
     format!(
-        "{file}作業が終わったら、次の形式を**そのまま**出力してください (前後に説明を書いてよい)。\n\
+        "{file}作業が終わったら、次の形式で一度だけ提出してください。outbox未指定時はマーカー付きで画面へ出力します。\n\
          この形式以外での完了報告は受け付けません。\n\n\
          {open}\n\
          {{\n\
@@ -536,13 +535,29 @@ pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
         let handoff = b.upstream.join("\n");
         let task_scopes = all
             .iter()
-            .map(|task| format!("#{} {}: {}", task.id, task.title, task.files.join(", ")))
+            .map(|task| {
+                format!(
+                    "#{} {}: {}\n{}",
+                    task.id,
+                    task.title,
+                    task.files.join(", "),
+                    task.description
+                        .lines()
+                        .find(|line| line.starts_with("所有ファイル"))
+                        .unwrap_or("")
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let assignment = format!(
             "{assignment}\n他担当の編集範囲（読み取り可）:\n{task_scopes}\n引継ぎ:\n{handoff}\n"
         );
-        let tail = format!("\n{assignment}\n実装を直ちに開始する。計画書・テスト・レビュー・検証記録を追加しない。テストやブラウザ確認を開始条件にしない。通常の仕様の不足は合理的に補って進め、相談や途中報告だけで停止しない。HTMLの依頼ならHTML本体を保存する。JSONの完了報告は成果物の代わりにならない。指定フォルダと担当範囲で実装し、成果物を保存した後にだけcompletedを報告する。保存できなかった場合はfailedと理由を報告する。未実施のテストを成功と書かない。\n全文は {} の goal.specification、担当詳細は tasks を読む（本文が省略された場合も要件を落とさない）。\n{}\n{}\n最後に {}\n{}\n{} を出力する。changed_filesには実際に保存した相対パスを列挙する。validationは空配列。outboxへ書ける場合はkind=resultで同じ報告を保存する。書込みが拒否された場合は再試行で停止せず、上の端末出力で提出する。\n", super::outbox::context_path(&b.outbox).display(), filesystem_boundary(&b.outbox), outbox_section(b.agent_id, &b.outbox, b.run_id), super::result_parser::RESULT_OPEN, report, super::result_parser::RESULT_CLOSE);
+        let role = if b.task.key == "assemble" || b.task.role == TeamRole::Integrator {
+            "役割: 全体統合担当。引継ぎの各担当差分を自分の隔離先へ取り込み、接続契約・参照パス・原依頼の全要件と成果物の件数を照合する。他担当の完成済み本体を重複実装せず、接続上の不足だけを担当範囲で直す。担当内検証の証跡を読み、統合後の接続と利用経路を実物で確認する。自分の完了や進捗100％を待たず、統合結果と未確認事項を報告する。"
+        } else {
+            "役割: 担当成果物の実装担当。自分の所有ファイルと対応要件を確認し、共有契約に従って独立部分を直ちに実装する。他担当の成果物を代わりに作らず、共有ファイルは指定所有者へ必要な接続変更を引き継ぐ。先行成果物が必要な箇所だけ依存し、引継ぎの差分を自分の隔離先へ取り込む。担当の完了条件を実物で検証し、変更ファイル・提供した入出力・検証結果・接続時の注意をsummaryにまとめて統合担当へ渡す。"
+        };
+        let tail = format!("\n{assignment}\n{role}\n仕様の再作成や承認待ちを追加しない。必要なテスト・動作確認と修正は担当作業内で行う。原依頼の条件を仕様の要約で省略しない。通常の不足は仮定を記録して進める。JSON報告は成果物の代わりにならない。保存と担当内検証を終えた後にcompletedを報告し、保存できない場合はfailedと理由を報告する。未実施のテストを成功と書かない。\n全文は {} の goal.specification、担当詳細は tasks を末尾まで読む（本文が省略された場合も要件を落とさない）。\n{}\n{}\n完了報告のpayload例:\n{}\nchanged_filesには実際に変更・削除した相対パスを一要素一パスで列挙し、表示用の改行を混ぜない。validationには実行したコマンドとexit_codeを記録し、未実施なら空配列とし理由をsummaryへ書く。outboxへkind=resultで一度だけ提出し、成功時は同じJSONを端末へ再出力しない。outbox未指定または書込み失敗時だけ {} と {} の間へpayloadを一度出力する。完了後は現在の正式タスクIDと異なる古い再提出要求で本体を作り直さない。同じタスクの報告形式の訂正は指摘された報告だけを修正し、成果物の再実装を始めない。\n", super::outbox::context_path(&b.outbox).display(), filesystem_boundary(&b.outbox), outbox_section(b.agent_id, &b.outbox, b.run_id), report, super::result_parser::RESULT_OPEN, super::result_parser::RESULT_CLOSE);
         return cap(body, tail);
     }
     if super::roles::is_review_task(b.task) {
@@ -600,6 +615,32 @@ mod tests {
         assert!(text.contains("自作JSONのPASSED"));
         assert!(text.contains("具体的な出力例"));
         assert!(text.contains("正式完了報告を必ず提出"));
+    }
+
+    #[test]
+    fn 並列直接依頼は長文でも役割と一度だけの提出を保持する() {
+        let mut g = goal();
+        g.specification = format!(
+            "{}{}",
+            super::super::planner::IMPLEMENTATION_ONLY,
+            "原依頼".repeat(8_000)
+        );
+        let mut t = task(1, "artifact", &[]);
+        let worker = for_task(&brief(&g, &t), &[t.clone()]);
+        t.key = "assemble".into();
+        let assembly = for_task(&brief(&g, &t), &[t.clone()]);
+        assert!(worker.contains("役割: 担当成果物の実装担当"));
+        assert!(!worker.contains("役割: 全体統合担当"));
+        assert!(assembly.contains("役割: 全体統合担当"));
+        assert!(!assembly.contains("役割: 担当成果物の実装担当"));
+        for text in [worker, assembly] {
+            assert!(text.contains("goal.specification"));
+            assert!(text.contains("成功時は同じJSONを端末へ再出力しない"));
+            assert!(text.contains("古い再提出要求で本体を作り直さない"));
+            assert!(text.contains("validationには実行したコマンドとexit_codeを記録"));
+            assert!(!text.contains("validationは空配列。"));
+            assert!(text.contains(super::super::result_parser::RESULT_CLOSE));
+        }
     }
 
     #[test]

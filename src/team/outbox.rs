@@ -197,7 +197,7 @@ pub fn save_context(
     }
     super::persistence::ensure_plain_dir_created(dir).map_err(|e| e.detail())?;
     let context = if super::planner::implementation_only(&goal.specification) {
-        serde_json::json!({"execution_policy": "開いたフォルダで担当成果物を直ちに実装・保存する。仕様書・テスト・レビュー・検証記録の作成や承認待ちを工程に追加しない。実装に必要な不足は合理的に補う。保存できない場合は失敗理由を正直に報告する。", "goal": goal, "tasks": tasks})
+        serde_json::json!({"execution_policy": "開いたフォルダで担当成果物を直ちに実装・保存する。仕様の再作成や承認待ちを工程に追加しない。原依頼全文を最優先にし、担当ファイル・接続契約・完了条件を守る。必要なテスト・動作確認と修正は担当作業内で実施する。実装に必要な不足は合理的に補う。保存できない場合は失敗理由を正直に報告する。", "goal": goal, "tasks": tasks})
     } else {
         serde_json::json!({"execution_policy": EXECUTION_POLICY, "quality_policy": QUALITY_POLICY, "evidence_policy": super::acceptance::EVIDENCE_POLICY, "goal": goal, "tasks": tasks})
     };

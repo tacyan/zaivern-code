@@ -1640,17 +1640,21 @@ fn new_run_form(
             }
 
             ui.label(tr("team.form.agents"));
-            // **手で動かしたら、おすすめはもう当てない。** 人の判断を
-            // 計画のたびに上書きすると、動かした意味が無くなる。
-            if ui
-                .add(egui::Slider::new(
-                    &mut form.agents,
-                    1..=super::panel::FORM_MAX_AGENTS,
-                ))
-                .changed()
-            {
-                form.composition_touched = true;
-            }
+            ui.horizontal(|ui| {
+                let mut automatic = !form.composition_touched;
+                if ui
+                    .checkbox(&mut automatic, tr("team.form.agent_auto"))
+                    .changed()
+                {
+                    form.composition_touched = !automatic;
+                }
+                if !automatic {
+                    ui.add(egui::Slider::new(
+                        &mut form.agents,
+                        1..=super::panel::FORM_MAX_AGENTS,
+                    ));
+                }
+            });
             ui.end_row();
 
             ui.label(tr("team.form.max_attempts"));

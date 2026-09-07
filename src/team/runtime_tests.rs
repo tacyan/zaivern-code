@@ -3034,13 +3034,14 @@ fn 断られた遷移は黙殺せず記録に残す() {
     // 無かったことにすると「押したのに何も起きない」を誰も追えない。
     let (mut rt, sids, tid) = to_assigned();
     let before = rt.rejected_transitions();
-    // 完了したタスクへ、あとから報告が流れてくる筋書き。
-    rt.set_state_for_test(tid, TeamTaskState::Completed);
+    // 未配送のタスクへ報告が届く不正な遷移は記録する。
+    // 完了済みタスクの再報告は受理済みの重複なので、この検査の対象ではない。
+    rt.set_state_for_test(tid, TeamTaskState::Ready);
     report_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(
         rt.task(tid).unwrap().state,
-        TeamTaskState::Completed,
-        "完了から動いてしまった"
+        TeamTaskState::Ready,
+        "未配送のタスクが動いてしまった"
     );
     assert!(
         rt.rejected_transitions() > before,

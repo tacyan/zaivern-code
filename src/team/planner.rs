@@ -47,6 +47,7 @@ pub struct PlanInput {
 /// 計画に失敗した理由。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
+    InvalidAssignment(String),
     InvalidAcceptance(String),
     /// SPEC が空 / 短すぎる。
     EmptySpec,
@@ -85,6 +86,7 @@ pub enum PlanError {
 impl PlanError {
     pub fn detail(&self) -> String {
         match self {
+            PlanError::InvalidAssignment(reason) => reason.clone(),
             PlanError::InvalidAcceptance(reason) => reason.clone(),
             PlanError::EmptySpec => "SPEC が空です。実装したい内容を書いてください。".to_string(),
             PlanError::SpecTooLarge { bytes, limit } => {
@@ -144,9 +146,7 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
         .chars()
         .take(100)
         .collect();
-    let sections = parse_sections(request);
-    // Only explicit, disjoint file assignments can safely run concurrently.
-    // Unstructured requests stay intact so requirements cannot disappear in a split.
+    let sections = parse_sections(assignment_spec(request));
     let seeds = implementation_seeds(&sections, &title);
     let mut tasks: Vec<TaskDoc> = Vec::new();
     let root = format!(
@@ -154,7 +154,71 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
         super::task_workspace::ROOT,
         super::runtime::new_run_id()
     );
-    {
+    if has_task_assignments(request) {
+        if seeds.len() >= super::plan_schema::MAX_TASKS {
+            return Err(PlanError::InvalidAssignment(crate::i18n::trf(
+                "team.plan.assignment_limit",
+                &[("limit", super::plan_schema::MAX_TASKS.to_string())],
+            )));
+        }
+        // 同時実行数は scheduler が制御する。担当を人数で束ねたり切り捨てない。
+        let mut ownership: Vec<Vec<String>> = Vec::new();
+        for (i, seed) in seeds.iter().enumerate() {
+            let (label, files) = split_files(&seed.title);
+            if files.is_empty() {
+                return Err(PlanError::InvalidAssignment(crate::i18n::trf(
+                    "team.plan.assignment_files",
+                    &[("task", seed.title.clone())],
+                )));
+            }
+            for file in &files {
+                if !super::graph::path_inside_workspace(file) {
+                    return Err(PlanError::InvalidAssignment(crate::i18n::trf(
+                        "team.plan.assignment_path",
+                        &[("path", file.clone())],
+                    )));
+                }
+            }
+            let (label, deps) = assignment_dependencies(&label)?;
+            let token = label
+                .split_once(':')
+                .map_or(label.as_str(), |(_, rest)| rest)
+                .trim();
+            let first = token.split_whitespace().next().unwrap_or_default();
+            let key = if first.starts_with('T')
+                && first[1..].chars().all(|c| c.is_ascii_digit())
+                && first.len() > 1
+            {
+                first.to_string()
+            } else {
+                format!("implement-{}", i + 1)
+            };
+            let dir = format!("{root}/part-{}", i + 1);
+            tasks.push(TaskDoc {
+                key, title: label.clone(),
+                description: format!("担当: {label}\n{}\n所有ファイル（隔離先からの相対パス）: {}\nこの担当範囲だけを編集し、他担当の実装を重複して作らない。共通仕様の入出力・接続契約と完了条件を守る。仕様と原依頼が食い違う場合は原依頼を優先する。必要な確認と不具合修正は担当作業内で行い、未確認を成功と報告しない。仕様の再作成や承認待ちを追加しない。変更・削除したファイルと接続方法を完了要約へ列挙する。", seed.body, files.join(", ")),
+                team: "implementation".into(), role: "implementer".into(), depends_on: deps,
+                files: vec![format!("{dir}/**")], required_caps: vec![],
+                acceptance_criteria: vec!["担当成果物が原依頼・接続契約・完了条件を満たす".into()], validation_commands: vec![],
+            });
+            ownership.push(files);
+        }
+        // 同一ファイルを複数担当へ配った仕様でも、並行編集にはしない。
+        // 先に依存順を決めるので、逆向きの依存も尊重し循環を増やさない。
+        let order = assignment_order(&tasks)?;
+        for (position, &i) in order.iter().enumerate() {
+            for &j in &order[..position] {
+                if ownership[i]
+                    .iter()
+                    .any(|a| ownership[j].iter().any(|b| crate::lease::overlaps(a, b)))
+                    && !tasks[i].depends_on.contains(&tasks[j].key)
+                {
+                    let key = tasks[j].key.clone();
+                    tasks[i].depends_on.push(key);
+                }
+            }
+        }
+    } else {
         // ファイル分担の無い自然文でも、実装を独立した作業場所へ分けて即時並列化する。
         // Run ごとの一意な場所なので、同じ依頼の同時実行でも中間成果を上書きしない。
         let units: Vec<String> = seeds
@@ -199,7 +263,7 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
     let dependencies = tasks.iter().map(|task| task.key.clone()).collect();
     tasks.push(TaskDoc {
         key: "assemble".into(), title: "実装を組み合わせて成果物を保存".into(),
-        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを自分の統合用隔離先へ統合する。元フォルダは直接編集しない。最終反映はZaivernが現在の元フォルダとの競合を検出して実行する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。仕様書・テスト・レビュー・確認待ちは追加しない。他Runの作業場所は使わない。".into(),
+        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを自分の統合用隔離先へ統合する。元フォルダは直接編集しない。最終反映はZaivernが現在の元フォルダとの競合を検出して実行する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。原依頼全文と各担当の完了条件に照らし、接続と動作を確認し不足を修正する。未確認を合格扱いしない。仕様の再作成や確認待ちは追加しない。他Runの作業場所は使わない。".into(),
         team: "implementation".into(), role: "implementer".into(), depends_on: dependencies,
         files: vec![format!("{root}/part-0/**")], required_caps: vec![],
         acceptance_criteria: vec!["最終成果物を統合用の隔離先に保存した".into()], validation_commands: vec![],
@@ -216,6 +280,100 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
         }],
         tasks,
     })
+}
+
+/// 見出しと担当一覧があれば、自然文からの仕様生成を重ねない。
+pub fn has_task_assignments(spec: &str) -> bool {
+    parse_sections(assignment_spec(spec)).iter().any(|section| {
+        (section.title.trim() == "タスク" || section.title.trim().eq_ignore_ascii_case("tasks"))
+            && !section.bullets.is_empty()
+    })
+}
+
+/// 箇条書きの要望だけでは担当は未定。全担当の編集対象があるときだけ再生成を省く。
+pub fn has_file_assignments(spec: &str) -> bool {
+    has_task_assignments(spec)
+        && implementation_seeds(&parse_sections(assignment_spec(spec)), "")
+            .iter()
+            .all(|seed| !split_files(&seed.title).1.is_empty())
+}
+
+fn assignment_spec(spec: &str) -> &str {
+    spec.split_once("\n## 原依頼（最優先・省略禁止）")
+        .map_or(spec, |(plan, _)| plan)
+}
+
+fn assignment_dependencies(label: &str) -> Result<(String, Vec<String>), PlanError> {
+    let Some(start) = label.find("(deps:") else {
+        return Ok((label.to_owned(), Vec::new()));
+    };
+    let Some(end) = label[start..].find(')').map(|end| start + end) else {
+        return Err(PlanError::InvalidAssignment(crate::i18n::tr(
+            "team.plan.assignment_deps",
+        )));
+    };
+    let deps = label[start + "(deps:".len()..end]
+        .split([',', ' '])
+        .filter(|part| !part.is_empty() && *part != "none")
+        .map(str::to_owned)
+        .collect();
+    Ok((
+        format!("{}{}", &label[..start], &label[end + 1..])
+            .trim()
+            .to_owned(),
+        deps,
+    ))
+}
+
+fn assignment_order(tasks: &[TaskDoc]) -> Result<Vec<usize>, PlanError> {
+    let keys: std::collections::BTreeMap<_, _> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| (task.key.as_str(), i))
+        .collect();
+    if keys.len() != tasks.len() {
+        return Err(PlanError::InvalidAssignment(crate::i18n::tr(
+            "team.plan.assignment_duplicate",
+        )));
+    }
+    let mut remaining = vec![0; tasks.len()];
+    let mut successors = vec![Vec::new(); tasks.len()];
+    for (i, task) in tasks.iter().enumerate() {
+        for dependency in &task.depends_on {
+            let Some(&parent) = keys.get(dependency.as_str()) else {
+                return Err(PlanError::InvalidAssignment(crate::i18n::trf(
+                    "team.plan.assignment_unknown",
+                    &[
+                        ("task", task.key.clone()),
+                        ("dependency", dependency.clone()),
+                    ],
+                )));
+            };
+            successors[parent].push(i);
+            remaining[i] += 1;
+        }
+    }
+    let mut ready: std::collections::BTreeSet<_> = remaining
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &count)| (count == 0).then_some(i))
+        .collect();
+    let mut order = Vec::with_capacity(tasks.len());
+    while let Some(i) = ready.pop_first() {
+        order.push(i);
+        for &next in &successors[i] {
+            remaining[next] -= 1;
+            if remaining[next] == 0 {
+                ready.insert(next);
+            }
+        }
+    }
+    if order.len() != tasks.len() {
+        return Err(PlanError::InvalidAssignment(crate::i18n::tr(
+            "team.plan.assignment_cycle",
+        )));
+    }
+    Ok(order)
 }
 
 pub const SPEC_MAX_BYTES: usize = 512 * 1024;
@@ -1032,7 +1190,6 @@ impl StaticPlanner {
 ///
 /// これに満たない SPEC では、分割そのものが仕事になるので
 /// 計画 → 設計 → 実装 と直列に繋ぐ。満たしていれば**待たせない**。
-#[cfg(test)]
 pub const MIN_PARALLEL_TASKS: usize = 2;
 
 /// SPEC から**実装タスクの見出し**を選ぶ (純関数)。
@@ -1043,7 +1200,6 @@ pub const MIN_PARALLEL_TASKS: usize = 2;
 /// **`compose` から切り出してあるのは、「この SPEC では何件に分かれるか」を
 /// 計画を作らずに知りたい側が居るから** ([`needs_spec_rewrite`])。
 /// 物差しを 2 つ持つと、「短いと言われたのに計画は分かれた」/ その逆が起きる。
-#[cfg(test)]
 pub fn implementation_titles(sections: &[SpecSection], title: &str) -> Vec<String> {
     implementation_seeds(sections, title)
         .into_iter()
@@ -1120,7 +1276,6 @@ pub fn implementation_seeds(sections: &[SpecSection], title: &str) -> Vec<TaskSe
 /// 文字数では測らない。長くても箇条書きの無い散文は 1 件にしかならないし、
 /// 短くても箇条書きが 3 つあれば 3 件に分かれる。**計画と同じ読み取りで
 /// 数える**のが唯一ずれない物差しになる。
-#[cfg(test)]
 pub fn needs_spec_rewrite(spec: &str) -> bool {
     let sections = parse_sections(spec);
     let title = sections
@@ -1178,6 +1333,105 @@ impl TeamPlanner for StaticPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assigned_plan(body: &str, agents: usize) -> Result<TeamPlan, PlanError> {
+        let mut inp = input(&format!(
+            "{IMPLEMENTATION_ONLY}\n# 並列仕様\n## タスク\n{body}"
+        ));
+        inp.agent_count = agents;
+        StaticPlanner.plan(inp)
+    }
+
+    #[test]
+    fn 仕様の担当数は同時実行数で切り捨てず独立担当を待たせない() {
+        let body = (1..=6)
+            .map(|i| format!("- implementer: T{i:02} 固有処理{i} (files: src/part{i}.rs)\n"))
+            .collect::<String>();
+        let plan = assigned_plan(&body, 2).unwrap();
+        assert_eq!(plan.tasks.len(), 7);
+        for (i, task) in plan.tasks[..6].iter().enumerate() {
+            assert_eq!(task.key, format!("T{:02}", i + 1));
+            assert!(task.description.contains(&format!("src/part{}.rs", i + 1)));
+            assert!(task.dependencies.is_empty());
+        }
+        assert_eq!(plan.tasks[6].dependencies.len(), 6);
+    }
+
+    #[test]
+    fn 三つの独立成果物は整合の参照があっても三並列にできる() {
+        let body = "- implementer: T01 サムネイル (deps: none) (files: skills/thumbnail/SKILL.md)\n- implementer: T02 LP (deps: none) (files: skills/lp/SKILL.md)\n- implementer: T03 ブランド。T01/T02と名称を共有契約で揃える。必須入力なし (deps: none) (files: skills/brand/SKILL.md)";
+        for agents in [2, 3, 4] {
+            let plan = assigned_plan(body, agents).unwrap();
+            assert_eq!(plan.tasks.len(), 4);
+            assert!(plan.tasks[..3].iter().all(|t| t.dependencies.is_empty()));
+            assert_eq!(super::super::graph::max_parallel_width(&plan.tasks), 3);
+            assert_eq!(
+                super::super::scheduler::desired_sessions(&plan.tasks, agents),
+                agents.min(3)
+            );
+            assert_eq!(plan.tasks[3].dependencies.len(), 3);
+        }
+    }
+
+    #[test]
+    fn 別ファイルでも実データを消費する依存は外さない() {
+        let plan = assigned_plan("- implementer: T01 データ生成 (deps: none) (files: data/generated.json)\n- implementer: T02 変換。必須入力: T01のdata/generated.json; 待機理由: 実データから索引を作る (deps: T01) (files: data/index.json)", 4).unwrap();
+        assert_eq!(plan.tasks[1].dependencies, vec![plan.tasks[0].id]);
+        assert_eq!(super::super::graph::max_parallel_width(&plan.tasks), 1);
+    }
+
+    #[test]
+    fn 仕様の単一成果物は本体と表示へ分割しない() {
+        let plan = assigned_plan("- implementer: T01 完成HTML (files: index.html)", 8).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[1].dependencies, vec![plan.tasks[0].id]);
+    }
+
+    #[test]
+    fn 仕様の明示依存と共有ファイルだけを直列化する() {
+        let plan = assigned_plan("- implementer: T01 本体 (files: src/core/**)\n- implementer: T02 表示 (files: src/view.rs)\n- implementer: T03 接続 (deps: T02) (files: src/core/mod.rs)", 4).unwrap();
+        assert!(plan.tasks[0].dependencies.is_empty());
+        assert!(plan.tasks[1].dependencies.is_empty());
+        assert!(plan.tasks[2].dependencies.contains(&plan.tasks[0].id));
+        assert!(plan.tasks[2].dependencies.contains(&plan.tasks[1].id));
+        let reverse = assigned_plan("- implementer: T01 後続 (deps: T02) (files: shared.rs)\n- implementer: T02 先行 (files: shared.rs)", 2).unwrap();
+        assert_eq!(reverse.tasks[0].dependencies, vec![reverse.tasks[1].id]);
+        assert!(reverse.tasks[1].dependencies.is_empty());
+    }
+
+    #[test]
+    fn 不完全な担当指定を汎用分割で隠さない() {
+        for body in [
+            "- implementer: T01 パスなし",
+            "- implementer: T01 外部 (files: ../outside.rs)",
+            "- implementer: T01 不明依存 (deps: T99) (files: a.rs)",
+            "- implementer: T01 A (deps: T02) (files: a.rs)\n- implementer: T02 B (deps: T01) (files: b.rs)",
+            "- implementer: T01 A (files: a.rs)\n- implementer: T01 B (files: b.rs)",
+        ] {
+            assert!(assigned_plan(body, 2).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn 保持した原依頼内のタスク見出しを二重に配らない() {
+        let original = "## タスク\n- 昔のメモを維持\nURLと数値を省略しない";
+        let plan = assigned_plan(&format!("- implementer: T01 本体 (files: index.html)\n## 原依頼（最優先・省略禁止）\n{original}"), 4).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(plan.goal.specification.ends_with(original));
+    }
+
+    #[test]
+    fn 担当未定の箇条書きは仕様生成を省略しない() {
+        assert!(!has_file_assignments(
+            "## タスク\n- 検索を追加\n- 表示を改善"
+        ));
+        assert!(!has_file_assignments(
+            "## タスク\n- A (files: a.rs)\n- 未分担"
+        ));
+        assert!(has_file_assignments(
+            "## タスク\n- implementer: T01 A (files: a.rs)"
+        ));
+    }
 
     #[test]
     fn 新規計画は一体でも全要件を担当し統合だけを後続にする() {

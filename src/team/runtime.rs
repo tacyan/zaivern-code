@@ -859,25 +859,22 @@ fn step(
 ///
 /// # どこまでを「通り過ぎた」と見なすか
 ///
-/// **検証を抜けてレビューへ渡した後** — `Reviewing` と `RevisionRequired`
-/// の 2 つだけ。実装担当の報告は `completed` も `blocked` も `failed` も
+/// **検証を抜けてレビューへ渡した後** — `Reviewing` と `RevisionRequired`、
+/// 完了済みの `Completed`。実装担当の報告は `completed` も `blocked` も `failed` も
 /// 「実装を終える・止める」ための合図で、レビューへ渡した時点でその合図は
 /// **もう使い終わっている**。ここから先を動かすのは検証の決着とレビューの
 /// 判定であって、実装担当の報告ではない。
+/// `Validating` では受理済みの `completed` だけを見送り、実行中の検証を維持する。
+/// 完了後の遅延報告も、本文のハッシュによらず担当と状態で重複と判断する。
 ///
 /// # 見送らないもの (今までどおり試みて、断られたら記録する)
 ///
 /// * **配る前** (`Pending` / `Ready`) — 「まだ配ってもいないタスクへの
 ///   完了報告」は本物の異常。黙らせない
-/// * **実装中** (`Assigned` / `Running` / `Validating`) — 報告が正しく効く段
+/// * **実装中** (`Assigned` / `Running`) — 報告が正しく効く段
 /// * **横へ逸れた状態** (`Blocked` / `Failed` / `NeedsUser`) — 先へ進んだ
 ///   のではないので「通り過ぎた」ではない。とくに `NeedsUser` は人の判断を
 ///   待っている最中で、そこへ報告が来ること自体が読む価値のある事実
-/// * **`Completed`** — レビューを通って締めた後に「終わりました」と言って
-///   くるのは、遅れた重複と同じ形をしていても**終端へ届いた報告**であって、
-///   ここを黙らせるのは既存の約束 (`runtime_tests::断られた遷移は黙殺せず
-///   記録に残す`) を壊す。**実機で並んだ 4 行はどれも `reviewing` 発**なので、
-///   直すのに `Completed` を含める必要も無い
 ///
 /// なお**別の担当からの報告・存在しないタスクへの報告・status が読めない
 /// 報告**は、この関数の手前 ([`TeamRuntime::take_result`] と
@@ -887,13 +884,13 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
     // レビューへ渡した後か (`RevisionRequired` はレビューの判定そのもの)。
     let past_implementation = matches!(
         state,
-        TeamTaskState::Reviewing | TeamTaskState::RevisionRequired
+        TeamTaskState::Reviewing | TeamTaskState::RevisionRequired | TeamTaskState::Completed
     );
     // **報告の種類ごとに明示する。** 種類が増えた日に「どちらでもない」を
     // 選べないようにしておく (網羅で必ずコンパイルが止まる)。
     match status {
         // 「終わった」= 新しい検証回を始める合図 (`Running → Validating`)。
-        ReportedStatus::Completed => past_implementation,
+        ReportedStatus::Completed => past_implementation || state == TeamTaskState::Validating,
         // 「止まった」「失敗した」= 実装を止める合図。
         ReportedStatus::Blocked | ReportedStatus::Failed => past_implementation,
     }
@@ -3239,7 +3236,7 @@ impl TeamRuntime {
             // **却下は画面経路でも記録済み** (`take_*` が理由を時系列へ残す)。
             // ここで結果を捨ててよいのは、画面には再送の口が無いため。
             for body in p.results {
-                let _ = self.take_result(&p.agent, &body);
+                let _ = self.take_result_from(&p.agent, &body, true);
             }
             for body in p.reviews {
                 let _ = self.take_review(&p.agent, &body);
@@ -3450,14 +3447,20 @@ impl TeamRuntime {
         }
         let applied = match kind {
             super::outbox::Kind::Result => self.take_result(agent, body),
-            super::outbox::Kind::Review => self.take_review(agent, body),
-            super::outbox::Kind::Message => self.take_message(agent, body),
-            super::outbox::Kind::Event => self.take_event(agent, body, now),
+            super::outbox::Kind::Review => self
+                .take_review(agent, body)
+                .map(|()| AcceptOutcome::Applied),
+            super::outbox::Kind::Message => self
+                .take_message(agent, body)
+                .map(|()| AcceptOutcome::Applied),
+            super::outbox::Kind::Event => self
+                .take_event(agent, body, now)
+                .map(|()| AcceptOutcome::Applied),
         };
         // **適用できたときだけ印を付ける。**
-        applied?;
+        let outcome = applied?;
         self.mark_seen(key);
-        Ok(AcceptOutcome::Applied)
+        Ok(outcome)
     }
 
     /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
@@ -3568,8 +3571,17 @@ impl TeamRuntime {
     }
 
     /// 完了報告 1 件。
-    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
-        let doc = match rp::parse_result(body) {
+    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<AcceptOutcome, String> {
+        self.take_result_from(agent, body, false)
+    }
+
+    fn take_result_from(
+        &mut self,
+        agent: &AgentId,
+        body: &str,
+        screen: bool,
+    ) -> Result<AcceptOutcome, String> {
+        let mut doc = match rp::parse_result(body) {
             Ok(d) => d,
             Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
@@ -3591,6 +3603,22 @@ impl TeamRuntime {
             ));
         }
 
+        // ファイル計測や却下・再提出より先に、受理済みの担当報告を除外する。
+        // 別agent_idや未知statusはここでも拒否し、なりすましを重複にしない。
+        if matches!(
+            task.state,
+            TeamTaskState::Completed
+                | TeamTaskState::Reviewing
+                | TeamTaskState::RevisionRequired
+                | TeamTaskState::Validating
+        ) {
+            let status = rp::validate_result_header(&doc, &task)
+                .map_err(|e| self.reject(agent, None, e.detail()))?;
+            if report_already_passed(task.state, status) {
+                return Ok(AcceptOutcome::Duplicate);
+            }
+        }
+
         if task.review_of.is_some() {
             let why = self.review_report_retry(
                 agent,
@@ -3603,6 +3631,9 @@ impl TeamRuntime {
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
         // は補助情報として持ち越すだけ。
         let (evidence, attribution) = self.file_evidence(&task);
+        if screen {
+            rp::repair_screen_paths(&mut doc, &task, &evidence, &self.workspace);
+        }
         // **帰属できないことを黙って捨てない。** 却下ではないので
         // `Rejected` では残さない (正しく働いた担当が却下ログに並ぶのが
         // 元の不具合)。人が時系列で追えるように、事実として 1 行残す。
@@ -3653,7 +3684,7 @@ impl TeamRuntime {
         match verdict {
             Ok(acc) => {
                 self.apply_accepted(agent, acc, attribution);
-                Ok(())
+                Ok(AcceptOutcome::Applied)
             }
             Err(detail) => {
                 if finished_report && !self.allow_report_repair(agent, &task, &detail) {
@@ -3683,7 +3714,7 @@ impl TeamRuntime {
                         agent: agent.clone(), session,
                         key: manual_instruction_key(agent, self.next_event_id),
                         text: if super::planner::implementation_only(&self.goal.specification) {
-                            format!("{why}\n担当 #{} の成果物を保存し、報告の形式・担当パスの不一致を修正して再提出してください。テストやレビューは不要です。", task.id)
+                            format!("{why}\n担当 #{} の指摘された不一致だけを修正して再提出してください。報告形式やパス表記だけの問題なら成果物を作り直さず、報告だけを訂正してください。成果物自体に不足がある場合は担当範囲で修正・確認し、実施した検証を正確に報告してください。", task.id)
                         } else {
                             format!("{why}\n担当 #{} は継続中です。実物の不一致を修正・再検証して正式完了報告を再提出してください。計画の検証条件を緩めて通さないでください。", task.id)
                         },
@@ -3941,7 +3972,7 @@ impl TeamRuntime {
     fn allow_report_repair(&mut self, _agent: &AgentId, task: &TeamTask, detail: &str) -> bool {
         if matches!(
             task.state,
-            TeamTaskState::NeedsUser | TeamTaskState::Submitted
+            TeamTaskState::NeedsUser | TeamTaskState::Submitted | TeamTaskState::Completed
         ) {
             return false;
         }
@@ -6328,21 +6359,73 @@ mod stale_report_tests {
     }
 
     #[test]
-    fn 完了したタスクへの報告は今までどおり記録する() {
+    fn 完了後の異なる本文も再提出せず次の担当を妨げない() {
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        let before = serde_json::to_value(&rt.tasks).unwrap();
+        let events_before = rt.events.len();
+        let messages_before = rt.pending_msgs.len();
+        for screen in [false, true] {
+            let body = report(2, AGENT)
+                .replace("実装しました", "再提出します")
+                .replace(
+                    "\"changed_files\":[]",
+                    "\"changed_files\":[\"outside/pa\\n  th.md\"]",
+                );
+            assert!(matches!(
+                rt.take_result_from(&agent, &body, screen),
+                Ok(AcceptOutcome::Duplicate)
+            ));
+        }
+        assert_eq!(serde_json::to_value(&rt.tasks).unwrap(), before);
+        assert_eq!(counts(&mut rt), (0, 0));
+        assert_eq!(rt.events.len(), events_before, "イベントが増えた");
+        assert_eq!(rt.pending_msgs.len(), messages_before, "再提出要求が増えた");
+    }
+
+    #[test]
+    fn 完了後も本文の担当違いと未知状態は拒否する() {
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
+        assert!(rt.take_result(&agent, &report(2, "impostor")).is_err());
+        assert!(rt
+            .take_result(&agent, &report(2, AGENT).replace("completed", "unknown"))
+            .is_err());
+        assert_eq!(counts(&mut rt), (0, 2));
+        assert!(rt
+            .task(2)
+            .unwrap()
+            .context
+            .iter()
+            .all(|c| !c.starts_with("[report-repair:")));
+    }
+
+    #[test]
+    fn 検証中の再報告で検証結果と世代を消さない() {
         fix_evidence();
         let mut rt = run_with_two_tasks();
         let agent = AgentId::new(AGENT);
-        // 終端へ遅れて届いた報告。**ここは見送らない** —
-        // `runtime_tests::断られた遷移は黙殺せず記録に残す` と対になる。
-        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
-        let _ = rt.take_result(&agent, &report(2, AGENT));
-        let (transitions, _) = counts(&mut rt);
-        assert_eq!(transitions, 2, "完了したタスクへの報告まで見送った");
-        assert_eq!(
-            rt.task(2).map(|t| t.state),
-            Some(TeamTaskState::Completed),
-            "終端から動いた"
-        );
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        rt.take_result(&agent, &report(1, AGENT)).unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Validating);
+        rt.tasks[0].validation.running = true;
+        rt.tasks[0]
+            .validation
+            .runs
+            .push(ValidationRun::passed("first check"));
+        let before = serde_json::to_value(&rt.tasks).unwrap();
+        assert!(matches!(
+            rt.take_result(
+                &agent,
+                &report(1, AGENT).replace("実装しました", "完了です")
+            ),
+            Ok(AcceptOutcome::Duplicate)
+        ));
+        assert_eq!(serde_json::to_value(&rt.tasks).unwrap(), before);
+        assert_eq!(counts(&mut rt), (0, 0));
         test_hooks::clear();
     }
 
@@ -6363,7 +6446,7 @@ mod stale_report_tests {
 
     /// **状態 × 報告の種類 → 記録するか**を表で固定する。
     ///
-    /// 見送るのは「レビューへ渡した後」の 3 つだけ。ここを広げると
+    /// レビュー以降の3状態と、検証中の完了再報告を見送る。ここを広げると
     /// 本物の異常まで消えるので、増減は必ずこの表の変更として現れる。
     #[test]
     fn 見送る状態を表で固定する() {
@@ -6378,10 +6461,7 @@ mod stale_report_tests {
             (S::Reviewing, true),
             (S::RevisionRequired, true),
             (S::Failed, false),
-            // **終端は含めない。** 完了したタスクへ遅れて届いた報告を
-            // 断ったことは、これまでどおり記録に残す
-            // (`runtime_tests::断られた遷移は黙殺せず記録に残す`)。
-            (S::Completed, false),
+            (S::Completed, true),
             (S::Submitted, false),
             (S::NeedsUser, false),
         ];
@@ -6398,7 +6478,7 @@ mod stale_report_tests {
             ] {
                 assert_eq!(
                     report_already_passed(state, status),
-                    skip,
+                    skip || (state == S::Validating && status == ReportedStatus::Completed),
                     "{} × {status:?}",
                     state.key()
                 );
@@ -7135,6 +7215,9 @@ mod worker_ownership_tests {
     use super::super::planner::{PlanInput, StaticPlanner, TeamPlanner, IMPLEMENTATION_ONLY};
     use super::*;
 
+    // 終了監視の台帳はプロセス共通。別Caseの終了済みsessionと衝突させない。
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000_000);
+
     struct Case {
         root: PathBuf,
         rt: TeamRuntime,
@@ -7180,7 +7263,7 @@ mod worker_ownership_tests {
             });
             for effect in effects {
                 if let TeamEffect::StartAgent(spec) = &effect {
-                    let id = self.sessions.len() as u64 + 1;
+                    let id = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.rt.bind_session(&spec.agent_id, id, None);
                     self.rt.note_effect_done(&effect.key());
                     self.sessions.push(SessionObs {

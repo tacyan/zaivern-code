@@ -87,6 +87,7 @@ impl ZaivernApp {
     /// **Run が無いときは 1 命令も走らない**ので、アイドルのコストはゼロ。
     pub(crate) fn team_tick(&mut self, ctx: &egui::Context) {
         // 1) `zai team run` からの起動要求を拾う (**1 回だけ**)。
+        self.team_poll_spec(ctx);
         self.team_take_launch_request();
         panel::with_panel(|p| p.poll_workspace_preparations());
 
@@ -138,6 +139,9 @@ impl ZaivernApp {
     ///
     /// **一度しか処理しない** ([`launch::take`] が拾うと同時に消す)。
     fn team_take_launch_request(&mut self) {
+        if panel::with_panel(|p| p.drafting()) {
+            return;
+        }
         // **毎フレーム `stat` を撃たない。** 画面が動いている間はここが
         // 60fps で呼ばれる (設計原則 3: アイドル時のコストはゼロ)。
         if !panel::with_panel(|p| p.launch_poll_due(Instant::now())) {
@@ -159,7 +163,7 @@ impl ZaivernApp {
         let Some(req) = launch::take_in(&root, &ws, now) else {
             return;
         };
-        let mut opts = RunOptions {
+        let opts = RunOptions {
             spec_source: req.spec_path.display().to_string(),
             agent_count: req.agent_count,
             review_required: false,
@@ -171,26 +175,28 @@ impl ZaivernApp {
         };
         let roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
         let auto = req.auto_start;
-        let spec_text = planner::prepare_direct_request(&req.spec_text, &mut opts);
         let result = panel::with_panel(|p| {
             p.open = true;
-            // **要求の中の workspace を attach しない。** 未信頼データに
-            // 置き場と cwd を決めさせると、投函箱を書き換えるだけで
-            // 「別のフォルダを Team Run にする」ができてしまう。
-            // 権限を持つのは**いま開いている workspace** だけ
-            // (`take_in` も同じ値で境界を確かめている)。
-            // **実行中の Run があるなら乗っ取らない。** `zai team run` を
-            // 二重に叩いても、動いているチームを別の計画で潰さない。
             p.attach_workspace(&ws)?;
             p.tab = BoardTab::Organization;
-            p.form.open = false;
-            let r = p.plan_with(&spec_text, &opts.spec_source.clone(), opts, roles, "");
-            if r.is_ok() && auto {
-                p.act(TeamAction::Start);
-            }
-            r
+            Ok::<(), String>(())
+        })
+        .and_then(|()| {
+            self.team_prepare_spec(
+                &req.spec_text,
+                panel::DraftRequest {
+                    workspace: ws,
+                    source: opts.spec_source.clone(),
+                    options: opts,
+                    roles,
+                    title: String::new(),
+                    auto_start: auto,
+                    auto_agents: false,
+                },
+            )
         });
         match result {
+            Ok(()) if panel::with_panel(|p| p.drafting()) => {}
             Ok(()) => self.toast(
                 trf(
                     "team.toast.plan_ready",
@@ -933,7 +939,7 @@ impl ZaivernApp {
         self.team_apply_recommendation(&mut form, &spec_text, &ws);
         form.roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
         form.review_required = false;
-        let mut opts = RunOptions {
+        let opts = RunOptions {
             // **秒だけで作らない。** 同じ秒に 2 回始めると ID が衝突し、
             // 前の Run の検証結果や承認が新しい Run の同じ番号のタスクへ
             // 当たりうる (`runtime::new_run_id`)。
@@ -953,22 +959,153 @@ impl ZaivernApp {
                 cost_limit: form.cost_limit,
             },
         };
-        let spec_text = planner::prepare_direct_request(&spec_text, &mut opts);
-        let roles = form.roles.clone();
-        let title = form.goal_name.clone();
-        let r = panel::with_panel(|p| {
-            let r = p.plan_with(&spec_text, &source, opts, roles, &title);
-            if r.is_ok() {
-                p.form.open = false;
-                p.form.error.clear();
-                p.tab = BoardTab::Organization;
-                p.act(TeamAction::Start);
-            }
-            r
-        });
+        let r = self.team_prepare_spec(
+            &spec_text,
+            panel::DraftRequest {
+                workspace: ws,
+                source,
+                options: opts,
+                roles: form.roles.clone(),
+                title: form.goal_name.clone(),
+                auto_start: true,
+                auto_agents: !form.composition_touched,
+            },
+        );
         match r {
             Ok(()) => {}
             Err(e) => panel::with_panel(|p| p.form.error = e),
+        }
+    }
+
+    /// 仕様の入力と実行条件を固定し、必要な場合だけ非同期で担当を具体化する。
+    fn team_prepare_spec(
+        &mut self,
+        text: &str,
+        request: panel::DraftRequest,
+    ) -> Result<(), String> {
+        use crate::features::team::imp::spec_writer;
+        if panel::with_panel(|p| p.drafting()) {
+            return Err(tr("team.draft.hint"));
+        }
+        if text.trim().is_empty() {
+            return Err(tr("team.draft.empty_brief"));
+        }
+        if text.len() > spec_writer::DRAFT_MAX_BYTES {
+            return Err(tr("team.draft.too_large"));
+        }
+        if planner::has_file_assignments(text) {
+            return Self::team_install_spec(text, request);
+        }
+        let names: Vec<&str> = self.cfg.agents.iter().map(|p| p.name.as_str()).collect();
+        let (label, program, args) =
+            spec_writer::select_agent(&names, &request.options.agent_presets, |index| {
+                let preset = &self.cfg.agents[index];
+                let spec = crate::agents::spec_for_command(&preset.command)
+                    .ok_or_else(|| tr("team.draft.no_agent"))?;
+                let (program, args) =
+                    crate::diagnostician::build_invocation(&preset.command, spec)?;
+                let resolved = crate::features::team::imp::validation_command::resolve_in(
+                    &program,
+                    &request.workspace,
+                    std::env::var("PATH").ok().as_deref(),
+                    std::env::var("PATHEXT").ok().as_deref(),
+                )
+                .map_err(|e| format!("{e:?}"))?;
+                Ok((preset.name.clone(), resolved.path, args))
+            })?;
+        let prompt = spec_writer::build_prompt(
+            &request.title,
+            text,
+            request.options.agent_count,
+            &[crate::features::team::imp::model::TeamRole::Implementer],
+            &[],
+            crate::features::team::imp::composition::WorkShape::WideIndependent,
+        );
+        let cwd = request.workspace.clone();
+        let original = text.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = launch::new_cancel_flag();
+        let pid = launch::new_pid_slot();
+        let worker_cancel = cancel.clone();
+        let worker_pid = pid.clone();
+        std::thread::Builder::new()
+            .name("team-spec".into())
+            .spawn(move || {
+                let result = spec_writer::draft_with(
+                    &program,
+                    &args,
+                    &cwd,
+                    &prompt,
+                    &original,
+                    &worker_cancel,
+                    &worker_pid,
+                );
+                let _ = tx.send(result);
+            })
+            .map_err(|e| e.to_string())?;
+        panel::with_panel(|p| {
+            p.begin_draft(&label, rx, cancel, pid);
+            p.pending_draft = Some(request);
+            p.form.error.clear();
+            p.notice = trf("team.draft.running", &[("agent", label)]);
+            p.mark_dirty();
+        });
+        Ok(())
+    }
+
+    fn team_install_spec(text: &str, mut request: panel::DraftRequest) -> Result<(), String> {
+        let text = planner::prepare_direct_request(text, &mut request.options);
+        panel::with_panel(|p| {
+            if p.workspace() != request.workspace {
+                return Err(tr("team.draft.workspace_changed"));
+            }
+            p.plan_with_auto_agents(
+                &text,
+                &request.source,
+                request.options,
+                request.roles,
+                &request.title,
+                request.auto_agents,
+            )?;
+            p.form.open = false;
+            p.form.error.clear();
+            p.notice.clear();
+            p.tab = BoardTab::Organization;
+            if request.auto_start {
+                p.act(TeamAction::Start);
+            }
+            p.mark_dirty();
+            Ok(())
+        })
+    }
+
+    fn team_poll_spec(&mut self, ctx: &egui::Context) {
+        let completed = panel::with_panel(|p| {
+            p.poll_draft();
+            if p.drafting() {
+                return None;
+            }
+            let request = p.pending_draft.take()?;
+            Some((request, std::mem::take(&mut p.form.draft)))
+        });
+        if let Some((request, state)) = completed {
+            let result = match state {
+                panel::DraftState::Ready { text, .. } => Self::team_install_spec(&text, request),
+                panel::DraftState::Failed { why } => Err(why),
+                _ => Err(tr("team.draft.lost")),
+            };
+            if let Err(error) = result {
+                panel::with_panel(|p| {
+                    p.form.error = error.clone();
+                    p.notice = error.clone();
+                    p.form.open = true;
+                    p.mark_dirty();
+                });
+                self.toast(error, false);
+            }
+        }
+        if panel::with_panel(|p| p.drafting()) {
+            crate::perf::repaint_after(ctx, std::time::Duration::from_millis(250), "team_draft");
         }
     }
 

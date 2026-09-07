@@ -544,7 +544,6 @@ pub fn fallback_spec(goal: &str, brief: &str, rec: &Recommendation) -> String {
 /// [`super::spec_writer::build_prompt`] がこれをそのまま貼る。編成を
 /// 決めた層と作法を書く層が別々に判断すると、「2 体と言ったのに 8 本に
 /// 割る」ような食い違いが出る。
-#[cfg(test)]
 pub fn spec_guidance(shape: WorkShape) -> &'static str {
     match shape {
         WorkShape::SingleArtifact => {

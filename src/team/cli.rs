@@ -888,7 +888,9 @@ mod tests {
         // 投函箱も状態も作られない = 何も起動していない
         let home = test_home(&dir);
         assert!(!launch::launch_path_in(&home, &dir).exists());
-        assert!(!persistence::has_run(&persistence::team_dir_in(&home, &dir)));
+        assert!(!persistence::has_run(&persistence::team_dir_in(
+            &home, &dir
+        )));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -991,7 +993,9 @@ mod tests {
 
     #[test]
     fn ヘルプは全サブコマンドを載せる() {
-        for sub in ["plan", "run", "status", "resume", "stop", "check", "draft", "shot", "reset"] {
+        for sub in [
+            "plan", "run", "status", "resume", "stop", "check", "draft", "shot", "reset",
+        ] {
             assert!(HELP.contains(&format!("zai team {sub}")), "{sub} が無い");
         }
         assert_eq!(cli_main(&v(&["--help"])), EXIT_OK);
@@ -1088,7 +1092,6 @@ mod tests {
         assert!(req.auto_start);
         std::fs::remove_dir_all(&dir).ok();
     }
-
 
     /// **画面が持っているかの判定は、渡された置き場だけを見る。**
     ///

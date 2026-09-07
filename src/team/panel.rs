@@ -151,13 +151,12 @@ pub enum BoardAction {
 /// [`TeamPanel`] が持ち、毎フレーム移し替える)。持たせると、
 /// 画面を描くたびに受信を試すことになって真実の在り処が 2 つになる。
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-#[cfg(test)]
 pub enum DraftState {
     #[default]
     Idle,
     /// 依頼中。`agent` は表示用の名前。
     Running { agent: String },
-    /// 書き換わった。**まだ採用していない** — 人の確認を待つ。
+    /// 書き換わった。呼び出し側が計画を検査して自動開始する。
     Ready { agent: String, text: String },
     /// 失敗した。理由はそのまま人へ出す。
     Failed { why: String },
@@ -222,7 +221,6 @@ pub struct NewRunForm {
     /// 直近のエラー文面。
     pub error: String,
     /// 仕様書への書き換えの進み具合。
-    #[cfg(test)]
     pub draft: DraftState,
     /// **人が体の数か役割を手で変えたか。**
     ///
@@ -257,7 +255,6 @@ impl Default for NewRunForm {
             approval_mode: "ask".to_string(),
             cost_limit: 0.0,
             error: String::new(),
-            #[cfg(test)]
             draft: DraftState::Idle,
             composition_touched: false,
             probe: super::composition::WorkspaceProbe::default(),
@@ -380,17 +377,29 @@ impl LiveWork {
     }
 }
 
+/// 非同期仕様生成の起動条件を固定する。編集中のフォームと混ぜない。
+pub struct DraftRequest {
+    pub workspace: std::path::PathBuf,
+    pub source: String,
+    pub options: RunOptions,
+    pub roles: Vec<TeamRole>,
+    pub title: String,
+    pub auto_start: bool,
+    pub auto_agents: bool,
+}
+
 /// Team 画面の状態。
 pub struct TeamPanel {
     pub open: bool,
     pub tab: BoardTab,
     pub form: NewRunForm,
+    pub pending_draft: Option<DraftRequest>,
     /// 仕様書の書き換えの受け口。**フォームには持たせない**
     /// (描画のたびに受信を試す形にすると真実の在り処が 2 つになる)。
-    #[cfg(test)]
     draft_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    #[cfg(test)]
     draft_started: Option<std::time::Instant>,
+    draft_cancel: Option<super::launch::CancelFlag>,
+    draft_pid: Option<super::launch::PidSlot>,
     workspace_preparations:
         std::collections::BTreeMap<String, std::sync::mpsc::Receiver<Result<(), String>>>,
     pub selected_agent: Option<AgentId>,
@@ -499,13 +508,14 @@ impl Default for TeamPanel {
         Self {
             open: false,
             tab: BoardTab::default(),
-            #[cfg(test)]
             draft_rx: None,
-            #[cfg(test)]
             draft_started: None,
+            draft_cancel: None,
+            draft_pid: None,
             expanded_output: None,
             needs_git: false,
             form: NewRunForm::default(),
+            pending_draft: None,
             workspace_preparations: Default::default(),
             selected_agent: None,
             selected_task: None,
@@ -600,7 +610,8 @@ impl TeamPanel {
                         .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
                         .count()
                 })
-                .sum(),
+                .sum::<usize>()
+                + usize::from(self.drafting()),
             // **検証と未実行の仕事は画面側の持ち物。** Runtime が無い
             // ときに 0 と答えると、`discard_run` の直後 (Runtime は捨てた
             // が子プロセスはまだ畳んでいる) に「空いている」と嘘をつく。
@@ -702,11 +713,12 @@ impl TeamPanel {
     /// **重ねて始めない。** 走っている最中にもう一度押されても、
     /// 先に頼んだほうの結果を待つ (2 本目を起こすと 2 通の下書きが返り、
     /// どちらを採ったのか誰にも分からなくなる)。
-    #[cfg(test)]
     pub fn begin_draft(
         &mut self,
         agent: &str,
         rx: std::sync::mpsc::Receiver<Result<String, String>>,
+        cancel: super::launch::CancelFlag,
+        pid: super::launch::PidSlot,
     ) {
         if matches!(self.form.draft, DraftState::Running { .. }) {
             return;
@@ -715,17 +727,17 @@ impl TeamPanel {
             agent: agent.to_string(),
         };
         self.draft_rx = Some(rx);
+        self.draft_cancel = Some(cancel);
+        self.draft_pid = Some(pid);
         self.draft_started = Some(std::time::Instant::now());
     }
 
     /// 走っている書き換えがあるか (毎フレームの再描画要求に使う)。
-    #[cfg(test)]
     pub fn drafting(&self) -> bool {
         matches!(self.form.draft, DraftState::Running { .. })
     }
 
     /// 受け口を覗いて、届いていればフォームへ移す。**待たない。**
-    #[cfg(test)]
     pub fn poll_draft(&mut self) {
         let Some(rx) = self.draft_rx.as_ref() else {
             return;
@@ -748,6 +760,7 @@ impl TeamPanel {
                 Err(crate::i18n::tr("team.validation.timed_out"))
             }
         };
+        self.stop_draft_worker();
         self.draft_started = None;
         self.draft_rx = None;
         let agent = match &self.form.draft {
@@ -770,6 +783,7 @@ impl TeamPanel {
     /// `roles` はフォームの「エージェントプリセット」、`title_override` は
     /// 「Goal 名」。**どちらも実際に計画へ効く** — 選べるのに何も変わらない
     /// 入力欄を残さない。
+    #[cfg(test)]
     pub fn plan_with(
         &mut self,
         spec_text: &str,
@@ -777,6 +791,18 @@ impl TeamPanel {
         opts: RunOptions,
         roles: Vec<TeamRole>,
         title_override: &str,
+    ) -> Result<(), String> {
+        self.plan_with_auto_agents(spec_text, source, opts, roles, title_override, false)
+    }
+
+    pub fn plan_with_auto_agents(
+        &mut self,
+        spec_text: &str,
+        source: &str,
+        mut opts: RunOptions,
+        roles: Vec<TeamRole>,
+        title_override: &str,
+        auto_agents: bool,
     ) -> Result<(), String> {
         // 上限とIDの所有権は、計画を組み立てる前に確定する。同じrun_idを
         // 受け入れるとworktree・outbox・保存が同じ所有者になり、Run間分離が
@@ -820,6 +846,13 @@ impl TeamPanel {
                 .map(|i| i.detail())
                 .collect::<Vec<_>>()
                 .join("\n"));
+        }
+        // 短い依頼からの暫定人数ではなく、確定した担当・依存の幅で決める。
+        // 手動指定とCLIの上限は変えない。仕事自体を人数に合わせて増やさない。
+        if auto_agents {
+            opts.agent_count = super::scheduler::desired_sessions(&plan.tasks, FORM_MAX_AGENTS)
+                .max(if opts.review_required { 2 } else { 1 });
+            self.form.agents = opts.agent_count;
         }
         // **動いているチームを別の計画で潰さない。** 置き換えると、走って
         // いる検証と起動済みのエージェントの面倒を見る相手が消える
@@ -2676,7 +2709,29 @@ impl TeamPanel {
         remaining
     }
 
+    /// 閉じる側でもプロセスを止められるよう、ランナーと同じ停止札とPIDを持つ。
+    fn stop_draft_worker(&mut self) {
+        if let Some(cancel) = self.draft_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(pid) = self.draft_pid.take() {
+            let pid = pid.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                crate::procx::kill_tree(pid);
+            }
+        }
+    }
+
+    fn discard_draft_work(&mut self) {
+        self.stop_draft_worker();
+        self.draft_rx = None;
+        self.draft_started = None;
+        self.pending_draft = None;
+        self.form.draft = DraftState::Idle;
+    }
+
     pub fn shutdown(&mut self) -> usize {
+        self.discard_draft_work();
         // Runtime::drop retains any remaining custody until the writer stops.
         let killed = self.stop_all_validations_now();
         self.pending_launches.clear();
@@ -2712,6 +2767,8 @@ impl TeamPanel {
         if self.rt().is_none()
             && self.workspace.as_os_str().is_empty()
             && self.validation_jobs.is_empty()
+            && self.draft_rx.is_none()
+            && self.pending_draft.is_none()
         {
             return false;
         }
@@ -2918,7 +2975,12 @@ mod tests {
     fn 仕様の送り手が残っていても期限で待機を終了する() {
         let mut panel = super::TeamPanel::default();
         let (_sender, receiver) = std::sync::mpsc::channel();
-        panel.begin_draft("selected-agent", receiver);
+        panel.begin_draft(
+            "selected-agent",
+            receiver,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
         panel.poll_draft();
         assert!(panel.drafting());
         panel.draft_started = Some(
@@ -2930,6 +2992,96 @@ mod tests {
         assert!(!panel.drafting());
         assert!(matches!(panel.form.draft, super::DraftState::Failed { .. }));
         assert!(panel.draft_rx.is_none());
+    }
+
+    #[test]
+    fn 仕様生成中の二重開始とワークスペース変更を防ぐ() {
+        let mut panel = super::TeamPanel::default();
+        let (_first_sender, first) = std::sync::mpsc::channel();
+        let (_second_sender, second) = std::sync::mpsc::channel();
+        panel.begin_draft(
+            "first",
+            first,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
+        panel.begin_draft(
+            "second",
+            second,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
+        assert!(
+            matches!(&panel.form.draft, super::DraftState::Running { agent } if agent == "first")
+        );
+        assert!(panel.live_work().is_busy());
+        assert!(panel
+            .attach_workspace(std::path::Path::new("another-workspace"))
+            .is_err());
+        assert!(panel.drafting());
+    }
+
+    #[test]
+    fn 閉じるか文脈を替えると仕様生成を停止し旧結果を捨てる() {
+        for adopt in [false, true] {
+            let mut panel = super::TeamPanel::default();
+            panel.home = crate::test_util::unique_temp_dir("team-draft", "shutdown");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let cancel = super::super::launch::new_cancel_flag();
+            panel.begin_draft(
+                "writer",
+                receiver,
+                cancel.clone(),
+                super::super::launch::new_pid_slot(),
+            );
+            panel.pending_draft = Some(super::DraftRequest {
+                workspace: std::path::PathBuf::new(),
+                source: "request".into(),
+                options: super::RunOptions::default(),
+                roles: vec![],
+                title: "goal".into(),
+                auto_start: true,
+                auto_agents: false,
+            });
+            sender.send(Ok("遅れて届いた仕様書".into())).unwrap();
+            if adopt {
+                assert!(panel.adopt_new_app_context());
+            } else {
+                panel.shutdown();
+            }
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(sender.send(Ok("終了後の結果".into())).is_err());
+            panel.poll_draft();
+            assert!(panel.pending_draft.is_none());
+            assert!(panel.draft_rx.is_none());
+            assert!(panel.draft_pid.is_none());
+            assert!(matches!(panel.form.draft, super::DraftState::Idle));
+            assert!(!panel.has_run());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 閉じると仕様生成プロセスをworkerに頼らず停止する() {
+        use std::os::unix::process::CommandExt;
+        let mut panel = super::TeamPanel::default();
+        panel.home = crate::test_util::unique_temp_dir("team-draft", "kill");
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .process_group(0)
+            .spawn()
+            .expect("子を起こせる");
+        let pid = super::super::launch::new_pid_slot();
+        pid.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        panel.begin_draft(
+            "writer",
+            receiver,
+            super::super::launch::new_cancel_flag(),
+            pid,
+        );
+        panel.shutdown();
+        assert!(!child.wait().expect("子を回収できる").success());
     }
 
     use super::*;
@@ -3005,6 +3157,62 @@ mod tests {
         assert_eq!(p.goal_status().unwrap(), GoalStatus::Running);
         // 置き場もワークスペースの下なので、これ 1 行で全部片付く
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 自動人数は暫定二体を超え必要な独立担当だけに合わせる() {
+        for (count, chained, automatic, expected) in [
+            (1, false, true, 1),
+            (2, false, true, 2),
+            (3, false, true, 3),
+            (5, false, true, 5),
+            (3, true, true, 1),
+            (3, false, false, 2),
+        ] {
+            let dir = ws("automatic-agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = panel_at(&dir);
+            let mut spec = format!(
+                "{}\n# 成果物\n## タスク\n",
+                super::super::planner::IMPLEMENTATION_ONLY
+            );
+            for i in 1..=count {
+                let deps = if chained && i > 1 {
+                    format!("T{:02}", i - 1)
+                } else {
+                    "none".into()
+                };
+                spec.push_str(&format!(
+                    "- implementer: T{i:02} 担当{i} (deps: {deps}) (files: part{i}.md)\n"
+                ));
+            }
+            p.plan_with_auto_agents(
+                &spec,
+                "request",
+                RunOptions {
+                    agent_count: 2,
+                    review_required: false,
+                    ..RunOptions::default()
+                },
+                vec![TeamRole::Implementer],
+                "",
+                automatic,
+            )
+            .unwrap();
+            let rt = p.rt().unwrap();
+            assert_eq!(rt.run().agent_count, expected);
+            assert_eq!(rt.agents().len(), expected);
+            assert_eq!(
+                rt.tasks().len(),
+                count + 1,
+                "人数のためにタスクを増やさない"
+            );
+            if automatic {
+                assert_eq!(p.form.agents, expected);
+            }
+            drop(p);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
