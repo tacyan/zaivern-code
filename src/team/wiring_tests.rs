@@ -1559,6 +1559,9 @@ fn 四種類とも置き場から受理する経路がある() {
         &rt,
         rt.find("pub fn accept_outbox").expect("置き場からの受理口"),
     );
+    // メソッドチェーンの改行・インデントは呼び出しの有無に影響させない。
+    // 正規化はこの照合だけに限定し、他の構造検査には元の本体を使う。
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     for f in [
         "self.take_result(",
         "self.take_review(",
@@ -1566,7 +1569,7 @@ fn 四種類とも置き場から受理する経路がある() {
         "self.take_event(",
     ] {
         assert!(
-            body.contains(f),
+            compact.contains(f),
             "accept_outbox が {f} を通していない:\n{body}"
         );
     }
