@@ -159,9 +159,9 @@ impl ZaivernApp {
         let Some(req) = launch::take_in(&root, &ws, now) else {
             return;
         };
-        let opts = RunOptions {
+        let mut opts = RunOptions {
             spec_source: req.spec_path.display().to_string(),
-            agent_count: req.agent_count.max(2),
+            agent_count: req.agent_count,
             review_required: false,
             guardrails: crate::features::team::imp::model::RunGuardrails {
                 approval_mode: self.cfg.approval_mode.clone(),
@@ -171,7 +171,7 @@ impl ZaivernApp {
         };
         let roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
         let auto = req.auto_start;
-        let spec_text = format!("{}\n{}", planner::IMPLEMENTATION_ONLY, req.spec_text);
+        let spec_text = planner::prepare_direct_request(&req.spec_text, &mut opts);
         let result = panel::with_panel(|p| {
             p.open = true;
             // **要求の中の workspace を attach しない。** 未信頼データに
@@ -288,7 +288,18 @@ impl ZaivernApp {
             // 次の tick でも同じ理由で止まるので、送り直すぶんだけ同じ
             // トーストが出続けて前に進まない。人が手当てできる形へ上げる
             // (既存のコスト上限判定をそのまま使う — 第 2 の判定を作らない)。
-            let blocked = self.team_cost_block_reason(&owner);
+            let blocked = self.team_cost_block_reason(&owner).or_else(|| {
+                // 配送前に実 writer の生存を永続化する。アプリが強制終了しても
+                // 生きている担当のロックを、次のアプリが回収してはいけない。
+                let pid = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session)
+                    .and_then(|s| s.live_process_id());
+                panel::with_panel(|p| p.handoff_integration_writer(&owner, task, session, pid))
+                    .err()
+            });
             let queued = if blocked.is_some() {
                 false
             } else {
@@ -915,11 +926,6 @@ impl ZaivernApp {
         } else {
             (form.spec_text.clone(), tr("team.form.direct_source"))
         };
-        let spec_text = if planner::implementation_only(&spec_text) {
-            spec_text
-        } else {
-            format!("{}\n{}", planner::IMPLEMENTATION_ONLY, spec_text)
-        };
         // **計画にも同じ編成を当てる。** 書き換えの段だけで当てると、
         // 書き換えを経ない (最初から分かれている) SPEC が既定の 6 役割・
         // 4 体のまま計画され、画面のおすすめと実際の編成が食い違う。
@@ -927,13 +933,13 @@ impl ZaivernApp {
         self.team_apply_recommendation(&mut form, &spec_text, &ws);
         form.roles = vec![crate::features::team::imp::model::TeamRole::Implementer];
         form.review_required = false;
-        let opts = RunOptions {
+        let mut opts = RunOptions {
             // **秒だけで作らない。** 同じ秒に 2 回始めると ID が衝突し、
             // 前の Run の検証結果や承認が新しい Run の同じ番号のタスクへ
             // 当たりうる (`runtime::new_run_id`)。
             run_id: crate::features::team::imp::runtime::new_run_id(),
             spec_source: source.clone(),
-            agent_count: form.agents.max(2),
+            agent_count: form.agents,
             // 空なら「おまかせ」(役割ごとに配る)。名前が入っていれば全員それ。
             agent_presets: form.agent_presets.clone(),
             max_attempts: form.max_attempts,
@@ -947,6 +953,7 @@ impl ZaivernApp {
                 cost_limit: form.cost_limit,
             },
         };
+        let spec_text = planner::prepare_direct_request(&spec_text, &mut opts);
         let roles = form.roles.clone();
         let title = form.goal_name.clone();
         let r = panel::with_panel(|p| {
@@ -1118,78 +1125,96 @@ mod give_up_ledger_tests {
     }
 }
 
-/// **短い依頼が通常の計画ボタンをすり抜けないことの番人。**
-///
-/// `planner::needs_spec_rewrite` 自体の判定は planner の純関数テストが持つ。
-/// ここでは、その判定が GUI の通常導線へ本当に繋がっていることだけを見る。
+/// CLI と GUI が共有する新規 Run 境界を実際の計画器まで通す。
 #[cfg(test)]
-mod short_spec_route_tests {
+mod direct_request_route_tests {
+    use super::*;
+    use crate::features::team::imp::{model::TeamRole, planner::TeamPlanner};
+
     #[test]
     fn cli投函は同じworkspaceの二本目を保留しない() {
-        let a = std::path::Path::new("/workspace/a");
-        let b = std::path::Path::new("/workspace/b");
+        let a = std::path::Path::new("workspace-a");
+        let b = std::path::Path::new("workspace-b");
         assert!(!super::defer_team_launch(a, a, true));
         assert!(super::defer_team_launch(a, b, true));
         assert!(!super::defer_team_launch(a, b, false));
     }
 
-    #[test]
-    fn cliの短い起動要求も直接planへ入れない() {
-        let src = include_str!("team_glue.rs").replace("\r\n", "\n");
-        let body = src
-            .split("fn team_take_launch_request")
-            .nth(1)
-            .and_then(|s| s.split("\n    /// いま生きている").next())
-            .expect("CLI 起動要求の受け口がある");
-        let gate = body
-            .find("planner::needs_spec_rewrite(&req.spec_text)")
-            .expect("CLI でも短い指示を判定している");
-        let plan = body
-            .find("p.plan_with(&req.spec_text")
-            .expect("通常SPECの計画口");
-        assert!(gate < plan, "計画より後に短さを判定している:\n{body}");
-        assert!(body.contains("p.form = panel::NewRunForm::default()"));
-        assert!(body.contains("self.team_draft_spec()"));
-        assert!(body.contains("p.form.open = true"));
-        assert!(body.contains("p.form.approval_mode = approval_mode"));
-        assert!(body.contains("p.form.cost_limit = cost_limit"));
+    fn plan_request(
+        text: &str,
+        count: usize,
+    ) -> (
+        crate::features::team::imp::plan_schema::TeamPlan,
+        RunOptions,
+    ) {
+        let mut opts = RunOptions {
+            agent_count: count,
+            ..RunOptions::default()
+        };
+        let spec = planner::prepare_direct_request(text, &mut opts);
+        let plan = planner::StaticPlanner
+            .plan(planner::PlanInput {
+                spec,
+                source: "request.md".into(),
+                agent_count: opts.agent_count,
+                review_required: opts.review_required,
+                workspace_root: std::path::PathBuf::new(),
+                roles: vec![TeamRole::Implementer],
+            })
+            .unwrap();
+        (plan, opts)
     }
 
     #[test]
-    fn 一件にしかならない指示は計画より先に書き換える() {
-        let src = include_str!("team_glue.rs").replace("\r\n", "\n");
-        let body = src
-            .split("fn team_plan_from_form_inner")
-            .nth(1)
-            .and_then(|s| s.split("\n    /// **いまの設定").next())
-            .expect("計画の本体がある");
-        let gate = body
-            .find("planner::needs_spec_rewrite(&spec_text)")
-            .expect("計画と同じ物差しで短い指示を見ている");
-        let plan = body.find("p.plan_with(").expect("計画へ渡す口がある");
-        assert!(gate < plan, "計画した後に書き換えを判定している:\n{body}");
-        assert!(
-            body.contains("!form.from_file || planner::needs_spec_rewrite(&spec_text)"),
-            "直接入力が箇条書きだとエージェント変換をすり抜ける"
-        );
-        assert!(
-            body[..plan].contains("self.team_draft_spec()"),
-            "短い指示を書き換えへ送っていない:\n{body}"
-        );
+    fn cliの短い起動要求は仕様生成なしで実装へ進む() {
+        let (plan, opts) = plan_request("HTMLを作成してください", 1);
+        assert_eq!(opts.agent_count, 1);
+        assert!(!opts.review_required);
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(plan.tasks[0].dependencies.is_empty());
+        assert_eq!(plan.tasks[1].dependencies, vec![plan.tasks[0].id]);
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|t| t.role == TeamRole::Implementer && t.validation_commands.is_empty()));
     }
 
     #[test]
-    fn 元のまま進むと選んだ時だけ書き換えを迂回する() {
-        let src = include_str!("team_glue.rs").replace("\r\n", "\n");
-        let arm = src
-            .split("BoardAction::DiscardDraft => {")
-            .nth(1)
-            .and_then(|s| s.split("BoardAction::OpenNewRun").next())
-            .expect("元のまま進む分岐がある");
-        assert!(arm.contains("p.discard_draft()"), "下書きを捨てていない");
-        assert!(
-            arm.contains("self.team_plan_from_form_inner(false)"),
-            "通常導線へ戻して同じ書き換えを繰り返す:\n{arm}"
+    fn 直接入力の要件は書き換えず全体を保持する() {
+        let text = "# 商品ページ\n- 日本語\n- 手元の画像を使用\n- キーボード操作に対応";
+        let (plan, _) = plan_request(text, 3);
+        assert_eq!(
+            plan.goal
+                .specification
+                .strip_prefix(planner::IMPLEMENTATION_ONLY)
+                .unwrap()
+                .trim(),
+            text
         );
+        assert!(plan.tasks.iter().all(|t| t.role == TeamRole::Implementer));
+        assert!(plan.tasks.last().unwrap().dependencies.len() >= 2);
+    }
+
+    #[test]
+    fn 新規導線の準備を繰り返しても設定と依頼を失わない() {
+        let mut opts = RunOptions {
+            agent_count: 1,
+            agent_presets: vec!["selected-agent".into()],
+            max_attempts: 2,
+            guardrails: crate::features::team::imp::model::RunGuardrails {
+                approval_mode: "strict".into(),
+                cost_limit: 12.0,
+            },
+            ..RunOptions::default()
+        };
+        let first = planner::prepare_direct_request("LPを作る", &mut opts);
+        let second = planner::prepare_direct_request(&first, &mut opts);
+        assert_eq!(first, second);
+        assert_eq!(opts.agent_count, 1);
+        assert_eq!(opts.agent_presets, vec!["selected-agent"]);
+        assert_eq!(opts.max_attempts, 2);
+        assert_eq!(opts.guardrails.approval_mode, "strict");
+        assert_eq!(opts.guardrails.cost_limit, 12.0);
+        assert!(!opts.review_required);
     }
 }

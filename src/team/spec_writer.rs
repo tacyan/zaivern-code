@@ -26,7 +26,6 @@
 //! 答えとして読む」経路はここには無い。それでも取り出しは**最後の塊**を
 //! 採る — 依頼文を復唱してから答える CLI があっても答えのほうを採るため。
 
-use std::path::Path;
 use std::time::Duration;
 
 use super::model::TeamRole;
@@ -368,31 +367,6 @@ pub fn accept(draft: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 実体を起こして下書きを 1 本作る。
-///
-/// `program` は**解決済みの絶対パス**、`args` は起動引数 (依頼文は最後に
-/// 足される)。判断も解決もここではしない — 呼ぶ側が済ませておく。
-///
-/// **ランナーは既存のものを使う** ([`super::launch::run_resolved_capped`])。
-/// 時間切れ・停止・木ごとの後始末を 2 か所に持たない。
-pub fn draft_with(
-    program: &Path,
-    args: &[String],
-    cwd: &Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<String, String> {
-    if prompt.starts_with(super::planner::IMPLEMENTATION_ONLY) {
-        let text = draft_once(program, args, cwd, prompt, timeout)?;
-        let specification = format!("{}\n{}", super::planner::IMPLEMENTATION_ONLY, text);
-        accept(&specification)?;
-        return Ok(specification);
-    }
-    audited_draft(prompt, timeout, |instruction, remaining| {
-        draft_once(program, args, cwd, instruction, remaining)
-    })
-}
-
 /// 生成内で見直しを行い、ローカル検査の不備がある場合だけ同じCLIに補修を依頼する。
 /// 最大3回・全体timeout内で補修し、失敗は成功に偽装しない。
 fn audited_draft(
@@ -444,48 +418,6 @@ fn audited_draft(
     ))
 }
 
-fn draft_once(
-    program: &Path,
-    args: &[String],
-    cwd: &Path,
-    prompt: &str,
-    timeout: Duration,
-) -> Result<String, String> {
-    let overrides = crate::agents::specification_only_args(program);
-    let mut argv: Vec<&str> = args
-        .iter()
-        .chain(overrides.iter())
-        .map(String::as_str)
-        .collect();
-    argv.push(prompt);
-    let cancel: super::launch::CancelFlag = Default::default();
-    let pid: super::launch::PidSlot = Default::default();
-    let (code, why, out) = super::launch::run_resolved_capped(
-        program,
-        &argv,
-        cwd,
-        timeout,
-        &cancel,
-        &pid,
-        // 想定する仕様サイズの2倍まで保持し、無制限出力は避ける。
-        DRAFT_MAX_BYTES.saturating_mul(2),
-    );
-    use super::model::ValidationOutcome as V;
-    match why {
-        V::Passed => draft_candidate(&out.stdout, prompt),
-        V::TimedOut => Err(format!(
-            "{} 秒待っても返ってきませんでした",
-            timeout.as_secs()
-        )),
-        V::SpawnFailed => Err("エージェントを起動できませんでした".to_string()),
-        V::Cancelled => Err("中止しました".to_string()),
-        _ => Err(format!(
-            "エージェントが失敗しました (終了コード {code}){}",
-            first_line(&out.stderr)
-        )),
-    }
-}
-
 /// 構造不備も監査の修正材料にする。空・巨大出力・完全なエコーは採らない。
 /// 最終採用は audited_draft の accept を必ず通る。
 fn draft_candidate(stdout: &str, sent: &str) -> Result<String, String> {
@@ -497,14 +429,6 @@ fn draft_candidate(stdout: &str, sent: &str) -> Result<String, String> {
         return Ok(text.to_string());
     }
     Err(why_no_draft(stdout))
-}
-
-/// stderr の 1 行目だけを「: …」の形で添える (空なら何も足さない)。
-fn first_line(s: &str) -> String {
-    match s.lines().map(str::trim).find(|l| !l.is_empty()) {
-        Some(l) => format!(": {}", l.chars().take(200).collect::<String>()),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]

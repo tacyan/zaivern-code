@@ -114,6 +114,18 @@ pub fn implementation_only(spec: &str) -> bool {
     spec.starts_with(IMPLEMENTATION_ONLY)
 }
 
+/// CLI と GUI の新規 Run を同じ直接実装契約へ揃える。
+/// 旧 Run の復元や明示的な旧モードの入力には適用しない。
+pub fn prepare_direct_request(spec: &str, opts: &mut super::runtime::RunOptions) -> String {
+    opts.agent_count = opts.agent_count.clamp(1, super::launch::MAX_AGENTS);
+    opts.review_required = false;
+    if implementation_only(spec) {
+        spec.to_owned()
+    } else {
+        format!("{IMPLEMENTATION_ONLY}\n{spec}")
+    }
+}
+
 fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
     let request = input
         .spec
@@ -137,14 +149,14 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
     // Unstructured requests stay intact so requirements cannot disappear in a split.
     let seeds = implementation_seeds(&sections, &title);
     let mut tasks: Vec<TaskDoc> = Vec::new();
+    let root = format!(
+        "{}/{}",
+        super::task_workspace::ROOT,
+        super::runtime::new_run_id()
+    );
     {
         // ファイル分担の無い自然文でも、実装を独立した作業場所へ分けて即時並列化する。
         // Run ごとの一意な場所なので、同じ依頼の同時実行でも中間成果を上書きしない。
-        let root = format!(
-            "{}/{}",
-            super::task_workspace::ROOT,
-            super::runtime::new_run_id()
-        );
         let units: Vec<String> = seeds
             .iter()
             .filter(|seed| {
@@ -152,9 +164,15 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
             })
             .map(|seed| format!("{}\n{}", seed.title, seed.body))
             .collect();
-        let count = units.len().max(2).min(input.agent_count.max(2)).min(8);
+        let count = units
+            .len()
+            .max(2)
+            .min(input.agent_count.clamp(1, super::launch::MAX_AGENTS))
+            .min(8);
         for i in 0..count {
-            let focus = if units.len() > 1 {
+            let focus = if count == 1 {
+                "元の依頼全体を担当する。本体・表示・入出力・導入説明・入力例・テンプレート・完成見本のうち、依頼に必要な成果物をすべて実装する。".into()
+            } else if units.len() > 1 {
                 units
                     .iter()
                     .skip(i)
@@ -170,7 +188,7 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
             let dir = format!("{root}/part-{}", i + 1);
             tasks.push(TaskDoc {
                 key: format!("implement-{}", i + 1), title: format!("並列実装 {}: {}", i + 1, focus.lines().next().unwrap_or("担当部分").chars().take(80).collect::<String>()),
-                description: format!("担当: {focus}\n隔離先: {dir}/。Zaivernが用意するGitワークツリー（Gitが使えない環境では独立コピー）内で、既存の実装を直接編集する。ファイルの複製を別の場所へ作らない。他担当の完了を待たず、利用方法が分かる実装を作る。仕様書・計画書・テスト・レビューは作らない。変更ファイルと削除ファイルを完了要約へ列挙する。後続担当が差分を元のフォルダへ統合する。依頼外の機能は追加しない。"),
+                description: format!("担当: {focus}\n隔離先: {dir}/。Zaivernが用意するGitワークツリー（Gitが使えない環境では独立コピー）内で、既存の実装を直接編集する。ファイルの複製を別の場所へ作らない。他担当の完了を待たず、利用方法が分かる実装を作る。仕様書・計画書・テスト・レビューは作らない。変更ファイルと削除ファイルを完了要約へ列挙する。後続担当が差分を専用の隔離先へ統合し、Zaivernが開いたフォルダへ反映する。依頼外の機能は追加しない。"),
                 team: "implementation".into(), role: "implementer".into(), depends_on: vec![],
                 files: vec![format!("{dir}/**")], required_caps: vec![],
                 acceptance_criteria: vec!["担当部分の実体を作業場所に保存した".into()], validation_commands: vec![],
@@ -181,10 +199,10 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
     let dependencies = tasks.iter().map(|task| task.key.clone()).collect();
     tasks.push(TaskDoc {
         key: "assemble".into(), title: "実装を組み合わせて成果物を保存".into(),
-        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを開いたフォルダへ統合する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。仕様書・テスト・レビュー・確認待ちは追加しない。他Runの作業場所は使わない。".into(),
+        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを自分の統合用隔離先へ統合する。元フォルダは直接編集しない。最終反映はZaivernが現在の元フォルダとの競合を検出して実行する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。仕様書・テスト・レビュー・確認待ちは追加しない。他Runの作業場所は使わない。".into(),
         team: "implementation".into(), role: "implementer".into(), depends_on: dependencies,
-        files: vec!["**".into()], required_caps: vec![],
-        acceptance_criteria: vec!["最終成果物を本来の保存先に保存した".into()], validation_commands: vec![],
+        files: vec![format!("{root}/part-0/**")], required_caps: vec![],
+        acceptance_criteria: vec!["最終成果物を統合用の隔離先に保存した".into()], validation_commands: vec![],
     });
     Ok(PlanDoc {
         goal: GoalDoc {
@@ -1162,6 +1180,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn 新規計画は一体でも全要件を担当し統合だけを後続にする() {
+        let mut opts = super::super::runtime::RunOptions {
+            agent_count: 1,
+            ..Default::default()
+        };
+        let request = "# 実装\n- APIを書く\n- HTMLを書く\n- CSSを書く";
+        let spec = prepare_direct_request(request, &mut opts);
+        let mut inp = input(&spec);
+        inp.agent_count = opts.agent_count;
+        let p = StaticPlanner.plan(inp).unwrap();
+        assert_eq!(p.tasks.len(), 2);
+        assert!(p.tasks[0].dependencies.is_empty());
+        assert_eq!(p.tasks[1].dependencies, vec![p.tasks[0].id]);
+        assert!(p.tasks[0].description.contains("元の依頼全体を担当"));
+        assert!(p.goal.specification.ends_with(request));
+        assert!(p
+            .tasks
+            .iter()
+            .all(|t| t.role == super::super::model::TeamRole::Implementer));
+    }
+
+    #[test]
+    fn 新規計画は担当と統合を別々の隔離先へ割り当てる() {
+        let mut opts = super::super::runtime::RunOptions {
+            agent_count: 3,
+            ..Default::default()
+        };
+        let spec =
+            prepare_direct_request("# 実装\n- APIを書く\n- HTMLを書く\n- CSSを書く", &mut opts);
+        let mut inp = input(&spec);
+        inp.agent_count = opts.agent_count;
+        let p = StaticPlanner.plan(inp).unwrap();
+        let assemble = p.tasks.last().unwrap();
+        assert_eq!(assemble.key, "assemble");
+        assert!(assemble.files[0].ends_with("/part-0/**"));
+        let mut scopes = std::collections::HashSet::new();
+        for task in &p.tasks {
+            assert!(scopes.insert(super::super::task_workspace::scope(&task.files).unwrap()));
+            if task.id != assemble.id {
+                assert!(task.dependencies.is_empty());
+                assert!(assemble.dependencies.contains(&task.id));
+            }
+            assert!(task.validation_commands.is_empty());
+        }
+        assert!(scopes.len() >= 3);
+        assert!(
+            super::super::graph::validate_plan(&p.tasks, &p.goal.definition_of_done).is_empty()
+        );
+    }
+
+    #[test]
     fn 詳細要件を追加しても実行タスクが増えない() {
         for heading in ["タスク", "Tasks"] {
             let spec = format!(
@@ -1895,19 +1964,20 @@ mod tests {
         assert_eq!(lanes, vec!["implementation", "integration"]);
     }
 
-    /// **一行のゴールでも、役割ごとのチームになる。**
-    ///
-    /// 実機で「かっこいい３DのWebページを作って」と 1 行だけ入れた Run は、
-    /// 実装 1 件 + 統合 1 件の**2 タスク**にしかならず、しかも実装が
-    /// Team Lead へ渡ったので、起動した Agent 1 は最後まで仕事ゼロだった
-    /// (`state.json` の実物で確認)。既定の役割を 5 つにしたので、同じ
-    /// 1 行から設計・実装・テスト・統合が立つ。
+    /// 復元対象の旧モードは、明示的に選んだ役割を引き続き計画する。
     #[test]
-    fn 一行のゴールでも役割ごとのタスクが立つ() {
+    fn 旧モードで明示した役割ごとのタスクが立つ() {
         use super::super::model::TeamRole as R;
         let mut inp = input("かっこいい３DのWebページを作って");
-        inp.roles = super::super::panel::NewRunForm::default().roles;
-        assert_eq!(inp.roles.len(), 6, "既定は選べる 6 つ全部");
+        inp.roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
+        assert_eq!(inp.roles.len(), 6);
         let p = StaticPlanner.plan(inp).unwrap();
         for want in [
             R::Planner,
@@ -1943,7 +2013,14 @@ mod tests {
     fn 分割済みのspecは設計確定後に実装が並列で動ける() {
         use super::super::model::TeamRole as R;
         let mut inp = input(SPEC);
-        inp.roles = super::super::panel::NewRunForm::default().roles;
+        inp.roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
         let p = StaticPlanner.plan(inp).unwrap();
         let impls: Vec<&super::super::model::TeamTask> = p
             .tasks
@@ -1998,7 +2075,14 @@ mod tests {
     fn 一行のspecでは計画から順に繋ぐ() {
         use super::super::model::TeamRole as R;
         let mut inp = input("かっこいいHPを作る");
-        inp.roles = super::super::panel::NewRunForm::default().roles;
+        inp.roles = vec![
+            R::Planner,
+            R::Architect,
+            R::Implementer,
+            R::Tester,
+            R::Reviewer,
+            R::Integrator,
+        ];
         let p = StaticPlanner.plan(inp).unwrap();
         let plan = p.tasks.iter().find(|t| t.role == R::Planner).unwrap();
         let design = p.tasks.iter().find(|t| t.role == R::Architect).unwrap();

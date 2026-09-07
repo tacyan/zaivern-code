@@ -1645,7 +1645,7 @@ fn new_run_form(
             if ui
                 .add(egui::Slider::new(
                     &mut form.agents,
-                    2..=super::panel::FORM_MAX_AGENTS,
+                    1..=super::panel::FORM_MAX_AGENTS,
                 ))
                 .changed()
             {
@@ -1723,6 +1723,45 @@ fn new_run_form(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 新規フォームを描画しても一体指定と手動選択を増やさない() {
+        let theme = crate::theme::all().remove(0);
+        for touched in [false, true] {
+            for count in [1, super::super::panel::FORM_MAX_AGENTS] {
+                let ctx = egui::Context::default();
+                let mut form = NewRunForm {
+                    agents: count,
+                    composition_touched: touched,
+                    spec_text: "HTMLを作成する".into(),
+                    ..Default::default()
+                };
+                let mut actions = Vec::new();
+                for _ in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(900.0, 700.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                new_run_form(ui, &theme, &mut form, &[], &mut actions);
+                            });
+                        },
+                    );
+                    assert_eq!(form.agents, count, "描画で指定人数を変更した");
+                    assert_eq!(
+                        form.composition_touched, touched,
+                        "描画を手動変更と誤認した"
+                    );
+                }
+                assert!(actions.is_empty());
+            }
+        }
+    }
 
     /// **端末タブはサブエージェントも並べる。**
     ///

@@ -317,6 +317,9 @@ pub struct TeamRuntime {
     effect_order: VecDeque<String>,
     /// 既存の調停層。**割り当ての最終判断はここ。**
     co: Coordinator,
+    integration: Option<IntegrationHold>,
+    worker_holds: BTreeMap<TaskId, IntegrationHold>,
+    published: BTreeSet<TaskId>,
     /// 登録済みセッション。
     registered: BTreeSet<SessionId>,
     /// 保存が要るか。
@@ -893,12 +896,35 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
     }
 }
 
+// 統合候補を作るセッションが止まるまで、配送前に得た排他を保持する。
+struct IntegrationHold {
+    permit: super::integration::Permit,
+    task: TaskId,
+    session: SessionId,
+}
+
+fn isolated_assembly(task: &TeamTask) -> bool {
+    task.key == "assemble" && super::task_workspace::scope(&task.files).is_some()
+}
+
+impl Drop for TeamRuntime {
+    fn drop(&mut self) {
+        for (session, permit) in self.take_integration_for_shutdown() {
+            if let Some(handle) = crate::terminal::reaping_session(session) {
+                let _ = permit.retire(handle);
+            } else {
+                permit.release_when_writer_stops();
+            }
+        }
+    }
+}
+
 impl TeamRuntime {
     /// 計画から新しい Run を作る。
     pub fn from_plan(plan: TeamPlan, workspace: PathBuf, mut opts: RunOptions) -> Self {
         if super::planner::implementation_only(&plan.goal.specification) {
             opts.review_required = false;
-            opts.agent_count = opts.agent_count.max(2);
+            opts.agent_count = opts.agent_count.clamp(1, super::launch::MAX_AGENTS);
         } else if reviewer::requires_content_review(&plan.goal) {
             opts.review_required = true;
             opts.agent_count = opts.agent_count.max(2);
@@ -943,6 +969,9 @@ impl TeamRuntime {
             effects: BTreeMap::new(),
             effect_order: VecDeque::new(),
             co: Coordinator::new(),
+            integration: None,
+            worker_holds: BTreeMap::new(),
+            published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: true,
             snapshot_generation: 0,
@@ -1032,6 +1061,14 @@ impl TeamRuntime {
             if orphaned_reviews.contains(&t.id) {
                 t.state = TeamTaskState::Running;
                 t.dispatch_seq = t.dispatch_seq.saturating_add(1);
+            }
+            // 隔離統合は再配送前に新しい所有権を取得する。
+            if isolated_assembly(t) && t.state == TeamTaskState::Validating {
+                t.state = TeamTaskState::Ready;
+                t.assigned_agent = None;
+                t.reassign_pending = false;
+                t.validation.running = false;
+                t.review.running = false;
             }
             // セッションはどれも生き残っていない。結び付きは必ず外す。
             t.assigned_session = None;
@@ -1134,6 +1171,9 @@ impl TeamRuntime {
             effects,
             effect_order,
             co: Coordinator::new(),
+            integration: None,
+            worker_holds: BTreeMap::new(),
+            published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: false,
             snapshot_generation: 0,
@@ -1149,6 +1189,25 @@ impl TeamRuntime {
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
+        }
+        // 旧直接統合には隔離開始時の基準が無い。現在の元フォルダを
+        // 新しい基準にすると、旧コピーによる上書きを正当化してしまう。
+        if super::planner::implementation_only(&rt.goal.specification) {
+            let unsafe_assemblies: Vec<_> = rt
+                .tasks
+                .iter()
+                .filter(|t| t.key == "assemble" && !isolated_assembly(t) && !t.state.is_terminal())
+                .map(|t| t.id)
+                .collect();
+            for id in unsafe_assemblies {
+                if let Some(task) = rt.tasks.iter_mut().find(|t| t.id == id) {
+                    if !task.last_summary.is_empty() {
+                        task.context
+                            .push(format!("旧担当の報告: {}", task.last_summary));
+                    }
+                }
+                rt.submit_with_issues(id, "旧形式の統合には開始時の比較基準がありません。既存成果と担当の候補を保持し、元フォルダへの自動反映を見送りました");
+            }
         }
         rt
     }
@@ -1754,6 +1813,9 @@ impl TeamRuntime {
         let Some(t) = self.task(task).cloned() else {
             return;
         };
+        if isolated_assembly(&t) && !self.published.contains(&task) {
+            return;
+        }
         if t.state != TeamTaskState::Validating || t.validation.running {
             return;
         }
@@ -1959,6 +2021,7 @@ impl TeamRuntime {
             TeamAction::Resume => {
                 if self.run.paused {
                     self.run.paused = false;
+                    self.run.stopped = false;
                     self.goal.status = GoalStatus::Running;
                     self.log(TeamEventKind::RunResumed, None, None, "再開しました".into());
                 }
@@ -2245,6 +2308,154 @@ impl TeamRuntime {
 
     // ── 調停ループ ──
 
+    pub fn take_integration_for_shutdown(
+        &mut self,
+    ) -> Vec<(SessionId, super::integration::Permit)> {
+        let mut holds: Vec<_> = std::mem::take(&mut self.worker_holds)
+            .into_values()
+            .map(|hold| (hold.session, hold.permit))
+            .collect();
+        if let Some(hold) = self.integration.take() {
+            holds.push((hold.session, hold.permit));
+        }
+        holds
+    }
+
+    /// 配送前に実際の書き手を永続化する。アプリの強制終了も排他を解かない。
+    pub fn handoff_integration_writer(
+        &mut self,
+        task: TaskId,
+        session: SessionId,
+        pid: Option<u32>,
+    ) -> Result<(), String> {
+        let Some(task) = self.task(task) else {
+            return Err("配送先のタスクがありません".into());
+        };
+        if super::task_workspace::scope(&task.files).is_none() {
+            return Ok(());
+        }
+        let id = task.id;
+        let hold = if isolated_assembly(task) {
+            self.integration.as_mut()
+        } else {
+            self.worker_holds.get_mut(&id)
+        };
+        let Some(hold) = hold.filter(|h| h.task == id && h.session == session) else {
+            return Err("担当指示の所有権がありません".into());
+        };
+        let pid = pid
+            .filter(|p| *p != 0)
+            .ok_or("統合担当のプロセスを確認できません")?;
+        hold.permit.handoff_writer(Some(pid))
+    }
+
+    /// 配送の各段で照合する。停止中は保留、旧世代・旧担当は破棄する。
+    pub fn instruction_delivery_ready(&self, key: &str, session: SessionId) -> Option<bool> {
+        let current = self.tasks.iter().any(|t| {
+            t.assigned_session == Some(session)
+                && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+                && t.assigned_agent.as_ref().is_some_and(|agent| {
+                    instruction_key(t.id, agent, t.attempts, t.dispatch_seq) == key
+                })
+        });
+        current.then_some(!self.run.paused && !self.run.stopped)
+    }
+
+    fn settle_workers(&mut self, obs: &Observation) {
+        let finished: Vec<_> = self
+            .worker_holds
+            .iter()
+            .filter_map(|(id, hold)| {
+                let session = obs.sessions.iter().find(|s| s.id == hold.session);
+                let exited = session.is_none_or(|s| s.state == SessionState::Exited);
+                if exited {
+                    return Some(*id);
+                }
+                if self.run.stopped {
+                    return None;
+                }
+                let released_report = self.task(*id).is_some_and(|task| {
+                    !task.state.is_held() || task.state == TeamTaskState::Validating
+                });
+                (released_report && session.is_some_and(|s| coordinator::deliverable(s.state)))
+                    .then_some(*id)
+            })
+            .collect();
+        for id in finished {
+            self.worker_holds.remove(&id);
+        }
+    }
+
+    fn settle_integration(&mut self, obs: &Observation) {
+        let Some(hold) = self.integration.as_ref() else {
+            return;
+        };
+        let Some(task) = self.task(hold.task).cloned() else {
+            return;
+        };
+        let session = obs.sessions.iter().find(|s| s.id == hold.session);
+        let exited = session.is_none_or(|s| s.state == SessionState::Exited);
+        let idle = session.is_some_and(|s| coordinator::deliverable(s.state));
+        let submitted = task.state == TeamTaskState::Submitted;
+        let reported = task.state == TeamTaskState::Validating || submitted;
+        if self.run.stopped && !exited {
+            return; // Stopは終了確認ではない。Idleでも未配送の指示が残り得る。
+        }
+        // 完了JSONが出てもWorkingなら待つ。Stopボタンだけでも解放しない。
+        if !exited && !(idle && (reported || !task.state.is_held() || self.run.stopped)) {
+            return;
+        }
+        if reported && !self.run.stopped && !self.run.paused {
+            let result = super::integration::publish(&hold.permit, &self.workspace, &task.files);
+            match result {
+                Ok(outcome) => {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                        t.changed_files = outcome.changed;
+                        t.context.extend(outcome.notes);
+                    }
+                    if submitted {
+                        if !outcome.conflicts.is_empty() {
+                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                                t.blockers
+                                    .push(format!("未統合: {}", outcome.conflicts.join(", ")));
+                            }
+                        }
+                        self.dirty = true;
+                    } else if outcome.conflicts.is_empty() {
+                        self.published.insert(task.id);
+                        self.settle_validation(task.id);
+                    } else {
+                        self.submit_with_issues(
+                            task.id,
+                            &format!(
+                                "元フォルダの更新を保持しました。未統合: {}",
+                                outcome.conflicts.join(", ")
+                            ),
+                        );
+                    }
+                }
+                Err(why) => {
+                    if submitted {
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                            t.blockers.push(why);
+                        }
+                        self.dirty = true;
+                    } else {
+                        self.submit_with_issues(task.id, &why);
+                    }
+                }
+            }
+            self.integration = None; // publishの全書き込みが戻ってから解放。
+        } else if self.run.paused && !self.run.stopped && reported {
+            // Pauseは再開後に同じ候補を反映する。所有権も維持する。
+        } else {
+            self.integration = None;
+            if self.run.stopped || exited {
+                self.free_task(task.id, false);
+            }
+        }
+    }
+
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
@@ -2267,6 +2478,27 @@ impl TeamRuntime {
         let states_before: Vec<(TaskId, TeamTaskState)> =
             self.tasks.iter().map(|t| (t.id, t.state)).collect();
 
+        // 終了した端末にも最後の報告が残る。所有権や session_id を外す前に
+        // 読むことで、完了直後の自然終了を未報告の失敗として回収しない。
+        let exited: Vec<_> = obs
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.state == SessionState::Exited
+                    && !s.text.trim().is_empty()
+                    && self.agents.iter().any(|a| a.session_id == Some(s.id))
+            })
+            .cloned()
+            .collect();
+        if !exited.is_empty() {
+            self.harvest(&Observation {
+                now: obs.now,
+                sessions: exited,
+            });
+        }
+        // 消滅した担当を回収する前に、前tickの報告と今回の停止観測を照合する。
+        self.settle_workers(obs);
+        self.settle_integration(obs);
         // 1) 観測 — セッションの状態をエージェントへ写す。
         self.sync_sessions(obs);
 
@@ -2451,7 +2683,7 @@ impl TeamRuntime {
                 continue;
             };
             match live.get(&sid) {
-                Some(s) => {
+                Some(s) if s.state != SessionState::Exited => {
                     if a.provider != s.provider {
                         a.provider = s.provider.clone();
                         snapshot_changed = true;
@@ -2530,7 +2762,12 @@ impl TeamRuntime {
                         }
                     }
                 }
-                None => {
+                ended => {
+                    // 終了済みタブは表示に残っても再利用できない。明示的な
+                    // 終了観測では復元用の目印も捨て、旧 PTY を採用し直さない。
+                    if ended.is_some() {
+                        a.session_identity = None;
+                    }
                     // セッションが消えた。**担当を勝手に配り直さない**
                     // (前任者の停止確認は下の release_dead が既存側へ通す)。
                     a.session_id = None;
@@ -4401,6 +4638,51 @@ impl TeamRuntime {
             let Some(task) = self.tasks.iter().find(|t| t.id == a.task).cloned() else {
                 continue;
             };
+            if isolated_assembly(&task) {
+                // 既存の所有者が停止するまで、同じRunにも再配送しない。
+                if self.integration.is_some() || !self.worker_holds.is_empty() {
+                    continue;
+                }
+                match super::integration::try_acquire(&self.workspace, &self.run.run_id) {
+                    Ok(Some(permit)) => {
+                        self.integration = Some(IntegrationHold {
+                            permit,
+                            task: task.id,
+                            session: a.session,
+                        });
+                    }
+                    Ok(None) => continue,
+                    Err(why) => {
+                        self.submit_with_issues(task.id, &why);
+                        continue;
+                    }
+                }
+            } else if super::task_workspace::scope(&task.files).is_some() {
+                if self.worker_holds.contains_key(&task.id) {
+                    continue;
+                }
+                match super::integration::try_acquire_task(
+                    &self.workspace,
+                    &task.files,
+                    &self.run.run_id,
+                ) {
+                    Ok(Some(permit)) => {
+                        self.worker_holds.insert(
+                            task.id,
+                            IntegrationHold {
+                                permit,
+                                task: task.id,
+                                session: a.session,
+                            },
+                        );
+                    }
+                    Ok(None) => continue,
+                    Err(why) => {
+                        self.submit_with_issues(task.id, &why);
+                        continue;
+                    }
+                }
+            }
             let coord_id = match task.coordinator_task {
                 Some(id) => id,
                 None => {
@@ -4492,6 +4774,11 @@ impl TeamRuntime {
                     self.dirty = true;
                 }
                 Err(refusal) => {
+                    if isolated_assembly(&task) {
+                        self.integration = None; // まだ配送していない。
+                    } else {
+                        self.worker_holds.remove(&task.id); // まだ配送していない。
+                    }
                     // 既存側が断った。**回避しない。**
                     //
                     // ただし**同じ理由を毎 tick 書かない**。断りは配置から
@@ -5700,14 +5987,14 @@ mod stale_report_tests {
         rt.tasks.truncate(1);
         rt.goal.specification = "SKILL.md を作成".into();
         let plan = TeamPlan {
-            goal: rt.goal,
-            teams: rt.teams,
-            tasks: rt.tasks,
+            goal: rt.goal.clone(),
+            teams: rt.teams.clone(),
+            tasks: rt.tasks.clone(),
         };
         let mut opts = RunOptions::default();
         opts.review_required = false;
         opts.agent_count = 1;
-        let mut rt = TeamRuntime::from_plan(plan, rt.workspace, opts);
+        let mut rt = TeamRuntime::from_plan(plan, rt.workspace.clone(), opts);
         assert!(rt.run.review_required);
         assert!(rt.run.agent_count >= 2);
         assert!(
@@ -6703,5 +6990,379 @@ mod seen_key_tests {
             "再送が二重に適用された"
         );
         test_hooks::clear();
+    }
+}
+
+#[cfg(test)]
+#[path = "integration_runtime_tests.rs"]
+mod integration_runtime_tests;
+
+#[cfg(test)]
+mod worker_ownership_tests {
+    use super::super::planner::{PlanInput, StaticPlanner, TeamPlanner, IMPLEMENTATION_ONLY};
+    use super::*;
+
+    struct Case {
+        root: PathBuf,
+        rt: TeamRuntime,
+        sessions: Vec<SessionObs>,
+    }
+    impl Case {
+        fn new() -> Self {
+            let root = crate::test_util::unique_temp_dir("zai-worker-lease", "runtime");
+            std::fs::create_dir_all(&root).unwrap();
+            let plan = StaticPlanner
+                .plan(PlanInput {
+                    spec: format!("{IMPLEMENTATION_ONLY}\n成果物を実装する"),
+                    source: "request".into(),
+                    agent_count: 2,
+                    review_required: false,
+                    workspace_root: root.clone(),
+                    roles: vec![TeamRole::Implementer],
+                })
+                .unwrap();
+            super::super::task_workspace::prepare(&root, &plan.tasks).unwrap();
+            let mut rt = TeamRuntime::from_plan(
+                plan,
+                root.clone(),
+                RunOptions {
+                    run_id: new_run_id(),
+                    agent_count: 2,
+                    review_required: false,
+                    ..RunOptions::default()
+                },
+            );
+            rt.set_outbox(root.join("outbox"));
+            rt.apply_action(TeamAction::Start);
+            Self {
+                root,
+                rt,
+                sessions: Vec::new(),
+            }
+        }
+        fn bind(&mut self) {
+            let effects = self.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: self.sessions.clone(),
+            });
+            for effect in effects {
+                if let TeamEffect::StartAgent(spec) = &effect {
+                    let id = self.sessions.len() as u64 + 1;
+                    self.rt.bind_session(&spec.agent_id, id, None);
+                    self.rt.note_effect_done(&effect.key());
+                    self.sessions.push(SessionObs {
+                        id,
+                        title: "fake".into(),
+                        provider: "fake".into(),
+                        state: SessionState::Idle,
+                        text: String::new(),
+                    });
+                }
+            }
+        }
+        fn tick(&mut self, state: SessionState) -> Vec<TaskId> {
+            for s in &mut self.sessions {
+                s.state = state;
+            }
+            let effects = self.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: self.sessions.clone(),
+            });
+            let mut assigned = Vec::new();
+            for effect in effects {
+                if let TeamEffect::SendInstruction {
+                    task, session, key, ..
+                } = effect
+                {
+                    self.rt
+                        .handoff_integration_writer(task, session, Some(std::process::id()))
+                        .unwrap();
+                    self.rt.note_effect_done(&key);
+                    assigned.push(task);
+                }
+            }
+            assigned
+        }
+        fn locked(&self, task: TaskId) -> bool {
+            super::super::integration::try_acquire_task(
+                &self.root,
+                &self.rt.task(task).unwrap().files,
+                "observer",
+            )
+            .unwrap()
+            .is_none()
+        }
+    }
+    impl Drop for Case {
+        fn drop(&mut self) {
+            drop(self.rt.take_integration_for_shutdown());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn 実装報告後も書込中の担当がいれば統合を配送しない() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        for id in &tasks {
+            let task = c.rt.task(*id).unwrap().clone();
+            let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            std::fs::write(work.join("output.txt"), format!("worker {id}")).unwrap();
+            let agent = task.assigned_agent.unwrap();
+            let report = serde_json::json!({"task_id": id, "agent_id": agent.to_string(), "status": "completed", "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/output.txt")], "validation": [], "blockers": []}).to_string();
+            assert_eq!(
+                c.rt.accept_outbox(
+                    &agent,
+                    super::super::outbox::Kind::Result,
+                    &report,
+                    now_secs()
+                )
+                .unwrap(),
+                AcceptOutcome::Applied
+            );
+        }
+        assert!(c.tick(SessionState::Working).is_empty());
+        for id in &tasks {
+            assert!(c.locked(*id));
+        }
+        let assembly = c.tick(SessionState::Idle);
+        assert_eq!(assembly.len(), 1);
+        assert_eq!(c.rt.task(assembly[0]).unwrap().key, "assemble");
+        for id in tasks {
+            assert!(!c.locked(id));
+        }
+    }
+
+    #[test]
+    fn 停止操作だけでは実装担当の所有権を解放しない() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        c.rt.apply_action(TeamAction::Stop);
+        assert!(c.tick(SessionState::Idle).is_empty());
+        for id in &tasks {
+            assert!(c.locked(*id));
+        }
+        c.sessions.clear();
+        c.tick(SessionState::Exited);
+        for id in tasks {
+            assert!(!c.locked(id));
+        }
+    }
+
+    #[test]
+    fn 復元したrunは旧実装担当が所有中の同じ隔離先へ配送しない() {
+        let mut old = Case::new();
+        old.bind();
+        let tasks = old.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        let rt = TeamRuntime::restore(old.rt.to_saved(), old.root.clone());
+        let mut restored = Case {
+            root: old.root.clone(),
+            rt,
+            sessions: Vec::new(),
+        };
+        restored.bind();
+        assert!(restored.tick(SessionState::Idle).is_empty());
+        drop(old.rt.take_integration_for_shutdown()); // Controlled old-writer termination.
+        assert_eq!(restored.tick(SessionState::Idle).len(), 2);
+    }
+
+    #[test]
+    fn runを破棄しても実writerが終了するまで担当の所有権を保持する() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let ready = c.root.join("child-ready");
+        let module = module_path!().split_once("::").unwrap().1;
+        let team = module.split("::runtime::").next().unwrap();
+        let probe = format!("{team}::integration::tests::writer_process_probe");
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &probe, "--nocapture"])
+                .env("ZAI_INTEGRATION_WRITER_PROBE", &ready)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writerが起動しなかった"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for id in &tasks {
+            let session = c.rt.task(*id).unwrap().assigned_session.unwrap();
+            c.rt.handoff_integration_writer(*id, session, Some(child.0.id()))
+                .unwrap();
+        }
+        let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
+        drop(std::mem::replace(&mut c.rt, replacement));
+        for id in &tasks {
+            assert!(c.locked(*id), "Run dropだけで旧writerから所有権を奪った");
+        }
+        drop(child.0.stdin.take());
+        child.0.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tasks.iter().any(|id| c.locked(*id)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "実終了後に所有権を返さなかった"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn 終了タブが残っても最終報告を受理して未完了担当を起動し直す() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        let complete = c.rt.task(tasks[0]).unwrap().clone();
+        let incomplete = c.rt.task(tasks[1]).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &complete.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("output.txt"), "completed output").unwrap();
+        let agent = complete.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({
+            "task_id": complete.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/output.txt")],
+            "validation": [], "blockers": []
+        })
+        .to_string();
+        for session in &mut c.sessions {
+            session.state = SessionState::Exited;
+            if Some(session.id) == complete.assigned_session {
+                session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+            }
+        }
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert_eq!(
+            c.rt.task(complete.id).unwrap().state,
+            TeamTaskState::Completed
+        );
+        let uncompleted = c.rt.task(incomplete.id).unwrap();
+        assert_eq!(uncompleted.state, TeamTaskState::Ready);
+        assert!(uncompleted.assigned_session.is_none());
+        assert_eq!(uncompleted.attempts, incomplete.attempts + 1);
+        let launches: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                TeamEffect::StartAgent(spec) => Some((spec.clone(), effect.key())),
+                _ => None,
+            })
+            .collect();
+        assert!(!launches.is_empty(), "終了タブを生存扱いせず後任を起動する");
+        let old_sessions: Vec<_> = c.sessions.iter().map(|s| s.id).collect();
+        for (index, (spec, key)) in launches.into_iter().enumerate() {
+            let id = 100 + index as u64;
+            c.rt.bind_session(&spec.agent_id, id, None);
+            c.rt.note_effect_done(&key);
+            c.sessions.push(SessionObs {
+                id,
+                title: "replacement".into(),
+                provider: "fake".into(),
+                state: SessionState::Idle,
+                text: String::new(),
+            });
+        }
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert!(effects.iter().any(|effect| matches!(effect,
+            TeamEffect::SendInstruction { task, session, .. }
+                if *task == incomplete.id && !old_sessions.contains(session))));
+        assert_eq!(
+            c.rt.task(complete.id).unwrap().state,
+            TeamTaskState::Completed
+        );
+
+        // 後任の完了から統合へ進め、統合担当も最終報告と同時に終了する。
+        for effect in effects {
+            if let TeamEffect::SendInstruction {
+                task, session, key, ..
+            } = effect
+            {
+                c.rt.handoff_integration_writer(task, session, Some(std::process::id()))
+                    .unwrap();
+                c.rt.note_effect_done(&key);
+            }
+        }
+        let task = c.rt.task(incomplete.id).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("second.txt"), "second output").unwrap();
+        let agent = task.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({"task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/second.txt")], "validation": [], "blockers": []}).to_string();
+        c.rt.accept_outbox(
+            agent,
+            super::super::outbox::Kind::Result,
+            &report,
+            now_secs(),
+        )
+        .unwrap();
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        let assembly = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                TeamEffect::SendInstruction {
+                    task, session, key, ..
+                } if c.rt.task(task).is_some_and(|t| t.key == "assemble") => {
+                    Some((task, session, key))
+                }
+                _ => None,
+            })
+            .expect("後任の完了後に統合へ進む");
+        c.rt.handoff_integration_writer(assembly.0, assembly.1, Some(std::process::id()))
+            .unwrap();
+        c.rt.note_effect_done(&assembly.2);
+        let task = c.rt.task(assembly.0).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("final.txt"), "final output").unwrap();
+        let agent = task.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({"task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "統合成果を保存した", "changed_files": [format!("{prefix}/final.txt")], "validation": [], "blockers": []}).to_string();
+        let session = c.sessions.iter_mut().find(|s| s.id == assembly.1).unwrap();
+        session.state = SessionState::Exited;
+        session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+        c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(c.rt.goal().status, GoalStatus::Completed);
+        assert_eq!(
+            std::fs::read(c.root.join("final.txt")).unwrap(),
+            b"final output"
+        );
     }
 }

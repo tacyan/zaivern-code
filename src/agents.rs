@@ -2219,13 +2219,6 @@ impl AgentManager {
         Some(removed)
     }
 
-    #[cfg(test)]
-    pub fn remove(&mut self, i: usize) {
-        if let Some(session) = self.take_removed(i) {
-            crate::terminal::reap(session);
-        }
-    }
-
     /// Team RunのClose用。削除完了を待つ側へreaperの札を返す。
     pub fn remove_tracked(&mut self, i: usize) -> Option<crate::terminal::ReapHandle> {
         self.take_removed(i).map(crate::terminal::reap_tracked)
@@ -5153,10 +5146,10 @@ mod tests {
             m
         }
 
-        /// app.rs の閉じる経路と同じ。`remove` が終了と後始末まで持っていくので
+        /// app.rs の閉じる経路と同じ。`remove_tracked` が終了と後始末まで持っていくので
         /// (crate::terminal::reap)、呼び出し側は index を渡すだけでよい。
         fn close(m: &mut AgentManager, i: usize) {
-            m.remove(i);
+            let _ = m.remove_tracked(i);
         }
 
         fn kill_all(m: &mut AgentManager) {

@@ -48,6 +48,7 @@ pub mod cli;
 pub mod gitinit;
 pub mod graph;
 pub mod inspector;
+pub mod integration;
 pub mod launch;
 pub mod model;
 pub mod organization_board;

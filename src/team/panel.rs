@@ -238,7 +238,7 @@ pub struct NewRunForm {
 /// フォームのスライダの上限 = おすすめが出せる体の数の上限。
 /// **2 か所に数を書かない** — スライダとおすすめが別の上限を持つと、
 /// 「おすすめは 20 体なのにスライダは 16 まで」のような嘘が出る。
-pub const FORM_MAX_AGENTS: usize = 16;
+pub const FORM_MAX_AGENTS: usize = super::launch::MAX_AGENTS;
 
 impl Default for NewRunForm {
     fn default() -> Self {
@@ -754,23 +754,6 @@ impl TeamPanel {
             },
             Err(why) => DraftState::Failed { why },
         };
-    }
-
-    /// 下書きを採用する (SPEC は直接入力へ移す)。**採用は人が決める。**
-    #[cfg(test)]
-    pub fn accept_draft(&mut self) {
-        if let DraftState::Ready { text, .. } = std::mem::take(&mut self.form.draft) {
-            self.form.spec_text = text;
-            self.form.from_file = false;
-            self.form.error.clear();
-        }
-    }
-
-    /// 下書きを捨てる (元の指示のまま進む / やり直す)。
-    #[cfg(test)]
-    pub fn discard_draft(&mut self) {
-        self.form.draft = DraftState::Idle;
-        self.draft_rx = None;
     }
 
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
@@ -1629,7 +1612,27 @@ impl TeamPanel {
     }
 
     /// 1 tick 進める。**描画の外で呼ぶこと。**
-    pub fn pump(&mut self, obs: Observation) {
+    pub fn pump(&mut self, mut obs: Observation) {
+        // A terminal removed from the tab list can still be reaping its process
+        // tree. Preserve that observation until the actual completion fence.
+        for (id, handle) in crate::terminal::reaping_sessions() {
+            if !handle.is_finished() && !obs.sessions.iter().any(|s| s.id == id) {
+                let provider = self
+                    .runs
+                    .iter()
+                    .flat_map(|rt| rt.agents())
+                    .find(|agent| agent.session_id == Some(id))
+                    .map(|agent| agent.provider.clone())
+                    .unwrap_or_default();
+                obs.sessions.push(super::runtime::SessionObs {
+                    id,
+                    title: String::new(),
+                    provider,
+                    state: crate::coordinator::SessionState::Working,
+                    text: String::new(),
+                });
+            }
+        }
         if self.read_only {
             return;
         }
@@ -2492,6 +2495,28 @@ impl TeamPanel {
     /// 仕事を渡すので、`owner()` で目印を作ると **2 本目の Run の配達に
     /// 1 本目の名札が付く**。名札が違えば結末は捨てられ、担当は `running`
     /// のまま残る (実機で 6 体中 2 体が 28 分放置された形)。
+    pub fn delivery_ready(&self, tag: &str, session: SessionId) -> Option<bool> {
+        let (run, key) = tag.split_once('|')?;
+        let rt = self.runs.get(self.run_pos_of(run)?)?;
+        if key.starts_with("manual:") {
+            return Some(!rt.is_stopped());
+        }
+        rt.instruction_delivery_ready(key, session)
+    }
+
+    pub fn handoff_integration_writer(
+        &mut self,
+        owner: &RunOwner,
+        task: TaskId,
+        session: SessionId,
+        pid: Option<u32>,
+    ) -> Result<(), String> {
+        let index = self
+            .run_pos_of_owner(owner)
+            .ok_or("配送先のRunがありません")?;
+        self.runs[index].handoff_integration_writer(task, session, pid)
+    }
+
     pub fn delivery_tag(&self, owner: &RunOwner, key: &str) -> Option<String> {
         self.run_pos_of_owner(owner)?;
         Some(format!("{}|{key}", owner.run_id))
@@ -2613,7 +2638,26 @@ impl TeamPanel {
     /// 復元するので、まだ読んでいない報告を消すと復元後に届かない。
     /// 置き場を消すのは Run を閉じる ([`Self::close_run`]) か捨てる
     /// ([`Self::discard_run`]) ときだけ。
+    /// Extract integration custody before destroying the runtime. Reapers that
+    /// already own a removed terminal retain its permit until confirmed shutdown.
+    pub fn take_shutdown_integrations(&mut self) -> Vec<(SessionId, super::integration::Permit)> {
+        let mut remaining = Vec::new();
+        for rt in &mut self.runs {
+            for (session, permit) in rt.take_integration_for_shutdown() {
+                if let Some(handle) = crate::terminal::reaping_session(session) {
+                    if let Err(why) = permit.retire(handle) {
+                        self.notice = why;
+                    }
+                } else {
+                    remaining.push((session, permit));
+                }
+            }
+        }
+        remaining
+    }
+
     pub fn shutdown(&mut self) -> usize {
+        // Runtime::drop retains any remaining custody until the writer stops.
         let killed = self.stop_all_validations_now();
         self.pending_launches.clear();
         self.pending_instructions.clear();
@@ -4335,26 +4379,15 @@ mod tests {
     }
 
     #[test]
-    fn フォームの初期値は仕様どおり() {
+    fn フォームの初期値は直接実装を選ぶ() {
         let f = NewRunForm::default();
         assert_eq!(f.agents, 4);
         assert_eq!(f.max_attempts, 3);
-        assert!(f.review_required);
+        assert!(!f.review_required);
         assert_eq!(f.approval_mode, "ask");
-        assert!(!f.composition_touched, "開いた直後は手で変えていない");
-        // 既定のプリセットは実装 + レビュー
-        assert_eq!(
-            f.roles,
-            vec![
-                TeamRole::Planner,
-                TeamRole::Architect,
-                TeamRole::Implementer,
-                TeamRole::Tester,
-                TeamRole::Reviewer,
-                TeamRole::Integrator,
-            ],
-            "既定は選べる 6 つ全部 (2 つだとチームとして分担しない)"
-        );
+        assert!(!f.composition_touched);
+        assert_eq!(f.roles, vec![TeamRole::Implementer]);
+        assert_eq!(FORM_MAX_AGENTS, super::super::launch::MAX_AGENTS);
     }
 
     #[test]

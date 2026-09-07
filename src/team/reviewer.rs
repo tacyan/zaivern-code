@@ -25,13 +25,19 @@ use super::result_parser::{ARRAY_MAX, BLOCK_MAX_BYTES};
 /// 新しい成果物契約を持つ依頼は形式に関係なく内容レビューを要求する。
 /// 旧スキル計画も互換性のため対象に含める。
 pub fn requires_content_review(goal: &super::model::TeamGoal) -> bool {
-    if goal.specification.contains(super::acceptance::OPEN) { return true; }
+    if goal.specification.contains(super::acceptance::OPEN) {
+        return true;
+    }
     let text = format!("{}\n{}", goal.title, goal.specification).to_lowercase();
     text.contains("skill.md") || text.contains("skills") || text.contains("スキル")
 }
 
-pub const QUALITY_CRITERIA: [&str; 5] = [
-    "requirements", "truthfulness", "deliverables", "reproducibility", "scope",
+pub const QUALITY_CRITERIA: &[&str] = &[
+    "requirements",
+    "truthfulness",
+    "deliverables",
+    "reproducibility",
+    "scope",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,41 +51,77 @@ pub struct QualityCheck {
 
 /// JSON の自己宣言だけでは承認しない。根拠を実際のファイルと照合する。
 /// 意味上の適否は別担当が判定し、アプリは証拠の存在と報告の充足を検証する。
-pub fn validate_quality(review: &AcceptedReview, workspace: &std::path::Path) -> Result<(), String> {
+pub fn validate_quality(
+    review: &AcceptedReview,
+    workspace: &std::path::Path,
+) -> Result<(), String> {
     use std::io::Read;
-    if review.verdict != ReviewVerdict::Approve { return Ok(()); }
+    if review.verdict != ReviewVerdict::Approve {
+        return Ok(());
+    }
     if !review.findings.is_empty() {
         return Err("指摘が残るため REQUEST_CHANGES で修正を依頼してください".into());
     }
-    let root = workspace.canonicalize().map_err(|e| format!("作業フォルダを確認できません: {e}"))?;
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| format!("作業フォルダを確認できません: {e}"))?;
     // 同じ資料を複数観点で読む場合も I/O は一度だけ。メモリと読み取り量を制限。
     let mut files = std::collections::HashMap::new();
-    for criterion in QUALITY_CRITERIA {
+    for &criterion in QUALITY_CRITERIA {
         let check = review.quality_checks.iter().find(|c| c.criterion == criterion)
             .ok_or_else(|| format!("quality_checks に {criterion} の検証が必要です。source_path, excerpt, expected, actual を実物に基づき報告してください"))?;
-        if check.excerpt.trim().len() < 12 || check.expected.trim().is_empty() || check.actual.trim().is_empty() {
-            return Err(format!("{criterion}: 根拠の引用・期待結果・観測結果を具体的に記載してください"));
+        if check.excerpt.trim().len() < 12
+            || check.expected.trim().is_empty()
+            || check.actual.trim().is_empty()
+        {
+            return Err(format!(
+                "{criterion}: 根拠の引用・期待結果・観測結果を具体的に記載してください"
+            ));
         }
         let relative = std::path::Path::new(&check.source_path);
-        if relative.as_os_str().is_empty() || relative.is_absolute()
-            || relative.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-            return Err(format!("{criterion}: source_path は作業フォルダ内の相対パスにしてください"));
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "{criterion}: source_path は作業フォルダ内の相対パスにしてください"
+            ));
         }
-        let path = root.join(relative).canonicalize().map_err(|_| format!("{criterion}: 根拠ファイル {} がありません", check.source_path))?;
-        if !path.starts_with(&root) { return Err(format!("{criterion}: 作業フォルダ外の根拠は使用できません")); }
-        if !path.is_file() { return Err("根拠は通常のテキストファイルにしてください".into()); }
+        let path = root.join(relative).canonicalize().map_err(|_| {
+            format!(
+                "{criterion}: 根拠ファイル {} がありません",
+                check.source_path
+            )
+        })?;
+        if !path.starts_with(&root) {
+            return Err(format!("{criterion}: 作業フォルダ外の根拠は使用できません"));
+        }
+        if !path.is_file() {
+            return Err("根拠は通常のテキストファイルにしてください".into());
+        }
         if !files.contains_key(&path) {
             let file = std::fs::File::open(&path).map_err(|e| format!("根拠を読めません: {e}"))?;
             let meta = file.metadata().map_err(|e| e.to_string())?;
             const LIMIT: u64 = 1024 * 1024;
-            if !meta.is_file() || meta.len() > LIMIT { return Err("根拠は1MiB以下のテキストファイルにしてください".into()); }
+            if !meta.is_file() || meta.len() > LIMIT {
+                return Err("根拠は1MiB以下のテキストファイルにしてください".into());
+            }
             let mut text = String::new();
-            file.take(LIMIT + 1).read_to_string(&mut text).map_err(|e| format!("根拠を読めません: {e}"))?;
-            if text.len() as u64 > LIMIT { return Err("根拠ファイルが大きすぎます".into()); }
+            file.take(LIMIT + 1)
+                .read_to_string(&mut text)
+                .map_err(|e| format!("根拠を読めません: {e}"))?;
+            if text.len() as u64 > LIMIT {
+                return Err("根拠ファイルが大きすぎます".into());
+            }
             files.insert(path.clone(), text);
         }
         if !files[&path].contains(check.excerpt.trim()) {
-            return Err(format!("{criterion}: 引用が {} の実際の内容と一致しません", check.source_path));
+            return Err(format!(
+                "{criterion}: 引用が {} の実際の内容と一致しません",
+                check.source_path
+            ));
         }
     }
     Ok(())
@@ -209,10 +251,16 @@ mod tests {
         let excerpt = "入力価格を全出力に反映。実績は架空例と明示。";
         std::fs::write(dir.join("SKILL.md"), excerpt).unwrap();
         let mut review = parse_review(r#"{"task_id":1,"verdict":"APPROVE"}"#, 1).unwrap();
-        review.quality_checks = QUALITY_CRITERIA.iter().map(|c| QualityCheck {
-            criterion: c.to_string(), source_path: "SKILL.md".into(), excerpt: excerpt.into(),
-            expected: "要件に沿うこと".into(), actual: "入力価格2種類と不足入力を確認した".into(),
-        }).collect();
+        review.quality_checks = QUALITY_CRITERIA
+            .iter()
+            .map(|c| QualityCheck {
+                criterion: c.to_string(),
+                source_path: "SKILL.md".into(),
+                excerpt: excerpt.into(),
+                expected: "要件に沿うこと".into(),
+                actual: "入力価格2種類と不足入力を確認した".into(),
+            })
+            .collect();
         (dir, review)
     }
 
@@ -228,10 +276,14 @@ mod tests {
     fn 自己申告だけの承認と不足観点を拒否する() {
         let (dir, mut review) = quality_fixture();
         review.quality_checks.clear();
-        assert!(validate_quality(&review, &dir).unwrap_err().contains("requirements"));
+        assert!(validate_quality(&review, &dir)
+            .unwrap_err()
+            .contains("requirements"));
         let (_, mut review) = quality_fixture();
         review.quality_checks.pop();
-        assert!(validate_quality(&review, &dir).unwrap_err().contains("scope"));
+        assert!(validate_quality(&review, &dir)
+            .unwrap_err()
+            .contains("scope"));
     }
 
     #[test]
@@ -243,7 +295,9 @@ mod tests {
         review.quality_checks[0].excerpt = "実際には書かれていない売上の根拠".into();
         assert!(validate_quality(&review, &dir).is_err());
         let (_, mut review) = quality_fixture();
-        review.findings.push("出力例が3件必要だが2件しかない".into());
+        review
+            .findings
+            .push("出力例が3件必要だが2件しかない".into());
         assert!(validate_quality(&review, &dir).is_err());
         review.verdict = ReviewVerdict::RequestChanges;
         assert!(validate_quality(&review, &dir).is_ok());
@@ -252,7 +306,10 @@ mod tests {
     #[test]
     fn 根拠パスの逸脱と巨大ファイルを拒否する() {
         let (dir, mut review) = quality_fixture();
-        for path in ["../SKILL.md".to_string(), dir.join("SKILL.md").display().to_string()] {
+        for path in [
+            "../SKILL.md".to_string(),
+            dir.join("SKILL.md").display().to_string(),
+        ] {
             review.quality_checks[0].source_path = path;
             assert!(validate_quality(&review, &dir).is_err());
         }

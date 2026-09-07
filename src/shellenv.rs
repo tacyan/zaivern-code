@@ -55,8 +55,18 @@ const SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// UI スレッドから初めて呼ぶと最大その時間だけ止まるので、起動直後に
 /// [`warm_up`] でワーカースレッドから温めておくこと。
 pub fn user_path() -> &'static OsStr {
-    static CACHE: OnceLock<OsString> = OnceLock::new();
-    CACHE.get_or_init(resolve_path).as_os_str()
+    USER_PATH.get_or_init(resolve_path).as_os_str()
+}
+
+static USER_PATH: OnceLock<OsString> = OnceLock::new();
+
+/// 隔離した子テストプロセスで、OS から解決された PATH の代わりを注入する。
+/// 初期化後の書換えは許さず、通常の PATH 解決処理には影響しない。
+#[cfg(test)]
+pub(crate) fn initialize_test_user_path(path: OsString) {
+    USER_PATH
+        .set(path)
+        .expect("test PATH must precede resolver initialization");
 }
 
 /// PATH の解決をバックグラウンドで済ませておく (結果は [`user_path`] が使い回す)。

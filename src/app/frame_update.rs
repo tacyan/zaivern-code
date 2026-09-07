@@ -101,12 +101,32 @@ impl eframe::App for ZaivernApp {
         // 状態は `thread_local!` に居てアプリより長生きするので、保存して
         // から手放す (次回は保存経路から入り直す — そこで死んだセッションの
         // 結び付きが必ず外れる)。
+        let mut integration =
+            crate::features::team::imp::panel::with_panel(|p| p.take_shutdown_integrations());
+        for s in std::mem::take(&mut self.agents.sessions) {
+            let mut permits = Vec::new();
+            while let Some(index) = integration.iter().position(|(id, _)| *id == s.id) {
+                let (_, mut permit) = integration.swap_remove(index);
+                // Persist writer liveness before the independent killer starts.
+                let _ = permit.handoff_writer(s.live_process_id());
+                permits.push(permit);
+            }
+            if !permits.is_empty() {
+                let handle = crate::terminal::abandon_tracked(s);
+                for permit in permits {
+                    permit.release_after(handle.clone());
+                }
+            } else {
+                crate::terminal::abandon(s);
+            }
+        }
+        for (_, permit) in integration {
+            // Removed terminals can still have a live writer after Run discard.
+            permit.release_when_writer_stops();
+        }
         crate::features::team::imp::panel::with_panel(|p| {
             p.shutdown();
         });
-        for s in std::mem::take(&mut self.agents.sessions) {
-            crate::terminal::abandon(s);
-        }
     }
 }
 

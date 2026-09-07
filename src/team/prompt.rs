@@ -519,15 +519,16 @@ pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
                 .unwrap_or(&b.goal.specification)
         );
         let assignment = format!(
-            "作業フォルダ: {}\n担当 #{}: {}\n編集範囲:\n{}\n編集禁止:\n{}\n",
+            "元フォルダ（参照用）: {}\n担当 #{}: {}\n{}\n編集範囲:\n{}\n編集禁止:\n{}\n",
             b.workspace_root,
             b.task.id,
-            format!("{}\n{}", b.task.title, b.task.description),
+            b.task.title,
+            b.task.description,
             bullets(&b.task.files),
             bullets(&b.forbidden_files)
         );
         let isolation = match super::task_workspace::execution(std::path::Path::new(b.workspace_root), &b.task.files) {
-            Ok(Some((workspace, prefix, git))) => format!("\n実装用cwd: {}。{}。各ツールはこのディレクトリをcwdとして実行する。changed_filesは元フォルダ基準で {prefix}/ を先頭につける。変更・削除したファイルを要約に列挙し、作業用コピー全体を成果物として申告しない。\n", workspace.display(), if git { "隔離Gitワークツリーで直接実装する" } else { "Gitなしの独立コピーで直接実装する。Gitコマンドは不要" }),
+            Ok(Some((workspace, prefix, git))) => format!("\n実装用cwd: {}。{}。各ツールはこのディレクトリをcwdとして実行し、実装担当も統合担当も元フォルダには書き込まない。統合担当は他担当の変更だけを自分の隔離先へ取り込み、元フォルダへの反映はZaivernに任せる。changed_filesは元フォルダ基準で {prefix}/ を先頭につける。変更・削除したファイルを要約に列挙し、作業用コピー全体を成果物として申告しない。\n", workspace.display(), if git { "隔離Gitワークツリーで直接実装する" } else { "Gitなしの独立コピーで直接実装する。Gitコマンドは不要" }),
             _ => String::new(),
         };
         let assignment = format!("{assignment}{isolation}{DELIVERY_QUALITY}");
@@ -582,7 +583,7 @@ mod tests {
             workspace_root: "<ワークスペース>",
             upstream: vec!["#1 の成果: API の骨格".into()],
             forbidden_files: vec!["src/other/**".into()],
-            outbox: std::path::PathBuf::from("/tmp/zv-outbox"),
+            outbox: std::env::temp_dir().join("zv-outbox"),
             run_id: "run-1712345678-1-0",
             teammates: vec![("reviewer-1".into(), "Reviewer".into())],
         }
@@ -641,7 +642,24 @@ mod tests {
             integrator(&b, std::slice::from_ref(&t)),
         ] {
             assert!(p.len() <= PROMPT_MAX_BYTES);
-            assert!(p.contains("/tmp/zv-outbox/execution-context.md"));
+            assert!(p.contains(
+                b.outbox
+                    .join("execution-context.md")
+                    .to_string_lossy()
+                    .as_ref()
+            ));
+            let (open, close) = if p.contains(super::super::reviewer::REVIEW_OPEN) {
+                (
+                    super::super::reviewer::REVIEW_OPEN,
+                    super::super::reviewer::REVIEW_CLOSE,
+                )
+            } else {
+                (
+                    super::super::result_parser::RESULT_OPEN,
+                    super::super::result_parser::RESULT_CLOSE,
+                )
+            };
+            assert!(p.contains(open) && p.contains(close));
             assert!(p.contains("担当タスク ID: 1"));
             assert!(p.contains("execution_policy"));
             assert!(p.contains("権限拒否時は迂回・昇格せず"));
@@ -948,7 +966,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} の長い可変本文が切り詰められていない"));
             let completion = if super::super::roles::is_review_task(&assigned) {
                 assert!(text.contains(super::super::reviewer::REVIEW_CLOSE));
-                for criterion in super::super::reviewer::QUALITY_CRITERIA {
+                for &criterion in super::super::reviewer::QUALITY_CRITERIA {
                     assert!(text.contains(criterion));
                 }
                 text.find(super::super::reviewer::REVIEW_OPEN)

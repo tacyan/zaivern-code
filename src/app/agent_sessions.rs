@@ -575,6 +575,18 @@ impl ZaivernApp {
         let mut delivery_turn = submit::DeliveryTurn::default();
         queue.retain_mut(|p| {
             let sid = p.job.session;
+            if let Some(tag) = p.job.tag.as_deref() {
+                match crate::features::team::imp::panel::with_panel(|panel| {
+                    panel.delivery_ready(tag, sid)
+                }) {
+                    None => return false, // 旧Run・旧世代には本文も確定キーも送らない。
+                    Some(false) => {
+                        next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
+                        return true;
+                    }
+                    Some(true) => {}
+                }
+            }
             if !delivery_turn.enter(sid) {
                 next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
                 return true;

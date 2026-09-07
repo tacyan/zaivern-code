@@ -1,5 +1,8 @@
 # === Rust / Cargo ===
 /target/
+# ツールチェーン・検証用に分離したルートの Cargo 出力
+/target-msrv/
+/target-verify/
 # ベンダリングしたクレートのビルド成果物 (誤コミット防止)
 vendor/*/target/
 **/target/
@@ -22,6 +25,13 @@ mutants.out*/
 # .zaivern.toml はワークスペース単位の個人上書き設定（テーマ・フォント等）なので ignore。
 # チームで共有したい場合はこの行を削除して git add -f すること。
 .zaivern.toml
+# 担当の隔離コピー・worktreeと所有権台帳（納品物は元フォルダへ反映する）
+.zai-team-worktrees/
+.zai-team-parts/
+# 統合ファイルの置換前に作る一時ファイル（異常終了時の残骸を含む）
+.zai-publish-*
+# リモート画面から受け取った個人用添付ファイル
+**/.zaivern/uploads/
 
 # === Claude Code / AI agents ===
 .claude/settings.local.json
@@ -101,7 +111,6 @@ licgen_key*
 
 # 実機確認用のスクリーンショット (作業成果物ではない)
 screenshots/
-target-verify/
 
 # 並列エージェント用の隔離ワークツリーと作業指示書 (成果物ではない)
 .claude/worktrees/
