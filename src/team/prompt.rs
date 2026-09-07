@@ -1092,8 +1092,35 @@ mod tests {
     fn 絶対パスを焼き込まない() {
         let g = goal();
         let t = task(1, "a", &[]);
-        let s = implementer(&brief(&g, &t));
+        let mut b = brief(&g, &t);
+        b.workspace_root = "portable-workspace";
+        b.outbox = std::path::PathBuf::from("portable-outbox");
+        let s = implementer(&b);
         assert!(!s.contains("/Users/"), "絶対パスが入っている");
         assert!(!s.contains("C:\\"), "絶対パスが入っている");
+        assert!(s.contains(b.workspace_root));
+        assert!(s.contains("portable-outbox"));
+
+        // 入力で指定された絶対パスは合法。固定パスの禁止とは区別し、
+        // 本文と引用済みコマンドの参照先が入力に追従することを確かめる。
+        let workspace = std::env::temp_dir().join("prompt-workspace");
+        let workspace = workspace.to_string_lossy();
+        b.workspace_root = &workspace;
+        b.outbox = std::env::temp_dir().join("prompt-outbox");
+        let outbox = b.outbox.to_string_lossy();
+        let mut configured = implementer(&b);
+        assert!(configured.contains(workspace.as_ref()));
+        assert!(configured.contains(outbox.as_ref()));
+        for (path, marker) in [
+            (workspace.as_ref(), "portable-workspace"),
+            (outbox.as_ref(), "portable-outbox"),
+        ] {
+            for quote in [posix_single_quote, powershell_single_quote] {
+                let quoted = quote(path);
+                configured = configured.replace(&quoted[1..quoted.len() - 1], marker);
+            }
+            configured = configured.replace(path, marker);
+        }
+        assert_eq!(configured, s, "入力以外のパスや文面が変わっている");
     }
 }
