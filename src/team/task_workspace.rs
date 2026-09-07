@@ -402,8 +402,19 @@ fn entry_with_fingerprint(
     }
 }
 
+pub(super) fn check_cancel(cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        Err("統合の停止を要求されたため保留しました（反映済みの変更は保持します）".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// Hash with bounded memory, independently of the publication byte budget.
-pub(super) fn streamed_entry(path: &Path) -> Result<Entry, String> {
+pub(super) fn streamed_entry_cancellable(
+    path: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Entry, String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -411,6 +422,7 @@ pub(super) fn streamed_entry(path: &Path) -> Result<Entry, String> {
     let mut len = 0;
     let mut buffer = [0u8; 65536];
     loop {
+        check_cancel(cancel)?;
         let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
@@ -431,13 +443,23 @@ pub(super) fn snapshot(
     root: &Path,
     exclusions: &std::collections::BTreeSet<PathBuf>,
 ) -> Result<Snapshot, String> {
+    snapshot_cancellable(root, exclusions, &std::sync::atomic::AtomicBool::new(false))
+}
+
+fn snapshot_cancellable(
+    root: &Path,
+    exclusions: &std::collections::BTreeSet<PathBuf>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Snapshot, String> {
     fn walk(
         root: &Path,
         dir: &Path,
         exclusions: &std::collections::BTreeSet<PathBuf>,
         out: &mut Snapshot,
+        cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), String> {
         for item in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            check_cancel(cancel)?;
             let item = item.map_err(|e| e.to_string())?;
             let path = item.path();
             if skipped(&item.file_name())
@@ -449,7 +471,7 @@ pub(super) fn snapshot(
             }
             let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
             if meta.is_dir() {
-                walk(root, &path, exclusions, out)?;
+                walk(root, &path, exclusions, out, cancel)?;
                 continue;
             }
             #[cfg(not(windows))]
@@ -465,7 +487,7 @@ pub(super) fn snapshot(
             let entry = if meta.is_symlink() {
                 Entry::Link(std::fs::read_link(&path).map_err(|e| e.to_string())?)
             } else if meta.is_file() {
-                streamed_entry(&path)?
+                streamed_entry_cancellable(&path, cancel)?
             } else {
                 return Err(format!("通常ファイルではありません: {relative}"));
             };
@@ -477,7 +499,7 @@ pub(super) fn snapshot(
         Ok(())
     }
     let mut out = Snapshot::new();
-    walk(root, root, exclusions, &mut out)?;
+    walk(root, root, exclusions, &mut out, cancel)?;
     Ok(out)
 }
 
@@ -488,12 +510,14 @@ pub(super) fn frozen_files(
     source: &Path,
     files: &[String],
     baseline: &Snapshot,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<std::collections::BTreeMap<String, (Entry, Vec<u8>)>, String> {
     use std::io::Read;
-    let scanned = snapshot(root, &read_ready(source, files)?.excluded)?;
+    let scanned = snapshot_cancellable(root, &read_ready(source, files)?.excluded, cancel)?;
     let mut out = std::collections::BTreeMap::new();
     let mut budget = super::changeset::MAX_HASH_BYTES;
     for (relative, entry) in scanned {
+        check_cancel(cancel)?;
         let mut bytes = Vec::new();
         if baseline.get(&relative) != Some(&entry) && matches!(entry, Entry::File { .. }) {
             let path = checked_root(root, &relative)?;
@@ -502,9 +526,16 @@ pub(super) fn frozen_files(
             if meta.len() > budget {
                 return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
             }
-            file.take(budget + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
+            let mut reader = file.take(budget + 1);
+            let mut buffer = [0u8; 65536];
+            loop {
+                check_cancel(cancel)?;
+                let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..n]);
+            }
             if bytes.len() as u64 > budget {
                 return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
             }

@@ -11,6 +11,7 @@ struct Harness {
     sessions: Vec<SessionObs>,
     now: u64,
     next_session: SessionId,
+    wait_for_publication: bool,
 }
 
 impl Harness {
@@ -46,6 +47,7 @@ impl Harness {
             sessions: vec![],
             now: now_secs(),
             next_session: 1,
+            wait_for_publication: true,
         }
     }
 
@@ -54,10 +56,25 @@ impl Harness {
         for session in &mut self.sessions {
             session.state = state;
         }
-        let effects = self.rt.tick(&Observation {
+        let obs = Observation {
             now: self.now,
             sessions: self.sessions.clone(),
-        });
+        };
+        let mut effects = self.rt.tick(&obs);
+        // Existing state-machine tests assert settled outcomes. Wait only in this
+        // harness; production tick and the explicit nonblocking tests never wait.
+        if self.wait_for_publication {
+            if let Some(job) = self.rt.publication.as_mut() {
+                if job.ready.is_none() {
+                    job.ready = Some(
+                        job.rx
+                            .recv_timeout(std::time::Duration::from_secs(20))
+                            .unwrap(),
+                    );
+                }
+                effects.extend(self.rt.tick(&obs));
+            }
+        }
         let mut assigned = vec![];
         for effect in effects {
             let effect_key = effect.key();
@@ -477,6 +494,7 @@ fn 完了報告後に復元しても旧担当の停止と新たな統合所有�
         sessions: vec![],
         now: now_secs(),
         next_session: 100,
+        wait_for_publication: true,
     };
     for _ in 0..3 {
         assert!(
@@ -538,6 +556,7 @@ fn 旧形式の直接統合は復元時に成果と履歴を保持して自動�
         sessions: vec![],
         now: now_secs(),
         next_session: 100,
+        wait_for_publication: true,
     };
     for _ in 0..3 {
         assert!(h.pump(SessionState::Idle).is_empty());
@@ -566,6 +585,7 @@ fn 実装担当の復元でも旧担当の終了確認まで同じ隔離先へ�
         sessions: vec![],
         now: now_secs(),
         next_session: 100,
+        wait_for_publication: true,
     };
     for _ in 0..3 {
         assert!(
@@ -634,4 +654,271 @@ fn 実装担当が完了報告しても書込み中は統合を配送しない()
         );
         assert_eq!(h.rt.goal().status, GoalStatus::Completed);
     }
+}
+
+#[test]
+fn publication_worker_does_not_block_tick_or_stop() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (returned_tx, returned_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    let ui = std::thread::spawn(move || {
+        let root = root();
+        let mut h = Harness::new(&root, 1);
+        let task = h.assembly();
+        h.complete(task, "body.txt", "candidate");
+        h.wait_for_publication = false;
+        h.rt.publication_hook = Some(Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        h.pump(SessionState::Idle);
+        h.rt.apply_action(TeamAction::Stop);
+        returned_tx.send(()).unwrap();
+        finish_rx.recv().unwrap();
+        // The test's UI response has already been observed. Now fence worker
+        // teardown so this test does not leave background I/O after returning.
+        if let Some(job) = h.rt.publication.as_mut() {
+            let report = job.rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert!(report.error.is_some());
+            assert_eq!(
+                std::fs::read_to_string(root.join("body.txt")).unwrap(),
+                "元の本文"
+            );
+        }
+    });
+    let entered = entered_rx.recv_timeout(Duration::from_secs(20));
+    let returned = returned_rx.recv_timeout(Duration::from_secs(5));
+    // Release the deliberately blocked publish even when the assertion fails.
+    let _ = release_tx.send(());
+    let _ = finish_tx.send(());
+    ui.join().unwrap();
+    assert!(entered.is_ok(), "publish did not start");
+    assert!(returned.is_ok(), "tick/Stop waited for publication I/O");
+}
+
+// The hook is inside the real worker before scanning, never on the UI caller.
+fn blocked_publication() -> (Harness, TaskId, std::sync::mpsc::Sender<()>) {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    h.complete(task, "body.txt", "published candidate");
+    h.wait_for_publication = false;
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    h.rt.publication_hook = Some(Box::new(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    }));
+    h.pump(SessionState::Idle);
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap();
+    (h, task, release_tx)
+}
+
+fn receive_publication(h: &mut Harness) {
+    let job = h.rt.publication.as_mut().unwrap();
+    job.ready = Some(
+        job.rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap(),
+    );
+}
+
+#[test]
+fn publication_starts_once_holds_lease_and_applies_once() {
+    let (mut h, task, release) = blocked_publication();
+    let root = h.rt.workspace().to_owned();
+    let identity = h.rt.publication.as_ref().unwrap().dispatch_seq;
+    for _ in 0..5 {
+        assert!(h.pump(SessionState::Idle).is_empty());
+        assert!(locked(&root));
+        assert_eq!(h.rt.publication.as_ref().unwrap().dispatch_seq, identity);
+    }
+    release.send(()).unwrap();
+    receive_publication(&mut h);
+    assert!(!locked(&root));
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.goal().status, GoalStatus::Completed);
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "published candidate"
+    );
+    let context = h.rt.task(task).unwrap().context.clone();
+    for _ in 0..3 {
+        h.pump(SessionState::Idle);
+    }
+    assert!(h.rt.publication.is_none());
+    assert_eq!(h.rt.task(task).unwrap().context, context);
+}
+
+#[test]
+fn paused_publication_retains_result_until_resume() {
+    let (mut h, task, release) = blocked_publication();
+    h.rt.apply_action(TeamAction::Pause);
+    release.send(()).unwrap();
+    receive_publication(&mut h);
+    h.pump(SessionState::Idle);
+    assert!(h.rt.publication.is_some());
+    assert_ne!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+    h.rt.apply_action(TeamAction::Resume);
+    h.pump(SessionState::Idle);
+    assert!(h.rt.publication.is_none());
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+}
+
+#[test]
+fn stopped_publication_does_not_complete_after_resume_or_change_a_new_attempt() {
+    for new_attempt in [false, true] {
+        let (mut h, task, release) = blocked_publication();
+        let root = h.rt.workspace().to_owned();
+        h.rt.apply_action(TeamAction::Stop);
+        h.rt.apply_action(TeamAction::Resume);
+        if new_attempt {
+            let t = h.rt.tasks.iter_mut().find(|t| t.id == task).unwrap();
+            t.dispatch_seq += 1;
+            t.context.push("new attempt sentinel".into());
+        }
+        let previous = h.rt.task(task).unwrap().context.clone();
+        assert!(locked(&root));
+        release.send(()).unwrap();
+        receive_publication(&mut h);
+        h.pump(SessionState::Idle);
+        assert_ne!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            "元の本文"
+        );
+        assert!(!locked(&root));
+        if new_attempt {
+            assert_eq!(h.rt.task(task).unwrap().context, previous);
+        } else {
+            assert!(h
+                .rt
+                .task(task)
+                .unwrap()
+                .blockers
+                .iter()
+                .any(|s| s.contains("停止")));
+        }
+    }
+}
+
+#[test]
+fn dropped_runtime_keeps_worker_lease_and_durable_result_separate_from_restore() {
+    let (mut h, task, release) = blocked_publication();
+    let root = h.rt.workspace().to_owned();
+    let saved = h.rt.to_saved();
+    let run_id = h.rt.owner().run_id;
+    let (_, disconnected) = std::sync::mpsc::channel();
+    let finished = std::mem::replace(&mut h.rt.publication.as_mut().unwrap().rx, disconnected);
+    let holds = h.rt.take_integration_for_shutdown();
+    assert!(holds.is_empty());
+    drop(h);
+    assert!(locked(&root));
+    let restored = TeamRuntime::restore(saved, root.clone());
+    let state = restored.task(task).unwrap().state;
+    release.send(()).unwrap();
+    let report = finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap();
+    assert!(report.error.is_some());
+    assert!(!locked(&root));
+    assert_eq!(restored.task(task).unwrap().state, state);
+    assert_ne!(state, TeamTaskState::Completed);
+    let receipt = report
+        .outcome
+        .notes
+        .iter()
+        .find_map(|n| n.strip_prefix("統合結果の記録: "))
+        .unwrap();
+    let identity: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(PathBuf::from(receipt).join("job.json")).unwrap())
+            .unwrap();
+    assert_eq!(identity["run_id"], run_id);
+    assert_eq!(identity["task"], task);
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(PathBuf::from(receipt).join("result.json")).unwrap())
+            .unwrap();
+    assert!(result["error"].is_string());
+}
+
+#[test]
+fn disconnected_publication_never_completes_or_releases_a_running_worker() {
+    let (mut h, task, release) = blocked_publication();
+    let root = h.rt.workspace().to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    let finished = std::mem::replace(&mut h.rt.publication.as_mut().unwrap().rx, rx);
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Submitted);
+    assert!(h
+        .rt
+        .task(task)
+        .unwrap()
+        .blockers
+        .iter()
+        .any(|s| s.contains("チャネル")));
+    assert!(locked(&root));
+    release.send(()).unwrap();
+    let report = finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap();
+    assert!(report.error.is_some());
+    assert!(!locked(&root));
+    h.pump(SessionState::Idle);
+    assert_ne!(h.rt.goal().status, GoalStatus::Completed);
+}
+
+#[test]
+fn failed_publication_worker_keeps_reason_and_submitted_state() {
+    for panic in [false, true] {
+        let root = root();
+        let mut h = Harness::new(&root, 1);
+        let task = h.assembly();
+        h.complete(task, "body.txt", "candidate");
+        if panic {
+            h.rt.publication_hook = Some(Box::new(|| panic!("simulated worker failure")));
+        } else {
+            let (candidate, _) = h.candidate(task);
+            std::fs::File::create(candidate.join("oversized"))
+                .unwrap()
+                .set_len(65 * 1024 * 1024)
+                .unwrap();
+        }
+        h.pump(SessionState::Idle);
+        assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Submitted);
+        assert!(h
+            .rt
+            .task(task)
+            .unwrap()
+            .blockers
+            .iter()
+            .any(|s| s.contains(if panic { "異常終了" } else { "上限" })));
+        assert_eq!(
+            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            "元の本文"
+        );
+        assert!(!locked(&root));
+    }
+}
+
+pub(crate) fn closing_publication_fixture() -> (
+    TeamRuntime,
+    std::sync::mpsc::Sender<()>,
+    fn(&mut TeamRuntime),
+) {
+    let (h, _, release) = blocked_publication();
+    fn finish(runtime: &mut TeamRuntime) {
+        let job = runtime.publication.as_mut().unwrap();
+        job.ready = Some(
+            job.rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap(),
+        );
+    }
+    (h.rt, release, finish)
 }

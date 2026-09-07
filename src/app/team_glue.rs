@@ -1035,7 +1035,9 @@ impl ZaivernApp {
     /// 開いたまま放置しても、アイドルのコストはゼロに戻る (設計原則 3)。
     pub(crate) fn team_is_active(&self) -> bool {
         panel::with_panel(|p| {
-            p.has_run() && !p.is_read_only() && p.goal_status().is_some_and(|g| !g.is_terminal())
+            p.has_run()
+                && !p.is_read_only()
+                && (p.has_publications() || p.goal_status().is_some_and(|g| !g.is_terminal()))
         })
     }
 }

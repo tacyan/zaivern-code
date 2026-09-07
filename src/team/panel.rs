@@ -570,6 +570,10 @@ impl TeamPanel {
         persistence::team_dir_in(&self.home, &self.workspace)
     }
 
+    pub fn has_publications(&self) -> bool {
+        self.runs.iter().any(TeamRuntime::publication_pending)
+    }
+
     /// **いま面倒を見ているものがあるか。**
     ///
     /// あるうちは workspace を切り替えない — 切り替えると Runtime への参照が
@@ -601,7 +605,12 @@ impl TeamPanel {
             // ときに 0 と答えると、`discard_run` の直後 (Runtime は捨てた
             // が子プロセスはまだ畳んでいる) に「空いている」と嘘をつく。
             validations: self.validation_jobs.len(),
-            effects: self.pending_launches.len()
+            effects: self
+                .runs
+                .iter()
+                .filter(|rt| rt.publication_pending())
+                .count()
+                + self.pending_launches.len()
                 + self.pending_instructions.len()
                 + self.pending_manual.len()
                 + self.pending_stops.len()
@@ -2068,7 +2077,18 @@ impl TeamPanel {
             return;
         };
         let owner = &pending.owner;
-        let busy = self.pending_stops.iter().any(|(o, _, _)| o == owner)
+        // Closing runs no longer tick. Still collect their publication result
+        // before deleting a workspace that the worker may be reading/writing.
+        let publishing = self.run_pos_of_owner(owner).is_some_and(|pos| {
+            let runtime = &mut self.runs[pos];
+            if runtime.publication_pending() {
+                runtime.collect_publication();
+                self.needs_save = true;
+            }
+            runtime.publication_pending()
+        });
+        let busy = publishing
+            || self.pending_stops.iter().any(|(o, _, _)| o == owner)
             || self.stop_jobs.iter().any(|j| &j.owner == owner)
             || self.validation_jobs.iter().any(|j| &j.owner == owner)
             || self.pending_validations.iter().any(|(o, _, _)| o == owner);
@@ -3102,6 +3122,35 @@ mod tests {
         p.collect_validations();
         p.progress_close();
         stops
+    }
+
+    #[test]
+    fn closing_run_waits_nonblocking_for_publication_before_cleanup() {
+        let (runtime, release, finish) = super::super::runtime::closing_publication_fixture();
+        let source = runtime.workspace().to_owned();
+        let id = runtime.run().run_id.clone();
+        let mut panel = panel_at(&source);
+        panel.runs.push(runtime);
+        panel.begin_close(&id, persistence::ClosePolicy::Keep);
+        finish_close_for_test(&mut panel);
+        assert!(panel.pending_close.is_some());
+        assert_eq!(panel.runs.len(), 1);
+        assert!(panel.has_publications());
+        assert!(super::super::integration::try_acquire(&source, "observer")
+            .unwrap()
+            .is_none());
+        release.send(()).unwrap();
+        finish(&mut panel.runs[0]);
+        panel.progress_close();
+        assert!(panel.pending_close.is_none());
+        assert!(panel.runs.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source.join("body.txt")).unwrap(),
+            "元の本文"
+        );
+        assert!(super::super::integration::try_acquire(&source, "observer")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

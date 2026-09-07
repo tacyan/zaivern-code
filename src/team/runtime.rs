@@ -318,6 +318,9 @@ pub struct TeamRuntime {
     /// 既存の調停層。**割り当ての最終判断はここ。**
     co: Coordinator,
     integration: Option<IntegrationHold>,
+    publication: Option<publication::Job>,
+    #[cfg(test)]
+    publication_hook: Option<Box<dyn FnOnce() + Send>>,
     worker_holds: BTreeMap<TaskId, IntegrationHold>,
     published: BTreeSet<TaskId>,
     /// 登録済みセッション。
@@ -896,6 +899,9 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
     }
 }
 
+#[path = "publication.rs"]
+mod publication;
+
 // 統合候補を作るセッションが止まるまで、配送前に得た排他を保持する。
 struct IntegrationHold {
     permit: super::integration::Permit,
@@ -970,6 +976,9 @@ impl TeamRuntime {
             effect_order: VecDeque::new(),
             co: Coordinator::new(),
             integration: None,
+            publication: None,
+            #[cfg(test)]
+            publication_hook: None,
             worker_holds: BTreeMap::new(),
             published: BTreeSet::new(),
             registered: BTreeSet::new(),
@@ -1172,6 +1181,9 @@ impl TeamRuntime {
             effect_order,
             co: Coordinator::new(),
             integration: None,
+            publication: None,
+            #[cfg(test)]
+            publication_hook: None,
             worker_holds: BTreeMap::new(),
             published: BTreeSet::new(),
             registered: BTreeSet::new(),
@@ -2030,6 +2042,16 @@ impl TeamRuntime {
                 // 新規割り当ては即座に止める。**kill は承認ゲートを通す。**
                 self.run.stopped = true;
                 self.run.paused = true;
+                if let Some(job) = &self.publication {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                    let id = job.task;
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                        // Keep the attempt identity until its actual I/O has stopped.
+                        task.blockers.push(
+                            "統合停止を要求しました。反映済み内容は終了時に記録します".into(),
+                        );
+                    }
+                }
                 let live: Vec<SessionId> =
                     self.agents.iter().filter_map(|a| a.session_id).collect();
                 self.log(
@@ -2202,6 +2224,9 @@ impl TeamRuntime {
                 self.dirty = true;
             }
             TeamAction::ReassignTask(id) => {
+                if let Some(job) = self.publication.as_ref().filter(|job| job.task == id) {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
                 // **旧担当が生きているうちは配り直さない。**
                 //
                 // 担当を外して `Ready` に戻すと、まだ編集しているかもしれない
@@ -2311,6 +2336,9 @@ impl TeamRuntime {
     pub fn take_integration_for_shutdown(
         &mut self,
     ) -> Vec<(SessionId, super::integration::Permit)> {
+        if let Some(job) = &self.publication {
+            job.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let mut holds: Vec<_> = std::mem::take(&mut self.worker_holds)
             .into_values()
             .map(|hold| (hold.session, hold.permit))
@@ -2386,7 +2414,94 @@ impl TeamRuntime {
         }
     }
 
+    pub(super) fn publication_pending(&self) -> bool {
+        self.publication.is_some()
+    }
+
+    pub(super) fn collect_publication(&mut self) {
+        let Some(job) = self.publication.as_mut() else {
+            return;
+        };
+        if job.ready.is_none() {
+            match job.rx.try_recv() {
+                Ok(report) => job.ready = Some(report),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    job.ready = Some(publication::Report { outcome: Default::default(),
+                        error: Some("統合ワーカーの結果チャネルが切断されました。統合の退避・結果記録を確認してください".into()) });
+                }
+            }
+        }
+        // Pause does not undo work. Retain the result until Resume (or Stop).
+        if self.run.paused && !self.run.stopped {
+            return;
+        }
+        let mut job = self.publication.take().unwrap();
+        let Some(task) = self.task(job.task).cloned() else {
+            return;
+        };
+        if job.owner != self.owner()
+            || job.attempts != task.attempts
+            || job.dispatch_seq != task.dispatch_seq
+        {
+            // The private receiver cannot target another Runtime. Attempt identity
+            // additionally fences reassignments within this Runtime; receipt stays on disk.
+            return;
+        }
+        let publication::Report { outcome, mut error } = job.ready.take().unwrap();
+        if job.cancel.load(std::sync::atomic::Ordering::Acquire) && error.is_none() {
+            error = Some("停止した統合の結果を記録しました（反映済み内容は保持します）".into());
+        }
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+            t.changed_files.extend(outcome.changed.iter().cloned());
+            t.changed_files.sort();
+            t.changed_files.dedup();
+            t.context.extend(outcome.notes.iter().cloned());
+        }
+        let submitted = task.state == TeamTaskState::Submitted;
+        match error {
+            None => {
+                if submitted {
+                    if !outcome.conflicts.is_empty() {
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                            t.blockers
+                                .push(format!("未統合: {}", outcome.conflicts.join(", ")));
+                        }
+                    }
+                    self.dirty = true;
+                } else if outcome.conflicts.is_empty() {
+                    self.published.insert(task.id);
+                    self.settle_validation(task.id);
+                } else {
+                    self.submit_with_issues(
+                        task.id,
+                        &format!(
+                            "元フォルダの更新を保持しました。未統合: {}",
+                            outcome.conflicts.join(", ")
+                        ),
+                    );
+                }
+            }
+            Some(why) => {
+                if submitted {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                        t.blockers.push(why);
+                    }
+                    self.dirty = true;
+                } else {
+                    self.submit_with_issues(task.id, &why);
+                }
+            }
+        }
+
+        self.dirty = true;
+    }
+
     fn settle_integration(&mut self, obs: &Observation) {
+        if self.publication.is_some() {
+            self.collect_publication();
+            return;
+        }
         let Some(hold) = self.integration.as_ref() else {
             return;
         };
@@ -2406,46 +2521,17 @@ impl TeamRuntime {
             return;
         }
         if reported && !self.run.stopped && !self.run.paused {
-            let result = super::integration::publish(&hold.permit, &self.workspace, &task.files);
-            match result {
-                Ok(outcome) => {
-                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
-                        t.changed_files = outcome.changed;
-                        t.context.extend(outcome.notes);
-                    }
-                    if submitted {
-                        if !outcome.conflicts.is_empty() {
-                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
-                                t.blockers
-                                    .push(format!("未統合: {}", outcome.conflicts.join(", ")));
-                            }
-                        }
-                        self.dirty = true;
-                    } else if outcome.conflicts.is_empty() {
-                        self.published.insert(task.id);
-                        self.settle_validation(task.id);
-                    } else {
-                        self.submit_with_issues(
-                            task.id,
-                            &format!(
-                                "元フォルダの更新を保持しました。未統合: {}",
-                                outcome.conflicts.join(", ")
-                            ),
-                        );
-                    }
-                }
-                Err(why) => {
-                    if submitted {
-                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
-                            t.blockers.push(why);
-                        }
-                        self.dirty = true;
-                    } else {
-                        self.submit_with_issues(task.id, &why);
-                    }
-                }
+            let hold = self.integration.take().unwrap();
+            match publication::Job::start(
+                hold,
+                &task,
+                self.owner(),
+                #[cfg(test)]
+                self.publication_hook.take(),
+            ) {
+                Ok(job) => self.publication = Some(job),
+                Err(why) => self.submit_with_issues(task.id, &why),
             }
-            self.integration = None; // publishの全書き込みが戻ってから解放。
         } else if self.run.paused && !self.run.stopped && reported {
             // Pauseは再開後に同じ候補を反映する。所有権も維持する。
         } else {
@@ -2585,7 +2671,8 @@ impl TeamRuntime {
     /// 止めるのは**人が止めたとき**と**まだ始まっていない / もう終わった
     /// とき**だけ。
     fn accepting_work(&self) -> bool {
-        !self.run.paused
+        self.publication.is_none()
+            && !self.run.paused
             && !self.run.stopped
             && !matches!(
                 self.goal.status,
@@ -3030,6 +3117,7 @@ impl TeamRuntime {
             .tasks
             .iter()
             .filter(|t| t.state.is_held())
+            .filter(|t| self.publication.as_ref().is_none_or(|job| job.task != t.id))
             .filter_map(|t| t.assigned_session.map(|s| (t.id, s)))
             .filter(|(_, s)| !alive.contains(s))
             .collect();
@@ -3282,6 +3370,9 @@ impl TeamRuntime {
     pub fn close(&mut self) -> Vec<TeamEffect> {
         self.run.stopped = true;
         self.run.paused = true;
+        if let Some(job) = &self.publication {
+            job.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let mut out: Vec<TeamEffect> = self
             .agents
             .iter()
@@ -4640,10 +4731,16 @@ impl TeamRuntime {
             };
             if isolated_assembly(&task) {
                 // 既存の所有者が停止するまで、同じRunにも再配送しない。
-                if self.integration.is_some() || !self.worker_holds.is_empty() {
+                if self.integration.is_some()
+                    || self.publication.is_some()
+                    || !self.worker_holds.is_empty()
+                {
                     continue;
                 }
-                match super::integration::try_acquire(&self.workspace, &self.run.run_id) {
+                match super::integration::try_acquire_for_dispatch(
+                    &self.workspace,
+                    &self.run.run_id,
+                ) {
                     Ok(Some(permit)) => {
                         self.integration = Some(IntegrationHold {
                             permit,
@@ -5039,6 +5136,10 @@ impl TeamRuntime {
             .map(|t| t.id)
             .collect();
         for id in waiting {
+            if let Some(job) = self.publication.as_ref().filter(|job| job.task == id) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                continue;
+            }
             if self.live_session_of(id).is_none() {
                 // 担当セッションはもう居ない = 停止を確認できた。
                 self.free_task(id, false);
@@ -5070,6 +5171,12 @@ impl TeamRuntime {
     /// 場合は数え、人が配り直した場合は数えない — 人の操作を失敗として
     /// 記録すると、上限に早く当たって使えなくなる)。
     fn free_task(&mut self, task: TaskId, count_attempt: bool) {
+        if let Some(job) = self.publication.as_ref().filter(|job| job.task == task) {
+            if self.task(task).is_some_and(|t| t.reassign_pending) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            return; // The session exiting is not proof that publication I/O ended.
+        }
         let max = self.run.max_attempts;
         self.release_after_stop_confirmed(task);
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
@@ -6996,6 +7103,8 @@ mod seen_key_tests {
 #[cfg(test)]
 #[path = "integration_runtime_tests.rs"]
 mod integration_runtime_tests;
+#[cfg(test)]
+pub(super) use integration_runtime_tests::closing_publication_fixture;
 
 #[cfg(test)]
 mod worker_ownership_tests {
@@ -7354,6 +7463,18 @@ mod worker_ownership_tests {
         let session = c.sessions.iter_mut().find(|s| s.id == assembly.1).unwrap();
         session.state = SessionState::Exited;
         session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+        c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        // Publication is asynchronous; preserve the same completed-state assertions
+        // after receiving the actual worker's completion, without timing sleeps.
+        let job = c.rt.publication.as_mut().expect("publication started");
+        job.ready = Some(
+            job.rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap(),
+        );
         c.rt.tick(&Observation {
             now: now_secs(),
             sessions: c.sessions.clone(),

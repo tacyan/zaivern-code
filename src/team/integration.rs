@@ -104,6 +104,7 @@ impl Drop for Permit {
     }
 }
 
+#[cfg(test)]
 pub fn try_acquire(source: &Path, run_id: &str) -> Result<Option<Permit>, String> {
     let permit = try_acquire_at(
         source,
@@ -114,6 +115,18 @@ pub fn try_acquire(source: &Path, run_id: &str) -> Result<Option<Permit>, String
         recover_publications(&permit.source)?;
     }
     Ok(permit)
+}
+
+/// Dispatch only acquires ownership; recovery I/O runs in the publisher thread.
+pub(super) fn try_acquire_for_dispatch(
+    source: &Path,
+    run_id: &str,
+) -> Result<Option<Permit>, String> {
+    try_acquire_at(
+        source,
+        run_id,
+        &format!("{}/integration.json", task_workspace::ROOT),
+    )
 }
 
 /// Different isolated parts have different leases, preserving parallel workers
@@ -219,7 +232,7 @@ fn try_acquire_at(
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Outcome {
     pub changed: Vec<String>,
     pub conflicts: Vec<String>,
@@ -236,16 +249,39 @@ fn checked_file(source: &Path, relative: &str) -> Result<PathBuf, String> {
     task_workspace::checked_root(source, relative)
 }
 
-fn current(source: &Path, relative: &str) -> Result<Option<Entry>, String> {
+fn current(
+    source: &Path,
+    relative: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<Entry>, String> {
     let path = checked_file(source, relative)?;
-    entry_at(&path)
+    entry_at_cancellable(&path, cancel)
 }
 
 fn entry_at(path: &Path) -> Result<Option<Entry>, String> {
+    // Once captured, finish the comparison/install/recovery of this file before
+    // honoring Stop. The pre-capture comparison can stop between read chunks.
+    entry_at_cancellable(path, &std::sync::atomic::AtomicBool::new(false))
+}
+
+fn entry_at_cancellable(
+    path: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Option<Entry>, String> {
+    task_workspace::check_cancel(cancel)?;
     match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(e.to_string()),
-        Ok(meta) if meta.is_file() => Ok(Some(task_workspace::streamed_entry(path)?)),
+        Ok(meta) if meta.is_file() => Ok(Some(task_workspace::streamed_entry_cancellable(
+            path, cancel,
+        )?)),
         Ok(_) => Err("通常ファイルではありません".into()),
     }
 }
@@ -286,7 +322,15 @@ fn pending_publications(source: &Path) -> Result<PathBuf, String> {
 
 // Called only with the cross-Run integration lease held. Interrupted captures
 // are restored create-only; completed deletions must never be resurrected.
+#[cfg(test)]
 fn recover_publications(source: &Path) -> Result<(), String> {
+    recover_publications_cancellable(source, &std::sync::atomic::AtomicBool::new(false))
+}
+
+fn recover_publications_cancellable(
+    source: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
     let pending = pending_publications(source)?;
     let entries = match std::fs::read_dir(&pending) {
         Ok(entries) => entries,
@@ -294,6 +338,7 @@ fn recover_publications(source: &Path) -> Result<(), String> {
         Err(e) => return Err(e.to_string()),
     };
     for entry in entries {
+        task_workspace::check_cancel(cancel)?;
         let path = entry.map_err(|e| e.to_string())?.path();
         let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         if !metadata.is_file() || metadata.len() > 65536 {
@@ -340,21 +385,142 @@ fn recover_publications(source: &Path) -> Result<(), String> {
     sync_directory(&pending)
 }
 
+fn has_descendant<T>(entries: &std::collections::BTreeMap<String, T>, relative: &str) -> bool {
+    let prefix = format!("{relative}/");
+    entries
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&prefix))
+}
+
+// Inspect every actual child, including ignored files and links. A replacement
+// must not hide a concurrent user's content behind the workspace exclusion policy.
+fn check_replacement_tree(
+    source: &Path,
+    relative: &str,
+    baseline: &task_workspace::Snapshot,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    task_workspace::check_cancel(cancel)?;
+    for item in std::fs::read_dir(checked_file(source, relative)?).map_err(|e| e.to_string())? {
+        let item = item.map_err(|e| e.to_string())?;
+        let child = format!(
+            "{relative}/{}",
+            item.file_name()
+                .to_str()
+                .ok_or("ファイル名を表現できません")?
+        );
+        let path = checked_file(source, &child)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_dir() && has_descendant(baseline, &child) {
+            check_replacement_tree(source, &child, baseline, cancel)?;
+        } else {
+            let conflict = || format!("置換先に追加・変更された内容があります: {child}");
+            let expected = baseline.get(&child).ok_or_else(conflict)?;
+            if !meta.is_file()
+                || expected != &task_workspace::streamed_entry_cancellable(&path, cancel)?
+            {
+                return Err(conflict());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_replaced_directories(
+    source: &Path,
+    relative: &str,
+    baseline: &task_workspace::Snapshot,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    // Only known ancestors of old files are eligible. remove_dir is the atomic
+    // emptiness check; never recursively remove source contents or new directories.
+    let mut dirs = BTreeSet::new();
+    let prefix = format!("{relative}/");
+    for (path, _) in baseline
+        .range(prefix.clone()..)
+        .take_while(|(p, _)| p.starts_with(&prefix))
+    {
+        for dir in Path::new(path).ancestors().skip(1) {
+            if !dir.starts_with(relative) {
+                break;
+            }
+            dirs.insert(dir.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+    for dir in dirs {
+        task_workspace::check_cancel(cancel)?;
+        let path = checked_file(source, &dir)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir(&path).map_err(|e| {
+                format!("空でないか変更されたディレクトリを保持しました: {dir}: {e}")
+            })?,
+            Ok(_) if dir == relative => {} // Already installed or a user file: compare normally.
+            Ok(_) => return Err(format!("ディレクトリが変更されました: {dir}")),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn record_worker_start(
+    permit: &Permit,
+    identity: &serde_json::Value,
+) -> Result<PathBuf, String> {
+    let directory = task_workspace::checked_root(
+        &permit.source,
+        &format!(
+            "{}/publications/worker-{}-{}",
+            task_workspace::ROOT,
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ),
+    )?;
+    std::fs::create_dir_all(directory.parent().ok_or("記録先の親がありません")?)
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    sync_record(
+        &directory.join("job.json"),
+        &serde_json::to_vec(identity).map_err(|e| e.to_string())?,
+    )?;
+    sync_directory(&directory)?;
+    Ok(directory)
+}
+
+pub(super) fn record_worker_result(
+    permit: &Permit,
+    directory: &Path,
+    outcome: &Outcome,
+    error: &Option<String>,
+) -> Result<(), String> {
+    let relative = directory
+        .strip_prefix(&permit.source)
+        .map_err(|e| e.to_string())?;
+    task_workspace::checked_root(&permit.source, &relative.to_string_lossy())?;
+    sync_record(
+        &directory.join("result.json"),
+        &serde_json::to_vec(&serde_json::json!({"outcome": outcome, "error": error}))
+            .map_err(|e| e.to_string())?,
+    )?;
+    sync_directory(directory)
+}
+
 /// Keep the permit until this call and the old writer have both finished.
 /// Only differences from the immutable isolation baseline are eligible.
+#[cfg(test)]
 pub fn publish(
     permit: &Permit,
     source: &Path,
     assemble_files: &[String],
 ) -> Result<Outcome, String> {
-    #[cfg(test)]
-    {
-        publish_inner(permit, source, assemble_files, |_, _| {})
-    }
-    #[cfg(not(test))]
-    {
-        publish_inner(permit, source, assemble_files)
-    }
+    publish_inner(permit, source, assemble_files, |_, _| {})
 }
 
 #[cfg(test)]
@@ -365,12 +531,53 @@ enum PublishStage {
     BeforeInstall,
 }
 
+#[cfg(test)]
 fn publish_inner(
     permit: &Permit,
     source: &Path,
     assemble_files: &[String],
     #[cfg(test)] mut checkpoint: impl FnMut(PublishStage, &str),
 ) -> Result<Outcome, String> {
+    let mut outcome = Outcome::default();
+    publish_impl(
+        permit,
+        source,
+        assemble_files,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut outcome,
+        #[cfg(test)]
+        &mut checkpoint,
+    )?;
+    Ok(outcome)
+}
+
+pub(super) fn publish_cancellable(
+    permit: &Permit,
+    source: &Path,
+    files: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+    outcome: &mut Outcome,
+) -> Result<(), String> {
+    publish_impl(
+        permit,
+        source,
+        files,
+        cancel,
+        outcome,
+        #[cfg(test)]
+        &mut |_, _| {},
+    )
+}
+
+fn publish_impl(
+    permit: &Permit,
+    source: &Path,
+    assemble_files: &[String],
+    cancel: &std::sync::atomic::AtomicBool,
+    outcome: &mut Outcome,
+    #[cfg(test)] checkpoint: &mut dyn FnMut(PublishStage, &str),
+) -> Result<(), String> {
+    task_workspace::check_cancel(cancel)?;
     let source = source
         .canonicalize()
         .map(crate::pathx::plain)
@@ -384,13 +591,74 @@ fn publish_inner(
     if !held {
         return Err("統合の所有権が失われました".into());
     }
+    recover_publications_cancellable(&permit.source, cancel)?;
     let (workspace, _, _) = task_workspace::execution(&source, assemble_files)?
         .ok_or("統合担当が隔離されていません")?;
     let baseline = task_workspace::baseline(&source, assemble_files)?;
-    let candidate = task_workspace::frozen_files(&workspace, &source, assemble_files, &baseline)?;
+    let candidate =
+        task_workspace::frozen_files(&workspace, &source, assemble_files, &baseline, cancel)?;
     let paths: BTreeSet<_> = baseline.keys().chain(candidate.keys()).cloned().collect();
-    let mut outcome = Outcome::default();
+    let replacements: BTreeSet<_> = candidate
+        .keys()
+        .filter(|path| !baseline.contains_key(*path) && has_descendant(&baseline, path))
+        .cloned()
+        .collect();
+    let mut blocked = BTreeSet::new();
+    for path in &replacements {
+        task_workspace::check_cancel(cancel)?;
+        if checked_file(&source, path).is_ok_and(|p| p.is_dir()) {
+            if let Err(why) = check_replacement_tree(&source, path, &baseline, cancel) {
+                blocked.insert(path.clone());
+                outcome.notes.push(format!("{path}: {why}"));
+            }
+        }
+    }
+    let candidate_entries: task_workspace::Snapshot = candidate
+        .iter()
+        .map(|(path, (entry, _))| {
+            let mut entry = entry.clone();
+            #[cfg(unix)]
+            if let Entry::File {
+                mode: Some(mode), ..
+            } = &mut entry
+            {
+                *mode &= 0o777;
+            }
+            #[cfg(not(unix))]
+            let _ = &mut entry;
+            (path.clone(), entry)
+        })
+        .collect();
+    for path in baseline
+        .keys()
+        .filter(|path| !candidate.contains_key(*path) && has_descendant(&candidate, path))
+    {
+        if checked_file(&source, path).is_ok_and(|p| p.is_dir()) {
+            if let Err(why) = check_replacement_tree(&source, path, &candidate_entries, cancel) {
+                blocked.insert(path.clone());
+                outcome.notes.push(format!("{path}: {why}"));
+            }
+        }
+    }
+    let mut paths: Vec<_> = paths.into_iter().collect();
+    // Remove old leaves first; file -> directory removes the old parent before
+    // creating children. Successful deletions remain journaled on partial failure.
+    paths.sort_by_cached_key(|p| {
+        (
+            candidate.contains_key(p),
+            std::cmp::Reverse(p.matches('/').count()),
+            p.clone(),
+        )
+    });
     for relative in paths {
+        task_workspace::check_cancel(cancel)?;
+        if Path::new(&relative)
+            .ancestors()
+            .any(|p| blocked.contains(&p.to_string_lossy().replace('\\', "/")))
+        {
+            outcome.conflicts.push(relative);
+            continue;
+        }
         let before = baseline.get(&relative);
         let after = candidate.get(&relative).map(|(entry, _)| entry);
         if before == after {
@@ -413,7 +681,25 @@ fn publish_inner(
             outcome.conflicts.push(relative);
             continue;
         }
-        let actual = match current(&source, &relative) {
+        if replacements.contains(&relative) {
+            let removal = remove_replaced_directories(&source, &relative, &baseline, cancel);
+            if let Err(why) = removal {
+                outcome.notes.push(format!("{relative}: {why}"));
+                outcome.conflicts.push(relative);
+                continue;
+            }
+        }
+        // A prior attempt may already have replaced the old file by a directory.
+        // Its children are still checked independently, including create-only writes.
+        let old_file_is_directory = after.is_none()
+            && before.is_some()
+            && has_descendant(&candidate, &relative)
+            && checked_file(&source, &relative).is_ok_and(|p| p.is_dir());
+        let actual = match if old_file_is_directory {
+            Ok(None)
+        } else {
+            current(&source, &relative, cancel)
+        } {
             Ok(actual) => actual,
             Err(_) => {
                 outcome.conflicts.push(relative);
@@ -487,6 +773,7 @@ fn publish_inner(
             }
             #[cfg(test)]
             checkpoint(PublishStage::BeforeCapture, &relative);
+            task_workspace::check_cancel(cancel)?;
             checked_file(&source, &relative)?;
             let backup = directory.join("original");
             let captured = before.is_some();
@@ -527,6 +814,7 @@ fn publish_inner(
             }
             let _ = std::fs::remove_file(&temporary);
             if install.is_ok() {
+                outcome.changed.push(relative.clone());
                 sync_directory(target.parent().ok_or("保存先の親がありません")?)?;
                 sync_record(&directory.join("done"), b"completed")?;
                 sync_directory(&directory)?;
@@ -540,9 +828,10 @@ fn publish_inner(
             outcome.conflicts.push(relative);
             continue;
         }
-        outcome.changed.push(relative);
     }
-    Ok(outcome)
+    outcome.changed.sort();
+    outcome.conflicts.sort();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -592,6 +881,194 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn publish_replaces_directory_with_file_and_retries_idempotently() {
+        let f = Fixture::new("directory-to-file");
+        f.write("config/nested/settings.json", "baseline");
+        let (files, work) = f.isolate("run");
+        std::fs::remove_dir_all(work.join("config")).unwrap();
+        std::fs::write(work.join("config"), "flat config").unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        for _ in 0..2 {
+            let outcome = publish(&permit, &f.0, &files).unwrap();
+            assert!(outcome.conflicts.is_empty(), "{outcome:?}");
+            assert_eq!(f.read("config"), "flat config");
+        }
+    }
+
+    #[test]
+    fn publish_replaces_file_with_directory_and_retries_idempotently() {
+        let f = Fixture::new("file-to-directory");
+        f.write("config", "baseline");
+        let (files, work) = f.isolate("run");
+        std::fs::remove_file(work.join("config")).unwrap();
+        std::fs::create_dir(work.join("config")).unwrap();
+        std::fs::write(work.join("config/settings.json"), "nested config").unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        for _ in 0..2 {
+            let outcome = publish(&permit, &f.0, &files).unwrap();
+            assert!(outcome.conflicts.is_empty(), "{outcome:?}");
+            assert_eq!(f.read("config/settings.json"), "nested config");
+        }
+    }
+
+    #[test]
+    fn directory_replacement_preserves_added_and_modified_children() {
+        for modified in [false, true] {
+            let f = Fixture::new("replacement-conflict");
+            f.write("config/settings.json", "baseline");
+            let (files, work) = f.isolate("run");
+            std::fs::remove_dir_all(work.join("config")).unwrap();
+            std::fs::write(work.join("config"), "candidate").unwrap();
+            let user_path = if modified {
+                "config/settings.json"
+            } else {
+                "config/user.txt"
+            };
+            f.write(user_path, "user edit");
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let outcome = publish(&permit, &f.0, &files).unwrap();
+            assert!(outcome.conflicts.contains(&"config".into()));
+            assert!(outcome.changed.is_empty());
+            assert_eq!(f.read(user_path), "user edit");
+            assert!(f.0.join("config/settings.json").is_file());
+        }
+    }
+
+    #[test]
+    fn replacement_races_preserve_user_content_and_retry_partial_publication() {
+        for stage in [PublishStage::BeforeCapture, PublishStage::BeforeInstall] {
+            let f = Fixture::new("replacement-race");
+            f.write("config/settings.json", "baseline");
+            let (files, work) = f.isolate("run");
+            std::fs::remove_dir_all(work.join("config")).unwrap();
+            std::fs::write(work.join("config"), "candidate").unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let mut raced = false;
+            let result = publish_inner(&permit, &f.0, &files, |at, path| {
+                if !raced
+                    && at == stage
+                    && path
+                        == if stage == PublishStage::BeforeCapture {
+                            "config/settings.json"
+                        } else {
+                            "config"
+                        }
+                {
+                    raced = true;
+                    f.write(
+                        if stage == PublishStage::BeforeCapture {
+                            "config/user.txt"
+                        } else {
+                            "config"
+                        },
+                        "user edit",
+                    );
+                }
+            })
+            .unwrap();
+            assert!(raced);
+            assert!(result.conflicts.contains(&"config".into()), "{result:?}");
+            assert!(result.changed.contains(&"config/settings.json".into()));
+            let user_path = if stage == PublishStage::BeforeCapture {
+                "config/user.txt"
+            } else {
+                "config"
+            };
+            assert_eq!(f.read(user_path), "user edit");
+            // Explicitly remove this test's concurrent edit, then retry the same candidate.
+            std::fs::remove_file(f.0.join(user_path)).unwrap();
+            for _ in 0..2 {
+                let outcome = publish(&permit, &f.0, &files).unwrap();
+                assert!(outcome.conflicts.is_empty(), "{outcome:?}");
+                assert_eq!(f.read("config"), "candidate");
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_directory_replacement_recovers_and_retries() {
+        for stage in [PublishStage::AfterCapture, PublishStage::BeforeInstall] {
+            let f = Fixture::new("replacement-interrupted");
+            f.write("config/settings.json", "baseline");
+            let (files, work) = f.isolate("run");
+            std::fs::remove_dir_all(work.join("config")).unwrap();
+            std::fs::write(work.join("config"), "candidate").unwrap();
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let interrupted = std::panic::catch_unwind(|| {
+                publish_inner(&permit, &f.0, &files, |at, path| {
+                    if at == stage
+                        && path
+                            == if stage == PublishStage::AfterCapture {
+                                "config/settings.json"
+                            } else {
+                                "config"
+                            }
+                    {
+                        panic!("simulated interruption");
+                    }
+                })
+            });
+            assert!(interrupted.is_err());
+            drop(permit);
+            let permit = try_acquire(&f.0, "retry").unwrap().unwrap();
+            for _ in 0..2 {
+                let outcome = publish(&permit, &f.0, &files).unwrap();
+                assert!(outcome.conflicts.is_empty(), "{outcome:?}");
+                assert_eq!(f.read("config"), "candidate");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_replacement_does_not_accept_a_users_new_directory() {
+        let f = Fixture::new("inverse-user-directory");
+        f.write("config", "baseline");
+        let (files, work) = f.isolate("run");
+        std::fs::remove_file(work.join("config")).unwrap();
+        std::fs::create_dir(work.join("config")).unwrap();
+        std::fs::write(work.join("config/settings.json"), "candidate").unwrap();
+        std::fs::remove_file(f.0.join("config")).unwrap();
+        f.write("config/user.txt", "personal");
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let outcome = publish(&permit, &f.0, &files).unwrap();
+        assert!(outcome.conflicts.contains(&"config".into()));
+        assert!(!f.0.join("config/settings.json").exists());
+        assert_eq!(f.read("config/user.txt"), "personal");
+    }
+
+    #[test]
+    fn cancellation_finishes_captured_file_and_records_partial_publication() {
+        let f = Fixture::new("cancel-boundary");
+        f.write("a", "old a");
+        f.write("b", "old b");
+        let (files, work) = f.isolate("run");
+        std::fs::write(work.join("a"), "new a").unwrap();
+        std::fs::write(work.join("b"), "new b").unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut outcome = Outcome::default();
+        let result = publish_impl(
+            &permit,
+            &f.0,
+            &files,
+            &cancel,
+            &mut outcome,
+            &mut |at, path| {
+                if at == PublishStage::AfterCapture && path == "a" {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(outcome.changed, ["a"]);
+        assert_eq!(f.read("a"), "new a");
+        assert_eq!(f.read("b"), "old b");
+        let retry = publish(&permit, &f.0, &files).unwrap();
+        assert!(retry.conflicts.is_empty());
+        assert_eq!(f.read("b"), "new b");
     }
 
     #[cfg(unix)]
