@@ -997,6 +997,19 @@ const AGY_SELECT_HINT: &str = "[Use arrow keys to navigate, Enter to select]";
 ///   フォルダ信頼確認などの起動時プロンプトは別途出るため、この表が要る。
 pub static PROMPT_RULES: &[PromptRule] = &[
     // ── Antigravity CLI (agy) ───────────────────────────────────────
+    PromptRule {
+        agent: "agy",
+        needles: &[
+            "How's the CLI experience so far?",
+            "[1] Good",
+            "[2] Fine",
+            "[3] Bad",
+            "[0] Skip",
+        ],
+        avoid: &[],
+        reply: b"0",
+        desc: "Antigravity の任意アンケートをスキップ",
+    },
     // ファイル読み取り許可。見出し + 肯定選択肢の両方が出ていることを要求する。
     PromptRule {
         agent: "agy",
@@ -1814,6 +1827,9 @@ const TERMINAL_SCROLLBACK_ENV: &[(&str, &[(&str, &str)])] =
 ///
 /// **待てば直る**ので、待つ時間を CLI ごとに持つ。0 の CLI は待たない。
 const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
+    // Antigravity 1.1.27: フォルダ信頼確認後の描画中に届いた本文は捨てられる。
+    // 起動・承認応答後の待ちに加え、INPUT_READY_MARKERS で入力画面も確認する。
+    ("agy", 3_000, b"\r"),
     // Claude Code: 起動直後に書いても落ちる。実測で 3 秒あれば受け取る。
     ("claude", 3_000, b"\r"),
     // Codex: MCP を立ち上げ終わるまで確定キーを飲み込む。実機で
@@ -1860,6 +1876,32 @@ pub fn input_ready_ms(bin: &str) -> u64 {
         .find(|(b, _, _)| *b == bin)
         .map(|(_, ms, _)| *ms)
         .unwrap_or(0)
+}
+
+/// 初回描画が終わった入力画面の印。CLI 固有の値はカタログに閉じる。
+const INPUT_READY_MARKERS: &[(&str, &str)] = &[("agy", "? for shortcuts")];
+
+pub fn input_ready_marker(bin: &str) -> Option<&'static str> {
+    INPUT_READY_MARKERS
+        .iter()
+        .find(|(b, _)| *b == bin)
+        .map(|(_, marker)| *marker)
+}
+
+/// 起動バナーや信頼確認を入力可能と誤認しない。現在画面だけを調べる。
+pub fn input_surface_ready(bin: &str, screen: &str) -> bool {
+    input_ready_marker(bin).is_none_or(|marker| {
+        let lines: Vec<_> = screen.lines().map(str::trim).collect();
+        let survey =
+            screen.contains("How's the CLI experience so far?") && screen.contains("[0] Skip");
+        let busy = lines
+            .iter()
+            .any(|line| line.starts_with("esc to cancel") || line.starts_with("esc to interrupt"));
+        lines.iter().any(|line| line.starts_with(marker))
+            && lines.iter().any(|line| *line == ">")
+            && !survey
+            && !busy
+    })
 }
 
 /// 送信を確定するキー列。持たなければ `\r`。
@@ -2175,13 +2217,6 @@ impl AgentManager {
             self.active = self.sessions.len() - 1;
         }
         Some(removed)
-    }
-
-    #[cfg(test)]
-    pub fn remove(&mut self, i: usize) {
-        if let Some(session) = self.take_removed(i) {
-            crate::terminal::reap(session);
-        }
     }
 
     /// Team RunのClose用。削除完了を待つ側へreaperの札を返す。
@@ -5111,10 +5146,10 @@ mod tests {
             m
         }
 
-        /// app.rs の閉じる経路と同じ。`remove` が終了と後始末まで持っていくので
+        /// app.rs の閉じる経路と同じ。`remove_tracked` が終了と後始末まで持っていくので
         /// (crate::terminal::reap)、呼び出し側は index を渡すだけでよい。
         fn close(m: &mut AgentManager, i: usize) {
-            m.remove(i);
+            let _ = m.remove_tracked(i);
         }
 
         fn kill_all(m: &mut AgentManager) {
@@ -5338,6 +5373,64 @@ mod tests {
     /// 誰にも分からなくなる (CLAUDE.md「エージェント固有値はカタログにデータと
     /// して持つ」)。
     #[test]
+    fn アンケートと実行中の画面には次の本文を送らない() {
+        let survey = "How's the CLI experience so far? Help us improve:\n[1] Good  [2] Fine  [3] Bad  [0] Skip\n>\n? for shortcuts";
+        assert_eq!(
+            super::prompt_rule_reply(survey, Some("agy")).unwrap().0,
+            b"0"
+        );
+        assert!(super::prompt_rule_reply(survey, Some("codex")).is_none());
+        assert!(!super::input_surface_ready("agy", survey));
+        assert!(!super::input_surface_ready(
+            "agy",
+            ">\n? for shortcuts\nesc to cancel"
+        ));
+        assert!(super::input_surface_ready("agy", ">\n? for shortcuts"));
+    }
+
+    #[test]
+    fn 起動画面と信頼確認には本文を送らず入力画面を待つ() {
+        use crate::submit::{self, Act, Job, Peek};
+        use std::time::Duration;
+        let bin = super::spec_for_command("antigravity").unwrap().bin;
+        let delay = Duration::from_millis(super::input_ready_ms(bin));
+        assert!(delay >= Duration::from_secs(3));
+        let boot = "Antigravity CLI 1.1.27\nGemini 3.7 Flash (Low)";
+        let trust = "Do you trust the contents of this project?\n> Yes, I trust this folder\n↑/↓ Navigate · enter Confirm";
+        let ready = "Antigravity CLI 1.1.27\n──────────────────\n> \n──────────────────\n? for shortcuts    Gemini 3.7 Flash · lo";
+        let job = Job::user(1, "担当成果物を作成してください");
+        for (screen, age, reply, expected) in [
+            (boot, 60, None, false),
+            (trust, 60, None, false),
+            (ready, 1, None, false),
+            (ready, 60, Some(0), false),
+            (ready, 60, Some(4), true),
+        ] {
+            let peek = Peek {
+                running: true,
+                idle: true,
+                input_ready: submit::input_ready(
+                    Duration::from_secs(age),
+                    reply.map(Duration::from_secs),
+                    delay,
+                ) && super::input_surface_ready(bin, screen),
+                ..Peek::default()
+            };
+            let act = submit::decide(&job, &peek, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            assert_eq!(
+                act == Act::WriteBody,
+                expected,
+                "{screen:?}, age={age}, reply={reply:?}"
+            );
+        }
+        assert!(super::input_surface_ready("unknown", ""));
+        assert!(!super::input_surface_ready(
+            bin,
+            "途中の出力: ? for shortcuts"
+        ));
+    }
+
+    #[test]
     fn エージェントごとの癖はカタログにだけ置く() {
         // カタログは名前で引ける (持たない CLI には既定が返る)。
         assert!(
@@ -5371,5 +5464,70 @@ mod tests {
                 "submit.rs に CLI 名 {needle} が書かれている (癖はカタログへ)"
             );
         }
+    }
+}
+
+/// 仕様文の変換だけでは外部ツールを使わない。モデル・認証・通常起動設定は保持する。
+#[cfg(test)]
+pub fn specification_only_args(program: &std::path::Path) -> Vec<String> {
+    if program.file_stem().and_then(|s| s.to_str()) != Some("codex") {
+        return Vec::new();
+    }
+    let activation = &CODEX_ACTIVATION[0];
+    let home = std::env::var_os(activation.home_env)
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(activation.home_rel)));
+    let Some(home) = home else { return Vec::new() };
+    let path = home.join(activation.file_rel);
+    if !std::fs::metadata(&path).is_ok_and(|m| m.len() <= 512 * 1024) {
+        return Vec::new();
+    }
+    let Ok(config) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    specification_mcp_overrides(&config)
+}
+
+#[cfg(test)]
+fn specification_mcp_overrides(config: &str) -> Vec<String> {
+    let Ok(config) = config.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(servers) = config.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    let mut args = Vec::new();
+    for name in servers.keys() {
+        // CLIのdotted keyで曖昧になる名前は上書きしない。
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            continue;
+        }
+        args.push("-c".into());
+        args.push(format!("mcp_servers.{name}.enabled=false"));
+    }
+    args
+}
+
+#[cfg(test)]
+mod specification_launch_tests {
+    #[test]
+    fn 仕様用の上書きはmcp起動だけに限定する() {
+        let config = "model='chosen-model'\nmodel_reasoning_effort='medium'\n[mcp_servers.search]\ncommand='server'\n[mcp_servers.second]\nurl='https://example.invalid'\n";
+        let args = super::specification_mcp_overrides(config);
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "mcp_servers.search.enabled=false",
+                "-c",
+                "mcp_servers.second.enabled=false"
+            ]
+        );
+        assert!(super::specification_only_args(std::path::Path::new("claude")).is_empty());
+        assert!(super::specification_mcp_overrides("invalid=").is_empty());
     }
 }

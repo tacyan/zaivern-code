@@ -277,9 +277,7 @@ pub fn plan_assignments(
             // **待っても解決しない**のは、実装担当以外が 1 体も居ないとき
             // だけ (空いているかどうかではない)。
             let no_other = author_session.is_some()
-                && !candidates
-                    .iter()
-                    .any(|c| Some(c.session) != author_session);
+                && !candidates.iter().any(|c| Some(c.session) != author_session);
             out.unassigned.push(if no_other {
                 Unassigned::NoOtherReviewer(t.id)
             } else if only_author {
@@ -351,12 +349,24 @@ pub fn desired_sessions(tasks: &[TeamTask], max_agents: usize) -> usize {
     // **レビュー用に 1 体余分に見る。** 実装担当は自分のレビューをできない
     // ので、並列実装数ぴったりだと「全員が実装中でレビューできない」状態が
     // 生まれ、上限に当たるまで誰も先へ進めない (実測で詰まった)。
-    let need = if tasks.len() > 1 {
+    // 直接実装は統合も同じ担当プールを再利用し、後からレビュー担当を追加しない。
+    // 従来計画にはレビューを実行時に追加する経路があるため、予備枠を維持する。
+    let direct = tasks.iter().any(|task| task.key == "assemble")
+        && tasks
+            .iter()
+            .all(|task| task.role == super::model::TeamRole::Implementer && task.review_of.is_none());
+    let need = if !direct && tasks.len() > 1 {
         parallel.max(1) + 1
     } else {
-        1
+        parallel.max(1)
     };
-    need.min(max_agents)
+    // 直列の計画でも専門の担当を置く。依存の幅だけでは常に2体になる。
+    let specialties: std::collections::BTreeSet<_> = tasks
+        .iter()
+        .filter(|t| t.review_of.is_none())
+        .map(|t| t.role)
+        .collect();
+    need.max(specialties.len()).min(max_agents)
 }
 
 #[cfg(test)]
@@ -379,6 +389,21 @@ mod tests {
         t.state = TeamTaskState::Ready;
         t.files = files.iter().map(|s| s.to_string()).collect();
         t
+    }
+
+    #[test]
+    fn 直列でも仕事内容に応じて専門担当数を変える() {
+        use super::super::model::TeamRole;
+        let mut tasks = vec![
+            task(1, "implementation", &[]),
+            task(2, "test", &[1]),
+            task(3, "integration", &[2]),
+        ];
+        tasks[1].role = TeamRole::Tester;
+        tasks[2].role = TeamRole::Integrator;
+        assert_eq!(desired_sessions(&tasks, 8), 3);
+        assert_eq!(desired_sessions(&tasks, 2), 2);
+        assert_eq!(desired_sessions(&tasks[..1], 8), 1);
     }
 
     #[test]
@@ -577,8 +602,20 @@ mod tests {
         assert_eq!(
             desired_sessions(&[t1.clone(), t2], 4),
             2,
-            "レビュー用に最低 2 体"
+            "従来計画は後から追加するレビュー用に最低2体"
         );
+        let mut review = task(2, "review", &[1]);
+        review.review_of = Some(1);
+        assert_eq!(desired_sessions(&[t1.clone(), review], 4), 2);
+        let independent = vec![
+            t1.clone(),
+            task(2, "b", &[]),
+            task(3, "c", &[]),
+            task(4, "assemble", &[1, 2, 3]),
+        ];
+        assert_eq!(desired_sessions(&independent, 64), 3);
+        let serial = vec![t1, task(2, "b", &[1]), task(3, "assemble", &[1, 2])];
+        assert_eq!(desired_sessions(&serial, 64), 1);
         let many: Vec<TeamTask> = (1..=8).map(|i| task(i, &format!("k{i}"), &[])).collect();
         assert_eq!(desired_sessions(&many, 4), 4, "上限を超えない");
         assert_eq!(desired_sessions(&many, 0), 0);

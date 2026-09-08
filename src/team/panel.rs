@@ -22,8 +22,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::model::*;
 use super::gitinit;
+use super::model::*;
 use super::outbox::{self, ReadOutcome, Verdict};
 use super::persistence::{self, LoadOutcome};
 use super::planner::{PlanInput, StaticPlanner, TeamPlanner};
@@ -139,12 +139,6 @@ pub enum BoardAction {
     RetryCloseRun,
     /// **このワークスペースを Git 管理下にする** (実測の基準点を作る)。
     InitGit,
-    /// **短い指示を仕様書へ書き換えてもらう。** 計画の手前の段。
-    DraftSpec,
-    /// 書き換えた下書きを採用して、そのまま計画へ進む。
-    AcceptDraft,
-    /// 下書きを捨てる (元の指示のまま進む / やり直す)。
-    DiscardDraft,
     /// 未完了 Run の扱い。
     ResumeRun,
     DiscardRun,
@@ -162,7 +156,7 @@ pub enum DraftState {
     Idle,
     /// 依頼中。`agent` は表示用の名前。
     Running { agent: String },
-    /// 書き換わった。**まだ採用していない** — 人の確認を待つ。
+    /// 書き換わった。呼び出し側が計画を検査して自動開始する。
     Ready { agent: String, text: String },
     /// 失敗した。理由はそのまま人へ出す。
     Failed { why: String },
@@ -184,7 +178,7 @@ pub const OUTBOX_PER_TICK: usize = 32;
 const RESTORE_SCAN_MAX: usize = 256;
 
 /// 同じ元 workspace で同時に走らせてよい Run の本数。
-/// すべての Run は `run_workspace` で別々の git worktree へ隔離する。
+/// 新しい Run は開いたフォルダで実行する。実行状態は Run ID ごとに管理する。
 pub const MAX_CONCURRENT_RUNS: usize = 4;
 
 /// New Team Run フォームの入力。
@@ -242,7 +236,7 @@ pub struct NewRunForm {
 /// フォームのスライダの上限 = おすすめが出せる体の数の上限。
 /// **2 か所に数を書かない** — スライダとおすすめが別の上限を持つと、
 /// 「おすすめは 20 体なのにスライダは 16 まで」のような嘘が出る。
-pub const FORM_MAX_AGENTS: usize = 16;
+pub const FORM_MAX_AGENTS: usize = super::launch::MAX_AGENTS;
 
 impl Default for NewRunForm {
     fn default() -> Self {
@@ -251,20 +245,13 @@ impl Default for NewRunForm {
             goal_name: String::new(),
             spec_path: "SPEC.md".to_string(),
             spec_text: String::new(),
-            from_file: true,
+            from_file: false,
             // 仕様の初期値
             agents: 4,
             max_attempts: 3,
-            review_required: true,
+            review_required: false,
             agent_presets: Vec::new(),
-            roles: vec![
-                TeamRole::Planner,
-                TeamRole::Architect,
-                TeamRole::Implementer,
-                TeamRole::Tester,
-                TeamRole::Reviewer,
-                TeamRole::Integrator,
-            ],
+            roles: vec![TeamRole::Implementer],
             approval_mode: "ask".to_string(),
             cost_limit: 0.0,
             error: String::new(),
@@ -390,14 +377,31 @@ impl LiveWork {
     }
 }
 
+/// 非同期仕様生成の起動条件を固定する。編集中のフォームと混ぜない。
+pub struct DraftRequest {
+    pub workspace: std::path::PathBuf,
+    pub source: String,
+    pub options: RunOptions,
+    pub roles: Vec<TeamRole>,
+    pub title: String,
+    pub auto_start: bool,
+    pub auto_agents: bool,
+}
+
 /// Team 画面の状態。
 pub struct TeamPanel {
     pub open: bool,
     pub tab: BoardTab,
     pub form: NewRunForm,
+    pub pending_draft: Option<DraftRequest>,
     /// 仕様書の書き換えの受け口。**フォームには持たせない**
     /// (描画のたびに受信を試す形にすると真実の在り処が 2 つになる)。
     draft_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    draft_started: Option<std::time::Instant>,
+    draft_cancel: Option<super::launch::CancelFlag>,
+    draft_pid: Option<super::launch::PidSlot>,
+    workspace_preparations:
+        std::collections::BTreeMap<String, std::sync::mpsc::Receiver<Result<(), String>>>,
     pub selected_agent: Option<AgentId>,
     pub selected_task: Option<TaskId>,
     pub inspector_open: bool,
@@ -505,9 +509,14 @@ impl Default for TeamPanel {
             open: false,
             tab: BoardTab::default(),
             draft_rx: None,
+            draft_started: None,
+            draft_cancel: None,
+            draft_pid: None,
             expanded_output: None,
             needs_git: false,
             form: NewRunForm::default(),
+            pending_draft: None,
+            workspace_preparations: Default::default(),
             selected_agent: None,
             selected_task: None,
             inspector_open: false,
@@ -571,6 +580,10 @@ impl TeamPanel {
         persistence::team_dir_in(&self.home, &self.workspace)
     }
 
+    pub fn has_publications(&self) -> bool {
+        self.runs.iter().any(TeamRuntime::publication_pending)
+    }
+
     /// **いま面倒を見ているものがあるか。**
     ///
     /// あるうちは workspace を切り替えない — 切り替えると Runtime への参照が
@@ -597,12 +610,18 @@ impl TeamPanel {
                         .filter(|a| a.kind == AgentKind::ManagedSession && a.session_id.is_some())
                         .count()
                 })
-                .sum(),
+                .sum::<usize>()
+                + usize::from(self.drafting()),
             // **検証と未実行の仕事は画面側の持ち物。** Runtime が無い
             // ときに 0 と答えると、`discard_run` の直後 (Runtime は捨てた
             // が子プロセスはまだ畳んでいる) に「空いている」と嘘をつく。
             validations: self.validation_jobs.len(),
-            effects: self.pending_launches.len()
+            effects: self
+                .runs
+                .iter()
+                .filter(|rt| rt.publication_pending())
+                .count()
+                + self.pending_launches.len()
                 + self.pending_instructions.len()
                 + self.pending_manual.len()
                 + self.pending_stops.len()
@@ -619,6 +638,9 @@ impl TeamPanel {
     pub fn attach_workspace(&mut self, ws: &Path) -> Result<(), String> {
         if self.workspace == ws {
             return Ok(());
+        }
+        if !self.workspace_preparations.is_empty() {
+            return Err("隔離ワークスペースを準備中です".into());
         }
         let live = self.live_work();
         if live.is_busy() {
@@ -695,6 +717,8 @@ impl TeamPanel {
         &mut self,
         agent: &str,
         rx: std::sync::mpsc::Receiver<Result<String, String>>,
+        cancel: super::launch::CancelFlag,
+        pid: super::launch::PidSlot,
     ) {
         if matches!(self.form.draft, DraftState::Running { .. }) {
             return;
@@ -703,6 +727,9 @@ impl TeamPanel {
             agent: agent.to_string(),
         };
         self.draft_rx = Some(rx);
+        self.draft_cancel = Some(cancel);
+        self.draft_pid = Some(pid);
+        self.draft_started = Some(std::time::Instant::now());
     }
 
     /// 走っている書き換えがあるか (毎フレームの再描画要求に使う)。
@@ -721,8 +748,20 @@ impl TeamPanel {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(crate::i18n::tr("team.draft.lost"))
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // worker の終了通知自体が来なくても、画面を永久待ちにしない。
+                let limit = super::spec_writer::DRAFT_TIMEOUT + std::time::Duration::from_secs(5);
+                if !self
+                    .draft_started
+                    .is_some_and(|start| start.elapsed() >= limit)
+                {
+                    return;
+                }
+                Err(crate::i18n::tr("team.validation.timed_out"))
+            }
         };
+        self.stop_draft_worker();
+        self.draft_started = None;
         self.draft_rx = None;
         let agent = match &self.form.draft {
             DraftState::Running { agent } => agent.clone(),
@@ -739,26 +778,12 @@ impl TeamPanel {
         };
     }
 
-    /// 下書きを採用する (SPEC は直接入力へ移す)。**採用は人が決める。**
-    pub fn accept_draft(&mut self) {
-        if let DraftState::Ready { text, .. } = std::mem::take(&mut self.form.draft) {
-            self.form.spec_text = text;
-            self.form.from_file = false;
-            self.form.error.clear();
-        }
-    }
-
-    /// 下書きを捨てる (元の指示のまま進む / やり直す)。
-    pub fn discard_draft(&mut self) {
-        self.form.draft = DraftState::Idle;
-        self.draft_rx = None;
-    }
-
     /// 計画を作って Runtime を立てる (まだ開始はしない)。
     ///
     /// `roles` はフォームの「エージェントプリセット」、`title_override` は
     /// 「Goal 名」。**どちらも実際に計画へ効く** — 選べるのに何も変わらない
     /// 入力欄を残さない。
+    #[cfg(test)]
     pub fn plan_with(
         &mut self,
         spec_text: &str,
@@ -766,6 +791,18 @@ impl TeamPanel {
         opts: RunOptions,
         roles: Vec<TeamRole>,
         title_override: &str,
+    ) -> Result<(), String> {
+        self.plan_with_auto_agents(spec_text, source, opts, roles, title_override, false)
+    }
+
+    pub fn plan_with_auto_agents(
+        &mut self,
+        spec_text: &str,
+        source: &str,
+        mut opts: RunOptions,
+        roles: Vec<TeamRole>,
+        title_override: &str,
+        auto_agents: bool,
     ) -> Result<(), String> {
         // 上限とIDの所有権は、計画を組み立てる前に確定する。同じrun_idを
         // 受け入れるとworktree・outbox・保存が同じ所有者になり、Run間分離が
@@ -809,6 +846,13 @@ impl TeamPanel {
                 .map(|i| i.detail())
                 .collect::<Vec<_>>()
                 .join("\n"));
+        }
+        // 短い依頼からの暫定人数ではなく、確定した担当・依存の幅で決める。
+        // 手動指定とCLIの上限は変えない。仕事自体を人数に合わせて増やさない。
+        if auto_agents {
+            opts.agent_count = super::scheduler::desired_sessions(&plan.tasks, FORM_MAX_AGENTS)
+                .max(if opts.review_required { 2 } else { 1 });
+            self.form.agents = opts.agent_count;
         }
         // **動いているチームを別の計画で潰さない。** 置き換えると、走って
         // いる検証と起動済みのエージェントの面倒を見る相手が消える
@@ -890,9 +934,7 @@ impl TeamPanel {
                 .collect();
             if dirs.len() > RESTORE_SCAN_MAX {
                 dirs.truncate(RESTORE_SCAN_MAX);
-                skipped.push(format!(
-                    "Run保存の走査上限{RESTORE_SCAN_MAX}件を超えました"
-                ));
+                skipped.push(format!("Run保存の走査上限{RESTORE_SCAN_MAX}件を超えました"));
             }
             dirs.sort();
             for d in dirs {
@@ -1021,13 +1063,13 @@ impl TeamPanel {
     }
 
     /// 保存された Run の元 workspace / 実行 workspace 対応を検査する。
-    /// 実行中だった旧形式に worktree 記録が無ければ、復元前に専用
-    /// worktree を作り、対応の保存が成功してから Runtime を返す。
+    /// 専用 worktree の記録がある旧 Run は、その成果物を維持して復元する。
+    /// 記録がない Run は、開いたフォルダを実行先として復元する。
     fn restore_saved(
         &self,
-        mut saved: persistence::Saved,
-        save_dir: &Path,
-        read_only: bool,
+        saved: persistence::Saved,
+        _save_dir: &Path,
+        _read_only: bool,
     ) -> Result<TeamRuntime, String> {
         let source = self
             .workspace
@@ -1042,36 +1084,19 @@ impl TeamPanel {
             return Err("保存された Run は別の workspace のものです".to_string());
         }
 
-        let execution = if let Some(run_workspace) = saved.run.run_workspace.as_ref() {
-            super::run_workspace::restore(
-                &self.home,
-                &source,
-                &saved.run.run_id,
-                run_workspace,
-            )?
-        } else if read_only || saved.goal.status == GoalStatus::Ready {
-            // まだ開始していない計画プレビューは、Start 時に worktree を作る。
+        let runtime_source = if saved.run.run_workspace.is_some() {
             source.clone()
         } else {
-            let run_workspace =
-                super::run_workspace::create(&self.home, &source, &saved.run.run_id)?;
-            saved.run.workspace = run_workspace.source_workspace.clone();
-            saved.run.run_workspace = Some(run_workspace.clone());
-            if let Err(e) = persistence::save(save_dir, &saved) {
-                let cleanup = super::run_workspace::remove_clean(
-                    &self.home,
-                    &source,
-                    &saved.run.run_id,
-                    &run_workspace,
-                )
-                .err()
-                .map(|why| format!(" / worktree の後始末も失敗: {why}"))
-                .unwrap_or_default();
-                return Err(format!("{}{cleanup}", e.detail()));
-            }
-            PathBuf::from(&run_workspace.execution_workspace)
+            self.workspace.clone()
         };
-        Ok(TeamRuntime::restore_in(saved, source, execution))
+        let execution = if let Some(run_workspace) = saved.run.run_workspace.as_ref() {
+            super::run_workspace::restore(&self.home, &source, &saved.run.run_id, run_workspace)?
+        } else {
+            // 通常の Team は開いたフォルダをそのまま使う。
+            // 旧版の専用 worktree は上の分岐で元の成果物とともに復元する。
+            self.workspace.clone()
+        };
+        Ok(TeamRuntime::restore_in(saved, runtime_source, execution))
     }
 
     /// 保存された Run を消す (**確認済みの呼び出しだけ**)。
@@ -1126,14 +1151,12 @@ impl TeamPanel {
                 }
             };
             if let Some(worktree) = worktree {
-                if let Err(e) =
-                    super::run_workspace::remove_discarded(
-                        &self.home,
-                        &self.workspace,
-                        id,
-                        worktree,
-                    )
-                {
+                if let Err(e) = super::run_workspace::remove_discarded(
+                    &self.home,
+                    &self.workspace,
+                    id,
+                    worktree,
+                ) {
                     let why = format!("Run {id} の専用 worktree を削除できません: {e}");
                     self.notice = why.clone();
                     return Err(why);
@@ -1178,6 +1201,25 @@ impl TeamPanel {
             return;
         }
         if matches!(&action, TeamAction::Start) {
+            if let Some(rt) = self.rt() {
+                if super::planner::implementation_only(&rt.goal().specification)
+                    && !super::task_workspace::ready(rt.workspace(), rt.tasks())
+                {
+                    let id = rt.run().run_id.clone();
+                    if self.workspace_preparations.contains_key(&id) {
+                        return;
+                    }
+                    let source = rt.workspace().to_path_buf();
+                    let tasks = rt.tasks().to_vec();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(super::task_workspace::prepare(&source, &tasks));
+                    });
+                    self.workspace_preparations.insert(id, rx);
+                    self.notice = "隔離ワークスペースを準備しています".into();
+                    return;
+                }
+            }
             if let Err(why) = self.prepare_active_workspace() {
                 self.notice = why;
                 self.refresh_git_readiness();
@@ -1193,9 +1235,43 @@ impl TeamPanel {
         self.dirty = true;
     }
 
-    /// active Run の専用 worktree を作り、対応を保存してから開始可能にする。
-    /// worktree 作成後の保存に失敗した場合は Runtime を共有 workspace へ
-    /// 向けず、そのまま Ready で止める。
+    /// 重い worktree 作成・コピーを描画スレッドで待たない。
+    pub fn poll_workspace_preparations(&mut self) {
+        let finished: Vec<_> = self
+            .workspace_preparations
+            .iter()
+            .filter_map(|(id, rx)| match rx.try_recv() {
+                Ok(result) => Some((id.clone(), result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(_) => Some((id.clone(), Err("隔離準備が中断されました".into()))),
+            })
+            .collect();
+        for (id, result) in finished {
+            self.workspace_preparations.remove(&id);
+            let Some(pos) = self.runs.iter().position(|r| r.run().run_id == id) else {
+                continue;
+            };
+            match result {
+                Ok(()) => {
+                    if self.runs[pos].goal().status != super::model::GoalStatus::Ready
+                        || self.runs[pos].is_stopped()
+                        || self.runs[pos].is_paused()
+                    {
+                        continue;
+                    }
+                    let active = self.active;
+                    self.active = pos;
+                    self.notice.clear();
+                    self.act(TeamAction::Start);
+                    self.active = active;
+                }
+                Err(why) => self.notice = why,
+            }
+        }
+    }
+
+    /// 開いたフォルダで開始する。旧版で作成した専用 worktree の再開は維持する。
+    /// 保存に失敗した場合は Ready のままにし、エージェントを起動しない。
     fn prepare_active_workspace(&mut self) -> Result<(), String> {
         let pos = self.active;
         let Some(rt) = self.runs.get(pos) else {
@@ -1216,27 +1292,28 @@ impl TeamPanel {
 
         let id = rt.run().run_id.clone();
         let outbox_dir = outbox::prepare_run_dir(&self.state_dir(), &id)?;
-        let run_workspace = super::run_workspace::create(&self.home, &self.workspace, &id)?;
-        // まず対応を含む完全なスナップショットを書く。これが成功するまで
-        // Runtime の cwd は切り替えないので、途中失敗で共有 workspace を走らない。
-        let mut saved = self.runs[pos].to_saved();
-        saved.run.workspace = run_workspace.source_workspace.clone();
-        saved.run.run_workspace = Some(run_workspace.clone());
+        // エージェントと検証器の cwd は計画時に固定した、開いたフォルダ。
+        // 専用 worktree を作らず、未コミット・未追跡ファイルもそのまま見せる。
+        let source = self
+            .workspace
+            .canonicalize()
+            .map(crate::pathx::plain)
+            .map_err(|e| format!("作業フォルダを確認できません: {e}"))?;
+        let execution = rt
+            .workspace()
+            .canonicalize()
+            .map(crate::pathx::plain)
+            .map_err(|e| format!("実行フォルダを確認できません: {e}"))?;
+        if source != execution {
+            return Err("開いているフォルダと Team の作業先が一致しません".into());
+        }
+        if !super::planner::implementation_only(&rt.goal().specification) {
+            crate::worktree::git_out(&source, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+        }
+        let saved = self.runs[pos].to_saved();
         let dir = persistence::run_dir_in(&self.state_dir(), &id)
             .ok_or_else(|| format!("Run {id:?} の保存先を作れません"))?;
-        if let Err(e) = persistence::save(&dir, &saved) {
-            let cleanup = super::run_workspace::remove_clean(
-                &self.home,
-                &self.workspace,
-                &id,
-                &run_workspace,
-            )
-            .err()
-            .map(|why| format!(" / worktree の後始末も失敗: {why}"))
-            .unwrap_or_default();
-            return Err(format!("{}{cleanup}", e.detail()));
-        }
-        self.runs[pos].set_run_workspace(run_workspace);
+        persistence::save(&dir, &saved).map_err(|e| e.detail())?;
         self.runs[pos].set_outbox(outbox_dir);
         self.needs_save = true;
         Ok(())
@@ -1337,6 +1414,7 @@ impl TeamPanel {
             }
         }
         let mut lanes = Vec::with_capacity(order.len());
+        let mut misplaced = std::collections::HashMap::new();
         for run in order {
             let dir = self.runs[run].outbox().to_path_buf();
             if dir.as_os_str().is_empty() {
@@ -1344,6 +1422,18 @@ impl TeamPanel {
             }
             let run_id = self.runs[run].run().run_id.clone();
             let mut files = outbox::list_reports_skipping(&dir, &self.outbox_skip);
+            if let Some(parent) = dir
+                .parent()
+                .filter(|_| dir.file_name().is_some_and(|n| n == run_id.as_str()))
+            {
+                let grouped = misplaced
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| outbox::misplaced_reports(parent, &self.outbox_skip));
+                if let Some(recovered) = grouped.remove(&run_id) {
+                    files.extend(recovered);
+                }
+                files.sort();
+            }
             if let Some(cursor) = self.outbox_file_cursors.get(&run_id) {
                 let next = files.partition_point(|f| f <= cursor);
                 if !files.is_empty() {
@@ -1389,6 +1479,7 @@ impl TeamPanel {
     /// 1 ファイルだけを処理する。公平な選択と内容の検証を分け、異常な
     /// 1 ファイルが他 Run の順番まで巻き込まない。
     fn process_outbox_file(&mut self, run: usize, run_id: &str, file: &Path, now: u64) -> bool {
+        let misplaced = !file.starts_with(self.runs[run].outbox());
         let file = match outbox::claim_report(file) {
             Ok(file) => file,
             Err(e) => {
@@ -1407,7 +1498,13 @@ impl TeamPanel {
             .unwrap_or_default()
             .to_string();
         let verdict = match outbox::read_report(&file) {
-            ReadOutcome::Body(body) => outbox::judge(&stem, &body, &ids, run_id),
+            ReadOutcome::Body(body) => {
+                if misplaced {
+                    outbox::judge_misplaced(&stem, &body, &ids, run_id)
+                } else {
+                    outbox::judge(&stem, &body, &ids, run_id)
+                }
+            }
             ReadOutcome::Retry(why) => Verdict::Retry(why),
             ReadOutcome::Reject(why) => Verdict::Reject { agent: None, why },
         };
@@ -1421,16 +1518,14 @@ impl TeamPanel {
                             format!("受理した状態を保存できません: {e}"),
                         ),
                         Ok(()) => match outbox::remove_report(&file) {
-                        Ok(()) => {
-                            self.outbox_ledger.forget(&file);
-                            return outcome == super::runtime::AcceptOutcome::Applied;
-                        }
-                        Err(e) => self.outbox_retry(
-                            run,
-                            &file,
-                            format!("受理したが消せません: {e}"),
-                        ),
-                    },
+                            Ok(()) => {
+                                self.outbox_ledger.forget(&file);
+                                return outcome == super::runtime::AcceptOutcome::Applied;
+                            }
+                            Err(e) => {
+                                self.outbox_retry(run, &file, format!("受理したが消せません: {e}"))
+                            }
+                        },
                     },
                     Err(why) => self.outbox_quarantine(run, &file, Some(agent), why),
                 }
@@ -1489,7 +1584,10 @@ impl TeamPanel {
             }
             outbox::Disposal::Renamed(dest) => {
                 self.outbox_ledger.forget(file);
-                format!("{} へ名前を変えました (隔離先を作れませんでした)", dest.display())
+                format!(
+                    "{} へ名前を変えました (隔離先を作れませんでした)",
+                    dest.display()
+                )
             }
             // **消さない。** 中身は「何を書いたのか」の唯一の証拠なので、
             // 動かせないときはその場に残す。ただし読み直しは止める —
@@ -1556,7 +1654,27 @@ impl TeamPanel {
     }
 
     /// 1 tick 進める。**描画の外で呼ぶこと。**
-    pub fn pump(&mut self, obs: Observation) {
+    pub fn pump(&mut self, mut obs: Observation) {
+        // A terminal removed from the tab list can still be reaping its process
+        // tree. Preserve that observation until the actual completion fence.
+        for (id, handle) in crate::terminal::reaping_sessions() {
+            if !handle.is_finished() && !obs.sessions.iter().any(|s| s.id == id) {
+                let provider = self
+                    .runs
+                    .iter()
+                    .flat_map(|rt| rt.agents())
+                    .find(|agent| agent.session_id == Some(id))
+                    .map(|agent| agent.provider.clone())
+                    .unwrap_or_default();
+                obs.sessions.push(super::runtime::SessionObs {
+                    id,
+                    title: String::new(),
+                    provider,
+                    state: crate::coordinator::SessionState::Working,
+                    text: String::new(),
+                });
+            }
+        }
         if self.read_only {
             return;
         }
@@ -1603,6 +1721,8 @@ impl TeamPanel {
 
     /// 持ち主を指定して取り込む (Run が複数あるときはこちら)。
     fn absorb_for(&mut self, owner: RunOwner, effects: Vec<TeamEffect>) {
+        // 同じ Run の一括配送では全文を一度だけ保存する。
+        let mut context_saved = None;
         for e in effects {
             let key = e.key();
             match e {
@@ -1612,9 +1732,25 @@ impl TeamPanel {
                     session,
                     text,
                     ..
-                } => self
-                    .pending_instructions
-                    .push((owner.clone(), key, (task, session, text))),
+                } => {
+                    let Some(pos) = self.run_pos_of_owner(&owner) else {
+                        continue;
+                    };
+                    let rt = &self.runs[pos];
+                    if let Err(why) = context_saved.get_or_insert_with(|| {
+                        super::outbox::save_context(rt.outbox(), rt.goal(), rt.tasks())
+                    }) {
+                        self.ack_failed(&owner, &key);
+                        self.note_instruction_blocked(
+                            &owner,
+                            task,
+                            &format!("全文資料を保存できません: {why}"),
+                        );
+                        continue;
+                    }
+                    self.pending_instructions
+                        .push((owner.clone(), key, (task, session, text)));
+                }
                 TeamEffect::SendManualInstruction {
                     agent,
                     session,
@@ -1788,8 +1924,7 @@ impl TeamPanel {
         if i >= self.runs.len() {
             return None;
         }
-        if self.pending_close.is_some()
-            || matches!(self.close_prompt, ClosePrompt::Stopping { .. })
+        if self.pending_close.is_some() || matches!(self.close_prompt, ClosePrompt::Stopping { .. })
         {
             self.notice = crate::i18n::tr("team.close.already_running");
             return None;
@@ -1797,12 +1932,7 @@ impl TeamPanel {
         let id = self.runs[i].run().run_id.clone();
         let artifact_path = self.runs[i].workspace().display().to_string();
         if let Some(saved) = self.runs[i].run().run_workspace.as_ref() {
-            match super::run_workspace::change_state(
-                &self.home,
-                &self.workspace,
-                &id,
-                saved,
-            ) {
+            match super::run_workspace::change_state(&self.home, &self.workspace, &id, saved) {
                 Ok(super::run_workspace::ChangeState::Dirty) => {
                     self.close_prompt = ClosePrompt::Confirm {
                         run_id: id.clone(),
@@ -1980,7 +2110,18 @@ impl TeamPanel {
             return;
         };
         let owner = &pending.owner;
-        let busy = self.pending_stops.iter().any(|(o, _, _)| o == owner)
+        // Closing runs no longer tick. Still collect their publication result
+        // before deleting a workspace that the worker may be reading/writing.
+        let publishing = self.run_pos_of_owner(owner).is_some_and(|pos| {
+            let runtime = &mut self.runs[pos];
+            if runtime.publication_pending() {
+                runtime.collect_publication();
+                self.needs_save = true;
+            }
+            runtime.publication_pending()
+        });
+        let busy = publishing
+            || self.pending_stops.iter().any(|(o, _, _)| o == owner)
             || self.stop_jobs.iter().any(|j| &j.owner == owner)
             || self.validation_jobs.iter().any(|j| &j.owner == owner)
             || self.pending_validations.iter().any(|(o, _, _)| o == owner);
@@ -2012,12 +2153,8 @@ impl TeamPanel {
         // 新しい確認なしには消さない。
         if pending.policy == persistence::ClosePolicy::CleanOnly {
             if let Some(worktree) = saved.as_ref() {
-                match super::run_workspace::change_state(
-                    &self.home,
-                    &self.workspace,
-                    id,
-                    worktree,
-                ) {
+                match super::run_workspace::change_state(&self.home, &self.workspace, id, worktree)
+                {
                     Ok(super::run_workspace::ChangeState::Dirty) => {
                         if let Err(e) = persistence::mark_close_state(
                             &self.state_dir(),
@@ -2140,12 +2277,9 @@ impl TeamPanel {
                     id,
                     worktree,
                 ),
-                persistence::ClosePolicy::CleanOnly => super::run_workspace::remove_clean(
-                    &self.home,
-                    &self.workspace,
-                    id,
-                    worktree,
-                ),
+                persistence::ClosePolicy::CleanOnly => {
+                    super::run_workspace::remove_clean(&self.home, &self.workspace, id, worktree)
+                }
                 persistence::ClosePolicy::Keep => return Ok(()),
             };
             result.map_err(|e| format!("Run {id} の専用 worktree を削除できません: {e}"))?;
@@ -2207,14 +2341,13 @@ impl TeamPanel {
             // base_commitを使わずworktreeを再発見すると、基準不明としてDirtyに
             // 倒れ、clean削除の再試行まで永久に止まる。保存値は削除先には使わず、
             // cleanup_closed_run -> verified_for_removalで決定パスと再照合する。
-            let saved_workspace = persistence::run_dir_in(root, &id).and_then(|dir| {
-                match persistence::load(&dir) {
+            let saved_workspace =
+                persistence::run_dir_in(root, &id).and_then(|dir| match persistence::load(&dir) {
                     persistence::LoadOutcome::Loaded(saved) if saved.run.run_id == id => {
                         saved.run.run_workspace.clone()
                     }
                     _ => None,
-                }
-            });
+                });
             if self
                 .cleanup_closed_run(&id, saved_workspace.as_ref(), record.policy)
                 .is_ok()
@@ -2415,6 +2548,28 @@ impl TeamPanel {
     /// 仕事を渡すので、`owner()` で目印を作ると **2 本目の Run の配達に
     /// 1 本目の名札が付く**。名札が違えば結末は捨てられ、担当は `running`
     /// のまま残る (実機で 6 体中 2 体が 28 分放置された形)。
+    pub fn delivery_ready(&self, tag: &str, session: SessionId) -> Option<bool> {
+        let (run, key) = tag.split_once('|')?;
+        let rt = self.runs.get(self.run_pos_of(run)?)?;
+        if key.starts_with("manual:") {
+            return Some(!rt.is_stopped());
+        }
+        rt.instruction_delivery_ready(key, session)
+    }
+
+    pub fn handoff_integration_writer(
+        &mut self,
+        owner: &RunOwner,
+        task: TaskId,
+        session: SessionId,
+        writer: Option<crate::terminal::writer_tree::Identity>,
+    ) -> Result<(), String> {
+        let index = self
+            .run_pos_of_owner(owner)
+            .ok_or("配送先のRunがありません")?;
+        self.runs[index].handoff_integration_writer(task, session, writer)
+    }
+
     pub fn delivery_tag(&self, owner: &RunOwner, key: &str) -> Option<String> {
         self.run_pos_of_owner(owner)?;
         Some(format!("{}|{key}", owner.run_id))
@@ -2514,8 +2669,7 @@ impl TeamPanel {
             if &job.owner != owner {
                 continue;
             }
-            job.cancel
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             let pid = job.pid.load(std::sync::atomic::Ordering::Relaxed);
             if pid != 0 {
                 crate::procx::kill_tree(pid);
@@ -2537,7 +2691,48 @@ impl TeamPanel {
     /// 復元するので、まだ読んでいない報告を消すと復元後に届かない。
     /// 置き場を消すのは Run を閉じる ([`Self::close_run`]) か捨てる
     /// ([`Self::discard_run`]) ときだけ。
+    /// Extract integration custody before destroying the runtime. Reapers that
+    /// already own a removed terminal retain its permit until confirmed shutdown.
+    pub fn take_shutdown_integrations(&mut self) -> Vec<(SessionId, super::integration::Permit)> {
+        let mut remaining = Vec::new();
+        for rt in &mut self.runs {
+            for (session, permit) in rt.take_integration_for_shutdown() {
+                if let Some(handle) = crate::terminal::reaping_session(session) {
+                    if let Err(why) = permit.retire(handle) {
+                        self.notice = why;
+                    }
+                } else {
+                    remaining.push((session, permit));
+                }
+            }
+        }
+        remaining
+    }
+
+    /// 閉じる側でもプロセスを止められるよう、ランナーと同じ停止札とPIDを持つ。
+    fn stop_draft_worker(&mut self) {
+        if let Some(cancel) = self.draft_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(pid) = self.draft_pid.take() {
+            let pid = pid.load(std::sync::atomic::Ordering::Relaxed);
+            if pid != 0 {
+                crate::procx::kill_tree(pid);
+            }
+        }
+    }
+
+    fn discard_draft_work(&mut self) {
+        self.stop_draft_worker();
+        self.draft_rx = None;
+        self.draft_started = None;
+        self.pending_draft = None;
+        self.form.draft = DraftState::Idle;
+    }
+
     pub fn shutdown(&mut self) -> usize {
+        self.discard_draft_work();
+        // Runtime::drop retains any remaining custody until the writer stops.
         let killed = self.stop_all_validations_now();
         self.pending_launches.clear();
         self.pending_instructions.clear();
@@ -2572,6 +2767,8 @@ impl TeamPanel {
         if self.rt().is_none()
             && self.workspace.as_os_str().is_empty()
             && self.validation_jobs.is_empty()
+            && self.draft_rx.is_none()
+            && self.pending_draft.is_none()
         {
             return false;
         }
@@ -2774,6 +2971,119 @@ pub fn begin_app_context() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn 仕様の送り手が残っていても期限で待機を終了する() {
+        let mut panel = super::TeamPanel::default();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        panel.begin_draft(
+            "selected-agent",
+            receiver,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
+        panel.poll_draft();
+        assert!(panel.drafting());
+        panel.draft_started = Some(
+            std::time::Instant::now()
+                - super::super::spec_writer::DRAFT_TIMEOUT
+                - std::time::Duration::from_secs(6),
+        );
+        panel.poll_draft();
+        assert!(!panel.drafting());
+        assert!(matches!(panel.form.draft, super::DraftState::Failed { .. }));
+        assert!(panel.draft_rx.is_none());
+    }
+
+    #[test]
+    fn 仕様生成中の二重開始とワークスペース変更を防ぐ() {
+        let mut panel = super::TeamPanel::default();
+        let (_first_sender, first) = std::sync::mpsc::channel();
+        let (_second_sender, second) = std::sync::mpsc::channel();
+        panel.begin_draft(
+            "first",
+            first,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
+        panel.begin_draft(
+            "second",
+            second,
+            super::super::launch::new_cancel_flag(),
+            super::super::launch::new_pid_slot(),
+        );
+        assert!(
+            matches!(&panel.form.draft, super::DraftState::Running { agent } if agent == "first")
+        );
+        assert!(panel.live_work().is_busy());
+        assert!(panel
+            .attach_workspace(std::path::Path::new("another-workspace"))
+            .is_err());
+        assert!(panel.drafting());
+    }
+
+    #[test]
+    fn 閉じるか文脈を替えると仕様生成を停止し旧結果を捨てる() {
+        for adopt in [false, true] {
+            let mut panel = super::TeamPanel::default();
+            panel.home = crate::test_util::unique_temp_dir("team-draft", "shutdown");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let cancel = super::super::launch::new_cancel_flag();
+            panel.begin_draft(
+                "writer",
+                receiver,
+                cancel.clone(),
+                super::super::launch::new_pid_slot(),
+            );
+            panel.pending_draft = Some(super::DraftRequest {
+                workspace: std::path::PathBuf::new(),
+                source: "request".into(),
+                options: super::RunOptions::default(),
+                roles: vec![],
+                title: "goal".into(),
+                auto_start: true,
+                auto_agents: false,
+            });
+            sender.send(Ok("遅れて届いた仕様書".into())).unwrap();
+            if adopt {
+                assert!(panel.adopt_new_app_context());
+            } else {
+                panel.shutdown();
+            }
+            assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(sender.send(Ok("終了後の結果".into())).is_err());
+            panel.poll_draft();
+            assert!(panel.pending_draft.is_none());
+            assert!(panel.draft_rx.is_none());
+            assert!(panel.draft_pid.is_none());
+            assert!(matches!(panel.form.draft, super::DraftState::Idle));
+            assert!(!panel.has_run());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 閉じると仕様生成プロセスをworkerに頼らず停止する() {
+        use std::os::unix::process::CommandExt;
+        let mut panel = super::TeamPanel::default();
+        panel.home = crate::test_util::unique_temp_dir("team-draft", "kill");
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .process_group(0)
+            .spawn()
+            .expect("子を起こせる");
+        let pid = super::super::launch::new_pid_slot();
+        pid.store(child.id(), std::sync::atomic::Ordering::Relaxed);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        panel.begin_draft(
+            "writer",
+            receiver,
+            super::super::launch::new_cancel_flag(),
+            pid,
+        );
+        panel.shutdown();
+        assert!(!child.wait().expect("子を回収できる").success());
+    }
+
     use super::*;
 
     fn ws(name: &str) -> PathBuf {
@@ -2850,6 +3160,62 @@ mod tests {
     }
 
     #[test]
+    fn 自動人数は暫定二体を超え必要な独立担当だけに合わせる() {
+        for (count, chained, automatic, expected) in [
+            (1, false, true, 1),
+            (2, false, true, 2),
+            (3, false, true, 3),
+            (5, false, true, 5),
+            (3, true, true, 1),
+            (3, false, false, 2),
+        ] {
+            let dir = ws("automatic-agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut p = panel_at(&dir);
+            let mut spec = format!(
+                "{}\n# 成果物\n## タスク\n",
+                super::super::planner::IMPLEMENTATION_ONLY
+            );
+            for i in 1..=count {
+                let deps = if chained && i > 1 {
+                    format!("T{:02}", i - 1)
+                } else {
+                    "none".into()
+                };
+                spec.push_str(&format!(
+                    "- implementer: T{i:02} 担当{i} (deps: {deps}) (files: part{i}.md)\n"
+                ));
+            }
+            p.plan_with_auto_agents(
+                &spec,
+                "request",
+                RunOptions {
+                    agent_count: 2,
+                    review_required: false,
+                    ..RunOptions::default()
+                },
+                vec![TeamRole::Implementer],
+                "",
+                automatic,
+            )
+            .unwrap();
+            let rt = p.rt().unwrap();
+            assert_eq!(rt.run().agent_count, expected);
+            assert_eq!(rt.agents().len(), expected);
+            assert_eq!(
+                rt.tasks().len(),
+                count + 1,
+                "人数のためにタスクを増やさない"
+            );
+            if automatic {
+                assert_eq!(p.form.agents, expected);
+            }
+            drop(p);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn フォームの入力はすべて計画に効く() {
         use super::super::model::TeamRole as R;
         let dir = ws("form-effect");
@@ -2896,6 +3262,66 @@ mod tests {
         p
     }
 
+    fn attach_legacy_workspace(p: &mut TeamPanel) {
+        let id = p.owner().unwrap().run_id;
+        let worktree = super::super::run_workspace::create(&p.home, &p.workspace, &id).unwrap();
+        p.runs[p.active].set_run_workspace(worktree);
+    }
+
+    fn started_legacy_panel(dir: &Path) -> TeamPanel {
+        let mut p = panel_at(dir);
+        add_product_run(&mut p).unwrap();
+        attach_legacy_workspace(&mut p);
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        p
+    }
+
+    #[test]
+    fn 開いたフォルダの成果物は再開と終了と破棄でも残る() {
+        let dir = ws("in-place-artifacts");
+        let mut p = panel_at(&dir);
+        std::fs::write(dir.join("user-draft.txt"), "uncommitted").unwrap();
+        add_product_run(&mut p).unwrap();
+        p.act(TeamAction::Start);
+        p.pump(super::super::runtime::Observation {
+            now: 1,
+            sessions: Vec::new(),
+        });
+        for (_, _, launch) in p.take_launches() {
+            assert_eq!(launch.workspace_root, dir);
+            assert_eq!(
+                std::fs::read_to_string(launch.workspace_root.join("user-draft.txt")).unwrap(),
+                "uncommitted"
+            );
+            std::fs::write(launch.workspace_root.join("result.txt"), "done").unwrap();
+        }
+        assert!(dir.join("result.txt").exists());
+        assert!(p.rt().unwrap().run().run_workspace.is_none());
+        p.save_if_needed();
+        let mut q = panel_at(&dir);
+        q.restore_run(false).unwrap();
+        assert_eq!(q.owner().unwrap(), p.owner().unwrap());
+        q.close_run(0).unwrap();
+        finish_close_for_test(&mut q);
+        assert!(dir.join("result.txt").exists());
+        add_product_run(&mut q).unwrap();
+        q.act(TeamAction::Start);
+        q.discard_run().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("user-draft.txt")).unwrap(),
+            "uncommitted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("result.txt")).unwrap(),
+            "done"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn finish_close_for_test(p: &mut TeamPanel) -> Vec<(RunOwner, String, SessionId)> {
         let stops = p.take_stops();
         for (owner, key, _) in stops.iter().cloned() {
@@ -2904,6 +3330,35 @@ mod tests {
         p.collect_validations();
         p.progress_close();
         stops
+    }
+
+    #[test]
+    fn closing_run_waits_nonblocking_for_publication_before_cleanup() {
+        let (runtime, release, finish) = super::super::runtime::closing_publication_fixture();
+        let source = runtime.workspace().to_owned();
+        let id = runtime.run().run_id.clone();
+        let mut panel = panel_at(&source);
+        panel.runs.push(runtime);
+        panel.begin_close(&id, persistence::ClosePolicy::Keep);
+        finish_close_for_test(&mut panel);
+        assert!(panel.pending_close.is_some());
+        assert_eq!(panel.runs.len(), 1);
+        assert!(panel.has_publications());
+        assert!(super::super::integration::try_acquire(&source, "observer")
+            .unwrap()
+            .is_none());
+        release.send(()).unwrap();
+        finish(&mut panel.runs[0]);
+        panel.progress_close();
+        assert!(panel.pending_close.is_none());
+        assert!(panel.runs.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(source.join("body.txt")).unwrap(),
+            "元の本文"
+        );
+        assert!(super::super::integration::try_acquire(&source, "observer")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2921,7 +3376,10 @@ mod tests {
                 p.owner().expect("active Run").workspace,
                 "起動要求が Run の workspace を運んでいない"
             );
-            assert_ne!(spec.workspace_root, p.workspace, "元 workspace を共有した");
+            assert_eq!(
+                spec.workspace_root, p.workspace,
+                "開いたフォルダで起動していない"
+            );
             // 飾りのフィールドを残さない (役割と名前は指示文と端末名に出る)。
             assert!(!spec.name.trim().is_empty(), "名前が空");
             assert!(!spec.team_id.0.trim().is_empty(), "所属チームが空");
@@ -3024,7 +3482,7 @@ mod tests {
     /// 内部フィクスチャで `runs` を書き換えず、GUI/CLI が共通で使う
     /// `plan` → `Start` だけで4本を開始できることを要求する。
     #[test]
-    fn 製品経路から四本を別worktreeで開始し五本目を拒否する() {
+    fn 製品経路から四本を開いたフォルダで開始し五本目を拒否する() {
         let Some(dir) = git_repo("product-four-runs") else {
             println!("[skip] git を使えません");
             return;
@@ -3044,10 +3502,10 @@ mod tests {
         assert_eq!(p.runs.len(), 4);
         let workspaces: std::collections::HashSet<PathBuf> =
             owners.iter().map(|o| o.workspace.clone()).collect();
-        assert_eq!(workspaces.len(), 4, "Run 間で実行 workspace が共有された");
+        assert_eq!(workspaces.len(), 1, "開いたフォルダ以外で実行された");
         assert!(
-            workspaces.iter().all(|w| w != &dir && w.is_dir()),
-            "専用 worktree ではない: {workspaces:?}"
+            workspaces.iter().all(|w| w == &dir && w.is_dir()),
+            "開いたフォルダではない: {workspaces:?}"
         );
         let before: Vec<String> = owners.iter().map(|o| o.run_id.clone()).collect();
         let err = p
@@ -3080,7 +3538,11 @@ mod tests {
         add_product_run(&mut p).expect("計画までは作れる");
         let source = p.owner().expect("Run").workspace;
         p.act(TeamAction::Start);
-        assert_eq!(p.goal_status(), Some(GoalStatus::Ready), "共有workspaceで開始した");
+        assert_eq!(
+            p.goal_status(),
+            Some(GoalStatus::Ready),
+            "共有workspaceで開始した"
+        );
         assert_eq!(p.owner().expect("Run").workspace, source);
         assert!(p.runs[0].run().run_workspace.is_none());
         assert!(p.take_launches().is_empty(), "拒否したのに担当を起動した");
@@ -3104,11 +3566,15 @@ mod tests {
         persistence::fault_inject::fail_at(persistence::SavePhase::TmpWritten);
         p.act(TeamAction::Start);
         persistence::fault_inject::clear();
-        assert_eq!(p.goal_status(), Some(GoalStatus::Ready), "保存前にBを開始した");
+        assert_eq!(
+            p.goal_status(),
+            Some(GoalStatus::Ready),
+            "保存前にBを開始した"
+        );
         assert!(p.runs[p.active].run().run_workspace.is_none());
         assert!(a.workspace.is_dir(), "失敗でAのworktreeを消した");
-        let b_root = super::super::run_workspace::expected_root(&p.home, &dir, &b_id)
-            .expect("Bの決定パス");
+        let b_root =
+            super::super::run_workspace::expected_root(&p.home, &dir, &b_id).expect("Bの決定パス");
         assert!(!b_root.exists(), "保存に失敗したBのworktreeを残した");
         assert_eq!(p.runs.len(), 2, "失敗で既存Runを消した");
         let pos_a = p.run_pos_of_owner(&a).expect("A");
@@ -3118,7 +3584,7 @@ mod tests {
     }
 
     #[test]
-    fn 作成済み未保存のworktreeをstartが再利用して既存runを壊さない() {
+    fn 保存された旧worktreeをstartが再利用して既存runを壊さない() {
         let Some(dir) = git_repo("worktree-created-before-save") else {
             println!("[skip] git を使えません");
             return;
@@ -3130,7 +3596,8 @@ mod tests {
         add_product_run(&mut p).expect("B計画");
         let b_id = p.owner().expect("B").run_id;
         let orphan = super::super::run_workspace::create(&p.home, &dir, &b_id)
-            .expect("保存直前に落ちたworktreeを再現");
+            .expect("旧版のworktreeを再現");
+        p.runs[p.active].set_run_workspace(orphan.clone());
 
         p.act(TeamAction::Start);
         let b = p.owner().expect("B");
@@ -3150,21 +3617,28 @@ mod tests {
         };
         let mut p = panel_at(&dir);
         add_product_run(&mut p).expect("A計画");
+        attach_legacy_workspace(&mut p);
         p.act(TeamAction::Start);
         let a = p.owner().expect("A");
         add_product_run(&mut p).expect("B計画");
+        attach_legacy_workspace(&mut p);
         p.act(TeamAction::Start);
         let b = p.owner().expect("B");
         p.save_if_needed();
         let state = p.state_dir();
 
         super::super::run_workspace::fault_inject::fail_remove_once();
-        p.close_run(p.run_pos_of_owner(&a).expect("A")).expect("Aを閉じる");
+        p.close_run(p.run_pos_of_owner(&a).expect("A"))
+            .expect("Aを閉じる");
         finish_close_for_test(&mut p);
         assert!(a.workspace.is_dir(), "削除失敗を成功扱いした");
         assert!(b.workspace.is_dir(), "Aの失敗でBのworktreeを消した");
         assert!(persistence::is_closed(&state, &a.run_id), "Aの墓標が無い");
-        assert!(p.notice.contains("削除に失敗"), "診断が残らない: {}", p.notice);
+        assert!(
+            p.notice.contains("削除に失敗"),
+            "診断が残らない: {}",
+            p.notice
+        );
 
         let mut q = TeamPanel::default();
         q.home = p.home.clone();
@@ -3174,7 +3648,10 @@ mod tests {
         assert!(b.workspace.is_dir(), "再試行でBのworktreeを消した");
         assert_eq!(q.runs.len(), 1);
         assert_eq!(q.owner().expect("B").run_id, b.run_id);
-        assert!(!persistence::is_closed(&state, &a.run_id), "清掃後も墓標が残った");
+        assert!(
+            !persistence::is_closed(&state, &a.run_id),
+            "清掃後も墓標が残った"
+        );
         q.close_run(0);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3302,7 +3779,11 @@ mod tests {
             p.runs.iter().any(|rt| rt.owner() == before),
             "実行中の Run を置き換えた"
         );
-        assert_ne!(p.owner(), Some(before), "2本目が独立した Run になっていない");
+        assert_ne!(
+            p.owner(),
+            Some(before),
+            "2本目が独立した Run になっていない"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3460,7 +3941,8 @@ mod tests {
         let mut p = TeamPanel::default();
         p.home = dir.join(".zaivern-test-home");
         let _ = p.attach_workspace(&dir);
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("計画");
         assert!(
             p.needs_git,
             "HEAD が無いのに準備完了と判定した (基準点が無いまま走る)"
@@ -3469,7 +3951,10 @@ mod tests {
         p.init_git().expect("続きから作れる");
         assert!(!p.needs_git, "用意したのに旗が残っている");
         let base = super::super::changeset::capture_baseline(&dir).expect("基準点");
-        assert!(base.usable() && base.entries.is_empty(), "基準点が綺麗でない");
+        assert!(
+            base.usable() && base.entries.is_empty(),
+            "基準点が綺麗でない"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3484,7 +3969,8 @@ mod tests {
         let mut p = TeamPanel::default();
         p.home = dir.join(".zaivern-test-home");
         let _ = p.attach_workspace(&dir);
-        p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+        p.plan(SPEC, "SPEC.md", RunOptions::default())
+            .expect("計画");
         match p.init_git() {
             Err(why) => {
                 assert!(why.contains(".env"), "何を止めたのか言っていない: {why}");
@@ -3545,7 +4031,9 @@ mod tests {
         p.close_run(0).expect("1 本目を閉じる");
         let stops = p.take_stops();
         assert!(
-            stops.iter().any(|(o, k, s)| o == &first && k == "stop:1" && *s == 1),
+            stops
+                .iter()
+                .any(|(o, k, s)| o == &first && k == "stop:1" && *s == 1),
             "閉じた Run の停止が捨てられた (プロセスが残る): {stops:?}"
         );
         for (owner, key, _) in stops.iter().cloned() {
@@ -3616,11 +4104,21 @@ mod tests {
         assert_eq!(p.runs.len(), 2, "切り替えで消えた");
         let snap_a = p.snapshot().cloned().expect("Aの表示");
         assert_ne!(snap_a.goal.title, "Run B");
-        assert!(snap_a.agents.iter().any(|a| a.preview.contains("Aだけのログ")));
-        assert!(!snap_a.agents.iter().any(|a| a.preview.contains("Bだけのログ")));
+        assert!(snap_a
+            .agents
+            .iter()
+            .any(|a| a.preview.contains("Aだけのログ")));
+        assert!(!snap_a
+            .agents
+            .iter()
+            .any(|a| a.preview.contains("Bだけのログ")));
         let tasks_a: Vec<String> = p.runs[0].tasks().iter().map(|t| t.title.clone()).collect();
         assert_eq!(
-            snap_a.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            snap_a
+                .tasks
+                .iter()
+                .map(|t| t.title.clone())
+                .collect::<Vec<_>>(),
             tasks_a,
             "Aのタスク表示ではない"
         );
@@ -3631,11 +4129,21 @@ mod tests {
         p.refresh_snapshot(3);
         let snap_b = p.snapshot().expect("Bの表示");
         assert_eq!(snap_b.goal.title, "Run B");
-        assert!(snap_b.agents.iter().any(|a| a.preview.contains("Bだけのログ")));
-        assert!(!snap_b.agents.iter().any(|a| a.preview.contains("Aだけのログ")));
+        assert!(snap_b
+            .agents
+            .iter()
+            .any(|a| a.preview.contains("Bだけのログ")));
+        assert!(!snap_b
+            .agents
+            .iter()
+            .any(|a| a.preview.contains("Aだけのログ")));
         let tasks_b: Vec<String> = p.runs[1].tasks().iter().map(|t| t.title.clone()).collect();
         assert_eq!(
-            snap_b.tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>(),
+            snap_b
+                .tasks
+                .iter()
+                .map(|t| t.title.clone())
+                .collect::<Vec<_>>(),
             tasks_b,
             "Bのタスク表示ではない"
         );
@@ -4128,26 +4636,15 @@ mod tests {
     }
 
     #[test]
-    fn フォームの初期値は仕様どおり() {
+    fn フォームの初期値は直接実装を選ぶ() {
         let f = NewRunForm::default();
         assert_eq!(f.agents, 4);
         assert_eq!(f.max_attempts, 3);
-        assert!(f.review_required);
+        assert!(!f.review_required);
         assert_eq!(f.approval_mode, "ask");
-        assert!(!f.composition_touched, "開いた直後は手で変えていない");
-        // 既定のプリセットは実装 + レビュー
-        assert_eq!(
-            f.roles,
-            vec![
-                TeamRole::Planner,
-                TeamRole::Architect,
-                TeamRole::Implementer,
-                TeamRole::Tester,
-                TeamRole::Reviewer,
-                TeamRole::Integrator,
-            ],
-            "既定は選べる 6 つ全部 (2 つだとチームとして分担しない)"
-        );
+        assert!(!f.composition_touched);
+        assert_eq!(f.roles, vec![TeamRole::Implementer]);
+        assert_eq!(FORM_MAX_AGENTS, super::super::launch::MAX_AGENTS);
     }
 
     #[test]
@@ -4420,9 +4917,9 @@ mod tests {
                 spec.workspace_root, owner.workspace,
                 "起動先が Run 専用 workspace と一致しない"
             );
-            assert_ne!(
+            assert_eq!(
                 spec.workspace_root, owner.source_workspace,
-                "元 workspace を実行先として共有している"
+                "開いたフォルダを実行先として使っていない"
             );
             agents.push(spec.agent_id.clone());
             p.ack_done(launch_owner, key);
@@ -5248,7 +5745,7 @@ mod tests {
         #[test]
         fn dirty_closeは取消と保持を選べ成果物を消さない() {
             let dir = ws("close-dirty-keep");
-            let mut p = started_panel(&dir);
+            let mut p = started_legacy_panel(&dir);
             let owner = p.owner().unwrap();
             let worktree = owner.workspace.clone();
             let artifact = worktree.join("artifact.txt");
@@ -5279,7 +5776,7 @@ mod tests {
         #[test]
         fn 明示破棄はdirtyな対象runだけを削除する() {
             let dir = ws("close-explicit-discard");
-            let mut p = started_panel(&dir);
+            let mut p = started_legacy_panel(&dir);
             let a = p.owner().unwrap();
             std::fs::write(a.workspace.join("a-result.txt"), "a\n").unwrap();
             add_product_run(&mut p).unwrap();
@@ -5298,7 +5795,7 @@ mod tests {
         #[test]
         fn セッション停止完了前と削除直前に増えた成果物は削除しない() {
             let dir = ws("close-stop-and-toctou");
-            let mut p = started_panel(&dir);
+            let mut p = started_legacy_panel(&dir);
             let owner = p.owner().unwrap();
             let (_, _, launch) = p.take_launches().into_iter().next().unwrap();
             p.bind_session(&owner, &launch.agent_id, 700, None);
@@ -5310,13 +5807,19 @@ mod tests {
             let handle = crate::terminal::ReapHandle::for_test(false);
             p.watch_stop(stop_owner, key, Some(handle.clone()));
             p.progress_close();
-            assert!(owner.workspace.exists(), "セッション停止前にworktreeを削除した");
+            assert!(
+                owner.workspace.exists(),
+                "セッション停止前にworktreeを削除した"
+            );
 
             handle.finish_for_test();
             std::fs::write(owner.workspace.join("late.txt"), "late\n").unwrap();
             p.progress_close();
             assert!(matches!(p.close_prompt, ClosePrompt::Confirm { .. }));
-            assert!(owner.workspace.join("late.txt").exists(), "競合成果物を削除した");
+            assert!(
+                owner.workspace.join("late.txt").exists(),
+                "競合成果物を削除した"
+            );
             assert!(p.has_run(), "再確認前にRunを外した");
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -5340,7 +5843,9 @@ mod tests {
             let stops = finish_pending_stops(&mut p);
             for sid in &sids {
                 assert!(
-                    stops.iter().any(|(o, k, s)| o == &a && s == sid && k == &format!("stop:{sid}")),
+                    stops
+                        .iter()
+                        .any(|(o, k, s)| o == &a && s == sid && k == &format!("stop:{sid}")),
                     "セッション #{sid} の停止が出ていない (プロセスが残る): {stops:?}"
                 );
             }
@@ -5348,7 +5853,10 @@ mod tests {
             assert_eq!(run_ids(&p), vec![b.run_id.clone()], "停止完了後もAが残った");
             // 停止以外の古い仕事は実行しない (既存の保証はそのまま)。
             assert!(p.take_launches().is_empty(), "閉じた Run の起動を実行した");
-            assert!(p.take_instructions().is_empty(), "閉じた Run の指示を送った");
+            assert!(
+                p.take_instructions().is_empty(),
+                "閉じた Run の指示を送った"
+            );
             assert!(p.dropped_effects() > 0, "捨てたことを数えていない");
             // 消えた Run への ACK は落ちるだけで、残った Run を触らない。
             p.ack_done(&a, "stop:300");
@@ -5391,7 +5899,10 @@ mod tests {
                 p.bind_session(o, &spec.agent_id, sid, None);
                 b_sids.push(sid);
             }
-            assert!(!a_sids.is_empty() && !b_sids.is_empty(), "前提: 両方に担当が居る");
+            assert!(
+                !a_sids.is_empty() && !b_sids.is_empty(),
+                "前提: 両方に担当が居る"
+            );
             let pos = p.run_pos_of_owner(&a).expect("A");
             p.close_run(pos).expect("A を閉じる");
             let stops = finish_pending_stops(&mut p);
@@ -5403,7 +5914,10 @@ mod tests {
             for s in &b_sids {
                 assert!(!got.contains(s), "B のセッション #{s} まで止めようとした");
             }
-            assert!(stops.iter().all(|(o, _, _)| o == &a), "持ち主が A でない停止が混ざった");
+            assert!(
+                stops.iter().all(|(o, _, _)| o == &a),
+                "持ち主が A でない停止が混ざった"
+            );
             // B はそのまま動く。
             assert_eq!(run_ids(&p), vec![b.run_id.clone()]);
             std::fs::remove_dir_all(&dir).ok();
@@ -5490,7 +6004,10 @@ mod tests {
             // 最後の 1 本を閉じると根の控えも消え、案内そのものが出ない。
             q.close_run(0).expect("B を閉じる");
             finish_pending_stops(&mut q);
-            assert!(!persistence::has_run(&state), "根の控えが残っている (復活の温床)");
+            assert!(
+                !persistence::has_run(&state),
+                "根の控えが残っている (復活の温床)"
+            );
             let r = reopened(&q, &dir);
             assert_eq!(r.restore, RestorePrompt::None, "閉じた Run を案内した");
             let mut r = r;
@@ -5516,21 +6033,31 @@ mod tests {
             // 帯には「保存」の失敗として出る (置き場の失敗とは別の文言)。
             let want = crate::i18n::trf(
                 "team.notice.run_state_cleanup_failed",
-                &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+                &[
+                    ("run", a.run_id.clone()),
+                    ("e", "(テスト) 削除に失敗".into()),
+                ],
             );
             assert_eq!(p.notice, want, "失敗が帯に出ていない / 種類が違う");
             assert_ne!(
                 p.notice,
                 crate::i18n::trf(
                     "team.notice.outbox_cleanup_failed",
-                    &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+                    &[
+                        ("run", a.run_id.clone()),
+                        ("e", "(テスト) 削除に失敗".into())
+                    ],
                 ),
                 "保存の失敗を置き場の失敗として出した"
             );
             // 失敗が続いている次の起動: A は戻らず、保存も墓標も残る。
             let mut q = reopened(&p, &dir);
             q.restore_run(false).expect("B を復元");
-            assert_eq!(run_ids(&q), vec![b.run_id.clone()], "消せなかった A が復活した");
+            assert_eq!(
+                run_ids(&q),
+                vec![b.run_id.clone()],
+                "消せなかった A が復活した"
+            );
             assert!(a_dir.exists() && persistence::is_closed(&state, &a.run_id));
             // 消せるようになった次の起動: 片付け直して墓標も掃く。
             persistence::fault_inject::clear();
@@ -5560,7 +6087,10 @@ mod tests {
                 crate::i18n::tr("team.notice.run_closed"),
                 "NotFound を失敗として出した"
             );
-            assert!(!persistence::is_closed(&state, &a.run_id), "墓標が残っている");
+            assert!(
+                !persistence::is_closed(&state, &a.run_id),
+                "墓標が残っている"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5584,7 +6114,10 @@ mod tests {
             assert!(q.runs.is_empty());
             // 壊れた墓標から削除方針を推測しない。保存と診断材料を残す。
             assert!(a_dir.exists(), "方針不明なのに保存を消した");
-            assert!(persistence::is_closed(&state, &a.run_id), "壊れた墓標を消した");
+            assert!(
+                persistence::is_closed(&state, &a.run_id),
+                "壊れた墓標を消した"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5620,17 +6153,21 @@ mod tests {
             for bad in ["", ".", "..", "../x", "/abs", "a/b", "a\\b", "C:x"] {
                 let err = p
                     .plan(
-                    SPEC,
-                    "SPEC.md",
-                    RunOptions {
-                        run_id: bad.to_string(),
-                        ..RunOptions::default()
-                    },
-                )
+                        SPEC,
+                        "SPEC.md",
+                        RunOptions {
+                            run_id: bad.to_string(),
+                            ..RunOptions::default()
+                        },
+                    )
                     .expect_err("不正IDを開始前に拒否する");
                 assert!(err.contains("run_id"), "理由が分からない: {err}");
                 for c in &canaries {
-                    assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
+                    assert!(
+                        c.exists(),
+                        "{bad:?} で想定外の場所を消した: {}",
+                        c.display()
+                    );
                 }
                 assert!(!state.join("x").exists(), "{bad:?} で runs/ の外へ書いた");
                 assert_eq!(
@@ -5648,7 +6185,10 @@ mod tests {
                         && n != persistence::CLOSED_DIR
                 })
                 .collect();
-            assert_eq!(after_state, before_state, "状態ディレクトリに想定外のものが増えた");
+            assert_eq!(
+                after_state, before_state,
+                "状態ディレクトリに想定外のものが増えた"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -5659,7 +6199,8 @@ mod tests {
             let dir = ws("restore-cap-dedupe");
             std::fs::create_dir_all(&dir).unwrap();
             let mut p = panel_at(&dir);
-            p.plan(SPEC, "SPEC.md", RunOptions::default()).expect("計画");
+            p.plan(SPEC, "SPEC.md", RunOptions::default())
+                .expect("計画");
             for _ in 1..4 {
                 add_product_run(&mut p).expect("製品経路の複数Run");
             }
@@ -5668,8 +6209,11 @@ mod tests {
             // 5 本目 (名前は末尾に並ぶ) と、中身の run_id が別物のフォルダ。
             let mut extra = p.runs[0].to_saved();
             extra.run.run_id = "zz-extra".to_string();
-            persistence::save(&persistence::run_dir_in(&state, "zz-extra").unwrap(), &extra)
-                .expect("保存");
+            persistence::save(
+                &persistence::run_dir_in(&state, "zz-extra").unwrap(),
+                &extra,
+            )
+            .expect("保存");
             persistence::save(
                 &persistence::run_dir_in(&state, "zz-mismatch").unwrap(),
                 &extra,
@@ -5679,13 +6223,20 @@ mod tests {
             q.restore_run(false).expect("復元");
             assert_eq!(q.runs.len(), MAX_CONCURRENT_RUNS, "上限を超えて復元した");
             let ids = run_ids(&q);
-            assert!(!ids.iter().any(|i| i == "zz-mismatch"), "名前の食い違う保存を復元した");
             assert!(
-                persistence::run_dir_in(&state, "zz-mismatch").unwrap().exists(),
+                !ids.iter().any(|i| i == "zz-mismatch"),
+                "名前の食い違う保存を復元した"
+            );
+            assert!(
+                persistence::run_dir_in(&state, "zz-mismatch")
+                    .unwrap()
+                    .exists(),
                 "読まなかった保存を消した"
             );
             assert!(
-                persistence::run_dir_in(&state, "zz-extra").unwrap().exists(),
+                persistence::run_dir_in(&state, "zz-extra")
+                    .unwrap()
+                    .exists(),
                 "上限で残した保存を消した"
             );
             // もう一度復元しても増えない (重複しない)。
@@ -5758,7 +6309,10 @@ mod tests {
                 err,
                 crate::i18n::trf(
                     "team.notice.run_state_cleanup_failed",
-                    &[("run", a.run_id.clone()), ("e", "(テスト) 削除に失敗".into())],
+                    &[
+                        ("run", a.run_id.clone()),
+                        ("e", "(テスト) 削除に失敗".into())
+                    ],
                 ),
                 "失敗の伝え方が変わっている"
             );
@@ -5768,7 +6322,10 @@ mod tests {
                 let t = dict
                     .get("team.notice.run_state_cleanup_failed")
                     .unwrap_or_else(|| panic!("{lang} に訳が無い"));
-                assert!(t.contains("{e}"), "{lang}: 原因 ({{e}}) が訳から落ちている: {t}");
+                assert!(
+                    t.contains("{e}"),
+                    "{lang}: 原因 ({{e}}) が訳から落ちている: {t}"
+                );
                 assert!(t.contains("{run}"), "{lang}: どの Run か分からない: {t}");
             }
             assert!(persistence::is_closed(&state, &a.run_id), "墓標が無い");
@@ -5820,7 +6377,11 @@ mod tests {
         /// 起動要求の担当へセッションを結び、その Run の [`Lane`] を返す。
         fn bind_lane(
             p: &mut TeamPanel,
-            boot: &[(RunOwner, String, super::super::super::runtime::AgentLaunchSpec)],
+            boot: &[(
+                RunOwner,
+                String,
+                super::super::super::runtime::AgentLaunchSpec,
+            )],
             first_sid: SessionId,
         ) -> Lane {
             assert!(!boot.is_empty(), "起動要求が無い");
@@ -5840,7 +6401,10 @@ mod tests {
                 .iter()
                 .find(|a| a.id.as_str() == "team-lead")
                 .expect("team-lead が居る");
-            assert!(!rt.outbox().as_os_str().is_empty(), "置き場が決まっていない");
+            assert!(
+                !rt.outbox().as_os_str().is_empty(),
+                "置き場が決まっていない"
+            );
             std::fs::create_dir_all(rt.outbox()).expect("置き場を作れる");
             Lane {
                 owner,
@@ -5854,11 +6418,18 @@ mod tests {
         fn many_lanes(tag: &str, count: usize) -> (TeamPanel, PathBuf, Vec<Lane>) {
             assert!((1..=4).contains(&count));
             let dir = ws(tag);
-            let mut p = started_panel(&dir);
+            let legacy = tag == "outbox-multi-run-e2e";
+            let mut p = if legacy {
+                started_legacy_panel(&dir)
+            } else {
+                started_panel(&dir)
+            };
             let mut boots = vec![p.take_launches()];
             for i in 1..count {
-                add_product_run(&mut p)
-                    .unwrap_or_else(|e| panic!("{} 本目: {e}", i + 1));
+                add_product_run(&mut p).unwrap_or_else(|e| panic!("{} 本目: {e}", i + 1));
+                if legacy {
+                    attach_legacy_workspace(&mut p);
+                }
                 p.act(TeamAction::Start);
                 p.pump(super::super::super::runtime::Observation {
                     now: 2 + i as u64,
@@ -5870,8 +6441,7 @@ mod tests {
             for (i, boot) in boots.iter().enumerate() {
                 lanes.push(bind_lane(&mut p, boot, 101 + i as SessionId * 100));
             }
-            let owners: HashSet<String> =
-                lanes.iter().map(|l| l.owner.run_id.clone()).collect();
+            let owners: HashSet<String> = lanes.iter().map(|l| l.owner.run_id.clone()).collect();
             let dirs: HashSet<PathBuf> = lanes.iter().map(|l| l.dir.clone()).collect();
             assert_eq!(owners.len(), count, "Run の持ち主が衝突した");
             assert_eq!(dirs.len(), count, "outbox が衝突した");
@@ -5979,11 +6549,51 @@ mod tests {
                 p.pump_sessions(rows(&[&a, &b]), now);
             }
             assert!(tmp.exists(), "一時ファイルを消した");
-            assert_eq!(saw(&p, &a.owner, "#99"), 0, "一時ファイルを報告として取り込んだ");
+            assert_eq!(
+                saw(&p, &a.owner, "#99"),
+                0,
+                "一時ファイルを報告として取り込んだ"
+            );
             assert!(
                 p.outbox_ledger.tracked().is_empty(),
                 "一時ファイルを読み直しの台帳に載せた"
             );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn 親へ誤提出した任意名の報告を宛先runへ一度だけ届ける() {
+            let (mut p, dir, a, b) = two_lanes("outbox-parent-recovery");
+            let parent = a.dir.parent().unwrap();
+            let file = parent.join("run-1788740010.json");
+            let event = r#"{"kind":"sub_agent_started","agent_id":"recovered-child","parent_id":"team-lead","role":"tester","action":"統合報告回収"}"#;
+            std::fs::write(
+                &file,
+                envelope(&a.owner.run_id, "team-lead", "event", event),
+            )
+            .unwrap();
+            let other = parent.join("old-run.json");
+            std::fs::write(
+                &other,
+                envelope("run-unrelated", "team-lead", "event", event),
+            )
+            .unwrap();
+            let bare = parent.join("bare.json");
+            std::fs::write(&bare, event).unwrap();
+            p.pump_sessions(rows(&[&a, &b]), 100);
+            p.pump_sessions(rows(&[&a, &b]), 101);
+            let count = |p: &TeamPanel, owner: &RunOwner| {
+                p.runs[p.run_pos_of_owner(owner).unwrap()]
+                    .agents()
+                    .iter()
+                    .filter(|a| a.id.as_str() == "recovered-child")
+                    .count()
+            };
+            assert_eq!(count(&p, &a.owner), 1);
+            assert_eq!(count(&p, &b.owner), 0);
+            assert!(!file.exists());
+            assert!(other.exists());
+            assert!(bare.exists());
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -6024,7 +6634,11 @@ mod tests {
 
             p.pump_sessions(rows(&[a, b]), now);
 
-            assert_eq!(saw(p, &a.owner, "#99"), 1, "skipの後ろをRuntimeへ配送していない");
+            assert_eq!(
+                saw(p, &a.owner, "#99"),
+                1,
+                "skipの後ろをRuntimeへ配送していない"
+            );
             assert!(!omitted.exists(), "配送した報告を片付けていない");
         }
 
@@ -6058,14 +6672,12 @@ mod tests {
             p.pump_sessions(rows(&[&a, &b]), 100);
             assert!(!file.exists(), "原本をprocessingへ確保していない");
             assert!(
-                outbox::list_reports(&a.dir)
-                    .iter()
-                    .any(|path| {
-                        path.parent()
-                            .and_then(|slot| slot.parent())
-                            .and_then(|parent| parent.file_name())
-                            .is_some_and(|name| name == outbox::PROCESSING_DIR)
-                    }),
+                outbox::list_reports(&a.dir).iter().any(|path| {
+                    path.parent()
+                        .and_then(|slot| slot.parent())
+                        .and_then(|parent| parent.file_name())
+                        .is_some_and(|name| name == outbox::PROCESSING_DIR)
+                }),
                 "削除失敗なのに確保済み報告が残っていない"
             );
             let count = |panel: &TeamPanel| {
@@ -6094,7 +6706,10 @@ mod tests {
                 1,
                 "再起動後の削除再試行で状態を二重更新した"
             );
-            assert!(outbox::list_reports(&a.dir).is_empty(), "受理済み報告を片付けていない");
+            assert!(
+                outbox::list_reports(&a.dir).is_empty(),
+                "受理済み報告を片付けていない"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -6107,7 +6722,9 @@ mod tests {
             let f = a.dir.join(outbox::final_name("team-lead", "1"));
             let mut writer = std::fs::File::create(&f).unwrap();
             use std::io::Write as _;
-            writer.write_all(&full.as_bytes()[..full.len() / 2]).unwrap();
+            writer
+                .write_all(&full.as_bytes()[..full.len() / 2])
+                .unwrap();
             writer.flush().unwrap();
             p.pump_sessions(rows(&[&a, &b]), 100);
             assert!(
@@ -6121,7 +6738,9 @@ mod tests {
                 "1 回読めなかっただけで却下を記録した"
             );
             // 書き終わったら、次の tick で届く
-            writer.write_all(&full.as_bytes()[full.len() / 2..]).unwrap();
+            writer
+                .write_all(&full.as_bytes()[full.len() / 2..])
+                .unwrap();
             writer.flush().unwrap();
             p.pump_sessions(rows(&[&a, &b]), 101);
             assert_eq!(saw(&p, &a.owner, "#99"), 1, "書き終わった報告が届かない");
@@ -6148,12 +6767,20 @@ mod tests {
                     outbox::MAX_ATTEMPTS
                 );
             }
-            assert_eq!(quarantined(&p, &a.owner, &name), 0, "上限の手前で理由を出した");
+            assert_eq!(
+                quarantined(&p, &a.owner, &name),
+                0,
+                "上限の手前で理由を出した"
+            );
             p.pump_sessions(rows(&[&a, &b]), 200);
             assert!(!f.exists(), "上限に達したのに置き場に残っている");
             let pen = a.dir.join(outbox::REJECTED_DIR).join(&name);
             assert!(pen.exists(), "隔離先に無い: {}", pen.display());
-            assert_eq!(quarantined(&p, &a.owner, &name), 1, "理由が記録されていない");
+            assert_eq!(
+                quarantined(&p, &a.owner, &name),
+                1,
+                "理由が記録されていない"
+            );
             assert_eq!(saw(&p, &a.owner, "#99"), 0, "壊れた報告を解析器へ渡した");
             // 隔離したものは二度と読まない・言い直さない
             for now in 201..205 {
@@ -6165,7 +6792,10 @@ mod tests {
                 "隔離したファイルを言い直した"
             );
             assert!(pen.exists(), "隔離したファイルが消えた");
-            assert!(p.outbox_ledger.tracked().is_empty(), "隔離したのに台帳に残っている");
+            assert!(
+                p.outbox_ledger.tracked().is_empty(),
+                "隔離したのに台帳に残っている"
+            );
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -6175,7 +6805,10 @@ mod tests {
             for lane in [&a, &b] {
                 let pos = p.run_pos_of_owner(&lane.owner).unwrap();
                 assert!(
-                    p.runs[pos].agents().iter().any(|x| x.id.as_str() == "team-lead"),
+                    p.runs[pos]
+                        .agents()
+                        .iter()
+                        .any(|x| x.id.as_str() == "team-lead"),
                     "前提: どちらの Run にも team-lead が居る"
                 );
             }
@@ -6202,7 +6835,11 @@ mod tests {
             // ここで落ちる — 置き場は担当 ID だけで配るので落ちない)。
             p.pump_sessions(rows(&[&b]), 100);
             assert_eq!(saw(&p, &b.owner, "#99"), 1, "B の報告が B へ届かない");
-            assert_eq!(saw(&p, &a.owner, "#98"), 1, "観測に無いだけで A の報告を落とした");
+            assert_eq!(
+                saw(&p, &a.owner, "#98"),
+                1,
+                "観測に無いだけで A の報告を落とした"
+            );
             assert_eq!(saw(&p, &b.owner, "#98"), 0, "A の報告が B へ流れた");
             assert_eq!(saw(&p, &a.owner, "#99"), 0, "B の報告が A へ流れた");
             assert!(!fa.exists() && !fb.exists(), "受理したのに消していない");
@@ -6212,7 +6849,11 @@ mod tests {
             finish_close(&mut p);
             let fb2 = submit(&b.dir, "team-lead", "2", &report("team-lead", 97));
             p.pump_sessions(rows(&[&b]), 102);
-            assert_eq!(saw(&p, &b.owner, "#97"), 1, "A を閉じたら B へ届かなくなった");
+            assert_eq!(
+                saw(&p, &b.owner, "#97"),
+                1,
+                "A を閉じたら B へ届かなくなった"
+            );
             assert!(!fb2.exists());
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -6234,13 +6875,15 @@ mod tests {
             std::fs::create_dir_all(&out).unwrap();
             // **一度も bind していない担当**の報告。
             assert!(
-                p.runs[pos]
-                    .agents()
-                    .iter()
-                    .all(|x| x.session_id.is_none()),
+                p.runs[pos].agents().iter().all(|x| x.session_id.is_none()),
                 "前提: まだ誰にもセッションが結び付いていない"
             );
-            let f = submit(&out, spec.agent_id.as_str(), "1", &report(spec.agent_id.as_str(), 96));
+            let f = submit(
+                &out,
+                spec.agent_id.as_str(),
+                "1",
+                &report(spec.agent_id.as_str(), 96),
+            );
             // 観測は空 (プロセスが終わった直後と同じ状況)。
             p.pump_sessions(Vec::new(), 100);
             assert_eq!(saw(&p, &owner, "#96"), 1, "未 bind の報告を落とした");
@@ -6250,11 +6893,7 @@ mod tests {
             for i in 0..(outbox::MAX_ATTEMPTS + 5) {
                 p.pump_sessions(Vec::new(), 101 + u64::from(i));
             }
-            assert_eq!(
-                saw(&p, &owner, "取り込めません"),
-                0,
-                "正しい報告を隔離した"
-            );
+            assert_eq!(saw(&p, &owner, "取り込めません"), 0, "正しい報告を隔離した");
             std::fs::remove_dir_all(&dir).ok();
         }
 
@@ -6535,23 +7174,25 @@ mod tests {
                 .expect("B の基準点");
             std::fs::write(a.owner.workspace.join("only-a.txt"), "A\n").unwrap();
             std::fs::write(b.owner.workspace.join("only-b.txt"), "B\n").unwrap();
-            let changed_a = super::super::super::changeset::measure(
-                &a.owner.workspace,
-                &baseline_a,
-            )
-            .expect("A の changeset");
-            let changed_b = super::super::super::changeset::measure(
-                &b.owner.workspace,
-                &baseline_b,
-            )
-            .expect("B の changeset");
+            let changed_a =
+                super::super::super::changeset::measure(&a.owner.workspace, &baseline_a)
+                    .expect("A の changeset");
+            let changed_b =
+                super::super::super::changeset::measure(&b.owner.workspace, &baseline_b)
+                    .expect("B の changeset");
             assert_eq!(
-                changed_a.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                changed_a
+                    .iter()
+                    .map(|c| c.path.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["only-a.txt"],
                 "B の変更が A に混入した"
             );
             assert_eq!(
-                changed_b.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                changed_b
+                    .iter()
+                    .map(|c| c.path.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["only-b.txt"],
                 "A の変更が B に混入した"
             );
@@ -6606,7 +7247,10 @@ mod tests {
             assert_eq!(saw(&p, &b.owner, "#91"), 0, "A の報告が B へ流れた");
             let has_agent = |panel: &TeamPanel, owner: &RunOwner, id: &str| {
                 let pos = panel.run_pos_of_owner(owner).expect("Run");
-                panel.runs[pos].agents().iter().any(|agent| agent.id.as_str() == id)
+                panel.runs[pos]
+                    .agents()
+                    .iter()
+                    .any(|agent| agent.id.as_str() == id)
             };
             assert!(has_agent(&p, &a.owner, "e2e-a"), "A の状態が遷移しない");
             assert!(has_agent(&p, &b.owner, "e2e-b"), "B の状態が遷移しない");
@@ -6654,7 +7298,10 @@ mod tests {
                 &envelope(&b.owner.run_id, "team-lead", "event", event_b2),
             );
             q.pump_sessions(Vec::new(), 601);
-            assert!(has_agent(&q, &b.owner, "e2e-b2"), "A を閉じたら B が止まった");
+            assert!(
+                has_agent(&q, &b.owner, "e2e-b2"),
+                "A を閉じたら B が止まった"
+            );
 
             // もう一度再起動しても閉じたAは戻らず、Bの対応は維持される。
             q.shutdown();
@@ -6751,7 +7398,11 @@ mod tests {
             // ファイル名は `X-10-…` で本文だけ `X-1` を名乗っても、配らない
             let f2 = submit(&a.dir, &long, "2", &report(&short, 99));
             p.pump_sessions(rows(&[&a, &b]), 101);
-            assert_eq!(saw(&p, &a.owner, "#99"), 0, "本文の名乗りだけで {short} へ配った");
+            assert_eq!(
+                saw(&p, &a.owner, "#99"),
+                0,
+                "本文の名乗りだけで {short} へ配った"
+            );
             assert!(!f2.exists() && a.dir.join(outbox::REJECTED_DIR).join(name_of(&f2)).exists());
             std::fs::remove_dir_all(&dir).ok();
         }
@@ -6797,7 +7448,10 @@ mod tests {
             p.save_if_needed();
             let runs_a = state.join(RUNS_DIR).join(&a.owner.run_id);
             let runs_b = state.join(RUNS_DIR).join(&b.owner.run_id);
-            assert!(runs_a.exists() && runs_b.exists(), "前提: 保存の置き場がある");
+            assert!(
+                runs_a.exists() && runs_b.exists(),
+                "前提: 保存の置き場がある"
+            );
             p.notice.clear();
             let pos_a = p.run_pos_of_owner(&a.owner).unwrap();
             p.close_run(pos_a).expect("A を閉じる");
@@ -6807,7 +7461,10 @@ mod tests {
             assert!(!runs_a.exists(), "A の保存が残っている");
             assert!(b.dir.exists() && fb.exists(), "B の置き場まで消した");
             assert!(runs_b.exists(), "B の保存まで消した");
-            assert!(state.join(outbox::DIR_NAME).exists(), "親フォルダごと消した");
+            assert!(
+                state.join(outbox::DIR_NAME).exists(),
+                "親フォルダごと消した"
+            );
             assert_eq!(
                 p.notice,
                 crate::i18n::tr("team.notice.run_closed"),
@@ -6848,7 +7505,11 @@ mod tests {
                 assert!(result.is_err(), "危険なrun_id {bad:?}を計画に通した");
                 assert!(!p.has_run(), "拒否したrun_idでRunを残した");
                 for c in &canaries {
-                    assert!(c.exists(), "{bad:?} で想定外の場所を消した: {}", c.display());
+                    assert!(
+                        c.exists(),
+                        "{bad:?} で想定外の場所を消した: {}",
+                        c.display()
+                    );
                 }
             }
             std::fs::remove_dir_all(&dir).ok();
@@ -6898,7 +7559,11 @@ mod tests {
 
             p.pump_sessions(rows(&[&a, &b]), 100);
 
-            assert_eq!(saw(&p, &b.owner, "#99"), 1, "壊れた Run が後続 Run を止めた");
+            assert_eq!(
+                saw(&p, &b.owner, "#99"),
+                1,
+                "壊れた Run が後続 Run を止めた"
+            );
             assert!(!fb.exists());
             assert_eq!(
                 p.outbox_ledger.tracked().len(),
@@ -6947,7 +7612,10 @@ mod tests {
             let rejected = a.dir.join(outbox::REJECTED_DIR).join(&name);
             assert!(rejected.exists(), "巨大ファイルの証拠を隔離していない");
             assert_eq!(quarantined(&p, &a.owner, &name), 1);
-            assert!(!p.outbox_ledger.tracked().contains(&huge), "再試行台帳へ載せた");
+            assert!(
+                !p.outbox_ledger.tracked().contains(&huge),
+                "再試行台帳へ載せた"
+            );
             assert_eq!(saw(&p, &b.owner, "#99"), 1, "他Runの報告を止めた");
             assert!(!good.exists());
 
@@ -7001,7 +7669,11 @@ mod tests {
             for now in 100..103 {
                 p.pump_sessions(rows(&[&a, &b]), now);
             }
-            assert_eq!(saw(&p, &a.owner, "#99"), 1, "名前順の後方が永久に読まれない");
+            assert_eq!(
+                saw(&p, &a.owner, "#99"),
+                1,
+                "名前順の後方が永久に読まれない"
+            );
             assert!(!valid.exists());
             std::fs::remove_dir_all(&dir).ok();
         }

@@ -35,8 +35,7 @@ use super::changeset;
 use super::graph;
 use super::model::*;
 use super::persistence::{
-    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval,
-    SCHEMA_VERSION,
+    EffectRecord, EffectState, RunDoc, Saved, SeenBlockRecord, ValidationApproval, SCHEMA_VERSION,
 };
 use super::plan_schema::TeamPlan;
 use super::result_parser::{self as rp, ReportedStatus};
@@ -318,6 +317,17 @@ pub struct TeamRuntime {
     effect_order: VecDeque<String>,
     /// 既存の調停層。**割り当ての最終判断はここ。**
     co: Coordinator,
+    integration: Option<IntegrationHold>,
+    publication: Option<publication::Job>,
+    #[cfg(test)]
+    publication_hook: Option<Box<dyn FnOnce() + Send>>,
+    worker_holds: BTreeMap<TaskId, IntegrationHold>,
+    // Rebuilt from dispatch history on every restore; an empty in-memory hold
+    // is not evidence that the previous writer stopped.
+    restored_writers: BTreeSet<TaskId>,
+    writer_probe: Option<std::sync::mpsc::Receiver<Vec<TaskId>>>,
+    writer_probe_at: Instant,
+    published: BTreeSet<TaskId>,
     /// 登録済みセッション。
     registered: BTreeSet<SessionId>,
     /// 保存が要るか。
@@ -629,12 +639,12 @@ pub fn judge_stall(inp: StallInput) -> StallVerdict {
 ///
 /// **報告の囲みマーカーを 1 つも書かない。** 書くと、端末が描き返した
 /// エコーが「中身が壊れた報告」として拾われ、却下ログだけが積み上がる
-/// (`harvest` はマーカーの間を報告として読むため)。形式は最初の指示に
-/// 書いてあるので、ここでは思い出させるだけでよい。
+/// (`harvest` はマーカーの間を報告として読むため)。現在の担当と報告先を
+/// 明示し、過去の担当指示へ戻らせない。
 pub fn stall_nudge_text(task: TaskId, title: &str) -> String {
     format!(
         "[Zaivern] あなたの担当 #{task}「{title}」はまだ報告されていません。\n\
-         終わっていれば、最初の指示にある形式で報告してください。\n\
+         過去の担当の完了待ちではなく、現在の担当 #{task} を進めてください。終わっていれば現在の割り当ての形式で報告してください。\n\
          まだなら、いまどこで詰まっているかを 1〜2 行で教えてください\n\
          (承認待ち・入力待ちで止まっているなら、その旨だけで構いません)。",
         title = title.chars().take(60).collect::<String>()
@@ -854,25 +864,22 @@ fn step(
 ///
 /// # どこまでを「通り過ぎた」と見なすか
 ///
-/// **検証を抜けてレビューへ渡した後** — `Reviewing` と `RevisionRequired`
-/// の 2 つだけ。実装担当の報告は `completed` も `blocked` も `failed` も
+/// **検証を抜けてレビューへ渡した後** — `Reviewing` と `RevisionRequired`、
+/// 完了済みの `Completed`。実装担当の報告は `completed` も `blocked` も `failed` も
 /// 「実装を終える・止める」ための合図で、レビューへ渡した時点でその合図は
 /// **もう使い終わっている**。ここから先を動かすのは検証の決着とレビューの
 /// 判定であって、実装担当の報告ではない。
+/// `Validating` では受理済みの `completed` だけを見送り、実行中の検証を維持する。
+/// 完了後の遅延報告も、本文のハッシュによらず担当と状態で重複と判断する。
 ///
 /// # 見送らないもの (今までどおり試みて、断られたら記録する)
 ///
 /// * **配る前** (`Pending` / `Ready`) — 「まだ配ってもいないタスクへの
 ///   完了報告」は本物の異常。黙らせない
-/// * **実装中** (`Assigned` / `Running` / `Validating`) — 報告が正しく効く段
+/// * **実装中** (`Assigned` / `Running`) — 報告が正しく効く段
 /// * **横へ逸れた状態** (`Blocked` / `Failed` / `NeedsUser`) — 先へ進んだ
 ///   のではないので「通り過ぎた」ではない。とくに `NeedsUser` は人の判断を
 ///   待っている最中で、そこへ報告が来ること自体が読む価値のある事実
-/// * **`Completed`** — レビューを通って締めた後に「終わりました」と言って
-///   くるのは、遅れた重複と同じ形をしていても**終端へ届いた報告**であって、
-///   ここを黙らせるのは既存の約束 (`runtime_tests::断られた遷移は黙殺せず
-///   記録に残す`) を壊す。**実機で並んだ 4 行はどれも `reviewing` 発**なので、
-///   直すのに `Completed` を含める必要も無い
 ///
 /// なお**別の担当からの報告・存在しないタスクへの報告・status が読めない
 /// 報告**は、この関数の手前 ([`TeamRuntime::take_result`] と
@@ -882,21 +889,58 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
     // レビューへ渡した後か (`RevisionRequired` はレビューの判定そのもの)。
     let past_implementation = matches!(
         state,
-        TeamTaskState::Reviewing | TeamTaskState::RevisionRequired
+        TeamTaskState::Reviewing | TeamTaskState::RevisionRequired | TeamTaskState::Completed
     );
     // **報告の種類ごとに明示する。** 種類が増えた日に「どちらでもない」を
     // 選べないようにしておく (網羅で必ずコンパイルが止まる)。
     match status {
         // 「終わった」= 新しい検証回を始める合図 (`Running → Validating`)。
-        ReportedStatus::Completed => past_implementation,
+        ReportedStatus::Completed => past_implementation || state == TeamTaskState::Validating,
         // 「止まった」「失敗した」= 実装を止める合図。
         ReportedStatus::Blocked | ReportedStatus::Failed => past_implementation,
     }
 }
 
+#[path = "publication.rs"]
+mod publication;
+
+#[cfg(test)]
+#[path = "restore_writer_tests.rs"]
+mod restore_writer_tests;
+
+// 統合候補を作るセッションが止まるまで、配送前に得た排他を保持する。
+struct IntegrationHold {
+    permit: super::integration::Permit,
+    task: TaskId,
+    session: SessionId,
+}
+
+fn isolated_assembly(task: &TeamTask) -> bool {
+    task.key == "assemble" && super::task_workspace::scope(&task.files).is_some()
+}
+
+impl Drop for TeamRuntime {
+    fn drop(&mut self) {
+        for (session, permit) in self.take_integration_for_shutdown() {
+            if let Some(handle) = crate::terminal::reaping_session(session) {
+                let _ = permit.retire(handle);
+            } else {
+                permit.release_when_writer_stops();
+            }
+        }
+    }
+}
+
 impl TeamRuntime {
     /// 計画から新しい Run を作る。
-    pub fn from_plan(plan: TeamPlan, workspace: PathBuf, opts: RunOptions) -> Self {
+    pub fn from_plan(plan: TeamPlan, workspace: PathBuf, mut opts: RunOptions) -> Self {
+        if super::planner::implementation_only(&plan.goal.specification) {
+            opts.review_required = false;
+            opts.agent_count = opts.agent_count.clamp(1, super::launch::MAX_AGENTS);
+        } else if reviewer::requires_content_review(&plan.goal) {
+            opts.review_required = true;
+            opts.agent_count = opts.agent_count.max(2);
+        }
         let now = now_secs();
         let next_task_id = plan.tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
         let mut rt = Self {
@@ -937,6 +981,15 @@ impl TeamRuntime {
             effects: BTreeMap::new(),
             effect_order: VecDeque::new(),
             co: Coordinator::new(),
+            integration: None,
+            publication: None,
+            #[cfg(test)]
+            publication_hook: None,
+            worker_holds: BTreeMap::new(),
+            restored_writers: BTreeSet::new(),
+            writer_probe: None,
+            writer_probe_at: Instant::now(),
+            published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: true,
             snapshot_generation: 0,
@@ -1006,7 +1059,40 @@ impl TeamRuntime {
             .saturating_add(1);
         let seen_records = saved.run.seen_blocks.clone();
         let mut tasks = saved.tasks;
+        let restored_writers: BTreeSet<_> = tasks
+            .iter()
+            .filter(|t| t.dispatch_seq > 0 && super::task_workspace::scope(&t.files).is_some())
+            .map(|t| t.id)
+            .collect();
+        let orphaned_reviews: BTreeSet<_> = tasks
+            .iter()
+            .filter(|t| {
+                t.review_of.is_none()
+                    && t.state == TeamTaskState::Reviewing
+                    && t.review.verdict.is_none()
+            })
+            .filter_map(|target| {
+                tasks
+                    .iter()
+                    .filter(|t| t.review_of == Some(target.id))
+                    .max_by_key(|t| t.id)
+            })
+            .filter(|review| review.state == TeamTaskState::Completed)
+            .map(|review| review.id)
+            .collect();
         for t in &mut tasks {
+            if orphaned_reviews.contains(&t.id) {
+                t.state = TeamTaskState::Running;
+                t.dispatch_seq = t.dispatch_seq.saturating_add(1);
+            }
+            // 隔離統合は再配送前に新しい所有権を取得する。
+            if isolated_assembly(t) && t.state == TeamTaskState::Validating {
+                t.state = TeamTaskState::Ready;
+                t.assigned_agent = None;
+                t.reassign_pending = false;
+                t.validation.running = false;
+                t.review.running = false;
+            }
             // セッションはどれも生き残っていない。結び付きは必ず外す。
             t.assigned_session = None;
             t.coordinator_task = None;
@@ -1108,6 +1194,15 @@ impl TeamRuntime {
             effects,
             effect_order,
             co: Coordinator::new(),
+            integration: None,
+            publication: None,
+            #[cfg(test)]
+            publication_hook: None,
+            worker_holds: BTreeMap::new(),
+            restored_writers,
+            writer_probe: None,
+            writer_probe_at: Instant::now(),
+            published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: false,
             snapshot_generation: 0,
@@ -1123,6 +1218,33 @@ impl TeamRuntime {
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
+        }
+        if !rt.restored_writers.is_empty()
+            && matches!(
+                rt.goal.status,
+                GoalStatus::Completed | GoalStatus::Submitted
+            )
+        {
+            rt.goal.status = GoalStatus::Running;
+        }
+        // 旧直接統合には隔離開始時の基準が無い。現在の元フォルダを
+        // 新しい基準にすると、旧コピーによる上書きを正当化してしまう。
+        if super::planner::implementation_only(&rt.goal.specification) {
+            let unsafe_assemblies: Vec<_> = rt
+                .tasks
+                .iter()
+                .filter(|t| t.key == "assemble" && !isolated_assembly(t) && !t.state.is_terminal())
+                .map(|t| t.id)
+                .collect();
+            for id in unsafe_assemblies {
+                if let Some(task) = rt.tasks.iter_mut().find(|t| t.id == id) {
+                    if !task.last_summary.is_empty() {
+                        task.context
+                            .push(format!("旧担当の報告: {}", task.last_summary));
+                    }
+                }
+                rt.submit_with_issues(id, "旧形式の統合には開始時の比較基準がありません。既存成果と担当の候補を保持し、元フォルダへの自動反映を見送りました");
+            }
         }
         rt
     }
@@ -1381,6 +1503,7 @@ impl TeamRuntime {
     }
 
     /// 起動前に作った Run 専用 worktree へ、実行先を一度だけ切り替える。
+    #[cfg(test)]
     pub fn set_run_workspace(&mut self, run_workspace: super::run_workspace::RunWorkspace) {
         self.source_workspace = PathBuf::from(&run_workspace.source_workspace);
         self.workspace = PathBuf::from(&run_workspace.execution_workspace);
@@ -1724,9 +1847,15 @@ impl TeamRuntime {
     /// `Completed` へ行く経路を作らないこと** — 作った瞬間に「エージェントが
     /// 完了と言っただけで完了になる」が戻ってくる。
     fn settle_validation(&mut self, task: TaskId) {
+        if self.task_writer_pending(task) {
+            return;
+        }
         let Some(t) = self.task(task).cloned() else {
             return;
         };
+        if isolated_assembly(&t) && !self.published.contains(&task) {
+            return;
+        }
         if t.state != TeamTaskState::Validating || t.validation.running {
             return;
         }
@@ -1749,6 +1878,7 @@ impl TeamRuntime {
                 x.review.running = true;
                 x.review.verdict = None;
                 x.review.findings.clear();
+                x.review.quality_checks.clear();
             }
             self.tasks.push(rev);
             self.log(
@@ -1887,13 +2017,9 @@ impl TeamRuntime {
             format!("#{task} の検証が失敗したので差し戻しました"),
         );
         if escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(task),
-                None,
-                format!("#{task} の検証が上限回数まで失敗しました"),
-                format!("失敗したコマンド: {}", failed.join(", ")),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+            self.submit_with_issues(
+                task,
+                &format!("検証が再試行上限に達しました: {}", failed.join(", ")),
             );
         }
         self.dirty = true;
@@ -1935,6 +2061,7 @@ impl TeamRuntime {
             TeamAction::Resume => {
                 if self.run.paused {
                     self.run.paused = false;
+                    self.run.stopped = false;
                     self.goal.status = GoalStatus::Running;
                     self.log(TeamEventKind::RunResumed, None, None, "再開しました".into());
                 }
@@ -1943,6 +2070,16 @@ impl TeamRuntime {
                 // 新規割り当ては即座に止める。**kill は承認ゲートを通す。**
                 self.run.stopped = true;
                 self.run.paused = true;
+                if let Some(job) = &self.publication {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                    let id = job.task;
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+                        // Keep the attempt identity until its actual I/O has stopped.
+                        task.blockers.push(
+                            "統合停止を要求しました。反映済み内容は終了時に記録します".into(),
+                        );
+                    }
+                }
                 let live: Vec<SessionId> =
                     self.agents.iter().filter_map(|a| a.session_id).collect();
                 self.log(
@@ -2080,6 +2217,8 @@ impl TeamRuntime {
                     ) {
                         // 人が回すときは試行回数を 1 つ戻す (無限には回さない)。
                         t.attempts = t.attempts.min(max.saturating_sub(1));
+                        t.context
+                            .retain(|line| !line.starts_with("[report-repair:"));
                         // **`NeedsUser` から出られるのは人の操作だけ**なので、
                         // ここは意図的に表を迂回する (`sm::force` の存在理由)。
                         // 自動処理からこの行へ来る経路は無い —
@@ -2113,6 +2252,9 @@ impl TeamRuntime {
                 self.dirty = true;
             }
             TeamAction::ReassignTask(id) => {
+                if let Some(job) = self.publication.as_ref().filter(|job| job.task == id) {
+                    job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
                 // **旧担当が生きているうちは配り直さない。**
                 //
                 // 担当を外して `Ready` に戻すと、まだ編集しているかもしれない
@@ -2219,13 +2361,278 @@ impl TeamRuntime {
 
     // ── 調停ループ ──
 
+    pub fn take_integration_for_shutdown(
+        &mut self,
+    ) -> Vec<(SessionId, super::integration::Permit)> {
+        if let Some(job) = &self.publication {
+            job.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        let mut holds: Vec<_> = std::mem::take(&mut self.worker_holds)
+            .into_values()
+            .map(|hold| (hold.session, hold.permit))
+            .collect();
+        if let Some(hold) = self.integration.take() {
+            holds.push((hold.session, hold.permit));
+        }
+        holds
+    }
+
+    /// 配送前に実際の書き手を永続化する。アプリの強制終了も排他を解かない。
+    pub fn handoff_integration_writer(
+        &mut self,
+        task: TaskId,
+        session: SessionId,
+        writer: Option<crate::terminal::writer_tree::Identity>,
+    ) -> Result<(), String> {
+        let Some(task) = self.task(task) else {
+            return Err("配送先のタスクがありません".into());
+        };
+        if super::task_workspace::scope(&task.files).is_none() {
+            return Ok(());
+        }
+        let id = task.id;
+        let hold = if isolated_assembly(task) {
+            self.integration.as_mut()
+        } else {
+            self.worker_holds.get_mut(&id)
+        };
+        let Some(hold) = hold.filter(|h| h.task == id && h.session == session) else {
+            return Err("担当指示の所有権がありません".into());
+        };
+        let writer = writer
+            .filter(|w| w.pid != 0)
+            .ok_or("統合担当のプロセスを確認できません")?;
+        hold.permit.handoff_identity(writer)
+    }
+
+    /// 配送の各段で照合する。停止中は保留、旧世代・旧担当は破棄する。
+    pub fn instruction_delivery_ready(&self, key: &str, session: SessionId) -> Option<bool> {
+        let current = self.tasks.iter().any(|t| {
+            t.assigned_session == Some(session)
+                && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+                && t.assigned_agent.as_ref().is_some_and(|agent| {
+                    instruction_key(t.id, agent, t.attempts, t.dispatch_seq) == key
+                })
+        });
+        current.then_some(!self.run.paused && !self.run.stopped)
+    }
+
+    fn settle_workers(&mut self, obs: &Observation, out: &mut Vec<TeamEffect>) {
+        let finished: Vec<_> = self
+            .worker_holds
+            .iter()
+            .filter_map(|(id, hold)| {
+                let session = obs.sessions.iter().find(|s| s.id == hold.session);
+                let exited = session.is_none_or(|s| s.state == SessionState::Exited);
+                if exited {
+                    return hold.permit.writer_stopped().then_some(*id);
+                }
+                if self.run.stopped {
+                    return None;
+                }
+                let released_report = self.task(*id).is_some_and(|task| {
+                    !task.state.is_held() || task.state == TeamTaskState::Validating
+                });
+                if released_report && session.is_some_and(|s| coordinator::deliverable(s.state)) {
+                    if hold.permit.writer_stopped() {
+                        // Keep the session fenced until Exited is observed;
+                        // this tick's Idle snapshot may predate completion.
+                        return (!hold.permit.has_session_writer()).then_some(*id);
+                    }
+                    // Idle and a report do not prove background writers stopped.
+                    out.push(TeamEffect::StopAgent(hold.session));
+                }
+                None
+            })
+            .collect();
+        for id in finished {
+            self.worker_holds.remove(&id);
+            self.settle_validation(id);
+        }
+    }
+
+    pub(super) fn publication_pending(&self) -> bool {
+        self.publication.is_some()
+    }
+
+    pub(super) fn collect_publication(&mut self) {
+        let Some(job) = self.publication.as_mut() else {
+            return;
+        };
+        if job.ready.is_none() {
+            match job.rx.try_recv() {
+                Ok(report) => job.ready = Some(report),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    job.ready = Some(publication::Report { outcome: Default::default(),
+                        error: Some("統合ワーカーの結果チャネルが切断されました。統合の退避・結果記録を確認してください".into()) });
+                }
+            }
+        }
+        // Pause does not undo work. Retain the result until Resume (or Stop).
+        if self.run.paused && !self.run.stopped {
+            return;
+        }
+        let mut job = self.publication.take().unwrap();
+        let Some(task) = self.task(job.task).cloned() else {
+            return;
+        };
+        if job.owner != self.owner()
+            || job.attempts != task.attempts
+            || job.dispatch_seq != task.dispatch_seq
+        {
+            // The private receiver cannot target another Runtime. Attempt identity
+            // additionally fences reassignments within this Runtime; receipt stays on disk.
+            return;
+        }
+        let publication::Report { outcome, mut error } = job.ready.take().unwrap();
+        if job.cancel.load(std::sync::atomic::Ordering::Acquire) && error.is_none() {
+            error = Some("停止した統合の結果を記録しました（反映済み内容は保持します）".into());
+        }
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+            t.changed_files.extend(outcome.changed.iter().cloned());
+            t.changed_files.sort();
+            t.changed_files.dedup();
+            t.context.extend(outcome.notes.iter().cloned());
+        }
+        let submitted = task.state == TeamTaskState::Submitted;
+        match error {
+            None => {
+                if submitted {
+                    if !outcome.conflicts.is_empty() {
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                            t.blockers
+                                .push(format!("未統合: {}", outcome.conflicts.join(", ")));
+                        }
+                    }
+                    self.dirty = true;
+                } else if outcome.conflicts.is_empty() {
+                    self.published.insert(task.id);
+                    self.settle_validation(task.id);
+                } else {
+                    self.submit_with_issues(
+                        task.id,
+                        &format!(
+                            "元フォルダの更新を保持しました。未統合: {}",
+                            outcome.conflicts.join(", ")
+                        ),
+                    );
+                }
+            }
+            Some(why) => {
+                if submitted {
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                        t.blockers.push(why);
+                    }
+                    self.dirty = true;
+                } else {
+                    self.submit_with_issues(task.id, &why);
+                }
+            }
+        }
+
+        self.dirty = true;
+    }
+
+    fn settle_integration(&mut self, obs: &Observation, out: &mut Vec<TeamEffect>) {
+        if self.publication.is_some() {
+            self.collect_publication();
+            return;
+        }
+        let Some(hold) = self.integration.as_ref() else {
+            return;
+        };
+        let Some(task) = self.task(hold.task).cloned() else {
+            return;
+        };
+        let session = obs.sessions.iter().find(|s| s.id == hold.session);
+        let exited = session.is_none_or(|s| s.state == SessionState::Exited);
+        if exited && !hold.permit.writer_stopped() {
+            return;
+        }
+        let idle = session.is_some_and(|s| coordinator::deliverable(s.state));
+        let submitted = task.state == TeamTaskState::Submitted;
+        let reported = task.state == TeamTaskState::Validating || submitted;
+        if self.run.stopped && !exited {
+            return; // Stopは終了確認ではない。Idleでも未配送の指示が残り得る。
+        }
+        // 完了JSONが出てもWorkingなら待つ。Stopボタンだけでも解放しない。
+        if !exited && !(idle && (reported || !task.state.is_held() || self.run.stopped)) {
+            return;
+        }
+        if !hold.permit.writer_stopped() {
+            out.push(TeamEffect::StopAgent(hold.session));
+            return;
+        }
+        if !exited && hold.permit.has_session_writer() {
+            return;
+        }
+        if reported && !self.run.stopped && !self.run.paused {
+            let hold = self.integration.take().unwrap();
+            match publication::Job::start(
+                hold,
+                &task,
+                self.owner(),
+                #[cfg(test)]
+                self.publication_hook.take(),
+            ) {
+                Ok(job) => self.publication = Some(job),
+                Err(why) => self.submit_with_issues(task.id, &why),
+            }
+        } else if self.run.paused && !self.run.stopped && reported {
+            // Pauseは再開後に同じ候補を反映する。所有権も維持する。
+        } else {
+            self.integration = None;
+            if self.run.stopped || exited {
+                self.free_task(task.id, false);
+            }
+        }
+    }
+
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        self.poll_restored_writers();
+        // 旧版で報告の修正上限により停止したRunも、同じ方針で続行する。
+        let pending: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.state == TeamTaskState::NeedsUser
+                    && t.context
+                        .iter()
+                        .any(|line| line.starts_with("[report-repair:"))
+            })
+            .map(|t| (t.id, t.blockers.join(" / ")))
+            .collect();
+        for (id, detail) in pending {
+            self.submit_with_issues(id, &detail);
+        }
         // 話が進んだかを見るための控え (**状態が動いたら塊の記憶を忘れる**)。
         let states_before: Vec<(TaskId, TeamTaskState)> =
             self.tasks.iter().map(|t| (t.id, t.state)).collect();
 
+        // 終了した端末にも最後の報告が残る。所有権や session_id を外す前に
+        // 読むことで、完了直後の自然終了を未報告の失敗として回収しない。
+        let exited: Vec<_> = obs
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.state == SessionState::Exited
+                    && !s.text.trim().is_empty()
+                    && self.agents.iter().any(|a| a.session_id == Some(s.id))
+            })
+            .cloned()
+            .collect();
+        if !exited.is_empty() {
+            self.harvest(&Observation {
+                now: obs.now,
+                sessions: exited,
+            });
+        }
+        // 消滅した担当を回収する前に、前tickの報告と今回の停止観測を照合する。
+        self.settle_workers(obs, &mut out);
+        self.settle_integration(obs, &mut out);
         // 1) 観測 — セッションの状態をエージェントへ写す。
         self.sync_sessions(obs);
 
@@ -2312,7 +2719,8 @@ impl TeamRuntime {
     /// 止めるのは**人が止めたとき**と**まだ始まっていない / もう終わった
     /// とき**だけ。
     fn accepting_work(&self) -> bool {
-        !self.run.paused
+        self.publication.is_none()
+            && !self.run.paused
             && !self.run.stopped
             && !matches!(
                 self.goal.status,
@@ -2321,6 +2729,7 @@ impl TeamRuntime {
                     | GoalStatus::Paused
                     | GoalStatus::Completed
                     | GoalStatus::Failed
+                    | GoalStatus::Submitted
             )
     }
 
@@ -2409,15 +2818,23 @@ impl TeamRuntime {
                 continue;
             };
             match live.get(&sid) {
-                Some(s) => {
+                Some(s) if s.state != SessionState::Exited => {
                     if a.provider != s.provider {
                         a.provider = s.provider.clone();
                         snapshot_changed = true;
                         persistent_changed = true;
                     }
-                    let task = self.tasks.iter().find(|t| {
-                        t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
-                    });
+                    let task = self
+                        .tasks
+                        .iter()
+                        .filter(|t| {
+                            t.assigned_agent.as_ref() == Some(&a.id) && !t.state.is_terminal()
+                        })
+                        .min_by_key(|t| match t.state {
+                            TeamTaskState::Assigned | TeamTaskState::Running => 0,
+                            TeamTaskState::Validating => 1,
+                            _ => 2,
+                        });
                     let current_task = task.map(|t| t.id);
                     if a.current_task != current_task {
                         a.current_task = current_task;
@@ -2480,7 +2897,12 @@ impl TeamRuntime {
                         }
                     }
                 }
-                None => {
+                ended => {
+                    // 終了済みタブは表示に残っても再利用できない。明示的な
+                    // 終了観測では復元用の目印も捨て、旧 PTY を採用し直さない。
+                    if ended.is_some() {
+                        a.session_identity = None;
+                    }
                     // セッションが消えた。**担当を勝手に配り直さない**
                     // (前任者の停止確認は下の release_dead が既存側へ通す)。
                     a.session_id = None;
@@ -2652,7 +3074,18 @@ impl TeamRuntime {
                     out.push(TeamEffect::SendManualInstruction {
                         agent: h.agent.clone(),
                         session: h.session,
-                        text: stall_nudge_text(h.task, &h.title),
+                        text: {
+                            let mut text = stall_nudge_text(h.task, &h.title);
+                            if let Some(t) = self.task(h.task) {
+                                text.push_str(&format!("\n最新の担当詳細は `{}` の tasks 内の ID {} を確認してください。仲間の完了連絡は担当変更ではありません。\n",
+                                    super::outbox::context_path(&self.outbox).display(), t.id));
+                                if let Some(target) = t.review_of {
+                                    text.push_str(&format!("現在はレビュー作業 #{}、判定対象 #{} です。実物を読み、APPROVE または REQUEST_CHANGES を判定し、現在のoutbox `{}` に kind=review、payload.task_id={} で提出してください。以前の実装タスクのレビュー待ちを続けないでください。判定できない点は findings に残してください。",
+                                        t.id, target, self.outbox.display(), target));
+                                }
+                            }
+                            text
+                        },
                         key: manual_instruction_key(&h.agent, id),
                     });
                     if let Some(w) = self.stalls.get_mut(&h.agent) {
@@ -2661,6 +3094,15 @@ impl TeamRuntime {
                     self.dirty = true;
                 }
                 StallVerdict::Reclaim => {
+                    // 読み取り専用レビューは担当を再配置せず、未判定を残して提出する。
+                    // 実装者の編集権を持つタスクには適用しない。
+                    if self
+                        .task(h.task)
+                        .is_some_and(|t| t.review_of.is_some() && t.files.is_empty())
+                    {
+                        self.submit_with_issues(h.task, "現在のレビュー担当を再通知しましたが、猶予時間内に判定が届きませんでした");
+                        continue;
+                    }
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == h.task) {
                         t.reassign_pending = true;
                         t.updated_at = now_secs();
@@ -2723,6 +3165,8 @@ impl TeamRuntime {
             .tasks
             .iter()
             .filter(|t| t.state.is_held())
+            .filter(|t| self.publication.as_ref().is_none_or(|job| job.task != t.id))
+            .filter(|t| !self.task_writer_pending(t.id))
             .filter_map(|t| t.assigned_session.map(|s| (t.id, s)))
             .filter(|(_, s)| !alive.contains(s))
             .collect();
@@ -2834,7 +3278,7 @@ impl TeamRuntime {
             // **却下は画面経路でも記録済み** (`take_*` が理由を時系列へ残す)。
             // ここで結果を捨ててよいのは、画面には再送の口が無いため。
             for body in p.results {
-                let _ = self.take_result(&p.agent, &body);
+                let _ = self.take_result_from(&p.agent, &body, true);
             }
             for body in p.reviews {
                 let _ = self.take_review(&p.agent, &body);
@@ -2912,8 +3356,9 @@ impl TeamRuntime {
             });
         }
         if delivered == 0 {
-            return Err(last_why
-                .unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string()));
+            return Err(
+                last_why.unwrap_or_else(|| "伝言を渡せる相手が 1 人も居ませんでした".to_string())
+            );
         }
         Ok(())
     }
@@ -2923,11 +3368,10 @@ impl TeamRuntime {
     /// 伝言は*連絡*であって*指示*ではない。相手の端末には両者の区別が
     /// 無いので、こちらが毎回書く。担当を持っていなければ何も足さない。
     fn standing_order(&self, to: &AgentId) -> String {
-        let Some(t) = self
-            .tasks
-            .iter()
-            .find(|t| t.assigned_agent.as_ref() == Some(to) && t.state.is_held())
-        else {
+        let Some(t) = self.tasks.iter().find(|t| {
+            t.assigned_agent.as_ref() == Some(to)
+                && matches!(t.state, TeamTaskState::Assigned | TeamTaskState::Running)
+        }) else {
             return String::new();
         };
         format!(
@@ -2938,7 +3382,7 @@ impl TeamRuntime {
              **担当を置いて別の作業へ移らないでください。**",
             t.id,
             t.title.chars().take(60).collect::<String>()
-        )
+        ) + &t.review_of.map(|target| format!("\nこの担当はレビューです。RESULTではなく [ZAI-TEAM-REVIEW] を提出し、task_id は対象 #{target} にしてください。")).unwrap_or_default()
     }
 
     /// この Run が**その仕事を出したか** (冪等キーで見る)。
@@ -2975,6 +3419,9 @@ impl TeamRuntime {
     pub fn close(&mut self) -> Vec<TeamEffect> {
         self.run.stopped = true;
         self.run.paused = true;
+        if let Some(job) = &self.publication {
+            job.cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
         let mut out: Vec<TeamEffect> = self
             .agents
             .iter()
@@ -3042,14 +3489,20 @@ impl TeamRuntime {
         }
         let applied = match kind {
             super::outbox::Kind::Result => self.take_result(agent, body),
-            super::outbox::Kind::Review => self.take_review(agent, body),
-            super::outbox::Kind::Message => self.take_message(agent, body),
-            super::outbox::Kind::Event => self.take_event(agent, body, now),
+            super::outbox::Kind::Review => self
+                .take_review(agent, body)
+                .map(|()| AcceptOutcome::Applied),
+            super::outbox::Kind::Message => self
+                .take_message(agent, body)
+                .map(|()| AcceptOutcome::Applied),
+            super::outbox::Kind::Event => self
+                .take_event(agent, body, now)
+                .map(|()| AcceptOutcome::Applied),
         };
         // **適用できたときだけ印を付ける。**
-        applied?;
+        let outcome = applied?;
         self.mark_seen(key);
-        Ok(AcceptOutcome::Applied)
+        Ok(outcome)
     }
 
     /// **置き場のファイルを取り込めなかった** (読む側 = `panel` が呼ぶ)。
@@ -3160,8 +3613,17 @@ impl TeamRuntime {
     }
 
     /// 完了報告 1 件。
-    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<(), String> {
-        let doc = match rp::parse_result(body) {
+    fn take_result(&mut self, agent: &AgentId, body: &str) -> Result<AcceptOutcome, String> {
+        self.take_result_from(agent, body, false)
+    }
+
+    fn take_result_from(
+        &mut self,
+        agent: &AgentId,
+        body: &str,
+        screen: bool,
+    ) -> Result<AcceptOutcome, String> {
+        let mut doc = match rp::parse_result(body) {
             Ok(d) => d,
             Err(e) => return Err(self.reject(agent, None, e.detail())),
         };
@@ -3183,9 +3645,37 @@ impl TeamRuntime {
             ));
         }
 
+        // ファイル計測や却下・再提出より先に、受理済みの担当報告を除外する。
+        // 別agent_idや未知statusはここでも拒否し、なりすましを重複にしない。
+        if matches!(
+            task.state,
+            TeamTaskState::Completed
+                | TeamTaskState::Reviewing
+                | TeamTaskState::RevisionRequired
+                | TeamTaskState::Validating
+        ) {
+            let status = rp::validate_result_header(&doc, &task)
+                .map_err(|e| self.reject(agent, None, e.detail()))?;
+            if report_already_passed(task.state, status) {
+                return Ok(AcceptOutcome::Duplicate);
+            }
+        }
+
+        if task.review_of.is_some() {
+            let why = self.review_report_retry(
+                agent,
+                &task,
+                "レビューは通常のRESULTでは完了できません。明示的な判定が必要です",
+            );
+            return Err(why);
+        }
+
         // **判定の根拠はこちらが測ったもの。** 自己申告 (`changed_files`)
         // は補助情報として持ち越すだけ。
         let (evidence, attribution) = self.file_evidence(&task);
+        if screen {
+            rp::repair_screen_paths(&mut doc, &task, &evidence, &self.workspace);
+        }
         // **帰属できないことを黙って捨てない。** 却下ではないので
         // `Rejected` では残さない (正しく働いた担当が却下ログに並ぶのが
         // 元の不具合)。人が時系列で追えるように、事実として 1 行残す。
@@ -3210,8 +3700,25 @@ impl TeamRuntime {
         // 受理の関門は 2 段: 報告の形と担当範囲 (`rp::accept`) と、
         // Web の成果物なら読み込みの実在 (`web_gate`)。どちらで落ちても
         // 本人へ同じ形で伝える。
+        let finished_report = matches!(
+            doc.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "failed" | "blocked"
+        );
         let verdict = rp::accept(doc, &task, &evidence)
             .map_err(|e| e.detail())
+            .and_then(|acc| {
+                if acc.status == rp::ReportedStatus::Completed
+                    && !super::planner::implementation_only(&self.goal.specification)
+                {
+                    super::acceptance::verify(
+                        &self.goal.specification,
+                        &self.workspace,
+                        &task.files,
+                        task.role == TeamRole::Integrator,
+                    )?;
+                }
+                Ok(acc)
+            })
             .and_then(|acc| match self.web_gate(&task, &acc) {
                 None => Ok(acc),
                 Some(why) => Err(why),
@@ -3219,9 +3726,14 @@ impl TeamRuntime {
         match verdict {
             Ok(acc) => {
                 self.apply_accepted(agent, acc, attribution);
-                Ok(())
+                Ok(AcceptOutcome::Applied)
             }
             Err(detail) => {
+                if finished_report && !self.allow_report_repair(agent, &task, &detail) {
+                    return Err(format!(
+                        "#{task_id}: 自動再提出の上限に達しました: {detail}"
+                    ));
+                }
                 // **却下は必ず本人へ伝える** (黙って捨てると永久に待つ)。
                 let why = self.reject(
                     agent,
@@ -3234,6 +3746,21 @@ impl TeamRuntime {
                     )));
                     t.context = clamp_list(std::mem::take(&mut t.context));
                     t.updated_at = now_secs();
+                }
+                if let Some(session) = self
+                    .agent(agent)
+                    .and_then(|a| a.session_id)
+                    .or(task.assigned_session)
+                {
+                    self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                        agent: agent.clone(), session,
+                        key: manual_instruction_key(agent, self.next_event_id),
+                        text: if super::planner::implementation_only(&self.goal.specification) {
+                            format!("{why}\n担当 #{} の指摘された不一致だけを修正して再提出してください。報告形式やパス表記だけの問題なら成果物を作り直さず、報告だけを訂正してください。成果物自体に不足がある場合は担当範囲で修正・確認し、実施した検証を正確に報告してください。", task.id)
+                        } else {
+                            format!("{why}\n担当 #{} は継続中です。実物の不一致を修正・再検証して正式完了報告を再提出してください。計画の検証条件を緩めて通さないでください。", task.id)
+                        },
+                    });
                 }
                 self.dirty = true;
                 Err(why)
@@ -3250,7 +3777,9 @@ impl TeamRuntime {
     /// Chrome を起こす (数秒) ので、描画スレッドのここではしない —
     /// `zai team check` と検証担当の手に置く。
     fn web_gate(&self, task: &TeamTask, acc: &rp::AcceptedResult) -> Option<String> {
-        if acc.status != ReportedStatus::Completed {
+        if super::planner::implementation_only(&self.goal.specification)
+            || acc.status != ReportedStatus::Completed
+        {
             return None;
         }
         let touches_web = task
@@ -3266,7 +3795,10 @@ impl TeamRuntime {
             Ok(bad) if bad.is_empty() => None,
             Ok(bad) => Some(format!(
                 "読み込むと言ったファイルがありません: {}",
-                bad.iter().map(|d| d.detail()).collect::<Vec<_>>().join(" / ")
+                bad.iter()
+                    .map(|d| d.detail())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
             )),
             // 測れないときは止めない (大きすぎる作業場)。
             Err(_) => None,
@@ -3417,7 +3949,11 @@ impl TeamRuntime {
         // Zaivern 自身が走らせた検証の結果 ([`Self::settle_validation`]) が
         // 決める。`advance` が `Validating` のタスクへ `RunValidation` を出し、
         // `note_validation` が実測を受けて決着させる。
-        if acc.status == ReportedStatus::Completed {
+        if acc.status == ReportedStatus::Completed
+            && super::planner::implementation_only(&self.goal.specification)
+        {
+            self.settle_validation(acc.task_id);
+        } else if acc.status == ReportedStatus::Completed {
             self.log(
                 TeamEventKind::ValidationStarted,
                 Some(agent.clone()),
@@ -3439,15 +3975,116 @@ impl TeamRuntime {
         }
 
         if let Some((tid, why)) = escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(tid),
+            self.submit_with_issues(tid, &why);
+        }
+        self.dirty = true;
+    }
+
+    /// 不正な報告では担当を閉じず、正しい報告契約を同じ端末に再通知する。
+    fn review_report_retry(&mut self, agent: &AgentId, task: &TeamTask, detail: &str) -> String {
+        if !self.allow_report_repair(agent, task, detail) {
+            return format!("#{}: 自動再提出の上限に達しました: {detail}", task.id);
+        }
+        let target = task.review_of.unwrap_or(task.id);
+        let why = format!("#{0} のレビュー報告を却下: {detail}", task.id);
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+            if t.context.iter().any(|c| c == &why) {
+                return why;
+            }
+            t.context.push(why.clone());
+        }
+        if let Some(session) = self
+            .agent(agent)
+            .and_then(|a| a.session_id)
+            .or(task.assigned_session)
+        {
+            let id = self.next_event_id;
+            self.pending_msgs.push(TeamEffect::SendManualInstruction {
+                agent: agent.clone(), session,
+                key: manual_instruction_key(agent, id),
+                text: format!("{why}\nレビュー作業 #{} は継続中です。RESULTではなく [ZAI-TEAM-REVIEW] で task_id: {target}, verdict: APPROVE または REQUEST_CHANGES, findings, summary を報告してください。判定は実際の確認結果に基づけてください。", task.id),
+            });
+        }
+        self.dirty = true;
+        self.reject(agent, None, why)
+    }
+
+    /// 再提出の上限は保存されるtask contextに持つ。再起動でループを再開しない。
+    /// 作業終了報告後なので、既存の自己報告による解放経路を使う。
+    fn allow_report_repair(&mut self, _agent: &AgentId, task: &TeamTask, detail: &str) -> bool {
+        if matches!(
+            task.state,
+            TeamTaskState::NeedsUser | TeamTaskState::Submitted | TeamTaskState::Completed
+        ) {
+            return false;
+        }
+        let prefix = format!("[report-repair:{}]", task.attempts);
+        let limit = usize::from(self.run.max_attempts.clamp(1, 3));
+        let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) else {
+            return false;
+        };
+        let count = t
+            .context
+            .iter()
+            .filter(|line| line.starts_with(&prefix))
+            .count()
+            + 1;
+        t.context.push(clamp_text(&format!("{prefix} {detail}")));
+        t.context = clamp_list(std::mem::take(&mut t.context));
+        t.updated_at = now_secs();
+        self.dirty = true;
+        if count < limit {
+            return true;
+        }
+        self.submit_with_issues(task.id, detail);
+        false
+    }
+
+    /// 修正上限時は、合格を偽装せず現状提出として閉じ、後続作業を進める。
+    fn submit_with_issues(&mut self, id: TaskId, detail: &str) {
+        let target = self.task(id).and_then(|t| t.review_of);
+        let ids: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.id == id
+                    || Some(t.id) == target
+                    || (t.review_of == Some(id) && !t.state.is_held())
+            })
+            .filter(|t| !matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
+            .map(|t| t.id)
+            .collect();
+        for tid in &ids {
+            let agent = self.task(*tid).and_then(|t| t.assigned_agent.clone());
+            self.release_after_self_report(*tid);
+            if let Some(ct) = self.task(*tid).and_then(|t| t.coordinator_task) {
+                self.co.note_done(ct, Instant::now());
+            }
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == *tid) {
+                // ユーザー指定の現状提出。Completed/APPROVEにはしない。
+                t.state = sm::force(t.state, TeamTaskState::Submitted);
+                t.blockers = vec![clamp_text(detail)];
+                t.last_summary = clamp_text(&format!("未解決事項付きで提出: {detail}"));
+                t.validation.running = false;
+                t.review.running = false;
+                t.assigned_agent = None;
+                t.assigned_session = None;
+                t.updated_at = now_secs();
+            }
+            if let Some(agent) = agent {
+                self.pending_msgs.retain(|m| !matches!(m, TeamEffect::SendManualInstruction { agent: a, .. } if a == &agent));
+            }
+            self.log(
+                TeamEventKind::TaskCompleted,
                 None,
-                why,
-                format!("#{tid} は自動では進められません"),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+                None,
+                format!("#{tid} を未解決事項付きで提出しました: {detail}"),
             );
         }
+        self.decisions.retain(|d| {
+            !(d.kind == DecisionKind::AttemptsExhausted
+                && d.task_id.is_some_and(|id| ids.contains(&id)))
+        });
         self.dirty = true;
     }
 
@@ -3474,18 +4111,41 @@ impl TeamRuntime {
             ));
         };
         let target_id = rev.review_of.unwrap_or(0);
-        let parsed = reviewer::parse_review(body, target_id);
+        let parsed = reviewer::parse_review(body, target_id).or_else(|e| {
+            // 担当中のレビュー作業IDだけを別名として許容する。他の対象は拒否する。
+            if matches!(e, reviewer::ReviewReject::TaskMismatch { got, .. } if got == rev.id) {
+                reviewer::parse_review(body, rev.id).map(|mut acc| {
+                    acc.task_id = target_id;
+                    acc
+                })
+            } else {
+                Err(e)
+            }
+        });
         let acc = match parsed {
             Ok(a) => a,
-            Err(e) => {
-                return Err(self.reject(
-                    agent,
-                    None,
-                    format!("レビュー報告を却下: {}", e.detail()),
-                ))
-            }
+            Err(e) => return Err(self.review_report_retry(agent, &rev, &e.detail())),
         };
 
+        if acc.verdict == ReviewVerdict::Approve {
+            if let Some(target) = self.task(target_id) {
+                if let Err(detail) = super::acceptance::verify(
+                    &self.goal.specification,
+                    &self.workspace,
+                    &target.files,
+                    target.role == TeamRole::Integrator,
+                ) {
+                    // 成果物の不一致は報告書を直しても解決しない。実装者へ差し戻す。
+                    let body = serde_json::json!({"task_id":target_id,"verdict":"REQUEST_CHANGES","findings":[detail]});
+                    return self.take_review(agent, &body.to_string());
+                }
+            }
+        }
+        if reviewer::requires_content_review(&self.goal) {
+            if let Err(detail) = reviewer::validate_quality(&acc, &self.workspace) {
+                return Err(self.review_report_retry(agent, &rev, &detail));
+            }
+        }
         let max = self.run.max_attempts;
         let mut escalate = false;
         let mut released = false;
@@ -3495,6 +4155,7 @@ impl TeamRuntime {
             t.review.reviewer_session = rev.assigned_session;
             t.review.verdict = Some(acc.verdict);
             t.review.findings = acc.findings.clone();
+            t.review.quality_checks = acc.quality_checks.clone();
             t.updated_at = now_secs();
             match acc.verdict {
                 ReviewVerdict::Approve => {
@@ -3550,13 +4211,12 @@ impl TeamRuntime {
             self.complete_task(target_id, agent);
         }
         if escalate {
-            self.raise(
-                DecisionKind::AttemptsExhausted,
-                Some(target_id),
-                None,
-                format!("#{target_id} が再試行の上限 ({max} 回) に達しました"),
-                "指摘が繰り返し解消されていません".into(),
-                vec!["retry".into(), "reassign".into(), "reject".into()],
+            self.submit_with_issues(
+                target_id,
+                &format!(
+                    "レビュー指摘が再試行上限に達しました: {}",
+                    acc.findings.join(" / ")
+                ),
             );
         }
         self.dirty = true;
@@ -3657,6 +4317,12 @@ impl TeamRuntime {
             return;
         }
         for id in ready {
+            if self
+                .task(id)
+                .is_some_and(|t| self.dependencies_writer_pending(t))
+            {
+                continue;
+            }
             // 遷移が断られたら**黙らない**。「なぜか Ready にならない」を
             // 追えるように理由をそのまま残す。
             let refused =
@@ -3699,6 +4365,7 @@ impl TeamRuntime {
             .tasks
             .iter()
             .filter(|t| t.state == TeamTaskState::Validating && !t.validation.running)
+            .filter(|t| !self.task_writer_pending(t.id))
             .filter(|t| !t.validation.passed(&t.validation_commands))
             .map(|t| (t.id, t.validation_commands.clone()))
             .collect();
@@ -3936,7 +4603,13 @@ impl TeamRuntime {
 
     /// 必要なぶんだけエージェントを起こす。**無条件に N 体起こさない。**
     fn ensure_agents(&mut self, out: &mut Vec<TeamEffect>) {
-        let want = scheduler::desired_sessions(&self.tasks, self.run.agent_count);
+        let want = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(
+            if self.run.review_required && self.run.agent_count >= 2 {
+                2
+            } else {
+                1
+            },
+        );
         let bound = self
             .agents
             .iter()
@@ -4034,6 +4707,14 @@ impl TeamRuntime {
             .filter(|a| a.kind == AgentKind::ManagedSession)
             .filter_map(|a| {
                 let sid = a.session_id?;
+                if self
+                    .worker_holds
+                    .values()
+                    .chain(self.integration.iter())
+                    .any(|hold| hold.session == sid)
+                {
+                    return None;
+                }
                 Some(Candidate {
                     agent: a.id.clone(),
                     session: sid,
@@ -4054,7 +4735,19 @@ impl TeamRuntime {
             return;
         }
         let depth = graph::critical_depth(&self.tasks);
-        let plan = scheduler::plan_assignments(&self.tasks, &candidates, &depth);
+        let mut scheduling = std::borrow::Cow::Borrowed(self.tasks.as_slice());
+        for (index, task) in self.tasks.iter().enumerate() {
+            if task.state == TeamTaskState::Ready
+                && (self.task_writer_pending(task.id)
+                    || self.dependencies_writer_pending(task)
+                    || (isolated_assembly(task) && !self.restored_writers.is_empty()))
+            {
+                // Exclude before assigning candidates, so a blocked restored
+                // task cannot reserve the only agent ahead of independent work.
+                scheduling.to_mut()[index].state = TeamTaskState::Pending;
+            }
+        }
+        let plan = scheduler::plan_assignments(&scheduling, &candidates, &depth);
 
         // **この tick で本当に成り立っている理由**の鍵。ここに無い
         // スケジューリング由来の判断は、下で撤回する。
@@ -4146,6 +4839,61 @@ impl TeamRuntime {
             let Some(task) = self.tasks.iter().find(|t| t.id == a.task).cloned() else {
                 continue;
             };
+            if self.task_writer_pending(task.id) || self.dependencies_writer_pending(&task) {
+                continue;
+            }
+            if isolated_assembly(&task) {
+                // 既存の所有者が停止するまで、同じRunにも再配送しない。
+                if self.integration.is_some()
+                    || self.publication.is_some()
+                    || !self.worker_holds.is_empty()
+                    || !self.restored_writers.is_empty()
+                {
+                    continue;
+                }
+                match super::integration::try_acquire_for_dispatch(
+                    &self.workspace,
+                    &self.run.run_id,
+                ) {
+                    Ok(Some(permit)) => {
+                        self.integration = Some(IntegrationHold {
+                            permit,
+                            task: task.id,
+                            session: a.session,
+                        });
+                    }
+                    Ok(None) => continue,
+                    Err(why) => {
+                        self.submit_with_issues(task.id, &why);
+                        continue;
+                    }
+                }
+            } else if super::task_workspace::scope(&task.files).is_some() {
+                if self.worker_holds.contains_key(&task.id) {
+                    continue;
+                }
+                match super::integration::try_acquire_task(
+                    &self.workspace,
+                    &task.files,
+                    &self.run.run_id,
+                ) {
+                    Ok(Some(permit)) => {
+                        self.worker_holds.insert(
+                            task.id,
+                            IntegrationHold {
+                                permit,
+                                task: task.id,
+                                session: a.session,
+                            },
+                        );
+                    }
+                    Ok(None) => continue,
+                    Err(why) => {
+                        self.submit_with_issues(task.id, &why);
+                        continue;
+                    }
+                }
+            }
             let coord_id = match task.coordinator_task {
                 Some(id) => id,
                 None => {
@@ -4190,7 +4938,7 @@ impl TeamRuntime {
                         .map(|t| !t.baseline.as_ref().is_some_and(|b| b.usable()))
                         .unwrap_or(true);
                     let baseline = if need_baseline {
-                        Some(self.capture_baseline())
+                        Some(self.capture_baseline(a.task))
                     } else {
                         None
                     };
@@ -4237,6 +4985,11 @@ impl TeamRuntime {
                     self.dirty = true;
                 }
                 Err(refusal) => {
+                    if isolated_assembly(&task) {
+                        self.integration = None; // まだ配送していない。
+                    } else {
+                        self.worker_holds.remove(&task.id); // まだ配送していない。
+                    }
                     // 既存側が断った。**回避しない。**
                     //
                     // ただし**同じ理由を毎 tick 書かない**。断りは配置から
@@ -4273,12 +5026,21 @@ impl TeamRuntime {
     /// **失敗を握り潰さない。** 空の基準点を返すと、完了報告の時点で
     /// 「何も汚れていなかった」と読めてしまい、担当外の変更が
     /// 「担当内だけ」に化ける。
-    fn capture_baseline(&self) -> changeset::FileBaseline {
+    fn capture_baseline(&self, task_id: TaskId) -> changeset::FileBaseline {
         #[cfg(test)]
         if let Some(b) = test_hooks::forced_baseline() {
             return b;
         }
-        match changeset::capture_baseline(&self.workspace) {
+        let isolated = self.task(task_id).and_then(|t| {
+            super::task_workspace::execution(&self.workspace, &t.files)
+                .ok()
+                .flatten()
+        });
+        let workspace = isolated
+            .as_ref()
+            .map(|(root, _, _)| root.as_path())
+            .unwrap_or(&self.workspace);
+        match changeset::capture_baseline(workspace) {
             Ok(b) => b,
             Err(e) => changeset::FileBaseline::unavailable(e.detail()),
         }
@@ -4315,10 +5077,41 @@ impl TeamRuntime {
         if let Some(e) = test_hooks::forced_evidence() {
             return (e, attribution);
         }
+        if super::task_workspace::scope(&task.files).is_some() {
+            let measured = (|| -> Result<rp::FileEvidence, String> {
+                let (workspace, prefix, git) =
+                    super::task_workspace::execution(&self.workspace, &task.files)?
+                        .ok_or("隔離先がありません")?;
+                if !git {
+                    return Ok(rp::FileEvidence::Unmeasurable(
+                        "Gitなしの隔離コピーで実装しています".into(),
+                    ));
+                }
+                let baseline = task.baseline.as_ref().ok_or("隔離先の基準点がありません")?;
+                let changes = changeset::measure(&workspace, baseline).map_err(|e| e.detail())?;
+                Ok(rp::FileEvidence::Measured {
+                    mine: changes
+                        .into_iter()
+                        .map(|c| format!("{prefix}/{}", c.path))
+                        .collect(),
+                    out_of_scope: vec![],
+                })
+            })();
+            return (
+                measured.unwrap_or_else(rp::FileEvidence::Unavailable),
+                attribution,
+            );
+        }
         // **「測る手立てが無い」と「測れるはずが失敗した」を分ける。**
         // Git 管理下でないフォルダは直しようが無いので、そこで止めると
         // **1 件も完了できない**。前者は通し、盤面が「実測なし」を出す。
-        let no_git = crate::git::discover_toplevel(&self.workspace).is_none();
+        let no_git = crate::git::discover_toplevel(&self.workspace).is_none()
+            || (super::planner::implementation_only(&self.goal.specification)
+                && crate::worktree::git_out(
+                    &self.workspace,
+                    &["rev-parse", "--verify", "HEAD^{commit}"],
+                )
+                .is_err());
         let cannot_measure = |e: changeset::MeasureError| -> rp::FileEvidence {
             if no_git {
                 rp::FileEvidence::Unmeasurable(e.detail())
@@ -4420,12 +5213,13 @@ impl TeamRuntime {
             .agent(agent)
             .and_then(|a| a.parent_id.clone())
             .map(|p| p.0);
+        let workspace_text = self.workspace.to_string_lossy();
         let brief = super::prompt::Brief {
             goal: &self.goal,
             task,
             agent_id: agent.as_str(),
             parent_id: parent.as_deref(),
-            workspace_root: "<ワークスペースルート>",
+            workspace_root: &workspace_text,
             upstream,
             forbidden_files: forbidden,
             // **自分以外の顔ぶれ。** 端末を持つ相手だけを載せる —
@@ -4456,6 +5250,10 @@ impl TeamRuntime {
             .map(|t| t.id)
             .collect();
         for id in waiting {
+            if let Some(job) = self.publication.as_ref().filter(|job| job.task == id) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Release);
+                continue;
+            }
             if self.live_session_of(id).is_none() {
                 // 担当セッションはもう居ない = 停止を確認できた。
                 self.free_task(id, false);
@@ -4486,7 +5284,85 @@ impl TeamRuntime {
     /// `count_attempt` が真のときだけ試行回数を数える (セッションが落ちた
     /// 場合は数え、人が配り直した場合は数えない — 人の操作を失敗として
     /// 記録すると、上限に早く当たって使えなくなる)。
+    fn task_writer_pending(&self, task: TaskId) -> bool {
+        self.restored_writers.contains(&task)
+            || self
+                .worker_holds
+                .get(&task)
+                .or_else(|| self.integration.as_ref().filter(|hold| hold.task == task))
+                .is_some_and(|hold| !hold.permit.writer_stopped())
+    }
+
+    fn dependencies_writer_pending(&self, task: &TeamTask) -> bool {
+        // Old snapshots may already have completed an intermediate task after
+        // resolving a live writer. Its completion cannot hide that ancestor.
+        let mut pending = task.dependencies.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if self.task_writer_pending(id) {
+                return true;
+            }
+            if let Some(dependency) = self.task(id) {
+                pending.extend(&dependency.dependencies);
+            }
+        }
+        false
+    }
+
+    fn poll_restored_writers(&mut self) {
+        if let Some(rx) = &self.writer_probe {
+            match rx.try_recv() {
+                Ok(finished) => {
+                    for id in finished {
+                        self.restored_writers.remove(&id);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                // Losing a worker does not prove completion; retry below.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+            self.writer_probe = None;
+            self.writer_probe_at = Instant::now() + std::time::Duration::from_millis(100);
+        }
+        if self.restored_writers.is_empty() || Instant::now() < self.writer_probe_at {
+            return;
+        }
+        let tasks: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| self.restored_writers.contains(&t.id))
+            .map(|t| (t.id, t.files.clone(), isolated_assembly(t)))
+            .collect();
+        let workspace = self.workspace.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.writer_probe = Some(rx);
+        // Disk/OS queries never run in tick. Each batch terminates even if the
+        // Runtime is dropped; no joining or persistent polling thread is needed.
+        std::thread::spawn(move || {
+            let finished = tasks
+                .into_iter()
+                .filter_map(|(id, files, assembly)| {
+                    super::integration::restored_writer_stopped(&workspace, &files, assembly)
+                        .then_some(id)
+                })
+                .collect();
+            let _ = tx.send(finished);
+        });
+    }
+
     fn free_task(&mut self, task: TaskId, count_attempt: bool) {
+        if self.task_writer_pending(task) {
+            return;
+        }
+        if let Some(job) = self.publication.as_ref().filter(|job| job.task == task) {
+            if self.task(task).is_some_and(|t| t.reassign_pending) {
+                job.cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            return; // The session exiting is not proof that publication I/O ended.
+        }
         let max = self.run.max_attempts;
         self.release_after_stop_confirmed(task);
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
@@ -4616,6 +5492,9 @@ impl TeamRuntime {
 
     /// Goal の状態を Task Graph から更新する。
     fn update_goal(&mut self) {
+        if self.tasks.iter().any(|t| self.task_writer_pending(t.id)) {
+            return;
+        }
         if self.goal.status.is_terminal() {
             return;
         }
@@ -4624,7 +5503,19 @@ impl TeamRuntime {
             &self.goal.definition_of_done,
             self.run.review_required,
         );
-        let next = if done {
+        let delivered = !self.tasks.is_empty()
+            && self
+                .tasks
+                .iter()
+                .all(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted));
+        let next = if delivered
+            && self
+                .tasks
+                .iter()
+                .any(|t| t.state == TeamTaskState::Submitted)
+        {
+            GoalStatus::Submitted
+        } else if done {
             GoalStatus::Completed
         } else if !self.decisions.is_empty() {
             GoalStatus::NeedsUser
@@ -4660,6 +5551,14 @@ impl TeamRuntime {
             self.goal.status = next;
             self.goal.updated_at = now_secs();
             self.dirty = true;
+            if next == GoalStatus::Submitted {
+                self.log(
+                    TeamEventKind::GoalCompleted,
+                    None,
+                    None,
+                    "成果物を提出しました（未解決事項あり）。各タスクの指摘を確認できます".into(),
+                );
+            }
             if next == GoalStatus::Completed {
                 self.log(
                     TeamEventKind::GoalCompleted,
@@ -4685,7 +5584,13 @@ impl TeamRuntime {
     /// 並列で効くのは実装なので、余りを実装に寄せる。
     fn plan_roster(&mut self) {
         let now = now_secs();
-        let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(1);
+        let n = scheduler::desired_sessions(&self.tasks, self.run.agent_count).max(
+            if self.run.review_required && self.run.agent_count >= 2 {
+                2
+            } else {
+                1
+            },
+        );
         let lead_team = self
             .teams
             .first()
@@ -5152,6 +6057,67 @@ mod stale_report_tests {
     use super::super::testkit;
     use super::*;
 
+    #[test]
+    fn 修正上限で現状提出し後続も終われば未解決付き提出になる() {
+        let mut rt = run_with_two_tasks();
+        let agent = rt.agents[0].id.clone();
+        put(&mut rt, 1, agent.as_str(), TeamTaskState::Running);
+        rt.tasks[1].dependencies = vec![1];
+        rt.tasks[1].state = TeamTaskState::Pending;
+        rt.run.max_attempts = 3;
+        for i in 0..3 {
+            let task = rt.task(1).unwrap().clone();
+            assert_eq!(
+                rt.allow_report_repair(&agent, &task, "出力の引用が不一致"),
+                i < 2
+            );
+        }
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Submitted);
+        assert!(rt.decisions.is_empty());
+        rt.promote_ready();
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Ready);
+        rt.submit_with_issues(2, "残る検証不一致");
+        rt.update_goal();
+        assert_eq!(rt.goal.status, GoalStatus::Submitted);
+        assert_eq!(graph::progress(&rt.tasks), 1.0);
+        assert!(!graph::goal_done(
+            &rt.tasks,
+            &rt.goal.definition_of_done,
+            false
+        ));
+    }
+
+    #[test]
+    fn 保存済みの修正上限待ちは自動提出され繰り返さない() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::NeedsUser;
+        rt.tasks[0]
+            .context
+            .push("[report-repair:1] 引用不一致".into());
+        rt.tasks[0].blockers.push("引用不一致".into());
+        rt.tasks[1].state = TeamTaskState::Completed;
+        rt.goal.status = GoalStatus::NeedsUser;
+        rt.tick(&Observation::default());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Submitted);
+        assert_eq!(rt.goal.status, GoalStatus::Submitted);
+        let events = rt.events.len();
+        rt.tick(&Observation::default());
+        assert_eq!(rt.events.len(), events);
+        assert!(!rt.task(1).unwrap().blockers.is_empty());
+    }
+
+    #[test]
+    fn レビューの修正上限は対象も未解決付きで提出する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].state = TeamTaskState::Running;
+        rt.submit_with_issues(2, "引用の確認が完了しない");
+        assert!(rt.tasks.iter().all(|t| t.state == TeamTaskState::Submitted));
+        assert!(rt.tasks.iter().all(|t| !t.review.approved()));
+        assert!(rt.decisions.is_empty());
+    }
+
     /// 実機の台帳に並んだ 4 行そのもの (時刻は落としてある)。
     /// **1 回の再報告につき 2 行**が、2 回ぶん。
     const REAL_REJECTED_LINES: [&str; 4] = [
@@ -5229,6 +6195,241 @@ mod stale_report_tests {
         }));
     }
 
+    fn artifact_contract() -> String {
+        format!(
+            "{}{}{}",
+            super::super::acceptance::OPEN,
+            r#"{"checks":[{"requirement":"REQ-01: 指定価格","paths":["output.json"],"kind":"json_equals","pointer":"/price","value":39800}]}"#,
+            super::super::acceptance::CLOSE
+        )
+    }
+
+    #[test]
+    fn 実物不一致を即通知し修正後の完了報告を受け取る() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = artifact_contract();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":1}"#).unwrap();
+        rt.tasks[0].files = vec!["output.json".into()];
+        rt.tasks[0].assigned_session = Some(42);
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        assert!(rt
+            .take_result(&AgentId::new(AGENT), &report(1, AGENT))
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Running);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":39800}"#).unwrap();
+        rt.take_result(&AgentId::new(AGENT), &report(1, AGENT))
+            .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Validating);
+    }
+
+    #[test]
+    fn 承認が来ても実物が壊れていれば作者へ差し戻す() {
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = artifact_contract();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        std::fs::write(rt.workspace.join("output.json"), r#"{"price":1}"#).unwrap();
+        rt.tasks[0].files = vec!["output.json".into()];
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"APPROVE"}"#)
+            .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(
+            rt.task(1).unwrap().review.verdict,
+            Some(ReviewVerdict::RequestChanges)
+        );
+        assert!(rt
+            .task(1)
+            .unwrap()
+            .context
+            .iter()
+            .any(|s| s.contains("指定価格")));
+    }
+
+    #[test]
+    fn 内容根拠の無い承認は再確認され不備は修正へ戻る() {
+        let mut rt = run_with_two_tasks();
+        rt.goal.specification = "SKILL.md を作成".into();
+        std::fs::create_dir_all(&rt.workspace).unwrap();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.tasks[1].assigned_session = Some(42);
+        assert!(rt
+            .take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"APPROVE"}"#)
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        rt.take_review(&AgentId::new(AGENT), r#"{"task_id":1,"verdict":"REQUEST_CHANGES","findings":["バナーは3件必要だが2件のみ。売上5000万円の出典がなく、同梱PDFが存在しない。"]}"#).unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Completed);
+        assert!(rt
+            .task(1)
+            .unwrap()
+            .context
+            .iter()
+            .any(|c| c.contains("同梱PDF")));
+    }
+
+    #[test]
+    fn スキル一件でも別担当レビューを必須にする() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks.truncate(1);
+        rt.goal.specification = "SKILL.md を作成".into();
+        let plan = TeamPlan {
+            goal: rt.goal.clone(),
+            teams: rt.teams.clone(),
+            tasks: rt.tasks.clone(),
+        };
+        let mut opts = RunOptions::default();
+        opts.review_required = false;
+        opts.agent_count = 1;
+        let mut rt = TeamRuntime::from_plan(plan, rt.workspace.clone(), opts);
+        assert!(rt.run.review_required);
+        assert!(rt.run.agent_count >= 2);
+        assert!(
+            rt.agents
+                .iter()
+                .filter(|a| a.kind == AgentKind::ManagedSession)
+                .count()
+                >= 2
+        );
+        rt.tasks[0].state = TeamTaskState::Validating;
+        rt.tasks[0].validation_commands.clear();
+        rt.settle_validation(1);
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert!(rt.tasks.iter().any(|t| t.review_of == Some(1)));
+    }
+
+    #[test]
+    fn 判定の無い完了レビューは復元時に最新の一件だけ再開する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].state = TeamTaskState::Completed;
+        let mut old = rt.tasks[1].clone();
+        old.id = 0;
+        rt.tasks.push(old);
+        let restored = TeamRuntime::restore(
+            rt.to_saved(),
+            crate::test_util::unique_temp_dir("zaivern-team-test", "orphan-review"),
+        );
+        assert_eq!(restored.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(restored.task(2).unwrap().state, TeamTaskState::Ready);
+        assert_eq!(restored.task(0).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(restored.task(2).unwrap().dispatch_seq, 1);
+    }
+
+    #[test]
+    fn レビュー作業番号でも判定を受け取り対象と担当を完了する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        rt.tasks[1].validation_commands.clear();
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.take_review(
+            &AgentId::new(AGENT),
+            r#"{"task_id":2,"verdict":"APPROVE","findings":[],"summary":"確認済み"}"#,
+        )
+        .unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Completed);
+    }
+
+    #[test]
+    fn レビューへの通常完了報告を拒否し正しい判定を再要求する() {
+        let mut rt = run_with_two_tasks();
+        rt.tasks[0].state = TeamTaskState::Reviewing;
+        rt.tasks[0].assigned_agent = Some(AgentId::new(AGENT));
+        rt.tasks[1].role = TeamRole::Reviewer;
+        rt.tasks[1].review_of = Some(1);
+        put(&mut rt, 2, AGENT, TeamTaskState::Running);
+        rt.tasks[1].assigned_session = Some(42);
+        assert!(rt
+            .take_result(&AgentId::new(AGENT), &report(2, AGENT))
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Running);
+        assert_eq!(rt.pending_msgs.len(), 1);
+        assert!(rt.standing_order(&AgentId::new(AGENT)).contains("対象 #1"));
+        assert!(rt
+            .take_review(
+                &AgentId::new(AGENT),
+                r#"{"task_id":99,"verdict":"APPROVE"}"#
+            )
+            .is_err());
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Reviewing);
+    }
+
+    #[test]
+    fn 検証担当の完了から統合を経てチーム全体が完了する() {
+        fix_evidence();
+        let mut rt = run_with_two_tasks();
+        let agent_id = rt.agents[0].id.clone();
+        let agent = agent_id.as_str();
+        rt.run.review_required = false;
+        rt.tasks[0].role = TeamRole::Tester;
+        rt.tasks[1].role = TeamRole::Integrator;
+        rt.tasks[1].dependencies = vec![1];
+        // 文書作成タスク。外部コマンドの指定が無いケースを再現する。
+        for t in &mut rt.tasks {
+            t.validation_commands.clear();
+        }
+        rt.promote_ready();
+        assert_eq!(rt.task(2).unwrap().state, TeamTaskState::Pending);
+        for id in [1, 2] {
+            assert_eq!(rt.task(id).unwrap().state, TeamTaskState::Ready);
+            put(&mut rt, id, agent, TeamTaskState::Running);
+            let mut body: serde_json::Value = serde_json::from_str(&report(id, agent)).unwrap();
+            body["validation"] = serde_json::json!([]);
+            if id == 2 {
+                // 実際の停止例: 統合完了をRunの一段上へ任意名で提出していた。
+                let root =
+                    crate::test_util::unique_temp_dir("zaivern-integration", "misplaced-final");
+                let run_id = rt.run.run_id.clone();
+                let dir = super::super::outbox::prepare_run_dir(&root, &run_id).unwrap();
+                let file = dir.parent().unwrap().join("run-1788740010.json");
+                let envelope = serde_json::json!({"kind":"result","run_id":run_id,"agent_id":agent,"payload":body});
+                std::fs::write(&file, envelope.to_string()).unwrap();
+                let grouped = super::super::outbox::misplaced_reports(
+                    dir.parent().unwrap(),
+                    &Default::default(),
+                );
+                assert_eq!(grouped[&run_id], vec![file.clone()]);
+                let super::super::outbox::Verdict::Deliver { agent, kind, body } =
+                    super::super::outbox::judge_misplaced(
+                        file.file_stem().unwrap().to_str().unwrap(),
+                        &std::fs::read_to_string(&file).unwrap(),
+                        &[AgentId::new(agent)],
+                        &run_id,
+                    )
+                else {
+                    panic!("統合完了が配送されない");
+                };
+                rt.accept_outbox(&agent, kind, &body, 100).unwrap();
+                std::fs::remove_dir_all(root).unwrap();
+            } else {
+                rt.take_result(&AgentId::new(agent), &body.to_string())
+                    .unwrap();
+            }
+            rt.settle_validation(id);
+            assert_eq!(rt.task(id).unwrap().state, TeamTaskState::Completed);
+            rt.promote_ready();
+        }
+        rt.update_goal();
+        assert_eq!(rt.goal.status, GoalStatus::Completed);
+        assert_eq!(counts(&mut rt), (0, 0));
+        test_hooks::clear();
+    }
+
     #[test]
     fn 先へ進んだタスクへの再報告で台帳を埋めない() {
         fix_evidence();
@@ -5296,21 +6497,73 @@ mod stale_report_tests {
     }
 
     #[test]
-    fn 完了したタスクへの報告は今までどおり記録する() {
+    fn 完了後の異なる本文も再提出せず次の担当を妨げない() {
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        let before = serde_json::to_value(&rt.tasks).unwrap();
+        let events_before = rt.events.len();
+        let messages_before = rt.pending_msgs.len();
+        for screen in [false, true] {
+            let body = report(2, AGENT)
+                .replace("実装しました", "再提出します")
+                .replace(
+                    "\"changed_files\":[]",
+                    "\"changed_files\":[\"outside/pa\\n  th.md\"]",
+                );
+            assert!(matches!(
+                rt.take_result_from(&agent, &body, screen),
+                Ok(AcceptOutcome::Duplicate)
+            ));
+        }
+        assert_eq!(serde_json::to_value(&rt.tasks).unwrap(), before);
+        assert_eq!(counts(&mut rt), (0, 0));
+        assert_eq!(rt.events.len(), events_before, "イベントが増えた");
+        assert_eq!(rt.pending_msgs.len(), messages_before, "再提出要求が増えた");
+    }
+
+    #[test]
+    fn 完了後も本文の担当違いと未知状態は拒否する() {
+        let mut rt = run_with_two_tasks();
+        let agent = AgentId::new(AGENT);
+        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
+        assert!(rt.take_result(&agent, &report(2, "impostor")).is_err());
+        assert!(rt
+            .take_result(&agent, &report(2, AGENT).replace("completed", "unknown"))
+            .is_err());
+        assert_eq!(counts(&mut rt), (0, 2));
+        assert!(rt
+            .task(2)
+            .unwrap()
+            .context
+            .iter()
+            .all(|c| !c.starts_with("[report-repair:")));
+    }
+
+    #[test]
+    fn 検証中の再報告で検証結果と世代を消さない() {
         fix_evidence();
         let mut rt = run_with_two_tasks();
         let agent = AgentId::new(AGENT);
-        // 終端へ遅れて届いた報告。**ここは見送らない** —
-        // `runtime_tests::断られた遷移は黙殺せず記録に残す` と対になる。
-        put(&mut rt, 2, AGENT, TeamTaskState::Completed);
-        let _ = rt.take_result(&agent, &report(2, AGENT));
-        let (transitions, _) = counts(&mut rt);
-        assert_eq!(transitions, 2, "完了したタスクへの報告まで見送った");
-        assert_eq!(
-            rt.task(2).map(|t| t.state),
-            Some(TeamTaskState::Completed),
-            "終端から動いた"
-        );
+        put(&mut rt, 1, AGENT, TeamTaskState::Running);
+        rt.take_result(&agent, &report(1, AGENT)).unwrap();
+        assert_eq!(rt.task(1).unwrap().state, TeamTaskState::Validating);
+        rt.tasks[0].validation.running = true;
+        rt.tasks[0]
+            .validation
+            .runs
+            .push(ValidationRun::passed("first check"));
+        let before = serde_json::to_value(&rt.tasks).unwrap();
+        assert!(matches!(
+            rt.take_result(
+                &agent,
+                &report(1, AGENT).replace("実装しました", "完了です")
+            ),
+            Ok(AcceptOutcome::Duplicate)
+        ));
+        assert_eq!(serde_json::to_value(&rt.tasks).unwrap(), before);
+        assert_eq!(counts(&mut rt), (0, 0));
         test_hooks::clear();
     }
 
@@ -5331,12 +6584,12 @@ mod stale_report_tests {
 
     /// **状態 × 報告の種類 → 記録するか**を表で固定する。
     ///
-    /// 見送るのは「レビューへ渡した後」の 3 つだけ。ここを広げると
+    /// レビュー以降の3状態と、検証中の完了再報告を見送る。ここを広げると
     /// 本物の異常まで消えるので、増減は必ずこの表の変更として現れる。
     #[test]
     fn 見送る状態を表で固定する() {
         use TeamTaskState as S;
-        const TABLE: [(S, bool); 11] = [
+        const TABLE: [(S, bool); 12] = [
             (S::Pending, false),
             (S::Ready, false),
             (S::Assigned, false),
@@ -5346,10 +6599,8 @@ mod stale_report_tests {
             (S::Reviewing, true),
             (S::RevisionRequired, true),
             (S::Failed, false),
-            // **終端は含めない。** 完了したタスクへ遅れて届いた報告を
-            // 断ったことは、これまでどおり記録に残す
-            // (`runtime_tests::断られた遷移は黙殺せず記録に残す`)。
-            (S::Completed, false),
+            (S::Completed, true),
+            (S::Submitted, false),
             (S::NeedsUser, false),
         ];
         // 表が状態を 1 つ残らず覆っていること (状態を足したら必ず落ちる)。
@@ -5365,7 +6616,7 @@ mod stale_report_tests {
             ] {
                 assert_eq!(
                     report_already_passed(state, status),
-                    skip,
+                    skip || (state == S::Validating && status == ReportedStatus::Completed),
                     "{} × {status:?}",
                     state.key()
                 );
@@ -5519,6 +6770,39 @@ mod stall_tests {
     }
 
     // ── snapshot 無効化 ──
+
+    #[test]
+    fn レビュー待ちの旧タスクより実行中のレビューを現在の担当にする() {
+        let (mut rt, sessions) = dispatched();
+        let sid = sessions[0];
+        let agent = rt
+            .agents
+            .iter()
+            .find(|a| a.session_id == Some(sid))
+            .unwrap()
+            .id
+            .clone();
+        let original = rt
+            .tasks
+            .iter_mut()
+            .find(|t| t.assigned_agent.as_ref() == Some(&agent))
+            .unwrap();
+        original.state = TeamTaskState::Reviewing;
+        let original_id = original.id;
+        let mut review = super::super::testkit::task(100, "review-other", &[]);
+        review.role = TeamRole::Reviewer;
+        review.review_of = Some(200);
+        review.state = TeamTaskState::Running;
+        review.assigned_agent = Some(agent.clone());
+        review.assigned_session = Some(sid);
+        rt.tasks.push(review);
+        rt.sync_sessions(&obs_of(10, &rows_of(&sessions, "reviewing")));
+        assert_eq!(rt.agent(&agent).unwrap().current_task, Some(100));
+        assert_eq!(
+            rt.task(original_id).unwrap().state,
+            TeamTaskState::Reviewing
+        );
+    }
 
     #[test]
     fn snapshot世代は正規化画面が変わったときだけ進む() {
@@ -5704,6 +6988,38 @@ mod stall_tests {
     }
 
     #[test]
+    fn 停滞レビューは現在の対象を再通知し判断待ちにせず提出する() {
+        let (mut rt, sessions) = dispatched();
+        let active = rt
+            .tasks
+            .iter()
+            .find(|t| t.assigned_session.is_some())
+            .unwrap()
+            .id;
+        let target_id = rt.tasks.iter().map(|t| t.id).max().unwrap() + 1;
+        let mut target = rt.task(active).unwrap().clone();
+        target.id = target_id;
+        target.state = TeamTaskState::Reviewing;
+        target.assigned_agent = None;
+        target.assigned_session = None;
+        target.coordinator_task = None;
+        rt.tasks.push(target);
+        let t = rt.tasks.iter_mut().find(|t| t.id == active).unwrap();
+        t.review_of = Some(target_id);
+        t.files.clear();
+        let agent = t.assigned_agent.clone().unwrap();
+        run_quiet(&mut rt, &sessions, 28);
+        assert_eq!(rt.task(active).unwrap().state, TeamTaskState::Submitted);
+        assert_eq!(rt.task(target_id).unwrap().state, TeamTaskState::Submitted);
+        assert!(!rt.task(target_id).unwrap().review.approved());
+        assert!(!rt.decisions.iter().any(|d| d.task_id == Some(active)));
+        assert!(!rt
+            .tasks
+            .iter()
+            .any(|t| t.assigned_agent.as_ref() == Some(&agent) && t.id == active));
+    }
+
+    #[test]
     fn 二十八分変わらない担当は促されて回収要求まで進む() {
         let (mut rt, sessions) = dispatched();
         let nudged = run_quiet(&mut rt, &sessions, 28);
@@ -5838,10 +7154,12 @@ mod budget_tests {
         assert!(t.contains("#3"));
         assert!(t.contains("10 分"));
         assert!(t.contains("完了報告"));
-        assert!(!t.contains("[ZAI-TEAM-RESULT]"), "形式をここに二度書いている");
+        assert!(
+            !t.contains("[ZAI-TEAM-RESULT]"),
+            "形式をここに二度書いている"
+        );
     }
 }
-
 
 /// **重複判定のスコープ** — 本文だけで数えると正しい報告が消える。
 ///
@@ -5850,9 +7168,9 @@ mod budget_tests {
 /// 2 通目以降が「もう見た」で捨てられ、タスクが `Reviewing` のまま止まる。
 #[cfg(test)]
 mod seen_key_tests {
+    use super::super::outbox::Kind;
     use super::super::testkit;
     use super::*;
-    use super::super::outbox::Kind;
 
     fn rt() -> TeamRuntime {
         let ws = crate::test_util::unique_temp_dir("zaivern-team-seen", "key");
@@ -5939,7 +7257,11 @@ mod seen_key_tests {
             }
             rt.mark_seen(k);
         }
-        assert_eq!(rt.seen_blocks.len(), SEEN_BLOCKS_CAP, "上限を超えて覚えている");
+        assert_eq!(
+            rt.seen_blocks.len(),
+            SEEN_BLOCKS_CAP,
+            "上限を超えて覚えている"
+        );
         assert_eq!(rt.seen_block_order.len(), SEEN_BLOCKS_CAP);
         assert!(
             !rt.is_seen(&first.expect("最初の鍵")),
@@ -6013,5 +7335,695 @@ mod seen_key_tests {
             "再送が二重に適用された"
         );
         test_hooks::clear();
+    }
+}
+
+#[cfg(test)]
+#[path = "descendant_tests.rs"]
+pub(super) mod descendant_tests;
+
+#[cfg(test)]
+#[path = "integration_runtime_tests.rs"]
+mod integration_runtime_tests;
+#[cfg(test)]
+pub(super) use integration_runtime_tests::closing_publication_fixture;
+
+#[cfg(test)]
+mod worker_ownership_tests {
+    use super::super::planner::{PlanInput, StaticPlanner, TeamPlanner, IMPLEMENTATION_ONLY};
+    use super::*;
+
+    // 終了監視の台帳はプロセス共通。別Caseの終了済みsessionと衝突させない。
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(10_000_000);
+
+    struct Case {
+        root: PathBuf,
+        rt: TeamRuntime,
+        sessions: Vec<SessionObs>,
+    }
+    impl Case {
+        fn new() -> Self {
+            let root = crate::test_util::unique_temp_dir("zai-worker-lease", "runtime");
+            std::fs::create_dir_all(&root).unwrap();
+            let plan = StaticPlanner
+                .plan(PlanInput {
+                    spec: format!("{IMPLEMENTATION_ONLY}\n成果物を実装する"),
+                    source: "request".into(),
+                    agent_count: 2,
+                    review_required: false,
+                    workspace_root: root.clone(),
+                    roles: vec![TeamRole::Implementer],
+                })
+                .unwrap();
+            super::super::task_workspace::prepare(&root, &plan.tasks).unwrap();
+            let mut rt = TeamRuntime::from_plan(
+                plan,
+                root.clone(),
+                RunOptions {
+                    run_id: new_run_id(),
+                    agent_count: 2,
+                    review_required: false,
+                    ..RunOptions::default()
+                },
+            );
+            rt.set_outbox(root.join("outbox"));
+            rt.apply_action(TeamAction::Start);
+            Self {
+                root,
+                rt,
+                sessions: Vec::new(),
+            }
+        }
+        fn bind(&mut self) {
+            let effects = self.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: self.sessions.clone(),
+            });
+            for effect in effects {
+                if let TeamEffect::StartAgent(spec) = &effect {
+                    let id = NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.rt.bind_session(&spec.agent_id, id, None);
+                    self.rt.note_effect_done(&effect.key());
+                    self.sessions.push(SessionObs {
+                        id,
+                        title: "fake".into(),
+                        provider: "fake".into(),
+                        state: SessionState::Idle,
+                        text: String::new(),
+                    });
+                }
+            }
+        }
+        fn tick(&mut self, state: SessionState) -> Vec<TaskId> {
+            for s in &mut self.sessions {
+                s.state = state;
+            }
+            self.rt.writer_probe_at = Instant::now();
+            let obs = Observation {
+                now: now_secs(),
+                sessions: self.sessions.clone(),
+            };
+            let mut effects = self.rt.tick(&obs);
+            if let Some(rx) = self.rt.writer_probe.take() {
+                // This synchronous fixture waits for the real background query;
+                // production tick remains nonblocking.
+                let result = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(result).unwrap();
+                self.rt.writer_probe = Some(rx);
+                effects.extend(self.rt.tick(&obs));
+            }
+            let mut assigned = Vec::new();
+            for effect in effects {
+                if let TeamEffect::SendInstruction {
+                    task, session, key, ..
+                } = effect
+                {
+                    self.rt
+                        .handoff_integration_writer(
+                            task,
+                            session,
+                            crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+                        )
+                        .unwrap();
+                    self.rt.note_effect_done(&key);
+                    assigned.push(task);
+                }
+            }
+            assigned
+        }
+        fn locked(&self, task: TaskId) -> bool {
+            super::super::integration::try_acquire_task(
+                &self.root,
+                &self.rt.task(task).unwrap().files,
+                "observer",
+            )
+            .unwrap()
+            .is_none()
+        }
+    }
+    impl Drop for Case {
+        fn drop(&mut self) {
+            drop(self.rt.take_integration_for_shutdown());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn exited_parent_keeps_descendant_worker_ownership() {
+        descendant_worker_ownership("group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setpgid_child_keeps_worker_ownership_until_exit() {
+        descendant_worker_ownership("setpgid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_child_keeps_worker_ownership_until_exit() {
+        descendant_worker_ownership("setsid");
+    }
+
+    fn descendant_worker_ownership(group: &str) {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let task = c.rt.task(tasks[0]).unwrap().clone();
+        let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        let mut writer = super::descendant_tests::Descendant::spawn_group(
+            task.assigned_session.unwrap(),
+            &work,
+            "late.txt",
+            group,
+        );
+        let session = writer.session.as_ref().unwrap();
+        c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+            .unwrap();
+        writer.exit_parent();
+        assert!(c.tick(SessionState::Exited).is_empty());
+        assert!(
+            c.locked(task.id),
+            "parent exit released ownership while its descendant could still write"
+        );
+        // A restored Run cannot bypass the old writer's actual part lease.
+        let mut restored = Case {
+            root: c.root.clone(),
+            rt: TeamRuntime::restore(c.rt.to_saved(), c.root.clone()),
+            sessions: vec![],
+        };
+        restored.bind();
+        assert!(!restored.tick(SessionState::Idle).contains(&task.id));
+        writer.finish_child();
+        assert_eq!(
+            std::fs::read_to_string(work.join("late.txt")).unwrap(),
+            "late writer"
+        );
+        c.tick(SessionState::Exited);
+        assert!(!c.locked(task.id));
+        assert!(restored.tick(SessionState::Idle).contains(&task.id));
+    }
+
+    #[test]
+    fn stopped_removed_or_discarded_parent_retains_descendant_custody() {
+        descendant_custody("group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setpgid_child_stop_and_resume_preserve_custody() {
+        descendant_custody("setpgid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_child_stop_and_resume_preserve_custody() {
+        descendant_custody("setsid");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracking_error_retains_worker_until_supervisor_recovers() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let task = c.rt.task(tasks[0]).unwrap().clone();
+        let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        struct SocketPath(std::path::PathBuf);
+        impl Drop for SocketPath {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        // Darwin's sockaddr_un is short; do not append to the workspace path.
+        let socket = SocketPath(std::env::temp_dir().join(format!(
+            "zw{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        let listener = UnixListener::bind(&socket.0).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut writer = super::descendant_tests::Descendant::spawn_group_with_env(
+            task.assigned_session.unwrap(),
+            &work,
+            "late.txt",
+            "setsid",
+            [(
+                "ZAIVERN_WRITER_TEST_TRACKING_SOCKET".into(),
+                socket.0.to_string_lossy().into_owned(),
+            )]
+            .into(),
+        );
+        let session = writer.session.as_ref().unwrap();
+        c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+            .unwrap();
+        let mut fault = None;
+        super::descendant_tests::wait_until(|| match listener.accept() {
+            Ok((stream, _)) => {
+                fault = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("tracking handshake: {e}"),
+        });
+        let mut fault = fault.unwrap();
+        fault.set_nonblocking(false).unwrap();
+        fault
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        writer.exit_parent();
+        writer.session.as_mut().unwrap().kill();
+        let mut acknowledgement = [0];
+        fault.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, *b"E");
+        writer.write_child();
+        c.tick(SessionState::Exited);
+        assert!(!writer.tree.finished());
+        assert!(c.locked(task.id), "tracking failure released a live writer");
+        fault.write_all(b"R").unwrap();
+        let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+        super::descendant_tests::wait_until(|| handle.is_finished());
+        c.tick(SessionState::Exited);
+        assert!(!c.locked(task.id), "recovered tracker stranded ownership");
+    }
+
+    fn descendant_custody(group: &str) {
+        for mode in ["stop", "tab", "discard", "exit"] {
+            let mut c = Case::new();
+            c.bind();
+            let tasks = c.tick(SessionState::Idle);
+            let task = c.rt.task(tasks[0]).unwrap().clone();
+            let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
+                task.assigned_session.unwrap(),
+                &work,
+                "late.txt",
+                group,
+            );
+            let session = writer.session.as_ref().unwrap();
+            c.rt.handoff_integration_writer(task.id, session.id, session.writer_identity())
+                .unwrap();
+            writer.exit_parent();
+            c.rt.apply_action(TeamAction::Stop);
+            c.tick(SessionState::Exited);
+            assert!(c.locked(task.id));
+            if mode == "discard" {
+                let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
+                drop(std::mem::replace(&mut c.rt, replacement));
+                assert!(c.locked(task.id));
+                writer.finish_child();
+            } else {
+                if mode == "stop" {
+                    writer.session.as_mut().unwrap().kill();
+                }
+                let handle = if mode == "exit" {
+                    crate::terminal::abandon_tracked(writer.session.take().unwrap())
+                } else {
+                    crate::terminal::reap_tracked(writer.session.take().unwrap())
+                };
+                c.sessions.clear();
+                c.tick(SessionState::Exited);
+                if !writer.tree.finished() {
+                    assert!(c.locked(task.id));
+                }
+                super::descendant_tests::wait_until(|| handle.is_finished());
+            }
+            super::descendant_tests::wait_until(|| {
+                c.tick(SessionState::Exited);
+                !c.locked(task.id)
+            });
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn idle_worker_parent_stops_detached_writer_before_completion_and_redispatch() {
+        for group in ["setpgid", "setsid"] {
+            let mut c = Case::new();
+            c.bind();
+            let tasks = c.tick(SessionState::Idle);
+            let task = c.rt.task(tasks[0]).unwrap().clone();
+            let session_id = task.assigned_session.unwrap();
+            let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
+                session_id, &work, "late.txt", group,
+            );
+            c.rt.handoff_integration_writer(
+                task.id,
+                session_id,
+                writer.session.as_ref().unwrap().writer_identity(),
+            )
+            .unwrap();
+            writer.write_child();
+            let agent = task.assigned_agent.as_ref().unwrap();
+            let report = serde_json::json!({
+                "task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+                "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/late.txt")],
+                "validation": [], "blockers": []
+            })
+            .to_string();
+            assert_eq!(
+                c.rt.accept_outbox(
+                    agent,
+                    super::super::outbox::Kind::Result,
+                    &report,
+                    now_secs(),
+                )
+                .unwrap(),
+                AcceptOutcome::Applied
+            );
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Validating);
+            assert!(!writer
+                .session
+                .as_ref()
+                .unwrap()
+                .exited
+                .load(std::sync::atomic::Ordering::Acquire));
+            for session in &mut c.sessions {
+                session.state = SessionState::Idle;
+            }
+            let effects = c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert!(effects
+                .iter()
+                .any(|effect| matches!(effect, TeamEffect::StopAgent(id) if *id == session_id)));
+            assert!(!effects.iter().any(|effect| matches!(
+                effect,
+                TeamEffect::SendInstruction { session, .. } if *session == session_id
+            )));
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Validating);
+            assert!(c.locked(task.id));
+            assert_ne!(c.rt.goal().status, GoalStatus::Completed);
+            writer.write_child();
+            assert!(!writer.tree.finished());
+            writer.session.as_mut().unwrap().kill();
+            let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+            super::descendant_tests::wait_until(|| handle.is_finished());
+            // The process has stopped, but this observation was sampled before
+            // the UI noticed its exit. Do not reuse that stale Idle session.
+            let stale_effects = c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert!(!stale_effects.iter().any(|effect| matches!(
+                effect,
+                TeamEffect::SendInstruction { session, .. } if *session == session_id
+            )));
+            assert!(c.locked(task.id));
+            c.sessions
+                .iter_mut()
+                .find(|session| session.id == session_id)
+                .unwrap()
+                .state = SessionState::Exited;
+            c.rt.tick(&Observation {
+                now: now_secs(),
+                sessions: c.sessions.clone(),
+            });
+            assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Completed);
+            assert!(!c.locked(task.id));
+        }
+    }
+
+    #[test]
+    fn 実装報告後も書込中の担当がいれば統合を配送しない() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        for id in &tasks {
+            let task = c.rt.task(*id).unwrap().clone();
+            let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            std::fs::write(work.join("output.txt"), format!("worker {id}")).unwrap();
+            let agent = task.assigned_agent.unwrap();
+            let report = serde_json::json!({"task_id": id, "agent_id": agent.to_string(), "status": "completed", "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/output.txt")], "validation": [], "blockers": []}).to_string();
+            assert_eq!(
+                c.rt.accept_outbox(
+                    &agent,
+                    super::super::outbox::Kind::Result,
+                    &report,
+                    now_secs()
+                )
+                .unwrap(),
+                AcceptOutcome::Applied
+            );
+        }
+        assert!(c.tick(SessionState::Working).is_empty());
+        for id in &tasks {
+            assert!(c.locked(*id));
+        }
+        let assembly = c.tick(SessionState::Idle);
+        assert_eq!(assembly.len(), 1);
+        assert_eq!(c.rt.task(assembly[0]).unwrap().key, "assemble");
+        for id in tasks {
+            assert!(!c.locked(id));
+        }
+    }
+
+    #[test]
+    fn 停止操作だけでは実装担当の所有権を解放しない() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        c.rt.apply_action(TeamAction::Stop);
+        assert!(c.tick(SessionState::Idle).is_empty());
+        for id in &tasks {
+            assert!(c.locked(*id));
+        }
+        c.sessions.clear();
+        c.tick(SessionState::Exited);
+        for id in tasks {
+            assert!(!c.locked(id));
+        }
+    }
+
+    #[test]
+    fn 復元したrunは旧実装担当が所有中の同じ隔離先へ配送しない() {
+        let mut old = Case::new();
+        old.bind();
+        let tasks = old.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        let rt = TeamRuntime::restore(old.rt.to_saved(), old.root.clone());
+        let mut restored = Case {
+            root: old.root.clone(),
+            rt,
+            sessions: Vec::new(),
+        };
+        restored.bind();
+        assert!(restored.tick(SessionState::Idle).is_empty());
+        drop(old.rt.take_integration_for_shutdown()); // Controlled old-writer termination.
+        assert_eq!(restored.tick(SessionState::Idle).len(), 2);
+    }
+
+    #[test]
+    fn runを破棄しても実writerが終了するまで担当の所有権を保持する() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        let mut writers = Vec::new();
+        for id in &tasks {
+            let task = c.rt.task(*id).unwrap().clone();
+            let (work, _, _) = super::super::task_workspace::execution(&c.root, &task.files)
+                .unwrap()
+                .unwrap();
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
+                task.assigned_session.unwrap(),
+                &work,
+                "late.txt",
+                "setsid",
+            );
+            c.rt.handoff_integration_writer(
+                *id,
+                task.assigned_session.unwrap(),
+                writer.session.as_ref().unwrap().writer_identity(),
+            )
+            .unwrap();
+            writer.exit_parent();
+            writers.push(writer);
+        }
+        let replacement = TeamRuntime::restore(c.rt.to_saved(), c.root.clone());
+        drop(std::mem::replace(&mut c.rt, replacement));
+        for id in &tasks {
+            assert!(c.locked(*id), "Run dropだけで旧writerから所有権を奪った");
+        }
+        for writer in &mut writers {
+            writer.write_child();
+            writer.finish_child();
+        }
+        super::descendant_tests::wait_until(|| tasks.iter().all(|id| !c.locked(*id)));
+    }
+
+    #[test]
+    fn 終了タブが残っても最終報告を受理して未完了担当を起動し直す() {
+        let mut c = Case::new();
+        c.bind();
+        let tasks = c.tick(SessionState::Idle);
+        assert_eq!(tasks.len(), 2);
+        let complete = c.rt.task(tasks[0]).unwrap().clone();
+        let incomplete = c.rt.task(tasks[1]).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &complete.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("output.txt"), "completed output").unwrap();
+        let agent = complete.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({
+            "task_id": complete.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/output.txt")],
+            "validation": [], "blockers": []
+        })
+        .to_string();
+        for session in &mut c.sessions {
+            session.state = SessionState::Exited;
+            if Some(session.id) == complete.assigned_session {
+                session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+            }
+        }
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert_eq!(
+            c.rt.task(complete.id).unwrap().state,
+            TeamTaskState::Completed
+        );
+        let uncompleted = c.rt.task(incomplete.id).unwrap();
+        assert_eq!(uncompleted.state, TeamTaskState::Ready);
+        assert!(uncompleted.assigned_session.is_none());
+        assert_eq!(uncompleted.attempts, incomplete.attempts + 1);
+        let launches: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                TeamEffect::StartAgent(spec) => Some((spec.clone(), effect.key())),
+                _ => None,
+            })
+            .collect();
+        assert!(!launches.is_empty(), "終了タブを生存扱いせず後任を起動する");
+        let old_sessions: Vec<_> = c.sessions.iter().map(|s| s.id).collect();
+        for (index, (spec, key)) in launches.into_iter().enumerate() {
+            let id = 100 + index as u64;
+            c.rt.bind_session(&spec.agent_id, id, None);
+            c.rt.note_effect_done(&key);
+            c.sessions.push(SessionObs {
+                id,
+                title: "replacement".into(),
+                provider: "fake".into(),
+                state: SessionState::Idle,
+                text: String::new(),
+            });
+        }
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert!(effects.iter().any(|effect| matches!(effect,
+            TeamEffect::SendInstruction { task, session, .. }
+                if *task == incomplete.id && !old_sessions.contains(session))));
+        assert_eq!(
+            c.rt.task(complete.id).unwrap().state,
+            TeamTaskState::Completed
+        );
+
+        // 後任の完了から統合へ進め、統合担当も最終報告と同時に終了する。
+        for effect in effects {
+            if let TeamEffect::SendInstruction {
+                task, session, key, ..
+            } = effect
+            {
+                c.rt.handoff_integration_writer(
+                    task,
+                    session,
+                    crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+                )
+                .unwrap();
+                c.rt.note_effect_done(&key);
+            }
+        }
+        let task = c.rt.task(incomplete.id).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("second.txt"), "second output").unwrap();
+        let agent = task.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({"task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "担当成果を保存した", "changed_files": [format!("{prefix}/second.txt")], "validation": [], "blockers": []}).to_string();
+        c.rt.accept_outbox(
+            agent,
+            super::super::outbox::Kind::Result,
+            &report,
+            now_secs(),
+        )
+        .unwrap();
+        let effects = c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        let assembly = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                TeamEffect::SendInstruction {
+                    task, session, key, ..
+                } if c.rt.task(task).is_some_and(|t| t.key == "assemble") => {
+                    Some((task, session, key))
+                }
+                _ => None,
+            })
+            .expect("後任の完了後に統合へ進む");
+        c.rt.handoff_integration_writer(
+            assembly.0,
+            assembly.1,
+            crate::terminal::writer_tree::Identity::for_test(std::process::id()),
+        )
+        .unwrap();
+        c.rt.note_effect_done(&assembly.2);
+        let task = c.rt.task(assembly.0).unwrap().clone();
+        let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
+            .unwrap()
+            .unwrap();
+        std::fs::write(work.join("final.txt"), "final output").unwrap();
+        let agent = task.assigned_agent.as_ref().unwrap();
+        let report = serde_json::json!({"task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
+            "summary": "統合成果を保存した", "changed_files": [format!("{prefix}/final.txt")], "validation": [], "blockers": []}).to_string();
+        let session = c.sessions.iter_mut().find(|s| s.id == assembly.1).unwrap();
+        session.state = SessionState::Exited;
+        session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
+        c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        // Publication is asynchronous; preserve the same completed-state assertions
+        // after receiving the actual worker's completion, without timing sleeps.
+        let job = c.rt.publication.as_mut().expect("publication started");
+        job.ready = Some(
+            job.rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap(),
+        );
+        c.rt.tick(&Observation {
+            now: now_secs(),
+            sessions: c.sessions.clone(),
+        });
+        assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Completed);
+        assert_eq!(c.rt.goal().status, GoalStatus::Completed);
+        assert_eq!(
+            std::fs::read(c.root.join("final.txt")).unwrap(),
+            b"final output"
+        );
     }
 }

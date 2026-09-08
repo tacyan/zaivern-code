@@ -412,14 +412,14 @@ fn request_changesで差し戻される() {
 }
 
 #[test]
-fn 上限まで差し戻すと人へ上げる() {
+fn 上限まで差し戻すと未解決付きで提出する() {
     let (mut rt, sids, tid, mut rev_sid) = to_review_stage();
     let mut now = 20;
     for round in 0..3 {
         let block = review_block(tid, false);
         tick_text(&mut rt, now, &sids, rev_sid, &block);
         now += 1;
-        if rt.task(tid).unwrap().state == TeamTaskState::NeedsUser {
+        if rt.task(tid).unwrap().state == TeamTaskState::Submitted {
             break;
         }
         // 再実装 → 再報告 → 再レビュー
@@ -443,12 +443,12 @@ fn 上限まで差し戻すと人へ上げる() {
             .and_then(|t| t.assigned_session)
             .unwrap_or(rev_sid);
     }
-    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::NeedsUser);
+    assert_eq!(rt.task(tid).unwrap().state, TeamTaskState::Submitted);
     assert!(
-        rt.decisions()
+        !rt.decisions()
             .iter()
             .any(|d| d.kind == DecisionKind::AttemptsExhausted),
-        "人へ上げていない: {:?}",
+        "人の判断が要求されている: {:?}",
         rt.decisions()
     );
 }
@@ -3034,13 +3034,14 @@ fn 断られた遷移は黙殺せず記録に残す() {
     // 無かったことにすると「押したのに何も起きない」を誰も追えない。
     let (mut rt, sids, tid) = to_assigned();
     let before = rt.rejected_transitions();
-    // 完了したタスクへ、あとから報告が流れてくる筋書き。
-    rt.set_state_for_test(tid, TeamTaskState::Completed);
+    // 未配送のタスクへ報告が届く不正な遷移は記録する。
+    // 完了済みタスクの再報告は受理済みの重複なので、この検査の対象ではない。
+    rt.set_state_for_test(tid, TeamTaskState::Ready);
     report_and_collect(&mut rt, &sids, tid, 12);
     assert_eq!(
         rt.task(tid).unwrap().state,
-        TeamTaskState::Completed,
-        "完了から動いてしまった"
+        TeamTaskState::Ready,
+        "未配送のタスクが動いてしまった"
     );
     assert!(
         rt.rejected_transitions() > before,
@@ -3259,7 +3260,7 @@ fn 調停層が断ったら指示も出さない() {
 }
 
 #[test]
-fn 迂回してよい場所は二か所だけ() {
+fn 迂回してよい場所は三か所だけ() {
     // **`sm::force` を増やしたらここが赤くなる。** 増やすなら、その場所と
     // 「なぜ確認済みと言えるか」をこのテストにも書くこと。
     let src = include_str!("runtime.rs").replace("\r\n", "\n");
@@ -3269,8 +3270,8 @@ fn 迂回してよい場所は二か所だけ() {
         .filter(|l| l.contains("sm::force("))
         .count();
     assert_eq!(
-        n, 2,
-        "状態機械を迂回している箇所が {n} 個ある (人の Retry と、停止確認後の回収だけのはず)"
+        n, 3,
+        "状態機械を迂回している箇所が {n} 個ある (人の Retry、停止確認後の回収、ユーザー指定の未解決付き提出だけのはず)"
     );
 }
 

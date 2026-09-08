@@ -678,7 +678,7 @@ pub fn run_resolved_capped(
     // 終わってから読もうとすると、たくさん出す子は書き込みで止まったまま
     // 進まない (こちらは終了を待つ = 相互に待つ = 固まる)。
     // 上限を超えた分は捨てながら**末尾だけ**を持つので、記憶は増えない。
-    let out_tail = spawn_reader(child.stdout.take(), STDOUT_TAIL_BYTES);
+    let out_tail = spawn_reader(child.stdout.take(), STDOUT_TAIL_BYTES.max(success_cap));
     let err_tail = spawn_reader(child.stderr.take(), STDERR_TAIL_BYTES);
     // **外から落とせるようにする。** 閉じる側 (`on_exit`) は worker を
     // 待てないので、PID を見て自分で木を落とす。
@@ -1668,6 +1668,23 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
         r
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 仕様生成の出力は三十二kbを超えても先頭を保持する() {
+        let dir = ws("draft-large-output");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (code, why, output) = run_resolved_capped(
+            Path::new("/bin/sh"), &["-c", "printf 'SPEC_START\\n'; i=0; while [ $i -lt 6000 ]; do printf 'requirement\\n'; i=$((i+1)); done; printf 'SPEC_END\\n'"],
+            &dir, std::time::Duration::from_secs(10), &new_cancel_flag(), &new_pid_slot(), 128 * 1024);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(code, 0);
+        assert_eq!(why, ValidationOutcome::Passed);
+        assert!(output.stdout.len() > STDOUT_TAIL_BYTES);
+        assert!(output.stdout.starts_with("SPEC_START"));
+        assert!(output.stdout.contains("SPEC_END"));
+        assert!(!output.stdout_truncated);
     }
 
     #[cfg(unix)]

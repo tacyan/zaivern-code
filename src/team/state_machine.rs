@@ -46,7 +46,7 @@ pub fn allowed(from: S, to: S) -> bool {
     }
     // 人を呼ぶのはいつでもできる。ただし完了済みは呼び戻さない。
     if to == S::NeedsUser {
-        return from != S::Completed;
+        return !matches!(from, S::Completed | S::Submitted);
     }
     matches!(
         (from, to),
@@ -76,7 +76,7 @@ pub fn allowed(from: S, to: S) -> bool {
 
 /// 遷移を試す。許されていれば新しい状態を返す。
 pub fn apply(from: S, to: S) -> Result<S, TransitionError> {
-    if from == S::Completed && to != S::Completed {
+    if matches!(from, S::Completed | S::Submitted) && to != from {
         return Err(TransitionError::Terminal { from });
     }
     if allowed(from, to) {
@@ -88,8 +88,8 @@ pub fn apply(from: S, to: S) -> Result<S, TransitionError> {
 
 /// 人が明示的に動かす経路 (`NeedsUser` からの復帰、`Completed` の取り消し)。
 ///
-/// **自動処理からは呼ばない。** 呼び出し元は必ず人の操作
-/// ([`super::runtime::TeamAction`]) から来ること。
+/// 人の操作、停止確認済みの回収、またはユーザー指定の修正上限時の
+/// 現状提出だけで使う。検証合格を偽装する用途には使わない。
 pub fn force(_from: S, to: S) -> S {
     to
 }
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn 人へはどこからでも上げられるが完了からは上げない() {
         for s in S::ALL {
-            if s == S::Completed {
+            if matches!(s, S::Completed | S::Submitted) {
                 assert!(apply(s, S::NeedsUser).is_err(), "{}", s.key());
             } else {
                 assert_eq!(apply(s, S::NeedsUser), Ok(S::NeedsUser), "{}", s.key());
@@ -152,18 +152,13 @@ mod tests {
 
     #[test]
     fn 完了は自動では動かない() {
-        for s in S::ALL {
-            if s == S::Completed {
-                continue;
+        for terminal in [S::Completed, S::Submitted] {
+            for s in S::ALL {
+                if s == terminal { continue; }
+                assert!(matches!(apply(terminal, s), Err(TransitionError::Terminal { .. })),
+                    "{} → {} を許してしまった", terminal.key(), s.key());
+                assert!(!allowed(terminal, s));
             }
-            assert!(
-                matches!(
-                    apply(S::Completed, s),
-                    Err(TransitionError::Terminal { .. })
-                ),
-                "Completed → {} を許してしまった",
-                s.key()
-            );
         }
         // 人の操作だけが取り消せる
         assert_eq!(force(S::Completed, S::Ready), S::Ready);

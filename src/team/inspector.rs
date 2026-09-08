@@ -11,7 +11,7 @@ use crate::theme::Theme;
 
 use super::model::*;
 use super::panel::BoardAction;
-use super::view_model::{self, TeamAgentView, TaskView, TeamSnapshot};
+use super::view_model::{self, TaskView, TeamAgentView, TeamSnapshot};
 
 /// 1 つの一覧に出す行数の上限 (長文は Inspector でも切って hover で出す)。
 pub const LIST_ROWS_MAX: usize = 12;
@@ -203,32 +203,36 @@ fn task_section(ui: &mut egui::Ui, theme: &Theme, t: &TaskView, acts: &mut Vec<B
             ui.label(tr("team.inspector.attempts"));
             ui.label(t.attempts.to_string());
             ui.end_row();
-            ui.label(tr("team.inspector.validation"));
-            ui.label(if !t.validation_ran {
-                tr("team.inspector.not_run")
-            } else if t.validation_ok {
-                tr("team.inspector.passed")
-            } else {
-                // **なぜ通らなかったのかまで出す。** 時間切れと実装の失敗を
-                // 同じ「失敗」で塗ると、直しようが無い。
-                match t.validation_result {
-                    Some(ValidationOutcome::TimedOut) => tr("team.validation.timed_out"),
-                    Some(ValidationOutcome::Cancelled) => tr("team.validation.cancelled"),
-                    Some(ValidationOutcome::SpawnFailed) => tr("team.validation.spawn_failed"),
-                    Some(ValidationOutcome::RunnerDisconnected) => {
-                        tr("team.validation.runner_disconnected")
+            if t.validation_ran || !t.validation_commands.is_empty() {
+                ui.label(tr("team.inspector.validation"));
+                ui.label(if !t.validation_ran {
+                    tr("team.inspector.not_run")
+                } else if t.validation_ok {
+                    tr("team.inspector.passed")
+                } else {
+                    // **なぜ通らなかったのかまで出す。** 時間切れと実装の失敗を
+                    // 同じ「失敗」で塗ると、直しようが無い。
+                    match t.validation_result {
+                        Some(ValidationOutcome::TimedOut) => tr("team.validation.timed_out"),
+                        Some(ValidationOutcome::Cancelled) => tr("team.validation.cancelled"),
+                        Some(ValidationOutcome::SpawnFailed) => tr("team.validation.spawn_failed"),
+                        Some(ValidationOutcome::RunnerDisconnected) => {
+                            tr("team.validation.runner_disconnected")
+                        }
+                        _ => tr("team.inspector.failed"),
                     }
-                    _ => tr("team.inspector.failed"),
-                }
-            });
-            ui.end_row();
-            ui.label(tr("team.inspector.review"));
-            ui.label(match t.review_verdict {
-                Some(ReviewVerdict::Approve) => tr("team.review.approved"),
-                Some(ReviewVerdict::RequestChanges) => tr("team.review.changes"),
-                None => tr("team.inspector.not_run"),
-            });
-            ui.end_row();
+                });
+                ui.end_row();
+            }
+            if t.review_verdict.is_some() {
+                ui.label(tr("team.inspector.review"));
+                ui.label(match t.review_verdict {
+                    Some(ReviewVerdict::Approve) => tr("team.review.approved"),
+                    Some(ReviewVerdict::RequestChanges) => tr("team.review.changes"),
+                    None => tr("team.inspector.not_run"),
+                });
+                ui.end_row();
+            }
         });
 
     section(ui, theme, "team.inspector.files", &t.files);
@@ -238,12 +242,7 @@ fn task_section(ui: &mut egui::Ui, theme: &Theme, t: &TaskView, acts: &mut Vec<B
         "team.inspector.acceptance",
         &t.acceptance_criteria,
     );
-    section(
-        ui,
-        theme,
-        "team.inspector.commands",
-        &t.validation_commands,
-    );
+    section(ui, theme, "team.inspector.commands", &t.validation_commands);
     // **落ちた検証の出力を人にも見せる。** ここが無いと、直せなかった
     // ときに人が同じコマンドを手で打ち直して確かめることになる。
     section(
@@ -256,7 +255,11 @@ fn task_section(ui: &mut egui::Ui, theme: &Theme, t: &TaskView, acts: &mut Vec<B
     section(ui, theme, "team.inspector.context", &t.context);
     section(ui, theme, "team.inspector.blockers", &t.blockers);
     if !t.last_summary.is_empty() {
-        ui.label(RichText::new(tr("team.inspector.last_report")).color(theme.text).strong());
+        ui.label(
+            RichText::new(tr("team.inspector.last_report"))
+                .color(theme.text)
+                .strong(),
+        );
         let sum = plain(&t.last_summary);
         ui.label(RichText::new(&sum).color(theme.text_dim))
             .on_hover_text(sum);

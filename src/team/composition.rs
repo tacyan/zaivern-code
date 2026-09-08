@@ -197,7 +197,15 @@ const ARTIFACT_WORDS: &[&str] = &[
 /// 1 枚の成果物を**弱く**指す語。空の作業場でだけ効く —
 /// 既存リポジトリの「設定画面にフォントサイズを足す」は機能追加であって、
 /// 画面を 1 枚作る依頼ではない。
-const WEAK_ARTIFACT_WORDS: &[&str] = &["ページ", "画面", "ui", "デザイン", "mockup", "page", "screen"];
+const WEAK_ARTIFACT_WORDS: &[&str] = &[
+    "ページ",
+    "画面",
+    "ui",
+    "デザイン",
+    "mockup",
+    "page",
+    "screen",
+];
 
 /// 独立した単位が並ぶことを示す語。
 const WIDE_WORDS: &[&str] = &[
@@ -301,13 +309,9 @@ pub fn count_units(brief: &str) -> usize {
             l.starts_with("- ")
                 || l.starts_with("* ")
                 || l.starts_with("・")
-                || l
-                    .split_once(['.', ')', '、'])
-                    .is_some_and(|(n, rest)| {
-                        !n.is_empty()
-                            && n.chars().all(|c| c.is_ascii_digit())
-                            && !rest.is_empty()
-                    })
+                || l.split_once(['.', ')', '、']).is_some_and(|(n, rest)| {
+                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty()
+                })
         })
         .count();
     let counted = counted_number(brief);
@@ -393,6 +397,10 @@ pub fn classify(brief: &str, probe: &WorkspaceProbe) -> (WorkShape, usize) {
     let text = brief.to_lowercase();
     let units = count_units(brief);
     let artifact = contains_any(&text, ARTIFACT_WORDS)
+        || text.contains("スキル")
+        || text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| matches!(word, "skill" | "skills"))
         || (!probe.has_repo_markers && contains_any(&text, WEAK_ARTIFACT_WORDS));
     let wide = contains_any(&text, WIDE_WORDS);
     let research = contains_any(&text, RESEARCH_WORDS) && !contains_any(&text, BUILD_WORDS);
@@ -421,7 +429,7 @@ pub fn recommend(brief: &str, probe: &WorkspaceProbe, max_agents: usize) -> Reco
     let max = max_agents.max(1);
     let (shape, units) = classify(brief, probe);
     let mut reasons = Vec::new();
-    let (agents, roles) = match shape {
+    let (mut agents, roles) = match shape {
         WorkShape::SingleArtifact => {
             reasons.push(Reason::SingleArtifact);
             if !probe.has_files {
@@ -451,6 +459,13 @@ pub fn recommend(brief: &str, probe: &WorkspaceProbe, max_agents: usize) -> Reco
             (1, vec![R::Planner])
         }
     };
+    // 詳細計画がある場合は、短い依頼文からの暫定2体を引き継がない。
+    if brief
+        .lines()
+        .any(|line| matches!(line.trim(), "## タスク" | "## Tasks"))
+    {
+        agents = agents.max(units.saturating_add(1));
+    }
     reasons.push(Reason::TokenCost);
     let (review_required, time_budget_min) = match shape {
         WorkShape::SingleArtifact => (false, Some(SINGLE_ARTIFACT_BUDGET_MIN)),
@@ -468,7 +483,6 @@ pub fn recommend(brief: &str, probe: &WorkspaceProbe, max_agents: usize) -> Reco
     }
 }
 
-
 /// 1 枚の成果物の SPEC を**こちらで書く** (純関数)。
 ///
 /// 書き換えの段は headless のエージェントに最大 5 分待つ。1 枚の成果物の
@@ -478,52 +492,51 @@ pub fn recommend(brief: &str, probe: &WorkspaceProbe, max_agents: usize) -> Reco
 ///
 /// 形の決まり (計画がそのまま読める):
 /// * 箇条書きの先頭に役割の名乗り (`implementer:` / `tester:`)
-/// * 担当ファイルは**行末の** `(files: …)` 1 つだけ。それより後ろに
-///   括弧を置かない (`planner::split_files` は最後の括弧を見る)
-/// * 完了条件は**測れる形** — 何が在るか・何が出ないか・どの幅か
+/// * 担当ファイルや検証コマンドは依頼だけで確定できないため固定しない
+/// * 完了条件は成果物の利用方法に沿って検証する
 pub fn spec_template(goal: &str, brief: &str, rec: &Recommendation) -> Option<String> {
     if rec.shape != WorkShape::SingleArtifact {
         return None;
     }
-    let budget = rec.time_budget_min.unwrap_or(SINGLE_ARTIFACT_BUDGET_MIN);
     let goal = goal.trim();
     let brief = brief.trim();
     let title = if goal.is_empty() {
-        brief.lines().next().unwrap_or("Web ページ").trim()
+        brief.lines().next().unwrap_or("成果物").trim()
     } else {
         goal
     };
-    // 依頼文の改行は 1 行に畳む (箇条書きの行にすると計画が別タスクに割る)。
-    let ask: String = if brief.is_empty() { title } else { brief }
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(format!(
-        "# {title}\n\
-         \n\
-         ## タスク\n\
-         - implementer: 「{ask}」を 1 枚のページとして**通しで**作る。HTML・CSS・JS を全部このタスクが持ち、\
-         見た目のまとまり — 配色・余白・文字の大きさ・動き — を 1 人で決める。\
-         **{budget} 分で仕上げる**: 凝る前に動くものを出し、残りの時間で磨く。\
-         文言はプレースホルダを使わず、依頼から読み取れる実際の内容で書く。\
-         外部ライブラリは CDN の URL で読むか、`assets/vendor/` に自分で置く — \
-         読み込むと書いたのに置かないファイルを 1 つも残さない。\
-         375px 幅と 1280px 幅の両方で崩れないこと。\
-         できたら `zai team check` を自分でも走らせてから完了報告する \
-         (files: index.html assets/css/style.css assets/js/main.js assets/vendor/**)\n\
-         - tester: 実装担当が「できた」と言ったら**実際に開いて確かめる**。`zai team check` で \
-         読み込みエラーとブラウザのコンソールエラーを見て、`zai team shot` で 375px と 1280px の \
-         画像を撮って崩れ・読めない文字・埋もれた文字を見る。直すべき点は具体的な箇所と直し方を \
-         伝言で実装担当へ返し、直ったのをもう一度開いて確認してから完了にする。\
-         手順書・レビュー記録・README は書かない — 直すのはページであって文書ではない\n\
-         \n\
+    Some(fallback_spec(title, brief, rec))
+}
+
+/// 生成失敗時にも元の依頼を残した確認用下書きを作る。
+/// 形式・ファイル名・検証コマンドを推測で固定しない。
+pub fn fallback_spec(goal: &str, brief: &str, rec: &Recommendation) -> String {
+    let title = goal.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ask = brief.split_whitespace().collect::<Vec<_>>().join(" ");
+    let primary = if rec.roles.contains(&TeamRole::Implementer) {
+        TeamRole::Implementer
+    } else {
+        rec.roles.first().copied().unwrap_or(TeamRole::Planner)
+    };
+    let checker = [TeamRole::Tester, TeamRole::Reviewer]
+        .into_iter()
+        .find(|r| rec.roles.contains(r))
+        .unwrap_or(primary);
+    let work = if rec.shape == WorkShape::Research {
+        "依頼の観点で調査し、出典と根拠を付けて結論をまとめる。未確認の点は明示する"
+    } else {
+        "依頼に適した形式・言語で成果物を通しで作る。既存の構造と規約に合わせ、必要なファイルと参照先を揃える。文書やスキルが依頼なら、それ自体を完成させる"
+    };
+    format!(
+        "# {title}\n\n## 依頼\n{brief}\n\n## タスク\n\
+         - {primary}: 「{ask}」について、{work}\n\
+         - {checker}: 成果物が揃ったら実際の利用方法で検証する。コードは実行・テスト、文書やスキルは内容・参照先・手順の再現性、調査は根拠と結論の整合性を確認する。不備を修正して再確認する\n\n\
          ## 完了条件\n\
-         - `index.html` を開くと、見出し・説明・行動を促すボタン・フッターが実際の文言で表示される\n\
-         - `index.html` が読み込むローカルファイルがすべて実在する (`zai team check` が緑)\n\
-         - ブラウザのコンソールにエラーが 0 件\n\
-         - 375px 幅と 1280px 幅の両方で横スクロールが出ず、文字が背景に埋もれず読める\n\
-         - 開始から {budget} 分以内に上の条件を満たしている\n"
-    ))
+         - 元の依頼の要件を満たす成果物があり、未確認の点が明示されている\n\
+         - 成果物に適した検証を実施し、結果を報告している\n",
+        primary = primary.key(),
+        checker = checker.key(),
+    )
 }
 
 /// 書き換え依頼文へ載せる**形ごとの作法** (純関数)。
@@ -534,13 +547,11 @@ pub fn spec_template(goal: &str, brief: &str, rec: &Recommendation) -> Option<St
 pub fn spec_guidance(shape: WorkShape) -> &'static str {
     match shape {
         WorkShape::SingleArtifact => {
-            "* **成果物は 1 枚。実装は 1 本のタスクにまとめる** — HTML / CSS / JS の\
-             ように 1 つのものを成す部品は**同じ担当が通しで作る**。分けると\
-             繋ぎ目 (読み込み順・命名・配色) が誰の担当でもなくなる\n\
-             * テスト担当のタスクは「**実際に開いて確かめ、崩れは伝言で実装担当へ\
-             返す**」。確認手順書は作らない (手順書はページを直さない)\n\
-             * 品質の物差しを完了条件に**具体的に**書く: 何を読み込むか・\
-             どの幅で崩れないか・コンソールにエラーが無いか"
+            "* **主成果物の一貫性を保つ。独立した付属成果物は別タスクにする** — 関連する部品は\
+             **同じファイルは同じ担当が通しで作る**。成果物の形式と言語は依頼に合わせる\n\
+             * テスト担当は実際の利用方法で確かめ、不備を実装担当へ返す\n\
+             * 品質の物差しを完了条件に**具体的に**書く。コードなら実行結果、\
+             文書・スキルなら内容と手順の再現性を確認する"
         }
         WorkShape::WideIndependent => {
             "* **単位ごとに 1 本**。各タスクは他のタスクの完成を待たずに\
@@ -580,6 +591,13 @@ mod tests {
     }
 
     /// **実機の依頼そのもの。** 6 役割・4 体ではなく 2 体になる。
+    #[test]
+    fn 詳細計画の作業数で暫定人数を更新する() {
+        let spec = "# Skill\n## タスク\n- implementer: 本体\n- tester: 実物検証\n";
+        assert_eq!(recommend(spec, &empty(), 8).agents, 3);
+        assert_eq!(recommend(spec, &empty(), 2).agents, 2);
+    }
+
     #[test]
     fn かっこいいhpは2体で実装とテスト() {
         for brief in [
@@ -654,7 +672,11 @@ mod tests {
         assert!(r.reasons.contains(&Reason::ExistingRepo));
 
         // 2 単位: 設計を先頭に。
-        let r = recommend("- 設定モデルに font_size を足す\n- 設定画面に UI を足す", &repo(), 16);
+        let r = recommend(
+            "- 設定モデルに font_size を足す\n- 設定画面に UI を足す",
+            &repo(),
+            16,
+        );
         assert_eq!(r.shape, WorkShape::FeatureInRepo);
         assert_eq!(r.roles[0], R::Architect);
         assert!(r.agents >= 3);
@@ -668,7 +690,11 @@ mod tests {
         assert_eq!(r.agents, 1);
         assert_eq!(r.roles, vec![R::Planner]);
         // 「調査して実装する」は実装。
-        let r = recommend("ライブラリを調査して、選んだものでログイン画面を作る", &empty(), 16);
+        let r = recommend(
+            "ライブラリを調査して、選んだものでログイン画面を作る",
+            &empty(),
+            16,
+        );
         assert_ne!(r.shape, WorkShape::Research);
     }
 
@@ -686,7 +712,11 @@ mod tests {
         for brief in ["HP", "12 個の API", "調査", "機能を足す", ""] {
             for max in [1, 2, 4, 16] {
                 let r = recommend(brief, &repo(), max);
-                assert!((1..=max).contains(&r.agents), "{brief} / max={max} → {}", r.agents);
+                assert!(
+                    (1..=max).contains(&r.agents),
+                    "{brief} / max={max} → {}",
+                    r.agents
+                );
             }
         }
     }
@@ -697,12 +727,17 @@ mod tests {
     fn 形ごとの作法は空でない() {
         for s in WorkShape::ALL {
             assert!(!spec_guidance(s).trim().is_empty(), "{:?}", s);
-            assert!(spec_guidance(s).starts_with("* "), "箇条書きで始める: {:?}", s);
+            assert!(
+                spec_guidance(s).starts_with("* "),
+                "箇条書きで始める: {:?}",
+                s
+            );
         }
         // 1 枚の成果物は「1 本にまとめる」と言い切る。
-        assert!(spec_guidance(WorkShape::SingleArtifact).contains("1 本のタスクにまとめる"));
+        assert!(
+            spec_guidance(WorkShape::SingleArtifact).contains("独立した付属成果物は別タスクにする")
+        );
     }
-
 
     /// **1 枚の成果物はレビュー専任を立てず、10 分の予算を持つ。**
     #[test]
@@ -716,51 +751,133 @@ mod tests {
     }
 
     /// **雛形は計画がそのまま読める。** 実装 1 本 + 検証 1 本に割れ、
-    /// 役割が付き、実装は Web の 3 ファイルと vendor を持つ。
+    /// 役割が付き、実装方式は依頼に合わせて選べる。
     #[test]
     fn 一枚の成果物の雛形は計画がそのまま読める() {
         use super::super::planner;
         let rec = recommend("かっこいいHPを作る", &empty(), 16);
         let spec = spec_template("かっこいい HP", "かっこいいHPを作る", &rec).expect("雛形が出る");
-        assert!(!planner::needs_spec_rewrite(&spec), "雛形なのに書き換えが要ると言う");
+        assert!(
+            !planner::needs_spec_rewrite(&spec),
+            "雛形なのに書き換えが要ると言う"
+        );
         let sections = planner::parse_sections(&spec);
         let seeds = planner::implementation_seeds(&sections, "かっこいい HP");
         assert_eq!(seeds.len(), 2, "実装 1 本 + 検証 1 本でない: {seeds:?}");
-        assert!(seeds[0].title.starts_with("implementer: "), "{}", seeds[0].title);
-        assert!(seeds[1].title.starts_with("tester: "), "{}", seeds[1].title);
-        // 担当ファイルは行末の (files: …) だけ。
-        let mut i = super::super::planner::tests_hook::split_files_for_test(&seeds[0].title);
-        i.1.sort();
-        assert_eq!(
-            i.1,
-            vec![
-                "assets/css/style.css".to_string(),
-                "assets/js/main.js".to_string(),
-                "assets/vendor/**".to_string(),
-                "index.html".to_string(),
-            ]
+        assert!(
+            seeds[0].title.starts_with("implementer: "),
+            "{}",
+            seeds[0].title
         );
-        assert!(spec.contains("10 分"), "時間の予算が載っていない");
-        // 完了条件は測れる形 (何が在るか・何が出ないか・どの幅か)。
-        for must in ["zai team check", "コンソール", "375px", "1280px"] {
-            assert!(spec.contains(must), "完了条件に {must} が無い");
-        }
-        // 雛形そのものを計画へ渡しても、体の数は 2 のまま (完了条件の
-        // 箇条書きを単位として数えない)。
+        assert!(seeds[1].title.starts_with("tester: "), "{}", seeds[1].title);
+        assert!(spec.contains("かっこいいHPを作る"));
+        assert!(
+            super::super::planner::tests_hook::split_files_for_test(&seeds[0].title)
+                .1
+                .is_empty()
+        );
+        assert!(
+            !spec.contains("index.html"),
+            "指定されていない実装方式を固定しない"
+        );
+        // 詳細計画から統合担当も含めて人数を更新する。完了条件は数えない。
         let again = recommend(&spec, &empty(), 16);
-        assert_eq!(again.shape, WorkShape::SingleArtifact, "雛形を読ませたら形が変わった");
-        assert_eq!(again.agents, 2);
+        assert_eq!(
+            again.shape,
+            WorkShape::SingleArtifact,
+            "雛形を読ませたら形が変わった"
+        );
+        assert_eq!(again.agents, 3);
     }
 
     /// 1 枚の成果物でなければ雛形は出さない (書き換えはエージェントに頼む)。
     #[test]
     fn 一枚の成果物でなければ雛形を出さない() {
-        for brief in ["12 個のエンドポイントを実装する", "競合を調査して比較する"] {
+        for brief in ["12 個のエンドポイントを実装する", "競合を調査して比較する"]
+        {
             let rec = recommend(brief, &repo(), 16);
             assert!(spec_template("x", brief, &rec).is_none(), "{brief}");
         }
     }
 
+    #[test]
+    fn 非web成果物にhtmlの仕様を強制しない() {
+        for brief in [
+            "Brainでデザイン系のSKILLSで100万以上稼ぐ",
+            "Rust の CLI を作って",
+            "Python のスクリプトを作って",
+            "記事を作って",
+            "ロゴを作って",
+            "PHP のライブラリを作って",
+        ] {
+            let rec = recommend(brief, &empty(), 16);
+            let spec = spec_template("成果物", brief, &rec).expect(brief);
+            assert!(spec.contains(brief));
+            assert!(!super::super::planner::needs_spec_rewrite(&spec));
+            for web in ["index.html", "HTML", "375px", "zai team check"] {
+                assert!(!spec.contains(web), "{brief}: {web}");
+            }
+        }
+    }
+
+    #[test]
+    fn すべての依頼形で汎用下書きを計画できる() {
+        use super::super::planner::{PlanInput, StaticPlanner, TeamPlanner};
+        for brief in [
+            "React と TypeScript でサイトを作って",
+            "Rust CLI を実装",
+            "Python API を実装",
+            "記事を書く",
+            "スキルを作成",
+            "競合を調査して比較する",
+            "12 個のエンドポイントを実装する",
+            "設定に機能を追加",
+        ] {
+            for probe in [empty(), repo()] {
+                let rec = recommend(brief, &probe, 16);
+                let spec = fallback_spec("成果物", brief, &rec);
+                assert!(spec.contains(brief));
+                assert!(!spec.contains("index.html"));
+                assert!(!super::super::planner::needs_spec_rewrite(&spec));
+                StaticPlanner
+                    .plan(PlanInput {
+                        spec,
+                        source: "SPEC.md".into(),
+                        agent_count: rec.agents,
+                        review_required: rec.review_required,
+                        workspace_root: std::path::PathBuf::new(),
+                        roles: rec.roles,
+                    })
+                    .unwrap_or_else(|e| panic!("{brief}: {e:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn 既存リポジトリでもスキル作成は下書きから計画まで進める() {
+        use super::super::planner::{PlanInput, StaticPlanner, TeamPlanner};
+        let brief = "Brainでデザイン系のSKILLSで100万以上稼ぐ";
+        let rec = recommend(brief, &repo(), 16);
+        let spec = spec_template("SKILLSを作成する", brief, &rec).expect("下書き");
+        assert!(!spec.contains("index.html"));
+        let plan = StaticPlanner
+            .plan(PlanInput {
+                spec,
+                source: "SPEC.md".into(),
+                agent_count: rec.agents,
+                review_required: rec.review_required,
+                workspace_root: std::path::PathBuf::new(),
+                roles: rec.roles,
+            })
+            .expect("計画できる");
+        let implementer = plan
+            .tasks
+            .iter()
+            .find(|t| t.role == R::Implementer)
+            .unwrap();
+        let tester = plan.tasks.iter().find(|t| t.role == R::Tester).unwrap();
+        assert!(tester.dependencies.contains(&implementer.id));
+    }
 
     /// **確かめる担当は、確かめるものができてから配る。** 雛形を計画へ
     /// 通すと、`tester:` は `implementer:` に依存する (同時に配られて
@@ -795,7 +912,10 @@ mod tests {
             "検証担当が実装を待っていない: {:?}",
             tester.dependencies
         );
-        assert!(implementer.dependencies.is_empty(), "実装が何かを待っている");
+        assert!(
+            implementer.dependencies.is_empty(),
+            "実装が何かを待っている"
+        );
     }
 
     /// 観測は実ファイルで往復する。**空フォルダと目印付きを見分ける。**

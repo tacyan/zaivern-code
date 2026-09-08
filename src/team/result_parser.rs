@@ -153,18 +153,16 @@ impl RejectReason {
                 format!("報告のエージェント「{got}」が担当「{want}」と一致しません")
             }
             RejectReason::OutOfScopeFiles(f) => {
+                format!("担当外のファイルが実際に変更されています: {}", f.join(", "))
+            }
+            RejectReason::OutOfScopeReported(f) => {
                 format!(
-                    "担当外のファイルが実際に変更されています: {}",
+                    "担当外のファイルを変更したと報告しています: {}",
                     f.join(", ")
                 )
             }
-            RejectReason::OutOfScopeReported(f) => {
-                format!("担当外のファイルを変更したと報告しています: {}", f.join(", "))
-            }
             RejectReason::EvidenceUnavailable(w) => {
-                format!(
-                    "変更されたファイルを実測できないので完了にできません: {w}"
-                )
+                format!("変更されたファイルを実測できないので完了にできません: {w}")
             }
             RejectReason::ValidationMissing(c) => {
                 format!("検証コマンドが実行されていません: {}", c.join(", "))
@@ -499,7 +497,19 @@ pub fn parse_lenient<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, St
 ///
 /// **上限つき。** 走査対象そのものも末尾 [`SCAN_MAX_BYTES`] だけを見る。
 pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
-    let text = tail_bytes(text, SCAN_MAX_BYTES);
+    extract_blocks_with_limits(text, open, close, BLOCK_MAX_BYTES, SCAN_MAX_BYTES)
+}
+
+/// 計画など、報告とは上限が異なる文書も同じ抽出規則で読む。
+/// 呼び出し側が文書と走査の上限を指定する。通常の報告の制限は変えない。
+pub fn extract_blocks_with_limits(
+    text: &str,
+    open: &str,
+    close: &str,
+    block_max: usize,
+    scan_max: usize,
+) -> Vec<String> {
+    let text = tail_bytes(text, scan_max);
     let mut out = Vec::new();
     let mut rest = text;
     while out.len() < BLOCKS_PER_SCAN {
@@ -507,14 +517,13 @@ pub fn extract_blocks(text: &str, open: &str, close: &str) -> Vec<String> {
         let after = &rest[i + open.len()..];
         let Some(j) = after.find(close) else { break };
         let body = &after[..j];
-        if body.len() <= BLOCK_MAX_BYTES {
+        if body.len() <= block_max {
             out.push(body.trim().to_string());
         }
         rest = &after[j + close.len()..];
     }
     out
 }
-
 
 // ── 自分が送った指示のエコー ─────────────────────────────────────────
 
@@ -602,14 +611,11 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
     Ok(doc)
 }
 
-/// 報告を、割り当てられたタスクと突き合わせて受理するか決める。
-///
-/// **ここが「完了」の関門**。落ちた理由はそのまま人へ出す。
-pub fn accept(
-    doc: ResultDoc,
+/// 再送を無視する場合も、担当と status の照合は省略しない。
+pub fn validate_result_header(
+    doc: &ResultDoc,
     task: &TeamTask,
-    evidence: &FileEvidence,
-) -> Result<AcceptedResult, RejectReason> {
+) -> Result<ReportedStatus, RejectReason> {
     if doc.task_id != task.id {
         return Err(RejectReason::TaskMismatch {
             got: doc.task_id,
@@ -630,10 +636,98 @@ pub fn accept(
 
     // 受け付ける語は `STATUS_WORDS` の 1 か所だけ。却下文も同じ表を読む。
     let spelled = doc.status.trim().to_ascii_lowercase();
-    let status = match STATUS_WORDS.iter().find(|(w, _)| *w == spelled) {
-        Some((_, st)) => *st,
-        None => return Err(RejectReason::UnknownStatus(spelled)),
-    };
+    match STATUS_WORDS.iter().find(|(w, _)| *w == spelled) {
+        Some((_, st)) => Ok(*st),
+        None => Err(RejectReason::UnknownStatus(spelled)),
+    }
+}
+
+/// 画面の折返しだけを補修する。outbox の原文には適用しない。
+/// 実測は書き換えず、担当内の既知パスへ一意に戻せる自己申告だけを直す。
+pub fn repair_screen_paths(
+    doc: &mut ResultDoc,
+    task: &TeamTask,
+    evidence: &FileEvidence,
+    workspace: &std::path::Path,
+) {
+    if !doc.changed_files.iter().any(|p| p.contains(['\r', '\n'])) {
+        return;
+    }
+    let root = workspace.canonicalize().ok();
+    for path in &mut doc.changed_files {
+        if !path.contains(['\r', '\n']) {
+            continue;
+        }
+        // Unix では改行も正規のファイル名。実物があるなら画面ノイズと決めない。
+        if evidence.measured_paths().iter().any(|p| p == path)
+            || workspace.join(&*path).symlink_metadata().is_ok()
+        {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        for mode in 0..3 {
+            let mut candidate = String::with_capacity(path.len());
+            let mut chars = path.chars().peekable();
+            while let Some(c) = chars.next() {
+                if matches!(c, '\r' | '\n') {
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    if mode > 0 {
+                        while chars.peek().is_some_and(|c| matches!(c, ' ' | '\t')) {
+                            chars.next();
+                        }
+                    }
+                    if mode == 2 {
+                        candidate.push(' ');
+                    }
+                } else {
+                    candidate.push(c);
+                }
+            }
+            // normalize_path は絶対パスや .. を畳むため、照合の前に弾く。
+            let slashed = candidate.replace('\\', "/");
+            if slashed.starts_with('/')
+                || slashed.contains(':')
+                || slashed.split('/').any(|part| part == "..")
+            {
+                continue;
+            }
+            let normalized = crate::lease::normalize_path(&candidate);
+            if !task
+                .files
+                .iter()
+                .any(|p| crate::lease::overlaps(p, &normalized))
+            {
+                continue;
+            }
+            let measured = evidence.measured_paths().contains(&normalized);
+            let exists_inside = root.as_ref().is_some_and(|root| {
+                workspace
+                    .join(&candidate)
+                    .canonicalize()
+                    .ok()
+                    .is_some_and(|p| p.starts_with(root) && p.is_file())
+            });
+            if (measured || exists_inside) && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        if candidates.len() == 1 {
+            *path = candidates.pop().expect("one candidate");
+        }
+    }
+}
+
+/// 報告を、割り当てられたタスクと突き合わせて受理するか決める。
+///
+/// **ここが「完了」の関門**。落ちた理由はそのまま人へ出す。
+pub fn accept(
+    doc: ResultDoc,
+    task: &TeamTask,
+    evidence: &FileEvidence,
+) -> Result<AcceptedResult, RejectReason> {
+    let status = validate_result_header(&doc, task)?;
 
     let changed: Vec<String> = doc
         .changed_files
@@ -1056,8 +1150,8 @@ fn unescape_lenient(s: &str) -> Option<String> {
                     if !(0xdc00..=0xdfff).contains(&low) {
                         return None;
                     }
-                    let scalar = 0x1_0000
-                        + (((code as u32 - 0xd800) << 10) | (low as u32 - 0xdc00));
+                    let scalar =
+                        0x1_0000 + (((code as u32 - 0xd800) << 10) | (low as u32 - 0xdc00));
                     out.push(char::from_u32(scalar)?);
                 } else if (0xdc00..=0xdfff).contains(&code) {
                     return None;
@@ -1096,9 +1190,7 @@ pub fn read_message(body: &str) -> Result<MessageDoc, MessageReject> {
     // 2) それでも駄目なら、伝言だけの受け皿 (鍵を 2 つ直接拾う) へ落ちる。
     let mut doc: MessageDoc = match parse_lenient(body) {
         Ok(d) => d,
-        Err(e) => {
-            lenient_message(&escape_raw_controls(body)).ok_or(MessageReject::BadJson(e))?
-        }
+        Err(e) => lenient_message(&escape_raw_controls(body)).ok_or(MessageReject::BadJson(e))?,
     };
     // **整形もここで済ませる。** 呼ぶ側で `trim` と上限を書くと、
     // 片方だけ上限が違う伝言が届く。
@@ -1439,7 +1531,10 @@ mod tests {
         t.assigned_agent = Some(AgentId::new("backend-api-1"));
         t.files = vec!["src/auth.rs".to_string()];
         t.validation_commands =
-        vec![super::super::validation_command::ValidationCommand::parse("cargo test auth").unwrap()];
+            vec![
+                super::super::validation_command::ValidationCommand::parse("cargo test auth")
+                    .unwrap(),
+            ];
         t
     }
 
@@ -1468,6 +1563,126 @@ mod tests {
       "validation": [{"command": "cargo test auth", "exit_code": 0}],
       "blockers": []
     }"#;
+
+    #[test]
+    fn 画面の折返しパスは実測に一致する場合だけ戻す() {
+        let mut t = assigned();
+        t.files = vec![".zai-team-worktrees/run-123-456-1/part-0/skills/".into()];
+        let expected = ".zai-team-worktrees/run-123-456-1/part-0/skills/readme.md";
+        let evidence = FileEvidence::Measured {
+            mine: vec![expected.into()],
+            out_of_scope: vec![],
+        };
+        let root = crate::test_util::unique_temp_dir("screen-path", "measured");
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files = vec![expected.replace("456-1", "456-\n  1")];
+        repair_screen_paths(&mut doc, &t, &evidence, &root);
+        assert_eq!(doc.changed_files, vec![expected]);
+        let accepted = accept(doc, &t, &evidence).unwrap();
+        assert_eq!(accepted.reported_files, accepted.changed_files);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 画面補修は正規の空白と改行入りファイル名を保持する() {
+        let root = crate::test_util::unique_temp_dir("screen-path", "spaces");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let mut t = assigned();
+        t.files = vec!["docs/".into()];
+        let evidence = FileEvidence::Unmeasurable("no git".into());
+        let names = ["docs/my guide.md", "docs/my  guide.md"];
+        for name in names {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files = names.iter().map(|s| s.to_string()).collect();
+        repair_screen_paths(&mut doc, &t, &evidence, &root);
+        assert_eq!(doc.changed_files, names);
+        doc.changed_files = vec!["docs/my \n  guide.md".into()];
+        // 「my guide」と「my  guide」の両方が実在するので曖昧な補修はしない。
+        let original = doc.changed_files.clone();
+        repair_screen_paths(&mut doc, &t, &evidence, &root);
+        assert_eq!(doc.changed_files, original);
+        #[cfg(unix)]
+        {
+            let name = "docs/my\n  guide.md";
+            std::fs::write(root.join(name), "x").unwrap();
+            doc.changed_files = vec![name.into()];
+            repair_screen_paths(&mut doc, &t, &evidence, &root);
+            assert_eq!(doc.changed_files, vec![name]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 画面補修は実在する担当内ファイルに限る() {
+        let root = crate::test_util::unique_temp_dir("screen-path", "existing");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/auth.rs"), "x").unwrap();
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files = vec!["src/au\r\n  th.rs".into()];
+        let evidence = FileEvidence::Unmeasurable("no git".into());
+        repair_screen_paths(&mut doc, &assigned(), &evidence, &root);
+        assert_eq!(doc.changed_files, vec!["src/auth.rs"]);
+        for path in [
+            "other/au\n th.rs",
+            "../src/au\n th.rs",
+            "/src/au\n th.rs",
+            "C:\\src\\au\n th.rs",
+            "src/miss\n ing.rs",
+        ] {
+            doc.changed_files = vec![path.into()];
+            repair_screen_paths(&mut doc, &assigned(), &clean(), &root);
+            assert_eq!(doc.changed_files, vec![path]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn 画面補修で担当外の実測を隠さない() {
+        let root = crate::test_util::unique_temp_dir("screen-path", "outside");
+        let evidence = dirty(&["src/other.rs"]);
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files = vec!["src/au\n  th.rs".into()];
+        repair_screen_paths(&mut doc, &assigned(), &evidence, &root);
+        assert!(matches!(
+            accept(doc, &assigned(), &evidence),
+            Err(RejectReason::OutOfScopeFiles(_))
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 画面補修は作業場所外へのリンクを実在根拠にしない() {
+        let root = crate::test_util::unique_temp_dir("screen-path", "symlink-root");
+        let outside = crate::test_util::unique_temp_dir("screen-path", "symlink-outside");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(outside.join("auth.rs"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("auth.rs"), root.join("src/auth.rs")).unwrap();
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.changed_files = vec!["src/au\n  th.rs".into()];
+        repair_screen_paths(
+            &mut doc,
+            &assigned(),
+            &FileEvidence::Unmeasurable("no git".into()),
+            &root,
+        );
+        assert_eq!(doc.changed_files, vec!["src/au\n  th.rs"]);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn 構造化報告のパスは画面補修を明示しない限り変えない() {
+        let body = GOOD.replace("src/auth.rs", "src/au\\n  th.rs");
+        let doc = parse_result(&body).unwrap();
+        assert_eq!(doc.changed_files, vec!["src/au\n  th.rs"]);
+        assert!(matches!(
+            accept(doc, &assigned(), &clean()),
+            Err(RejectReason::OutOfScopeReported(_))
+        ));
+    }
 
     #[test]
     fn 囲まれたブロックだけを読む() {
@@ -1528,7 +1743,9 @@ mod tests {
         doc.changed_files.push("src/other.rs".into());
         assert_eq!(
             accept(doc, &assigned(), &clean()),
-            Err(RejectReason::OutOfScopeReported(vec!["src/other.rs".into()]))
+            Err(RejectReason::OutOfScopeReported(
+                vec!["src/other.rs".into()]
+            ))
         );
     }
 
@@ -1573,7 +1790,10 @@ mod tests {
             vec!["src/auth.rs".to_string()],
             "台帳へ載るのは実測のほう"
         );
-        assert!(acc.reported_files.is_empty(), "自己申告は自己申告として残す");
+        assert!(
+            acc.reported_files.is_empty(),
+            "自己申告は自己申告として残す"
+        );
         // 食い違いが見える形で残る。
         let (missing, phantom) = acc.report_mismatch();
         assert_eq!(missing, vec!["src/auth.rs".to_string()]);
@@ -1762,7 +1982,10 @@ mod tests {
                 "省いたことが分からない: {d}"
             );
         }
-        assert!(d.len() <= super::super::model::TEXT_MAX, "却下文が長すぎる: {d}");
+        assert!(
+            d.len() <= super::super::model::TEXT_MAX,
+            "却下文が長すぎる: {d}"
+        );
     }
 
     /// **長い表は切ってよいが、切ったと書く。**
@@ -2197,7 +2420,10 @@ mod tests {
         );
         let (to, text) = check_message(body, &known, &AgentId::new("a")).expect("届く");
         assert_eq!(to, vec![AgentId::new("b")]);
-        assert!(text.contains("次は実装に入って"), "本文が欠けている: {text:?}");
+        assert!(
+            text.contains("次は実装に入って"),
+            "本文が欠けている: {text:?}"
+        );
         assert!(text.contains('\n'), "改行が失われている: {text:?}");
     }
 
@@ -2213,9 +2439,7 @@ mod tests {
         let done = "{\"text\": \"a\\nb\"}";
         assert_eq!(escape_raw_controls(done), done, "二重にエスケープしている");
     }
-
 }
-
 
 #[cfg(test)]
 mod lenient_message_tests {
@@ -2297,7 +2521,9 @@ mod lenient_message_tests {
         let _ = std::panic::catch_unwind(|| read(&near_limit)).expect("上限付近で panic した");
 
         // 任意UTF-8相当の決定的な探針。構造文字・制御文字・Unicodeを混ぜる。
-        let alphabet = ['{', '}', '[', ']', '"', '\\', ':', ',', '\n', '\t', 'a', '日', '😀'];
+        let alphabet = [
+            '{', '}', '[', ']', '"', '\\', ':', ',', '\n', '\t', 'a', '日', '😀',
+        ];
         let mut seed = 0x51_u64;
         for len in 0..512usize {
             let mut s = String::new();
@@ -2326,8 +2552,8 @@ mod lenient_message_tests {
             read(r#"{"to": "reviewer-1" "text": "カンマが無い"}"#).expect("カンマ抜けで落ちた");
         assert_eq!(text, "カンマが無い");
         // 3) 末尾カンマ
-        let (_, text) = read(r#"{"to": "reviewer-1", "text": "末尾カンマ",}"#)
-            .expect("末尾カンマで落ちた");
+        let (_, text) =
+            read(r#"{"to": "reviewer-1", "text": "末尾カンマ",}"#).expect("末尾カンマで落ちた");
         assert_eq!(text, "末尾カンマ");
         // 4) Windows パス (`\U` / `\m` は JSON の不正エスケープ)
         let (_, text) =
@@ -2346,8 +2572,7 @@ mod lenient_message_tests {
     /// `\\` で書く」と教える)。読み手側では決められない。
     #[test]
     fn 正当なエスケープと紛れるパスは化ける() {
-        let (_, text) =
-            read(r#"{"to": "reviewer-1", "text": "C:\temp の "log" を見て"}"#).unwrap();
+        let (_, text) = read(r#"{"to": "reviewer-1", "text": "C:\temp の "log" を見て"}"#).unwrap();
         assert_eq!(text, "C:\temp の \"log\" を見て".replace("\\t", "\t"));
         assert!(text.contains('\t'), "タブとして読まれていない");
         assert!(text.contains(r#""log""#), "伝言そのものは届いている");
@@ -2373,7 +2598,10 @@ mod lenient_message_tests {
             read(r#"{"dest": "reviewer-1", "body": "鍵の名前が違う"}"#),
             Err(MessageReject::BadJson(_))
         ));
-        assert!(matches!(read("ただの文章です"), Err(MessageReject::BadJson(_))));
+        assert!(matches!(
+            read("ただの文章です"),
+            Err(MessageReject::BadJson(_))
+        ));
         // 宛先が空 / 本文が空は、受け皿を通っても断る。
         assert!(matches!(
             read(r#"{"to": "", "text": "宛先が空"}"#),
@@ -2501,10 +2729,9 @@ mod lenient_message_tests {
     /// 「最後の引用符まで」を素直にやると、そこまで本文になる。
     #[test]
     fn 括弧の外の後書きを飲み込まない() {
-        let (_, text) = read(
-            "{\"to\": \"reviewer-1\", \"text\": \"本文 \"引用\" あり\"}\n書き終わり \"余談\"",
-        )
-        .expect("読めない");
+        let (_, text) =
+            read("{\"to\": \"reviewer-1\", \"text\": \"本文 \"引用\" あり\"}\n書き終わり \"余談\"")
+                .expect("読めない");
         assert_eq!(text, "本文 \"引用\" あり");
     }
 
@@ -2515,7 +2742,6 @@ mod lenient_message_tests {
         assert_eq!(text, r#""to": を説明する"#);
     }
 }
-
 
 #[cfg(test)]
 mod repair_tests {

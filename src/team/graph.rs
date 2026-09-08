@@ -844,7 +844,7 @@ pub fn find_cycle(tasks: &[TeamTask]) -> Option<Vec<TaskId>> {
 pub fn newly_ready(tasks: &[TeamTask]) -> Vec<TaskId> {
     let done: BTreeSet<TaskId> = tasks
         .iter()
-        .filter(|t| t.state == TeamTaskState::Completed)
+        .filter(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
         .map(|t| t.id)
         .collect();
     let mut out: Vec<TaskId> = tasks
@@ -869,7 +869,49 @@ pub fn newly_ready(tasks: &[TeamTask]) -> Vec<TaskId> {
 ///
 /// 段は根からの最長距離で決める (`critical_depth` は葉からの距離なので
 /// ここでは使えない — 幅を測るには根からの段が要る)。
+/// DAG は一度のトポロジカル走査で距離を計算する。入力順に依存しない。
+/// 不正な循環は既存の有界フォールバックへ渡す（診断の振る舞いを維持）。
+fn dag_distances(tasks: &[TeamTask]) -> Option<(Vec<u32>, Vec<u32>)> {
+    let index: BTreeMap<TaskId, usize> = tasks.iter().enumerate().map(|(i,t)| (t.id,i)).collect();
+    let mut incoming = vec![0usize; tasks.len()];
+    let mut children = vec![Vec::new(); tasks.len()];
+    for (i, task) in tasks.iter().enumerate() {
+        for dep in &task.dependencies {
+            if let Some(&d) = index.get(dep) {
+                incoming[i] += 1;
+                children[d].push(i);
+            }
+        }
+    }
+    let mut queue: std::collections::VecDeque<usize> = incoming.iter().enumerate()
+        .filter_map(|(i,n)| (*n == 0).then_some(i)).collect();
+    let mut order = Vec::with_capacity(tasks.len());
+    let mut level = vec![0u32; tasks.len()];
+    while let Some(i) = queue.pop_front() {
+        order.push(i);
+        for &c in &children[i] {
+            level[c] = level[c].max(level[i].saturating_add(1));
+            incoming[c] -= 1;
+            if incoming[c] == 0 { queue.push_back(c); }
+        }
+    }
+    if order.len() != tasks.len() { return None; }
+    let mut depth = vec![0u32; tasks.len()];
+    for &i in order.iter().rev() {
+        depth[i] = children[i].iter().map(|&c| depth[c].saturating_add(1)).max().unwrap_or(0);
+    }
+    Some((level, depth))
+}
+
 pub fn max_parallel_width(tasks: &[TeamTask]) -> usize {
+    if let Some((levels, _)) = dag_distances(tasks) {
+        let mut counts = vec![0usize; tasks.len()];
+        for (task, level) in tasks.iter().zip(levels) {
+            if !task.state.is_terminal() { counts[level as usize] += 1; }
+        }
+        return counts.into_iter().max().unwrap_or(0);
+    }
+
     let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
     let mut level: BTreeMap<TaskId, u32> = ids.iter().map(|i| (*i, 0u32)).collect();
     // 循環があっても止まるよう上限つきで回す (検証済みなら 1 周で足りる)。
@@ -908,6 +950,10 @@ pub fn max_parallel_width(tasks: &[TeamTask]) -> usize {
 }
 
 pub fn critical_depth(tasks: &[TeamTask]) -> BTreeMap<TaskId, u32> {
+    if let Some((_, depth)) = dag_distances(tasks) {
+        return tasks.iter().zip(depth).map(|(t,d)| (t.id,d)).collect();
+    }
+
     let mut children: BTreeMap<TaskId, Vec<TaskId>> = BTreeMap::new();
     let ids: BTreeSet<TaskId> = tasks.iter().map(|t| t.id).collect();
     for t in tasks {
@@ -980,6 +1026,7 @@ impl Phase {
 /// フェーズの進み具合。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhaseStatus {
+    Submitted,
     Waiting,
     Running,
     Done,
@@ -988,6 +1035,7 @@ pub enum PhaseStatus {
 impl PhaseStatus {
     pub fn key(self) -> &'static str {
         match self {
+            PhaseStatus::Submitted => "submitted",
             PhaseStatus::Waiting => "waiting",
             PhaseStatus::Running => "running",
             PhaseStatus::Done => "done",
@@ -1017,9 +1065,11 @@ pub fn phases(tasks: &[TeamTask], goal_completed: bool) -> Vec<(Phase, PhaseStat
     for p in Phase::ALL {
         if p == Phase::FinalValidation {
             let all_done =
-                !tasks.is_empty() && tasks.iter().all(|t| t.state == TeamTaskState::Completed);
+                !tasks.is_empty() && tasks.iter().all(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted));
             let st = if goal_completed {
                 PhaseStatus::Done
+            } else if all_done && tasks.iter().any(|t| t.state == TeamTaskState::Submitted) {
+                PhaseStatus::Submitted
             } else if all_done {
                 PhaseStatus::Running
             } else {
@@ -1033,8 +1083,8 @@ pub fn phases(tasks: &[TeamTask], goal_completed: bool) -> Vec<(Phase, PhaseStat
             // タスクが無いフェーズは「通過済み」として扱う。
             // 空のまま Waiting にすると、永久に待っているように見える。
             PhaseStatus::Done
-        } else if mine.iter().all(|t| t.state == TeamTaskState::Completed) {
-            PhaseStatus::Done
+        } else if mine.iter().all(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted)) {
+            if mine.iter().any(|t| t.state == TeamTaskState::Submitted) { PhaseStatus::Submitted } else { PhaseStatus::Done }
         } else if mine.iter().any(|t| t.state != TeamTaskState::Pending) {
             PhaseStatus::Running
         } else {
@@ -1076,7 +1126,8 @@ pub fn goal_done(tasks: &[TeamTask], definition_of_done: &[String], review_requi
         if t.review_of.is_some() {
             return true;
         }
-        t.validation.passed(&t.validation_commands) && (!review_required || t.review.approved())
+        // タスク完了時と同じ基準。指定の無いコマンドを待ち続けない。
+        t.validation.settled(&t.validation_commands) && (!review_required || t.review.approved())
     })
 }
 
@@ -1087,7 +1138,7 @@ pub fn progress(tasks: &[TeamTask]) -> f32 {
     }
     let done = tasks
         .iter()
-        .filter(|t| t.state == TeamTaskState::Completed)
+        .filter(|t| matches!(t.state, TeamTaskState::Completed | TeamTaskState::Submitted))
         .count();
     done as f32 / tasks.len() as f32
 }
@@ -1474,6 +1525,20 @@ mod tests {
     }
 
     #[test]
+    fn 検証コマンドの無いgoalも全タスク完了と必要な承認を要求する() {
+        let mut a = task(1, "document", &[]);
+        a.validation_commands.clear();
+        assert!(!goal_done(&[a.clone()], &["done".into()], false));
+        a.state = TeamTaskState::Completed;
+        assert!(goal_done(&[a.clone()], &["done".into()], false));
+        assert!(!goal_done(&[a.clone()], &["done".into()], true));
+        a.review.verdict = Some(super::super::model::ReviewVerdict::Approve);
+        assert!(goal_done(&[a.clone()], &["done".into()], true));
+        a.validation.running = true;
+        assert!(!goal_done(&[a], &["done".into()], true));
+    }
+
+    #[test]
     fn goalは検証未実行では完了しない() {
         let mut a = task(1, "a", &[]);
         a.state = TeamTaskState::Completed;
@@ -1542,5 +1607,30 @@ mod tests {
                 .any(|i| matches!(i, PlanIssue::NoValidationCommand(2))),
             "抜け穴を通してしまった: {issues:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dag_fast_tests {
+    use super::*;
+    use super::super::testkit::task;
+    #[test]
+    fn 逆順の深い依存でも幅と優先順位は変わらない() {
+        let mut tasks: Vec<_> = (1..=200).map(|i| { let deps = if i == 1 { vec![] } else { vec![i-1] }; task(i, &format!("t{i}"), &deps) }).collect();
+        let forward = critical_depth(&tasks);
+        tasks.reverse();
+        assert_eq!(critical_depth(&tasks), forward);
+        assert_eq!(forward[&1], 199);
+        assert_eq!(forward[&200], 0);
+        assert_eq!(max_parallel_width(&tasks), 1);
+    }
+    #[test]
+    fn 独立作業を並列化し完了済みの段は人数に含めない() {
+        let mut tasks = vec![task(1,"a",&[]),task(2,"b",&[]),task(3,"c",&[1,2])];
+        assert_eq!(max_parallel_width(&tasks), 2);
+        tasks[0].state = TeamTaskState::Completed;
+        tasks[1].state = TeamTaskState::Completed;
+        assert_eq!(max_parallel_width(&tasks), 1);
+        assert_eq!(critical_depth(&tasks)[&1], 1);
     }
 }

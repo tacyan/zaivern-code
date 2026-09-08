@@ -498,49 +498,59 @@ mod meta {
 
 #[test]
 fn cli起動とgui起動は同じruntimeを通る() {
-    // **別々の実装を作らない。** CLI は起動要求を投函するだけで、計画も実行も
-    // GUI 側の 1 本 (`TeamPanel::plan` → `TeamRuntime`) を通る。
-    let cli = src(TEAM_CLI);
-    assert!(
-        !cli.contains("TeamRuntime::from_plan"),
-        "CLI が独自に Runtime を建てている (GUI と二重実装になる)"
-    );
-    assert!(
-        cli.contains("launch::post_in(&root, &req)"),
-        "CLI が起動要求を投函していない"
-    );
-    // 計画の入口は Planner 1 本
-    assert!(
-        cli.contains("StaticPlanner") && cli.contains("plan_schema::TeamPlan"),
-        "CLI が Planner 境界を通っていない"
-    );
-
-    let glue = src(GLUE);
-    assert!(
-        glue.contains("p.plan_with(&req.spec_text"),
-        "GUI が投函された SPEC で計画していない"
-    );
-    // 投函経由 (CLI) も、フォーム経由 (GUI) も、同じ 1 本 (`plan_with`) へ落ちる。
-    assert!(
-        glue.matches("p.plan_with(").count() >= 2,
-        "CLI 経由と GUI 経由で入口が分かれている"
-    );
-
-    let panel = src(PANEL);
-    // `plan` は `plan_with` へ委譲するだけ。計画を建てる本体は 1 つ。
-    assert!(
-        panel.contains("self.plan_with(spec_text, source, opts, Vec::new(), \"\")"),
-        "plan が plan_with へ委譲していない (実装が 2 本になる)"
-    );
-    assert!(
-        panel.contains("TeamRuntime::from_plan"),
-        "Runtime を建てるのが TeamPanel::plan の 1 か所でない"
-    );
+    use super::{
+        planner::{PlanInput, StaticPlanner, TeamPlanner},
+        runtime::{RunOptions, TeamRuntime},
+    };
+    let dir = crate::test_util::unique_temp_dir("team-wiring", "shared-runtime");
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec_path = dir.join("request.md");
+    let text = "# Webページ\n- HTMLを作る\n- CSSを作る";
+    std::fs::write(&spec_path, text).unwrap();
+    let home = dir.join("state");
+    let posted = super::launch::build(&dir, &spec_path, 1, true).unwrap();
+    super::launch::post_in(&home, &posted).unwrap();
+    let received = super::launch::take_in(&home, &dir, posted.requested_at).unwrap();
+    assert!(super::launch::take_in(&home, &dir, posted.requested_at).is_none());
+    assert!(received.auto_start);
+    let make_runtime = |request: &str, agents| {
+        let mut opts = RunOptions {
+            agent_count: agents,
+            ..RunOptions::default()
+        };
+        let spec = super::planner::prepare_direct_request(request, &mut opts);
+        let plan = StaticPlanner
+            .plan(PlanInput {
+                spec,
+                source: "request.md".into(),
+                agent_count: opts.agent_count,
+                review_required: opts.review_required,
+                workspace_root: dir.clone(),
+                roles: vec![super::model::TeamRole::Implementer],
+            })
+            .unwrap();
+        TeamRuntime::from_plan(plan, dir.clone(), opts)
+    };
+    let cli = make_runtime(&received.spec_text, received.agent_count);
+    let gui = make_runtime(text, 1);
+    assert_eq!(cli.goal().specification, gui.goal().specification);
+    assert_eq!(cli.run().agent_count, 1);
+    assert_eq!(cli.run().agent_count, gui.run().agent_count);
+    assert!(!cli.run().review_required && !gui.run().review_required);
+    assert_eq!(cli.agents().len(), 1);
+    assert_eq!(cli.tasks().len(), gui.tasks().len());
+    for (from_cli, from_gui) in cli.tasks().iter().zip(gui.tasks()) {
+        assert_eq!(from_cli.key, from_gui.key);
+        assert_eq!(from_cli.role, from_gui.role);
+        assert_eq!(from_cli.dependencies, from_gui.dependencies);
+        assert!(super::task_workspace::scope(&from_cli.files).is_some());
+        assert!(super::task_workspace::scope(&from_gui.files).is_some());
+    }
     assert_eq!(
-        panel.matches("TeamRuntime::from_plan").count(),
-        1,
-        "Runtime を建てる場所が 2 つ以上ある"
+        cli.tasks().last().unwrap().dependencies,
+        vec![cli.tasks()[0].id]
     );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -667,7 +677,8 @@ fn 別のrunのeffectを実行させない構造がある() {
     let rt = src(RUNTIME);
     let rt_close = function_body(&rt, rt.find("pub fn close(&mut self)").expect("Runtime 側"));
     assert!(
-        rt_close.contains("TeamEffect::StopAgent") && rt_close.contains("cancel_running_validations"),
+        rt_close.contains("TeamEffect::StopAgent")
+            && rt_close.contains("cancel_running_validations"),
         "閉じるときに担当と検証の両方を止めていない:\n{rt_close}"
     );
     // 例外が漏れないこと: workspace の切り替えと終了は、取り出す前に列を空にする。
@@ -880,31 +891,19 @@ fn 起動要求にworkspaceを決めさせない() {
 }
 
 #[test]
-fn 起動要求はteam画面を選ぶ() {
-    let s = src(GLUE);
-    let body = function_body(
-        &s,
-        s.find("fn team_take_launch_request").expect("受け口がある"),
-    );
-    assert!(body.contains("p.open = true"), "Team 画面を開いていない");
-    assert!(
-        body.contains("p.tab = BoardTab::Organization"),
-        "Organization タブを選んでいない"
-    );
-    assert!(
-        body.contains("p.form.open = false") && body.contains("p.form.open = true"),
-        "通常SPECと短いSPECの表示先を分けていない"
-    );
-    assert!(
-        body.contains("planner::needs_spec_rewrite(&req.spec_text)")
-            && body.contains("self.team_draft_spec()"),
-        "CLI の短いSPECが仕様書作成を迂回している"
-    );
-    // `--yes` は **Start Team の確認だけ**を省く
-    assert!(
-        body.contains("if r.is_ok() && auto") && body.contains("TeamAction::Start"),
-        "--yes が Start Team を省く経路になっていない"
-    );
+fn 起動要求は自動開始指定と元フォルダを保持する() {
+    let dir = crate::test_util::unique_temp_dir("team-wiring", "launch-route");
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = dir.join("request.md");
+    std::fs::write(&spec, "HTMLを作成する").unwrap();
+    for auto in [false, true] {
+        let req = super::launch::build(&dir, &spec, 1, auto).unwrap();
+        assert_eq!(req.auto_start, auto);
+        assert_eq!(req.agent_count, 1);
+        assert_eq!(req.workspace_root, dir.canonicalize().unwrap());
+        assert_eq!(req.spec_text, "HTMLを作成する");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -1231,7 +1230,10 @@ fn 実行側は必ず成否を返す() {
         ),
         (
             "for (owner, key, session) in stops",
-            &["self.close_agent_tracked(i)", "p.watch_stop(owner, key, handle)"],
+            &[
+                "self.close_agent_tracked(i)",
+                "p.watch_stop(owner, key, handle)",
+            ],
         ),
         // 検証だけは裏スレッドへ渡すので、返すのは委譲先 (下で見る)。
         (
@@ -1401,69 +1403,79 @@ fn 計画ができたら始め方がその場に出る() {
 }
 
 #[test]
-fn おすすめの編成は計画と書き換えの両方に当たる() {
-    // **画面のおすすめと、実際に使う編成を食い違わせない。** 書き換えの段
-    // だけで当てると、最初から分かれている SPEC は既定の 6 役割・4 体の
-    // まま計画される。計画の段だけで当てると、書き換え依頼文が 4 体・
-    // 6 役割のまま飛んで 1 枚の HP が 8 本に割られる (実測)。
-    let glue = src(GLUE);
-    for f in ["fn team_draft_spec", "fn team_plan_from_form_inner"] {
-        let body = function_body(&glue, glue.find(f).expect(f));
-        assert!(
-            body.contains("team_apply_recommendation("),
-            "{f} がおすすめの編成を当てていない"
-        );
-    }
-    let apply = function_body(
-        &glue,
-        glue.find("fn team_apply_recommendation")
-            .expect("おすすめを当てる口"),
+fn おすすめの編成でも新規計画は直接実装になる() {
+    use super::{
+        composition,
+        planner::{PlanInput, StaticPlanner, TeamPlanner},
+        runtime::RunOptions,
+    };
+    let dir = crate::test_util::unique_temp_dir("team-wiring", "recommended-direct");
+    std::fs::create_dir_all(&dir).unwrap();
+    let request = "会社のホームページを作る";
+    let rec = composition::recommend(
+        request,
+        &composition::probe_workspace(&dir),
+        super::panel::FORM_MAX_AGENTS,
     );
-    // 人が手で変えた編成は上書きしない。
+    let mut opts = RunOptions {
+        agent_count: rec.agents,
+        review_required: rec.review_required,
+        ..RunOptions::default()
+    };
+    let spec = super::planner::prepare_direct_request(request, &mut opts);
+    let plan = StaticPlanner
+        .plan(PlanInput {
+            spec,
+            source: "request".into(),
+            agent_count: opts.agent_count,
+            review_required: opts.review_required,
+            workspace_root: dir.clone(),
+            roles: rec.roles,
+        })
+        .unwrap();
+    assert_eq!(opts.agent_count, rec.agents);
+    assert!(!opts.review_required);
     assert!(
-        apply.contains("if !form.composition_touched"),
-        "手で変えた編成を上書きしている"
+        plan.tasks
+            .iter()
+            .all(|t| t.role == super::model::TeamRole::Implementer
+                && t.validation_commands.is_empty())
     );
-    // 当てた結果は画面へ書き戻す (計画は 2 体なのにフォームは 4 体、を残さない)。
-    assert!(
-        apply.contains("p.form.agents = ") && apply.contains("p.form.roles = "),
-        "画面のフォームへ書き戻していない"
-    );
-    let board = src(BOARD);
-    assert!(
-        board.contains("form.composition_touched = true"),
-        "手で変えたことを記録していない (おすすめが毎回上書きする)"
-    );
-    assert!(
-        board.contains("recommendation_section(ui, theme, form)"),
-        "おすすめの段が画面から呼ばれていない"
-    );
+    assert!(!plan.tasks.last().unwrap().dependencies.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn 一枚の成果物は仕様書をこちらで書きwebの完了は読み込みを確かめる() {
-    // **10 分の予算を、仕様書を書いてもらう 5 分で使わない。** 1 枚の成果物は
-    // 雛形が出るので、エージェントを起こす前に返す。
-    let glue = src(GLUE);
-    let body = function_body(&glue, glue.find("fn team_draft_spec").expect("書き換え"));
-    let tpl = body.find("spec_template(").expect("雛形を使っていない");
-    let agent = body.find("team_headless_agent()").expect("エージェントの選定");
-    assert!(tpl < agent, "雛形より先にエージェントを起こしている (5 分待つ)");
-    assert!(
-        body.contains("DraftState::Ready"),
-        "雛形を人の確認へ回していない (黙って採用している)"
-    );
-    // **Web の成果物は、読み込むと言ったものが在ってこそ完了。**
-    let rt = src(include_str!("runtime.rs"));
-    assert!(
-        rt.contains("match self.web_gate(&task, &acc)"),
-        "完了報告の受理が読み込みの実在を見ていない"
-    );
-    let gate = function_body(&rt, rt.find("fn web_gate").expect("関門"));
-    assert!(
-        gate.contains("webcheck::scan("),
-        "関門が走査していない"
-    );
+fn 新規依頼は仕様変換せず選択エージェントへ渡せる計画になる() {
+    use super::{
+        planner::{PlanInput, StaticPlanner, TeamPlanner},
+        runtime::{RunOptions, TeamRuntime},
+    };
+    let mut opts = RunOptions {
+        agent_count: 2,
+        agent_presets: vec!["selected-agent".into()],
+        ..RunOptions::default()
+    };
+    let request = "日本語のLPとCSSを作る。申込URLは後で差し替え可能にする。";
+    let spec = super::planner::prepare_direct_request(request, &mut opts);
+    let plan = StaticPlanner
+        .plan(PlanInput {
+            spec,
+            source: "request".into(),
+            agent_count: opts.agent_count,
+            review_required: opts.review_required,
+            workspace_root: std::path::PathBuf::new(),
+            roles: vec![],
+        })
+        .unwrap();
+    let coordinator = TeamRuntime::from_plan(plan, std::path::PathBuf::new(), opts);
+    assert!(coordinator.goal().specification.ends_with(request));
+    assert!(coordinator
+        .tasks()
+        .iter()
+        .all(|t| t.role == super::model::TeamRole::Implementer));
+    assert_eq!(coordinator.agents().len(), 2);
+    assert_eq!(coordinator.run().agent_presets, vec!["selected-agent"]);
 }
 
 #[test]
@@ -1471,53 +1483,67 @@ fn 予算を越えた実装担当は促される() {
     // **動いている担当は停滞ではない**ので `nudge_stalled` は黙る。だから
     // 予算の促しは別に要る。tick が両方を、止めている間は撃たない場所で呼ぶ。
     let rt = src(include_str!("runtime.rs"));
-    let tick = rt.find("self.nudge_stalled(obs.now, &mut out);").expect("停滞の促し");
-    let budget = rt.find("self.nudge_over_budget(obs.now, &mut out);").expect("予算の促し");
-    assert!(budget > tick && budget - tick < 600, "予算の促しが停滞の促しの隣に無い");
+    let tick = rt
+        .find("self.nudge_stalled(obs.now, &mut out);")
+        .expect("停滞の促し");
+    let budget = rt
+        .find("self.nudge_over_budget(obs.now, &mut out);")
+        .expect("予算の促し");
+    assert!(
+        budget > tick && budget - tick < 600,
+        "予算の促しが停滞の促しの隣に無い"
+    );
     let body = function_body(&rt, rt.find("fn nudge_over_budget").expect("関数"));
-    assert!(body.contains("time_budget_secs(&self.goal.definition_of_done)"), "予算を完了条件から読んでいない");
-    assert!(body.contains("TeamRole::Implementer"), "実装担当以外まで急かしている");
+    assert!(
+        body.contains("time_budget_secs(&self.goal.definition_of_done)"),
+        "予算を完了条件から読んでいない"
+    );
+    assert!(
+        body.contains("TeamRole::Implementer"),
+        "実装担当以外まで急かしている"
+    );
     assert!(body.contains("budget_nudged"), "1 度だけ、になっていない");
-    assert!(body.contains("TeamEffect::SendManualInstruction"), "人の指示と同じ経路を使っていない");
+    assert!(
+        body.contains("TeamEffect::SendManualInstruction"),
+        "人の指示と同じ経路を使っていない"
+    );
 }
 
 #[test]
-fn cliから来たrunにもおすすめの編成が当たる() {
-    // **画面のフォームだけで当てない。** `zai team run` は既定の「レビュー
-    // 必須」のまま計画され、1 枚の HP に「#1 のレビュー」が 1 本増えて
-    // 直列に 1 段延びた (実測: 試行 3)。体の数は `--agents` を尊重し、
-    // 役割とレビューの有無だけを依頼の形から当てる。
-    let glue = src(GLUE);
-    let body = function_body(
-        &glue,
-        glue.find("fn team_take_launch_request").expect("投函の受け取り"),
-    );
-    assert!(body.contains("composition::recommend("), "投函の Run に編成を当てていない");
-    assert!(
-        body.contains("review_required: rec.review_required"),
-        "レビューの有無を当てていない (1 枚の HP にレビューが 1 段増える)"
-    );
-    assert!(
-        body.contains("agent_count: req.agent_count"),
-        "--agents で人が言った体の数を上書きしている"
-    );
-    assert!(body.contains("p.plan_with("), "役割を計画へ渡していない");
+fn cliとguiは一体指定と同じ上限で直接実装を計画する() {
+    use super::{
+        planner::{PlanInput, StaticPlanner, TeamPlanner},
+        runtime::{RunOptions, TeamRuntime},
+    };
+    assert_eq!(super::panel::FORM_MAX_AGENTS, super::launch::MAX_AGENTS);
+    for count in [1, 2, super::launch::MAX_AGENTS] {
+        let mut opts = RunOptions {
+            agent_count: count,
+            ..RunOptions::default()
+        };
+        let spec = super::planner::prepare_direct_request("HTMLを作る", &mut opts);
+        assert_eq!(opts.agent_count, count);
+        let plan = StaticPlanner
+            .plan(PlanInput {
+                spec,
+                source: "request".into(),
+                agent_count: opts.agent_count,
+                review_required: opts.review_required,
+                workspace_root: std::path::PathBuf::new(),
+                roles: vec![],
+            })
+            .unwrap();
+        let run = TeamRuntime::from_plan(plan, std::path::PathBuf::new(), opts);
+        assert!(!run.agents().is_empty());
+        assert!(run.agents().len() <= count);
+        assert!(!run.tasks().last().unwrap().dependencies.is_empty());
+    }
 }
-
-
-// ══════════════════════════════════════════════════════════════════════
-//  構造化報告は画面ではなく置き場が正規の経路 (P1-1)
-// ══════════════════════════════════════════════════════════════════════
 
 const OUTBOX: &str = include_str!("outbox.rs");
 const PROMPT: &str = include_str!("prompt.rs");
 const GITINIT: &str = include_str!("gitinit.rs");
 
-/// **4 種類とも置き場を通れること**を構造で固定する。
-///
-/// 完了報告だけを置き場へ移しても根本解決にならない (レビューを落とすと
-/// タスクが `Reviewing` のまま止まる)。種別を 1 つ足したのに配送側の
-/// `match` を足し忘れる、を赤にする。
 #[test]
 fn 四種類とも置き場から受理する経路がある() {
     let o = src(OUTBOX);
@@ -1533,13 +1559,19 @@ fn 四種類とも置き場から受理する経路がある() {
         &rt,
         rt.find("pub fn accept_outbox").expect("置き場からの受理口"),
     );
+    // メソッドチェーンの改行・インデントは呼び出しの有無に影響させない。
+    // 正規化はこの照合だけに限定し、他の構造検査には元の本体を使う。
+    let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     for f in [
         "self.take_result(",
         "self.take_review(",
         "self.take_message(",
         "self.take_event(",
     ] {
-        assert!(body.contains(f), "accept_outbox が {f} を通していない:\n{body}");
+        assert!(
+            compact.contains(f),
+            "accept_outbox が {f} を通していない:\n{body}"
+        );
     }
     // **二重取り込みは構造化キーで止める** (画面と置き場の両方に出ても 1 回)。
     assert!(
@@ -1571,7 +1603,9 @@ fn 置き場のファイルは受理してから消す() {
             .expect("一ファイルの取り込み"),
     );
     let accept = body.find("accept_outbox").expect("受理を通していない");
-    let remove = body.find("remove_report").expect("専用の削除口を通していない");
+    let remove = body
+        .find("remove_report")
+        .expect("専用の削除口を通していない");
     assert!(
         accept < remove,
         "受理より先に消している (落ちた報告が戻らない):\n{body}"
@@ -1619,7 +1653,11 @@ fn 指示文は四種類とも置き場へ出すよう教える() {
         assert!(sec.contains(needle), "提出の作法に {needle} が無い:\n{sec}");
     }
     // 種別ごとの案内も繋がっていること。
-    for f in ["fn review_submit", "fn subagents_section", "fn teammates_section"] {
+    for f in [
+        "fn review_submit",
+        "fn subagents_section",
+        "fn teammates_section",
+    ] {
         let body = function_body(&p, p.find(f).unwrap_or_else(|| panic!("{f} が無い")));
         assert!(
             body.contains("提出のしかた"),
@@ -1641,10 +1679,7 @@ fn git判定はheadの有無まで見る() {
         !init.contains("discover_toplevel"),
         "`.git` の有無で準備完了を決めている (HEAD 無しを見逃す):\n{init}"
     );
-    let refresh = function_body(
-        &p,
-        p.find("fn refresh_git_readiness").expect("旗の決め所"),
-    );
+    let refresh = function_body(&p, p.find("fn refresh_git_readiness").expect("旗の決め所"));
     assert!(
         refresh.contains("gitinit::plan_for") && refresh.contains("gitinit::probe"),
         "旗を状態から決めていない:\n{refresh}"
@@ -1663,7 +1698,13 @@ fn git判定はheadの有無まで見る() {
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
-    for bad in ["--hard", "checkout", "\"clean\"", "remove_dir_all", "remove_file(ws"] {
+    for bad in [
+        "--hard",
+        "checkout",
+        "\"clean\"",
+        "remove_dir_all",
+        "remove_file(ws",
+    ] {
         assert!(
             !code.contains(bad),
             "gitinit が破壊的な操作 ({bad}) を使っている"

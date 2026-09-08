@@ -174,6 +174,57 @@ pub fn prepare_run_dir(state_dir: &Path, run_id: &str) -> Result<PathBuf, String
     Ok(dir)
 }
 
+/// 全役割が担当範囲内で作業を継続するための方針。全文資料へ保存する。
+const EXECUTION_POLICY: &str = "担当の役割・編集範囲を守り、担当成果物の作成と検証まで進める。調査や計画が担当なら、その文書自体を完成させる。不足情報は既存資料を調べ、変更可能な選択は仮定・根拠・変更方法を記録して進める。質問だけで停止せず、未確定事項に依存しない作業を完了する。権限・秘密情報・不可逆な判断が必要な部分は保留し、必要な確認と残作業を報告する。完了や検証結果は捏造しない。検証は実行したコマンドを1件ずつ記録し、複数コマンドをセミコロンやパイプで連結しない。";
+
+/// 長い品質方針は全文資料に一度だけ保存し、端末の8KB指示枠を消費しない。
+const QUALITY_POLICY: &str = "依頼の種類に合う実物を検証する。コード/CLI/APIは実装を呼び、文書・スキルは未知の具体的入力で手順を実行し、画像・動画・表は実ファイルを開いて確認する。テスト内に別実装したsimulateやmockの成功を本体の動作確認と扱わない。意味のある検証には実入力、呼び出した本体、観測した出力、期待値との比較が必要。テスト名・コメント・見出しの引用だけでは再現性の証拠にならない。テスト担当は合格例に加え、一時コピーの期待される値や出力を一つ意図的に壊し、実物を検証するテストが失敗することを確認する（本番や元ファイルを壊さない）。壊しても通るテストは修正する。レビュー担当は作者の要約に依存せず、実物と原要件を照合し、別入力で追試する。実績は出典・条件が必要、未確認なら明示し、入力された値・件数・参照先を全成果物で揃える。付属品は企画案と納品済みを区別する。開発者向けの運用指示を成果物の要件・実績へ混入させない。scenariosは必ず実施し、指定evidenceに入力・実行手順・観測した出力・比較結果・不良例での失敗結果を残す。測定していない値を実測値と書かない。テスト担当は証跡ファイルを実物と別に保存し、レビュー担当は証跡と実物を直接比較する。ZAI-ACCEPTANCEは計画時の読み取り専用契約でアプリも直接照合するが、構造・文字列一致だけで品質を保証するものではない。専門ツールや外部サービスが未確認ならその範囲を明示する。数値は元データから再計算する。WCAGでは実際の前景と背景を照合し、色名だけで合格にしない。フォーム例は正常・空入力・不正入力で実行し、novalidateがあれば代替検証とエラー通知が動くことを確認する。根拠のない監修・No.1・返金保証・成果率・売上・推薦は追加しない。架空例は納品コードや画像の表示面にも架空と明示する。スキル内の固定例と同じ入力だけでなく別入力を実際に使い、実行履歴と出力を保存する。差し戻しは不備・再現入力・期待値・修正対象を一度にまとめ、合格済みで影響のない部分を作り直さない。独立した成果物は並列に進め、同じファイルの所有者を一人にする。";
+
+/// 報告の走査対象 (.json) と区別した、実行指示の全文資料。
+pub fn context_path(dir: &Path) -> PathBuf {
+    dir.join("execution-context.md")
+}
+
+/// アプリが指示を送る前に保存する。部分書込みや symlink を経由しない。
+pub fn save_context(
+    dir: &Path,
+    goal: &super::model::TeamGoal,
+    tasks: &[super::model::TeamTask],
+) -> Result<(), String> {
+    use std::io::Write;
+    if dir.as_os_str().is_empty() {
+        return Err("全文資料の保存先がありません".into());
+    }
+    super::persistence::ensure_plain_dir_created(dir).map_err(|e| e.detail())?;
+    let context = if super::planner::implementation_only(&goal.specification) {
+        serde_json::json!({"execution_policy": "開いたフォルダで担当成果物を直ちに実装・保存する。仕様の再作成や承認待ちを工程に追加しない。原依頼全文を最優先にし、担当ファイル・接続契約・完了条件を守る。必要なテスト・動作確認と修正は担当作業内で実施する。実装に必要な不足は合理的に補う。保存できない場合は失敗理由を正直に報告する。", "goal": goal, "tasks": tasks})
+    } else {
+        serde_json::json!({"execution_policy": EXECUTION_POLICY, "quality_policy": QUALITY_POLICY, "evidence_policy": super::acceptance::EVIDENCE_POLICY, "goal": goal, "tasks": tasks})
+    };
+    let body = serde_json::to_vec_pretty(&context).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = dir.join(format!(".context-{}-{stamp}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
+    let result = file.write_all(&body).map_err(|e| e.to_string());
+    drop(file);
+    let result =
+        result.and_then(|()| super::persistence::rename_retrying(&tmp, &context_path(dir)));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// ファイル名 (拡張子なし) が担当 `id` のものか。**境界を見る。**
 ///
 /// `id` そのもの、または `id` の直後に `-` が来るものだけ。
@@ -419,9 +470,7 @@ impl<'de> Deserialize<'de> for StrictEnvelope {
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "kind" if kind.is_none() => kind = Some(map.next_value::<String>()?),
-                        "run_id" if run_id.is_none() => {
-                            run_id = Some(map.next_value::<String>()?)
-                        }
+                        "run_id" if run_id.is_none() => run_id = Some(map.next_value::<String>()?),
                         "agent_id" if agent_id.is_none() => {
                             agent_id = Some(map.next_value::<String>()?)
                         }
@@ -532,9 +581,7 @@ pub fn judge(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
             if claimed_run.is_empty() || claimed_run != run_id {
                 return Verdict::Reject {
                     agent: None,
-                    why: format!(
-                        "別の Run 宛てです (本文 {claimed_run:?} / この置き場 {run_id})"
-                    ),
+                    why: format!("別の Run 宛てです (本文 {claimed_run:?} / この置き場 {run_id})"),
                 };
             }
             let sender = (!envelope.agent_id.trim().is_empty())
@@ -629,6 +676,44 @@ pub fn list_reports(dir: &Path) -> Vec<PathBuf> {
     list_reports_skipping(dir, &HashSet::new())
 }
 
+/// Runの一段上へ誤提出された包みだけを宛先別に拾う。裸のJSONから宛先は推測しない。
+/// 親ごとに一度だけ呼び、通常の受理・永続化・重複排除へ流す。
+pub fn misplaced_reports(parent: &Path, skip: &HashSet<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
+    let mut grouped: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    if parent.file_name().is_none_or(|n| n != DIR_NAME) {
+        return grouped;
+    }
+    for file in list_reports_skipping(parent, skip) {
+        let ReadOutcome::Body(body) = read_report(&file) else {
+            continue;
+        };
+        let Ok(envelope) = serde_json::from_str::<StrictEnvelope>(&body) else {
+            continue;
+        };
+        if valid_run_id(&envelope.run_id) {
+            grouped.entry(envelope.run_id).or_default().push(file);
+        }
+    }
+    grouped
+}
+
+/// 誤提出の任意ファイル名は厳密な包みの送り主で補う。別担当名との矛盾は許さない。
+pub fn judge_misplaced(stem: &str, body: &str, ids: &[AgentId], run_id: &str) -> Verdict {
+    if candidates(stem, ids).is_empty() {
+        if let Ok(envelope) = serde_json::from_str::<StrictEnvelope>(body) {
+            if envelope.run_id == run_id && ids.iter().any(|id| id.as_str() == envelope.agent_id) {
+                return judge(
+                    &format!("{}-recovered", envelope.agent_id),
+                    body,
+                    ids,
+                    run_id,
+                );
+            }
+        }
+    }
+    judge(stem, body, ids, run_id)
+}
+
 /// この起動で再処理しない報告を、件数上限を適用する前に除いて並べる。
 pub fn list_reports_skipping(dir: &Path, skip: &HashSet<PathBuf>) -> Vec<PathBuf> {
     // Run の置き場自体が symlink / junction へ差し替えられても、リンク先の
@@ -657,9 +742,7 @@ pub fn list_reports_skipping(dir: &Path, skip: &HashSet<PathBuf>) -> Vec<PathBuf
                 let Ok(kind) = slot.file_type() else { continue };
                 if kind.is_file() {
                     let path = slot.path();
-                    if path.extension().is_some_and(|x| x == FINAL_EXT)
-                        && !skip.contains(&path)
-                    {
+                    if path.extension().is_some_and(|x| x == FINAL_EXT) && !skip.contains(&path) {
                         files.push(path);
                     }
                 } else if kind.is_dir() {
@@ -672,12 +755,7 @@ pub fn list_reports_skipping(dir: &Path, skip: &HashSet<PathBuf>) -> Vec<PathBuf
             if processing_budget == 0 {
                 break;
             }
-            regular_reports_in(
-                &slot,
-                skip,
-                &mut processing_budget,
-                &mut files,
-            );
+            regular_reports_in(&slot, skip, &mut processing_budget, &mut files);
         }
     }
     files.sort();
@@ -1003,8 +1081,69 @@ impl Ledger {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 全文資料は長い仕様の末尾と担当タスクを保存する() {
+        let dir = crate::test_util::unique_temp_dir("zaivern-outbox", "full-context");
+        let spec = format!("{}末尾の重要要件", "詳細な仕様\n".repeat(3000));
+        let g = super::super::model::TeamGoal::new(
+            super::super::model::GoalId::new("g1"),
+            "制作",
+            &spec,
+            vec!["検証".into()],
+        );
+        let t = super::super::testkit::task(1, "制作", &[]);
+        save_context(&dir, &g, &[t]).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(context_path(&dir)).unwrap()).unwrap();
+        assert_eq!(v["goal"]["specification"], spec);
+        assert!(v["execution_policy"]
+            .as_str()
+            .unwrap()
+            .contains("未確定事項に依存しない作業"));
+        assert_eq!(v["tasks"][0]["id"], 1);
+        assert!(list_reports(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 全文資料は保存先のシンボリックリンクを辿らない() {
+        let root = crate::test_util::unique_temp_dir("zaivern-outbox", "context-symlink");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(save_context(&link, &super::super::testkit::goal(), &[]).is_err());
+        assert!(!context_path(&outside).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn ids(list: &[&str]) -> Vec<AgentId> {
         list.iter().map(|s| AgentId::new(*s)).collect()
+    }
+
+    #[test]
+    fn 誤提出の回収でも別runと担当矛盾と重複キーを拒否する() {
+        let agents = ids(&["team-lead", "agent-1"]);
+        let body = r#"{"kind":"result","run_id":"run-a","agent_id":"team-lead","payload":{"task_id":5,"agent_id":"team-lead","status":"completed"}}"#;
+        assert!(matches!(
+            judge_misplaced("run-123", body, &agents, "run-a"),
+            Verdict::Deliver { .. }
+        ));
+        assert!(matches!(
+            judge_misplaced("run-123", body, &agents, "run-b"),
+            Verdict::Reject { .. }
+        ));
+        assert!(matches!(
+            judge_misplaced("agent-1-123", body, &agents, "run-a"),
+            Verdict::Reject { .. }
+        ));
+        let duplicate = body.replacen("\"run_id\":", "\"run_id\":\"run-b\",\"run_id\":", 1);
+        assert!(matches!(
+            judge_misplaced("run-123", &duplicate, &agents, "run-a"),
+            Verdict::Reject { .. }
+        ));
     }
 
     /// この置き場の Run。
@@ -1058,7 +1197,11 @@ mod tests {
         // 走査順に依らない: 逆順で渡しても同じ 1 つに決まる
         let rev: Vec<AgentId> = all.iter().rev().cloned().collect();
         for stem in ["agent-1-r", "agent-10-r", "agent-100-r"] {
-            assert_eq!(candidates(stem, &all), candidates(stem, &rev), "stem={stem}");
+            assert_eq!(
+                candidates(stem, &all),
+                candidates(stem, &rev),
+                "stem={stem}"
+            );
         }
     }
 
@@ -1103,8 +1246,14 @@ mod tests {
     fn エンベロープは四種類とも種別と送り主で配送先が決まる() {
         let all = ids(&["impl-1", "reviewer-1"]);
         let table: &[(Kind, &str)] = &[
-            (Kind::Result, r#"{"task_id":1,"agent_id":"impl-1","status":"completed"}"#),
-            (Kind::Review, r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#),
+            (
+                Kind::Result,
+                r#"{"task_id":1,"agent_id":"impl-1","status":"completed"}"#,
+            ),
+            (
+                Kind::Review,
+                r#"{"task_id":1,"verdict":"APPROVE","findings":[]}"#,
+            ),
             (Kind::Message, r#"{"to":"impl-1","text":"できました"}"#),
             (
                 Kind::Event,
@@ -1114,7 +1263,11 @@ mod tests {
         for (kind, payload) in table {
             let env = envelope(kind.key(), RUN, "impl-1", payload);
             match judge("impl-1-9", &env, &all, RUN) {
-                Verdict::Deliver { agent, kind: k, body } => {
+                Verdict::Deliver {
+                    agent,
+                    kind: k,
+                    body,
+                } => {
                     assert_eq!(agent, AgentId::new("impl-1"), "{kind:?}");
                     assert_eq!(k, *kind, "{kind:?} の種別を取り違えた");
                     // 中身は囲みへ入れる JSON そのもの (包みは剥がす)。
@@ -1140,11 +1293,21 @@ mod tests {
         ));
         // payload はあるが kind が無い → 隔離
         assert!(matches!(
-            judge("impl-1-9", r#"{"agent_id":"impl-1","payload":{}}"#, &all, RUN),
+            judge(
+                "impl-1-9",
+                r#"{"agent_id":"impl-1","payload":{}}"#,
+                &all,
+                RUN
+            ),
             Verdict::Reject { .. }
         ));
         // 送り主が違う → 配送しない
-        let env = envelope("review", RUN, "reviewer-1", r#"{"task_id":1,"verdict":"APPROVE"}"#);
+        let env = envelope(
+            "review",
+            RUN,
+            "reviewer-1",
+            r#"{"task_id":1,"verdict":"APPROVE"}"#,
+        );
         assert!(matches!(
             judge("impl-1-9", &env, &all, RUN),
             Verdict::Reject { .. }
@@ -1162,9 +1325,7 @@ mod tests {
             other => panic!("別 Run 宛てを配送した: {other:?}"),
         }
         // エンベロープではrun_idが必須。素のJSONだけが旧形式互換。
-        let env = format!(
-            r#"{{"kind":"review","agent_id":"impl-1","payload":{payload}}}"#
-        );
+        let env = format!(r#"{{"kind":"review","agent_id":"impl-1","payload":{payload}}}"#);
         assert!(matches!(
             judge("impl-1-9", &env, &all, RUN),
             Verdict::Reject { .. }
@@ -1258,7 +1419,12 @@ mod tests {
         );
         // 種別の見分けは表の語だけ。知らない kind の素 JSON は隔離。
         assert!(matches!(
-            judge("impl-1-5", r#"{"kind":"hack_the_planet","parent_id":"impl-1"}"#, &all, RUN),
+            judge(
+                "impl-1-5",
+                r#"{"kind":"hack_the_planet","parent_id":"impl-1"}"#,
+                &all,
+                RUN
+            ),
             Verdict::Reject { .. }
         ));
     }
@@ -1356,7 +1522,11 @@ mod tests {
         let longest = "x".repeat(RUN_ID_MAX_LEN);
         for good in ["run-1756000000-123-0", "abc", "a.b-c_d", longest.as_str()] {
             let dir = run_dir(&root, good).unwrap_or_else(|| panic!("{good:?} を断った"));
-            assert_eq!(dir.parent(), Some(base.as_path()), "{good:?} の親が置き場でない");
+            assert_eq!(
+                dir.parent(),
+                Some(base.as_path()),
+                "{good:?} の親が置き場でない"
+            );
             assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some(good));
         }
         // `new_run_id` が作るものは必ず通る
@@ -1372,14 +1542,21 @@ mod tests {
         std::fs::write(dir.join("agent-1.json"), "{}").unwrap();
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
         std::fs::create_dir_all(dir.join(REJECTED_DIR)).unwrap();
-        std::fs::write(dir.join(REJECTED_DIR).join(final_name("agent-1", "3")), "{}").unwrap();
+        std::fs::write(
+            dir.join(REJECTED_DIR).join(final_name("agent-1", "3")),
+            "{}",
+        )
+        .unwrap();
         // 拡張子だけ `.json` のディレクトリも報告ではない
         std::fs::create_dir_all(dir.join("dir.json")).unwrap();
         let names: Vec<String> = list_reports(&dir)
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["agent-1-2.json".to_string(), "agent-1.json".to_string()]);
+        assert_eq!(
+            names,
+            vec!["agent-1-2.json".to_string(), "agent-1.json".to_string()]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1410,10 +1587,8 @@ mod tests {
 
     #[test]
     fn processing配下も列挙上限より前にskipを除く() {
-        let dir = crate::test_util::unique_temp_dir(
-            "zaivern-outbox",
-            "skip-before-limit-processing",
-        );
+        let dir =
+            crate::test_util::unique_temp_dir("zaivern-outbox", "skip-before-limit-processing");
         let slot = dir.join(PROCESSING_DIR).join("slot");
         std::fs::create_dir_all(&slot).unwrap();
         skip上限回帰(&dir, &slot);
@@ -1459,7 +1634,10 @@ mod tests {
         };
         assert_eq!(dest.parent(), Some(dir.join(REJECTED_DIR).as_path()));
         assert!(dest.exists() && !f.exists());
-        assert!(list_reports(&dir).is_empty(), "隔離したものがまだ一覧に出る");
+        assert!(
+            list_reports(&dir).is_empty(),
+            "隔離したものがまだ一覧に出る"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1498,7 +1676,11 @@ mod tests {
             Some("tmp"),
             "一時ファイルの拡張子が json になっている (読まれてしまう)"
         );
-        assert_eq!(&tmp[..tmp.len() - 4], &fin, "`.tmp` を外すと正式な名前になる");
+        assert_eq!(
+            &tmp[..tmp.len() - 4],
+            &fin,
+            "`.tmp` を外すと正式な名前になる"
+        );
     }
 
     #[test]
@@ -1516,8 +1698,14 @@ mod tests {
         match read_report(&over) {
             ReadOutcome::Reject(why) => {
                 assert!(why.contains("agent-1-over.json"), "ファイル名が無い: {why}");
-                assert!(why.contains(&(rp::BLOCK_MAX_BYTES + 1).to_string()), "実サイズが無い: {why}");
-                assert!(why.contains(&rp::BLOCK_MAX_BYTES.to_string()), "上限が無い: {why}");
+                assert!(
+                    why.contains(&(rp::BLOCK_MAX_BYTES + 1).to_string()),
+                    "実サイズが無い: {why}"
+                );
+                assert!(
+                    why.contains(&rp::BLOCK_MAX_BYTES.to_string()),
+                    "上限が無い: {why}"
+                );
             }
             other => panic!("上限超過の本文を渡した: {other:?}"),
         }
@@ -1562,7 +1750,10 @@ mod tests {
         let linked = dir.join("run-id");
         std::os::unix::fs::symlink(&outside, &linked).unwrap();
 
-        assert!(list_reports(&linked).is_empty(), "symlink先の報告を列挙した");
+        assert!(
+            list_reports(&linked).is_empty(),
+            "symlink先の報告を列挙した"
+        );
         assert_eq!(std::fs::read_to_string(&report).unwrap(), "外の証拠");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&outside).ok();
@@ -1710,7 +1901,10 @@ mod tests {
             other => panic!("隔離できなかった: {other:?}"),
         };
         assert_ne!(moved, occupied, "dangling symlink を上書きした");
-        assert!(std::fs::symlink_metadata(&occupied).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&occupied)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(std::fs::read_to_string(&moved).unwrap(), "後の証拠");
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -52,10 +52,14 @@ pub fn now_secs() -> u64 {
 /// 文字列を上限で切る。**切ったことが分かるように印を付ける**
 /// (黙って消すと「報告したのに読まれていない」と区別が付かない)。
 pub fn clamp_text(s: &str) -> String {
-    if s.len() <= TEXT_MAX {
+    clamp_text_at(s, TEXT_MAX)
+}
+
+fn clamp_text_at(s: &str, max: usize) -> String {
+    if s.len() <= max {
         return s.to_string();
     }
-    let mut cut = TEXT_MAX;
+    let mut cut = max;
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -141,6 +145,8 @@ pub enum GoalStatus {
     Integrating,
     /// Definition of Done を全部満たした。
     Completed,
+    /// 未解決事項を明示して現状の成果物を提出した。
+    Submitted,
     /// 失敗で終わった。
     Failed,
     /// 人の判断が要る。
@@ -159,6 +165,7 @@ impl GoalStatus {
             GoalStatus::Reviewing => "reviewing",
             GoalStatus::Integrating => "integrating",
             GoalStatus::Completed => "completed",
+            GoalStatus::Submitted => "submitted",
             GoalStatus::Failed => "failed",
             GoalStatus::NeedsUser => "needs_user",
         }
@@ -166,7 +173,7 @@ impl GoalStatus {
 
     /// もう動かさない状態か。
     pub fn is_terminal(self) -> bool {
-        matches!(self, GoalStatus::Completed | GoalStatus::Failed)
+        matches!(self, GoalStatus::Completed | GoalStatus::Submitted | GoalStatus::Failed)
     }
 }
 
@@ -179,7 +186,7 @@ impl GoalStatus {
 pub struct TeamGoal {
     pub id: GoalId,
     pub title: String,
-    /// SPEC の本文 (切り詰め済み)。
+    /// SPEC の全文。入力の上限は planner / launch が検証する。
     pub specification: String,
     /// 完了条件。**空を許さない** ([`super::graph::validate_plan`] が弾く)。
     pub definition_of_done: Vec<String>,
@@ -194,7 +201,7 @@ impl TeamGoal {
         Self {
             id,
             title: clamp_text(&title.into()),
-            specification: clamp_text(spec),
+            specification: clamp_text_at(spec, super::planner::SPEC_MAX_BYTES),
             definition_of_done: clamp_list(dod),
             status: GoalStatus::Planning,
             created_at: now,
@@ -739,6 +746,9 @@ pub enum ReviewVerdict {
 /// タスクのレビュー状態。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewState {
+    /// 内容レビューの実ファイル根拠。旧保存データでは空。
+    #[serde(default)]
+    pub quality_checks: Vec<super::reviewer::QualityCheck>,
     /// レビュー中か。
     pub running: bool,
     /// 担当したレビュアー (実装担当と**別セッション**であること)。
@@ -781,6 +791,8 @@ pub enum TeamTaskState {
     Failed,
     /// 完了 (**レビュー承認済み**)。
     Completed,
+    /// 検証上の未解決事項を残して提出した（合格ではない）。
+    Submitted,
     /// 人の判断待ち。
     NeedsUser,
 }
@@ -798,13 +810,14 @@ impl TeamTaskState {
             TeamTaskState::RevisionRequired => "revision_required",
             TeamTaskState::Failed => "failed",
             TeamTaskState::Completed => "completed",
+            TeamTaskState::Submitted => "submitted",
             TeamTaskState::NeedsUser => "needs_user",
         }
     }
 
     /// これ以上動かさない状態か。
     pub fn is_terminal(self) -> bool {
-        matches!(self, TeamTaskState::Completed | TeamTaskState::NeedsUser)
+        matches!(self, TeamTaskState::Completed | TeamTaskState::Submitted | TeamTaskState::NeedsUser)
     }
 
     /// **その担当が今まさに手を動かしている**状態か。
@@ -833,7 +846,7 @@ impl TeamTaskState {
     }
 
     /// 一覧 (状態遷移テストの網羅で使う)。
-    pub const ALL: [TeamTaskState; 11] = [
+    pub const ALL: [TeamTaskState; 12] = [
         TeamTaskState::Pending,
         TeamTaskState::Ready,
         TeamTaskState::Assigned,
@@ -845,6 +858,7 @@ impl TeamTaskState {
         TeamTaskState::Failed,
         TeamTaskState::Completed,
         TeamTaskState::NeedsUser,
+        TeamTaskState::Submitted,
     ];
 }
 
