@@ -235,6 +235,39 @@ fn persisted_writer_alive(holder: &Holder) -> bool {
     }
 }
 
+/// Background-only recovery query. A released ledger is valid evidence, but a
+/// missing/empty/malformed ledger is not. Never use read_store's creation defaults
+/// to decide whether a previously dispatched writer finished.
+pub(super) fn restored_writer_stopped(source: &Path, files: &[String], assembly: bool) -> bool {
+    let relative = if assembly {
+        format!("{}/integration.json", task_workspace::ROOT)
+    } else if let Some(scope) = task_workspace::scope(files) {
+        format!("{scope}.lease.json")
+    } else {
+        return false;
+    };
+    let Ok(store) = task_workspace::checked_root(source, &relative) else {
+        return false;
+    };
+    #[derive(serde::Deserialize)]
+    struct Evidence {
+        leases: Vec<lease::Lease>,
+    }
+    lease::with_store(&store, |_| {
+        let Ok(raw) = std::fs::read(&store) else {
+            return false;
+        };
+        let Ok(evidence) = serde_json::from_slice::<Evidence>(&raw) else {
+            return false;
+        };
+        evidence
+            .leases
+            .iter()
+            .all(|entry| entry.holder.agent == RETIRED && !persisted_writer_alive(&entry.holder))
+    })
+    .unwrap_or(false)
+}
+
 fn try_acquire_at(
     source: &Path,
     run_id: &str,

@@ -164,6 +164,20 @@ fn empty(handle: HANDLE) -> Option<bool> {
     (ok != 0).then_some(info.ActiveProcesses == 0)
 }
 pub fn persisted_alive(name: &str) -> bool {
+    // A malformed saved name must not turn ERROR_FILE_NOT_FOUND into proof
+    // that the original writer's Job ended.
+    let valid = name
+        .strip_prefix("Local\\ZaivernWriter-")
+        .and_then(|identity| identity.split_once('-'))
+        .is_some_and(|(pid, stamp)| {
+            pid.bytes().all(|b| b.is_ascii_digit())
+                && pid.parse::<u32>().is_ok_and(|pid| pid != 0)
+                && stamp.bytes().all(|b| b.is_ascii_digit())
+                && stamp.parse::<u128>().is_ok()
+        });
+    if !valid {
+        return true;
+    }
     let handle = unsafe {
         OpenJobObjectW(
             JOB_OBJECT_QUERY | JOB_OBJECT_SET_ATTRIBUTES,
@@ -176,6 +190,22 @@ pub fn persisted_alive(name: &str) -> bool {
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
     quiescent(handle.as_raw_handle()) != Some(true)
+}
+
+#[test]
+fn malformed_persisted_job_identity_does_not_prove_writer_exit() {
+    for name in [
+        "",
+        "broken",
+        "Local\\ZaivernWriter-",
+        "Local\\ZaivernWriter-0-123",
+        "Local\\ZaivernWriter-4294967296-123",
+        "Local\\ZaivernWriter-1-",
+        "Local\\ZaivernWriter-1-broken",
+        "Local\\ZaivernWriter-1-123\0suffix",
+    ] {
+        assert!(persisted_alive(name), "invalid identity: {name:?}");
+    }
 }
 
 fn join(name: &str) -> Result<(), String> {

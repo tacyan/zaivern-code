@@ -322,6 +322,11 @@ pub struct TeamRuntime {
     #[cfg(test)]
     publication_hook: Option<Box<dyn FnOnce() + Send>>,
     worker_holds: BTreeMap<TaskId, IntegrationHold>,
+    // Rebuilt from dispatch history on every restore; an empty in-memory hold
+    // is not evidence that the previous writer stopped.
+    restored_writers: BTreeSet<TaskId>,
+    writer_probe: Option<std::sync::mpsc::Receiver<Vec<TaskId>>>,
+    writer_probe_at: Instant,
     published: BTreeSet<TaskId>,
     /// 登録済みセッション。
     registered: BTreeSet<SessionId>,
@@ -899,6 +904,10 @@ fn report_already_passed(state: TeamTaskState, status: ReportedStatus) -> bool {
 #[path = "publication.rs"]
 mod publication;
 
+#[cfg(test)]
+#[path = "restore_writer_tests.rs"]
+mod restore_writer_tests;
+
 // 統合候補を作るセッションが止まるまで、配送前に得た排他を保持する。
 struct IntegrationHold {
     permit: super::integration::Permit,
@@ -977,6 +986,9 @@ impl TeamRuntime {
             #[cfg(test)]
             publication_hook: None,
             worker_holds: BTreeMap::new(),
+            restored_writers: BTreeSet::new(),
+            writer_probe: None,
+            writer_probe_at: Instant::now(),
             published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: true,
@@ -1047,6 +1059,11 @@ impl TeamRuntime {
             .saturating_add(1);
         let seen_records = saved.run.seen_blocks.clone();
         let mut tasks = saved.tasks;
+        let restored_writers: BTreeSet<_> = tasks
+            .iter()
+            .filter(|t| t.dispatch_seq > 0 && super::task_workspace::scope(&t.files).is_some())
+            .map(|t| t.id)
+            .collect();
         let orphaned_reviews: BTreeSet<_> = tasks
             .iter()
             .filter(|t| {
@@ -1182,6 +1199,9 @@ impl TeamRuntime {
             #[cfg(test)]
             publication_hook: None,
             worker_holds: BTreeMap::new(),
+            restored_writers,
+            writer_probe: None,
+            writer_probe_at: Instant::now(),
             published: BTreeSet::new(),
             registered: BTreeSet::new(),
             dirty: false,
@@ -1198,6 +1218,14 @@ impl TeamRuntime {
         };
         while rt.events.len() > EVENT_CAP {
             rt.events.pop_front();
+        }
+        if !rt.restored_writers.is_empty()
+            && matches!(
+                rt.goal.status,
+                GoalStatus::Completed | GoalStatus::Submitted
+            )
+        {
+            rt.goal.status = GoalStatus::Running;
         }
         // 旧直接統合には隔離開始時の基準が無い。現在の元フォルダを
         // 新しい基準にすると、旧コピーによる上書きを正当化してしまう。
@@ -2564,6 +2592,7 @@ impl TeamRuntime {
     /// 1 tick。**同じ入力で同じ Effect を返す** (時刻以外)。
     pub fn tick(&mut self, obs: &Observation) -> Vec<TeamEffect> {
         let mut out = Vec::new();
+        self.poll_restored_writers();
         // 旧版で報告の修正上限により停止したRunも、同じ方針で続行する。
         let pending: Vec<_> = self
             .tasks
@@ -4288,6 +4317,12 @@ impl TeamRuntime {
             return;
         }
         for id in ready {
+            if self
+                .task(id)
+                .is_some_and(|t| self.dependencies_writer_pending(t))
+            {
+                continue;
+            }
             // 遷移が断られたら**黙らない**。「なぜか Ready にならない」を
             // 追えるように理由をそのまま残す。
             let refused =
@@ -4700,7 +4735,19 @@ impl TeamRuntime {
             return;
         }
         let depth = graph::critical_depth(&self.tasks);
-        let plan = scheduler::plan_assignments(&self.tasks, &candidates, &depth);
+        let mut scheduling = std::borrow::Cow::Borrowed(self.tasks.as_slice());
+        for (index, task) in self.tasks.iter().enumerate() {
+            if task.state == TeamTaskState::Ready
+                && (self.task_writer_pending(task.id)
+                    || self.dependencies_writer_pending(task)
+                    || (isolated_assembly(task) && !self.restored_writers.is_empty()))
+            {
+                // Exclude before assigning candidates, so a blocked restored
+                // task cannot reserve the only agent ahead of independent work.
+                scheduling.to_mut()[index].state = TeamTaskState::Pending;
+            }
+        }
+        let plan = scheduler::plan_assignments(&scheduling, &candidates, &depth);
 
         // **この tick で本当に成り立っている理由**の鍵。ここに無い
         // スケジューリング由来の判断は、下で撤回する。
@@ -4792,11 +4839,15 @@ impl TeamRuntime {
             let Some(task) = self.tasks.iter().find(|t| t.id == a.task).cloned() else {
                 continue;
             };
+            if self.task_writer_pending(task.id) || self.dependencies_writer_pending(&task) {
+                continue;
+            }
             if isolated_assembly(&task) {
                 // 既存の所有者が停止するまで、同じRunにも再配送しない。
                 if self.integration.is_some()
                     || self.publication.is_some()
                     || !self.worker_holds.is_empty()
+                    || !self.restored_writers.is_empty()
                 {
                     continue;
                 }
@@ -5234,10 +5285,72 @@ impl TeamRuntime {
     /// 場合は数え、人が配り直した場合は数えない — 人の操作を失敗として
     /// 記録すると、上限に早く当たって使えなくなる)。
     fn task_writer_pending(&self, task: TaskId) -> bool {
-        self.worker_holds
-            .get(&task)
-            .or_else(|| self.integration.as_ref().filter(|hold| hold.task == task))
-            .is_some_and(|hold| !hold.permit.writer_stopped())
+        self.restored_writers.contains(&task)
+            || self
+                .worker_holds
+                .get(&task)
+                .or_else(|| self.integration.as_ref().filter(|hold| hold.task == task))
+                .is_some_and(|hold| !hold.permit.writer_stopped())
+    }
+
+    fn dependencies_writer_pending(&self, task: &TeamTask) -> bool {
+        // Old snapshots may already have completed an intermediate task after
+        // resolving a live writer. Its completion cannot hide that ancestor.
+        let mut pending = task.dependencies.clone();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if self.task_writer_pending(id) {
+                return true;
+            }
+            if let Some(dependency) = self.task(id) {
+                pending.extend(&dependency.dependencies);
+            }
+        }
+        false
+    }
+
+    fn poll_restored_writers(&mut self) {
+        if let Some(rx) = &self.writer_probe {
+            match rx.try_recv() {
+                Ok(finished) => {
+                    for id in finished {
+                        self.restored_writers.remove(&id);
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                // Losing a worker does not prove completion; retry below.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+            self.writer_probe = None;
+            self.writer_probe_at = Instant::now() + std::time::Duration::from_millis(100);
+        }
+        if self.restored_writers.is_empty() || Instant::now() < self.writer_probe_at {
+            return;
+        }
+        let tasks: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| self.restored_writers.contains(&t.id))
+            .map(|t| (t.id, t.files.clone(), isolated_assembly(t)))
+            .collect();
+        let workspace = self.workspace.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.writer_probe = Some(rx);
+        // Disk/OS queries never run in tick. Each batch terminates even if the
+        // Runtime is dropped; no joining or persistent polling thread is needed.
+        std::thread::spawn(move || {
+            let finished = tasks
+                .into_iter()
+                .filter_map(|(id, files, assembly)| {
+                    super::integration::restored_writer_stopped(&workspace, &files, assembly)
+                        .then_some(id)
+                })
+                .collect();
+            let _ = tx.send(finished);
+        });
     }
 
     fn free_task(&mut self, task: TaskId, count_attempt: bool) {
@@ -5379,6 +5492,9 @@ impl TeamRuntime {
 
     /// Goal の状態を Task Graph から更新する。
     fn update_goal(&mut self) {
+        if self.tasks.iter().any(|t| self.task_writer_pending(t.id)) {
+            return;
+        }
         if self.goal.status.is_terminal() {
             return;
         }
@@ -7303,10 +7419,21 @@ mod worker_ownership_tests {
             for s in &mut self.sessions {
                 s.state = state;
             }
-            let effects = self.rt.tick(&Observation {
+            self.rt.writer_probe_at = Instant::now();
+            let obs = Observation {
                 now: now_secs(),
                 sessions: self.sessions.clone(),
-            });
+            };
+            let mut effects = self.rt.tick(&obs);
+            if let Some(rx) = self.rt.writer_probe.take() {
+                // This synchronous fixture waits for the real background query;
+                // production tick remains nonblocking.
+                let result = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(result).unwrap();
+                self.rt.writer_probe = Some(rx);
+                effects.extend(self.rt.tick(&obs));
+            }
             let mut assigned = Vec::new();
             for effect in effects {
                 if let TeamEffect::SendInstruction {
@@ -7551,8 +7678,9 @@ mod worker_ownership_tests {
             let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
                 .unwrap()
                 .unwrap();
-            let mut writer =
-                super::descendant_tests::Descendant::spawn_group(session_id, &work, "late.txt", group);
+            let mut writer = super::descendant_tests::Descendant::spawn_group(
+                session_id, &work, "late.txt", group,
+            );
             c.rt.handoff_integration_writer(
                 task.id,
                 session_id,

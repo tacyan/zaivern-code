@@ -187,6 +187,12 @@ pub fn persisted_alive(proof: &str) -> bool {
     let Ok((path, nonce, boot)) = serde_json::from_str::<(Vec<u8>, String, String)>(proof) else {
         return true;
     };
+    if !valid_boot_identity(&boot)
+        || nonce.len() != 64
+        || !nonce.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return true;
+    }
     if std::fs::read_to_string(PathBuf::from(std::ffi::OsString::from_vec(path)))
         .is_ok_and(|value| value == nonce)
     {
@@ -194,10 +200,9 @@ pub fn persisted_alive(proof: &str) -> bool {
     }
     // A reboot is another kernel proof that every writer from the old boot
     // is gone, recovering even a forcibly killed supervisor without receipt.
-    !valid_boot_identity(&boot)
-        || boot_identity()
-            .map(|current| current == boot)
-            .unwrap_or(true)
+    boot_identity()
+        .map(|current| current == boot)
+        .unwrap_or(true)
 }
 fn valid_boot_identity(value: &str) -> bool {
     value.len() == 36
@@ -577,16 +582,17 @@ fn missing_and_wrong_receipts_do_not_release_ownership() {
     let dir = std::env::temp_dir().join(format!("zai-receipt-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("done");
+    let nonce = "a".repeat(64);
     let proof = serde_json::to_string(&(
         path.as_os_str().as_bytes(),
-        "expected",
+        &nonce,
         boot_identity().unwrap(),
     ))
     .unwrap();
     assert!(persisted_alive(&proof));
     std::fs::write(&path, "different identity").unwrap();
     assert!(persisted_alive(&proof));
-    std::fs::write(&path, "expected").unwrap();
+    std::fs::write(&path, &nonce).unwrap();
     assert!(!persisted_alive(&proof));
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -683,8 +689,38 @@ fn previous_boot_recovers_missing_receipt_but_invalid_identity_does_not() {
     if previous == current {
         previous.replace_range(..1, "1");
     }
-    let proof = serde_json::to_string(&(path.as_os_str().as_bytes(), "nonce", previous)).unwrap();
+    let nonce = "a".repeat(64);
+    let proof = serde_json::to_string(&(path.as_os_str().as_bytes(), &nonce, previous)).unwrap();
     assert!(!persisted_alive(&proof));
-    let proof = serde_json::to_string(&(path.as_os_str().as_bytes(), "nonce", "unknown")).unwrap();
+    let proof = serde_json::to_string(&(path.as_os_str().as_bytes(), &nonce, "unknown")).unwrap();
     assert!(persisted_alive(&proof));
+}
+
+#[test]
+fn malformed_identity_cannot_match_a_receipt_and_release_ownership() {
+    struct ReceiptDir(PathBuf);
+    impl Drop for ReceiptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = ReceiptDir(crate::test_util::unique_temp_dir(
+        "zai-writer",
+        "invalid-proof",
+    ));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("done");
+    let current = boot_identity().unwrap();
+    for (nonce, boot) in [
+        (String::new(), current.clone()),
+        ("g".repeat(64), current),
+        ("a".repeat(64), "invalid-boot".into()),
+    ] {
+        std::fs::write(&path, &nonce).unwrap();
+        let proof = serde_json::to_string(&(path.as_os_str().as_bytes(), nonce, boot)).unwrap();
+        assert!(
+            persisted_alive(&proof),
+            "malformed proof matched its receipt"
+        );
+    }
 }

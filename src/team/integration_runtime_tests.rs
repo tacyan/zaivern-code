@@ -60,10 +60,24 @@ impl Harness {
             now: self.now,
             sessions: self.sessions.clone(),
         };
+        if self.wait_for_publication {
+            // Skip only the retry schedule; the actual background lease probe
+            // must still acknowledge completion below.
+            self.rt.writer_probe_at = std::time::Instant::now();
+        }
         let mut effects = self.rt.tick(&obs);
         // Existing state-machine tests assert settled outcomes. Wait only in this
         // harness; production tick and the explicit nonblocking tests never wait.
         if self.wait_for_publication {
+            if let Some(probe) = self.rt.writer_probe.take() {
+                let finished = probe
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap();
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(finished).unwrap();
+                self.rt.writer_probe = Some(rx);
+                effects.extend(self.rt.tick(&obs));
+            }
             if let Some(job) = self.rt.publication.as_mut() {
                 if job.ready.is_none() {
                     job.ready = Some(
@@ -534,6 +548,9 @@ fn 旧形式の直接統合は復元時に成果と履歴を保持して自動�
     let root = root();
     let mut original = Harness::new(&root, 1);
     original.workers();
+    // This legacy-format case starts after the implementation writer stopped.
+    // Completed alone must not stand in for the final ownership release tick.
+    original.pump(SessionState::Exited);
     let mut saved = original.rt.to_saved();
     let task = saved
         .tasks
@@ -930,6 +947,201 @@ pub(crate) fn closing_publication_fixture() -> (
 #[test]
 fn exited_assembly_parent_does_not_publish_a_live_descendants_candidate() {
     descendant_candidate("group");
+}
+
+#[test]
+fn restored_validating_implementation_waits_for_real_writer_before_dependencies() {
+    restored_reported_writer(false, false);
+}
+
+#[test]
+fn restored_validating_implementation_with_finished_writer_makes_progress() {
+    restored_reported_writer(true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn restored_validating_implementation_waits_through_tracking_error_and_recovers() {
+    restored_reported_writer(false, true);
+}
+
+fn restored_reported_writer(finish_before_restore: bool, tracking_error: bool) {
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    let root = root();
+    let mut original = Harness::new(&root, 1);
+    static NEXT_SESSION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(93_000_000);
+    original.next_session = NEXT_SESSION.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    let task = (0..4)
+        .find_map(|_| original.pump(SessionState::Idle).first().copied())
+        .expect("実装の配送");
+    assert_ne!(original.rt.task(task).unwrap().key, "assemble");
+    assert!(original
+        .rt
+        .tasks()
+        .iter()
+        .filter(|t| t.id != task)
+        .all(|t| t.dependencies.contains(&task)));
+    let (candidate, _) = original.candidate(task);
+    let files = original.rt.task(task).unwrap().files.clone();
+    let baseline = task_workspace::baseline(&root, &files).unwrap();
+    let session_id = original.rt.task(task).unwrap().assigned_session.unwrap();
+    #[cfg(unix)]
+    let listener = tracking_error.then(|| {
+        let path = std::env::temp_dir().join(format!("zr{}-{}", std::process::id(), new_run_id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (path, listener)
+    });
+    #[cfg(unix)]
+    let extra = listener
+        .as_ref()
+        .map(|(path, _)| {
+            (
+                "ZAIVERN_WRITER_TEST_TRACKING_SOCKET".into(),
+                path.to_string_lossy().into_owned(),
+            )
+        })
+        .into_iter()
+        .collect();
+    #[cfg(not(unix))]
+    let extra = {
+        assert!(!tracking_error);
+        Default::default()
+    };
+    let mut writer = super::descendant_tests::Descendant::spawn_group_with_env(
+        session_id,
+        &candidate,
+        "body.txt",
+        if cfg!(unix) { "setsid" } else { "group" },
+        extra,
+    );
+    #[cfg(unix)]
+    let mut fault = listener.map(|(path, listener)| {
+        let mut accepted = None;
+        super::descendant_tests::wait_until(|| match listener.accept() {
+            Ok((stream, _)) => {
+                accepted = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("tracking handshake: {e}"),
+        });
+        std::fs::remove_file(path).unwrap();
+        let stream = accepted.unwrap();
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream
+    });
+    original
+        .rt
+        .handoff_integration_writer(
+            task,
+            session_id,
+            writer.session.as_ref().unwrap().writer_identity(),
+        )
+        .unwrap();
+    original.complete(task, "body.txt", "受理済み成果物");
+    assert_eq!(
+        original.rt.task(task).unwrap().state,
+        TeamTaskState::Validating
+    );
+    assert!(original
+        .rt
+        .task(task)
+        .unwrap()
+        .validation_commands
+        .is_empty());
+    let saved = original.rt.to_saved();
+    let summary = original.rt.task(task).unwrap().last_summary.clone();
+    writer.exit_parent(); // ACK proves the detached child can still write.
+    #[cfg(unix)]
+    if let Some(fault) = &mut fault {
+        writer.tree.stop();
+        let mut acknowledgement = [0];
+        fault.read_exact(&mut acknowledgement).unwrap();
+        assert_eq!(acknowledgement, *b"E");
+        writer.write_child();
+    }
+    std::fs::write(candidate.join("retained.txt"), "既存成果物").unwrap();
+    std::fs::write(root.join("body.txt"), "復元前のユーザー変更").unwrap();
+    drop(original); // The runtime's in-memory holds are now gone.
+    if finish_before_restore {
+        writer.finish_child();
+    }
+    let mut h = Harness {
+        rt: TeamRuntime::restore(saved, root.clone()),
+        sessions: vec![],
+        now: now_secs(),
+        next_session: 100,
+        wait_for_publication: true,
+    };
+    if !finish_before_restore {
+        for _ in 0..3 {
+            for _ in 0..3 {
+                let assigned = h.pump(SessionState::Idle);
+                assert_ne!(
+                    h.rt.task(task).unwrap().state,
+                    TeamTaskState::Completed,
+                    "メモリ上のholdが無いだけで終了確定した"
+                );
+                assert!(
+                    assigned.is_empty(),
+                    "復元前のwriterが書込み中なのに後続へ配送した"
+                );
+                assert!(h.rt.publication.is_none());
+                writer.write_child();
+            }
+            h.rt = TeamRuntime::restore(h.rt.to_saved(), root.clone());
+            h.sessions.clear();
+        }
+        if tracking_error {
+            #[cfg(unix)]
+            fault.as_mut().unwrap().write_all(b"R").unwrap();
+            super::descendant_tests::wait_until(|| writer.tree.finished());
+        } else {
+            writer.finish_child();
+        }
+    }
+    let mut assigned = Vec::new();
+    super::descendant_tests::wait_until(|| {
+        assigned.extend(h.pump(SessionState::Idle));
+        h.rt.task(task).unwrap().state == TeamTaskState::Completed
+    });
+    assert_eq!(h.rt.task(task).unwrap().last_summary, summary);
+    assert!(!assigned.contains(&task), "受理済み実装を再配送した");
+    super::descendant_tests::wait_until(|| {
+        assigned.extend(h.pump(SessionState::Idle));
+        !assigned.is_empty()
+    });
+    assert_eq!(task_workspace::baseline(&root, &files).unwrap(), baseline);
+    assert_eq!(
+        std::fs::read_to_string(candidate.join("body.txt")).unwrap(),
+        "late writer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(candidate.join("retained.txt")).unwrap(),
+        "既存成果物"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "復元前のユーザー変更"
+    );
+    let assembly = assigned
+        .into_iter()
+        .find(|id| h.rt.task(*id).unwrap().key == "assemble")
+        .expect("終了確認後に統合へ配送");
+    h.complete(assembly, "body.txt", "統合候補");
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(assembly).unwrap().state, TeamTaskState::Submitted);
+    assert_eq!(
+        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        "復元前のユーザー変更",
+        "復元時にbaselineを更新してユーザー変更を上書きした"
+    );
 }
 
 #[cfg(unix)]
