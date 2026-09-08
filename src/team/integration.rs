@@ -1605,95 +1605,6 @@ mod tests {
         let _ = std::io::stdin().read(&mut [0u8; 1]);
     }
 
-    #[cfg(windows)]
-    fn check_writer_lifecycle(publisher_alive: bool) {
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let f = Fixture::new("surviving-writer");
-        let ready = f.0.join("writer-ready");
-        let relative_module = module_path!()
-            .split_once("::")
-            .map(|(_, path)| path)
-            .unwrap_or(module_path!());
-        let probe_name = format!("{relative_module}::writer_process_probe");
-        let mut child = Child(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &probe_name, "--nocapture"])
-                .env("ZAI_INTEGRATION_WRITER_PROBE", &ready)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "writerが起動前に終了した"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "writerの起動待ちが終了しなかった"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let mut permit = try_acquire(&f.0, "old-app").unwrap().unwrap();
-        #[cfg(unix)]
-        permit.handoff_writer(Some(child.0.id())).unwrap();
-        #[cfg(windows)]
-        {
-            // The probe has acknowledged readiness and is blocked on stdin;
-            // unlike an arbitrary CLI it cannot fork before test assignment.
-            let job = crate::terminal::writer_tree::windows::Job::for_test_assign(child.0.id());
-            let tree = crate::terminal::writer_tree::Tree::register(Some(child.0.id()), job);
-            permit
-                .handoff_identity(crate::terminal::writer_tree::Identity {
-                    pid: child.0.id(),
-                    tree: Some(tree),
-                })
-                .unwrap();
-        }
-        let permit = if publisher_alive {
-            Some(permit)
-        } else {
-            let dead_pid = u32::MAX / 2;
-            assert!(!crate::instances::pid_alive(dead_pid));
-            lease::with_store(&permit.store, |state| {
-                let owner = state
-                    .leases
-                    .iter_mut()
-                    .find(|lease| lease.holder.same(&permit.holder))
-                    .unwrap();
-                // Simulate the app process having disappeared while its writer survived.
-                let token = format!("old-app:{dead_pid}:1");
-                owner.holder.session = owner
-                    .holder
-                    .session
-                    .split_once('|')
-                    .map_or_else(|| token.clone(), |(job, _)| format!("{job}|{token}"));
-            })
-            .unwrap();
-            std::mem::forget(permit);
-            None
-        };
-        assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
-        drop(child.0.stdin.take());
-        child.0.wait().unwrap();
-        if publisher_alive {
-            assert!(
-                try_acquire(&f.0, "new-app").unwrap().is_none(),
-                "writer終了だけでpublish中のappから所有権を奪った"
-            );
-            drop(permit);
-        }
-        assert!(try_acquire(&f.0, "new-app").unwrap().is_some());
-    }
-
     #[cfg(any(windows, any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn legacy_parent_only_writer_identity_is_not_completion_proof() {
@@ -1711,7 +1622,6 @@ mod tests {
         assert!(try_acquire(&f.0, "new-app").unwrap().is_none());
     }
 
-    #[cfg(unix)]
     fn check_writer_lifecycle(publisher_alive: bool) {
         let f = Fixture::new("supervised-writer");
         let mut writer = super::super::runtime::descendant_tests::Descendant::spawn_group(

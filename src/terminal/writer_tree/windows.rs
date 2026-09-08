@@ -23,24 +23,6 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 impl Job {
-    #[cfg(test)]
-    pub fn for_test_assign(pid: u32) -> Self {
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
-        };
-        let job = Self::prepare(&mut portable_pty::CommandBuilder::new("cmd.exe")).unwrap();
-        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-        assert!(!process.is_null());
-        let process = unsafe { OwnedHandle::from_raw_handle(process) };
-        assert_ne!(
-            unsafe {
-                AssignProcessToJobObject(job.handle.as_raw_handle(), process.as_raw_handle())
-            },
-            0
-        );
-        job
-    }
-
     pub fn prepare(cmd: &mut portable_pty::CommandBuilder) -> Result<Self, String> {
         let name = format!(
             "Local\\ZaivernWriter-{}-{}",
