@@ -21,7 +21,7 @@ Claude Code・Codex・Gemini CLI ほか、すでに入れてある 30 種のエ�
 
 </div>
 
-[Zaivern Code の紹介動画を見る](assets/Zaivern.mp4)
+[![Zaivern Code の紹介動画を見る](assets/Zaivern.gif)](assets/Zaivern.mp4)
 
 **インストールして起動する**
 

@@ -22,7 +22,7 @@ você já tem instaladas. Binário nativo único — macOS, Linux, Windows.
 
 </div>
 
-[Assista ao vídeo de demonstração do Zaivern Code](assets/Zaivern.mp4)
+[![Assista ao vídeo de demonstração do Zaivern Code](assets/Zaivern.gif)](assets/Zaivern.mp4)
 
 **Instale e inicie**
 

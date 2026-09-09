@@ -22,7 +22,7 @@ already installed. Single native binary — macOS, Linux, Windows.
 
 </div>
 
-[Watch the Zaivern Code demo](assets/Zaivern.mp4)
+[![Watch the Zaivern Code demo](assets/Zaivern.gif)](assets/Zaivern.mp4)
 
 **Install and launch**
 
