@@ -1,5 +1,7 @@
 # docs/ — 何がどこに書いてあるか
 
+[Zaivern Code の紹介動画を見る](../assets/Zaivern.mp4)
+
 **1 文書 = 1 つの保証。**「この主張の根拠はどれか」を引くための索引である。
 製品としての紹介は [../README.md](../README.md)、開発規約は
 [../CLAUDE.md](../CLAUDE.md) にある。

@@ -21,6 +21,8 @@ Zaivern Code 在重叠的改动落地之前就拦住它们，因此它们不会�
 
 </div>
 
+[观看 Zaivern Code 演示视频](assets/Zaivern.mp4)
+
 **安装并启动**
 
 macOS / Linux：
