@@ -423,8 +423,7 @@ pub enum ConsoleVerdict {
     Errors(Vec<String>),
 }
 
-/// Chrome を待つ上限。**固定の待ちは遅い環境で誤って殺す**が、ここは
-/// 1 枚の静的ページを開くだけなので、超えたら固まっている。
+/// Chrome を待つ上限。超過は検査未完了であり、ページのエラーとは区別する。
 const CHROME_WAIT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// ページが仮想時間で進む量 (ミリ秒)。アニメーションの `requestAnimationFrame`
@@ -552,11 +551,14 @@ pub fn console_errors(workspace: &Path, page: &str) -> ConsoleVerdict {
     }
     let url = match file_url(&full) {
         Some(u) => u,
-        None => {
-            return ConsoleVerdict::Skipped(format!("{} を URL にできません", full.display()))
-        }
+        None => return ConsoleVerdict::Skipped(format!("{} を URL にできません", full.display())),
     };
     let profile = scratch_profile("webcheck");
+    if let Err(e) = std::fs::create_dir(&profile) {
+        return ConsoleVerdict::Skipped(format!("検査用プロファイルを作れません: {e}"));
+    }
+    let capture = profile.join("console.png");
+    let log = profile.join("console.log");
     let out = run_chrome(
         &chrome,
         &[
@@ -566,28 +568,56 @@ pub fn console_errors(workspace: &Path, page: &str) -> ConsoleVerdict {
             "--no-default-browser-check",
             "--disable-extensions",
             "--allow-file-access-from-files",
-            "--enable-logging=stderr",
+            // Windows の sandboxed renderer のログは stderr では取得できない。
+            // https://www.chromium.org/for-testers/enable-logging/
+            "--enable-logging",
+            &format!("--log-file={}", log.display()),
             "--v=0",
             &format!("--user-data-dir={}", profile.display()),
             &format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
-            "--dump-dom",
+            &format!("--screenshot={}", capture.display()),
             &url,
         ],
-        // **DOM が出たら終わり。** Chrome は dump のあと自分では終わらない
-        // (実測: macOS / Chrome 151 で 20 秒待っても生きていた)。
-        |stdout, _| stdout.contains("</html>"),
+        // stdout の DOM 出力に依存せず、画像の書き込み完了を確認する。
+        |_, _| png_complete(&capture),
     );
-    let _ = std::fs::remove_dir_all(&profile);
-    match out {
+    let verdict = match out {
         Err(why) => ConsoleVerdict::Skipped(why),
-        Ok(stderr) => {
-            let errs = parse_console_errors(&stderr);
-            if errs.is_empty() {
-                ConsoleVerdict::Clean
-            } else {
-                ConsoleVerdict::Errors(errs)
-            }
-        }
+        Ok(_) => captured_console_errors(&capture, &log),
+    };
+    let _ = std::fs::remove_dir_all(&profile);
+    verdict
+}
+
+/// PNG の末尾まで書き終わったことを確認する。ポーリングでは画像を全復号しない。
+fn png_complete(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut signature = [0; 8];
+    let mut end = [0; 12];
+    file.read_exact(&mut signature).is_ok()
+        && signature == *b"\x89PNG\r\n\x1a\n"
+        && file.seek(SeekFrom::End(-12)).is_ok()
+        && file.read_exact(&mut end).is_ok()
+        && end == *b"\0\0\0\0IEND\xae\x42\x60\x82"
+}
+
+/// Chrome の早期終了やログ取得失敗を、エラーゼロと取り違えない。
+fn captured_console_errors(capture: &Path, log: &Path) -> ConsoleVerdict {
+    if !png_complete(capture) || image::open(capture).is_err() {
+        return ConsoleVerdict::Skipped("Chrome の描画完了を確認できませんでした".into());
+    }
+    let stderr = match std::fs::read_to_string(log) {
+        Ok(s) => s,
+        Err(e) => return ConsoleVerdict::Skipped(format!("Chrome のログを読めません: {e}")),
+    };
+    let errs = parse_console_errors(&stderr);
+    if errs.is_empty() {
+        ConsoleVerdict::Clean
+    } else {
+        ConsoleVerdict::Errors(errs)
     }
 }
 
@@ -764,9 +794,15 @@ fn run_chrome(
     let snapshot = |b: &Arc<Mutex<String>>| b.lock().map(|s| s.clone()).unwrap_or_default();
     let started = std::time::Instant::now();
     let mut timed_out = false;
+    let mut exit_error = None;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                if !status.success() {
+                    exit_error = Some(format!("Chrome が異常終了しました: {status}"));
+                }
+                break;
+            }
             Ok(None) => {}
             Err(e) => return Err(format!("Chrome の終了を待てません: {e}")),
         }
@@ -788,6 +824,9 @@ fn run_chrome(
     // 群ごと落としたのでパイプは閉じ、読み取りは必ず返る。
     let _ = t_out.join();
     let _ = t_err.join();
+    if let Some(why) = exit_error {
+        return Err(why);
+    }
     if timed_out {
         return Err(format!(
             "Chrome が {} 秒以内に描き終えませんでした",
@@ -846,6 +885,57 @@ mod console_tests {
             ]
         );
         assert!(parse_console_errors("").is_empty());
+    }
+
+    #[test]
+    fn 描画未完了やログ欠落を正常と扱わない() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "webcheck-capture");
+        let capture = dir.join("console.png");
+        let log = dir.join("console.log");
+        std::fs::write(&log, "").unwrap();
+        assert!(matches!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Skipped(_)
+        ));
+        image::RgbaImage::new(1, 1).save(&capture).unwrap();
+        assert!(png_complete(&capture));
+        assert_eq!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Clean
+        );
+        std::fs::remove_file(&log).unwrap();
+        assert!(matches!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Skipped(_)
+        ));
+        std::fs::write(&log, "[1:2:INFO:CONSOLE:1] \"Uncaught ReferenceError: undefinedFn is not defined\", source: file:///test.html (1)\n").unwrap();
+        assert!(matches!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Errors(_)
+        ));
+        let mut png = std::fs::read(&capture).unwrap();
+        png.truncate(png.len() - 1);
+        std::fs::write(&capture, png).unwrap();
+        assert!(matches!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Skipped(_)
+        ));
+        // シグネチャと終端だけを持つ壊れた画像も正常扱いしない。
+        std::fs::write(&capture, b"\x89PNG\r\n\x1a\n\0\0\0\0IEND\xae\x42\x60\x82").unwrap();
+        assert!(png_complete(&capture));
+        assert!(matches!(captured_console_errors(&capture, &log), ConsoleVerdict::Skipped(_)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chromeの異常終了を正常と扱わない() {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd.exe", &["/C", "exit", "7"])
+        } else {
+            ("sh", &["-c", "exit 7"])
+        };
+        let result = run_chrome(Path::new(program), args, |_, _| false);
+        assert!(result.unwrap_err().contains("異常終了"));
     }
 
     #[test]
