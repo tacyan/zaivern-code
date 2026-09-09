@@ -21,6 +21,8 @@ Claude Code, Codex, Gemini CLI를 비롯해 이미 설치해 둔 30가지 에이
 
 </div>
 
+[Zaivern Code 데모 영상 보기](assets/Zaivern.mp4)
+
 **설치하고 실행하기**
 
 macOS / Linux:

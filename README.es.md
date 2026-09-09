@@ -22,6 +22,8 @@ tienes instaladas. Binario nativo único: macOS, Linux, Windows.
 
 </div>
 
+[Ver el vídeo de demostración de Zaivern Code](assets/Zaivern.mp4)
+
 **Instalar y arrancar**
 
 macOS / Linux:

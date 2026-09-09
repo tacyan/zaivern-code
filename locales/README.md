@@ -1,5 +1,7 @@
 # Zaivern Code — Language Packs
 
+[Watch the Zaivern Code demo](../assets/Zaivern.mp4)
+
 Flat JSON, one file per language, **stable IDs as keys**.
 
 ```json
