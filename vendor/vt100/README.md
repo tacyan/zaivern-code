@@ -1,6 +1,6 @@
 # vt100
 
-[Watch the Zaivern Code demo](../../assets/Zaivern.mp4)
+[![Watch the Zaivern Code demo](../../assets/Zaivern.gif)](../../assets/Zaivern.mp4)
 
 This crate parses a terminal byte stream and provides an in-memory
 representation of the rendered contents.
