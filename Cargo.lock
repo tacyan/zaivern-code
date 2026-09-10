@@ -5103,7 +5103,7 @@ dependencies = [
 
 [[package]]
 name = "zaivern-code"
-version = "0.24.1"
+version = "0.24.2"
 dependencies = [
  "arboard",
  "base64 0.23.1",
