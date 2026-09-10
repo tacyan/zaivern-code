@@ -371,6 +371,10 @@ jobs:
           }
           Write-Host "install.ps1: 構文エラー 0 件"
 
+      - name: Windows installer regression tests
+        shell: pwsh
+        run: ./tools/windows-installer-test.ps1
+
       # tools/*.sh は 21 本あり、重いもの (ベンチ・証明の網羅版) は
       # xplat.yml の週次でしか動かさない。**壊れていることに 1 週間気付かない**
       # のを避けるため、実行はせずに構文と静的検査だけをここで毎回通す。

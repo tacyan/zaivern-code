@@ -6,7 +6,7 @@
 #   2. リリースの checksums.txt と SHA-256 を突き合わせてから
 #      %LOCALAPPDATA%\Zaivern\bin へ配置
 #      (**検証できなければ展開も実行もせずに中止する = fail-closed**)
-#   3. ビルド済みが取得できない場合はソースからビルド
+#   3. ZAI_FROM_SOURCE=1 を指定した場合だけソースからビルド
 #      (Rust が無ければ rustup ごと非対話でセットアップ)
 #
 # 2回目以降の実行は「更新」として動作する:
@@ -37,6 +37,9 @@ function Test-Checksum($file, $baseName, $sumsUrl) {
     try {
         # -UseBasicParsing: Windows PowerShell 5.1 で IE エンジンに依存しない
         $body = (Invoke-WebRequest $sumsUrl -UseBasicParsing).Content
+        # GitHub Releases の application/octet-stream は PowerShell 7 では Byte[]。
+        # 行の解析前に UTF-8 へ復号し、文字列で返る PowerShell 5.1 と揃える。
+        if ($body -is [byte[]]) { $body = [System.Text.Encoding]::UTF8.GetString($body) }
     } catch {
         Warn "checksums.txt を取得できませんでした: $_"
         return $false
@@ -162,8 +165,10 @@ function Show-Done($verb, $exe, $tag) {
 
 # --- ビルド済みバイナリのインストール ----------------------------------------
 function Install-Prebuilt {
-    if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64") {
-        Warn "ビルド済みバイナリは x86_64 のみです (現在: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture))"
+    # Windows PowerShell 5.1 の古い .NET でも動作し、32-bit PowerShell も考慮する。
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    if ($arch -ne "AMD64") {
+        Warn "ビルド済みバイナリは x86_64 のみです (現在: $arch)"
         return $false
     }
     Say "最新リリースを確認しています..."
@@ -177,7 +182,7 @@ function Install-Prebuilt {
     $sumsUrl = "$repoUrl/releases/download/$tag/checksums.txt"
     Say "ダウンロード: $url"
     $ProgressPreference = "SilentlyContinue"  # Invoke-WebRequest の進捗バーは遅いので切る
-    Invoke-WebRequest $url -OutFile $zip
+    Invoke-WebRequest $url -OutFile $zip -UseBasicParsing
 
     # ここから先は fail-closed。展開する前に必ず突き合わせる。
     # 戻り値は「最後の出力」で判定する (Say/Warn は Write-Host なので
@@ -215,7 +220,28 @@ function Install-Prebuilt {
     return $true
 }
 
-# --- ソースビルド (フォールバック) -------------------------------------------
+# PATH 上の link.exe だけでは判定しない。rustc は Visual Studio を自動検出する。
+# 小さなプログラムで SDK / 標準ライブラリを含めたリンクを実際に確認する。
+function Test-SourceToolchain {
+    $probe = Join-Path ([IO.Path]::GetTempPath()) ("zai-toolchain-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $probe | Out-Null
+    try {
+        $source = Join-Path $probe "probe.rs"
+        $binary = Join-Path $probe "probe.exe"
+        [IO.File]::WriteAllText($source, 'fn main() { println!("Zaivern toolchain check"); }')
+        & rustc --crate-name zai_toolchain_probe $source -o $binary | Out-Host
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $binary)) { return $true }
+        Warn "ソースビルド環境の確認に失敗しました。MSVC では C++ Build Tools と Windows SDK が必要です。"
+        Warn '  winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"'
+        Warn "導入済みの場合は Visual Studio Installer の「変更」で「C++ によるデスクトップ開発」と Windows SDK を確認してください。"
+        Warn "セットアップ完了後、新しい PowerShell でインストーラを再実行してください。"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# --- ソースビルド (明示指定のみ) ---------------------------------------------
 function Install-FromSource {
     Say "ソースからビルド・インストールします..."
 
@@ -226,9 +252,11 @@ function Install-FromSource {
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
         Say "Rust (cargo) が見つかりません。rustup をインストールします..."
         $init = Join-Path $env:TEMP "rustup-init.exe"
-        Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile $init
+        Invoke-WebRequest "https://win.rustup.rs/x86_64" -OutFile $init -UseBasicParsing
         & $init -y --default-toolchain stable | Out-Host
+        $initExit = $LASTEXITCODE
         Remove-Item $init -Force -ErrorAction SilentlyContinue
+        if ($initExit -ne 0) { Warn "rustup のセットアップに失敗しました ($initExit)。"; return $false }
         $env:Path = "$env:Path;$cargoBin"
     }
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -241,20 +269,19 @@ function Install-FromSource {
     if (($ver -notmatch '^\d+$') -or ([int]$ver -lt $requiredMinor)) {
         Say "rustc 1.$requiredMinor+ が必要です(現在: $(rustc --version))。stable を更新します..."
         rustup update stable | Out-Host
+        if ($LASTEXITCODE -ne 0) { Warn "Rust の更新に失敗しました。"; return $false }
     }
 
-    # 3. C++ ビルドツール (link.exe) のヒント
-    if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
-        Say "ヒント: ビルドに失敗する場合は Visual Studio Build Tools が必要です:"
-        Say "  winget install --id Microsoft.VisualStudio.2022.BuildTools --override `"--quiet --add Microsoft.VisualStudio.Workload.VCTools`""
-    }
+    # 3. 依存クレートをコンパイルする前に、リンク可能か確認する。
+    if (-not (Test-SourceToolchain)) { return $false }
 
     # 4. GitHub から直接ビルド & インストール
     #    --force: 同一バージョンがインストール済みでも再ビルドして上書き(=再実行で更新)
     Say "GitHub からビルド・インストールします(初回は数分かかります)..."
     cargo install --git $repoUrl --locked --force zaivern-code | Out-Host
+    $buildExit = $LASTEXITCODE
     $exe = Join-Path $cargoBin "zai.exe"
-    if (-not (Test-Path $exe)) {
+    if ($buildExit -ne 0 -or -not (Test-Path $exe)) {
         Warn "ビルドに失敗しました。上のエラーを確認してください。"
         return $false
     }
@@ -279,7 +306,13 @@ try {
         # 関数の戻り値は「最後の出力」で判定する (途中の出力が混ざっても壊れないように)
         try { $ok = @(Install-Prebuilt)[-1] -eq $true } catch { Warn "ビルド済みバイナリを取得できませんでした: $_" }
     }
-    if (-not $ok -and -not $script:zaiGiveUp) { $null = Install-FromSource }
+    if ($env:ZAI_FROM_SOURCE -eq "1") {
+        $null = Install-FromSource
+    } elseif (-not $ok -and -not $script:zaiGiveUp) {
+        Warn "ビルド済みバイナリをインストールできませんでした。上のエラーを確認して再実行してください。"
+        Warn "配布ページ: $repoUrl/releases/latest"
+        Warn 'ソースビルドを希望する場合だけ、C++ Build Tools と Windows SDK を導入し、$env:ZAI_FROM_SOURCE = "1" を設定して再実行してください。'
+    }
 } finally {
     $ErrorActionPreference = $zaiPrevEap
 }
