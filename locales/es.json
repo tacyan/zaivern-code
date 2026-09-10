@@ -1,4 +1,9 @@
 {
+  "remote.security_app": "Registrar la aplicación en el software de seguridad",
+  "remote.security_app_hint": "En el control de aplicaciones de su software de seguridad, seleccione este ejecutable para permitir conexiones de red. Las conexiones HTTPS usan el servicio Tailscale.",
+  "remote.windows_security": "Abrir la configuración del Firewall de Windows",
+  "remote.tailscale_setup": "Instale Tailscale en el PC y el móvil e inicie sesión en la misma tailnet. Conecte ambos dispositivos y active HTTPS abajo.",
+  "remote.tailscale_download": "Descargar Tailscale",
   "acp.acp_agent": "Agente ACP",
   "acp.acp_agent_structured_protocol": "Agente ACP (protocolo estructurado)",
   "acp.acp_agents_panel": "🛰 Agentes ACP",

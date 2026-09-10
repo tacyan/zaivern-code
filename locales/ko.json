@@ -1,4 +1,9 @@
 {
+  "remote.security_app": "보안 소프트웨어에 앱 등록",
+  "remote.security_app_hint": "보안 소프트웨어의 앱 또는 프로그램 제어에서 이 실행 파일을 선택하여 네트워크 통신을 허용하세요. HTTPS 연결은 Tailscale 서비스가 처리합니다.",
+  "remote.windows_security": "Windows 방화벽 설정 열기",
+  "remote.tailscale_setup": "PC와 휴대폰에 Tailscale을 설치하고 같은 tailnet에 로그인하세요. 두 기기를 연결한 다음 아래에서 HTTPS를 켜세요.",
+  "remote.tailscale_download": "Tailscale 다운로드",
   "acp.acp_agent": "ACP 에이전트",
   "acp.acp_agent_structured_protocol": "ACP 에이전트 (구조화 프로토콜)",
   "acp.acp_agents_panel": "🛰 ACP 에이전트",

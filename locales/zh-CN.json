@@ -1,4 +1,9 @@
 {
+  "remote.security_app": "在安全软件中注册应用",
+  "remote.security_app_hint": "在安全软件的应用或程序控制中，选择此可执行文件并允许其网络连接。HTTPS 连接由 Tailscale 服务处理。",
+  "remote.windows_security": "打开 Windows 防火墙设置",
+  "remote.tailscale_setup": "在电脑和手机上安装 Tailscale，并登录同一个 tailnet。连接两台设备后，在下方启用 HTTPS。",
+  "remote.tailscale_download": "下载 Tailscale",
   "acp.acp_agent": "ACP 代理",
   "acp.acp_agent_structured_protocol": "ACP 代理 (结构化协议)",
   "acp.acp_agents_panel": "🛰 ACP 代理",

@@ -1,4 +1,9 @@
 {
+  "remote.security_app": "ウイルス対策ソフトへのアプリ登録",
+  "remote.security_app_hint": "お使いのソフトの「アプリ／プログラム制御」で、この実行ファイルを選んで通信を許可できます。HTTPS 接続の通信は Tailscale サービスが担当します。",
+  "remote.windows_security": "Windows ファイアウォール設定を開く",
+  "remote.tailscale_setup": "PC とスマホの両方に Tailscale を入れ、同じ tailnet にサインインしてください。両方を接続してから、下の HTTPS を有効にします。",
+  "remote.tailscale_download": "Tailscale をダウンロード",
   "acp.acp_agent": "ACP エージェント",
   "acp.acp_agent_structured_protocol": "ACP エージェント (構造化プロトコル)",
   "acp.acp_agents_panel": "🛰 ACP エージェント",

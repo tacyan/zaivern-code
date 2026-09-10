@@ -1246,7 +1246,7 @@ impl ZaivernApp {
         } else {
             String::new()
         };
-        let fw_exe = if fw_check {
+        let fw_exe = if firewall::applicable() {
             self.fw.exe()
         } else {
             String::new()
@@ -1255,17 +1255,24 @@ impl ZaivernApp {
         egui::Window::new(tr("📱 スマホリモート"))
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .resizable(true)
+            .default_pos(ctx.screen_rect().min + egui::vec2(24.0, 48.0))
+            .default_height((ctx.screen_rect().height() - 96.0).clamp(120.0, 720.0))
+            .max_height((ctx.screen_rect().height() - 64.0).max(80.0))
+            .vscroll(true)
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                // **ここに `ScrollArea` を置かない** (一度入れて撤回した)。
-                // 中央に固定した窓の中では、`ScrollArea` が使える高さを
-                // 「窓の中の残り」= 実質画面の半分と読むので、`max_height` に
-                // いくら大きな値を渡しても効かず、**窓が半分に畳まれる**。
-                // 実測 (2026-08-16 / アプリ窓 1920×1050 · ui_zoom 1.0):
-                // 上限 954px を渡しても中身は 470px で頭打ちになり、
-                // Tailscale と SSH の段がスクロールの下へ隠れた。
+                // Window 自身のスクロールを使い、中央固定による高さの制約を避ける。
+                if firewall::applicable() {
+                    ui.collapsing(tr("remote.security_app"), |ui| {
+                        ui.label(tr("remote.security_app_hint"));
+                        ui.label(RichText::new(&fw_exe).small());
+                        if ui.button(tr("📋 exe のパスをコピー")).clicked() {
+                            fw_copy_exe = true;
+                        }
+                        ui.hyperlink_to(tr("remote.windows_security"), "windowsdefender://network/");
+                    });
+                }
                 match (&url_full, &err) {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
@@ -1584,13 +1591,6 @@ impl ZaivernApp {
 
                             // ── Tailscale VPN ───────────────────────────
                             // 踏み台も同じ Wi-Fi も要らない 3 本目の経路。
-                            // **入れていない人には 1 行も出さない** — 押せない
-                            // ボタンと直せない警告を並べても場所を食うだけ。
-                            // (繋がっていれば必ず検出できるので、使える人には出る)
-                            if ts.stage != tailscale::Stage::Missing
-                                || ts_mode
-                                || https_mode
-                                || https_leftover
                             {
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -1605,6 +1605,10 @@ impl ZaivernApp {
                                     );
                                 });
                                 ui.add_space(3.0);
+                                if ts.stage != tailscale::Stage::Up {
+                                    ui.label(tr("remote.tailscale_setup"));
+                                    ui.hyperlink_to(tr("remote.tailscale_download"), "https://tailscale.com/download");
+                                }
                                 let ts_col = match ts.stage {
                                     tailscale::Stage::Up => theme.ok,
                                     tailscale::Stage::Down => theme.warn,
@@ -1646,15 +1650,6 @@ impl ZaivernApp {
                                                 .color(theme.text_dim),
                                         );
                                     }
-                                } else if ui
-                                    .add_enabled(
-                                        ts.ready(),
-                                        egui::Button::new(tr("🔒 Tailscale で待ち受ける")),
-                                    )
-                                    .on_hover_text(tr(tailscale::SWITCH_HINT))
-                                    .clicked()
-                                {
-                                    ts_on = true;
                                 }
 
                                 // ── HTTPS (tailscale serve) ──────────
@@ -1696,6 +1691,14 @@ impl ZaivernApp {
                                             ts_https_on = true;
                                         }
                                     }
+                                }
+                                if !ts_mode && !https_mode && !https_leftover && https_busy.is_none() {
+                                    ui.collapsing("HTTP", |ui| {
+                                        if ui.add_enabled(ts.ready(), egui::Button::new(tr("🔒 Tailscale で待ち受ける")))
+                                            .on_hover_text(tr(tailscale::SWITCH_HINT)).clicked() {
+                                            ts_on = true;
+                                        }
+                                    });
                                 }
                                 // **できなかった理由は 4 通りある。**
                                 // 「できませんでした」で終わらせない —
