@@ -144,7 +144,11 @@ fn as_local(value: &str) -> Option<String> {
     // スキームだけを外部とみなす。
     if let Some(colon) = v.find(':') {
         let scheme = &v[..colon];
-        if scheme.len() >= 2 && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') {
+        if scheme.len() >= 2
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        {
             return None;
         }
     }
@@ -323,22 +327,37 @@ mod tests {
           <a href="mailto:a@example.com">mail</a>
           <a href="tel:0000">tel</a>
         "##;
-        assert!(local_refs(html).is_empty(), "外部を拾った: {:?}", local_refs(html));
+        assert!(
+            local_refs(html).is_empty(),
+            "外部を拾った: {:?}",
+            local_refs(html)
+        );
     }
 
     /// 問い合わせと断片は落とす (`style.css?v=3` は `style.css`)。
     #[test]
     fn 問い合わせと断片を落とす() {
         let html = r#"<link href="./a.css?v=3"><script src="b.js#x"></script>"#;
-        assert_eq!(local_refs(html), vec!["./a.css".to_string(), "b.js".to_string()]);
+        assert_eq!(
+            local_refs(html),
+            vec!["./a.css".to_string(), "b.js".to_string()]
+        );
     }
 
     /// 相対・絶対・`..` を、根からの 1 つの綴りへ畳む。
     #[test]
     fn 参照を根からの綴りへ畳む() {
         for (page, r, want) in [
-            ("index.html", "./assets/js/main.js", Some("assets/js/main.js")),
-            ("index.html", "/assets/js/main.js", Some("assets/js/main.js")),
+            (
+                "index.html",
+                "./assets/js/main.js",
+                Some("assets/js/main.js"),
+            ),
+            (
+                "index.html",
+                "/assets/js/main.js",
+                Some("assets/js/main.js"),
+            ),
             ("docs/a.html", "../assets/x.css", Some("assets/x.css")),
             ("docs/a.html", "b.css", Some("docs/b.css")),
             ("docs/deep/a.html", "../../top.js", Some("top.js")),
@@ -658,56 +677,84 @@ pub fn screenshot(
     })?;
     let full = workspace.join(page);
     let url = file_url(&full).ok_or_else(|| format!("{} を URL にできません", full.display()))?;
-    let _ = std::fs::remove_file(out);
+    if let Err(e) = std::fs::remove_file(out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("古い画像 {} を削除できません: {e}", out.display()));
+        }
+    }
     let profile = scratch_profile(&format!("webshot-{width}x{height}"));
-    let narrow = width < CHROME_MIN_WINDOW_WIDTH;
-    // 狭い幅は包み紙を経由する。包み紙はプロファイルの隣に置く
-    // (終わったら一緒に消える)。
-    let (target_url, window_w) = if narrow {
-        let wrap = profile.with_extension("wrap.html");
-        std::fs::write(&wrap, iframe_wrapper(&url, width, height))
-            .map_err(|e| format!("{} を書けません: {e}", wrap.display()))?;
-        let wrap_url = file_url(&wrap).ok_or("包み紙を URL にできません")?;
-        (wrap_url, CHROME_MIN_WINDOW_WIDTH.max(width + 16))
-    } else {
-        (url, width)
-    };
-    let target = out.to_path_buf();
-    let r = run_chrome(
-        &chrome,
-        &[
-            "--headless=new",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--allow-file-access-from-files",
-            "--hide-scrollbars",
-            &format!("--user-data-dir={}", profile.display()),
-            &format!("--window-size={window_w},{height}"),
-            &format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
-            &format!("--screenshot={}", out.display()),
-            &target_url,
-        ],
-        // PNG が書かれたら終わり。
-        move |_, _| std::fs::metadata(&target).map(|m| m.len() > 0).unwrap_or(false),
-    );
-    let _ = std::fs::remove_file(profile.with_extension("wrap.html"));
+    std::fs::create_dir(&profile).map_err(|e| format!("検査用プロファイルを作れません: {e}"))?;
+    let result = (|| {
+        let log = profile.join("chrome.log");
+        let narrow = width < CHROME_MIN_WINDOW_WIDTH;
+        // 包み紙は自分が作成したプロファイル内に置き、失敗時も一緒に片付ける。
+        let (target_url, window_w) = if narrow {
+            let wrap = profile.join("wrap.html");
+            std::fs::write(&wrap, iframe_wrapper(&url, width, height))
+                .map_err(|e| format!("{} を書けません: {e}", wrap.display()))?;
+            let wrap_url = file_url(&wrap).ok_or("包み紙を URL にできません")?;
+            (wrap_url, CHROME_MIN_WINDOW_WIDTH.max(width + 16))
+        } else {
+            (url, width)
+        };
+        let target = out.to_path_buf();
+        let r = run_chrome(
+            &chrome,
+            &[
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--allow-file-access-from-files",
+                "--hide-scrollbars",
+                "--enable-logging",
+                &format!("--log-file={}", log.display()),
+                "--v=0",
+                &format!("--user-data-dir={}", profile.display()),
+                &format!("--window-size={window_w},{height}"),
+                &format!("--virtual-time-budget={VIRTUAL_TIME_BUDGET_MS}"),
+                &format!("--screenshot={}", out.display()),
+                &target_url,
+            ],
+            // 部分書き込みでは終了させず、PNG の末尾まで確認する。
+            move |_, _| png_complete(&target),
+        );
+        r.map_err(|why| format!("{why}\n{}", chrome_log_tail(&log)))?;
+        if !png_complete(out) {
+            return Err(format!(
+                "{} の PNG 書き込みが完了していません",
+                out.display()
+            ));
+        }
+        if narrow {
+            // 包み紙の余白を落として、頼まれた幅×高さだけを残す。
+            let img =
+                image::open(out).map_err(|e| format!("{} を読めません: {e}", out.display()))?;
+            let w = width.min(img.width());
+            let h = height.min(img.height());
+            img.crop_imm(0, 0, w, h)
+                .save(out)
+                .map_err(|e| format!("{} を書けません: {e}", out.display()))?;
+        }
+        Ok(())
+    })();
     let _ = std::fs::remove_dir_all(&profile);
-    r.map(|_| ())?;
-    if !out.is_file() {
-        return Err(format!("{} が書かれませんでした", out.display()));
-    }
-    if narrow {
-        // 包み紙の余白を落として、頼まれた幅×高さだけを残す。
-        let img = image::open(out).map_err(|e| format!("{} を読めません: {e}", out.display()))?;
-        let w = width.min(img.width());
-        let h = height.min(img.height());
-        img.crop_imm(0, 0, w, h)
-            .save(out)
-            .map_err(|e| format!("{} を書けません: {e}", out.display()))?;
-    }
-    Ok(())
+    result
+}
+
+/// 失敗理由を残す。巨大なブラウザログをエラー表示へ丸ごと読み込まない。
+fn chrome_log_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len().min(8192);
+        file.seek(SeekFrom::End(-(len as i64)))?;
+        let mut bytes = Vec::new();
+        file.take(len).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    read().unwrap_or_else(|e| format!("Chrome ログを取得できません: {e}"))
 }
 
 /// 一時プロファイルの置き場 (利用者の Chrome のプロファイルには触らない)。
@@ -784,11 +831,17 @@ fn run_chrome(
         })
     };
     let t_out = pump(
-        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
         out_buf.clone(),
     );
     let t_err = pump(
-        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
         err_buf.clone(),
     );
     let snapshot = |b: &Arc<Mutex<String>>| b.lock().map(|s| s.clone()).unwrap_or_default();
@@ -923,7 +976,10 @@ mod console_tests {
         // シグネチャと終端だけを持つ壊れた画像も正常扱いしない。
         std::fs::write(&capture, b"\x89PNG\r\n\x1a\n\0\0\0\0IEND\xae\x42\x60\x82").unwrap();
         assert!(png_complete(&capture));
-        assert!(matches!(captured_console_errors(&capture, &log), ConsoleVerdict::Skipped(_)));
+        assert!(matches!(
+            captured_console_errors(&capture, &log),
+            ConsoleVerdict::Skipped(_)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -940,7 +996,12 @@ mod console_tests {
 
     #[test]
     fn webの成果物の見分け() {
-        for p in ["index.html", "a/B.HTM", "assets/css/style.css", "assets/js/main.js"] {
+        for p in [
+            "index.html",
+            "a/B.HTM",
+            "assets/css/style.css",
+            "assets/js/main.js",
+        ] {
             assert!(is_web_path(p), "{p}");
         }
         for p in ["src/main.rs", "docs/PLAN.md", "package.json", ""] {
@@ -955,6 +1016,20 @@ mod console_tests {
         assert!(u.starts_with("file:///"), "{u}");
         assert!(u.ends_with("index.html"), "{u}");
         assert!(!u.contains("////"), "{u}");
+    }
+
+    #[test]
+    fn chromeの診断ログは末尾だけを読み取得失敗も示す() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "chrome-log-tail");
+        let log = dir.join("chrome.log");
+        assert!(chrome_log_tail(&log).contains("取得できません"));
+        std::fs::write(&log, "日本語のログ").unwrap();
+        assert_eq!(chrome_log_tail(&log), "日本語のログ");
+        std::fs::write(&log, format!("{}END", "x".repeat(9000))).unwrap();
+        let tail = chrome_log_tail(&log);
+        assert_eq!(tail.len(), 8192);
+        assert!(tail.ends_with("END"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 包み紙は指定した幅の iframe を 1 枚だけ持つ。
@@ -983,7 +1058,11 @@ mod console_tests {
         let out = dir.join("shot.png");
         screenshot(&dir, "index.html", 375, 812, &out).expect("撮れる");
         let img = image::open(&out).expect("PNG");
-        assert_eq!((img.width(), img.height()), (375, 812), "包み紙の余白が残っている");
+        assert_eq!(
+            (img.width(), img.height()),
+            (375, 812),
+            "包み紙の余白が残っている"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1001,7 +1080,11 @@ mod console_tests {
             "<!doctype html><html><body><h1>ok</h1><script>console.log('fine')</script></body></html>",
         )
         .unwrap();
-        assert_eq!(console_errors(&dir, "index.html"), ConsoleVerdict::Clean, "正常なページで赤");
+        assert_eq!(
+            console_errors(&dir, "index.html"),
+            ConsoleVerdict::Clean,
+            "正常なページで赤"
+        );
 
         std::fs::write(
             dir.join("index.html"),

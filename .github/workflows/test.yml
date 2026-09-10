@@ -76,14 +76,6 @@ env:
   RUSTFLAGS: -C debuginfo=0
 
 jobs:
-  windows-chrome-probe:
-    if: github.head_ref == 'release/v0.24.2'
-    runs-on: windows-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - shell: pwsh
-        run: ./tools/windows-chrome-probe.ps1
   # terminal:: 以外の全テスト。表示名: "fast (ubuntu-latest)" など。
   fast:
     # 同一リポジトリからの PR のうち、**push run が実際に走るブランチ**だけを
