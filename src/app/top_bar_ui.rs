@@ -12,42 +12,42 @@ impl ZaivernApp {
         self.refresh_tasks_cache();
         // VS Code 準拠メニューバーの表示状態スナップショット (描画用の読み取り専用)
         let menu_info = self.build_menu_info(ctx);
+        let density = top_bar_density(ctx.available_rect().width() - 20.0);
+        let two_rows = density == TopBarDensity::Overflow;
 
         let bar = egui::TopBottomPanel::top("zv-top")
-            .exact_height(42.0)
+            .exact_height(if two_rows { 72.0 } else { 42.0 })
             .frame(
                 egui::Frame::none()
                     .fill(theme.panel)
                     .inner_margin(egui::Margin::symmetric(10.0, 6.0)),
             )
             .show(ctx, |ui| {
-                // 幅が足りないときは右側を縮退させる。縮退しないと右側が
-                // メニューバーの上に重なって両方読めなくなる。
-                let density = top_bar_density(ui.available_width());
-                ui.horizontal_centered(|ui| {
-                    self.top_bar_left(ui, &theme, &menu_info, &branch, &mut cmds);
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if density == TopBarDensity::Overflow {
-                            // 装飾系 (テーマ / リモート / 音声 / ペット) は 1 つの
-                            // 「⋯」へ畳む。エージェント操作だけは常に表に残す。
-                            ui.menu_button("⋯", |ui| {
-                                self.top_bar_language_menu(ui, &mut cmds);
-                                self.top_bar_theme_menu(ui, &mut cmds);
-                                self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
-                                self.top_bar_pet_menu(ui, &mut cmds);
-                            })
-                            .response
-                            .on_hover_text(tr("表示言語・テーマ・スマホリモート・音声・ペット"));
-                        } else {
-                            self.top_bar_language_menu(ui, &mut cmds);
-                            self.top_bar_theme_menu(ui, &mut cmds);
-                            self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
-                            self.top_bar_pet_menu(ui, &mut cmds);
-                        }
-                        self.top_bar_agent_controls(ui, &theme, density, &mut cmds);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding = egui::vec2(5.0, 3.0);
+                // 左右から重ねて描かず、同じ行へ順番に配置する。
+                // 大きな文字・極端に狭い窓でも、はみ出した操作へ横スクロールで届く。
+                egui::ScrollArea::horizontal()
+                    .id_salt("zv-top-scroll")
+                    .max_height(28.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            self.top_bar_left(ui, &theme, &menu_info, &branch, density, &mut cmds);
+                            self.top_bar_primary_controls(ui, &theme, density, &mut cmds);
+                            self.top_bar_secondary_controls(ui, &theme, &mut cmds);
+                            if !two_rows {
+                                self.top_bar_visible_controls(ui, &mut cmds);
+                            }
+                        });
                     });
-                });
+                if two_rows {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("zv-top-views-scroll")
+                        .max_height(28.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| self.top_bar_visible_controls(ui, &mut cmds));
+                        });
+                }
             });
         // ガイドツアーへ「ツールバーはここ」と申告する (非表示なら申告しないだけ)
         tutorial::anchor(ctx, AnchorId::Toolbar, bar.response.rect);
@@ -77,6 +77,14 @@ impl ZaivernApp {
         for c in cmds {
             self.apply_cmd(c, ctx);
         }
+    }
+
+    fn top_bar_visible_controls(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        self.top_bar_view_controls(ui, cmds);
+        self.top_bar_pet_menu(ui, cmds);
+        self.top_bar_remote_and_voice(ui, &self.theme, cmds);
+        self.top_bar_theme_menu(ui, cmds);
+        self.top_bar_language_menu(ui, cmds);
     }
 
     /// 起動バー (⌃1〜⌃9)。**割り当てが 0 件なら 1px も描かない**。
@@ -382,23 +390,32 @@ impl ZaivernApp {
         theme: &Theme,
         menu_info: &menu_bar::MenuInfo,
         branch: &Option<String>,
+        density: TopBarDensity,
         cmds: &mut Vec<Cmd>,
     ) {
-        ui.label(
-            RichText::new("⚡ ZAIVERN")
-                .strong()
-                .size(16.0)
-                .color(theme.accent),
-        );
-        ui.separator();
+        if density != TopBarDensity::Overflow {
+            ui.label(
+                RichText::new("⚡ ZAIVERN")
+                    .strong()
+                    .size(13.0)
+                    .color(theme.accent),
+            );
+            ui.separator();
+        }
 
         // VS Code と同じ 8 メニュー
         // (ファイル/編集/選択/表示/移動/実行/ターミナル/ヘルプ)
         // menu_bar::ui は Vec<Cmd> しか返さないので、矩形は scope で測る。
-        let menus = ui.scope(|ui| menu_bar::ui(ui, menu_info, &self.keys));
+        let menus = ui.scope(|ui| {
+            if density == TopBarDensity::Overflow {
+                ui.menu_button(tr("toolbar.menu"), |ui| {
+                    cmds.extend(menu_bar::ui(ui, menu_info, &self.keys));
+                });
+            } else {
+                cmds.extend(menu_bar::ui(ui, menu_info, &self.keys));
+            }
+        });
         tutorial::anchor(ui.ctx(), AnchorId::MenuBar, menus.response.rect);
-        let mut menu_cmds = menus.inner;
-        cmds.append(&mut menu_cmds);
 
         if let Some(b) = branch {
             self.branch_button(ui, theme, b);
@@ -412,10 +429,11 @@ impl ZaivernApp {
     /// [`git::BranchSnapshot::plan_switch`] の判断を通してから別スレッドで実行する。
     pub(super) fn branch_button(&mut self, ui: &mut egui::Ui, theme: &Theme, current: &str) {
         let busy = self.branch_nav.busy();
+        let short = top_bar_branch_label(current);
         let label = if busy {
-            format!("🌿 {current} …")
+            format!("🌿 {short} …")
         } else {
-            format!("🌿 {current} ▾")
+            format!("🌿 {short} ▾")
         };
         let color = if busy { theme.warn } else { theme.text_dim };
         let menu = ui.menu_button(RichText::new(label).color(color), |ui| {
@@ -429,7 +447,7 @@ impl ZaivernApp {
                 &[("b", self.branch_nav.job_label().to_string())],
             )
         } else {
-            tr("ブランチを切り替え")
+            format!("{}\n{current}", tr("ブランチを切り替え"))
         });
     }
 
@@ -1043,25 +1061,16 @@ impl ZaivernApp {
 
     /// トップバー: エージェント関連 (権限一括切替・既定承認モード・Cockpit・
     /// エージェント起動・コマンドパレット・稼働数表示)。
-    pub(super) fn top_bar_agent_controls(
+    pub(super) fn top_bar_secondary_controls(
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
-        density: TopBarDensity,
         cmds: &mut Vec<Cmd>,
     ) {
-        let compact = density.compact();
         // 実行中の対応エージェントを一括で権限モード切替
         if self.agents.running_count() > 0
             && ui
-                .button(
-                    RichText::new(if compact {
-                        "🛡".to_string()
-                    } else {
-                        tr("🛡 全切替")
-                    })
-                    .color(theme.ok),
-                )
+                .button(RichText::new(tr("🛡 全切替")).color(theme.ok))
                 .on_hover_text(tr(
                     "実行中の Claude/Codex/Antigravity に権限モード切替を送信します。\n\
                      Claude/Antigravity は Shift+Tab、Codex は /permissions を送ります",
@@ -1072,43 +1081,31 @@ impl ZaivernApp {
         }
 
         // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り。
-        // **いちばん狭いときは出さない** — 重なって読めないより出さない方が事故が
-        // 少ない (⌘P のコマンドパレットから同じ切替ができる)。
+        // 短いラベルでモード名を常時表示する。
         let mode = self.cfg.approval_mode.as_str();
         let (ap_label, next_mode, highlight) = match mode {
             "auto" => (
-                RichText::new(tr("⚡ 既定:全自動"))
+                RichText::new(tr("toolbar.approval.auto"))
                     .color(theme.warn)
                     .strong(),
                 "agent",
                 true,
             ),
             "agent" => (
-                RichText::new(tr("👾 既定:Agent優先"))
+                RichText::new(tr("toolbar.approval.agent"))
                     .color(theme.ok)
                     .strong(),
                 "ask",
                 true,
             ),
             _ => (
-                RichText::new(tr("🛡 既定:承認")).color(theme.ok),
+                RichText::new(tr("toolbar.approval.ask")).color(theme.ok),
                 "auto",
                 false,
             ),
         };
-        if density != TopBarDensity::Overflow {
-            // 狭いときは絵文字だけ残す (色と絵文字でモードは判別できる)
-            let ap_label = if compact {
-                let icon: String = ap_label.text().chars().take(1).collect();
-                RichText::new(icon).color(match mode {
-                    "auto" => theme.warn,
-                    "agent" => theme.ok,
-                    _ => theme.ok,
-                })
-            } else {
-                ap_label
-            };
-            let perm_btn = ui.selectable_label(highlight, ap_label);
+        {
+            let perm_btn = ui.selectable_label(highlight, ap_label.size(11.0));
             tutorial::anchor(ui.ctx(), AnchorId::PermissionMode, perm_btn.rect);
             if perm_btn
             .on_hover_text(tr(
@@ -1124,11 +1121,10 @@ impl ZaivernApp {
             cmds.push(Cmd::SetApproval(next_mode.into()));
         }
         }
+    }
 
-        let cockpit = ui.selectable_label(
-            self.cockpit,
-            RichText::new(if compact { "🎛" } else { "🎛 Cockpit" }),
-        );
+    fn top_bar_view_controls(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let cockpit = ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit").size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::CockpitButton, cockpit.rect);
         if cockpit
             .on_hover_text(trf(
@@ -1140,14 +1136,7 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleCockpit);
         }
 
-        let kanban = ui.selectable_label(
-            self.kanban,
-            RichText::new(if compact {
-                "📋".to_string()
-            } else {
-                tr("📋 看板")
-            }),
-        );
+        let kanban = ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")).size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::KanbanButton, kanban.rect);
         if kanban
             .on_hover_text(trf(
@@ -1161,14 +1150,7 @@ impl ZaivernApp {
 
         // エージェントデッキ (縦 1 本)。Cockpit=格子 / 看板=レーン と並べて
         // 「もう 1 つの見方」として同じ場所から選べるようにする。
-        let deck = ui.selectable_label(
-            self.deck,
-            RichText::new(if compact {
-                "▤".to_string()
-            } else {
-                tr("▤ デッキ")
-            }),
-        );
+        let deck = ui.selectable_label(self.deck, RichText::new(tr("▤ デッキ")).size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::DeckButton, deck.rect);
         if deck
             .on_hover_text(trf(
@@ -1182,85 +1164,92 @@ impl ZaivernApp {
 
         // 🗒 変更一覧 — 「どのファイルのどの行が変わったか」を一望する中央ビュー。
         // Cockpit / 看板 / デッキと同じ場所に並べる (中央ビューの入口を 1 か所に集める)。
-        let changes = ui.selectable_label(
-            self.changes,
-            RichText::new(if compact {
-                "🗒".to_string()
-            } else {
-                tr("🗒 変更")
-            }),
-        );
+        let changes = ui.selectable_label(self.changes, RichText::new(tr("🗒 変更")).size(11.5));
         if changes
             .on_hover_text(tr("変更一覧 — 未コミットの変更を「どのファイルのどの行」で一望する\n行をクリックするとその場所へ飛べます"))
             .clicked()
         {
             cmds.push(Cmd::ToggleChanges);
         }
+    }
 
+    pub(super) fn top_bar_primary_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        density: TopBarDensity,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        let compact = density.compact();
         let new_agent = ui.menu_button(if compact { "👾＋" } else { "👾 Agent ＋" }, |ui| {
-            for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
-                if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
-                    cmds.push(Cmd::NewAgent(i));
-                    ui.close_menu();
-                }
-            }
-            // ── worktree 隔離で起動 ────────────────────────────────
-            // 同じ作業ツリーを共有させないので、ファイルの取り合いが起きない。
-            // worktree は git の機能なので、git リポジトリでなければ選べない
-            // (理由はホバーで出す — 押せないボタンを無言で置かない)。
-            ui.separator();
-            let isolated_label = tr("🌿 worktree 隔離で起動…");
-            if worktree::looks_like_git_repo(&self.agent_cwd()) {
-                let m = ui.menu_button(isolated_label, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("zv-new-agent-scroll")
+                .max_height(top_bar_menu_height(ui.ctx().screen_rect().height()))
+                .show(ui, |ui| {
                     for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
                         if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
-                            cmds.push(Cmd::NewAgentIsolated(i));
+                            cmds.push(Cmd::NewAgent(i));
                             ui.close_menu();
                         }
                     }
-                });
-                m.response.on_hover_text(tr(
-                    "このエージェント専用の git worktree (ブランチ agent/…) を切って、\n\
+                    // ── worktree 隔離で起動 ────────────────────────────────
+                    // 同じ作業ツリーを共有させないので、ファイルの取り合いが起きない。
+                    // worktree は git の機能なので、git リポジトリでなければ選べない
+                    // (理由はホバーで出す — 押せないボタンを無言で置かない)。
+                    ui.separator();
+                    let isolated_label = tr("🌿 worktree 隔離で起動…");
+                    if worktree::looks_like_git_repo(&self.agent_cwd()) {
+                        let m = ui.menu_button(isolated_label, |ui| {
+                            for (i, p) in self.cfg.agents.clone().into_iter().enumerate() {
+                                if ui.button(format!("{} {}", p.icon, p.name)).clicked() {
+                                    cmds.push(Cmd::NewAgentIsolated(i));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        m.response.on_hover_text(tr(
+                            "このエージェント専用の git worktree (ブランチ agent/…) を切って、\n\
                      そこを作業フォルダにして起動します。他のエージェントと\n\
                      同じファイルを取り合いません",
-                ));
-            } else {
-                ui.add_enabled(false, egui::Button::new(isolated_label))
-                    .on_disabled_hover_text(tr(
-                        "このフォルダは git リポジトリではないので worktree を作れません",
-                    ));
-            }
-            // 稼働中が 1 体も居ないときは 1 行も使わない (常に出るだけのボタンを作らない)。
-            if self.agents.running_count() > 0
-                && ui
-                    .button(tr("🛑 全エージェントを停止…"))
-                    .on_hover_text(tr(
-                        "稼働中のエージェントをプロセスツリーごと止めます（確認あり）",
-                    ))
-                    .clicked()
-            {
-                cmds.push(Cmd::StopAllAgents);
-                ui.close_menu();
-            }
+                        ));
+                    } else {
+                        ui.add_enabled(false, egui::Button::new(isolated_label))
+                            .on_disabled_hover_text(tr(
+                                "このフォルダは git リポジトリではないので worktree を作れません",
+                            ));
+                    }
+                    // 稼働中が 1 体も居ないときは 1 行も使わない (常に出るだけのボタンを作らない)。
+                    if self.agents.running_count() > 0
+                        && ui
+                            .button(tr("🛑 全エージェントを停止…"))
+                            .on_hover_text(tr(
+                                "稼働中のエージェントをプロセスツリーごと止めます（確認あり）",
+                            ))
+                            .clicked()
+                    {
+                        cmds.push(Cmd::StopAllAgents);
+                        ui.close_menu();
+                    }
 
-            ui.separator();
-            // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
-            if ui
-                .button(tr("📋 フリート看板 — 全員の状況を俯瞰"))
-                .on_hover_text(tr("エージェントをカンバン方式で指揮統制する画面を開く"))
-                .clicked()
-            {
-                cmds.push(Cmd::ToggleKanban);
-                ui.close_menu();
-            }
-            if ui
-                .button(tr("➕ エージェントを追加…"))
-                .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
-                .clicked()
-            {
-                cmds.push(Cmd::OpenAgentPicker);
-                ui.close_menu();
-            }
+                    ui.separator();
+                    // エージェントと同じ場所から呼び出せる「指揮統制の看板」。
+                    if ui
+                        .button(tr("📋 フリート看板 — 全員の状況を俯瞰"))
+                        .on_hover_text(tr("エージェントをカンバン方式で指揮統制する画面を開く"))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::ToggleKanban);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button(tr("➕ エージェントを追加…"))
+                        .on_hover_text(tr("対応している CLI エージェントの一覧から選んで足す"))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::OpenAgentPicker);
+                        ui.close_menu();
+                    }
+                });
         });
         tutorial::anchor(ui.ctx(), AnchorId::NewAgentButton, new_agent.response.rect);
         new_agent.response.on_hover_text(trf(

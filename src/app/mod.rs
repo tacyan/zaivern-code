@@ -1198,21 +1198,21 @@ fn cockpit_header_compact(avail_w: f32) -> bool {
 
 /// トップバー左側 (ロゴ + VS Code 準拠の 8 メニュー + ブランチ) のおおよその幅。
 /// 右側のボタン群がここへ食い込むと、メニューの文字と重なって両方読めなくなる。
-const TOP_BAR_LEFT_W: f32 = 620.0;
+const TOP_BAR_LEFT_W: f32 = 700.0;
 /// 右側ボタン群をラベル付きで並べるのに要る幅。
-const TOP_BAR_RIGHT_W: f32 = 470.0;
+const TOP_BAR_RIGHT_W: f32 = 900.0;
 
 /// アイコンだけに縮めた右側ボタン群の幅。
-const TOP_BAR_RIGHT_ICON_W: f32 = 430.0;
+const TOP_BAR_RIGHT_ICON_W: f32 = 350.0;
 
 /// トップバー右側の密度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopBarDensity {
-    /// ラベル付き
+    /// メニューバーと主要操作、承認モード、表示切替を並べる。
     Full,
-    /// アイコンだけ
+    /// Agent 追加を短く表示する。表示切替と各アイコンは残す。
     Compact,
-    /// アイコンだけ + 装飾系 (テーマ/リモート/音声/ペット) を「⋯」へ畳む
+    /// 8 個のメニューを畳み、表示切替と各アイコンを常時見える2段目へ並べる。
     Overflow,
 }
 
@@ -1225,10 +1225,8 @@ impl TopBarDensity {
 
 /// トップバー右側の密度を決める (純関数)。
 ///
-/// 実際に起きていた不具合: 900px 幅で「実行 / ターミナル / ヘルプ」の上に
-/// 「看板」「Cockpit」「既定:承認」が**重なって**描かれ、どちらも読めない。
-/// egui の `right_to_left` は残り幅が足りなくても縮めてくれないので、
-/// 入る形かどうかをこちらで決める。
+/// 標準の文字サイズでの幅予算。長い翻訳や文字拡大で予算を超えた場合も、
+/// 描画側は順次配置と横スクロールを使い、メニュー同士を重ねない。
 fn top_bar_density(bar_w: f32) -> TopBarDensity {
     if bar_w >= TOP_BAR_LEFT_W + TOP_BAR_RIGHT_W {
         TopBarDensity::Full
@@ -1237,6 +1235,24 @@ fn top_bar_density(bar_w: f32) -> TopBarDensity {
     } else {
         TopBarDensity::Overflow
     }
+}
+
+/// 長いブランチ名が操作領域を占有しないようにする。全名はホバーに残す。
+fn top_bar_branch_label(branch: &str) -> String {
+    const MAX_CHARS: usize = 14;
+    if branch.chars().count() <= MAX_CHARS {
+        branch.to_string()
+    } else {
+        format!(
+            "{}…",
+            branch.chars().take(MAX_CHARS - 1).collect::<String>()
+        )
+    }
+}
+
+/// 上部バーのポップアップは画面の上下に余白を残してスクロールする。
+fn top_bar_menu_height(screen_height: f32) -> f32 {
+    (screen_height - 80.0).clamp(0.0, 420.0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

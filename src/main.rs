@@ -1,4 +1,5 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Windows でも CLI の入出力とシェルの終了待ちを維持する。
+// GUI は CLI 判定後にコンソールなしの子プロセスへ引き継ぐ。
 
 mod acp;
 mod agent_input;
@@ -108,6 +109,10 @@ mod tutorial;
 mod voice;
 mod whats_new;
 mod whichkey;
+#[cfg(windows)]
+mod windows_startup;
+#[cfg(windows)]
+mod windows_update;
 mod worktree;
 mod zoom;
 
@@ -140,6 +145,9 @@ fn load_icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    let (gui_child, args) = windows_startup::take_gui_marker(args);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if std::env::args().nth(1).as_deref() == Some("--zai-internal-writer-supervisor") {
         terminal::writer_tree::unix::entry();
@@ -164,9 +172,19 @@ fn main() -> eframe::Result<()> {
 
     // サブコマンド指定なら CLI として処理して終了する。
     // 引数なし / パス指定のときは None が返り、そのまま GUI 起動へ進む。
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = cli::try_run_cli(&args) {
+    #[cfg(not(windows))]
+    let gui_child = false;
+    if let Some(code) = (!gui_child).then(|| cli::try_run_cli(&args)).flatten() {
         std::process::exit(code);
+    }
+    #[cfg(windows)]
+    if !gui_child {
+        // team run のような CLI → GUI 経路も、CLI の副作用は一度だけ実行する。
+        if let Err(error) = windows_startup::spawn_gui(&args) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // 子プロセスへ渡す PATH の解決を先に走らせておく。macOS の `.app` 起動では

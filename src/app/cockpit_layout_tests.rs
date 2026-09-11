@@ -357,7 +357,7 @@ fn メディアカードは狭いとボタンを縦へ積む() {
 /// 900px 幅で「実行 / ターミナル / ヘルプ」の上に「看板」「Cockpit」
 /// 「既定:承認」が重なって描かれていた (どちらも読めない)。
 #[test]
-fn トップバーは狭いとアイコンだけになる() {
+fn トップバーは狭いと常時表示の操作を二段に分ける() {
     // 900px: メニューバー + アイコン列でも入らないので装飾系を「⋯」へ畳む
     assert_eq!(top_bar_density(900.0), TopBarDensity::Overflow);
     assert!(top_bar_density(900.0).compact());
@@ -375,8 +375,8 @@ fn トップバーは狭いとアイコンだけになる() {
     );
     assert_eq!(
         top_bar_density(1400.0),
-        TopBarDensity::Full,
-        "1400px はそのまま"
+        TopBarDensity::Compact,
+        "1400px でも補助操作はもっと見るへ移す"
     );
     assert!(!top_bar_density(2560.0).compact());
     // 幅が広がるほど密度が下がることはない (単調)
@@ -393,6 +393,22 @@ fn トップバーは狭いとアイコンだけになる() {
         assert!(cur >= prev, "w={w}: 幅が広いのに密度が下がった");
         prev = cur;
     }
+}
+
+#[test]
+fn トップバーの長いブランチ名と短い画面を扱える() {
+    assert_eq!(top_bar_branch_label("main"), "main");
+    assert_eq!(top_bar_branch_label("12345678901234"), "12345678901234");
+    assert_eq!(top_bar_branch_label("123456789012345"), "1234567890123…");
+    let cjk = top_bar_branch_label("機能改善のためのとても長いブランチ名");
+    assert_eq!(cjk.chars().count(), 14);
+    assert!(cjk.ends_with('…'));
+    for height in [0.0_f32, 80.0, 240.0, 480.0, 768.0, 1080.0] {
+        let menu = top_bar_menu_height(height);
+        assert!(menu >= 0.0 && menu <= height);
+        assert!(menu <= 420.0);
+    }
+    assert_eq!(top_bar_menu_height(240.0), 160.0);
 }
 
 /// **中央ビューは常に 1 つだけ。**

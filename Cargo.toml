@@ -81,9 +81,9 @@ ed25519-dalek = "3"
 # ライセンスキーの Base64URL 部分。0.22 は syntect → plist 経由で既にロックへ
 # 入っているため、直接依存にしても依存グラフは 1 つも増えない。
 base64 = "0.23"
-# Cloud Execution の Provider API (Hetzner 等) を叩く**同期**の HTTP client。
-# 呼ぶのは `src/features/cloud_execution/provider/http.rs` の 1 ファイルだけで、
-# 番人テスト (`ureqの名前はこのファイルにしか出ない`) がそれを強制する。
+# Cloud Execution の Provider API と Windows の更新情報取得に使う同期 HTTP client。
+# Cloud 内の呼び出しは provider/http.rs に集約する。Windows CLI も同じ依存を使い、
+# セキュリティ製品が zai.exe 自体の通信を識別できるようにする。
 #   * **同期**。Cloud API のためだけに tokio ランタイムを持ち込まない
 #   * 純 Rust + rustls。ネイティブの OpenSSL も実行時ダウンロードも要らず、
 #     素の `cargo build` が macOS / Windows / Linux で通る
@@ -114,6 +114,8 @@ libc = "0.2"
 #   * `trash` クレートは採らない: macOS でゴミ箱の中のパスを返さないため
 #     「削除の取り消し」が作れない (自前実装なら戻り先が分かる)
 [target.'cfg(windows)'.dependencies]
+# Windows の証明書ストアを使い、Norton 等の HTTPS 検査下でも検証を維持する。
+ureq = { version = "3.4.0", default-features = false, features = ["platform-verifier"] }
 # Win32_Globalization は `GetUserDefaultLocaleName` (UI 表示言語の自動判定)。
 # Windows は言語を環境変数へ置かないので、これが無いと `auto` が
 # **Windows でだけ**効かない (macOS/Linux では気付けない壊れ方をする)。

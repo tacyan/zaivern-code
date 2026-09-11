@@ -89,6 +89,35 @@ const RULE_DESC: &str = "Zaivern Code phone remote (LAN only, token required)";
 pub const PORT_FROM: u16 = 8899;
 pub const PORT_TO: u16 = 8919;
 
+/// セキュリティ製品のファイル選択で使う、実行中のアプリの保存先を開く。
+/// パスをシェルのコマンド文字列に埋め込まない。
+pub fn open_app_folder(exe: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let directory = std::path::Path::new(exe)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing executable directory",
+                )
+            })?;
+        crate::procx::hidden_command("explorer.exe")
+            .arg(directory)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows only",
+        ))
+    }
+}
+
 /// 受信許可の状態。[`Report::problems`] が空でない間、スマホからは繋がらない。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -895,6 +924,8 @@ pub fn run(args: &[String]) -> i32 {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Busy {
     Check,
+    /// この実行ファイル自身で外向きの HTTPS 通信を行う。
+    DetectApp,
     Allow,
     Revoke,
     /// 「すべての受信接続をブロックする」の解除。
@@ -907,13 +938,21 @@ pub enum Busy {
 #[derive(Default)]
 pub struct FirewallUi {
     report: Option<Report>,
-    rx: Option<mpsc::Receiver<Result<Report, String>>>,
+    rx: Option<mpsc::Receiver<Result<FirewallResult, String>>>,
     busy: Option<Busy>,
     started: bool,
     /// 直前の操作のエラー (成功時は None)。
     pub error: Option<String>,
     /// 直前の操作が成功したときのメッセージ (トースト用に取り出す)。
     pub done: Option<String>,
+}
+
+// 非 Windows では受信処理だけがコンパイルされ、これを生成する worker は存在しない
+// (テストは `Detected` しか作らないので、`Report` は test でも未構築のまま)。
+#[cfg_attr(not(windows), allow(dead_code))]
+enum FirewallResult {
+    Report(Report),
+    Detected,
 }
 
 impl FirewallUi {
@@ -929,6 +968,10 @@ impl FirewallUi {
     /// もう一度調べ直す。
     pub fn recheck(&mut self) {
         self.spawn(Busy::Check);
+    }
+
+    pub fn detect_app(&mut self) {
+        self.spawn(Busy::DetectApp);
     }
 
     /// 受信を許可する (UAC の確認が出る)。
@@ -960,12 +1003,14 @@ impl FirewallUi {
                 .name("zv-firewall".into())
                 .spawn(move || {
                     let r = match what {
-                        Busy::Check => check_now(),
+                        Busy::Check => check_now().map(FirewallResult::Report),
+                        Busy::DetectApp => crate::cli::check_distribution_connection()
+                            .map(|()| FirewallResult::Detected),
                         // プロファイルは allow_now が「いまの」ネットワークから
                         // 決める (画面の状態は古いことがある)。
-                        Busy::Allow => allow_now(),
-                        Busy::Revoke => revoke_now(),
-                        Busy::Unblock => unblock_now(),
+                        Busy::Allow => allow_now().map(FirewallResult::Report),
+                        Busy::Revoke => revoke_now().map(FirewallResult::Report),
+                        Busy::Unblock => unblock_now().map(FirewallResult::Report),
                     };
                     let _ = tx.send(r);
                 });
@@ -977,7 +1022,13 @@ impl FirewallUi {
     pub fn poll(&mut self) -> bool {
         let Some(rx) = &self.rx else { return false };
         match rx.try_recv() {
-            Ok(Ok(report)) => {
+            Ok(Ok(FirewallResult::Detected)) => {
+                self.busy = None;
+                self.rx = None;
+                self.done = Some(tr("remote.detect_app_done"));
+                true
+            }
+            Ok(Ok(FirewallResult::Report(report))) => {
                 let what = self.busy.take();
                 self.rx = None;
                 // 「許可しました」は **本当に繋がる状態になったときだけ** 出す。
@@ -1064,6 +1115,34 @@ impl FirewallUi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detection_completion_does_not_claim_or_replace_firewall_permission() {
+        for successful in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let mut ui = FirewallUi {
+                report: Some(Report {
+                    blocked: true,
+                    ..Default::default()
+                }),
+                rx: Some(rx),
+                busy: Some(Busy::DetectApp),
+                ..Default::default()
+            };
+            tx.send(if successful {
+                Ok(FirewallResult::Detected)
+            } else {
+                Err("connection failed".into())
+            })
+            .unwrap();
+            assert!(ui.poll());
+            assert!(ui.report().unwrap().blocked);
+            assert!(!ui.report().unwrap().allowed);
+            assert!(ui.busy().is_none());
+            assert_eq!(ui.done.is_some(), successful);
+            assert_eq!(ui.error.is_some(), !successful);
+        }
+    }
+
     /// 位置プレースホルダの埋め方を表で固定する (`desktop.rs` と対の複製)。
     /// 訳文は外部ファイルから来るので、`{}` の数が原文と食い違いうる。
     #[test]

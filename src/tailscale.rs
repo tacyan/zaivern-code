@@ -57,6 +57,10 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 /// MagicDNS の固定アドレス。tailnet が上がっているときだけ経路がある。
@@ -357,11 +361,8 @@ pub const HTTPS_OFF_HINT: &str = "tailnet の HTTPS 公開 (tailscale serve) を
 
 /// 1 回目の接続だけ遅い / 失敗することの説明。
 ///
-/// **これを出さないと「繋がらない」と判断されて終わる。** Tailscale は
-/// 最初の接続で Let's Encrypt へ証明書を取りに行くので、そこだけ待ちがある
-/// (実測: 温めずに叩くと 1 回目の TLS ハンドシェイクが失敗し、2 回目は 34ms)。
-pub const FIRST_CONNECT_NOTE: &str = "※ 最初の 1 回だけ証明書の取得で待つことがあります\n\u{3000}\
-     (失敗したらもう一度読み込んでください。2 回目からは一瞬です)";
+/// 証明書取得を待つ理由と、失敗時の再試行を案内する安定 ID。
+pub const FIRST_CONNECT_NOTE: &str = "remote.https_certificate_wait";
 
 // ─── 画面から毎フレーム読むための薄いキャッシュ ──────────────────────
 
@@ -582,6 +583,17 @@ struct CliOut {
 }
 
 impl CliOut {
+    // cert の stdout は秘密鍵を含む。失敗時にも表示へ流さない。
+    fn certificate_result(self) -> Result<(), String> {
+        if self.ok {
+            Ok(())
+        } else if self.stderr.trim().is_empty() {
+            Err(crate::i18n::tr("remote.https_certificate_failed"))
+        } else {
+            Err(self.stderr.trim().to_string())
+        }
+    }
+
     /// 画面に出す「そのままの出力」。stderr を先に置く (理由はそちらにある)。
     fn message(&self) -> String {
         let mut s = String::new();
@@ -752,10 +764,7 @@ pub fn serve_https_off() -> Result<(), HttpsBlock> {
 
 /// 証明書を先に取りに行く (**1 回目だけ Let's Encrypt との往復がある**)。
 ///
-/// 温めずに QR を出すと、**利用者の最初の 1 接続がエラーになる** (実測:
-/// 1 回目の TLS ハンドシェイクが失敗し、2 回目から 34ms)。
-/// ここは失敗しても致命ではない — serve は立っているので、ブラウザ側の
-/// ハンドシェイクが同じことをやり直す。だから戻り値は警告として扱う。
+/// 取得できなければ HTTPS の準備失敗として扱い、URL を配らない。
 ///
 /// `--cert-file -` / `--key-file -` は**標準出力へ出すだけでディスクに書かない**
 /// (実物の `tailscale cert --help` で確認済み。既定は `DOMAIN.crt` を
@@ -767,11 +776,7 @@ pub fn warm_cert(domain: &str) -> Result<(), String> {
         &["cert", "--cert-file", "-", "--key-file", "-", domain],
         CERT_BUDGET,
     )?;
-    if out.ok {
-        Ok(())
-    } else {
-        Err(out.message())
-    }
+    out.certificate_result()
 }
 
 // ─── 裏のスレッドで回す係 (UI は 1 度も待たない) ─────────────────────
@@ -804,16 +809,21 @@ impl HttpsBusy {
 /// 裏のスレッドが返す結果。
 #[derive(Clone, Debug)]
 pub enum HttpsDone {
-    /// 使えるようになった。`warn` は証明書の先取りに失敗したときだけ付く
-    /// (serve は立っているので、最初の 1 接続が遅くなるだけ)。
-    On {
-        domain: String,
-        warn: Option<String>,
-    },
+    /// 証明書の取得と Serve 設定が成功した。
+    On { domain: String },
     /// 公開をやめた
     Off,
     /// できなかった。理由は 4 通りに分かれている
     Blocked(HttpsBlock),
+}
+
+impl HttpsDone {
+    fn after_certificate(domain: String, certificate: Result<(), String>) -> Self {
+        match certificate {
+            Ok(()) => Self::On { domain },
+            Err(error) => Self::Blocked(HttpsBlock::Failed(error)),
+        }
+    }
 }
 
 /// HTTPS の入り切りを**裏のスレッド**で回す係。
@@ -832,7 +842,9 @@ pub struct Https {
     /// この起動で 1 度でも serve を立てたか。
     /// **終了時に撃つかどうかの判断がこれ 1 つで決まる** (立てていなければ
     /// 何もしない = 利用者の tailnet を勝手に触らない)。
-    touched: bool,
+    touched: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    stop_pending: bool,
 }
 
 impl Https {
@@ -842,12 +854,41 @@ impl Https {
     }
 
     /// serve が向いているドメイン (立っている間だけ)。
-    pub fn domain(&self) -> Option<&str> {
+    #[cfg(test)]
+    fn domain(&self) -> Option<&str> {
         self.domain.as_deref()
+    }
+
+    /// 証明書取得・解除の失敗後でも、所有している Serve の解除操作を残す。
+    pub fn needs_cleanup(&self) -> bool {
+        self.touched.load(Ordering::Acquire)
     }
 
     /// `port` を tailnet の HTTPS 前面に載せる。**すぐ戻る**。
     pub fn start(&mut self, port: u16) {
+        self.start_with(move |touched, stx| {
+            match https_domain() {
+                Err(e) => HttpsDone::Blocked(e),
+                Ok(domain) => match serve_https_on(port) {
+                    Err(e) => HttpsDone::Blocked(e),
+                    Ok(()) => {
+                        // UI が完了を poll する前から後片付けの対象にする。
+                        touched.store(true, Ordering::Release);
+                        let _ = stx.send(HttpsBusy::Warming);
+                        let certificate = warm_cert(&domain);
+                        HttpsDone::after_certificate(domain, certificate)
+                    }
+                },
+            }
+        });
+    }
+
+    fn start_with(
+        &mut self,
+        task: impl FnOnce(Arc<AtomicBool>, std::sync::mpsc::Sender<HttpsBusy>) -> HttpsDone
+            + Send
+            + 'static,
+    ) {
         if self.busy.is_some() {
             return;
         }
@@ -856,47 +897,64 @@ impl Https {
         self.busy = Some(HttpsBusy::Starting);
         self.rx = Some(rx);
         self.stage_rx = Some(srx);
-        let _ = std::thread::Builder::new()
+        self.stop_pending = false;
+        let touched = Arc::clone(&self.touched);
+        let fail_tx = tx.clone();
+        match std::thread::Builder::new()
             .name("zv-ts-https".into())
             .spawn(move || {
-                let msg = match https_domain() {
-                    Err(e) => HttpsDone::Blocked(e),
-                    Ok(domain) => match serve_https_on(port) {
-                        Err(e) => HttpsDone::Blocked(e),
-                        Ok(()) => {
-                            // ここから先は「立っている」。温めは失敗しても続ける
-                            let _ = stx.send(HttpsBusy::Warming);
-                            let warn = warm_cert(&domain).err();
-                            HttpsDone::On { domain, warn }
-                        }
-                    },
-                };
+                let msg = task(touched, stx);
                 let _ = tx.send(msg);
-            });
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(e) => {
+                let _ = fail_tx.send(HttpsDone::Blocked(HttpsBlock::Failed(e.to_string())));
+            }
+        }
     }
 
     /// 公開をやめる。**すぐ戻る**。
     pub fn stop(&mut self) {
         if self.busy.is_some() {
+            if self.busy != Some(HttpsBusy::Stopping) {
+                self.stop_pending = true;
+            }
+            return;
+        }
+        if !self.touched.load(Ordering::Acquire) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.busy = Some(HttpsBusy::Stopping);
         self.rx = Some(rx);
         self.stage_rx = None;
-        let _ = std::thread::Builder::new()
+        let touched = Arc::clone(&self.touched);
+        let fail_tx = tx.clone();
+        match std::thread::Builder::new()
             .name("zv-ts-https-off".into())
             .spawn(move || {
                 let msg = match serve_https_off() {
-                    Ok(()) => HttpsDone::Off,
+                    Ok(()) => {
+                        touched.store(false, Ordering::Release);
+                        HttpsDone::Off
+                    }
                     Err(e) => HttpsDone::Blocked(e),
                 };
                 let _ = tx.send(msg);
-            });
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(e) => {
+                let _ = fail_tx.send(HttpsDone::Blocked(HttpsBlock::Failed(e.to_string())));
+            }
+        }
     }
 
     /// 毎フレーム呼ぶ。終わっていれば 1 度だけ結果を返す。
     pub fn poll(&mut self) -> Option<HttpsDone> {
+        self.poll_with(Self::stop)
+    }
+
+    fn poll_with(&mut self, stop: impl FnOnce(&mut Self)) -> Option<HttpsDone> {
         if let Some(rx) = self.stage_rx.as_ref() {
             if let Ok(s) = rx.try_recv() {
                 self.busy = Some(s);
@@ -910,7 +968,6 @@ impl Https {
         match &msg {
             HttpsDone::On { domain, .. } => {
                 self.domain = Some(domain.clone());
-                self.touched = true;
             }
             HttpsDone::Off => self.domain = None,
             // 立てようとして断られたなら、立っていない。
@@ -922,25 +979,38 @@ impl Https {
                 }
             }
         }
+        if std::mem::take(&mut self.stop_pending) && self.touched.load(Ordering::Acquire) {
+            stop(self);
+            // 接続先を変えた後の On を UI に渡さない。
+            return None;
+        }
         Some(msg)
     }
 
     /// 終了時の後片付け。**この起動で立てたときだけ**撃つ。
     ///
-    /// 終了処理なので同期で待つが、時限は [`CLI_BUDGET`] で頭打ちになる
-    /// (立てていなければシステムコール 1 つも撃たない)。
+    /// 準備中ならその時限付き処理が終わってから解除する。最大で準備の
+    /// CLI 2 回 + 証明書取得 + 解除 CLI 1 回の上限となる。
     pub fn cleanup_on_exit(&mut self) {
-        if !self.touched {
+        self.cleanup_with(serve_https_off);
+    }
+
+    fn cleanup_with(&mut self, stop: impl FnOnce() -> Result<(), HttpsBlock>) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if !self.touched.load(Ordering::Acquire) {
             return;
         }
-        self.touched = false;
-        self.domain = None;
-        if let Err(e) = serve_https_off() {
+        if let Err(e) = stop() {
             eprintln!(
                 "tailnet の HTTPS 公開を解除できませんでした: {:?}\n手で解除するには: tailscale {}",
                 e,
                 serve_off_args().join(" ")
             );
+        } else {
+            self.touched.store(false, Ordering::Release);
+            self.domain = None;
         }
     }
 }
@@ -948,6 +1018,120 @@ impl Https {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_failure_keeps_url_hidden_and_cleanup_available_then_can_retry() {
+        let mut https = Https::default();
+        for succeeds in [false, true] {
+            https.start_with(move |touched, _| {
+                touched.store(true, Ordering::Release);
+                HttpsDone::after_certificate(
+                    "test.example.ts.net".into(),
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err("certificate unavailable".into())
+                    },
+                )
+            });
+            https.worker.take().unwrap().join().unwrap();
+            let result = https
+                .poll_with(|_| panic!("no stop was requested"))
+                .unwrap();
+            assert_eq!(matches!(result, HttpsDone::On { .. }), succeeds);
+            assert_eq!(https.domain().is_some(), succeeds);
+            assert!(https.needs_cleanup());
+            assert!(https.busy().is_none());
+        }
+        https.cleanup_with(|| Ok(()));
+        assert!(!https.needs_cleanup());
+    }
+
+    #[test]
+    fn certificate_errors_never_expose_private_key_stdout() {
+        for stderr in ["", "certificate request failed"] {
+            let error = CliOut {
+                ok: false,
+                stdout: "-----BEGIN PRIVATE KEY-----\nsecret".into(),
+                stderr: stderr.into(),
+            }
+            .certificate_result()
+            .unwrap_err();
+            assert!(!error.contains("PRIVATE KEY"));
+            assert!(!error.contains("secret"));
+            assert!(!error.is_empty());
+        }
+    }
+
+    #[test]
+    fn exit_during_start_waits_for_worker_before_removing_serve() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let mut https = Https::default();
+        https.start_with(move |touched, stage| {
+            touched.store(true, Ordering::Release);
+            stage.send(HttpsBusy::Warming).unwrap();
+            ready_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            HttpsDone::On {
+                domain: "test.example.ts.net".into(),
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(https.domain().is_none()); // UI は On をまだ受け取っていない。
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_tx.send(()).unwrap();
+            https.cleanup_with(|| {
+                stopped_tx.send(()).unwrap();
+                Ok(())
+            });
+            assert!(!https.touched.load(Ordering::Acquire));
+        });
+        cleanup_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            stopped_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        finish_tx.send(()).unwrap();
+        stopped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cleanup.join().unwrap();
+    }
+
+    #[test]
+    fn changing_transport_during_start_consumes_late_on_and_schedules_stop() {
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let mut https = Https::default();
+        https.start_with(move |touched, _| {
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            touched.store(true, Ordering::Release);
+            HttpsDone::On {
+                domain: "test.example.ts.net".into(),
+            }
+        });
+        https.stop(); // Starting 中でも解除要求を忘れない。
+        finish_tx.send(()).unwrap();
+        https.worker.take().unwrap().join().unwrap();
+        let mut stopped = false;
+        let done = https.poll_with(|state| {
+            stopped = true;
+            assert_eq!(state.domain(), Some("test.example.ts.net"));
+            assert_eq!(state.busy(), None);
+        });
+        assert!(stopped);
+        assert!(
+            done.is_none(),
+            "old HTTPS URL must not reach the new transport"
+        );
+    }
+
+    #[test]
+    fn failed_start_does_not_remove_unowned_serve_settings() {
+        let mut https = Https::default();
+        https.start_with(|_, _| HttpsDone::Blocked(HttpsBlock::NoCli));
+        https.cleanup_with(|| panic!("no serve was started by this app"));
+    }
 
     #[test]
     fn tailnet_v4は100_64から100_127まで() {
@@ -1288,7 +1472,9 @@ mod tests {
         let mut errs = Vec::new();
         let ja = crate::locale::load_one(crate::locale::SOURCE_LANG, &[], &mut errs);
         assert!(errs.is_empty(), "同梱辞書が読めない: {errs:?}");
-        let values: std::collections::HashSet<&str> = ja.values().map(|s| s.as_str()).collect();
+        // tr は安定 ID の直接検索と、既存の日本語原文の逆引きの両方を使う。
+        let values: std::collections::HashSet<&str> =
+            ja.values().chain(ja.keys()).map(|s| s.as_str()).collect();
         let missing: Vec<&str> = 画面文字列一覧()
             .into_iter()
             .filter(|s| !values.contains(*s))
@@ -1305,9 +1491,12 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/plugins/english-mode/lang");
         let dict = crate::i18n::load_dict(&dir).expect("同梱辞書が読める");
+        let mut errs = Vec::new();
+        let builtin = crate::locale::load_one("en", &[], &mut errs);
+        assert!(errs.is_empty(), "同梱辞書が読めない: {errs:?}");
         let missing: Vec<&str> = 画面文字列一覧()
             .into_iter()
-            .filter(|s| !dict.contains_key(*s))
+            .filter(|s| !dict.contains_key(*s) && !builtin.contains_key(*s))
             .collect();
         assert!(missing.is_empty(), "英語辞書に無い文字列: {missing:#?}");
     }
