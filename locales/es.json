@@ -1,4 +1,6 @@
 {
+  "remote.copy_app_name": "Copiar nombre de la aplicación para buscar",
+  "remote.norton_search_hint": "Busque “Zaivern Code” o “zai” en Norton. Introducir la ruta del exe en la búsqueda no registra la aplicación. Si no aparece, añada un programa en Control de programas y pegue la ruta inferior en el selector de archivos. Tailscale gestiona las conexiones HTTPS; compruebe también sus permisos de red.",
   "remote.install_tailscale": "Abrir la descarga oficial de Tailscale",
   "remote.norton_program_control_help": "Instrucciones para registrar la aplicación en Norton",
   "remote.open_app_folder": "Abrir carpeta de la aplicación",

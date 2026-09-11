@@ -1,4 +1,6 @@
 {
+  "remote.copy_app_name": "検索用のアプリ名をコピー",
+  "remote.norton_search_hint": "Norton の検索欄には「Zaivern Code」または「zai」を入力してください。exe のパスでは登録できません。一覧にない場合はプログラム制御のアプリ追加からファイルを選び、下のパスをファイル選択画面へ貼り付けてください。HTTPS 接続は Tailscale サービスが担当するため、Tailscale の許可も確認してください。",
   "remote.install_tailscale": "Tailscale の公式ダウンロードを開く",
   "remote.norton_program_control_help": "Norton のアプリ登録手順",
   "remote.open_app_folder": "アプリの保存先を開く",

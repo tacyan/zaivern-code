@@ -1,17 +1,25 @@
 use super::*;
 
 fn remote_connection_window<'a>(ctx: &egui::Context, open: &'a mut bool) -> egui::Window<'a> {
-    // Window 自身のスクロールを使い、中央固定でも Resize が先に高さを確保する。
-    // 画面の上下に余白を残し、内容が長い場合はウィンドウ内でスクロールする。
-    let height = ctx.available_rect().height() * 0.8;
-    egui::Window::new(tr("📱 スマホリモート"))
+    // アプリの表示領域全体を使う。タイトルと枠の分を引き、閉じる操作も画面内に保つ。
+    let screen = ctx.screen_rect();
+    let style = ctx.style();
+    let frame = egui::Frame::window(&style);
+    let title = egui::WidgetText::from(tr("📱 スマホリモート"));
+    let title_height = ctx
+        .fonts(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style)))
+        + frame.inner_margin.sum().y;
+    let content_size = (screen.size() - frame.total_margin().sum() - egui::vec2(0.0, title_height))
+        .max(egui::Vec2::ZERO);
+    egui::Window::new(title)
         .open(open)
         .collapsible(false)
         .resizable(false)
-        .default_height(height)
-        .max_height(height)
+        .frame(frame)
+        .fixed_pos(screen.min)
+        .fixed_size(content_size)
+        .constrain_to(screen)
         .vscroll(true)
-        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
 }
 
 /// **Fleet のスナップショットを読む要求か** (純関数)。
@@ -1277,7 +1285,6 @@ impl ZaivernApp {
 
         remote_connection_window(ctx, &mut open)
             .show(ctx, |ui| {
-                ui.set_width(340.0);
                 match (&url_full, &err) {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
@@ -1495,6 +1502,10 @@ impl ZaivernApp {
                             if firewall::applicable() {
                                 ui.collapsing(tr("remote.security_register_app"), |ui| {
                                     ui.label(tr("remote.security_register_hint"));
+                                    ui.label(tr("remote.norton_search_hint"));
+                                    if ui.button(tr("remote.copy_app_name")).clicked() {
+                                        ui.ctx().copy_text(crate::desktop::APP_NAME.to_string());
+                                    }
                                     ui.label(egui::RichText::new(&fw_exe).monospace());
                                     ui.horizontal_wrapped(|ui| {
                                         if ui.button(tr("📋 exe のパスをコピー")).clicked() {
@@ -2833,7 +2844,6 @@ mod remote_window_tests {
                     let mut open = true;
                     let response = super::remote_connection_window(ctx, &mut open)
                         .show(ctx, |ui| {
-                            ui.set_width(340.0);
                             // 長い接続説明と QR がある状態を再現する。
                             ui.allocate_exact_size(
                                 vec2(300.0, 1400.0),
@@ -2854,9 +2864,10 @@ mod remote_window_tests {
             }
             assert!(before.0.height() <= screen.y, "window must fit: {before:?}");
             assert!(
-                before.0.height() > screen.y * 0.65,
-                "window must not collapse to half height"
+                before.0.height() >= screen.y - 2.0 && before.0.width() >= screen.x - 2.0,
+                "window must fill the app viewport: {before:?}"
             );
+            assert!(before.0.width() <= screen.x, "window width must fit");
             assert!(
                 !before.2.contains_rect(before.1),
                 "footer initially below viewport"
