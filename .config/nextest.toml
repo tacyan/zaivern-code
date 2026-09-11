@@ -32,6 +32,11 @@ failure-output = "immediate-final"
 [test-groups]
 # 実PTYテストは同時実行するとシェル起動が競合しフレーキーになるため直列化。
 pty = { max-threads = 1 }
+# 本物の headless Chrome を起こすテスト (webcheck の撮影 / コンソール検査)。
+# 同じジョブで 2 本が同時に Chrome を立ち上げると Windows ランナーでは
+# 起動だけで 25 秒を超え、ログファイルが出る前に時間切れになっていた。
+# 直列化のコストは Chrome 1 回ぶん (数秒〜20 秒) で、他のテストとは並列のまま。
+chrome = { max-threads = 1 }
 
 [[profile.ci.overrides]]
 # 実 PTY を起動するモジュールのみ。他の terminal:: テストは並列で構わない。
@@ -41,6 +46,12 @@ test-group = "pty"
 # ハング 1 件のコストは ≤50 秒 (旧設定の 4 分から短縮)。
 slow-timeout = { period = "45s", terminate-after = 1, grace-period = "5s" }
 
+
+[[profile.ci.overrides]]
+# 本物の Chrome を起こす 2 本だけ。純粋なロジックのテスト (同じモジュール内に
+# 数本ある) は並列のままでよいので、名前で絞る。
+filter = 'test(/webcheck::console_tests::(狭い幅でも頼んだ大きさのpngになる|実際に開いてエラーを数える)$/)'
+test-group = "chrome"
 
 [[profile.ci.overrides]]
 # **実 git を何度も起こす網羅証明。** ここだけ 60 秒では足りない。

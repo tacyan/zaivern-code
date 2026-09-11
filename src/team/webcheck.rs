@@ -442,8 +442,96 @@ pub enum ConsoleVerdict {
     Errors(Vec<String>),
 }
 
-/// Chrome を待つ上限。超過は検査未完了であり、ページのエラーとは区別する。
-const CHROME_WAIT: std::time::Duration = std::time::Duration::from_secs(25);
+/// **進捗の無いまま**待つ上限。Chrome が何も書かない (stdout / stderr /
+/// ログ / PNG / プロファイルのどれも伸びない) 時間がこれを超えたら諦める。
+///
+/// 壁時計の固定値 (旧 25 秒) は遅いランナーを誤って殺していた — Windows の
+/// CI で Chrome の起動だけで 25 秒を超え、ログファイルすら作られる前に
+/// 時間切れになった (「Chrome ログを取得できません: file not found」が
+/// タイムアウトの本文に付いて出た)。起動が遅くても書き込みが続いている限り
+/// は待ち、本当に止まったときだけ切る。
+const CHROME_IDLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// それでも絶対に超えない壁時計の上限。nextest の CI プロファイル
+/// (`.config/nextest.toml` の `slow-timeout`, 60 秒) より内側に置く —
+/// 外側だと nextest がテストプロセスごと殺し、理由が 1 行も残らない。
+/// 順序 `CHROME_IDLE < CHROME_CEILING < slow-timeout` は
+/// `console_tests::時限は三段で外側ほど長い` が数で照合する。
+const CHROME_CEILING: std::time::Duration = std::time::Duration::from_secs(50);
+
+/// 待ち続けるか、諦めるか (純関数。時計を持たないので表で固定できる)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitVerdict {
+    /// まだ待つ。
+    Continue,
+    /// 進捗が [`CHROME_IDLE`] のあいだ無い。
+    Idle,
+    /// 進捗はあるが [`CHROME_CEILING`] に当たった。
+    Ceiling,
+}
+
+fn wait_verdict(elapsed: std::time::Duration, since_progress: std::time::Duration) -> WaitVerdict {
+    if elapsed > CHROME_CEILING {
+        WaitVerdict::Ceiling
+    } else if since_progress > CHROME_IDLE {
+        WaitVerdict::Idle
+    } else {
+        WaitVerdict::Continue
+    }
+}
+
+/// 「Chrome がまだ何かしている」の観測。指紋 (出力バイト数とファイルの
+/// 大きさの和) が変わった時刻を覚え、最後に変わってからの時間を答える。
+struct Progress {
+    fingerprint: u64,
+    changed_at: std::time::Instant,
+}
+
+impl Progress {
+    fn new(fingerprint: u64, now: std::time::Instant) -> Self {
+        Self {
+            fingerprint,
+            changed_at: now,
+        }
+    }
+
+    /// 指紋が変わっていれば時刻を進める。
+    fn observe(&mut self, fingerprint: u64, now: std::time::Instant) {
+        if fingerprint != self.fingerprint {
+            self.fingerprint = fingerprint;
+            self.changed_at = now;
+        }
+    }
+
+    fn since_change(&self, now: std::time::Instant) -> std::time::Duration {
+        now.saturating_duration_since(self.changed_at)
+    }
+}
+
+/// `paths` の下にあるファイルの個数と大きさを足し合わせる (深さ 2 まで)。
+/// Chrome はプロファイルの中へ起動直後から書くので、ログや PNG が出る前の
+/// 「起動中」もこれで見える。
+fn fs_fingerprint(paths: &[&Path]) -> u64 {
+    fn walk(p: &Path, depth: u8, acc: &mut u64) {
+        let Ok(meta) = std::fs::metadata(p) else { return };
+        if meta.is_file() {
+            *acc = acc.wrapping_add(1).wrapping_add(meta.len());
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        for e in rd.flatten() {
+            walk(&e.path(), depth - 1, acc);
+        }
+    }
+    let mut acc = 0u64;
+    for p in paths {
+        walk(p, 2, &mut acc);
+    }
+    acc
+}
 
 /// ページが仮想時間で進む量 (ミリ秒)。アニメーションの `requestAnimationFrame`
 /// もこの分だけ進んでから DOM を吐く。
@@ -597,6 +685,7 @@ pub fn console_errors(workspace: &Path, page: &str) -> ConsoleVerdict {
             &format!("--screenshot={}", capture.display()),
             &url,
         ],
+        &[&profile],
         // stdout の DOM 出力に依存せず、画像の書き込み完了を確認する。
         |_, _| png_complete(&capture),
     );
@@ -717,6 +806,8 @@ pub fn screenshot(
                 &format!("--screenshot={}", out.display()),
                 &target_url,
             ],
+            // PNG は profile の外 (`out`) に書かれるので、別に見張る。
+            &[&profile, out],
             // 部分書き込みでは終了させず、PNG の末尾まで確認する。
             move |_, _| png_complete(&target),
         );
@@ -782,9 +873,13 @@ fn file_url(p: &Path) -> Option<String> {
 }
 
 /// Chrome を起こし、`done(stdout, stderr)` が真になるか、自分で終わるか、
-/// 上限に当たるまで待ち、stderr を返す。**終わりは自分で作る** — headless Chrome は
+/// 時限に当たるまで待ち、stderr を返す。**終わりは自分で作る** — headless Chrome は
 /// `--dump-dom` / `--screenshot` を書いたあと自分では終わらないことがある
 /// (実測: macOS / Chrome 151。4 通りの旗で 20 秒待っても生きていた)。
+///
+/// 時限は壁時計の固定値ではなく**進捗ベース** ([`CHROME_IDLE`] /
+/// [`CHROME_CEILING`])。`watch` は Chrome が書き込む場所 (プロファイル・
+/// ログ・PNG) で、ここが伸びている限り「起動中 / 描画中」と見なして待つ。
 ///
 /// 落とすときは**プロセス群ごと** ([`crate::procx::kill_tree`] は pgid ==
 /// pid を前提にするので、unix では自分の群で起こす)。親だけ殺すと
@@ -793,6 +888,7 @@ fn file_url(p: &Path) -> Option<String> {
 fn run_chrome(
     chrome: &Path,
     args: &[&str],
+    watch: &[&Path],
     done: impl Fn(&str, &str) -> bool,
 ) -> Result<String, String> {
     use std::io::Read;
@@ -845,8 +941,14 @@ fn run_chrome(
         err_buf.clone(),
     );
     let snapshot = |b: &Arc<Mutex<String>>| b.lock().map(|s| s.clone()).unwrap_or_default();
+    let fingerprint = |out: &str, err: &str| {
+        fs_fingerprint(watch)
+            .wrapping_add(out.len() as u64)
+            .wrapping_add((err.len() as u64).wrapping_mul(0x9E37_79B9))
+    };
     let started = std::time::Instant::now();
-    let mut timed_out = false;
+    let mut progress = Progress::new(fingerprint("", ""), started);
+    let mut timed_out = None;
     let mut exit_error = None;
     loop {
         match child.try_wait() {
@@ -859,18 +961,24 @@ fn run_chrome(
             Ok(None) => {}
             Err(e) => return Err(format!("Chrome の終了を待てません: {e}")),
         }
-        if done(&snapshot(&out_buf), &snapshot(&err_buf)) {
+        let (out, err) = (snapshot(&out_buf), snapshot(&err_buf));
+        if done(&out, &err) {
             // 遅れて出るコンソール行を少しだけ待ってから落とす。
             std::thread::sleep(std::time::Duration::from_millis(700));
             crate::procx::kill_tree(child.id());
             let _ = child.wait();
             break;
         }
-        if started.elapsed() > CHROME_WAIT {
-            timed_out = true;
-            crate::procx::kill_tree(child.id());
-            let _ = child.wait();
-            break;
+        let now = std::time::Instant::now();
+        progress.observe(fingerprint(&out, &err), now);
+        match wait_verdict(now - started, progress.since_change(now)) {
+            WaitVerdict::Continue => {}
+            verdict => {
+                timed_out = Some(verdict);
+                crate::procx::kill_tree(child.id());
+                let _ = child.wait();
+                break;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -880,11 +988,21 @@ fn run_chrome(
     if let Some(why) = exit_error {
         return Err(why);
     }
-    if timed_out {
-        return Err(format!(
-            "Chrome が {} 秒以内に描き終えませんでした",
-            CHROME_WAIT.as_secs()
-        ));
+    match timed_out {
+        Some(WaitVerdict::Idle) => {
+            return Err(format!(
+                "Chrome が {} 秒間なにも書きませんでした (起動から {} 秒)",
+                CHROME_IDLE.as_secs(),
+                started.elapsed().as_secs()
+            ));
+        }
+        Some(WaitVerdict::Ceiling) => {
+            return Err(format!(
+                "Chrome が {} 秒以内に描き終えませんでした (書き込みは続いていた)",
+                CHROME_CEILING.as_secs()
+            ));
+        }
+        _ => {}
     }
     // 返すのは stderr (コンソール行の置き場)。stdout の DOM は `done` の
     // 判定にだけ使う。
@@ -990,8 +1108,86 @@ mod console_tests {
         } else {
             ("sh", &["-c", "exit 7"])
         };
-        let result = run_chrome(Path::new(program), args, |_, _| false);
+        let result = run_chrome(Path::new(program), args, &[], |_, _| false);
         assert!(result.unwrap_err().contains("異常終了"));
+    }
+
+    /// **時限は三段で、外側ほど長い**: 無進捗 < 天井 < nextest の slow-timeout。
+    /// 天井が nextest より外側だとテストプロセスごと殺されて理由が残らない。
+    /// nextest 側の値は設定ファイルから読む (写経してずれない)。
+    #[test]
+    fn 時限は三段で外側ほど長い() {
+        let toml = include_str!("../../.config/nextest.toml").replace("\r\n", "\n");
+        let ci = toml
+            .split("[profile.ci]")
+            .nth(1)
+            .and_then(|s| s.split("[test-groups]").next())
+            .expect("profile.ci がある");
+        let period = ci
+            .lines()
+            .find(|l| l.trim_start().starts_with("slow-timeout"))
+            .and_then(|l| l.split("period = \"").nth(1))
+            .and_then(|s| s.split('s').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .expect("slow-timeout の period を秒で読める");
+        assert!(CHROME_IDLE < CHROME_CEILING);
+        assert!(
+            CHROME_CEILING.as_secs() < period,
+            "天井 {}s は nextest の slow-timeout {period}s より内側に置く",
+            CHROME_CEILING.as_secs()
+        );
+    }
+
+    /// 判定は純関数で表に固定する。進捗があれば無進捗の線は動かず、
+    /// 天井だけが最後に効く。
+    #[test]
+    fn 待ちの判定は進捗があれば天井まで延びる() {
+        let s = std::time::Duration::from_secs;
+        let cases: &[(u64, u64, WaitVerdict)] = &[
+            (1, 1, WaitVerdict::Continue),
+            (CHROME_IDLE.as_secs(), CHROME_IDLE.as_secs(), WaitVerdict::Continue),
+            (CHROME_IDLE.as_secs() + 1, CHROME_IDLE.as_secs() + 1, WaitVerdict::Idle),
+            // 旧 25 秒なら死んでいた点: 起動が遅くても書き込みが続けば待つ
+            (30, 1, WaitVerdict::Continue),
+            (CHROME_CEILING.as_secs(), 0, WaitVerdict::Continue),
+            (CHROME_CEILING.as_secs() + 1, 0, WaitVerdict::Ceiling),
+            // 天井と無進捗が同時なら天井
+            (CHROME_CEILING.as_secs() + 1, CHROME_IDLE.as_secs() + 1, WaitVerdict::Ceiling),
+        ];
+        for &(elapsed, idle, want) in cases {
+            assert_eq!(wait_verdict(s(elapsed), s(idle)), want, "elapsed={elapsed} idle={idle}");
+        }
+    }
+
+    /// 指紋が変わったときだけ「最後の進捗」が進む。
+    #[test]
+    fn 進捗は指紋が変わったときだけ進む() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut p = Progress::new(10, t0);
+        let t1 = t0 + Duration::from_secs(5);
+        p.observe(10, t1);
+        assert_eq!(p.since_change(t1), Duration::from_secs(5));
+        let t2 = t0 + Duration::from_secs(9);
+        p.observe(11, t2);
+        assert_eq!(p.since_change(t2), Duration::ZERO);
+        assert_eq!(p.since_change(t2 + Duration::from_secs(3)), Duration::from_secs(3));
+    }
+
+    /// ファイルの指紋は、無い → 空のディレクトリ → 中身が増える、で単調に変わる。
+    #[test]
+    fn ファイル指紋はchromeの書き込みを映す() {
+        let dir = crate::test_util::unique_temp_dir("zaivern", "webcheck-fingerprint");
+        let missing = dir.join("missing");
+        assert_eq!(fs_fingerprint(&[&missing]), 0);
+        let empty = fs_fingerprint(&[&dir]);
+        std::fs::create_dir(dir.join("Default")).unwrap();
+        std::fs::write(dir.join("Default").join("Preferences"), "{}").unwrap();
+        let one = fs_fingerprint(&[&dir]);
+        assert_ne!(empty, one, "中身が増えたのに指紋が同じ");
+        std::fs::write(dir.join("Default").join("Preferences"), "{\"a\":1}").unwrap();
+        assert_ne!(one, fs_fingerprint(&[&dir]), "伸びたのに指紋が同じ");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
