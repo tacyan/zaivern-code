@@ -361,11 +361,8 @@ pub const HTTPS_OFF_HINT: &str = "tailnet の HTTPS 公開 (tailscale serve) を
 
 /// 1 回目の接続だけ遅い / 失敗することの説明。
 ///
-/// **これを出さないと「繋がらない」と判断されて終わる。** Tailscale は
-/// 最初の接続で Let's Encrypt へ証明書を取りに行くので、そこだけ待ちがある
-/// (実測: 温めずに叩くと 1 回目の TLS ハンドシェイクが失敗し、2 回目は 34ms)。
-pub const FIRST_CONNECT_NOTE: &str = "※ 最初の 1 回だけ証明書の取得で待つことがあります\n\u{3000}\
-     (失敗したらもう一度読み込んでください。2 回目からは一瞬です)";
+/// 証明書取得を待つ理由と、失敗時の再試行を案内する安定 ID。
+pub const FIRST_CONNECT_NOTE: &str = "remote.https_certificate_wait";
 
 // ─── 画面から毎フレーム読むための薄いキャッシュ ──────────────────────
 
@@ -586,6 +583,17 @@ struct CliOut {
 }
 
 impl CliOut {
+    // cert の stdout は秘密鍵を含む。失敗時にも表示へ流さない。
+    fn certificate_result(self) -> Result<(), String> {
+        if self.ok {
+            Ok(())
+        } else if self.stderr.trim().is_empty() {
+            Err(crate::i18n::tr("remote.https_certificate_failed"))
+        } else {
+            Err(self.stderr.trim().to_string())
+        }
+    }
+
     /// 画面に出す「そのままの出力」。stderr を先に置く (理由はそちらにある)。
     fn message(&self) -> String {
         let mut s = String::new();
@@ -756,10 +764,7 @@ pub fn serve_https_off() -> Result<(), HttpsBlock> {
 
 /// 証明書を先に取りに行く (**1 回目だけ Let's Encrypt との往復がある**)。
 ///
-/// 温めずに QR を出すと、**利用者の最初の 1 接続がエラーになる** (実測:
-/// 1 回目の TLS ハンドシェイクが失敗し、2 回目から 34ms)。
-/// ここは失敗しても致命ではない — serve は立っているので、ブラウザ側の
-/// ハンドシェイクが同じことをやり直す。だから戻り値は警告として扱う。
+/// 取得できなければ HTTPS の準備失敗として扱い、URL を配らない。
 ///
 /// `--cert-file -` / `--key-file -` は**標準出力へ出すだけでディスクに書かない**
 /// (実物の `tailscale cert --help` で確認済み。既定は `DOMAIN.crt` を
@@ -771,11 +776,7 @@ pub fn warm_cert(domain: &str) -> Result<(), String> {
         &["cert", "--cert-file", "-", "--key-file", "-", domain],
         CERT_BUDGET,
     )?;
-    if out.ok {
-        Ok(())
-    } else {
-        Err(out.message())
-    }
+    out.certificate_result()
 }
 
 // ─── 裏のスレッドで回す係 (UI は 1 度も待たない) ─────────────────────
@@ -808,16 +809,21 @@ impl HttpsBusy {
 /// 裏のスレッドが返す結果。
 #[derive(Clone, Debug)]
 pub enum HttpsDone {
-    /// 使えるようになった。`warn` は証明書の先取りに失敗したときだけ付く
-    /// (serve は立っているので、最初の 1 接続が遅くなるだけ)。
-    On {
-        domain: String,
-        warn: Option<String>,
-    },
+    /// 証明書の取得と Serve 設定が成功した。
+    On { domain: String },
     /// 公開をやめた
     Off,
     /// できなかった。理由は 4 通りに分かれている
     Blocked(HttpsBlock),
+}
+
+impl HttpsDone {
+    fn after_certificate(domain: String, certificate: Result<(), String>) -> Self {
+        match certificate {
+            Ok(()) => Self::On { domain },
+            Err(error) => Self::Blocked(HttpsBlock::Failed(error)),
+        }
+    }
 }
 
 /// HTTPS の入り切りを**裏のスレッド**で回す係。
@@ -848,8 +854,14 @@ impl Https {
     }
 
     /// serve が向いているドメイン (立っている間だけ)。
-    pub fn domain(&self) -> Option<&str> {
+    #[cfg(test)]
+    fn domain(&self) -> Option<&str> {
         self.domain.as_deref()
+    }
+
+    /// 証明書取得・解除の失敗後でも、所有している Serve の解除操作を残す。
+    pub fn needs_cleanup(&self) -> bool {
+        self.touched.load(Ordering::Acquire)
     }
 
     /// `port` を tailnet の HTTPS 前面に載せる。**すぐ戻る**。
@@ -863,8 +875,8 @@ impl Https {
                         // UI が完了を poll する前から後片付けの対象にする。
                         touched.store(true, Ordering::Release);
                         let _ = stx.send(HttpsBusy::Warming);
-                        let warn = warm_cert(&domain).err();
-                        HttpsDone::On { domain, warn }
+                        let certificate = warm_cert(&domain);
+                        HttpsDone::after_certificate(domain, certificate)
                     }
                 },
             }
@@ -1008,6 +1020,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn certificate_failure_keeps_url_hidden_and_cleanup_available_then_can_retry() {
+        let mut https = Https::default();
+        for succeeds in [false, true] {
+            https.start_with(move |touched, _| {
+                touched.store(true, Ordering::Release);
+                HttpsDone::after_certificate(
+                    "test.example.ts.net".into(),
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err("certificate unavailable".into())
+                    },
+                )
+            });
+            https.worker.take().unwrap().join().unwrap();
+            let result = https
+                .poll_with(|_| panic!("no stop was requested"))
+                .unwrap();
+            assert_eq!(matches!(result, HttpsDone::On { .. }), succeeds);
+            assert_eq!(https.domain().is_some(), succeeds);
+            assert!(https.needs_cleanup());
+            assert!(https.busy().is_none());
+        }
+        https.cleanup_with(|| Ok(()));
+        assert!(!https.needs_cleanup());
+    }
+
+    #[test]
+    fn certificate_errors_never_expose_private_key_stdout() {
+        for stderr in ["", "certificate request failed"] {
+            let error = CliOut {
+                ok: false,
+                stdout: "-----BEGIN PRIVATE KEY-----\nsecret".into(),
+                stderr: stderr.into(),
+            }
+            .certificate_result()
+            .unwrap_err();
+            assert!(!error.contains("PRIVATE KEY"));
+            assert!(!error.contains("secret"));
+            assert!(!error.is_empty());
+        }
+    }
+
+    #[test]
     fn exit_during_start_waits_for_worker_before_removing_serve() {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
@@ -1019,7 +1075,6 @@ mod tests {
             finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             HttpsDone::On {
                 domain: "test.example.ts.net".into(),
-                warn: None,
             }
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1053,7 +1108,6 @@ mod tests {
             touched.store(true, Ordering::Release);
             HttpsDone::On {
                 domain: "test.example.ts.net".into(),
-                warn: None,
             }
         });
         https.stop(); // Starting 中でも解除要求を忘れない。
@@ -1418,7 +1472,9 @@ mod tests {
         let mut errs = Vec::new();
         let ja = crate::locale::load_one(crate::locale::SOURCE_LANG, &[], &mut errs);
         assert!(errs.is_empty(), "同梱辞書が読めない: {errs:?}");
-        let values: std::collections::HashSet<&str> = ja.values().map(|s| s.as_str()).collect();
+        // tr は安定 ID の直接検索と、既存の日本語原文の逆引きの両方を使う。
+        let values: std::collections::HashSet<&str> =
+            ja.values().chain(ja.keys()).map(|s| s.as_str()).collect();
         let missing: Vec<&str> = 画面文字列一覧()
             .into_iter()
             .filter(|s| !values.contains(*s))
@@ -1435,9 +1491,12 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("assets/plugins/english-mode/lang");
         let dict = crate::i18n::load_dict(&dir).expect("同梱辞書が読める");
+        let mut errs = Vec::new();
+        let builtin = crate::locale::load_one("en", &[], &mut errs);
+        assert!(errs.is_empty(), "同梱辞書が読めない: {errs:?}");
         let missing: Vec<&str> = 画面文字列一覧()
             .into_iter()
-            .filter(|s| !dict.contains_key(*s))
+            .filter(|s| !dict.contains_key(*s) && !builtin.contains_key(*s))
             .collect();
         assert!(missing.is_empty(), "英語辞書に無い文字列: {missing:#?}");
     }

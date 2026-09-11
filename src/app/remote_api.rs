@@ -1092,7 +1092,7 @@ impl ZaivernApp {
             return;
         };
         match done {
-            tailscale::HttpsDone::On { domain, warn } => {
+            tailscale::HttpsDone::On { domain } => {
                 if !self
                     .remote
                     .as_ref()
@@ -1101,7 +1101,7 @@ impl ZaivernApp {
                     self.https.stop();
                     return;
                 }
-                // **`serve` が rc=0 で返ってからしか https の URL を配らない。**
+                // 証明書取得と Serve 設定の両方が成功してから URL を配る。
                 if let Some(r) = self.remote.as_mut() {
                     r.set_https_host(&domain);
                 }
@@ -1114,11 +1114,6 @@ impl ZaivernApp {
                     ),
                     true,
                 );
-                // 証明書の先取りに失敗しても serve は立っている。
-                // 「最初の 1 接続が遅い / 1 度失敗する」ことだけを伝える。
-                if warn.is_some() {
-                    self.toast_warn(tr(tailscale::FIRST_CONNECT_NOTE));
-                }
             }
             tailscale::HttpsDone::Off => {
                 if let Some(r) = self.remote.as_mut() {
@@ -1127,15 +1122,11 @@ impl ZaivernApp {
                 self.qr_url.clear();
             }
             tailscale::HttpsDone::Blocked(b) => {
-                // 立てられなかったのに loopback だけで待ち受け続けると
-                // **どこからも繋がらない**。同じ Wi-Fi へ戻して手を残す。
-                if self
-                    .remote
-                    .as_ref()
-                    .is_some_and(|r| r.bind == remote::Bind::TailscaleHttps)
-                {
-                    self.tunnel_err = self.rebind_remote(ctx, remote::Bind::Lan).err();
+                // HTTPS 失敗を LAN 公開へ自動変更しない。URL を隠し再試行を残す。
+                if let Some(r) = self.remote.as_mut() {
+                    r.clear_https_host();
                 }
+                self.qr_url.clear();
                 self.toast_warn(tr(b.headline()));
                 self.https_err = Some(b);
             }
@@ -1231,7 +1222,7 @@ impl ZaivernApp {
         // **解除に失敗すると、モードを戻した後も serve が立ったまま残る。**
         // そのときは「やめる」ボタンを出し続ける — 出さないと、利用者は
         // 自分の tailnet に残った proxy 設定を消す手を画面から失う。
-        let https_leftover = self.https.domain().is_some();
+        let https_leftover = self.https.needs_cleanup();
         // 前面が立つまでの URL は `http://127.0.0.1:<port>` で、スマホからは
         // 絶対に繋がらない。**その QR を出さない**のが唯一正しい振る舞い。
         let https_preparing = https_mode && !https_ready;
@@ -1580,8 +1571,8 @@ impl ZaivernApp {
                             if https_preparing {
                                 ui.label(
                                     RichText::new(tr(https_busy
-                                        .unwrap_or(tailscale::HttpsBusy::Starting)
-                                        .label()))
+                                        .map(|busy| busy.label())
+                                        .unwrap_or("remote.https_certificate_failed")))
                                     .size(12.0)
                                     .color(theme.warn),
                                 );
@@ -1707,6 +1698,9 @@ impl ZaivernApp {
                                         );
                                     }
                                     None if https_mode || https_leftover => {
+                                        if !https_ready && ui.button(tr("remote.https_retry")).clicked() {
+                                            ts_https_on = true;
+                                        }
                                         if ui
                                             .button(tr("🔓 HTTPS をやめる"))
                                             .on_hover_text(tr(tailscale::HTTPS_OFF_HINT))

@@ -47,3 +47,20 @@ Norton の登録・自動検出仕様は [公式のプログラム制御の説�
 - `tools/verify.sh` は MSVC の PDB 上限で失敗し、デバッグ情報を減らした再試行ではディスク容量不足が発生した。今回生成した4つの incremental キャッシュだけを削除し、`--config 'profile.dev.package.zaivern-code.debug=0' --config 'profile.dev.incremental=false'` によりビルド・テストが成功した。リポジトリの共通プロファイルは変更していない。MSVC の linker_messages 警告は残る。
 - 別エージェントの反証レビューで HTTP へのリダイレクト許可と検出完了後の無時限プロセス待ちを指摘され、HTTPS限定と結果型の分離により修正した。Windows の証明書・接続先名検証を維持することも再レビューした。新規 Windows 依存の宣言 MSRV は1.88以内。rustc 1.88 と他OSでの実行は未確認。
 - 最新の修正版 GUI を起動し、ウィンドウの作成と応答を確認した。GUI の見た目・操作完了をプロセス確認だけで保証しない。公開・リリースおよび既存インストールの置換は行っていない。
+
+## HTTPS 証明書未取得時の成功表示を修正
+
+- `fix/compact-toolbar` / 009fd26 を基点に修正。証明書取得失敗を警告付き成功として扱っていたため、スマホで開けない URL と QR が表示されていた。証明書取得成功と Serve 設定成功の両方が揃った場合だけ URL を出すようにした。
+- 失敗時は HTTPS の待受を維持して URL / QR を隠し、「HTTPS を再試行」を表示する。LAN の平文公開へ自動変更しない。準備失敗後も、この起動が作成した Serve の解除操作を維持する。
+- `tailscale cert` の stdout は秘密鍵を含み得るため、失敗表示へ流さない。stderr が空なら一般の失敗文言を表示する。「2回目からは一瞬」という説明を撤回し、6言語へ新規3キーを追加した。
+- Tailscale 18件、全画面ホイール1件が成功。証明書失敗→URL非公開→再試行成功、cleanup の保持、秘密鍵 stdout の非表示を検証した。別エージェントによる反証レビュー後の再レビューで追加の重大指摘なし。
+- Windows ネイティブでビルド成功。前項の容量対策2設定を cargo ラッパー関数で引き継ぎ、`tools/verify.sh --quick` も成功。6言語 check、新規3キーの一時辞書への apply と内容一致、missing 0件を確認。リンク時の linker_messages 警告は残る。他OSでの実行は未確認。
+
+### 実接続の診断と未完了事項
+
+- Tailscale は Running、PC・iPhone はオンラインで、iPhone への tailscale ping が成功した。Serve は HTTPS 443 を今回のアプリの 127.0.0.1:8900 へ転送し、アプリ本体は HTTP 200 で応答した。
+- スマホ側の TLS 接続は tailscaled の証明書取得処理まで到達したが、ACME の注文が invalid となるエラーを確認。その後は `SetDNS ... 500 Internal Server Error, failed to create DNS record` を確認した。実際のスマホからの HTTPS 接続は復旧していない。
+- PC 自身からの tailnet IP:443 接続ではアクセス拒否も観測した。これだけでスマホからの到達不能や Norton の因果関係を断定しない。
+- 公開証明書の発行者から Norton の HTTPS 検査を確認した。Norton の正式な設定画面で ACME 発行先だけを一時的に除外し、公開証明書の発行者が Let's Encrypt へ変わることを確認した。ただし証明書用 DNS 登録の500エラーは解消しなかったため、今回追加した除外を画面から削除した。既存の除外・ウイルス対策・ファイアウォールの設定は保全した。
+- 管理者承認後に Tailscale サービスを再起動し Running へ復帰したが、証明書発行エラーは残る。ノートンの内部DBは編集していない。診断時に証明書秘密鍵の本文を表示・保存していない。
+- 類似するサービス側エラーは [Tailscale #20823](https://github.com/tailscale/tailscale/issues/20823) にも報告されている。同一原因・回復時間は未確定で、待てば必ず復旧するとは保証しない。問い合わせやログの外部送信は行っていない。
