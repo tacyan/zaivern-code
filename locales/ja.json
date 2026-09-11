@@ -4966,7 +4966,6 @@
   "toolbar.more": "⋯ もっと見る",
   "toolbar.pet": "🐾 ペット",
   "toolbar.remote": "スマホ接続",
-  "toolbar.voice": "音声入力",
   "top_bar_ui.account_usage_projection": "{account}: {used} / {proj}",
   "top_bar_ui.add_name_to_end": "＋ {name} を末尾へ",
   "top_bar_ui.add_supported_cli_agent": "対応している CLI エージェントの一覧から選んで足す",

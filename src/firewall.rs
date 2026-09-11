@@ -947,8 +947,9 @@ pub struct FirewallUi {
     pub done: Option<String>,
 }
 
-// 非 Windows では受信処理だけがコンパイルされ、これを生成する worker は存在しない。
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+// 非 Windows では受信処理だけがコンパイルされ、これを生成する worker は存在しない
+// (テストは `Detected` しか作らないので、`Report` は test でも未構築のまま)。
+#[cfg_attr(not(windows), allow(dead_code))]
 enum FirewallResult {
     Report(Report),
     Detected,
