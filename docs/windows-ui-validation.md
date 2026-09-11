@@ -63,4 +63,14 @@ Norton の登録・自動検出仕様は [公式のプログラム制御の説�
 - PC 自身からの tailnet IP:443 接続ではアクセス拒否も観測した。これだけでスマホからの到達不能や Norton の因果関係を断定しない。
 - 公開証明書の発行者から Norton の HTTPS 検査を確認した。Norton の正式な設定画面で ACME 発行先だけを一時的に除外し、公開証明書の発行者が Let's Encrypt へ変わることを確認した。ただし証明書用 DNS 登録の500エラーは解消しなかったため、今回追加した除外を画面から削除した。既存の除外・ウイルス対策・ファイアウォールの設定は保全した。
 - 管理者承認後に Tailscale サービスを再起動し Running へ復帰したが、証明書発行エラーは残る。ノートンの内部DBは編集していない。診断時に証明書秘密鍵の本文を表示・保存していない。
-- 類似するサービス側エラーは [Tailscale #20823](https://github.com/tailscale/tailscale/issues/20823) にも報告されている。同一原因・回復時間は未確定で、待てば必ず復旧するとは保証しない。問い合わせやログの外部送信は行っていない。
+- 類似するサービス側エラーは [Tailscale #20823](https://github.com/tailscale/tailscale/issues/20823) にも報告されている。同一原因・回復時間は未確定で、待てば必ず復旧するとは保証しない。
+
+### 続報（同日）: Norton を除外しても再現。サーバー側障害と判断し支援依頼を送信
+
+- GitHub #20823 の全文を確認。報告者は macOS クライアントと無関係な Linux Kubernetes operator（別 ACME アカウント）の両方で同一の `SetDNS ... 500` を確認しており、AV/TLS 検査が一切無い環境でも発生し、10 時間後に何もせず自然回復したと明記している。**クライアント固有ではない**と報告側で断定済み。
+- Norton の Web/Mail Shield が `acme-v02.api.letsencrypt.org` だけでなく、このマシンの通常の制御プレーン接続 (`login.tailscale.com`, `controlplane.tailscale.com`) の TLS も横取りしていることを直接の TLS プローブで新たに確認した（`google.com` は横取りされない＝ドメイン選択的）。SetDNS の実宛先はこの制御プレーンであるため、検証価値のある未検証の仮説だった。
+- ユーザー本人が Norton の正規の Safe Web 除外設定から上記 3 ホスト（ACME + 2 制御プレーンホスト）を同時に除外。直後の TLS プローブで 3 ホストとも Let's Encrypt 発行の正規証明書が見えることを確認（横取りが外れたことの確認）。
+- その状態で `tailscale cert` を計 3 回実行（1 回目は待ち時間が長く background 実行）。**3 回とも同一の `acme: order ... status: invalid` で失敗**（毎回新しい注文 ID）。Norton 除外は結論後に元へ戻された。
+- 以上により、**Norton は原因ではないと確定**（除外してもしなくても同じ失敗）。GitHub #20823 の知見と整合し、Tailscale 制御プレーン側の DNS 書き込みパス不具合（断続的）である可能性が高いという結論に至った。
+- ユーザーの明示的許可を得て、更新済みの問い合わせ文を `tailscale.com/contact/support` のフォームへ実際に送信した（ユーザーの Tailscale アカウントでログイン済みの状態、ブラウザ自動操作）。AI 自動応答（kapa.ai）は「既知の Tailscale 側バックエンド障害の兆候と一致し、知識ベースだけでは現在進行中の障害か確認できない、直接の support request が適切」と回答。「No, I still need help」を選んでフォームへ戻り、実際に送信して「Thank you for contacting our support team. We will get back to you shortly.」の確認画面を確認した。送信内容・Bug Report ID (`BUG-206867c248ec...`) は `.Codex/tailscale-https-support-request.txt` に保存済み。
+- **未解決事項**: Tailscale サポートからの回答待ち。回答が来る、または `status.tailscale.com` に関連インシデントが出るまで、この Windows ノードでのスマホ HTTPS 接続は復旧していない。アプリ側の対応（1f57da4: 証明書未取得時は成功扱いにしない）は正しく機能しており、これ以上のアプリ側変更でこの障害は解消しない。
