@@ -34,19 +34,10 @@ impl ZaivernApp {
                         ui.horizontal_centered(|ui| {
                             self.top_bar_left(ui, &theme, &menu_info, &branch, density, &mut cmds);
                             self.top_bar_primary_controls(ui, &theme, density, &mut cmds);
+                            self.top_bar_secondary_controls(ui, &theme, &mut cmds);
                             if !two_rows {
                                 self.top_bar_visible_controls(ui, &mut cmds);
                             }
-                            ui.menu_button(tr("toolbar.more"), |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("zv-top-more-scroll")
-                                    .max_height(top_bar_menu_height(
-                                        ui.ctx().screen_rect().height(),
-                                    ))
-                                    .show(ui, |ui| {
-                                        self.top_bar_secondary_controls(ui, &theme, &mut cmds);
-                                    });
-                            });
                         });
                     });
                 if two_rows {
@@ -1090,7 +1081,7 @@ impl ZaivernApp {
         }
 
         // 承認モード切替(次回起動の既定)。クリックで 承認→全自動→Agent優先 を順送り。
-        // 狭い窓では「もっと見る」に同じ操作を置き、モード名も読めるようにする。
+        // 短いラベルでモード名を常時表示する。
         let mode = self.cfg.approval_mode.as_str();
         let (ap_label, next_mode, highlight) = match mode {
             "auto" => (

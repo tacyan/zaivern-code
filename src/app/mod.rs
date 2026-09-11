@@ -1208,7 +1208,7 @@ const TOP_BAR_RIGHT_ICON_W: f32 = 350.0;
 /// トップバー右側の密度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopBarDensity {
-    /// メニューバーと主要操作、表示切替を並べる。補助機能は「もっと見る」。
+    /// メニューバーと主要操作、承認モード、表示切替を並べる。
     Full,
     /// Agent 追加を短く表示する。表示切替と各アイコンは残す。
     Compact,
