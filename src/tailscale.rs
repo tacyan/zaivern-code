@@ -57,6 +57,10 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 /// MagicDNS の固定アドレス。tailnet が上がっているときだけ経路がある。
@@ -832,7 +836,9 @@ pub struct Https {
     /// この起動で 1 度でも serve を立てたか。
     /// **終了時に撃つかどうかの判断がこれ 1 つで決まる** (立てていなければ
     /// 何もしない = 利用者の tailnet を勝手に触らない)。
-    touched: bool,
+    touched: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    stop_pending: bool,
 }
 
 impl Https {
@@ -848,6 +854,29 @@ impl Https {
 
     /// `port` を tailnet の HTTPS 前面に載せる。**すぐ戻る**。
     pub fn start(&mut self, port: u16) {
+        self.start_with(move |touched, stx| {
+            match https_domain() {
+                Err(e) => HttpsDone::Blocked(e),
+                Ok(domain) => match serve_https_on(port) {
+                    Err(e) => HttpsDone::Blocked(e),
+                    Ok(()) => {
+                        // UI が完了を poll する前から後片付けの対象にする。
+                        touched.store(true, Ordering::Release);
+                        let _ = stx.send(HttpsBusy::Warming);
+                        let warn = warm_cert(&domain).err();
+                        HttpsDone::On { domain, warn }
+                    }
+                },
+            }
+        });
+    }
+
+    fn start_with(
+        &mut self,
+        task: impl FnOnce(Arc<AtomicBool>, std::sync::mpsc::Sender<HttpsBusy>) -> HttpsDone
+            + Send
+            + 'static,
+    ) {
         if self.busy.is_some() {
             return;
         }
@@ -856,47 +885,64 @@ impl Https {
         self.busy = Some(HttpsBusy::Starting);
         self.rx = Some(rx);
         self.stage_rx = Some(srx);
-        let _ = std::thread::Builder::new()
+        self.stop_pending = false;
+        let touched = Arc::clone(&self.touched);
+        let fail_tx = tx.clone();
+        match std::thread::Builder::new()
             .name("zv-ts-https".into())
             .spawn(move || {
-                let msg = match https_domain() {
-                    Err(e) => HttpsDone::Blocked(e),
-                    Ok(domain) => match serve_https_on(port) {
-                        Err(e) => HttpsDone::Blocked(e),
-                        Ok(()) => {
-                            // ここから先は「立っている」。温めは失敗しても続ける
-                            let _ = stx.send(HttpsBusy::Warming);
-                            let warn = warm_cert(&domain).err();
-                            HttpsDone::On { domain, warn }
-                        }
-                    },
-                };
+                let msg = task(touched, stx);
                 let _ = tx.send(msg);
-            });
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(e) => {
+                let _ = fail_tx.send(HttpsDone::Blocked(HttpsBlock::Failed(e.to_string())));
+            }
+        }
     }
 
     /// 公開をやめる。**すぐ戻る**。
     pub fn stop(&mut self) {
         if self.busy.is_some() {
+            if self.busy != Some(HttpsBusy::Stopping) {
+                self.stop_pending = true;
+            }
+            return;
+        }
+        if !self.touched.load(Ordering::Acquire) {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.busy = Some(HttpsBusy::Stopping);
         self.rx = Some(rx);
         self.stage_rx = None;
-        let _ = std::thread::Builder::new()
+        let touched = Arc::clone(&self.touched);
+        let fail_tx = tx.clone();
+        match std::thread::Builder::new()
             .name("zv-ts-https-off".into())
             .spawn(move || {
                 let msg = match serve_https_off() {
-                    Ok(()) => HttpsDone::Off,
+                    Ok(()) => {
+                        touched.store(false, Ordering::Release);
+                        HttpsDone::Off
+                    }
                     Err(e) => HttpsDone::Blocked(e),
                 };
                 let _ = tx.send(msg);
-            });
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(e) => {
+                let _ = fail_tx.send(HttpsDone::Blocked(HttpsBlock::Failed(e.to_string())));
+            }
+        }
     }
 
     /// 毎フレーム呼ぶ。終わっていれば 1 度だけ結果を返す。
     pub fn poll(&mut self) -> Option<HttpsDone> {
+        self.poll_with(Self::stop)
+    }
+
+    fn poll_with(&mut self, stop: impl FnOnce(&mut Self)) -> Option<HttpsDone> {
         if let Some(rx) = self.stage_rx.as_ref() {
             if let Ok(s) = rx.try_recv() {
                 self.busy = Some(s);
@@ -910,7 +956,6 @@ impl Https {
         match &msg {
             HttpsDone::On { domain, .. } => {
                 self.domain = Some(domain.clone());
-                self.touched = true;
             }
             HttpsDone::Off => self.domain = None,
             // 立てようとして断られたなら、立っていない。
@@ -922,25 +967,38 @@ impl Https {
                 }
             }
         }
+        if std::mem::take(&mut self.stop_pending) && self.touched.load(Ordering::Acquire) {
+            stop(self);
+            // 接続先を変えた後の On を UI に渡さない。
+            return None;
+        }
         Some(msg)
     }
 
     /// 終了時の後片付け。**この起動で立てたときだけ**撃つ。
     ///
-    /// 終了処理なので同期で待つが、時限は [`CLI_BUDGET`] で頭打ちになる
-    /// (立てていなければシステムコール 1 つも撃たない)。
+    /// 準備中ならその時限付き処理が終わってから解除する。最大で準備の
+    /// CLI 2 回 + 証明書取得 + 解除 CLI 1 回の上限となる。
     pub fn cleanup_on_exit(&mut self) {
-        if !self.touched {
+        self.cleanup_with(serve_https_off);
+    }
+
+    fn cleanup_with(&mut self, stop: impl FnOnce() -> Result<(), HttpsBlock>) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        if !self.touched.load(Ordering::Acquire) {
             return;
         }
-        self.touched = false;
-        self.domain = None;
-        if let Err(e) = serve_https_off() {
+        if let Err(e) = stop() {
             eprintln!(
                 "tailnet の HTTPS 公開を解除できませんでした: {:?}\n手で解除するには: tailscale {}",
                 e,
                 serve_off_args().join(" ")
             );
+        } else {
+            self.touched.store(false, Ordering::Release);
+            self.domain = None;
         }
     }
 }
@@ -948,6 +1006,78 @@ impl Https {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_during_start_waits_for_worker_before_removing_serve() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let mut https = Https::default();
+        https.start_with(move |touched, stage| {
+            touched.store(true, Ordering::Release);
+            stage.send(HttpsBusy::Warming).unwrap();
+            ready_tx.send(()).unwrap();
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            HttpsDone::On {
+                domain: "test.example.ts.net".into(),
+                warn: None,
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(https.domain().is_none()); // UI は On をまだ受け取っていない。
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_tx.send(()).unwrap();
+            https.cleanup_with(|| {
+                stopped_tx.send(()).unwrap();
+                Ok(())
+            });
+            assert!(!https.touched.load(Ordering::Acquire));
+        });
+        cleanup_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            stopped_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        finish_tx.send(()).unwrap();
+        stopped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cleanup.join().unwrap();
+    }
+
+    #[test]
+    fn changing_transport_during_start_consumes_late_on_and_schedules_stop() {
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let mut https = Https::default();
+        https.start_with(move |touched, _| {
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            touched.store(true, Ordering::Release);
+            HttpsDone::On {
+                domain: "test.example.ts.net".into(),
+                warn: None,
+            }
+        });
+        https.stop(); // Starting 中でも解除要求を忘れない。
+        finish_tx.send(()).unwrap();
+        https.worker.take().unwrap().join().unwrap();
+        let mut stopped = false;
+        let done = https.poll_with(|state| {
+            stopped = true;
+            assert_eq!(state.domain(), Some("test.example.ts.net"));
+            assert_eq!(state.busy(), None);
+        });
+        assert!(stopped);
+        assert!(
+            done.is_none(),
+            "old HTTPS URL must not reach the new transport"
+        );
+    }
+
+    #[test]
+    fn failed_start_does_not_remove_unowned_serve_settings() {
+        let mut https = Https::default();
+        https.start_with(|_, _| HttpsDone::Blocked(HttpsBlock::NoCli));
+        https.cleanup_with(|| panic!("no serve was started by this app"));
+    }
 
     #[test]
     fn tailnet_v4は100_64から100_127まで() {

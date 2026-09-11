@@ -1,5 +1,19 @@
 use super::*;
 
+fn remote_connection_window<'a>(ctx: &egui::Context, open: &'a mut bool) -> egui::Window<'a> {
+    // Window 自身のスクロールを使い、中央固定でも Resize が先に高さを確保する。
+    // 画面の上下に余白を残し、内容が長い場合はウィンドウ内でスクロールする。
+    let height = ctx.available_rect().height() * 0.8;
+    egui::Window::new(tr("📱 スマホリモート"))
+        .open(open)
+        .collapsible(false)
+        .resizable(false)
+        .default_height(height)
+        .max_height(height)
+        .vscroll(true)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+}
+
 /// **Fleet のスナップショットを読む要求か** (純関数)。
 ///
 /// 該当するのは `self.fleet.snap()` を実際に読む応答だけ:
@@ -1019,7 +1033,7 @@ impl ZaivernApp {
         // SSH トンネルへ切り替え — どの経路もこの関数を通る)。撃ち忘れると
         // 利用者の tailnet に proxy 設定が残り続ける。
         // 立っていないときは何もしない (利用者の設定を勝手に触らない)。
-        if was == remote::Bind::TailscaleHttps && self.https.domain().is_some() {
+        if was == remote::Bind::TailscaleHttps {
             self.https.stop();
         }
         // 先に畳んでポートを解放する (Drop が accept の終了まで待つ)
@@ -1071,6 +1085,14 @@ impl ZaivernApp {
         };
         match done {
             tailscale::HttpsDone::On { domain, warn } => {
+                if !self
+                    .remote
+                    .as_ref()
+                    .is_some_and(|r| r.bind == remote::Bind::TailscaleHttps)
+                {
+                    self.https.stop();
+                    return;
+                }
                 // **`serve` が rc=0 で返ってからしか https の URL を配らない。**
                 if let Some(r) = self.remote.as_mut() {
                     r.set_https_host(&domain);
@@ -1240,6 +1262,7 @@ impl ZaivernApp {
         let mut fw_copy_cmd = false;
         let mut fw_unblock = false;
         let mut fw_copy_exe = false;
+        let mut fw_open_folder = false;
         // 別のファイアウォール製品 (ノートン等) の名前と、そこへ登録する exe パス
         let fw_other = if fw_check {
             self.fw.other_firewall()
@@ -1252,27 +1275,9 @@ impl ZaivernApp {
             String::new()
         };
 
-        egui::Window::new(tr("📱 スマホリモート"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_pos(ctx.screen_rect().min + egui::vec2(24.0, 48.0))
-            .default_height((ctx.screen_rect().height() - 96.0).clamp(120.0, 720.0))
-            .max_height((ctx.screen_rect().height() - 64.0).max(80.0))
-            .vscroll(true)
+        remote_connection_window(ctx, &mut open)
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                // Window 自身のスクロールを使い、中央固定による高さの制約を避ける。
-                if firewall::applicable() {
-                    ui.collapsing(tr("remote.security_app"), |ui| {
-                        ui.label(tr("remote.security_app_hint"));
-                        ui.label(RichText::new(&fw_exe).small());
-                        if ui.button(tr("📋 exe のパスをコピー")).clicked() {
-                            fw_copy_exe = true;
-                        }
-                        ui.hyperlink_to(tr("remote.windows_security"), "windowsdefender://network/");
-                    });
-                }
                 match (&url_full, &err) {
                     (Some(url), _) => {
                         ui.vertical_centered(|ui| {
@@ -1421,17 +1426,6 @@ impl ZaivernApp {
                                                         {
                                                             fw_allow = true;
                                                         }
-                                                        // 別製品への登録は exe パスを求められる。
-                                                        // 手で打たせない (打ち間違えると許可されない)。
-                                                        if problems
-                                                            .contains(&firewall::Problem::OtherFirewall)
-                                                            && ui
-                                                                .button(tr("📋 exe のパスをコピー"))
-                                                                .on_hover_text(&fw_exe)
-                                                                .clicked()
-                                                        {
-                                                            fw_copy_exe = true;
-                                                        }
                                                         if ui.button(tr("⟳ 再確認")).clicked() {
                                                             fw_recheck = true;
                                                         }
@@ -1497,6 +1491,24 @@ impl ZaivernApp {
                                 if let Some(e) = &fw_error {
                                     ui.label(RichText::new(e).size(10.5).color(theme.err));
                                 }
+                            }
+                            if firewall::applicable() {
+                                ui.collapsing(tr("remote.security_register_app"), |ui| {
+                                    ui.label(tr("remote.security_register_hint"));
+                                    ui.label(egui::RichText::new(&fw_exe).monospace());
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button(tr("📋 exe のパスをコピー")).clicked() {
+                                            fw_copy_exe = true;
+                                        }
+                                        if ui.button(tr("remote.open_app_folder")).clicked() {
+                                            fw_open_folder = true;
+                                        }
+                                    });
+                                    ui.hyperlink_to(
+                                        tr("remote.norton_program_control_help"),
+                                        "https://support.norton.com/sp/ja/jp/home/current/solutions/v20240108181338560",
+                                    );
+                                });
                             }
                             // ── スマホからの接続が実際に届いたか ──
                             // 規則を読んで分かるのは建前だけ。ここが 0 件のままなら
@@ -1591,6 +1603,7 @@ impl ZaivernApp {
 
                             // ── Tailscale VPN ───────────────────────────
                             // 踏み台も同じ Wi-Fi も要らない 3 本目の経路。
+                            // 未導入でも導入先を示し、Windows でも接続経路を見つけられるようにする。
                             {
                                 ui.horizontal(|ui| {
                                     ui.label(
@@ -1605,10 +1618,6 @@ impl ZaivernApp {
                                     );
                                 });
                                 ui.add_space(3.0);
-                                if ts.stage != tailscale::Stage::Up {
-                                    ui.label(tr("remote.tailscale_setup"));
-                                    ui.hyperlink_to(tr("remote.tailscale_download"), "https://tailscale.com/download");
-                                }
                                 let ts_col = match ts.stage {
                                     tailscale::Stage::Up => theme.ok,
                                     tailscale::Stage::Down => theme.warn,
@@ -1635,6 +1644,15 @@ impl ZaivernApp {
                                         .color(theme.text_dim),
                                 );
                                 ui.add_space(3.0);
+                                if ts.stage == tailscale::Stage::Missing {
+                                    ui.hyperlink_to(
+                                        tr("remote.install_tailscale"),
+                                        "https://tailscale.com/download",
+                                    );
+                                }
+                                if !ts.ready() {
+                                    ui.label(tr("remote.tailscale_same_account"));
+                                }
                                 if ts_mode || https_mode {
                                     if ui
                                         .button(tr("📶 同じ Wi-Fi に戻す"))
@@ -1681,9 +1699,7 @@ impl ZaivernApp {
                                         if ui
                                             .add_enabled(
                                                 ts.ready(),
-                                                egui::Button::new(tr(
-                                                    "🎤 HTTPS で待ち受ける (スマホの音声入力が使えます)",
-                                                )),
+                                                egui::Button::new(tr("remote.tailscale_https_connect")),
                                             )
                                             .on_hover_text(tr(tailscale::HTTPS_ON_HINT))
                                             .clicked()
@@ -1692,17 +1708,18 @@ impl ZaivernApp {
                                         }
                                     }
                                 }
+                                // **できなかった理由は 4 通りある。**
+                                // 「できませんでした」で終わらせない —
+                                // 直し方がそれぞれ違う。
                                 if !ts_mode && !https_mode && !https_leftover && https_busy.is_none() {
-                                    ui.collapsing("HTTP", |ui| {
+                                    ui.collapsing(tr("remote.tailscale_http_advanced"), |ui| {
                                         if ui.add_enabled(ts.ready(), egui::Button::new(tr("🔒 Tailscale で待ち受ける")))
-                                            .on_hover_text(tr(tailscale::SWITCH_HINT)).clicked() {
+                                            .on_hover_text(tr(tailscale::SWITCH_HINT)).clicked()
+                                        {
                                             ts_on = true;
                                         }
                                     });
                                 }
-                                // **できなかった理由は 4 通りある。**
-                                // 「できませんでした」で終わらせない —
-                                // 直し方がそれぞれ違う。
                                 if let Some(b) = &https_err {
                                     ui.label(
                                         RichText::new(tr(b.headline()))
@@ -2044,11 +2061,19 @@ impl ZaivernApp {
             );
         }
         if fw_copy_exe {
-            ctx.copy_text(fw_exe);
+            ctx.copy_text(fw_exe.clone());
             self.toast(
                 tr("exe のパスをコピーしました (お使いのファイアウォール製品で受信を許可してください)"),
                 true,
             );
+        }
+        if fw_open_folder {
+            if let Err(e) = firewall::open_app_folder(&fw_exe) {
+                self.toast(
+                    trf("remote.open_app_folder_failed", &[("error", e.to_string())]),
+                    false,
+                );
+            }
         }
     }
 
@@ -2786,6 +2811,77 @@ fn scrollback_rows(
 /// 配達 (確定キーの再送・コスト上限・チェックポイント) を remote 側で
 /// 作り直すと、見張りが素通りしたまま「送れているように見える」経路が
 /// もう 1 本増える。合流していることは実行時には見えないので、ここで押さえる。
+#[cfg(test)]
+mod remote_window_tests {
+    #[test]
+    fn wheel_reaches_footer_without_growing_past_screen() {
+        use egui::{pos2, vec2, Event, Rect};
+
+        for screen in [vec2(456.0, 280.0), vec2(456.0, 800.0), vec2(1920.0, 1050.0)] {
+            let ctx = egui::Context::default();
+            let mut frame = 0;
+            let mut draw = |events| {
+                frame += 1;
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+                    time: Some(f64::from(frame) / 60.0),
+                    events,
+                    ..Default::default()
+                };
+                let mut result = (Rect::NOTHING, Rect::NOTHING, Rect::NOTHING);
+                let _ = ctx.run(input, |ctx| {
+                    let mut open = true;
+                    let response = super::remote_connection_window(ctx, &mut open)
+                        .show(ctx, |ui| {
+                            ui.set_width(340.0);
+                            // 長い接続説明と QR がある状態を再現する。
+                            ui.allocate_exact_size(
+                                vec2(300.0, 1400.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            let footer = ui.button("SSH connection").rect;
+                            (footer, ui.clip_rect())
+                        })
+                        .unwrap();
+                    let (footer, clip) = response.inner.unwrap();
+                    result = (response.response.rect, footer, clip);
+                });
+                result
+            };
+            let mut before = draw(vec![]);
+            for _ in 0..8 {
+                before = draw(vec![]);
+            }
+            assert!(before.0.height() <= screen.y, "window must fit: {before:?}");
+            assert!(
+                before.0.height() > screen.y * 0.65,
+                "window must not collapse to half height"
+            );
+            assert!(
+                !before.2.contains_rect(before.1),
+                "footer initially below viewport"
+            );
+            let mut after = draw(vec![
+                Event::PointerMoved(before.0.center()),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -5000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            for _ in 0..60 {
+                after = draw(vec![]);
+            }
+            assert!(after.1.top() < before.1.top(), "wheel must scroll content");
+            assert!(
+                after.2.contains_rect(after.1),
+                "footer must be reachable: {after:?}"
+            );
+            assert!(after.0.height() <= screen.y, "scrolled window must fit");
+        }
+    }
+}
+
 #[cfg(test)]
 mod bulk_wiring_tests {
     /// 関数 1 本ぶんの本文を切り出す (実装はテストより前に来る前提)。

@@ -89,6 +89,35 @@ const RULE_DESC: &str = "Zaivern Code phone remote (LAN only, token required)";
 pub const PORT_FROM: u16 = 8899;
 pub const PORT_TO: u16 = 8919;
 
+/// セキュリティ製品のファイル選択で使う、実行中のアプリの保存先を開く。
+/// パスをシェルのコマンド文字列に埋め込まない。
+pub fn open_app_folder(exe: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let directory = std::path::Path::new(exe)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "missing executable directory",
+                )
+            })?;
+        crate::procx::hidden_command("explorer.exe")
+            .arg(directory)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Windows only",
+        ))
+    }
+}
+
 /// 受信許可の状態。[`Report::problems`] が空でない間、スマホからは繋がらない。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
