@@ -1,7 +1,12 @@
-/// 言語選択前の母語名と、同梱6言語の全文字を両フォント族で確認する。
+/// Windows の CJK / Segoe UI Emoji フォールバックで、言語選択前の母語名と
+/// 同梱6言語の全文字を両フォント族で確認する。
 /// 翻訳のグローバル状態やユーザー設定には触れない。
+/// Linux では CJK フォントの追加導入が必要で、macOS のカラー絵文字は
+/// egui 0.29 で使えないため、全文字の検査は Windows の回帰テストとする。
+/// 全 OS 共通の UI 記号は下のテストで別途検査する。
+#[cfg(target_os = "windows")]
 #[test]
-fn builtin_languages_have_glyphs() {
+fn windows_builtin_languages_have_glyphs() {
     let ctx = egui::Context::default();
     super::install_fonts(&ctx);
     let _ = ctx.run(Default::default(), |_| {});
