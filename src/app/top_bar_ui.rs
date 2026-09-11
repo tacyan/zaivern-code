@@ -12,9 +12,11 @@ impl ZaivernApp {
         self.refresh_tasks_cache();
         // VS Code 準拠メニューバーの表示状態スナップショット (描画用の読み取り専用)
         let menu_info = self.build_menu_info(ctx);
+        let density = top_bar_density(ctx.available_rect().width() - 20.0);
+        let two_rows = density == TopBarDensity::Overflow;
 
         let bar = egui::TopBottomPanel::top("zv-top")
-            .exact_height(42.0)
+            .exact_height(if two_rows { 72.0 } else { 42.0 })
             .frame(
                 egui::Frame::none()
                     .fill(theme.panel)
@@ -23,18 +25,17 @@ impl ZaivernApp {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.spacing_mut().button_padding = egui::vec2(5.0, 3.0);
-                let density = top_bar_density(ui.available_width());
                 // 左右から重ねて描かず、同じ行へ順番に配置する。
                 // 大きな文字・極端に狭い窓でも、はみ出した操作へ横スクロールで届く。
                 egui::ScrollArea::horizontal()
                     .id_salt("zv-top-scroll")
-                    .auto_shrink([false, false])
+                    .max_height(28.0)
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
                             self.top_bar_left(ui, &theme, &menu_info, &branch, density, &mut cmds);
                             self.top_bar_primary_controls(ui, &theme, density, &mut cmds);
-                            if density == TopBarDensity::Full {
-                                self.top_bar_secondary_controls(ui, &theme, &mut cmds);
+                            if !two_rows {
+                                self.top_bar_visible_controls(ui, &mut cmds);
                             }
                             ui.menu_button(tr("toolbar.more"), |ui| {
                                 egui::ScrollArea::vertical()
@@ -43,18 +44,19 @@ impl ZaivernApp {
                                         ui.ctx().screen_rect().height(),
                                     ))
                                     .show(ui, |ui| {
-                                        if density != TopBarDensity::Full {
-                                            self.top_bar_secondary_controls(ui, &theme, &mut cmds);
-                                            ui.separator();
-                                        }
-                                        self.top_bar_language_menu(ui, &mut cmds);
-                                        self.top_bar_theme_menu(ui, &mut cmds);
-                                        self.top_bar_remote_and_voice(ui, &theme, &mut cmds);
-                                        self.top_bar_pet_menu(ui, &mut cmds);
+                                        self.top_bar_secondary_controls(ui, &theme, &mut cmds);
                                     });
                             });
                         });
                     });
+                if two_rows {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("zv-top-views-scroll")
+                        .max_height(28.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| self.top_bar_visible_controls(ui, &mut cmds));
+                        });
+                }
             });
         // ガイドツアーへ「ツールバーはここ」と申告する (非表示なら申告しないだけ)
         tutorial::anchor(ctx, AnchorId::Toolbar, bar.response.rect);
@@ -84,6 +86,14 @@ impl ZaivernApp {
         for c in cmds {
             self.apply_cmd(c, ctx);
         }
+    }
+
+    fn top_bar_visible_controls(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        self.top_bar_view_controls(ui, cmds);
+        self.top_bar_pet_menu(ui, cmds);
+        self.top_bar_remote_and_voice(ui, &self.theme, cmds);
+        self.top_bar_theme_menu(ui, cmds);
+        self.top_bar_language_menu(ui, cmds);
     }
 
     /// 起動バー (⌃1〜⌃9)。**割り当てが 0 件なら 1px も描かない**。
@@ -685,7 +695,7 @@ impl ZaivernApp {
     /// トップバー: 🎨 テーマ選択メニュー (プラグインのカスタムテーマ含む)。
     pub(super) fn top_bar_theme_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         let themes = self.theme_entries();
-        let menu = ui.menu_button(format!("🎨 {}", tr("配色テーマ")), |ui| {
+        let menu = ui.menu_button("🎨", |ui| {
             menu_bar::theme_menu_ui(ui, &themes, cmds);
         });
         tutorial::anchor(ui.ctx(), AnchorId::ThemeMenu, menu.response.rect);
@@ -723,7 +733,7 @@ impl ZaivernApp {
     /// 🎨 の隣に置く — 「見た目を変える」ものが 1 か所にまとまる。
     pub(super) fn top_bar_language_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         let langs = self.language_entries();
-        let menu = ui.menu_button(format!("🌐 {}", tr("表示言語")), |ui| {
+        let menu = ui.menu_button("🌐", |ui| {
             menu_bar::language_menu_ui(ui, &langs, cmds);
         });
         menu.response.on_hover_text(trf(
@@ -753,11 +763,7 @@ impl ZaivernApp {
             .map(|r| r.bind.needs_inbound_firewall())
             .unwrap_or(true);
         let blocked = lan_mode && self.fw.needs_allow();
-        let mut icon = RichText::new(format!(
-            "{} {}",
-            if blocked { "📱⚠" } else { "📱" },
-            tr("toolbar.remote")
-        ));
+        let mut icon = RichText::new(if blocked { "📱⚠" } else { "📱" });
         if blocked {
             icon = icon.color(theme.warn);
         }
@@ -794,12 +800,11 @@ impl ZaivernApp {
         }
         let voice_btn = ui.selectable_label(
             rec,
-            RichText::new(format!(
-                "{} {}",
-                if rec { "🔴" } else { "🎤" },
-                tr("toolbar.voice")
-            ))
-            .color(if rec { theme.err } else { theme.text }),
+            RichText::new(if rec { "🔴" } else { "🎤" }).color(if rec {
+                theme.err
+            } else {
+                theme.text
+            }),
         );
         tutorial::anchor(ui.ctx(), AnchorId::VoiceButton, voice_btn.rect);
         if voice_btn
@@ -946,7 +951,7 @@ impl ZaivernApp {
     /// トップバー: 🐾 ペットメニュー (表示切替・画像変更)。
     pub(super) fn top_bar_pet_menu(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
         // ペットメニュー(表示切替・画像変更)
-        ui.menu_button(tr("toolbar.pet"), |ui| {
+        ui.menu_button("🐾", |ui| {
             let show = self.cfg.show_pet;
             if ui
                 .selectable_label(
@@ -1125,8 +1130,10 @@ impl ZaivernApp {
             cmds.push(Cmd::SetApproval(next_mode.into()));
         }
         }
+    }
 
-        let cockpit = ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit"));
+    fn top_bar_view_controls(&self, ui: &mut egui::Ui, cmds: &mut Vec<Cmd>) {
+        let cockpit = ui.selectable_label(self.cockpit, RichText::new("🎛 Cockpit").size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::CockpitButton, cockpit.rect);
         if cockpit
             .on_hover_text(trf(
@@ -1138,7 +1145,7 @@ impl ZaivernApp {
             cmds.push(Cmd::ToggleCockpit);
         }
 
-        let kanban = ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")));
+        let kanban = ui.selectable_label(self.kanban, RichText::new(tr("📋 看板")).size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::KanbanButton, kanban.rect);
         if kanban
             .on_hover_text(trf(
@@ -1152,7 +1159,7 @@ impl ZaivernApp {
 
         // エージェントデッキ (縦 1 本)。Cockpit=格子 / 看板=レーン と並べて
         // 「もう 1 つの見方」として同じ場所から選べるようにする。
-        let deck = ui.selectable_label(self.deck, RichText::new(tr("▤ デッキ")));
+        let deck = ui.selectable_label(self.deck, RichText::new(tr("▤ デッキ")).size(11.5));
         tutorial::anchor(ui.ctx(), AnchorId::DeckButton, deck.rect);
         if deck
             .on_hover_text(trf(
@@ -1166,7 +1173,7 @@ impl ZaivernApp {
 
         // 🗒 変更一覧 — 「どのファイルのどの行が変わったか」を一望する中央ビュー。
         // Cockpit / 看板 / デッキと同じ場所に並べる (中央ビューの入口を 1 か所に集める)。
-        let changes = ui.selectable_label(self.changes, RichText::new(tr("🗒 変更")));
+        let changes = ui.selectable_label(self.changes, RichText::new(tr("🗒 変更")).size(11.5));
         if changes
             .on_hover_text(tr("変更一覧 — 未コミットの変更を「どのファイルのどの行」で一望する\n行をクリックするとその場所へ飛べます"))
             .clicked()
@@ -1183,15 +1190,6 @@ impl ZaivernApp {
         cmds: &mut Vec<Cmd>,
     ) {
         let compact = density.compact();
-        // 録音中はメニューを閉じても状態と停止操作を表に残す。
-        if self.voice.session.is_some()
-            && ui
-                .button("🔴 ⏹")
-                .on_hover_text(tr("音声入力を止める"))
-                .clicked()
-        {
-            cmds.push(Cmd::VoiceStop);
-        }
         let new_agent = ui.menu_button(if compact { "👾＋" } else { "👾 Agent ＋" }, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("zv-new-agent-scroll")
