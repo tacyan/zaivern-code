@@ -699,6 +699,25 @@ pub(super) fn apply_ui_zoom(ctx: &egui::Context, z: f32) {
     ctx.set_zoom_factor(zoom::clamp(z));
 }
 
+/// Windows のインストール先からフォントパスを解決する。
+/// 他 OS の候補は従来の絶対パスをそのまま使う。
+fn system_font_paths(candidates: &[&str]) -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(root) = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))
+        else {
+            return Vec::new();
+        };
+        let dir = Path::new(&root).join("Fonts");
+        candidates
+            .iter()
+            .map(|name| dir.join(name).to_string_lossy().into_owned())
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    candidates.iter().map(|path| (*path).to_owned()).collect()
+}
+
 pub(super) fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let candidates: Vec<&str> = if cfg!(target_os = "macos") {
@@ -708,11 +727,7 @@ pub(super) fn install_fonts(ctx: &egui::Context) {
             "/System/Library/Fonts/Hiragino Sans GB.ttc",
         ]
     } else if cfg!(target_os = "windows") {
-        vec![
-            "C:/Windows/Fonts/YuGothM.ttc",
-            "C:/Windows/Fonts/meiryo.ttc",
-            "C:/Windows/Fonts/msgothic.ttc",
-        ]
+        vec!["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"]
     } else {
         vec![
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -721,7 +736,20 @@ pub(super) fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
         ]
     };
+    let candidate_paths = system_font_paths(&candidates);
+    let candidates: Vec<&str> = candidate_paths.iter().map(String::as_str).collect();
     let cjk_loaded = push_fallback_font(&mut fonts, "cjk", &candidates);
+    let mut symbols_at = 1 + usize::from(cjk_loaded.is_some());
+
+    // 日本語フェイスだけでは简体中文や한국어を表示できない。
+    // UI・エディタ・端末の両フォント族へ中国語と韓国語の補完を積む。
+    // 言語を切り替える前の言語メニューにも必要なので常に登録する。
+    if cfg!(target_os = "windows") {
+        let paths = system_font_paths(&["msyh.ttc", "msjh.ttc", "malgun.ttf"]);
+        let candidates: Vec<&str> = paths.iter().map(String::as_str).collect();
+        symbols_at +=
+            push_fallback_fonts_all(&mut fonts, "cjk-extra", &candidates, None, symbols_at);
+    }
 
     // 記号フォント。egui 同梱の Ubuntu-Light / NotoEmoji / emoji-icon-font にも
     // 日本語フォントにも無い記号 (✕ ✗ ⌫ ⌥ ⌃ ❯ ▸ ▾ 罫線 点字スピナー など) は、
@@ -737,10 +765,11 @@ pub(super) fn install_fonts(ctx: &egui::Context) {
         ]
     } else if cfg!(target_os = "windows") {
         vec![
-            "C:/Windows/Fonts/seguisym.ttf",
-            "C:/Windows/Fonts/consola.ttf",
-            "C:/Windows/Fonts/segoeui.ttf",
-            "C:/Windows/Fonts/arial.ttf",
+            "seguisym.ttf",
+            "consola.ttf",
+            "segoeui.ttf",
+            "arial.ttf",
+            "seguiemj.ttf",
         ]
     } else {
         vec![
@@ -750,14 +779,10 @@ pub(super) fn install_fonts(ctx: &egui::Context) {
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
         ]
     };
-    // 主フォント (0) と、読めていれば CJK (1) の後ろから記号を積む。
-    push_fallback_fonts_all(
-        &mut fonts,
-        "symbols",
-        &symbols,
-        cjk_loaded,
-        1 + usize::from(cjk_loaded.is_some()),
-    );
+    let symbol_paths = system_font_paths(&symbols);
+    let symbols: Vec<&str> = symbol_paths.iter().map(String::as_str).collect();
+    // 主フォントと CJK フォールバックの後ろから記号を積む。
+    push_fallback_fonts_all(&mut fonts, "symbols", &symbols, cjk_loaded, symbols_at);
 
     // ── Windows: 本文の Proportional を OS の日本語フェイスそのものにする ──
     // epaint はフェイスごとに ascent が違う値で行内へ置くため、ラテンと日本語が
