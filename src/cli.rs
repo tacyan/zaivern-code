@@ -485,11 +485,12 @@ pub const HELP_TRAIN_SPLIT: &str = "\
 /// `zai update --help` のセクション。
 pub const HELP_UPDATE: &str = "\
 update (Zaivern Code 自身を更新します — エディタが起動していなくても使えます):
-  zai update                            最新版を確認し、実行するコマンドを見せてから更新
+  zai update                            最新版を確認し、確認後に更新
   zai update --check                    最新かどうかを確認するだけ (何も実行しません)
   zai update --yes | -y                 確認を求めずに更新する
                                         更新手段は入っている場所で自動的に選ばれます
-                                        (~/.cargo/bin なら cargo、それ以外はインストーラ)
+                                        (Windows は同梱インストーラで現在の配置先を更新)
+                                        (macOS/Linux: ~/.cargo/bin なら cargo、それ以外はインストーラ)
 
 ";
 
@@ -2963,7 +2964,8 @@ fn fetch_text(url: &str) -> Result<String, CliError> {
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(format!(
-                "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+                "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; \
+                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
                  (Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri '{url}').Content"
             ))
             .output()
@@ -3021,16 +3023,17 @@ pub enum UpdateMethod {
 
 /// 更新手段を選ぶ純関数 (テストから OS と置き場所を差し込めるようにしてある)。
 pub fn choose_update_method(exe: &Path, cargo_bin: Option<&Path>, windows: bool) -> UpdateMethod {
+    // Windows インストーラは .cargo/bin の配布版も同期するため、場所だけで
+    // cargo install と判定できない。指定先を更新できる同梱インストーラを使う。
+    if windows {
+        return UpdateMethod::PowerShell;
+    }
     if let (Some(dir), Some(parent)) = (cargo_bin, exe.parent()) {
         if parent == dir {
             return UpdateMethod::Cargo;
         }
     }
-    if windows {
-        UpdateMethod::PowerShell
-    } else {
-        UpdateMethod::Shell
-    }
+    UpdateMethod::Shell
 }
 
 /// `cargo install` の置き場 (`CARGO_HOME` を尊重する)。
@@ -3057,7 +3060,7 @@ pub fn update_command_line(method: UpdateMethod, dist: &Distribution) -> String 
 
 /// 更新を実行する。**自分自身を消しには行かない** — 上書きはインストーラ
 /// (Windows は実行中 exe を改名して差し替える) に任せ、ここは待つだけ。
-fn run_update(method: UpdateMethod, dist: &Distribution) -> Result<(), CliError> {
+fn run_update(method: UpdateMethod, dist: &Distribution, exe: &Path) -> Result<(), CliError> {
     let line = update_command_line(method, dist);
     let mut cmd = match method {
         UpdateMethod::Cargo => {
@@ -3080,11 +3083,23 @@ fn run_update(method: UpdateMethod, dist: &Distribution) -> Result<(), CliError>
             let mut c = std::process::Command::new("powershell");
             c.arg("-NoProfile")
                 .arg("-Command")
-                .arg(format!("irm {} | iex", dist.installer_ps1));
+                .arg(format!("$ErrorActionPreference = 'Stop'; {line}"));
+            // 表示した実行ファイルの場所を更新する。パスをスクリプトへ埋め込まない。
+            if let Some(dir) = exe.parent() {
+                c.env("ZAI_INSTALL_DIR", dir);
+            }
             c
         }
     };
-    let status = cmd.status().map_err(|e| {
+    #[cfg(windows)]
+    let result = if method == UpdateMethod::PowerShell {
+        crate::windows_update::run(exe, INSTALL_PS1)
+    } else {
+        cmd.status()
+    };
+    #[cfg(not(windows))]
+    let result = cmd.status();
+    let status = result.map_err(|e| {
         CliError::Runtime(format!(
             "更新コマンドを起動できませんでした: {e}\n手動で次を実行してください:\n  {line}"
         ))
@@ -3123,6 +3138,10 @@ fn confirm(prompt: &str) -> bool {
 
 /// `zai update` のディスパッチ。
 fn update_dispatch(args: &[String]) -> CliOut {
+    update_dispatch_version(args, env!("CARGO_PKG_VERSION"))
+}
+
+fn update_dispatch_version(args: &[String], current: &str) -> CliOut {
     if wants_help(args) {
         return Ok(HELP_UPDATE.trim_end().to_string());
     }
@@ -3134,7 +3153,6 @@ fn update_dispatch(args: &[String]) -> CliOut {
     let yes = yes_long || yes_short;
 
     let dist = distribution()?;
-    let current = env!("CARGO_PKG_VERSION");
     println!("現在のバージョン: {current}");
     println!("配布元を確認しています: {}", dist.repo_url);
     let latest = fetch_latest_tag(&dist.latest_api)?;
@@ -3149,8 +3167,10 @@ fn update_dispatch(args: &[String]) -> CliOut {
     println!();
     println!("🆕 新しいバージョンがあります: {current} → {latest}");
     println!("インストール先: {}", exe.display());
-    println!("次のコマンドで更新します:");
-    println!("  {line}");
+    if method != UpdateMethod::PowerShell {
+        println!("次のコマンドで更新します:");
+        println!("  {line}");
+    }
     if check {
         return Ok("(--check のため実行していません)".into());
     }
@@ -3158,7 +3178,7 @@ fn update_dispatch(args: &[String]) -> CliOut {
         return Ok("中止しました。".into());
     }
     println!();
-    run_update(method, &dist)?;
+    run_update(method, &dist, &exe)?;
     Ok("✅ 更新しました。`zai --version` で確認してください。".into())
 }
 
@@ -5610,11 +5630,14 @@ prunable gitdir file points to non-existent location
         let cargo_bin = PathBuf::from("/opt/cargo/bin");
         let in_cargo = cargo_bin.join("zai");
         let elsewhere = PathBuf::from("/opt/local/bin/zai");
-        // cargo install で入れた形跡があれば OS を問わず cargo
-        for windows in [false, true] {
+        // Windows はインストーラが .cargo/bin にも配布版を置く。
+        for (windows, expected) in [
+            (false, UpdateMethod::Cargo),
+            (true, UpdateMethod::PowerShell),
+        ] {
             assert_eq!(
                 choose_update_method(&in_cargo, Some(&cargo_bin), windows),
-                UpdateMethod::Cargo
+                expected
             );
         }
         assert_eq!(
@@ -5648,6 +5671,89 @@ prunable gitdir file points to non-existent location
         assert!(cargo.ends_with(env!("CARGO_PKG_NAME")), "{cargo}");
         assert!(update_command_line(UpdateMethod::Shell, &d).starts_with("curl -fsSL "));
         assert!(update_command_line(UpdateMethod::PowerShell, &d).starts_with("irm "));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "downloads a public release into an isolated temporary installation"]
+    fn windows_update_downloads_and_replaces_running_exe() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "ZAI_TEST_UPDATE_CHILD";
+        if let Some(root) = std::env::var_os(CHILD_ENV) {
+            let root = PathBuf::from(root);
+            assert_eq!(
+                crate::pathx::canonical(std::env::current_exe().unwrap().parent().unwrap()),
+                crate::pathx::canonical(&root)
+            );
+            // 現在版だけを差し込み、実際の確認入力・配布物検証・自己置換を通す。
+            let result = update_dispatch_version(&[], "0.0.0").expect("complete update");
+            println!("{result}");
+            return;
+        }
+
+        let root = crate::test_util::unique_temp_dir("zai-update-e2e", "日本語 ' path");
+        let exe = root.join("zai.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        let mut child = Command::new(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "cli::tests::windows_update_downloads_and_replaces_running_exe",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &root)
+            .env("ZAIVERN_HOME", root.join("home"))
+            .env("TEMP", &root)
+            .env("TMP", &root)
+            .env("ZAI_FROM_SOURCE", "0")
+            .stdin(Stdio::piped())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+        let started = Instant::now();
+        let mut report_at = Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "update child failed: {status}; fixture: {}",
+                    root.display()
+                );
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(180) {
+                crate::procx::kill_tree(child.id());
+                let _ = child.wait();
+                panic!("update exceeded 180 seconds; fixture: {}", root.display());
+            }
+            if started.elapsed() >= report_at {
+                eprintln!(
+                    "update integration test: {} seconds",
+                    started.elapsed().as_secs()
+                );
+                report_at += Duration::from_secs(10);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        drop(child);
+        let installed = Command::new(&exe)
+            .arg("--version")
+            .env("ZAIVERN_HOME", root.join("home"))
+            .output()
+            .unwrap();
+        assert!(installed.status.success());
+        let version = String::from_utf8(installed.stdout).unwrap();
+        assert!(version.starts_with("Zaivern Code "), "{version}");
+        assert!(version_is_newer(
+            version.trim_start_matches("Zaivern Code ").trim(),
+            "0.0.0"
+        ));
+        eprintln!("installed release: {}", version.trim());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

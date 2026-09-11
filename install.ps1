@@ -1,4 +1,4 @@
-# Zaivern Code ワンライナーインストーラ (Windows)
+﻿# Zaivern Code ワンライナーインストーラ (Windows)
 #   irm https://raw.githubusercontent.com/tacyan/zaivern-code/main/install.ps1 | iex
 #
 # やること:
@@ -16,6 +16,7 @@
 # 環境変数:
 #   ZAI_INSTALL_DIR    ビルド済みバイナリの配置先 (既定: %LOCALAPPDATA%\Zaivern\bin)
 #   ZAI_FROM_SOURCE=1  常にソースビルドする
+#   ZAI_UPDATE_ONLY=1 zai update が指定先だけを更新する (PATH・アプリ登録は変更しない)
 
 $repo = "tacyan/zaivern-code"
 $repoUrl = "https://github.com/$repo"
@@ -73,28 +74,61 @@ function Add-UserPath($dir) {
     if (($env:Path -split ";") -notcontains $dir) { $env:Path = "$env:Path;$dir" }
 }
 
+function Invoke-UpdateFileStep([scriptblock]$action, [string]$label, [int]$timeoutMs = 10000) {
+    # 初回起動直後の共有違反が約 2〜3 秒続く Windows 環境がある。
+    # 10 秒で打ち切り、一般の権限エラーや欠落ファイルは再試行しない。
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $nextReport = 0
+    while ($true) {
+        try { return (& $action) } catch {
+            $cause = $_.Exception
+            while ($cause.InnerException) { $cause = $cause.InnerException }
+            $code = $cause.HResult -band 0xffff
+            if ($code -notin @(32, 33)) { throw }
+            $remaining = $timeoutMs - $timer.ElapsedMilliseconds
+            if ($remaining -le 0) { throw }
+            if ($timer.ElapsedMilliseconds -ge $nextReport) {
+                Say "$label のファイルロック解除を待っています... (最大 $timeoutMs ms)"
+                $nextReport = $timer.ElapsedMilliseconds + 1000
+            }
+            Start-Sleep -Milliseconds ([int][Math]::Min(200, $remaining))
+        }
+    }
+}
+
 # zai.exe を配置する。起動中の exe は上書きできないので、
 # その場合は実行中のファイルを .old へ改名してから置き換える
 # (Windows は実行中の exe を削除できないが改名はできる)。
 function Copy-Binary($src, $dst) {
+    $staged = "$dst.new-" + [Guid]::NewGuid().ToString('N')
+    $old = "$dst.old-" + [Guid]::NewGuid().ToString('N')
+    $renamed = $false
+    $updateLock = $null
     try {
-        Copy-Item $src $dst -Force
-        # 前回の置き換えで残った .old を掃除する (まだ使用中なら失敗するので無視)
-        Remove-Item "$dst.old" -Force -ErrorAction SilentlyContinue
+        # ロックファイルは残す。閉じた後に削除すると、別更新の取得と競合する。
+        $updateLock = Invoke-UpdateFileStep {
+            [IO.File]::Open("$dst.update-lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        } '更新'
+        # コピー失敗で元の exe を失わないよう、先に別名へコピーしてから入れ替える。
+        Copy-Item -LiteralPath $src -Destination $staged -ErrorAction Stop
+        if (Test-Path -LiteralPath $dst) {
+            Invoke-UpdateFileStep { [IO.File]::Move($dst, $old) } '旧バージョン'
+            $renamed = $true
+        }
+        Invoke-UpdateFileStep { Move-Item -LiteralPath $staged -Destination $dst -ErrorAction Stop } '新バージョン'
+        if ($renamed) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
         return $true
     } catch {
-        if (-not (Test-Path $dst)) { throw }
-        $old = "$dst.old"
-        try {
-            Remove-Item $old -Force -ErrorAction SilentlyContinue  # 前回の残骸 (使用中なら残る)
-            Move-Item $dst $old -Force
-            Copy-Item $src $dst -Force
-            Warn "起動中の $dst を置き換えました (次回起動から新しい版になります)"
-            return $true
-        } catch {
-            Warn "$dst を更新できませんでした: $_"
-            return $false
+        Warn "$dst を更新できませんでした: $_"
+        if ($renamed -and -not (Test-Path -LiteralPath $dst)) {
+            try {
+                Invoke-UpdateFileStep { [IO.File]::Move($old, $dst) } '復元'
+            } catch { Warn "元のファイルは $old に残っています: $_" }
         }
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        if ($updateLock) { $updateLock.Dispose() }
     }
 }
 
@@ -112,7 +146,7 @@ function Sync-Stale($newBin, $skipDir) {
 }
 
 # OS のアプリ一覧 (スタートメニュー) へ登録。失敗しても続行。
-# zai.exe は GUI サブシステムなので Start-Process -Wait で完了を待つ
+# 旧 GUI サブシステム版でも完了を待つため Start-Process -Wait を使う。
 function Register-App($exe) {
     try {
         Start-Process -FilePath $exe -ArgumentList "app", "install" -Wait -WindowStyle Hidden
@@ -177,8 +211,11 @@ function Install-Prebuilt {
 
     $name = "zai-$tag-windows-x86_64"
     $url = "$repoUrl/releases/download/$tag/$name.zip"
-    $zip = Join-Path $env:TEMP "$name.zip"
-    $extract = Join-Path $env:TEMP "zai-extract"
+    $downloadRoot = Join-Path ([IO.Path]::GetTempPath()) ('zai-update-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+    $zip = Join-Path $downloadRoot "$name.zip"
+    $extract = Join-Path $downloadRoot 'extract'
+    try {
     $sumsUrl = "$repoUrl/releases/download/$tag/checksums.txt"
     Say "ダウンロード: $url"
     $ProgressPreference = "SilentlyContinue"  # Invoke-WebRequest の進捗バーは遅いので切る
@@ -189,7 +226,6 @@ function Install-Prebuilt {
     # パイプラインには乗らないが、この形なら混ざっても壊れない)。
     Say "チェックサムを確認します: $sumsUrl"
     if (@(Test-Checksum $zip "$name.zip" $sumsUrl)[-1] -ne $true) {
-        Remove-Item $zip -Force -ErrorAction SilentlyContinue
         Write-Host "[zaivern-code] ⛔ 配布物を検証できなかったため中止しました。" -ForegroundColor Red
         Write-Host "[zaivern-code]    ダウンロードしたものは展開も実行もしていません。" -ForegroundColor Red
         Write-Host '[zaivern-code]    ソースから入れる場合: $env:ZAI_FROM_SOURCE = "1" を設定して再実行してください。'
@@ -197,7 +233,6 @@ function Install-Prebuilt {
         return $false
     }
 
-    if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
     Expand-Archive $zip -DestinationPath $extract -Force
 
     $new = Join-Path $extract "$name\zai.exe"
@@ -206,18 +241,22 @@ function Install-Prebuilt {
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     if (-not (Copy-Binary $new $exe)) {
         Warn "Zaivern Code を終了してから、もう一度実行してください。"
-        Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue
         $script:zaiGiveUp = $true   # ダウンロードは成功しているのでソースビルドはしない
         return $false
     }
-    Sync-Stale $new $installDir
-    Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue
+    if ($env:ZAI_UPDATE_ONLY -ne "1") { Sync-Stale $new $installDir }
 
-    Add-UserPath $installDir
-    Register-App $exe
-    Register-Firewall $exe
+    if ($env:ZAI_UPDATE_ONLY -ne "1") {
+        Add-UserPath $installDir
+        Register-App $exe
+        Register-Firewall $exe
+    }
     Show-Done $verb $exe "($tag)"
     return $true
+    } finally {
+        # この呼び出しが作成したディレクトリだけを掃除する。
+        Remove-Item -LiteralPath $downloadRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # PATH 上の link.exe だけでは判定しない。rustc は Visual Studio を自動検出する。
@@ -278,20 +317,46 @@ function Install-FromSource {
     # 4. GitHub から直接ビルド & インストール
     #    --force: 同一バージョンがインストール済みでも再ビルドして上書き(=再実行で更新)
     Say "GitHub からビルド・インストールします(初回は数分かかります)..."
-    cargo install --git $repoUrl --locked --force zaivern-code | Out-Host
+    $buildRoot = $null
+    try {
+    if ($env:ZAI_UPDATE_ONLY -eq "1") {
+        # 更新先以外の .cargo/bin/zai.exe を cargo install に書き換えさせない。
+        $buildRoot = Join-Path ([IO.Path]::GetTempPath()) ('zai-source-update-' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $buildRoot | Out-Null
+        cargo install --git $repoUrl --locked --force --root $buildRoot zaivern-code | Out-Host
+        $exe = Join-Path $buildRoot 'bin/zai.exe'
+    } else {
+        cargo install --git $repoUrl --locked --force zaivern-code | Out-Host
+        $exe = Join-Path $cargoBin "zai.exe"
+    }
     $buildExit = $LASTEXITCODE
-    $exe = Join-Path $cargoBin "zai.exe"
     if ($buildExit -ne 0 -or -not (Test-Path $exe)) {
         Warn "ビルドに失敗しました。上のエラーを確認してください。"
         return $false
     }
 
-    Sync-Stale $exe $cargoBin
-    Add-UserPath $cargoBin
-    Register-App $exe
-    Register-Firewall $exe
+    # zai update が指定した実行ファイルの場所にも、ビルド結果を反映する。
+    $sourceExe = $exe
+    $destinationDir = $cargoBin
+    if ($env:ZAI_UPDATE_ONLY -eq "1" -or ($env:ZAI_INSTALL_DIR -and $installDir -ne $cargoBin)) {
+        New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+        $exe = Join-Path $installDir "zai.exe"
+        if (-not (Copy-Binary $sourceExe $exe)) { return $false }
+        $destinationDir = $installDir
+    }
+    if ($env:ZAI_UPDATE_ONLY -ne "1") {
+        Sync-Stale $sourceExe $cargoBin
+        Add-UserPath $destinationDir
+        Register-App $exe
+        Register-Firewall $exe
+    }
     Show-Done "インストール" $exe ""
     return $true
+    } finally {
+        if ($buildRoot) {
+            Remove-Item -LiteralPath $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 # --- 実行 ---------------------------------------------------------------------
@@ -307,12 +372,13 @@ try {
         try { $ok = @(Install-Prebuilt)[-1] -eq $true } catch { Warn "ビルド済みバイナリを取得できませんでした: $_" }
     }
     if ($env:ZAI_FROM_SOURCE -eq "1") {
-        $null = Install-FromSource
+        $ok = @(Install-FromSource)[-1] -eq $true
     } elseif (-not $ok -and -not $script:zaiGiveUp) {
         Warn "ビルド済みバイナリをインストールできませんでした。上のエラーを確認して再実行してください。"
         Warn "配布ページ: $repoUrl/releases/latest"
         Warn 'ソースビルドを希望する場合だけ、C++ Build Tools と Windows SDK を導入し、$env:ZAI_FROM_SOURCE = "1" を設定して再実行してください。'
     }
+    if (-not $ok) { throw 'Zaivern Code installation failed. See the errors above.' }
 } finally {
     $ErrorActionPreference = $zaiPrevEap
 }

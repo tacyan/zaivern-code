@@ -795,7 +795,7 @@ impl ZaivernApp {
                 return;
             }
         };
-        let mut cmd = std::process::Command::new(exe);
+        let mut cmd = crate::procx::hidden_command(exe);
         // 新プロセスは引数のフォルダをルートにする (main.rs の起動引数解釈)。
         // カレントディレクトリも合わせておくと、引数パスが消えていた場合の
         // フォールバック先も同じ場所になる。
