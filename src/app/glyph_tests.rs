@@ -1,3 +1,40 @@
+/// 言語選択前の母語名と、同梱6言語の全文字を両フォント族で確認する。
+/// 翻訳のグローバル状態やユーザー設定には触れない。
+#[test]
+fn builtin_languages_have_glyphs() {
+    let ctx = egui::Context::default();
+    super::install_fonts(&ctx);
+    let _ = ctx.run(Default::default(), |_| {});
+    let mut failures = Vec::new();
+    for (id, name, json) in crate::locale::BUILTIN {
+        let dict: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(json).expect("同梱辞書は文字列のマップ");
+        let chars: std::collections::BTreeSet<char> = name
+            .chars()
+            .chain(dict.values().flat_map(|text| text.chars()))
+            .filter(|c| !c.is_whitespace() && !c.is_control())
+            .collect();
+        for fid in [
+            egui::FontId::proportional(14.0),
+            egui::FontId::monospace(14.0),
+        ] {
+            let missing: String = ctx.fonts(|f| {
+                chars
+                    .iter()
+                    .filter(|c| !f.has_glyphs(&fid, &c.to_string()))
+                    .collect()
+            });
+            if !missing.is_empty() {
+                failures.push(format!("{id} {:?}: [{missing}]", fid.family));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "同梱言語の文字が豆腐になる: {failures:?}"
+    );
+}
+
 /// UI で使う記号が、実際のフォント構成で描画できることを保証する。
 ///
 /// egui 同梱の NotoEmoji はサブセットで、macOS の Apple Color Emoji は
