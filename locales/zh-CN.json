@@ -1,4 +1,8 @@
 {
+  "remote.detect_app": "发起通信以便 Norton 检测此应用",
+  "remote.detect_app_hint": "此 zai.exe 将自行通过 HTTPS 查询发布信息，不安装更新或更改设置。通信后请重新打开 Norton 的程序列表。",
+  "remote.detect_app_busy": "正在从此应用检查 HTTPS 通信…",
+  "remote.detect_app_done": "HTTPS 通信成功。请重新打开 Norton 列表检查；这不代表注册或授权已完成。",
   "remote.copy_app_name": "复制用于搜索的应用名称",
   "remote.norton_search_hint": "在 Norton 中搜索“Zaivern Code”或“zai”。在搜索框中输入 exe 路径不会注册应用。如果列表中没有该应用，请在程序控制中添加程序，并将下面的路径粘贴到文件选择窗口。HTTPS 连接由 Tailscale 服务处理，也请检查其网络权限。",
   "remote.install_tailscale": "打开 Tailscale 官方下载页面",

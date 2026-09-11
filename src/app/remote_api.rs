@@ -1270,6 +1270,7 @@ impl ZaivernApp {
         let mut fw_copy_cmd = false;
         let mut fw_unblock = false;
         let mut fw_copy_exe = false;
+        let mut fw_detect_app = false;
         let mut fw_open_folder = false;
         // 別のファイアウォール製品 (ノートン等) の名前と、そこへ登録する exe パス
         let fw_other = if fw_check {
@@ -1312,6 +1313,7 @@ impl ZaivernApp {
                                                 firewall::Busy::Check => {
                                                     "🛡 Windows の受信許可を確認中…"
                                                 }
+                                                firewall::Busy::DetectApp => "remote.detect_app_busy",
                                                 firewall::Busy::Allow => {
                                                     "🛡 受信を許可しています (管理者の確認に応答してください)…"
                                                 }
@@ -1501,6 +1503,13 @@ impl ZaivernApp {
                             }
                             if firewall::applicable() {
                                 ui.collapsing(tr("remote.security_register_app"), |ui| {
+                                    if ui.add_enabled(fw_busy.is_none(), egui::Button::new(tr("remote.detect_app")))
+                                        .on_hover_text(tr("remote.detect_app_hint")).clicked() {
+                                        fw_detect_app = true;
+                                    }
+                                    if fw_busy == Some(firewall::Busy::DetectApp) {
+                                        ui.label(tr("remote.detect_app_busy"));
+                                    }
                                     ui.label(tr("remote.security_register_hint"));
                                     ui.label(tr("remote.norton_search_hint"));
                                     if ui.button(tr("remote.copy_app_name")).clicked() {
@@ -2077,6 +2086,9 @@ impl ZaivernApp {
                 tr("exe のパスをコピーしました (お使いのファイアウォール製品で受信を許可してください)"),
                 true,
             );
+        }
+        if fw_detect_app {
+            self.fw.detect_app();
         }
         if fw_open_folder {
             if let Err(e) = firewall::open_app_folder(&fw_exe) {

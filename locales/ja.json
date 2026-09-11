@@ -1,4 +1,8 @@
 {
+  "remote.detect_app": "Norton 検出用の通信を行う",
+  "remote.detect_app_hint": "この zai.exe 自身が配布元へ HTTPS 接続して更新情報を確認します。設定変更や更新は行いません。通信後に Norton のプログラム一覧を開き直してください。",
+  "remote.detect_app_busy": "このアプリから HTTPS 通信を確認中…",
+  "remote.detect_app_done": "HTTPS 通信が成功しました。Norton の一覧を開き直して確認してください（登録・許可の完了を保証するものではありません）。",
   "remote.copy_app_name": "検索用のアプリ名をコピー",
   "remote.norton_search_hint": "Norton の検索欄には「Zaivern Code」または「zai」を入力してください。exe のパスでは登録できません。一覧にない場合はプログラム制御のアプリ追加からファイルを選び、下のパスをファイル選択画面へ貼り付けてください。HTTPS 接続は Tailscale サービスが担当するため、Tailscale の許可も確認してください。",
   "remote.install_tailscale": "Tailscale の公式ダウンロードを開く",

@@ -1,4 +1,8 @@
 {
+  "remote.detect_app": "Norton이 앱을 감지하도록 연결",
+  "remote.detect_app_hint": "이 zai.exe가 직접 HTTPS로 릴리스 정보를 확인합니다. 업데이트를 설치하거나 설정을 변경하지 않습니다. 이후 Norton 프로그램 목록을 다시 여세요.",
+  "remote.detect_app_busy": "이 앱에서 HTTPS 연결 확인 중…",
+  "remote.detect_app_done": "HTTPS 연결에 성공했습니다. Norton 목록을 다시 열어 확인하세요. 등록 또는 허용 완료를 의미하지는 않습니다.",
   "remote.copy_app_name": "검색할 앱 이름 복사",
   "remote.norton_search_hint": "Norton에서 “Zaivern Code” 또는 “zai”를 검색하세요. 검색창에 exe 경로를 입력해도 앱이 등록되지 않습니다. 목록에 없으면 프로그램 제어에서 프로그램을 추가하고 파일 선택 창에 아래 경로를 붙여 넣으세요. HTTPS 연결은 Tailscale 서비스가 처리하므로 해당 네트워크 권한도 확인하세요.",
   "remote.install_tailscale": "Tailscale 공식 다운로드 열기",

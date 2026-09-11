@@ -1,4 +1,8 @@
 {
+  "remote.detect_app": "Conectar para que Norton detecte la aplicación",
+  "remote.detect_app_hint": "Este zai.exe consulta directamente información de versiones por HTTPS. No instala actualizaciones ni cambia ajustes. Después, vuelva a abrir la lista de programas de Norton.",
+  "remote.detect_app_busy": "Comprobando HTTPS desde esta aplicación…",
+  "remote.detect_app_done": "La conexión HTTPS funcionó. Vuelva a abrir la lista de Norton para comprobarlo; esto no confirma el registro ni el permiso.",
   "remote.copy_app_name": "Copiar nombre de la aplicación para buscar",
   "remote.norton_search_hint": "Busque “Zaivern Code” o “zai” en Norton. Introducir la ruta del exe en la búsqueda no registra la aplicación. Si no aparece, añada un programa en Control de programas y pegue la ruta inferior en el selector de archivos. Tailscale gestiona las conexiones HTTPS; compruebe también sus permisos de red.",
   "remote.install_tailscale": "Abrir la descarga oficial de Tailscale",

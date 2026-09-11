@@ -4,7 +4,7 @@
 
 ## 変更
 
-- スマホリモートのウィンドウ内で縦スクロールできるようにした。表示領域の80%を高さの目安・上限とし、中央配置でも末尾へ移動できる。
+- スマホリモートのウィンドウ内で縦スクロールできるようにした。初期修正では高さ80%を上限とし、その後の追加指定で全画面へ変更した。末尾までスクロールできる。
 - 未導入時にも Tailscale の状態と公式ダウンロード先を表示する。
 - Windows / macOS 共通の「HTTPS でスマホに接続」を主操作にした。既存の HTTP 接続は詳細に移した。
 - HTTPS は既存の `tailscale serve --bg --https=443 http://127.0.0.1:<port>` を使い、準備成功後に HTTPS URL / QR を表示する。Funnel は使わない。
@@ -23,7 +23,7 @@
 ## 実環境と未確認事項
 
 - この PC では Norton 360 を検出した。開始時点では Tailscale の実行ファイル・サービスが無かった。
-- 公式配布元を確認し、winget の Tailscale 1.102.3 インストーラーを取得、ハッシュ検証に成功。統合検証時にインストールも完了し、現在は `NeedsLogin`。ログインはユーザー操作が必要。
+- 公式配布元を確認し、winget の Tailscale 1.102.3 インストーラーを取得、ハッシュ検証に成功。統合検証時にインストールも完了し、導入直後は `NeedsLogin`。その後のユーザーログインにより `Running` と PC・iPhone のオンライン状態を確認した。
 - スマホからの実 HTTPS 接続、音声入力、Norton の許可設定後の疎通、GUI の目視確認は未確認。
 - Norton の独自設定をプログラムで変更していない。スタートメニューへの登録と、Norton のファイアウォールでの許可は別の操作である。
 - Windows 以外の実 OS での動作は未確認。
@@ -35,3 +35,5 @@
 - [Tailscale の Windows 導入](https://tailscale.com/docs/install/windows)
 - [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)
 - [Norton のプログラム制御・アプリルール](https://support.norton.com/sp/ja/jp/home/current/solutions/v20240108181338560)
+
+Norton 検出用のネイティブ HTTPS 通信と保存済みアプリ登録の確認結果は、[統合検証の追記](windows-ui-validation.md#norton-一覧に出ない問題への追加修正) を参照。

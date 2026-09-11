@@ -2949,51 +2949,72 @@ pub fn version_is_newer(latest: &str, current: &str) -> bool {
 
 /// URL の本文を取る。
 ///
-/// **HTTP クライアントのクレートは足さない** — どの OS にも標準で入っている
-/// ものを子プロセスで呼ぶ (macOS / Linux: curl、Windows: PowerShell)。
-/// 依存を 1 つ増やすと配布バイナリと監査対象が増えるが、ここで欲しいのは
-/// 「タグ名 1 個」だけなので割に合わない。
+/// Windows は既存の ureq でこのプロセス自身が通信する。
+/// セキュリティ製品が zai.exe の通信を識別できるよう、PowerShell に委譲しない。
+/// macOS / Linux の curl 経路は維持する。
 fn fetch_text(url: &str) -> Result<String, CliError> {
     // 自前の定数由来の URL しか来ないが、埋め込む前に必ず形を確認する。
     if !url.starts_with("https://") || url.contains('\'') || url.contains(char::is_whitespace) {
         return Err(CliError::Runtime(format!("取得できない URL です: {url}")));
     }
-    let out = if cfg!(windows) {
-        crate::procx::hidden_command("powershell")
-            .arg("-NoProfile")
-            .arg("-NonInteractive")
-            .arg("-Command")
-            .arg(format!(
-                "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; \
-                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
-                 (Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri '{url}').Content"
-            ))
-            .output()
-    } else {
-        crate::procx::hidden_command("curl")
+    #[cfg(windows)]
+    {
+        let agent = ureq::Agent::config_builder()
+            .https_only(true)
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                    .build(),
+            )
+            .timeout_global(Some(std::time::Duration::from_secs(20)))
+            .user_agent(concat!("zaivern-code/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .new_agent();
+        let mut response = agent
+            .get(url)
+            .call()
+            .map_err(|e| CliError::Runtime(format!("配布元へ接続できませんでした: {url} — {e}")))?;
+        // リリース情報・言語辞書用。ureq 既定の10MB上限を超える応答はエラーにする。
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| CliError::Runtime(format!("配布元の応答を解釈できません: {e}")))
+    }
+    #[cfg(not(windows))]
+    {
+        let out = crate::procx::hidden_command("curl")
             .arg("-fsSL")
             .arg("--max-time")
             .arg("20")
             .arg(url)
-            .output()
-    };
-    let out = out.map_err(|e| {
-        CliError::Runtime(format!(
-            "ネットワーク取得コマンドを起動できません: {e} (curl / PowerShell が必要です)"
-        ))
-    })?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(CliError::Runtime(format!(
-            "配布元へ接続できませんでした: {url}{}",
-            if err.is_empty() {
-                String::new()
-            } else {
-                format!(" — {err}")
-            }
-        )));
+            .output();
+        let out = out.map_err(|e| {
+            CliError::Runtime(format!(
+                "ネットワーク取得コマンドを起動できません: {e} (curl / PowerShell が必要です)"
+            ))
+        })?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(CliError::Runtime(format!(
+                "配布元へ接続できませんでした: {url}{}",
+                if err.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {err}")
+                }
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// セキュリティ製品の検出確認用。更新せず、製品プロセス自身から配布元へ HTTPS 接続する。
+#[cfg(windows)]
+pub(crate) fn check_distribution_connection() -> Result<(), String> {
+    distribution()
+        .and_then(|dist| fetch_latest_tag(&dist.latest_api))
+        .map(|_| ())
+        .map_err(|error| error.message().to_string())
 }
 
 /// 最新リリースのタグ (`v0.8.1` など)。
