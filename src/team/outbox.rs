@@ -6,8 +6,10 @@
 //!
 //! 画面から読むのをやめてここから読む。Claude Code v2 は報告を改行ではなく
 //! カーソル移動で描くので、画面のグリッドでは行が潰れて**構造的に**
-//! 取りこぼす (実測)。置き場を `ZAIVERN_HOME` の下に置くのは、ワークスペースへ
-//! 置くと `changeset` が「担当外を変更した」と測って報告ごと却下されるため。
+//! 取りこぼす (実測)。新しい直接実行は、開いたフォルダ内の
+//! `.zai-team-worktrees/.control/outbox/` を使う。この管理領域は担当の
+//! 差分計測・スナップショット・納品から除外する。従来の Run は既存の
+//! `ZAIVERN_HOME` 配下を維持し、既に渡した報告先と読み手を一致させる。
 //!
 //! ## 取り決め (書きかけを読まないために)
 //!
@@ -157,6 +159,27 @@ pub fn safe_child(base: &Path, name: &str) -> Option<PathBuf> {
 /// (画面から読む経路だけになる) し、閉じるときも**消さない**。
 pub fn run_dir(state_dir: &Path, run_id: &str) -> Option<PathBuf> {
     safe_child(&state_dir.join(DIR_NAME), run_id)
+}
+
+/// Direct-team reports belong inside the opened workspace's internal area,
+/// where agent tools can write without broadening sandbox permissions.
+pub fn workspace_run_dir(workspace: &Path, run_id: &str) -> Result<PathBuf, String> {
+    if !valid_run_id(run_id) {
+        return Err("報告先のRun IDが不正です".into());
+    }
+    super::task_workspace::checked_root(
+        workspace,
+        &format!("{}/.control/outbox/{run_id}", super::task_workspace::ROOT),
+    )
+}
+
+pub fn prepare_workspace_run_dir(workspace: &Path, run_id: &str) -> Result<PathBuf, String> {
+    let dir = workspace_run_dir(workspace, run_id)?;
+    let state = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("報告先の親がありません")?;
+    prepare_run_dir(state, run_id)
 }
 
 /// このRunのoutboxを、安全な親から1段ずつ作る。
@@ -1080,6 +1103,34 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_reports_are_internal_and_run_scoped() {
+        let root = crate::test_util::unique_temp_dir("team-outbox", "workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = prepare_workspace_run_dir(&root, "run-a").unwrap();
+        assert_eq!(dir, root.join(".zai-team-worktrees/.control/outbox/run-a"));
+        assert!(dir.is_dir());
+        assert_eq!(prepare_workspace_run_dir(&root, "run-a").unwrap(), dir);
+        assert_ne!(workspace_run_dir(&root, "run-b").unwrap(), dir);
+        assert!(workspace_run_dir(&root, "../outside").is_err());
+        assert!(!root.join("output").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_reports_reject_redirected_control_directories() {
+        let root = crate::test_util::unique_temp_dir("team-outbox", "workspace-link");
+        let internal = root.join(super::super::task_workspace::ROOT);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, internal.join(".control")).unwrap();
+        assert!(prepare_workspace_run_dir(&root, "run-a").is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn 全文資料は長い仕様の末尾と担当タスクを保存する() {

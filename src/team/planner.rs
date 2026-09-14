@@ -112,6 +112,9 @@ impl PlanError {
 /// (LLM Planner でも文脈に収まらないし、静的解析でも意味を成さない)。
 pub const IMPLEMENTATION_ONLY: &str = "[ZAI-IMPLEMENTATION-ONLY]";
 
+/// 仕様生成から担当・統合まで共通の納品契約。隔離先は納品先ではない。
+pub(super) const DELIVERY_CONTRACT: &str = "納品構成: チーム全体で一つの完成成果物を作る。最終納品先は開いたフォルダ直下の output/ に固定する。各担当は実装用cwd直下の output/ に本体と必要な同梱物を保存する。仕様の相対ファイル名も output/ 配下として扱い、既に output/ で始まるパスには重ねて付けない。既存プロジェクトを利用する場合も必要なファイルを output/ 内に揃え、外側の既存ファイルを変更・削除しない。統合担当は output/ の外に作った成果物を内側へ整理し、参照・起動コマンドを修正して単独で利用できることを確認する。全担当は同じ納品ルート・ファイル構成・起動入口・入出力契約を共有する。Part1・Part2や担当別フォルダに独立した完成品を作らない。part-N は内部の隔離作業先であり納品構成に含めない。各隔離先では共通の納品先基準の相対パスに担当部分を作る。統合担当は各部分を接続し、納品先の入口から仕様で要求された一連の利用操作を確認する。作業先や他担当のフォルダに依存する参照を残さない。最終報告には納品先・入口・起動または利用手順・実施した全体動作確認・未確認事項を記載する。納品先に保存するのは仕様で必要な本体・設定・同梱物だけとし、作業メモ・自己評価JSON・進捗ログ・重複した完了報告・空の雛形を追加しない。JSONは実行設定や要求されたデータなど用途がある場合だけ保存する。チーム制御の報告は指定outboxへ送り、納品先へ複製しない。統合時に今回生成した不要ファイルだけを除外し、既存の利用者ファイルや必要な検証資料を勝手に削除しない。";
+
 pub fn implementation_only(spec: &str) -> bool {
     spec.starts_with(IMPLEMENTATION_ONLY)
 }
@@ -179,6 +182,16 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
                     )));
                 }
             }
+            let files: Vec<_> = files
+                .into_iter()
+                .map(|file| {
+                    if file.starts_with("output/") {
+                        file
+                    } else {
+                        format!("output/{file}")
+                    }
+                })
+                .collect();
             let (label, deps) = assignment_dependencies(&label)?;
             let token = label
                 .split_once(':')
@@ -252,7 +265,7 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
             let dir = format!("{root}/part-{}", i + 1);
             tasks.push(TaskDoc {
                 key: format!("implement-{}", i + 1), title: format!("並列実装 {}: {}", i + 1, focus.lines().next().unwrap_or("担当部分").chars().take(80).collect::<String>()),
-                description: format!("担当: {focus}\n隔離先: {dir}/。Zaivernが用意するGitワークツリー（Gitが使えない環境では独立コピー）内で、既存の実装を直接編集する。ファイルの複製を別の場所へ作らない。他担当の完了を待たず、利用方法が分かる実装を作る。仕様書・計画書・テスト・レビューは作らない。変更ファイルと削除ファイルを完了要約へ列挙する。後続担当が差分を専用の隔離先へ統合し、Zaivernが開いたフォルダへ反映する。依頼外の機能は追加しない。"),
+                description: format!("担当: {focus}\n隔離先: {dir}/。Zaivernが用意するGitワークツリー（Gitが使えない環境では独立コピー）内で、output/ 内に担当成果物を実装する。既存の実装を参照する場合も必要なファイルを output/ 内に揃える。他担当の完了を待たず、利用方法が分かる実装を作る。仕様書・計画書・レビューの独立工程は増やさない。担当部分の必要なテストと動作確認は行う。変更ファイルと削除ファイルを完了要約へ列挙する。後続担当が差分を専用の隔離先へ統合し、Zaivernが開いたフォルダへ反映する。依頼外の機能は追加しない。"),
                 team: "implementation".into(), role: "implementer".into(), depends_on: vec![],
                 files: vec![format!("{dir}/**")], required_caps: vec![],
                 acceptance_criteria: vec!["担当部分の実体を作業場所に保存した".into()], validation_commands: vec![],
@@ -263,15 +276,23 @@ fn compose_implementation(input: &PlanInput) -> Result<PlanDoc, PlanError> {
     let dependencies = tasks.iter().map(|task| task.key.clone()).collect();
     tasks.push(TaskDoc {
         key: "assemble".into(), title: "実装を組み合わせて成果物を保存".into(),
-        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを自分の統合用隔離先へ統合する。元フォルダは直接編集しない。最終反映はZaivernが現在の元フォルダとの競合を検出して実行する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。原依頼全文と各担当の完了条件に照らし、接続と動作を確認し不足を修正する。未確認を合格扱いしない。仕様の再作成や確認待ちは追加しない。他Runの作業場所は使わない。".into(),
+        description: "完了した各担当の実装を読み、元の依頼の成果物へ組み込む。担当の隔離ワークツリーまたは独立コピーから、各担当が実装した差分だけを自分の統合用隔離先へ統合する。元フォルダは直接編集しない。各担当の output/ の独立した差分はZaivernが自動収集する。同じファイルの競合はこの統合先で解決する。最終反映はZaivernが現在の元フォルダとの競合を検出して実行する。コピーされた既存ファイル全体を上書きしない。Gitを使える場合はgit diff等で変更と削除を取得し、競合は元の依頼に合わせて解消する。Gitがない場合は完了要約の変更・削除ファイルと実体を使って統合する。HTMLの依頼ならHTML本体を作成する。本文・テンプレート・入力例・完成見本の名称、項目、値、ファイル形式を揃え、リンクを納品先基準の相対パスへ繋ぐ。商品本文へ混入した内部作業パスは除く。担当が提出できなかった本体・導入説明・完成見本は入手できた成果から直接補って仕上げる。他担当への差戻しを繰り返さず、自分で統合を完了する。原依頼全文と各担当の完了条件に照らし、接続と動作を確認し不足を修正する。未確認を合格扱いしない。仕様の再作成や確認待ちは追加しない。他Runの作業場所は使わない。".into(),
         team: "implementation".into(), role: "implementer".into(), depends_on: dependencies,
         files: vec![format!("{root}/part-0/**")], required_caps: vec![],
         acceptance_criteria: vec!["最終成果物を統合用の隔離先に保存した".into()], validation_commands: vec![],
     });
+    for task in &mut tasks {
+        task.description.push('\n');
+        task.description.push_str(DELIVERY_CONTRACT);
+    }
+    tasks.last_mut().unwrap().acceptance_criteria = vec![
+        "共通の納品先に各担当の成果を接続し、仕様の全要件を満たす一つの成果物として入口から利用できる".into(),
+        "納品先・入口・利用手順と全体動作確認の結果を報告し、未確認事項を明示した".into(),
+    ];
     Ok(PlanDoc {
         goal: GoalDoc {
             title,
-            definition_of_done: vec!["依頼された成果物を開いたフォルダに保存する".into()],
+            definition_of_done: vec!["共通の納品先に統合された成果物が仕様どおりに機能し、利用手順と検証結果が示されている".into()],
         },
         teams: vec![TeamDoc {
             key: "implementation".into(),
@@ -1400,6 +1421,18 @@ mod tests {
     }
 
     #[test]
+    fn 所有ファイルをoutputへ統一し二重化せず競合も検出する() {
+        let plan = assigned_plan("- implementer: T01 本体 (files: src/main.rs)\n- implementer: T02 接続 (files: output/src/main.rs)", 2).unwrap();
+        for task in &plan.tasks[..2] {
+            assert!(task
+                .description
+                .contains("所有ファイル（隔離先からの相対パス）: output/src/main.rs"));
+            assert!(!task.description.contains("output/output/"));
+        }
+        assert_eq!(plan.tasks[1].dependencies, vec![plan.tasks[0].id]);
+    }
+
+    #[test]
     fn 不完全な担当指定を汎用分割で隠さない() {
         for body in [
             "- implementer: T01 パスなし",
@@ -1417,6 +1450,10 @@ mod tests {
         let original = "## タスク\n- 昔のメモを維持\nURLと数値を省略しない";
         let plan = assigned_plan(&format!("- implementer: T01 本体 (files: index.html)\n## 原依頼（最優先・省略禁止）\n{original}"), 4).unwrap();
         assert_eq!(plan.tasks.len(), 2);
+        assert!(plan
+            .tasks
+            .iter()
+            .all(|t| t.description.contains(DELIVERY_CONTRACT)));
         assert!(plan.goal.specification.ends_with(original));
     }
 
@@ -1449,6 +1486,10 @@ mod tests {
         assert_eq!(p.tasks[1].dependencies, vec![p.tasks[0].id]);
         assert!(p.tasks[0].description.contains("元の依頼全体を担当"));
         assert!(p.goal.specification.ends_with(request));
+        assert!(p
+            .tasks
+            .iter()
+            .all(|t| t.description.contains(DELIVERY_CONTRACT)));
         assert!(p
             .tasks
             .iter()

@@ -229,7 +229,7 @@ impl ZaivernApp {
                     s.rate_limited.is_some(),
                     self.supervisor.state_of(s.id),
                 ),
-                tail: s.screen_tail_lines(SCAN_ROWS, SCAN_COLS),
+                tail: s.team_report_lines(SCAN_ROWS, SCAN_COLS),
             })
             .collect()
     }
@@ -1003,7 +1003,7 @@ impl ZaivernApp {
                 let spec = crate::agents::spec_for_command(&preset.command)
                     .ok_or_else(|| tr("team.draft.no_agent"))?;
                 let (program, args) =
-                    crate::diagnostician::build_invocation(&preset.command, spec)?;
+                    crate::agents::specification_invocation(&preset.command, spec)?;
                 let resolved = crate::features::team::imp::validation_command::resolve_in(
                     &program,
                     &request.workspace,

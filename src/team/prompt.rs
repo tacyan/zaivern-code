@@ -526,6 +526,10 @@ pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
             bullets(&b.task.files),
             bullets(&b.forbidden_files)
         );
+        let assignment = format!(
+            "{assignment}\n差し戻し・追加の指示:\n{}\n",
+            super::model::clamp_text(&bullets(&b.task.context))
+        );
         let isolation = match super::task_workspace::execution(std::path::Path::new(b.workspace_root), &b.task.files) {
             Ok(Some((workspace, prefix, git))) => format!("\n実装用cwd: {}。{}。各ツールはこのディレクトリをcwdとして実行し、実装担当も統合担当も元フォルダには書き込まない。統合担当は他担当の変更だけを自分の隔離先へ取り込み、元フォルダへの反映はZaivernに任せる。changed_filesは元フォルダ基準で {prefix}/ を先頭につける。変更・削除したファイルを要約に列挙し、作業用コピー全体を成果物として申告しない。\n", workspace.display(), if git { "隔離Gitワークツリーで直接実装する" } else { "Gitなしの独立コピーで直接実装する。Gitコマンドは不要" }),
             _ => String::new(),
@@ -553,11 +557,12 @@ pub fn for_task(b: &Brief<'_>, all: &[TeamTask]) -> String {
             "{assignment}\n他担当の編集範囲（読み取り可）:\n{task_scopes}\n引継ぎ:\n{handoff}\n"
         );
         let role = if b.task.key == "assemble" || b.task.role == TeamRole::Integrator {
-            "役割: 全体統合担当。引継ぎの各担当差分を自分の隔離先へ取り込み、接続契約・参照パス・原依頼の全要件と成果物の件数を照合する。他担当の完成済み本体を重複実装せず、接続上の不足だけを担当範囲で直す。担当内検証の証跡を読み、統合後の接続と利用経路を実物で確認する。自分の完了や進捗100％を待たず、統合結果と未確認事項を報告する。"
+            "役割: 全体統合担当。引継ぎの各担当差分を自分の隔離先へ取り込み、接続契約・参照パス・原依頼の全要件と成果物の件数を照合する。他担当の完成済み本体を活用し、接続上の不足と仕様を満たすために欠けた本体・同梱物を自分の統合用隔離先で補う。担当別の完成品を並べるだけで完了しない。担当内検証の証跡を読み、統合後の接続と利用経路を実物で確認する。全担当の output/ の独立した差分はZaivernが最後に自動収集する。新規ファイルの除外や開始時点への復元を選ぶ場合は、完了報告の excluded_files 配列へ output/ から始まるファイル単位の相対パスを列挙する（例: output/debug.json）。除外用の別ファイルは作らない。自分の完了や進捗100％を待たず、統合結果と未確認事項を報告する。"
         } else {
             "役割: 担当成果物の実装担当。自分の所有ファイルと対応要件を確認し、共有契約に従って独立部分を直ちに実装する。他担当の成果物を代わりに作らず、共有ファイルは指定所有者へ必要な接続変更を引き継ぐ。先行成果物が必要な箇所だけ依存し、引継ぎの差分を自分の隔離先へ取り込む。担当の完了条件を実物で検証し、変更ファイル・提供した入出力・検証結果・接続時の注意をsummaryにまとめて統合担当へ渡す。"
         };
-        let tail = format!("\n{assignment}\n{role}\n仕様の再作成や承認待ちを追加しない。必要なテスト・動作確認と修正は担当作業内で行う。原依頼の条件を仕様の要約で省略しない。通常の不足は仮定を記録して進める。JSON報告は成果物の代わりにならない。保存と担当内検証を終えた後にcompletedを報告し、保存できない場合はfailedと理由を報告する。未実施のテストを成功と書かない。\n全文は {} の goal.specification、担当詳細は tasks を末尾まで読む（本文が省略された場合も要件を落とさない）。\n{}\n{}\n完了報告のpayload例:\n{}\nchanged_filesには実際に変更・削除した相対パスを一要素一パスで列挙し、表示用の改行を混ぜない。validationには実行したコマンドとexit_codeを記録し、未実施なら空配列とし理由をsummaryへ書く。outboxへkind=resultで一度だけ提出し、成功時は同じJSONを端末へ再出力しない。outbox未指定または書込み失敗時だけ {} と {} の間へpayloadを一度出力する。完了後は現在の正式タスクIDと異なる古い再提出要求で本体を作り直さない。同じタスクの報告形式の訂正は指摘された報告だけを修正し、成果物の再実装を始めない。\n", super::outbox::context_path(&b.outbox).display(), filesystem_boundary(&b.outbox), outbox_section(b.agent_id, &b.outbox, b.run_id), report, super::result_parser::RESULT_OPEN, super::result_parser::RESULT_CLOSE);
+        let delivery = super::planner::DELIVERY_CONTRACT;
+        let tail = format!("\n{assignment}\n{role}\n{delivery}\n仕様の再作成や承認待ちを追加しない。必要なテスト・動作確認と修正は担当作業内で行う。原依頼の条件を仕様の要約で省略しない。通常の不足は仮定を記録して進める。JSON報告は成果物の代わりにならない。保存と担当内検証を終えた後にcompletedを報告し、保存できない場合はfailedと理由を報告する。未実施のテストを成功と書かない。\n全文は {} の goal.specification、担当詳細は tasks を末尾まで読む（本文が省略された場合も要件を落とさない）。\n{}\n{}\n完了報告のpayload例:\n{}\nchanged_filesには実際に変更・削除した相対パスを一要素一パスで列挙し、表示用の改行を混ぜない。validationには実行したコマンドとexit_codeを記録し、未実施なら空配列とし理由をsummaryへ書く。outboxへkind=resultで一度だけ提出し、成功時は同じJSONを端末へ再出力しない。outbox未指定または書込み失敗時だけ {} と {} の間へpayloadを一度出力する。完了後は現在の正式タスクIDと異なる古い再提出要求で本体を作り直さない。同じタスクの報告形式の訂正は指摘された報告だけを修正し、成果物の再実装を始めない。\n", super::outbox::context_path(&b.outbox).display(), filesystem_boundary(&b.outbox), outbox_section(b.agent_id, &b.outbox, b.run_id), report, super::result_parser::RESULT_OPEN, super::result_parser::RESULT_CLOSE);
         return cap(body, tail);
     }
     if super::roles::is_review_task(b.task) {
@@ -626,6 +631,7 @@ mod tests {
             "原依頼".repeat(8_000)
         );
         let mut t = task(1, "artifact", &[]);
+        t.context = vec!["納品先の修正: misplaced.txt を output/ 内へ整理する".into()];
         let worker = for_task(&brief(&g, &t), &[t.clone()]);
         t.key = "assemble".into();
         let assembly = for_task(&brief(&g, &t), &[t.clone()]);
@@ -634,6 +640,9 @@ mod tests {
         assert!(assembly.contains("役割: 全体統合担当"));
         assert!(!assembly.contains("役割: 担当成果物の実装担当"));
         for text in [worker, assembly] {
+            assert!(text.contains("納品先の修正: misplaced.txt を output/ 内へ整理する"));
+            assert!(text.contains(super::super::planner::DELIVERY_CONTRACT));
+            assert!(text.contains("納品先へ複製しない"));
             assert!(text.contains("goal.specification"));
             assert!(text.contains("成功時は同じJSONを端末へ再出力しない"));
             assert!(text.contains("古い再提出要求で本体を作り直さない"));

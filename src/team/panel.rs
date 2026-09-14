@@ -972,7 +972,7 @@ impl TeamPanel {
                     capped += 1;
                     continue;
                 }
-                let outbox_dir = match outbox::prepare_run_dir(&root, &name) {
+                let outbox_dir = match self.prepare_outbox_dir(&name) {
                     Ok(dir) => dir,
                     Err(why) => {
                         skipped.push(format!("{name:?} ({why})"));
@@ -1041,7 +1041,7 @@ impl TeamPanel {
                     self.restore = RestorePrompt::None;
                     return Err("保存された Team Run がありません".to_string());
                 }
-                let outbox_dir = outbox::prepare_run_dir(&dir, &id)?;
+                let outbox_dir = self.prepare_outbox_dir(&id)?;
                 let mut rt = self.restore_saved(*s, &dir, read_only)?;
                 rt.set_outbox(outbox_dir);
                 self.runs.push(rt);
@@ -1171,6 +1171,13 @@ impl TeamPanel {
         // こと自体は人に見せる。
         let runs_gone = persistence::remove_dir_checked(&dir.join(RUNS_DIR));
         let outbox_gone = persistence::remove_dir_checked(&dir.join(outbox::DIR_NAME));
+        let outbox_gone = outbox_gone.and_then(|()| {
+            for id in &ids {
+                let local = outbox::workspace_run_dir(&self.workspace, id)?;
+                persistence::remove_dir_checked(&local)?;
+            }
+            Ok(())
+        });
         self.outbox_ledger.prune_missing();
         self.runs.clear();
         self.active = 0;
@@ -1291,7 +1298,16 @@ impl TeamPanel {
         }
 
         let id = rt.run().run_id.clone();
-        let outbox_dir = outbox::prepare_run_dir(&self.state_dir(), &id)?;
+        let fresh = rt.goal().status == GoalStatus::Ready
+            && rt
+                .tasks()
+                .iter()
+                .all(|task| task.attempts == 0 && task.assigned_agent.is_none());
+        let outbox_dir = if fresh && super::planner::implementation_only(&rt.goal().specification) {
+            outbox::prepare_workspace_run_dir(&self.workspace, &id)?
+        } else {
+            self.prepare_outbox_dir(&id)?
+        };
         // エージェントと検証器の cwd は計画時に固定した、開いたフォルダ。
         // 専用 worktree を作らず、未コミット・未追跡ファイルもそのまま見せる。
         let source = self
@@ -1347,7 +1363,22 @@ impl TeamPanel {
     /// Run になる (画面から読む経路だけ)。作らないものは閉じるときも消さない
     /// ので、作る側と消す側が同じ関門 ([`outbox::run_dir`]) を通る。
     fn outbox_dir(&self, run_id: &str) -> PathBuf {
+        if let Ok(dir) = outbox::workspace_run_dir(&self.workspace, run_id) {
+            if dir.is_dir() {
+                return dir;
+            }
+        }
         outbox::run_dir(&self.state_dir(), run_id).unwrap_or_default()
+    }
+
+    fn prepare_outbox_dir(&self, run_id: &str) -> Result<PathBuf, String> {
+        let dir = outbox::workspace_run_dir(&self.workspace, run_id)?;
+        if dir.exists() {
+            outbox::prepare_workspace_run_dir(&self.workspace, run_id)
+        } else {
+            // Existing runs keep their original reporting location and instructions.
+            outbox::prepare_run_dir(&self.state_dir(), run_id)
+        }
     }
 
     /// **置き場に届いた報告を読み、取り込めたファイルだけ消す。**
@@ -2299,6 +2330,18 @@ impl TeamPanel {
                 errors.push(e);
             }
         }
+        match outbox::workspace_run_dir(&self.workspace, id) {
+            Ok(dir) => {
+                if let Err(e) = persistence::remove_dir_checked(&dir) {
+                    all_gone = false;
+                    errors.push(e);
+                }
+            }
+            Err(e) => {
+                all_gone = false;
+                errors.push(e);
+            }
+        }
         // **根の控えが閉じた Run のものなら消す。** 控えは「いちばん古い 1 本」の
         // 写しなので、その Run を閉じたのに残すと復元経路が拾い直す
         // (墓標が断るが、案内だけ出て何も起きない状態になる)。
@@ -3160,6 +3203,62 @@ mod tests {
     }
 
     #[test]
+    fn direct_run_reports_stay_inside_workspace_across_restore_and_close() {
+        let dir = ws("direct-report-lifecycle");
+        let mut p = panel_at(&dir);
+        let spec = format!(
+            "{}\n# ページ\n## 要件\n- ページを作る (output/index.html)\n",
+            super::super::planner::IMPLEMENTATION_ONLY
+        );
+        p.plan(&spec, "request", RunOptions::default()).unwrap();
+        p.act(TeamAction::Start);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !p.workspace_preparations.is_empty() && std::time::Instant::now() < deadline {
+            p.poll_workspace_preparations();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(p.workspace_preparations.is_empty(), "隔離準備が完了しない");
+        assert_eq!(p.goal_status(), Some(GoalStatus::Running), "{}", p.notice);
+        let id = p.owner().unwrap().run_id;
+        let local = outbox::workspace_run_dir(&dir, &id).unwrap();
+        assert_eq!(p.rt().unwrap().outbox(), local);
+        assert_eq!(p.outbox_dir(&id), local);
+        assert!(local.is_dir());
+        p.save_if_needed();
+        drop(p);
+        let mut q = panel_at(&dir);
+        q.restore_run(false).unwrap();
+        assert_eq!(q.rt().unwrap().outbox(), local);
+        assert_eq!(q.prepare_outbox_dir(&id).unwrap(), local);
+        q.prepare_active_workspace().unwrap();
+        assert_eq!(q.rt().unwrap().outbox(), local);
+        std::fs::create_dir_all(dir.join("output")).unwrap();
+        std::fs::write(dir.join("output/index.html"), "delivered").unwrap();
+        q.close_run(0).unwrap();
+        finish_close_for_test(&mut q);
+        assert!(!local.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("output/index.html")).unwrap(),
+            "delivered"
+        );
+        drop(q);
+        let mut legacy = panel_at(&dir);
+        legacy
+            .plan(&spec, "request", RunOptions::default())
+            .unwrap();
+        // Model a restored old direct run: already started, with its original outbox.
+        legacy.rt_mut().unwrap().apply_action(TeamAction::Start);
+        let old_id = legacy.owner().unwrap().run_id;
+        let old_dir = outbox::prepare_run_dir(&legacy.state_dir(), &old_id).unwrap();
+        legacy.rt_mut().unwrap().set_outbox(old_dir.clone());
+        legacy.prepare_active_workspace().unwrap();
+        assert_eq!(legacy.rt().unwrap().outbox(), old_dir);
+        assert!(!outbox::workspace_run_dir(&dir, &old_id).unwrap().exists());
+        drop(legacy);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn 自動人数は暫定二体を超え必要な独立担当だけに合わせる() {
         for (count, chained, automatic, expected) in [
             (1, false, true, 1),
@@ -3353,7 +3452,7 @@ mod tests {
         assert!(panel.pending_close.is_none());
         assert!(panel.runs.is_empty());
         assert_eq!(
-            std::fs::read_to_string(source.join("body.txt")).unwrap(),
+            std::fs::read_to_string(source.join("output/body.txt")).unwrap(),
             "元の本文"
         );
         assert!(super::super::integration::try_acquire(&source, "observer")

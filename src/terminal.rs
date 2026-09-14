@@ -3092,7 +3092,7 @@ impl Session {
         let Some(bin) = self.agent_bin() else {
             return true;
         };
-        if crate::agents::input_ready_marker(bin).is_none() {
+        if !crate::agents::needs_input_surface_check(bin, self.last_prompt.is_some()) {
             return true;
         }
         crate::agents::input_surface_ready(bin, &lock_ok(&self.parser).screen().contents())
@@ -3595,12 +3595,121 @@ impl Session {
         }
     }
 
+    /// Team protocol input: retain JSON punctuation and recent scrollback.
+    /// Card previews deliberately discard punctuation-only rows and cannot be used here.
+    pub fn team_report_lines(&self, rows: usize, cols: usize) -> Vec<String> {
+        recent_report_lines(&mut lock_ok(&self.parser), rows, cols)
+    }
+
     /// 看板カードのライブプレビュー用: 画面末尾の「内容のある行」を最大 `rows` 行、
     /// 各行 `max` 文字までで返す (上から下へ時系列順)。英数字か仮名漢字を 1 文字も
     /// 含まない行 (罫線・入力枠だけの行) や空行は飛ばす。
     pub fn screen_tail_lines(&self, rows: usize, max: usize) -> Vec<String> {
         let text = lock_ok(&self.parser).screen().contents();
         pick_tail_lines(&text, rows, max)
+    }
+}
+
+/// Read a bounded physical-row window without changing the user's scroll position.
+/// Soft-wrapped rows are joined, preserving JSON strings and long relative paths.
+pub(crate) fn recent_report_lines(
+    p: &mut vt100::Parser,
+    requested: usize,
+    column_budget: usize,
+) -> Vec<String> {
+    let saved = p.screen().scrollback();
+    let (height, width) = p.screen().size();
+    let limit = requested.min(requested.saturating_mul(column_budget) / usize::from(width.max(1)));
+    if height == 0 || limit == 0 {
+        return Vec::new();
+    }
+    p.set_scrollback(limit.saturating_sub(usize::from(height)));
+    let top = p.screen().scrollback();
+    let mut consumed = usize::from(height).saturating_sub(limit);
+    let end = consumed + limit;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    loop {
+        let offset = top.saturating_sub(consumed);
+        p.set_scrollback(offset);
+        let start = top - p.screen().scrollback();
+        for (row, text) in p
+            .screen()
+            .rows(0, width)
+            .enumerate()
+            .skip(consumed.saturating_sub(start))
+            .take(end - consumed)
+        {
+            line.push_str(&text);
+            consumed += 1;
+            if !p.screen().row_wrapped(row as u16) {
+                lines.push(std::mem::take(&mut line));
+            }
+        }
+        if offset == 0 || consumed >= end {
+            break;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    p.set_scrollback(saved);
+    lines
+}
+
+#[cfg(test)]
+mod team_report_tests {
+    #[test]
+    fn short_budget_reads_the_bottom_and_restores_the_view() {
+        let mut parser = vt100::Parser::new(300, 80, 1000);
+        for row in 0..299 {
+            parser.process(format!("row-{row}\r\n").as_bytes());
+        }
+        parser.process(b"FINAL-REPORT");
+        let lines = super::recent_report_lines(&mut parser, 12, 80);
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines.first().unwrap(), "row-288");
+        assert_eq!(lines.last().unwrap(), "FINAL-REPORT");
+        let lines = super::recent_report_lines(&mut parser, 200, 400);
+        assert_eq!(lines.last().unwrap(), "FINAL-REPORT");
+        assert!(super::recent_report_lines(&mut parser, 0, 80).is_empty());
+        assert!(super::recent_report_lines(&mut parser, 200, 0).is_empty());
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn json_report_survives_scrollback_punctuation_and_soft_wrapping() {
+        let mut parser = vt100::Parser::new(5, 48, 1000);
+        for _ in 0..100 {
+            parser.process(b"old output\r\n");
+        }
+        let value = serde_json::json!({"task_id":1,"status":"completed", "changed_files":[format!("output/{}/main.js", "long-path-".repeat(8))],"validation":[{"exit_code":0}],"blockers":[]});
+        let body = serde_json::to_string_pretty(&value).unwrap();
+        parser.process(
+            format!(
+                "[ZAI-TEAM-RESULT]\r\n{}\r\n[/ZAI-TEAM-RESULT]\r\nready\r\n",
+                body.replace('\n', "\r\n")
+            )
+            .as_bytes(),
+        );
+        parser.set_scrollback(3);
+        let position = parser.screen().scrollback();
+        let text = super::recent_report_lines(&mut parser, 200, 400).join("\n");
+        assert_eq!(parser.screen().scrollback(), position);
+        let body = text
+            .split_once("[ZAI-TEAM-RESULT]\n")
+            .unwrap()
+            .1
+            .split_once("\n[/ZAI-TEAM-RESULT]")
+            .unwrap()
+            .0;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            value
+        );
+        assert!(text.lines().any(|line| line.trim() == "}"));
+        let bounded = super::recent_report_lines(&mut parser, 12, 48);
+        assert!(bounded.len() <= 12);
     }
 }
 

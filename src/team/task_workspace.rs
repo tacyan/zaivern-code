@@ -4,6 +4,15 @@ use std::path::{Component, Path, PathBuf};
 
 pub const ROOT: &str = ".zai-team-worktrees";
 
+/// Exact delivery paths only; never accept a directory wildcard or traversal.
+pub(super) fn delivery_file_path(path: &str) -> bool {
+    path.starts_with("output/")
+        && !path.contains(['\\', ':', '*', '?', '[', ']'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 pub fn scope(files: &[String]) -> Option<&str> {
     if files.len() != 1 {
         return None;
@@ -511,11 +520,13 @@ pub(super) fn frozen_files(
     files: &[String],
     baseline: &Snapshot,
     cancel: &std::sync::atomic::AtomicBool,
+    budget: &mut u64,
+    preflight: impl FnOnce(&mut Snapshot) -> Result<(), String>,
 ) -> Result<std::collections::BTreeMap<String, (Entry, Vec<u8>)>, String> {
     use std::io::Read;
-    let scanned = snapshot_cancellable(root, &read_ready(source, files)?.excluded, cancel)?;
+    let mut scanned = snapshot_cancellable(root, &read_ready(source, files)?.excluded, cancel)?;
+    preflight(&mut scanned)?;
     let mut out = std::collections::BTreeMap::new();
-    let mut budget = super::changeset::MAX_HASH_BYTES;
     for (relative, entry) in scanned {
         check_cancel(cancel)?;
         let mut bytes = Vec::new();
@@ -523,10 +534,10 @@ pub(super) fn frozen_files(
             let path = checked_root(root, &relative)?;
             let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
             let meta = file.metadata().map_err(|e| e.to_string())?;
-            if meta.len() > budget {
+            if meta.len() > *budget {
                 return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
             }
-            let mut reader = file.take(budget + 1);
+            let mut reader = file.take(*budget + 1);
             let mut buffer = [0u8; 65536];
             loop {
                 check_cancel(cancel)?;
@@ -536,13 +547,13 @@ pub(super) fn frozen_files(
                 }
                 bytes.extend_from_slice(&buffer[..n]);
             }
-            if bytes.len() as u64 > budget {
+            if bytes.len() as u64 > *budget {
                 return Err("統合の変更内容が読み取り上限64MiBを超えたため保留しました".into());
             }
             if file_entry(&bytes, &meta) != entry {
                 return Err(format!("統合候補の取得中に更新されました: {relative}"));
             }
-            budget -= bytes.len() as u64;
+            *budget -= bytes.len() as u64;
         }
         out.insert(relative, (entry, bytes));
     }

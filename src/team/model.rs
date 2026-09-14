@@ -173,7 +173,10 @@ impl GoalStatus {
 
     /// もう動かさない状態か。
     pub fn is_terminal(self) -> bool {
-        matches!(self, GoalStatus::Completed | GoalStatus::Submitted | GoalStatus::Failed)
+        matches!(
+            self,
+            GoalStatus::Completed | GoalStatus::Submitted | GoalStatus::Failed
+        )
     }
 }
 
@@ -817,7 +820,10 @@ impl TeamTaskState {
 
     /// これ以上動かさない状態か。
     pub fn is_terminal(self) -> bool {
-        matches!(self, TeamTaskState::Completed | TeamTaskState::Submitted | TeamTaskState::NeedsUser)
+        matches!(
+            self,
+            TeamTaskState::Completed | TeamTaskState::Submitted | TeamTaskState::NeedsUser
+        )
     }
 
     /// **その担当が今まさに手を動かしている**状態か。
@@ -947,6 +953,9 @@ pub struct TeamTask {
     /// 見た人が自己申告を「実際に変わったファイル」として読む。
     #[serde(default)]
     pub reported_files: Vec<String>,
+    /// Assembly choices: do not restore these worker paths during final collection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_files: Vec<String>,
     pub blockers: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -1184,8 +1193,11 @@ mod tests {
         assert!(!v.passed(&req), "未実行で通してはいけない");
         v.runs.push(ValidationRun::passed("cargo test a"));
         assert!(!v.passed(&req), "一部だけで通してはいけない");
-        v.runs
-            .push(ValidationRun::new("cargo test b", 1, ValidationOutcome::Failed));
+        v.runs.push(ValidationRun::new(
+            "cargo test b",
+            1,
+            ValidationOutcome::Failed,
+        ));
         assert!(!v.passed(&req), "失敗があるのに通してはいけない");
         assert!(v.failed());
     }

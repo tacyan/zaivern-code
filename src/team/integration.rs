@@ -363,6 +363,8 @@ fn try_acquire_at(
 
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Outcome {
+    /// A delivery-layout failure occurs before any candidate is installed.
+    pub delivery_rejected: bool,
     pub changed: Vec<String>,
     pub conflicts: Vec<String>,
     pub notes: Vec<String>,
@@ -671,9 +673,14 @@ fn publish_inner(
     publish_impl(
         permit,
         source,
-        assemble_files,
+        DeliveryFiles {
+            assembly: assemble_files,
+            contributors: &[],
+            excluded: &[],
+        },
         &std::sync::atomic::AtomicBool::new(false),
         &mut outcome,
+        false,
         #[cfg(test)]
         &mut checkpoint,
     )?;
@@ -684,28 +691,47 @@ pub(super) fn publish_cancellable(
     permit: &Permit,
     source: &Path,
     files: &[String],
+    contributors: &[Vec<String>],
+    excluded_files: &[String],
     cancel: &std::sync::atomic::AtomicBool,
     outcome: &mut Outcome,
 ) -> Result<(), String> {
     publish_impl(
         permit,
         source,
-        files,
+        DeliveryFiles {
+            assembly: files,
+            contributors,
+            excluded: excluded_files,
+        },
         cancel,
         outcome,
+        true,
         #[cfg(test)]
         &mut |_, _| {},
     )
 }
 
+struct DeliveryFiles<'a> {
+    assembly: &'a [String],
+    contributors: &'a [Vec<String>],
+    excluded: &'a [String],
+}
+
 fn publish_impl(
     permit: &Permit,
     source: &Path,
-    assemble_files: &[String],
+    files: DeliveryFiles<'_>,
     cancel: &std::sync::atomic::AtomicBool,
     outcome: &mut Outcome,
+    require_output: bool,
     #[cfg(test)] checkpoint: &mut dyn FnMut(PublishStage, &str),
 ) -> Result<(), String> {
+    let DeliveryFiles {
+        assembly: assemble_files,
+        contributors,
+        excluded: excluded_files,
+    } = files;
     task_workspace::check_cancel(cancel)?;
     let source = source
         .canonicalize()
@@ -724,8 +750,129 @@ fn publish_impl(
     let (workspace, _, _) = task_workspace::execution(&source, assemble_files)?
         .ok_or("統合担当が隔離されていません")?;
     let baseline = task_workspace::baseline(&source, assemble_files)?;
-    let candidate =
-        task_workspace::frozen_files(&workspace, &source, assemble_files, &baseline, cancel)?;
+    let mut budget = super::changeset::MAX_HASH_BYTES;
+    let mut candidate = task_workspace::frozen_files(
+        &workspace,
+        &source,
+        assemble_files,
+        &baseline,
+        cancel,
+        &mut budget,
+        |candidate| {
+            if require_output {
+                let outside: Vec<_> = baseline
+                    .keys()
+                    .chain(candidate.keys())
+                    .filter(|path| {
+                        !path.starts_with("output/") && baseline.get(*path) != candidate.get(*path)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .take(20)
+                    .cloned()
+                    .collect();
+                if !outside.is_empty() {
+                    outcome.delivery_rejected = true;
+                    return Err(format!("納品先は開いたフォルダ直下の output/ です。範囲外の変更・削除を反映せず差し戻しました: {}。自分の隔離先で必要な成果物を output/ 内へ整理し、外側の既存ファイルを隔離開始時の状態へ戻し、参照と利用手順を確認して再提出してください", outside.join(", ")));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if excluded_files
+        .iter()
+        .any(|path| !task_workspace::delivery_file_path(path))
+    {
+        return Err("成果物の除外パスが不正です".into());
+    }
+    let excluded: BTreeSet<_> = excluded_files.iter().collect();
+    // Assembly edits resolve overlaps; untouched paths retain every worker's
+    // independent change. All bytes share one budget and the existing journal.
+    let assembly_changes: BTreeSet<_> = baseline
+        .keys()
+        .chain(candidate.keys())
+        .filter(|path| baseline.get(*path) != candidate.get(*path).map(|(entry, _)| entry))
+        .cloned()
+        .collect();
+    let mut selected: std::collections::BTreeMap<String, Option<Entry>> = Default::default();
+    let scope = task_workspace::scope(assemble_files).ok_or("統合範囲が不正です")?;
+    let run_scope = scope.rsplit_once('/').ok_or("統合Runが不正です")?.0;
+    for files in contributors {
+        task_workspace::check_cancel(cancel)?;
+        let worker_scope = task_workspace::scope(files).ok_or("担当の隔離範囲が不正です")?;
+        if worker_scope == scope || worker_scope.rsplit_once('/').map(|v| v.0) != Some(run_scope) {
+            return Err("異なるRunまたは統合担当自身の変更は収集できません".into());
+        }
+        let (worker, _, _) =
+            task_workspace::execution(&source, files)?.ok_or("担当の隔離先がありません")?;
+        if task_workspace::baseline(&source, files)? != baseline {
+            return Err("担当間の開始時点が一致しないため成果物の集約を保留しました".into());
+        }
+        let mut changes = task_workspace::frozen_files(
+            &worker,
+            &source,
+            files,
+            &baseline,
+            cancel,
+            &mut budget,
+            |snapshot| {
+                snapshot.retain(|path, _| {
+                    path.starts_with("output/")
+                        && !assembly_changes.contains(path)
+                        && !excluded.contains(path)
+                });
+                Ok(())
+            },
+        )?;
+        let paths: BTreeSet<_> = baseline
+            .keys()
+            .chain(changes.keys())
+            .filter(|path| {
+                path.starts_with("output/")
+                    && !assembly_changes.contains(*path)
+                    && !excluded.contains(*path)
+                    && baseline.get(*path) != changes.get(*path).map(|(entry, _)| entry)
+            })
+            .cloned()
+            .collect();
+        for path in paths {
+            let after = changes.get(&path).map(|(entry, _)| entry.clone());
+            if selected
+                .get(&path)
+                .is_some_and(|previous| previous != &after)
+            {
+                outcome.delivery_rejected = true;
+                return Err(format!("担当間で成果物が競合しています: {path}。各Partの変更を確認し、統合担当の output/ に解決済みの内容を保存して再提出してください"));
+            }
+            selected.insert(path.clone(), after);
+            if let Some(file) = changes.remove(&path) {
+                candidate.insert(path, file);
+            } else {
+                candidate.remove(&path);
+            }
+        }
+        if candidate.len() > 100_000 {
+            return Err("統合ファイル数の上限を超えました".into());
+        }
+    }
+    if require_output {
+        if !candidate.iter().any(|(path, (entry, _))| {
+            path.starts_with("output/") && matches!(entry, Entry::File { .. })
+        }) {
+            outcome.delivery_rejected = true;
+            return Err("全担当を集約しても output/ に納品する実ファイルがありません。成果物を保存して再提出してください".into());
+        }
+        for path in candidate.keys().filter(|path| path.starts_with("output/")) {
+            if Path::new(path)
+                .ancestors()
+                .skip(1)
+                .any(|parent| candidate.contains_key(&parent.to_string_lossy().replace('\\', "/")))
+            {
+                outcome.delivery_rejected = true;
+                return Err(format!("担当間でファイルとフォルダが競合しています: {path}。統合担当の output/ で構成を解決して再提出してください"));
+            }
+        }
+    }
     let paths: BTreeSet<_> = baseline.keys().chain(candidate.keys()).cloned().collect();
     let replacements: BTreeSet<_> = candidate
         .keys()
@@ -984,6 +1131,9 @@ mod tests {
             std::fs::read_to_string(self.0.join(name)).unwrap()
         }
         fn isolate(&self, run: &str) -> (Vec<String>, PathBuf) {
+            self.isolate_part(run, 0)
+        }
+        fn isolate_part(&self, run: &str, part: usize) -> (Vec<String>, PathBuf) {
             let plan = StaticPlanner
                 .plan(PlanInput {
                     spec: format!(
@@ -998,7 +1148,7 @@ mod tests {
                 })
                 .unwrap();
             let mut task = plan.tasks[0].clone();
-            task.files = vec![format!("{}/{run}/part-0/**", task_workspace::ROOT)];
+            task.files = vec![format!("{}/{run}/part-{part}/**", task_workspace::ROOT)];
             task_workspace::prepare(&self.0, std::slice::from_ref(&task)).unwrap();
             let (root, _, _) = task_workspace::execution(&self.0, &task.files)
                 .unwrap()
@@ -1010,6 +1160,336 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn put_output(work: &Path, name: &str, body: &str) {
+        let path = work.join("output").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn all_parts_are_collected_into_the_opened_folder_without_part_directories() {
+        let f = Fixture::new("collect-all");
+        let (assembly, work) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (second, two) = f.isolate_part("run", 2);
+        put_output(&one, "index.html", "<script src='assets/app.js'></script>");
+        put_output(&two, "assets/app.js", "console.log('ready')");
+        put_output(&work, "README.md", "open index.html");
+        std::fs::write(one.join("internal-note.json"), "not a deliverable").unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &[first, second],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(outcome.changed.len(), 3);
+        assert_eq!(
+            f.read("output/index.html"),
+            "<script src='assets/app.js'></script>"
+        );
+        assert_eq!(f.read("output/assets/app.js"), "console.log('ready')");
+        assert_eq!(f.read("output/README.md"), "open index.html");
+        assert!(!f.0.join("output/part-1").exists());
+        assert!(!f.0.join("output/output").exists());
+        assert!(!f.0.join("internal-note.json").exists());
+    }
+
+    #[test]
+    fn untouched_copies_do_not_undo_worker_edits_and_deletions() {
+        let f = Fixture::new("collect-diff");
+        f.write("output/body.txt", "original");
+        f.write("output/obsolete.txt", "obsolete");
+        let (assembly, _) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (second, _) = f.isolate_part("run", 2);
+        put_output(&one, "body.txt", "worker edit");
+        std::fs::remove_file(one.join("output/obsolete.txt")).unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &[first, second],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(f.read("output/body.txt"), "worker edit");
+        assert!(!f.0.join("output/obsolete.txt").exists());
+    }
+
+    #[test]
+    fn conflicting_parts_wait_for_assembly_resolution_before_any_publication() {
+        let f = Fixture::new("collect-conflict");
+        let (assembly, work) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (second, two) = f.isolate_part("run", 2);
+        put_output(&one, "shared.txt", "first");
+        put_output(&one, "first.txt", "one");
+        put_output(&two, "shared.txt", "second");
+        put_output(&two, "second.txt", "two");
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let contributors = [first, second];
+        let mut outcome = Outcome::default();
+        assert!(publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &contributors,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome
+        )
+        .unwrap_err()
+        .contains("shared.txt"));
+        assert!(outcome.delivery_rejected);
+        assert!(outcome.changed.is_empty());
+        assert!(!f.0.join("output").exists());
+        put_output(&work, "shared.txt", "resolved");
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &contributors,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(f.read("output/shared.txt"), "resolved");
+        assert_eq!(f.read("output/first.txt"), "one");
+        assert_eq!(f.read("output/second.txt"), "two");
+    }
+
+    #[test]
+    fn collected_workers_do_not_overwrite_user_edits_or_include_other_runs() {
+        let f = Fixture::new("collect-user-edit");
+        f.write("output/body.txt", "original");
+        let (assembly, _) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (foreign, other) = f.isolate_part("other", 1);
+        put_output(&one, "body.txt", "worker edit");
+        put_output(&other, "foreign.txt", "other run");
+        f.write("output/body.txt", "user edit");
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let mut outcome = Outcome::default();
+        assert!(publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &[foreign],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome
+        )
+        .is_err());
+        assert!(outcome.changed.is_empty());
+        assert!(!f.0.join("output/foreign.txt").exists());
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &[first],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(outcome.conflicts, ["output/body.txt"]);
+        assert_eq!(f.read("output/body.txt"), "user edit");
+    }
+
+    #[test]
+    fn explicit_exclusions_preserve_reverts_and_do_not_resurrect_unwanted_files() {
+        let f = Fixture::new("collect-exclude");
+        f.write("output/body.txt", "original");
+        let (assembly, work) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (second, two) = f.isolate_part("run", 2);
+        for (worker, content) in [(&one, "one"), (&two, "two")] {
+            put_output(worker, "body.txt", content);
+            put_output(worker, "debug.json", content);
+        }
+        put_output(&work, "README.md", "complete");
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &[first, second],
+            &["output/body.txt".into(), "output/debug.json".into()],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(f.read("output/body.txt"), "original");
+        assert!(!f.0.join("output/debug.json").exists());
+        assert_eq!(f.read("output/README.md"), "complete");
+        assert!(!outcome.delivery_rejected);
+    }
+
+    #[test]
+    fn collection_reads_only_selected_output_bytes_and_shares_the_total_budget() {
+        let f = Fixture::new("collect-budget");
+        let (assembly, work) = f.isolate("run");
+        let (first, one) = f.isolate_part("run", 1);
+        let (second, two) = f.isolate_part("run", 2);
+        put_output(&one, "a.bin", "a");
+        put_output(&two, "b.bin", "b");
+        std::fs::File::create(one.join("outside.bin"))
+            .unwrap()
+            .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+            .unwrap();
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let contributors = [first, second];
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &contributors,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(f.read("output/a.bin"), "a");
+        assert!(!f.0.join("outside.bin").exists());
+        for (worker, path) in [(&one, "output/a.bin"), (&two, "output/b.bin")] {
+            std::fs::File::create(worker.join(path))
+                .unwrap()
+                .set_len(super::super::changeset::MAX_HASH_BYTES / 2 + 1)
+                .unwrap();
+        }
+        let mut outcome = Outcome::default();
+        assert!(publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &contributors,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome
+        )
+        .unwrap_err()
+        .contains("64MiB"));
+        assert!(outcome.changed.is_empty());
+        assert_eq!(f.read("output/a.bin"), "a");
+        // A resolved assembly replacement must not read the oversized worker copy.
+        put_output(&work, "a.bin", "a");
+        put_output(&work, "b.bin", "b");
+        let mut outcome = Outcome::default();
+        publish_cancellable(
+            &permit,
+            &f.0,
+            &assembly,
+            &contributors,
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn production_publication_checks_output_before_any_installation() {
+        for outside in [
+            "index.html",
+            "output-other/app.js",
+            "existing.txt",
+            "large.bin",
+        ] {
+            let f = Fixture::new("delivery-boundary");
+            f.write("existing.txt", "original");
+            let (files, work) = f.isolate("run");
+            std::fs::create_dir_all(work.join("output")).unwrap();
+            std::fs::write(work.join("output/index.html"), "deliverable").unwrap();
+            if outside == "existing.txt" {
+                std::fs::remove_file(work.join(outside)).unwrap();
+            } else {
+                std::fs::create_dir_all(work.join(outside).parent().unwrap()).unwrap();
+                std::fs::write(work.join(outside), "misplaced").unwrap();
+                if outside == "large.bin" {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(work.join(outside))
+                        .unwrap()
+                        .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
+                        .unwrap();
+                }
+            }
+            let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+            let mut outcome = Outcome::default();
+            let result = publish_cancellable(
+                &permit,
+                &f.0,
+                &files,
+                &[],
+                &[],
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut outcome,
+            );
+            assert!(result.unwrap_err().contains(outside));
+            assert!(outcome.delivery_rejected);
+            assert!(outcome.changed.is_empty());
+            assert!(!f.0.join("output/index.html").exists());
+            assert_eq!(f.read("existing.txt"), "original");
+            if outside == "existing.txt" {
+                std::fs::write(work.join(outside), "original").unwrap();
+            } else {
+                std::fs::remove_file(work.join(outside)).unwrap();
+            }
+            let mut outcome = Outcome::default();
+            publish_cancellable(
+                &permit,
+                &f.0,
+                &files,
+                &[],
+                &[],
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut outcome,
+            )
+            .unwrap();
+            assert!(!outcome.delivery_rejected);
+            assert_eq!(outcome.changed, ["output/index.html"]);
+            assert_eq!(f.read("output/index.html"), "deliverable");
+            assert!(!f.0.join("output/output").exists());
+            assert_eq!(f.read("existing.txt"), "original");
+        }
+    }
+
+    #[test]
+    fn production_publication_rejects_empty_output() {
+        let f = Fixture::new("empty-delivery");
+        let (files, _) = f.isolate("run");
+        let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+        let mut outcome = Outcome::default();
+        assert!(publish_cancellable(
+            &permit,
+            &f.0,
+            &files,
+            &[],
+            &[],
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut outcome
+        )
+        .is_err());
+        assert!(outcome.delivery_rejected);
+        assert!(outcome.changed.is_empty());
     }
 
     #[test]
@@ -1182,9 +1662,14 @@ mod tests {
         let result = publish_impl(
             &permit,
             &f.0,
-            &files,
+            DeliveryFiles {
+                assembly: &files,
+                contributors: &[],
+                excluded: &[],
+            },
             &cancel,
             &mut outcome,
+            false,
             &mut |at, path| {
                 if at == PublishStage::AfterCapture && path == "a" {
                     cancel.store(true, Ordering::Release);

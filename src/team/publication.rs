@@ -33,6 +33,7 @@ impl Job {
         hold: IntegrationHold,
         task: &TeamTask,
         owner: RunOwner,
+        contributors: Vec<Vec<String>>,
         #[cfg(test)] hook: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
@@ -40,6 +41,7 @@ impl Job {
         let stop = cancel.clone();
         let source = owner.workspace.clone();
         let files = task.files.clone();
+        let excluded_files = task.excluded_files.clone();
         let identity = serde_json::json!({"run_id": owner.run_id, "source_workspace": owner.source_workspace,
             "workspace": source, "task": task.id, "attempts": task.attempts,
             "dispatch_seq": task.dispatch_seq, "session": hold.session});
@@ -58,6 +60,8 @@ impl Job {
                         &hold.permit,
                         &source,
                         &files,
+                        &contributors,
+                        &excluded_files,
                         &stop,
                         &mut outcome,
                     )

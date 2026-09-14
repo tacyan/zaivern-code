@@ -274,6 +274,7 @@ pub fn validate(doc: PlanDoc, spec_text: &str) -> Result<TeamPlan, SchemaError> 
             state: TeamTaskState::Pending,
             baseline: None,
             reported_files: Vec::new(),
+            excluded_files: Vec::new(),
             assigned_agent: None,
             assigned_session: None,
             attempts: 0,
@@ -549,13 +550,28 @@ mod role_from_title_tests {
     fn 表題が役割を名乗っていれば拾う() {
         // 実機の表題そのもの。
         for (title, want) in [
-            ("planner: 依頼にある中身を実装前に文章で固める", TeamRole::Planner),
-            ("architect: ファイル構成と 3D の実現方式を確定する", TeamRole::Architect),
-            ("implementer(markup): ページの HTML を書く", TeamRole::Implementer),
+            (
+                "planner: 依頼にある中身を実装前に文章で固める",
+                TeamRole::Planner,
+            ),
+            (
+                "architect: ファイル構成と 3D の実現方式を確定する",
+                TeamRole::Architect,
+            ),
+            (
+                "implementer(markup): ページの HTML を書く",
+                TeamRole::Implementer,
+            ),
             ("implementer(style): スタイルを書く", TeamRole::Implementer),
             ("tester: 実際にブラウザで開いて確認する", TeamRole::Tester),
-            ("reviewer: index.html を読み、契約と照合する", TeamRole::Reviewer),
-            ("integrator: 各タスクの成果物を 1 つのサイトとして繋ぐ", TeamRole::Integrator),
+            (
+                "reviewer: index.html を読み、契約と照合する",
+                TeamRole::Reviewer,
+            ),
+            (
+                "integrator: 各タスクの成果物を 1 つのサイトとして繋ぐ",
+                TeamRole::Integrator,
+            ),
         ] {
             assert_eq!(role_of("", title), want, "表題から拾えない: {title}");
         }

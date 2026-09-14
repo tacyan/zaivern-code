@@ -1717,3 +1717,12 @@ fn git判定はheadの有無まで見る() {
         "利用者の index を守る手立てと秘密情報の検査が無い:\n{prep}"
     );
 }
+
+#[test]
+fn guiの仕様生成はgit管理外対応の起動設定を使う() {
+    let source = src(GLUE);
+    let body = function_body(&source, source.find("fn team_prepare_spec(").unwrap());
+    assert!(body.contains("crate::agents::specification_invocation(&preset.command, spec)?"));
+    assert!(!body.contains("crate::diagnostician::build_invocation("));
+    assert!(body.contains("spec_writer::draft_with("));
+}

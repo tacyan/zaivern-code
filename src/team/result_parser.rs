@@ -97,6 +97,8 @@ pub struct ResultDoc {
     pub summary: String,
     #[serde(default)]
     pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_files: Vec<String>,
     #[serde(default)]
     pub validation: Vec<ValidationDoc>,
     #[serde(default)]
@@ -265,6 +267,7 @@ pub struct AcceptedResult {
     /// 実測と食い違ったら、その食い違い自体が読み手への情報になる
     /// ([`Self::report_mismatch`])。
     pub reported_files: Vec<String>,
+    pub excluded_files: Vec<String>,
     pub validation: Vec<ValidationRun>,
     pub blockers: Vec<String>,
 }
@@ -595,6 +598,11 @@ pub fn parse_result(body: &str) -> Result<ResultDoc, RejectReason> {
         return Err(RejectReason::TooLarge { bytes: body.len() });
     }
     let doc: ResultDoc = parse_lenient(body).map_err(RejectReason::BadJson)?;
+    if doc.excluded_files.len() > ARRAY_MAX {
+        return Err(RejectReason::ArrayTooLong {
+            field: "excluded_files",
+        });
+    }
     if doc.changed_files.len() > ARRAY_MAX {
         return Err(RejectReason::ArrayTooLong {
             field: "changed_files",
@@ -728,6 +736,15 @@ pub fn accept(
     evidence: &FileEvidence,
 ) -> Result<AcceptedResult, RejectReason> {
     let status = validate_result_header(&doc, task)?;
+    if !doc.excluded_files.is_empty()
+        && (task.key != "assemble"
+            || doc
+                .excluded_files
+                .iter()
+                .any(|path| !super::task_workspace::delivery_file_path(path)))
+    {
+        return Err(RejectReason::BadJson("excluded_filesは統合担当だけが指定でき、output/から始まるファイル単位の相対パスが必要です".into()));
+    }
 
     let changed: Vec<String> = doc
         .changed_files
@@ -757,6 +774,7 @@ pub fn accept(
             status,
             changed_files: evidence.measured_paths().to_vec(),
             reported_files: changed,
+            excluded_files: doc.excluded_files.clone(),
             summary: super::model::clamp_text(&doc.summary),
             validation,
             blockers: doc.blockers.clone(),
@@ -838,6 +856,7 @@ pub fn accept(
         // 見た人が「これが実際に変わったファイルだ」と読んでしまう。
         changed_files: evidence.measured_paths().to_vec(),
         reported_files: changed,
+        excluded_files: doc.excluded_files.clone(),
         validation,
         blockers: Vec::new(),
     })
@@ -1563,6 +1582,37 @@ mod tests {
       "validation": [{"command": "cargo test auth", "exit_code": 0}],
       "blockers": []
     }"#;
+
+    #[test]
+    fn exclusions_are_optional_and_only_exact_output_paths_from_assembly_are_accepted() {
+        let mut task = assigned();
+        let mut doc = parse_result(GOOD).unwrap();
+        doc.task_id = task.id;
+        doc.agent_id = task.assigned_agent.as_ref().unwrap().to_string();
+        doc.status = "failed".into();
+        doc.excluded_files = vec!["output/debug.json".into()];
+        let evidence = FileEvidence::NoScope { measured: vec![] };
+        assert!(accept(doc.clone(), &task, &evidence).is_err());
+        task.key = "assemble".into();
+        assert_eq!(
+            accept(doc.clone(), &task, &evidence)
+                .unwrap()
+                .excluded_files,
+            doc.excluded_files
+        );
+        for bad in [
+            "../outside",
+            "output/../outside",
+            "output/**",
+            "output/",
+            "output/a\\b",
+            "/output/a",
+        ] {
+            doc.excluded_files = vec![bad.into()];
+            assert!(accept(doc.clone(), &task, &evidence).is_err(), "{bad}");
+        }
+        assert!(parse_result(GOOD).unwrap().excluded_files.is_empty());
+    }
 
     #[test]
     fn 画面の折返しパスは実測に一致する場合だけ戻す() {

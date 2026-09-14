@@ -110,7 +110,8 @@ pub fn build_prompt(
 ## 目的と要件
 原依頼の入力・出力・例外・制約
 ## 共有契約
-担当間の接続と共有ファイルの所有者
+{delivery_contract}
+納品ルート・最終ファイル構成・起動または利用入口・全体動作の確認手順を具体的に決め、担当間の接続と共有ファイルの所有者を記載する。納品先は開いたフォルダ直下の output/ に固定し、担当ファイルは output/ を含む相対パスで列挙する。
 ## タスク
 - implementer: T01 具体的な担当と成果物。完了条件: 観測できる期待結果 (deps: none) (files: 相対ファイルパス)
 ## 完了条件
@@ -120,7 +121,8 @@ pub fn build_prompt(
 {SPEC_CLOSE}
 原依頼:
 {brief}"#,
-            mode = super::planner::IMPLEMENTATION_ONLY
+            mode = super::planner::IMPLEMENTATION_ONLY,
+            delivery_contract = super::planner::DELIVERY_CONTRACT
         );
     }
     let lanes: Vec<&str> = roles.iter().map(|r| r.key()).collect();
@@ -552,6 +554,34 @@ fn finish_draft(candidate: &str, original: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codexのgit管理外指定は引数経路とwindows標準入力経路に残る() {
+        let spec = crate::agents::spec_for_bin("codex").unwrap();
+        let (_, args) =
+            crate::agents::specification_invocation("codex -m selected-model", spec).unwrap();
+        let prompt = "日本語の仕様\n改行と & | を保持";
+        for (program, batch) in [
+            ("codex", false),
+            ("codex.exe", false),
+            ("codex.cmd", true),
+            ("CODEX.BAT", true),
+        ] {
+            let (argv, stdin) = prompt_transport(std::path::Path::new(program), &args, prompt);
+            assert_eq!(
+                &argv[..4],
+                &["exec", "--skip-git-repo-check", "-m", "selected-model"]
+            );
+            if batch {
+                assert_eq!(argv.len(), 4);
+                assert_eq!(stdin, Some(prompt));
+            } else {
+                assert_eq!(argv.len(), 5);
+                assert_eq!(argv[4], prompt);
+                assert_eq!(stdin, None);
+            }
+        }
+    }
+
     use super::*;
     use crate::features::team::imp::model::TeamRole as R;
 
@@ -603,6 +633,7 @@ mod tests {
         );
         for contract in [
             "共有ファイルの編集者は一人",
+            super::super::planner::DELIVERY_CONTRACT,
             "完了条件",
             "deps: T01,T02",
             "単一成果物は無理に分割",

@@ -2433,6 +2433,18 @@ impl TeamRuntime {
                 let released_report = self.task(*id).is_some_and(|task| {
                     !task.state.is_held() || task.state == TeamTaskState::Validating
                 });
+                // A validated completion report is the handoff boundary. The
+                // supervisor may keep Codex Working after its final response;
+                // request teardown rather than waiting forever for an Idle guess.
+                // Do not release ownership until the normal exit/writer checks pass.
+                if self
+                    .task(*id)
+                    .is_some_and(|task| task.state == TeamTaskState::Validating)
+                    && session.is_some_and(|s| !coordinator::deliverable(s.state))
+                {
+                    out.push(TeamEffect::StopAgent(hold.session));
+                    return None;
+                }
                 if released_report && session.is_some_and(|s| coordinator::deliverable(s.state)) {
                     if hold.permit.writer_stopped() {
                         // Keep the session fenced until Exited is observed;
@@ -2453,6 +2465,36 @@ impl TeamRuntime {
 
     pub(super) fn publication_pending(&self) -> bool {
         self.publication.is_some()
+    }
+
+    /// The publisher has released its writer and lease before this retry.
+    fn retry_delivery(&mut self, task: TaskId, why: &str) {
+        let max = self.run.max_attempts;
+        let mut exhausted = false;
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            t.attempts = t.attempts.saturating_add(1);
+            t.context.insert(0, clamp_text(why));
+            t.context = clamp_list(std::mem::take(&mut t.context));
+            step(t, TeamTaskState::Failed, &self.rejections);
+            exhausted = t.attempts >= max;
+        }
+        if exhausted {
+            self.submit_with_issues(task, why);
+        } else {
+            self.release_after_self_report(task);
+            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+                t.assigned_agent = None;
+                t.assigned_session = None;
+                step(t, TeamTaskState::Ready, &self.rejections);
+            }
+        }
+        self.log(
+            TeamEventKind::ValidationCompleted,
+            None,
+            None,
+            format!("#{task} の納品先検査: {why}"),
+        );
+        self.dirty = true;
     }
 
     pub(super) fn collect_publication(&mut self) {
@@ -2520,7 +2562,9 @@ impl TeamRuntime {
                 }
             }
             Some(why) => {
-                if submitted {
+                if outcome.delivery_rejected && !submitted && !self.run.stopped {
+                    self.retry_delivery(task.id, &why);
+                } else if submitted {
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task.id) {
                         t.blockers.push(why);
                     }
@@ -2556,7 +2600,13 @@ impl TeamRuntime {
         if self.run.stopped && !exited {
             return; // Stopは終了確認ではない。Idleでも未配送の指示が残り得る。
         }
-        // 完了JSONが出てもWorkingなら待つ。Stopボタンだけでも解放しない。
+        // Accepted reports finish the agent's turn even if the UI still says
+        // Working. Stop the owned writer, then wait for actual exit before publish.
+        if !exited && reported && !idle {
+            out.push(TeamEffect::StopAgent(hold.session));
+            return;
+        }
+        // Stop要求だけでは解放しない。終了観測とwriter停止の両方を待つ。
         if !exited && !(idle && (reported || !task.state.is_held() || self.run.stopped)) {
             return;
         }
@@ -2568,11 +2618,19 @@ impl TeamRuntime {
             return;
         }
         if reported && !self.run.stopped && !self.run.paused {
+            let contributors = task
+                .dependencies
+                .iter()
+                .filter_map(|id| self.task(*id))
+                .filter(|dependency| super::task_workspace::scope(&dependency.files).is_some())
+                .map(|dependency| dependency.files.clone())
+                .collect();
             let hold = self.integration.take().unwrap();
             match publication::Job::start(
                 hold,
                 &task,
                 self.owner(),
+                contributors,
                 #[cfg(test)]
                 self.publication_hook.take(),
             ) {
@@ -3617,6 +3675,54 @@ impl TeamRuntime {
         self.take_result_from(agent, body, false)
     }
 
+    /// Unparseable screen text may be an old echo, so never finish a task on
+    /// this evidence. Only send bounded format reminders to its current owner.
+    fn request_result_format_repair(&mut self, agent: &AgentId) {
+        if self.run.stopped || self.run.paused {
+            return;
+        }
+        let Some(owner) = self.agent(agent) else {
+            return;
+        };
+        let (Some(id), Some(session)) = (owner.current_task, owner.session_id) else {
+            return;
+        };
+        let Some(task) = self.task(id) else {
+            return;
+        };
+        if task.state != TeamTaskState::Running
+            || task.assigned_agent.as_ref() != Some(agent)
+            || task.assigned_session != Some(session)
+            || task.review_of.is_some()
+        {
+            return;
+        }
+        let marker = format!("[result-format-repair:{}]", task.attempts);
+        let limit = usize::from(self.run.max_attempts.clamp(1, 3));
+        if task
+            .context
+            .iter()
+            .filter(|line| line.starts_with(&marker))
+            .count()
+            >= limit
+        {
+            return;
+        }
+        let text = format!("[Zaivern] 現在の担当 #{id} の完了報告をJSONとして読めませんでした。成果物を作り直さず、実際の結果を短い正規JSONで再提出してください。正式な task_id は {id}、agent_id は {agent} です。summaryは短くし、changed_filesは実際の相対パスを列挙してください。指定outboxへ提出し、書込みが拒否された場合は権限を変更せず、元の指示のRESULT開始・終了マーカーの間にJSONだけを表示してください。囲み枠・表・箇条書き・説明文をJSONへ混ぜないでください。以前の壊れた報告と区別できるようsummaryに「報告形式を訂正」を含めてください。");
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            // Keep the reminder budget even when prior context fills the cap.
+            t.context.insert(0, marker);
+            t.context = clamp_list(std::mem::take(&mut t.context));
+        }
+        self.pending_msgs.push(TeamEffect::SendManualInstruction {
+            agent: agent.clone(),
+            session,
+            key: manual_instruction_key(agent, self.next_event_id),
+            text,
+        });
+        self.dirty = true;
+    }
+
     fn take_result_from(
         &mut self,
         agent: &AgentId,
@@ -3625,7 +3731,11 @@ impl TeamRuntime {
     ) -> Result<AcceptOutcome, String> {
         let mut doc = match rp::parse_result(body) {
             Ok(d) => d,
-            Err(e) => return Err(self.reject(agent, None, e.detail())),
+            Err(e) => {
+                let why = self.reject(agent, None, e.detail());
+                self.request_result_format_repair(agent);
+                return Err(why);
+            }
         };
         let task_id = doc.task_id;
         let Some(task) = self.tasks.iter().find(|t| t.id == task_id).cloned() else {
@@ -3853,6 +3963,7 @@ impl TeamRuntime {
             // 「これが実際に変わったファイルだ」と読んでしまう。
             t.changed_files = acc.changed_files.clone();
             t.reported_files = acc.reported_files.clone();
+            t.excluded_files = acc.excluded_files.clone();
             t.blockers = acc.blockers.clone();
             t.updated_at = now;
             if !unreported.is_empty() {
@@ -5483,6 +5594,7 @@ impl TeamRuntime {
             last_summary: String::new(),
             changed_files: Vec::new(),
             reported_files: Vec::new(),
+            excluded_files: Vec::new(),
             baseline: None,
             blockers: Vec::new(),
             created_at: now,
@@ -7996,10 +8108,11 @@ mod worker_ownership_tests {
         let (work, prefix, _) = super::super::task_workspace::execution(&c.root, &task.files)
             .unwrap()
             .unwrap();
-        std::fs::write(work.join("final.txt"), "final output").unwrap();
+        std::fs::create_dir_all(work.join("output")).unwrap();
+        std::fs::write(work.join("output/final.txt"), "final output").unwrap();
         let agent = task.assigned_agent.as_ref().unwrap();
         let report = serde_json::json!({"task_id": task.id, "agent_id": agent.to_string(), "status": "completed",
-            "summary": "統合成果を保存した", "changed_files": [format!("{prefix}/final.txt")], "validation": [], "blockers": []}).to_string();
+            "summary": "統合成果を保存した", "changed_files": [format!("{prefix}/output/final.txt")], "validation": [], "blockers": []}).to_string();
         let session = c.sessions.iter_mut().find(|s| s.id == assembly.1).unwrap();
         session.state = SessionState::Exited;
         session.text = format!("{}\n{report}\n{}", rp::RESULT_OPEN, rp::RESULT_CLOSE);
@@ -8022,7 +8135,7 @@ mod worker_ownership_tests {
         assert_eq!(c.rt.task(task.id).unwrap().state, TeamTaskState::Completed);
         assert_eq!(c.rt.goal().status, GoalStatus::Completed);
         assert_eq!(
-            std::fs::read(c.root.join("final.txt")).unwrap(),
+            std::fs::read(c.root.join("output/final.txt")).unwrap(),
             b"final output"
         );
     }

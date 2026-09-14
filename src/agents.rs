@@ -1838,7 +1838,7 @@ const SUBMIT_PROFILES: &[(&str, u64, &[u8])] = &[
     // 普通に動く (利用者の報告) ので、起動ぶんだけ待てばよい。
     //
     // 10 秒は実測から置いた**暫定値**。MCP の数だけ伸びるので、足りない
-    // 環境が出たらここを増やす — 送信側は 1 行も変えなくてよい。
+    // 環境もあるので、時間だけでなく INPUT_READY_MARKERS で入力画面を確認する。
     ("codex", 10_000, b"\r"),
 ];
 
@@ -1879,7 +1879,11 @@ pub fn input_ready_ms(bin: &str) -> u64 {
 }
 
 /// 初回描画が終わった入力画面の印。CLI 固有の値はカタログに閉じる。
-const INPUT_READY_MARKERS: &[(&str, &str)] = &[("agy", "? for shortcuts")];
+const INPUT_READY_MARKERS: &[(&str, &str)] = &[
+    ("agy", "? for shortcuts"),
+    // Codex 0.154.0 の入力欄。loading 中にも出るので下の判定と組み合わせる。
+    ("codex", "›"),
+];
 
 pub fn input_ready_marker(bin: &str) -> Option<&'static str> {
     INPUT_READY_MARKERS
@@ -1888,10 +1892,34 @@ pub fn input_ready_marker(bin: &str) -> Option<&'static str> {
         .map(|(_, marker)| *marker)
 }
 
+/// Codex は最初の本文だけ起動画面を確認する。会話中の引用や過去のバナーで
+/// 後続タスクを止めない。後続の busy / attention は既存の配達処理が扱う。
+pub fn needs_input_surface_check(bin: &str, has_prompt: bool) -> bool {
+    input_ready_marker(bin).is_some() && (bin != "codex" || !has_prompt)
+}
+
 /// 起動バナーや信頼確認を入力可能と誤認しない。現在画面だけを調べる。
 pub fn input_surface_ready(bin: &str, screen: &str) -> bool {
     input_ready_marker(bin).is_none_or(|marker| {
         let lines: Vec<_> = screen.lines().map(str::trim).collect();
+        if bin == "codex" {
+            // 2026-09 の実ログ: 入力欄とフッターが先に描画されても、model は
+            // loading のまま。固定の10秒後に貼ると本文の痕跡なしで失われた。
+            // 現在画面の読み込み・確認・実行中表示を除外してから初回本文を送る。
+            // MCP startup issues は完了後にも残る警告なので、それだけでは止めない。
+            let blocked = lines.iter().any(|line| {
+                let line = line.trim_matches('│').trim();
+                ["model:", "directory:"].iter().any(|label| {
+                    line.strip_prefix(label)
+                        .is_some_and(|value| value.trim_start().starts_with("loading"))
+                }) || line.contains("esc to interrupt")
+                    || line.contains("esc to cancel")
+                    || line.contains("Starting MCP")
+                    || line.contains("Do you trust the contents of this directory?")
+                    || line.contains("Press enter to continue")
+            });
+            return !blocked && lines.iter().any(|line| line.starts_with(marker));
+        }
         let survey =
             screen.contains("How's the CLI experience so far?") && screen.contains("[0] Skip");
         let busy = lines
@@ -5431,6 +5459,46 @@ mod tests {
     }
 
     #[test]
+    fn codexは入力欄が先に出ても読み込み完了まで本文を送らない() {
+        use crate::submit::{self, Act, Job, Peek};
+        use std::time::Duration;
+        let input = "› Ask Codex to do anything\ngpt-6-astra low fast · project";
+        let loading =
+            format!("│ model: loading /model to change │\n│ directory: project │\n{input}");
+        let ready = format!("│ model: gpt-6-astra low fast /model to change │\n│ directory: project │\n⚠ 2 MCP startup issues · ctrl + t for details\n• You have 2 usage limit resets available. Run /usage to use one.\n{input}");
+        for (screen, expected) in [
+            (loading, false),
+            (format!("│ directory: loading │\n{input}"), false),
+            ("Do you trust the contents of this directory?\n› 1. Yes, continue\nPress enter to continue".to_string(), false),
+            (format!("• Starting MCP servers (1/2)\n{input}"), false),
+            (format!("• Working (1s · esc to interrupt)\n{input}"), false),
+            ("OpenAI Codex (v0.154.0)".into(), false),
+            (ready, true),
+            ("› Implement a feature\n? for shortcuts".into(), true),
+        ] {
+            let peek = Peek {
+                running: true,
+                idle: true,
+                input_ready: submit::input_ready(Duration::from_secs(90), None,
+                    Duration::from_millis(super::input_ready_ms("codex")))
+                    && super::input_surface_ready("codex", &screen),
+                ..Peek::default()
+            };
+            let job = Job::user(1, "担当成果物を作成してください");
+            let act = submit::decide(&job, &peek, Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            assert_eq!(act == Act::WriteBody, expected, "{screen}");
+            // 承認待ちを入力画面の印で上書きしてはいけない。
+            let attention = Peek { attention: true, ..peek };
+            assert_eq!(submit::decide(&job, &attention, Duration::ZERO, Duration::ZERO, Duration::ZERO), Act::Wait(submit::POLL));
+        }
+        assert!(super::input_ready_marker("codex").is_some());
+        assert!(super::needs_input_surface_check("codex", false));
+        assert!(!super::needs_input_surface_check("codex", true));
+        assert!(super::needs_input_surface_check("agy", true));
+        assert!(!super::needs_input_surface_check("unknown", false));
+    }
+
+    #[test]
     fn エージェントごとの癖はカタログにだけ置く() {
         // カタログは名前で引ける (持たない CLI には既定が返る)。
         assert!(
@@ -5465,6 +5533,21 @@ mod tests {
             );
         }
     }
+}
+
+/// 仕様生成は Git 管理外の作業フォルダでも利用する。
+/// Codex のリポジトリ前提だけを外し、承認・sandbox・モデルの設定は変更しない。
+/// `codex exec --help` と公式 CLI reference の `--skip-git-repo-check` を確認済み。
+pub fn specification_invocation(
+    command: &str,
+    spec: &AgentSpec,
+) -> Result<(String, Vec<String>), String> {
+    let (program, mut args) = crate::diagnostician::build_invocation(command, spec)?;
+    if spec.bin == "codex" && !args.iter().any(|arg| arg == "--skip-git-repo-check") {
+        // カタログの `codex exec` の直後。ユーザー引数や末尾の依頼文を分断しない。
+        args.insert(1, "--skip-git-repo-check".into());
+    }
+    Ok((program, args))
 }
 
 /// 仕様文の変換だけでは外部ツールを使わない。モデル・認証・通常起動設定は保持する。
@@ -5514,6 +5597,39 @@ fn specification_mcp_overrides(config: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod specification_launch_tests {
+    #[test]
+    fn 仕様生成だけgit管理外を許可し利用者設定を保持する() {
+        let spec = super::spec_for_bin("codex").unwrap();
+        for command in [
+            "codex",
+            "codex -m chosen-model -s read-only -c approval_policy=on-request",
+            "codex --dangerously-bypass-approvals-and-sandbox",
+        ] {
+            let (program, original) =
+                crate::diagnostician::build_invocation(command, spec).unwrap();
+            let (actual_program, mut actual) =
+                super::specification_invocation(command, spec).unwrap();
+            assert_eq!(actual_program, program);
+            assert_eq!(actual.remove(1), "--skip-git-repo-check");
+            assert_eq!(actual, original, "Git 前提以外の設定を変えてはいけない");
+        }
+    }
+
+    #[test]
+    fn 明示されたgit判定省略は重複せず他エージェントには追加しない() {
+        for command in [
+            "codex --skip-git-repo-check",
+            "claude -m chosen-model",
+            "agy",
+        ] {
+            let spec = super::spec_for_command(command).unwrap();
+            assert_eq!(
+                super::specification_invocation(command, spec).unwrap(),
+                crate::diagnostician::build_invocation(command, spec).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn 仕様用の上書きはmcp起動だけに限定する() {
         let config = "model='chosen-model'\nmodel_reasoning_effort='medium'\n[mcp_servers.search]\ncommand='server'\n[mcp_servers.second]\nurl='https://example.invalid'\n";

@@ -143,6 +143,7 @@ impl Harness {
 
     fn complete(&mut self, task: TaskId, relative: &str, bytes: &str) -> (AgentId, String) {
         let (path, _) = self.candidate(task);
+        std::fs::create_dir_all(path.join(relative).parent().unwrap()).unwrap();
         std::fs::write(path.join(relative), bytes).unwrap();
         let (agent, body) = self.report(task, relative);
         assert_eq!(
@@ -194,7 +195,8 @@ fn root() -> PathBuf {
     let base = crate::test_util::unique_temp_dir("zaivern-integration-runtime", "source");
     let root = base.join("project");
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("body.txt"), "元の本文").unwrap();
+    std::fs::create_dir_all(root.join("output")).unwrap();
+    std::fs::write(root.join("output/body.txt"), "元の本文").unwrap();
     root
 }
 
@@ -217,17 +219,17 @@ fn 一体で実装から統合へ進み担当が停止するまで元フォル�
         1
     );
     assert!(locked(&root), "配送時点でRun間の所有権を持つ");
-    h.complete(task, "body.txt", "最終本文");
+    h.complete(task, "output/body.txt", "最終本文");
     h.pump(SessionState::Working);
     assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Validating);
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "最終本文"
     );
     assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
@@ -249,19 +251,19 @@ fn 同じ元フォルダの二つのrunへ統合を同時配送しない() {
         .iter()
         .filter(|t| t.key == "assemble")
         .all(|t| t.assigned_agent.is_none()));
-    first.complete(first_task, "first.txt", "一つ目");
+    first.complete(first_task, "output/first.txt", "一つ目");
     first.pump(SessionState::Working);
     assert!(second.pump(SessionState::Idle).is_empty());
     first.pump(SessionState::Idle);
     let second_task = second.assembly();
-    second.complete(second_task, "second.txt", "二つ目");
+    second.complete(second_task, "output/second.txt", "二つ目");
     second.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("first.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/first.txt")).unwrap(),
         "一つ目"
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("second.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/second.txt")).unwrap(),
         "二つ目"
     );
     assert_eq!(second.rt.goal().status, GoalStatus::Completed);
@@ -272,28 +274,28 @@ fn 停止要求だけでは統合所有権を解放せず終了観測後に再�
     let root = root();
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
-    h.complete(task, "body.txt", "停止した担当の候補");
+    h.complete(task, "output/body.txt", "停止した担当の候補");
     h.rt.apply_action(TeamAction::Stop);
     h.pump(SessionState::Working);
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.pump(SessionState::Exited);
     assert!(!locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.rt.apply_action(TeamAction::Resume);
     h.sessions.clear();
     let retried = h.assembly();
     assert_eq!(retried, task);
-    h.complete(retried, "body.txt", "再開後の成果物");
+    h.complete(retried, "output/body.txt", "再開後の成果物");
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "再開後の成果物"
     );
     assert_eq!(h.rt.goal().status, GoalStatus::Completed);
@@ -304,17 +306,17 @@ fn 不正重複遅延報告は統合を早期実行も再実行もしない() {
     let root = root();
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
-    let (agent, _) = h.report(task, "body.txt");
+    let (agent, _) = h.report(task, "output/body.txt");
     assert!(h
         .rt
         .accept_outbox(&agent, outbox::Kind::Result, "{", h.now)
         .is_err());
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
-    let (agent, body) = h.complete(task, "body.txt", "正式な成果物");
+    let (agent, body) = h.complete(task, "output/body.txt", "正式な成果物");
     assert_eq!(
         h.rt.accept_outbox(&agent, outbox::Kind::Result, &body, h.now)
             .unwrap(),
@@ -322,16 +324,16 @@ fn 不正重複遅延報告は統合を早期実行も再実行もしない() {
     );
     h.pump(SessionState::Working);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.pump(SessionState::Idle);
-    std::fs::write(root.join("body.txt"), "完了後のユーザー編集").unwrap();
+    std::fs::write(root.join("output/body.txt"), "完了後のユーザー編集").unwrap();
     let _ =
         h.rt.accept_outbox(&agent, outbox::Kind::Result, &body, h.now);
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "完了後のユーザー編集"
     );
     assert!(!locked(&root));
@@ -342,11 +344,11 @@ fn 隔離後のユーザー変更は保持して未解決ありとして提出�
     let root = root();
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
-    h.complete(task, "body.txt", "古い本文からの変更");
-    std::fs::write(root.join("body.txt"), "ユーザーの更新").unwrap();
+    h.complete(task, "output/body.txt", "古い本文からの変更");
+    std::fs::write(root.join("output/body.txt"), "ユーザーの更新").unwrap();
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "ユーザーの更新"
     );
     assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Submitted);
@@ -362,13 +364,13 @@ fn 同じファイルを変更した二つのrunは後続を未解決として�
     let mut second = Harness::new(&root, 1);
     let first_task = first.assembly();
     second.workers();
-    first.complete(first_task, "body.txt", "先行Runの本文");
+    first.complete(first_task, "output/body.txt", "先行Runの本文");
     first.pump(SessionState::Idle);
     let second_task = second.assembly();
-    second.complete(second_task, "body.txt", "後続Runの古い候補");
+    second.complete(second_task, "output/body.txt", "後続Runの古い候補");
     second.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "先行Runの本文"
     );
     assert_eq!(first.rt.goal().status, GoalStatus::Completed);
@@ -382,17 +384,17 @@ fn 一時停止中に受けた統合報告は所有権を保持し再開後だ�
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
     h.rt.apply_action(TeamAction::Pause);
-    h.complete(task, "body.txt", "再開して公開する本文");
+    h.complete(task, "output/body.txt", "再開して公開する本文");
     h.pump(SessionState::Idle);
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.rt.apply_action(TeamAction::Resume);
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "再開して公開する本文"
     );
     assert_eq!(h.rt.goal().status, GoalStatus::Completed);
@@ -443,17 +445,17 @@ fn 未解決の統合候補は停止確認後に提出しても成功や承認�
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
     let (candidate, _) = h.candidate(task);
-    std::fs::write(candidate.join("body.txt"), "未解決のある提出物").unwrap();
+    std::fs::write(candidate.join("output/body.txt"), "未解決のある提出物").unwrap();
     h.rt.submit_with_issues(task, "内容の一部が未解決");
     h.pump(SessionState::Working);
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "未解決のある提出物"
     );
     let task = h.rt.task(task).unwrap();
@@ -473,11 +475,11 @@ fn 変更候補の容量超過はcompletedではなく理由付きsubmittedに�
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
     let (candidate, _) = h.candidate(task);
-    std::fs::File::create(candidate.join("large-asset"))
+    std::fs::File::create(candidate.join("output/large-asset"))
         .unwrap()
         .set_len(super::super::changeset::MAX_HASH_BYTES + 1)
         .unwrap();
-    h.complete(task, "body.txt", "candidate");
+    h.complete(task, "output/body.txt", "candidate");
     h.pump(SessionState::Idle);
     let task = h.rt.task(task).unwrap();
     assert_eq!(task.state, TeamTaskState::Submitted);
@@ -487,10 +489,10 @@ fn 変更候補の容量超過はcompletedではなく理由付きsubmittedに�
         .iter()
         .any(|s| s.contains("64MiB") && s.contains("保留")));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
-    assert!(!root.join("large-asset").exists());
+    assert!(!root.join("output/large-asset").exists());
     assert!(!locked(&root));
 }
 
@@ -499,7 +501,7 @@ fn 完了報告後に復元しても旧担当の停止と新たな統合所有�
     let root = root();
     let mut original = Harness::new(&root, 1);
     let task = original.assembly();
-    original.complete(task, "body.txt", "復元前の候補");
+    original.complete(task, "output/body.txt", "復元前の候補");
     let saved = original.rt.to_saved();
     assert_eq!(
         original.rt.task(task).unwrap().state,
@@ -522,7 +524,7 @@ fn 完了報告後に復元しても旧担当の停止と新たな統合所有�
     }
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     original.rt.apply_action(TeamAction::Stop);
@@ -531,13 +533,13 @@ fn 完了報告後に復元しても旧担当の停止と新たな統合所有�
     assert_eq!(h.assembly(), task);
     assert!(locked(&root));
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
-    h.complete(task, "body.txt", "復元後の正式な候補");
+    h.complete(task, "output/body.txt", "復元後の正式な候補");
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "復元後の正式な候補"
     );
     assert_eq!(h.rt.goal().status, GoalStatus::Completed);
@@ -583,7 +585,7 @@ fn 旧形式の直接統合は復元時に成果と履歴を保持して自動�
         assert!(h.pump(SessionState::Idle).is_empty());
     }
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     assert_eq!(h.rt.goal().status, GoalStatus::Submitted);
@@ -599,7 +601,7 @@ fn 実装担当の復元でも旧担当の終了確認まで同じ隔離先へ�
         .expect("実装の配送");
     assert_ne!(original.rt.task(task).unwrap().key, "assemble");
     let (candidate, _) = original.candidate(task);
-    std::fs::write(candidate.join("body.txt"), "旧担当が作業中の本文").unwrap();
+    std::fs::write(candidate.join("output/body.txt"), "旧担当が作業中の本文").unwrap();
     let restored = TeamRuntime::restore(original.rt.to_saved(), root.clone());
     let mut h = Harness {
         rt: restored,
@@ -621,7 +623,7 @@ fn 実装担当の復元でも旧担当の終了確認まで同じ隔離先へ�
         "停止要求だけで旧実装担当の所有権を解放した"
     );
     assert_eq!(
-        std::fs::read_to_string(candidate.join("body.txt")).unwrap(),
+        std::fs::read_to_string(candidate.join("output/body.txt")).unwrap(),
         "旧担当が作業中の本文"
     );
     original.pump(SessionState::Exited);
@@ -630,12 +632,12 @@ fn 実装担当の復元でも旧担当の終了確認まで同じ隔離先へ�
         .expect("旧担当終了後の再配送");
     assert_eq!(reassigned, task);
     assert_eq!(h.candidate(reassigned).0, candidate);
-    h.complete(reassigned, "body.txt", "再開後の実装");
+    h.complete(reassigned, "output/body.txt", "再開後の実装");
     let assembly = h.assembly();
-    h.complete(assembly, "body.txt", "再開後の実装");
+    h.complete(assembly, "output/body.txt", "再開後の実装");
     h.pump(SessionState::Idle);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "再開後の実装"
     );
     assert_eq!(h.rt.goal().status, GoalStatus::Completed);
@@ -650,7 +652,7 @@ fn 実装担当が完了報告しても書込み中は統合を配送しない()
             .find_map(|_| h.pump(SessionState::Idle).first().copied())
             .expect("実装の配送");
         assert_ne!(h.rt.task(task).unwrap().key, "assemble");
-        h.complete(task, "body.txt", "完了報告済みの本文");
+        h.complete(task, "output/body.txt", "完了報告済みの本文");
         for _ in 0..3 {
             assert!(
                 h.pump(SessionState::Working).is_empty(),
@@ -658,7 +660,7 @@ fn 実装担当が完了報告しても書込み中は統合を配送しない()
             );
         }
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "元の本文"
         );
         let effects = h.pump(stopped);
@@ -667,10 +669,10 @@ fn 実装担当が完了報告しても書込み中は統合を配送しない()
             .find(|id| h.rt.task(*id).unwrap().key == "assemble")
             .unwrap_or_else(|| h.assembly());
         assert!(h.rt.task(assembly).unwrap().dependencies.contains(&task));
-        h.complete(assembly, "body.txt", "完了報告済みの本文");
+        h.complete(assembly, "output/body.txt", "完了報告済みの本文");
         h.pump(SessionState::Idle);
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "完了報告済みの本文"
         );
         assert_eq!(h.rt.goal().status, GoalStatus::Completed);
@@ -689,7 +691,7 @@ fn publication_worker_does_not_block_tick_or_stop() {
         let root = root();
         let mut h = Harness::new(&root, 1);
         let task = h.assembly();
-        h.complete(task, "body.txt", "candidate");
+        h.complete(task, "output/body.txt", "candidate");
         h.wait_for_publication = false;
         h.rt.publication_hook = Some(Box::new(move || {
             entered_tx.send(()).unwrap();
@@ -705,7 +707,7 @@ fn publication_worker_does_not_block_tick_or_stop() {
             let report = job.rx.recv_timeout(Duration::from_secs(20)).unwrap();
             assert!(report.error.is_some());
             assert_eq!(
-                std::fs::read_to_string(root.join("body.txt")).unwrap(),
+                std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
                 "元の本文"
             );
         }
@@ -725,7 +727,7 @@ fn blocked_publication() -> (Harness, TaskId, std::sync::mpsc::Sender<()>) {
     let root = root();
     let mut h = Harness::new(&root, 1);
     let task = h.assembly();
-    h.complete(task, "body.txt", "published candidate");
+    h.complete(task, "output/body.txt", "published candidate");
     h.wait_for_publication = false;
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -765,7 +767,7 @@ fn publication_starts_once_holds_lease_and_applies_once() {
     h.pump(SessionState::Idle);
     assert_eq!(h.rt.goal().status, GoalStatus::Completed);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "published candidate"
     );
     let context = h.rt.task(task).unwrap().context.clone();
@@ -810,7 +812,7 @@ fn stopped_publication_does_not_complete_after_resume_or_change_a_new_attempt() 
         h.pump(SessionState::Idle);
         assert_ne!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "元の本文"
         );
         assert!(!locked(&root));
@@ -900,12 +902,12 @@ fn failed_publication_worker_keeps_reason_and_submitted_state() {
         let root = root();
         let mut h = Harness::new(&root, 1);
         let task = h.assembly();
-        h.complete(task, "body.txt", "candidate");
+        h.complete(task, "output/body.txt", "candidate");
         if panic {
             h.rt.publication_hook = Some(Box::new(|| panic!("simulated worker failure")));
         } else {
             let (candidate, _) = h.candidate(task);
-            std::fs::File::create(candidate.join("oversized"))
+            std::fs::File::create(candidate.join("output/oversized"))
                 .unwrap()
                 .set_len(65 * 1024 * 1024)
                 .unwrap();
@@ -920,7 +922,7 @@ fn failed_publication_worker_keeps_reason_and_submitted_state() {
             .iter()
             .any(|s| s.contains(if panic { "異常終了" } else { "上限" })));
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "元の本文"
         );
         assert!(!locked(&root));
@@ -1013,7 +1015,7 @@ fn restored_reported_writer(finish_before_restore: bool, tracking_error: bool) {
     let mut writer = super::descendant_tests::Descendant::spawn_group_with_env(
         session_id,
         &candidate,
-        "body.txt",
+        "output/body.txt",
         if cfg!(unix) { "setsid" } else { "group" },
         extra,
     );
@@ -1044,7 +1046,7 @@ fn restored_reported_writer(finish_before_restore: bool, tracking_error: bool) {
             writer.session.as_ref().unwrap().writer_identity(),
         )
         .unwrap();
-    original.complete(task, "body.txt", "受理済み成果物");
+    original.complete(task, "output/body.txt", "受理済み成果物");
     assert_eq!(
         original.rt.task(task).unwrap().state,
         TeamTaskState::Validating
@@ -1066,8 +1068,8 @@ fn restored_reported_writer(finish_before_restore: bool, tracking_error: bool) {
         assert_eq!(acknowledgement, *b"E");
         writer.write_child();
     }
-    std::fs::write(candidate.join("retained.txt"), "既存成果物").unwrap();
-    std::fs::write(root.join("body.txt"), "復元前のユーザー変更").unwrap();
+    std::fs::write(candidate.join("output/retained.txt"), "既存成果物").unwrap();
+    std::fs::write(root.join("output/body.txt"), "復元前のユーザー変更").unwrap();
     drop(original); // The runtime's in-memory holds are now gone.
     if finish_before_restore {
         writer.finish_child();
@@ -1119,26 +1121,26 @@ fn restored_reported_writer(finish_before_restore: bool, tracking_error: bool) {
     });
     assert_eq!(task_workspace::baseline(&root, &files).unwrap(), baseline);
     assert_eq!(
-        std::fs::read_to_string(candidate.join("body.txt")).unwrap(),
+        std::fs::read_to_string(candidate.join("output/body.txt")).unwrap(),
         "late writer"
     );
     assert_eq!(
-        std::fs::read_to_string(candidate.join("retained.txt")).unwrap(),
+        std::fs::read_to_string(candidate.join("output/retained.txt")).unwrap(),
         "既存成果物"
     );
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "復元前のユーザー変更"
     );
     let assembly = assigned
         .into_iter()
         .find(|id| h.rt.task(*id).unwrap().key == "assemble")
         .expect("終了確認後に統合へ配送");
-    h.complete(assembly, "body.txt", "統合候補");
+    h.complete(assembly, "output/body.txt", "統合候補");
     h.pump(SessionState::Idle);
     assert_eq!(h.rt.task(assembly).unwrap().state, TeamTaskState::Submitted);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "復元前のユーザー変更",
         "復元時にbaselineを更新してユーザー変更を上書きした"
     );
@@ -1162,24 +1164,28 @@ fn descendant_candidate(group: &str) {
     let task = h.assembly();
     let (work, _) = h.candidate(task);
     let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
-    let mut writer =
-        super::descendant_tests::Descendant::spawn_group(session_id, &work, "body.txt", group);
+    let mut writer = super::descendant_tests::Descendant::spawn_group(
+        session_id,
+        &work,
+        "output/body.txt",
+        group,
+    );
     let session = writer.session.as_ref().unwrap();
     h.rt.handoff_integration_writer(task, session_id, session.writer_identity())
         .unwrap();
-    h.complete(task, "body.txt", "assembly before child");
+    h.complete(task, "output/body.txt", "assembly before child");
     writer.exit_parent();
     h.pump(SessionState::Exited);
     assert!(h.rt.publication.is_none());
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "元の本文"
     );
     assert!(locked(&root));
     writer.finish_child();
     h.pump(SessionState::Exited);
     assert_eq!(
-        std::fs::read_to_string(root.join("body.txt")).unwrap(),
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
         "late writer"
     );
     assert!(!locked(&root));
@@ -1187,22 +1193,31 @@ fn descendant_candidate(group: &str) {
 
 #[cfg(unix)]
 #[test]
-fn idle_assembly_parent_stops_detached_writer_before_publication() {
-    for group in ["setpgid", "setsid"] {
+fn reported_assembly_stops_detached_writer_even_when_supervisor_stays_working() {
+    for (group, observed) in [
+        ("setpgid", SessionState::Idle),
+        ("setsid", SessionState::Idle),
+        ("setpgid", SessionState::Working),
+        ("setsid", SessionState::Working),
+    ] {
         let root = root();
         let mut h = Harness::new(&root, 1);
         let task = h.assembly();
         let (work, _) = h.candidate(task);
         let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
-        let mut writer =
-            super::descendant_tests::Descendant::spawn_group(session_id, &work, "body.txt", group);
+        let mut writer = super::descendant_tests::Descendant::spawn_group(
+            session_id,
+            &work,
+            "output/body.txt",
+            group,
+        );
         h.rt.handoff_integration_writer(
             task,
             session_id,
             writer.session.as_ref().unwrap().writer_identity(),
         )
         .unwrap();
-        h.complete(task, "body.txt", "assembly before child");
+        h.complete(task, "output/body.txt", "assembly before child");
         // The parent is still blocked on its control socket, while the child
         // acknowledges a real write. Idle is an observation, not writer exit.
         writer.write_child();
@@ -1213,7 +1228,7 @@ fn idle_assembly_parent_stops_detached_writer_before_publication() {
             .exited
             .load(std::sync::atomic::Ordering::Acquire));
         for session in &mut h.sessions {
-            session.state = SessionState::Idle;
+            session.state = observed;
         }
         let effects = h.rt.tick(&Observation {
             now: h.now + 1,
@@ -1229,7 +1244,7 @@ fn idle_assembly_parent_stops_detached_writer_before_publication() {
         assert!(locked(&root));
         assert_ne!(h.rt.goal().status, GoalStatus::Completed);
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "元の本文"
         );
         // The Stop effect has not executed yet: ownership must also protect
@@ -1241,9 +1256,243 @@ fn idle_assembly_parent_stops_detached_writer_before_publication() {
         super::descendant_tests::wait_until(|| handle.is_finished());
         h.pump(SessionState::Exited);
         assert_eq!(
-            std::fs::read_to_string(root.join("body.txt")).unwrap(),
+            std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
             "late writer"
         );
         assert!(!locked(&root));
     }
+}
+
+#[test]
+fn 納品先違反は統合担当へ差し戻し修正後outputだけへ保存する() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    let attempts = h.rt.task(task).unwrap().attempts;
+    h.complete(task, "misplaced.txt", "成果物");
+    let mut assigned = h.pump(SessionState::Idle);
+    assert!(!root.join("misplaced.txt").exists());
+    assert_ne!(h.rt.goal().status, GoalStatus::Completed);
+    assert_eq!(h.rt.task(task).unwrap().attempts, attempts + 1);
+    assert!(h
+        .rt
+        .task(task)
+        .unwrap()
+        .context
+        .iter()
+        .any(|s| s.contains("output/")));
+    for _ in 0..6 {
+        if assigned.contains(&task) {
+            break;
+        }
+        assigned.extend(h.pump(SessionState::Idle));
+    }
+    assert!(assigned.contains(&task), "統合担当に再配送される");
+    let (candidate, _) = h.candidate(task);
+    std::fs::remove_file(candidate.join("misplaced.txt")).unwrap();
+    h.complete(task, "output/body.txt", "修正した成果物");
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+    assert_eq!(
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
+        "修正した成果物"
+    );
+    assert!(!root.join("misplaced.txt").exists());
+    assert!(!root.join("output/output").exists());
+}
+
+#[test]
+fn 納品先違反の再試行には上限がある() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    h.rt.run.max_attempts = h.rt.task(task).unwrap().attempts + 1;
+    h.complete(task, "misplaced.txt", "成果物");
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Submitted);
+    assert!(!root.join("misplaced.txt").exists());
+    assert!(!h.pump(SessionState::Idle).contains(&task));
+}
+
+#[test]
+fn 壊れたjson報告は有界に訂正通知し現在担当を完了扱いにしない() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = h.assembly();
+    // Observe the assigned session once, as the GUI does before harvesting output.
+    h.pump(SessionState::Working);
+    let agent = h.rt.task(task).unwrap().assigned_agent.clone().unwrap();
+    h.rt.tasks
+        .iter_mut()
+        .find(|t| t.id == task)
+        .unwrap()
+        .context = (0..super::super::model::LIST_MAX)
+        .map(|i| format!("既存コンテキスト {i}"))
+        .collect();
+    let before = h.rt.pending_msgs.len();
+    for _ in 0..5 {
+        assert!(h.rt.take_result_from(&agent, "{broken json", true).is_err());
+    }
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Running);
+    assert_eq!(
+        h.rt.pending_msgs.len() - before,
+        usize::from(h.rt.run.max_attempts.clamp(1, 3))
+    );
+    assert!(h.rt.pending_msgs.iter().any(|effect| matches!(effect,
+        TeamEffect::SendManualInstruction { text, .. } if text.contains("成果物を作り直さず"))));
+    h.complete(task, "output/body.txt", "訂正後の成果物");
+    let messages = h.rt.pending_msgs.len();
+    assert!(h
+        .rt
+        .take_result_from(&agent, "{another broken json", true)
+        .is_err());
+    assert_eq!(
+        h.rt.pending_msgs.len(),
+        messages,
+        "検証中には再提出を求めない"
+    );
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+    assert_eq!(
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
+        "訂正後の成果物"
+    );
+}
+
+#[test]
+fn 全担当のoutputを統合担当の取り込み漏れに依存せず外側へ集約する() {
+    let root = root();
+    let mut h = Harness::new(&root, 2);
+    let mut assembly = None;
+    let mut workers = Vec::new();
+    for _ in 0..12 {
+        for task in h.pump(SessionState::Idle) {
+            if h.rt.task(task).unwrap().key == "assemble" {
+                assembly = Some(task);
+            } else {
+                let (work, _) = h.candidate(task);
+                if workers.is_empty() {
+                    std::fs::write(work.join("output/debug.json"), "unwanted").unwrap();
+                }
+                let file = format!("output/component-{task}.txt");
+                std::fs::write(work.join(&file), format!("担当 {task} の成果物")).unwrap();
+                let (agent, body) = h.report(task, &file);
+                // Exercise the actual terminal parser -> runtime harvest route:
+                // the full report has scrolled off screen and includes JSON-only rows.
+                let mut parser = vt100::Parser::new(5, 48, 1000);
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let pretty = serde_json::to_string_pretty(&value).unwrap();
+                parser.process(
+                    format!(
+                        "[ZAI-TEAM-RESULT]\r\n{}\r\n[/ZAI-TEAM-RESULT]\r\nready\r\n",
+                        pretty.replace('\n', "\r\n")
+                    )
+                    .as_bytes(),
+                );
+                let session =
+                    h.rt.agents()
+                        .iter()
+                        .find(|a| a.id == agent)
+                        .unwrap()
+                        .session_id
+                        .unwrap();
+                h.sessions
+                    .iter_mut()
+                    .find(|s| s.id == session)
+                    .unwrap()
+                    .text = crate::terminal::recent_report_lines(&mut parser, 200, 400).join("\n");
+                workers.push((task, file));
+            }
+        }
+        if assembly.is_some() {
+            break;
+        }
+    }
+    assert_eq!(workers.len(), 2);
+    let task = assembly.expect("統合担当へ進む");
+    let (candidate, _) = h.candidate(task);
+    for (_, path) in &workers {
+        assert!(
+            !candidate.join(path).exists(),
+            "統合担当はまだ取り込んでいない"
+        );
+        assert!(!root.join(path).exists(), "最終反映前は外側を変更しない");
+    }
+    std::fs::write(candidate.join("output/README.md"), "共通の利用入口").unwrap();
+    let (agent, body) = h.report(task, "output/README.md");
+    let mut report: serde_json::Value = serde_json::from_str(&body).unwrap();
+    report["excluded_files"] = serde_json::json!(["output/debug.json"]);
+    h.rt.accept_outbox(&agent, outbox::Kind::Result, &report.to_string(), h.now)
+        .unwrap();
+    let restored: TeamTask =
+        serde_json::from_str(&serde_json::to_string(h.rt.task(task).unwrap()).unwrap()).unwrap();
+    assert_eq!(restored.excluded_files, ["output/debug.json"]);
+    h.pump(SessionState::Idle);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+    assert_eq!(h.rt.goal().status, GoalStatus::Completed);
+    for (id, path) in workers {
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            format!("担当 {id} の成果物")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("output/README.md")).unwrap(),
+        "共通の利用入口"
+    );
+    assert!(!root.join("output/debug.json").exists());
+    assert!(!root.join("output/part-1").exists());
+    assert!(!root.join("output/output").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn reported_worker_stops_real_writer_while_supervisor_stays_working() {
+    let root = root();
+    let mut h = Harness::new(&root, 1);
+    let task = (0..4)
+        .find_map(|_| h.pump(SessionState::Idle).first().copied())
+        .unwrap();
+    assert_ne!(h.rt.task(task).unwrap().key, "assemble");
+    let (work, _) = h.candidate(task);
+    let session_id = h.rt.task(task).unwrap().assigned_session.unwrap();
+    let mut writer = super::descendant_tests::Descendant::spawn_group(
+        session_id,
+        &work,
+        "output/body.txt",
+        "setsid",
+    );
+    h.rt.handoff_integration_writer(
+        task,
+        session_id,
+        writer.session.as_ref().unwrap().writer_identity(),
+    )
+    .unwrap();
+    h.complete(task, "output/body.txt", "reported worker result");
+    writer.write_child();
+    for session in &mut h.sessions {
+        session.state = SessionState::Working;
+    }
+    let effects = h.rt.tick(&Observation {
+        now: h.now + 1,
+        sessions: h.sessions.clone(),
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, TeamEffect::StopAgent(id) if *id == session_id)));
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Validating);
+    assert!(h.rt.worker_holds.contains_key(&task));
+    assert!(!effects.iter().any(|effect| matches!(effect, TeamEffect::SendInstruction { task: id, .. } if h.rt.task(*id).unwrap().key == "assemble")));
+    writer.write_child();
+    assert!(!writer.tree.finished());
+    writer.session.as_mut().unwrap().kill();
+    let handle = crate::terminal::reap_tracked(writer.session.take().unwrap());
+    super::descendant_tests::wait_until(|| handle.is_finished());
+    h.pump(SessionState::Exited);
+    assert_eq!(h.rt.task(task).unwrap().state, TeamTaskState::Completed);
+    assert!(!h.rt.worker_holds.contains_key(&task));
+    assert_eq!(
+        std::fs::read_to_string(root.join("output/body.txt")).unwrap(),
+        "元の本文"
+    );
 }
