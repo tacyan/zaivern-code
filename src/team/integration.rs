@@ -1313,6 +1313,55 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_exclusions_publish_exact_paths_without_resurrecting_worker_changes() {
+        for route in ["[id]", "[...slug]", "[[...slug]]"] {
+            for existing in [false, true] {
+                let f = Fixture::new("bracketed-exclusions");
+                let relative = format!("app/{route}/page.tsx");
+                let excluded = format!("output/{relative}");
+                if existing {
+                    f.write(&excluded, "original route");
+                }
+                let (assembly, work) = f.isolate("run");
+                let (worker, worker_root) = f.isolate_part("run", 1);
+                put_output(&worker_root, &relative, "worker route");
+                put_output(&worker_root, "app/i/page.tsx", "required literal i route");
+                put_output(&work, "README.md", "delivery entry");
+                if existing {
+                    assert_eq!(
+                        std::fs::read_to_string(work.join(&excluded)).unwrap(),
+                        "original route"
+                    );
+                } else {
+                    assert!(!work.join(&excluded).exists());
+                }
+                let permit = try_acquire(&f.0, "run").unwrap().unwrap();
+                let mut outcome = Outcome::default();
+                publish_cancellable(
+                    &permit,
+                    &f.0,
+                    &assembly,
+                    &[worker],
+                    std::slice::from_ref(&excluded),
+                    &std::sync::atomic::AtomicBool::new(false),
+                    &mut outcome,
+                )
+                .unwrap();
+                assert!(outcome.conflicts.is_empty());
+                assert!(!outcome.delivery_rejected);
+                assert!(!outcome.changed.contains(&excluded));
+                if existing {
+                    assert_eq!(f.read(&excluded), "original route");
+                } else {
+                    assert!(!f.0.join(&excluded).exists());
+                }
+                assert_eq!(f.read("output/app/i/page.tsx"), "required literal i route");
+                assert_eq!(f.read("output/README.md"), "delivery entry");
+            }
+        }
+    }
+
+    #[test]
     fn explicit_exclusions_preserve_reverts_and_do_not_resurrect_unwanted_files() {
         let f = Fixture::new("collect-exclude");
         f.write("output/body.txt", "original");

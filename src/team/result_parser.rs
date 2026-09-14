@@ -1584,6 +1584,30 @@ mod tests {
     }"#;
 
     #[test]
+    fn bracketed_exclusions_accept_completed_assembly_reports_only() {
+        let mut task = assigned();
+        task.key = "assemble".into();
+        for path in [
+            "output/app/[id]/page.tsx",
+            "output/app/[...slug]/page.tsx",
+            "output/app/[[...slug]]/page.tsx",
+        ] {
+            let mut json: serde_json::Value = serde_json::from_str(GOOD).unwrap();
+            json["excluded_files"] = serde_json::json!([path]);
+            let doc = parse_result(&json.to_string()).unwrap();
+            let accepted = accept(doc.clone(), &task, &clean()).unwrap();
+            assert_eq!(accepted.status, ReportedStatus::Completed);
+            assert_eq!(accepted.excluded_files, [path]);
+            let mut worker = task.clone();
+            worker.key = "implement".into();
+            assert!(matches!(
+                accept(doc, &worker, &clean()),
+                Err(RejectReason::BadJson(_))
+            ));
+        }
+    }
+
+    #[test]
     fn exclusions_are_optional_and_only_exact_output_paths_from_assembly_are_accepted() {
         let mut task = assigned();
         let mut doc = parse_result(GOOD).unwrap();
@@ -1607,6 +1631,12 @@ mod tests {
             "output/",
             "output/a\\b",
             "/output/a",
+            "output//a",
+            "output/./a",
+            "output/a?",
+            "output/*/page.tsx",
+            "output/app/[id]/../outside",
+            "C:/output/a",
         ] {
             doc.excluded_files = vec![bad.into()];
             assert!(accept(doc.clone(), &task, &evidence).is_err(), "{bad}");

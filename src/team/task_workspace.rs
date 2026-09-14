@@ -4,10 +4,11 @@ use std::path::{Component, Path, PathBuf};
 
 pub const ROOT: &str = ".zai-team-worktrees";
 
-/// Exact delivery paths only; never accept a directory wildcard or traversal.
+/// Exact delivery paths only; brackets are literal filename characters, not globs.
+/// Never accept a directory wildcard or traversal.
 pub(super) fn delivery_file_path(path: &str) -> bool {
     path.starts_with("output/")
-        && !path.contains(['\\', ':', '*', '?', '[', ']'])
+        && !path.contains(['\\', ':', '*', '?'])
         && path
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
