@@ -345,6 +345,21 @@ impl Job {
             tag: None,
         }
     }
+
+    /// 「入力欄へ入れるだけ」の分 (確定キーは送らず、人の Enter を待つ)。
+    ///
+    /// **これもキューへ積む。** PTY へ生書きすると、先行する確定送信の
+    /// 確定キーが届く前に入力欄へ追記され、その確定キーで一緒に
+    /// 送信されてしまう (確定までの待ちは最低 [`COMMIT_DELAY`]、
+    /// 処理中判定では [`COMMIT_IDLE_WAIT`] まで延びる)。キューへ積めば
+    /// [`due_now`] が同じセッションへ先頭の 1 通だけしか進めないので、
+    /// 先行する分がキューを出てから書かれる。
+    pub fn insert(session: u64, text: impl Into<String>) -> Self {
+        Self {
+            submit: false,
+            ..Self::user(session, text)
+        }
+    }
 }
 
 /// [`decide`] が返す次の一手。
@@ -600,6 +615,26 @@ impl DeliveryTurn {
     }
 }
 
+/// **この tick に動かしてよい配達を、積まれた順に選ぶ** (純関数)。
+///
+/// 同じセッションへはキューの先頭から 1 通だけ。後から積まれた分
+/// (確定送信の途中に届いた「入力欄へ挿入」など) は先行する分が
+/// キューを出るまで動かない — これが「確定前の本文へ挿入が追記されて
+/// 一緒に送信される」混線を防ぐ壁である。
+///
+/// `held` が真の要素は今回も保留するが、**ターンは消費しない**
+/// (配達の外の門で止まっている分が、後続の同じセッションの配達まで
+/// 止めないため)。`held` と `queue` は同じ長さで渡すこと。
+pub fn due_now(queue: &[Pending], held: &[bool]) -> Vec<bool> {
+    debug_assert_eq!(queue.len(), held.len());
+    let mut turn = DeliveryTurn::default();
+    queue
+        .iter()
+        .zip(held.iter().copied())
+        .map(|(p, h)| !h && turn.enter(p.job.session))
+        .collect()
+}
+
 /// 送信待ちの 1 通。時刻の記帳だけを持ち、判断は [`decide`] に任せる。
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -679,6 +714,110 @@ mod delivery_turn_tests {
         queue.remove(0);
         let mut turn = DeliveryTurn::default();
         assert!(turn.enter(queue[0].session));
+    }
+}
+
+/// **確定送信と「入力欄への挿入」の順序の番人。**
+///
+/// 挿入を PTY へ生書きすると、まだ確定していない本文へ追記されて
+/// 先行する確定キーで一緒に送信される — これがその回帰テスト。
+/// 挿入も同じキューへ積む限り、[`due_now`] が同じセッションへ
+/// 1 tick に先頭の 1 通だけしか進めないので、挿入の本文は先行する
+/// 確定送信がキューを出てから書かれる。
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    /// **「A を確定送信 → A の確定前に B を入力欄へ挿入」で
+    /// B の本文は A が終わるまで書かれず、確定キーも B へは行かない。**
+    ///
+    /// `submit_tick` と同じ順序の壁 ([`due_now`]) と同じ段遷移で
+    /// キューを進め、PTY へ書かれる順を記録する。時刻は論理時刻
+    /// (実時間を待たない)。
+    #[test]
+    fn 確定前に届いた挿入は先行する配達が終わってから書かれる() {
+        let t0 = Instant::now();
+        let mut queue = vec![
+            Pending::new(Job::user(1, "本文A"), t0),
+            Pending::new(Job::insert(1, "本文B"), t0),
+        ];
+        // 擬似的な入力欄: 本文が書かれると残り、確定キーが効くと空になる
+        let mut input = String::new();
+        // PTY へ書かれたものと配達の完了を、起きた順に記録する
+        let mut log: Vec<String> = Vec::new();
+        let mut t = t0;
+        for _ in 0..100 {
+            if queue.is_empty() {
+                break;
+            }
+            t += POLL;
+            let peek = Peek {
+                running: true,
+                input_ready: true,
+                idle: true,
+                input: Some(input.clone()),
+                ..Default::default()
+            };
+            // submit_tick と同じ壁: 同じセッションへ先頭の 1 通だけ。
+            let held = vec![false; queue.len()];
+            let mut due = due_now(&queue, &held).into_iter();
+            queue.retain_mut(|p| {
+                if !due.next().unwrap_or(false) {
+                    return true; // 順番待ち (この tick では動かない)
+                }
+                match p.act(&peek, t) {
+                    Act::WriteBody => {
+                        log.push(format!("本文:{}", p.job.text));
+                        input = p.job.text.clone();
+                        p.advance(Stage::Commit, t);
+                        true
+                    }
+                    Act::WriteCommit => {
+                        log.push(format!("確定:{}", p.job.text));
+                        input.clear();
+                        p.advance(Stage::Verify, t);
+                        true
+                    }
+                    Act::Done => {
+                        log.push(format!("完了:{}", p.job.text));
+                        false
+                    }
+                    Act::Gone | Act::GaveUp => false,
+                    Act::Wait(_) => true,
+                }
+            });
+        }
+        assert_eq!(
+            log,
+            [
+                "本文:本文A",
+                "確定:本文A",
+                "完了:本文A",
+                "本文:本文B",
+                "完了:本文B",
+            ],
+            "確定送信の途中へ挿入の本文が紛れ込んだ (B が A の確定キーで送信される)"
+        );
+    }
+
+    /// **門で止まっている分はターンを消費しない。**
+    ///
+    /// 外の門 (承認待ち等) が閉じている分にターンを使わせると、
+    /// 後続の同じセッションの配達まで永久に置き去りになる。
+    #[test]
+    fn 保留の分はターンを消費しない() {
+        let t0 = Instant::now();
+        let queue = vec![
+            Pending::new(Job::user(1, "止まっている分"), t0),
+            Pending::new(Job::insert(1, "後続"), t0),
+            Pending::new(Job::user(2, "別端末"), t0),
+        ];
+        // 先頭が門で止まっている (held) 場合、同じセッションの後続は動ける
+        let due = due_now(&queue, &[true, false, false]);
+        assert_eq!(due, vec![false, true, true]);
+        // 先頭が動けるなら、同じセッションの後続は止まる
+        let due = due_now(&queue, &[false, false, false]);
+        assert_eq!(due, vec![true, false, true]);
     }
 }
 

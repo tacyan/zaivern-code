@@ -572,22 +572,36 @@ impl ZaivernApp {
         let mut queue = std::mem::take(&mut self.outbox);
         let sup = &self.supervisor;
         let agents = &mut self.agents;
-        let mut delivery_turn = submit::DeliveryTurn::default();
+        // 配達の外の門 (実行計画の承認待ち等) を先に尋ねる。閉じている分は
+        // ターンを消費させない — 消費させると、後続の同じセッションの
+        // 配達まで門が開くまで置き去りになる。
+        let gates: Vec<Option<bool>> = queue
+            .iter()
+            .map(|p| {
+                p.job.tag.as_deref().map_or(Some(true), |tag| {
+                    crate::features::team::imp::panel::with_panel(|panel| {
+                        panel.delivery_ready(tag, p.job.session)
+                    })
+                })
+            })
+            .collect();
+        // **同じセッションへは 1 tick に先頭の 1 通だけ** — 積まれた順に
+        // 動かすので、確定送信の途中に届いた「入力欄への挿入」が
+        // まだ確定していない本文へ追記されて一緒に送信されることはない
+        // (順序の壁は `submit::due_now`)。
+        let held: Vec<bool> = gates.iter().map(|g| *g != Some(true)).collect();
+        let mut due = submit::due_now(&queue, &held).into_iter();
+        let mut gates = gates.into_iter();
         queue.retain_mut(|p| {
             let sid = p.job.session;
-            if let Some(tag) = p.job.tag.as_deref() {
-                match crate::features::team::imp::panel::with_panel(|panel| {
-                    panel.delivery_ready(tag, sid)
-                }) {
-                    None => return false, // 旧Run・旧世代には本文も確定キーも送らない。
-                    Some(false) => {
-                        next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
-                        return true;
-                    }
-                    Some(true) => {}
-                }
+            let gate = gates.next().unwrap_or(None);
+            let actionable = due.next().unwrap_or(false);
+            if gate.is_none() {
+                // 旧Run・旧世代には本文も確定キーも送らない。
+                return false;
             }
-            if !delivery_turn.enter(sid) {
+            if !actionable {
+                // 門が閉じているか、同じセッションの先の配達がまだ残っている
                 next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
                 return true;
             }
@@ -777,6 +791,25 @@ mod delivery_peek_tests {
                 "{stage:?} / submit={submit} の読み取り判断が違う"
             );
         }
+    }
+
+    /// **同じセッションの配達は `due_now` で先頭から 1 通ずつ進める。**
+    ///
+    /// この順序の壁を外すと、確定送信の途中に届いた「入力欄への挿入」が
+    /// 未確定の本文へ追記されて、先行する確定キーで一緒に送信される。
+    #[test]
+    fn submit_tick_はセッションごとに先頭の1通だけ進める() {
+        let src = include_str!("agent_sessions.rs").replace("\r\n", "\n");
+        let at = src
+            .find("pub(super) fn submit_tick")
+            .expect("submit_tick が無い");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("submit::due_now"),
+            "submit_tick が due_now を通っていない (同じセッションの後続が割り込める)"
+        );
     }
 
     /// **判断を `submit_tick` が実際に通していること。**

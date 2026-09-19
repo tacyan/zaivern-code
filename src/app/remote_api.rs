@@ -603,10 +603,12 @@ impl ZaivernApp {
         // 判定して CR を改行として飲み、入力欄に抱えたまま送信しない
         // (`zai session send` の長文で実際に起きた)。コスト上限の理由は
         // `bulk` と同じく呼び出し元へそのまま返す。
-        if submit {
-            if let Some(why) = self.cost_block_reason() {
-                return json!({"ok": false, "error": why}).to_string();
-            }
+        //
+        // 「入れるだけ」(submit=false) も同じキューへ積む。PTY へ生書き
+        // すると、先行する確定送信の確定キーが届く前に追記されてしまい、
+        // その確定キーで未送信のつもりの文章まで一緒に送信される。
+        if let Some(why) = self.cost_block_reason() {
+            return json!({"ok": false, "error": why}).to_string();
         }
         if id < 0 {
             // 全エージェントへブロードキャスト
@@ -620,10 +622,15 @@ impl ZaivernApp {
                 }
             } else {
                 // submit=false は入力欄へ挿入するだけ (Enter は送らない)
-                for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
-                    // リモートからの手動送信もユーザーの応答扱い
-                    s.note_user_input();
-                    s.write_bytes(text.as_bytes());
+                let ids: Vec<u64> = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .filter(|s| s.running())
+                    .map(|s| s.id)
+                    .collect();
+                for id in ids {
+                    self.queue_submit(submit::Job::insert(id, text.clone()));
                 }
             }
             self.toast(
@@ -641,19 +648,20 @@ impl ZaivernApp {
         } else {
             // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
             let sid = id as u64;
-            match self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+            match self.agents.sessions.iter().find(|s| s.id == sid) {
                 Some(s) if s.running() => {
                     let title = s.title.clone();
-                    if submit {
-                        // 積めなかった理由は queue_submit がトーストで説明済み
-                        if !self.queue_submit(submit::Job::user(sid, text.clone())) {
-                            return json!({"ok": false, "error": tr("送信できませんでした")})
-                                .to_string();
-                        }
+                    // 「入れるだけ」も確定送信と同じキューへ積む — 生書きに
+                    // すると先行する確定送信の確定キーで一緒に送信される。
+                    // 積めなかった理由は queue_submit がトーストで説明済み
+                    let job = if submit {
+                        submit::Job::user(sid, text.clone())
                     } else {
-                        // submit=false は入力欄へ挿入するだけ (Enter は送らない)
-                        s.note_user_input();
-                        s.write_bytes(text.as_bytes());
+                        submit::Job::insert(sid, text.clone())
+                    };
+                    if !self.queue_submit(job) {
+                        return json!({"ok": false, "error": tr("送信できませんでした")})
+                            .to_string();
                     }
                     self.toast(format!("🎤 {title} {verb}: {text}"), true);
                     json!({"ok": true, "sent": 1}).to_string()
@@ -699,8 +707,9 @@ impl ZaivernApp {
 
     /// 指定した ID 群へ生バイトを書く。実際に届いた数を返す。
     ///
-    /// 制御キー (Esc 等) と「入力欄へ入れるだけ」の 1 体宛て送信で使う。
-    /// `/api/term` と同じ経路なので、1 体宛ての挙動はこれまでと変わらない。
+    /// **制御キー (Esc 等) 専用。** 「入力欄へ入れるだけ」の本文はここを
+    /// 通さない — 生書きすると先行する確定送信の確定キーで一緒に
+    /// 送信されてしまうので、`submit::Job::insert` でキューへ積む。
     fn bulk_write_raw(&mut self, ids: &[u64], bytes: &[u8]) -> usize {
         let mut n = 0;
         for s in self
@@ -741,8 +750,6 @@ impl ZaivernApp {
             return json!({"ok": false, "error": why}).to_string();
         }
         let sent = match (mode, submit) {
-            // 1 体宛ての「入れるだけ」は従来どおり生書き (`/api/term` と同じバイト列)。
-            (remote::BulkMode::One, false) => self.bulk_write_raw(&targets, text.as_bytes()),
             // 1 体宛ての確定送信も配達機構へ合流させる。本文と CR を 1 回で書くと
             // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
             (remote::BulkMode::One, true) => {
@@ -769,8 +776,9 @@ impl ZaivernApp {
                 }
                 Some(n) => n,
             },
-            // 「入れるだけ」は Cockpit に対応する入口が無い (一斉送信は必ず確定する)
-            // ので、同じ配達機構を submit=false のジョブで通す。
+            // 「入れるだけ」も同じ配達機構を通す (確定キーは送らない
+            // `Job::insert`)。PTY へ生書きすると、先行する確定送信の
+            // 確定キーが届く前に追記されて一緒に送信されてしまう。
             // コスト上限は**宛先ごとに理由を出さない**よう、ここで一度だけ見る。
             (_, false) => {
                 if let Some(why) = self.cost_block_reason() {
@@ -779,10 +787,7 @@ impl ZaivernApp {
                 }
                 let mut n = 0;
                 for id in &targets {
-                    let job = submit::Job {
-                        submit: false,
-                        ..submit::Job::user(*id, text.clone())
-                    };
+                    let job = submit::Job::insert(*id, text.clone());
                     if self.queue_submit(job) {
                         n += 1;
                     }

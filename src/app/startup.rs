@@ -1439,22 +1439,25 @@ impl ZaivernApp {
             let s = &self.agents.sessions[i];
             (s.id, s.title.clone())
         };
-        if submit && !expanded_text.trim().is_empty() {
-            // 確定送信は配達機構へ合流させる。本文と CR を 1 回で書くと
-            // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+        if !expanded_text.trim().is_empty() {
+            // 確定送信はもちろん、「入れるだけ」(submit=false) も同じ
+            // 配達機構へ積む。PTY へ生書きすると、先行する確定送信の
+            // 確定キーが届く前に入力欄へ追記されて一緒に送信される。
             // 積めなかった理由は queue_submit がトーストで説明済み
-            if !self.queue_submit(submit::Job::user(sid, expanded_text.clone())) {
+            let job = if submit {
+                submit::Job::user(sid, expanded_text.clone())
+            } else {
+                submit::Job::insert(sid, expanded_text.clone())
+            };
+            if !self.queue_submit(job) {
                 return false;
             }
-        } else {
+        } else if submit {
             let s = &mut self.agents.sessions[i];
             // 明示的な送り込みはユーザーの応答扱い (承認エピソードを解決する)
             s.note_user_input();
-            s.write_bytes(expanded_text.as_bytes());
             // 空へ展開されるコマンド (`/clear` 等) でも確定キーは従来どおり送る
-            if submit {
-                s.write_bytes(submit::COMMIT);
-            }
+            s.write_bytes(submit::COMMIT);
         }
         self.agents.panel_open = true;
         let verb = if submit {
