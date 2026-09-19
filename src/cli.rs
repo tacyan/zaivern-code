@@ -218,7 +218,8 @@ fn call(inst: &Instance, method: &str, path: &str, body: Option<String>) -> Resu
 pub fn is_cli_subcommand(word: &str) -> bool {
     matches!(
         word,
-        "open"
+        "mcp"
+            | "open"
             | "notify"
             | "prompt"
             | "run"
@@ -304,7 +305,7 @@ fn yields_to_directory(word: &str) -> bool {
 pub fn help_text() -> String {
     format!(
         "{HELP_HEAD}{HELP_WORKTREE}{HELP_SESSION}{HELP_AGENT}{HELP_LEASE}{HELP_GUARD}\n\
-         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_CLOUD}{HELP_TEAM}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
+         {HELP_CZERO}{HELP_TRAIN_SPLIT}{HELP_CONTEXT}{HELP_CLOUD}{HELP_TEAM}{HELP_MCP}{HELP_UPDATE}{HELP_UNINSTALL}{HELP_TAIL}"
     )
 }
 
@@ -436,6 +437,7 @@ pub const HELP_CLOUD: &str = crate::features::cloud_execution::HELP;
 /// `zai team --help` のセクション。実体は `src/team/cli.rs`
 /// (`HELP_GUARD` と同じ方針 — 写経すると必ず食い違う)。
 pub const HELP_TEAM: &str = crate::features::team::HELP;
+pub const HELP_MCP: &str = crate::features::chat_bridge::HELP;
 
 /// 競合ゼロの導入・証明・プロセスメッシュ・交渉。
 ///
@@ -569,6 +571,7 @@ pub fn try_run_cli(args: &[String]) -> Option<i32> {
             println!("Zaivern Code {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        "mcp" => crate::features::chat_bridge::cli_main(rest),
         // git フック (pre-commit 等) と CI がここを呼ぶ。実体は src/guard.rs。
         "guard" => crate::features::guard::cli_main(rest),
         // 順次統合。実体は src/train.rs。

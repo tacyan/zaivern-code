@@ -85,12 +85,23 @@ enum Chunk {
 ///
 /// `label` は失敗のメッセージに出る短い名前 (`ssh` / `git` 等)。
 pub(crate) fn run_child(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     label: &str,
     sink: &mut dyn EventSink,
 ) -> Result<ExecResult, CloudError> {
-    cmd.stdin(Stdio::null())
+    run_child_with_stdin(cmd, timeout, label, sink, Stdio::null())
+}
+
+/// Same bounded runner with an explicitly owned input stream (e.g. a snapshot file).
+pub(crate) fn run_child_with_stdin(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+    sink: &mut dyn EventSink,
+    input: Stdio,
+) -> Result<ExecResult, CloudError> {
+    cmd.stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

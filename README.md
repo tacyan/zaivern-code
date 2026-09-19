@@ -13,6 +13,8 @@ merge conflicts.
 One window for Claude Code, Codex, Gemini CLI, and 30 other agent CLIs you have
 already installed. Single native binary — macOS, Linux, Windows.
 
+[Using Zaivern from ChatGPT](docs/chatgpt.md) — experimental MCP task bridge, with isolated execution and explicit limitations.
+
 **English** | [日本語](README.ja.md) | [简体中文](README.zh-CN.md) | [한국어](README.ko.md) | [Português (Brasil)](README.pt-BR.md) | [Español](README.es.md)
 
 [![Release](https://img.shields.io/github/v/release/tacyan/zaivern-code)](https://github.com/tacyan/zaivern-code/releases/latest)

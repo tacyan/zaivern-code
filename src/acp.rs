@@ -1911,6 +1911,8 @@ enum Call {
 
 /// ACP 接続 1 本 = エージェント 1 体。
 pub struct AcpClient {
+    /// A bridge-owned isolated process never inherits GUI auto-approval policy.
+    isolated: bool,
     /// 承認キューで使う疑似セッション ID (PTY のセッション ID とは別空間)。
     pub id: u64,
     /// カタログの ID。
@@ -1965,12 +1967,46 @@ impl AcpClient {
         host: Arc<FsHost>,
         ctx: Option<egui::Context>,
     ) -> Result<AcpClient, String> {
-        let launch = entry.resolve()?;
-        let dir = crate::pathx::launch_dir(&cwd);
-        let mut cmd = crate::procx::hidden_command(&launch.program);
-        cmd.args(&launch.args)
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::piped())
+        Self::start_inner(entry, id, cwd, host, ctx, None)
+    }
+
+    /// A transport-owned process. Host filesystem capabilities are disabled.
+    pub(crate) fn start_command(
+        entry: &'static AcpEntry,
+        id: u64,
+        cwd: PathBuf,
+        cmd: std::process::Command,
+    ) -> Result<AcpClient, String> {
+        Self::start_inner(entry, id, cwd, Arc::new(FsHost::default()), None, Some(cmd))
+    }
+
+    fn start_inner(
+        entry: &'static AcpEntry,
+        id: u64,
+        cwd: PathBuf,
+        host: Arc<FsHost>,
+        ctx: Option<egui::Context>,
+        command: Option<std::process::Command>,
+    ) -> Result<AcpClient, String> {
+        let client_fs = command.is_none();
+        let (launch, dir, mut cmd) = if let Some(cmd) = command {
+            (
+                Launch {
+                    program: PathBuf::from(entry.local_bin),
+                    args: Vec::new(),
+                    via_npx: false,
+                },
+                cwd,
+                cmd,
+            )
+        } else {
+            let launch = entry.resolve()?;
+            let dir = crate::pathx::launch_dir(&cwd);
+            let mut cmd = crate::procx::hidden_command(&launch.program);
+            cmd.args(&launch.args).current_dir(&dir);
+            (launch, dir, cmd)
+        };
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // **独立したプロセスグループで起こす。** エージェントは自分の MCP 子
@@ -2049,7 +2085,16 @@ impl AcpClient {
             let ctx2 = ctx.clone();
             std::thread::Builder::new()
                 .name("acp-read".into())
-                .spawn(move || read_loop(BufReader::new(stdout), tx_ev, out, host, ctx2))
+                .spawn(move || {
+                    let output: Box<dyn std::io::Read + Send> = if client_fs {
+                        Box::new(stdout)
+                    } else {
+                        // A bridge task has a finite protocol-output budget;
+                        // EOF fails the task rather than allocating indefinitely.
+                        Box::new(std::io::Read::take(stdout, 8 * 1024 * 1024))
+                    };
+                    read_loop(BufReader::new(output), tx_ev, out, host, ctx2)
+                })
         };
         if let Err(e) = reader {
             abort!(e.to_string());
@@ -2061,7 +2106,12 @@ impl AcpClient {
             std::thread::Builder::new()
                 .name("acp-err".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines() {
+                    let errors: Box<dyn std::io::Read + Send> = if client_fs {
+                        Box::new(stderr)
+                    } else {
+                        Box::new(std::io::Read::take(stderr, 1024 * 1024))
+                    };
+                    for line in BufReader::new(errors).lines() {
                         let Ok(l) = line else { break };
                         if tx_ev.send(AcpEvent::Stderr(l)).is_err() {
                             break;
@@ -2074,6 +2124,7 @@ impl AcpClient {
         }
 
         let mut c = AcpClient {
+            isolated: !client_fs,
             id,
             entry_id: entry.id,
             label: entry.label.to_string(),
@@ -2111,7 +2162,7 @@ impl AcpClient {
                 "protocolVersion": PROTOCOL_VERSION,
                 "clientCapabilities": {
                     // terminal/* は未実装。**実装していない能力は広告しない。**
-                    "fs": {"readTextFile": true, "writeTextFile": true},
+                    "fs": {"readTextFile": client_fs, "writeTextFile": client_fs},
                     "terminal": false
                 },
                 "clientInfo": {
@@ -2526,6 +2577,21 @@ impl AcpClient {
         p.status.apply(&mut row.status);
         p.locations.apply(&mut row.locations);
         p.raw_input.apply(&mut row.raw_input);
+        if self.isolated {
+            let reply = match row.kind {
+                Some(ToolKind::Read | ToolKind::Edit | ToolKind::Search) => ReplyAction::Approve,
+                _ => ReplyAction::Deny,
+            };
+            self.reply_permission(
+                PendingPerm {
+                    approval_id: 0,
+                    req_id,
+                    options: params.options,
+                },
+                reply,
+            );
+            return;
+        }
         // ── 他人が持っているファイルへの編集要求は、ユーザーへ出す前に断る ──
         //
         // **なぜここにも門を置くか**: ACP アダプタには client の
@@ -5028,6 +5094,7 @@ rl.on("line", (line) => {
         let (tx_out, rx_out) = mpsc::channel::<String>();
         let (tx_ev, rx) = mpsc::channel::<AcpEvent>();
         let c = AcpClient {
+            isolated: false,
             id: ACP_SESSION_ID_BASE,
             entry_id: "mock",
             label: "Mock".into(),
