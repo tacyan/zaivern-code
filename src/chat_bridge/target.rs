@@ -747,6 +747,20 @@ exit 1
         assert!(diff.contains("+fn answer() { correct(); }"), "{diff}");
     }
     #[test]
+    fn diff_redacts_authorization_context() {
+        for header in [
+            "// AUTHORIZATION: basic fixture-auth-secret",
+            r#"// {"Authorization":"Basic fixture-auth-secret"}"#,
+            "// bearer fixture-auth-secret",
+        ] {
+            let before = format!("{header}\nfn answer() {{ wrong(); }}\n");
+            let diff = summarize(&before, &before.replace("wrong()", "correct()"));
+            assert!(!diff.contains("fixture-auth-secret"), "{diff}");
+            assert!(diff.contains("+fn answer() { correct(); }"), "{diff}");
+        }
+    }
+
+    #[test]
     fn diff_redacts_unchanged_camel_case_context() {
         for name in [
             "accessToken",

@@ -109,7 +109,7 @@ fn mask_assignments(text: &str) -> String {
     static ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
     let pattern = ASSIGNMENT.get_or_init(|| {
         regex::Regex::new(
-            r#"(?im)(\b(?:[a-z0-9]+_)*(?:api_key|apikey|token|password|secret|accessToken|refreshToken|clientSecret)\b(?:["'][ \t]*[=:]|[ \t]+[=:]|:[ \t]*&(?:'static[ \t]+)?str[ \t]*=|:|=[ \t]+|=["'])[ \t]*["']?)[^\r\n]*"#,
+            r#"(?im)(\b(?:[a-z0-9]+_)*(?:api_key|apikey|token|password|secret|authorization|accessToken|refreshToken|clientSecret)\b(?:["'][ \t]*[=:]|[ \t]+[=:]|:[ \t]*&(?:'static[ \t]+)?str[ \t]*=|:|=[ \t]+|=["'])[ \t]*["']?)[^\r\n]*"#,
         ).expect("constant credential assignment pattern")
     });
     pattern.replace_all(text, "${1}***").into_owned()
@@ -119,7 +119,11 @@ fn mask_assignments(text: &str) -> String {
 fn mask_bearer(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find("Bearer ") {
+    while let Some(at) = rest
+        .as_bytes()
+        .windows(b"Bearer ".len())
+        .position(|bytes| bytes.eq_ignore_ascii_case(b"Bearer "))
+    {
         out.push_str(&rest[..at + "Bearer ".len()]);
         let tail = &rest[at + "Bearer ".len()..];
         let end = tail
@@ -228,6 +232,24 @@ mod tests {
             assert!(result.contains(MASK), "{result}");
         }
         let ordinary = "mod tokenizer;\nfn secret() {}\nlet tokenizer = 1;\nlet secretary = 2;\nlet credential_manager = 3;\n";
+        assert_eq!(redact_with(ordinary, &[]), ordinary);
+    }
+
+    #[test]
+    fn authorization_headers_json_and_bearer_are_case_insensitive() {
+        for text in [
+            "AUTHORIZATION: basic fixture-auth-secret",
+            "aUtHoRiZaTiOn: Bearer fixture-auth-secret",
+            r#"{"Authorization":"Basic fixture-auth-secret"}"#,
+            r#"let headers = { authorization: "bearer fixture-auth-secret" };"#,
+            "bearer fixture-auth-secret",
+            "BEARER fixture-auth-secret",
+        ] {
+            let result = redact_with(text, &[]);
+            assert!(!result.contains("fixture-auth-secret"), "{result}");
+            assert!(result.contains(MASK), "{result}");
+        }
+        let ordinary = "fn authorization() {}\nmod tokenizer;\nfn secret() {}\n";
         assert_eq!(redact_with(ordinary, &[]), ordinary);
     }
 
