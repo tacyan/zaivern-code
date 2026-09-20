@@ -543,11 +543,13 @@ pub struct Session {
     /// 側がそのセッションの `submit=true` 配達を始めない
     /// ([`crate::submit::due_now`])。
     ///
-    /// 中身は [`InputDraft`] が [`feed_typed_line`] と同じ打鍵規則で畳む。
+    /// 残量は [`InputDraft`] が [`feed_typed_line`] と同じ打鍵規則で畳む
+    /// (追うのは文字数だけなので、下書きの長さに上限は無い)。
     /// 下ろすのは「確実に消費・消去された」と分かる打鍵だけ — 確定
-    /// (CR/LF)・行消去 (Ctrl+U・Ctrl+C)、または Backspace で推定中身が
-    /// 空になるまで消したとき ([`Self::write_bytes`] が全経路の唯一の
-    /// 出口なので、そこでバイトを見る)。Esc や矢印キーでは下ろさない。
+    /// (CR/LF)・行消去 (Ctrl+U・Ctrl+C)、または Backspace で推定の
+    /// 残り文字数が 0 になるまで消したとき ([`Self::write_bytes`] が
+    /// 全経路の唯一の出口なので、そこでバイトを見る)。Esc や矢印キー
+    /// では下ろさない。
     /// 入力欄の読み取り (見えない=空) は CLI ごとに意味が違うので、
     /// 解放の根拠にはしない。
     input_draft: Option<InputDraft>,
@@ -686,7 +688,7 @@ const LOG_CAP: u64 = 4 * 1024 * 1024;
 const PROMPT_MIN_CHARS: usize = 4;
 
 /// 覚えておくプロンプトの最大文字数 (引き継ぎ材料。無限に太らせない)。
-const PROMPT_KEEP_CHARS: usize = 4000;
+pub(crate) const PROMPT_KEEP_CHARS: usize = 4000;
 
 impl LogSink {
     fn open(path: &Path, header: &str) -> Option<Self> {
@@ -1682,37 +1684,40 @@ pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
 /// * CR / LF … 確定 = 下書きは送信済み (または確定キー自身が消費した)
 /// * Ctrl+C (`0x03`) / Ctrl+U (`0x15`) … 行を捨てる / 消す
 ///   ([`feed_typed_line`] が行の終わりとして扱うのと同じ打鍵)
-/// * Backspace (`0x7f` / `0x08`) … **推定中身が空になるまで**消したとき。
-///   1 打鍵で下ろすと「ABC → AB」で誤解放して残りを後続の確定キーが
-///   巻き込むので、畳んだ中身が空になった時点でだけ下ろす
+/// * Backspace (`0x7f` / `0x08`) … **推定の残り文字数が 0 になるまで**
+///   消したとき。1 打鍵で下ろすと「ABC → AB」で誤解放して残りを後続の
+///   確定キーが巻き込むので、畳んだ文字数が尽きた時点でだけ下ろす
 ///
-/// 文字の打ち込みは中身へ追記する (下書きは残ったまま)。エスケープ列
-/// (Esc・矢印キー等) では**下ろさない** — 列の意味は CLI ごとに違う。
-/// ただし列を見た以後は中身の推定を信用できなくなる (`unsure`) ので、
-/// Backspace の空判定には戻らず、確定・消去打鍵だけで解く
-/// (矢印で動いたあとの削除回数は当てにしない)。
+/// 追うのは本文そのものではなく**文字数だけ** (`chars`)。下書きは
+/// 任意の長さがあり得るので、中身をバッファへ保持すると打ち切り点を
+/// 超えた分が「空」と誤判定されて早期解放になる — 文字数の積算だけなら
+/// 上限無しに正確に追える。文字の打ち込み・追記の insert 本文は
+/// `chars` へ加算する (下書きは残ったまま)。
 ///
-/// 中身は書き込まれた本文を種にし、追記の insert 本文や人の打鍵は
-/// `feed` で畳まれる。畳み方は [`feed_typed_line`] と同じ規則
-/// (UTF-8 の途中切れは持ち越す、bracketed paste の囲みは剥がす)。
-/// **中身の推定が実際より少なめにずれても解放は確定・消去打鍵だけ**に
-/// なり、多めにずれる分には Backspace 判定が保守側へ倒れるだけ
-/// (解放が遅れる = 安全側)。入力欄の見た目 (`input_text` 等) は
-/// CLI ごとに意味が違うので一切見ない。
+/// エスケープ列 (Esc・矢印キー等) では**下ろさない** — 列の意味は
+/// CLI ごとに違う。ただし列を見た以後は残量の推定を信用できなくなる
+/// (`unsure`) ので、Backspace の空判定には戻らず、確定・消去打鍵だけで
+/// 解く (矢印で動いたあとの削除回数は当てにしない)。
+///
+/// 畳み方は [`feed_typed_line`] と同じ規則 (UTF-8 の途中切れは持ち越す、
+/// bracketed paste の囲みは剥がす)。**残量の推定が実際より多めにずれる
+/// 分には Backspace 判定が保守側へ倒れるだけ** (解放が遅れる = 安全側)。
+/// 入力欄の見た目 (`input_text` 等) は CLI ごとに意味が違うので
+/// 一切見ない。
 pub struct InputDraft {
-    /// 下書きだと推定している中身 (畳み込みの積算)
-    buf: String,
-    /// エスケープ列を見たあとは中身の推定を信用しない
+    /// 下書きだと推定している残りの文字数 (畳み込みの積算)
+    chars: usize,
+    /// エスケープ列を見たあとは残量の推定を信用しない
     unsure: bool,
     /// 打鍵の UTF-8 はチャンク境界で割れる ([`TypedLine`] と同じ理由)
     dec: crate::textenc::StreamDecoder,
 }
 
 impl InputDraft {
-    /// 入力欄へ残した本文を種にして追跡を始める。
-    fn seeded(text: &str) -> Self {
+    /// 入力欄へ残した本文の文字数を種にして追跡を始める。
+    pub(crate) fn seeded(text: &str) -> Self {
         Self {
-            buf: text.chars().take(PROMPT_KEEP_CHARS).collect(),
+            chars: text.chars().count(),
             unsure: false,
             dec: crate::textenc::StreamDecoder::default(),
         }
@@ -1720,7 +1725,7 @@ impl InputDraft {
 
     /// 打鍵バイト列を畳む。`true` が返ったら下書きは消費・消去済み —
     /// 占有を解いてよい。
-    fn feed(&mut self, bytes: &[u8]) -> bool {
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
         // bracketed paste の囲みは剥がす (中身は普通の文字として畳む)。
         let text = self.dec.feed(bytes);
         let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
@@ -1730,8 +1735,8 @@ impl InputDraft {
                 '\r' | '\n' | '\u{3}' | '\u{15}' => return true,
                 '\u{7f}' | '\u{8}' => {
                     if !self.unsure {
-                        self.buf.pop();
-                        if self.buf.is_empty() {
+                        self.chars = self.chars.saturating_sub(1);
+                        if self.chars == 0 {
                             return true;
                         }
                     }
@@ -1747,9 +1752,9 @@ impl InputDraft {
                     }
                 }
                 c if c.is_control() => {}
-                c => {
-                    if !self.unsure && self.buf.chars().count() < PROMPT_KEEP_CHARS {
-                        self.buf.push(c);
+                _ => {
+                    if !self.unsure {
+                        self.chars = self.chars.saturating_add(1);
                     }
                 }
             }
@@ -2913,10 +2918,10 @@ impl Session {
     /// 「入力欄へ入れるだけ」の配達が本文を入力欄へ残した (下書き占有の開始)。
     /// この印がある間、そのセッションへの `submit=true` 配達は始まらない。
     ///
-    /// `text` は残した本文そのもの — [`InputDraft`] の中身をそれで始める
-    /// (追記や Backspace 全消しを追跡するため)。すでに下書きがあるなら
-    /// 追記側の本文は `write_bytes` の feed ですでに畳まれているので、
-    /// ここでは何もしない (種を置き直すと残量を過少に見る)。
+    /// `text` は残した本文そのもの — [`InputDraft`] の残り文字数をそれで
+    /// 始める (追記や Backspace 全消しを追跡するため)。すでに下書きが
+    /// あるなら追記側の本文は `write_bytes` の feed ですでに畳まれて
+    /// いるので、ここでは何もしない (種を置き直すと残量を過少に見る)。
     pub fn note_input_draft(&mut self, text: &str) {
         if self.input_draft.is_none() {
             self.input_draft = Some(InputDraft::seeded(text));
@@ -4136,7 +4141,9 @@ mod menu_answer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_yes_reply, auto_yes_reply_for, stalled_reply_for, InputDraft};
+    use super::{
+        auto_yes_reply, auto_yes_reply_for, stalled_reply_for, InputDraft, PROMPT_KEEP_CHARS,
+    };
 
     /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
     fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
@@ -4197,6 +4204,83 @@ mod tests {
         assert!(!d.feed(b"\x7f\x7f\x7f\x7f"));
         // 確定・消去打鍵だけで解く
         assert!(d.feed(b"\x15"));
+    }
+
+    /// **下書きの追跡は上限の無い文字数の積算** — 長文で打ち切られない。
+    ///
+    /// 中身を `PROMPT_KEEP_CHARS` で打ち切って保持すると、それを超える
+    /// 下書きで残量が実際より少なく見えて Backspace の解放が早まり、
+    /// 後続の確定キーが残った下書きを巻き込む (4000 を 10000 に変えても
+    /// 10001 文字で再発する)。文字数だけ数える構造にした根拠の番人。
+    #[test]
+    fn 下書きは上限の無い残り文字数で追われる() {
+        let text = "a".repeat(PROMPT_KEEP_CHARS + 1000);
+        let mut d = InputDraft::seeded(&text);
+        // 打ち切り点を超える分まで消し切るまでは解放しない。
+        for _ in 0..PROMPT_KEEP_CHARS {
+            assert!(!d.feed(b"\x7f"), "追跡が打ち切られて早期解放した");
+        }
+        for _ in 0..999 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "全部消したのに解放しない");
+    }
+
+    /// **下書きへの追記も残量へそのまま乗る** — 追記も頭打ちにしない。
+    #[test]
+    fn 下書きへの追記は残り文字数へ加算される() {
+        let mut d = InputDraft::seeded("x");
+        let appended = PROMPT_KEEP_CHARS + 500;
+        assert!(!d.feed("y".repeat(appended).as_bytes()));
+        // x + 追記分の文字数が残っているので、追記の文字数だけ消しても
+        // まだ x が残る (追跡量が上限で頭打ちになっていないこと)。
+        for _ in 0..appended {
+            assert!(!d.feed(b"\x7f"), "追記が打ち切られて早期解放した");
+        }
+        assert!(d.feed(b"\x7f"));
+    }
+
+    /// **マルチバイト文字はバイト数ではなく文字数で消える。**
+    ///
+    /// 「あ」は 3 バイトだが入力欄では 1 文字 — Backspace 1 回で消える。
+    /// バイト数で数えると3倍回さないと解放されず後続を止め続ける。
+    #[test]
+    fn 下書きの残量は_utf8_の文字数で数える() {
+        let mut d = InputDraft::seeded("あいうえお");
+        for _ in 0..4 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "5 文字の下書きは 5 打鍵で消し切れる");
+    }
+
+    /// **UTF-8 の途中で切れた打鍵は次の呼び出しへ持ち越して 1 文字に数える。**
+    ///
+    /// [`feed_typed_line`] と同じ [`crate::textenc::StreamDecoder`] の性質:
+    /// バイト境界で割れた「あ」が `U+FFFD` 化して残量を狂わせないこと。
+    #[test]
+    fn 下書きへの追記は_utf8_の途中切れでも1文字として畳む() {
+        let mut d = InputDraft::seeded("x");
+        for b in "あ".as_bytes() {
+            assert!(!d.feed(&[*b]));
+        }
+        // x + あ の 2 文字 — 2 打鍵で消し切れる (割れた分が余計な文字に
+        // 化けていればここでずれる)。
+        assert!(!d.feed(b"\x7f"));
+        assert!(d.feed(b"\x7f"));
+    }
+
+    /// **長文でも、エスケープ列のあとの Backspace は解放根拠にしない。**
+    ///
+    /// `unsure` 後は残量の推定を信用しないので、消し切るのに十分な回数を
+    /// 打っても解放されず、確定・消去打鍵だけで解く。
+    #[test]
+    fn 長文の下書きはエスケープ列のあとのバックスペースでは解かない() {
+        let mut d = InputDraft::seeded(&"a".repeat(PROMPT_KEEP_CHARS + 100));
+        assert!(!d.feed(b"\x1b[D"));
+        for _ in 0..PROMPT_KEEP_CHARS + 200 {
+            assert!(!d.feed(b"\x7f"), "unsure 後の Backspace 数で解放した");
+        }
+        assert!(d.feed(b"\x03"), "Ctrl+C では解く");
     }
 
     /// 起動直後に空の入力欄へ y が撃ち込まれたバグの再発防止。
@@ -12683,6 +12767,41 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             gone,
             "drop 後も孫 (pid={gpid}) が生きている — Drop の木殺しがグループへ届いていない"
         );
+    }
+
+    /// **insert が残した下書きは、`write_bytes` の打鍵追跡で全部消えるまで
+    /// 占有が解けない** (実セッション経由の配線確認)。
+    ///
+    /// 追跡は文字数の積算で上限が無いので、`PROMPT_KEEP_CHARS` を超える
+    /// 下書きでも途中の Backspace で「空」と誤判定して解放しない —
+    /// 解放されると後続の確定送信が残りの下書きを巻き込んで送信する。
+    #[test]
+    fn 長文の下書きは打鍵で全部消すまで解放しない() {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "/bin/bash --noprofile --norc".into(),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        // insert の配達が残した下書き (submit_tick の WriteBody が立てる印)。
+        sess.note_input_draft(&"a".repeat(PROMPT_KEEP_CHARS + 1000));
+        assert!(sess.input_draft());
+        // 残り 1 文字になるまで消しても解放しない (打ち切りで早期解放しない)。
+        for _ in 0..PROMPT_KEEP_CHARS + 999 {
+            sess.write_bytes(b"\x7f");
+            assert!(sess.input_draft(), "残っているのに占有を解いた");
+        }
+        // 全部消した = 人が下書きを捨てた → 解放。
+        sess.write_bytes(b"\x7f");
+        assert!(!sess.input_draft(), "全部消したのに占有が残っている");
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

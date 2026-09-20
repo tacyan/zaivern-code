@@ -1176,6 +1176,66 @@ mod ordering_tests {
         assert_eq!(due, vec![false, true, true]);
     }
 
+    /// **長文の挿入が残す下書きは、消し切るまで後続の確定送信を止める。**
+    ///
+    /// 解放判定には実物の追跡器 ([`crate::terminal::InputDraft`]) を使う —
+    /// 追跡は文字数の積算で上限が無いので、本文が `PROMPT_KEEP_CHARS`
+    /// を超えても途中の Backspace で「空」と誤判定しない。
+    /// (`drafts` 集合は `Session::input_draft` が返す占有印に相当)
+    #[test]
+    fn 長文の挿入の下書きは消し切るまで後続の確定送信を止める() {
+        let t0 = Instant::now();
+        let long = "あ".repeat(crate::terminal::PROMPT_KEEP_CHARS + 1000);
+        let mut queue = vec![
+            Pending::new(Job::insert(1, long.clone()), t0),
+            Pending::new(Job::user(1, "後続"), t0),
+        ];
+        let mut input = String::new();
+        let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
+        // 解放判定は実物の追跡器 — Backspace で残量が尽きるまで解かない。
+        let mut draft = crate::terminal::InputDraft::seeded(&long);
+        let mut t = t0;
+        // 挿入だけが書かれて人の下書きが残る (後続の確定送信は始まらない)。
+        for _ in 0..5 {
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            [format!("本文:{long}"), format!("完了:{long}")],
+            "挿入が書かれていない / 下書きがあるのに後続が動いた: {log:?}"
+        );
+        assert!(drafts.contains(&1));
+        // 残り 1 文字になるまで消しても解放されない → 後続は動かない。
+        for _ in 0..crate::terminal::PROMPT_KEEP_CHARS + 999 {
+            assert!(!draft.feed(b"\x7f"), "追跡が打ち切られて早期解放した");
+        }
+        for _ in 0..5 {
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(log.len(), 2, "下書きが残っているのに後続が動いた: {log:?}");
+        // 最後の 1 文字を消す = 人が下書きを捨てた → 解放、後続が進む。
+        assert!(draft.feed(b"\x7f"));
+        drafts.clear();
+        for _ in 0..100 {
+            if queue.is_empty() {
+                break;
+            }
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            &log[2..],
+            ["本文:後続", "確定:後続", "完了:後続"],
+            "解放後に後続が届かなかった: {log:?}"
+        );
+    }
+
     /// **挿入だけなら本文を 1 度だけ書き、確定キーは送らない。**
     #[test]
     fn 挿入は本文を一度だけ書いて確定キーを送らない() {
