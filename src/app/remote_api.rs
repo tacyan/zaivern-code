@@ -612,13 +612,18 @@ impl ZaivernApp {
         }
         if id < 0 {
             // 全エージェントへブロードキャスト
-            let n = self.agents.running_count();
-            if n == 0 {
+            if self.agents.running_count() == 0 {
                 return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
             }
-            if submit {
-                if self.queue_submit_all(&text).is_none() {
-                    return json!({"ok": false, "error": tr("送信できませんでした")}).to_string();
+            // **実際に積めた数を返す** — 途中で宛先が消えた等で積めなかった
+            // 分まで「送った」とスマホへ報告しない。
+            let n = if submit {
+                match self.queue_submit_all(&text) {
+                    None => {
+                        return json!({"ok": false, "error": tr("送信できませんでした")})
+                            .to_string()
+                    }
+                    Some(n) => n,
                 }
             } else {
                 // submit=false は入力欄へ挿入するだけ (Enter は送らない)
@@ -629,10 +634,14 @@ impl ZaivernApp {
                     .filter(|s| s.running())
                     .map(|s| s.id)
                     .collect();
+                let mut n = 0;
                 for id in ids {
-                    self.queue_submit(submit::Job::insert(id, text.clone()));
+                    if self.queue_submit(submit::Job::insert(id, text.clone())) {
+                        n += 1;
+                    }
                 }
-            }
+                n
+            };
             self.toast(
                 trf(
                     "🎤📣 {n} セッション {verb}: {text}",
@@ -644,7 +653,7 @@ impl ZaivernApp {
                 ),
                 true,
             );
-            json!({"ok": true, "sent": n}).to_string()
+            json!({"ok": n > 0, "sent": n}).to_string()
         } else {
             // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
             let sid = id as u64;

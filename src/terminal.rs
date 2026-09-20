@@ -533,6 +533,23 @@ pub struct Session {
     /// 入力欄の中身がずれる。ずれたことに気づけるよう印を立て、
     /// 音声側が読んだら下ろす (`take_user_typed`)。
     user_typed: bool,
+    /// **「入力欄へ入れるだけ」(insert) の配達が残した本文が、いまも入力欄に
+    /// 残っている可能性がある**、という印。
+    ///
+    /// PTY の入力欄はセッション内で共有される mutable state なので、
+    /// insert は確定キーを送らず本文を残したまま終わる。その上から後続の
+    /// 確定送信が本文+確定キーを書くと、人が自分で送るつもりだった下書き
+    /// まで一緒に送信されてしまう。この印が立っている間は `submit_tick`
+    /// 側がそのセッションの `submit=true` 配達を始めない
+    /// ([`crate::submit::due_now`])。
+    ///
+    /// 下ろすのは、入力欄を実際に消費・消去する打鍵 (Enter=CR・行消去の
+    /// Ctrl+U・中断の Ctrl+C) が PTY へ届いたときだけ — [`Self::write_bytes`]
+    /// が全経路の唯一の出口なので、そこでバイトを見る。Esc は除く
+    /// (矢印キー等のシーケンスの先頭でもあり、「行を消した」を確実に
+    /// 意味しない)。入力欄の読み取り (見えない=空) は CLI ごとに意味が
+    /// 違うので、解放の根拠にはしない。
+    input_draft: bool,
     /// DECSCUSR で指定された現在のカーソル形状(読取スレッドが書き、描画が読む)。
     cursor_shape: Arc<AtomicU8>,
     /// シェル統合 (OSC 633 / 133) の追跡。読取スレッドが書き、UI が読む。
@@ -1657,6 +1674,22 @@ pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
     out
 }
 
+/// **このバイト列は「人の下書き」の占有を解く打鍵を含むか** (純関数)。
+///
+/// [`Session::input_draft`] を下ろす条件 — 入力欄を実際に消費・消去する
+/// 打鍵が PTY へ届いたときだけ解放する:
+/// * CR (`\r`) … 入力欄を確定した = 下書きは送信済み
+/// * Ctrl+U (`0x15`) / Ctrl+C (`0x03`) … 行を消す / 中断する
+///   ([`feed_typed_line`] が行の終わりとして扱うのと同じ打鍵)
+///
+/// Esc は**含まない**。矢印キー等のシーケンスの先頭バイトでもあり、
+/// CLI ごとに「入力欄を消した」を確実に意味しない。誤って解放すると、
+/// 残っている下書きへ後続の確定送信が追記して、確定キーで一緒に
+/// 送信してしまう。
+fn releases_input_draft(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| matches!(b, b'\r' | 0x03 | 0x15))
+}
+
 pub fn prompt_signature(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2453,6 +2486,7 @@ impl Session {
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
+            input_draft: false,
             cursor_shape,
             shell,
             lines,
@@ -2797,7 +2831,25 @@ impl Session {
     /// 記録 ([`input_log_record`]) も 1 か所で足りる —
     /// 「片方の経路だけ記録されていて、無いものを無いと信じる」が起きない。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
+        // 「人の下書き」の占有は、入力欄を消費・消去する打鍵が実際に届いた
+        // 時点で解く。下書き中は配達キューの確定キーが走らないので、
+        // ここを通る CR 系の打鍵は人の手・リモートの端末キー・明示的な
+        // 送信操作のどれか = 下書きは送信されたか捨てられたかしている。
+        if self.input_draft && releases_input_draft(bytes) {
+            self.input_draft = false;
+        }
         self.writer.send(bytes);
+    }
+
+    /// 「入力欄へ入れるだけ」の配達が本文を入力欄へ残した (下書き占有の開始)。
+    /// この印がある間、そのセッションへの `submit=true` 配達は始まらない。
+    pub fn note_input_draft(&mut self) {
+        self.input_draft = true;
+    }
+
+    /// insert が残した人の下書きが入力欄にある可能性があるか。
+    pub fn input_draft(&self) -> bool {
+        self.input_draft
     }
 
     /// 端末の隅に出すバッジ用: (段, 直近の終了コード)。
@@ -4008,11 +4060,30 @@ mod menu_answer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_yes_reply, auto_yes_reply_for, stalled_reply_for};
+    use super::{auto_yes_reply, auto_yes_reply_for, releases_input_draft, stalled_reply_for};
 
     /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
     fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         stalled_reply_for(text, None)
+    }
+
+    /// **人の下書きの占有は「確定・消去に確実に相当する打鍵」でだけ解く。**
+    ///
+    /// 本文の途中の矢印キーや Esc で解くと、残っている下書きへ後続の
+    /// 確定送信が追記されて、その確定キーで一緒に送信される。
+    #[test]
+    fn 下書きは確定と行消去の打鍵でだけ解放される() {
+        // 確定 (Enter)・行消去 (Ctrl+U)・中断 (Ctrl+C) → 解放
+        assert!(releases_input_draft(b"\r"));
+        assert!(releases_input_draft("たぶんこれ\r".as_bytes()));
+        assert!(releases_input_draft(b"\x15"));
+        assert!(releases_input_draft(b"\x03"));
+        // 普通の文字・Backspace・Esc・矢印キー列 → 解放しない
+        assert!(!releases_input_draft("あ".as_bytes()));
+        assert!(!releases_input_draft(b"\x7f"));
+        assert!(!releases_input_draft(b"\x1b"));
+        assert!(!releases_input_draft(b"\x1b[A"));
+        assert!(!releases_input_draft(b""));
     }
 
     /// 起動直後に空の入力欄へ y が撃ち込まれたバグの再発防止。

@@ -352,8 +352,13 @@ impl Job {
     /// 確定キーが届く前に入力欄へ追記され、その確定キーで一緒に
     /// 送信されてしまう (確定までの待ちは最低 [`COMMIT_DELAY`]、
     /// 処理中判定では [`COMMIT_IDLE_WAIT`] まで延びる)。キューへ積めば
-    /// [`due_now`] が同じセッションへ先頭の 1 通だけしか進めないので、
-    /// 先行する分がキューを出てから書かれる。
+    /// [`due_now`] が「入力欄を占有している配達」の間は後続を進めない。
+    ///
+    /// 書き終わると入力欄は**人の下書き**として占有されたまま残る —
+    /// 呼び出し側が `Session::note_input_draft` で印を立て、
+    /// この印がある間は後続の `submit=true` が始まらない
+    /// (始まると、その確定キーが下書きまで一緒に送信する)。
+    /// 解放は人の打鍵 (Enter 等) を `Session::write_bytes` が見る。
     pub fn insert(session: u64, text: impl Into<String>) -> Self {
         Self {
             submit: false,
@@ -617,26 +622,72 @@ impl DeliveryTurn {
 
 /// **この tick に動かしてよい配達を、積まれた順に選ぶ** (純関数)。
 ///
-/// 同じセッションへはキューの先頭から 1 通だけ — **厳密な FIFO**。
-/// 後から積まれた分 (確定送信の途中に届いた「入力欄へ挿入」など) は
-/// 先行する分がキューを出るまで動かない。先行する分が `held`
-/// (配達の外の門が閉じている) でも後続は**追い越せない** —
-/// 追い越せると、門が開いた後に先行する確定送信の確定キーが、
-/// 追い越して書かれた挿入の本文まで一緒に送信してしまう。
-/// PTY の入力欄はセッション内で共有される mutable state なので、
-/// 順序の壁は「その tick に動かすか」ではなく「位置を譲らない」で作る。
-/// 別のセッションは従来どおり並行して進む。
+/// PTY の入力欄はセッション内で共有される mutable state なので、壁は
+/// キューの位置ではなく**入力欄の占有**で作る:
 ///
-/// `held` と `queue` は同じ長さで渡すこと。
-pub fn due_now(queue: &[Pending], held: &[bool]) -> Vec<bool> {
+/// * **配達の途中** (本文を書いて、確定・検収が残っている) のジョブは
+///   入力欄を占有している。そのセッションの他のジョブは、それが
+///   キューを出るまで書き始められない — 確定送信の途中に届いた
+///   「入力欄への挿入」が未確定の本文へ追記されて一緒に送信される
+///   混線を防ぐ。
+/// * **人の下書き** (`insert` が残した本文 = `drafts` にある
+///   セッション) が残っている間は、`submit=true` の配達を新しく
+///   始めない — 始めると、その確定キーが人の下書きまで一緒に
+///   送信する。解放は人の打鍵 (Enter 等) を呼び出し側が検知する。
+///   `submit=false` の挿入は下書きへの追記なのでそのまま進めてよい。
+/// * **門 (held) で止まっていてまだ PTY へ 1 バイトも書いていない
+///   ジョブは、占有もこの tick の順番も消費しない** — ここで位置を
+///   占有させると、門が閉じたままの 1 通に後続の無関係な送信まで
+///   永久に連れて行かれる。追い越しの安全は「後続が書き始めた時点で
+///   後続自身が占有者になる (挿入なら下書きになる)」で保つ — 門が
+///   開いても、占有が解けるまで先行分は書き始められない。
+/// * 同じ tick に**新しく**書き始めるのはセッションごとに 1 通まで
+///   (この判定を通った順に [`DeliveryTurn`] が絞る)。
+/// * 別のセッションは従来どおり並行して進む。
+///
+/// `held`・`queue` は同じ長さで渡すこと。`drafts` は「人の下書きが
+/// 残っている可能性がある」セッション ID の集合。
+pub fn due_now(
+    queue: &[Pending],
+    held: &[bool],
+    drafts: &std::collections::BTreeSet<u64>,
+) -> Vec<bool> {
     debug_assert_eq!(queue.len(), held.len());
+    // 入力欄をいま占有している配達 (本文を書き終え、確定・検収の途中) が
+    // あるセッション。占有している本人だけが続きを進められる。
+    let mut busy = std::collections::BTreeSet::new();
+    for p in queue {
+        if p.job.stage != Stage::Ready {
+            busy.insert(p.job.session);
+        }
+    }
     let mut turn = DeliveryTurn::default();
     queue
         .iter()
         .zip(held.iter().copied())
         .map(|(p, h)| {
-            // `held` でも先頭の 1 通は FIFO の位置を占有する (追い越し不可)。
-            turn.enter(p.job.session) && !h
+            if h {
+                // 門が閉じている分はこの tick では動かさない。
+                // 占有の判定には含めない — まだ PTY へ何も書いていない
+                // (`Stage::Ready` しか通れない) ので、止める理由が無い。
+                return false;
+            }
+            if p.job.stage != Stage::Ready {
+                // 自分が入力欄を占有している配達の続き。
+                return true;
+            }
+            let s = p.job.session;
+            if busy.contains(&s) {
+                // 別の配達が入力欄を占有中。それが終わるまで書き始めない。
+                return false;
+            }
+            if p.job.submit && drafts.contains(&s) {
+                // insert が残した人の下書きがある。ここで本文と確定キーを
+                // 書くと下書きまで一緒に送信されるので、人が解放するまで待つ。
+                return false;
+            }
+            // この tick に新しく書き始めるのはセッションごとに先頭の 1 通。
+            turn.enter(s)
         })
         .collect()
 }
@@ -725,25 +776,32 @@ mod delivery_turn_tests {
 
 /// **確定送信と「入力欄への挿入」の順序の番人。**
 ///
-/// 挿入を PTY へ生書きすると、まだ確定していない本文へ追記されて
-/// 先行する確定キーで一緒に送信される — これがその回帰テスト。
-/// 挿入も同じキューへ積む限り、[`due_now`] が同じセッションへ
-/// **厳密な FIFO** で先頭の 1 通だけしか進めないので、挿入の本文は
-/// 先行する配達がキューを出てから書かれる。門 (held) で止まっている
-/// 先行分も位置は譲らない。
+/// 挿入を PTY へ生書きしたり、門で止まった先行分へ FIFO の位置を
+/// 占有させたりすると、まだ確定していない本文・人の下書きへ追記されて
+/// 先行/後続の確定キーで一緒に送信される — これがその回帰テスト。
+/// 壁はキュー位置ではなく**入力欄の占有** ([`due_now`] + 呼び出し側の
+/// `drafts` 集合) で作る:
+/// 配達の途中のジョブだけが入力欄を占有し、insert が残した下書きが
+/// ある間は後続の確定送信が始まらない。
 #[cfg(test)]
 mod ordering_tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// `submit_tick` と同じ順序の壁でキューを 1 tick 進める。
     ///
-    /// `held` は「配達の外の門が閉じている」印 — 真の分は動かないが
-    /// FIFO の位置は譲らない。`input` は擬似的な入力欄 (本文が書かれると
-    /// 残り、確定キーが効くと空になる)。PTY へ書かれたものと配達の完了を
-    /// `log` へ起きた順に記録する。時刻は論理時刻 (実時間を待たない)。
+    /// `held` は「配達の外の門が閉じている」印 — 真の分は動かないが、
+    /// まだ PTY へ書いていないので占有もしない (後続は追い越せる)。
+    /// `drafts` は insert が残した「人の下書き」があるセッション —
+    /// insert の本文が書かれた時点で入り、人の打鍵 (このテスト群では
+    /// 明示的に `clear` する) で解かれるまで `submit=true` を止める。
+    /// `input` は擬似的な入力欄 (本文が書かれると残り、確定キーが効くと
+    /// 空になる)。PTY へ書かれたものと配達の完了を `log` へ起きた順に
+    /// 記録する。時刻は論理時刻 (実時間を待たない)。
     fn step(
         queue: &mut Vec<Pending>,
         held: &[bool],
+        drafts: &mut BTreeSet<u64>,
         input: &mut String,
         log: &mut Vec<String>,
         t: Instant,
@@ -755,7 +813,7 @@ mod ordering_tests {
             input: Some(input.clone()),
             ..Default::default()
         };
-        let mut due = due_now(queue, held).into_iter();
+        let mut due = due_now(queue, held, drafts).into_iter();
         queue.retain_mut(|p| {
             if !due.next().unwrap_or(false) {
                 return true; // 順番待ち (この tick では動かない)
@@ -764,6 +822,10 @@ mod ordering_tests {
                 Act::WriteBody => {
                     log.push(format!("本文:{}", p.job.text));
                     *input = p.job.text.clone();
+                    // insert は書き終えても入力欄に残る = 人の下書き。
+                    if !p.job.submit {
+                        drafts.insert(p.job.session);
+                    }
                     p.advance(Stage::Commit, t);
                     true
                 }
@@ -794,6 +856,7 @@ mod ordering_tests {
         ];
         let mut input = String::new();
         let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
         let mut t = t0;
         for _ in 0..100 {
             if queue.is_empty() {
@@ -801,7 +864,7 @@ mod ordering_tests {
             }
             t += POLL;
             let held = vec![false; queue.len()];
-            step(&mut queue, &held, &mut input, &mut log, t);
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
         }
         assert_eq!(
             log,
@@ -814,16 +877,70 @@ mod ordering_tests {
             ],
             "確定送信の途中へ挿入の本文が紛れ込んだ (B が A の確定キーで送信される)"
         );
+        // B には確定キーが行っていない (本文が入力欄に残っている)。
+        assert!(!log.iter().any(|l| l == "確定:本文B"));
     }
 
-    /// **門 (held) で止まっている確定送信を挿入が追い越さない。**
+    /// **挿入のあとの確定送信は、人の下書きが解放されるまで始まらない。**
     ///
-    /// 追い越せると挿入の本文が先に入力欄へ残り、門が開いた後の
-    /// 確定送信の確定キーで一緒に送信される — 防ぐべき混線が
-    /// 門経路で再発する。厳密な FIFO なら、門が閉じている間は
-    /// 後続も動かない。
+    /// insert B → submit C の順で積まれたとき、B の本文が残ったまま C が
+    /// 本文+確定キーを書くと、B まで一緒に送信される — 「入れるだけ」の
+    /// 仕様違反。人が Enter 等で解放するまで C は本文も確定キーも書けない。
     #[test]
-    fn 門で止まっている確定送信を挿入が追い越さない() {
+    fn 挿入のあとの確定送信は下書きが解放されるまで待つ() {
+        let t0 = Instant::now();
+        let mut queue = vec![
+            Pending::new(Job::insert(1, "本文B"), t0),
+            Pending::new(Job::user(1, "本文C"), t0),
+        ];
+        let mut input = String::new();
+        let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
+        let mut t = t0;
+        // B が入力欄へ入ったあと、C は下書きが残っている間は何も書かない。
+        for _ in 0..10 {
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            ["本文:本文B", "完了:本文B"],
+            "下書きが残っているのに後続の確定送信を書き始めた"
+        );
+        assert!(!queue.is_empty(), "C が消えてしまった (届いていないのに)");
+        // 人が Enter で確定 (または消去) した = 下書きの占有が解けた。
+        drafts.clear();
+        for _ in 0..100 {
+            if queue.is_empty() {
+                break;
+            }
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            [
+                "本文:本文B",
+                "完了:本文B",
+                "本文:本文C",
+                "確定:本文C",
+                "完了:本文C",
+            ],
+            "解放前に C が進んだ、または B が確定キーで送信された"
+        );
+    }
+
+    /// **門で止まっている先行分はまだ PTY を触っていないので、後続を止めない。**
+    ///
+    /// 門 (承認待ち等) が閉じたままの配達に FIFO の位置を占有させると、
+    /// 後続の無関係な送信が永久に進めない。追い越しの安全は占有で保つ:
+    /// 後続 (B) が書き始めた時点で B 自身が占有者になる (挿入なら
+    /// 下書きとして残る) ので、門が開いても A は占有が解けるまで
+    /// 書き始められない — A の確定キーが B の下書きを巻き込まない。
+    #[test]
+    fn 門で止まっている先行分は後続を止めないが下書きは守られる() {
         let t0 = Instant::now();
         let mut queue = vec![
             Pending::new(Job::user(1, "本文A"), t0),
@@ -831,58 +948,144 @@ mod ordering_tests {
         ];
         let mut input = String::new();
         let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
         let mut t = t0;
-        // A の門が閉じている間は、門が開いている B も動かない。
-        for _ in 0..3 {
+        // A の門が閉じている間、B (insert) は進める = 永久ブロックしない。
+        for _ in 0..5 {
             t += POLL;
             let held: Vec<bool> = queue.iter().map(|p| p.job.text == "本文A").collect();
-            step(&mut queue, &held, &mut input, &mut log, t);
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
         }
-        assert!(
-            log.is_empty(),
-            "門が閉じている先行分を後続が追い越した: {log:?}"
+        assert_eq!(
+            log,
+            ["本文:本文B", "完了:本文B"],
+            "門で止まっている先行分に後続が永久ブロックされている: {log:?}"
         );
-        // 門が開いた。先頭の A から順に進み、B は A が終わってから書かれる。
+        // 門が開いても、B の下書きが残っている間は A は始まらない
+        // (ここが混線を防ぐ壁: A の確定キーが B を巻き込まない)。
+        for _ in 0..5 {
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            ["本文:本文B", "完了:本文B"],
+            "人の下書きが残っているのに確定送信を書き始めた: {log:?}"
+        );
+        // 人が解放すると A は普通に届く。
+        drafts.clear();
         for _ in 0..100 {
             if queue.is_empty() {
                 break;
             }
             t += POLL;
             let held = vec![false; queue.len()];
-            step(&mut queue, &held, &mut input, &mut log, t);
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
         }
         assert_eq!(
             log,
             [
+                "本文:本文B",
+                "完了:本文B",
                 "本文:本文A",
                 "確定:本文A",
                 "完了:本文A",
-                "本文:本文B",
-                "完了:本文B",
             ],
-            "門が開いた後、先行する確定送信の確定キーが挿入の本文まで送った"
+            "門で止まった先行分が届かなかった / 下書きを巻き込んだ: {log:?}"
         );
+        // B には一度も確定キーが行っていない。
+        assert!(!log.iter().any(|l| l == "確定:本文B"));
     }
 
-    /// **門で止まっている先行分も FIFO の位置を譲らない。**
+    /// **配達の途中 (本文を書いて確定待ち) へ挿入は割り込まない。**
     ///
-    /// 後続が追い越せると、門が開いた後に先行する確定送信の確定キーが
-    /// 追い越して書かれた挿入の本文まで一緒に送信してしまう。
-    /// 別セッションは従来どおり並行して進める。
+    /// 占有しているのは「キュー上の先頭」ではなく「入力欄を持っている
+    /// 配達」。確定待ちの途中で届いた挿入は、その配達がキューを出てから
+    /// 書かれる。
     #[test]
-    fn 保留の先行分は同じセッションの後続を止める() {
+    fn 配達の途中へ挿入は割り込まない() {
+        let t0 = Instant::now();
+        let mut a = Pending::new(Job::user(1, "本文A"), t0);
+        // 本文を書き終え、確定を待っている状態から始める。
+        a.advance(Stage::Commit, t0);
+        let queue = vec![a, Pending::new(Job::insert(1, "本文B"), t0)];
+        // A は配達の途中なので進み、B は同じセッションなので待つ。
+        // 別セッションの C は従来どおり並行して進める。
+        let mut queue = queue;
+        queue.push(Pending::new(Job::user(2, "別端末"), t0));
+        let drafts = BTreeSet::new();
+        let due = due_now(&queue, &[false, false, false], &drafts);
+        assert_eq!(due, vec![true, false, true]);
+    }
+
+    /// **門で止まっている先行分は後続を永久に止めない** (純関数レベル)。
+    ///
+    /// A が門で止まっていても、まだ PTY へ書いていないので
+    /// 同じセッションの後続 B は進められる。別セッション C も並行。
+    /// (追い越しの安全は [`門で止まっている先行分は後続を止めないが下書きは守られる`]
+    ///  が挙動で保証する)
+    #[test]
+    fn 門で止まった先行分は後続を止めない() {
         let t0 = Instant::now();
         let queue = vec![
             Pending::new(Job::user(1, "止まっている分"), t0),
-            Pending::new(Job::insert(1, "後続"), t0),
+            Pending::new(Job::user(1, "後続"), t0),
             Pending::new(Job::user(2, "別端末"), t0),
         ];
-        // 先頭が門で止まっていても、同じセッションの後続は追い越せない
-        let due = due_now(&queue, &[true, false, false]);
-        assert_eq!(due, vec![false, false, true]);
-        // 先頭が動けるなら、同じセッションの後続はやはり止まる
-        let due = due_now(&queue, &[false, false, false]);
+        let drafts = BTreeSet::new();
+        // 先頭が門で止まっていても、同じセッションの後続と別セッションは進める
+        let due = due_now(&queue, &[true, false, false], &drafts);
+        assert_eq!(due, vec![false, true, true]);
+        // 先頭が動けるなら、同じセッションの後続はこの tick では止まる
+        // (同じ tick に新しく書き始めるのはセッションごとに 1 通)
+        let due = due_now(&queue, &[false, false, false], &drafts);
         assert_eq!(due, vec![true, false, true]);
+    }
+
+    /// **人の下書きは確定送信だけを止め、挿入 (追記) は止めない。**
+    ///
+    /// 下書きに挿入を追記しても確定キーは飛ばないので混線は起きない。
+    /// 止めるのは `submit=true` だけ — 止めないと後続の確定キーが
+    /// 下書きごと送信する。
+    #[test]
+    fn 下書きは確定送信だけを止める() {
+        let t0 = Instant::now();
+        let mut drafts = BTreeSet::new();
+        drafts.insert(1_u64);
+        let queue = vec![
+            Pending::new(Job::user(1, "確定送信"), t0),
+            Pending::new(Job::insert(1, "追記"), t0),
+            Pending::new(Job::user(2, "別端末"), t0),
+        ];
+        let due = due_now(&queue, &[false, false, false], &drafts);
+        assert_eq!(due, vec![false, true, true]);
+    }
+
+    /// **挿入だけなら本文を 1 度だけ書き、確定キーは送らない。**
+    #[test]
+    fn 挿入は本文を一度だけ書いて確定キーを送らない() {
+        let t0 = Instant::now();
+        let mut queue = vec![Pending::new(Job::insert(1, "本文B"), t0)];
+        let mut input = String::new();
+        let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
+        let mut t = t0;
+        for _ in 0..100 {
+            if queue.is_empty() {
+                break;
+            }
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            ["本文:本文B", "完了:本文B"],
+            "挿入が複数回書かれた / 確定キーが飛んだ"
+        );
+        // 書き終わったあとも下書きとして占有が残る。
+        assert!(drafts.contains(&1));
     }
 }
 

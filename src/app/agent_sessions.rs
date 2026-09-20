@@ -502,10 +502,15 @@ impl ZaivernApp {
             return None;
         }
         let ids: Vec<u64> = self.stalled_session_ids();
+        let mut sent = 0;
         for id in &ids {
-            self.queue_submit(submit::Job::user(*id, text));
+            // 実際に積めた数だけを返す (途中でセッションが消えた等で
+            // 積めなかった分まで「送った」と数えない)。
+            if self.queue_submit(submit::Job::user(*id, text)) {
+                sent += 1;
+            }
         }
-        Some(ids.len())
+        Some(sent)
     }
 
     /// 止まっているセッションの ID (起動順)。チップの件数表示と送信で共有する。
@@ -536,10 +541,13 @@ impl ZaivernApp {
             .filter(|s| s.running())
             .map(|s| s.id)
             .collect();
+        let mut sent = 0;
         for id in &ids {
-            self.queue_submit(submit::Job::user(*id, text));
+            if self.queue_submit(submit::Job::user(*id, text)) {
+                sent += 1;
+            }
         }
-        Some(ids.len())
+        Some(sent)
     }
 
     /// 配達待ちを 1 フレームぶん進める。
@@ -573,9 +581,9 @@ impl ZaivernApp {
         let sup = &self.supervisor;
         let agents = &mut self.agents;
         // 配達の外の門 (実行計画の承認待ち等) を先に尋ねる。閉じている分は
-        // この tick では動かさないが、**キュー上の位置は譲らない** —
-        // 後続が追い越せると、門が開いた後の確定送信の確定キーが
-        // 追い越して書かれた挿入の本文まで一緒に送信してしまう。
+        // この tick では動かさない — が、まだ PTY へ 1 バイトも書いていない
+        // ので**占有もしない** (占有させると門が閉じたままの 1 通に後続の
+        // 無関係な送信まで永久に連れて行かれる)。
         let gates: Vec<Option<bool>> = queue
             .iter()
             .map(|p| {
@@ -586,12 +594,18 @@ impl ZaivernApp {
                 })
             })
             .collect();
-        // **同じセッションへは 1 tick に先頭の 1 通だけ — 厳密な FIFO**。
-        // 積まれた順に動かすので、確定送信の途中に届いた「入力欄への挿入」が
-        // まだ確定していない本文へ追記されて一緒に送信されることはない
-        // (順序の壁は `submit::due_now`)。
+        // **入力欄はセッション内で共有される mutable state** — 壁はキュー
+        // の位置ではなく占有で作る (`submit::due_now`)。配達の途中の分だけが
+        // 入力欄を占有し、insert が残した「人の下書き」がある間は後続の
+        // 確定送信が始まらない (始めると確定キーが下書きまで一緒に送る)。
+        let drafted: std::collections::BTreeSet<u64> = agents
+            .sessions
+            .iter()
+            .filter(|s| s.input_draft())
+            .map(|s| s.id)
+            .collect();
         let held: Vec<bool> = gates.iter().map(|g| *g != Some(true)).collect();
-        let mut due = submit::due_now(&queue, &held).into_iter();
+        let mut due = submit::due_now(&queue, &held, &drafted).into_iter();
         let mut gates = gates.into_iter();
         queue.retain_mut(|p| {
             let sid = p.job.session;
@@ -680,6 +694,13 @@ impl ZaivernApp {
                     s.note_prompt(&p.job.text);
                     s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
                     s.set_scroll(0);
+                    if !p.job.submit {
+                        // 確定キーを送らない配達は、本文を入力欄へ残したまま
+                        // 終わる = **人の下書き**として占有が残る。この間に
+                        // 後続の確定送信を始めると、その確定キーが下書きまで
+                        // 一緒に送信する (解放は人の打鍵を write_bytes が見る)。
+                        s.note_input_draft();
+                    }
                     if p.job.wait_idle {
                         delivered.push(s.title.clone());
                     }
@@ -794,12 +815,14 @@ mod delivery_peek_tests {
         }
     }
 
-    /// **同じセッションの配達は `due_now` で先頭から 1 通ずつ進める。**
+    /// **同じセッションの配達は `due_now` の占有判定で進める。**
     ///
-    /// この順序の壁を外すと、確定送信の途中に届いた「入力欄への挿入」が
-    /// 未確定の本文へ追記されて、先行する確定キーで一緒に送信される。
+    /// この壁を外すと、確定送信の途中や人の下書きが残っている入力欄へ
+    /// 後続の本文+確定キーが追記されて、一緒に送信される。
+    /// `due_now` を呼ぶだけでは足りず、**下書きの印 (`input_draft`) を
+    /// 渡し、insert の本文を書いたら印を立てる**までが一体。
     #[test]
-    fn submit_tick_はセッションごとに先頭の1通だけ進める() {
+    fn submit_tick_は入力欄の占有を_due_now_へ委ねている() {
         let src = include_str!("agent_sessions.rs").replace("\r\n", "\n");
         let at = src
             .find("pub(super) fn submit_tick")
@@ -810,6 +833,14 @@ mod delivery_peek_tests {
         assert!(
             body.contains("submit::due_now"),
             "submit_tick が due_now を通っていない (同じセッションの後続が割り込める)"
+        );
+        assert!(
+            body.contains("input_draft()"),
+            "submit_tick が下書き占有を due_now へ渡していない"
+        );
+        assert!(
+            body.contains("note_input_draft()"),
+            "insert の配達後に下書きの印を立てていない (後続の確定送信が下書きを巻き込む)"
         );
     }
 
