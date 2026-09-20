@@ -78,6 +78,9 @@ HTTPS server / OAuth server はこの PR に追加していません。
 ## Tools と例
 
 公開する tool は3つだけです。shell、ファイル単位の読み書き、任意 Git コマンドは公開しません。
+annotations は全toolで `openWorldHint=false`。run は既存ファイルの上書きを伴い得るため
+`readOnlyHint=false / destructiveHint=true`、status は `true / false`、cancel は `false / false` です。
+これらはクライアント向けのヒントであり、実行時の隔離・検証・権限検査を置き換えません。
 
 | Tool | 引数 | 結果 |
 | --- | --- | --- |
@@ -170,9 +173,10 @@ snapshot の初期化を通常CIで検査しますが、全テストの成功に
 その場合、修復時の診断は固定メッセージに制限されます。ホスト上の元依存にも外部編集がないことを import 前に照合します。
 
 `instruction` は空白だけを除き1〜16384 Unicode code pointsです。別に JSONL の
-MCPフレーム全体（改行・envelope・JSON escapeを含む）に64 KiB上限があります。
-日本語10000文字は通常この範囲に収まりますが、emoji 16384文字は文字数内でも
-フレーム上限を超えます。超過フレームは bounded read で接続を終了します。
+MCPフレーム全体（改行・envelope・JSON escapeを含む）に256 KiB上限があります。
+ASCII・日本語・emoji の16384文字を受け付け、最悪の surrogate-pair escapeでも
+192 KiB＋envelopeの余裕があります。16385文字はtool validation errorとなり接続は維持します。
+巨大な追加metadata等も含めてframe上限を超えた場合は、上限＋1 byteまでの bounded readで接続を終了します。
 
 ## 実装と既存機構
 
@@ -222,6 +226,11 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   ビルド生成物は別の空の `/target` tmpfs（256 MiB）へ置きます。volume は最後のコンテナ終了後に削除し、
   準備コンテナ・verifier・volume の cleanup 失敗はいずれも import を禁止します。
   Docker daemon、OS、指定した image は信頼する基盤です。
+- import前に、保持中のroot FDと現在のworkspace pathの `dev + ino` を照合します。
+  pathは全成分を `O_NOFOLLOW` で開き直し、rename/recreate・symlink差し替え・消失を
+  lease判定前および全ファイル検証後の書込み開始前に拒否します。旧directoryにも書き込みません。
+  import全体は既存のcancel/import gate内で実行します。外部プロセスのrenameと書込みを
+  原子的にロックする仕組みではないため、import中の外部編集・移動は避けてください。
 - Agent の permission request は Qwen の `_meta.toolName`、kind、引数、locations を照合します。
   `read_file` / `edit` / `grep_search` の既存共有ファイル完全一致だけを一度限り許可します。
   metadata 欠落、未知引数、別 session、ディレクトリ単位の探索・glob、永続許可は拒否します。

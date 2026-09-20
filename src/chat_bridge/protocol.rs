@@ -4,7 +4,9 @@ use super::task::ChatBridge;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
-const MAX_LINE: usize = 64 * 1024;
+// 16384 code points need at most 192 KiB as JSON surrogate-pair escapes.
+// Reserve another 64 KiB for the envelope while keeping reads bounded.
+const MAX_LINE: usize = 256 * 1024;
 const VERSION: &str = "2024-11-05";
 
 pub(super) fn serve(
@@ -128,11 +130,14 @@ fn write_response(out: &mut impl Write, value: Value) -> io::Result<()> {
 }
 fn tools() -> Value {
     json!([
-        {"name":"zaivern_run_task","description":"Run a coding task in an isolated Zaivern agent; returns a task ID immediately.",
+        {"name":"zaivern_run_task","description":"Run a coding task in an isolated Zaivern agent; returns a task ID immediately. The task may overwrite existing files in the server-configured workspace after successful Cargo verification, or without verification for unsupported projects.",
+         "annotations":{"readOnlyHint":false,"openWorldHint":false,"destructiveHint":true},
          "inputSchema":{"type":"object","properties":{"instruction":{"type":"string","minLength":1,"maxLength":16384}},"required":["instruction"],"additionalProperties":false}},
         {"name":"zaivern_task_status","description":"Get task state, changes and verification status.",
+         "annotations":{"readOnlyHint":true,"openWorldHint":false,"destructiveHint":false},
          "inputSchema":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}},
         {"name":"zaivern_cancel_task","description":"Request cancellation. Poll status until cancelled or another terminal state.",
+         "annotations":{"readOnlyHint":false,"openWorldHint":false,"destructiveHint":false},
          "inputSchema":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}}
     ])
 }
@@ -142,34 +147,48 @@ mod tests {
     use super::*;
     #[test]
     fn unicode_frame_budget_is_separate_from_character_validation() {
-        for (unit, count, fits) in [
-            ("a", 16384, true),
-            ("あ", 10000, true),
-            ("🦀", 16384, false),
+        for (unit, encoded) in [
+            ("a", "a"),
+            ("あ", "あ"),
+            ("🦀", "🦀"),
+            ("あ", r"\u3042"),
+            ("🦀", r"\ud83e\udd80"),
         ] {
-            let bridge = ChatBridge::new(
-                std::path::PathBuf::from("unused"),
-                std::sync::Arc::new(super::super::task::tests::Fake),
-            );
-            let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":VERSION,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}});
-            let ready = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
-            let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":unit.repeat(count)}}});
-            let input = format!("{initialize}\n{ready}\n{call}\n");
-            let mut output = Vec::new();
-            let result = serve(std::io::Cursor::new(input), &mut output, &bridge);
-            if fits {
-                result.unwrap();
-                let response: Value = serde_json::from_str(
-                    std::str::from_utf8(&output)
+            for count in [16384, 16385] {
+                let bridge = ChatBridge::new(
+                    std::path::PathBuf::from("unused"),
+                    std::sync::Arc::new(super::super::task::tests::Fake),
+                );
+                let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":VERSION,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}});
+                let ready = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+                let call = format!(
+                    r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"zaivern_run_task","arguments":{{"instruction":"{}"}}}}}}"#,
+                    encoded.repeat(count)
+                );
+                assert!(call.len() + 1 <= MAX_LINE);
+                let decoded: Value = serde_json::from_str(&call).unwrap();
+                assert_eq!(
+                    decoded["params"]["arguments"]["instruction"],
+                    unit.repeat(count)
+                );
+                let ping = json!({"jsonrpc":"2.0","id":3,"method":"ping"});
+                let input = format!("{initialize}\n{ready}\n{call}\n{ping}\n");
+                let mut output = Vec::new();
+                serve(io::Cursor::new(input), &mut output, &bridge).unwrap();
+                let rows: Vec<Value> = std::str::from_utf8(&output)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[1]["result"]["isError"], count > 16384, "{rows:?}");
+                if count > 16384 {
+                    assert!(rows[1]["result"]["content"][0]["text"]
+                        .as_str()
                         .unwrap()
-                        .lines()
-                        .last()
-                        .unwrap(),
-                )
-                .unwrap();
-                assert_eq!(response["result"]["isError"], false, "{response}");
-            } else {
-                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+                        .contains("1..16384 characters"));
+                }
+                assert_eq!(rows[2]["result"], json!({}), "stream must remain open");
             }
         }
     }
@@ -258,6 +277,27 @@ mod tests {
         assert_eq!(results.len(), 7);
         assert_eq!(results[0]["result"]["protocolVersion"], VERSION);
         assert_eq!(results[1]["result"]["tools"].as_array().unwrap().len(), 3);
+        for (name, read_only, destructive) in [
+            ("zaivern_run_task", false, true),
+            ("zaivern_task_status", true, false),
+            ("zaivern_cancel_task", false, false),
+        ] {
+            let tool = results[1]["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"].as_bool(),
+                Some(read_only)
+            );
+            assert_eq!(tool["annotations"]["openWorldHint"].as_bool(), Some(false));
+            assert_eq!(
+                tool["annotations"]["destructiveHint"].as_bool(),
+                Some(destructive)
+            );
+        }
         assert_eq!(results[2]["result"]["isError"], true);
         assert_eq!(results[3]["result"]["isError"], true);
         assert_eq!(results[4]["error"]["code"], -32602);
@@ -267,13 +307,10 @@ mod tests {
             serde_json::from_str(results[6]["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
         assert!(task["task_id"].as_str().is_some_and(|id| !id.is_empty()));
-        let error = serve(
-            io::Cursor::new(vec![b'x'; MAX_LINE + 1]),
-            Vec::new(),
-            &bridge,
-        )
-        .unwrap_err();
+        let mut oversized = io::Cursor::new(vec![b'x'; MAX_LINE * 2]);
+        let error = serve(&mut oversized, Vec::new(), &bridge).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(oversized.position(), (MAX_LINE + 1) as u64);
         drop(bridge);
         std::fs::remove_dir_all(root).unwrap();
     }

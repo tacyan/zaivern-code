@@ -356,7 +356,28 @@ impl Snapshot {
         Ok(())
     }
 
+    // The held directory FD pins the original identity (and prevents inode reuse).
+    // Reopen every path component without following symlinks before using leases.
+    #[cfg(unix)]
+    fn ensure_root_unchanged(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let error = "workspace root changed while task ran; no results imported";
+        let original = self.directory.metadata().map_err(|_| error)?;
+        let current = open_root(&self.root).map_err(|_| error)?;
+        let current = current.metadata().map_err(|_| error)?;
+        if original.dev() != current.dev() || original.ino() != current.ino() {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_root_unchanged(&self) -> Result<(), String> {
+        Err("secure workspace handles unsupported".into())
+    }
+
     pub fn apply(&self, changes: &BTreeMap<PathBuf, Vec<u8>>) -> Result<Applied, String> {
+        self.ensure_root_unchanged()?;
         // Open and validate every destination before changing any file. Existing
         // user changes cause rejection; deleted/new files are not imported in MVP.
         let mut destinations = Vec::new();
@@ -399,6 +420,11 @@ impl Snapshot {
                 destinations.push((path, file, after));
             }
         }
+        // Validation can take time; reject a root swap during that pass too.
+        // This remains inside Control::import's cancellation/import gate.
+        #[cfg(all(test, unix))]
+        tests::before_write_hook();
+        self.ensure_root_unchanged()?;
         let mut changed = Vec::new();
         for (path, mut file, after) in destinations {
             changed.push(path.to_string_lossy().into_owned());
@@ -721,28 +747,124 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn root_replacement_cannot_redirect_existing_snapshot() {
-        let base = crate::test_util::unique_temp_dir("bridge", "root-swap");
-        std::fs::create_dir_all(base.join("root")).unwrap();
-        std::fs::create_dir_all(base.join("outside")).unwrap();
-        let base = base.canonicalize().unwrap();
-        std::fs::write(base.join("root/file.rs"), "before").unwrap();
-        std::fs::write(base.join("outside/file.rs"), "private").unwrap();
-        let snapshot = Snapshot::read(&base.join("root")).unwrap();
-        std::fs::rename(base.join("root"), base.join("moved")).unwrap();
-        std::os::unix::fs::symlink(base.join("outside"), base.join("root")).unwrap();
-        assert!(Snapshot::read(&base.join("root")).is_err());
-        let result = snapshot
-            .apply(&BTreeMap::from([(
+        for replacement in ["symlink", "same_inode_symlink", "directory", "missing"] {
+            let base = crate::test_util::unique_temp_dir("bridge", "root-swap");
+            std::fs::create_dir_all(base.join("root")).unwrap();
+            std::fs::create_dir_all(base.join("outside")).unwrap();
+            let base = base.canonicalize().unwrap();
+            std::fs::write(base.join("root/file.rs"), "before").unwrap();
+            std::fs::write(base.join("outside/file.rs"), "private").unwrap();
+            let snapshot = Snapshot::read(&base.join("root")).unwrap();
+            std::fs::rename(base.join("root"), base.join("moved")).unwrap();
+            match replacement {
+                "symlink" | "same_inode_symlink" => {
+                    let target = if replacement == "symlink" {
+                        "outside"
+                    } else {
+                        "moved"
+                    };
+                    std::os::unix::fs::symlink(base.join(target), base.join("root")).unwrap();
+                    assert!(Snapshot::read(&base.join("root")).is_err());
+                }
+                "directory" => {
+                    std::fs::create_dir(base.join("root")).unwrap();
+                    // Identical bytes must not hide a different directory inode.
+                    std::fs::write(base.join("root/file.rs"), "before").unwrap();
+                }
+                _ => {}
+            }
+            let result = snapshot.apply(&BTreeMap::from([(
                 PathBuf::from("file.rs"),
                 b"after".to_vec(),
-            )]))
-            .unwrap();
-        assert!(result.error.is_none());
+            )]));
+            assert_eq!(
+                result.err().unwrap(),
+                "workspace root changed while task ran; no results imported"
+            );
+            assert_eq!(
+                std::fs::read(base.join("outside/file.rs")).unwrap(),
+                b"private"
+            );
+            assert_eq!(
+                std::fs::read(base.join("moved/file.rs")).unwrap(),
+                b"before"
+            );
+            if replacement == "directory" {
+                assert_eq!(std::fs::read(base.join("root/file.rs")).unwrap(), b"before");
+            }
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn external_file_edit_rejects_all_imports_before_first_write() {
+        let base = crate::test_util::unique_temp_dir("bridge", "external-conflict");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = validate_root(&base).unwrap();
+        for name in ["a.rs", "z.rs"] {
+            std::fs::write(root.join(name), "before").unwrap();
+        }
+        let snapshot = Snapshot::read(&root).unwrap();
+        std::fs::write(root.join("z.rs"), "external edit").unwrap();
+        let changes = BTreeMap::from([
+            (PathBuf::from("a.rs"), b"candidate".to_vec()),
+            (PathBuf::from("z.rs"), b"candidate".to_vec()),
+        ]);
+        assert!(snapshot.apply(&changes).is_err());
+        assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), b"before");
+        assert_eq!(std::fs::read(root.join("z.rs")).unwrap(), b"external edit");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    std::thread_local! {
+        static BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn before_write_hook() {
+        let hook = BEFORE_WRITE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_swap_after_validation_still_imports_zero_files() {
+        let base = crate::test_util::unique_temp_dir("bridge", "late-root-swap");
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        let root = validate_root(&base.join("root")).unwrap();
+        for name in ["a.rs", "z.rs"] {
+            std::fs::write(root.join(name), "before").unwrap();
+        }
+        let snapshot = Snapshot::read(&root).unwrap();
+        let moved = root.with_file_name("moved");
+        let swap_root = root.clone();
+        let swap_moved = moved.clone();
+        BEFORE_WRITE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&swap_root, swap_moved).unwrap();
+                std::fs::create_dir(&swap_root).unwrap();
+                for name in ["a.rs", "z.rs"] {
+                    std::fs::write(swap_root.join(name), "replacement").unwrap();
+                }
+            }));
+        });
+        let changes = BTreeMap::from([
+            (PathBuf::from("a.rs"), b"candidate".to_vec()),
+            (PathBuf::from("z.rs"), b"candidate".to_vec()),
+        ]);
         assert_eq!(
-            std::fs::read(base.join("outside/file.rs")).unwrap(),
-            b"private"
+            snapshot.apply(&changes).err().unwrap(),
+            "workspace root changed while task ran; no results imported"
         );
-        assert_eq!(std::fs::read(base.join("moved/file.rs")).unwrap(), b"after");
+        for name in ["a.rs", "z.rs"] {
+            assert_eq!(std::fs::read(moved.join(name)).unwrap(), b"before");
+            assert_eq!(std::fs::read(root.join(name)).unwrap(), b"replacement");
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 }
