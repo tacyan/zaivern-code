@@ -273,12 +273,22 @@ impl LocalExecutionTarget {
         changes: &BTreeMap<PathBuf, Vec<u8>>,
         started: Instant,
     ) -> Result<Verification, String> {
+        // Do not even stage hidden inputs: exit status, retries, import and
+        // elapsed time are also output channels, not just stdout/stderr.
+        if snapshot.has_verification_only() {
+            return Ok(Verification {
+                decision: VerificationDecision::NotVerified,
+                output: String::new(),
+                test_status: "not_verified".into(),
+                cleanup_error: None,
+            });
+        }
         let staging = Staging::new()?;
         if let Err(error) = snapshot.stage_verification(&staging.0, changes) {
             return Ok(Verification::failed(error));
         }
-        // Exactly the import candidate + frozen original inputs; never discover
-        // host inputs from the candidate. The entire input volume is readonly.
+        // Shared inputs only; never discover host inputs from the candidate.
+        // The entire input volume is readonly.
         let verifier = self.prepare_verifier(&staging.0, started)?;
         let (metadata_ok, metadata) = self.cargo(
             &verifier,
@@ -328,7 +338,11 @@ impl LocalExecutionTarget {
         };
         let cleanup_error = verifier.shutdown().err();
         Ok(Verification {
-            passed,
+            decision: if passed {
+                VerificationDecision::Verified
+            } else {
+                VerificationDecision::Failed
+            },
             output,
             test_status: status.into(),
             cleanup_error,
@@ -336,8 +350,17 @@ impl LocalExecutionTarget {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum VerificationDecision {
+    Verified,
+    NotVerified,
+    Failed,
+}
+
+const UNSHARED_VERIFICATION_SUMMARY: &str = "Zaivern verification: not run because Cargo verification requires unshared inputs. Candidate-controlled code was not executed with hidden verifier inputs.";
+
 struct Verification {
-    passed: bool,
+    decision: VerificationDecision,
     output: String,
     test_status: String,
     cleanup_error: Option<String>,
@@ -345,7 +368,7 @@ struct Verification {
 impl Verification {
     fn failed(output: String) -> Self {
         Self {
-            passed: false,
+            decision: VerificationDecision::Failed,
             output,
             test_status: "failed".into(),
             cleanup_error: None,
@@ -353,12 +376,11 @@ impl Verification {
     }
 }
 
-// This is an information-flow boundary, not credential detection. Candidate code
-// can print arbitrary (including encoded) unshared inputs into either stream.
-// Never inspect or forward either stream when the verifier has additional files.
+// Defense in depth only. The primary boundary forbids executing candidate code
+// with hidden inputs. If called for such a snapshot, never forward any output.
 pub(super) fn verification_feedback(snapshot: &Snapshot, sink: &CollectSink) -> String {
     if snapshot.has_verification_only() {
-        "Detailed verifier output was withheld because the isolated verifier uses additional unshared Cargo inputs. Fix the candidate using only shared editable files and available context.".into()
+        UNSHARED_VERIFICATION_SUMMARY.into()
     } else if sink.truncated {
         "Test output exceeded response limit; details omitted.".into()
     } else {
@@ -596,9 +618,11 @@ impl TaskExecutor for LocalExecutionTarget {
                         self.run(&strings(&["pause", &container.id]), budget(started, 30)?)?;
                         let candidate = self.collect(&container, &snapshot, control, started)?;
                         if snapshot.files.contains_key(Path::new("Cargo.toml")) {
-                            control.state(State::Running, "verifying cargo tests");
+                            if !snapshot.has_verification_only() {
+                                control.state(State::Running, "verifying cargo tests");
+                            }
                             let Verification {
-                                passed,
+                                decision,
                                 output,
                                 test_status: verified_status,
                                 cleanup_error,
@@ -615,10 +639,14 @@ impl TaskExecutor for LocalExecutionTarget {
                                     build_status,
                                 });
                             }
-                            if passed {
-                                // Only a successfully verified Cargo candidate
-                                // can leave this branch for the import below.
-                                break candidate;
+                            match decision {
+                                VerificationDecision::Verified
+                                | VerificationDecision::NotVerified => {
+                                    // NotVerified explicitly bypasses repair; no hidden-input
+                                    // execution outcome may influence this decision.
+                                    break candidate;
+                                }
+                                VerificationDecision::Failed => {}
                             }
                             if attempts < 2 && !control.is_cancelled() {
                                 self.run(
@@ -666,10 +694,13 @@ impl TaskExecutor for LocalExecutionTarget {
                 snapshot.files.len(),
                 snapshot.omitted
             ));
-            summary.push_str(if snapshot.files.contains_key(Path::new("Cargo.toml")) {
-                "\nZaivern verification: cargo test --workspace --frozen passed on the shared candidate plus original Cargo inputs; no independent build verification. Only directly compiled crate roots with trustworthy evidence can be passed; other edits remain not_verified."
+            summary.push('\n');
+            summary.push_str(if snapshot.has_verification_only() {
+                UNSHARED_VERIFICATION_SUMMARY
+            } else if snapshot.files.contains_key(Path::new("Cargo.toml")) {
+                "Zaivern verification: cargo test --workspace --frozen passed on shared inputs only; no independent build verification. Only directly compiled crate roots with trustworthy evidence can be passed; other edits remain not_verified."
             } else {
-                "\nZaivern verification: no supported test or build verification performed."
+                "Zaivern verification: no supported test or build verification performed."
             });
             agent.stop();
             if control.is_cancelled() {
@@ -921,6 +952,78 @@ exit 1
             drop(container);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verification_only_candidate_code_is_not_executed_and_has_no_result_or_repair_oracle() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_util::unique_temp_dir("bridge", "hidden-oracle");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::create_dir_all(workspace.join("vendor/local_dep/src")).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[package]\nname='oracle'\nversion='0.1.0'\n[dependencies]\nlocal_dep={path='vendor/local_dep'}\n").unwrap();
+        std::fs::write(
+            workspace.join("vendor/local_dep/Cargo.toml"),
+            "[package]\nname='local_dep'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let docker = root.join("docker-fixture");
+        // Any process invocation, including metadata/staging/preparer startup,
+        // is a test failure. This is not a wall-clock or redaction assertion.
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 19\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = LocalExecutionTarget {
+            image: "fixture".into(),
+            docker: docker.clone(),
+            endpoint: "fixture".into(),
+        };
+        let attack = br#"#[test] fn oracle() {
+            let hidden = std::fs::read("vendor/local_dep/src/lib.rs").unwrap();
+            eprintln!("{:?}", hidden);
+            if hidden[3] & 1 == 0 { panic!("secret dependent failure"); }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }"#;
+        for bit in [0, 1] {
+            std::fs::write(workspace.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+            std::fs::write(
+                workspace.join("vendor/local_dep/src/lib.rs"),
+                format!("// {bit} VERIFICATION_ONLY_SENTINEL_7f10a2\npub fn answer() {{}}\n"),
+            )
+            .unwrap();
+            let snapshot =
+                Snapshot::read_for_task(&workspace.canonicalize().unwrap(), "edit src/lib.rs")
+                    .unwrap();
+            assert!(snapshot.has_verification_only());
+            let mut candidate = snapshot.files.clone();
+            candidate.insert("src/lib.rs".into(), attack.to_vec());
+            let result = target
+                .verify(&snapshot, &candidate, Instant::now())
+                .unwrap();
+            assert_eq!(result.decision, VerificationDecision::NotVerified);
+            assert_eq!(result.test_status, "not_verified");
+            assert!(result.output.is_empty());
+            assert!(result.cleanup_error.is_none());
+            assert!(
+                !docker.with_extension("invoked").exists(),
+                "hidden-input code reached Docker"
+            );
+            let stage = root.join(format!("stage-{bit}"));
+            std::fs::create_dir(&stage).unwrap();
+            assert!(snapshot.stage_verification(&stage, &candidate).is_err());
+            assert!(std::fs::read_dir(&stage).unwrap().next().is_none());
+            // No hidden reread oracle, including removal after snapshot.
+            std::fs::remove_file(workspace.join("vendor/local_dep/src/lib.rs")).unwrap();
+            let applied = snapshot.apply(&candidate).unwrap();
+            assert!(applied.error.is_none());
+            assert_eq!(applied.changed, vec!["src/lib.rs"]);
+            assert_eq!(std::fs::read(workspace.join("src/lib.rs")).unwrap(), attack);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

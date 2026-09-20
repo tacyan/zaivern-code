@@ -149,11 +149,23 @@ Agent 本文や検証出力が収集上限で切り詰められた場合は、�
 - “Fix the failing tests and show me the diff.”
 - 「このプロジェクトの失敗しているテストを直して、修正後にテストして diff を見せて。」
 
-`Cargo.toml` が共有された場合、返却候補と開始時に固定した Cargo 検証入力を別の空のコンテナへ配置し、
-`cargo test --workspace --frozen` を実行します。Agent が追加した未共有ファイルは検証に使いません。
-失敗時は最大2回、同じ Agent に修復を依頼します。検証専用入力がある場合は詳細出力を渡さず、
-固定メッセージのみを返します。共有ファイルだけで検証する場合は redaction 済みの出力を返します。結果は出口コードで判定し、
-Agent が「成功」と書いただけでは passed にしません。
+`Cargo.toml` が共有され、必要なCargo入力が**すべてAgentにも共有されている場合だけ**、
+共有候補を別の空のread-onlyコンテナへ配置し、`cargo test --workspace --frozen`を実行します。
+実際の検証失敗は最大2回修復を依頼し、最終失敗ではimportしません。出力はredactionを通します。
+Agentが追加した未共有ファイルは検証に使わず、Agentの成功宣言だけではpassedにしません。
+
+`verification_only`が1つでもあれば、**Cargo metadata / build / testを一切起動しません**。
+判定は明示的な`NotVerified`で、`passed=true`の代用ではありません。repairも発生せず、
+`test_status=not_verified`、`build_status=not_verified`と「未共有入力が必要なため検証未実行」の
+summaryを返します。候補コードと未共有入力を同じ実行環境へ置かないため、stdoutだけでなく
+pass/fail、repair回数、import有無、候補コードのsleepによる時間oracleも防ぎます。
+通常のroot identity・共有ファイル競合・write lease・cancel/import gate・cleanup検査を
+通過した既存共有ファイルの変更は取り込み可能です。これは正しさを検証済みという意味ではありません。
+未共有ファイルはimport時にも再読込・比較せず、その変更をimport可否の判定に使いません。
+未共有入力があるtaskでは、Cargo.tomlの変更はimportを拒否します。依存を削除して次のtaskで
+秘匿対象を共有対象へ変える経路を防ぐためです。共有範囲の変更は所有者がホスト側で行ってください。
+
+以下はshared-only検証を実行する場合の仕様です。
 `--workspace` は root package / default-members に限定せず全 workspace member を対象にします。
 `--frozen` により lockfile の生成・更新とネットワーク取得を禁止します。有効な `Cargo.lock` を
 開始前に用意してください。欠落・不整合は検証失敗となり、候補をホストへ取り込みません。
@@ -186,14 +198,13 @@ Cargo 検証は別 snapshot を使います。開始時の元 manifest を既存
 通常・dev・build・target 依存、`[patch]` / `[replace]` の `path`、workspace member と
 使用される workspace 継承依存を再帰的に解決します。候補 manifest を理由にホストから
 追加読取することはありません。`vendor/` 全体をコピーせず、到達した local package
-だけを検証専用とし、Agent の ACP 許可集合・import 集合から除外します。
+だけを未共有入力として識別し、Agent の ACP 許可集合・import 集合から除外します。
 通常の workspace member は他の local dependency でなければ編集候補になります。
 
-検証用には各 package の root の安全なテキストファイル、`src/tests/examples/benches/
-assets/resources/i18n` と元 manifest の明示 target path を収集し、編集候補の bytes を
-重ねます。上限は合計64 MiB / 8192ファイル / 128 packages、1ファイル1 MiBです。
-64 MiBは既存256 MiB tmpfsの4分の1に制限し、残りをビルド等に残す予算です。
-これは Agent に共有する容量の増量ではありません。上限を超えた Cargo 入力は拒否し、
+必要入力の識別には各 package の root の安全なテキストファイル、`src/tests/examples/benches/
+assets/resources/i18n` と元 manifest の明示 target path を収集します。上限は合計64 MiB / 8192ファイル / 128 packages、1ファイル1 MiBです。
+ホスト内の識別用メモリにも既存の64 MiB上限を維持します。実行対象の共有入力は8 MiB以内です。
+これはAgentやverifierへ未共有内容を渡す予算ではなく、ホスト内の入力識別の上限です。上限を超えた Cargo 入力は拒否し、
 危険・過大な Rust source を省いた状態でテスト成功とは判定しません。
 
 依存 path は workspace 内の通常相対パスに限定し、canonical root・directory FD・
@@ -203,14 +214,13 @@ assets/resources/i18n` と元 manifest の明示 target path を収集し、編�
 [Cargo の依存仕様](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) と
 [workspace 仕様](https://doc.rust-lang.org/cargo/reference/workspaces.html) の限定サブセットです。
 
-非標準 build script の追加入力、除外対象の設定・秘密・binary、image にない registry
+shared-onlyの実行で、非標準 build script の追加入力、除外対象の設定・秘密・binary、image にない registry
 cache / toolchain が必要なら検証は失敗し、ホストへ取り込みません。Zaivern 自身でも
-snapshot の初期化を通常CIで検査しますが、全テストの成功には適切な image と許可対象内の
-ビルド入力が必要です。既存の config/秘密鍵ポリシーを都合よく解除しません。
-検証専用ファイルには同じ秘密除外ポリシーを適用します。candidate のテストコードは verifier 内で
-これらを読めるため、検証専用入力が一つでもあれば stdout/stderr 全体を Agent への返却前に遮断します。
-符号化された値も含め、詳細出力を repair prompt や MCP response へ渡しません。
-その場合、修復時の診断は固定メッセージに制限されます。ホスト上の元依存にも外部編集がないことを import 前に照合します。
+snapshotの初期化を通常CIで検査しますが、未共有入力があるため自動Cargo検証は行いません。既存の config/秘密鍵ポリシーを都合よく解除しません。
+未共有入力にも同じ秘密除外ポリシーを適用します。元manifestによる入力識別・容量・構造の
+検査はホスト内で継続しますが、未共有入力を含む実行treeのstagingは拒否します。
+stdout/stderrの秘匿だけでは、候補コードが作る成功/失敗・時間のoracleを防げないためです。
+shared-only verifierの出力には従来どおりredactionを適用します。
 
 `instruction` は空白だけを除き1〜16384 Unicode code pointsです。別に JSONL の
 MCPフレーム全体（改行・envelope・JSON escapeを含む）に256 KiB上限があります。
@@ -224,7 +234,7 @@ ASCII・日本語・emoji の16384文字を受け付け、最悪の surrogate-pa
 ChatGPT Chat → authenticated tunnel → MCP stdio → ChatBridge
   → TaskStore → TaskExecutor → local Docker snapshot
   → existing AcpClient / agents catalog / structured Phase
-  → isolated edit → offline test → validated result import → status
+  → isolated edit → shared-only verification / not_verified → checked import → status
 ```
 
 main 調査時点は `d13185d` (0.24.5)。本体は単一 crate / `zai` binary で、
@@ -262,7 +272,7 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   外部通信なし、read-only root、capabilities 削除、no-new-privileges、PID 128 / CPU 2 / memory 4 GiB の上限を使います。
   workspace は容量256 MiBのタスク専用 tmpfs volume で、stdinから配置し、
   コンテナ全体をpauseして結果を取得します。verifier は準備コンテナ削除後、入力 volume を
-  read-only で mount します。Cargo.lock / manifest / ソース / 検証専用入力を変更・削除・追加できません。
+  read-only で mount します。Cargo.lock / manifest / 共有ソースを変更・削除・追加できません。未共有入力は配置しません。
   ビルド生成物は別の空の `/target` tmpfs（256 MiB）へ置きます。volume は最後のコンテナ終了後に削除し、
   Agent・準備コンテナ・verifier・volume の cleanup 失敗はいずれも import を禁止します。
   Docker daemon、OS、指定した image は信頼する基盤です。
@@ -338,8 +348,10 @@ fixture は実際の ACP process として起動し、危険操作の拒否、ho
 local dependency / patch / workspace、候補manifest改変、逸脱・リンク・外部変更を検査します。
 固定fixtureを使った `cargo test --workspace --frozen` も実行します（ユーザーコードのホスト実行ではありません）。
 Docker E2E は Ubuntu の通常 CI で専用 image をビルドし、immutable image ID を指定して明示実行します。
-他 OS の通常テストでは Docker を要求しません。検証専用入力の読み出し・hex 出力を試みる
-攻撃 fixture、Agent prompt / MCP response への非流出、失敗時の import 拒否も確認します。
+他 OS の通常テストでは Docker を要求しません。未共有入力の読み出し・hex出力・bitに応じた
+panic/sleepを試みる攻撃fixtureは、検証を起動せずnot_verifiedで同じ安全import経路に進み、
+repairを発生させないことを検査します。通常CIでもDockerコマンド呼出しゼロとstagingゼロを
+故障注入で確認します。shared-onlyの検証失敗時import拒否とrepair成功も検査します。
 non-virtual workspace / default-members、未使用 Rust、lockfile 欠落・不整合、入力 volume への
 書き込み拒否も通常 Cargo 回帰と Docker E2E で検査します。
 CI はテスト前後の container / volume を比較し、新たな残存を失敗として扱い、回収を試みます。

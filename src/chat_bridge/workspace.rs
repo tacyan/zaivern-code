@@ -314,6 +314,11 @@ impl Snapshot {
         destination: &Path,
         changes: &BTreeMap<PathBuf, Vec<u8>>,
     ) -> Result<(), String> {
+        // A future caller must not accidentally materialize a hidden-input
+        // execution tree by bypassing the executor's NotVerified decision.
+        if self.has_verification_only() {
+            return Err("unshared Cargo inputs cannot be staged for candidate execution".into());
+        }
         if self.unsafe_cargo_source.get() {
             return Err("Cargo source excluded by safety policy; changes were not imported".into());
         }
@@ -321,19 +326,17 @@ impl Snapshot {
         {
             return Err("candidate must contain exactly the shared files".into());
         }
-        let total: usize = changes
-            .values()
-            .chain(self.verification_only.values())
-            .map(Vec::len)
-            .sum();
+        let total: usize = changes.values().map(Vec::len).sum();
         if total > VERIFICATION_LIMIT || changes.values().any(|b| b.len() > FILE_LIMIT) {
             return Err("Cargo verification snapshot limit exceeded".into());
         }
         self.stage_changes(destination, changes)?;
-        for (path, bytes) in &self.verification_only {
-            stage_file(destination, path, bytes)?;
-        }
         Ok(())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn has_frozen_input(&self, path: &Path) -> bool {
+        self.verification_only.contains_key(path)
     }
 
     pub(super) fn has_verification_only(&self) -> bool {
@@ -386,13 +389,18 @@ impl Snapshot {
         {
             return Err("candidate must contain exactly the shared files".into());
         }
-        // Unshared build inputs are part of the verified result too.
-        for (path, before) in &self.verification_only {
-            if self.read_text(path)?.as_ref() != Some(before) {
-                return Err(
-                    "verification input changed while task ran; no results imported".into(),
-                );
-            }
+        // Hidden inputs were not executed, so never reread/compare them here:
+        // their contents or concurrent edits must not decide import success.
+        // Keep original manifests authoritative across subsequent tasks too.
+        // Removing a local dependency must not reclassify its hidden sources
+        // as editable on the next snapshot.
+        if self.has_verification_only()
+            && changes.iter().any(|(path, after)| {
+                path.file_name().is_some_and(|name| name == "Cargo.toml")
+                    && self.files.get(path) != Some(after)
+            })
+        {
+            return Err("Cargo manifests defining unshared input scope cannot be imported".into());
         }
         for (path, after) in changes {
             let before = self.files.get(path).ok_or("unshared output path")?;

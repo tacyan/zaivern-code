@@ -45,7 +45,7 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
     std::fs::create_dir_all(workspace.join("src")).unwrap();
     std::fs::write(
         workspace.join("Cargo.toml"),
-        "[package]\nname=\"bridge_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlocal_dep={path=\"vendor/local_dep\"}\npatched=\"0.1.0\"\n[patch.crates-io]\npatched={path=\"vendor/patched\"}\n",
+        "[package]\nname=\"bridge_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
     )
     .unwrap();
     for name in ["local_dep", "patched"] {
@@ -63,11 +63,11 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         .unwrap();
     }
     let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
-    let lock = "version = 4\n[[package]]\nname='bridge_fixture'\nversion='0.1.0'\ndependencies=['local_dep','patched']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n[[package]]\nname='patched'\nversion='0.1.0'\n";
+    let lock = "version = 4\n[[package]]\nname='bridge_fixture'\nversion='0.1.0'\n";
     std::fs::write(workspace.join("Cargo.lock"), lock).unwrap();
     std::fs::write(
         workspace.join("src/lib.rs"),
-        "#[test]\nfn arithmetic() { assert_eq!(local_dep::answer(), 4); assert_eq!(patched::answer(), 4); assert_eq!(2 + 2, 5); }\n",
+        "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
     )
     .unwrap();
     std::fs::write(workspace.join(".env"), "SENTINEL=not-for-agent").unwrap();
@@ -154,11 +154,11 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
     );
     for instruction in [
         "Fix the failing test and show the diff",
+        "REPAIR_SUCCESS",
         "MIXED_FRONTEND",
         "WAIT_FOREVER",
         "UNSHARED_HELPER",
         "VERIFY_CANCEL",
-        "EXFILTRATE_VERIFIER",
         "WORKSPACE_COMPILE_ERROR",
         "WORKSPACE_TEST_FAILURE",
         "WORKSPACE_PASS",
@@ -166,8 +166,28 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         "READONLY_INPUTS",
         "LOCK_MISSING",
         "LOCK_STALE",
+        "EXFILTRATE_VERIFIER",
+        "ORACLE_EVEN",
+        "ORACLE_ODD",
         "NO_CARGO",
     ] {
+        let hidden = matches!(
+            instruction,
+            "EXFILTRATE_VERIFIER" | "ORACLE_EVEN" | "ORACLE_ODD"
+        );
+        if hidden {
+            std::fs::write(workspace.join("Cargo.toml"), format!("{manifest}\n[dependencies]\nlocal_dep={{path='vendor/local_dep'}}\npatched='0.1.0'\n[patch.crates-io]\npatched={{path='vendor/patched'}}\n")).unwrap();
+            std::fs::write(workspace.join("Cargo.lock"), "version = 4\n[[package]]\nname='bridge_fixture'\nversion='0.1.0'\ndependencies=['local_dep','patched']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n[[package]]\nname='patched'\nversion='0.1.0'\n").unwrap();
+            let bit = usize::from(instruction == "ORACLE_ODD");
+            std::fs::write(
+                workspace.join("vendor/local_dep/src/lib.rs"),
+                format!(
+                    "// {bit} VERIFICATION_ONLY_SENTINEL_7f10a2\npub fn answer() -> u32 {{ 4 }}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(workspace.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
+        }
         if instruction.starts_with("WORKSPACE_") {
             std::fs::write(
                 workspace.join("Cargo.toml"),
@@ -232,7 +252,6 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             instruction,
             "UNSHARED_HELPER"
                 | "VERIFY_CANCEL"
-                | "EXFILTRATE_VERIFIER"
                 | "WORKSPACE_COMPILE_ERROR"
                 | "WORKSPACE_TEST_FAILURE"
                 | "LOCK_MISSING"
@@ -319,14 +338,38 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
                 assert!(!expect_failure, "{status}");
-                let verification =
-                    if matches!(instruction, "NO_CARGO" | "MIXED_FRONTEND" | "UNUSED_RUST") {
-                        "not_verified"
-                    } else {
-                        "passed"
-                    };
+                let verification = if hidden
+                    || matches!(instruction, "NO_CARGO" | "MIXED_FRONTEND" | "UNUSED_RUST")
+                {
+                    "not_verified"
+                } else {
+                    "passed"
+                };
                 assert_eq!(status["test_status"], verification, "{status}");
                 assert_eq!(status["build_status"], "not_verified", "{status}");
+                if hidden {
+                    let summary = status["summary"].as_str().unwrap();
+                    assert!(
+                        summary.contains(
+                            "not run because Cargo verification requires unshared inputs"
+                        ),
+                        "{status}"
+                    );
+                    assert!(!summary.contains("frozen passed"), "{status}");
+                    assert!(
+                        summary.contains("prompt_count=1"),
+                        "repair oracle: {status}"
+                    );
+                }
+                if instruction == "REPAIR_SUCCESS" {
+                    assert!(
+                        status["summary"]
+                            .as_str()
+                            .unwrap()
+                            .contains("prompt_count=2"),
+                        "{status}"
+                    );
+                }
                 if instruction == "MIXED_FRONTEND" {
                     assert_eq!(
                         status["changed_files"],
@@ -348,10 +391,15 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                     "WORKSPACE_PASS" => "+#[test] fn member() { assert_eq!(2 + 2, 4); }",
                     "UNUSED_RUST" => "+this is invalid Rust;",
                     "READONLY_INPUTS" => "+#[test] fn inputs_are_immutable()",
+                    "EXFILTRATE_VERIFIER" => "+#[test] fn exfiltrate()",
+                    "ORACLE_EVEN" | "ORACLE_ODD" => "+#[test] fn oracle()",
                     _ => "+fn arithmetic()",
                 };
                 assert!(
-                    status["diff_summary"].as_str().unwrap().contains(expected_line),
+                    status["diff_summary"]
+                        .as_str()
+                        .unwrap()
+                        .contains(expected_line),
                     "{status}"
                 );
                 if instruction == "WORKSPACE_PASS" {

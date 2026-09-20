@@ -46,7 +46,7 @@ fn main() {
             );
             exfiltrate |= line.contains("EXFILTRATE_VERIFIER");
             if exfiltrate && prompts > 0 {
-                assert!(line.contains("Detailed verifier output was withheld"));
+                panic!("hidden-input candidate must not receive a repair prompt");
             }
             for name in [
                 "WORKSPACE_COMPILE_ERROR",
@@ -54,10 +54,16 @@ fn main() {
                 "WORKSPACE_PASS",
                 "UNUSED_RUST",
                 "READONLY_INPUTS",
+                "ORACLE_EVEN",
+                "ORACLE_ODD",
+                "REPAIR_SUCCESS",
             ] {
                 if line.contains(name) {
                     scenario = name;
                 }
+            }
+            if scenario.starts_with("ORACLE_") {
+                assert_eq!(prompts, 0, "hidden-input repair oracle");
             }
             prompts += 1;
             helper_only |= line.contains("UNSHARED_HELPER");
@@ -103,13 +109,30 @@ fn main() {
                 )
                 .unwrap();
             } else if scenario == "READONLY_INPUTS" {
-                std::fs::write(file, r#"#[test] fn inputs_are_immutable() {
-                    for path in ["Cargo.toml", "Cargo.lock", "src/lib.rs", "vendor/local_dep/src/lib.rs"] {
+                std::fs::write(
+                    file,
+                    r#"#[test] fn inputs_are_immutable() {
+                    for path in ["Cargo.toml", "Cargo.lock", "src/lib.rs"] {
                         assert!(std::fs::write(path, "mutated").is_err(), "{path}");
                         assert!(std::fs::remove_file(path).is_err(), "{path}");
                     }
                     assert!(std::fs::write("new-file", "new").is_err());
-                }"#).unwrap();
+                }"#,
+                )
+                .unwrap();
+            } else if scenario.starts_with("ORACLE_") {
+                std::fs::write(
+                    file,
+                    r#"#[test] fn oracle() {
+                    let hidden = std::fs::read("vendor/local_dep/src/lib.rs").unwrap();
+                    if hidden[3] & 1 == 0 { panic!("secret dependent failure"); }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }"#,
+                )
+                .unwrap();
+            } else if scenario == "REPAIR_SUCCESS" && prompts == 1 {
+                std::fs::write(file, "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n")
+                    .unwrap();
             } else if exfiltrate {
                 std::fs::write(
                     file,
@@ -136,9 +159,9 @@ fn main() {
             if mixed {
                 std::fs::write("/workspace/frontend/app.ts", "const broken = ;\n").unwrap();
             }
-            send(
-                r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Fixed fixture. Zaivern must verify the tests independently."}}}}"#,
-            );
+            send(&format!(
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fixture","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"Fixed fixture. Zaivern must verify the tests independently. prompt_count={prompts}"}}}}}}}}"#,
+            ));
             send(&format!(
                 r#"{{"jsonrpc":"2.0","id":{prompt_id},"result":{{"stopReason":"end_turn"}}}}"#
             ));

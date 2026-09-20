@@ -63,10 +63,12 @@ fn directory_enumeration_is_repeatable_and_large_source_selection_is_bounded() {
     assert_eq!(first, second);
     assert!(!first.is_empty());
     let stage = Fixture::new("large-stage");
-    snapshot
+    assert!(snapshot.has_verification_only());
+    assert!(snapshot
         .stage_verification(&stage.0, &snapshot.files)
-        .unwrap();
-    assert!(stage.0.join("src/module_00.rs").exists());
+        .is_err());
+    assert!(std::fs::read_dir(&stage.0).unwrap().next().is_none());
+    snapshot.stage(&stage.0).unwrap();
     assert!(stage.0.join("src/module_31.rs").exists());
     assert!(!stage.0.join("docs/manual_0.md").exists());
 }
@@ -85,7 +87,7 @@ fn this_repository_can_initialize_a_task_snapshot() {
 }
 
 #[test]
-fn local_dependency_candidate_is_verified_frozen_but_never_editable() {
+fn local_dependency_is_frozen_but_never_staged_with_candidate() {
     for patch in [false, true] {
         let f = Fixture::new("path-dep");
         let dependency = if patch {
@@ -115,110 +117,23 @@ fn local_dependency_candidate_is_verified_frozen_but_never_editable() {
             b"#[test] fn answer() { assert_eq!(local_dep::answer(), 4); }\n".to_vec(),
         );
         let verifier = Fixture::new("verifier-stage");
-        snapshot
+        assert!(snapshot.has_verification_only());
+        assert!(snapshot.has_frozen_input(Path::new("vendor/local_dep/src/lib.rs")));
+        assert!(!snapshot.has_frozen_input(Path::new("vendor/unrelated/src/lib.rs")));
+        for secret in [".env", "credentials.json", "secret.pem"] {
+            assert!(!snapshot.has_frozen_input(&Path::new("vendor/local_dep").join(secret)));
+        }
+        assert!(snapshot
             .stage_verification(&verifier.0, &candidate)
-            .unwrap();
+            .is_err());
+        assert!(std::fs::read_dir(&verifier.0).unwrap().next().is_none());
+        let applied = snapshot.apply(&candidate).unwrap();
+        assert!(applied.error.is_none());
+        assert_eq!(applied.changed, vec!["src/lib.rs"]);
         assert_eq!(
-            std::fs::read(verifier.0.join("src/lib.rs")).unwrap(),
+            std::fs::read(f.0.join("src/lib.rs")).unwrap(),
             candidate[Path::new("src/lib.rs")]
         );
-        assert!(verifier.0.join("vendor/local_dep/src/lib.rs").exists());
-        assert!(!verifier.0.join("vendor/unrelated").exists());
-        for secret in [".env", "credentials.json", "secret.pem"] {
-            assert!(!verifier.0.join("vendor/local_dep").join(secret).exists());
-        }
-        // Only our fixed fixture code is run on the host. Production always uses Docker.
-        let mut command = crate::procx::hidden_command_raw(env!("CARGO"));
-        command
-            .args(["test", "--workspace", "--frozen"])
-            .current_dir(&verifier.0)
-            .env("CARGO_HOME", verifier.0.join("cargo-home"))
-            .env("CARGO_TARGET_DIR", verifier.0.join("target"))
-            .env("ZAIVERN_HOME", verifier.0.join("home"))
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS");
-        let mut sink = crate::features::cloud_execution::model::CollectSink::with_limit(64 * 1024);
-        let result = crate::features::cloud_execution::transport::run_child(
-            command,
-            std::time::Duration::from_secs(30),
-            "cargo",
-            &mut sink,
-        )
-        .unwrap();
-        assert!(
-            result.ok(),
-            "{}\n{}",
-            sink.stdout_text(),
-            sink.stderr_text()
-        );
-        assert!(sink.stdout_text().contains("1 passed"));
-        // Malicious shared code can read and encode unshared inputs in the verifier.
-        // The sentinel is ordinary text, deliberately not a credential pattern.
-        const SENTINEL: &str = "VERIFICATION_ONLY_SENTINEL_7f10a2";
-        let frozen = Fixture::new("exfiltration");
-        frozen.package("", "exfiltration", dependency);
-        frozen.package("vendor/local_dep/", "local_dep", "");
-        frozen.put("Cargo.lock", "version = 4\n[[package]]\nname='exfiltration'\nversion='0.1.0'\ndependencies=['local_dep']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n");
-        frozen.put(
-            "vendor/local_dep/src/lib.rs",
-            &format!("// {SENTINEL}\npub fn answer() -> u32 {{ 4 }}\n"),
-        );
-        frozen.put(
-            "src/lib.rs",
-            r#"#[test] fn exfiltrate() {
-            let text = std::fs::read_to_string("vendor/local_dep/src/lib.rs").unwrap();
-            eprintln!("{text}");
-            for byte in text.bytes() { eprint!("{byte:02x}"); }
-            panic!("force verification failure");
-        }"#,
-        );
-        let unshared = frozen.read().unwrap();
-        assert!(unshared.has_verification_only());
-        assert!(!unshared
-            .files
-            .values()
-            .any(|bytes| String::from_utf8_lossy(bytes).contains(SENTINEL)));
-        let stage = Fixture::new("exfiltration-stage");
-        unshared
-            .stage_verification(&stage.0, &unshared.files)
-            .unwrap();
-        let mut command = crate::procx::hidden_command_raw(env!("CARGO"));
-        command
-            .args(["test", "--workspace", "--frozen"])
-            .current_dir(&stage.0)
-            .env("CARGO_HOME", stage.0.join("cargo-home"))
-            .env("CARGO_TARGET_DIR", stage.0.join("target"))
-            .env("ZAIVERN_HOME", stage.0.join("home"))
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS");
-        let mut sink = crate::features::cloud_execution::model::CollectSink::with_limit(64 * 1024);
-        let result = crate::features::cloud_execution::transport::run_child(
-            command,
-            std::time::Duration::from_secs(30),
-            "cargo",
-            &mut sink,
-        )
-        .unwrap();
-        assert!(!result.ok());
-        let raw = format!("{}\n{}", sink.stdout_text(), sink.stderr_text());
-        let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
-        assert!(raw.contains(SENTINEL), "{raw}");
-        assert!(raw.contains(&encoded), "{raw}");
-        assert!(crate::features::cloud_execution::redact::redact(&raw).contains(SENTINEL));
-        let feedback = super::target::verification_feedback(&unshared, &sink);
-        let agent_visible_data = super::target::repair_prompt(&feedback);
-        assert!(!agent_visible_data.contains(SENTINEL));
-        assert!(!agent_visible_data.contains(&encoded));
-        assert!(agent_visible_data.contains("Detailed verifier output was withheld"));
-        // Without unshared inputs the same failure output remains useful.
-        let shared = Fixture::new("shared-only");
-        shared.package("", "shared_only", "");
-        let shared = shared.read().unwrap();
-        assert!(!shared.has_verification_only());
-        let feedback = super::target::verification_feedback(&shared, &sink);
-        assert!(feedback.contains("force verification failure"));
 
         // A candidate cannot acquire an unshared editable path or trigger discovery.
         candidate.insert(
@@ -256,17 +171,18 @@ fn workspace_members_inheritance_target_and_recursive_dependencies() {
         .files
         .contains_key(Path::new("crates/app/support/helper/src/lib.rs")));
     let verifier = Fixture::new("workspace-stage");
-    snapshot
+    assert!(snapshot
         .stage_verification(&verifier.0, &snapshot.files)
-        .unwrap();
+        .is_err());
+    assert!(std::fs::read_dir(&verifier.0).unwrap().next().is_none());
     for path in [
         "vendor/shared/src/lib.rs",
         "crates/app/support/helper/src/lib.rs",
         "crates/app/support/helper/leaf/src/lib.rs",
     ] {
-        assert!(verifier.0.join(path).exists(), "{path}");
+        assert!(snapshot.has_frozen_input(Path::new(path)), "{path}");
     }
-    assert!(!verifier.0.join("vendor/not_needed").exists());
+    assert!(!snapshot.has_frozen_input(Path::new("vendor/not_needed/Cargo.toml")));
 }
 
 #[test]
@@ -312,7 +228,7 @@ fn dependency_paths_fail_closed_and_candidate_manifest_never_expands_host_reads(
 }
 
 #[test]
-fn dependency_links_and_external_modifications_cannot_be_imported() {
+fn dependency_links_are_rejected_and_only_shared_conflicts_gate_import() {
     let f = Fixture::new("linked-dep");
     let outside = Fixture::new("outside-dep");
     outside.package("", "dep", "");
@@ -338,11 +254,19 @@ fn dependency_links_and_external_modifications_cannot_be_imported() {
     let snapshot = f.read().unwrap();
     let mut candidate = snapshot.files.clone();
     candidate.insert("src/lib.rs".into(), b"candidate edit".to_vec());
+    // Hidden contents are no longer verification inputs: even a concurrent
+    // change must not turn the candidate into an import oracle.
     f.put("vendor/dep/src/lib.rs", "external edit");
+    let applied = snapshot.apply(&candidate).unwrap();
+    assert!(applied.error.is_none());
+    assert_eq!(applied.changed, vec!["src/lib.rs"]);
+    // Shared input conflicts remain fail closed, before any host write.
+    let snapshot = f.read().unwrap();
+    f.put("src/lib.rs", "external shared edit");
     assert!(snapshot.apply(&candidate).is_err());
     assert_eq!(
-        std::fs::read(f.0.join("src/lib.rs")).unwrap(),
-        snapshot.files[Path::new("src/lib.rs")]
+        std::fs::read_to_string(f.0.join("src/lib.rs")).unwrap(),
+        "external shared edit"
     );
 }
 
@@ -469,8 +393,28 @@ fn workspace_member_used_as_local_dependency_remains_verification_only() {
         .files
         .contains_key(Path::new("crates/app/src/lib.rs")));
     let stage = Fixture::new("member-dependency-stage");
-    snapshot
+    assert!(snapshot
         .stage_verification(&stage.0, &snapshot.files)
-        .unwrap();
-    assert!(stage.0.join("crates/core/src/lib.rs").exists());
+        .is_err());
+    assert!(std::fs::read_dir(&stage.0).unwrap().next().is_none());
+    assert!(snapshot.has_frozen_input(Path::new("crates/core/src/lib.rs")));
+    let mut candidate = snapshot.files.clone();
+    candidate.insert(
+        "Cargo.toml".into(),
+        b"[workspace]\nmembers=['crates/app','crates/core']\n".to_vec(),
+    );
+    candidate.insert(
+        "crates/app/Cargo.toml".into(),
+        b"[package]\nname='app'\nversion='0.1.0'\n".to_vec(),
+    );
+    assert!(snapshot
+        .apply(&candidate)
+        .err()
+        .unwrap()
+        .contains("unshared input scope"));
+    let next_task = Snapshot::read_for_task(&f.0, "Read crates/core/src/lib.rs").unwrap();
+    assert!(!next_task
+        .files
+        .contains_key(Path::new("crates/core/src/lib.rs")));
+    assert!(next_task.has_frozen_input(Path::new("crates/core/src/lib.rs")));
 }

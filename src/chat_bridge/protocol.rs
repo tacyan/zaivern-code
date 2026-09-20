@@ -130,7 +130,7 @@ fn write_response(out: &mut impl Write, value: Value) -> io::Result<()> {
 }
 fn tools() -> Value {
     json!([
-        {"name":"zaivern_run_task","description":"Run a coding task in an isolated Zaivern agent; returns a task ID immediately. The task may overwrite existing files in the server-configured workspace after successful Cargo verification, or without verification for unsupported projects.",
+        {"name":"zaivern_run_task","description":"Run a coding task in an isolated Zaivern agent; returns a task ID immediately. The task may overwrite existing files in the server-configured workspace after successful Cargo verification, or without verification when required inputs are unshared or the project is unsupported.",
          "annotations":{"readOnlyHint":false,"openWorldHint":false,"destructiveHint":true},
          "inputSchema":{"type":"object","properties":{"instruction":{"type":"string","minLength":1,"maxLength":16384}},"required":["instruction"],"additionalProperties":false}},
         {"name":"zaivern_task_status","description":"Get task state, changes and verification status.",
