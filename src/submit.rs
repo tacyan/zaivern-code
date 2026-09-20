@@ -164,13 +164,16 @@ pub fn sanitize(text: &str) -> String {
 /// なるが、これは素のシェルでは望ましい挙動なのでそのまま流す。
 ///
 /// 空文字は空のバイト列を返す (呼び出し側が送信そのものを取り止める)。
-pub fn body_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    let body = sanitize(text);
+///
+/// 呼び出し側は `let body = sanitize(text)` を一度だけ作り、本文の
+/// バイト列はここから、下書き追跡の種など同じ本文を使う他の用途は
+/// `body` から取る — 別々に sanitize すると将来ずれる。
+pub fn wrap_body(body: &str, bracketed: bool) -> Vec<u8> {
     if body.is_empty() {
         return Vec::new();
     }
     if !bracketed {
-        return body.into_bytes();
+        return body.as_bytes().to_vec();
     }
     let mut out = Vec::with_capacity(body.len() + PASTE_BEGIN.len() + PASTE_END.len());
     out.extend_from_slice(PASTE_BEGIN);
@@ -1334,7 +1337,7 @@ mod tests {
     #[test]
     fn 本文のバイト列に確定キーを含めない() {
         for bracketed in [false, true] {
-            let b = body_bytes("やること", bracketed);
+            let b = wrap_body(&sanitize("やること"), bracketed);
             assert!(!b.ends_with(COMMIT), "bracketed={bracketed}");
             assert!(!b.contains(&b'\r'), "bracketed={bracketed}");
         }
@@ -1342,20 +1345,20 @@ mod tests {
 
     #[test]
     fn bracketed_なら本文を包む() {
-        let b = body_bytes("一行目\n二行目", true);
+        let b = wrap_body(&sanitize("一行目\n二行目"), true);
         let s = String::from_utf8(b).unwrap();
         assert_eq!(s, "\x1b[200~一行目\n二行目\x1b[201~");
     }
 
     #[test]
     fn bracketed_でなければ素のまま送る() {
-        let b = body_bytes("ls -la", false);
+        let b = wrap_body(&sanitize("ls -la"), false);
         assert_eq!(String::from_utf8(b).unwrap(), "ls -la");
     }
 
     #[test]
     fn 空文字は空のバイト列() {
-        assert!(body_bytes("   \n ", true).is_empty());
+        assert!(wrap_body(&sanitize("   \n "), true).is_empty());
     }
 
     /// 承認プロンプトが出ている間は、どの段でも絶対に書かない。

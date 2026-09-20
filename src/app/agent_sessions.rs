@@ -692,16 +692,28 @@ impl ZaivernApp {
                     s.note_user_input();
                     // 失敗切替で別プロファイルへ引き継ぐ材料として覚えておく。
                     s.note_prompt(&p.job.text);
-                    s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
+                    // 本文の sanitize はここで一度だけ — PTY へ書くバイト列と
+                    // 下書き追跡の種を同じ文字列から作る (末尾空白・制御文字・
+                    // CRLF を落とした後の、実際に入力欄へ入る文字数で追う)。
+                    let body = submit::sanitize(&p.job.text);
+                    if p.job.submit {
+                        // 確定送信の本文・確定キーは下書き追跡に畳まない —
+                        // 配達自身の書き込みで、残っている下書きを誤って
+                        // 消費済みにしない。
+                        s.write_bytes(&submit::wrap_body(&body, peek.bracketed));
+                    } else {
+                        // 挿入は入力欄への追記 = 人の打鍵と同じく追跡へ畳む。
+                        s.write_typed(&submit::wrap_body(&body, peek.bracketed));
+                    }
                     s.set_scroll(0);
                     if !p.job.submit {
                         // 確定キーを送らない配達は、本文を入力欄へ残したまま
                         // 終わる = **人の下書き**として占有が残る。この間に
                         // 後続の確定送信を始めると、その確定キーが下書きまで
-                        // 一緒に送信する (解放は人の打鍵を write_bytes が見る)。
-                        // 残した本文を渡して追跡の種にする — Backspace での
-                        // 全消しまで追えるようになる。
-                        s.note_input_draft(&p.job.text);
+                        // 一緒に送信する (解放は人の打鍵を write_typed が見る)。
+                        // 残した本文 (sanitize 済み) を渡して追跡の種にする —
+                        // Backspace での全消しまで追えるようになる。
+                        s.note_input_draft(&body);
                     }
                     if p.job.wait_idle {
                         delivered.push(s.title.clone());
@@ -841,9 +853,26 @@ mod delivery_peek_tests {
             "submit_tick が下書き占有を due_now へ渡していない"
         );
         assert!(
-            body.contains("note_input_draft(&p.job.text)"),
+            body.contains("note_input_draft(&body)"),
             "insert の配達後に下書きの印を立てていない (後続の確定送信が下書きを巻き込む)\n\
              残した本文を渡さないと Backspace 全消しでの解放まで追えない"
+        );
+        // **下書きの種と PTY へ書く本文は同じ sanitize 済み文字列から作る。**
+        // 生の `p.job.text` を種にすると、sanitize が落とす末尾空白・制御
+        // 文字・CRLF ぶん残量が実際より多く見えて、全部消しても解放しない
+        // (保守側ではあるが永久待ちになる)。
+        assert!(
+            body.contains("let body = submit::sanitize(&p.job.text);"),
+            "本文の sanitize が一度で済んでいない (PTY 書き込みと種でずれる):\n{body}"
+        );
+        assert!(
+            body.contains("s.write_typed(&submit::wrap_body(&body, peek.bracketed))"),
+            "insert の本文が人の打鍵として畳まれていない (追記が追跡に乗らない):\n{body}"
+        );
+        assert!(
+            body.contains("s.write_bytes(&submit::wrap_body(&body, peek.bracketed))"),
+            "確定送信の本文が内部書き込みになっていない (配達自身の書き込みで\n\
+             残っている下書きを誤って畳む):\n{body}"
         );
     }
 

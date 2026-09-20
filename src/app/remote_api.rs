@@ -580,7 +580,7 @@ impl ZaivernApp {
             remote::AgentAct::Stop => {
                 // リモートからの手動操作もユーザーの応答扱い
                 s.note_user_input();
-                s.write_bytes(b"\x1b");
+                s.write_typed(b"\x1b");
                 json!({"ok": true}).to_string()
             }
         }
@@ -729,7 +729,7 @@ impl ZaivernApp {
         {
             // リモートからの手動操作もユーザーの応答扱い (承認エピソードを解決する)
             s.note_user_input();
-            s.write_bytes(bytes);
+            s.write_typed(bytes);
             n += 1;
         }
         n
@@ -997,10 +997,10 @@ impl ZaivernApp {
                 // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
                 s.note_user_input();
                 if raw {
-                    s.write_bytes(payload.as_bytes());
+                    s.write_typed(payload.as_bytes());
                 } else {
-                    s.write_bytes(payload.as_bytes());
-                    s.write_bytes(submit::COMMIT);
+                    s.write_typed(payload.as_bytes());
+                    s.write_typed(submit::COMMIT);
                 }
                 json!({"ok": true}).to_string()
             }

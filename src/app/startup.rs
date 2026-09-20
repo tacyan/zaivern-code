@@ -1457,7 +1457,7 @@ impl ZaivernApp {
             // 明示的な送り込みはユーザーの応答扱い (承認エピソードを解決する)
             s.note_user_input();
             // 空へ展開されるコマンド (`/clear` 等) でも確定キーは従来どおり送る
-            s.write_bytes(submit::COMMIT);
+            s.write_typed(submit::COMMIT);
         }
         self.agents.panel_open = true;
         let verb = if submit {
