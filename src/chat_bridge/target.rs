@@ -457,8 +457,11 @@ impl TaskExecutor for LocalExecutionTarget {
                             test_status = if passed { "passed" } else { "failed" }.into();
                             if passed {
                                 build_status = "passed".into();
+                                // Only a successfully verified Cargo candidate
+                                // can leave this branch for the import below.
+                                break candidate;
                             }
-                            if !passed && attempts < 2 && !control.is_cancelled() {
+                            if attempts < 2 && !control.is_cancelled() {
                                 self.run(
                                     &strings(&["unpause", &container.id]),
                                     budget(started, 30)?,
@@ -469,7 +472,23 @@ impl TaskExecutor for LocalExecutionTarget {
                             }
                                 continue;
                             }
+                            // Verification failure is terminal, including when
+                            // cancellation arrived during verification. Return
+                            // before apply; candidate edits are never host edits.
+                            agent.stop();
+                            return Ok(Outcome {
+                                error: Some(
+                                    "verification failed; changes were not imported".into(),
+                                ),
+                                summary: "Verification failed; host workspace was not modified."
+                                    .into(),
+                                changed_files: Vec::new(),
+                                diff_summary: String::new(),
+                                test_status,
+                                build_status,
+                            });
                         }
+                        // Projects without Cargo.toml retain not_verified.
                         break candidate;
                     }
                     Phase::Failed(_) | Phase::Ended => {
@@ -514,7 +533,10 @@ impl TaskExecutor for LocalExecutionTarget {
         })();
         match (result, container.shutdown()) {
             (Ok(mut outcome), Err(error)) => {
-                outcome.error = Some(error);
+                outcome.error = Some(match outcome.error {
+                    Some(cause) => format!("{cause}; {error}"),
+                    None => error,
+                });
                 Ok(outcome)
             }
             (Err(_), Err(error)) => Err(error),
@@ -632,6 +654,22 @@ mod tests {
         assert!(diff.contains("api_key=***"), "{diff}");
         assert!(diff.contains("-fn answer() { wrong(); }"), "{diff}");
         assert!(diff.contains("+fn answer() { correct(); }"), "{diff}");
+    }
+    #[test]
+    fn diff_redacts_unchanged_camel_case_context() {
+        for name in [
+            "accessToken",
+            "refreshToken",
+            "clientSecret",
+            "apiKey",
+            "password",
+        ] {
+            let before = format!("const {name} = \"fixture-secret-value\";\nold();\n");
+            let diff = summarize(&before, &before.replace("old();", "new();"));
+            assert!(!diff.contains("fixture-secret-value"), "{diff}");
+            assert!(diff.contains("***"), "{diff}");
+            assert!(diff.contains("-old();\n+new();\n"), "{diff}");
+        }
     }
     #[test]
     fn diff_bounds_context_and_redacts_before_response_limit() {

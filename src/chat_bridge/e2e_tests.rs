@@ -133,7 +133,19 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         "Fix the failing test and show the diff",
         "WAIT_FOREVER",
         "UNSHARED_HELPER",
+        "NO_CARGO",
     ] {
+        if instruction == "NO_CARGO" {
+            std::fs::remove_file(workspace.join("Cargo.toml")).unwrap();
+            std::fs::write(
+                workspace.join("src/lib.rs"),
+                "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
+            )
+            .unwrap();
+        }
+        let original_lib = std::fs::read(workspace.join("src/lib.rs")).unwrap();
+        let original_manifest = std::fs::read(workspace.join("Cargo.toml")).ok();
+        let original_env = std::fs::read(workspace.join(".env")).unwrap();
         let response = call(
             "tools/call",
             json!({"name":"zaivern_run_task","arguments":{"instruction":instruction,"workspace":workspace}}),
@@ -178,13 +190,35 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             if status["state"] == "failed" {
                 assert_eq!(instruction, "UNSHARED_HELPER", "{status}");
                 assert_eq!(status["test_status"], "failed", "{status}");
+                assert_eq!(status["changed_files"], json!([]), "{status}");
+                assert!(
+                    status["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("verification failed; changes were not imported"),
+                    "{status}"
+                );
+                assert_eq!(
+                    std::fs::read(workspace.join("src/lib.rs")).unwrap(),
+                    original_lib
+                );
                 assert!(!workspace.join("src/generated.rs").exists());
+                assert_eq!(
+                    std::fs::read(workspace.join("Cargo.toml")).ok(),
+                    original_manifest
+                );
+                assert_eq!(std::fs::read(workspace.join(".env")).unwrap(), original_env);
                 break;
             }
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
                 assert_ne!(instruction, "UNSHARED_HELPER", "{status}");
-                assert_eq!(status["test_status"], "passed", "{status}");
+                let verification = if instruction == "NO_CARGO" {
+                    "not_verified"
+                } else {
+                    "passed"
+                };
+                assert_eq!(status["test_status"], verification, "{status}");
                 assert_eq!(status["changed_files"], json!(["src/lib.rs"]));
                 assert!(status["diff_summary"]
                     .as_str()

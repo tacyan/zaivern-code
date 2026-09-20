@@ -109,7 +109,7 @@ fn mask_assignments(text: &str) -> String {
     static ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
     let pattern = ASSIGNMENT.get_or_init(|| {
         regex::Regex::new(
-            r#"(?im)(\b(?:[a-z0-9]+_)*(?:api_key|apikey|token|password|secret)\b(?:["'][ \t]*[=:]|[ \t]+[=:]|:[ \t]*&(?:'static[ \t]+)?str[ \t]*=|:|=[ \t]+|=["'])[ \t]*["']?)[^\r\n]*"#,
+            r#"(?im)(\b(?:[a-z0-9]+_)*(?:api_key|apikey|token|password|secret|accessToken|refreshToken|clientSecret)\b(?:["'][ \t]*[=:]|[ \t]+[=:]|:[ \t]*&(?:'static[ \t]+)?str[ \t]*=|:|=[ \t]+|=["'])[ \t]*["']?)[^\r\n]*"#,
         ).expect("constant credential assignment pattern")
     });
     pattern.replace_all(text, "${1}***").into_owned()
@@ -208,6 +208,28 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "super-secret-test-token";
+
+    #[test]
+    fn camel_case_credentials_are_redacted_without_identifier_false_positives() {
+        for text in [
+            r#"const accessToken = "fixture-secret-value";"#,
+            r#"const refreshToken = "fixture-secret-value";"#,
+            r#"const clientSecret = "fixture-secret-value";"#,
+            r#"const apiKey = "fixture-secret-value";"#,
+            r#"const password = "fixture-secret-value";"#,
+            r#"const accessToken: string = "fixture-secret-value";"#,
+            r#"{"refreshToken":"fixture-secret-value"}"#,
+            "clientSecret=fixture-secret-value",
+            "accessToken=fixture-secret-value",
+            "refreshToken=fixture-secret-value",
+        ] {
+            let result = redact_with(text, &[]);
+            assert!(!result.contains("fixture-secret-value"), "{result}");
+            assert!(result.contains(MASK), "{result}");
+        }
+        let ordinary = "mod tokenizer;\nfn secret() {}\nlet tokenizer = 1;\nlet secretary = 2;\nlet credential_manager = 3;\n";
+        assert_eq!(redact_with(ordinary, &[]), ordinary);
+    }
 
     #[test]
     fn source_and_config_assignments_are_redacted() {
