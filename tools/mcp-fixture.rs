@@ -14,6 +14,7 @@ fn main() {
     let mut cancel_verification = false;
     let mut exfiltrate = false;
     let mut prompts = 0;
+    let mut scenario = "";
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         let id = line
@@ -47,6 +48,17 @@ fn main() {
             if exfiltrate && prompts > 0 {
                 assert!(line.contains("Detailed verifier output was withheld"));
             }
+            for name in [
+                "WORKSPACE_COMPILE_ERROR",
+                "WORKSPACE_TEST_FAILURE",
+                "WORKSPACE_PASS",
+                "UNUSED_RUST",
+                "READONLY_INPUTS",
+            ] {
+                if line.contains(name) {
+                    scenario = name;
+                }
+            }
             prompts += 1;
             helper_only |= line.contains("UNSHARED_HELPER");
             mixed |= line.contains("MIXED_FRONTEND");
@@ -68,7 +80,7 @@ fn main() {
         } else if id == "902" {
             assert!(line.contains("\"optionId\":\"deny\""));
             send(
-                r#"{"jsonrpc":"2.0","id":903,"method":"session/request_permission","params":{"sessionId":"fixture","toolCall":{"toolCallId":"edit-shared","kind":"edit","_meta":{"toolName":"edit"},"rawInput":{"file_path":"/workspace/src/lib.rs","old_string":"2 + 2, 5","new_string":"2 + 2, 4"},"locations":[{"path":"/workspace/src/lib.rs"}]},"options":[{"optionId":"deny","kind":"reject_once"},{"optionId":"allow","kind":"allow_once"}]}}"#,
+                &r#"{"jsonrpc":"2.0","id":903,"method":"session/request_permission","params":{"sessionId":"fixture","toolCall":{"toolCallId":"edit-shared","kind":"edit","_meta":{"toolName":"edit"},"rawInput":{"file_path":"/workspace/src/lib.rs","old_string":"2 + 2, 5","new_string":"2 + 2, 4"},"locations":[{"path":"/workspace/src/lib.rs"}]},"options":[{"optionId":"deny","kind":"reject_once"},{"optionId":"allow","kind":"allow_once"}]}}"#.replace("/workspace/src/lib.rs", editable_path(scenario)),
             );
         } else if id == "903" {
             assert!(line.contains("\"optionId\":\"allow\""));
@@ -80,9 +92,25 @@ fn main() {
                 std::time::Duration::from_millis(200)
             )
             .is_err());
-            let file = "/workspace/src/lib.rs";
+            let file = editable_path(scenario);
             let before = std::fs::read_to_string(file).unwrap();
-            if exfiltrate {
+            if scenario == "WORKSPACE_COMPILE_ERROR" || scenario == "UNUSED_RUST" {
+                std::fs::write(file, "this is invalid Rust;\n").unwrap();
+            } else if scenario == "WORKSPACE_TEST_FAILURE" {
+                std::fs::write(
+                    file,
+                    "#[test] fn member() { panic!(\"member failure\"); }\n",
+                )
+                .unwrap();
+            } else if scenario == "READONLY_INPUTS" {
+                std::fs::write(file, r#"#[test] fn inputs_are_immutable() {
+                    for path in ["Cargo.toml", "Cargo.lock", "src/lib.rs", "vendor/local_dep/src/lib.rs"] {
+                        assert!(std::fs::write(path, "mutated").is_err(), "{path}");
+                        assert!(std::fs::remove_file(path).is_err(), "{path}");
+                    }
+                    assert!(std::fs::write("new-file", "new").is_err());
+                }"#).unwrap();
+            } else if exfiltrate {
                 std::fs::write(
                     file,
                     r#"#[test] fn exfiltrate() {
@@ -115,5 +143,15 @@ fn main() {
                 r#"{{"jsonrpc":"2.0","id":{prompt_id},"result":{{"stopReason":"end_turn"}}}}"#
             ));
         }
+    }
+}
+
+fn editable_path(scenario: &str) -> &'static str {
+    if scenario.starts_with("WORKSPACE_") {
+        "/workspace/crates/foo/src/lib.rs"
+    } else if scenario == "UNUSED_RUST" {
+        "/workspace/src/unused.rs"
+    } else {
+        "/workspace/src/lib.rs"
     }
 }

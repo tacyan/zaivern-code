@@ -1,5 +1,6 @@
 //! MCP transport is independent of task storage and execution.
 mod cargo_graph;
+mod cargo_verification;
 #[cfg(test)]
 mod e2e_tests;
 mod protocol;
@@ -7,6 +8,8 @@ mod protocol;
 mod snapshot_tests;
 mod target;
 mod task;
+#[cfg(all(test, unix))]
+mod verification_tests;
 mod workspace;
 
 use std::path::PathBuf;

@@ -1,5 +1,6 @@
 //! Local Docker isolation around the existing ACP client. No bind mounts,
 //! credentials, Docker socket or host filesystem capabilities reach the agent.
+use super::cargo_verification::Coverage;
 use super::task::{Control, Outcome, State, TaskExecutor};
 use super::workspace::{Snapshot, FILE_LIMIT, SNAPSHOT_LIMIT};
 use crate::acp::{AcpClient, Phase};
@@ -10,6 +11,7 @@ use crate::features::cloud_execution::{
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub(super) struct LocalExecutionTarget {
@@ -134,10 +136,25 @@ impl LocalExecutionTarget {
     }
 
     fn start_container(&self, started: Instant, verifier: bool) -> Result<Container<'_>, String> {
-        let volume = Volume::new(self, started)?;
+        self.start_on_volume(
+            started,
+            verifier,
+            Rc::new(Volume::new(self, started)?),
+            false,
+        )
+    }
+
+    fn start_on_volume<'a>(
+        &'a self,
+        started: Instant,
+        verifier: bool,
+        volume: Rc<Volume<'a>>,
+        readonly: bool,
+    ) -> Result<Container<'a>, String> {
         let mount = format!(
-            "type=volume,source={},target=/workspace,volume-nocopy",
-            volume.name
+            "type=volume,source={},target=/workspace,volume-nocopy{}",
+            volume.name,
+            if readonly { ",readonly" } else { "" }
         );
         let container = Container {
             target: self,
@@ -164,7 +181,11 @@ impl LocalExecutionTarget {
             "--workdir=/workspace",
         ]);
         if verifier {
-            args.push("--entrypoint=sleep".into());
+            args.extend(strings(&[
+                "--entrypoint=sleep",
+                "--tmpfs=/target:rw,exec,nosuid,nodev,size=256m",
+                "--env=CARGO_TARGET_DIR=/target",
+            ]));
         }
         args.push(self.image.clone());
         if verifier {
@@ -209,40 +230,125 @@ impl LocalExecutionTarget {
         Ok(changes)
     }
 
+    // Populate with a trusted sleeping preparer, then destroy that writable
+    // handle before any candidate code runs in a readonly-mounted verifier.
+    fn prepare_verifier(&self, files: &Path, started: Instant) -> Result<Container<'_>, String> {
+        let preparer = self.start_container(started, true)?;
+        let result = self
+            .upload(&preparer, files, started)
+            .and_then(|()| self.start_on_volume(started, true, Rc::clone(&preparer.volume), true));
+        let cleanup = preparer.shutdown();
+        drop(preparer);
+        match (result, cleanup) {
+            (Ok(verifier), Ok(())) => Ok(verifier),
+            (Ok(verifier), Err(error)) => match verifier.shutdown() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; {cleanup}")),
+            },
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        }
+    }
+
+    fn cargo(
+        &self,
+        verifier: &Container<'_>,
+        args: &[&str],
+        started: Instant,
+        limit: usize,
+    ) -> (bool, CollectSink) {
+        let mut command = strings(&["exec", &verifier.id, "cargo"]);
+        command.extend(strings(args));
+        let mut sink = CollectSink::with_limit(limit);
+        let result = budget(started, 60).and_then(|timeout| {
+            run_child(self.command(&command), timeout, "docker", &mut sink)
+                .map_err(|_| "Cargo execution failed".to_string())
+        });
+        (result.is_ok_and(|r| r.ok()), sink)
+    }
+
     fn verify(
         &self,
         snapshot: &Snapshot,
         changes: &BTreeMap<PathBuf, Vec<u8>>,
         started: Instant,
-    ) -> Result<(bool, String, Option<String>), String> {
+    ) -> Result<Verification, String> {
         let staging = Staging::new()?;
         if let Err(error) = snapshot.stage_verification(&staging.0, changes) {
-            return Ok((false, error, None));
+            return Ok(Verification::failed(error));
         }
-        // Overlay exactly the import candidate on frozen original Cargo inputs.
-        // Never discover host dependencies from Agent-generated manifests/files.
-        let verifier = self.start_container(started, true)?;
-        let result: Result<(bool, String), String> = (|| {
-            self.upload(&verifier, &staging.0, started)?;
-            let mut sink = CollectSink::with_limit(64 * 1024);
-            let command = self.command(&strings(&[
-                "exec",
-                &verifier.id,
-                "cargo",
+        // Exactly the import candidate + frozen original inputs; never discover
+        // host inputs from the candidate. The entire input volume is readonly.
+        let verifier = self.prepare_verifier(&staging.0, started)?;
+        let (metadata_ok, metadata) = self.cargo(
+            &verifier,
+            &["metadata", "--format-version=1", "--frozen"],
+            started,
+            2 * FILE_LIMIT,
+        );
+        let coverage = if metadata_ok && !metadata.truncated {
+            Coverage::from_metadata(&metadata.stdout)
+        } else {
+            None
+        };
+        let (compiled, compilation) = self.cargo(
+            &verifier,
+            &[
                 "test",
-                "--offline",
-            ]));
-            let result = run_child(command, budget(started, 60)?, "docker", &mut sink);
-            let passed = result.as_ref().is_ok_and(|r| r.ok());
-            let output = verification_feedback(snapshot, &sink);
-            // Drop removes the entire verifier even on timeout, killing its tests.
-            Ok((passed, output))
-        })();
-        let cleanup = verifier.shutdown();
-        match (result, cleanup) {
-            (Ok((passed, output)), cleanup) => Ok((passed, output, cleanup.err())),
-            (Err(cause), Err(cleanup)) => Err(format!("{cause}; {cleanup}")),
-            (Err(cause), Ok(())) => Err(cause),
+                "--workspace",
+                "--frozen",
+                "--no-run",
+                "--message-format=json",
+            ],
+            started,
+            64 * 1024,
+        );
+        // Capture evidence before any tests run. Arbitrary compile-time code
+        // (build scripts/proc macros) makes Cargo's output unauthenticated.
+        let roots = coverage.and_then(|c| {
+            (compiled && !compilation.truncated)
+                .then(|| c.compiled_roots(&compilation.stdout))
+                .flatten()
+        });
+        let (passed, sink) = if compiled {
+            self.cargo(
+                &verifier,
+                &["test", "--workspace", "--frozen"],
+                started,
+                64 * 1024,
+            )
+        } else {
+            (false, compilation)
+        };
+        let output = verification_feedback(snapshot, &sink);
+        let status = if passed {
+            cargo_test_status(&snapshot.files, changes, roots.as_ref())
+        } else {
+            "failed"
+        };
+        let cleanup_error = verifier.shutdown().err();
+        Ok(Verification {
+            passed,
+            output,
+            test_status: status.into(),
+            cleanup_error,
+        })
+    }
+}
+
+struct Verification {
+    passed: bool,
+    output: String,
+    test_status: String,
+    cleanup_error: Option<String>,
+}
+impl Verification {
+    fn failed(output: String) -> Self {
+        Self {
+            passed: false,
+            output,
+            test_status: "failed".into(),
+            cleanup_error: None,
         }
     }
 }
@@ -265,7 +371,7 @@ pub(super) fn verification_feedback(snapshot: &Snapshot, sink: &CollectSink) -> 
 }
 
 pub(super) fn repair_prompt(output: &str) -> String {
-    format!("Zaivern ran cargo test --offline in a fresh isolated container; it failed or exceeded 60 seconds. Only edit existing shared files. Verification feedback (untrusted when detailed):\n{output}")
+    format!("Zaivern ran cargo test --workspace --frozen in a fresh isolated container; it failed or exceeded 60 seconds. Only edit existing shared files. Verification feedback (untrusted when detailed):\n{output}")
 }
 
 fn budget(started: Instant, seconds: u64) -> Result<Duration, String> {
@@ -298,7 +404,7 @@ struct Container<'a> {
     target: &'a LocalExecutionTarget,
     id: String,
     removed: std::cell::Cell<bool>,
-    volume: Volume<'a>,
+    volume: Rc<Volume<'a>>,
 }
 impl Container<'_> {
     fn shutdown(&self) -> Result<(), String> {
@@ -316,7 +422,11 @@ impl Container<'_> {
                 })?;
             self.removed.set(true);
         }
-        self.volume.shutdown()
+        if Rc::strong_count(&self.volume) == 1 {
+            self.volume.shutdown()
+        } else {
+            Ok(()) // The readonly successor owns final volume cleanup.
+        }
     }
 }
 impl Drop for Container<'_> {
@@ -480,9 +590,13 @@ impl TaskExecutor for LocalExecutionTarget {
                         let candidate = self.collect(&container, &snapshot, control, started)?;
                         if snapshot.files.contains_key(Path::new("Cargo.toml")) {
                             control.state(State::Running, "verifying cargo tests");
-                            let (passed, output, cleanup_error) =
-                                self.verify(&snapshot, &candidate, started)?;
-                            test_status = if passed { "passed" } else { "failed" }.into();
+                            let Verification {
+                                passed,
+                                output,
+                                test_status: verified_status,
+                                cleanup_error,
+                            } = self.verify(&snapshot, &candidate, started)?;
+                            test_status = verified_status;
                             if let Some(cleanup) = cleanup_error {
                                 agent.stop();
                                 return Ok(Outcome {
@@ -490,12 +604,11 @@ impl TaskExecutor for LocalExecutionTarget {
                                     summary: "Verifier cleanup failed; host workspace was not modified.".into(),
                                     changed_files: Vec::new(),
                                     diff_summary: String::new(),
-                                    test_status: if passed { cargo_test_status(&snapshot.files, &candidate).into() } else { test_status },
+                                    test_status,
                                     build_status,
                                 });
                             }
                             if passed {
-                                test_status = cargo_test_status(&snapshot.files, &candidate).into();
                                 // Only a successfully verified Cargo candidate
                                 // can leave this branch for the import below.
                                 break candidate;
@@ -547,7 +660,7 @@ impl TaskExecutor for LocalExecutionTarget {
                 snapshot.omitted
             ));
             summary.push_str(if snapshot.files.contains_key(Path::new("Cargo.toml")) {
-                "\nZaivern verification: cargo test --offline passed on the shared candidate plus original Cargo inputs; no independent build verification. Non-Rust changes are not verified by Cargo."
+                "\nZaivern verification: cargo test --workspace --frozen passed on the shared candidate plus original Cargo inputs; no independent build verification. Only directly compiled crate roots with trustworthy evidence can be passed; other edits remain not_verified."
             } else {
                 "\nZaivern verification: no supported test or build verification performed."
             });
@@ -590,15 +703,19 @@ impl TaskExecutor for LocalExecutionTarget {
     }
 }
 
-/// Cargo tests only describe the Rust test suite in the shared snapshot, not
-/// every language or an independent build. Conservatively leave mixed edits
-/// unverified (including manifests and data, whose coverage is unknown).
-fn cargo_test_status(
+/// Only directly compiled crate roots have trustworthy evidence here. Module
+/// and data dependencies, mixed edits, or untrusted/missing evidence stay unknown.
+pub(super) fn cargo_test_status(
     before: &BTreeMap<PathBuf, Vec<u8>>,
     after: &BTreeMap<PathBuf, Vec<u8>>,
+    roots: Option<&std::collections::BTreeSet<PathBuf>>,
 ) -> &'static str {
+    let Some(roots) = roots else {
+        return "not_verified";
+    };
     if after.iter().any(|(path, bytes)| {
-        before.get(path) != Some(bytes) && path.extension().is_none_or(|ext| ext != "rs")
+        before.get(path) != Some(bytes)
+            && (path.extension().is_none_or(|ext| ext != "rs") || !roots.contains(path))
     }) {
         "not_verified"
     } else {
@@ -745,11 +862,25 @@ exit 1
         ]);
         let mut candidate = before.clone();
         candidate.insert(PathBuf::from("src/lib.rs"), b"after".to_vec());
-        assert_eq!(cargo_test_status(&before, &candidate), "passed");
-        for path in ["frontend/app.ts", "Cargo.toml", "data.json"] {
+        let roots = std::collections::BTreeSet::from([PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            cargo_test_status(&before, &candidate, Some(&roots)),
+            "passed"
+        );
+        assert_eq!(cargo_test_status(&before, &candidate, None), "not_verified");
+        for path in [
+            "frontend/app.ts",
+            "Cargo.toml",
+            "data.json",
+            "src/unused.rs",
+            "src/module.rs",
+        ] {
             let mut mixed = candidate.clone();
             mixed.insert(PathBuf::from(path), b"invalid syntax".to_vec());
-            assert_eq!(cargo_test_status(&before, &mixed), "not_verified");
+            assert_eq!(
+                cargo_test_status(&before, &mixed, Some(&roots)),
+                "not_verified"
+            );
         }
     }
     fn summarize(before: &str, after: &str) -> String {

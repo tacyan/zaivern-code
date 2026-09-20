@@ -85,7 +85,7 @@ fn this_repository_can_initialize_a_task_snapshot() {
 }
 
 #[test]
-fn local_dependency_candidate_is_verified_offline_but_never_editable() {
+fn local_dependency_candidate_is_verified_frozen_but_never_editable() {
     for patch in [false, true] {
         let f = Fixture::new("path-dep");
         let dependency = if patch {
@@ -95,6 +95,7 @@ fn local_dependency_candidate_is_verified_offline_but_never_editable() {
         };
         f.package("", "root_fixture", dependency);
         f.package("vendor/local_dep/", "local_dep", "");
+        f.put("Cargo.lock", "version = 4\n[[package]]\nname='root_fixture'\nversion='0.1.0'\ndependencies=['local_dep']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n");
         f.put(
             "src/lib.rs",
             "#[test] fn answer() { assert_eq!(local_dep::answer(), 5); }\n",
@@ -129,7 +130,7 @@ fn local_dependency_candidate_is_verified_offline_but_never_editable() {
         // Only our fixed fixture code is run on the host. Production always uses Docker.
         let mut command = crate::procx::hidden_command_raw(env!("CARGO"));
         command
-            .args(["test", "--offline"])
+            .args(["test", "--workspace", "--frozen"])
             .current_dir(&verifier.0)
             .env("CARGO_HOME", verifier.0.join("cargo-home"))
             .env("CARGO_TARGET_DIR", verifier.0.join("target"))
@@ -158,6 +159,7 @@ fn local_dependency_candidate_is_verified_offline_but_never_editable() {
         let frozen = Fixture::new("exfiltration");
         frozen.package("", "exfiltration", dependency);
         frozen.package("vendor/local_dep/", "local_dep", "");
+        frozen.put("Cargo.lock", "version = 4\n[[package]]\nname='exfiltration'\nversion='0.1.0'\ndependencies=['local_dep']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n");
         frozen.put(
             "vendor/local_dep/src/lib.rs",
             &format!("// {SENTINEL}\npub fn answer() -> u32 {{ 4 }}\n"),
@@ -183,7 +185,7 @@ fn local_dependency_candidate_is_verified_offline_but_never_editable() {
             .unwrap();
         let mut command = crate::procx::hidden_command_raw(env!("CARGO"));
         command
-            .args(["test", "--offline"])
+            .args(["test", "--workspace", "--frozen"])
             .current_dir(&stage.0)
             .env("CARGO_HOME", stage.0.join("cargo-home"))
             .env("CARGO_TARGET_DIR", stage.0.join("target"))

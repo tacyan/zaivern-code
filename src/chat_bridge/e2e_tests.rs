@@ -62,6 +62,9 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         )
         .unwrap();
     }
+    let manifest = std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap();
+    let lock = "version = 4\n[[package]]\nname='bridge_fixture'\nversion='0.1.0'\ndependencies=['local_dep','patched']\n[[package]]\nname='local_dep'\nversion='0.1.0'\n[[package]]\nname='patched'\nversion='0.1.0'\n";
+    std::fs::write(workspace.join("Cargo.lock"), lock).unwrap();
     std::fs::write(
         workspace.join("src/lib.rs"),
         "#[test]\nfn arithmetic() { assert_eq!(local_dep::answer(), 4); assert_eq!(patched::answer(), 4); assert_eq!(2 + 2, 5); }\n",
@@ -156,8 +159,52 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         "UNSHARED_HELPER",
         "VERIFY_CANCEL",
         "EXFILTRATE_VERIFIER",
+        "WORKSPACE_COMPILE_ERROR",
+        "WORKSPACE_TEST_FAILURE",
+        "WORKSPACE_PASS",
+        "UNUSED_RUST",
+        "READONLY_INPUTS",
+        "LOCK_MISSING",
+        "LOCK_STALE",
         "NO_CARGO",
     ] {
+        if instruction.starts_with("WORKSPACE_") {
+            std::fs::write(
+                workspace.join("Cargo.toml"),
+                format!("{manifest}\n[workspace]\nmembers=['crates/foo']\ndefault-members=['.']\n"),
+            )
+            .unwrap();
+            std::fs::create_dir_all(workspace.join("crates/foo/src")).unwrap();
+            std::fs::write(
+                workspace.join("crates/foo/Cargo.toml"),
+                "[package]\nname='foo'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join("crates/foo/src/lib.rs"),
+                "#[test] fn member() { assert_eq!(2 + 2, 5); }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join("Cargo.lock"),
+                format!("{lock}[[package]]\nname='foo'\nversion='0.1.0'\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                workspace.join("src/lib.rs"),
+                "#[test] fn root() { assert_eq!(2 + 2, 4); }\n",
+            )
+            .unwrap();
+        }
+        if instruction == "UNUSED_RUST" {
+            std::fs::write(workspace.join("src/unused.rs"), "pub fn unused() {}\n").unwrap();
+        }
+        if instruction == "LOCK_MISSING" {
+            std::fs::remove_file(workspace.join("Cargo.lock")).unwrap();
+        }
+        if instruction == "LOCK_STALE" {
+            std::fs::write(workspace.join("Cargo.lock"), "version = 4\n").unwrap();
+        }
         if instruction == "MIXED_FRONTEND" {
             std::fs::create_dir_all(workspace.join("frontend")).unwrap();
             std::fs::write(workspace.join("frontend/app.ts"), "const valid = 1;\n").unwrap();
@@ -177,6 +224,20 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         }
         let original_lib = std::fs::read(workspace.join("src/lib.rs")).unwrap();
         let original_manifest = std::fs::read(workspace.join("Cargo.toml")).ok();
+        let original_lock = std::fs::read(workspace.join("Cargo.lock")).ok();
+        let original_member = std::fs::read(workspace.join("crates/foo/src/lib.rs")).ok();
+        let original_dependency =
+            std::fs::read(workspace.join("vendor/local_dep/src/lib.rs")).unwrap();
+        let expect_failure = matches!(
+            instruction,
+            "UNSHARED_HELPER"
+                | "VERIFY_CANCEL"
+                | "EXFILTRATE_VERIFIER"
+                | "WORKSPACE_COMPILE_ERROR"
+                | "WORKSPACE_TEST_FAILURE"
+                | "LOCK_MISSING"
+                | "LOCK_STALE"
+        );
         let original_env = std::fs::read(workspace.join(".env")).unwrap();
         let response = call(
             "tools/call",
@@ -225,13 +286,7 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                 serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
             if status["state"] == "failed" {
-                assert!(
-                    matches!(
-                        instruction,
-                        "UNSHARED_HELPER" | "VERIFY_CANCEL" | "EXFILTRATE_VERIFIER"
-                    ),
-                    "{status}"
-                );
+                assert!(expect_failure, "{status}");
                 assert_eq!(status["test_status"], "failed", "{status}");
                 assert_eq!(status["changed_files"], json!([]), "{status}");
                 assert!(
@@ -245,6 +300,14 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                     std::fs::read(workspace.join("src/lib.rs")).unwrap(),
                     original_lib
                 );
+                assert_eq!(
+                    std::fs::read(workspace.join("Cargo.lock")).ok(),
+                    original_lock
+                );
+                assert_eq!(
+                    std::fs::read(workspace.join("crates/foo/src/lib.rs")).ok(),
+                    original_member
+                );
                 assert!(!workspace.join("src/generated.rs").exists());
                 assert_eq!(
                     std::fs::read(workspace.join("Cargo.toml")).ok(),
@@ -255,18 +318,13 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             }
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
-                assert!(
-                    !matches!(
-                        instruction,
-                        "UNSHARED_HELPER" | "VERIFY_CANCEL" | "EXFILTRATE_VERIFIER"
-                    ),
-                    "{status}"
-                );
-                let verification = if instruction == "NO_CARGO" || instruction == "MIXED_FRONTEND" {
-                    "not_verified"
-                } else {
-                    "passed"
-                };
+                assert!(!expect_failure, "{status}");
+                let verification =
+                    if matches!(instruction, "NO_CARGO" | "MIXED_FRONTEND" | "UNUSED_RUST") {
+                        "not_verified"
+                    } else {
+                        "passed"
+                    };
                 assert_eq!(status["test_status"], verification, "{status}");
                 assert_eq!(status["build_status"], "not_verified", "{status}");
                 if instruction == "MIXED_FRONTEND" {
@@ -277,14 +335,49 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                     assert!(status["summary"]
                         .as_str()
                         .unwrap()
-                        .contains("cargo test --offline passed"));
+                        .contains("cargo test --workspace --frozen passed"));
                 } else {
-                    assert_eq!(status["changed_files"], json!(["src/lib.rs"]));
+                    let changed = match instruction {
+                        "WORKSPACE_PASS" => "crates/foo/src/lib.rs",
+                        "UNUSED_RUST" => "src/unused.rs",
+                        _ => "src/lib.rs",
+                    };
+                    assert_eq!(status["changed_files"], json!([changed]), "{status}");
                 }
-                assert!(status["diff_summary"]
-                    .as_str()
-                    .unwrap()
-                    .contains("+fn arithmetic()"));
+                let expected_line = match instruction {
+                    "WORKSPACE_PASS" => "+#[test] fn member() { assert_eq!(2 + 2, 4); }",
+                    "UNUSED_RUST" => "+this is invalid Rust;",
+                    "READONLY_INPUTS" => "+#[test] fn inputs_are_immutable()",
+                    _ => "+fn arithmetic()",
+                };
+                assert!(
+                    status["diff_summary"].as_str().unwrap().contains(expected_line),
+                    "{status}"
+                );
+                if instruction == "WORKSPACE_PASS" {
+                    assert_eq!(
+                        std::fs::read_to_string(workspace.join("crates/foo/src/lib.rs")).unwrap(),
+                        "#[test] fn member() { assert_eq!(2 + 2, 4); }\n"
+                    );
+                }
+                if instruction == "UNUSED_RUST" {
+                    assert_eq!(
+                        std::fs::read_to_string(workspace.join("src/unused.rs")).unwrap(),
+                        "this is invalid Rust;\n"
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(workspace.join("Cargo.lock")).ok(),
+                    original_lock
+                );
+                assert_eq!(
+                    std::fs::read(workspace.join("Cargo.toml")).ok(),
+                    original_manifest
+                );
+                assert_eq!(
+                    std::fs::read(workspace.join("vendor/local_dep/src/lib.rs")).unwrap(),
+                    original_dependency
+                );
                 break;
             }
             if status["state"] == "cancelled" {

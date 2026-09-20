@@ -107,14 +107,25 @@ Agent 本文や検証出力が収集上限で切り詰められた場合は、�
 - 「このプロジェクトの失敗しているテストを直して、修正後にテストして diff を見せて。」
 
 `Cargo.toml` が共有された場合、返却候補と開始時に固定した Cargo 検証入力を別の空のコンテナへ配置し、
-`cargo test --offline` を実行します。Agent が追加した未共有ファイルは検証に使いません。
+`cargo test --workspace --frozen` を実行します。Agent が追加した未共有ファイルは検証に使いません。
 失敗時は最大2回、同じ Agent に修復を依頼します。検証専用入力がある場合は詳細出力を渡さず、
 固定メッセージのみを返します。共有ファイルだけで検証する場合は redaction 済みの出力を返します。結果は出口コードで判定し、
 Agent が「成功」と書いただけでは passed にしません。
-`test_status=passed` はその検証 snapshot 内の Cargo テストの成功だけを表し、全動作の保証ではありません。
-非 Rust ファイルの変更（manifest・データを含む）がある場合、Cargo が成功しても
-`test_status=not_verified` とし、summary に実行した検証の範囲を明記します。
-独立したビルド検証は実行しないため `build_status` は常に `not_verified` です。1回の検証上限は60秒です。
+`--workspace` は root package / default-members に限定せず全 workspace member を対象にします。
+`--frozen` により lockfile の生成・更新とネットワーク取得を禁止します。有効な `Cargo.lock` を
+開始前に用意してください。欠落・不整合は検証失敗となり、候補をホストへ取り込みません。
+
+`test_status=passed` は、Cargo テスト成功に加え、変更した全ファイルが実コンパイルを確認できた
+Rust crate root である場合だけです。verifier 内の `cargo metadata --format-version=1 --frozen` で
+全依存に build script / proc-macro がないことを確認し、成功した
+`cargo test --workspace --frozen --no-run --message-format=json` の compiler-artifact と照合します。
+この証跡はテスト実行前に固定し、host のファイル探索・共有許可には使いません。
+任意のコンパイル時コードがある場合、出力を偽造できるため証跡を信用しません。
+未使用 `.rs`、通常 module、`include_str!` のデータ、非 Rust、証跡の欠落・上限超過・未知形式は
+`not_verified` です。dep-info のファイル一覧だけで Rust の検証成功とは判定しません。
+Cargo 自体の失敗は `failed` のままで、`not_verified` に置き換えません。
+独立したビルド検証は実行しないため `build_status` は常に `not_verified` です。
+metadata・no-run・test の各コマンドは最大60秒、task 全体は30分です。
 タイムアウト時は検証コンテナ全体を削除します。停止確認に失敗した場合は
 `cancelled` とせず、container 識別名と cleanup error を返します。
 他の build/test system は `not_verified` です。
@@ -206,7 +217,10 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
 - Docker socket、host mount、host environment/credential、Git metadata は渡しません。
   外部通信なし、read-only root、capabilities 削除、no-new-privileges、PID 128 / CPU 2 / memory 4 GiB の上限を使います。
   workspace は容量256 MiBのタスク専用 tmpfs volume で、stdinから配置し、
-  コンテナ全体をpauseして結果を取得します。volumeはコンテナ終了後に削除します。
+  コンテナ全体をpauseして結果を取得します。verifier は準備コンテナ削除後、入力 volume を
+  read-only で mount します。Cargo.lock / manifest / ソース / 検証専用入力を変更・削除・追加できません。
+  ビルド生成物は別の空の `/target` tmpfs（256 MiB）へ置きます。volume は最後のコンテナ終了後に削除し、
+  準備コンテナ・verifier・volume の cleanup 失敗はいずれも import を禁止します。
   Docker daemon、OS、指定した image は信頼する基盤です。
 - Agent の permission request は Qwen の `_meta.toolName`、kind、引数、locations を照合します。
   `read_file` / `edit` / `grep_search` の既存共有ファイル完全一致だけを一度限り許可します。
@@ -246,10 +260,12 @@ fixture は実際の ACP process として起動し、危険操作の拒否、ho
 未共有の追加ファイルに依存する候補を、検証成功と判定しない反証も含みます。
 通常CIの snapshot tests は Docker / LLM / API キーを必要とせず、大規模ソース選択、
 local dependency / patch / workspace、候補manifest改変、逸脱・リンク・外部変更を検査します。
-固定fixtureを使った `cargo test --offline` も実行します（ユーザーコードのホスト実行ではありません）。
+固定fixtureを使った `cargo test --workspace --frozen` も実行します（ユーザーコードのホスト実行ではありません）。
 Docker E2E は Ubuntu の通常 CI で専用 image をビルドし、immutable image ID を指定して明示実行します。
 他 OS の通常テストでは Docker を要求しません。検証専用入力の読み出し・hex 出力を試みる
 攻撃 fixture、Agent prompt / MCP response への非流出、失敗時の import 拒否も確認します。
+non-virtual workspace / default-members、未使用 Rust、lockfile 欠落・不整合、入力 volume への
+書き込み拒否も通常 Cargo 回帰と Docker E2E で検査します。
 CI はテスト前後の container / volume を比較し、新たな残存を失敗として扱い、回収を試みます。
 
 ## Future Cloud Runner
