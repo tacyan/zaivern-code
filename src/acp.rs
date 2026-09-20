@@ -49,7 +49,7 @@
 //! - **終了はプロセスツリーごと** ([`crate::procx::kill_tree`])。エージェントは
 //!   自分の MCP 子プロセスを起こすので、直接の子だけ殺すと孫が残る。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -507,6 +507,8 @@ fn count_lines(s: &str) -> usize {
 /// `tool_call` / `tool_call_update` の中身 (**両方とも同じ形。更新は部分適用**)。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct ToolCallPatch {
+    #[serde(rename = "_meta", default)]
+    pub(crate) meta: Value,
     #[serde(rename = "toolCallId", default)]
     pub tool_call_id: String,
     #[serde(default)]
@@ -805,6 +807,66 @@ pub fn pick_option(options: &[PermissionOption], allow: bool) -> Option<&Permiss
     order
         .iter()
         .find_map(|want| options.iter().find(|o| o.kind == *want))
+}
+
+/// Deliberately restricted Qwen ACP contract, not UI title/ToolKind alone.
+/// Audited against Qwen 878a32f (Session.ts and core tools). Grep's optional
+/// path is a search working DIRECTORY, not a single-file search contract.
+/// Deny grep entirely rather than approve an unsupported file-scoped request.
+/// Edit's UI-only modified_by_user/ai_proposed_content are unsupported too.
+/// Metadata is peer-supplied; Docker/snapshot import enforce the host boundary.
+/// Unknown tools/argument versions fail closed; no shell/directory operations.
+fn isolated_permission_allowed(call: &ToolCallPatch, shared: &HashSet<String>) -> bool {
+    let (Patch::Set(kind), Patch::Set(Value::Object(input))) = (&call.kind, &call.raw_input) else {
+        return false;
+    };
+    let Some(name) = call.meta.get("toolName").and_then(Value::as_str) else {
+        return false;
+    };
+    let (expected_kind, path_key, keys): (ToolKind, &str, &[&str]) = match name {
+        "read_file" => (
+            ToolKind::Read,
+            "file_path",
+            &["file_path", "offset", "limit", "pages"],
+        ),
+        "edit" => (
+            ToolKind::Edit,
+            "file_path",
+            &["file_path", "old_string", "new_string", "replace_all"],
+        ),
+        _ => return false,
+    };
+    let Some(path) = input.get(path_key).and_then(Value::as_str) else {
+        return false;
+    };
+    if *kind != expected_kind
+        || !shared.contains(path)
+        || input.keys().any(|key| !keys.contains(&key.as_str()))
+    {
+        return false;
+    }
+    if let Patch::Set(locations) = &call.locations {
+        if locations.iter().any(|location| location.path != path) {
+            return false;
+        }
+    }
+    match name {
+        "read_file" => {
+            ["offset", "limit"]
+                .iter()
+                .all(|key| input.get(*key).is_none_or(Value::is_u64))
+                && input.get("pages").is_none_or(Value::is_string)
+        }
+        "edit" => {
+            input
+                .get("old_string")
+                .and_then(Value::as_str)
+                .is_some_and(|old| !old.is_empty())
+                && input.get("new_string").is_some_and(Value::is_string)
+                && input.get("replace_all").is_none_or(Value::is_boolean)
+        }
+        _ => false,
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1669,6 +1731,7 @@ pub struct Turn {
     pub tools: Vec<ToolCallRow>,
     /// エージェントの本文 (チャンクを連結したもの)。
     pub message: String,
+    message_truncated: bool,
     /// 思考 (チャンクを連結したもの)。
     pub thought: String,
     /// **こちらの依頼**。`session/load` / `session/resume` の再生では過去の
@@ -1691,12 +1754,25 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Never redact a tail after losing its assignment/PRIVATE KEY opening context.
+    pub(crate) fn bridge_summary(&self) -> String {
+        if self.message_truncated {
+            return "Agent report exceeded limit and was omitted; see verification and diff."
+                .into();
+        }
+        crate::features::cloud_execution::redact::redact(&self.message)
+            .chars()
+            .take(8192)
+            .collect()
+    }
+
     /// 新しいプロンプトを投げるときに、ターン固有の状態だけ捨てる。
     /// (モード・コマンド一覧・タイトルはセッションの持ち物なので残す)
     pub fn begin(&mut self) {
         self.plan.clear();
         self.tools.clear();
         self.message.clear();
+        self.message_truncated = false;
         self.thought.clear();
         self.user_message.clear();
         self.stop = None;
@@ -1706,7 +1782,10 @@ impl Turn {
     pub fn apply(&mut self, u: SessionUpdate) {
         match u {
             SessionUpdate::AgentMessageChunk { content } => {
-                push_capped(&mut self.message, &content.display_text());
+                let text = content.display_text();
+                self.message_truncated |=
+                    self.message.len().saturating_add(text.len()) > MESSAGE_CAP;
+                push_capped(&mut self.message, &text);
             }
             SessionUpdate::AgentThoughtChunk { content } => {
                 push_capped(&mut self.thought, &content.display_text());
@@ -1911,6 +1990,9 @@ enum Call {
 
 /// ACP 接続 1 本 = エージェント 1 体。
 pub struct AcpClient {
+    /// A bridge-owned isolated process never inherits GUI auto-approval policy.
+    isolated: bool,
+    isolated_files: HashSet<String>,
     /// 承認キューで使う疑似セッション ID (PTY のセッション ID とは別空間)。
     pub id: u64,
     /// カタログの ID。
@@ -1965,12 +2047,52 @@ impl AcpClient {
         host: Arc<FsHost>,
         ctx: Option<egui::Context>,
     ) -> Result<AcpClient, String> {
-        let launch = entry.resolve()?;
-        let dir = crate::pathx::launch_dir(&cwd);
-        let mut cmd = crate::procx::hidden_command(&launch.program);
-        cmd.args(&launch.args)
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::piped())
+        Self::start_inner(entry, id, cwd, host, ctx, None)
+    }
+
+    /// A transport-owned process. Host filesystem capabilities are disabled.
+    pub(crate) fn start_command(
+        entry: &'static AcpEntry,
+        id: u64,
+        cwd: PathBuf,
+        cmd: std::process::Command,
+        shared_files: impl Iterator<Item = PathBuf>,
+    ) -> Result<AcpClient, String> {
+        let mut client =
+            Self::start_inner(entry, id, cwd, Arc::new(FsHost::default()), None, Some(cmd))?;
+        client.isolated_files = shared_files
+            .map(|path| format!("/workspace/{}", path.to_string_lossy()))
+            .collect();
+        Ok(client)
+    }
+
+    fn start_inner(
+        entry: &'static AcpEntry,
+        id: u64,
+        cwd: PathBuf,
+        host: Arc<FsHost>,
+        ctx: Option<egui::Context>,
+        command: Option<std::process::Command>,
+    ) -> Result<AcpClient, String> {
+        let client_fs = command.is_none();
+        let (launch, dir, mut cmd) = if let Some(cmd) = command {
+            (
+                Launch {
+                    program: PathBuf::from(entry.local_bin),
+                    args: Vec::new(),
+                    via_npx: false,
+                },
+                cwd,
+                cmd,
+            )
+        } else {
+            let launch = entry.resolve()?;
+            let dir = crate::pathx::launch_dir(&cwd);
+            let mut cmd = crate::procx::hidden_command(&launch.program);
+            cmd.args(&launch.args).current_dir(&dir);
+            (launch, dir, cmd)
+        };
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         // **独立したプロセスグループで起こす。** エージェントは自分の MCP 子
@@ -2049,7 +2171,16 @@ impl AcpClient {
             let ctx2 = ctx.clone();
             std::thread::Builder::new()
                 .name("acp-read".into())
-                .spawn(move || read_loop(BufReader::new(stdout), tx_ev, out, host, ctx2))
+                .spawn(move || {
+                    let output: Box<dyn std::io::Read + Send> = if client_fs {
+                        Box::new(stdout)
+                    } else {
+                        // A bridge task has a finite protocol-output budget;
+                        // EOF fails the task rather than allocating indefinitely.
+                        Box::new(std::io::Read::take(stdout, 8 * 1024 * 1024))
+                    };
+                    read_loop(BufReader::new(output), tx_ev, out, host, ctx2)
+                })
         };
         if let Err(e) = reader {
             abort!(e.to_string());
@@ -2061,7 +2192,12 @@ impl AcpClient {
             std::thread::Builder::new()
                 .name("acp-err".into())
                 .spawn(move || {
-                    for line in BufReader::new(stderr).lines() {
+                    let errors: Box<dyn std::io::Read + Send> = if client_fs {
+                        Box::new(stderr)
+                    } else {
+                        Box::new(std::io::Read::take(stderr, 1024 * 1024))
+                    };
+                    for line in BufReader::new(errors).lines() {
                         let Ok(l) = line else { break };
                         if tx_ev.send(AcpEvent::Stderr(l)).is_err() {
                             break;
@@ -2074,6 +2210,8 @@ impl AcpClient {
         }
 
         let mut c = AcpClient {
+            isolated: !client_fs,
+            isolated_files: HashSet::new(),
             id,
             entry_id: entry.id,
             label: entry.label.to_string(),
@@ -2111,7 +2249,7 @@ impl AcpClient {
                 "protocolVersion": PROTOCOL_VERSION,
                 "clientCapabilities": {
                     // terminal/* は未実装。**実装していない能力は広告しない。**
-                    "fs": {"readTextFile": true, "writeTextFile": true},
+                    "fs": {"readTextFile": client_fs, "writeTextFile": client_fs},
                     "terminal": false
                 },
                 "clientInfo": {
@@ -2526,6 +2664,29 @@ impl AcpClient {
         p.status.apply(&mut row.status);
         p.locations.apply(&mut row.locations);
         p.raw_input.apply(&mut row.raw_input);
+        if self.isolated {
+            let reply = if self.session.as_deref() == Some(params.session_id.as_str())
+                && isolated_permission_allowed(&params.tool_call, &self.isolated_files)
+            {
+                ReplyAction::Approve
+            } else {
+                ReplyAction::Deny
+            };
+            self.reply_permission(
+                PendingPerm {
+                    approval_id: 0,
+                    req_id,
+                    // Never turn a single-file permission into persistent approval.
+                    options: params
+                        .options
+                        .into_iter()
+                        .filter(|option| option.kind != PermissionOptionKind::AllowAlways)
+                        .collect(),
+                },
+                reply,
+            );
+            return;
+        }
         // ── 他人が持っているファイルへの編集要求は、ユーザーへ出す前に断る ──
         //
         // **なぜここにも門を置くか**: ACP アダプタには client の
@@ -5023,11 +5184,154 @@ rl.on("line", (line) => {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn bridge_summary_omits_truncated_secret_context() {
+        let mut turn = Turn::default();
+        let text = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}fixture-secret-tail\n-----END PRIVATE KEY-----",
+            "x".repeat(MESSAGE_CAP)
+        );
+        turn.apply(SessionUpdate::AgentMessageChunk {
+            content: ContentBlock {
+                kind: "text".into(),
+                text,
+                ..Default::default()
+            },
+        });
+        assert!(turn.message.contains("fixture-secret-tail"));
+        assert!(!turn.message.contains("BEGIN PRIVATE KEY"));
+        assert!(!turn.bridge_summary().contains("fixture-secret-tail"));
+        turn.begin();
+        turn.apply(SessionUpdate::AgentMessageChunk {
+            content: ContentBlock {
+                kind: "text".into(),
+                text: "const accessToken = \"fixture-secret-value\";\nFixed tokenizer.".into(),
+                ..Default::default()
+            },
+        });
+        assert!(!turn.bridge_summary().contains("fixture-secret-value"));
+        assert!(turn.bridge_summary().contains("Fixed tokenizer."));
+    }
+
+    #[test]
+    fn isolated_permissions_validate_contract_and_never_allow_always() {
+        let (mut client, replies, _) = fake_client();
+        client.isolated = true;
+        client.isolated_files.insert("/workspace/src/lib.rs".into());
+        let root = crate::test_util::unique_temp_dir("acp", "isolated-permissions");
+        let mut queue = ApprovalQueue::in_dir(root.join("audit"));
+        let valid = [
+            (
+                "read_file",
+                "read",
+                json!({"file_path":"/workspace/src/lib.rs"}),
+            ),
+            (
+                "edit",
+                "edit",
+                json!({"file_path":"/workspace/src/lib.rs","old_string":"old","new_string":"new"}),
+            ),
+        ];
+        for (name, kind, input) in valid {
+            let base = json!({"sessionId":"s1","toolCall":{"toolCallId":"invocation-1","title":"display only","kind":kind,"_meta":{"toolName":name},"rawInput":input,"locations":[{"path":"/workspace/src/lib.rs"}]},"options":[{"optionId":"once","kind":"allow_once"},{"optionId":"always","kind":"allow_always"},{"optionId":"deny","kind":"reject_once"}]});
+            for variant in 0..20 {
+                let mut request = base.clone();
+                match variant {
+                    0 => {}
+                    1 => request["toolCall"]["kind"] = json!("execute"),
+                    2 => request["toolCall"]["_meta"]["toolName"] = json!("run_shell_command"),
+                    3 => request["toolCall"]["rawInput"]["command"] = json!("rm -rf /workspace"),
+                    4 => request["sessionId"] = json!("other"),
+                    5 => request["toolCall"]["_meta"] = Value::Null,
+                    6 => request["toolCall"]["locations"][0]["path"] = json!("/etc/passwd"),
+                    7 => request["options"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|option| option["optionId"] != "once"),
+                    8 => {
+                        request["toolCall"]["rawInput"]["file_path"] =
+                            json!("/workspace/src/../src/lib.rs")
+                    }
+                    9 => request["toolCall"]["kind"] = json!("unknown"),
+                    10 => request["toolCall"]["_meta"]["toolName"] = json!("unknown"),
+                    11 => request["toolCall"]["rawInput"] = json!("malformed"),
+                    12 => request["toolCall"]["rawInput"] = Value::Null,
+                    13 => request["toolCall"]["rawInput"]["future_argument"] = json!(true),
+                    14 => request["toolCall"]["_meta"]["toolName"] = json!("shell"),
+                    15 => request["toolCall"]["_meta"]["toolName"] = json!("delete"),
+                    16 => request["toolCall"]["_meta"]["toolName"] = json!("move"),
+                    17 => request["toolCall"]["_meta"]["toolName"] = json!("fetch"),
+                    18 | 19 => {
+                        request["toolCall"]["rawInput"]["file_path"] = json!(if variant == 18 {
+                            "/etc/passwd"
+                        } else {
+                            "/workspace/src/unshared.rs"
+                        });
+                    }
+                    _ => unreachable!(),
+                }
+                client.on_permission(
+                    json!(1),
+                    serde_json::from_value(request).unwrap(),
+                    &mut queue,
+                    &mut Vec::new(),
+                );
+                let reply: Value = serde_json::from_str(&replies.recv().unwrap()).unwrap();
+                if variant == 0 {
+                    assert_eq!(reply["result"]["outcome"]["optionId"], "once");
+                } else {
+                    assert_ne!(reply["result"]["outcome"]["optionId"], "once", "{reply}");
+                }
+                assert_ne!(reply["result"]["outcome"]["optionId"], "always");
+            }
+        }
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn isolated_qwen_directory_search_contract_is_explicitly_denied() {
+        let shared = HashSet::from(["/workspace/src/lib.rs".into()]);
+        // Qwen supplies [] for grep locations. Even a shared file path cannot
+        // turn its directory-based implementation into a supported operation.
+        for input in [
+            json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer"}),
+            json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","limit":10}),
+        ] {
+            let call: ToolCallPatch = serde_json::from_value(json!({
+                "toolCallId":"grep-1", "kind":"search", "_meta":{"toolName":"grep_search"},
+                "rawInput":input, "locations":[]
+            }))
+            .unwrap();
+            assert!(!isolated_permission_allowed(&call, &shared));
+            for invalid in [
+                json!({"pattern":"tokenizer"}),
+                json!({"path":"/workspace","pattern":"tokenizer"}),
+                json!({"path":"/workspace/src","pattern":"tokenizer"}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","glob":"*.rs"}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","future":true}),
+                json!({"path":"/workspace/src/lib.rs","pattern":1}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"x","limit":-1}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"x","limit":"10"}),
+            ] {
+                let mut rejected = call.clone();
+                rejected.raw_input = Patch::Set(invalid.clone());
+                assert!(
+                    !isolated_permission_allowed(&rejected, &shared),
+                    "{invalid}"
+                );
+            }
+        }
+    }
+
     /// 子プロセスを持たない検査用クライアント (送信内容だけを見る)。
     fn fake_client() -> (AcpClient, mpsc::Receiver<String>, mpsc::Sender<AcpEvent>) {
         let (tx_out, rx_out) = mpsc::channel::<String>();
         let (tx_ev, rx) = mpsc::channel::<AcpEvent>();
         let c = AcpClient {
+            isolated: false,
+            isolated_files: HashSet::new(),
             id: ACP_SESSION_ID_BASE,
             entry_id: "mock",
             label: "Mock".into(),

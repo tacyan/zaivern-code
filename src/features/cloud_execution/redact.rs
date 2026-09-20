@@ -78,6 +78,7 @@ pub fn redact(text: &str) -> String {
 /// (環境変数を差し替えるテストは、並列に走る他のテストへ漏れる)。
 pub fn redact_with(text: &str, secret_values: &[String]) -> String {
     let mut out = mask_private_keys(text);
+    out = mask_assignments(&out);
     out = mask_after_marker(&out, "Authorization:");
     out = mask_after_marker(&out, "authorization:");
     out = mask_bearer(&out);
@@ -101,11 +102,28 @@ pub fn redact_with(text: &str, secret_values: &[String]) -> String {
     out
 }
 
+/// Source/config assignments may contain whitespace, quoted keys, or a Rust
+/// type annotation. Mask the remainder of that line conservatively; the old
+/// query masking below still preserves unrelated URL parameters.
+fn mask_assignments(text: &str) -> String {
+    static ASSIGNMENT: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = ASSIGNMENT.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?im)(\b(?:[a-z0-9]+_)*(?:api_key|apikey|token|password|secret|authorization|accessToken|refreshToken|clientSecret)\b(?:["'][ \t]*[=:]|[ \t]+[=:]|:[ \t]*&(?:'static[ \t]+)?str[ \t]*=|:|=[ \t]+|=["'])[ \t]*["']?)[^\r\n]*"#,
+        ).expect("constant credential assignment pattern")
+    });
+    pattern.replace_all(text, "${1}***").into_owned()
+}
+
 /// `Bearer <値>` の値を伏せる。
 fn mask_bearer(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find("Bearer ") {
+    while let Some(at) = rest
+        .as_bytes()
+        .windows(b"Bearer ".len())
+        .position(|bytes| bytes.eq_ignore_ascii_case(b"Bearer "))
+    {
         out.push_str(&rest[..at + "Bearer ".len()]);
         let tail = &rest[at + "Bearer ".len()..];
         let end = tail
@@ -144,7 +162,11 @@ fn mask_after_marker(text: &str, marker: &str) -> String {
 fn mask_query_value(text: &str, key: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find(key) {
+    while let Some(at) = rest
+        .as_bytes()
+        .windows(key.len())
+        .position(|window| window.eq_ignore_ascii_case(key.as_bytes()))
+    {
         out.push_str(&rest[..at + key.len()]);
         let tail = &rest[at + key.len()..];
         let end = tail
@@ -190,6 +212,70 @@ mod tests {
     use super::*;
 
     const TOKEN: &str = "super-secret-test-token";
+
+    #[test]
+    fn camel_case_credentials_are_redacted_without_identifier_false_positives() {
+        for text in [
+            r#"const accessToken = "fixture-secret-value";"#,
+            r#"const refreshToken = "fixture-secret-value";"#,
+            r#"const clientSecret = "fixture-secret-value";"#,
+            r#"const apiKey = "fixture-secret-value";"#,
+            r#"const password = "fixture-secret-value";"#,
+            r#"const accessToken: string = "fixture-secret-value";"#,
+            r#"{"refreshToken":"fixture-secret-value"}"#,
+            "clientSecret=fixture-secret-value",
+            "accessToken=fixture-secret-value",
+            "refreshToken=fixture-secret-value",
+        ] {
+            let result = redact_with(text, &[]);
+            assert!(!result.contains("fixture-secret-value"), "{result}");
+            assert!(result.contains(MASK), "{result}");
+        }
+        let ordinary = "mod tokenizer;\nfn secret() {}\nlet tokenizer = 1;\nlet secretary = 2;\nlet credential_manager = 3;\n";
+        assert_eq!(redact_with(ordinary, &[]), ordinary);
+    }
+
+    #[test]
+    fn authorization_headers_json_and_bearer_are_case_insensitive() {
+        for text in [
+            "AUTHORIZATION: basic fixture-auth-secret",
+            "aUtHoRiZaTiOn: Bearer fixture-auth-secret",
+            r#"{"Authorization":"Basic fixture-auth-secret"}"#,
+            r#"let headers = { authorization: "bearer fixture-auth-secret" };"#,
+            "bearer fixture-auth-secret",
+            "BEARER fixture-auth-secret",
+        ] {
+            let result = redact_with(text, &[]);
+            assert!(!result.contains("fixture-auth-secret"), "{result}");
+            assert!(result.contains(MASK), "{result}");
+        }
+        let ordinary = "fn authorization() {}\nmod tokenizer;\nfn secret() {}\n";
+        assert_eq!(redact_with(ordinary, &[]), ordinary);
+    }
+
+    #[test]
+    fn source_and_config_assignments_are_redacted() {
+        for text in [
+            "// token = fixture-secret-value",
+            "{\"token\":\"fixture-secret-value\"}",
+            "const API_KEY: &str = \"fixture-secret-value\";",
+            "const ACCESS_TOKEN: &'static str = \"fixture-secret-value\";",
+            "TOKEN=fixture-secret-value",
+            "API_KEY=fixture-secret-value",
+        ] {
+            let result = redact_with(text, &[]);
+            assert!(!result.contains("fixture-secret-value"), "{result}");
+            assert!(result.contains(MASK), "{result}");
+        }
+        assert_eq!(
+            redact_with("mod tokenizer;\nfn secret() {}\n", &[]),
+            "mod tokenizer;\nfn secret() {}\n"
+        );
+        assert_eq!(
+            redact_with("https://example.test/?TOKEN=private-value&page=2", &[]),
+            "https://example.test/?TOKEN=***&page=2"
+        );
+    }
 
     #[test]
     fn ベアラートークンを伏せる() {
