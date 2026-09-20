@@ -40,14 +40,19 @@ pub(super) fn serve(
         if !request.is_object()
             || request.get("jsonrpc") != Some(&json!("2.0"))
             || method.is_none()
-            || id.as_ref().is_some_and(|v| !(v.is_string() || v.is_i64()))
+            || id
+                .as_ref()
+                .is_some_and(|v| !(v.is_string() || v.is_i64() || v.is_u64()))
         {
             write_response(&mut output, error(Value::Null, -32600, "Invalid request"))?;
             continue;
         }
         let method = method.unwrap_or_default();
         if id.is_none() {
-            if initialized && method == "notifications/initialized" {
+            if initialized
+                && method == "notifications/initialized"
+                && request.get("params").is_none_or(Value::is_object)
+            {
                 ready = true;
             }
             continue;
@@ -64,7 +69,10 @@ pub(super) fn serve(
         let result = match method {
             "initialize" if !initialized => {
                 if !params.get("protocolVersion").is_some_and(Value::is_string)
-                    || !params.get("clientInfo").is_some_and(Value::is_object)
+                    || !params.get("clientInfo").is_some_and(|info| {
+                        info.get("name").is_some_and(Value::is_string)
+                            && info.get("version").is_some_and(Value::is_string)
+                    })
                     || !params.get("capabilities").is_some_and(Value::is_object)
                 {
                     Err((-32602, "Invalid initialize parameters"))
@@ -121,7 +129,7 @@ fn write_response(out: &mut impl Write, value: Value) -> io::Result<()> {
 fn tools() -> Value {
     json!([
         {"name":"zaivern_run_task","description":"Run a coding task in an isolated Zaivern agent; returns a task ID immediately.",
-         "inputSchema":{"type":"object","properties":{"instruction":{"type":"string","minLength":1,"maxLength":16384},"workspace":{"type":"string"}},"required":["instruction","workspace"],"additionalProperties":false}},
+         "inputSchema":{"type":"object","properties":{"instruction":{"type":"string","minLength":1,"maxLength":16384}},"required":["instruction"],"additionalProperties":false}},
         {"name":"zaivern_task_status","description":"Get task state, changes and verification status.",
          "inputSchema":{"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"],"additionalProperties":false}},
         {"name":"zaivern_cancel_task","description":"Request cancellation. Poll status until cancelled or another terminal state.",
@@ -132,6 +140,56 @@ fn tools() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protocol_envelopes_and_initialization_order() {
+        let bridge = ChatBridge::new(
+            std::path::PathBuf::from("unused"),
+            std::sync::Arc::new(super::super::task::tests::Fake),
+        );
+        let initialize = json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":VERSION,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}});
+        let requests = [
+            "{malformed".into(),
+            json!({"jsonrpc":"2.0","id":null,"method":"ping"}).to_string(),
+            json!({"jsonrpc":"2.0","id":true,"method":"ping"}).to_string(),
+            json!({"jsonrpc":"2.0","id":1.5,"method":"ping"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+            initialize.to_string(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized","params":[]}).to_string(),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"unknown"}).to_string(),
+            json!({"jsonrpc":"2.0","id":u64::MAX,"method":"ping"}).to_string(),
+            json!({"jsonrpc":"2.0","id":"unknown","method":"unknown"}).to_string(),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"edit","workspace":"/tmp"}}}).to_string(),
+        ];
+        let mut output = Vec::new();
+        serve(io::Cursor::new(requests.join("\n")), &mut output, &bridge).unwrap();
+        let rows: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 10);
+        for (index, code) in [
+            (0, -32700),
+            (1, -32600),
+            (2, -32600),
+            (3, -32600),
+            (4, -32000),
+            (6, -32000),
+            (8, -32601),
+        ] {
+            assert_eq!(rows[index]["error"]["code"], code, "{rows:?}");
+        }
+        assert_eq!(rows[7]["id"], u64::MAX);
+        assert_eq!(rows[9]["result"]["isError"], true);
+        let schema = tools();
+        assert_eq!(schema[0]["inputSchema"]["required"], json!(["instruction"]));
+        assert!(schema[0]["inputSchema"]["properties"]
+            .get("workspace")
+            .is_none());
+    }
     #[test]
     fn startup_initialize_list_and_validation() {
         let root = crate::test_util::unique_temp_dir("bridge", "protocol");
@@ -145,11 +203,11 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":VERSION,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}}),
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"","workspace":root}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":""}}}),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"zaivern_task_status","arguments":{"task_id":"unknown"}}}),
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":[]}),
             json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"unknown"}}),
-            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"passed","workspace":root}}}),
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"passed"}}}),
         ];
         let input = requests
             .iter()

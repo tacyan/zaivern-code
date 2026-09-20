@@ -81,9 +81,12 @@ HTTPS server / OAuth server はこの PR に追加していません。
 
 | Tool | 引数 | 結果 |
 | --- | --- | --- |
-| `zaivern_run_task` | `instruction`, `workspace` | `task_id` |
+| `zaivern_run_task` | `instruction` | `task_id` |
 | `zaivern_task_status` | `task_id` | state、summary、progress、changed_files、test/build status、diff_summary、error、duration |
 | `zaivern_cancel_task` | `task_id` | cancellation_requested と現在の状態 |
+
+対象は起動時に許可した workspace に固定されます。ChatGPT が絶対パスを知る必要はありません。
+`workspace` を tool 引数に渡すと拒否されます。
 
 run は worker を起動して直ちに返ります。status は terminal state になるまでポーリングします。
 cancel の応答は停止完了ではありません。`cancelled` または他の terminal state を確認してください。
@@ -92,6 +95,7 @@ Zaivern の検証が失敗した場合は `test_status=failed` と `state=failed
 修復を再試行しても検証に失敗した候補はホストへ取り込まず、`changed_files` は空にし、
 `error` に取り込まなかった理由を返します。検証対象の候補は成功時だけ取り込みます。
 対象外の検証は `not_verified` とし、それだけでは task を失敗にしません。
+Agent 本文や検証出力が収集上限で切り詰められた場合は、秘密情報の文脈を失うため本文を省略します。
 差分は既存の秘匿処理を通した変更範囲と前後3行で、200行を超える置換範囲は省略します。
 差分応答全体が秘匿処理後に32 KiBを超える場合は、ローカル確認を求めるメッセージを返します。
 
@@ -105,9 +109,13 @@ Zaivern の検証が失敗した場合は `test_status=failed` と `state=failed
 `Cargo.toml` が共有された場合、Agent 完了後に返却予定ファイルだけを別の空のコンテナへ配置し、
 `cargo test --offline` を実行します。Agent が追加した未共有ファイルは検証に使いません。
 失敗時は最大2回、実際の出力を同じ Agent へ戻します。結果は出口コードで判定し、
-Agent が「成功」と書いただけでは passed にしません。1回の検証上限は60秒です。
+Agent が「成功」と書いただけでは passed にしません。
+`test_status=passed` は共有 snapshot 内の Cargo テストの成功だけを表し、全動作の保証ではありません。
+非 Rust ファイルの変更（manifest・データを含む）がある場合、Cargo が成功しても
+`test_status=not_verified` とし、summary に実行した検証の範囲を明記します。
+独立したビルド検証は実行しないため `build_status` は常に `not_verified` です。1回の検証上限は60秒です。
 タイムアウト時は検証コンテナ全体を削除します。停止確認に失敗した場合は
-`cancelled` とせず、container ID と cleanup error を返します。
+`cancelled` とせず、container 識別名と cleanup error を返します。
 他の build/test system は `not_verified` です。
 
 ## 実装と既存機構
@@ -155,7 +163,13 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   workspace は容量256 MiBのタスク専用 tmpfs volume で、stdinから配置し、
   コンテナ全体をpauseして結果を取得します。volumeはコンテナ終了後に削除します。
   Docker daemon、OS、指定した image は信頼する基盤です。
-- Agent の permission request は構造化された read / edit / search のみ許可します。
+- Agent の permission request は Qwen の `_meta.toolName`、kind、引数、locations を照合します。
+  `read_file` / `edit` / `grep_search` の既存共有ファイル完全一致だけを一度限り許可します。
+  metadata 欠落、未知引数、別 session、ディレクトリ単位の探索・glob、永続許可は拒否します。
+  [Qwen の ACP 契約](https://github.com/QwenLM/qwen-code/blob/main/packages/cli/src/acp-integration/session/Session.ts)
+  に対応しない image は fail closed となります。
+  ACP metadata は peer の申告で、Agent は承認要求を省略することもあります。
+  このフィルタは承認応答の制限です。ホストの強制的な隔離境界は Docker と snapshot/import が担います。
   execute / delete / move / fetch / unknown は拒否し、GUI の自動承認 policy は継承しません。
   `git push`、commit、merge、rebase、reset、clean、`rm -rf`、sudo をホストで実行する経路はありません。
   ホストの status / log / branch / show もこの限定 MVP では取得しません。

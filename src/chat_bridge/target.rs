@@ -139,8 +139,16 @@ impl LocalExecutionTarget {
             "type=volume,source={},target=/workspace,volume-nocopy",
             volume.name
         );
+        let container = Container {
+            target: self,
+            id: ids::new_id("zaivern-mcp-"),
+            removed: std::cell::Cell::new(false),
+            volume,
+        };
         let mut args = strings(&[
             "create",
+            "--name",
+            &container.id,
             "--pull=never",
             "--network=none",
             "--read-only",
@@ -162,28 +170,16 @@ impl LocalExecutionTarget {
         if verifier {
             args.push("1800".into());
         }
-        let output = match self.run(&args, budget(started, 30)?) {
-            Ok(output) => output,
-            Err(error) => {
-                volume.shutdown()?;
-                return Err(error);
-            }
-        };
-        let id = std::str::from_utf8(&output)
-            .map_err(|_| "invalid Docker container ID")?
-            .trim();
-        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("invalid Docker container ID".into());
-        }
-        let container = Container {
-            target: self,
-            id: id.to_string(),
-            removed: std::cell::Cell::new(false),
-            volume,
-        };
-        if let Err(error) = self.run(&strings(&["start", &container.id]), budget(started, 30)?) {
-            container.shutdown()?;
-            return Err(error);
+        // Track our unique name before create: the daemon can create a container
+        // even if its response is lost or the CLI times out. Drop still removes it.
+        let launch = self
+            .run(&args, budget(started, 30)?)
+            .and_then(|_| self.run(&strings(&["start", &container.id]), budget(started, 30)?));
+        if let Err(error) = launch {
+            return Err(match container.shutdown() {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; {cleanup}"),
+            });
         }
         Ok(container)
     }
@@ -218,13 +214,13 @@ impl LocalExecutionTarget {
         snapshot: &Snapshot,
         changes: &BTreeMap<PathBuf, Vec<u8>>,
         started: Instant,
-    ) -> Result<(bool, String), String> {
+    ) -> Result<(bool, String, Option<String>), String> {
         let staging = Staging::new()?;
         snapshot.stage_changes(&staging.0, changes)?;
         // Test exactly the files that will be imported, without any extra files,
         // config, generated helpers or surviving processes created by the agent.
         let verifier = self.start_container(started, true)?;
-        let result = (|| {
+        let result: Result<(bool, String), String> = (|| {
             self.upload(&verifier, &staging.0, started)?;
             let mut sink = CollectSink::with_limit(64 * 1024);
             let command = self.command(&strings(&[
@@ -236,16 +232,24 @@ impl LocalExecutionTarget {
             ]));
             let result = run_child(command, budget(started, 60)?, "docker", &mut sink);
             let passed = result.as_ref().is_ok_and(|r| r.ok());
-            let output = crate::features::cloud_execution::redact::redact(&format!(
-                "{}\n{}",
-                sink.stdout_text(),
-                sink.stderr_text()
-            ));
+            let output = if sink.truncated {
+                "Test output exceeded response limit; details omitted.".into()
+            } else {
+                crate::features::cloud_execution::redact::redact(&format!(
+                    "{}\n{}",
+                    sink.stdout_text(),
+                    sink.stderr_text()
+                ))
+            };
             // Drop removes the entire verifier even on timeout, killing its tests.
             Ok((passed, output))
         })();
-        verifier.shutdown()?;
-        result
+        let cleanup = verifier.shutdown();
+        match (result, cleanup) {
+            (Ok((passed, output)), cleanup) => Ok((passed, output, cleanup.err())),
+            (Err(cause), Err(cleanup)) => Err(format!("{cause}; {cleanup}")),
+            (Err(cause), Ok(())) => Err(cause),
+        }
     }
 }
 
@@ -417,13 +421,14 @@ impl TaskExecutor for LocalExecutionTarget {
                 1,
                 PathBuf::from("/workspace"),
                 self.command(&args),
+                snapshot.files.keys().cloned(),
             )
             .map_err(|_| "cannot start isolated ACP agent")?;
             let mut approvals = ApprovalQueue::in_dir(staging.0.join("audit"));
             let mut sent = false;
             let mut attempts = 0;
             let mut test_status = "not_verified".to_string();
-            let mut build_status = "not_verified".to_string();
+            let build_status = "not_verified".to_string();
             let changes = loop {
                 if control.is_cancelled() {
                     agent.cancel(&mut approvals);
@@ -453,10 +458,23 @@ impl TaskExecutor for LocalExecutionTarget {
                         self.run(&strings(&["pause", &container.id]), budget(started, 30)?)?;
                         let candidate = self.collect(&container, &snapshot, control, started)?;
                         if snapshot.files.contains_key(Path::new("Cargo.toml")) {
-                            let (passed, output) = self.verify(&snapshot, &candidate, started)?;
+                            control.state(State::Running, "verifying cargo tests");
+                            let (passed, output, cleanup_error) =
+                                self.verify(&snapshot, &candidate, started)?;
                             test_status = if passed { "passed" } else { "failed" }.into();
+                            if let Some(cleanup) = cleanup_error {
+                                agent.stop();
+                                return Ok(Outcome {
+                                    error: Some(format!("verification {test_status}; changes were not imported; {cleanup}")),
+                                    summary: "Verifier cleanup failed; host workspace was not modified.".into(),
+                                    changed_files: Vec::new(),
+                                    diff_summary: String::new(),
+                                    test_status: if passed { cargo_test_status(&snapshot.files, &candidate).into() } else { test_status },
+                                    build_status,
+                                });
+                            }
                             if passed {
-                                build_status = "passed".into();
+                                test_status = cargo_test_status(&snapshot.files, &candidate).into();
                                 // Only a successfully verified Cargo candidate
                                 // can leave this branch for the import below.
                                 break candidate;
@@ -501,11 +519,12 @@ impl TaskExecutor for LocalExecutionTarget {
                 }
                 std::thread::sleep(Duration::from_millis(25));
             };
-            let summary: String =
-                crate::features::cloud_execution::redact::redact(&agent.turn.message)
-                    .chars()
-                    .take(8192)
-                    .collect();
+            let mut summary = agent.turn.bridge_summary();
+            summary.push_str(if snapshot.files.contains_key(Path::new("Cargo.toml")) {
+                "\nZaivern verification: cargo test --offline passed in the shared snapshot; no independent build verification. Non-Rust changes are not verified by Cargo."
+            } else {
+                "\nZaivern verification: no supported test or build verification performed."
+            });
             agent.stop();
             if control.is_cancelled() {
                 return Err("cancelled".into());
@@ -515,7 +534,7 @@ impl TaskExecutor for LocalExecutionTarget {
                 return Err("cancelled".into());
             }
             budget(started, 1)?;
-            let applied = snapshot.apply(&changes)?;
+            let applied = control.import(|| snapshot.apply(&changes))?;
             let changed_files = applied.changed;
             let diff_summary = if applied.error.is_some() {
                 "Import partially failed; inspect changed_files locally for actual bytes.".into()
@@ -539,9 +558,25 @@ impl TaskExecutor for LocalExecutionTarget {
                 });
                 Ok(outcome)
             }
-            (Err(_), Err(error)) => Err(error),
+            (Err(cause), Err(error)) => Err(format!("{cause}; {error}")),
             (result, Ok(())) => result,
         }
+    }
+}
+
+/// Cargo tests only describe the Rust test suite in the shared snapshot, not
+/// every language or an independent build. Conservatively leave mixed edits
+/// unverified (including manifests and data, whose coverage is unknown).
+fn cargo_test_status(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+) -> &'static str {
+    if after.iter().any(|(path, bytes)| {
+        before.get(path) != Some(bytes) && path.extension().is_none_or(|ext| ext != "rs")
+    }) {
+        "not_verified"
+    } else {
+        "passed"
     }
 }
 
@@ -635,6 +670,62 @@ fn regular_tar_payload(tar: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn create_response_failure_still_cleans_owned_name_and_reports_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_util::unique_temp_dir("bridge", "create-cleanup");
+        std::fs::create_dir_all(&root).unwrap();
+        let docker = root.join("docker-fixture");
+        std::fs::write(
+            &docker,
+            r#"#!/bin/sh
+shift 2
+case "$1" in
+volume) exit 0 ;;
+create) printf '%s' "$3" > "$0.created"; exit 17 ;;
+rm) printf '%s' "$3" > "$0.removed"; exit 19 ;;
+esac
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target = LocalExecutionTarget {
+            image: "fixture".into(),
+            docker: docker.clone(),
+            endpoint: "fixture".into(),
+        };
+        let error = target
+            .start_container(Instant::now(), false)
+            .err()
+            .expect("create must fail");
+        let created = std::fs::read_to_string(docker.with_extension("created")).unwrap();
+        let removed = std::fs::read_to_string(docker.with_extension("removed")).unwrap();
+        assert_eq!(created, removed);
+        assert!(created.starts_with("zaivern-mcp-"));
+        assert!(error.contains("Docker operation failed"), "{error}");
+        assert!(error.contains("container cleanup unconfirmed"), "{error}");
+        assert!(error.contains(&created), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cargo_success_does_not_verify_mixed_changes() {
+        let before = BTreeMap::from([
+            (PathBuf::from("src/lib.rs"), b"before".to_vec()),
+            (PathBuf::from("frontend/app.ts"), b"valid".to_vec()),
+            (PathBuf::from("Cargo.toml"), b"manifest".to_vec()),
+        ]);
+        let mut candidate = before.clone();
+        candidate.insert(PathBuf::from("src/lib.rs"), b"after".to_vec());
+        assert_eq!(cargo_test_status(&before, &candidate), "passed");
+        for path in ["frontend/app.ts", "Cargo.toml", "data.json"] {
+            let mut mixed = candidate.clone();
+            mixed.insert(PathBuf::from(path), b"invalid syntax".to_vec());
+            assert_eq!(cargo_test_status(&before, &mixed), "not_verified");
+        }
+    }
     fn summarize(before: &str, after: &str) -> String {
         diff_summary(
             &["src/lib.rs".into()],

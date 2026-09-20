@@ -1,3 +1,4 @@
+#[cfg(test)]
 use super::workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -105,11 +106,24 @@ pub(super) trait TaskExecutor: Send + Sync {
 pub(super) struct Control {
     pub cancelled: Arc<AtomicBool>,
     store: Arc<dyn TaskStore>,
+    import_gate: Arc<Mutex<()>>,
     id: String,
 }
 impl Control {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+    /// Linearization point: cancellation accepted before this gate prevents import.
+    /// Once import owns the gate it completes and reports its actual result.
+    pub fn import<T>(&self, apply: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _guard = self
+            .import_gate
+            .lock()
+            .map_err(|_| "import gate unavailable")?;
+        if self.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        apply()
     }
     pub fn state(&self, state: State, progress: &str) {
         if let Ok(mut status) = self.store.get(&self.id) {
@@ -121,6 +135,8 @@ impl Control {
 }
 
 struct Worker {
+    task_id: String,
+    import_gate: Arc<Mutex<()>>,
     cancel: Arc<AtomicBool>,
     join: std::thread::JoinHandle<()>,
 }
@@ -134,7 +150,6 @@ pub(super) struct ChatBridge {
 #[serde(deny_unknown_fields)]
 struct Run {
     instruction: String,
-    workspace: PathBuf,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -159,9 +174,6 @@ impl ChatBridge {
                 if args.instruction.trim().is_empty() || args.instruction.len() > 16384 {
                     return Err("instruction must be 1..16384 bytes".into());
                 }
-                if workspace::validate_root(&args.workspace)? != self.root {
-                    return Err("workspace is not explicitly allowed".into());
-                }
                 let mut worker = self.worker.lock().map_err(|_| "worker unavailable")?;
                 if worker.as_ref().is_some_and(|w| !w.join.is_finished()) {
                     return Err("another task is active".into());
@@ -185,7 +197,9 @@ impl ChatBridge {
                 };
                 self.store.insert(status)?;
                 let cancel = Arc::new(AtomicBool::new(false));
+                let import_gate = Arc::new(Mutex::new(()));
                 let control = Control {
+                    import_gate: import_gate.clone(),
                     cancelled: cancel.clone(),
                     store: self.store.clone(),
                     id: id.clone(),
@@ -255,7 +269,12 @@ impl ChatBridge {
                         }
                         "cannot start task worker"
                     })?;
-                *worker = Some(Worker { cancel, join });
+                *worker = Some(Worker {
+                    task_id: id.clone(),
+                    import_gate,
+                    cancel,
+                    join,
+                });
                 eprintln!("mcp tool=zaivern_run_task task_id={id} state=queued");
                 Ok(json!({"task_id":id}))
             }
@@ -274,6 +293,19 @@ impl ChatBridge {
                         .map_err(|_| "worker unavailable")?
                         .as_ref()
                     {
+                        if worker.task_id != args.task_id {
+                            return serde_json::to_value(self.store.get(&args.task_id)?)
+                                .map_err(|_| "cannot serialize status".into());
+                        }
+                        let _guard = worker
+                            .import_gate
+                            .lock()
+                            .map_err(|_| "import gate unavailable")?;
+                        status = self.store.get(&args.task_id)?;
+                        if status.state.terminal() {
+                            return serde_json::to_value(status)
+                                .map_err(|_| "cannot serialize status".into());
+                        }
                         worker.cancel.store(true, Ordering::Release);
                         status.cancellation_requested = true;
                         self.store.request_cancel(&args.task_id);
@@ -344,6 +376,99 @@ pub(super) mod tests {
         }
     }
     #[test]
+    fn run_without_workspace_uses_only_server_root() {
+        struct Recording(Arc<Mutex<Option<PathBuf>>>);
+        impl TaskExecutor for Recording {
+            fn execute(
+                &self,
+                root: &std::path::Path,
+                instruction: &str,
+                control: &Control,
+            ) -> Result<Outcome, String> {
+                *self.0.lock().unwrap() = Some(root.to_owned());
+                Fake.execute(root, instruction, control)
+            }
+        }
+        let root = crate::test_util::unique_temp_dir("bridge", "fixed-root");
+        let observed = Arc::new(Mutex::new(None));
+        let bridge = ChatBridge::new(root.clone(), Arc::new(Recording(observed.clone())));
+        assert!(bridge
+            .call(
+                "zaivern_run_task",
+                json!({"instruction":"finish", "workspace":root})
+            )
+            .is_err());
+        let id = bridge
+            .call("zaivern_run_task", json!({"instruction":"finish"}))
+            .unwrap();
+        assert!(id["task_id"].is_string());
+        bridge
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join
+            .join()
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(root.clone()));
+        drop(bridge);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_before_import_never_calls_apply() {
+        let control = Control {
+            cancelled: Arc::new(AtomicBool::new(true)),
+            import_gate: Arc::new(Mutex::new(())),
+            store: Arc::new(InMemoryTaskStore::default()),
+            id: "cancelled".into(),
+        };
+        assert_eq!(
+            control
+                .import::<()>(|| panic!("must not import"))
+                .unwrap_err(),
+            "cancelled"
+        );
+        control.cancelled.store(false, Ordering::Release);
+        assert_eq!(control.import(|| Ok(42)).unwrap(), 42);
+    }
+
+    #[test]
+    fn stale_task_cannot_cancel_another_worker() {
+        let bridge = ChatBridge::new(PathBuf::from("unused"), Arc::new(Fake));
+        let old = bridge
+            .call("zaivern_run_task", json!({"instruction":"finish"}))
+            .unwrap();
+        bridge
+            .worker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join
+            .join()
+            .unwrap();
+        let active = bridge
+            .call("zaivern_run_task", json!({"instruction":"wait"}))
+            .unwrap();
+        // Model a stale nonterminal read racing replacement by a new worker.
+        let mut stale = bridge.store.get(old["task_id"].as_str().unwrap()).unwrap();
+        stale.state = State::Running;
+        bridge.store.update(stale);
+        bridge.call("zaivern_cancel_task", old).unwrap();
+        assert!(!bridge
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Acquire));
+        bridge.call("zaivern_cancel_task", active).unwrap();
+    }
+
+    #[test]
     fn lifecycle_and_cancel() {
         let root = crate::test_util::unique_temp_dir("bridge", "lifecycle");
         std::fs::create_dir_all(&root).unwrap();
@@ -360,10 +485,7 @@ pub(super) mod tests {
             ("wait", "cancelled"),
         ] {
             let id = bridge
-                .call(
-                    "zaivern_run_task",
-                    json!({"instruction":instruction,"workspace":root}),
-                )
+                .call("zaivern_run_task", json!({"instruction":instruction}))
                 .unwrap();
             if instruction == "wait" || instruction == "failed_after_cancel" {
                 let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -404,6 +526,7 @@ pub(super) mod tests {
         let root = workspace::validate_root(&root).unwrap();
         let bridge = ChatBridge::new(root.clone(), Arc::new(Fake));
         for path in [
+            root.clone(),
             root.join("missing"),
             root.join("../escape"),
             root.parent().unwrap().to_path_buf(),

@@ -155,21 +155,25 @@ impl Snapshot {
         // Open and validate every destination before changing any file. Existing
         // user changes cause rejection; deleted/new files are not imported in MVP.
         let mut destinations = Vec::new();
+        if changes.len() != self.files.len()
+            || changes.keys().any(|path| !self.files.contains_key(path))
+        {
+            return Err("candidate must contain exactly the shared files".into());
+        }
         for (path, after) in changes {
             let before = self.files.get(path).ok_or("unshared output path")?;
-            if before == after {
-                continue;
-            }
             if after.len() > FILE_LIMIT || std::str::from_utf8(after).is_err() {
                 return Err("invalid output file".into());
             }
-            if !matches!(
-                crate::lease::check_write(&self.root.join(path)),
-                crate::lease::Verdict::Allow
-            ) {
+            if before != after
+                && !matches!(
+                    crate::lease::check_write(&self.root.join(path)),
+                    crate::lease::Verdict::Allow
+                )
+            {
                 return Err("workspace lease denied the edit".into());
             }
-            let mut file = open_relative(&self.directory, path, true)?;
+            let mut file = open_relative(&self.directory, path, before != after)?;
             let mut current = Vec::new();
             Read::by_ref(&mut file)
                 .take((FILE_LIMIT + 1) as u64)
@@ -178,7 +182,9 @@ impl Snapshot {
             if &current != before {
                 return Err("workspace changed while task ran; no results imported".into());
             }
-            destinations.push((path, file, after));
+            if before != after {
+                destinations.push((path, file, after));
+            }
         }
         let mut changed = Vec::new();
         for (path, mut file, after) in destinations {
@@ -349,6 +355,29 @@ fn directory_names(_: &File) -> Result<Vec<std::ffi::OsString>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn external_change_to_unedited_input_prevents_all_import() {
+        let root = crate::test_util::unique_temp_dir("bridge", "unchanged-conflict");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "original").unwrap();
+        std::fs::write(root.join("input.txt"), "verified input").unwrap();
+        let root = validate_root(&root).unwrap();
+        let snapshot = Snapshot::read(&root).unwrap();
+        let mut changes = snapshot.files.clone();
+        changes.insert(PathBuf::from("lib.rs"), b"candidate".to_vec());
+        std::fs::write(root.join("input.txt"), "external edit").unwrap();
+        assert!(snapshot.apply(&changes).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("lib.rs")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("input.txt")).unwrap(),
+            "external edit"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn validation_and_dangerous_paths() {
         assert!(validate_root(Path::new("../project")).is_err());

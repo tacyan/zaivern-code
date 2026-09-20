@@ -131,10 +131,21 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
     );
     for instruction in [
         "Fix the failing test and show the diff",
+        "MIXED_FRONTEND",
         "WAIT_FOREVER",
         "UNSHARED_HELPER",
+        "VERIFY_CANCEL",
         "NO_CARGO",
     ] {
+        if instruction == "MIXED_FRONTEND" {
+            std::fs::create_dir_all(workspace.join("frontend")).unwrap();
+            std::fs::write(workspace.join("frontend/app.ts"), "const valid = 1;\n").unwrap();
+            std::fs::write(
+                workspace.join("src/lib.rs"),
+                "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
+            )
+            .unwrap();
+        }
         if instruction == "NO_CARGO" {
             std::fs::remove_file(workspace.join("Cargo.toml")).unwrap();
             std::fs::write(
@@ -148,13 +159,13 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         let original_env = std::fs::read(workspace.join(".env")).unwrap();
         let response = call(
             "tools/call",
-            json!({"name":"zaivern_run_task","arguments":{"instruction":instruction,"workspace":workspace}}),
+            json!({"name":"zaivern_run_task","arguments":{"instruction":instruction}}),
         );
         assert_eq!(response["result"]["isError"], false, "{response}");
         let id: Value =
             serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                 .unwrap();
-        if instruction == "WAIT_FOREVER" {
+        if instruction == "WAIT_FOREVER" || instruction == "VERIFY_CANCEL" {
             let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 let response = call(
@@ -166,7 +177,12 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                 )
                 .unwrap();
                 assert_ne!(status["state"], "failed", "{status}");
-                if status["progress"] == "agent executing" {
+                let progress = if instruction == "VERIFY_CANCEL" {
+                    "verifying cargo tests"
+                } else {
+                    "agent executing"
+                };
+                if status["progress"] == progress {
                     break;
                 }
                 assert!(Instant::now() < deadline, "{status}");
@@ -188,7 +204,10 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                 serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
             if status["state"] == "failed" {
-                assert_eq!(instruction, "UNSHARED_HELPER", "{status}");
+                assert!(
+                    matches!(instruction, "UNSHARED_HELPER" | "VERIFY_CANCEL"),
+                    "{status}"
+                );
                 assert_eq!(status["test_status"], "failed", "{status}");
                 assert_eq!(status["changed_files"], json!([]), "{status}");
                 assert!(
@@ -213,13 +232,25 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
                 assert_ne!(instruction, "UNSHARED_HELPER", "{status}");
-                let verification = if instruction == "NO_CARGO" {
+                let verification = if instruction == "NO_CARGO" || instruction == "MIXED_FRONTEND" {
                     "not_verified"
                 } else {
                     "passed"
                 };
                 assert_eq!(status["test_status"], verification, "{status}");
-                assert_eq!(status["changed_files"], json!(["src/lib.rs"]));
+                assert_eq!(status["build_status"], "not_verified", "{status}");
+                if instruction == "MIXED_FRONTEND" {
+                    assert_eq!(
+                        status["changed_files"],
+                        json!(["frontend/app.ts", "src/lib.rs"])
+                    );
+                    assert!(status["summary"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cargo test --offline passed"));
+                } else {
+                    assert_eq!(status["changed_files"], json!(["src/lib.rs"]));
+                }
                 assert!(status["diff_summary"]
                     .as_str()
                     .unwrap()
