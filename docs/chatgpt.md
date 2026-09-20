@@ -106,17 +106,60 @@ Agent 本文や検証出力が収集上限で切り詰められた場合は、�
 - “Fix the failing tests and show me the diff.”
 - 「このプロジェクトの失敗しているテストを直して、修正後にテストして diff を見せて。」
 
-`Cargo.toml` が共有された場合、Agent 完了後に返却予定ファイルだけを別の空のコンテナへ配置し、
+`Cargo.toml` が共有された場合、返却候補と開始時に固定した Cargo 検証入力を別の空のコンテナへ配置し、
 `cargo test --offline` を実行します。Agent が追加した未共有ファイルは検証に使いません。
 失敗時は最大2回、実際の出力を同じ Agent へ戻します。結果は出口コードで判定し、
 Agent が「成功」と書いただけでは passed にしません。
-`test_status=passed` は共有 snapshot 内の Cargo テストの成功だけを表し、全動作の保証ではありません。
+`test_status=passed` はその検証 snapshot 内の Cargo テストの成功だけを表し、全動作の保証ではありません。
 非 Rust ファイルの変更（manifest・データを含む）がある場合、Cargo が成功しても
 `test_status=not_verified` とし、summary に実行した検証の範囲を明記します。
 独立したビルド検証は実行しないため `build_status` は常に `not_verified` です。1回の検証上限は60秒です。
 タイムアウト時は検証コンテナ全体を削除します。停止確認に失敗した場合は
 `cancelled` とせず、container 識別名と cleanup error を返します。
 他の build/test system は `not_verified` です。
+
+### 編集コンテキストと Cargo 検証入力
+
+Agent の編集用 snapshot は8 MiB / 1024ファイルまでです。リポジトリ全体の容量が
+8 MiBを超えても、それだけで開始を拒否しません。指示中の既存相対パス
+（例: `Fix src/chat_bridge/task.rs`）を優先し、Cargo.toml、entry point、Rust source、
+その他の順に、パス順を固定して選びます。共有パス一覧を Agent に渡し、共有されなかったファイル数を Agent と結果に
+明示します。選択は依存解析や全リポジトリ理解の保証ではありません。対象を絞った指示を
+推奨します。Agent が未共有ファイルを追加・変更しても取り込みません。
+
+Cargo 検証は別 snapshot を使います。開始時の元 manifest を既存 `toml` で解析し、
+通常・dev・build・target 依存、`[patch]` / `[replace]` の `path`、workspace member と
+使用される workspace 継承依存を再帰的に解決します。候補 manifest を理由にホストから
+追加読取することはありません。`vendor/` 全体をコピーせず、到達した local package
+だけを検証専用とし、Agent の ACP 許可集合・import 集合から除外します。
+通常の workspace member は他の local dependency でなければ編集候補になります。
+
+検証用には各 package の root の安全なテキストファイル、`src/tests/examples/benches/
+assets/resources/i18n` と元 manifest の明示 target path を収集し、編集候補の bytes を
+重ねます。上限は合計64 MiB / 8192ファイル / 128 packages、1ファイル1 MiBです。
+64 MiBは既存256 MiB tmpfsの4分の1に制限し、残りをビルド等に残す予算です。
+これは Agent に共有する容量の増量ではありません。上限を超えた Cargo 入力は拒否し、
+危険・過大な Rust source を省いた状態でテスト成功とは判定しません。
+
+依存 path は workspace 内の通常相対パスに限定し、canonical root・directory FD・
+`O_NOFOLLOW`・hardlink検査を適用します。絶対パス、親 `..`（root内の兄弟参照も含む）、
+秘密/hidden/config path、nested workspace は拒否します。member glob は末尾成分の
+単一 `*`（例 `crates/*`）に対応し、他の glob は明示的に拒否します。
+[Cargo の依存仕様](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html) と
+[workspace 仕様](https://doc.rust-lang.org/cargo/reference/workspaces.html) の限定サブセットです。
+
+非標準 build script の追加入力、除外対象の設定・秘密・binary、image にない registry
+cache / toolchain が必要なら検証は失敗し、ホストへ取り込みません。Zaivern 自身でも
+snapshot の初期化を通常CIで検査しますが、全テストの成功には適切な image と許可対象内の
+ビルド入力が必要です。既存の config/秘密鍵ポリシーを都合よく解除しません。
+検証専用ファイルは秘密領域ではありません。candidate のテストコードが読み、検証出力へ
+書く可能性があるため、同じ秘密除外・出力redactionを適用します。ホスト上の元依存にも
+外部編集がないことを import 前に照合します。
+
+`instruction` は空白だけを除き1〜16384 Unicode code pointsです。別に JSONL の
+MCPフレーム全体（改行・envelope・JSON escapeを含む）に64 KiB上限があります。
+日本語10000文字は通常この範囲に収まりますが、emoji 16384文字は文字数内でも
+フレーム上限を超えます。超過フレームは bounded read で接続を終了します。
 
 ## 実装と既存機構
 
@@ -178,8 +221,8 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   取り込み前に元内容との一致と既存の write lease を確認します。
   複数ファイルの取り込みは transaction ではなく、I/O 失敗時は部分適用の可能性と対象を返します。
   作業中に別の editor / process から同じ workspace を変更しないでください。
-- 1 task / server、記録128件、1 file 1 MiB、snapshot 8 MiB / 1024 files、task 30分。
-  上限超過は拒否します。task store はメモリ上のみで、再起動すると task ID は失効します。
+- 1 task / server、記録128件、1 file 1 MiB、Agent snapshot 8 MiB / 1024 files、task 30分。
+  編集対象を上限内に選択し、検証入力の上限超過は拒否します。task store はメモリ上のみで、再起動すると task ID は失効します。
   diff response は32 KiBまでで、超過時は省略した事実を返します。
 - macOS / Linux のローカル実行だけを提供します。Windows、外部モデルへの安全な gateway、
   interactive approval、汎用 build/test runner、永続 task store は未対応です。
@@ -199,7 +242,11 @@ ZAIVERN_MCP_TEST_IMAGE="$(docker image inspect zaivern-mcp-fixture --format '{{.
 fixture は実際の ACP process として起動し、危険操作の拒否、host FS capability の拒否、
 外部ネットワーク不可、編集、実際の offline Rust test、diff、実行中 cancel を検証します。
 未共有の追加ファイルに依存する候補を、検証成功と判定しない反証も含みます。
-通常の unit tests は Docker / LLM / API キーを必要としません。
+通常CIの snapshot tests は Docker / LLM / API キーを必要とせず、大規模ソース選択、
+local dependency / patch / workspace、候補manifest改変、逸脱・リンク・外部変更を検査します。
+固定fixtureを使った `cargo test --offline` も実行します（ユーザーコードのホスト実行ではありません）。
+Docker E2Eは専用 image を明示して起動する opt-in のままです。検証用 local dependency を
+実コンテナへ配置する経路も、この E2E で確認します。
 
 ## Future Cloud Runner
 

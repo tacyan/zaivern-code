@@ -60,6 +60,7 @@ fn main() {
             assert!(line.contains("\"optionId\":\"allow\""));
             assert!(!std::path::Path::new("/workspace/.git").exists());
             assert!(!std::path::Path::new("/workspace/.env").exists());
+            assert!(!std::path::Path::new("/workspace/vendor").exists());
             assert!(std::net::TcpStream::connect_timeout(
                 &"1.1.1.1:443".parse().unwrap(),
                 std::time::Duration::from_millis(200)

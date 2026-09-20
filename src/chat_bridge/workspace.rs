@@ -1,6 +1,6 @@
 //! A bounded text snapshot, never a host bind mount. Symlinks, hard links,
 //! hidden/configuration directories, credential files and special files are denied.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
@@ -8,6 +8,10 @@ use std::path::{Component, Path, PathBuf};
 pub(super) const FILE_LIMIT: usize = 1024 * 1024;
 pub(super) const SNAPSHOT_LIMIT: usize = 8 * FILE_LIMIT;
 const FILE_COUNT: usize = 1024;
+// A separate verifier budget, never an Agent context increase. At most one
+// quarter of the existing 256 MiB volume; the rest is reserved for build output.
+pub(super) const VERIFICATION_LIMIT: usize = 64 * FILE_LIMIT;
+const VERIFICATION_FILES: usize = 8192;
 
 pub(super) fn validate_root(root: &Path) -> Result<PathBuf, String> {
     if !root.is_absolute() || root.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -23,6 +27,18 @@ pub(super) fn validate_root(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn allowed(path: &Path) -> bool {
+    allowed_verification(path)
+        && !path
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("vendor"))
+}
+
+// Vendor is only reachable through the original Cargo graph, never Agent selection.
+pub(super) fn allowed_verification(path: &Path) -> bool {
+    // Bound metadata/index and Agent path-list memory independently of file bytes.
+    if path.as_os_str().len() > 1024 || path.components().count() > 64 {
+        return false;
+    }
     path.components().all(|c| {
         let Component::Normal(name) = c else {
             return false;
@@ -44,10 +60,7 @@ fn allowed(path: &Path) -> bool {
             && !name.contains(':')
             && !name.contains('\\')
             && !name.chars().any(char::is_control)
-            && !matches!(
-                name.as_str(),
-                "target" | "node_modules" | "vendor" | "config"
-            )
+            && !matches!(name.as_str(), "target" | "node_modules" | "config")
             && !["config.", "id_"].iter().any(|s| name.starts_with(s))
             && ![".pem", ".key", ".p12", ".pfx", ".env"]
                 .iter()
@@ -59,77 +72,268 @@ pub(super) struct Snapshot {
     pub root: PathBuf,
     directory: File,
     pub files: BTreeMap<PathBuf, Vec<u8>>,
+    verification_only: BTreeMap<PathBuf, Vec<u8>>,
+    pub omitted: usize,
+    unsafe_cargo_source: std::cell::Cell<bool>,
 }
 pub(super) struct Applied {
     pub changed: Vec<String>,
     pub error: Option<String>,
 }
 impl Snapshot {
+    #[cfg(all(test, unix))]
     pub fn read(root: &Path) -> Result<Self, String> {
-        let directory = open_root(root)?;
+        Self::read_for_task(root, "")
+    }
+
+    pub fn read_for_task(root: &Path, instruction: &str) -> Result<Self, String> {
         let mut snapshot = Self {
             root: root.to_path_buf(),
-            directory,
+            directory: open_root(root)?,
             files: BTreeMap::new(),
+            verification_only: BTreeMap::new(),
+            omitted: 0,
+            unsafe_cargo_source: std::cell::Cell::new(false),
         };
-        let mut pending = vec![PathBuf::new()];
+        // This closure is frozen before the Agent starts. Candidate manifests
+        // never authorize additional host reads.
+        let graph = super::cargo_graph::discover(&snapshot)?;
+        let dependency_roots: BTreeSet<_> = graph
+            .packages
+            .keys()
+            .filter(|p| !p.as_os_str().is_empty())
+            .cloned()
+            .collect();
+        let mut paths = snapshot.walk(Path::new(""), false, &graph.dependencies)?;
+        let hints: Vec<_> = instruction
+            .split(|c: char| !(c.is_alphanumeric() || "_./-".contains(c)))
+            .filter(|s| !s.is_empty())
+            .collect();
+        paths.sort_by_cached_key(|path| (source_priority(path, &hints), path.clone()));
         let mut bytes = 0;
+        for path in paths {
+            if snapshot.files.len() == FILE_COUNT || bytes == SNAPSHOT_LIMIT {
+                snapshot.omitted += 1;
+                continue;
+            }
+            let Some(content) = snapshot.read_text(&path)? else {
+                snapshot.omitted += 1;
+                continue;
+            };
+            if bytes + content.len() > SNAPSHOT_LIMIT {
+                snapshot.omitted += 1;
+                continue;
+            }
+            bytes += content.len();
+            snapshot.files.insert(path, content);
+        }
+        // Original manifests are authoritative even if source selection would
+        // omit one. Root Cargo.toml is priority zero and cannot be oversized.
+        if let Some(original) = graph.manifests.get(Path::new("Cargo.toml")) {
+            if snapshot.files.get(Path::new("Cargo.toml")) != Some(original) {
+                return Err("root manifest changed during snapshot or cannot be shared".into());
+            }
+        }
+        let mut verification_paths = BTreeSet::new();
+        for (package, manifest) in &graph.packages {
+            verification_paths.extend(super::cargo_graph::inputs(
+                &snapshot,
+                package,
+                manifest,
+                &dependency_roots,
+            )?);
+            if verification_paths.len() > VERIFICATION_FILES {
+                return Err("Cargo verification file limit exceeded".into());
+            }
+        }
+        let mut verification_bytes = bytes;
+        for path in verification_paths {
+            if snapshot.files.contains_key(&path) {
+                continue;
+            }
+            let Some(content) = snapshot.read_text(&path)? else {
+                if path.extension().is_some_and(|e| e == "rs") {
+                    snapshot.unsafe_cargo_source.set(true);
+                }
+                continue;
+            };
+            verification_bytes += content.len();
+            if verification_bytes > VERIFICATION_LIMIT
+                || snapshot.files.len() + snapshot.verification_only.len() >= VERIFICATION_FILES
+            {
+                return Err("Cargo verification snapshot limit exceeded".into());
+            }
+            snapshot.verification_only.insert(path, content);
+        }
+        for (path, original) in graph.manifests {
+            if snapshot
+                .files
+                .get(&path)
+                .or_else(|| snapshot.verification_only.get(&path))
+                != Some(&original)
+            {
+                return Err("Cargo manifest changed during snapshot".into());
+            }
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) fn names(&self, path: &Path) -> Result<Vec<std::ffi::OsString>, String> {
+        let dir = if path.as_os_str().is_empty() {
+            self.directory
+                .try_clone()
+                .map_err(|_| "cannot duplicate workspace handle")?
+        } else {
+            open_relative(&self.directory, path, false)?
+        };
+        directory_names(&dir)
+    }
+
+    pub(super) fn is_file(&self, path: &Path) -> Result<bool, String> {
+        Ok(open_relative(&self.directory, path, false)?
+            .metadata()
+            .map_err(|_| "cannot inspect input")?
+            .is_file())
+    }
+
+    pub(super) fn exists(&self, path: &Path) -> Result<bool, String> {
+        let parent = path.parent().ok_or("invalid input path")?;
+        let name = path.file_name().ok_or("invalid input path")?;
+        Ok(self.names(parent)?.iter().any(|n| n == name))
+    }
+
+    pub(super) fn read_text(&self, path: &Path) -> Result<Option<Vec<u8>>, String> {
+        let mut file = open_relative(&self.directory, path, false)?;
+        if !file
+            .metadata()
+            .map_err(|_| "cannot inspect input")?
+            .is_file()
+        {
+            return Err("expected regular source file".into());
+        }
+        let mut content = Vec::new();
+        Read::by_ref(&mut file)
+            .take((FILE_LIMIT + 1) as u64)
+            .read_to_end(&mut content)
+            .map_err(|_| "cannot read workspace file")?;
+        // Never share an oversized, binary or private-key-bearing file, even
+        // when explicitly named in an instruction or Cargo manifest.
+        if content.len() > FILE_LIMIT
+            || std::str::from_utf8(&content).is_err()
+            || content.contains(&0)
+            || content
+                .windows(b"PRIVATE KEY-----".len())
+                .any(|w| w == b"PRIVATE KEY-----")
+        {
+            return Ok(None);
+        }
+        Ok(Some(content))
+    }
+
+    pub(super) fn walk(
+        &self,
+        start: &Path,
+        verification: bool,
+        excluded: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut pending = vec![start.to_path_buf()];
+        let mut files = Vec::new();
         let mut visited = 0;
         while let Some(rel) = pending.pop() {
-            let directory = if rel.as_os_str().is_empty() {
-                snapshot
-                    .directory
-                    .try_clone()
-                    .map_err(|_| "cannot duplicate workspace handle")?
-            } else {
-                open_relative(&snapshot.directory, &rel, false)?
-            };
-            for name in directory_names(&directory)? {
+            for name in self.names(&rel)? {
                 visited += 1;
                 if visited > 16 * FILE_COUNT {
                     return Err("workspace entry limit exceeded".into());
                 }
-                let path = rel.join(name);
-                if !allowed(&path) {
+                let path = rel.join(&name);
+                let admitted = if verification {
+                    allowed_verification(&path)
+                } else {
+                    allowed(&path)
+                };
+                let vendor = name.eq_ignore_ascii_case("vendor");
+                if !admitted || vendor {
+                    // Cargo discovers integration tests/targets by directory.
+                    // Silently dropping even a forbidden source name could turn
+                    // a failing suite green. Do not open it; reject verification.
+                    if verification
+                        && rel.components().any(|c| {
+                            matches!(
+                                c.as_os_str().to_str(),
+                                Some("src" | "tests" | "examples" | "benches")
+                            )
+                        })
+                    {
+                        self.unsafe_cargo_source.set(true);
+                    }
                     continue;
                 }
-                let mut file = open_relative(&snapshot.directory, &path, false)?;
-                let metadata = file
+                if excluded.contains(&path) {
+                    continue;
+                }
+                let file = open_relative(&self.directory, &path, false)?;
+                let meta = file
                     .metadata()
                     .map_err(|_| "cannot inspect workspace entry")?;
-                if metadata.is_dir() {
+                if meta.is_dir() {
                     pending.push(path);
-                    continue;
-                }
-                if !metadata.is_file() {
+                } else if meta.is_file() {
+                    files.push(path);
+                } else {
                     return Err("special file in shared workspace files".into());
                 }
-                let mut content = Vec::new();
-                Read::by_ref(&mut file)
-                    .take((FILE_LIMIT + 1) as u64)
-                    .read_to_end(&mut content)
-                    .map_err(|_| "cannot read workspace file")?;
-                if content.len() > FILE_LIMIT {
-                    return Err("workspace file exceeds 1 MiB".into());
-                }
-                if std::str::from_utf8(&content).is_err() || content.contains(&0) {
-                    continue;
-                }
-                // The snapshot is source code, not an authentication/configuration channel.
-                if content
-                    .windows(b"PRIVATE KEY-----".len())
-                    .any(|w| w == b"PRIVATE KEY-----")
-                {
-                    return Err("private key material in shared source".into());
-                }
-                bytes += content.len();
-                if bytes > SNAPSHOT_LIMIT || snapshot.files.len() >= FILE_COUNT {
-                    return Err("workspace snapshot limit exceeded".into());
-                }
-                snapshot.files.insert(path, content);
             }
         }
-        Ok(snapshot)
+        Ok(files)
+    }
+
+    pub(super) fn validate_local_directory(&self, path: &Path) -> Result<(), String> {
+        if !path.as_os_str().is_empty() {
+            let file = open_relative(&self.directory, path, false)?;
+            if !file
+                .metadata()
+                .map_err(|_| "cannot inspect local dependency")?
+                .is_dir()
+            {
+                return Err("Cargo local dependency must be a directory".into());
+            }
+        }
+        let canonical = self
+            .root
+            .join(path)
+            .canonicalize()
+            .map_err(|_| "local dependency unavailable")?;
+        if !crate::pathx::plain(canonical).starts_with(&self.root) {
+            return Err("Cargo local dependency escapes workspace".into());
+        }
+        Ok(())
+    }
+
+    pub fn stage_verification(
+        &self,
+        destination: &Path,
+        changes: &BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<(), String> {
+        if self.unsafe_cargo_source.get() {
+            return Err("Cargo source excluded by safety policy; changes were not imported".into());
+        }
+        if changes.len() != self.files.len() || changes.keys().any(|p| !self.files.contains_key(p))
+        {
+            return Err("candidate must contain exactly the shared files".into());
+        }
+        let total: usize = changes
+            .values()
+            .chain(self.verification_only.values())
+            .map(Vec::len)
+            .sum();
+        if total > VERIFICATION_LIMIT || changes.values().any(|b| b.len() > FILE_LIMIT) {
+            return Err("Cargo verification snapshot limit exceeded".into());
+        }
+        self.stage_changes(destination, changes)?;
+        for (path, bytes) in &self.verification_only {
+            stage_file(destination, path, bytes)?;
+        }
+        Ok(())
     }
 
     pub fn stage(&self, destination: &Path) -> Result<(), String> {
@@ -143,10 +347,7 @@ impl Snapshot {
     ) -> Result<(), String> {
         for key in self.files.keys() {
             let bytes = changes.get(key).ok_or("missing shared candidate file")?;
-            let path = destination.join(key);
-            std::fs::create_dir_all(path.parent().ok_or("invalid snapshot path")?)
-                .map_err(|_| "cannot stage snapshot")?;
-            std::fs::write(path, bytes).map_err(|_| "cannot stage snapshot")?;
+            stage_file(destination, key, bytes)?;
         }
         Ok(())
     }
@@ -159,6 +360,14 @@ impl Snapshot {
             || changes.keys().any(|path| !self.files.contains_key(path))
         {
             return Err("candidate must contain exactly the shared files".into());
+        }
+        // Unshared build inputs are part of the verified result too.
+        for (path, before) in &self.verification_only {
+            if self.read_text(path)?.as_ref() != Some(before) {
+                return Err(
+                    "verification input changed while task ran; no results imported".into(),
+                );
+            }
         }
         for (path, after) in changes {
             let before = self.files.get(path).ok_or("unshared output path")?;
@@ -205,12 +414,43 @@ impl Snapshot {
     }
 }
 
+fn stage_file(destination: &Path, relative: &Path, bytes: &[u8]) -> Result<(), String> {
+    let path = destination.join(relative);
+    std::fs::create_dir_all(path.parent().ok_or("invalid snapshot path")?)
+        .map_err(|_| "cannot stage snapshot")?;
+    std::fs::write(path, bytes).map_err(|_| "cannot stage snapshot".into())
+}
+
+fn source_priority(path: &Path, hints: &[&str]) -> u8 {
+    if path == Path::new("Cargo.toml") {
+        return 0;
+    }
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if hints.iter().any(|hint| {
+        let hint = Path::new(hint);
+        hint.components().all(|c| matches!(c, Component::Normal(_)))
+            && (path.starts_with(hint) || hint == Path::new(name))
+    }) {
+        return 1;
+    }
+    if matches!(
+        name,
+        "lib.rs" | "main.rs" | "mod.rs" | "build.rs" | "Cargo.lock" | "README.md"
+    ) {
+        return 2;
+    }
+    if path.extension().is_some_and(|e| e == "rs") {
+        return 3;
+    }
+    4
+}
+
 #[cfg(unix)]
 fn open_relative(root: &File, relative: &Path, write: bool) -> Result<File, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
-    if !allowed(relative) {
+    if !allowed_verification(relative) {
         return Err("file policy denied access".into());
     }
     let parts: Vec<_> = relative.components().collect();
@@ -293,7 +533,7 @@ fn open_root(_: &Path) -> Result<File, String> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn directory_names(directory: &File) -> Result<Vec<std::ffi::OsString>, String> {
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStringExt;
     struct Directory(*mut libc::DIR);
     impl Drop for Directory {
@@ -304,12 +544,20 @@ fn directory_names(directory: &File) -> Result<Vec<std::ffi::OsString>, String> 
             }
         }
     }
-    let fd = directory
-        .try_clone()
-        .map_err(|_| "cannot duplicate directory")?
-        .into_raw_fd();
-    // SAFETY: fd is an owned open directory descriptor. On failure ownership
-    // remains ours; on success closedir owns it.
+    // A dup/try_clone shares the directory cursor with the original handle.
+    // Reopen "." relative to the pinned descriptor for an independent cursor.
+    // SAFETY: the directory descriptor and NUL-terminated name remain valid.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err("cannot reopen workspace directory".into());
+    }
+    // SAFETY: on success closedir owns fd; on failure we close it below.
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         unsafe {

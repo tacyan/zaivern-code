@@ -141,6 +141,40 @@ fn tools() -> Value {
 mod tests {
     use super::*;
     #[test]
+    fn unicode_frame_budget_is_separate_from_character_validation() {
+        for (unit, count, fits) in [
+            ("a", 16384, true),
+            ("あ", 10000, true),
+            ("🦀", 16384, false),
+        ] {
+            let bridge = ChatBridge::new(
+                std::path::PathBuf::from("unused"),
+                std::sync::Arc::new(super::super::task::tests::Fake),
+            );
+            let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":VERSION,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}});
+            let ready = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+            let call = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":unit.repeat(count)}}});
+            let input = format!("{initialize}\n{ready}\n{call}\n");
+            let mut output = Vec::new();
+            let result = serve(std::io::Cursor::new(input), &mut output, &bridge);
+            if fits {
+                result.unwrap();
+                let response: Value = serde_json::from_str(
+                    std::str::from_utf8(&output)
+                        .unwrap()
+                        .lines()
+                        .last()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(response["result"]["isError"], false, "{response}");
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[test]
     fn protocol_envelopes_and_initialization_order() {
         let bridge = ChatBridge::new(
             std::path::PathBuf::from("unused"),

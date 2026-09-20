@@ -45,12 +45,26 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
     std::fs::create_dir_all(workspace.join("src")).unwrap();
     std::fs::write(
         workspace.join("Cargo.toml"),
-        "[package]\nname=\"bridge_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        "[package]\nname=\"bridge_fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nlocal_dep={path=\"vendor/local_dep\"}\npatched=\"0.1.0\"\n[patch.crates-io]\npatched={path=\"vendor/patched\"}\n",
     )
     .unwrap();
+    for name in ["local_dep", "patched"] {
+        let dependency = workspace.join("vendor").join(name);
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2021'\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 4 }\n",
+        )
+        .unwrap();
+    }
     std::fs::write(
         workspace.join("src/lib.rs"),
-        "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
+        "#[test]\nfn arithmetic() { assert_eq!(local_dep::answer(), 4); assert_eq!(patched::answer(), 4); assert_eq!(2 + 2, 5); }\n",
     )
     .unwrap();
     std::fs::write(workspace.join(".env"), "SENTINEL=not-for-agent").unwrap();

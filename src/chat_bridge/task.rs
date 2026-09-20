@@ -171,8 +171,8 @@ impl ChatBridge {
             "zaivern_run_task" => {
                 let args: Run =
                     serde_json::from_value(args).map_err(|_| "invalid run_task arguments")?;
-                if args.instruction.trim().is_empty() || args.instruction.len() > 16384 {
-                    return Err("instruction must be 1..16384 bytes".into());
+                if args.instruction.trim().is_empty() || args.instruction.chars().count() > 16384 {
+                    return Err("instruction must be 1..16384 characters".into());
                 }
                 let mut worker = self.worker.lock().map_err(|_| "worker unavailable")?;
                 if worker.as_ref().is_some_and(|w| !w.join.is_finished()) {
@@ -375,6 +375,36 @@ pub(super) mod tests {
             })
         }
     }
+    #[test]
+    fn instruction_limits_count_unicode_characters() {
+        for (unit, count, accepted) in [
+            ("a", 16384, true),
+            ("a", 16385, false),
+            ("あ", 10000, true),
+            ("あ", 16384, true),
+            ("あ", 16385, false),
+            ("🦀", 16384, true),
+            ("🦀", 16385, false),
+        ] {
+            let bridge = ChatBridge::new(PathBuf::from("unused"), Arc::new(Fake));
+            let result = bridge.call(
+                "zaivern_run_task",
+                json!({"instruction":unit.repeat(count)}),
+            );
+            assert_eq!(result.is_ok(), accepted, "{unit} × {count}: {result:?}");
+            if !accepted {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "instruction must be 1..16384 characters"
+                );
+            }
+        }
+        let bridge = ChatBridge::new(PathBuf::from("unused"), Arc::new(Fake));
+        assert!(bridge
+            .call("zaivern_run_task", json!({"instruction":"　 \n"}))
+            .is_err());
+    }
+
     #[test]
     fn run_without_workspace_uses_only_server_root() {
         struct Recording(Arc<Mutex<Option<PathBuf>>>);

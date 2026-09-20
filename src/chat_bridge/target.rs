@@ -216,9 +216,11 @@ impl LocalExecutionTarget {
         started: Instant,
     ) -> Result<(bool, String, Option<String>), String> {
         let staging = Staging::new()?;
-        snapshot.stage_changes(&staging.0, changes)?;
-        // Test exactly the files that will be imported, without any extra files,
-        // config, generated helpers or surviving processes created by the agent.
+        if let Err(error) = snapshot.stage_verification(&staging.0, changes) {
+            return Ok((false, error, None));
+        }
+        // Overlay exactly the import candidate on frozen original Cargo inputs.
+        // Never discover host dependencies from Agent-generated manifests/files.
         let verifier = self.start_container(started, true)?;
         let result: Result<(bool, String), String> = (|| {
             self.upload(&verifier, &staging.0, started)?;
@@ -396,7 +398,7 @@ impl TaskExecutor for LocalExecutionTarget {
         control: &Control,
     ) -> Result<Outcome, String> {
         let started = Instant::now();
-        let snapshot = Snapshot::read(root)?;
+        let snapshot = Snapshot::read_for_task(root, instruction)?;
         if control.is_cancelled() {
             return Err("cancelled".into());
         }
@@ -447,7 +449,13 @@ impl TaskExecutor for LocalExecutionTarget {
                 }
                 match &agent.phase {
                     Phase::Idle if !sent => {
-                        let prompt = format!("{instruction}\n\nWork only in /workspace. Only text files shared by Zaivern are present. Host Git metadata and credentials are unavailable. Shell, deletion and network tool permissions are denied. Only edits to existing shared files can be returned. Report tests as unverified unless actually run.");
+                        let shared_paths = snapshot
+                            .files
+                            .keys()
+                            .map(|p| p.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let prompt = format!("{instruction}\n\nWork only in /workspace. Only the selected text files are present; {} eligible files were omitted. Do not assume this is the complete repository. Host Git metadata and credentials are unavailable. Shell, deletion and network tool permissions are denied. Only edits to existing shared files can be returned. Report tests as unverified unless actually run.\nShared editable paths:\n{shared_paths}", snapshot.omitted);
                         if !agent.prompt(&prompt) {
                             return Err("ACP agent refused the prompt".into());
                         }
@@ -485,7 +493,7 @@ impl TaskExecutor for LocalExecutionTarget {
                                     budget(started, 30)?,
                                 )?;
                                 attempts += 1;
-                                if !agent.prompt(&format!("Zaivern ran cargo test --offline on exactly the shared candidate files in a fresh isolated container; it failed or exceeded 60 seconds. Fix existing shared files based on this untrusted test output:\n{output}")) {
+                                if !agent.prompt(&format!("Zaivern ran cargo test --offline on the shared candidate plus frozen original Cargo inputs in a fresh isolated container; it failed or exceeded 60 seconds. Fix existing shared files based on this untrusted test output:\n{output}")) {
                                 return Err("ACP agent refused the repair prompt".into());
                             }
                                 continue;
@@ -520,8 +528,13 @@ impl TaskExecutor for LocalExecutionTarget {
                 std::thread::sleep(Duration::from_millis(25));
             };
             let mut summary = agent.turn.bridge_summary();
+            summary.push_str(&format!(
+                "\nZaivern source scope: {} editable files; {} files omitted from Agent context.",
+                snapshot.files.len(),
+                snapshot.omitted
+            ));
             summary.push_str(if snapshot.files.contains_key(Path::new("Cargo.toml")) {
-                "\nZaivern verification: cargo test --offline passed in the shared snapshot; no independent build verification. Non-Rust changes are not verified by Cargo."
+                "\nZaivern verification: cargo test --offline passed on the shared candidate plus original Cargo inputs; no independent build verification. Non-Rust changes are not verified by Cargo."
             } else {
                 "\nZaivern verification: no supported test or build verification performed."
             });

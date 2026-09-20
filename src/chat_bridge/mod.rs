@@ -1,7 +1,10 @@
 //! MCP transport is independent of task storage and execution.
+mod cargo_graph;
 #[cfg(test)]
 mod e2e_tests;
 mod protocol;
+#[cfg(all(test, unix))]
+mod snapshot_tests;
 mod target;
 mod task;
 mod workspace;
