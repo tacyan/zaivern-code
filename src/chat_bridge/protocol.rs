@@ -136,6 +136,7 @@ mod tests {
     fn startup_initialize_list_and_validation() {
         let root = crate::test_util::unique_temp_dir("bridge", "protocol");
         std::fs::create_dir_all(&root).unwrap();
+        let root = super::super::workspace::validate_root(&root).unwrap();
         let bridge = ChatBridge::new(
             root.clone(),
             std::sync::Arc::new(super::super::task::tests::Fake),
@@ -146,6 +147,9 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"","workspace":root}}}),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"zaivern_task_status","arguments":{"task_id":"unknown"}}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":[]}),
+            json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"unknown"}}),
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"passed","workspace":root}}}),
         ];
         let input = requests
             .iter()
@@ -159,11 +163,26 @@ mod tests {
             .lines()
             .map(|s| serde_json::from_str(s).unwrap())
             .collect();
-        assert_eq!(results.len(), 4);
+        assert_eq!(results.len(), 7);
         assert_eq!(results[0]["result"]["protocolVersion"], VERSION);
         assert_eq!(results[1]["result"]["tools"].as_array().unwrap().len(), 3);
         assert_eq!(results[2]["result"]["isError"], true);
         assert_eq!(results[3]["result"]["isError"], true);
+        assert_eq!(results[4]["error"]["code"], -32602);
+        assert_eq!(results[5]["error"]["code"], -32602);
+        assert_eq!(results[6]["result"]["isError"], false);
+        let task: Value =
+            serde_json::from_str(results[6]["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert!(task["task_id"].as_str().is_some_and(|id| !id.is_empty()));
+        let error = serve(
+            io::Cursor::new(vec![b'x'; MAX_LINE + 1]),
+            Vec::new(),
+            &bridge,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(bridge);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

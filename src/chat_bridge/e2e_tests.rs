@@ -175,14 +175,15 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             let status: Value =
                 serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
-            assert_ne!(status["state"], "failed", "{status}");
+            if status["state"] == "failed" {
+                assert_eq!(instruction, "UNSHARED_HELPER", "{status}");
+                assert_eq!(status["test_status"], "failed", "{status}");
+                assert!(!workspace.join("src/generated.rs").exists());
+                break;
+            }
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
-                if instruction == "UNSHARED_HELPER" {
-                    assert_eq!(status["test_status"], "failed", "{status}");
-                    assert!(!workspace.join("src/generated.rs").exists());
-                    break;
-                }
+                assert_ne!(instruction, "UNSHARED_HELPER", "{status}");
                 assert_eq!(status["test_status"], "passed", "{status}");
                 assert_eq!(status["changed_files"], json!(["src/lib.rs"]));
                 assert!(status["diff_summary"]

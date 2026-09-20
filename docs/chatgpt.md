@@ -45,7 +45,16 @@ stdio のこの MVP は、利用可能なアカウントで公式 Tunnel を使�
 Platform の Tunnel 設定から tunnel ID と runtime key を用意し、公式クライアントを導入します。
 以下の command は適切に shell quote した絶対パスへ置き換えてください。
 
+実際のキーをコマンド文字列や repository / shell history に保存しないでください。
+以下は bash / zsh の端末で入力を非表示にして環境変数へ設定する例です。
+（`set -x` 等のシェルトレースは無効にしてください。）
+
 ```sh
+printf 'Tunnel runtime API key: '
+read -rs CONTROL_PLANE_API_KEY
+printf '\n'
+export CONTROL_PLANE_API_KEY
+
 tunnel-client init \
   --sample sample_mcp_stdio_local \
   --profile zaivern \
@@ -78,7 +87,11 @@ HTTPS server / OAuth server はこの PR に追加していません。
 
 run は worker を起動して直ちに返ります。status は terminal state になるまでポーリングします。
 cancel の応答は停止完了ではありません。`cancelled` または他の terminal state を確認してください。
-結果の取り込みが既に始まっていた場合は `completed` になることがあります。既存編集の巻き戻しはしません。
+結果の取り込みが既に始まっていた場合は `completed` または `failed` になることがあります。既存編集の巻き戻しはしません。
+Zaivern の検証が失敗した場合は `test_status=failed` と `state=failed` を返します。
+対象外の検証は `not_verified` とし、それだけでは task を失敗にしません。
+差分は既存の秘匿処理を通した変更範囲と前後3行で、200行を超える置換範囲は省略します。
+差分応答全体が秘匿処理後に32 KiBを超える場合は、ローカル確認を求めるメッセージを返します。
 
 例:
 

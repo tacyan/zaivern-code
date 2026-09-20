@@ -498,38 +498,10 @@ impl TaskExecutor for LocalExecutionTarget {
             budget(started, 1)?;
             let applied = snapshot.apply(&changes)?;
             let changed_files = applied.changed;
-            let diff_summary = changed_files
-                .iter()
-                .map(|path| {
-                    let path = Path::new(path);
-                    let before = String::from_utf8_lossy(&snapshot.files[path]);
-                    let after = String::from_utf8_lossy(&changes[path]);
-                    // A complete replacement hunk is intentionally simple and honest.
-                    // This does not execute Git config, external diff or textconv.
-                    format!(
-                        "--- a/{}\n+++ b/{}\n@@ -1,{} +1,{} @@\n{}{}",
-                        path.display(),
-                        path.display(),
-                        before.lines().count(),
-                        after.lines().count(),
-                        before
-                            .lines()
-                            .map(|line| format!("-{line}\n"))
-                            .collect::<String>(),
-                        after
-                            .lines()
-                            .map(|line| format!("+{line}\n"))
-                            .collect::<String>()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
             let diff_summary = if applied.error.is_some() {
                 "Import partially failed; inspect changed_files locally for actual bytes.".into()
-            } else if diff_summary.len() <= 32 * 1024 {
-                diff_summary
             } else {
-                "Diff exceeds response limit; inspect changed_files locally.".into()
+                diff_summary(&changed_files, &snapshot.files, &changes)
             };
             Ok(Outcome {
                 error: applied.error,
@@ -548,6 +520,74 @@ impl TaskExecutor for LocalExecutionTarget {
             (Err(_), Err(error)) => Err(error),
             (result, Ok(())) => result,
         }
+    }
+}
+
+/// One replacement hunk per file, with three context lines. Linear in snapshot
+/// size, without executing Git configuration, external diff or textconv.
+/// Large replacement spans are explicitly omitted rather than returning full files.
+fn diff_summary(
+    paths: &[String],
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+) -> String {
+    use crate::features::cloud_execution::redact::redact;
+    let mut diff = String::new();
+    for path in paths {
+        let key = Path::new(path);
+        // Redact complete documents before slicing, so a PEM block cannot lose
+        // its BEGIN marker at a context boundary. Redact the final response too.
+        let old = redact(&String::from_utf8_lossy(&before[key]));
+        let new = redact(&String::from_utf8_lossy(&after[key]));
+        let old: Vec<_> = old.split_inclusive('\n').collect();
+        let new: Vec<_> = new.split_inclusive('\n').collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        diff.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+        if prefix == old.len() && prefix == new.len() {
+            diff.push_str("[Change hidden by redaction]\n");
+            continue;
+        }
+        let start = prefix.saturating_sub(3);
+        let old_end = old.len() - suffix;
+        let new_end = new.len() - suffix;
+        let context = suffix.min(3);
+        if old_end - start + new_end - start + 2 * context > 200 {
+            diff.push_str("[Replacement span exceeds 200 lines; inspect this file locally]\n");
+            continue;
+        }
+        diff.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            if old.is_empty() { 0 } else { start + 1 },
+            old_end + context - start,
+            if new.is_empty() { 0 } else { start + 1 },
+            new_end + context - start
+        ));
+        for (mark, lines) in [
+            (' ', &old[start..prefix]),
+            ('-', &old[prefix..old_end]),
+            ('+', &new[prefix..new_end]),
+            (' ', &old[old_end..old_end + context]),
+        ] {
+            for line in lines {
+                diff.push(mark);
+                diff.push_str(line);
+                if !line.ends_with('\n') {
+                    diff.push_str("\n\\ No newline at end of file\n");
+                }
+            }
+        }
+    }
+    let diff = redact(&diff);
+    if diff.len() <= 32 * 1024 {
+        diff
+    } else {
+        "Diff exceeds response limit; inspect changed_files locally.".into()
     }
 }
 
@@ -573,6 +613,59 @@ fn regular_tar_payload(tar: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn summarize(before: &str, after: &str) -> String {
+        diff_summary(
+            &["src/lib.rs".into()],
+            &BTreeMap::from([(PathBuf::from("src/lib.rs"), before.as_bytes().to_vec())]),
+            &BTreeMap::from([(PathBuf::from("src/lib.rs"), after.as_bytes().to_vec())]),
+        )
+    }
+    #[test]
+    fn diff_redacts_unchanged_context_and_keeps_the_edit() {
+        let before = "const API_KEY: &str = \"fixture-rust-secret\";\n// token = fixture-spaced-secret\n// {\"token\":\"fixture-json-secret\"}\nfn answer() { wrong(); }\n// api_key=fixture-private-api-value\n// token=fixture-private-token-value\n";
+        let diff = summarize(before, &before.replace("wrong()", "correct()"));
+        assert!(!diff.contains("fixture-private-api-value"), "{diff}");
+        assert!(!diff.contains("fixture-private-token-value"), "{diff}");
+        assert!(!diff.contains("fixture-rust-secret"), "{diff}");
+        assert!(!diff.contains("fixture-spaced-secret"), "{diff}");
+        assert!(!diff.contains("fixture-json-secret"), "{diff}");
+        assert!(diff.contains("api_key=***"), "{diff}");
+        assert!(diff.contains("-fn answer() { wrong(); }"), "{diff}");
+        assert!(diff.contains("+fn answer() { correct(); }"), "{diff}");
+    }
+    #[test]
+    fn diff_bounds_context_and_redacts_before_response_limit() {
+        let before = format!(
+            "{}old\n{}",
+            "unrelated\n".repeat(1000),
+            "tail\n".repeat(1000)
+        );
+        let diff = summarize(&before, &before.replace("old\n", "new\n"));
+        assert_eq!(diff.matches(" unrelated\n").count(), 3);
+        assert_eq!(diff.matches(" tail\n").count(), 3);
+        assert!(diff.contains("-old\n+new\n"));
+        let diff = summarize(
+            "old\n",
+            &format!("api_key={}\nnew\n", "x".repeat(40 * 1024)),
+        );
+        assert!(diff.contains("+api_key=***\n+new\n"), "{diff}");
+        assert!(!diff.contains("response limit"));
+        assert!(summarize("old\n", &"x".repeat(40 * 1024)).contains("response limit"));
+        assert!(summarize(&"old\n".repeat(201), "new\n").contains("exceeds 200 lines"));
+    }
+    #[test]
+    fn diff_handles_empty_files_newlines_and_private_key_boundaries() {
+        assert!(summarize("", "new\n").contains("@@ -0,0 +1,1 @@\n+new\n"));
+        assert!(summarize("old\n", "").contains("@@ -1,1 +0,0 @@\n-old\n"));
+        assert!(summarize("same", "same\n").contains("No newline at end of file"));
+        let before = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}-----END RSA PRIVATE KEY-----\nold\n",
+            "private-key-body\n".repeat(10)
+        );
+        let diff = summarize(&before, &before.replace("old\n", "new\n"));
+        assert!(!diff.contains("private-key-body"));
+        assert!(diff.contains("-old\n+new\n"));
+    }
     #[test]
     fn immutable_image_and_non_regular_outputs() {
         assert!(!valid_image("agent:latest"));

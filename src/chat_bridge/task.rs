@@ -205,7 +205,10 @@ impl ChatBridge {
                                 started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             match result {
                                 Ok(Ok(outcome)) => {
-                                    status.state = if outcome.error.is_some() {
+                                    status.state = if outcome.error.is_some()
+                                        || outcome.test_status == "failed"
+                                        || outcome.build_status == "failed"
+                                    {
                                         State::Failed
                                     } else {
                                         State::Completed
@@ -311,13 +314,32 @@ pub(super) mod tests {
                 }
                 return Err("cancelled".into());
             }
+            if instruction == "executor_error" {
+                return Err("executor failed".into());
+            }
+            if instruction == "failed_after_cancel" {
+                control.state(State::Running, "verification running");
+                while !control.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             Ok(Outcome {
-                error: None,
+                error: (instruction == "import_error").then(|| "import failed".into()),
                 summary: "mock".into(),
                 changed_files: vec![],
                 diff_summary: String::new(),
-                test_status: "not_verified".into(),
-                build_status: "not_verified".into(),
+                test_status: match instruction {
+                    "passed" => "passed",
+                    "failed" | "failed_after_cancel" => "failed",
+                    _ => "not_verified",
+                }
+                .into(),
+                build_status: if instruction == "build_failed" {
+                    "failed"
+                } else {
+                    "not_verified"
+                }
+                .into(),
             })
         }
     }
@@ -327,25 +349,49 @@ pub(super) mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let root = workspace::validate_root(&root).unwrap();
         let bridge = ChatBridge::new(root.clone(), Arc::new(Fake));
-        for (instruction, terminal) in [("finish", "completed"), ("wait", "cancelled")] {
+        for (instruction, terminal) in [
+            ("finish", "completed"),
+            ("passed", "completed"),
+            ("failed", "failed"),
+            ("failed_after_cancel", "failed"),
+            ("build_failed", "failed"),
+            ("executor_error", "failed"),
+            ("import_error", "failed"),
+            ("wait", "cancelled"),
+        ] {
             let id = bridge
                 .call(
                     "zaivern_run_task",
                     json!({"instruction":instruction,"workspace":root}),
                 )
                 .unwrap();
-            if instruction == "wait" {
+            if instruction == "wait" || instruction == "failed_after_cancel" {
+                let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                while bridge.call("zaivern_task_status", id.clone()).unwrap()["state"] == "queued" {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 bridge.call("zaivern_cancel_task", id.clone()).unwrap();
             }
             let deadline = Instant::now() + std::time::Duration::from_secs(2);
             loop {
                 let status = bridge.call("zaivern_task_status", id.clone()).unwrap();
                 if status["state"] == terminal {
+                    let cancelled = bridge.call("zaivern_cancel_task", id.clone()).unwrap();
+                    assert_eq!(cancelled["state"], terminal);
+                    assert_eq!(
+                        bridge.call("zaivern_task_status", id.clone()).unwrap()["state"],
+                        terminal
+                    );
                     break;
                 }
                 assert!(Instant::now() < deadline, "{status}");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
+            // Terminal status is stored just before the worker returns. Join
+            // here so the next case does not race the single-worker admission.
+            let worker = bridge.worker.lock().unwrap().take().unwrap();
+            worker.join.join().unwrap();
         }
         drop(bridge);
         std::fs::remove_dir_all(root).unwrap();

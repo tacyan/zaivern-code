@@ -31,7 +31,16 @@ fn allowed(path: &Path) -> bool {
             return false;
         };
         let name = name.to_ascii_lowercase();
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((&name, ""));
+        let sensitive = matches!(
+            stem,
+            "credential" | "credentials" | "secret" | "secrets" | "token" | "tokens"
+        ) && matches!(
+            extension,
+            "" | "json" | "yaml" | "yml" | "toml" | "ini" | "txt"
+        );
         !name.starts_with('.')
+            && !sensitive
             && !name.contains(':')
             && !name.contains('\\')
             && !name.chars().any(char::is_control)
@@ -39,9 +48,7 @@ fn allowed(path: &Path) -> bool {
                 name.as_str(),
                 "target" | "node_modules" | "vendor" | "config"
             )
-            && !["config.", "id_", "credential", "secret", "token"]
-                .iter()
-                .any(|s| name.starts_with(s))
+            && !["config.", "id_"].iter().any(|s| name.starts_with(s))
             && ![".pem", ".key", ".p12", ".pfx", ".env"]
                 .iter()
                 .any(|s| name.ends_with(s))
@@ -350,6 +357,23 @@ mod tests {
             "../x",
             ".git/config",
             ".env",
+            ".env.local",
+            "private.key",
+            "credentials.json",
+            "token.json",
+            "tokens.json",
+            "secret.json",
+            "secrets.json",
+            "credentials",
+            "credentials.yaml",
+            "credentials.toml",
+            "secrets.yml",
+            "token.txt",
+            "secret.ini",
+            "id_rsa",
+            "id_ed25519",
+            "private.p12",
+            "private.pfx",
             ".ssh/id_rsa",
             "secret.pem",
             "a/../../x",
@@ -359,6 +383,29 @@ mod tests {
             assert!(!allowed(Path::new(path)), "{path}");
         }
         assert!(allowed(Path::new("src/main.rs")));
+        for path in [
+            "src/tokenizer.rs",
+            "src/tokens.rs",
+            "src/secretary.rs",
+            "src/credential_manager.rs",
+        ] {
+            assert!(allowed(Path::new(path)), "{path}");
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_includes_tokenizer_but_not_credentials() {
+        let root = crate::test_util::unique_temp_dir("bridge", "tokenizer");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let root = validate_root(&root).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "mod tokenizer;\n").unwrap();
+        std::fs::write(root.join("src/tokenizer.rs"), "pub fn tokenize() {}\n").unwrap();
+        std::fs::write(root.join("credentials.json"), "private fixture").unwrap();
+        let snapshot = Snapshot::read(&root).unwrap();
+        assert_eq!(snapshot.files.len(), 2);
+        assert!(snapshot.files.contains_key(Path::new("src/tokenizer.rs")));
+        assert!(!snapshot.files.contains_key(Path::new("credentials.json")));
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(unix)]
     #[test]
