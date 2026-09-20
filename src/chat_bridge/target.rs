@@ -407,6 +407,13 @@ struct Container<'a> {
     volume: Rc<Volume<'a>>,
 }
 impl Container<'_> {
+    /// All container/volume cleanup must succeed before publishing host edits.
+    /// The caller still owns the cancellation/import gate inside this closure.
+    fn after_cleanup<T>(&self, publish: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        self.shutdown()?;
+        publish()
+    }
+
     fn shutdown(&self) -> Result<(), String> {
         if !self.removed.get() {
             self.target
@@ -673,7 +680,8 @@ impl TaskExecutor for LocalExecutionTarget {
                 return Err("cancelled".into());
             }
             budget(started, 1)?;
-            let applied = control.import(|| snapshot.apply(&changes))?;
+            let applied =
+                container.after_cleanup(|| control.import(|| snapshot.apply(&changes)))?;
             let changed_files = applied.changed;
             let diff_summary = if applied.error.is_some() {
                 "Import partially failed; inspect changed_files locally for actual bytes.".into()
@@ -851,6 +859,68 @@ exit 1
         assert!(error.contains("container cleanup unconfirmed"), "{error}");
         assert!(error.contains(&created), "{error}");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_cleanup_failure_prevents_host_import() {
+        use std::os::unix::fs::PermissionsExt;
+        for failure in ["container", "volume"] {
+            let root = crate::test_util::unique_temp_dir("bridge", "import-cleanup");
+            std::fs::create_dir_all(&root).unwrap();
+            let docker = root.join("docker-fixture");
+            std::fs::write(
+                &docker,
+                format!(
+                    "#!/bin/sh\nshift 2\ncase \"$1\" in\nrm) {} ;;\nvolume) {} ;;\nesac\nexit 1\n",
+                    if failure == "container" {
+                        "exit 19"
+                    } else {
+                        "exit 0"
+                    },
+                    if failure == "volume" {
+                        "exit 19"
+                    } else {
+                        "exit 0"
+                    },
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let workspace = root.join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            std::fs::write(workspace.join("file.rs"), "before").unwrap();
+            let snapshot =
+                Snapshot::read_for_task(&workspace.canonicalize().unwrap(), "edit file.rs")
+                    .unwrap();
+            let target = LocalExecutionTarget {
+                image: "fixture".into(),
+                docker,
+                endpoint: "fixture".into(),
+            };
+            let container = Container {
+                target: &target,
+                id: "zaivern-mcp-fixture".into(),
+                removed: std::cell::Cell::new(false),
+                volume: Rc::new(Volume {
+                    target: &target,
+                    name: "zaivern-mcp-fixture-volume".into(),
+                    removed: std::cell::Cell::new(false),
+                }),
+            };
+            let changes = BTreeMap::from([(PathBuf::from("file.rs"), b"after".to_vec())]);
+            let error = container
+                .after_cleanup(|| snapshot.apply(&changes))
+                .err()
+                .expect("cleanup must block import");
+            assert!(error.contains("cleanup unconfirmed"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("file.rs")).unwrap(),
+                "before"
+            );
+            drop(container);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -177,7 +177,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --bin zai
-          docker build -f tools/mcp-fixture.Dockerfile -t zaivern-mcp-fixture:test tools
+          docker pull rust:1-bookworm
+          docker build --network=none -f tools/mcp-fixture.Dockerfile -t zaivern-mcp-fixture:test tools
           ZAIVERN_MCP_TEST_IMAGE="$(docker image inspect zaivern-mcp-fixture:test --format '{{.Id}}')"
           [[ "$ZAIVERN_MCP_TEST_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]
           export ZAIVERN_MCP_TEST_IMAGE

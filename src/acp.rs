@@ -809,10 +809,13 @@ pub fn pick_option(options: &[PermissionOption], allow: bool) -> Option<&Permiss
         .find_map(|want| options.iter().find(|o| o.kind == *want))
 }
 
-/// Qwen ACP's concrete tool contract, not UI title/ToolKind alone. Metadata is
-/// still peer-supplied: Docker and snapshot import enforce the host boundary.
-/// Unsupported tools/argument versions fail closed; no shell or directory-wide
-/// operation can be approved through this bridge permission adapter.
+/// Deliberately restricted Qwen ACP contract, not UI title/ToolKind alone.
+/// Audited against Qwen 878a32f (Session.ts and core tools). Grep's optional
+/// path is a search working DIRECTORY, not a single-file search contract.
+/// Deny grep entirely rather than approve an unsupported file-scoped request.
+/// Edit's UI-only modified_by_user/ai_proposed_content are unsupported too.
+/// Metadata is peer-supplied; Docker/snapshot import enforce the host boundary.
+/// Unknown tools/argument versions fail closed; no shell/directory operations.
 fn isolated_permission_allowed(call: &ToolCallPatch, shared: &HashSet<String>) -> bool {
     let (Patch::Set(kind), Patch::Set(Value::Object(input))) = (&call.kind, &call.raw_input) else {
         return false;
@@ -831,7 +834,6 @@ fn isolated_permission_allowed(call: &ToolCallPatch, shared: &HashSet<String>) -
             "file_path",
             &["file_path", "old_string", "new_string", "replace_all"],
         ),
-        "grep_search" => (ToolKind::Search, "path", &["path", "pattern", "limit"]),
         _ => return false,
     };
     let Some(path) = input.get(path_key).and_then(Value::as_str) else {
@@ -862,10 +864,6 @@ fn isolated_permission_allowed(call: &ToolCallPatch, shared: &HashSet<String>) -
                 .is_some_and(|old| !old.is_empty())
                 && input.get("new_string").is_some_and(Value::is_string)
                 && input.get("replace_all").is_none_or(Value::is_boolean)
-        }
-        "grep_search" => {
-            input.get("pattern").is_some_and(Value::is_string)
-                && input.get("limit").is_none_or(Value::is_u64)
         }
         _ => false,
     }
@@ -5233,15 +5231,10 @@ rl.on("line", (line) => {
                 "edit",
                 json!({"file_path":"/workspace/src/lib.rs","old_string":"old","new_string":"new"}),
             ),
-            (
-                "grep_search",
-                "search",
-                json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer"}),
-            ),
         ];
         for (name, kind, input) in valid {
             let base = json!({"sessionId":"s1","toolCall":{"toolCallId":"invocation-1","title":"display only","kind":kind,"_meta":{"toolName":name},"rawInput":input,"locations":[{"path":"/workspace/src/lib.rs"}]},"options":[{"optionId":"once","kind":"allow_once"},{"optionId":"always","kind":"allow_always"},{"optionId":"deny","kind":"reject_once"}]});
-            for variant in 0..11 {
+            for variant in 0..20 {
                 let mut request = base.clone();
                 match variant {
                     0 => {}
@@ -5256,14 +5249,25 @@ rl.on("line", (line) => {
                         .unwrap()
                         .retain(|option| option["optionId"] != "once"),
                     8 => {
-                        request["toolCall"]["rawInput"][if name == "grep_search" {
-                            "path"
-                        } else {
-                            "file_path"
-                        }] = json!("/workspace/src/../src/lib.rs")
+                        request["toolCall"]["rawInput"]["file_path"] =
+                            json!("/workspace/src/../src/lib.rs")
                     }
                     9 => request["toolCall"]["kind"] = json!("unknown"),
                     10 => request["toolCall"]["_meta"]["toolName"] = json!("unknown"),
+                    11 => request["toolCall"]["rawInput"] = json!("malformed"),
+                    12 => request["toolCall"]["rawInput"] = Value::Null,
+                    13 => request["toolCall"]["rawInput"]["future_argument"] = json!(true),
+                    14 => request["toolCall"]["_meta"]["toolName"] = json!("shell"),
+                    15 => request["toolCall"]["_meta"]["toolName"] = json!("delete"),
+                    16 => request["toolCall"]["_meta"]["toolName"] = json!("move"),
+                    17 => request["toolCall"]["_meta"]["toolName"] = json!("fetch"),
+                    18 | 19 => {
+                        request["toolCall"]["rawInput"]["file_path"] = json!(if variant == 18 {
+                            "/etc/passwd"
+                        } else {
+                            "/workspace/src/unshared.rs"
+                        });
+                    }
                     _ => unreachable!(),
                 }
                 client.on_permission(
@@ -5283,6 +5287,41 @@ rl.on("line", (line) => {
         }
         if root.exists() {
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn isolated_qwen_directory_search_contract_is_explicitly_denied() {
+        let shared = HashSet::from(["/workspace/src/lib.rs".into()]);
+        // Qwen supplies [] for grep locations. Even a shared file path cannot
+        // turn its directory-based implementation into a supported operation.
+        for input in [
+            json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer"}),
+            json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","limit":10}),
+        ] {
+            let call: ToolCallPatch = serde_json::from_value(json!({
+                "toolCallId":"grep-1", "kind":"search", "_meta":{"toolName":"grep_search"},
+                "rawInput":input, "locations":[]
+            }))
+            .unwrap();
+            assert!(!isolated_permission_allowed(&call, &shared));
+            for invalid in [
+                json!({"pattern":"tokenizer"}),
+                json!({"path":"/workspace","pattern":"tokenizer"}),
+                json!({"path":"/workspace/src","pattern":"tokenizer"}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","glob":"*.rs"}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"tokenizer","future":true}),
+                json!({"path":"/workspace/src/lib.rs","pattern":1}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"x","limit":-1}),
+                json!({"path":"/workspace/src/lib.rs","pattern":"x","limit":"10"}),
+            ] {
+                let mut rejected = call.clone();
+                rejected.raw_input = Patch::Set(invalid.clone());
+                assert!(
+                    !isolated_permission_allowed(&rejected, &shared),
+                    "{invalid}"
+                );
+            }
         }
     }
 

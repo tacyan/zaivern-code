@@ -75,6 +75,46 @@ Work でしか利用できないアカウントでは、今回の通常 Chat の
 HTTPS server / OAuth server はこの PR に追加していません。
 独自の認証なし HTTP wrapper を公開する手順も提供しません。
 
+## Manual acceptance checklist
+
+**Manual acceptance: NOT YET VERIFIED** — 自動CIはstdio → Docker fixture ACPまでです。
+実ChatGPTアカウント・Secure MCP Tunnel・実Qwen/モデルでの成功は未確認です。
+隔離した試験用workspaceとバックアップを用意し、次を実アカウントで記録してください。
+
+1. 上記手順でSecure MCP Tunnelを起動し、doctorの結果を確認する。
+2. 利用可能なChatGPT Developer modeでconnectorを追加する。
+3. 新しい**通常Chat conversation**を開き、connectorを選択する。
+4. `zaivern_run_task`、`zaivern_task_status`、`zaivern_cancel_task`の3つが表示されることを確認する。
+5. 「ファイルを変更せず構成を説明して」と依頼する。これは指示でありread-only capabilityではないため、前後のhost bytesも比較する。
+6. runの`task_id`を記録し、statusをpollして`completed`を確認する。
+7. 共有される既存ファイル1つだけの小さな修正を依頼する。
+8. terminal statusの`changed_files`がその1ファイルであること、`diff_summary`とhost実ファイルの変更が一致することを確認する。
+9. Cargo workspaceでは`test_status`を確認する。下記のcoverage条件外は`not_verified`、Cargo失敗は`failed`でimportゼロが正しい。
+10. 長時間taskを開始してcancelし、statusをpollしてterminal stateを確認する。
+11. import開始前にcancelが受理された場合、host bytesが不変であることを確認する。開始後は巻き戻されない。
+12. tool argumentsへ`workspace`を追加すると拒否され、別workspaceへアクセスできないことを確認する。
+13. unknown tool、無効な`task_id`、不正引数が適切にエラーになることを確認する。ChatGPTが不正呼出しを生成できない場合は同じ接続のprotocol clientで確認し、実施手段を記録する。
+
+### Manual acceptance record
+
+- Date:
+- Zaivern commit:
+- ChatGPT plan/workspace:
+- 通常Chatで利用可能か（Workのみなら不合格）:
+- Tunnel client version:
+- Qwen Code version / image ID:
+- Docker version:
+- OS:
+- Result:
+  - tools visible:
+  - run_task / task_id:
+  - status / terminal state:
+  - edit/import / host bytes:
+  - diff / test_status:
+  - cancel / host bytes:
+  - invalid arguments / unknown tool / task_id:
+- 未実施項目・失敗内容・再現手順:
+
 ## Tools と例
 
 公開する tool は3つだけです。shell、ファイル単位の読み書き、任意 Git コマンドは公開しません。
@@ -224,7 +264,7 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   コンテナ全体をpauseして結果を取得します。verifier は準備コンテナ削除後、入力 volume を
   read-only で mount します。Cargo.lock / manifest / ソース / 検証専用入力を変更・削除・追加できません。
   ビルド生成物は別の空の `/target` tmpfs（256 MiB）へ置きます。volume は最後のコンテナ終了後に削除し、
-  準備コンテナ・verifier・volume の cleanup 失敗はいずれも import を禁止します。
+  Agent・準備コンテナ・verifier・volume の cleanup 失敗はいずれも import を禁止します。
   Docker daemon、OS、指定した image は信頼する基盤です。
 - import前に、保持中のroot FDと現在のworkspace pathの `dev + ino` を照合します。
   pathは全成分を `O_NOFOLLOW` で開き直し、rename/recreate・symlink差し替え・消失を
@@ -232,10 +272,22 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
   import全体は既存のcancel/import gate内で実行します。外部プロセスのrenameと書込みを
   原子的にロックする仕組みではないため、import中の外部編集・移動は避けてください。
 - Agent の permission request は Qwen の `_meta.toolName`、kind、引数、locations を照合します。
-  `read_file` / `edit` / `grep_search` の既存共有ファイル完全一致だけを一度限り許可します。
+  `read_file` / `edit` の既存共有ファイル完全一致だけを一度限り許可します。
   metadata 欠落、未知引数、別 session、ディレクトリ単位の探索・glob、永続許可は拒否します。
-  [Qwen の ACP 契約](https://github.com/QwenLM/qwen-code/blob/main/packages/cli/src/acp-integration/session/Session.ts)
-  に対応しない image は fail closed となります。
+  [Qwen ACP Session（監査commit 878a32f）](https://github.com/QwenLM/qwen-code/blob/878a32f86f8e2a4167f63c84ee41d33a4a8090b3/packages/cli/src/acp-integration/session/Session.ts)
+  のpermission requestは`_meta.toolName`、mapped kind、`rawInput=args`、`invocation.toolLocations()`を送ります。
+  [read_file](https://github.com/QwenLM/qwen-code/blob/878a32f86f8e2a4167f63c84ee41d33a4a8090b3/packages/core/src/tools/read-file.ts)
+  は`file_path`と任意の`offset/limit/pages`、
+  [edit](https://github.com/QwenLM/qwen-code/blob/878a32f86f8e2a4167f63c84ee41d33a4a8090b3/packages/core/src/tools/edit.ts)
+  は`file_path/old_string/new_string`と任意の`replace_all`だけを対応範囲とします。
+  `old_string`は空を拒否し、新規ファイル作成を許可しません。UI用の`modified_by_user/ai_proposed_content`も未対応です。
+  [grep_search](https://github.com/QwenLM/qwen-code/blob/878a32f86f8e2a4167f63c84ee41d33a4a8090b3/packages/core/src/tools/grep.ts)
+  の正式引数は`pattern`と任意の`path/glob/limit`ですが、pathを検索用working directoryにする実装です。
+  単一共有ファイルだけを検索する契約ではないため、bridgeでは**grep_searchを明示拒否**します。
+  path省略、directory、globだけでなく共有ファイル完全一致の指定も拒否します。
+  Agentは共有パス一覧から必要なファイルを`read_file`で読んでください。
+  read/editのlocationsは指定時に対象ファイルと一致させます。未知引数は拒否し、
+  実Qwen/モデルとの運用確認は上記manual acceptanceで別途行います。
   ACP metadata は peer の申告で、Agent は承認要求を省略することもあります。
   このフィルタは承認応答の制限です。ホストの強制的な隔離境界は Docker と snapshot/import が担います。
   execute / delete / move / fetch / unknown は拒否し、GUI の自動承認 policy は継承しません。
@@ -257,12 +309,27 @@ HTTP を追加する際は SDK への置き換えを優先して再評価して�
 
 ## LLM 不要の検証
 
-```sh
-docker build --network=none -f tools/mcp-fixture.Dockerfile -t zaivern-mcp-fixture tools
-cargo build --bin zai
-ZAIVERN_MCP_TEST_IMAGE="$(docker image inspect zaivern-mcp-fixture --format '{{.Id}}')" \
-  cargo test real_stdio_container_agent_edit_test_diff_and_cancel -- --ignored --nocapture
+base imageの取得にはネットワークが必要です。CIと同じく取得を先に行い、
+その後のbuildのRUN命令はネットワークなしで実行します。`--network=none`はbuild全体の
+registry通信を遮断する指定ではありません。baseはRust公式の保守tagを使用し、実行時は
+ビルド済みfixtureのimmutable image IDを固定します（bit-for-bit再現ビルドの保証ではありません）。
+
+```bash
+docker pull rust:1-bookworm
+docker build --network=none -f tools/mcp-fixture.Dockerfile -t zaivern-mcp-fixture:test tools
+cargo build --locked --bin zai
+ZAIVERN_MCP_TEST_IMAGE="$(docker image inspect zaivern-mcp-fixture:test --format '{{.Id}}')"
+[[ "$ZAIVERN_MCP_TEST_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]
+export ZAIVERN_MCP_TEST_IMAGE
+cargo test --locked --bin zai \
+  features::chat_bridge::imp::e2e_tests::real_stdio_container_agent_edit_test_diff_and_cancel \
+  -- --exact --ignored --nocapture
+docker ps -a --filter name=zaivern-mcp-
+docker volume ls --filter name=zaivern-mcp-
 ```
+
+`running 1 test`と成功を確認してください。開始前にも資源一覧を保存し、今回生成した
+container/volumeの残存がないことを比較します。他のtaskの資源は削除しません。
 
 fixture は実際の ACP process として起動し、危険操作の拒否、host FS capability の拒否、
 外部ネットワーク不可、編集、実際の offline Rust test、diff、実行中 cancel を検証します。
