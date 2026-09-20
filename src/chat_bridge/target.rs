@@ -352,6 +352,7 @@ impl LocalExecutionTarget {
 
 #[derive(Debug, PartialEq, Eq)]
 enum VerificationDecision {
+    /// Cargo actually succeeded; test_status additionally accounts for coverage.
     Verified,
     NotVerified,
     Failed,

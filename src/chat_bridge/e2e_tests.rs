@@ -171,6 +171,13 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         "ORACLE_ODD",
         "NO_CARGO",
     ] {
+        if instruction == "REPAIR_SUCCESS" {
+            std::fs::write(
+                workspace.join("src/lib.rs"),
+                "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
+            )
+            .unwrap();
+        }
         let hidden = matches!(
             instruction,
             "EXFILTRATE_VERIFIER" | "ORACLE_EVEN" | "ORACLE_ODD"
