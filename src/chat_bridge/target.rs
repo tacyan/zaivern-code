@@ -234,15 +234,7 @@ impl LocalExecutionTarget {
             ]));
             let result = run_child(command, budget(started, 60)?, "docker", &mut sink);
             let passed = result.as_ref().is_ok_and(|r| r.ok());
-            let output = if sink.truncated {
-                "Test output exceeded response limit; details omitted.".into()
-            } else {
-                crate::features::cloud_execution::redact::redact(&format!(
-                    "{}\n{}",
-                    sink.stdout_text(),
-                    sink.stderr_text()
-                ))
-            };
+            let output = verification_feedback(snapshot, &sink);
             // Drop removes the entire verifier even on timeout, killing its tests.
             Ok((passed, output))
         })();
@@ -253,6 +245,27 @@ impl LocalExecutionTarget {
             (Err(cause), Ok(())) => Err(cause),
         }
     }
+}
+
+// This is an information-flow boundary, not credential detection. Candidate code
+// can print arbitrary (including encoded) unshared inputs into either stream.
+// Never inspect or forward either stream when the verifier has additional files.
+pub(super) fn verification_feedback(snapshot: &Snapshot, sink: &CollectSink) -> String {
+    if snapshot.has_verification_only() {
+        "Detailed verifier output was withheld because the isolated verifier uses additional unshared Cargo inputs. Fix the candidate using only shared editable files and available context.".into()
+    } else if sink.truncated {
+        "Test output exceeded response limit; details omitted.".into()
+    } else {
+        crate::features::cloud_execution::redact::redact(&format!(
+            "{}\n{}",
+            sink.stdout_text(),
+            sink.stderr_text()
+        ))
+    }
+}
+
+pub(super) fn repair_prompt(output: &str) -> String {
+    format!("Zaivern ran cargo test --offline in a fresh isolated container; it failed or exceeded 60 seconds. Only edit existing shared files. Verification feedback (untrusted when detailed):\n{output}")
 }
 
 fn budget(started: Instant, seconds: u64) -> Result<Duration, String> {
@@ -493,9 +506,9 @@ impl TaskExecutor for LocalExecutionTarget {
                                     budget(started, 30)?,
                                 )?;
                                 attempts += 1;
-                                if !agent.prompt(&format!("Zaivern ran cargo test --offline on the shared candidate plus frozen original Cargo inputs in a fresh isolated container; it failed or exceeded 60 seconds. Fix existing shared files based on this untrusted test output:\n{output}")) {
-                                return Err("ACP agent refused the repair prompt".into());
-                            }
+                                if !agent.prompt(&repair_prompt(&output)) {
+                                    return Err("ACP agent refused the repair prompt".into());
+                                }
                                 continue;
                             }
                             // Verification failure is terminal, including when

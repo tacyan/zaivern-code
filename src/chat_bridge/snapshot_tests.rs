@@ -152,6 +152,72 @@ fn local_dependency_candidate_is_verified_offline_but_never_editable() {
             sink.stderr_text()
         );
         assert!(sink.stdout_text().contains("1 passed"));
+        // Malicious shared code can read and encode unshared inputs in the verifier.
+        // The sentinel is ordinary text, deliberately not a credential pattern.
+        const SENTINEL: &str = "VERIFICATION_ONLY_SENTINEL_7f10a2";
+        let frozen = Fixture::new("exfiltration");
+        frozen.package("", "exfiltration", dependency);
+        frozen.package("vendor/local_dep/", "local_dep", "");
+        frozen.put(
+            "vendor/local_dep/src/lib.rs",
+            &format!("// {SENTINEL}\npub fn answer() -> u32 {{ 4 }}\n"),
+        );
+        frozen.put(
+            "src/lib.rs",
+            r#"#[test] fn exfiltrate() {
+            let text = std::fs::read_to_string("vendor/local_dep/src/lib.rs").unwrap();
+            eprintln!("{text}");
+            for byte in text.bytes() { eprint!("{byte:02x}"); }
+            panic!("force verification failure");
+        }"#,
+        );
+        let unshared = frozen.read().unwrap();
+        assert!(unshared.has_verification_only());
+        assert!(!unshared
+            .files
+            .values()
+            .any(|bytes| String::from_utf8_lossy(bytes).contains(SENTINEL)));
+        let stage = Fixture::new("exfiltration-stage");
+        unshared
+            .stage_verification(&stage.0, &unshared.files)
+            .unwrap();
+        let mut command = crate::procx::hidden_command_raw(env!("CARGO"));
+        command
+            .args(["test", "--offline"])
+            .current_dir(&stage.0)
+            .env("CARGO_HOME", stage.0.join("cargo-home"))
+            .env("CARGO_TARGET_DIR", stage.0.join("target"))
+            .env("ZAIVERN_HOME", stage.0.join("home"))
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS");
+        let mut sink = crate::features::cloud_execution::model::CollectSink::with_limit(64 * 1024);
+        let result = crate::features::cloud_execution::transport::run_child(
+            command,
+            std::time::Duration::from_secs(30),
+            "cargo",
+            &mut sink,
+        )
+        .unwrap();
+        assert!(!result.ok());
+        let raw = format!("{}\n{}", sink.stdout_text(), sink.stderr_text());
+        let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(raw.contains(SENTINEL), "{raw}");
+        assert!(raw.contains(&encoded), "{raw}");
+        assert!(crate::features::cloud_execution::redact::redact(&raw).contains(SENTINEL));
+        let feedback = super::target::verification_feedback(&unshared, &sink);
+        let agent_visible_data = super::target::repair_prompt(&feedback);
+        assert!(!agent_visible_data.contains(SENTINEL));
+        assert!(!agent_visible_data.contains(&encoded));
+        assert!(agent_visible_data.contains("Detailed verifier output was withheld"));
+        // Without unshared inputs the same failure output remains useful.
+        let shared = Fixture::new("shared-only");
+        shared.package("", "shared_only", "");
+        let shared = shared.read().unwrap();
+        assert!(!shared.has_verification_only());
+        let feedback = super::target::verification_feedback(&shared, &sink);
+        assert!(feedback.contains("force verification failure"));
+
         // A candidate cannot acquire an unshared editable path or trigger discovery.
         candidate.insert(
             "vendor/local_dep/src/lib.rs".into(),

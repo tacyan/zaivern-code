@@ -168,6 +168,51 @@ jobs:
         if: matrix.shard == 1
         run: cargo test --manifest-path vendor/vt100/Cargo.toml
 
+      # Docker 経路は Ubuntu で毎回実行する。通常の nextest の ignore は
+      # Docker がない OS 用に維持し、この 1 件だけを exact 指定で実行する。
+      - name: MCP Docker fixture E2E
+        if: runner.os == 'Linux'
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --bin zai
+          docker build -f tools/mcp-fixture.Dockerfile -t zaivern-mcp-fixture:test tools
+          ZAIVERN_MCP_TEST_IMAGE="$(docker image inspect zaivern-mcp-fixture:test --format '{{.Id}}')"
+          [[ "$ZAIVERN_MCP_TEST_IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]
+          export ZAIVERN_MCP_TEST_IMAGE
+          # このテストが新規作成した資源だけを終了後の検査・回収対象とする。
+          docker ps -a --filter name=zaivern-mcp- --format '{{.Names}}' | LC_ALL=C sort > "$RUNNER_TEMP/mcp-containers-before"
+          docker volume ls --filter name=zaivern-mcp- --format '{{.Name}}' | LC_ALL=C sort > "$RUNNER_TEMP/mcp-volumes-before"
+          test_name=features::chat_bridge::imp::e2e_tests::real_stdio_container_agent_edit_test_diff_and_cancel
+          # 名前変更で「0件成功」に化けないことも確認する。
+          cargo test --locked --bin zai "$test_name" -- --exact --ignored --list | grep -Fx "$test_name: test"
+          cargo test --locked --bin zai "$test_name" -- --exact --ignored
+
+      - name: Assert MCP Docker cleanup (including failure paths)
+        if: always() && runner.os == 'Linux'
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Build が失敗し、E2E を開始していない場合は回収対象なし。
+          [[ -f "$RUNNER_TEMP/mcp-volumes-before" ]] || exit 0
+          docker ps -a --filter name=zaivern-mcp- --format '{{.Names}}' | LC_ALL=C sort > "$RUNNER_TEMP/mcp-containers-after"
+          docker volume ls --filter name=zaivern-mcp- --format '{{.Name}}' | LC_ALL=C sort > "$RUNNER_TEMP/mcp-volumes-after"
+          LC_ALL=C comm -13 "$RUNNER_TEMP/mcp-containers-before" "$RUNNER_TEMP/mcp-containers-after" > "$RUNNER_TEMP/mcp-containers-leaked"
+          LC_ALL=C comm -13 "$RUNNER_TEMP/mcp-volumes-before" "$RUNNER_TEMP/mcp-volumes-after" > "$RUNNER_TEMP/mcp-volumes-leaked"
+          if [[ -s "$RUNNER_TEMP/mcp-containers-leaked" || -s "$RUNNER_TEMP/mcp-volumes-leaked" ]]; then
+            echo '::error::MCP E2E leaked Docker resources; attempting scoped cleanup'
+            while IFS= read -r name; do
+              docker rm -f "$name" || true
+            done < "$RUNNER_TEMP/mcp-containers-leaked"
+            while IFS= read -r name; do
+              docker volume rm "$name" || true
+            done < "$RUNNER_TEMP/mcp-volumes-leaked"
+            exit 1
+          fi
+          echo 'MCP containers and volumes cleaned up successfully'
+
   # 実PTYテスト群。.config/nextest.toml の pty グループで直列化される。
   # 表示名: "pty (ubuntu-latest)" など。
   pty:

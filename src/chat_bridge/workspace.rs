@@ -336,6 +336,10 @@ impl Snapshot {
         Ok(())
     }
 
+    pub(super) fn has_verification_only(&self) -> bool {
+        !self.verification_only.is_empty()
+    }
+
     pub fn stage(&self, destination: &Path) -> Result<(), String> {
         self.stage_changes(destination, &self.files)
     }

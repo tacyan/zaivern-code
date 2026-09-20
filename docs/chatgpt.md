@@ -108,7 +108,8 @@ Agent 本文や検証出力が収集上限で切り詰められた場合は、�
 
 `Cargo.toml` が共有された場合、返却候補と開始時に固定した Cargo 検証入力を別の空のコンテナへ配置し、
 `cargo test --offline` を実行します。Agent が追加した未共有ファイルは検証に使いません。
-失敗時は最大2回、実際の出力を同じ Agent へ戻します。結果は出口コードで判定し、
+失敗時は最大2回、同じ Agent に修復を依頼します。検証専用入力がある場合は詳細出力を渡さず、
+固定メッセージのみを返します。共有ファイルだけで検証する場合は redaction 済みの出力を返します。結果は出口コードで判定し、
 Agent が「成功」と書いただけでは passed にしません。
 `test_status=passed` はその検証 snapshot 内の Cargo テストの成功だけを表し、全動作の保証ではありません。
 非 Rust ファイルの変更（manifest・データを含む）がある場合、Cargo が成功しても
@@ -152,9 +153,10 @@ assets/resources/i18n` と元 manifest の明示 target path を収集し、編�
 cache / toolchain が必要なら検証は失敗し、ホストへ取り込みません。Zaivern 自身でも
 snapshot の初期化を通常CIで検査しますが、全テストの成功には適切な image と許可対象内の
 ビルド入力が必要です。既存の config/秘密鍵ポリシーを都合よく解除しません。
-検証専用ファイルは秘密領域ではありません。candidate のテストコードが読み、検証出力へ
-書く可能性があるため、同じ秘密除外・出力redactionを適用します。ホスト上の元依存にも
-外部編集がないことを import 前に照合します。
+検証専用ファイルには同じ秘密除外ポリシーを適用します。candidate のテストコードは verifier 内で
+これらを読めるため、検証専用入力が一つでもあれば stdout/stderr 全体を Agent への返却前に遮断します。
+符号化された値も含め、詳細出力を repair prompt や MCP response へ渡しません。
+その場合、修復時の診断は固定メッセージに制限されます。ホスト上の元依存にも外部編集がないことを import 前に照合します。
 
 `instruction` は空白だけを除き1〜16384 Unicode code pointsです。別に JSONL の
 MCPフレーム全体（改行・envelope・JSON escapeを含む）に64 KiB上限があります。
@@ -245,8 +247,10 @@ fixture は実際の ACP process として起動し、危険操作の拒否、ho
 通常CIの snapshot tests は Docker / LLM / API キーを必要とせず、大規模ソース選択、
 local dependency / patch / workspace、候補manifest改変、逸脱・リンク・外部変更を検査します。
 固定fixtureを使った `cargo test --offline` も実行します（ユーザーコードのホスト実行ではありません）。
-Docker E2Eは専用 image を明示して起動する opt-in のままです。検証用 local dependency を
-実コンテナへ配置する経路も、この E2E で確認します。
+Docker E2E は Ubuntu の通常 CI で専用 image をビルドし、immutable image ID を指定して明示実行します。
+他 OS の通常テストでは Docker を要求しません。検証専用入力の読み出し・hex 出力を試みる
+攻撃 fixture、Agent prompt / MCP response への非流出、失敗時の import 拒否も確認します。
+CI はテスト前後の container / volume を比較し、新たな残存を失敗として扱い、回収を試みます。
 
 ## Future Cloud Runner
 

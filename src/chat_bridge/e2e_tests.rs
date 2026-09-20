@@ -1,4 +1,4 @@
-//! Opt-in real-binary + real-container test. No LLM or API credential is used.
+//! Real-binary + real-container test, explicitly run in Ubuntu CI. No LLM/API key.
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -58,7 +58,7 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         .unwrap();
         std::fs::write(
             dependency.join("src/lib.rs"),
-            "pub fn answer() -> u32 { 4 }\n",
+            "// VERIFICATION_ONLY_SENTINEL_7f10a2\npub fn answer() -> u32 { 4 }\n",
         )
         .unwrap();
     }
@@ -103,11 +103,14 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         )
         .unwrap();
         server.0.stdin.as_mut().unwrap().flush().unwrap();
-        serde_json::from_str(
-            &rx.recv_timeout(Duration::from_secs(10))
-                .expect("MCP response timeout"),
-        )
-        .unwrap()
+        let response = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP response timeout");
+        const SENTINEL: &str = "VERIFICATION_ONLY_SENTINEL_7f10a2";
+        let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(!response.contains(SENTINEL));
+        assert!(!response.contains(&encoded));
+        serde_json::from_str(&response).unwrap()
     };
     let init = call(
         "initialize",
@@ -130,11 +133,14 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         )
         .unwrap();
         server.0.stdin.as_mut().unwrap().flush().unwrap();
-        serde_json::from_str(
-            &rx.recv_timeout(Duration::from_secs(10))
-                .expect("MCP response timeout"),
-        )
-        .unwrap()
+        let response = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("MCP response timeout");
+        const SENTINEL: &str = "VERIFICATION_ONLY_SENTINEL_7f10a2";
+        let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
+        assert!(!response.contains(SENTINEL));
+        assert!(!response.contains(&encoded));
+        serde_json::from_str(&response).unwrap()
     };
     assert_eq!(
         call("tools/list", json!({}))["result"]["tools"]
@@ -149,6 +155,7 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         "WAIT_FOREVER",
         "UNSHARED_HELPER",
         "VERIFY_CANCEL",
+        "EXFILTRATE_VERIFIER",
         "NO_CARGO",
     ] {
         if instruction == "MIXED_FRONTEND" {
@@ -219,7 +226,10 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
                     .unwrap();
             if status["state"] == "failed" {
                 assert!(
-                    matches!(instruction, "UNSHARED_HELPER" | "VERIFY_CANCEL"),
+                    matches!(
+                        instruction,
+                        "UNSHARED_HELPER" | "VERIFY_CANCEL" | "EXFILTRATE_VERIFIER"
+                    ),
                     "{status}"
                 );
                 assert_eq!(status["test_status"], "failed", "{status}");
@@ -245,7 +255,13 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             }
             if status["state"] == "completed" {
                 assert_ne!(instruction, "WAIT_FOREVER");
-                assert_ne!(instruction, "UNSHARED_HELPER", "{status}");
+                assert!(
+                    !matches!(
+                        instruction,
+                        "UNSHARED_HELPER" | "VERIFY_CANCEL" | "EXFILTRATE_VERIFIER"
+                    ),
+                    "{status}"
+                );
                 let verification = if instruction == "NO_CARGO" || instruction == "MIXED_FRONTEND" {
                     "not_verified"
                 } else {

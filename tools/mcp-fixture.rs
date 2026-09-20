@@ -12,6 +12,8 @@ fn main() {
     let mut helper_only = false;
     let mut mixed = false;
     let mut cancel_verification = false;
+    let mut exfiltrate = false;
+    let mut prompts = 0;
     for line in io::stdin().lock().lines() {
         let line = line.unwrap();
         let id = line
@@ -34,6 +36,18 @@ fn main() {
             if line.contains("WAIT_FOREVER") {
                 continue;
             }
+            const SENTINEL: &str = "VERIFICATION_ONLY_SENTINEL_7f10a2";
+            let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
+            assert!(!line.contains(SENTINEL), "unshared input reached Agent");
+            assert!(
+                !line.contains(&encoded),
+                "encoded unshared input reached Agent"
+            );
+            exfiltrate |= line.contains("EXFILTRATE_VERIFIER");
+            if exfiltrate && prompts > 0 {
+                assert!(line.contains("Detailed verifier output was withheld"));
+            }
+            prompts += 1;
             helper_only |= line.contains("UNSHARED_HELPER");
             mixed |= line.contains("MIXED_FRONTEND");
             cancel_verification |= line.contains("VERIFY_CANCEL");
@@ -68,7 +82,18 @@ fn main() {
             .is_err());
             let file = "/workspace/src/lib.rs";
             let before = std::fs::read_to_string(file).unwrap();
-            if cancel_verification {
+            if exfiltrate {
+                std::fs::write(
+                    file,
+                    r#"#[test] fn exfiltrate() {
+                    let text = std::fs::read_to_string("vendor/local_dep/src/lib.rs").unwrap();
+                    eprintln!("{text}");
+                    for byte in text.bytes() { eprint!("{byte:02x}"); }
+                    panic!("force verification failure");
+                }"#,
+                )
+                .unwrap();
+            } else if cancel_verification {
                 std::fs::write(file, "#[test] fn failing() { std::thread::sleep(std::time::Duration::from_secs(3)); panic!(\"fixture failure\"); }\n").unwrap();
             } else if helper_only {
                 std::fs::write(
