@@ -161,6 +161,7 @@
   "agent_sessions.git_blame_mode_hint": "👤 Git blame: {mode} (autor · tiempo relativo en el margen; haz clic para ver el diff del commit)",
   "agent_sessions.instructions_delivered": "📋 Instrucciones entregadas a {title}",
   "agent_sessions.instructions_delivery_failed": "No se pudieron entregar las instrucciones ({title}): la sesión nunca se estabilizó",
+  "agent_sessions.insert_multiline_refused": "Inserción en {title} rechazada — este terminal no tiene bracketed paste, por lo que los saltos de línea del texto se ejecutarían",
   "agent_sessions.launched_approval_mode": "🛡 {name} iniciado en modo de aprobación{via}",
   "agent_sessions.launched_full_auto": "⚡ {name} iniciado en modo totalmente automático{via}",
   "agent_sessions.launched_in_isolated_worktree": "🌿 {name} iniciado en un worktree aislado ({branch})",

@@ -161,6 +161,7 @@
   "agent_sessions.git_blame_mode_hint": "👤 Git blame: {mode} (author · relative time in the gutter; click for that commit's diff)",
   "agent_sessions.instructions_delivered": "📋 Instructions delivered to {title}",
   "agent_sessions.instructions_delivery_failed": "Could not deliver the instructions ({title}): the session never settled",
+  "agent_sessions.insert_multiline_refused": "Refused to insert into {title} — this terminal has no bracketed paste, so the newlines in the text would run as commands",
   "agent_sessions.launched_approval_mode": "🛡 {name} launched in approval mode{via}",
   "agent_sessions.launched_full_auto": "⚡ {name} launched in full-auto mode{via}",
   "agent_sessions.launched_in_isolated_worktree": "🌿 {name} launched in an isolated worktree ({branch})",

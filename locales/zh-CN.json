@@ -161,6 +161,7 @@
   "agent_sessions.git_blame_mode_hint": "👤 Git blame: {mode}（边栏显示 作者 · 相对时间。点击查看该提交的差异）",
   "agent_sessions.instructions_delivered": "📋 已把指令送达 {title}",
   "agent_sessions.instructions_delivery_failed": "无法送达指令（{title}）：会话一直没有稳定下来",
+  "agent_sessions.insert_multiline_refused": "已拒绝向 {title} 执行“插入到输入框” — 该终端不支持 bracketed paste，文本中的换行会被当作命令执行",
   "agent_sessions.launched_approval_mode": "🛡 {name} 已以审批模式启动{via}",
   "agent_sessions.launched_full_auto": "⚡ {name} 已以全自动模式启动{via}",
   "agent_sessions.launched_in_isolated_worktree": "🌿 {name} 已在隔离的 worktree（{branch}）中启动",

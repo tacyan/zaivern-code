@@ -573,6 +573,9 @@ impl ZaivernApp {
         let mut next: Option<Duration> = None;
         let mut delivered: Vec<String> = Vec::new();
         let mut gave_up: Vec<String> = Vec::new();
+        // 「入れるだけ」が安全に配達できなかった分 (bracketed paste 無し
+        // の端末へ複数行を挿入しようとした等) — 書かずに断ったことを知らせる。
+        let mut refused: Vec<String> = Vec::new();
         // **終わり方を目印つきで拾う** (`(目印, 本当に届いたか)`)。
         // 積めたことと届いたことは別の時刻に決まるので、頼んだ側へは
         // ここでしか本当のことを返せない。
@@ -581,9 +584,10 @@ impl ZaivernApp {
         let sup = &self.supervisor;
         let agents = &mut self.agents;
         // 配達の外の門 (実行計画の承認待ち等) を先に尋ねる。閉じている分は
-        // この tick では動かさない — が、まだ PTY へ 1 バイトも書いていない
-        // ので**占有もしない** (占有させると門が閉じたままの 1 通に後続の
-        // 無関係な送信まで永久に連れて行かれる)。
+        // この tick では動かさない — が、門が止めるのは `Stage::Ready` の
+        // 開始だけ。**書き始めた配達は門が閉じても最後まで運ぶ** (途中で
+        // 止めると本文だけが入力欄に残って占有が外れず、門が再び開かない
+        // 限りそのセッション全体が止まる)。
         let gates: Vec<Option<bool>> = queue
             .iter()
             .map(|p| {
@@ -683,6 +687,18 @@ impl ZaivernApp {
                     }
                     false
                 }
+                // **1 バイトも書かずに断る。** 改行を含む本文を bracketed
+                // paste の無い端末へ流すと途中の改行が確定として走り、本文
+                // の先頭行が実行される — 「入力欄へ挿入するだけ」の契約を
+                // 守れないので配達しない (本文を書き換えて意味を変える
+                // こともしない)。
+                submit::Act::UnsafeInsert => {
+                    refused.push(s.title.clone());
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
+                    false
+                }
                 submit::Act::Wait(d) => {
                     soon(d);
                     true
@@ -696,15 +712,12 @@ impl ZaivernApp {
                     // 下書き追跡の種を同じ文字列から作る (末尾空白・制御文字・
                     // CRLF を落とした後の、実際に入力欄へ入る文字数で追う)。
                     let body = submit::sanitize(&p.job.text);
-                    if p.job.submit {
-                        // 確定送信の本文・確定キーは下書き追跡に畳まない —
-                        // 配達自身の書き込みで、残っている下書きを誤って
-                        // 消費済みにしない。
-                        s.write_bytes(&submit::wrap_body(&body, peek.bracketed));
-                    } else {
-                        // 挿入は入力欄への追記 = 人の打鍵と同じく追跡へ畳む。
-                        s.write_typed(&submit::wrap_body(&body, peek.bracketed));
-                    }
+                    // 配達自身の書き込みは下書き追跡へ畳まない (人の打鍵
+                    // ではない)。挿入は下の `note_input_draft` で残した本文を
+                    // 一度だけ種にする — `write_typed` で畳むと同じ本文が
+                    // feed と seed の両方で二重計上され、Backspace では
+                    // 永遠に消し切れない占有になる。
+                    s.write_bytes(&submit::wrap_body(&body, peek.bracketed));
                     s.set_scroll(0);
                     if !p.job.submit {
                         // 確定キーを送らない配達は、本文を入力欄へ残したまま
@@ -751,6 +764,12 @@ impl ZaivernApp {
         for title in gave_up {
             self.toast_warn(trf(
                 "指示文を配達できませんでした ({title}): セッションが落ち着きません",
+                &[("title", title)],
+            ));
+        }
+        for title in refused {
+            self.toast_warn(trf(
+                "agent_sessions.insert_multiline_refused",
                 &[("title", title)],
             ));
         }
@@ -866,13 +885,9 @@ mod delivery_peek_tests {
             "本文の sanitize が一度で済んでいない (PTY 書き込みと種でずれる):\n{body}"
         );
         assert!(
-            body.contains("s.write_typed(&submit::wrap_body(&body, peek.bracketed))"),
-            "insert の本文が人の打鍵として畳まれていない (追記が追跡に乗らない):\n{body}"
-        );
-        assert!(
             body.contains("s.write_bytes(&submit::wrap_body(&body, peek.bracketed))"),
-            "確定送信の本文が内部書き込みになっていない (配達自身の書き込みで\n\
-             残っている下書きを誤って畳む):\n{body}"
+            "配達の本文が内部書き込みになっていない (配達自身の書き込みで\n\
+             残っている下書きを誤って畳む/本文が二重計上される):\n{body}"
         );
     }
 

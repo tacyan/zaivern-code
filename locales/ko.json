@@ -161,6 +161,7 @@
   "agent_sessions.git_blame_mode_hint": "👤 Git blame: {mode} (거터에 작성자 · 상대 시각. 클릭하면 해당 커밋의 diff)",
   "agent_sessions.instructions_delivered": "📋 {title} 에 지시문을 전달했습니다",
   "agent_sessions.instructions_delivery_failed": "지시문을 전달하지 못했습니다 ({title}): 세션이 안정되지 않습니다",
+  "agent_sessions.insert_multiline_refused": "{title} 에 대한 ‘입력란 삽입’ 전달을 거부했습니다 — 이 터미널은 bracketed paste 를 지원하지 않아 본문의 줄바꿈이 명령으로 실행됩니다",
   "agent_sessions.launched_approval_mode": "🛡 {name} 승인 모드로 실행됨{via}",
   "agent_sessions.launched_full_auto": "⚡ {name} 전자동 모드로 실행됨{via}",
   "agent_sessions.launched_in_isolated_worktree": "🌿 {name} 을(를) 격리 worktree ({branch}) 에서 실행했습니다",
