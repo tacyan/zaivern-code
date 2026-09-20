@@ -314,6 +314,13 @@ pub struct Job {
     ///
     /// **送信経路は増やさない。** 目印を運ぶだけで、書き込みはこれまで
     /// どおり `submit_tick` の 1 か所しかない。
+    ///
+    /// 目印つきの配達はさらに「**同じセッションの因果系列**」でもある
+    /// (Team / Coordinator の指示は積まれた順に意味がある)。
+    /// [`due_now`] は、同じセッションの先に目印つきの配達が残っている
+    /// 間は後の目印つき配達を進めない — 門 (held) で止まっていても同じ。
+    /// 目印のない配達 (人の手動送信・API の `user`/`insert`) は独立した
+    /// レーンなので、門で止まった目印つきを追い越してよい。
     pub tag: Option<String>,
 }
 
@@ -641,6 +648,12 @@ impl DeliveryTurn {
 ///   永久に連れて行かれる。追い越しの安全は「後続が書き始めた時点で
 ///   後続自身が占有者になる (挿入なら下書きになる)」で保つ — 門が
 ///   開いても、占有が解けるまで先行分は書き始められない。
+/// * **ただし目印つき (`job.tag`) の配達同士は同じ因果系列**として
+///   扱い、積まれた順にしか進めない。Team / Coordinator の指示は
+///   「実装して → テストして」のように意味的に順序が効くので、先行が
+///   門で止まっていても後続の目印つきは追い越さない
+///   (追い越してよいのは目印のない独立した送信 = 人の手動送信や
+///   API 経由の `Job::user` / `Job::insert` だけ)。
 /// * 同じ tick に**新しく**書き始めるのはセッションごとに 1 通まで
 ///   (この判定を通った順に [`DeliveryTurn`] が絞る)。
 /// * 別のセッションは従来どおり並行して進む。
@@ -662,10 +675,21 @@ pub fn due_now(
         }
     }
     let mut turn = DeliveryTurn::default();
+    // キュー上、先に目印つきの配達が残っているセッション —
+    // 後の目印つき配達は追い越せない (同じ因果系列 = 配達レーン)。
+    // 目印のない配達は独立レーンなのでこの判定には入らない。
+    let mut tagged_lane: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     queue
         .iter()
         .zip(held.iter().copied())
         .map(|(p, h)| {
+            let s = p.job.session;
+            // 同じセッションの先の目印つきがキューに残っているか。
+            // 門が閉じていようと動いていようと、残っている限り壁になる。
+            let waits_for_tagged = p.job.tag.is_some() && tagged_lane.contains(&s);
+            if p.job.tag.is_some() {
+                tagged_lane.insert(s);
+            }
             if h {
                 // 門が閉じている分はこの tick では動かさない。
                 // 占有の判定には含めない — まだ PTY へ何も書いていない
@@ -676,7 +700,10 @@ pub fn due_now(
                 // 自分が入力欄を占有している配達の続き。
                 return true;
             }
-            let s = p.job.session;
+            if waits_for_tagged {
+                // 同じ系列の先の配達が残っている。門で止まっていても順序は守る。
+                return false;
+            }
             if busy.contains(&s) {
                 // 別の配達が入力欄を占有中。それが終わるまで書き始めない。
                 return false;
@@ -932,18 +959,22 @@ mod ordering_tests {
         );
     }
 
-    /// **門で止まっている先行分はまだ PTY を触っていないので、後続を止めない。**
+    /// **門で止まっている先行分はまだ PTY を触っていないので、
+    /// 独立した後続を止めない。**
     ///
     /// 門 (承認待ち等) が閉じたままの配達に FIFO の位置を占有させると、
     /// 後続の無関係な送信が永久に進めない。追い越しの安全は占有で保つ:
     /// 後続 (B) が書き始めた時点で B 自身が占有者になる (挿入なら
     /// 下書きとして残る) ので、門が開いても A は占有が解けるまで
     /// 書き始められない — A の確定キーが B の下書きを巻き込まない。
+    /// (実際に門で止まるのは目印つきの配達なので、A には目印を付ける)
     #[test]
     fn 門で止まっている先行分は後続を止めないが下書きは守られる() {
         let t0 = Instant::now();
+        let mut a = Job::user(1, "本文A");
+        a.tag = Some("run|instr:1".into());
         let mut queue = vec![
-            Pending::new(Job::user(1, "本文A"), t0),
+            Pending::new(a, t0),
             Pending::new(Job::insert(1, "本文B"), t0),
         ];
         let mut input = String::new();
@@ -1019,28 +1050,111 @@ mod ordering_tests {
         assert_eq!(due, vec![true, false, true]);
     }
 
-    /// **門で止まっている先行分は後続を永久に止めない** (純関数レベル)。
+    /// **門で止まっている先行分は、独立した後続を永久に止めない**
+    /// (純関数レベル)。
     ///
     /// A が門で止まっていても、まだ PTY へ書いていないので
-    /// 同じセッションの後続 B は進められる。別セッション C も並行。
+    /// 同じセッションの独立した後続 C (目印なし) は進められる。
+    /// 別セッション D も並行。ただし同じ因果系列の後続 B (目印つき)
+    /// は追い越せない — 系列の壁がないと B がこの tick の 1 通を取り、
+    /// C まで止まってしまうので、系列の壁そのものを検証する。
     /// (追い越しの安全は [`門で止まっている先行分は後続を止めないが下書きは守られる`]
     ///  が挙動で保証する)
     #[test]
-    fn 門で止まった先行分は後続を止めない() {
+    fn 門で止まった先行分は独立した後続を止めない() {
         let t0 = Instant::now();
+        let mut a = Job::user(1, "門で止まっている命令");
+        a.tag = Some("run|instr:1".into());
+        let mut b = Job::user(1, "同じ系列の後続");
+        b.tag = Some("run|instr:2".into());
         let queue = vec![
-            Pending::new(Job::user(1, "止まっている分"), t0),
-            Pending::new(Job::user(1, "後続"), t0),
+            Pending::new(a, t0),
+            Pending::new(b, t0),
+            Pending::new(Job::user(1, "人の独立した送信"), t0),
             Pending::new(Job::user(2, "別端末"), t0),
         ];
         let drafts = BTreeSet::new();
-        // 先頭が門で止まっていても、同じセッションの後続と別セッションは進める
-        let due = due_now(&queue, &[true, false, false], &drafts);
-        assert_eq!(due, vec![false, true, true]);
-        // 先頭が動けるなら、同じセッションの後続はこの tick では止まる
-        // (同じ tick に新しく書き始めるのはセッションごとに 1 通)
-        let due = due_now(&queue, &[false, false, false], &drafts);
-        assert_eq!(due, vec![true, false, true]);
+        // A が門で止まっていても: 独立レーンの C と別セッション D は進む。
+        // 同じ系列の B だけは追い越さない (順序のある指示なので)。
+        let due = due_now(&queue, &[true, false, false, false], &drafts);
+        assert_eq!(due, vec![false, false, true, true]);
+        // A の門が開いたら A が先 — 同じ系列の B と、同じ tick の
+        // 新規 1 通の壁で C はこの tick では待つ
+        let due = due_now(&queue, &[false, false, false, false], &drafts);
+        assert_eq!(due, vec![true, false, false, true]);
+    }
+
+    /// **門で止まった目印つきの命令を、同じ系列の後続は絶対に追い越さない。**
+    ///
+    /// Team / Coordinator の指示 (例: 「実装して」→「テストして」) は
+    /// 順序に意味がある。先行 A が門で止まっている間に後続 B が書き始めると
+    /// 逆順で届いてしまうので、キューに A が残っている限り B は進まない。
+    /// 独立した挿入 C (目印なし) は進んでよいが、それが残す人の下書きは
+    /// 門が開いたあとの A をも止める (A の確定キーが C を巻き込まない)。
+    #[test]
+    fn 門で止まった命令を同じ系列の後続が追い越さない() {
+        let t0 = Instant::now();
+        let mut a = Job::user(1, "命令A");
+        a.tag = Some("run|instr:1".into());
+        let mut b = Job::user(1, "命令B");
+        b.tag = Some("run|instr:2".into());
+        let mut queue = vec![
+            Pending::new(a, t0),
+            Pending::new(b, t0),
+            Pending::new(Job::insert(1, "追記C"), t0),
+        ];
+        let mut input = String::new();
+        let mut log: Vec<String> = Vec::new();
+        let mut drafts = BTreeSet::new();
+        let mut t = t0;
+        // A の門が閉じている間: 同じ系列の B は何も書かない (追い越さない)。
+        // 独立した挿入 C だけが進み、人の下書きを残す。
+        for _ in 0..5 {
+            t += POLL;
+            let held: Vec<bool> = queue.iter().map(|p| p.job.text == "命令A").collect();
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            ["本文:追記C", "完了:追記C"],
+            "門で止まった命令を同じ系列の後続が追い越した: {log:?}"
+        );
+        // 門が開いても、C の下書きが残っている間は A も B も書き始めない。
+        for _ in 0..5 {
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            ["本文:追記C", "完了:追記C"],
+            "人の下書きが残っているのに命令を書き始めた: {log:?}"
+        );
+        // 人が解放すると、命令は積まれた順 (A → B) にだけ届く。
+        drafts.clear();
+        for _ in 0..100 {
+            if queue.is_empty() {
+                break;
+            }
+            t += POLL;
+            let held = vec![false; queue.len()];
+            step(&mut queue, &held, &mut drafts, &mut input, &mut log, t);
+        }
+        assert_eq!(
+            log,
+            [
+                "本文:追記C",
+                "完了:追記C",
+                "本文:命令A",
+                "確定:命令A",
+                "完了:命令A",
+                "本文:命令B",
+                "確定:命令B",
+                "完了:命令B",
+            ],
+            "命令の順序が壊れた / 下書きを確定キーで巻き込んだ: {log:?}"
+        );
+        assert!(!log.iter().any(|l| l == "確定:追記C"));
     }
 
     /// **人の下書きは確定送信だけを止め、挿入 (追記) は止めない。**

@@ -543,13 +543,14 @@ pub struct Session {
     /// 側がそのセッションの `submit=true` 配達を始めない
     /// ([`crate::submit::due_now`])。
     ///
-    /// 下ろすのは、入力欄を実際に消費・消去する打鍵 (Enter=CR・行消去の
-    /// Ctrl+U・中断の Ctrl+C) が PTY へ届いたときだけ — [`Self::write_bytes`]
-    /// が全経路の唯一の出口なので、そこでバイトを見る。Esc は除く
-    /// (矢印キー等のシーケンスの先頭でもあり、「行を消した」を確実に
-    /// 意味しない)。入力欄の読み取り (見えない=空) は CLI ごとに意味が
-    /// 違うので、解放の根拠にはしない。
-    input_draft: bool,
+    /// 中身は [`InputDraft`] が [`feed_typed_line`] と同じ打鍵規則で畳む。
+    /// 下ろすのは「確実に消費・消去された」と分かる打鍵だけ — 確定
+    /// (CR/LF)・行消去 (Ctrl+U・Ctrl+C)、または Backspace で推定中身が
+    /// 空になるまで消したとき ([`Self::write_bytes`] が全経路の唯一の
+    /// 出口なので、そこでバイトを見る)。Esc や矢印キーでは下ろさない。
+    /// 入力欄の読み取り (見えない=空) は CLI ごとに意味が違うので、
+    /// 解放の根拠にはしない。
+    input_draft: Option<InputDraft>,
     /// DECSCUSR で指定された現在のカーソル形状(読取スレッドが書き、描画が読む)。
     cursor_shape: Arc<AtomicU8>,
     /// シェル統合 (OSC 633 / 133) の追跡。読取スレッドが書き、UI が読む。
@@ -1674,20 +1675,87 @@ pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
     out
 }
 
-/// **このバイト列は「人の下書き」の占有を解く打鍵を含むか** (純関数)。
+/// **「人の下書き」の追跡** — `submit=false` の配達が入力欄へ残した
+/// 本文の占有を、打鍵ごとに畳んで追う。
 ///
-/// [`Session::input_draft`] を下ろす条件 — 入力欄を実際に消費・消去する
-/// 打鍵が PTY へ届いたときだけ解放する:
-/// * CR (`\r`) … 入力欄を確定した = 下書きは送信済み
-/// * Ctrl+U (`0x15`) / Ctrl+C (`0x03`) … 行を消す / 中断する
+/// 占有を解けるのは「下書きが確実に消費・消去された」と分かるときだけ:
+/// * CR / LF … 確定 = 下書きは送信済み (または確定キー自身が消費した)
+/// * Ctrl+C (`0x03`) / Ctrl+U (`0x15`) … 行を捨てる / 消す
 ///   ([`feed_typed_line`] が行の終わりとして扱うのと同じ打鍵)
+/// * Backspace (`0x7f` / `0x08`) … **推定中身が空になるまで**消したとき。
+///   1 打鍵で下ろすと「ABC → AB」で誤解放して残りを後続の確定キーが
+///   巻き込むので、畳んだ中身が空になった時点でだけ下ろす
 ///
-/// Esc は**含まない**。矢印キー等のシーケンスの先頭バイトでもあり、
-/// CLI ごとに「入力欄を消した」を確実に意味しない。誤って解放すると、
-/// 残っている下書きへ後続の確定送信が追記して、確定キーで一緒に
-/// 送信してしまう。
-fn releases_input_draft(bytes: &[u8]) -> bool {
-    bytes.iter().any(|b| matches!(b, b'\r' | 0x03 | 0x15))
+/// 文字の打ち込みは中身へ追記する (下書きは残ったまま)。エスケープ列
+/// (Esc・矢印キー等) では**下ろさない** — 列の意味は CLI ごとに違う。
+/// ただし列を見た以後は中身の推定を信用できなくなる (`unsure`) ので、
+/// Backspace の空判定には戻らず、確定・消去打鍵だけで解く
+/// (矢印で動いたあとの削除回数は当てにしない)。
+///
+/// 中身は書き込まれた本文を種にし、追記の insert 本文や人の打鍵は
+/// `feed` で畳まれる。畳み方は [`feed_typed_line`] と同じ規則
+/// (UTF-8 の途中切れは持ち越す、bracketed paste の囲みは剥がす)。
+/// **中身の推定が実際より少なめにずれても解放は確定・消去打鍵だけ**に
+/// なり、多めにずれる分には Backspace 判定が保守側へ倒れるだけ
+/// (解放が遅れる = 安全側)。入力欄の見た目 (`input_text` 等) は
+/// CLI ごとに意味が違うので一切見ない。
+pub struct InputDraft {
+    /// 下書きだと推定している中身 (畳み込みの積算)
+    buf: String,
+    /// エスケープ列を見たあとは中身の推定を信用しない
+    unsure: bool,
+    /// 打鍵の UTF-8 はチャンク境界で割れる ([`TypedLine`] と同じ理由)
+    dec: crate::textenc::StreamDecoder,
+}
+
+impl InputDraft {
+    /// 入力欄へ残した本文を種にして追跡を始める。
+    fn seeded(text: &str) -> Self {
+        Self {
+            buf: text.chars().take(PROMPT_KEEP_CHARS).collect(),
+            unsure: false,
+            dec: crate::textenc::StreamDecoder::default(),
+        }
+    }
+
+    /// 打鍵バイト列を畳む。`true` が返ったら下書きは消費・消去済み —
+    /// 占有を解いてよい。
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        // bracketed paste の囲みは剥がす (中身は普通の文字として畳む)。
+        let text = self.dec.feed(bytes);
+        let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' | '\n' | '\u{3}' | '\u{15}' => return true,
+                '\u{7f}' | '\u{8}' => {
+                    if !self.unsure {
+                        self.buf.pop();
+                        if self.buf.is_empty() {
+                            return true;
+                        }
+                    }
+                }
+                '\u{1b}' => {
+                    self.unsure = true;
+                    // 続く列そのものを読み飛ばす (次の確定は上の分岐で拾う)。
+                    while let Some(&c) = chars.peek() {
+                        if c == '\r' || c == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                c if c.is_control() => {}
+                c => {
+                    if !self.unsure && self.buf.chars().count() < PROMPT_KEEP_CHARS {
+                        self.buf.push(c);
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 pub fn prompt_signature(text: &str) -> u64 {
@@ -2486,7 +2554,7 @@ impl Session {
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
-            input_draft: false,
+            input_draft: None,
             cursor_shape,
             shell,
             lines,
@@ -2831,25 +2899,33 @@ impl Session {
     /// 記録 ([`input_log_record`]) も 1 か所で足りる —
     /// 「片方の経路だけ記録されていて、無いものを無いと信じる」が起きない。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        // 「人の下書き」の占有は、入力欄を消費・消去する打鍵が実際に届いた
-        // 時点で解く。下書き中は配達キューの確定キーが走らないので、
-        // ここを通る CR 系の打鍵は人の手・リモートの端末キー・明示的な
-        // 送信操作のどれか = 下書きは送信されたか捨てられたかしている。
-        if self.input_draft && releases_input_draft(bytes) {
-            self.input_draft = false;
+        // 「人の下書き」の占有は、入力欄を消費・消去しきった打鍵が実際に
+        // 届いた時点で解く。下書き中は配達キューの確定キーが走らないので、
+        // ここを通る確定・消去系の打鍵は人の手・リモートの端末キー・
+        // 明示的な送信操作のどれか。追記 (insert 本文・人の打ち込み) は
+        // feed が中身へ畳むので、下書きは残ったままになる。
+        if self.input_draft.as_mut().is_some_and(|d| d.feed(bytes)) {
+            self.input_draft = None;
         }
         self.writer.send(bytes);
     }
 
     /// 「入力欄へ入れるだけ」の配達が本文を入力欄へ残した (下書き占有の開始)。
     /// この印がある間、そのセッションへの `submit=true` 配達は始まらない。
-    pub fn note_input_draft(&mut self) {
-        self.input_draft = true;
+    ///
+    /// `text` は残した本文そのもの — [`InputDraft`] の中身をそれで始める
+    /// (追記や Backspace 全消しを追跡するため)。すでに下書きがあるなら
+    /// 追記側の本文は `write_bytes` の feed ですでに畳まれているので、
+    /// ここでは何もしない (種を置き直すと残量を過少に見る)。
+    pub fn note_input_draft(&mut self, text: &str) {
+        if self.input_draft.is_none() {
+            self.input_draft = Some(InputDraft::seeded(text));
+        }
     }
 
     /// insert が残した人の下書きが入力欄にある可能性があるか。
     pub fn input_draft(&self) -> bool {
-        self.input_draft
+        self.input_draft.is_some()
     }
 
     /// 端末の隅に出すバッジ用: (段, 直近の終了コード)。
@@ -4060,7 +4136,7 @@ mod menu_answer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_yes_reply, auto_yes_reply_for, releases_input_draft, stalled_reply_for};
+    use super::{auto_yes_reply, auto_yes_reply_for, stalled_reply_for, InputDraft};
 
     /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
     fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
@@ -4072,18 +4148,55 @@ mod tests {
     /// 本文の途中の矢印キーや Esc で解くと、残っている下書きへ後続の
     /// 確定送信が追記されて、その確定キーで一緒に送信される。
     #[test]
-    fn 下書きは確定と行消去の打鍵でだけ解放される() {
+    fn 下書きは確定と行消去の打鍵で解放される() {
         // 確定 (Enter)・行消去 (Ctrl+U)・中断 (Ctrl+C) → 解放
-        assert!(releases_input_draft(b"\r"));
-        assert!(releases_input_draft("たぶんこれ\r".as_bytes()));
-        assert!(releases_input_draft(b"\x15"));
-        assert!(releases_input_draft(b"\x03"));
-        // 普通の文字・Backspace・Esc・矢印キー列 → 解放しない
-        assert!(!releases_input_draft("あ".as_bytes()));
-        assert!(!releases_input_draft(b"\x7f"));
-        assert!(!releases_input_draft(b"\x1b"));
-        assert!(!releases_input_draft(b"\x1b[A"));
-        assert!(!releases_input_draft(b""));
+        assert!(InputDraft::seeded("下書き").feed(b"\r"));
+        assert!(InputDraft::seeded("下書き").feed(b"\n"));
+        assert!(InputDraft::seeded("下書き").feed(b"\x15"));
+        assert!(InputDraft::seeded("下書き").feed(b"\x03"));
+    }
+
+    /// **Backspace で下書きを消し切ると解放されるが、一部だけでは解かない。**
+    ///
+    /// 「1 打鍵で解く」と ABC → AB で誤解放して、残りが後続の確定キーで
+    /// 送信される。追跡している中身が空になるまで解かない (空になれば
+    /// 後続の確定送信を永久に止めない — Backspace 全消しは解放経路)。
+    #[test]
+    fn 下書きはバックスペースで消し切ると解放される() {
+        let mut d = InputDraft::seeded("ABC");
+        // 一部だけ消した (ABC → AB → A) → まだ下書き
+        assert!(!d.feed(b"\x7f"));
+        assert!(!d.feed(b"\x7f"));
+        // 全部消した → 解放 (後続の submit が永久に止まらない)
+        assert!(d.feed(b"\x7f"));
+        // 0x08 側の Backspace でも同じ
+        let mut d = InputDraft::seeded("あい");
+        assert!(!d.feed(b"\x08"));
+        assert!(d.feed(b"\x08"));
+        // 下書きへ人が文字を追記しても、下書きは残っている
+        let mut d = InputDraft::seeded("ABC");
+        assert!(!d.feed("D".as_bytes()));
+        assert!(!d.feed(b"\x7f")); // ABCD → ABC — 追記分を消しただけでは元の下書きが残る
+        assert!(!d.feed(b"\x7f"));
+        assert!(!d.feed(b"\x7f"));
+        assert!(d.feed(b"\x7f")); // 全部消えた
+    }
+
+    /// **Esc・矢印キーでは解放せず、以後の Backspace も解放根拠にしない。**
+    ///
+    /// エスケープ列が混ざると中身の推定が当てにならない (矢印で動いた
+    /// あとの削除回数は読めない) ので、確定・消去打鍵だけで解く。
+    #[test]
+    fn 下書きはエスケープ列では解放されず以後は確定消去だけで解く() {
+        let mut d = InputDraft::seeded("ABC");
+        // Esc・矢印キーでは解放しない
+        assert!(!d.feed(b"\x1b"));
+        assert!(!d.feed(b"\x1b[A"));
+        // 推定が曖昧になったあとの Backspace は解放根拠にしない
+        // (回数がずれているかもしれないので、空推定を信じない)
+        assert!(!d.feed(b"\x7f\x7f\x7f\x7f"));
+        // 確定・消去打鍵だけで解く
+        assert!(d.feed(b"\x15"));
     }
 
     /// 起動直後に空の入力欄へ y が撃ち込まれたバグの再発防止。

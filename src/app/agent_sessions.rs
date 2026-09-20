@@ -699,7 +699,9 @@ impl ZaivernApp {
                         // 終わる = **人の下書き**として占有が残る。この間に
                         // 後続の確定送信を始めると、その確定キーが下書きまで
                         // 一緒に送信する (解放は人の打鍵を write_bytes が見る)。
-                        s.note_input_draft();
+                        // 残した本文を渡して追跡の種にする — Backspace での
+                        // 全消しまで追えるようになる。
+                        s.note_input_draft(&p.job.text);
                     }
                     if p.job.wait_idle {
                         delivered.push(s.title.clone());
@@ -839,8 +841,9 @@ mod delivery_peek_tests {
             "submit_tick が下書き占有を due_now へ渡していない"
         );
         assert!(
-            body.contains("note_input_draft()"),
-            "insert の配達後に下書きの印を立てていない (後続の確定送信が下書きを巻き込む)"
+            body.contains("note_input_draft(&p.job.text)"),
+            "insert の配達後に下書きの印を立てていない (後続の確定送信が下書きを巻き込む)\n\
+             残した本文を渡さないと Backspace 全消しでの解放まで追えない"
         );
     }
 
