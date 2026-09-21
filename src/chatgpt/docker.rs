@@ -14,7 +14,9 @@ pub(super) fn detect() -> Result<(PathBuf, String)> {
     } else {
         let mut cmd = process::command(&binary);
         cmd.args(["context", "inspect"]);
-        let data = process::capture(cmd, Duration::from_secs(10), 65536)?;
+        let data = process::capture(cmd, Duration::from_secs(10), 65536).map_err(|_| {
+            "Docker context lookup failed or timed out; check docker context ls, then retry setup"
+        })?;
         let value: serde_json::Value =
             serde_json::from_slice(&data).map_err(|_| "Invalid Docker context")?;
         value[0]["Endpoints"]["docker"]["Host"]
@@ -25,7 +27,10 @@ pub(super) fn detect() -> Result<(PathBuf, String)> {
     validate_endpoint(&endpoint)?;
     let mut cmd = command(&binary, &endpoint);
     cmd.args(["info", "--format", "{{.OSType}}"]);
-    if process::capture(cmd, Duration::from_secs(15), 1024)? != b"linux\n" {
+    if process::capture(cmd, Duration::from_secs(15), 1024).map_err(|_| {
+        "Docker daemon unavailable or timed out; start Docker and retry zai chatgpt doctor"
+    })? != b"linux\n"
+    {
         return Err("Docker must run Linux containers".into());
     }
     Ok((binary, endpoint))
