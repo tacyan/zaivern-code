@@ -55,6 +55,7 @@
 - 文書だけの変更は差分・リンク・指示の整合性を確認する。実行コードやビルドに影響しなければ Rust / OS 検証は不要。
 - Rust 変更は `tools/verify.sh` を入口とし、push 前には `tools/verify.sh --lint` を実行する。テストコードもコンパイルして警告を確認する。同じ目的で check と test を重複実行しない。
 - OS 分岐・ファイルシステム・プロセス・端末・打鍵・依存・ビルドの変更は、影響する OS を検証する。Linux は `tools/linux-test.sh`、Windows は `tools/windows-check.sh` を使い、ホストの成果物を分離する。
+- 保存済み Windows 検証 VM の起動・終了・再現手順は [Windows VM 手順](docs/windows-vm.md) を参照する。
 - クロスチェック成功を、対象 OS の実行・GUI・リソース埋め込みの確認と扱わない。GUI 変更は対象の操作と表示を検証する。プロセス生存確認は起動の検査に限定する。
 - スマホ画面は必要に応じて `tools/remote-check.sh` を使う。実 PTY テストの全量実行には `.config/nextest.toml` の分離・直列化・時限設定を使う。
 - 実行不能・skip は理由付きで「未確認」と報告する。Docker 固有の既知の制約は再現条件と追跡先を記録し、新しい失敗を一括除外しない。
