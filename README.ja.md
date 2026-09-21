@@ -42,6 +42,8 @@ zai .
 対応する AI コーディング CLI を最低 1 つ、導入してサインインしておく必要があります。
 Zaivern Code は手元の CLI を動かすだけで、AI モデルも利用権も同梱しません。
 
+[**Discordに参加する**](https://discord.gg/WeuJFgaxM6)
+
 **競合調整（任意）:**
 
 ```bash

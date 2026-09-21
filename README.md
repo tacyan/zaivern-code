@@ -45,6 +45,8 @@ zai .
 Requires at least one supported coding CLI already installed and signed in.
 Zaivern Code drives your existing CLIs and includes no AI model or subscription.
 
+[**Join us on Discord**](https://discord.gg/WeuJFgaxM6)
+
 **Optional conflict coordination:**
 
 ```bash

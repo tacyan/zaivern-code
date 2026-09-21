@@ -42,6 +42,8 @@ zai .
 지원되는 AI 코딩 CLI를 최소 하나는 설치하고 로그인해 두어야 합니다.
 Zaivern Code는 이미 가지고 있는 CLI를 구동할 뿐, AI 모델이나 구독을 포함하지 않습니다.
 
+[**Discord에 참여하기**](https://discord.gg/WeuJFgaxM6)
+
 **충돌 조정(선택):**
 
 ```bash

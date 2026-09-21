@@ -42,6 +42,8 @@ zai .
 需要你至少已经安装并登录一种受支持的 AI 编程 CLI。
 Zaivern Code 只是驱动你现有的 CLI，本身不附带任何 AI 模型或订阅。
 
+[**加入 Discord 社区**](https://discord.gg/WeuJFgaxM6)
+
 **冲突协调（可选）：**
 
 ```bash

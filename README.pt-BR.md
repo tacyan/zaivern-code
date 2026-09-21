@@ -43,6 +43,8 @@ zai .
 Requer pelo menos uma CLI de código compatível já instalada e autenticada.
 O Zaivern Code apenas conduz as CLIs que você já tem e não inclui modelo de IA nem assinatura.
 
+[**Junte-se a nós no Discord**](https://discord.gg/WeuJFgaxM6)
+
 **Coordenação de conflitos (opcional):**
 
 ```bash
