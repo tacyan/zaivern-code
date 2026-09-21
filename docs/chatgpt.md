@@ -36,13 +36,19 @@ image の非秘密設定として用意します。[Qwen の公式認証仕様](
 ## ChatGPT への接続
 
 stdio プロセスをブラウザの ChatGPT が直接起動する、という前提にはしていません。
-2026-09-20 に確認した OpenAI 公式文書では、開発用 MCP の接続先は公開 HTTPS または
+2026-09-22 に確認した OpenAI 公式文書では、開発用 MCP の接続先は公開 HTTPS または
 Secure MCP Tunnel で、Tunnel は stdio server へ転送できます。
 Developer mode の利用可否はアカウントと workspace policy に依存します。
 [接続・テストの公式手順](https://developers.openai.com/plugins/deploy/connect-chatgpt)
 
 stdio のこの MVP は、利用可能なアカウントで公式 Tunnel を使う構成です。
 Platform の Tunnel 設定から tunnel ID と runtime key を用意し、公式クライアントを導入します。
+この手順の確認対象は **tunnel-client v0.0.14** です。
+配布物 `tunnel-client-v0.0.14-<OS>-<ARCH>` に含まれる `tunnel-client` を使用します。
+`tunnel-client-runtime-cloudflared` 単体は、この `init` / `doctor` / `run` 手順の起点ではありません。
+端末で `tunnel-client --version` が `0.0.14` を示すことを確認してください。
+ローカルの darwin-amd64 配布物では
+`0.0.14+0f870e50a973fa820d4c409000059e181e8d242b` と各サブコマンドの help を確認しました。
 以下の command は適切に shell quote した絶対パスへ置き換えてください。
 
 実際のキーをコマンド文字列や repository / shell history に保存しないでください。
@@ -59,10 +65,20 @@ tunnel-client init \
   --sample sample_mcp_stdio_local \
   --profile zaivern \
   --tunnel-id YOUR_TUNNEL_ID \
-  --mcp-command 'zai mcp serve --workspace /absolute/project --image sha256:IMAGE_ID'
+  --mcp-command '/absolute/path/to/zai mcp serve --workspace /absolute/project --image sha256:IMAGE_ID'
 tunnel-client doctor --profile zaivern --explain
-tunnel-client run --profile zaivern
+tunnel-client run --profile zaivern --mcp.stdio-send-initialized-notification
 ```
+
+`--mcp-command` の `zai` は修正版をビルドした実行ファイルの絶対パスにしてください。
+PATH 上の古い v0.24.7 バイナリを指定したままでは、ソースを修正しても discovery は変わりません。
+同じ profile が存在する場合は無条件に `init --force` で上書きせず、既存設定の MCP command を更新します。
+
+v0.0.14 の initialized 自動通知は **opt-in** です。上記 run オプションにより、
+旧 MCP の `initialize` 成功後に `notifications/initialized` を stdio server へ送信します。
+クライアントが後から同じ通知を送った場合は tunnel-client 側が重複を抑制します。
+[v0.0.14 の実装](https://github.com/openai/tunnel-client/blob/v0.0.14/pkg/mcpclient/serialized_forwarding_transport.go)
+この通知を省略した旧 MCP の tool 呼び出しを、Zaivern が暗黙に初期化済みとして許可することはありません。
 
 Tunnel の runtime key は Tunnel client にだけ設定し、Agent image へ渡しません。
 必要な workspace 関連付け・権限・認証方法は [Secure MCP Tunnel の公式文書](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
@@ -72,8 +88,47 @@ tools menu から選択して試してください。公式文書には新規 co
 **使用するアカウントの通常 Chat で実際に選択できるかは manual verification required です。**
 Work でしか利用できないアカウントでは、今回の通常 Chat の要件を満たしたと扱いません。
 
+Connector / Plugin 作成では Connection を **Tunnel**、対象 Tunnel を **Zaivern**、
+Authentication を **None** とします（この stdio server 自体は OAuth を公開していません）。
+`run` は Connector 登録・利用中も起動したままにします。
+Tunnel UI の Health=live / Ready=ready / connected は転送経路の状態です。
+`doctor` 成功、`tunnel_service_status="200"`、`/response` の HTTP 200 は
+MCP の `result` 成功を保証しません。`error.code` / `error.message` も確認してください。
+
 HTTPS server / OAuth server はこの PR に追加していません。
 独自の認証なし HTTP wrapper を公開する手順も提供しません。
+
+### Discovery と protocol version
+
+`src/features/chat_bridge.rs` → `src/chat_bridge/mod.rs` → `protocol::serve` が
+`zai mcp serve` の stdio 経路です。応答は改行区切りの JSON-RPC のみを stdout に出し、
+ログは stderr に出します。
+
+- 旧ハンドシェイク: `initialize` → `notifications/initialized` → `server/discover` → `tools/list`。
+  `2024-11-05` / `2025-06-18` / `2025-11-25` の要求には同じ版を返します。
+  未対応版には対応する旧版 `2025-11-25` を提示し、利用可否はクライアントが判断します。
+  batching が必要な `2025-03-26` は対応版として掲示しません。
+- 新仕様 `2026-07-28`: request の `params._meta` に
+  `io.modelcontextprotocol/protocolVersion` と `io.modelcontextprotocol/clientCapabilities` を付けます。
+  initialize は不要で、`server/discover` または `tools/list` / `tools/call` から開始できます。
+  対応しない要求版には `-32022` と `error.data.supported` / `requested` を返します。
+- discovery は `resultType: "complete"`、`supportedVersions`、`capabilities: {"tools":{}}`、
+  `_meta["io.modelcontextprotocol/serverInfo"]` を返します。草案 SEP の top-level `serverInfo` とは異なります。
+- discovery と最新仕様の tools/list は、必須の `cacheScope: "private"`、`ttlMs: 0` を返し、共有キャッシュや古いツール定義の再利用を要求しません。
+  tools の一覧は `tools/list` で取得します。resources / prompts は掲示せず、対応しないメソッドには
+  `-32601` を返します。存在しないツールは `-32602`、実行・引数の失敗は tool result の `isError` です。
+
+根拠: [MCP discovery](https://modelcontextprotocol.io/specification/2026-07-28/server/discover)、
+[新旧バージョンの互換性](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)、
+[旧 initialize の版交渉](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)。
+
+修正前の v0.24.7 の `protocol.rs` には `server/discover` の分岐がなく、通知後でも
+`-32601 Method not found`、通知前なら `-32000 Initialize the connection first` を返していました。
+また版の応答は `2024-11-05` 固定でした。固定値だけを登録失敗の原因とは断定できませんが、
+新仕様の discovery を要求するクライアントには必要な応答がありませんでした。
+v0.0.14 の [dispatcher](https://github.com/openai/tunnel-client/blob/v0.0.14/pkg/dispatcher/internal/processor.go)
+は JSON-RPC の error も正常に転送するため、HTTP 200 はこの不整合を否定しません。
+実アカウントの request/response 本文と Connector 再登録の成功は、下記 manual acceptance で確認します。
 
 ## Manual acceptance checklist
 

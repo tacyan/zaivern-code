@@ -113,8 +113,21 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
         assert!(!response.contains(SENTINEL));
         assert!(!response.contains(&encoded));
-        serde_json::from_str(&response).unwrap()
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], sequence);
+        response
     };
+    // A modern client can discover and list on fresh stdio without initialize.
+    let metadata = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    let modern_discovery = call("server/discover", json!({"_meta":metadata}));
+    assert_eq!(modern_discovery["result"]["resultType"], "complete");
+    let modern_list = call("tools/list", json!({"_meta":metadata}));
+    assert_eq!(modern_list["result"]["resultType"], "complete");
+    assert_eq!(modern_list["result"]["tools"].as_array().unwrap().len(), 3);
     let init = call(
         "initialize",
         json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}),
@@ -143,14 +156,31 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
         let encoded: String = SENTINEL.bytes().map(|b| format!("{b:02x}")).collect();
         assert!(!response.contains(SENTINEL));
         assert!(!response.contains(&encoded));
-        serde_json::from_str(&response).unwrap()
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], sequence);
+        response
     };
+    // Registration must discover the server as well as list tools. HTTP 200
+    // from the tunnel is not sufficient if this is a JSON-RPC error.
+    let discovery = call("server/discover", json!({}));
+    assert!(discovery.get("error").is_none(), "{discovery}");
+    assert_eq!(discovery["result"]["resultType"], "complete");
+    assert_eq!(discovery["result"]["capabilities"], json!({"tools":{}}));
     assert_eq!(
-        call("tools/list", json!({}))["result"]["tools"]
+        discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "zaivern-chat-bridge"
+    );
+    let listed = call("tools/list", json!({}));
+    assert_eq!(listed["result"]["tools"], modern_list["result"]["tools"]);
+    assert_eq!(
+        listed["result"]["tools"]
             .as_array()
             .unwrap()
-            .len(),
-        3
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["zaivern_run_task", "zaivern_task_status", "zaivern_cancel_task"]
     );
     for instruction in [
         "Fix the failing test and show the diff",
