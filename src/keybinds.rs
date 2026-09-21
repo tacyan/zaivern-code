@@ -460,7 +460,13 @@ fn default_shortcut(a: BindAction) -> KeyboardShortcut {
             }
         }
         BindAction::NavForward => {
-            KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus)
+            if cfg!(target_os = "macos") {
+                KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Minus)
+            } else {
+                // Ctrl+Shift+- は配列を問わず縮小に使う。ファイル単位の
+                // Ctrl+Alt+Shift+- とも競合しない標準的な「進む」の打鍵。
+                KeyboardShortcut::new(Modifiers::ALT, Key::ArrowRight)
+            }
         }
         BindAction::GoToDefinition => KeyboardShortcut::new(Modifiers::NONE, Key::F12),
         BindAction::GoToBracket => KeyboardShortcut::new(cmd_shift, Key::Backslash),
@@ -937,7 +943,20 @@ impl Keybinds {
 
     /// 画面に出す打鍵表記。chord は "⌘K ⌘S" のように 2 つ並べる。
     pub fn label(&self, a: BindAction) -> String {
-        format_binding(self.binding(a))
+        let mut binding = self.binding(a);
+        // Windows/Linux の全体ズームは、記号を打つ Shift も明示する。
+        // 既定の消費は Shift なしも受け付けるため、従来の Ctrl+- / Ctrl+=
+        // を維持したまま、メニュー・パレットには実際に使える同じ打鍵を出す。
+        // 別キーや chord への再割り当ては、その指定どおり表示する。
+        if !cfg!(target_os = "macos")
+            && matches!(a, BindAction::ZoomIn | BindAction::ZoomOut)
+            && binding.canonical() == default_binding(a).canonical()
+        {
+            if let Binding::Single(sc) = &mut binding {
+                sc.modifiers.shift = true;
+            }
+        }
+        format_binding(binding)
     }
 
     /// GUI からの再割り当て。
@@ -2326,6 +2345,32 @@ pub fn take_clipboard_event(i: &mut egui::InputState, alias: ClipboardAlias) -> 
 /// 必ずこれを通すこと** — 素の `consume_shortcut` を使うと
 /// 「画面には ⌘⇧C と書いてあるのに効かない」が再発する。
 pub fn consume_shortcut_compat(i: &mut egui::InputState, sc: KeyboardShortcut) -> bool {
+    // US の Ctrl+= は拡大の別名。ただし JIS の Shift+- も論理キーが
+    // Equals になるので、物理 Minus は縮小へ振り分ける。通常の文字入力や
+    // Equals 自体への再割り当ては変更せず、Plus / Minus の消費時だけ扱う。
+    if matches!(sc.logical_key, Key::Plus | Key::Minus) {
+        for event in &mut i.events {
+            if let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            {
+                if *key == Key::Equals && modifiers.matches_logically(sc.modifiers) {
+                    let target = if *physical_key == Some(Key::Minus) && modifiers.shift {
+                        Key::Minus
+                    } else {
+                        Key::Plus
+                    };
+                    if target == sc.logical_key {
+                        *key = target;
+                    }
+                }
+            }
+        }
+    }
     if i.consume_shortcut(&sc) {
         return true;
     }
@@ -4867,5 +4912,164 @@ fn other() {
         );
         // 割り当ての無い ID は空文字 (パレットの打鍵欄が空のまま出る)
         assert_eq!(feature_key_hint(&binds, "t.unknown"), "");
+    }
+}
+
+#[cfg(test)]
+mod zoom_shortcut_regression_tests {
+    use super::*;
+
+    fn pressed(key: Key, physical_key: Option<Key>, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn zoom_direction_follows_minus_on_jis_and_plus_on_us() {
+        let mods = if cfg!(target_os = "macos") {
+            Modifiers::COMMAND.plus(Modifiers::SHIFT)
+        } else {
+            Modifiers::CTRL
+                .plus(Modifiers::COMMAND)
+                .plus(Modifiers::SHIFT)
+        };
+        for (key, physical, expected) in [
+            (Key::Equals, Some(Key::Minus), BindAction::ZoomOut),
+            (Key::Minus, Some(Key::Minus), BindAction::ZoomOut),
+            (Key::Plus, Some(Key::Equals), BindAction::ZoomIn),
+            (Key::Plus, Some(Key::Semicolon), BindAction::ZoomIn),
+            (Key::Equals, Some(Key::Equals), BindAction::ZoomIn),
+            (Key::Equals, None, BindAction::ZoomIn),
+        ] {
+            for file in [false, true] {
+                let modifiers = if file {
+                    mods.plus(Modifiers::ALT)
+                } else {
+                    mods
+                };
+                let ctx = egui::Context::default();
+                let mut fired = Vec::new();
+                let _ = ctx.run(
+                    egui::RawInput {
+                        modifiers,
+                        events: vec![pressed(key, physical, modifiers)],
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.input_mut(|i| {
+                            let mut chord = ChordState::default();
+                            // 製品と同じ優先順。NavForward が縮小を奪う回帰も検出する。
+                            for action in [
+                                BindAction::FileZoomIn,
+                                BindAction::FileZoomOut,
+                                BindAction::NavForward,
+                                BindAction::NavBack,
+                                BindAction::ZoomIn,
+                                BindAction::ZoomOut,
+                            ] {
+                                if consume_binding(
+                                    i,
+                                    Binding::Single(default_shortcut(action)),
+                                    &mut chord,
+                                ) {
+                                    fired.push(action);
+                                }
+                            }
+                            assert!(i.events.is_empty(), "押下が二重に残った");
+                        });
+                    },
+                );
+                let expected = if file {
+                    if expected == BindAction::ZoomIn {
+                        BindAction::FileZoomIn
+                    } else {
+                        BindAction::FileZoomOut
+                    }
+                } else {
+                    expected
+                };
+                assert_eq!(fired, vec![expected], "{key:?}/{physical:?}, file={file}");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_labels_show_shift_and_preserve_custom_bindings() {
+        let mut keys = Keybinds::default();
+        for (action, symbol) in [(BindAction::ZoomIn, "+"), (BindAction::ZoomOut, "-")] {
+            let expected = if cfg!(target_os = "macos") {
+                format!("⌘{symbol}")
+            } else {
+                format!("Ctrl+Shift+{symbol}")
+            };
+            assert_eq!(keys.label(action), expected);
+            let shown = canonical_shortcut(parse_display_shortcut(&keys.label(action)).unwrap());
+            let ctx = egui::Context::default();
+            let mut fired = false;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![pressed(shown.logical_key, None, shown.modifiers)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.input_mut(|i| {
+                        fired =
+                            consume_binding(i, keys.binding(action), &mut ChordState::default());
+                    })
+                },
+            );
+            assert!(fired, "表示した打鍵が効かない: {expected}");
+            for spec in ["cmd+f8", "cmd+k cmd+u"] {
+                let binding = parse_binding(spec).unwrap();
+                keys.set(action, binding);
+                assert_eq!(keys.label(action), format_binding(binding));
+            }
+        }
+        assert_eq!(
+            keys.label(BindAction::ZoomReset),
+            format_shortcut(default_shortcut(BindAction::ZoomReset))
+        );
+    }
+
+    #[test]
+    fn plus_alias_respects_modifiers_rebinding_and_chord_waiting() {
+        let cmd = Modifiers::COMMAND;
+        let plus = KeyboardShortcut::new(cmd, Key::Plus);
+        let prefix = KeyboardShortcut::new(cmd, Key::K);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![pressed(Key::Equals, Some(Key::Equals), cmd)],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.input_mut(|i| {
+                    let mut chord = ChordState::default();
+                    let original = i.events.clone();
+                    assert!(!consume_binding(
+                        i,
+                        Binding::Single(KeyboardShortcut::new(cmd, Key::F8)),
+                        &mut chord
+                    ));
+                    assert!(!consume_binding(
+                        i,
+                        Binding::Single(KeyboardShortcut::new(cmd.plus(Modifiers::ALT), Key::Plus)),
+                        &mut chord
+                    ));
+                    assert_eq!(i.events, original);
+                    chord.arm(prefix, i.time);
+                    assert!(!consume_binding(i, Binding::Single(plus), &mut chord));
+                    assert_eq!(i.events, original);
+                    assert!(consume_binding(i, Binding::Chord(prefix, plus), &mut chord));
+                    assert!(i.events.is_empty());
+                    assert!(!chord.is_waiting());
+                })
+            },
+        );
     }
 }

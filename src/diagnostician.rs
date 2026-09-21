@@ -1024,12 +1024,21 @@ mod tests {
     fn huge_response_is_bounded_and_rejected() {
         // 大量出力でもバッファは MAX_RESPONSE_BYTES で止まり、形式不一致で None。
         #[cfg(windows)]
-        // 'guruguru' (8 文字) × 25 万 = 2,000,000 文字を 1 行で吐く
-        let d = ps1_diag("huge", "'guruguru' * 250000\n", 30);
+        // PowerShell の表示整形を通さず、同じ 2,000,000 バイトを直接流す。
+        // 検査対象は表示速度ではなく、子の出力を最後まで読み捨てる上限処理。
+        let d = ps1_diag(
+            "huge",
+            "$bytes = [Text.Encoding]::ASCII.GetBytes('guruguru' * 250000)\n$stdout = [Console]::OpenStandardOutput()\n$stdout.Write($bytes, 0, $bytes.Length)\n$stdout.Flush()\n",
+            30,
+        );
         #[cfg(not(windows))]
         let d = raw("/bin/sh", &["-c", "yes ぐるぐる | head -c 2000000"], 30);
         assert!(d.diagnose(&req(Anomaly::Runaway, "x")).is_none());
-        assert!(d.last_error().unwrap().contains("形式"));
+        assert!(
+            d.last_error().unwrap().contains("形式"),
+            "{:?}",
+            d.last_error()
+        );
     }
 
     // --- 実機確認 (既定では走らせない) ---

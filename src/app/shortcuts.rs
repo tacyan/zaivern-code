@@ -366,14 +366,8 @@ impl ZaivernApp {
         // egui の `Modifiers::matches_logically` は「パターンに無い修飾キーは
         // 押されていてもよい」判定なので、修飾キーの多い方から取らないと
         // 少ない方 (戻る・画面全体ズーム) に吸われる。
-        // ⌥⌘= の別名も足す: macOS の ⌥= は「≠」を打つ組み合わせで論理キーが
-        // 取れず、winit が物理キー (Equal) へフォールバックするため。
-        if consume(ctx, self.keys.binding(BindAction::FileZoomIn))
-            || consume_sc(
-                ctx,
-                KeyboardShortcut::new(self.keys.get(BindAction::FileZoomIn).modifiers, Key::Equals),
-            )
-        {
+        // `=` の別名は keybinds の互換消費で扱う (JIS の Shift+- と区別する)。
+        if consume(ctx, self.keys.binding(BindAction::FileZoomIn)) {
             cmds.push(Cmd::FileZoomIn);
         }
         if consume(ctx, self.keys.binding(BindAction::FileZoomOut)) {
@@ -592,13 +586,9 @@ impl ZaivernApp {
         // 順序を入れ替えると **ファイル単位のズームが画面全体になる**。
         // ファイル単位 (⌘⌥+ / ⌘⌥- / ⌘⌥0) は上でもう消費済み — ⌥ 付きを
         // 先に取らないと、少ない方 (画面全体) へ吸われるため。
-        // `=` の別名も割り当てから作る (再割り当てしても別名がついてくる)。
-        if consume(ctx, self.keys.binding(BindAction::ZoomIn))
-            || consume_sc(
-                ctx,
-                KeyboardShortcut::new(self.keys.get(BindAction::ZoomIn).modifiers, Key::Equals),
-            )
-        {
+        // `=` の別名は Plus の割り当てだけに付く。別キーへの再割り当てや
+        // chord へ変更した場合に、古い単打の別名を残さない。
+        if consume(ctx, self.keys.binding(BindAction::ZoomIn)) {
             cmds.push(Cmd::ZoomIn);
         }
         if consume(ctx, self.keys.binding(BindAction::ZoomOut)) {

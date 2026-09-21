@@ -200,6 +200,9 @@ impl ZaivernApp {
         // 画面全体のズームは毎フレームここで egui へ揃える。値が変わって
         // いなければ何も起きない (再描画も要求されない)。
         apply_ui_zoom(ctx, self.cfg.ui_zoom);
+        // 文字倍率も設定から同期する。メニューやバッジでの変更・リセットを
+        // 次の描画へ渡し、起動時の倍率がテーマに残り続けるのを防ぐ。
+        crate::theme::set_text_scale(ctx, self.cfg.text_scale);
         // ⌘+ホイール / ピンチはショートカットより先に見る。ここで拾わないと
         // ScrollArea が同じイベントをスクロールとして食ってしまう。
         self.handle_zoom_gesture(ctx);
@@ -1170,5 +1173,31 @@ impl ZaivernApp {
         // フレームまで「アイドルなのに描いた」に混ざり、設計原則 3 の数字が
         // 実際より悪く出る (= 直す必要のないものを追いかける)。
         crate::perf::note_idle(!signals.had_input && !signals.agents_running);
+    }
+}
+
+#[cfg(test)]
+mod text_scale_sync_regression_tests {
+    #[test]
+    fn changed_text_scale_reaches_the_next_frame_without_restart() {
+        // update_impl の接続が消えると、設定だけ更新され表示に反映されない。
+        let update = include_str!("frame_update.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(update.contains("crate::theme::set_text_scale(ctx, self.cfg.text_scale);"));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, &crate::theme::by_name("zaivern-dark"));
+        let normal = ctx.style().text_styles.clone();
+        assert!(crate::theme::set_text_scale(&ctx, 3.0));
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert!(
+            ctx.style().text_styles[&egui::TextStyle::Body].size
+                > normal[&egui::TextStyle::Body].size * 2.0
+        );
+        assert!(crate::theme::set_text_scale(&ctx, 1.0));
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert_eq!(ctx.style().text_styles, normal);
+        assert!(!crate::theme::set_text_scale(&ctx, 1.0));
     }
 }
