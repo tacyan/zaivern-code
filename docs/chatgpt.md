@@ -3,7 +3,110 @@
 目的は、通常の ChatGPT **Chat conversation** から Zaivern に開発作業を依頼することです。
 独自 Chat UI、Codex 専用フロントエンド、ChatGPT Work への切り替えは実装しません。
 
-## 起動と workspace の許可
+## Quickstart
+
+対象プロジェクトのディレクトリで実行します。
+この導線には本変更を含むビルドが必要です。既存の v0.24.7 配布バイナリには
+`chatgpt` サブコマンドがないため、同じバージョン表示だけで対応済みと判断しないでください。
+
+```sh
+zai chatgpt setup
+zai chatgpt start
+```
+
+setup は OS/CPU、実行中の zai、ローカル Docker context/socket、workspace、既存設定を確認し、
+公式の**通常版** tunnel-client を検証して管理領域へ導入します。Tunnel ID、信頼する Agent image 名、
+Runtime API Key を対話入力します。image の SHA256 を手作業で調べる必要はありません。
+取得済み image を検査し、なければ確認して pull し、以後は immutable image ID で実行します。
+workspace は既定でカレントディレクトリです。絶対 canonical path に固定します。
+
+**推論用の OpenAI API Key や別途の Responses / Chat Completions API 利用は不要です。**
+Runtime API Key は Secure MCP Tunnel の認証専用です。モデル推論には使用しません。
+ChatGPT の通常 Chat が依頼の入口となり、既存 Bridge のコンテナ内 Agent が作業を行います。
+現在の Agent 実装には、下記契約を満たす **Qwen ACP・ローカルモデル同梱 image** が必要です。
+公式の本番 Agent image やモデル重みをこの CLI が提供するわけではありません。
+`tools/mcp-fixture.Dockerfile` は検証専用であり、一般のバグ修正を行うモデルではありません。
+
+最後に ChatGPT の Settings → Plugins / Apps（Developer mode）で接続を作成します。
+名前を Zaivern、Connection を Tunnel、対象 Tunnel を選択し、Authentication は None とします。
+通常の新規 Chat で Zaivern を選び「このバグを直して」と依頼してください。
+ChatGPT UI の自動操作は行いません。アカウント・組織で Tunnel と Developer mode が利用可能である必要があります。
+Tunnel の作成・ID の確認先: <https://platform.openai.com/settings/organization/tunnels>。
+一覧取得のために追加の Admin API Key を要求せず、Tunnel ID 入力を使用します。
+
+### 日常の操作
+
+| コマンド | 動作 |
+| --- | --- |
+| `zai chatgpt start` | 所有する supervisor と tunnel-client をバックグラウンド起動。二重起動を防止 |
+| `zai chatgpt start --foreground` | 端末で実行。終了シグナルで所有する子を停止 |
+| `zai chatgpt status` | 所有プロセス、health/ready、stdio channel、workspace/image/Tunnel を表示 |
+| `zai chatgpt doctor` | 設定・鍵の存在・公式 doctor・実 stdio discovery を検査 |
+| `zai chatgpt stop` | nonce で所有 supervisor を確認して停止。保存 PID だけを信用して kill しない |
+| `zai chatgpt repair` | 検証済み client/profile/zai path を修復。image の再取得は確認付き |
+| `zai chatgpt setup --reauth` | Runtime key を非表示入力で更新。起動中は先に stop |
+| `zai chatgpt reset` | 削除範囲を表示して確認。設定・profile・Runtime key を削除 |
+| `zai chatgpt test` | 一時 workspace と deterministic ACP fixture によるローカル E2E |
+
+setup の再実行では Verify / Repair / Reconfigure / Cancel を選べます。
+設定変更と reset は実行中の Bridge を勝手に止めません。先に `stop` してください。
+停止は MCP worker の終了記録も確認します。強制終了や後片付け未確認を成功表示しません。
+未確認の世代が残る場合は再起動・再設定・reset を止め、状態を保存します。
+reset は Platform の Tunnel、ソース、Docker image、検証済み client のインストールを削除しません。
+自動ログイン起動の登録は行わないため、PC 再起動後は `start` します。
+
+### 保存先と秘密情報
+
+管理領域は `~/.zaivern/chatgpt/`（`ZAIVERN_HOME` 設定時はその直下）です。
+0700 ディレクトリ、0600 設定/profile、所有者・symlink/hardlink 検査を使用します。
+既存の `~/.config/tunnel-client/` profile は上書きせず、専用の `profile.yaml` を使います。
+JSON は YAML のサブセットとして公式クライアントの strict decoder で読み込みます。
+profile 内には `env:CONTROL_PLANE_API_KEY` 参照だけを保存します。
+
+macOS は Keychain、Linux は `secret-tool` 経由の Secret Service を使用します。
+Linux で Secret Service がない場合に限り、明示確認後に専用 0600 file を使用します。
+Keychain/keyring のアクセス拒否を理由に自動で平文保存へ切り替えることはありません。
+秘密保存先の変更は、先に保存先だけを記録した復旧 journal を永続化します。
+途中で設定保存が失敗しても `reset` が新旧の保存先を回収でき、旧キーは新設定の確定後に削除します。
+鍵は CLI 引数・shell history・workspace・image・Agent/Docker 環境へ渡しません。
+Tunnel 専用子プロセスだけに渡し、MCP 起動は通常初期化より前に環境を除去して再execします。
+生の子プロセス stdout/stderr は保存・表示せず、doctor の既知の検査名と状態だけを表示します。
+この版には `logs --export` はありません。診断には `status` / `doctor` を使用してください。
+
+### 配布物と互換性
+
+- Intel Mac: `darwin-amd64`。Apple Silicon: `darwin-arm64`。
+- Linux x86_64: `linux-amd64`。Linux aarch64/arm64: `linux-arm64`。
+- Windows は既存 MCP 実行層の安全な filesystem 対応が未実装のため明示的に非対応です。
+- tested / supported / detected を分離し、現在は **検証対象 0.0.14 のみ**を許可します。
+  pre-1.0 の将来版を semver だけで互換とみなしません。更新点は `src/chatgpt/install.rs` に集約しています。
+- `openai/tunnel-client` の release metadata、SHA256SUMS、提供される asset digest、サイズを検査し、
+  ZIP 検証後に binary header の OS/CPU を検査します。HTTPS のみで取得します。
+  `tunnel-client-runtime-cloudflared` は対象 asset として選択しません。
+- macOS で起動が拒否された場合は実行権限・quarantine・Keychain を確認します。
+  Gatekeeper を無効化したり quarantine を自動削除したりしません。
+
+### 診断と検証範囲
+
+`doctor` は `initialize → notifications/initialized → server/discover → tools/list` を実 stdio で実行し、
+公開 tool がちょうど3個であることを確認します。公式 `doctor --explain --json` の結果も検査します。
+公式 doctor は起動前の設定検査であり、Runtime key のサーバ側認証成功を保証しません。
+停止中の health/ready/Control Plane は WARN です。`start` 後に再検査してください。
+認証に失敗する場合は Runtime key、Tunnel の組織、Tunnels Read/Use 権限を確認し、
+必要なら `zai chatgpt setup --reauth` を実行します。
+Control Plane metadata の取得と MCP channel の起動は、Connector 登録や task 完了とは別の検査です。
+
+`test` は本番 workspace を編集せず、一時 Rust プロジェクトで run/status/edit/offline test/diff/cancel を実行します。
+設定前でも実行できます。この場合はローカル Docker 検証だけを行い、Tunnel 検査は未確認と表示します。
+fixture の初回 Docker build には base image 取得が必要な場合がありますが、LLM・推論 API Key は不要です。
+Runtime key が取得できないときは tunnel doctor を WARN にし、ローカル検証だけを行います。
+終了時に一時 workspace を削除します。fixture image/build cache は再利用のため残します。
+本番 Agent image 内の実モデルの品質・動作と、通常 Chat からの呼び出しは別途確認してください。
+**Remaining manual check: Open a normal ChatGPT chat and invoke Zaivern once.**
+
+## Advanced / Manual setup
+
+### 起動と workspace の許可
 
 ```sh
 zai mcp serve --workspace /absolute/path/to/project --image sha256:IMAGE_ID
@@ -308,10 +411,11 @@ Agent 自身の直接アクセスを制限しません。そのため今回の a
 実行時限と出力収集には既存 Cloud Execution の `run_child` / `CollectSink` を使います。
 タスクの内容をログへ記録せず、task ID / tool / state / duration / error 有無を stderr に出します。
 
-MCP は `2024-11-05` の stdio / initialize / ping / tools の限定実装です。
+MCP は stdio / initialize / ping / tools と上記の discovery・版交渉を実装します。
 [公式 rmcp](https://github.com/modelcontextprotocol/rust-sdk) は保守されている標準候補ですが、
 Tokio / futures / schemars 等を要します。同期構成と3 toolsに限定した今回は既存 serde_json を使い、
-新規依存・Cargo.lock の変更を避けました。独自 protocol 実装の保守責任が残ります。
+MCP 層への非同期 runtime 依存を追加していません。setup は別途 SHA256・ZIP・秘密保存の依存を使用します。
+独自 protocol 実装の保守責任が残ります。
 HTTP を追加する際は SDK への置き換えを優先して再評価してください。
 [chat-on-steroids](https://github.com/totec448-spec/chat-on-steroids) は high-level task lifecycle の参考で、
 コードをコピーしていません。

@@ -146,6 +146,16 @@ fn load_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // tunnel-client inherits its authentication environment into the stdio
+    // target. Sanitize before locale detection can spawn any helper process.
+    #[cfg(unix)]
+    if args.first().is_some_and(|arg| arg == "chatgpt")
+        && args
+            .get(1)
+            .is_some_and(|arg| arg == "__mcp" || arg == "__serve")
+    {
+        std::process::exit(features::chatgpt::cli_main(&args[1..]));
+    }
     #[cfg(windows)]
     let (gui_child, args) = windows_startup::take_gui_marker(args);
     #[cfg(any(target_os = "linux", target_os = "macos"))]

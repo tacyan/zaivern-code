@@ -18,6 +18,7 @@ pub(super) struct LocalExecutionTarget {
     image: String,
     docker: PathBuf,
     endpoint: String,
+    cleanup_failed: std::sync::atomic::AtomicBool,
 }
 impl LocalExecutionTarget {
     pub fn new(image: String) -> Result<Self, String> {
@@ -59,8 +60,14 @@ impl LocalExecutionTarget {
                 image,
                 docker,
                 endpoint,
+                cleanup_failed: std::sync::atomic::AtomicBool::new(false),
             })
         }
+    }
+    pub(super) fn cleanup_confirmed(&self) -> bool {
+        !self
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = crate::procx::hidden_command_raw(&self.docker);
@@ -462,6 +469,9 @@ impl Container<'_> {
 impl Drop for Container<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
+            self.target
+                .cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Release);
             eprintln!("mcp {error}");
         }
     }
@@ -518,6 +528,9 @@ impl<'a> Volume<'a> {
 impl Drop for Volume<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
+            self.target
+                .cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Release);
             eprintln!("mcp {error}");
         }
     }
@@ -878,6 +891,7 @@ exit 1
             image: "fixture".into(),
             docker: docker.clone(),
             endpoint: "fixture".into(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
         };
         let error = target
             .start_container(Instant::now(), false)
@@ -890,6 +904,7 @@ exit 1
         assert!(error.contains("Docker operation failed"), "{error}");
         assert!(error.contains("container cleanup unconfirmed"), "{error}");
         assert!(error.contains(&created), "{error}");
+        assert!(!target.cleanup_confirmed());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -929,6 +944,7 @@ exit 1
                 image: "fixture".into(),
                 docker,
                 endpoint: "fixture".into(),
+                cleanup_failed: std::sync::atomic::AtomicBool::new(false),
             };
             let container = Container {
                 target: &target,
@@ -951,6 +967,10 @@ exit 1
                 "before"
             );
             drop(container);
+            assert!(
+                !target.cleanup_confirmed(),
+                "{failure} cleanup must reach server exit status"
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -982,6 +1002,7 @@ exit 1
             image: "fixture".into(),
             docker: docker.clone(),
             endpoint: "fixture".into(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
         };
         let attack = br#"#[test] fn oracle() {
             let hidden = std::fs::read("vendor/local_dep/src/lib.rs").unwrap();

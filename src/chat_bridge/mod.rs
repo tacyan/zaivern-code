@@ -48,8 +48,17 @@ fn serve(args: &[String]) -> Result<(), String> {
         }
     }
     let root = workspace::validate_root(&root.ok_or("--workspace is required")?)?;
-    let target = target::LocalExecutionTarget::new(image.ok_or("--image is required")?)?;
-    let bridge = task::ChatBridge::new(root, Arc::new(target));
-    protocol::serve(std::io::stdin().lock(), std::io::stdout().lock(), &bridge)
-        .map_err(|e| e.to_string())
+    let target = Arc::new(target::LocalExecutionTarget::new(
+        image.ok_or("--image is required")?,
+    )?);
+    let bridge = task::ChatBridge::new(root, target.clone());
+    let result = protocol::serve(std::io::stdin().lock(), std::io::stdout().lock(), &bridge)
+        .map_err(|e| e.to_string());
+    drop(bridge); // Cancel/join the worker before observing final Docker cleanup.
+    if !target.cleanup_confirmed() {
+        return Err(
+            "Docker cleanup is unconfirmed; inspect the local task containers/volumes".into(),
+        );
+    }
+    result
 }

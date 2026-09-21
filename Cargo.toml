@@ -94,6 +94,12 @@ base64 = "0.23"
 #   * default-features を切っているのは gzip / json / cookies が要らないため
 #     (要るのは GET / POST / DELETE と Bearer ヘッダだけ)
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
+sha2 = "0.10.9"
+zeroize = "1.9"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 # セッション破棄時のプロセス**グループ**への killpg (procx::kill_tree)。
 # portable-pty は子を setsid するため pgid == pid で、グループごと落とせば
