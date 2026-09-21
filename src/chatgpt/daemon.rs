@@ -95,7 +95,7 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
     let config = Config::load(root)?;
     super::install::verify_installed(root)?;
     let key = secret::load(root, &config.secret_store)?;
-    for file in ["health-url", "runtime.json", "mcp.done", "shutdown.json"] {
+    for file in ["health-url", "runtime.json"] {
         let path = root.join(file);
         if path.symlink_metadata().is_ok() {
             private::open(&path, false)?;
@@ -120,16 +120,16 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
     // Raw client output can contain prompts or credentials. Discard it; status
     // and doctor expose structured checks only. No raw log file is persisted.
     let generation = private::nonce()?;
-    private::write(
-        &root.join("active-generation"),
-        generation.as_bytes(),
-        false,
-    )?;
+    {
+        let _execution = private::Lock::acquire(root, "mcp.lock")?;
+        super::cleanup::Cleanup::prepare(root, &config, &generation)?;
+    }
+    cmd.env("ZAIVERN_CHATGPT_GENERATION", &generation);
     let mut child = match process::OwnedChild::spawn(&mut cmd) {
         Ok(child) => child,
         Err(error) => {
             // No child was spawned, so no task can require cleanup.
-            private::write(&root.join("mcp.done"), generation.as_bytes(), false)?;
+            super::cleanup::Cleanup::load(root, &config)?.finish(false)?;
             return Err(error);
         }
     };
@@ -192,12 +192,7 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
     }
     let cleanup = ensure_clean(root);
     let success = result.is_ok() && shutdown.is_ok() && cleanup.is_ok();
-    private::write(
-        &root.join("shutdown.json"),
-        &serde_json::to_vec(&serde_json::json!({"generation":state.generation,"success":success}))
-            .map_err(|_| "Cannot encode shutdown receipt")?,
-        false,
-    )?;
+    write_shutdown(root, &state.generation, success)?;
     // Still hold the runtime lock, so another generation cannot exist yet.
     for file in ["runtime.json", "health-url"] {
         let _ = std::fs::remove_file(root.join(file));
@@ -259,13 +254,10 @@ pub(super) fn stop(root: &Path) -> Result<()> {
                 if let Ok(_lock) = private::Lock::acquire(root, "runtime.lock") {
                     ensure_clean(root)?;
                     let bytes = private::read(&root.join("shutdown.json"), 4096)?;
-                    let receipt: serde_json::Value =
+                    let receipt: ShutdownReceipt =
                         serde_json::from_slice(&bytes).map_err(|_| "Invalid shutdown receipt")?;
                     let active = private::read(&root.join("active-generation"), 64)?;
-                    if receipt["success"] != true
-                        || receipt["generation"].as_str().map(str::as_bytes)
-                            != Some(active.as_slice())
-                    {
+                    if !receipt.success || receipt.generation.as_bytes() != active.as_slice() {
                         return Err("Bridge exited abnormally or required forced termination; cleanup was checked, but stop was not successful. Run doctor.".into());
                     }
                     println!("ChatGPT Bridge stopped.");
@@ -291,7 +283,8 @@ pub(super) fn stop(root: &Path) -> Result<()> {
 }
 
 pub(super) fn ensure_clean(root: &Path) -> Result<()> {
-    if !root.join("active-generation").exists() {
+    super::cleanup::ensure_confirmed(root)?;
+    if root.join("active-generation").symlink_metadata().is_err() {
         return Ok(());
     }
     let active = private::read(&root.join("active-generation"), 64)?;
@@ -299,9 +292,28 @@ pub(super) fn ensure_clean(root: &Path) -> Result<()> {
         || !active.iter().all(u8::is_ascii_hexdigit)
         || private::read(&root.join("mcp.done"), 64).ok().as_ref() != Some(&active)
     {
-        return Err("Previous MCP cleanup is unconfirmed. State was preserved and restart/reset is blocked. Wait for task cancellation, then retry stop; inspect the local Docker task if it remains blocked.".into());
+        return Err("Previous MCP cleanup is unconfirmed. State preserved; start/setup/reset blocked. Run zai chatgpt status and zai chatgpt repair.".into());
     }
     Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShutdownReceipt {
+    generation: String,
+    success: bool,
+}
+
+pub(super) fn write_shutdown(root: &Path, generation: &str, success: bool) -> Result<()> {
+    private::write(
+        &root.join("shutdown.json"),
+        &serde_json::to_vec(&ShutdownReceipt {
+            generation: generation.into(),
+            success,
+        })
+        .map_err(|_| "Cannot encode shutdown receipt")?,
+        false,
+    )
 }
 
 pub(super) fn health(root: &Path, endpoint: &str) -> Result<bool> {

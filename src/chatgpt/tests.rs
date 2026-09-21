@@ -1,9 +1,9 @@
 use super::*;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
-struct Temp(std::path::PathBuf);
+pub(super) struct Temp(pub(super) std::path::PathBuf);
 impl Temp {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = crate::test_util::unique_temp_dir("chatgpt", "private");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)
@@ -15,7 +15,7 @@ impl Drop for Temp {
     }
 }
 
-fn fixture(root: &Path) -> Config {
+pub(super) fn fixture(root: &Path) -> Config {
     Config {
         version: 1,
         workspace: root.join("project ' 引用 $()"),
@@ -285,6 +285,7 @@ fn real_mcp_reexec_strips_key_before_any_startup_child() {
         .arg(&temp.0)
         .env("CONTROL_PLANE_API_KEY", "sk-runtime-sentinel-123456789")
         .env("OPENAI_API_KEY", "sk-inference-must-not-inherit")
+        .env("ZAIVERN_CHATGPT_GENERATION", private::nonce().unwrap())
         .env("ZAIVERN_HOME", temp.0.join("home"))
         .env_remove("LANG")
         .env_remove("LC_ALL");
@@ -365,6 +366,7 @@ fn official_client_managed_lifecycle_and_cleanup() {
     )
     .unwrap();
     install::install(&root).unwrap();
+    real_cleanup_failure_and_recovery(&root, &config);
     // Never use an actual account credential or a production workspace. The
     // control plane may reject this key; local MCP and health still must work.
     for _ in 0..2 {
@@ -381,4 +383,74 @@ fn official_client_managed_lifecycle_and_cleanup() {
         assert!(daemon::request(&root, "status").is_err());
     }
     assert_eq!(std::fs::read_dir(&config.workspace).unwrap().count(), 0);
+}
+
+fn real_cleanup_failure_and_recovery(root: &Path, config: &Config) {
+    use crate::features::chat_bridge::imp::{CleanupTracker, ResourceKind};
+    let generation = private::nonce().unwrap();
+    cleanup::Cleanup::prepare(root, config, &generation).unwrap();
+    let tracker = cleanup::Cleanup::load(root, config).unwrap();
+    tracker.admit(&generation).unwrap();
+    let (volume, labels) = tracker.register(ResourceKind::Volume).unwrap();
+    let mut cmd = docker::command(&config.docker, &config.docker_endpoint);
+    cmd.args(["volume", "create", "--driver", "local"])
+        .args(labels)
+        .arg(&volume);
+    process::capture(cmd, Duration::from_secs(30), 4096).unwrap();
+    tracker.created(ResourceKind::Volume, &volume).unwrap();
+    // The only resource this guard can remove was registered, labelled and
+    // verified above. Keep cleanup ownership even if an assertion unwinds.
+    struct CleanupGuard<'a>(&'a cleanup::Cleanup);
+    impl Drop for CleanupGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.finish(true);
+        }
+    }
+    let _guard = CleanupGuard(&tracker);
+    let (container, labels) = tracker.register(ResourceKind::Container).unwrap();
+    let mut cmd = docker::command(&config.docker, &config.docker_endpoint);
+    cmd.args([
+        "container",
+        "create",
+        "--name",
+        &container,
+        "--pull=never",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--pids-limit=128",
+        "--memory=4g",
+        "--cpus=2",
+        "--entrypoint=sleep",
+    ])
+    .args(labels)
+    .arg("--mount")
+    .arg(format!(
+        "type=volume,source={volume},target=/workspace,volume-nocopy"
+    ))
+    .arg(&config.image)
+    .arg("1800");
+    process::capture(cmd, Duration::from_secs(30), 4096).unwrap();
+    tracker
+        .created(ResourceKind::Container, &container)
+        .unwrap();
+    let mut failing = config.clone();
+    failing.docker = root.join("docker-fault-fixture");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$3\" = volume ] && [ \"$4\" = rm ]; then exit 19; fi\nexec {} \"$@\"\n",
+        config::quote(config.docker.to_str().unwrap()).unwrap()
+    );
+    private::write(&failing.docker, script.as_bytes(), true).unwrap();
+    let _operation = private::Lock::acquire(root, "operation.lock").unwrap();
+    let _runtime = private::Lock::acquire(root, "runtime.lock").unwrap();
+    assert!(cleanup::reconcile(root, &failing).is_err());
+    assert!(!root.join("mcp.done").exists());
+    assert!(daemon::ensure_clean(root).is_err());
+    assert!(cleanup::report(root)
+        .unwrap()
+        .contains("Pending containers: 0\nPending volumes: 1"));
+    cleanup::reconcile(root, config).unwrap();
+    daemon::ensure_clean(root).unwrap();
+    private::remove(&failing.docker).unwrap();
 }

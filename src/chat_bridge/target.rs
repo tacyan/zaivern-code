@@ -3,6 +3,7 @@
 use super::cargo_verification::Coverage;
 use super::task::{Control, Outcome, State, TaskExecutor};
 use super::workspace::{Snapshot, FILE_LIMIT, SNAPSHOT_LIMIT};
+use super::{CleanupTracker, ResourceKind};
 use crate::acp::{AcpClient, Phase};
 use crate::agents::approvals::ApprovalQueue;
 use crate::features::cloud_execution::{
@@ -19,6 +20,7 @@ pub(super) struct LocalExecutionTarget {
     docker: PathBuf,
     endpoint: String,
     cleanup_failed: std::sync::atomic::AtomicBool,
+    pub(super) cleanup: Option<std::sync::Arc<dyn CleanupTracker>>,
 }
 impl LocalExecutionTarget {
     pub fn new(image: String) -> Result<Self, String> {
@@ -61,6 +63,7 @@ impl LocalExecutionTarget {
                 docker,
                 endpoint,
                 cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+                cleanup: None,
             })
         }
     }
@@ -163,9 +166,13 @@ impl LocalExecutionTarget {
             volume.name,
             if readonly { ",readonly" } else { "" }
         );
+        let (name, labels) = match &self.cleanup {
+            Some(cleanup) => cleanup.register(ResourceKind::Container)?,
+            None => (ids::new_id("zaivern-mcp-"), Vec::new()),
+        };
         let container = Container {
             target: self,
-            id: ids::new_id("zaivern-mcp-"),
+            id: name,
             removed: std::cell::Cell::new(false),
             volume,
         };
@@ -194,6 +201,7 @@ impl LocalExecutionTarget {
                 "--env=CARGO_TARGET_DIR=/target",
             ]));
         }
+        args.extend(labels);
         args.push(self.image.clone());
         if verifier {
             args.push("1800".into());
@@ -202,6 +210,12 @@ impl LocalExecutionTarget {
         // even if its response is lost or the CLI times out. Drop still removes it.
         let launch = self
             .run(&args, budget(started, 30)?)
+            .and_then(|bytes| {
+                if let Some(cleanup) = &self.cleanup {
+                    cleanup.created(ResourceKind::Container, &container.id)?;
+                }
+                Ok(bytes)
+            })
             .and_then(|_| self.run(&strings(&["start", &container.id]), budget(started, 30)?));
         if let Err(error) = launch {
             return Err(match container.shutdown() {
@@ -446,17 +460,21 @@ impl Container<'_> {
 
     fn shutdown(&self) -> Result<(), String> {
         if !self.removed.get() {
-            self.target
-                .run(
-                    &strings(&["rm", "--force", &self.id]),
-                    Duration::from_secs(20),
-                )
-                .map_err(|_| {
-                    format!(
-                        "container cleanup unconfirmed: {}; inspect Docker locally",
-                        self.id
+            if let Some(cleanup) = &self.target.cleanup {
+                cleanup.remove(ResourceKind::Container, &self.id)?;
+            } else {
+                self.target
+                    .run(
+                        &strings(&["rm", "--force", &self.id]),
+                        Duration::from_secs(20),
                     )
-                })?;
+                    .map_err(|_| {
+                        format!(
+                            "container cleanup unconfirmed: {}; inspect Docker locally",
+                            self.id
+                        )
+                    })?;
+            }
             self.removed.set(true);
         }
         if Rc::strong_count(&self.volume) == 1 {
@@ -483,44 +501,54 @@ struct Volume<'a> {
 }
 impl<'a> Volume<'a> {
     fn new(target: &'a LocalExecutionTarget, started: Instant) -> Result<Self, String> {
+        let (name, labels) = match &target.cleanup {
+            Some(cleanup) => cleanup.register(ResourceKind::Volume)?,
+            None => (ids::new_id("zaivern-mcp-"), Vec::new()),
+        };
         let volume = Self {
             target,
-            name: ids::new_id("zaivern-mcp-"),
+            name,
             removed: std::cell::Cell::new(false),
         };
-        target.run(
-            &strings(&[
-                "volume",
-                "create",
-                "--driver",
-                "local",
-                "--opt",
-                "type=tmpfs",
-                "--opt",
-                "device=tmpfs",
-                "--opt",
-                "o=size=256m,exec,nosuid,nodev",
-                &volume.name,
-            ]),
-            budget(started, 30)?,
-        )?;
+        let mut args = strings(&[
+            "volume",
+            "create",
+            "--driver",
+            "local",
+            "--opt",
+            "type=tmpfs",
+            "--opt",
+            "device=tmpfs",
+            "--opt",
+            "o=size=256m,exec,nosuid,nodev",
+        ]);
+        args.extend(labels);
+        args.push(volume.name.clone());
+        target.run(&args, budget(started, 30)?)?;
+        if let Some(cleanup) = &target.cleanup {
+            cleanup.created(ResourceKind::Volume, &volume.name)?;
+        }
         Ok(volume)
     }
     fn shutdown(&self) -> Result<(), String> {
         if self.removed.get() {
             return Ok(());
         }
-        self.target
-            .run(
-                &strings(&["volume", "rm", &self.name]),
-                Duration::from_secs(20),
-            )
-            .map_err(|_| {
-                format!(
-                    "workspace volume cleanup unconfirmed: {}; inspect Docker locally",
-                    self.name
+        if let Some(cleanup) = &self.target.cleanup {
+            cleanup.remove(ResourceKind::Volume, &self.name)?;
+        } else {
+            self.target
+                .run(
+                    &strings(&["volume", "rm", &self.name]),
+                    Duration::from_secs(20),
                 )
-            })?;
+                .map_err(|_| {
+                    format!(
+                        "workspace volume cleanup unconfirmed: {}; inspect Docker locally",
+                        self.name
+                    )
+                })?;
+        }
         self.removed.set(true);
         Ok(())
     }
@@ -892,6 +920,7 @@ exit 1
             docker: docker.clone(),
             endpoint: "fixture".into(),
             cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: None,
         };
         let error = target
             .start_container(Instant::now(), false)
@@ -945,6 +974,7 @@ exit 1
                 docker,
                 endpoint: "fixture".into(),
                 cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+                cleanup: None,
             };
             let container = Container {
                 target: &target,
@@ -1003,6 +1033,7 @@ exit 1
             docker: docker.clone(),
             endpoint: "fixture".into(),
             cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: None,
         };
         let attack = br#"#[test] fn oracle() {
             let hidden = std::fs::read("vendor/local_dep/src/lib.rs").unwrap();

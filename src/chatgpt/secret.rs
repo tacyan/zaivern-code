@@ -82,10 +82,14 @@ fn account(root: &Path) -> String {
     super::install::sha256(root.as_os_str().as_encoded_bytes())
 }
 
-pub(super) fn save(root: &Path, secret: &Secret, allow_file: bool) -> Result<String> {
+pub(super) fn save(
+    root: &Path,
+    secret: &Secret,
+    approve_file: impl FnOnce() -> Result<bool>,
+) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let _ = allow_file;
+        let _ = approve_file;
         remember_store(root, "keychain")?;
         security_framework::passwords::set_generic_password(
             "org.zaivern.chatgpt.runtime",
@@ -99,51 +103,78 @@ pub(super) fn save(root: &Path, secret: &Secret, allow_file: bool) -> Result<Str
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if let Some(bin) = crate::shellenv::which("secret-tool") {
-            remember_store(root, "secret-service")?;
-            let mut command = super::process::command(&bin);
-            command
-                .args([
-                    "store",
-                    "--label=Zaivern ChatGPT Runtime",
-                    "application",
-                    "zaivern-chatgpt",
-                    "account",
-                    &account(root),
-                ])
-                .stdin(std::process::Stdio::piped());
-            let mut child = super::process::OwnedChild::spawn(&mut command)?;
-            let mut input = child
-                .child
-                .stdin
-                .take()
-                .ok_or("Secret Service input unavailable")?;
-            input
-                .write_all(&secret.0)
-                .and_then(|_| input.write_all(b"\n"))
-                .map_err(|_| "Secret Service write failed")?;
-            drop(input);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if let Some(status) = child.exited()? {
-                    return if status.success() {
-                        Ok("secret-service".into())
-                    } else {
-                        Err("Secret Service denied access; unlock your keyring and retry".into())
-                    };
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err("Secret Service timed out".into());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
+        save_with_service(
+            root,
+            secret,
+            crate::shellenv::which("secret-tool").as_deref(),
+            approve_file,
+        )
+    }
+}
+
+// Inject the executable, not global PATH/DBus state, in deterministic tests.
+#[cfg(any(not(target_os = "macos"), test))]
+fn save_with_service(
+    root: &Path,
+    secret: &Secret,
+    executable: Option<&Path>,
+    approve_file: impl FnOnce() -> Result<bool>,
+) -> Result<String> {
+    if let Some(bin) = executable {
+        // Keep this entry even on failure: the service may have committed the
+        // key before its reply was lost. Reset must retain that recovery debt.
+        if try_save_service(root, secret, bin).is_ok() {
+            return Ok("secret-service".into());
         }
-        if !allow_file {
-            return Err("Secret Service unavailable. Explicitly approve the private 0600 file fallback in setup".into());
+    }
+    if !approve_file()? {
+        return Err(
+            "Secret Service unavailable; private-file fallback declined. Setup cancelled.".into(),
+        );
+    }
+    remember_store(root, "private-file")?;
+    private::write(&root.join("runtime-key"), &secret.0, false)?;
+    Ok("private-file".into())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn try_save_service(root: &Path, secret: &Secret, bin: &Path) -> Result<()> {
+    remember_store(root, "secret-service")?;
+    let mut command = super::process::command(bin);
+    command
+        .args([
+            "store",
+            "--label=Zaivern ChatGPT Runtime",
+            "application",
+            "zaivern-chatgpt",
+            "account",
+            &account(root),
+        ])
+        .stdin(std::process::Stdio::piped());
+    let mut child = super::process::OwnedChild::spawn(&mut command)?;
+    let mut input = child
+        .child
+        .stdin
+        .take()
+        .ok_or("Secret Service input unavailable")?;
+    input
+        .write_all(&secret.0)
+        .and_then(|_| input.write_all(b"\n"))
+        .map_err(|_| "Secret Service write failed")?;
+    drop(input);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.exited()? {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err("Secret Service denied access; unlock your keyring and retry".into())
+            };
         }
-        remember_store(root, "private-file")?;
-        private::write(&root.join("runtime-key"), &secret.0, false)?;
-        Ok("private-file".into())
+        if std::time::Instant::now() >= deadline {
+            return Err("Secret Service timed out".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -252,4 +283,66 @@ pub(super) fn forget_store(root: &Path, backend: &str) -> Result<()> {
         &serde_json::to_vec(&stores).map_err(|_| "Cannot encode secret store journal")?,
         false,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn exercise(success: bool, approve: bool) {
+        let root = crate::test_util::unique_temp_dir("chatgpt", "secret-fallback");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = root.join("secret-tool");
+        private::write(&bin, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\nIFS= read -r key\nprintf '%s' \"$key\" >&2\nprintf '%s' \"$key\"\nexit {}\n",
+            if success { 0 } else { 1 }).as_bytes(), true).unwrap();
+        let sentinel = "sk-runtime-fallback-sentinel-123456789";
+        let secret = Secret::from_bytes(sentinel.as_bytes().to_vec()).unwrap();
+        let asked = std::cell::Cell::new(false);
+        let result = save_with_service(&root, &secret, Some(&bin), || {
+            asked.set(true);
+            Ok(approve)
+        });
+        assert_eq!(asked.get(), !success);
+        if success {
+            assert_eq!(result.unwrap(), "secret-service");
+            assert_eq!(stores(&root).unwrap(), ["secret-service"]);
+            assert!(!root.join("runtime-key").exists());
+        } else if approve {
+            assert_eq!(result.unwrap(), "private-file");
+            assert_eq!(stores(&root).unwrap(), ["secret-service", "private-file"]);
+            let path = root.join("runtime-key");
+            assert_eq!(private::read(&path, 4096).unwrap(), sentinel.as_bytes());
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        } else {
+            assert!(!result.unwrap_err().contains(sentinel));
+            assert!(!root.join("runtime-key").exists());
+            assert_eq!(stores(&root).unwrap(), ["secret-service"]);
+        }
+        for file in ["secret-tool.args", "secret-stores.json"] {
+            assert!(!std::fs::read_to_string(root.join(file))
+                .unwrap()
+                .contains(sentinel));
+        }
+        assert!(!root.join("config.json").exists());
+        assert!(!root.join("profile.yaml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn secret_service_unavailable_accepted_private_file() {
+        exercise(false, true);
+    }
+    #[test]
+    fn secret_service_unavailable_declined_does_not_save_file() {
+        exercise(false, false);
+    }
+    #[test]
+    fn secret_service_success_never_prompts_for_fallback() {
+        exercise(true, false);
+    }
 }

@@ -15,6 +15,32 @@ mod workspace;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResourceKind {
+    Container,
+    Volume,
+}
+
+/// Managed lifecycle persistence; not exposed over MCP or selected by requests.
+pub(crate) trait CleanupTracker: Send + Sync {
+    fn register(&self, kind: ResourceKind) -> Result<(String, Vec<String>), String>;
+    fn created(&self, kind: ResourceKind, name: &str) -> Result<(), String>;
+    fn remove(&self, kind: ResourceKind, name: &str) -> Result<(), String>;
+}
+
+#[cfg(unix)]
+pub(crate) fn serve_managed(
+    root: PathBuf,
+    image: String,
+    cleanup: Arc<dyn CleanupTracker>,
+) -> Result<(), String> {
+    let root = workspace::validate_root(&root)?;
+    let mut target = target::LocalExecutionTarget::new(image)?;
+    target.cleanup = Some(cleanup);
+    serve_target(root, target)
+}
+
 pub const HELP: &str = "\nMCP (ChatGPT bridge):\n  zai mcp serve --workspace ABSOLUTE_PATH --image IMAGE@sha256:DIGEST\n  See docs/chatgpt.md for isolation, agent setup and connection requirements.\n";
 
 pub fn cli_main(args: &[String]) -> i32 {
@@ -48,9 +74,12 @@ fn serve(args: &[String]) -> Result<(), String> {
         }
     }
     let root = workspace::validate_root(&root.ok_or("--workspace is required")?)?;
-    let target = Arc::new(target::LocalExecutionTarget::new(
-        image.ok_or("--image is required")?,
-    )?);
+    let target = target::LocalExecutionTarget::new(image.ok_or("--image is required")?)?;
+    serve_target(root, target)
+}
+
+fn serve_target(root: PathBuf, target: target::LocalExecutionTarget) -> Result<(), String> {
+    let target = Arc::new(target);
     let bridge = task::ChatBridge::new(root, target.clone());
     let result = protocol::serve(std::io::stdin().lock(), std::io::stdout().lock(), &bridge)
         .map_err(|e| e.to_string());

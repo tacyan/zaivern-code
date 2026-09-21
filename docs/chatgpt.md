@@ -43,7 +43,7 @@ Tunnel の作成・ID の確認先: <https://platform.openai.com/settings/organi
 | `zai chatgpt status` | 所有プロセス、health/ready、stdio channel、workspace/image/Tunnel を表示 |
 | `zai chatgpt doctor` | 設定・鍵の存在・公式 doctor・実 stdio discovery を検査 |
 | `zai chatgpt stop` | nonce で所有 supervisor を確認して停止。保存 PID だけを信用して kill しない |
-| `zai chatgpt repair` | 検証済み client/profile/zai path を修復。image の再取得は確認付き |
+| `zai chatgpt repair` | 未完了の所有Docker資源を再確認・回収後、client/profile/zai path を修復。image の再取得は確認付き |
 | `zai chatgpt setup --reauth` | Runtime key を非表示入力で更新。起動中は先に stop |
 | `zai chatgpt reset` | 削除範囲を表示して確認。設定・profile・Runtime key を削除 |
 | `zai chatgpt test` | 一時 workspace と deterministic ACP fixture によるローカル E2E |
@@ -52,6 +52,7 @@ setup の再実行では Verify / Repair / Reconfigure / Cancel を選べます�
 設定変更と reset は実行中の Bridge を勝手に止めません。先に `stop` してください。
 停止は MCP worker の終了記録も確認します。強制終了や後片付け未確認を成功表示しません。
 未確認の世代が残る場合は再起動・再設定・reset を止め、状態を保存します。
+`status` / `doctor` は未確認のcontainer/volume件数と `zai chatgpt repair` を案内します。
 reset は Platform の Tunnel、ソース、Docker image、検証済み client のインストールを削除しません。
 自動ログイン起動の登録は行わないため、PC 再起動後は `start` します。
 
@@ -64,14 +65,52 @@ JSON は YAML のサブセットとして公式クライアントの strict deco
 profile 内には `env:CONTROL_PLANE_API_KEY` 参照だけを保存します。
 
 macOS は Keychain、Linux は `secret-tool` 経由の Secret Service を使用します。
-Linux で Secret Service がない場合に限り、明示確認後に専用 0600 file を使用します。
+Linux は `secret-tool` の存在だけで利用可能とは判定せず、実際に保存を試みます。
+DBus・keyring不在、SSH/headless環境、daemon停止などで保存に失敗した場合も、
+その後にユーザーへ確認し、承認された場合だけ専用0600 fileを使用します。拒否時は保存せず中止します。
 Keychain/keyring のアクセス拒否を理由に自動で平文保存へ切り替えることはありません。
 秘密保存先の変更は、先に保存先だけを記録した復旧 journal を永続化します。
 途中で設定保存が失敗しても `reset` が新旧の保存先を回収でき、旧キーは新設定の確定後に削除します。
+保存失敗でも応答喪失前にkeyringへ書かれた可能性があるため、失敗した保存先もjournalに残します。
+旧keyringが利用不能でも承認したfallback設定は確定します。旧保存先の回収は警告し、
+keyring復旧後の `reset` で再試行します。回収失敗を成功扱いしてjournalを消すことはありません。
 鍵は CLI 引数・shell history・workspace・image・Agent/Docker 環境へ渡しません。
 Tunnel 専用子プロセスだけに渡し、MCP 起動は通常初期化より前に環境を除去して再execします。
 生の子プロセス stdout/stderr は保存・表示せず、doctor の既知の検査名と状態だけを表示します。
 この版には `logs --export` はありません。診断には `status` / `doctor` を使用してください。
+
+### Docker cleanup失敗からの復旧
+
+```sh
+zai chatgpt status
+zai chatgpt repair
+zai chatgpt start
+```
+
+`cleanup-pending.json` は、世代・local Docker socket・資源ごとのランダム名・作成／削除状態を
+Docker作成要求の**前**に永続化します。秘密鍵・prompt・Dockerの生出力は含めません。
+所有者、0600、通常ファイル、リンク数、JSONサイズ、未知field、世代一致を検証します。
+完了済みの記録も世代終了まで保持します。件数が0でもreceipt保存が未完了なら未確認です。
+
+`repair` はoperation/runtime/MCP execution lockを取得し、稼働中のsupervisorやworkerと競合しません。
+MCP受付を閉じたうえで、記録したsocketにだけ接続し、Zaivern管理領域・世代・資源nonceの
+Docker labelsを照合します。containerは照合した完全IDで削除し、volumeは照合した固有名で削除します。
+containerを先に回収し、成功した一覧問い合わせで不存在を確認します。
+途中失敗はjournalを残し、次の `repair` で続行します。既に手動削除された作成確認済み資源も再確認できます。
+全資源の確認後だけjournalをconfirmedにし、同世代の `mcp.done`、shutdown receiptを保存します。
+receipt保存だけ失敗した場合も再試行できます。journalを直接編集・削除して解除しないでください。
+
+旧Tunnelの遅延起動が新世代へ混入しないよう、起動世代を非秘密の専用環境変数で固定し、
+MCP受付は世代ごとに一度だけ許可します。MCPだけ異常終了した場合も `stop → repair → start` を使用します。
+世代切替途中の停止は `cleanup-prepared.json` から、資源を作成せず復旧します。
+
+**証明できない状態は解除しません。** 古い版のjournalがない未確認世代、所有ラベル不一致、
+破損stateは安全な自動削除の対象外です。また作成要求の応答を失い、作成完了を一度も確認できず、
+資源もまだ見つからない場合は、遅延したDocker作成を否定できないため未確認を維持します。
+この場合はローカルDockerの作成状況を調査してください。対象が出現すれば再repairで照合・回収できます。
+同じOSユーザーとDocker管理者は信頼境界です。Docker管理者が検査中に同名volumeを外部から
+置換する攻撃は防げません（Docker volumeにはcontainerのような不変IDがありません）。
+通常のMCP要求・AgentからjournalやDocker socketへ到達する経路はありません。
 
 ### 配布物と互換性
 

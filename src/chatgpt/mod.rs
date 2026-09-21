@@ -1,4 +1,5 @@
 //! Managed Secure MCP Tunnel setup. No model inference HTTP client exists here.
+mod cleanup;
 mod config;
 mod daemon;
 mod docker;
@@ -218,16 +219,9 @@ fn setup(root: &Path, reauth: bool) -> Result<()> {
         if let Some(old) = &existing {
             secret::remember_store(root, &old.secret_store)?;
         }
-        #[cfg(target_os = "macos")]
-        let allow_file = false;
-        #[cfg(not(target_os = "macos"))]
-        let allow_file = if crate::shellenv::which("secret-tool").is_none() {
-            confirm(&tr("chatgpt.file_fallback"), false)?
-        } else {
-            false
-        };
         let key = secret::prompt()?;
-        config.secret_store = secret::save(root, &key, allow_file)?;
+        config.secret_store =
+            secret::save(root, &key, || confirm(&tr("chatgpt.file_fallback"), false))?;
     }
     private::write(
         &root.join("profile.yaml"),
@@ -237,8 +231,13 @@ fn setup(root: &Path, reauth: bool) -> Result<()> {
     config.save(root)?;
     if let Some(old) = &existing {
         if old.secret_store != config.secret_store {
-            secret::remove(root, &old.secret_store)?;
-            secret::forget_store(root, &old.secret_store)?;
+            if secret::remove(root, &old.secret_store).is_ok() {
+                secret::forget_store(root, &old.secret_store)?;
+            } else {
+                // The new credential/config is committed. An unavailable old
+                // keyring must not disable the explicitly approved fallback.
+                println!("[WARN] Previous secret store unavailable; its recovery journal was retained. Restore the keyring before reset.");
+            }
         }
     }
     doctor(root, &config)?;
@@ -294,6 +293,14 @@ fn preflight(root: &Path, config: &Config) -> Result<()> {
 fn doctor(root: &Path, config: &Config) -> Result<()> {
     println!("Zaivern ChatGPT doctor");
     private::directory(root)?;
+    print!("{}", cleanup::report(root)?);
+    daemon::ensure_clean(root).or_else(|error| {
+        if daemon::request(root, "status").is_ok() {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
     preflight(root, config)?;
     println!("[PASS] configuration / filesystem permissions\n[PASS] workspace\n[PASS] Docker local socket\n[PASS] immutable Agent image\n[PASS] tunnel ID / profile / MCP executable");
     client_version(root)?;
@@ -331,6 +338,7 @@ fn doctor(root: &Path, config: &Config) -> Result<()> {
 fn status(root: &Path) -> Result<()> {
     let config = Config::load(root)?;
     println!("ChatGPT Bridge");
+    print!("{}", cleanup::report(root)?);
     match daemon::request(root, "status") {
         Ok(pid) => println!("Tunnel client    running (owned PID {pid})"),
         Err(_) => println!("Tunnel client    stopped/unknown"),
@@ -360,8 +368,8 @@ fn repair(root: &Path) -> Result<()> {
     let _operation = private::Lock::acquire(root, "operation.lock")?;
     let _runtime = private::Lock::acquire(root, "runtime.lock")
         .map_err(|_| "Stop the bridge before repair")?;
-    daemon::ensure_clean(root)?;
     let mut config = Config::load(root)?;
+    cleanup::reconcile(root, &config)?;
     install::install(root)?;
     config.executable = std::env::current_exe()
         .and_then(|p| p.canonicalize())
@@ -411,6 +419,7 @@ fn reset(root: &Path) -> Result<()> {
         "runtime.json",
         "health-url",
         "secret-stores.json",
+        "cleanup-pending.json",
         "active-generation",
         "mcp.done",
         "shutdown.json",
@@ -465,6 +474,10 @@ fn test(root: &Path) -> Result<()> {
 fn mcp_exec(root: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let config = Config::load(root)?;
+    let generation = std::env::var("ZAIVERN_CHATGPT_GENERATION")
+        .ok()
+        .filter(|s| cleanup::valid_nonce(s))
+        .ok_or("Missing managed MCP launch generation")?;
     let mut command = process::command(&config.executable);
     let mut paths = vec![config
         .docker
@@ -482,6 +495,7 @@ fn mcp_exec(root: &Path) -> Result<()> {
         .args(["chatgpt", "__serve"])
         .arg(root)
         .env("DOCKER_HOST", &config.docker_endpoint)
+        .env("ZAIVERN_CHATGPT_GENERATION", generation)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null());
@@ -504,32 +518,33 @@ fn managed_serve(root: &Path) -> Result<()> {
     {
         return Err("Managed MCP must be launched through its sanitized entry point".into());
     }
-    let generation = private::read(&root.join("active-generation"), 64)?;
-    if generation.len() != 64 || !generation.iter().all(u8::is_ascii_hexdigit) {
-        return Err("Missing managed runtime generation".into());
+    let _execution = private::Lock::acquire(root, "mcp.lock")?;
+    let generation = std::env::var("ZAIVERN_CHATGPT_GENERATION")
+        .ok()
+        .filter(|s| cleanup::valid_nonce(s))
+        .ok_or("Missing managed MCP launch generation")?;
+    let config = Config::load(root)?;
+    let cleanup = std::sync::Arc::new(cleanup::Cleanup::load(root, &config)?);
+    // The child can exec before its supervisor has committed runtime.json.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if daemon::request(root, "status").is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Managed supervisor unavailable; MCP admission denied".into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
-    let result = (|| -> Result<i32> {
-        let config = Config::load(root)?;
-        Ok(crate::features::chat_bridge::cli_main(&[
-            "serve".into(),
-            "--workspace".into(),
-            config
-                .workspace
-                .to_str()
-                .ok_or("Workspace must be UTF-8")?
-                .into(),
-            "--image".into(),
-            config.image,
-        ]))
-    })();
-    // Returning from the MCP server has dropped ChatBridge and joined/cancelled
-    // its worker. This receipt is the supervisor's cleanup proof, not a PID probe.
-    if result? == 0 {
-        private::write(&root.join("mcp.done"), &generation, false)?;
-        Ok(())
-    } else {
-        Err("Managed MCP target exited with an error".into())
-    }
+    cleanup.admit(&generation)?;
+    crate::features::chat_bridge::imp::serve_managed(
+        config.workspace,
+        config.image,
+        cleanup.clone(),
+    )?;
+    // The bridge has joined its worker. Only verified resource absence can
+    // commit a receipt; a failed server leaves its journal for repair.
+    cleanup.finish(false)
 }
 
 fn doctor_report(bytes: &[u8]) -> Result<String> {
