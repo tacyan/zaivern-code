@@ -264,16 +264,7 @@ pub(super) fn remove(root: &Path, backend: &str) -> Result<()> {
         },
         #[cfg(not(target_os = "macos"))]
         "secret-service" => {
-            let bin = service_executable()?;
-            let mut cmd = super::process::command(&bin);
-            cmd.args([
-                "clear",
-                "application",
-                "zaivern-chatgpt",
-                "account",
-                &account(root),
-            ]);
-            super::process::capture(cmd, std::time::Duration::from_secs(30), 1024)?;
+            remove_with_service(root, &service_executable()?)?;
         }
         "private-file" => {
             private::remove(&root.join("runtime-key"))?;
@@ -281,6 +272,36 @@ pub(super) fn remove(root: &Path, backend: &str) -> Result<()> {
         _ => return Err("Unknown secret store".into()),
     }
     Ok(())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn remove_with_service(root: &Path, bin: &Path) -> Result<()> {
+    let mut cmd = super::process::command(bin);
+    cmd.args([
+        "clear",
+        "application",
+        "zaivern-chatgpt",
+        "account",
+        &account(root),
+    ]);
+    let (success, error) = super::process::capture_status_stderr(
+        cmd,
+        std::time::Duration::from_secs(30),
+        4096,
+    )?;
+    if !success && !secret_service_absent(&error) {
+        return Err(
+            "Secret Service cleanup could not confirm credential absence; recovery state preserved"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn secret_service_absent(stderr: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    text.contains("no matching secret") || text.contains("no secret found")
 }
 
 pub(super) fn stores(root: &Path) -> Result<Vec<String>> {
@@ -384,5 +405,38 @@ mod tests {
     #[test]
     fn secret_service_success_never_prompts_for_fallback() {
         exercise(true, false);
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    fn remove_fixture(mode: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = crate::test_util::unique_temp_dir("chatgpt", "secret-remove");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = root.join("secret-tool");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = clear ]; then printf '%s' '{}' >&2; exit 1; fi\nexit 0\n",
+            mode
+        );
+        private::write(&bin, script.as_bytes(), true).unwrap();
+        remember_store(&root, "secret-service").unwrap();
+        (root, bin)
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    #[test]
+    fn secret_service_absent_is_idempotent_and_clears_debt() {
+        let (root, bin) = remove_fixture("No matching secret found");
+        remove_with_service(&root, &bin).unwrap();
+        forget_store(&root, "secret-service").unwrap();
+        assert!(stores(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(not(target_os = "macos"), test))]
+    #[test]
+    fn secret_service_backend_failure_preserves_debt() {
+        let (root, bin) = remove_fixture("Cannot connect to the D-Bus session bus");
+        assert!(remove_with_service(&root, &bin).is_err());
+        assert_eq!(stores(&root).unwrap(), ["secret-service"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

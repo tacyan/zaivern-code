@@ -118,6 +118,14 @@ impl OwnedProcessGroup {
             .ok_or_else(|| "Missing child output".into())
     }
 
+    #[cfg(any(not(target_os = "macos"), test))]
+    pub(super) fn take_stderr(&mut self) -> Result<std::process::ChildStderr> {
+        self.child
+            .stderr
+            .take()
+            .ok_or_else(|| "Missing child error output".into())
+    }
+
     pub(super) fn exited(&self) -> Result<bool> {
         if !self.reserved {
             return Ok(true);
@@ -512,6 +520,44 @@ pub(super) fn capture_status(
     limit: usize,
 ) -> Result<(bool, Vec<u8>)> {
     capture_status_scoped(command, timeout, limit, None)
+}
+
+/// Capture bounded stderr while retaining the same owned-process-group
+/// lifetime and timeout guarantees as the normal capture path. Callers must
+/// classify the returned bytes locally; they must never surface them because
+/// helper diagnostics can contain sensitive arguments or environment details.
+#[cfg(any(not(target_os = "macos"), test))]
+pub(super) fn capture_status_stderr(
+    mut command: Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<(bool, Vec<u8>)> {
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = OwnedProcessGroup::spawn(&mut command)?;
+    let stderr = child.take_stderr()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.take(limit as u64 + 1).read_to_end(&mut bytes);
+        let _ = tx.send((result, bytes));
+    });
+    let start = Instant::now();
+    loop {
+        if child.exited()? {
+            let (read, bytes) = rx
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|_| "Child error output unavailable")?;
+            if read.is_err() || bytes.len() > limit {
+                return Err("Child error output exceeded limit or could not be read".into());
+            }
+            let status = child.reclaim()?;
+            return Ok((status.success(), bytes));
+        }
+        if start.elapsed() >= timeout {
+            return Err("Child command timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
