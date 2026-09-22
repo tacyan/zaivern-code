@@ -82,6 +82,26 @@ fn account(root: &Path) -> String {
     super::install::sha256(root.as_os_str().as_encoded_bytes())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn service_executable() -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Path::new("/usr/bin/secret-tool")
+        .canonicalize()
+        .map_err(|_| "System Secret Service tool unavailable")?;
+    // Do not let PATH or an Agent-edited helper receive the runtime key.
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| "Cannot inspect Secret Service executable")?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err("Secret Service executable must be a root-owned, non-shared executable".into());
+    }
+    Ok(path)
+}
+
 pub(super) fn save(
     root: &Path,
     secret: &Secret,
@@ -106,7 +126,7 @@ pub(super) fn save(
         save_with_service(
             root,
             secret,
-            crate::shellenv::which("secret-tool").as_deref(),
+            service_executable().ok().as_deref(),
             approve_file,
         )
     }
@@ -151,12 +171,8 @@ fn try_save_service(root: &Path, secret: &Secret, bin: &Path) -> Result<()> {
             &account(root),
         ])
         .stdin(std::process::Stdio::piped());
-    let mut child = super::process::OwnedChild::spawn(&mut command)?;
-    let mut input = child
-        .child
-        .stdin
-        .take()
-        .ok_or("Secret Service input unavailable")?;
+    let mut child = super::process::OwnedProcessGroup::spawn(&mut command)?;
+    let mut input = child.take_lease()?;
     input
         .write_all(&secret.0)
         .and_then(|_| input.write_all(b"\n"))
@@ -164,7 +180,8 @@ fn try_save_service(root: &Path, secret: &Secret, bin: &Path) -> Result<()> {
     drop(input);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        if let Some(status) = child.exited()? {
+        if child.exited()? {
+            let status = child.reclaim()?;
             return if status.success() {
                 Ok(())
             } else {
@@ -179,6 +196,22 @@ fn try_save_service(root: &Path, secret: &Secret, bin: &Path) -> Result<()> {
 }
 
 pub(super) fn load(root: &Path, backend: &str) -> Result<Secret> {
+    load_scoped(root, backend, None)
+}
+
+pub(super) fn load_guarded(
+    root: &Path,
+    backend: &str,
+    scope: &super::process::GuardianScope,
+) -> Result<Secret> {
+    load_scoped(root, backend, Some(scope))
+}
+
+fn load_scoped(
+    root: &Path,
+    backend: &str,
+    _scope: Option<&super::process::GuardianScope>,
+) -> Result<Secret> {
     super::process::disable_core_dumps()?;
     let bytes = match backend {
         #[cfg(target_os = "macos")]
@@ -189,7 +222,7 @@ pub(super) fn load(root: &Path, backend: &str) -> Result<Secret> {
         .map_err(|_| "Runtime key unavailable in Keychain; run zai chatgpt setup --reauth")?,
         #[cfg(not(target_os = "macos"))]
         "secret-service" => {
-            let bin = crate::shellenv::which("secret-tool").ok_or("Secret Service unavailable")?;
+            let bin = service_executable()?;
             let mut command = super::process::command(&bin);
             command.args([
                 "lookup",
@@ -198,8 +231,15 @@ pub(super) fn load(root: &Path, backend: &str) -> Result<Secret> {
                 "account",
                 &account(root),
             ]);
-            let mut bytes =
-                super::process::capture(command, std::time::Duration::from_secs(60), 4097)?;
+            let mut bytes = match _scope {
+                Some(scope) => super::process::capture_guarded(
+                    scope,
+                    command,
+                    std::time::Duration::from_secs(60),
+                    4097,
+                )?,
+                None => super::process::capture(command, std::time::Duration::from_secs(60), 4097)?,
+            };
             if bytes.last() == Some(&b'\n') {
                 bytes.pop();
             }
@@ -224,7 +264,7 @@ pub(super) fn remove(root: &Path, backend: &str) -> Result<()> {
         },
         #[cfg(not(target_os = "macos"))]
         "secret-service" => {
-            let bin = crate::shellenv::which("secret-tool").ok_or("Secret Service unavailable")?;
+            let bin = service_executable()?;
             let mut cmd = super::process::command(&bin);
             cmd.args([
                 "clear",
@@ -244,7 +284,7 @@ pub(super) fn remove(root: &Path, backend: &str) -> Result<()> {
 }
 
 pub(super) fn stores(root: &Path) -> Result<Vec<String>> {
-    if !root.join("secret-stores.json").exists() {
+    if !private::exists_checked(&root.join("secret-stores.json"))? {
         return Ok(Vec::new());
     }
     let stores: Vec<String> =

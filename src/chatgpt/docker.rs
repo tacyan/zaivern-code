@@ -4,11 +4,30 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(super) fn detect() -> Result<(PathBuf, String)> {
-    let binary = crate::shellenv::which("docker")
-        .ok_or("Docker CLI missing; install/start Docker, then retry setup")?
-        .canonicalize()
-        .map_err(|_| "Cannot resolve Docker executable")?;
+fn executable(workspace: &Path) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = [
+        "/usr/local/bin/docker",
+        "/opt/homebrew/bin/docker",
+        "/usr/bin/docker",
+        "/bin/docker",
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/bin/docker"));
+    }
+    for candidate in candidates {
+        if let Ok(path) = super::config::validate_executable(&candidate, workspace) {
+            return Ok(path);
+        }
+    }
+    Err("Trusted Docker CLI missing; install Docker outside the workspace".into())
+}
+
+pub(super) fn detect(workspace: &Path) -> Result<(PathBuf, String)> {
+    let binary = executable(workspace)?;
     let endpoint = if let Ok(host) = std::env::var("DOCKER_HOST") {
         host
     } else {

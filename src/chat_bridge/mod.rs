@@ -4,6 +4,8 @@ mod cargo_verification;
 pub(crate) mod create;
 #[cfg(test)]
 mod e2e_tests;
+#[cfg(unix)]
+pub(crate) mod host;
 mod protocol;
 #[cfg(all(test, unix))]
 mod snapshot_tests;
@@ -37,11 +39,32 @@ pub(crate) trait CleanupTracker: Send + Sync {
 pub(crate) fn serve_managed(
     root: PathBuf,
     image: String,
+    docker: PathBuf,
+    docker_endpoint: String,
     cleanup: Arc<dyn CleanupTracker>,
 ) -> Result<(), String> {
     let root = workspace::validate_root(&root)?;
-    let mut target = target::LocalExecutionTarget::new(image)?;
-    target.cleanup = Some(cleanup);
+    let target = target::LocalExecutionTarget::new_managed(
+        image,
+        docker,
+        docker_endpoint,
+        Some(cleanup),
+        &root,
+    )?;
+    serve_target(root, target)
+}
+
+/// Local diagnostics use the same injected executable boundary, without a
+/// running managed generation. This is not an MCP method or a task option.
+#[cfg(unix)]
+pub(crate) fn serve_probe(
+    root: PathBuf,
+    image: String,
+    docker: PathBuf,
+    endpoint: String,
+) -> Result<(), String> {
+    let root = workspace::validate_root(&root)?;
+    let target = target::LocalExecutionTarget::new_managed(image, docker, endpoint, None, &root)?;
     serve_target(root, target)
 }
 
@@ -78,7 +101,7 @@ fn serve(args: &[String]) -> Result<(), String> {
         }
     }
     let root = workspace::validate_root(&root.ok_or("--workspace is required")?)?;
-    let target = target::LocalExecutionTarget::new(image.ok_or("--image is required")?)?;
+    let target = target::LocalExecutionTarget::new(image.ok_or("--image is required")?, &root)?;
     serve_target(root, target)
 }
 

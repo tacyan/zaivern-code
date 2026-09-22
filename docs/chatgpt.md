@@ -79,6 +79,32 @@ Tunnel 専用子プロセスだけに渡し、MCP 起動は通常初期化より
 生の子プロセス stdout/stderr は保存・表示せず、doctor の既知の検査名と状態だけを表示します。
 この版には `logs --export` はありません。診断には `status` / `doctor` を使用してください。
 
+### ホスト実行ファイルと環境の境界
+
+managed MCP と診断は、設定済みの canonical Docker executable と local Unix socket を直接使用します。
+タスクからPATHやDocker contextを再探索しません。setupのDocker検出は標準インストール先
+（`/usr/local/bin`、`/opt/homebrew/bin`、`/usr/bin`、`/bin`、Docker Desktop、`~/.docker/bin`）に限定し、
+workspace内の実行ファイル、hardlink、共有書込可能な実行ファイルを拒否します。
+LinuxのSecret Service helperはroot所有の `/usr/bin/secret-tool` を使用します。
+macOSの起動時言語検出も `/usr/bin/defaults` に固定し、workspaceのPATHを実行権限にしません。
+標準外のインストール先をユーザーPATHから自動採用することはありません。
+
+snapshotのtarはRustで検証済みの凍結バイト列から生成します。ホストの `tar` は起動せず、
+symlink/hardlink、絶対パス、親ディレクトリ参照をarchiveへ追加しません。
+タスク用Docker CLIには空の専用設定ディレクトリを渡し、ホストDocker設定のproxy認証情報が
+containerの環境へ自動注入される経路も遮断します。imageの事前取得はsetup側の処理です。
+
+| 段階 | 環境と実行権限 |
+| --- | --- |
+| setup / secret helper | 環境をallowlistで再構成。PATHはsystem directoryのみ。HOME、DBus等は鍵保管・Docker context検出のために使用 |
+| tunnel-client | 検証済み管理バイナリ。Runtime keyをこの子だけへ明示設定。`OPENAI_API_KEY`は継承しない |
+| managed MCP | 通常初期化前に再execしてkeyを除去。固定system PATH、設定済みDocker/socketを使用 |
+| タスク用Docker CLI | `env_clear`。system PATHと空の専用`DOCKER_CONFIG`のみ。HOME、DBus、Docker context、Runtime/model keyを継承しない |
+| Agent / verifier | Docker引数で定義したHOME・build用変数のみ。host credential、socket、workspace bind mount、networkなし |
+
+Docker credential helperがsystem PATH外にあるprivate imageは、事前に通常のDocker CLIで取得してください。
+setupが任意のworkspace helperを実行するためにPATHを広げることはありません。
+
 ### Docker cleanup失敗からの復旧
 
 ```sh
@@ -103,6 +129,17 @@ receipt保存だけ失敗した場合も再試行できます。journalを直接
 旧Tunnelの遅延起動が新世代へ混入しないよう、起動世代を非秘密の専用環境変数で固定し、
 MCP受付は世代ごとに一度だけ許可します。MCPだけ異常終了した場合も `stop → repair → start` を使用します。
 世代切替途中の停止は `cleanup-prepared.json` から、資源を作成せず復旧します。
+
+supervisorは専用guardianのleaderを `waitid(WNOWAIT)` で観測し、process groupの回収前にはreapしません。
+guardianとMCPは同じgroupを維持します。supervisorが異常終了すると、単独所有するpipe writerが閉じ、
+guardianがEOFを検出して同じ終了処理を行います。guardianが先に終了した場合はsupervisorが回収します。
+鍵取得前から監視を開始し、guardianが起動するSecret Service helperも同じgroupで回収します。
+保存PID/PGIDを再起動後のkill権限には使いません。正常終了にはMCP lockの解放、同世代のcleanup証拠、
+子の正常終了が必要です。強制終了後は成功したstopと表示せず、残ったjournalを `repair` で照合します。
+
+この猶予が必要なのは、[tunnel-client v0.0.14のstdio stop](https://github.com/openai/tunnel-client/blob/v0.0.14/pkg/mcpclient/stdio_command.go)
+がstdin closeとTERMの後、[Fxの既定15秒](https://github.com/uber-go/fx/blob/v1.23.0/app.go)までしか待たないためです。
+Zaivernは最大45秒のcleanup猶予を持ち、それを超えた場合も未確認のjournalを残します。
 
 **証明できない状態は解除しません。** 古い版のjournalがない未確認世代、所有ラベル不一致、
 破損stateは安全な自動削除の対象外です。また作成要求の応答を失い、作成完了を一度も確認できず、
@@ -165,7 +202,7 @@ Windows は安全なファイルハンドル実装が未対応のため、明示
 image の通常の起動処理は、コンテナ内で OpenAI 互換のローカル推論サーバを起動し、
 ACP を `docker exec` できる間、生存している必要があります。
 Qwen とモデル重み・推論エンジン・GNU tar・ビルド用ツールチェーンは事前に image に含めます。
-ホストにも tar が必要です。
+ホスト側のtarインストールは不要です。
 image に実際の API キー、ログイントークン、秘密鍵を含めないでください。
 `HOME=/tmp/agent-home` となり、workspace と一時ディレクトリだけが書き込み可能です。
 

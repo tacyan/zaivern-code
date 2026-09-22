@@ -5,38 +5,32 @@ use super::{
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 struct Mcp {
-    child: process::OwnedChild,
+    child: process::OwnedProcessGroup,
+    input: Option<std::process::ChildStdin>,
+    finished: Option<Result<()>>,
     replies: std::sync::mpsc::Receiver<Vec<u8>>,
     id: u64,
 }
 impl Mcp {
     fn start(config: &Config) -> Result<Self> {
+        config.validate_runtime_paths()?;
         let mut cmd = process::command(&config.executable);
-        let mut paths = vec![config
-            .docker
-            .parent()
-            .ok_or("Invalid Docker executable path")?
-            .to_path_buf()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        cmd.env(
-            "PATH",
-            std::env::join_paths(paths).map_err(|_| "Invalid executable search path")?,
-        );
-        cmd.args(["mcp", "serve", "--workspace"])
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.args(["chatgpt", "__probe"])
             .arg(&config.workspace)
-            .args(["--image", &config.image])
-            .env("DOCKER_HOST", &config.docker_endpoint)
+            .arg(&config.image)
+            .arg(&config.docker)
+            .arg(&config.docker_endpoint)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        let mut child = process::OwnedChild::spawn(&mut cmd)?;
-        let output = child.child.stdout.take().ok_or("Missing MCP stdout")?;
+        let mut child = process::OwnedProcessGroup::spawn(&mut cmd)?;
+        let output = child.take_stdout()?;
+        let input = Some(child.take_lease()?);
         let (tx, replies) = std::sync::mpsc::sync_channel(8);
         std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(output);
@@ -57,12 +51,14 @@ impl Mcp {
         });
         Ok(Self {
             child,
+            input,
+            finished: None,
             replies,
             id: 0,
         })
     }
     fn send(&mut self, value: Value) -> Result<()> {
-        let input = self.child.child.stdin.as_mut().ok_or("MCP stdin closed")?;
+        let input = self.input.as_mut().ok_or("MCP stdin closed")?;
         writeln!(input, "{value}")
             .and_then(|_| input.flush())
             .map_err(|_| "MCP request failed".into())
@@ -113,14 +109,33 @@ impl Mcp {
         )
         .map_err(|_| "Invalid MCP tool content".into())
     }
+    fn finish(&mut self) -> Result<()> {
+        if let Some(result) = &self.finished {
+            return result.clone();
+        }
+        let result = self.finish_inner();
+        self.finished = Some(result.clone());
+        result
+    }
+    fn finish_inner(&mut self) -> Result<()> {
+        self.input.take();
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while !self.child.exited()? {
+            if Instant::now() >= deadline {
+                self.child.reclaim()?;
+                return Err("MCP probe shutdown timed out; Docker cleanup is not confirmed".into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !self.child.reclaim()?.success() {
+            return Err("MCP probe failed or Docker cleanup is unconfirmed".into());
+        }
+        Ok(())
+    }
 }
 impl Drop for Mcp {
     fn drop(&mut self) {
-        self.child.child.stdin.take();
-        let deadline = Instant::now() + Duration::from_secs(35);
-        while self.child.exited().ok().flatten().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let _ = self.finish();
     }
 }
 
@@ -146,7 +161,9 @@ fn validate_tools(value: &Value) -> Result<()> {
 }
 
 pub(super) fn discovery(config: &Config) -> Result<()> {
-    Mcp::start(config)?.discover()
+    let mut mcp = Mcp::start(config)?;
+    mcp.discover()?;
+    mcp.finish()
 }
 
 struct Temporary(PathBuf);
@@ -234,10 +251,11 @@ pub(super) fn local_test(config: &Config) -> Result<()> {
         return Err("Fixture cancel failed".into());
     }
     println!("[PASS] cancel");
+    mcp.finish()?;
     drop(mcp);
     let path = temporary.0.clone();
     drop(temporary);
-    if Path::new(&path).exists() {
+    if super::private::exists_checked(&path)? {
         return Err("Temporary workspace cleanup failed".into());
     }
     println!("[PASS] temporary workspace cleanup\nLocal E2E: PASS");
@@ -264,5 +282,32 @@ fn wait(mcp: &mut Mcp, task: &Value, running: bool) -> Result<Value> {
             reported = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn probe_cannot_report_cleanup_success_after_mcp_failure() {
+        for code in [0, 1] {
+            let mut cmd = process::command(Path::new("/bin/sh"));
+            cmd.args(["-c", &format!("exit {code}")])
+                .stdin(Stdio::piped());
+            let mut child = process::OwnedProcessGroup::spawn(&mut cmd).unwrap();
+            let input = Some(child.take_lease().unwrap());
+            let (_tx, replies) = std::sync::mpsc::sync_channel(1);
+            let mut mcp = Mcp {
+                child,
+                input,
+                replies,
+                id: 0,
+                finished: None,
+            };
+            assert_eq!(mcp.finish().is_ok(), code == 0);
+            assert_eq!(mcp.finish().is_ok(), code == 0);
+        }
     }
 }

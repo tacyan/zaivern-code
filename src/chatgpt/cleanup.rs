@@ -209,6 +209,11 @@ impl Cleanup {
     }
 
     fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
+        if super::config::validate_executable(&self.config.docker, &self.config.workspace)?
+            != self.config.docker
+        {
+            return Err("Configured Docker executable changed; cleanup state preserved".into());
+        }
         docker::validate_endpoint(&self.config.docker_endpoint)?;
         let mut command = docker::command(&self.config.docker, &self.config.docker_endpoint);
         command.args(args);
@@ -419,21 +424,21 @@ impl CleanupTracker for Cleanup {
 }
 
 pub(super) fn ensure_confirmed(root: &Path) -> Result<()> {
-    if root.join(PREPARED).symlink_metadata().is_ok() {
+    if private::exists_checked(&root.join(PREPARED))? {
         return Err("Generation activation interrupted; run zai chatgpt repair".into());
     }
-    if root.join(FILE).symlink_metadata().is_ok() && read(root)?.phase != Phase::Confirmed {
+    if private::exists_checked(&root.join(FILE))? && read(root)?.phase != Phase::Confirmed {
         return Err("Previous cleanup: UNCONFIRMED. Run zai chatgpt repair; start/setup/reset remain blocked".into());
     }
     Ok(())
 }
 
 pub(super) fn report(root: &Path) -> Result<String> {
-    if root.join(PREPARED).symlink_metadata().is_ok() {
+    if private::exists_checked(&root.join(PREPARED))? {
         read_named(root, PREPARED)?;
         return Ok("Previous cleanup: UNCONFIRMED (activation interrupted)\nRecovery: zai chatgpt repair\n".into());
     }
-    if root.join(FILE).symlink_metadata().is_err() {
+    if !private::exists_checked(&root.join(FILE))? {
         return Ok(if super::daemon::ensure_clean(root).is_ok() {
             "Previous cleanup: confirmed / no generation\n".into()
         } else {
@@ -471,7 +476,7 @@ pub(super) fn reconcile(root: &Path, config: &Config) -> Result<()> {
     // Caller holds operation/runtime locks. Never inspect/kill a saved PID.
     let _execution = private::Lock::acquire(root, "mcp.lock")
         .map_err(|_| "MCP cleanup is still running; wait, then retry zai chatgpt repair")?;
-    if root.join(PREPARED).symlink_metadata().is_ok() {
+    if private::exists_checked(&root.join(PREPARED))? {
         let prepared = read_named(root, PREPARED)?;
         if prepared.phase != Phase::Open
             || !prepared.resources.is_empty()
@@ -479,7 +484,7 @@ pub(super) fn reconcile(root: &Path, config: &Config) -> Result<()> {
         {
             return Err("Invalid prepared generation; state preserved".into());
         }
-        if root.join(FILE).symlink_metadata().is_ok() {
+        if private::exists_checked(&root.join(FILE))? {
             let previous = read_named(root, FILE)?;
             if !(previous.phase == Phase::Confirmed
                 || previous.generation == prepared.generation
@@ -491,7 +496,7 @@ pub(super) fn reconcile(root: &Path, config: &Config) -> Result<()> {
                         .into(),
                 );
             }
-        } else if root.join("active-generation").symlink_metadata().is_ok()
+        } else if private::exists_checked(&root.join("active-generation"))?
             && active(root)? != prepared.generation
             && private::read(&root.join("mcp.done"), 64)? != active(root)?.as_bytes()
         {
@@ -505,7 +510,7 @@ pub(super) fn reconcile(root: &Path, config: &Config) -> Result<()> {
         write(root, &prepared)?;
         private::remove(&root.join(PREPARED))?;
     }
-    if super::daemon::ensure_clean(root).is_ok() && root.join(FILE).symlink_metadata().is_err() {
+    if super::daemon::ensure_clean(root).is_ok() && !private::exists_checked(&root.join(FILE))? {
         return Ok(());
     }
     Cleanup::load(root, config)?.finish(true)?;

@@ -6,11 +6,47 @@ use std::path::{Path, PathBuf};
 
 pub(super) type Result<T> = std::result::Result<T, String>;
 
+#[cfg(test)]
+thread_local! {
+    static METADATA_FAILURE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if METADATA_FAILURE.with(|slot| slot.borrow().as_deref() == Some(path)) {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+    }
+    fs::symlink_metadata(path)
+}
+
+/// A link is present; only ENOENT proves absence. IO/permission failures cannot
+/// authorize replacing a journal or treating an old generation as clean.
+pub(super) fn exists_checked(path: &Path) -> Result<bool> {
+    match metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("Cannot inspect managed state; existing evidence preserved".into()),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn with_metadata_failure<T>(path: &Path, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            METADATA_FAILURE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = METADATA_FAILURE.with(|slot| slot.replace(Some(path.into())));
+    let _restore = Restore(previous);
+    action()
+}
+
 pub(super) fn directory(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err("ChatGPT state directory must be absolute".into());
     }
-    if !path.exists() {
+    if !exists_checked(path)? {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(path)
@@ -74,7 +110,7 @@ pub(super) fn remove(path: &Path) -> Result<()> {
 
 pub(super) fn write(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
     directory(path.parent().ok_or("Missing private parent")?)?;
-    if path.symlink_metadata().is_ok() {
+    if exists_checked(path)? {
         open(path, executable)?;
     }
     let tmp = path.with_extension(format!("{}.tmp", nonce()?));
@@ -164,7 +200,7 @@ pub(super) fn root() -> Result<PathBuf> {
     if !base.is_absolute() {
         return Err("ZAIVERN_HOME must be absolute".into());
     }
-    if !base.exists() {
+    if !exists_checked(&base)? {
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&base)
@@ -182,4 +218,42 @@ pub(super) fn root() -> Result<PathBuf> {
         .join("chatgpt");
     directory(&root)?;
     Ok(root)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn metadata_errors_never_prove_clean_state_or_authorize_overwrite() {
+        let root = crate::test_util::unique_temp_dir("chatgpt", "metadata-failure");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(super::super::daemon::ensure_clean(&root).is_ok());
+        for name in [
+            "cleanup-prepared.json",
+            "cleanup-pending.json",
+            "active-generation",
+        ] {
+            with_metadata_failure(&root.join(name), || {
+                assert!(super::super::daemon::ensure_clean(&root).is_err(), "{name}");
+            });
+            assert!(!root.join("mcp.done").exists());
+            assert!(!root.join("shutdown.json").exists());
+        }
+        let journal = root.join("secret-stores.json");
+        write(&journal, b"[\"private-file\"]", false).unwrap();
+        with_metadata_failure(&journal, || {
+            assert!(super::super::secret::stores(&root).is_err());
+            assert!(super::super::secret::remember_store(&root, "secret-service").is_err());
+            assert!(write(&journal, b"replacement", false).is_err());
+        });
+        assert_eq!(read(&journal, 1024).unwrap(), b"[\"private-file\"]");
+        let dangling = root.join("dangling");
+        symlink(root.join("absent"), &dangling).unwrap();
+        assert!(exists_checked(&dangling).unwrap());
+        assert!(write(&dangling, b"must not follow", false).is_err());
+        assert!(!exists_checked(&root.join("absent")).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

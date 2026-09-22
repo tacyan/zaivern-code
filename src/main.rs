@@ -150,9 +150,12 @@ fn main() -> eframe::Result<()> {
     // target. Sanitize before locale detection can spawn any helper process.
     #[cfg(unix)]
     if args.first().is_some_and(|arg| arg == "chatgpt")
-        && args
-            .get(1)
-            .is_some_and(|arg| arg == "__mcp" || arg == "__serve")
+        && args.get(1).is_some_and(|arg| {
+            matches!(
+                arg.as_str(),
+                "__mcp" | "__serve" | "__probe" | "__tunnel" | "__supervise"
+            )
+        })
     {
         std::process::exit(features::chatgpt::cli_main(&args[1..]));
     }

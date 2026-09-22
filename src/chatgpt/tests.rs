@@ -352,7 +352,7 @@ fn official_client_managed_lifecycle_and_cleanup() {
         ),
         crate::test_util::ZaiVerdict::Usable
     );
-    let (docker, endpoint) = docker::detect().unwrap();
+    let (docker, endpoint) = docker::detect(&fixture(&temp.0).workspace).unwrap();
     let image = std::env::var("ZAIVERN_MCP_TEST_IMAGE").expect("set immutable fixture image");
     let mut config = fixture(&temp.0);
     config.executable = bin;

@@ -145,10 +145,9 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
     ensure_clean(root)?;
     let config = Config::load(root)?;
     super::install::verify_installed(root)?;
-    let key = secret::load(root, &config.secret_store)?;
     for file in ["health-url", "runtime.json"] {
         let path = root.join(file);
-        if path.symlink_metadata().is_ok() {
+        if private::exists_checked(&path)? {
             private::open(&path, false)?;
             std::fs::remove_file(path).map_err(|_| "Cannot clear stopped runtime state")?;
         }
@@ -167,7 +166,10 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
     listener
         .set_nonblocking(true)
         .map_err(|_| "Cannot configure supervisor listener")?;
-    let mut cmd = tunnel_command(root, &config, &key, "run")?;
+    let mut cmd = process::command(&config.executable);
+    cmd.args(["chatgpt", "__tunnel"])
+        .arg(root)
+        .stdin(std::process::Stdio::piped());
     // Raw client output can contain prompts or credentials. Discard it; status
     // and doctor expose structured checks only. No raw log file is persisted.
     let generation = private::nonce()?;
@@ -176,7 +178,7 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
         super::cleanup::Cleanup::prepare(root, &config, &generation)?;
     }
     cmd.env("ZAIVERN_CHATGPT_GENERATION", &generation);
-    let mut child = match process::OwnedChild::spawn(&mut cmd) {
+    let mut child = match process::OwnedProcessGroup::spawn(&mut cmd) {
         Ok(child) => child,
         Err(error) => {
             // No child was spawned, so no task can require cleanup.
@@ -184,10 +186,13 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
             return Err(error);
         }
     };
+    // Only this process owns the writer. SIGKILL/crash closes it in the kernel,
+    // waking the guardian even when no Rust destructor can run here.
+    let _lease = child.take_lease()?;
     let state = State {
         version: 1,
         pid: std::process::id(),
-        child_pid: child.child.id(),
+        child_pid: child.id(),
         port: listener
             .local_addr()
             .map_err(|_| "Cannot inspect supervisor listener")?
@@ -203,7 +208,7 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
         if STOP.load(Ordering::Relaxed) {
             break Ok(());
         }
-        if child.exited()?.is_some() {
+        if child.exited()? {
             break Err("Tunnel client exited; run zai chatgpt doctor".into());
         }
         match listener.accept() {
@@ -233,7 +238,11 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
             Err(_) => break Err("Supervisor listener failed".into()),
         }
     };
-    let shutdown = child.stop_gracefully();
+    let shutdown = child.stop_gracefully(Duration::from_secs(45), || {
+        let lock = private::Lock::acquire(root, "mcp.lock").ok()?;
+        ensure_clean(root).ok()?;
+        Some(lock)
+    });
     let deadline = Instant::now() + Duration::from_secs(45);
     while ensure_clean(root).is_err() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -246,6 +255,41 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
         let _ = std::fs::remove_file(root.join(file));
     }
     result.and(shutdown).and(cleanup)
+}
+
+pub(super) fn tunnel_guardian(root: &Path) -> Result<()> {
+    process::disable_core_dumps()?;
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            stop_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(libc::SIGINT, stop_signal as *const () as libc::sighandler_t);
+    }
+    process::guard_tunnel(
+        |scope| {
+            let config = Config::load(root)?;
+            super::install::verify_installed(root)?;
+            let generation = std::env::var("ZAIVERN_CHATGPT_GENERATION")
+                .map_err(|_| "Missing managed generation")?;
+            if !super::cleanup::valid_nonce(&generation)
+                || private::read(&root.join("active-generation"), 64)? != generation.as_bytes()
+            {
+                return Err("Guardian generation mismatch".into());
+            }
+            let key = secret::load_guarded(root, &config.secret_store, scope)?;
+            let mut command = tunnel_command(root, &config, &key, "run")?;
+            command.env("ZAIVERN_CHATGPT_GENERATION", generation);
+            Ok(command)
+        },
+        Duration::from_secs(45),
+        &STOP,
+        || {
+            let lock = private::Lock::acquire(root, "mcp.lock").ok()?;
+            ensure_clean(root).ok()?;
+            Some(lock)
+        },
+    )
 }
 
 pub(super) fn start(root: &Path, foreground: bool) -> Result<()> {
@@ -346,7 +390,7 @@ pub(super) fn stop(root: &Path) -> Result<()> {
 
 pub(super) fn ensure_clean(root: &Path) -> Result<()> {
     super::cleanup::ensure_confirmed(root)?;
-    if root.join("active-generation").symlink_metadata().is_err() {
+    if !private::exists_checked(&root.join("active-generation"))? {
         return Ok(());
     }
     let active = private::read(&root.join("active-generation"), 64)?;

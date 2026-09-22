@@ -2,6 +2,8 @@ use super::private::{self, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub(crate) use crate::features::chat_bridge::imp::host::validate_executable;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Config {
@@ -28,6 +30,20 @@ impl Config {
             || !self.docker.is_absolute()
         {
             return Err("ChatGPT paths must be absolute".into());
+        }
+        if [&self.workspace, &self.executable, &self.docker]
+            .iter()
+            .any(|path| {
+                path.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            })
+            || self.executable.starts_with(&self.workspace)
+            || self.docker.starts_with(&self.workspace)
+        {
+            return Err(
+                "Host executable paths must be outside the workspace without parent traversal"
+                    .into(),
+            );
         }
         // v0.0.14 runtimeconfig.ValidateTunnelID: tunnel_<32 lowercase letters or digits>.
         if !self.tunnel_id.strip_prefix("tunnel_").is_some_and(|id| {
@@ -57,6 +73,14 @@ impl Config {
         }
         Ok(())
     }
+    pub(super) fn validate_runtime_paths(&self) -> Result<()> {
+        if validate_executable(&self.executable, &self.workspace)? != self.executable
+            || validate_executable(&self.docker, &self.workspace)? != self.docker
+        {
+            return Err("Configured executable path changed; run zai chatgpt repair".into());
+        }
+        Ok(())
+    }
     pub(super) fn load(root: &Path) -> Result<Self> {
         let value: Self =
             serde_json::from_slice(&private::read(&root.join("config.json"), 64 * 1024)?)
@@ -74,8 +98,8 @@ impl Config {
     }
 }
 
-// tunnel-client v0.0.14 uses shellwords to split into exec.Command argv; it
-// does not execute a shell. Quote each argument, then JSON-encode the string.
+// Quote each argument in the command string accepted by tunnel-client v0.0.14,
+// then JSON-encode the complete string for its YAML profile.
 pub(super) fn quote(value: &str) -> Result<String> {
     if value.contains(['\0', '\n', '\r']) {
         return Err("MCP command paths cannot contain NUL/newlines".into());
@@ -116,4 +140,46 @@ pub(super) fn verify_profile(config: &Config, root: &Path) -> Result<()> {
         return Err("Managed tunnel profile changed; run zai chatgpt repair".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn executable_trust_rejects_workspace_links_and_shared_write() {
+        let root = crate::test_util::unique_temp_dir("chatgpt", "executable-trust");
+        let workspace = root.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let binary = root.join("tool");
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            validate_executable(&binary, &workspace).unwrap(),
+            binary.canonicalize().unwrap()
+        );
+        let unsafe_tool = workspace.join("docker");
+        std::fs::copy(&binary, &unsafe_tool).unwrap();
+        assert!(validate_executable(&unsafe_tool, &workspace).is_err());
+        let link = root.join("installation-link");
+        symlink(&unsafe_tool, &link).unwrap();
+        assert!(validate_executable(&link, &workspace).is_err());
+        std::fs::remove_file(&link).unwrap();
+        symlink(&binary, &link).unwrap();
+        assert_eq!(
+            validate_executable(&link, &workspace).unwrap(),
+            binary.canonicalize().unwrap()
+        );
+        let hardlink = root.join("hardlink");
+        std::fs::hard_link(&binary, &hardlink).unwrap();
+        assert!(validate_executable(&binary, &workspace).is_err());
+        std::fs::remove_file(&hardlink).unwrap();
+        for mode in [0o770, 0o707, 0o600] {
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(validate_executable(&binary, &workspace).is_err());
+        }
+        assert!(validate_executable(&workspace, &workspace).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

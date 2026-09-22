@@ -35,10 +35,16 @@ pub fn cli_main(args: &[String]) -> i32 {
 fn dispatch(args: &[String]) -> Result<()> {
     install::platform(std::env::consts::OS, std::env::consts::ARCH)?;
     match args.first().map(String::as_str) {
-        Some("__mcp" | "__serve" | "__supervise") if args.len() == 2 => {
+        Some("__probe") if args.len() == 5 => {
+            let workspace = Path::new(&args[1]);
+            let docker = Path::new(&args[3]);
+            config::validate_executable(docker, workspace)?;
+            crate::features::chat_bridge::imp::serve_probe(workspace.into(), args[2].clone(), docker.into(), args[4].clone())
+        }
+        Some("__mcp" | "__serve" | "__supervise" | "__tunnel") if args.len() == 2 => {
             let root = Path::new(&args[1]);
             private::directory(root)?;
-            match args[0].as_str() { "__mcp" => mcp_exec(root), "__serve" => managed_serve(root), _ => daemon::supervise(root) }
+            match args[0].as_str() { "__mcp" => mcp_exec(root), "__serve" => managed_serve(root), "__tunnel" => daemon::tunnel_guardian(root), _ => daemon::supervise(root) }
         }
         Some("setup") if args[1..].iter().all(|a| a == "--reauth" || a == "--test") => {
             let root = private::root()?;
@@ -114,7 +120,7 @@ fn setup(root: &Path, reauth: bool) -> Result<()> {
         install::platform(std::env::consts::OS, std::env::consts::ARCH)?
     );
     println!("{}", tr("chatgpt.runtime_auth_only"));
-    let existing = if root.join("config.json").exists() {
+    let existing = if private::exists_checked(&root.join("config.json"))? {
         Some(Config::load(root)?)
     } else {
         None
@@ -161,7 +167,7 @@ fn setup(root: &Path, reauth: bool) -> Result<()> {
             "Workspace must be a project directory outside ChatGPT credential storage".into(),
         );
     }
-    let (docker, docker_endpoint) = docker::detect()?;
+    let (docker, docker_endpoint) = docker::detect(&workspace)?;
     println!("[PASS] Docker — {}", docker_endpoint);
     println!("{}", tr("chatgpt.image_contract"));
     let image_source = prompt(
@@ -215,6 +221,7 @@ fn setup(root: &Path, reauth: bool) -> Result<()> {
         client_version: install::TESTED_VERSION.into(),
     };
     config.validate()?;
+    config.validate_runtime_paths()?;
     if reauth || existing.is_none() || secret::load(root, &config.secret_store).is_err() {
         if let Some(old) = &existing {
             secret::remember_store(root, &old.secret_store)?;
@@ -268,6 +275,7 @@ fn client_version(root: &Path) -> Result<()> {
 
 fn preflight(root: &Path, config: &Config) -> Result<()> {
     config.validate()?;
+    config.validate_runtime_paths()?;
     config::verify_profile(config, root)?;
     install::verify_installed(root)?;
     if !config.executable.is_file() || !config.workspace.is_dir() {
@@ -340,8 +348,8 @@ fn status(root: &Path) -> Result<()> {
     println!("ChatGPT Bridge");
     print!("{}", cleanup::report(root)?);
     match daemon::request(root, "status") {
-        Ok(pid) => println!("Tunnel client    running (owned PID {pid})"),
-        Err(_) => println!("Tunnel client    stopped/unknown"),
+        Ok(pid) => println!("Tunnel group     running (owned leader PID {pid})"),
+        Err(_) => println!("Tunnel group     stopped/unknown"),
     }
     println!(
         "Health           {}",
@@ -374,7 +382,7 @@ fn repair(root: &Path) -> Result<()> {
     config.executable = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|_| "Cannot resolve zai")?;
-    let (docker, endpoint) = docker::detect()?;
+    let (docker, endpoint) = docker::detect(&config.workspace)?;
     config.docker = docker;
     config.docker_endpoint = endpoint;
     if docker::image(&config.docker, &config.docker_endpoint, &config.image).is_err() {
@@ -431,7 +439,7 @@ fn reset(root: &Path) -> Result<()> {
 }
 
 fn test(root: &Path) -> Result<()> {
-    let config = if root.join("config.json").exists() {
+    let config = if private::exists_checked(&root.join("config.json"))? {
         let config = Config::load(root)?;
         preflight(root, &config)?;
         if secret::load(root, &config.secret_store).is_ok() {
@@ -442,7 +450,8 @@ fn test(root: &Path) -> Result<()> {
         config
     } else {
         println!("[WARN] Setup not present: running local E2E only, without tunnel credentials.");
-        let (docker, docker_endpoint) = docker::detect()?;
+        let (docker, docker_endpoint) =
+            docker::detect(&std::env::current_dir().map_err(|_| "Cannot locate workspace")?)?;
         Config {
             version: 1,
             workspace: std::env::temp_dir(),
@@ -473,28 +482,25 @@ fn test(root: &Path) -> Result<()> {
 
 fn mcp_exec(root: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    process::disable_core_dumps()?;
     let config = Config::load(root)?;
+    if config::validate_executable(&config.executable, &config.workspace)? != config.executable {
+        return Err("Configured MCP executable changed; run zai chatgpt repair".into());
+    }
     let generation = std::env::var("ZAIVERN_CHATGPT_GENERATION")
         .ok()
         .filter(|s| cleanup::valid_nonce(s))
         .ok_or("Missing managed MCP launch generation")?;
     let mut command = process::command(&config.executable);
-    let mut paths = vec![config
-        .docker
-        .parent()
-        .ok_or("Invalid Docker executable path")?
-        .to_path_buf()];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    command.env(
-        "PATH",
-        std::env::join_paths(paths).map_err(|_| "Invalid executable search path")?,
-    );
+    command
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("DOCKER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        // exec must retain the tunnel's owned group, not become a new leader.
+        .process_group(unsafe { libc::getpgrp() });
     command
         .args(["chatgpt", "__serve"])
         .arg(root)
-        .env("DOCKER_HOST", &config.docker_endpoint)
         .env("ZAIVERN_CHATGPT_GENERATION", generation)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
@@ -524,11 +530,12 @@ fn managed_serve(root: &Path) -> Result<()> {
         .filter(|s| cleanup::valid_nonce(s))
         .ok_or("Missing managed MCP launch generation")?;
     let config = Config::load(root)?;
+    config.validate_runtime_paths()?;
     let cleanup = std::sync::Arc::new(cleanup::Cleanup::load(root, &config)?);
     // The child can exec before its supervisor has committed runtime.json.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if daemon::request(root, "status").is_ok() {
+        if daemon::generation_running(root, &generation) {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -540,6 +547,8 @@ fn managed_serve(root: &Path) -> Result<()> {
     crate::features::chat_bridge::imp::serve_managed(
         config.workspace,
         config.image,
+        config.docker,
+        config.docker_endpoint,
         cleanup.clone(),
     )?;
     // The bridge has joined its worker. Only verified resource absence can
