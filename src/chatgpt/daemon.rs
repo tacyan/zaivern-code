@@ -352,39 +352,72 @@ fn wait_for_start(
 }
 
 pub(super) fn stop(root: &Path) -> Result<()> {
+    stop_with_timeout(root, Duration::from_secs(75))
+}
+
+fn stop_with_timeout(root: &Path, operation_timeout: Duration) -> Result<()> {
     match request(root, "stop") {
-        Ok(_) => {
-            let deadline = Instant::now() + Duration::from_secs(100);
-            let mut progress = Instant::now();
-            loop {
-                if let Ok(_lock) = private::Lock::acquire(root, "runtime.lock") {
-                    ensure_clean(root)?;
-                    let bytes = private::read(&root.join("shutdown.json"), 4096)?;
-                    let receipt: ShutdownReceipt =
-                        serde_json::from_slice(&bytes).map_err(|_| "Invalid shutdown receipt")?;
-                    let active = private::read(&root.join("active-generation"), 64)?;
-                    if !receipt.success || receipt.generation.as_bytes() != active.as_slice() {
-                        return Err("Bridge exited abnormally or required forced termination; cleanup was checked, but stop was not successful. Run doctor.".into());
-                    }
-                    println!("ChatGPT Bridge stopped.");
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err("Supervisor is still stopping; state was preserved".into());
-                }
-                if progress.elapsed() >= Duration::from_secs(10) {
-                    println!("Waiting for MCP task cancellation and cleanup...");
-                    progress = Instant::now();
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
+        Ok(_) => wait_for_stop(root),
         Err(_) => {
-            let _lock = private::Lock::acquire(root, "runtime.lock")?;
+            // A failed request is ambiguous: start may hold operation.lock
+            // between its preflight and supervisor spawn. Serialize the
+            // fallback with that operation, then ask the supervisor again.
+            // Never report "stopped" while a lifecycle operation is active.
+            let operation = acquire_operation_for_stop(root, operation_timeout)?;
+            if request(root, "stop").is_ok() {
+                drop(operation);
+                return wait_for_stop(root);
+            }
+            let _runtime = private::Lock::acquire(root, "runtime.lock")?;
             ensure_clean(root)?;
             println!("ChatGPT Bridge is stopped. No saved PID was signalled.");
             Ok(())
         }
+    }
+}
+
+fn acquire_operation_for_stop(root: &Path, timeout: Duration) -> Result<private::Lock> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match private::Lock::acquire(root, "operation.lock") {
+            Ok(lock) => return Ok(lock),
+            Err(acquire_error) => match private::Lock::held(root, "operation.lock") {
+                Ok(true) | Ok(false) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(true) | Ok(false) => {
+                    return Err("Another ChatGPT lifecycle operation is still running; stop was not confirmed".into())
+                }
+                Err(_) => return Err(acquire_error),
+            },
+        }
+    }
+}
+
+fn wait_for_stop(root: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(100);
+    let mut progress = Instant::now();
+    loop {
+        if let Ok(_lock) = private::Lock::acquire(root, "runtime.lock") {
+            ensure_clean(root)?;
+            let bytes = private::read(&root.join("shutdown.json"), 4096)?;
+            let receipt: ShutdownReceipt =
+                serde_json::from_slice(&bytes).map_err(|_| "Invalid shutdown receipt")?;
+            let active = private::read(&root.join("active-generation"), 64)?;
+            if !receipt.success || receipt.generation.as_bytes() != active.as_slice() {
+                return Err("Bridge exited abnormally or required forced termination; cleanup was checked, but stop was not successful. Run doctor.".into());
+            }
+            println!("ChatGPT Bridge stopped.");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("Supervisor is still stopping; state was preserved".into());
+        }
+        if progress.elapsed() >= Duration::from_secs(10) {
+            println!("Waiting for MCP task cancellation and cleanup...");
+            progress = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -614,6 +647,22 @@ mod tests {
             assert!(!temp.0.join("mcp.done").exists());
             assert!(!temp.0.join("shutdown.json").exists());
         }
+    }
+
+    #[test]
+    fn stop_does_not_claim_stopped_while_lifecycle_operation_is_active() {
+        use super::super::tests::Temp;
+
+        let temp = Temp::new();
+        let _operation = private::Lock::acquire(&temp.0, "operation.lock").unwrap();
+        let error = stop_with_timeout(&temp.0, Duration::from_millis(50)).unwrap_err();
+        assert!(error.contains("lifecycle operation"));
+        assert!(private::Lock::held(&temp.0, "operation.lock").unwrap());
+        assert!(private::Lock::acquire(&temp.0, "runtime.lock").is_ok());
+
+        let stopped = Temp::new();
+        stop_with_timeout(&stopped.0, Duration::from_millis(50)).unwrap();
+        assert!(private::Lock::acquire(&stopped.0, "runtime.lock").is_ok());
     }
 
     #[test]
