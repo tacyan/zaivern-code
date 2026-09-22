@@ -91,6 +91,40 @@ impl Drop for OwnedChild {
     }
 }
 
+/// Request graceful shutdown of a directly owned child without forcing cleanup
+/// to stop. `false` leaves the live Child with the caller; no saved PID is used.
+pub(super) fn terminate_and_wait(child: &mut Child, timeout: Duration) -> Result<bool> {
+    // try_wait also handles a Child that was already reaped: never signal its
+    // potentially recycled PID. Otherwise the unreaped child reserves the PID.
+    if child
+        .try_wait()
+        .map_err(|_| "Cannot inspect owned child")?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if unsafe { libc::kill(child.id() as i32, libc::SIGTERM) } != 0
+        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err("Cannot request supervisor shutdown; state preserved".into());
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| "Cannot inspect owned child")?
+            .is_some()
+        {
+            return Ok(true); // Reaped, but this is not a cleanup receipt.
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
 pub(super) fn capture(mut command: Command, timeout: Duration, limit: usize) -> Result<Vec<u8>> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let (success, bytes) = capture_status(command, timeout, limit)?;
@@ -151,4 +185,74 @@ pub(super) fn disable_core_dumps() -> Result<()> {
         return Err("Cannot disable core dumps before loading credentials".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use std::io::BufRead;
+
+    pub(in super::super) fn ready_child(script: &str) -> OwnedChild {
+        let mut cmd = command(Path::new("/bin/sh"));
+        cmd.args(["-c", script]).stdout(Stdio::piped());
+        let mut child = OwnedChild::spawn(&mut cmd).unwrap();
+        let output = child.child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(output).read_line(&mut line);
+            let _ = tx.send((result, line));
+        });
+        let (result, line) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        result.unwrap();
+        assert_eq!(line, "ready\n");
+        child
+    }
+
+    #[test]
+    fn termination_waits_for_graceful_exit_and_reaps_owned_child() {
+        let mut child = ready_child(
+            "trap 'sleep 0.2; exit 0' TERM; printf 'ready\\n'; while :; do sleep 1; done",
+        );
+        let started = Instant::now();
+        let terminated = terminate_and_wait(&mut child.child, Duration::from_secs(5));
+        let status = child.exited().unwrap(); // Update the guard before assertions can unwind.
+        assert!(terminated.unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(status.unwrap().success());
+        // The OS has no waitable child left, rather than just a dead zombie.
+        assert_eq!(
+            unsafe { libc::waitpid(child.child.id() as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn termination_is_bounded_and_retains_live_child_ownership() {
+        let mut child = ready_child("trap '' TERM; printf 'ready\\n'; exec sleep 30");
+        let mut unrelated = ready_child("printf 'ready\\n'; exec sleep 30");
+        let started = Instant::now();
+        assert!(!terminate_and_wait(&mut child.child, Duration::from_millis(100)).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(child.exited().unwrap().is_none());
+        assert!(unrelated.exited().unwrap().is_none());
+        // Only the fixture owner terminates these children after the assertion.
+        child.stop();
+        unrelated.stop();
+    }
+
+    #[test]
+    fn termination_of_already_reaped_child_returns_without_signalling() {
+        let mut cmd = command(Path::new("/bin/sh"));
+        cmd.args(["-c", "exit 0"]);
+        let mut child = OwnedChild::spawn(&mut cmd).unwrap();
+        assert!(child.child.wait().unwrap().success());
+        assert!(child.exited().unwrap().is_some());
+        assert!(terminate_and_wait(&mut child.child, Duration::ZERO).unwrap());
+        assert!(child.exited().unwrap().is_some());
+    }
 }

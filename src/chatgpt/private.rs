@@ -110,6 +110,23 @@ pub(super) fn nonce() -> Result<String> {
 
 pub(super) struct Lock(File);
 impl Lock {
+    /// Observe an existing lock without adopting an unsafe file or conflating
+    /// permission/IO errors with contention. This grants no lifecycle authority.
+    pub(super) fn held(root: &Path, name: &str) -> Result<bool> {
+        directory(root)?;
+        let file = open(&root.join(name), false)?;
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // File close releases this briefly acquired observational lock.
+            return Ok(false);
+        }
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+            Ok(true)
+        } else {
+            Err("Cannot inspect ChatGPT runtime lock".into())
+        }
+    }
+
     pub(super) fn acquire(root: &Path, name: &str) -> Result<Self> {
         directory(root)?;
         let file = OpenOptions::new()

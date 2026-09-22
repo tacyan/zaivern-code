@@ -42,6 +42,18 @@ fn read_state(root: &Path) -> Result<State> {
 }
 
 pub(super) fn request(root: &Path, action: &str) -> Result<u32> {
+    Ok(request_state(root, action)?.child_pid)
+}
+
+pub(super) fn generation_running(root: &Path, generation: &str) -> bool {
+    // The authenticated supervisor holds runtime.lock throughout its lifetime.
+    // Neither a journal phase nor the PID saved in runtime.json proves liveness.
+    private::Lock::held(root, "runtime.lock") == Ok(true)
+        && request_state(root, "status").is_ok_and(|state| state.generation == generation)
+        && private::Lock::held(root, "runtime.lock") == Ok(true)
+}
+
+fn request_state(root: &Path, action: &str) -> Result<State> {
     if !["status", "stop"].contains(&action) {
         return Err("Unknown supervisor action".into());
     }
@@ -69,7 +81,46 @@ pub(super) fn request(root: &Path, action: &str) -> Result<u32> {
     if response != format!("{} {} {}\n", state.generation, state.pid, state.child_pid) {
         return Err("Supervisor identity mismatch; no process was signalled".into());
     }
-    Ok(state.child_pid)
+    Ok(state)
+}
+
+fn read_supervisor_request(stream: &mut TcpStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    // Darwin inherits the nonblocking listener flag. A read timeout alone
+    // does not override it. Bound the whole frame, not each arriving byte.
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(timeout))?;
+    let deadline = Instant::now() + timeout;
+    let mut input = vec![0; 256];
+    let mut len = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut input[len..]) {
+            Ok(0) => {
+                input.truncate(len);
+                return Ok(input);
+            }
+            Ok(n) => {
+                len += n;
+                if len == input.len() {
+                    return Ok(input); // Oversized frames cannot match an action.
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(super) fn tunnel_command(
@@ -157,14 +208,11 @@ pub(super) fn supervise(root: &Path) -> Result<()> {
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(250)))
-                    .ok();
-                stream
-                    .set_write_timeout(Some(Duration::from_millis(250)))
-                    .ok();
-                let mut input = Vec::new();
-                if (&mut stream).take(256).read_to_end(&mut input).is_ok() {
+                // A failed/slow connection never terminates the supervisor.
+                // Reading the entire frame and writing the reply each have a
+                // 250ms budget, so STOP and the next status remain responsive.
+                if let Ok(input) = read_supervisor_request(&mut stream, Duration::from_millis(250))
+                {
                     let status = format!("{} status\n", state.generation);
                     let stop = format!("{} stop\n", state.generation);
                     if input == status.as_bytes() || input == stop.as_bytes() {
@@ -215,6 +263,20 @@ pub(super) fn start(root: &Path, foreground: bool) -> Result<()> {
     let mut cmd = process::command(&config.executable);
     cmd.args(["chatgpt", "__supervise"]).arg(root);
     let mut child = cmd.spawn().map_err(|_| "Cannot start ChatGPT supervisor")?;
+    wait_for_start(
+        root,
+        &mut child,
+        Duration::from_secs(65),
+        Duration::from_secs(15),
+    )
+}
+
+fn wait_for_start(
+    root: &Path,
+    child: &mut std::process::Child,
+    startup_timeout: Duration,
+    shutdown_timeout: Duration,
+) -> Result<()> {
     let started = Instant::now();
     loop {
         if request(root, "status").is_ok() {
@@ -231,11 +293,11 @@ pub(super) fn start(root: &Path, foreground: bool) -> Result<()> {
                     .into(),
             );
         }
-        if started.elapsed() >= Duration::from_secs(65) {
-            // Child is still unreaped and its identity is reserved. Ask it to
-            // stop gracefully so its held tunnel Child is cleaned up as well.
-            unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
+        if started.elapsed() >= startup_timeout {
+            // Allow a short graceful wait here; the supervisor retains its
+            // existing 45s shutdown/cleanup budgets if it needs longer.
+            if !process::terminate_and_wait(child, shutdown_timeout)? {
+                return Err("Supervisor startup timed out and shutdown is still pending; state preserved. Wait, then run zai chatgpt status or doctor.".into());
             }
             return Err(
                 "Supervisor startup timed out; unlock your secret store and run doctor".into(),
@@ -399,6 +461,116 @@ fn parse_live_status(bytes: &[u8], tunnel: &str) -> Result<(bool, bool)> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn supervisor_accepts_split_frames_and_bounds_slow_or_unfinished_requests() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "loopback accept timed out");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        };
+        for slow in [false, true] {
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let mut server = accept();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let reader = std::thread::spawn(move || {
+                let result = read_supervisor_request(&mut server, Duration::from_millis(100));
+                tx.send(result).unwrap();
+            });
+            // Keep the connection open: the request must expire even when
+            // bytes keep arriving more frequently than the read timeout.
+            let writer = if slow {
+                Some(std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        if client.write_all(b"x").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }))
+            } else {
+                None
+            };
+            let error = rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            reader.join().unwrap();
+            if let Some(writer) = writer {
+                writer.join().unwrap();
+            }
+        }
+        // A later legitimate, split request still works on the same listener.
+        let generation = private::nonce().unwrap();
+        let expected = format!("{generation} status\n");
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut server = accept();
+        let reader = std::thread::spawn(move || {
+            read_supervisor_request(&mut server, Duration::from_secs(2))
+        });
+        client.write_all(generation.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        client.write_all(b" status\n").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(reader.join().unwrap().unwrap(), expected.as_bytes());
+    }
+
+    #[test]
+    fn startup_timeout_wait_preserves_unconfirmed_generation() {
+        use super::super::{
+            cleanup::Cleanup,
+            tests::{fixture, Temp},
+        };
+        let temp = Temp::new();
+        let generation = private::nonce().unwrap();
+        Cleanup::prepare(&temp.0, &fixture(&temp.0), &generation).unwrap();
+        let _runtime = private::Lock::acquire(&temp.0, "runtime.lock").unwrap();
+        for (script, finishes) in [
+            (
+                "trap 'sleep 0.2; exit 0' TERM; printf 'ready\\n'; while :; do sleep 1; done",
+                true,
+            ),
+            ("trap '' TERM; printf 'ready\\n'; exec sleep 30", false),
+        ] {
+            let mut child = process::tests::ready_child(script);
+            let started = Instant::now();
+            let result = wait_for_start(
+                &temp.0,
+                &mut child.child,
+                Duration::ZERO,
+                if finishes {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(100)
+                },
+            );
+            let exited = child.exited().unwrap();
+            let error = result.unwrap_err();
+            assert!(error.contains("startup timed out"));
+            assert_eq!(error.contains("shutdown is still pending"), !finishes);
+            assert_eq!(exited.is_some(), finishes);
+            assert!(started.elapsed() < Duration::from_secs(6));
+            assert!(private::Lock::acquire(&temp.0, "runtime.lock").is_err());
+            assert!(ensure_clean(&temp.0).is_err());
+            assert_eq!(
+                private::read(&temp.0.join("active-generation"), 64).unwrap(),
+                generation.as_bytes()
+            );
+            assert!(!temp.0.join("mcp.done").exists());
+            assert!(!temp.0.join("shutdown.json").exists());
+        }
+    }
 
     #[test]
     fn live_status_checks_identity_stdio_and_unsafe_logging() {

@@ -87,9 +87,17 @@ fn config_profile_roundtrip_and_repeat_are_secret_free() {
 fn exclusive_lock_survives_file_reuse_and_blocks_duplicates() {
     let temp = Temp::new();
     let first = private::Lock::acquire(&temp.0, "runtime.lock").unwrap();
+    assert_eq!(private::Lock::held(&temp.0, "runtime.lock"), Ok(true));
     assert!(private::Lock::acquire(&temp.0, "runtime.lock").is_err());
     drop(first);
+    assert_eq!(private::Lock::held(&temp.0, "runtime.lock"), Ok(false));
     assert!(private::Lock::acquire(&temp.0, "runtime.lock").is_ok());
+    std::fs::set_permissions(
+        temp.0.join("runtime.lock"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(private::Lock::held(&temp.0, "runtime.lock").is_err());
 }
 
 #[test]
@@ -376,10 +384,20 @@ fn official_client_managed_lifecycle_and_cleanup() {
             std::thread::sleep(Duration::from_millis(100));
         }
         let health = daemon::health(&root, "healthz");
+        let running_report = cleanup::report(&root).unwrap();
         let stopped = daemon::stop(&root);
         assert_eq!(health, Ok(true), "local health listener must start");
         stopped.unwrap();
+        assert!(
+            running_report.contains("Current generation: RUNNING"),
+            "{running_report}"
+        );
+        assert!(!running_report.contains("UNCONFIRMED"), "{running_report}");
+        assert!(!running_report.contains("repair"), "{running_report}");
         daemon::ensure_clean(&root).unwrap();
+        let stopped_report = cleanup::report(&root).unwrap();
+        assert!(stopped_report.contains("Previous cleanup: CONFIRMED"));
+        assert!(!stopped_report.contains("repair"));
         assert!(daemon::request(&root, "status").is_err());
     }
     assert_eq!(std::fs::read_dir(&config.workspace).unwrap().count(), 0);

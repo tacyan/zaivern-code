@@ -425,9 +425,23 @@ pub(super) fn report(root: &Path) -> Result<String> {
             .filter(|r| r.kind == kind && r.state != ResourceState::Removed)
             .count()
     };
-    Ok(format!("Previous cleanup: {}\nPending containers: {}\nPending volumes: {}\nRecovery: zai chatgpt repair\n",
-        if journal.phase == Phase::Confirmed && super::daemon::ensure_clean(root).is_ok() { "CONFIRMED" } else { "UNCONFIRMED" },
-        count(ResourceKind::Container), count(ResourceKind::Volume)))
+    let (status, recovery) = if matches!(journal.phase, Phase::Open | Phase::Running)
+        && super::daemon::generation_running(root, &journal.generation)
+    {
+        ("Current generation: RUNNING\nCleanup tracking: active", "")
+    } else if journal.phase == Phase::Confirmed && super::daemon::ensure_clean(root).is_ok() {
+        ("Previous cleanup: CONFIRMED", "")
+    } else {
+        (
+            "Previous cleanup: UNCONFIRMED",
+            "Recovery: zai chatgpt repair\n",
+        )
+    };
+    Ok(format!(
+        "{status}\nPending containers: {}\nPending volumes: {}\n{recovery}",
+        count(ResourceKind::Container),
+        count(ResourceKind::Volume)
+    ))
 }
 
 pub(super) fn reconcile(root: &Path, config: &Config) -> Result<()> {
@@ -580,6 +594,132 @@ exit 1
             let _ =
                 std::fs::remove_file(self.config.docker_endpoint.strip_prefix("unix://").unwrap());
         }
+    }
+
+    // Exercise the real nonce/identity IPC, not an injected "running" boolean.
+    fn report_with_supervisor(
+        h: &Harness,
+        generation: &str,
+        valid_reply: bool,
+        hold_lock: bool,
+    ) -> String {
+        use std::io::{Read, Write};
+        let runtime = private::Lock::acquire(&h.temp.0, "runtime.lock").unwrap();
+        let _runtime = hold_lock.then_some(runtime);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let pid = std::process::id();
+        private::write(
+            &h.temp.0.join("runtime.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "version":1, "pid":pid, "child_pid":pid,
+                "port":listener.local_addr().unwrap().port(), "generation":generation
+            }))
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        if !hold_lock {
+            let text = report(&h.temp.0).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            return text;
+        }
+        let generation = generation.to_owned();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "missing status request"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            // Darwin can inherit O_NONBLOCK from the listening socket; use
+            // the bounded blocking read consistently on both Unix platforms.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            (&mut stream)
+                .take(256)
+                .read_to_string(&mut request)
+                .unwrap();
+            assert_eq!(request, format!("{generation} status\n"));
+            if valid_reply {
+                writeln!(stream, "{generation} {pid} {pid}").unwrap();
+            } else {
+                writeln!(stream, "wrong identity").unwrap();
+            }
+        });
+        let report = report(&h.temp.0).unwrap();
+        server.join().unwrap();
+        report
+    }
+
+    #[test]
+    fn report_active_generation_requires_authenticated_matching_supervisor() {
+        let h = Harness::new();
+        for phase in [Phase::Open, Phase::Running] {
+            if phase == Phase::Running {
+                let cleanup = h.cleanup();
+                cleanup.admit(&h.generation).unwrap();
+                cleanup.register(ResourceKind::Container).unwrap();
+                cleanup.register(ResourceKind::Volume).unwrap();
+            }
+            let text = report_with_supervisor(&h, &h.generation, true, true);
+            assert!(text.contains("Current generation: RUNNING\nCleanup tracking: active"));
+            assert!(!text.contains("UNCONFIRMED"));
+            assert!(!text.contains("repair"));
+            let count = usize::from(phase == Phase::Running);
+            assert!(text.contains(&format!(
+                "Pending containers: {count}\nPending volumes: {count}"
+            )));
+            // A display observation never produces a cleanup receipt/admission.
+            assert!(daemon::ensure_clean(&h.temp.0).is_err());
+            assert!(!h.temp.0.join("mcp.done").exists());
+            for text in [
+                report_with_supervisor(&h, &private::nonce().unwrap(), true, true),
+                report_with_supervisor(&h, &h.generation, false, true),
+                report_with_supervisor(&h, &h.generation, true, false),
+                report(&h.temp.0).unwrap(), // saved identity, no live listener
+            ] {
+                assert!(text.contains("UNCONFIRMED"));
+                assert!(text.contains("Recovery: zai chatgpt repair"));
+            }
+        }
+    }
+
+    #[test]
+    fn report_stopped_phases_and_legacy_remain_fail_closed() {
+        let h = Harness::new();
+        for phase in [Phase::Running, Phase::Reconciling] {
+            let mut journal = read(&h.temp.0).unwrap();
+            journal.phase = phase;
+            write(&h.temp.0, &journal).unwrap();
+            let text = report(&h.temp.0).unwrap();
+            assert!(text.contains("UNCONFIRMED"));
+            assert!(text.contains("Recovery: zai chatgpt repair"));
+        }
+        h.reconcile().unwrap();
+        let text = report(&h.temp.0).unwrap();
+        assert!(text.contains("Previous cleanup: CONFIRMED"));
+        assert!(!text.contains("repair"));
+        assert!(text.contains("Pending containers: 0\nPending volumes: 0"));
+        private::remove(&h.temp.0.join(FILE)).unwrap();
+        private::remove(&h.temp.0.join("mcp.done")).unwrap();
+        let text = report(&h.temp.0).unwrap();
+        assert!(text.contains("UNCONFIRMED (legacy state without resource journal)"));
+        assert!(text.contains("ownership audit required; state preserved"));
+        assert!(daemon::ensure_clean(&h.temp.0).is_err());
     }
 
     #[test]
@@ -811,6 +951,9 @@ exit 1
                 write(&h.temp.0, &prepared).unwrap();
             }
             assert!(daemon::ensure_clean(&h.temp.0).is_err());
+            let text = report(&h.temp.0).unwrap();
+            assert!(text.contains("activation interrupted"));
+            assert!(text.contains("Recovery: zai chatgpt repair"));
             h.reconcile().unwrap();
             daemon::ensure_clean(&h.temp.0).unwrap();
             assert_eq!(active(&h.temp.0).unwrap(), next);
