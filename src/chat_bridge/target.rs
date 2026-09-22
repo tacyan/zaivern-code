@@ -1023,21 +1023,19 @@ mod tests {
             decoded.insert(path, content);
         }
         assert_eq!(decoded, files);
-        for path in [
-            "",
-            "../escape",
-            "/absolute",
-            "a/../../b",
-            ".env",
-            "config/key",
-            "a\\b",
-        ] {
+        for path in ["", "../escape", "/absolute", "a/../../b", ".env", "config/key"] {
             assert!(snapshot_archive(
                 Vec::new(),
                 &BTreeMap::from([(PathBuf::from(path), b"x".to_vec())])
             )
             .is_err());
         }
+        #[cfg(not(windows))]
+        assert!(snapshot_archive(
+            Vec::new(),
+            &BTreeMap::from([(PathBuf::from("a\\b"), b"x".to_vec())])
+        )
+        .is_err());
     }
 
     #[cfg(unix)]

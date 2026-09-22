@@ -575,6 +575,10 @@ esac
 exit 1
 "#;
             private::write(&config.docker, script, true).unwrap();
+            // The production setup persists the canonical Docker executable.
+            // Canonicalize the fixture as well so macOS temporary-directory
+            // symlink prefixes do not make identity validation fail.
+            config.docker = config.docker.canonicalize().unwrap();
             let generation = private::nonce().unwrap();
             private::write(
                 &temp.0.join("active-generation"),
