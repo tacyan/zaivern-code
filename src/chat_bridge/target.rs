@@ -3,7 +3,10 @@
 use super::cargo_verification::Coverage;
 use super::task::{Control, Outcome, State, TaskExecutor};
 use super::workspace::{Snapshot, FILE_LIMIT, SNAPSHOT_LIMIT};
-use super::{CleanupTracker, ResourceKind};
+use super::{
+    create::{self, CreateOutcome},
+    CleanupTracker, ResourceKind,
+};
 use crate::acp::{AcpClient, Phase};
 use crate::agents::approvals::ApprovalQueue;
 use crate::features::cloud_execution::{
@@ -96,6 +99,32 @@ impl LocalExecutionTarget {
         Ok(sink.stdout)
     }
 
+    fn create(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        match create::run(self.command(args), timeout, kind, name) {
+            CreateOutcome::Created => {
+                if let Some(cleanup) = &self.cleanup {
+                    cleanup.created(kind, name)?;
+                }
+                Ok(())
+            }
+            CreateOutcome::DefinitelyNotCreated => {
+                if let Some(cleanup) = &self.cleanup {
+                    cleanup.rejected(kind, name)?;
+                }
+                Err("Docker create was rejected".into())
+            }
+            CreateOutcome::Unknown => {
+                Err("Docker create outcome is unknown; cleanup evidence retained".into())
+            }
+        }
+    }
+
     fn upload(
         &self,
         container: &Container<'_>,
@@ -161,6 +190,9 @@ impl LocalExecutionTarget {
         volume: Rc<Volume<'a>>,
         readonly: bool,
     ) -> Result<Container<'a>, String> {
+        // No create can be issued when the task budget has already expired.
+        // Reject before the write-ahead intent rather than leaving false debt.
+        let create_timeout = budget(started, 30)?;
         let mount = format!(
             "type=volume,source={},target=/workspace,volume-nocopy{}",
             volume.name,
@@ -209,13 +241,12 @@ impl LocalExecutionTarget {
         // Track our unique name before create: the daemon can create a container
         // even if its response is lost or the CLI times out. Drop still removes it.
         let launch = self
-            .run(&args, budget(started, 30)?)
-            .and_then(|bytes| {
-                if let Some(cleanup) = &self.cleanup {
-                    cleanup.created(ResourceKind::Container, &container.id)?;
-                }
-                Ok(bytes)
-            })
+            .create(
+                ResourceKind::Container,
+                &container.id,
+                &args,
+                create_timeout,
+            )
             .and_then(|_| self.run(&strings(&["start", &container.id]), budget(started, 30)?));
         if let Err(error) = launch {
             return Err(match container.shutdown() {
@@ -501,6 +532,7 @@ struct Volume<'a> {
 }
 impl<'a> Volume<'a> {
     fn new(target: &'a LocalExecutionTarget, started: Instant) -> Result<Self, String> {
+        let create_timeout = budget(started, 30)?;
         let (name, labels) = match &target.cleanup {
             Some(cleanup) => cleanup.register(ResourceKind::Volume)?,
             None => (ids::new_id("zaivern-mcp-"), Vec::new()),
@@ -524,10 +556,7 @@ impl<'a> Volume<'a> {
         ]);
         args.extend(labels);
         args.push(volume.name.clone());
-        target.run(&args, budget(started, 30)?)?;
-        if let Some(cleanup) = &target.cleanup {
-            cleanup.created(ResourceKind::Volume, &volume.name)?;
-        }
+        target.create(ResourceKind::Volume, &volume.name, &args, create_timeout)?;
         Ok(volume)
     }
     fn shutdown(&self) -> Result<(), String> {
@@ -894,6 +923,44 @@ fn regular_tar_payload(tar: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_create_budget_never_registers_cleanup_intent() {
+        struct NoCreate;
+        impl CleanupTracker for NoCreate {
+            fn register(&self, _: ResourceKind) -> Result<(String, Vec<String>), String> {
+                panic!("expired task must not register a create intent")
+            }
+            fn created(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no create was issued")
+            }
+            fn rejected(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no create was issued")
+            }
+            fn remove(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no cleanup resource was registered")
+            }
+        }
+        let target = LocalExecutionTarget {
+            image: "unused".into(),
+            docker: PathBuf::from("unused"),
+            endpoint: "unused".into(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: Some(std::sync::Arc::new(NoCreate)),
+        };
+        let expired = Instant::now() - Duration::from_secs(1801);
+        assert!(Volume::new(&target, expired).is_err());
+        let volume = Rc::new(Volume {
+            target: &target,
+            name: "already-removed-fixture".into(),
+            removed: std::cell::Cell::new(true),
+        });
+        assert!(target
+            .start_on_volume(expired, false, volume, false)
+            .is_err());
+        assert!(target.cleanup_confirmed());
+    }
     #[cfg(unix)]
     #[test]
     fn create_response_failure_still_cleans_owned_name_and_reports_failure() {
@@ -930,7 +997,10 @@ exit 1
         let removed = std::fs::read_to_string(docker.with_extension("removed")).unwrap();
         assert_eq!(created, removed);
         assert!(created.starts_with("zaivern-mcp-"));
-        assert!(error.contains("Docker operation failed"), "{error}");
+        assert!(
+            error.contains("Docker create outcome is unknown"),
+            "{error}"
+        );
         assert!(error.contains("container cleanup unconfirmed"), "{error}");
         assert!(error.contains(&created), "{error}");
         assert!(!target.cleanup_confirmed());

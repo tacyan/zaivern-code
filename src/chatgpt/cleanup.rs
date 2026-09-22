@@ -38,6 +38,9 @@ enum Phase {
 #[serde(rename_all = "snake_case")]
 enum ResourceState {
     Intent,
+    // Persist the completed rejection before querying Docker: a failed absence
+    // query must remain retryable without losing this evidence.
+    Rejected,
     Created,
     Removed,
 }
@@ -381,6 +384,26 @@ impl CleanupTracker for Cleanup {
         write(&self.root, &journal)
     }
 
+    fn rejected(&self, kind: ResourceKind, name: &str) -> Result<()> {
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| "Cleanup journal unavailable")?;
+        if journal.phase != Phase::Running {
+            return Err("Cleanup generation is closed".into());
+        }
+        let resource = journal
+            .resources
+            .iter_mut()
+            .find(|r| r.kind == kind && r.name == name)
+            .ok_or("Unregistered Docker resource")?;
+        if resource.state != ResourceState::Intent {
+            return Err("Docker create outcome already recorded".into());
+        }
+        resource.state = ResourceState::Rejected;
+        write(&self.root, &journal)
+    }
+
     fn remove(&self, kind: ResourceKind, name: &str) -> Result<()> {
         let mut journal = self
             .journal
@@ -525,6 +548,13 @@ shift 2
 for arg in "$@"; do name="$arg"; done
 printf '%s %s %s\n' "$kind" "$verb" "$name" >> "$base/commands"
 case "$verb" in
+create)
+  if [ "$kind" = volume ]; then
+    printf 'Error response from daemon: create %s: invalid option: "invalid-option"\n' "$name" >&2
+  else
+    printf '%s\n' 'Error response from daemon: No such image: sha256:0000' >&2
+  fi
+  exit 1 ;;
 ls)
   [ ! -f "$base/daemon-down" ] || exit 1
   name="${name#name=}"
@@ -916,6 +946,163 @@ exit 1
                 .unwrap();
         assert_eq!(receipt["generation"], h.generation);
         assert_eq!(receipt["success"], true);
+    }
+
+    #[test]
+    fn definite_create_rejection_is_durable_and_repairable_for_both_resource_kinds() {
+        use crate::features::chat_bridge::imp::create::{self, CreateOutcome};
+        for kind in [ResourceKind::Container, ResourceKind::Volume] {
+            let h = Harness::new();
+            let cleanup = h.cleanup();
+            cleanup.admit(&h.generation).unwrap();
+            let (name, _) = cleanup.register(kind).unwrap();
+            let mut command = docker::command(&h.config.docker, &h.config.docker_endpoint);
+            command.args([
+                if kind == ResourceKind::Container {
+                    "container"
+                } else {
+                    "volume"
+                },
+                "create",
+                &name,
+            ]);
+            assert_eq!(
+                create::run(command, Duration::from_secs(5), kind, &name),
+                CreateOutcome::DefinitelyNotCreated
+            );
+            cleanup.rejected(kind, &name).unwrap();
+            assert!(read(&h.temp.0).unwrap().resources[0].state == ResourceState::Rejected);
+            // Losing Docker after the rejection must retain the proof for retry.
+            private::write(&h.temp.0.join("daemon-down"), b"", false).unwrap();
+            assert!(h.reconcile().is_err());
+            let journal = read(&h.temp.0).unwrap();
+            assert!(journal.resources[0].state == ResourceState::Rejected);
+            assert!(journal.phase == Phase::Reconciling);
+            assert!(!h.temp.0.join("mcp.done").exists());
+            assert!(!h.temp.0.join("shutdown.json").exists());
+            assert!(daemon::ensure_clean(&h.temp.0).is_err());
+            let pending = report(&h.temp.0).unwrap();
+            assert!(pending.contains(if kind == ResourceKind::Container {
+                "Pending containers: 1"
+            } else {
+                "Pending volumes: 1"
+            }));
+            private::remove(&h.temp.0.join("daemon-down")).unwrap();
+            h.reconcile().unwrap();
+            let journal = read(&h.temp.0).unwrap();
+            assert!(journal.resources[0].state == ResourceState::Removed);
+            assert!(journal.phase == Phase::Confirmed);
+            assert_eq!(
+                private::read(&h.temp.0.join("mcp.done"), 64).unwrap(),
+                h.generation.as_bytes()
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &private::read(&h.temp.0.join("shutdown.json"), 4096).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["generation"], h.generation);
+            assert_eq!(receipt["success"], true);
+            daemon::ensure_clean(&h.temp.0).unwrap();
+            let report = report(&h.temp.0).unwrap();
+            assert!(report.contains("Pending containers: 0"));
+            assert!(report.contains("Pending volumes: 0"));
+            let commands = std::fs::read_to_string(h.temp.0.join("commands")).unwrap();
+            assert!(!commands.lines().any(|line| line.contains(" rm ")));
+        }
+    }
+
+    #[test]
+    fn rejected_create_still_requires_ownership_when_resource_exists() {
+        for kind in [ResourceKind::Container, ResourceKind::Volume] {
+            let h = Harness::new();
+            let cleanup = h.cleanup();
+            cleanup.admit(&h.generation).unwrap();
+            let name = h.resource(&cleanup, kind);
+            // Model a daemon that created the resource before returning an error.
+            let mut journal = read(&h.temp.0).unwrap();
+            journal.resources[0].state = ResourceState::Rejected;
+            write(&h.temp.0, &journal).unwrap();
+            let identity_path = h.temp.0.join(format!("{name}.identity"));
+            let valid = private::read(&identity_path, 4096).unwrap();
+            let mut foreign: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+            foreign["labels"][RESOURCE] = serde_json::json!(private::nonce().unwrap());
+            private::write(
+                &identity_path,
+                &serde_json::to_vec(&foreign).unwrap(),
+                false,
+            )
+            .unwrap();
+            assert!(h.reconcile().is_err());
+            assert!(!h.temp.0.join("mcp.done").exists());
+            assert!(!std::fs::read_to_string(h.temp.0.join("commands"))
+                .unwrap()
+                .contains(" rm "));
+            private::write(&identity_path, &valid, false).unwrap();
+            h.reconcile().unwrap();
+            assert!(!h.temp.0.join(format!("{name}.present")).exists());
+            daemon::ensure_clean(&h.temp.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn lost_create_response_retains_intent_and_blocks_receipts_for_both_kinds() {
+        use crate::features::chat_bridge::imp::create::{self, CreateOutcome};
+        for kind in [ResourceKind::Container, ResourceKind::Volume] {
+            let h = Harness::new();
+            let cleanup = h.cleanup();
+            cleanup.admit(&h.generation).unwrap();
+            let (name, _) = cleanup.register(kind).unwrap();
+            let mut command = process::command(Path::new("/bin/sh"));
+            command.args(["-c", "printf 'error during connect: EOF\\n' >&2; exit 1"]);
+            assert_eq!(
+                create::run(command, Duration::from_secs(5), kind, &name),
+                CreateOutcome::Unknown
+            );
+            for _ in 0..2 {
+                assert!(h.reconcile().is_err());
+                let journal = read(&h.temp.0).unwrap();
+                assert!(journal.phase == Phase::Reconciling);
+                assert!(journal.resources[0].state == ResourceState::Intent);
+                assert!(!h.temp.0.join("mcp.done").exists());
+                assert!(!h.temp.0.join("shutdown.json").exists());
+                assert!(daemon::ensure_clean(&h.temp.0).is_err());
+            }
+            assert!(!std::fs::read_to_string(h.temp.0.join("commands"))
+                .unwrap()
+                .contains(" rm "));
+        }
+    }
+
+    #[test]
+    fn daemon_partial_volume_creation_cannot_commit_an_absence_receipt() {
+        use crate::features::chat_bridge::imp::create::{self, CreateOutcome};
+        let h = Harness::new();
+        let cleanup = h.cleanup();
+        cleanup.admit(&h.generation).unwrap();
+        let (name, _) = cleanup.register(ResourceKind::Volume).unwrap();
+        // Moby local Root.Create can leave an unlisted directory on data-mkdir
+        // failure. It can reappear as a volume after daemon restart.
+        let message = format!("Error response from daemon: create {name}: error while creating volume data path: no space left on device");
+        let mut command = process::command(Path::new("/bin/sh"));
+        command.args([
+            "-c",
+            "printf '%s\\n' \"$1\" >&2; exit 1",
+            "fixture",
+            &message,
+        ]);
+        assert_eq!(
+            create::run(command, Duration::from_secs(5), ResourceKind::Volume, &name),
+            CreateOutcome::Unknown
+        );
+        assert!(h.reconcile().is_err());
+        assert!(read(&h.temp.0).unwrap().resources[0].state == ResourceState::Intent);
+        assert!(!h.temp.0.join("mcp.done").exists());
+        assert!(!h.temp.0.join("shutdown.json").exists());
+        assert!(daemon::ensure_clean(&h.temp.0).is_err());
+        assert!(report(&h.temp.0).unwrap().contains("Pending volumes: 1"));
+        assert!(!std::fs::read_to_string(h.temp.0.join("commands"))
+            .unwrap()
+            .contains(" rm "));
     }
 
     #[test]

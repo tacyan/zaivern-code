@@ -1,6 +1,7 @@
 //! MCP transport is independent of task storage and execution.
 mod cargo_graph;
 mod cargo_verification;
+pub(crate) mod create;
 #[cfg(test)]
 mod e2e_tests;
 mod protocol;
@@ -26,6 +27,9 @@ pub(crate) enum ResourceKind {
 pub(crate) trait CleanupTracker: Send + Sync {
     fn register(&self, kind: ResourceKind) -> Result<(String, Vec<String>), String>;
     fn created(&self, kind: ResourceKind, name: &str) -> Result<(), String>;
+    /// A proven pre-create rejection, not a backend failure or lost response. Absence
+    /// must still be proved by cleanup before committing any receipt.
+    fn rejected(&self, kind: ResourceKind, name: &str) -> Result<(), String>;
     fn remove(&self, kind: ResourceKind, name: &str) -> Result<(), String>;
 }
 
