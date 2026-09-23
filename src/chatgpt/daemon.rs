@@ -356,18 +356,25 @@ pub(super) fn stop(root: &Path) -> Result<()> {
 }
 
 fn stop_with_timeout(root: &Path, operation_timeout: Duration) -> Result<()> {
+    // Keep lifecycle authority until the supervisor has completed shutdown and
+    // its receipt has been authenticated. In the foreground-start case the
+    // command itself owns operation.lock for the duration of supervise(), so
+    // send the stop request first to let that owner exit, then acquire the
+    // lock before inspecting any shutdown state. No other lifecycle operation
+    // can mutate state while the supervisor still owns runtime.lock.
+    let _operation = match private::Lock::acquire(root, "operation.lock") {
+        Ok(lock) => lock,
+        Err(_) => {
+            let _ = request(root, "stop");
+            acquire_operation_for_stop(root, operation_timeout)?
+        }
+    };
     match request(root, "stop") {
         Ok(_) => wait_for_stop(root),
         Err(_) => {
-            // A failed request is ambiguous: start may hold operation.lock
-            // between its preflight and supervisor spawn. Serialize the
-            // fallback with that operation, then ask the supervisor again.
-            // Never report "stopped" while a lifecycle operation is active.
-            let operation = acquire_operation_for_stop(root, operation_timeout)?;
-            if request(root, "stop").is_ok() {
-                drop(operation);
-                return wait_for_stop(root);
-            }
+            // With lifecycle authority held, a failed request means no
+            // supervisor can start concurrently.  Only the runtime lock and
+            // cleanup evidence decide whether the bridge is already stopped.
             let _runtime = private::Lock::acquire(root, "runtime.lock")?;
             ensure_clean(root)?;
             println!("ChatGPT Bridge is stopped. No saved PID was signalled.");
@@ -663,6 +670,66 @@ mod tests {
         let stopped = Temp::new();
         stop_with_timeout(&stopped.0, Duration::from_millis(50)).unwrap();
         assert!(private::Lock::acquire(&stopped.0, "runtime.lock").is_ok());
+    }
+
+    #[test]
+    fn stop_holds_operation_lock_until_shutdown_receipt_is_verified() {
+        use super::super::tests::Temp;
+
+        let temp = Temp::new();
+        let generation = "a".repeat(64);
+        let pid = std::process::id();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        private::write(
+            &temp.0.join("runtime.json"),
+            &serde_json::to_vec(&State {
+                version: 1,
+                pid,
+                child_pid: pid,
+                port,
+                generation: generation.clone(),
+            })
+            .unwrap(),
+            false,
+        )
+        .unwrap();
+        private::write(
+            &temp.0.join("active-generation"),
+            generation.as_bytes(),
+            false,
+        )
+        .unwrap();
+        private::write(&temp.0.join("mcp.done"), generation.as_bytes(), false).unwrap();
+
+        // Keep the supervisor's runtime lease held while the accepted stop
+        // request is waiting for shutdown. This makes receipt verification a
+        // real, observable phase rather than a timing assumption.
+        let runtime = private::Lock::acquire(&temp.0, "runtime.lock").unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+        let expected = format!("{generation} stop\n");
+        let response_generation = generation.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert_eq!(request, expected);
+            accepted_tx.send(()).unwrap();
+            writeln!(stream, "{response_generation} {pid} {pid}").unwrap();
+        });
+
+        let root = temp.0.clone();
+        let stopper = std::thread::spawn(move || stop_with_timeout(&root, Duration::from_secs(2)));
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stop request was not accepted");
+        assert!(private::Lock::acquire(&temp.0, "operation.lock").is_err());
+
+        write_shutdown(&temp.0, &generation, true).unwrap();
+        drop(runtime);
+        server.join().unwrap();
+        stopper.join().unwrap().unwrap();
+        assert!(private::Lock::acquire(&temp.0, "operation.lock").is_ok());
     }
 
     #[test]
