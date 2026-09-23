@@ -1,4 +1,5 @@
-//! Synchronous JSON-RPC/stdio subset of MCP 2024-11-05.
+//! Bounded JSON-RPC/stdio MCP server, with legacy initialization and modern
+//! per-request discovery. Only the tools capability is advertised.
 //! No network listener, shell arguments, or filesystem tools are exposed.
 use super::task::ChatBridge;
 use serde_json::{json, Value};
@@ -7,7 +8,19 @@ use std::io::{self, BufRead, Write};
 // 16384 code points need at most 192 KiB as JSON surrogate-pair escapes.
 // Reserve another 64 KiB for the envelope while keeping reads bounded.
 const MAX_LINE: usize = 256 * 1024;
-const VERSION: &str = "2024-11-05";
+// The tools-only stdio surface is compatible with these legacy revisions.
+// A modern revision cannot be negotiated through the legacy initialize RPC.
+const VERSION: &str = "2025-11-25";
+const MODERN_VERSION: &str = "2026-07-28";
+const VERSIONS: &[&str] = &[
+    MODERN_VERSION,
+    VERSION,
+    "2025-06-18",
+    "2024-11-05",
+];
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
 
 pub(super) fn serve(
     mut input: impl BufRead,
@@ -68,26 +81,47 @@ pub(super) fn serve(
             )?;
             continue;
         }
+        let modern = match request_mode(&params, &id) {
+            Ok(modern) => modern,
+            Err(response) => {
+                write_response(&mut output, response)?;
+                continue;
+            }
+        };
         let result = match method {
-            "initialize" if !initialized => {
+            "initialize" if !modern => {
                 if !params.get("protocolVersion").is_some_and(Value::is_string)
-                    || !params.get("clientInfo").is_some_and(|info| {
-                        info.get("name").is_some_and(Value::is_string)
-                            && info.get("version").is_some_and(Value::is_string)
-                    })
+                    || !params.get("clientInfo").is_some_and(valid_implementation)
                     || !params.get("capabilities").is_some_and(Value::is_object)
                 {
                     Err((-32602, "Invalid initialize parameters"))
                 } else {
                     initialized = true;
+                    ready = false;
+                    let requested = params["protocolVersion"].as_str().unwrap_or_default();
+                    let version = if VERSIONS[1..].contains(&requested) {
+                        requested
+                    } else {
+                        VERSION
+                    };
                     Ok(
-                        json!({"protocolVersion":VERSION,"capabilities":{"tools":{}},
-                        "serverInfo":{"name":"zaivern-chat-bridge","version":env!("CARGO_PKG_VERSION")}}),
+                        json!({"protocolVersion":version,"capabilities":capabilities(),
+                        "serverInfo":server_info()}),
                     )
                 }
             }
+            // Discovery is safe before initialization and never authorizes a
+            // legacy tools/call. Its schema is the published 2026-07-28 one.
+            "server/discover" => Ok(json!({
+                "resultType":"complete", "supportedVersions":VERSIONS,
+                "cacheScope":"private", "ttlMs":0,
+                "capabilities":capabilities(),
+                "_meta":{"io.modelcontextprotocol/serverInfo":server_info()}
+            })),
             "ping" => Ok(json!({})),
-            _ if !ready => Err((-32000, "Initialize the connection first")),
+            "tools/list" | "tools/call" if !modern && !ready => {
+                Err((-32000, "Initialize the connection first"))
+            }
             "tools/list" => Ok(json!({"tools":tools()})),
             "tools/call" => match params.get("name").and_then(Value::as_str) {
                 Some(
@@ -112,12 +146,67 @@ pub(super) fn serve(
         write_response(
             &mut output,
             match result {
-                Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
+                Ok(mut value) => {
+                    if modern {
+                        value["resultType"] = json!("complete");
+                        value["_meta"] = json!({"io.modelcontextprotocol/serverInfo":server_info()});
+                        if method == "tools/list" {
+                            value["cacheScope"] = json!("private");
+                            value["ttlMs"] = json!(0);
+                        }
+                    }
+                    json!({"jsonrpc":"2.0","id":id,"result":value})
+                }
                 Err((code, message)) => error(id, code, message),
             },
         )?;
     }
     Ok(())
+}
+
+fn capabilities() -> Value {
+    json!({"tools":{}})
+}
+
+fn server_info() -> Value {
+    json!({"name":"zaivern-chat-bridge","version":env!("CARGO_PKG_VERSION")})
+}
+
+fn valid_implementation(info: &Value) -> bool {
+    info.get("name").is_some_and(Value::is_string)
+        && info.get("version").is_some_and(Value::is_string)
+}
+
+// Modern metadata is scoped to this request, never inferred from discovery or
+// cached on the connection. Legacy callers may still use unrelated _meta keys.
+fn request_mode(params: &Value, id: &Value) -> Result<bool, Value> {
+    let invalid = || error(id.clone(), -32602, "Invalid request metadata");
+    let Some(meta) = params.get("_meta") else {
+        return Ok(false);
+    };
+    let meta = meta.as_object().ok_or_else(invalid)?;
+    let Some(version) = meta.get(META_VERSION) else {
+        return if meta.contains_key(META_CAPABILITIES) || meta.contains_key(META_CLIENT) {
+            Err(invalid())
+        } else {
+            Ok(false)
+        };
+    };
+    let version = version.as_str().ok_or_else(invalid)?;
+    if !VERSIONS.contains(&version) {
+        let mut response = error(id.clone(), -32022, "Unsupported protocol version");
+        response["error"]["data"] = json!({"supported":VERSIONS,"requested":version});
+        return Err(response);
+    }
+    if version != MODERN_VERSION {
+        return Ok(false);
+    }
+    if !meta.get(META_CAPABILITIES).is_some_and(Value::is_object)
+        || meta.get(META_CLIENT).is_some_and(|info| !valid_implementation(info))
+    {
+        return Err(invalid());
+    }
+    Ok(true)
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
@@ -145,6 +234,181 @@ fn tools() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn exchange(requests: &[Value]) -> Vec<Value> {
+        let bridge = ChatBridge::new(
+            std::path::PathBuf::from("unused"),
+            std::sync::Arc::new(super::super::task::tests::Fake),
+        );
+        let input = requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let mut output = Vec::new();
+        serve(io::Cursor::new(input), &mut output, &bridge).unwrap();
+        std::str::from_utf8(&output).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect()
+    }
+
+    fn modern_meta() -> Value {
+        json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{},
+            "io.modelcontextprotocol/clientInfo":{"name":"discovery-regression","version":"1"}})
+    }
+
+    fn assert_tools(result: &Value) {
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["zaivern_run_task", "zaivern_task_status", "zaivern_cancel_task"]);
+        for (tool, argument) in tools.iter().zip(["instruction", "task_id", "task_id"]) {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["required"], json!([argument]));
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(schema["properties"].as_object().unwrap().len(), 1);
+            assert_eq!(schema["properties"][argument]["type"], "string");
+            assert_eq!(tool["annotations"]["openWorldHint"], false);
+        }
+    }
+
+    #[test]
+    fn legacy_versions_are_negotiated_without_claiming_unknown_versions() {
+        for (requested, expected) in [
+            ("2024-11-05", "2024-11-05"),
+            ("2025-06-18", "2025-06-18"),
+            ("2025-11-25", "2025-11-25"),
+            // 2025-03-26 required batching, which this bounded stdio server
+            // does not implement. Offer a supported legacy revision instead.
+            ("2025-03-26", "2025-11-25"),
+            ("2026-07-28", "2025-11-25"),
+            ("unknown", "2025-11-25"),
+        ] {
+            let init = json!({"jsonrpc":"2.0","id":-1,"method":"initialize","params":{"protocolVersion":requested,"clientInfo":{"name":"test","version":"1"},"capabilities":{}}});
+            let rows = exchange(&[
+                init.clone(),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                init,
+                json!({"jsonrpc":"2.0","id":"before-notification","method":"tools/list"}),
+                json!({"jsonrpc":"2.0","id":"before-call","method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}}),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+            ]);
+            for row in &rows[..2] {
+                assert_eq!(row["id"], -1);
+                assert_eq!(row["result"]["protocolVersion"], expected);
+                assert_eq!(row["result"]["capabilities"], json!({"tools":{}}));
+                assert_eq!(row["result"]["serverInfo"]["name"], "zaivern-chat-bridge");
+                assert_eq!(row["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+            }
+            assert_eq!(rows[2]["error"]["code"], -32000);
+            assert_eq!(rows[3]["error"]["code"], -32000);
+            assert_tools(&rows[4]["result"]);
+        }
+    }
+
+    #[test]
+    fn modern_discovery_and_inline_calls_do_not_need_or_change_legacy_initialization() {
+        for discover_first in [false, true] {
+            let mut requests = Vec::new();
+            if discover_first {
+                requests.push(json!({"jsonrpc":"2.0","id":"discover","method":"server/discover","params":{"_meta":modern_meta()}}));
+            }
+            requests.extend([
+                json!({"jsonrpc":"2.0","id":"list","method":"tools/list","params":{"_meta":modern_meta()}}),
+                json!({"jsonrpc":"2.0","id":u64::MAX,"method":"tools/call","params":{"_meta":modern_meta(),"name":"zaivern_task_status","arguments":{"task_id":"unknown"}}}),
+                json!({"jsonrpc":"2.0","id":"legacy-list","method":"tools/list"}),
+                json!({"jsonrpc":"2.0","id":"probe","method":"server/discover"}),
+                json!({"jsonrpc":"2.0","id":"legacy-call","method":"tools/call","params":{"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}}),
+            ]);
+            let rows = exchange(&requests);
+            assert_eq!(rows.len(), requests.len());
+            let offset = usize::from(discover_first);
+            assert_tools(&rows[offset]["result"]);
+            assert_eq!(rows[offset]["result"]["resultType"], "complete");
+            assert_eq!(rows[offset]["result"]["cacheScope"], "private");
+            assert_eq!(rows[offset]["result"]["ttlMs"], 0);
+            assert_eq!(rows[offset+1]["id"], u64::MAX);
+            assert_eq!(rows[offset+1]["result"]["resultType"], "complete");
+            assert_eq!(rows[offset+1]["result"]["isError"], true);
+            assert_eq!(rows[offset+1]["result"]["content"][0]["type"], "text");
+            assert_eq!(rows[offset+2]["error"]["code"], -32000);
+            assert_eq!(rows[offset+4]["error"]["code"], -32000);
+            let discovery = &rows[offset+3]["result"];
+            assert_eq!(discovery["cacheScope"], "private");
+            assert_eq!(discovery["ttlMs"], 0);
+            assert_eq!(discovery["supportedVersions"], json!(["2026-07-28","2025-11-25","2025-06-18","2024-11-05"]));
+            assert_eq!(discovery["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "zaivern-chat-bridge");
+            assert!(discovery.get("serverInfo").is_none(), "use the published schema, not the draft SEP");
+        }
+    }
+
+    #[test]
+    fn modern_version_errors_and_invalid_metadata_do_not_execute_tools() {
+        let mut unsupported = modern_meta();
+        unsupported[META_VERSION] = json!("2099-01-01");
+        let rows = exchange(&[
+            json!({"jsonrpc":"2.0","id":"unsupported","method":"tools/call","params":{"_meta":unsupported,"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}}),
+            json!({"jsonrpc":"2.0","id":"retry","method":"server/discover","params":{"_meta":modern_meta()}}),
+        ]);
+        assert_eq!(rows[0], json!({"jsonrpc":"2.0","id":"unsupported","error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":VERSIONS,"requested":"2099-01-01"}}}));
+        assert!(rows[1].get("error").is_none());
+        for meta in [json!(null), json!([]), json!({META_VERSION:42}),
+            json!({META_VERSION:MODERN_VERSION}),
+            json!({META_CAPABILITIES:{}}),
+            json!({META_VERSION:MODERN_VERSION,META_CAPABILITIES:[]}),
+            json!({META_VERSION:MODERN_VERSION,META_CAPABILITIES:{},META_CLIENT:{"name":"missing version"}}),
+        ] {
+            let rows = exchange(&[json!({"jsonrpc":"2.0","id":"bad","method":"tools/call","params":{"_meta":meta,"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}})]);
+            assert_eq!(rows[0]["error"]["code"], -32602, "{rows:?}");
+            assert_eq!(rows[0]["id"], "bad");
+        }
+    }
+
+    #[test]
+    fn discovery_never_exposes_host_operations_or_unadvertised_capabilities() {
+        let mut requests = vec![json!({"jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":modern_meta()}})];
+        for method in ["unknown", "resources/list", "resources/templates/list", "prompts/list"] {
+            requests.push(json!({"jsonrpc":"2.0","id":method,"method":method,"params":{"_meta":modern_meta()}}));
+        }
+        for name in ["execute", "delete", "move", "fetch", "zaivern_execute", "zaivern_delete", "zaivern_move", "zaivern_fetch"] {
+            requests.push(json!({"jsonrpc":"2.0","id":name,"method":"tools/call","params":{"_meta":modern_meta(),"name":name,"arguments":{}}}));
+        }
+        requests.push(json!({"jsonrpc":"2.0","id":"workspace","method":"tools/call","params":{"_meta":modern_meta(),"name":"zaivern_run_task","arguments":{"instruction":"edit","workspace":"/outside"}}}));
+        let rows = exchange(&requests);
+        assert_eq!(rows.len(), requests.len());
+        assert_eq!(rows[0]["result"]["capabilities"], json!({"tools":{}}));
+        for (i, row) in rows.iter().enumerate().take(13).skip(1) {
+            assert_eq!(row["id"], requests[i]["id"]);
+            assert_eq!(row["error"]["code"], if i < 5 { -32601 } else { -32602 });
+            assert!(row.get("result").is_none());
+        }
+        assert_eq!(rows[13]["result"]["isError"], true);
+        // Unknown methods have the standard error even before any handshake.
+        assert_eq!(exchange(&[json!({"jsonrpc":"2.0","id":1,"method":"unknown"})])[0]["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn chatgpt_discovery_sequence() {
+        let bridge = ChatBridge::new(
+            std::path::PathBuf::from("unused"),
+            std::sync::Arc::new(super::super::task::tests::Fake),
+        );
+        let requests = [
+            json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"discovery-regression","version":"1"},"capabilities":{}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":"discover","method":"server/discover"}),
+            json!({"jsonrpc":"2.0","id":0,"method":"tools/list"}),
+        ];
+        let input = requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let mut output = Vec::new();
+        serve(io::Cursor::new(input), &mut output, &bridge).unwrap();
+        let rows: Vec<Value> = std::str::from_utf8(&output).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 3, "notifications must not receive a response");
+        assert_eq!(rows[1]["id"], "discover");
+        assert!(rows[1].get("error").is_none(), "{rows:?}");
+        assert_eq!(rows[1]["result"]["resultType"], "complete");
+        assert_eq!(rows[1]["result"]["capabilities"], json!({"tools":{}}));
+        assert_eq!(rows[2]["id"], 0);
+        assert_tools(&rows[2]["result"]);
+    }
+
     #[test]
     fn unicode_frame_budget_is_separate_from_character_validation() {
         for (unit, encoded) in [
