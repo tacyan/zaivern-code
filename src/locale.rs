@@ -598,7 +598,9 @@ fn detect_windows() -> Option<String> {
 /// 待つわけにはいかない** ので裏のスレッドで 1 度だけ引く。
 #[cfg(target_os = "macos")]
 fn detect_macos() -> Option<String> {
-    let out = std::process::Command::new("defaults")
+    // PATH may contain an Agent-editable project directory. Locale detection
+    // runs before CLI dispatch, so only the system utility is authoritative.
+    let out = std::process::Command::new("/usr/bin/defaults")
         .args(["read", "-g", "AppleLocale"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -687,6 +689,81 @@ pub const SOURCE_LANG: &str = "ja";
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_locale_never_executes_defaults_from_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "ZAIVERN_LOCALE_PATH_FIXTURE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            // Call the OS probe directly: LANG must not accidentally bypass it.
+            let _ = super::detect_macos();
+            std::fs::write(
+                std::path::PathBuf::from(root).join("probe.completed"),
+                b"ok",
+            )
+            .unwrap();
+            return;
+        }
+        let root = crate::test_util::unique_temp_dir("locale", "defaults-path");
+        let helper = root.join("defaults");
+        let sentinel = root.join("defaults.SENTINEL");
+        std::fs::write(
+            &helper,
+            b"#!/bin/sh\nprintf attacked > \"$0.SENTINEL\"\nprintf 'en_US\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "locale::tests::macos_locale_never_executes_defaults_from_path",
+            ])
+            .env_clear()
+            .env(CHILD, &root)
+            .env("PATH", &root)
+            .env("HOME", &home)
+            .env("CFFIXED_USER_HOME", &home)
+            .env("ZAIVERN_HOME", root.join("zaivern"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("locale child exceeded deadline");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(status.success());
+        assert!(
+            root.join("probe.completed").exists(),
+            "child probe did not run"
+        );
+        assert!(!sentinel.exists(), "PATH defaults was executed");
+        // Positive control proves the exact poisoned PATH executable can run.
+        assert!(Command::new("defaults")
+            .env_clear()
+            .env("PATH", &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        assert!(sentinel.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
 
     #[test]

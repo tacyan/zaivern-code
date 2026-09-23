@@ -180,7 +180,11 @@ fn real_stdio_container_agent_edit_test_diff_and_cancel() {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["zaivern_run_task", "zaivern_task_status", "zaivern_cancel_task"]
+        [
+            "zaivern_run_task",
+            "zaivern_task_status",
+            "zaivern_cancel_task"
+        ]
     );
     for instruction in [
         "Fix the failing test and show the diff",
