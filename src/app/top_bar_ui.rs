@@ -222,6 +222,7 @@ impl ZaivernApp {
         let mut open = true;
         let mut commit = false;
         let mut cancel = false;
+        let focus = std::mem::take(&mut self.rename_agent_focus);
         // このセッション自身の CLI が命名を担えるか (別の相手へは投げない)。
         let gen = self
             .agents
@@ -242,6 +243,9 @@ impl ZaivernApp {
                         .id_salt(("zv-rename-agent", id))
                         .desired_width(ui.available_width()),
                 );
+                if focus {
+                    apply_pending_select(ctx, te.id, (0, buf.chars().count()), true);
+                }
                 ui.label(
                     RichText::new(tr("手で付けた名前は自動命名に上書きされません"))
                         .size(10.5)
@@ -288,15 +292,7 @@ impl ZaivernApp {
                 });
             });
         if commit {
-            let name = buf.trim().to_string();
-            if !name.is_empty() {
-                if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id) {
-                    s.title = name;
-                }
-                // 手動が常に勝つ: 以後この相手へは自動命名を撃たない。
-                self.manual_titles.insert(id);
-                self.persist_session();
-            }
+            self.set_agent_title(id, &buf);
             self.rename_agent = None;
         } else if cancel || !open {
             self.rename_agent = None;

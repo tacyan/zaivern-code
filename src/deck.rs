@@ -1165,6 +1165,14 @@ fn row_ui(
         );
         if st.rename_focus {
             edit.request_focus();
+            let mut state = egui::TextEdit::load_state(ui.ctx(), edit.id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(st.rename_buf.chars().count()),
+                )));
+            state.store(ui.ctx(), edit.id);
             st.rename_focus = false;
         }
         let commit = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1196,6 +1204,13 @@ fn row_ui(
     }
 
     let resp = resp.on_hover_text(format!("{}\n{}", v.title, v.subtitle));
+    if st.rename_for != Some(v.id) && crate::panels::agent_name_rename_requested(&resp) {
+        st.rename_buf = live
+            .get(r.idx)
+            .map(|l| l.title.clone())
+            .unwrap_or_else(|| v.title.clone());
+        st.apply_intent(Intent::BeginRename(v.id), &[], acts);
+    }
     if resp.clicked() || resp.double_clicked() {
         st.select(v.id);
         st.stop_armed = None;
@@ -2335,5 +2350,94 @@ mod tests {
             body.contains("pane_body_h(height, head_h, unit)"),
             "端末の高さが「全高 − ヘッダー」でなくなっている"
         );
+    }
+}
+
+#[cfg(test)]
+mod rename_pointer_tests {
+    use super::*;
+
+    fn draw(st: &mut DeckState, ui: &mut egui::Ui, live: &[LiveRow]) -> Vec<DeckAction> {
+        let rows = build_rows(live, "");
+        let views = row_views(&rows, live, None);
+        let theme = crate::theme::all()[0].clone();
+        let mut actions = Vec::new();
+        for (row, view) in rows.iter().zip(&views) {
+            row_ui(st, ui, &theme, view, *row, live, 16.0, &mut actions);
+        }
+        actions
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn double_click_edits_the_clicked_session_and_enter_commits_unicode() {
+        let live = vec![
+            LiveRow {
+                idx: 0,
+                id: 41,
+                title: "Codex".into(),
+                ..Default::default()
+            },
+            LiveRow {
+                idx: 1,
+                id: 92,
+                title: "Claude Code".into(),
+                ..Default::default()
+            },
+        ];
+        let mut st = DeckState::default();
+        let mut screen = crate::e2e::Screen::new(420.0, 280.0);
+        let (_, painted) = screen.panel(vec![], |ui| draw(&mut st, ui, &live));
+        let pos = painted.center_of("Claude Code").unwrap();
+        screen.click_panel(pos, |ui| draw(&mut st, ui, &live));
+        assert_eq!(st.rename_for, None);
+        screen.click_panel(pos, |ui| draw(&mut st, ui, &live));
+        assert_eq!(st.rename_for, Some(92));
+        assert_eq!(st.rename_buf, "Claude Code");
+        screen.panel(vec![], |ui| draw(&mut st, ui, &live));
+        screen.panel(
+            vec![egui::Event::Text("日本語レビュー担当".into())],
+            |ui| draw(&mut st, ui, &live),
+        );
+        let (actions, _) = screen.panel(vec![key(egui::Key::Enter)], |ui| draw(&mut st, ui, &live));
+        assert!(actions.iter().any(
+            |a| matches!(a, DeckAction::Rename { id: 92, title } if title == "日本語レビュー担当")
+        ));
+        assert_eq!(st.rename_for, None);
+    }
+
+    #[test]
+    fn empty_name_does_not_replace_the_session_title() {
+        let live = vec![LiveRow {
+            idx: 0,
+            id: 41,
+            title: "Codex".into(),
+            ..Default::default()
+        }];
+        let mut st = DeckState {
+            rename_for: Some(41),
+            rename_buf: "Codex".into(),
+            rename_focus: true,
+            ..Default::default()
+        };
+        let mut screen = crate::e2e::Screen::new(420.0, 240.0);
+        screen.panel(vec![], |ui| draw(&mut st, ui, &live));
+        screen.panel(vec![egui::Event::Text("   ".into())], |ui| {
+            draw(&mut st, ui, &live)
+        });
+        let (actions, _) = screen.panel(vec![key(egui::Key::Enter)], |ui| draw(&mut st, ui, &live));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, DeckAction::Rename { .. })));
+        assert_eq!(st.rename_for, None);
     }
 }

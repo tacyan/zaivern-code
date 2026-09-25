@@ -1,4 +1,5 @@
 {
+  "agent.rename.hint": "Clique duas vezes para renomear ou clique com o botão direito e escolha Renomear.",
   "remote.detect_app": "Conectar para o Norton detectar o app",
   "remote.detect_app_hint": "Este zai.exe consulta informações de versões via HTTPS diretamente. Não instala atualizações nem altera configurações. Depois, reabra a lista de programas do Norton.",
   "remote.detect_app_busy": "Verificando HTTPS a partir deste app…",

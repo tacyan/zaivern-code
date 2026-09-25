@@ -1,4 +1,5 @@
 {
+  "agent.rename.hint": "두 번 클릭하여 이름을 변경하거나, 마우스 오른쪽 버튼을 클릭한 뒤 이름 변경을 선택하세요.",
   "remote.detect_app": "Norton이 앱을 감지하도록 연결",
   "remote.detect_app_hint": "이 zai.exe가 직접 HTTPS로 릴리스 정보를 확인합니다. 업데이트를 설치하거나 설정을 변경하지 않습니다. 이후 Norton 프로그램 목록을 다시 여세요.",
   "remote.detect_app_busy": "이 앱에서 HTTPS 연결 확인 중…",

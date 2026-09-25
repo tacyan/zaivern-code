@@ -1037,14 +1037,21 @@ impl ZaivernApp {
                                         } else {
                                             ""
                                         };
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}{} {}",
-                                                badge, s.icon, s.title
-                                            ))
-                                            .strong()
-                                            .color(theme.text),
+                                        let name = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(format!(
+                                                    "{}{} {}",
+                                                    badge, s.icon, s.title
+                                                ))
+                                                .strong()
+                                                .color(theme.text),
+                                            )
+                                            .selectable(false)
+                                            .sense(egui::Sense::click()),
                                         );
+                                        if panels::agent_name_rename_requested(&name) {
+                                            acts.rename = Some(i);
+                                        }
                                         if s.has_unread() && !active {
                                             ui.label(
                                                 RichText::new("◆")
@@ -1634,6 +1641,9 @@ impl ZaivernApp {
         }
         if let Some(i) = acts.focus {
             self.apply_cmd(Cmd::FocusAgent(i), ctx);
+        }
+        if let Some(i) = acts.rename {
+            self.begin_rename_agent(i);
         }
         if let Some(i) = acts.restart {
             if let Err(e) = self.agents.restart(i, ctx) {

@@ -1,4 +1,5 @@
 {
+  "agent.rename.hint": "双击可重命名，也可右键单击并选择“重命名”。",
   "remote.detect_app": "发起通信以便 Norton 检测此应用",
   "remote.detect_app_hint": "此 zai.exe 将自行通过 HTTPS 查询发布信息，不安装更新或更改设置。通信后请重新打开 Norton 的程序列表。",
   "remote.detect_app_busy": "正在从此应用检查 HTTPS 通信…",
