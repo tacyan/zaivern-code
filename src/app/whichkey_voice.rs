@@ -367,7 +367,7 @@ impl ZaivernApp {
                     // 音声側が自分の書き込みを「手入力」と誤認して live 追跡を
                     // 捨ててしまうため、承認エピソードの解決だけを行う。
                     s.resolve_attention();
-                    s.write_bytes(&out);
+                    s.write_typed(&out);
                     Some(s.title.clone())
                 }
                 _ => None,
@@ -381,7 +381,7 @@ impl ZaivernApp {
                     // 書き込みのみ / 送信ありを自分で選ぶ
                     for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
                         s.resolve_attention();
-                        s.write_bytes(&out);
+                        s.write_typed(&out);
                     }
                     Some(trf("{n} セッション", &[("n", n.to_string())]))
                 }

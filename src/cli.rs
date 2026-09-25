@@ -2365,7 +2365,9 @@ fn session_send(args: &[String]) -> CliOut {
     // 終了済み / 見つからないセッションは **エラーが返るだけ** で終わる。
     // ここから kill は絶対に撃たない (PID 再利用の巻き添えを避ける)。
     check_api_ok(&resp)?;
-    Ok(format!("送信しました: セッション {id_num}"))
+    // 応答は「配達待ちへ積めた」までしか保証しない (本文 → 待ち → 確定キーは
+    // エディタ側で後から進む)。「送信しました」と言うと届いたと誤解される。
+    Ok(format!("送信を受け付けました: セッション {id_num}"))
 }
 
 fn session_log(args: &[String]) -> CliOut {

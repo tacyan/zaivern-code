@@ -533,6 +533,28 @@ pub struct Session {
     /// 入力欄の中身がずれる。ずれたことに気づけるよう印を立て、
     /// 音声側が読んだら下ろす (`take_user_typed`)。
     user_typed: bool,
+    /// **「入力欄へ入れるだけ」(insert) の配達が残した本文が、いまも入力欄に
+    /// 残っている可能性がある**、という印。
+    ///
+    /// PTY の入力欄はセッション内で共有される mutable state なので、
+    /// insert は確定キーを送らず本文を残したまま終わる。その上から後続の
+    /// 確定送信が本文+確定キーを書くと、人が自分で送るつもりだった下書き
+    /// まで一緒に送信されてしまう。この印が立っている間は `submit_tick`
+    /// 側がそのセッションの `submit=true` 配達を始めない
+    /// ([`crate::submit::due_now`])。
+    ///
+    /// 残量は [`InputDraft`] が [`feed_typed_line`] と同じ打鍵規則で畳む
+    /// (追うのは文字数だけなので、下書きの長さに上限は無い)。
+    /// 下ろすのは「確実に消費・消去された」と分かる打鍵だけ — 確定
+    /// (CR/LF)・行消去 (Ctrl+U・Ctrl+C)、または Backspace で推定の
+    /// 残り文字数が 0 になるまで消したとき。人の打鍵と等価の書き込みだけ
+    /// が通る [`Self::write_typed`] でバイトを見るので、approval 応答や
+    /// 配達の確定キーのような内部の書き込みでは下ろさない。bracketed
+    /// paste の内側の改行も確定打鍵ではないので下ろさない。
+    /// Esc や矢印キーでは下ろさない。
+    /// 入力欄の読み取り (見えない=空) は CLI ごとに意味が違うので、
+    /// 解放の根拠にはしない。
+    input_draft: Option<InputDraft>,
     /// DECSCUSR で指定された現在のカーソル形状(読取スレッドが書き、描画が読む)。
     cursor_shape: Arc<AtomicU8>,
     /// シェル統合 (OSC 633 / 133) の追跡。読取スレッドが書き、UI が読む。
@@ -668,7 +690,7 @@ const LOG_CAP: u64 = 4 * 1024 * 1024;
 const PROMPT_MIN_CHARS: usize = 4;
 
 /// 覚えておくプロンプトの最大文字数 (引き継ぎ材料。無限に太らせない)。
-const PROMPT_KEEP_CHARS: usize = 4000;
+pub(crate) const PROMPT_KEEP_CHARS: usize = 4000;
 
 impl LogSink {
     fn open(path: &Path, header: &str) -> Option<Self> {
@@ -1657,6 +1679,191 @@ pub fn feed_typed_line(st: &mut TypedLine, bytes: &[u8]) -> Option<String> {
     out
 }
 
+/// **「人の下書き」の追跡** — 入力欄に残っている本文の占有を、
+/// 打鍵ごとに畳んで追う。
+///
+/// 追跡対象は `submit=false` の配達が残した本文だけではなく、**人が
+/// 入力欄へ打ったもの全部** — [`Session::write_typed`] を通る書き込み
+/// (キーボード/IME/貼り付け・メニューや D&D の挿入・音声入力・
+/// リモートの手動キー) は下書きが無くても追跡を始めるし、insert 配達が
+/// 残す本文は [`Session::note_input_draft`] が種にする。insert 前から
+/// 人が打っていた本文を追えないと、その残りを後続の確定送信が
+/// 巻き込んでしまう。
+///
+/// 占有を解けるのは「下書きが確実に消費・消去された」と分かるときだけ:
+/// * CR / LF … 確定 = 下書きは送信済み (または確定キー自身が消費した)
+/// * Ctrl+C (`0x03`) / Ctrl+U (`0x15`) … 行を捨てる / 消す
+///   ([`feed_typed_line`] が行の終わりとして扱うのと同じ打鍵)
+/// * Backspace (`0x7f` / `0x08`) … **推定の残り文字数が 0 になるまで**
+///   消したとき。1 打鍵で下ろすと「ABC → AB」で誤解放して残りを後続の
+///   確定キーが巻き込むので、畳んだ文字数が尽きた時点でだけ下ろす
+///
+/// 追うのは本文そのものではなく**文字数だけ** (`chars`)。下書きは
+/// 任意の長さがあり得るので、中身をバッファへ保持すると打ち切り点を
+/// 超えた分が「空」と誤判定されて早期解放になる — 文字数の積算だけなら
+/// 上限無しに正確に追える。文字の打ち込み・追記の insert 本文は
+/// `chars` へ加算する (下書きは残ったまま)。
+///
+/// エスケープ列 (Esc・矢印キー等) では**下ろさない** — 列の意味は
+/// CLI ごとに違う。ただし列を見た以後は残量の推定を信用できなくなる
+/// (`unsure`) ので、Backspace の空判定には戻らず、確定・消去打鍵だけで
+/// 解く (矢印で動いたあとの削除回数は当てにしない)。
+///
+/// bracketed paste の囲み (`ESC[200~` … `ESC[201~`) は状態として追う:
+/// 内側の CR/LF・制御文字は貼られた本文の一部で、人が確定キーを打った
+/// わけではないので解放根拠にしない (全部入力欄の文字として数える)。
+/// 制御列は `feed` のチャンク境界で割れうるので、断片は `pending` へ
+/// 持ち越して次の呼び出しで完成を見る。
+///
+/// 畳み方は [`feed_typed_line`] と同じ規則 (UTF-8 の途中切れは
+/// [`crate::textenc::StreamDecoder`] で持ち越す)。**残量の推定が実際より
+/// 多めにずれる分には Backspace 判定が保守側へ倒れるだけ** (解放が
+/// 遅れる = 安全側)。入力欄の見た目 (`input_text` 等) は CLI ごとに
+/// 意味が違うので一切見ない。
+pub struct InputDraft {
+    /// 下書きだと推定している残りの文字数 (畳み込みの積算)
+    chars: usize,
+    /// エスケープ列を見たあとは残量の推定を信用しない
+    unsure: bool,
+    /// bracketed paste の内側にいる — 内側の打鍵は全部貼り付け本文
+    in_paste: bool,
+    /// feed の末尾で切れたエスケープ列の断片 (`\x1b[2` まで来て次が
+    /// `00~` か等)。貼り付け制御列の接頭辞しか入らないので頭打ち済み。
+    pending: String,
+    /// 打鍵の UTF-8 はチャンク境界で割れる ([`TypedLine`] と同じ理由)
+    dec: crate::textenc::StreamDecoder,
+}
+
+/// bracketed paste の囲み制御列 (開始, 終了)。
+const PASTE_MARKERS: [&str; 2] = ["\u{1b}[200~", "\u{1b}[201~"];
+
+impl InputDraft {
+    /// 入力欄へ残した本文の文字数を種にして追跡を始める。
+    ///
+    /// `text` は **PTY へ実際に送る本文** — 配達経路では
+    /// [`crate::submit::sanitize`] 済みのものを渡す (生の本文と実際の
+    /// 入力欄で文字数がずれないように)。
+    pub(crate) fn seeded(text: &str) -> Self {
+        Self {
+            chars: text.chars().count(),
+            unsure: false,
+            in_paste: false,
+            pending: String::new(),
+            dec: crate::textenc::StreamDecoder::default(),
+        }
+    }
+
+    /// 入力欄への追記分 (insert 配達等) を残量へ足す。
+    /// すでに追跡中の下書きがあるときの追記で、`text` は実際に PTY へ
+    /// 送った本文 (sanitize 済み)。加算なので「人の下書き + 挿入分」の
+    /// どちらも消し切るまで占有が解けない。
+    pub(crate) fn note_added(&mut self, text: &str) {
+        self.chars = self.chars.saturating_add(text.chars().count());
+    }
+
+    /// 打鍵バイト列を畳む。`true` = 入力欄に追跡中の中身が残っていない
+    /// (占有を解いてよい)。
+    ///
+    /// 解放の打鍵 (確定・消去) は**状態を空へ戻して畳み続ける** — 同じ
+    /// バッファの続きは新しい行の中身として追う (「`a\nb`」のように
+    /// 確定のあと文字が残ると、その残りは追われないまま入力欄に残る)。
+    /// 呼び出し側は `true` が返ったときだけ `input_draft` を下ろす。
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> bool {
+        // 前回末尾で切れたエスケープ列の断片を先頭へ繋げる — 貼り付け
+        // 制御列がチャンク境界で割れても完成形として判定できる。
+        let mut text = std::mem::take(&mut self.pending);
+        text.push_str(&self.dec.feed(bytes));
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                // 貼り付け制御列か、それ以外のエスケープ列かを見分ける。
+                // 制御列の途中でバッファが尽きたら断片を持ち越す
+                // (曖昧な列と即断しない)。
+                let mut seq = String::from('\u{1b}');
+                enum Esc {
+                    /// 制御列の完成 — bracketed paste の内側へ入る/出る
+                    Matched(bool),
+                    /// 貼り付け制御列ではない列 (矢印等) — 推定を曖昧に
+                    Dead,
+                    /// バッファ末尾で制御列が未完成 — 次の feed へ持ち越し
+                    Tail,
+                }
+                let r = loop {
+                    let Some(&c) = chars.peek() else {
+                        break Esc::Tail;
+                    };
+                    let mut cand = seq.clone();
+                    cand.push(c);
+                    if cand == PASTE_MARKERS[0] {
+                        chars.next();
+                        break Esc::Matched(true);
+                    }
+                    if cand == PASTE_MARKERS[1] {
+                        chars.next();
+                        break Esc::Matched(false);
+                    }
+                    if PASTE_MARKERS.iter().any(|m| m.starts_with(&cand)) {
+                        chars.next();
+                        seq = cand;
+                        continue;
+                    }
+                    // 貼り付け制御列でないことが確定 — 崩した文字 `c` は
+                    // 読み飛ばし側へ渡す (確定打鍵なら潰さない)。
+                    break Esc::Dead;
+                };
+                match r {
+                    Esc::Matched(inside) => self.in_paste = inside,
+                    Esc::Tail => self.pending = seq,
+                    Esc::Dead => {
+                        // Esc や矢印キー。曖昧になるので推定を信用しない
+                        // 方向へ倒す。列の残りは読み飛ばすが、**確実な解放
+                        // の打鍣 (確定・行消去) は潰さない** — そこで
+                        // 打ち切って外の match へ処理を戻す。
+                        self.unsure = true;
+                        while let Some(&c) = chars.peek() {
+                            if c == '\r' || c == '\n' || c == '\u{3}' || c == '\u{15}' {
+                                break;
+                            }
+                            chars.next();
+                        }
+                    }
+                }
+                continue;
+            }
+            if self.in_paste {
+                // 貼り付け本文 — CR/LF や制御文字に見えるものも全部
+                // 入力欄へ入る文字として数える (確定打鍵ではない)。
+                if !self.unsure {
+                    self.chars = self.chars.saturating_add(1);
+                }
+                continue;
+            }
+            match ch {
+                // 確定・行消去 — いまの行を消費・捨てたので残量と
+                // 曖昧さを空へ戻し、続きは新しい行として畳む。
+                '\r' | '\n' | '\u{3}' | '\u{15}' => {
+                    self.chars = 0;
+                    self.unsure = false;
+                }
+                '\u{7f}' | '\u{8}' => {
+                    if !self.unsure {
+                        self.chars = self.chars.saturating_sub(1);
+                    }
+                }
+                c if c.is_control() => {}
+                _ => {
+                    if !self.unsure {
+                        self.chars = self.chars.saturating_add(1);
+                    }
+                }
+            }
+        }
+        // 「残っている」が確実に言えないときだけ解放 — 残量ゼロで、
+        // 貼り付けの内側でもない (閉じていない paste の途中は占有が残る)。
+        self.chars == 0 && !self.in_paste
+    }
+}
+
 pub fn prompt_signature(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2453,6 +2660,7 @@ impl Session {
             search: SearchUi::default(),
             copied_at: None,
             user_typed: false,
+            input_draft: None,
             cursor_shape,
             shell,
             lines,
@@ -2796,8 +3004,65 @@ impl Session {
     /// プロンプト応答・スマホ・チーム調停の配達は全部ここを通るので、
     /// 記録 ([`input_log_record`]) も 1 か所で足りる —
     /// 「片方の経路だけ記録されていて、無いものを無いと信じる」が起きない。
+    ///
+    /// ここは下書き追跡 ([`Self::input_draft`]) を**畳まない**純粋な
+    /// 書き込み口 — 人の打鍵と等価の入力欄編集は [`Self::write_typed`]
+    /// を通すこと。approval 応答・権限切替・自動応答・配達の確定キーの
+    /// ような内部の書き込みはこちらで、残っている下書きを誤って
+    /// 「消費・消去済み」にしない。
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.writer.send(bytes);
+    }
+
+    /// 人の打鍵と同じ意味で入力欄へ書く — 下書き追跡
+    /// ([`Self::input_draft`]) へ畳んでから PTY へ送る。
+    ///
+    /// 下書きの占有は「人が編集・確定・消去した」打鍵でだけ状態が変わる
+    /// べきものなので、**入力欄の文字列を編集する書き込み**だけがここを
+    /// 通る: キーボード/IME/貼り付け、リモートの手動キー、GUI の挿入
+    /// (クリック挿入・ドラッグ&ドロップ・音声入力)、人が頼んだ確定キーの
+    /// 送信 (raw な送信ボタン等)。insert 配達が残す本文は配達自身の
+    /// 書き込みなので [`Self::write_bytes`] + [`Self::note_input_draft`]
+    /// の種で追跡する (畳むと feed と seed の二重計上になる)。
+    /// 内部の制御・応答 (approval・権限切替・自動応答・フォーカス報告・
+    /// 配達の確定キー) は [`Self::write_bytes`] を直接使う。
+    /// 迷ったらこちらではなく `write_bytes` を選ぶ — 追跡に乗せ忘れは
+    /// 解放が遅れるだけだが、内部書き込みを畳むと下書きを誤解放する。
+    ///
+    /// **下書きが無くても追跡は始める** — insert が残した本文だけを追う
+    /// 実装だと、人が先に打っていた本文を後続の確定送信が巻き込む。
+    /// 打鍵を畳んで入力欄に中身が残ると分かったときだけ `input_draft`
+    /// を立てる (Esc や矢印だけの打鍵では立てない — 入力欄の文字列を
+    /// 変えていないので占有の理由が無い)。
+    pub fn write_typed(&mut self, bytes: &[u8]) {
+        if self.input_draft.is_none() {
+            self.input_draft = Some(InputDraft::seeded(""));
+        }
+        if self.input_draft.as_mut().is_some_and(|d| d.feed(bytes)) {
+            self.input_draft = None;
+        }
+        self.write_bytes(bytes);
+    }
+
+    /// 「入力欄へ入れるだけ」の配達が本文を入力欄へ残した (下書き占有の開始)。
+    /// この印がある間、そのセッションへの `submit=true` 配達は始まらない。
+    ///
+    /// `text` は **PTY へ実際に送った本文** (配達経路なら
+    /// [`crate::submit::sanitize`] 済みのもの) — [`InputDraft`] の残り
+    /// 文字数をそれで始める。すでに人の下書きがあるなら**追記なので
+    /// 残量へ加算する** — 入力欄には「既存分 + 本文」が残っている
+    /// (置き直したり何もしなかったりすると既存分・追加分のどちらかを
+    /// 見落として早期解放する)。
+    pub fn note_input_draft(&mut self, text: &str) {
+        match self.input_draft.as_mut() {
+            Some(d) => d.note_added(text),
+            None => self.input_draft = Some(InputDraft::seeded(text)),
+        }
+    }
+
+    /// insert が残した人の下書きが入力欄にある可能性があるか。
+    pub fn input_draft(&self) -> bool {
+        self.input_draft.is_some()
     }
 
     /// 端末の隅に出すバッジ用: (段, 直近の終了コード)。
@@ -3081,7 +3346,7 @@ impl Session {
     /// アプリ (CLI エージェント) が bracketed paste を有効にしているか。
     ///
     /// 有効なら複数行の指示を `ESC[200~ … ESC[201~` で包める
-    /// ([`crate::submit::body_bytes`])。包まないと本文中の改行がその場で
+    /// ([`crate::submit::wrap_body`])。包まないと本文中の改行がその場で
     /// 確定として扱われ、**指示が途中で分割送信される**。
     pub fn bracketed_paste(&self) -> bool {
         lock_ok(&self.parser).screen().bracketed_paste()
@@ -3112,6 +3377,8 @@ impl Session {
     ///
     /// キーボード入力と同じ write_bytes 経路を使うため、ターミナルウィジェットに
     /// フォーカスが無くても子プロセスへ届く(ペットバブル等からの Allow/Deny 応答用)。
+    /// **内部の応答専用** — 下書き追跡には畳まれないので、入力欄の下書きを
+    /// approval 応答などで誤って消費済みにしない。
     pub fn send_text(&mut self, s: &str) -> bool {
         if !self.running() {
             return false;
@@ -4117,11 +4384,239 @@ mod menu_answer_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_yes_reply, auto_yes_reply_for, stalled_reply_for};
+    use super::{
+        auto_yes_reply, auto_yes_reply_for, stalled_reply_for, InputDraft, PROMPT_KEEP_CHARS,
+    };
 
     /// 停滞時の分類 (番号入力メニューにも答える版) のエージェント無し呼び出し。
     fn stalled_reply(text: &str) -> Option<(&'static [u8], &'static str)> {
         stalled_reply_for(text, None)
+    }
+
+    /// **人の下書きの占有は「確定・消去に確実に相当する打鍵」でだけ解く。**
+    ///
+    /// 本文の途中の矢印キーや Esc で解くと、残っている下書きへ後続の
+    /// 確定送信が追記されて、その確定キーで一緒に送信される。
+    #[test]
+    fn 下書きは確定と行消去の打鍵で解放される() {
+        // 確定 (Enter)・行消去 (Ctrl+U)・中断 (Ctrl+C) → 解放
+        assert!(InputDraft::seeded("下書き").feed(b"\r"));
+        assert!(InputDraft::seeded("下書き").feed(b"\n"));
+        assert!(InputDraft::seeded("下書き").feed(b"\x15"));
+        assert!(InputDraft::seeded("下書き").feed(b"\x03"));
+    }
+
+    /// **Backspace で下書きを消し切ると解放されるが、一部だけでは解かない。**
+    ///
+    /// 「1 打鍵で解く」と ABC → AB で誤解放して、残りが後続の確定キーで
+    /// 送信される。追跡している中身が空になるまで解かない (空になれば
+    /// 後続の確定送信を永久に止めない — Backspace 全消しは解放経路)。
+    #[test]
+    fn 下書きはバックスペースで消し切ると解放される() {
+        let mut d = InputDraft::seeded("ABC");
+        // 一部だけ消した (ABC → AB → A) → まだ下書き
+        assert!(!d.feed(b"\x7f"));
+        assert!(!d.feed(b"\x7f"));
+        // 全部消した → 解放 (後続の submit が永久に止まらない)
+        assert!(d.feed(b"\x7f"));
+        // 0x08 側の Backspace でも同じ
+        let mut d = InputDraft::seeded("あい");
+        assert!(!d.feed(b"\x08"));
+        assert!(d.feed(b"\x08"));
+        // 下書きへ人が文字を追記しても、下書きは残っている
+        let mut d = InputDraft::seeded("ABC");
+        assert!(!d.feed("D".as_bytes()));
+        assert!(!d.feed(b"\x7f")); // ABCD → ABC — 追記分を消しただけでは元の下書きが残る
+        assert!(!d.feed(b"\x7f"));
+        assert!(!d.feed(b"\x7f"));
+        assert!(d.feed(b"\x7f")); // 全部消えた
+    }
+
+    /// **Esc・矢印キーでは解放せず、以後の Backspace も解放根拠にしない。**
+    ///
+    /// エスケープ列が混ざると中身の推定が当てにならない (矢印で動いた
+    /// あとの削除回数は読めない) ので、確定・消去打鍵だけで解く。
+    #[test]
+    fn 下書きはエスケープ列では解放されず以後は確定消去だけで解く() {
+        let mut d = InputDraft::seeded("ABC");
+        // Esc・矢印キーでは解放しない
+        assert!(!d.feed(b"\x1b"));
+        assert!(!d.feed(b"\x1b[A"));
+        // 推定が曖昧になったあとの Backspace は解放根拠にしない
+        // (回数がずれているかもしれないので、空推定を信じない)
+        assert!(!d.feed(b"\x7f\x7f\x7f\x7f"));
+        // 確定・消去打鍵だけで解く
+        assert!(d.feed(b"\x15"));
+    }
+
+    /// **下書きの追跡は上限の無い文字数の積算** — 長文で打ち切られない。
+    ///
+    /// 中身を `PROMPT_KEEP_CHARS` で打ち切って保持すると、それを超える
+    /// 下書きで残量が実際より少なく見えて Backspace の解放が早まり、
+    /// 後続の確定キーが残った下書きを巻き込む (4000 を 10000 に変えても
+    /// 10001 文字で再発する)。文字数だけ数える構造にした根拠の番人。
+    #[test]
+    fn 下書きは上限の無い残り文字数で追われる() {
+        let text = "a".repeat(PROMPT_KEEP_CHARS + 1000);
+        let mut d = InputDraft::seeded(&text);
+        // 打ち切り点を超える分まで消し切るまでは解放しない。
+        for _ in 0..PROMPT_KEEP_CHARS {
+            assert!(!d.feed(b"\x7f"), "追跡が打ち切られて早期解放した");
+        }
+        for _ in 0..999 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "全部消したのに解放しない");
+    }
+
+    /// **下書きへの追記も残量へそのまま乗る** — 追記も頭打ちにしない。
+    #[test]
+    fn 下書きへの追記は残り文字数へ加算される() {
+        let mut d = InputDraft::seeded("x");
+        let appended = PROMPT_KEEP_CHARS + 500;
+        assert!(!d.feed("y".repeat(appended).as_bytes()));
+        // x + 追記分の文字数が残っているので、追記の文字数だけ消しても
+        // まだ x が残る (追跡量が上限で頭打ちになっていないこと)。
+        for _ in 0..appended {
+            assert!(!d.feed(b"\x7f"), "追記が打ち切られて早期解放した");
+        }
+        assert!(d.feed(b"\x7f"));
+    }
+
+    /// **マルチバイト文字はバイト数ではなく文字数で消える。**
+    ///
+    /// 「あ」は 3 バイトだが入力欄では 1 文字 — Backspace 1 回で消える。
+    /// バイト数で数えると3倍回さないと解放されず後続を止め続ける。
+    #[test]
+    fn 下書きの残量は_utf8_の文字数で数える() {
+        let mut d = InputDraft::seeded("あいうえお");
+        for _ in 0..4 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "5 文字の下書きは 5 打鍵で消し切れる");
+    }
+
+    /// **UTF-8 の途中で切れた打鍵は次の呼び出しへ持ち越して 1 文字に数える。**
+    ///
+    /// [`feed_typed_line`] と同じ [`crate::textenc::StreamDecoder`] の性質:
+    /// バイト境界で割れた「あ」が `U+FFFD` 化して残量を狂わせないこと。
+    #[test]
+    fn 下書きへの追記は_utf8_の途中切れでも1文字として畳む() {
+        let mut d = InputDraft::seeded("x");
+        for b in "あ".as_bytes() {
+            assert!(!d.feed(&[*b]));
+        }
+        // x + あ の 2 文字 — 2 打鍵で消し切れる (割れた分が余計な文字に
+        // 化けていればここでずれる)。
+        assert!(!d.feed(b"\x7f"));
+        assert!(d.feed(b"\x7f"));
+    }
+
+    /// **長文でも、エスケープ列のあとの Backspace は解放根拠にしない。**
+    ///
+    /// `unsure` 後は残量の推定を信用しないので、消し切るのに十分な回数を
+    /// 打っても解放されず、確定・消去打鍵だけで解く。
+    #[test]
+    fn 長文の下書きはエスケープ列のあとのバックスペースでは解かない() {
+        let mut d = InputDraft::seeded(&"a".repeat(PROMPT_KEEP_CHARS + 100));
+        assert!(!d.feed(b"\x1b[D"));
+        for _ in 0..PROMPT_KEEP_CHARS + 200 {
+            assert!(!d.feed(b"\x7f"), "unsure 後の Backspace 数で解放した");
+        }
+        assert!(d.feed(b"\x03"), "Ctrl+C では解く");
+    }
+
+    /// **bracketed paste 内の改行は確定打鍵ではない** — 解放しない。
+    ///
+    /// 囲みを剥がして中身の `\n` を Enter と誤認すると、貼り付けただけで
+    /// 下書き占有が解け、後続の確定送信が残りの下書きを巻き込む。
+    #[test]
+    fn bracketed_paste内の改行では下書きを解放しない() {
+        let mut d = InputDraft::seeded("abc");
+        // 貼り付け本文の中の \n は解放根拠ではない。
+        assert!(!d.feed("\u{1b}[200~foo\nbar\u{1b}[201~".as_bytes()));
+        // 貼り付け本文は残量へ乗る: abc + "foo\nbar" の 7 文字。
+        for _ in 0..3 + 7 - 1 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "貼り付け本文ごと消し切れば解放する");
+        // 貼り付けの直後に打たれた本物の確定キーは従来どおり解放する。
+        let mut d = InputDraft::seeded("abc");
+        assert!(!d.feed("\u{1b}[200~x\ny\u{1b}[201~".as_bytes()));
+        assert!(d.feed(b"\r"), "paste 後の Enter で解放する");
+        let mut d = InputDraft::seeded("abc");
+        assert!(!d.feed("\u{1b}[200~x\u{1b}[201~".as_bytes()));
+        assert!(d.feed(b"\x15"), "paste 後の Ctrl+U でも解放する");
+    }
+
+    /// **貼り付け制御列が feed 境界で割れても追跡できる。**
+    ///
+    /// 開始・終了どちらの制御列も複数回の `feed` に割れうる (打鍵チャンクや
+    /// 配達の書き込み単位は列の途中で切れる)。割れた断片を「貼り付けでは
+    /// ない曖昧な列」と即断すると、paste 内の改行で誤解放する。
+    #[test]
+    fn bracketed_pasteの制御列がfeed境界で分割されても追跡できる() {
+        // 開始列の分割
+        let mut d = InputDraft::seeded("abc");
+        assert!(!d.feed(b"\x1b["));
+        assert!(!d.feed(b"200~foo\nbar"));
+        assert!(!d.feed(b"\x1b"));
+        assert!(!d.feed(b"[201~"));
+        assert!(!d.feed(b"\x7f"), "paste 内の改行で誤解放した");
+        // abc + foo\nbar = 10 文字 — 消し切ると解放。
+        for _ in 0..8 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"));
+        // 終了列の分割
+        let mut d = InputDraft::seeded("abc");
+        assert!(!d.feed("\u{1b}[200~x\ny\u{1b}[20".as_bytes()));
+        assert!(!d.feed("1~".as_bytes()));
+        assert!(!d.feed(b"\x7f"), "割れた終了列を曖昧な列と誤認した");
+        // 終了直後の本物の Enter は解放する。
+        assert!(d.feed(b"\r"));
+        // 終わらない paste の中の Enter っぽい打鍵では解放しない。
+        let mut d = InputDraft::seeded("abc");
+        assert!(!d.feed("\u{1b}[200~foo".as_bytes()));
+        assert!(!d.feed(b"\r"), "閉じていない paste の内側の CR で解放した");
+        assert!(!d.feed("\nbar\u{1b}[201~".as_bytes()));
+        assert!(d.feed(b"\x03"));
+    }
+
+    /// **複数行の日本語貼り付けも解放根拠にしない** — 文字数は貼り付け分も正確に。
+    #[test]
+    fn 複数行日本語の貼り付けでは下書きを解放しない() {
+        let mut d = InputDraft::seeded("あいう");
+        assert!(!d.feed("\u{1b}[200~一行目\n二行目\n三行目\u{1b}[201~".as_bytes()));
+        // あいう + 一行目\n二行目\n三行目 = 3 + 11 = 14 文字
+        for _ in 0..13 {
+            assert!(!d.feed(b"\x7f"));
+        }
+        assert!(d.feed(b"\x7f"), "全部消し切れば解放する");
+    }
+
+    /// **下書きの種は「PTY へ実際に送る本文」の文字数** — sanitize 済み。
+    ///
+    /// `submit::sanitize` が落とす末尾空白・制御文字・CRLF を種へ数えると、
+    /// 入力欄はすでに空なのに残量が残ったまま解放されない。配達側は一度だけ
+    /// sanitize した本文を書き込みと種に共用する (配線は submit_tick の
+    /// 番人テストが見張る)。
+    #[test]
+    fn 下書きの種はsanitize済みの本文と同じ文字数() {
+        for (raw, want) in [
+            ("abc   \r\n", 3usize), // 末尾空白 + CRLF は送られない
+            ("abc\t\t\n", 3),       // 末尾タブ・改行も落ちる
+            ("a\x07b\x08c", 3),     // 制御文字は本文に入らない
+            ("あいうえお  ", 5),    // 日本語は文字数、末尾空白は落ちる
+        ] {
+            let body = crate::submit::sanitize(raw);
+            assert_eq!(body.chars().count(), want, "sanitize 結果が想定と違う");
+            let mut d = InputDraft::seeded(&body);
+            for _ in 0..want.saturating_sub(1) {
+                assert!(!d.feed(b"\x7f"), "{raw:?} が途中で解放した");
+            }
+            assert!(d.feed(b"\x7f"), "{raw:?} を消し切っても解放しない");
+        }
     }
 
     /// 起動直後に空の入力欄へ y が撃ち込まれたバグの再発防止。
@@ -6669,7 +7164,7 @@ mod tests {
         // 2) ユーザーが端末で直接応答した (terminal::draw のキーボード経路相当)。
         //    子は入力を読まないのでプロンプトは画面に残ったままになる。
         s.note_user_input();
-        s.write_bytes(b"y\r");
+        s.write_typed(b"y\r");
         assert!(!s.attention, "手入力の応答後も承認待ちが残った");
         assert!(s.take_user_typed());
 
@@ -9308,7 +9803,7 @@ fn forward_keyboard_input(ui: &mut egui::Ui, session: &mut Session, focus_id: eg
         // 送る前に通すこと — `write_bytes` の後だと、送信で状態が変わった
         // セッションに対して古い行を記録してしまう。
         session.note_typed_bytes(&out);
-        session.write_bytes(&out);
+        session.write_typed(&out);
         session.set_scroll(0);
     }
     if want_select_all {
@@ -9456,9 +9951,10 @@ fn handle_wheel_scroll(
             }
         } else if route == WheelRoute::Arrows {
             // マウス無効の全画面アプリ: 矢印キーで代用スクロール
+            // (入力欄をカーソル移動し得る打鍵なので、人の打鍵として畳む)
             let arrow: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
             for _ in 0..notches {
-                session.write_bytes(arrow);
+                session.write_typed(arrow);
             }
             if session.scroll != 0 {
                 session.set_scroll(0);
@@ -10608,7 +11104,7 @@ fn shell_integration_menu(ui: &mut egui::Ui, session: &mut Session, theme: &Them
     if let Some(line) = insert {
         // **Enter は送らない。** 誤クリックで `rm -rf` が走る作りにしない。
         // 打ち直しの手間を消すのが目的で、勝手に実行するのは目的ではない。
-        session.write_bytes(line.as_bytes());
+        session.write_typed(line.as_bytes());
         session.note_user_input();
         ui.close_menu();
     }
@@ -10782,7 +11278,7 @@ fn draw_shell_decorations(
         }
     }
     if let Some(line) = insert {
-        session.write_bytes(line.as_bytes());
+        session.write_typed(line.as_bytes());
         session.note_user_input();
     }
 }
@@ -10826,7 +11322,7 @@ pub fn draw(
     // 送信 (Enter) はしない — 入力欄に @パス が入るだけなので、暴発しない。
     if let Some(path) = response.dnd_release_payload::<PathBuf>() {
         let text = format!("@{} ", prompt_path(&path, &session.cwd));
-        session.write_bytes(text.as_bytes());
+        session.write_typed(text.as_bytes());
     }
     let os_dropped: Vec<egui::DroppedFile> = ui.input(|i| i.raw.dropped_files.clone());
     if !os_dropped.is_empty() && ui.rect_contains_pointer(rect) {
@@ -10837,7 +11333,7 @@ pub fn draw(
             }
         }
         if !text.is_empty() {
-            session.write_bytes(text.as_bytes());
+            session.write_typed(text.as_bytes());
             // エディタ側の既定処理 (タブで開く) と二重にならないよう印を立てる
             ui.ctx()
                 .data_mut(|d| d.insert_temp(egui::Id::new("zv-drop-consumed"), true));
@@ -12608,6 +13104,285 @@ printf '\r\nDA<%s>\r\nDONE\r\n' "$R"
             gone,
             "drop 後も孫 (pid={gpid}) が生きている — Drop の木殺しがグループへ届いていない"
         );
+    }
+
+    /// **insert が残した下書きは、`write_typed` の打鍵追跡で全部消えるまで
+    /// 占有が解けない** (実セッション経由の配線確認)。
+    ///
+    /// 追跡は文字数の積算で上限が無いので、`PROMPT_KEEP_CHARS` を超える
+    /// 下書きでも途中の Backspace で「空」と誤判定して解放しない —
+    /// 解放されると後続の確定送信が残りの下書きを巻き込んで送信する。
+    #[test]
+    fn 長文の下書きは打鍵で全部消すまで解放しない() {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "/bin/bash --noprofile --norc".into(),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        // insert の配達が残した下書き (submit_tick の WriteBody が立てる印)。
+        sess.note_input_draft(&"a".repeat(PROMPT_KEEP_CHARS + 1000));
+        assert!(sess.input_draft());
+        // 残り 1 文字になるまで消しても解放しない (打ち切りで早期解放しない)。
+        for _ in 0..PROMPT_KEEP_CHARS + 999 {
+            sess.write_typed(b"\x7f");
+            assert!(sess.input_draft(), "残っているのに占有を解いた");
+        }
+        // 全部消した = 人が下書きを捨てた → 解放。
+        sess.write_typed(b"\x7f");
+        assert!(!sess.input_draft(), "全部消したのに占有が残っている");
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **内部の書き込みでは下書きが解放されない** — approval 応答・
+    /// 権限切替・自動応答・配達の確定キーは追跡へ畳まない。
+    ///
+    /// `write_bytes` が無差別に畳んでいた頃は、approval モーダルへの
+    /// 内部 Enter が「人が下書きを確定した」と誤認されて占有が解け、
+    /// 後続の確定送信が残っている下書きを巻き込んでいた。
+    #[test]
+    fn 内部の書き込みでは下書きが解放されない() {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "/bin/bash --noprofile --norc".into(),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        sess.note_input_draft("abc");
+        assert!(sess.input_draft());
+        // approval 応答 (press_pet_approve_button / send_text が通る経路)
+        sess.write_bytes(b"\r");
+        assert!(sess.input_draft(), "approval 相当の Enter で誤解放した");
+        assert!(sess.send_text("\r"));
+        assert!(sess.input_draft(), "send_text の Enter で誤解放した");
+        // 権限切替キー (Codex は `/permissions\r`、Claude は Shift+Tab)
+        sess.write_bytes(b"/permissions\r");
+        assert!(sess.input_draft(), "権限切替キーで誤解放した");
+        sess.write_bytes(b"\x1b[Z");
+        assert!(sess.input_draft(), "Shift+Tab で誤解放した");
+        // 自動応答・配達の確定キー相当の内部書き込み
+        sess.write_bytes(b"y");
+        sess.write_bytes(crate::submit::COMMIT);
+        assert!(sess.input_draft(), "内部の応答・確定キーで誤解放した");
+        // 人の確定・消去打鍵は従来どおり解放する。
+        sess.write_typed(b"\r");
+        assert!(!sess.input_draft(), "人の Enter で解放しない");
+        sess.note_input_draft("abc");
+        sess.write_typed(b"\x15");
+        assert!(!sess.input_draft(), "人の Ctrl+U で解放しない");
+        sess.note_input_draft("abc");
+        sess.write_typed(b"\x03");
+        assert!(!sess.input_draft(), "人の Ctrl+C で解放しない");
+        // 人の Backspace 全消しでも解放する (消した回数が残量と一致)。
+        sess.note_input_draft("abc");
+        sess.write_typed(b"\x7f\x7f");
+        assert!(sess.input_draft(), "途中経過で誤解放した");
+        sess.write_typed(b"\x7f");
+        assert!(!sess.input_draft(), "消し切っても解放しない");
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **insert より前からある人の手入力も下書きとして占有する**
+    /// (ケース A–E)。追跡器が `Job::insert` 専用だった頃は、先に人が
+    /// 打った分が無印のまま残り、後続の確定送信がその確定キーで
+    /// 下書きごと送信していた。
+    #[test]
+    fn 人の手入力も下書きとして占有する() {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "/bin/bash --noprofile --norc".into(),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+
+        // ケース A: 手入力 AAA → insert の BBB が追記として畳まれる →
+        // BBB 分だけ消しても AAA が残っているので占有は解けない。
+        sess.write_typed(b"AAA");
+        assert!(sess.input_draft(), "人の手入力が占有を始めていない");
+        sess.note_input_draft("BBB");
+        for _ in 0..3 {
+            sess.write_typed(b"\x7f");
+        }
+        assert!(sess.input_draft(), "AAA が残っているのに占有を解いた");
+        // 残りを全部消す (= 人が下書きを捨てた) と解放される。
+        for _ in 0..3 {
+            sess.write_typed(b"\x7f");
+        }
+        assert!(!sess.input_draft(), "全部消したのに占有が残っている");
+
+        // ケース B/D: 手入力 AAA だけでも占有し、人の Enter で解放される。
+        sess.write_typed(b"AAA");
+        assert!(sess.input_draft(), "手入力が占有を始めていない");
+        sess.write_typed(b"\r");
+        assert!(!sess.input_draft(), "人の Enter で解放しない");
+
+        // ケース E: 矢印・Esc で位置が不確実になったら Backspace では
+        // 解かない (安全側)。確実な Ctrl+U でだけ解放する。
+        sess.write_typed(b"AAA");
+        sess.write_typed(b"\x1b[D");
+        for _ in 0..8 {
+            sess.write_typed(b"\x7f");
+            assert!(sess.input_draft(), "矢印後の Backspace で誤解放した");
+        }
+        sess.write_typed(b"\x1b");
+        assert!(sess.input_draft(), "Esc 単独で誤解放した");
+        sess.write_typed(b"\x15");
+        assert!(!sess.input_draft(), "人の Ctrl+U で解放しない");
+
+        // ケース C: 手入力だけの下書きは、打鍵で消し切った回数で解放される。
+        sess.write_typed(b"AAA");
+        sess.write_typed(b"\x7f\x7f");
+        assert!(sess.input_draft(), "途中経過で誤解放した");
+        sess.write_typed(b"\x7f");
+        assert!(!sess.input_draft(), "消し切っても解放しない");
+
+        // Esc / 矢印 / 制御キーだけでは占有を始めない (誤って人の
+        // 下書きとして登録しない — submit 配達が永久に止まるので)。
+        sess.write_typed(b"\x1b");
+        sess.write_typed(b"\x1b[A\x1b[B\x1b[C\x1b[D");
+        assert!(!sess.input_draft(), "制御キーだけで占有を始めた");
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **bracketed paste の無い実端末へは、複数行の「入れるだけ」を
+    /// 書かずに断る** (実 PTY の配線確認)。
+    ///
+    /// 包めない本文中の改行は確定キーとして走り、先頭行が実行されて
+    /// 「入力欄へ挿入するだけ」の契約を破る — かつ一部実行済みなのに
+    /// 追跡上は全部残っている divergence になる。配達時点で 1 バイトも
+    /// 書かずに断る (`Act::UnsafeInsert`)。
+    #[test]
+    fn bracketedの無い端末では複数行の挿入を断って実行させない() {
+        let dir = std::env::temp_dir().join(format!("zaivern-pty-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // bracketed paste を要求しないプレーンな shell (readline 無し)。
+        let spec = SpawnSpec {
+            title: "t".into(),
+            preset_name: "t".into(),
+            icon: "t".into(),
+            command: "/bin/sh".into(),
+            cwd: dir.clone(),
+            env: HashMap::new(),
+            log_path: None,
+        };
+        let mut sess = Session::spawn(1, spec, egui::Context::default()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        // プロンプトが出るまで待つ。
+        loop {
+            if Instant::now() >= deadline {
+                panic!("sh のプロンプトが出ない");
+            }
+            let screen = lock_ok(&sess.parser).screen().contents();
+            if !screen.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!sess.bracketed_paste(), "sh が bracketed を有効にした");
+        let t0 = Instant::now();
+        // `submit_tick` が組み立てるのと同じ条件を、実セッションの値で判定する。
+        let peek = crate::submit::Peek {
+            input_ready: true,
+            running: sess.running(),
+            idle: true,
+            attention: false,
+            bracketed: sess.bracketed_paste(),
+            input: None,
+        };
+        // 複数行の「入れるだけ」→ 断る。書かないので実行もしない。
+        let mut p = crate::submit::Pending::new(
+            crate::submit::Job::insert(1, "echo SHOULD_NOT_RUN\necho SECOND"),
+            t0,
+        );
+        assert_eq!(
+            p.act(&peek, t0),
+            crate::submit::Act::UnsafeInsert,
+            "複数行の挿入を断らなかった"
+        );
+        assert!(
+            !lock_ok(&sess.parser)
+                .screen()
+                .contents()
+                .contains("SHOULD_NOT_RUN"),
+            "断った本文が入力欄へ書かれた"
+        );
+        // 単一行の挿入は従来どおり入力欄へ入る (実行はしない)。
+        let body = crate::submit::sanitize("echo SINGLE_$((3*3))");
+        let mut p1 = crate::submit::Pending::new(crate::submit::Job::insert(1, &body), t0);
+        assert_eq!(p1.act(&peek, t0), crate::submit::Act::WriteBody);
+        sess.write_typed(&crate::submit::wrap_body(&body, sess.bracketed_paste()));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let screen = lock_ok(&sess.parser).screen().contents();
+            if screen.contains("SINGLE_$((3*3))") {
+                // 入力欄に本文が見える = 書けたが実行はしていない
+                // (実行されると出力行 "SINGLE_9" が出る)。
+                assert!(!screen.contains("SINGLE_9"), "挿入が実行された: {screen}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "単一行が入力欄へ入らない: {screen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(sess.input_draft(), "挿入が下書きとして占有していない");
+        // 人が捨てると解放される。
+        sess.write_typed(b"\x15");
+        assert!(!sess.input_draft());
+        // bracketed のある端末では、同じ複数行も包んで入力欄へ入る。
+        lock_ok(&sess.parser).process(b"\x1b[?2004h");
+        assert!(sess.bracketed_paste());
+        let peek = crate::submit::Peek {
+            bracketed: sess.bracketed_paste(),
+            ..peek
+        };
+        let body = crate::submit::sanitize("echo BRACKET_$((6*7))\necho NEXT_$((1+1))");
+        let mut p2 = crate::submit::Pending::new(crate::submit::Job::insert(1, &body), t0);
+        assert_eq!(p2.act(&peek, t0), crate::submit::Act::WriteBody);
+        sess.write_typed(&crate::submit::wrap_body(&body, sess.bracketed_paste()));
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let screen = lock_ok(&sess.parser).screen().contents();
+            if screen.contains("$((6*7))") {
+                // 包まれた改行は確定として走らず、入力欄へ本文として入る
+                // (実行されていれば "BRACKET_42" / "NEXT_2" の出力が出る)。
+                assert!(
+                    !screen.contains("BRACKET_42"),
+                    "包んだのに実行された: {screen}"
+                );
+                assert!(!screen.contains("NEXT_2"), "包んだのに実行された: {screen}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "複数行が入力欄へ入らない: {screen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        sess.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
