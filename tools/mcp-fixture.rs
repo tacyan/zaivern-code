@@ -8,6 +8,9 @@ fn send(message: &str) {
 }
 
 fn main() {
+    // Authentication for the host tunnel must never enter the Agent container.
+    assert!(std::env::var_os("CONTROL_PLANE_API_KEY").is_none());
+    assert!(std::env::var_os("CONTROL_PLANE_TUNNEL_ID").is_none());
     let mut prompt_id = String::new();
     let mut helper_only = false;
     let mut mixed = false;

@@ -12,12 +12,7 @@ const MAX_LINE: usize = 256 * 1024;
 // A modern revision cannot be negotiated through the legacy initialize RPC.
 const VERSION: &str = "2025-11-25";
 const MODERN_VERSION: &str = "2026-07-28";
-const VERSIONS: &[&str] = &[
-    MODERN_VERSION,
-    VERSION,
-    "2025-06-18",
-    "2024-11-05",
-];
+const VERSIONS: &[&str] = &[MODERN_VERSION, VERSION, "2025-06-18", "2024-11-05"];
 const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 const META_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 const META_CLIENT: &str = "io.modelcontextprotocol/clientInfo";
@@ -149,7 +144,8 @@ pub(super) fn serve(
                 Ok(mut value) => {
                     if modern {
                         value["resultType"] = json!("complete");
-                        value["_meta"] = json!({"io.modelcontextprotocol/serverInfo":server_info()});
+                        value["_meta"] =
+                            json!({"io.modelcontextprotocol/serverInfo":server_info()});
                         if method == "tools/list" {
                             value["cacheScope"] = json!("private");
                             value["ttlMs"] = json!(0);
@@ -202,7 +198,9 @@ fn request_mode(params: &Value, id: &Value) -> Result<bool, Value> {
         return Ok(false);
     }
     if !meta.get(META_CAPABILITIES).is_some_and(Value::is_object)
-        || meta.get(META_CLIENT).is_some_and(|info| !valid_implementation(info))
+        || meta
+            .get(META_CLIENT)
+            .is_some_and(|info| !valid_implementation(info))
     {
         return Err(invalid());
     }
@@ -239,11 +237,18 @@ mod tests {
             std::path::PathBuf::from("unused"),
             std::sync::Arc::new(super::super::task::tests::Fake),
         );
-        let input = requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let input = requests
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut output = Vec::new();
         serve(io::Cursor::new(input), &mut output, &bridge).unwrap();
-        std::str::from_utf8(&output).unwrap().lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect()
+        std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     fn modern_meta() -> Value {
@@ -254,8 +259,17 @@ mod tests {
 
     fn assert_tools(result: &Value) {
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect::<Vec<_>>(),
-            ["zaivern_run_task", "zaivern_task_status", "zaivern_cancel_task"]);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "zaivern_run_task",
+                "zaivern_task_status",
+                "zaivern_cancel_task"
+            ]
+        );
         for (tool, argument) in tools.iter().zip(["instruction", "task_id", "task_id"]) {
             let schema = &tool["inputSchema"];
             assert_eq!(schema["type"], "object");
@@ -294,7 +308,10 @@ mod tests {
                 assert_eq!(row["result"]["protocolVersion"], expected);
                 assert_eq!(row["result"]["capabilities"], json!({"tools":{}}));
                 assert_eq!(row["result"]["serverInfo"]["name"], "zaivern-chat-bridge");
-                assert_eq!(row["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+                assert_eq!(
+                    row["result"]["serverInfo"]["version"],
+                    env!("CARGO_PKG_VERSION")
+                );
             }
             assert_eq!(rows[2]["error"]["code"], -32000);
             assert_eq!(rows[3]["error"]["code"], -32000);
@@ -323,18 +340,27 @@ mod tests {
             assert_eq!(rows[offset]["result"]["resultType"], "complete");
             assert_eq!(rows[offset]["result"]["cacheScope"], "private");
             assert_eq!(rows[offset]["result"]["ttlMs"], 0);
-            assert_eq!(rows[offset+1]["id"], u64::MAX);
-            assert_eq!(rows[offset+1]["result"]["resultType"], "complete");
-            assert_eq!(rows[offset+1]["result"]["isError"], true);
-            assert_eq!(rows[offset+1]["result"]["content"][0]["type"], "text");
-            assert_eq!(rows[offset+2]["error"]["code"], -32000);
-            assert_eq!(rows[offset+4]["error"]["code"], -32000);
-            let discovery = &rows[offset+3]["result"];
+            assert_eq!(rows[offset + 1]["id"], u64::MAX);
+            assert_eq!(rows[offset + 1]["result"]["resultType"], "complete");
+            assert_eq!(rows[offset + 1]["result"]["isError"], true);
+            assert_eq!(rows[offset + 1]["result"]["content"][0]["type"], "text");
+            assert_eq!(rows[offset + 2]["error"]["code"], -32000);
+            assert_eq!(rows[offset + 4]["error"]["code"], -32000);
+            let discovery = &rows[offset + 3]["result"];
             assert_eq!(discovery["cacheScope"], "private");
             assert_eq!(discovery["ttlMs"], 0);
-            assert_eq!(discovery["supportedVersions"], json!(["2026-07-28","2025-11-25","2025-06-18","2024-11-05"]));
-            assert_eq!(discovery["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "zaivern-chat-bridge");
-            assert!(discovery.get("serverInfo").is_none(), "use the published schema, not the draft SEP");
+            assert_eq!(
+                discovery["supportedVersions"],
+                json!(["2026-07-28", "2025-11-25", "2025-06-18", "2024-11-05"])
+            );
+            assert_eq!(
+                discovery["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+                "zaivern-chat-bridge"
+            );
+            assert!(
+                discovery.get("serverInfo").is_none(),
+                "use the published schema, not the draft SEP"
+            );
         }
     }
 
@@ -346,15 +372,23 @@ mod tests {
             json!({"jsonrpc":"2.0","id":"unsupported","method":"tools/call","params":{"_meta":unsupported,"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}}),
             json!({"jsonrpc":"2.0","id":"retry","method":"server/discover","params":{"_meta":modern_meta()}}),
         ]);
-        assert_eq!(rows[0], json!({"jsonrpc":"2.0","id":"unsupported","error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":VERSIONS,"requested":"2099-01-01"}}}));
+        assert_eq!(
+            rows[0],
+            json!({"jsonrpc":"2.0","id":"unsupported","error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":VERSIONS,"requested":"2099-01-01"}}})
+        );
         assert!(rows[1].get("error").is_none());
-        for meta in [json!(null), json!([]), json!({META_VERSION:42}),
+        for meta in [
+            json!(null),
+            json!([]),
+            json!({META_VERSION:42}),
             json!({META_VERSION:MODERN_VERSION}),
             json!({META_CAPABILITIES:{}}),
             json!({META_VERSION:MODERN_VERSION,META_CAPABILITIES:[]}),
             json!({META_VERSION:MODERN_VERSION,META_CAPABILITIES:{},META_CLIENT:{"name":"missing version"}}),
         ] {
-            let rows = exchange(&[json!({"jsonrpc":"2.0","id":"bad","method":"tools/call","params":{"_meta":meta,"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}})]);
+            let rows = exchange(&[
+                json!({"jsonrpc":"2.0","id":"bad","method":"tools/call","params":{"_meta":meta,"name":"zaivern_run_task","arguments":{"instruction":"must not run"}}}),
+            ]);
             assert_eq!(rows[0]["error"]["code"], -32602, "{rows:?}");
             assert_eq!(rows[0]["id"], "bad");
         }
@@ -362,11 +396,27 @@ mod tests {
 
     #[test]
     fn discovery_never_exposes_host_operations_or_unadvertised_capabilities() {
-        let mut requests = vec![json!({"jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":modern_meta()}})];
-        for method in ["unknown", "resources/list", "resources/templates/list", "prompts/list"] {
+        let mut requests = vec![
+            json!({"jsonrpc":"2.0","id":0,"method":"server/discover","params":{"_meta":modern_meta()}}),
+        ];
+        for method in [
+            "unknown",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
             requests.push(json!({"jsonrpc":"2.0","id":method,"method":method,"params":{"_meta":modern_meta()}}));
         }
-        for name in ["execute", "delete", "move", "fetch", "zaivern_execute", "zaivern_delete", "zaivern_move", "zaivern_fetch"] {
+        for name in [
+            "execute",
+            "delete",
+            "move",
+            "fetch",
+            "zaivern_execute",
+            "zaivern_delete",
+            "zaivern_move",
+            "zaivern_fetch",
+        ] {
             requests.push(json!({"jsonrpc":"2.0","id":name,"method":"tools/call","params":{"_meta":modern_meta(),"name":name,"arguments":{}}}));
         }
         requests.push(json!({"jsonrpc":"2.0","id":"workspace","method":"tools/call","params":{"_meta":modern_meta(),"name":"zaivern_run_task","arguments":{"instruction":"edit","workspace":"/outside"}}}));
@@ -380,7 +430,10 @@ mod tests {
         }
         assert_eq!(rows[13]["result"]["isError"], true);
         // Unknown methods have the standard error even before any handshake.
-        assert_eq!(exchange(&[json!({"jsonrpc":"2.0","id":1,"method":"unknown"})])[0]["error"]["code"], -32601);
+        assert_eq!(
+            exchange(&[json!({"jsonrpc":"2.0","id":1,"method":"unknown"})])[0]["error"]["code"],
+            -32601
+        );
     }
 
     #[test]
@@ -395,11 +448,18 @@ mod tests {
             json!({"jsonrpc":"2.0","id":"discover","method":"server/discover"}),
             json!({"jsonrpc":"2.0","id":0,"method":"tools/list"}),
         ];
-        let input = requests.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let input = requests
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut output = Vec::new();
         serve(io::Cursor::new(input), &mut output, &bridge).unwrap();
-        let rows: Vec<Value> = std::str::from_utf8(&output).unwrap().lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let rows: Vec<Value> = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(rows.len(), 3, "notifications must not receive a response");
         assert_eq!(rows[1]["id"], "discover");
         assert!(rows[1].get("error").is_none(), "{rows:?}");
