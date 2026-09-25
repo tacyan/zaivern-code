@@ -1108,8 +1108,8 @@ pub fn text_scale(ctx: &egui::Context) -> f32 {
 
 /// 文字サイズ倍率を差し替える。変化があったら再描画を要求して true。
 ///
-/// 実際のスタイル書き換えは次フレーム先頭の [`resync_pixel_snapping`] が
-/// 行う — 書き換え地点を 1 つに保つことで、倍率と ppp の両方が動いたときに
+/// スタイルは [`resync_pixel_snapping`] を通してその場で同期する。
+/// 書き換え処理を 1 つに保つことで、倍率と ppp の両方が動いたときに
 /// 誤差が積み上がるのを防ぐ (毎回**基準値から**計算し直す)。
 pub fn set_text_scale(ctx: &egui::Context, scale: f32) -> bool {
     let scale = crate::zoom::clamp(scale);
@@ -1117,6 +1117,8 @@ pub fn set_text_scale(ctx: &egui::Context, scale: f32) -> bool {
         return false;
     }
     ctx.data_mut(|d| d.insert_temp(text_scale_id(), scale));
+    // フレーム先頭のフックより後に設定が届いても、同じフレームに反映する。
+    resync_pixel_snapping(ctx);
     ctx.request_repaint();
     true
 }
@@ -1972,6 +1974,37 @@ mod tests {
             normal.sort_unstable_by_key(|c| (c.r(), c.g(), c.b(), c.a()));
             normal.dedup();
             assert_eq!(normal.len(), 8, "{}: duplicate ansi normal color", t.name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod text_scale_frame_tests {
+    #[test]
+    fn changes_during_a_frame_apply_immediately_without_compounding_or_zooming() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            super::apply(&ctx, &super::by_name("zaivern-dark"));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let initial = ctx.style();
+                let ppp = ctx.pixels_per_point();
+                let zoom = ctx.zoom_factor();
+                for scale in [1.1, 1.2, 1.3, 3.0, 2.9, 1.2, 1.0, 3.0, 1.0] {
+                    super::set_text_scale(ctx, scale);
+                    let style = ctx.style();
+                    assert_eq!(
+                        style.text_styles[&egui::TextStyle::Body].size,
+                        super::snap_font_size(super::BASE_BODY_SIZE * scale, ppp)
+                    );
+                    assert_eq!(style.spacing.button_padding, initial.spacing.button_padding);
+                    assert_eq!(style.spacing.item_spacing, initial.spacing.item_spacing);
+                    assert_eq!(ctx.zoom_factor(), zoom);
+                    assert_eq!(ctx.pixels_per_point(), ppp);
+                    assert!(!super::set_text_scale(ctx, scale));
+                }
+                assert_eq!(ctx.style().text_styles, initial.text_styles);
+            });
         }
     }
 }
