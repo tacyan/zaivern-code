@@ -456,7 +456,7 @@ pub enum DeckAction {
     Rename { id: u64, title: String },
     /// 同じプリセット + 同じ作業ディレクトリでもう 1 本起こす
     Duplicate(usize),
-    /// セッションを閉じる (確認済み)
+    /// セッションを閉じる (閉じるボタン、または停止キーの確認済み操作)
     Stop(usize),
     /// 再起動
     Restart(usize),
@@ -1151,7 +1151,33 @@ fn row_ui(
     } else {
         theme.text_dim
     };
-    let inner_w = (w - pad * 2.0).max(unit);
+    // 常時見える閉じるボタンの領域を、名前・名前変更欄から分離する。
+    let close_size = title_h.max(20.0).min((w - pad * 2.0).max(0.0));
+    let inner_w = (w - pad * 3.0 - close_size).max(0.0);
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - pad - close_size * 0.5, rect.center().y),
+        egui::vec2(close_size, close_size),
+    );
+    let close = ui
+        .push_id(("deck-close", v.id), |ui| {
+            ui.put(
+                close_rect,
+                egui::Button::new(egui::RichText::new("✕").color(fg)).frame(false),
+            )
+            .on_hover_text(tr("セッションを閉じる"))
+        })
+        .inner;
+    if close.clicked() {
+        if let Some(l) = live.get(r.idx) {
+            acts.push(DeckAction::Stop(l.idx));
+        }
+        if st.rename_for == Some(v.id) {
+            st.rename_for = None;
+            st.rename_focus = false;
+        }
+        st.stop_armed = None;
+        return;
+    }
 
     // 名前変更中はタイトル行が入力欄に化ける (状態表示ではなく一時的な編集)
     if st.rename_for == Some(v.id) {
@@ -2413,6 +2439,59 @@ mod rename_pointer_tests {
             |a| matches!(a, DeckAction::Rename { id: 92, title } if title == "日本語レビュー担当")
         ));
         assert_eq!(st.rename_for, None);
+    }
+
+    #[test]
+    fn close_button_targets_its_row_without_selecting_or_renaming() {
+        let live = vec![
+            LiveRow {
+                idx: 3,
+                id: 41,
+                title: "Codex".into(),
+                ..Default::default()
+            },
+            LiveRow {
+                idx: 7,
+                id: 92,
+                title: "Shell".into(),
+                ..Default::default()
+            },
+        ];
+        for width in [180.0, 420.0] {
+            let mut st = DeckState {
+                selected: Some(41),
+                ..Default::default()
+            };
+            let mut screen = crate::e2e::Screen::new(width, 280.0);
+            let (_, painted) = screen.panel(vec![], |ui| draw(&mut st, ui, &live));
+            let buttons: Vec<_> = painted.texts.iter().filter(|t| t.text == "✕").collect();
+            assert_eq!(buttons.len(), 2, "各行に閉じるボタンが常時表示される");
+            let pos = buttons[1].rect.center();
+            let actions = screen.click_panel(pos, |ui| draw(&mut st, ui, &live));
+            assert_eq!(actions, vec![DeckAction::Stop(7)]);
+            assert_eq!(st.selected, Some(41));
+            assert_eq!(st.rename_for, None);
+        }
+    }
+
+    #[test]
+    fn close_button_does_not_overlap_a_long_title() {
+        let live = vec![LiveRow {
+            idx: 0,
+            id: 41,
+            title: "Codex long session name that should be truncated".into(),
+            ..Default::default()
+        }];
+        let mut st = DeckState::default();
+        let mut screen = crate::e2e::Screen::new(180.0, 280.0);
+        let (_, painted) = screen.panel(vec![], |ui| draw(&mut st, ui, &live));
+        let close = painted.texts.iter().find(|t| t.text == "✕").unwrap();
+        let title = painted
+            .texts
+            .iter()
+            .find(|t| t.text.starts_with("Codex"))
+            .unwrap();
+        assert!(title.rect.right() < close.rect.left());
     }
 
     #[test]
