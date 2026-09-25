@@ -3,10 +3,11 @@
 
 [plugin]
 name = "tasks"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "課題と PR の一覧、作業ブランチの作成、差分表示、レビュー依頼"
 api = 2
+shell = "posix"
 
 [[command]]
 id = "pr-list"

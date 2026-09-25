@@ -1,9 +1,10 @@
 [plugin]
 name = "diff-review"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "差分を読みながら行単位でコメントを溜め、まとめてエージェントへ渡す"
 api = 2
+shell = "posix"
 
 [[setting]]
 key = "agent"

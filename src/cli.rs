@@ -355,6 +355,13 @@ Zaivern Code — CLI 制御チャネル
   zai plugin enable <名前>              有効化
   zai plugin disable <名前>             無効化
 
+プラグインのスクリプトが使う道具 (スクリプトから呼ばれます — 手で打つものではありません):
+  zai plugin emit <キー> <値> …         アクション 1 行 (JSON Lines) を出す
+  zai plugin json <ファイル> keys|get|rows <パス> …
+                                        JSON を読む (無いものは空を返す)
+  zai plugin usage-scan [追加ディレクトリ]
+                                        使用量の目安を Markdown で出す
+
 アプリ登録 (OS のアプリ一覧から起動できるようにします):
   zai app install                       Launchpad / アプリメニュー / スタートメニューへ登録
   zai app uninstall                     登録を解除
@@ -1655,7 +1662,15 @@ fn run_plugin(args: &[String]) -> i32 {
         "new" => plugin_new(&name),
         "enable" => plugin_set_enabled(&name, true),
         "disable" => plugin_set_enabled(&name, false),
-        "" => Err("plugin のサブコマンドを指定してください: list / new / enable / disable".into()),
+        // 同梱プラグインのスクリプトが呼ぶ道具 (python3 の置き換え)。実体は
+        // src/plugin_script.rs — 「道具は Rust に置く」の適用例。
+        "emit" => crate::plugins::script::emit(&args[1..]),
+        "json" => crate::plugins::script::json_query(&args[1..]),
+        "usage-scan" => crate::plugins::script::usage_scan(&args[1..]),
+        "" => Err(
+            "plugin のサブコマンドを指定してください: list / new / enable / disable / emit / json / usage-scan"
+                .into(),
+        ),
         other => Err(format!("不明な plugin サブコマンドです: {other}")),
     };
     match result {
@@ -3714,6 +3729,11 @@ mod tests {
             "zai plugin new",
             "zai plugin enable",
             "zai plugin disable",
+            // プラグインのスクリプトが呼ぶ道具 (python3 を置き換えた入口。
+            // ここに載せ忘れると、スクリプトだけが知っている裏口になる)
+            "zai plugin emit",
+            "zai plugin json",
+            "zai plugin usage-scan",
             "zai app install",
             "zai app uninstall",
             "zai firewall status",

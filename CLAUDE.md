@@ -555,6 +555,36 @@
 - **`cmd /C` にコマンド全体を 1 引数で押し込まない。** Rust の `Command` は
   引数ごとに Windows の規則で引用するので、cmd 側の再解析とずれて失敗する。
   引数は分けて渡す。unix もシェルを挟まず実体 (`mv` 等) を直に起こすほうが安全。
+- **Windows の `sh` は PATH に無い。POSIX 前提のプラグインを cmd に通すと全滅する。**
+  Git for Windows が PATH へ入れるのは `Git\cmd` だけで、`sh.exe` が居る
+  `Git\usr\bin` は**意図的に外れている**。同梱プラグインの `run` は
+  `sh "$ZV_PLUGIN_DIR/x.sh"` なので、`%COMSPEC% /C` 経由では (1) `sh` が
+  見つからず (2) `$VAR` も展開されない — 0.24.4 では**起動のたびに 3 件の
+  失敗通知**が出ていた (quick-actions / usage-meter / worktrees のフック)。
+  そこで `run` の実行シェルは manifest の `[plugin].shell` が決める:
+  **既定は `"native"`** (unix: `$SHELL -lc`、Windows: `%COMSPEC% /C`。
+  `shell` を書かない既存 plugin.toml は無改造のまま従来どおり動く)。
+  POSIX 前提のプラグインだけ `shell = "posix"` を書き、それらは
+  `shellenv::script_command` で起こすこと。posix は **全 OS で** 解決済みの
+  `sh` を使う — `$SHELL` には fish 等の非 POSIX シェルが入りうるので
+  unix/macOS でも `$SHELL` 経由にしてはいけない。
+  - **`-c` ではなく `-lc`。** `-c` だと `/etc/profile` が読まれず、
+    `sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` が 1 つも
+    引けない (実測。PATH は `/c/Windows/system32:/c/Windows:/cmd` のまま)
+  - **MSYS 系の `-l` は $HOME へ cd する。** `/etc/profile` がそう動くので
+    `Command::current_dir` がシェル内 `pwd` に届かなくなる。
+    `script_command` が `CHERE_INVOKING=1` を渡して抑止している
+    (各プラグインに `cd` を書かせない)
+  - `sh` の在り処は **`git` の実体から辿る** (`<Git>\usr\bin\sh.exe`)。
+    絶対パスを書かない。逃げ道は `ZAIVERN_POSIX_SHELL` (全 OS で有効)
+  - 見つからない環境では**読み込み時に `error` へ落として黙らせる**
+    (`plugins::script_gate`)。毎起動の通知は、そのうち全部読み飛ばされる
+- **Windows の `python3` は「在るのに動かない」。存在確認では守れない。**
+  Microsoft Store の**アプリ実行エイリアス**が `%LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe`
+  として PATH に実在するので `command -v python3` は成功し、実行すると
+  `Python` の 1 行を出して **exit 49** で終わる。同梱プラグインはこれで
+  死んでいた。JSON の組み立て・読み取りは `zai plugin emit` / `json` /
+  `usage-scan` (`src/plugin_script.rs`) を使う — 「道具は Rust に置く」の適用。
 - **`thread_local!` に `///` を付けない。** rustdoc はマクロ展開の中身を
   文書化しないので `unused_doc_comments` で `-D warnings` が落ちる。通常の
   `//` にする。**`tools/verify.sh --lint` を push 前に必ず通すこと** —

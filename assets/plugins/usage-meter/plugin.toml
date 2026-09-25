@@ -3,10 +3,11 @@
 
 [plugin]
 name = "usage-meter"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "セッション記録から使用量の目安を集計して表示する"
 api = 2
+shell = "posix"
 
 [[command]]
 id = "refresh"
