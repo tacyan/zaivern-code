@@ -322,3 +322,56 @@ mod tests {
         assert_eq!(z, MAX);
     }
 }
+
+/// 文字だけの調整は一定の10ポイント刻み。画面ズームの大きな段を共有しない。
+/// 既存設定の125%なども、最寄りの増加／減少側の段から調整できる。
+pub fn step_text_size(cur: f32, increase: bool) -> f32 {
+    let units = clamp(cur) * 10.0;
+    let next = if increase {
+        (units + EPS).floor() + 1.0
+    } else {
+        (units - EPS).ceil() - 1.0
+    };
+    clamp(next / 10.0)
+}
+
+/// 小型ペインの基準サイズを先に制限し、その後で利用者の文字倍率を適用する。
+/// 最終上限は通常のエディタ／端末と同じ96pt。
+pub fn preview_font_size(base: f32, offset: f32, maximum: f32, scale: f32) -> f32 {
+    ((base - offset).clamp(8.0, maximum) * clamp(scale)).clamp(6.0, 96.0)
+}
+
+#[cfg(test)]
+mod text_size_tests {
+    use super::*;
+    #[test]
+    fn repeated_text_steps_are_small_reversible_and_bounded() {
+        let mut scale = DEFAULT;
+        for n in 1..=20 {
+            scale = step_text_size(scale, true);
+            assert!((scale - (1.0 + n as f32 / 10.0)).abs() < 1e-5);
+        }
+        assert_eq!(step_text_size(scale, true), MAX);
+        for _ in 0..20 {
+            scale = step_text_size(scale, false);
+        }
+        assert_eq!(scale, DEFAULT);
+        for _ in 0..100 {
+            scale = step_text_size(scale, false);
+        }
+        assert_eq!(scale, MIN);
+        assert_eq!(step_text_size(1.25, true), 1.3);
+        assert_eq!(step_text_size(1.25, false), 1.2);
+    }
+
+    #[test]
+    fn preview_text_keeps_growing_past_the_old_unscaled_limit() {
+        for (offset, maximum) in [(3.0, 14.0), (2.0, 16.0)] {
+            for base in [7.0, 14.0, 28.0] {
+                let normal = preview_font_size(base, offset, maximum, 1.0);
+                assert_eq!(preview_font_size(base, offset, maximum, 2.0), normal * 2.0);
+                assert_eq!(preview_font_size(base, offset, maximum, 3.0), normal * 3.0);
+            }
+        }
+    }
+}

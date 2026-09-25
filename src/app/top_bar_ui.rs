@@ -15,8 +15,11 @@ impl ZaivernApp {
         let density = top_bar_density(ctx.available_rect().width() - 20.0);
         let two_rows = density == TopBarDensity::Overflow;
 
+        let font = egui::TextStyle::Button.resolve(&ctx.style());
+        let font_height = ctx.fonts(|fonts| fonts.row_height(&font));
+        let (row_height, bar_height) = text_aware_top_bar_heights(font_height, two_rows);
         let bar = egui::TopBottomPanel::top("zv-top")
-            .exact_height(if two_rows { 72.0 } else { 42.0 })
+            .exact_height(bar_height)
             .frame(
                 egui::Frame::none()
                     .fill(theme.panel)
@@ -29,7 +32,7 @@ impl ZaivernApp {
                 // 大きな文字・極端に狭い窓でも、はみ出した操作へ横スクロールで届く。
                 egui::ScrollArea::horizontal()
                     .id_salt("zv-top-scroll")
-                    .max_height(28.0)
+                    .max_height(row_height)
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
                             self.top_bar_left(ui, &theme, &menu_info, &branch, density, &mut cmds);
@@ -43,7 +46,7 @@ impl ZaivernApp {
                 if two_rows {
                     egui::ScrollArea::horizontal()
                         .id_salt("zv-top-views-scroll")
-                        .max_height(28.0)
+                        .max_height(row_height)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| self.top_bar_visible_controls(ui, &mut cmds));
                         });
@@ -1996,5 +1999,35 @@ impl ZaivernApp {
             Some((cid, clen, _, le)) if *cid == b.id && *clen == b.text.len() => *le,
             _ => crate::textenc::detect_line_ending(&b.text),
         }
+    }
+}
+
+// 文字倍率では余白を拡大しないが、文字そのものが収まる高さは確保する。
+fn text_aware_top_bar_heights(font_height: f32, two_rows: bool) -> (f32, f32) {
+    let row = (font_height + 6.0).max(28.0);
+    (
+        row,
+        if two_rows {
+            row * 2.0 + 16.0
+        } else {
+            row + 14.0
+        },
+    )
+}
+
+#[cfg(test)]
+mod text_size_layout_tests {
+    #[test]
+    fn large_text_fits_without_scaling_toolbar_padding() {
+        for two_rows in [false, true] {
+            for height in [14.0, 21.0, 42.0, 60.0] {
+                let (row, bar) = super::text_aware_top_bar_heights(height, two_rows);
+                assert!(row >= height + 6.0);
+                let rows = if two_rows { 2.0 } else { 1.0 };
+                assert_eq!(bar - row * rows, if two_rows { 16.0 } else { 14.0 });
+            }
+        }
+        assert_eq!(super::text_aware_top_bar_heights(14.0, false), (28.0, 42.0));
+        assert_eq!(super::text_aware_top_bar_heights(14.0, true), (28.0, 72.0));
     }
 }

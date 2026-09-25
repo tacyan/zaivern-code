@@ -125,7 +125,8 @@ impl ZaivernApp {
         // ライブペイン: 端末描画は Cockpit と同じ道 (`terminal::draw`) をそのまま使う。
         // 看板側は矩形を用意して呼ぶだけ — 端末を再実装しない。
         // 借用は分けて取る (kanban_state と agents.sessions は別フィールド)。
-        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
+        let mini_font =
+            zoom::preview_font_size(self.cfg.terminal_font_size, 3.0, 14.0, self.cfg.text_scale);
         let dead: std::collections::HashSet<u64> = self
             .agents
             .sessions
@@ -350,7 +351,8 @@ impl ZaivernApp {
         let scanning = !self.deck_branch_pending.is_empty();
 
         // ライブ端末は Cockpit / 看板とまったく同じ道 (`terminal::draw`) を通す。
-        let mini_font = (self.scaled_terminal_font() - 2.0).clamp(8.0, 16.0);
+        let mini_font =
+            zoom::preview_font_size(self.cfg.terminal_font_size, 2.0, 16.0, self.cfg.text_scale);
         let dead: HashSet<u64> = self
             .agents
             .sessions

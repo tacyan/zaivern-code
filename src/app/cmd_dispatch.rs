@@ -1462,8 +1462,10 @@ impl ZaivernApp {
             Cmd::FileZoomIn => self.step_file_zoom(1),
             Cmd::FileZoomOut => self.step_file_zoom(-1),
             Cmd::FileZoomReset => self.reset_file_zoom(),
-            Cmd::TextSizeIn => self.set_text_scale(zoom::step_up(self.cfg.text_scale)),
-            Cmd::TextSizeOut => self.set_text_scale(zoom::step_down(self.cfg.text_scale)),
+            Cmd::TextSizeIn => self.set_text_scale(zoom::step_text_size(self.cfg.text_scale, true)),
+            Cmd::TextSizeOut => {
+                self.set_text_scale(zoom::step_text_size(self.cfg.text_scale, false))
+            }
             Cmd::TextSizeReset => self.set_text_scale(zoom::DEFAULT),
             Cmd::SendFileToAgent => {
                 let rel = self.editor.active.and_then(|i| {

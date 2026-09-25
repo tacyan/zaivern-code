@@ -923,7 +923,8 @@ impl ZaivernApp {
         }
 
         let avail = ui.available_size();
-        let mini_font = (self.scaled_terminal_font() - 3.0).clamp(8.0, 14.0);
+        let mini_font =
+            zoom::preview_font_size(self.cfg.terminal_font_size, 3.0, 14.0, self.cfg.text_scale);
         // 6 枚以上でも 1 枚ずつは読める高さを保つ。入り切らないぶんは
         // 縦スクロールで見せる (潰さない)。
         let g = cockpit_grid_metrics(avail, n, grid_comfort_cell_h(mini_font));
