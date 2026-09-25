@@ -701,7 +701,7 @@
   "cli.running_instance_does_not_support": "The running instance does not support this operation ({path}).",
   "cli.send_failed": "Failed to send: {e}",
   "cli.sent_to_agent": "Sent to the agent.",
-  "cli.sent_to_session": "Sent: session {id_num}",
+  "cli.sent_to_session": "Accepted for delivery: session {id_num}",
   "cli.session_id_must_be_non_negative": "Session ID must be 0 or greater: {id}",
   "cli.session_id_must_be_number": "Session ID must be a number: {id}",
   "cli.settings_kept": "\nSettings kept: {}",

@@ -593,27 +593,38 @@ impl ZaivernApp {
         if text.is_empty() {
             return json!({"ok": false, "error": "テキストが空です"}).to_string();
         }
-        // submit=false は入力欄へ挿入するだけ (Enter は送らない)
-        let payload = if submit {
-            format!("{text}\r")
-        } else {
-            text.clone()
-        };
         let verb = if submit {
             tr("送信")
         } else {
             tr("入力欄へ")
         };
+        // 確定まで送る分は PC 側と同じ配達機構 (`queue_submit*`) へ合流させる。
+        // 本文と CR を 1 回で書くと、Codex 等は長い本文をまとめてペーストと
+        // 判定して CR を改行として飲み、入力欄に抱えたまま送信しない
+        // (`zai session send` の長文で実際に起きた)。コスト上限の理由は
+        // `bulk` と同じく呼び出し元へそのまま返す。
+        if submit {
+            if let Some(why) = self.cost_block_reason() {
+                return json!({"ok": false, "error": why}).to_string();
+            }
+        }
         if id < 0 {
             // 全エージェントへブロードキャスト
             let n = self.agents.running_count();
             if n == 0 {
                 return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
             }
-            for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
-                // リモートからの手動送信もユーザーの応答扱い
-                s.note_user_input();
-                s.write_bytes(payload.as_bytes());
+            if submit {
+                if self.queue_submit_all(&text).is_none() {
+                    return json!({"ok": false, "error": tr("送信できませんでした")}).to_string();
+                }
+            } else {
+                // submit=false は入力欄へ挿入するだけ (Enter は送らない)
+                for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
+                    // リモートからの手動送信もユーザーの応答扱い
+                    s.note_user_input();
+                    s.write_bytes(text.as_bytes());
+                }
             }
             self.toast(
                 trf(
@@ -629,11 +640,21 @@ impl ZaivernApp {
             json!({"ok": true, "sent": n}).to_string()
         } else {
             // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
-            match self.agents.sessions.iter_mut().find(|s| s.id == id as u64) {
+            let sid = id as u64;
+            match self.agents.sessions.iter_mut().find(|s| s.id == sid) {
                 Some(s) if s.running() => {
-                    s.note_user_input();
-                    s.write_bytes(payload.as_bytes());
                     let title = s.title.clone();
+                    if submit {
+                        // 積めなかった理由は queue_submit がトーストで説明済み
+                        if !self.queue_submit(submit::Job::user(sid, text.clone())) {
+                            return json!({"ok": false, "error": tr("送信できませんでした")})
+                                .to_string();
+                        }
+                    } else {
+                        // submit=false は入力欄へ挿入するだけ (Enter は送らない)
+                        s.note_user_input();
+                        s.write_bytes(text.as_bytes());
+                    }
                     self.toast(format!("🎤 {title} {verb}: {text}"), true);
                     json!({"ok": true, "sent": 1}).to_string()
                 }
@@ -720,15 +741,18 @@ impl ZaivernApp {
             return json!({"ok": false, "error": why}).to_string();
         }
         let sent = match (mode, submit) {
-            // 1 体宛ては従来どおり生書き (`/api/term` と同じバイト列)。
-            // 素のシェルにも効く経路をここで変えない。
-            (remote::BulkMode::One, _) => {
-                let payload = if submit {
-                    format!("{text}\r")
-                } else {
-                    text.clone()
-                };
-                self.bulk_write_raw(&targets, payload.as_bytes())
+            // 1 体宛ての「入れるだけ」は従来どおり生書き (`/api/term` と同じバイト列)。
+            (remote::BulkMode::One, false) => self.bulk_write_raw(&targets, text.as_bytes()),
+            // 1 体宛ての確定送信も配達機構へ合流させる。本文と CR を 1 回で書くと
+            // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+            (remote::BulkMode::One, true) => {
+                let mut n = 0;
+                for id in &targets {
+                    if self.queue_submit(submit::Job::user(*id, text.clone())) {
+                        n += 1;
+                    }
+                }
+                n
             }
             // 一斉送信は Cockpit のブロードキャストと同じ入口へ合流させる。
             // 確定キーの再送・コスト上限・チェックポイントが全部そのまま効く。
@@ -936,18 +960,37 @@ impl ZaivernApp {
     /// remote_reply: TermInput — アクティブなエージェントへ入力を送る。
     pub(super) fn remote_reply_term_input(&mut self, payload: &str, raw: bool) -> String {
         use serde_json::json;
-        match self.agents.active_session() {
-            Some(s) if s.running() => {
+        let Some(sid) = self
+            .agents
+            .active_session()
+            .filter(|s| s.running())
+            .map(|s| s.id)
+        else {
+            return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
+        };
+        // 本文つきの確定送信は配達機構へ合流させる。本文と CR を 1 回で書くと
+        // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+        // キー入力 (raw) と、空白しか無い本文 + Enter は従来どおり生書きする
+        // (空白を捨てずに送る。配達機構は空白だけの本文を積まない)。
+        if !raw && !payload.trim().is_empty() {
+            if self.queue_submit(submit::Job::user(sid, payload)) {
+                return json!({"ok": true}).to_string();
+            }
+            return json!({"ok": false, "error": tr("送信できませんでした")}).to_string();
+        }
+        match self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+            Some(s) => {
                 // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
                 s.note_user_input();
                 if raw {
                     s.write_bytes(payload.as_bytes());
                 } else {
-                    s.write_bytes(format!("{payload}\r").as_bytes());
+                    s.write_bytes(payload.as_bytes());
+                    s.write_bytes(submit::COMMIT);
                 }
                 json!({"ok": true}).to_string()
             }
-            _ => json!({"ok": false, "error": "実行中のセッションがありません"}).to_string(),
+            None => json!({"ok": false, "error": "実行中のセッションがありません"}).to_string(),
         }
     }
 

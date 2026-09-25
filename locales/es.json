@@ -701,7 +701,7 @@
   "cli.running_instance_does_not_support": "La instancia en ejecución no admite esta operación ({path}).",
   "cli.send_failed": "Error al enviar: {e}",
   "cli.sent_to_agent": "Enviado al agente.",
-  "cli.sent_to_session": "Enviado: sesión {id_num}",
+  "cli.sent_to_session": "Envío aceptado: sesión {id_num}",
   "cli.session_id_must_be_non_negative": "El ID de sesión debe ser mayor o igual que 0: {id}",
   "cli.session_id_must_be_number": "El ID de sesión debe ser un número: {id}",
   "cli.settings_kept": "\nAjustes conservados: {}",

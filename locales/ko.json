@@ -701,7 +701,7 @@
   "cli.running_instance_does_not_support": "실행 중인 인스턴스가 이 작업을 지원하지 않습니다 ({path}).",
   "cli.send_failed": "전송에 실패했습니다: {e}",
   "cli.sent_to_agent": "에이전트에 전송했습니다.",
-  "cli.sent_to_session": "전송했습니다: 세션 {id_num}",
+  "cli.sent_to_session": "전송을 접수했습니다: 세션 {id_num}",
   "cli.session_id_must_be_non_negative": "세션 ID는 0 이상입니다: {id}",
   "cli.session_id_must_be_number": "세션 ID는 숫자입니다: {id}",
   "cli.settings_kept": "\n설정은 남겨 두었습니다: {}",

@@ -1419,11 +1419,6 @@ impl ZaivernApp {
         let parsed_cmd = crate::agent_input::SlashCommandEngine::parse(text);
         let expanded_text = crate::agent_input::SlashCommandEngine::expand_command(&parsed_cmd);
 
-        let payload = if submit {
-            format!("{expanded_text}\r")
-        } else {
-            expanded_text.clone()
-        };
         let idx = match agent.map(str::trim).filter(|a| !a.is_empty()) {
             Some(name) => self
                 .agents
@@ -1441,13 +1436,27 @@ impl ZaivernApp {
             self.toast(tr("エージェントセッションが見つかりません"), false);
             return false;
         };
-        let title = {
+        let (sid, title) = {
+            let s = &self.agents.sessions[i];
+            (s.id, s.title.clone())
+        };
+        if submit && !expanded_text.trim().is_empty() {
+            // 確定送信は配達機構へ合流させる。本文と CR を 1 回で書くと
+            // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+            // 積めなかった理由は queue_submit がトーストで説明済み
+            if !self.queue_submit(submit::Job::user(sid, expanded_text.clone())) {
+                return false;
+            }
+        } else {
             let s = &mut self.agents.sessions[i];
             // 明示的な送り込みはユーザーの応答扱い (承認エピソードを解決する)
             s.note_user_input();
-            s.write_bytes(payload.as_bytes());
-            s.title.clone()
-        };
+            s.write_bytes(expanded_text.as_bytes());
+            // 空へ展開されるコマンド (`/clear` 等) でも確定キーは従来どおり送る
+            if submit {
+                s.write_bytes(submit::COMMIT);
+            }
+        }
         self.agents.panel_open = true;
         let verb = if submit {
             tr("送信")

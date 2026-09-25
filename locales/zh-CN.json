@@ -701,7 +701,7 @@
   "cli.running_instance_does_not_support": "正在运行的实例不支持此操作（{path}）。",
   "cli.send_failed": "发送失败：{e}",
   "cli.sent_to_agent": "已发送给智能体。",
-  "cli.sent_to_session": "已发送：会话 {id_num}",
+  "cli.sent_to_session": "已受理发送：会话 {id_num}",
   "cli.session_id_must_be_non_negative": "会话 ID 必须大于等于 0：{id}",
   "cli.session_id_must_be_number": "会话 ID 必须是数字：{id}",
   "cli.settings_kept": "\n已保留设置：{}",
