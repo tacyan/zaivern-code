@@ -4152,3 +4152,65 @@ mod tests {
         );
     }
 }
+
+/// セッション名の共通操作。単クリックの選択は呼び出し側で維持する。
+pub(crate) fn agent_name_rename_requested(response: &egui::Response) -> bool {
+    let mut rename = response.double_clicked();
+    response.clone().on_hover_text(tr("agent.rename.hint"));
+    response.context_menu(|ui| {
+        if ui.button(tr("✏️ 名前を変更…")).clicked() {
+            rename = true;
+            ui.close_menu();
+        }
+    });
+    rename
+}
+
+#[cfg(test)]
+mod agent_name_tests {
+    use super::*;
+
+    fn name(ui: &mut egui::Ui) -> (egui::Rect, bool) {
+        let response = ui.add(
+            egui::Label::new("Codex")
+                .selectable(false)
+                .sense(egui::Sense::click()),
+        );
+        (response.rect, agent_name_rename_requested(&response))
+    }
+
+    #[test]
+    fn single_click_selects_without_rename_and_double_click_requests_rename() {
+        let mut screen = crate::e2e::Screen::new(420.0, 200.0);
+        let ((rect, _), _) = screen.panel(vec![], name);
+        assert!(!screen.click_panel(rect.center(), name).1);
+        assert!(screen.click_panel(rect.center(), name).1);
+    }
+
+    #[test]
+    fn right_click_menu_requests_rename_only_after_choosing_the_item() {
+        let mut screen = crate::e2e::Screen::new(420.0, 240.0);
+        let ((rect, _), _) = screen.panel(vec![], name);
+        let pos = rect.center();
+        for pressed in [true, false] {
+            let ((_, rename), _) = screen.panel(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                name,
+            );
+            assert!(!rename);
+        }
+        let (_, painted) = screen.panel(vec![], name);
+        let item = painted
+            .center_of(&tr("✏️ 名前を変更…"))
+            .expect("rename menu");
+        assert!(screen.click_panel(item, name).1);
+    }
+}

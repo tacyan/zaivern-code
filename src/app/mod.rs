@@ -1895,6 +1895,7 @@ struct CockpitActions {
     select: Option<usize>,
     restart: Option<usize>,
     remove: Option<usize>,
+    rename: Option<usize>,
     cycle: Option<usize>,
     cycle_all: bool,
     /// チェックポイント一覧を開く (Cockpit ヘッダから)。
@@ -3332,6 +3333,7 @@ pub struct ZaivernApp {
     /// エージェントタブのリネーム入力 (セッション ID, 入力中の文字列)。
     /// `None` = 開いていない (窓も 1px も描かない)。
     rename_agent: Option<(u64, String)>,
+    rename_agent_focus: bool,
     /// 自動命名のターン境界検出。`auto_name_sessions` が false のときは
     /// 1 度も触らない (アイドル時のコストはゼロ)。
     turns: crate::agents::naming::TurnWatcher,

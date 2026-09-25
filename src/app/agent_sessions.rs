@@ -266,6 +266,21 @@ impl ZaivernApp {
             return;
         };
         self.rename_agent = Some((s.id, s.title.clone()));
+        self.rename_agent_focus = true;
+    }
+
+    /// どの画面から変更しても手動名を優先し、同じセッションへ保存する。
+    pub(super) fn set_agent_title(&mut self, id: u64, title: &str) {
+        let name = title.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some(session) = self.agents.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        session.title = name.to_owned();
+        self.manual_titles.insert(id);
+        self.persist_session();
     }
 
     pub(super) fn launch_preset(&mut self, i: usize, ctx: &egui::Context) {

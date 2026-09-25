@@ -160,6 +160,7 @@ impl ZaivernApp {
             agent_worktrees: HashMap::new(),
             manual_titles: std::collections::HashSet::new(),
             rename_agent: None,
+            rename_agent_focus: false,
             turns: crate::agents::naming::TurnWatcher::default(),
             namer: crate::agents::naming::Namer::default(),
             named_for: HashMap::new(),

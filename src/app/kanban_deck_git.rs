@@ -392,10 +392,7 @@ impl ZaivernApp {
                 }
                 deck::DeckAction::Launch(i) => self.launch_preset(i, ctx),
                 deck::DeckAction::Rename { id, title } => {
-                    if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == id) {
-                        s.title = title;
-                    }
-                    self.persist_session();
+                    self.set_agent_title(id, &title);
                 }
                 deck::DeckAction::Duplicate(i) => self.duplicate_agent(i, ctx),
                 deck::DeckAction::Stop(i) => self.close_agent(i),
