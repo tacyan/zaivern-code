@@ -343,6 +343,7 @@ impl Snapshot {
         !self.verification_only.is_empty()
     }
 
+    #[cfg(all(test, unix))]
     pub fn stage(&self, destination: &Path) -> Result<(), String> {
         self.stage_changes(destination, &self.files)
     }

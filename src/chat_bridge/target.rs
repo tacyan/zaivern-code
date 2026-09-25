@@ -3,6 +3,10 @@
 use super::cargo_verification::Coverage;
 use super::task::{Control, Outcome, State, TaskExecutor};
 use super::workspace::{Snapshot, FILE_LIMIT, SNAPSHOT_LIMIT};
+use super::{
+    create::{self, CreateOutcome},
+    CleanupTracker, ResourceKind,
+};
 use crate::acp::{AcpClient, Phase};
 use crate::agents::approvals::ApprovalQueue;
 use crate::features::cloud_execution::{
@@ -18,9 +22,12 @@ pub(super) struct LocalExecutionTarget {
     image: String,
     docker: PathBuf,
     endpoint: String,
+    docker_config: Staging,
+    cleanup_failed: std::sync::atomic::AtomicBool,
+    pub(super) cleanup: Option<std::sync::Arc<dyn CleanupTracker>>,
 }
 impl LocalExecutionTarget {
-    pub fn new(image: String) -> Result<Self, String> {
+    pub fn new(image: String, _workspace: &Path) -> Result<Self, String> {
         if !valid_image(&image) {
             return Err("image must be an immutable IMAGE@sha256:DIGEST reference".into());
         }
@@ -28,7 +35,13 @@ impl LocalExecutionTarget {
         return Err("MCP execution is not yet supported on this OS".into());
         #[cfg(unix)]
         {
-            let docker = crate::shellenv::which("docker").ok_or("Docker CLI is required")?;
+            // Manual CLI may select its installation from the supplied PATH,
+            // but never run a login shell or execute an Agent-writable wrapper.
+            let docker = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|directory| directory.join("docker"))
+                .find(|path| path.is_file())
+                .ok_or("Docker CLI is required")?;
+            let docker = super::host::validate_executable(&docker, _workspace)?;
             let endpoint = if let Ok(host) = std::env::var("DOCKER_HOST") {
                 host
             } else {
@@ -59,14 +72,55 @@ impl LocalExecutionTarget {
                 image,
                 docker,
                 endpoint,
+                docker_config: Staging::new()?,
+                cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+                cleanup: None,
             })
         }
+    }
+    /// The managed caller supplies its validated, canonical executable and
+    /// local endpoint. Never rediscover either through PATH or Docker contexts.
+    #[cfg(unix)]
+    pub(super) fn new_managed(
+        image: String,
+        docker: PathBuf,
+        endpoint: String,
+        cleanup: Option<std::sync::Arc<dyn CleanupTracker>>,
+        workspace: &Path,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::FileTypeExt;
+        if !valid_image(&image) || super::host::validate_executable(&docker, workspace)? != docker {
+            return Err("invalid managed executable/image identity".into());
+        }
+        let socket = endpoint
+            .strip_prefix("unix://")
+            .filter(|path| Path::new(path).is_absolute())
+            .ok_or("managed execution requires a local Unix Docker socket")?;
+        if !std::fs::metadata(socket).is_ok_and(|m| m.file_type().is_socket()) {
+            return Err("local Docker socket is unavailable".into());
+        }
+        Ok(Self {
+            image,
+            docker,
+            endpoint,
+            docker_config: Staging::new()?,
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup,
+        })
+    }
+    pub(super) fn cleanup_confirmed(&self) -> bool {
+        !self
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
     fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = crate::procx::hidden_command_raw(&self.docker);
         command
-            .env_remove("DOCKER_HOST")
-            .env_remove("DOCKER_CONTEXT")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            // Docker otherwise injects host proxy credentials into create's
+            // container environment, even with --network=none.
+            .env("DOCKER_CONFIG", &self.docker_config.0)
             .args(["--host", &self.endpoint])
             .args(args);
         #[cfg(unix)]
@@ -86,29 +140,47 @@ impl LocalExecutionTarget {
         Ok(sink.stdout)
     }
 
+    fn create(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        match create::run(self.command(args), timeout, kind, name) {
+            CreateOutcome::Created => {
+                if let Some(cleanup) = &self.cleanup {
+                    cleanup.created(kind, name)?;
+                }
+                Ok(())
+            }
+            CreateOutcome::DefinitelyNotCreated => {
+                if let Some(cleanup) = &self.cleanup {
+                    cleanup.rejected(kind, name)?;
+                }
+                Err("Docker create was rejected".into())
+            }
+            CreateOutcome::Unknown => {
+                Err("Docker create outcome is unknown; cleanup evidence retained".into())
+            }
+        }
+    }
+
     fn upload(
         &self,
         container: &Container<'_>,
-        files: &Path,
+        files: &BTreeMap<PathBuf, Vec<u8>>,
         started: Instant,
     ) -> Result<(), String> {
         let staging = Staging::new()?;
         let archive = staging.0.join("snapshot.tar");
-        let tar = crate::shellenv::which("tar").ok_or("tar is required for snapshot transfer")?;
-        let mut command = crate::procx::hidden_command_raw(&tar);
-        command
-            .arg("-cf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(files)
-            .arg(".");
-        // A private directory populated only from validated regular text files.
+        // Only frozen, policy-validated regular file bytes enter the archive.
+        // No host executable or second traversal of a mutable staging tree.
+        snapshot_archive(
+            std::fs::File::create(&archive).map_err(|_| "cannot create snapshot archive")?,
+            files,
+        )?;
         let mut sink = CollectSink::with_limit(64 * 1024);
-        let result = run_child(command, budget(started, 30)?, "tar", &mut sink)
-            .map_err(|_| "cannot prepare snapshot archive")?;
-        if !result.ok() {
-            return Err("cannot prepare snapshot archive".into());
-        }
         let input = std::fs::File::open(archive).map_err(|_| "cannot open snapshot archive")?;
         let command = self.command(&strings(&[
             "exec",
@@ -151,14 +223,21 @@ impl LocalExecutionTarget {
         volume: Rc<Volume<'a>>,
         readonly: bool,
     ) -> Result<Container<'a>, String> {
+        // No create can be issued when the task budget has already expired.
+        // Reject before the write-ahead intent rather than leaving false debt.
+        let create_timeout = budget(started, 30)?;
         let mount = format!(
             "type=volume,source={},target=/workspace,volume-nocopy{}",
             volume.name,
             if readonly { ",readonly" } else { "" }
         );
+        let (name, labels) = match &self.cleanup {
+            Some(cleanup) => cleanup.register(ResourceKind::Container)?,
+            None => (ids::new_id("zaivern-mcp-"), Vec::new()),
+        };
         let container = Container {
             target: self,
-            id: ids::new_id("zaivern-mcp-"),
+            id: name,
             removed: std::cell::Cell::new(false),
             volume,
         };
@@ -187,6 +266,7 @@ impl LocalExecutionTarget {
                 "--env=CARGO_TARGET_DIR=/target",
             ]));
         }
+        args.extend(labels);
         args.push(self.image.clone());
         if verifier {
             args.push("1800".into());
@@ -194,7 +274,12 @@ impl LocalExecutionTarget {
         // Track our unique name before create: the daemon can create a container
         // even if its response is lost or the CLI times out. Drop still removes it.
         let launch = self
-            .run(&args, budget(started, 30)?)
+            .create(
+                ResourceKind::Container,
+                &container.id,
+                &args,
+                create_timeout,
+            )
             .and_then(|_| self.run(&strings(&["start", &container.id]), budget(started, 30)?));
         if let Err(error) = launch {
             return Err(match container.shutdown() {
@@ -232,7 +317,11 @@ impl LocalExecutionTarget {
 
     // Populate with a trusted sleeping preparer, then destroy that writable
     // handle before any candidate code runs in a readonly-mounted verifier.
-    fn prepare_verifier(&self, files: &Path, started: Instant) -> Result<Container<'_>, String> {
+    fn prepare_verifier(
+        &self,
+        files: &BTreeMap<PathBuf, Vec<u8>>,
+        started: Instant,
+    ) -> Result<Container<'_>, String> {
         let preparer = self.start_container(started, true)?;
         let result = self
             .upload(&preparer, files, started)
@@ -289,7 +378,7 @@ impl LocalExecutionTarget {
         }
         // Shared inputs only; never discover host inputs from the candidate.
         // The entire input volume is readonly.
-        let verifier = self.prepare_verifier(&staging.0, started)?;
+        let verifier = self.prepare_verifier(changes, started)?;
         let (metadata_ok, metadata) = self.cargo(
             &verifier,
             &["metadata", "--format-version=1", "--frozen"],
@@ -423,6 +512,41 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()
 }
 
+fn snapshot_archive(
+    output: impl std::io::Write,
+    files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<(), String> {
+    if files.len() > 8192
+        || files.values().map(Vec::len).sum::<usize>() > super::workspace::VERIFICATION_LIMIT
+    {
+        return Err("snapshot archive limit exceeded".into());
+    }
+    let mut archive = tar::Builder::new(output);
+    for (path, bytes) in files {
+        if path.as_os_str().is_empty()
+            || !super::workspace::allowed_verification(path)
+            || bytes.len() > FILE_LIMIT
+            || std::str::from_utf8(bytes).is_err()
+            || bytes.contains(&0)
+        {
+            return Err("invalid snapshot archive input".into());
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o600);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        archive
+            .append_data(&mut header, path, bytes.as_slice())
+            .map_err(|_| "cannot prepare snapshot archive")?;
+    }
+    archive
+        .finish()
+        .map_err(|_| "cannot finish snapshot archive".into())
+}
+
 struct Container<'a> {
     target: &'a LocalExecutionTarget,
     id: String,
@@ -439,17 +563,21 @@ impl Container<'_> {
 
     fn shutdown(&self) -> Result<(), String> {
         if !self.removed.get() {
-            self.target
-                .run(
-                    &strings(&["rm", "--force", &self.id]),
-                    Duration::from_secs(20),
-                )
-                .map_err(|_| {
-                    format!(
-                        "container cleanup unconfirmed: {}; inspect Docker locally",
-                        self.id
+            if let Some(cleanup) = &self.target.cleanup {
+                cleanup.remove(ResourceKind::Container, &self.id)?;
+            } else {
+                self.target
+                    .run(
+                        &strings(&["rm", "--force", &self.id]),
+                        Duration::from_secs(20),
                     )
-                })?;
+                    .map_err(|_| {
+                        format!(
+                            "container cleanup unconfirmed: {}; inspect Docker locally",
+                            self.id
+                        )
+                    })?;
+            }
             self.removed.set(true);
         }
         if Rc::strong_count(&self.volume) == 1 {
@@ -462,6 +590,9 @@ impl Container<'_> {
 impl Drop for Container<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
+            self.target
+                .cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Release);
             eprintln!("mcp {error}");
         }
     }
@@ -473,44 +604,52 @@ struct Volume<'a> {
 }
 impl<'a> Volume<'a> {
     fn new(target: &'a LocalExecutionTarget, started: Instant) -> Result<Self, String> {
+        let create_timeout = budget(started, 30)?;
+        let (name, labels) = match &target.cleanup {
+            Some(cleanup) => cleanup.register(ResourceKind::Volume)?,
+            None => (ids::new_id("zaivern-mcp-"), Vec::new()),
+        };
         let volume = Self {
             target,
-            name: ids::new_id("zaivern-mcp-"),
+            name,
             removed: std::cell::Cell::new(false),
         };
-        target.run(
-            &strings(&[
-                "volume",
-                "create",
-                "--driver",
-                "local",
-                "--opt",
-                "type=tmpfs",
-                "--opt",
-                "device=tmpfs",
-                "--opt",
-                "o=size=256m,exec,nosuid,nodev",
-                &volume.name,
-            ]),
-            budget(started, 30)?,
-        )?;
+        let mut args = strings(&[
+            "volume",
+            "create",
+            "--driver",
+            "local",
+            "--opt",
+            "type=tmpfs",
+            "--opt",
+            "device=tmpfs",
+            "--opt",
+            "o=size=256m,exec,nosuid,nodev",
+        ]);
+        args.extend(labels);
+        args.push(volume.name.clone());
+        target.create(ResourceKind::Volume, &volume.name, &args, create_timeout)?;
         Ok(volume)
     }
     fn shutdown(&self) -> Result<(), String> {
         if self.removed.get() {
             return Ok(());
         }
-        self.target
-            .run(
-                &strings(&["volume", "rm", &self.name]),
-                Duration::from_secs(20),
-            )
-            .map_err(|_| {
-                format!(
-                    "workspace volume cleanup unconfirmed: {}; inspect Docker locally",
-                    self.name
+        if let Some(cleanup) = &self.target.cleanup {
+            cleanup.remove(ResourceKind::Volume, &self.name)?;
+        } else {
+            self.target
+                .run(
+                    &strings(&["volume", "rm", &self.name]),
+                    Duration::from_secs(20),
                 )
-            })?;
+                .map_err(|_| {
+                    format!(
+                        "workspace volume cleanup unconfirmed: {}; inspect Docker locally",
+                        self.name
+                    )
+                })?;
+        }
         self.removed.set(true);
         Ok(())
     }
@@ -518,6 +657,9 @@ impl<'a> Volume<'a> {
 impl Drop for Volume<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
+            self.target
+                .cleanup_failed
+                .store(true, std::sync::atomic::Ordering::Release);
             eprintln!("mcp {error}");
         }
     }
@@ -527,13 +669,17 @@ struct Staging(PathBuf);
 impl Staging {
     fn new() -> Result<Self, String> {
         let path = std::env::temp_dir().join(ids::new_id("zaivern-mcp-"));
-        std::fs::create_dir(&path).map_err(|_| "cannot create task staging directory")?;
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| "cannot protect staging directory")?;
-        }
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder
+            .create(&path)
+            .map_err(|_| "cannot create private task staging directory")?;
         Ok(Self(path))
     }
 }
@@ -556,14 +702,11 @@ impl TaskExecutor for LocalExecutionTarget {
             return Err("cancelled".into());
         }
         let staging = Staging::new()?;
-        let files = staging.0.join("source");
-        std::fs::create_dir(&files).map_err(|_| "cannot create source staging directory")?;
-        snapshot.stage(&files)?;
         // The image must already exist. Pulling, provisioning and forwarding
         // host auth/environment are deliberately outside task execution.
         let container = self.start_container(started, false)?;
         let result = (|| {
-            self.upload(&container, &files, started)?;
+            self.upload(&container, &snapshot.files, started)?;
             // Reuse the existing agent catalog; no dynamically supplied command.
             let entry = crate::agents::ACP_CATALOG
                 .iter()
@@ -853,6 +996,320 @@ fn regular_tar_payload(tar: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_contains_only_validated_regular_bytes_and_relative_names() {
+        let files = BTreeMap::from([
+            (
+                PathBuf::from("src/空白 ' file.rs"),
+                b"fn main() {}\n".to_vec(),
+            ),
+            (
+                PathBuf::from(format!("{}/file.rs", "long-name".repeat(20))),
+                b"long\n".to_vec(),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        snapshot_archive(&mut bytes, &files).unwrap();
+        let mut decoded = BTreeMap::new();
+        for entry in tar::Archive::new(bytes.as_slice()).entries().unwrap() {
+            use std::io::Read;
+            let mut entry = entry.unwrap();
+            assert!(entry.header().entry_type().is_file());
+            assert_eq!(entry.header().mode().unwrap(), 0o600);
+            let path = entry.path().unwrap().into_owned();
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).unwrap();
+            decoded.insert(path, content);
+        }
+        assert_eq!(decoded, files);
+        for path in ["", "../escape", "/absolute", "a/../../b", ".env", "config/key"] {
+            assert!(snapshot_archive(
+                Vec::new(),
+                &BTreeMap::from([(PathBuf::from(path), b"x".to_vec())])
+            )
+            .is_err());
+        }
+        #[cfg(not(windows))]
+        assert!(snapshot_archive(
+            Vec::new(),
+            &BTreeMap::from([(PathBuf::from("a\\b"), b"x".to_vec())])
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_upload_ignores_malicious_path_executables() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "ZAIVERN_PATH_ATTACK_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = Staging::new().unwrap();
+            let attacker = root.0.join("workspace/bin");
+            std::fs::create_dir_all(&attacker).unwrap();
+            for name in ["tar", "docker"] {
+                let path = attacker.join(name);
+                std::fs::write(
+                    &path,
+                    "#!/bin/sh\nprintf ATTACK > \"$0.SENTINEL\"\nexit 99\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "features::chat_bridge::imp::target::tests::managed_upload_ignores_malicious_path_executables", "--nocapture"])
+                .env(CHILD, &root.0)
+                .env("PATH", std::env::join_paths([attacker.clone(), PathBuf::from("/tmp"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap())
+                .env("CONTROL_PLANE_API_KEY", "runtime-key-must-not-reach-docker")
+                .env("OPENAI_API_KEY", "model-key-must-not-reach-docker")
+                .env("DOCKER_CONFIG", &attacker)
+                .env("DOCKER_HOST", "tcp://attacker:2375");
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for name in ["tar", "docker"] {
+                assert!(!attacker.join(format!("{name}.SENTINEL")).exists());
+                // Positive control: these exact executables really would leave
+                // evidence if the old PATH-based implementation selected them.
+                assert!(!std::process::Command::new(attacker.join(name))
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(attacker.join(format!("{name}.SENTINEL")).exists());
+            }
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap())
+            .canonicalize()
+            .unwrap();
+        crate::shellenv::initialize_test_user_path(std::env::var_os("PATH").unwrap());
+        assert!(
+            LocalExecutionTarget::new(
+                format!("sha256:{}", "a".repeat(64)),
+                &root.join("workspace")
+            )
+            .is_err(),
+            "manual startup must reject the workspace Docker wrapper before executing it"
+        );
+        let docker = root.join("trusted-docker");
+        std::fs::write(&docker, "#!/bin/sh\n[ \"$1\" = --host ] || exit 2\nprintf '%s' \"$2\" > \"$0.endpoint\"\n[ -z \"${CONTROL_PLANE_API_KEY+x}${OPENAI_API_KEY+x}${HOME+x}${DOCKER_HOST+x}\" ] || exit 3\n[ -d \"$DOCKER_CONFIG\" ] && [ ! -e \"$DOCKER_CONFIG/config.json\" ] || exit 4\n/bin/cat > \"$0.archive\"\n").unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("docker.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let endpoint = format!("unix://{}", socket.display());
+        let target = LocalExecutionTarget::new_managed(
+            format!("sha256:{}", "a".repeat(64)),
+            docker.clone(),
+            endpoint.clone(),
+            None,
+            &root.join("workspace"),
+        )
+        .unwrap();
+        let container = Container {
+            target: &target,
+            id: "fixture".into(),
+            removed: std::cell::Cell::new(true),
+            volume: Rc::new(Volume {
+                target: &target,
+                name: "fixture".into(),
+                removed: std::cell::Cell::new(true),
+            }),
+        };
+        let files = BTreeMap::from([(PathBuf::from("bin/tar"), b"untrusted text\n".to_vec())]);
+        target.upload(&container, &files, Instant::now()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(docker.with_extension("endpoint")).unwrap(),
+            endpoint
+        );
+        let archive = std::fs::read(docker.with_extension("archive")).unwrap();
+        let mut entries = tar::Archive::new(archive.as_slice());
+        assert_eq!(entries.entries().unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires local Docker and immutable ACP fixture image"]
+    fn real_managed_task_ignores_path_and_docker_proxy_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        const CHILD: &str = "ZAIVERN_MANAGED_ATTACK_FIXTURE";
+        let image = std::env::var("ZAIVERN_MCP_TEST_IMAGE").unwrap();
+        if std::env::var_os(CHILD).is_none() {
+            let root = Staging::new().unwrap();
+            let workspace = root.0.join("workspace");
+            std::fs::create_dir_all(workspace.join("bin")).unwrap();
+            std::fs::create_dir_all(root.0.join("home/.docker")).unwrap();
+            std::fs::write(root.0.join("home/.docker/config.json"), br#"{"proxies":{"default":{"httpProxy":"http://user:PROXY_CREDENTIAL_SENTINEL@invalid:9","httpsProxy":"http://user:PROXY_CREDENTIAL_SENTINEL@invalid:9"}}}"#).unwrap();
+            for name in ["tar", "docker"] {
+                let path = workspace.join("bin").join(name);
+                std::fs::write(
+                    &path,
+                    "#!/bin/sh\nprintf ATTACK > \"$0.SENTINEL\"\nexit 99\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let trusted = LocalExecutionTarget::new(image, &workspace).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "features::chat_bridge::imp::target::tests::real_managed_task_ignores_path_and_docker_proxy_credentials", "--ignored", "--nocapture"])
+                .env(CHILD, &root.0)
+                .env("ZAIVERN_TEST_DOCKER", trusted.docker.canonicalize().unwrap())
+                .env("ZAIVERN_TEST_ENDPOINT", &trusted.endpoint)
+                .env("HOME", root.0.join("home"))
+                .env("PATH", std::env::join_paths([workspace.join("bin"), PathBuf::from("/tmp"), PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap())
+                .env("CONTROL_PLANE_API_KEY", "RUNTIME_SENTINEL")
+                .env("OPENAI_API_KEY", "INFERENCE_SENTINEL")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for name in ["tar", "docker"] {
+                assert!(!workspace
+                    .join("bin")
+                    .join(format!("{name}.SENTINEL"))
+                    .exists());
+            }
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap())
+            .canonicalize()
+            .unwrap();
+        crate::shellenv::initialize_test_user_path(std::env::var_os("PATH").unwrap());
+        let workspace = root.join("workspace");
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='bridge_fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname='bridge_fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "#[test]\nfn arithmetic() { assert_eq!(2 + 2, 5); }\n",
+        )
+        .unwrap();
+        let target = Arc::new(
+            LocalExecutionTarget::new_managed(
+                image,
+                PathBuf::from(std::env::var_os("ZAIVERN_TEST_DOCKER").unwrap()),
+                std::env::var("ZAIVERN_TEST_ENDPOINT").unwrap(),
+                None,
+                &workspace,
+            )
+            .unwrap(),
+        );
+        {
+            let container = target.start_container(Instant::now(), false).unwrap();
+            let bytes = target
+                .run(
+                    &strings(&["inspect", "--format", "{{json .Config.Env}}", &container.id]),
+                    Duration::from_secs(15),
+                )
+                .unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            for forbidden in [
+                "SENTINEL",
+                "CONTROL_PLANE_API_KEY",
+                "OPENAI_API_KEY",
+                "http_proxy",
+                "HTTP_PROXY",
+                "https_proxy",
+                "HTTPS_PROXY",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden} reached container");
+            }
+            container.shutdown().unwrap();
+        }
+        for instruction in ["Fix the failing test", "WAIT_FOREVER"] {
+            let bridge = super::super::task::ChatBridge::new(workspace.clone(), target.clone());
+            let task = bridge
+                .call(
+                    "zaivern_run_task",
+                    serde_json::json!({"instruction":instruction}),
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(180);
+            loop {
+                let status = bridge.call("zaivern_task_status", task.clone()).unwrap();
+                if instruction == "WAIT_FOREVER" && status["progress"] == "agent executing" {
+                    bridge.call("zaivern_cancel_task", task.clone()).unwrap();
+                }
+                if ["completed", "cancelled", "failed"].contains(&status["state"].as_str().unwrap())
+                {
+                    assert_eq!(
+                        status["state"],
+                        if instruction == "WAIT_FOREVER" {
+                            "cancelled"
+                        } else {
+                            "completed"
+                        },
+                        "{status}"
+                    );
+                    if instruction != "WAIT_FOREVER" {
+                        assert_eq!(status["test_status"], "passed");
+                        assert!(!status["diff_summary"].as_str().unwrap().is_empty());
+                    }
+                    break;
+                }
+                assert!(Instant::now() < deadline, "managed task timed out");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            drop(bridge); // Join the worker before starting the next task.
+        }
+        assert!(target.cleanup_confirmed());
+        assert!(std::fs::read_to_string(workspace.join("src/lib.rs"))
+            .unwrap()
+            .contains("2 + 2, 4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_create_budget_never_registers_cleanup_intent() {
+        struct NoCreate;
+        impl CleanupTracker for NoCreate {
+            fn register(&self, _: ResourceKind) -> Result<(String, Vec<String>), String> {
+                panic!("expired task must not register a create intent")
+            }
+            fn created(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no create was issued")
+            }
+            fn rejected(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no create was issued")
+            }
+            fn remove(&self, _: ResourceKind, _: &str) -> Result<(), String> {
+                panic!("no cleanup resource was registered")
+            }
+        }
+        let target = LocalExecutionTarget {
+            image: "unused".into(),
+            docker: PathBuf::from("unused"),
+            endpoint: "unused".into(),
+            docker_config: Staging::new().unwrap(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: Some(std::sync::Arc::new(NoCreate)),
+        };
+        let expired = Instant::now() - Duration::from_secs(1801);
+        assert!(Volume::new(&target, expired).is_err());
+        let volume = Rc::new(Volume {
+            target: &target,
+            name: "already-removed-fixture".into(),
+            removed: std::cell::Cell::new(true),
+        });
+        assert!(target
+            .start_on_volume(expired, false, volume, false)
+            .is_err());
+        assert!(target.cleanup_confirmed());
+    }
     #[cfg(unix)]
     #[test]
     fn create_response_failure_still_cleans_owned_name_and_reports_failure() {
@@ -878,6 +1335,9 @@ exit 1
             image: "fixture".into(),
             docker: docker.clone(),
             endpoint: "fixture".into(),
+            docker_config: Staging::new().unwrap(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: None,
         };
         let error = target
             .start_container(Instant::now(), false)
@@ -887,9 +1347,13 @@ exit 1
         let removed = std::fs::read_to_string(docker.with_extension("removed")).unwrap();
         assert_eq!(created, removed);
         assert!(created.starts_with("zaivern-mcp-"));
-        assert!(error.contains("Docker operation failed"), "{error}");
+        assert!(
+            error.contains("Docker create outcome is unknown"),
+            "{error}"
+        );
         assert!(error.contains("container cleanup unconfirmed"), "{error}");
         assert!(error.contains(&created), "{error}");
+        assert!(!target.cleanup_confirmed());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -929,6 +1393,9 @@ exit 1
                 image: "fixture".into(),
                 docker,
                 endpoint: "fixture".into(),
+                docker_config: Staging::new().unwrap(),
+                cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+                cleanup: None,
             };
             let container = Container {
                 target: &target,
@@ -951,6 +1418,10 @@ exit 1
                 "before"
             );
             drop(container);
+            assert!(
+                !target.cleanup_confirmed(),
+                "{failure} cleanup must reach server exit status"
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -982,6 +1453,9 @@ exit 1
             image: "fixture".into(),
             docker: docker.clone(),
             endpoint: "fixture".into(),
+            docker_config: Staging::new().unwrap(),
+            cleanup_failed: std::sync::atomic::AtomicBool::new(false),
+            cleanup: None,
         };
         let attack = br#"#[test] fn oracle() {
             let hidden = std::fs::read("vendor/local_dep/src/lib.rs").unwrap();

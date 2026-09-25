@@ -63,10 +63,7 @@ pub trait ExecutionTransport: Send + Sync {
 /// 実行先に合う Transport を返す。**ここが Provider 名で分岐しない唯一の理由**
 /// — 見ているのは [`ExecutionTarget::transport`] だけで、その値を誰が作ったか
 /// (Hetzner か静的 SSH か) は 1 バイトも見ていない。
-pub fn for_target(
-    target: &ExecutionTarget,
-    timeout: Duration,
-) -> Box<dyn ExecutionTransport> {
+pub fn for_target(target: &ExecutionTarget, timeout: Duration) -> Box<dyn ExecutionTransport> {
     match target.transport {
         TransportKind::Local => Box::new(LocalTransport::new(timeout)),
         TransportKind::Ssh => Box::new(SshTransport::new(timeout)),
@@ -79,6 +76,7 @@ enum Chunk {
     Err(Vec<u8>),
     OutEof,
     ErrEof,
+    ReadFailed,
 }
 
 /// 子プロセスを走らせ、出力を流しながら上限つきで待つ。
@@ -142,8 +140,12 @@ pub(crate) fn run_child_with_stdin(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            // 両方の読み手が落ちた (相手が消えた)。終了状態の確認へ進む。
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(Chunk::ReadFailed) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // A missing/read-failed response is not a completed command,
+                // even when the process subsequently returns a nonzero status.
+                let _ = kill_and_timeout(child, label, timeout);
+                return Err(CloudError::io(format!("{label} output unavailable")));
+            }
         }
     }
 
@@ -155,7 +157,7 @@ pub(crate) fn run_child_with_stdin(
                 return Ok(ExecResult {
                     exit_code: status.code(),
                     duration_ms,
-                })
+                });
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
@@ -186,14 +188,19 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
     is_stdout: bool,
 ) {
     let Some(mut stream) = stream else {
-        let _ = tx.send(if is_stdout { Chunk::OutEof } else { Chunk::ErrEof });
+        let _ = tx.send(Chunk::ReadFailed);
         return;
     };
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    let _ = tx.send(Chunk::ReadFailed);
+                    return;
+                }
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
                     let sent = tx.send(if is_stdout {
@@ -207,7 +214,11 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 }
             }
         }
-        let _ = tx.send(if is_stdout { Chunk::OutEof } else { Chunk::ErrEof });
+        let _ = tx.send(if is_stdout {
+            Chunk::OutEof
+        } else {
+            Chunk::ErrEof
+        });
     });
 }
 
@@ -369,16 +380,42 @@ mod tests {
         let mut sink = CollectSink::default();
         let r = run_child(cmd, Duration::from_secs(30), "test", &mut sink).expect("走る");
         assert_eq!(r.exit_code, Some(3));
-        assert!(sink.stdout_text().contains("hello"), "{}", sink.stdout_text());
+        assert!(
+            sink.stdout_text().contains("hello"),
+            "{}",
+            sink.stdout_text()
+        );
     }
 
     #[test]
     fn 無い道具は設定の誤りとして返る() {
         let cmd = Command::new("zaivern-no-such-program-xyz");
         let mut sink = CollectSink::default();
-        let e = run_child(cmd, Duration::from_secs(5), "zaivern-no-such-program-xyz", &mut sink)
-            .expect_err("失敗する");
+        let e = run_child(
+            cmd,
+            Duration::from_secs(5),
+            "zaivern-no-such-program-xyz",
+            &mut sink,
+        )
+        .expect_err("失敗する");
         // 「実行時エラー」ではなく「設定の誤り」= 終了コード 3
         assert_eq!(e.exit_code(), 3, "{e:?}");
+    }
+
+    #[test]
+    fn reader_failure_is_not_reported_as_eof() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected read failure"))
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        spawn_reader(Some(Broken), tx, true);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Chunk::ReadFailed
+        ));
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_err());
     }
 }
