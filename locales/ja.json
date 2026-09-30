@@ -1,4 +1,8 @@
 {
+  "shell.open_detached": "Shell を別ウィンドウで開く",
+  "shell.detached": "別ウィンドウで操作中",
+  "shell.return": "Cockpit に戻す",
+  "shell.pet_hint": "ザイガニ 🐾 — クリック: Cockpit/承認待ちへ / 右クリック: Shell を別ウィンドウで開く / ダブルクリック: ご機嫌 / ドラッグ: 移動",
   "agent.rename.hint": "ダブルクリックで名前を変更。右クリックの「名前を変更」からも編集できます。",
   "chatgpt.runtime_auth_only": "Runtime API Key は Tunnel 認証専用です。OpenAI の推論 API は使用しません。",
   "chatgpt.existing_setup": "既存設定が見つかりました。\n[1] 検証\n[2] 修復\n[3] 再設定\n[4] キャンセル",

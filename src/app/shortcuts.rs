@@ -507,10 +507,14 @@ impl ZaivernApp {
         if consume(ctx, self.keys.binding(BindAction::Find)) {
             // 端末フォーカス中の Cmd+F は端末内検索 (前フレームで terminal::draw が
             // 残したフォーカス中セッションIDで振り分ける)。それ以外はエディタ検索。
-            let term_sid: Option<u64> =
-                ctx.data(|d| d.get_temp(egui::Id::new("zv-focused-terminal")));
+            let focus_key = terminal::focused_terminal_key(ctx);
+            let term_sid: Option<u64> = ctx.data(|d| d.get_temp(focus_key));
             let routed = term_sid
-                .and_then(|sid| self.agents.sessions.iter_mut().find(|s| s.id == sid))
+                .and_then(|sid| {
+                    self.agents.sessions.iter_mut().find(|s| {
+                        s.id == sid && s.shell_viewport.is_none_or(|v| v == ctx.viewport_id())
+                    })
+                })
                 .map(|s| {
                     s.search.open = true;
                     s.search.focus_pending = true;
@@ -525,7 +529,8 @@ impl ZaivernApp {
         // エディタでの ⌘↑ / ⌘↓ (他 OS では Ctrl+↑/↓) まで飲み込む。
         // 前フレームで terminal::draw が残したセッション ID で振り分ける
         // (Cmd+F の端末内検索と同じ経路)。
-        if let Some(sid) = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("zv-focused-terminal"))) {
+        let focus_key = terminal::focused_terminal_key(ctx);
+        if let Some(sid) = ctx.data(|d| d.get_temp::<u64>(focus_key)) {
             // シェル統合が来ていなければ候補が無く、`shell_jump_prompt` は
             // false を返して**何も起きない** (嘘の移動をしない)。
             let mut jump: Option<bool> = None;
@@ -536,7 +541,9 @@ impl ZaivernApp {
                 jump = Some(true);
             }
             if let Some(forward) = jump {
-                if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+                if let Some(s) = self.agents.sessions.iter_mut().find(|s| {
+                    s.id == sid && s.shell_viewport.is_none_or(|v| v == ctx.viewport_id())
+                }) {
                     s.shell_jump_prompt(forward);
                 }
             }

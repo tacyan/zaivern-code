@@ -1888,6 +1888,7 @@ const CONFLICT_ROWS_MAX: usize = 6;
 
 #[derive(Default)]
 struct CockpitActions {
+    detach: Option<u64>,
     launch: Option<usize>,
     focus: Option<usize>,
     /// グリッドのセルを選んだら、そのセッションをアクティブ (紫枠) にする。
@@ -4310,6 +4311,7 @@ mod cmd_dispatch;
 mod cmd_palette;
 mod cockpit;
 mod code_editor;
+mod detached_shell;
 mod editor_layout;
 mod file_ops;
 mod file_viewers;

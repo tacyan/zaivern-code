@@ -1,4 +1,8 @@
 {
+  "shell.open_detached": "별도 창에서 Shell 열기",
+  "shell.detached": "별도 창에서 조작 중",
+  "shell.return": "Cockpit으로 돌아가기",
+  "shell.pet_hint": "Zaigani 🐾 — 클릭: Cockpit/승인 대기 / 오른쪽 클릭: 별도 창에서 Shell 열기 / 두 번 클릭: 기쁨 / 드래그: 이동",
   "agent.rename.hint": "두 번 클릭하여 이름을 변경하거나, 마우스 오른쪽 버튼을 클릭한 뒤 이름 변경을 선택하세요.",
   "chatgpt.runtime_auth_only": "Runtime API Key는 터널 인증 전용입니다. OpenAI 추론 API를 사용하지 않습니다.",
   "chatgpt.existing_setup": "기존 설정을 찾았습니다.\n[1] 검증\n[2] 복구\n[3] 재설정\n[4] 취소",

@@ -427,6 +427,8 @@ pub struct Session {
     /// セッション毎に一意な安定ID(呼び出し側が採番)。sessions の index は
     /// 削除で前へ詰まるため、バブル却下記録などの識別にはこちらを使う。
     pub id: u64,
+    /// 表示先だけを切り替える。PTY と履歴の所有権・寿命は変えない。
+    pub(crate) shell_viewport: Option<egui::ViewportId>,
     pub title: String,
     pub preset_name: String,
     pub icon: String,
@@ -2413,6 +2415,7 @@ impl Session {
 
         Ok(Self {
             id,
+            shell_viewport: None,
             title: spec.title,
             preset_name: spec.preset_name,
             icon: spec.icon,
@@ -10875,6 +10878,15 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// ショートカットの宛先を viewport ごとに分離する。
+pub(crate) fn focused_terminal_key(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("zv-focused-terminal", ctx.viewport_id()))
+}
+
+#[cfg(test)]
+#[path = "terminal_detached_shell_tests.rs"]
+mod detached_shell_tests;
+
 /// Render a terminal session. `interactive` forwards keyboard input on focus,
 /// `allow_resize` lets this view drive the PTY size.
 /// `hover_scroll`: ホバーだけでホイールを履歴スクロールに使うか。
@@ -10889,6 +10901,19 @@ pub fn draw(
     allow_resize: bool,
     hover_scroll: bool,
 ) -> egui::Response {
+    if session
+        .shell_viewport
+        .is_some_and(|owner| owner != ui.ctx().viewport_id())
+    {
+        // 他のビューは入力・IME・選択・PTY サイズを変更しない。
+        let focus_key = focused_terminal_key(ui.ctx());
+        ui.data_mut(|data| {
+            if data.get_temp::<u64>(focus_key) == Some(session.id) {
+                data.remove::<u64>(focus_key);
+            }
+        });
+        return ui.label(tr("shell.detached"));
+    }
     let (font_id, cell_w, cell_h) = cell_metrics(ui, font_size);
 
     let avail = ui.available_size();
@@ -11020,7 +11045,7 @@ pub fn draw(
     // Cmd+F ルーティング用に「どの端末がフォーカス中か」を egui 一時データへ
     // 残す。app 側のグローバルショートカット処理は (パネル描画より先に走るので)
     // 前フレームのこの値を読んで、エディタ検索か端末内検索かを振り分ける。
-    let focus_flag = egui::Id::new("zv-focused-terminal");
+    let focus_flag = focused_terminal_key(ui.ctx());
     if focused {
         ui.data_mut(|d| d.insert_temp(focus_flag, session.id));
     } else if ui.data(|d| d.get_temp::<u64>(focus_flag)) == Some(session.id) {
