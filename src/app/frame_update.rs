@@ -729,10 +729,10 @@ impl ZaivernApp {
                 &mut self.pet_rt,
             );
             if r.open_shell {
-                if self.agents.sessions.is_empty() {
-                    self.new_terminal(ctx);
-                }
-                if let Some(s) = self.agents.sessions.get(self.agents.active) {
+                let new_session_index = self.agents.sessions.len();
+                self.new_terminal(ctx);
+                // 起動に失敗した場合、選択中のエージェントを取り出さない。
+                if let Some(s) = self.agents.sessions.get(new_session_index) {
                     self.open_detached_shell(s.id, ctx);
                 }
             }
