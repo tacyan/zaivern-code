@@ -193,17 +193,22 @@ fn 八枚のときホイールでページがスクロールする() {
     );
 }
 
-/// Cockpit のミニターミナルは **allow_resize=false / hover_scroll=false** で描く。
+/// Cockpit のミニターミナルは **allow_resize=false / hover_scroll=active** で描く。
 ///
-/// hover_scroll を true にすると、タイルの上でホイールを回したときに端末の
-/// 履歴だけが動き、ページがスクロールできなくなる (タイルは画面の大半を
+/// hover_scroll を**全タイル**で true にすると、タイルの上でホイールを回したときに
+/// 端末の履歴だけが動き、ページがスクロールできなくなる (タイルは画面の大半を
 /// 覆っているので、事実上「6 枚目以降が見られない」に戻る)。
+///
+/// 逆に false 固定だと、エージェントをクリックして選んでも (見出しを押した
+/// だけでは端末にフォーカスが無い) その中身を遡れず、ページ全体が動く
+/// (利用者からの報告)。そこで**選ばれている (紫枠) 1 枚だけ**がホバーで受け、
+/// 他のタイルの上ではページが動く。
 ///
 /// allow_resize は `app::deck_wiring_tests::ライブ枠は端末の大きさを持たない`
 /// の側で理由を書いている (小さな枠へ PTY を縮めると、CLI エージェントの
 /// 会話が履歴へ二重に積まれる)。
 #[test]
-fn ミニターミナルはホイールを外側へ譲る() {
+fn ミニターミナルは選ばれたタイルだけがホイールを受ける() {
     let src = crate::app::SRC.replace("\r\n", "\n");
     let body = src
         .split("fn cockpit_grid_ui(")
@@ -216,8 +221,12 @@ fn ミニターミナルはホイールを外側へ譲る() {
     // 改行位置に依存しないよう空白を潰してから照合する
     let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        flat.contains("mini_font, true, false, false"),
-        "Cockpit のミニターミナルは hover_scroll=false (最後の引数) で描くこと"
+        flat.contains("mini_font, true, false, active"),
+        "Cockpit のミニターミナルは hover_scroll=active (最後の引数) で描くこと"
+    );
+    assert!(
+        !flat.contains("mini_font, true, false, true"),
+        "全タイルがホイールを奪うとページをスクロールできなくなる"
     );
 }
 

@@ -5855,6 +5855,73 @@ mod tests {
         }
     }
 
+    /// Cockpit のミニ端末の上でスクロールすると、端末だけでなく画面全体まで
+    /// 動いていた (利用者からの報告)。
+    #[test]
+    fn ホイールの残りが後続フレームで外側へ漏れない() {
+        // 実 egui で再現する: 外側の縦 ScrollArea の中に、ホイールを受ける
+        // 領域 (端末の代役) を置き、行単位のホイールを 1 ノッチだけ送る。
+        // egui はその量を数フレームに小分けして流すので、`raw_scroll_delta`
+        // が立ったフレームでだけ消すと残りで外側が動く。
+        fn run(consume_every_frame: bool) -> f32 {
+            let ctx = egui::Context::default();
+            let area = egui::Id::new("wheel-leak-outer");
+            let mut offset = 0.0;
+            for frame in 0..30 {
+                let mut input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 300.0),
+                    )),
+                    ..Default::default()
+                };
+                input
+                    .events
+                    .push(egui::Event::PointerMoved(egui::pos2(100.0, 100.0)));
+                if frame == 1 {
+                    input.events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -3.0),
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                input.predicted_dt = 1.0 / 60.0;
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let out = egui::ScrollArea::vertical().id_salt(area).show(ui, |ui| {
+                            let (_, resp) = ui.allocate_exact_size(
+                                egui::vec2(380.0, 2000.0),
+                                egui::Sense::hover(),
+                            );
+                            if resp.hovered() {
+                                if consume_every_frame {
+                                    super::consume_wheel(ui);
+                                } else if ui.input(|i| i.raw_scroll_delta.y.abs() > 0.5) {
+                                    // 直す前の形: 生の移動量があるフレームだけ消す
+                                    super::consume_wheel(ui);
+                                }
+                            }
+                        });
+                        offset = out.state.offset.y;
+                    });
+                });
+            }
+            offset
+        }
+        // 対照: 直す前の形は漏れる (再現できない環境なら検査が空回りする)
+        assert!(run(false) > 1.0, "対照が漏れを再現していない");
+        assert_eq!(run(true), 0.0, "ホイールの残りが外側の ScrollArea へ漏れた");
+    }
+
+    /// デッキ / Cockpit のタイルは**選ばれているとき**ホバーでホイールを受ける
+    /// (`hover_scroll = active`)。選ばれていないタイルの上ではページが動く。
+    #[test]
+    fn 選ばれているタイルはホバーでホイールを受ける() {
+        use super::wheel_belongs_here as w;
+        assert!(w(false, true, 0, false), "選択中のタイル");
+        assert!(!w(false, false, 0, false), "選ばれていないタイル");
+    }
+
     /// デッキ / Cockpit のタイル (`hover_scroll = false`) でも、
     /// **Shift 付き**と**遡っている最中**はその端末がホイールを受ける。
     /// ここが false のままだと、タイルの中身を上へ辿って選ぶことができない。
@@ -9464,13 +9531,25 @@ fn handle_wheel_scroll(
                 session.set_scroll(0);
             }
         }
-        // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する。
-        // Shift 付きは egui が x へ寄せているので**両軸とも**消す。
-        ui.input_mut(|i| {
-            i.raw_scroll_delta = egui::Vec2::ZERO;
-            i.smooth_scroll_delta = egui::Vec2::ZERO;
-        });
     }
+    consume_wheel(ui);
+}
+
+/// ホイールをこのフレームから消す (外側 ScrollArea へ渡さない)。
+fn consume_wheel(ui: &egui::Ui) {
+    // 外側 ScrollArea との二重スクロールを防ぐためホイールを消費する。
+    // Shift 付きは egui が x へ寄せているので**両軸とも**消す。
+    //
+    // **`dy` が 0 のフレームでも消す。** egui 0.29 はマウスホイール
+    // (行単位) の移動量を `unprocessed_scroll_delta` に溜め、**後続の
+    // 数フレームへ `smooth_scroll_delta` として小分けに流す**
+    // (`input_state/mod.rs`)。`raw_scroll_delta` が立つのは最初の 1 フレーム
+    // だけなので、そこでだけ消すと残りが外側の ScrollArea へ漏れ、
+    // 「端末の上でスクロールしたのに画面全体も動く」になる (実際に報告された)。
+    ui.input_mut(|i| {
+        i.raw_scroll_delta = egui::Vec2::ZERO;
+        i.smooth_scroll_delta = egui::Vec2::ZERO;
+    });
 }
 
 /// セル `(row, col)` を描くときに実際に使ってよい桁数を決める純関数。
