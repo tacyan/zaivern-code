@@ -728,6 +728,14 @@ impl ZaivernApp {
                 self.pet_tex.as_ref(),
                 &mut self.pet_rt,
             );
+            if r.open_shell {
+                let new_session_index = self.agents.sessions.len();
+                self.new_terminal(ctx);
+                // 起動に失敗した場合、選択中のエージェントを取り出さない。
+                if let Some(s) = self.agents.sessions.get(new_session_index) {
+                    self.open_detached_shell(s.id, ctx);
+                }
+            }
             // ペットの矩形は egui が Area の実測として持っている。
             // 大きさを app.rs 側で決め打ちしない (pet.rs の寸法と二重管理にしない)。
             if let Some(rect) = ctx.memory(|m| m.area_rect(egui::Id::new("zv-pet"))) {
@@ -880,6 +888,7 @@ impl ZaivernApp {
         // (`idle_repaint_ms` は animating のとき `None` を返す)。
         // 非表示のときは 1 本も予約しないので、完全アイドルの 0fps は保たれる。
         self.tutorial_tick(ctx);
+        self.detached_shells_ui(ctx);
 
         // 今フレームのズームジェスチャの持ち主を確定させる。描かなかった
         // フレームでは None になり、看板や画像タブに切り替えたあとも

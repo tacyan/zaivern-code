@@ -1,4 +1,8 @@
 {
+  "shell.open_detached": "Abrir Shell en otra ventana",
+  "shell.detached": "Abierto en otra ventana",
+  "shell.return": "Volver a Cockpit",
+  "shell.pet_hint": "Zaigani 🐾 — Clic: Cockpit/aprobación / Clic derecho: abrir Shell en otra ventana / Doble clic: alegría / Arrastrar: mover",
   "agent.rename.hint": "Haz doble clic para cambiar el nombre, o clic derecho y elige Cambiar nombre.",
   "chatgpt.runtime_auth_only": "La Runtime API Key solo autentica el túnel. No se usa la API de inferencia de OpenAI.",
   "chatgpt.existing_setup": "Se detectó una configuración existente.\n[1] Verificar\n[2] Reparar\n[3] Reconfigurar\n[4] Cancelar",

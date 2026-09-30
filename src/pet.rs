@@ -139,6 +139,7 @@ pub struct PetRuntime {
 #[derive(Default)]
 pub struct PetResponse {
     pub clicked: bool,
+    pub open_shell: bool,
     pub dragged: bool,
     /// ドラッグが終わったフレーム(位置の保存契機)
     pub drag_released: bool,
@@ -440,6 +441,7 @@ pub fn draw(
 
     let (resp, anchor) = inner;
     let clicked = resp.clicked();
+    let open_shell = resp.secondary_clicked();
     let dragged = resp.dragged();
     let drag_released = resp.drag_stopped();
 
@@ -467,9 +469,7 @@ pub fn draw(
         }
     }
 
-    resp.on_hover_text(
-        "ザイガニ 🐾 — クリック: Cockpit/承認待ちへ / ダブルクリック: ご機嫌 / ドラッグ: 移動\n(🐾 メニューで表示・見た目・画像変更)",
-    );
+    resp.on_hover_text(crate::i18n::tr("shell.pet_hint"));
 
     // 再描画は「本当に絵が変わるとき」だけ要求する。
     let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
@@ -483,6 +483,7 @@ pub fn draw(
 
     PetResponse {
         clicked,
+        open_shell,
         dragged,
         drag_released,
         double_clicked,
@@ -866,6 +867,45 @@ mod tests {
             scale: 1.0,
             free_roam: false,
             sleep_enabled: false,
+        }
+    }
+
+    #[test]
+    fn right_click_opens_shell_without_triggering_left_click() {
+        let ctx = egui::Context::default();
+        let theme = crate::theme::by_name("dark");
+        let mut pos = Some(egui::pos2(100.0, 100.0));
+        let mut rt = PetRuntime::default();
+        let mut run = |events| {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let mut response = PetResponse::default();
+            let _ = ctx.run(raw, |ctx| {
+                response = draw(ctx, &theme, &base_input(), &mut pos, None, &mut rt);
+            });
+            response
+        };
+        run(Vec::new());
+        run(Vec::new());
+        let center = ctx
+            .memory(|m| m.area_rect(egui::Id::new("zv-pet")))
+            .expect("pet area")
+            .center();
+        for pressed in [true, false] {
+            let response = run(vec![
+                egui::Event::PointerMoved(center),
+                egui::Event::PointerButton {
+                    pos: center,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            assert!(!response.clicked);
+            assert_eq!(response.open_shell, !pressed);
         }
     }
 

@@ -1130,6 +1130,14 @@ impl ZaivernApp {
                                                 }
                                                 if btn(
                                                     ui,
+                                                    "shell",
+                                                    "↗".into(),
+                                                    tr("shell.open_detached"),
+                                                ) {
+                                                    acts.detach = Some(sid);
+                                                }
+                                                if btn(
+                                                    ui,
                                                     "voice",
                                                     if self.voice.target
                                                         == voice::Target::Session(sid)
@@ -1416,7 +1424,9 @@ impl ZaivernApp {
                 let focus = l.focus();
                 terminal::apply_sizes(l, area, terminal::GUTTER, cw, ch, &mut |pid, r, c| {
                     if let Some(s) = self.agents.sessions.iter_mut().find(|s| s.id == pid) {
-                        s.resize(r, c);
+                        if s.shell_viewport.is_none() {
+                            s.resize(r, c);
+                        }
                     }
                 });
                 // クリックでフォーカスが移ったペインへ紫枠も追従させる。
@@ -1650,6 +1660,9 @@ impl ZaivernApp {
             if i < self.agents.sessions.len() {
                 self.agents.active = i;
             }
+        }
+        if let Some(sid) = acts.detach {
+            self.open_detached_shell(sid, ctx);
         }
         if let Some(i) = acts.focus {
             self.apply_cmd(Cmd::FocusAgent(i), ctx);

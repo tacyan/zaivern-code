@@ -113,6 +113,7 @@ pub(crate) const SRC_IMPL: &str = concat!(
     include_str!("sidebar_ui.rs"),
     include_str!("bottom_panels.rs"),
     include_str!("cockpit.rs"),
+    include_str!("detached_shell.rs"),
     include_str!("changes_center.rs"),
     include_str!("kanban_deck_git.rs"),
     include_str!("editor_layout.rs"),
@@ -156,6 +157,7 @@ pub(crate) const SRC: &str = concat!(
     include_str!("sidebar_ui.rs"),
     include_str!("bottom_panels.rs"),
     include_str!("cockpit.rs"),
+    include_str!("detached_shell.rs"),
     include_str!("changes_center.rs"),
     include_str!("kanban_deck_git.rs"),
     include_str!("editor_layout.rs"),
@@ -1888,6 +1890,7 @@ const CONFLICT_ROWS_MAX: usize = 6;
 
 #[derive(Default)]
 struct CockpitActions {
+    detach: Option<u64>,
     launch: Option<usize>,
     focus: Option<usize>,
     /// グリッドのセルを選んだら、そのセッションをアクティブ (紫枠) にする。
@@ -4310,6 +4313,7 @@ mod cmd_dispatch;
 mod cmd_palette;
 mod cockpit;
 mod code_editor;
+mod detached_shell;
 mod editor_layout;
 mod file_ops;
 mod file_viewers;

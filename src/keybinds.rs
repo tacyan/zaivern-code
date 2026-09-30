@@ -2411,8 +2411,8 @@ pub fn consume_shortcut_compat(i: &mut egui::InputState, sc: KeyboardShortcut) -
 /// 変換中フラグの置き場所 (egui の一時データ)。アプリの構造体に持たせないのは、
 /// 「ショートカットを消費してよいか」の判断材料が消費地点の隣にある方が
 /// 落ちにくいため (状態と規則が離れると片方だけ直されて壊れる)。
-fn ime_state_id() -> egui::Id {
-    egui::Id::new("zv-ime-composing")
+fn ime_state_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("zv-ime-composing", ctx.viewport_id()))
 }
 
 /// このフレームを処理し終えた時点で「まだ変換中」か。
@@ -2453,8 +2453,8 @@ fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> boo
     })
 }
 
-fn ime_frame_block_id() -> egui::Id {
-    egui::Id::new("zv-ime-frame-block")
+fn ime_frame_block_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("zv-ime-frame-block", ctx.viewport_id()))
 }
 
 /// IME 変換中か (変換中フラグを次フレームへ持ち越しつつ判定する)。
@@ -2468,25 +2468,23 @@ fn ime_frame_block_id() -> egui::Id {
 /// `handle_shortcuts` 以外の場所 — ファイルツリーのキー処理など — から
 /// 「いま変換中か」を見たいときは必ずこちらを使う。
 pub fn ime_blocks_shortcuts_peek(ctx: &egui::Context) -> bool {
+    let state_id = ime_state_id(ctx);
+    let block_id = ime_frame_block_id(ctx);
     // handle_shortcuts が状態を進めた後も、変換を終えたフレームの保護を維持する。
     let pass = ctx.cumulative_pass_nr();
-    if let Some((cached_pass, blocked)) =
-        ctx.data(|d| d.get_temp::<(u64, bool)>(ime_frame_block_id()))
-    {
+    if let Some((cached_pass, blocked)) = ctx.data(|d| d.get_temp::<(u64, bool)>(block_id)) {
         if cached_pass == pass {
             return blocked;
         }
     }
-    let was = ctx
-        .data(|d| d.get_temp::<bool>(ime_state_id()))
-        .unwrap_or(false);
+    let was = ctx.data(|d| d.get_temp::<bool>(state_id)).unwrap_or(false);
     ctx.input(|i| ime_blocks_shortcuts(&i.events, was))
 }
 
 pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
-    let was = ctx
-        .data(|d| d.get_temp::<bool>(ime_state_id()))
-        .unwrap_or(false);
+    let state_id = ime_state_id(ctx);
+    let block_id = ime_frame_block_id(ctx);
+    let was = ctx.data(|d| d.get_temp::<bool>(state_id)).unwrap_or(false);
     let (blocked, next) = ctx.input(|i| {
         (
             ime_blocks_shortcuts(&i.events, was),
@@ -2495,8 +2493,8 @@ pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
     });
     let pass = ctx.cumulative_pass_nr();
     ctx.data_mut(|d| {
-        d.insert_temp(ime_state_id(), next);
-        d.insert_temp(ime_frame_block_id(), (pass, blocked));
+        d.insert_temp(state_id, next);
+        d.insert_temp(block_id, (pass, blocked));
     });
     blocked
 }

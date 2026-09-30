@@ -1,4 +1,8 @@
 {
+  "shell.open_detached": "在独立窗口中打开 Shell",
+  "shell.detached": "正在独立窗口中操作",
+  "shell.return": "返回 Cockpit",
+  "shell.pet_hint": "Zaigani 🐾 — 单击：Cockpit/待批准 / 右键：在独立窗口中打开 Shell / 双击：开心 / 拖动：移动",
   "agent.rename.hint": "双击可重命名，也可右键单击并选择“重命名”。",
   "chatgpt.runtime_auth_only": "Runtime API Key 仅用于隧道认证，不调用 OpenAI 推理 API。",
   "chatgpt.existing_setup": "检测到现有配置。\n[1] 验证\n[2] 修复\n[3] 重新配置\n[4] 取消",
