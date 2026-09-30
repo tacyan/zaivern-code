@@ -116,10 +116,10 @@ fn ライブ枠は端末の大きさを持たない() {
     let owners = src.matches("let resp = terminal::draw(ui, s, &theme, font, true, true, true);");
     assert_eq!(owners.count(), 1, "端末の大きさを持つビューが 1 つではない");
     for preview in [
-        // Cockpit のミニ端末グリッド
-        "terminal::draw(\n                                            ui, s, theme, mini_font, true, false, false,\n                                        )",
+        // Cockpit のミニ端末グリッド (hover_scroll は「選ばれているか」)
+        "terminal::draw(\n                                            ui, s, theme, mini_font, true, false, active,\n                                        )",
         // Cockpit の分割タイル
-        "terminal::draw(ui, s, theme, mini_font, true, false, false);",
+        "terminal::draw(ui, s, theme, mini_font, true, false, hover_scroll);",
         // 看板 / デッキのライブ枠 (2 か所とも同じ形)
         "terminal::draw(ui, s, &live_theme, mini_font, true, false, false)",
     ] {

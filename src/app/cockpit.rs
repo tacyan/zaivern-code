@@ -1229,8 +1229,16 @@ impl ZaivernApp {
                                         // 合わせて縮めると、枠より高いフレームを
                                         // 描き直す CLI エージェントの会話が履歴へ
                                         // 二重に積まれる (grid_rect の説明を参照)。
+                                        //
+                                        // ホイールは**選ばれている (紫枠) タイル
+                                        // だけ**がホバーで受ける (`hover_scroll =
+                                        // active`)。見出しをクリックして選んだ
+                                        // だけでは端末にフォーカスが無いので、
+                                        // フォーカス条件だけだと中身ではなく
+                                        // ページ全体が動いていた。選ばれていない
+                                        // タイルの上では従来どおりページが動く。
                                         terminal::draw(
-                                            ui, s, theme, mini_font, true, false, false,
+                                            ui, s, theme, mini_font, true, false, active,
                                         )
                                     });
                                     // ミニターミナルをクリックして入力を始めた
@@ -1353,6 +1361,8 @@ impl ZaivernApp {
             .collect();
 
         let (err_col, dim_col) = (self.theme.err, self.theme.text_dim);
+        // 選ばれているペインだけがホバーでホイールを受ける (グリッドのタイルと同じ)。
+        let active_pid = self.active_id();
         let sessions = &mut self.agents.sessions;
         let Some(layout) = self.splits.get_mut(&sid) else {
             return;
@@ -1384,7 +1394,8 @@ impl ZaivernApp {
                     return;
                 };
                 draw_subview(Subview::Session(pid), || {
-                    terminal::draw(ui, s, theme, mini_font, true, false, false);
+                    let hover_scroll = active_pid == Some(pid);
+                    terminal::draw(ui, s, theme, mini_font, true, false, hover_scroll);
                 });
             },
         );
