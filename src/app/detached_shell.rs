@@ -81,9 +81,13 @@ impl ZaivernApp {
                             }
                         }
                         if chord.is_waiting() {
-                            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
-                                chord.remaining(ctx.input(|i| i.time)).min(0.1),
-                            ));
+                            crate::perf::repaint_after(
+                                ctx,
+                                std::time::Duration::from_secs_f64(
+                                    chord.remaining(ctx.input(|i| i.time)).min(0.1),
+                                ),
+                                "detached_shell_chord",
+                            );
                         }
                         ctx.data_mut(|data| data.insert_temp(chord_id, chord));
                     }
@@ -119,7 +123,7 @@ impl ZaivernApp {
             if close {
                 session.shell_viewport = None;
                 session.preedit.clear();
-                ctx.request_repaint();
+                crate::perf::repaint(ctx, "detached_shell_close");
             } else {
                 session.shell_viewport = Some(viewport);
             }
