@@ -45,16 +45,8 @@ zv_scripts() {
   _ws="${ZV_WORKSPACE:-$PWD}"
   case "$ZV_KIND" in
     node)
-      python3 - "$_ws/package.json" <<'ZVPY'
-import json, sys
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-except Exception:
-    sys.exit(0)
-for name in (data.get("scripts") or {}):
-    print(name)
-ZVPY
+      # package.json の scripts 名を並べる (JSON の読み取りは zai 本体)
+      "$ZV_ZAI" plugin json "$_ws/package.json" keys scripts
       ;;
     make)
       _mk="$_ws/Makefile"

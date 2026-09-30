@@ -22,42 +22,35 @@ zv_limit() {
   esac
 }
 
-# gh が出した JSON 配列のファイルを Markdown 表へ整形する。
+# gh が出した JSON 配列のファイルを Markdown へ整形する。
 # 引数1: 見出し, 引数2: 種別 (pr | issue), 引数3: JSON ファイルのパス
+#
+# JSON の読み取りは `zai plugin json ... rows` に任せ (1 行 1 件のタブ区切り)、
+# 整形はシェルで行う。python3 に頼ると Windows で動かない (common.sh の説明)。
 zv_render() {
-  python3 - "$1" "$2" "$3" <<'ZVPY'
-import json, sys
-
-heading, kind, path = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    with open(path, "r", encoding="utf-8") as fh:
-        rows = json.load(fh)
-except (OSError, json.JSONDecodeError):
-    rows = []
-if not isinstance(rows, list):
-    rows = []
-
-out = ["## " + heading, ""]
-if not rows:
-    out.append("該当する項目はありません。")
-else:
-    for row in rows:
-        num = row.get("number", "?")
-        title = (row.get("title") or "").replace("|", "\\|").strip()
-        author = (row.get("author") or {}).get("login") or "不明"
-        labels = ", ".join(l.get("name", "") for l in (row.get("labels") or []))
-        state = row.get("state") or ""
-        out.append("- **#%s** %s" % (num, title))
-        detail = ["作成者 @%s" % author]
-        if state:
-            detail.append("状態 %s" % state)
-        if labels:
-            detail.append("ラベル %s" % labels)
-        if kind == "pr" and row.get("headRefName"):
-            detail.append("ブランチ %s" % row["headRefName"])
-        out.append("  - " + " / ".join(detail))
-    out.append("")
-    out.append("計 %d 件" % len(rows))
-sys.stdout.write("\n".join(out) + "\n")
-ZVPY
+  _heading="$1"; _kind="$2"; _file="$3"
+  printf '## %s\n\n' "$_heading"
+  _rows=$("$ZV_ZAI" plugin json "$_file" rows number title author.login "labels[].name" state headRefName)
+  if [ -z "$_rows" ]; then
+    printf '%s\n' "該当する項目はありません。"
+    unset _heading _kind _file _rows
+    return 0
+  fi
+  # タブのままでは read が空欄を潰す (IFS の空白文字は連続を 1 個と数えるため、
+  # 作成者が空の行で状態がずれて「作成者 @MERGED」になった)。
+  # 空白でない区切り (US = 0x1f) へ寄せると、空欄がそのまま空欄で届く。
+  _us=$(printf '\037')
+  printf '%s\n' "$_rows" | tr '\t' "$_us" | while IFS="$_us" read -r num title author labels state branch; do
+    [ -n "$num" ] || continue
+    # 表組みと衝突しないよう | はエスケープする
+    title=$(printf '%s' "$title" | sed 's/|/\\|/g')
+    printf -- '- **#%s** %s\n' "$num" "$title"
+    _detail="作成者 @${author:-不明}"
+    [ -n "$state" ] && _detail="$_detail / 状態 $state"
+    [ -n "$labels" ] && _detail="$_detail / ラベル $labels"
+    [ "$_kind" = "pr" ] && [ -n "$branch" ] && _detail="$_detail / ブランチ $branch"
+    printf '  - %s\n' "$_detail"
+  done
+  printf '\n計 %d 件\n' "$(printf '%s\n' "$_rows" | grep -c '')"
+  unset _heading _kind _file _rows _us
 }

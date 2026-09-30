@@ -42,6 +42,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+// プラグインのスクリプトが呼ぶ道具 (`zai plugin emit` / `json` / `usage-scan`)。
+// `agents.rs` の `approvals` / `cmdwrite` と同じく `#[path]` でこのモジュールの
+// 子として取り込む (main.rs を触らない = 並列ブランチの衝突面を増やさない)。
+#[path = "plugin_script.rs"]
+pub mod script;
+
 /// このビルドが解釈できるマニフェスト API 世代の上限。
 ///
 /// * 1 … コマンド / テーマ / スニペット
@@ -223,6 +229,24 @@ impl SettingType {
     }
 }
 
+/// プラグインの `run` をどのシェルで実行するか。
+///
+/// 既定は [`PluginShell::Native`] —— `shell` を書かない既存 manifest は
+/// 無改造のまま従来どおり動く (unix: `$SHELL -lc`、Windows: `%COMSPEC% /C`)。
+/// POSIX シェルスクリプトを前提にするプラグインだけ、マニフェストで
+/// `shell = "posix"` と明示して opt-in する (Native は `$SHELL` 依存なので
+/// fish 等が指定されていると POSIX 構文が壊れる — Posix は全 OS で
+/// 解決済みの `sh` を使い、Windows では cmd を通さない)。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PluginShell {
+    /// OS の既定シェル (従来動作。manifest の `shell` 省略時の値)。
+    #[default]
+    Native,
+    /// POSIX シェル (`sh -lc`)。[`crate::shellenv::posix_shell`] が探し、
+    /// 見つからなければ読み込み時にプラグインを `error` へ落とす。
+    Posix,
+}
+
 #[derive(Clone, Debug)]
 pub struct PluginCommand {
     /// 安定識別子。省略時は title から slug 生成 (重複時は連番付き)。
@@ -230,6 +254,8 @@ pub struct PluginCommand {
     pub title: String,
     pub icon: String,
     pub run: String,
+    /// 実行シェル (manifest の `[plugin].shell` を写したもの)。
+    pub shell: PluginShell,
     pub input: CmdInput,
     /// v1 互換の出力先。v2 専用の出力先では Silent になる。
     pub output: CmdOutput,
@@ -260,6 +286,8 @@ impl PluginCommand {
 pub struct PluginHook {
     pub event: HookEvent,
     pub run: String,
+    /// 実行シェル (manifest の `[plugin].shell` を写したもの)。
+    pub shell: PluginShell,
     /// `event = Interval` のときの間隔 (秒、5 以上)。それ以外では 0。
     pub interval_secs: u64,
     pub sink: CmdSink,
@@ -275,6 +303,7 @@ impl PluginHook {
             title: format!("{plugin} / {}", self.event.as_str()),
             icon: "🪝".to_string(),
             run: self.run.clone(),
+            shell: self.shell,
             input: CmdInput::None,
             output: self.sink.legacy(),
             sink: self.sink,
@@ -296,6 +325,8 @@ pub struct PluginPanel {
     pub icon: String,
     /// 空可。空ならアクション経由でのみ更新される。
     pub run: String,
+    /// 実行シェル (manifest の `[plugin].shell` を写したもの)。
+    pub shell: PluginShell,
     pub refresh: PanelRefresh,
     /// `refresh = Interval` のときの間隔 (秒、5 以上)。それ以外では 0。
     pub interval_secs: u64,
@@ -311,6 +342,7 @@ impl PluginPanel {
             title: self.title.clone(),
             icon: self.icon.clone(),
             run: self.run.clone(),
+            shell: self.shell,
             input: CmdInput::None,
             output: CmdOutput::Silent,
             sink: CmdSink::Panel,
@@ -363,6 +395,8 @@ pub struct Plugin {
     pub description: String,
     /// マニフェスト API 世代 (省略時 1)。
     pub api: u32,
+    /// `run` の実行シェル (manifest の `[plugin].shell`。既定は Native)。
+    pub shell: PluginShell,
     pub dir: PathBuf,
     pub commands: Vec<PluginCommand>,
     pub hooks: Vec<PluginHook>,
@@ -409,6 +443,23 @@ impl Plugin {
     /// 実際に機能を登録してよいか (有効かつマニフェストが健全)。
     pub fn active(&self) -> bool {
         self.enabled && self.error.is_none()
+    }
+
+    /// POSIX シェルを要求するか —— manifest が `shell = "posix"` で、
+    /// 実行するシェル行を 1 つでも持つときだけ true。
+    ///
+    /// `shell` を書かない既存プラグイン (Native) は OS の既定シェルで動く
+    /// ので、`sh` が無い環境でも止めない。言語パック (`japanese-mode` 等) は
+    /// 辞書だけなので `run` を持たず、ここを見ずに一律で門を立てると
+    /// **シェルが無い環境で言語が切り替えられなくなる**。
+    pub fn needs_posix_shell(&self) -> bool {
+        if self.shell != PluginShell::Posix {
+            return false;
+        }
+        let has = |s: &String| !s.trim().is_empty();
+        self.commands.iter().any(|c| has(&c.run))
+            || self.hooks.iter().any(|h| has(&h.run))
+            || self.panels.iter().any(|p| has(&p.run))
     }
 
     /// 設定の現在値 (未設定なら宣言された既定値、宣言も無ければ空)。
@@ -557,6 +608,9 @@ struct RawPlugin {
     /// UI 言語のように「入れただけで挙動が変わる」プラグインは false にする。
     #[serde(default)]
     default_enabled: Option<bool>,
+    /// `run` の実行シェル。"native" (既定) か "posix"。
+    #[serde(default)]
+    shell: String,
 }
 
 /// `[language]` セクション。UI 言語パック。
@@ -713,6 +767,7 @@ fn scan_root(root: &Path) -> Vec<Plugin> {
                 author: String::new(),
                 description: String::new(),
                 api: 1,
+                shell: PluginShell::Native,
                 dir: path,
                 commands: Vec::new(),
                 hooks: Vec::new(),
@@ -755,12 +810,16 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         ));
     }
 
+    // `shell` が実行方式の唯一の真実の在り処。ここで 1 度だけ読み、
+    // コマンド / フック / パネルへ写して持ち回る。
+    let shell = parse_shell(&m.plugin.shell)?;
+
     // パネルはコマンド/フックの出力先として参照されるので先に確定させる。
-    let panels = parse_panels(m.panels)?;
+    let panels = parse_panels(m.panels, shell)?;
 
-    let commands = parse_commands(m.commands, &panels)?;
+    let commands = parse_commands(m.commands, &panels, shell)?;
 
-    let hooks = parse_hooks(m.hooks, &panels)?;
+    let hooks = parse_hooks(m.hooks, &panels, shell)?;
 
     let settings = parse_settings(m.settings)?;
 
@@ -833,6 +892,7 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         author: m.plugin.author.trim().to_string(),
         description: m.plugin.description.trim().to_string(),
         api,
+        shell,
         dir: dir.to_path_buf(),
         commands,
         hooks,
@@ -848,11 +908,46 @@ pub fn parse_manifest(dir: &Path) -> Result<Plugin, String> {
         error: None,
     };
     p.apply_settings(&HashMap::new()); // 既定値で初期化
+    p.error = script_gate(
+        p.needs_posix_shell(),
+        crate::shellenv::posix_shell().as_deref(),
+    );
     Ok(p)
 }
 
+/// スクリプトを持つプラグインに POSIX シェルが要る、という門 (純関数)。
+///
+/// # なぜ「読み込み時に error へ落とす」のか
+///
+/// `sh` が無い環境で `run` を撃つと、**フックが毎起動で失敗して通知を撒く**
+/// (0.24.4 の Windows で実際に起きた: 起動のたびに 3 件)。かといって黙って
+/// 捨てると「動いているのに何も起きない」になる。
+///
+/// [`Plugin::active`] は `error.is_none()` を見るので、ここへ理由を入れれば
+/// **フックもコマンドも撃たれず、プラグイン一覧に理由が 1 行出る** —
+/// 新しい通知の仕組みを足さずに「静かで、かつ正直」になる。
+fn script_gate(needs_shell: bool, shell: Option<&Path>) -> Option<String> {
+    if needs_shell && shell.is_none() {
+        Some(crate::shellenv::posix_shell_hint())
+    } else {
+        None
+    }
+}
+
+/// manifest の `[plugin].shell` を [`PluginShell`] へ写す (未指定・"native" は
+/// Native —— 既存プラグインは無改造のまま従来の OS シェルで動く)。
+fn parse_shell(raw: &str) -> Result<PluginShell, String> {
+    match raw.trim().to_lowercase().as_str() {
+        "" | "native" => Ok(PluginShell::Native),
+        "posix" => Ok(PluginShell::Posix),
+        other => Err(format!(
+            "shell が不正: {other:?} (\"native\" か \"posix\" のみ)"
+        )),
+    }
+}
+
 /// `[[panel]]` 群を検証して PluginPanel に変換する（parse_manifest から抽出）。
-fn parse_panels(raw_panels: Vec<RawPanel>) -> Result<Vec<PluginPanel>, String> {
+fn parse_panels(raw_panels: Vec<RawPanel>, shell: PluginShell) -> Result<Vec<PluginPanel>, String> {
     let mut panels: Vec<PluginPanel> = Vec::new();
     for (i, p) in raw_panels.into_iter().enumerate() {
         let id = p.id.trim().to_lowercase();
@@ -907,6 +1002,7 @@ fn parse_panels(raw_panels: Vec<RawPanel>) -> Result<Vec<PluginPanel>, String> {
                 p.icon.trim().to_string()
             },
             run: p.run.trim().to_string(),
+            shell,
             refresh,
             interval_secs,
             format,
@@ -920,6 +1016,7 @@ fn parse_panels(raw_panels: Vec<RawPanel>) -> Result<Vec<PluginPanel>, String> {
 fn parse_commands(
     raw_commands: Vec<RawCommand>,
     panels: &[PluginPanel],
+    shell: PluginShell,
 ) -> Result<Vec<PluginCommand>, String> {
     let mut commands: Vec<PluginCommand> = Vec::new();
     for (i, c) in raw_commands.into_iter().enumerate() {
@@ -954,6 +1051,7 @@ fn parse_commands(
                 c.icon.trim().to_string()
             },
             run: c.run.trim().to_string(),
+            shell,
             input,
             output,
             sink,
@@ -976,7 +1074,11 @@ fn parse_commands(
 }
 
 /// `[[hook]]` 群を検証して PluginHook に変換する（parse_manifest から抽出）。
-fn parse_hooks(raw_hooks: Vec<RawHook>, panels: &[PluginPanel]) -> Result<Vec<PluginHook>, String> {
+fn parse_hooks(
+    raw_hooks: Vec<RawHook>,
+    panels: &[PluginPanel],
+    shell: PluginShell,
+) -> Result<Vec<PluginHook>, String> {
     let mut hooks: Vec<PluginHook> = Vec::new();
     for (i, h) in raw_hooks.into_iter().enumerate() {
         if h.run.trim().is_empty() {
@@ -1013,6 +1115,7 @@ fn parse_hooks(raw_hooks: Vec<RawHook>, panels: &[PluginPanel]) -> Result<Vec<Pl
         hooks.push(PluginHook {
             event,
             run: h.run.trim().to_string(),
+            shell,
             interval_secs,
             sink,
             panel,
@@ -1757,10 +1860,6 @@ const BUNDLED: &[(&str, &[(&str, &str)])] = &[
                 "scripts/report.sh",
                 include_str!("../assets/plugins/usage-meter/scripts/report.sh"),
             ),
-            (
-                "scripts/scan.py",
-                include_str!("../assets/plugins/usage-meter/scripts/scan.py"),
-            ),
         ],
     ),
     (
@@ -1936,6 +2035,9 @@ version = "0.1.0"
 author = ""
 description = "説明をここに書く"
 api = 2
+# shell:  省略時 "native" (unix は $SHELL -lc、Windows は %COMSPEC% /C)。
+#         POSIX シェルスクリプト前提なら "posix" (Windows でも sh -lc)。
+# shell = "posix"
 
 # ─── コマンド ─────────────────────────────────────────────
 # 任意のシェルコマンドを実行し、結果をエディタへ反映します。
@@ -2340,11 +2442,22 @@ pub fn run_async(req: RunRequest, tx: Sender<RunOutcome>, ctx: egui::Context) {
     });
 }
 
+/// `run` を実行するシェルを選んで [`std::process::Command`] を組む。
+///
+/// 選択ロジックはここ 1 か所だけに持たせる (純関数なので Windows の分岐も
+/// Linux から検査できる):
+/// - `Native` は従来動作そのまま — unix は `$SHELL -lc`、Windows は
+///   `%COMSPEC% /C` ([`crate::shellenv::shell_command`])。
+/// - `Posix` は全 OS で解決済みの `sh -lc` ([`crate::shellenv::script_command`])。
+///   `sh` が見つからなければ起動前に理由を返す。
+fn run_command(shell: PluginShell, script: &str) -> Result<std::process::Command, String> {
+    match shell {
+        PluginShell::Native => Ok(crate::shellenv::shell_command(script)),
+        PluginShell::Posix => crate::shellenv::script_command(script),
+    }
+}
+
 fn run_blocking(req: &RunRequest) -> RunOutcome {
-    // シェルの選び方は OS で違う (Windows に `$SHELL` は無い) ので shellenv に任せる。
-    let shell = crate::shellenv::shell_program()
-        .to_string_lossy()
-        .into_owned();
     let fail = |msg: String| RunOutcome {
         plugin: req.plugin.clone(),
         command_id: req.command.id.clone(),
@@ -2363,7 +2476,16 @@ fn run_blocking(req: &RunRequest) -> RunOutcome {
         resave: req.resave,
     };
 
-    let mut cmd = crate::shellenv::shell_command(&req.command.run);
+    // `shell = "posix"` と opt-in したプラグインだけ、全 OS で解決済みの
+    // `sh -lc` へ直接渡す (Windows の cmd 経由だと `sh` も `$VAR` も引けず、
+    // unix の `$SHELL` は POSIX 非互換がありうる)。
+    // 未指定 (Native) の既存プラグインは従来どおり OS の既定シェルで動く。
+    // 詳細は [`crate::shellenv::script_command`] の説明。
+    let mut cmd = match run_command(req.command.shell, &req.command.run) {
+        Ok(c) => c,
+        Err(msg) => return fail(msg),
+    };
+    let shell = cmd.get_program().to_string_lossy().into_owned();
     cmd.current_dir(&req.workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2805,6 +2927,8 @@ input = "clipboard"
             title: "test".into(),
             icon: "🔌".into(),
             run: run.into(),
+            // テストのコマンドは POSIX 構文 (同梱プラグインと同じ道を通す)
+            shell: PluginShell::Posix,
             input: CmdInput::Selection,
             output: CmdOutput::Replace,
             sink: CmdSink::Replace,
@@ -3253,6 +3377,275 @@ run = "c"
         assert!(parse_actions("").is_empty());
     }
 
+    /// POSIX シェルが無い環境では、`run` を持つプラグインだけを止める。
+    ///
+    /// 全部止めると辞書だけの言語パックまで死に、止めないと**起動のたびに
+    /// フックが失敗して通知を撒く** (0.24.4 の Windows で実際に起きた)。
+    #[test]
+    fn シェルが無い環境ではrunを持つものだけ止める() {
+        let sh = std::path::Path::new("/bin/sh");
+        assert!(
+            script_gate(true, None).is_some(),
+            "sh が無いのにスクリプト持ちを通している"
+        );
+        assert!(
+            script_gate(false, None).is_none(),
+            "run を持たない言語パックまで止めている"
+        );
+        assert!(script_gate(true, Some(sh)).is_none());
+        assert!(script_gate(false, Some(sh)).is_none());
+        // 理由は空にしない (一覧の ⚠ に出る唯一の手掛かりなので)
+        assert!(!script_gate(true, None)
+            .unwrap_or_default()
+            .trim()
+            .is_empty());
+    }
+
+    /// `needs_posix_shell` は「`shell = "posix"` と opt-in した上で」
+    /// コマンド / フック / パネルの **どれか 1 つでも** `run` を持てば true。
+    /// どれかを見落とすと、そのプラグインだけが門をすり抜けて毎起動の
+    /// 失敗通知に戻る。`shell` 未指定 (Native) では `run` があっても false ——
+    /// OS の既定シェルで動くので `sh` を要求しない。
+    #[test]
+    fn runを持つかはposix指定と3種類を見る() {
+        let root = temp_dir("needs-shell");
+        let base = "[plugin]\nname = \"p\"\napi = 2\n";
+        let cases: [(&str, &str, bool); 8] = [
+            // (shell 指定, 追加セクション, POSIX 要求か)
+            ("", "", false),
+            ("shell = \"posix\"\n", "", false),
+            (
+                "",
+                "\n[[command]]\ntitle = \"c\"\nrun = \"echo hi\"\n",
+                false,
+            ),
+            (
+                "",
+                "\n[[hook]]\nevent = \"startup\"\nrun = \"echo hi\"\n",
+                false,
+            ),
+            (
+                "",
+                "\n[[panel]]\nid = \"x\"\ntitle = \"x\"\nrun = \"echo hi\"\n",
+                false,
+            ),
+            (
+                "shell = \"posix\"\n",
+                "\n[[command]]\ntitle = \"c\"\nrun = \"echo hi\"\n",
+                true,
+            ),
+            (
+                "shell = \"posix\"\n",
+                "\n[[hook]]\nevent = \"startup\"\nrun = \"echo hi\"\n",
+                true,
+            ),
+            (
+                "shell = \"posix\"\n",
+                "\n[[panel]]\nid = \"x\"\ntitle = \"x\"\nrun = \"echo hi\"\n",
+                true,
+            ),
+        ];
+        for (i, (shell, extra, want)) in cases.iter().enumerate() {
+            let dir = root.join(format!("p{i}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("plugin.toml"), format!("{base}{shell}{extra}"))
+                .expect("write");
+            let p = parse_manifest(&dir).expect("読める");
+            assert_eq!(
+                p.needs_posix_shell(),
+                *want,
+                "shell={shell:?} {extra:?} の判定が違う"
+            );
+        }
+    }
+
+    /// 後方互換: `shell` を書かない既存 manifest は Native (OS 既定シェル) の
+    /// まま。Windows でも `%COMSPEC% /C` で動き続ける。
+    #[test]
+    fn shell未指定のmanifestはnative() {
+        let dir = temp_dir("shell-default");
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"legacy\"\napi = 2\n\
+             [[command]]\ntitle = \"legacy\"\nrun = \"echo hello\"\n",
+        )
+        .expect("write");
+        let p = parse_manifest(&dir).expect("読める");
+        assert_eq!(p.shell, PluginShell::Native);
+        assert_eq!(p.commands[0].shell, PluginShell::Native);
+        // 明示しても同じ (大文字小文字は吸収する)
+        for v in ["native", "Native"] {
+            assert_eq!(parse_shell(v).expect("native は受理"), PluginShell::Native);
+        }
+        assert_eq!(parse_shell("").expect("省略は受理"), PluginShell::Native);
+        assert_eq!(
+            parse_shell("posix").expect("posix は受理"),
+            PluginShell::Posix
+        );
+        assert!(
+            parse_shell("zsh").is_err(),
+            "不明な shell は manifest エラー"
+        );
+    }
+
+    /// `shell = "posix"` を書いたプラグインは POSIX 判定になり、
+    /// その指定がコマンド・フック・パネルの実行系へ写る。
+    #[test]
+    fn posix指定が実行系へ写る() {
+        let dir = temp_dir("shell-posix");
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"p\"\napi = 2\nshell = \"posix\"\n\
+             [[command]]\ntitle = \"c\"\nrun = \"echo hi\"\n\
+             [[hook]]\nevent = \"startup\"\nrun = \"echo hi\"\n\
+             [[panel]]\nid = \"x\"\ntitle = \"x\"\nrun = \"echo hi\"\n",
+        )
+        .expect("write");
+        let p = parse_manifest(&dir).expect("読める");
+        assert_eq!(p.shell, PluginShell::Posix);
+        assert!(p.needs_posix_shell());
+        // フック・パネルが擬似コマンド化しても shell を落とさない
+        assert_eq!(p.hooks[0].as_command("p").shell, PluginShell::Posix);
+        assert_eq!(p.panels[0].as_command().shell, PluginShell::Posix);
+    }
+
+    /// 門 (script_gate) の対象は POSIX 指定プラグインだけ。
+    /// Native は `sh` が無くても止まらず、POSIX 指定は `sh` が無ければ error。
+    #[test]
+    fn gateされるのはposix指定だけ() {
+        let root = temp_dir("shell-gate");
+        let mk = |name: &str, shell: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(
+                dir.join("plugin.toml"),
+                format!(
+                    "[plugin]\nname = \"{name}\"\napi = 2\n{shell}\
+                     [[command]]\ntitle = \"c\"\nrun = \"echo hi\"\n"
+                ),
+            )
+            .expect("write");
+            parse_manifest(&dir).expect("読める")
+        };
+        let native = mk("n", "");
+        let posix = mk("p", "shell = \"posix\"\n");
+        // sh が無い環境: Native は動く、Posix だけが門で止まる
+        assert!(
+            script_gate(native.needs_posix_shell(), None).is_none(),
+            "sh が無いのに Native を止めている (後方互換の破壊)"
+        );
+        assert!(
+            script_gate(posix.needs_posix_shell(), None).is_some(),
+            "sh が無いのに POSIX 指定を通している"
+        );
+        // sh がある環境: 両方とも動く
+        let sh = std::path::Path::new("/bin/sh");
+        assert!(script_gate(native.needs_posix_shell(), Some(sh)).is_none());
+        assert!(script_gate(posix.needs_posix_shell(), Some(sh)).is_none());
+    }
+
+    /// 実行経路の分岐: Native は OS 既定シェル (Windows なら `%COMSPEC% /C`)、
+    /// Posix は `sh -lc`。判定を純関数で検査する (引数の形だけ見るので OS 非依存)。
+    #[test]
+    fn shellの選択が起動コマンドを決める() {
+        let args = |c: &std::process::Command| -> Vec<String> {
+            c.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let native = run_command(PluginShell::Native, "echo hi").expect("Native は必ず組める");
+        assert_eq!(
+            native.get_program(),
+            crate::shellenv::shell_program().as_os_str(),
+            "Native は OS の既定シェル (Windows なら %COMSPEC%)"
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                args(&native),
+                ["/C", "echo hi"],
+                "Windows の Native は cmd /C"
+            );
+        } else {
+            assert_eq!(args(&native), ["-lc", "echo hi"]);
+        }
+        // Posix は `sh -lc`。`sh` の在り処は環境依存なので program ではなく
+        // 引数の形と「Native とは別経路である」ことを見る (sh が無い環境では
+        // 起動前に Err になることも確認)。
+        match run_command(PluginShell::Posix, "echo hi") {
+            Ok(posix) => {
+                assert_eq!(args(&posix), ["-lc", "echo hi"], "Posix は sh -lc");
+                if cfg!(windows) {
+                    assert_ne!(
+                        posix.get_program(),
+                        native.get_program(),
+                        "Windows で Posix が cmd に流れている"
+                    );
+                }
+            }
+            Err(msg) => {
+                assert!(
+                    cfg!(windows) && crate::shellenv::posix_shell().is_none(),
+                    "sh がある環境で Posix が Err: {msg}"
+                );
+                assert!(!msg.trim().is_empty());
+            }
+        }
+    }
+
+    /// E2E: manifest の `shell = "posix"` が parse → RunRequest → 実行まで
+    /// 通り、シェル内 cwd (= workdir)・`$VAR` 展開・POSIX 構文の 3 点が
+    /// 正しいこと。login shell の $HOME への cd (MSYS 系) に負けないことを、
+    /// 実プロセスの stdout で確認する。
+    #[test]
+    fn posix指定プラグインはworkspaceで実際に動く() {
+        if crate::shellenv::posix_shell().is_none() {
+            // sh が無い Windows では gate が止める (起動自体しない)
+            assert!(cfg!(windows), "unix 系で POSIX シェルが無いのは想定外");
+            return;
+        }
+        let dir = temp_dir("posix-e2e");
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::fs::write(ws.join("marker.txt"), "x").expect("write");
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nname = \"posix-test\"\napi = 2\nshell = \"posix\"\n\
+             [[command]]\ntitle = \"t\"\n\
+             run = \"(pwd -W 2>/dev/null || pwd); echo \\\"$ZV_MARK\\\"; test -f marker.txt && echo marker-ok\"\n",
+        )
+        .expect("write");
+        let p = parse_manifest(&dir).expect("読める");
+        assert_eq!(p.commands[0].shell, PluginShell::Posix);
+        let out = run_sync(RunRequest {
+            plugin: p.name.clone(),
+            command: p.commands[0].clone(),
+            stdin_text: String::new(),
+            envs: vec![("ZV_MARK".into(), "env-ok".into())],
+            workdir: ws.clone(),
+            buffer_id: None,
+            replace_range: None,
+            resave: false,
+        });
+        assert!(out.ok, "stderr: {}", out.stderr);
+        let printed = out.stdout.lines().next().unwrap_or("").trim();
+        let want = std::fs::canonicalize(&ws).expect("canon");
+        let got =
+            std::fs::canonicalize(printed).unwrap_or_else(|_| std::path::PathBuf::from(printed));
+        assert_eq!(
+            got,
+            want,
+            "シェル内 cwd が workdir でない: {printed} vs {}",
+            want.display()
+        );
+        assert!(out.stdout.contains("env-ok"), "$VAR 展開: {}", out.stdout);
+        assert!(
+            out.stdout.contains("marker-ok"),
+            "workdir の相対パスが見えていない: {}",
+            out.stdout
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ─── v2: 有効/無効・設定 ─────────────────────────────────────
 
     #[test]
@@ -3557,6 +3950,97 @@ run = "c"
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `shell = "posix"` のような manifest 変更は、版を上げた時だけ
+    /// 展開済みユーザーへ届く。版の据え置きでは `version_newer` が偽なので
+    /// 届かない — 中身を変えたら必ず version を上げる約束を、この形で固定する。
+    #[test]
+    fn bundled_manifest_change_reaches_users_only_with_version_bump() {
+        let shell_bundle = |ver: &str, shell: Option<&str>| {
+            let line = shell
+                .map(|s| format!("shell = \"{s}\"\n"))
+                .unwrap_or_default();
+            vec![(
+                "std-demo".to_string(),
+                vec![
+                    (
+                        "plugin.toml".to_string(),
+                        format!(
+                            "[plugin]\nname = \"std-demo\"\nversion = \"{ver}\"\napi = 2\n{line}"
+                        ),
+                    ),
+                    ("run.sh".to_string(), format!("#!/bin/sh\necho {ver}\n")),
+                ],
+            )]
+        };
+        let manifest = |root: &Path| {
+            std::fs::read_to_string(root.join("std-demo").join("plugin.toml")).unwrap()
+        };
+        let stamp =
+            |root: &Path| std::fs::read_to_string(root.join("std-demo").join(".bundled")).unwrap();
+
+        let root = temp_dir("bundle-shell");
+        // shell 未指定の 0.1.0 が既に入っている既存ユーザーの状態
+        assert_eq!(
+            seed(&root, &shell_bundle("0.1.0", None)),
+            vec!["std-demo".to_string()]
+        );
+        assert!(!manifest(&root).contains("shell"), "{:?}", manifest(&root));
+        assert_eq!(stamp(&root), "0.1.0");
+
+        // 版が据え置きなら、manifest を変えても届かない (= bump 忘れの姿)
+        assert!(seed(&root, &shell_bundle("0.1.0", Some("posix"))).is_empty());
+        assert!(!manifest(&root).contains("shell"), "{:?}", manifest(&root));
+        assert_eq!(stamp(&root), "0.1.0");
+
+        // 版が上がれば新 manifest が届き、.bundled も新しい版へ進む
+        assert_eq!(
+            seed(&root, &shell_bundle("0.2.0", Some("posix"))),
+            vec!["std-demo".to_string()]
+        );
+        assert!(
+            manifest(&root).contains("shell = \"posix\""),
+            "{:?}",
+            manifest(&root)
+        );
+        assert_eq!(stamp(&root), "0.2.0");
+        assert_eq!(
+            parse_manifest(&root.join("std-demo")).unwrap().shell,
+            PluginShell::Posix
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `sh` を呼ぶ run を持つ標準プラグインは必ず `shell = "posix"` を
+    /// 書く。opt-in を書き忘れると Windows では cmd.exe /C へ流れて
+    /// 「'sh' は認識されていません」が再発する — 内容の整合を担保する。
+    #[test]
+    fn bundled_plugins_invoking_sh_opt_into_posix() {
+        for (name, files) in BUNDLED {
+            let Some((_, toml)) = files.iter().find(|(rel, _)| *rel == "plugin.toml") else {
+                continue;
+            };
+            let dir = temp_dir(&format!("bundled-{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.toml"), toml).unwrap();
+            let p = parse_manifest(&dir)
+                .unwrap_or_else(|e| panic!("{name}/plugin.toml が解析できない: {e}"));
+            let invokes_sh = p
+                .commands
+                .iter()
+                .map(|c| c.run.as_str())
+                .chain(p.hooks.iter().map(|h| h.run.as_str()))
+                .chain(p.panels.iter().map(|h| h.run.as_str()))
+                .any(|run| run.split_whitespace().next() == Some("sh"));
+            assert_eq!(
+                invokes_sh,
+                p.shell == PluginShell::Posix,
+                "{name}: sh を呼ぶ run と shell = \"posix\" が食い違っている"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn version_compare_and_extraction() {
         assert!(version_newer("1.0.1", "1.0.0"));
@@ -3590,22 +4074,15 @@ run = "c"
 
     #[test]
     fn run_reports_failure_and_timeout() {
-        // コマンドは OS のシェル (unix: $SHELL -c / Windows: cmd /C) で走るので
-        // 構文もそれぞれに合わせる (cmd は `;` を区切りとして解さない)。
-        let fail_cmd = if cfg!(windows) {
-            "echo boom 1>&2 & exit 3"
-        } else {
-            "echo boom >&2; exit 3"
-        };
-        // Windows は cmd ビルトインだけで時間を潰す (rem のビジーループ)。
-        // ping 等の外部コマンドを使うと、孫がパイプの書き込みハンドルを継承した
-        // まま生き残り (リダイレクトしても**ハンドルの継承**は防げない)、cmd を
-        // kill しても EOF が来ず run_blocking の read join が孫の寿命まで待つ。
-        let sleep_cmd = if cfg!(windows) {
-            "for /L %i in (1,1,2000000000) do @rem"
-        } else {
-            "sleep 30"
-        };
+        // run は POSIX シェル (shellenv::script_command → sh -lc) で走るので
+        // 構文は sh に揃える (cmd 構文は構文エラーで即終了し、タイムアウトを
+        // 検証できない)。
+        let fail_cmd = "echo boom >&2; exit 3";
+        // 待機はシェルのビジーループ。外部コマンド (sleep 等) を使うと、孫が
+        // パイプの書き込みハンドルを継承したまま生き残り (リダイレクトしても
+        // ハンドルの継承は防げない)、シェルを kill しても EOF が来ず
+        // run_blocking の read join が孫の寿命まで待つ。
+        let sleep_cmd = "while :; do :; done";
         let out = run_sync(RunRequest {
             plugin: "p".into(),
             command: basic_cmd(fail_cmd, 10),

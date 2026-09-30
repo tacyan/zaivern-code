@@ -1,34 +1,24 @@
 #!/bin/sh
 # 共通ヘルパ。JSON Lines のアクション出力と依存コマンドの確認をまとめる。
 # 各スクリプトの先頭から . (ドット) で読み込んで使う。
+#
+# JSON の組み立ては zai 本体 (`zai plugin emit`) に任せる。以前は python3 で
+# 組んでいたが、Windows では Microsoft Store の「アプリ実行エイリアス」が
+# python3 として PATH に居座るため、`command -v python3` は成功するのに
+# 実行すると `Python` の 1 行を出して exit 49 で死ぬ — 存在確認を通り抜けて
+# 失敗する壊れ方だった。zai は今このスクリプトを動かしている本体なので、
+# 「在るか分からない別の実行環境」を増やさずに済む。
 
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '%s\n' '{"action":"notify","level":"error","message":"python3 が見つかりません。この機能には python3 が必要です。"}'
+# zai 本体。ZV_BIN は仕様 3 章の環境変数 (実行中の zai の実体)。
+ZV_ZAI="${ZV_BIN:-zai}"
+if ! command -v "$ZV_ZAI" >/dev/null 2>&1; then
+  printf '%s\n' '{"action":"notify","level":"error","message":"zai 本体が見つかりません。プラグインは Zaivern から実行してください。"}'
   exit 0
 fi
 
 # zv_emit キー 値 [キー 値 ...]
-# 値が @@ で始まる場合は、続くパスのファイル内容を読み込んで値にする。
-zv_emit() {
-  python3 - "$@" <<'ZVPY'
-import json, sys
-
-args = sys.argv[1:]
-obj = {}
-for i in range(0, len(args) - 1, 2):
-    key, val = args[i], args[i + 1]
-    if val.startswith("@@"):
-        with open(val[2:], "r", encoding="utf-8", errors="replace") as fh:
-            val = fh.read()
-    if key == "submit":
-        obj[key] = val.lower() in ("1", "true", "yes")
-    elif key in ("line", "column"):
-        obj[key] = int(val)
-    else:
-        obj[key] = val
-sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-ZVPY
-}
+# 値が @@ で始まる場合は、続くパスのファイル内容を値にする。
+zv_emit() { "$ZV_ZAI" plugin emit "$@"; }
 
 # zv_notify レベル メッセージ
 zv_notify() { zv_emit action notify level "$1" message "$2"; }

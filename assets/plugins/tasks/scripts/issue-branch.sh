@@ -24,16 +24,15 @@ if ! gh issue view "$NUM" --json number,title >"$META" 2>"$ZV_PLUGIN_DATA/issue-
 fi
 
 PREFIX="${ZV_CFG_BRANCH_PREFIX:-work}"
-SLUG=$(python3 - "$META" <<'ZVPY'
-import json, re, sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    data = json.load(fh)
-title = (data.get("title") or "").lower()
-slug = re.sub(r"[^a-z0-9]+", "-", title).strip("-")[:40].strip("-")
-sys.stdout.write(slug or "issue")
-ZVPY
-)
+# 課題名からブランチ名の部品を作る (小文字・英数以外は - へ畳む)。
+# JSON の読み取りは zai 本体、畳み込みは tr — python3 は使わない。
+SLUG=$("$ZV_ZAI" plugin json "$META" get title \
+  | tr '[:upper:]' '[:lower:]' \
+  | tr -cs 'a-z0-9' '-' \
+  | sed 's/^-*//; s/-*$//' \
+  | cut -c1-40 \
+  | sed 's/-*$//')
+[ -n "$SLUG" ] || SLUG="issue"
 
 BRANCH="$PREFIX/$NUM-$SLUG"
 WS="${ZV_WORKSPACE:-$PWD}"

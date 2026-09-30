@@ -9,7 +9,7 @@ DIR="${ZV_PLUGIN_DIR:-$(dirname "$0")/..}"
 zv_data
 
 OUT="$ZV_PLUGIN_DATA/usage.md"
-if ! python3 "$DIR/scripts/scan.py" "${ZV_CFG_EXTRA_DIRS:-}" >"$OUT" 2>"$ZV_PLUGIN_DATA/usage.err"; then
+if ! "$ZV_ZAI" plugin usage-scan "${ZV_CFG_EXTRA_DIRS:-}" >"$OUT" 2>"$ZV_PLUGIN_DATA/usage.err"; then
   zv_fail "使用量を集計できませんでした: $(head -c 200 "$ZV_PLUGIN_DATA/usage.err" | tr '\n' ' ')"
 fi
 
