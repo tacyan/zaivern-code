@@ -2453,6 +2453,10 @@ fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> boo
     })
 }
 
+fn ime_frame_block_id() -> egui::Id {
+    egui::Id::new("zv-ime-frame-block")
+}
+
 /// IME 変換中か (変換中フラグを次フレームへ持ち越しつつ判定する)。
 ///
 /// **1 フレームに 1 回だけ呼ぶこと** (状態を更新するため)。呼び出し地点は
@@ -2464,6 +2468,15 @@ fn ime_blocks_shortcuts(events: &[egui::Event], composing_at_start: bool) -> boo
 /// `handle_shortcuts` 以外の場所 — ファイルツリーのキー処理など — から
 /// 「いま変換中か」を見たいときは必ずこちらを使う。
 pub fn ime_blocks_shortcuts_peek(ctx: &egui::Context) -> bool {
+    // handle_shortcuts が状態を進めた後も、変換を終えたフレームの保護を維持する。
+    let pass = ctx.cumulative_pass_nr();
+    if let Some((cached_pass, blocked)) =
+        ctx.data(|d| d.get_temp::<(u64, bool)>(ime_frame_block_id()))
+    {
+        if cached_pass == pass {
+            return blocked;
+        }
+    }
     let was = ctx
         .data(|d| d.get_temp::<bool>(ime_state_id()))
         .unwrap_or(false);
@@ -2480,7 +2493,11 @@ pub fn ime_blocks_shortcuts_now(ctx: &egui::Context) -> bool {
             ime_composing_after(&i.events, was),
         )
     });
-    ctx.data_mut(|d| d.insert_temp(ime_state_id(), next));
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| {
+        d.insert_temp(ime_state_id(), next);
+        d.insert_temp(ime_frame_block_id(), (pass, blocked));
+    });
     blocked
 }
 

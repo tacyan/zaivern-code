@@ -1,5 +1,23 @@
 use super::*;
 
+fn rename_agent_text_edit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    session_id: u64,
+) -> (egui::Response, bool) {
+    let ime = crate::keybinds::ime_blocks_shortcuts_peek(ui.ctx());
+    let mut edit = egui::TextEdit::singleline(text)
+        .id_salt(("zv-rename-agent", session_id))
+        .desired_width(ui.available_width());
+    if ime {
+        // Enter を先に処理してフォーカスを外すと、同フレームの Commit も失われる。
+        edit = edit.return_key(None);
+    }
+    let response = ui.add(edit);
+    let confirm = !ime && response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    (response, confirm)
+}
+
 impl ZaivernApp {
     // ─── UI: top bar ────────────────────────────────────────────────
 
@@ -241,11 +259,7 @@ impl ZaivernApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_width(320.0);
-                let te = ui.add(
-                    egui::TextEdit::singleline(&mut buf)
-                        .id_salt(("zv-rename-agent", id))
-                        .desired_width(ui.available_width()),
-                );
+                let (te, enter_confirmed) = rename_agent_text_edit(ui, &mut buf, id);
                 if focus {
                     apply_pending_select(ctx, te.id, (0, buf.chars().count()), true);
                 }
@@ -284,9 +298,7 @@ impl ZaivernApp {
                     ));
                 }
                 ui.horizontal(|ui| {
-                    if ui.button(tr("変更")).clicked()
-                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                    {
+                    if ui.button(tr("変更")).clicked() || enter_confirmed {
                         commit = true;
                     }
                     if ui.button(tr("やめる")).clicked() {
@@ -2029,5 +2041,126 @@ mod text_size_layout_tests {
         }
         assert_eq!(super::text_aware_top_bar_heights(14.0, false), (28.0, 42.0));
         assert_eq!(super::text_aware_top_bar_heights(14.0, true), (28.0, 72.0));
+    }
+}
+
+#[cfg(test)]
+mod rename_ime_tests {
+    use super::*;
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        text: &mut String,
+        events: Vec<egui::Event>,
+        focus: bool,
+    ) -> bool {
+        let mut confirm = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 240.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                // 製品と同じ順番: ショートカットの状態更新後に入力欄を描く。
+                crate::keybinds::ime_blocks_shortcuts_now(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (response, requested) = rename_agent_text_edit(ui, text, 1);
+                    confirm = requested;
+                    if focus {
+                        response.request_focus();
+                    } else if !requested {
+                        assert!(
+                            response.has_focus(),
+                            "変換中の Enter でフォーカスが失われた"
+                        );
+                    }
+                });
+            },
+        );
+        confirm
+    }
+
+    #[test]
+    fn conversion_enter_keeps_name_edit_open_and_next_enter_confirms() {
+        for enter_first in [false, true] {
+            let ctx = egui::Context::default();
+            let mut text = String::new();
+            frame(&ctx, &mut text, vec![], true);
+            assert!(!frame(
+                &ctx,
+                &mut text,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("にほんご".into())),
+                ],
+                false
+            ));
+            // IME イベントが来ない変換中のフレームも保護する。
+            assert!(!frame(&ctx, &mut text, vec![enter()], false));
+            let commit = egui::Event::Ime(egui::ImeEvent::Commit("日本語".into()));
+            let events = if enter_first {
+                vec![enter(), commit]
+            } else {
+                vec![commit, enter()]
+            };
+            assert!(!frame(&ctx, &mut text, events, false));
+            assert_eq!(text, "日本語", "Enter と Commit の順番で文字を失わない");
+            assert!(frame(&ctx, &mut text, vec![enter()], false));
+        }
+    }
+
+    #[test]
+    fn empty_preedit_end_frame_does_not_confirm_name() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        frame(&ctx, &mut text, vec![], true);
+        frame(
+            &ctx,
+            &mut text,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("にほん".into())),
+            ],
+            false,
+        );
+        assert!(!frame(
+            &ctx,
+            &mut text,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                enter(),
+            ],
+            false
+        ));
+        assert!(frame(&ctx, &mut text, vec![enter()], false));
+    }
+
+    #[test]
+    fn plain_enter_still_confirms_name() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        frame(&ctx, &mut text, vec![], true);
+        assert!(frame(
+            &ctx,
+            &mut text,
+            vec![egui::Event::Text("New name".into()), enter()],
+            false
+        ));
+        assert_eq!(text, "New name");
     }
 }
