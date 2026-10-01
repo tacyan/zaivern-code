@@ -517,10 +517,15 @@ impl ZaivernApp {
             return None;
         }
         let ids: Vec<u64> = self.stalled_session_ids();
+        let mut sent = 0;
         for id in &ids {
-            self.queue_submit(submit::Job::user(*id, text));
+            // 実際に積めた数だけを返す (途中でセッションが消えた等で
+            // 積めなかった分まで「送った」と数えない)。
+            if self.queue_submit(submit::Job::user(*id, text)) {
+                sent += 1;
+            }
         }
-        Some(ids.len())
+        Some(sent)
     }
 
     /// 止まっているセッションの ID (起動順)。チップの件数表示と送信で共有する。
@@ -551,10 +556,13 @@ impl ZaivernApp {
             .filter(|s| s.running())
             .map(|s| s.id)
             .collect();
+        let mut sent = 0;
         for id in &ids {
-            self.queue_submit(submit::Job::user(*id, text));
+            if self.queue_submit(submit::Job::user(*id, text)) {
+                sent += 1;
+            }
         }
-        Some(ids.len())
+        Some(sent)
     }
 
     /// 配達待ちを 1 フレームぶん進める。
@@ -580,6 +588,9 @@ impl ZaivernApp {
         let mut next: Option<Duration> = None;
         let mut delivered: Vec<String> = Vec::new();
         let mut gave_up: Vec<String> = Vec::new();
+        // 「入れるだけ」が安全に配達できなかった分 (bracketed paste 無し
+        // の端末へ複数行を挿入しようとした等) — 書かずに断ったことを知らせる。
+        let mut refused: Vec<String> = Vec::new();
         // **終わり方を目印つきで拾う** (`(目印, 本当に届いたか)`)。
         // 積めたことと届いたことは別の時刻に決まるので、頼んだ側へは
         // ここでしか本当のことを返せない。
@@ -587,22 +598,44 @@ impl ZaivernApp {
         let mut queue = std::mem::take(&mut self.outbox);
         let sup = &self.supervisor;
         let agents = &mut self.agents;
-        let mut delivery_turn = submit::DeliveryTurn::default();
+        // 配達の外の門 (実行計画の承認待ち等) を先に尋ねる。閉じている分は
+        // この tick では動かさない — が、門が止めるのは `Stage::Ready` の
+        // 開始だけ。**書き始めた配達は門が閉じても最後まで運ぶ** (途中で
+        // 止めると本文だけが入力欄に残って占有が外れず、門が再び開かない
+        // 限りそのセッション全体が止まる)。
+        let gates: Vec<Option<bool>> = queue
+            .iter()
+            .map(|p| {
+                p.job.tag.as_deref().map_or(Some(true), |tag| {
+                    crate::features::team::imp::panel::with_panel(|panel| {
+                        panel.delivery_ready(tag, p.job.session)
+                    })
+                })
+            })
+            .collect();
+        // **入力欄はセッション内で共有される mutable state** — 壁はキュー
+        // の位置ではなく占有で作る (`submit::due_now`)。配達の途中の分だけが
+        // 入力欄を占有し、insert が残した「人の下書き」がある間は後続の
+        // 確定送信が始まらない (始めると確定キーが下書きまで一緒に送る)。
+        let drafted: std::collections::BTreeSet<u64> = agents
+            .sessions
+            .iter()
+            .filter(|s| s.input_draft())
+            .map(|s| s.id)
+            .collect();
+        let held: Vec<bool> = gates.iter().map(|g| *g != Some(true)).collect();
+        let mut due = submit::due_now(&queue, &held, &drafted).into_iter();
+        let mut gates = gates.into_iter();
         queue.retain_mut(|p| {
             let sid = p.job.session;
-            if let Some(tag) = p.job.tag.as_deref() {
-                match crate::features::team::imp::panel::with_panel(|panel| {
-                    panel.delivery_ready(tag, sid)
-                }) {
-                    None => return false, // 旧Run・旧世代には本文も確定キーも送らない。
-                    Some(false) => {
-                        next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
-                        return true;
-                    }
-                    Some(true) => {}
-                }
+            let gate = gates.next().unwrap_or(None);
+            let actionable = due.next().unwrap_or(false);
+            if gate.is_none() {
+                // 旧Run・旧世代には本文も確定キーも送らない。
+                return false;
             }
-            if !delivery_turn.enter(sid) {
+            if !actionable {
+                // 門が閉じているか、同じセッションの先の配達がまだ残っている
                 next = Some(next.map_or(submit::POLL, |d| d.min(submit::POLL)));
                 return true;
             }
@@ -669,6 +702,18 @@ impl ZaivernApp {
                     }
                     false
                 }
+                // **1 バイトも書かずに断る。** 改行を含む本文を bracketed
+                // paste の無い端末へ流すと途中の改行が確定として走り、本文
+                // の先頭行が実行される — 「入力欄へ挿入するだけ」の契約を
+                // 守れないので配達しない (本文を書き換えて意味を変える
+                // こともしない)。
+                submit::Act::UnsafeInsert => {
+                    refused.push(s.title.clone());
+                    if let Some(t) = p.job.tag.clone() {
+                        outcomes.push((t, false));
+                    }
+                    false
+                }
                 submit::Act::Wait(d) => {
                     soon(d);
                     true
@@ -678,8 +723,26 @@ impl ZaivernApp {
                     s.note_user_input();
                     // 失敗切替で別プロファイルへ引き継ぐ材料として覚えておく。
                     s.note_prompt(&p.job.text);
-                    s.write_bytes(&submit::body_bytes(&p.job.text, peek.bracketed));
+                    // 本文の sanitize はここで一度だけ — PTY へ書くバイト列と
+                    // 下書き追跡の種を同じ文字列から作る (末尾空白・制御文字・
+                    // CRLF を落とした後の、実際に入力欄へ入る文字数で追う)。
+                    let body = submit::sanitize(&p.job.text);
+                    // 配達自身の書き込みは下書き追跡へ畳まない (人の打鍵
+                    // ではない)。挿入は下の `note_input_draft` で残した本文を
+                    // 一度だけ種にする — `write_typed` で畳むと同じ本文が
+                    // feed と seed の両方で二重計上され、Backspace では
+                    // 永遠に消し切れない占有になる。
+                    s.write_bytes(&submit::wrap_body(&body, peek.bracketed));
                     s.set_scroll(0);
+                    if !p.job.submit {
+                        // 確定キーを送らない配達は、本文を入力欄へ残したまま
+                        // 終わる = **人の下書き**として占有が残る。この間に
+                        // 後続の確定送信を始めると、その確定キーが下書きまで
+                        // 一緒に送信する (解放は人の打鍵を write_typed が見る)。
+                        // 残した本文 (sanitize 済み) を渡して追跡の種にする —
+                        // Backspace での全消しまで追えるようになる。
+                        s.note_input_draft(&body);
+                    }
                     if p.job.wait_idle {
                         delivered.push(s.title.clone());
                     }
@@ -716,6 +779,12 @@ impl ZaivernApp {
         for title in gave_up {
             self.toast_warn(trf(
                 "指示文を配達できませんでした ({title}): セッションが落ち着きません",
+                &[("title", title)],
+            ));
+        }
+        for title in refused {
+            self.toast_warn(trf(
+                "agent_sessions.insert_multiline_refused",
                 &[("title", title)],
             ));
         }
@@ -792,6 +861,49 @@ mod delivery_peek_tests {
                 "{stage:?} / submit={submit} の読み取り判断が違う"
             );
         }
+    }
+
+    /// **同じセッションの配達は `due_now` の占有判定で進める。**
+    ///
+    /// この壁を外すと、確定送信の途中や人の下書きが残っている入力欄へ
+    /// 後続の本文+確定キーが追記されて、一緒に送信される。
+    /// `due_now` を呼ぶだけでは足りず、**下書きの印 (`input_draft`) を
+    /// 渡し、insert の本文を書いたら印を立てる**までが一体。
+    #[test]
+    fn submit_tick_は入力欄の占有を_due_now_へ委ねている() {
+        let src = include_str!("agent_sessions.rs").replace("\r\n", "\n");
+        let at = src
+            .find("pub(super) fn submit_tick")
+            .expect("submit_tick が無い");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("submit::due_now"),
+            "submit_tick が due_now を通っていない (同じセッションの後続が割り込める)"
+        );
+        assert!(
+            body.contains("input_draft()"),
+            "submit_tick が下書き占有を due_now へ渡していない"
+        );
+        assert!(
+            body.contains("note_input_draft(&body)"),
+            "insert の配達後に下書きの印を立てていない (後続の確定送信が下書きを巻き込む)\n\
+             残した本文を渡さないと Backspace 全消しでの解放まで追えない"
+        );
+        // **下書きの種と PTY へ書く本文は同じ sanitize 済み文字列から作る。**
+        // 生の `p.job.text` を種にすると、sanitize が落とす末尾空白・制御
+        // 文字・CRLF ぶん残量が実際より多く見えて、全部消しても解放しない
+        // (保守側ではあるが永久待ちになる)。
+        assert!(
+            body.contains("let body = submit::sanitize(&p.job.text);"),
+            "本文の sanitize が一度で済んでいない (PTY 書き込みと種でずれる):\n{body}"
+        );
+        assert!(
+            body.contains("s.write_bytes(&submit::wrap_body(&body, peek.bracketed))"),
+            "配達の本文が内部書き込みになっていない (配達自身の書き込みで\n\
+             残っている下書きを誤って畳む/本文が二重計上される):\n{body}"
+        );
     }
 
     /// **判断を `submit_tick` が実際に通していること。**

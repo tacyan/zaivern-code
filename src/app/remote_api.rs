@@ -580,7 +580,7 @@ impl ZaivernApp {
             remote::AgentAct::Stop => {
                 // リモートからの手動操作もユーザーの応答扱い
                 s.note_user_input();
-                s.write_bytes(b"\x1b");
+                s.write_typed(b"\x1b");
                 json!({"ok": true}).to_string()
             }
         }
@@ -593,28 +593,55 @@ impl ZaivernApp {
         if text.is_empty() {
             return json!({"ok": false, "error": "テキストが空です"}).to_string();
         }
-        // submit=false は入力欄へ挿入するだけ (Enter は送らない)
-        let payload = if submit {
-            format!("{text}\r")
-        } else {
-            text.clone()
-        };
         let verb = if submit {
             tr("送信")
         } else {
             tr("入力欄へ")
         };
+        // 確定まで送る分は PC 側と同じ配達機構 (`queue_submit*`) へ合流させる。
+        // 本文と CR を 1 回で書くと、Codex 等は長い本文をまとめてペーストと
+        // 判定して CR を改行として飲み、入力欄に抱えたまま送信しない
+        // (`zai session send` の長文で実際に起きた)。コスト上限の理由は
+        // `bulk` と同じく呼び出し元へそのまま返す。
+        //
+        // 「入れるだけ」(submit=false) も同じキューへ積む。PTY へ生書き
+        // すると、先行する確定送信の確定キーが届く前に追記されてしまい、
+        // その確定キーで未送信のつもりの文章まで一緒に送信される。
+        if let Some(why) = self.cost_block_reason() {
+            return json!({"ok": false, "error": why}).to_string();
+        }
         if id < 0 {
             // 全エージェントへブロードキャスト
-            let n = self.agents.running_count();
-            if n == 0 {
+            if self.agents.running_count() == 0 {
                 return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
             }
-            for s in self.agents.sessions.iter_mut().filter(|s| s.running()) {
-                // リモートからの手動送信もユーザーの応答扱い
-                s.note_user_input();
-                s.write_bytes(payload.as_bytes());
-            }
+            // **実際に積めた数を返す** — 途中で宛先が消えた等で積めなかった
+            // 分まで「送った」とスマホへ報告しない。
+            let n = if submit {
+                match self.queue_submit_all(&text) {
+                    None => {
+                        return json!({"ok": false, "error": tr("送信できませんでした")})
+                            .to_string()
+                    }
+                    Some(n) => n,
+                }
+            } else {
+                // submit=false は入力欄へ挿入するだけ (Enter は送らない)
+                let ids: Vec<u64> = self
+                    .agents
+                    .sessions
+                    .iter()
+                    .filter(|s| s.running())
+                    .map(|s| s.id)
+                    .collect();
+                let mut n = 0;
+                for id in ids {
+                    if self.queue_submit(submit::Job::insert(id, text.clone())) {
+                        n += 1;
+                    }
+                }
+                n
+            };
             self.toast(
                 trf(
                     "🎤📣 {n} セッション {verb}: {text}",
@@ -626,14 +653,25 @@ impl ZaivernApp {
                 ),
                 true,
             );
-            json!({"ok": true, "sent": n}).to_string()
+            json!({"ok": n > 0, "sent": n}).to_string()
         } else {
             // セッション id 指定 (インデックスではなく id — 閉じてもずれない)
-            match self.agents.sessions.iter_mut().find(|s| s.id == id as u64) {
+            let sid = id as u64;
+            match self.agents.sessions.iter().find(|s| s.id == sid) {
                 Some(s) if s.running() => {
-                    s.note_user_input();
-                    s.write_bytes(payload.as_bytes());
                     let title = s.title.clone();
+                    // 「入れるだけ」も確定送信と同じキューへ積む — 生書きに
+                    // すると先行する確定送信の確定キーで一緒に送信される。
+                    // 積めなかった理由は queue_submit がトーストで説明済み
+                    let job = if submit {
+                        submit::Job::user(sid, text.clone())
+                    } else {
+                        submit::Job::insert(sid, text.clone())
+                    };
+                    if !self.queue_submit(job) {
+                        return json!({"ok": false, "error": tr("送信できませんでした")})
+                            .to_string();
+                    }
                     self.toast(format!("🎤 {title} {verb}: {text}"), true);
                     json!({"ok": true, "sent": 1}).to_string()
                 }
@@ -678,8 +716,9 @@ impl ZaivernApp {
 
     /// 指定した ID 群へ生バイトを書く。実際に届いた数を返す。
     ///
-    /// 制御キー (Esc 等) と「入力欄へ入れるだけ」の 1 体宛て送信で使う。
-    /// `/api/term` と同じ経路なので、1 体宛ての挙動はこれまでと変わらない。
+    /// **制御キー (Esc 等) 専用。** 「入力欄へ入れるだけ」の本文はここを
+    /// 通さない — 生書きすると先行する確定送信の確定キーで一緒に
+    /// 送信されてしまうので、`submit::Job::insert` でキューへ積む。
     fn bulk_write_raw(&mut self, ids: &[u64], bytes: &[u8]) -> usize {
         let mut n = 0;
         for s in self
@@ -690,7 +729,7 @@ impl ZaivernApp {
         {
             // リモートからの手動操作もユーザーの応答扱い (承認エピソードを解決する)
             s.note_user_input();
-            s.write_bytes(bytes);
+            s.write_typed(bytes);
             n += 1;
         }
         n
@@ -720,15 +759,16 @@ impl ZaivernApp {
             return json!({"ok": false, "error": why}).to_string();
         }
         let sent = match (mode, submit) {
-            // 1 体宛ては従来どおり生書き (`/api/term` と同じバイト列)。
-            // 素のシェルにも効く経路をここで変えない。
-            (remote::BulkMode::One, _) => {
-                let payload = if submit {
-                    format!("{text}\r")
-                } else {
-                    text.clone()
-                };
-                self.bulk_write_raw(&targets, payload.as_bytes())
+            // 1 体宛ての確定送信も配達機構へ合流させる。本文と CR を 1 回で書くと
+            // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+            (remote::BulkMode::One, true) => {
+                let mut n = 0;
+                for id in &targets {
+                    if self.queue_submit(submit::Job::user(*id, text.clone())) {
+                        n += 1;
+                    }
+                }
+                n
             }
             // 一斉送信は Cockpit のブロードキャストと同じ入口へ合流させる。
             // 確定キーの再送・コスト上限・チェックポイントが全部そのまま効く。
@@ -745,8 +785,9 @@ impl ZaivernApp {
                 }
                 Some(n) => n,
             },
-            // 「入れるだけ」は Cockpit に対応する入口が無い (一斉送信は必ず確定する)
-            // ので、同じ配達機構を submit=false のジョブで通す。
+            // 「入れるだけ」も同じ配達機構を通す (確定キーは送らない
+            // `Job::insert`)。PTY へ生書きすると、先行する確定送信の
+            // 確定キーが届く前に追記されて一緒に送信されてしまう。
             // コスト上限は**宛先ごとに理由を出さない**よう、ここで一度だけ見る。
             (_, false) => {
                 if let Some(why) = self.cost_block_reason() {
@@ -755,10 +796,7 @@ impl ZaivernApp {
                 }
                 let mut n = 0;
                 for id in &targets {
-                    let job = submit::Job {
-                        submit: false,
-                        ..submit::Job::user(*id, text.clone())
-                    };
+                    let job = submit::Job::insert(*id, text.clone());
                     if self.queue_submit(job) {
                         n += 1;
                     }
@@ -936,18 +974,37 @@ impl ZaivernApp {
     /// remote_reply: TermInput — アクティブなエージェントへ入力を送る。
     pub(super) fn remote_reply_term_input(&mut self, payload: &str, raw: bool) -> String {
         use serde_json::json;
-        match self.agents.active_session() {
-            Some(s) if s.running() => {
+        let Some(sid) = self
+            .agents
+            .active_session()
+            .filter(|s| s.running())
+            .map(|s| s.id)
+        else {
+            return json!({"ok": false, "error": "実行中のセッションがありません"}).to_string();
+        };
+        // 本文つきの確定送信は配達機構へ合流させる。本文と CR を 1 回で書くと
+        // Ink 系 TUI は長い本文をペースト扱いにして CR を改行として飲む。
+        // キー入力 (raw) と、空白しか無い本文 + Enter は従来どおり生書きする
+        // (空白を捨てずに送る。配達機構は空白だけの本文を積まない)。
+        if !raw && !payload.trim().is_empty() {
+            if self.queue_submit(submit::Job::user(sid, payload)) {
+                return json!({"ok": true}).to_string();
+            }
+            return json!({"ok": false, "error": tr("送信できませんでした")}).to_string();
+        }
+        match self.agents.sessions.iter_mut().find(|s| s.id == sid) {
+            Some(s) => {
                 // スマホの端末キー/入力欄 = 手入力。承認エピソードを解決する
                 s.note_user_input();
                 if raw {
-                    s.write_bytes(payload.as_bytes());
+                    s.write_typed(payload.as_bytes());
                 } else {
-                    s.write_bytes(format!("{payload}\r").as_bytes());
+                    s.write_typed(payload.as_bytes());
+                    s.write_typed(submit::COMMIT);
                 }
                 json!({"ok": true}).to_string()
             }
-            _ => json!({"ok": false, "error": "実行中のセッションがありません"}).to_string(),
+            None => json!({"ok": false, "error": "実行中のセッションがありません"}).to_string(),
         }
     }
 
