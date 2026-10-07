@@ -114,17 +114,30 @@ default_enabled = true    # 省略時 true。false なら初回は無効で入�
 
 ```toml
 [[command]]
-id = "fmt"                # 省略可。省略時は title から自動生成
-title = "JSON を整形"      # UI に出る名前
+id = "trim"                # 省略可。省略時は title から自動生成
+title = "行末の空白を落とす"  # UI に出る名前
 icon = "✨"
-run = "python3 -m json.tool"
+run = "sed 's/[[:space:]]*$//'"
 input = "file"            # none | selection | file
 output = "replace"        # 下表を参照
-langs = ["json"]          # 空 or 省略なら全言語で出る
+langs = []                # 空 or 省略なら全言語で出る
 keybind = "cmd+alt+f"
 on_save = true            # 保存時に自動実行（フォーマッタ向け）
 timeout_secs = 30         # 1〜600
 ```
+
+`run` は既定では **OS のシェル**で実行されます（`shell = "native"`、
+unix は `$SHELL -lc`、Windows は `%COMSPEC% /C`）。POSIX シェル
+スクリプトを前提にする場合は `[plugin]` に **`shell = "posix"`** を
+書いてください —— **全 OS で** `sh -lc` で走り、`sed` / `awk` / `tr`
+のような POSIX の道具や `$VAR` 形式の環境変数がそのまま使えます。
+unix/macOS でも `$SHELL` ではなく解決済みの `sh` を使うので、
+`$SHELL` に fish 等が設定されていても影響しません。Windows では
+Git for Windows 同梱の `sh.exe` が使われ、見つからない場合は
+`run` を持つ posix プラグインだけが読み込み時にエラーになります
+（エラー行には理由が出ます）。`ZAIVERN_POSIX_SHELL` で使う `sh`
+を明示指定もできます（全 OS で有効）。`shell` を書かない既存の
+`plugin.toml` は無改造のまま従来どおり動きます。
 
 ### `input` — スクリプトの標準入力に何を渡すか
 
@@ -282,6 +295,50 @@ echo '{"action":"open_file","path":"src/main.rs","line":42}'
 解釈できない行は無視されるだけで、プラグインは止まりません。
 `echo` のデバッグ出力が混ざっていても壊れません。
 
+---
+
+
+### アクション行は `zai plugin emit` で組むと楽です
+
+JSON を手で組み立てると、引用符・改行・日本語のエスケープで必ず事故ります。
+`zai` 本体が同じことをやってくれます（`ZV_BIN` に自分の実体のパスが入っています）。
+
+```sh
+"$ZV_BIN" plugin emit action notify level info message "処理が終わりました"
+"$ZV_BIN" plugin emit action open_file path "src/main.rs" line 42
+```
+
+* キーと値を並べるだけ。`submit` は真偽、`line` / `column` は数値として載ります
+* 値が `@@` で始まると、**続くパスのファイル内容**が値になります
+  （パネル本文のように長い値を、引数の長さ制限を気にせず渡せます）
+
+```sh
+"$ZV_BIN" plugin emit action set_panel panel usage text "@@$ZV_PLUGIN_DATA/usage.md"
+```
+
+JSON を**読む**ほうと、使用量の集計にも道具があります。
+
+| コマンド | 出すもの |
+|---|---|
+| `zai plugin json <ファイル> keys <パス>` | そこにあるキー名を 1 行 1 件 |
+| `zai plugin json <ファイル> get <パス>` | そこにある値を 1 つ |
+| `zai plugin json <ファイル> rows <パス> …` | 配列の各要素から指定パスの値をタブ区切りで |
+| `zai plugin usage-scan [追加ディレクトリ]` | 使用量の目安を Markdown で |
+
+`rows` のパスは `.` 区切りで、`labels[].name` のように `[]` を挟むと配列を
+辿って `, ` で連結します。**無いファイル・無いパスは空を返して成功します**
+（`set -eu` のスクリプトを、探しただけで落とさないため）。
+
+```sh
+gh pr list --json number,title,author,labels --limit 20 >"$ZV_PLUGIN_DATA/pr.json"
+"$ZV_BIN" plugin json "$ZV_PLUGIN_DATA/pr.json" rows number title author.login "labels[].name"
+```
+
+> **python3 を使わないでください。** Windows では Microsoft Store の
+> 「アプリ実行エイリアス」が `python3` として PATH に居座るので、
+> `command -v python3` は成功するのに、実行すると `Python` の 1 行を出して
+> 終了コード 49 で死にます。**存在確認を通り抜けて失敗する**ので、
+> 原因がいちばん分かりにくい壊れ方をします。
 ---
 
 ## 環境変数
@@ -466,3 +523,19 @@ GitHub にそのまま置いても構いませんし、フォルダを直接
 
 **変更が反映されない**
 🔌 タブの ⟳ で再読み込みしてください。`plugin.toml` を書き換えたときは必須です。
+
+**Windows で「POSIX シェル (sh) が見つかりません」と出る**
+`shell = "posix"` を指定したプラグインは Windows でも `sh` が要ります
+（`sh` スクリプトを呼ぶ同梱プラグインは全て posix 指定）。Zaivern は **cmd.exe を通さず** `sh` を
+直接起こしますが、置き場所を自分で探す必要があります（Git for Windows は
+`Git\cmd` しか PATH へ入れず、`sh.exe` が居る `Git\usr\bin` は PATH の外
+だからです）。
+
+* 探す順番: 環境変数 `ZAIVERN_POSIX_SHELL` → PATH 上の `sh` →
+  **PATH 上の `git` の隣**（`<Git>\usr\bin\sh.exe`）→ よくある導入先
+* つまり **Git for Windows が入っていれば、何も設定せずに動きます**
+* 別の場所にある人は `ZAIVERN_POSIX_SHELL` にその実体のパスを入れてください
+
+見つからない間、posix 指定プラグインは 🔌 タブで ⚠ 付きの停止状態になります
+（フックも撃たれません）。`shell` を書かないプラグインと辞書だけの言語パックは
+そのまま使えます。

@@ -1,9 +1,10 @@
 [plugin]
 name = "worktrees"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "作業ごとに git ワークツリーを切り、並列で進めて最後に取り込む"
 api = 2
+shell = "posix"
 
 [[setting]]
 key = "count"

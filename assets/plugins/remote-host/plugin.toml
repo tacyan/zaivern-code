@@ -1,9 +1,10 @@
 [plugin]
 name = "remote-host"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "手元の作業を ssh 越しのマシンへ持って行き、向こうで動かして結果を持ち帰る"
 api = 2
+shell = "posix"
 
 [[setting]]
 key = "host"

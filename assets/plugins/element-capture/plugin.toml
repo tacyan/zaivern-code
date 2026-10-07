@@ -3,10 +3,11 @@
 
 [plugin]
 name = "element-capture"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "ページ上の UI 要素と画面の切り取りをエージェントへ渡す"
 api = 2
+shell = "posix"
 
 [[command]]
 id = "pick"

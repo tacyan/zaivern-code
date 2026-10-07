@@ -22,6 +22,7 @@ author = ""
 description = ""
 api = 2                   # 追加: 省略時 1。`[[syntax]]` を使うなら 3
 default_enabled = true    # v3 追加: 省略時 true。false なら初回は無効で入る
+shell = "native"          # 省略時 "native"。POSIX 前提の run は "posix" (§5)
 
 [[command]]
 id = "fmt"                # 追加: 安定ID。省略時は title から slug 生成
@@ -144,8 +145,48 @@ token = "xxx"
 - ビルド時に `include_str!` で埋め込み、初回起動時に `~/.zaivern/plugins/<name>/` へ展開する。
 - 展開済み判定は `~/.zaivern/plugins/<name>/.bundled` に書いたバージョン文字列で行う。
   バンドル版のほうが新しい場合のみ再展開する（ユーザーが編集したファイルを毎回潰さない）。
+  **中身（manifest・スクリプト）を変えたら `version` を必ず上げる** — 版が据え置きだと
+  `version_newer` が偽で再展開されず、既存ユーザーへ修正が届かない。
 - 標準プラグインは無効化できるが、アンインストールは無効化として扱う（次回起動で復活してよい）。
 - シェルスクリプトは展開時に実行権限を付与する。
+- **同梱スクリプトは python3 を前提にしない。** JSON の組み立て・読み取り・
+  使用量の集計は `zai plugin emit` / `json` / `usage-scan`（実体は
+  `src/plugin_script.rs`）へ寄せる。Windows では Microsoft Store の
+  アプリ実行エイリアスが `python3` として PATH に居座り、`command -v` を
+  通り抜けてから exit 49 で死ぬため、存在確認では守れない。
+  例外は `element-capture`（macOS 専用。`build-prompt.py` を使う前に
+  `zv_have python3` で確認して降りる）。
+
+### 実行シェル
+
+- `run` の実行シェルは manifest の `[plugin].shell` が唯一の真実の在り処で、
+  既定は **`shell = "native"`**（省略可）—— unix は `$SHELL -lc`、Windows は
+  `%COMSPEC% /C`（`shellenv::shell_command`）。`shell` を書かない既存の
+  `plugin.toml` は無改造のまま従来どおり動く（後方互換）。
+- POSIX シェルスクリプトを前提にするプラグインは **`shell = "posix"`** と
+  明示して opt-in する。**全 OS で** `shellenv::posix_shell` が解決した `sh`
+  を `sh -lc` で起動する（`shellenv::script_command`）。unix/macOS でも
+  `$SHELL` ではなく `sh` を使う —— `$SHELL` には fish / nushell などの
+  非 POSIX シェルが入りうるため。Windows では cmd.exe を通さない
+  （cmd では `sh` も `$VAR` も引けない）。同梱プラグインは全て posix 指定。
+- `sh` の探索順は `ZAIVERN_POSIX_SHELL`（明示上書き。全 OS で有効）→
+  PATH 上の `sh` →（Windows のみ）PATH 上の `git` の祖先
+  （`<Git>\usr\bin\sh.exe`）→ env 由来のよくある導入先 →（unix）
+  `/bin/sh` 等の固定パス。**絶対パスをコードへ書かない**
+  （`shellenv::posix_shell_candidates` は純関数で、探針＝`which` の結果と
+  env を引数で受ける）。
+- 引数は `-c` ではなく **`-lc`**。`-c` では Git for Windows の `/etc/profile` が
+  読まれず、`sed` / `awk` / `tr` / `head` / `stat` / `date` / `basename` / `git` が
+  引けない（実測）。ただし MSYS 系の login shell は `/etc/profile` から
+  `$HOME` へ cd するため、プラグインの `current_dir`（= ワークスペース）を
+  シェル内 `pwd` まで届けるため **`CHERE_INVOKING=1`** を Windows で渡して
+  profile の cd を抑止する。
+- `sh` が見つからない環境では、**`shell = "posix"` で `run` を 1 つでも持つ
+  プラグインだけ**を読み込み時に `error` にする（`plugins::script_gate` →
+  `Plugin::needs_posix_shell`）。`Plugin::active` が false になるので
+  フックもコマンドも撃たれず、一覧に理由が 1 行出る。
+  Native プラグインと `run` を持たない言語パックは `sh` が無くても止まらない。
+  起動のたびに失敗通知を撒かないための門であって、黙って捨てるためではない。
 
 ## 6. CLI 制御チャネル
 

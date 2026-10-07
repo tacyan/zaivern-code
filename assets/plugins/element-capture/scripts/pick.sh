@@ -84,6 +84,9 @@ zv_emit action set_status text "切り取る範囲をドラッグしてくださ
 SHOT=$(zv_shot)
 
 PROMPT="$ZV_PLUGIN_DATA/prompt.txt"
+# このプラグインだけは python3 が要る (build-prompt.py が DOM の情報を畳む)。
+# macOS 専用の機能なので zai 側へは移していない。無ければ理由を言って降りる。
+zv_have python3 || zv_fail "この機能には python3 が必要です (要素情報の整形に使います)。"
 python3 "$DIR/scripts/build-prompt.py" "$PICK" "$SHOT" >"$PROMPT"
 
 zv_emit action agent_prompt agent "${ZV_AGENT:-}" text "@@$PROMPT" submit false

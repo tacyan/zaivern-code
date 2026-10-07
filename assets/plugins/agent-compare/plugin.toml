@@ -1,9 +1,10 @@
 [plugin]
 name = "agent-compare"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "並列に進めた各ブランチの成果を並べて比べ、良かったものを取り込む"
 api = 2
+shell = "posix"
 
 [[setting]]
 key = "base"

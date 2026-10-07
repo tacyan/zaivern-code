@@ -3,10 +3,11 @@
 
 [plugin]
 name = "quick-actions"
-version = "0.1.0"
+version = "0.2.0"
 author = "Zaivern"
 description = "プロジェクトを判定して、テスト・ビルド・整形・スクリプトを実行する"
 api = 2
+shell = "posix"
 
 [[command]]
 id = "script"
