@@ -33,6 +33,37 @@ fn 送信経路はコスト上限の門を通る() {
     }
 }
 
+/// 外から届く確定送信 (`/api/voice` = `zai session send` / `/api/bulk` /
+/// `/api/term` / `/api/prompt` とプラグイン) は配達機構へ合流させる。
+/// 本文と CR を 1 回で書くと、長い本文ではペースト扱いで CR が飲まれて
+/// 送信されない。合流していればコスト上限の門も一緒に通る。
+#[test]
+fn リモートの確定送信は配達機構を通る() {
+    for sig in [
+        "fn remote_reply_voice_send(&mut self, text: &str, id: i64, submit: bool) -> String {",
+        "fn remote_reply_bulk(",
+        "fn remote_reply_term_input(&mut self, payload: &str, raw: bool) -> String {",
+        "fn send_agent_prompt(",
+    ] {
+        let body = body_of(sig);
+        assert!(
+            !body.contains(r#"\r")"#),
+            "{sig} が本文と CR を 1 回で書いている (長文が送信されない)"
+        );
+        assert!(
+            body.contains("self.queue_submit"),
+            "{sig} の確定送信が配達機構 (queue_submit*) を通っていない"
+        );
+    }
+    let voice = body_of(
+        "fn remote_reply_voice_send(&mut self, text: &str, id: i64, submit: bool) -> String {",
+    );
+    assert!(
+        voice.contains("self.cost_block_reason()"),
+        "確定送信の理由をリモートへ返していない"
+    );
+}
+
 /// **黙って無視しない** — 止めたときは必ず理由を画面へ出す。
 #[test]
 fn 止めた理由を必ず画面に出す() {
