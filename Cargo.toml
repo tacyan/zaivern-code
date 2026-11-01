@@ -96,7 +96,7 @@ base64 = "0.23"
 ureq = { version = "3.4.0", default-features = false, features = ["rustls"] }
 sha2 = "0.10.9"
 zeroize = "1.9"
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 # Snapshot archives are built from validated bytes, never by a host PATH executable.
 tar = { version = "0.4", default-features = false }
 
