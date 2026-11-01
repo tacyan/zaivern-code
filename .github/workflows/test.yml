@@ -137,7 +137,7 @@ jobs:
       # 依存クレートのビルド結果をコミット間・fast/pty ジョブ間で使い回す。
       # shared-key はジョブ名ベースの自動キーを置き換えるため、
       # 同一 OS の fast と pty が同じキャッシュを読み書きする。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -151,7 +151,7 @@ jobs:
         run: sh tools/ci-linux-deps.sh --lld
 
       # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -249,7 +249,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -262,7 +262,7 @@ jobs:
         run: sh tools/ci-linux-deps.sh --lld
 
       # ref 名がツール名を兼ねる糖衣は SHA 固定と両立しないので tool: を明示する。
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -307,7 +307,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-windows-latest
           cache-on-failure: true
@@ -350,7 +350,7 @@ jobs:
           toolchain: "1.88.0"
 
       # stable のキャッシュとは別に持つ (rustc が違えば成果物は共有できない)。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: msrv-188
           cache-on-failure: true
@@ -491,7 +491,7 @@ jobs:
       # プロファイルも同じなので依存クレートのビルドはそのまま再利用でき、
       # このジョブが増やすのは zai 本体のコンパイルとリンクだけになる
       # (xplat.yml の shapes ジョブと同じ流儀)。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-macos-latest
           cache-on-failure: true
@@ -559,7 +559,7 @@ jobs:
       # lint は clippy-driver 経由で fingerprint が変わるため、
       # test ジョブとキャッシュを共有すると互いに上書きし合って
       # 毎回ミスになる。専用の shared-key を持たせる。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: lint-ubuntu
           cache-on-failure: true
