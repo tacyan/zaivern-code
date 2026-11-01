@@ -126,7 +126,7 @@ jobs:
       # 担当外のファイルなので直していない)。windows-latest の git-bash では
       # `python3` が Microsoft Store のスタブに化けることがあるので、
       # **確実に実体を置く**。ubuntu / macOS では既に入っているぶんを拾うだけ。
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.x"
 
@@ -154,7 +154,7 @@ jobs:
         shell: bash
         run: sh tools/merge-band-probe.sh --mode pairs
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: xplat-probe-${{ matrix.os }}
@@ -208,7 +208,7 @@ jobs:
       - name: 帯の反証 (merge-band-probe --mode pairs)
         run: sh tools/merge-band-probe.sh --mode pairs
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: xplat-probe-debian-${{ matrix.base }}
@@ -244,7 +244,7 @@ jobs:
 
       # `tools/anyrepo-prove.sh` は python3 が無いと 1 行も走らない
       # (乱数種から決まる担当表を実装非依存に固定するため)。
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.x"
 
@@ -258,7 +258,7 @@ jobs:
       # test.yml の fast / pty と同じ shared-key を読む。同じ RUSTFLAGS /
       # プロファイルなので依存クレートのビルドはそのまま再利用でき、
       # このジョブが増やすのは zai 本体のリンクだけ。
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -282,7 +282,7 @@ jobs:
           sh tools/anyrepo-prove.sh --shapes --writers 4 --overlap 1.0 --json \
             > "shapes-${{ matrix.os }}.json"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: xplat-shapes-${{ matrix.os }}
@@ -327,7 +327,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-${{ matrix.os }}
           cache-on-failure: true
@@ -352,7 +352,7 @@ jobs:
           mkdir -p "$ZAIVERN_HOME"
           sh tools/repo-shapes-prove.sh --json > "repo-shapes-${{ matrix.os }}.json"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: xplat-repo-shapes-${{ matrix.os }}
@@ -378,7 +378,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-ubuntu-latest
           cache-on-failure: true
@@ -418,7 +418,7 @@ jobs:
           mkdir -p "$ZAIVERN_HOME"
           sh tools/shared-surface-bench.sh --json > chain4-shared-surface.json
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: xplat-chains
@@ -471,7 +471,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: test-ubuntu-latest
           cache-on-failure: true
