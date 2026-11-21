@@ -47,6 +47,10 @@ qrcode = { version = "0.14", default-features = false }
 # 実測と経緯は src/textenc.rs の「記録: 端末に出る「$ だらけの文字化け」の正体」。
 # 既に推移依存として Cargo.lock に居るのでビルド時間もサイズも増えない。
 encoding_rs = "0.8"
+# 推定コストの既定単価表 (src/config.rs の default_model_prices)。
+# Anthropic の公開価格を出典 URL・確認日つきで同梱した表。MIT / 純 Rust /
+# 既定 feature では依存ゼロ、ビルド時に埋め込むので実行時の通信も無い。
+llm-prices = "1.8.0"
 # クリップボードの画像取得 (⌘V/Ctrl+V で画像を PNG 保存してパス挿入)。
 # egui-winit も arboard を使うが image-data feature なしのため直接依存する。
 # wayland-data-control は Linux (Wayland) 専用で他 OS のビルドには影響しない。
