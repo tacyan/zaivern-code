@@ -862,38 +862,57 @@ impl Default for PricingConfig {
 
 /// 既定の単価表。
 ///
-/// **2026-08-09 時点**の公開価格 (100 万トークンあたり・米ドル)。
-/// キャッシュ単価は入力単価から導出している (書き込み = 入力の 1.25 倍 /
-/// 5 分 TTL、読み出し = 入力の 0.1 倍)。**古くなったら設定で上書きすること** —
-/// このアプリは価格を問い合わせに行かない (通信ゼロの方針)。
+/// 値は [`llm_prices`] crate に同梱された Anthropic の公開価格表
+/// (100 万トークンあたり・米ドル、各行に出典 URL と確認日つき) から組み立てる。
+/// 手書きの表は前方一致キーが粗く、`claude-opus-4` が 15/75 の
+/// `claude-opus-4-0` / `claude-opus-4-1` を 5/25 で引き、`claude-sonnet-5` を
+/// 3/15 (正しくは 2/10) にしていた。**古くなったら設定で上書きすること** —
+/// このアプリは価格を問い合わせに行かない (通信ゼロの方針。表はビルド時に同梱)。
 ///
-/// キーは前方一致で引かれるので、日付サフィックス付きの ID
-/// (`claude-haiku-4-5-20251001` 等) もここの短い名前に当たる。
+/// 各行はモデル ID・別名・日付を外した形 (`claude-opus-4-1-20250805` →
+/// `claude-opus-4-1`) の 3 通りのキーで入る。引き当ては最長の前方一致なので、
+/// `claude-opus-4-0` は `claude-opus-4` (15/75) に、`claude-opus-4-8` は自分の行
+/// (5/25) に当たる。
 fn default_model_prices() -> HashMap<String, ModelPrice> {
-    /// 入力単価から 1 行ぶんを組み立てる (キャッシュ倍率は共通)。
-    fn row(input: f64, output: f64) -> ModelPrice {
-        ModelPrice {
+    /// `-YYYYMMDD` の日付サフィックスを外す。
+    fn undated(id: &str) -> Option<&str> {
+        let (head, tail) = id.rsplit_once('-')?;
+        (tail.len() == 8 && tail.starts_with("20") && tail.bytes().all(|b| b.is_ascii_digit()))
+            .then_some(head)
+    }
+    let mut map = HashMap::new();
+    for p in llm_prices::Provider::Anthropic.rows() {
+        let (Some(input), Some(output), Some(cache_read)) = (p.input, p.output, p.cache_read)
+        else {
+            continue;
+        };
+        // キャッシュ書き込みは 5 分 TTL の単価。
+        let Some(cache_write) = p.cache_write("5m") else {
+            continue;
+        };
+        let price = ModelPrice {
             input,
             output,
-            cache_write: input * 1.25,
-            cache_read: input * 0.1,
+            cache_write,
+            cache_read,
+        };
+        let ids = std::iter::once(p.model).chain(p.aliases.iter().copied());
+        for id in ids {
+            map.entry(id.to_string()).or_insert(price);
+            if let Some(base) = undated(id) {
+                map.entry(base.to_string()).or_insert(price);
+            }
         }
     }
-    // (モデル名の前方一致キー, 入力, 出力)
-    const TABLE: &[(&str, f64, f64)] = &[
-        // Anthropic
-        ("claude-fable-5", 10.0, 50.0),
-        ("claude-mythos-5", 10.0, 50.0),
-        ("claude-opus-5", 5.0, 25.0),
-        ("claude-opus-4", 5.0, 25.0),
-        ("claude-sonnet-5", 3.0, 15.0),
-        ("claude-sonnet-4", 3.0, 15.0),
-        ("claude-haiku-4", 1.0, 5.0),
-    ];
-    TABLE
-        .iter()
-        .map(|(name, i, o)| ((*name).to_string(), row(*i, *o)))
-        .collect()
+    // llm-prices に載っていないモデル (従来の既定値を保持)。
+    map.entry("claude-mythos-5".to_string())
+        .or_insert(ModelPrice {
+            input: 10.0,
+            output: 50.0,
+            cache_write: 12.5,
+            cache_read: 1.0,
+        });
+    map
 }
 
 impl PricingConfig {
@@ -6463,6 +6482,32 @@ cache_read = 10.0
             again.pricing.lookup("my-model").map(|m| m.input),
             Some(100.0)
         );
+    }
+
+    /// 既定の表は llm-prices の公開価格どおりに引ける。前方一致キーが
+    /// 世代違いのモデルを誤った単価で拾わない (旧表の `claude-opus-4` は
+    /// 15/75 の Opus 4 / 4.1 を 5/25 で引き、`claude-sonnet-5` は 3/15 だった)。
+    #[test]
+    fn 既定の単価表は世代違いを取り違えない() {
+        let p = PricingConfig::default();
+        let io = |m: &str| p.lookup(m).map(|x| (x.input, x.output));
+        // Opus 4 / 4.1 は 15/75
+        assert_eq!(io("claude-opus-4-0"), Some((15.0, 75.0)));
+        assert_eq!(io("claude-opus-4-20250514"), Some((15.0, 75.0)));
+        assert_eq!(io("claude-opus-4-1"), Some((15.0, 75.0)));
+        assert_eq!(io("claude-opus-4-1-20250805"), Some((15.0, 75.0)));
+        // Opus 4.5 以降は 5/25
+        assert_eq!(io("claude-opus-4-5-20251101"), Some((5.0, 25.0)));
+        assert_eq!(io("claude-opus-4-8"), Some((5.0, 25.0)));
+        assert_eq!(io("claude-opus-5[1m]"), Some((5.0, 25.0)));
+        // Sonnet 5 は 2/10、Sonnet 4.x は 3/15
+        assert_eq!(io("claude-sonnet-5"), Some((2.0, 10.0)));
+        assert_eq!(io("claude-sonnet-4-6"), Some((3.0, 15.0)));
+        assert_eq!(io("claude-sonnet-4-5"), Some((3.0, 15.0)));
+        assert_eq!(io("claude-haiku-4-5-20251001"), Some((1.0, 5.0)));
+        // キャッシュ単価も表の値 (Opus 4.1: 書き 18.75 / 読み 1.5)
+        let o41 = p.lookup("claude-opus-4-1").unwrap();
+        assert_eq!((o41.cache_write, o41.cache_read), (18.75, 1.5));
     }
 }
 
